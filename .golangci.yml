@@ -9,11 +9,17 @@ linters:
   default: none
   enable:
     - asasalint
+    - asciicheck
+    - bidichk
     - bodyclose
+    - canonicalheader
     - copyloopvar
+    - cyclop
     - dogsled
+    - dupl
     - durationcheck
     - dupword
+    - embeddedstructfieldcheck
     - errcheck
     - errchkjson
     - errname
@@ -21,14 +27,22 @@ linters:
     - exhaustive
     - fatcontext
     - forcetypeassert
+    - gocheckcompilerdirectives
+    - gocognit
     - gocritic
+    - godot
+    - goprintffuncname
     - gosec
     - govet
+    - inamedparam
     - ineffassign
+    - interfacebloat
     - intrange
+    - lll
     - makezero
     - mirror
     - misspell
+    - nestif
     - nilerr
     - nilnil
     - noctx
@@ -38,10 +52,12 @@ linters:
     - predeclared
     - protogetter
     - reassign
+    - recvcheck
     - revive
     - rowserrcheck
     - sqlclosecheck
     - staticcheck
+    - tagalign
     - testifylint
     - thelper
     - unconvert
@@ -97,6 +113,26 @@ linters:
       require-explanation: true
       require-specific: true
       allow-unused: false
+    # godot：仅要求声明注释以句号收尾（接受中文句号「。」），不约束行内注释。
+    godot:
+      scope: declarations
+    # lll：源码行宽上限 160（测试内的长 JSON 字面量另行豁免，见 exclusions）。
+    lll:
+      line-length: 160
+    # dupl：150 token 的重复片段视为可提取（当前无命中，作为回归护栏）。
+    dupl:
+      threshold: 150
+    # cyclop / gocognit / nestif：函数复杂度上限。三者同口径收紧，
+    # 用于抑制超长热路径（如 SSE 聚合、请求转发）继续膨胀。
+    cyclop:
+      max-complexity: 10
+    gocognit:
+      min-complexity: 30
+    nestif:
+      min-complexity: 5
+    # interfacebloat：接口方法数上限，超过即拆分为更小的角色接口。
+    interfacebloat:
+      max: 10
     revive:
       enable-all-rules: false
       rules:
@@ -158,6 +194,8 @@ linters:
           - revive
           - predeclared
           - usetesting
+          # 测试内的长 JSON / SSE 字面量无法合理折行，豁免行宽检查。
+          - lll
 
 formatters:
   enable:
