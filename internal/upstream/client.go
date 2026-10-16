@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -822,6 +823,31 @@ func New() *Client {
 	}
 	c.SanitizeFingerprints.Store(true)
 	return c
+}
+
+// SetDialer 替换出站底层拨号器（代理池接入点，issue #15）。base 为 nil 时回落
+// 内置直连拨号器。保留 writeDeadlineConn 写 deadline 包装（连接层加固不回退）。
+// 装配期调用（首次请求前）；HTTP 与 ChatHTTP 共用同一 Transport，设置一次即覆盖两者。
+func (c *Client) SetDialer(base func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	if base == nil {
+		base = newDialer().DialContext
+	}
+	wt := writeTimeout
+	wrap := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := base(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &writeDeadlineConn{Conn: conn, writeTimeout: wt}, nil
+	}
+	if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
+		tr.DialContext = wrap
+	}
+	if c.ChatHTTP != nil {
+		if tr, ok := c.ChatHTTP.Transport.(*http.Transport); ok {
+			tr.DialContext = wrap
+		}
+	}
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。

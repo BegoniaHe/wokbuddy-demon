@@ -54,7 +54,8 @@
     "passthrough_ip": false,
     "rotate_max": 3,
     "rotate_budget": "0",
-    "rotate_status_codes": []
+    "rotate_status_codes": [],
+    "proxies": []
   },
   "features": {
     "sanitize_blacklist_fingerprints": true
