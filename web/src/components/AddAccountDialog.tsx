@@ -8,7 +8,7 @@ import { Tabs } from '@/components/ui/tabs';
 import { Modal, ModalBody, ModalFooter, ModalHeader, ModalTitle } from '@/components/ui/dialog';
 
 type Phase = 'pick' | 'load' | 'ready' | 'done' | 'err';
-type Tab = 'login' | 'import';
+type Tab = 'login' | 'import' | 'secure';
 
 export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const qc = useQueryClient();
@@ -20,6 +20,9 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   const [doneMsg, setDoneMsg] = useState('');
   const [importMsg, setImportMsg] = useState('');
   const [importErr, setImportErr] = useState('');
+  const [secPass, setSecPass] = useState('');
+  const [secMsg, setSecMsg] = useState('');
+  const [secErr, setSecErr] = useState('');
   const stateRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
 
@@ -39,6 +42,9 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
       setDoneMsg('');
       setImportMsg('');
       setImportErr('');
+      setSecPass('');
+      setSecMsg('');
+      setSecErr('');
       stateRef.current = null;
       stopPoll();
     } else {
@@ -110,6 +116,59 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
     }
   };
 
+  const onSecureExport = async () => {
+    setSecMsg('');
+    setSecErr('');
+    if (secPass.length < 8) {
+      setSecErr('密码至少 8 位');
+      return;
+    }
+    const h: Record<string, string> = { 'Content-Type': 'application/json' };
+    const k = getKey();
+    if (k) h['Authorization'] = 'Bearer ' + k;
+    try {
+      const r = await fetch('/panel/api/export/encrypted', { method: 'POST', headers: h, body: JSON.stringify({ password: secPass }) });
+      if (!r.ok) {
+        const d = (await r.json().catch(() => ({}))) as { error?: string };
+        throw new Error(d.error || 'HTTP ' + r.status);
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'wokbuddy-accounts.wbenc.json';
+      a.click();
+      URL.revokeObjectURL(url);
+      setSecMsg('已导出加密备份文件');
+    } catch (e) {
+      setSecErr('导出失败：' + (e as Error).message);
+    }
+  };
+
+  const onSecureImport = async (file: File) => {
+    setSecMsg('');
+    setSecErr('');
+    if (secPass.length < 8) {
+      setSecErr('请先输入至少 8 位密码');
+      return;
+    }
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('password', secPass);
+    const h: Record<string, string> = {};
+    const k = getKey();
+    if (k) h['Authorization'] = 'Bearer ' + k;
+    try {
+      const r = await fetch('/panel/api/import/encrypted', { method: 'POST', body: fd, headers: h });
+      const d = (await r.json()) as { error?: string; imported?: number; skipped?: number };
+      if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+      setSecMsg('导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : ''));
+      void qc.invalidateQueries({ queryKey: ['overview'] });
+    } catch (e) {
+      setSecErr('导入失败：' + (e as Error).message);
+    }
+  };
+
   return (
     <Modal open={open} onOpenChange={onOpenChange}>
       <ModalHeader>
@@ -121,6 +180,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
             items={[
               { value: 'login', label: '浏览器登录' },
               { value: 'import', label: '导入 JSON' },
+              { value: 'secure', label: '加密备份' },
             ]}
           />
         </div>
@@ -153,7 +213,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
             {phase === 'done' ? <div className="text-sm text-ok">{doneMsg}</div> : null}
             {phase === 'err' ? <div className="text-sm text-bad">{errMsg}</div> : null}
           </>
-        ) : (
+        ) : tab === 'import' ? (
           <>
             <div className="mb-2 text-2xs text-ink-3">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
             <Input
@@ -168,6 +228,37 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
             />
             {importMsg ? <div className="text-sm text-ok">{importMsg}</div> : null}
             {importErr ? <div className="text-sm text-bad">{importErr}</div> : null}
+          </>
+        ) : (
+          <>
+            <div className="mb-2 text-2xs text-ink-3">
+              AES-256-GCM 加密的账号备份（含登录态 token）。设置密码后导出为加密文件；导入需同一密码。密码不会写入文件，也无法找回。
+            </div>
+            <Input
+              type="password"
+              placeholder="备份密码（至少 8 位）"
+              value={secPass}
+              onChange={(e) => setSecPass(e.target.value)}
+              className="mb-2"
+            />
+            <div className="mb-2 flex items-center gap-2">
+              <Button variant="primary" onClick={() => void onSecureExport()}>
+                导出加密备份
+              </Button>
+              <span className="text-2xs text-ink-3">或选择备份文件导入：</span>
+            </div>
+            <Input
+              type="file"
+              accept=".json"
+              className="mb-2 py-1.5"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) void onSecureImport(f);
+                e.target.value = '';
+              }}
+            />
+            {secMsg ? <div className="text-sm text-ok">{secMsg}</div> : null}
+            {secErr ? <div className="text-sm text-bad">{secErr}</div> : null}
           </>
         )}
       </ModalBody>
