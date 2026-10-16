@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import { fmtMs, fmtTok } from '@/lib/format';
+import { fmtClockTime, fmtMs, fmtTok } from '@/lib/format';
 import {
   fmtBytes,
   reqCreditCell,
@@ -236,7 +236,7 @@ export function LogsView() {
           ) : (
             logEntries.map((e, i) => {
               const lvl = /error|失败|错误/.test(e.text) ? 'text-bad' : /warn|冷却|熔断/.test(e.text) ? 'text-warn' : '';
-              const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+              const t = e.ts ? fmtClockTime(e.ts) : '';
               return (
                 <span key={i} className={cn('block', lvl)}>
                   {ch === 'all' ? (
@@ -263,7 +263,7 @@ export function LogsView() {
 }
 
 function RequestRow({ e }: { e: RequestEntry }) {
-  const when = e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const when = fmtClockTime(e.time);
   const tone = reqOutcomeTone(e);
   const muted = <span className="text-ink-3">—</span>;
   return (

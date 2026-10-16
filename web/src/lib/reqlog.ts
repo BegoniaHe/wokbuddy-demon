@@ -1,5 +1,5 @@
 // 请求记录格式化与筛选（纯函数，便于测试）。
-import { fmtMs, fmtTok, trimFixed } from '@/lib/format';
+import { fmtClockTime, fmtMs, fmtTok, trimFixed } from '@/lib/format';
 
 export interface RequestEntry {
   time?: string;
@@ -88,7 +88,7 @@ export function reqMatch(e: RequestEntry | undefined, f: ReqFilter): boolean {
 }
 
 export function requestLogText(e: RequestEntry | undefined): string {
-  const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const when = fmtClockTime(e && e.time);
   const token =
     Number((e && e.total_tokens) || 0) ||
     Number((e && e.prompt_tokens) || 0) + Number((e && e.completion_tokens) || 0);
