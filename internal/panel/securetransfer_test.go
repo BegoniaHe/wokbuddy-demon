@@ -108,6 +108,24 @@ func TestExportImportEncryptedEndToEnd(t *testing.T) {
 	}
 }
 
+// TestImportEncryptedRejectsOversized 超过请求体上限的文件在解析前即被拒（issue #30 复审）。
+func TestImportEncryptedRejectsOversized(t *testing.T) {
+	pn, _, _ := newSecurePanel(t)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "big.json")
+	fw.Write(bytes.Repeat([]byte("x"), secureMaxUploadBytes+1))
+	mw.WriteField("password", "correct horse battery")
+	mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/import/encrypted", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	pn.importEncrypted(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+}
+
 func TestImportEncryptedWrongPassword(t *testing.T) {
 	pn, _, _ := newSecurePanel(t)
 	env, _ := encryptPayload("right-password", []byte(`[]`))

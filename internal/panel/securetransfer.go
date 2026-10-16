@@ -33,6 +33,10 @@ const (
 	// secureMaxIter 解密侧上限：拒绝畸形文件声明的超大迭代（防 CPU DoS）。
 	secureMaxIter = 5_000_000
 	secureMinPass = 8
+	// secureMaxUploadBytes 加密导入请求体上限（防无界读；正常导出远小于此）。
+	// ParseMultipartForm 的 maxMemory 只决定内存/临时文件切分，不限制大小，
+	// 故在解析前用 http.MaxBytesReader 兜住整个请求体。
+	secureMaxUploadBytes = 8 << 20
 )
 
 // errSecureDecrypt 通用解密失败：不区分「密码错」与「文件损坏」（避免侧信道）。
@@ -213,6 +217,7 @@ func (p *Panel) exportEncrypted(w http.ResponseWriter, r *http.Request) {
 //
 // 返回 {ok, total, imported, skipped, errors}。
 func (p *Panel) importEncrypted(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, secureMaxUploadBytes)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
