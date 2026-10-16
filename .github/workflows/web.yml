@@ -1,0 +1,49 @@
+name: web
+
+# 前端工程门禁（web/，Rsbuild + React + Tailwind）：
+#   - 类型检查（tsc --noEmit）、单元测试（vitest）、生产构建
+#   - 断言提交进仓库的 internal/panel/dist 与 web/ 源码一致（重新构建后零 diff）
+#   - push main / PR / 手动触发；PR 仅触碰前端或产物时才跑
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "web/**"
+      - "internal/panel/dist/**"
+      - ".github/workflows/web.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install deps
+        working-directory: web
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        working-directory: web
+        run: bun run typecheck
+      - name: Unit tests
+        working-directory: web
+        run: bun run test
+      - name: Build
+        working-directory: web
+        run: bun run build
+      - name: Assert committed dist matches source
+        run: |
+          if ! git diff --exit-code -- internal/panel/dist; then
+            echo "::error::internal/panel/dist 与 web/ 源码不一致；请在 web/ 下运行 'bun run build' 并提交产物"
+            exit 1
+          fi

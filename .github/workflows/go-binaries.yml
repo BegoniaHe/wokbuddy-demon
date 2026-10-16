@@ -36,7 +36,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      # ubuntu runner 自带 node → panel 包的 JS 运行时冒烟测试（TestAppJSTopLevelSmoke）会真实执行
+      # 面板前端产物 internal/panel/dist 已提交进仓库，panel 包的静态资源测试无需 node。
       - run: go test ./...
 
   build:

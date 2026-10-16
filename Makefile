@@ -17,6 +17,7 @@ LDFLAGS  := -s -w -X main.appVersion=$(VERSION)
 
 .PHONY: all build build-all build-tools run dev restart stop status logs config \
 	test test-short test-race bench cover lint fmt fmt-check vet tidy clean ci \
+	web web-install web-dev web-check web-check-dist \
 	docker-build docker-up docker-down docker-logs help
 
 # 默认：格式化 + 静态检查 + 测试 + 构建
@@ -35,6 +36,8 @@ help:
 	@echo "  make build-all    构建全部二进制（server/signin/login/credit）"
 	@echo "  make test         全量测试      make test-short  快速测试"
 	@echo "  make lint/fmt     静态检查 / 格式化"
+	@echo "  make web          构建前端（web/ → internal/panel/dist，需 Bun）"
+	@echo "  make web-dev      前端开发服务器   make web-check  前端类型检查 + 单测"
 	@echo "  make docker-up    构建并后台启动 Docker 服务"
 
 # ---------------------------------------------------------------------------
@@ -43,6 +46,29 @@ help:
 
 build:
 	go build $(PKG)
+
+# 前端工程（web/，Rsbuild + React + Tailwind）：产物输出到 internal/panel/dist，
+# 随 go:embed 打进二进制。dist 已提交进仓库，故 `go build` 本身无需 node/bun；
+# 仅改动前端源码时才需重新构建。依赖 Bun（https://bun.sh）。
+BUN ?= bun
+
+web:
+	cd web && $(BUN) install --frozen-lockfile && $(BUN) run build
+
+web-install:
+	cd web && $(BUN) install
+
+web-dev:
+	cd web && $(BUN) run dev
+
+web-check:
+	cd web && $(BUN) run typecheck && $(BUN) run test
+
+# 校验提交的 dist 与 web/ 源码一致（CI 用：重新构建后要求零 diff）。
+web-check-dist: web
+	@git diff --exit-code -- internal/panel/dist || \
+		(echo "internal/panel/dist 与 web/ 源码不一致，请运行 'make web' 后提交产物"; exit 1)
+
 
 # 一次编译全部二进制（与 Dockerfile 同口径）。
 build-all: build-tools

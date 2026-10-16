@@ -12,6 +12,8 @@ scripts/__pycache__/
 /signin_bin
 # 真实配置不进镜像（镜像默认用 config.example.json，生产以挂载卷覆盖）
 config.json
+# 前端依赖不进构建上下文（产物 internal/panel/dist 已提交，随源码进镜像）
+web/node_modules/
 PLAN.md
 SPEC.md
 LOOP.md
