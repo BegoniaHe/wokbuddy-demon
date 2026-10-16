@@ -1,0 +1,122 @@
+name: nightly
+
+# 滚动更新的 nightly 构建：二进制（五平台，存 artifact）+ 多架构镜像（:nightly）。
+# 本项目无版本号、不做带版本的 Release；nightly 是唯一的发布产物形态。
+# 触发：每日 03:00 UTC 定时 + 手动。产物保留 14 天。
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  APP_VERSION_PKG: main
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, ext: .zip }
+          - { goos: linux, goarch: amd64, ext: .tar.gz }
+          - { goos: linux, goarch: arm64, ext: .tar.gz }
+          - { goos: darwin, goarch: amd64, ext: .tar.gz }
+          - { goos: darwin, goarch: arm64, ext: .tar.gz }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: 计算 nightly 构建标识
+        id: ver
+        run: echo "v=nightly-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: 构建（注入构建标识）
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          BIN="wokbuddy-demon${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          go build -trimpath \
+            -ldflags "-s -w -X ${APP_VERSION_PKG}.appVersion=${{ steps.ver.outputs.v }}" \
+            -o "$BIN" ./cmd/server
+
+      - name: 断言构建标识
+        run: |
+          BIN="wokbuddy-demon${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          if ! grep -qa "${{ steps.ver.outputs.v }}" "$BIN"; then
+            echo "::error::binary missing build id ${{ steps.ver.outputs.v }}"
+            exit 1
+          fi
+          echo "build id assert OK: ${{ steps.ver.outputs.v }}"
+
+      - name: 打包（windows=zip，其余=tar.gz）
+        run: |
+          V="${{ steps.ver.outputs.v }}"
+          case "${{ matrix.goos }}" in
+            windows)
+              NAME="wokbuddy-demon-${V}-windows-amd64.zip"
+              zip -q "$NAME" wokbuddy-demon.exe config.example.json README.md
+              ;;
+            *)
+              NAME="wokbuddy-demon-${V}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
+              tar czf "$NAME" wokbuddy-demon config.example.json README.md
+              ;;
+          esac
+          echo "name=$NAME" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.name }}
+          path: ${{ env.name }}
+          retention-days: 14
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU（arm64 交叉模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算 nightly 构建标识
+        id: ver
+        run: echo "v=nightly-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push nightly image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:nightly
+          build-args: |
+            VERSION=${{ steps.ver.outputs.v }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # 关闭 provenance attestation：避免 ghcr 页面出现 unknown/unknown 架构条目
+          provenance: false

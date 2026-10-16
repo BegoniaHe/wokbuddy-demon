@@ -1,0 +1,28 @@
+name: Dependency Review
+
+# 阻止引入已知漏洞依赖的 PR。仅在依赖面变动时触发，省 CI 配额。
+on:
+  pull_request:
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  dependency-review:
+    name: Block vulnerable dependency additions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v5.0.0
+        with:
+          fail-on-severity: low
+          fail-on-scopes: runtime,development,unknown
