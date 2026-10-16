@@ -18,6 +18,12 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
+// 归一化后的账号域取值：realm 字段与 Realm()/ResolveRealm 的返回值恒为二者之一。
+const (
+	realmCN     = "cn"
+	realmGlobal = "global"
+)
+
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
 	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
@@ -121,12 +127,12 @@ func (a *Auth) Realm() string {
 // 改写，故读取必须与写方同锁（理由见 AccessTokenValue 注释）。
 func (a *Auth) realmLocked() string {
 	if !globalEnabled.Load() {
-		return "cn"
+		return realmCN
 	}
-	if strings.TrimSpace(a.realm) == "global" || isGlobalDomain(a.Domain) {
-		return "global"
+	if strings.TrimSpace(a.realm) == realmGlobal || isGlobalDomain(a.Domain) {
+		return realmGlobal
 	}
-	return "cn"
+	return realmCN
 }
 
 // ResolveRealm 归一化 realm（cn/global）：显式非空优先，否则按原始 domain 推断
@@ -137,9 +143,9 @@ func ResolveRealm(explicit, domain string) string {
 		return r
 	}
 	if isGlobalDomain(domain) {
-		return "global"
+		return realmGlobal
 	}
-	return "cn"
+	return realmCN
 }
 
 // BackfillRealm 为缺省 realm 标识的账号持久化补标识：a.realm 为空时按「原始 domain 推断」
@@ -174,7 +180,7 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 		return false, errors.New("nil auth")
 	}
 	switch strings.TrimSpace(realm) {
-	case "cn", "global":
+	case realmCN, realmGlobal:
 	default:
 		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
 	}
@@ -188,7 +194,7 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 }
 
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
-func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
+func (a *Auth) IsGlobal() bool { return a.Realm() == realmGlobal }
 
 // IsEnterprise 报告账号是否为企业版（auth 文件带非空 enterpriseId）。
 //
@@ -386,7 +392,7 @@ func LoadDir(dir string) ([]*Auth, error) {
 			if changed, r := a.BackfillRealm(); changed {
 				if err := a.SaveAtomic(); err != nil {
 					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
-				} else if r == "global" {
+				} else if r == realmGlobal {
 					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
 				}
 			}

@@ -55,6 +55,9 @@ const (
 	globalDesktopReleaseDate = int64(1791115438867) // 2026-10-04T12:03:58.867Z
 )
 
+// desktopLocal 桌面端事件中 source/mode 字段的本地标记值（官方分发端恒发此值）。
+const desktopLocal = "LOCAL"
+
 // desktopBuild 官方桌面分发包构建指纹（版本 + commit + releaseDate）。
 type desktopBuild struct {
 	version     string
@@ -177,7 +180,7 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 	}
 	return []DesktopEvent{
 		mk("agent_task_created", map[string]any{
-			"source": "LOCAL", "name": "working", "task_target": "local", "mode": "craft",
+			"source": desktopLocal, "name": "working", "task_target": "local", "mode": "craft",
 			"requestModelId": modelID, "requestModelName": modelName,
 			"has_repo": false, "repo_type": "none", "workspace_type": "empty",
 			"has_connector": false, "connector_types": []any{},
@@ -268,7 +271,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 func DesktopBuddyAppSequence(buddyID, buddyName string) []DesktopEvent {
 	mk := func(code string, extra map[string]any) DesktopEvent {
 		ev := DesktopEvent{
-			"eventCode": code, "mode": "LOCAL",
+			"eventCode": code, "mode": desktopLocal,
 			"buddyId": buddyID, "buddyName": buddyName,
 		}
 		for k, v := range extra {
@@ -292,7 +295,7 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 		"eventCode": "automated_task_create_suc", "name": name,
 		"source": "manually", "modelId": "fast-model", "modelIsThinking": true,
 		"connectorCount": 0, "skills": "", "skillCount": 0,
-		"scheduleType": "once", "mode": "LOCAL",
+		"scheduleType": "once", "mode": desktopLocal,
 	}
 }
 
@@ -484,6 +487,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	}
 	defer resp.Body.Close()
 	if os.Getenv("WB2A_DEBUG_CHAT") != "" {
+		//nolint:forbidigo // WB2A_DEBUG_CHAT 调试输出，非库内调试残留。
 		fmt.Printf("[dbg] status=%d enc=%q\n", resp.StatusCode, resp.Header.Get("Content-Encoding"))
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -541,6 +545,8 @@ func (c *Client) setDesktopExpertHeaders(req *http.Request, a *auth.Auth, conver
 }
 
 // debugChatRequest 调试输出请求 URL 与全部请求头（仅 WB2A_DEBUG_CHAT 非空时）。
+//
+//nolint:forbidigo // 调试专用输出：仅 WB2A_DEBUG_CHAT 显式开启时打印到终端，非库内调试残留。
 func debugChatRequest(req *http.Request) {
 	fmt.Printf("[dbg] URL=%s\n", req.URL)
 	for k := range req.Header {
@@ -598,6 +604,8 @@ func scanBufferedRequestID(buf []byte, searchFrom int) (id string, matched bool,
 }
 
 // debugChatRead 调试输出单次读取的字节（仅 WB2A_DEBUG_CHAT 非空时）。
+//
+//nolint:forbidigo // 调试专用输出：仅 WB2A_DEBUG_CHAT 显式开启时打印到终端，非库内调试残留。
 func debugChatRead(chunk []byte) {
 	if os.Getenv("WB2A_DEBUG_CHAT") == "" {
 		return
@@ -610,6 +618,8 @@ func debugChatRead(chunk []byte) {
 }
 
 // debugChatID 调试输出匹配到的 id（仅 WB2A_DEBUG_CHAT 非空时）。
+//
+//nolint:forbidigo // 调试专用输出：仅 WB2A_DEBUG_CHAT 显式开启时打印到终端，非库内调试残留。
 func debugChatID(id string) {
 	if os.Getenv("WB2A_DEBUG_CHAT") == "" {
 		return
@@ -643,7 +653,7 @@ func DesktopExpertSummonSequence(e MarketExpert) []DesktopEvent {
 		{
 			"eventCode": "expert_summon_click", "id": e.ExpertID, "name": e.DisplayNameZH,
 			"expertTitle": e.ProfessionZH, "type": "expert-all", "position": 0,
-			"expertType": e.ExpertType, "version": ver, "mode": "LOCAL",
+			"expertType": e.ExpertType, "version": ver, "mode": desktopLocal,
 		},
 		{
 			"eventCode": "expert_summoned", "id": e.ExpertID, "name": e.DisplayNameZH,
@@ -664,7 +674,7 @@ func DesktopExpertActualUseEvent(e MarketExpert, conversationID, requestID strin
 // 对齐真实样本 Sunny row 868：轻量云专家使用时 mode=LOCAL、type 为空、cost=0）。
 func DesktopExpertActualUseLocal(e MarketExpert, conversationID, requestID string) DesktopEvent {
 	ev := desktopExpertActualUse(e, conversationID, requestID)
-	ev["mode"] = "LOCAL"
+	ev["mode"] = desktopLocal
 	return ev
 }
 

@@ -23,6 +23,9 @@ import (
 
 const schoolBase = "/portal/activity/school"
 
+// mpExtVersion 小程序自身版本号（覆盖 mpEventBase 默认的 2.4.0）。
+const mpExtVersion = "2.2.8"
+
 // schoolJSON 学院活动 API 请求（剥信封，业务 code≠0 返回带 msg 的 error）。
 func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]any, out any) error {
 	var raw []byte
@@ -171,7 +174,7 @@ func MiniExpertUseEvent(expertID, expertName, expertType string) map[string]any 
 	}
 	return map[string]any{
 		"eventCode": "expert_actual_use", "reportDelay": 0,
-		"extVersion": "2.2.8", "source": "mini_program",
+		"extVersion": mpExtVersion, "source": "mini_program",
 		"id": expertID, "name": expertID,
 		"expertTitle": expertName, "type": "send_message",
 		"characterCount": 12, "expertType": expertType,
@@ -202,7 +205,7 @@ func MiniPlaybookEvents(caseID, caseName string) []map[string]any {
 	}
 	cta := map[string]any{
 		"eventCode": "playbook_cta_click", "source": "discover", "position": 1,
-		"extVersion": "2.2.8",
+		"extVersion": mpExtVersion,
 	}
 	for k, v := range base {
 		cta[k] = v
@@ -211,7 +214,7 @@ func MiniPlaybookEvents(caseID, caseName string) []map[string]any {
 		"eventCode": "playbook_prompt_send", "source": "discover",
 		"promptLength": 96, "isOfficial": 1,
 		"conversationId": "wb2api-mp-pb-" + clientToken(),
-		"extVersion":     "2.2.8",
+		"extVersion":     mpExtVersion,
 	}
 	for k, v := range base {
 		send[k] = v

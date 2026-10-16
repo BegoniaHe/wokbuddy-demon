@@ -1113,9 +1113,9 @@ func (f *chatFlow) handleNonStreamSuccess(acct *auth.Auth, rc io.ReadCloser, att
 			f.bareModel, m, len(f.declaredTools))
 	}
 	credit, total, hasCredit := usageCreditTotal(resp)
-	if usage, ok := resp["usage"].(map[string]any); ok {
-		if hit, okH := upstream.UsageCacheHitTokens(usage); okH {
-			miss, _ := upstream.UsageCacheMissTokens(usage)
+	if usageMap, ok := resp["usage"].(map[string]any); ok {
+		if hit, okH := upstream.UsageCacheHitTokens(usageMap); okH {
+			miss, _ := upstream.UsageCacheMissTokens(usageMap)
 			f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = int64(hit), int64(miss), true
 		}
 	}
@@ -1361,12 +1361,12 @@ func promptTooLongMessage(body string) string {
 // usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
 // 任一字段缺失/非法 → ok=false（不记录）。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
-	usage, _ := resp["usage"].(map[string]any)
-	if usage == nil {
+	usageMap, _ := resp["usage"].(map[string]any)
+	if usageMap == nil {
 		return 0, 0, false
 	}
-	c, _ := usage["credit"].(float64)
-	t, _ := usage["total_tokens"].(float64)
+	c, _ := usageMap["credit"].(float64)
+	t, _ := usageMap["total_tokens"].(float64)
 	if t <= 0 {
 		return 0, 0, false
 	}

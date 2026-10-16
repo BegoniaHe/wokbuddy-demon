@@ -13,8 +13,10 @@ linters:
     - bidichk
     - bodyclose
     - canonicalheader
+    - containedctx
     - copyloopvar
     - cyclop
+    - decorder
     - dogsled
     - dupl
     - durationcheck
@@ -26,6 +28,7 @@ linters:
     - errorlint
     - exhaustive
     - fatcontext
+    - forbidigo
     - forcetypeassert
     - gocheckcompilerdirectives
     - gocognit
@@ -34,16 +37,21 @@ linters:
     - goprintffuncname
     - gosec
     - govet
+    - grouper
     - inamedparam
     - ineffassign
     - interfacebloat
     - intrange
     - lll
+    - maintidx
     - makezero
     - mirror
     - misspell
+    - musttag
+    - nakedret
     - nestif
     - nilerr
+    - nilnesserr
     - nilnil
     - noctx
     - nolintlint
@@ -133,6 +141,15 @@ linters:
     # interfacebloat：接口方法数上限，超过即拆分为更小的角色接口。
     interfacebloat:
       max: 10
+    # 以下为补充的「结构/异味」护栏（当前均 0 命中，作为回归拦截）：
+    #   containedctx 禁止把 context.Context 收进结构体（应显式传参）；
+    #   decorder     约束声明顺序（const/var/type/func）；
+    #   forbidigo    禁止库内散落的 fmt.Print* 调试输出（cmd/* CLI 输出另行豁免）；
+    #   grouper      约束同类声明聚组；
+    #   maintidx     可维护性指数下限（与 cyclop/gocognit 同口径）；
+    #   musttag      序列化为 JSON 的结构体须带 tag；
+    #   nakedret     禁止长函数使用裸 return；
+    #   nilnesserr   避免 nil 检查后返回语义不一致的 error。
     revive:
       enable-all-rules: false
       rules:
@@ -156,6 +173,16 @@ linters:
         - name: superfluous-else
         - name: unreachable-code
         - name: redefines-builtin-id
+        - name: use-any
+        - name: early-return
+        - name: use-errors-new
+        - name: string-of-int
+        - name: modifies-value-receiver
+        - name: import-shadowing
+        - name: unnecessary-stmt
+        - name: max-control-nesting
+        - name: datarace
+        - name: deep-exit
     staticcheck:
       checks:
         - all
@@ -194,8 +221,14 @@ linters:
           - revive
           - predeclared
           - usetesting
+          # 测试 helper 常把 ctx 收进结构体模拟真实 reader/客户端，非生产代码的 ctx 反模式。
+          - containedctx
           # 测试内的长 JSON / SSE 字面量无法合理折行，豁免行宽检查。
           - lll
+      # CLI 工具（cmd/*）向终端打印是其正常输出，非库内调试残留。
+      - path: ^cmd/
+        linters:
+          - forbidigo
 
 formatters:
   enable:
