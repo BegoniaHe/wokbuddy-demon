@@ -149,6 +149,22 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	}
 }
 
+// sseUsageFrame SSE data 帧的 usage 子结构。字段用指针以区分「缺失」与「零值」。
+type sseUsageFrame struct {
+	PromptTokens         *int     `json:"prompt_tokens"`
+	CompletionTokens     *int     `json:"completion_tokens"`
+	TotalTokens          *int     `json:"total_tokens"`
+	Credit               *float64 `json:"credit"`
+	PromptCacheHitTokens *int     `json:"prompt_cache_hit_tokens"`
+	PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
+}
+
+// sseChunkFrame SSE data 帧的最小解析形态：error 原文 + usage。
+type sseChunkFrame struct {
+	Error json.RawMessage `json:"error"`
+	Usage *sseUsageFrame  `json:"usage"`
+}
+
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
@@ -163,17 +179,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
-	var chunk struct {
-		Error json.RawMessage `json:"error"`
-		Usage *struct {
-			PromptTokens         *int     `json:"prompt_tokens"`
-			CompletionTokens     *int     `json:"completion_tokens"`
-			TotalTokens          *int     `json:"total_tokens"`
-			Credit               *float64 `json:"credit"`
-			PromptCacheHitTokens *int     `json:"prompt_cache_hit_tokens"`
-			PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
-		} `json:"usage"`
-	}
+	var chunk sseChunkFrame
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
 			s.errorFrame = true
@@ -183,29 +189,34 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if len(chunk.Error) > 0 {
 		s.errorFrame = true
 	}
-	if chunk.Usage.PromptTokens != nil {
+	s.applyUsage(chunk.Usage)
+}
+
+// applyUsage 把末帧 usage 的非空字段写入统计（缺失字段不动，保留上一帧值）。
+func (s *chatStatsReader) applyUsage(u *sseUsageFrame) {
+	if u.PromptTokens != nil {
 		s.hasPromptTokens = true
-		s.promptTokens = *chunk.Usage.PromptTokens
+		s.promptTokens = *u.PromptTokens
 	}
-	if chunk.Usage.CompletionTokens != nil {
+	if u.CompletionTokens != nil {
 		s.hasCompletionTokens = true
-		s.completionTokens = *chunk.Usage.CompletionTokens
+		s.completionTokens = *u.CompletionTokens
 	}
-	if chunk.Usage.TotalTokens != nil {
+	if u.TotalTokens != nil {
 		s.hasTotalTokens = true
-		s.totalTokens = *chunk.Usage.TotalTokens
+		s.totalTokens = *u.TotalTokens
 	}
-	if chunk.Usage.Credit != nil {
+	if u.Credit != nil {
 		s.hasCredit = true
-		s.credit = *chunk.Usage.Credit
+		s.credit = *u.Credit
 	}
-	if chunk.Usage.PromptCacheHitTokens != nil {
+	if u.PromptCacheHitTokens != nil {
 		s.hasCacheHit = true
-		s.cacheHit = *chunk.Usage.PromptCacheHitTokens
+		s.cacheHit = *u.PromptCacheHitTokens
 	}
-	if chunk.Usage.PromptCacheMissTok != nil {
+	if u.PromptCacheMissTok != nil {
 		s.hasCacheMiss = true
-		s.cacheMiss = *chunk.Usage.PromptCacheMissTok
+		s.cacheMiss = *u.PromptCacheMissTok
 	}
 }
 
@@ -286,37 +297,39 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	if !ok {
 		return delta
 	}
-	read := func(key string) (int64, bool) {
-		v, ok := u[key]
-		if !ok {
-			return 0, false
-		}
-		switch n := v.(type) {
-		case float64:
-			return int64(n), true
-		case float32:
-			return int64(n), true
-		case int:
-			return int64(n), true
-		case int64:
-			return n, true
-		case json.Number:
-			i, err := n.Int64()
-			return i, err == nil
-		default:
-			return 0, false
-		}
-	}
-	if n, ok := read("prompt_tokens"); ok {
+	if n, ok := readUsageInt(u, "prompt_tokens"); ok {
 		delta.HasPromptTokens, delta.PromptTokens = true, n
 	}
-	if n, ok := read("completion_tokens"); ok {
+	if n, ok := readUsageInt(u, "completion_tokens"); ok {
 		delta.HasCompletionTokens, delta.CompletionTokens = true, n
 	}
-	if n, ok := read("total_tokens"); ok {
+	if n, ok := readUsageInt(u, "total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
 	return delta
+}
+
+// readUsageInt 从 usage map 取一个整数字段，兼容 float/整型/json.Number 形态。
+func readUsageInt(u map[string]any, key string) (int64, bool) {
+	v, ok := u[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case float32:
+		return int64(n), true
+	case int:
+		return int64(n), true
+	case int64:
+		return n, true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	default:
+		return 0, false
+	}
 }
 
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
@@ -441,6 +454,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 // 避免破坏 SSE 逐帧刷新。
 type responseObserver struct {
 	http.ResponseWriter
+
 	status int
 }
 
@@ -504,48 +518,13 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
 	// 账号标签只补不截：超宽时宁可让该行变宽，也不丢昵称信息（昵称是排查的主线索）。
 	acct := logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
-	tokField := "-"
-	tokpsField := "-"
-	if toks >= 0 {
-		tokField = strconv.Itoa(toks)
-		// 速率与用量账本走同一个函数（扣掉 TTFB）。此前这里自己除 total，漏扣首
-		// token 等待，于是控制台流水行的 tok/s 与面板数字对不上（issue #34）——
-		// 本函数本来就收到了 ttfb，只是没拿它算速率。
-		if tps, ok := tokensPerSecond(int64(toks), total, ttfb); ok {
-			tokpsField = fmt.Sprintf("%.1ftok/s", tps)
-		} else {
-			tokpsField = "0.0tok/s"
-		}
-	}
+	tokField, tokpsField := tokFields(toks, total, ttfb)
 	ttfbMS := "-"
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	extra := ""
-	if requestID != "" {
-		if outcome == "" {
-			outcome = reqlog.OutcomeHTTPError
-			if status >= 200 && status < 300 {
-				outcome = reqlog.OutcomeSuccess
-			}
-		}
-		creditField := "-"
-		if hasCredit {
-			creditField = fmt.Sprintf("%.4f", credit)
-		}
-		extra = fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
-	}
-	// 调用来源：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后的客户端标签
-	// 并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只会取到 OpenAI/Python）。
-	// 两者都未采集时不追加，旧行格式保持不变。
-	src := ""
-	if clientIP != "" || userAgent != "" {
-		ua := "-"
-		if s := logfmt.ShortUA(userAgent); s != "" {
-			ua = `"` + s + `"`
-		}
-		src = fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
-	}
+	extra := extraFields(requestID, outcome, status, attempts, credit, hasCredit)
+	src := sourceFields(clientIP, userAgent)
 	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
@@ -560,6 +539,52 @@ func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, stat
 		extra,
 		src,
 	)
+}
+
+// tokFields 计算 tok 与 tok/s 两列（toks<0 = usage 缺失，两列均显示 "-"）。
+// 速率与用量账本走同一个函数（扣掉 TTFB），避免流水行与面板数字口径漂移（issue #34）。
+func tokFields(toks int, total, ttfb time.Duration) (tokField, tokpsField string) {
+	if toks < 0 {
+		return "-", "-"
+	}
+	tokField = strconv.Itoa(toks)
+	if tps, ok := tokensPerSecond(int64(toks), total, ttfb); ok {
+		return tokField, fmt.Sprintf("%.1ftok/s", tps)
+	}
+	return tokField, "0.0tok/s"
+}
+
+// extraFields 组装请求 ID / 结果 / 重试 / 积分扩展段；requestID 为空时返回空串
+// （旧行格式保持不变）。outcome 为空时按 status 兜底推断。
+func extraFields(requestID, outcome string, status, attempts int, credit float64, hasCredit bool) string {
+	if requestID == "" {
+		return ""
+	}
+	if outcome == "" {
+		outcome = reqlog.OutcomeHTTPError
+		if status >= 200 && status < 300 {
+			outcome = reqlog.OutcomeSuccess
+		}
+	}
+	creditField := "-"
+	if hasCredit {
+		creditField = fmt.Sprintf("%.4f", credit)
+	}
+	return fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
+}
+
+// sourceFields 组装调用来源段：IP 用可解析的裸值（便于 grep），UA 用 ShortUA 压缩后
+// 的客户端标签并加引号（标签内可能含空格，如 `OpenAI/Python 1.30.0` 只取 OpenAI/Python）。
+// 两者都未采集时返回空串，旧行格式保持不变。
+func sourceFields(clientIP, userAgent string) string {
+	if clientIP == "" && userAgent == "" {
+		return ""
+	}
+	ua := "-"
+	if s := logfmt.ShortUA(userAgent); s != "" {
+		ua = `"` + s + `"`
+	}
+	return fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
 }
 
 // cacheMissSignal 低命中率告警信号（issue #92 P1 轻量化）：同一模型此前观测到过
