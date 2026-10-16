@@ -79,13 +79,10 @@ func (m *metricsRegistry) observeRequestDuration(seconds float64, ok bool) {
 	hist.count++
 }
 
-// incRotation 记录一次换号；reason 为触发原因标签，空值回落 "other"。
+// incRotation 记录一次换号；reason 为触发原因标签（调用方保证非空）。
 func (m *metricsRegistry) incRotation(reason string) {
 	if m == nil {
 		return
-	}
-	if reason == "" {
-		reason = "other"
 	}
 	m.mu.Lock()
 	m.rotations[reason]++
@@ -135,8 +132,8 @@ func (h *Handler) writeModelMetrics(b *strings.Builder) {
 		return
 	}
 	rows := h.cfg.Usage.AggregateByModel()
+	// 每族样本连续输出（HELP/TYPE 紧邻其样本），符合 exposition 惯例。
 	writeHelpType(b, "wokbuddy_requests_total", "Total upstream request attempts by model and result.", "counter")
-	writeHelpType(b, "wokbuddy_tokens_total", "Total tokens by model and kind.", "counter")
 	for i := range rows {
 		row := &rows[i]
 		ok := row.Requests - row.Errors
@@ -145,6 +142,10 @@ func (h *Handler) writeModelMetrics(b *strings.Builder) {
 		}
 		writeSample(b, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "ok"), float64(ok))
 		writeSample(b, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "error"), float64(row.Errors))
+	}
+	writeHelpType(b, "wokbuddy_tokens_total", "Total tokens by model and kind.", "counter")
+	for i := range rows {
+		row := &rows[i]
 		writeSample(b, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "prompt"), float64(row.PromptTokens))
 		writeSample(b, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "completion"), float64(row.CompletionTok))
 		writeSample(b, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "total"), float64(row.TotalTokens))

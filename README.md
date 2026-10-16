@@ -225,6 +225,8 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `wokbuddy_request_duration_seconds{result}` | histogram | 上游尝试耗时（秒），按成功/失败分流（`result` = `ok` / `error`） |
 | `wokbuddy_upstream_rotations_total{reason}` | counter | 上游换号次数（`reason` 为触发分类；degrade 同号重试不计入） |
 
+`result` 口径：`ok` 表示本次上游尝试**拿到了 `usage`**（与面板用量账本同源），并非 HTTP 成功。客户端显式设置 `stream_options.include_usage=false` 时，即便 200 成功响应也会因无 usage 计入 `error`。
+
 账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram 与换号计数为进程内生命周期，重启清零。鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
 
 ## 配置说明
