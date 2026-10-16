@@ -1195,8 +1195,8 @@ func TestAPIKeyAuth(t *testing.T) {
 	}
 }
 
-// TestNamedKeyAuth 命名密钥只作用于 /v1/*：接受于 models/chat，拒绝于 /status；
-// 默认密钥照旧；撤销后立即失效；命中时计入该密钥的请求数。
+// TestNamedKeyAuth 命名密钥只作用于 /v1/*：接受于 models/chat，拒绝于 /status 与
+// /metrics（运维面只认默认密钥）；默认密钥照旧；撤销后立即失效；命中时计入该密钥的请求数。
 func TestNamedKeyAuth(t *testing.T) {
 	store := apikey.New("")
 	rec, raw, err := store.Create("client-a")
@@ -1225,7 +1225,9 @@ func TestNamedKeyAuth(t *testing.T) {
 	}{
 		{"命名密钥可用于 /v1/models", http.MethodGet, "/v1/models", raw, 200},
 		{"命名密钥不可用于 /status", http.MethodGet, "/status", raw, 401},
+		{"命名密钥不可用于 /metrics", http.MethodGet, "/metrics", raw, 401},
 		{"默认密钥可用于 /status", http.MethodGet, "/status", "secret", 200},
+		{"默认密钥可用于 /metrics", http.MethodGet, "/metrics", "secret", 200},
 		{"未知密钥被拒", http.MethodGet, "/v1/models", "sk-wb-nope", 401},
 	}
 	for _, c := range cases {
