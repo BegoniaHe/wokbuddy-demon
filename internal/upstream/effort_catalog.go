@@ -124,10 +124,10 @@ func globalEffortMap(remoteEfforts map[string][]string, remoteDefaults map[strin
 	efforts := make(map[string][]string, len(globalEffortFallback)+len(remoteEfforts))
 	defs := make(map[string]string, len(globalEffortFallback)+len(remoteDefaults))
 	// 静态兜底为基。
-	for id, cap := range globalEffortFallback {
-		efforts[id] = append([]string(nil), cap.efforts...)
-		if cap.defaultEffort != "" {
-			defs[id] = cap.defaultEffort
+	for id, fallback := range globalEffortFallback {
+		efforts[id] = append([]string(nil), fallback.efforts...)
+		if fallback.defaultEffort != "" {
+			defs[id] = fallback.defaultEffort
 		}
 	}
 	// 远端权威覆盖（仅当远端确实下发了该模型档位）。
