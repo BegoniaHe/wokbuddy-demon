@@ -2035,3 +2035,25 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
 	}
 }
+
+// TestChatModelBlockPlatformHint 模型全池阻塞且账号共享同一上游重置时刻 → hint 标注
+// platform-level（issue #29）。
+func TestChatModelBlockPlatformHint(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	reset := time.Now().Add(time.Hour)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.2", "6004 rate limited")
+	p.CooldownSoftForModel("u2", time.Minute, reset, "glm-5.2", "6004 rate limited")
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "platform-level") {
+		t.Errorf("model block hint should mark platform-level: %s", rec.Body)
+	}
+}

@@ -1425,7 +1425,13 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 	if !upstreamMsgPassed {
 		msg = "model is unavailable on every account (per-model cooldown), try another model"
 	}
-	hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", f.modelBlock.Count)
+	// 阻塞范围（issue #29）：平台级（上游统一限流，等上游恢复）与账号级（换号/等本号
+	// 恢复）对运维的处置完全不同，在 hint 里点明。
+	if f.modelBlock.Scope == pool.ModelBlockScopePlatform {
+		hint = fmt.Sprintf("model_blocked: upstream platform-level rate limit on this model (%d account(s) share the same reset)", f.modelBlock.Count)
+	} else {
+		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model (account-level)", f.modelBlock.Count)
+	}
 	if !f.modelBlock.Until.IsZero() {
 		hint += "; earliest unblock at " + f.modelBlock.Until.Format(time.RFC3339)
 	}

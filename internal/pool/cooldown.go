@@ -308,12 +308,35 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.dirty.Store(true)
 }
 
+// 模型级阻塞的范围（issue #29）：
+//   - platform：>=2 个被挡账号共享同一非零上游重置时刻 ResetAt——推断为上游**平台级**
+//     限流（同一时刻对全池解封），运维应等上游恢复；
+//   - account：各账号独立冷却 / 无重置时刻 / 仅单账号被挡——账号级问题，换号或等本号恢复。
+const (
+	ModelBlockScopePlatform = "platform"
+	ModelBlockScopeAccount  = "account"
+)
+
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
 type ModelBlockStatus struct {
 	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
 	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// Scope 阻塞范围：platform / account（见常量）。只读诊断，不参与选号。
+	Scope string
+	// SharedResetAt 平台级时的共享上游重置时刻（账号级为零值）。
+	SharedResetAt time.Time
+}
+
+// modelBlockScope 由被挡账号的重置时刻一致性推断阻塞范围：全部被挡账号（>=2）
+// 都带非零 ResetAt 且完全一致 → platform；否则 account。精确相等（无容差）是保守
+// 选择——上游给语义相同但毫秒级不同的时刻时会判账号级，不会误报平台级。
+func modelBlockScope(total, withReset, distinctResets int, shared time.Time) (string, time.Time) {
+	if total >= 2 && withReset == total && distinctResets == 1 && !shared.IsZero() {
+		return ModelBlockScopePlatform, shared
+	}
+	return ModelBlockScopeAccount, time.Time{}
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
@@ -339,6 +362,13 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	now := time.Now()
 
 	var st ModelBlockStatus
+	// 重置时刻一致性统计（issue #29）：distinct 用集合去重，withReset 计带非零
+	// ResetAt 的账号数，shared 记唯一值。
+	var (
+		withReset int
+		distinct  = make(map[time.Time]struct{})
+		shared    time.Time
+	)
 	for _, e := range p.byUID {
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的
 		// 证明不成立——否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」。
@@ -352,12 +382,18 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 		st.Count++
 		mc, ok := e.modelCooldowns[model]
 		st.mergeModelCooldown(mc, ok)
+		if ok && !mc.ResetAt.IsZero() {
+			withReset++
+			distinct[mc.ResetAt] = struct{}{}
+			shared = mc.ResetAt
+		}
 	}
 	if st.Count == 0 {
 		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。
 		return ModelBlockStatus{}
 	}
 	st.Blocked = true
+	st.Scope, st.SharedResetAt = modelBlockScope(st.Count, withReset, len(distinct), shared)
 	return st
 }
 
