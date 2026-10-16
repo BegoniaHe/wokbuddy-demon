@@ -333,6 +333,34 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 	}
 }
 
+// AggregateByModel 按裸模型名聚合全历史（跨 realm/uid/时间片），按 key 升序。
+func TestAggregateByModel(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 同一模型两个账号/两个域/两个时间片，应合并为一行。
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true}, true)
+	r.Add(now.Add(-2*time.Hour), "global", "uid2", "glm-5.2", Delta{PromptTokens: 10, HasPromptTokens: true}, false)
+	r.Add(now, "cn", "uid1", "claude-4.6", Delta{TotalTokens: 7, HasTotal: true}, true)
+
+	rows := r.AggregateByModel()
+	wantEq(t, "项数", len(rows), 2)
+	// 升序：claude-4.6 < glm-5.2。
+	wantEq(t, "rows[0].key", rows[0].Key, "claude-4.6")
+	wantEq(t, "claude requests", rows[0].Requests, int64(1))
+	wantEq(t, "glm requests", rows[1].Requests, int64(2))
+	wantEq(t, "glm errors", rows[1].Errors, int64(1))
+	wantEq(t, "glm prompt_tokens", rows[1].PromptTokens, int64(110))
+	wantEq(t, "glm completion_tokens", rows[1].CompletionTok, int64(50))
+	wantEq(t, "glm total_tokens(兜底 pt+ct)", rows[1].TotalTokens, int64(160))
+
+	// 空记录器返回空切片，非 nil。
+	empty := New("").AggregateByModel()
+	if empty == nil {
+		t.Fatal("空记录器应返回非 nil 空切片")
+	}
+	wantEq(t, "空切片长度", len(empty), 0)
+}
+
 // wantEq 断言 got == want，失败时用 label 指明字段。统一入口避免逐项 if 抬高
 // 测试函数复杂度，断言条件与原逐项检查等价。
 func wantEq[T comparable](t *testing.T, label string, got, want T) {

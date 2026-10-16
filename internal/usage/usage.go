@@ -599,6 +599,37 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	return snap
 }
 
+// AggregateByModel 返回按裸模型名分组的**全历史**累计（请求数/失败数/Token），
+// 供 /metrics 导出。与 SnapshotWindow 的区别：只保留 model 一维，恒为全部历史
+// （含已折叠日桶），不构造时序/账号/积分维度。与 SnapshotWindow 的整体拷贝不同，
+// 这里在锁内直接遍历聚合（模型维度小、聚合是纯 CPU），避免 maxBuckets 逼近上界时
+// 每次抓取拷贝数十 MB；代价是聚合期间阻塞写入，单次抓取量级可接受。
+// 空记录器返回空切片（非 nil），调用方无需判空。
+func (r *Recorder) AggregateByModel() []KeyedAgg {
+	if r == nil {
+		return []KeyedAgg{}
+	}
+	agg := make(map[string]*aggAcc)
+	r.mu.Lock()
+	for _, b := range r.buckets {
+		acc := agg[b.Model]
+		if acc == nil {
+			acc = &aggAcc{}
+			agg[b.Model] = acc
+		}
+		acc.add(b)
+	}
+	r.mu.Unlock()
+
+	out := make([]KeyedAgg, 0, len(agg))
+	for k, v := range agg {
+		out = append(out, KeyedAgg{Key: k, Agg: v.finish()})
+	}
+	// 按 key 升序，保证 /metrics 输出稳定（Prometheus 虽无序，但稳定输出便于 diff）。
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
 // inWindow 判断桶 scope 是否落在窗口 [from, to] 内（零值侧不设界）；windowed=false
 // 时全收（全部历史）。scope 解析失败的脏桶不进窗口聚合（也不该出现在任何口径里）。
 func inWindow(scope string, from, to time.Time, windowed bool) bool {
