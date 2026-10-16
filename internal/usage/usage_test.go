@@ -375,22 +375,23 @@ func TestTTFTAggregation(t *testing.T) {
 	wantEq(t, "avg_latency_ms", s.Totals.AvgLatencyMs, (2000.0+2500.0+100.0)/3)
 }
 
-// TestBackfillOverridesLocalDay 上游回填覆盖同 (天, realm, uid, model) 的本地桶，
-// 不与本地实时记录重复计数（issue #31）。
+// TestBackfillOverridesLocalDay 上游回填覆盖同 (天, realm, uid, model) 的请求数/积分，
+// 不与本地实时记录重复计数；token 等上游不提供的维度保留本地观测（issue #31）。
 func TestBackfillOverridesLocalDay(t *testing.T) {
 	r := New("")
 	now := time.Now()
 	day := now.Format("2006-01-02")
 	r.Add(now, "cn", "uid1", "glm-5.2", Delta{TotalTokens: 10, HasTotal: true, Credit: 1, HasCredit: true}, true)
 
-	n := r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "uid1", Model: "glm-5.2", Requests: 5, Credits: 9, Tokens: 50}})
+	n := r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "uid1", Model: "glm-5.2", Requests: 5, Credits: 9}})
 	if n != 1 {
 		t.Fatalf("backfill buckets=%d want 1", n)
 	}
 	s := r.Snapshot(0, nil)
 	wantEq(t, "requests(覆盖后)", s.Totals.Requests, int64(5))
 	wantEq(t, "credits(覆盖后)", s.Totals.Credits, 9.0)
-	wantEq(t, "total_tokens(覆盖后)", s.Totals.TotalTokens, int64(50))
+	// token 无法从上游逐笔接口恢复：覆盖请求数/积分后仍保留本地值（10），不被清零。
+	wantEq(t, "total_tokens(保留本地)", s.Totals.TotalTokens, int64(10))
 }
 
 // TestBackfillThenRealtimeNoDoubleCount 回填后同日的实时记录与 Rollup 折叠都不与
@@ -400,13 +401,13 @@ func TestBackfillThenRealtimeNoDoubleCount(t *testing.T) {
 	r := New("")
 	old := time.Now().Add(-100 * 24 * time.Hour) // 早于 hourlyKeep，可被 Rollup 折叠
 	day := old.Format("2006-01-02")
-	r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "u1", Model: "m", Requests: 5, Credits: 9, Tokens: 50}})
+	r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "u1", Model: "m", Requests: 5, Credits: 9}})
 	r.Add(old, "cn", "u1", "m", Delta{TotalTokens: 20, HasTotal: true, Credit: 2, HasCredit: true}, true)
 	r.Rollup(time.Now())
 	s := r.Snapshot(0, nil)
 	wantEq(t, "requests(回填+实时)", s.Totals.Requests, int64(6))
 	wantEq(t, "credits(回填+实时)", s.Totals.Credits, 11.0)
-	wantEq(t, "total_tokens(回填+实时)", s.Totals.TotalTokens, int64(70))
+	wantEq(t, "total_tokens(回填+实时)", s.Totals.TotalTokens, int64(20))
 }
 
 // wantEq 断言 got == want，失败时用 label 指明字段。统一入口避免逐项 if 抬高

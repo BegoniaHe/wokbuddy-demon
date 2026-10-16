@@ -280,11 +280,15 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
 		// 优雅停机（issue #19）：等待在途 SSE 长流排空，最多 ShutdownStreamGrace；
 		// 超时则记录未排空流数后由进程退出强制结束，不静默丢弃。
+		// 注意：Shutdown 关闭 listener 后 ListenAndServe 会立即返回 ErrServerClosed，
+		// 但排空等待仍在进行，main 必须等 shutdownDone 再退出，否则在途长流被直接丢弃。
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), server.ShutdownStreamGrace)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
@@ -298,6 +302,8 @@ func main() {
 		log.Printf("http: %v", err)
 		return
 	}
+	// ErrServerClosed 由 Shutdown 触发：等排空 goroutine 收尾后再退出。
+	<-shutdownDone
 	log.Printf("bye")
 }
 

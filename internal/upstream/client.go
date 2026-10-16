@@ -199,7 +199,6 @@ var (
 	// 含「已过期」但非活动态）。文案按实测补充（见 issue #27）。
 	inactiveCheckinMarkers = []string{
 		"活动未开启", "活动未开放", "活动已结束", "活动已过期",
-		"inactive",
 	}
 	badParamsMarkerCode = `"code":11101`
 )

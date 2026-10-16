@@ -88,7 +88,7 @@ func (p *Pool) RecordModelHealth(uid, model string, ttftMs int64, hasTTFT, ok bo
 	if e.health == nil {
 		e.health = make(map[string]*modelHealth)
 	}
-	now := time.Now()
+	now := p.now()
 	mh := e.health[model]
 	if mh == nil {
 		mh = &modelHealth{}

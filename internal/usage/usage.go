@@ -197,6 +197,9 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 }
 
 // BackfillRow 上游逐笔用量按天聚合的一行（issue #31）。
+//
+// 只承载上游逐笔接口能提供的权威维度（请求数 / 积分）；token、延迟、缓存等维度
+// 上游不返回，回填时保留本地观测（见 applyBackfillLocked），故不在此声明。
 type BackfillRow struct {
 	Day      string // 本地日历日 "2006-01-02"
 	Realm    string
@@ -204,12 +207,12 @@ type BackfillRow struct {
 	Model    string
 	Requests int64
 	Credits  float64
-	Tokens   int64
 }
 
 // Backfill 用上游权威数据覆盖指定 (天, realm, uid, model) 的用量桶：删除该键的本地
 // 小时桶与日桶后写入标记 Synced 的日桶，避免与本地实时记录重复计数（issue #31）。
-// 返回覆盖的桶数。仅显式触发时调用。
+// 仅覆盖上游能提供的维度（请求数 / 积分），token / 延迟 / 缓存等本地维度在覆盖前
+// 聚合保留，避免把无法从上游恢复的本地观测清零。返回覆盖的桶数。仅显式触发时调用。
 func (r *Recorder) Backfill(rows []BackfillRow) int {
 	if r == nil {
 		return 0
@@ -230,7 +233,8 @@ func (r *Recorder) Backfill(rows []BackfillRow) int {
 	return n
 }
 
-// applyBackfillLocked 覆盖单个 (天, realm, uid, model) 的桶：删本地桶后写 Synced 日桶。
+// applyBackfillLocked 覆盖单个 (天, realm, uid, model) 的桶：先聚合本地不可从上游
+// 恢复的维度（token / 延迟 / 缓存），删除本地桶后写入携带这些维度、标记 Synced 的日桶。
 func (r *Recorder) applyBackfillLocked(row BackfillRow) {
 	realm := row.Realm
 	if realm == "" {
@@ -242,11 +246,24 @@ func (r *Recorder) applyBackfillLocked(row BackfillRow) {
 	}
 	dayScope := "d:" + row.Day
 	hourPrefix := "h:" + row.Day + "T"
+	var local bucket
 	for k, b := range r.buckets {
-		if b.UID == row.UID && b.Realm == realm && b.Model == model &&
-			(b.Scope == dayScope || strings.HasPrefix(b.Scope, hourPrefix)) {
-			delete(r.buckets, k)
+		if b.UID != row.UID || b.Realm != realm || b.Model != model ||
+			(b.Scope != dayScope && !strings.HasPrefix(b.Scope, hourPrefix)) {
+			continue
 		}
+		local.PT += b.PT
+		local.CT += b.CT
+		local.TT += b.TT
+		local.LatMs += b.LatMs
+		local.LatN += b.LatN
+		local.TFMs += b.TFMs
+		local.TFN += b.TFN
+		local.TPS += b.TPS
+		local.TPSN += b.TPSN
+		local.CH += b.CH
+		local.CM += b.CM
+		delete(r.buckets, k)
 	}
 	b := &bucket{
 		Scope:  dayScope,
@@ -254,13 +271,23 @@ func (r *Recorder) applyBackfillLocked(row BackfillRow) {
 		UID:    row.UID,
 		Model:  model,
 		Req:    row.Requests,
-		TT:     row.Tokens,
+		PT:     local.PT,
+		CT:     local.CT,
+		TT:     local.TT,
+		LatMs:  local.LatMs,
+		LatN:   local.LatN,
+		TFMs:   local.TFMs,
+		TFN:    local.TFN,
+		TPS:    local.TPS,
+		TPSN:   local.TPSN,
+		CH:     local.CH,
+		CM:     local.CM,
 		Synced: true,
 	}
 	if row.Credits != 0 {
 		b.CR = row.Credits
 		b.CRN = row.Requests
-		b.CRT = row.Tokens
+		b.CRT = local.TT
 	}
 	r.buckets[dayScope+"|"+realm+"|"+row.UID+"|"+model+"|"] = b
 }

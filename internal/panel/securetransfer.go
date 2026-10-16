@@ -293,7 +293,7 @@ func (p *Panel) importSecureAccount(acc secureAccount) (bool, string) {
 	if err := p.persistImportedAuth(a, realm, uid); err != nil {
 		return false, err.Error()
 	}
-	p.importCheckin(a, realm, uid)
+	p.importCheckin(a, uid)
 	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
 		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 	}
