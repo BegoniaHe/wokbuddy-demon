@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -499,7 +500,66 @@ func (c *Config) normalize() error {
 	if err := c.normalizeSchedule(); err != nil {
 		return err
 	}
-	return c.normalizePrompt()
+	if err := c.normalizePrompt(); err != nil {
+		return err
+	}
+	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
+	return c.Validate()
+}
+
+// Validate 对归一化后的配置做字段范围与跨字段一致性校验（Provision → Validate 的
+// 第二段）。由 normalize() 末尾调用，因此覆盖启动加载（含 env 覆盖）与面板保存两条
+// 路径：非法配置在写入前返回可读错误、不落盘。
+//
+// 只拒绝语义上非法的组合，不改变合法配置的行为；normalize 里既有的「空 / 0 回落默认」
+// 语义保持不变（那些是缺省，不是错误）。
+func (c *Config) Validate() error {
+	if err := c.validateBackoffOrder(); err != nil {
+		return err
+	}
+	if err := c.validateRanges(); err != nil {
+		return err
+	}
+	return c.validateGlobalMutex()
+}
+
+// validateBackoffOrder 跨字段：指数退避封顶不得小于基数（否则封顶形同虚设）。
+func (c *Config) validateBackoffOrder() error {
+	if c.SoftRateDur > 0 && c.SoftRateMaxDur > 0 && c.SoftRateMaxDur < c.SoftRateDur {
+		return fmt.Errorf("cooldown.soft_rate_max (%s) 不得小于 cooldown.soft_rate (%s)",
+			c.Cooldown.SoftRateMax, c.Cooldown.SoftRate)
+	}
+	if c.BreakerCooldownDur > 0 && c.BreakerCooldownMaxD > 0 && c.BreakerCooldownMaxD < c.BreakerCooldownDur {
+		return fmt.Errorf("pool.breaker_cooldown_max (%s) 不得小于 pool.breaker_cooldown (%s)",
+			c.Pool.BreakerCooldownMax, c.Pool.BreakerCooldown)
+	}
+	if c.DegradeCooldownDur > 0 && c.DegradeCooldownMaxD > 0 && c.DegradeCooldownMaxD < c.DegradeCooldownDur {
+		return fmt.Errorf("pool.degrade_cooldown_max (%s) 不得小于 pool.degrade_cooldown (%s)",
+			c.Pool.DegradeCooldownMax, c.Pool.DegradeCooldown)
+	}
+	return nil
+}
+
+// validateRanges 字段范围：0 有明确语义（不限 / 关闭）的键不接受负值。
+func (c *Config) validateRanges() error {
+	if c.Pool.MaxInFlight < 0 {
+		return fmt.Errorf("pool.max_in_flight: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlight)
+	}
+	if c.SessionTTL < 0 {
+		return fmt.Errorf("session_sticky.ttl: 负时长 %q 无意义", c.SessionSticky.TTL)
+	}
+	if c.SessionGCInterval <= 0 {
+		return fmt.Errorf("session_sticky.gc_interval: 必须为正时长，当前 %q", c.SessionSticky.GCInterval)
+	}
+	return nil
+}
+
+// validateGlobalMutex 互斥：global 路由关闭时再配 global base 自相矛盾（base 永不会被使用）。
+func (c *Config) validateGlobalMutex() error {
+	if !c.Global.Enabled && (strings.TrimSpace(c.Global.ChatBase) != "" || strings.TrimSpace(c.Global.BillingBase) != "") {
+		return errors.New("global.enabled=false 与 global.chat_base / global.billing_base 同时设置自相矛盾：请清空 base 或开启 global")
+	}
+	return nil
 }
 
 // normalizeStaticDefaults 补齐面板 / 日志 / 池 / 上游的数值型缺省值。
