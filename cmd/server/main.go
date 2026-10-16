@@ -282,9 +282,14 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 优雅停机（issue #19）：等待在途 SSE 长流排空，最多 ShutdownStreamGrace；
+		// 超时则记录未排空流数后由进程退出强制结束，不静默丢弃。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), server.ShutdownStreamGrace)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		if n := h.ActiveStreams(); n > 0 {
+			log.Printf("WARN: [server] graceful shutdown timed out with %d in-flight SSE stream(s) still active; forcing exit", n)
+		}
 	}()
 
 	log.Printf("wokbuddy-demon listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
