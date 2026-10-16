@@ -219,11 +219,11 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 | 指标 | 类型 | 说明 |
 |---|---|---|
-| `wokbuddy_accounts{state}` | gauge | 分状态账号数（`ok` / `cooling` / `disabled` / `paused` / `in_flight_full`） |
+| `wokbuddy_accounts{state}` | gauge | 分状态账号数（`ok` / `cooling` / `disabled` / `paused` / `in_flight_full`）；各 state **互斥**，`sum` 恒等于账号总数 |
 | `wokbuddy_requests_total{model,result}` | counter | 按模型与结果的请求尝试数（`result` = `ok` / `error`，逐上游尝试计） |
 | `wokbuddy_tokens_total{model,kind}` | counter | 按模型与类别的 Token 数（`kind` = `prompt` / `completion` / `total`） |
-| `wokbuddy_request_duration_seconds` | histogram | 上游尝试耗时（秒） |
-| `wokbuddy_upstream_rotations_total{reason}` | counter | 上游换号次数（`reason` 为触发分类） |
+| `wokbuddy_request_duration_seconds{result}` | histogram | 上游尝试耗时（秒），按成功/失败分流（`result` = `ok` / `error`） |
+| `wokbuddy_upstream_rotations_total{reason}` | counter | 上游换号次数（`reason` 为触发分类；degrade 同号重试不计入） |
 
 账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram 与换号计数为进程内生命周期，重启清零。鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
 

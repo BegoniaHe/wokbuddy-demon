@@ -601,27 +601,26 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 
 // AggregateByModel 返回按裸模型名分组的**全历史**累计（请求数/失败数/Token），
 // 供 /metrics 导出。与 SnapshotWindow 的区别：只保留 model 一维，恒为全部历史
-// （含已折叠日桶），不构造时序/账号/积分维度——成本是一次遍历，适合高频抓取。
+// （含已折叠日桶），不构造时序/账号/积分维度。与 SnapshotWindow 的整体拷贝不同，
+// 这里在锁内直接遍历聚合（模型维度小、聚合是纯 CPU），避免 maxBuckets 逼近上界时
+// 每次抓取拷贝数十 MB；代价是聚合期间阻塞写入，单次抓取量级可接受。
 // 空记录器返回空切片（非 nil），调用方无需判空。
 func (r *Recorder) AggregateByModel() []KeyedAgg {
 	if r == nil {
 		return []KeyedAgg{}
 	}
+	agg := make(map[string]*aggAcc)
 	r.mu.Lock()
-	bs := make([]bucket, 0, len(r.buckets))
 	for _, b := range r.buckets {
-		bs = append(bs, *b)
+		acc := agg[b.Model]
+		if acc == nil {
+			acc = &aggAcc{}
+			agg[b.Model] = acc
+		}
+		acc.add(b)
 	}
 	r.mu.Unlock()
 
-	agg := make(map[string]*aggAcc, len(bs))
-	for i := range bs {
-		b := &bs[i]
-		if agg[b.Model] == nil {
-			agg[b.Model] = &aggAcc{}
-		}
-		agg[b.Model].add(b)
-	}
 	out := make([]KeyedAgg, 0, len(agg))
 	for k, v := range agg {
 		out = append(out, KeyedAgg{Key: k, Agg: v.finish()})

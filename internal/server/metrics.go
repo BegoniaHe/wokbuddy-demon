@@ -14,6 +14,25 @@ import (
 // 由 le 标签重建分布；+Inf 桶在渲染时补，不在此列。
 var durationBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}
 
+// 耗时 histogram 的 result 维度取值。成功/失败分开观测，避免 429 / 传输错误等
+// 毫秒级失败样本压低整体 P50/P90。
+const (
+	resultOK    = "ok"
+	resultError = "error"
+)
+
+// durationResults 是 result 维度的固定枚举，渲染时按此顺序输出保证稳定。
+var durationResults = []string{resultOK, resultError}
+
+// durationHist 单一 result 维度下的累积式耗时直方图。
+type durationHist struct {
+	// buckets[i] 是 le<=durationBuckets[i] 的累计观测数（累积式，observe 时同时
+	// 递增所有满足上界的桶）。
+	buckets []uint64
+	sum     float64
+	count   uint64
+}
+
 // metricsRegistry 进程内生命周期指标，只持有仓库其它包不提供的两类：请求耗时
 // histogram 与上游轮换计数。账号 / 请求 / Token 三类直接读现有计数
 // （pool.CountsDetailedWithPaused / usage.AggregateByModel），不在此重复记账
@@ -21,36 +40,43 @@ var durationBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60}
 type metricsRegistry struct {
 	mu sync.Mutex
 
-	// 耗时 histogram：durBuckets[i] 是 le<=durationBuckets[i] 的累计观测数
-	// （累积式，observe 时同时递增所有满足上界的桶）。
-	durBuckets []uint64
-	durSum     float64
-	durCount   uint64
+	// dur 按 result（ok/error）分流的耗时 histogram。
+	dur map[string]*durationHist
 
 	rotations map[string]uint64
 }
 
 func newMetricsRegistry() *metricsRegistry {
 	return &metricsRegistry{
-		durBuckets: make([]uint64, len(durationBuckets)),
-		rotations:  map[string]uint64{},
+		dur:       map[string]*durationHist{},
+		rotations: map[string]uint64{},
 	}
 }
 
-// observeRequestDuration 记录一次上游尝试耗时（秒）。nil 接收者安全（防御裸用）。
-func (m *metricsRegistry) observeRequestDuration(seconds float64) {
+// observeRequestDuration 记录一次上游尝试耗时（秒），按成功/失败分流。nil 接收者
+// 安全（防御裸用）。
+func (m *metricsRegistry) observeRequestDuration(seconds float64, ok bool) {
 	if m == nil {
 		return
 	}
+	result := resultError
+	if ok {
+		result = resultOK
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	hist := m.dur[result]
+	if hist == nil {
+		hist = &durationHist{buckets: make([]uint64, len(durationBuckets))}
+		m.dur[result] = hist
+	}
 	for i, ub := range durationBuckets {
 		if seconds <= ub {
-			m.durBuckets[i]++
+			hist.buckets[i]++
 		}
 	}
-	m.durSum += seconds
-	m.durCount++
+	hist.sum += seconds
+	hist.count++
 }
 
 // incRotation 记录一次换号；reason 为触发原因标签，空值回落 "other"。
@@ -80,7 +106,11 @@ func (h *Handler) metricsHandler(w http.ResponseWriter, _ *http.Request) {
 
 // writeAccountMetrics 账号分状态计数（复用 pool.CountsDetailedWithPaused）。
 // paused 与 disabled 分开：暂停只退出选号、照常保号，与禁用是两种运维状态
-// （见 pool.CountsDetailedWithPaused 注释），合并会丢信号。healthy 含 in_flight_full。
+// （见 pool.CountsDetailedWithPaused 注释），合并会丢信号。
+//
+// state 是互斥分区，sum(wokbuddy_accounts) 恒等于账号总数。CountsDetailedWithPaused
+// 的 healthy 含 in_flight_full（在途满载仍是状态机意义上的健康），故此处 ok 取
+// healthy-in_flight_full，避免满载号被 ok 与 in_flight_full 重复计。
 func (h *Handler) writeAccountMetrics(b *strings.Builder) {
 	_, healthy, cooling, disabled, paused, inFlightFull := h.cfg.Pool.CountsDetailedWithPaused()
 	writeHelpType(b, "wokbuddy_accounts", "Number of accounts by state.", "gauge")
@@ -88,7 +118,7 @@ func (h *Handler) writeAccountMetrics(b *strings.Builder) {
 		state string
 		value int
 	}{
-		{"ok", healthy},
+		{"ok", healthy - inFlightFull},
 		{"cooling", cooling},
 		{"disabled", disabled},
 		{"paused", paused},
@@ -121,26 +151,34 @@ func (h *Handler) writeModelMetrics(b *strings.Builder) {
 	}
 }
 
-// writeDurationMetrics 渲染耗时 histogram（进程内累计）。
+// writeDurationMetrics 渲染按 result 分流的耗时 histogram（进程内累计）。
 func (h *Handler) writeDurationMetrics(b *strings.Builder) {
-	m := h.metrics
-	writeHelpType(b, "wokbuddy_request_duration_seconds", "Upstream attempt duration in seconds.", "histogram")
-	if m == nil {
-		writeSample(b, "wokbuddy_request_duration_seconds_bucket", label("le", "+Inf"), 0)
-		writeSample(b, "wokbuddy_request_duration_seconds_sum", "", 0)
-		writeSample(b, "wokbuddy_request_duration_seconds_count", "", 0)
-		return
+	writeHelpType(b, "wokbuddy_request_duration_seconds", "Upstream attempt duration in seconds by result.", "histogram")
+	// 先快照再渲染：ok/error 恒输出（无观测即全零），保证序列集稳定。
+	snapshot := make(map[string]durationHist, len(durationResults))
+	for _, result := range durationResults {
+		snapshot[result] = durationHist{buckets: make([]uint64, len(durationBuckets))}
 	}
-	m.mu.Lock()
-	buckets := append([]uint64(nil), m.durBuckets...)
-	sum, count := m.durSum, m.durCount
-	m.mu.Unlock()
-	for i, ub := range durationBuckets {
-		writeSample(b, "wokbuddy_request_duration_seconds_bucket", label("le", formatFloat(ub)), float64(buckets[i]))
+	if m := h.metrics; m != nil {
+		m.mu.Lock()
+		for result, hist := range m.dur {
+			snapshot[result] = durationHist{
+				buckets: append([]uint64(nil), hist.buckets...),
+				sum:     hist.sum,
+				count:   hist.count,
+			}
+		}
+		m.mu.Unlock()
 	}
-	writeSample(b, "wokbuddy_request_duration_seconds_bucket", label("le", "+Inf"), float64(count))
-	writeSample(b, "wokbuddy_request_duration_seconds_sum", "", sum)
-	writeSample(b, "wokbuddy_request_duration_seconds_count", "", float64(count))
+	for _, result := range durationResults {
+		hist := snapshot[result]
+		for i, ub := range durationBuckets {
+			writeSample(b, "wokbuddy_request_duration_seconds_bucket", labelPair("result", result, "le", formatFloat(ub)), float64(hist.buckets[i]))
+		}
+		writeSample(b, "wokbuddy_request_duration_seconds_bucket", labelPair("result", result, "le", "+Inf"), float64(hist.count))
+		writeSample(b, "wokbuddy_request_duration_seconds_sum", label("result", result), hist.sum)
+		writeSample(b, "wokbuddy_request_duration_seconds_count", label("result", result), float64(hist.count))
+	}
 }
 
 // writeRotationMetrics 渲染上游换号计数（进程内累计，按原因标签）。
