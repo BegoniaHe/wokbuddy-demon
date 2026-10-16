@@ -149,6 +149,14 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// RotateMax 单请求最多换号次数，默认 3（issue #17）。
+		RotateMax int `json:"rotate_max"`
+		// RotateBudget 轮换总时长预算（如 "90s"）；"0"/空 = 不限（默认）。与
+		// RotateMax 构成「先到先停」，避免慢上游把客户端拖久。
+		RotateBudget string `json:"rotate_budget"`
+		// RotateStatusCodes 非空时，HTTP 状态码错误仅这些码触发换号（如
+		// [429,500,502,503,504]）；空 = 维持现有按错误分类的换号语义（默认）。
+		RotateStatusCodes []int `json:"rotate_status_codes"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -230,6 +238,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// RotateBudgetDur 解析后的轮换总时长预算（issue #17）；0 = 不限。
+	RotateBudgetDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -622,6 +632,12 @@ func (c *Config) normalizeUpstreamDefaults() {
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
+	if c.Upstream.RotateMax <= 0 {
+		c.Upstream.RotateMax = 3
+	}
+	if c.Upstream.RotateBudget == "" {
+		c.Upstream.RotateBudget = "0"
+	}
 }
 
 // normalizeDurations 把字符串时长解析到对应的 *Dur 字段，并按需回落默认值。
@@ -639,7 +655,28 @@ func (c *Config) normalizeDurations() error {
 	if err := c.normalizeSessionDurations(); err != nil {
 		return err
 	}
+	if err := c.normalizeUpstreamRotate(); err != nil {
+		return err
+	}
 	return c.normalizeExpiringDurations()
+}
+
+// normalizeUpstreamRotate 解析轮换总时长预算（issue #17）：空 = "0"（不限）；
+// 负时长无意义 fail fast。
+func (c *Config) normalizeUpstreamRotate() error {
+	budget := c.Upstream.RotateBudget
+	if budget == "" {
+		budget = "0"
+	}
+	d, err := time.ParseDuration(budget)
+	if err != nil {
+		return fmt.Errorf("upstream.rotate_budget: %w", err)
+	}
+	if d < 0 {
+		return fmt.Errorf("upstream.rotate_budget: 负时长 %q 无意义", c.Upstream.RotateBudget)
+	}
+	c.RotateBudgetDur = d
+	return nil
 }
 
 // normalizeServerDuration 解析入站读取上限。

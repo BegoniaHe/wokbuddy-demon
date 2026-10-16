@@ -51,7 +51,10 @@
     "client_name": "",
     "device_token": "",
     "device_token_file": "",
-    "passthrough_ip": false
+    "passthrough_ip": false,
+    "rotate_max": 3,
+    "rotate_budget": "0",
+    "rotate_status_codes": []
   },
   "features": {
     "sanitize_blacklist_fingerprints": true
