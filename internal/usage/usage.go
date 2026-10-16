@@ -68,6 +68,9 @@ type bucket struct {
 	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
 	CH    int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
 	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
+	// Synced 标记该桶来自上游逐笔用量回填（issue #31）：覆盖本地记录，供聚合与
+	// 面板区分「本地实时记录」与「上游权威对账」。
+	Synced bool `json:"syn,omitempty"`
 }
 
 // file 落盘结构。
@@ -185,6 +188,75 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	}
 	b.apply(d, ok)
 	r.dirty = true
+}
+
+// BackfillRow 上游逐笔用量按天聚合的一行（issue #31）。
+type BackfillRow struct {
+	Day      string // 本地日历日 "2006-01-02"
+	Realm    string
+	UID      string
+	Model    string
+	Requests int64
+	Credits  float64
+	Tokens   int64
+}
+
+// Backfill 用上游权威数据覆盖指定 (天, realm, uid, model) 的用量桶：删除该键的本地
+// 小时桶与日桶后写入标记 Synced 的日桶，避免与本地实时记录重复计数（issue #31）。
+// 返回覆盖的桶数。仅显式触发时调用。
+func (r *Recorder) Backfill(rows []BackfillRow) int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, row := range rows {
+		if row.Day == "" || row.UID == "" {
+			continue
+		}
+		r.applyBackfillLocked(row)
+		n++
+	}
+	if n > 0 {
+		r.dirty = true
+	}
+	return n
+}
+
+// applyBackfillLocked 覆盖单个 (天, realm, uid, model) 的桶：删本地桶后写 Synced 日桶。
+func (r *Recorder) applyBackfillLocked(row BackfillRow) {
+	realm := row.Realm
+	if realm == "" {
+		realm = "cn"
+	}
+	model := row.Model
+	if model == "" {
+		model = "(unknown)"
+	}
+	dayScope := "d:" + row.Day
+	hourPrefix := "h:" + row.Day + "T"
+	for k, b := range r.buckets {
+		if b.UID == row.UID && b.Realm == realm && b.Model == model &&
+			(b.Scope == dayScope || strings.HasPrefix(b.Scope, hourPrefix)) {
+			delete(r.buckets, k)
+		}
+	}
+	b := &bucket{
+		Scope:  dayScope,
+		Realm:  realm,
+		UID:    row.UID,
+		Model:  model,
+		Req:    row.Requests,
+		TT:     row.Tokens,
+		Synced: true,
+	}
+	if row.Credits != 0 {
+		b.CR = row.Credits
+		b.CRN = row.Requests
+		b.CRT = row.Tokens
+	}
+	r.buckets[dayScope+"|"+realm+"|"+row.UID+"|"+model+"|"] = b
 }
 
 // tokenTotal 返回本次尝试的 token 合计：优先上游给的 total，缺省用 pt+ct 兜底，

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { api } from '@/lib/api';
+import { api, postJSON } from '@/lib/api';
+import { toast } from '@/components/Toaster';
 import {
   fmtCredit,
   fmtCreditRatio,
@@ -44,6 +45,7 @@ export function UsageView() {
   const [dim, setDim] = useState<DimKey>('account');
   const [creditDim, setCreditDim] = useState<CreditDim>('account');
   const [sort, setSort] = useState<UsSort>('total');
+  const [backfilling, setBackfilling] = useState(false);
 
   const rangeStr = trangeQuery(range, true).toString();
 
@@ -96,6 +98,24 @@ export function UsageView() {
             {note}
           </BoxNote>
           <TimeRange value={range} onChange={setRange} />
+          <Button
+            size="xs"
+            disabled={backfilling}
+            onClick={() => {
+              if (!confirm('从上游拉取最近 7 天逐笔用量并按天覆盖本地用量桶（用于对账/回填），继续？')) return;
+              setBackfilling(true);
+              void postJSON<{ records?: number; buckets?: number; failures?: Record<string, string> }>('usage/backfill', { days: 7 })
+                .then((r) => {
+                  const failed = r.failures ? Object.keys(r.failures).length : 0;
+                  toast('回填完成：' + (r.records ?? 0) + ' 条记录，覆盖 ' + (r.buckets ?? 0) + ' 个桶' + (failed ? '，' + failed + ' 个账号失败' : ''), failed ? 'err' : 'ok');
+                  void refetch();
+                })
+                .catch((e) => toast('回填失败：' + (e as Error).message, 'err'))
+                .finally(() => setBackfilling(false));
+            }}
+          >
+            {backfilling ? '回填中…' : '回填上游'}
+          </Button>
           <Button size="xs" disabled={isFetching} onClick={() => void refetch()}>
             刷新
           </Button>

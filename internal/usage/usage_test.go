@@ -361,6 +361,24 @@ func TestAggregateByModel(t *testing.T) {
 	wantEq(t, "空切片长度", len(empty), 0)
 }
 
+// TestBackfillOverridesLocalDay 上游回填覆盖同 (天, realm, uid, model) 的本地桶，
+// 不与本地实时记录重复计数（issue #31）。
+func TestBackfillOverridesLocalDay(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	day := now.Format("2006-01-02")
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{TotalTokens: 10, HasTotal: true, Credit: 1, HasCredit: true}, true)
+
+	n := r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "uid1", Model: "glm-5.2", Requests: 5, Credits: 9, Tokens: 50}})
+	if n != 1 {
+		t.Fatalf("backfill buckets=%d want 1", n)
+	}
+	s := r.Snapshot(0, nil)
+	wantEq(t, "requests(覆盖后)", s.Totals.Requests, int64(5))
+	wantEq(t, "credits(覆盖后)", s.Totals.Credits, 9.0)
+	wantEq(t, "total_tokens(覆盖后)", s.Totals.TotalTokens, int64(50))
+}
+
 // wantEq 断言 got == want，失败时用 label 指明字段。统一入口避免逐项 if 抬高
 // 测试函数复杂度，断言条件与原逐项检查等价。
 func wantEq[T comparable](t *testing.T, label string, got, want T) {
