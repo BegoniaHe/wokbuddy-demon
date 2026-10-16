@@ -89,7 +89,7 @@ export function Switch({
 }
 
 const tagVariants = cva(
-  'inline-flex items-center gap-1.5 rounded-full px-2.5 py-px text-2xs font-medium whitespace-nowrap',
+  'inline-flex items-center gap-1.5 rounded-control px-2.5 py-px text-2xs font-medium whitespace-nowrap',
   {
     variants: {
       tone: {

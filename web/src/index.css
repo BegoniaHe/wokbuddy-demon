@@ -4,52 +4,52 @@
    与 Tailwind 默认的 prefers-color-scheme 解耦，故自定义 dark 变体。 */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-/* 设计令牌：冷石墨基调（仪表盘语言，非营销页）。底色分层 + 单一靛蓝强调（仅交互），
+/* 设计令牌：极简中性基调。底色分层 + 单一蓝色强调（仅交互），
    语义色只给状态。等宽数字承载所有观测值。 */
 :root {
-  --bg: #0c0e14;
-  --surface: #14171f;
-  --surface-2: #1a1e28;
-  --raise: #202531;
-  --line: #262c3a;
-  --line-soft: #1e232e;
-  --ink: #e8ebf2;
-  --ink-2: #a8b0c2;
-  --ink-3: #6b7488;
-  --accent: #5b7cfa;
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --raise: #ffffff;
+  --line: #e4e4e7;
+  --line-soft: #efeff1;
+  --ink: #18181b;
+  --ink-2: #52525b;
+  --ink-3: #a1a1aa;
+  --accent: #2563eb;
   --accent-ink: #ffffff;
-  --accent-soft: rgba(91, 124, 250, 0.13);
-  --ok: #3ddc97;
-  --ok-soft: rgba(61, 220, 151, 0.12);
-  --warn: #f5b544;
-  --warn-soft: rgba(245, 181, 68, 0.12);
-  --bad: #f0655f;
-  --bad-soft: rgba(240, 101, 95, 0.12);
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  --accent-soft: rgba(37, 99, 235, 0.08);
+  --ok: #16a34a;
+  --ok-soft: rgba(22, 163, 74, 0.09);
+  --warn: #d97706;
+  --warn-soft: rgba(217, 119, 6, 0.1);
+  --bad: #dc2626;
+  --bad-soft: rgba(220, 38, 38, 0.08);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
-[data-theme="light"] {
-  --bg: #f4f5f8;
-  --surface: #ffffff;
-  --surface-2: #f8f9fb;
-  --raise: #ffffff;
-  --line: #e2e5ec;
-  --line-soft: #eceef3;
-  --ink: #14171f;
-  --ink-2: #545c6e;
-  --ink-3: #8b93a5;
-  --accent: #3d5fe0;
+[data-theme="dark"] {
+  --bg: #09090b;
+  --surface: #111113;
+  --surface-2: #18181b;
+  --raise: #1c1c1f;
+  --line: #27272a;
+  --line-soft: #1f1f22;
+  --ink: #fafafa;
+  --ink-2: #a1a1aa;
+  --ink-3: #71717a;
+  --accent: #3b82f6;
   --accent-ink: #ffffff;
-  --accent-soft: rgba(61, 95, 224, 0.09);
-  --ok: #0f9d63;
-  --ok-soft: rgba(15, 157, 99, 0.1);
-  --warn: #b47611;
-  --warn-soft: rgba(180, 118, 17, 0.11);
-  --bad: #cf3b34;
-  --bad-soft: rgba(207, 59, 52, 0.09);
-  --shadow: 0 1px 2px rgba(16, 20, 32, 0.06), 0 8px 24px -14px rgba(16, 20, 32, 0.14);
+  --accent-soft: rgba(59, 130, 246, 0.14);
+  --ok: #4ade80;
+  --ok-soft: rgba(74, 222, 128, 0.12);
+  --warn: #fbbf24;
+  --warn-soft: rgba(251, 191, 36, 0.12);
+  --bad: #f87171;
+  --bad-soft: rgba(248, 113, 113, 0.12);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
 @theme inline {
@@ -90,9 +90,9 @@
   --text-lg--line-height: 1.45;
 
   /* 成套圆角：control 控件 · inner 内层卡片 · surface 面板/弹窗。 */
-  --radius-control: 6px;
-  --radius-inner: 8px;
-  --radius-surface: 12px;
+  --radius-control: 4px;
+  --radius-inner: 6px;
+  --radius-surface: 8px;
 }
 
 html,

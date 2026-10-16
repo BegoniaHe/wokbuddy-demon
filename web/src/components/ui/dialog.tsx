@@ -1,9 +1,8 @@
+import { Dialog } from '@base-ui/react';
 import type { ReactNode } from 'react';
-import * as DialogPrimitive from '@radix-ui/react-dialog';
 import { cn } from '@/lib/utils';
 
-// Modal：基于 Radix Dialog（焦点陷阱 / Esc / 滚动锁开箱即用）。
-// 外观对齐旧面板的 .veil/.dlg：遮罩 + 居中卡片，标题走 Radix.Title（a11y）。
+// Modal：基于 Base UI Dialog（焦点陷阱 / Esc / 滚动锁开箱即用）。
 export function Modal({
   open,
   onOpenChange,
@@ -16,18 +15,18 @@ export function Modal({
   children: ReactNode;
 }) {
   return (
-    <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
-      <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="fixed inset-0 z-[60] bg-[rgba(6,8,13,0.62)] backdrop-blur-[2px]" />
-        <DialogPrimitive.Content
+    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+      <Dialog.Portal>
+        <Dialog.Backdrop className="fixed inset-0 z-[60] bg-[rgba(6,8,13,0.62)] backdrop-blur-[2px]" />
+        <Dialog.Popup
           aria-describedby={undefined}
           className="fixed left-1/2 top-1/2 z-[60] flex max-h-[86vh] w-[calc(100%-40px)] -translate-x-1/2 -translate-y-1/2 flex-col rounded-surface border border-line bg-surface shadow-[0_24px_64px_-24px_rgba(0,0,0,0.6)] focus:outline-none"
           style={{ maxWidth: width }}
         >
           {children}
-        </DialogPrimitive.Content>
-      </DialogPrimitive.Portal>
-    </DialogPrimitive.Root>
+        </Dialog.Popup>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }
 
@@ -38,7 +37,7 @@ export function ModalHeader({ children, className }: { children: ReactNode; clas
 }
 
 export function ModalTitle({ children }: { children: ReactNode }) {
-  return <DialogPrimitive.Title className="text-lg font-semibold">{children}</DialogPrimitive.Title>;
+  return <Dialog.Title className="text-lg font-semibold">{children}</Dialog.Title>;
 }
 
 export function ModalHint({ children }: { children: ReactNode }) {
@@ -57,4 +56,4 @@ export function ModalFooter({ children, className }: { children: ReactNode; clas
   );
 }
 
-export const CloseOnEscape = DialogPrimitive.Close;
+export const CloseOnEscape = Dialog.Close;

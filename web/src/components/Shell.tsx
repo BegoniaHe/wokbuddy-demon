@@ -70,10 +70,10 @@ export function Shell({
   const statusTone: DotTone = healthy > 0 ? 'ok' : total ? 'warn' : 'bad';
 
   return (
-    <div className="grid min-h-screen grid-cols-1 md:grid-cols-[208px_1fr]">
+    <div className="grid min-h-screen grid-cols-1 md:grid-cols-[200px_1fr]">
       <nav className="flex flex-col border-b border-line bg-surface md:sticky md:top-0 md:h-screen md:border-b-0 md:border-r">
-        <div className="flex items-center gap-3 border-b border-line-soft px-[18px] py-4 md:block">
-          <div className="text-lg font-semibold tracking-tight">WokBuddy Demon</div>
+        <div className="flex items-center gap-3 border-b border-line-soft px-4 py-4 md:block">
+          <div className="text-base font-semibold tracking-tight">WokBuddy Demon</div>
           <div className="mt-0.5 font-mono text-2xs text-ink-3">
             v{data?.version ?? '-'}
           </div>
@@ -116,7 +116,7 @@ export function Shell({
 
       <div className="flex min-w-0 flex-col">
         <div className="sticky top-0 z-20 flex items-center gap-3.5 border-b border-line bg-surface px-4 py-3.5 md:px-6">
-          <h2 className="text-lg font-semibold tracking-tight">{VIEW_TITLES[view]}</h2>
+          <h2 className="text-base font-semibold tracking-tight">{VIEW_TITLES[view]}</h2>
           <span className="text-ink-3">/</span>
           <span className="font-mono text-xs text-ink-3">
             {data ? uptimeText(data.uptime_sec) : '-'}

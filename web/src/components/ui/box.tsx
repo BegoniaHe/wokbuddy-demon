@@ -6,7 +6,7 @@ export function Box({ children, className }: { children: ReactNode; className?: 
   return (
     <section
       className={cn(
-        'mb-5 overflow-hidden rounded-surface border border-line bg-surface shadow-panel',
+        'mb-5 overflow-hidden rounded-surface border border-line bg-surface',
         className,
       )}
     >

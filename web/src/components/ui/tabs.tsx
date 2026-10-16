@@ -21,7 +21,7 @@ export function Tabs({
   className?: string;
 }) {
   return (
-    <span className={cn('inline-flex gap-0.5 rounded-inner bg-surface-2 p-0.5', className)}>
+    <span className={cn('inline-flex gap-0.5 rounded-control border border-line bg-surface-2 p-0.5', className)}>
       {items.map((it) => (
         <button
           key={it.value}
@@ -30,7 +30,9 @@ export function Tabs({
           onClick={() => onSelect(it.value)}
           className={cn(
             'rounded-control px-3 py-1 text-xs font-medium transition-colors',
-            it.value === active ? 'bg-surface text-ink shadow-sm' : 'text-ink-3 hover:text-ink',
+            it.value === active
+              ? 'border border-line bg-surface text-ink'
+              : 'border border-transparent text-ink-3 hover:text-ink',
           )}
         >
           {it.label}
