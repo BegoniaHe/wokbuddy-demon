@@ -141,7 +141,22 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
+	// 未注册路径兜底（Issue #12）：返回 OpenAI 风格 JSON 错误体，而非 ServeMux 裸 404。
+	// 注册在最具体的路由之后；ServeMux 优先精确/更长前缀，故不会遮蔽上面的端点。
+	h.mux.HandleFunc("/", h.notFound)
 	return h
+}
+
+// notFound 未注册路径的统一出口：OpenAI 风格 404 JSON（不鉴权——未知路径无需泄露
+// 鉴权存在性，也不暴露端点清单）。协议面（OpenAI 兼容 API）只承诺
+// POST /v1/chat/completions 与 GET /v1/models；其余一律落到这里。
+func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotFound, map[string]any{
+		"error": map[string]any{
+			"message": "unknown endpoint: " + r.Method + " " + r.URL.Path,
+			"type":    "invalid_request_error",
+		},
+	})
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -531,8 +546,11 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 // 阶段；原函数局部变量逐字迁移为字段，各阶段内语句顺序与早返回语义保持不变。
 type chatFlow struct {
 	h *Handler
-	w http.ResponseWriter
-	r *http.Request
+
+	// 传输无关端口（Issue #12）：out 承载结构化结果出口；核心不再持有
+	// http.Request / http.ResponseWriter。请求 context.Context 不存字段（containedctx
+	// 禁止），而由入口显式逐层传参（取消/超时信号传播到上游与轮转退避）。
+	out chatResponder
 
 	// 请求体与解析结果
 	body          []byte
@@ -547,6 +565,10 @@ type chatFlow struct {
 	// 统计与追踪
 	st       *chatStat
 	clientIP string
+
+	// 入站头（适配器提取；供 buildChatMeta 组装会话头族）
+	convReqID string
+	traceID   string
 
 	// 会话标识
 	sessKey   string
@@ -573,100 +595,88 @@ const (
 )
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	f, ok := h.newChatFlow(w, r)
+	// 入站适配：解析 HTTP 请求为结构化输入，并构造输出端口（唯一的 net/http 边界）。
+	in, out, ok := newChatInput(w, r)
 	if !ok {
 		return
 	}
+	f := h.newChatFlow(in, out)
 	// 出口统一释放：先释放在途租约，再落请求流水行（与原 defer 顺序一致）。
 	defer f.st.done()
 	defer f.releaseHeld()
-	if f.runRotation() {
+	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
+	if f.runRotation(r.Context()) {
 		return
 	}
 	f.writeFinalError()
 }
 
-// newChatFlow 读取并解析请求体、组装统计与会话标识。返回 false 表示已写出 400。
-func (h *Handler) newChatFlow(w http.ResponseWriter, r *http.Request) (*chatFlow, bool) {
-	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
-	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
-	clientIP := upstream.ExtractClientIP(r)
-	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入，超限类问题交由
-	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
-	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
-	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-		return nil, false
-	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &peek)
-
+// newChatFlow 由结构化输入组装统计、会话标识与轮转状态（传输无关）。
+// 入站 HTTP 解析（读 body / 提取头与 IP）已在 newChatInput 完成。
+func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	realm, bareModel := resolveModel(in.model)
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), body, peek.Stream)
-	if tr := requestTraceFrom(r); tr != nil {
-		tr.stat = st
+	st := newChatStat(time.Now(), in.body, in.stream)
+	if in.trace != nil {
+		in.trace.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
-		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+		st.clientIP, st.userAgent = in.trace.clientIP, in.trace.userAgent
 	}
 	f := &chatFlow{
-		h: h, w: w, r: r, clientIP: clientIP,
-		body:     body,
-		stream:   peek.Stream,
-		rawModel: peek.Model,
+		h: h, out: out, clientIP: in.clientIP,
+		body:     in.body,
+		stream:   in.stream,
+		rawModel: in.model,
 		realm:    realm,
 		// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 		// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
-		declaredTools: upstream.ToolNameAllowlist(body),
+		declaredTools: upstream.ToolNameAllowlist(in.body),
 		// gateway_hint 判定所需的请求形态（image_url part）：在改写前取。
-		reqHasImage: hasImagePart(body),
+		reqHasImage: hasImagePart(in.body),
 		bareModel:   bareModel,
 		modelRate:   modelRate,
 		st:          st,
 		tried:       map[string]bool{},
+		convReqID:   in.convReqID,
+		traceID:     in.traceID,
 	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，
 	// 走普通轮换）。ExtractKey 与粘性开关解耦：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级。
-	f.sessKey = session.ExtractKey(body)
+	f.sessKey = session.ExtractKey(in.body)
 	if h.cfg.Session != nil && f.sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, in.model); ok {
 			f.stickyUID = uid
 		}
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生。必须在 prompt.Rewrite 之前取
 	// ——改写会动 messages 内容，之后取会让键漂移。
-	f.turnKey = session.TurnKey(body)
+	f.turnKey = session.TurnKey(in.body)
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
 	f.applyPromptRewrite()
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
-	if bareModel != peek.Model {
+	if bareModel != in.model {
 		f.body = rewriteModel(f.body, bareModel)
 	}
 	f.buildChatMeta()
-	return f, true
+	return f
 }
 
 // applyPromptRewrite 按 PromptMode 改写出站提示词（轮转前、每请求一次）。
@@ -701,7 +711,7 @@ func (f *chatFlow) buildChatMeta() {
 		convID = f.sessKey
 	}
 	f.chatMeta = upstream.ChatMeta{ConversationID: convID}
-	if v := f.r.Header.Get("X-Conversation-Request-Id"); v != "" {
+	if v := f.convReqID; v != "" {
 		f.chatMeta.ConversationRequestID = v
 	} else if f.turnKey != "" && f.sessKey != "" {
 		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞（#170 统一轮级）。
@@ -716,7 +726,7 @@ func (f *chatFlow) buildChatMeta() {
 		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
 		f.chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
-	f.chatMeta.TraceID = f.r.Header.Get("X-Trace-Id")
+	f.chatMeta.TraceID = f.traceID
 }
 
 // releaseHeld 释放在途租约（幂等）。
@@ -745,9 +755,9 @@ func (f *chatFlow) fail(uid string) {
 }
 
 // runRotation 执行选号 + 重试轮转。返回 true 表示已写出响应（成功或请求级错误）。
-func (f *chatFlow) runRotation() bool {
+func (f *chatFlow) runRotation(ctx context.Context) bool {
 	for i := range f.h.cfg.MaxRotate {
-		switch f.attempt(i) {
+		switch f.attempt(ctx, i) {
 		case rotContinue:
 			// 换号继续（下一轮）
 		case rotDone:
@@ -760,7 +770,7 @@ func (f *chatFlow) runRotation() bool {
 }
 
 // attempt 执行一次「选号 → 占名额 → 刷新 token → 转发」尝试，返回控制流去向。
-func (f *chatFlow) attempt(i int) rotationAction {
+func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 	acct := f.pickAccount()
 	if acct == nil {
 		f.st.status = http.StatusServiceUnavailable
@@ -778,18 +788,18 @@ func (f *chatFlow) attempt(i int) rotationAction {
 
 	// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 	if !f.h.cfg.Pool.Acquire(acct.UID) {
-		return f.retryAcquireFailed(acct, i)
+		return f.retryAcquireFailed(ctx, acct, i)
 	}
 	f.heldUID = acct.UID
 
 	// token 临近过期 → 先 refresh（失败冷却换号）。
-	if proceed, stop := f.ensureFreshToken(acct, i); !proceed {
+	if proceed, stop := f.ensureFreshToken(ctx, acct, i); !proceed {
 		if stop {
 			return rotBreak
 		}
 		return rotContinue
 	}
-	return f.dispatch(acct, i)
+	return f.dispatch(ctx, acct, i)
 }
 
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
@@ -809,11 +819,11 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，
 // 避免下一轮仍撞同一个满载粘性号再浪费一次 PickByUID 往返。
-func (f *chatFlow) retryAcquireFailed(acct *auth.Auth, i int) rotationAction {
+func (f *chatFlow) retryAcquireFailed(ctx context.Context, acct *auth.Auth, i int) rotationAction {
 	if f.stickyUID != "" && acct.UID == f.stickyUID {
 		f.unbindSticky()
 	}
-	if !rotateBackoff(f.r.Context(), i) {
+	if !rotateBackoff(ctx, i) {
 		// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
 		return rotBreak
 	}
@@ -822,7 +832,7 @@ func (f *chatFlow) retryAcquireFailed(acct *auth.Auth, i int) rotationAction {
 
 // ensureFreshToken 在 token 临近过期时刷新。返回 (proceed, stop)：proceed=false 表示
 // 刷新失败已按策略处置（stop=true → 终止轮转，false → 换号继续）。
-func (f *chatFlow) ensureFreshToken(acct *auth.Auth, i int) (proceed, stop bool) {
+func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int) (proceed, stop bool) {
 	if !acct.NeedsRefresh(f.h.cfg.RefreshSkew) {
 		return true, false
 	}
@@ -830,7 +840,7 @@ func (f *chatFlow) ensureFreshToken(acct *auth.Auth, i int) (proceed, stop bool)
 		f.lastErr = err
 		f.penalizeRefreshFailure(acct, err)
 		f.fail(acct.UID)
-		if !rotateBackoff(f.r.Context(), i) {
+		if !rotateBackoff(ctx, i) {
 			return false, true // ctx 取消：终止轮转（refresh 失败换号退避）
 		}
 		return false, false
@@ -853,10 +863,10 @@ func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
 }
 
 // dispatch 发起一次上游转发，按错误分类与响应形态分派收尾。
-func (f *chatFlow) dispatch(acct *auth.Auth, i int) rotationAction {
+func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotationAction {
 	// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 	attemptStarted := time.Now()
-	rc, status, respBody, terr := f.h.cfg.Upstream.ChatStreamContext(f.r.Context(), acct, f.body, f.clientIP, f.chatMeta)
+	rc, status, respBody, terr := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, f.body, f.clientIP, f.chatMeta)
 	// 分类信封一次成型：upstream 已在错误路径返回 *upstream.Error（Kind +
 	// Retry-After 头解析）。传输层错误（非 *Error）走抖动换号分支；防御分支
 	// （terr 为 nil 但 status>=400，如 ErrNone 兜底）回落本地 Classify，双保险。
@@ -865,10 +875,10 @@ func (f *chatFlow) dispatch(acct *auth.Auth, i int) rotationAction {
 		status = uerr.Status
 	}
 	if uerr == nil && terr != nil {
-		return f.handleTransportError(acct, terr, attemptStarted, i)
+		return f.handleTransportError(ctx, acct, terr, attemptStarted, i)
 	}
 	if status >= 400 {
-		return f.handleHTTPError(acct, status, respBody, uerr, attemptStarted, i)
+		return f.handleHTTPError(ctx, acct, status, respBody, uerr, attemptStarted, i)
 	}
 	// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 	// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核）。
@@ -879,11 +889,11 @@ func (f *chatFlow) dispatch(acct *auth.Auth, i int) rotationAction {
 }
 
 // handleTransportError 处置传输层错误（terr 非 nil 且非 *upstream.Error 信封）。
-func (f *chatFlow) handleTransportError(acct *auth.Auth, terr error, attemptStarted time.Time, i int) rotationAction {
+func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, terr error, attemptStarted time.Time, i int) rotationAction {
 	// 上游超时 / 停滞：**不换号、不罚号**。超时不是账号的问题：同一份请求换到
 	// 别的号撞上的是同一个慢上游，只会把客户端拖到 MaxRotate × header_timeout。
-	// 判定三态见 isUpstreamTimeout；客户端主动断连时 r.Context() 已取消，走抖动分支。
-	if isUpstreamTimeout(terr, f.r.Context().Err() != nil) {
+	// 判定三态见 isUpstreamTimeout；客户端主动断连时 ctx 已取消，走抖动分支。
+	if isUpstreamTimeout(terr, ctx.Err() != nil) {
 		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 		f.st.status = http.StatusServiceUnavailable
 		f.lastErr = fmt.Errorf("%w: %w", errUpstreamTimeout, terr)
@@ -898,14 +908,17 @@ func (f *chatFlow) handleTransportError(acct *auth.Auth, terr error, attemptStar
 	f.lastErr = terr
 	f.h.cfg.Pool.NoteFailures(acct.UID)
 	f.fail(acct.UID)
-	if !rotateBackoff(f.r.Context(), i) {
+	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（传输层错误换号退避）
 	}
 	return rotContinue
 }
 
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
-func (f *chatFlow) handleHTTPError(acct *auth.Auth, status int, respBody []byte, uerr *upstream.Error, attemptStarted time.Time, i int) rotationAction {
+func (f *chatFlow) handleHTTPError(
+	ctx context.Context, acct *auth.Auth, status int, respBody []byte,
+	uerr *upstream.Error, attemptStarted time.Time, i int,
+) rotationAction {
 	f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	f.st.status = status
 	var kind upstream.ErrKind
@@ -945,7 +958,7 @@ func (f *chatFlow) handleHTTPError(acct *auth.Auth, status int, respBody []byte,
 	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
 		return rotBreak
 	}
-	if !rotateBackoff(f.r.Context(), i) {
+	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（分类错误换号退避）
 	}
 	return rotContinue
@@ -974,7 +987,7 @@ func (f *chatFlow) handleRequestLevelError(acct *auth.Auth, kind upstream.ErrKin
 		// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 		msg = fallback
 	}
-	writeOpenAIErrorHint(f.w, http.StatusBadRequest, code, msg,
+	f.out.Error(http.StatusBadRequest, code, msg,
 		f.h.hintOf(kind, raw, f.bareModel, f.reqHasImage, uerr))
 	f.st.status = http.StatusBadRequest
 	f.st.outcome = reqlog.OutcomeHTTPError
@@ -1007,10 +1020,9 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 	// 还原成 delta.tool_calls（见 upstream/dsml.go）。第二参数 true = 名单为空时启用
 	// 弱判定——tools 声明在链路上丢失是实测最常见的泄漏成因。
 	repair := upstream.NewMarkupRepair(f.declaredTools, true)
-	sErr := upstream.StreamHint(f.w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
 		return f.h.hintContext(f.bareModel, f.reqHasImage)
-	}), upstream.WithErrorFrameObserver(func(payload string) { errFrame = payload }),
-		upstream.WithMarkupRepair(repair))
+	}), repair, func(payload string) { errFrame = payload })
 	switch {
 	case upstream.IsEmptyStreamError(sErr):
 		// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE] 兜底（HTTP 头
@@ -1096,7 +1108,7 @@ func (f *chatFlow) handleNonStreamSuccess(acct *auth.Auth, rc io.ReadCloser, att
 	if err != nil {
 		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 		// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
-		writeOpenAIError(f.w, http.StatusBadGateway, "upstream_parse", err.Error())
+		f.out.Error(http.StatusBadGateway, "upstream_parse", err.Error(), "")
 		f.st.status = http.StatusBadGateway
 		f.st.outcome = reqlog.OutcomeHTTPError
 		return rotDone
@@ -1123,7 +1135,7 @@ func (f *chatFlow) handleNonStreamSuccess(acct *auth.Auth, rc io.ReadCloser, att
 	if f.st.hasCache {
 		cacheMissWarn.noteCacheTokens(f.bareModel, f.st.promptTokens, f.st.cacheHit, f.st.cacheMiss)
 	}
-	writeJSON(f.w, http.StatusOK, resp)
+	f.out.JSON(http.StatusOK, resp)
 	f.st.status = http.StatusOK
 	f.st.outcome = reqlog.OutcomeSuccess
 	f.st.toks = completionTokens(resp)
@@ -1226,7 +1238,7 @@ func (f *chatFlow) recordUsage(uid string, delta pool.TokenUsageDelta, credit fl
 func (f *chatFlow) writeFinalError() {
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
-	writeOpenAIErrorHint(f.w, status, code, msg, hint)
+	f.out.Error(status, code, msg, hint)
 	f.st.status = status
 	f.st.outcome = reqlog.OutcomeHTTPError
 }
