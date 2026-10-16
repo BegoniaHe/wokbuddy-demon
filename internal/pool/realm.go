@@ -3,7 +3,6 @@ package pool
 
 import (
 	"sort"
-	"time"
 )
 
 // expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例权重。
@@ -15,7 +14,7 @@ const expiringVirtualSlots = 3
 func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
@@ -44,7 +43,7 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
@@ -80,7 +79,7 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {

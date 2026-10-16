@@ -62,11 +62,14 @@ func TestPickSkipsCooling(t *testing.T) {
 
 func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p := New("")
+	// 注入时钟：推进虚拟时间让冷却到期，无需真实 sleep（issue #20）。
+	now := time.Now()
+	p.SetClock(func() time.Time { return now })
 	a1 := &auth.Auth{UID: "u1"}
 	p.Add(a1)
 	p.SetCredits("u1", 100, 0)
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
-	time.Sleep(5 * time.Millisecond)
+	now = now.Add(5 * time.Millisecond) // 推进注入时钟越过冷却截止
 	got := p.Pick()
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("pick=%+v want u1 after cooldown expiry", got)

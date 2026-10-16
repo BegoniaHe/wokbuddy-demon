@@ -73,7 +73,7 @@ type modelLockAgg struct {
 func (p *Pool) ModelLockView() []ModelLockRow {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	rows, routable := p.aggregateModelLocks(now)
 	if len(rows) == 0 {
 		return nil
