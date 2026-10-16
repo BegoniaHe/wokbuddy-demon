@@ -30,8 +30,11 @@
 | ------------------- | ----------------------------------------------------------- |
 | Go                  | 1.27（`go.mod`、CI、`Dockerfile` 同源）                     |
 | golangci-lint       | v2（严格规则集见 `.golangci.yml`；含 `gofumpt` + `gci`）    |
+| Bun                 | 前端工程 `web/` 的依赖与构建（Rsbuild + React 19 + Tailwind 4） |
 | Python              | 3.x，仅用于 `scripts/*.py` 与 `login.sh` 的 JSON 解析       |
 | Docker（可选）      | `docker compose` 本地镜像运行                                |
+
+前端产物 `internal/panel/dist` 已提交进仓库，`go build`/`go test` 本身**无需** Bun；仅改动 `web/` 前端源码时才需 `make web` 重新构建并提交产物。
 
 开始：
 
@@ -52,6 +55,7 @@ go build ./...
 go run ./cmd/server -config config.json
 go test ./...
 golangci-lint run ./...
+cd web && bun run build   # 前端（改 web/ 后需重新构建 internal/panel/dist）
 ```
 
 ### 依赖与锁定
@@ -67,6 +71,8 @@ make test-race     # 竞态检测（较慢，手工跑）
 make bench         # 基准测试
 make cover         # 覆盖率
 make ci            # fmt-check + lint + test（CI 本地复现）
+make web           # 前端构建（web/ → internal/panel/dist，需 Bun）
+make web-check     # 前端类型检查 + 单元测试
 ```
 
 仓库门禁是分开的：
@@ -75,8 +81,9 @@ make ci            # fmt-check + lint + test（CI 本地复现）
 - `make lint`：`golangci-lint run`（严格规则集）。
 - `make vet`：`go vet`。
 - `make build` / `make build-all`：构建。
+- `make web-check`：前端 typecheck + vitest（`web/` 内改动必跑）。
 
-CI（`.github/workflows/`）：`lint.yml` 跑 `golangci-lint` v2 与格式校验；`go-binaries.yml` 跑测试 + 五平台编译验证（PR/主干，不发布）；`nightly.yml` 每日构建 nightly 二进制与 `:nightly` 镜像；`docker-ghcr.yml` 在主干构建多架构镜像；`secret-scan.yml` / `dependency-review.yml` 做密钥与依赖审查。格式问题一律用 `make fmt` 修，不要手工对抗 formatter。
+CI（`.github/workflows/`）：`lint.yml` 跑 `golangci-lint` v2 与格式校验；`go-binaries.yml` 跑测试 + 五平台编译验证（PR/主干，不发布）；`web.yml` 跑前端 typecheck/test/build 并断言 `internal/panel/dist` 与源码一致；`nightly.yml` 每日构建 nightly 二进制与 `:nightly` 镜像；`docker-ghcr.yml` 在主干构建多架构镜像；`secret-scan.yml` / `dependency-review.yml` 做密钥与依赖审查。格式问题一律用 `make fmt` 修，不要手工对抗 formatter。
 
 构建标识：`make build-all VERSION=<id>` 经 `-ldflags -X main.appVersion` 注入（缺省取 git 短 SHA）；CI/nightly 注入 `nightly-<date>-<sha>`。`appVersion` 只是运行时自述串，非发布版本。
 
@@ -108,7 +115,7 @@ WokBuddy Demon 是一个本地网关：接收 OpenAI 兼容的 `/v1/*` 请求，
 
 - `internal/server/`：HTTP handler、WAF/IP、退避、模型解析、降级、日志。
 - `internal/httpauth/`：网关与面板共用的 Bearer 鉴权原语，常量时间比较（`subtle.ConstantTimeCompare`）。两处鉴权必须同口径。
-- `internal/panel/`：内嵌管理面板（`//go:embed` 单文件 `index.html` + `app.js`），无外部构建依赖，与二进制同体部署。账号运维 / 用量积分 / 模型档位 / 在线改配置 / 运行日志 / 任务中心。
+- `internal/panel/`：内嵌管理面板（前端 `web/` 的构建产物 `dist/` 经 `//go:embed` 打进二进制），与二进制同体部署。账号运维 / 用量积分 / 模型档位 / 在线改配置 / 运行日志 / 任务中心。
 - `internal/usage/`、`internal/reqlog/`、`internal/livecfg/`、`internal/logfmt/`：用量记录、请求归档（脱敏元数据）、热改配置快照、日志格式化。
 
 ### 配置与状态
@@ -129,7 +136,7 @@ WokBuddy Demon 是一个本地网关：接收 OpenAI 兼容的 `/v1/*` 请求，
 
 ## Generated artifacts and documentation
 
-- 面板前端 `internal/panel/*.html`、`*.js` 为手工维护并 `go:embed`；改动需保证冒烟测试（顶层 JS 冒烟）通过。
+- 面板前端源码在 `web/`（Rsbuild + React 19 + Tailwind 4）；构建产物 `internal/panel/dist` 提交进仓库并 `go:embed`。改 `web/` 后运行 `make web` 重新构建并提交产物；CI（`web.yml`）断言产物与源码一致，`web/` 内改动需通过 `make web-check`（typecheck + vitest）。
 - `internal/upstream/model.json` 为本地模型目录缓存，按需从 models.dev 拉取后原子写回；缺失/损坏自动回落仓库内嵌种子。
 - 用户可见行为变更更新 `README.md`（中文）。溯源/血缘变更更新 `internal/upstream/UPSTREAM.md`。
 - 不要把上游（`AstrBot` / 前序 fork）的发布/文档 URL 当作本仓库产物；引用上游仅用于标注来源。
