@@ -398,6 +398,25 @@ func TestChatStreamPassthrough(t *testing.T) {
 	assertChatSuccessUsage(t, h.cfg.Pool, "u1")
 }
 
+// TestChatStreamRecordsTTFT 流式成功时 TTFT 采样写入账号摘要与 usage 时序（issue #16）。
+func TestChatStreamRecordsTTFT(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	rec := usage.New("")
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: rec})
+
+	res := postChat(t, h, `{"model":"glm-5.2","stream":true,"messages":[]}`)
+	if res.Code != 200 {
+		t.Fatalf("code=%d body=%s", res.Code, res.Body)
+	}
+	if st := statusOf(t, p, "u1"); st.TokenUsage.LastTTFTMs < 1 {
+		t.Errorf("last_ttft_ms=%d want >=1", st.TokenUsage.LastTTFTMs)
+	}
+	if s := rec.Snapshot(24, nil); s.Totals.AvgTTFTMs < 1 {
+		t.Errorf("avg_ttft_ms=%v want >=1", s.Totals.AvgTTFTMs)
+	}
+}
+
 func TestChatRecordsCreditForStreamAndSync(t *testing.T) {
 	for _, stream := range []bool{false, true} {
 		name := "sync"

@@ -56,7 +56,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	maxCredits := maxCreditsOf(cands)
 	bestTier, explored := p.resolveCostTier(cands, reqModel, realm, now)
 	ordered, top := p.rankCandidates(cands, reqModel, bestTier, maxCredits, now)
-	e := p.selectCandidate(ordered, top, now)
+	e := p.selectCandidate(ordered, top, reqModel, now)
 	if explored {
 		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
 		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
@@ -83,6 +83,7 @@ func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now
 		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
 		e.pruneExpiredModelCooldowns(now)
 		e.pruneExpiredModelCosts(now)
+		e.pruneExpiredHealth(now)
 		if !e.healthyInRealm(now, reqModel, realm) {
 			continue
 		}
@@ -199,7 +200,7 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 	for _, e := range cands {
 		ti, ci := e.costTier(reqModel, now)
 		if ti == bestTier {
-			ws = append(ws, weightedEntry{e: e, w: p.routingWeightOf(e, maxCredits, now), cost1k: ci})
+			ws = append(ws, weightedEntry{e: e, w: p.routingWeightOf(e, maxCredits, reqModel, now), cost1k: ci})
 		}
 	}
 	if len(ws) > 5 && hasWeightTie(ws) {
@@ -241,7 +242,7 @@ func hasWeightTie(ws []weightedEntry) bool {
 // selectCandidate 从有序候选中选出最终账号：先按 minPickGap 过滤（防并发撞号，
 // 同一账号在窗口内不重复被选中），全部刚被用过时在**全候选**里按 usedSeq 取最旧者
 // （LRU 兜底，避免 top5 字典序截断把等权重靠后账号饿死），否则在 top5 内加权抽签。
-func (p *Pool) selectCandidate(ordered, top []*entry, now time.Time) *entry {
+func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Time) *entry {
 	eligible := make([]*entry, 0, len(top))
 	for _, c := range top {
 		if now.Sub(c.lastUsed) >= minPickGap {
@@ -260,7 +261,7 @@ func (p *Pool) selectCandidate(ordered, top []*entry, now time.Time) *entry {
 		}
 		return e
 	}
-	return p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+	return p.pickWeighted(eligible, model) // eligible 保序 = top5 降序子集
 }
 
 // floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
@@ -395,7 +396,7 @@ var minPickGap = 100 * time.Millisecond
 // credits 全 0 时仍按 idleWeight 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
-func (p *Pool) pickWeighted(cands []*entry) *entry {
+func (p *Pool) pickWeighted(cands []*entry, model string) *entry {
 	now := p.now()
 	var maxCredits int64
 	for _, e := range cands {
@@ -407,7 +408,7 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	weights := make([]int64, len(cands))
 	var total int64
 	for i, e := range cands {
-		w := p.routingWeightOf(e, maxCredits, now)
+		w := p.routingWeightOf(e, maxCredits, model, now)
 		weights[i] = int64(w * scale)
 		total += weights[i]
 	}
@@ -429,8 +430,8 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	return cands[len(cands)-1]
 }
 
-// weightOf 计算单个账号的普通加权分值。
-func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+// weightOf 计算单个账号的普通加权分值（model 用于叠加该模型上的健康降权因子）。
+func (p *Pool) weightOf(e *entry, maxCredits int64, model string, now time.Time) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
 	if maxCredits > 0 {
@@ -453,7 +454,9 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// 3.（原「成功率 ×3」因子已删，对齐上游 success-ema-review：errTotal 是终身
 	// 累计、只增不减，成功率 = successCount/(successCount+errTotal) 会让早期出过错
 	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
-	return w
+	// 4. 实时健康因子（issue #16）：TTFT 慢 / 错误率高的号按模型降权（半衰期衰减，
+	// 可恢复）。无观测时因子恒 1，不改变既有权重。
+	return w * e.healthFactor(model, now)
 }
 
 // expiringNow 报告账号是否存在当前仍有效的快过期积分批次。
@@ -466,8 +469,8 @@ func expiringNow(e *entry, now time.Time) bool {
 
 // routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
 // 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
-func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
-	w := p.weightOf(e, maxCredits, now)
+func (p *Pool) routingWeightOf(e *entry, maxCredits int64, model string, now time.Time) float64 {
+	w := p.weightOf(e, maxCredits, model, now)
 	if p.preferExpiring && expiringNow(e, now) {
 		return w * expiringVirtualSlots
 	}

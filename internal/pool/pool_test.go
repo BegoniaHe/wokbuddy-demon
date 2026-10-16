@@ -1357,7 +1357,7 @@ func (p *Pool) entryWeight(uid string) float64 {
 			maxCredits = x.credits
 		}
 	}
-	return p.weightOf(e, maxCredits, time.Now())
+	return p.weightOf(e, maxCredits, "", time.Now())
 }
 
 func TestWeightHighCreditsDominates(t *testing.T) {
@@ -1815,8 +1815,8 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
 
 	p.mu.Lock()
-	we := p.routingWeightOf(p.byUID["a"], 100, now)
-	wn := p.routingWeightOf(p.byUID["b"], 100, now)
+	we := p.routingWeightOf(p.byUID["a"], 100, "", now)
+	wn := p.routingWeightOf(p.byUID["b"], 100, "", now)
 	p.mu.Unlock()
 	if we != wn*expiringVirtualSlots {
 		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
@@ -1825,8 +1825,8 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetPreferExpiring(false)
 
 	p.mu.Lock()
-	wa := p.routingWeightOf(p.byUID["a"], 100, now)
-	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	wa := p.routingWeightOf(p.byUID["a"], 100, "", now)
+	wb := p.routingWeightOf(p.byUID["b"], 100, "", now)
 	p.mu.Unlock()
 	if wa != wb {
 		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)
