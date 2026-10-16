@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
@@ -278,7 +279,7 @@ func (p *Pool) saveLocked() {
 		p.notePersistFail(err)
 		return
 	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
+	if err := atomicwrite.Rename(tmp, p.stateFp); err != nil {
 		p.notePersistFail(err)
 		return
 	}
