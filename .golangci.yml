@@ -1,0 +1,175 @@
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - asasalint
+    - bodyclose
+    - copyloopvar
+    - dogsled
+    - durationcheck
+    - dupword
+    - errcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    - fatcontext
+    - forcetypeassert
+    - gocritic
+    - gosec
+    - govet
+    - ineffassign
+    - intrange
+    - makezero
+    - mirror
+    - misspell
+    - nilerr
+    - nilnil
+    - noctx
+    - nolintlint
+    - perfsprint
+    - prealloc
+    - predeclared
+    - protogetter
+    - reassign
+    - revive
+    - rowserrcheck
+    - sqlclosecheck
+    - staticcheck
+    - testifylint
+    - thelper
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: false
+      exclude-functions:
+        - (io.Closer).Close
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+      disabled-checks:
+        - hugeParam
+        - rangeValCopy
+        - ifElseChain
+        # 项目既有 API 一致返回多值、匿名返回；重命名会波及大量调用点，
+        # 属风格取舍而非缺陷。
+        - tooManyResultsChecker
+        - unnamedResult
+        - importShadow
+    gosec:
+      excludes:
+        - G104
+        # 非加密随机：账号池加权选号 / 会话 id 抖动，非安全用途。
+        - G404
+        # 路径拼接 / SSRF：仅出现在本地 CLI 工具与 login.sh 驱动的 OAuth 流程，
+        # 输入来自本机用户，非对外服务的攻击面。
+        - G703
+        - G704
+        # 序列化 api_key 到本地 config：config 本就是凭据载体，落盘为设计行为。
+        - G117
+    misspell:
+      locale: US
+    exhaustive:
+      # 带 default 兜底的 switch 视为已穷举（项目大量 switch 用 default 收口）。
+      default-signifies-exhaustive: true
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+    revive:
+      enable-all-rules: false
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: if-return
+        - name: increment-decrement
+        - name: var-naming
+        - name: var-declaration
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: errorf
+        - name: empty-block
+        - name: superfluous-else
+        - name: unreachable-code
+        - name: redefines-builtin-id
+    staticcheck:
+      checks:
+        - all
+    usetesting:
+      context-background: true
+      context-todo: true
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - forcetypeassert
+          - gosec
+          - unparam
+          - gocritic
+          - prealloc
+          - errchkjson
+          # 测试惯用：httptest.NewRequest / exec.Command 不带 context；
+          # UA 三段式等常量含合法重复词；表驱动 helper 命名自由。
+          - noctx
+          - dupword
+          - nolintlint
+          - dogsled
+          - unused
+          - errname
+          - mirror
+          - thelper
+          - staticcheck
+          - revive
+          - predeclared
+          - usetesting
+
+formatters:
+  enable:
+    - gofumpt
+    - gci
+  settings:
+    gofumpt:
+      extra:
+        group-params: true
+    gci:
+      sections:
+        - standard
+        - default
+        - prefix(github.com/BegoniaHe/wokbuddy-demon)
+      custom-order: true

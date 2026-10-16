@@ -1,0 +1,38 @@
+name: lint
+
+# 严格静态检查 + 格式校验（gofumpt + gci，规则见 .golangci.yml）。
+#   - push main / PR / 手动触发
+#   - PR 仅触碰 Go 相关文件时才跑（省 CI 配额）
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".golangci.yml"
+      - ".github/workflows/lint.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  golangci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+      - name: Lint
+        run: golangci-lint run --timeout=5m ./...
+      - name: Format check (gofumpt + gci)
+        run: golangci-lint fmt --diff ./...
