@@ -5,7 +5,6 @@ package upstream
 
 import (
 	"errors"
-	"net/http"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -26,7 +25,7 @@ func (c *Client) ClaimTrial(a *auth.Auth) (claimed bool, err error) {
 	if a == nil || a.Realm() != "global" {
 		return false, errors.New("claim trial: only global accounts")
 	}
-	_, err = c.billingJSON(a, http.MethodPost, trialPath, nil)
+	_, err = c.billingJSON(a, trialPath, nil)
 	if err != nil {
 		var ue *Error
 		if errors.As(err, &ue) && trialAlreadyErr(ue.Msg) {

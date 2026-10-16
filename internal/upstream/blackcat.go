@@ -73,7 +73,7 @@ func (c *Client) RunNightChats(a *auth.Auth, need int) (int64, error) {
 
 // ClaimGift 领取新手礼包（每号一次，已领返回业务错误）。
 func (c *Client) ClaimGift(a *auth.Auth) (int64, error) {
-	data, err := c.billingJSON(a, http.MethodPost, "/billing/meter/claim-gift", map[string]any{})
+	data, err := c.billingJSON(a, "/billing/meter/claim-gift", map[string]any{})
 	if err != nil {
 		return 0, err
 	}
@@ -86,7 +86,7 @@ func (c *Client) ClaimGift(a *auth.Auth) (int64, error) {
 
 // ClaimCompensation 领取活动补偿（有则领，无则业务错误）。
 func (c *Client) ClaimCompensation(a *auth.Auth) (int64, error) {
-	data, err := c.billingJSON(a, http.MethodPost, "/billing/meter/claim-compensation", map[string]any{})
+	data, err := c.billingJSON(a, "/billing/meter/claim-compensation", map[string]any{})
 	if err != nil {
 		return 0, err
 	}
