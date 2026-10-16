@@ -34,6 +34,13 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
+	// RotateBudget 轮换总时长预算：从首个尝试起累计耗时达此值即停止换号（0 = 不限）。
+	// 与 MaxRotate 构成「先到先停」——避免慢上游下 MaxRotate × header_timeout 把
+	// 客户端拖很久（issue #17）。
+	RotateBudget time.Duration
+	// RotateStatuses 非空时，HTTP 状态码错误仅当 status 在集合内才换号（空 = 维持
+	// 现有按错误分类的换号语义）。只收窄换号，不改账号冷却/熔断惩罚（issue #17）。
+	RotateStatuses map[int]bool
 	// Keys 命名密钥存储（可选；nil = 仅默认 api_key）。命名密钥只用于网关 API
 	// 面（/v1/chat/completions、/v1/models）；/status 仍只认默认密钥。
 	Keys *apikey.Store
@@ -797,8 +804,19 @@ func (f *chatFlow) fail(uid string) {
 }
 
 // runRotation 执行选号 + 重试轮转。返回 true 表示已写出响应（成功或请求级错误）。
+// 「先到先停」：次数上限 MaxRotate 与总时长预算 RotateBudget（>0 时）任一先到即停。
 func (f *chatFlow) runRotation(ctx context.Context) bool {
+	var deadline time.Time
+	if f.h.cfg.RotateBudget > 0 {
+		deadline = time.Now().Add(f.h.cfg.RotateBudget)
+	}
 	for i := range f.h.cfg.MaxRotate {
+		// 预算检查放在循环顶部（含上一轮退避之后）：退避已把耗时推过预算时立即停。
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			log.Printf("WARN: [server] rotate budget %s exhausted after %d attempt(s): stop rotating",
+				f.h.cfg.RotateBudget, i)
+			return false
+		}
 		f.rotateReason = ""
 		switch f.attempt(ctx, i) {
 		case rotContinue:
@@ -1008,11 +1026,25 @@ func (f *chatFlow) handleHTTPError(
 	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
 		return rotBreak
 	}
+	// 状态码换号闸（issue #17，默认关闭）：allowlist 非空时仅列出的状态码才换号；
+	// 不在列表则停止换号、透传上游错误（账号惩罚已由 applyErrorPolicy 记账，不变）。
+	if !f.rotateAllowedForStatus(status) {
+		return rotBreak
+	}
 	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（分类错误换号退避）
 	}
 	f.rotateReason = kind.String()
 	return rotContinue
+}
+
+// rotateAllowedForStatus 报告该 HTTP 状态码是否允许换号：RotateStatuses 为空时恒 true
+// （维持现有按错误分类的换号语义）；非空时为 allowlist 判定。
+func (f *chatFlow) rotateAllowedForStatus(status int) bool {
+	if len(f.h.cfg.RotateStatuses) == 0 {
+		return true
+	}
+	return f.h.cfg.RotateStatuses[status]
 }
 
 // failFastKind 报告 kind 是否属于「换号必然同样失败」的请求级错误。

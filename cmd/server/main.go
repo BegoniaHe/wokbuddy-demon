@@ -244,6 +244,10 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
+		MaxRotate:      cfg.Upstream.RotateMax,
+		RotateBudget:   cfg.RotateBudgetDur,
+		RotateStatuses: rotateStatusSet(cfg.Upstream.RotateStatusCodes),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
