@@ -101,13 +101,18 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 	return nil, fmt.Errorf("%w: %w", ErrProxyDial, lastErr)
 }
 
-// inCooldown 报告代理是否处于有效冷却期。调用方须持 pool.mu 或已快照 now。
+// inCooldown 报告代理是否处于有效冷却期。内部加锁，可在未持 pool.mu 时调用
+// （DialContext 拨号前已释放锁，多路并发拨号会并发读写 cooldownTill）。
 func (pool *Pool) inCooldown(st *proxyState, now time.Time) bool {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
 	return now.Before(st.cooldownTill)
 }
 
-// earliest 返回冷却截止最早的代理（全部冷却时的半开探测目标）。
+// earliest 返回冷却截止最早的代理（全部冷却时的半开探测目标）。内部加锁。
 func (pool *Pool) earliest() *proxyState {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
 	best := pool.states[0]
 	for _, st := range pool.states[1:] {
 		if st.cooldownTill.Before(best.cooldownTill) {

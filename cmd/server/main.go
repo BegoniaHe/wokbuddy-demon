@@ -622,7 +622,7 @@ func restartRequiredFields(c *Config) []string {
 	// up.UserAgent = ...），之后不再读取——不在 livecfg 热快照里，也无法热改。
 	// 此前漏列 user_agent，导致面板改完显示"已保存"却不提示需要重启（issue #102 附带发现 2）。
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds",
-		"upstream.idle_timeout_seconds", "upstream.user_agent")
+		"upstream.idle_timeout_seconds", "upstream.user_agent", "upstream.proxies")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}

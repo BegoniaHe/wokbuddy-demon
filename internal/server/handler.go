@@ -952,9 +952,9 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 		return rotBreak
 	}
 	// 出站代理层拨号失败（issue #15）：不是账号的问题，且同一请求换号仍走同一代理池
-	// ——终止轮转、不惩罚账号（不喂熔断/连败降权），代理池自身已轮换/冷却。
+	// ——终止轮转、不惩罚账号，代理池自身已轮换/冷却。不调用 recordAttempt：连接从未
+	// 建立，不算一次上游尝试，避免喂账号健康台账（issue #16 的错误压力）与连败降权。
 	if errors.Is(terr, outbound.ErrProxyDial) {
-		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 		f.st.status = http.StatusServiceUnavailable
 		f.lastErr = fmt.Errorf("proxy: %w", terr)
 		log.Printf("WARN: [server] outbound proxy dial failed acct=%s: %v (rotation stopped, account not penalized)",

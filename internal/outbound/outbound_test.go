@@ -130,10 +130,7 @@ func TestPoolFallbackAndCooldown(t *testing.T) {
 	}
 	conn.Close()
 	// dead 已冷却：第二次直接走代理。
-	pool.mu.Lock()
-	cooled := pool.inCooldown(pool.states[0], pool.now())
-	pool.mu.Unlock()
-	if !cooled {
+	if !pool.inCooldown(pool.states[0], time.Now()) {
 		t.Error("failed proxy should be in cooldown")
 	}
 }
