@@ -361,6 +361,20 @@ func TestAggregateByModel(t *testing.T) {
 	wantEq(t, "空切片长度", len(empty), 0)
 }
 
+// TestTTFTAggregation TTFT 采样：仅 HasTTFT 的样本参与均值，非流式不污染样本（issue #16）。
+func TestTTFTAggregation(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{TTFTMs: 300, HasTTFT: true, LatencyMs: 2000, HasLatency: true}, true)
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{TTFTMs: 500, HasTTFT: true, LatencyMs: 2500, HasLatency: true}, true)
+	// 非流式：无 TTFT 观测，不参与均值。
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{LatencyMs: 100, HasLatency: true}, true)
+
+	s := r.Snapshot(24, nil)
+	wantEq(t, "avg_ttft_ms", s.Totals.AvgTTFTMs, 400.0)
+	wantEq(t, "avg_latency_ms", s.Totals.AvgLatencyMs, (2000.0+2500.0+100.0)/3)
+}
+
 // wantEq 断言 got == want，失败时用 label 指明字段。统一入口避免逐项 if 抬高
 // 测试函数复杂度，断言条件与原逐项检查等价。
 func wantEq[T comparable](t *testing.T, label string, got, want T) {

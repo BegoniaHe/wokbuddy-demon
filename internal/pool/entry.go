@@ -27,12 +27,15 @@ func (k CoolKind) String() string {
 
 // TokenUsage 账号聊天请求的累计 token 用量摘要（不包含任何原始凭证）。
 type TokenUsage struct {
-	RequestCount        int64     `json:"request_count,omitempty"`
-	UsageCount          int64     `json:"usage_count,omitempty"`
-	PromptTokens        int64     `json:"prompt_tokens,omitempty"`
-	CompletionTokens    int64     `json:"completion_tokens,omitempty"`
-	TotalTokens         int64     `json:"total_tokens,omitempty"`
-	LastLatencyMs       int64     `json:"last_latency_ms,omitempty"`
+	RequestCount     int64 `json:"request_count,omitempty"`
+	UsageCount       int64 `json:"usage_count,omitempty"`
+	PromptTokens     int64 `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64 `json:"completion_tokens,omitempty"`
+	TotalTokens      int64 `json:"total_tokens,omitempty"`
+	LastLatencyMs    int64 `json:"last_latency_ms,omitempty"`
+	// LastTTFTMs 最近一次首字节延迟（TTFT，ms）。仅流式有观测；0 = 无观测。
+	// 与 LastLatencyMs（端到端）区分：TTFT 不受输出长度影响，是延迟健康信号。
+	LastTTFTMs          int64     `json:"last_ttft_ms,omitempty"`
 	LastTokensPerSecond *float64  `json:"last_tokens_per_second,omitempty"`
 	LastUsedAt          time.Time `json:"last_used_at,omitempty"`
 	LastModel           string    `json:"last_model,omitempty"`
@@ -50,6 +53,8 @@ type TokenUsageDelta struct {
 	TotalTokens         int64
 	HasLatencyMs        bool
 	LatencyMs           int64
+	HasTTFTMs           bool
+	TTFTMs              int64
 	HasTokensPerSecond  bool
 	TokensPerSecond     float64
 }
@@ -189,6 +194,9 @@ type entry struct {
 	lastErr                  time.Time  // 最近一次错误时间
 	lastSuccess              time.Time  // 最近一次成功时间
 	tokenUsage               TokenUsage // 聊天请求 token 用量摘要（持久化）
+	// health 按模型的实时健康台账（TTFT EWMA + 错误压力），供选号降权（issue #16）。
+	// 运行态、不持久化：信号短时有效（TTL 过期即删），重启后中性起步。
+	health map[string]*modelHealth
 	// lastCheckinDay 最近一次签到成功的本地日期（"2006-01-02"）。签到成功与上游
 	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 CheckinDone 供面板按钮显示
 	// 签到/已签。持久化：跨重启不丢当日状态。
