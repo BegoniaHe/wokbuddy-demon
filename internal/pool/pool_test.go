@@ -495,15 +495,7 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// JSON tag 全小写下划线；err_total 落盘，err_count 不再落盘。
-	for _, want := range []string{`"cool_kind"`, `"success_count"`, `"err_total"`, `"last_success"`, `"last_err"`} {
-		if !strings.Contains(string(raw), want) {
-			t.Errorf("state.json missing %s:\n%s", want, raw)
-		}
-	}
-	if strings.Contains(string(raw), `"err_count"`) {
-		t.Errorf("state.json should not write legacy err_count:\n%s", raw)
-	}
+	assertStateJSONFields(t, raw)
 
 	// 重载后字段保留
 	p2 := New(fp)
@@ -520,6 +512,20 @@ func TestStateRoundTripExtendedFields(t *testing.T) {
 	}
 	if st.LastSuccessTime.IsZero() || st.LastErrTime.IsZero() {
 		t.Error("last_success/last_err lost after reload")
+	}
+}
+
+// assertStateJSONFields 校验 state.json 含必需字段、且不再写旧 err_count。
+func assertStateJSONFields(t *testing.T, raw []byte) {
+	t.Helper()
+	// JSON tag 全小写下划线；err_total 落盘，err_count 不再落盘。
+	for _, want := range []string{`"cool_kind"`, `"success_count"`, `"err_total"`, `"last_success"`, `"last_err"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("state.json missing %s:\n%s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), `"err_count"`) {
+		t.Errorf("state.json should not write legacy err_count:\n%s", raw)
 	}
 }
 
@@ -1039,21 +1045,24 @@ func TestList(t *testing.T) {
 	if len(list) != 2 {
 		t.Fatalf("list=%d", len(list))
 	}
-	var s1, s2 Status
-	for _, s := range list {
-		if s.UID == "u1" {
-			s1 = s
-		}
-		if s.UID == "u2" {
-			s2 = s
-		}
-	}
+	s1 := statusByUID(list, "u1")
+	s2 := statusByUID(list, "u2")
 	if s1.Credits != 42 || s1.Nickname != "nick1" || s1.Disabled || s1.Cooling {
 		t.Errorf("s1=%+v", s1)
 	}
 	if !s2.Cooling || s2.Reason != "429" {
 		t.Errorf("s2=%+v", s2)
 	}
+}
+
+// statusByUID 从状态列表里取指定 uid 的项；不存在返回零值。
+func statusByUID(list []Status, uid string) Status {
+	for _, s := range list {
+		if s.UID == uid {
+			return s
+		}
+	}
+	return Status{}
 }
 
 func TestRemoveMissingFromDir(t *testing.T) {
@@ -1733,6 +1742,12 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertTokenUsagePersisted(t, raw)
+}
+
+// assertTokenUsagePersisted 校验 state.json 落了 token_usage 且不含凭证字段。
+func assertTokenUsagePersisted(t *testing.T, raw []byte) {
+	t.Helper()
 	if !strings.Contains(string(raw), `"token_usage"`) {
 		t.Fatalf("state.json missing token_usage: %s", raw)
 	}
@@ -1822,27 +1837,38 @@ func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
 	p.SetCreditsDetailed("u1", 100, 100, 50, now.Add(time.Hour), 40)
 
 	st, _ := p.Status("u1")
-	if st.CreditsExpiring != 50 || st.CreditsEarliestRemaining != 40 || st.CreditsEarliestExpiry.IsZero() {
-		t.Fatalf("initial snapshot=%+v", st)
-	}
+	assertExpirySnapshot(t, st, "initial", 50, 40, false)
 
 	p.NoteModelCost("u1", "m", 10, 1000)
 	st, _ = p.Status("u1")
-	if st.Credits != 90 || st.CreditsExpiring != 40 || st.CreditsEarliestRemaining != 30 {
-		t.Fatalf("after consume=%+v", st)
-	}
+	assertCredits(t, st, "after consume", 90)
+	assertExpirySnapshot(t, st, "after consume", 40, 30, false)
 
 	p.NoteModelCost("u1", "m", 40, 1000)
 	st, _ = p.Status("u1")
-	if st.Credits != 50 || st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
-		t.Fatalf("after exhaustion=%+v", st)
-	}
+	assertCredits(t, st, "after exhaustion", 50)
+	assertExpirySnapshot(t, st, "after exhaustion", 0, 0, true)
 
 	p.SetCreditsDetailed("u1", 50, 50, 10, now.Add(time.Hour), 10)
 	p.SetCreditsDetailed("u1", 50, 50, 0, time.Time{}, 0)
 	st, _ = p.Status("u1")
-	if st.CreditsExpiring != 0 || st.CreditsEarliestRemaining != 0 || !st.CreditsEarliestExpiry.IsZero() {
-		t.Fatalf("zero refresh did not clear snapshot=%+v", st)
+	assertExpirySnapshot(t, st, "zero refresh", 0, 0, true)
+}
+
+// assertCredits 断言账号剩余积分。
+func assertCredits(t *testing.T, st Status, stage string, want int64) {
+	t.Helper()
+	if st.Credits != want {
+		t.Fatalf("%s credits=%d want %d: %+v", stage, st.Credits, want, st)
+	}
+}
+
+// assertExpirySnapshot 断言账号到期快照三元组：expiring/earliestRemaining 与
+// earliestExpiry 是否零值。
+func assertExpirySnapshot(t *testing.T, st Status, stage string, expiring, earliest int64, expiryZero bool) {
+	t.Helper()
+	if st.CreditsExpiring != expiring || st.CreditsEarliestRemaining != earliest || st.CreditsEarliestExpiry.IsZero() != expiryZero {
+		t.Fatalf("%s snapshot=%+v want expiring=%d earliest=%d expiryZero=%v", stage, st, expiring, earliest, expiryZero)
 	}
 }
 

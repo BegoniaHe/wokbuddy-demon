@@ -156,66 +156,87 @@ data: [DONE]
 // TestStripToolCallNames 直测跨帧 name 收敛：首片保留 name、同 index 后续分片删除
 // name 键（空串或重复非空串都删），不同 index 互不串扰，非 tool_calls 帧零影响。
 func TestStripToolCallNames(t *testing.T) {
-	mkFrame := func(idx float64, name, args string) map[string]any {
-		fn := map[string]any{}
-		if name != "" {
-			fn["name"] = name
-		}
-		if args != "" {
-			fn["arguments"] = args
-		}
-		return map[string]any{"choices": []any{
-			map[string]any{"delta": map[string]any{"tool_calls": []any{
-				map[string]any{"index": idx, "function": fn},
-			}}},
-		}}
-	}
-	getFn := func(f map[string]any) map[string]any {
-		return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
-	}
 	seen := map[int]bool{}
+	assertStripFirstChunk(t, seen)
+	assertStripSubsequentChunks(t, seen)
+	assertStripOtherIndex(t, seen)
+	assertStripContentOnlyUntouched(t, seen)
+}
 
-	// 首片带 name：保留，seen 建立
-	f0 := mkFrame(0, "lookup", "")
+// stripTestFrame 构造单 tool_call 的 delta 帧（name/args 为空则不写对应键）。
+func stripTestFrame(idx float64, name, args string) map[string]any {
+	fn := map[string]any{}
+	if name != "" {
+		fn["name"] = name
+	}
+	if args != "" {
+		fn["arguments"] = args
+	}
+	return map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{"tool_calls": []any{
+			map[string]any{"index": idx, "function": fn},
+		}}},
+	}}
+}
+
+// stripTestFn 取 stripTestFrame 帧里的 function 对象。
+func stripTestFn(f map[string]any) map[string]any {
+	return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+}
+
+// assertStripFirstChunk 首片带 name：保留，seen 建立。
+func assertStripFirstChunk(t *testing.T, seen map[int]bool) {
+	t.Helper()
+	f0 := stripTestFrame(0, "lookup", "")
 	stripToolCallNames(f0, seen)
 	if !seen[0] {
 		t.Fatal("index 0 should be marked seen after first chunk")
 	}
-	if getFn(f0)["name"] != "lookup" {
-		t.Errorf("first chunk name=%v want lookup", getFn(f0)["name"])
+	if stripTestFn(f0)["name"] != "lookup" {
+		t.Errorf("first chunk name=%v want lookup", stripTestFn(f0)["name"])
 	}
+}
 
+// assertStripSubsequentChunks 同 index 后续分片（空串或重复非空 name）删除 name 键，
+// arguments 原样保留。
+func assertStripSubsequentChunks(t *testing.T, seen map[int]bool) {
+	t.Helper()
 	// 后续 chunk name 为空串：删除 name 键
-	f1 := mkFrame(0, "", `{"term":"x"}`)
+	f1 := stripTestFrame(0, "", `{"term":"x"}`)
 	stripToolCallNames(f1, seen)
-	if _, ok := getFn(f1)["name"]; ok {
-		t.Errorf("subsequent empty name should be stripped: %#v", getFn(f1))
+	if _, ok := stripTestFn(f1)["name"]; ok {
+		t.Errorf("subsequent empty name should be stripped: %#v", stripTestFn(f1))
 	}
-	if getFn(f1)["arguments"] != `{"term":"x"}` {
-		t.Errorf("arguments altered: %#v", getFn(f1)["arguments"])
+	if stripTestFn(f1)["arguments"] != `{"term":"x"}` {
+		t.Errorf("arguments altered: %#v", stripTestFn(f1)["arguments"])
 	}
-
 	// 后续 chunk 重复非空 name（上游噪声）：同样删除，arguments 原样
-	f2 := mkFrame(0, "lookup", "y")
+	f2 := stripTestFrame(0, "lookup", "y")
 	stripToolCallNames(f2, seen)
-	if _, ok := getFn(f2)["name"]; ok {
-		t.Errorf("subsequent duplicate non-empty name should be stripped: %#v", getFn(f2))
+	if _, ok := stripTestFn(f2)["name"]; ok {
+		t.Errorf("subsequent duplicate non-empty name should be stripped: %#v", stripTestFn(f2))
 	}
-	if getFn(f2)["arguments"] != "y" {
-		t.Errorf("arguments altered: %#v", getFn(f2)["arguments"])
+	if stripTestFn(f2)["arguments"] != "y" {
+		t.Errorf("arguments altered: %#v", stripTestFn(f2)["arguments"])
 	}
+}
 
-	// 不同 index 互不串扰：index 1 首片保留 name
-	f3 := mkFrame(1, "other", "")
+// assertStripOtherIndex 不同 index 互不串扰：index 1 首片保留 name。
+func assertStripOtherIndex(t *testing.T, seen map[int]bool) {
+	t.Helper()
+	f3 := stripTestFrame(1, "other", "")
 	stripToolCallNames(f3, seen)
-	if getFn(f3)["name"] != "other" {
-		t.Errorf("index 1 first name=%v want other", getFn(f3)["name"])
+	if stripTestFn(f3)["name"] != "other" {
+		t.Errorf("index 1 first name=%v want other", stripTestFn(f3)["name"])
 	}
 	if !seen[1] {
 		t.Error("index 1 should be marked seen")
 	}
+}
 
-	// 非 tool_calls 帧（content only）零影响
+// assertStripContentOnlyUntouched 非 tool_calls 帧（content only）零影响。
+func assertStripContentOnlyUntouched(t *testing.T, seen map[int]bool) {
+	t.Helper()
 	f4 := map[string]any{"choices": []any{
 		map[string]any{"delta": map[string]any{"content": "hi"}},
 	}}
@@ -244,6 +265,12 @@ func TestStreamToolCallNameOnce(t *testing.T) {
 	if len(frames) != nFrames {
 		t.Fatalf("frames=%d want %d", len(frames), nFrames)
 	}
+	assertToolCallNameOnceFrames(t, frames)
+}
+
+// assertToolCallNameOnceFrames 断言 name 只出现在首帧（值 Bash），arguments 逐帧原样。
+func assertToolCallNameOnceFrames(t *testing.T, frames []map[string]any) {
+	t.Helper()
 	gotName := 0
 	for i, fr := range frames {
 		chs, _ := fr["choices"].([]any)
@@ -478,7 +505,16 @@ func TestStreamNormalizesFrames(t *testing.T) {
 	}
 
 	// 帧 1：噪声全剔除，finish_reason ""→null，usage 缺失→null，顶层非标字段剥除
-	f0 := frames[0]
+	assertNormalizedFrame0(t, frames[0])
+	// 帧 2：非空 content 与 tool_calls 保留，finish_reason ""→null
+	assertNormalizedFrame1(t, frames[1])
+	// 帧 3：finish_reason 非空保留，usage 保留
+	assertNormalizedFrame2(t, frames[2])
+}
+
+// assertNormalizedFrame0 断言首帧：顶层非标字段剥除、空 delta 噪声全剔除、finish/usage 归 null。
+func assertNormalizedFrame0(t *testing.T, f0 map[string]any) {
+	t.Helper()
 	if _, ok := f0["extra_field"]; ok {
 		t.Error("top-level extra_field should be dropped")
 	}
@@ -499,9 +535,11 @@ func TestStreamNormalizesFrames(t *testing.T) {
 			t.Errorf("frame1 delta should drop %q, got %#v", noise, d)
 		}
 	}
+}
 
-	// 帧 2：非空 content 与 tool_calls 保留，finish_reason ""→null
-	f1 := frames[1]
+// assertNormalizedFrame1 断言第二帧：非空 content 与 tool_calls 保留，空 finish_reason 归 null。
+func assertNormalizedFrame1(t *testing.T, f1 map[string]any) {
+	t.Helper()
 	ch1 := f1["choices"].([]any)[0].(map[string]any)
 	d1 := ch1["delta"].(map[string]any)
 	if d1["content"] != "hello" {
@@ -514,9 +552,11 @@ func TestStreamNormalizesFrames(t *testing.T) {
 	if ch1["finish_reason"] != nil {
 		t.Errorf("frame2 finish_reason=%v want null (input empty string)", ch1["finish_reason"])
 	}
+}
 
-	// 帧 3：finish_reason 非空保留，usage 保留
-	f2 := frames[2]
+// assertNormalizedFrame2 断言第三帧：finish_reason 与 usage 均保留。
+func assertNormalizedFrame2(t *testing.T, f2 map[string]any) {
+	t.Helper()
 	ch2 := f2["choices"].([]any)[0].(map[string]any)
 	if ch2["finish_reason"] != "stop" {
 		t.Errorf("frame3 finish_reason=%v want stop", ch2["finish_reason"])
@@ -708,32 +748,39 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
-			body := rec.Body.String()
-			if n := strings.Count(body, "data: [DONE]"); n != 1 {
-				t.Errorf("[DONE] count=%d want 1: %q", n, body)
-			}
-			// error 帧必须原样保留 error 字段（未被 normalizeFrame 白名单剥掉）
-			var e map[string]any
-			found := false
-			for _, ln := range strings.Split(body, "\n") {
-				ln = strings.TrimSpace(ln)
-				if strings.HasPrefix(ln, "data: ") {
-					payload := strings.TrimPrefix(ln, "data: ")
-					if payload == "[DONE]" {
-						continue
-					}
-					if json.Unmarshal([]byte(payload), &e) == nil {
-						if em, ok := e["error"].(map[string]any); ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" {
-							found = true
-						}
-					}
-				}
-			}
-			if !found {
-				t.Errorf("error frame absent or error field stripped: %q", body)
-			}
+			assertEmptyStreamErrorFrame(t, rec.Body.String())
 		})
 	}
+}
+
+// assertEmptyStreamErrorFrame 断言空流响应恰好一个 [DONE] 且带完整的空流 error 帧。
+func assertEmptyStreamErrorFrame(t *testing.T, body string) {
+	t.Helper()
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, body)
+	}
+	if !findEmptyStreamError(body) {
+		t.Errorf("error frame absent or error field stripped: %q", body)
+	}
+}
+
+// findEmptyStreamError 在 SSE body 里查找空流 error 帧（error 字段未被白名单剥掉）。
+func findEmptyStreamError(body string) bool {
+	for _, ln := range strings.Split(body, "\n") {
+		payload, ok := strings.CutPrefix(strings.TrimSpace(ln), "data: ")
+		if !ok || payload == "[DONE]" {
+			continue
+		}
+		var e map[string]any
+		if json.Unmarshal([]byte(payload), &e) != nil {
+			continue
+		}
+		em, ok := e["error"].(map[string]any)
+		if ok && em["message"] == "empty upstream stream" && em["type"] == "upstream_error" {
+			return true
+		}
+	}
+	return false
 }
 
 // TestStreamGarbageAfterDone 校验 DONE 之后的垃圾帧不出现在响应里。
@@ -1045,58 +1092,82 @@ func TestStreamMarkupRepairEndToEnd(t *testing.T) {
 	}
 
 	frames := viewSSE(t, body)
-	var text strings.Builder
-	var calls []map[string]any
-	lastCallIdx, finishIdx, finishCount := -1, -1, 0
+	s := summarizeMarkupFrames(frames)
+	if s.text.String() != prose {
+		t.Fatalf("正文应只保留标记之外的部分\nwant %q\ngot  %q", prose, s.text.String())
+	}
+	assertMarkupRepairCalls(t, s.calls, []string{"ls -la", "pwd"})
+	if s.finishCount != 1 {
+		t.Fatalf("收尾帧应恰好 1 个，实际 %d（body=%s）", s.finishCount, body)
+	}
+	if frames[s.finishIdx].finish != "tool_calls" {
+		t.Fatalf("收尾 finish_reason=%q want tool_calls", frames[s.finishIdx].finish)
+	}
+	if s.finishIdx < s.lastCallIdx {
+		t.Fatalf("收尾帧（第 %d 帧）必须排在最后一个调用帧（第 %d 帧）之后", s.finishIdx, s.lastCallIdx)
+	}
+}
+
+// markupRepairSummary 汇总透传帧：正文、调用帧、收尾帧位置。
+type markupRepairSummary struct {
+	text        strings.Builder
+	calls       []map[string]any
+	lastCallIdx int
+	finishIdx   int
+	finishCount int
+}
+
+// summarizeMarkupFrames 汇总 viewSSE 帧序列。
+func summarizeMarkupFrames(frames []sseFrameView) markupRepairSummary {
+	s := markupRepairSummary{lastCallIdx: -1, finishIdx: -1}
 	for i, f := range frames {
-		text.WriteString(f.content)
+		s.text.WriteString(f.content)
 		for _, tc := range f.calls {
-			calls = append(calls, tc)
-			lastCallIdx = i
+			s.calls = append(s.calls, tc)
+			s.lastCallIdx = i
 		}
 		if f.finish != "" {
-			finishCount++
-			finishIdx = i
+			s.finishCount++
+			s.finishIdx = i
 		}
 	}
-	if text.String() != prose {
-		t.Fatalf("正文应只保留标记之外的部分\nwant %q\ngot  %q", prose, text.String())
+	return s
+}
+
+// assertMarkupRepairCalls 断言还原出的 tool_call 帧的 type/id/index/name/arguments。
+func assertMarkupRepairCalls(t *testing.T, calls []map[string]any, wants []string) {
+	t.Helper()
+	if len(calls) != len(wants) {
+		t.Fatalf("应还原 %d 个 tool_call，实际 %d", len(wants), len(calls))
 	}
-	if len(calls) != 2 {
-		t.Fatalf("应还原 2 个 tool_call，实际 %d（body=%s）", len(calls), body)
+	for i, want := range wants {
+		assertMarkupRepairCall(t, i, calls[i], want)
 	}
-	for i, want := range []string{"ls -la", "pwd"} {
-		tc := calls[i]
-		if tc["type"] != "function" {
-			t.Fatalf("第 %d 个 tool_call type=%v want function", i, tc["type"])
-		}
-		if id, _ := tc["id"].(string); id == "" {
-			t.Fatalf("第 %d 个 tool_call 缺 id", i)
-		}
-		if idx, ok := tc["index"].(float64); !ok || int(idx) != i {
-			t.Fatalf("第 %d 个 tool_call index=%v", i, tc["index"])
-		}
-		fn, _ := tc["function"].(map[string]any)
-		if fn == nil || fn["name"] != "exec_command" {
-			t.Fatalf("第 %d 个 tool_call 函数名错误: %#v", i, tc)
-		}
-		argsJSON, _ := fn["arguments"].(string)
-		var args map[string]any
-		if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-			t.Fatalf("第 %d 个 tool_call arguments 不是合法 JSON: %q", i, argsJSON)
-		}
-		if args["cmd"] != want {
-			t.Fatalf("第 %d 个 tool_call cmd=%#v want %q", i, args["cmd"], want)
-		}
+}
+
+// assertMarkupRepairCall 断言第 i 个 tool_call 的字段与参数。
+func assertMarkupRepairCall(t *testing.T, i int, tc map[string]any, want string) {
+	t.Helper()
+	if tc["type"] != "function" {
+		t.Fatalf("第 %d 个 tool_call type=%v want function", i, tc["type"])
 	}
-	if finishCount != 1 {
-		t.Fatalf("收尾帧应恰好 1 个，实际 %d（body=%s）", finishCount, body)
+	if id, _ := tc["id"].(string); id == "" {
+		t.Fatalf("第 %d 个 tool_call 缺 id", i)
 	}
-	if frames[finishIdx].finish != "tool_calls" {
-		t.Fatalf("收尾 finish_reason=%q want tool_calls", frames[finishIdx].finish)
+	if idx, ok := tc["index"].(float64); !ok || int(idx) != i {
+		t.Fatalf("第 %d 个 tool_call index=%v", i, tc["index"])
 	}
-	if finishIdx < lastCallIdx {
-		t.Fatalf("收尾帧（第 %d 帧）必须排在最后一个调用帧（第 %d 帧）之后", finishIdx, lastCallIdx)
+	fn, _ := tc["function"].(map[string]any)
+	if fn == nil || fn["name"] != "exec_command" {
+		t.Fatalf("第 %d 个 tool_call 函数名错误: %#v", i, tc)
+	}
+	argsJSON, _ := fn["arguments"].(string)
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+		t.Fatalf("第 %d 个 tool_call arguments 不是合法 JSON: %q", i, argsJSON)
+	}
+	if args["cmd"] != want {
+		t.Fatalf("第 %d 个 tool_call cmd=%#v want %q", i, args["cmd"], want)
 	}
 }
 
@@ -1105,16 +1176,7 @@ func TestStreamMarkupRepairAcrossManyChunks(t *testing.T) {
 	content := "开头\n" + mkBlock(mkInvoke("exec_command", mkParam("cmd", "ls -la"))) + "\n结尾"
 	// 按 rune 边界切：真实上游的 JSON 字符串不可能把多字节字符劈成半个 rune，
 	// 字节级切分会在 json.Marshal 时把非法 UTF-8 替换成 U+FFFD，等于先改坏夹具。
-	runes := []rune(content)
-	chunks := make([]string, 0, len(runes)/5+1)
-	for i := 0; i < len(runes); i += 5 {
-		end := i + 5
-		if end > len(runes) {
-			end = len(runes)
-		}
-		chunks = append(chunks, string(runes[i:end]))
-	}
-	raw := upstreamSSEWithContent(chunks, "stop")
+	raw := upstreamSSEWithContent(chunkRunes(content, 5), "stop")
 
 	repair := NewMarkupRepair(testTools, false)
 	rec := httptest.NewRecorder()
@@ -1127,18 +1189,9 @@ func TestStreamMarkupRepairAcrossManyChunks(t *testing.T) {
 	if repair.Converted() != 1 {
 		t.Fatalf("Converted 应为 1，实际 %d", repair.Converted())
 	}
-	var text strings.Builder
-	var calls int
-	var finish string
-	for _, f := range viewSSE(t, rec.Body.String()) {
-		text.WriteString(f.content)
-		calls += len(f.calls)
-		if f.finish != "" {
-			finish = f.finish
-		}
-	}
-	if text.String() != "开头\n\n结尾" {
-		t.Fatalf("正文错误: %q", text.String())
+	text, calls, finish := markupTextSummary(viewSSE(t, rec.Body.String()))
+	if text != "开头\n\n结尾" {
+		t.Fatalf("正文错误: %q", text)
 	}
 	if calls != 1 {
 		t.Fatalf("应还原 1 个 tool_call，实际 %d", calls)
@@ -1146,6 +1199,33 @@ func TestStreamMarkupRepairAcrossManyChunks(t *testing.T) {
 	if finish != "tool_calls" {
 		t.Fatalf("收尾 finish_reason=%q want tool_calls", finish)
 	}
+}
+
+// chunkRunes 按 rune 边界把 content 切成每块最多 size 个 rune。
+func chunkRunes(content string, size int) []string {
+	runes := []rune(content)
+	chunks := make([]string, 0, len(runes)/size+1)
+	for i := 0; i < len(runes); i += size {
+		end := i + size
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[i:end]))
+	}
+	return chunks
+}
+
+// markupTextSummary 汇总透传帧的正文、调用数与收尾 reason。
+func markupTextSummary(frames []sseFrameView) (text string, calls int, finish string) {
+	var sb strings.Builder
+	for _, f := range frames {
+		sb.WriteString(f.content)
+		calls += len(f.calls)
+		if f.finish != "" {
+			finish = f.finish
+		}
+	}
+	return sb.String(), calls, finish
 }
 
 // TestStreamMarkupRepairUnclosedFlushedVerbatim 未闭合的块在流尾原样回吐，不吞字节。

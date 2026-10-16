@@ -303,6 +303,12 @@ func (e *entry) modelExempt() bool {
 	return false
 }
 
+// hardCoolingActive 报告账号是否处于有效的余额耗尽硬冷却期（CoolHard 且 until 未到期）。
+// 该形态下调了必 402，兜底选号需排除，等签到恢复。
+func (e *entry) hardCoolingActive(now time.Time) bool {
+	return e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until)
+}
+
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
 // 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
 func (e *entry) modelCooled(now time.Time, reqModel string) bool {
@@ -382,20 +388,22 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 // 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard 才被排除）。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
-	if !e.until.IsZero() && now.Before(e.until) {
-		t = e.until
-	}
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		if t.IsZero() || e.breakerUntil.Before(t) {
-			t = e.breakerUntil
-		}
-	}
-	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
-		if t.IsZero() || e.degradeUntil.Before(t) {
-			t = e.degradeUntil
-		}
-	}
+	t = earlierActive(t, e.until, now)
+	t = earlierActive(t, e.breakerUntil, now)
+	t = earlierActive(t, e.degradeUntil, now)
 	return t
+}
+
+// earlierActive 返回 cur 与 cand 中「当前仍在生效」的更早截止：cand 不在未来时保留
+// cur；否则取两者较早者。用于把 until/breakerUntil/degradeUntil 归并成最近到期时刻。
+func earlierActive(cur, cand, now time.Time) time.Time {
+	if cand.IsZero() || !now.Before(cand) {
+		return cur
+	}
+	if cur.IsZero() || cand.Before(cur) {
+		return cand
+	}
+	return cur
 }
 
 // fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却/连败降权；breaker：熔断期）。

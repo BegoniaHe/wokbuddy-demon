@@ -19,35 +19,28 @@ func TestAddAndTotals(t *testing.T) {
 	r.Add(now, "cn", "uid1", "glm-5.2", Delta{PromptTokens: 10, HasPromptTokens: true, CompletionTokens: 5, HasCompletion: true}, true)
 
 	s := r.Snapshot(24, nil)
-	if s.Totals.Requests != 3 || s.Totals.Errors != 1 {
-		t.Fatalf("requests/errors = %d/%d, want 3/1", s.Totals.Requests, s.Totals.Errors)
-	}
-	if s.Totals.PromptTokens != 110 || s.Totals.CompletionTok != 55 {
-		t.Fatalf("pt/ct = %d/%d, want 110/55", s.Totals.PromptTokens, s.Totals.CompletionTok)
-	}
-	if s.Totals.TotalTokens != 165 {
-		t.Fatalf("tt = %d, want 165（无 total 时按 pt+ct 兜底）", s.Totals.TotalTokens)
-	}
-	if s.Totals.Credits != 1.5 || s.Totals.CreditSamples != 1 || s.Totals.CreditTokens != 150 || s.Totals.CreditsPer1MTokens != 10000 {
-		t.Fatalf("credit totals = %+v, want credits=1.5 samples=1 tokens=150 ratio=10000", s.Totals)
-	}
-	if s.Totals.AvgLatencyMs != 200 {
-		t.Fatalf("avg latency = %v, want 200", s.Totals.AvgLatencyMs)
-	}
-	if len(s.ByRealm) != 2 {
-		t.Fatalf("by_realm = %d 项, want 2", len(s.ByRealm))
-	}
+	wantEq(t, "requests", s.Totals.Requests, int64(3))
+	wantEq(t, "errors", s.Totals.Errors, int64(1))
+	wantEq(t, "prompt_tokens", s.Totals.PromptTokens, int64(110))
+	wantEq(t, "completion_tokens", s.Totals.CompletionTok, int64(55))
+	wantEq(t, "total_tokens", s.Totals.TotalTokens, int64(165))
+	wantEq(t, "credits", s.Totals.Credits, 1.5)
+	wantEq(t, "credit_samples", s.Totals.CreditSamples, int64(1))
+	wantEq(t, "credit_tokens", s.Totals.CreditTokens, int64(150))
+	wantEq(t, "credits_per_1m_tokens", s.Totals.CreditsPer1MTokens, 10000.0)
+	wantEq(t, "avg_latency_ms", s.Totals.AvgLatencyMs, 200.0)
+	wantEq(t, "by_realm 项数", len(s.ByRealm), 2)
 	if s.ByAccount[0].Realm == "" {
 		t.Fatal("by_account 行缺 realm 标注")
 	}
-	if len(s.CreditByAccount) != 1 || s.CreditByAccount[0].Key != "uid1" ||
-		s.CreditByAccount[0].CreditSamples != 1 || s.CreditByAccount[0].CreditsPer1MTokens != 10000 {
-		t.Fatalf("credit_by_account = %+v, want one uid1 row", s.CreditByAccount)
-	}
-	if len(s.CreditByModel) != 1 || s.CreditByModel[0].Key != "glm-5.2" ||
-		s.CreditByModel[0].Rate != "0.05" || s.CreditByModel[0].CreditsPer1MTokens != 10000 {
-		t.Fatalf("credit_by_model = %+v, want one glm-5.2 rate=0.05 row", s.CreditByModel)
-	}
+	wantEq(t, "credit_by_account 项数", len(s.CreditByAccount), 1)
+	wantEq(t, "credit_by_account key", s.CreditByAccount[0].Key, "uid1")
+	wantEq(t, "credit_by_account samples", s.CreditByAccount[0].CreditSamples, int64(1))
+	wantEq(t, "credit_by_account ratio", s.CreditByAccount[0].CreditsPer1MTokens, 10000.0)
+	wantEq(t, "credit_by_model 项数", len(s.CreditByModel), 1)
+	wantEq(t, "credit_by_model key", s.CreditByModel[0].Key, "glm-5.2")
+	wantEq(t, "credit_by_model rate", s.CreditByModel[0].Rate, "0.05")
+	wantEq(t, "credit_by_model ratio", s.CreditByModel[0].CreditsPer1MTokens, 10000.0)
 }
 
 // Rollup 把超出 hourlyKeep 的小时桶折叠为日桶，且幂等：重复折叠不重复计数。
@@ -61,26 +54,22 @@ func TestRollupIdempotent(t *testing.T) {
 
 	r.Rollup(time.Now())
 	after := r.Snapshot(24, nil)
-	if after.Totals.Requests != 1 || after.Totals.PromptTokens != 1 {
-		t.Fatalf("24h 窗口 totals = %d/%d, want 1/1（窗口外日桶不进聚合）", after.Totals.Requests, after.Totals.PromptTokens)
-	}
-	if len(after.Series) != 1 || after.Series[0].Scope != "hour" {
-		t.Fatalf("series = %+v, want 仅当前小时 1 个点", after.Series)
-	}
+	wantEq(t, "24h requests", after.Totals.Requests, int64(1))
+	wantEq(t, "24h prompt_tokens", after.Totals.PromptTokens, int64(1))
+	wantEq(t, "24h series 项数", len(after.Series), 1)
+	wantEq(t, "24h series scope", after.Series[0].Scope, "hour")
 
 	all := r.Snapshot(0, nil)
-	if all.Totals.Requests != 3 || all.Totals.PromptTokens != 15 {
-		t.Fatalf("全部历史 totals = %d/%d, want 3/15", all.Totals.Requests, all.Totals.PromptTokens)
-	}
-	if len(all.Series) != 2 || all.Series[0].Scope != "day" || all.Series[1].Scope != "hour" {
-		t.Fatalf("series = %+v, want 日点在前 + 小时点在后", all.Series)
-	}
+	wantEq(t, "全部历史 requests", all.Totals.Requests, int64(3))
+	wantEq(t, "全部历史 prompt_tokens", all.Totals.PromptTokens, int64(15))
+	wantEq(t, "全部历史 series 项数", len(all.Series), 2)
+	wantEq(t, "全部历史 series[0] scope", all.Series[0].Scope, "day")
+	wantEq(t, "全部历史 series[1] scope", all.Series[1].Scope, "hour")
 
 	r.Rollup(time.Now())
 	again := r.Snapshot(0, nil)
-	if again.Totals.Requests != 3 || again.Totals.PromptTokens != 15 {
-		t.Fatalf("二次折叠后 totals = %d/%d, want 3/15（幂等被破坏）", again.Totals.Requests, again.Totals.PromptTokens)
-	}
+	wantEq(t, "二次折叠 requests", again.Totals.Requests, int64(3))
+	wantEq(t, "二次折叠 prompt_tokens", again.Totals.PromptTokens, int64(15))
 }
 
 // 落盘→新实例恢复，数据不丢；落盘结构带版本号。
@@ -183,20 +172,16 @@ func TestSnapshotWindowFilter(t *testing.T) {
 	r.Add(now.Add(-48*time.Hour), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外
 	r.Add(now, "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内
 	s := r.Snapshot(24, nil)
-	if s.Totals.Requests != 1 || s.Totals.PromptTokens != 3 {
-		t.Fatalf("24h 窗口 totals = %d/%d, want 1/3（48h 前的数据应被过滤）", s.Totals.Requests, s.Totals.PromptTokens)
-	}
-	if len(s.Series) != 1 || s.Series[0].Scope != "hour" || s.Series[0].PromptTokens != 3 {
-		t.Fatalf("series = %+v, want 仅窗口内 1 个小时点", s.Series)
-	}
-	if s.Buckets != 1 {
-		t.Fatalf("buckets = %d, want 1（窗口内命中桶数）", s.Buckets)
-	}
+	wantEq(t, "24h 窗口 requests", s.Totals.Requests, int64(1))
+	wantEq(t, "24h 窗口 prompt_tokens", s.Totals.PromptTokens, int64(3))
+	wantEq(t, "series 项数", len(s.Series), 1)
+	wantEq(t, "series scope", s.Series[0].Scope, "hour")
+	wantEq(t, "series prompt_tokens", s.Series[0].PromptTokens, int64(3))
+	wantEq(t, "buckets", s.Buckets, 1)
 
 	all := r.Snapshot(0, nil)
-	if all.Totals.Requests != 2 || all.Totals.PromptTokens != 8 {
-		t.Fatalf("全部历史 totals = %d/%d, want 2/8", all.Totals.Requests, all.Totals.PromptTokens)
-	}
+	wantEq(t, "全部历史 requests", all.Totals.Requests, int64(2))
+	wantEq(t, "全部历史 prompt_tokens", all.Totals.PromptTokens, int64(8))
 	// since 是全库数据起点，不受窗口影响。
 	if all.Since == "" || s.Since != all.Since {
 		t.Fatalf("since 应为全库起点且不随窗口变化: all=%q windowed=%q", all.Since, s.Since)
@@ -217,12 +202,10 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 		From: base.Add(2 * time.Hour),
 		To:   base.Add(3 * time.Hour),
 	}, nil, nil)
-	if s.Totals.Requests != 2 || s.Totals.PromptTokens != 20 {
-		t.Fatalf("显式区间 totals = %d/%d, want 2/20", s.Totals.Requests, s.Totals.PromptTokens)
-	}
-	if len(s.Series) != 2 || s.Buckets != 2 {
-		t.Fatalf("显式区间 series/buckets = %d/%d, want 2/2", len(s.Series), s.Buckets)
-	}
+	wantEq(t, "显式区间 requests", s.Totals.Requests, int64(2))
+	wantEq(t, "显式区间 prompt_tokens", s.Totals.PromptTokens, int64(20))
+	wantEq(t, "显式区间 series 项数", len(s.Series), 2)
+	wantEq(t, "显式区间 buckets", s.Buckets, 2)
 	if s.WindowFrom == "" || s.WindowTo == "" {
 		t.Fatalf("显式区间应回显 window_from/window_to: %+v", s)
 	}
@@ -232,18 +215,14 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 
 	// 只有 From（「今天」的形态）：从该点起到最新，全量命中。
 	only := r.SnapshotWindow(Window{From: base.Add(4 * time.Hour)}, nil, nil)
-	if only.Totals.Requests != 2 {
-		t.Fatalf("仅 From 的 totals = %d, want 2", only.Totals.Requests)
-	}
+	wantEq(t, "仅 From 的 requests", only.Totals.Requests, int64(2))
 	if only.WindowFrom == "" || only.WindowTo != "" {
 		t.Fatalf("仅 From 时 window_to 应为空: %+v", only)
 	}
 
 	// 空窗口（From/To 全零且 Hours<=0）= 全部历史，与 Snapshot(0) 等价。
 	all := r.SnapshotWindow(Window{}, nil, nil)
-	if all.Totals.Requests != 6 {
-		t.Fatalf("全零窗口 totals = %d, want 6（全部历史）", all.Totals.Requests)
-	}
+	wantEq(t, "全零窗口 requests", all.Totals.Requests, int64(6))
 	if all.WindowFrom != "" || all.WindowTo != "" {
 		t.Fatalf("全部历史不应回显区间: %+v", all)
 	}
@@ -351,5 +330,14 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 	snap := r2.Snapshot(0, nil)
 	if snap.CreditByModel[0].CacheHitRate != 75 {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
+	}
+}
+
+// wantEq 断言 got == want，失败时用 label 指明字段。统一入口避免逐项 if 抬高
+// 测试函数复杂度，断言条件与原逐项检查等价。
+func wantEq[T comparable](t *testing.T, label string, got, want T) {
+	t.Helper()
+	if got != want {
+		t.Fatalf("%s = %v, want %v", label, got, want)
 	}
 }

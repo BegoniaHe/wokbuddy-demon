@@ -52,53 +52,15 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 			i++
 			continue
 		}
-		want := map[string]bool{}
-		for _, tci := range tcs {
-			if tc, ok := tci.(map[string]any); ok {
-				if id, _ := tc["id"].(string); id != "" {
-					want[id] = true
-				}
-			}
-		}
+		want := toolCallIDs(tcs)
 		// 收集紧随其后（允许被其他消息打断）的同批 tool 结果，按原相对顺序。
 		out = append(out, messages[i])
 		i++
-		var results []any
-		var between []any
-		sawNonTool := false
-		for i < len(messages) {
-			mm, ok := messages[i].(map[string]any)
-			if !ok {
-				break
-			}
-			role, _ := mm["role"].(string)
-			if role == "tool" {
-				id, _ := mm["tool_call_id"].(string)
-				if !want[id] {
-					break
-				}
-				results = append(results, messages[i])
-				if sawNonTool {
-					changed = true
-				}
-				i++
-				continue
-			}
-			if len(results) == 0 {
-				break // assistant 后没有结果：交由 cleanupOrphanToolCalls 处理
-			}
-			// 下一组 assistant.tool_calls 是新的组头，绝不能当插入物吞掉：一旦被收进
-			// between，它永远不再被外层循环当作组头处理，它自己那批结果也就永远得不
-			// 到重排（真实会话 msg[181] 正是这样漏掉的）。必须 break 交还外层循环。
-			if role == "assistant" {
-				if next, _ := mm["tool_calls"].([]any); len(next) > 0 {
-					break
-				}
-			}
-			// 同批结果尚未收齐时，中间消息视为插入物，暂存待后移。
-			between = append(between, messages[i])
-			sawNonTool = true
-			i++
+		var results, between []any
+		var separated bool
+		i, results, between, separated = collectToolResults(messages, i, want)
+		if separated {
+			changed = true
 		}
 		out = append(out, results...)
 		out = append(out, between...)
@@ -107,6 +69,61 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 		return messages, false
 	}
 	return out, true
+}
+
+// toolCallIDs 收集 assistant.tool_calls 的 id 集合。
+func toolCallIDs(tcs []any) map[string]bool {
+	want := map[string]bool{}
+	for _, tci := range tcs {
+		if tc, ok := tci.(map[string]any); ok {
+			if id, _ := tc["id"].(string); id != "" {
+				want[id] = true
+			}
+		}
+	}
+	return want
+}
+
+// collectToolResults 从 start 起收集同批（want 内 id）tool 结果与夹在结果之间的插入
+// 消息，返回更新后的下标、结果、插入物，以及是否出现「结果被插入物分隔」。
+func collectToolResults(messages []any, start int, want map[string]bool) (next int, results, between []any, separated bool) {
+	i := start
+	sawNonTool := false
+	for i < len(messages) {
+		mm, ok := messages[i].(map[string]any)
+		if !ok {
+			break
+		}
+		role, _ := mm["role"].(string)
+		if role == "tool" {
+			id, _ := mm["tool_call_id"].(string)
+			if !want[id] {
+				break
+			}
+			results = append(results, messages[i])
+			if sawNonTool {
+				separated = true
+			}
+			i++
+			continue
+		}
+		if len(results) == 0 {
+			break // assistant 后没有结果：交由 cleanupOrphanToolCalls 处理
+		}
+		// 下一组 assistant.tool_calls 是新的组头，绝不能当插入物吞掉：一旦被收进
+		// between，它永远不再被外层循环当作组头处理，它自己那批结果也就永远得不
+		// 到重排（真实会话 msg[181] 正是这样漏掉的）。必须 break 交还外层循环。
+		if role == "assistant" {
+			if next, _ := mm["tool_calls"].([]any); len(next) > 0 {
+				break
+			}
+		}
+		// 同批结果尚未收齐时，中间消息视为插入物，暂存待后移。
+		between = append(between, messages[i])
+		sawNonTool = true
+		i++
+	}
+	return i, results, between, separated
 }
 
 // cleanupOrphanToolCalls 剔除无法配对的 tool_call 与 tool 结果（所有模型，独立于
@@ -124,10 +141,37 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	if len(messages) == 0 {
 		return messages, false
 	}
-	callIDs := map[string]bool{}
-	resultIDs := map[string]bool{}
-	nameBadIDs := map[string]bool{}
-	hasTraffic := false
+	callIDs, resultIDs, nameBadIDs, hasTraffic := collectToolPairing(messages)
+	if !hasTraffic {
+		return messages, false
+	}
+	keepCalls := computeKeepCalls(callIDs, resultIDs, nameBadIDs)
+	// 1) assistant.tool_calls：按 keepCalls 对称裁剪——只留有结果的调用，过滤后为空则删键。
+	//
+	// 历史实现是「批内每个 id 都齐才整批保留，否则删掉整个 tool_calls 键」。那会留下
+	// 无主结果：批 [c1,c2] 只回了 c1 时，调用侧整批被删，而 tool{c1} 仍按 id 命中
+	// keepCalls 得以保留 —— 出站载荷于是变成「无 tool_calls 的 assistant + 孤儿 tool」，
+	// 上游判 11148（tool calls and tool results do not match）并顶死整条会话。
+	// 现在两侧共用同一份 keepCalls 按 id 对称裁剪（与 2) 的删除侧同口径），
+	// 任何输入都不会再产生半截配对。
+	changed := trimAssistantToolCalls(messages, keepCalls)
+	// 2) role:tool 结果：只有对应 tool_call 被保留才保留；孤儿结果整条删除。
+	kept, dropped := dropOrphanToolResults(messages, keepCalls)
+	if dropped {
+		changed = true
+	}
+	if !changed {
+		return messages, false
+	}
+	return kept, true
+}
+
+// collectToolPairing 单遍收集：结果集 resultIDs、调用集 callIDs、function.name 为空
+// 的调用集 nameBadIDs，以及是否存在任何工具流量。
+func collectToolPairing(messages []any) (callIDs, resultIDs, nameBadIDs map[string]bool, hasTraffic bool) {
+	callIDs = map[string]bool{}
+	resultIDs = map[string]bool{}
+	nameBadIDs = map[string]bool{}
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -135,37 +179,50 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		}
 		switch msg["role"] {
 		case "tool":
-			if id, ok := msg["tool_call_id"].(string); ok && id != "" {
+			if id, _ := msg["tool_call_id"].(string); id != "" {
 				resultIDs[id] = true
 				hasTraffic = true
 			}
 		case "assistant":
-			if tcs, ok := msg["tool_calls"].([]any); ok {
-				for _, tci := range tcs {
-					tc, ok := tci.(map[string]any)
-					if !ok {
-						continue
-					}
-					if id, ok := tc["id"].(string); ok && id != "" {
-						callIDs[id] = true
-						if toolCallNameEmpty(tc) {
-							nameBadIDs[id] = true
-						}
-						hasTraffic = true
-					}
-				}
+			if collectAssistantCalls(msg, callIDs, nameBadIDs) {
+				hasTraffic = true
 			}
 		}
 	}
-	if !hasTraffic {
-		return messages, false
+	return callIDs, resultIDs, nameBadIDs, hasTraffic
+}
+
+// collectAssistantCalls 收集一条 assistant 消息的 tool_call id（含 name 为空标记），
+// 返回是否发现任何有效调用。
+func collectAssistantCalls(msg map[string]any, callIDs, nameBadIDs map[string]bool) bool {
+	tcs, ok := msg["tool_calls"].([]any)
+	if !ok {
+		return false
 	}
-	// keepCalls：调用 id 是否双侧齐全（调用存在且结果存在）。重复 id 与乱序均按集合处理。
-	//
-	// 追加否决条件：function.name 为空（含纯空白）的调用一律不保留。上游对这类
-	// 条目直接判 11133 model_param_invalid（tool_calls[i].function.name must be a
-	// non-empty string），且带不带配对结果都会拒——带结果的脏条目原本会命中
-	// keepCalls 原样出站，正是线上 503 的成因。删除动作完全复用两侧对称裁剪。
+	found := false
+	for _, tci := range tcs {
+		tc, ok := tci.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := tc["id"].(string); id != "" {
+			callIDs[id] = true
+			if toolCallNameEmpty(tc) {
+				nameBadIDs[id] = true
+			}
+			found = true
+		}
+	}
+	return found
+}
+
+// computeKeepCalls 计算双侧齐全（调用存在且结果存在）且 name 非空的调用 id 集合。
+//
+// 追加否决条件：function.name 为空（含纯空白）的调用一律不保留。上游对这类条目
+// 直接判 11133 model_param_invalid（tool_calls[i].function.name must be a
+// non-empty string），且带不带配对结果都会拒——带结果的脏条目原本会命中 keepCalls
+// 原样出站，正是线上 503 的成因。删除动作完全复用两侧对称裁剪。
+func computeKeepCalls(callIDs, resultIDs, nameBadIDs map[string]bool) map[string]bool {
 	keepCalls := map[string]bool{}
 	for id := range callIDs {
 		if nameBadIDs[id] {
@@ -175,15 +232,12 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 			keepCalls[id] = true
 		}
 	}
+	return keepCalls
+}
+
+// trimAssistantToolCalls 按 keepCalls 对称裁剪各 assistant.tool_calls。返回是否有改动。
+func trimAssistantToolCalls(messages []any, keepCalls map[string]bool) bool {
 	changed := false
-	// 1) assistant.tool_calls：按 keepCalls 对称裁剪——只留有结果的调用，过滤后为空则删键。
-	//
-	// 历史实现是「批内每个 id 都齐才整批保留，否则删掉整个 tool_calls 键」。那会留下
-	// 无主结果：批 [c1,c2] 只回了 c1 时，调用侧整批被删，而 tool{c1} 仍按 id 命中
-	// keepCalls 得以保留 —— 出站载荷于是变成「无 tool_calls 的 assistant + 孤儿 tool」，
-	// 上游判 11148（tool calls and tool results do not match）并顶死整条会话。
-	// 现在两侧共用同一份 keepCalls 按 id 对称裁剪（与 2) 的删除侧同口径），
-	// 任何输入都不会再产生半截配对。
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -192,32 +246,45 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		if role, _ := msg["role"].(string); role != "assistant" {
 			continue
 		}
-		tcs, ok := msg["tool_calls"].([]any)
-		if !ok || len(tcs) == 0 {
-			continue
+		if trimOneAssistantCalls(msg, keepCalls) {
+			changed = true
 		}
-		keptCalls := make([]any, 0, len(tcs))
-		for _, tci := range tcs {
-			tc, ok := tci.(map[string]any)
-			if !ok {
-				continue
-			}
-			if id, _ := tc["id"].(string); keepCalls[id] {
-				keptCalls = append(keptCalls, tc)
-			}
-		}
-		if len(keptCalls) == len(tcs) {
-			continue // 整批齐全：零改动
-		}
-		changed = true
-		if len(keptCalls) == 0 {
-			delete(msg, "tool_calls")
-			continue
-		}
-		msg["tool_calls"] = keptCalls
 	}
-	// 2) role:tool 结果：只有对应 tool_call 被保留才保留；孤儿结果整条删除。
+	return changed
+}
+
+// trimOneAssistantCalls 裁剪单条 assistant 的 tool_calls（过滤后为空则删键）。
+func trimOneAssistantCalls(msg map[string]any, keepCalls map[string]bool) bool {
+	tcs, ok := msg["tool_calls"].([]any)
+	if !ok || len(tcs) == 0 {
+		return false
+	}
+	keptCalls := make([]any, 0, len(tcs))
+	for _, tci := range tcs {
+		tc, ok := tci.(map[string]any)
+		if !ok {
+			continue
+		}
+		if id, _ := tc["id"].(string); keepCalls[id] {
+			keptCalls = append(keptCalls, tc)
+		}
+	}
+	if len(keptCalls) == len(tcs) {
+		return false // 整批齐全：零改动
+	}
+	if len(keptCalls) == 0 {
+		delete(msg, "tool_calls")
+		return true
+	}
+	msg["tool_calls"] = keptCalls
+	return true
+}
+
+// dropOrphanToolResults 删除 keepCalls 中不存在的 role:tool 结果消息。返回清理后的
+// slice 与是否发生删除。
+func dropOrphanToolResults(messages []any, keepCalls map[string]bool) ([]any, bool) {
 	kept := make([]any, 0, len(messages))
+	changed := false
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -233,10 +300,7 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 		}
 		kept = append(kept, m)
 	}
-	if !changed {
-		return messages, false
-	}
-	return kept, true
+	return kept, changed
 }
 
 // mergeAdjacentToolCalls 把**背靠背**的 assistant.tool_calls 消息合成一条（tool_calls 依原序拼接）。
@@ -283,42 +347,13 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 			continue
 		}
 		if role, _ := msg["role"].(string); role == "assistant" && len(out) > 0 {
-			// 形态一：本条是带 tool_calls 的 assistant 且没有正文 → 并入上一条
-			// 同为 assistant 且带 tool_calls 的消息（背靠背的并行调用声明）。
-			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 && emptyContent(msg["content"]) {
-				if prev, ok := out[len(out)-1].(map[string]any); ok {
-					if prevRole, _ := prev["role"].(string); prevRole == "assistant" {
-						if prevCalls, ok := prev["tool_calls"].([]any); ok && len(prevCalls) > 0 {
-							prev["tool_calls"] = append(prevCalls, tcs...)
-							mergeReasoningContent(prev, msg)
-							changed = true
-							continue // 本条已并入上一条，不再单独出站
-						}
-					}
-				}
+			if mergeForwardToolCalls(out, msg) {
+				changed = true
+				continue // 本条已并入上一条，不再单独出站
 			}
-			// 形态二（反向）：本条是纯正文 assistant，上一条是带 tool_calls 但没正文的
-			// assistant → 把正文折进上一条，合成 assistant(正文 + tool_calls)。这样
-			// "声明 tool_calls 的 assistant 紧跟它自己的结果"在两种拆分顺序下都成立。
-			//
-			// 谁会产出这个顺序：部分 OpenAI 兼容 agent 客户端的回放顺序（正文与
-			// 调用声明拆成两条独立 assistant）。
-			//
-			// 条件同样从严：只认**字符串正文**（数组正文可能含多模态块，拼接会丢结构，
-			// 交给 repackToolResultBlocks 原样处理）；上一条必须自身无正文。
-			if _, hasCalls := msg["tool_calls"]; !hasCalls {
-				if txt, ok := msg["content"].(string); ok && txt != "" {
-					if prev, ok := out[len(out)-1].(map[string]any); ok {
-						if prevRole, _ := prev["role"].(string); prevRole == "assistant" {
-							if prevCalls, ok := prev["tool_calls"].([]any); ok && len(prevCalls) > 0 && emptyContent(prev["content"]) {
-								prev["content"] = txt
-								mergeReasoningContent(prev, msg)
-								changed = true
-								continue // 正文已折进上一条
-							}
-						}
-					}
-				}
+			if mergeBackwardToolCalls(out, msg) {
+				changed = true
+				continue // 正文已折进上一条
 			}
 		}
 		out = append(out, m)
@@ -327,6 +362,62 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 		return messages, false
 	}
 	return out, true
+}
+
+// mergeForwardToolCalls 形态一：本条是带 tool_calls 的 assistant 且没有正文 → 并入
+// 上一条同为 assistant 且带 tool_calls 的消息（背靠背的并行调用声明）。返回是否合并。
+func mergeForwardToolCalls(out []any, msg map[string]any) bool {
+	tcs, ok := msg["tool_calls"].([]any)
+	if !ok || len(tcs) == 0 || !emptyContent(msg["content"]) {
+		return false
+	}
+	prev, ok := out[len(out)-1].(map[string]any)
+	if !ok {
+		return false
+	}
+	if prevRole, _ := prev["role"].(string); prevRole != "assistant" {
+		return false
+	}
+	prevCalls, ok := prev["tool_calls"].([]any)
+	if !ok || len(prevCalls) == 0 {
+		return false
+	}
+	prev["tool_calls"] = append(prevCalls, tcs...)
+	mergeReasoningContent(prev, msg)
+	return true
+}
+
+// mergeBackwardToolCalls 形态二（反向）：本条是纯正文 assistant，上一条是带 tool_calls
+// 但没正文的 assistant → 把正文折进上一条，合成 assistant(正文 + tool_calls)。这样
+// "声明 tool_calls 的 assistant 紧跟它自己的结果"在两种拆分顺序下都成立。
+//
+// 谁会产出这个顺序：部分 OpenAI 兼容 agent 客户端的回放顺序（正文与调用声明拆成两条
+// 独立 assistant）。
+//
+// 条件同样从严：只认**字符串正文**（数组正文可能含多模态块，拼接会丢结构，交给
+// repackToolResultBlocks 原样处理）；上一条必须自身无正文。
+func mergeBackwardToolCalls(out []any, msg map[string]any) bool {
+	if _, hasCalls := msg["tool_calls"]; hasCalls {
+		return false
+	}
+	txt, ok := msg["content"].(string)
+	if !ok || txt == "" {
+		return false
+	}
+	prev, ok := out[len(out)-1].(map[string]any)
+	if !ok {
+		return false
+	}
+	if prevRole, _ := prev["role"].(string); prevRole != "assistant" {
+		return false
+	}
+	prevCalls, ok := prev["tool_calls"].([]any)
+	if !ok || len(prevCalls) == 0 || !emptyContent(prev["content"]) {
+		return false
+	}
+	prev["content"] = txt
+	mergeReasoningContent(prev, msg)
+	return true
 }
 
 // mergeReasoningContent 把 src 的 reasoning_content 并入 dst（两边都有则换行拼接）。

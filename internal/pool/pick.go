@@ -42,18 +42,38 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
+// 拆成「收集候选 → 定成本层 → 排序 → 选号」四段，各段独立可读。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
-	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
-	if reqModel != "" {
-		healthyOf = func(e *entry) bool { return realmOK(e) && e.healthyForModel(now, reqModel) }
+	cands := p.pickCandidates(tried, reqModel, realm, now)
+	if len(cands) == 0 {
+		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
+		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
 	}
-	// floorBlocked 积分保底拦截判定（实现在 floorBlockedForRealmModel，与粘性路径共用）：
-	// 触底 + 收费（本地实测台账 或 上游目录倍率）即拦；免费/未知倍率不受限。
-	floorBlocked := func(e *entry) bool { return p.floorBlockedForRealmModel(e, reqModel, realm, now) }
+	maxCredits := maxCreditsOf(cands)
+	bestTier, explored := p.resolveCostTier(cands, reqModel, realm, now)
+	ordered, top := p.rankCandidates(cands, reqModel, bestTier, maxCredits, now)
+	e := p.selectCandidate(ordered, top, now)
+	if explored {
+		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
+		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
+		// 常规路径）。
+		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
+			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+	}
+	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
+	p.pickSeq++
+	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	return e.a
+}
+
+// pickCandidates 收集本次 pick 的 healthy 候选：跳过 tried、惰性清理过期模型级
+// 冷却/成本台账、按模型与域判定健康、应用积分保底拦截与在途占满过滤。
+// 调用方必须已持有 p.mu 写锁。
+func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now time.Time) []*entry {
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -63,10 +83,10 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
 		e.pruneExpiredModelCooldowns(now)
 		e.pruneExpiredModelCosts(now)
-		if !healthyOf(e) {
+		if !e.healthyInRealm(now, reqModel, realm) {
 			continue
 		}
-		if floorBlocked(e) {
+		if p.floorBlockedForRealmModel(e, reqModel, realm, now) {
 			continue // 积分保底：触底号不接实测收费模型（tier 0/1 不受限）
 		}
 		if p.inFlightFull(e) {
@@ -74,106 +94,117 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 		cands = append(cands, e)
 	}
-	if len(cands) == 0 {
-		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+	return cands
+}
+
+// healthyInRealm 报告账号在指定域与请求模型下是否可选：realm 非空时叠加域过滤，
+// reqModel 非空时用 healthyForModel（模型级冷却豁免），否则用账号级 healthy。
+func (e *entry) healthyInRealm(now time.Time, reqModel, realm string) bool {
+	if realm != "" && e.a.Realm() != realm {
+		return false
 	}
-	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
-	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
-	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
-	// 抽签权重共享同一基准，两个阶段权重可比。
+	if reqModel != "" {
+		return e.healthyForModel(now, reqModel)
+	}
+	return e.healthy(now)
+}
+
+// maxCreditsOf 返回候选集中的最大 credits（权重归一基准）。
+func maxCreditsOf(cands []*entry) int64 {
 	var maxCredits int64
 	for _, e := range cands {
 		if e.credits > maxCredits {
 			maxCredits = e.credits
 		}
 	}
-	// 成本分层（reqModel 非空时）：按该模型的实测扣费把候选分层，只保留最优层。
-	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
-	//   1 = 无观测（含观测过期）
-	//   2 = 已实测收费
-	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
-	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
-	// 为什么用硬过滤而非仅排序：pickWeighted 会在候选内加权随机，只排序的话
-	// 收费号仍有机会抽中，达不到"优先免费"的语义。
-	costTier := func(e *entry) (int, float64) {
-		mc, ok := e.modelCostOf(reqModel, now)
-		if !ok {
-			return 1, 0
-		}
-		if mc.CostPer1k <= 0 {
-			return 0, 0
-		}
-		return 2, mc.CostPer1k
+	return maxCredits
+}
+
+// costTier 按该模型的实测扣费把候选分层：
+//
+//	0 = 已实测免费（限免期/夜间免费的号，最强偏好）
+//	1 = 无观测（含观测过期）
+//	2 = 已实测收费
+//
+// "无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，若已知收费的号
+// 恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
+func (e *entry) costTier(model string, now time.Time) (int, float64) {
+	mc, ok := e.modelCostOf(model, now)
+	if !ok {
+		return 1, 0
 	}
+	if mc.CostPer1k <= 0 {
+		return 0, 0
+	}
+	return 2, mc.CostPer1k
+}
+
+// resolveCostTier 计算本次 pick 生效的成本层，并按条件探索（issue #136 方案 a′）
+// 决定是否切到 tier 1-only。返回生效层与是否发生探索。
+//
+// 条件探索：tier 0 垄断层存在（bestTier==0 且 reqModel 非空）且候选含 tier 1
+// （冻结存在）且距上次探索 ≥ 窗口（零值 timer=从未探索 → 首次满足即探）时，本次
+// pick 生效层切 tier 1-only——探索=搭车改道，把一个既有真实用户请求改道给未知号
+// （零新增上游请求；IP 维度零增量，WAF 友好）。timer 同锁写入：并发 pick 串行进入
+// 写锁，只有一个进入者能通过窗口判定（天然防重复探索）。key = realm + "\x1f" +
+// reqModel：同模型名可跨域，探索节奏按 (域, 模型) 独立；realm==""（Pick 老语义）单独成键。
+func (p *Pool) resolveCostTier(cands []*entry, reqModel, realm string, now time.Time) (int, bool) {
 	bestTier := 2
-	hasTier1 := false
-	explored := false // 本次 pick 是否切了探索层（事件日志在选中号确定后打）
 	for _, e := range cands {
-		if ti, _ := costTier(e); ti < bestTier {
+		if ti, _ := e.costTier(reqModel, now); ti < bestTier {
 			bestTier = ti
 		}
 	}
-	// 条件探索（issue #136 方案 a′）：tier 0 垄断层存在（bestTier==0 且 reqModel
-	// 非空）且候选含 tier 1（冻结存在）且距上次探索 ≥ 窗口（零值 timer=从未探索
-	// →首次满足即探）时，本次 pick 生效层切 tier 1-only——探索=搭车改道，把一个
-	// 既有真实用户请求改道给未知号（零新增上游请求；IP 维度零增量，WAF 友好）。
-	// 成功 → NoteModelCost 首观测 → 毕业（tier 0/2，下一轮 pick 立即生效）；
-	// 失败 → 既有错误策略照常，无探测风暴。
-	// hasTier1 复用本循环上方 costTier 的预计算口径（每候选一次的契约不变）。
-	// timer 同锁写入：并发 pick 串行进入写锁，只有一个进入者能通过窗口判定
-	// （天然防重复探索）。key = realm + "\x1f" + reqModel：同模型名可跨域，
-	// 探索节奏按 (域, 模型) 独立；realm==""（Pick 老语义）单独成键。
-	if p.costExploreInterval > 0 && bestTier == 0 && reqModel != "" {
-		for _, e := range cands {
-			if ti, _ := costTier(e); ti == 1 {
-				hasTier1 = true
-				break
-			}
-		}
-		key := realm + "\x1f" + reqModel
-		if hasTier1 && now.Sub(p.exploreLast[key]) >= p.costExploreInterval {
-			p.exploreLast[key] = now
-			p.costExploreEvents++
-			bestTier = 1
-			explored = true
-		}
+	if p.costExploreInterval <= 0 || bestTier != 0 || reqModel == "" {
+		return bestTier, false
 	}
-	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
-	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序。
-	// costTier/modelCostOf 同样每候选只算一次（存入 tier/cost1k），比较器只读缓存字段。
-	type weighted struct {
-		e      *entry
-		w      float64
-		tier   int
-		cost1k float64
+	if !anyTier1(cands, reqModel, now) {
+		return bestTier, false
 	}
-	ws := make([]weighted, 0, len(cands))
+	key := realm + "\x1f" + reqModel
+	if now.Sub(p.exploreLast[key]) < p.costExploreInterval {
+		return bestTier, false
+	}
+	p.exploreLast[key] = now
+	p.costExploreEvents++
+	return 1, true
+}
+
+// anyTier1 报告候选中是否存在无观测（tier 1）账号。
+func anyTier1(cands []*entry, model string, now time.Time) bool {
 	for _, e := range cands {
-		ti, ci := costTier(e)
-		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+		if ti, _ := e.costTier(model, now); ti == 1 {
+			return true
 		}
 	}
-	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
-	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
-	// 见 TestPickDeterministicViaSetRandomSource）。权重全等或存在并列时，按字典序
-	// 截断会让 uid 靠后的账号永远进不了 top5（等权重账号被字典序饿死、LRU 兜底
-	// 又只在 top5 内转——惊群集中单号的根因）。洗牌用独立的 time-seeded 源，
-	// 只在截断边界制造等权重随机次序，不影响加权抽签本身的确定性。
-	if len(ws) > 5 {
-		eq := false
-		for i := 1; i < len(ws); i++ {
-			if ws[i].w == ws[0].w {
-				eq = true
-				break
-			}
+	return false
+}
+
+// rankCandidates 过滤出 bestTier 层的候选并计算权重，排序后返回全量有序列表
+// （ordered）与截断的 top5（top）。
+//
+// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n)
+// 次冗余浮点计算。等权重洗牌：仅当存在权重相等且候选数超过 top5 时才对 ws 做
+// Fisher-Yates 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的
+// 确定性语义），否则按字典序截断会让 uid 靠后的账号永远进不了 top5。
+// weightedEntry 权重排序中间态（rankCandidates 用）。
+type weightedEntry struct {
+	e      *entry
+	w      float64
+	cost1k float64
+}
+
+func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, maxCredits int64, now time.Time) (ordered, top []*entry) {
+	ws := make([]weightedEntry, 0, len(cands))
+	for _, e := range cands {
+		ti, ci := e.costTier(reqModel, now)
+		if ti == bestTier {
+			ws = append(ws, weightedEntry{e: e, w: p.routingWeightOf(e, maxCredits, now), cost1k: ci})
 		}
-		if eq {
-			shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
-			shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
-		}
+	}
+	if len(ws) > 5 && hasWeightTie(ws) {
+		shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
+		shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
 	}
 	sort.SliceStable(ws, func(i, j int) bool {
 		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
@@ -186,52 +217,50 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 		return ws[i].e.a.UID < ws[j].e.a.UID // 稳定兜底（洗牌后此项几乎不触发）
 	})
-	cands = cands[:0]
-	for _, c := range ws {
-		cands = append(cands, c.e)
+	ordered = make([]*entry, len(ws))
+	for i, c := range ws {
+		ordered[i] = c.e
 	}
-	// candsAll 保留截断前的全候选（权重降序），供 LRU 兜底在全量范围选最旧者，
-	// 避免 top5 字典序截断把等权重靠后账号饿死（惊群根因之一）。
-	candsAll := cands
-	if len(cands) > 5 {
-		cands = cands[:5]
+	if len(ordered) > 5 {
+		return ordered, ordered[:5]
 	}
-	var e *entry
-	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
-	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
-	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
-	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入。
-	eligible := make([]*entry, 0, len(cands))
-	for _, c := range cands {
+	return ordered, ordered
+}
+
+// hasWeightTie 报告是否存在与首元素权重并列的候选（存在并列时按字典序截断会饿死
+// uid 靠后的等权重账号，故需先洗牌）。
+func hasWeightTie(ws []weightedEntry) bool {
+	for i := 1; i < len(ws); i++ {
+		if ws[i].w == ws[0].w {
+			return true
+		}
+	}
+	return false
+}
+
+// selectCandidate 从有序候选中选出最终账号：先按 minPickGap 过滤（防并发撞号，
+// 同一账号在窗口内不重复被选中），全部刚被用过时在**全候选**里按 usedSeq 取最旧者
+// （LRU 兜底，避免 top5 字典序截断把等权重靠后账号饿死），否则在 top5 内加权抽签。
+func (p *Pool) selectCandidate(ordered, top []*entry, now time.Time) *entry {
+	eligible := make([]*entry, 0, len(top))
+	for _, c := range top {
 		if now.Sub(c.lastUsed) >= minPickGap {
 			eligible = append(eligible, c)
 		}
 	}
 	if len(eligible) == 0 {
-		// top5 全部刚被用过：LRU 兜底，在**全候选 candsAll**（非仅 top5）里选最旧者。
-		// 用 usedSeq 单调序号而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度
-		// ~0.5ms，快速连续选号时所有 lastUsed 完全相等，Before 全 false 会恒选
-		// candsAll[0] 导致集中。usedSeq 严格全序，与时间精度无关。
-		e = candsAll[0]
-		for _, c := range candsAll[1:] {
+		// top5 全部刚被用过：LRU 兜底，在**全候选**里选最旧者。用 usedSeq 单调序号
+		// 而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度 ~0.5ms，快速连续
+		// 选号时所有 lastUsed 完全相等，Before 全 false 会恒选 ordered[0] 导致集中。
+		e := ordered[0]
+		for _, c := range ordered[1:] {
 			if c.usedSeq < e.usedSeq {
 				e = c
 			}
 		}
-	} else {
-		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+		return e
 	}
-	if explored {
-		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
-		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
-		// 常规路径）。
-		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
-			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
-	}
-	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
-	p.pickSeq++
-	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
-	return e.a
+	return p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
 }
 
 // floorBlockedForModel 积分保底拦截判定（pick 普通轮换与 PickByUIDForModel 粘性
@@ -295,22 +324,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
 	var best *entry
 	for uid, e := range p.byUID {
-		if tried != nil && tried[uid] {
-			continue
-		}
-		if realm != "" && e.a.Realm() != realm {
-			continue // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
-		}
-		if e.disabled || e.paused {
-			continue // 禁用/暂停选号的账号永不参与兜底
-		}
-		if e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until) {
-			continue // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
-		}
-		if p.floorBlockedForRealmModel(e, model, realm, now) {
-			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
-		}
-		if p.inFlightFull(e) {
+		if !p.fallbackEligible(e, uid, tried, realm, model, now) {
 			continue
 		}
 		exp := e.expiry(now)
@@ -324,7 +338,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s",
+		logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
 	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
@@ -333,6 +348,27 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
 	return best.a
+}
+
+// fallbackEligible 判定账号是否可参与全冷却兜底：排除 tried/跨域/禁用暂停/
+// 有效 hard 冷却（调了必 402）/积分保底拦截/在途占满。调用方需已持 p.mu。
+func (p *Pool) fallbackEligible(e *entry, uid string, tried map[string]bool, realm, model string, now time.Time) bool {
+	if tried != nil && tried[uid] {
+		return false
+	}
+	if realm != "" && e.a.Realm() != realm {
+		return false // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
+	}
+	if e.disabled || e.paused {
+		return false // 禁用/暂停选号的账号永不参与兜底
+	}
+	if e.hardCoolingActive(now) {
+		return false // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+	}
+	if p.floorBlockedForRealmModel(e, model, realm, now) {
+		return false // 积分保底：触底号不接收费模型（兜底路径同判据）
+	}
+	return !p.inFlightFull(e)
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；

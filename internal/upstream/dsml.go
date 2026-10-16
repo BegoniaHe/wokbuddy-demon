@@ -268,12 +268,8 @@ func parseMarkupBlock(inner string, allowed map[string]bool) ([]MarkupCall, bool
 		if !ok {
 			return nil, false
 		}
-		if strict {
-			if !allowed[name] {
-				return nil, false // 工具名不在客户端声明的 tools 里 → 不认，原文透出
-			}
-		} else if !markupToolNameRe.MatchString(name) {
-			return nil, false // 名单缺失时的弱判定：名字不像工具名 → 不认，原文透出
+		if !markupNameAllowed(name, allowed, strict) {
+			return nil, false // 工具名不在声明里 / 名单缺失且名字不像工具名 → 原文透出
 		}
 		out = append(out, MarkupCall{Name: name, Arguments: args})
 	}
@@ -284,6 +280,15 @@ func parseMarkupBlock(inner string, allowed map[string]bool) ([]MarkupCall, bool
 		return nil, false // 最后一个 invoke 之后夹带了正文
 	}
 	return out, true
+}
+
+// markupNameAllowed 按 strict（客户端 tools 名单非空）分两级判定工具名：名单非空走
+// 严格比对，名单为空走形态检查（名字像工具名即可）。
+func markupNameAllowed(name string, allowed map[string]bool, strict bool) bool {
+	if strict {
+		return allowed[name]
+	}
+	return markupToolNameRe.MatchString(name)
 }
 
 // parseMarkupParams 解析一个 invoke 内部的 parameter 列表，产出 JSON 对象文本。
@@ -344,32 +349,48 @@ func parseMarkupParams(body string) (string, bool) {
 // 两个来源都为空 → 返回 nil，由调用方决定是否启用弱判定（见 NewMarkupRepair）。
 // 解析失败按空处理（不编造名单）。
 func ToolNameAllowlist(body []byte) map[string]bool {
-	var req struct {
-		Tools []struct {
-			Name     string `json:"name"`
-			Function *struct {
-				Name string `json:"name"`
-			} `json:"function"`
-		} `json:"tools"`
-		Functions []struct {
-			Name string `json:"name"`
-		} `json:"functions"`
-		Messages []struct {
-			ToolCalls []struct {
-				Function *struct {
-					Name string `json:"name"`
-				} `json:"function"`
-			} `json:"tool_calls"`
-			FunctionCall *struct {
-				Name string `json:"name"`
-			} `json:"function_call"`
-		} `json:"messages"`
-	}
+	var req toolNameRequest
 	if json.Unmarshal(body, &req) != nil {
 		return nil
 	}
 	names := map[string]bool{}
-	for _, t := range req.Tools {
+	addToolDeclarations(names, req.Tools, req.Functions)
+	addHistoryToolNames(names, req.Messages)
+	if len(names) == 0 {
+		return nil
+	}
+	return names
+}
+
+// toolNameRequest 工具名收集用的请求体形态。
+type toolNameRequest struct {
+	Tools     []toolNameTool     `json:"tools"`
+	Functions []toolNameFunction `json:"functions"`
+	Messages  []toolNameMessage  `json:"messages"`
+}
+
+type toolNameTool struct {
+	Name     string            `json:"name"`
+	Function *toolNameFunction `json:"function"`
+}
+
+type toolNameFunction struct {
+	Name string `json:"name"`
+}
+
+type toolNameMessage struct {
+	ToolCalls    []toolNameToolCall `json:"tool_calls"`
+	FunctionCall *toolNameFunction  `json:"function_call"`
+}
+
+type toolNameToolCall struct {
+	Function *toolNameFunction `json:"function"`
+}
+
+// addToolDeclarations 收集本请求声明的工具名：tools[].function.name、Responses 风格裸
+// tools[].name、旧版 functions[].name。
+func addToolDeclarations(names map[string]bool, tools []toolNameTool, functions []toolNameFunction) {
+	for _, t := range tools {
 		if t.Function != nil && t.Function.Name != "" {
 			names[t.Function.Name] = true
 			continue
@@ -378,12 +399,17 @@ func ToolNameAllowlist(body []byte) map[string]bool {
 			names[t.Name] = true
 		}
 	}
-	for _, f := range req.Functions {
+	for _, f := range functions {
 		if f.Name != "" {
 			names[f.Name] = true
 		}
 	}
-	for _, m := range req.Messages {
+}
+
+// addHistoryToolNames 收集会话历史里出现过的工具名：messages[].tool_calls[].function.name
+// 与旧版 messages[].function_call.name。
+func addHistoryToolNames(names map[string]bool, messages []toolNameMessage) {
+	for _, m := range messages {
 		for _, tc := range m.ToolCalls {
 			if tc.Function != nil && tc.Function.Name != "" {
 				names[tc.Function.Name] = true
@@ -393,10 +419,6 @@ func ToolNameAllowlist(body []byte) map[string]bool {
 			names[m.FunctionCall.Name] = true
 		}
 	}
-	if len(names) == 0 {
-		return nil
-	}
-	return names
 }
 
 // RepairAggregatedResponse 在非流式聚合响应里把正文中的标记还原为 tool_calls。
@@ -417,34 +439,38 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 		return r
 	}
 	for _, ci := range choices {
-		c, ok := ci.(map[string]any)
-		if !ok {
-			continue
+		if c, ok := ci.(map[string]any); ok {
+			r.repairChoice(c)
 		}
-		msg, ok := c["message"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
-			continue
-		}
-		if fr, _ := c["finish_reason"].(string); fr != "stop" {
-			continue
-		}
-		text, _ := msg["content"].(string)
-		if text == "" || !strings.Contains(text, markupPipe) {
-			continue
-		}
-		emit, calls := r.Feed(text)
-		emit += r.Flush()
-		if len(calls) == 0 {
-			continue
-		}
-		msg["content"] = emit
-		msg["tool_calls"] = markupMessageToolCalls(calls)
-		c["finish_reason"] = "tool_calls"
 	}
 	return r
+}
+
+// repairChoice 尝试把单个 choice 的正文标记还原为 tool_calls。返回是否发生转换。
+func (r *MarkupRepair) repairChoice(c map[string]any) bool {
+	msg, ok := c["message"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+		return false
+	}
+	if fr, _ := c["finish_reason"].(string); fr != "stop" {
+		return false
+	}
+	text, _ := msg["content"].(string)
+	if text == "" || !strings.Contains(text, markupPipe) {
+		return false
+	}
+	emit, calls := r.Feed(text)
+	emit += r.Flush()
+	if len(calls) == 0 {
+		return false
+	}
+	msg["content"] = emit
+	msg["tool_calls"] = markupMessageToolCalls(calls)
+	c["finish_reason"] = "tool_calls"
+	return true
 }
 
 // markupMessageToolCalls 把还原出来的调用转成**非流式** message.tool_calls 数组。

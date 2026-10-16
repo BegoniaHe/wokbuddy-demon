@@ -3,11 +3,8 @@
 package upstream
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 
@@ -45,20 +42,7 @@ type TravelState struct {
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
-	var rdr io.Reader
-	if body != nil {
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		rdr = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequestWithContext(context.Background(), method, c.chatBase(a)+path, rdr)
-	if err != nil {
-		return nil, err
-	}
-	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.domainJSON(a, c.chatBase(a), method, path, body)
 }
 
 // TravelStatus 查询猫猫旅行状态。

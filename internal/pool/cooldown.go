@@ -69,34 +69,42 @@ func (p *Pool) NoteCheckinDone(uid string) {
 func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if credits < 0 {
-			credits = 0
-		}
-		if expiring < 0 {
-			expiring = 0
-		}
-		if expiring > credits {
-			expiring = credits
-		}
-		now := time.Now()
-		if earliestRemaining < 0 {
-			earliestRemaining = 0
-		}
-		if earliestRemaining > credits {
-			earliestRemaining = credits
-		}
-		if earliestAt.IsZero() || !earliestAt.After(now) || earliestRemaining == 0 {
-			earliestAt = time.Time{}
-			earliestRemaining = 0
-		}
-		e.credits = credits
-		e.creditsTotal = total
-		e.creditsExpiring = expiring
-		e.creditsEarliestExpiry = earliestAt
-		e.creditsEarliestRemaining = earliestRemaining
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(credits, expiring, earliestAt, earliestRemaining)
+	e.credits = credits
+	e.creditsTotal = total
+	e.creditsExpiring = expiring
+	e.creditsEarliestExpiry = earliestAt
+	e.creditsEarliestRemaining = earliestRemaining
+	p.dirty.Store(true)
+}
+
+// clampCreditsDetailed 把上游余额/到期明细钳到合法区间：负数归零、子集不超过总额，
+// 最早到期批次不在未来（或剩余为零）时整体清空。纯函数，便于单点校验。
+func clampCreditsDetailed(credits, expiring int64, earliestAt time.Time, earliestRemaining int64) (int64, int64, time.Time, int64) {
+	if credits < 0 {
+		credits = 0
+	}
+	if expiring < 0 {
+		expiring = 0
+	}
+	if expiring > credits {
+		expiring = credits
+	}
+	if earliestRemaining < 0 {
+		earliestRemaining = 0
+	}
+	if earliestRemaining > credits {
+		earliestRemaining = credits
+	}
+	if earliestAt.IsZero() || !earliestAt.After(time.Now()) || earliestRemaining == 0 {
+		earliestAt = time.Time{}
+		earliestRemaining = 0
+	}
+	return credits, expiring, earliestAt, earliestRemaining
 }
 
 // ClearExpiringSnapshots 清空所有账号的快过期/最早到期缓存。配置窗口改变时调用，
@@ -149,32 +157,34 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		now := time.Now()
-		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
-			if e.modelCooldowns == nil {
-				e.modelCooldowns = map[string]modelCooldown{}
-			}
-			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
-				ResetAt: resetAt,
-				Reason:  reason,
-			}
-		} else {
-			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
-			if e.coolKind != CoolSoft || !now.Before(e.until) {
-				d := p.softDurationLocked(base, e.softStreak+1)
-				e.softStreak++
-				e.until = now.Add(d)
-			}
-			e.coolKind = CoolSoft
-			e.reason = reason
-			clearRoutingModelCooldownsLocked(e)
-		}
-		p.dirty.Store(true)
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
 	}
+	now := time.Now()
+	if !resetAt.IsZero() {
+		// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+		if e.modelCooldowns == nil {
+			e.modelCooldowns = map[string]modelCooldown{}
+		}
+		e.modelCooldowns[model] = modelCooldown{
+			Until:   p.cappedSoftUntilLocked(now, resetAt),
+			ResetAt: resetAt,
+			Reason:  reason,
+		}
+	} else {
+		// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
+		// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
+		if e.coolKind != CoolSoft || !now.Before(e.until) {
+			d := p.softDurationLocked(base, e.softStreak+1)
+			e.softStreak++
+			e.until = now.Add(d)
+		}
+		e.coolKind = CoolSoft
+		e.reason = reason
+		clearRoutingModelCooldownsLocked(e)
+	}
+	p.dirty.Store(true)
 }
 
 // RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
@@ -340,15 +350,8 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 			return ModelBlockStatus{}
 		}
 		st.Count++
-		if mc, ok := e.modelCooldowns[model]; ok {
-			if st.Reason == "" {
-				st.Reason = mc.Reason
-			}
-			// 取最早解封：那才是"再等多久值得重试"的答案。
-			if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
-				st.Until = mc.Until
-			}
-		}
+		mc, ok := e.modelCooldowns[model]
+		st.mergeModelCooldown(mc, ok)
 	}
 	if st.Count == 0 {
 		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。
@@ -356,6 +359,20 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	}
 	st.Blocked = true
 	return st
+}
+
+// mergeModelCooldown 把单个账号的模型级冷却并入全池阻塞画像：记录首个非空原因，
+// 并取最早解封时刻（那才是"再等多久值得重试"的答案）。
+func (st *ModelBlockStatus) mergeModelCooldown(mc modelCooldown, ok bool) {
+	if !ok {
+		return
+	}
+	if st.Reason == "" {
+		st.Reason = mc.Reason
+	}
+	if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
+		st.Until = mc.Until
+	}
 }
 
 // CooldownSoftRate 429/限流文案的**账号级**软冷却入口（handler.applyErrorPolicy 调用）。

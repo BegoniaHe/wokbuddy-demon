@@ -320,36 +320,16 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	var fetchErrs []string
 
-	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
-	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
-	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-			infos, err := p.cfg.Upstream.FetchModels(acct)
-			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
-			} else {
-				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
-				}
-			}
+	if entries, errMsg := p.collectCNModels(); len(entries) > 0 || errMsg != "" {
+		out = append(out, entries...)
+		if errMsg != "" {
+			fetchErrs = append(fetchErrs, errMsg)
 		}
 	}
-
-	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
-	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
-	if p.cfg.Upstream.GlobalEnabled {
-		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
-			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
-				if len(infos) == 0 {
-					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
-				} else {
-					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
-					for _, mi := range infos {
-						out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
-					}
-				}
-			}
+	if entries, errMsg := p.collectGlobalModels(); len(entries) > 0 || errMsg != "" {
+		out = append(out, entries...)
+		if errMsg != "" {
+			fetchErrs = append(fetchErrs, errMsg)
 		}
 	}
 
@@ -362,6 +342,56 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// collectCNModels 查 CN 域模型：无可用 CN 账号或账号缺失时返回空；查询失败返回
+// 错误描述（前缀 "cn:"）。此前无条件 Pool.Pick()+FetchModels——选中 global 账号时
+// 打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸。
+func (p *Panel) collectCNModels() ([]map[string]any, string) {
+	uids := p.cfg.Pool.AvailableUIDsForRealm("cn")
+	if len(uids) == 0 {
+		return nil, ""
+	}
+	acct := p.cfg.Pool.AuthByUID(uids[0])
+	if acct == nil {
+		return nil, ""
+	}
+	infos, err := p.cfg.Upstream.FetchModels(acct)
+	if err != nil {
+		return nil, "cn: " + err.Error()
+	}
+	out := make([]map[string]any, 0, len(infos))
+	for _, mi := range infos {
+		out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+	}
+	return out, ""
+}
+
+// collectGlobalModels 查 global 域模型：路由开关关、无可用 global 账号或账号缺失时
+// 返回空；上游返回空目录时返回错误描述。Upstream.GlobalEnabled 是探测侧同一道闸，
+// 与 main 装配的 config global.enabled 一致。
+func (p *Panel) collectGlobalModels() ([]map[string]any, string) {
+	if !p.cfg.Upstream.GlobalEnabled {
+		return nil, ""
+	}
+	uids := p.cfg.Pool.AvailableUIDsForRealm("global")
+	if len(uids) == 0 {
+		return nil, ""
+	}
+	acct := p.cfg.Pool.AuthByUID(uids[0])
+	if acct == nil {
+		return nil, ""
+	}
+	infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
+	if len(infos) == 0 {
+		return nil, "global: 上游未返回可用模型"
+	}
+	efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
+	out := make([]map[string]any, 0, len(infos))
+	for _, mi := range infos {
+		out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
+	}
+	return out, ""
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
@@ -662,19 +692,7 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // upstream.FetchAccountProfile 内即被丢弃）；单号失败静默跳过，不打断余额刷新
 // 的既有结果。
 func (p *Panel) syncNicknames() {
-	type job struct {
-		uid string
-		a   *auth.Auth
-	}
-	var jobs []job
-	for _, st := range p.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
-		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil && a.AccessTokenValue() != "" {
-			jobs = append(jobs, job{uid: st.UID, a: a})
-		}
-	}
+	jobs := p.collectNicknameJobs()
 	if len(jobs) == 0 {
 		return
 	}
@@ -687,28 +705,58 @@ func (p *Panel) syncNicknames() {
 	)
 	for _, j := range jobs {
 		wg.Add(1)
-		go func(j job) {
+		go func(j nicknameJob) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
-			if err != nil {
-				mu.Lock()
-				failed++
-				mu.Unlock()
+			u, f := p.fetchNickname(j)
+			if u == 0 && f == 0 {
 				return
 			}
-			if p.cfg.Pool.SetNickname(j.uid, nick) {
-				mu.Lock()
-				updated++
-				mu.Unlock()
-			}
+			mu.Lock()
+			updated += u
+			failed += f
+			mu.Unlock()
 		}(j)
 	}
 	wg.Wait()
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
 	}
+}
+
+// nicknameJob 一次昵称同步任务：目标 uid 与其 auth 句柄。
+type nicknameJob struct {
+	uid string
+	a   *auth.Auth
+}
+
+// collectNicknameJobs 收集需要同步昵称的账号：跳过禁用号与无 access token 的号。
+func (p *Panel) collectNicknameJobs() []nicknameJob {
+	var jobs []nicknameJob
+	for _, st := range p.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.AccessTokenValue() == "" {
+			continue
+		}
+		jobs = append(jobs, nicknameJob{uid: st.UID, a: a})
+	}
+	return jobs
+}
+
+// fetchNickname 拉取单号昵称并写回池；返回 (更新数, 失败数)，均未变化时为 (0,0)。
+func (p *Panel) fetchNickname(j nicknameJob) (int, int) {
+	nick, err := p.cfg.Upstream.FetchAccountProfile(j.a)
+	if err != nil {
+		return 0, 1
+	}
+	if p.cfg.Pool.SetNickname(j.uid, nick) {
+		return 1, 0
+	}
+	return 0, 0
 }
 
 // ---------------------------------------------------------------------------
@@ -726,21 +774,7 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
 		return
 	}
-	q := r.URL.Query()
-	win := usage.Window{}
-	win.From = parseTimeParam(q.Get("from"))
-	win.To = parseTimeParam(q.Get("to"))
-	if win.From.IsZero() && win.To.IsZero() {
-		win.Hours = 72
-		if v := q.Get("hours"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-				win.Hours = n
-			}
-		}
-		if win.Hours > 1440 {
-			win.Hours = 1440
-		}
-	}
+	win := parseUsageWindow(r)
 	// 昵称仅用于展示，取自池快照（不含任何凭证）。
 	nicks := map[string]string{}
 	for _, s := range p.cfg.Pool.List() {
@@ -753,6 +787,28 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 		currentRate = p.cfg.Upstream.ModelRate
 	}
 	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(win, nicks, currentRate))
+}
+
+// parseUsageWindow 解析用量统计窗口：from/to 任一给出则用显式区间；否则用 hours
+// 滚动窗口（默认 72、上限 1440），显式 hours=0 表示全部历史。区间与 hours 互斥。
+func parseUsageWindow(r *http.Request) usage.Window {
+	q := r.URL.Query()
+	win := usage.Window{}
+	win.From = parseTimeParam(q.Get("from"))
+	win.To = parseTimeParam(q.Get("to"))
+	if !win.From.IsZero() || !win.To.IsZero() {
+		return win
+	}
+	win.Hours = 72
+	if v := q.Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			win.Hours = n
+		}
+	}
+	if win.Hours > 1440 {
+		win.Hours = 1440
+	}
+	return win
 }
 
 // parseTimeParam 解析时间查询参数：unix 秒（前端默认）或 RFC3339（便于手工调

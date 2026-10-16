@@ -152,20 +152,22 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
-			r.touch(key, e.uid, now)
-			return e.uid, true
-		}
-		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
+	if found && !expired(e, now, r.cfg.TTL) && available[e.uid] {
+		r.touch(key, e.uid, now)
+		return e.uid, true
 	}
+	// 未命中/失效，或绑定号已冷却/占满 → 落入慢路径重分配。
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.resolveSlowLocked(key, model, now, available)
+}
 
+// resolveSlowLocked 在写锁内完成 re-check 与分配（见 ResolveForModel 头注）。
+func (r *Router) resolveSlowLocked(key, model string, now time.Time, available map[string]bool) (string, bool) {
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
-	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
+	if e2, found := r.entries[key]; found && !expired(e2, now, r.cfg.TTL) {
 		if available[e2.uid] {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
@@ -178,7 +180,18 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 		return "", false
 	}
 
-	// 双段策略：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
+	uid := r.pickUID(key, uids)
+	prev, existed := r.entries[key]
+	r.entries[key] = entry{uid: uid, lastActive: now}
+	if existed && prev.uid != uid {
+		r.cfg.Store.DelBind(key)
+	}
+	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	return uid, true
+}
+
+// pickUID 双段分配：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
+func (r *Router) pickUID(key string, uids []string) string {
 	bound := map[string]bool{}
 	for _, v := range r.entries {
 		bound[v.uid] = true
@@ -189,19 +202,11 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 			idle = append(idle, u)
 		}
 	}
-	pool2 := idle
-	if len(pool2) == 0 {
-		pool2 = uids
+	pool := idle
+	if len(pool) == 0 {
+		pool = uids
 	}
-	uid := pool2[hashIndex(key, len(pool2))]
-
-	prev, existed := r.entries[key]
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	if existed && prev.uid != uid {
-		r.cfg.Store.DelBind(key)
-	}
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
-	return uid, true
+	return pool[hashIndex(key, len(pool))]
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
@@ -394,7 +399,20 @@ func deriveKey(obj map[string]any) string {
 	if !ok || len(msgs) == 0 {
 		return ""
 	}
-	systemText, firstUserText := "", ""
+	systemText, firstUserText := scanDeriveTexts(msgs)
+	if firstUserText == "" {
+		return "" // 无用户消息：无从归属会话
+	}
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// scanDeriveTexts 遍历消息，取首条 system/developer 文本与首条 user 内容签名；
+// 两者都拿到即提前停止（见 deriveKey）。首条 user 用内容签名（ids.go
+// contentSignature 的会话级变体 userContentSignature）而非纯文本提取：纯图片轮
+// （无 text part）在 messageText 下恒空串 → 派生键失效（首图会话的粘性盲区）；
+// 签名口径下图片 part 以 [type] 占位入键。
+func scanDeriveTexts(msgs []any) (systemText, firstUserText string) {
 	for _, m := range msgs {
 		msg, ok := m.(map[string]any)
 		if !ok {
@@ -408,9 +426,6 @@ func deriveKey(obj map[string]any) string {
 			}
 		case "user":
 			if firstUserText == "" {
-				// 首条 user 用内容签名（ids.go contentSignature）而非纯文本提取：
-				// 纯图片轮（无 text part）在 messageText 下恒空串 → 派生键失效
-				// （首图会话的粘性盲区）；签名口径下图片 part 以 [type:摘要] 入键。
 				firstUserText = userContentSignature(msg["content"])
 			}
 		}
@@ -418,11 +433,7 @@ func deriveKey(obj map[string]any) string {
 			break // 都已拿到：停止遍历长历史
 		}
 	}
-	if firstUserText == "" {
-		return "" // 无用户消息：无从归属会话
-	}
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
-	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+	return systemText, firstUserText
 }
 
 // userContentSignature 把已解析的 content（any）转回 RawMessage 后取**会话级稳定**
@@ -452,32 +463,11 @@ func userContentSignature(content any) string {
 	if st[0] != '[' {
 		return ""
 	}
-	var parts []json.RawMessage
-	if json.Unmarshal(raw, &parts) != nil {
-		return ""
-	}
-	var b strings.Builder
-	hasNonText := false
-	for _, pr := range parts {
-		var p struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
-		if json.Unmarshal(pr, &p) != nil {
-			return ""
-		}
-		if p.Type == "" || p.Type == "text" {
-			b.WriteString(p.Text)
-			continue
-		}
-		hasNonText = true
-		b.WriteString("\n[" + p.Type + "]\n")
-	}
-	out := b.String()
-	if !hasNonText {
-		return out
-	}
-	return strings.TrimSpace(out)
+	// 非文本 part 只入 "[type]" 占位，不入内容摘要（保证派生键随图片 URL 变化
+	// 仍稳定——fork 既有契约）。
+	return partsSignature(raw, func(typeName string, _ json.RawMessage) string {
+		return "\n[" + typeName + "]\n"
+	})
 }
 
 // messageText 提取消息 content 的文本表示。

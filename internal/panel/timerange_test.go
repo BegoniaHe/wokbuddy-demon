@@ -54,47 +54,67 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 	}
 	p := New(Config{Version: "test", APIKey: "k", Usage: rec, Pool: pool.New("")})
 
-	get := func(query string) map[string]any {
-		t.Helper()
-		req := httptest.NewRequest(http.MethodGet, "/panel/api/usage"+query, nil)
-		req.Header.Set("Authorization", "Bearer k")
-		rr := httptest.NewRecorder()
-		p.ServeHTTP(rr, req)
-		if rr.Code != 200 {
-			t.Fatalf("usage%s -> %d %s", query, rr.Code, rr.Body)
-		}
-		var out map[string]any
-		if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
-			t.Fatal(err)
-		}
-		return out
-	}
-
 	from := base.Add(2 * time.Hour).Unix()
 	to := base.Add(3 * time.Hour).Unix()
 	// 同时带上 hours=720：区间参数应优先，否则会被算成 30 天全量。
-	got := get("?hours=720&from=" + strconv.FormatInt(from, 10) + "&to=" + strconv.FormatInt(to, 10))
-	totals := got["totals"].(map[string]any)
-	if reqs := totals["requests"].(float64); reqs != 2 {
+	got := usageGET(t, p, "?hours=720&from="+strconv.FormatInt(from, 10)+"&to="+strconv.FormatInt(to, 10))
+	if reqs := usageRequests(t, got); reqs != 2 {
 		t.Fatalf("区间请求数 = %v, want 2（from/to 应优先于 hours）", reqs)
 	}
-	if got["window_from"] == nil || got["window_to"] == nil {
-		t.Fatalf("响应应回显 window_from/window_to: %+v", got)
-	}
+	assertUsageRangeEcho(t, got, true)
 
 	// 无区间参数时回落默认 72h，且不回显区间。
-	def := get("")
-	if def["window_from"] != nil || def["window_to"] != nil {
-		t.Fatalf("默认窗口不应回显区间: %+v", def)
-	}
-	if r := def["totals"].(map[string]any)["requests"].(float64); r != 6 {
+	def := usageGET(t, p, "")
+	assertUsageRangeEcho(t, def, false)
+	if r := usageRequests(t, def); r != 6 {
 		t.Fatalf("默认窗口请求数 = %v, want 6", r)
 	}
 
 	// hours=0（全部历史）同样不回显区间。
-	all := get("?hours=0")
-	if r := all["totals"].(map[string]any)["requests"].(float64); r != 6 {
+	all := usageGET(t, p, "?hours=0")
+	if r := usageRequests(t, all); r != 6 {
 		t.Fatalf("全部历史请求数 = %v, want 6", r)
+	}
+}
+
+// usageGET 带鉴权请求 usage 端点并解析 JSON 响应。
+func usageGET(t *testing.T, p *Panel, query string) map[string]any {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/usage"+query, nil)
+	req.Header.Set("Authorization", "Bearer k")
+	rr := httptest.NewRecorder()
+	p.ServeHTTP(rr, req)
+	if rr.Code != 200 {
+		t.Fatalf("usage%s -> %d %s", query, rr.Code, rr.Body)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// usageRequests 取出响应 totals.requests。
+func usageRequests(t *testing.T, got map[string]any) float64 {
+	t.Helper()
+	totals, ok := got["totals"].(map[string]any)
+	if !ok {
+		t.Fatalf("响应缺 totals: %+v", got)
+	}
+	reqs, ok := totals["requests"].(float64)
+	if !ok {
+		t.Fatalf("totals.requests 类型异常: %+v", totals)
+	}
+	return reqs
+}
+
+// assertUsageRangeEcho 断言 window_from/window_to 是否随请求回显。
+func assertUsageRangeEcho(t *testing.T, got map[string]any, want bool) {
+	t.Helper()
+	hasFrom := got["window_from"] != nil
+	hasTo := got["window_to"] != nil
+	if hasFrom != want || hasTo != want {
+		t.Fatalf("window 回显 = from:%v to:%v, want %v: %+v", hasFrom, hasTo, want, got)
 	}
 }
 

@@ -374,6 +374,14 @@ func WriteDefault(path string) (string, error) {
 }
 
 func applyEnv(c *Config) {
+	applyEnvCore(c)
+	applyEnvTimeouts(c)
+	applyEnvIdentity(c)
+	applyEnvFeatures(c)
+}
+
+// applyEnvCore 覆盖监听 / 鉴权 / 路径与冷却基数。
+func applyEnvCore(c *Config) {
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
 		c.Listen = v
 	}
@@ -392,21 +400,23 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
 		c.Cooldown.SoftRateMax = v
 	}
-	if v := os.Getenv("WB2A_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.TimeoutSeconds = n
-		}
+}
+
+// applyEnvTimeouts 覆盖出站 HTTP 三段超时（短 RPC / 首字节前 / 流中空闲）。
+func applyEnvTimeouts(c *Config) {
+	if n, ok := envInt("WB2A_TIMEOUT_SECONDS"); ok {
+		c.Upstream.TimeoutSeconds = n
 	}
-	if v := os.Getenv("WB2A_HEADER_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.HeaderTimeoutSeconds = n
-		}
+	if n, ok := envInt("WB2A_HEADER_TIMEOUT_SECONDS"); ok {
+		c.Upstream.HeaderTimeoutSeconds = n
 	}
-	if v := os.Getenv("WB2A_IDLE_TIMEOUT_SECONDS"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.Upstream.IdleTimeoutSeconds = n
-		}
+	if n, ok := envInt("WB2A_IDLE_TIMEOUT_SECONDS"); ok {
+		c.Upstream.IdleTimeoutSeconds = n
 	}
+}
+
+// applyEnvIdentity 覆盖出站 UA / 归属头 / 设备 token 与 IP 透传开关。
+func applyEnvIdentity(c *Config) {
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
 		c.Upstream.UserAgent = v
 	}
@@ -425,15 +435,15 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
 		c.Upstream.DeviceTokenFile = v
 	}
-	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Upstream.PassthroughIP = b
-		}
+	if b, ok := envBool("WB2A_PASSTHROUGH_IP"); ok {
+		c.Upstream.PassthroughIP = b
 	}
-	if v := os.Getenv("WB2A_SANITIZE_FINGERPRINTS"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Features.SanitizeBlacklistFingerprints = b
-		}
+}
+
+// applyEnvFeatures 覆盖脱敏开关、prompt 模式 / 文件与积分过期相关项。
+func applyEnvFeatures(c *Config) {
+	if b, ok := envBool("WB2A_SANITIZE_FINGERPRINTS"); ok {
+		c.Features.SanitizeBlacklistFingerprints = b
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
@@ -444,15 +454,56 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
-	if v := os.Getenv("WB2A_PREFER_EXPIRING"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.Pool.PreferExpiring = b
-		}
+	if b, ok := envBool("WB2A_PREFER_EXPIRING"); ok {
+		c.Pool.PreferExpiring = b
 	}
 }
 
+// envInt 读取整型环境变量：键缺席或解析失败一律视为未设置（ok=false），
+// 与旧内联写法「仅 Atoi 成功才覆盖」语义一致。
+func envInt(key string) (int, bool) {
+	v := os.Getenv(key)
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// envBool 读取布尔环境变量：键缺席或解析失败一律视为未设置（ok=false）。
+func envBool(key string) (bool, bool) {
+	v := os.Getenv(key)
+	if v == "" {
+		return false, false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, false
+	}
+	return b, true
+}
+
+// normalize 归一化配置：补齐默认值、解析时长、校验排程。
+// 顺序刻意保持「时长解析 → 静态默认值 → 排程校验 → prompt」：原实现里
+// pool.degrade_cooldown(_max) 是「先解析、后空值回落」，显式空串会在解析阶段
+// fail fast；若把静态默认值提前，空串会被先补成默认值而吞掉该错误。
 func (c *Config) normalize() error {
-	var err error
+	if err := c.normalizeDurations(); err != nil {
+		return err
+	}
+	c.normalizeStaticDefaults()
+	if err := c.normalizeSchedule(); err != nil {
+		return err
+	}
+	return c.normalizePrompt()
+}
+
+// normalizeStaticDefaults 补齐面板 / 日志 / 池 / 上游的数值型缺省值。
+// 这些字段互不依赖、也不参与时长解析，合并处理不改变可观测行为。
+func (c *Config) normalizeStaticDefaults() {
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
@@ -462,67 +513,12 @@ func (c *Config) normalize() error {
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
 	}
-	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
-	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
-	if c.Server.ReadTimeout == "" {
-		c.Server.ReadTimeout = "300s"
-	}
-	if c.ServerReadTimeoutDur, err = time.ParseDuration(c.Server.ReadTimeout); err != nil {
-		return fmt.Errorf("server.read_timeout: %w", err)
-	}
-	if c.ServerReadTimeoutDur < 0 {
-		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
-	}
-	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
-		return fmt.Errorf("cooldown.soft_rate: %w", err)
-	}
-	// 空值回落默认 2h（Default() 已置值；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
-	if c.Cooldown.SoftRateMax == "" {
-		c.Cooldown.SoftRateMax = "2h"
-	}
-	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
-		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
-	}
-	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
-		return fmt.Errorf("pool.breaker_cooldown: %w", err)
-	}
-	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
-		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
-	}
-	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
-		return fmt.Errorf("pool.degrade_cooldown: %w", err)
-	}
-	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
-		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
-	}
-	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
-		return fmt.Errorf("session_sticky.ttl: %w", err)
-	}
-	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
-		return fmt.Errorf("session_sticky.gc_interval: %w", err)
-	}
-	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
-	if c.Pool.ExpiringSoon != "" {
-		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
-			return fmt.Errorf("pool.expiring_soon: %w", err)
-		}
-	}
-	if c.ExpiringSoonDur < 0 {
-		c.ExpiringSoonDur = 0
-		c.Pool.ExpiringSoon = "0"
-	}
-	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
-	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停
-	// （"−5m" 无合理语义）。
-	if c.Pool.CostExploreInterval == "" {
-		c.Pool.CostExploreInterval = "30m"
-	}
-	if c.CostExploreIntervalDur, err = time.ParseDuration(c.Pool.CostExploreInterval); err != nil {
-		return fmt.Errorf("pool.cost_explore_interval: %w", err)
-	}
-	if c.CostExploreIntervalDur < 0 {
-		c.CostExploreIntervalDur = 0
-	}
+	c.normalizePoolDefaults()
+	c.normalizeUpstreamDefaults()
+}
+
+// normalizePoolDefaults 补齐池相关的数值型缺省值（阈值 / 权重 / 上限）。
+func (c *Config) normalizePoolDefaults() {
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
@@ -550,6 +546,10 @@ func (c *Config) normalize() error {
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
 	}
+}
+
+// normalizeUpstreamDefaults 补齐出站超时缺省值（header 回落 timeout、idle 走内置大值）。
+func (c *Config) normalizeUpstreamDefaults() {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
@@ -561,6 +561,127 @@ func (c *Config) normalize() error {
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
+}
+
+// normalizeDurations 把字符串时长解析到对应的 *Dur 字段，并按需回落默认值。
+// 子步骤按原实现顺序串联，任一项非法即短路返回（保持错误信息与优先级不变）。
+func (c *Config) normalizeDurations() error {
+	if err := c.normalizeServerDuration(); err != nil {
+		return err
+	}
+	if err := c.normalizeCooldownDurations(); err != nil {
+		return err
+	}
+	if err := c.normalizePoolDurations(); err != nil {
+		return err
+	}
+	if err := c.normalizeSessionDurations(); err != nil {
+		return err
+	}
+	return c.normalizeExpiringDurations()
+}
+
+// normalizeServerDuration 解析入站读取上限。
+func (c *Config) normalizeServerDuration() error {
+	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
+	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
+	if c.Server.ReadTimeout == "" {
+		c.Server.ReadTimeout = "300s"
+	}
+	var err error
+	if c.ServerReadTimeoutDur, err = time.ParseDuration(c.Server.ReadTimeout); err != nil {
+		return fmt.Errorf("server.read_timeout: %w", err)
+	}
+	if c.ServerReadTimeoutDur < 0 {
+		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	return nil
+}
+
+// normalizeCooldownDurations 解析软冷却基数与封顶。
+func (c *Config) normalizeCooldownDurations() error {
+	var err error
+	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
+		return fmt.Errorf("cooldown.soft_rate: %w", err)
+	}
+	// 空值回落默认 2h（Default() 已置值；此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	if c.Cooldown.SoftRateMax == "" {
+		c.Cooldown.SoftRateMax = "2h"
+	}
+	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
+		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
+	}
+	return nil
+}
+
+// normalizePoolDurations 解析熔断与连败降权的时长参数。
+func (c *Config) normalizePoolDurations() error {
+	var err error
+	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown: %w", err)
+	}
+	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
+		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
+	}
+	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown: %w", err)
+	}
+	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
+		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
+	}
+	return nil
+}
+
+// normalizeSessionDurations 解析会话粘性 TTL 与 GC 周期。
+func (c *Config) normalizeSessionDurations() error {
+	var err error
+	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
+		return fmt.Errorf("session_sticky.ttl: %w", err)
+	}
+	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
+		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	return nil
+}
+
+// normalizeExpiringDurations 解析快过期窗口与 costTier 探索窗口。
+func (c *Config) normalizeExpiringDurations() error {
+	var err error
+	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
+	if c.Pool.ExpiringSoon != "" {
+		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
+			return fmt.Errorf("pool.expiring_soon: %w", err)
+		}
+	}
+	if c.ExpiringSoonDur < 0 {
+		c.ExpiringSoonDur = 0
+		c.Pool.ExpiringSoon = "0"
+	}
+	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
+	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停
+	// （"−5m" 无合理语义）。
+	if c.Pool.CostExploreInterval == "" {
+		c.Pool.CostExploreInterval = "30m"
+	}
+	if c.CostExploreIntervalDur, err = time.ParseDuration(c.Pool.CostExploreInterval); err != nil {
+		return fmt.Errorf("pool.cost_explore_interval: %w", err)
+	}
+	if c.CostExploreIntervalDur < 0 {
+		c.CostExploreIntervalDur = 0
+	}
+	return nil
+}
+
+// normalizeSchedule 归一化监听地址与排程：小时数组空值回落默认、余额刷新周期，
+// 最后校验小时合法区间（0-23）。
+func (c *Config) normalizeSchedule() error {
+	c.normalizeListenAndHours()
+	c.normalizeBalanceRefresh()
+	return c.validateScheduleHours()
+}
+
+// normalizeListenAndHours 补齐 listen 前缀与六个排程小时数组的缺省值。
+func (c *Config) normalizeListenAndHours() {
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
 	}
@@ -584,17 +705,17 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.GrowthHours) == 0 {
 		c.Schedule.GrowthHours = []int{1}
 	}
-	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
+}
+
+// normalizeBalanceRefresh 计算余额后台刷新周期：启用时 minutes<=0 回落默认 5；
+// 关闭时 interval 保持 0（不启动）。
+func (c *Config) normalizeBalanceRefresh() {
 	if c.Schedule.BalanceRefreshEnabled {
 		if c.Schedule.BalanceRefreshMinutes <= 0 {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
 	}
-	if err := c.validateScheduleHours(); err != nil {
-		return err
-	}
-	return c.normalizePrompt()
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。

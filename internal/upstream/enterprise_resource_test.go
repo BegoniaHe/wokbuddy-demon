@@ -32,6 +32,24 @@ func TestEnterpriseResourceMapsAllocatedQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
+	assertEnterpriseAllocatedQuota(t, gotPath, gotEnt, remain, total, expiring, earliestAt, earliestRemaining)
+
+	// soon 覆盖周期末 → 整份剩余额度计入 expiring（prefer_expiring 据此优先消耗）。
+	_, _, expiring2, _, _, err := c.UserResourceDetailedWithExpiry(a, 30*24*time.Hour)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if expiring2 != 1188 {
+		t.Errorf("周期内 expiring=%d want 1188", expiring2)
+	}
+}
+
+// assertEnterpriseAllocatedQuota 断言企业额度归一后的 remain/total/expiring/最早批次。
+func assertEnterpriseAllocatedQuota(
+	t *testing.T, gotPath, gotEnt string,
+	remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64,
+) {
+	t.Helper()
 	if !strings.HasSuffix(gotPath, "/v2/billing/meter/get-enterprise-user-usage") {
 		t.Errorf("path=%s want .../get-enterprise-user-usage", gotPath)
 	}
@@ -47,15 +65,6 @@ func TestEnterpriseResourceMapsAllocatedQuota(t *testing.T) {
 	}
 	if earliestAt.IsZero() || earliestRemaining != 1188 {
 		t.Errorf("最早到期批次未记录：at=%v remaining=%d", earliestAt, earliestRemaining)
-	}
-
-	// soon 覆盖周期末 → 整份剩余额度计入 expiring（prefer_expiring 据此优先消耗）。
-	_, _, expiring2, _, _, err := c.UserResourceDetailedWithExpiry(a, 30*24*time.Hour)
-	if err != nil {
-		t.Fatalf("err=%v", err)
-	}
-	if expiring2 != 1188 {
-		t.Errorf("周期内 expiring=%d want 1188", expiring2)
 	}
 }
 

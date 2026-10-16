@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -82,25 +83,10 @@ type resourcePackage struct {
 	CycleCapacitySize   int64 `json:"CycleCapacitySize"`
 }
 
-// packageRemainUsed 与 billing.go:203-258 一致
+// packageRemainUsed 与 billing.go:203-258 一致。
 func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
 	if a.CycleCapacitySize > 0 {
-		remain = a.CycleCapacityRemain
-		size = a.CycleCapacitySize
-		if remain < 0 {
-			remain = 0
-		}
-		if remain > size {
-			remain = size
-		}
-		used = size - remain
-		if a.CycleCapacityUsed > used {
-			used = a.CycleCapacityUsed
-			if size >= used {
-				remain = size - used
-			}
-		}
-		return remain, used, size
+		return cycleRemainUsed(a)
 	}
 	remain = a.CapacityRemain
 	used = a.CapacityUsed
@@ -111,7 +97,47 @@ func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
 	return remain, used, size
 }
 
+// cycleRemainUsed 处理带周期（Cycle）的套餐：以 CycleCapacitySize 为上限，
+// remain 夹到 [0,size]，used 取周期用量与 size-remain 的较大值。
+func cycleRemainUsed(a resourcePackage) (remain, used, size int64) {
+	remain = a.CycleCapacityRemain
+	size = a.CycleCapacitySize
+	if remain < 0 {
+		remain = 0
+	}
+	if remain > size {
+		remain = size
+	}
+	used = size - remain
+	if a.CycleCapacityUsed > used {
+		used = a.CycleCapacityUsed
+	}
+	if size >= used {
+		remain = size - used
+	}
+	return remain, used, size
+}
+
 func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err error) {
+	req, err := newUserResourceRequest(af)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return 0, 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	return parseUserResource(resp.Body)
+}
+
+// newUserResourceRequest 构造 meter/get-user-resource 请求：按 realm 选计费域与路径，
+// 并带上账号身份头（X-User-Id / X-Enterprise-Id / X-Tenant-Id / X-Domain）。
+func newUserResourceRequest(af *authFile) (*http.Request, error) {
 	now := time.Now()
 	body, err := json.Marshal(map[string]any{
 		"PageNumber":               1,
@@ -122,7 +148,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return nil, err
 	}
 	base := billingBaseFor(af)
 	// global 域无 /v2 前缀（与 internal/upstream 的 billingMeterPaths 同口径）。
@@ -132,7 +158,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	}
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, base+path, bytes.NewReader(body))
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+af.Auth.AccessToken)
 	req.Header.Set("Accept", "application/json")
@@ -147,15 +173,12 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	if af.Auth.Domain != "" {
 		req.Header.Set("X-Domain", af.Auth.Domain)
 	}
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return 0, 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
+	return req, nil
+}
+
+// parseUserResource 解析计费响应信封：聚合各 package 的 Cycle/Capacity 用量，
+// 以 TotalDosage 作 size 下限，derived（size-remain）作 used 下限。
+func parseUserResource(body io.Reader) (remain, used, size int64, packs int, err error) {
 	var env struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -168,7 +191,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 			} `json:"Response"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
+	if err := json.NewDecoder(body).Decode(&env); err != nil {
 		return 0, 0, 0, 0, err
 	}
 	if env.Code != 0 {
@@ -204,6 +227,37 @@ func main() {
 	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
 	sort.Strings(files)
 
+	accounts := collectAccounts(files)
+	totalRemain, totalUsed, totalSize, okCount := summarize(accounts)
+
+	if pretty {
+		printPretty(accounts, totalRemain, totalUsed, totalSize, okCount)
+		return
+	}
+	out := map[string]any{
+		"service": "workbuddy",
+		"ts":      time.Now().Unix(),
+		"total": map[string]any{
+			"remain":   totalRemain,
+			"used":     totalUsed,
+			"size":     totalSize,
+			"accounts": len(accounts),
+			"ok":       okCount,
+			"failed":   len(accounts) - okCount,
+		},
+		"accounts": accounts,
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "marshal output:", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(raw))
+}
+
+// collectAccounts 逐个账号拉取余额：读取/解析失败静默跳过（与旧行为一致），
+// 无 accessToken 记为错误，成功则填 remain/used/size/packages。每账号间隔 200ms。
+func collectAccounts(files []string) []accountResult {
 	accounts := make([]accountResult, 0, len(files))
 	for _, f := range files {
 		var af authFile
@@ -230,46 +284,27 @@ func main() {
 		accounts = append(accounts, res)
 		time.Sleep(200 * time.Millisecond)
 	}
+	return accounts
+}
 
-	var totalRemain, totalUsed, totalSize int64
-	okCount := 0
+// summarize 汇总成功账号的余额与成功计数（failed = len(accounts) - ok）。
+func summarize(accounts []accountResult) (totalRemain, totalUsed, totalSize int64, okCount int) {
 	for _, a := range accounts {
-		if a.OK {
-			okCount++
-			if a.Remain != nil {
-				totalRemain += *a.Remain
-			}
-			if a.Used != nil {
-				totalUsed += *a.Used
-			}
-			if a.Size != nil {
-				totalSize += *a.Size
-			}
+		if !a.OK {
+			continue
+		}
+		okCount++
+		if a.Remain != nil {
+			totalRemain += *a.Remain
+		}
+		if a.Used != nil {
+			totalUsed += *a.Used
+		}
+		if a.Size != nil {
+			totalSize += *a.Size
 		}
 	}
-	out := map[string]any{
-		"service": "workbuddy",
-		"ts":      time.Now().Unix(),
-		"total": map[string]any{
-			"remain":   totalRemain,
-			"used":     totalUsed,
-			"size":     totalSize,
-			"accounts": len(accounts),
-			"ok":       okCount,
-			"failed":   len(accounts) - okCount,
-		},
-		"accounts": accounts,
-	}
-	if pretty {
-		printPretty(accounts, totalRemain, totalUsed, totalSize, okCount)
-		return
-	}
-	raw, err := json.Marshal(out)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "marshal output:", err)
-		os.Exit(1)
-	}
-	fmt.Println(string(raw))
+	return totalRemain, totalUsed, totalSize, okCount
 }
 
 // printPretty 人类可读日报：四行汇总，无账号明细。

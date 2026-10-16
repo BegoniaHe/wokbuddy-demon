@@ -16,7 +16,7 @@ func TestFetchAccountProfile(t *testing.T) {
 		if !strings.HasSuffix(r.URL.Path, "/console/account") {
 			return nil, errors.New("wrong path")
 		}
-		if r.Header.Get("Authorization") == "" || r.Header.Get("x-client-platform") != "web" {
+		if r.Header.Get("Authorization") == "" || r.Header.Get("X-Client-Platform") != "web" {
 			return nil, errors.New("missing bearer / web platform header")
 		}
 		// 响应刻意带 phoneNumber：方法必须只解析 nickname/uid，敏感字段不得进入返回值。

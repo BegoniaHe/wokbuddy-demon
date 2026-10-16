@@ -21,17 +21,8 @@ func TestModelProbesEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	get := func(cfg Config) *httptest.ResponseRecorder {
-		p := New(cfg)
-		req := httptest.NewRequest(http.MethodGet, "/panel/api/model_probes", nil)
-		req.Header.Set("Authorization", "Bearer test-key")
-		rec := httptest.NewRecorder()
-		p.ServeHTTP(rec, req)
-		return rec
-	}
-
 	// 1) 文件存在：透传 + exists + updated_at
-	rec := get(Config{Version: "test", APIKey: "test-key", ProbeFile: f})
+	rec := getModelProbes(Config{Version: "test", APIKey: "test-key", ProbeFile: f})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -40,9 +31,7 @@ func TestModelProbesEndpoint(t *testing.T) {
 		Exists    bool                       `json:"exists"`
 		UpdatedAt string                     `json:"updated_at"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
+	decodeJSONBytes(t, rec.Body.Bytes(), &got)
 	if !got.Exists || len(got.Probes) != 1 || got.UpdatedAt == "" {
 		t.Fatalf("exists=%v probes=%d updated_at=%q", got.Exists, len(got.Probes), got.UpdatedAt)
 	}
@@ -50,16 +39,17 @@ func TestModelProbesEndpoint(t *testing.T) {
 		Verdict  string `json:"verdict"`
 		Measured int64  `json:"measured"`
 	}
-	if err := json.Unmarshal(got.Probes["cn:glm-5.2"], &rec1); err != nil {
-		t.Fatal(err)
-	}
+	decodeJSONBytes(t, got.Probes["cn:glm-5.2"], &rec1)
 	if rec1.Verdict != "clamped" || rec1.Measured != 48000 {
 		t.Fatalf("probe passthrough = %+v", rec1)
 	}
+}
 
-	// 2) 文件缺失：空集 200（不是错误——无数据 = 无标注）。
-	//    注意每个 case 用全新结构体：向已非 nil 的 map 再次 Unmarshal 是合并不是替换。
-	rec = get(Config{Version: "test", APIKey: "test-key", ProbeFile: filepath.Join(dir, "nope.json")})
+// TestModelProbesEndpointMissing 文件缺失 / 未配置都回空集 200（不是错误——无数据 = 无标注）。
+// 注意每个 case 用全新结构体：向已非 nil 的 map 再次 Unmarshal 是合并不是替换。
+func TestModelProbesEndpointMissing(t *testing.T) {
+	dir := t.TempDir()
+	rec := getModelProbes(Config{Version: "test", APIKey: "test-key", ProbeFile: filepath.Join(dir, "nope.json")})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("missing file: code=%d want 200", rec.Code)
 	}
@@ -67,26 +57,45 @@ func TestModelProbesEndpoint(t *testing.T) {
 		Probes map[string]json.RawMessage `json:"probes"`
 		Exists bool                       `json:"exists"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &gotEmpty); err != nil {
-		t.Fatal(err)
-	}
+	decodeJSONBytes(t, rec.Body.Bytes(), &gotEmpty)
 	if gotEmpty.Exists || len(gotEmpty.Probes) != 0 {
 		t.Fatalf("missing file: exists=%v probes=%d, want false/0", gotEmpty.Exists, len(gotEmpty.Probes))
 	}
 
-	// 3) 未配置：同文件缺失
-	rec = get(Config{Version: "test", APIKey: "test-key"})
+	// 未配置：同文件缺失
+	rec = getModelProbes(Config{Version: "test", APIKey: "test-key"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unconfigured: code=%d want 200", rec.Code)
 	}
+}
 
-	// 4) 文件损坏：502（让面板显示读取失败而不是静默空白）
+// TestModelProbesEndpointCorrupt 文件损坏回 502（让面板显示读取失败而不是静默空白）。
+func TestModelProbesEndpointCorrupt(t *testing.T) {
+	dir := t.TempDir()
 	bad := filepath.Join(dir, "bad.json")
 	if err := os.WriteFile(bad, []byte(`{not json`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rec = get(Config{Version: "test", APIKey: "test-key", ProbeFile: bad})
+	rec := getModelProbes(Config{Version: "test", APIKey: "test-key", ProbeFile: bad})
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("corrupt file: code=%d want 502", rec.Code)
+	}
+}
+
+// getModelProbes 带鉴权请求 model_probes 端点。
+func getModelProbes(cfg Config) *httptest.ResponseRecorder {
+	p := New(cfg)
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/model_probes", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	return rec
+}
+
+// decodeJSONBytes 解析 JSON，失败即 Fatal。
+func decodeJSONBytes(t *testing.T, data []byte, v any) {
+	t.Helper()
+	if err := json.Unmarshal(data, v); err != nil {
+		t.Fatal(err)
 	}
 }

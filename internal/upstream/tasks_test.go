@@ -18,7 +18,7 @@ func TestClaimRewardWebEndpoint(t *testing.T) {
 	var gotPlatform, gotReferer string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath, gotMethod = r.URL.Path, r.Method
-		gotPlatform = r.Header.Get("x-client-platform")
+		gotPlatform = r.Header.Get("X-Client-Platform")
 		gotReferer = r.Header.Get("Referer")
 		buf := make([]byte, 64)
 		n, _ := r.Body.Read(buf)

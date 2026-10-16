@@ -71,6 +71,12 @@ func TestClassify(t *testing.T) {
 		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
 		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
 		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 同节点内 code 为空串/纯空白时须继续回落后备键 errCode/error_code：
+		// 停在空 code 会丢掉 11102 判定（回归：firstCodeField 曾「首个存在即返回」）。
+		{400, `{"code":"","errCode":"11102"}`, ErrModelBlocked},
+		{404, `{"code":"   ","error_code":"11102"}`, ErrModelBlocked},
+		// msg 为纯空白时须继续回落后备键 message（同类回归）。
+		{400, `{"msg":"   ","message":"service info not found"}`, ErrModelBlocked},
 		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。
@@ -310,6 +316,19 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fetch models: %v", err)
 	}
+	// glm-5.2 只支持 low/high，请求 max → 降级为 high
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
+	if err != nil || status != 200 {
+		t.Fatalf("chat: status=%d err=%v", status, err)
+	}
+	rc.Close()
+	assertEffortsDowngrade(t, infos, outbound)
+}
+
+// assertEffortsDowngrade 断言 effort 能力缓存与降级后的出站 body（glm-5.2 只支持
+// low/high，请求 max 应降级为 high）。
+func assertEffortsDowngrade(t *testing.T, infos []ModelInfo, outbound []byte) {
+	t.Helper()
 	if len(infos) != 1 {
 		t.Fatalf("infos=%+v", infos)
 	}
@@ -320,12 +339,6 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	if infos[0].DefaultEffort != "high" {
 		t.Errorf("infos[0].DefaultEffort=%q want high", infos[0].DefaultEffort)
 	}
-	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
-	if err != nil || status != 200 {
-		t.Fatalf("chat: status=%d err=%v", status, err)
-	}
-	rc.Close()
 	var m map[string]any
 	if err := json.Unmarshal(outbound, &m); err != nil {
 		t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
@@ -553,6 +566,12 @@ func TestFetchModelsDefaultEffortDualKeyAndSizes(t *testing.T) {
 	for _, mi := range infos {
 		byID[mi.ID] = mi
 	}
+	assertDefaultEffortDualKey(t, byID, c)
+}
+
+// assertDefaultEffortDualKey 断言 defaultEffort 新键与 effort 老键双通道解析出的字段。
+func assertDefaultEffortDualKey(t *testing.T, byID map[string]ModelInfo, c *Client) {
+	t.Helper()
 	g := byID["glm-5.3"]
 	if g.DefaultEffort != "high" {
 		t.Errorf("glm-5.3 DefaultEffort=%q want high (from defaultEffort key)", g.DefaultEffort)
@@ -607,15 +626,7 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			sawIDE = true
-			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
-			}
-			if r.Header.Get("X-Product") != "SaaS" {
-				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
-			}
-			if r.Header.Get("X-User-Id") != "u1" {
-				t.Errorf("X-User-Id=%q want u1", r.Header.Get("X-User-Id"))
-			}
+			assertV3ConfigHeaders(t, r)
 			return jsonResp(200, `{"code":0,"data":{"models":[
 				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.03","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"defaultEffort":"high","summary":"auto","supportedEfforts":["low","high","max"]}}
 			]}}`), nil
@@ -635,7 +646,26 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	if len(infos) != 1 {
 		t.Fatalf("infos=%+v", infos)
 	}
-	mi := infos[0]
+	assertV3Overlay(t, infos[0])
+}
+
+// assertV3ConfigHeaders 断言 /v3/config 请求带 IDE UA 与 SaaS 产品头。
+func assertV3ConfigHeaders(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.Header.Get("User-Agent") != codeBuddyIDEUA {
+		t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+	}
+	if r.Header.Get("X-Product") != "SaaS" {
+		t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
+	}
+	if r.Header.Get("X-User-Id") != "u1" {
+		t.Errorf("X-User-Id=%q want u1", r.Header.Get("X-User-Id"))
+	}
+}
+
+// assertV3Overlay 断言 /v3/config 的完整能力字段覆盖了 CLI 精简字段。
+func assertV3Overlay(t *testing.T, mi ModelInfo) {
+	t.Helper()
 	if mi.MaxTokens != 393216 {
 		t.Errorf("MaxTokens=%d want 393216", mi.MaxTokens)
 	}

@@ -64,6 +64,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // bindStore 记录粘性绑定镜像调用（不联网），供 D4 端到端断言绑定收敛到最终成功号。
 type bindStore struct {
 	redisstore.Noop
+
 	mu     sync.Mutex
 	binds  map[string]string
 	delCnt int
@@ -113,6 +114,159 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 		p.SetCredits(a.UID, 1000, 0)
 	}
 	return p
+}
+
+// postChat 向 h 发一次 /v1/chat/completions 请求（body 为 JSON 字符串），返回响应记录器。
+func postChat(t *testing.T, h *Handler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+	return rec
+}
+
+// statusOf 取账号状态；账号缺失即 Fatal。
+func statusOf(t *testing.T, p *pool.Pool, uid string) pool.Status {
+	t.Helper()
+	st, ok := p.Status(uid)
+	if !ok {
+		t.Fatalf("account %s status missing", uid)
+	}
+	return st
+}
+
+// assertChatSuccessUsage 断言单次成功 chat 的标准用量（请求数/用量次数/token 三元组 + 性能观测）。
+func assertChatSuccessUsage(t *testing.T, p *pool.Pool, uid string) {
+	t.Helper()
+	st := statusOf(t, p, uid)
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
+		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
+		t.Errorf("token usage=%+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
+		t.Errorf("latest performance=%+v", st.TokenUsage)
+	}
+}
+
+// assertCalls 断言每个 Authorization（完整 Bearer 头）的调用次数。
+func assertCalls(t *testing.T, calls, want map[string]int) {
+	t.Helper()
+	if len(calls) != len(want) {
+		t.Fatalf("calls=%v want %v", calls, want)
+	}
+	for k, v := range want {
+		if calls[k] != v {
+			t.Errorf("calls[%q]=%d want %d", k, calls[k], v)
+		}
+	}
+}
+
+// assertSoftRateCooling 断言账号处于 soft_rate 冷却，剩余时长落在 (0, maxSec]。
+func assertSoftRateCooling(t *testing.T, st pool.Status, maxSec int64) {
+	t.Helper()
+	if !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Fatalf("应进入 soft_rate 冷却: %+v", st)
+	}
+	if st.CoolRemaining <= 0 || st.CoolRemaining > maxSec {
+		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, maxSec)
+	}
+}
+
+// assertHardCreditCooldown 断言硬积分冷却到次日 04:00（非固定 12h/配置时长）。
+func assertHardCreditCooldown(t *testing.T, st pool.Status) {
+	t.Helper()
+	if !st.Cooling {
+		t.Fatalf("bad should be cooling: %+v", st)
+	}
+	if st.Reason != "余额不足" {
+		t.Errorf("reason=%q", st.Reason)
+	}
+	if st.Until.Hour() != 4 {
+		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
+	}
+	// 距次日 04:00 最长 28h（凌晨 00:00~04:00 间运行时 now→次日 04:00 跨度 > 24h，属正常）。
+	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
+		t.Errorf("until %v not within (0,28h]: %v", st.Until, d)
+	}
+}
+
+// assertModelResetCooldown 断言 6004 带重置时间：账号级不 cooling，模型级单行 until ≈ reset。
+func assertModelResetCooldown(t *testing.T, st pool.Status, reset time.Time) {
+	t.Helper()
+	if st.Cooling {
+		t.Fatalf("6004-with-reset should NOT set account-level cooling: %+v", st)
+	}
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
+		t.Fatalf("want single model ledger row glm-5.3: %+v", st.RateLimitedModels)
+	}
+	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
+		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
+	}
+}
+
+// assertRepairedToolCall 断言 message 已把正文标记还原成单个 tool_call（正文无残留）。
+func assertRepairedToolCall(t *testing.T, msg, choice map[string]any, wantContent, wantName, wantArg string) {
+	t.Helper()
+	if msg["content"] != wantContent {
+		t.Errorf("content=%q", msg["content"])
+	}
+	tcs, _ := msg["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("tool_calls=%#v want 1 个", msg["tool_calls"])
+	}
+	fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn == nil || fn["name"] != wantName {
+		t.Fatalf("function=%#v", tcs[0])
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(fn["arguments"].(string)), &args); err != nil {
+		t.Fatalf("arguments 不是合法 JSON: %v", fn["arguments"])
+	}
+	if args["cmd"] != wantArg {
+		t.Errorf("cmd=%v", args["cmd"])
+	}
+	if choice["finish_reason"] != "tool_calls" {
+		t.Errorf("finish_reason=%v want tool_calls", choice["finish_reason"])
+	}
+}
+
+// assertStatusSummary 断言 /status 的汇总字段与池级字段。
+func assertStatusSummary(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	var statusBody map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &statusBody); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	if statusBody["total"] != float64(1) || statusBody["healthy"] != float64(1) ||
+		statusBody["cooling"] != float64(0) || statusBody["disabled"] != float64(0) ||
+		statusBody["in_flight_full"] != float64(0) {
+		t.Errorf("summary=%v want total=1 healthy=1 cooling=0 disabled=0 in_flight_full=0", statusBody)
+	}
+	if statusBody["sticky_sessions"] != float64(0) {
+		t.Errorf("sticky_sessions=%v want 0", statusBody["sticky_sessions"])
+	}
+	if statusBody["redis_mode"] != "noop" {
+		t.Errorf("redis_mode=%v want noop", statusBody["redis_mode"])
+	}
+}
+
+// assertPortrait 断言 /status 单账号健康画像字段。
+func assertPortrait(t *testing.T, st pool.Status) {
+	t.Helper()
+	if !st.Cooling || st.CoolKind != "soft_rate" || st.CoolRemaining <= 0 {
+		t.Errorf("cooling portrait=%+v", st)
+	}
+	if st.SuccessCount != 2 {
+		t.Errorf("success_count=%d want 2", st.SuccessCount)
+	}
+	if st.ErrTotal != 1 {
+		t.Errorf("err_total=%d want 1", st.ErrTotal)
+	}
+	if st.LastSuccessTime.IsZero() {
+		t.Error("last_success should be set")
+	}
+	if st.LastErrTime.IsZero() {
+		t.Error("last_err should be set")
+	}
 }
 
 // TestChatLargeBodyNoGatewayLimit 请求体无网关侧上限（max_body_mb 已移除）：
@@ -203,9 +357,7 @@ func TestChatNonStreamAggregates(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -220,17 +372,7 @@ func TestChatNonStreamAggregates(t *testing.T) {
 	if msg["content"] != "你好" {
 		t.Errorf("content=%q", msg["content"])
 	}
-	st, ok := h.cfg.Pool.Status("u1")
-	if !ok {
-		t.Fatal("account status missing")
-	}
-	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
-		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
-		t.Errorf("token usage=%+v", st.TokenUsage)
-	}
-	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
-		t.Errorf("latest performance=%+v", st.TokenUsage)
-	}
+	assertChatSuccessUsage(t, h.cfg.Pool, "u1")
 }
 
 func TestChatStreamPassthrough(t *testing.T) {
@@ -241,9 +383,7 @@ func TestChatStreamPassthrough(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	rec := postChat(t, h, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d", rec.Code)
 	}
@@ -254,55 +394,53 @@ func TestChatStreamPassthrough(t *testing.T) {
 	if !strings.Contains(body, "你好") || !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("body=%q", body)
 	}
-	st, ok := h.cfg.Pool.Status("u1")
-	if !ok {
-		t.Fatal("account status missing")
-	}
-	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
-		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
-		t.Errorf("token usage=%+v", st.TokenUsage)
-	}
-	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
-		t.Errorf("latest performance=%+v", st.TokenUsage)
-	}
+	assertChatSuccessUsage(t, h.cfg.Pool, "u1")
 }
 
 func TestChatRecordsCreditForStreamAndSync(t *testing.T) {
-	const sseCredit = "data: {\"id\":\"chatcmpl-credit\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10,\"credit\":1.25}}\n\n" +
-		"data: [DONE]\n\n"
 	for _, stream := range []bool{false, true} {
 		name := "sync"
 		if stream {
 			name = "stream"
 		}
-		t.Run(name, func(t *testing.T) {
-			up := newFakeUpstream(t, func(string) (int, string, bool) {
-				return 200, sseCredit, true
-			})
-			rec := usage.New("")
-			h := NewHandler(Config{
-				Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
-				Upstream: up,
-				Usage:    rec,
-			})
-			body := `{"model":"glm-5.2","messages":[]}`
-			if stream {
-				body = `{"model":"glm-5.2","stream":true,"messages":[]}`
-			}
-			recorder := httptest.NewRecorder()
-			h.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
-			if recorder.Code != http.StatusOK {
-				t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body)
-			}
-			s := rec.Snapshot(24, nil)
-			if s.Totals.Credits != 1.25 || s.Totals.CreditSamples != 1 || s.Totals.CreditTokens != 10 || s.Totals.CreditsPer1MTokens != 125000 {
-				t.Fatalf("usage totals = %+v, want credit=1.25 tokens=10 ratio=125000", s.Totals)
-			}
-			if len(s.CreditByAccount) != 1 || s.CreditByAccount[0].Key != "u1" ||
-				len(s.CreditByModel) != 1 || s.CreditByModel[0].Key != "glm-5.2" {
-				t.Fatalf("credit dimensions = %+v / %+v", s.CreditByAccount, s.CreditByModel)
-			}
-		})
+		t.Run(name, func(t *testing.T) { checkCreditRecording(t, stream) })
+	}
+}
+
+// checkCreditRecording 断言流式/非流式下 credit 用量维度被正确记录。
+func checkCreditRecording(t *testing.T, stream bool) {
+	t.Helper()
+	const sseCredit = "data: {\"id\":\"chatcmpl-credit\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10,\"credit\":1.25}}\n\n" +
+		"data: [DONE]\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, sseCredit, true
+	})
+	rec := usage.New("")
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Usage:    rec,
+	})
+	body := `{"model":"glm-5.2","messages":[]}`
+	if stream {
+		body = `{"model":"glm-5.2","stream":true,"messages":[]}`
+	}
+	recorder := postChat(t, h, body)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body)
+	}
+	assertCreditUsage(t, rec.Snapshot(24, nil))
+}
+
+// assertCreditUsage 断言单次请求的 credit 总量与账号/模型维度。
+func assertCreditUsage(t *testing.T, s usage.Snapshot) {
+	t.Helper()
+	if s.Totals.Credits != 1.25 || s.Totals.CreditSamples != 1 || s.Totals.CreditTokens != 10 || s.Totals.CreditsPer1MTokens != 125000 {
+		t.Fatalf("usage totals = %+v, want credit=1.25 tokens=10 ratio=125000", s.Totals)
+	}
+	if len(s.CreditByAccount) != 1 || s.CreditByAccount[0].Key != "u1" ||
+		len(s.CreditByModel) != 1 || s.CreditByModel[0].Key != "glm-5.2" {
+		t.Fatalf("credit dimensions = %+v / %+v", s.CreditByAccount, s.CreditByModel)
 	}
 }
 
@@ -323,23 +461,19 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	p.SetCredits("bad", 2000, 0)
 	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
-		t.Errorf("calls=%v", calls)
+	assertCalls(t, calls, map[string]int{"Bearer at-bad": 1, "Bearer at-good": 1})
+	bad := statusOf(t, p, "bad")
+	if !bad.Cooling || bad.Reason == "" {
+		t.Errorf("bad account should be cooling: %+v", bad)
 	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.Reason == "" {
-		t.Errorf("bad account should be cooling: %+v", st)
+	if bad.TokenUsage.RequestCount != 1 || bad.TokenUsage.UsageCount != 0 {
+		t.Errorf("bad token usage=%+v", bad.TokenUsage)
 	}
-	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 0 {
-		t.Errorf("bad token usage=%+v", st.TokenUsage)
-	}
-	good, _ := p.Status("good")
+	good := statusOf(t, p, "good")
 	if good.TokenUsage.RequestCount != 1 || good.TokenUsage.TotalTokens != 2 {
 		t.Errorf("good token usage=%+v", good.TokenUsage)
 	}
@@ -368,27 +502,17 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	const soft = 45 * time.Second
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
-		t.Errorf("calls=%v want bad/good 各 1 次", calls)
-	}
-	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
-	}
+	assertCalls(t, calls, map[string]int{"Bearer at-bad": 1, "Bearer at-good": 1})
 	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	if max := int64(soft / time.Second); st.CoolRemaining <= 0 || st.CoolRemaining > max {
-		t.Errorf("cool_remaining_sec=%d want in (0,%d]", st.CoolRemaining, max)
-	}
+	assertSoftRateCooling(t, statusOf(t, p, "bad"), int64(soft/time.Second))
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
 	before := calls["Bearer at-bad"]
-	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	rec2 := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
 	if rec2.Code != 200 {
 		t.Fatalf("second code=%d body=%s", rec2.Code, rec2.Body)
 	}
@@ -595,31 +719,16 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	p.SetCredits("bad", 2000, 0) // bad 积分高，确定性源 → 先被选中
 	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	st, ok := p.Status("bad")
-	if !ok || !st.Cooling {
-		t.Fatalf("bad should be cooling: %+v ok=%v", st, ok)
-	}
-	if st.Reason != "余额不足" {
-		t.Errorf("reason=%q", st.Reason)
-	}
 	// 硬信贷冷却必须是次日 04:00，而不是固定 12h/配置时长。
-	if st.Until.Hour() != 4 {
-		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
-	}
-	// 距次日 04:00 最长 28h（凌晨 00:00~04:00 间运行时 now→次日 04:00 跨度 > 24h，属正常）。
-	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
-		t.Errorf("until %v not within (0,28h]: %v", st.Until, d)
-	}
+	assertHardCreditCooldown(t, statusOf(t, p, "bad"))
 	// 立即换号成功：good 被选中。
-	stGood, _ := p.Status("good")
-	if stGood.Cooling || stGood.Disabled {
-		t.Errorf("good should stay healthy: %+v", stGood)
+	good := statusOf(t, p, "good")
+	if good.Cooling || good.Disabled {
+		t.Errorf("good should stay healthy: %+v", good)
 	}
 }
 
@@ -677,34 +786,20 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	p.SetCredits("good", 1000, 0)
 	// 隔离对 breaker 的干扰：熔断阈值默认 3，一次失败不触发。
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.3","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	rec := postChat(t, h, `{"model":"glm-5.3","messages":[]}`)
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s (want 200 after rotate to good)", rec.Code, rec.Body)
 	}
 	// bad 已进入 6004 模型级独立冷却：账号级不 cooling，台账单行 until ≈ reset。
-	st, _ := p.Status("bad")
-	if st.Cooling {
-		t.Fatalf("6004-with-reset should NOT set account-level cooling: %+v", st)
-	}
-	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" {
-		t.Fatalf("want single model ledger row glm-5.3: %+v", st.RateLimitedModels)
-	}
-	if d := st.RateLimitedModels[0].Until.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("model until=%v want ~reset=%v (diff %v)", st.RateLimitedModels[0].Until, reset, d)
-	}
+	assertModelResetCooldown(t, statusOf(t, p, "bad"), reset)
 	// 记录触发模型（bad 池内 private 字段需经 Status 不可见，改用行为断言）：
 	// 同模型 glm-5.3 的请求不应选中 bad（仍冷却）；
 	// 不同模型 hy3-x 的请求应豁免冷却选中 bad（最高分）。
 	p.SetRandomSource(func(n int64) int64 { return 0 })
-	same := p.PickExcludingForModel(nil, "glm-5.3")
-	if same == nil || same.UID != "good" {
+	if same := p.PickExcludingForModel(nil, "glm-5.3"); same == nil || same.UID != "good" {
 		t.Fatalf("same-model pick should skip bad (still cooling), got %+v", same)
 	}
-	diff := p.PickExcludingForModel(nil, "hy3-x")
-	if diff == nil || diff.UID != "bad" {
+	if diff := p.PickExcludingForModel(nil, "hy3-x"); diff == nil || diff.UID != "bad" {
 		t.Fatalf("different-model pick should bypass bad soft cooling, got %+v", diff)
 	}
 }
@@ -903,43 +998,8 @@ func TestModelsDynamic(t *testing.T) {
 	if !ids["cn:dyn-model-a"] || !ids["cn:glm-9.9"] {
 		t.Errorf("dynamic ids missing: %v", ids)
 	}
-
 	// 断言字段映射：maxInputTokens → context_length，maxOutputTokens → max_output_tokens
-	for _, m := range data {
-		mm := m.(map[string]any)
-		switch mm["id"] {
-		case "dyn-model-a":
-			if mm["context_length"].(float64) != 65536 {
-				t.Errorf("dyn-model-a context_length=%v want 65536", mm["context_length"])
-			}
-			if mm["max_output_tokens"].(float64) != 8192 {
-				t.Errorf("dyn-model-a max_output_tokens=%v want 8192", mm["max_output_tokens"])
-			}
-			// reasoning 档位透出：supported_efforts + default_effort
-			efforts, _ := mm["supported_efforts"].([]any)
-			if len(efforts) != 3 || efforts[0] != "low" {
-				t.Errorf("dyn-model-a supported_efforts=%v", mm["supported_efforts"])
-			}
-			if mm["default_effort"] != "medium" {
-				t.Errorf("dyn-model-a default_effort=%v want medium", mm["default_effort"])
-			}
-		case "dyn-model-b":
-			// 上游未返回 reasoning → 两个档位字段都省略（客户端按自身默认）
-			if _, has := mm["supported_efforts"]; has {
-				t.Errorf("dyn-model-b supported_efforts should be omitted, got %v", mm["supported_efforts"])
-			}
-			if _, has := mm["default_effort"]; has {
-				t.Errorf("dyn-model-b default_effort should be omitted")
-			}
-		case "glm-9.9":
-			if mm["context_length"].(float64) != 262144 {
-				t.Errorf("glm-9.9 context_length=%v want 262144", mm["context_length"])
-			}
-			if mm["max_output_tokens"].(float64) != 32768 {
-				t.Errorf("glm-9.9 max_output_tokens=%v want 32768", mm["max_output_tokens"])
-			}
-		}
-	}
+	assertDynamicModelFields(t, data)
 
 	// 第二次调用走缓存（把上游关掉也成功）
 	dynamicModelsCache.RLock()
@@ -947,6 +1007,63 @@ func TestModelsDynamic(t *testing.T) {
 	dynamicModelsCache.RUnlock()
 	if cached != 3 {
 		t.Errorf("cache not populated: %d", cached)
+	}
+}
+
+// assertDynamicModelFields 按模型 id 断言字段映射（context_length / max_output_tokens / effort 档位）。
+func assertDynamicModelFields(t *testing.T, data []any) {
+	t.Helper()
+	for _, m := range data {
+		mm := m.(map[string]any)
+		switch mm["id"] {
+		case "dyn-model-a":
+			assertDynModelA(t, mm)
+		case "dyn-model-b":
+			assertDynModelB(t, mm)
+		case "glm-9.9":
+			assertGLM99(t, mm)
+		}
+	}
+}
+
+// assertDynModelA 断言 dyn-model-a 的长度映射与 reasoning 档位透出。
+func assertDynModelA(t *testing.T, mm map[string]any) {
+	t.Helper()
+	if mm["context_length"].(float64) != 65536 {
+		t.Errorf("dyn-model-a context_length=%v want 65536", mm["context_length"])
+	}
+	if mm["max_output_tokens"].(float64) != 8192 {
+		t.Errorf("dyn-model-a max_output_tokens=%v want 8192", mm["max_output_tokens"])
+	}
+	// reasoning 档位透出：supported_efforts + default_effort
+	efforts, _ := mm["supported_efforts"].([]any)
+	if len(efforts) != 3 || efforts[0] != "low" {
+		t.Errorf("dyn-model-a supported_efforts=%v", mm["supported_efforts"])
+	}
+	if mm["default_effort"] != "medium" {
+		t.Errorf("dyn-model-a default_effort=%v want medium", mm["default_effort"])
+	}
+}
+
+// assertDynModelB 断言上游未返回 reasoning → 两个档位字段都省略（客户端按自身默认）。
+func assertDynModelB(t *testing.T, mm map[string]any) {
+	t.Helper()
+	if _, has := mm["supported_efforts"]; has {
+		t.Errorf("dyn-model-b supported_efforts should be omitted, got %v", mm["supported_efforts"])
+	}
+	if _, has := mm["default_effort"]; has {
+		t.Errorf("dyn-model-b default_effort should be omitted")
+	}
+}
+
+// assertGLM99 断言 glm-9.9 的长度映射。
+func assertGLM99(t *testing.T, mm map[string]any) {
+	t.Helper()
+	if mm["context_length"].(float64) != 262144 {
+		t.Errorf("glm-9.9 context_length=%v want 262144", mm["context_length"])
+	}
+	if mm["max_output_tokens"].(float64) != 32768 {
+		t.Errorf("glm-9.9 max_output_tokens=%v want 32768", mm["max_output_tokens"])
 	}
 }
 
@@ -1094,23 +1211,8 @@ func TestStatusEndpoint(t *testing.T) {
 	if strings.Contains(body, "AccessToken") || strings.Contains(body, `"at"`) {
 		t.Error("token leaked in status output")
 	}
-	// Phase 3 汇总字段。
-	var statusBody map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &statusBody); err != nil {
-		t.Fatalf("status not json: %v", err)
-	}
-	if statusBody["total"] != float64(1) || statusBody["healthy"] != float64(1) ||
-		statusBody["cooling"] != float64(0) || statusBody["disabled"] != float64(0) ||
-		statusBody["in_flight_full"] != float64(0) {
-		t.Errorf("summary=%v want total=1 healthy=1 cooling=0 disabled=0 in_flight_full=0", statusBody)
-	}
-	// Phase v3：池级 sticky_sessions + redis_mode。
-	if statusBody["sticky_sessions"] != float64(0) {
-		t.Errorf("sticky_sessions=%v want 0", statusBody["sticky_sessions"])
-	}
-	if statusBody["redis_mode"] != "noop" {
-		t.Errorf("redis_mode=%v want noop", statusBody["redis_mode"])
-	}
+	// Phase 3 汇总字段 + Phase v3 池级 sticky_sessions / redis_mode。
+	assertStatusSummary(t, rec)
 }
 
 // TestStatusInFlightFull /status 透出满载计数：healthy 且占满在途的账号数。
@@ -1163,22 +1265,7 @@ func TestStatusPortraitFields(t *testing.T) {
 	if len(body.Accounts) != 1 {
 		t.Fatalf("accounts=%d", len(body.Accounts))
 	}
-	st := body.Accounts[0]
-	if !st.Cooling || st.CoolKind != "soft_rate" || st.CoolRemaining <= 0 {
-		t.Errorf("cooling portrait=%+v", st)
-	}
-	if st.SuccessCount != 2 {
-		t.Errorf("success_count=%d want 2", st.SuccessCount)
-	}
-	if st.ErrTotal != 1 {
-		t.Errorf("err_total=%d want 1", st.ErrTotal)
-	}
-	if st.LastSuccessTime.IsZero() {
-		t.Error("last_success should be set")
-	}
-	if st.LastErrTime.IsZero() {
-		t.Error("last_err should be set")
-	}
+	assertPortrait(t, body.Accounts[0])
 }
 
 // TestHealthzEmptyPool 空池（healthy=0）→ 503，表示暂不可服务。
@@ -1526,17 +1613,19 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	out := string(sentBody)
-	// 1) system 为自有提示词，旧 system 内容零残留。
+	// 1) system 为自有提示词，旧 system 内容零残留；原始指纹被改写而非删除。
+	assertFingerprintSanitized(t, out, customSys)
+	// 2) messages 头部恰好一条 system = 自有提示词（Rewrite 已删旧 system）。
+	assertSingleSystemMessage(t, sentBody, customSys)
+}
+
+// assertFingerprintSanitized 断言出站 body 中 system 为自有提示词、原始指纹串被改写
+// （"official CLI for Claude." → "...tool for Claude."；"Main branch (" → "Default branch ("）。
+func assertFingerprintSanitized(t *testing.T, out, customSys string) {
+	t.Helper()
 	if !strings.Contains(out, customSys) {
 		t.Errorf("out body should contain custom system prompt: %s", out)
 	}
-	if strings.Contains(out, "official CLI for Claude.") && strings.Contains(out, "You are Claude Code, Anthropic's") {
-		// 旧 system 原文（含句点）不应以 system 角色出现；但 sanitize 把它改写为
-		// "...official CLI tool for Claude."，所以原文 fingerprint 串应消失。
-	}
-	// 原始指纹串（逐字精确匹配）在出站 body 中应被改写：
-	// "official CLI for Claude." → "official CLI tool for Claude."
-	// "Main branch (" → "Default branch ("
 	if strings.Contains(out, "official CLI for Claude.") {
 		t.Errorf("identity fingerprint not rewritten by sanitize in user msg: %s", out)
 	}
@@ -1550,10 +1639,14 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	if !strings.Contains(out, "Default branch (you will usually use this for PRs)") {
 		t.Errorf("sanitized branch rewrite missing: %s", out)
 	}
-	// 2) messages 头部恰好一条 system = 自有提示词（Rewrite 已删旧 system）。
+}
+
+// assertSingleSystemMessage 断言 messages 头部恰好一条 system = 自有提示词。
+func assertSingleSystemMessage(t *testing.T, sentBody []byte, customSys string) {
+	t.Helper()
 	var obj map[string]any
 	if err := json.Unmarshal(sentBody, &obj); err != nil {
-		t.Fatalf("out body not json: %v %s", err, out)
+		t.Fatalf("out body not json: %v %s", err, sentBody)
 	}
 	msgs := obj["messages"].([]any)
 	var systemCount int
@@ -1635,27 +1728,7 @@ func TestChatNonStreamRepairsMarkupToolCalls(t *testing.T) {
 	}
 	choice := resp["choices"].([]any)[0].(map[string]any)
 	msg := choice["message"].(map[string]any)
-	if msg["content"] != "先读一遍控制器。\n\n" {
-		t.Errorf("content=%q", msg["content"])
-	}
-	tcs, _ := msg["tool_calls"].([]any)
-	if len(tcs) != 1 {
-		t.Fatalf("tool_calls=%#v want 1 个", msg["tool_calls"])
-	}
-	fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
-	if fn == nil || fn["name"] != "exec_command" {
-		t.Fatalf("function=%#v", tcs[0])
-	}
-	var args map[string]any
-	if err := json.Unmarshal([]byte(fn["arguments"].(string)), &args); err != nil {
-		t.Fatalf("arguments 不是合法 JSON: %v", fn["arguments"])
-	}
-	if args["cmd"] != "ls -la" {
-		t.Errorf("cmd=%v", args["cmd"])
-	}
-	if choice["finish_reason"] != "tool_calls" {
-		t.Errorf("finish_reason=%v want tool_calls", choice["finish_reason"])
-	}
+	assertRepairedToolCall(t, msg, choice, "先读一遍控制器。\n\n", "exec_command", "ls -la")
 }
 
 // TestChatStreamRepairsMarkupToolCalls 流式：同样还原成 delta.tool_calls，且收尾帧
@@ -1682,9 +1755,34 @@ func TestChatStreamRepairsMarkupToolCalls(t *testing.T) {
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("缺 [DONE] 收尾: %s", body)
 	}
-	var text strings.Builder
-	var calls int
-	frameNo, lastCallFrame, finishFrame := 0, -1, -1
+	scan := scanStreamFrames(t, body)
+	if scan.text.String() != "先读一遍控制器。\n\n" {
+		t.Errorf("正文错误: %q", scan.text.String())
+	}
+	if scan.calls != 1 {
+		t.Errorf("tool_call 帧数=%d want 1", scan.calls)
+	}
+	if scan.lastCall < 0 || scan.finish < 0 {
+		t.Fatalf("缺调用帧或收尾帧: lastCall=%d finish=%d", scan.lastCall, scan.finish)
+	}
+	if scan.finish < scan.lastCall {
+		t.Errorf("收尾帧（第 %d 帧）必须排在调用帧（第 %d 帧）之后", scan.finish, scan.lastCall)
+	}
+}
+
+// streamFrameScan 扫描 SSE 帧收集到的形态数据：正文、tool_call 数量与调用/收尾帧序号。
+type streamFrameScan struct {
+	text     strings.Builder
+	calls    int
+	lastCall int
+	finish   int
+}
+
+// scanStreamFrames 解析流式响应体，统计正文、tool_call 帧与收尾帧序号。
+func scanStreamFrames(t *testing.T, body string) *streamFrameScan {
+	t.Helper()
+	scan := &streamFrameScan{lastCall: -1, finish: -1}
+	frameNo := 0
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "data: ") {
@@ -1695,45 +1793,48 @@ func TestChatStreamRepairsMarkupToolCalls(t *testing.T) {
 			continue
 		}
 		frameNo++
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
-			t.Fatalf("帧不是合法 JSON: %q (%v)", payload, err)
-		}
-		chs, _ := obj["choices"].([]any)
-		if len(chs) == 0 {
-			continue
-		}
-		ch, _ := chs[0].(map[string]any)
-		d, _ := ch["delta"].(map[string]any)
-		if v, ok := d["content"].(string); ok {
-			text.WriteString(v)
-		}
-		if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
-			calls += len(tcs)
-			lastCallFrame = frameNo
-			fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
-			if fn == nil || fn["name"] != "exec_command" {
-				t.Fatalf("调用帧 function=%#v", tcs[0])
-			}
-		}
-		if v, ok := ch["finish_reason"].(string); ok && v != "" {
-			finishFrame = frameNo
-			if v != "tool_calls" {
-				t.Errorf("finish_reason=%q want tool_calls", v)
-			}
+		scan.frame(t, frameNo, payload)
+	}
+	return scan
+}
+
+// frame 解析单帧并累加统计。
+func (s *streamFrameScan) frame(t *testing.T, frameNo int, payload string) {
+	t.Helper()
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+		t.Fatalf("帧不是合法 JSON: %q (%v)", payload, err)
+	}
+	chs, _ := obj["choices"].([]any)
+	if len(chs) == 0 {
+		return
+	}
+	ch, _ := chs[0].(map[string]any)
+	d, _ := ch["delta"].(map[string]any)
+	if v, ok := d["content"].(string); ok {
+		s.text.WriteString(v)
+	}
+	s.noteToolCalls(t, frameNo, d)
+	if v, ok := ch["finish_reason"].(string); ok && v != "" {
+		s.finish = frameNo
+		if v != "tool_calls" {
+			t.Errorf("finish_reason=%q want tool_calls", v)
 		}
 	}
-	if text.String() != "先读一遍控制器。\n\n" {
-		t.Errorf("正文错误: %q", text.String())
+}
+
+// noteToolCalls 累加 tool_call 帧并校验工具名。
+func (s *streamFrameScan) noteToolCalls(t *testing.T, frameNo int, d map[string]any) {
+	t.Helper()
+	tcs, ok := d["tool_calls"].([]any)
+	if !ok || len(tcs) == 0 {
+		return
 	}
-	if calls != 1 {
-		t.Errorf("tool_call 帧数=%d want 1", calls)
-	}
-	if lastCallFrame < 0 || finishFrame < 0 {
-		t.Fatalf("缺调用帧或收尾帧: lastCall=%d finish=%d", lastCallFrame, finishFrame)
-	}
-	if finishFrame < lastCallFrame {
-		t.Errorf("收尾帧（第 %d 帧）必须排在调用帧（第 %d 帧）之后", finishFrame, lastCallFrame)
+	s.calls += len(tcs)
+	s.lastCall = frameNo
+	fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+	if fn == nil || fn["name"] != "exec_command" {
+		t.Fatalf("调用帧 function=%#v", tcs[0])
 	}
 }
 

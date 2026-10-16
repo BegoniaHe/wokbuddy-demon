@@ -225,23 +225,36 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		if d > e.credits {
 			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
 		}
-		e.credits -= d
-		if e.creditsExpiring > 0 {
-			if d > e.creditsExpiring {
-				e.creditsExpiring = 0
-			} else {
-				e.creditsExpiring -= d
-			}
-		}
-		if e.creditsEarliestRemaining > 0 {
-			if d >= e.creditsEarliestRemaining {
-				e.creditsEarliestRemaining = 0
-				e.creditsEarliestExpiry = time.Time{}
-			} else {
-				e.creditsEarliestRemaining -= d
-			}
+		e.deductCredit(d)
+	}
+	e.observeModelCost(uid, model, per1k)
+	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
+}
+
+// deductCredit 从账号余额扣减 d（已四舍五入并钳到不超过 credits），并同步扣减
+// 快过期/最早到期批次。各批次钳 0，不产生负值。
+func (e *entry) deductCredit(d int64) {
+	e.credits -= d
+	if e.creditsExpiring > 0 {
+		if d > e.creditsExpiring {
+			e.creditsExpiring = 0
+		} else {
+			e.creditsExpiring -= d
 		}
 	}
+	if e.creditsEarliestRemaining > 0 {
+		if d >= e.creditsEarliestRemaining {
+			e.creditsEarliestRemaining = 0
+			e.creditsEarliestExpiry = time.Time{}
+		} else {
+			e.creditsEarliestRemaining -= d
+		}
+	}
+}
+
+// observeModelCost 把一次实测单价并入该 (账号, 模型) 的 EMA 账本（alpha=0.3）。
+// 首观测直接落值；限免结束（tier 0 → 收费）时打一条明确日志供运维对账。
+func (e *entry) observeModelCost(uid, model string, per1k float64) {
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
 	}
@@ -249,19 +262,18 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	prev, seen := e.modelCost[model]
 	if !seen {
 		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
-	} else {
-		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
-		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
-		if prev.CostPer1k <= 0 && per1k > 0 {
-			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
-		}
-		e.modelCost[model] = modelCostEntry{
-			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:  time.Now(),
-			Samples:   prev.Samples + 1,
-		}
+		return
 	}
-	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
+	// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
+	// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
+	if prev.CostPer1k <= 0 && per1k > 0 {
+		log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+	}
+	e.modelCost[model] = modelCostEntry{
+		CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
+		LastSeen:  time.Now(),
+		Samples:   prev.Samples + 1,
+	}
 }
 
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
@@ -273,39 +285,44 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	if !ok {
 		return
 	}
-	usage := &e.tokenUsage
-	usage.RequestCount++
-	usage.LastUsedAt = time.Now()
+	e.tokenUsage.applyDelta(delta)
+	p.dirty.Store(true)
+}
+
+// applyDelta 把一次聊天尝试的 usage 增量并入累计摘要：请求次数与最近使用时刻总是累计，
+// 仅明确存在（Has*）且非负的 token 字段参与累加；有任一 token 字段命中即计一次
+// UsageCount。缺 completion_tokens 时清空上次吞吐速度，避免展示陈旧值。
+func (u *TokenUsage) applyDelta(delta TokenUsageDelta) {
+	u.RequestCount++
+	u.LastUsedAt = time.Now()
 	if delta.Model != "" {
-		usage.LastModel = delta.Model
+		u.LastModel = delta.Model
 	}
-	known := false
-	if delta.HasPromptTokens && delta.PromptTokens >= 0 {
-		usage.PromptTokens += delta.PromptTokens
-		known = true
-	}
-	if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
-		usage.CompletionTokens += delta.CompletionTokens
-		known = true
-	}
-	if delta.HasTotalTokens && delta.TotalTokens >= 0 {
-		usage.TotalTokens += delta.TotalTokens
-		known = true
-	}
+	known := addToken(&u.PromptTokens, delta.HasPromptTokens, delta.PromptTokens)
+	known = addToken(&u.CompletionTokens, delta.HasCompletionTokens, delta.CompletionTokens) || known
+	known = addToken(&u.TotalTokens, delta.HasTotalTokens, delta.TotalTokens) || known
 	if known {
-		usage.UsageCount++
+		u.UsageCount++
 	}
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
-		usage.LastLatencyMs = delta.LatencyMs
+		u.LastLatencyMs = delta.LatencyMs
 	}
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
 		speed := delta.TokensPerSecond
-		usage.LastTokensPerSecond = &speed
+		u.LastTokensPerSecond = &speed
 	} else {
 		// 失败或缺少 completion_tokens 时不展示上一次请求的旧吞吐速度。
-		usage.LastTokensPerSecond = nil
+		u.LastTokensPerSecond = nil
 	}
-	p.dirty.Store(true)
+}
+
+// addToken 在字段明确存在（has）且非负时累加到 dst，返回是否命中。
+func addToken(dst *int64, has bool, v int64) bool {
+	if !has || v < 0 {
+		return false
+	}
+	*dst += v
+	return true
 }
 
 // Status 查询单账号状态。
@@ -579,27 +596,31 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		st.DisabledReason = e.reason
 	}
 	if st.Cooling {
-		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。
-		// 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，
-		// 取仍在未来且更晚截止的那个，避免仅熔断期时误报 0 / unknown。
-		remaining := int64(0)
-		if now.Before(e.until) {
-			if r := int64(time.Until(e.until).Seconds() + 0.999); r > remaining {
-				remaining = r
-			}
-		}
-		if now.Before(e.breakerUntil) {
-			if r := int64(time.Until(e.breakerUntil).Seconds() + 0.999); r > remaining {
-				remaining = r
-				st.CoolKind = "breaker"
-			}
-		}
-		st.CoolRemaining = remaining
-		if st.CoolKind == "" {
-			st.CoolKind = e.coolKind.String()
-		}
+		fillCoolingStatus(&st, e, now)
 	}
 	return st
+}
+
+// fillCoolingStatus 填充冷却剩余秒数（向上取整，避免 0 显示为已到期）与冷却类型。
+// 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，取仍在未来且更晚
+// 截止的那个，避免仅熔断期时误报 0 / unknown。
+func fillCoolingStatus(st *Status, e *entry, now time.Time) {
+	var remaining int64
+	if now.Before(e.until) {
+		if r := int64(time.Until(e.until).Seconds() + 0.999); r > remaining {
+			remaining = r
+		}
+	}
+	if now.Before(e.breakerUntil) {
+		if r := int64(time.Until(e.breakerUntil).Seconds() + 0.999); r > remaining {
+			remaining = r
+			st.CoolKind = "breaker"
+		}
+	}
+	st.CoolRemaining = remaining
+	if st.CoolKind == "" {
+		st.CoolKind = e.coolKind.String()
+	}
 }
 
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。

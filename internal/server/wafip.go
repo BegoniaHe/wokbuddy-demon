@@ -65,7 +65,8 @@ func (g *wafIPGate) noteWaf(uid string) bool {
 	}
 	if len(g.hits) >= wafIPThreshold {
 		g.until = now.Add(wafIPWindow)
-		log.Printf("WARN: [server] waf ip-level block: %d accounts hit waf 403 within %s, rotate fail-fast until %s", len(g.hits), wafIPWindow, g.until.Format(time.RFC3339))
+		log.Printf("WARN: [server] waf ip-level block: %d accounts hit waf 403 within %s, rotate fail-fast until %s",
+			len(g.hits), wafIPWindow, g.until.Format(time.RFC3339))
 		g.hits = map[string]time.Time{}
 		return true
 	}

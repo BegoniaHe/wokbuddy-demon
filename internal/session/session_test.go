@@ -13,6 +13,7 @@ import (
 // countingStore 记录镜像调用次数的假 Store（不联网）。
 type countingStore struct {
 	redisstore.Noop
+
 	mu       sync.Mutex
 	setBinds int
 	delBinds int

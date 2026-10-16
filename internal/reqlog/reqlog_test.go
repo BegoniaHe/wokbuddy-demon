@@ -15,12 +15,27 @@ func TestRecorderMetricsAndRecent(t *testing.T) {
 	r.Record(Event{RequestID: "bad", Status: 429, OK: false, Outcome: OutcomeHTTPError, DurationMs: 30})
 
 	s := r.Snapshot()
+	assertMetricsCounts(t, s)
+	assertMetricsRates(t, s)
+	assertRecentNewestFirst(t, s)
+}
+
+func assertMetricsCounts(t *testing.T, s Snapshot) {
+	t.Helper()
 	if s.Completed != 2 || s.InFlight != 0 || s.Succeeded != 1 || s.Failed != 1 {
 		t.Fatalf("counts = %+v", s)
 	}
+}
+
+func assertMetricsRates(t *testing.T, s Snapshot) {
+	t.Helper()
 	if s.SuccessRate != 50 || s.HTTPSuccessRate != 50 || s.AvgDurationMs != 20 {
 		t.Fatalf("rates = success:%v http:%v avg:%v", s.SuccessRate, s.HTTPSuccessRate, s.AvgDurationMs)
 	}
+}
+
+func assertRecentNewestFirst(t *testing.T, s Snapshot) {
+	t.Helper()
 	if len(s.Recent) != 2 || s.Recent[0].RequestID != "bad" || s.Recent[1].RequestID != "ok" {
 		t.Fatalf("recent = %+v, want newest first", s.Recent)
 	}
@@ -96,6 +111,22 @@ func TestReadArchiveOrdersByEventTimeNotFileMtime(t *testing.T) {
 	if len(entries) != n {
 		t.Fatalf("归档文件数 = %d, want %d", len(entries), n)
 	}
+	rewriteMtimesAscending(t, dir, entries)
+
+	rows, err := r.ReadArchive(n, Filter{Model: "glm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]string, 0, n)
+	for i := range n {
+		want = append(want, "ev-"+string(rune('a'+n-1-i)))
+	}
+	assertRequestOrder(t, requestIDs(rows), want)
+}
+
+// rewriteMtimesAscending 按目录项顺序递增地改写文件 mtime，用于打乱「mtime 可还原时间序」的假设。
+func rewriteMtimesAscending(t *testing.T, dir string, entries []os.DirEntry) {
+	t.Helper()
 	stamp := time.Unix(1700000000, 0)
 	for i, e := range entries {
 		ts := stamp.Add(time.Duration(i) * time.Second)
@@ -103,22 +134,26 @@ func TestReadArchiveOrdersByEventTimeNotFileMtime(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
 
-	rows, err := r.ReadArchive(n, Filter{Model: "glm"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := make([]string, 0, len(rows))
+// requestIDs 抽取事件列表的 RequestID，便于断言顺序。
+func requestIDs(rows []Event) []string {
+	ids := make([]string, 0, len(rows))
 	for _, e := range rows {
-		got = append(got, e.RequestID)
+		ids = append(ids, e.RequestID)
 	}
-	if len(rows) != n {
-		t.Fatalf("rows = %d, want %d", len(rows), n)
+	return ids
+}
+
+// assertRequestOrder 断言事件 RequestID 序列与期望逐位相等。
+func assertRequestOrder(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("rows = %v, want %v", got, want)
 	}
-	for i := range rows {
-		want := "ev-" + string(rune('a'+n-1-i))
-		if rows[i].RequestID != want {
-			t.Fatalf("rows[%d] = %s, want %s（须按事件时间倒序，与文件 mtime 无关）\n got %v", i, rows[i].RequestID, want, got)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("rows[%d] = %s, want %s\n got %v", i, got[i], want[i], got)
 		}
 	}
 }
@@ -145,33 +180,46 @@ func TestArchiveFilterByClientInfo(t *testing.T) {
 	}
 	r.Close()
 
-	got, err := r.ReadArchive(10, Filter{ClientIP: "203.0.113."})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0].RequestID != "a" {
+	got := readOne(t, r, Filter{ClientIP: "203.0.113."})
+	if got.RequestID != "a" {
 		t.Fatalf("client ip filter = %+v", got)
 	}
-	if got[0].UserAgent != "python-requests/2.31.0" {
-		t.Fatalf("user agent not persisted: %+v", got[0])
+	if got.UserAgent != "python-requests/2.31.0" {
+		t.Fatalf("user agent not persisted: %+v", got)
 	}
 
 	// UA 片段过滤大小写不敏感（面板搜索框直接传用户输入）。
-	got, err = r.ReadArchive(10, Filter{UserAgent: "chrome/120"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 1 || got[0].RequestID != "b" {
-		t.Fatalf("ua filter = %+v", got)
+	ua := readOne(t, r, Filter{UserAgent: "chrome/120"})
+	if ua.RequestID != "b" {
+		t.Fatalf("ua filter = %+v", ua)
 	}
 
 	// 来源为空的旧事件不该被非空来源条件误命中。
-	got, err = r.ReadArchive(10, Filter{ClientIP: "10.0.0.1"})
+	readNone(t, r, Filter{ClientIP: "10.0.0.1"})
+}
+
+// readOne 读取归档并断言恰好命中一条，返回该条事件。
+func readOne(t *testing.T, r *Recorder, filter Filter) Event {
+	t.Helper()
+	got, err := r.ReadArchive(10, filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %+v, want 1", got)
+	}
+	return got[0]
+}
+
+// readNone 读取归档并断言无命中。
+func readNone(t *testing.T, r *Recorder, filter Filter) {
+	t.Helper()
+	got, err := r.ReadArchive(10, filter)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 0 {
-		t.Fatalf("unmatched ip filter = %+v", got)
+		t.Fatalf("rows = %+v, want 0", got)
 	}
 }
 
@@ -193,41 +241,23 @@ func TestArchiveFilterByTimeRange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := make([]string, 0, len(rows))
-	for _, e := range rows {
-		got = append(got, e.RequestID)
-	}
 	// 倒序返回，闭区间命中 d2、d1。
-	if len(got) != 2 || got[0] != "d1" || got[1] != "d2" {
-		t.Fatalf("时间区间过滤 = %v, want [d1 d2]", got)
-	}
+	assertRequestOrder(t, requestIDs(rows), []string{"d1", "d2"})
 
 	onlyFrom, err := r.ReadArchive(10, Filter{From: base.Add(48 * time.Hour)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(onlyFrom) != 2 || onlyFrom[0].RequestID != "now" {
-		t.Fatalf("仅 From 过滤 = %+v, want 2 条（d1、now）", onlyFrom)
-	}
+	assertRequestOrder(t, requestIDs(onlyFrom), []string{"now", "d1"})
 
 	onlyTo, err := r.ReadArchive(10, Filter{To: base})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(onlyTo) != 1 || onlyTo[0].RequestID != "d3" {
-		t.Fatalf("仅 To 过滤 = %+v, want 仅 d3", onlyTo)
-	}
+	assertRequestOrder(t, requestIDs(onlyTo), []string{"d3"})
 
 	// 时间区间与其它条件是与关系。
-	combined, err := r.ReadArchive(10, Filter{
-		From: base.Add(24 * time.Hour), To: base.Add(48 * time.Hour), Outcome: OutcomeHTTPError,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(combined) != 0 {
-		t.Fatalf("区间+结果组合应为空（这几条都是成功）: %+v", combined)
-	}
+	readNone(t, r, Filter{From: base.Add(24 * time.Hour), To: base.Add(48 * time.Hour), Outcome: OutcomeHTTPError})
 }
 
 func TestArchiveQueueDropCounter(t *testing.T) {

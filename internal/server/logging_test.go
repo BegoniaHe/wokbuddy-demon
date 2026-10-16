@@ -53,6 +53,12 @@ func TestChatStatsReaderTokensFromUsage(t *testing.T) {
 	if !ok || toks != 1 {
 		t.Fatalf("tokens=%d ok=%v, want 1/true (from usage, not rune count)", toks, ok)
 	}
+	assertReaderUsage(t, r)
+}
+
+// assertReaderUsage 断言 reader 采信 usage 三元组且 TTFB 已记录。
+func assertReaderUsage(t *testing.T, r *chatStatsReader) {
+	t.Helper()
 	usage := r.Usage()
 	if !usage.HasPromptTokens || usage.PromptTokens != 1 || !usage.HasCompletionTokens || usage.CompletionTokens != 1 || !usage.HasTotalTokens || usage.TotalTokens != 2 {
 		t.Fatalf("usage=%+v, want prompt=1 completion=1 total=2", usage)
@@ -128,14 +134,19 @@ func TestRequestMetricsRecordsStream(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if got := rec.Header().Get("X-Request-Id"); !strings.HasPrefix(got, "req-") {
+	if got := rec.Header().Get("X-Request-ID"); !strings.HasPrefix(got, "req-") {
 		t.Fatalf("X-Request-Id=%q", got)
 	}
 	s := reqLog.Snapshot()
 	if s.Completed != 1 || s.Succeeded != 1 || s.Failed != 0 || len(s.Recent) != 1 {
 		t.Fatalf("metrics = %+v", s)
 	}
-	e := s.Recent[0]
+	assertRequestEvent(t, s.Recent[0])
+}
+
+// assertRequestEvent 断言单条归档事件的关键字段。
+func assertRequestEvent(t *testing.T, e reqlog.Event) {
+	t.Helper()
 	if e.Outcome != reqlog.OutcomeSuccess || e.Status != http.StatusOK || !e.OK || e.Model != "glm-5.2" || e.TotalTokens != 2 || e.Attempts != 1 {
 		t.Fatalf("event = %+v", e)
 	}

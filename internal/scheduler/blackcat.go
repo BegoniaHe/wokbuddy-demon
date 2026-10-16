@@ -6,6 +6,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -41,20 +42,25 @@ func (s *Scheduler) RunBlackcatNow() {
 		if a.IsEnterprise() {
 			continue // 企业版门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」）
 		}
-		need, err := s.cfg.Upstream.BlackcatNeed(a)
-		if err != nil {
-			log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-			continue
-		}
-		if need <= 0 {
-			continue
-		}
-		ok, err := s.cfg.Upstream.RunNightChats(a, int(need))
-		if err != nil {
-			log.Printf("blackcat %s: %d/%d 完成，中断: %v", logfmt.Label(a.UID, a.Nickname), ok, need, err)
-			continue
-		}
-		log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
-		time.Sleep(activityAccountDelay)
+		s.blackcatOne(a)
 	}
+}
+
+// blackcatOne 单账号夜猫子补足：查需补的对话数 → 跑夜间对话；已补足（need<=0）则跳过。
+func (s *Scheduler) blackcatOne(a *auth.Auth) {
+	need, err := s.cfg.Upstream.BlackcatNeed(a)
+	if err != nil {
+		log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+		return
+	}
+	if need <= 0 {
+		return
+	}
+	ok, err := s.cfg.Upstream.RunNightChats(a, int(need))
+	if err != nil {
+		log.Printf("blackcat %s: %d/%d 完成，中断: %v", logfmt.Label(a.UID, a.Nickname), ok, need, err)
+		return
+	}
+	log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
+	time.Sleep(activityAccountDelay)
 }

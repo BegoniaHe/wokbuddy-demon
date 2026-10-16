@@ -76,30 +76,8 @@ func backfillReasoningContent(obj map[string]any) {
 	if !ok || len(msgs) == 0 {
 		return
 	}
-	// thinkingEnabled 半边：读注入后的 thinking.type（与官方 el.thinkingEnabled 对应）。
-	thinkingEnabled := false
-	if th, ok := obj["thinking"].(map[string]any); ok {
-		if typ, _ := th["type"].(string); strings.EqualFold(strings.TrimSpace(typ), "enabled") {
-			thinkingEnabled = true
-		}
-	}
-	// hasTrace 半边：检测是否有任何 reasoning 痕迹（非空 reasoning 或已有 reasoning_content）。
-	hasTrace := false
-	for _, mm := range msgs {
-		msg, ok := mm.(map[string]any)
-		if !ok {
-			continue
-		}
-		if r, ok := msg["reasoning"].(string); ok && r != "" {
-			hasTrace = true
-			break
-		}
-		if _, ok := msg["reasoning_content"]; ok {
-			hasTrace = true
-			break
-		}
-	}
-	if !thinkingEnabled && !hasTrace {
+	// 门控（对齐官方 ReasoningContentBackfillRule）：thinkingEnabled || hasTrace。
+	if !thinkingEnabledFrom(obj) && !messagesHaveReasoningTrace(msgs) {
 		return
 	}
 	// 第二遍：所有 assistant 消息补/复制 reasoning_content 字段，并镜像保证
@@ -117,28 +95,60 @@ func backfillReasoningContent(obj map[string]any) {
 		if !ok {
 			continue
 		}
-		role, _ := msg["role"].(string)
-		if role != "assistant" {
+		if role, _ := msg["role"].(string); role == "assistant" {
+			backfillAssistantReasoning(msg)
+		}
+	}
+}
+
+// thinkingEnabledFrom 读注入后的 thinking.type == "enabled"（与官方 el.thinkingEnabled 对应）。
+func thinkingEnabledFrom(obj map[string]any) bool {
+	th, ok := obj["thinking"].(map[string]any)
+	if !ok {
+		return false
+	}
+	typ, _ := th["type"].(string)
+	return strings.EqualFold(strings.TrimSpace(typ), "enabled")
+}
+
+// messagesHaveReasoningTrace 检测会话内是否有任何 reasoning 痕迹（非空 reasoning string
+// 或已有 reasoning_content 字段）。比官方仅扫 assistant 的口径宽，只影响 disabled 分支。
+func messagesHaveReasoningTrace(msgs []any) bool {
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
 			continue
 		}
-		rc, hasRC := msg["reasoning_content"].(string)
-		if !hasRC {
-			if r, ok := msg["reasoning"].(string); ok {
-				rc = r
-			} else {
-				rc = ""
-			}
-			msg["reasoning_content"] = rc
-		}
-		// 镜像：reasoning 缺失/null/空串 → 归一化（非空 rc 优先，皆无补 " "）。
 		if r, ok := msg["reasoning"].(string); ok && r != "" {
-			continue // 已非空 → 不覆盖
+			return true
 		}
-		if rc != "" {
-			msg["reasoning"] = rc
+		if _, ok := msg["reasoning_content"]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// backfillAssistantReasoning 给单条 assistant 消息补/镜像 reasoning_content 与 reasoning
+// （见 backfillReasoningContent 注释）。
+func backfillAssistantReasoning(msg map[string]any) {
+	rc, hasRC := msg["reasoning_content"].(string)
+	if !hasRC {
+		if r, ok := msg["reasoning"].(string); ok {
+			rc = r
 		} else {
-			msg["reasoning"] = " "
+			rc = ""
 		}
+		msg["reasoning_content"] = rc
+	}
+	// 镜像：reasoning 缺失/null/空串 → 归一化（非空 rc 优先，皆无补 " "）。
+	if r, ok := msg["reasoning"].(string); ok && r != "" {
+		return // 已非空 → 不覆盖
+	}
+	if rc != "" {
+		msg["reasoning"] = rc
+	} else {
+		msg["reasoning"] = " "
 	}
 }
 

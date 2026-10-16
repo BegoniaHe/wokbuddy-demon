@@ -44,37 +44,29 @@ const (
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
+// errKindNames 错误类别的字符串名（未知类别回落 "none"）。
+var errKindNames = map[ErrKind]string{
+	ErrNone:           "none",
+	ErrHardCredit:     "hard_credit",
+	ErrSoftRate:       "soft_rate",
+	ErrSessionDead:    "session_dead",
+	ErrNotFound:       "not_found",
+	ErrServer:         "server",
+	ErrContentBlocked: "content_blocked",
+	ErrBadParams:      "bad_params",
+	ErrModelBlocked:   "model_blocked",
+	ErrWafBlock:       "waf_block",
+	ErrPromptTooLong:  "prompt_too_long",
+	ErrImageInvalid:   "image_invalid",
+	ErrAccountFault:   "account_fault",
+	ErrClient:         "client",
+}
+
 func (k ErrKind) String() string {
-	switch k {
-	case ErrHardCredit:
-		return "hard_credit"
-	case ErrSoftRate:
-		return "soft_rate"
-	case ErrSessionDead:
-		return "session_dead"
-	case ErrNotFound:
-		return "not_found"
-	case ErrServer:
-		return "server"
-	case ErrContentBlocked:
-		return "content_blocked"
-	case ErrBadParams:
-		return "bad_params"
-	case ErrModelBlocked:
-		return "model_blocked"
-	case ErrWafBlock:
-		return "waf_block"
-	case ErrPromptTooLong:
-		return "prompt_too_long"
-	case ErrImageInvalid:
-		return "image_invalid"
-	case ErrAccountFault:
-		return "account_fault"
-	case ErrClient:
-		return "client"
-	default:
-		return "none"
+	if name, ok := errKindNames[k]; ok {
+		return name
 	}
+	return "none"
 }
 
 // Error 带分类的上游错误。
@@ -273,27 +265,62 @@ func IsModelBlocked(status int, body string) bool {
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
 		return false
 	}
-	nodes := []map[string]any{root}
-	if inner, ok := root["error"].(map[string]any); ok {
-		nodes = append(nodes, inner)
-	}
-	code, msg := "", ""
-	for _, node := range nodes {
-		for _, key := range []string{"code", "errCode", "error_code"} {
-			if v, ok := node[key]; ok && v != nil && code == "" {
-				code = strings.TrimSpace(fmt.Sprint(v))
-			}
-		}
-		for _, key := range []string{"msg", "message"} {
-			if v, ok := node[key].(string); ok && v != "" && msg == "" {
-				msg = strings.TrimSpace(v)
-			}
-		}
-	}
+	code, msg := modelBlockFields(root)
 	if code == modelBlockCode {
 		return true
 	}
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
+}
+
+// modelBlockFields 从顶层与 error 子对象两层抽取 code（code/errCode/error_code，
+// 取首个非空）与 msg（msg/message，取首个非空）。用于 IsModelBlocked 的确定性判定。
+func modelBlockFields(root map[string]any) (code, msg string) {
+	nodes := []map[string]any{root}
+	if inner, ok := root["error"].(map[string]any); ok {
+		nodes = append(nodes, inner)
+	}
+	for _, node := range nodes {
+		code = firstCodeField(node, code)
+		msg = firstMsgField(node, msg)
+	}
+	return code, msg
+}
+
+// firstCodeField 返回 node 中首个非空 code 字段（code/errCode/error_code 按序），
+// current 已非空时原样返回（跨节点只取首个）。
+func firstCodeField(node map[string]any, current string) string {
+	if current != "" {
+		return current
+	}
+	for _, key := range []string{"code", "errCode", "error_code"} {
+		if v, ok := node[key]; ok && v != nil {
+			// 空串（含纯空白）不算命中：继续尝试同节点内的后备键，与旧内联循环
+			// 「code 仍为空则继续」的口径一致（否则 {"code":"","errCode":"11102"}
+			// 会停在空 code，丢掉 11102 判定）。
+			if s := strings.TrimSpace(fmt.Sprint(v)); s != "" {
+				return s
+			}
+		}
+	}
+	return current
+}
+
+// firstMsgField 返回 node 中首个非空字符串 msg 字段（msg/message 按序），current
+// 已非空时原样返回（跨节点只取首个）。
+func firstMsgField(node map[string]any, current string) string {
+	if current != "" {
+		return current
+	}
+	for _, key := range []string{"msg", "message"} {
+		if v, ok := node[key].(string); ok && v != "" {
+			// 纯空白串 TrimSpace 后为空不算命中：继续尝试同节点内的后备键，与旧内联
+			// 循环「msg 仍为空则继续」的口径一致。
+			if s := strings.TrimSpace(v); s != "" {
+				return s
+			}
+		}
+	}
+	return current
 }
 
 // hasBusinessCode reports whether a JSON error envelope contains an exact
@@ -506,98 +533,176 @@ func Classify(status int, body string) ErrKind {
 	// sessionDead / accountFault 先于 status==429：账号级终态等不来自愈，限流状态码
 	// 不得掩盖它们（429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须
 	// sessionDead——此层 marker 是精确词，比限流层的大范围子串更具体，具体优先于宽泛）。
-	for _, m := range sessionDeadMarkers {
-		if strings.Contains(body, m) {
-			return ErrSessionDead
-		}
+	if kind, ok := classifySessionOrAccount(lower, body); ok {
+		return kind
 	}
-	for _, m := range accountFaultMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrAccountFault
-		}
+	if kind, ok := classifyRateLimit(status, body); ok {
+		return kind
 	}
-	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
-	// 可自愈的软限流并在全池冷却时反复兜底选中（issue #175）。仅按结构化 code
-	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
-	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
-		return ErrHardCredit
-	}
-	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
-	// "额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归
-	// ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词更权威的
-	// 信号：上游既然给了 429，就按限流语义处理（宁可短冷却自愈，不可长冷却弃号）；
-	// 真正的余额耗尽由 402（上层）或 14018（上层）捕获，非 429 状态码的 quota
-	// 措辞仍走下方 hardMarkers（历史语义不变）。
-	if status == http.StatusTooManyRequests {
-		return ErrSoftRate
-	}
-	for _, m := range hardMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrHardCredit
-		}
-	}
-	for _, m := range softRateMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrSoftRate
-		}
+	if kind, ok := classifyBillingOrRate(lower, body); ok {
+		return kind
 	}
 	// 11115「prompt is too long」：判在 404/5xx/WAF/内容策略/参数错误/通用 4xx
 	// 之前——请求级语义最具体（上下文超限），须先于宽泛的状态码兜底（404 兜底会
 	// 误归 ErrNotFound 只冷却不透传；ErrClient 只换号，浪费健康号配额）。
-	if isPromptTooLongStatus(status) {
-		for _, m := range promptTooLongMarkers {
-			if strings.Contains(body, m) || (m != strings.ToLower(m) && strings.Contains(lower, strings.ToLower(m))) {
-				return ErrPromptTooLong
-			}
-		}
+	if kind, ok := classifyPromptTooLong(status, lower, body); ok {
+		return kind
 	}
-	if status == http.StatusNotFound {
-		return ErrNotFound
+	if kind, ok := classifyStatusFallback(status, body); ok {
+		return kind
 	}
-	if status >= 500 {
-		return ErrServer
-	}
-	// WAF 403（无业务信封的拦截形态）：判在内容策略/参数错误/通用 4xx 之前——
-	// 这些层只认带文案的 body，WAF 空体/HTML 永远不会命中它们的 marker，
-	// 但落 ErrClient 兜底的代价是「只换号不罚」（连环 403 根因），必须在兜底前分流。
-	// 带信封的 403 在上方各层已有权威分类，不受影响。
-	if IsWafBlocked(status, body) {
-		return ErrWafBlock
-	}
-	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接
-	// fail-fast，避免把健康账号轮转一遍后仍把最终 503 返回给客户端。
-	// 11135 业务码走 codeMarker（JSON 空白容差），文案走 invalidImageMarkers。
-	if status == http.StatusBadRequest && codeMarker(lower, "11135") {
-		return ErrImageInvalid
-	}
-	if status == http.StatusBadRequest {
-		for _, m := range invalidImageMarkers {
-			if strings.Contains(lower, m) {
-				return ErrImageInvalid
-			}
-		}
-	}
-	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
-	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
-	if status >= 400 {
-		for _, m := range contentBlockedMarkers {
-			if strings.Contains(lower, m) {
-				return ErrContentBlocked
-			}
-		}
-		// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
-		// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
-		// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
-		// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
-		// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
-		// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
-		if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
-			return ErrBadParams
-		}
-		return ErrClient
+	if kind, ok := classifyGeneric4xx(status, lower, body); ok {
+		return kind
 	}
 	// HTTP 200 但业务 code 非 0 且含余额关键词的情况已被上面 hardMarkers 捕获。
 	return ErrNone
+}
+
+// classifySessionOrAccount 判定 sessionDead / accountFault：账号级终态等不来自愈，
+// 限流状态码不得掩盖它们（429+14017 必须 accountFault，401+12153 混排 "rate limit"
+// 必须 sessionDead——此层 marker 是精确词，比限流层的大范围子串更具体）。
+func classifySessionOrAccount(lower, body string) (ErrKind, bool) {
+	for _, m := range sessionDeadMarkers {
+		if strings.Contains(body, m) {
+			return ErrSessionDead, true
+		}
+	}
+	if containsAnyDual(lower, body, accountFaultMarkers) {
+		return ErrAccountFault, true
+	}
+	return ErrNone, false
+}
+
+// classifyRateLimit 判定 429 状态码。14018 是明确的账号积分耗尽业务码，必须先于
+// 通用 429 兜底，否则会被误判为可自愈的软限流并在全池冷却时反复兜底选中
+// （issue #175）。仅按结构化 code 判定；无该 code 的 "credits exhausted" 文案仍
+// 保持普通 429 的软限流语义。
+//
+// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/"额度不足"
+// 等跨计费/限流两界的措辞，hardMarkers 先判会把限流误归 ErrHardCredit 硬冷却到次日
+// 04:00，白扔号约 12h。状态码是比关键词更权威的信号：上游既然给了 429，就按限流
+// 语义处理（宁可短冷却自愈，不可长冷却弃号）；真正的余额耗尽由 402（上层）或
+// 14018（上层）捕获，非 429 状态码的 quota 措辞仍走 hardMarkers（历史语义不变）。
+func classifyRateLimit(status int, body string) (ErrKind, bool) {
+	if status != http.StatusTooManyRequests {
+		return ErrNone, false
+	}
+	if hasBusinessCode(body, "14018") {
+		return ErrHardCredit, true
+	}
+	return ErrSoftRate, true
+}
+
+// classifyPromptTooLong 判定「prompt is too long」请求级错误（11115）。请求级语义
+// 最具体（上下文超限），须先于宽泛的状态码兜底。
+func classifyPromptTooLong(status int, lower, body string) (ErrKind, bool) {
+	if isPromptTooLongStatus(status) && isPromptTooLongBody(lower, body) {
+		return ErrPromptTooLong, true
+	}
+	return ErrNone, false
+}
+
+// classifyStatusFallback 判定 404/5xx/WAF 403 三类状态码兜底（顺序即优先级）。
+//
+// WAF 403（无业务信封的拦截形态）判在内容策略/参数错误/通用 4xx 之前——这些层只认
+// 带文案的 body，WAF 空体/HTML 永远不会命中它们的 marker，但落 ErrClient 兜底的代价
+// 是「只换号不罚」（连环 403 根因），必须在兜底前分流。带信封的 403 在上方各层已有
+// 权威分类，不受影响。
+func classifyStatusFallback(status int, body string) (ErrKind, bool) {
+	if status == http.StatusNotFound {
+		return ErrNotFound, true
+	}
+	if status >= 500 {
+		return ErrServer, true
+	}
+	if IsWafBlocked(status, body) {
+		return ErrWafBlock, true
+	}
+	return ErrNone, false
+}
+
+// classifyBillingOrRate 判定非 429 状态码上的计费/限流文案（hardMarkers 先于
+// softRateMarkers，历史语义不变）。
+func classifyBillingOrRate(lower, body string) (ErrKind, bool) {
+	if containsAnyDual(lower, body, hardMarkers) {
+		return ErrHardCredit, true
+	}
+	if containsAnyDual(lower, body, softRateMarkers) {
+		return ErrSoftRate, true
+	}
+	return ErrNone, false
+}
+
+// containsAnyDual 报告 lower/body 是否命中 marker 列表（小写比较 + 原文比较双通道）。
+func containsAnyDual(lower, body string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// isPromptTooLongBody 报告 body 是否命中「prompt is too long」文案（原文比较 +
+// 含大写字母的 marker 追加小写比较，与既有容差口径一致）。
+func isPromptTooLongBody(lower, body string) bool {
+	for _, m := range promptTooLongMarkers {
+		if strings.Contains(body, m) || (m != strings.ToLower(m) && strings.Contains(lower, strings.ToLower(m))) {
+			return true
+		}
+	}
+	return false
+}
+
+// isImageInvalid 报告 400 响应是否命中图片格式/数据错误：11135 业务码走
+// codeMarker（JSON 空白容差），文案走 invalidImageMarkers。此类错误是确定性的
+// 请求级错误：同 body 换账号结果不变，直接 fail-fast，避免把健康账号轮转一遍后
+// 仍把最终 503 返回给客户端。
+func isImageInvalid(status int, lower string) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	if codeMarker(lower, "11135") {
+		return true
+	}
+	return containsAnyLower(lower, invalidImageMarkers)
+}
+
+// containsAnyLower 报告 lower 是否包含 markers 中任一子串（markers 均为小写）。
+func containsAnyLower(lower string, markers []string) bool {
+	for _, m := range markers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyGeneric4xx 判定通用 4xx 兜底：图片格式/数据错误（请求级 fail-fast）、
+// 内容策略拦截（误报信号，不罚账号，由网关降级重试处理）、请求体解析失败，最后
+// 归 ErrClient。status < 400 时返回 false（交由调用方收口）。
+func classifyGeneric4xx(status int, lower, body string) (ErrKind, bool) {
+	if isImageInvalid(status, lower) {
+		return ErrImageInvalid, true
+	}
+	if status < http.StatusBadRequest {
+		return ErrNone, false
+	}
+	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
+	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
+	if containsAnyLower(lower, contentBlockedMarkers) {
+		return ErrContentBlocked, true
+	}
+	// 请求体解析失败（HTTP 400 + Unmarshal chat params failed / code 11101）：
+	// 这是"发给上游的 body 有问题"。网关侧截断已由 413 消灭（issue #41 commit A），
+	// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
+	// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
+	// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
+	// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
+	if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
+		return ErrBadParams, true
+	}
+	return ErrClient, true
 }
 
 // apiEnvelope 上游统一信封。
@@ -913,12 +1018,9 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
 func (c *Client) RefreshToken(a *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
-	a.Lock()
-	rtSnapshot := a.RefreshToken
-	atBefore := a.AccessToken
-	a.Unlock()
-	if strings.TrimSpace(rtSnapshot) == "" {
-		return errors.New("no refreshToken")
+	rtSnapshot, atBefore, err := refreshTokenSnapshot(a)
+	if err != nil {
+		return err
 	}
 
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
@@ -949,17 +1051,48 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if err != nil {
 		return err
 	}
-	var tok struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int64  `json:"expiresIn"`
-		Domain       string `json:"domain"`
-	}
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return errors.New("refresh_failed: no accessToken in response — re-login required")
+	tok, err := parseRefreshResponse(data)
+	if err != nil {
+		return err
 	}
 
 	// 第 2 段（锁内）：校验快照一致后写回。
+	commitRefreshedToken(a, tok, atBefore, rtSnapshot)
+	return nil
+}
+
+// refreshTokenResponse refresh 端点响应体（字段名与上游 JSON 对齐）。
+type refreshTokenResponse struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int64  `json:"expiresIn"`
+	Domain       string `json:"domain"`
+}
+
+// refreshTokenSnapshot 锁内读取 refresh/access token 快照；refreshToken 为空视为
+// 无刷新凭证，返回错误（调用方直接失败）。
+func refreshTokenSnapshot(a *auth.Auth) (rtSnapshot, atBefore string, err error) {
+	a.Lock()
+	rtSnapshot = a.RefreshToken
+	atBefore = a.AccessToken
+	a.Unlock()
+	if strings.TrimSpace(rtSnapshot) == "" {
+		return "", "", errors.New("no refreshToken")
+	}
+	return rtSnapshot, atBefore, nil
+}
+
+// parseRefreshResponse 解析 refresh 响应；缺 accessToken 视为刷新失败（需重登）。
+func parseRefreshResponse(data []byte) (refreshTokenResponse, error) {
+	var tok refreshTokenResponse
+	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+		return refreshTokenResponse{}, errors.New("refresh_failed: no accessToken in response — re-login required")
+	}
+	return tok, nil
+}
+
+// commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
+func commitRefreshedToken(a *auth.Auth, tok refreshTokenResponse, atBefore, rtSnapshot string) {
 	a.Lock()
 	defer a.Unlock()
 	// 写回守卫是 AND 语义：锁外期间另一刷新已完成 → 两 token 必同时变化（实测 R-D：
@@ -971,7 +1104,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
 		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
 		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
-		return nil
+		return
 	}
 	a.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
@@ -989,7 +1122,6 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
 		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
-	return nil
 }
 
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
@@ -1019,7 +1151,9 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
 // #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
 // 反证，删了无回滚路径）。
-func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStreamContext(
+	ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta,
+) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -1274,8 +1408,20 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.storeModelRates(a.Realm(), out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
-	cache := make(map[string][]string, len(out))
-	defCache := make(map[string]string, len(out))
+	cache, defCache := buildEffortCaches(out)
+	if len(cache) == 0 && len(defCache) == 0 {
+		return out, nil
+	}
+	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
+	c.storeEfforts(a.Realm(), cache, defCache)
+	return out, nil
+}
+
+// buildEffortCaches 从模型目录抽取 effort 能力桶：有 supportedEfforts 的入 cache，
+// 有 defaultEffort 的入 defCache（供请求体降级）。
+func buildEffortCaches(out []ModelInfo) (cache map[string][]string, defCache map[string]string) {
+	cache = make(map[string][]string, len(out))
+	defCache = make(map[string]string, len(out))
 	for _, mi := range out {
 		if len(mi.Efforts) > 0 {
 			cache[mi.ID] = mi.Efforts
@@ -1284,12 +1430,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			defCache[mi.ID] = mi.DefaultEffort
 		}
 	}
-	if len(cache) == 0 && len(defCache) == 0 {
-		return out, nil
-	}
-	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.storeEfforts(a.Realm(), cache, defCache)
-	return out, nil
+	return cache, defCache
 }
 
 // mergeModelInfos 合并两路模型目录：primary 为主（同 id 以 primary 条目为准——
@@ -1344,21 +1485,38 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
-	var env struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []dynModelEntry `json:"models"`
-			Agents []struct {
-				Name   string   `json:"name"`
-				Models []string `json:"models"`
-			} `json:"agents"`
-		} `json:"data"`
+	cliIDs, dynMap, err := parseEnterpriseModels(raw)
+	if err != nil {
+		return nil, err
 	}
+	out := collectEnterpriseModels(cliIDs, dynMap)
+	if len(out) == 0 {
+		return nil, errors.New("models api returned empty list")
+	}
+	return out, nil
+}
+
+// enterpriseModelsEnv /console/enterprises/personal/models 响应信封。
+type enterpriseModelsEnv struct {
+	Code int `json:"code"`
+	Data struct {
+		Models []dynModelEntry `json:"models"`
+		Agents []struct {
+			Name   string   `json:"name"`
+			Models []string `json:"models"`
+		} `json:"agents"`
+	} `json:"data"`
+}
+
+// parseEnterpriseModels 解析企业端点响应：取 agents[cli].models 过滤集，并以
+// nonChatModel 规则剔除的模型字段建 dynMap。
+func parseEnterpriseModels(raw []byte) ([]string, map[string]dynModelEntry, error) {
+	var env enterpriseModelsEnv
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
+		return nil, nil, fmt.Errorf("models parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("models api code=%d", env.Code)
+		return nil, nil, fmt.Errorf("models api code=%d", env.Code)
 	}
 	var cliIDs []string
 	for _, ag := range env.Data.Agents {
@@ -1368,7 +1526,7 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 	}
 	if len(cliIDs) == 0 {
-		return nil, errors.New("no cli agent models found")
+		return nil, nil, errors.New("no cli agent models found")
 	}
 	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
 	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
@@ -1380,16 +1538,18 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 		}
 		dynMap[m.ID] = m
 	}
+	return cliIDs, dynMap, nil
+}
+
+// collectEnterpriseModels 按 cli 过滤集从 dynMap 取可用模型（disabled 剔除）。
+func collectEnterpriseModels(cliIDs []string, dynMap map[string]dynModelEntry) []ModelInfo {
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
 		if m, ok := dynMap[id]; ok && !m.Disabled {
 			out = append(out, m.modelInfo())
 		}
 	}
-	if len(out) == 0 {
-		return nil, errors.New("models api returned empty list")
-	}
-	return out, nil
+	return out
 }
 
 // fetchV3Models 单路探测 /v3/config（IDE UA 完整能力版，见 codeBuddyIDEUA）。
@@ -1432,15 +1592,21 @@ type v3ModelPromotion struct {
 	Hover *struct {
 		TextZh string `json:"textZh"`
 	} `json:"hover"`
-	Schedule *struct {
-		Daily []struct {
-			Start string `json:"start"` // "23:00"
-			End   string `json:"end"`   // "7:50"（可跨午夜）
-		} `json:"daily"`
-		Timezone   string `json:"timezone"`  // 实测恒 Asia/Shanghai
-		ValidFrom  string `json:"validFrom"` // RFC3339，可缺省
-		ValidUntil string `json:"validUntil"`
-	} `json:"schedule"`
+	Schedule *v3PromoSchedule `json:"schedule"`
+}
+
+// v3PromoSchedule 优惠的生效时段定义（daily 窗口可跨午夜）。
+type v3PromoSchedule struct {
+	Daily      []v3PromoWindow `json:"daily"`
+	Timezone   string          `json:"timezone"`  // 实测恒 Asia/Shanghai
+	ValidFrom  string          `json:"validFrom"` // RFC3339，可缺省
+	ValidUntil string          `json:"validUntil"`
+}
+
+// v3PromoWindow 单条每日时段，Start/End 为 "HH:MM"（End 可小于 Start 表示跨午夜）。
+type v3PromoWindow struct {
+	Start string `json:"start"` // "23:00"
+	End   string `json:"end"`   // "7:50"（可跨午夜）
 }
 
 // promoZone 优惠时区：上游恒 Asia/Shanghai（UTC+8 无夏令时），用 FixedZone 免依赖
@@ -1467,44 +1633,55 @@ func promoActive(p *v3ModelPromotion, now time.Time) bool {
 	if !p.Enabled {
 		return false
 	}
-	if sc := p.Schedule; sc != nil {
-		if sc.ValidFrom != "" {
-			from, err := time.Parse(time.RFC3339, sc.ValidFrom)
-			if err == nil && now.Before(from) {
-				return false
-			}
+	sc := p.Schedule
+	if sc == nil {
+		return true
+	}
+	if !promoWithinValidRange(sc, now) {
+		return false
+	}
+	if len(sc.Daily) == 0 {
+		return true
+	}
+	return promoInDailyWindow(sc.Daily, now)
+}
+
+// promoWithinValidRange 报告 now 是否落在 validFrom/validUntil 区间内（缺省或
+// 解析失败视为不设限）。
+func promoWithinValidRange(sc *v3PromoSchedule, now time.Time) bool {
+	if sc.ValidFrom != "" {
+		if from, err := time.Parse(time.RFC3339, sc.ValidFrom); err == nil && now.Before(from) {
+			return false
 		}
-		if sc.ValidUntil != "" {
-			until, err := time.Parse(time.RFC3339, sc.ValidUntil)
-			if err == nil && !now.Before(until) {
-				return false
-			}
-		}
-		if len(sc.Daily) > 0 {
-			cur := now.Hour()*60 + now.Minute()
-			inWindow := false
-			for _, w := range sc.Daily {
-				st, ok1 := promoClock(w.Start)
-				ed, ok2 := promoClock(w.End)
-				if !ok1 || !ok2 {
-					continue
-				}
-				if st <= ed {
-					if cur >= st && cur < ed {
-						inWindow = true
-						break
-					}
-				} else if cur >= st || cur < ed { // 跨午夜（23:00→7:50）
-					inWindow = true
-					break
-				}
-			}
-			if !inWindow {
-				return false
-			}
+	}
+	if sc.ValidUntil != "" {
+		if until, err := time.Parse(time.RFC3339, sc.ValidUntil); err == nil && !now.Before(until) {
+			return false
 		}
 	}
 	return true
+}
+
+// promoInDailyWindow 报告 now 是否落在任一 daily 窗口内（支持跨午夜，如 23:00→7:50）。
+func promoInDailyWindow(daily []v3PromoWindow, now time.Time) bool {
+	cur := now.Hour()*60 + now.Minute()
+	for _, w := range daily {
+		st, ok1 := promoClock(w.Start)
+		ed, ok2 := promoClock(w.End)
+		if !ok1 || !ok2 {
+			continue
+		}
+		if st <= ed {
+			if cur >= st && cur < ed {
+				return true
+			}
+			continue
+		}
+		if cur >= st || cur < ed { // 跨午夜（23:00→7:50）
+			return true
+		}
+	}
+	return false
 }
 
 // applyModelPromotions 把当前生效的优惠挂到目录条目：同模型多条命中取 priority
@@ -1515,11 +1692,18 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 		return
 	}
 	now := time.Now().In(promoZone)
-	type cand struct {
-		prio int
-		p    *v3ModelPromotion
+	for id, p := range bestPromotions(out, promos, now) {
+		mi := out[id]
+		applyPromo(&mi, p)
+		out[id] = mi
 	}
-	best := map[string]cand{}
+}
+
+// bestPromotions 选出每个目录内模型当前生效的优惠：同模型多条命中取 priority 最高
+// （实测 glm-5.2 白天 badge-only(50) 与夜间五折(100) 靠 priority+daily 双轨切换）。
+func bestPromotions(out map[string]ModelInfo, promos []v3ModelPromotion, now time.Time) map[string]*v3ModelPromotion {
+	best := make(map[string]*v3ModelPromotion)
+	bestPrio := make(map[string]int)
 	for i := range promos {
 		p := &promos[i]
 		if !promoActive(p, now) {
@@ -1529,25 +1713,28 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 			if _, ok := out[id]; !ok {
 				continue // 目录外模型（如同名 global 变体）不挂
 			}
-			if b, seen := best[id]; !seen || p.Priority > b.prio {
-				best[id] = cand{prio: p.Priority, p: p}
+			if prio, seen := bestPrio[id]; !seen || p.Priority > prio {
+				best[id] = p
+				bestPrio[id] = p.Priority
 			}
 		}
 	}
-	for id, c := range best {
-		mi := out[id]
-		if c.p.Badge != nil {
-			mi.PromoLabel = c.p.Badge.Label
-		}
-		if c.p.Hover != nil {
-			mi.PromoNote = c.p.Hover.TextZh
-		}
-		if c.p.Discount != nil {
-			f := c.p.Discount.Factor
-			mi.PromoFactor = &f
-			mi.PromoCredits = c.p.Discount.DiscountedCredits
-		}
-		out[id] = mi
+	return best
+}
+
+// applyPromo 把单条优惠的标签/说明/折扣价挂到目录条目（无 discount 对象的条目也
+// 挂标签/说明，错峰类 PromoFactor 留 nil）。
+func applyPromo(mi *ModelInfo, p *v3ModelPromotion) {
+	if p.Badge != nil {
+		mi.PromoLabel = p.Badge.Label
+	}
+	if p.Hover != nil {
+		mi.PromoNote = p.Hover.TextZh
+	}
+	if p.Discount != nil {
+		f := p.Discount.Factor
+		mi.PromoFactor = &f
+		mi.PromoCredits = p.Discount.DiscountedCredits
 	}
 }
 
@@ -1667,6 +1854,42 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 // ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
 // 不同模型集合**（见 codeBuddyCLIUA 注释），global 探测据此并发两路取并集。
 func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
+	req, err := c.newV3ConfigRequest(a, ua)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	env, err := parseV3ConfigEnv(raw)
+	if err != nil {
+		return nil, err
+	}
+	out := buildV3ModelMap(env.Data.Models)
+	mergeTrialBannerModels(out, env.Data.ProductFeaturesConfig.ModelTrialBanner.Banners)
+	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
+	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
+	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
+	applyModelPromotions(out, env.Data.ModelPromotions)
+	if len(out) == 0 {
+		return nil, errors.New("v3/config returned empty models")
+	}
+	return out, nil
+}
+
+// newV3ConfigRequest 构造 /v3/config 请求（该端点对 UA 敏感：必须带
+// CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403；空串等价 codeBuddyIDEUA）。
+func (c *Client) newV3ConfigRequest(a *auth.Auth, ua string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, c.chatBase(a)+"/v3/config", http.NoBody)
 	if err != nil {
 		return nil, err
@@ -1685,61 +1908,71 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
-	if err != nil {
-		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
-	}
-	var env struct {
-		Code int `json:"code"`
-		Data struct {
-			Models []dynModelEntry `json:"models"`
-			// 试用模型横幅：上游把「N 天免费试用」的模型放在这里，**不在 data.models 里**。
-			// 实测 global 侧 hy4-preview-f 只出现在此（modelId=hy4-preview-f、
-			// targetModelId=hy4-preview、trialDays=14），纯 data.models 解析会漏掉它。
-			ProductFeaturesConfig struct {
-				ModelTrialBanner struct {
-					Banners []struct {
-						ModelID       string `json:"modelId"`
-						TargetModelID string `json:"targetModelId"`
-					} `json:"banners"`
-				} `json:"ModelTrialBanner"`
-			} `json:"productFeaturesConfig"`
-			ModelPromotions []v3ModelPromotion `json:"modelPromotions"`
-		} `json:"data"`
-	}
+	return req, nil
+}
+
+// v3ConfigEnv /v3/config 响应信封。
+type v3ConfigEnv struct {
+	Code int `json:"code"`
+	Data struct {
+		Models []dynModelEntry `json:"models"`
+		// 试用模型横幅：上游把「N 天免费试用」的模型放在这里，**不在 data.models 里**。
+		// 实测 global 侧 hy4-preview-f 只出现在此（modelId=hy4-preview-f、
+		// targetModelId=hy4-preview、trialDays=14），纯 data.models 解析会漏掉它。
+		ProductFeaturesConfig v3ProductFeaturesConfig `json:"productFeaturesConfig"`
+		ModelPromotions       []v3ModelPromotion      `json:"modelPromotions"`
+	} `json:"data"`
+}
+
+// v3ProductFeaturesConfig /v3/config data.productFeaturesConfig。
+type v3ProductFeaturesConfig struct {
+	ModelTrialBanner struct {
+		Banners []v3TrialBanner `json:"banners"`
+	} `json:"ModelTrialBanner"`
+}
+
+// v3TrialBanner 单条试用模型横幅。
+type v3TrialBanner struct {
+	ModelID       string `json:"modelId"`
+	TargetModelID string `json:"targetModelId"`
+}
+
+// parseV3ConfigEnv 解析 /v3/config 响应并校验业务 code。
+func parseV3ConfigEnv(raw []byte) (v3ConfigEnv, error) {
+	var env v3ConfigEnv
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("v3/config parse: %w", err)
+		return v3ConfigEnv{}, fmt.Errorf("v3/config parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("v3/config code=%d", env.Code)
+		return v3ConfigEnv{}, fmt.Errorf("v3/config code=%d", env.Code)
 	}
-	out := make(map[string]ModelInfo, len(env.Data.Models))
-	for _, m := range env.Data.Models {
+	return env, nil
+}
+
+// buildV3ModelMap 按模型 id 建能力表（空 id 跳过）。
+func buildV3ModelMap(models []dynModelEntry) map[string]ModelInfo {
+	out := make(map[string]ModelInfo, len(models))
+	for _, m := range models {
 		if strings.TrimSpace(m.ID) == "" {
 			continue
 		}
 		out[m.ID] = m.modelInfo()
 	}
-	// 补入试用横幅模型（ModelTrialBanner）：上游把「N 天免费试用」的模型只放在这里，
-	// data.models 里没有，故纯目录解析会漏（实测 global 侧 hy4-preview-f 即如此，
-	// 但该模型**实际可调用**）。
-	//
-	// 元数据口径：能力字段（context/maxTokens/efforts/reasoning 等）从 targetModelId
-	// 的既有条目继承——试用版与其转正目标是同族模型，能力应当一致；
-	// 但 **Credits 与 Tags 显式清空**——它们描述的是"转正后"的计费与营销信息
-	// （如 hy4-preview 的 x0.29 与 badge），用在免费试用版上会误导下游展示。
-	//
-	// firstUseTimeKey / trialDays 属**账号级**试用状态，不透出给下游。
-	for _, b := range env.Data.ProductFeaturesConfig.ModelTrialBanner.Banners {
+	return out
+}
+
+// mergeTrialBannerModels 补入试用横幅模型（ModelTrialBanner）：上游把「N 天免费试用」
+// 的模型只放在这里，data.models 里没有，故纯目录解析会漏（实测 global 侧
+// hy4-preview-f 即如此，但该模型**实际可调用**）。
+//
+// 元数据口径：能力字段（context/maxTokens/efforts/reasoning 等）从 targetModelId
+// 的既有条目继承——试用版与其转正目标是同族模型，能力应当一致；
+// 但 **Credits 与 Tags 显式清空**——它们描述的是"转正后"的计费与营销信息
+// （如 hy4-preview 的 x0.29 与 badge），用在免费试用版上会误导下游展示。
+//
+// firstUseTimeKey / trialDays 属**账号级**试用状态，不透出给下游。
+func mergeTrialBannerModels(out map[string]ModelInfo, banners []v3TrialBanner) {
+	for _, b := range banners {
 		id := strings.TrimSpace(b.ModelID)
 		if id == "" {
 			continue
@@ -1758,15 +1991,6 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 		mi.Tags = nil
 		out[id] = mi
 	}
-	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
-	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
-	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
-	applyModelPromotions(out, env.Data.ModelPromotions)
-
-	if len(out) == 0 {
-		return nil, errors.New("v3/config returned empty models")
-	}
-	return out, nil
 }
 
 // UserResource 查询账号积分余额与总额度（所有套餐聚合）。remain 负值钳 0；
@@ -1822,38 +2046,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 	// 注意层级：doJSON 已经解过 apiEnvelope 并返回 env.Data，所以这里从
 	// Response 开始解析——**不能**再套一层 Code/Data，否则 Accounts 恒为空，
 	// 表现为「每个号都 0 个包」（实测踩过）。
-	var resp struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// 到期时间字段名在上游存在三种口径：ExpiredTime / PackageEndTime
-					// 在 CN/global 实测字段全集里均恒 miss（见 UserResourceDetailed
-					// 处注释），真实下发的是 CycleEndTime——三者都读，谁有值用谁。
-					ExpiredTime    string `json:"ExpiredTime"`
-					PackageEndTime string `json:"PackageEndTime"`
-					CycleEndTime   string `json:"CycleEndTime"`
-					// DeductionEndTime 可抵扣窗口结束（epoch 毫秒）——「这个包什么时候
-					// 不能再花」的真失效时刻。CycleEndTime 是周期边界（额度重置点），
-					// 两者语义不同：判「用不完就没了」以本字段为准，CycleEndTime 兜底
-					// （OkRoromori 分支实测结论：请求参数叫 PackageEndTimeRange*，但
-					// 响应里 ExpiredTime 恒空，真正的失效时刻只有这里下发）。
-					DeductionEndTime int64 `json:"DeductionEndTime"`
-					// 发放时刻（epoch 毫秒）。
-					CreateTime     int64  `json:"CreateTime"`
-					PackageCode    string `json:"PackageCode"`
-					SubProductCode string `json:"SubProductCode"`
-					SubProductName string `json:"SubProductName"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
+	var resp billingPackagesResp
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, 0, 0, fmt.Errorf("packages parse: %w", err)
 	}
@@ -1861,53 +2054,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 	out := make([]CreditPackage, 0, len(packs))
 	var sumRemain, sumSize int64
 	for _, p := range packs {
-		cp := CreditPackage{
-			Name:           p.PackageName,
-			PackageCode:    p.PackageCode,
-			SubProductCode: p.SubProductCode,
-			SubProductName: p.SubProductName,
-		}
-		switch {
-		case p.DeductionEndTime > 0:
-			// 真失效时刻（可抵扣窗口结束），语义见上方字段注释：判「用不完就没了」
-			// 用它而不是周期边界。epoch 毫秒 → RFC3339，与 CycleEndTime 字符串口径
-			// 共存（前端统一 slice(0,10) 取日期）。ExpiresAt 直接用原始毫秒——
-			// RFC3339 不是 packageEndLayout 形态，交给下方解析会静默失败得 0。
-			cp.EndTime = time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339)
-			cp.ExpiresAt = p.DeductionEndTime
-		case p.ExpiredTime != "":
-			cp.EndTime = p.ExpiredTime
-		case p.PackageEndTime != "":
-			cp.EndTime = p.PackageEndTime
-		default:
-			cp.EndTime = p.CycleEndTime
-		}
-		if cp.ExpiresAt == 0 && cp.EndTime != "" {
-			if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {
-				cp.ExpiresAt = end.UnixMilli()
-			}
-		}
-		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
-		if p.CreateTime > 0 {
-			cp.CreatedAt = time.UnixMilli(p.CreateTime).Format(time.RFC3339)
-		}
-		if p.CycleCapacitySize > 0 {
-			cp.Cycle = true
-			cp.Remain, cp.Size = p.CycleCapacityRemain, p.CycleCapacitySize
-			cp.Used = cp.Size - cp.Remain
-			if p.CycleCapacityUsed > cp.Used {
-				cp.Used = p.CycleCapacityUsed
-				cp.Remain = cp.Size - cp.Used
-			}
-			if cp.Remain < 0 {
-				cp.Remain = 0
-			}
-		} else {
-			cp.Remain, cp.Used, cp.Size = p.CapacityRemain, p.CapacityUsed, p.CapacitySize
-			if cp.Used == 0 && cp.Size > cp.Remain {
-				cp.Used = cp.Size - cp.Remain
-			}
-		}
+		cp := creditPackageFromAccount(p)
 		sumRemain += cp.Remain
 		sumSize += cp.Size
 		out = append(out, cp)
@@ -1915,6 +2062,108 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 	// 面额降序：大包一眼可见，正是差异最可能出现的地方。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Size > out[j].Size })
 	return out, sumRemain, sumSize, nil
+}
+
+// billingPackagesResp 积分包列表响应信封（从 Response 起，见上方层级注释）。
+type billingPackagesResp struct {
+	Response struct {
+		Data struct {
+			Accounts []billingPackageAccount `json:"Accounts"`
+		} `json:"Data"`
+	} `json:"Response"`
+}
+
+// billingPackageAccount 单个积分包的上游字段。
+type billingPackageAccount struct {
+	PackageName         string `json:"PackageName"`
+	CapacityRemain      int64  `json:"CapacityRemain"`
+	CapacityUsed        int64  `json:"CapacityUsed"`
+	CapacitySize        int64  `json:"CapacitySize"`
+	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+	// 到期时间字段名在上游存在三种口径：ExpiredTime / PackageEndTime
+	// 在 CN/global 实测字段全集里均恒 miss（见 UserResourceDetailed
+	// 处注释），真实下发的是 CycleEndTime——三者都读，谁有值用谁。
+	ExpiredTime    string `json:"ExpiredTime"`
+	PackageEndTime string `json:"PackageEndTime"`
+	CycleEndTime   string `json:"CycleEndTime"`
+	// DeductionEndTime 可抵扣窗口结束（epoch 毫秒）——「这个包什么时候
+	// 不能再花」的真失效时刻。CycleEndTime 是周期边界（额度重置点），
+	// 两者语义不同：判「用不完就没了」以本字段为准，CycleEndTime 兜底
+	// （OkRoromori 分支实测结论：请求参数叫 PackageEndTimeRange*，但
+	// 响应里 ExpiredTime 恒空，真正的失效时刻只有这里下发）。
+	DeductionEndTime int64 `json:"DeductionEndTime"`
+	// 发放时刻（epoch 毫秒）。
+	CreateTime     int64  `json:"CreateTime"`
+	PackageCode    string `json:"PackageCode"`
+	SubProductCode string `json:"SubProductCode"`
+	SubProductName string `json:"SubProductName"`
+}
+
+// creditPackageFromAccount 把单个上游积分包映射为面板用的 CreditPackage。
+func creditPackageFromAccount(p billingPackageAccount) CreditPackage {
+	cp := CreditPackage{
+		Name:           p.PackageName,
+		PackageCode:    p.PackageCode,
+		SubProductCode: p.SubProductCode,
+		SubProductName: p.SubProductName,
+	}
+	cp.EndTime, cp.ExpiresAt = creditPackageExpiry(p)
+	if cp.ExpiresAt == 0 && cp.EndTime != "" {
+		if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {
+			cp.ExpiresAt = end.UnixMilli()
+		}
+	}
+	// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
+	if p.CreateTime > 0 {
+		cp.CreatedAt = time.UnixMilli(p.CreateTime).Format(time.RFC3339)
+	}
+	cp.Cycle, cp.Remain, cp.Used, cp.Size = creditPackageAmounts(p)
+	return cp
+}
+
+// creditPackageExpiry 按上游口径选出失效时刻：DeductionEndTime 优先（epoch 毫秒，
+// 真「用不完就没了」），依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
+// 返回 RFC3339 文本与同源 Unix 毫秒（后者仅在 DeductionEndTime 分支有值）。
+func creditPackageExpiry(p billingPackageAccount) (endTime string, expiresAt int64) {
+	switch {
+	case p.DeductionEndTime > 0:
+		// 真失效时刻（可抵扣窗口结束），语义见字段注释：判「用不完就没了」
+		// 用它而不是周期边界。epoch 毫秒 → RFC3339，与 CycleEndTime 字符串口径
+		// 共存（前端统一 slice(0,10) 取日期）。ExpiresAt 直接用原始毫秒——
+		// RFC3339 不是 packageEndLayout 形态，交给调用方解析会静默失败得 0。
+		return time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339), p.DeductionEndTime
+	case p.ExpiredTime != "":
+		return p.ExpiredTime, 0
+	case p.PackageEndTime != "":
+		return p.PackageEndTime, 0
+	default:
+		return p.CycleEndTime, 0
+	}
+}
+
+// creditPackageAmounts 按周期字段优先口径算出包的 remain/used/size（与
+// UserResourceDetailed 的 packageRemainUsed 同构，两处口径不能混）。
+func creditPackageAmounts(p billingPackageAccount) (cycle bool, remain, used, size int64) {
+	if p.CycleCapacitySize > 0 {
+		cycle = true
+		remain, size = p.CycleCapacityRemain, p.CycleCapacitySize
+		used = size - remain
+		if p.CycleCapacityUsed > used {
+			used = p.CycleCapacityUsed
+			remain = size - used
+		}
+		if remain < 0 {
+			remain = 0
+		}
+		return cycle, remain, used, size
+	}
+	remain, used, size = p.CapacityRemain, p.CapacityUsed, p.CapacitySize
+	if used == 0 && size > remain {
+		used = size - remain
+	}
+	return cycle, remain, used, size
 }
 
 func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
@@ -1989,7 +2238,9 @@ const (
 // 分桶：企业配额按周期重置、未用完即作废，与个人「奖励积分到期作废」同性质，故把
 // cycleEndTime 作为唯一到期批次——周期末企业号会被 prefer_expiring 优先选中（期望行为）。
 // limitNum < 0（不限量）无作废语义，不参与分桶。
-func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+func (c *Client) enterpriseResource(
+	a *auth.Auth, soon time.Duration,
+) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	// 与个人口径一致：余额是签到后的紧邻调用，偶发 500 值得有界重试。
 	var data json.RawMessage
 	err = c.retryBillingTransient(func() error {
@@ -2001,59 +2252,86 @@ func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, t
 		return 0, 0, 0, time.Time{}, 0, err
 	}
 	// 兼容上游两套字段命名（桌面端两条解析路径分别读 camelCase 与 snake_case）。
-	var resp struct {
-		Credit         float64 `json:"credit"`
-		LimitNum       int64   `json:"limitNum"`
-		LimitNumSnake  int64   `json:"limit_num"`
-		UsedNum        float64 `json:"used_num"`
-		CycleEndTime   string  `json:"cycleEndTime"`
-		CycleResetTime string  `json:"cycleResetTime"`
-	}
-	if uerr := json.Unmarshal(data, &resp); uerr != nil {
-		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource parse: %w", uerr)
-	}
-	limit := resp.LimitNum
-	if limit == 0 && resp.LimitNumSnake != 0 {
-		limit = resp.LimitNumSnake
-	}
-	used := resp.Credit
-	if used == 0 && resp.UsedNum != 0 {
-		used = resp.UsedNum
+	limit, used, cycleEnd, cycleReset, err := parseEnterpriseQuota(data)
+	if err != nil {
+		return 0, 0, 0, time.Time{}, 0, err
 	}
 	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
 	if limit < 0 {
 		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
 	}
-	// credit 是浮点（如 812.45），池内 credits 是整数：四舍五入到最近整数
-	// （向下取整会低报剩余额度，与"额度还有多少"的展示意图相悖）。
-	usedInt := int64(used)
-	if used-float64(usedInt) >= 0.5 {
-		usedInt++
-	}
-	remain = limit - usedInt
+	remain = limit - roundHalfUp(used)
 	if remain < 0 {
 		remain = 0
 	}
 	total = limit
 	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
-	now := time.Now()
-	end, ok := parsePackageEndTime(resp.CycleEndTime)
-	if !ok {
-		end, ok = parsePackageEndTime(resp.CycleResetTime)
-	}
-	if ok && remain > 0 && end.After(now) {
-		earliestAt, earliestRemaining = end, remain
-		if soon > 0 && !end.After(now.Add(soon)) {
-			expiring = remain
-		}
-	}
+	earliestAt, earliestRemaining, expiring = enterpriseExpiryBucket(cycleEnd, cycleReset, remain, time.Now(), soon)
 	return remain, total, expiring, earliestAt, earliestRemaining, nil
+}
+
+// enterpriseQuota 企业额度响应字段（兼容 camelCase 与 snake_case 两套命名）。
+type enterpriseQuota struct {
+	Credit         float64 `json:"credit"`
+	LimitNum       int64   `json:"limitNum"`
+	LimitNumSnake  int64   `json:"limit_num"`
+	UsedNum        float64 `json:"used_num"`
+	CycleEndTime   string  `json:"cycleEndTime"`
+	CycleResetTime string  `json:"cycleResetTime"`
+}
+
+// parseEnterpriseQuota 解析企业额度响应，把两套字段命名归一到 limit/used。
+func parseEnterpriseQuota(data json.RawMessage) (limit int64, used float64, cycleEnd, cycleReset string, err error) {
+	var resp enterpriseQuota
+	if uerr := json.Unmarshal(data, &resp); uerr != nil {
+		return 0, 0, "", "", fmt.Errorf("enterprise resource parse: %w", uerr)
+	}
+	limit = resp.LimitNum
+	if limit == 0 && resp.LimitNumSnake != 0 {
+		limit = resp.LimitNumSnake
+	}
+	used = resp.Credit
+	if used == 0 && resp.UsedNum != 0 {
+		used = resp.UsedNum
+	}
+	return limit, used, resp.CycleEndTime, resp.CycleResetTime, nil
+}
+
+// roundHalfUp 把浮点额度四舍五入到最近整数（credit 是浮点如 812.45，池内 credits
+// 是整数；向下取整会低报剩余额度，与"额度还有多少"的展示意图相悖）。
+func roundHalfUp(used float64) int64 {
+	usedInt := int64(used)
+	if used-float64(usedInt) >= 0.5 {
+		usedInt++
+	}
+	return usedInt
+}
+
+// enterpriseExpiryBucket 计算企业配额的周期到期批次：cycleEndTime 优先、缺失回落
+// cycleResetTime；过期或零余额不入桶。limitNum<0（不限量）无作废语义不参与分桶。
+func enterpriseExpiryBucket(
+	cycleEnd, cycleReset string, remain int64, now time.Time, soon time.Duration,
+) (earliestAt time.Time, earliestRemaining, expiring int64) {
+	end, ok := parsePackageEndTime(cycleEnd)
+	if !ok {
+		end, ok = parsePackageEndTime(cycleReset)
+	}
+	if !ok || remain <= 0 || !end.After(now) {
+		return time.Time{}, 0, 0
+	}
+	earliestAt, earliestRemaining = end, remain
+	if soon > 0 && !end.After(now.Add(soon)) {
+		expiring = remain
+	}
+	return earliestAt, earliestRemaining, expiring
 }
 
 // UserResourceDetailedWithExpiry 在 UserResourceDetailed 基础上返回最早未来到期批次：
 // earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
 // 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
-func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+func (c *Client) UserResourceDetailedWithExpiry(
+	a *auth.Auth, soon time.Duration,
+) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if a.IsEnterprise() {
@@ -2079,61 +2357,85 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 	if err != nil {
 		return 0, 0, 0, time.Time{}, 0, err
 	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				Accounts []struct {
-					PackageName         string `json:"PackageName"`
-					CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
+	var resp resourceDetailedResp
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
 	}
+	var totals resourceTotals
 	for _, acct := range resp.Response.Data.Accounts {
-		r, _, size := packageRemainUsed(respAccount{
-			CapacityRemain:      acct.CapacityRemain,
-			CapacityUsed:        acct.CapacityUsed,
-			CapacitySize:        acct.CapacitySize,
-			CycleCapacityRemain: acct.CycleCapacityRemain,
-			CycleCapacityUsed:   acct.CycleCapacityUsed,
-			CycleCapacitySize:   acct.CycleCapacitySize,
-		})
-		if r < 0 {
-			r = 0
-		}
-		if size < r {
-			size = r
-		}
-		remain += r
-		total += size
-		if r <= 0 {
-			continue
-		}
-		end, ok := parsePackageEndTime(acct.CycleEndTime)
-		if !ok || !end.After(now) {
-			continue
-		}
-		if earliestAt.IsZero() || end.Before(earliestAt) {
-			earliestAt = end
-			earliestRemaining = r
-		} else if end.Equal(earliestAt) {
-			earliestRemaining += r
-		}
-		// 分桶：仅 soon>0 且确实在窗口内 → expiring。
-		if soon > 0 && !end.After(now.Add(soon)) {
-			expiring += r
-		}
+		totals.add(acct, now, soon)
 	}
-	return remain, total, expiring, earliestAt, earliestRemaining, nil
+	return totals.remain, totals.total, totals.expiring, totals.earliestAt, totals.earliestRemaining, nil
+}
+
+// resourceDetailedResp get-user-resource 响应信封。
+type resourceDetailedResp struct {
+	Response struct {
+		Data struct {
+			Accounts []resourceAccount `json:"Accounts"`
+		} `json:"Data"`
+	} `json:"Response"`
+}
+
+// resourceAccount get-user-resource 的单个套餐字段。
+type resourceAccount struct {
+	PackageName         string `json:"PackageName"`
+	CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
+	CapacitySize        int64  `json:"CapacitySize"`
+	CapacityRemain      int64  `json:"CapacityRemain"`
+	CapacityUsed        int64  `json:"CapacityUsed"`
+	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
+	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
+	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
+}
+
+// resourceTotals 个人资源聚合累加器。
+type resourceTotals struct {
+	remain, total, expiring int64
+	earliestAt              time.Time
+	earliestRemaining       int64
+}
+
+// add 累加单个套餐的余额与到期批次（余额钳非负、size 不高于 remain）。
+func (t *resourceTotals) add(acct resourceAccount, now time.Time, soon time.Duration) {
+	r, _, size := packageRemainUsed(respAccount{
+		CapacityRemain:      acct.CapacityRemain,
+		CapacityUsed:        acct.CapacityUsed,
+		CapacitySize:        acct.CapacitySize,
+		CycleCapacityRemain: acct.CycleCapacityRemain,
+		CycleCapacityUsed:   acct.CycleCapacityUsed,
+		CycleCapacitySize:   acct.CycleCapacitySize,
+	})
+	if r < 0 {
+		r = 0
+	}
+	if size < r {
+		size = r
+	}
+	t.remain += r
+	t.total += size
+	if r <= 0 {
+		return
+	}
+	end, ok := parsePackageEndTime(acct.CycleEndTime)
+	if !ok || !end.After(now) {
+		return
+	}
+	t.addExpiry(end, r, now, soon)
+}
+
+// addExpiry 更新最早到期批次并累计窗口内 expiring。
+func (t *resourceTotals) addExpiry(end time.Time, r int64, now time.Time, soon time.Duration) {
+	if t.earliestAt.IsZero() || end.Before(t.earliestAt) {
+		t.earliestAt = end
+		t.earliestRemaining = r
+	} else if end.Equal(t.earliestAt) {
+		t.earliestRemaining += r
+	}
+	// 分桶：仅 soon>0 且确实在窗口内 → expiring。
+	if soon > 0 && !end.After(now.Add(soon)) {
+		t.expiring += r
+	}
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。
@@ -2151,28 +2453,34 @@ type respAccount struct {
 // 三字段，used 取 CycleUsed 与 size-remain 的较大者；否则回退 Capacity 三字段。
 func packageRemainUsed(a respAccount) (remain, used, size int64) {
 	if a.CycleCapacitySize > 0 {
-		remain = a.CycleCapacityRemain
-		size = a.CycleCapacitySize
-		if remain < 0 {
-			remain = 0
-		}
-		if remain > size {
-			remain = size
-		}
-		used = size - remain
-		if a.CycleCapacityUsed > used {
-			used = a.CycleCapacityUsed
-			if size >= used {
-				remain = size - used
-			}
-		}
-		return remain, used, size
+		return cyclePackageAmounts(a)
 	}
 	remain = a.CapacityRemain
 	used = a.CapacityUsed
 	size = a.CapacitySize
 	if used == 0 && size > remain {
 		used = size - remain
+	}
+	return remain, used, size
+}
+
+// cyclePackageAmounts 周期套餐的 remain/used/size：remain 先钳 [0,size]，used 取
+// size-remain 与 CycleUsed 的较大者。
+func cyclePackageAmounts(a respAccount) (remain, used, size int64) {
+	remain = a.CycleCapacityRemain
+	size = a.CycleCapacitySize
+	if remain < 0 {
+		remain = 0
+	}
+	if remain > size {
+		remain = size
+	}
+	used = size - remain
+	if a.CycleCapacityUsed > used {
+		used = a.CycleCapacityUsed
+	}
+	if size >= used {
+		remain = size - used
 	}
 	return remain, used, size
 }

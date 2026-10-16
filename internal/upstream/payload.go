@@ -176,24 +176,42 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if !ok || len(supported) == 0 {
 		return
 	}
-	var key string
+	key, reqStr, reqIdx, known := resolveRequestEffort(obj)
+	if !known {
+		return
+	}
+	// 在 ≤请求档位的支持档里选最高档；命中且与请求不同才改写。
+	if applyBestEffort(obj, key, model, reqStr, supported, reqIdx) {
+		return
+	}
+	// 支持档全部高于请求档：取最低支持档。
+	if lowest := pickLowestEffort(supported); lowest != "" {
+		obj[key] = lowest
+		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+	}
+}
+
+// resolveRequestEffort 解析请求携带的 reasoning 档位（snake/camel 双字段兼容）。
+// known=false 表示未携带字段 / 非字符串 / 档位名未知，调用方一律透传。
+func resolveRequestEffort(obj map[string]any) (key, reqStr string, reqIdx int, known bool) {
 	if _, present := obj["reasoning_effort"]; present {
 		key = "reasoning_effort"
 	} else if _, present := obj["reasoningEffort"]; present {
 		key = "reasoningEffort"
 	} else {
-		return
+		return "", "", 0, false
 	}
-	reqStr, ok := obj[key].(string)
+	raw, ok := obj[key].(string)
 	if !ok {
-		return
+		return "", "", 0, false
 	}
-	reqStr = strings.TrimSpace(strings.ToLower(reqStr))
-	reqIdx, known := effortRank[reqStr]
-	if !known {
-		return
-	}
-	// 在 ≤请求档位的支持档里选最高档；命中且与请求不同才改写。
+	reqStr = strings.TrimSpace(strings.ToLower(raw))
+	reqIdx, known = effortRank[reqStr]
+	return key, reqStr, reqIdx, known
+}
+
+// applyBestEffort 命中「≤请求档的最高支持档」时改写 obj[key]；返回是否命中。
+func applyBestEffort(obj map[string]any, key, model, reqStr string, supported []string, reqIdx int) bool {
 	best, bestIdx := "", -1
 	for _, s := range supported {
 		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
@@ -201,14 +219,18 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 			best, bestIdx = s, idx
 		}
 	}
-	if best != "" {
-		if !strings.EqualFold(best, reqStr) {
-			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
-		}
-		return
+	if best == "" {
+		return false
 	}
-	// 支持档全部高于请求档：取最低支持档。
+	if !strings.EqualFold(best, reqStr) {
+		obj[key] = best
+		log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+	}
+	return true
+}
+
+// pickLowestEffort 取 supported 里 rank 最低的有效档位；无有效档返回 ""。
+func pickLowestEffort(supported []string) string {
 	lowest, lowestIdx := "", 1<<30
 	for _, s := range supported {
 		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
@@ -216,10 +238,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 			lowest, lowestIdx = s, idx
 		}
 	}
-	if lowest != "" {
-		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
-	}
+	return lowest
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。
@@ -343,33 +362,43 @@ func normalizeToolChoice(obj map[string]any) {
 			suppress()
 		}
 	case map[string]any:
-		typ, _ := v["type"].(string)
-		typ = strings.ToLower(strings.TrimSpace(typ))
-		switch typ {
-		case "none":
-			delete(obj, "tool_choice")
-			suppress()
-		case "auto", "required":
-			obj["tool_choice"] = typ
-		case "function":
-			name := ""
-			if fn, ok := v["function"].(map[string]any); ok {
-				name, _ = fn["name"].(string)
-			}
-			if name == "" {
-				name, _ = v["name"].(string)
-			}
-			if name = strings.TrimSpace(name); name != "" {
-				obj["tool_choice"] = name
-			} else {
-				obj["tool_choice"] = "auto"
-			}
-		default:
-			delete(obj, "tool_choice")
-		}
+		normalizeToolChoiceObject(obj, v, suppress)
 	default:
 		delete(obj, "tool_choice")
 	}
+}
+
+// normalizeToolChoiceObject 处理对象形态的 tool_choice（type 决定改写/删除）。
+func normalizeToolChoiceObject(obj, v map[string]any, suppress func()) {
+	typ, _ := v["type"].(string)
+	typ = strings.ToLower(strings.TrimSpace(typ))
+	switch typ {
+	case "none":
+		delete(obj, "tool_choice")
+		suppress()
+	case "auto", "required":
+		obj["tool_choice"] = typ
+	case "function":
+		obj["tool_choice"] = toolChoiceFunctionName(v)
+	default:
+		delete(obj, "tool_choice")
+	}
+}
+
+// toolChoiceFunctionName 取 function 形态里的工具名（function.name 优先，回落裸 name）；
+// 缺失/空串回落 "auto"。
+func toolChoiceFunctionName(v map[string]any) string {
+	name := ""
+	if fn, ok := v["function"].(map[string]any); ok {
+		name, _ = fn["name"].(string)
+	}
+	if name == "" {
+		name, _ = v["name"].(string)
+	}
+	if name = strings.TrimSpace(name); name != "" {
+		return name
+	}
+	return "auto"
 }
 
 // normalizeToolPatterns 归一化 tools 子树里 pattern 的非标准转义 `\_`（→ `_`）。
@@ -414,20 +443,7 @@ func unescapePatternLiteralEscapes(node any) {
 		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
 			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
 		}
-		if props, ok := n["patternProperties"].(map[string]any); ok {
-			rebuilt := false
-			fixed := make(map[string]any, len(props))
-			for k, v := range props {
-				if strings.Contains(k, `\_`) {
-					k = strings.ReplaceAll(k, `\_`, `_`)
-					rebuilt = true
-				}
-				fixed[k] = v
-			}
-			if rebuilt {
-				n["patternProperties"] = fixed
-			}
-		}
+		unescapePatternProperties(n)
 		for _, v := range n {
 			unescapePatternLiteralEscapes(v)
 		}
@@ -435,5 +451,26 @@ func unescapePatternLiteralEscapes(node any) {
 		for _, v := range n {
 			unescapePatternLiteralEscapes(v)
 		}
+	}
+}
+
+// unescapePatternProperties 改写 patternProperties 键里的 `\_`（map 键不可原地改，
+// 命中时重建该层并写回 n）。
+func unescapePatternProperties(n map[string]any) {
+	props, ok := n["patternProperties"].(map[string]any)
+	if !ok {
+		return
+	}
+	rebuilt := false
+	fixed := make(map[string]any, len(props))
+	for k, v := range props {
+		if strings.Contains(k, `\_`) {
+			k = strings.ReplaceAll(k, `\_`, `_`)
+			rebuilt = true
+		}
+		fixed[k] = v
+	}
+	if rebuilt {
+		n["patternProperties"] = fixed
 	}
 }

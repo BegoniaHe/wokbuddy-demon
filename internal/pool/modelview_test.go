@@ -33,6 +33,41 @@ func setModelCooldown(p *Pool, uid, model string, until time.Time, reason string
 	p.mu.Unlock()
 }
 
+// oneRow 断言恰好一行并返回它。
+func oneRow(t *testing.T, rows []ModelLockRow) ModelLockRow {
+	t.Helper()
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %+v", rows)
+	}
+	return rows[0]
+}
+
+// assertUnlockAround 断言解锁时刻距今约 want（±10 分钟）。
+func assertUnlockAround(t *testing.T, got time.Time, want time.Duration) {
+	t.Helper()
+	if d := time.Until(got); d < want-10*time.Minute || d > want+10*time.Minute {
+		t.Errorf("unlock 应在约 %v 后，得到 %v", want, d)
+	}
+}
+
+// rowsByRealm 把行按域建索引。
+func rowsByRealm(rows []ModelLockRow) map[string]ModelLockRow {
+	byRealm := map[string]ModelLockRow{}
+	for _, r := range rows {
+		byRealm[r.Realm] = r
+	}
+	return byRealm
+}
+
+// assertRealmLockRow 断言某域的行：total/locked/reason 均匹配。
+func assertRealmLockRow(t *testing.T, byRealm map[string]ModelLockRow, realm string, total, locked int, reason string) {
+	t.Helper()
+	r, ok := byRealm[realm]
+	if !ok || r.Total != total || r.Locked != locked || r.Reason != reason {
+		t.Errorf("%s 行 = %+v want total %d locked %d reason %q", realm, r, total, locked, reason)
+	}
+}
+
 // TestModelLockViewEmpty 没有未过期模型级冷却 → 返回 nil（面板按空态渲染）。
 func TestModelLockViewEmpty(t *testing.T) {
 	p := lockViewPool(t)
@@ -47,10 +82,7 @@ func TestModelLockViewPartial(t *testing.T) {
 	setModelCooldown(p, "u1", "glm-5.3", time.Now().Add(time.Hour), "6004 model rate limit", false)
 
 	rows := p.ModelLockView()
-	if len(rows) != 1 {
-		t.Fatalf("want 1 row, got %+v", rows)
-	}
-	r := rows[0]
+	r := oneRow(t, rows)
 	if r.Model != "glm-5.3" || r.Realm != "cn" {
 		t.Errorf("model/realm = %q/%q want glm-5.3/cn", r.Model, r.Realm)
 	}
@@ -63,9 +95,7 @@ func TestModelLockViewPartial(t *testing.T) {
 	if r.Reason != "6004 model rate limit" {
 		t.Errorf("reason = %q want 6004 model rate limit", r.Reason)
 	}
-	if d := time.Until(r.UnlockAt); d < 50*time.Minute || d > 70*time.Minute {
-		t.Errorf("unlock_at 应在约 1h 后，得到 %v", d)
-	}
+	assertUnlockAround(t, r.UnlockAt, time.Hour)
 	if !r.FullyUnlockAt.Equal(r.UnlockAt) {
 		t.Errorf("只有一个号被锁时 fully_unlock_at 应等于 unlock_at")
 	}
@@ -80,10 +110,7 @@ func TestModelLockViewLocked(t *testing.T) {
 	setModelCooldown(p, "u2", "glm-5.3", base.Add(time.Hour), "reason-early", false)
 
 	rows := p.ModelLockView()
-	if len(rows) != 1 {
-		t.Fatalf("want 1 row, got %+v", rows)
-	}
-	r := rows[0]
+	r := oneRow(t, rows)
 	if r.State != "locked" {
 		t.Errorf("state = %q want locked", r.State)
 	}
@@ -93,12 +120,8 @@ func TestModelLockViewLocked(t *testing.T) {
 	if r.Reason != "reason-early" {
 		t.Errorf("reason 应取最早解锁账号的，得到 %q", r.Reason)
 	}
-	if d := time.Until(r.UnlockAt); d < 50*time.Minute || d > 70*time.Minute {
-		t.Errorf("unlock_at 应约 1h 后，得到 %v", d)
-	}
-	if d := time.Until(r.FullyUnlockAt); d < 110*time.Minute || d > 130*time.Minute {
-		t.Errorf("fully_unlock_at 应约 2h 后，得到 %v", d)
-	}
+	assertUnlockAround(t, r.UnlockAt, time.Hour)
+	assertUnlockAround(t, r.FullyUnlockAt, 2*time.Hour)
 }
 
 // TestModelLockViewStarved 此刻没号能服务、但不是模型冷却造成的（账号级冷却）→ starved，
@@ -181,18 +204,9 @@ func TestModelLockViewRealmIsolation(t *testing.T) {
 	if len(rows) != 2 {
 		t.Fatalf("同名模型在两个域应各出一行，得到 %+v", rows)
 	}
-	byRealm := map[string]ModelLockRow{}
-	for _, r := range rows {
-		byRealm[r.Realm] = r
-	}
-	cn, ok := byRealm["cn"]
-	if !ok || cn.Total != 2 || cn.Locked != 1 || cn.Reason != "6004 cn" {
-		t.Errorf("cn 行 = %+v want total 2 locked 1 reason \"6004 cn\"", cn)
-	}
-	g, ok := byRealm["global"]
-	if !ok || g.Total != 2 || g.Locked != 1 || g.Reason != "6004 global" {
-		t.Errorf("global 行 = %+v want total 2 locked 1 reason \"6004 global\"", g)
-	}
+	byRealm := rowsByRealm(rows)
+	assertRealmLockRow(t, byRealm, "cn", 2, 1, "6004 cn")
+	assertRealmLockRow(t, byRealm, "global", 2, 1, "6004 global")
 }
 
 // TestModelLockViewSortsLockedFirst 整池不可用排在部分限流前面，方便一眼看到最该处理的。

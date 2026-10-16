@@ -226,42 +226,43 @@ const (
 	taskGrowth
 )
 
-// nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
-// 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
-// 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
-// 排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
-func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+// wakeSlot 一类任务的候选时点：at 为零值表示该类当前无有效时点。
+type wakeSlot struct {
+	at   time.Time
+	kind taskKind
+}
+
+// candidateSlots 在 schedMu 下快照排程参数，返回各类未禁用任务的候选时点。
+// 顺序固定为 checkin→travel→activity→keepalive→blackcat→growth，与同刻任务的
+// kinds 收集顺序一致；已显式禁用的任务不进候选（nextFire 对其零值返回零时间）。
+func (s *Scheduler) candidateSlots(now time.Time) []wakeSlot {
 	s.schedMu.Lock()
-	checkinHours, keepaliveHours, blackcatHours := s.cfg.CheckinHours, s.cfg.KeepaliveHours, s.cfg.BlackcatHours
-	travelHours, activityHours := s.cfg.TravelHours, s.cfg.ActivityHours
-	checkinOff, keepaliveOff, blackcatOff := s.cfg.CheckinDisabled, s.cfg.KeepaliveDisabled, s.cfg.BlackcatDisabled
-	growthHours, growthOff := s.cfg.GrowthHours, s.cfg.GrowthDisabled
-	travelOff, activityOff := s.cfg.TravelDisabled, s.cfg.ActivityDisabled
+	specs := []struct {
+		hours    []int
+		kind     taskKind
+		disabled bool
+	}{
+		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled},
+		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled},
+		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled},
+		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled},
+		{s.cfg.BlackcatHours, taskBlackcat, s.cfg.BlackcatDisabled},
+		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled},
+	}
 	s.schedMu.Unlock()
 
-	type slot struct {
-		at   time.Time
-		kind taskKind
+	var slots []wakeSlot
+	for _, sp := range specs {
+		if sp.disabled {
+			continue
+		}
+		slots = append(slots, wakeSlot{nextFire(now, sp.hours), sp.kind})
 	}
-	var slots []slot
-	if !checkinOff {
-		slots = append(slots, slot{nextFire(now, checkinHours), taskCheckin})
-	}
-	if !travelOff {
-		slots = append(slots, slot{nextFire(now, travelHours), taskTravel})
-	}
-	if !activityOff {
-		slots = append(slots, slot{nextFire(now, activityHours), taskActivity})
-	}
-	if !keepaliveOff {
-		slots = append(slots, slot{nextFire(now, keepaliveHours), taskKeepalive})
-	}
-	if !blackcatOff {
-		slots = append(slots, slot{nextFire(now, blackcatHours), taskBlackcat})
-	}
-	if !growthOff {
-		slots = append(slots, slot{nextFire(now, growthHours), taskGrowth})
-	}
+	return slots
+}
+
+// earliestSlot 返回候选时点中最近的一个（忽略零值时点）；全为零值则返回零时间。
+func earliestSlot(slots []wakeSlot) time.Time {
 	var earliest time.Time
 	for _, sl := range slots {
 		if sl.at.IsZero() {
@@ -271,6 +272,15 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 			earliest = sl.at
 		}
 	}
+	return earliest
+}
+
+// nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
+// 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
+// 排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
+func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+	slots := s.candidateSlots(now)
+	earliest := earliestSlot(slots)
 	if earliest.IsZero() {
 		return time.Time{}, nil
 	}
@@ -470,21 +480,7 @@ func (s *Scheduler) RunCheckinNow() {
 		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
 		// credit_floor 判定与面板额度展示的唯一数据源）。
 		if !a.IsEnterprise() {
-			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-				if upstream.IsAlreadyCheckin(err) {
-					s.cfg.Pool.NoteCheckinDone(st.UID)
-					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
-				} else {
-					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-				}
-				// 其余业务错误也继续走余额查询
-			} else {
-				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-				// 重复触发时出现），成功也落一行。
-				s.cfg.Pool.NoteCheckinDone(st.UID)
-				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
-			}
+			s.checkinOne(st.UID, st.Nickname, a)
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
 		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
@@ -496,6 +492,26 @@ func (s *Scheduler) RunCheckinNow() {
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
 	s.RunStreakBonusNow()
+}
+
+// checkinOne 单账号签到并落一行结果日志：幂等（今天已签到）与首次成功分开表述，
+// 其余错误记 error 行；均不阻断调用方的后续余额查询。
+func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) {
+	if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+		if upstream.IsAlreadyCheckin(err) {
+			s.cfg.Pool.NoteCheckinDone(uid)
+			log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, nickname))
+		} else {
+			log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
+		}
+		// 其余业务错误也继续走余额查询
+		return
+	}
+	// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+	// 重复触发时出现），成功也落一行。
+	s.cfg.Pool.NoteCheckinDone(uid)
+	log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -589,18 +605,24 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
-				if s.cfg.Pool.NoteSessionDead(st.UID) {
-					log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
-				}
-			}
+			s.noteKeepaliveFailure(st, err)
 			continue
 		}
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
+		}
+	}
+}
+
+// noteKeepaliveFailure 刷新失败后的计数与日志：12153 session dead 连续累计到阈值才禁用
+// （一次失败不杀号）；其余错误只落一行。已禁用账号不再重复计数 12153。
+func (s *Scheduler) noteKeepaliveFailure(st pool.Status, err error) {
+	log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+	var ue *upstream.Error
+	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
+		if s.cfg.Pool.NoteSessionDead(st.UID) {
+			log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 		}
 	}
 }

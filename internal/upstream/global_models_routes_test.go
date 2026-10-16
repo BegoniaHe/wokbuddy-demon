@@ -46,20 +46,31 @@ func TestMergeV3RoutesPriority(t *testing.T) {
 	if got.err != nil {
 		t.Fatalf("unexpected err: %v", got.err)
 	}
-	wantIDs := []string{"shared", "only-desktop", "only-ide", "only-cli"}
-	if len(got.names) != len(wantIDs) {
-		t.Fatalf("names = %v, want %v", got.names, wantIDs)
+	assertV3Names(t, got.names, []string{"shared", "only-desktop", "only-ide", "only-cli"})
+	// 主路字段权威：shared 的窗口必须是主路值。
+	assertSharedFromPrimary(t, got.infos)
+}
+
+// assertV3Names 断言合并后的 names 顺序与期望一致。
+func assertV3Names(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("names = %v, want %v", got, want)
 	}
-	for i, id := range wantIDs {
-		if got.names[i] != id {
-			t.Errorf("names[%d] = %q, want %q (full %v)", i, got.names[i], id, got.names)
+	for i, id := range want {
+		if got[i] != id {
+			t.Errorf("names[%d] = %q, want %q (full %v)", i, got[i], id, got)
 		}
 	}
-	// 主路字段权威：shared 的窗口必须是主路值。
+}
+
+// assertSharedFromPrimary 断言同 id "shared" 的字段取自主路（桌面端）。
+func assertSharedFromPrimary(t *testing.T, infos []ModelInfo) {
+	t.Helper()
 	var shared *ModelInfo
-	for i := range got.infos {
-		if got.infos[i].ID == "shared" {
-			shared = &got.infos[i]
+	for i := range infos {
+		if infos[i].ID == "shared" {
+			shared = &infos[i]
 		}
 	}
 	if shared == nil {

@@ -183,6 +183,24 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
 		r.buckets[key] = b
 	}
+	b.apply(d, ok)
+	r.dirty = true
+}
+
+// tokenTotal 返回本次尝试的 token 合计：优先上游给的 total，缺省用 pt+ct 兜底，
+// 保证总量口径连续（两条链路——总量与积分比例分母——共用同一口径）。
+func (d Delta) tokenTotal() int64 {
+	if d.HasTotal {
+		return d.TotalTokens
+	}
+	if d.HasPromptTokens || d.HasCompletion {
+		return d.PromptTokens + d.CompletionTokens
+	}
+	return 0
+}
+
+// apply 把一次尝试的增量并入桶。
+func (b *bucket) apply(d Delta, ok bool) {
 	b.Req++
 	if !ok {
 		b.Err++
@@ -193,22 +211,13 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	if d.HasCompletion {
 		b.CT += d.CompletionTokens
 	}
-	if d.HasTotal {
-		b.TT += d.TotalTokens
-	} else if d.HasPromptTokens || d.HasCompletion {
-		// 上游没给 total：用 pt+ct 兜底，保证总量口径连续。
-		b.TT += d.PromptTokens + d.CompletionTokens
-	}
+	b.TT += d.tokenTotal()
 	if d.HasCredit {
 		b.CR += d.Credit
 		b.CRN++
 		// 比例只使用同一次请求同时具备 credit 与 token 的样本，避免把
 		// 仅 token 的旧记录或仅 credit 的观测混进分母。
-		if d.HasTotal {
-			b.CRT += d.TotalTokens
-		} else if d.HasPromptTokens || d.HasCompletion {
-			b.CRT += d.PromptTokens + d.CompletionTokens
-		}
+		b.CRT += d.tokenTotal()
 	}
 	if d.HasCacheTokens {
 		b.CH += d.CacheHitTokens
@@ -222,7 +231,6 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
 	}
-	r.dirty = true
 }
 
 // Rollup 把超出 hourlyKeep 的小时桶折叠为日桶（按本地日历日）。
@@ -368,6 +376,7 @@ type Agg struct {
 // 正确加权（不能对每桶的均值再取平均），所以样本数留在这里。
 type aggAcc struct {
 	Agg
+
 	latSum     int64
 	latSamples int64
 	tpsSum     float64
@@ -410,17 +419,19 @@ func (g *aggAcc) finish() Agg {
 
 // KeyedAgg 按某个维度聚合的一行。
 type KeyedAgg struct {
+	Agg
+
 	Key   string `json:"key"`
 	Realm string `json:"realm,omitempty"`
 	Extra string `json:"extra,omitempty"` // 账号行放昵称
-	Agg
 }
 
 // Point 时序上的一个点。
 type Point struct {
+	Agg
+
 	T     string `json:"t"`
 	Scope string `json:"scope"` // "hour" | "day"
-	Agg
 }
 
 // CreditAgg 积分扣除统计的一行。Key 在账号维度是 UID，在模型维度是裸模型名；
@@ -555,7 +566,6 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
 	}
 	from, to := w.bounds()
-	explicit := !w.From.IsZero() || !w.To.IsZero()
 	windowed := !from.IsZero() || !to.IsZero()
 
 	r.mu.Lock()
@@ -565,163 +575,216 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	}
 	r.mu.Unlock()
 
-	var total aggAcc
-	realmAgg := map[string]*aggAcc{}
-	acctAgg := map[string]*aggAcc{}
-	acctRealm := map[string]string{}
-	modelAgg := map[string]*aggAcc{}
-	hourSeries := map[string]*aggAcc{}
-	daySeries := map[string]*aggAcc{}
-	creditAcctAgg := map[string]*creditAcc{}
-	creditModelAgg := map[string]*creditAcc{}
-	rateCache := map[string]string{}
-
+	acc := newSnapshotAcc(nicks, currentRate)
 	// 数据起点（全库最早分片）：不受窗口影响，表示"记录自何时开始"。scope 字典序
 	// 即时间序（同前缀内同格式排序；"d:" 恒早于 "h:"——日桶只来自 90 天前的小时折叠）。
 	since := ""
 	matched := 0
 	for i := range bs {
 		b := &bs[i]
-		if b.Scope < since || since == "" {
+		if since == "" || b.Scope < since {
 			since = b.Scope
 		}
-		if windowed {
-			ts, ok := bucketTime(b.Scope)
-			// 解析失败的脏桶不进窗口聚合（也不该出现在任何口径里）。
-			if !ok {
-				continue
-			}
-			if !from.IsZero() && ts.Before(from) {
-				continue
-			}
-			if !to.IsZero() && ts.After(to) {
-				continue
-			}
+		if !inWindow(b.Scope, from, to, windowed) {
+			continue
 		}
 		matched++
-		total.add(b)
-
-		if realmAgg[b.Realm] == nil {
-			realmAgg[b.Realm] = &aggAcc{}
-		}
-		realmAgg[b.Realm].add(b)
-
-		if acctAgg[b.UID] == nil {
-			acctAgg[b.UID] = &aggAcc{}
-		}
-		acctAgg[b.UID].add(b)
-		// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；
-		// keyed() 的 Realm 字段默认是空的（它按 key 分组，不知道 realm）。
-		if acctRealm[b.UID] == "" {
-			acctRealm[b.UID] = b.Realm
-		}
-
-		if modelAgg[b.Model] == nil {
-			modelAgg[b.Model] = &aggAcc{}
-		}
-		modelAgg[b.Model].add(b)
-
-		if strings.HasPrefix(b.Scope, "h:") {
-			scope := strings.TrimPrefix(b.Scope, "h:")
-			if hourSeries[scope] == nil {
-				hourSeries[scope] = &aggAcc{}
-			}
-			hourSeries[scope].add(b)
-		} else {
-			scope := strings.TrimPrefix(b.Scope, "d:")
-			if daySeries[scope] == nil {
-				daySeries[scope] = &aggAcc{}
-			}
-			daySeries[scope].add(b)
-		}
-		if b.CRN > 0 {
-			ca := creditAcctAgg[b.UID]
-			if ca == nil {
-				ca = &creditAcc{CreditAgg: CreditAgg{
-					Key:      b.UID,
-					Realm:    b.Realm,
-					Nickname: nicks[b.UID],
-				}}
-				creditAcctAgg[b.UID] = ca
-			}
-			ca.add(b)
-
-			model := canonicalUsageModel(b.Model)
-			rate := b.Rate
-			if rate == "" && currentRate != nil {
-				cacheKey := b.Realm + "\x00" + model
-				if cached, ok := rateCache[cacheKey]; ok {
-					rate = cached
-				} else {
-					rate = currentRate(b.Realm, model)
-					rateCache[cacheKey] = rate
-				}
-			}
-			modelKey := model + "\x00" + rate
-			cm := creditModelAgg[modelKey]
-			if cm == nil {
-				cm = &creditAcc{CreditAgg: CreditAgg{Key: model, Rate: rate}}
-				creditModelAgg[modelKey] = cm
-			}
-			cm.add(b)
-		}
+		acc.add(b)
 	}
 
+	snap := acc.snapshot(matched)
+	snap.Since = strings.TrimPrefix(strings.TrimPrefix(since, "h:"), "d:")
+	snap.FileBytes = r.fileBytes()
+	snap.WindowFrom, snap.WindowTo = w.echoBounds()
+	return snap
+}
+
+// inWindow 判断桶 scope 是否落在窗口 [from, to] 内（零值侧不设界）；windowed=false
+// 时全收（全部历史）。scope 解析失败的脏桶不进窗口聚合（也不该出现在任何口径里）。
+func inWindow(scope string, from, to time.Time, windowed bool) bool {
+	if !windowed {
+		return true
+	}
+	ts, ok := bucketTime(scope)
+	if !ok {
+		return false
+	}
+	if !from.IsZero() && ts.Before(from) {
+		return false
+	}
+	if !to.IsZero() && ts.After(to) {
+		return false
+	}
+	return true
+}
+
+// echoBounds 返回需要回显给面板的显式区间（仅显式口径；滚动窗口由 hours 表达，
+// 全部历史没有区间——两者回显都会变成噪音）。
+func (w Window) echoBounds() (string, string) {
+	if w.From.IsZero() && w.To.IsZero() {
+		return "", ""
+	}
+	var from, to string
+	if !w.From.IsZero() {
+		from = w.From.Format(time.RFC3339)
+	}
+	if !w.To.IsZero() {
+		to = w.To.Format(time.RFC3339)
+	}
+	return from, to
+}
+
+// fileBytes 返回落盘文件大小（未落盘或读取失败返回 0）。
+func (r *Recorder) fileBytes() int64 {
+	if r.path == "" {
+		return 0
+	}
+	if fi, err := os.Stat(r.path); err == nil {
+		return fi.Size()
+	}
+	return 0
+}
+
+// snapshotAcc 快照聚合累加器：把逐桶累计分摊到各维度，避免单函数堆叠全部维度。
+type snapshotAcc struct {
+	total          aggAcc
+	realmAgg       map[string]*aggAcc
+	acctAgg        map[string]*aggAcc
+	acctRealm      map[string]string
+	modelAgg       map[string]*aggAcc
+	hourSeries     map[string]*aggAcc
+	daySeries      map[string]*aggAcc
+	creditAcctAgg  map[string]*creditAcc
+	creditModelAgg map[string]*creditAcc
+	rateCache      map[string]string
+	nicks          map[string]string
+	currentRate    func(realm, model string) string
+}
+
+func newSnapshotAcc(nicks map[string]string, currentRate func(realm, model string) string) *snapshotAcc {
+	return &snapshotAcc{
+		realmAgg:       map[string]*aggAcc{},
+		acctAgg:        map[string]*aggAcc{},
+		acctRealm:      map[string]string{},
+		modelAgg:       map[string]*aggAcc{},
+		hourSeries:     map[string]*aggAcc{},
+		daySeries:      map[string]*aggAcc{},
+		creditAcctAgg:  map[string]*creditAcc{},
+		creditModelAgg: map[string]*creditAcc{},
+		rateCache:      map[string]string{},
+		nicks:          nicks,
+		currentRate:    currentRate,
+	}
+}
+
+func (a *snapshotAcc) add(b *bucket) {
+	a.total.add(b)
+	a.addKeyed(a.realmAgg, b.Realm, b)
+	a.addKeyed(a.acctAgg, b.UID, b)
+	// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；keyed() 的 Realm
+	// 字段默认是空的（它按 key 分组，不知道 realm）。
+	if a.acctRealm[b.UID] == "" {
+		a.acctRealm[b.UID] = b.Realm
+	}
+	a.addKeyed(a.modelAgg, b.Model, b)
+
+	if strings.HasPrefix(b.Scope, "h:") {
+		a.addKeyed(a.hourSeries, strings.TrimPrefix(b.Scope, "h:"), b)
+	} else {
+		a.addKeyed(a.daySeries, strings.TrimPrefix(b.Scope, "d:"), b)
+	}
+	if b.CRN > 0 {
+		a.addCredit(b)
+	}
+}
+
+// addKeyed 按 key 取（或新建）该维度的累加器后并入桶。
+func (a *snapshotAcc) addKeyed(m map[string]*aggAcc, key string, b *bucket) {
+	if m[key] == nil {
+		m[key] = &aggAcc{}
+	}
+	m[key].add(b)
+}
+
+// addCredit 并入积分维度：账号行与「裸模型名 + 生效倍率」行。
+func (a *snapshotAcc) addCredit(b *bucket) {
+	ca := a.creditAcctAgg[b.UID]
+	if ca == nil {
+		ca = &creditAcc{CreditAgg: CreditAgg{
+			Key:      b.UID,
+			Realm:    b.Realm,
+			Nickname: a.nicks[b.UID],
+		}}
+		a.creditAcctAgg[b.UID] = ca
+	}
+	ca.add(b)
+
+	model := canonicalUsageModel(b.Model)
+	rate := a.resolveRate(b.Realm, model, b.Rate)
+	modelKey := model + "\x00" + rate
+	cm := a.creditModelAgg[modelKey]
+	if cm == nil {
+		cm = &creditAcc{CreditAgg: CreditAgg{Key: model, Rate: rate}}
+		a.creditModelAgg[modelKey] = cm
+	}
+	cm.add(b)
+}
+
+// resolveRate 旧桶缺倍率时用当前目录倍率回填（带缓存）。rate 非空或未注入
+// currentRate 时原样返回。
+func (a *snapshotAcc) resolveRate(realm, model, rate string) string {
+	if rate != "" || a.currentRate == nil {
+		return rate
+	}
+	cacheKey := realm + "\x00" + model
+	if cached, ok := a.rateCache[cacheKey]; ok {
+		return cached
+	}
+	rate = a.currentRate(realm, model)
+	a.rateCache[cacheKey] = rate
+	return rate
+}
+
+// snapshot 把累加器定型为对外快照（matched 为窗口内命中的桶数）。
+func (a *snapshotAcc) snapshot(matched int) Snapshot {
 	snap := Snapshot{
-		Totals: total.finish(),
-		ByRealm: keyed(realmAgg, func(k string) (string, string) {
+		Totals: a.total.finish(),
+		ByRealm: keyed(a.realmAgg, func(k string) (string, string) {
 			return k, ""
 		}),
-		ByAccount: keyed(acctAgg, func(k string) (string, string) {
-			return k, nicks[k]
+		ByAccount: keyed(a.acctAgg, func(k string) (string, string) {
+			return k, a.nicks[k]
 		}),
-		ByModel:         keyed(modelAgg, func(k string) (string, string) { return k, "" }),
-		CreditByAccount: creditKeyed(creditAcctAgg),
-		CreditByModel:   creditKeyed(creditModelAgg),
+		ByModel:         keyed(a.modelAgg, func(k string) (string, string) { return k, "" }),
+		CreditByAccount: creditKeyed(a.creditAcctAgg),
+		CreditByModel:   creditKeyed(a.creditModelAgg),
 		Buckets:         matched,
 		Generated:       time.Now().Format(time.RFC3339),
 	}
 	for i := range snap.ByAccount {
-		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
+		snap.ByAccount[i].Realm = a.acctRealm[snap.ByAccount[i].Key]
 	}
-
 	// 日点（升序）+ 小时点（升序）拼成一条连续时序。
-	dayKeys := make([]string, 0, len(daySeries))
-	for k := range daySeries {
-		dayKeys = append(dayKeys, k)
-	}
-	sort.Strings(dayKeys)
-	for _, k := range dayKeys {
-		snap.Series = append(snap.Series, Point{T: k, Scope: "day", Agg: daySeries[k].finish()})
-	}
-	hourKeys := make([]string, 0, len(hourSeries))
-	for k := range hourSeries {
-		hourKeys = append(hourKeys, k)
-	}
-	sort.Strings(hourKeys)
-	for _, k := range hourKeys {
-		snap.Series = append(snap.Series, Point{T: k, Scope: "hour", Agg: hourSeries[k].finish()})
-	}
-
-	if r.path != "" {
-		if fi, err := os.Stat(r.path); err == nil {
-			snap.FileBytes = fi.Size()
-		}
-	}
-	// since 去掉 scope 前缀（"h:2026-09-16T13" → "2026-09-16T13"）给前端展示；
-	// 无任何桶时保持空（无数据不伪造起点）。
-	snap.Since = strings.TrimPrefix(strings.TrimPrefix(since, "h:"), "d:")
-	// 回显实际生效的区间：**仅显式区间口径**。滚动窗口由 hours 表达（前端自己
-	// 知道选的是哪个预设），全部历史没有区间——两者回显都会变成噪音。
-	if explicit {
-		if !w.From.IsZero() {
-			snap.WindowFrom = w.From.Format(time.RFC3339)
-		}
-		if !w.To.IsZero() {
-			snap.WindowTo = w.To.Format(time.RFC3339)
-		}
-	}
+	snap.Series = append(seriesPoints(a.daySeries, "day"), seriesPoints(a.hourSeries, "hour")...)
 	return snap
+}
+
+// seriesPoints 把某分片维度的累加器转成升序时序点；无数据返回 nil（保持 JSON
+// 序列化的 null 语义，与历史行为一致）。
+func seriesPoints(m map[string]*aggAcc, scope string) []Point {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pts := make([]Point, 0, len(keys))
+	for _, k := range keys {
+		pts = append(pts, Point{T: k, Scope: scope, Agg: m[k].finish()})
+	}
+	return pts
 }
 
 func canonicalUsageModel(model string) string {
@@ -785,11 +848,6 @@ func (r *Recorder) Describe() string {
 	r.mu.Lock()
 	n := len(r.buckets)
 	r.mu.Unlock()
-	var sz int64
-	if r.path != "" {
-		if fi, err := os.Stat(r.path); err == nil {
-			sz = fi.Size()
-		}
-	}
+	sz := r.fileBytes()
 	return fmt.Sprintf("%d buckets, file %d bytes", n, sz)
 }
