@@ -21,6 +21,8 @@ func TestClassifyCheckin(t *testing.T) {
 		{"inactive-已结束", &Error{Kind: ErrNone, Status: 200, Msg: "活动已结束"}, CheckinInactive},
 		{"inactive-已过期", &Error{Kind: ErrNone, Status: 200, Msg: "活动已过期"}, CheckinInactive},
 		{"failed-业务错误", &Error{Kind: ErrNone, Status: 200, Msg: "请求参数错误"}, CheckinFailed},
+		{"failed-凭证已过期", &Error{Kind: ErrNone, Status: 200, Msg: "登录态已过期，请重新登录"}, CheckinFailed},
+		{"failed-未开启子串无活动", &Error{Kind: ErrNone, Status: 200, Msg: "功能未开启"}, CheckinFailed},
 		{"failed-5xx", &Error{Kind: ErrNone, Status: 500, Msg: "internal error"}, CheckinFailed},
 		{"failed-网络层", errors.New("connection reset"), CheckinFailed},
 	}

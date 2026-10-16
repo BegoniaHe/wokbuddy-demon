@@ -193,11 +193,12 @@ func isPromptTooLongStatus(status int) bool {
 var (
 	alreadyCheckinMarkers = []string{"已签到", "already"}
 	// inactiveCheckinMarkers "活动未开启/未开放/已结束"等非错误态关键词（上游对未开放
-	// 的签到活动返回 code!=0 + 明确文案）。保守取显式短语：未命中即判真失败，避免把
-	// 真失败误当 inactive 而漏报。文案按实测补充（见 issue #27）。
+	// 的签到活动返回 code!=0 + 明确文案）。保守取带「活动」上下文的显式短语：未命中即判
+	// 真失败，避免把真失败误当 inactive 而漏报；也不误伤凭证类文案（如「登录态已过期」
+	// 含「已过期」但非活动态）。文案按实测补充（见 issue #27）。
 	inactiveCheckinMarkers = []string{
-		"活动未开启", "活动未开放", "活动已结束", "活动结束",
-		"未开启", "未开放", "已过期", "inactive",
+		"活动未开启", "活动未开放", "活动已结束", "活动已过期",
+		"inactive",
 	}
 	badParamsMarkerCode = `"code":11101`
 )
