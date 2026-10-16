@@ -171,7 +171,7 @@ func TestRecordUsageNilSafeAndCounts(t *testing.T) {
 	if got.Requests != 2 || got.PromptTokens != 101 || got.CompletionTokens != 202 || got.TotalTokens != 303 {
 		t.Errorf("counters = %+v", got)
 	}
-	if got.LastUsedAt.IsZero() {
+	if got.LastUsedAt == nil || got.LastUsedAt.IsZero() {
 		t.Error("last_used_at not set")
 	}
 }

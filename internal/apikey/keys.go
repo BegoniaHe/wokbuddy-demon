@@ -44,17 +44,17 @@ const (
 
 // Record 一把命名密钥的持久化记录。Hash 为 SHA-256 十六进制串，绝不回显。
 type Record struct {
-	ID               string    `json:"id"`
-	Name             string    `json:"name"`
-	Prefix           string    `json:"prefix"`
-	Hash             string    `json:"hash,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	LastUsedAt       time.Time `json:"last_used_at,omitempty"`
-	Revoked          bool      `json:"revoked,omitempty"`
-	Requests         int64     `json:"requests"`
-	PromptTokens     int64     `json:"prompt_tokens"`
-	CompletionTokens int64     `json:"completion_tokens"`
-	TotalTokens      int64     `json:"total_tokens"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	Prefix           string     `json:"prefix"`
+	Hash             string     `json:"hash,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
+	Revoked          bool       `json:"revoked,omitempty"`
+	Requests         int64      `json:"requests"`
+	PromptTokens     int64      `json:"prompt_tokens"`
+	CompletionTokens int64      `json:"completion_tokens"`
+	TotalTokens      int64      `json:"total_tokens"`
 }
 
 // file 落盘结构。
@@ -256,7 +256,8 @@ func (s *Store) RecordUsage(id string, prompt, completion, total int64) {
 		r.PromptTokens += prompt
 		r.CompletionTokens += completion
 		r.TotalTokens += total
-		r.LastUsedAt = time.Now()
+		now := time.Now()
+		r.LastUsedAt = &now
 		s.dirty = true
 		return
 	}
@@ -274,25 +275,20 @@ func (s *Store) Flush() {
 	}
 }
 
-// flush 防抖落盘：先快照再释放锁写盘，避免写盘阻塞 RecordUsage；失败标记回 dirty。
+// flush 防抖落盘：持锁写盘，与 Create/Revoke/Delete 的落盘同序。若先快照再释放
+// 锁写盘，旧快照会覆盖期间并发变更（内存有、磁盘无），且两个写共用 path+".tmp"
+// 会相互截断导致文件损坏。落盘失败时保持 dirty，下次 tick 重试。
 func (s *Store) flush() {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.path == "" || !s.dirty {
-		s.mu.Unlock()
 		return
 	}
-	snap := make([]Record, len(s.records))
-	copy(snap, s.records)
-	s.dirty = false
-	s.mu.Unlock()
-	if err := writeRecords(s.path, snap); err != nil {
+	if err := s.persistLocked(); err != nil {
 		log.Printf("[apikey] 落盘失败: %v", err)
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
 	}
 }
 
