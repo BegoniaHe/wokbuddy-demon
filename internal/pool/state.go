@@ -304,15 +304,24 @@ func (u *TokenUsage) applyDelta(delta TokenUsageDelta) {
 	if known {
 		u.UsageCount++
 	}
-	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
-		u.LastLatencyMs = delta.LatencyMs
-	}
+	u.setLatestLatency(delta)
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
 		speed := delta.TokensPerSecond
 		u.LastTokensPerSecond = &speed
 	} else {
 		// 失败或缺少 completion_tokens 时不展示上一次请求的旧吞吐速度。
 		u.LastTokensPerSecond = nil
+	}
+}
+
+// setLatestLatency 更新最近一次延迟观测：端到端延迟与首字节延迟（TTFT）分别记录，
+// 仅在字段明确存在且非负时覆盖（缺观测保留旧值）。TTFT 仅流式有观测。
+func (u *TokenUsage) setLatestLatency(delta TokenUsageDelta) {
+	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
+		u.LastLatencyMs = delta.LatencyMs
+	}
+	if delta.HasTTFTMs && delta.TTFTMs >= 0 {
+		u.LastTTFTMs = delta.TTFTMs
 	}
 }
 

@@ -49,25 +49,27 @@ const fileVersion = 4
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`            // cn / global
-	UID   string  `json:"u"`            // 账号 uid
-	Model string  `json:"m"`            // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`            // 请求数（含失败）
-	Err   int64   `json:"e"`            // 失败数
-	PT    int64   `json:"p"`            // prompt tokens
-	CT    int64   `json:"c"`            // completion tokens
-	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`            // 延迟累计（ms）
-	LatN  int64   `json:"ln"`           // 延迟样本数
-	TPS   float64 `json:"v"`            // 吐字速率累计
-	TPSN  int64   `json:"vn"`           // 速率样本数
-	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
-	CH    int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
-	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
+	Scope string  `json:"s"`             // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string  `json:"r"`             // cn / global
+	UID   string  `json:"u"`             // 账号 uid
+	Model string  `json:"m"`             // 上游裸模型名
+	Rate  string  `json:"x,omitempty"`   // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Req   int64   `json:"q"`             // 请求数（含失败）
+	Err   int64   `json:"e"`             // 失败数
+	PT    int64   `json:"p"`             // prompt tokens
+	CT    int64   `json:"c"`             // completion tokens
+	TT    int64   `json:"t"`             // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`             // 延迟累计（ms）
+	LatN  int64   `json:"ln"`            // 延迟样本数
+	TFMs  int64   `json:"tf,omitempty"`  // 首字节延迟（TTFT）累计（ms，仅流式观测）
+	TFN   int64   `json:"tfn,omitempty"` // TTFT 样本数
+	TPS   float64 `json:"v"`             // 吐字速率累计
+	TPSN  int64   `json:"vn"`            // 速率样本数
+	CR    float64 `json:"cr,omitempty"`  // usage.credit 累计（仅明确存在的观测）
+	CRN   int64   `json:"cn,omitempty"`  // usage.credit 样本数（区分缺字段与真实 0）
+	CRT   int64   `json:"ct,omitempty"`  // 同时具备 credit 与 token 的 Token 合计
+	CH    int64   `json:"ch,omitempty"`  // 前缀缓存命中 token 累计（上游回该维度才累计）
+	CM    int64   `json:"cm,omitempty"`  // 前缀缓存未命中 token 累计
 }
 
 // file 落盘结构。
@@ -154,6 +156,8 @@ type Delta struct {
 	CacheMissTokens int64
 	LatencyMs       int64
 	HasLatency      bool
+	TTFTMs          int64
+	HasTTFT         bool
 	TokensPerSecond float64
 	HasTPS          bool
 }
@@ -227,6 +231,10 @@ func (b *bucket) apply(d Delta, ok bool) {
 		b.LatMs += d.LatencyMs
 		b.LatN++
 	}
+	if d.HasTTFT {
+		b.TFMs += d.TTFTMs
+		b.TFN++
+	}
 	if d.HasTPS {
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
@@ -276,6 +284,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.TT += src.TT
 			dst.LatMs += src.LatMs
 			dst.LatN += src.LatN
+			dst.TFMs += src.TFMs
+			dst.TFN += src.TFN
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
 			dst.CR += src.CR
@@ -369,6 +379,7 @@ type Agg struct {
 	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
 	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
 	AvgLatencyMs       float64 `json:"avg_latency_ms"`
+	AvgTTFTMs          float64 `json:"avg_ttft_ms,omitempty"`
 	AvgTPS             float64 `json:"avg_tokens_per_second"`
 }
 
@@ -377,10 +388,12 @@ type Agg struct {
 type aggAcc struct {
 	Agg
 
-	latSum     int64
-	latSamples int64
-	tpsSum     float64
-	tpsSamples int64
+	latSum      int64
+	latSamples  int64
+	ttftSum     int64
+	ttftSamples int64
+	tpsSum      float64
+	tpsSamples  int64
 }
 
 func (g *aggAcc) add(b *bucket) {
@@ -396,6 +409,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.CacheMissTokens += b.CM
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
+	g.ttftSum += b.TFMs
+	g.ttftSamples += b.TFN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
 }
@@ -404,6 +419,9 @@ func (g *aggAcc) finish() Agg {
 	a := g.Agg
 	if g.latSamples > 0 {
 		a.AvgLatencyMs = float64(g.latSum) / float64(g.latSamples)
+	}
+	if g.ttftSamples > 0 {
+		a.AvgTTFTMs = float64(g.ttftSum) / float64(g.ttftSamples)
 	}
 	if g.tpsSamples > 0 {
 		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)

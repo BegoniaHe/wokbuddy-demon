@@ -1211,6 +1211,15 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 	latencyMs := attemptLatencyMs(started)
 	delta.HasLatencyMs = true
 	delta.LatencyMs = latencyMs
+	// TTFT 采样（issue #16）：仅流式有观测（首 data 帧）；非流式 ttfb=0 不写。
+	if ttfb > 0 {
+		ttftMs := ttfb.Milliseconds()
+		if ttftMs < 1 {
+			ttftMs = 1
+		}
+		delta.HasTTFTMs = true
+		delta.TTFTMs = ttftMs
+	}
 	// 耗时 histogram（issue #13）：每次上游尝试观测一次，与用量同源；按是否拿到
 	// usage 分成功/失败（与 recordUsage 的 ok 同口径），失败不再混入整体分位。
 	f.h.metrics.observeRequestDuration(float64(latencyMs)/1000, deltaHasUsage(delta))
@@ -1223,6 +1232,9 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 		}
 	}
 	f.h.cfg.Pool.RecordTokenUsage(uid, delta)
+	// 健康台账（issue #16）：成功口径同 usage（deltaHasUsage），TTFT 有观测才并入。
+	// 只供选号降权，不改判定语义。
+	f.h.cfg.Pool.RecordModelHealth(uid, delta.Model, delta.TTFTMs, delta.HasTTFTMs, deltaHasUsage(delta))
 	// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试没拿到
 	// 任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。失败也计入请求数。
 	f.recordUsage(uid, delta, credit, hasCredit)
@@ -1283,6 +1295,8 @@ func (f *chatFlow) recordUsage(uid string, delta pool.TokenUsageDelta, credit fl
 		ModelRate:        f.modelRate,
 		LatencyMs:        delta.LatencyMs,
 		HasLatency:       delta.HasLatencyMs,
+		TTFTMs:           delta.TTFTMs,
+		HasTTFT:          delta.HasTTFTMs,
 		TokensPerSecond:  delta.TokensPerSecond,
 		HasTPS:           delta.HasTokensPerSecond,
 	}, deltaHasUsage(delta))
