@@ -2,6 +2,7 @@ import { useQuery } from '@tanstack/react-query';
 import {
   BarChart3,
   Boxes,
+  KeyRound,
   MessageSquare,
   Moon,
   Package,
@@ -24,6 +25,7 @@ const NAV: { id: ViewId; icon: LucideIcon }[] = [
   { id: 'packages', icon: Package },
   { id: 'taskscenter', icon: MessageSquare },
   { id: 'models', icon: Boxes },
+  { id: 'keys', icon: KeyRound },
   { id: 'config', icon: Settings },
   { id: 'logs', icon: ScrollText },
 ];

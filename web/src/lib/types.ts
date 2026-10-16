@@ -57,6 +57,19 @@ export interface ModelLock {
   reason?: string;
 }
 
+export interface ApiKey {
+  id: string;
+  name: string;
+  prefix: string;
+  created_at: string;
+  last_used_at?: string;
+  revoked?: boolean;
+  requests?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
 export interface Overview {
   total: number;
   healthy: number;

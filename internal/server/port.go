@@ -33,6 +33,9 @@ type chatInput struct {
 	traceID string
 	// trace 请求观测状态（请求日志出口回填统计）；nil = 未启用请求日志。
 	trace *requestTrace
+	// keyUsage 命名密钥用量累加器（由 withClientAuth 经 context 注入）；
+	// nil = 默认密钥命中或未启用命名密钥，出口不记账。
+	keyUsage *keyUsage
 }
 
 // chatResponder 核心的结构化结果出口。实现方负责把结果编码为具体传输形态

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
@@ -170,6 +171,13 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	// 命名密钥库：与 state 文件同目录（data/api_keys.json）。面板签发/撤销，
+	// 网关 /v1/* 校验（默认 api_key 照旧，命名密钥只作用于 API 面）。
+	keyStore := apikey.New(stateSibling(cfg.StateFile, "api_keys.json"))
+	keyStore.Start()
+	defer keyStore.Stop()
+	log.Printf("[apikey] 命名密钥已启用: %s（%d 把）", stateSibling(cfg.StateFile, "api_keys.json"), len(keyStore.List()))
+
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
 	requestLog := reqlog.New(reqlog.Config{
 		Dir:           stateSibling(cfg.StateFile, "request-logs"),
@@ -190,6 +198,7 @@ func main() {
 		Pool:        p,
 		Usage:       rec,
 		RequestLog:  requestLog,
+		Keys:        keyStore,
 		Upstream:    up,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
@@ -219,6 +228,7 @@ func main() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		Keys:         keyStore,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,

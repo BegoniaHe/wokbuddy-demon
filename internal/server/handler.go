@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
@@ -33,6 +34,9 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
+	// Keys 命名密钥存储（可选；nil = 仅默认 api_key）。命名密钥只用于网关 API
+	// 面（/v1/chat/completions、/v1/models）；/status 仍只认默认密钥。
+	Keys *apikey.Store
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -136,8 +140,10 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry()}
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
+	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
+	h.mux.HandleFunc("GET /v1/models", h.withClientAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
@@ -186,6 +192,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// withAuth 默认密钥鉴权（/status 等运维面）：只认 config.api_key。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
@@ -193,6 +200,28 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		next(w, r)
+	}
+}
+
+// withClientAuth 网关 API 面（/v1/*）的鉴权：默认密钥或任一未撤销命名密钥。
+//
+// 命中命名密钥时挂一个用量累加器到 context，请求结束后计入该密钥的请求数/token
+// 与 last_used_at；默认密钥命中不在此计数（其用量由 usage 记录器承载）。
+// 空默认密钥 + 无命名密钥 = 不鉴权（既有默认，见 httpauth.Authenticate）。
+func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		res := httpauth.Authenticate(r, h.loadLive().APIKey, h.cfg.Keys.Keys())
+		if !res.OK {
+			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		if res.IsDefault || h.cfg.Keys == nil {
+			next(w, r)
+			return
+		}
+		ku := &keyUsage{id: res.KeyID}
+		next(w, r.WithContext(context.WithValue(r.Context(), keyUsageKey{}, ku)))
+		h.cfg.Keys.RecordUsage(ku.id, ku.prompt, ku.completion, ku.total)
 	}
 }
 
@@ -569,6 +598,8 @@ type chatFlow struct {
 	// 统计与追踪
 	st       *chatStat
 	clientIP string
+	// keyUsage 命名密钥用量累加器（nil = 默认密钥/未鉴权请求），出口回填 token。
+	keyUsage *keyUsage
 
 	// 入站头（适配器提取；供 buildChatMeta 组装会话头族）
 	convReqID string
@@ -612,6 +643,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 出口统一释放：先释放在途租约，再落请求流水行（与原 defer 顺序一致）。
 	defer f.st.done()
 	defer f.releaseHeld()
+	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
+	defer f.recordKeyUsage()
 	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
 	if f.runRotation(r.Context()) {
 		return
@@ -655,6 +688,7 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 		bareModel:   bareModel,
 		modelRate:   modelRate,
 		st:          st,
+		keyUsage:    in.keyUsage,
 		tried:       map[string]bool{},
 		convReqID:   in.convReqID,
 		traceID:     in.traceID,
@@ -1257,6 +1291,17 @@ func (f *chatFlow) recordUsage(uid string, delta pool.TokenUsageDelta, credit fl
 // deltaHasUsage 报告本次尝试是否拿到上游 usage（成功口径，与 recordUsage 的 ok 一致）。
 func deltaHasUsage(delta pool.TokenUsageDelta) bool {
 	return delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens
+}
+
+// recordKeyUsage 把本次请求的 token 观测回填到命名密钥用量累加器（无累加器时空操作）。
+// 由 chatCompletions 在出口 defer 调用，早于 withClientAuth 的落账。
+func (f *chatFlow) recordKeyUsage() {
+	if f.keyUsage == nil {
+		return
+	}
+	f.keyUsage.prompt = f.st.promptTokens
+	f.keyUsage.completion = f.st.completionTokens
+	f.keyUsage.total = f.st.totalTokens
 }
 
 // writeFinalError 末端错误透传：轮转耗尽/提前终止后写出最终错误响应。

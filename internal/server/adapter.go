@@ -40,6 +40,7 @@ func newChatInput(w http.ResponseWriter, r *http.Request) (chatInput, chatRespon
 		convReqID: r.Header.Get("X-Conversation-Request-Id"),
 		traceID:   r.Header.Get("X-Trace-Id"),
 		trace:     requestTraceFrom(r),
+		keyUsage:  keyUsageFrom(r.Context()),
 	}
 	return in, &httpResponder{w: w}, true
 }

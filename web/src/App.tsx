@@ -14,6 +14,7 @@ import { UsageView } from '@/views/UsageView';
 import { PackagesView } from '@/views/PackagesView';
 import { TasksCenterView } from '@/views/TasksCenterView';
 import { ModelsView } from '@/views/ModelsView';
+import { KeysView } from '@/views/KeysView';
 import { ConfigView } from '@/views/ConfigView';
 import { LogsView } from '@/views/LogsView';
 
@@ -56,6 +57,8 @@ export default function App() {
         return <TasksCenterView />;
       case 'models':
         return <ModelsView />;
+      case 'keys':
+        return <KeysView />;
       case 'config':
         return <ConfigView />;
       case 'logs':
