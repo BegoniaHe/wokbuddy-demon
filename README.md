@@ -43,7 +43,7 @@ WokBuddy Demon 是一个**自托管的 CodeBuddy 账号成长伴侣**：一只�
 | ⏰ **定时任务** | 签到（09/21 点）+ 活跃上报（10 点）+ 猫猫旅行（09/21 点）+ 保活（22 点）+ 夜猫子（23 点），各自独立开关 |
 | 🎯 **成长任务一键完成** | 18 个成长任务中 **17 个一键纯自动化**，推进进度、等待计分落定并**自动领奖** |
 | 🎲 **连登管家** | 签到末尾自动兑换连登档位 + 抽完抽奖次数，全程无需人工盯 |
-| 📊 **可观测** | 每请求一行表格日志（TTFB / 速率 / uid）；`/healthz` 带身份标识便于宿主探活 |
+| 📊 **可观测** | 每请求一行表格日志（TTFB / 速率 / uid）；`/healthz` 带身份标识便于宿主探活；`/metrics` 暴露 Prometheus 文本指标 |
 | 💾 **状态持久化** | 状态本地原子落盘 + 可选 Redis 异步镜像，重启择新恢复 |
 | 🖥️ **Web 管理面板** | 内嵌面板（React + Tailwind，明暗主题，响应式，七大视图）：账号运维 / 用量分析 / 积分构成 / 任务中心 / 模型档位 / 在线配置 / 运行日志 |
 
@@ -208,7 +208,24 @@ curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
 
 # 健康检查
 curl -s http://localhost:7863/healthz
+
+# Prometheus 指标（文本格式；鉴权与主服务同口径，api_key 为空则无需 token）
+curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 ```
+
+### Prometheus 指标
+
+`GET /metrics` 按 Prometheus 文本格式（`text/plain; version=0.0.4`）导出核心指标，可直接配置为抓取目标：
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `wokbuddy_accounts{state}` | gauge | 分状态账号数（`ok` / `cooling` / `disabled` / `paused` / `in_flight_full`） |
+| `wokbuddy_requests_total{model,result}` | counter | 按模型与结果的请求尝试数（`result` = `ok` / `error`，逐上游尝试计） |
+| `wokbuddy_tokens_total{model,kind}` | counter | 按模型与类别的 Token 数（`kind` = `prompt` / `completion` / `total`） |
+| `wokbuddy_request_duration_seconds` | histogram | 上游尝试耗时（秒） |
+| `wokbuddy_upstream_rotations_total{reason}` | counter | 上游换号次数（`reason` 为触发分类） |
+
+账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram 与换号计数为进程内生命周期，重启清零。鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
 
 ## 配置说明
 

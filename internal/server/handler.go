@@ -80,6 +80,8 @@ type Handler struct {
 	cfg     Config
 	mux     *http.ServeMux
 	degrade degradeGate
+	// metrics 进程内生命周期指标（/metrics 的耗时 histogram 与换号计数）。
+	metrics *metricsRegistry
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
@@ -133,11 +135,13 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
+	h.mux.HandleFunc("GET /metrics", h.withAuth(h.metricsHandler))
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
@@ -581,6 +585,9 @@ type chatFlow struct {
 	modelBlock      pool.ModelBlockStatus
 	degradedApplied bool
 	heldUID         string
+	// rotateReason 本轮换号原因（供 /metrics 的 wokbuddy_upstream_rotations_total
+	// 标签）。各 return rotContinue 分支写入；空值由 metricsRegistry 回落 "other"。
+	rotateReason string
 
 	chatMeta upstream.ChatMeta
 }
@@ -757,9 +764,11 @@ func (f *chatFlow) fail(uid string) {
 // runRotation 执行选号 + 重试轮转。返回 true 表示已写出响应（成功或请求级错误）。
 func (f *chatFlow) runRotation(ctx context.Context) bool {
 	for i := range f.h.cfg.MaxRotate {
+		f.rotateReason = ""
 		switch f.attempt(ctx, i) {
 		case rotContinue:
-			// 换号继续（下一轮）
+			// 换号继续（下一轮）；计入上游轮换指标（issue #13）。
+			f.h.metrics.incRotation(f.rotateReason)
 		case rotDone:
 			return true
 		case rotBreak:
@@ -797,6 +806,7 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		if stop {
 			return rotBreak
 		}
+		f.rotateReason = "refresh"
 		return rotContinue
 	}
 	return f.dispatch(ctx, acct, i)
@@ -827,6 +837,7 @@ func (f *chatFlow) retryAcquireFailed(ctx context.Context, acct *auth.Auth, i in
 		// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
 		return rotBreak
 	}
+	f.rotateReason = "acquire"
 	return rotContinue
 }
 
@@ -911,6 +922,7 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（传输层错误换号退避）
 	}
+	f.rotateReason = "transport"
 	return rotContinue
 }
 
@@ -939,6 +951,7 @@ func (f *chatFlow) handleHTTPError(
 		delete(f.tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 		f.releaseHeld()
 		log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+		f.rotateReason = "degrade"
 		return rotContinue
 	}
 	// 请求级错误（内容防火墙 / 上下文超限 / 图片无效 / 请求体畸形）：换任何账号都会
@@ -961,6 +974,7 @@ func (f *chatFlow) handleHTTPError(
 	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（分类错误换号退避）
 	}
+	f.rotateReason = kind.String()
 	return rotContinue
 }
 
@@ -1160,6 +1174,8 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 	latencyMs := attemptLatencyMs(started)
 	delta.HasLatencyMs = true
 	delta.LatencyMs = latencyMs
+	// 耗时 histogram（issue #13）：每次上游尝试观测一次，与用量同源。
+	f.h.metrics.observeRequestDuration(float64(latencyMs) / 1000)
 	// HasCompletionTokens 是「本次有没有 token 观测」的独立判断，与速率怎么算无关；
 	// 速率本身的边界（TTFB 缺失/超界）收在 tokensPerSecond。
 	if delta.HasCompletionTokens {
