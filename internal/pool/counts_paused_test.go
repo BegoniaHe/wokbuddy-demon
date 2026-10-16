@@ -33,8 +33,22 @@ func TestCountsPausedSeparate(t *testing.T) {
 	if disabled != 2 {
 		t.Errorf("CountsDetailed.disabled=%d want 2（暂停 + 禁用，即 /status 的不可用口径）", disabled)
 	}
+	assertPausedSplitMatches(t, p, total, healthy, disabled)
 
-	// --- 分开口径（面板概况）：禁用与暂停各自计数 ---
+	// --- 按域分组（/status 的 realm 建模）同样保持合并口径 ---
+	// 空 realm = 不加谓词，因此必须与 CountsDetailed 逐项一致；不能用面板的拆分口径
+	// 顺手改掉它。
+	totR, _, _, disR, _ := p.CountsDetailedForRealm("")
+	if totR != total || disR != disabled {
+		t.Errorf("CountsDetailedForRealm(\"\") 应与 CountsDetailed 同口径：(%d,%d) vs (%d,%d)",
+			totR, disR, total, disabled)
+	}
+}
+
+// assertPausedSplitMatches 校验分开口径（面板概况：禁用/暂停各自计数）与合并口径
+// 一致且可互相还原。
+func assertPausedSplitMatches(t *testing.T, p *Pool, total, healthy, disabled int) {
+	t.Helper()
 	t2, h2, _, dis, pz, _ := p.CountsDetailedWithPaused()
 	if t2 != total || h2 != healthy {
 		t.Errorf("两种口径的 total/healthy 必须一致：WithPaused=(%d,%d) Counts=(%d,%d)",
@@ -48,14 +62,5 @@ func TestCountsPausedSeparate(t *testing.T) {
 	}
 	if dis+pz != disabled {
 		t.Errorf("拆分后必须仍能还原合并口径：%d+%d != %d", dis, pz, disabled)
-	}
-
-	// --- 按域分组（/status 的 realm 建模）同样保持合并口径 ---
-	// 空 realm = 不加谓词，因此必须与 CountsDetailed 逐项一致；不能用面板的拆分口径
-	// 顺手改掉它。
-	totR, _, _, disR, _ := p.CountsDetailedForRealm("")
-	if totR != total || disR != disabled {
-		t.Errorf("CountsDetailedForRealm(\"\") 应与 CountsDetailed 同口径：(%d,%d) vs (%d,%d)",
-			totR, disR, total, disabled)
 	}
 }
