@@ -151,6 +151,19 @@ func contentSignature(raw json.RawMessage) string {
 	if s[0] != '[' {
 		return ""
 	}
+	// 非文本 part：type + 原文 sha256 前 8 hex（超长 data: URL 只入短摘要）。
+	return partsSignature(raw, func(typeName string, rawPart json.RawMessage) string {
+		sum := sha256.Sum256(rawPart)
+		return "\n[" + typeName + ":" + hex.EncodeToString(sum[:4]) + "]\n"
+	})
+}
+
+// partsSignature 对多模态 parts 数组做确定性签名：文本 part（type 为 "" 或 "text"）
+// 按原文无缝拼接（与 contentText 完全同口径——全文本 part 的数组签名 == contentText
+// 结果，存量键零漂移）；非文本 part 的渲染交由 renderNonText（各调用方口径不同，
+// 见 contentSignature / userContentSignature）。存在非文本 part 时对整体结果
+// TrimSpace。json 解析失败返回 ""（不伪造）。
+func partsSignature(raw json.RawMessage, renderNonText func(typeName string, rawPart json.RawMessage) string) string {
 	var parts []json.RawMessage
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return ""
@@ -166,15 +179,11 @@ func contentSignature(raw json.RawMessage) string {
 			return ""
 		}
 		if p.Type == "" || p.Type == "text" {
-			// 文本 part：无缝拼接（与 contentText 完全同口径——全文本 part 的数组
-			// 签名 == contentText 结果，存量键零漂移）。
 			b.WriteString(p.Text)
 			continue
 		}
-		// 非文本 part：type + 原文 sha256 前 8 hex（超长 data: URL 只入短摘要）。
 		hasNonText = true
-		sum := sha256.Sum256(pr)
-		fmt.Fprintf(&b, "\n[%s:%s]\n", p.Type, hex.EncodeToString(sum[:4]))
+		b.WriteString(renderNonText(p.Type, pr))
 	}
 	out := b.String()
 	if !hasNonText {
