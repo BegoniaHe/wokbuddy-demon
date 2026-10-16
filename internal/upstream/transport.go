@@ -55,6 +55,11 @@ const (
 	// 作「对端完全不消费」的 stall 上界，与 responseHeaderTimeout 同口径，保证
 	// 半死连接快速失败并可轮换账号（issue #11；参考 Caddy tcpRWTimeoutConn /
 	// Traefik connWithTimeouts 的「包装 conn + 每写设 deadline」做法）。
+	//
+	// HTTP 与 ChatHTTP 共用同一 Transport 实例（client.go），故本超时同时约束
+	// 流式 SSE 与非流式 JSON 两条路径：JSON 路径上传请求体时对端停止消费，也会
+	// 在 writeTimeout 处失败，而不再等到 HTTP.Timeout（120s）。这是有意的跨路径
+	// 收紧，非仅聊天路径生效。
 	writeTimeout = 60 * time.Second
 )
 

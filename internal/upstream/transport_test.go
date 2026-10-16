@@ -142,13 +142,19 @@ func TestTransportWriteDeadlineStalledPeer(t *testing.T) {
 			return
 		}
 		defer c.Close()
+		// 收窄接收缓冲，使 TCP 流控在写入极少数据后即阻塞发送方：不依赖
+		// body 大小恰好超过内核默认缓冲（autotuning 环境可能把缓冲撑大到
+		// 容纳整个 body，导致写不阻塞、测试误等响应头超时）。
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetReadBuffer(1 << 10)
+		}
 		// 永不读取：模拟对端停止消费请求体。
 		<-done
 	}()
 	defer close(done)
 
 	client := &http.Client{Timeout: 0, Transport: newTransportWithWriteTimeout(200 * time.Millisecond)}
-	body := bytes.Repeat([]byte("x"), 4<<20) // 大于 socket 缓冲，写必然阻塞
+	body := bytes.Repeat([]byte("x"), 4<<20) // 远超收端缓冲，写必然阻塞
 	start := time.Now()
 	resp, err := client.Post("http://"+ln.Addr().String()+"/", "application/json", bytes.NewReader(body))
 	if err == nil {
