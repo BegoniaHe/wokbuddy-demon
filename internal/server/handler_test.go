@@ -28,6 +28,9 @@ import (
 // 断言表格行输出的测试（logging_test.go 中的 ChatLogs/LogChatRow 系列）用 withChatLog 临时开启。
 func TestMain(m *testing.M) {
 	chatLogEnabled = false
+	// 测试期去掉轮换退避的真实等待（默认 500ms/次，16 条轮换用例累计约 7s）。
+	// 仅影响轮换间 sleep，不改任何换号/退避决策语义（无测试断言其时长）。
+	rotateBackoffBase = 0
 	os.Exit(m.Run())
 }
 
