@@ -6,6 +6,7 @@
 package upstream
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
@@ -46,6 +47,20 @@ const (
 	// 「Config 未接线/测试裸用」时的安全网——与 config.example.json 的取值
 	// 对齐避免三处口径漂移（transport 60 / config 回落 120 / example 60）。
 	responseHeaderTimeout = 60 * time.Second
+	// writeTimeout 单次出站 Write 的上限（每次 Write 前重设，非整请求总时长）。
+	// 现役此前完全缺失写方向 deadline：聊天 SSE 路径用 http.Client{Timeout:0}
+	// （client.go）且请求 ctx 无 deadline，对端停止读取请求体时 net/http 的 Write
+	// 会无限阻塞——ResponseHeaderTimeout 只在请求完全写完后才计时，DialContext
+	// 只管建连，无任何一层能打断写阶段。健康连接的每次 Write 毫秒级完成，60s 仅
+	// 作「对端完全不消费」的 stall 上界，与 responseHeaderTimeout 同口径，保证
+	// 半死连接快速失败并可轮换账号（issue #11；参考 Caddy tcpRWTimeoutConn /
+	// Traefik connWithTimeouts 的「包装 conn + 每写设 deadline」做法）。
+	//
+	// HTTP 与 ChatHTTP 共用同一 Transport 实例（client.go），故本超时同时约束
+	// 流式 SSE 与非流式 JSON 两条路径：JSON 路径上传请求体时对端停止消费，也会
+	// 在 writeTimeout 处失败，而不再等到 HTTP.Timeout（120s）。这是有意的跨路径
+	// 收紧，非仅聊天路径生效。
+	writeTimeout = 60 * time.Second
 )
 
 // maxIdleConns / maxIdleConnsPerHost 连接池容量（既有值，一并集中定义）。
@@ -63,6 +78,27 @@ func newDialer() *net.Dialer {
 	}
 }
 
+// writeDeadlineConn 包装拨号返回的 net.Conn，在每次 Write 前重设写 deadline，
+// 让「对端停止读取请求体」的写阻塞有上限（issue #11）。只重写 Write：读方向
+// 不设固定 deadline——首字节由 Transport.ResponseHeaderTimeout 管、流中空闲由
+// idle.go 的 monitorBody 接管，加固定 read deadline 会误杀合法长 SSE 流。
+//
+// 不做 Traefik 式的写后清理：每次 Write 前必设新 deadline，且写 deadline 与
+// Read 互不影响，残留的过期写 deadline 不会影响后续读或连接池复用。
+type writeDeadlineConn struct {
+	net.Conn
+
+	writeTimeout time.Duration
+}
+
+func (c *writeDeadlineConn) Write(b []byte) (int, error) {
+	if c.writeTimeout > 0 {
+		// 与标准库一致：设 deadline 失败只忽略（网络层下次写自会报错）。
+		_ = c.SetWriteDeadline(time.Now().Add(c.writeTimeout))
+	}
+	return c.Conn.Write(b)
+}
+
 // newTransport 构造共享出站 Transport（HTTP 与 ChatHTTP 同一实例，连接池不重复）。
 // 分两层防半死连接：
 //   - TLS 层：空 TLSNextProto 真正禁 h2（kongjianguan 二次修正的实证：ForceAttemptHTTP2=false
@@ -71,10 +107,25 @@ func newDialer() *net.Dialer {
 //     完成后无 h2 协议可用，连接退回 HTTP/1.1）。
 //   - TCP 层：DialContext 10s 建连上限 + 15s keepalive 探测，半开连接在建立期
 //     和复用期都能被快速识别（见 dialTimeout/dialKeepAlive 注释）。
+//   - 写方向：拨号返回的 conn 包上 writeDeadlineConn，每次 Write 前设 writeTimeout
+//     上限，写阻塞不再无限（issue #11，见 writeTimeout 注释）。
 func newTransport() *http.Transport {
+	return newTransportWithWriteTimeout(writeTimeout)
+}
+
+// newTransportWithWriteTimeout 是 newTransport 的可测构造：writeTimeout 参数化，
+// 便于测试用小超时验证写 deadline（wt<=0 关闭写 deadline）。
+func newTransportWithWriteTimeout(wt time.Duration) *http.Transport {
 	dialer := newDialer()
+	base := dialer.DialContext
 	return &http.Transport{
-		DialContext: dialer.DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := base(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &writeDeadlineConn{Conn: conn, writeTimeout: wt}, nil
+		},
 		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
 		// nil 表示「让标准库注入默认 h2 映射」（kongjianguan 实测：设
 		// ForceAttemptHTTP2=false 后日志仍报 h2 timeout，正是这个陷阱）。
