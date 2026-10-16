@@ -21,6 +21,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/redisstore"
@@ -412,6 +413,17 @@ func configureUpstream(cfg *Config, up *upstream.Client) {
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
+	// 出站代理池（issue #15）：非空时按健康轮换，失败代理进入冷却；空 = 直连。
+	// URL 合法性已在 config 解析阶段校验（非法即拒绝启动），此处构造理论上不失败。
+	if len(cfg.Upstream.Proxies) > 0 {
+		proxyPool, err := outbound.New(cfg.Upstream.Proxies)
+		if err != nil {
+			log.Printf("WARN: [server] 出站代理配置无效，回退直连: %v", err)
+		} else {
+			up.SetDialer(proxyPool.DialContext)
+			log.Printf("出站代理池已启用：%d 个代理（失败自动冷却轮换）", proxyPool.Len())
+		}
+	}
 }
 
 // logScheduleConfig 启动日志：逐项打印排程启用态与小时。纯日志，无副作用。

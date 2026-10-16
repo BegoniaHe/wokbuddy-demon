@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
 
@@ -149,6 +150,9 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// Proxies 出站代理列表（issue #15）：支持 http://、https://、socks5://
+		// （可选 user:pass）；非空时出站按健康轮换，失败代理进入冷却。空 = 直连（默认）。
+		Proxies []string `json:"proxies"`
 		// RotateMax 单请求最多换号次数，默认 3（issue #17）。
 		RotateMax int `json:"rotate_max"`
 		// RotateBudget 轮换总时长预算（如 "90s"）；"0"/空 = 不限（默认）。与
@@ -513,8 +517,21 @@ func (c *Config) normalize() error {
 	if err := c.normalizePrompt(); err != nil {
 		return err
 	}
+	if err := c.normalizeProxies(); err != nil {
+		return err
+	}
 	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
 	return c.Validate()
+}
+
+// normalizeProxies 校验出站代理 URL（issue #15）：任一非法即拒绝（避免运行时才暴露）。
+func (c *Config) normalizeProxies() error {
+	for _, raw := range c.Upstream.Proxies {
+		if _, err := outbound.ParseProxy(raw); err != nil {
+			return fmt.Errorf("upstream.proxies: %w", err)
+		}
+	}
+	return nil
 }
 
 // Validate 对归一化后的配置做字段范围与跨字段一致性校验（Provision → Validate 的

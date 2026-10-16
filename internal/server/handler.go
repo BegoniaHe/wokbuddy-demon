@@ -20,6 +20,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -970,6 +971,16 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 		f.st.status = http.StatusServiceUnavailable
 		f.lastErr = fmt.Errorf("%w: %w", errUpstreamTimeout, terr)
 		log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
+			logfmt.Label(acct.UID, acct.Nickname), terr)
+		return rotBreak
+	}
+	// 出站代理层拨号失败（issue #15）：不是账号的问题，且同一请求换号仍走同一代理池
+	// ——终止轮转、不惩罚账号（不喂熔断/连败降权），代理池自身已轮换/冷却。
+	if errors.Is(terr, outbound.ErrProxyDial) {
+		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+		f.st.status = http.StatusServiceUnavailable
+		f.lastErr = fmt.Errorf("proxy: %w", terr)
+		log.Printf("WARN: [server] outbound proxy dial failed acct=%s: %v (rotation stopped, account not penalized)",
 			logfmt.Label(acct.UID, acct.Nickname), terr)
 		return rotBreak
 	}
