@@ -75,34 +75,8 @@ func main() {
 	// trial 是 global 专属端点：必须开启 global realm 路由，否则 upstream.New() 的
 	// GlobalEnabled 零值 false 会把请求路由到 CN base（codebuddy.cn）而必然失败。
 	up.GlobalEnabled = true
-	var rows []trialRow
-	for _, f := range files {
-		r := trialRow{uid: filepath.Base(f)}
-		raw, err := os.ReadFile(f)
-		if err != nil {
-			r.status, r.detail = trialFailed, "load: "+err.Error()
-			rows = append(rows, r)
-			continue
-		}
-		a, err := auth.Parse(raw)
-		if err != nil {
-			r.status, r.detail = trialFailed, "parse: "+err.Error()
-			rows = append(rows, r)
-			continue
-		}
-		a.FilePath = f
-		r.uid, r.nick = a.UID, a.Nickname
 
-		// 仅 global 账号适用：CN 明确提示不适用，不发任何请求。
-		if !a.IsGlobal() {
-			r.status, r.detail = trialNotApp, "CN account not applicable"
-			rows = append(rows, r)
-			continue
-		}
-
-		r.status, r.detail = classifyTrial(up.ClaimTrial(a))
-		rows = append(rows, r)
-	}
+	rows := collectTrialRows(files, up)
 
 	var okN, alreadyN, notAppN, failN int
 	fmt.Printf("uid                                  | nick        | status  | detail\n")
@@ -123,6 +97,41 @@ func main() {
 	}
 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
 		len(rows), okN, alreadyN, notAppN, failN)
+}
+
+// collectTrialRows 逐个 auth 文件领取 trial，返回每账号结果行（顺序与 files 一致）。
+func collectTrialRows(files []string, up *upstream.Client) []trialRow {
+	rows := make([]trialRow, 0, len(files))
+	for _, f := range files {
+		rows = append(rows, trialForFile(f, up))
+	}
+	return rows
+}
+
+// trialForFile 处理单个账号：读取/解析失败记 FAIL；非 global 账号明确不适用（不发请求）；
+// 其余调用 ClaimTrial 归一化结果。
+func trialForFile(f string, up *upstream.Client) trialRow {
+	r := trialRow{uid: filepath.Base(f)}
+	raw, err := os.ReadFile(f)
+	if err != nil {
+		r.status, r.detail = trialFailed, "load: "+err.Error()
+		return r
+	}
+	a, err := auth.Parse(raw)
+	if err != nil {
+		r.status, r.detail = trialFailed, "parse: "+err.Error()
+		return r
+	}
+	a.FilePath = f
+	r.uid, r.nick = a.UID, a.Nickname
+
+	// 仅 global 账号适用：CN 明确提示不适用，不发任何请求。
+	if !a.IsGlobal() {
+		r.status, r.detail = trialNotApp, "CN account not applicable"
+		return r
+	}
+	r.status, r.detail = classifyTrial(up.ClaimTrial(a))
+	return r
 }
 
 func trunc(s string, n int) string {

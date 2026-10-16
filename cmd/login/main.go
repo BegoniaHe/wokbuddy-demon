@@ -76,14 +76,14 @@ func commonHeaders(origin string) func(*http.Request) {
 	}
 }
 
-// apiEnvelope 与 main.go:429-433 一致
+// apiEnvelope 与 main.go:429-433 一致。
 type apiEnvelope struct {
 	Code int             `json:"code"`
 	Msg  string          `json:"msg"`
 	Data json.RawMessage `json:"data"`
 }
 
-// doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error
+// doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error。
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
 	if err != nil {
@@ -117,7 +117,7 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 	return env.Data, resp.StatusCode, nil
 }
 
-func fatal(format string, args ...any) {
+func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "login: "+format+"\n", args...)
 	exitFunc(1)
 }
@@ -125,6 +125,21 @@ func fatal(format string, args ...any) {
 type loginState struct {
 	State string `json:"state"`
 	Realm string `json:"realm,omitempty"` // url 落盘时写回的 realm，poll 读回校验防混域
+}
+
+// tokenBundle 是 auth/token 成功返回的凭证包。
+type tokenBundle struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int64  `json:"expiresIn"`
+	Domain       string `json:"domain"`
+}
+
+// accountInfo 是 login/account 返回的账号标识。
+type accountInfo struct {
+	UID          string `json:"uid"`
+	EnterpriseID string `json:"enterpriseId"`
+	Nickname     string `json:"nickname"`
 }
 
 // realm 取值枚举（与 internal/auth 的 Realm() 归一化输出一致）。
@@ -211,21 +226,21 @@ func runURL(base, origin, realm, statePath string, client *http.Client, out io.W
 	headers := commonHeaders(origin)
 	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		fatal("auth state failed: %v", err)
+		fatalf("auth state failed: %v", err)
 	}
 	var st struct {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
 	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
-		fatal("auth state: missing state or authUrl")
+		fatalf("auth state: missing state or authUrl")
 	}
 	raw, merr := json.Marshal(loginState{State: st.State, Realm: realm})
 	if merr != nil {
-		fatal("marshal state: %v", merr)
+		fatalf("marshal state: %v", merr)
 	}
 	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
-		fatal("write state: %v", err)
+		fatalf("write state: %v", err)
 	}
 	fmt.Fprintln(out, st.AuthURL)
 }
@@ -234,72 +249,72 @@ func runURL(base, origin, realm, statePath string, client *http.Client, out io.W
 // GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
 // statePath 可注入临时文件便于测试。
 func runPoll(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
-	raw, err := os.ReadFile(statePath)
-	if err != nil {
-		fatal("read state: %v (先跑 login url)", err)
-	}
-	var ls loginState
-	if err := json.Unmarshal(raw, &ls); err != nil {
-		fatal("parse state: %v", err)
-	}
-	// 防混域：state 落盘 realm 与命令行 --realm 不一致则拒绝（url 与 poll 必须同域）
-	if err := validateRealmMatch(ls.Realm, realm); err != nil {
-		fatal("%v", err)
-	}
+	ls := loadLoginState(statePath, realm)
 	headers := commonHeaders(origin)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+ls.State, headers, nil)
-	if errTok != nil {
-		if status == 0 || status >= 500 {
-			fatal("token endpoint error: %v", errTok)
-		}
-		fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
-	}
-	var tok struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int64  `json:"expiresIn"`
-		Domain       string `json:"domain"`
-	}
-	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-		fatal("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
-	}
+	tok := pollToken(base, ls.State, headers, client)
 	// login/account 拿 uid/nickname（带 Bearer）
-	var acct struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-	}
-	acctHeaders := func(r *http.Request) {
-		headers(r)
-		r.Header.Set("Authorization", "Bearer "+tok.AccessToken)
-	}
-	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+ls.State, acctHeaders, nil); errAcct == nil {
-		_ = json.Unmarshal(acctRaw, &acct)
-	}
+	acct := pollAccount(base, ls.State, tok.AccessToken, headers, client)
 	oraw, oerr := json.Marshal(buildLoginOutput(tok, realm, acct))
 	if oerr != nil {
-		fatal("marshal output: %v", oerr)
+		fatalf("marshal output: %v", oerr)
 	}
 	fmt.Fprintln(out, string(oraw))
 	os.Remove(statePath)
 }
 
+// loadLoginState 读取并解析 state 文件，校验 realm 与命令行 --realm 一致（防混域），
+// 任一步失败即 fatal（url 与 poll 必须同域）。
+func loadLoginState(statePath, realm string) loginState {
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		fatalf("read state: %v (先跑 login url)", err)
+	}
+	var ls loginState
+	if err := json.Unmarshal(raw, &ls); err != nil {
+		fatalf("parse state: %v", err)
+	}
+	if err := validateRealmMatch(ls.Realm, realm); err != nil {
+		fatalf("%v", err)
+	}
+	return ls
+}
+
+// pollToken 向 token 端点 GET 一次：pending（业务 code 非 0）或服务端错误时 fatal，
+// 成功返回 token bundle。
+func pollToken(base, state string, headers func(*http.Request), client *http.Client) tokenBundle {
+	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil)
+	if errTok != nil {
+		if status == 0 || status >= 500 {
+			fatalf("token endpoint error: %v", errTok)
+		}
+		fatalf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+	}
+	var tok tokenBundle
+	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
+		fatalf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+	}
+	return tok
+}
+
+// pollAccount 带 Bearer 拉取 login/account；失败时返回零值（与旧行为一致，不中断输出）。
+func pollAccount(base, state, accessToken string, headers func(*http.Request), client *http.Client) accountInfo {
+	var acct accountInfo
+	acctHeaders := func(r *http.Request) {
+		headers(r)
+		r.Header.Set("Authorization", "Bearer "+accessToken)
+	}
+	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+state, acctHeaders, nil); errAcct == nil {
+		_ = json.Unmarshal(acctRaw, &acct)
+	}
+	return acct
+}
+
 // buildLoginOutput 组装 poll 输出的完整 JSON（login.sh 据此落盘 auth 文件）。
 // realm 永不空：显式 --realm 优先（ResolveRealm 处理），否则按上游返回的 domain 推断——
 // 保证登录落盘的 auth 文件恒带 realm 键。
-func buildLoginOutput(tok struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ExpiresIn    int64  `json:"expiresIn"`
-	Domain       string `json:"domain"`
-}, realm string, acct struct {
-	UID          string `json:"uid"`
-	EnterpriseID string `json:"enterpriseId"`
-	Nickname     string `json:"nickname"`
-},
-) map[string]any {
+func buildLoginOutput(tok tokenBundle, realm string, acct accountInfo) map[string]any {
 	return map[string]any{
 		"access_token":  tok.AccessToken,
 		"refresh_token": tok.RefreshToken,
@@ -315,10 +330,10 @@ func buildLoginOutput(tok struct {
 func main() {
 	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
-		fatal("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
+		fatalf("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
 	}
 	if len(rest) < 1 {
-		fatal("usage: login [--realm=cn|global] <url|poll>")
+		fatalf("usage: login [--realm=cn|global] <url|poll>")
 	}
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
 	jar, _ := cookiejar.New(nil)
@@ -340,6 +355,6 @@ func main() {
 		fmt.Println(realm)
 
 	default:
-		fatal("unknown subcommand %q (want url|poll|realm)", rest[0])
+		fatalf("unknown subcommand %q (want url|poll|realm)", rest[0])
 	}
 }

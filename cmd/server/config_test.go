@@ -53,34 +53,24 @@ func TestLoggingDefaults(t *testing.T) {
 	if err := c.normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if !c.Logging.RequestArchiveEnabled || c.Logging.RequestRetentionDays != 7 || c.Logging.RequestArchiveMaxMB != 100 {
-		t.Fatalf("logging defaults = %+v", c.Logging)
-	}
+	checkLoggingArchive(t, "default",
+		c.Logging.RequestArchiveEnabled, c.Logging.RequestRetentionDays, c.Logging.RequestArchiveMaxMB,
+		true, 7, 100)
 	// 来源记录（IP/UA）缺省开启：键缺席时必须保持 true，只有显式 false 才关闭。
-	if !c.Logging.RequestClientInfo {
-		t.Fatalf("request_client_info default = false, want true: %+v", c.Logging)
-	}
-	configured, err := ParseConfig([]byte(`{"logging":{"request_archive_enabled":false,"request_retention_days":30,"request_archive_max_mb":500}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if configured.Logging.RequestArchiveEnabled || configured.Logging.RequestRetentionDays != 30 || configured.Logging.RequestArchiveMaxMB != 500 {
-		t.Fatalf("configured logging = %+v", configured.Logging)
-	}
-	off, err := ParseConfig([]byte(`{"logging":{"request_client_info":false}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if off.Logging.RequestClientInfo {
-		t.Fatalf("explicit false ignored: %+v", off.Logging)
-	}
-	fallback, err := ParseConfig([]byte(`{"logging":{"request_retention_days":0,"request_archive_max_mb":0}}`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fallback.Logging.RequestRetentionDays != 7 || fallback.Logging.RequestArchiveMaxMB != 100 {
-		t.Fatalf("logging fallback = %+v", fallback.Logging)
-	}
+	checkBool(t, "request_client_info default", c.Logging.RequestClientInfo, true)
+
+	configured := mustParseConfig(t, `{"logging":{"request_archive_enabled":false,"request_retention_days":30,"request_archive_max_mb":500}}`)
+	checkLoggingArchive(t, "configured",
+		configured.Logging.RequestArchiveEnabled, configured.Logging.RequestRetentionDays, configured.Logging.RequestArchiveMaxMB,
+		false, 30, 500)
+
+	off := mustParseConfig(t, `{"logging":{"request_client_info":false}}`)
+	checkBool(t, "explicit false request_client_info", off.Logging.RequestClientInfo, false)
+
+	fallback := mustParseConfig(t, `{"logging":{"request_retention_days":0,"request_archive_max_mb":0}}`)
+	checkLoggingArchive(t, "fallback",
+		fallback.Logging.RequestArchiveEnabled, fallback.Logging.RequestRetentionDays, fallback.Logging.RequestArchiveMaxMB,
+		true, 7, 100)
 }
 
 func TestLoadFile(t *testing.T) {
@@ -136,42 +126,24 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if c.Pool.MaxInFlight != 3 {
-		t.Errorf("max_in_flight=%d want 3", c.Pool.MaxInFlight)
-	}
-	if c.Pool.BreakerThreshold != 3 {
-		t.Errorf("breaker_threshold=%d want 3", c.Pool.BreakerThreshold)
-	}
-	if c.BreakerCooldownDur.Minutes() != 30 {
-		t.Errorf("breaker_cooldown=%v want 30m", c.BreakerCooldownDur)
-	}
-	if c.BreakerCooldownMaxD.Hours() != 6 {
-		t.Errorf("breaker_cooldown_max=%v want 6h", c.BreakerCooldownMaxD)
-	}
-	if c.Pool.IdleWeightPerHour != 0.5 || c.Pool.IdleWeightMax != 5.0 {
-		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
-	}
-	if !c.Pool.PreferExpiring || c.ExpiringSoonDur != 7*24*time.Hour {
-		t.Errorf("expiring defaults: enabled=%v window=%v", c.Pool.PreferExpiring, c.ExpiringSoonDur)
-	}
-	if c.SoftRateMaxDur.Hours() != 2 {
-		t.Errorf("soft_rate_max=%v want 2h", c.SoftRateMaxDur)
-	}
-	if !c.SessionSticky.Enabled {
-		t.Error("session_sticky.enabled want true")
-	}
-	if c.SessionTTL.Minutes() != 30 || c.SessionGCInterval.Minutes() != 5 {
-		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
-	}
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		t.Errorf("upstash default should be empty: %+v", c.Upstash)
-	}
+	checkInt(t, "max_in_flight", c.Pool.MaxInFlight, 3)
+	checkInt(t, "breaker_threshold", c.Pool.BreakerThreshold, 3)
+	checkDur(t, "breaker_cooldown", c.BreakerCooldownDur, 30*time.Minute)
+	checkDur(t, "breaker_cooldown_max", c.BreakerCooldownMaxD, 6*time.Hour)
+	checkFloat(t, "idle_weight_per_hour", c.Pool.IdleWeightPerHour, 0.5)
+	checkFloat(t, "idle_weight_max", c.Pool.IdleWeightMax, 5.0)
+	checkBool(t, "prefer_expiring", c.Pool.PreferExpiring, true)
+	checkDur(t, "expiring_soon", c.ExpiringSoonDur, 7*24*time.Hour)
+	checkDur(t, "soft_rate_max", c.SoftRateMaxDur, 2*time.Hour)
+	checkBool(t, "session_sticky.enabled", c.SessionSticky.Enabled, true)
+	checkDur(t, "session_sticky.ttl", c.SessionTTL, 30*time.Minute)
+	checkDur(t, "session_sticky.gc_interval", c.SessionGCInterval, 5*time.Minute)
+	checkStr(t, "upstash.url", c.Upstash.URL, "")
+	checkStr(t, "upstash.token", c.Upstash.Token, "")
 }
 
 func TestPoolConfigParsedFromFile(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{
+	c := loadTempConfig(t, `{
 		"upstash":{"url":"https://foo.upstash.io","token":"tok"},
 		"pool":{
 			"max_in_flight":5,
@@ -184,32 +156,20 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 			"expiring_soon":"72h"
 		},
 		"session_sticky":{"enabled":false,"ttl":"1h","gc_interval":"2m"}
-	}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Upstash.URL != "https://foo.upstash.io" || c.Upstash.Token != "tok" {
-		t.Errorf("upstash=%+v", c.Upstash)
-	}
-	if c.Pool.MaxInFlight != 5 || c.Pool.BreakerThreshold != 4 {
-		t.Errorf("pool=%+v", c.Pool)
-	}
-	if c.BreakerCooldownDur.Minutes() != 10 || c.BreakerCooldownMaxD.Hours() != 2 {
-		t.Errorf("breaker durations=%v/%v", c.BreakerCooldownDur, c.BreakerCooldownMaxD)
-	}
-	if c.Pool.IdleWeightPerHour != 0.7 || c.Pool.IdleWeightMax != 8.0 {
-		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
-	}
-	if c.Pool.PreferExpiring || c.ExpiringSoonDur != 72*time.Hour {
-		t.Errorf("expiring override: enabled=%v window=%v", c.Pool.PreferExpiring, c.ExpiringSoonDur)
-	}
-	if c.SessionSticky.Enabled {
-		t.Error("session_sticky.enabled want false from file")
-	}
-	if c.SessionTTL.Hours() != 1 || c.SessionGCInterval.Minutes() != 2 {
-		t.Errorf("session durations=%v/%v", c.SessionTTL, c.SessionGCInterval)
-	}
+	}`)
+	checkStr(t, "upstash.url", c.Upstash.URL, "https://foo.upstash.io")
+	checkStr(t, "upstash.token", c.Upstash.Token, "tok")
+	checkInt(t, "max_in_flight", c.Pool.MaxInFlight, 5)
+	checkInt(t, "breaker_threshold", c.Pool.BreakerThreshold, 4)
+	checkDur(t, "breaker_cooldown", c.BreakerCooldownDur, 10*time.Minute)
+	checkDur(t, "breaker_cooldown_max", c.BreakerCooldownMaxD, 2*time.Hour)
+	checkFloat(t, "idle_weight_per_hour", c.Pool.IdleWeightPerHour, 0.7)
+	checkFloat(t, "idle_weight_max", c.Pool.IdleWeightMax, 8.0)
+	checkBool(t, "prefer_expiring", c.Pool.PreferExpiring, false)
+	checkDur(t, "expiring_soon", c.ExpiringSoonDur, 72*time.Hour)
+	checkBool(t, "session_sticky.enabled", c.SessionSticky.Enabled, false)
+	checkDur(t, "session_sticky.ttl", c.SessionTTL, 1*time.Hour)
+	checkDur(t, "session_sticky.gc_interval", c.SessionGCInterval, 2*time.Minute)
 }
 
 func TestSoftRateMaxParsedFromFile(t *testing.T) {
@@ -372,48 +332,26 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 	if err := c.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
-		t.Errorf("enabled defaults want true/true, got %v/%v",
-			c.Schedule.CheckinEnabled, c.Schedule.KeepaliveEnabled)
-	}
-	if !c.Schedule.TravelEnabled || !c.Schedule.ActivityEnabled {
-		t.Errorf("travel/activity enabled defaults want true/true, got %v/%v",
-			c.Schedule.TravelEnabled, c.Schedule.ActivityEnabled)
-	}
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want [9,21]", c.Schedule.TravelHours)
-	}
-	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
-	}
+	checkBool(t, "checkin_enabled", c.Schedule.CheckinEnabled, true)
+	checkBool(t, "keepalive_enabled", c.Schedule.KeepaliveEnabled, true)
+	checkBool(t, "travel_enabled", c.Schedule.TravelEnabled, true)
+	checkBool(t, "activity_enabled", c.Schedule.ActivityEnabled, true)
+	checkHours(t, "travel_hours", c.Schedule.TravelHours, []int{9, 21})
+	checkHours(t, "activity_hours", c.Schedule.ActivityHours, []int{10})
 }
 
 // TestScheduleLegacyConfigKeepsRunning 老 config（只写签到/保活小时数组，无新键）加载后仍是启用态，
 // 新开关缺省 true、新 hours 回落默认——对老配置零影响。
 func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"schedule":{"checkin_hours":[9,21],"keepalive_hours":[22]}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
-		t.Errorf("legacy config must stay enabled: %+v", c.Schedule)
-	}
-	if !c.Schedule.TravelEnabled || !c.Schedule.ActivityEnabled {
-		t.Errorf("new switches must default true on legacy config: %+v", c.Schedule)
-	}
-	if len(c.Schedule.CheckinHours) != 2 {
-		t.Errorf("checkin_hours=%v", c.Schedule.CheckinHours)
-	}
+	c := loadTempConfig(t, `{"schedule":{"checkin_hours":[9,21],"keepalive_hours":[22]}}`)
+	checkBool(t, "checkin_enabled", c.Schedule.CheckinEnabled, true)
+	checkBool(t, "keepalive_enabled", c.Schedule.KeepaliveEnabled, true)
+	checkBool(t, "travel_enabled", c.Schedule.TravelEnabled, true)
+	checkBool(t, "activity_enabled", c.Schedule.ActivityEnabled, true)
+	checkHours(t, "checkin_hours", c.Schedule.CheckinHours, []int{9, 21})
 	// 新 hours 缺省 → 回落默认（非空）。
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want default [9,21]", c.Schedule.TravelHours)
-	}
-	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
-	}
+	checkHours(t, "travel_hours", c.Schedule.TravelHours, []int{9, 21})
+	checkHours(t, "activity_hours", c.Schedule.ActivityHours, []int{10})
 }
 
 // TestScheduleExplicitDisable 显式 checkin_enabled=false 即可真正关掉签到
@@ -440,27 +378,15 @@ func TestScheduleExplicitDisable(t *testing.T) {
 
 // TestScheduleTravelActivityExplicitDisable 显式关闭旅行/活跃上报开关。
 func TestScheduleTravelActivityExplicitDisable(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"schedule":{"travel_enabled":false,"activity_enabled":false}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Schedule.TravelEnabled || c.Schedule.ActivityEnabled {
-		t.Errorf("want travel/activity disabled: %+v", c.Schedule)
-	}
+	c := loadTempConfig(t, `{"schedule":{"travel_enabled":false,"activity_enabled":false}}`)
+	checkBool(t, "travel_enabled", c.Schedule.TravelEnabled, false)
+	checkBool(t, "activity_enabled", c.Schedule.ActivityEnabled, false)
 	// 签到/保活开关缺省 true（互不干扰）。
-	if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
-		t.Errorf("checkin/keepalive should stay enabled: %+v", c.Schedule)
-	}
+	checkBool(t, "checkin_enabled", c.Schedule.CheckinEnabled, true)
+	checkBool(t, "keepalive_enabled", c.Schedule.KeepaliveEnabled, true)
 	// hours 仍回落默认。
-	if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-		t.Errorf("travel_hours=%v want default [9,21] even when disabled", c.Schedule.TravelHours)
-	}
-	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-		t.Errorf("activity_hours=%v want default [10] even when disabled", c.Schedule.ActivityHours)
-	}
+	checkHours(t, "travel_hours", c.Schedule.TravelHours, []int{9, 21})
+	checkHours(t, "activity_hours", c.Schedule.ActivityHours, []int{10})
 }
 
 // TestScheduleTravelActivityInvalidHoursRejected 旅行/活跃非法小时报错并指向正确开关。
@@ -529,33 +455,23 @@ func TestScheduleEmptyHoursFallsBackToDefault(t *testing.T) {
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			fp := filepath.Join(dir, "c.json")
-			os.WriteFile(fp, []byte(body), 0o600)
-			c, err := Load(fp)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(c.Schedule.CheckinHours) != 2 || c.Schedule.CheckinHours[0] != 9 || c.Schedule.CheckinHours[1] != 21 {
-				t.Errorf("checkin_hours=%v want default [9 21]", c.Schedule.CheckinHours)
-			}
-			if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 22 {
-				t.Errorf("keepalive_hours=%v want default [22]", c.Schedule.KeepaliveHours)
-			}
-			if len(c.Schedule.TravelHours) != 2 || c.Schedule.TravelHours[0] != 9 || c.Schedule.TravelHours[1] != 21 {
-				t.Errorf("travel_hours=%v want default [9 21]", c.Schedule.TravelHours)
-			}
-			if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
-				t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
-			}
-			if !c.Schedule.CheckinEnabled || !c.Schedule.KeepaliveEnabled {
-				t.Errorf("empty hours must not imply disabled: %+v", c.Schedule)
-			}
-			if !c.Schedule.TravelEnabled || !c.Schedule.ActivityEnabled {
-				t.Errorf("empty hours must not imply disabled: %+v", c.Schedule)
-			}
+			assertEmptyHoursDefaults(t, loadTempConfig(t, body))
 		})
 	}
+}
+
+// assertEmptyHoursDefaults 断言未配置小时数组时的回落结果：四个小时数组回默认，
+// 且四个开关保持缺省 true（空 hours 不蕴含禁用）。
+func assertEmptyHoursDefaults(t *testing.T, c *Config) {
+	t.Helper()
+	checkHours(t, "checkin_hours", c.Schedule.CheckinHours, []int{9, 21})
+	checkHours(t, "keepalive_hours", c.Schedule.KeepaliveHours, []int{22})
+	checkHours(t, "travel_hours", c.Schedule.TravelHours, []int{9, 21})
+	checkHours(t, "activity_hours", c.Schedule.ActivityHours, []int{10})
+	checkBool(t, "checkin_enabled", c.Schedule.CheckinEnabled, true)
+	checkBool(t, "keepalive_enabled", c.Schedule.KeepaliveEnabled, true)
+	checkBool(t, "travel_enabled", c.Schedule.TravelEnabled, true)
+	checkBool(t, "activity_enabled", c.Schedule.ActivityEnabled, true)
 }
 
 // TestScheduleInvalidHourRejected 非法小时快速失败：指向正确的禁用开关，避免用户
@@ -600,26 +516,34 @@ func TestWriteDefault(t *testing.T) {
 	if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
 		t.Errorf("key=%q want sk-<random>", key)
 	}
-	if key2, _ := WriteDefault(filepath.Join(dir, "another.json")); key2 == key {
+	key2, err := WriteDefault(filepath.Join(dir, "another.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key2 == key {
 		t.Errorf("two generated keys identical: %q", key)
 	}
 	// 落盘文件可被 Load 正常加载，推荐值齐备且 api_key 生效
+	assertWrittenDefaults(t, fp, key)
+	// 已存在的文件不覆盖：二次写入同一路径必须报错
+	if _, err := WriteDefault(fp); err == nil {
+		t.Error("WriteDefault must refuse to overwrite existing file")
+	}
+}
+
+// assertWrittenDefaults 断言 WriteDefault 产出的文件可加载、api_key 生效且推荐值齐备。
+func assertWrittenDefaults(t *testing.T, fp, key string) {
+	t.Helper()
 	c, err := Load(fp)
 	if err != nil {
 		t.Fatalf("load generated config: %v", err)
 	}
-	if c.APIKey != key {
-		t.Errorf("api_key=%q want %q", c.APIKey, key)
-	}
+	checkStr(t, "api_key", c.APIKey, key)
 	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
 		t.Errorf("generated defaults off: %+v", c)
 	}
 	if len(c.Schedule.CheckinHours) == 0 || !c.Schedule.CheckinEnabled {
 		t.Errorf("generated schedule off: %+v", c.Schedule)
-	}
-	// 已存在的文件不覆盖：二次写入同一路径必须报错
-	if _, err := WriteDefault(fp); err == nil {
-		t.Error("WriteDefault must refuse to overwrite existing file")
 	}
 }
 
@@ -857,5 +781,94 @@ func TestServerReadTimeout(t *testing.T) {
 	c.Server.ReadTimeout = "bogus"
 	if err := c.normalize(); err == nil {
 		t.Error("unparsable read_timeout should fail fast")
+	}
+}
+
+// mustParseConfig 解析一段配置 JSON（不读环境变量），失败即终止测试。
+func mustParseConfig(t *testing.T, body string) *Config {
+	t.Helper()
+	c, err := ParseConfig([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// writeTempConfig 把 body 写入临时目录下的 c.json，返回文件路径。
+func writeTempConfig(t *testing.T, body string) string {
+	t.Helper()
+	fp := filepath.Join(t.TempDir(), "c.json")
+	if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fp
+}
+
+// loadTempConfig 写入临时配置并 Load，失败即终止测试。
+func loadTempConfig(t *testing.T, body string) *Config {
+	t.Helper()
+	c, err := Load(writeTempConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+func checkInt(t *testing.T, name string, got, want int) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s=%d want %d", name, got, want)
+	}
+}
+
+func checkFloat(t *testing.T, name string, got, want float64) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s=%v want %v", name, got, want)
+	}
+}
+
+func checkBool(t *testing.T, name string, got, want bool) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s=%v want %v", name, got, want)
+	}
+}
+
+func checkStr(t *testing.T, name, got, want string) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s=%q want %q", name, got, want)
+	}
+}
+
+func checkDur(t *testing.T, name string, got, want time.Duration) {
+	t.Helper()
+	if got != want {
+		t.Errorf("%s=%v want %v", name, got, want)
+	}
+}
+
+// checkHours 断言小时数组与期望逐元素相等（长度与顺序都校验）。
+func checkHours(t *testing.T, name string, got, want []int) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("%s=%v want %v", name, got, want)
+		return
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("%s=%v want %v", name, got, want)
+			return
+		}
+	}
+}
+
+// checkLoggingArchive 断言归档三项（开关 / 保留天数 / 上限 MiB）。
+func checkLoggingArchive(t *testing.T, tag string, enabled bool, days, mb int, wantEnabled bool, wantDays, wantMB int) {
+	t.Helper()
+	if enabled != wantEnabled || days != wantDays || mb != wantMB {
+		t.Fatalf("%s logging archive = enabled=%v days=%d mb=%d, want %v/%d/%d",
+			tag, enabled, days, mb, wantEnabled, wantDays, wantMB)
 	}
 }
