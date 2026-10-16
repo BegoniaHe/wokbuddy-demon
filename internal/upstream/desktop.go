@@ -1,16 +1,17 @@
-// desktop.go 桌面客户端（WorkBuddy Desktop 5.5.6）行为指纹上报。
+// desktop.go 桌面客户端（WorkBuddy Desktop）行为指纹上报。
 //
-// 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）。桌面端点亮
-// 「需电脑端」类任务的关键不是独立端点，而是同一 POST /v2/report 通道上
-// **不同的客户端指纹**：
+// 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）+ 官方分发包
+// app.asar 逆向（CN 5.8.2 / global 5.7.6）。桌面端点亮「需电脑端」类任务的关键
+// 不是独立端点，而是同一 POST /v2/report 通道上**不同的客户端指纹**：
 //
 //	POST https://copilot.tencent.com/v2/report        ← chatBase（CLI 上报走 billingBase）
-//	User-Agent: WorkBuddy/5.5.6 CLI/2.137.1
+//	User-Agent: WorkBuddy/<realm 版本>
 //	X-Domain: copilot.tencent.com, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
 // 每个事件除业务字段外必带桌面指纹（ideName/ideType=WorkBuddy、
-// extName=workbuddy-desktop 等）。实测点亮记录：
+// extName=workbuddy-desktop、commit/releaseDate 取分发包 product.json 真值等）。
+// 实测点亮记录：
 //   - RichMeow_Chat（桌面端对话1次）：agent_task_created + 成功的
 //     chat_message_response(isSuccessful=true) → 1/1 + UR Buddy。
 //   - Hp_Appearance（主题任务）：独立 API
@@ -37,14 +38,43 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 CLI/2.137.1"
+
+	// 官方桌面分发包构建指纹（realm 分档，取自各包 cli/product.json）。
+	//   cn     5.8.2  commit b8f6c953…  date 2026-10-12T12:02:33.293Z
+	//   global 5.7.6  commit 306add2a…  date 2026-10-04T12:03:58.867Z
+	// 上报事件 product/releaseDate/commit/ideVersion/extVersion 取此组，与 UA 版本自洽。
+	cnDesktopCommit          = "b8f6c953610cb16e2bd275c003ded4bc315ec528"
+	cnDesktopReleaseDate     = int64(1791806553293) // 2026-10-12T12:02:33.293Z
+	globalDesktopCommit      = "306add2a5dfafacf97769081cd17c3d172f6e60d"
+	globalDesktopReleaseDate = int64(1791115438867) // 2026-10-04T12:03:58.867Z
 )
+
+// desktopBuild 官方桌面分发包构建指纹（版本 + commit + releaseDate）。
+type desktopBuild struct {
+	version     string
+	commit      string
+	releaseDate int64
+}
+
+// desktopBuildFor 按账号 realm 返回桌面构建指纹（nil 账号按 cn）。
+func desktopBuildFor(a *auth.Auth) desktopBuild {
+	if a != nil && a.IsGlobal() {
+		return desktopBuild{version: globalClientVersion, commit: globalDesktopCommit, releaseDate: globalDesktopReleaseDate}
+	}
+	return desktopBuild{version: cnClientVersion, commit: cnDesktopCommit, releaseDate: cnDesktopReleaseDate}
+}
+
+// desktopUAFor 桌面上报/白名单类出站 UA：单段 `WorkBuddy/<realm 版本>`
+// （官方 daemon 上报头组 `${applicationName}/${appVersion}` 形态，不带 CLI 段）。
+func desktopUAFor(a *auth.Auth) string {
+	return "WorkBuddy/" + desktopBuildFor(a).version
+}
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
@@ -60,7 +90,10 @@ func deriveID(a *auth.Auth, salt string) string {
 type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
+// 版本/commit/releaseDate 按 realm 取官方分发包真值；os/arch 固定为常见桌面
+// （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台。
 func desktopFingerprint(a *auth.Auth) map[string]any {
+	b := desktopBuildFor(a)
 	now := time.Now().UnixMilli()
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
@@ -69,15 +102,15 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"username":     a.Nickname,
 		"userNickname": a.Nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1789036585355),
-		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
+		"releaseDate":  b.releaseDate,
+		"commit":       b.commit,
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
+		"ideVersion":   b.version,
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   b.version,
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",
@@ -118,7 +151,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Domain", c.desktopBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("X-Request-ID", deriveID(a, "req")+strconv.FormatInt(time.Now().UnixNano()%1e6, 10))
@@ -219,7 +252,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
@@ -397,7 +430,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", desktopUAFor(a))
 	req.Header.Set("X-Domain", c.chatBase(a))
 	req.Header.Set("X-Product", "SaaS")
 	if a.UID != "" {
@@ -466,23 +499,42 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 }
 
 // setDesktopExpertHeaders 注入桌面指纹 chat 请求头（可带 X-Expert-Id）。
+// 对齐官方桌面端 chat 头组：完整三段 UA + X-Agent-Intent/Purpose/Type + X-Private-Data
+// + 会话头族 + traceparent/b3/X-B3-* 链路族 + acp-connection-id。
 func (c *Client) setDesktopExpertHeaders(req *http.Request, a *auth.Auth, conversationID, expertID string) {
 	h := req.Header
+	requestID := session.NewMessageID()
 	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
+	h.Set("User-Agent", c.userAgent(a))
 	h.Set("X-Domain", c.chatBase(a))
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-Id", conversationID)
-	h.Set("X-Request-ID", strconv.FormatInt(time.Now().UnixNano(), 10))
+	h.Set("X-Conversation-Request-Id", requestID)
+	h.Set("X-Conversation-Message-Id", requestID)
+	h.Set("X-Request-ID", requestID)
+	h.Set("X-Root-Request-Id", requestID)
+	h.Set("Acp-Connection-Id", acpConnectionID(conversationID))
+	h.Set("X-Agent-Purpose", "conversation")
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
+	h.Set("X-Private-Data", "true")
 	h.Set("X-Ide-Name", "WorkBuddy")
 	h.Set("X-Ide-Type", "WorkBuddy")
-	h.Set("X-Ide-Version", "5.5.6")
+	h.Set("X-Ide-Version", c.clientVersionFor(a))
 	h.Set("X-Codebuddy-Request", "1")
+	// 链路族（traceparent/b3 单头 + X-B3-*），与 injectConversationHeaders 同口径。
+	spanID := requestID[:16]
+	parentSpanID := session.NewMessageID()[:16]
+	h.Set("X-Trace-Id", requestID)
+	h.Set("Traceparent", "00-"+requestID+"-"+spanID+"-01")
+	h.Set("B3", requestID+"-"+spanID+"-1-"+parentSpanID)
+	h.Set("X-B3-Traceid", requestID)
+	h.Set("X-B3-Parentspanid", parentSpanID)
+	h.Set("X-B3-Spanid", spanID)
+	h.Set("X-B3-Sampled", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
 	}

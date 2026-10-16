@@ -2,8 +2,9 @@
 //
 // 两个子命令，由 login.sh 顺序驱动：
 //
-//	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=CLI 拿 state+authUrl，
-//	                                  state 落 /tmp/wb2api-login-state.json，stdout 打印授权 URL
+//	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=<workbuddy|workbuddy-ai>
+//	                                  拿 state+authUrl，state 落 /tmp/wb2api-login-state.json，
+//	                                  stdout 打印授权 URL
 //	login [--realm=cn|global] poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
 //	                                  成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
 //	                                  stdout 打印完整 token+account JSON（含 realm 键）
@@ -63,6 +64,16 @@ func realmConfig(realm string) (base, origin string) {
 	return upstreamBaseCN, originRefererCN
 }
 
+// authPlatform 按 realm 返回 auth/state 的 platform 查询参数值。官方桌面端取
+// cli/product.json 的 authentication.attributes.platform：cn → "workbuddy"、
+// global → "workbuddy-ai"（旧值 "CLI" 与官方不符）。
+func authPlatform(realm string) string {
+	if realm == realmGlobal {
+		return "workbuddy-ai"
+	}
+	return "workbuddy"
+}
+
 // commonHeaders 按 origin 设置通用请求头（Origin/Referer 随 realm 变化）。
 // 返回 func(*http.Request)，由调用方按 realm 选定的 origin 构造一次后复用。
 func commonHeaders(origin string) func(*http.Request) {
@@ -73,6 +84,18 @@ func commonHeaders(origin string) func(*http.Request) {
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Referer", origin+"/")
 		req.Header.Set("User-Agent", clientUA)
+	}
+}
+
+// noAuthHeaders 在 base 头组上叠加设备授权未登录态声明头（官方 fetchAuthState/
+// loopGetToken 同款）：显式声明无凭证、无用户/企业/部门上下文。
+func noAuthHeaders(base func(*http.Request)) func(*http.Request) {
+	return func(req *http.Request) {
+		base(req)
+		req.Header.Set("X-No-Authorization", "true")
+		req.Header.Set("X-No-User-Id", "true")
+		req.Header.Set("X-No-Enterprise-Id", "true")
+		req.Header.Set("X-No-Department-Info", "true")
 	}
 }
 
@@ -223,8 +246,8 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；stateFile 为落盘路径
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
 func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
-	headers := commonHeaders(origin)
-	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", headers, bytes.NewReader([]byte("{}")))
+	headers := noAuthHeaders(commonHeaders(origin))
+	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform="+authPlatform(realm), headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		fatalf("auth state failed: %v", err)
 	}
@@ -253,7 +276,7 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	headers := commonHeaders(origin)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-	tok := pollToken(base, ls.State, headers, client)
+	tok := pollToken(base, ls.State, noAuthHeaders(headers), client)
 	// login/account 拿 uid/nickname（带 Bearer）
 	acct := pollAccount(base, ls.State, tok.AccessToken, headers, client)
 	oraw, oerr := json.Marshal(buildLoginOutput(tok, realm, acct))
@@ -304,6 +327,10 @@ func pollAccount(base, state, accessToken string, headers func(*http.Request), c
 	acctHeaders := func(r *http.Request) {
 		headers(r)
 		r.Header.Set("Authorization", "Bearer "+accessToken)
+		// 已带 Bearer：声明无用户/企业/部门上下文（官方 loopGetAccount 头组，不含 X-No-Authorization）。
+		r.Header.Set("X-No-User-Id", "true")
+		r.Header.Set("X-No-Enterprise-Id", "true")
+		r.Header.Set("X-No-Department-Info", "true")
 	}
 	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+state, acctHeaders, nil); errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)

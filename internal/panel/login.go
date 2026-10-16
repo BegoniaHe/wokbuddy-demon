@@ -34,16 +34,18 @@ const (
 
 // loginEndpoints 按 realm 返回设备授权三端点（auth/state、token、account）+ Origin。
 // realm=="global" → 国际版（workbuddy.ai 同域）；cn/非法/缺省 → CN（零回归）。
+// auth/state 的 platform 参数取官方 product.json authentication.attributes.platform
+// （cn "workbuddy" / global "workbuddy-ai"）。
 func loginEndpoints(realm string) (state, token, account, origin string) {
 	if realm == "global" {
 		base := upstreamBaseGlobal
-		return base + "/v2/plugin/auth/state?platform=CLI",
+		return base + "/v2/plugin/auth/state?platform=workbuddy-ai",
 			base + "/v2/plugin/auth/token?state=",
 			base + "/v2/plugin/login/account?state=",
 			originRefererGlobal
 	}
 	base := upstreamBaseCN
-	return base + "/v2/plugin/auth/state?platform=CLI",
+	return base + "/v2/plugin/auth/state?platform=workbuddy",
 		base + "/v2/plugin/auth/token?state=",
 		base + "/v2/plugin/login/account?state=",
 		originRefererCN
@@ -94,7 +96,14 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	commonHeaders(req, origin)
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
+	} else {
+		// 未登录态显式声明（官方 fetchAuthState/loopGetToken 同款）：无凭证。
+		req.Header.Set("X-No-Authorization", "true")
 	}
+	// 设备授权流程恒声明无用户/企业/部门上下文（官方 fetchAuthState 头组）。
+	req.Header.Set("X-No-User-Id", "true")
+	req.Header.Set("X-No-Enterprise-Id", "true")
+	req.Header.Set("X-No-Department-Info", "true")
 	resp, err := loginHTTP.Do(req)
 	if err != nil {
 		return nil, 0, err
