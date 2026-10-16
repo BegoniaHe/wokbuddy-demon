@@ -49,47 +49,27 @@ func Load(mode, file string) (string, error) {
 // 解析失败 → 原样返回（绝不失败）：Rewrite 是出站改写的关键路径，
 // 任何解析错误都不应阻塞请求转发，让上游按其原始语义处理。
 func Rewrite(body []byte, systemPrompt string) []byte {
-	if len(body) == 0 || systemPrompt == "" {
-		return body
-	}
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	obj, ok := decodeBody(body, systemPrompt)
+	if !ok {
 		return body
 	}
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
 		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
-		obj["messages"] = []any{map[string]any{"role": "system", "content": systemPrompt}}
-		if out, err := json.Marshal(obj); err == nil {
-			return out
-		}
-		return body
+		obj["messages"] = []any{systemMsg(systemPrompt)}
+		return marshalOr(obj, body)
 	}
 	// 过滤掉所有 system/developer 消息，保留 user/assistant/tool 及其他角色。
 	kept := make([]any, 0, len(msgs)+1)
 	for _, m := range msgs {
-		mm, ok := m.(map[string]any)
-		if !ok {
-			kept = append(kept, m)
-			continue
-		}
-		role, _ := mm["role"].(string)
-		if role == "system" || role == "developer" {
+		if isSystemMsg(m) {
 			continue
 		}
 		kept = append(kept, m)
 	}
 	// 头部插入单条 system 消息（prepend 避免整体重排语义）。
-	rewritten := append(
-		[]any{map[string]any{"role": "system", "content": systemPrompt}},
-		kept...,
-	)
-	obj["messages"] = rewritten
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-	return out
+	obj["messages"] = append([]any{systemMsg(systemPrompt)}, kept...)
+	return marshalOr(obj, body)
 }
 
 // Append 解析 OpenAI 请求体并在"开头连续 system/developer 块"之后插入一条
@@ -109,45 +89,68 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 // 还是 developer。网关消息角色用 system 而非 developer——上游 role 白名单
 // 不含 developer，插 developer 等于制造一次必然归一与多余的 11128 风险窗口。
 func Append(body []byte, systemPrompt string) []byte {
-	if len(body) == 0 || systemPrompt == "" {
-		return body
-	}
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	obj, ok := decodeBody(body, systemPrompt)
+	if !ok {
 		return body
 	}
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
 		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
-		obj["messages"] = []any{map[string]any{"role": "system", "content": systemPrompt}}
-		if out, err := json.Marshal(obj); err == nil {
-			return out
-		}
-		return body
+		obj["messages"] = []any{systemMsg(systemPrompt)}
+		return marshalOr(obj, body)
 	}
 	// 扫描开头连续 system/developer 块，遇第一条非 system/developer 即停。
 	insertAt := 0
 	for _, m := range msgs {
-		mm, ok := m.(map[string]any)
-		if !ok {
-			break
-		}
-		role, _ := mm["role"].(string)
-		if role != "system" && role != "developer" {
+		if !isSystemMsg(m) {
 			break
 		}
 		insertAt++
 	}
-	gw := map[string]any{"role": "system", "content": systemPrompt}
 	// 已有消息逐字不动：只在插入点拼接，不重排、不改写任何元素。
 	rewritten := make([]any, 0, len(msgs)+1)
 	rewritten = append(rewritten, msgs[:insertAt]...)
-	rewritten = append(rewritten, gw)
+	rewritten = append(rewritten, systemMsg(systemPrompt))
 	rewritten = append(rewritten, msgs[insertAt:]...)
 	obj["messages"] = rewritten
+	return marshalOr(obj, body)
+}
+
+// decodeBody 解析 OpenAI 请求体，供 Rewrite/Append 共用：
+// 空 body 或空 systemPrompt 直接判否（调用方原样返回，绝不失败）；
+// JSON 解析失败同样判否。
+func decodeBody(body []byte, systemPrompt string) (map[string]any, bool) {
+	if len(body) == 0 || systemPrompt == "" {
+		return nil, false
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, false
+	}
+	return obj, true
+}
+
+// systemMsg 构造一条网关自有 system 消息（角色固定 system，理由见 Append 注释）。
+func systemMsg(content string) map[string]any {
+	return map[string]any{"role": "system", "content": content}
+}
+
+// isSystemMsg 判定消息是否 role 为 system/developer（精确字符串匹配）。
+// 非 map 消息、无 role 消息均判否（与 Rewrite 删除口径、Append 停止口径一致）。
+func isSystemMsg(m any) bool {
+	mm, ok := m.(map[string]any)
+	if !ok {
+		return false
+	}
+	role, _ := mm["role"].(string)
+	return role == "system" || role == "developer"
+}
+
+// marshalOr 序列化 obj，失败时返回 fallback（原 body），保证改写路径绝不失败。
+func marshalOr(obj map[string]any, fallback []byte) []byte {
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return body
+		return fallback
 	}
 	return out
 }

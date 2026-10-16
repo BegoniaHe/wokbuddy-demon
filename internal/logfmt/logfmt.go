@@ -130,8 +130,36 @@ func ShortUA(ua string) string {
 	return Truncate(ua, maxShortUALen)
 }
 
-// runeWidth 单个 rune 的显示列宽。区段判定取自 Unicode East Asian Width 的
+// wideRanges 记 2 列宽字符的区段（闭区间），取自 Unicode East Asian Width 的
 // Wide/Fullwidth 集合（与 go-runewidth 的默认表口径一致），只保留实际会用到的段。
+// 用表驱动替代逐 case 分支，保持逐区间等价的同时降低圈复杂度。
+var wideRanges = [][2]rune{
+	{0x1100, 0x115f},   // Hangul Jamo 初声
+	{0x2329, 0x232a},   // 尖括号
+	{0x2e80, 0xa4cf},   // CJK 部首…Yi（303f 是窄字符，见 isWide 排除）
+	{0xac00, 0xd7a3},   // Hangul 音节
+	{0xf900, 0xfaff},   // CJK 兼容表意
+	{0xfe30, 0xfe6f},   // CJK 兼容形式
+	{0xff00, 0xff60},   // 全角 ASCII
+	{0xffe0, 0xffe6},   // 全角符号
+	{0x1f300, 0x1f9ff}, // emoji
+	{0x20000, 0x3fffd}, // CJK 扩展 B 及以后
+}
+
+// isWide 判定 rune 是否占 2 显示列。
+func isWide(r rune) bool {
+	if r == 0x303f { // 窄字符，落在 0x2e80…0xa4cf 段内需单独排除
+		return false
+	}
+	for _, rg := range wideRanges {
+		if r >= rg[0] && r <= rg[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// runeWidth 单个 rune 的显示列宽。区段判定见 isWide。
 func runeWidth(r rune) int {
 	switch {
 	case r == 0:
@@ -139,27 +167,7 @@ func runeWidth(r rune) int {
 	case r < 0x20 || (r >= 0x7f && r < 0xa0):
 		// 控制字符（含 DEL/C1）不占位：日志里若混入 \t \r 不破坏列宽计算。
 		return 0
-	case r < 0x1100:
-		return 1
-	case r <= 0x115f: // Hangul Jamo 初声
-		return 2
-	case r == 0x2329 || r == 0x232a:
-		return 2
-	case r >= 0x2e80 && r <= 0xa4cf && r != 0x303f: // CJK 部首…Yi（303f 是窄字符）
-		return 2
-	case r >= 0xac00 && r <= 0xd7a3: // Hangul 音节
-		return 2
-	case r >= 0xf900 && r <= 0xfaff: // CJK 兼容表意
-		return 2
-	case r >= 0xfe30 && r <= 0xfe6f: // CJK 兼容形式
-		return 2
-	case r >= 0xff00 && r <= 0xff60: // 全角 ASCII
-		return 2
-	case r >= 0xffe0 && r <= 0xffe6: // 全角符号
-		return 2
-	case r >= 0x1f300 && r <= 0x1f9ff: // emoji
-		return 2
-	case r >= 0x20000 && r <= 0x3fffd: // CJK 扩展 B 及以后
+	case isWide(r):
 		return 2
 	}
 	return 1
