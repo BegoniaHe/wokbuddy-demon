@@ -243,3 +243,23 @@ func TestModelLockViewAfterClear(t *testing.T) {
 		t.Fatalf("清除后应回到 nil：%+v", rows)
 	}
 }
+
+// TestModelLockViewScope 锁池行范围诊断（issue #29）：全锁账号共享同一非零上游
+// 重置时刻 → platform；否则 account。
+func TestModelLockViewScope(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	p := lockViewPool(t)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 rate limited")
+	p.CooldownSoftForModel("u2", time.Minute, reset, "glm-5.3", "6004 rate limited")
+	if row := oneRow(t, p.ModelLockView()); row.Scope != ModelBlockScopePlatform {
+		t.Errorf("scope=%q want platform", row.Scope)
+	}
+
+	// 不同重置时刻 → 账号级。
+	p2 := lockViewPool(t)
+	p2.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 rate limited")
+	p2.CooldownSoftForModel("u2", time.Minute, reset.Add(30*time.Minute), "glm-5.3", "6004 rate limited")
+	if row := oneRow(t, p2.ModelLockView()); row.Scope != ModelBlockScopeAccount {
+		t.Errorf("scope=%q want account", row.Scope)
+	}
+}

@@ -179,3 +179,85 @@ func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 		t.Errorf("Count=%d want 1（暂停号不计入）", st.Count)
 	}
 }
+
+// TestModelBlockedScope 阻塞范围诊断（issue #29）：全池被挡账号共享同一非零
+// ResetAt → platform；不同 ResetAt / 单账号 / 无 ResetAt → account。
+func TestModelBlockedScope(t *testing.T) {
+	reset := time.Now().Add(time.Hour)
+	cases := []struct {
+		name  string
+		setup func(p *Pool)
+		want  string
+	}{
+		{
+			name: "platform-same-reset",
+			setup: func(p *Pool) {
+				p.mu.Lock()
+				for _, uid := range []string{"u1", "u2"} {
+					p.byUID[uid].modelCooldowns = map[string]modelCooldown{
+						"m": {Until: reset, ResetAt: reset, Reason: "6004 limit"},
+					}
+				}
+				p.mu.Unlock()
+			},
+			want: ModelBlockScopePlatform,
+		},
+		{
+			name: "account-different-reset",
+			setup: func(p *Pool) {
+				p.mu.Lock()
+				p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+					"m": {Until: reset, ResetAt: reset, Reason: "6004 limit"},
+				}
+				p.byUID["u2"].modelCooldowns = map[string]modelCooldown{
+					"m": {Until: reset.Add(time.Minute), ResetAt: reset.Add(time.Minute), Reason: "6004 limit"},
+				}
+				p.mu.Unlock()
+			},
+			want: ModelBlockScopeAccount,
+		},
+		{
+			name: "account-no-reset",
+			setup: func(p *Pool) {
+				p.mu.Lock()
+				for _, uid := range []string{"u1", "u2"} {
+					p.byUID[uid].modelCooldowns = map[string]modelCooldown{
+						"m": {Until: reset, Reason: "11102 model not found"},
+					}
+				}
+				p.mu.Unlock()
+			},
+			want: ModelBlockScopeAccount,
+		},
+		{
+			name: "account-single",
+			setup: func(p *Pool) {
+				p.mu.Lock()
+				p.byUID["u1"].modelCooldowns = map[string]modelCooldown{
+					"m": {Until: reset, ResetAt: reset, Reason: "6004 limit"},
+				}
+				p.byUID["u2"].paused = true // 单账号被挡（另一号暂停不计入）
+				p.mu.Unlock()
+			},
+			want: ModelBlockScopeAccount,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := New("")
+			p.Add(&auth.Auth{UID: "u1"})
+			p.Add(&auth.Auth{UID: "u2"})
+			c.setup(p)
+			st := p.ModelBlocked("m")
+			if !st.Blocked {
+				t.Fatalf("want blocked, got %+v", st)
+			}
+			if st.Scope != c.want {
+				t.Errorf("scope=%q want %q", st.Scope, c.want)
+			}
+			if c.want == ModelBlockScopePlatform && !st.SharedResetAt.Equal(reset) {
+				t.Errorf("shared reset=%v want %v", st.SharedResetAt, reset)
+			}
+		})
+	}
+}
