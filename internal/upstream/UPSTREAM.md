@@ -26,11 +26,12 @@
 
 | 上游 | 状态 | 跟进影响 |
 | --- | --- | --- |
-| `Sliverkiss/workbuddy2api` | 已删除 | 无新提交可跟进；原作者保留随时止损的权利 |
-| `linguo2625469/workbuddy2api-panel` | 前序 fork，已停更 | 重建后不再作为上游来源 |
+| `Sliverkiss/workbuddy2api` | 已删除（404） | 无新提交可跟进；原作者保留随时止损的权利 |
+| `linguo2625469/workbuddy2api-panel` | 前序 fork，已停更（仍可 fetch） | **当前追踪的上游**；无新提交时同步为空操作 |
 
-**结论**：当前**没有活跃的上游仓库可供 rebase / 合并**。本仓库自 `ea8b1e5` 基线之后
-的所有演进（面板、任务体系、依赖升级、lint/fmt 治理）均为本分支独立维护。
+**结论**：当前**没有活跃的上游仓库可供 rebase / 合并**。前序 fork 仍可 fetch，作为
+唯一的「上游提交」来源由 `sync-upstream` 技能按提交逐一评估吸收。本仓库自 `ea8b1e5`
+基线之后的所有演进（面板、任务体系、依赖升级、lint/fmt 治理）均为本分支独立维护。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -41,12 +42,34 @@
 
 ## 五、跟进策略（Maintenance Policy）
 
-1. **无常规上游 rebase**：原始上游已删库，不存在可合并的上游分支。
-2. **接口变更自行适配**：上游行为（CodeBuddy / workbuddy 接口）变更时，由本仓库在
+1. **无常规上游 rebase**：原始上游已删库，不存在可合并的上游分支；前序 fork 仅作
+   提交级评估来源，不做 `git merge` / `rebase`。
+2. **默认 adapt，而非 cherry-pick**：因历史已重建（无共同祖先）、module path 与
+   lint/fmt 基线不同，绝大多数上游提交不逐字适用，一律按当前边界重新实现
+   （`cherry-pick` 仅用于与 fork 分叉路径不重叠且无冲突的提交）。
+3. **接口变更自行适配**：上游行为（CodeBuddy / workbuddy 接口）变更时，由本仓库在
    `internal/upstream/` 内自行适配，不依赖上游修复。
-3. **溯源完整性**：本文件与 `LICENSE` 共同保留原始作者与各 fork 的署名。
+4. **溯源完整性**：本文件与 `LICENSE` 共同保留原始作者与各 fork 的署名；每次吸收的
+   逐提交决策记录于 `upstream-decisions.jsonl`（决策账本），游标见 `upstream-sync.yaml`。
+
+## 六、上游同步工具（sync-upstream 技能）
+
+- 技能位置：`.agents/skills/sync-upstream/`（OpenCode 经 `.opencode/opencode.json`
+  的 `skills.paths` 加载）。
+- 上游远端：`upstream` → `https://github.com/linguo2625469/workbuddy2api-panel.git`
+  （branch `main`）。首次使用执行 `git fetch --prune upstream`。
+- 游标基线（逻辑基线，位于上游历史中，非本仓库祖先）：
+  `6b31db6d045e985042620c819c3a938002e7b0b1`（前序 fork `main` 末次提交，Merge PR #152）。
+- 常用命令：
+
+  ```bash
+  git fetch --prune upstream
+  python3 .agents/skills/sync-upstream/scripts/inspect_upstream.py
+  python3 .agents/skills/sync-upstream/scripts/upstream_decisions.py validate
+  python3 .agents/skills/sync-upstream/scripts/upstream_decisions.py list --path internal/upstream
+  ```
 
 ---
 
-_当前版本：`appVersion = 1.13.0-panel`（`cmd/server/main.go`）。_
+_发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
 _最近更新：2026-10-16。_

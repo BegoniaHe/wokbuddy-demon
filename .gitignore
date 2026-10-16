@@ -1,48 +1,48 @@
-# Auth & secrets
+# ── 密钥、凭证与运行时状态（绝不进版本库）──────────────────────────────
 auths/
 data/
+config.json
+backups/
 *.key
 *.pem
-*.env
 .env
 .env.*
 
-# Binaries (anchored to repo root only — bare "login"/"credit" would also ignore cmd/login/, cmd/credit/)
-/login
-/credit
+# ── 二进制与构建产物（仅锚定仓库根，避免误伤 cmd/login、cmd/credit）────
 /wokbuddy-demon
+/wokbuddy-demon.exe
 /signin_bin
+/login
+/login.exe
+/credit
+/credit.exe
+/server.exe
+coverage.out
+*.zip
 
-# Config with secrets (use config.example.json)
-config.json
+# ── 开发运行产物（scripts/make_dev.sh）───────────────────────────────
+/.make/
+/server_run.log
+/server_run.err.log
 
-# Build artifacts
+# ── 临时工作区与缓存 ────────────────────────────────────────────────
+.tmp/
 *.tmp
+*.pyc
 __pycache__/
 
-# Backups (contains auth tokens)
-backups/
+# ── 本地验证工具（判据逆向过程脚本；结论沉淀于 data/）────────────────
+/cmd/desktopverify*/
 
-# IDE
+# ── 设计/计划草稿（仓库治理文档与源码内嵌资源照常入库，见 AGENTS.md）──
+# 注意：不要用 `*.md` 整体忽略——internal/prompt/defaultprompt.md 等资源经
+# go:embed 打进二进制，被忽略会导致干净检出编译/CI 失败。
+/docs/
+/LOOP.md
+/PLAN.md
+/SPEC.md
+
+# ── IDE / OS ───────────────────────────────────────────────────────
 .idea/
 .vscode/
-LOOP.md
-PLAN.md
-SPEC.md
-docs/
-
-# 设计/计划文档（但 README.md 与上游跟进记录必须进版本库）
-*.md
-!README.md
-!internal/upstream/UPSTREAM.md
-
-# Windows binaries
-/wokbuddy-demon.exe
-/login.exe
-/credit.exe
-
-# 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
-/cmd/desktopverify*/
-*.zip
-server.exe
 .DS_Store

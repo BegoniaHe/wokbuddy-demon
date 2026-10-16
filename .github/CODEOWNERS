@@ -1,0 +1,46 @@
+# CODEOWNERS for BegoniaHe/wokbuddy-demon
+#
+# GitHub uses this file to automatically request reviews from the owners of
+# changed paths. See:
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Update this file when ownership boundaries change.
+
+# Global default owners for anything not matched below.
+*                   @BegoniaHe
+
+# Gateway entry, config, and wiring.
+/cmd/               @BegoniaHe
+/config.example.json @BegoniaHe
+
+# Core runtime packages (pool, scheduler, server, upstream, panel, auth, ...).
+/internal/          @BegoniaHe
+
+# Panel frontend (embedded single-file assets).
+/internal/panel/    @BegoniaHe
+
+# Scripts and CLI shells.
+/scripts/           @BegoniaHe
+/login.sh           @BegoniaHe
+/signin.sh          @BegoniaHe
+/credit.sh          @BegoniaHe
+
+# Repo tooling, CI, and quality gates.
+/.github/           @BegoniaHe
+/Makefile           @BegoniaHe
+/go.mod             @BegoniaHe
+/go.sum             @BegoniaHe
+/.golangci.yml      @BegoniaHe
+
+# Deployment manifests.
+/Dockerfile         @BegoniaHe
+/docker-compose.yml @BegoniaHe
+
+# Upstream-sync tracking and fork governance records.
+/upstream-sync.yaml         @BegoniaHe
+/upstream-decisions.jsonl   @BegoniaHe
+/AGENTS.md                  @BegoniaHe
+/AI_POLICY.md               @BegoniaHe
+/CONTRIBUTING.md            @BegoniaHe
+/SECURITY.md                @BegoniaHe
+/.agents/                   @BegoniaHe

@@ -1,0 +1,22 @@
+schema_version: 1
+
+# 上游追踪（upstream tracking）
+#
+# 原始上游 Sliverkiss/workbuddy2api 已删库，不可获取。本仓库实际追踪的上游是
+# 前序 fork linguo2625469/workbuddy2api-panel（branch main）。本仓库 2026-10-16
+# 以工作区快照重建 git 历史，与上游无共同祖先；下面 last_synced.commit 是
+# “逻辑基线”——该提交位于上游仓库历史中，是本仓库快照所对应的上游状态。
+upstream:
+  repo: https://github.com/linguo2625469/workbuddy2api-panel.git
+  branch: main
+
+last_synced:
+  commit: 6b31db6d045e985042620c819c3a938002e7b0b1
+  synced_at_utc: 2026-10-16T00:00:00Z
+  sync_method: adapt
+  source_pr: "152"
+  note: >-
+    前序 fork main 末次提交（Merge PR #152，fix(panel): 积分到期提醒卡片默认可见），
+    即本仓库重建快照所对应的上游状态。此后前序 fork 停更；本仓库自该基线起独立演进
+    （Go module path 改为 github.com/BegoniaHe/wokbuddy-demon、golangci-lint v2 严格
+    规则集、gofumpt + gci、面板/任务体系维护）。默认吸收方式为 adapt。

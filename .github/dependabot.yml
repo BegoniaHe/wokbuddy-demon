@@ -1,0 +1,65 @@
+# Keep all dependency surfaces current: Go modules, GitHub Actions, and the
+# Docker base image. Dependabot runs daily, keeps a generous queue of update
+# PRs, and groups compatible updates while leaving major upgrades in a separate
+# PR.
+# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/keeping-your-actions-up-to-date-with-dependabot
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: daily
+      time: '00:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 20
+    labels:
+      - dependencies
+      - go
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      go-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+      go-major:
+        patterns:
+          - '*'
+        update-types:
+          - major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+      time: '00:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 20
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: deps
+      include: scope
+    groups:
+      github-actions:
+        patterns:
+          - '*'
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: daily
+      time: '00:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 20
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: deps
+      include: scope

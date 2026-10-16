@@ -1,0 +1,7 @@
+interface:
+  display_name: 'Sync wokbuddy-demon Upstream'
+  short_description: 'Review or adapt upstream commits with provenance'
+  default_prompt: 'Use $sync-upstream to review pending upstream commits from linguo2625469/workbuddy2api-panel and produce an integration plan, or execute the plan already authorized in this conversation.'
+
+policy:
+  allow_implicit_invocation: true

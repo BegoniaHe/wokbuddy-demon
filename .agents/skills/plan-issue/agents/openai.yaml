@@ -1,0 +1,7 @@
+interface:
+  display_name: 'Plan a wokbuddy-demon Issue'
+  short_description: 'Turn an issue or request into a verifiable code plan'
+  default_prompt: 'Use $plan-issue to research this request and write a validated implementation plan under .tmp/issue-plan/, asking only about unresolved decisions that change the result.'
+
+policy:
+  allow_implicit_invocation: true

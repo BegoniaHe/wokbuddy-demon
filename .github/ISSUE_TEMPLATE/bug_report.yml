@@ -1,0 +1,86 @@
+name: Bug report
+description: Report a reproducible defect in this fork. Not a user-support ticket.
+title: '[bug] '
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a defect in the current branch. This is not a helpdesk.
+        Search existing Issues and PRs first.
+
+        **Security vulnerabilities must go through [private reporting](https://github.com/BegoniaHe/wokbuddy-demon/security/advisories/new), not here.**
+
+        Fill **exactly one** of Human note or Agent note. Agents must not fabricate a Human note. See AI_POLICY.md.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I searched open and closed Issues and PRs.
+          required: true
+        - label: I tested the current `main` branch or the exact commit.
+          required: true
+        - label: This report contains no secrets, tokens, credentials, or private data.
+          required: true
+        - label: This is not a security vulnerability (those use a private advisory).
+          required: true
+        - label: I filled exactly one of Human note or Agent note, matching who wrote this Issue.
+          required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Gateway / HTTP handler
+        - Account pool / scheduling
+        - Scheduler tasks (checkin/travel/keepalive/...)
+        - Upstream protocol / SSE / tool-call
+        - Panel (web UI)
+        - Auth / credentials
+        - Config / hot-apply
+        - CLI (login/signin/credit/trial)
+        - Build / CI / Docker
+        - Docs
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: describe
+    attributes:
+      label: What happened
+      description: Expected vs actual. Include a minimal reproduction.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or build
+      placeholder: main SHA or nightly build identifier
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: OS/arch, Go version, Docker or source run, relevant config (redact api_key)
+  - type: dropdown
+    id: author
+    attributes:
+      label: Author
+      options:
+        - Human
+        - Agent
+    validations:
+      required: true
+  - type: textarea
+    id: human_note
+    attributes:
+      label: Human note
+      description: Humans only. Mother tongue, own words. Leave empty if an agent is the author.
+  - type: textarea
+    id: agent_note
+    attributes:
+      label: Agent note
+      description: Agents only. Checks run and residual risk. Leave empty if a human is the author.

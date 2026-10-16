@@ -1,0 +1,16 @@
+{
+  "source": "https://github.com/DietrichGebert/ponytail",
+  "path": "skills/ponytail/SKILL.md",
+  "commit": "e3ba2aa6f1e6f0bc4d69eb09c9f0d0a93af56156",
+  "license": "MIT",
+  "fetched_at_utc": "2026-09-15T19:12:19Z",
+  "purpose": "checkout-only overlay of the YAGNI ladder; not the upstream plugin",
+  "local_patches": [
+    "Skill name is simplifier, not ponytail",
+    "SKILL.md is a wokbuddy-demon overlay, not the upstream prompt",
+    "Go 1.27 rungs (stdlib, internal packages, go.mod) instead of Python",
+    "No lite/full/ultra levels, hooks, or companion skills",
+    "No ponytail: comments; corners are reported in the reply",
+    "Tests use existing go test coverage, not example self-checks"
+  ]
+}

@@ -1,0 +1,25 @@
+# Development Issues track defects, features, and maintenance.
+# This fork does not operate a user-support queue.
+# Labels used by the templates: bug, enhancement, task.
+# https://docs.github.com/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+
+blank_issues_enabled: false
+
+contact_links:
+  - name: Documentation / 文档
+    url: https://github.com/BegoniaHe/wokbuddy-demon#readme
+    about: |
+      Deployment and usage live in README.md. This is not a support queue.
+      部署与使用说明见 README.md。这里不是客服。
+  - name: Report a Security Vulnerability / 报告安全漏洞
+    url: https://github.com/BegoniaHe/wokbuddy-demon/security/advisories/new
+    about: |
+      Report security issues privately. Do NOT open a public issue.
+      See SECURITY.md.
+      安全漏洞请私密报告，切勿在公开 Issue 中提交，详见 SECURITY.md。
+  - name: AI contribution policy / AI 使用政策
+    url: https://github.com/BegoniaHe/wokbuddy-demon/blob/main/AI_POLICY.md
+    about: |
+      Agents may open development Issues and PRs on BegoniaHe/wokbuddy-demon
+      (`gh --repo BegoniaHe/wokbuddy-demon`). They must not merge.
+      智能体可以在 BegoniaHe/wokbuddy-demon 开开发 Issue 与 PR，不得自行合并。
