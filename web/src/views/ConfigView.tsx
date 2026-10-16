@@ -13,7 +13,7 @@ import {
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
 import { Field, Input, Select, Switch } from '@/components/ui/field';
-import { Box, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
+import { Box, BoxBody, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
 import { cn } from '@/lib/utils';
 
 export function ConfigView() {
@@ -103,7 +103,7 @@ export function ConfigView() {
           <Grow />
           <BoxNote>{path}</BoxNote>
         </BoxHeader>
-        <div className="p-4">
+        <BoxBody>
           <div className="grid gap-x-5 md:grid-cols-2">
             <Field label="监听地址" hint="改动需重启进程">
               {text('listen', { placeholder: ':7863' })}
@@ -120,14 +120,14 @@ export function ConfigView() {
           <Field label="单账号明细默认展示条数" hint="积分构成页按最早到期展示，其余未用完包聚合">
             {num('package_detail_limit', { min: 1, placeholder: '5' })}
           </Field>
-        </div>
+        </BoxBody>
       </Box>
 
       <Box>
         <BoxHeader>
           <BoxTitle>定时任务</BoxTitle>
         </BoxHeader>
-        <div className="p-4">
+        <BoxBody>
           <div className="grid gap-x-5 md:grid-cols-2">
             <div>
               {check('checkin_enabled', '自动签到')}
@@ -167,19 +167,19 @@ export function ConfigView() {
           </div>
           <Hr />
           {check('include_disabled_in_tasks', '保号任务覆盖已禁用账号')}
-          <div className="text-[11.5px] text-ink-3">
+          <div className="text-2xs text-ink-3">
             禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。
             <br />
             若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。
           </div>
-        </div>
+        </BoxBody>
       </Box>
 
       <Box>
         <BoxHeader>
           <BoxTitle>账号池与流量治理</BoxTitle>
         </BoxHeader>
-        <div className="p-4">
+        <BoxBody>
           <div className="grid gap-x-4 md:grid-cols-3">
             <Field label="单账号最大在途" hint="0 = 不限制">{num('max_in_flight', { min: 0, placeholder: '3' })}</Field>
             <Field label="国际版在途上限" hint="global 域风控更紧，默认 2">{num('max_in_flight_global', { min: 1, placeholder: '2' })}</Field>
@@ -213,14 +213,14 @@ export function ConfigView() {
             <Field label="会话粘性 TTL" hint="改动需重启进程">{text('ttl', { placeholder: '30m' })}</Field>
           </div>
           {check('prefer_expiring', '快过期积分优先')}
-        </div>
+        </BoxBody>
       </Box>
 
       <Box>
         <BoxHeader>
           <BoxTitle>上游与高级</BoxTitle>
         </BoxHeader>
-        <div className="p-4">
+        <BoxBody>
           <div className="grid gap-x-4 md:grid-cols-3">
             <Field label="短请求超时" hint="需重启">{num('timeout_seconds', { min: 1, placeholder: '120' })}</Field>
             <Field label="聊天首字节超时" hint="需重启">{num('header_timeout_seconds', { min: 1, placeholder: '120' })}</Field>
@@ -248,31 +248,31 @@ export function ConfigView() {
           <Hr />
           {check('sanitize_blacklist_fingerprints', '出站请求指纹脱敏')}
           {check('session_sticky_enabled', '会话粘性路由')}
-          <div className="mt-2.5 text-[11.5px] text-ink-3">
+          <div className="mt-2.5 text-2xs text-ink-3">
             Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。
           </div>
-        </div>
+        </BoxBody>
       </Box>
 
       <Box>
         <BoxHeader>
           <BoxTitle>日志</BoxTitle>
         </BoxHeader>
-        <div className="p-4">
+        <BoxBody>
           {check('request_client_info', '记录调用来源（客户端 IP / User-Agent）')}
-          <div className="text-[11.5px] text-ink-3">
+          <div className="text-2xs text-ink-3">
             开启后，「运行日志」页的请求记录会显示每次调用来自哪个 IP、用什么客户端；关闭则归档与面板都不再出现来源信息。改动即时生效，无需重启。
           </div>
-          <div className="mt-2 text-[11.5px] text-ink-3">
+          <div className="mt-2 text-2xs text-ink-3">
             归档开关、保留天数与容量上限（<code>logging.request_archive_*</code>）需手工编辑配置文件。
           </div>
-        </div>
+        </BoxBody>
       </Box>
 
       <div className="sticky bottom-0 flex items-center gap-3 border-t border-line-soft bg-surface-2 px-4 py-3">
         <Grow />
-        {badFields.length ? <span className="text-[12.5px] text-warn">{DURATION_TIP}</span> : null}
-        <span className="text-[12.5px] text-warn">{note}</span>
+        {badFields.length ? <span className="text-xs text-warn">{DURATION_TIP}</span> : null}
+        <span className="text-xs text-warn">{note}</span>
         <Button disabled={saving} onClick={() => void load()}>
           放弃修改
         </Button>

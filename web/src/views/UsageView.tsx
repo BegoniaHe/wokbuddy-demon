@@ -26,11 +26,12 @@ import {
 import { defaultTimeRangeState, trangeLabel, trangeQuery, type TimeRangeState } from '@/lib/timeRange';
 import { Button } from '@/components/ui/button';
 import { Select } from '@/components/ui/field';
-import { Box, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
-import { Empty, Num, Table, TableWrap, Td, Th } from '@/components/ui/table';
+import { Box, BoxBody, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
+import { Empty, Num, RailCell, Table, TableWrap, Td, Th } from '@/components/ui/table';
 import { Kpi, Kpis } from '@/components/ui/stat';
+import { MixBar, Legend } from '@/components/ui/bar';
+import { Tabs } from '@/components/ui/tabs';
 import { TimeRange } from '@/components/TimeRange';
-import { cn } from '@/lib/utils';
 
 function usPct(part: unknown, total: unknown): string {
   const t = Number(total || 0);
@@ -61,8 +62,6 @@ export function UsageView() {
   const reqs = Number(t.requests || 0);
   const errs = Number(t.errors || 0);
   const okRate = reqs ? ((reqs - errs) / reqs) * 100 : null;
-  const pctW = (part: unknown) =>
-    total ? Math.max(0, Math.min(100, (Number(part || 0) / total) * 100)).toFixed(2) + '%' : '0%';
 
   const winLabel = trangeLabel(range);
   const rangeEcho = data?.window_from
@@ -109,10 +108,7 @@ export function UsageView() {
             <Kpis>
               <Kpi value={fmtTok(reqs)} label="请求数" tone="accent" sub={errs ? '其中失败 ' + errs + ' 次' : '全部成功'} />
               <Kpi value={fmtTok(total)} label="总 token" tone="accent" sub={'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total)}>
-                <div className="mt-1.5 flex h-1 overflow-hidden rounded bg-line">
-                  <i className="block h-full min-w-[2px] bg-accent" style={{ width: pctW(pt) }} />
-                  <i className="block h-full min-w-[2px] bg-ok" style={{ width: pctW(ct) }} />
-                </div>
+                <MixBar prompt={pt} completion={ct} total={total} className="mt-1.5 h-1" />
               </Kpi>
               <Kpi value={fmtTok(pt)} label="prompt" tone="soft" sub={'占比 ' + usPct(pt, total)} />
               <Kpi value={fmtTok(ct)} label="completion" tone="ok" sub={'占比 ' + usPct(ct, total)} />
@@ -120,24 +116,23 @@ export function UsageView() {
               <Kpi value={fmtMs(t.avg_latency_ms)} label="平均延迟" tone="soft" sub={t.avg_tokens_per_second ? '吐字 ' + usageRate(t.avg_tokens_per_second) : '无速率样本'} />
             </Kpis>
 
-            <div className="p-4">
-              <div className="overflow-hidden rounded-[10px] border border-line-soft bg-surface-2">
+            <BoxBody>
+              <div className="overflow-hidden rounded-inner border border-line-soft bg-surface-2">
                 <div className="flex flex-wrap items-center gap-2.5 border-b border-line-soft px-3.5 py-2.5 text-xs">
                   <span className="font-semibold text-ink-2">Token 时序</span>
-                  <BoxNote>—</BoxNote>
                   <Grow />
-                  <span className="flex items-center gap-1.5 text-[11.5px] text-ink-3">
-                    <i className="inline-block h-2.5 w-2.5 rounded-sm bg-accent" />prompt
-                    <i className="inline-block h-2.5 w-2.5 rounded-sm bg-ok" />completion
+                  <span className="flex items-center gap-1.5 text-2xs text-ink-3">
+                    <Legend color="var(--accent)">prompt</Legend>
+                    <Legend color="var(--ok)">completion</Legend>
                     <span className="mx-1 h-3 w-px bg-line" />
-                    <i className="inline-block h-2.5 w-2.5 rounded-sm bg-warn" />均值
+                    <Legend color="var(--warn)">均值</Legend>
                   </span>
                 </div>
                 <div className="px-2.5 pb-1 pt-2">
                   <UsageChart series={data?.series || []} />
                 </div>
               </div>
-            </div>
+            </BoxBody>
           </>
         )}
       </Box>
@@ -145,21 +140,20 @@ export function UsageView() {
       <Box>
         <BoxHeader>
           <BoxTitle>用量明细</BoxTitle>
-          <TabButtons
-            items={[
-              ['account', '按账号'],
-              ['model', '按模型'],
-              ['realm', '按域'],
-            ]}
+          <Tabs
             active={dim}
-            counts={counts}
             onSelect={(v) => setDim(v as DimKey)}
+            items={[
+              { value: 'account', label: '按账号', count: counts.account },
+              { value: 'model', label: '按模型', count: counts.model },
+              { value: 'realm', label: '按域', count: counts.realm },
+            ]}
           />
           <Grow />
           <BoxNote>{rows.length + ' 行 · 请求数含失败尝试'}</BoxNote>
           <label className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs text-ink-3">
             排序
-            <Select className="w-auto rounded-md px-2 py-[3px] text-xs" value={sort} onChange={(e) => setSort(e.target.value as UsSort)}>
+            <Select size="sm" value={sort} onChange={(e) => setSort(e.target.value as UsSort)}>
               <option value="total">合计 Token</option>
               <option value="requests">请求数</option>
               <option value="errors">失败数</option>
@@ -203,14 +197,13 @@ export function UsageView() {
       <Box>
         <BoxHeader>
           <BoxTitle>积分扣除历史</BoxTitle>
-          <TabButtons
-            items={[
-              ['account', '按账号'],
-              ['model', '按模型'],
-            ]}
+          <Tabs
             active={creditDim}
-            counts={{ account: creditAccounts.length, model: creditModels.length }}
             onSelect={(v) => setCreditDim(v as CreditDim)}
+            items={[
+              { value: 'account', label: '按账号', count: creditAccounts.length },
+              { value: 'model', label: '按模型', count: creditModels.length },
+            ]}
           />
           <Grow />
           <BoxNote>
@@ -257,7 +250,7 @@ export function UsageView() {
                 ) : (
                   creditModels.map((row, i) => (
                     <tr key={i}>
-                      <Td className="w-[3px] p-0" />
+                      <RailCell />
                       <Td>{row.key || '—'}</Td>
                       <Td>{fmtModelRate(row.rate)}</Td>
                       <Td className="text-right"><Num>{fmtTok(row.requests)}</Num></Td>
@@ -279,10 +272,10 @@ export function UsageView() {
                   const uid = String(row.key || '');
                   return (
                     <tr key={i}>
-                      <Td className="w-[3px] p-0" />
+                      <RailCell />
                       <Td>
                         {row.nickname || uid.slice(0, 8) || '—'}
-                        <div className="text-[11px] text-ink-3">
+                        <div className="text-2xs text-ink-3">
                           {(row.realm || '') + ' · ' + uid.slice(0, 8)}
                         </div>
                       </Td>
@@ -331,10 +324,10 @@ function UsageDimRow({ x, dim, withPerf }: { x: UsageRow; dim: DimKey; withPerf:
   const sub = dim === 'account' ? x.extra || '' : '';
   return (
     <tr>
-      <Td className="w-[3px] p-0" />
+      <RailCell />
       <Td>
         {name}
-        {sub ? <div className="text-[11px] text-ink-3">{sub}</div> : null}
+        {sub ? <div className="text-2xs text-ink-3">{sub}</div> : null}
       </Td>
       {dim === 'account' ? (
         <Td className="text-right">
@@ -349,58 +342,11 @@ function UsageDimRow({ x, dim, withPerf }: { x: UsageRow; dim: DimKey; withPerf:
       <Td className="text-right"><Num>{fmtTok(x.completion_tokens)}</Num></Td>
       <Td className="text-right">
         <Num>{fmtTok(x.total_tokens)}</Num>
-        <MixBar prompt={x.prompt_tokens} completion={x.completion_tokens} total={x.total_tokens} />
+        <MixBar prompt={x.prompt_tokens} completion={x.completion_tokens} total={x.total_tokens} className="mt-1 min-w-[60px]" />
       </Td>
       {withPerf ? <Td className="text-right"><Num>{fmtMs(x.avg_latency_ms)}</Num></Td> : null}
       {withPerf ? <Td className="text-right"><Num>{usageRate(x.avg_tokens_per_second)}</Num></Td> : null}
     </tr>
-  );
-}
-
-function MixBar({ prompt, completion, total }: { prompt?: number; completion?: number; total?: number }) {
-  const t = Number(total || 0);
-  if (!t) return null;
-  const pp = Math.max(0, Math.min(100, (Number(prompt || 0) / t) * 100));
-  const pc = Math.max(0, Math.min(100, (Number(completion || 0) / t) * 100));
-  return (
-    <span
-      className="mt-1 flex h-[3px] min-w-[60px] overflow-hidden rounded bg-line"
-      title={'prompt ' + pp.toFixed(1) + '% · completion ' + pc.toFixed(1) + '%'}
-    >
-      <i className="block h-full bg-accent" style={{ width: pp.toFixed(2) + '%' }} />
-      <i className="block h-full bg-ok" style={{ width: pc.toFixed(2) + '%' }} />
-    </span>
-  );
-}
-
-function TabButtons({
-  items,
-  active,
-  counts,
-  onSelect,
-}: {
-  items: [string, string][];
-  active: string;
-  counts: Record<string, number>;
-  onSelect: (v: string) => void;
-}) {
-  return (
-    <span className="inline-flex gap-0.5 rounded-lg bg-surface-2 p-0.5">
-      {items.map(([k, label]) => (
-        <button
-          key={k}
-          type="button"
-          onClick={() => onSelect(k)}
-          className={cn(
-            'rounded-md px-3 py-1 text-[12.5px] font-medium',
-            k === active ? 'bg-surface text-ink shadow-sm' : 'text-ink-3 hover:text-ink',
-          )}
-        >
-          {label}
-          {counts[k] != null ? <span className="ml-1 font-normal tabular-nums text-ink-3">{counts[k]}</span> : null}
-        </button>
-      ))}
-    </span>
   );
 }
 
@@ -419,7 +365,7 @@ function UsageChart({ series }: { series: SeriesPoint[] }) {
   }, [series]);
 
   if (!model.length) {
-    return <div className="py-8 text-center text-[12.5px] text-ink-3">暂无用量数据。发起一次对话后再刷新。</div>;
+    return <div className="py-8 text-center text-xs text-ink-3">暂无用量数据。发起一次对话后再刷新。</div>;
   }
 
   const W = 1200;
@@ -549,7 +495,7 @@ function UsageChart({ series }: { series: SeriesPoint[] }) {
           <line key={i} x1={x} y1={PT} x2={x} y2={PT + ih} stroke="var(--line-soft)" strokeWidth={1} strokeDasharray="2 3" opacity={0.45} />
         ))}
       </svg>
-      <div className="pb-1 text-[11px] text-ink-3">
+      <div className="pb-1 text-2xs text-ink-3">
         {model.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + fmtTokTimeLabel({ t: peak.raw, scope: peak.scope }) + ' · 均值 ' + fmtTok(avg)}
       </div>
     </>

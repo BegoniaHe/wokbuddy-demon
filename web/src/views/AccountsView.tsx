@@ -15,9 +15,10 @@ import { expBatches, expDaysLeft, type Package } from '@/lib/expiry';
 import { fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Tag } from '@/components/ui/field';
-import { Box, BoxHeader, BoxHint, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
-import { Empty, Num, Table, TableWrap, Td, Th } from '@/components/ui/table';
+import { Badge, Chip, Tag } from '@/components/ui/field';
+import { Bar } from '@/components/ui/bar';
+import { Box, BoxBody, BoxHeader, BoxHint, BoxNote, BoxTitle, Dot, Grow, type DotTone } from '@/components/ui/box';
+import { Empty, Num, RailCell, Table, TableWrap, Td, Th, type RailTone } from '@/components/ui/table';
 import { Stat, Stats } from '@/components/ui/stat';
 import { TasksDialog } from '@/components/TasksDialog';
 import { useState } from 'react';
@@ -189,8 +190,8 @@ function ExpiryBox({
       const nm = a.nickname || String(a.uid || '').slice(0, 8);
       if (a.error) {
         return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-[12.5px] first:border-t-0">
-            <span className="mt-1 h-2.5 w-2.5 flex-none rounded-full bg-ink-3" />
+          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
+            <Dot tone="mute" className="mt-1 h-2.5 w-2.5" />
             <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
             <span className="text-bad">查询失败：{a.error}</span>
           </div>
@@ -199,8 +200,8 @@ function ExpiryBox({
       const bs = expBatches(a.packages).filter((b) => expDaysLeft(b.date, today) >= 0);
       if (!bs.length) {
         return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-[12.5px] first:border-t-0">
-            <span className="mt-1 h-2.5 w-2.5 flex-none rounded-full bg-ok" />
+          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
+            <Dot tone="ok" className="mt-1 h-2.5 w-2.5" />
             <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
             <span className="text-ink-2">7 天内无到期积分</span>
           </div>
@@ -210,20 +211,20 @@ function ExpiryBox({
       const days = expDaysLeft(first.date, today);
       const daily = Math.ceil(first.remain / Math.max(1, days));
       const week = bs.filter((b) => expDaysLeft(b.date, today) <= 7).reduce((s, b) => s + b.remain, 0);
-      const dot = days <= 3 ? 'bg-bad' : days <= 7 ? 'bg-warn' : 'bg-ok';
+      const dotTone: DotTone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
       const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
       const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
       const rest = bs.slice(1, 4).map((b) => '随后 ' + b.date.slice(5) + ' · ' + fmtTok(b.remain)).join('　') + more;
       return (
-        <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-[12.5px] first:border-t-0">
-          <span className={'mt-1 h-2.5 w-2.5 flex-none rounded-full ' + dot} />
+        <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
+          <Dot tone={dotTone} className="mt-1 h-2.5 w-2.5" />
           <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
           <span className="text-ink-2">
             最近到期 <b className="font-mono">{first.date}</b>（{dayWord}）· 该批{' '}
             <b className="font-mono">{fmtTok(first.remain)}</b> 积分 · 到期前日均需耗 ≥
             <b className="font-mono">{fmtTok(daily)}</b>
             {week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : ''}
-            {rest ? <div className="mt-0.5 text-[11px] text-ink-3">{rest}</div> : null}
+            {rest ? <div className="mt-0.5 text-2xs text-ink-3">{rest}</div> : null}
           </span>
         </div>
       );
@@ -254,8 +255,8 @@ function ExpiryBox({
       const nm = a.nickname || String(a.uid || '').slice(0, 8);
       if (!ms || !a.credits_earliest_remaining) {
         return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-[12.5px] first:border-t-0">
-            <span className="mt-1 h-2.5 w-2.5 flex-none rounded-full bg-ok" />
+          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
+            <Dot tone="ok" className="mt-1 h-2.5 w-2.5" />
             <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
             <span className="text-ink-2">无近期到期批次</span>
           </div>
@@ -264,18 +265,18 @@ function ExpiryBox({
       const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
       const remain = Number(a.credits_earliest_remaining || 0);
       const daily = Math.ceil(remain / Math.max(1, days));
-      const dot = days <= 3 ? 'bg-bad' : days <= 7 ? 'bg-warn' : 'bg-ok';
+      const dotTone: DotTone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
       const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
       const when = new Date(ms).toISOString().slice(0, 10);
       return (
-        <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-[12.5px] first:border-t-0">
-          <span className={'mt-1 h-2.5 w-2.5 flex-none rounded-full ' + dot} />
+        <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
+          <Dot tone={dotTone} className="mt-1 h-2.5 w-2.5" />
           <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
           <span className="text-ink-2">
             最近到期 <b className="font-mono">{when}</b>（{dayWord}）· 该批{' '}
             <b className="font-mono">{fmtTok(remain)}</b> 积分 · 到期前日均需耗 ≥
             <b className="font-mono">{fmtTok(daily)}</b>
-            <div className="mt-0.5 text-[11px] text-ink-3">仅最早一批，点「检查」看全部到期批次</div>
+            <div className="mt-0.5 text-2xs text-ink-3">仅最早一批，点「检查」看全部到期批次</div>
           </span>
         </div>
       );
@@ -296,7 +297,7 @@ function ExpiryBox({
           {checking ? '查询中…' : '检查'}
         </Button>
       </BoxHeader>
-      <div className="p-4">{rows && (rows as unknown[])?.length ? rows : <Empty>没有账号</Empty>}</div>
+      <BoxBody>{rows && (rows as unknown[])?.length ? rows : <Empty>没有账号</Empty>}</BoxBody>
     </Box>
   );
 }
@@ -435,23 +436,22 @@ function AccountRow({
   };
 
   const limits = (s.rate_limited_models || []).filter((r) => r && r.model);
+  const railTone: RailTone = s.disabled || s.paused ? 'bad' : cool > 0 ? 'warn' : 'ok';
 
   return (
     <tr className={cls} title={'uid: ' + s.uid}>
-      <Td className="w-[3px] p-0">
-        <i className={'block h-full min-h-[36px] w-[3px] ' + (s.disabled || s.paused ? 'bg-bad' : cool > 0 ? 'bg-warn' : 'bg-ok')} />
-      </Td>
+      <RailCell tone={railTone} />
       <Td>
         <div className="font-medium">
           {s.nickname ? s.nickname : <span className="text-ink-3">未命名</span>}
-          {s.realm === 'global' ? <span className="ml-1.5 rounded border border-accent/25 bg-accent-soft px-1 py-px text-[10px] font-medium text-accent">国际版</span> : null}
-          {s.enterprise ? <span className="ml-1.5 rounded border border-accent/25 bg-accent-soft px-1 py-px text-[10px] font-medium text-accent">企业版</span> : null}
+          {s.realm === 'global' ? <Badge className="ml-1.5">国际版</Badge> : null}
+          {s.enterprise ? <Badge className="ml-1.5">企业版</Badge> : null}
         </div>
-        <div className="mt-px truncate font-mono text-[11.5px] text-ink-3">{short}</div>
+        <div className="mt-px truncate font-mono text-2xs text-ink-3">{short}</div>
       </Td>
       <Td>
         {tag}
-        {s.reason ? <div className="mt-0.5 text-[11.5px] text-ink-3">{s.reason}</div> : null}
+        {s.reason ? <div className="mt-0.5 text-2xs text-ink-3">{s.reason}</div> : null}
         {limits.length ? (
           <div className="mt-1.5 flex min-w-[210px] flex-col gap-1">
             {limits.map((row, i) => {
@@ -461,7 +461,7 @@ function AccountRow({
                   key={i}
                   title={m.title}
                   className={
-                    'flex items-baseline gap-1.5 rounded-md border px-1.5 py-1 text-[11.5px] leading-tight ' +
+                    'flex items-baseline gap-1.5 rounded-control border px-1.5 py-1 text-2xs leading-tight ' +
                     (m.kind === 'model_unavailable'
                       ? 'border-line bg-surface-2 text-ink-3'
                       : 'border-warn/25 bg-warn-soft')
@@ -476,10 +476,8 @@ function AccountRow({
         ) : null}
       </Td>
       <Td title={credTip}>
-        <div className="font-mono text-[13px] tabular-nums">{cred}</div>
-        <div className="mt-1 h-[3px] max-w-[88px] overflow-hidden rounded-sm bg-line">
-          <i className="block h-full rounded-sm bg-accent" style={{ width: pct + '%' }} />
-        </div>
+        <div className="font-mono text-sm tabular-nums">{cred}</div>
+        <Bar pct={pct} className="mt-1 max-w-[88px]" />
       </Td>
       <Td>
         <Num>
@@ -492,20 +490,10 @@ function AccountRow({
       </Td>
       <Td title={usageTitle}>
         <span className="inline-flex flex-wrap items-center gap-1">
-          <span className="inline-flex items-baseline rounded-md bg-accent-soft px-1.5 py-0.5 font-mono text-[11.5px] font-semibold tabular-nums text-accent">
-            {req}
-            <em className="ml-0.5 font-sans text-[10px] not-italic">次</em>
-          </span>
-          <span className="inline-flex items-baseline rounded-md bg-accent-soft px-1.5 py-0.5 font-mono text-[11.5px] font-semibold tabular-nums text-accent">
-            {totalTok}
-            {totalTok !== '—' ? <em className="ml-0.5 font-sans text-[10px] not-italic">tok</em> : null}
-          </span>
-          <span className="inline-flex items-baseline rounded-md bg-warn-soft px-1.5 py-0.5 font-mono text-[11.5px] font-semibold tabular-nums text-warn">
-            {latency}
-          </span>
-          <span className="inline-flex items-baseline rounded-md bg-ok-soft px-1.5 py-0.5 font-mono text-[11.5px] font-semibold tabular-nums text-ok">
-            {rate}
-          </span>
+          <Chip tone="accent" unit="次">{req}</Chip>
+          <Chip tone="accent" unit={totalTok !== '—' ? 'tok' : undefined}>{totalTok}</Chip>
+          <Chip tone="warn">{latency}</Chip>
+          <Chip tone="ok">{rate}</Chip>
         </span>
       </Td>
       <Td>
@@ -603,7 +591,7 @@ function ModelLocks({ rows }: { rows?: ModelLock[] }) {
                   <tr key={i}>
                     <Td>{r.model}</Td>
                     <Td>
-                      <span className="rounded border border-accent/25 bg-accent-soft px-1 py-px text-[10px] font-medium text-accent">{realm}</span>
+                      <Badge>{realm}</Badge>
                     </Td>
                     <Td>
                       <Tag tone={st[0] as 'bad' | 'warn' | 'mute'}>{st[1]}</Tag>

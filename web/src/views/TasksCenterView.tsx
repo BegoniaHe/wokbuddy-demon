@@ -2,10 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { api, postJSON } from '@/lib/api';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Select } from '@/components/ui/field';
-import { Box, BoxHeader, BoxHint, BoxTitle, Grow } from '@/components/ui/box';
+import { Select, Tag } from '@/components/ui/field';
+import { Box, BoxHeader, BoxHint, BoxTitle, Dot, Grow, type DotTone } from '@/components/ui/box';
+import { Bar } from '@/components/ui/bar';
 import { VouchersDialog } from '@/components/VouchersDialog';
-import { cn } from '@/lib/utils';
 
 interface QRow {
   kind: string;
@@ -154,7 +154,7 @@ export function TasksCenterView() {
           </Button>
           <label className="inline-flex items-center gap-1.5 whitespace-nowrap text-xs text-ink-3">
             并发
-            <Select className="w-auto rounded-md px-2 py-[3px] text-xs" value={conc} onChange={(e) => setConc(e.target.value)}>
+            <Select size="sm" value={conc} onChange={(e) => setConc(e.target.value)}>
               <option value="1">1</option>
               <option value="2">2</option>
               <option value="3">3</option>
@@ -170,9 +170,7 @@ export function TasksCenterView() {
 
         {progress?.items ? (
           <div className="flex items-center gap-3 px-4 pt-3">
-            <div className="h-1 flex-1 overflow-hidden rounded bg-surface-2">
-              <i className="block h-full rounded bg-accent transition-[width] duration-500" style={{ width: pct + '%' }} />
-            </div>
+            <Bar pct={pct} className="h-1 flex-1" />
             <span className="whitespace-nowrap text-xs tabular-nums text-ink-3">
               {(progress.running ? '执行中 ' : '已结束 ') + done + ' / ' + progress.items.length}
             </span>
@@ -190,7 +188,7 @@ export function TasksCenterView() {
             <div className="font-medium text-ink-2">
               {groups ? '没有待办任务 🎉' : '还没有扫描过'}
             </div>
-            <div className="max-w-[34em] text-center text-[12.5px]">
+            <div className="max-w-[34em] text-center text-xs">
               {groups
                 ? '全部账号的成长任务与开学季活动都已完成，明日再来。'
                 : '扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。'}
@@ -201,7 +199,7 @@ export function TasksCenterView() {
             {groups.map((g) => (
               <div key={g.uid} className="border-t border-line-soft py-1 first:border-t-0">
                 <header className="flex items-baseline gap-2.5 px-4 pb-1.5 pt-2.5">
-                  <span className="text-[13.5px] font-semibold">{g.nick || g.uid.slice(0, 12)}</span>
+                  <span className="text-sm font-semibold">{g.nick || g.uid.slice(0, 12)}</span>
                   <span className="text-xs tabular-nums text-ink-3">{g.rows.length} 项待办</span>
                 </header>
                 {g.rows.map((it, i) => (
@@ -220,30 +218,25 @@ export function TasksCenterView() {
 
 function QueueRow({ it, title }: { it: QRow; title: string }) {
   const isSchool = it.kind === 'school';
-  const dotCls =
-    it.status === 'running'
-      ? 'bg-accent animate-pulse'
-      : it.status === 'error'
-        ? 'bg-bad'
-        : it.status === 'skipped'
-          ? 'bg-ink-3'
-          : it.status === 'done'
-            ? 'bg-ok'
-            : 'border-[1.5px] border-ink-3';
+  const known =
+    it.status === 'running' || it.status === 'error' || it.status === 'skipped' || it.status === 'done';
+  const dotTone: DotTone =
+    it.status === 'running' ? 'accent' : it.status === 'error' ? 'bad' : it.status === 'done' ? 'ok' : 'mute';
+  const dotExtra = it.status === 'running' ? 'animate-pulse' : known ? '' : 'border-[1.5px] border-ink-3 bg-transparent';
   const stWord = it.status === 'scan' ? '待执行' : ST_WORDS[it.status] || it.status;
   return (
     <div
-      className="grid grid-cols-[118px_1fr_52px_84px_minmax(120px,240px)] items-center gap-2.5 px-4 py-[7.5px] text-[13px] hover:bg-surface-2"
+      className="grid grid-cols-[118px_1fr_52px_84px_minmax(120px,240px)] items-center gap-2.5 px-4 py-[7.5px] text-sm hover:bg-surface-2"
       title={it.message || ''}
     >
-      <span className="truncate font-mono text-[11.5px] text-ink-3">{it.code}</span>
+      <span className="truncate font-mono text-2xs text-ink-3">{it.code}</span>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate">{title}</span>
-        {isSchool ? <span className="rounded-full bg-surface-2 px-2 py-px text-[11.5px] text-ink-3">开学季</span> : null}
+        {isSchool ? <Tag tone="mute">开学季</Tag> : null}
       </span>
       <span className="text-right font-mono tabular-nums text-ink-2">{it.prog || ''}</span>
       <span className="inline-flex items-center gap-1.5 whitespace-nowrap">
-        <span className={cn('h-[7px] w-[7px] flex-none rounded-full', dotCls)} />
+        <Dot tone={dotTone} className={dotExtra} />
         {stWord}
       </span>
       <span className="truncate text-xs text-ink-2">{it.message || ''}</span>

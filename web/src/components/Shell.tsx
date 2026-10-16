@@ -15,6 +15,7 @@ import { api } from '@/lib/api';
 import type { Overview } from '@/lib/types';
 import { VIEW_TITLES, type ViewId } from '@/views/registry';
 import { Button } from '@/components/ui/button';
+import { Dot, type DotTone } from '@/components/ui/box';
 import { cn } from '@/lib/utils';
 
 const NAV: { id: ViewId; icon: LucideIcon }[] = [
@@ -64,14 +65,14 @@ export function Shell({
   const healthy = data?.healthy ?? 0;
   const total = data?.total ?? 0;
   const stateText = healthy > 0 ? '服务正常' : total ? '无可用账号' : '待添加账号';
-  const pulseCls = healthy > 0 ? 'bg-ok' : total ? 'bg-warn' : 'bg-bad';
+  const statusTone: DotTone = healthy > 0 ? 'ok' : total ? 'warn' : 'bad';
 
   return (
     <div className="grid min-h-screen grid-cols-1 md:grid-cols-[208px_1fr]">
       <nav className="flex flex-col border-b border-line bg-surface md:sticky md:top-0 md:h-screen md:border-b-0 md:border-r">
         <div className="flex items-center gap-3 border-b border-line-soft px-[18px] py-4 md:block">
-          <div className="text-[15px] font-semibold tracking-tight">WokBuddy Demon</div>
-          <div className="mt-0.5 font-mono text-[11.5px] text-ink-3">
+          <div className="text-lg font-semibold tracking-tight">WokBuddy Demon</div>
+          <div className="mt-0.5 font-mono text-2xs text-ink-3">
             v{data?.version ?? '-'}
           </div>
         </div>
@@ -87,7 +88,7 @@ export function Shell({
                     onNavigate(id);
                   }}
                   className={cn(
-                    'flex items-center gap-2.5 rounded-[7px] px-2.5 py-2 text-[13.5px] no-underline',
+                    'flex items-center gap-2.5 rounded-control px-2.5 py-2 text-sm no-underline',
                     on
                       ? 'bg-accent-soft font-medium text-accent'
                       : 'text-ink-2 hover:bg-surface-2 hover:text-ink',
@@ -100,9 +101,9 @@ export function Shell({
             );
           })}
         </ul>
-        <div className="hidden border-t border-line-soft px-4 py-3 text-[11.5px] text-ink-3 md:block">
+        <div className="hidden border-t border-line-soft px-4 py-3 text-2xs text-ink-3 md:block">
           <div className="flex items-center gap-2">
-            <span className={cn('h-[7px] w-[7px] flex-none rounded-full', pulseCls)} />
+            <Dot tone={statusTone} />
             <span>{stateText}</span>
           </div>
           <div className="mt-1.5">
@@ -113,7 +114,7 @@ export function Shell({
 
       <div className="flex min-w-0 flex-col">
         <div className="sticky top-0 z-20 flex items-center gap-3.5 border-b border-line bg-surface px-4 py-3.5 md:px-6">
-          <h2 className="text-[15.5px] font-semibold tracking-tight">{VIEW_TITLES[view]}</h2>
+          <h2 className="text-lg font-semibold tracking-tight">{VIEW_TITLES[view]}</h2>
           <span className="text-ink-3">/</span>
           <span className="font-mono text-xs text-ink-3">
             {data ? uptimeText(data.uptime_sec) : '-'}

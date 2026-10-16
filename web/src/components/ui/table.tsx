@@ -1,4 +1,4 @@
-import type { HTMLAttributes, ReactNode, ThHTMLAttributes, TdHTMLAttributes } from 'react';
+import type { CSSProperties, HTMLAttributes, ReactNode, ThHTMLAttributes, TdHTMLAttributes } from 'react';
 import { cn } from '@/lib/utils';
 
 // 表格：与旧面板一致——横向可滚、行 hover 高亮、表头小号弱化。
@@ -8,7 +8,7 @@ export function TableWrap({ children, className }: { children: ReactNode; classN
 
 export function Table({ children, className }: { children: ReactNode; className?: string }) {
   return (
-    <table className={cn('w-full min-w-[640px] border-collapse text-[13px]', className)}>
+    <table className={cn('w-full min-w-[640px] border-collapse text-sm', className)}>
       {children}
     </table>
   );
@@ -18,7 +18,7 @@ export function Th({ children, className, ...props }: ThHTMLAttributes<HTMLTable
   return (
     <th
       className={cn(
-        'whitespace-nowrap border-b border-line px-2.5 py-2.5 text-left text-[11.5px] font-medium text-ink-3',
+        'whitespace-nowrap border-b border-line px-2.5 py-2.5 text-left text-2xs font-medium text-ink-3',
         className,
       )}
       {...props}
@@ -50,5 +50,34 @@ export function Num({ children, className, ...props }: HTMLAttributes<HTMLSpanEl
     <span className={cn('font-mono tabular-nums whitespace-nowrap', className)} {...props}>
       {children}
     </span>
+  );
+}
+
+const railTone = {
+  accent: 'bg-accent',
+  ok: 'bg-ok',
+  warn: 'bg-warn',
+  bad: 'bg-bad',
+  mute: 'bg-line',
+} as const;
+
+export type RailTone = keyof typeof railTone;
+
+// RailCell：行首 3px 状态色条单元格（账号 / 模型 / 包表统一使用）。
+export function RailCell({
+  tone,
+  style,
+  className,
+}: {
+  tone?: RailTone;
+  style?: CSSProperties;
+  className?: string;
+}) {
+  return (
+    <Td className="w-[3px] p-0">
+      {tone || style ? (
+        <i className={cn('block h-full min-h-[36px] w-[3px]', tone && railTone[tone], className)} style={style} />
+      ) : null}
+    </Td>
   );
 }

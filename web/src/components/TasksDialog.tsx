@@ -3,7 +3,7 @@ import { api, postJSON } from '@/lib/api';
 import { AUTO_TASKS } from '@/lib/autoTasks';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Table, TableWrap, Td, Th } from '@/components/ui/table';
+import { Table, TableWrap, Td, Th, RailCell } from '@/components/ui/table';
 import { Tag } from '@/components/ui/field';
 import { Modal, ModalBody, ModalFooter, ModalHeader, ModalHint, ModalTitle } from '@/components/ui/dialog';
 
@@ -139,11 +139,11 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
       </ModalHeader>
       <ModalBody>
         {isLoading ? (
-          <div className="text-[13px] text-ink-2">加载中…</div>
+          <div className="text-sm text-ink-2">加载中…</div>
         ) : error ? (
-          <div className="text-[13px] text-bad">{(error as Error).message}</div>
+          <div className="text-sm text-bad">{(error as Error).message}</div>
         ) : tasks.length === 0 ? (
-          <div className="text-[13px] text-ink-2">该账号暂无任务</div>
+          <div className="text-sm text-ink-2">该账号暂无任务</div>
         ) : (
           <TableWrap>
             <Table className="min-w-[700px]">
@@ -183,12 +183,10 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
                     .join('\n');
                   return (
                     <tr key={t.task_code} title={tip}>
-                      <Td className="w-[3px] p-0">
-                        <i className="block h-full min-h-[36px] w-[3px] bg-ok" />
-                      </Td>
+                      <RailCell tone="ok" />
                       <Td>
                         <div className="font-medium">{t.title || t.task_code}</div>
-                        <div className="font-mono text-[11.5px] text-ink-3">
+                        <div className="font-mono text-2xs text-ink-3">
                           {t.task_code}
                           {t.tag ? ' · ' + t.tag : ''}
                         </div>
