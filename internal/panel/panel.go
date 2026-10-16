@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
@@ -61,6 +62,9 @@ type Config struct {
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
+	// Keys 命名密钥存储（nil = 密钥接口返回 501）。仅面板管理；面板自身鉴权
+	// 仍只认默认 api_key（命名密钥是给网关客户端的，不应获得管理权限）。
+	Keys *apikey.Store
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -184,6 +188,10 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.keysList))
+	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
+	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAuth(p.keysRevoke))
+	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAuth(p.keysDelete))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))

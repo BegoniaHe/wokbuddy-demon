@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
@@ -1191,6 +1192,85 @@ func TestAPIKeyAuth(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Errorf("right key: code=%d", rec.Code)
+	}
+}
+
+// TestNamedKeyAuth 命名密钥只作用于 /v1/*：接受于 models/chat，拒绝于 /status 与
+// /metrics（运维面只认默认密钥）；默认密钥照旧；撤销后立即失效；命中时计入该密钥的请求数。
+func TestNamedKeyAuth(t *testing.T) {
+	store := apikey.New("")
+	rec, raw, err := store.Create("client-a")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		APIKey:   "secret",
+		Keys:     store,
+	})
+	do := func(method, path, token string) int {
+		req := httptest.NewRequest(method, path, strings.NewReader(`{}`))
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rw := httptest.NewRecorder()
+		h.ServeHTTP(rw, req)
+		return rw.Code
+	}
+
+	cases := []struct {
+		name, method, path, token string
+		want                      int
+	}{
+		{"命名密钥可用于 /v1/models", http.MethodGet, "/v1/models", raw, 200},
+		{"命名密钥不可用于 /status", http.MethodGet, "/status", raw, 401},
+		{"命名密钥不可用于 /metrics", http.MethodGet, "/metrics", raw, 401},
+		{"默认密钥可用于 /status", http.MethodGet, "/status", "secret", 200},
+		{"默认密钥可用于 /metrics", http.MethodGet, "/metrics", "secret", 200},
+		{"未知密钥被拒", http.MethodGet, "/v1/models", "sk-wb-nope", 401},
+	}
+	for _, c := range cases {
+		if code := do(c.method, c.path, c.token); code != c.want {
+			t.Errorf("%s: code=%d, want %d", c.name, code, c.want)
+		}
+	}
+	// 仅那次成功的命名密钥请求计入用量（默认密钥与 401 不计）。
+	if got := store.List()[0].Requests; got != 1 {
+		t.Errorf("named key requests = %d, want 1", got)
+	}
+
+	if ok, err := store.Revoke(rec.ID); err != nil || !ok {
+		t.Fatalf("revoke: %v, %v", ok, err)
+	}
+	if code := do(http.MethodGet, "/v1/models", raw); code != 401 {
+		t.Errorf("revoked key on /v1/models: code=%d, want 401", code)
+	}
+}
+
+// TestNamedKeyRequiredWhenDefaultEmpty 默认密钥为空但存在命名密钥时，/v1/* 必须鉴权。
+func TestNamedKeyRequiredWhenDefaultEmpty(t *testing.T) {
+	store := apikey.New("")
+	_, raw, _ := store.Create("client")
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		Keys:     store,
+	})
+	// 无 token → 401
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	rw := httptest.NewRecorder()
+	h.ServeHTTP(rw, req)
+	if rw.Code != 401 {
+		t.Errorf("no token with keys present: code=%d, want 401", rw.Code)
+	}
+	// 正确命名密钥 → 200
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+raw)
+	rw = httptest.NewRecorder()
+	h.ServeHTTP(rw, req)
+	if rw.Code != 200 {
+		t.Errorf("valid named key: code=%d, want 200", rw.Code)
 	}
 }
 
