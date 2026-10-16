@@ -192,7 +192,14 @@ func isPromptTooLongStatus(status int) bool {
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var (
 	alreadyCheckinMarkers = []string{"已签到", "already"}
-	badParamsMarkerCode   = `"code":11101`
+	// inactiveCheckinMarkers "活动未开启/未开放/已结束"等非错误态关键词（上游对未开放
+	// 的签到活动返回 code!=0 + 明确文案）。保守取显式短语：未命中即判真失败，避免把
+	// 真失败误当 inactive 而漏报。文案按实测补充（见 issue #27）。
+	inactiveCheckinMarkers = []string{
+		"活动未开启", "活动未开放", "活动已结束", "活动结束",
+		"未开启", "未开放", "已过期", "inactive",
+	}
+	badParamsMarkerCode = `"code":11101`
 )
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
@@ -2500,16 +2507,58 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 // 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
 // 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
 func IsAlreadyCheckin(err error) bool {
+	return matchCheckinMarker(err, alreadyCheckinMarkers)
+}
+
+// IsCheckinInactive 报告 err 是否表示"签到活动未开启/未开放/已结束"等非错误态。
+// 与 IsAlreadyCheckin 同口径：只认 *Error.Msg，网络层/解析层错误不在此识别；
+// 保守策略——未命中显式 inactive 关键词即返回 false（真失败不误判为 inactive）。
+func IsCheckinInactive(err error) bool {
+	return matchCheckinMarker(err, inactiveCheckinMarkers)
+}
+
+// matchCheckinMarker 对 *Error.Msg 做大小写不敏感的关键词包含匹配。
+func matchCheckinMarker(err error, markers []string) bool {
 	var ue *Error
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
+	lower := strings.ToLower(ue.Msg)
+	for _, m := range markers {
+		if strings.Contains(ue.Msg, m) || strings.Contains(lower, strings.ToLower(m)) {
 			return true
 		}
 	}
 	return false
+}
+
+// CheckinResult 签到结果分类：inactive（活动未开启）与 already（幂等）从真失败中分离，
+// 供调度日志与面板按类呈现，避免把非错误态刷成 error 行。
+type CheckinResult int
+
+const (
+	// CheckinOK 签到成功（err == nil）。
+	CheckinOK CheckinResult = iota
+	// CheckinAlready 上游幂等拒绝重复签到（"今天已签到"）。
+	CheckinAlready
+	// CheckinInactive 活动未开启/未开放/已结束等非错误态。
+	CheckinInactive
+	// CheckinFailed 其余业务/HTTP 错误（真失败）。
+	CheckinFailed
+)
+
+// ClassifyCheckin 归类签到结果。分类只描述「结果语义」，不改变重试与幂等判定。
+func ClassifyCheckin(err error) CheckinResult {
+	switch {
+	case err == nil:
+		return CheckinOK
+	case IsAlreadyCheckin(err):
+		return CheckinAlready
+	case IsCheckinInactive(err):
+		return CheckinInactive
+	default:
+		return CheckinFailed
+	}
 }
 
 func truncate(s string, n int) string {

@@ -562,11 +562,17 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if a.IsEnterprise() {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
-		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
-		if upstream.IsAlreadyCheckin(err) {
+		// 按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游非错误态，
+		// 不标记已签、给出可区分文案（issue #27）；其余才是真失败。
+		switch upstream.ClassifyCheckin(err) {
+		case upstream.CheckinAlready:
 			p.cfg.Pool.NoteCheckinDone(uid)
 			checkinDone = true
+			checkinMsg = "今天已签到"
+		case upstream.CheckinInactive:
+			checkinMsg = "签到活动未开启（非失败）"
+		default:
+			checkinMsg = err.Error() // 业务错误照常查余额
 		}
 	} else {
 		p.cfg.Pool.NoteCheckinDone(uid)
