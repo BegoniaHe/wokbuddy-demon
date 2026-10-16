@@ -167,14 +167,29 @@ func (r *Recorder) Record(e Event) {
 	if e.Time.IsZero() {
 		e.Time = time.Now()
 	}
-	if e.Outcome == "" {
-		if e.Status == 200 && e.OK {
-			e.Outcome = OutcomeSuccess
-		} else {
-			e.Outcome = OutcomeHTTPError
-		}
-	}
+	e.normalizeOutcome()
 	r.mu.Lock()
+	r.observe(e)
+	r.mu.Unlock()
+	if r.archive != nil {
+		r.archive.enqueue(e)
+	}
+}
+
+// normalizeOutcome 在未显式指定结果时按状态码与成功标志推断 outcome。
+func (e *Event) normalizeOutcome() {
+	if e.Outcome != "" {
+		return
+	}
+	if e.Status == 200 && e.OK {
+		e.Outcome = OutcomeSuccess
+		return
+	}
+	e.Outcome = OutcomeHTTPError
+}
+
+// observe 在持锁状态下累计内存指标并保留最近事件。
+func (r *Recorder) observe(e Event) {
 	if r.inFlight > 0 {
 		r.inFlight--
 	}
@@ -189,10 +204,6 @@ func (r *Recorder) Record(e Event) {
 	r.recent = append([]Event{e}, r.recent...)
 	if len(r.recent) > recentLimit {
 		r.recent = r.recent[:recentLimit]
-	}
-	r.mu.Unlock()
-	if r.archive != nil {
-		r.archive.enqueue(e)
 	}
 }
 
@@ -342,18 +353,9 @@ func (w *archiveWriter) writeEvent(e Event) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	day := now.Format("2006-01-02")
-	if w.file == nil || w.day != day {
-		if err := w.openFile(now, false); err != nil {
-			w.setErr(err)
-			return
-		}
-	}
-	if w.size > 0 && w.size+int64(len(raw))+1 > w.cfg.FileMaxBytes {
-		if err := w.openFile(now, true); err != nil {
-			w.setErr(err)
-			return
-		}
+	if err := w.ensureFile(now, len(raw)); err != nil {
+		w.setErr(err)
+		return
 	}
 	if _, err := w.buf.Write(raw); err != nil {
 		w.setErr(err)
@@ -364,6 +366,22 @@ func (w *archiveWriter) writeEvent(e Event) {
 		return
 	}
 	w.size += int64(len(raw)) + 1
+}
+
+// ensureFile 保证当前写入文件存在且未越过单文件上限，必要时按天切换或轮转。
+func (w *archiveWriter) ensureFile(now time.Time, rawLen int) error {
+	day := now.Format("2006-01-02")
+	if w.file == nil || w.day != day {
+		if err := w.openFile(now, false); err != nil {
+			return err
+		}
+	}
+	if w.size > 0 && w.size+int64(rawLen)+1 > w.cfg.FileMaxBytes {
+		if err := w.openFile(now, true); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *archiveWriter) openFile(now time.Time, rotate bool) error {
@@ -468,34 +486,52 @@ func (w *archiveWriter) closeFile() {
 	w.size = 0
 }
 
-func (w *archiveWriter) prune() {
-	if !w.enabled() {
-		return
+// archiveItem 是一个归档文件的裁剪元数据。
+type archiveItem struct {
+	path  string
+	size  int64
+	mtime time.Time
+}
+
+// isArchiveFile 判断目录项是否为归档文件（requests-*.jsonl）。
+func isArchiveFile(entry os.DirEntry) bool {
+	if entry.IsDir() {
+		return false
 	}
-	entries, err := os.ReadDir(w.cfg.Dir)
+	name := entry.Name()
+	return strings.HasPrefix(name, "requests-") && strings.HasSuffix(name, ".jsonl")
+}
+
+// scanArchiveItems 收集归档目录下所有归档文件的元数据与总字节数。
+func scanArchiveItems(dir string) ([]archiveItem, int64, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		w.setErr(err)
-		return
+		return nil, 0, err
 	}
-	type item struct {
-		path  string
-		size  int64
-		mtime time.Time
-	}
-	items := make([]item, 0, len(entries))
+	items := make([]archiveItem, 0, len(entries))
 	var total int64
-	cutoff := time.Now().AddDate(0, 0, -w.cfg.RetentionDays)
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "requests-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if !isArchiveFile(entry) {
 			continue
 		}
-		path := filepath.Join(w.cfg.Dir, entry.Name())
 		info, err := entry.Info()
 		if err != nil {
 			continue
 		}
-		items = append(items, item{path: path, size: info.Size(), mtime: info.ModTime()})
+		items = append(items, archiveItem{path: filepath.Join(dir, entry.Name()), size: info.Size(), mtime: info.ModTime()})
 		total += info.Size()
+	}
+	return items, total, nil
+}
+
+func (w *archiveWriter) prune() {
+	if !w.enabled() {
+		return
+	}
+	items, total, err := scanArchiveItems(w.cfg.Dir)
+	if err != nil {
+		w.setErr(err)
+		return
 	}
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].mtime.Equal(items[j].mtime) {
@@ -503,11 +539,18 @@ func (w *archiveWriter) prune() {
 		}
 		return items[i].mtime.Before(items[j].mtime)
 	})
+	w.removeExpired(items, total)
+}
+
+// removeExpired 按「最早优先」删除过期或超额的归档文件，跳过当前写入文件。
+func (w *archiveWriter) removeExpired(items []archiveItem, total int64) {
+	cutoff := time.Now().AddDate(0, 0, -w.cfg.RetentionDays)
 	for _, it := range items {
-		if it.path != w.path && (it.mtime.Before(cutoff) || total > w.cfg.MaxBytes) {
-			if err := os.Remove(it.path); err == nil {
-				total -= it.size
-			}
+		if it.path == w.path || (!it.mtime.Before(cutoff) && total <= w.cfg.MaxBytes) {
+			continue
+		}
+		if err := os.Remove(it.path); err == nil {
+			total -= it.size
 		}
 	}
 }
@@ -516,12 +559,7 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	if !w.enabled() {
 		return nil, nil
 	}
-	if limit <= 0 {
-		limit = 200
-	}
-	if limit > defaultReadMax {
-		limit = defaultReadMax
-	}
+	limit = clampReadLimit(limit)
 	entries, err := os.ReadDir(w.cfg.Dir)
 	if err != nil {
 		return nil, err
@@ -532,11 +570,10 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 	// requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复备份后 mtime 更不可信。
 	var out []Event
 	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
+		if !isArchiveFile(entry) {
 			continue
 		}
-		rows, err := readFile(filepath.Join(w.cfg.Dir, name), filter)
+		rows, err := readFile(filepath.Join(w.cfg.Dir, entry.Name()), filter)
 		if err != nil {
 			return out, err
 		}
@@ -548,6 +585,17 @@ func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
 		out = out[:limit]
 	}
 	return out, nil
+}
+
+// clampReadLimit 归一化读取条数：<=0 回落 200，上限 1000。
+func clampReadLimit(limit int) int {
+	if limit <= 0 {
+		return 200
+	}
+	if limit > defaultReadMax {
+		return defaultReadMax
+	}
+	return limit
 }
 
 func readFile(path string, filter Filter) ([]Event, error) {
@@ -573,22 +621,26 @@ func (f Filter) match(e Event) bool {
 	if f.Outcome != "" && e.Outcome != f.Outcome {
 		return false
 	}
-	if !containsFold(e.Account, f.Account) {
+	if !f.matchTextFields(e) {
 		return false
 	}
-	if !containsFold(e.Model, f.Model) {
+	return f.matchTimeRange(e.Time)
+}
+
+// matchTextFields 对所有字符串字段做大小写不敏感的包含匹配，全部命中才返回 true。
+func (f Filter) matchTextFields(e Event) bool {
+	return containsFold(e.Account, f.Account) &&
+		containsFold(e.Model, f.Model) &&
+		containsFold(e.ClientIP, f.ClientIP) &&
+		containsFold(e.UserAgent, f.UserAgent)
+}
+
+// matchTimeRange 闭区间时间过滤，From/To 任一侧零值即该侧不设界。
+func (f Filter) matchTimeRange(t time.Time) bool {
+	if !f.From.IsZero() && t.Before(f.From) {
 		return false
 	}
-	if !containsFold(e.ClientIP, f.ClientIP) {
-		return false
-	}
-	if !containsFold(e.UserAgent, f.UserAgent) {
-		return false
-	}
-	if !f.From.IsZero() && e.Time.Before(f.From) {
-		return false
-	}
-	if !f.To.IsZero() && e.Time.After(f.To) {
+	if !f.To.IsZero() && t.After(f.To) {
 		return false
 	}
 	return true
@@ -613,7 +665,7 @@ func (w *archiveWriter) stats() ArchiveStats {
 		return s
 	}
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "requests-") || !strings.HasSuffix(entry.Name(), ".jsonl") {
+		if !isArchiveFile(entry) {
 			continue
 		}
 		if info, err := entry.Info(); err == nil {
