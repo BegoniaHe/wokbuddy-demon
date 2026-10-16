@@ -89,6 +89,8 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// streams 在途 SSE 流注册表（issue #19）：关闭时显式等待排空并记录未排空数。
+	streams *streamTracker
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -139,7 +141,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker()}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
@@ -156,6 +158,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("/", h.notFound)
 	return h
 }
+
+// ActiveStreams 返回当前在途 SSE 流数（供优雅关闭记录未排空情况，issue #19）。
+func (h *Handler) ActiveStreams() int { return h.streams.Active() }
 
 // notFound 未注册路径的统一出口：OpenAI 风格 404 JSON（不鉴权——未知路径无需泄露
 // 鉴权存在性，也不暴露端点清单）。协议面（OpenAI 兼容 API）只承诺
@@ -1062,6 +1067,9 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
 func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
+	f.h.streams.enter()
+	defer f.h.streams.leave()
 	// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 	f.st.status = http.StatusOK
 	stats := newChatStatsReaderSince(rc, f.st.start)
