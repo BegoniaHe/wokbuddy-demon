@@ -68,6 +68,9 @@ type Pool struct {
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
+	// nowFn 仅供测试注入确定性时钟（退避 / EWMA / 冷却计算的时间来源）；
+	// nil 时用系统时钟 time.Now（生产默认）。见 SetClock 与 p.now。
+	nowFn func() time.Time
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
@@ -330,6 +333,23 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.randInt64N = fn
+}
+
+// SetClock 仅供测试注入确定性时钟；生产代码不应调用。注入后，退避 / EWMA /
+// 冷却 / 选号空闲补偿等所有时间计算改用注入源，使时序用例无需真实 sleep。
+func (p *Pool) SetClock(fn func() time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.nowFn = fn
+}
+
+// now 返回当前时间：注入时钟优先，否则系统时钟。所有退避 / EWMA / 冷却 / 选号
+// 时间计算必须经此取值，避免直接 time.Now() 绕过注入（时序测试确定性）。
+func (p *Pool) now() time.Time {
+	if p.nowFn != nil {
+		return p.nowFn()
+	}
+	return time.Now()
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。

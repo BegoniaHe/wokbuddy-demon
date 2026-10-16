@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 )
 
 // hourlyKeep 小时桶的保留时长；超出后折叠为日桶。
@@ -49,25 +51,30 @@ const fileVersion = 4
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`            // cn / global
-	UID   string  `json:"u"`            // 账号 uid
-	Model string  `json:"m"`            // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`            // 请求数（含失败）
-	Err   int64   `json:"e"`            // 失败数
-	PT    int64   `json:"p"`            // prompt tokens
-	CT    int64   `json:"c"`            // completion tokens
-	TT    int64   `json:"t"`            // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`            // 延迟累计（ms）
-	LatN  int64   `json:"ln"`           // 延迟样本数
-	TPS   float64 `json:"v"`            // 吐字速率累计
-	TPSN  int64   `json:"vn"`           // 速率样本数
-	CR    float64 `json:"cr,omitempty"` // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"` // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"` // 同时具备 credit 与 token 的 Token 合计
-	CH    int64   `json:"ch,omitempty"` // 前缀缓存命中 token 累计（上游回该维度才累计）
-	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
+	Scope string  `json:"s"`             // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string  `json:"r"`             // cn / global
+	UID   string  `json:"u"`             // 账号 uid
+	Model string  `json:"m"`             // 上游裸模型名
+	Rate  string  `json:"x,omitempty"`   // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Req   int64   `json:"q"`             // 请求数（含失败）
+	Err   int64   `json:"e"`             // 失败数
+	PT    int64   `json:"p"`             // prompt tokens
+	CT    int64   `json:"c"`             // completion tokens
+	TT    int64   `json:"t"`             // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`             // 延迟累计（ms）
+	LatN  int64   `json:"ln"`            // 延迟样本数
+	TFMs  int64   `json:"tf,omitempty"`  // 首字节延迟（TTFT）累计（ms，仅流式观测）
+	TFN   int64   `json:"tfn,omitempty"` // TTFT 样本数
+	TPS   float64 `json:"v"`             // 吐字速率累计
+	TPSN  int64   `json:"vn"`            // 速率样本数
+	CR    float64 `json:"cr,omitempty"`  // usage.credit 累计（仅明确存在的观测）
+	CRN   int64   `json:"cn,omitempty"`  // usage.credit 样本数（区分缺字段与真实 0）
+	CRT   int64   `json:"ct,omitempty"`  // 同时具备 credit 与 token 的 Token 合计
+	CH    int64   `json:"ch,omitempty"`  // 前缀缓存命中 token 累计（上游回该维度才累计）
+	CM    int64   `json:"cm,omitempty"`  // 前缀缓存未命中 token 累计
+	// Synced 标记该桶来自上游逐笔用量回填（issue #31）：覆盖本地记录，供聚合与
+	// 面板区分「本地实时记录」与「上游权威对账」。
+	Synced bool `json:"syn,omitempty"`
 }
 
 // file 落盘结构。
@@ -154,6 +161,8 @@ type Delta struct {
 	CacheMissTokens int64
 	LatencyMs       int64
 	HasLatency      bool
+	TTFTMs          int64
+	HasTTFT         bool
 	TokensPerSecond float64
 	HasTPS          bool
 }
@@ -185,6 +194,102 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	}
 	b.apply(d, ok)
 	r.dirty = true
+}
+
+// BackfillRow 上游逐笔用量按天聚合的一行（issue #31）。
+//
+// 只承载上游逐笔接口能提供的权威维度（请求数 / 积分）；token、延迟、缓存等维度
+// 上游不返回，回填时保留本地观测（见 applyBackfillLocked），故不在此声明。
+type BackfillRow struct {
+	Day      string // 本地日历日 "2006-01-02"
+	Realm    string
+	UID      string
+	Model    string
+	Requests int64
+	Credits  float64
+}
+
+// Backfill 用上游权威数据覆盖指定 (天, realm, uid, model) 的用量桶：删除该键的本地
+// 小时桶与日桶后写入标记 Synced 的日桶，避免与本地实时记录重复计数（issue #31）。
+// 仅覆盖上游能提供的维度（请求数 / 积分），token / 延迟 / 缓存等本地维度在覆盖前
+// 聚合保留，避免把无法从上游恢复的本地观测清零。返回覆盖的桶数。仅显式触发时调用。
+func (r *Recorder) Backfill(rows []BackfillRow) int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, row := range rows {
+		if row.Day == "" || row.UID == "" {
+			continue
+		}
+		r.applyBackfillLocked(row)
+		n++
+	}
+	if n > 0 {
+		r.dirty = true
+	}
+	return n
+}
+
+// applyBackfillLocked 覆盖单个 (天, realm, uid, model) 的桶：先聚合本地不可从上游
+// 恢复的维度（token / 延迟 / 缓存），删除本地桶后写入携带这些维度、标记 Synced 的日桶。
+func (r *Recorder) applyBackfillLocked(row BackfillRow) {
+	realm := row.Realm
+	if realm == "" {
+		realm = "cn"
+	}
+	model := row.Model
+	if model == "" {
+		model = "(unknown)"
+	}
+	dayScope := "d:" + row.Day
+	hourPrefix := "h:" + row.Day + "T"
+	var local bucket
+	for k, b := range r.buckets {
+		if b.UID != row.UID || b.Realm != realm || b.Model != model ||
+			(b.Scope != dayScope && !strings.HasPrefix(b.Scope, hourPrefix)) {
+			continue
+		}
+		local.PT += b.PT
+		local.CT += b.CT
+		local.TT += b.TT
+		local.LatMs += b.LatMs
+		local.LatN += b.LatN
+		local.TFMs += b.TFMs
+		local.TFN += b.TFN
+		local.TPS += b.TPS
+		local.TPSN += b.TPSN
+		local.CH += b.CH
+		local.CM += b.CM
+		delete(r.buckets, k)
+	}
+	b := &bucket{
+		Scope:  dayScope,
+		Realm:  realm,
+		UID:    row.UID,
+		Model:  model,
+		Req:    row.Requests,
+		PT:     local.PT,
+		CT:     local.CT,
+		TT:     local.TT,
+		LatMs:  local.LatMs,
+		LatN:   local.LatN,
+		TFMs:   local.TFMs,
+		TFN:    local.TFN,
+		TPS:    local.TPS,
+		TPSN:   local.TPSN,
+		CH:     local.CH,
+		CM:     local.CM,
+		Synced: true,
+	}
+	if row.Credits != 0 {
+		b.CR = row.Credits
+		b.CRN = row.Requests
+		b.CRT = local.TT
+	}
+	r.buckets[dayScope+"|"+realm+"|"+row.UID+"|"+model+"|"] = b
 }
 
 // tokenTotal 返回本次尝试的 token 合计：优先上游给的 total，缺省用 pt+ct 兜底，
@@ -226,6 +331,10 @@ func (b *bucket) apply(d Delta, ok bool) {
 	if d.HasLatency {
 		b.LatMs += d.LatencyMs
 		b.LatN++
+	}
+	if d.HasTTFT {
+		b.TFMs += d.TTFTMs
+		b.TFN++
 	}
 	if d.HasTPS {
 		b.TPS += d.TokensPerSecond
@@ -276,6 +385,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.TT += src.TT
 			dst.LatMs += src.LatMs
 			dst.LatN += src.LatN
+			dst.TFMs += src.TFMs
+			dst.TFN += src.TFN
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
 			dst.CR += src.CR
@@ -344,7 +455,7 @@ func (r *Recorder) flush(force bool) {
 		log.Printf("[usage] 写临时文件失败: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, r.path); err != nil {
+	if err := atomicwrite.Rename(tmp, r.path); err != nil {
 		log.Printf("[usage] 原子替换失败: %v", err)
 	}
 }
@@ -369,6 +480,7 @@ type Agg struct {
 	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
 	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
 	AvgLatencyMs       float64 `json:"avg_latency_ms"`
+	AvgTTFTMs          float64 `json:"avg_ttft_ms,omitempty"`
 	AvgTPS             float64 `json:"avg_tokens_per_second"`
 }
 
@@ -377,10 +489,12 @@ type Agg struct {
 type aggAcc struct {
 	Agg
 
-	latSum     int64
-	latSamples int64
-	tpsSum     float64
-	tpsSamples int64
+	latSum      int64
+	latSamples  int64
+	ttftSum     int64
+	ttftSamples int64
+	tpsSum      float64
+	tpsSamples  int64
 }
 
 func (g *aggAcc) add(b *bucket) {
@@ -396,6 +510,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.CacheMissTokens += b.CM
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
+	g.ttftSum += b.TFMs
+	g.ttftSamples += b.TFN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
 }
@@ -404,6 +520,9 @@ func (g *aggAcc) finish() Agg {
 	a := g.Agg
 	if g.latSamples > 0 {
 		a.AvgLatencyMs = float64(g.latSum) / float64(g.latSamples)
+	}
+	if g.ttftSamples > 0 {
+		a.AvgTTFTMs = float64(g.ttftSum) / float64(g.ttftSamples)
 	}
 	if g.tpsSamples > 0 {
 		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)

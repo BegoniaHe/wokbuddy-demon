@@ -63,10 +63,21 @@ func (r *recorderUpstream) server() *httptest.Server {
 	}))
 }
 
+// fastAdoptGap 关闭领养前置上报后的等待，避免测试白等 ~1s（issue #20）。
+func fastAdoptGap(t *testing.T) {
+	t.Helper()
+	old := adoptReportGap
+	adoptReportGap = 0
+	t.Cleanup(func() { adoptReportGap = old })
+}
+
 // enterpriseTestScheduler 构造只含一个账号的调度器；enterprise=true 时该号带
 // enterpriseId（企业版），否则是个人号（对照组）。
 func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *recorderUpstream) {
 	t.Helper()
+	fastTravel(t)
+	fastActivity(t)
+	fastAdoptGap(t)
 	r := &recorderUpstream{}
 	srv := r.server()
 	t.Cleanup(srv.Close)

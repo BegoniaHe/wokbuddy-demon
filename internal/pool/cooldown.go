@@ -55,7 +55,7 @@ func (p *Pool) NoteCheckinDone(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		day := time.Now().Format("2006-01-02")
+		day := p.now().Format("2006-01-02")
 		if e.lastCheckinDay != day {
 			e.lastCheckinDay = day
 			p.dirty.Store(true)
@@ -73,7 +73,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 	if !ok {
 		return
 	}
-	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(credits, expiring, earliestAt, earliestRemaining)
+	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(p.now(), credits, expiring, earliestAt, earliestRemaining)
 	e.credits = credits
 	e.creditsTotal = total
 	e.creditsExpiring = expiring
@@ -84,7 +84,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 
 // clampCreditsDetailed 把上游余额/到期明细钳到合法区间：负数归零、子集不超过总额，
 // 最早到期批次不在未来（或剩余为零）时整体清空。纯函数，便于单点校验。
-func clampCreditsDetailed(credits, expiring int64, earliestAt time.Time, earliestRemaining int64) (int64, int64, time.Time, int64) {
+func clampCreditsDetailed(now time.Time, credits, expiring int64, earliestAt time.Time, earliestRemaining int64) (int64, int64, time.Time, int64) {
 	if credits < 0 {
 		credits = 0
 	}
@@ -100,7 +100,7 @@ func clampCreditsDetailed(credits, expiring int64, earliestAt time.Time, earlies
 	if earliestRemaining > credits {
 		earliestRemaining = credits
 	}
-	if earliestAt.IsZero() || !earliestAt.After(time.Now()) || earliestRemaining == 0 {
+	if earliestAt.IsZero() || !earliestAt.After(now) || earliestRemaining == 0 {
 		earliestAt = time.Time{}
 		earliestRemaining = 0
 	}
@@ -132,7 +132,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.until = time.Now().Add(d)
+		e.until = p.now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
 		// 非模型级冷却入口：清空会参与路由的模型级冷却，避免上一次
@@ -161,7 +161,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 	if !ok {
 		return
 	}
-	now := time.Now()
+	now := p.now()
 	if !resetAt.IsZero() {
 		// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
 		if e.modelCooldowns == nil {
@@ -200,7 +200,7 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	if !ok {
 		return
 	}
-	now := time.Now()
+	now := p.now()
 	if old, exists := e.modelCooldowns[model]; exists && !old.AuditOnly && old.Until.After(now) {
 		return // 已有真实模型冷却，审计记录不得覆盖路由截止
 	}
@@ -260,7 +260,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if !ok {
 		return
 	}
-	now := time.Now()
+	now := p.now()
 	hits := 0
 	if e.modelCooldowns != nil {
 		hits = e.modelCooldowns[model].Hits
@@ -308,12 +308,35 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	p.dirty.Store(true)
 }
 
+// 模型级阻塞的范围（issue #29）：
+//   - platform：>=2 个被挡账号共享同一非零上游重置时刻 ResetAt——推断为上游**平台级**
+//     限流（同一时刻对全池解封），运维应等上游恢复；
+//   - account：各账号独立冷却 / 无重置时刻 / 仅单账号被挡——账号级问题，换号或等本号恢复。
+const (
+	ModelBlockScopePlatform = "platform"
+	ModelBlockScopeAccount  = "account"
+)
+
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
 type ModelBlockStatus struct {
 	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
 	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// Scope 阻塞范围：platform / account（见常量）。只读诊断，不参与选号。
+	Scope string
+	// SharedResetAt 平台级时的共享上游重置时刻（账号级为零值）。
+	SharedResetAt time.Time
+}
+
+// modelBlockScope 由被挡账号的重置时刻一致性推断阻塞范围：全部被挡账号（>=2）
+// 都带非零 ResetAt 且完全一致 → platform；否则 account。精确相等（无容差）是保守
+// 选择——上游给语义相同但毫秒级不同的时刻时会判账号级，不会误报平台级。
+func modelBlockScope(total, withReset, distinctResets int, shared time.Time) (string, time.Time) {
+	if total >= 2 && withReset == total && distinctResets == 1 && !shared.IsZero() {
+		return ModelBlockScopePlatform, shared
+	}
+	return ModelBlockScopeAccount, time.Time{}
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
@@ -336,9 +359,16 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := time.Now()
+	now := p.now()
 
 	var st ModelBlockStatus
+	// 重置时刻一致性统计（issue #29）：distinct 用集合去重，withReset 计带非零
+	// ResetAt 的账号数，shared 记唯一值。
+	var (
+		withReset int
+		distinct  = make(map[time.Time]struct{})
+		shared    time.Time
+	)
 	for _, e := range p.byUID {
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的
 		// 证明不成立——否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」。
@@ -352,12 +382,18 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 		st.Count++
 		mc, ok := e.modelCooldowns[model]
 		st.mergeModelCooldown(mc, ok)
+		if ok && !mc.ResetAt.IsZero() {
+			withReset++
+			distinct[mc.ResetAt] = struct{}{}
+			shared = mc.ResetAt
+		}
 	}
 	if st.Count == 0 {
 		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。
 		return ModelBlockStatus{}
 	}
 	st.Blocked = true
+	st.Scope, st.SharedResetAt = modelBlockScope(st.Count, withReset, len(distinct), shared)
 	return st
 }
 
@@ -392,7 +428,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		now := time.Now()
+		now := p.now()
 		if !resetAt.IsZero() {
 			e.until = p.cappedSoftUntilLocked(now, resetAt)
 		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
@@ -473,13 +509,13 @@ func (p *Pool) recordBreakerFailureLocked(e *entry) {
 	// 触发熔断：重置失败计数供下一轮重新累计；retryCount 递增放大退避指数。
 	e.fails = 0
 	e.retryCount++
-	e.breakerUntil = time.Now().Add(d)
+	e.breakerUntil = p.now().Add(d)
 }
 
 // CooldownUntilTomorrow4AM 冷却到下一个 04:00（本地时区）。
 // 用于 ErrHardCredit 场景：积分耗尽账号等签到任务（09:00/21:00）恢复。
 func (p *Pool) CooldownUntilTomorrow4AM(uid, reason string) {
-	now := time.Now()
+	now := p.now()
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }
 

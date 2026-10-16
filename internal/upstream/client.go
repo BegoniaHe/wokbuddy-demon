@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -192,7 +193,14 @@ func isPromptTooLongStatus(status int) bool {
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var (
 	alreadyCheckinMarkers = []string{"已签到", "already"}
-	badParamsMarkerCode   = `"code":11101`
+	// inactiveCheckinMarkers "活动未开启/未开放/已结束"等非错误态关键词（上游对未开放
+	// 的签到活动返回 code!=0 + 明确文案）。保守取带「活动」上下文的显式短语：未命中即判
+	// 真失败，避免把真失败误当 inactive 而漏报；也不误伤凭证类文案（如「登录态已过期」
+	// 含「已过期」但非活动态）。文案按实测补充（见 issue #27）。
+	inactiveCheckinMarkers = []string{
+		"活动未开启", "活动未开放", "活动已结束", "活动已过期",
+	}
+	badParamsMarkerCode = `"code":11101`
 )
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
@@ -721,6 +729,10 @@ type Client struct {
 	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
 	ChatHTTP *http.Client
 
+	// RetryDelay 维护类计费调用（签到/余额/保活）瞬时错误重试的间隔基数；
+	// <=0 回落包级默认 billingRetryDelay（2s）。仅供测试注入更短间隔，生产不设置。
+	RetryDelay time.Duration
+
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
 	HeaderTimeout time.Duration
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
@@ -810,6 +822,31 @@ func New() *Client {
 	}
 	c.SanitizeFingerprints.Store(true)
 	return c
+}
+
+// SetDialer 替换出站底层拨号器（代理池接入点，issue #15）。base 为 nil 时回落
+// 内置直连拨号器。保留 writeDeadlineConn 写 deadline 包装（连接层加固不回退）。
+// 装配期调用（首次请求前）；HTTP 与 ChatHTTP 共用同一 Transport，设置一次即覆盖两者。
+func (c *Client) SetDialer(base func(ctx context.Context, network, addr string) (net.Conn, error)) {
+	if base == nil {
+		base = newDialer().DialContext
+	}
+	wt := writeTimeout
+	wrap := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := base(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &writeDeadlineConn{Conn: conn, writeTimeout: wt}, nil
+	}
+	if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
+		tr.DialContext = wrap
+	}
+	if c.ChatHTTP != nil {
+		if tr, ok := c.ChatHTTP.Transport.(*http.Transport); ok {
+			tr.DialContext = wrap
+		}
+	}
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -2040,7 +2077,7 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), body)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -2246,7 +2283,7 @@ func (c *Client) enterpriseResource(
 	var data json.RawMessage
 	err = c.retryBillingTransient(func() error {
 		var e error
-		data, e = c.billingJSON(a, http.MethodPost, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
+		data, e = c.billingJSON(a, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
 		return e
 	})
 	if err != nil {
@@ -2352,7 +2389,7 @@ func (c *Client) UserResourceDetailedWithExpiry(
 	var data json.RawMessage
 	err = c.retryBillingTransient(func() error {
 		var e error
-		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), body)
 		return e
 	})
 	if err != nil {
@@ -2491,7 +2528,7 @@ func cyclePackageAmounts(a respAccount) (remain, used, size int64) {
 // 让该账号整天漏签；「已签到」等业务错误不重试。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
 	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), map[string]any{})
 		return err
 	})
 }
@@ -2500,16 +2537,58 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 // 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
 // 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
 func IsAlreadyCheckin(err error) bool {
+	return matchCheckinMarker(err, alreadyCheckinMarkers)
+}
+
+// IsCheckinInactive 报告 err 是否表示"签到活动未开启/未开放/已结束"等非错误态。
+// 与 IsAlreadyCheckin 同口径：只认 *Error.Msg，网络层/解析层错误不在此识别；
+// 保守策略——未命中显式 inactive 关键词即返回 false（真失败不误判为 inactive）。
+func IsCheckinInactive(err error) bool {
+	return matchCheckinMarker(err, inactiveCheckinMarkers)
+}
+
+// matchCheckinMarker 对 *Error.Msg 做大小写不敏感的关键词包含匹配。
+func matchCheckinMarker(err error, markers []string) bool {
 	var ue *Error
 	if !errors.As(err, &ue) {
 		return false
 	}
-	for _, m := range alreadyCheckinMarkers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
+	lower := strings.ToLower(ue.Msg)
+	for _, m := range markers {
+		if strings.Contains(ue.Msg, m) || strings.Contains(lower, strings.ToLower(m)) {
 			return true
 		}
 	}
 	return false
+}
+
+// CheckinResult 签到结果分类：inactive（活动未开启）与 already（幂等）从真失败中分离，
+// 供调度日志与面板按类呈现，避免把非错误态刷成 error 行。
+type CheckinResult int
+
+const (
+	// CheckinOK 签到成功（err == nil）。
+	CheckinOK CheckinResult = iota
+	// CheckinAlready 上游幂等拒绝重复签到（"今天已签到"）。
+	CheckinAlready
+	// CheckinInactive 活动未开启/未开放/已结束等非错误态。
+	CheckinInactive
+	// CheckinFailed 其余业务/HTTP 错误（真失败）。
+	CheckinFailed
+)
+
+// ClassifyCheckin 归类签到结果。分类只描述「结果语义」，不改变重试与幂等判定。
+func ClassifyCheckin(err error) CheckinResult {
+	switch {
+	case err == nil:
+		return CheckinOK
+	case IsAlreadyCheckin(err):
+		return CheckinAlready
+	case IsCheckinInactive(err):
+		return CheckinInactive
+	default:
+		return CheckinFailed
+	}
 }
 
 func truncate(s string, n int) string {

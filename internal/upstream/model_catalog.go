@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 )
 
 // modelSeedFS 仓库种子版 model.json（context_catalog 静态表 27 值迁移，source=seed）。
@@ -164,7 +166,7 @@ func (c *modelCatalog) saveLocked() {
 		log.Printf("WARN: [upstream] model.json 落盘失败（内存缓存仍生效）: path=%s err=%v", c.path, err)
 		return
 	}
-	if err := os.Rename(tmp, c.path); err != nil {
+	if err := atomicwrite.Rename(tmp, c.path); err != nil {
 		log.Printf("WARN: [upstream] model.json 落盘改名失败: path=%s err=%v", c.path, err)
 	}
 }

@@ -155,7 +155,7 @@ func (p *Pool) NoteError(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.errTotal++
-		e.lastErr = time.Now()
+		e.lastErr = p.now()
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
 	}
@@ -175,7 +175,7 @@ func (p *Pool) NoteSuccess(uid string) {
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.successCount++
-		e.lastSuccess = time.Now()
+		e.lastSuccess = p.now()
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
@@ -227,7 +227,7 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 		}
 		e.deductCredit(d)
 	}
-	e.observeModelCost(uid, model, per1k)
+	e.observeModelCost(p.now(), uid, model, per1k)
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
 }
 
@@ -254,14 +254,14 @@ func (e *entry) deductCredit(d int64) {
 
 // observeModelCost 把一次实测单价并入该 (账号, 模型) 的 EMA 账本（alpha=0.3）。
 // 首观测直接落值；限免结束（tier 0 → 收费）时打一条明确日志供运维对账。
-func (e *entry) observeModelCost(uid, model string, per1k float64) {
+func (e *entry) observeModelCost(now time.Time, uid, model string, per1k float64) {
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
 	}
 	const alpha = 0.3
 	prev, seen := e.modelCost[model]
 	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: now, Samples: 1}
 		return
 	}
 	// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
@@ -271,7 +271,7 @@ func (e *entry) observeModelCost(uid, model string, per1k float64) {
 	}
 	e.modelCost[model] = modelCostEntry{
 		CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
-		LastSeen:  time.Now(),
+		LastSeen:  now,
 		Samples:   prev.Samples + 1,
 	}
 }
@@ -285,16 +285,16 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	if !ok {
 		return
 	}
-	e.tokenUsage.applyDelta(delta)
+	e.tokenUsage.applyDelta(p.now(), delta)
 	p.dirty.Store(true)
 }
 
 // applyDelta 把一次聊天尝试的 usage 增量并入累计摘要：请求次数与最近使用时刻总是累计，
 // 仅明确存在（Has*）且非负的 token 字段参与累加；有任一 token 字段命中即计一次
 // UsageCount。缺 completion_tokens 时清空上次吞吐速度，避免展示陈旧值。
-func (u *TokenUsage) applyDelta(delta TokenUsageDelta) {
+func (u *TokenUsage) applyDelta(now time.Time, delta TokenUsageDelta) {
 	u.RequestCount++
-	u.LastUsedAt = time.Now()
+	u.LastUsedAt = now
 	if delta.Model != "" {
 		u.LastModel = delta.Model
 	}
@@ -304,15 +304,24 @@ func (u *TokenUsage) applyDelta(delta TokenUsageDelta) {
 	if known {
 		u.UsageCount++
 	}
-	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
-		u.LastLatencyMs = delta.LatencyMs
-	}
+	u.setLatestLatency(delta)
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
 		speed := delta.TokensPerSecond
 		u.LastTokensPerSecond = &speed
 	} else {
 		// 失败或缺少 completion_tokens 时不展示上一次请求的旧吞吐速度。
 		u.LastTokensPerSecond = nil
+	}
+}
+
+// setLatestLatency 更新最近一次延迟观测：端到端延迟与首字节延迟（TTFT）分别记录，
+// 仅在字段明确存在且非负时覆盖（缺观测保留旧值）。TTFT 仅流式有观测。
+func (u *TokenUsage) setLatestLatency(delta TokenUsageDelta) {
+	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
+		u.LastLatencyMs = delta.LatencyMs
+	}
+	if delta.HasTTFTMs && delta.TTFTMs >= 0 {
+		u.LastTTFTMs = delta.TTFTMs
 	}
 }
 
@@ -351,7 +360,7 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 func (p *Pool) AvailableUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthy(now) {
@@ -372,7 +381,7 @@ func (p *Pool) AvailableUIDs() []string {
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthyForModel(now, model) {
@@ -398,7 +407,7 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if !ok {
 		return nil
 	}
-	now := time.Now()
+	now := p.now()
 	if !e.healthyForModel(now, model) {
 		return nil
 	}
@@ -431,7 +440,7 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	if !ok {
 		return nil
 	}
-	now := time.Now()
+	now := p.now()
 	if !e.healthy(now) {
 		return nil
 	}
@@ -482,7 +491,7 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	for _, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
@@ -521,7 +530,7 @@ func (p *Pool) ServableNow() bool {
 func (p *Pool) ServableForRealm(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	for _, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
@@ -556,7 +565,7 @@ func (p *Pool) List() []Status {
 }
 
 func (p *Pool) statusOf(uid string, e *entry) Status {
-	now := time.Now()
+	now := p.now()
 	st := Status{
 		UID: uid,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，

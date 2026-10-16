@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
@@ -133,7 +134,7 @@ func (p *Pool) load() {
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
-	now := time.Now()
+	now := p.now()
 	for uid, s := range accounts {
 		p.byUID[uid] = buildEntryFromState(uid, s, now)
 	}
@@ -278,7 +279,7 @@ func (p *Pool) saveLocked() {
 		p.notePersistFail(err)
 		return
 	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
+	if err := atomicwrite.Rename(tmp, p.stateFp); err != nil {
 		p.notePersistFail(err)
 		return
 	}
@@ -289,7 +290,7 @@ func (p *Pool) saveLocked() {
 	}
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
 	if p.store != nil {
-		snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: time.Now()})
+		snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: p.now()})
 		if err == nil {
 			p.store.SaveState(snapRaw)
 		}
@@ -312,7 +313,7 @@ func (p *Pool) notePersistFail(err error) {
 
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
-	now := time.Now()
+	now := p.now()
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = buildStateAccount(e, now)

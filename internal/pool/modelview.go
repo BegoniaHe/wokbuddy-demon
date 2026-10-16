@@ -38,6 +38,9 @@ type ModelLockRow struct {
 	FullyUnlockAt time.Time `json:"fully_unlock_at"`
 	// Reason 该模型被锁的原因（取最早解锁账号的上游原文）。
 	Reason string `json:"reason,omitempty"`
+	// Scope 锁的范围（issue #29）：platform（>=2 个被锁账号共享同一非零上游重置
+	// 时刻，推断为平台级限流）/ account（账号级）。只读诊断。
+	Scope string `json:"scope,omitempty"`
 }
 
 // ModelLockView 汇总当前所有「有未过期模型级限流」的 (域, 模型)，按不可用优先排序。
@@ -61,12 +64,16 @@ type modelLockAgg struct {
 	unlockAt time.Time
 	fullyAt  time.Time
 	reason   string
+	// 重置时刻一致性统计（issue #29）：withReset 计带非零 ResetAt 的账号数，
+	// resetCounts 按时刻计数（用于判定是否共享同一上游重置时刻）。
+	withReset   int
+	resetCounts map[time.Time]int
 }
 
 func (p *Pool) ModelLockView() []ModelLockRow {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
+	now := p.now()
 	rows, routable := p.aggregateModelLocks(now)
 	if len(rows) == 0 {
 		return nil
@@ -133,6 +140,13 @@ func aggregateModelLock(rows map[string]*modelLockAgg, realm, model string, mc m
 	if a.fullyAt.IsZero() || mc.Until.After(a.fullyAt) {
 		a.fullyAt = mc.Until
 	}
+	if !mc.ResetAt.IsZero() {
+		if a.resetCounts == nil {
+			a.resetCounts = make(map[time.Time]int)
+		}
+		a.resetCounts[mc.ResetAt]++
+		a.withReset++
+	}
 }
 
 // buildModelLockRow 由聚合态构造单行画像：补上 Servable 计数（该域内
@@ -157,6 +171,14 @@ func (p *Pool) buildModelLockRow(key string, a *modelLockAgg, routable map[strin
 			row.Servable++
 		}
 	}
+	// 锁范围（issue #29）：全部被锁账号共享同一非零上游重置时刻 → 平台级。
+	var shared time.Time
+	if len(a.resetCounts) == 1 {
+		for t := range a.resetCounts {
+			shared = t
+		}
+	}
+	row.Scope, _ = modelBlockScope(a.locked, a.withReset, len(a.resetCounts), shared)
 	switch {
 	case row.Servable > 0:
 		row.State = "partial"

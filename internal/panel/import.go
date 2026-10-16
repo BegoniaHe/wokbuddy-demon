@@ -114,7 +114,7 @@ func (p *Panel) importOneCockpitAccount(acc cockpitAccount) (bool, string) {
 	}
 
 	// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-	p.importCheckin(a, realm, uid)
+	p.importCheckin(a, uid)
 	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
 		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 	}
@@ -162,9 +162,11 @@ func (p *Panel) persistImportedAuth(a *auth.Auth, realm, uid string) error {
 	return nil
 }
 
-// importCheckin 导入后的签到/激活（幂等；失败仅记日志，不阻断导入）。
-func (p *Panel) importCheckin(a *auth.Auth, realm, uid string) {
-	if realm == "global" {
+// importCheckin 导入后的签到/激活（幂等；失败仅记日志，不阻断导入）。realm 取落盘
+// 后的 a.Realm()，与 persistImportedAuth 的 BackfillRealm/iss 兜底结果一致，避免
+// 本地按 domain 推断的 realm 与最终写入的 realm 分叉而漏掉 global 激活/trial。
+func (p *Panel) importCheckin(a *auth.Auth, uid string) {
+	if a.Realm() == "global" {
 		p.importGlobalActivation(a, uid)
 		return
 	}

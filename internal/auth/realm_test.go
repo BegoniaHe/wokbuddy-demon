@@ -1,10 +1,18 @@
 package auth
 
 import (
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// jwtWithIss 构造仅含 iss 的伪 JWT（三段，payload 为 base64url，无签名校验需求）。
+func jwtWithIss(iss string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"` + iss + `"}`))
+	return header + "." + payload + ".sig"
+}
 
 // withGlobalEnabled 临时打开 global realm 开关（生产缺省即开，此辅助仅显式确保），
 // 测试结束复位为开启态（缺省）。
@@ -246,6 +254,74 @@ func TestBackfillRealmIdempotent(t *testing.T) {
 		t.Errorf("backfill got=%q want cn (existing realm preserved)", got)
 	}
 	assertRealmStored(a, "cn", t)
+}
+
+// TestRealmFromIssuer 覆盖 iss 兜底判定：global 家族命中 / 未知 / 非法 token。
+func TestRealmFromIssuer(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name, token, want string
+	}{
+		{"global-www", jwtWithIss("https://www.workbuddy.ai/auth/realms/copilot"), "global"},
+		{"global-bare", jwtWithIss("https://workbuddy.ai/realms/x"), "global"},
+		{"cn-host", jwtWithIss("https://www.codebuddy.cn/auth/realms/copilot"), ""},
+		{"unknown-host", jwtWithIss("https://example.com/realms/x"), ""},
+		{"empty-iss", jwtWithIss(""), ""},
+		{"not-jwt", "not-a-jwt", ""},
+		{"bad-base64", "aaa.!!!.ccc", ""},
+		{"padded", base64.URLEncoding.EncodeToString([]byte(`{"iss":"https://www.workbuddy.ai"}`)), "global"},
+	}
+	for _, c := range cases {
+		// padded 用例需补 header 段才成三段。
+		tok := c.token
+		if c.name == "padded" {
+			tok = "h." + c.token + ".s"
+		}
+		if got := realmFromIssuer(tok); got != c.want {
+			t.Errorf("%s: realmFromIssuer=%q want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRealmIssFallback realm 与 domain 均空时从 iss 兜底；任一非空则不启用兜底。
+func TestRealmIssFallback(t *testing.T) {
+	withGlobalEnabled(t)
+	global := jwtWithIss("https://www.workbuddy.ai/auth/realms/copilot")
+
+	// 均空 + global iss → global。
+	if got := (&Auth{AccessToken: global}).Realm(); got != "global" {
+		t.Errorf("empty realm/domain + global iss: Realm()=%q want global", got)
+	}
+	// 均空 + 未知 iss → cn。
+	if got := (&Auth{AccessToken: jwtWithIss("https://example.com")}).Realm(); got != "cn" {
+		t.Errorf("unknown iss: Realm()=%q want cn", got)
+	}
+	// domain 非空（cn）→ 不启用 iss 兜底。
+	if got := (&Auth{Domain: "www.codebuddy.cn", AccessToken: global}).Realm(); got != "cn" {
+		t.Errorf("cn domain must win over iss: Realm()=%q want cn", got)
+	}
+	// 显式 realm=cn → 不启用 iss 兜底。
+	if got := (&Auth{realm: "cn", AccessToken: global}).Realm(); got != "cn" {
+		t.Errorf("explicit cn must win over iss: Realm()=%q want cn", got)
+	}
+}
+
+// TestBackfillRealmIssFallback domain 与 realm 均空时 backfill 落盘 global（来自 iss）。
+func TestBackfillRealmIssFallback(t *testing.T) {
+	t.Parallel()
+	a := &Auth{AccessToken: jwtWithIss("https://www.workbuddy.ai/auth/realms/copilot")}
+	changed, got := a.BackfillRealm()
+	if !changed || got != "global" {
+		t.Fatalf("backfill changed=%v got=%q want true/global", changed, got)
+	}
+	assertRealmStored(a, "global", t)
+
+	// 未知 iss → 仍落盘 cn（保持现有默认）。
+	b := &Auth{AccessToken: jwtWithIss("https://example.com")}
+	changed, got = b.BackfillRealm()
+	if !changed || got != "cn" {
+		t.Fatalf("unknown iss backfill changed=%v got=%q want true/cn", changed, got)
+	}
 }
 
 func assertRealmStored(a *Auth, want string, t *testing.T) {

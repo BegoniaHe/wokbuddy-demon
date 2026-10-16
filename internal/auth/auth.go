@@ -3,11 +3,13 @@
 package auth
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
@@ -85,6 +88,16 @@ func (a *Auth) DomainValue() string {
 	return a.Domain
 }
 
+// ExpiresAtValue 加锁读取 ExpiresAt（同 AccessTokenValue：RefreshToken 在锁内改写）。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
 // RefreshTokenValue 加锁读取 RefreshToken（同 AccessTokenValue：RefreshToken 在锁内
 // 改写它）。调度器的「有无凭证」前置守卫（checkin/keepalive/travel 的
 // `a.RefreshToken == ""`）必须经此取值，勿直读字段。
@@ -132,6 +145,12 @@ func (a *Auth) realmLocked() string {
 	if strings.TrimSpace(a.realm) == realmGlobal || isGlobalDomain(a.Domain) {
 		return realmGlobal
 	}
+	// 兜底：realm 与 domain 均缺失时，从 access token 的 iss claim 反推
+	// （仅认 global 家族；未知 / 非法 token 回落 cn）。
+	if strings.TrimSpace(a.realm) == "" && strings.TrimSpace(a.Domain) == "" &&
+		realmFromIssuer(a.AccessToken) == realmGlobal {
+		return realmGlobal
+	}
 	return realmCN
 }
 
@@ -161,6 +180,11 @@ func (a *Auth) BackfillRealm() (bool, string) {
 		return false, a.realm
 	}
 	r := ResolveRealm("", a.Domain)
+	// 兜底：domain 也缺失时，从 access token 的 iss claim 反推（仅认 global 家族）。
+	// 与 realmLocked 同口径：未知 / 非法 token 保持 ResolveRealm 的 cn 结果。
+	if strings.TrimSpace(a.Domain) == "" && realmFromIssuer(a.AccessToken) == realmGlobal {
+		r = realmGlobal
+	}
 	a.realm = r
 	return true, r
 }
@@ -220,6 +244,40 @@ func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) !=
 func isGlobalDomain(d string) bool {
 	d = strings.ToLower(strings.TrimSpace(d))
 	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+}
+
+// realmFromIssuer 从 access token 的 JWT iss claim 兜底推断账号域：iss host 命中
+// workbuddy.ai 家族 → "global"，否则返回空串（未知 / 非法 token，调用方回落现有行为）。
+//
+// 仅解 payload（base64url 第二段），不做签名校验——本项只用于缺 realm/domain 时的
+// 路由兜底，安全默认是「未知即不判 global」。解码 / 解析失败静默返回空串，不吞调用方错误。
+func realmFromIssuer(accessToken string) string {
+	parts := strings.Split(accessToken, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		// 容错：部分实现带 padding。
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return ""
+		}
+	}
+	var claims struct {
+		Iss string `json:"iss"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	u, err := url.Parse(strings.TrimSpace(claims.Iss))
+	if err != nil {
+		return ""
+	}
+	if isGlobalDomain(u.Hostname()) {
+		return realmGlobal
+	}
+	return ""
 }
 
 // NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
@@ -357,7 +415,7 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	return atomicwrite.Rename(tmp, a.FilePath)
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。

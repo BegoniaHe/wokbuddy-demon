@@ -28,6 +28,9 @@ import (
 // 断言表格行输出的测试（logging_test.go 中的 ChatLogs/LogChatRow 系列）用 withChatLog 临时开启。
 func TestMain(m *testing.M) {
 	chatLogEnabled = false
+	// 测试期去掉轮换退避的真实等待（默认 500ms/次，16 条轮换用例累计约 7s）。
+	// 仅影响轮换间 sleep，不改任何换号/退避决策语义（无测试断言其时长）。
+	rotateBackoffBase = 0
 	os.Exit(m.Run())
 }
 
@@ -396,6 +399,25 @@ func TestChatStreamPassthrough(t *testing.T) {
 		t.Errorf("body=%q", body)
 	}
 	assertChatSuccessUsage(t, h.cfg.Pool, "u1")
+}
+
+// TestChatStreamRecordsTTFT 流式成功时 TTFT 采样写入账号摘要与 usage 时序（issue #16）。
+func TestChatStreamRecordsTTFT(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	rec := usage.New("")
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, Usage: rec})
+
+	res := postChat(t, h, `{"model":"glm-5.2","stream":true,"messages":[]}`)
+	if res.Code != 200 {
+		t.Fatalf("code=%d body=%s", res.Code, res.Body)
+	}
+	if st := statusOf(t, p, "u1"); st.TokenUsage.LastTTFTMs < 1 {
+		t.Errorf("last_ttft_ms=%d want >=1", st.TokenUsage.LastTTFTMs)
+	}
+	if s := rec.Snapshot(24, nil); s.Totals.AvgTTFTMs < 1 {
+		t.Errorf("avg_ttft_ms=%v want >=1", s.Totals.AvgTTFTMs)
+	}
 }
 
 func TestChatRecordsCreditForStreamAndSync(t *testing.T) {
@@ -2014,5 +2036,27 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
 	if _, ok := msg["tool_calls"]; ok {
 		t.Fatalf("未声明的工具名不得转换: %#v", msg["tool_calls"])
+	}
+}
+
+// TestChatModelBlockPlatformHint 模型全池阻塞且账号共享同一上游重置时刻 → hint 标注
+// platform-level（issue #29）。
+func TestChatModelBlockPlatformHint(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	reset := time.Now().Add(time.Hour)
+	p.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.2", "6004 rate limited")
+	p.CooldownSoftForModel("u2", time.Minute, reset, "glm-5.2", "6004 rate limited")
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "platform-level") {
+		t.Errorf("model block hint should mark platform-level: %s", rec.Body)
 	}
 }

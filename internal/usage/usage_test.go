@@ -361,6 +361,55 @@ func TestAggregateByModel(t *testing.T) {
 	wantEq(t, "空切片长度", len(empty), 0)
 }
 
+// TestTTFTAggregation TTFT 采样：仅 HasTTFT 的样本参与均值，非流式不污染样本（issue #16）。
+func TestTTFTAggregation(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{TTFTMs: 300, HasTTFT: true, LatencyMs: 2000, HasLatency: true}, true)
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{TTFTMs: 500, HasTTFT: true, LatencyMs: 2500, HasLatency: true}, true)
+	// 非流式：无 TTFT 观测，不参与均值。
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{LatencyMs: 100, HasLatency: true}, true)
+
+	s := r.Snapshot(24, nil)
+	wantEq(t, "avg_ttft_ms", s.Totals.AvgTTFTMs, 400.0)
+	wantEq(t, "avg_latency_ms", s.Totals.AvgLatencyMs, (2000.0+2500.0+100.0)/3)
+}
+
+// TestBackfillOverridesLocalDay 上游回填覆盖同 (天, realm, uid, model) 的请求数/积分，
+// 不与本地实时记录重复计数；token 等上游不提供的维度保留本地观测（issue #31）。
+func TestBackfillOverridesLocalDay(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	day := now.Format("2006-01-02")
+	r.Add(now, "cn", "uid1", "glm-5.2", Delta{TotalTokens: 10, HasTotal: true, Credit: 1, HasCredit: true}, true)
+
+	n := r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "uid1", Model: "glm-5.2", Requests: 5, Credits: 9}})
+	if n != 1 {
+		t.Fatalf("backfill buckets=%d want 1", n)
+	}
+	s := r.Snapshot(0, nil)
+	wantEq(t, "requests(覆盖后)", s.Totals.Requests, int64(5))
+	wantEq(t, "credits(覆盖后)", s.Totals.Credits, 9.0)
+	// token 无法从上游逐笔接口恢复：覆盖请求数/积分后仍保留本地值（10），不被清零。
+	wantEq(t, "total_tokens(保留本地)", s.Totals.TotalTokens, int64(10))
+}
+
+// TestBackfillThenRealtimeNoDoubleCount 回填后同日的实时记录与 Rollup 折叠都不与
+// 回填值重复计数（issue #31 复审）：回填删除当日本地桶，故实时记录落在新小时桶，
+// 与 Synced 日桶相加即正确总量；小时桶折叠进 Synced 日桶同样不叠加。
+func TestBackfillThenRealtimeNoDoubleCount(t *testing.T) {
+	r := New("")
+	old := time.Now().Add(-100 * 24 * time.Hour) // 早于 hourlyKeep，可被 Rollup 折叠
+	day := old.Format("2006-01-02")
+	r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "u1", Model: "m", Requests: 5, Credits: 9}})
+	r.Add(old, "cn", "u1", "m", Delta{TotalTokens: 20, HasTotal: true, Credit: 2, HasCredit: true}, true)
+	r.Rollup(time.Now())
+	s := r.Snapshot(0, nil)
+	wantEq(t, "requests(回填+实时)", s.Totals.Requests, int64(6))
+	wantEq(t, "credits(回填+实时)", s.Totals.Credits, 11.0)
+	wantEq(t, "total_tokens(回填+实时)", s.Totals.TotalTokens, int64(20))
+}
+
 // wantEq 断言 got == want，失败时用 label 指明字段。统一入口避免逐项 if 抬高
 // 测试函数复杂度，断言条件与原逐项检查等价。
 func wantEq[T comparable](t *testing.T, label string, got, want T) {

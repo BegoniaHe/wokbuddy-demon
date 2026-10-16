@@ -62,11 +62,14 @@ func TestPickSkipsCooling(t *testing.T) {
 
 func TestPickExpiredCooldownReturnsToHealthy(t *testing.T) {
 	p := New("")
+	// 注入时钟：推进虚拟时间让冷却到期，无需真实 sleep（issue #20）。
+	now := time.Now()
+	p.SetClock(func() time.Time { return now })
 	a1 := &auth.Auth{UID: "u1"}
 	p.Add(a1)
 	p.SetCredits("u1", 100, 0)
 	p.Cooldown("u1", CoolSoft, time.Millisecond, "429")
-	time.Sleep(5 * time.Millisecond)
+	now = now.Add(5 * time.Millisecond) // 推进注入时钟越过冷却截止
 	got := p.Pick()
 	if got == nil || got.UID != "u1" {
 		t.Fatalf("pick=%+v want u1 after cooldown expiry", got)
@@ -1354,7 +1357,7 @@ func (p *Pool) entryWeight(uid string) float64 {
 			maxCredits = x.credits
 		}
 	}
-	return p.weightOf(e, maxCredits, time.Now())
+	return p.weightOf(e, maxCredits, "", time.Now())
 }
 
 func TestWeightHighCreditsDominates(t *testing.T) {
@@ -1812,8 +1815,8 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
 
 	p.mu.Lock()
-	we := p.routingWeightOf(p.byUID["a"], 100, now)
-	wn := p.routingWeightOf(p.byUID["b"], 100, now)
+	we := p.routingWeightOf(p.byUID["a"], 100, "", now)
+	wn := p.routingWeightOf(p.byUID["b"], 100, "", now)
 	p.mu.Unlock()
 	if we != wn*expiringVirtualSlots {
 		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
@@ -1822,8 +1825,8 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetPreferExpiring(false)
 
 	p.mu.Lock()
-	wa := p.routingWeightOf(p.byUID["a"], 100, now)
-	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	wa := p.routingWeightOf(p.byUID["a"], 100, "", now)
+	wb := p.routingWeightOf(p.byUID["b"], 100, "", now)
 	p.mu.Unlock()
 	if wa != wb {
 		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)

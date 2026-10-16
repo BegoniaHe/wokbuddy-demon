@@ -20,6 +20,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -34,6 +35,13 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
+	// RotateBudget 轮换总时长预算：从首个尝试起累计耗时达此值即停止换号（0 = 不限）。
+	// 与 MaxRotate 构成「先到先停」——避免慢上游下 MaxRotate × header_timeout 把
+	// 客户端拖很久（issue #17）。
+	RotateBudget time.Duration
+	// RotateStatuses 非空时，HTTP 状态码错误仅当 status 在集合内才换号（空 = 维持
+	// 现有按错误分类的换号语义）。只收窄换号，不改账号冷却/熔断惩罚（issue #17）。
+	RotateStatuses map[int]bool
 	// Keys 命名密钥存储（可选；nil = 仅默认 api_key）。命名密钥只用于网关 API
 	// 面（/v1/chat/completions、/v1/models）；/status 仍只认默认密钥。
 	Keys *apikey.Store
@@ -89,6 +97,8 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// streams 在途 SSE 流注册表（issue #19）：关闭时显式等待排空并记录未排空数。
+	streams *streamTracker
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -139,7 +149,7 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker()}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
@@ -156,6 +166,9 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("/", h.notFound)
 	return h
 }
+
+// ActiveStreams 返回当前在途 SSE 流数（供优雅关闭记录未排空情况，issue #19）。
+func (h *Handler) ActiveStreams() int { return h.streams.Active() }
 
 // notFound 未注册路径的统一出口：OpenAI 风格 404 JSON（不鉴权——未知路径无需泄露
 // 鉴权存在性，也不暴露端点清单）。协议面（OpenAI 兼容 API）只承诺
@@ -797,8 +810,19 @@ func (f *chatFlow) fail(uid string) {
 }
 
 // runRotation 执行选号 + 重试轮转。返回 true 表示已写出响应（成功或请求级错误）。
+// 「先到先停」：次数上限 MaxRotate 与总时长预算 RotateBudget（>0 时）任一先到即停。
 func (f *chatFlow) runRotation(ctx context.Context) bool {
+	var deadline time.Time
+	if f.h.cfg.RotateBudget > 0 {
+		deadline = time.Now().Add(f.h.cfg.RotateBudget)
+	}
 	for i := range f.h.cfg.MaxRotate {
+		// 预算检查放在循环顶部（含上一轮退避之后）：退避已把耗时推过预算时立即停。
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			log.Printf("WARN: [server] rotate budget %s exhausted after %d attempt(s): stop rotating",
+				f.h.cfg.RotateBudget, i)
+			return false
+		}
 		f.rotateReason = ""
 		switch f.attempt(ctx, i) {
 		case rotContinue:
@@ -950,6 +974,16 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 			logfmt.Label(acct.UID, acct.Nickname), terr)
 		return rotBreak
 	}
+	// 出站代理层拨号失败（issue #15）：不是账号的问题，且同一请求换号仍走同一代理池
+	// ——终止轮转、不惩罚账号，代理池自身已轮换/冷却。不调用 recordAttempt：连接从未
+	// 建立，不算一次上游尝试，避免喂账号健康台账（issue #16 的错误压力）与连败降权。
+	if errors.Is(terr, outbound.ErrProxyDial) {
+		f.st.status = http.StatusServiceUnavailable
+		f.lastErr = fmt.Errorf("proxy: %w", terr)
+		log.Printf("WARN: [server] outbound proxy dial failed acct=%s: %v (rotation stopped, account not penalized)",
+			logfmt.Label(acct.UID, acct.Nickname), terr)
+		return rotBreak
+	}
 	// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 	// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」。
 	f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
@@ -1008,11 +1042,25 @@ func (f *chatFlow) handleHTTPError(
 	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
 		return rotBreak
 	}
+	// 状态码换号闸（issue #17，默认关闭）：allowlist 非空时仅列出的状态码才换号；
+	// 不在列表则停止换号、透传上游错误（账号惩罚已由 applyErrorPolicy 记账，不变）。
+	if !f.rotateAllowedForStatus(status) {
+		return rotBreak
+	}
 	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（分类错误换号退避）
 	}
 	f.rotateReason = kind.String()
 	return rotContinue
+}
+
+// rotateAllowedForStatus 报告该 HTTP 状态码是否允许换号：RotateStatuses 为空时恒 true
+// （维持现有按错误分类的换号语义）；非空时为 allowlist 判定。
+func (f *chatFlow) rotateAllowedForStatus(status int) bool {
+	if len(f.h.cfg.RotateStatuses) == 0 {
+		return true
+	}
+	return f.h.cfg.RotateStatuses[status]
 }
 
 // failFastKind 报告 kind 是否属于「换号必然同样失败」的请求级错误。
@@ -1062,6 +1110,9 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
 func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
+	f.h.streams.enter()
+	defer f.h.streams.leave()
 	// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 	f.st.status = http.StatusOK
 	stats := newChatStatsReaderSince(rc, f.st.start)
@@ -1211,6 +1262,15 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 	latencyMs := attemptLatencyMs(started)
 	delta.HasLatencyMs = true
 	delta.LatencyMs = latencyMs
+	// TTFT 采样（issue #16）：仅流式有观测（首 data 帧）；非流式 ttfb=0 不写。
+	if ttfb > 0 {
+		ttftMs := ttfb.Milliseconds()
+		if ttftMs < 1 {
+			ttftMs = 1
+		}
+		delta.HasTTFTMs = true
+		delta.TTFTMs = ttftMs
+	}
 	// 耗时 histogram（issue #13）：每次上游尝试观测一次，与用量同源；按是否拿到
 	// usage 分成功/失败（与 recordUsage 的 ok 同口径），失败不再混入整体分位。
 	f.h.metrics.observeRequestDuration(float64(latencyMs)/1000, deltaHasUsage(delta))
@@ -1223,6 +1283,9 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 		}
 	}
 	f.h.cfg.Pool.RecordTokenUsage(uid, delta)
+	// 健康台账（issue #16）：成功口径同 usage（deltaHasUsage），TTFT 有观测才并入。
+	// 只供选号降权，不改判定语义。
+	f.h.cfg.Pool.RecordModelHealth(uid, delta.Model, delta.TTFTMs, delta.HasTTFTMs, deltaHasUsage(delta))
 	// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试没拿到
 	// 任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。失败也计入请求数。
 	f.recordUsage(uid, delta, credit, hasCredit)
@@ -1283,6 +1346,8 @@ func (f *chatFlow) recordUsage(uid string, delta pool.TokenUsageDelta, credit fl
 		ModelRate:        f.modelRate,
 		LatencyMs:        delta.LatencyMs,
 		HasLatency:       delta.HasLatencyMs,
+		TTFTMs:           delta.TTFTMs,
+		HasTTFT:          delta.HasTTFTMs,
 		TokensPerSecond:  delta.TokensPerSecond,
 		HasTPS:           delta.HasTokensPerSecond,
 	}, deltaHasUsage(delta))
@@ -1379,7 +1444,13 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 	if !upstreamMsgPassed {
 		msg = "model is unavailable on every account (per-model cooldown), try another model"
 	}
-	hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model", f.modelBlock.Count)
+	// 阻塞范围（issue #29）：平台级（上游统一限流，等上游恢复）与账号级（换号/等本号
+	// 恢复）对运维的处置完全不同，在 hint 里点明。
+	if f.modelBlock.Scope == pool.ModelBlockScopePlatform {
+		hint = fmt.Sprintf("model_blocked: upstream platform-level rate limit on this model (%d account(s) share the same reset)", f.modelBlock.Count)
+	} else {
+		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model (account-level)", f.modelBlock.Count)
+	}
 	if !f.modelBlock.Until.IsZero() {
 		hint += "; earliest unblock at " + f.modelBlock.Until.Format(time.RFC3339)
 	}

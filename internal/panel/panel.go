@@ -163,6 +163,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	p.mux.HandleFunc("POST /panel/api/export/encrypted", p.withAuth(p.exportEncrypted))
+	p.mux.HandleFunc("POST /panel/api/import/encrypted", p.withAuth(p.importEncrypted))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
@@ -188,6 +190,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("POST /panel/api/usage/backfill", p.withAuth(p.usageBackfill))
 	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.keysList))
 	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAuth(p.keysRevoke))
@@ -562,11 +565,17 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if a.IsEnterprise() {
 		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
 	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
-		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
-		if upstream.IsAlreadyCheckin(err) {
+		// 按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游非错误态，
+		// 不标记已签、给出可区分文案（issue #27）；其余才是真失败。
+		switch upstream.ClassifyCheckin(err) {
+		case upstream.CheckinAlready:
 			p.cfg.Pool.NoteCheckinDone(uid)
 			checkinDone = true
+			checkinMsg = "今天已签到"
+		case upstream.CheckinInactive:
+			checkinMsg = "签到活动未开启（非失败）"
+		default:
+			checkinMsg = err.Error() // 业务错误照常查余额
 		}
 	} else {
 		p.cfg.Pool.NoteCheckinDone(uid)

@@ -18,8 +18,10 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/redisstore"
@@ -244,6 +246,10 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
+		MaxRotate:      cfg.Upstream.RotateMax,
+		RotateBudget:   cfg.RotateBudgetDur,
+		RotateStatuses: rotateStatusSet(cfg.Upstream.RotateStatusCodes),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -274,12 +280,21 @@ func main() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 优雅停机（issue #19）：等待在途 SSE 长流排空，最多 ShutdownStreamGrace；
+		// 超时则记录未排空流数后由进程退出强制结束，不静默丢弃。
+		// 注意：Shutdown 关闭 listener 后 ListenAndServe 会立即返回 ErrServerClosed，
+		// 但排空等待仍在进行，main 必须等 shutdownDone 再退出，否则在途长流被直接丢弃。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), server.ShutdownStreamGrace)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
+		if n := h.ActiveStreams(); n > 0 {
+			log.Printf("WARN: [server] graceful shutdown timed out with %d in-flight SSE stream(s) still active; forcing exit", n)
+		}
 	}()
 
 	log.Printf("wokbuddy-demon listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
@@ -287,6 +302,8 @@ func main() {
 		log.Printf("http: %v", err)
 		return
 	}
+	// ErrServerClosed 由 Shutdown 触发：等排空 goroutine 收尾后再退出。
+	<-shutdownDone
 	log.Printf("bye")
 }
 
@@ -402,6 +419,17 @@ func configureUpstream(cfg *Config, up *upstream.Client) {
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
+	// 出站代理池（issue #15）：非空时按健康轮换，失败代理进入冷却；空 = 直连。
+	// URL 合法性已在 config 解析阶段校验（非法即拒绝启动），此处构造理论上不失败。
+	if len(cfg.Upstream.Proxies) > 0 {
+		proxyPool, err := outbound.New(cfg.Upstream.Proxies)
+		if err != nil {
+			log.Printf("WARN: [server] 出站代理配置无效，回退直连: %v", err)
+		} else {
+			up.SetDialer(proxyPool.DialContext)
+			log.Printf("出站代理池已启用：%d 个代理（失败自动冷却轮换）", proxyPool.Len())
+		}
+	}
 }
 
 // logScheduleConfig 启动日志：逐项打印排程启用态与小时。纯日志，无副作用。
@@ -554,7 +582,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 // replaceConfigFile 用 tmp 原子替换 path；单文件 Docker bind mount 无法被 rename
 // 覆盖（Linux 返回 EBUSY / "device or resource busy"）时回退为就地写入挂载文件。
 func replaceConfigFile(tmp, path string, out []byte) error {
-	if err := os.Rename(tmp, path); err != nil {
+	if err := atomicwrite.Rename(tmp, path); err != nil {
 		// A single-file Docker bind mount cannot be renamed over its mount
 		// target (Linux returns EBUSY / "device or resource busy"). Keep the
 		// atomic path for regular files, but update the mounted file in place
@@ -609,8 +637,12 @@ func restartRequiredFields(c *Config) []string {
 	// HTTP client 捕获；upstream.user_agent 在装配期被写进出站 client（main.go 的
 	// up.UserAgent = ...），之后不再读取——不在 livecfg 热快照里，也无法热改。
 	// 此前漏列 user_agent，导致面板改完显示"已保存"却不提示需要重启（issue #102 附带发现 2）。
+	// 轮换策略（rotate_max/rotate_budget/rotate_status_codes，issue #17）同样在装配期
+	// 被 server handler 捕获，改后需重启。
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds",
-		"upstream.idle_timeout_seconds", "upstream.user_agent")
+		"upstream.idle_timeout_seconds", "upstream.user_agent",
+		"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
+		"upstream.proxies")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
