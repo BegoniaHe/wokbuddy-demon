@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   ago,
   dur,
+  fmtClockTime,
   fmtCredit,
   fmtCreditRatio,
   fmtModelRate,
@@ -56,6 +57,20 @@ describe('parseAPITime / ago', () => {
     expect(parseAPITime('0001-01-01T00:00:00Z')).toBe(0);
     expect(parseAPITime('')).toBe(0);
     expect(ago('0001-01-01T00:00:00Z')).toBe('—');
+  });
+  it('无法解析的时间串不产生 NaN 文案', () => {
+    expect(ago('not-a-date')).toBe('—');
+  });
+});
+
+describe('fmtClockTime', () => {
+  it('空值/非法值回落 —', () => {
+    expect(fmtClockTime('')).toBe('—');
+    expect(fmtClockTime(undefined)).toBe('—');
+    expect(fmtClockTime('not-a-date')).toBe('—');
+  });
+  it('有效 ISO 渲染为本地 HH:MM:SS', () => {
+    expect(fmtClockTime('2026-10-16T09:24:03+02:00')).toMatch(/^\d{2}:\d{2}:\d{2}$/);
   });
 });
 

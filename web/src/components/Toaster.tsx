@@ -39,7 +39,7 @@ export function Toaster() {
         <div
           key={t.id}
           className={cn(
-            'max-w-[380px] rounded-lg border border-line border-l-[3px] border-l-ink-3 bg-raise px-3.5 py-2.5 text-[13px] shadow-panel',
+            'max-w-[380px] rounded-inner border border-line border-l-[3px] border-l-ink-3 bg-raise px-3.5 py-2.5 text-sm shadow-panel',
             t.cls === 'ok' && 'border-l-ok',
             t.cls === 'err' && 'border-l-bad',
           )}

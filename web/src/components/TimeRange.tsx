@@ -31,13 +31,11 @@ export function TimeRange({
     onChange({ ...value, [which]: dtLocalParse(raw) });
   };
 
-  const cls = 'w-auto rounded-md border-line bg-surface-2 px-2 py-[5px] text-[12.5px]';
-
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
       <Select
+        size="sm"
         aria-label="时间范围"
-        className={cls}
         value={value.preset}
         onChange={(e) => setPreset(e.target.value)}
       >
@@ -51,16 +49,18 @@ export function TimeRange({
         <span className="inline-flex items-center gap-1.5">
           <Input
             type="datetime-local"
+            size="sm"
             aria-label="起始时间"
-            className={cn(cls, 'font-mono text-xs', bad && 'border-bad bg-bad-soft')}
+            className={cn('font-mono', bad && 'border-bad bg-bad-soft')}
             value={value.from ? dtLocalValue(value.from) : ''}
             onChange={(e) => readCustom('from', e.target.value)}
           />
           <span className="text-xs text-ink-3">→</span>
           <Input
             type="datetime-local"
+            size="sm"
             aria-label="结束时间"
-            className={cn(cls, 'font-mono text-xs', bad && 'border-bad bg-bad-soft')}
+            className={cn('font-mono', bad && 'border-bad bg-bad-soft')}
             value={value.to ? dtLocalValue(value.to) : ''}
             onChange={(e) => readCustom('to', e.target.value)}
           />

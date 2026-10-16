@@ -98,8 +98,12 @@ export function parsePointTime(p: SeriesPoint): number | null {
 }
 
 // fmtTokTimeLabel 时间桶短标签（日桶 MM-DD，小时桶 HH:00）。
+// 必须复用 parsePointTime 规范化：小时桶 t 为 "YYYY-MM-DDTHH"（13 字符），
+// 直接 new Date 在 V8 下是 Invalid Date，会渲染出 "NaN:00"。
 export function fmtTokTimeLabel(p: SeriesPoint): string {
-  const d = new Date(p.t);
+  const ms = parsePointTime(p);
+  if (ms === null) return p.t;
+  const d = new Date(ms);
   return p.scope === 'day'
     ? d.getMonth() + 1 + '-' + String(d.getDate()).padStart(2, '0')
     : String(d.getHours()).padStart(2, '0') + ':00';

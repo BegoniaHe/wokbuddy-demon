@@ -28,12 +28,23 @@ export function fmtLocalDateTime(ms: number): string {
 export function ago(iso: unknown): string {
   const s = String(iso ?? '');
   if (!s || s.startsWith('0001-')) return '—';
-  const diff = (Date.now() - new Date(s).getTime()) / 1000;
+  const ms = new Date(s).getTime();
+  if (!Number.isFinite(ms)) return '—';
+  const diff = (Date.now() - ms) / 1000;
   if (diff < 0) return '刚刚';
   if (diff < 60) return Math.floor(diff) + ' 秒前';
   if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
   if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
   return Math.floor(diff / 86400) + ' 天前';
+}
+
+// fmtClockTime ISO 时间串 → 本地 HH:MM:SS；空/无法解析回落 '—'。
+export function fmtClockTime(iso: unknown): string {
+  const s = String(iso ?? '');
+  if (!s) return '—';
+  const ms = new Date(s).getTime();
+  if (!Number.isFinite(ms)) return '—';
+  return new Date(ms).toLocaleTimeString('zh-CN', { hour12: false });
 }
 
 // dur 秒 → 「N时MM分 / N分SS秒 / N秒」。

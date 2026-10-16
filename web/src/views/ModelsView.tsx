@@ -4,8 +4,8 @@ import { api } from '@/lib/api';
 import { mdMatch, mdSortList, DEFAULT_MODEL_FILTER, type ModelEntry, type ModelFilter } from '@/lib/models';
 import { Button } from '@/components/ui/button';
 import { Input, Select, Tag } from '@/components/ui/field';
-import { Box, BoxHeader, BoxHint, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
-import { Empty, Num, Table, TableWrap, Td, Th } from '@/components/ui/table';
+import { Box, BoxHeader, BoxHint, BoxNote, BoxTitle, Grow, Toolbar } from '@/components/ui/box';
+import { Empty, Num, RailCell, Table, TableWrap, Td, Th } from '@/components/ui/table';
 import { cn } from '@/lib/utils';
 
 interface Probe {
@@ -88,10 +88,11 @@ export function ModelsView() {
         </Button>
       </BoxHeader>
 
-      <div className="flex flex-wrap items-center gap-2 border-b border-line-soft bg-surface-2 px-4 py-2.5">
+      <Toolbar>
         <Input
           type="search"
-          className="w-auto min-w-[200px] flex-[0_1_280px] rounded-md px-2.5 py-[5px] text-[12.5px]"
+          size="sm"
+          className="min-w-[200px] flex-[0_1_280px]"
           placeholder="搜索模型 ID / 名称 / 描述 / 厂商"
           aria-label="搜索模型"
           value={q}
@@ -138,7 +139,7 @@ export function ModelsView() {
         <Button size="xs" variant="ghost" title="清空全部筛选条件" onClick={() => { setQ(''); setFilter(DEFAULT_MODEL_FILTER); }}>
           重置
         </Button>
-      </div>
+      </Toolbar>
 
       <TableWrap>
         <Table className="min-w-[700px]">
@@ -190,7 +191,7 @@ function FilterSelect({
   return (
     <Select
       {...rest}
-      className="w-auto rounded-md px-2.5 py-[5px] text-[12.5px]"
+      size="sm"
       value={value}
       onChange={(e) => onChange(e.target.value)}
     >
@@ -206,7 +207,7 @@ function RateCell({ m }: { m: ModelEntry }) {
       <span title={tip} className="cursor-help">
         <b className="font-mono">{m.promo_credits}</b>
         {m.promo_label ? <Tag tone="ok" className="ml-1">{m.promo_label}</Tag> : null}
-        {m.credits ? <s className="ml-1 text-[11.5px] text-ink-3">{m.credits}</s> : null}
+        {m.credits ? <s className="ml-1 text-2xs text-ink-3">{m.credits}</s> : null}
       </span>
     );
   }
@@ -238,7 +239,7 @@ function OutCell({ m, pr }: { m: ModelEntry; pr?: Probe }) {
       return (
         <Num title={tip}>
           <span className="font-semibold text-warn">{fmtK(pr.measured)} ⚠</span>
-          <div className="text-[11px] text-ink-3">钳制 {xs}{stale}</div>
+          <div className="text-2xs text-ink-3">钳制 {xs}{stale}</div>
         </Num>
       );
     }
@@ -260,7 +261,7 @@ function OutCell({ m, pr }: { m: ModelEntry; pr?: Probe }) {
   return (
     <Num title={tip}>
       <span className="text-ink-3">?</span>
-      <div className="text-[11px] text-ink-3">未测出{stale}</div>
+      <div className="text-2xs text-ink-3">未测出{stale}</div>
     </Num>
   );
 }
@@ -277,7 +278,7 @@ function ModelRow({ m, pr }: { m: ModelEntry; pr?: Probe }) {
       ))}
     </span>
   ) : (
-    <span className="text-[12.5px] text-ink-3">
+    <span className="text-xs text-ink-3">
       {m.supports_reasoning ? '固定档 · 默认 ' + (m.default_effort || '?') : '不支持思考'}
     </span>
   );
@@ -288,12 +289,10 @@ function ModelRow({ m, pr }: { m: ModelEntry; pr?: Probe }) {
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push(<Tag key="r" tone="warn">思考常开</Tag>);
   return (
     <tr>
-      <Td className="w-[3px] p-0">
-        <i className="block h-full min-h-[36px] w-[3px] bg-ok" />
-      </Td>
+      <RailCell tone="ok" />
       <Td title={m.description}>
         <div className="font-medium">{m.id}</div>
-        <div className="font-mono text-[11.5px] text-ink-3">{m.name || ''}</div>
+        <div className="font-mono text-2xs text-ink-3">{m.name || ''}</div>
         {caps.length ? <div className="mt-0.5 flex gap-1">{caps}</div> : null}
       </Td>
       <Td>

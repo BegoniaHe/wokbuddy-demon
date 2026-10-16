@@ -4,8 +4,8 @@ import { api, getKey, postJSON } from '@/lib/api';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/field';
+import { Tabs } from '@/components/ui/tabs';
 import { Modal, ModalBody, ModalFooter, ModalHeader, ModalTitle } from '@/components/ui/dialog';
-import { cn } from '@/lib/utils';
 
 type Phase = 'pick' | 'load' | 'ready' | 'done' | 'err';
 type Tab = 'login' | 'import';
@@ -113,23 +113,16 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   return (
     <Modal open={open} onOpenChange={onOpenChange}>
       <ModalHeader>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-3">
           <ModalTitle>添加账号</ModalTitle>
-          <span className="ml-2.5 inline-flex gap-0.5 rounded-lg bg-surface-2 p-0.5 align-middle">
-            {(['login', 'import'] as const).map((t) => (
-              <button
-                key={t}
-                type="button"
-                onClick={() => setTab(t)}
-                className={cn(
-                  'rounded-md px-3.5 py-1 text-[12.5px] font-medium',
-                  t === tab ? 'bg-surface text-ink shadow-sm' : 'text-ink-3',
-                )}
-              >
-                {t === 'login' ? '浏览器登录' : '导入 JSON'}
-              </button>
-            ))}
-          </span>
+          <Tabs
+            active={tab}
+            onSelect={(v) => setTab(v as Tab)}
+            items={[
+              { value: 'login', label: '浏览器登录' },
+              { value: 'import', label: '导入 JSON' },
+            ]}
+          />
         </div>
       </ModalHeader>
       <ModalBody>
@@ -139,30 +132,30 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
               <>
                 <div className="flex items-center gap-3.5 py-1 pb-2.5">
                   <span className="text-xs text-ink-3">版本：</span>
-                  <label className="inline-flex items-center gap-1.5 text-[12.5px] text-ink-2">
+                  <label className="inline-flex items-center gap-1.5 text-xs text-ink-2">
                     <input type="radio" name="addRealm" className="accent-accent" checked={realm === 'cn'} onChange={() => setRealm('cn')} /> 国内版（CN）
                   </label>
-                  <label className="inline-flex items-center gap-1.5 text-[12.5px] text-ink-2">
+                  <label className="inline-flex items-center gap-1.5 text-xs text-ink-2">
                     <input type="radio" name="addRealm" className="accent-accent" checked={realm === 'global'} onChange={() => setRealm('global')} /> 国际版（Global）
                   </label>
                 </div>
                 <div className="text-xs text-ink-3">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
               </>
             ) : null}
-            {phase === 'load' ? <div className="text-[13px] text-ink-2">正在获取授权链接…</div> : null}
+            {phase === 'load' ? <div className="text-sm text-ink-2">正在获取授权链接…</div> : null}
             {phase === 'ready' ? (
               <>
-                <div className="text-[13px] text-ink-2">在浏览器打开以下链接并登录：</div>
-                <div className="my-2 mb-3 select-all break-all rounded-lg border border-line bg-surface-2 px-3 py-2.5 font-mono text-xs text-accent">{url}</div>
-                <div className="text-[13px] text-ink-2">等待授权完成，自动检测中…</div>
+                <div className="text-sm text-ink-2">在浏览器打开以下链接并登录：</div>
+                <div className="my-2 mb-3 select-all break-all rounded-inner border border-line bg-surface-2 px-3 py-2.5 font-mono text-xs text-accent">{url}</div>
+                <div className="text-sm text-ink-2">等待授权完成，自动检测中…</div>
               </>
             ) : null}
-            {phase === 'done' ? <div className="text-[13px] text-ok">{doneMsg}</div> : null}
-            {phase === 'err' ? <div className="text-[13px] text-bad">{errMsg}</div> : null}
+            {phase === 'done' ? <div className="text-sm text-ok">{doneMsg}</div> : null}
+            {phase === 'err' ? <div className="text-sm text-bad">{errMsg}</div> : null}
           </>
         ) : (
           <>
-            <div className="mb-2 text-[11.5px] text-ink-3">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
+            <div className="mb-2 text-2xs text-ink-3">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
             <Input
               type="file"
               accept=".json"
@@ -173,8 +166,8 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
                 e.target.value = '';
               }}
             />
-            {importMsg ? <div className="text-[13px] text-ok">{importMsg}</div> : null}
-            {importErr ? <div className="text-[13px] text-bad">{importErr}</div> : null}
+            {importMsg ? <div className="text-sm text-ok">{importMsg}</div> : null}
+            {importErr ? <div className="text-sm text-bad">{importErr}</div> : null}
           </>
         )}
       </ModalBody>

@@ -55,7 +55,7 @@ export function KeyGate({
             if (e.key === 'Enter') void submit();
           }}
         />
-        {err ? <div className="mt-2.5 text-[13px] text-bad">密钥不正确，请重试。</div> : null}
+        {err ? <div className="mt-2.5 text-sm text-bad">密钥不正确，请重试。</div> : null}
       </ModalBody>
       <ModalFooter>
         <span className="flex-1" />

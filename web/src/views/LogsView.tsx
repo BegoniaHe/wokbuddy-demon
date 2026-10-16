@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import { fmtMs, fmtTok } from '@/lib/format';
+import { fmtClockTime, fmtMs, fmtTok } from '@/lib/format';
 import {
   fmtBytes,
   reqCreditCell,
@@ -14,9 +14,10 @@ import {
 } from '@/lib/reqlog';
 import { defaultTimeRangeState, trangeQuery, type TimeRangeState } from '@/lib/timeRange';
 import { Button } from '@/components/ui/button';
-import { Input, Select } from '@/components/ui/field';
-import { Box, BoxHeader, BoxHint, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
+import { Input, Select, Tag } from '@/components/ui/field';
+import { Box, BoxHeader, BoxHint, BoxNote, BoxTitle, Grow, Toolbar } from '@/components/ui/box';
 import { Empty, Num, Table, TableWrap, Td, Th } from '@/components/ui/table';
+import { Tabs } from '@/components/ui/tabs';
 import { TimeRange } from '@/components/TimeRange';
 import { cn } from '@/lib/utils';
 
@@ -131,18 +132,19 @@ export function LogsView() {
           <BoxNote className="flex-[1_1_320px] text-left">{reqSummary}</BoxNote>
           <BoxNote className="flex-[0_1_260px] text-right">{reqNote}</BoxNote>
         </BoxHeader>
-        <div className="flex flex-wrap items-center gap-2 border-b border-line-soft bg-surface-2 px-4 py-2.5">
+        <Toolbar>
           <Input
             type="search"
-            className="w-auto min-w-[200px] flex-[0_1_280px] rounded-md px-2.5 py-[5px] text-[12.5px]"
+            size="sm"
+            className="min-w-[200px] flex-[0_1_280px]"
             placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID"
             aria-label="搜索请求记录"
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
           <Select
+            size="sm"
             aria-label="按结果筛选"
-            className="w-auto rounded-md px-2.5 py-[5px] text-[12.5px]"
             value={outcome}
             onChange={(e) => setOutcome(e.target.value)}
           >
@@ -154,8 +156,8 @@ export function LogsView() {
           </Select>
           <TimeRange value={range} onChange={setRange} />
           <Select
+            size="sm"
             aria-label="读取条数"
-            className="w-auto rounded-md px-2.5 py-[5px] text-[12.5px]"
             value={limit}
             onChange={(e) => setLimit(e.target.value)}
           >
@@ -174,7 +176,7 @@ export function LogsView() {
           <Button size="xs" disabled={reqQ.isFetching} onClick={() => void reqQ.refetch()}>
             重新读取
           </Button>
-        </div>
+        </Toolbar>
         <TableWrap className="max-h-[460px] overflow-auto">
           <Table className="min-w-[1080px]">
             <thead className="sticky top-0 z-[1] bg-surface">
@@ -210,22 +212,16 @@ export function LogsView() {
         <BoxHeader>
           <BoxTitle>运行日志</BoxTitle>
           <Grow />
-          <span className="inline-flex items-center gap-1">
-            {(['all', 'task', 'chat', 'sys'] as const).map((c) => (
-              <Button
-                key={c}
-                size="xs"
-                variant="ghost"
-                className={cn(
-                  'rounded-full px-2.5',
-                  c === ch && 'border-transparent bg-accent-soft font-medium text-accent',
-                )}
-                onClick={() => setCh(c)}
-              >
-                {c === 'all' ? '全部' : CH_LABEL[c]}
-              </Button>
-            ))}
-          </span>
+          <Tabs
+            active={ch}
+            onSelect={setCh}
+            items={[
+              { value: 'all', label: '全部' },
+              { value: 'task', label: CH_LABEL.task },
+              { value: 'chat', label: CH_LABEL.chat },
+              { value: 'sys', label: CH_LABEL.sys },
+            ]}
+          />
           <BoxNote>{logNote}</BoxNote>
           <Button size="xs" onClick={() => setPin((p) => !p)}>
             自动滚动：{pin ? '开' : '关'}
@@ -240,13 +236,13 @@ export function LogsView() {
           ) : (
             logEntries.map((e, i) => {
               const lvl = /error|失败|错误/.test(e.text) ? 'text-bad' : /warn|冷却|熔断/.test(e.text) ? 'text-warn' : '';
-              const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
+              const t = e.ts ? fmtClockTime(e.ts) : '';
               return (
                 <span key={i} className={cn('block', lvl)}>
                   {ch === 'all' ? (
                     <i
                       className={cn(
-                        'mr-2 inline-block rounded px-1.5 py-0.5 align-[1px] text-[10px] not-italic leading-none',
+                        'mr-2 inline-block rounded px-1.5 py-0.5 align-[1px] text-3xs not-italic leading-none',
                         e.ch === 'task' && 'bg-accent-soft text-accent',
                         e.ch === 'chat' && 'bg-ok-soft text-ok',
                         e.ch === 'sys' && 'bg-surface-2 text-ink-3',
@@ -267,16 +263,8 @@ export function LogsView() {
 }
 
 function RequestRow({ e }: { e: RequestEntry }) {
-  const when = e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const when = fmtClockTime(e.time);
   const tone = reqOutcomeTone(e);
-  const toneCls =
-    tone === 'ok'
-      ? 'bg-ok-soft text-ok'
-      : tone === 'warn'
-        ? 'bg-warn-soft text-warn'
-        : tone === 'bad'
-          ? 'bg-bad-soft text-bad'
-          : 'bg-surface-2 text-ink-3';
   const muted = <span className="text-ink-3">—</span>;
   return (
     <tr title={requestLogText(e)}>
@@ -284,13 +272,11 @@ function RequestRow({ e }: { e: RequestEntry }) {
         <Num>{when}</Num>
       </Td>
       <Td>
-        <span className={cn('inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-px text-[11.5px] font-medium', toneCls)}>
-          {String(e.status ?? '—') + ' ' + reqOutcomeLabel(e)}
-        </span>
+        <Tag tone={tone}>{String(e.status ?? '—') + ' ' + reqOutcomeLabel(e)}</Tag>
       </Td>
       <Td>{e.model || '—'}</Td>
       <Td>{e.account || '—'}</Td>
-      <Td>{e.client_ip ? <Clip className="max-w-[150px] font-mono text-[12.5px]" text={e.client_ip} /> : muted}</Td>
+      <Td>{e.client_ip ? <Clip className="max-w-[150px] font-mono text-xs" text={e.client_ip} /> : muted}</Td>
       <Td>{e.user_agent ? <Clip className="max-w-[300px]" text={e.user_agent} /> : muted}</Td>
       <Td className="text-right">
         <Num>{fmtMs(e.duration_ms)}</Num>
@@ -301,7 +287,7 @@ function RequestRow({ e }: { e: RequestEntry }) {
       <Td className="text-right">
         <Num>{reqCreditCell(e)}</Num>
       </Td>
-      <Td>{e.request_id ? <Clip className="max-w-[150px] font-mono text-[11.5px] text-ink-3" text={e.request_id} /> : muted}</Td>
+      <Td>{e.request_id ? <Clip className="max-w-[150px] font-mono text-2xs text-ink-3" text={e.request_id} /> : muted}</Td>
     </tr>
   );
 }

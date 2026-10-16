@@ -20,8 +20,9 @@ import {
 } from '@/lib/packages';
 import { Button } from '@/components/ui/button';
 import { Select } from '@/components/ui/field';
-import { Box, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
-import { Empty, Table, TableWrap, Td, Th } from '@/components/ui/table';
+import { Box, BoxBody, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
+import { Empty, RailCell, Table, TableWrap, Td, Th } from '@/components/ui/table';
+import { Legend } from '@/components/ui/bar';
 import { cn } from '@/lib/utils';
 
 const LS_PK_SORT = 'pkSortMode';
@@ -70,9 +71,9 @@ export function PackagesView() {
           <Grow />
           <BoxNote>按批次到期日聚合，颜色区分账号</BoxNote>
         </BoxHeader>
-        <div className="p-4">
+        <BoxBody>
           <ExpiryDistribution list={list} now={now} />
-        </div>
+        </BoxBody>
       </Box>
 
       <Box>
@@ -80,7 +81,7 @@ export function PackagesView() {
           <BoxTitle>账号对比</BoxTitle>
           <Grow />
           <BoxNote>{list.length ? list.length + ' 个账号 · 实时查询上游' : '—'}</BoxNote>
-          <Select className="w-auto rounded-md px-2 py-[3px] text-xs" value={sortMode} onChange={(e) => changeSort(e.target.value)} title="逐包明细的排序规则">
+          <Select size="sm" value={sortMode} onChange={(e) => changeSort(e.target.value)} title="逐包明细的排序规则">
             <option value="end_asc">按到期时间</option>
             <option value="size_desc">按面额大小</option>
           </Select>
@@ -88,7 +89,7 @@ export function PackagesView() {
             刷新
           </Button>
         </BoxHeader>
-        <div className="p-4">
+        <BoxBody>
           {pkgQ.isLoading ? (
             <Empty>查询中…（逐账号向上游实时查询）</Empty>
           ) : pkgQ.error ? (
@@ -98,7 +99,7 @@ export function PackagesView() {
           ) : (
             <ComparisonCards list={list} now={now} />
           )}
-        </div>
+        </BoxBody>
       </Box>
 
       {list
@@ -128,17 +129,16 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
   const legend = list
     .filter((a) => a && !a.error && a.uid && pkAccountSegments(a, now).some((s) => s.days != null))
     .map((a) => (
-      <span key={a.uid} className="inline-flex items-center gap-1.5">
-        <i className="inline-block h-2.5 w-2.5 rounded" style={{ background: colors.get(String(a.uid)) || 'var(--accent)' }} />
+      <Legend key={a.uid} color={colors.get(String(a.uid)) || 'var(--accent)'}>
         {a.nickname || String(a.uid).slice(0, 8)}
-      </span>
+      </Legend>
     ));
 
   const foot = summary.accountCount + ' 个账号' + (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '');
 
   return (
     <>
-      <div className="mb-1 grid grid-cols-[64px_minmax(80px,1fr)_72px] items-center gap-2.5 text-[11px] text-ink-3">
+      <div className="mb-1 grid grid-cols-[64px_minmax(80px,1fr)_72px] items-center gap-2.5 text-2xs text-ink-3">
         <span>剩余天数</span>
         <span className="text-center">各账号该批剩余</span>
         <b className="text-right font-semibold">剩余积分</b>
@@ -148,7 +148,7 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
           const total = row.credits || 1;
           return (
             <div key={row.days} className="grid min-h-[30px] grid-cols-[64px_minmax(80px,1fr)_72px] items-center gap-2.5 pr-0.5">
-              <span className="text-[11.5px] text-ink-3">{row.days === 0 ? '已到期' : row.days + ' 天'}</span>
+              <span className="text-2xs text-ink-3">{row.days === 0 ? '已到期' : row.days + ' 天'}</span>
               <div className="flex h-[9px] items-stretch gap-0.5 overflow-hidden rounded-[5px] bg-surface-2">
                 {row.segments.map((segment, i) => {
                   const color = colors.get(segment.uid) || 'var(--accent)';
@@ -176,13 +176,13 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
                   );
                 })}
               </div>
-              <b className="text-right font-mono text-[11.5px] tabular-nums [overflow-wrap:anywhere]">{fmtTok(row.credits)}</b>
+              <b className="text-right font-mono text-2xs tabular-nums [overflow-wrap:anywhere]">{fmtTok(row.credits)}</b>
             </div>
           );
         })}
       </div>
-      {legend.length ? <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-ink-3">{legend}</div> : null}
-      <div className="mt-2 border-t border-line-soft pt-2 text-[11px] text-ink-3">{foot}</div>
+      {legend.length ? <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-ink-3">{legend}</div> : null}
+      <div className="mt-2 border-t border-line-soft pt-2 text-2xs text-ink-3">{foot}</div>
     </>
   );
 }
@@ -207,10 +207,10 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
       {list.map((a) => {
         if (a.error) {
           return (
-            <div key={a.uid} className="min-w-[200px] flex-1 rounded-lg border border-line-soft p-3">
+            <div key={a.uid} className="min-w-[200px] flex-1 rounded-inner border border-line-soft p-3">
               <div className="flex items-baseline gap-1.5">
-                <span className="text-[13px] font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
-                <span className="font-mono text-[11px] text-ink-3">{a.realm || ''}</span>
+                <span className="text-sm font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
+                <span className="font-mono text-2xs text-ink-3">{a.realm || ''}</span>
               </div>
               <div className="mt-1 text-xs text-warn">查询失败：{a.error}</div>
             </div>
@@ -222,13 +222,13 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
         const expiryTotal = Math.max(1, expiry.reduce((s, x) => s + x.amount, 0));
         const expiryColor = expiryColors.get(String(a.uid)) || 'var(--accent)';
         return (
-          <div key={a.uid} className="min-w-[200px] flex-1 rounded-lg border border-line-soft p-3">
+          <div key={a.uid} className="min-w-[200px] flex-1 rounded-inner border border-line-soft p-3">
             <div className="mb-1.5 flex items-baseline gap-1.5">
-              <span className="text-[13px] font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
-              <span className="font-mono text-[11px] text-ink-3">{a.realm || ''}</span>
+              <span className="text-sm font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
+              <span className="font-mono text-2xs text-ink-3">{a.realm || ''}</span>
             </div>
             <div className="font-mono text-2xl font-semibold tabular-nums">{fmtTok(a.remain)}</div>
-            <div className="mt-0.5 text-[11.5px] text-ink-3">
+            <div className="mt-0.5 text-2xs text-ink-3">
               共 {fmtTok(a.size)} · {(a.packages || []).length} 个包 · 占最高 {((Number(a.remain || 0) / maxRemain) * 100).toFixed(0)}%
             </div>
             <div className="mt-2 flex h-[7px] overflow-hidden rounded bg-surface-2">
@@ -257,12 +257,11 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
                 ))}
               </div>
             ) : null}
-            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-ink-3">
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-ink-3">
               {srcs.map((s, i) => (
-                <span key={i} className="flex items-center gap-1.5">
-                  <i className="inline-block h-2.5 w-2.5 rounded" style={{ background: colorOf(s.key) }} />
+                <Legend key={i} color={colorOf(s.key)}>
                   {s.name.replace(/^CodeBuddy/, '') + ' x' + s.n + ' · ' + fmtTok(s.size) + (s.minCreated ? ' · 首发 ' + s.minCreated.slice(5) : '')}
-                </span>
+                </Legend>
               ))}
             </div>
           </div>
@@ -299,12 +298,10 @@ function DetailBox({
       (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') || (p.package_code || '').replace(/^TCACA_/, '');
     return (
       <tr key={k + '-' + i}>
-        <Td className="w-[3px] p-0">
-          <i className="block h-full min-h-[36px] w-[3px]" style={{ background: colorOf(k) }} />
-        </Td>
+        <RailCell style={{ background: colorOf(k) }} />
         <Td>
           {p.name || '(未命名)'}
-          {sub ? <div className="text-[11px] text-ink-3">{sub}</div> : null}
+          {sub ? <div className="text-2xs text-ink-3">{sub}</div> : null}
         </Td>
         <Td className="text-right font-mono tabular-nums">{fmtTok(p.size)}</Td>
         <Td className="text-right font-mono tabular-nums">{fmtTok(p.remain)}</Td>

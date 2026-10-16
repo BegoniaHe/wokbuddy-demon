@@ -6,7 +6,7 @@ export function Stats({ children, className }: { children: ReactNode; className?
   return (
     <div
       className={cn(
-        'mb-5 grid grid-cols-2 overflow-hidden rounded-xl border border-line bg-surface shadow-panel sm:grid-cols-3 lg:grid-cols-7',
+        'mb-5 grid grid-cols-2 overflow-hidden rounded-surface border border-line bg-surface shadow-panel sm:grid-cols-3 lg:grid-cols-7',
         className,
       )}
     >
@@ -36,7 +36,7 @@ export function Stat({
       >
         {value}
       </div>
-      <div className="mt-1.5 text-[11.5px] text-ink-3">{label}</div>
+      <div className="mt-1.5 text-2xs text-ink-3">{label}</div>
     </div>
   );
 }
@@ -102,12 +102,12 @@ export function Kpi({
   return (
     <div
       className={cn(
-        'relative min-w-0 overflow-hidden rounded-[10px] border border-line-soft bg-surface-2 py-2.5 pl-4 pr-3.5',
+        'relative min-w-0 overflow-hidden rounded-inner border border-line-soft bg-surface-2 py-2.5 pl-4 pr-3.5',
         'before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:opacity-90 before:content-[""]',
         kpiRail[tone],
       )}
     >
-      <div className="truncate text-[11.5px] text-ink-3">{label}</div>
+      <div className="truncate text-2xs text-ink-3">{label}</div>
       <div
         className={cn(
           'mt-1 whitespace-nowrap font-mono text-[23px] font-semibold leading-tight tracking-tight tabular-nums',
@@ -116,7 +116,7 @@ export function Kpi({
       >
         {value}
       </div>
-      {sub ? <div className="mt-1 truncate text-[11px] text-ink-3">{sub}</div> : null}
+      {sub ? <div className="mt-1 truncate text-2xs text-ink-3">{sub}</div> : null}
       {children}
     </div>
   );
