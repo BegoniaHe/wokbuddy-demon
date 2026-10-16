@@ -244,6 +244,9 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
+| `upstream.rotate_max` | `3` | 单请求最多换号次数 |
+| `upstream.rotate_budget` | `0` | 轮换总时长预算（如 `90s`）；`0` = 不限。与 `rotate_max` 先到先停 |
+| `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |
 | `schedule.travel_hours` | `[9, 21]` | 每日整点推进猫猫旅行状态机 |
 | `schedule.activity_hours` | `[10]` | 每日整点对话活跃上报 |

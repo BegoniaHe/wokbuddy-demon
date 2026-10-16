@@ -5,6 +5,19 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/server"
 )
 
+// rotateStatusSet 把配置的状态码列表转为查表集合（issue #17）。空列表返回 nil，
+// 表示「不按状态码过滤，维持现有按错误分类的换号语义」。
+func rotateStatusSet(codes []int) map[int]bool {
+	if len(codes) == 0 {
+		return nil
+	}
+	set := make(map[int]bool, len(codes))
+	for _, c := range codes {
+		set[c] = true
+	}
+	return set
+}
+
 // realmAwareAvailableForModel 构造会话粘性路由按模型可用口径的 realm 感知闭包。
 //
 // 粘性分配的模型名可能带 realm 前缀（"global:gpt-5.4" / "cn:glm-5.2"）：必须按前缀剥出
