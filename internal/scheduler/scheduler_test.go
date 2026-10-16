@@ -395,6 +395,7 @@ func TestCheckinErrorDoesNotCrash(t *testing.T) {
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
+		RetryDelay:    time.Millisecond, // 注入短重试间隔，避免 500 重试拖慢用例（issue #20）
 	}
 	s := New(Config{Pool: p, Upstream: up})
 	// 不应 panic
@@ -684,6 +685,7 @@ func TestPausedVsDisabledTaskParticipation(t *testing.T) {
 // 领养前置上报），不发模型对话，与「让位防风控」不冲突——唯一被跳过的
 // 对话类任务只有夜猫子（RunNightChats 真实 ChatStream）。
 func TestPausedStillTravels(t *testing.T) {
+	fastTravel(t)
 	f := &fakeUpstream{}
 	srv := f.server()
 	defer srv.Close()

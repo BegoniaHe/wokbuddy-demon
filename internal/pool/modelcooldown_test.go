@@ -524,9 +524,8 @@ func TestHealthyForModelAccountCooledAllowsNothingAfterUntil(t *testing.T) {
 	if e.healthyForModel(time.Now(), "glm-5.3") {
 		t.Fatal("until 冷却内不可选")
 	}
-	// 等 until 过期：模型无独立冷却 → 恢复可选。
-	time.Sleep(10 * time.Millisecond)
-	if !e.healthyForModel(time.Now(), "glm-5.3") {
+	// 推进 now 越过 until：模型无独立冷却 → 恢复可选（无需真实 sleep）。
+	if !e.healthyForModel(time.Now().Add(20*time.Millisecond), "glm-5.3") {
 		t.Fatal("until 过期后应恢复可选")
 	}
 }

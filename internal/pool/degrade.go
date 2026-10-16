@@ -30,13 +30,13 @@ func (p *Pool) NoteFailures(uid string) {
 		return
 	}
 	e.consecutiveFails = 0
-	if !e.degradeUntil.IsZero() && time.Now().Before(e.degradeUntil) {
+	if !e.degradeUntil.IsZero() && p.now().Before(e.degradeUntil) {
 		// 降权期内的连败达阈：不延长（取更长者语义由 healthy 或门保证）。计数
 		// 已清零——到期放行后需重新连败满阈值才再降。
 		p.dirty.Store(true)
 		return
 	}
-	e.degradeUntil = time.Now().Add(p.degradeDurationLocked())
+	e.degradeUntil = p.now().Add(p.degradeDurationLocked())
 	p.dirty.Store(true)
 }
 

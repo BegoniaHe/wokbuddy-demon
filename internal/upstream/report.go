@@ -68,9 +68,18 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, b
 	return nil, lastErr
 }
 
-// billingRetryDelay 签到/余额等维护类计费调用瞬时错误重试的间隔基数。
-// 独立变量供测试缩短（生产固定 2s：第 1 次重试等 2s、第 2 次等 4s）。
+// billingRetryDelay 签到/余额等维护类计费调用瞬时错误重试的间隔基数默认值
+// （生产固定 2s：第 1 次重试等 2s、第 2 次等 4s）。测试可经 Client.RetryDelay 注入
+// 更短间隔（跨包测试无法改本包变量，issue #20）。
 var billingRetryDelay = 2 * time.Second
+
+// retryDelay 返回生效的重试间隔基数：Client.RetryDelay 非正时回落包级默认。
+func (c *Client) retryDelay() time.Duration {
+	if c.RetryDelay > 0 {
+		return c.RetryDelay
+	}
+	return billingRetryDelay
+}
 
 // isTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
 // 上游 5xx（ErrServer，实测偶发 "code 10000 / API request failed with status
@@ -95,8 +104,9 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 	if err == nil || !isTransientBillingErr(err) {
 		return err
 	}
+	delay := c.retryDelay()
 	for i := 1; i <= 2; i++ {
-		time.Sleep(time.Duration(i) * billingRetryDelay)
+		time.Sleep(time.Duration(i) * delay)
 		if err = fn(); err == nil || !isTransientBillingErr(err) {
 			return err
 		}
