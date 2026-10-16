@@ -11,10 +11,43 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
 var acceptBatchGap = 1050 * time.Millisecond
+
+// pendingTaskCodes 收集尚未接受且未完成的任务 code（跳过已领取/已锁定/已接受/已完成）。
+func pendingTaskCodes(tasks []upstream.Task) []string {
+	var codes []string
+	for _, t := range tasks {
+		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
+			continue
+		}
+		codes = append(codes, t.TaskCode)
+	}
+	return codes
+}
+
+// claimTaskReward 领取任务奖励（mp 专属码走 chat 域 mp 口径，其余 Web 端接口）。
+func (p *Panel) claimTaskReward(a *auth.Auth, code string) (int64, int64, error) {
+	if isMPTaskCode(code) {
+		return p.cfg.Upstream.ClaimRewardMP(a, code)
+	}
+	return p.cfg.Upstream.ClaimReward(a, code)
+}
+
+// decodeTaskCode 解析请求体的 task_code；缺失时写 400 并返回 false。
+func decodeTaskCode(w http.ResponseWriter, r *http.Request) (string, bool) {
+	var body struct {
+		TaskCode string `json:"task_code"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
+		writeErr(w, http.StatusBadRequest, "task_code required")
+		return "", false
+	}
+	return body.TaskCode, true
+}
 
 // accountByUID 取账号凭证；不存在时写 404 并返回 nil。
 func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
@@ -94,26 +127,31 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
-	var codes []string
-	for _, t := range tasks {
-		// 跳过已完成/已领取/已接受的；locked 的也不碰（上游未开放）。
-		if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
-			continue
-		}
-		codes = append(codes, t.TaskCode)
-	}
+	codes := pendingTaskCodes(tasks)
 	if len(codes) == 0 {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accepted": 0, "message": "所有任务均已接受"})
 		return
 	}
+	accepted, failed := p.acceptCodesInBatches(a, uid, codes)
+	// 小程序口径任务单独批量接受（默认列表不含 mp 码，accept 也要求 mp 头）。
+	mpAccepted, mpFailed := p.acceptMPPending(a, uid)
+	accepted += mpAccepted
+	failed = append(failed, mpFailed...)
+	log.Printf("panel: 全部接受 uid=%s 接受=%d 失败=%d", uid, accepted, len(failed))
+	resp := map[string]any{"ok": true, "accepted": accepted, "failed": failed}
+	if len(failed) > 0 {
+		resp["message"] = "部分任务接受失败（上游拒绝），可重试"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// acceptCodesInBatches 分片接受任务 code（每批 20，批间节流），返回接受数与失败 code。
+func (p *Panel) acceptCodesInBatches(a *auth.Auth, uid string, codes []string) (int, []string) {
 	const batch = 20
 	accepted := 0
 	var failed []string
 	for i := 0; i < len(codes); i += batch {
-		end := i + batch
-		if end > len(codes) {
-			end = len(codes)
-		}
+		end := min(i+batch, len(codes))
 		if err := p.cfg.Upstream.AcceptTasks(a, codes[i:end]); err != nil {
 			log.Printf("panel: 批量接受失败 uid=%s codes=%v err=%v", uid, codes[i:end], err)
 			failed = append(failed, codes[i:end]...)
@@ -122,31 +160,25 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 		accepted += end - i
 		time.Sleep(acceptBatchGap) // 批间节流（对齐脚本 1.05s 口径）
 	}
-	// 小程序口径任务单独批量接受（默认列表不含 mp 码，accept 也要求 mp 头）。
-	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
-		var mpCodes []string
-		for _, t := range mpTasks {
-			if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
-				continue
-			}
-			mpCodes = append(mpCodes, t.TaskCode)
-		}
-		if len(mpCodes) > 0 {
-			if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
-				log.Printf("panel: mp 批量接受失败 uid=%s err=%v", uid, err)
-				failed = append(failed, mpCodes...)
-			} else {
-				accepted += len(mpCodes)
-				time.Sleep(acceptBatchGap)
-			}
-		}
+	return accepted, failed
+}
+
+// acceptMPPending 批量接受小程序口径未接受任务；返回接受数与失败 code（列表失败静默）。
+func (p *Panel) acceptMPPending(a *auth.Auth, uid string) (int, []string) {
+	mpTasks, err := p.cfg.Upstream.ListTasksMP(a)
+	if err != nil {
+		return 0, nil
 	}
-	log.Printf("panel: 全部接受 uid=%s 接受=%d 失败=%d", uid, accepted, len(failed))
-	resp := map[string]any{"ok": true, "accepted": accepted, "failed": failed}
-	if len(failed) > 0 {
-		resp["message"] = "部分任务接受失败（上游拒绝），可重试"
+	codes := pendingTaskCodes(mpTasks)
+	if len(codes) == 0 {
+		return 0, nil
 	}
-	writeJSON(w, http.StatusOK, resp)
+	if err := p.cfg.Upstream.AcceptTasksMP(a, codes); err != nil {
+		log.Printf("panel: mp 批量接受失败 uid=%s err=%v", uid, err)
+		return 0, codes
+	}
+	time.Sleep(acceptBatchGap)
+	return len(codes), nil
 }
 
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
@@ -164,13 +196,7 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 小程序口径任务走 chat 域 mp 头领奖（缺头实测不可领）；其余 Web 端接口。
-	var credit, energy int64
-	var err error
-	if isMPTaskCode(body.TaskCode) {
-		credit, energy, err = p.cfg.Upstream.ClaimRewardMP(a, body.TaskCode)
-	} else {
-		credit, energy, err = p.cfg.Upstream.ClaimReward(a, body.TaskCode)
-	}
+	credit, energy, err := p.claimTaskReward(a, body.TaskCode)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "claim: "+err.Error())
 		return

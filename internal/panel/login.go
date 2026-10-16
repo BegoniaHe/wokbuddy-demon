@@ -155,6 +155,21 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
 }
 
+// loginToken auth/token 端点返回的凭证字段。
+type loginToken struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int64  `json:"expiresIn"`
+	Domain       string `json:"domain"`
+}
+
+// loginAccount login/account 端点返回的账号字段。
+type loginAccount struct {
+	UID          string `json:"uid"`
+	EnterpriseID string `json:"enterpriseId"`
+	Nickname     string `json:"nickname"`
+}
+
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
 func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
@@ -169,113 +184,27 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
 		return
 	}
-	_, epToken, epAcct, origin := loginEndpoints(sess.realm)
 
-	// auth/token 是权威登录状态端点：pending 时业务 code 非 0（"login ing"）。
-	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
+	tok, pending, err := pollLoginToken(sess.realm, state)
 	if err != nil {
 		// pending / 未完成：面板前端继续轮询。
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
 		return
 	}
-	var tok struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresIn    int64  `json:"expiresIn"`
-		Domain       string `json:"domain"`
-	}
-	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
+	if pending {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "waiting for login"})
 		return
 	}
 
-	// 完成：取 uid/nickname（失败不阻塞，仅缺展示名）。
-	var acct struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-	}
-	if acctRaw, _, err := doJSON(http.MethodGet, epAcct+state, tok.AccessToken, nil, origin); err == nil {
-		_ = json.Unmarshal(acctRaw, &acct)
-	}
-	if acct.UID == "" {
-		writeErr(w, http.StatusBadGateway, "login done but no uid（token 已发但账号信息获取失败，请重试）")
+	acct := fetchLoginAccount(sess.realm, state, tok.AccessToken)
+	a, status, msg := p.persistLoginAuth(sess.realm, tok, acct)
+	if status != 0 {
+		writeErr(w, status, msg)
 		return
 	}
-	// UID 来自上游响应，未经校验就用于拼文件名会被路径穿越利用
-	// （filepath.Join("./auths", "workbuddy-../../evil.json") → auths/evil.json）。
-	// UID 是腾讯侧账号标识，实测为 UUID（十六进制与连字符），故只放行 [A-Za-z0-9_-]。
-	if !validUID(acct.UID) {
-		writeErr(w, http.StatusBadGateway, "上游返回的 uid 含非法字符，拒绝落盘（防路径穿越）")
-		return
-	}
-
-	// 凭证落盘（嵌套形，与 auths/ 目录既有格式一致）→ 热加载进池。
-	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
-		writeErr(w, http.StatusInternalServerError, "mkdir auth dir: "+err.Error())
-		return
-	}
-	a := &auth.Auth{
-		AccessToken:  tok.AccessToken,
-		RefreshToken: tok.RefreshToken,
-		ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
-		Domain:       tok.Domain,
-		UID:          acct.UID,
-		EnterpriseID: acct.EnterpriseID,
-		Nickname:     acct.Nickname,
-		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
-	}
-	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
-	if sess.realm == "global" {
-		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
-			writeErr(w, http.StatusInternalServerError, "set realm: "+err.Error())
-			return
-		}
-	} else {
-		// CN 也显式补 realm 键（幂等），让 auth 文件形态统一（与 LoadDir 存量迁移对齐）。
-		_, _ = a.BackfillRealm()
-	}
-	if err := a.SaveAtomic(); err != nil {
-		writeErr(w, http.StatusInternalServerError, "save auth: "+err.Error())
-		return
-	}
-	p.cfg.Pool.Add(a)
-	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
-	// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取
-	// （D4 门控同 scheduler：CN 任务端点对 global 不发起任何调用）。
-	checkinMsg := ""
-	remain := int64(-1)
-	total := int64(0)
-	if sess.realm == "global" {
-		// 注册激活（幂等）：region required 时自动补地区（白名单首个，HK）后重新激活。
-		// 失败不阻断登录结果（auth 已落盘），只在返回字段里体现。
-		if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-			checkinMsg = "注册激活失败: " + err.Error()
-			log.Printf("panel: global 注册激活 uid=%s: %v", acct.UID, err)
-		} else if activated {
-			log.Printf("panel: global 注册激活 uid=%s 完成", acct.UID)
-		}
-		// trial 加油包（幂等 14051 = 已领过，非错误）。
-		if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-			checkinMsg = joinMsg(checkinMsg, "trial 领取失败: "+err.Error())
-			log.Printf("panel: global trial uid=%s: %v", acct.UID, err)
-		} else if claimed {
-			log.Printf("panel: global trial uid=%s 已领", acct.UID)
-		}
-	} else if !a.IsEnterprise() {
-		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
-		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
-		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
-		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-			checkinMsg = err.Error()
-		}
-	}
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-		remain, total = rm, tt
-		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
-	}
+	checkinMsg, remain, total := p.postLoginTasks(a, sess.realm, acct.UID)
 
 	p.loginMu.Lock()
 	delete(p.logins, state)
@@ -290,6 +219,120 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
 	})
+}
+
+// pollLoginToken 查 auth/token：请求失败返回 err（面板按 pending 处理）；token 尚未
+// 就绪返回 pending=true；成功返回解析后的凭证。
+func pollLoginToken(realm, state string) (loginToken, bool, error) {
+	_, epToken, _, origin := loginEndpoints(realm)
+	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
+	if err != nil {
+		return loginToken{}, false, err
+	}
+	var tok loginToken
+	_ = json.Unmarshal(tokRaw, &tok)
+	if tok.AccessToken == "" {
+		return loginToken{}, true, nil
+	}
+	return tok, false, nil
+}
+
+// fetchLoginAccount 取 uid/nickname（失败不阻塞，仅缺展示名）。
+func fetchLoginAccount(realm, state, bearer string) loginAccount {
+	_, _, epAcct, origin := loginEndpoints(realm)
+	var acct loginAccount
+	if acctRaw, _, err := doJSON(http.MethodGet, epAcct+state, bearer, nil, origin); err == nil {
+		_ = json.Unmarshal(acctRaw, &acct)
+	}
+	return acct
+}
+
+// persistLoginAuth 校验 uid、落盘凭证并热加载进池。返回非零 status 表示失败，
+// 调用方据此回写 HTTP 错误；成功时返回落盘后的 auth。
+func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount) (*auth.Auth, int, string) {
+	if acct.UID == "" {
+		return nil, http.StatusBadGateway, "login done but no uid（token 已发但账号信息获取失败，请重试）"
+	}
+	// UID 来自上游响应，未经校验就用于拼文件名会被路径穿越利用
+	// （filepath.Join("./auths", "workbuddy-../../evil.json") → auths/evil.json）。
+	// UID 是腾讯侧账号标识，实测为 UUID（十六进制与连字符），故只放行 [A-Za-z0-9_-]。
+	if !validUID(acct.UID) {
+		return nil, http.StatusBadGateway, "上游返回的 uid 含非法字符，拒绝落盘（防路径穿越）"
+	}
+
+	// 凭证落盘（嵌套形，与 auths/ 目录既有格式一致）→ 热加载进池。
+	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
+		return nil, http.StatusInternalServerError, "mkdir auth dir: " + err.Error()
+	}
+	a := &auth.Auth{
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
+		Domain:       tok.Domain,
+		UID:          acct.UID,
+		EnterpriseID: acct.EnterpriseID,
+		Nickname:     acct.Nickname,
+		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
+	}
+	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
+	if realm == "global" {
+		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+			return nil, http.StatusInternalServerError, "set realm: " + err.Error()
+		}
+	} else {
+		// CN 也显式补 realm 键（幂等），让 auth 文件形态统一（与 LoadDir 存量迁移对齐）。
+		_, _ = a.BackfillRealm()
+	}
+	if err := a.SaveAtomic(); err != nil {
+		return nil, http.StatusInternalServerError, "save auth: " + err.Error()
+	}
+	p.cfg.Pool.Add(a)
+	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
+	return a, 0, ""
+}
+
+// postLoginTasks 登录完成后的签到/激活与余额刷新，返回 (提示消息, 余额, 总额)。
+// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取
+// （D4 门控同 scheduler：CN 任务端点对 global 不发起任何调用）。
+func (p *Panel) postLoginTasks(a *auth.Auth, realm, uid string) (string, int64, int64) {
+	checkinMsg := ""
+	if realm == "global" {
+		checkinMsg = p.activateGlobalLogin(a, uid)
+	} else if !a.IsEnterprise() {
+		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
+		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
+		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
+		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+			checkinMsg = err.Error()
+		}
+	}
+	remain, total := int64(-1), int64(0)
+	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+		remain, total = rm, tt
+		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+	}
+	return checkinMsg, remain, total
+}
+
+// activateGlobalLogin global 登录的注册激活 + trial 领取（幂等；失败不阻断登录结果，
+// auth 已落盘，只在返回字段里体现）。
+func (p *Panel) activateGlobalLogin(a *auth.Auth, uid string) string {
+	checkinMsg := ""
+	// 注册激活（幂等）：region required 时自动补地区（白名单首个，HK）后重新激活。
+	if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
+		checkinMsg = "注册激活失败: " + err.Error()
+		log.Printf("panel: global 注册激活 uid=%s: %v", uid, err)
+	} else if activated {
+		log.Printf("panel: global 注册激活 uid=%s 完成", uid)
+	}
+	// trial 加油包（幂等 14051 = 已领过，非错误）。
+	if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
+		checkinMsg = joinMsg(checkinMsg, "trial 领取失败: "+err.Error())
+		log.Printf("panel: global trial uid=%s: %v", uid, err)
+	} else if claimed {
+		log.Printf("panel: global trial uid=%s 已领", uid)
+	}
+	return checkinMsg
 }
 
 // joinMsg 拼接 login 完成后的提示消息（多段用「；」连接，空段跳过）。

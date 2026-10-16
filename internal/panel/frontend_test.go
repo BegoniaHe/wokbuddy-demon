@@ -553,38 +553,18 @@ process.stdout.write(JSON.stringify({
 // 少了一个开关而 Go 测试全绿，只有人肉点开配置页才会发现。这里把"表单字段 ↔
 // CFG_MAP"与"关键热改键必须在表单里"两条都钉住。
 func TestConfigFormMatchesCFGMap(t *testing.T) {
-	src, err := os.ReadFile("app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	js := string(src)
-	htmlBytes, err := os.ReadFile("index.html")
-	if err != nil {
-		t.Fatal(err)
-	}
-	html := string(htmlBytes)
+	js, html := readPanelSources(t)
 
 	// CFG_MAP 块（下面两条检查共用）。
-	mapBlock := js[strings.Index(js, "const CFG_MAP = {"):]
-	mapBlock = mapBlock[:strings.Index(mapBlock, "\n};")]
-	// 不能按行首匹配：CFG_MAP 里多个键写在同一行（`a: [...], b: [...]`），只有行首
-	// 那个带换行缩进。按「前面是行首或分隔符」判定才不漏。
-	inMap := func(name string) bool {
-		return regexp.MustCompile(`(?:^|[\s,{])` + regexp.QuoteMeta(name) + `:\s*\[`).MatchString(mapBlock)
-	}
+	mapBlock := cfgMapBlock(js)
 
 	// 1) 表单里的每个 name 都要有 CFG_MAP 条目（否则收集/回填都拿不到它）。
-	form := html[strings.Index(html, `<form id="cfgForm">`):]
-	form = form[:strings.Index(form, "</form>")]
-	names := map[string]bool{}
-	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(form, -1) {
-		names[m[1]] = true
-	}
+	names := formFieldNames(html)
 	if len(names) == 0 {
 		t.Fatal("未从配置表单解析出任何 name 字段")
 	}
 	for n := range names {
-		if !inMap(n) {
+		if !cfgMapHasEntry(mapBlock, n) {
 			t.Errorf("表单字段 %q 在 CFG_MAP 里没有条目（保存时会被静默丢弃）", n)
 		}
 	}
@@ -603,6 +583,44 @@ func TestConfigFormMatchesCFGMap(t *testing.T) {
 	if !names["request_client_info"] {
 		t.Error("配置表单缺「记录调用来源」开关（logging.request_client_info）")
 	}
+}
+
+// readPanelSources 读取面板前端两个源文件（app.js / index.html）。
+func readPanelSources(t *testing.T) (js, html string) {
+	t.Helper()
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	htmlBytes, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(src), string(htmlBytes)
+}
+
+// cfgMapBlock 截取 app.js 中 `const CFG_MAP = {` 到 `\n};` 之间的块。
+func cfgMapBlock(js string) string {
+	block := js[strings.Index(js, "const CFG_MAP = {"):]
+	return block[:strings.Index(block, "\n};")]
+}
+
+// cfgMapHasEntry 判断 CFG_MAP 块内是否有 name 键条目。不能按行首匹配：CFG_MAP 里
+// 多个键写在同一行（`a: [...], b: [...]`），只有行首那个带换行缩进。按「前面是
+// 行首或分隔符」判定才不漏。
+func cfgMapHasEntry(mapBlock, name string) bool {
+	return regexp.MustCompile(`(?:^|[\s,{])` + regexp.QuoteMeta(name) + `:\s*\[`).MatchString(mapBlock)
+}
+
+// formFieldNames 解析配置表单里所有 name 属性的字段名。
+func formFieldNames(html string) map[string]bool {
+	form := html[strings.Index(html, `<form id="cfgForm">`):]
+	form = form[:strings.Index(form, "</form>")]
+	names := map[string]bool{}
+	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(form, -1) {
+		names[m[1]] = true
+	}
+	return names
 }
 
 // 同到期时间按面额降序；其余未用完包与零/负余额包分别聚合。

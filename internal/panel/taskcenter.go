@@ -71,40 +71,8 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a == nil {
 				return
 			}
-			it := &items[i]
-			it.UID, it.Nickname = uid, a.Nickname
-			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-			if a.IsGlobal() {
-				return
-			}
-			// 企业版门控：同上——企业版无个人成长体系（GET /v2/activity/growth/tasks
-			// 上游 403「growth system is only available for personal users」）。
-			if a.IsEnterprise() {
-				return
-			}
-			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
-				it.GrowthErr = err.Error()
-			} else {
-				for _, t := range tasks {
-					if growthPending(t) {
-						it.Growth = append(it.Growth, t)
-					}
-				}
-			}
-			// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
-			// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
-			// 静默（无 mp 任务的部署/活动结束时零影响）。
-			if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
-				seen := map[string]bool{}
-				for _, t := range it.Growth {
-					seen[t.TaskCode] = true
-				}
-				for _, t := range mpTasks {
-					if growthPending(t) && !seen[t.TaskCode] {
-						it.Growth = append(it.Growth, t)
-					}
-				}
-			}
+			items[i].UID, items[i].Nickname = uid, a.Nickname
+			items[i].Growth, items[i].GrowthErr = p.scanAccountGrowth(a)
 		}(i, st.UID)
 	}
 	wg.Wait()
@@ -114,6 +82,48 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+}
+
+// scanAccountGrowth 拉取单账号待办成长任务（默认口径 + mp 口径合并，不排序）。
+// global/enterprise 门控；默认列表失败返回错误文本（此时仍合并 mp 待办）。
+func (p *Panel) scanAccountGrowth(a *auth.Auth) ([]upstream.Task, string) {
+	// D4/企业版门控：global 与企业版无 CN 个人成长任务体系，不发起任何上游调用。
+	if a.IsGlobal() || a.IsEnterprise() {
+		return nil, ""
+	}
+	var grow []upstream.Task
+	growthErr := ""
+	if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
+		growthErr = err.Error()
+	} else {
+		for _, t := range tasks {
+			if growthPending(t) {
+				grow = append(grow, t)
+			}
+		}
+	}
+	// 小程序口径任务（school_season 校园日 / Sequential_Tasks_1 小程序首对话）
+	// 仅在 mp 头列表下发，与默认口径不重叠——合并进待办列表；mp 列表失败
+	// 静默（无 mp 任务的部署/活动结束时零影响）。
+	if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
+		grow = mergeMPPending(grow, mpTasks)
+	}
+	return grow, growthErr
+}
+
+// mergeMPPending 把 mp 口径待办合并进 grow（按 code 去重；grow 已含的跳过）。
+// 注意：mp 列表内部重复 code 不会被二次去重（与既有扫描/队列口径一致）。
+func mergeMPPending(grow, mpTasks []upstream.Task) []upstream.Task {
+	seen := map[string]bool{}
+	for _, t := range grow {
+		seen[t.TaskCode] = true
+	}
+	for _, t := range mpTasks {
+		if growthPending(t) && !seen[t.TaskCode] {
+			grow = append(grow, t)
+		}
+	}
+	return grow
 }
 
 // ---------------------------------------------------------------------------
@@ -200,66 +210,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	q.startedAt = time.Now()
 	q.mu.Unlock()
 
-	// 扫描待办（复用扫描逻辑的拉取部分）。
-	states := p.cfg.Pool.List()
-
-	var accts []queueAccount
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	for _, st := range states {
-		if st.Disabled {
-			continue
-		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(a *auth.Auth) {
-			defer wg.Done()
-			one := queueAccount{a: a}
-			// D4 门控：global 账号无 CN 成长任务体系，不发起任何上游调用。
-			if a.IsGlobal() {
-				return
-			}
-			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			if a.IsEnterprise() {
-				return
-			}
-			if growth {
-				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
-					for _, t := range tasks {
-						if growthPending(t) {
-							one.grow = append(one.grow, t)
-						}
-					}
-					// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径
-					// 超集，按 code 去重；失败静默）。此前此处漏合并——扫描显示
-					// mp 待办而队列报"无可执行待办"。
-					if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
-						seen := map[string]bool{}
-						for _, t := range one.grow {
-							seen[t.TaskCode] = true
-						}
-						for _, t := range mpTasks {
-							if growthPending(t) && !seen[t.TaskCode] {
-								one.grow = append(one.grow, t)
-							}
-						}
-					}
-					sort.Slice(one.grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
-						return autoActionIndex(one.grow[i].TaskCode) < autoActionIndex(one.grow[j].TaskCode)
-					})
-				}
-			}
-			if len(one.grow) > 0 {
-				mu.Lock()
-				accts = append(accts, one)
-				mu.Unlock()
-			}
-		}(a)
-	}
-	wg.Wait()
+	accts := p.collectQueueAccounts(growth)
 
 	// 组装队列（账号分组，保持顺序）。
 	var items []queueItem
@@ -287,6 +238,66 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	go p.runQueueItems(accts, items, concurrency)
 	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v）", len(items), concurrency, growth)
 	return true, len(items), seq, ""
+}
+
+// collectQueueAccounts 并发拉取各账号待办成长任务（复用扫描逻辑的拉取部分），
+// 返回待办非空的账号（保持原顺序）。growth=false 时不做上游拉取。
+func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
+	states := p.cfg.Pool.List()
+	var accts []queueAccount
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for _, st := range states {
+		if st.Disabled {
+			continue
+		}
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(a *auth.Auth) {
+			defer wg.Done()
+			one := queueAccount{a: a}
+			if growth {
+				one.grow = p.queueAccountGrowth(a)
+			}
+			if len(one.grow) > 0 {
+				mu.Lock()
+				accts = append(accts, one)
+				mu.Unlock()
+			}
+		}(a)
+	}
+	wg.Wait()
+	return accts
+}
+
+// queueAccountGrowth 拉取账号待办成长任务并按 autoActions 顺序排序。global/企业版
+// 门控；默认列表失败则整账号跳过（与扫描口径不同：扫描失败仍合并 mp 待办）。
+func (p *Panel) queueAccountGrowth(a *auth.Auth) []upstream.Task {
+	if a.IsGlobal() || a.IsEnterprise() {
+		return nil
+	}
+	tasks, err := p.cfg.Upstream.ListTasks(a)
+	if err != nil {
+		return nil
+	}
+	var grow []upstream.Task
+	for _, t := range tasks {
+		if growthPending(t) {
+			grow = append(grow, t)
+		}
+	}
+	// 合并小程序口径待办（与 tasksScanAll 同口径：mp 列表是默认口径超集，按 code
+	// 去重；失败静默）。此前此处漏合并——扫描显示 mp 待办而队列报"无可执行待办"。
+	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+		grow = mergeMPPending(grow, mpTasks)
+	}
+	sort.Slice(grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
+		return autoActionIndex(grow[i].TaskCode) < autoActionIndex(grow[j].TaskCode)
+	})
+	return grow
 }
 
 // RunGrowthQueueOnce 调度器 growth 时点回调（sch.SetGrowthHook 挂载）：与
@@ -426,7 +437,6 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if before == nil {
 		return "该账号无此任务", nil
 	}
-	isMP := isMPTaskCode(code)
 	if before.Claimed {
 		return "已完成（已领取）", nil
 	}
@@ -434,29 +444,24 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var after *upstream.Task
-	if isMP {
-		after, _ = p.taskByCodeMP(a, code)
-	} else {
-		after, _ = p.taskByCodeWaiting(a, code)
-	}
+	after, _ := p.taskByCodeAfterAction(a, code)
 	if after != nil && after.Claimable {
-		var credit, energy int64
-		var cerr error
-		if isMP {
-			credit, energy, cerr = p.cfg.Upstream.ClaimRewardMP(a, code)
-		} else {
-			credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, code)
-		}
-		if cerr == nil && (credit > 0 || energy > 0) {
-			msg += fmt.Sprintf("；自动领奖 +%d 分 +%d 能", credit, energy)
-		}
+		msg = p.autoClaimQueued(a, code, msg)
 	}
 	if after != nil {
 		msg += "（进度 " + taskProgressText(after) + "）"
 	}
 	log.Printf("panel: 队列 growth uid=%s code=%s: %s", a.UID, code, msg)
 	return msg, nil
+}
+
+// autoClaimQueued 队列达标自动领奖并返回追加说明（无新增奖励时原样返回）。
+func (p *Panel) autoClaimQueued(a *auth.Auth, code, msg string) string {
+	credit, energy, err := p.claimTaskReward(a, code)
+	if err != nil || (credit <= 0 && energy <= 0) {
+		return msg
+	}
+	return msg + fmt.Sprintf("；自动领奖 +%d 分 +%d 能", credit, energy)
 }
 
 // tasksQueueStatus 队列状态（轮询用）。

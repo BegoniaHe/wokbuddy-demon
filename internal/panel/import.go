@@ -73,85 +73,13 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	var errs []string
 
 	for _, acc := range accounts {
-		uid := strings.TrimSpace(acc.UID)
-		at := strings.TrimSpace(acc.AccessToken)
-		rt := strings.TrimSpace(acc.RefreshToken)
-		if uid == "" || at == "" || rt == "" {
-			skipped++
-			errs = append(errs, fmt.Sprintf("missing required fields (id=%s)", acc.ID))
+		ok, msg := p.importOneCockpitAccount(acc)
+		if ok {
+			imported++
 			continue
 		}
-		if !validImportUID(uid) {
-			skipped++
-			errs = append(errs, fmt.Sprintf("invalid uid (id=%s)", acc.ID))
-			continue
-		}
-
-		// 按 domain 推断 realm：workbuddy.ai 家族 → global，否则 cn。
-		realm := auth.ResolveRealm("", acc.Domain)
-
-		// cockpit tools 的 expires_at 为毫秒时间戳，转为秒。
-		expiresAt := acc.ExpiresAt / 1000
-		if expiresAt <= 0 {
-			expiresAt = time.Now().Add(365 * 24 * time.Hour).Unix()
-		}
-
-		nickname := acc.Nickname
-		if strings.TrimSpace(nickname) == "" {
-			nickname = acc.Email
-		}
-
-		a := &auth.Auth{
-			AccessToken:  at,
-			RefreshToken: rt,
-			ExpiresAt:    expiresAt,
-			Domain:       acc.Domain,
-			UID:          uid,
-			Nickname:     nickname,
-			FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", uid)),
-		}
-
-		if realm == "global" {
-			if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
-				skipped++
-				errs = append(errs, fmt.Sprintf("uid=%s: set realm failed: %v", uid, err))
-				continue
-			}
-		} else {
-			_, _ = a.BackfillRealm()
-		}
-
-		if err := a.SaveAtomic(); err != nil {
-			skipped++
-			errs = append(errs, fmt.Sprintf("uid=%s: save auth failed: %v", uid, err))
-			continue
-		}
-
-		p.cfg.Pool.Add(a)
-		p.cfg.Pool.Revive(uid)
-
-		// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-		if realm == "global" {
-			if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
-				log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
-			} else if activated {
-				log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
-			}
-			if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
-				log.Printf("panel: import global trial uid=%s: %v", uid, err)
-			} else if claimed {
-				log.Printf("panel: import global trial uid=%s 已领", uid)
-			}
-		} else {
-			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-				log.Printf("panel: import checkin uid=%s: %v", uid, err)
-			}
-		}
-		if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-			p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
-		}
-
-		imported++
+		skipped++
+		errs = append(errs, msg)
 	}
 
 	total = len(accounts)
@@ -163,6 +91,100 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		"skipped":  skipped,
 		"errors":   errs,
 	})
+}
+
+// importOneCockpitAccount 导入单个 cockpit 账号：字段校验、落盘、热加载并顺带
+// 签到/激活。返回 (是否导入成功, 失败原因)；失败原因与旧实现逐字一致。
+func (p *Panel) importOneCockpitAccount(acc cockpitAccount) (bool, string) {
+	uid := strings.TrimSpace(acc.UID)
+	at := strings.TrimSpace(acc.AccessToken)
+	rt := strings.TrimSpace(acc.RefreshToken)
+	if uid == "" || at == "" || rt == "" {
+		return false, fmt.Sprintf("missing required fields (id=%s)", acc.ID)
+	}
+	if !validImportUID(uid) {
+		return false, fmt.Sprintf("invalid uid (id=%s)", acc.ID)
+	}
+
+	// 按 domain 推断 realm：workbuddy.ai 家族 → global，否则 cn。
+	realm := auth.ResolveRealm("", acc.Domain)
+	a := buildImportedAuth(acc, uid, at, rt, p.cfg.AuthDir)
+	if err := p.persistImportedAuth(a, realm, uid); err != nil {
+		return false, err.Error()
+	}
+
+	// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
+	p.importCheckin(a, realm, uid)
+	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+	}
+	return true, ""
+}
+
+// buildImportedAuth 由 cockpit 账号构造 auth：expires_at 毫秒转秒（缺省 +365 天），
+// nickname 缺失时回落 email。
+func buildImportedAuth(acc cockpitAccount, uid, at, rt, authDir string) *auth.Auth {
+	// cockpit tools 的 expires_at 为毫秒时间戳，转为秒。
+	expiresAt := acc.ExpiresAt / 1000
+	if expiresAt <= 0 {
+		expiresAt = time.Now().Add(365 * 24 * time.Hour).Unix()
+	}
+	nickname := acc.Nickname
+	if strings.TrimSpace(nickname) == "" {
+		nickname = acc.Email
+	}
+	return &auth.Auth{
+		AccessToken:  at,
+		RefreshToken: rt,
+		ExpiresAt:    expiresAt,
+		Domain:       acc.Domain,
+		UID:          uid,
+		Nickname:     nickname,
+		FilePath:     filepath.Join(authDir, fmt.Sprintf("workbuddy-%s.json", uid)),
+	}
+}
+
+// persistImportedAuth 按 realm 补 realm 键、落盘并热加载进池；失败返回与旧实现
+// 逐字一致的原因串（调用方计入 skipped）。
+func (p *Panel) persistImportedAuth(a *auth.Auth, realm, uid string) error {
+	if realm == "global" {
+		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+			return fmt.Errorf("uid=%s: set realm failed: %w", uid, err)
+		}
+	} else {
+		_, _ = a.BackfillRealm()
+	}
+	if err := a.SaveAtomic(); err != nil {
+		return fmt.Errorf("uid=%s: save auth failed: %w", uid, err)
+	}
+	p.cfg.Pool.Add(a)
+	p.cfg.Pool.Revive(uid)
+	return nil
+}
+
+// importCheckin 导入后的签到/激活（幂等；失败仅记日志，不阻断导入）。
+func (p *Panel) importCheckin(a *auth.Auth, realm, uid string) {
+	if realm == "global" {
+		p.importGlobalActivation(a, uid)
+		return
+	}
+	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+		log.Printf("panel: import checkin uid=%s: %v", uid, err)
+	}
+}
+
+// importGlobalActivation global 导入后的注册激活 + trial 领取（幂等；失败仅记日志）。
+func (p *Panel) importGlobalActivation(a *auth.Auth, uid string) {
+	if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
+		log.Printf("panel: import global 注册激活 uid=%s: %v", uid, err)
+	} else if activated {
+		log.Printf("panel: import global 注册激活 uid=%s 完成", uid)
+	}
+	if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
+		log.Printf("panel: import global trial uid=%s: %v", uid, err)
+	} else if claimed {
+		log.Printf("panel: import global trial uid=%s 已领", uid)
+	}
 }
 
 // validImportUID 校验导入 uid 是否可用于拼文件名（同 login.go validUID 口径）。
