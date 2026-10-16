@@ -133,10 +133,15 @@ func (f *modelsDevFetcher) lookup(model string) (modelsDevEntry, bool) {
 		}
 	}
 	// 未命中（索引在但模型不在，或索引尚未就绪）：记 miss。
+	f.recordNegativeMiss(model, time.Now())
+	return modelsDevEntry{}, false
+}
+
+// recordNegativeMiss 记录一次未命中（首次 miss 才写时刻）并按需惰性淘汰过期/超限条目。
+func (f *modelsDevFetcher) recordNegativeMiss(model string, now time.Time) {
 	if f.negatives == nil {
 		f.negatives = make(map[string]time.Time)
 	}
-	now := time.Now()
 	// 未命中「重复查询」不再刷新记录时刻：TTL 只从**首次未命中**起算。
 	// 否则覆盖写等于每次查询都把条目续期——一个持续出现在 /v1/models 名单里的
 	// 未知模型（每条 listing 经 ContextWindowListingV4 + MaxOutputTokensListingV4
@@ -147,6 +152,12 @@ func (f *modelsDevFetcher) lookup(model string) (modelsDevEntry, bool) {
 	if _, seen := f.negatives[model]; !seen {
 		f.negatives[model] = now
 	}
+	f.pruneNegatives(now)
+}
+
+// pruneNegatives 惰性淘汰负缓存：超软上限时扫一遍删过期项；仍超硬上限时按时间序
+// 丢弃最旧条目削回软上限。
+func (f *modelsDevFetcher) pruneNegatives(now time.Time) {
 	// 惰性淘汰已过期的负缓存条目：TTL 到期后 negativeFresh 本就判 false（等效不存在），
 	// 条目继续留着只是内存泄漏——models.dev 永不收录的模型名（model 由客户端任意指定）
 	// 查一次就永久驻留，而全库唯一的删除点 backfillMisses 只删「文档里查到」的模型，
@@ -173,7 +184,6 @@ func (f *modelsDevFetcher) lookup(model string) (modelsDevEntry, bool) {
 			delete(f.negatives, m)
 		}
 	}
-	return modelsDevEntry{}, false
 }
 
 // negativeFresh 模型是否在负缓存有效期内（供查找链短路第 4 级触发）。
@@ -277,83 +287,102 @@ func parseModelsDevDoc(raw []byte) (map[string]modelsDevEntry, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("models.dev doc: %w", err)
 	}
-	// 同名 id 的候选值收集：vendorOfficial 标记官方源，votes 计众数，
-	// minProvider 维护该候选已见的最小 provider 名（tie-break 用）。
-	type candidate struct {
-		entry       modelsDevEntry
-		vendor      bool
-		votes       int
-		aggKey      string // 去重聚合 key（同值多 provider 只计票不重复存）
-		minProvider string
-	}
-	byModel := map[string][]candidate{}
+	byModel := map[string][]modelsDevCandidate{}
 	for provider, pv := range doc {
 		for fullID, mv := range pv.Models {
 			if mv.Limit == nil {
 				continue
 			}
-			id := fullID
-			if i := strings.LastIndex(fullID, "/"); i >= 0 {
-				id = fullID[i+1:]
-			}
-			if id == "" {
-				continue
-			}
-			// 值校验（任务书 §2）：正数 + 量级上限，脏值不进索引。
 			ctx, out := mv.Limit.Context, mv.Limit.Output
-			if ctx <= 0 || ctx > modelsDevValueMax {
+			if !validModelsDevLimit(ctx, out) {
 				continue
 			}
-			if out < 0 || out > modelsDevValueMax {
-				continue
-			}
-			key := fmt.Sprintf("%d/%d", ctx, out)
-			cs := byModel[id]
-			dup := false
-			for i := range cs {
-				if cs[i].aggKey != key {
-					continue
-				}
-				cs[i].votes++
-				if modelsDevVendorSources[provider] {
-					cs[i].vendor = true
-				}
-				if provider < cs[i].minProvider {
-					cs[i].minProvider = provider
-				}
-				dup = true
-				break
-			}
-			if !dup {
-				byModel[id] = append(cs, candidate{
-					entry:       modelsDevEntry{Context: ctx, Output: out},
-					vendor:      modelsDevVendorSources[provider],
-					votes:       1,
-					aggKey:      key,
-					minProvider: provider,
-				})
+			if id := bareModelID(fullID); id != "" {
+				byModel[id] = accumulateCandidate(byModel[id], provider, ctx, out)
 			}
 		}
 	}
 	out := make(map[string]modelsDevEntry, len(byModel))
 	for id, cs := range byModel {
-		best := 0
-		for i, c := range cs {
-			// 优先级：官方 vendor 源 > 票数众数 > provider 字典序（tie-break 确定性）。
-			cur := cs[best]
-			better := false
-			if c.vendor && !cur.vendor {
-				better = true
-			} else if c.vendor == cur.vendor && c.votes > cur.votes {
-				better = true
-			} else if c.vendor == cur.vendor && c.votes == cur.votes && c.minProvider < cur.minProvider {
-				better = true
-			}
-			if better {
-				best = i
-			}
-		}
-		out[id] = cs[best].entry
+		out[id] = bestCandidate(cs).entry
 	}
 	return out, nil
+}
+
+// modelsDevCandidate 同名 id 的候选值：vendorOfficial 标记官方源，votes 计众数，
+// minProvider 维护该候选已见的最小 provider 名（tie-break 用）。
+type modelsDevCandidate struct {
+	entry       modelsDevEntry
+	vendor      bool
+	votes       int
+	aggKey      string // 去重聚合 key（同值多 provider 只计票不重复存）
+	minProvider string
+}
+
+// validModelsDevLimit 值校验（任务书 §2）：context 正数、output 非负，均不超量级上限。
+func validModelsDevLimit(ctx, out int64) bool {
+	if ctx <= 0 || ctx > modelsDevValueMax {
+		return false
+	}
+	return out >= 0 && out <= modelsDevValueMax
+}
+
+// bareModelID 从 fullID 取最后一段作为裸模型 id（无 "/" 时即自身）。
+func bareModelID(fullID string) string {
+	if i := strings.LastIndex(fullID, "/"); i >= 0 {
+		return fullID[i+1:]
+	}
+	return fullID
+}
+
+// accumulateCandidate 把 (provider, ctx, out) 并入候选列表：同值聚合投票并维护
+// vendor/minProvider，新值追加候选。
+func accumulateCandidate(cs []modelsDevCandidate, provider string, ctx, out int64) []modelsDevCandidate {
+	key := fmt.Sprintf("%d/%d", ctx, out)
+	for i := range cs {
+		if cs[i].aggKey != key {
+			continue
+		}
+		cs[i].votes++
+		if modelsDevVendorSources[provider] {
+			cs[i].vendor = true
+		}
+		if provider < cs[i].minProvider {
+			cs[i].minProvider = provider
+		}
+		return cs
+	}
+	return append(cs, modelsDevCandidate{
+		entry:       modelsDevEntry{Context: ctx, Output: out},
+		vendor:      modelsDevVendorSources[provider],
+		votes:       1,
+		aggKey:      key,
+		minProvider: provider,
+	})
+}
+
+// bestCandidate 按优先级选最佳候选：官方 vendor 源 > 票数众数 > provider 字典序
+// （tie-break 确定性）。
+func bestCandidate(cs []modelsDevCandidate) modelsDevCandidate {
+	best := 0
+	for i, c := range cs {
+		if candidateBetter(c, cs[best]) {
+			best = i
+		}
+	}
+	return cs[best]
+}
+
+// candidateBetter 报告 c 是否优于 cur（官方 vendor 源 > 票数众数 > provider 字典序）。
+func candidateBetter(c, cur modelsDevCandidate) bool {
+	if c.vendor && !cur.vendor {
+		return true
+	}
+	if c.vendor != cur.vendor {
+		return false
+	}
+	if c.votes != cur.votes {
+		return c.votes > cur.votes
+	}
+	return c.minProvider < cur.minProvider
 }

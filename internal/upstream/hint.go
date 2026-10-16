@@ -42,33 +42,28 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	if isInvalidImageData(msg) {
 		return "image data rejected by upstream; use a real/valid image, may need a new conversation"
 	}
-	switch kind {
-	case ErrPromptTooLong:
-		return "request context exceeds the model's limit; reduce history/message size"
-	case ErrImageInvalid:
-		return "image request was rejected by upstream; check image_url format and image data"
-	case ErrWafBlock:
-		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
-		// （等待窗口过去再试，换号/立刻重试无意义）。
-		return "upstream WAF blocked the gateway; retry after the block window"
-	case ErrSoftRate:
-		return "rate limited by upstream; retry after reset"
-	case ErrAccountFault:
-		return "account-level fault at upstream (auth/quota state); the gateway will rotate or disable this account"
-	case ErrSessionDead:
-		return "account session expired at upstream; the account is disabled until re-login"
-	case ErrHardCredit:
-		return "account credits exhausted at upstream; waiting for daily check-in to restore"
-	case ErrModelBlocked:
-		return "upstream has no such model on this backend; switch model or retry on another account"
-	case ErrContentBlocked:
-		// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
-		// （handler_test 的泄漏守卫），hint 遵守同一口径。
-		return "request content was rejected by content policy; adjust the prompt and retry"
-	default:
-		// ErrNone/ErrNotFound/ErrServer/ErrBadParams/ErrClient 等未覆盖形态：无 hint。
-		return ""
-	}
+	// 其余走 Kind 一对一映射；未覆盖形态（ErrNone/ErrNotFound/ErrServer/
+	// ErrBadParams/ErrClient 等）无 hint。
+	return gatewayHintByKind[kind]
+}
+
+// gatewayHintByKind ErrKind → 固定 hint 文案（未覆盖形态无 hint）。
+var gatewayHintByKind = map[ErrKind]string{
+	ErrPromptTooLong: "request context exceeds the model's limit; reduce history/message size",
+	ErrImageInvalid:  "image request was rejected by upstream; check image_url format and image data",
+	// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
+	// （等待窗口过去再试，换号/立刻重试无意义）。
+	ErrWafBlock: "upstream WAF blocked the gateway; retry after the block window",
+	ErrSoftRate: "rate limited by upstream; retry after reset",
+	ErrAccountFault: "account-level fault at upstream (auth/quota state); " +
+		"the gateway will rotate or disable this account",
+	ErrSessionDead: "account session expired at upstream; the account is disabled until re-login",
+	ErrHardCredit:  "account credits exhausted at upstream; waiting for daily check-in to restore",
+	ErrModelBlocked: "upstream has no such model on this backend; " +
+		"switch model or retry on another account",
+	// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
+	// （handler_test 的泄漏守卫），hint 遵守同一口径。
+	ErrContentBlocked: "request content was rejected by content policy; adjust the prompt and retry",
 }
 
 // HintContext gateway_hint 判定所需的请求侧上下文（handler 侧组装，见
@@ -140,7 +135,14 @@ func isInvalidImageData(body string) bool {
 // codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，
 // 与 IsModelBlocked 的 code 判定同容差口径）。lower 须为小写 body。
 func codeMarker(lower, code string) bool {
-	for _, v := range []string{`"code":` + code, `"code": ` + code, `"code":"` + code + `"`, `"code": "` + code + `"`, `"code":" ` + code + `"`, `"code": '` + code + `'`} {
+	for _, v := range []string{
+		`"code":` + code,
+		`"code": ` + code,
+		`"code":"` + code + `"`,
+		`"code": "` + code + `"`,
+		`"code":" ` + code + `"`,
+		`"code": '` + code + `'`,
+	} {
 		if strings.Contains(lower, v) {
 			return true
 		}

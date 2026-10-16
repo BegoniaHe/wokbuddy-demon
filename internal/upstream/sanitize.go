@@ -194,21 +194,15 @@ func sanitizeMessages(messages []any) bool {
 		}
 		// reasoning_content（思维链回填字段，见 thinking.go/sse.go）实测同样
 		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeText。
-		if rc, ok := m["reasoning_content"].(string); ok {
-			if s := sanitizeText(rc); s != rc {
-				m["reasoning_content"] = s
-				changed = true
-			}
+		if sanitizeStringField(m, "reasoning_content") {
+			changed = true
 		}
 		// reasoning：另一形态的思维链字段。thinking.go 的回填会把客户端送来的
 		// reasoning_content 镜像进 reasoning（反之亦然），而此前只洗 content /
 		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
 		// 裸 "11128" 这种反探测串同样致命。
-		if r, ok := m["reasoning"].(string); ok {
-			if s := sanitizeText(r); s != r {
-				m["reasoning"] = s
-				changed = true
-			}
+		if sanitizeStringField(m, "reasoning") {
+			changed = true
 		}
 		if tc, ok := m["tool_calls"]; ok {
 			if sanitizeToolCalls(tc) {
@@ -217,4 +211,17 @@ func sanitizeMessages(messages []any) bool {
 		}
 	}
 	return changed
+}
+
+// sanitizeStringField 净化 m[key] 的字符串形态（非字符串不处理）；返回是否改动。
+func sanitizeStringField(m map[string]any, key string) bool {
+	s, ok := m[key].(string)
+	if !ok {
+		return false
+	}
+	if out := sanitizeText(s); out != s {
+		m[key] = out
+		return true
+	}
+	return false
 }

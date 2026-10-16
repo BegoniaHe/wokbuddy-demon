@@ -87,33 +87,7 @@ func TestNormalizeRoles(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			// 全程 sanitize=false：验证 role 归一与内容脱敏开关无关（D4）。
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
-			var obj map[string]any
-			if err := json.Unmarshal(out, &obj); err != nil {
-				t.Fatalf("unmarshal: %v (out=%s)", err, out)
-			}
-
-			// 提取输出 messages 里的 role（非对象元素跳过，不 panic）。
-			var got []string
-			if msgs, ok := obj["messages"].([]any); ok {
-				for _, m := range msgs {
-					msg, ok := m.(map[string]any)
-					if !ok {
-						continue
-					}
-					if role, ok := msg["role"].(string); ok {
-						got = append(got, role)
-					}
-				}
-			}
-
-			if len(got) != len(c.wantRoles) {
-				t.Fatalf("role 数量不符: got %v (%d) want %v (%d)", got, len(got), c.wantRoles, len(c.wantRoles))
-			}
-			for i := range got {
-				if got[i] != c.wantRoles[i] {
-					t.Errorf("role[%d] = %q want %q", i, got[i], c.wantRoles[i])
-				}
-			}
+			assertRoles(t, rolesFromBody(t, out), c.wantRoles)
 		})
 	}
 
@@ -128,6 +102,42 @@ func TestNormalizeRoles(t *testing.T) {
 			t.Errorf("其余字段被改动: %v", obj)
 		}
 	})
+}
+
+// rolesFromBody 解出 PrepareBodyOptWithEfforts 输出里 messages 的 role 列表
+// （非对象元素跳过，不 panic）。
+func rolesFromBody(t *testing.T, out []byte) []string {
+	t.Helper()
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v (out=%s)", err, out)
+	}
+	var got []string
+	if msgs, ok := obj["messages"].([]any); ok {
+		for _, m := range msgs {
+			msg, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			if role, ok := msg["role"].(string); ok {
+				got = append(got, role)
+			}
+		}
+	}
+	return got
+}
+
+// assertRoles 断言 got 与 want 逐条相等。
+func assertRoles(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("role 数量不符: got %v (%d) want %v (%d)", got, len(got), want, len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Errorf("role[%d] = %q want %q", i, got[i], want[i])
+		}
+	}
 }
 
 func TestPrepareBodyOptWithEfforts(t *testing.T) {
@@ -317,23 +327,7 @@ func TestNormalizeImageURL(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, sanitize := range []bool{false, true} {
 				out := PrepareBodyOptWithEfforts([]byte(tc.body), sanitize, nil)
-				obj, err := decodeBody(out)
-				if err != nil {
-					t.Fatalf("sanitize=%v unmarshal: %v (out=%s)", sanitize, err, out)
-				}
-				msgs := obj["messages"].([]any)
-				content := msgs[0].(map[string]any)["content"].([]any)
-				var part map[string]any
-				for _, rawPart := range content {
-					candidate, ok := rawPart.(map[string]any)
-					if ok && candidate["type"] == "image_url" {
-						part = candidate
-						break
-					}
-				}
-				if part == nil {
-					t.Fatal("image_url part not found")
-				}
+				part := findImageURLPart(t, out, sanitize)
 				if tc.want == nil {
 					if _, exists := part["image_url"]; exists {
 						t.Fatalf("sanitize=%v: missing image_url should stay missing, got %#v", sanitize, part)
@@ -348,143 +342,166 @@ func TestNormalizeImageURL(t *testing.T) {
 	}
 }
 
+// findImageURLPart 从 PrepareBodyOptWithEfforts 输出里定位第一个 image_url part。
+func findImageURLPart(t *testing.T, out []byte, sanitize bool) map[string]any {
+	t.Helper()
+	obj, err := decodeBody(out)
+	if err != nil {
+		t.Fatalf("sanitize=%v unmarshal: %v (out=%s)", sanitize, err, out)
+	}
+	msgs := obj["messages"].([]any)
+	content := msgs[0].(map[string]any)["content"].([]any)
+	for _, rawPart := range content {
+		if candidate, ok := rawPart.(map[string]any); ok && candidate["type"] == "image_url" {
+			return candidate
+		}
+	}
+	t.Fatal("image_url part not found")
+	return nil
+}
+
+// lookupToolPattern 沿 path（string 键 / int 下标）下钻取 body 里的字符串值。
+func lookupToolPattern(t *testing.T, body string, path ...any) string {
+	t.Helper()
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(body), &obj); err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+	cur := any(obj)
+	for _, p := range path {
+		switch k := p.(type) {
+		case string:
+			m, ok := cur.(map[string]any)
+			if !ok {
+				t.Fatalf("path %v: want object, got %T", path, cur)
+			}
+			cur = m[k]
+		case int:
+			l, ok := cur.([]any)
+			if !ok || k >= len(l) {
+				t.Fatalf("path %v: bad array at %T", path, cur)
+			}
+			cur = l[k]
+		}
+	}
+	s, _ := cur.(string)
+	return s
+}
+
 // TestNormalizeToolPatterns 工具 schema pattern 的 `\_` 转义归一（11129 实案：
 // exa agent_run 的 `^agent\_run\_` 被 deepseek 系确定性拒收，归一后上游 200）。
 // 覆盖：function.parameters 与裸 parameters 两形态、嵌套 schema、patternProperties
 // 键、消息正文不碰、无 tools no-op、sanitize 开关两态一致。
 func TestNormalizeToolPatterns(t *testing.T) {
-	lookupPattern := func(t *testing.T, body string, path ...any) string {
-		t.Helper()
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(body), &obj); err != nil {
-			t.Fatalf("out not json: %v", err)
-		}
-		cur := any(obj)
-		for _, p := range path {
-			switch k := p.(type) {
-			case string:
-				m, ok := cur.(map[string]any)
-				if !ok {
-					t.Fatalf("path %v: want object, got %T", path, cur)
-				}
-				cur = m[k]
-			case int:
-				l, ok := cur.([]any)
-				if !ok || k >= len(l) {
-					t.Fatalf("path %v: bad array at %T", path, cur)
-				}
-				cur = l[k]
-			}
-		}
-		s, _ := cur.(string)
-		return s
+	t.Run("exa agent_run pattern normalized", testAgentRunPatternNormalized)
+	t.Run("nested anyOf items pattern normalized", testNestedAnyOfPatternNormalized)
+	t.Run("bare tool parameters form normalized", testBareToolParametersNormalized)
+	t.Run("patternProperties key normalized", testPatternPropertiesKeyNormalized)
+	t.Run("message content backslash untouched", testMessageContentBackslashUntouched)
+	t.Run("clean pattern untouched", testCleanPatternUntouched)
+	t.Run("no tools is no-op", testNoToolsNoop)
+	t.Run("sanitize on and off behave the same", testSanitizeOnOffSame)
+}
+
+// bs 反斜杠：测试体经工具链多层转义易被吞，运行时拼装保真。
+const bs = `\`
+
+func testAgentRunPatternNormalized(t *testing.T) {
+	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"agent_run","parameters":{"type":"object","properties":{"runId":{"type":"string","pattern":"^agent` + bs + bs + `_run` + bs + bs + `_"}` + `,"query":{"type":"string"}},"required":["query"]}}}]}` //nolint:lll // 实案 body 原样
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "runId", "pattern"); got != `^agent_run_` {
+		t.Fatalf("pattern = %q, want %q", got, `^agent_run_`)
 	}
+	// 同 schema 的兄弟字段不受影响
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "query", "type"); got != "string" {
+		t.Fatalf("sibling field disturbed: %q", got)
+	}
+}
 
-	t.Run("exa agent_run pattern normalized", func(t *testing.T) {
-		bs := string(byte(92))                                                                                                                                                                                                                                                                                                                // 反斜杠，测试体经工具链多层转义易被吞，运行时拼装保真
-		body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"agent_run","parameters":{"type":"object","properties":{"runId":{"type":"string","pattern":"^agent` + bs + bs + `_run` + bs + bs + `_"}` + `,"query":{"type":"string"}},"required":["query"]}}}]}` //nolint:lll // 实案 body 原样
-		out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
-		if got := lookupPattern(t, out, "tools", 0, "function", "parameters", "properties", "runId", "pattern"); got != `^agent_run_` {
-			t.Fatalf("pattern = %q, want %q", got, `^agent_run_`)
-		}
-		// 同 schema 的兄弟字段不受影响
-		if got := lookupPattern(t, out, "tools", 0, "function", "parameters", "properties", "query", "type"); got != "string" {
-			t.Fatalf("sibling field disturbed: %q", got)
-		}
-	})
+func testNestedAnyOfPatternNormalized(t *testing.T) {
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"anyOf":[{"properties":{"code":{"pattern":"x` + bs + bs + `_y"}}},{"type":"string"}]}}}]}` //nolint:lll
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "anyOf", 0, "properties", "code", "pattern"); got != "x_y" {
+		t.Fatalf("nested pattern = %q, want %q", got, "x_y")
+	}
+}
 
-	t.Run("nested anyOf items pattern normalized", func(t *testing.T) {
-		bs := string(byte(92))
-		body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"anyOf":[{"properties":{"code":{"pattern":"x` + bs + bs + `_y"}}},{"type":"string"}]}}}]}` //nolint:lll
-		out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
-		if got := lookupPattern(t, out, "tools", 0, "function", "parameters", "anyOf", 0, "properties", "code", "pattern"); got != "x_y" {
-			t.Fatalf("nested pattern = %q, want %q", got, "x_y")
-		}
-	})
+func testBareToolParametersNormalized(t *testing.T) {
+	body := `{"messages":[],"tools":[{"name":"t","parameters":{"properties":{"id":{"pattern":"p` + bs + bs + `_q"}}}}]}`
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+	if got := lookupToolPattern(t, out, "tools", 0, "parameters", "properties", "id", "pattern"); got != "p_q" {
+		t.Fatalf("bare parameters pattern = %q, want %q", got, "p_q")
+	}
+}
 
-	t.Run("bare tool parameters form normalized", func(t *testing.T) {
-		bs := string(byte(92))
-		body := `{"messages":[],"tools":[{"name":"t","parameters":{"properties":{"id":{"pattern":"p` + bs + bs + `_q"}}}}]}`
-		out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
-		if got := lookupPattern(t, out, "tools", 0, "parameters", "properties", "id", "pattern"); got != "p_q" {
-			t.Fatalf("bare parameters pattern = %q, want %q", got, "p_q")
+func testPatternPropertiesKeyNormalized(t *testing.T) {
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"patternProperties":{"^a` + bs + bs + `_b` + bs + bs + `_":{"type":"string"}}}}}]}` //nolint:lll
+	var obj map[string]any
+	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+	tool := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+	props := tool["patternProperties"].(map[string]any)
+	if _, ok := props["^a_b_"]; !ok {
+		t.Fatalf("normalized key missing: %v", props)
+	}
+	for k := range props {
+		if strings.Contains(k, bs) {
+			t.Fatalf("patternProperties key not normalized: %q", k)
 		}
-	})
+	}
+}
 
-	t.Run("patternProperties key normalized", func(t *testing.T) {
-		bs := string(byte(92))
-		body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"patternProperties":{"^a` + bs + bs + `_b` + bs + bs + `_":{"type":"string"}}}}}]}` //nolint:lll
-		var obj map[string]any
-		out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
-		if err := json.Unmarshal(out, &obj); err != nil {
-			t.Fatalf("out not json: %v", err)
-		}
-		tool := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
-		props := tool["patternProperties"].(map[string]any)
-		if _, ok := props["^a_b_"]; !ok {
-			t.Fatalf("normalized key missing: %v", props)
-		}
-		for k := range props {
-			if strings.Contains(k, string(byte(92))) {
-				t.Fatalf("patternProperties key not normalized: %q", k)
-			}
-		}
-	})
+func testMessageContentBackslashUntouched(t *testing.T) {
+	raw := `{"messages":[{"role":"user","content":"path C:` + bs + bs + `_dir and regex a` + bs + bs + `_b"}],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"q` + bs + bs + `_r"}}}}}]}` //nolint:lll
+	out := string(PrepareBodyOptWithEfforts([]byte(raw), false, nil))
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+	msg := obj["messages"].([]any)[0].(map[string]any)
+	if got := msg["content"]; got != `path C:\_dir and regex a\_b` {
+		t.Fatalf("message content mutated: %q", got)
+	}
+}
 
-	t.Run("message content backslash untouched", func(t *testing.T) {
-		bs := string(byte(92))
-		raw := `{"messages":[{"role":"user","content":"path C:` + bs + bs + `_dir and regex a` + bs + bs + `_b"}],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"q` + bs + bs + `_r"}}}}}]}` //nolint:lll
-		out := string(PrepareBodyOptWithEfforts([]byte(raw), false, nil))
-		var obj map[string]any
-		if err := json.Unmarshal([]byte(out), &obj); err != nil {
-			t.Fatalf("out not json: %v", err)
-		}
-		msg := obj["messages"].([]any)[0].(map[string]any)
-		if got := msg["content"]; got != `path C:\_dir and regex a\_b` {
-			t.Fatalf("message content mutated: %q", got)
-		}
-	})
+func testCleanPatternUntouched(t *testing.T) {
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"^[a-z]+` + bs + bs + `d_$"}}}}}]}` //nolint:lll
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != `^[a-z]+\d_$` {
+		t.Fatalf("clean pattern mutated: %q", got)
+	}
+}
 
-	t.Run("clean pattern untouched", func(t *testing.T) {
-		bs := string(byte(92))
-		body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"^[a-z]+` + bs + bs + `d_$"}}}}}]}` //nolint:lll
-		out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
-		if got := lookupPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != `^[a-z]+\d_$` {
-			t.Fatalf("clean pattern mutated: %q", got)
-		}
-	})
+func testNoToolsNoop(t *testing.T) {
+	body := `{"model":"m","messages":[{"role":"user","content":"a` + bs + bs + `_b"}]}`
+	var inObj, outObj map[string]any
+	if err := json.Unmarshal([]byte(body), &inObj); err != nil {
+		t.Fatal(err)
+	}
+	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+	if err := json.Unmarshal(out, &outObj); err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+	inMsg, _ := json.Marshal(inObj["messages"])
+	outMsg, _ := json.Marshal(outObj["messages"])
+	if string(inMsg) != string(outMsg) {
+		t.Fatalf("messages changed without tools: %s -> %s", inMsg, outMsg)
+	}
+	if _, has := outObj["tools"]; has {
+		t.Fatal("tools appeared out of nowhere")
+	}
+}
 
-	t.Run("no tools is no-op", func(t *testing.T) {
-		bs := string(byte(92))
-		body := `{"model":"m","messages":[{"role":"user","content":"a` + bs + bs + `_b"}]}`
-		var inObj, outObj map[string]any
-		if err := json.Unmarshal([]byte(body), &inObj); err != nil {
-			t.Fatal(err)
+func testSanitizeOnOffSame(t *testing.T) {
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"a` + bs + bs + `_b"}}}}}]}` //nolint:lll
+	for _, sanitize := range []bool{false, true} {
+		out := string(PrepareBodyOptWithEfforts([]byte(body), sanitize, nil))
+		if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != "a_b" {
+			t.Fatalf("sanitize=%v: pattern = %q, want %q", sanitize, got, "a_b")
 		}
-		out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
-		if err := json.Unmarshal(out, &outObj); err != nil {
-			t.Fatalf("out not json: %v", err)
-		}
-		inMsg, _ := json.Marshal(inObj["messages"])
-		outMsg, _ := json.Marshal(outObj["messages"])
-		if string(inMsg) != string(outMsg) {
-			t.Fatalf("messages changed without tools: %s -> %s", inMsg, outMsg)
-		}
-		if _, has := outObj["tools"]; has {
-			t.Fatal("tools appeared out of nowhere")
-		}
-	})
-
-	t.Run("sanitize on and off behave the same", func(t *testing.T) {
-		bs := string(byte(92))
-		body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"a` + bs + bs + `_b"}}}}}]}` //nolint:lll
-		for _, sanitize := range []bool{false, true} {
-			out := string(PrepareBodyOptWithEfforts([]byte(body), sanitize, nil))
-			if got := lookupPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != "a_b" {
-				t.Fatalf("sanitize=%v: pattern = %q, want %q", sanitize, got, "a_b")
-			}
-		}
-	})
+	}
 }
 
 // TestClampGPTMinMaxTokens GPT 系上游要求 max_tokens ≥ 16（实测 gpt-6-sol/gpt-6-luna/

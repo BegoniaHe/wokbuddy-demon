@@ -134,8 +134,8 @@ func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
 	if a == nil || a.UID == "" {
 		return
 	}
-	req.Header.Set("X-Machine-ID", deriveAccountStableID(a.UID, "machine"))
-	req.Header.Set("X-Session-ID", deriveAccountStableID(a.UID, "session"))
+	req.Header.Set("X-Machine-Id", deriveAccountStableID(a.UID, "machine"))
+	req.Header.Set("X-Session-Id", deriveAccountStableID(a.UID, "session"))
 }
 
 // CommonHeaders 设置所有 API 共享的请求头。
@@ -150,7 +150,7 @@ func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", c.userAgent(a))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
-	req.Header.Set("X-CodeBuddy-Request", "1")
+	req.Header.Set("X-Codebuddy-Request", "1")
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
@@ -171,7 +171,7 @@ func acceptLanguageFor(a *auth.Auth) string {
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
 // billing 域未走 CommonHeaders，单独注入保证全出站覆盖（D1）。
 func (c *Client) injectCodeBuddyRequest(req *http.Request) {
-	req.Header.Set("X-CodeBuddy-Request", "1")
+	req.Header.Set("X-Codebuddy-Request", "1")
 }
 
 // ChatMeta 一次 chat 出站的会话头族元数据（issue #35：后台按 X-Conversation-Request-ID
@@ -212,16 +212,7 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
 	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
 	if a != nil && !a.IsGlobal() {
-		if a.EnterpriseID != "" {
-			req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		} else {
-			req.Header.Set("X-No-Enterprise-Id", "1")
-		}
-		if d := a.DomainValue(); d != "" {
-			req.Header.Set("X-Domain", d)
-		} else {
-			req.Header.Set("X-No-Department-Info", "1")
-		}
+		injectCNChatHeaders(req, a)
 	} else {
 		c.injectGlobalChatHeaders(req, a)
 	}
@@ -233,6 +224,20 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	c.injectDeviceToken(req, a)
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
+}
+
+// injectCNChatHeaders CN 账号的 chat 域头：企业 ID 与 Domain 原样透传（缺省 X-No-*）。
+func injectCNChatHeaders(req *http.Request, a *auth.Auth) {
+	if a.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	} else {
+		req.Header.Set("X-No-Enterprise-Id", "1")
+	}
+	if d := a.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
+	} else {
+		req.Header.Set("X-No-Department-Info", "1")
+	}
 }
 
 // injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
@@ -270,23 +275,23 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	}
 	messageID := session.NewMessageID()
 	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-ID", meta.ConversationID)
+		req.Header.Set("X-Conversation-Id", meta.ConversationID)
 	}
-	req.Header.Set("X-Conversation-Request-ID", convReqID)
-	req.Header.Set("X-Conversation-Message-ID", messageID)
+	req.Header.Set("X-Conversation-Request-Id", convReqID)
+	req.Header.Set("X-Conversation-Message-Id", messageID)
 	req.Header.Set("X-Request-ID", messageID)
-	req.Header.Set("X-Root-Request-ID", convReqID)
+	req.Header.Set("X-Root-Request-Id", convReqID)
 	traceID := meta.TraceID
 	if traceID == "" {
 		traceID = convReqID
 	}
-	req.Header.Set("X-Trace-ID", traceID)
+	req.Header.Set("X-Trace-Id", traceID)
 	b3Trace := convReqID
 	if !validTraceID(b3Trace) {
 		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
 	}
-	req.Header.Set("X-B3-TraceId", b3Trace)
-	req.Header.Set("X-B3-SpanId", messageID[:16])
+	req.Header.Set("X-B3-Traceid", b3Trace)
+	req.Header.Set("X-B3-Spanid", messageID[:16])
 	req.Header.Set("X-B3-Sampled", "1")
 }
 
@@ -329,9 +334,9 @@ func (c *Client) injectAttribution(req *http.Request) {
 		return
 	}
 	req.Header.Set("X-Agent-Purpose", "conversation")
-	req.Header.Set("X-IDE-Name", name)
-	req.Header.Set("X-IDE-Type", name)
-	req.Header.Set("X-IDE-Version", c.clientVersion())
+	req.Header.Set("X-Ide-Name", name)
+	req.Header.Set("X-Ide-Type", name)
+	req.Header.Set("X-Ide-Version", c.clientVersion())
 	req.Header.Set("X-Product", name)
 }
 
@@ -342,7 +347,7 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 	}
 	req.Header.Set("X-Forwarded-For", clientIP)
 	req.Header.Set("X-Real-IP", clientIP)
-	req.Header.Set("X-Client-IP", clientIP)
+	req.Header.Set("X-Client-Ip", clientIP)
 }
 
 // ExtractClientIP 从入站请求提取客户端 IP 首段（X-Forwarded-For 首段，回落 X-Real-IP）。

@@ -114,7 +114,8 @@ func (c *Client) AcceptTasksMP(a *auth.Auth, taskCodes []string) error {
 // + mp 头（上游 task_runner claim_one(mp=True) 同款）；chat 域 400 时降级 Web 域
 // 领奖端点（ClaimReward，x-client-platform: web 形态）。返回 (credit, energy, err)。
 func (c *Client) ClaimRewardMP(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.chatBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		c.chatBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -227,7 +228,8 @@ func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
 // 一直返回 400 "task not completed"，是此前领奖失败的真实原因。
 // 本实现返回 (credit, energy, err)：credit/energy 为本次到账奖励（已领取过时为 0）。
 func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.webBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		c.webBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -238,7 +240,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://www.workbuddy.cn")
 	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
-	req.Header.Set("x-client-platform", "web")
+	req.Header.Set("X-Client-Platform", "web")
 	if ua := c.userAgent(a); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}

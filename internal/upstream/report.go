@@ -26,6 +26,12 @@ const reportPath = "/v2/report"
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
 // report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
 func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.domainJSON(a, c.billingBase(a), method, path, body)
+}
+
+// domainJSON 是 billingJSON / growthJSON 的唯一实现：对指定 base 域发请求并解信封。
+// body 为 nil 时不带请求体；请求头统一 BillingHeaders，错误语义同 doJSON。
+func (c *Client) domainJSON(a *auth.Auth, base, method, path string, body any) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -34,7 +40,7 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 		}
 		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequestWithContext(context.Background(), method, c.billingBase(a)+path, rdr)
+	req, err := http.NewRequestWithContext(context.Background(), method, base+path, rdr)
 	if err != nil {
 		return nil, err
 	}

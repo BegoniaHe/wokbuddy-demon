@@ -100,7 +100,8 @@ func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCoun
 	if a == nil || a.Realm() != "global" {
 		return nil, errors.New("fetch countries: only global accounts")
 	}
-	req, err := c.globalRegisterReq(http.MethodPost, c.globalRegisterBase()+"/billing/area/get-country-code", a.AccessTokenValue(), map[string]any{"filterForbidden": 1})
+	req, err := c.globalRegisterReq(http.MethodPost,
+		c.globalRegisterBase()+"/billing/area/get-country-code", a.AccessTokenValue(), map[string]any{"filterForbidden": 1})
 	if err != nil {
 		return nil, err
 	}
@@ -112,17 +113,14 @@ func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCoun
 		return nil, fmt.Errorf("get-country-code: %s (code=%d)", msg, code)
 	}
 	// data 是 JSON 字符串（双层信封）或对象，需二次解析。
+	raw, err = unwrapCountryData(raw)
+	if err != nil {
+		return nil, err
+	}
 	var inner struct {
 		Data struct {
 			List []GlobalCountry `json:"list"`
 		} `json:"data"`
-	}
-	if s := strings.TrimSpace(string(raw)); strings.HasPrefix(s, "\"") {
-		var s2 string
-		if err := json.Unmarshal(raw, &s2); err != nil {
-			return nil, fmt.Errorf("country list unwrap: %w", err)
-		}
-		raw = json.RawMessage(s2)
 	}
 	if err := json.Unmarshal(raw, &inner); err != nil {
 		return nil, fmt.Errorf("country list parse: %w", err)
@@ -131,7 +129,24 @@ func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCoun
 	if !intlOnly {
 		return list, nil
 	}
-	// 国际版 web 白名单过滤（HK, MO, SG, TH, PH, MY, ID，顺序对齐 web 展示）。
+	return filterIntlCountries(list), nil
+}
+
+// unwrapCountryData 解 data 的双层信封：data 是 JSON 字符串时二次解析，否则原样返回。
+func unwrapCountryData(raw json.RawMessage) (json.RawMessage, error) {
+	if s := strings.TrimSpace(string(raw)); strings.HasPrefix(s, "\"") {
+		var s2 string
+		if err := json.Unmarshal(raw, &s2); err != nil {
+			return nil, fmt.Errorf("country list unwrap: %w", err)
+		}
+		return json.RawMessage(s2), nil
+	}
+	return raw, nil
+}
+
+// filterIntlCountries 按国际版 web 白名单过滤并排序（HK/MO/SG/TH/PH/MY/ID，顺序对齐
+// web 展示）。
+func filterIntlCountries(list []GlobalCountry) []GlobalCountry {
 	whitelist := []string{"HK", "MO", "SG", "TH", "PH", "MY", "ID"}
 	byCode := make(map[string]GlobalCountry, len(list))
 	for _, ctry := range list {
@@ -143,7 +158,7 @@ func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCoun
 			out = append(out, ctry)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // GlobalRegisterStatus 报告 global 账号注册激活状态：是否需要补地区、是否已激活。

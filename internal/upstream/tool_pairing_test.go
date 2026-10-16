@@ -72,107 +72,117 @@ func assertSummary(t *testing.T, got, want []string) {
 // 这是部分 OpenAI 兼容 agent 客户端回放并行工具调用的报文形状（同一批调用
 // 拆成多条独立 assistant 消息），上游 deepseek 系模型对它判 11148。
 func TestMergeAdjacentToolCalls(t *testing.T) {
-	const (
-		aNil = `{"role":"assistant","content":null,"tool_calls":[{"id":"c00","type":"function","function":{"name":"f","arguments":"{}"}}]}`
-		aC01 = `{"role":"assistant","content":null,"tool_calls":[{"id":"c01","type":"function","function":{"name":"f","arguments":"{}"}}]}`
-		tC00 = `{"role":"tool","tool_call_id":"c00","content":"r0"}`
-		tC01 = `{"role":"tool","tool_call_id":"c01","content":"r1"}`
-	)
+	t.Run("并行两条合成一条（修复目标形态）", testMergeAdjacentParallelTwo)
+	t.Run("三条连续全并", testMergeAdjacentThree)
+	t.Run("已是规范形态原样返回且零改动", testMergeAdjacentCanonical)
+	t.Run("中间隔着消息不合并（非背靠背）", testMergeAdjacentSeparated)
+	t.Run("后一条 content 非空不合并", testMergeAdjacentNonEmptyContent)
+	t.Run("前一条无 tool_calls 不合并", testMergeAdjacentNoPrevCalls)
+	t.Run("reasoning_content 逐条保留（换行拼接）", testMergeAdjacentReasoning)
+	t.Run("首条即 assistant.tool_calls 不越界", testMergeAdjacentSingle)
+	t.Run("非对象元素原样保留且不阻断后续合并", testMergeAdjacentNonObject)
+}
 
-	t.Run("并行两条合成一条（修复目标形态）", func(t *testing.T) {
-		// 输入即线上复现 11148 的报文：assistant(c00) 之后紧跟 assistant(c01)。
-		in := msgs(t, "["+aNil+","+aC01+","+tC00+","+tC01+"]")
-		out, changed := mergeAdjacentToolCalls(in)
-		if !changed {
-			t.Fatal("changed=false，期望发生合并")
-		}
-		assertSummary(t, summarize(out), []string{"assistant(c00,c01)", "tool(c00)", "tool(c01)"})
-		// 拼接顺序必须是声明顺序（= 结果的 wire 顺序），不得反转。
-		tcs := out[0].(map[string]any)["tool_calls"].([]any)
-		if id, _ := tcs[0].(map[string]any)["id"].(string); id != "c00" {
-			t.Errorf("合并后首个 tool_call = %q want c00", id)
-		}
-	})
+const (
+	tpANil = `{"role":"assistant","content":null,"tool_calls":[{"id":"c00","type":"function","function":{"name":"f","arguments":"{}"}}]}`
+	tpAC01 = `{"role":"assistant","content":null,"tool_calls":[{"id":"c01","type":"function","function":{"name":"f","arguments":"{}"}}]}`
+	tpTC00 = `{"role":"tool","tool_call_id":"c00","content":"r0"}`
+	tpTC01 = `{"role":"tool","tool_call_id":"c01","content":"r1"}`
+)
 
-	t.Run("三条连续全并", func(t *testing.T) {
-		aC02 := `{"role":"assistant","content":null,"tool_calls":[{"id":"c02","type":"function","function":{"name":"f","arguments":"{}"}}]}`
-		in := msgs(t, "["+aNil+","+aC01+","+aC02+"]")
-		out, changed := mergeAdjacentToolCalls(in)
-		if !changed {
-			t.Fatal("changed=false，期望发生合并")
-		}
-		assertSummary(t, summarize(out), []string{"assistant(c00,c01,c02)"})
-	})
+func testMergeAdjacentParallelTwo(t *testing.T) {
+	// 输入即线上复现 11148 的报文：assistant(c00) 之后紧跟 assistant(c01)。
+	in := msgs(t, "["+tpANil+","+tpAC01+","+tpTC00+","+tpTC01+"]")
+	out, changed := mergeAdjacentToolCalls(in)
+	if !changed {
+		t.Fatal("changed=false，期望发生合并")
+	}
+	assertSummary(t, summarize(out), []string{"assistant(c00,c01)", "tool(c00)", "tool(c01)"})
+	// 拼接顺序必须是声明顺序（= 结果的 wire 顺序），不得反转。
+	tcs := out[0].(map[string]any)["tool_calls"].([]any)
+	if id, _ := tcs[0].(map[string]any)["id"].(string); id != "c00" {
+		t.Errorf("合并后首个 tool_call = %q want c00", id)
+	}
+}
 
-	t.Run("已是规范形态原样返回且零改动", func(t *testing.T) {
-		// chat 规范形态（一条 assistant 带全部 tool_calls）：不得改动，便于上层判断 no-op。
-		merged := `{"role":"assistant","content":null,"tool_calls":[{"id":"c00"},{"id":"c01"}]}`
-		in := msgs(t, "["+merged+","+tC00+","+tC01+"]")
-		out, changed := mergeAdjacentToolCalls(in)
-		if changed {
-			t.Error("changed=true，规范形态不应被改动")
-		}
-		assertSummary(t, summarize(out), []string{"assistant(c00,c01)", "tool(c00)", "tool(c01)"})
-	})
+func testMergeAdjacentThree(t *testing.T) {
+	aC02 := `{"role":"assistant","content":null,"tool_calls":[{"id":"c02","type":"function","function":{"name":"f","arguments":"{}"}}]}`
+	in := msgs(t, "["+tpANil+","+tpAC01+","+aC02+"]")
+	out, changed := mergeAdjacentToolCalls(in)
+	if !changed {
+		t.Fatal("changed=false，期望发生合并")
+	}
+	assertSummary(t, summarize(out), []string{"assistant(c00,c01,c02)"})
+}
 
-	t.Run("中间隔着消息不合并（非背靠背）", func(t *testing.T) {
-		// 隔了 user 消息 = 两条独立声明，不是同一批；擅自合并会改变语义。
-		in := msgs(t, "["+aNil+`,{"role":"user","content":"x"},`+aC01+","+tC00+","+tC01+"]")
-		out, changed := mergeAdjacentToolCalls(in)
-		if changed {
-			t.Error("changed=true，非相邻不应合并")
-		}
-		assertSummary(t, summarize(out), []string{"assistant(c00)", "user(-)", "assistant(c01)", "tool(c00)", "tool(c01)"})
-	})
+func testMergeAdjacentCanonical(t *testing.T) {
+	// chat 规范形态（一条 assistant 带全部 tool_calls）：不得改动，便于上层判断 no-op。
+	merged := `{"role":"assistant","content":null,"tool_calls":[{"id":"c00"},{"id":"c01"}]}`
+	in := msgs(t, "["+merged+","+tpTC00+","+tpTC01+"]")
+	out, changed := mergeAdjacentToolCalls(in)
+	if changed {
+		t.Error("changed=true，规范形态不应被改动")
+	}
+	assertSummary(t, summarize(out), []string{"assistant(c00,c01)", "tool(c00)", "tool(c01)"})
+}
 
-	t.Run("后一条 content 非空不合并", func(t *testing.T) {
-		// content 非空无法无损拼接：不猜语义，原样交给上游。
-		in := msgs(t, "["+aNil+`,{"role":"assistant","content":"text","tool_calls":[{"id":"c01"}]}`+"]")
-		out, changed := mergeAdjacentToolCalls(in)
-		if changed {
-			t.Error("changed=true，content 非空不应合并")
-		}
-		assertSummary(t, summarize(out), []string{"assistant(c00)", "assistant(c01)"})
-	})
+func testMergeAdjacentSeparated(t *testing.T) {
+	// 隔了 user 消息 = 两条独立声明，不是同一批；擅自合并会改变语义。
+	in := msgs(t, "["+tpANil+`,{"role":"user","content":"x"},`+tpAC01+","+tpTC00+","+tpTC01+"]")
+	out, changed := mergeAdjacentToolCalls(in)
+	if changed {
+		t.Error("changed=true，非相邻不应合并")
+	}
+	assertSummary(t, summarize(out), []string{"assistant(c00)", "user(-)", "assistant(c01)", "tool(c00)", "tool(c01)"})
+}
 
-	t.Run("前一条无 tool_calls 不合并", func(t *testing.T) {
-		in := msgs(t, `[{"role":"assistant","content":"hi"},`+aNil+"]")
-		out, changed := mergeAdjacentToolCalls(in)
-		if changed {
-			t.Error("changed=true，前一条无 tool_calls 不应合并")
-		}
-		assertSummary(t, summarize(out), []string{"assistant(-)", "assistant(c00)"})
-	})
+func testMergeAdjacentNonEmptyContent(t *testing.T) {
+	// content 非空无法无损拼接：不猜语义，原样交给上游。
+	in := msgs(t, "["+tpANil+`,{"role":"assistant","content":"text","tool_calls":[{"id":"c01"}]}`+"]")
+	out, changed := mergeAdjacentToolCalls(in)
+	if changed {
+		t.Error("changed=true，content 非空不应合并")
+	}
+	assertSummary(t, summarize(out), []string{"assistant(c00)", "assistant(c01)"})
+}
 
-	t.Run("reasoning_content 逐条保留（换行拼接）", func(t *testing.T) {
-		// deepseek 多轮要求 assistant 带回填思维链，丢弃会换一个错误，故必须搬过去。
-		in := msgs(t, `[{"role":"assistant","content":null,"reasoning_content":"r1","tool_calls":[{"id":"c00"}]},{"role":"assistant","content":null,"reasoning_content":"r2","tool_calls":[{"id":"c01"}]}]`)
-		out, changed := mergeAdjacentToolCalls(in)
-		if !changed {
-			t.Fatal("changed=false，期望合并")
-		}
-		rc, _ := out[0].(map[string]any)["reasoning_content"].(string)
-		if rc != "r1\nr2" {
-			t.Errorf("reasoning_content = %q want %q", rc, "r1\nr2")
-		}
-	})
+func testMergeAdjacentNoPrevCalls(t *testing.T) {
+	in := msgs(t, `[{"role":"assistant","content":"hi"},`+tpANil+"]")
+	out, changed := mergeAdjacentToolCalls(in)
+	if changed {
+		t.Error("changed=true，前一条无 tool_calls 不应合并")
+	}
+	assertSummary(t, summarize(out), []string{"assistant(-)", "assistant(c00)"})
+}
 
-	t.Run("首条即 assistant.tool_calls 不越界", func(t *testing.T) {
-		out, changed := mergeAdjacentToolCalls(msgs(t, "["+aNil+"]"))
-		if changed {
-			t.Error("单条消息不应改动")
-		}
-		assertSummary(t, summarize(out), []string{"assistant(c00)"})
-	})
+func testMergeAdjacentReasoning(t *testing.T) {
+	// deepseek 多轮要求 assistant 带回填思维链，丢弃会换一个错误，故必须搬过去。
+	in := msgs(t, `[{"role":"assistant","content":null,"reasoning_content":"r1","tool_calls":[{"id":"c00"}]},{"role":"assistant","content":null,"reasoning_content":"r2","tool_calls":[{"id":"c01"}]}]`)
+	out, changed := mergeAdjacentToolCalls(in)
+	if !changed {
+		t.Fatal("changed=false，期望合并")
+	}
+	rc, _ := out[0].(map[string]any)["reasoning_content"].(string)
+	if rc != "r1\nr2" {
+		t.Errorf("reasoning_content = %q want %q", rc, "r1\nr2")
+	}
+}
 
-	t.Run("非对象元素原样保留且不阻断后续合并", func(t *testing.T) {
-		in := msgs(t, `["str",`+aNil+","+aC01+"]")
-		out, changed := mergeAdjacentToolCalls(in)
-		if !changed {
-			t.Fatal("changed=false，期望 aNil/aC01 合并")
-		}
-		assertSummary(t, summarize(out), []string{"<non-object>", "assistant(c00,c01)"})
-	})
+func testMergeAdjacentSingle(t *testing.T) {
+	out, changed := mergeAdjacentToolCalls(msgs(t, "["+tpANil+"]"))
+	if changed {
+		t.Error("单条消息不应改动")
+	}
+	assertSummary(t, summarize(out), []string{"assistant(c00)"})
+}
+
+func testMergeAdjacentNonObject(t *testing.T) {
+	in := msgs(t, `["str",`+tpANil+","+tpAC01+"]")
+	out, changed := mergeAdjacentToolCalls(in)
+	if !changed {
+		t.Fatal("changed=false，期望 aNil/aC01 合并")
+	}
+	assertSummary(t, summarize(out), []string{"<non-object>", "assistant(c00,c01)"})
 }
 
 // TestPrepareBodyMergesSplitParallelToolCalls 全链路：出站管线必须把「拆开的并行调用」

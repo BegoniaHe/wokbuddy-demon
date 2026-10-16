@@ -286,7 +286,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("x-client-platform", "web")
+	req.Header.Set("X-Client-Platform", "web")
 	req.Header.Set("Origin", c.webBase(a))
 	req.Header.Set("Referer", pageURL)
 	req.Header.Set("User-Agent", ua)
@@ -390,7 +390,8 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.chatBase(a)+"/portal/operation-platform/market/expert/list", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		c.chatBase(a)+"/portal/operation-platform/market/expert/list", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -440,30 +441,9 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	if err != nil {
 		return "", "", err
 	}
-	h := req.Header
-	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	h.Set("Content-Type", "application/json")
-	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
-	h.Set("X-Domain", c.chatBase(a))
-	h.Set("X-Product", "SaaS")
-	h.Set("X-User-Id", a.UID)
-	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", strconv.FormatInt(time.Now().UnixNano(), 10))
-	h.Set("X-Agent-Intent", "craft")
-	h.Set("X-Agent-Type", "main")
-	h.Set("X-IDE-Name", "WorkBuddy")
-	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
-	h.Set("x-codebuddy-request", "1")
-	if expertID != "" {
-		h.Set("X-Expert-Id", expertID)
-	}
+	c.setDesktopExpertHeaders(req, a, conversationID, expertID)
 	if os.Getenv("WB2A_DEBUG_CHAT") != "" {
-		fmt.Printf("[dbg] URL=%s\n", req.URL)
-		for k := range req.Header {
-			fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
-		}
+		debugChatRequest(req)
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -478,43 +458,111 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 		return "", "", fmt.Errorf("chat http %d: %s", resp.StatusCode, b)
 	}
 	// 从 SSE 流抓第一个 data.id 作为服务端 requestId（读干流避免残留连接）。
+	id, err := readServerRequestID(resp.Body)
+	if err != nil {
+		return "", "", err
+	}
+	return conversationID, id, nil
+}
+
+// setDesktopExpertHeaders 注入桌面指纹 chat 请求头（可带 X-Expert-Id）。
+func (c *Client) setDesktopExpertHeaders(req *http.Request, a *auth.Auth, conversationID, expertID string) {
+	h := req.Header
+	h.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	h.Set("Content-Type", "application/json")
+	h.Set("Accept", "text/event-stream")
+	h.Set("User-Agent", desktopUA)
+	h.Set("X-Domain", c.chatBase(a))
+	h.Set("X-Product", "SaaS")
+	h.Set("X-User-Id", a.UID)
+	h.Set("X-Conversation-Id", conversationID)
+	h.Set("X-Request-ID", strconv.FormatInt(time.Now().UnixNano(), 10))
+	h.Set("X-Agent-Intent", "craft")
+	h.Set("X-Agent-Type", "main")
+	h.Set("X-Ide-Name", "WorkBuddy")
+	h.Set("X-Ide-Type", "WorkBuddy")
+	h.Set("X-Ide-Version", "5.5.6")
+	h.Set("X-Codebuddy-Request", "1")
+	if expertID != "" {
+		h.Set("X-Expert-Id", expertID)
+	}
+}
+
+// debugChatRequest 调试输出请求 URL 与全部请求头（仅 WB2A_DEBUG_CHAT 非空时）。
+func debugChatRequest(req *http.Request) {
+	fmt.Printf("[dbg] URL=%s\n", req.URL)
+	for k := range req.Header {
+		fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
+	}
+}
+
+// readServerRequestID 从 SSE 流抓第一个形状合法的 data.id 作为服务端 requestId
+// （读干流避免残留连接）。返回错误表示未找到。
+func readServerRequestID(body io.Reader) (string, error) {
 	buf := make([]byte, 0, 1<<20)
 	tmp := make([]byte, 8192)
 	searchFrom := 0
 	for {
-		n, rerr := resp.Body.Read(tmp)
+		n, rerr := body.Read(tmp)
 		if n > 0 {
 			buf = append(buf, tmp[:n]...)
-			if os.Getenv("WB2A_DEBUG_CHAT") != "" {
-				dbg := string(tmp[:n])
-				if len(dbg) > 120 {
-					dbg = dbg[:120]
-				}
-				fmt.Printf("[dbg-rd %d] %q\n", n, dbg)
+			debugChatRead(tmp[:n])
+			id, matched, next := scanBufferedRequestID(buf, searchFrom)
+			if matched {
+				return id, nil
 			}
-			// 从上次搜索位置继续：SSE 里 `"id":"` 可能先出现在消息 id 等字段，
-			// 若不推进偏移，首个不匹配的 id 会让循环永远重复命中同一位置，
-			// 读满 1MB 后误报"未找到 requestId"。
-			if i := bytes.Index(buf[searchFrom:], []byte(`"id":"`)); i >= 0 {
-				abs := searchFrom + i
-				rest := buf[abs+6:]
-				if end := bytes.IndexByte(rest, '"'); end > 0 {
-					id := string(rest[:end])
-					if os.Getenv("WB2A_DEBUG_CHAT") != "" {
-						fmt.Printf("[dbg-id] %q match=%v\n", id, idRegex.MatchString(id))
-					}
-					if idRegex.MatchString(id) {
-						return conversationID, id, nil
-					}
-					searchFrom = abs + 1
-				}
-			}
+			searchFrom = next
 		}
 		if rerr != nil || len(buf) > 1<<20 {
 			break
 		}
 	}
-	return "", "", errors.New("SSE 中未找到服务端 requestId")
+	return "", errors.New("SSE 中未找到服务端 requestId")
+}
+
+// scanBufferedRequestID 在 buf[searchFrom:] 中定位首个 `"id":"..."`：命中形状合法的 id
+// 返回 (id, true, _)；命中但 id 不合法则推进搜索偏移（next）并返回 matched=false，
+// 避免同一位置被反复命中。
+//
+// 从上次搜索位置继续：SSE 里 `"id":"` 可能先出现在消息 id 等字段，若不推进偏移，
+// 首个不匹配的 id 会让循环永远重复命中同一位置，读满 1MB 后误报"未找到 requestId"。
+func scanBufferedRequestID(buf []byte, searchFrom int) (id string, matched bool, next int) {
+	i := bytes.Index(buf[searchFrom:], []byte(`"id":"`))
+	if i < 0 {
+		return "", false, searchFrom
+	}
+	abs := searchFrom + i
+	rest := buf[abs+6:]
+	end := bytes.IndexByte(rest, '"')
+	if end <= 0 {
+		return "", false, searchFrom
+	}
+	id = string(rest[:end])
+	debugChatID(id)
+	if idRegex.MatchString(id) {
+		return id, true, searchFrom
+	}
+	return "", false, abs + 1
+}
+
+// debugChatRead 调试输出单次读取的字节（仅 WB2A_DEBUG_CHAT 非空时）。
+func debugChatRead(chunk []byte) {
+	if os.Getenv("WB2A_DEBUG_CHAT") == "" {
+		return
+	}
+	dbg := string(chunk)
+	if len(dbg) > 120 {
+		dbg = dbg[:120]
+	}
+	fmt.Printf("[dbg-rd %d] %q\n", len(chunk), dbg)
+}
+
+// debugChatID 调试输出匹配到的 id（仅 WB2A_DEBUG_CHAT 非空时）。
+func debugChatID(id string) {
+	if os.Getenv("WB2A_DEBUG_CHAT") == "" {
+		return
+	}
+	fmt.Printf("[dbg-id] %q match=%v\n", id, idRegex.MatchString(id))
 }
 
 // idRegex 服务端 requestId 形状（cmb- 前缀 32hex 或裸 32hex）。

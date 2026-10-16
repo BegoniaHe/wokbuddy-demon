@@ -16,16 +16,8 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	var got []map[string]any
 	var gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v2/report" {
-			t.Errorf("path=%s want /v2/report", r.URL.Path)
-		}
+		assertReportDesktopRequest(t, r)
 		gotUA = r.Header.Get("User-Agent")
-		if r.Header.Get("X-User-Id") != "u-dt" {
-			t.Errorf("X-User-Id=%q want u-dt", r.Header.Get("X-User-Id"))
-		}
-		if r.Header.Get("X-Product") != "SaaS" {
-			t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
-		}
 		raw, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(raw, &got); err != nil {
 			t.Fatalf("body must be array: %v", err)
@@ -43,6 +35,26 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	if gotUA != desktopUA {
 		t.Errorf("UA=%q want %q", gotUA, desktopUA)
 	}
+	assertDesktopEventFingerprint(t, got)
+}
+
+// assertReportDesktopRequest 断言桌面上报请求的路径与账号头。
+func assertReportDesktopRequest(t *testing.T, r *http.Request) {
+	t.Helper()
+	if r.URL.Path != "/v2/report" {
+		t.Errorf("path=%s want /v2/report", r.URL.Path)
+	}
+	if r.Header.Get("X-User-Id") != "u-dt" {
+		t.Errorf("X-User-Id=%q want u-dt", r.Header.Get("X-User-Id"))
+	}
+	if r.Header.Get("X-Product") != "SaaS" {
+		t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
+	}
+}
+
+// assertDesktopEventFingerprint 断言上报事件被注入 workbuddy-desktop 公共指纹。
+func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
+	t.Helper()
 	if len(got) != 1 {
 		t.Fatalf("events=%d want 1", len(got))
 	}

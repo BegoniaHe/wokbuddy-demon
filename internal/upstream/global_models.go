@@ -57,6 +57,7 @@ var GlobalModelNames = []string{
 // Mutex 内嵌，与 modelList 无并发读路径竞争（唯一读写点本文件内）。
 type fetchGlobalModelsCache struct {
 	sync.Mutex
+
 	names    []string    // 成功缓存：并集模型名（已去重）；nil = 未探测/失败
 	infos    []ModelInfo // 成功缓存：对象形态的全字段条目（窄表/失败形态为 nil）
 	fetched  time.Time
@@ -108,28 +109,14 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		// 逃生门兜底：账号不路由 global 上游 → 不探测（零上游调用）。
 		return nil, nil
 	}
-
-	c.globalModels.Lock()
-	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
-		names, infos := c.globalModels.names, c.globalModels.infos
-		c.globalModels.Unlock()
+	if names, infos, hit := c.globalModelsCacheHit(); hit {
 		return names, infos
 	}
-	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
-		// 负缓存冷却期内：避免反复打上游，直接按失败处理（无静态回落）。
-		c.globalModels.Unlock()
-		return nil, nil
-	}
-	c.globalModels.Unlock()
 
 	names, infos, efforts, defaults, err := c.probeGlobalModels(a)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
-		c.globalModels.Lock()
-		c.globalModels.lastFail = time.Now()
-		c.globalModels.names = nil
-		c.globalModels.infos = nil
-		c.globalModels.Unlock()
+		c.markGlobalModelsFail()
 		return nil, nil
 	}
 	// global 域 effort 能力：探测下发的 supportedEfforts/defaultEffort 权威写入 global 桶
@@ -142,6 +129,46 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
 	// 不注入 costTier。
+	merged := dedupeNames(names)
+	c.storeGlobalModels(merged, infos)
+	return merged, infos
+}
+
+// globalModelsCacheHit 报告探测缓存/负缓存是否命中；命中时返回缓存的 (names, infos)。
+func (c *Client) globalModelsCacheHit() (names []string, infos []ModelInfo, hit bool) {
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
+		return c.globalModels.names, c.globalModels.infos, true
+	}
+	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
+		// 负缓存冷却期内：避免反复打上游，直接按失败处理（无静态回落）。
+		return nil, nil, true
+	}
+	return nil, nil, false
+}
+
+// markGlobalModelsFail 记录一次探测失败（负缓存 + 清空成功缓存）。
+func (c *Client) markGlobalModelsFail() {
+	c.globalModels.Lock()
+	c.globalModels.lastFail = time.Now()
+	c.globalModels.names = nil
+	c.globalModels.infos = nil
+	c.globalModels.Unlock()
+}
+
+// storeGlobalModels 写入成功探测缓存并清除负缓存。
+func (c *Client) storeGlobalModels(names []string, infos []ModelInfo) {
+	c.globalModels.Lock()
+	c.globalModels.names = names
+	c.globalModels.infos = infos
+	c.globalModels.fetched = time.Now()
+	c.globalModels.lastFail = time.Time{}
+	c.globalModels.Unlock()
+}
+
+// dedupeNames 去重模型名（保原序，跳过空串）。
+func dedupeNames(names []string) []string {
 	seen := make(map[string]bool, len(names))
 	merged := make([]string, 0, len(names))
 	for _, id := range names {
@@ -151,14 +178,7 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		seen[id] = true
 		merged = append(merged, id)
 	}
-
-	c.globalModels.Lock()
-	c.globalModels.names = merged
-	c.globalModels.infos = infos
-	c.globalModels.fetched = time.Now()
-	c.globalModels.lastFail = time.Time{}
-	c.globalModels.Unlock()
-	return merged, infos
+	return merged
 }
 
 // probeGlobalModels 发起一次 global 模型目录探测（v3-config-merge + desktop-ua）：
@@ -178,51 +198,17 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 // 模型 id，输出顺序稳定。全部 v3 路失败且企业端点也失败才返回错误；单路失败
 // 降级为其余路结果 + warn 日志，互不拖累。
 func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
-	// probeV3 单次 /v3/config 探测（UA 参数化）。该端点对不同 UA 下发**不同模型集合**：
-	// 桌面端 / IDE / CLI 三路各有独有模型（见 probeGlobalModels 注释），故并发三路取并集。
-	probeV3 := func(ua string) chan probeResult {
-		ch := make(chan probeResult, 1)
-		go func() {
-			// chatBase 已按 realm 切 global base。
-			byID, perr := c.fetchV3ConfigModelMap(a, ua)
-			if perr != nil {
-				ch <- probeResult{err: perr}
-				return
-			}
-			ids := make([]string, 0, len(byID))
-			outInfos := make([]ModelInfo, 0, len(byID))
-			for _, mi := range byID {
-				if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
-					continue
-				}
-				ids = append(ids, mi.ID)
-				outInfos = append(outInfos, mi)
-			}
-			sort.Strings(ids) // map 迭代序随机，排序保输出稳定
-			ch <- probeResult{names: ids, infos: outInfos}
-		}()
-		return ch
-	}
 	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
 	// 按账号 realm 生成（global → `WorkBuddy AI` 平台段），故必须传 a 而非用常量。
-	v3DesktopCh := probeV3(c.defaultWorkBuddyUAFor(a))
-	v3IDECh := probeV3(codeBuddyIDEUA)
-	v3CLICh := probeV3(codeBuddyCLIUA)
+	// 三路 v3 并发（桌面端 / IDE / CLI，各有独有模型，见上方 UA 注释）。
+	v3DesktopCh := make(chan probeResult, 1)
+	go func() { v3DesktopCh <- c.probeV3Route(a, c.defaultWorkBuddyUAFor(a)) }()
+	v3IDECh := make(chan probeResult, 1)
+	go func() { v3IDECh <- c.probeV3Route(a, codeBuddyIDEUA) }()
+	v3CLICh := make(chan probeResult, 1)
+	go func() { v3CLICh <- c.probeV3Route(a, codeBuddyCLIUA) }()
 	enterpriseCh := make(chan probeResult, 1)
-	go func() {
-		// 企业端点家族：/v2 首选 → /console 兜底（既有探活序，零回归）。
-		var lastErr error
-		for _, path := range globalModelsProbePaths {
-			names, infos, perr := c.globalModelsOnce(a, path)
-			if perr != nil {
-				lastErr = perr
-				continue
-			}
-			enterpriseCh <- probeResult{names: names, infos: infos}
-			return
-		}
-		enterpriseCh <- probeResult{err: lastErr}
-	}()
+	go func() { enterpriseCh <- c.probeEnterpriseRoute(a) }()
 	v3Desktop := <-v3DesktopCh
 	v3IDE := <-v3IDECh
 	v3CLI := <-v3CLICh
@@ -254,7 +240,49 @@ func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelI
 		names, infos, efforts, defaults = extractEfforts(v3.infos)
 		return names, infos, efforts, defaults, nil //nolint:nilerr // 企业端点失败但 v3 结果有效
 	}
-	// 两路皆成功：v3 为主、企业端点补缺合并（含 effort 桶合并，v3 权威）。
+	return mergeGlobalProbeResults(v3, enterprise)
+}
+
+// probeV3Route 单次 /v3/config 探测（UA 参数化）并过滤非对话模型，返回该路结果。
+// 该端点对不同 UA 下发**不同模型集合**：桌面端 / IDE / CLI 三路各有独有模型，故并发取并集。
+func (c *Client) probeV3Route(a *auth.Auth, ua string) probeResult {
+	// chatBase 已按 realm 切 global base。
+	byID, perr := c.fetchV3ConfigModelMap(a, ua)
+	if perr != nil {
+		return probeResult{err: perr}
+	}
+	ids := make([]string, 0, len(byID))
+	outInfos := make([]ModelInfo, 0, len(byID))
+	for _, mi := range byID {
+		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+			continue
+		}
+		ids = append(ids, mi.ID)
+		outInfos = append(outInfos, mi)
+	}
+	sort.Strings(ids) // map 迭代序随机，排序保输出稳定
+	return probeResult{names: ids, infos: outInfos}
+}
+
+// probeEnterpriseRoute 企业端点家族探测：/v2 首选 → /console 兜底（既有探活序，零回归）。
+func (c *Client) probeEnterpriseRoute(a *auth.Auth) probeResult {
+	var lastErr error
+	for _, path := range globalModelsProbePaths {
+		names, infos, perr := c.globalModelsOnce(a, path)
+		if perr != nil {
+			lastErr = perr
+			continue
+		}
+		return probeResult{names: names, infos: infos}
+	}
+	return probeResult{err: lastErr}
+}
+
+// mergeGlobalProbeResults 两路皆成功时合并：v3 为主、企业端点补缺（含 effort 桶合并，
+// v3 权威）。
+func mergeGlobalProbeResults(
+	v3, enterprise probeResult,
+) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	v3Names, v3Infos, v3Efforts, v3Defaults := extractEfforts(v3.infos)
 	if len(v3Names) == 0 {
 		v3Names = v3.names
@@ -346,19 +374,15 @@ func extractEfforts(infos []ModelInfo) (names []string, out []ModelInfo, efforts
 // 企业端点补充项在其原序后追加——稳定输出）；infos 同步合并（v3 条目字段权威，
 // 企业端点条目只在 id 缺失时进并集）。
 // 窄表形态（infos nil）时保持 nil——无对象字段不编造。
-func mergeGlobalCatalog(primaryNames []string, primaryInfos []ModelInfo, secondaryNames []string, secondaryInfos []ModelInfo) (names []string, infos []ModelInfo) {
+func mergeGlobalCatalog(
+	primaryNames []string, primaryInfos []ModelInfo, secondaryNames []string, secondaryInfos []ModelInfo,
+) (names []string, infos []ModelInfo) {
 	if len(secondaryNames) == 0 {
 		return primaryNames, primaryInfos
 	}
 	seen := make(map[string]bool, len(primaryNames)+len(secondaryNames))
 	out := make([]string, 0, len(primaryNames)+len(secondaryNames))
-	for _, id := range primaryNames {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		out = append(out, id)
-	}
+	out = appendUniqueNames(out, seen, primaryNames)
 	var outInfos []ModelInfo
 	if primaryInfos != nil {
 		outInfos = make([]ModelInfo, 0, len(primaryInfos)+len(secondaryInfos))
@@ -372,14 +396,33 @@ func mergeGlobalCatalog(primaryNames []string, primaryInfos []ModelInfo, seconda
 		out = append(out, id)
 		// 窄表企业响应（secondaryInfos nil / 超出条目数）时该 id 无对象字段，
 		// infos 保持原样（调用方按 id 名单输出裸条目，不编造字段）。
-		for _, mi := range secondaryInfos {
-			if mi.ID == id {
-				outInfos = append(outInfos, mi)
-				break
-			}
+		if mi, ok := secondaryInfosByID(secondaryInfos, id); ok {
+			outInfos = append(outInfos, mi)
 		}
 	}
 	return out, outInfos
+}
+
+// appendUniqueNames 把 names 中非空且未出现过的 id 追加到 out，并更新 seen。
+func appendUniqueNames(out []string, seen map[string]bool, names []string) []string {
+	for _, id := range names {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// secondaryInfosByID 在 secondaryInfos 中查找 id 对应条目。
+func secondaryInfosByID(secondaryInfos []ModelInfo, id string) (ModelInfo, bool) {
+	for _, mi := range secondaryInfos {
+		if mi.ID == id {
+			return mi, true
+		}
+	}
+	return ModelInfo{}, false
 }
 
 // mergeEffortBuckets 合并两路 effort 桶：主路（v3）权威，企业端点只补主路缺失的模型档位。
@@ -461,129 +504,183 @@ func (c *Client) globalModelsOnce(a *auth.Auth, path string) ([]string, []ModelI
 // 同时产出 effort 能力桶（supportedEfforts/defaultEffort）。
 // 解析成功但名单为空 → 返回错误（等价"该端点没给全"）。
 func parseGlobalModelNames(raw []byte) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
-	fail := func(e error) ([]string, []ModelInfo, map[string][]string, map[string]string, error) {
-		return nil, nil, nil, nil, e
+	payload, err := resolveGlobalPayload(raw)
+	if err != nil {
+		return nil, nil, nil, nil, err
 	}
-	// 信封层：code 拒绝非 0 业务码（字段缺失 = 放行，兼容无信封直出的目录端点）。
+	arr, ok := resolveGlobalModelsArray(payload)
+	if !ok {
+		return nil, nil, nil, nil, errors.New("global models empty list")
+	}
+	// 主形态：对象数组 → dynModelEntry 全字段（与 CN FetchModels 共用解析，零口径漂移）。
+	if names, infos, efforts, defaults, ok := parseGlobalModelEntries(arr); ok {
+		return names, infos, efforts, defaults, nil
+	}
+	// 可用条目为 0（键名全对不上）：落入下方动态兜底，不在这里报空。
+	// 窄表：字符串数组 → 仅 ID（无 effort 元数据、无对象字段 → infos nil）。
+	if names, isStr := parseGlobalNarrowTable(arr); isStr {
+		if len(names) > 0 {
+			return names, nil, nil, nil, nil
+		}
+		return nil, nil, nil, nil, errors.New("global models empty list")
+	}
+	// 动态兜底：逐对象宽松解析（上游换键名时不至于整域空列表）。
+	return parseGlobalModelLooseArray(arr)
+}
+
+// resolveGlobalPayload 解信封：code 非 0 拒绝（字段缺失 = 放行，兼容无信封直出的目录
+// 端点）；payload = data（非空非 null 时）否则整包。
+func resolveGlobalPayload(raw []byte) (json.RawMessage, error) {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return fail(fmt.Errorf("global models parse: %w", err))
+		return nil, fmt.Errorf("global models parse: %w", err)
 	}
 	if codeRaw, ok := envelope["code"]; ok {
 		var code int
 		if json.Unmarshal(codeRaw, &code) == nil && code != 0 {
-			return fail(fmt.Errorf("global models code=%d", code))
+			return nil, fmt.Errorf("global models code=%d", code)
 		}
 	}
-	payload := json.RawMessage(raw)
 	if data, ok := envelope["data"]; ok {
 		if t := strings.TrimSpace(string(data)); t != "" && t != "null" {
-			payload = data
+			return data, nil
 		}
 	}
-	arr, ok := resolveGlobalModelsArray(payload)
-	if !ok {
-		return fail(errors.New("global models empty list"))
-	}
+	return json.RawMessage(raw), nil
+}
 
-	// 主形态：对象数组 → dynModelEntry 全字段（与 CN FetchModels 共用解析，零口径漂移）。
-	var entries []dynModelEntry
-	if json.Unmarshal(arr, &entries) == nil {
-		out := make([]string, 0, len(entries))
-		objInfos := make([]ModelInfo, 0, len(entries))
-		for _, m := range entries {
-			// id 回退链 id→modelId→model→name（宽松键仅出现在 global 目录变体里）。
-			id := m.ID
-			if id == "" {
-				id = m.ModelID
-			}
-			if id == "" {
-				id = m.Model
-			}
-			if id == "" {
-				id = m.Name
-			}
-			if id == "" || m.Disabled {
-				continue
-			}
-			out = append(out, id)
-			mi := m.modelInfo()
-			mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
-			objInfos = append(objInfos, mi)
-			if len(m.Reasoning.SupportedEfforts) > 0 {
-				if efforts == nil {
-					efforts = make(map[string][]string)
-				}
-				efforts[id] = m.Reasoning.SupportedEfforts
-			}
-			if d := m.Reasoning.DefaultEffort; d != "" {
-				if defaults == nil {
-					defaults = make(map[string]string)
-				}
-				defaults[id] = d
-			}
-		}
-		if len(out) > 0 {
-			return out, objInfos, efforts, defaults, nil
-		}
-		// 可用条目为 0（键名全对不上）：落入下方动态兜底，不在这里报空。
-		efforts, defaults = nil, nil
-	}
-
-	// 窄表：字符串数组 → 仅 ID（无 effort 元数据、无对象字段 → infos nil）。
+// parseGlobalNarrowTable 窄表形态：字符串数组 → 仅 ID（去空白）。isStringArray=false
+// 表示不是字符串数组（调用方回落动态兜底）。
+func parseGlobalNarrowTable(arr json.RawMessage) (names []string, isStringArray bool) {
 	var strs []string
-	if json.Unmarshal(arr, &strs) == nil {
-		out := make([]string, 0, len(strs))
-		for _, id := range strs {
-			if id = strings.TrimSpace(id); id != "" {
-				out = append(out, id)
-			}
-		}
-		if len(out) > 0 {
-			return out, nil, nil, nil, nil
-		}
-		return fail(errors.New("global models empty list"))
+	if json.Unmarshal(arr, &strs) != nil {
+		return nil, false
 	}
+	out := make([]string, 0, len(strs))
+	for _, id := range strs {
+		if id = strings.TrimSpace(id); id != "" {
+			out = append(out, id)
+		}
+	}
+	return out, true
+}
 
-	// 动态兜底：逐对象宽松解析（上游换键名时不至于整域空列表）。
+// looseCatalog 动态兜底逐条解析的累积结果。
+type looseCatalog struct {
+	names    []string
+	infos    []ModelInfo
+	efforts  map[string][]string
+	defaults map[string]string
+}
+
+// addString 并入混合数组里的裸 ID 条目。
+func (lc *looseCatalog) addString(id string) {
+	lc.names = append(lc.names, id)
+	lc.infos = append(lc.infos, ModelInfo{ID: id})
+}
+
+// addModel 并入宽松解析出的模型条目，并归集 effort 能力桶。
+func (lc *looseCatalog) addModel(mi ModelInfo) {
+	lc.names = append(lc.names, mi.ID)
+	lc.infos = append(lc.infos, mi)
+	if len(mi.Efforts) > 0 {
+		if lc.efforts == nil {
+			lc.efforts = make(map[string][]string)
+		}
+		lc.efforts[mi.ID] = mi.Efforts
+	}
+	if mi.DefaultEffort != "" {
+		if lc.defaults == nil {
+			lc.defaults = make(map[string]string)
+		}
+		lc.defaults[mi.ID] = mi.DefaultEffort
+	}
+}
+
+// parseGlobalModelLooseArray 动态兜底：逐对象宽松解析（上游换键名时不至于整域空列表）。
+func parseGlobalModelLooseArray(arr json.RawMessage) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	var items []any
 	if json.Unmarshal(arr, &items) != nil {
-		return fail(errors.New("global models parse: unsupported payload shape"))
+		return nil, nil, nil, nil, errors.New("global models parse: unsupported payload shape")
 	}
-	out := make([]string, 0, len(items))
-	infos = make([]ModelInfo, 0, len(items))
+	lc := &looseCatalog{
+		names: make([]string, 0, len(items)),
+		infos: make([]ModelInfo, 0, len(items)),
+	}
 	for _, item := range items {
 		switch v := item.(type) {
 		case string: // 混合数组里的裸 ID：按窄表条目处理
 			if id := strings.TrimSpace(v); id != "" {
-				out = append(out, id)
-				infos = append(infos, ModelInfo{ID: id})
+				lc.addString(id)
 			}
 		case map[string]any:
-			mi, ok := parseGlobalModelLoose(v)
-			if !ok {
-				continue
-			}
-			out = append(out, mi.ID)
-			infos = append(infos, mi)
-			if len(mi.Efforts) > 0 {
-				if efforts == nil {
-					efforts = make(map[string][]string)
-				}
-				efforts[mi.ID] = mi.Efforts
-			}
-			if mi.DefaultEffort != "" {
-				if defaults == nil {
-					defaults = make(map[string]string)
-				}
-				defaults[mi.ID] = mi.DefaultEffort
+			if mi, ok := parseGlobalModelLoose(v); ok {
+				lc.addModel(mi)
 			}
 		}
 	}
-	if len(out) == 0 {
-		return fail(errors.New("global models empty list"))
+	if len(lc.names) == 0 {
+		return nil, nil, nil, nil, errors.New("global models empty list")
 	}
-	return out, infos, efforts, defaults, nil
+	return lc.names, lc.infos, lc.efforts, lc.defaults, nil
+}
+
+// parseGlobalModelEntries 解析主形态（对象数组 → dynModelEntry 全字段，与 CN FetchModels
+// 共用解析，零口径漂移）：id 回退链 id→modelId→model→name，disabled 剔除；顺带产出
+// effort 能力桶。ok=false 表示该形态解析不出任何可用条目（键名对不上），调用方回落动态兜底。
+func parseGlobalModelEntries(arr json.RawMessage) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, ok bool) {
+	var entries []dynModelEntry
+	if json.Unmarshal(arr, &entries) != nil {
+		return nil, nil, nil, nil, false
+	}
+	names = make([]string, 0, len(entries))
+	infos = make([]ModelInfo, 0, len(entries))
+	for _, m := range entries {
+		id := modelEntryID(m)
+		if id == "" || m.Disabled {
+			continue
+		}
+		names = append(names, id)
+		mi := m.modelInfo()
+		mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
+		infos = append(infos, mi)
+		efforts, defaults = addEffortBucket(m, id, efforts, defaults)
+	}
+	if len(names) == 0 {
+		return nil, nil, nil, nil, false
+	}
+	return names, infos, efforts, defaults, true
+}
+
+// modelEntryID 按 id→modelId→model→name 回退链取模型 id。
+func modelEntryID(m dynModelEntry) string {
+	if m.ID != "" {
+		return m.ID
+	}
+	if m.ModelID != "" {
+		return m.ModelID
+	}
+	if m.Model != "" {
+		return m.Model
+	}
+	return m.Name
+}
+
+// addEffortBucket 把单模型的 supportedEfforts/defaultEffort 写入能力桶（按需建桶）。
+func addEffortBucket(m dynModelEntry, id string, efforts map[string][]string, defaults map[string]string) (map[string][]string, map[string]string) {
+	if len(m.Reasoning.SupportedEfforts) > 0 {
+		if efforts == nil {
+			efforts = make(map[string][]string)
+		}
+		efforts[id] = m.Reasoning.SupportedEfforts
+	}
+	if d := m.Reasoning.DefaultEffort; d != "" {
+		if defaults == nil {
+			defaults = make(map[string]string)
+		}
+		defaults[id] = d
+	}
+	return efforts, defaults
 }
 
 // resolveGlobalModelsArray 从 payload 定位模型数组：payload 本身是数组直接用；
@@ -613,59 +710,75 @@ func resolveGlobalModelsArray(payload json.RawMessage) (json.RawMessage, bool) {
 // defaultEffort 新键优先、effort 老键兜底。disabled 剔除。Credits 恒不解析
 // （PLAN §3.D2：倍率不进 global 路径）。
 func parseGlobalModelLoose(obj map[string]any) (ModelInfo, bool) {
-	str := func(key string) string {
-		s, _ := obj[key].(string)
-		return strings.TrimSpace(s)
-	}
-	id := str("id")
-	for _, k := range []string{"modelId", "model", "name"} {
-		if id != "" {
-			break
-		}
-		id = str(k)
-	}
+	id := looseModelID(obj)
 	if id == "" {
 		return ModelInfo{}, false
 	}
 	if disabled, ok := obj["disabled"].(bool); ok && disabled {
 		return ModelInfo{}, false
 	}
-	num := func(keys ...string) int64 {
-		for _, k := range keys {
-			if n, ok := obj[k].(float64); ok && n > 0 {
-				return int64(n)
-			}
-		}
-		return 0
-	}
 	mi := ModelInfo{
 		ID:             id,
-		Name:           str("name"),
-		ContextWindow:  num("maxInputTokens", "contextWindow"),
-		MaxTokens:      num("maxOutputTokens", "maxTokens"),
-		MaxAllowedSize: num("maxAllowedSize"),
+		Name:           looseString(obj, "name"),
+		ContextWindow:  looseInt(obj, "maxInputTokens", "contextWindow"),
+		MaxTokens:      looseInt(obj, "maxOutputTokens", "maxTokens"),
+		MaxAllowedSize: looseInt(obj, "maxAllowedSize"),
 	}
 	mi.SupportsReasoning, _ = obj["supportsReasoning"].(bool)
 	mi.SupportsImages, _ = obj["supportsImages"].(bool)
-	if r, ok := obj["reasoning"].(map[string]any); ok {
-		reasonStr := func(key string) string {
-			s, _ := r[key].(string)
-			return strings.TrimSpace(s)
+	fillLooseReasoning(&mi, obj)
+	return mi, true
+}
+
+// looseString 取 obj[key] 的字符串并去空白。
+func looseString(obj map[string]any, key string) string {
+	s, _ := obj[key].(string)
+	return strings.TrimSpace(s)
+}
+
+// looseModelID 按 id→modelId→model→name 回退链取宽松解析的模型 id。
+func looseModelID(obj map[string]any) string {
+	id := looseString(obj, "id")
+	for _, k := range []string{"modelId", "model", "name"} {
+		if id != "" {
+			break
 		}
-		mi.DefaultEffort = reasonStr("defaultEffort")
-		if mi.DefaultEffort == "" {
-			mi.DefaultEffort = reasonStr("effort") // 老模型键兜底，与 CN 侧同款
+		id = looseString(obj, k)
+	}
+	return id
+}
+
+// looseInt 按 keys 顺序取首个正数的数值字段（float64 → int64），全缺返回 0。
+func looseInt(obj map[string]any, keys ...string) int64 {
+	for _, k := range keys {
+		if n, ok := obj[k].(float64); ok && n > 0 {
+			return int64(n)
 		}
-		mi.CanDisableThinking, _ = r["canDisableThinking"].(bool)
-		if arr, ok := r["supportedEfforts"].([]any); ok {
-			for _, item := range arr {
-				if s, ok := item.(string); ok {
-					if s = strings.TrimSpace(s); s != "" {
-						mi.Efforts = append(mi.Efforts, s)
-					}
-				}
+	}
+	return 0
+}
+
+// fillLooseReasoning 宽松解析 reasoning 子对象：defaultEffort 新键优先、effort 老键
+// 兜底；canDisableThinking；supportedEfforts 数组去空白。
+func fillLooseReasoning(mi *ModelInfo, obj map[string]any) {
+	r, ok := obj["reasoning"].(map[string]any)
+	if !ok {
+		return
+	}
+	mi.DefaultEffort = looseString(r, "defaultEffort")
+	if mi.DefaultEffort == "" {
+		mi.DefaultEffort = looseString(r, "effort") // 老模型键兜底，与 CN 侧同款
+	}
+	mi.CanDisableThinking, _ = r["canDisableThinking"].(bool)
+	arr, ok := r["supportedEfforts"].([]any)
+	if !ok {
+		return
+	}
+	for _, item := range arr {
+		if s, ok := item.(string); ok {
+			if s = strings.TrimSpace(s); s != "" {
+				mi.Efforts = append(mi.Efforts, s)
 			}
 		}
 	}
-	return mi, true
 }

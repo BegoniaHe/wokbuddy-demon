@@ -276,41 +276,54 @@ func TestInjectThinkingSkipNonDeepSeek(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			// 记录输入是否已带 thinking 及值，输出必须逐字节语义不变。
-			var in map[string]any
-			if err := json.Unmarshal([]byte(c.body), &in); err != nil {
-				t.Fatalf("unmarshal input: %v", err)
-			}
-			inTh, inHadThink := in["thinking"]
-			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
-			var got map[string]any
-			if err := json.Unmarshal(out, &got); err != nil {
-				t.Fatalf("unmarshal out: %v (out=%s)", err, out)
-			}
-			outTh, outHadThink := got["thinking"]
-			if inHadThink != outHadThink {
-				t.Errorf("thinking 出现性变化: in=%v(had=%v) out=%v(had=%v)",
-					inTh, inHadThink, outTh, outHadThink)
-			}
-			if inHadThink {
-				// 保留的 thinking 必须原值相等（JSON 语义级）。
-				inJSON, _ := json.Marshal(inTh)
-				outJSON, _ := json.Marshal(outTh)
-				if string(inJSON) != string(outJSON) {
-					t.Errorf("thinking 被改动: in=%s out=%s", inJSON, outJSON)
-				}
-			}
-			// 非 deepseek 不得新增 thinking 相关字段；允许的既有新增字段：
-			// stream（强制流式）+ stream_options（D7 include_usage，CLI 流式必发）。
-			allowedNew := map[string]bool{"stream": true, "stream_options": true}
-			if len(got) > len(in)+len(allowedNew) {
-				for k := range got {
-					if _, had := in[k]; !had && !allowedNew[k] {
-						t.Errorf("非 deepseek 新增字段 %q (out=%s)", k, out)
-					}
-				}
-			}
+			assertNonDeepSeekNoInjection(t, c.body)
 		})
+	}
+}
+
+// assertNonDeepSeekNoInjection 断言非 deepseek 模型出站不新增 thinking 相关字段，
+// 已有 thinking 原值保留。
+func assertNonDeepSeekNoInjection(t *testing.T, body string) {
+	t.Helper()
+	// 记录输入是否已带 thinking 及值，输出必须逐字节语义不变。
+	var in map[string]any
+	if err := json.Unmarshal([]byte(body), &in); err != nil {
+		t.Fatalf("unmarshal input: %v", err)
+	}
+	inTh, inHadThink := in["thinking"]
+	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("unmarshal out: %v (out=%s)", err, out)
+	}
+	outTh, outHadThink := got["thinking"]
+	if inHadThink != outHadThink {
+		t.Errorf("thinking 出现性变化: in=%v(had=%v) out=%v(had=%v)",
+			inTh, inHadThink, outTh, outHadThink)
+	}
+	if inHadThink {
+		// 保留的 thinking 必须原值相等（JSON 语义级）。
+		inJSON, _ := json.Marshal(inTh)
+		outJSON, _ := json.Marshal(outTh)
+		if string(inJSON) != string(outJSON) {
+			t.Errorf("thinking 被改动: in=%s out=%s", inJSON, outJSON)
+		}
+	}
+	assertNoUnexpectedNewFields(t, in, got, out)
+}
+
+// assertNoUnexpectedNewFields 断言 got 相对 in 未新增 allowed 之外的字段。
+// 允许的既有新增字段：stream（强制流式）+ stream_options（D7 include_usage，CLI 流式必发）。
+func assertNoUnexpectedNewFields(t *testing.T, in, got map[string]any, out []byte) {
+	t.Helper()
+	allowedNew := map[string]bool{"stream": true, "stream_options": true}
+	if len(got) <= len(in)+len(allowedNew) {
+		return
+	}
+	for k := range got {
+		if _, had := in[k]; !had && !allowedNew[k] {
+			t.Errorf("非 deepseek 新增字段 %q (out=%s)", k, out)
+		}
 	}
 }
 
