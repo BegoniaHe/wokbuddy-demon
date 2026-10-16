@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,12 +13,35 @@ func newTestPanel() *Panel {
 	return New(Config{Version: "test", APIKey: "test-key"})
 }
 
-// 面板安全响应头必须覆盖：页面、静态脚本、鉴权失败响应。
+// firstStaticAsset 返回内嵌产物中的第一个 /panel/static/** 资源相对路径（带哈希）。
+func firstStaticAsset(t *testing.T) string {
+	t.Helper()
+	var found string
+	err := fs.WalkDir(panelFS, "static", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && found == "" {
+			found = p
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk dist static: %v", err)
+	}
+	if found == "" {
+		t.Fatal("dist 产物缺少 static/ 资源（是否忘记 `bun run build`？）")
+	}
+	return found
+}
+
+// 面板安全响应头必须覆盖：页面、静态资源、鉴权失败响应。
 func TestSecurityHeadersOnAllPanelResponses(t *testing.T) {
 	p := newTestPanel()
+	asset := firstStaticAsset(t)
 	paths := []struct{ method, path string }{
 		{"GET", "/panel/"},
-		{"GET", "/panel/app.js"},
+		{"GET", "/panel/" + asset},
 		{"GET", "/panel/api/overview"}, // 401（未提供 key）
 		{"POST", "/panel/api/config"},  // 401
 		{"GET", "/panel/api/nonexistent"},
@@ -70,28 +94,43 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panel/", nil))
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `<script src="app.js"></script>`) {
-		t.Error("index.html must load app.js externally (inline script is blocked by CSP)")
+	if !strings.Contains(body, `src="/panel/static/`) {
+		t.Error("index.html must load scripts externally from /panel/static/ (inline script is blocked by CSP)")
 	}
-	// 反例保护：出现内联 <script>...</script> 内容块即为回归
-	if strings.Contains(body, "<script>\n") || strings.Contains(body, "<script> ") {
-		t.Error("index.html still contains an inline <script> block; CSP would block it")
+	// 反例保护：出现内联 <script>...</script> 内容块即为回归。
+	for _, bad := range []string{"<script>\n", "<script> ", "<script>var", "<script>window"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("index.html contains an inline <script> block (%q); CSP would block it", bad)
+		}
 	}
 }
 
-// app.js 必须能作为同源脚本取到且类型正确（否则页面白屏）。
-func TestAppScriptServed(t *testing.T) {
+// 构建产物必须能作为同源资源取到且类型正确（否则页面白屏）。
+func TestStaticAssetServed(t *testing.T) {
 	p := newTestPanel()
+	asset := firstStaticAsset(t)
 	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panel/app.js", nil))
+	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panel/"+asset, nil))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("code=%d want 200", rec.Code)
+		t.Fatalf("GET /panel/%s code=%d want 200", asset, rec.Code)
 	}
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
-		t.Errorf("Content-Type=%q want javascript", ct)
+	if !strings.HasPrefix(rec.Header().Get("Cache-Control"), "public, max-age=") {
+		t.Errorf("asset Cache-Control=%q want immutable caching", rec.Header().Get("Cache-Control"))
 	}
-	if !strings.Contains(rec.Body.String(), "'use strict'") {
-		t.Error("app.js body looks wrong")
+	if rec.Body.Len() == 0 {
+		t.Error("static asset body is empty")
+	}
+}
+
+// 资源路径穿越防护：/panel/../ 等不得命中产物外的文件。
+func TestAssetRejectsTraversal(t *testing.T) {
+	p := newTestPanel()
+	for _, bad := range []string{"/panel/../go.mod", "/panel/../../etc/passwd", "/panel/static/../index.html.bak"} {
+		rec := httptest.NewRecorder()
+		p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, bad, nil))
+		if rec.Code == http.StatusOK {
+			t.Errorf("GET %s unexpectedly 200", bad)
+		}
 	}
 }
 
