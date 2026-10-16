@@ -494,24 +494,26 @@ func (s *Scheduler) RunCheckinNow() {
 	s.RunStreakBonusNow()
 }
 
-// checkinOne 单账号签到并落一行结果日志：幂等（今天已签到）与首次成功分开表述，
-// 其余错误记 error 行；均不阻断调用方的后续余额查询。
+// checkinOne 单账号签到并落一行结果日志：按 CheckinResult 分类呈现——成功/幂等/
+// 活动未开启（非错误态）分开表述，只有真失败记 error 行；均不阻断后续余额查询。
 func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) {
-	if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-		// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-		if upstream.IsAlreadyCheckin(err) {
-			s.cfg.Pool.NoteCheckinDone(uid)
-			log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, nickname))
-		} else {
-			log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
-		}
-		// 其余业务错误也继续走余额查询
-		return
+	err := s.cfg.Upstream.DailyCheckin(a)
+	switch upstream.ClassifyCheckin(err) {
+	case upstream.CheckinOK:
+		// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+		// 重复触发时出现），成功也落一行。
+		s.cfg.Pool.NoteCheckinDone(uid)
+		log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
+	case upstream.CheckinAlready:
+		// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不当失败打 error 行。
+		s.cfg.Pool.NoteCheckinDone(uid)
+		log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, nickname))
+	case upstream.CheckinInactive:
+		// 活动未开启/已结束是上游非错误态：不标记已签、不打 error 行（issue #27）。
+		log.Printf("checkin %s: 签到活动未开启（跳过，非失败）", logfmt.Label(uid, nickname))
+	default:
+		log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
 	}
-	// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-	// 重复触发时出现），成功也落一行。
-	s.cfg.Pool.NoteCheckinDone(uid)
-	log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
