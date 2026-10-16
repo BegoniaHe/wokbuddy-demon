@@ -379,6 +379,22 @@ func TestBackfillOverridesLocalDay(t *testing.T) {
 	wantEq(t, "total_tokens(覆盖后)", s.Totals.TotalTokens, int64(50))
 }
 
+// TestBackfillThenRealtimeNoDoubleCount 回填后同日的实时记录与 Rollup 折叠都不与
+// 回填值重复计数（issue #31 复审）：回填删除当日本地桶，故实时记录落在新小时桶，
+// 与 Synced 日桶相加即正确总量；小时桶折叠进 Synced 日桶同样不叠加。
+func TestBackfillThenRealtimeNoDoubleCount(t *testing.T) {
+	r := New("")
+	old := time.Now().Add(-100 * 24 * time.Hour) // 早于 hourlyKeep，可被 Rollup 折叠
+	day := old.Format("2006-01-02")
+	r.Backfill([]BackfillRow{{Day: day, Realm: "cn", UID: "u1", Model: "m", Requests: 5, Credits: 9, Tokens: 50}})
+	r.Add(old, "cn", "u1", "m", Delta{TotalTokens: 20, HasTotal: true, Credit: 2, HasCredit: true}, true)
+	r.Rollup(time.Now())
+	s := r.Snapshot(0, nil)
+	wantEq(t, "requests(回填+实时)", s.Totals.Requests, int64(6))
+	wantEq(t, "credits(回填+实时)", s.Totals.Credits, 11.0)
+	wantEq(t, "total_tokens(回填+实时)", s.Totals.TotalTokens, int64(70))
+}
+
 // wantEq 断言 got == want，失败时用 label 指明字段。统一入口避免逐项 if 抬高
 // 测试函数复杂度，断言条件与原逐项检查等价。
 func wantEq[T comparable](t *testing.T, label string, got, want T) {
