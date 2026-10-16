@@ -13,6 +13,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
@@ -41,18 +42,36 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
 	s.makeupYesterday(a)
 	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
-	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
-	}
-	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
-	}
+	s.claimStreakGifts(a)
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {
 		log.Printf("streak-bonus %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
+	s.redeemUnlockedTiers(a, full)
+
+	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
+	chances, err := s.cfg.Upstream.LotteryChances(a)
+	if err != nil {
+		log.Printf("streak-bonus %s: lottery summary: %v", logfmt.Label(a.UID, a.Nickname), err)
+		return
+	}
+	s.drawAllLottery(a, chances)
+}
+
+// claimStreakGifts 领取新手礼包与补偿（各一次，业务错误静默跳过）。
+func (s *Scheduler) claimStreakGifts(a *auth.Auth) {
+	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
+		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
+	}
+	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
+		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
+	}
+}
+
+// redeemUnlockedTiers 兑换所有已解锁档位（locked/claimed 跳过；未解锁 403 静默）。
+func (s *Scheduler) redeemUnlockedTiers(a *auth.Auth, full *upstream.StreakFull) {
 	statuses := map[string]string{
 		"7d":  full.RedemptionStatus.Tier7dStatus,
 		"14d": full.RedemptionStatus.Tier14dStatus,
@@ -71,12 +90,10 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 		log.Printf("streak-bonus %s: ★ 兑换 %s 档（+%dc +%de 卡×%d 抽奖×%d）",
 			a.UID, tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
 	}
-	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
-	chances, err := s.cfg.Upstream.LotteryChances(a)
-	if err != nil {
-		log.Printf("streak-bonus %s: lottery summary: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
-	}
+}
+
+// drawAllLottery 按当前抽奖次数全部抽完，遇错即停。
+func (s *Scheduler) drawAllLottery(a *auth.Auth, chances int) {
 	for i := range chances {
 		raw, err := s.cfg.Upstream.LotteryDraw(a)
 		if err != nil {

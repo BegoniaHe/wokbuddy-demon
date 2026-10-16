@@ -323,11 +323,10 @@ func TestRunTravelAdoptTriedExpiresNextDay(t *testing.T) {
 	}
 }
 
-// TestRunTravelSkipsDisabledAndFailedAccounts 禁用账号不查；单账号出错不影响后续账号。
-func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
-	fastTravel(t)
-	var deadCalls, okDepart, disabledCalls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// travelSkipStubHandler 模拟三态：disabled 号 401 且计数、dead 号 401 且计数、
+// 正常号 info→有猫 / status→空闲 / depart→成功。
+func travelSkipStubHandler(deadCalls, okDepart, disabledCalls *atomic.Int32) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Header.Get("X-User-Id") == "disabled":
 			disabledCalls.Add(1)
@@ -347,7 +346,14 @@ func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
 		default:
 			http.Error(w, "not found", http.StatusNotFound)
 		}
-	}))
+	})
+}
+
+// TestRunTravelSkipsDisabledAndFailedAccounts 禁用账号不查；单账号出错不影响后续账号。
+func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
+	fastTravel(t)
+	var deadCalls, okDepart, disabledCalls atomic.Int32
+	srv := httptest.NewServer(travelSkipStubHandler(&deadCalls, &okDepart, &disabledCalls))
 	defer srv.Close()
 
 	s, p := newTravelScheduler(t, srv, "disabled", "dead", "ok")
@@ -389,54 +395,71 @@ func TestRunTravelDisabledAccountSkipsAllCalls(t *testing.T) {
 	}
 }
 
-// TestRunTravelActionErrorsDoNotAbort 各环节上游报错只影响本账号本轮：不 panic、不中断遍历。
-func TestRunTravelActionErrorsDoNotAbort(t *testing.T) {
-	fastTravel(t)
-	var okDepart atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// travelErrorFailPaths 各环节失败注入：(uid → 应失败的 path)。
+var travelErrorFailPaths = map[string]string{
+	"status": "/activity/growth/buddy/travel/status", // 查状态失败
+	"depart": "/activity/growth/buddy/travel/depart", // 派出发失败
+	"claim":  "/activity/growth/buddy/travel/claim",  // 领奖失败
+	"agree":  "/activity/growth/buddy/agreement",     // 同意协议失败
+	"first":  "/activity/growth/buddy/first",         // 领养非门槛类失败
+}
+
+// travelErrorRequestFails 该 (uid, path) 是否应返回 500（覆盖各环节失败注入）。
+// bdinfo 任意 path 都失败（查有无猫失败）；其余按 travelErrorFailPaths 精确匹配。
+func travelErrorRequestFails(uid, path string) bool {
+	if uid == "bdinfo" {
+		return true
+	}
+	return travelErrorFailPaths[uid] == path
+}
+
+// travelErrorBuddyInfo info 端点响应：claim/depart/status/ok 有猫，其余无猫。
+func travelErrorBuddyInfo(uid string) string {
+	switch uid {
+	case "claim", "depart", "status", "ok":
+		return `{"code":0,"data":{"buddy":{"id":1}}}`
+	}
+	return `{"code":0,"data":{"buddy":null}}`
+}
+
+// travelErrorStatus status 端点响应：claim 已到站可领奖，其余空闲可派出。
+func travelErrorStatus(uid string) string {
+	if uid == "claim" {
+		return `{"code":0,"data":{"state":"arrived","record_id":42}}`
+	}
+	return `{"code":0,"data":{"state":"idle","daily_limit_reached":false}}`
+}
+
+// travelErrorStubHandler 按 (uid, path) 注入各环节失败或成功响应。
+func travelErrorStubHandler(okDepart *atomic.Int32) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		uid := r.Header.Get("X-User-Id")
-		fail := func() {
+		if travelErrorRequestFails(uid, r.URL.Path) {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(`{"code":500,"msg":"boom"}`))
+			return
 		}
-		switch {
-		case uid == "bdinfo": // 查有无猫失败
-			fail()
-		case uid == "status" && r.URL.Path == "/activity/growth/buddy/travel/status": // 查状态失败
-			fail()
-		case uid == "depart" && r.URL.Path == "/activity/growth/buddy/travel/depart": // 派出发失败
-			fail()
-		case uid == "claim" && r.URL.Path == "/activity/growth/buddy/travel/claim": // 领奖失败
-			fail()
-		case uid == "agree" && r.URL.Path == "/activity/growth/buddy/agreement": // 同意协议失败
-			fail()
-		case uid == "first" && r.URL.Path == "/activity/growth/buddy/first": // 领养非门槛类失败
-			fail()
-		case r.URL.Path == "/activity/growth/buddy/info":
-			if uid == "claim" {
-				w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1}}}`))
-				return
-			}
-			if uid == "depart" || uid == "status" || uid == "ok" {
-				w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1}}}`))
-				return
-			}
-			w.Write([]byte(`{"code":0,"data":{"buddy":null}}`))
-		case r.URL.Path == "/activity/growth/buddy/travel/status":
-			if uid == "claim" {
-				w.Write([]byte(`{"code":0,"data":{"state":"arrived","record_id":42}}`))
-				return
-			}
-			w.Write([]byte(`{"code":0,"data":{"state":"idle","daily_limit_reached":false}}`))
-		case r.URL.Path == "/activity/growth/buddy/travel/depart":
+		switch r.URL.Path {
+		case "/activity/growth/buddy/info":
+			w.Write([]byte(travelErrorBuddyInfo(uid)))
+		case "/activity/growth/buddy/travel/status":
+			w.Write([]byte(travelErrorStatus(uid)))
+		case "/activity/growth/buddy/travel/depart":
 			okDepart.Add(1)
 			w.Write([]byte(`{"code":0,"data":{}}`))
-		case r.URL.Path == "/activity/growth/buddy/agreement":
+		case "/activity/growth/buddy/agreement":
 			w.Write([]byte(`{"code":0,"data":{"agreed":true}}`))
 		default:
 			http.Error(w, "not found", http.StatusNotFound)
 		}
-	}))
+	})
+}
+
+// TestRunTravelActionErrorsDoNotAbort 各环节上游报错只影响本账号本轮：不 panic、不中断遍历。
+func TestRunTravelActionErrorsDoNotAbort(t *testing.T) {
+	fastTravel(t)
+	var okDepart atomic.Int32
+	srv := httptest.NewServer(travelErrorStubHandler(&okDepart))
 	defer srv.Close()
 
 	s, _ := newTravelScheduler(t, srv, "agree", "bdinfo", "claim", "depart", "first", "ok", "status")
