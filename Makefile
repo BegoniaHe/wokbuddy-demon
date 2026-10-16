@@ -6,8 +6,9 @@
 GOLANGCI ?= golangci-lint
 PKG      ?= ./...
 BIN      ?= wokbuddy-demon
-# 开发运行参数（可覆盖：make run PORT=7863 CONFIG=config.json）。
-PORT     ?= 7863
+# 开发运行参数（可覆盖：make run CONFIG=config.json）。
+# 监听端口由 config.json 的 listen（或 WB2A_LISTEN 环境变量）决定；
+# run/stop/status 以 pid 文件为生命周期事实源，不依赖端口。
 CONFIG   ?= config.json
 DEV      := bash scripts/make_dev.sh
 # 构建标识：编译时经 -ldflags 注入 server 二进制（滚动更新、无版本号）。
@@ -85,21 +86,21 @@ build-tools:
 
 # 后台启动：构建 → 拉起进程 → 写 pid/日志 → 立即返回终端。
 run:
-	@PORT=$(PORT) CONFIG=$(CONFIG) $(DEV) run
+	@CONFIG=$(CONFIG) $(DEV) run
 
 # 前台运行：Ctrl-C 退出，适合开发调试。
 dev:
 	go run ./cmd/server -config $(CONFIG)
 
 restart:
-	@PORT=$(PORT) $(DEV) stop
+	@CONFIG=$(CONFIG) $(DEV) stop
 	@$(MAKE) --no-print-directory run
 
 stop:
-	@PORT=$(PORT) $(DEV) stop
+	@CONFIG=$(CONFIG) $(DEV) stop
 
 status:
-	@PORT=$(PORT) $(DEV) status
+	@CONFIG=$(CONFIG) $(DEV) status
 
 logs:
 	@$(DEV) logs
@@ -156,7 +157,7 @@ tidy:
 
 clean:
 	go clean -cache -testcache
-	@PORT=$(PORT) $(DEV) clean
+	@CONFIG=$(CONFIG) $(DEV) clean
 
 # CI 本地复现：格式校验 + 静态检查 + 全量测试。
 ci: fmt-check lint test

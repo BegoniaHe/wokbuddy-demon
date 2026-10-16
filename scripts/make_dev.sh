@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # make_dev.sh — 后台托管 wokbuddy-demon 开发进程（run / stop / status / logs / clean）。
 #
-# 设计目标：`make run` 后立即把终端还给用户（服务在后台跑），
-# 通过 pid 文件 + 日志文件管理生命周期，`make stop` / `make status` 与之配套。
+# 生命周期以 pid 文件（.make/server.pid）为唯一事实源：stop / status / clean
+# 只针对 `make run` 启动的那个进程，与其监听端口无关。监听地址由服务端
+# config.json 的 listen（或 WB2A_LISTEN 环境变量）决定，脚本不臆测端口。
 set -euo pipefail
 
 if (($# != 1)); then
@@ -16,7 +17,6 @@ pid_file="$run_dir/server.pid"
 stdout_log="$repo_root/server_run.log"
 stderr_log="$repo_root/server_run.err.log"
 bin_path="$repo_root/wokbuddy-demon"
-port="${PORT:-7863}"
 config_path="${CONFIG:-config.json}"
 warmup_seconds="${WARMUP:-1}"
 
@@ -26,9 +26,18 @@ remove_if_exists() {
   fi
 }
 
+# pid_is_ours 校验 pid 确为脚本拉起的二进制，避免 pid 复用误杀无关进程。
+pid_is_ours() {
+  local pid="$1"
+  kill -0 "$pid" 2>/dev/null || return 1
+  local cmd
+  cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+  [[ "$cmd" == *"$bin_path"* || "$cmd" == *"$(basename -- "$bin_path")"* ]]
+}
+
 stop_pid() {
   local pid="$1"
-  kill -0 "$pid" 2>/dev/null || return 0
+  pid_is_ours "$pid" || return 0
 
   local pgid
   pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)"
@@ -61,26 +70,22 @@ stop_from_pid_file() {
   rm -f -- "$file"
 }
 
-pids_listening_on_port() {
-  local p="$1"
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -tiTCP:"$p" -sTCP:LISTEN 2>/dev/null || true
-  elif command -v ss >/dev/null 2>&1; then
-    ss -ltnp 2>/dev/null | sed -nE "s/.*[:.]${p}[[:space:]].*pid=([0-9]+).*/\\1/p" || true
-  elif command -v netstat >/dev/null 2>&1; then
-    netstat -ltnp 2>/dev/null | sed -nE "s/.*[:.]${p}[[:space:]].*[[:space:]]([0-9]+)\\/.*/\\1/p" || true
-  else
-    echo "Unable to inspect port $p: install lsof, iproute2, or net-tools." >&2
-    return 1
+# listen_port 取实际监听端口，仅用于面板 URL 与 /healthz 探测：
+# WB2A_LISTEN 覆盖 > config.json listen > 7863。
+listen_port() {
+  local addr=""
+  if [[ -n "${WB2A_LISTEN:-}" ]]; then
+    addr="$WB2A_LISTEN"
+  elif [[ -f "$config_path" ]] && command -v python3 >/dev/null 2>&1; then
+    addr="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("listen") or "")' "$config_path" 2>/dev/null || true)"
   fi
-}
-
-stop_by_port() {
-  local p="$1"
-  local pid
-  while IFS= read -r pid; do
-    [[ "$pid" =~ ^[0-9]+$ ]] && stop_pid "$pid"
-  done < <(pids_listening_on_port "$p")
+  if [[ "$addr" == *:* ]]; then
+    printf '%s' "${addr##*:}"
+  elif [[ "$addr" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$addr"
+  else
+    printf '7863'
+  fi
 }
 
 url_is_available() {
@@ -102,7 +107,6 @@ case "$1" in
     (cd "$repo_root" && go build -o "$bin_path" ./cmd/server)
 
     stop_from_pid_file "$pid_file"
-    stop_by_port "$port"
 
     : >"$stdout_log"
     : >"$stderr_log"
@@ -121,7 +125,7 @@ case "$1" in
 
     if kill -0 "$local_pid" 2>/dev/null; then
       echo "==> [run] wokbuddy-demon 已在后台启动 (pid $local_pid)"
-      echo "    面板: http://127.0.0.1:${port}/panel/"
+      echo "    面板: http://127.0.0.1:$(listen_port)/panel/"
       echo "    日志: $stdout_log / $stderr_log"
       echo "    停止: make stop    状态: make status    跟踪: make logs"
     else
@@ -133,7 +137,6 @@ case "$1" in
     ;;
   stop)
     stop_from_pid_file "$pid_file"
-    stop_by_port "$port"
     echo "==> [stop] wokbuddy-demon 已停止"
     ;;
   status)
@@ -142,6 +145,7 @@ case "$1" in
     else
       state="stopped"
     fi
+    port="$(listen_port)"
     if url_is_available "http://127.0.0.1:${port}/healthz"; then
       health="up"
     else
@@ -156,7 +160,6 @@ case "$1" in
     ;;
   clean)
     stop_from_pid_file "$pid_file"
-    stop_by_port "$port"
     remove_if_exists "$run_dir"
     remove_if_exists "$stdout_log"
     remove_if_exists "$stderr_log"
