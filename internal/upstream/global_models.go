@@ -199,7 +199,7 @@ func dedupeNames(names []string) []string {
 // 降级为其余路结果 + warn 日志，互不拖累。
 func (c *Client) probeGlobalModels(a *auth.Auth) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
-	// 按账号 realm 生成（global → `WorkBuddy AI` 平台段），故必须传 a 而非用常量。
+	// 按账号 realm 生成（仅版本号分档），故必须传 a 而非用常量。
 	// 三路 v3 并发（桌面端 / IDE / CLI，各有独有模型，见上方 UA 注释）。
 	v3DesktopCh := make(chan probeResult, 1)
 	go func() { v3DesktopCh <- c.probeV3Route(a, c.defaultWorkBuddyUAFor(a)) }()

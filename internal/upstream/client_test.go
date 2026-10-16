@@ -262,12 +262,15 @@ func TestRefreshSessionDead(t *testing.T) {
 }
 
 func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
-	var gotAuth, gotUID, gotProduct string
+	got := map[string]string{}
 	var gotBody []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
-		gotAuth = r.Header.Get("Authorization")
-		gotUID = r.Header.Get("X-User-Id")
-		gotProduct = r.Header.Get("X-Product")
+		for _, k := range []string{
+			"Authorization", "X-User-Id", "X-Product", "X-Agent-Intent",
+			"X-Private-Data", "X-Ide-Type", "X-Ide-Version",
+		} {
+			got[k] = r.Header.Get(k)
+		}
 		gotBody, _ = io.ReadAll(r.Body)
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -284,8 +287,21 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
-		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
+	// 官方桌面端 chat 指纹：X-Product=SaaS、X-IDE-Type=WorkBuddy、X-IDE-Version=realm 版本、
+	// X-Agent-Intent=craft、X-Private-Data=true。
+	want := map[string]string{
+		"Authorization":  "Bearer at",
+		"X-User-Id":      "u1",
+		"X-Product":      "SaaS",
+		"X-Agent-Intent": "craft",
+		"X-Private-Data": "true",
+		"X-Ide-Type":     "WorkBuddy",
+		"X-Ide-Version":  cnClientVersion,
+	}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("header %s=%q want %q", k, got[k], w)
+		}
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
 		t.Errorf("stream not forced: %s", gotBody)
