@@ -30,8 +30,9 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.13.0-panel"
+// appVersion 构建标识：编译时经 -ldflags -X 注入（缺省 "dev"），透出到 /panel/api/overview。
+// 本项目滚动更新、无版本号——这里只是运行时自述用的构建串，不是可比的发布版本。
+var appVersion = "dev"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

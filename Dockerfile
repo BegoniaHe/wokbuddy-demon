@@ -1,11 +1,14 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.27-alpine AS build
 WORKDIR /src
+# 构建标识：编译期注入 server 二进制（滚动更新、无版本号）。
+# 构建时可用 --build-arg VERSION=nightly-YYYYMMDD-<sha> 覆盖。
+ARG VERSION=dev
 COPY go.mod ./
 RUN go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/wokbuddy-demon ./cmd/server \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" -o /out/wokbuddy-demon ./cmd/server \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/signin_bin ./cmd/signin \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/login ./cmd/login \
  && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/credit ./cmd/credit

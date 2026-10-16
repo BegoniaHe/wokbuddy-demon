@@ -160,7 +160,7 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 ### 方式二：Windows 单文件运行（无需 Docker）
 
 ```powershell
-# 1) 下载 Release 中的 wokbuddy-demon.exe，或从源码构建
+# 1) 下载 nightly 构建产物（wokbuddy-demon.exe），或从源码构建
 go build -trimpath -ldflags="-s -w" -o wokbuddy-demon.exe ./cmd/server
 
 # 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）

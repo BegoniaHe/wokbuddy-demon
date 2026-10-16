@@ -1,13 +1,13 @@
 name: docker-ghcr
 
 # 多架构镜像（amd64/arm64）自动构建并发布到 ghcr.io：
-#   - push 到 main / 打 v* tag / 手动触发 → 构建并推送
+#   - push 到 main / 手动触发 → 构建并推送
 #   - PR 触碰构建相关文件 → 仅构建验证，不推送
-# tag 说明：main 推 latest + main + sha-xxxxxx；v1.2.3 推 1.2.3 / 1.2 / 1
+# tag 说明：main 推 latest + main + sha-xxxxxx（滚动更新，无版本化 tag）。
+# 每日 nightly 镜像（:nightly）由 nightly.yml 推送。
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     paths:
       - "Dockerfile"
@@ -22,8 +22,8 @@ on:
       - ".github/workflows/docker-ghcr.yml"
   workflow_dispatch:
 
-# 并发组：PR 取消过时构建；main/tag 按引用串行——发版时 main+tag 同推不再双跑
-# 同一份代码的多架构构建（QEMU arm64 一次不便宜）。
+# 并发组：PR 取消过时构建；main 按引用串行——同推不再双跑同一份代码的
+# 多架构构建（QEMU arm64 一次不便宜）。
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -65,9 +65,11 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
+
+      - name: 计算构建标识
+        id: ver
+        run: echo "v=nightly-$(date -u +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -77,6 +79,8 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.ver.outputs.v }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           # 关闭 provenance attestation：避免 ghcr 页面出现 unknown/unknown 架构条目
