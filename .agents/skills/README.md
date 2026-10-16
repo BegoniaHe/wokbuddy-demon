@@ -25,6 +25,7 @@
 | `sync-upstream` | 吸收前序 fork `linguo2625469/workbuddy2api-panel` `main` 提交  |
 | `plan-issue`    | 把 Issue 或请求变成研究充分、可验证的实施计划                  |
 | `simplifier`    | 要最小改动、YAGNI、砍过度设计/依赖时                           |
+| `reverse-workbuddy` | 解包 `.tmp/workbuddy/` 官方客户端并比对 `internal/upstream/` 协议差异 |
 
 > 不要添加只复述 `AGENTS.md` 的技能。当出现第二个可独立加载的工作流时，再拆分技能。
 
