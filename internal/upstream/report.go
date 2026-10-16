@@ -25,8 +25,8 @@ const reportPath = "/v2/report"
 // billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
 // report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
-func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
-	return c.domainJSON(a, c.billingBase(a), method, path, body)
+func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessage, error) {
+	return c.domainJSON(a, c.billingBase(a), http.MethodPost, path, body)
 }
 
 // domainJSON 是 billingJSON / growthJSON 的唯一实现：对指定 base 域发请求并解信封。
@@ -51,10 +51,10 @@ func (c *Client) domainJSON(a *auth.Auth, base, method, path string, body any) (
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
 // 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
 // （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
-func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
+func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.RawMessage, error) {
 	var lastErr error
 	for i, path := range paths {
-		data, err := c.billingJSON(a, method, path, body)
+		data, err := c.billingJSON(a, path, body)
 		if err == nil {
 			return data, nil
 		}
@@ -218,6 +218,6 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 	if err != nil {
 		return err
 	}
-	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
+	_, err = c.billingJSON(a, reportPath, json.RawMessage(raw))
 	return err
 }
