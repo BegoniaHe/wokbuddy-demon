@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
@@ -554,7 +555,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 // replaceConfigFile 用 tmp 原子替换 path；单文件 Docker bind mount 无法被 rename
 // 覆盖（Linux 返回 EBUSY / "device or resource busy"）时回退为就地写入挂载文件。
 func replaceConfigFile(tmp, path string, out []byte) error {
-	if err := os.Rename(tmp, path); err != nil {
+	if err := atomicwrite.Rename(tmp, path); err != nil {
 		// A single-file Docker bind mount cannot be renamed over its mount
 		// target (Linux returns EBUSY / "device or resource busy"). Keep the
 		// atomic path for regular files, but update the mounted file in place

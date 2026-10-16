@@ -24,6 +24,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 )
 
 // hourlyKeep 小时桶的保留时长；超出后折叠为日桶。
@@ -344,7 +346,7 @@ func (r *Recorder) flush(force bool) {
 		log.Printf("[usage] 写临时文件失败: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, r.path); err != nil {
+	if err := atomicwrite.Rename(tmp, r.path); err != nil {
 		log.Printf("[usage] 原子替换失败: %v", err)
 	}
 }

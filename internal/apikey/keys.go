@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 )
 
@@ -320,7 +321,7 @@ func writeRecords(path string, records []Record) error {
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	return atomicwrite.Rename(tmp, path)
 }
 
 // rebuildKeysLocked 由 records 重建未撤销密钥的校验快照。
