@@ -88,6 +88,16 @@ func (a *Auth) DomainValue() string {
 	return a.Domain
 }
 
+// ExpiresAtValue 加锁读取 ExpiresAt（同 AccessTokenValue：RefreshToken 在锁内改写）。
+func (a *Auth) ExpiresAtValue() int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ExpiresAt
+}
+
 // RefreshTokenValue 加锁读取 RefreshToken（同 AccessTokenValue：RefreshToken 在锁内
 // 改写它）。调度器的「有无凭证」前置守卫（checkin/keepalive/travel 的
 // `a.RefreshToken == ""`）必须经此取值，勿直读字段。
