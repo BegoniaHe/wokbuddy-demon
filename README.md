@@ -244,6 +244,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
+| `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |
 | `schedule.travel_hours` | `[9, 21]` | 每日整点推进猫猫旅行状态机 |
 | `schedule.activity_hours` | `[10]` | 每日整点对话活跃上报 |
