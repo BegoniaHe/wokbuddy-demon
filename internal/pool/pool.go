@@ -49,6 +49,9 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	// 每日护栏（issue #95）：全局默认 + cn/global 字段级覆盖；0 = 关闭。
+	dailyDefault, dailyCN, dailyGlobal DailyLimits
+	dailyUsage                         func() map[string]DailyUsage
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
@@ -228,6 +231,56 @@ func (p *Pool) SetCreditFloor(n int64) {
 	if n >= 0 {
 		p.creditFloor = n
 	}
+}
+
+// DailyLimits 账号级每日护栏；0 = 关闭。
+type DailyLimits struct {
+	Tokens      int64
+	Credits     float64
+	ModelTokens int64
+}
+
+// DailyUsage 账号当日的 token / 积分 / 按模型 token 聚合（由 usage 包提供）。
+type DailyUsage struct {
+	Tokens  int64
+	Credits float64
+	Models  map[string]int64
+}
+
+// SetDailyLimits 注入全局默认与 cn/global 覆盖（issue #95）。
+func (p *Pool) SetDailyLimits(def, cn, global DailyLimits) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dailyDefault, p.dailyCN, p.dailyGlobal = def, cn, global
+}
+
+// SetDailyUsageProvider 注入当日用量快照读取器（issue #95）；nil = 关闭护栏。
+func (p *Pool) SetDailyUsageProvider(fn func() map[string]DailyUsage) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dailyUsage = fn
+}
+
+// dailyLimitsFor 返回账号 realm 的生效限额：realm 字段 >0 时覆盖全局默认。
+// 调用方需已持 p.mu。
+func (p *Pool) dailyLimitsFor(realm string) DailyLimits {
+	out := p.dailyDefault
+	var r DailyLimits
+	if realm == "global" {
+		r = p.dailyGlobal
+	} else {
+		r = p.dailyCN
+	}
+	if r.Tokens > 0 {
+		out.Tokens = r.Tokens
+	}
+	if r.Credits > 0 {
+		out.Credits = r.Credits
+	}
+	if r.ModelTokens > 0 {
+		out.ModelTokens = r.ModelTokens
+	}
+	return out
 }
 
 // SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。

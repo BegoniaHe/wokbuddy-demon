@@ -95,6 +95,21 @@
     "url": "",
     "token": ""
   },
+  "limits": {
+    "daily_tokens": 0,
+    "daily_credits": 0,
+    "model_daily_tokens": 0,
+    "cn": {
+      "daily_tokens": 0,
+      "daily_credits": 0,
+      "model_daily_tokens": 0
+    },
+    "global": {
+      "daily_tokens": 0,
+      "daily_credits": 0,
+      "model_daily_tokens": 0
+    }
+  },
   "pool": {
     "max_in_flight": 3,
     "max_in_flight_global": 2,

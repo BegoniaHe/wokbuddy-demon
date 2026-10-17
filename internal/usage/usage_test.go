@@ -418,3 +418,28 @@ func wantEq[T comparable](t *testing.T, label string, got, want T) {
 		t.Fatalf("%s = %v, want %v", label, got, want)
 	}
 }
+
+func TestDailyTotals(t *testing.T) {
+	r := New("")
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.Local)
+	r.Add(now, "cn", "u1", "glm-5.2", Delta{TotalTokens: 100, HasTotal: true, Credit: 1.5, HasCredit: true}, true)
+	r.Add(now, "cn", "u1", "hy4", Delta{TotalTokens: 50, HasTotal: true}, true)
+	r.Add(now, "global", "u2", "gpt-5", Delta{TotalTokens: 70, HasTotal: true}, true)
+	// 昨天的桶不计入今天。
+	r.Add(now.AddDate(0, 0, -1), "cn", "u1", "glm-5.2", Delta{TotalTokens: 999, HasTotal: true}, true)
+
+	got := r.DailyTotals(now)
+	if got["u1"].Tokens != 150 || got["u2"].Tokens != 70 {
+		t.Fatalf("daily totals=%+v", got)
+	}
+	if got["u1"].Credits != 1.5 {
+		t.Errorf("credits=%v want 1.5", got["u1"].Credits)
+	}
+	if got["u1"].Models["glm-5.2"] != 100 || got["u1"].Models["hy4"] != 50 {
+		t.Errorf("model totals=%v", got["u1"].Models)
+	}
+	// 缓存命中：同一时刻直接复用。
+	if cached := r.DailyTotalsCached(now); cached["u1"].Tokens != 150 {
+		t.Errorf("cached totals=%+v", cached)
+	}
+}

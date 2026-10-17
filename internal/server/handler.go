@@ -1004,6 +1004,11 @@ func (f *chatFlow) recordRotation() {
 func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 	acct := f.pickAccount()
 	if acct == nil {
+		if f.h.cfg.Pool.AllDailyBlocked(f.bareModel, f.realm) {
+			f.st.dailyLimited = true
+			f.st.status = http.StatusTooManyRequests
+			return rotBreak
+		}
 		f.st.status = http.StatusServiceUnavailable
 		// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 		//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
@@ -1644,6 +1649,15 @@ func (f *chatFlow) recordKeyUsage() {
 
 // writeFinalError 末端错误透传：轮转耗尽/提前终止后写出最终错误响应。
 func (f *chatFlow) writeFinalError() {
+	if f.st != nil && f.st.dailyLimited {
+		seconds := secondsUntilLocalMidnight(time.Now())
+		f.out.Header("Retry-After", strconv.Itoa(seconds))
+		f.out.Error(http.StatusTooManyRequests, "daily_limit_reached",
+			"daily account limits reached; retry after local midnight", "")
+		f.st.status = http.StatusTooManyRequests
+		f.st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
 	if seconds := f.retryAfterSeconds(status); seconds > 0 {
@@ -2175,4 +2189,15 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 		msg = uerr.Msg
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+}
+
+// secondsUntilLocalMidnight 返回距离本地次日 0 点的秒数（至少 1）。
+func secondsUntilLocalMidnight(now time.Time) int {
+	y, m, d := now.Date()
+	next := time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
+	sec := int(math.Ceil(next.Sub(now).Seconds()))
+	if sec < 1 {
+		return 1
+	}
+	return sec
 }

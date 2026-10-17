@@ -784,6 +784,21 @@ func TestServerReadTimeout(t *testing.T) {
 	}
 }
 
+// TestDailyLimitsConfig 每日限额负值拒绝，0 = 关闭（issue #95）。
+func TestDailyLimitsConfig(t *testing.T) {
+	c := Default()
+	if c.Limits.DailyTokens != 0 || c.Limits.DailyCredits != 0 {
+		t.Errorf("default limits=%+v want zero", c.Limits)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	c.Limits.DailyTokens = -1
+	if err := c.normalize(); err == nil {
+		t.Error("negative daily_tokens should fail")
+	}
+}
+
 // mustParseConfig 解析一段配置 JSON（不读环境变量），失败即终止测试。
 func mustParseConfig(t *testing.T, body string) *Config {
 	t.Helper()

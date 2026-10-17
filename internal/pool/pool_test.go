@@ -2011,3 +2011,52 @@ func TestResumeIdempotent(t *testing.T) {
 		t.Errorf("Paused 应仍为 false: %+v", st)
 	}
 }
+
+func TestDailyLimitTokens(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetDailyLimits(DailyLimits{Tokens: 100}, DailyLimits{}, DailyLimits{})
+	p.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u1": {Tokens: 100}}
+	})
+	if got := p.Pick(); got == nil || got.UID != "u2" {
+		t.Fatalf("pick=%+v want u2 (u1 at daily token limit)", got)
+	}
+}
+
+func TestDailyLimitCreditsOnlyPaid(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetDailyLimits(DailyLimits{Credits: 10}, DailyLimits{}, DailyLimits{})
+	p.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u1": {Credits: 10}}
+	})
+	p.SetModelRateOf(func(_, model string) string {
+		if model == "paid" {
+			return "1"
+		}
+		return "0"
+	})
+	if got := p.PickExcludingForRealm(nil, "paid", "cn"); got != nil {
+		t.Fatalf("paid pick=%+v want nil (daily credit limit)", got)
+	}
+	if got := p.PickExcludingForRealm(nil, "free", "cn"); got == nil {
+		t.Fatal("free model should still be served after daily credit limit")
+	}
+}
+
+func TestDailyLimitPerModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetDailyLimits(DailyLimits{ModelTokens: 100}, DailyLimits{}, DailyLimits{})
+	p.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u1": {Models: map[string]int64{"hot": 100}}}
+	})
+	if got := p.PickExcludingForRealm(nil, "hot", "cn"); got != nil {
+		t.Fatalf("hot pick=%+v want nil", got)
+	}
+	if got := p.PickExcludingForRealm(nil, "other", "cn"); got == nil {
+		t.Fatal("other model should still be served")
+	}
+}

@@ -360,6 +360,10 @@ claude
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
 | `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
+| `limits.daily_tokens` | `0` | 账号当日总 token 达限后不接单；`0` = 关闭。本地 0 点重置 |
+| `limits.daily_credits` | `0` | 账号当日消耗积分达限后只接免费模型；`0` = 关闭 |
+| `limits.model_daily_tokens` | `0` | 账号 × 模型当日 token 达限后只禁该模型；`0` = 关闭 |
+| `limits.cn` / `limits.global` | 同全局 | 按域字段级覆盖（>0 生效） |
 | `pool.credit_floor` | `100` | 积分保底：余额低于该值不再参与收费模型轮换 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |

@@ -101,6 +101,8 @@ export interface Overview {
   version: string;
   redis_mode?: string;
   in_flight_full?: number;
+  daily_limited?: string[];
+  daily_reset_at?: string;
   uptime_sec: number;
   accounts?: Account[];
   model_locks?: ModelLock[];

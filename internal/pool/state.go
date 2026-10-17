@@ -422,6 +422,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
 		return nil
 	}
+	if p.dailyBlocked(e, model, e.a.Realm(), now) {
+		log.Printf("WARN: [pool] daily limit: sticky acct=%s model=%s, unbind",
+			logfmt.Label(e.a.UID, e.a.Nickname), model)
+		return nil
+	}
 	if p.inFlightFull(e) {
 		return nil
 	}
