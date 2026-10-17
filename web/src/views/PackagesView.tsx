@@ -22,9 +22,11 @@ import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
-  SelectItem,
+  SelectOptions,
   SelectTrigger,
   SelectValue,
+  selectOptionItems,
+  type SelectOption,
 } from '@/components/ui/select';
 import {
   Card,
@@ -46,11 +48,19 @@ import { Legend } from '@/components/ui-kit';
 
 const LS_PK_SORT = 'pkSortMode';
 
+// 逐包明细排序选项（labels 与 PK_SORT_LABELS 的 key 保持一致）。
+const PK_SORT_OPTIONS = [
+  { value: 'end_asc', label: '按到期时间' },
+  { value: 'size_desc', label: '按面额大小' },
+] as const satisfies readonly SelectOption[];
+
+function readSortMode(): string {
+  const v = localStorage.getItem(LS_PK_SORT) || 'end_asc';
+  return v === 'size_desc' ? 'size_desc' : 'end_asc';
+}
+
 export function PackagesView() {
-  const [sortMode, setSortMode] = useState(() => {
-    const v = localStorage.getItem(LS_PK_SORT) || 'end_asc';
-    return v === 'size_desc' ? 'size_desc' : 'end_asc';
-  });
+  const [sortMode, setSortMode] = useState(readSortMode);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const pkgQ = useQuery({
@@ -100,13 +110,15 @@ export function PackagesView() {
           <CardAction>
             <div className="flex flex-wrap items-center gap-3">
               <CardDescription>{list.length ? list.length + ' 个账号 · 实时查询上游' : '—'}</CardDescription>
-              <Select value={sortMode} onValueChange={(v) => changeSort(v ?? 'end_asc')}>
+              <Select
+                items={selectOptionItems(PK_SORT_OPTIONS)}
+                value={sortMode}
+                onValueChange={(v) => changeSort(v ?? 'end_asc')}>
                 <SelectTrigger size="sm" className="w-32" title="逐包明细的排序规则">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="end_asc">按到期时间</SelectItem>
-                  <SelectItem value="size_desc">按面额大小</SelectItem>
+                  <SelectOptions options={PK_SORT_OPTIONS} />
                 </SelectContent>
               </Select>
               <Button size="xs" disabled={pkgQ.isFetching} onClick={() => void pkgQ.refetch()}>

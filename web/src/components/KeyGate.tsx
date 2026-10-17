@@ -48,7 +48,7 @@ export function KeyGate({ open, onOpenChange }: { open: boolean; onOpenChange: (
         </DialogHeader>
         <Input
           type="password"
-          autoComplete="off"
+          autoComplete="current-password"
           placeholder="api_key"
           value={val}
           onChange={(e) => setVal(e.target.value)}

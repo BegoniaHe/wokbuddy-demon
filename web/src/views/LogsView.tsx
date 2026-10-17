@@ -17,9 +17,11 @@ import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
-  SelectItem,
+  SelectOptions,
   SelectTrigger,
   SelectValue,
+  selectOptionItems,
+  type SelectOption,
 } from '@/components/ui/select';
 import {
   Card,
@@ -58,6 +60,23 @@ interface RequestMetrics {
 }
 
 const CH_LABEL: Record<string, string> = { task: '任务', chat: '对话', sys: '系统' };
+
+// 请求记录筛选选项：首项为「不筛选」哨兵，选中即空筛选条件。
+const OUTCOME_OPTIONS = [
+  { value: '__all__', label: '全部结果' },
+  { value: 'success', label: '成功' },
+  { value: 'http_error', label: 'HTTP 错误' },
+  { value: 'stream_error', label: '流错误' },
+  { value: 'interrupted', label: '中断' },
+] as const satisfies readonly SelectOption[];
+
+const LIMIT_OPTIONS = [
+  { value: '100', label: '最近 100 条' },
+  { value: '300', label: '最近 300 条' },
+  { value: '1000', label: '最近 1000 条' },
+] as const satisfies readonly SelectOption[];
+
+const OUTCOME_ALL = OUTCOME_OPTIONS[0].value;
 
 export function LogsView() {
   const [range, setRange] = useState<TimeRangeState>(() => defaultTimeRangeState('0'));
@@ -166,27 +185,27 @@ export function LogsView() {
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
-          <Select value={outcome || '__all__'} onValueChange={(v) => setOutcome(v === '__all__' ? '' : (v ?? ''))}>
+          <Select
+            items={selectOptionItems(OUTCOME_OPTIONS)}
+            value={outcome || OUTCOME_ALL}
+            onValueChange={(v) => setOutcome(v === OUTCOME_ALL ? '' : (v ?? ''))}>
             <SelectTrigger size="sm" className="w-28" aria-label="按结果筛选">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="__all__">全部结果</SelectItem>
-              <SelectItem value="success">成功</SelectItem>
-              <SelectItem value="http_error">HTTP 错误</SelectItem>
-              <SelectItem value="stream_error">流错误</SelectItem>
-              <SelectItem value="interrupted">中断</SelectItem>
+              <SelectOptions options={OUTCOME_OPTIONS} />
             </SelectContent>
           </Select>
           <TimeRange value={range} onChange={setRange} />
-          <Select value={limit} onValueChange={(v) => v && setLimit(v)}>
+          <Select
+            items={selectOptionItems(LIMIT_OPTIONS)}
+            value={limit}
+            onValueChange={(v) => v && setLimit(v)}>
             <SelectTrigger size="sm" className="w-28" aria-label="读取条数">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="100">最近 100 条</SelectItem>
-              <SelectItem value="300">最近 300 条</SelectItem>
-              <SelectItem value="1000">最近 1000 条</SelectItem>
+              <SelectOptions options={LIMIT_OPTIONS} />
             </SelectContent>
           </Select>
           <span className="flex-1" />

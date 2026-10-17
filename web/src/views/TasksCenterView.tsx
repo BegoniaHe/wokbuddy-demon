@@ -5,9 +5,11 @@ import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
-  SelectItem,
+  SelectOptions,
   SelectTrigger,
   SelectValue,
+  selectOptionItems,
+  type SelectOption,
 } from '@/components/ui/select';
 import {
   Card,
@@ -45,6 +47,13 @@ const ST_WORDS: Record<string, string> = {
   pending: '排队',
   scan: '待执行',
 };
+
+// 成长任务并发档位。
+const CONC_OPTIONS = [
+  { value: '1', label: '并发 1' },
+  { value: '2', label: '并发 2' },
+  { value: '3', label: '并发 3' },
+] as const satisfies readonly SelectOption[];
 
 export function TasksCenterView() {
   const [groups, setGroups] = useState<Group[] | null>(null);
@@ -165,14 +174,12 @@ export function TasksCenterView() {
               <Button size="xs" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）" onClick={() => setVouchersOpen(true)}>
                 查询券码
               </Button>
-              <Select value={conc} onValueChange={(v) => setConc(v ?? '1')}>
+              <Select items={selectOptionItems(CONC_OPTIONS)} value={conc} onValueChange={(v) => setConc(v ?? '1')}>
                 <SelectTrigger size="sm" className="w-16">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="1">并发 1</SelectItem>
-                  <SelectItem value="2">并发 2</SelectItem>
-                  <SelectItem value="3">并发 3</SelectItem>
+                  <SelectOptions options={CONC_OPTIONS} />
                 </SelectContent>
               </Select>
               <Button size="xs" disabled={scanning} onClick={() => void scan()}>

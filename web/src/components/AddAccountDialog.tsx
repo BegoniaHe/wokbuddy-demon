@@ -240,6 +240,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
               </p>
               <Input
                 type="password"
+                autoComplete="new-password"
                 placeholder="备份密码（至少 8 位）"
                 value={secPass}
                 onChange={(e) => setSecPass(e.target.value)}

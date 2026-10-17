@@ -6,9 +6,11 @@ import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
-  SelectItem,
+  SelectOptions,
   SelectTrigger,
   SelectValue,
+  selectOptionItems,
+  type SelectOption,
 } from '@/components/ui/select';
 import {
   Card,
@@ -49,24 +51,31 @@ function probeDays(ts?: string): number | null {
   return isNaN(d) ? null : Math.floor(d);
 }
 
-// FilterSelect：工具栏筛选下拉。
+// FilterSelect：工具栏筛选下拉。options 同时驱动 items 映射与列表项；
+// value 为空串时回落 options[0]（即「全部…」项），以空串表示不筛选。
 function FilterSelect({
+  options,
   value,
   onChange,
-  children,
   ariaLabel,
 }: {
+  options: readonly SelectOption[];
   value: string;
   onChange: (v: string) => void;
-  children: React.ReactNode;
   ariaLabel?: string;
 }) {
+  const fallback = options[0]?.value ?? '';
   return (
-    <Select value={value || '__all__'} onValueChange={(v) => onChange(v === '__all__' ? '' : (v ?? ''))}>
+    <Select
+      items={selectOptionItems(options)}
+      value={value || fallback}
+      onValueChange={(v) => onChange(v === fallback ? '' : (v ?? ''))}>
       <SelectTrigger size="sm" aria-label={ariaLabel}>
         <SelectValue />
       </SelectTrigger>
-      <SelectContent>{children}</SelectContent>
+      <SelectContent>
+        <SelectOptions options={options} />
+      </SelectContent>
     </Select>
   );
 }
@@ -142,40 +151,60 @@ export function ModelsView() {
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
-        <FilterSelect ariaLabel="按域筛选" value={filter.realm} onChange={(v) => setFilter((f) => ({ ...f, realm: v }))}>
-          <SelectItem value="__all__">全部域</SelectItem>
-          <SelectItem value="cn">国内版 CN</SelectItem>
-          <SelectItem value="global">国际版 Global</SelectItem>
-        </FilterSelect>
-        <FilterSelect ariaLabel="按能力筛选" value={filter.cap} onChange={(v) => setFilter((f) => ({ ...f, cap: v }))}>
-          <SelectItem value="__all__">全部能力</SelectItem>
-          <SelectItem value="tool">支持工具调用</SelectItem>
-          <SelectItem value="vision">支持视觉</SelectItem>
-          <SelectItem value="reasoning">支持思考</SelectItem>
-          <SelectItem value="default">默认模型</SelectItem>
-        </FilterSelect>
-        <FilterSelect ariaLabel="按思考档位筛选" value={filter.effort} onChange={(v) => setFilter((f) => ({ ...f, effort: v }))}>
-          <SelectItem value="__all__">全部档位</SelectItem>
-          <SelectItem value="off">可关闭思考</SelectItem>
-          <SelectItem value="low">low</SelectItem>
-          <SelectItem value="medium">medium</SelectItem>
-          <SelectItem value="high">high</SelectItem>
-          <SelectItem value="xhigh">xhigh</SelectItem>
-          <SelectItem value="max">max</SelectItem>
-        </FilterSelect>
-        <FilterSelect ariaLabel="按价格筛选" value={filter.promo} onChange={(v) => setFilter((f) => ({ ...f, promo: v }))}>
-          <SelectItem value="__all__">全部价格</SelectItem>
-          <SelectItem value="promo">有折扣 / 限时免费</SelectItem>
-          <SelectItem value="free">限时免费</SelectItem>
-          <SelectItem value="discount">打折（非免费）</SelectItem>
-        </FilterSelect>
-        <FilterSelect ariaLabel="排序方式" value={filter.sort} onChange={(v) => setFilter((f) => ({ ...f, sort: v }))}>
-          <SelectItem value="default">上游默认顺序</SelectItem>
-          <SelectItem value="rate">积分倍率 低 → 高</SelectItem>
-          <SelectItem value="context">上下文长度 大 → 小</SelectItem>
-          <SelectItem value="output">最大输出 大 → 小</SelectItem>
-          <SelectItem value="name">模型 ID A → Z</SelectItem>
-        </FilterSelect>
+        <FilterSelect
+          options={[
+            { value: '__all__', label: '全部域' },
+            { value: 'cn', label: '国内版 CN' },
+            { value: 'global', label: '国际版 Global' },
+          ]}
+          ariaLabel="按域筛选"
+          value={filter.realm}
+          onChange={(v) => setFilter((f) => ({ ...f, realm: v }))} />
+        <FilterSelect
+          options={[
+            { value: '__all__', label: '全部能力' },
+            { value: 'tool', label: '支持工具调用' },
+            { value: 'vision', label: '支持视觉' },
+            { value: 'reasoning', label: '支持思考' },
+            { value: 'default', label: '默认模型' },
+          ]}
+          ariaLabel="按能力筛选"
+          value={filter.cap}
+          onChange={(v) => setFilter((f) => ({ ...f, cap: v }))} />
+        <FilterSelect
+          options={[
+            { value: '__all__', label: '全部档位' },
+            { value: 'off', label: '可关闭思考' },
+            { value: 'low', label: 'low' },
+            { value: 'medium', label: 'medium' },
+            { value: 'high', label: 'high' },
+            { value: 'xhigh', label: 'xhigh' },
+            { value: 'max', label: 'max' },
+          ]}
+          ariaLabel="按思考档位筛选"
+          value={filter.effort}
+          onChange={(v) => setFilter((f) => ({ ...f, effort: v }))} />
+        <FilterSelect
+          options={[
+            { value: '__all__', label: '全部价格' },
+            { value: 'promo', label: '有折扣 / 限时免费' },
+            { value: 'free', label: '限时免费' },
+            { value: 'discount', label: '打折（非免费）' },
+          ]}
+          ariaLabel="按价格筛选"
+          value={filter.promo}
+          onChange={(v) => setFilter((f) => ({ ...f, promo: v }))} />
+        <FilterSelect
+          options={[
+            { value: 'default', label: '上游默认顺序' },
+            { value: 'rate', label: '积分倍率 低 → 高' },
+            { value: 'context', label: '上下文长度 大 → 小' },
+            { value: 'output', label: '最大输出 大 → 小' },
+            { value: 'name', label: '模型 ID A → Z' },
+          ]}
+          ariaLabel="排序方式"
+          value={filter.sort}
+          onChange={(v) => setFilter((f) => ({ ...f, sort: v }))} />
         <span className="flex-1" />
         <span className={cn('text-xs text-muted-foreground', filtered && 'text-warning')}>
           {!all.length ? '' : filtered ? '命中 ' + list.length + ' / ' + all.length + ' 个模型' : all.length + ' 个模型'}

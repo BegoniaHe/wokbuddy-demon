@@ -3,7 +3,26 @@ import { Select as SelectPrimitive } from "@base-ui/react/select"
 import { cn } from "@/lib/utils"
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react"
 
-const Select = SelectPrimitive.Root
+function SelectRootImpl<Value>({
+  items,
+  ...props
+}: SelectPrimitive.Root.Props<Value, false>) {
+  return <SelectPrimitive.Root {...props} items={items} />
+}
+
+const Select = SelectRootImpl as typeof SelectPrimitive.Root
+
+// selectOption 单个选项：value 与触发框/列表中显示的中文标签。
+export interface SelectOption {
+  value: string
+  label: string
+}
+
+// selectOptionItems 把选项数组转成 Base UI 的 items 映射（value → 标签）。
+// Base UI 缺 items 时 SelectValue 会把原始 value 当文本渲染（如 `__all__`、`end_asc`）。
+export function selectOptionItems(options: readonly SelectOption[]): Record<string, string> {
+  return Object.fromEntries(options.map((o) => [o.value, o.label]))
+}
 
 function SelectGroup({ className, ...props }: SelectPrimitive.Group.Props) {
   return (
@@ -184,12 +203,26 @@ function SelectScrollDownButton({
   )
 }
 
+// SelectOptions：由一份选项数组同时产出 items 映射与列表项，避免 value/标签双写漂移。
+function SelectOptions({ options }: { options: readonly SelectOption[] }) {
+  return (
+    <>
+      {options.map((o) => (
+        <SelectItem key={o.value} value={o.value}>
+          {o.label}
+        </SelectItem>
+      ))}
+    </>
+  )
+}
+
 export {
   Select,
   SelectContent,
   SelectGroup,
   SelectItem,
   SelectLabel,
+  SelectOptions,
   SelectScrollDownButton,
   SelectScrollUpButton,
   SelectSeparator,
