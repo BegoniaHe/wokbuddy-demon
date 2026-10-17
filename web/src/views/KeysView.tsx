@@ -169,6 +169,7 @@ export function KeysView() {
                   <TableHead>前缀</TableHead>
                   <TableHead className="text-right">请求数</TableHead>
                   <TableHead className="text-right">Token</TableHead>
+                  <TableHead className="text-right">拒绝</TableHead>
                   <TableHead>限制</TableHead>
                   <TableHead>创建</TableHead>
                   <TableHead>最近使用</TableHead>
@@ -186,6 +187,9 @@ export function KeysView() {
                     </TableCell>
                     <TableCell className="text-right">
                       <span className="font-mono tabular-nums">{fmtTok(k.total_tokens ?? 0)}</span>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <span className="font-mono tabular-nums">{k.rejected ?? 0}</span>
                     </TableCell>
                     <TableCell className="text-muted-foreground">{limitsText(k)}</TableCell>
                     <TableCell className="text-muted-foreground">{ago(k.created_at)}</TableCell>
