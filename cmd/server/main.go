@@ -243,7 +243,9 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
-		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		RecordClientInfo:    cfg.Logging.RequestClientInfo,
+		DecisionTrace:       cfg.Logging.DecisionTrace,
+		DecisionTraceSample: cfg.Logging.DecisionTraceSample,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
@@ -648,7 +650,8 @@ func restartRequiredFields(c *Config) []string {
 	}
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval",
 		"logging.request_archive_enabled", "logging.request_retention_days",
-		"logging.request_archive_max_mb", "server.read_timeout")
+		"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
+		"server.read_timeout")
 	return out
 }
 

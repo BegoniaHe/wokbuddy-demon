@@ -244,6 +244,8 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `state_file` | `./data/state.json` | 账号管家状态持久化文件 |
 | `logging.request_archive_enabled` | `true` | 请求元数据归档开关 |
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
+| `logging.decision_trace` | `false` | 请求归档记录选号决策链（候选/排除原因/成本层/Top-N/轮换） |
+| `logging.decision_trace_sample` | `0.1` | 决策链采样率：0/1 = 全部，0<v<1 按比例。改后需重启 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `upstream.rotate_max` | `3` | 单请求最多换号次数 |

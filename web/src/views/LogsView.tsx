@@ -234,12 +234,13 @@ export function LogsView() {
                 <TableHead className="text-right">Token</TableHead>
                 <TableHead className="text-right">积分</TableHead>
                 <TableHead>请求 ID</TableHead>
+                <TableHead>决策</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {filtered.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={10} className="py-10 text-center text-muted-foreground">{entries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录'}</TableCell>
+                  <TableCell colSpan={11} className="py-10 text-center text-muted-foreground">{entries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录'}</TableCell>
                 </TableRow>
               ) : (
                 filtered.map((e, i) => <RequestRow key={e.request_id || i} e={e} />)
@@ -305,10 +306,12 @@ export function LogsView() {
 }
 
 function RequestRow({ e }: { e: RequestEntry }) {
+  const [open, setOpen] = useState(false);
   const when = fmtClockTime(e.time);
   const tone = reqOutcomeTone(e);
   const muted = <span className="text-muted-foreground">—</span>;
   return (
+    <>
     <TableRow title={requestLogText(e)}>
       <TableCell>
         <span className="font-mono tabular-nums">{when}</span>
@@ -330,7 +333,24 @@ function RequestRow({ e }: { e: RequestEntry }) {
         <span className="font-mono tabular-nums">{reqCreditCell(e)}</span>
       </TableCell>
       <TableCell>{e.request_id ? <Clip className="max-w-[150px] font-mono text-2xs text-muted-foreground" text={e.request_id} /> : muted}</TableCell>
+      <TableCell>
+        {e.decision ? (
+          <Button size="xs" variant="ghost" onClick={() => setOpen((v) => !v)}>
+            {open ? '收起' : '展开'}
+          </Button>
+        ) : muted}
+      </TableCell>
     </TableRow>
+    {open && e.decision ? (
+      <TableRow>
+        <TableCell colSpan={11} className="bg-muted/30">
+          <pre className="m-0 max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs text-muted-foreground">
+            {JSON.stringify(e.decision, null, 2)}
+          </pre>
+        </TableCell>
+      </TableRow>
+    ) : null}
+    </>
   );
 }
 
