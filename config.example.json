@@ -85,7 +85,9 @@
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,
-    "multimodal_routing": false
+    "multimodal_routing": false,
+    "local_web_tools": false,
+    "local_web_tool_rounds": 3
   },
   "prompt": {
     "mode": "passthrough",

@@ -105,6 +105,11 @@ type Config struct {
 	DecisionTrace       bool
 	DecisionTraceSample float64
 
+	// LocalWebTools 是否允许 Responses 本地 web 工具代跑（issue #104）。
+	LocalWebTools bool
+	// LocalWebToolRounds 本地工具代跑轮数（0 回落默认 3，封顶 8）。
+	LocalWebToolRounds int
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -133,10 +138,12 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:            h.cfg.APIKey,
-		SoftCooldown:      h.cfg.SoftCooldown,
-		RecordClientInfo:  h.cfg.RecordClientInfo,
-		MultimodalRouting: h.cfg.MultimodalRouting,
+		APIKey:             h.cfg.APIKey,
+		SoftCooldown:       h.cfg.SoftCooldown,
+		RecordClientInfo:   h.cfg.RecordClientInfo,
+		MultimodalRouting:  h.cfg.MultimodalRouting,
+		LocalWebTools:      h.cfg.LocalWebTools,
+		LocalWebToolRounds: h.cfg.LocalWebToolRounds,
 	}
 }
 

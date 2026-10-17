@@ -41,20 +41,26 @@ type responsesReason struct {
 
 // responsesHandler 是 POST /v1/responses 入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) responsesHandler(w http.ResponseWriter, r *http.Request) {
-	in, out, ok := newResponsesChatInput(w, r, h.cfg.KeepaliveInterval)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		return
+	}
+	if h.loadLive().LocalWebTools {
+		if wanted, ok := declaredLocalWebTools(body); ok {
+			h.serveResponsesWithLocalTools(w, r, body, wanted)
+			return
+		}
+	}
+	in, out, ok := newResponsesChatInput(w, r, body, h.cfg.KeepaliveInterval)
 	if !ok {
 		return
 	}
 	h.serveChat(r, in, out)
 }
 
-// newResponsesChatInput 把 Responses 请求转换为内部 chatInput。
-func newResponsesChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration) (chatInput, chatResponder, bool) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-		return chatInput{}, nil, false
-	}
+// newResponsesChatInput 把已读取的 Responses 请求转换为内部 chatInput。
+func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, keepalive time.Duration) (chatInput, chatResponder, bool) {
 	openAI, model, instructions, stream, err := responsesToOpenAI(body)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())

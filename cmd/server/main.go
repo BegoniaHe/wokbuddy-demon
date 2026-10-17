@@ -171,6 +171,8 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		MultimodalRouting:    cfg.Features.MultimodalRouting,
+		LocalWebTools:        cfg.Features.LocalWebTools,
+		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -234,37 +236,19 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
-	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Keys:         keyStore,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
-		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
-		// 裸用/测试路径拿到同一缺省值。
-		RecordClientInfo:    cfg.Logging.RequestClientInfo,
-		DecisionTrace:       cfg.Logging.DecisionTrace,
-		DecisionTraceSample: cfg.Logging.DecisionTraceSample,
-		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
-		GlobalEnabled: cfg.Global.Enabled,
-		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。
-		ModelAliases: cfg.Models.Aliases,
-		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
-		MaxRotate:      cfg.Upstream.RotateMax,
-		RotateBudget:   cfg.RotateBudgetDur,
-		RotateStatuses: rotateStatusSet(cfg.Upstream.RotateStatusCodes),
-		// 入站 SSE 心跳（issue #54）：0 = 关闭；改后需重启。
-		KeepaliveInterval: cfg.KeepaliveIntervalDur,
-		Notifier:          notifier,
+	h := buildHandler(handlerDeps{
+		cfg:         cfg,
+		pool:        p,
+		up:          up,
+		keys:        keyStore,
+		session:     sessRouter,
+		stickyCount: sessCount,
+		redisMode:   redisMode,
+		panel:       pn,
+		live:        live,
+		usage:       rec,
+		requestLog:  requestLog,
+		notifier:    notifier,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -576,6 +560,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		MultimodalRouting:    newCfg.Features.MultimodalRouting,
+		LocalWebTools:        newCfg.Features.LocalWebTools,
+		LocalWebToolRounds:   newCfg.Features.LocalWebToolRounds,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
