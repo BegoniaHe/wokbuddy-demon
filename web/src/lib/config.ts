@@ -6,11 +6,15 @@ export interface FieldDef {
   name: string;
   path: string[];
   kind: FieldKind;
+  // secret 字段加载时不回填已保存值（输入框留空 = 保持原值），避免敏感值进入 DOM。
+  secret?: boolean;
 }
 
 export const CFG_FIELDS: FieldDef[] = [
   { name: 'listen', path: ['listen'], kind: 'text' },
   { name: 'api_key', path: ['api_key'], kind: 'password' },
+  { name: 'auth_dir', path: ['auth_dir'], kind: 'text' },
+  { name: 'state_file', path: ['state_file'], kind: 'text' },
   { name: 'package_detail_limit', path: ['panel', 'package_detail_limit'], kind: 'number' },
   { name: 'max_body_bytes', path: ['server', 'max_body_bytes'], kind: 'number' },
   { name: 'checkin_enabled', path: ['schedule', 'checkin_enabled'], kind: 'checkbox' },
@@ -54,6 +58,21 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'user_agent', path: ['upstream', 'user_agent'], kind: 'text' },
   { name: 'background_names', path: ['models', 'background_names'], kind: 'list' },
   { name: 'background_target', path: ['models', 'background_target'], kind: 'text' },
+  { name: 'client_version', path: ['upstream', 'client_version'], kind: 'text' },
+  { name: 'cli_version', path: ['upstream', 'cli_version'], kind: 'text' },
+  { name: 'client_name', path: ['upstream', 'client_name'], kind: 'text' },
+  { name: 'device_token', path: ['upstream', 'device_token'], kind: 'password', secret: true },
+  { name: 'device_token_file', path: ['upstream', 'device_token_file'], kind: 'text' },
+  { name: 'passthrough_ip', path: ['upstream', 'passthrough_ip'], kind: 'checkbox' },
+  { name: 'rotate_max', path: ['upstream', 'rotate_max'], kind: 'number' },
+  { name: 'rotate_budget', path: ['upstream', 'rotate_budget'], kind: 'text' },
+  { name: 'rotate_status_codes', path: ['upstream', 'rotate_status_codes'], kind: 'hours' },
+  { name: 'proxies', path: ['upstream', 'proxies'], kind: 'list' },
+  { name: 'global_enabled', path: ['global', 'enabled'], kind: 'checkbox' },
+  { name: 'global_chat_base', path: ['global', 'chat_base'], kind: 'text' },
+  { name: 'global_billing_base', path: ['global', 'billing_base'], kind: 'text' },
+  { name: 'upstash_url', path: ['upstash', 'url'], kind: 'text' },
+  { name: 'upstash_token', path: ['upstash', 'token'], kind: 'password', secret: true },
   { name: 'prompt_mode', path: ['prompt', 'mode'], kind: 'select' },
   { name: 'prompt_file', path: ['prompt', 'file'], kind: 'text' },
   { name: 'sanitize_blacklist_fingerprints', path: ['features', 'sanitize_blacklist_fingerprints'], kind: 'checkbox' },
@@ -83,6 +102,7 @@ export const DURATION_FIELDS = new Set([
   'expiring_soon',
   'ttl',
   'checkin_account_delay',
+  'rotate_budget',
 ]);
 export const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 
@@ -108,6 +128,20 @@ export function put(obj: Record<string, unknown>, path: string[], val: unknown):
 export function durationBad(value: string): boolean {
   const v = value.trim();
   return v !== '' && !DURATION_RE.test(v);
+}
+
+// configToValues 把服务端配置映射为表单初值。secret 字段已有值时留空，
+// 让「空 = 不修改」与 collectConfig 的跳过语义配合，避免敏感值进入 DOM。
+export function configToValues(cfg: unknown): Record<string, FieldValue> {
+  const next: Record<string, FieldValue> = {};
+  for (const f of CFG_FIELDS) {
+    const v = dig(cfg, f.path);
+    if (f.kind === 'checkbox') next[f.name] = !!v;
+    else if (f.secret && v != null && v !== '') next[f.name] = '';
+    else if (Array.isArray(v)) next[f.name] = v.join(', ');
+    else next[f.name] = v == null ? '' : String(v);
+  }
+  return next;
 }
 
 // collectConfig 从表单值组装提交对象：空 = 不下发（覆盖型字段除外）。
