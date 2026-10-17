@@ -215,6 +215,11 @@ type Config struct {
 		// 该模态的模型并重写 model（默认 false = 明确 400 model_capability）。
 		// issue #109。
 		MultimodalRouting bool `json:"multimodal_routing"`
+		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
+		// 网关本地执行（issue #104）。默认 false = 原样透传。
+		LocalWebTools bool `json:"local_web_tools"`
+		// LocalWebToolRounds 本地工具最多代跑轮数；<=0 回落 3，>8 钳到 8。
+		LocalWebToolRounds int `json:"local_web_tool_rounds"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -354,6 +359,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.LocalWebToolRounds = 3
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -850,6 +856,7 @@ func (c *Config) normalizeStaticDefaults() {
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
 	}
+	c.normalizeLocalWebToolRounds()
 	c.normalizePoolDefaults()
 	c.normalizeUpstreamDefaults()
 }
@@ -910,6 +917,17 @@ func invalidOriginReason(u *url.URL) string {
 		return "不能包含路径"
 	default:
 		return ""
+	}
+}
+
+// normalizeLocalWebToolRounds 规范化本地上网工具轮数（issue #104）：<=0 回落 3，
+// >8 钳到 8（每轮都消耗一次上游额度，必须硬上限）。
+func (c *Config) normalizeLocalWebToolRounds() {
+	if c.Features.LocalWebToolRounds <= 0 {
+		c.Features.LocalWebToolRounds = 3
+	}
+	if c.Features.LocalWebToolRounds > 8 {
+		c.Features.LocalWebToolRounds = 8
 	}
 }
 

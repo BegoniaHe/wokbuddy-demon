@@ -236,6 +236,8 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		MultimodalRouting:    cfg.Features.MultimodalRouting,
+		LocalWebTools:        cfg.Features.LocalWebTools,
+		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -628,6 +630,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		MultimodalRouting:    newCfg.Features.MultimodalRouting,
+		LocalWebTools:        newCfg.Features.LocalWebTools,
+		LocalWebToolRounds:   newCfg.Features.LocalWebToolRounds,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

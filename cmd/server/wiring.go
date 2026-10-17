@@ -82,6 +82,8 @@ func buildHandler(d handlerDeps) *server.Handler {
 		RecordClientInfo:    d.cfg.Logging.RequestClientInfo,
 		DecisionTrace:       d.cfg.Logging.DecisionTrace,
 		DecisionTraceSample: d.cfg.Logging.DecisionTraceSample,
+		LocalWebTools:       d.cfg.Features.LocalWebTools,
+		LocalWebToolRounds:  d.cfg.Features.LocalWebToolRounds,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: d.cfg.Global.Enabled,
 		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。

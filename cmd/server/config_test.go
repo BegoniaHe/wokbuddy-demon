@@ -948,6 +948,29 @@ func TestCORSOrigins(t *testing.T) {
 	}
 }
 
+// TestLocalWebToolRounds 本地上网工具轮数默认 3、上限 8（issue #104）。
+func TestLocalWebToolRounds(t *testing.T) {
+	c := Default()
+	if c.Features.LocalWebToolRounds != 3 {
+		t.Errorf("default rounds=%d want 3", c.Features.LocalWebToolRounds)
+	}
+	c.Features.LocalWebToolRounds = 99
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.LocalWebToolRounds != 8 {
+		t.Errorf("clamped rounds=%d want 8", c.Features.LocalWebToolRounds)
+	}
+	c = Default()
+	c.Features.LocalWebToolRounds = 0
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.LocalWebToolRounds != 3 {
+		t.Errorf("zero rounds=%d want 3", c.Features.LocalWebToolRounds)
+	}
+}
+
 // mustParseConfig 解析一段配置 JSON（不读环境变量），失败即终止测试。
 func mustParseConfig(t *testing.T, body string) *Config {
 	t.Helper()

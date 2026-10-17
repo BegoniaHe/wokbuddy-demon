@@ -380,6 +380,16 @@ export function ConfigView() {
           <Separator className="my-4" />
           {check('sanitize_blacklist_fingerprints', '出站请求指纹脱敏')}
           {check('multimodal_routing', '多模态按能力路由（不匹配时改选支持该模态的模型；关闭则返回 400）')}
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <div>
+              {check('local_web_tools', 'Responses 本地代跑 web_search / web_fetch', '开启后每个工具轮次都会额外消耗一次上游额度')}
+            </div>
+            <Field>
+              <FieldLabel>本地工具最多轮数</FieldLabel>
+              {num('local_web_tool_rounds', { min: 1, max: 8, placeholder: '3' })}
+              <FieldDescription>默认 3，封顶 8；仅对 /v1/responses 生效</FieldDescription>
+            </Field>
+          </div>
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
             Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。
