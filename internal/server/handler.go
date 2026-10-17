@@ -471,12 +471,14 @@ func modelDescription(credits, description string) string {
 
 // applyModelInfoCapabilities 合入能力旗标 / 尺寸上限 / 推理档位字段（空值省略）。
 func applyModelInfoCapabilities(entry map[string]any, mi upstream.ModelInfo) {
-	if mi.SupportsImages {
-		entry["supports_images"] = true // 兼容字段：仅图片能力布尔
+	mods := mi.EffectiveInputModalities()
+	// 兼容字段与 input_modalities 同源：image 能力也可能来自 models.dev 推导。
+	if containsModality(mods, upstream.ModalityImage) {
+		entry["supports_images"] = true
 	}
 	// 输入模态（issue #109）：已知才宣称（未知 = 省略），normalize 后至少含 text/image
 	// 之类的确定值；supports_images 保留作为兼容字段。
-	if mods := mi.EffectiveInputModalities(); len(mods) > 0 {
+	if len(mods) > 0 {
 		entry["input_modalities"] = mods
 	}
 	if mi.SupportsReasoning {
@@ -1754,6 +1756,10 @@ func localErrorEnvelope(err error, fallbackStatus int, fallbackCode, fallbackMsg
 		// 上游单行超过防御上限（issue #113）：同样 502 upstream_parse。轮转耗尽
 		// 意味着每个号都吐超大行——上游/代理异常，客户端重试同一请求无意义。
 		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	case errors.Is(err, upstream.ErrSSEAggregateTooLong):
+		// 非流式聚合总量超限（issue #113）：同 502 upstream_parse，不落回
+		// no_healthy_account（那会把「上游吐了超大响应」表述成「号全挂了」）。
+		return http.StatusBadGateway, "upstream_parse", err.Error(), true
 	default:
 		return fallbackStatus, fallbackCode, fallbackMsg, false
 	}
@@ -1771,8 +1777,9 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint = upstream.NoHealthyAccountHint()
 	if s2, c2, m2, ok := localErrorEnvelope(f.lastErr, status, code, msg); ok {
-		// 本地分类错误（超时 / 截断 / 空流）：自带状态码与文案，直接透出。
-		return s2, c2, m2, hint, false
+		// 本地分类错误（超时 / 截断 / 空流 / 大小超限）：属于上游或传输层异常，
+		// 不是号池调度失败，不透出 no_healthy_account hint（排查方向完全不同）。
+		return s2, c2, m2, "", false
 	}
 	var ue *upstream.Error
 	if !errors.As(f.lastErr, &ue) {

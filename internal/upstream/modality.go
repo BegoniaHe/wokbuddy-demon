@@ -54,14 +54,24 @@ func normalizeModalities(in []string) []string {
 	return out
 }
 
-// EffectiveInputModalities 返回模型的有效输入模态；nil = 能力未知（不宣称、
-// 不做能力拒绝）。来源见文件头三级优先级。
-func (m ModelInfo) EffectiveInputModalities() []string {
+// DeclaredInputModalities 返回上游字段或 models.dev 明确声明的输入模态；nil =
+// 没有完整声明。只有完整声明才能用于「缺少某模态 → 拒绝」，因为
+// supports_images 只能证明图片能力，不能证明音频/文件缺失。
+func (m ModelInfo) DeclaredInputModalities() []string {
 	if mods := normalizeModalities(m.InputModalities); len(mods) > 0 {
 		return mods
 	}
 	if mods, ok := lookupModelsDevModalities(m.ID); ok {
 		return normalizeModalities(mods)
+	}
+	return nil
+}
+
+// EffectiveInputModalities 返回模型的有效输入模态；nil = 能力未知（不宣称、
+// 不做能力拒绝）。来源见文件头三级优先级。
+func (m ModelInfo) EffectiveInputModalities() []string {
+	if mods := m.DeclaredInputModalities(); len(mods) > 0 {
+		return mods
 	}
 	if m.SupportsImages {
 		// 兼容推导：supports_images=true 即支持图片输入（文本恒隐含）。

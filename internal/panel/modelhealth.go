@@ -263,7 +263,11 @@ type probeChunk struct {
 	} `json:"usage"`
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
+				ID string `json:"id"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 	} `json:"choices"`
 }
@@ -346,10 +350,12 @@ func handleProbeFrame(payload string, start time.Time, ttft, tokens int64) (done
 	return false, ttft, tokens, "", ""
 }
 
-// chunkHasContent 报告该帧是否携带非空 delta.content（首字判定）。
+// chunkHasContent 报告该帧是否携带首字证据：正文、思维链增量或首个工具调用。
+// 推理模型可能在小 max_tokens 下只产出 reasoning_content，工具调用型响应则可能
+// 只产出 tool_calls；两者都证明上游已开始有效输出，不能记为解析失败。
 func chunkHasContent(c probeChunk) bool {
 	for _, ch := range c.Choices {
-		if ch.Delta.Content != "" {
+		if ch.Delta.Content != "" || ch.Delta.ReasoningContent != "" || len(ch.Delta.ToolCalls) > 0 {
 			return true
 		}
 	}

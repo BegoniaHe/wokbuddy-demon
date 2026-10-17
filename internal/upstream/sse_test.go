@@ -1419,8 +1419,8 @@ func (w *keepaliveFailWriter) WriteHeader(int)           {}
 func (w *keepaliveFailWriter) Flush()                    {}
 
 // TestStreamTruncatedNoDone 上游未发 [DONE] 就 EOF（截断）：仍向客户端补一个
-// [DONE] 收尾、已写帧不撤回，但返回 errTruncatedStream（issue #105）——请求结果
-// 必须是失败，截断的 content 不是完整回答。
+// [DONE] 收尾、已写帧不撤回，同时写一帧 error（客户端无法区分半截回答与正常完成），
+// 并返回 errTruncatedStream（issue #105）——请求结果必须是失败。
 func TestStreamTruncatedNoDone(t *testing.T) {
 	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
 		"data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n"
@@ -1435,6 +1435,9 @@ func TestStreamTruncatedNoDone(t *testing.T) {
 	}
 	if !strings.Contains(body, "hello") || !strings.Contains(body, "world") {
 		t.Errorf("已写帧被撤回: %q", body)
+	}
+	if !strings.Contains(body, "upstream stream truncated before [DONE]") || !strings.Contains(body, `"code":"upstream_parse"`) {
+		t.Errorf("截断必须带 error 帧，客户端不能读成正常完成: %q", body)
 	}
 	if IsEmptyStreamError(err) {
 		t.Errorf("截断不是空流，不得复用空流哨兵")

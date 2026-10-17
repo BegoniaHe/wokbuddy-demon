@@ -83,7 +83,7 @@ func TestAggregateLineTooLong(t *testing.T) {
 }
 
 // TestAggregateTotalTooLong 非流式聚合：多帧小行累计超过总量上限时返回
-// errSSEAggregateTooLong，不返回残缺成功响应（issue #113）。
+// ErrSSEAggregateTooLong，不返回残缺成功响应（issue #113）。
 func TestAggregateTotalTooLong(t *testing.T) {
 	// 每帧 1 MiB content：单行不超限，累计 33 帧超过 32 MiB。
 	const frame = 1 << 20
@@ -96,7 +96,7 @@ func TestAggregateTotalTooLong(t *testing.T) {
 	}
 	sb.WriteString("data: [DONE]\n\n")
 	resp, err := Aggregate(strings.NewReader(sb.String()))
-	if !errors.Is(err, errSSEAggregateTooLong) {
+	if !errors.Is(err, ErrSSEAggregateTooLong) {
 		t.Fatalf("err=%v want aggregate too long (resp!=nil: %v)", err, resp != nil)
 	}
 	if resp != nil {

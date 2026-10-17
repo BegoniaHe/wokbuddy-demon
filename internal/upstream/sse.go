@@ -49,7 +49,7 @@ func IsClientWriteError(err error) bool { return errors.Is(err, errClientWrite) 
 // 分片/半行由 readSSELine 处理（单行上限 4 MiB，issue #113）；遇到 "data: [DONE]" 结束。
 // EOF 收尾但未见过 [DONE] → errTruncatedStream：截断的 content 不是完整回答，
 // 不返回残缺成功响应，由 handler 映射为 502 upstream_parse（issue #105）。
-// 聚合总量超 32 MiB → errSSEAggregateTooLong（issue #113），同样不返回残缺成功。
+// 聚合总量超 32 MiB → ErrSSEAggregateTooLong（issue #113），同样不返回残缺成功。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
 	a := newStreamAggregator()
@@ -110,7 +110,7 @@ func newStreamAggregator() *streamAggregator {
 }
 
 // handleLine 处理一行：data: 帧解析聚合，[DONE] 返回 true（调用方停止读取）。
-// 聚合总量超限时返回 errSSEAggregateTooLong（issue #113）。
+// 聚合总量超限时返回 ErrSSEAggregateTooLong（issue #113）。
 func (a *streamAggregator) handleLine(line string) (bool, error) {
 	if !strings.HasPrefix(line, "data: ") {
 		return false, nil
@@ -1138,12 +1138,16 @@ func (s *streamWriter) finish(validFrames *int) error {
 	if werr := s.finishRepair(validFrames); werr != nil {
 		return werr
 	}
-	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
-	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
-	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
-	if *validFrames == 0 {
+	// 空流 / 截断都不是完整回答：先写一帧 error（绕过 normalizeFrame 原样保留
+	// error 字段），再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方
+	// 记录。与 finishSizeLimit 同形态，客户端不能把半截内容读成正常完成。
+	// 网关本地兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
+	// 且 writeRaw 的 hintFn 闭包在兜底路径下可能携带上一帧的上下文造成误配。
+	switch {
+	case *validFrames == 0:
 		_ = s.writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
+	case !s.sawDone:
+		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if err := s.writeAll("data: [DONE]\n\n"); err != nil {

@@ -182,6 +182,61 @@ func TestChatRejectsAudioAndFileParts(t *testing.T) {
 	}
 }
 
+// TestChatSupportsImagesOnlyDoesNotRejectAudioFile supports_images 只能证明图片
+// 能力，不能据此判 audio/file 缺失：这两类请求仍原样送上游。
+func TestChatSupportsImagesOnlyDoesNotRejectAudioFile(t *testing.T) {
+	setModelCatalog(t, []upstream.ModelInfo{{ID: "vision-only", SupportsImages: true}})
+	up, _, calls := captureUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	for _, part := range []string{"input_audio", "file"} {
+		rec := postChat(t, h, partBody("vision-only", part))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: code=%d want 200 body=%s（能力未知不得拒绝）", part, rec.Code, rec.Body)
+		}
+	}
+	if n := atomic.LoadInt64(calls); n != 2 {
+		t.Errorf("upstream calls=%d want 2", n)
+	}
+}
+
+// TestMissingModalitiesOnlyUsesDeclared 缺少模态判定只依据完整声明；
+// supports_images 推导不是完整能力集。
+func TestMissingModalitiesOnlyUsesDeclared(t *testing.T) {
+	derived := upstream.ModelInfo{ID: "vision-only", SupportsImages: true}
+	for _, want := range []string{"image", "audio", "file"} {
+		if missing := missingModalities(derived, []string{want}); len(missing) != 0 {
+			t.Errorf("supports_images 推导 missing(%s)=%v want none", want, missing)
+		}
+	}
+	declared := upstream.ModelInfo{ID: "text-only", InputModalities: []string{"text"}}
+	if missing := missingModalities(declared, []string{"audio"}); len(missing) != 1 || missing[0] != "audio" {
+		t.Errorf("declared missing=%v want [audio]", missing)
+	}
+}
+
+// TestChatMultimodalRoutingUsesSupportsImagesCandidate 路由候选可来自
+// supports_images（图片能力可证明），不必等完整模态列表。
+func TestChatMultimodalRoutingUsesSupportsImagesCandidate(t *testing.T) {
+	setModelCatalog(t, []upstream.ModelInfo{
+		{ID: "text-only", InputModalities: []string{"text"}},
+		{ID: "vision-only", SupportsImages: true},
+	})
+	up, models, _ := captureUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, SoftCooldown: time.Minute,
+		Live: livecfg.New(livecfg.Snapshot{MultimodalRouting: true}),
+	})
+	rec := postChat(t, h, imageBody("text-only"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if got := (*models)[0]; got != "vision-only" {
+		t.Errorf("outbound model=%q want vision-only", got)
+	}
+}
+
 // TestChatMultimodalRoutingRewritesModel 开启路由后改选支持该模态的模型，
 // 出站 body 的 model 被重写（issue #109）。
 func TestChatMultimodalRoutingRewritesModel(t *testing.T) {
@@ -290,6 +345,7 @@ func TestChatTextOnlyRoutingUnchanged(t *testing.T) {
 func TestModelsListingIncludesInputModalities(t *testing.T) {
 	setModelCatalog(t, []upstream.ModelInfo{
 		{ID: "vision", SupportsImages: true},
+		{ID: "declared-vision", InputModalities: []string{"text", "image"}},
 		{ID: "text-only", InputModalities: []string{"text"}},
 		{ID: "unknown"},
 	})
@@ -306,6 +362,10 @@ func TestModelsListingIncludesInputModalities(t *testing.T) {
 	}
 	if vision["supports_images"] != true {
 		t.Errorf("vision supports_images=%v want true（兼容字段保留）", vision["supports_images"])
+	}
+	declared := byID["cn:declared-vision"]
+	if declared["supports_images"] != true {
+		t.Errorf("declared-vision supports_images=%v want true（与 input_modalities 同源）", declared["supports_images"])
 	}
 	textOnly := byID["cn:text-only"]
 	if mods, ok := textOnly["input_modalities"].([]string); !ok || strings.Join(mods, ",") != "text" {

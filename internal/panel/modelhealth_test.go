@@ -316,3 +316,35 @@ func TestReadProbeStreamOverlongLine(t *testing.T) {
 		t.Fatalf("class=%q want upstream_parse", class)
 	}
 }
+
+// TestReadProbeStreamReasoningIsFirstToken 推理模型只吐 reasoning_content 时
+// 不能记为「无内容帧」失败（issue #110）。
+func TestReadProbeStreamReasoningIsFirstToken(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"completion_tokens\":16}}\n\n" +
+		"data: [DONE]\n\n"
+	ttft, tokens, class, msg := readProbeStream(time.Now(), strings.NewReader(raw))
+	if class != "" || msg != "" {
+		t.Fatalf("class=%q msg=%q want success", class, msg)
+	}
+	if ttft <= 0 {
+		t.Errorf("ttft=%d want > 0（reasoning_content 也是首字）", ttft)
+	}
+	if tokens != 16 {
+		t.Errorf("tokens=%d want 16", tokens)
+	}
+}
+
+// TestReadProbeStreamToolCallIsFirstToken 只产出 tool_calls 的响应也证明上游
+// 已开始有效输出，不计为解析失败。
+func TestReadProbeStreamToolCallIsFirstToken(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"function\":{\"name\":\"ping\"}}]}}]}\n\n" +
+		"data: [DONE]\n\n"
+	ttft, _, class, msg := readProbeStream(time.Now(), strings.NewReader(raw))
+	if class != "" || msg != "" {
+		t.Fatalf("class=%q msg=%q want success", class, msg)
+	}
+	if ttft <= 0 {
+		t.Errorf("ttft=%d want > 0（tool_calls 也是首字）", ttft)
+	}
+}

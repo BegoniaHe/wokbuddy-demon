@@ -31,8 +31,9 @@ const MaxSSELineBytes = 4 << 20
 // 正常量级（约千万级字符），超限即判上游异常。
 const maxSSEAggregateBytes = 32 << 20
 
-// errSSEAggregateTooLong 聚合内容超过 maxSSEAggregateBytes。
-var errSSEAggregateTooLong = errors.New("sse aggregate exceeds size limit")
+// ErrSSEAggregateTooLong 非流式聚合内容超过 maxSSEAggregateBytes（issue #113）。
+// server 末端错误映射与单行超限同口径：502 upstream_parse。
+var ErrSSEAggregateTooLong = errors.New("sse aggregate exceeds size limit")
 
 // readSSELine 读一行（含 '\n'），单行字节数超过 MaxSSELineBytes 时返回
 // ErrSSELineTooLong 而不继续累积内存。语义对齐 bufio.Reader.ReadString：
@@ -60,7 +61,7 @@ func readSSELine(br *bufio.Reader) (string, error) {
 }
 
 // limitAggregate 在聚合写入点检查总量上限（content / reasoning / tool_call
-// arguments 三条写入路径都经此）。超限返回 errSSEAggregateTooLong，调用方
+// arguments 三条写入路径都经此）。超限返回 ErrSSEAggregateTooLong，调用方
 // 立即中止——不返回残缺成功响应（issue #113）。
 type aggregateGuard struct {
 	total int
@@ -70,7 +71,7 @@ type aggregateGuard struct {
 func (g *aggregateGuard) add(n int) error {
 	g.total += n
 	if g.total > maxSSEAggregateBytes {
-		return fmt.Errorf("%w: > %d bytes", errSSEAggregateTooLong, maxSSEAggregateBytes)
+		return fmt.Errorf("%w: > %d bytes", ErrSSEAggregateTooLong, maxSSEAggregateBytes)
 	}
 	return nil
 }

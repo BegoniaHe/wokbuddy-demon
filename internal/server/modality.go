@@ -76,10 +76,11 @@ func findModelInfo(infos []upstream.ModelInfo, id string) (upstream.ModelInfo, b
 	return upstream.ModelInfo{}, false
 }
 
-// missingModalities 返回 request 中有、而模型能力声明里没有的模态。
-// 模型能力未知（EffectiveInputModalities 为 nil）→ nil（放行）。
+// missingModalities 返回 request 中有、而模型**明确声明**里没有的模态。
+// 只依据完整声明（上游字段/models.dev）：能力未知 → nil（放行）；仅
+// supports_images 推导时只能证明图片能力，不能据此判 audio/file 缺失。
 func missingModalities(mi upstream.ModelInfo, want []string) []string {
-	have := mi.EffectiveInputModalities()
+	have := mi.DeclaredInputModalities()
 	if len(have) == 0 {
 		return nil
 	}
@@ -96,20 +97,36 @@ func missingModalities(mi upstream.ModelInfo, want []string) []string {
 	return missing
 }
 
-// modelsSupporting 返回目录里**明确声明**支持全部 want 模态的模型（保持目录顺序）。
+// modelsSupporting 返回目录里**能证明**支持全部 want 模态的模型（保持目录顺序）。
 // 与请求侧「能力未知即放行」不同：改选/提示候选只在能力可证实时成立，未知模型
 // 不得凭「无法证明不支持」成为候选，否则开路由后可能把请求改选到纯文本模型。
 func modelsSupporting(infos []upstream.ModelInfo, want []string) []upstream.ModelInfo {
 	var out []upstream.ModelInfo
 	for _, mi := range infos {
-		if len(mi.EffectiveInputModalities()) == 0 {
-			continue // 能力未知：不作为候选
-		}
-		if len(missingModalities(mi, want)) == 0 {
+		if modelSupportsAll(mi, want) {
 			out = append(out, mi)
 		}
 	}
 	return out
+}
+
+// modelSupportsAll 报告模型是否能被证明支持全部 want 模态：完整声明优先，
+// supports_images 仅用于证明图片能力；其余无法证明的一律视为不支持。
+func modelSupportsAll(mi upstream.ModelInfo, want []string) bool {
+	has := map[string]bool{}
+	for _, m := range mi.DeclaredInputModalities() {
+		has[m] = true
+	}
+	for _, m := range want {
+		if has[m] {
+			continue
+		}
+		if m == upstream.ModalityImage && mi.SupportsImages {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // applyModalityRoute 在选号前做模态能力判定/路由（issue #109）。返回 false 表示
@@ -173,10 +190,13 @@ func (f *chatFlow) rejectModality(model string, missing []string, infos []upstre
 }
 
 // rewriteModelForRouting 把出站请求体的 model 重写为候选裸模型名，并同步
-// bareModel（选号、粘性、用量维度都以 bareModel 为准）。
+// bareModel 与倍率（选号、粘性、用量维度都以 bareModel 为准）。
 func (f *chatFlow) rewriteModelForRouting(bare string) {
 	f.body = rewriteModel(f.body, bare)
 	f.bareModel = bare
+	if f.h.cfg.Upstream != nil {
+		f.modelRate = f.h.cfg.Upstream.ModelRate(f.realm, bare)
+	}
 }
 
 // multimodalRoutingEnabled 读取热配置 features.multimodal_routing（默认 false）。
