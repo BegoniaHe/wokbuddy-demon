@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
@@ -45,6 +46,14 @@ type Config struct {
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
 	} `json:"logging"`
+
+	Notify struct {
+		// WebhookURL 告警 webhook 地址；空 = 关闭。只支持 http/https，可内嵌 token。
+		WebhookURL string `json:"webhook_url"`
+		// Events 订阅的事件名；空 = 默认关键事件（session_dead/pool_unavailable/
+		// credit_low/waf_ip_blocked/task_failed）。
+		Events []string `json:"events"`
+	} `json:"notify"`
 
 	Server struct {
 		// ReadTimeout 入站请求读取（含 body 上传）总时长上限（issue #100）。
@@ -511,6 +520,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.normalizeStaticDefaults()
+	if err := c.normalizeNotify(); err != nil {
+		return err
+	}
 	if err := c.normalizeSchedule(); err != nil {
 		return err
 	}
@@ -522,6 +534,33 @@ func (c *Config) normalize() error {
 	}
 	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
 	return c.Validate()
+}
+
+// normalizeNotify 校验 webhook 与事件名，并去掉事件首尾空白/重复项。
+func (c *Config) normalizeNotify() error {
+	url := strings.TrimSpace(c.Notify.WebhookURL)
+	if err := notify.ValidateURL(url); err != nil {
+		return fmt.Errorf("notify.webhook_url: %w", err)
+	}
+	c.Notify.WebhookURL = url
+	if len(c.Notify.Events) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Notify.Events))
+	events := make([]string, 0, len(c.Notify.Events))
+	for _, raw := range c.Notify.Events {
+		name := strings.TrimSpace(raw)
+		if !notify.ValidEvent(name) {
+			return fmt.Errorf("notify.events: 未知事件 %q", raw)
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		events = append(events, name)
+	}
+	c.Notify.Events = events
+	return nil
 }
 
 // normalizeProxies 校验出站代理 URL（issue #15）：任一非法即拒绝（避免运行时才暴露）。

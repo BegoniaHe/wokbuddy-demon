@@ -20,6 +20,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
@@ -66,6 +67,9 @@ type Config struct {
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
+
+	// Notifier webhook 告警出口（可选；nil = 关闭）。发送失败不影响主路径。
+	Notifier notify.Sender
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
@@ -850,6 +854,17 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
 		// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 		f.modelBlock = f.h.cfg.Pool.ModelBlocked(f.bareModel)
+		detail := map[string]any{"model": f.bareModel}
+		if f.modelBlock.Blocked {
+			detail["model_blocked"] = true
+			detail["block_reason"] = f.modelBlock.Reason
+		}
+		f.h.notify(notify.Event{
+			Event:   notify.EventPoolUnavailable,
+			Realm:   f.realm,
+			Summary: "无可用账号（池健康或在途名额耗尽）",
+			Detail:  detail,
+		})
 		return rotBreak
 	}
 	f.st.uid = acct.UID
@@ -930,6 +945,8 @@ func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
 	var ue *upstream.Error
 	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 		f.h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+		f.h.notifyAccount(acct.UID, notify.EventSessionDead, "账号 session 失效，已禁用，需重新登录",
+			map[string]any{"stage": "refresh"})
 		return
 	}
 	f.h.cfg.Pool.NoteError(acct.UID)
@@ -1040,6 +1057,8 @@ func (f *chatFlow) handleHTTPError(
 	// WAF 403 喂入 IP 级状态机，若激活（短窗多号命中）则立即终止轮转，避免把请求放大
 	// MaxRotate 倍打同一出口 IP。账号级软冷却已在上方 applyErrorPolicy 照常记账。
 	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
+		f.h.notifyAccount(acct.UID, notify.EventWAFIPBlocked, "出口 IP 触发上游 WAF 级拦截，轮转已停止",
+			map[string]any{"model": f.bareModel})
 		return rotBreak
 	}
 	// 状态码换号闸（issue #17，默认关闭）：allowlist 非空时仅列出的状态码才换号；
@@ -1250,6 +1269,26 @@ func (f *chatFlow) handleNonStreamSuccess(acct *auth.Auth, rc io.ReadCloser, att
 		f.h.cfg.Pool.NoteModelCost(acct.UID, f.bareModel, credit, total)
 	}
 	return rotDone
+}
+
+// notifyAccount 发送账号级告警（uid 由通知层截为 uid8；账号不存在时只带 uid）。
+func (h *Handler) notifyAccount(uid, event, summary string, detail map[string]any) {
+	if h.cfg.Notifier == nil {
+		return
+	}
+	e := notify.Event{Event: event, UID: uid, Summary: summary, Detail: detail}
+	if st, ok := h.cfg.Pool.Status(uid); ok {
+		e.Nickname = st.Nickname
+		e.Realm = st.Realm
+	}
+	h.notify(e)
+}
+
+// notify 发送事件（未配置时为空操作）。
+func (h *Handler) notify(e notify.Event) {
+	if h.cfg.Notifier != nil {
+		h.cfg.Notifier.Notify(e)
+	}
 }
 
 // recordAttempt 记录一次尝试的用量（唯一汇聚点：流式/非流式、成功/失败都走此，
@@ -1696,6 +1735,8 @@ func (h *Handler) applyLifecyclePolicy(uid string, kind upstream.ErrKind) {
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+		h.notifyAccount(uid, notify.EventSessionDead, "账号 session 失效（12153），已禁用，需重新登录",
+			map[string]any{"stage": "chat"})
 	case upstream.ErrNotFound:
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrServer:

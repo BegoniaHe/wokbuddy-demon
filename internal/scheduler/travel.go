@@ -75,6 +75,7 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
 		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
 		return
 	}
 	if buddy == nil {
@@ -84,6 +85,7 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 	ts, err := s.cfg.Upstream.TravelStatus(a)
 	if err != nil {
 		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
 		return
 	}
 	switch ts.State {
@@ -106,6 +108,7 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
 	}
 	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
 		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
 		return
 	}
 	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.Nickname), travelLocationID)
@@ -120,6 +123,7 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
 	if err != nil {
 		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
+		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
 		return
 	}
 	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.Nickname), ts.RecordID, reward)
@@ -144,6 +148,7 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 	}
 	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
 		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
 		return
 	}
 	err := s.cfg.Upstream.BuddyFirst(a)
@@ -155,6 +160,7 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) {
 		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.Nickname))
 	default:
 		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.Nickname), err)
+		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
 	}
 }
 
