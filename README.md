@@ -216,6 +216,14 @@ curl -s http://localhost:7863/healthz
 curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 ```
 
+### 错误与重试
+
+网关在限流/无可用账号等可恢复错误上返回标准 `Retry-After` 头（秒）：
+
+- `429`：取账号级软冷却或模型级冷却的最早到期时间；上游明示 `Retry-After` 时一并对齐。
+- `503`：仅在能确定模型级最早解封时间时携带。
+- 无法确定可靠时间时不携带该头，客户端应使用自身退避策略。错误 JSON body 与 `gateway_hint` 保持原格式不变。
+
 ### Prometheus 指标
 
 `GET /metrics` 按 Prometheus 文本格式（`text/plain; version=0.0.4`）导出核心指标，可直接配置为抓取目标：

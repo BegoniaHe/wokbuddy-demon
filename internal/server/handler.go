@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1373,9 +1375,85 @@ func (f *chatFlow) recordKeyUsage() {
 func (f *chatFlow) writeFinalError() {
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
+	if seconds := f.retryAfterSeconds(status); seconds > 0 {
+		f.out.Header("Retry-After", strconv.Itoa(seconds))
+	}
 	f.out.Error(status, code, msg, hint)
 	f.st.status = status
 	f.st.outcome = reqlog.OutcomeHTTPError
+}
+
+// retryAfterSeconds 计算 Retry-After 秒数：仅 429/503 且存在可确定的最早解封时间
+// 时返回 >0；无可靠时间返回 0（不编造）。
+func (f *chatFlow) retryAfterSeconds(status int) int {
+	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
+		return 0
+	}
+	until := f.earliestRecovery(time.Now())
+	if until.IsZero() {
+		return 0
+	}
+	seconds := int(math.Ceil(time.Until(until).Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
+}
+
+// earliestRecovery 汇总账号/模型级冷却与上游 Retry-After，返回最早的未来解封时刻。
+func (f *chatFlow) earliestRecovery(now time.Time) time.Time {
+	var ue *upstream.Error
+	if errors.As(f.lastErr, &ue) && ue.RetryAfter > 0 {
+		return now.Add(ue.RetryAfter)
+	}
+	acc := f.accountRecovery(now)
+	model := f.modelRecovery(now)
+	switch {
+	case acc.IsZero():
+		return model
+	case model.IsZero() || acc.Before(model):
+		return acc
+	default:
+		return model
+	}
+}
+
+// accountRecovery 最近尝试账号的账号级/模型级冷却截止（无观测/已过期 → 零值）。
+func (f *chatFlow) accountRecovery(now time.Time) time.Time {
+	if f.h.cfg.Pool == nil || f.st == nil || f.st.uid == "" {
+		return time.Time{}
+	}
+	st, ok := f.h.cfg.Pool.Status(f.st.uid)
+	if !ok {
+		return time.Time{}
+	}
+	until := futureOrZero(st.Until, now)
+	for _, m := range st.RateLimitedModels {
+		if t := futureOrZero(m.Until, now); !t.IsZero() && (until.IsZero() || t.Before(until)) {
+			until = t
+		}
+	}
+	return until
+}
+
+// modelRecovery 模型级全池冷却截止（未触发 → 零值）。
+func (f *chatFlow) modelRecovery(now time.Time) time.Time {
+	if f.h.cfg.Pool == nil {
+		return time.Time{}
+	}
+	mb := f.h.cfg.Pool.ModelBlocked(f.bareModel)
+	if !mb.Blocked {
+		return time.Time{}
+	}
+	return futureOrZero(mb.Until, now)
+}
+
+// futureOrZero 仅保留晚于 now 的时刻。
+func futureOrZero(t, now time.Time) time.Time {
+	if t.After(now) {
+		return t
+	}
+	return time.Time{}
 }
 
 // finalErrorEnvelope 由 lastErr 推导末端错误透传的状态码 / code / message / hint。
