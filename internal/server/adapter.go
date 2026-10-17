@@ -2,6 +2,8 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -17,12 +19,17 @@ import (
 // xxxResponder 适配器，核心逻辑（chatFlow 及其下游）无需改动。
 
 // newChatInput 读取并解码入站请求，返回传输无关输入与输出端口。返回 false
-// 表示请求体读取失败、已写出 400（核心不启动）。
-func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration) (chatInput, chatResponder, bool) {
-	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入。读错误只可能
-	// 来自客户端自己断流，就地 400，不把半截 JSON 喂上游 unmarshal（#41 防御语义）。
+// 表示请求体读取失败、已写出错误响应（核心不启动）。
+func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration, maxBodyBytes int64) (chatInput, chatResponder, bool) {
+	// 解析前先套上网关侧上限（server.max_body_bytes，0 = 不限制）：Content-Length
+	// 与 chunked 都由 MaxBytesReader 约束，超限不进入选号与上游请求。
+	limitRequestBody(w, r, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large", bodyTooLargeMessage(maxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			return chatInput{}, nil, false
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return chatInput{}, nil, false
 	}
@@ -44,6 +51,24 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 		keyUsage:  keyUsageFrom(r.Context()),
 	}
 	return in, &httpResponder{w: w, keepalive: keepalive}, true
+}
+
+// limitRequestBody 用 http.MaxBytesReader 包住请求体；limit<=0 表示不限制。
+func limitRequestBody(w http.ResponseWriter, r *http.Request, limit int64) {
+	if limit > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+	}
+}
+
+// isBodyTooLarge 判断读取错误是否来自 MaxBytesReader 的上限。
+func isBodyTooLarge(err error) bool {
+	var mbe *http.MaxBytesError
+	return errors.As(err, &mbe)
+}
+
+// bodyTooLargeMessage 生成不泄露内部细节的超限提示。
+func bodyTooLargeMessage(limit int64) string {
+	return fmt.Sprintf("request body exceeds server.max_body_bytes (%d bytes)", limit)
 }
 
 // httpResponder 把核心的结构化结果编码为 OpenAI 兼容 HTTP 响应。它是 chat 路径

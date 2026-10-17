@@ -71,6 +71,10 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		// （慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// MaxBodyBytes 聊天类入站请求体上限（字节，issue #86），覆盖
+		// /v1/chat/completions、/v1/messages 与 count_tokens。超限在解析前返回
+		// 413，不进入选号。缺省 16 MiB；0 = 不限制。改动需重启进程。
+		MaxBodyBytes int64 `json:"max_body_bytes"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -310,6 +314,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Server.MaxBodyBytes = 16 << 20
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
@@ -804,6 +809,9 @@ func (c *Config) validateBackoffOrder() error {
 func (c *Config) validateRanges() error {
 	if c.Pool.MaxInFlight < 0 {
 		return fmt.Errorf("pool.max_in_flight: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlight)
+	}
+	if c.Server.MaxBodyBytes < 0 {
+		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）", c.Server.MaxBodyBytes)
 	}
 	if c.SessionTTL < 0 {
 		return fmt.Errorf("session_sticky.ttl: 负时长 %q 无意义", c.SessionSticky.TTL)

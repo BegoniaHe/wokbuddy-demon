@@ -159,6 +159,11 @@ export function ConfigView() {
             {num('package_detail_limit', { min: 1, placeholder: '5' })}
             <FieldDescription>积分构成页按最早到期展示，其余未用完包聚合</FieldDescription>
           </Field>
+          <Field>
+            <FieldLabel>聊天请求体上限（字节）</FieldLabel>
+            {num('max_body_bytes', { min: 0, placeholder: '16777216' })}
+            <FieldDescription>覆盖 chat / messages / count_tokens；超限返回 413。0 = 不限制。改动需重启进程</FieldDescription>
+          </Field>
         </CardContent>
       </Card>
 

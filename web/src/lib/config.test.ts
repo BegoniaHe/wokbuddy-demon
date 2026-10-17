@@ -38,6 +38,7 @@ describe('collectConfig', () => {
   });
   it('number 字段转数值', () => {
     expect(collectConfig({ max_in_flight: '3' })).toEqual({ pool: { max_in_flight: 3 } });
+    expect(collectConfig({ max_body_bytes: '0' })).toEqual({ server: { max_body_bytes: 0 } });
   });
   it('checkbox 转布尔', () => {
     expect(collectConfig({ prefer_expiring: true })).toEqual({ pool: { prefer_expiring: true } });

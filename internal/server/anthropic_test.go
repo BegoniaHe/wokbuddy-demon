@@ -115,6 +115,23 @@ func TestAnthropicToOpenAITools(t *testing.T) {
 	}
 }
 
+// TestAnthropicRequestBodyLimit /v1/messages 与 count_tokens 同样受
+// server.max_body_bytes 约束（issue #86），超限返回 Anthropic 形态 413。
+func TestAnthropicRequestBodyLimit(t *testing.T) {
+	h := NewHandler(Config{MaxBodyBytes: 32})
+	body := strings.Repeat("a", 64)
+	for _, path := range []string{"/v1/messages", "/v1/messages/count_tokens"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("path=%s code=%d body=%s", path, rec.Code, rec.Body)
+		}
+		if !strings.Contains(rec.Body.String(), `"request_too_large"`) {
+			t.Errorf("path=%s missing request_too_large: %s", path, rec.Body)
+		}
+	}
+}
+
 // TestAnthropicNonStreamResponse 非流式文本 + usage 映射。
 func TestAnthropicNonStreamResponse(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
