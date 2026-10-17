@@ -3,9 +3,15 @@ import { useQueryClient } from '@tanstack/react-query';
 import { api, getKey, postJSON } from '@/lib/api';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/field';
-import { Tabs } from '@/components/ui/tabs';
-import { Modal, ModalBody, ModalFooter, ModalHeader, ModalTitle } from '@/components/ui/dialog';
+import { Input } from '@/components/ui/input';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+} from '@/components/ui/dialog';
 
 type Phase = 'pick' | 'load' | 'ready' | 'done' | 'err';
 type Tab = 'login' | 'import' | 'secure';
@@ -170,124 +176,120 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   };
 
   return (
-    <Modal open={open} onOpenChange={onOpenChange}>
-      <ModalHeader>
-        <div className="flex items-center gap-3">
-          <ModalTitle>添加账号</ModalTitle>
-          <Tabs
-            active={tab}
-            onSelect={(v) => setTab(v as Tab)}
-            items={[
-              { value: 'login', label: '浏览器登录' },
-              { value: 'import', label: '导入 JSON' },
-              { value: 'secure', label: '加密备份' },
-            ]}
-          />
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg" showCloseButton={false}>
+        <DialogHeader>
+          <div className="flex items-center gap-3">
+            <DialogTitle>添加账号</DialogTitle>
+            <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
+              <TabsList>
+                <TabsTrigger value="login">浏览器登录</TabsTrigger>
+                <TabsTrigger value="import">导入 JSON</TabsTrigger>
+                <TabsTrigger value="secure">加密备份</TabsTrigger>
+              </TabsList>
+            </Tabs>
+          </div>
+        </DialogHeader>
+        <div className="flex flex-col gap-3">
+          {tab === 'login' ? (
+            <>
+              {phase === 'pick' ? (
+                <>
+                  <div className="flex items-center gap-3.5">
+                    <span className="text-xs text-muted-foreground">版本：</span>
+                    <label className="inline-flex items-center gap-1.5 text-xs text-foreground">
+                      <input type="radio" name="addRealm" checked={realm === 'cn'} onChange={() => setRealm('cn')} /> 国内版（CN）
+                    </label>
+                    <label className="inline-flex items-center gap-1.5 text-xs text-foreground">
+                      <input type="radio" name="addRealm" checked={realm === 'global'} onChange={() => setRealm('global')} /> 国际版（Global）
+                    </label>
+                  </div>
+                  <p className="text-xs text-muted-foreground">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</p>
+                </>
+              ) : null}
+              {phase === 'load' ? <p className="text-sm text-muted-foreground">正在获取授权链接…</p> : null}
+              {phase === 'ready' ? (
+                <>
+                  <p className="text-sm text-muted-foreground">在浏览器打开以下链接并登录：</p>
+                  <div className="select-all break-all rounded-lg border border-border bg-secondary px-3 py-2.5 font-mono text-xs text-accent-foreground">{url}</div>
+                  <p className="text-sm text-muted-foreground">等待授权完成，自动检测中…</p>
+                </>
+              ) : null}
+              {phase === 'done' ? <p className="text-sm text-success">{doneMsg}</p> : null}
+              {phase === 'err' ? <p className="text-sm text-destructive">{errMsg}</p> : null}
+            </>
+          ) : tab === 'import' ? (
+            <>
+              <p className="text-2xs text-muted-foreground">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</p>
+              <Input
+                type="file"
+                accept=".json"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void onImport(f);
+                  e.target.value = '';
+                }}
+              />
+              {importMsg ? <p className="text-sm text-success">{importMsg}</p> : null}
+              {importErr ? <p className="text-sm text-destructive">{importErr}</p> : null}
+            </>
+          ) : (
+            <>
+              <p className="text-2xs text-muted-foreground">
+                AES-256-GCM 加密的账号备份（含登录态 token）。设置密码后导出为加密文件；导入需同一密码。密码不会写入文件，也无法找回。
+              </p>
+              <Input
+                type="password"
+                placeholder="备份密码（至少 8 位）"
+                value={secPass}
+                onChange={(e) => setSecPass(e.target.value)}
+              />
+              <div className="flex items-center gap-2">
+                <Button variant="default" onClick={() => void onSecureExport()}>
+                  导出加密备份
+                </Button>
+                <span className="text-2xs text-muted-foreground">或选择备份文件导入：</span>
+              </div>
+              <Input
+                type="file"
+                accept=".json"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void onSecureImport(f);
+                  e.target.value = '';
+                }}
+              />
+              {secMsg ? <p className="text-sm text-success">{secMsg}</p> : null}
+              {secErr ? <p className="text-sm text-destructive">{secErr}</p> : null}
+            </>
+          )}
         </div>
-      </ModalHeader>
-      <ModalBody>
-        {tab === 'login' ? (
-          <>
-            {phase === 'pick' ? (
-              <>
-                <div className="flex items-center gap-3.5 py-1 pb-2.5">
-                  <span className="text-xs text-ink-3">版本：</span>
-                  <label className="inline-flex items-center gap-1.5 text-xs text-ink-2">
-                    <input type="radio" name="addRealm" className="accent-accent" checked={realm === 'cn'} onChange={() => setRealm('cn')} /> 国内版（CN）
-                  </label>
-                  <label className="inline-flex items-center gap-1.5 text-xs text-ink-2">
-                    <input type="radio" name="addRealm" className="accent-accent" checked={realm === 'global'} onChange={() => setRealm('global')} /> 国际版（Global）
-                  </label>
-                </div>
-                <div className="text-xs text-ink-3">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
-              </>
-            ) : null}
-            {phase === 'load' ? <div className="text-sm text-ink-2">正在获取授权链接…</div> : null}
-            {phase === 'ready' ? (
-              <>
-                <div className="text-sm text-ink-2">在浏览器打开以下链接并登录：</div>
-                <div className="my-2 mb-3 select-all break-all rounded-inner border border-line bg-surface-2 px-3 py-2.5 font-mono text-xs text-accent">{url}</div>
-                <div className="text-sm text-ink-2">等待授权完成，自动检测中…</div>
-              </>
-            ) : null}
-            {phase === 'done' ? <div className="text-sm text-ok">{doneMsg}</div> : null}
-            {phase === 'err' ? <div className="text-sm text-bad">{errMsg}</div> : null}
-          </>
-        ) : tab === 'import' ? (
-          <>
-            <div className="mb-2 text-2xs text-ink-3">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
-            <Input
-              type="file"
-              accept=".json"
-              className="mb-2 py-1.5"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void onImport(f);
-                e.target.value = '';
-              }}
-            />
-            {importMsg ? <div className="text-sm text-ok">{importMsg}</div> : null}
-            {importErr ? <div className="text-sm text-bad">{importErr}</div> : null}
-          </>
-        ) : (
-          <>
-            <div className="mb-2 text-2xs text-ink-3">
-              AES-256-GCM 加密的账号备份（含登录态 token）。设置密码后导出为加密文件；导入需同一密码。密码不会写入文件，也无法找回。
-            </div>
-            <Input
-              type="password"
-              placeholder="备份密码（至少 8 位）"
-              value={secPass}
-              onChange={(e) => setSecPass(e.target.value)}
-              className="mb-2"
-            />
-            <div className="mb-2 flex items-center gap-2">
-              <Button variant="primary" onClick={() => void onSecureExport()}>
-                导出加密备份
+        <DialogFooter>
+          {tab === 'login' && phase === 'pick' ? (
+            <Button variant="default" onClick={() => void startLogin()}>
+              获取授权链接
+            </Button>
+          ) : null}
+          {tab === 'login' && phase === 'ready' ? (
+            <>
+              <Button
+                onClick={() =>
+                  void navigator.clipboard.writeText(url).then(
+                    () => toast('链接已复制', 'ok'),
+                    () => toast('复制失败，请手动选择复制', 'err'),
+                  )
+                }
+              >
+                复制链接
               </Button>
-              <span className="text-2xs text-ink-3">或选择备份文件导入：</span>
-            </div>
-            <Input
-              type="file"
-              accept=".json"
-              className="mb-2 py-1.5"
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void onSecureImport(f);
-                e.target.value = '';
-              }}
-            />
-            {secMsg ? <div className="text-sm text-ok">{secMsg}</div> : null}
-            {secErr ? <div className="text-sm text-bad">{secErr}</div> : null}
-          </>
-        )}
-      </ModalBody>
-      <ModalFooter>
-        <span className="flex-1" />
-        {tab === 'login' && phase === 'pick' ? (
-          <Button variant="primary" onClick={() => void startLogin()}>
-            获取授权链接
-          </Button>
-        ) : null}
-        {tab === 'login' && phase === 'ready' ? (
-          <>
-            <Button
-              onClick={() =>
-                void navigator.clipboard.writeText(url).then(
-                  () => toast('链接已复制', 'ok'),
-                  () => toast('复制失败，请手动选择复制', 'err'),
-                )
-              }
-            >
-              复制链接
-            </Button>
-            <Button variant="primary" onClick={() => window.open(url, '_blank')}>
-              在浏览器打开
-            </Button>
-          </>
-        ) : null}
-        <Button onClick={() => onOpenChange(false)}>关闭</Button>
-      </ModalFooter>
-    </Modal>
+              <Button variant="default" onClick={() => window.open(url, '_blank')}>
+                在浏览器打开
+              </Button>
+            </>
+          ) : null}
+          <Button onClick={() => onOpenChange(false)}>关闭</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

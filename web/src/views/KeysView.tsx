@@ -1,14 +1,42 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { MoreHorizontal } from 'lucide-react';
 import { api, postJSON } from '@/lib/api';
 import { ago, fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
 import type { ApiKey } from '@/lib/types';
 import { Button } from '@/components/ui/button';
-import { Field, Input } from '@/components/ui/field';
-import { Box, BoxBody, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
-import { Empty, Num, Table, TableWrap, Td, Th } from '@/components/ui/table';
-import { Modal, ModalBody, ModalFooter, ModalHeader, ModalHint, ModalTitle } from '@/components/ui/dialog';
+import { Field, FieldLabel, FieldDescription } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  Card,
+  CardContent,
+  CardAction,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
 
 // KeysView：命名 API 密钥管理。命名密钥只用于网关 /v1/*（chat/models）；
 // 面板与 /status、/metrics 仍只认 config.json 的默认 api_key。
@@ -67,106 +95,111 @@ export function KeysView() {
 
   return (
     <>
-      <Box>
-        <BoxHeader>
-          <BoxTitle>命名密钥</BoxTitle>
-          <Grow />
-          <BoxNote>仅用于 /v1/*（chat / models）；面板与 /status、/metrics 仍只认默认 api_key</BoxNote>
-          <Button variant="primary" size="xs" onClick={openCreate}>
-            创建密钥
-          </Button>
-        </BoxHeader>
-        <BoxBody className="p-0">
-          {keysQ.isLoading ? (
-            <Empty>加载中…</Empty>
-          ) : keysQ.error ? (
-            <Empty>读取失败：{(keysQ.error as Error).message}</Empty>
-          ) : list.length === 0 ? (
-            <Empty>暂无命名密钥。创建后即可分发给不同客户端，并在此查看各自的请求与 token 用量。</Empty>
-          ) : (
-            <TableWrap>
-              <Table>
-                <thead>
-                  <tr>
-                    <Th>名称</Th>
-                    <Th>前缀</Th>
-                    <Th className="text-right">请求数</Th>
-                    <Th className="text-right">Token</Th>
-                    <Th>创建</Th>
-                    <Th>最近使用</Th>
-                    <Th>状态</Th>
-                    <Th className="text-right">操作</Th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {list.map((k) => (
-                    <tr key={k.id}>
-                      <Td>{k.name}</Td>
-                      <Td className="font-mono text-ink-3">{k.prefix}…</Td>
-                      <Td className="text-right">
-                        <Num>{k.requests ?? 0}</Num>
-                      </Td>
-                      <Td className="text-right">
-                        <Num>{fmtTok(k.total_tokens ?? 0)}</Num>
-                      </Td>
-                      <Td className="text-ink-3">{ago(k.created_at)}</Td>
-                      <Td className="text-ink-3">{k.last_used_at ? ago(k.last_used_at) : '—'}</Td>
-                      <Td>
-                        {k.revoked ? (
-                          <span className="text-bad">已撤销</span>
-                        ) : (
-                          <span className="text-ok">有效</span>
-                        )}
-                      </Td>
-                      <Td className="text-right">
-                        {k.revoked ? null : (
-                          <Button
-                            size="xs"
-                            disabled={revokeM.isPending}
-                            onClick={() => revokeM.mutate(k.id)}
-                          >
-                            撤销
-                          </Button>
-                        )}
+      <Card>
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>命名密钥</CardTitle>
+          <CardAction>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-xs text-muted-foreground">仅用于 /v1/*（chat / models）；面板与 /status、/metrics 仍只认默认 api_key</span>
+              <Button onClick={openCreate}>创建密钥</Button>
+            </div>
+          </CardAction>
+        </CardHeader>
+        {keysQ.isLoading ? (
+          <CardContent className="py-10 text-center text-muted-foreground">加载中…</CardContent>
+        ) : keysQ.error ? (
+          <CardContent className="py-10 text-center text-muted-foreground">读取失败：{(keysQ.error as Error).message}</CardContent>
+        ) : list.length === 0 ? (
+          <CardContent className="py-10 text-center text-muted-foreground">暂无命名密钥。创建后即可分发给不同客户端，并在此查看各自的请求与 token 用量。</CardContent>
+        ) : (
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>名称</TableHead>
+                  <TableHead>前缀</TableHead>
+                  <TableHead className="text-right">请求数</TableHead>
+                  <TableHead className="text-right">Token</TableHead>
+                  <TableHead>创建</TableHead>
+                  <TableHead>最近使用</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {list.map((k) => (
+                  <TableRow key={k.id}>
+                    <TableCell>{k.name}</TableCell>
+                    <TableCell className="font-mono text-muted-foreground">{k.prefix}…</TableCell>
+                    <TableCell className="text-right">
+                      <span className="font-mono tabular-nums">{k.requests ?? 0}</span>
+                    </TableCell>
+                    <TableCell className="text-right">
+                      <span className="font-mono tabular-nums">{fmtTok(k.total_tokens ?? 0)}</span>
+                    </TableCell>
+                    <TableCell className="text-muted-foreground">{ago(k.created_at)}</TableCell>
+                    <TableCell className="text-muted-foreground">{k.last_used_at ? ago(k.last_used_at) : '—'}</TableCell>
+                    <TableCell>
+                      {k.revoked ? <span className="text-destructive">已撤销</span> : <span className="text-success">有效</span>}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {k.revoked ? null : (
                         <Button
                           size="xs"
-                          variant="danger"
-                          className="ml-1.5"
-                          disabled={deleteM.isPending}
-                          onClick={() => {
-                            if (!confirm('删除密钥「' + k.name + '」将同时清除其用量记录，且不可恢复。确认删除？')) return;
-                            deleteM.mutate(k.id);
-                          }}
+                          variant="ghost"
+                          disabled={revokeM.isPending}
+                          onClick={() => revokeM.mutate(k.id)}
                         >
-                          删除
+                          撤销
                         </Button>
-                      </Td>
-                    </tr>
-                  ))}
-                </tbody>
-              </Table>
-            </TableWrap>
-          )}
-        </BoxBody>
-      </Box>
+                      )}
+                      <DropdownMenu>
+                        <DropdownMenuTrigger
+                          render={
+                            <Button size="xs" variant="ghost" title="更多操作">
+                              <MoreHorizontal />
+                            </Button>
+                          }
+                        />
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem variant="destructive"
+                            disabled={deleteM.isPending}
+                            onClick={() => {
+                              if (!confirm('删除密钥「' + k.name + '」将同时清除其用量记录，且不可恢复。确认删除？')) return;
+                              deleteM.mutate(k.id);
+                            }}
+                          >
+                            删除
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </Card>
 
-      <Modal open={createOpen} onOpenChange={setCreateOpen} width={480}>
-        <ModalHeader>
-          <ModalTitle>创建命名密钥</ModalTitle>
-          <ModalHint>密钥明文仅创建时显示一次，请立即复制保存。</ModalHint>
-        </ModalHeader>
-        <ModalBody>
+      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+        <DialogContent className="sm:max-w-md" showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>创建命名密钥</DialogTitle>
+            <DialogDescription>密钥明文仅创建时显示一次，请立即复制保存。</DialogDescription>
+          </DialogHeader>
           {rawKey ? (
             <>
-              <Field label="密钥（仅此一次显示）">
+              <Field>
+                <FieldLabel>密钥（仅此一次显示）</FieldLabel>
                 <Input readOnly value={rawKey} className="font-mono" onFocus={(e) => e.target.select()} />
               </Field>
-              <div className="text-2xs text-warn">关闭后无法再次查看。如丢失，请撤销后重新创建。</div>
+              <p className="text-2xs text-warning">关闭后无法再次查看。如丢失，请撤销后重新创建。</p>
             </>
           ) : (
-            <Field label="名称" hint="用于区分客户端，例如「笔记本」「手机」。">
+            <Field>
+              <FieldLabel>名称</FieldLabel>
               <Input
-                autoFocus
                 placeholder="客户端名称"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
@@ -174,28 +207,28 @@ export function KeysView() {
                   if (e.key === 'Enter') createM.mutate(name);
                 }}
               />
+              <FieldDescription>用于区分客户端，例如「笔记本」「手机」。</FieldDescription>
             </Field>
           )}
-        </ModalBody>
-        <ModalFooter>
-          <span className="flex-1" />
-          {rawKey ? (
-            <>
-              <Button onClick={() => copyKey(rawKey)}>复制密钥</Button>
-              <Button variant="primary" onClick={() => setCreateOpen(false)}>
-                完成
-              </Button>
-            </>
-          ) : (
-            <>
-              <Button onClick={() => setCreateOpen(false)}>取消</Button>
-              <Button variant="primary" disabled={createM.isPending} onClick={() => createM.mutate(name)}>
-                {createM.isPending ? '创建中…' : '创建'}
-              </Button>
-            </>
-          )}
-        </ModalFooter>
-      </Modal>
+          <DialogFooter>
+            {rawKey ? (
+              <>
+                <Button onClick={() => copyKey(rawKey)}>复制密钥</Button>
+                <Button variant="default" onClick={() => setCreateOpen(false)}>
+                  完成
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button onClick={() => setCreateOpen(false)}>取消</Button>
+                <Button variant="default" disabled={createM.isPending} onClick={() => createM.mutate(name)}>
+                  {createM.isPending ? '创建中…' : '创建'}
+                </Button>
+              </>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </>
   );
 }

@@ -14,11 +14,31 @@ import {
 } from '@/lib/reqlog';
 import { defaultTimeRangeState, trangeQuery, type TimeRangeState } from '@/lib/timeRange';
 import { Button } from '@/components/ui/button';
-import { Input, Select, Tag } from '@/components/ui/field';
-import { Box, BoxHeader, BoxHint, BoxNote, BoxTitle, Grow, Toolbar } from '@/components/ui/box';
-import { Empty, Num, Table, TableWrap, Td, Th } from '@/components/ui/table';
-import { Tabs } from '@/components/ui/tabs';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Card,
+  CardAction,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tag } from '@/components/ui-kit';
 import { TimeRange } from '@/components/TimeRange';
+import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 
 interface LogEntry {
@@ -123,119 +143,122 @@ export function LogsView() {
 
   return (
     <>
-      <Box>
-        <BoxHeader>
-          <BoxTitle>
-            请求记录 <BoxHint>调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</BoxHint>
-          </BoxTitle>
-          <Grow />
-          <BoxNote className="flex-[1_1_320px] text-left">{reqSummary}</BoxNote>
-          <BoxNote className="flex-[0_1_260px] text-right">{reqNote}</BoxNote>
-        </BoxHeader>
-        <Toolbar>
+      <Card className="mb-5">
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle className="flex items-baseline">
+            请求记录
+            <span className="ml-1.5 text-2xs font-normal text-muted-foreground">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span>
+          </CardTitle>
+          <CardAction>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-xs text-muted-foreground">{reqSummary}</span>
+              <span className="text-xs text-muted-foreground">{reqNote}</span>
+            </div>
+          </CardAction>
+        </CardHeader>
+        <div className="flex flex-wrap items-center gap-2 border-y border-border/60 bg-secondary px-4 py-2.5">
           <Input
             type="search"
-            size="sm"
+            h-7 text-xs
             className="min-w-[200px] flex-[0_1_280px]"
             placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID"
             aria-label="搜索请求记录"
             value={q}
             onChange={(e) => setQ(e.target.value)}
           />
-          <Select
-            size="sm"
-            aria-label="按结果筛选"
-            value={outcome}
-            onChange={(e) => setOutcome(e.target.value)}
-          >
-            <option value="">全部结果</option>
-            <option value="success">成功</option>
-            <option value="http_error">HTTP 错误</option>
-            <option value="stream_error">流错误</option>
-            <option value="interrupted">中断</option>
+          <Select value={outcome || '__all__'} onValueChange={(v) => setOutcome(v === '__all__' ? '' : (v ?? ''))}>
+            <SelectTrigger size="sm" className="w-28" aria-label="按结果筛选">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">全部结果</SelectItem>
+              <SelectItem value="success">成功</SelectItem>
+              <SelectItem value="http_error">HTTP 错误</SelectItem>
+              <SelectItem value="stream_error">流错误</SelectItem>
+              <SelectItem value="interrupted">中断</SelectItem>
+            </SelectContent>
           </Select>
           <TimeRange value={range} onChange={setRange} />
-          <Select
-            size="sm"
-            aria-label="读取条数"
-            value={limit}
-            onChange={(e) => setLimit(e.target.value)}
-          >
-            <option value="100">最近 100 条</option>
-            <option value="300">最近 300 条</option>
-            <option value="1000">最近 1000 条</option>
+          <Select value={limit} onValueChange={(v) => v && setLimit(v)}>
+            <SelectTrigger size="sm" className="w-28" aria-label="读取条数">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="100">最近 100 条</SelectItem>
+              <SelectItem value="300">最近 300 条</SelectItem>
+              <SelectItem value="1000">最近 1000 条</SelectItem>
+            </SelectContent>
           </Select>
-          <Grow />
-          <BoxNote className={cn((filtered.length !== entries.length || !hasSource) && 'text-warn')}>
+          <span className="flex-1" />
+          <span className={cn('text-xs text-muted-foreground', (filtered.length !== entries.length || !hasSource) && 'text-warning')}>
             {!entries.length
               ? ''
               : (filtered.length !== entries.length
                   ? '命中 ' + filtered.length + ' / ' + entries.length + ' 条'
                   : entries.length + ' 条') + (hasSource ? '' : ' · 来源未记录')}
-          </BoxNote>
+          </span>
           <Button size="xs" disabled={reqQ.isFetching} onClick={() => void reqQ.refetch()}>
             重新读取
           </Button>
-        </Toolbar>
-        <TableWrap className="max-h-[460px] overflow-auto">
+        </div>
+        <div className="max-h-[460px] overflow-auto">
           <Table className="min-w-[1080px]">
-            <thead className="sticky top-0 z-[1] bg-surface">
-              <tr>
-                <Th>时间</Th>
-                <Th>结果</Th>
-                <Th>模型</Th>
-                <Th>账号</Th>
-                <Th>来源 IP</Th>
-                <Th>User-Agent</Th>
-                <Th className="text-right">耗时</Th>
-                <Th className="text-right">Token</Th>
-                <Th className="text-right">积分</Th>
-                <Th>请求 ID</Th>
-              </tr>
-            </thead>
-            <tbody>
+            <TableHeader className="sticky top-0 z-[1] bg-card">
+              <TableRow>
+                <TableHead>时间</TableHead>
+                <TableHead>结果</TableHead>
+                <TableHead>模型</TableHead>
+                <TableHead>账号</TableHead>
+                <TableHead>来源 IP</TableHead>
+                <TableHead>User-Agent</TableHead>
+                <TableHead className="text-right">耗时</TableHead>
+                <TableHead className="text-right">Token</TableHead>
+                <TableHead className="text-right">积分</TableHead>
+                <TableHead>请求 ID</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {filtered.length === 0 ? (
-                <tr>
-                  <Td colSpan={10}>
-                    <Empty>{entries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录'}</Empty>
-                  </Td>
-                </tr>
+                <TableRow>
+                  <TableCell colSpan={10} className="py-10 text-center text-muted-foreground">{entries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录'}</TableCell>
+                </TableRow>
               ) : (
                 filtered.map((e, i) => <RequestRow key={e.request_id || i} e={e} />)
               )}
-            </tbody>
+            </TableBody>
           </Table>
-        </TableWrap>
-      </Box>
+        </div>
+      </Card>
 
-      <Box>
-        <BoxHeader>
-          <BoxTitle>运行日志</BoxTitle>
-          <Grow />
-          <Tabs
-            active={ch}
-            onSelect={setCh}
-            items={[
-              { value: 'all', label: '全部' },
-              { value: 'task', label: CH_LABEL.task },
-              { value: 'chat', label: CH_LABEL.chat },
-              { value: 'sys', label: CH_LABEL.sys },
-            ]}
-          />
-          <BoxNote>{logNote}</BoxNote>
-          <Button size="xs" onClick={() => setPin((p) => !p)}>
-            自动滚动：{pin ? '开' : '关'}
-          </Button>
-        </BoxHeader>
+      <Card className="mt-5">
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>运行日志</CardTitle>
+          <Tabs value={ch} onValueChange={(v) => setCh(v ?? 'all')}>
+            <TabsList>
+              <TabsTrigger value="all">全部</TabsTrigger>
+              <TabsTrigger value="task">{CH_LABEL.task}</TabsTrigger>
+              <TabsTrigger value="chat">{CH_LABEL.chat}</TabsTrigger>
+              <TabsTrigger value="sys">{CH_LABEL.sys}</TabsTrigger>
+            </TabsList>
+          </Tabs>
+          <CardAction>
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-xs text-muted-foreground">{logNote}</span>
+              <Button size="xs" onClick={() => setPin((p) => !p)}>
+                自动滚动：{pin ? '开' : '关'}
+              </Button>
+            </div>
+          </CardAction>
+        </CardHeader>
         <pre
           ref={logBoxRef}
-          className="m-0 max-h-[420px] overflow-auto whitespace-pre-wrap break-all px-4 py-3.5 font-mono text-xs leading-[1.75] text-ink-2"
+          className="m-0 max-h-[420px] overflow-auto whitespace-pre-wrap break-all px-4 py-3.5 font-mono text-xs leading-[1.75] text-muted-foreground"
         >
           {logEntries.length === 0 ? (
-            <span className="text-ink-3">暂无日志</span>
+            <span className="text-muted-foreground/70">暂无日志</span>
           ) : (
             logEntries.map((e, i) => {
-              const lvl = /error|失败|错误/.test(e.text) ? 'text-bad' : /warn|冷却|熔断/.test(e.text) ? 'text-warn' : '';
+              const lvl = /error|失败|错误/.test(e.text) ? 'text-destructive' : /warn|冷却|熔断/.test(e.text) ? 'text-warning' : '';
               const t = e.ts ? fmtClockTime(e.ts) : '';
               return (
                 <span key={i} className={cn('block', lvl)}>
@@ -243,9 +266,9 @@ export function LogsView() {
                     <i
                       className={cn(
                         'mr-2 inline-block rounded px-1.5 py-0.5 align-[1px] text-3xs not-italic leading-none',
-                        e.ch === 'task' && 'bg-accent-soft text-accent',
-                        e.ch === 'chat' && 'bg-ok-soft text-ok',
-                        e.ch === 'sys' && 'bg-surface-2 text-ink-3',
+                        e.ch === 'task' && 'bg-accent-soft text-accent-foreground',
+                        e.ch === 'chat' && 'bg-success-soft text-success',
+                        e.ch === 'sys' && 'bg-secondary text-muted-foreground',
                       )}
                     >
                       {CH_LABEL[e.ch || ''] || e.ch}
@@ -257,7 +280,7 @@ export function LogsView() {
             })
           )}
         </pre>
-      </Box>
+      </Card>
     </>
   );
 }
@@ -265,36 +288,36 @@ export function LogsView() {
 function RequestRow({ e }: { e: RequestEntry }) {
   const when = fmtClockTime(e.time);
   const tone = reqOutcomeTone(e);
-  const muted = <span className="text-ink-3">—</span>;
+  const muted = <span className="text-muted-foreground">—</span>;
   return (
-    <tr title={requestLogText(e)}>
-      <Td>
-        <Num>{when}</Num>
-      </Td>
-      <Td>
+    <TableRow title={requestLogText(e)}>
+      <TableCell>
+        <span className="font-mono tabular-nums">{when}</span>
+      </TableCell>
+      <TableCell>
         <Tag tone={tone}>{String(e.status ?? '—') + ' ' + reqOutcomeLabel(e)}</Tag>
-      </Td>
-      <Td>{e.model || '—'}</Td>
-      <Td>{e.account || '—'}</Td>
-      <Td>{e.client_ip ? <Clip className="max-w-[150px] font-mono text-xs" text={e.client_ip} /> : muted}</Td>
-      <Td>{e.user_agent ? <Clip className="max-w-[300px]" text={e.user_agent} /> : muted}</Td>
-      <Td className="text-right">
-        <Num>{fmtMs(e.duration_ms)}</Num>
-      </Td>
-      <Td className="text-right">
-        <Num>{reqTokenCell(e)}</Num>
-      </Td>
-      <Td className="text-right">
-        <Num>{reqCreditCell(e)}</Num>
-      </Td>
-      <Td>{e.request_id ? <Clip className="max-w-[150px] font-mono text-2xs text-ink-3" text={e.request_id} /> : muted}</Td>
-    </tr>
+      </TableCell>
+      <TableCell>{e.model || '—'}</TableCell>
+      <TableCell>{e.account || '—'}</TableCell>
+      <TableCell>{e.client_ip ? <Clip className="max-w-[150px] font-mono text-xs" text={e.client_ip} /> : muted}</TableCell>
+      <TableCell>{e.user_agent ? <Clip className="max-w-[300px]" text={e.user_agent} /> : muted}</TableCell>
+      <TableCell className="text-right">
+        <span className="font-mono tabular-nums">{fmtMs(e.duration_ms)}</span>
+      </TableCell>
+      <TableCell className="text-right">
+        <span className="font-mono tabular-nums">{reqTokenCell(e)}</span>
+      </TableCell>
+      <TableCell className="text-right">
+        <span className="font-mono tabular-nums">{reqCreditCell(e)}</span>
+      </TableCell>
+      <TableCell>{e.request_id ? <Clip className="max-w-[150px] font-mono text-2xs text-muted-foreground" text={e.request_id} /> : muted}</TableCell>
+    </TableRow>
   );
 }
 
 function Clip({ text, className }: { text: string; className?: string }) {
   return (
-    <span className={cn('block overflow-hidden text-ellipsis whitespace-nowrap', className)} title={text}>
+    <span className={cn('block truncate', className)} title={text}>
       {text}
     </span>
   );

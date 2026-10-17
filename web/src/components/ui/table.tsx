@@ -1,83 +1,113 @@
-import type { CSSProperties, HTMLAttributes, ReactNode, ThHTMLAttributes, TdHTMLAttributes } from 'react';
-import { cn } from '@/lib/utils';
+import * as React from "react"
+import { cn } from "@/lib/utils"
 
-// 表格：与旧面板一致——横向可滚、行 hover 高亮、表头小号弱化。
-export function TableWrap({ children, className }: { children: ReactNode; className?: string }) {
-  return <div className={cn('overflow-x-auto', className)}>{children}</div>;
+function Table({ className, ...props }: React.ComponentProps<"table">) {
+  return (
+    <div
+      data-slot="table-container"
+      className="relative w-full overflow-x-auto"
+    >
+      <table
+        data-slot="table"
+        className={cn("w-full caption-bottom text-sm", className)}
+        {...props}
+      />
+    </div>
+  )
 }
 
-export function Table({ children, className }: { children: ReactNode; className?: string }) {
+function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
   return (
-    <table className={cn('w-full min-w-[640px] border-collapse text-sm', className)}>
-      {children}
-    </table>
-  );
+    <thead
+      data-slot="table-header"
+      className={cn("[&_tr]:border-b", className)}
+      {...props}
+    />
+  )
 }
 
-export function Th({ children, className, ...props }: ThHTMLAttributes<HTMLTableCellElement>) {
+function TableBody({ className, ...props }: React.ComponentProps<"tbody">) {
   return (
-    <th
+    <tbody
+      data-slot="table-body"
+      className={cn("[&_tr:last-child]:border-0", className)}
+      {...props}
+    />
+  )
+}
+
+function TableFooter({ className, ...props }: React.ComponentProps<"tfoot">) {
+  return (
+    <tfoot
+      data-slot="table-footer"
       className={cn(
-        'whitespace-nowrap border-b border-line px-2.5 py-2.5 text-left text-2xs font-medium text-ink-3',
-        className,
+        "border-t bg-muted/50 font-medium [&>tr]:last:border-b-0",
+        className
       )}
       {...props}
-    >
-      {children}
-    </th>
-  );
+    />
+  )
 }
 
-export function Td({ children, className, ...props }: TdHTMLAttributes<HTMLTableCellElement>) {
+function TableRow({ className, ...props }: React.ComponentProps<"tr">) {
+  return (
+    <tr
+      data-slot="table-row"
+      className={cn(
+        "border-b transition-colors hover:bg-muted/50 has-aria-expanded:bg-muted/50 data-[state=selected]:bg-muted",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function TableHead({ className, ...props }: React.ComponentProps<"th">) {
+  return (
+    <th
+      data-slot="table-head"
+      className={cn(
+        "h-10 px-2 text-left align-middle font-medium whitespace-nowrap text-foreground [&:has([role=checkbox])]:pr-0",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function TableCell({ className, ...props }: React.ComponentProps<"td">) {
   return (
     <td
-      className={cn('border-b border-line-soft px-2.5 py-2.5 align-middle', className)}
+      data-slot="table-cell"
+      className={cn(
+        "p-2 align-middle whitespace-nowrap [&:has([role=checkbox])]:pr-0",
+        className
+      )}
       {...props}
-    >
-      {children}
-    </td>
-  );
+    />
+  )
 }
 
-// Empty：空态占位。
-export function Empty({ children }: { children: ReactNode }) {
-  return <div className="px-5 py-10 text-center text-ink-3">{children}</div>;
-}
-
-// Num：等宽数字单元格内容。
-export function Num({ children, className, ...props }: HTMLAttributes<HTMLSpanElement>) {
-  return (
-    <span className={cn('font-mono tabular-nums whitespace-nowrap', className)} {...props}>
-      {children}
-    </span>
-  );
-}
-
-const railTone = {
-  accent: 'bg-accent',
-  ok: 'bg-ok',
-  warn: 'bg-warn',
-  bad: 'bg-bad',
-  mute: 'bg-line',
-} as const;
-
-export type RailTone = keyof typeof railTone;
-
-// RailCell：行首 3px 状态色条单元格（账号 / 模型 / 包表统一使用）。
-export function RailCell({
-  tone,
-  style,
+function TableCaption({
   className,
-}: {
-  tone?: RailTone;
-  style?: CSSProperties;
-  className?: string;
-}) {
+  ...props
+}: React.ComponentProps<"caption">) {
   return (
-    <Td className="w-[3px] p-0">
-      {tone || style ? (
-        <i className={cn('block h-full min-h-[36px] w-[3px]', tone && railTone[tone], className)} style={style} />
-      ) : null}
-    </Td>
-  );
+    <caption
+      data-slot="table-caption"
+      className={cn("mt-4 text-sm text-muted-foreground", className)}
+      {...props}
+    />
+  )
+}
+
+export {
+  Table,
+  TableHeader,
+  TableBody,
+  TableFooter,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableCaption,
 }

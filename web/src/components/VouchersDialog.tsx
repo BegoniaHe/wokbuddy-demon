@@ -4,9 +4,15 @@ import { api } from '@/lib/api';
 import { qrMatrix, qrRects, QR_VIEW_SIZE } from '@/lib/qr';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Tag } from '@/components/ui/field';
-import { Modal, ModalBody, ModalFooter, ModalHeader, ModalHint, ModalTitle } from '@/components/ui/dialog';
-import { cn } from '@/lib/utils';
+import { Tag } from '@/components/ui-kit';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
 
 interface Voucher {
   prize_name?: string;
@@ -54,7 +60,7 @@ function QR({ text, px = 148 }: { text: string; px?: number }) {
       </svg>
     );
   } catch (e) {
-    return <span className="text-2xs text-ink-3">二维码生成失败：{(e as Error).message}</span>;
+    return <span className="text-2xs text-muted-foreground">二维码生成失败：{(e as Error).message}</span>;
   }
 }
 
@@ -82,86 +88,87 @@ export function VouchersDialog({ open, onOpenChange }: { open: boolean; onOpenCh
   };
 
   return (
-    <Modal open={open} onOpenChange={onOpenChange}>
-      <ModalHeader>
-        <ModalTitle>开学季 · 我的券码</ModalTitle>
-        <ModalHint>抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</ModalHint>
-      </ModalHeader>
-      <ModalBody>
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md" showCloseButton={false}>
+        <DialogHeader>
+          <DialogTitle>开学季 · 我的券码</DialogTitle>
+          <DialogDescription>抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应 app / 小程序兑换。</DialogDescription>
+        </DialogHeader>
         {isLoading ? (
-          <div className="text-sm text-ink-2">查询中…</div>
+          <p className="text-sm text-muted-foreground">查询中…</p>
         ) : error ? (
-          <div className="text-sm text-bad">{(error as Error).message}</div>
+          <p className="text-sm text-destructive">{(error as Error).message}</p>
         ) : shown.length === 0 ? (
-          <div className="py-6 text-center text-ink-3">
-            <div className="mb-1 text-sm">🎟️</div>还没有抽到券
-          </div>
+          <p className="py-6 text-center text-muted-foreground">
+            <span className="mr-1 text-sm">🎟️</span>还没有抽到券
+          </p>
         ) : (
-          shown.map((a) => (
-            <div key={a.uid}>
-              <div className="mx-0.5 mb-2 mt-4 flex items-baseline gap-1.5 text-xs text-ink-3 first:mt-1">
-                <span className="text-sm font-semibold text-ink-2">{a.nickname || a.uid}</span>
-                <span>{(a.vouchers || []).length} 张</span>
-              </div>
-              {(a.vouchers || []).map((v, i) => {
-                const expired = v.valid_to && new Date(v.valid_to) < new Date();
-                return (
-                  <div
-                    key={i}
-                    className={cn('mb-2.5 overflow-hidden rounded-surface border bg-surface', expired ? 'border-dashed border-line' : 'border-line hover:border-accent')}
-                  >
-                    <div className={cn('flex items-center gap-2 px-3.5 pt-3', expired && 'opacity-55')}>
-                      <span className="text-sm font-semibold">{v.prize_name || v.sku_code || '券'}</span>
-                      <span className="ml-auto">
-                        {expired ? <Tag tone="bad">已过期</Tag> : <Tag tone="ok">可使用</Tag>}
-                      </span>
-                    </div>
-                    <div className={cn('px-3.5 pb-2.5 text-2xs text-ink-3', expired && 'opacity-55')}>
-                      {v.valid_to ? '有效期至 ' + v.valid_to : '长期有效'}
-                      {v.granted_at ? ' · ' + v.granted_at.slice(0, 10) + ' 抽中' : ''}
-                    </div>
-                    <div className="mx-3 border-t border-dashed border-line" />
-                    <div className="flex items-center gap-3 px-3.5 py-2.5">
-                      <span className="flex-none text-2xs text-ink-3">券码</span>
-                      <code className="rounded-control border border-line-soft bg-surface-2 px-3 py-1.5 font-mono text-lg font-semibold tracking-widest">{v.code || '-'}</code>
-                      <span className="ml-auto flex flex-none gap-2">
-                        {v.code ? (
-                          <Button size="xs" variant="ghost" onClick={() => setQrCode((c) => (c === v.code ? null : v.code!))}>
-                            二维码
-                          </Button>
-                        ) : null}
-                        <Button size="xs" variant="ghost" onClick={() => void onCopy(v.code || '')}>
-                          复制
-                        </Button>
-                      </span>
-                    </div>
-                    {qrCode === v.code ? (
-                      <div className="flex justify-center border-t border-dashed border-line p-3.5">
-                        <QR text={v.code || ''} />
+          <div className="flex flex-col gap-2.5">
+            {shown.map((a) => (
+              <div key={a.uid}>
+                <div className="mb-2 flex items-baseline gap-1.5 text-xs text-muted-foreground">
+                  <span className="text-sm font-semibold text-foreground">{a.nickname || a.uid}</span>
+                  <span>{(a.vouchers || []).length} 张</span>
+                </div>
+                {(a.vouchers || []).map((v, i) => {
+                  const expired = v.valid_to && new Date(v.valid_to) < new Date();
+                  return (
+                    <div
+                      key={i}
+                      className={`mb-2.5 overflow-hidden rounded-lg border bg-card ${expired ? 'border-dashed border-border opacity-55' : 'border-border'}`}
+                    >
+                      <div className="flex items-center gap-2 px-3.5 pt-3">
+                        <span className="text-sm font-semibold">{v.prize_name || v.sku_code || '券'}</span>
+                        <span className="ml-auto">
+                          {expired ? <Tag tone="bad">已过期</Tag> : <Tag tone="ok">可使用</Tag>}
+                        </span>
                       </div>
-                    ) : null}
-                  </div>
-                );
-              })}
-            </div>
-          ))
+                      <div className="px-3.5 pb-2.5 text-2xs text-muted-foreground">
+                        {v.valid_to ? '有效期至 ' + v.valid_to : '长期有效'}
+                        {v.granted_at ? ' · ' + v.granted_at.slice(0, 10) + ' 抽中' : ''}
+                      </div>
+                      <div className="mx-3 border-t border-dashed border-border" />
+                      <div className="flex items-center gap-3 px-3.5 py-2.5">
+                        <span className="flex-none text-2xs text-muted-foreground">券码</span>
+                        <code className="rounded-md border border-border bg-secondary px-3 py-1.5 font-mono text-lg font-semibold tracking-widest">{v.code || '-'}</code>
+                        <span className="ml-auto flex flex-none gap-2">
+                          {v.code ? (
+                            <Button size="xs" variant="ghost" onClick={() => setQrCode((c) => (c === v.code ? null : v.code!))}>
+                              二维码
+                            </Button>
+                          ) : null}
+                          <Button size="xs" variant="ghost" onClick={() => void onCopy(v.code || '')}>
+                            复制
+                          </Button>
+                        </span>
+                      </div>
+                      {qrCode === v.code ? (
+                        <div className="flex justify-center border-t border-dashed border-border p-3.5">
+                          <QR text={v.code || ''} />
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ))}
+          </div>
         )}
         {errs.length ? (
-          <div className="mt-2 text-2xs text-warn">
+          <p className="text-2xs text-warning">
             查询失败：{errs.map((a) => (a.nickname || a.uid.slice(0, 8)) + '（' + a.error + '）').join('、')}
-          </div>
+          </p>
         ) : null}
-      </ModalBody>
-      <ModalFooter>
-        <span className="text-2xs text-ink-3">{total ? total + ' 张券 · ' + ok.filter((a) => !(a.vouchers || []).length).length + ' 个账号未抽中' : ''}</span>
-        <span className="flex-1" />
-        <Button size="xs" onClick={() => void refetch()}>
-          刷新
-        </Button>
-        <Button size="xs" variant="primary" onClick={() => onOpenChange(false)}>
-          关闭
-        </Button>
-      </ModalFooter>
-    </Modal>
+        <DialogFooter>
+          <span className="text-2xs text-muted-foreground">{total ? total + ' 张券 · ' + ok.filter((a) => !(a.vouchers || []).length).length + ' 个账号未抽中' : ''}</span>
+          <Button size="xs" onClick={() => void refetch()}>
+            刷新
+          </Button>
+          <Button size="xs" variant="default" onClick={() => onOpenChange(false)}>
+            关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

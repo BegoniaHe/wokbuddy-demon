@@ -3,9 +3,30 @@ import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { mdMatch, mdSortList, DEFAULT_MODEL_FILTER, type ModelEntry, type ModelFilter } from '@/lib/models';
 import { Button } from '@/components/ui/button';
-import { Input, Select, Tag } from '@/components/ui/field';
-import { Box, BoxHeader, BoxHint, BoxNote, BoxTitle, Grow, Toolbar } from '@/components/ui/box';
-import { Empty, Num, RailCell, Table, TableWrap, Td, Th } from '@/components/ui/table';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Card,
+  CardAction,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Tag } from '@/components/ui-kit';
+import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 
 interface Probe {
@@ -26,6 +47,28 @@ function probeDays(ts?: string): number | null {
   const t = new Date(String(ts).replace(' ', 'T'));
   const d = (Date.now() - t.getTime()) / 86400000;
   return isNaN(d) ? null : Math.floor(d);
+}
+
+// FilterSelect：工具栏筛选下拉。
+function FilterSelect({
+  value,
+  onChange,
+  children,
+  ariaLabel,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  children: React.ReactNode;
+  ariaLabel?: string;
+}) {
+  return (
+    <Select value={value || '__all__'} onValueChange={(v) => onChange(v === '__all__' ? '' : (v ?? ''))}>
+      <SelectTrigger size="sm" aria-label={ariaLabel}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>{children}</SelectContent>
+    </Select>
+  );
 }
 
 export function ModelsView() {
@@ -73,130 +116,104 @@ export function ModelsView() {
     : all.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
 
   return (
-    <Box>
-      <BoxHeader>
-        <BoxTitle>
-          模型能力{' '}
-          <BoxHint>
-            max_tokens bug已修复目前可以正常透传最大输出,但是官方返回的最大输出仅为参考，不保证完全正确
-          </BoxHint>
-        </BoxTitle>
-        <Grow />
-        <BoxNote>{note}</BoxNote>
-        <Button size="xs" disabled={isFetching} onClick={reload}>
-          重新获取
-        </Button>
-      </BoxHeader>
+    <Card>
+      <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardTitle className="flex items-baseline">
+          模型能力
+          <CardDescription className="ml-1.5">max_tokens bug 已修复目前可以正常透传最大输出，但是官方返回的最大输出仅为参考，不保证完全正确</CardDescription>
+        </CardTitle>
+        <CardAction>
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-xs text-muted-foreground">{note}</span>
+            <Button size="xs" disabled={isFetching} onClick={reload}>
+              重新获取
+            </Button>
+          </div>
+        </CardAction>
+      </CardHeader>
 
-      <Toolbar>
+      <div className="flex flex-wrap items-center gap-2 border-y border-border/60 bg-secondary px-4 py-2.5">
         <Input
           type="search"
-          size="sm"
+          h-7 text-xs
           className="min-w-[200px] flex-[0_1_280px]"
           placeholder="搜索模型 ID / 名称 / 描述 / 厂商"
           aria-label="搜索模型"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
-        <FilterSelect aria-label="按域筛选" value={filter.realm} onChange={(v) => setFilter((f) => ({ ...f, realm: v }))}>
-          <option value="">全部域</option>
-          <option value="cn">国内版 CN</option>
-          <option value="global">国际版 Global</option>
+        <FilterSelect ariaLabel="按域筛选" value={filter.realm} onChange={(v) => setFilter((f) => ({ ...f, realm: v }))}>
+          <SelectItem value="__all__">全部域</SelectItem>
+          <SelectItem value="cn">国内版 CN</SelectItem>
+          <SelectItem value="global">国际版 Global</SelectItem>
         </FilterSelect>
-        <FilterSelect aria-label="按能力筛选" value={filter.cap} onChange={(v) => setFilter((f) => ({ ...f, cap: v }))}>
-          <option value="">全部能力</option>
-          <option value="tool">支持工具调用</option>
-          <option value="vision">支持视觉</option>
-          <option value="reasoning">支持思考</option>
-          <option value="default">默认模型</option>
+        <FilterSelect ariaLabel="按能力筛选" value={filter.cap} onChange={(v) => setFilter((f) => ({ ...f, cap: v }))}>
+          <SelectItem value="__all__">全部能力</SelectItem>
+          <SelectItem value="tool">支持工具调用</SelectItem>
+          <SelectItem value="vision">支持视觉</SelectItem>
+          <SelectItem value="reasoning">支持思考</SelectItem>
+          <SelectItem value="default">默认模型</SelectItem>
         </FilterSelect>
-        <FilterSelect aria-label="按思考档位筛选" value={filter.effort} onChange={(v) => setFilter((f) => ({ ...f, effort: v }))}>
-          <option value="">全部档位</option>
-          <option value="off">可关闭思考</option>
-          <option value="low">low</option>
-          <option value="medium">medium</option>
-          <option value="high">high</option>
-          <option value="xhigh">xhigh</option>
-          <option value="max">max</option>
+        <FilterSelect ariaLabel="按思考档位筛选" value={filter.effort} onChange={(v) => setFilter((f) => ({ ...f, effort: v }))}>
+          <SelectItem value="__all__">全部档位</SelectItem>
+          <SelectItem value="off">可关闭思考</SelectItem>
+          <SelectItem value="low">low</SelectItem>
+          <SelectItem value="medium">medium</SelectItem>
+          <SelectItem value="high">high</SelectItem>
+          <SelectItem value="xhigh">xhigh</SelectItem>
+          <SelectItem value="max">max</SelectItem>
         </FilterSelect>
-        <FilterSelect aria-label="按价格筛选" value={filter.promo} onChange={(v) => setFilter((f) => ({ ...f, promo: v }))}>
-          <option value="">全部价格</option>
-          <option value="promo">有折扣 / 限时免费</option>
-          <option value="free">限时免费</option>
-          <option value="discount">打折（非免费）</option>
+        <FilterSelect ariaLabel="按价格筛选" value={filter.promo} onChange={(v) => setFilter((f) => ({ ...f, promo: v }))}>
+          <SelectItem value="__all__">全部价格</SelectItem>
+          <SelectItem value="promo">有折扣 / 限时免费</SelectItem>
+          <SelectItem value="free">限时免费</SelectItem>
+          <SelectItem value="discount">打折（非免费）</SelectItem>
         </FilterSelect>
-        <FilterSelect aria-label="排序方式" value={filter.sort} onChange={(v) => setFilter((f) => ({ ...f, sort: v }))}>
-          <option value="default">上游默认顺序</option>
-          <option value="rate">积分倍率 低 → 高</option>
-          <option value="context">上下文长度 大 → 小</option>
-          <option value="output">最大输出 大 → 小</option>
-          <option value="name">模型 ID A → Z</option>
+        <FilterSelect ariaLabel="排序方式" value={filter.sort} onChange={(v) => setFilter((f) => ({ ...f, sort: v }))}>
+          <SelectItem value="default">上游默认顺序</SelectItem>
+          <SelectItem value="rate">积分倍率 低 → 高</SelectItem>
+          <SelectItem value="context">上下文长度 大 → 小</SelectItem>
+          <SelectItem value="output">最大输出 大 → 小</SelectItem>
+          <SelectItem value="name">模型 ID A → Z</SelectItem>
         </FilterSelect>
-        <Grow />
-        <BoxNote className={cn(filtered && 'text-warn')}>
+        <span className="flex-1" />
+        <span className={cn('text-xs text-muted-foreground', filtered && 'text-warning')}>
           {!all.length ? '' : filtered ? '命中 ' + list.length + ' / ' + all.length + ' 个模型' : all.length + ' 个模型'}
-        </BoxNote>
+        </span>
         <Button size="xs" variant="ghost" title="清空全部筛选条件" onClick={() => { setQ(''); setFilter(DEFAULT_MODEL_FILTER); }}>
           重置
         </Button>
-      </Toolbar>
+      </div>
 
-      <TableWrap>
+      <div className="overflow-x-auto">
         <Table className="min-w-[700px]">
-          <thead>
-            <tr>
-              <Th className="w-[3px] p-0" aria-hidden />
-              <Th>模型</Th>
-              <Th>积分倍率</Th>
-              <Th>默认档</Th>
-              <Th>支持的思考档位</Th>
-              <Th>上下文长度</Th>
-              <Th>最大输出</Th>
-            </tr>
-          </thead>
-          <tbody>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[3px] p-0" aria-hidden />
+              <TableHead>模型</TableHead>
+              <TableHead>积分倍率</TableHead>
+              <TableHead>默认档</TableHead>
+              <TableHead>支持的思考档位</TableHead>
+              <TableHead>上下文长度</TableHead>
+              <TableHead>最大输出</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {error ? (
-              <tr>
-                <Td colSpan={7}>
-                  <Empty>{(error as Error).message}</Empty>
-                </Td>
-              </tr>
+              <TableRow>
+                <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">{(error as Error).message}</TableCell>
+              </TableRow>
             ) : list.length === 0 ? (
-              <tr>
-                <Td colSpan={7}>
-                  <Empty>{all.length ? '没有符合当前筛选条件的模型' : '正在向上游查询…'}</Empty>
-                </Td>
-              </tr>
+              <TableRow>
+                <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">{all.length ? '没有符合当前筛选条件的模型' : '正在向上游查询…'}</TableCell>
+              </TableRow>
             ) : (
               list.map((m) => <ModelRow key={m.id} m={m} pr={probeOf(m.id)} />)
             )}
-          </tbody>
+          </TableBody>
         </Table>
-      </TableWrap>
-    </Box>
-  );
-}
-
-function FilterSelect({
-  value,
-  onChange,
-  children,
-  ...rest
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  children: React.ReactNode;
-  'aria-label'?: string;
-}) {
-  return (
-    <Select
-      {...rest}
-      size="sm"
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-    >
-      {children}
-    </Select>
+      </div>
+    </Card>
   );
 }
 
@@ -207,7 +224,7 @@ function RateCell({ m }: { m: ModelEntry }) {
       <span title={tip} className="cursor-help">
         <b className="font-mono">{m.promo_credits}</b>
         {m.promo_label ? <Tag tone="ok" className="ml-1">{m.promo_label}</Tag> : null}
-        {m.credits ? <s className="ml-1 text-2xs text-ink-3">{m.credits}</s> : null}
+        {m.credits ? <s className="ml-1 text-2xs text-muted-foreground">{m.credits}</s> : null}
       </span>
     );
   }
@@ -222,7 +239,7 @@ function RateCell({ m }: { m: ModelEntry }) {
 }
 
 function OutCell({ m, pr }: { m: ModelEntry; pr?: Probe }) {
-  if (!pr) return <Num>{m.max_output_tokens ? fmtK(m.max_output_tokens) : '—'}</Num>;
+  if (!pr) return <span className="font-mono tabular-nums">{m.max_output_tokens ? fmtK(m.max_output_tokens) : '—'}</span>;
   const tip =
     '声称 ' +
     (pr.claimed ? fmtK(pr.claimed) : '?') +
@@ -237,32 +254,32 @@ function OutCell({ m, pr }: { m: ModelEntry; pr?: Probe }) {
       const x = pr.claimed / pr.measured;
       const xs = (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×';
       return (
-        <Num title={tip}>
-          <span className="font-semibold text-warn">{fmtK(pr.measured)} ⚠</span>
-          <div className="text-2xs text-ink-3">钳制 {xs}{stale}</div>
-        </Num>
+        <span className="font-mono tabular-nums" title={tip}>
+          <span className="font-semibold text-warning">{fmtK(pr.measured)} ⚠</span>
+          <div className="text-2xs text-muted-foreground">钳制 {xs}{stale}</div>
+        </span>
       );
     }
     return (
-      <Num title={tip}>
-        <span className="text-ok">
+      <span className="font-mono tabular-nums" title={tip}>
+        <span className="text-success">
           {fmtK(pr.measured)}
           {pr.claimed && pr.measured > pr.claimed ? ' ↑' : ' ✓'}
         </span>
-      </Num>
+      </span>
     );
   }
   if (pr.verdict === 'at_least' && pr.measured)
     return (
-      <Num title={tip}>
-        <span className="text-ink-3">≥{fmtK(pr.measured)}</span>
-      </Num>
+      <span className="font-mono tabular-nums" title={tip}>
+        <span className="text-muted-foreground">≥{fmtK(pr.measured)}</span>
+      </span>
     );
   return (
-    <Num title={tip}>
-      <span className="text-ink-3">?</span>
-      <div className="text-2xs text-ink-3">未测出{stale}</div>
-    </Num>
+    <span className="font-mono tabular-nums" title={tip}>
+      <span className="text-muted-foreground">?</span>
+      <div className="text-2xs text-muted-foreground">未测出{stale}</div>
+    </span>
   );
 }
 
@@ -278,7 +295,7 @@ function ModelRow({ m, pr }: { m: ModelEntry; pr?: Probe }) {
       ))}
     </span>
   ) : (
-    <span className="text-xs text-ink-3">
+    <span className="text-xs text-muted-foreground">
       {m.supports_reasoning ? '固定档 · 默认 ' + (m.default_effort || '?') : '不支持思考'}
     </span>
   );
@@ -288,24 +305,26 @@ function ModelRow({ m, pr }: { m: ModelEntry; pr?: Probe }) {
   if (m.supports_images) caps.push(<Tag key="v" tone="warn">视觉</Tag>);
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push(<Tag key="r" tone="warn">思考常开</Tag>);
   return (
-    <tr>
-      <RailCell tone="ok" />
-      <Td title={m.description}>
+    <TableRow>
+      <TableCell className="w-[3px] p-0">
+        <span className="block h-full min-h-[36px] w-[3px] bg-success" />
+      </TableCell>
+      <TableCell title={m.description}>
         <div className="font-medium">{m.id}</div>
-        <div className="font-mono text-2xs text-ink-3">{m.name || ''}</div>
+        <div className="font-mono text-2xs text-muted-foreground">{m.name || ''}</div>
         {caps.length ? <div className="mt-0.5 flex gap-1">{caps}</div> : null}
-      </Td>
-      <Td>
+      </TableCell>
+      <TableCell>
         <RateCell m={m} />
-      </Td>
-      <Td>{m.default_effort ? <Tag tone="ok">{m.default_effort}</Tag> : <span className="text-ink-3">—</span>}</Td>
-      <Td className="min-w-[150px]">{effs}</Td>
-      <Td>
-        <Num>{m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—'}</Num>
-      </Td>
-      <Td>
+      </TableCell>
+      <TableCell>{m.default_effort ? <Tag tone="ok">{m.default_effort}</Tag> : <span className="text-muted-foreground">—</span>}</TableCell>
+      <TableCell className="min-w-[150px]">{effs}</TableCell>
+      <TableCell>
+        <span className="font-mono tabular-nums">{m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—'}</span>
+      </TableCell>
+      <TableCell>
         <OutCell m={m} pr={pr} />
-      </Td>
-    </tr>
+      </TableCell>
+    </TableRow>
   );
 }
