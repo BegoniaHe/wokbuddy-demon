@@ -50,6 +50,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'prompt_mode', path: ['prompt', 'mode'], kind: 'select' },
   { name: 'prompt_file', path: ['prompt', 'file'], kind: 'text' },
   { name: 'sanitize_blacklist_fingerprints', path: ['features', 'sanitize_blacklist_fingerprints'], kind: 'checkbox' },
+  { name: 'multimodal_routing', path: ['features', 'multimodal_routing'], kind: 'checkbox' },
   { name: 'session_sticky_enabled', path: ['session_sticky', 'enabled'], kind: 'checkbox' },
   { name: 'request_client_info', path: ['logging', 'request_client_info'], kind: 'checkbox' },
 ];

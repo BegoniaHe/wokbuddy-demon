@@ -197,6 +197,10 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// MultimodalRouting 请求模态与模型能力不匹配时，在同 realm 目录内改选支持
+		// 该模态的模型并重写 model（默认 false = 明确 400 model_capability）。
+		// issue #109。
+		MultimodalRouting bool `json:"multimodal_routing"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -507,6 +511,9 @@ func applyEnvIdentity(c *Config) {
 func applyEnvFeatures(c *Config) {
 	if b, ok := envBool("WB2A_SANITIZE_FINGERPRINTS"); ok {
 		c.Features.SanitizeBlacklistFingerprints = b
+	}
+	if b, ok := envBool("WB2A_MULTIMODAL_ROUTING"); ok {
+		c.Features.MultimodalRouting = b
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v

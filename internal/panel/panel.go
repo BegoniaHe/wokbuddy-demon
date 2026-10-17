@@ -462,6 +462,10 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 	if mi.PromoNote != "" {
 		entry["promo_note"] = mi.PromoNote
 	}
+	if mods := mi.EffectiveInputModalities(); len(mods) > 0 {
+		// 输入模态（issue #109）：与 /v1/models 同口径，未知时省略（不宣称）。
+		entry["input_modalities"] = mods
+	}
 	if mi.MaxAllowedSize > 0 {
 		entry["max_allowed_size"] = mi.MaxAllowedSize
 	}

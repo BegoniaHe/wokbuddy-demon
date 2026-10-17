@@ -782,3 +782,14 @@ func fillLooseReasoning(mi *ModelInfo, obj map[string]any) {
 		}
 	}
 }
+
+// CachedGlobalModelInfos 返回 global 模型目录缓存里的全字段条目（**只读缓存，
+// 不触发上游探测**）。供聊天热路径的能力判定/按模态路由使用：缓存冷或探测失败
+// → nil，调用方跳过能力判定（宁缺勿滥，不为判定打上游）。
+func (c *Client) CachedGlobalModelInfos() []ModelInfo {
+	_, infos, hit := c.globalModelsCacheHit()
+	if !hit {
+		return nil
+	}
+	return infos
+}
