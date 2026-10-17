@@ -81,7 +81,8 @@
     "rotate_max": 3,
     "rotate_budget": "0",
     "rotate_status_codes": [],
-    "proxies": []
+    "proxies": [],
+    "proxy_slots": []
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,

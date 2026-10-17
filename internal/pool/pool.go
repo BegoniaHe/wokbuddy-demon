@@ -241,6 +241,29 @@ func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 	p.modelRateOf = fn
 }
 
+// ProxySlotOf 返回账号绑定的代理槽 ID（空 = 不绑定）。
+func (p *Pool) ProxySlotOf(uid string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.proxySlot
+	}
+	return ""
+}
+
+// SetProxySlot 绑定/解绑账号的出站代理槽（issue #96）；slot 为空 = 解绑。
+func (p *Pool) SetProxySlot(uid, slot string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.proxySlot = strings.TrimSpace(slot)
+	p.dirty.Store(true)
+	return true
+}
+
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。
 func (p *Pool) SetMaxInFlight(n int) {
 	p.mu.Lock()

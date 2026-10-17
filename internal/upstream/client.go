@@ -746,6 +746,13 @@ type Client struct {
 	timeoutMu      sync.Mutex
 	timeoutClients map[time.Duration]*http.Client
 
+	// AccountRoute 返回账号绑定的出站代理槽与拨号器（issue #96）；空 = 默认。
+	AccountRoute func(a *auth.Auth) (slot string, dial func(ctx context.Context, network, addr string) (net.Conn, error))
+	// slotMu/slotClients 按「槽 + header 超时」缓存独立 Transport，避免同一账号的
+	// 连接被其他出口复用；条目数受槽数 × 模型超时数约束。
+	slotMu      sync.Mutex
+	slotClients map[string]*http.Client
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。
@@ -1217,7 +1224,7 @@ func (c *Client) ChatStreamContext(
 		prepared = ensureConsoleSystem(prepared)
 	}
 	headerTimeout, idleTimeout := c.modelTimeout(a.Realm(), modelFromBody(prepared))
-	chatHTTP := c.chatHTTPForHeader(headerTimeout)
+	chatHTTP := c.chatHTTPForAccount(a, headerTimeout)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1332,6 +1339,44 @@ func (c *Client) chatHTTPForHeader(d time.Duration) *http.Client {
 	cloned.ResponseHeaderTimeout = d
 	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
 	c.timeoutClients[d] = client
+	return client
+}
+
+// chatHTTPForAccount 返回账号代理槽专用的 chat client（issue #96）。未绑定槽
+// 或未配置路由时回落到默认 client；每个槽使用独立 Transport，连接池不跨账号共享。
+func (c *Client) chatHTTPForAccount(a *auth.Auth, d time.Duration) *http.Client {
+	base := c.chatHTTPForHeader(d)
+	if c.AccountRoute == nil || a == nil {
+		return base
+	}
+	slot, dial := c.AccountRoute(a)
+	if slot == "" || dial == nil {
+		return base
+	}
+	key := slot + "|" + d.String()
+	c.slotMu.Lock()
+	defer c.slotMu.Unlock()
+	if client := c.slotClients[key]; client != nil {
+		return client
+	}
+	tr, ok := base.Transport.(*http.Transport)
+	if !ok {
+		return base
+	}
+	cloned := tr.Clone()
+	wt := writeTimeout
+	cloned.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &writeDeadlineConn{Conn: conn, writeTimeout: wt}, nil
+	}
+	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
+	if c.slotClients == nil {
+		c.slotClients = map[string]*http.Client{}
+	}
+	c.slotClients[key] = client
 	return client
 }
 
