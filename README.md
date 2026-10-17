@@ -360,6 +360,9 @@ claude
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
 | `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
+| `pricing.enabled` | `false` | 在用量页展示 OpenRouter 公开价折算的等价花费；只读，不参与调度/计费 |
+| `pricing.refresh_minutes` | `0` | 价格自动刷新周期；`0` = 只在启动时拉取一次 |
+| `pricing.exchange_rate` | `1` | 展示币种换算系数（1 = USD） |
 | `pool.credit_floor` | `100` | 积分保底：余额低于该值不再参与收费模型轮换 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |

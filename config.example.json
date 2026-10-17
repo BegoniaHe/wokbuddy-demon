@@ -95,6 +95,11 @@
     "url": "",
     "token": ""
   },
+  "pricing": {
+    "enabled": false,
+    "refresh_minutes": 0,
+    "exchange_rate": 1
+  },
   "pool": {
     "max_in_flight": 3,
     "max_in_flight_global": 2,

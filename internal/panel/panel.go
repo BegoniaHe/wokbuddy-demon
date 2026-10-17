@@ -27,6 +27,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -50,7 +51,10 @@ type Config struct {
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
 	// nil 时配置页返回 501。
 	ConfigPath string
-	LoadConfig func() (any, error)
+	// Pricing 等价价格缓存（issue #99）；nil = 关闭或未初始化。
+	Pricing     *pricing.Catalog
+	PricingRate float64
+	LoadConfig  func() (any, error)
 	// SaveConfig 校验并落盘配置，返回需要重启才能生效的字段列表；随后由 main 注入的
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
 	SaveConfig func(raw []byte) (restartRequired []string, err error)
@@ -211,6 +215,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAuth(p.keysRevoke))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAuth(p.keysDelete))
+	p.mux.HandleFunc("GET /panel/api/pricing", p.withAuth(p.pricingHandler))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAuth(p.keysUpdateLimits))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("POST /panel/api/model_probes", p.withAuth(p.modelProbe))
@@ -995,4 +1000,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// pricingHandler 返回只读价格快照（issue #99）。
+func (p *Panel) pricingHandler(w http.ResponseWriter, r *http.Request) {
+	snap := p.cfg.Pricing.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":       p.cfg.Pricing != nil,
+		"exchange_rate": p.cfg.PricingRate,
+		"updated_at":    snap.UpdatedAt,
+		"last_error":    snap.LastError,
+		"prices":        snap.Prices,
+	})
 }
