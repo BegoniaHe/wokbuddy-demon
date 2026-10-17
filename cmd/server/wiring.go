@@ -15,6 +15,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/server"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
@@ -156,6 +157,14 @@ func startPricingRefresh(ctx context.Context, cfg *Config, cat *pricing.Catalog)
 			}
 		}
 	}()
+// setupQuota 创建撞线事件存储并接到 pool（issue #101）。
+func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
+	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
+	p.SetModelRateLimitHook(func(uid, model, realm string, resetAt time.Time) {
+		used := rec.TokensSince(realm, uid, model, resetAt.Add(-24*time.Hour))
+		store.Add(quota.Event{UID: uid, Realm: realm, Model: model, ResetAt: resetAt, Used: used})
+	})
+	return store
 }
 
 // handlerDeps 是构建 HTTP handler 所需的装配期依赖。
@@ -177,7 +186,7 @@ type handlerDeps struct {
 // buildHandler 把装配期依赖映射为 server.Config；这些字段改动需重启。
 func buildHandler(d handlerDeps) *server.Handler {
 	return server.NewHandler(server.Config{
-		Pool:         d.pool,
+         d.pool,
 		Upstream:     d.up,
 		APIKey:       d.cfg.APIKey,
 		Keys:         d.keys,

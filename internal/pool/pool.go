@@ -73,6 +73,8 @@ type Pool struct {
 	// inFlightTotal 当前全局在途数（所有账号租约之和）。无论是否设上限都累加，
 	// 供面板观测与上限判定；Release 仅在账号名额真正减一时同步递减，保证幂等。
 	inFlightTotal atomic.Int64
+	// onModelRateLimit 撞线事件回调（issue #101）：账号 6004 带重置时间时触发。
+	onModelRateLimit func(uid, model, realm string, resetAt time.Time)
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -320,6 +322,13 @@ func (p *Pool) SetProxySlot(uid, slot string) bool {
 	e.proxySlot = strings.TrimSpace(slot)
 	p.dirty.Store(true)
 	return true
+}
+
+// SetModelRateLimitHook 注入 6004 撞线事件回调（issue #101）；nil = 不记录。
+func (p *Pool) SetModelRateLimitHook(fn func(uid, model, realm string, resetAt time.Time)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onModelRateLimit = fn
 }
 
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。

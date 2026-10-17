@@ -2059,6 +2059,19 @@ func TestResumeIdempotent(t *testing.T) {
 	}
 }
 
+func TestModelRateLimitHook(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	var gotUID, gotModel, gotRealm string
+	p.SetModelRateLimitHook(func(uid, model, realm string, _ time.Time) {
+		gotUID, gotModel, gotRealm = uid, model, realm
+	})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "glm-5.2", "6004 limit")
+	if gotUID != "u1" || gotModel != "glm-5.2" || gotRealm != "cn" {
+		t.Fatalf("hook got uid=%q model=%q realm=%q", gotUID, gotModel, gotRealm)
+	}
+}
+
 func TestSetProxySlotPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	p := New(path)

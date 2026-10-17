@@ -251,6 +251,7 @@ func main() {
 	rec.Start()
 	defer rec.Stop()
 	setDailyUsageProvider(p, rec)
+	quotaStore := setupQuota(p, rec, cfg)
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	// 命名密钥库：与 state 文件同目录（data/api_keys.json）。面板签发/撤销，
@@ -296,6 +297,9 @@ func main() {
 		ProbeStateFile: stateSibling(cfg.StateFile, "model_probes.json"),
 		ConfigPath:     *cfgPath,
 		ProxySlots:     proxySlotInfos(cfg),
+		Pricing:        priceCat,
+		PricingRate:    cfg.Pricing.ExchangeRate,
+		Quota:          quotaStore,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -310,7 +314,7 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := buildHandler(handlerDeps{
-		cfg:         cfg,
+         cfg,
 		pool:        p,
 		up:          up,
 		keys:        keyStore,

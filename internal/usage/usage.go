@@ -251,6 +251,51 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	r.dirty = true
 }
 
+// TokensByAccountModel 汇总自 since 起每个账号×模型的成功 token（issue #101）。
+func (r *Recorder) TokensByAccountModel(since time.Time) map[string]map[string]int64 {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := map[string]map[string]int64{}
+	for _, b := range r.buckets {
+		if !strings.HasPrefix(b.Scope, "h:") {
+			continue
+		}
+		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+		if err != nil || t.Before(since) {
+			continue
+		}
+		if out[b.UID] == nil {
+			out[b.UID] = map[string]int64{}
+		}
+		out[b.UID][b.Model] += b.TT
+	}
+	return out
+}
+
+// TokensSince 汇总某账号×模型自 since 起的成功 token（issue #101）。
+func (r *Recorder) TokensSince(realm, uid, model string, since time.Time) int64 {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var total int64
+	for _, b := range r.buckets {
+		if b.Realm != realm || b.UID != uid || b.Model != model || !strings.HasPrefix(b.Scope, "h:") {
+			continue
+		}
+		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+		if err != nil || t.Before(since) {
+			continue
+		}
+		total += b.TT
+	}
+	return total
+}
+
 // BackfillRow 上游逐笔用量按天聚合的一行（issue #31）。
 //
 // 只承载上游逐笔接口能提供的权威维度（请求数 / 积分）；token、延迟、缓存等维度
