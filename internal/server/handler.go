@@ -1434,11 +1434,18 @@ func (f *chatFlow) accountRecovery(now time.Time) time.Time {
 		if f.bareModel != "" && m.Model != f.bareModel {
 			continue
 		}
-		if t := futureOrZero(m.Until, now); !t.IsZero() && (until.IsZero() || t.Before(until)) {
-			until = t
-		}
+		until = earlierFuture(until, m.Until, now)
 	}
 	return until
+}
+
+// earlierFuture 返回 cur 与 cand 中更早的未来时刻；两者都已过期时返回零值。
+func earlierFuture(cur, cand, now time.Time) time.Time {
+	t := futureOrZero(cand, now)
+	if t.IsZero() || (!cur.IsZero() && !t.Before(cur)) {
+		return cur
+	}
+	return t
 }
 
 // modelRecovery 模型级全池冷却截止（未触发 → 零值）。
