@@ -12,7 +12,9 @@
 package panel
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +29,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -50,6 +53,8 @@ type Config struct {
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
 	// nil 时配置页返回 501。
 	ConfigPath string
+	// Quota 撞线事件与预算估算（issue #101）；nil = 未启用。
+	Quota      *quota.Store
 	LoadConfig func() (any, error)
 	// SaveConfig 校验并落盘配置，返回需要重启才能生效的字段列表；随后由 main 注入的
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
@@ -206,6 +211,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/usage/remaining", p.withAuth(p.usageRemaining))
 	p.mux.HandleFunc("POST /panel/api/usage/backfill", p.withAuth(p.usageBackfill))
 	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.keysList))
 	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
@@ -995,4 +1001,84 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// remainingRow 单账号×模型的剩余用量估算（issue #101）。
+type remainingRow struct {
+	UID         string  `json:"uid"`
+	Nickname    string  `json:"nickname"`
+	Realm       string  `json:"realm"`
+	Model       string  `json:"model"`
+	Used        int64   `json:"used"`
+	Budget      float64 `json:"budget"`
+	Remaining   float64 `json:"remaining"`
+	WindowStart string  `json:"window_start,omitempty"`
+	Cooling     bool    `json:"cooling"`
+	Estimated   bool    `json:"estimated"`
+	Samples     int     `json:"samples"`
+}
+
+// usageRemaining 只读剩余用量估算；短 TTL + ETag（issue #101）。
+func (p *Panel) usageRemaining(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Quota == nil || p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "quota store or usage recorder not available")
+		return
+	}
+	now := time.Now()
+	budgets := p.cfg.Quota.Budgets()
+	events := p.cfg.Quota.Events()
+	y, m, d := now.Date()
+	since := time.Date(y, m, d, 0, 0, 0, 0, now.Location())
+	daily := p.cfg.Usage.TokensByAccountModel(since)
+	resetByKey := map[string]time.Time{}
+	for _, e := range events {
+		key := e.UID + "|" + e.Model
+		if e.ResetAt.After(resetByKey[key]) {
+			resetByKey[key] = e.ResetAt
+		}
+	}
+	rows := make([]remainingRow, 0)
+	for _, acct := range p.cfg.Pool.List() {
+		for model, used := range daily[acct.UID] {
+			budget, ok := budgets[acct.Realm+"|"+model]
+			row := remainingRow{UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm, Model: model, Used: used}
+			if ok {
+				row.Budget = budget.Used
+				row.Remaining = max(0, budget.Used-float64(used))
+				row.Samples = budget.Samples
+				if reset := resetByKey[acct.UID+"|"+model]; !reset.IsZero() {
+					row.WindowStart = reset.Add(-24 * time.Hour).Format(time.RFC3339)
+					row.Cooling = reset.After(now)
+				}
+			} else {
+				row.Estimated = true
+				row.Budget = float64(used)
+				row.Remaining = 0
+			}
+			rows = append(rows, row)
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remaining < rows[j].Remaining })
+	etag := remainingETag(rows, len(events))
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generated_at": now, "ttl_sec": 5, "rows": rows, "budgets": budgets,
+	})
+}
+
+// remainingETag 依据行与事件数生成弱 ETag。
+func remainingETag(rows []remainingRow, events int) string {
+	raw, err := json.Marshal(struct {
+		Rows   []remainingRow `json:"rows"`
+		Events int            `json:"events"`
+	}{Rows: rows, Events: events})
+	if err != nil {
+		return `"0"`
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf(`"%x"`, sum[:8])
 }

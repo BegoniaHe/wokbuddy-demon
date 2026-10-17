@@ -1,8 +1,19 @@
 package main
 
 import (
+	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/server"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
 // rotateStatusSet 把配置的状态码列表转为查表集合（issue #17）。空列表返回 nil，
@@ -34,4 +45,47 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 		realm, bare := server.ResolveModel(model)
 		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
 	}
+}
+
+// setupQuota 创建撞线事件存储并接到 pool（issue #101）。
+func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
+	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
+	p.SetModelRateLimitHook(func(uid, model, realm string, resetAt time.Time) {
+		used := rec.TokensSince(realm, uid, model, resetAt.Add(-24*time.Hour))
+		store.Add(quota.Event{UID: uid, Realm: realm, Model: model, ResetAt: resetAt, Used: used})
+	})
+	return store
+}
+
+// handlerDeps 是构建 HTTP handler 所需的装配期依赖。
+type handlerDeps struct {
+	cfg         *Config
+	pool        *pool.Pool
+	up          *upstream.Client
+	keys        *apikey.Store
+	session     *session.Router
+	stickyCount func() int
+	redisMode   string
+	panel       *panel.Panel
+	live        *livecfg.Holder
+	usage       *usage.Recorder
+	requestLog  *reqlog.Recorder
+	notifier    notify.Sender
+}
+
+// buildHandler 把装配期依赖映射为 server.Config；这些字段改动需重启。
+func buildHandler(d handlerDeps) *server.Handler {
+	return server.NewHandler(server.Config{
+		Pool: d.pool, Upstream: d.up, APIKey: d.cfg.APIKey, Keys: d.keys,
+		Session: d.session, StickyCount: d.stickyCount, RedisMode: d.redisMode,
+		SoftCooldown: d.cfg.SoftRateDur, Panel: d.panel, Live: d.live,
+		Usage: d.usage, RequestLog: d.requestLog,
+		PromptMode: d.cfg.Prompt.Mode, PromptText: d.cfg.PromptText,
+		RecordClientInfo: d.cfg.Logging.RequestClientInfo,
+		DecisionTrace:    d.cfg.Logging.DecisionTrace, DecisionTraceSample: d.cfg.Logging.DecisionTraceSample,
+		GlobalEnabled: d.cfg.Global.Enabled, ModelAliases: d.cfg.Models.Aliases,
+		MaxRotate: d.cfg.Upstream.RotateMax, RotateBudget: d.cfg.RotateBudgetDur,
+		RotateStatuses:    rotateStatusSet(d.cfg.Upstream.RotateStatusCodes),
+		KeepaliveInterval: d.cfg.KeepaliveIntervalDur, Notifier: d.notifier,
+	})
 }

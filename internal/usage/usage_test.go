@@ -418,3 +418,20 @@ func wantEq[T comparable](t *testing.T, label string, got, want T) {
 		t.Fatalf("%s = %v, want %v", label, got, want)
 	}
 }
+
+func TestTokensByAccountModel(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "glm-5.2", Delta{TotalTokens: 10, HasTotal: true}, true)
+	r.Add(now, "cn", "u2", "glm-5.2", Delta{TotalTokens: 20, HasTotal: true}, true)
+	got := r.TokensByAccountModel(now.Add(-time.Hour))
+	if got["u1"]["glm-5.2"] != 10 || got["u2"]["glm-5.2"] != 20 {
+		t.Fatalf("tokens=%v", got)
+	}
+	if since := r.TokensSince("cn", "u1", "glm-5.2", now.Add(-time.Hour)); since != 10 {
+		t.Fatalf("since=%d want 10", since)
+	}
+	if all := r.TokensSince("cn", "u1", "glm-5.2", now.Add(time.Hour)); all != 0 {
+		t.Fatalf("future since=%d want 0", all)
+	}
+}
