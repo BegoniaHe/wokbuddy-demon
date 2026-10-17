@@ -58,7 +58,7 @@ func TestLimiterBoundsTrackedIPs(t *testing.T) {
 	l := NewLimiter(2, time.Hour)
 	now := time.Unix(1000, 0)
 	l.now = func() time.Time { return now }
-	for i := 0; i < maxTrackedIPs+100; i++ {
+	for i := range maxTrackedIPs + 100 {
 		l.Fail(fmt.Sprintf("198.51.100.%d", i))
 	}
 	if got := len(l.byIP); got > maxTrackedIPs {
