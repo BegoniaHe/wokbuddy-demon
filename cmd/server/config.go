@@ -565,7 +565,8 @@ func (c *Config) normalizeModelAliases() error {
 	return nil
 }
 
-// normalizeAliasTarget 去掉目标首尾空白并校验 "[realm:]model" 的裸名部分非空。
+// normalizeAliasTarget 去掉目标首尾空白并校验 "[realm:]model"：冒号前只允许
+// cn/global（未知前缀会与裸模型名混淆，必须在启动期拒绝），裸名部分必须非空。
 func normalizeAliasTarget(name, value string) (string, error) {
 	target := strings.TrimSpace(value)
 	if target == "" {
@@ -573,9 +574,11 @@ func normalizeAliasTarget(name, value string) (string, error) {
 	}
 	model := target
 	if i := strings.IndexByte(model, ':'); i >= 0 {
-		if prefix := model[:i]; prefix == "cn" || prefix == "global" {
-			model = model[i+1:]
+		prefix := model[:i]
+		if prefix != "cn" && prefix != "global" {
+			return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 的 realm 前缀必须是 cn 或 global", name, target)
 		}
+		model = model[i+1:]
 	}
 	if model == "" {
 		return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 缺少裸模型名", name, target)
