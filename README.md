@@ -336,7 +336,8 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 - 命名密钥以 **SHA-256 哈希**存储（`data/api_keys.json`），明文**仅在创建时回显一次**；
 - 命名密钥**只作用于网关 API 面**（`POST /v1/chat/completions`、`GET /v1/models`）；
 - 面板、`GET /status`、`GET /metrics` 仍**只认**默认 `api_key`（命名密钥是给客户端的，不获得管理/运维可见性）；
-- 每把密钥记录 `last_used_at` 与请求数 / token 用量，面板可查看；
+- 每把密钥记录 `last_used_at`、请求数 / token 用量与被限制拒绝数，面板可查看；
+- 面板「限制」可设置每把密钥的 `rpm` / `tpm` / `max_concurrent` / 模型白名单（glob，可带 `cn:` / `global:` 前缀）；超限返回 `429 + Retry-After`，白名单未命中返回 `403 model_not_allowed`；未配置限制的密钥行为不变。限流为进程内单实例计数；
 - `api_key` 为空且未创建任何命名密钥时，网关仍为「不鉴权」放行（既有默认）。
 
 本功能**不涉及任何计费**：不设额度、不设配额、不设账单。

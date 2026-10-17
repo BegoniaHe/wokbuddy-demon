@@ -1,6 +1,11 @@
 package server
 
-import "context"
+import (
+	"context"
+	"net/http"
+	"strconv"
+	"time"
+)
 
 // keyUsage 一次命名密钥请求的用量累加器：withClientAuth 创建并挂到 context，
 // chatFlow 在出口回填 token 观测，withClientAuth 在 next 返回后落账到密钥库。
@@ -17,4 +22,14 @@ type keyUsageKey struct{}
 func keyUsageFrom(ctx context.Context) *keyUsage {
 	ku, _ := ctx.Value(keyUsageKey{}).(*keyUsage)
 	return ku
+}
+
+// writeKeyLimitError 命名密钥超限响应：429 + Retry-After（秒，至少 1）。
+func writeKeyLimitError(w http.ResponseWriter, retryAfter time.Duration) {
+	seconds := int((retryAfter + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "api key rate limit exceeded")
 }

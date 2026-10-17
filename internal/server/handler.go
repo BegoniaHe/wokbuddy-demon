@@ -232,6 +232,13 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
+		if !ok {
+			h.cfg.Keys.RecordRejected(res.KeyID)
+			writeKeyLimitError(w, retryAfter)
+			return
+		}
+		defer release()
 		ku := &keyUsage{id: res.KeyID}
 		next(w, r.WithContext(context.WithValue(r.Context(), keyUsageKey{}, ku)))
 		h.cfg.Keys.RecordUsage(ku.id, ku.prompt, ku.completion, ku.total)
@@ -650,6 +657,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 入站适配：解析 HTTP 请求为结构化输入，并构造输出端口（唯一的 net/http 边界）。
 	in, out, ok := newChatInput(w, r)
 	if !ok {
+		return
+	}
+	if ku := in.keyUsage; ku != nil && !h.cfg.Keys.ModelAllowed(ku.id, in.model) {
+		h.cfg.Keys.RecordRejected(ku.id)
+		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed", "model is not allowed for this API key")
 		return
 	}
 	f := h.newChatFlow(in, out)

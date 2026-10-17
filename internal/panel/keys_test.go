@@ -135,3 +135,31 @@ func TestNamedKeyCannotAccessPanel(t *testing.T) {
 		t.Errorf("named key on panel: code=%d, want 401", rec.Code)
 	}
 }
+
+// TestKeysUpdateLimits 限制可编辑、可读回；非法值返回 400，未知密钥 404。
+func TestKeysUpdateLimits(t *testing.T) {
+	store := apikey.New("")
+	p := panelWithKeys(store)
+	_, rec := createKey(t, p, "limited")
+
+	body := `{"limits":{"rpm":10,"tpm":1000,"max_concurrent":2,"models":["cn:glm-*"," gpt-5* "]}}`
+	if code, resp := p.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/limits", body); code != http.StatusOK {
+		t.Fatalf("update code=%d body=%s", code, resp)
+	}
+	got := store.List()[0].Limits
+	if got.RPM != 10 || got.TPM != 1000 || got.MaxConcurrent != 2 || len(got.Models) != 2 || got.Models[1] != "gpt-5*" {
+		t.Fatalf("limits=%+v", got)
+	}
+
+	for _, bad := range []string{
+		`{"limits":{"rpm":-1}}`,
+		`{"limits":{"models":["[bad"]}}`,
+	} {
+		if code, resp := p.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/limits", bad); code != http.StatusBadRequest {
+			t.Errorf("bad %s: code=%d body=%s", bad, code, resp)
+		}
+	}
+	if code, _ := p.doKeys(http.MethodPost, "/panel/api/keys/nope/limits", `{"limits":{}}`); code != http.StatusNotFound {
+		t.Errorf("unknown key code=%d", code)
+	}
+}

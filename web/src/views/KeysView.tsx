@@ -4,7 +4,7 @@ import { MoreHorizontal } from 'lucide-react';
 import { api, postJSON } from '@/lib/api';
 import { ago, fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
-import type { ApiKey } from '@/lib/types';
+import type { ApiKey, ApiKeyLimits } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { Field, FieldLabel, FieldDescription } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
@@ -45,6 +45,11 @@ export function KeysView() {
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState('');
   const [rawKey, setRawKey] = useState('');
+  const [limitsFor, setLimitsFor] = useState<ApiKey | null>(null);
+  const [rpm, setRpm] = useState('');
+  const [tpm, setTpm] = useState('');
+  const [concurrent, setConcurrent] = useState('');
+  const [models, setModels] = useState('');
 
   const keysQ = useQuery({
     queryKey: ['keys'],
@@ -80,6 +85,50 @@ export function KeysView() {
     },
     onError: (e) => toast('删除失败：' + (e as Error).message, 'err'),
   });
+
+  const limitsM = useMutation({
+    mutationFn: (v: { id: string; limits: ApiKeyLimits }) =>
+      postJSON('keys/' + v.id + '/limits', { limits: v.limits }),
+    onSuccess: () => {
+      toast('限制已保存，下一个请求生效', 'ok');
+      setLimitsFor(null);
+      void invalidate();
+    },
+    onError: (e) => toast('保存限制失败：' + (e as Error).message, 'err'),
+  });
+
+  const openLimits = (k: ApiKey) => {
+    setLimitsFor(k);
+    setRpm(String(k.limits?.rpm ?? ''));
+    setTpm(String(k.limits?.tpm ?? ''));
+    setConcurrent(String(k.limits?.max_concurrent ?? ''));
+    setModels((k.limits?.models ?? []).join(', '));
+  };
+
+  const saveLimits = () => {
+    if (!limitsFor) return;
+    const num = (v: string) => (v.trim() === '' ? 0 : Number(v));
+    limitsM.mutate({
+      id: limitsFor.id,
+      limits: {
+        rpm: num(rpm),
+        tpm: num(tpm),
+        max_concurrent: num(concurrent),
+        models: models.split(/[,，\s]+/).filter(Boolean),
+      },
+    });
+  };
+
+  const limitsText = (k: ApiKey) => {
+    const l = k.limits;
+    if (!l) return '—';
+    const parts: string[] = [];
+    if (l.rpm) parts.push('RPM ' + l.rpm);
+    if (l.tpm) parts.push('TPM ' + l.tpm);
+    if (l.max_concurrent) parts.push('并发 ' + l.max_concurrent);
+    if (l.models?.length) parts.push(l.models.join(', '));
+    return parts.length ? parts.join(' · ') : '—';
+  };
 
   const openCreate = () => {
     setName('');
@@ -120,6 +169,7 @@ export function KeysView() {
                   <TableHead>前缀</TableHead>
                   <TableHead className="text-right">请求数</TableHead>
                   <TableHead className="text-right">Token</TableHead>
+                  <TableHead>限制</TableHead>
                   <TableHead>创建</TableHead>
                   <TableHead>最近使用</TableHead>
                   <TableHead>状态</TableHead>
@@ -137,6 +187,7 @@ export function KeysView() {
                     <TableCell className="text-right">
                       <span className="font-mono tabular-nums">{fmtTok(k.total_tokens ?? 0)}</span>
                     </TableCell>
+                    <TableCell className="text-muted-foreground">{limitsText(k)}</TableCell>
                     <TableCell className="text-muted-foreground">{ago(k.created_at)}</TableCell>
                     <TableCell className="text-muted-foreground">{k.last_used_at ? ago(k.last_used_at) : '—'}</TableCell>
                     <TableCell>
@@ -144,14 +195,19 @@ export function KeysView() {
                     </TableCell>
                     <TableCell className="text-right">
                       {k.revoked ? null : (
-                        <Button
-                          size="xs"
-                          variant="ghost"
-                          disabled={revokeM.isPending}
-                          onClick={() => revokeM.mutate(k.id)}
-                        >
-                          撤销
-                        </Button>
+                        <>
+                          <Button size="xs" variant="ghost" onClick={() => openLimits(k)}>
+                            限制
+                          </Button>
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            disabled={revokeM.isPending}
+                            onClick={() => revokeM.mutate(k.id)}
+                          >
+                            撤销
+                          </Button>
+                        </>
                       )}
                       <DropdownMenu>
                         <DropdownMenuTrigger
@@ -226,6 +282,38 @@ export function KeysView() {
                 </Button>
               </>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!limitsFor} onOpenChange={(open) => !open && setLimitsFor(null)}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>限制「{limitsFor?.name}」</DialogTitle>
+            <DialogDescription>0 或留空 = 不限制；保存后下一个请求生效。模型白名单支持 glob 与 cn:/global: 前缀。</DialogDescription>
+          </DialogHeader>
+          <div className="grid grid-cols-2 gap-3">
+            <Field>
+              <FieldLabel>RPM</FieldLabel>
+              <Input inputMode="numeric" placeholder="每分钟请求数" value={rpm} onChange={(e) => setRpm(e.target.value)} />
+            </Field>
+            <Field>
+              <FieldLabel>TPM</FieldLabel>
+              <Input inputMode="numeric" placeholder="每分钟 token" value={tpm} onChange={(e) => setTpm(e.target.value)} />
+            </Field>
+            <Field>
+              <FieldLabel>最大并发</FieldLabel>
+              <Input inputMode="numeric" placeholder="并发请求数" value={concurrent} onChange={(e) => setConcurrent(e.target.value)} />
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel>模型白名单</FieldLabel>
+            <Input placeholder="cn:glm-*, gpt-5*" value={models} onChange={(e) => setModels(e.target.value)} />
+            <FieldDescription>逗号或空格分隔；留空 = 全部模型。</FieldDescription>
+          </Field>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setLimitsFor(null)}>取消</Button>
+            <Button disabled={limitsM.isPending} onClick={saveLimits}>保存</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
