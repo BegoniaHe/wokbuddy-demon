@@ -260,8 +260,17 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 | 协议 | 端点 |
 |---|---|
-| OpenAI | `POST /v1/chat/completions`、`GET /v1/models` |
+| OpenAI Chat Completions | `POST /v1/chat/completions`、`GET /v1/models` |
+| OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function tools） |
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
+
+Codex CLI 等使用 Responses API 的客户端：
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:7863/v1
+export OPENAI_API_KEY=test_key   # 换成 config.json 中生效的 api_key
+codex
+```
 
 Claude Code 接入示例（`api_key` 非空时填同一密钥）：
 

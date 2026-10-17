@@ -196,6 +196,7 @@ func NewHandler(cfg Config) *Handler {
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/responses", h.withClientAuth(h.responsesHandler))
 	h.mux.HandleFunc("POST /v1/messages", h.withClientAuth(h.anthropicMessagesHandler))
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withClientAuth(h.anthropicCountTokensHandler))
 	h.mux.HandleFunc("GET /v1/models", h.withClientAuth(h.models))
