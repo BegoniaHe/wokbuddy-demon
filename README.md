@@ -182,6 +182,20 @@ go build -trimpath -ldflags="-s -w" -o wokbuddy-demon.exe ./cmd/server
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
+### 校验 nightly 产物
+
+nightly 的每个二进制压缩包同目录附带 `.sha256`，下载后校验：
+
+```bash
+# Linux
+sha256sum -c wokbuddy-demon-nightly-*.sha256
+
+# macOS（文件名在文件里，需先进入下载目录）
+shasum -a 256 -c wokbuddy-demon-nightly-*.sha256
+```
+
+校验和覆盖压缩包本身；容器镜像的完整性由 GHCR digest 提供。
+
 ### 方式三：源码运行（开发调试）
 
 ```bash
