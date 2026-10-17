@@ -2165,3 +2165,57 @@ func TestChatNonStreamTruncatedAllAccountsFails502(t *testing.T) {
 		t.Errorf("success_count=%d want 0", s)
 	}
 }
+
+// TestChatStreamLineTooLongNoSuccess 上游单行超过大小上限（issue #113）：
+// 客户端收到 200 + error 帧 + [DONE]，但账号不记成功、不绑粘性。
+func TestChatStreamLineTooLongNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		huge := strings.Repeat("x", upstream.MaxSSELineBytes+1024)
+		return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+			"data: " + huge + "\n\n", true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "exceeded size limit") {
+		t.Errorf("missing size-limit error frame: %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, body)
+	}
+	// 防御上限命中 = 上游异常：不记成功、不绑粘性。
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (size-limit hit is upstream failure)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("size-limit failure must not bind sticky")
+	}
+}
+
+// TestChatNonStreamLineTooLongRotates 非流式单行超限：换号重试；全部超限时
+// 回 502（issue #113），不把部分内容当完整回答。
+func TestChatNonStreamLineTooLongRotates(t *testing.T) {
+	huge := strings.Repeat("x", upstream.MaxSSELineBytes+1024)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: " + huge + "\n\n", true
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d want 502 body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0", s)
+	}
+}

@@ -4,6 +4,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -243,13 +244,18 @@ func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 func (s *chatStatsReader) SawErrorFrame() bool { return s.errorFrame }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
+// 单行上限与 upstream SSE 读取同口径（upstream.MaxSSELineBytes，issue #113）：
+// 统计层自己也是按行读取点，不设限会把超长行原样拷贝给下游透传。
 func (s *chatStatsReader) Read(p []byte) (int, error) {
 	if len(s.pend) > 0 {
 		n := copy(p, s.pend)
 		s.pend = s.pend[n:]
 		return n, nil
 	}
-	line, err := s.br.ReadString('\n')
+	line, err := readSSEStatsLine(s.br)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return 0, err // 超长行 / 读错误：上抛，不拷贝部分行
+	}
 	if line != "" {
 		s.parseSSELine(line)
 		s.pend = []byte(line)
@@ -258,6 +264,28 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	return 0, err
+}
+
+// readSSEStatsLine 读一行，单行超过 upstream.MaxSSELineBytes 时返回
+// upstream.ErrSSELineTooLong（issue #113）。语义对齐 ReadString：行尾不带 '\n'
+// 时返回该行 + io.EOF。自己按 chunk 累积，超限立即失败（ReadString 的字符串
+// 拼接会把超长行 concat 成任意大小）。
+func readSSEStatsLine(br *bufio.Reader) (string, error) {
+	var sb strings.Builder
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if sb.Len()+len(chunk) > upstream.MaxSSELineBytes {
+			return "", fmt.Errorf("%w: > %d bytes", upstream.ErrSSELineTooLong, upstream.MaxSSELineBytes)
+		}
+		sb.Write(chunk)
+		if err == nil {
+			return sb.String(), nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return sb.String(), err
+	}
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。

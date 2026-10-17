@@ -1331,6 +1331,10 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 		// 上游未发 [DONE] 就以 EOF 收尾（issue #105）：StreamHint 已向客户端补一个
 		// [DONE] 兜底收尾，但截断的 content 不是完整回答——按上游失败处置账号。
 		f.failStreamUpstream(acct, "upstream stream truncated (EOF without [DONE])")
+	case errors.Is(sErr, upstream.ErrSSELineTooLong):
+		// 上游单行超过大小上限（issue #113）：StreamHint 已写 error 帧 + [DONE] 收尾。
+		// 防御上限命中 = 上游/代理异常，按上游失败处置——绝不按客户端断连记成功。
+		f.failStreamUpstream(acct, sErr.Error())
 	case errFrame != "":
 		// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并处置账号
 		// ——**不记成功、不清 11102 负缓存、不绑粘性**。
@@ -1717,6 +1721,10 @@ func localErrorEnvelope(err error, fallbackStatus int, fallbackCode, fallbackMsg
 			"upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later",
 			true
 	case upstream.IsTruncatedStreamError(err), upstream.IsEmptyStreamError(err):
+		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	case errors.Is(err, upstream.ErrSSELineTooLong):
+		// 上游单行超过防御上限（issue #113）：同样 502 upstream_parse。轮转耗尽
+		// 意味着每个号都吐超大行——上游/代理异常，客户端重试同一请求无意义。
 		return http.StatusBadGateway, "upstream_parse", err.Error(), true
 	default:
 		return fallbackStatus, fallbackCode, fallbackMsg, false
