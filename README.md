@@ -350,6 +350,7 @@ claude
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；`0` = 不限制。改后需重启 |
 | `server.max_body_bytes` | `16777216` | 聊天类入站请求体上限（字节，16 MiB），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413 `payload_too_large`；`0` = 不限制。改后需重启 |
+| `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `upstream.model_timeouts` | `{}` | 按模型覆盖 `header` / `idle` 超时（如 `{"cn:glm-5.2":{"header":"300s","idle":"600s"}}`）；未命中回落全局。改后需重启 |

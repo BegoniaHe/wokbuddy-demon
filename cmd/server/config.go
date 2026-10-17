@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -75,6 +76,10 @@ type Config struct {
 		// /v1/chat/completions、/v1/messages 与 count_tokens。超限在解析前返回
 		// 413，不进入选号。缺省 16 MiB；0 = 不限制。改动需重启进程。
 		MaxBodyBytes int64 `json:"max_body_bytes"`
+		// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin 列表（如
+		// "http://localhost:3000"）。空 = 关闭 CORS，行为不变。只精确匹配
+		// scheme://host[:port]；不支持 "*"，管理面不参与。
+		CORSOrigins []string `json:"cors_origins"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -652,6 +657,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.normalizeStaticDefaults()
+	if err := c.normalizeCORS(); err != nil {
+		return err
+	}
 	if err := c.normalizeModelAliases(); err != nil {
 		return err
 	}
@@ -729,11 +737,11 @@ func normalizeAliasTarget(name, value string) (string, error) {
 
 // normalizeNotify 校验 webhook 与事件名，并去掉事件首尾空白/重复项。
 func (c *Config) normalizeNotify() error {
-	url := strings.TrimSpace(c.Notify.WebhookURL)
-	if err := notify.ValidateURL(url); err != nil {
+	webhook := strings.TrimSpace(c.Notify.WebhookURL)
+	if err := notify.ValidateURL(webhook); err != nil {
 		return fmt.Errorf("notify.webhook_url: %w", err)
 	}
-	c.Notify.WebhookURL = url
+	c.Notify.WebhookURL = webhook
 	if len(c.Notify.Events) == 0 {
 		return nil
 	}
@@ -844,6 +852,65 @@ func (c *Config) normalizeStaticDefaults() {
 	}
 	c.normalizePoolDefaults()
 	c.normalizeUpstreamDefaults()
+}
+
+// normalizeCORS 规范化并校验 server.cors_origins：只接受 scheme://host[:port]，
+// 去重并忽略大小写；通配、路径、查询、凭证一律拒绝（避免配置出静默不生效的源）。
+func (c *Config) normalizeCORS() error {
+	if len(c.Server.CORSOrigins) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Server.CORSOrigins))
+	out := make([]string, 0, len(c.Server.CORSOrigins))
+	for _, raw := range c.Server.CORSOrigins {
+		norm, err := normalizeCORSOrigin(raw)
+		if err != nil {
+			return err
+		}
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		out = append(out, norm)
+	}
+	c.Server.CORSOrigins = out
+	return nil
+}
+
+// normalizeCORSOrigin 把单个 Origin 规范化为小写 scheme://host[:port]；非法即报错。
+func normalizeCORSOrigin(raw string) (string, error) {
+	origin := strings.TrimSpace(raw)
+	if origin == "*" {
+		return "", errors.New(`server.cors_origins: 不支持通配 "*"，请逐项列出允许的 Origin`)
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q: %w", raw, err)
+	}
+	if reason := invalidOriginReason(u); reason != "" {
+		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q（%s）", raw, reason)
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host), nil
+}
+
+// invalidOriginReason 返回 Origin URL 不合规的原因；合规时返回空串。
+func invalidOriginReason(u *url.URL) string {
+	switch {
+	case u.Scheme != "http" && u.Scheme != "https":
+		return "scheme 必须是 http 或 https"
+	case u.Host == "":
+		return "缺少 host"
+	case u.User != nil:
+		return "不能包含用户凭证"
+	case u.RawQuery != "":
+		return "不能包含查询参数"
+	case u.Fragment != "":
+		return "不能包含 fragment"
+	case u.Path != "" && u.Path != "/":
+		return "不能包含路径"
+	default:
+		return ""
+	}
 }
 
 // normalizePoolDefaults 补齐池相关的数值型缺省值（阈值 / 权重 / 上限）。

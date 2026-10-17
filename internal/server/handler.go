@@ -109,6 +109,9 @@ type Config struct {
 	DecisionTrace       bool
 	DecisionTraceSample float64
 
+	// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin（已规范化）；空 = 关闭。
+	CORSOrigins []string
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -122,6 +125,8 @@ type Handler struct {
 	degrade degradeGate
 	// metrics 进程内生命周期指标（/metrics 的耗时 histogram 与换号计数）。
 	metrics *metricsRegistry
+	// cors 允许跨域的 Origin 集合；空 = 关闭 CORS。
+	cors map[string]bool
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
@@ -183,6 +188,10 @@ func NewHandler(cfg Config) *Handler {
 	h := &Handler{
 		cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
 		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+		cors:        make(map[string]bool, len(cfg.CORSOrigins)),
+	}
+	for _, origin := range cfg.CORSOrigins {
+		h.cors[origin] = true
 	}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
@@ -218,7 +227,39 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleCORS 处理 `/v1/*` 的跨域头与 OPTIONS 预检。返回 true 表示已写出
+// 预检响应；普通请求只附加允许头后继续。管理面与未配置 CORS 时完全跳过。
+func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
+	if len(h.cors) == 0 || !isV1Path(r.URL.Path) {
+		return false
+	}
+	w.Header().Add("Vary", "Origin")
+	origin := strings.ToLower(r.Header.Get("Origin"))
+	allowed := origin != "" && h.cors[origin]
+	if allowed {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+	if r.Method != http.MethodOptions {
+		return false
+	}
+	if allowed {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+		w.Header().Set("Access-Control-Max-Age", "600")
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return true
+}
+
+// isV1Path 仅匹配网关 API 面（/v1 及其子路径），管理面不参与 CORS。
+func isV1Path(path string) bool {
+	return path == "/v1" || strings.HasPrefix(path, "/v1/")
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.handleCORS(w, r) {
+		return
+	}
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
 		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages") {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
