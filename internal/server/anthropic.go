@@ -12,13 +12,14 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // anthropicMessagesHandler 是 /v1/messages 的入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
-	in, out, ok := newAnthropicChatInput(w, r)
+	in, out, ok := newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval)
 	if !ok {
 		return
 	}
@@ -77,7 +78,7 @@ func countJSONTextBytes(v any) int {
 }
 
 // newAnthropicChatInput 读取并转换 Anthropic 请求体；失败时已写出 Anthropic 错误。
-func newAnthropicChatInput(w http.ResponseWriter, r *http.Request) (chatInput, chatResponder, bool) {
+func newAnthropicChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration) (chatInput, chatResponder, bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
@@ -98,7 +99,7 @@ func newAnthropicChatInput(w http.ResponseWriter, r *http.Request) (chatInput, c
 		trace:     requestTraceFrom(r),
 		keyUsage:  keyUsageFrom(r.Context()),
 	}
-	return in, &anthropicResponder{w: w, model: model}, true
+	return in, &anthropicResponder{w: w, model: model, keepalive: keepalive}, true
 }
 
 // anthropicRequest 只声明转换需要的字段；未知字段由客户端协议自行演进，忽略。
@@ -451,8 +452,9 @@ func anthropicThinking(raw json.RawMessage) map[string]any {
 
 // anthropicResponder 把核心的 OpenAI 形态结果编码为 Anthropic 响应。
 type anthropicResponder struct {
-	w     http.ResponseWriter
-	model string
+	w         http.ResponseWriter
+	model     string
+	keepalive time.Duration
 }
 
 // JSON 写出非流式 Anthropic Message。
@@ -478,6 +480,9 @@ func (r *anthropicResponder) Stream(rc io.Reader, hint func(string) string, repa
 		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
 	}
 	opts = append(opts, upstream.WithMarkupRepair(repair))
+	if r.keepalive > 0 {
+		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
+	}
 	return upstream.StreamHint(tw, rc, hint, opts...)
 }
 
@@ -687,6 +692,15 @@ func (a *anthropicStreamWriter) Write(p []byte) (int, error) {
 // handleLine 处理单行：data 帧转换，[DONE] 收尾，注释/空行忽略。
 func (a *anthropicStreamWriter) handleLine(line string) error {
 	if a.finished {
+		return nil
+	}
+	// SSE 注释（如上游静默心跳 ": keepalive"）原样转发；上游写路径已设置
+	// 单次写截止，这里只负责补帧尾并 flush。
+	if strings.HasPrefix(line, ":") {
+		if _, err := io.WriteString(a.w, line+"\n\n"); err != nil {
+			return err
+		}
+		a.Flush()
 		return nil
 	}
 	if strings.HasPrefix(line, "data: ") {

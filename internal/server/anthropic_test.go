@@ -2,10 +2,12 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -315,5 +317,32 @@ func TestAnthropicStreamErrorKeepsGatewayHint(t *testing.T) {
 	out := rec.Body.String()
 	if !strings.Contains(out, "event: error") || !strings.Contains(out, `"gateway_hint":"wait 30s"`) {
 		t.Fatalf("流式错误丢失 gateway_hint:\n%s", out)
+	}
+}
+
+// TestAnthropicStreamKeepalive Anthropic SSE 在复用上游心跳时也必须把
+// ": keepalive" 注释帧透传给客户端，不能被协议转换层吞掉（issue #54 + #51）。
+func TestAnthropicStreamKeepalive(t *testing.T) {
+	pr, pw := io.Pipe()
+	rec := httptest.NewRecorder()
+	done := make(chan error, 1)
+	r := &anthropicResponder{w: rec, model: "m", keepalive: 20 * time.Millisecond}
+	go func() { done <- r.Stream(pr, nil, nil, nil) }()
+	time.Sleep(80 * time.Millisecond)
+	raw := "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	if _, err := pw.Write([]byte(raw)); err != nil {
+		t.Fatalf("pipe write: %v", err)
+	}
+	_ = pw.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, ": keepalive\n\n") {
+		t.Fatalf("缺少 keepalive 注释帧:\n%s", out)
+	}
+	if !strings.Contains(out, "event: content_block_delta") {
+		t.Fatalf("心跳后 Anthropic 事件丢失:\n%s", out)
 	}
 }
