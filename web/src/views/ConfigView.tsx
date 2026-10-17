@@ -2,9 +2,8 @@ import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { api, LS_KEY, postJSON } from '@/lib/api';
 import {
-  CFG_FIELDS,
   collectConfig,
-  dig,
+  configToValues,
   durationBad,
   DURATION_FIELDS,
   DURATION_TIP,
@@ -53,15 +52,7 @@ export function ConfigView() {
     try {
       const d = await api<{ path?: string; config?: unknown }>('config');
       setPath(d.path || '');
-      const cfg = d.config;
-      const next: Record<string, FieldValue> = {};
-      for (const f of CFG_FIELDS) {
-        const v = dig(cfg, f.path);
-        if (f.kind === 'checkbox') next[f.name] = !!v;
-        else if (Array.isArray(v)) next[f.name] = v.join(', ');
-        else next[f.name] = v == null ? '' : String(v);
-      }
-      setValues(next);
+      setValues(configToValues(d.config));
       setNote('');
     } catch (e) {
       toast('读取配置失败：' + (e as Error).message, 'err');
@@ -345,8 +336,88 @@ export function ConfigView() {
           <div className="grid gap-x-5 md:grid-cols-2">
             <Field>
               <FieldLabel>出站 User-Agent</FieldLabel>
-              {text('user_agent', { placeholder: '留空 = CLI/2.63.2 CodeBuddy/2.63.2' })}
+              {text('user_agent', { placeholder: '留空 = 内置三段式 UA' })}
               <FieldDescription>影响官网积分记录「使用端」显示；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>客户端版本</FieldLabel>
+              {text('client_version', { placeholder: '留空 = 按 realm 内置默认' })}
+              <FieldDescription>UA 的 WorkBuddy/&lt;ver&gt; 段；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>CLI 版本</FieldLabel>
+              {text('cli_version', { placeholder: '留空 = 按 realm 内置默认' })}
+              <FieldDescription>UA 的 CLI/&lt;ver&gt; 段；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>用量归属名</FieldLabel>
+              {text('client_name', { placeholder: '留空 = WorkBuddy / SaaS' })}
+              <FieldDescription>X-Product 与 X-IDE-Name/Type 跟随该值；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>设备 Token</FieldLabel>
+              {text('device_token', { type: 'password', placeholder: '留空 = 不修改' })}
+              <FieldDescription>已设置时留空保持不变；账号级 token 优先；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>设备 Token 文件</FieldLabel>
+              {text('device_token_file', { placeholder: '留空 = 不读取文件' })}
+              <FieldDescription>桌面端落盘 token 路径，5 分钟读取缓存；需重启</FieldDescription>
+            </Field>
+          </div>
+          {check('passthrough_ip', '向上游透传客户端 IP', '默认关闭；开启前确认反代信任边界，需重启')}
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-3">
+            <Field>
+              <FieldLabel>单请求最多换号</FieldLabel>
+              {num('rotate_max', { min: 1, placeholder: '3' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>轮换总时长预算</FieldLabel>
+              {text('rotate_budget', { placeholder: '0 = 不限' })}
+              <FieldDescription>如 90s；与换号次数先到先停；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>触发换号的状态码</FieldLabel>
+              {text('rotate_status_codes', { placeholder: '留空 = 按错误分类' })}
+              <FieldDescription>逗号分隔，如 429,500,502；需重启</FieldDescription>
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel>出站代理列表</FieldLabel>
+            {text('proxies', { placeholder: 'http://user:pass@host:port, socks5://host:1080' })}
+            <FieldDescription>逗号分隔；非空按健康轮换，失败自动冷却；需重启</FieldDescription>
+          </Field>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-3">
+            <Field>
+              <FieldLabel>国际版路由</FieldLabel>
+              {check('global_enabled', '启用 global realm')}
+              <FieldDescription>关闭后不路由 global 账号与 global: 模型；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国际版 Chat Base</FieldLabel>
+              {text('global_chat_base', { placeholder: '留空 = 内置默认' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国际版 Billing Base</FieldLabel>
+              {text('global_billing_base', { placeholder: '留空 = 内置默认' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+          </div>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <Field>
+              <FieldLabel>Upstash URL</FieldLabel>
+              {text('upstash_url', { placeholder: 'rediss://... 或 https://xxx.upstash.io' })}
+              <FieldDescription>留空 = 纯内存模式；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Upstash Token</FieldLabel>
+              {text('upstash_token', { type: 'password', placeholder: '留空 = 不修改' })}
+              <FieldDescription>已设置时留空保持不变；需重启</FieldDescription>
             </Field>
           </div>
           <Separator className="my-4" />
@@ -377,7 +448,7 @@ export function ConfigView() {
           {check('multimodal_routing', '多模态按能力路由（不匹配时改选支持该模态的模型；关闭则返回 400）')}
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
-            Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。
+            本卡片字段均在启动期装配，保存后需重启进程；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。
           </p>
         </CardContent>
       </Card>

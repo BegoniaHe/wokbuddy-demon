@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { collectConfig, durationBad, dig, put } from './config';
+import { collectConfig, configToValues, durationBad, dig, put } from './config';
 
 describe('dig / put', () => {
   it('嵌套读写', () => {
@@ -44,5 +44,32 @@ describe('collectConfig', () => {
   });
   it('api_key 空不下发（避免误关鉴权）', () => {
     expect('api_key' in collectConfig({ api_key: '' })).toBe(false);
+  });
+  it('list 字段拆成字符串数组', () => {
+    expect(collectConfig({ proxies: 'http://a, socks5://b' })).toEqual({
+      upstream: { proxies: ['http://a', 'socks5://b'] },
+    });
+  });
+  it('数字列表字段复用 hours 拆分', () => {
+    expect(collectConfig({ rotate_status_codes: '429, 500' })).toEqual({
+      upstream: { rotate_status_codes: [429, 500] },
+    });
+  });
+  it('secret 字段空值不下发（保留磁盘原值）', () => {
+    expect('device_token' in collectConfig({ device_token: '' })).toBe(false);
+    expect('upstash_token' in collectConfig({ upstash_token: '' })).toBe(false);
+  });
+});
+
+describe('configToValues', () => {
+  it('secret 字段已有值时留空，普通字段照常回填', () => {
+    const v = configToValues({
+      listen: ':7863',
+      upstream: { device_token: 'tok' },
+      upstash: { token: 'redis-token' },
+    });
+    expect(v.listen).toBe(':7863');
+    expect(v.device_token).toBe('');
+    expect(v.upstash_token).toBe('');
   });
 });
