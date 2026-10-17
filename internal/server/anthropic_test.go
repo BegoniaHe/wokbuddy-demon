@@ -279,3 +279,17 @@ func TestAnthropicMessageFromOpenAIToolUse(t *testing.T) {
 		t.Fatalf("input=%v", input)
 	}
 }
+
+// TestAnthropicStreamErrorKeepsGatewayHint 流式上游 error 帧的 gateway_hint
+// 必须保留在 Anthropic error 事件里，不能被协议转换丢掉。
+func TestAnthropicStreamErrorKeepsGatewayHint(t *testing.T) {
+	rec := httptest.NewRecorder()
+	tw := newAnthropicStreamWriter(rec, "m")
+	if err := tw.handleChunk(`{"error":{"message":"rate limited","gateway_hint":"wait 30s"}}`); err != nil {
+		t.Fatalf("handleChunk: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "event: error") || !strings.Contains(out, `"gateway_hint":"wait 30s"`) {
+		t.Fatalf("流式错误丢失 gateway_hint:\n%s", out)
+	}
+}

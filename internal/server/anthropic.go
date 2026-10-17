@@ -457,6 +457,11 @@ func (r *anthropicResponder) Error(status int, code, msg, hint string) {
 	writeAnthropicError(r.w, status, anthropicErrorType(status), msg, hint)
 }
 
+// Header 设置响应头（与 OpenAI 适配器同契约，供 Retry-After 等使用）。
+func (r *anthropicResponder) Header(name, value string) {
+	r.w.Header().Set(name, value)
+}
+
 // Stream 读取上游 OpenAI SSE，逐帧转换为 Anthropic SSE 事件。
 func (r *anthropicResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
 	tw := newAnthropicStreamWriter(r.w, r.model)
@@ -721,10 +726,12 @@ func (a *anthropicStreamWriter) handleUpstreamError(errObj map[string]any) error
 		msg = "upstream stream error"
 	}
 	a.errored = true
-	return a.event("error", map[string]any{
-		"type":  "error",
-		"error": map[string]any{"type": "api_error", "message": msg},
-	})
+	errBody := map[string]any{"type": "api_error", "message": msg}
+	// gateway_hint 由上游流层附在 error 帧上；流式错误不能把它丢掉。
+	if hint, _ := errObj["gateway_hint"].(string); hint != "" {
+		errBody["gateway_hint"] = hint
+	}
+	return a.event("error", map[string]any{"type": "error", "error": errBody})
 }
 
 // applyDelta 处理一个 choice delta 的文本、思考与工具调用增量。
