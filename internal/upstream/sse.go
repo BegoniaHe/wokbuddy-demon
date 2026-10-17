@@ -956,11 +956,10 @@ func (s *streamWriter) keepaliveIfIdle(lastWrite *time.Time) error {
 	if time.Since(*lastWrite) < s.keepalive {
 		return nil
 	}
-	if _, err := io.WriteString(s.w, ": keepalive\n\n"); err != nil {
+	// 复用逐行写路径：升级到带写截止的实现（如 issue #53）后，心跳同样受
+	// 单次写上限保护，不会在客户端不消费时无限阻塞。
+	if _, _, err := s.handleStreamLine(": keepalive\n\n"); err != nil {
 		return err
-	}
-	if s.fl != nil {
-		s.fl.Flush()
 	}
 	*lastWrite = time.Now()
 	return nil
