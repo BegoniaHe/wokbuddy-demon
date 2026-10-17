@@ -4,6 +4,7 @@ package panel
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -82,5 +83,54 @@ func TestAddBackfillRecordDedup(t *testing.T) {
 		if row.Requests != 1 || row.Credits != 1.5 {
 			t.Fatalf("row=%+v want requests=1 credits=1.5", row)
 		}
+	}
+}
+
+// TestFetchBackfillRecordsSplitsCappedWindow 单次范围命中 3000 条上限时必须二分
+// 时间窗，否则上游会把较新的记录（例如今天）丢掉。
+func TestFetchBackfillRecordsSplitsCappedWindow(t *testing.T) {
+	loc := time.FixedZone("UTC+8", 8*60*60)
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body struct {
+			StartTime string `json:"startTime"`
+			EndTime   string `json:"endTime"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		start, err := time.ParseInLocation("2006-01-02 15:04:05", body.StartTime, loc)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		end, err := time.ParseInLocation("2006-01-02 15:04:05", body.EndTime, loc)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		total := 1
+		if end.Sub(start) > 2*time.Hour {
+			total = requestUsageResultCap
+		}
+		fmt.Fprintf(w, `{"code":0,"data":{"total":%d,"data":[
+			{"requestId":"r-%s","model":"m","credit":1,"requestTime":"%s"}]}}`,
+			total, body.StartTime, body.StartTime)
+	}))
+	defer srv.Close()
+
+	p := &Panel{cfg: Config{Upstream: &upstream.Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}}}
+	start := time.Date(2026, 10, 17, 0, 0, 0, 0, loc)
+	recs, err := p.fetchBackfillRecords(&auth.Auth{AccessToken: "at"}, start, start.Add(4*time.Hour))
+	if err != nil {
+		t.Fatalf("fetchBackfillRecords: %v", err)
+	}
+	if len(recs) != 2 {
+		t.Fatalf("records=%d want 2 (one per split window)", len(recs))
+	}
+	if calls < 3 {
+		t.Fatalf("calls=%d want >=3 (cap probe + two windows)", calls)
 	}
 }
