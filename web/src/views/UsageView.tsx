@@ -205,6 +205,12 @@ export function UsageView() {
               <Kpi value={fmtTok(ct)} label="completion" tone="ok" sub={'占比 ' + usPct(ct, total)} />
               <Kpi value={String(errs)} label="失败尝试" tone={errs ? 'warn' : 'mute'} sub={okRate == null ? '—' : errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%'} />
               <Kpi value={fmtMs(t.avg_latency_ms)} label="平均延迟" sub={t.avg_tokens_per_second ? '吐字 ' + usageRate(t.avg_tokens_per_second) : '无速率样本'} />
+              <Kpi
+                value={t.avg_ttft_ms ? fmtMs(t.avg_ttft_ms) : '—'}
+                label="首字延迟"
+                tone={t.avg_ttft_ms ? 'accent' : 'mute'}
+                sub={t.avg_ttft_ms ? 'TTFT 均值（流式样本）' : '无 TTFT 样本'}
+              />
             </Kpis>
 
             <CardContent className="pt-3.5">

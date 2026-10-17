@@ -70,6 +70,9 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+	// ProbeStateFile 面板主动探测（TTFT/成功失败历史）的状态文件（issue #110）。
+	// 与 ProbeFile 分离：不覆盖脚本生成的实测上限文件。空 = 探测可执行但不落盘。
+	ProbeStateFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -98,6 +101,12 @@ type Panel struct {
 
 	// authLimiter 鉴权失败按来源 IP 限速（issue #61）。
 	authLimiter *httpauth.Limiter
+
+	// 模型探测（modelhealth.go，issue #110）：单飞 + 全局并发名额 + 状态文件锁。
+	probeMu       sync.Mutex
+	probeInflight map[string]bool
+	probeSem      chan struct{}
+	probeStateMu  sync.Mutex
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -201,6 +210,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAuth(p.keysDelete))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAuth(p.keysUpdateLimits))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	p.mux.HandleFunc("POST /panel/api/model_probes", p.withAuth(p.modelProbe))
+	p.mux.HandleFunc("GET /panel/api/model_health", p.withAuth(p.modelHealth))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
