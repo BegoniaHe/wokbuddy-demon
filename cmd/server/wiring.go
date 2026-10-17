@@ -1,6 +1,8 @@
 package main
 
 import (
+	"strings"
+
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
@@ -12,6 +14,18 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
+
+// backgroundNameSet 把后台模型名单转为小写查表集合（issue #103）。
+func backgroundNameSet(names []string) map[string]bool {
+	if len(names) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	return set
+}
 
 // rotateStatusSet 把配置的状态码列表转为查表集合（issue #17）。空列表返回 nil，
 // 表示「不按状态码过滤，维持现有按错误分类的换号语义」。
@@ -84,6 +98,9 @@ func buildHandler(d handlerDeps) *server.Handler {
 		DecisionTraceSample: d.cfg.Logging.DecisionTraceSample,
 		LocalWebTools:       d.cfg.Features.LocalWebTools,
 		LocalWebToolRounds:  d.cfg.Features.LocalWebToolRounds,
+		// 后台模型重定向（issue #103）：Live 快照优先，这里填静态回落值。
+		BackgroundNames:  backgroundNameSet(d.cfg.Models.BackgroundNames),
+		BackgroundTarget: d.cfg.Models.BackgroundTarget,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: d.cfg.Global.Enabled,
 		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。

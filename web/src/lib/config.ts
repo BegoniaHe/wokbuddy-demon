@@ -1,6 +1,6 @@
 // 配置页字段映射与收集逻辑（纯函数）。
 
-export type FieldKind = 'text' | 'number' | 'password' | 'select' | 'checkbox' | 'hours';
+export type FieldKind = 'text' | 'number' | 'password' | 'select' | 'checkbox' | 'hours' | 'list';
 
 export interface FieldDef {
   name: string;
@@ -48,6 +48,8 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'header_timeout_seconds', path: ['upstream', 'header_timeout_seconds'], kind: 'number' },
   { name: 'idle_timeout_seconds', path: ['upstream', 'idle_timeout_seconds'], kind: 'number' },
   { name: 'user_agent', path: ['upstream', 'user_agent'], kind: 'text' },
+  { name: 'background_names', path: ['models', 'background_names'], kind: 'list' },
+  { name: 'background_target', path: ['models', 'background_target'], kind: 'text' },
   { name: 'prompt_mode', path: ['prompt', 'mode'], kind: 'select' },
   { name: 'prompt_file', path: ['prompt', 'file'], kind: 'text' },
   { name: 'sanitize_blacklist_fingerprints', path: ['features', 'sanitize_blacklist_fingerprints'], kind: 'checkbox' },
@@ -119,6 +121,8 @@ export function collectConfig(values: Record<string, FieldValue>): Record<string
         v = CLEARABLE_CFG.has(field.name) ? '' : undefined;
       } else if (field.kind === 'hours') {
         v = trimmed.split(/[,，\s]+/).filter(Boolean).map(Number);
+      } else if (field.kind === 'list') {
+        v = trimmed.split(/[,，\s]+/).filter(Boolean);
       } else if (field.kind === 'number') {
         v = Number(trimmed);
       } else {

@@ -948,6 +948,27 @@ func TestCORSOrigins(t *testing.T) {
 	}
 }
 
+// TestBackgroundModels 后台模型名单规范化与默认目标（issue #103）。
+func TestBackgroundModels(t *testing.T) {
+	c := Default()
+	if c.Models.BackgroundTarget != "deepseek-v4.1-flash" {
+		t.Errorf("default target=%q", c.Models.BackgroundTarget)
+	}
+	c.Models.BackgroundNames = []string{" GPT-5-Background ", "gpt-5-background", "", "memory-gen"}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	want := []string{"gpt-5-background", "memory-gen"}
+	if len(c.Models.BackgroundNames) != len(want) {
+		t.Fatalf("names=%v want %v", c.Models.BackgroundNames, want)
+	}
+	for i := range want {
+		if c.Models.BackgroundNames[i] != want[i] {
+			t.Errorf("names[%d]=%q want %q", i, c.Models.BackgroundNames[i], want[i])
+		}
+	}
+}
+
 // TestLocalWebToolRounds 本地上网工具轮数默认 3、上限 8（issue #104）。
 func TestLocalWebToolRounds(t *testing.T) {
 	c := Default()

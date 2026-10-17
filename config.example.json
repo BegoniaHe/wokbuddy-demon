@@ -61,7 +61,9 @@
     "include_disabled_in_tasks": false
   },
   "models": {
-    "aliases": {}
+    "aliases": {},
+    "background_names": [],
+    "background_target": "deepseek-v4.1-flash"
   },
   "global": {
     "enabled": true,

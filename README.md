@@ -383,6 +383,8 @@ claude
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
+| `models.background_names` | `[]` | 客户端后台任务硬编码模型名（大小写不敏感）；命中后把 `model` 改写为 `background_target`。留空 = 关闭。热生效 |
+| `models.background_target` | `deepseek-v4.1-flash` | 后台模型改写目标；只改 `model`，其余请求原样透传 |
 
 ### 模型别名
 
