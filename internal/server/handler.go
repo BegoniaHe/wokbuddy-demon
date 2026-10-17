@@ -1429,6 +1429,11 @@ func (f *chatFlow) accountRecovery(now time.Time) time.Time {
 	}
 	until := futureOrZero(st.Until, now)
 	for _, m := range st.RateLimitedModels {
+		// 只认当前模型：其他模型的冷却与本次请求无关，取它们的最早值会给出
+		// 偏短且必然失败的 Retry-After。
+		if f.bareModel != "" && m.Model != f.bareModel {
+			continue
+		}
 		if t := futureOrZero(m.Until, now); !t.IsZero() && (until.IsZero() || t.Before(until)) {
 			until = t
 		}

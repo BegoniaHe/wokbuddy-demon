@@ -90,3 +90,18 @@ func TestRetryAfterAbsentWhenUnknown(t *testing.T) {
 		t.Fatalf("不可确定时不应带 Retry-After，got %q", got)
 	}
 }
+
+// TestRetryAfterSecondsOnlyCurrentModel 账号上有多个模型冷却时，只取当前模型的
+// 截止时间，避免返回一个客户端按此重试仍会失败的过短等待。
+func TestRetryAfterSecondsOnlyCurrentModel(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(10*time.Second), "other", "6004")
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(90*time.Second), "m", "6004")
+	h := NewHandler(Config{Pool: p})
+	f := &chatFlow{h: h, bareModel: "m", st: &chatStat{uid: "u1"}}
+
+	got := f.retryAfterSeconds(http.StatusTooManyRequests)
+	if got < 89 || got > 91 {
+		t.Fatalf("Retry-After=%d want ~90（当前模型冷却）", got)
+	}
+}
