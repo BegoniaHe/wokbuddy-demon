@@ -36,6 +36,9 @@
     "balance_refresh_minutes": 5,
     "include_disabled_in_tasks": false
   },
+  "models": {
+    "aliases": {}
+  },
   "global": {
     "enabled": true,
     "chat_base": "",

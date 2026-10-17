@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,10 @@ type Config struct {
 	PromptMode string
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
+
+	// ModelAliases 客户端模型别名 → 上游 "[realm:]model"（config models.aliases）。
+	// 命中后选号/粘性/成本台账/日志统一使用解析后的裸模型名（issue #52）。
+	ModelAliases map[string]string
 
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
@@ -436,7 +441,53 @@ func (h *Handler) modelList() []map[string]any {
 	if h.cfg.GlobalEnabled {
 		out = append(out, h.globalModelEntries()...)
 	}
+	return h.appendAliasEntries(out)
+}
+
+// appendAliasEntries 把配置的模型别名追加到 /v1/models 列表（issue #52）。
+// 别名按名字排序保证输出稳定；与真实模型同 id 时以别名为准（请求解析同样
+// 别名优先），避免"列表显示一个、实际路由到另一个"。
+func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
+	if len(h.cfg.ModelAliases) == 0 {
+		return out
+	}
+	names := make([]string, 0, len(h.cfg.ModelAliases))
+	for name := range h.cfg.ModelAliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	index := make(map[string]int, len(out))
+	for i, entry := range out {
+		if id, ok := entry["id"].(string); ok {
+			index[id] = i
+		}
+	}
+	for _, name := range names {
+		entry := map[string]any{
+			"id":       name,
+			"object":   "model",
+			"created":  1753600000,
+			"owned_by": "workbuddy",
+			// upstream_id 保留配置里的 "[realm:]model" 原文；省略 realm 时
+			// 请求侧裸名按 cn 解析，这里也补上 cn: 便于客户端识别目标域。
+			"upstream_id": normalizeAliasTarget(h.cfg.ModelAliases[name]),
+		}
+		if i, ok := index[name]; ok {
+			out[i] = entry
+			continue
+		}
+		out = append(out, entry)
+	}
 	return out
+}
+
+// normalizeAliasTarget 把别名目标规范成 "[realm:]model"（缺省 realm 补 cn）。
+func normalizeAliasTarget(target string) string {
+	realm, bare, prefixed := splitRealm(target)
+	if !prefixed {
+		realm = "cn"
+	}
+	return realm + ":" + bare
 }
 
 // cnModelEntry 组装单个 CN 模型条目（realm 前缀 + 四级长度查找 + 全字段 + effort）。
@@ -671,7 +722,7 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(in.model)
+	realm, bareModel := resolveRequestModel(in.model, h.cfg.ModelAliases)
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -714,7 +765,10 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	if h.cfg.Session != nil && f.sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, in.model); ok {
+		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
+		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
+		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
+		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, f.realm+":"+f.bareModel); ok {
 			f.stickyUID = uid
 		}
 	}
