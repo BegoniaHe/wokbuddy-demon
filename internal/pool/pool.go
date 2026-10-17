@@ -49,6 +49,9 @@ type Pool struct {
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
 	creditFloor int64
+	// 每日护栏（issue #95）：全局默认 + cn/global 字段级覆盖；0 = 关闭。
+	dailyDefault, dailyCN, dailyGlobal DailyLimits
+	dailyUsage                         func() map[string]DailyUsage
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
@@ -65,6 +68,13 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// maxInFlightTotal 网关级全局在途上限（issue #92）；0 = 不限（保持现状）。
+	maxInFlightTotal int
+	// inFlightTotal 当前全局在途数（所有账号租约之和）。无论是否设上限都累加，
+	// 供面板观测与上限判定；Release 仅在账号名额真正减一时同步递减，保证幂等。
+	inFlightTotal atomic.Int64
+	// onModelRateLimit 撞线事件回调（issue #101）：账号 6004 带重置时间时触发。
+	onModelRateLimit func(uid, model, realm string, resetAt time.Time)
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -230,6 +240,56 @@ func (p *Pool) SetCreditFloor(n int64) {
 	}
 }
 
+// DailyLimits 账号级每日护栏；0 = 关闭。
+type DailyLimits struct {
+	Tokens      int64
+	Credits     float64
+	ModelTokens int64
+}
+
+// DailyUsage 账号当日的 token / 积分 / 按模型 token 聚合（由 usage 包提供）。
+type DailyUsage struct {
+	Tokens  int64
+	Credits float64
+	Models  map[string]int64
+}
+
+// SetDailyLimits 注入全局默认与 cn/global 覆盖（issue #95）。
+func (p *Pool) SetDailyLimits(def, cn, global DailyLimits) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dailyDefault, p.dailyCN, p.dailyGlobal = def, cn, global
+}
+
+// SetDailyUsageProvider 注入当日用量快照读取器（issue #95）；nil = 关闭护栏。
+func (p *Pool) SetDailyUsageProvider(fn func() map[string]DailyUsage) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dailyUsage = fn
+}
+
+// dailyLimitsFor 返回账号 realm 的生效限额：realm 字段 >0 时覆盖全局默认。
+// 调用方需已持 p.mu。
+func (p *Pool) dailyLimitsFor(realm string) DailyLimits {
+	out := p.dailyDefault
+	var r DailyLimits
+	if realm == "global" {
+		r = p.dailyGlobal
+	} else {
+		r = p.dailyCN
+	}
+	if r.Tokens > 0 {
+		out.Tokens = r.Tokens
+	}
+	if r.Credits > 0 {
+		out.Credits = r.Credits
+	}
+	if r.ModelTokens > 0 {
+		out.ModelTokens = r.ModelTokens
+	}
+	return out
+}
+
 // SetModelRateOf 注入上游目录积分倍率查表（main 用 upstream.Client.ModelRate 装配）。
 // 供积分保底兜底判定「未实测过的模型是否收费」——本地台账无观测时，不能因为
 // 「没学过」就放行，否则高价新模型会把触底号一次性打穿（kimi-k3-1 实案：
@@ -239,6 +299,36 @@ func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.modelRateOf = fn
+}
+
+// ProxySlotOf 返回账号绑定的代理槽 ID（空 = 不绑定）。
+func (p *Pool) ProxySlotOf(uid string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.proxySlot
+	}
+	return ""
+}
+
+// SetProxySlot 绑定/解绑账号的出站代理槽（issue #96）；slot 为空 = 解绑。
+func (p *Pool) SetProxySlot(uid, slot string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.proxySlot = strings.TrimSpace(slot)
+	p.dirty.Store(true)
+	return true
+}
+
+// SetModelRateLimitHook 注入 6004 撞线事件回调（issue #101）；nil = 不记录。
+func (p *Pool) SetModelRateLimitHook(fn func(uid, model, realm string, resetAt time.Time)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onModelRateLimit = fn
 }
 
 // SetMaxInFlight 注入单账号最大在途请求数；0 = 不限。负值保留原值。
@@ -258,6 +348,32 @@ func (p *Pool) SetMaxInFlightGlobal(n int) {
 	if n >= 0 {
 		p.maxInFlightGlobal = n
 	}
+}
+
+// SetMaxInFlightTotal 注入网关级全局在途上限（issue #92）；0 = 不限。
+// 负值保留原值。
+func (p *Pool) SetMaxInFlightTotal(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.maxInFlightTotal = n
+	}
+}
+
+// MaxInFlightTotal 返回全局在途上限（0 = 不限）。
+func (p *Pool) MaxInFlightTotal() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.maxInFlightTotal
+}
+
+// InFlightTotal 返回当前全局在途请求数。
+func (p *Pool) InFlightTotal() int { return int(p.inFlightTotal.Load()) }
+
+// GlobalInFlightFull 报告全局在途是否已达上限（上限 0 = 恒 false）。
+func (p *Pool) GlobalInFlightFull() bool {
+	limit := p.MaxInFlightTotal()
+	return limit > 0 && p.inFlightTotal.Load() >= int64(limit)
 }
 
 // inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；
@@ -291,9 +407,49 @@ func (p *Pool) Acquire(uid string) bool {
 		return false
 	}
 	limit := p.inFlightLimit(e)
+	totalLimit := p.maxInFlightTotal
 	p.mu.RUnlock()
+
+	// 先占全局名额（issue #92）：即使未设上限也计数，供观测与后续热开上限判定。
+	if !p.acquireTotal(totalLimit) {
+		return false
+	}
+	if !p.acquireAccount(e, limit) {
+		p.releaseTotal()
+		return false
+	}
+	return true
+}
+
+// acquireTotal 占一个全局在途名额；limit>0 时满额返回 false。
+func (p *Pool) acquireTotal(limit int) bool {
+	for {
+		cur := p.inFlightTotal.Load()
+		if limit > 0 && cur >= int64(limit) {
+			return false
+		}
+		if p.inFlightTotal.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// releaseTotal 归还一个全局名额；钳到 0，避免重复释放把计数扣成负数。
+func (p *Pool) releaseTotal() {
+	for {
+		cur := p.inFlightTotal.Load()
+		if cur <= 0 {
+			return
+		}
+		if p.inFlightTotal.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+// acquireAccount 占账号名额；limit<=0 时只计数不拒绝。
+func (p *Pool) acquireAccount(e *entry, limit int) bool {
 	if limit <= 0 {
-		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
 		return true
 	}
@@ -322,6 +478,8 @@ func (p *Pool) Release(uid string) {
 			return
 		}
 		if e.inFlight.CompareAndSwap(cur, cur-1) {
+			// 只有账号名额真正减一时才减全局，重复 Release 不会侵占他人的名额。
+			p.releaseTotal()
 			return
 		}
 	}
@@ -370,8 +528,11 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		p.upsertLocked(a)
 	}
 	changed := false
-	for uid := range p.byUID {
+	for uid, e := range p.byUID {
 		if !seen[uid] {
+			if n := e.inFlight.Swap(0); n > 0 {
+				p.inFlightTotal.Add(-n)
+			}
 			delete(p.byUID, uid)
 			changed = true
 		}
@@ -392,6 +553,9 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 		return nil
 	}
 	delete(p.byUID, uid)
+	if n := e.inFlight.Swap(0); n > 0 {
+		p.inFlightTotal.Add(-n)
+	}
 	p.dirty.Store(true)
 	p.saveLocked()
 	return e.a

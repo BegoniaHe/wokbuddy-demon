@@ -76,6 +76,10 @@ type Config struct {
 	// 命中后选号/粘性/成本台账/日志统一使用解析后的裸模型名（issue #52）。
 	ModelAliases map[string]string
 
+	// MaxBodyBytes 聊天类入站请求体上限（server.max_body_bytes）；
+	// 0 = 不限制。超限在解析前返回 413，不进入选号。
+	MaxBodyBytes int64
+
 	// KeepaliveInterval 入站 SSE 主动心跳间隔（config upstream.keepalive_interval，
 	// issue #54）；0 = 关闭（保持逐字节行为）。
 	KeepaliveInterval time.Duration
@@ -105,6 +109,17 @@ type Config struct {
 	DecisionTrace       bool
 	DecisionTraceSample float64
 
+	// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin（已规范化）；空 = 关闭。
+	CORSOrigins []string
+	// LocalWebTools 是否允许 Responses 本地 web 工具代跑（issue #104）。
+	LocalWebTools bool
+	// LocalWebToolRounds 本地工具代跑轮数（0 回落默认 3，封顶 8）。
+	LocalWebToolRounds int
+	// BackgroundNames 后台模型改写名单（小写；issue #103）；空 = 关闭。
+	BackgroundNames map[string]bool
+	// BackgroundTarget 后台模型改写目标（issue #103）。
+	BackgroundTarget string
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -118,6 +133,8 @@ type Handler struct {
 	degrade degradeGate
 	// metrics 进程内生命周期指标（/metrics 的耗时 histogram 与换号计数）。
 	metrics *metricsRegistry
+	// cors 允许跨域的 Origin 集合；空 = 关闭 CORS。
+	cors map[string]bool
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
@@ -133,10 +150,14 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:            h.cfg.APIKey,
-		SoftCooldown:      h.cfg.SoftCooldown,
-		RecordClientInfo:  h.cfg.RecordClientInfo,
-		MultimodalRouting: h.cfg.MultimodalRouting,
+		APIKey:             h.cfg.APIKey,
+		SoftCooldown:       h.cfg.SoftCooldown,
+		RecordClientInfo:   h.cfg.RecordClientInfo,
+		MultimodalRouting:  h.cfg.MultimodalRouting,
+		LocalWebTools:      h.cfg.LocalWebTools,
+		LocalWebToolRounds: h.cfg.LocalWebToolRounds,
+		BackgroundNames:    h.cfg.BackgroundNames,
+		BackgroundTarget:   h.cfg.BackgroundTarget,
 	}
 }
 
@@ -179,10 +200,15 @@ func NewHandler(cfg Config) *Handler {
 	h := &Handler{
 		cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
 		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+		cors:        make(map[string]bool, len(cfg.CORSOrigins)),
+	}
+	for _, origin := range cfg.CORSOrigins {
+		h.cors[origin] = true
 	}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/responses", h.withClientAuth(h.responsesHandler))
 	h.mux.HandleFunc("POST /v1/messages", h.withClientAuth(h.anthropicMessagesHandler))
 	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withClientAuth(h.anthropicCountTokensHandler))
 	h.mux.HandleFunc("GET /v1/models", h.withClientAuth(h.models))
@@ -214,9 +240,46 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleCORS 处理 `/v1/*` 的跨域头与 OPTIONS 预检。返回 true 表示已写出
+// 预检响应；普通请求只附加允许头后继续。管理面与未配置 CORS 时完全跳过。
+func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
+	if len(h.cors) == 0 || !isV1Path(r.URL.Path) {
+		return false
+	}
+	w.Header().Add("Vary", "Origin")
+	origin := strings.ToLower(r.Header.Get("Origin"))
+	allowed := origin != "" && h.cors[origin]
+	if allowed {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-ID")
+	}
+	if r.Method != http.MethodOptions {
+		return false
+	}
+	if allowed {
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		headers := r.Header.Get("Access-Control-Request-Headers")
+		if headers == "" {
+			headers = "Authorization, Content-Type, X-Requested-With"
+		}
+		w.Header().Set("Access-Control-Allow-Headers", headers)
+		w.Header().Set("Access-Control-Max-Age", "600")
+	}
+	w.WriteHeader(http.StatusNoContent)
+	return true
+}
+
+// isV1Path 仅匹配网关 API 面（/v1 及其子路径），管理面不参与 CORS。
+func isV1Path(path string) bool {
+	return path == "/v1" || strings.HasPrefix(path, "/v1/")
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.handleCORS(w, r) {
+		return
+	}
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
-		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages") {
+		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses") {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
@@ -307,7 +370,11 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		defer release()
 		ku := &keyUsage{id: res.KeyID}
-		next(w, r.WithContext(context.WithValue(r.Context(), keyUsageKey{}, ku)))
+		ctx := context.WithValue(r.Context(), keyUsageKey{}, ku)
+		if realm := h.cfg.Keys.Realm(res.KeyID); realm != "" {
+			ctx = context.WithValue(ctx, keyRealmCtxKey{}, realm)
+		}
+		next(w, r.WithContext(ctx))
 		h.cfg.Keys.RecordUsage(ku.id, ku.prompt, ku.completion, ku.total)
 	}
 }
@@ -726,10 +793,13 @@ type chatFlow struct {
 	out chatResponder
 
 	// 请求体与解析结果
-	body          []byte
-	stream        bool
-	rawModel      string
-	realm         string
+	body     []byte
+	stream   bool
+	rawModel string
+	realm    string
+	// realmErr 命名密钥出口绑定与请求显式前缀冲突（issue #94）；非 nil 时
+	// serveChat 在选号前返回 400。
+	realmErr      error
 	bareModel     string
 	modelRate     string
 	declaredTools map[string]bool
@@ -778,7 +848,7 @@ const (
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 入站适配：解析 HTTP 请求为结构化输入，并构造输出端口（唯一的 net/http 边界）。
-	in, out, ok := newChatInput(w, r, h.cfg.KeepaliveInterval)
+	in, out, ok := newChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
@@ -793,6 +863,11 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 		return
 	}
 	f := h.newChatFlow(in, out)
+	if f.realmErr != nil {
+		f.out.Error(http.StatusBadRequest, "realm_binding_conflict", f.realmErr.Error(), "")
+		f.st.status = http.StatusBadRequest
+		return
+	}
 	// 出口统一释放：先释放在途租约，再落请求流水行（与原 defer 顺序一致）。
 	defer f.st.done()
 	defer f.releaseHeld()
@@ -809,13 +884,40 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 	f.writeFinalError()
 }
 
+// backgroundTarget 返回后台模型改写目标；未命中或名单为空返回空串。
+func (h *Handler) backgroundTarget(model string) string {
+	live := h.loadLive()
+	if len(live.BackgroundNames) == 0 {
+		return ""
+	}
+	if !live.BackgroundNames[strings.ToLower(strings.TrimSpace(model))] {
+		return ""
+	}
+	return live.BackgroundTarget
+}
+
 // newChatFlow 由结构化输入组装统计、会话标识与轮转状态（传输无关）。
 // 入站 HTTP 解析（读 body / 提取头与 IP）已在 newChatInput 完成。
 func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
+	// 后台任务模型重定向（issue #103）：只改 model 字段，后续 realm/别名/选号/
+	// 记账全部基于改写后的模型。名单为空时不改变任何行为。
+	if target := h.backgroundTarget(in.model); target != "" {
+		log.Printf("INFO: [server] alias: background model %s -> %s", in.model, target)
+		in.body = rewriteModel(in.body, target)
+		in.model = target
+	}
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveRequestModel(in.model, h.cfg.ModelAliases)
+	var realmErr error
+	if in.keyRealm != "" {
+		if err := checkKeyRealmBinding(in.model, h.cfg.ModelAliases, in.keyRealm); err != nil {
+			realmErr = err
+		} else {
+			realm = in.keyRealm
+		}
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -838,6 +940,7 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 		stream:   in.stream,
 		rawModel: in.model,
 		realm:    realm,
+		realmErr: realmErr,
 		// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 		// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
@@ -963,6 +1066,12 @@ func (f *chatFlow) fail(uid string) {
 // runRotation 执行选号 + 重试轮转。返回 true 表示已写出响应（成功或请求级错误）。
 // 「先到先停」：次数上限 MaxRotate 与总时长预算 RotateBudget（>0 时）任一先到即停。
 func (f *chatFlow) runRotation(ctx context.Context) bool {
+	// 全局在途满额：在选号前快速失败（issue #92），避免为一个注定拿不到名额的
+	// 请求做选号、粘性与轮换。并发竞态仍由 Acquire 的 CAS 兜底。
+	if f.h.cfg.Pool.GlobalInFlightFull() {
+		f.st.status = http.StatusServiceUnavailable
+		return false
+	}
 	var deadline time.Time
 	if f.h.cfg.RotateBudget > 0 {
 		deadline = time.Now().Add(f.h.cfg.RotateBudget)
@@ -1004,6 +1113,11 @@ func (f *chatFlow) recordRotation() {
 func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 	acct := f.pickAccount()
 	if acct == nil {
+		if f.h.cfg.Pool.AllDailyBlocked(f.bareModel, f.realm) {
+			f.st.dailyLimited = true
+			f.st.status = http.StatusTooManyRequests
+			return rotBreak
+		}
 		f.st.status = http.StatusServiceUnavailable
 		// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 		//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
@@ -1030,6 +1144,11 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 
 	// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 	if !f.h.cfg.Pool.Acquire(acct.UID) {
+		// 全局名额被并发抢走：直接终止，不再换号空转。
+		if f.h.cfg.Pool.GlobalInFlightFull() {
+			f.st.status = http.StatusServiceUnavailable
+			return rotBreak
+		}
 		return f.retryAcquireFailed(ctx, acct, i)
 	}
 	f.heldUID = acct.UID
@@ -1644,6 +1763,15 @@ func (f *chatFlow) recordKeyUsage() {
 
 // writeFinalError 末端错误透传：轮转耗尽/提前终止后写出最终错误响应。
 func (f *chatFlow) writeFinalError() {
+	if f.st != nil && f.st.dailyLimited {
+		seconds := secondsUntilLocalMidnight(time.Now())
+		f.out.Header("Retry-After", strconv.Itoa(seconds))
+		f.out.Error(http.StatusTooManyRequests, "daily_limit_reached",
+			"daily account limits reached; retry after local midnight", "")
+		f.st.status = http.StatusTooManyRequests
+		f.st.outcome = reqlog.OutcomeHTTPError
+		return
+	}
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
 	if seconds := f.retryAfterSeconds(status); seconds > 0 {
@@ -2175,4 +2303,15 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 		msg = uerr.Msg
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+}
+
+// secondsUntilLocalMidnight 返回距离本地次日 0 点的秒数（至少 1）。
+func secondsUntilLocalMidnight(now time.Time) int {
+	y, m, d := now.Date()
+	next := time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
+	sec := int(math.Ceil(next.Sub(now).Seconds()))
+	if sec < 1 {
+		return 1
+	}
+	return sec
 }

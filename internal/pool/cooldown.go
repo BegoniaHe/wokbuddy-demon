@@ -172,6 +172,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 			ResetAt: resetAt,
 			Reason:  reason,
 		}
+		if p.onModelRateLimit != nil {
+			p.onModelRateLimit(uid, model, e.a.Realm(), resetAt)
+		}
 	} else {
 		// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
 		// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。

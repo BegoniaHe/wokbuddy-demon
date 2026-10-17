@@ -531,6 +531,116 @@ func TestWriteDefault(t *testing.T) {
 	}
 }
 
+func TestReplacePlaceholderAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	raw := `{"api_key":"test_key","listen":":9000","custom":{"keep":true}}`
+	if err := os.WriteFile(fp, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key, replaced, err := ReplacePlaceholderAPIKey(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced || key == placeholderAPIKey || !strings.HasPrefix(key, "sk-") {
+		t.Fatalf("replaced=%v key=%q want random sk- key", replaced, key)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.APIKey != key || c.Listen != ":9000" {
+		t.Fatalf("loaded api_key=%q listen=%q", c.APIKey, c.Listen)
+	}
+	assertConfigDocAPIKey(t, fp, key)
+}
+
+func TestReplacePlaceholderAPIKeyIdempotent(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(fp, []byte(`{"api_key":"test_key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReplacePlaceholderAPIKey(fp); err != nil {
+		t.Fatal(err)
+	}
+	if _, replaced, err := ReplacePlaceholderAPIKey(fp); err != nil || replaced {
+		t.Fatalf("second run replaced=%v err=%v", replaced, err)
+	}
+}
+
+// assertConfigDocAPIKey 断言文件中 api_key 已写成 want，且未知顶层键仍保留。
+func assertConfigDocAPIKey(t *testing.T, fp, want string) {
+	t.Helper()
+	written, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(written, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["custom"]; !ok {
+		t.Error("unknown key custom dropped")
+	}
+	var got string
+	if err := json.Unmarshal(doc["api_key"], &got); err != nil || got != want {
+		t.Fatalf("file api_key=%q err=%v want %q", got, err, want)
+	}
+}
+
+func TestReplacePlaceholderAPIKeyKeepsExplicitValues(t *testing.T) {
+	for _, explicit := range []string{"", "my-own-key"} {
+		t.Run(explicit, func(t *testing.T) {
+			dir := t.TempDir()
+			fp := filepath.Join(dir, "config.json")
+			raw, err := json.Marshal(map[string]any{"api_key": explicit, "listen": ":9000"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fp, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			key, replaced, err := ReplacePlaceholderAPIKey(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replaced || key != "" {
+				t.Fatalf("replaced=%v key=%q want untouched", replaced, key)
+			}
+			after, err := os.ReadFile(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(raw) {
+				t.Errorf("file changed for explicit value %q", explicit)
+			}
+		})
+	}
+}
+
+func TestLoadConfigReplacesPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(fp, []byte(`{"api_key":"test_key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := loadConfig(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.APIKey == placeholderAPIKey || c.APIKey == "" {
+		t.Fatalf("api_key=%q want random", c.APIKey)
+	}
+	// 写回后的文件与运行时一致
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.APIKey != c.APIKey {
+		t.Errorf("file api_key=%q runtime=%q", c2.APIKey, c.APIKey)
+	}
+}
+
 // assertWrittenDefaults 断言 WriteDefault 产出的文件可加载、api_key 生效且推荐值齐备。
 func assertWrittenDefaults(t *testing.T, fp, key string) {
 	t.Helper()
@@ -739,6 +849,22 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	}
 }
 
+// TestMaxInFlightTotalConfig 全局在途上限默认 0（不限），负值 fail fast。
+func TestMaxInFlightTotalConfig(t *testing.T) {
+	c := Default()
+	if c.Pool.MaxInFlightTotal != 0 {
+		t.Errorf("default max_in_flight_total=%d want 0", c.Pool.MaxInFlightTotal)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	c = Default()
+	c.Pool.MaxInFlightTotal = -1
+	if err := c.normalize(); err == nil {
+		t.Error("negative max_in_flight_total should fail fast")
+	}
+}
+
 // TestServerReadTimeout 入站读取上限（issue #100）：空值回落默认 300s；
 // "0" = 显式不限制（0 是合法值不回落）；负值 fail fast（静默钳 0 会把保护悄悄关掉）。
 func TestServerReadTimeout(t *testing.T) {
@@ -781,6 +907,133 @@ func TestServerReadTimeout(t *testing.T) {
 	c.Server.ReadTimeout = "bogus"
 	if err := c.normalize(); err == nil {
 		t.Error("unparsable read_timeout should fail fast")
+	}
+}
+
+// TestBackgroundTargetPreserved 自定义后台模型目标不被 aliases / 空 checkin_hours 重置。
+func TestBackgroundTargetPreserved(t *testing.T) {
+	c := Default()
+	c.Models.BackgroundTarget = "custom-target"
+	c.Models.Aliases = map[string]string{"fast": "glm-5.2"}
+	c.Schedule.CheckinHours = nil
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Models.BackgroundTarget != "custom-target" {
+		t.Fatalf("target=%q want custom-target", c.Models.BackgroundTarget)
+	}
+}
+
+// TestDailyLimitsConfig 每日限额负值拒绝，0 = 关闭（issue #95）。
+func TestDailyLimitsConfig(t *testing.T) {
+	c := Default()
+	if c.Limits.DailyTokens != 0 || c.Limits.DailyCredits != 0 {
+		t.Errorf("default limits=%+v want zero", c.Limits)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	c.Limits.DailyTokens = -1
+	if err := c.normalize(); err == nil {
+		t.Error("negative daily_tokens should fail")
+	}
+}
+
+// TestServerMaxBodyBytes 聊天入口请求体上限（issue #86）：默认 16 MiB，
+// 0 = 不限制，负值 fail fast。
+func TestServerMaxBodyBytes(t *testing.T) {
+	c := Default()
+	if c.Server.MaxBodyBytes != 16<<20 {
+		t.Errorf("default max_body_bytes=%d want %d", c.Server.MaxBodyBytes, 16<<20)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+
+	c = Default()
+	c.Server.MaxBodyBytes = 0
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize zero: %v", err)
+	}
+	if c.Server.MaxBodyBytes != 0 {
+		t.Errorf("zero max_body_bytes=%d want 0", c.Server.MaxBodyBytes)
+	}
+
+	c = Default()
+	c.Server.MaxBodyBytes = -1
+	if err := c.normalize(); err == nil {
+		t.Error("negative max_body_bytes should fail fast")
+	}
+}
+
+// TestCORSOrigins 校验 server.cors_origins 的规范化与非法值拒绝（issue #91）。
+func TestCORSOrigins(t *testing.T) {
+	c := Default()
+	c.Server.CORSOrigins = []string{" HTTP://LocalHost:3000/ ", "http://localhost:3000", "https://app.example.com"}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	want := []string{"http://localhost:3000", "https://app.example.com"}
+	if len(c.Server.CORSOrigins) != len(want) {
+		t.Fatalf("origins=%v want %v", c.Server.CORSOrigins, want)
+	}
+	for i := range want {
+		if c.Server.CORSOrigins[i] != want[i] {
+			t.Errorf("origins[%d]=%q want %q", i, c.Server.CORSOrigins[i], want[i])
+		}
+	}
+
+	bad := []string{"*", "localhost:3000", "ftp://example.com", "https://example.com/path", "https://example.com?q=1", "https://u:p@example.com"}
+	for _, origin := range bad {
+		c := Default()
+		c.Server.CORSOrigins = []string{origin}
+		if err := c.normalize(); err == nil {
+			t.Errorf("origin %q should be rejected", origin)
+		}
+	}
+}
+
+// TestBackgroundModels 后台模型名单规范化与默认目标（issue #103）。
+func TestBackgroundModels(t *testing.T) {
+	c := Default()
+	if c.Models.BackgroundTarget != "deepseek-v4.1-flash" {
+		t.Errorf("default target=%q", c.Models.BackgroundTarget)
+	}
+	c.Models.BackgroundNames = []string{" GPT-5-Background ", "gpt-5-background", "", "memory-gen"}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	want := []string{"gpt-5-background", "memory-gen"}
+	if len(c.Models.BackgroundNames) != len(want) {
+		t.Fatalf("names=%v want %v", c.Models.BackgroundNames, want)
+	}
+	for i := range want {
+		if c.Models.BackgroundNames[i] != want[i] {
+			t.Errorf("names[%d]=%q want %q", i, c.Models.BackgroundNames[i], want[i])
+		}
+	}
+}
+
+// TestLocalWebToolRounds 本地上网工具轮数默认 3、上限 8（issue #104）。
+func TestLocalWebToolRounds(t *testing.T) {
+	c := Default()
+	if c.Features.LocalWebToolRounds != 3 {
+		t.Errorf("default rounds=%d want 3", c.Features.LocalWebToolRounds)
+	}
+	c.Features.LocalWebToolRounds = 99
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.LocalWebToolRounds != 8 {
+		t.Errorf("clamped rounds=%d want 8", c.Features.LocalWebToolRounds)
+	}
+	c = Default()
+	c.Features.LocalWebToolRounds = 0
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.LocalWebToolRounds != 3 {
+		t.Errorf("zero rounds=%d want 3", c.Features.LocalWebToolRounds)
 	}
 }
 
@@ -870,5 +1123,23 @@ func checkLoggingArchive(t *testing.T, tag string, enabled bool, days, mb int, w
 	if enabled != wantEnabled || days != wantDays || mb != wantMB {
 		t.Fatalf("%s logging archive = enabled=%v days=%d mb=%d, want %v/%d/%d",
 			tag, enabled, days, mb, wantEnabled, wantDays, wantMB)
+	}
+}
+
+// TestCORSOriginDefaultPort 规范化时去掉默认端口，避免浏览器 Origin 精确匹配失败。
+func TestCORSOriginDefaultPort(t *testing.T) {
+	c := Default()
+	c.Server.CORSOrigins = []string{"https://Example.com:443", "http://Example.com:80", "http://[::1]:80"}
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://example.com", "http://example.com", "http://[::1]"}
+	if len(c.Server.CORSOrigins) != len(want) {
+		t.Fatalf("origins=%v want %v", c.Server.CORSOrigins, want)
+	}
+	for i := range want {
+		if c.Server.CORSOrigins[i] != want[i] {
+			t.Errorf("origins[%d]=%q want %q", i, c.Server.CORSOrigins[i], want[i])
+		}
 	}
 }

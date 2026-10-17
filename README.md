@@ -49,7 +49,7 @@ WokBuddy Demon 是一个**自托管的 CodeBuddy 账号成长伴侣**：一只�
 
 ## 🎯 成长任务一键完成（17/18）
 
-官方「成长计划」的 18 个成长任务中，**17 个可在面板上一键完成**——无需安装官方客户端、无需人工交互，点一下「一键完成」即自动推进进度、等待异步计分落定并**自动领奖**。剩余任务展示操作指引。
+官方「成长计划」的 18 个成长任务中，**17 个可在面板上一键完成**——无需安装官方客户端、无需人工交互，点一下「一键完成」即自动推进进度、等待异步计分落定并**自动领奖**。剩余 1 个任务展示操作指引。
 
 ### 任务覆盖与奖励
 
@@ -71,6 +71,9 @@ WokBuddy Demon 是一个**自托管的 CodeBuddy 账号成长伴侣**：一只�
 | `Hp_Appearance` | +100c +5e | 主题设置 + 皮肤生效事件 |
 | `Expert_lighthouse` | +100c +5e | 轻量云专家召唤 + 使用链（可免费领一个月轻量服务器） |
 | `skill_1` | +100c +5e | 真实对话 + 技能加载事件 |
+| `black_cat` | — | 夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足；窗口外提示稍后再试 |
+
+**官方 18 个成长任务中：上表 17 个可一键完成（含夜猫子窗口任务），剩余 1 个需人工操作。** 小程序 `Sequential_Tasks_1`–`7` 与开学季任务属于独立活动口径，不在官方 18 个成长任务内，在任务中心另行执行。
 
 **全新账号一键全做完 ≈ +1950 credits +78 能量**，其中仅数个任务涉及真实对话，其余全部为行为事件上报，零对话消耗。
 
@@ -83,6 +86,8 @@ WokBuddy Demon 是一个**自托管的 CodeBuddy 账号成长伴侣**：一只�
 > ⚠️ 行为事件按天幂等：重复点「一键完成」不会重复扣资源，已达标的任务自动跳过。
 
 ### 🧭 任务中心
+
+「积分构成」页提供只读「获取历史」：按发放时间展示全部积分包、推断来源与可用/用完/过期状态；数据来自现有积分包快照，不额外请求上游。
 
 「任务中心」视图把散落的任务能力收拢成一处：
 
@@ -116,7 +121,7 @@ http://127.0.0.1:7863/panel/
 | **任务中心** | 成长任务队列：一键扫描全部账号待办 → 按账号排队执行，进度实时更新 |
 | **模型与档位** | 实时查询每模型倍率 / 思考档 / 上下文长度与最大输出，支持按条件查询与排序；可对单个模型「探测」首字延迟（TTFT），显示最近一次与滚动均值/p95，历史写入 `data/model_probes.json` |
 | **密钥** | 命名 API 密钥管理：创建（明文仅显示一次）/ 撤销 / 删除，并按密钥查看请求数与 token 用量 |
-| **配置** | 在线编辑配置：服务 / 定时任务 / 账号治理 / 高级 / 日志，保存即热生效 |
+| **配置** | 在线编辑配置：服务 / 定时任务 / 账号治理 / 上游身份与代理 / global / 提示词 / Upstash / 路径 / 日志；热字段即时生效，装配期字段提示重启 |
 | **运行日志** | 请求记录表（时间 / 结果 / 模型 / 账号 / 来源 IP / UA / 耗时 / Token）+ 运行日志分频道 |
 
 顶部另有「刷新」（向官方全量查询真实余额并回写）与「添加账号」（浏览器内完成授权登录，凭证落盘并**热加载，免重启**）。
@@ -147,7 +152,8 @@ cd wokbuddy-demon
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    示例里的 api_key 是公开占位值 test_key；程序启动时会自动替换为随机密钥
+#    并写回该文件（显式设置的其他值不会被覆盖）。也可先自行改成自己的密钥。
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -256,8 +262,17 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 | 协议 | 端点 |
 |---|---|
-| OpenAI | `POST /v1/chat/completions`、`GET /v1/models` |
+| OpenAI Chat Completions | `POST /v1/chat/completions`、`GET /v1/models` |
+| OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function tools） |
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
+
+Codex CLI 等使用 Responses API 的客户端：
+
+```bash
+export OPENAI_BASE_URL=http://127.0.0.1:7863/v1
+export OPENAI_API_KEY=test_key   # 换成 config.json 中生效的 api_key
+codex
+```
 
 Claude Code 接入示例（`api_key` 非空时填同一密钥）：
 
@@ -330,7 +345,7 @@ claude
 
 ## 配置说明
 
-**`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。下表为字段含义速查。
+**`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。启动时若 `api_key` 仍精确等于占位值 `test_key`，程序会生成随机密钥并原子写回配置文件；显式设置的其他值保持不变。检查生效值：`grep '"api_key"' config.json`（不要分享该输出）。下表为字段含义速查。面板保存后返回的「需重启」字段只包含本次实际变化的装配期字段；未提示的字段已热生效。面板「配置」页覆盖服务、定时任务、账号池、上游身份与代理、global、提示词、Upstash、路径与日志字段；设备 Token 与 Upstash Token 以密码框展示，已设置时留空保存即保持原值。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -344,6 +359,9 @@ claude
 | `logging.decision_trace_sample` | `0.1` | 决策链采样率：0/1 = 全部，0<v<1 按比例。改后需重启 |
 | `notify.webhook_url` | 空 | 告警 webhook（http/https）；空 = 关闭 |
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
+| `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；`0` = 不限制。改后需重启 |
+| `server.max_body_bytes` | `16777216` | 聊天类入站请求体上限（字节，16 MiB），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413 `payload_too_large`；`0` = 不限制。改后需重启 |
+| `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `upstream.model_timeouts` | `{}` | 按模型覆盖 `header` / `idle` 超时（如 `{"cn:glm-5.2":{"header":"300s","idle":"600s"}}`）；未命中回落全局。改后需重启 |
@@ -351,7 +369,10 @@ claude
 | `upstream.rotate_budget` | `0` | 轮换总时长预算（如 `90s`）；`0` = 不限。与 `rotate_max` 先到先停 |
 | `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
 | `upstream.keepalive_interval` | `0` | 入站 SSE 主动心跳间隔（如 `15s`）；上游静默时写 `: keepalive` 注释帧。`0` = 关闭 |
+| `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
+| `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
+| `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |
 | `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |
 | `schedule.travel_hours` | `[9, 21]` | 每日整点推进猫猫旅行状态机 |
@@ -360,11 +381,21 @@ claude
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
 | `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
-| `pool.credit_floor` | `100` | 积分保底：余额低于该值不再参与收费模型轮换 |
+| `limits.daily_tokens` | `0` | 账号当日总 token 达限后不接单；`0` = 关闭。本地 0 点重置 |
+| `limits.daily_credits` | `0` | 账号当日消耗积分达限后只接免费模型；`0` = 关闭 |
+| `limits.model_daily_tokens` | `0` | 账号 × 模型当日 token 达限后只禁该模型；`0` = 关闭 |
+| `limits.cn` / `limits.global` | 同全局 | 按域字段级覆盖（>0 生效） |
+| `pricing.enabled` | `false` | 在用量页展示 OpenRouter 公开价折算的等价花费；只读，不参与调度/计费 |
+| `pricing.refresh_minutes` | `0` | 价格自动刷新周期；`0` = 只在启动时拉取一次 |
+| `pricing.exchange_rate` | `1` | 展示币种换算系数（1 = USD） |
+| `pool.max_in_flight_total` | `0` | 网关级全局在途上限；满额新请求返回 503 且不选号；`0` = 不限。热生效 |
+| `pool.credit_floor` | `0`（示例 `100`） | 积分保底：余额低于该值不再参与收费模型轮换；`0` = 关闭 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
+| `models.background_names` | `[]` | 客户端后台任务硬编码模型名（大小写不敏感）；命中后把 `model` 改写为 `background_target`。留空 = 关闭。热生效 |
+| `models.background_target` | `deepseek-v4.1-flash` | 后台模型改写目标；只改 `model`，其余请求原样透传 |
 
 ### 模型别名
 
@@ -441,6 +472,7 @@ claude
 
 - 默认监听 `:7863`，**无内置 TLS**；Docker Compose 默认仅绑定 `127.0.0.1`，需要局域网/公网访问时显式改端口映射
 - 公网部署必须设置 `api_key`，并置于 HTTPS 之后 / 仅内网可达
+- 聊天请求体默认上限 16 MiB（`server.max_body_bytes`，0 = 不限制），超限在解析前返回 413
 - `api_key` 非空时，面板与 `GET /status`、`GET /metrics` 对同一来源地址的鉴权失败做 1 分钟窗口计数，连续 10 次失败后返回 `429` + `Retry-After`；成功鉴权清零。来源只取 TCP `RemoteAddr`，不信任 `X-Forwarded-For`；经反向代理部署时所有客户端共享反代地址，需在反代层另行限速
 - 日志字段不含任何 token 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**，代码无任何落盘日志文件
@@ -466,6 +498,16 @@ claude
 PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 ```
 
+### 智能体一键配置
+
+面板「智能体配置」页（仅本机回环可用）可检测 Claude Code / Codex CLI / OpenCode，并把网关 provider 增量写入各客户端配置：
+
+- 写入前把首次原件备份到 `data/agent-backups/<client>/`；还原按备份字节级恢复，网关新建的文件会被删除。
+- 若写入后用户手改过配置，还原前会提示并要求强制确认。
+- API key 只写入客户端本地配置，面板不回显。
+- 网关地址填根地址（如 `http://127.0.0.1:7863`）；Claude Code 使用根地址，Codex CLI / OpenCode 自动补 `/v1`。
+- Codex CLI 使用 `experimental_bearer_token` 内嵌 key，无需额外导出环境变量。
+
 ### 面板需要鉴权吗？
 
 `api_key` 非空时面板要求输入一次密钥（浏览器记住）；为空则直接可用。**公网部署务必设置 `api_key` 并置于 HTTPS 之后。**
@@ -479,6 +521,7 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 - 面板、`GET /status`、`GET /metrics` 仍**只认**默认 `api_key`（命名密钥是给客户端的，不获得管理/运维可见性）；
 - 每把密钥记录 `last_used_at`、请求数 / token 用量与被限制拒绝数，面板可查看；
 - 面板「限制」可设置每把密钥的 `rpm` / `tpm` / `max_concurrent` / 模型白名单（glob，可带 `cn:` / `global:` 前缀）；超限返回 `429 + Retry-After`，白名单未命中返回 `403 model_not_allowed`；未配置限制的密钥行为不变。限流为进程内单实例计数；
+- 每把密钥可绑定出口（`cn` / `global` / 跟随模型）：绑定后不带前缀的请求只走对应域；与显式 `cn:` / `global:` 前缀冲突返回 `400 realm_binding_conflict`，不消耗账号或上游额度；
 - `api_key` 为空且未创建任何命名密钥时，网关仍为「不鉴权」放行（既有默认）。
 
 本功能**不涉及任何计费**：不设额度、不设配额、不设账单。

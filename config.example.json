@@ -4,7 +4,10 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "read_timeout": "300s"
+    "read_timeout": "300s",
+    "read_timeout": "300s",
+    "max_body_bytes": 16777216,
+    "cors_origins": []
   },
   "panel": {
     "package_detail_limit": 5
@@ -58,7 +61,9 @@
     "include_disabled_in_tasks": false
   },
   "models": {
-    "aliases": {}
+    "aliases": {},
+    "background_names": [],
+    "background_target": "deepseek-v4.1-flash"
   },
   "global": {
     "enabled": true,
@@ -81,11 +86,14 @@
     "rotate_max": 3,
     "rotate_budget": "0",
     "rotate_status_codes": [],
-    "proxies": []
+    "proxies": [],
+    "proxy_slots": []
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,
-    "multimodal_routing": false
+    "multimodal_routing": false,
+    "local_web_tools": false,
+    "local_web_tool_rounds": 3
   },
   "prompt": {
     "mode": "passthrough",
@@ -95,9 +103,30 @@
     "url": "",
     "token": ""
   },
+  "limits": {
+    "daily_tokens": 0,
+    "daily_credits": 0,
+    "model_daily_tokens": 0,
+    "cn": {
+      "daily_tokens": 0,
+      "daily_credits": 0,
+      "model_daily_tokens": 0
+    },
+    "global": {
+      "daily_tokens": 0,
+      "daily_credits": 0,
+      "model_daily_tokens": 0
+    }
+  },
+  "pricing": {
+    "enabled": false,
+    "refresh_minutes": 0,
+    "exchange_rate": 1
+  },
   "pool": {
     "max_in_flight": 3,
     "max_in_flight_global": 2,
+    "max_in_flight_total": 0,
     "breaker_threshold": 3,
     "breaker_cooldown": "30m",
     "breaker_cooldown_max": "6h",

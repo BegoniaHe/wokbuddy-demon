@@ -19,7 +19,7 @@ import (
 
 // anthropicMessagesHandler 是 /v1/messages 的入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
-	in, out, ok := newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval)
+	in, out, ok := newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
@@ -30,8 +30,13 @@ func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Reques
 // 网关没有本地 tokenizer；这里按请求 JSON 文本字节数做近似（4 字节 ≈ 1 token），
 // 只用于客户端上下文预算，不作为计费依据。
 func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Request) {
+	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			return
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
 		return
 	}
@@ -78,9 +83,14 @@ func countJSONTextBytes(v any) int {
 }
 
 // newAnthropicChatInput 读取并转换 Anthropic 请求体；失败时已写出 Anthropic 错误。
-func newAnthropicChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration) (chatInput, chatResponder, bool) {
+func newAnthropicChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration, maxBodyBytes int64) (chatInput, chatResponder, bool) {
+	limitRequestBody(w, r, maxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyTooLargeMessage(maxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			return chatInput{}, nil, false
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
 		return chatInput{}, nil, false
 	}
@@ -98,6 +108,7 @@ func newAnthropicChatInput(w http.ResponseWriter, r *http.Request, keepalive tim
 		traceID:   r.Header.Get("X-Trace-Id"),
 		trace:     requestTraceFrom(r),
 		keyUsage:  keyUsageFrom(r.Context()),
+		keyRealm:  keyRealmFrom(r.Context()),
 	}
 	return in, &anthropicResponder{w: w, model: model, keepalive: keepalive}, true
 }

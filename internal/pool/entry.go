@@ -84,6 +84,8 @@ type Status struct {
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
 	Realm string `json:"realm,omitempty"`
+	// ProxySlot 出站代理槽（issue #96）；空 = 未绑定。
+	ProxySlot string `json:"proxy_slot,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
@@ -210,6 +212,9 @@ type entry struct {
 	paused   bool
 	reason   string
 	lastUsed time.Time // 最近被选中时刻（防并发撞号）
+	// proxySlot 出站代理槽 ID（issue #96）；空 = 不绑定（走全局代理池/直连）。
+	// 持久化到 state.json；上游经 Pool.ProxySlotOf 取槽选择 Dialer。
+	proxySlot string
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -484,6 +489,8 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// ProxySlot 出站代理槽 ID（issue #96）；空 = 不绑定。
+	ProxySlot string `json:"proxy_slot,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态

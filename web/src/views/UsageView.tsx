@@ -165,6 +165,18 @@ export function UsageView() {
 
   const rangeStr = trangeQuery(range, true).toString();
 
+  const pricingQ = useQuery({
+    queryKey: ['pricing'],
+    queryFn: () => api<PricingPayload>('pricing'),
+    staleTime: 60_000,
+  });
+
+  const remainingQ = useQuery({
+    queryKey: ['usage-remaining'],
+    queryFn: () => api<RemainingPayload>('usage/remaining'),
+    staleTime: 5_000,
+  });
+
   const { data, isFetching, error, refetch } = useQuery({
     queryKey: ['usage', rangeStr],
     queryFn: async () => {
@@ -206,6 +218,9 @@ export function UsageView() {
 
   return (
     <>
+      {pricingQ.data?.enabled ? <PricingCard rows={data?.by_model || []} payload={pricingQ.data} /> : null}
+      {remainingQ.data?.rows?.length ? <RemainingCard payload={remainingQ.data} /> : null}
+
       <Card className="mb-5">
         <CardHeader className="flex-row flex-wrap items-center gap-3">
           <CardTitle>用量总览</CardTitle>
@@ -841,3 +856,142 @@ function TrendChart({ points, metric }: { points: ReturnType<typeof usTrendPoint
     </>
   );
 }
+
+type PricingPayload = {
+  enabled?: boolean;
+  exchange_rate?: number;
+  updated_at?: string;
+  last_error?: string;
+  prices?: Record<string, { prompt?: number; completion?: number; cache_read?: number }>;
+};
+
+// PricingCard 按 OpenRouter 公开价估算等价花费（issue #99）；未定价模型显示 —。
+function PricingCard({ rows, payload }: { rows: UsageRow[]; payload: PricingPayload }) {
+  const prices = payload.prices || {};
+  const rate = payload.exchange_rate || 1;
+  const findPrice = (model: string) => {
+    if (prices[model]) return prices[model];
+    const suffix = '/' + model;
+    const key = Object.keys(prices).find((k) => k.endsWith(suffix));
+    return key ? prices[key] : undefined;
+  };
+  const priced = rows
+    .map((row) => {
+      const model = String(row.key || '');
+      const price = findPrice(model);
+      if (!price) return { model, cost: null as number | null };
+      const prompt = Number(row.prompt_tokens || 0);
+      const completion = Number(row.completion_tokens || 0);
+      const hit = Number(row.cache_hit_tokens || 0);
+      const miss = Number(row.cache_miss_tokens || 0);
+      const usd =
+        (hit + miss > 0
+          ? miss * Number(price.prompt || 0) + hit * Number(price.cache_read || 0)
+          : prompt * Number(price.prompt || 0)) + completion * Number(price.completion || 0);
+      return { model, cost: usd * rate };
+    })
+    .sort((a, b) => (b.cost ?? -1) - (a.cost ?? -1));
+  const total = priced.reduce((sum, row) => sum + (row.cost ?? 0), 0);
+  const unpriced = priced.filter((row) => row.cost === null).map((row) => row.model);
+
+  return (
+    <Card className="mb-5">
+      <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardTitle>等价花费（参考）</CardTitle>
+        <CardAction>
+          <span className="text-xs text-muted-foreground">
+            {payload.updated_at ? '价格更新 ' + payload.updated_at.replace('T', ' ').slice(0, 16) : '尚未拉到价格'}
+            {payload.last_error ? ' · 上次失败：' + payload.last_error : ''}
+          </span>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <div className="mb-3 text-lg font-semibold tabular-nums">≈ {total.toFixed(4)}</div>
+        <div className="grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
+          {priced.slice(0, 8).map((row) => (
+            <div key={row.model} className="flex justify-between gap-3 border-b border-border/60 py-1">
+              <span className="truncate font-mono">{row.model}</span>
+              <span className="tabular-nums">{row.cost === null ? '—' : row.cost.toFixed(4)}</span>
+            </div>
+          ))}
+        </div>
+        {unpriced.length ? (
+          <p className="mt-3 text-2xs text-muted-foreground">
+            未定价（显示 —，不推算）：{unpriced.join(', ')}
+          </p>
+        ) : null}
+        <p className="mt-2 text-2xs text-muted-foreground">按 OpenRouter 公开价折算，仅作参考，不代表上游实际扣费。</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+type RemainingRow = {
+  uid: string;
+  nickname?: string;
+  realm?: string;
+  model: string;
+  used?: number;
+  budget?: number;
+  remaining?: number;
+  window_start?: string;
+  cooling?: boolean;
+  estimated?: boolean;
+  samples?: number;
+};
+
+type RemainingPayload = { rows?: RemainingRow[]; generated_at?: string; ttl_sec?: number };
+
+// RemainingCard 剩余用量估算（issue #101）；估算行明确标注下界。
+function RemainingCard({ payload }: { payload: RemainingPayload }) {
+  const rows = payload.rows || [];
+  return (
+    <Card className="mb-5">
+      <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardTitle>剩余用量估算</CardTitle>
+        <CardAction>
+          <span className="text-xs text-muted-foreground">只读估算 · {rows.length} 行</span>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>账号</TableHead>
+                <TableHead>模型</TableHead>
+                <TableHead className="text-right">已用</TableHead>
+                <TableHead className="text-right">预算</TableHead>
+                <TableHead className="text-right">剩余</TableHead>
+                <TableHead>窗口起点</TableHead>
+                <TableHead>状态</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.slice(0, 30).map((row) => (
+                <TableRow key={row.uid + '|' + row.model}>
+                  <TableCell>{row.nickname || row.uid.slice(0, 8)}</TableCell>
+                  <TableCell className="font-mono text-xs">{row.model}</TableCell>
+                  <TableCell className="text-right tabular-nums">{fmtTok(row.used || 0)}</TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {row.estimated ? '—' : fmtTok(Math.round(row.budget || 0))}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums">
+                    {row.estimated ? '—' : fmtTok(Math.round(row.remaining || 0))}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {row.window_start ? row.window_start.replace('T', ' ').slice(0, 16) : '—'}
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {row.cooling ? '冷却中' : row.estimated ? '按 24h 估算（下界）' : '估算'}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+

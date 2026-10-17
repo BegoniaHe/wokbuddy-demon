@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -17,6 +18,13 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
+
+// placeholderAPIKey 是 config.example.json 里的公开占位密钥。
+// 它只用于示例，任何读到它的部署都必须在启动时替换（issue #85）。
+const placeholderAPIKey = "test_key"
+
+// defaultBackgroundTarget 后台任务模型改写目标（issue #103）。
+const defaultBackgroundTarget = "deepseek-v4.1-flash"
 
 // Config 顶层配置。
 type Config struct {
@@ -66,6 +74,14 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		// （慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// MaxBodyBytes 聊天类入站请求体上限（字节，issue #86），覆盖
+		// /v1/chat/completions、/v1/messages 与 count_tokens。超限在解析前返回
+		// 413，不进入选号。缺省 16 MiB；0 = 不限制。改动需重启进程。
+		MaxBodyBytes int64 `json:"max_body_bytes"`
+		// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin 列表（如
+		// "http://localhost:3000"）。空 = 关闭 CORS，行为不变。只精确匹配
+		// scheme://host[:port]；不支持 "*"，管理面不参与。
+		CORSOrigins []string `json:"cors_origins"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -126,6 +142,11 @@ type Config struct {
 	} `json:"schedule"`
 
 	Models struct {
+		// BackgroundNames 客户端后台任务使用的硬编码模型名（issue #103，大小写
+		// 不敏感）。命中后 model 改写为 BackgroundTarget；空 = 关闭。
+		BackgroundNames []string `json:"background_names"`
+		// BackgroundTarget 后台模型改写目标；默认 deepseek-v4.1-flash。
+		BackgroundTarget string `json:"background_target"`
 		// Aliases 客户端模型别名 → 上游模型（issue #52）：
 		// {"claude-sonnet-4-5": "cn:hy4", "gpt-5-codex": "hy4"}。
 		// 键必须是裸名（不含 realm 前缀，大小写敏感）；值沿用 "[realm:]model"
@@ -189,6 +210,9 @@ type Config struct {
 		// RotateStatusCodes 非空时，HTTP 状态码错误仅这些码触发换号（如
 		// [429,500,502,503,504]）；空 = 维持现有按错误分类的换号语义（默认）。
 		RotateStatusCodes []int `json:"rotate_status_codes"`
+		// ProxySlots 命名出站代理槽（issue #96）：账号绑定后使用独立 Transport，
+		// 未绑定账号继续走 Proxies 全局池/直连。
+		ProxySlots []ProxySlot `json:"proxy_slots"`
 		// Proxies 出站代理列表（issue #15）：支持 http://、https://、socks5://
 		// （可选 user:pass）；非空时出站按健康轮换，失败代理进入冷却。空 = 直连（默认）。
 		Proxies []string `json:"proxies"`
@@ -201,6 +225,11 @@ type Config struct {
 		// 该模态的模型并重写 model（默认 false = 明确 400 model_capability）。
 		// issue #109。
 		MultimodalRouting bool `json:"multimodal_routing"`
+		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
+		// 网关本地执行（issue #104）。默认 false = 原样透传。
+		LocalWebTools bool `json:"local_web_tools"`
+		// LocalWebToolRounds 本地工具最多代跑轮数；<=0 回落 3，>8 钳到 8。
+		LocalWebToolRounds int `json:"local_web_tool_rounds"`
 	} `json:"features"`
 
 	Prompt struct {
@@ -221,9 +250,28 @@ type Config struct {
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
 
+	// Limits 账号级每日护栏（issue #95）：全局默认 + 可选 cn/global 字段级覆盖。
+	Limits struct {
+		DailyTokens      int64     `json:"daily_tokens"`
+		DailyCredits     float64   `json:"daily_credits"`
+		ModelDailyTokens int64     `json:"model_daily_tokens"`
+		CN               LimitRule `json:"cn"`
+		Global           LimitRule `json:"global"`
+	} `json:"limits"`
+
+	// Pricing OpenRouter 等价价格估算（issue #99）；只读展示，不参与调度。
+	Pricing struct {
+		Enabled        bool    `json:"enabled"`
+		RefreshMinutes int     `json:"refresh_minutes"`
+		ExchangeRate   float64 `json:"exchange_rate"`
+	} `json:"pricing"`
+
 	Pool struct {
-		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		MaxInFlight       int `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal int `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		// MaxInFlightTotal 网关级全局在途上限（issue #92）；0 = 不限（默认）。
+		// 满额时新请求 503，不进入选号。热生效。
+		MaxInFlightTotal   int    `json:"max_in_flight_total"`
 		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
@@ -285,6 +333,21 @@ type Config struct {
 	KeepaliveIntervalDur time.Duration `json:"-"`
 }
 
+// LimitRule 每日护栏的一组取值（cn/global 覆盖用）。
+type LimitRule struct {
+	DailyTokens      int64   `json:"daily_tokens"`
+	DailyCredits     float64 `json:"daily_credits"`
+	ModelDailyTokens int64   `json:"model_daily_tokens"`
+}
+
+// ProxySlot 命名出站代理槽（issue #96）。
+type ProxySlot struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Enabled bool   `json:"enabled"`
+}
+
 // ModelTimeout 单个模型的超时覆盖；空/0 = 回落全局值。
 type ModelTimeout struct {
 	Header string `json:"header"`
@@ -305,6 +368,8 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Server.MaxBodyBytes = 16 << 20
+	c.Models.BackgroundTarget = defaultBackgroundTarget
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
@@ -339,6 +404,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.LocalWebToolRounds = 3
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -406,16 +472,29 @@ func ParseConfig(raw []byte) (*Config, error) {
 	return ParseConfigInto(raw, Default())
 }
 
+// parseConfigWithEnv 解析配置后再叠加环境变量覆盖，供面板比较「当前生效值」。
+// 与 Load 同序：JSON → env → normalize，避免 env 覆盖的字段被误报为已变化。
+func parseConfigWithEnv(raw []byte) (*Config, error) {
+	c := Default()
+	if _, err := ParseConfigInto(raw, c); err != nil {
+		return nil, err
+	}
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 // WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
 // 值取自 Default()（含超时/熔断/签到排程等推荐值），api_key 用 crypto/rand 随机生成：
 // 安全默认优于示例占位符（listen 绑定 0.0.0.0，空 key 会把网关裸暴露给局域网）。
 // 返回生成的 key 供启动日志透出。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
 func WriteDefault(path string) (string, error) {
-	raw := make([]byte, 18)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("gen api_key: %w", err)
+	key, err := randomAPIKey()
+	if err != nil {
+		return "", err
 	}
-	key := "sk-" + base64.RawURLEncoding.EncodeToString(raw)
 	c := Default()
 	c.APIKey = key
 	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
@@ -438,6 +517,81 @@ func WriteDefault(path string) (string, error) {
 		return "", fmt.Errorf("write config: %w", err)
 	}
 	return key, nil
+}
+
+// randomAPIKey 生成 sk- 前缀的随机网关密钥。
+func randomAPIKey() (string, error) {
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("gen api_key: %w", err)
+	}
+	return "sk-" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// ReplacePlaceholderAPIKey 把 path 中仍为公开占位值的 api_key 替换成随机密钥并
+// 原子写回。只精确匹配 placeholderAPIKey：显式配置的其他值（含空串）一律不动，
+// 避免把用户有意设置的密钥静默改掉。
+//
+// 返回新密钥与实际是否发生替换。文件不存在时返回 fs.ErrNotExist，由调用方决定
+// 是否走首次运行生成路径；非普通文件（如 Docker bind mount 误建目录）不处理，
+// 交由 Load 给出更具体的错误。
+func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
+	doc, current, err := readConfigDoc(path)
+	if err != nil || current != placeholderAPIKey {
+		return "", false, err
+	}
+	key, err := randomAPIKey()
+	if err != nil {
+		return "", false, err
+	}
+	encoded, err := json.Marshal(key)
+	if err != nil {
+		return "", false, fmt.Errorf("marshal api_key: %w", err)
+	}
+	doc["api_key"] = encoded
+	if err := writeConfigDoc(path, doc); err != nil {
+		return "", false, err
+	}
+	return key, true, nil
+}
+
+// readConfigDoc 读取配置文件为可按顶层键修改的文档，并返回当前 api_key。
+func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, "", nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("read config: %w", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, "", fmt.Errorf("parse config: %w", err)
+	}
+	var current string
+	if v, ok := doc["api_key"]; ok {
+		if err := json.Unmarshal(v, &current); err != nil {
+			return nil, "", fmt.Errorf("parse api_key: %w", err)
+		}
+	}
+	return doc, current, nil
+}
+
+// writeConfigDoc 原子写回配置文档（tmp + rename），保留所有未修改的顶层键。
+func writeConfigDoc(path string, doc map[string]json.RawMessage) error {
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return replaceConfigFile(tmp, path, out)
 }
 
 func applyEnv(c *Config) {
@@ -565,26 +719,15 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.normalizeStaticDefaults()
-	if err := c.normalizeModelAliases(); err != nil {
-		return err
+	steps := []func() error{
+		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
+		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
+		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
 	}
-	if err := c.normalizeNotify(); err != nil {
-		return err
-	}
-	if err := c.normalizeCheckinDelay(); err != nil {
-		return err
-	}
-	if err := c.normalizeLogging(); err != nil {
-		return err
-	}
-	if err := c.normalizeSchedule(); err != nil {
-		return err
-	}
-	if err := c.normalizePrompt(); err != nil {
-		return err
-	}
-	if err := c.normalizeProxies(); err != nil {
-		return err
+	for _, step := range steps {
+		if err := step(); err != nil {
+			return err
+		}
 	}
 	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
 	return c.Validate()
@@ -619,6 +762,31 @@ func (c *Config) normalizeModelAliases() error {
 	return nil
 }
 
+// normalizeBackgroundModels 规范化后台模型名单（issue #103）：去空白、转小写、
+// 去重；目标缺省 deepseek-v4.1-flash。名单为空时仍保留目标，便于后续热开。
+func (c *Config) normalizeBackgroundModels() error {
+	if strings.TrimSpace(c.Models.BackgroundTarget) == "" {
+		c.Models.BackgroundTarget = defaultBackgroundTarget
+	}
+	c.Models.BackgroundTarget = strings.TrimSpace(c.Models.BackgroundTarget)
+	if len(c.Models.BackgroundNames) == 0 {
+		c.Models.BackgroundNames = nil
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Models.BackgroundNames))
+	out := make([]string, 0, len(c.Models.BackgroundNames))
+	for _, raw := range c.Models.BackgroundNames {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	c.Models.BackgroundNames = out
+	return nil
+}
+
 // normalizeAliasTarget 去掉目标首尾空白并校验 "[realm:]model"：冒号前只允许
 // cn/global（未知前缀会与裸模型名混淆，必须在启动期拒绝），裸名部分必须非空。
 func normalizeAliasTarget(name, value string) (string, error) {
@@ -642,11 +810,11 @@ func normalizeAliasTarget(name, value string) (string, error) {
 
 // normalizeNotify 校验 webhook 与事件名，并去掉事件首尾空白/重复项。
 func (c *Config) normalizeNotify() error {
-	url := strings.TrimSpace(c.Notify.WebhookURL)
-	if err := notify.ValidateURL(url); err != nil {
+	webhook := strings.TrimSpace(c.Notify.WebhookURL)
+	if err := notify.ValidateURL(webhook); err != nil {
 		return fmt.Errorf("notify.webhook_url: %w", err)
 	}
-	c.Notify.WebhookURL = url
+	c.Notify.WebhookURL = webhook
 	if len(c.Notify.Events) == 0 {
 		return nil
 	}
@@ -680,6 +848,22 @@ func (c *Config) normalizeProxies() error {
 	for _, raw := range c.Upstream.Proxies {
 		if _, err := outbound.ParseProxy(raw); err != nil {
 			return fmt.Errorf("upstream.proxies: %w", err)
+		}
+	}
+	seen := make(map[string]bool, len(c.Upstream.ProxySlots))
+	for i := range c.Upstream.ProxySlots {
+		slot := &c.Upstream.ProxySlots[i]
+		slot.ID = strings.TrimSpace(slot.ID)
+		slot.Name = strings.TrimSpace(slot.Name)
+		if slot.ID == "" {
+			return fmt.Errorf("upstream.proxy_slots[%d]: id 不能为空", i)
+		}
+		if seen[slot.ID] {
+			return fmt.Errorf("upstream.proxy_slots: id %q 重复", slot.ID)
+		}
+		seen[slot.ID] = true
+		if _, err := outbound.ParseProxy(slot.URL); err != nil {
+			return fmt.Errorf("upstream.proxy_slots[%s]: %w", slot.ID, err)
 		}
 	}
 	return nil
@@ -720,14 +904,39 @@ func (c *Config) validateBackoffOrder() error {
 
 // validateRanges 字段范围：0 有明确语义（不限 / 关闭）的键不接受负值。
 func (c *Config) validateRanges() error {
+	if err := validateLimitRule("limits", LimitRule{
+		DailyTokens: c.Limits.DailyTokens, DailyCredits: c.Limits.DailyCredits, ModelDailyTokens: c.Limits.ModelDailyTokens,
+	}); err != nil {
+		return err
+	}
+	if err := validateLimitRule("limits.cn", c.Limits.CN); err != nil {
+		return err
+	}
+	if err := validateLimitRule("limits.global", c.Limits.Global); err != nil {
+		return err
+	}
 	if c.Pool.MaxInFlight < 0 {
 		return fmt.Errorf("pool.max_in_flight: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlight)
+	}
+	if c.Server.MaxBodyBytes < 0 {
+		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）", c.Server.MaxBodyBytes)
+	}
+	if c.Pool.MaxInFlightTotal < 0 {
+		return fmt.Errorf("pool.max_in_flight_total: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlightTotal)
 	}
 	if c.SessionTTL < 0 {
 		return fmt.Errorf("session_sticky.ttl: 负时长 %q 无意义", c.SessionSticky.TTL)
 	}
 	if c.SessionGCInterval <= 0 {
 		return fmt.Errorf("session_sticky.gc_interval: 必须为正时长，当前 %q", c.SessionSticky.GCInterval)
+	}
+	return nil
+}
+
+// validateLimitRule 校验一组每日限额非负（0 = 关闭）。
+func validateLimitRule(name string, r LimitRule) error {
+	if r.DailyTokens < 0 || r.DailyCredits < 0 || r.ModelDailyTokens < 0 {
+		return fmt.Errorf("%s: 每日限额不能为负（0 = 关闭）", name)
 	}
 	return nil
 }
@@ -752,8 +961,86 @@ func (c *Config) normalizeStaticDefaults() {
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
 	}
+	c.normalizeLocalWebToolRounds()
 	c.normalizePoolDefaults()
 	c.normalizeUpstreamDefaults()
+}
+
+// normalizeCORS 规范化并校验 server.cors_origins：只接受 scheme://host[:port]，
+// 去重并忽略大小写；通配、路径、查询、凭证一律拒绝（避免配置出静默不生效的源）。
+func (c *Config) normalizeCORS() error {
+	if len(c.Server.CORSOrigins) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Server.CORSOrigins))
+	out := make([]string, 0, len(c.Server.CORSOrigins))
+	for _, raw := range c.Server.CORSOrigins {
+		norm, err := normalizeCORSOrigin(raw)
+		if err != nil {
+			return err
+		}
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		out = append(out, norm)
+	}
+	c.Server.CORSOrigins = out
+	return nil
+}
+
+// normalizeCORSOrigin 把单个 Origin 规范化为小写 scheme://host[:port]；非法即报错。
+func normalizeCORSOrigin(raw string) (string, error) {
+	origin := strings.TrimSpace(raw)
+	if origin == "*" {
+		return "", errors.New(`server.cors_origins: 不支持通配 "*"，请逐项列出允许的 Origin`)
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q: %w", raw, err)
+	}
+	if reason := invalidOriginReason(u); reason != "" {
+		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q（%s）", raw, reason)
+	}
+	host := strings.ToLower(u.Host)
+	switch u.Scheme {
+	case "http":
+		host = strings.TrimSuffix(host, ":80")
+	case "https":
+		host = strings.TrimSuffix(host, ":443")
+	}
+	return u.Scheme + "://" + host, nil
+}
+
+// invalidOriginReason 返回 Origin URL 不合规的原因；合规时返回空串。
+func invalidOriginReason(u *url.URL) string {
+	switch {
+	case u.Scheme != "http" && u.Scheme != "https":
+		return "scheme 必须是 http 或 https"
+	case u.Host == "":
+		return "缺少 host"
+	case u.User != nil:
+		return "不能包含用户凭证"
+	case u.RawQuery != "":
+		return "不能包含查询参数"
+	case u.Fragment != "":
+		return "不能包含 fragment"
+	case u.Path != "" && u.Path != "/":
+		return "不能包含路径"
+	default:
+		return ""
+	}
+}
+
+// normalizeLocalWebToolRounds 规范化本地上网工具轮数（issue #104）：<=0 回落 3，
+// >8 钳到 8（每轮都消耗一次上游额度，必须硬上限）。
+func (c *Config) normalizeLocalWebToolRounds() {
+	if c.Features.LocalWebToolRounds <= 0 {
+		c.Features.LocalWebToolRounds = 3
+	}
+	if c.Features.LocalWebToolRounds > 8 {
+		c.Features.LocalWebToolRounds = 8
+	}
 }
 
 // normalizePoolDefaults 补齐池相关的数值型缺省值（阈值 / 权重 / 上限）。

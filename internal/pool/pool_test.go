@@ -1464,6 +1464,90 @@ func TestAcquireUnknownUID(t *testing.T) {
 	p.Release("nope") // 不 panic
 }
 
+func TestMaxInFlightTotal(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetMaxInFlightTotal(1)
+	if !p.Acquire("u1") {
+		t.Fatal("first acquire should succeed")
+	}
+	if p.InFlightTotal() != 1 {
+		t.Fatalf("in-flight total=%d want 1", p.InFlightTotal())
+	}
+	if p.Acquire("u2") {
+		t.Fatal("second acquire should fail on global limit")
+	}
+	if !p.GlobalInFlightFull() {
+		t.Error("GlobalInFlightFull should be true at limit")
+	}
+	p.Release("u1")
+	if !p.Acquire("u2") {
+		t.Fatal("acquire after global release should succeed")
+	}
+	p.Release("u2")
+	p.Release("u2") // 重复释放幂等
+	if p.InFlightTotal() != 0 {
+		t.Fatalf("in-flight total=%d want 0", p.InFlightTotal())
+	}
+}
+
+func TestRemoveReleasesGlobalInFlight(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlightTotal(1)
+	if !p.Acquire("u1") {
+		t.Fatal("acquire failed")
+	}
+	if p.InFlightTotal() != 1 {
+		t.Fatalf("in-flight total=%d want 1", p.InFlightTotal())
+	}
+	p.Remove("u1")
+	if p.InFlightTotal() != 0 {
+		t.Fatalf("after remove in-flight total=%d want 0", p.InFlightTotal())
+	}
+	p.Release("u1")
+	if p.InFlightTotal() != 0 {
+		t.Fatalf("release after remove total=%d want 0", p.InFlightTotal())
+	}
+	if !p.acquireTotal(1) {
+		t.Fatal("global slot should be reusable after remove")
+	}
+	p.releaseTotal()
+}
+
+func TestSyncToDirReleasesGlobalInFlight(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	if !p.Acquire("u1") {
+		t.Fatal("acquire failed")
+	}
+	p.SyncToDir([]*auth.Auth{{UID: "u2"}})
+	if p.InFlightTotal() != 0 {
+		t.Fatalf("after sync in-flight total=%d want 0", p.InFlightTotal())
+	}
+}
+
+func TestMaxInFlightTotalUnlimited(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	for i := range 50 {
+		if !p.Acquire("u1") {
+			t.Fatalf("unlimited global acquire %d failed", i)
+		}
+	}
+	if p.InFlightTotal() != 50 {
+		t.Fatalf("in-flight total=%d want 50", p.InFlightTotal())
+	}
+	for range 50 {
+		p.Release("u1")
+	}
+	if p.InFlightTotal() != 0 {
+		t.Fatalf("in-flight total=%d want 0", p.InFlightTotal())
+	}
+}
+
 func TestPickSkipsInFlightFull(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
@@ -2009,5 +2093,88 @@ func TestResumeIdempotent(t *testing.T) {
 	}
 	if st, _ := p.Status("u1"); st.Paused {
 		t.Errorf("Paused 应仍为 false: %+v", st)
+	}
+}
+
+func TestModelRateLimitHook(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	var gotUID, gotModel, gotRealm string
+	p.SetModelRateLimitHook(func(uid, model, realm string, _ time.Time) {
+		gotUID, gotModel, gotRealm = uid, model, realm
+	})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "glm-5.2", "6004 limit")
+	if gotUID != "u1" || gotModel != "glm-5.2" || gotRealm != "cn" {
+		t.Fatalf("hook got uid=%q model=%q realm=%q", gotUID, gotModel, gotRealm)
+	}
+}
+
+func TestSetProxySlotPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	p := New(path)
+	p.Add(&auth.Auth{UID: "u1"})
+	if !p.SetProxySlot("u1", "residential") {
+		t.Fatal("set proxy slot failed")
+	}
+	if got := p.ProxySlotOf("u1"); got != "residential" {
+		t.Fatalf("slot=%q want residential", got)
+	}
+	p.Flush()
+	p2 := New(path)
+	e := p2.byUID["u1"]
+	if e == nil || e.proxySlot != "residential" {
+		t.Fatalf("reloaded entry=%+v want proxy_slot residential", e)
+	}
+	if !p2.SetProxySlot("u1", "") || p2.ProxySlotOf("u1") != "" {
+		t.Fatal("unbind failed")
+	}
+}
+
+func TestDailyLimitTokens(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetDailyLimits(DailyLimits{Tokens: 100}, DailyLimits{}, DailyLimits{})
+	p.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u1": {Tokens: 100}}
+	})
+	if got := p.Pick(); got == nil || got.UID != "u2" {
+		t.Fatalf("pick=%+v want u2 (u1 at daily token limit)", got)
+	}
+}
+
+func TestDailyLimitCreditsOnlyPaid(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetDailyLimits(DailyLimits{Credits: 10}, DailyLimits{}, DailyLimits{})
+	p.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u1": {Credits: 10}}
+	})
+	p.SetModelRateOf(func(_, model string) string {
+		if model == "paid" {
+			return "1"
+		}
+		return "0"
+	})
+	if got := p.PickExcludingForRealm(nil, "paid", "cn"); got != nil {
+		t.Fatalf("paid pick=%+v want nil (daily credit limit)", got)
+	}
+	if got := p.PickExcludingForRealm(nil, "free", "cn"); got == nil {
+		t.Fatal("free model should still be served after daily credit limit")
+	}
+}
+
+func TestDailyLimitPerModel(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetDailyLimits(DailyLimits{ModelTokens: 100}, DailyLimits{}, DailyLimits{})
+	p.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u1": {Models: map[string]int64{"hot": 100}}}
+	})
+	if got := p.PickExcludingForRealm(nil, "hot", "cn"); got != nil {
+		t.Fatalf("hot pick=%+v want nil", got)
+	}
+	if got := p.PickExcludingForRealm(nil, "other", "cn"); got == nil {
+		t.Fatal("other model should still be served")
 	}
 }

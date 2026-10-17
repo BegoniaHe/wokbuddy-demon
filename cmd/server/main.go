@@ -14,9 +14,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/agentcfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -52,14 +55,37 @@ func stateSibling(stateFile, name string) string {
 	return filepath.Join(dir, name)
 }
 
+// preflightAPIKey 在加载前替换公开占位密钥；无法写回时返回仅供本进程使用的
+// 内存随机 key（重启后需重新设置），避免把 test_key 带进运行时。
+func preflightAPIKey(path string) (memoryKey string) {
+	key, replaced, err := ReplacePlaceholderAPIKey(path)
+	if err == nil && replaced {
+		log.Printf("config %s 使用公开占位 api_key，已替换为随机密钥（api_key=%s，记录在该文件里，可自行修改）", path, key)
+		return ""
+	}
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
+		return ""
+	}
+	key, kerr := randomAPIKey()
+	if kerr != nil {
+		return ""
+	}
+	log.Printf("WARN: 无法写回 config %s（%v）；本次进程临时使用随机 api_key（重启后需重新设置）", path, err)
+	return key
+}
+
 // loadConfig 加载配置，处理首次运行自动生成推荐配置的兜底：
 //   - 文件不存在 → 落一份推荐配置（含随机 api_key）再加载；
 //   - 生成失败（目录只读等）→ 退回纯默认 + env（旧行为兜底），不阻塞启动。
 //
 // errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
 func loadConfig(path string) (*Config, error) {
+	memoryKey := preflightAPIKey(path)
 	cfg, err := Load(path)
 	if err == nil {
+		if memoryKey != "" && cfg.APIKey == placeholderAPIKey {
+			cfg.APIKey = memoryKey
+		}
 		return cfg, nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
@@ -112,6 +138,8 @@ func main() {
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域 WAF 风控分档（P1-1）
+	p.SetMaxInFlightTotal(cfg.Pool.MaxInFlightTotal)   // 网关级全局在途上限（issue #92）
+	applyDailyLimits(p, cfg)
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
@@ -134,6 +162,7 @@ func main() {
 	p.SetModelRateOf(func(realm, model string) string { return up.ModelRate(realm, model) })
 
 	configureUpstream(cfg, up)
+	configureAccountRouting(p, up, cfg)
 
 	notifier := notify.New(notify.Config{URL: cfg.Notify.WebhookURL, Events: cfg.Notify.Events})
 	defer notifier.Close()
@@ -171,6 +200,10 @@ func main() {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		MultimodalRouting:    cfg.Features.MultimodalRouting,
+		LocalWebTools:        cfg.Features.LocalWebTools,
+		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
+		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
+		BackgroundTarget:     cfg.Models.BackgroundTarget,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -178,6 +211,8 @@ func main() {
 	rec := usage.New(usagePath)
 	rec.Start()
 	defer rec.Stop()
+	setDailyUsageProvider(p, rec)
+	quotaStore := setupQuota(p, rec, cfg)
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	// 命名密钥库：与 state 文件同目录（data/api_keys.json）。面板签发/撤销，
@@ -203,6 +238,9 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	priceCat := newPricingCatalog(cfg)
+	home, _ := os.UserHomeDir()
+	agents := agentcfg.New(home, stateSibling(cfg.StateFile, "agent-backups"))
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -221,6 +259,11 @@ func main() {
 		ProbeFile:      stateSibling(cfg.StateFile, "output_probes.json"),
 		ProbeStateFile: stateSibling(cfg.StateFile, "model_probes.json"),
 		ConfigPath:     *cfgPath,
+		ProxySlots:     proxySlotInfos(cfg),
+		Pricing:        priceCat,
+		PricingRate:    cfg.Pricing.ExchangeRate,
+		Quota:          quotaStore,
+		Agents:         agents,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -234,41 +277,29 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
-	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Keys:         keyStore,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
-		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
-		// 裸用/测试路径拿到同一缺省值。
-		RecordClientInfo:    cfg.Logging.RequestClientInfo,
-		DecisionTrace:       cfg.Logging.DecisionTrace,
-		DecisionTraceSample: cfg.Logging.DecisionTraceSample,
-		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
-		GlobalEnabled: cfg.Global.Enabled,
-		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。
-		ModelAliases: cfg.Models.Aliases,
-		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
-		MaxRotate:      cfg.Upstream.RotateMax,
-		RotateBudget:   cfg.RotateBudgetDur,
-		RotateStatuses: rotateStatusSet(cfg.Upstream.RotateStatusCodes),
-		// 入站 SSE 心跳（issue #54）：0 = 关闭；改后需重启。
-		KeepaliveInterval: cfg.KeepaliveIntervalDur,
-		Notifier:          notifier,
+	h := buildHandler(handlerDeps{
+		cfg:         cfg,
+		pool:        p,
+		up:          up,
+		keys:        keyStore,
+		session:     sessRouter,
+		stickyCount: sessCount,
+		redisMode:   redisMode,
+		panel:       pn,
+		live:        live,
+		usage:       rec,
+		requestLog:  requestLog,
+		notifier:    notifier,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	startPricingRefresh(ctx, cfg, priceCat)
+	serve(ctx, cfg, h, p, up, sch)
+}
+
+// serve 启动定时任务与 HTTP 监听，并在收到退出信号后等待在途流排空。
+func serve(ctx context.Context, cfg *Config, h *server.Handler, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) {
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
@@ -304,7 +335,7 @@ func main() {
 		// 超时则记录未排空流数后由进程退出强制结束，不静默丢弃。
 		// 注意：Shutdown 关闭 listener 后 ListenAndServe 会立即返回 ErrServerClosed，
 		// 但排空等待仍在进行，main 必须等 shutdownDone 再退出，否则在途长流被直接丢弃。
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), server.ShutdownStreamGrace)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), server.ShutdownStreamGrace)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 		if n := h.ActiveStreams(); n > 0 {
@@ -548,10 +579,15 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err := json.Unmarshal(raw, &incoming); err != nil {
 		return nil, fmt.Errorf("parse submitted config: %w", err)
 	}
+	// 旧配置用于判断本次真正变化的字段；文件损坏时回落默认，最多多报重启项。
+	oldCfg, oldErr := parseConfigWithEnv(oldRaw)
+	if oldErr != nil {
+		oldCfg = Default()
+	}
 	merged := mergeConfigMaps(cur, incoming)
 
 	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
-	newCfg, err := ParseConfig(mergedJSON(merged))
+	newCfg, err := parseConfigWithEnv(mergedJSON(merged))
 	if err != nil {
 		return nil, err
 	}
@@ -576,11 +612,17 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		MultimodalRouting:    newCfg.Features.MultimodalRouting,
+		LocalWebTools:        newCfg.Features.LocalWebTools,
+		LocalWebToolRounds:   newCfg.Features.LocalWebToolRounds,
+		BackgroundNames:      backgroundNameSet(newCfg.Models.BackgroundNames),
+		BackgroundTarget:     newCfg.Models.BackgroundTarget,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
+	p.SetMaxInFlightTotal(newCfg.Pool.MaxInFlightTotal)
+	applyDailyLimits(p, newCfg)
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
@@ -600,7 +642,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 
-	return restartRequiredFields(newCfg), nil
+	return restartRequiredFields(oldCfg, newCfg), nil
 }
 
 // replaceConfigFile 用 tmp 原子替换 path；单文件 Docker bind mount 无法被 rename
@@ -643,40 +685,71 @@ func writeConfigInPlace(tmp, path string, out []byte) error {
 	return nil
 }
 
-// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
+// restartFieldPaths 是装配期一次性捕获、修改后必须重启才能生效的字段路径。
+// 集中维护：新增装配期字段时只在这里加一行；JSON 路径同时覆盖嵌套结构。
+//
+// 路径在配置中缺失时新旧取值同为 nil，不会误报；字段存在后自动参与比较。
+var restartFieldPaths = []string{
+	"listen", "auth_dir", "state_file",
+	"server.read_timeout", "server.max_body_bytes",
+	// HTTP client / 出站身份 / 代理在 configureUpstream 一次性注入。
+	"upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds",
+	"upstream.keepalive_interval", "upstream.model_timeouts", "upstream.user_agent",
+	"upstream.client_version", "upstream.cli_version", "upstream.client_name",
+	"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip",
+	"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
+	"upstream.proxies",
+	// global 路由在 configureUpstream / auth / handler 构造期捕获。
+	"global.enabled", "global.chat_base", "global.billing_base",
+	// 提示词模式与文件在 handler 构造期解析。
+	"prompt.mode", "prompt.file",
+	// Redis 客户端在启动期装配。
+	"upstash.url", "upstash.token",
+	"models.aliases", "notify.webhook_url", "notify.events",
+	// 粘性路由器是否创建在装配期决定；TTL 类同样在启动期读取。
+	"session_sticky.enabled", "session_sticky.ttl", "session_sticky.gc_interval",
+	"logging.request_archive_enabled", "logging.request_retention_days",
+	"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
+}
+
+// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段路径。
+// 逐字段比较新旧配置，只返回实际变化的项（issue #87），避免面板恒提示全量。
+func restartRequiredFields(oldCfg, newCfg *Config) []string {
+	oldDoc, newDoc := configDoc(oldCfg), configDoc(newCfg)
 	var out []string
-	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
-		out = append(out, "listen")
+	for _, path := range restartFieldPaths {
+		if !reflect.DeepEqual(digJSONPath(oldDoc, path), digJSONPath(newDoc, path)) {
+			out = append(out, path)
+		}
 	}
-	if c.AuthDir != "" {
-		out = append(out, "auth_dir")
-	}
-	if c.StateFile != "" {
-		out = append(out, "state_file")
-	}
-	// upstream.timeout_seconds/header_timeout_seconds/idle_timeout_seconds 在装配期被
-	// HTTP client 捕获；upstream.user_agent 在装配期被写进出站 client（main.go 的
-	// up.UserAgent = ...），之后不再读取——不在 livecfg 热快照里，也无法热改。
-	// 此前漏列 user_agent，导致面板改完显示"已保存"却不提示需要重启（issue #102 附带发现 2）。
-	// 轮换策略（rotate_max/rotate_budget/rotate_status_codes，issue #17）同样在装配期
-	// 被 server handler 捕获，改后需重启。
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds",
-		"upstream.idle_timeout_seconds", "upstream.keepalive_interval", "upstream.model_timeouts",
-		"upstream.user_agent",
-		"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
-		"upstream.proxies")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
-	out = append(out, "models.aliases", "notify.webhook_url", "notify.events",
-		"session_sticky.ttl", "session_sticky.gc_interval",
-		"logging.request_archive_enabled", "logging.request_retention_days",
-		"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
-		"server.read_timeout")
 	return out
+}
+
+// configDoc 把配置序列化为按 JSON 路径取值的 map（解析后的 time.Duration
+// 字段带 json:"-"，不会参与比较）。
+func configDoc(c *Config) map[string]any {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil
+	}
+	return doc
+}
+
+// digJSONPath 按 "a.b.c" 路径取嵌套值；路径不存在返回 nil。
+func digJSONPath(doc map[string]any, path string) any {
+	var cur any = doc
+	for _, key := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = m[key]
+	}
+	return cur
 }
 
 // mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。

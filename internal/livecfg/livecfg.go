@@ -22,6 +22,14 @@ type Snapshot struct {
 	// MultimodalRouting 请求模态不匹配时在目录内改选支持该模态的模型
 	// （features.multimodal_routing，默认 false = 明确 400，issue #109）。
 	MultimodalRouting bool
+	// LocalWebTools 是否允许 Responses 本地代跑 web_search/web_fetch（issue #104）。
+	LocalWebTools bool
+	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
+	LocalWebToolRounds int
+	// BackgroundNames 后台模型改写名单（小写；issue #103）。空 = 关闭。
+	BackgroundNames map[string]bool
+	// BackgroundTarget 后台模型改写目标（issue #103）。
+	BackgroundTarget string
 }
 
 // Holder 原子持有当前快照。

@@ -274,10 +274,94 @@ func assertPortrait(t *testing.T, st pool.Status) {
 	}
 }
 
-// TestChatLargeBodyNoGatewayLimit 请求体无网关侧上限（max_body_mb 已移除）：
-// 数 MB 的合法 body 完整读入并照常打上游，网关不再 413（超限类问题交由上游
-// 自然响应，对齐上游 e34cfa4 规约）。
-func TestChatLargeBodyNoGatewayLimit(t *testing.T) {
+// TestGlobalInFlightLimit 全局在途满额时在选号前 503，不打上游（issue #92）。
+func TestGlobalInFlightLimit(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetMaxInFlight(0) // 不限单账号，隔离出全局上限
+	p.SetMaxInFlightTotal(1)
+	if !p.Acquire("u1") {
+		t.Fatal("seed acquire failed")
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	body := []byte(`{"model":"glm-5.2","messages":[]}`)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s want 503", rec.Code, rec.Body)
+	}
+	if calls != 0 {
+		t.Errorf("upstream calls=%d want 0", calls)
+	}
+	p.Release("u1")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("after release code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1", calls)
+	}
+}
+
+// TestChatLargeBodyUnlimitedWhenZero server.max_body_bytes=0 时不限制：
+// 数 MB 的合法 body 完整读入并照常打上游。
+// TestChatRequestBodyLimit 超过 server.max_body_bytes 时返回 413，
+// 且不消耗选号/上游调用（issue #86）。Content-Length 与 chunked 都覆盖。
+func TestChatRequestBodyLimit(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: 64})
+	body := []byte(`{"model":"glm-5.2","messages":[],"pad":"` + strings.Repeat("a", 128) + `"}`)
+	for _, chunked := range []bool{false, true} {
+		calls = 0
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+		if chunked {
+			req.ContentLength = -1
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("chunked=%v code=%d body=%s", chunked, rec.Code, rec.Body)
+		}
+		if !strings.Contains(rec.Body.String(), `"payload_too_large"`) {
+			t.Errorf("chunked=%v missing payload_too_large: %s", chunked, rec.Body)
+		}
+		if calls != 0 {
+			t.Errorf("chunked=%v upstream calls=%d want 0", chunked, calls)
+		}
+	}
+}
+
+// TestChatRequestBodyAtLimitAllowed 恰好等于上限的请求仍正常处理。
+func TestChatRequestBodyAtLimitAllowed(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	body := []byte(`{"model":"glm-5.2","messages":[]}`)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxBodyBytes: int64(len(body))})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1", calls)
+	}
+}
+
+func TestChatLargeBodyUnlimitedWhenZero(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++

@@ -12,7 +12,9 @@
 package panel
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -22,11 +24,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/agentcfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -50,6 +55,15 @@ type Config struct {
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
 	// nil 时配置页返回 501。
 	ConfigPath string
+	// ProxySlots 可供账号绑定的出站代理槽（issue #96）。
+	ProxySlots []ProxySlotInfo
+	// Pricing 等价价格缓存（issue #99）；nil = 关闭或未初始化。
+	Pricing     *pricing.Catalog
+	PricingRate float64
+	// Quota 撞线事件与预算估算（issue #101）；nil = 未启用。
+	Quota *quota.Store
+	// Agents 本机智能体配置管理器（issue #102）；nil = 不可用。
+	Agents     *agentcfg.Manager
 	LoadConfig func() (any, error)
 	// SaveConfig 校验并落盘配置，返回需要重启才能生效的字段列表；随后由 main 注入的
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
@@ -73,6 +87,12 @@ type Config struct {
 	// ProbeStateFile 面板主动探测（TTFT/成功失败历史）的状态文件（issue #110）。
 	// 与 ProbeFile 分离：不覆盖脚本生成的实测上限文件。空 = 探测可执行但不落盘。
 	ProbeStateFile string
+}
+
+// ProxySlotInfo 账号可绑定的代理槽展示信息。
+type ProxySlotInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -168,6 +188,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/{path...}", p.asset)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	p.mux.HandleFunc("GET /panel/api/agents", p.withAuth(p.agentsStatus))
+	p.mux.HandleFunc("POST /panel/api/agents/{client}/apply", p.withAuth(p.agentsApply))
+	p.mux.HandleFunc("POST /panel/api/agents/{client}/restore", p.withAuth(p.agentsRestore))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
@@ -182,6 +205,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy_slot", p.withAuth(p.accountProxySlot))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -206,12 +230,15 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/usage/remaining", p.withAuth(p.usageRemaining))
 	p.mux.HandleFunc("POST /panel/api/usage/backfill", p.withAuth(p.usageBackfill))
 	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.keysList))
 	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAuth(p.keysRevoke))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAuth(p.keysDelete))
+	p.mux.HandleFunc("GET /panel/api/pricing", p.withAuth(p.pricingHandler))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAuth(p.keysUpdateLimits))
+	p.mux.HandleFunc("POST /panel/api/keys/{id}/realm", p.withAuth(p.keysUpdateRealm))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("POST /panel/api/model_probes", p.withAuth(p.modelProbe))
 	p.mux.HandleFunc("GET /panel/api/model_health", p.withAuth(p.modelHealth))
@@ -286,18 +313,23 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		sticky = p.cfg.StickyCount()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":         p.cfg.Version,
-		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
-		"redis_mode":      p.cfg.RedisMode,
-		"sticky_sessions": sticky,
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"paused":          paused,
-		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"version":             p.cfg.Version,
+		"uptime_sec":          int(time.Since(p.started).Seconds()),
+		"auth_required":       p.apiKey() != "",
+		"redis_mode":          p.cfg.RedisMode,
+		"sticky_sessions":     sticky,
+		"total":               total,
+		"healthy":             healthy,
+		"cooling":             cooling,
+		"disabled":            disabled,
+		"paused":              paused,
+		"in_flight_full":      inFlightFull,
+		"in_flight_total":     p.cfg.Pool.InFlightTotal(),
+		"max_in_flight_total": p.cfg.Pool.MaxInFlightTotal(),
+		"daily_limited":       p.cfg.Pool.DailyLimitedUIDs(),
+		"daily_reset_at":      nextLocalMidnight(),
+		"proxy_slots":         p.cfg.ProxySlots,
+		"accounts":            p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -541,6 +573,38 @@ func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 // accountRevive 手动复活：清禁用 + 冷却 + 熔断（运维口径无条件恢复）。
+// accountProxySlot 绑定/解绑账号的出站代理槽（issue #96）；空串 = 解绑。
+func (p *Panel) accountProxySlot(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Slot string `json:"slot"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	slot := strings.TrimSpace(body.Slot)
+	if slot != "" && !p.hasProxySlot(slot) {
+		writeErr(w, http.StatusBadRequest, "unknown proxy slot")
+		return
+	}
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.SetProxySlot(uid, slot) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: 账号 %s 绑定代理槽 %q", uid, slot)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (p *Panel) hasProxySlot(id string) bool {
+	for _, slot := range p.cfg.ProxySlots {
+		if slot.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	if _, ok := p.cfg.Pool.Status(uid); !ok {
@@ -936,16 +1000,7 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 // 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Realm    string                   `json:"realm"`
-		Remain   int64                    `json:"remain"`
-		Size     int64                    `json:"size"`
-		Packages []upstream.CreditPackage `json:"packages"`
-		Error    string                   `json:"error,omitempty"`
-	}
-	out := make([]row, len(accts))
+	out := make([]packageAccountRow, len(accts))
 
 	sem := make(chan struct{}, 3)
 	var wg sync.WaitGroup
@@ -956,7 +1011,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			it := packageAccountRow{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
 			a := p.cfg.Pool.AuthByUID(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"
@@ -979,7 +1034,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "grants": creditGrants(out)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -995,4 +1050,218 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// nextLocalMidnight 返回本地次日 0 点（日限额恢复时间，issue #95）。
+func nextLocalMidnight() time.Time {
+	now := time.Now()
+	y, m, d := now.Date()
+	return time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
+}
+
+// pricingHandler 返回只读价格快照（issue #99）。
+func (p *Panel) pricingHandler(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Pricing == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled":       false,
+			"exchange_rate": p.cfg.PricingRate,
+		})
+		return
+	}
+	snap := p.cfg.Pricing.Snapshot()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":       true,
+		"exchange_rate": p.cfg.PricingRate,
+		"updated_at":    snap.UpdatedAt,
+		"last_error":    snap.LastError,
+		"prices":        snap.Prices,
+	})
+}
+
+// packageAccountRow packages 接口的逐账号行。
+type packageAccountRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Realm    string                   `json:"realm"`
+	Remain   int64                    `json:"remain"`
+	Size     int64                    `json:"size"`
+	Packages []upstream.CreditPackage `json:"packages"`
+	Error    string                   `json:"error,omitempty"`
+}
+
+// creditGrant 积分包获取历史的一行（issue #100，只读快照）。
+type creditGrant struct {
+	UID       string `json:"uid"`
+	Nickname  string `json:"nickname"`
+	Realm     string `json:"realm"`
+	Name      string `json:"name"`
+	Source    string `json:"source"`
+	Inferred  bool   `json:"inferred"`
+	Size      int64  `json:"size"`
+	Remain    int64  `json:"remain"`
+	CreatedAt string `json:"created_at,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+	Status    string `json:"status"`
+}
+
+// creditGrants 把全部账号的积分包摊平成获取历史，按发放时间倒序。
+func creditGrants(accounts []packageAccountRow) []creditGrant {
+	now := time.Now()
+	out := make([]creditGrant, 0)
+	for _, acct := range accounts {
+		for _, pkg := range acct.Packages {
+			source := inferGrantSource(pkg)
+			out = append(out, creditGrant{
+				UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm,
+				Name: pkg.Name, Source: source, Inferred: true,
+				Size: pkg.Size, Remain: pkg.Remain, CreatedAt: pkg.CreatedAt,
+				ExpiresAt: pkg.ExpiresAt, Status: grantStatus(pkg, now),
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+// inferGrantSource 按包名/编码推断来源；上游没给来源字段，故明确标注推断。
+func inferGrantSource(pkg upstream.CreditPackage) string {
+	text := strings.ToLower(pkg.Name + " " + pkg.PackageCode + " " + pkg.SubProductName)
+	for _, rule := range grantSourceRules {
+		for _, needle := range rule.needles {
+			if strings.Contains(text, needle) {
+				return rule.source
+			}
+		}
+	}
+	if pkg.Size >= 1500 {
+		return "首次授权（按面额推断）"
+	}
+	return "未知"
+}
+
+var grantSourceRules = []struct {
+	source  string
+	needles []string
+}{
+	{"签到/连登", []string{"签到", "checkin", "streak"}},
+	{"活动奖励", []string{"活动", "运营", "裂变", "拉新"}},
+	{"首次授权", []string{"首登", "首次", "授权", "新手"}},
+}
+
+// grantStatus 按剩余量与到期时间归类；"生效中"无法从上游快照判断，不编造。
+func grantStatus(pkg upstream.CreditPackage, now time.Time) string {
+	if pkg.ExpiresAt > 0 && pkg.ExpiresAt < now.UnixMilli() {
+		return "已过期"
+	}
+	if pkg.Remain <= 0 {
+		return "已用完"
+	}
+	if pkg.ExpiresAt == 0 {
+		return "可用（不过期）"
+	}
+	return "可用"
+}
+
+// remainingRow 单账号×模型的剩余用量估算（issue #101）。
+type remainingRow struct {
+	UID         string  `json:"uid"`
+	Nickname    string  `json:"nickname"`
+	Realm       string  `json:"realm"`
+	Model       string  `json:"model"`
+	Used        int64   `json:"used"`
+	Budget      float64 `json:"budget"`
+	Remaining   float64 `json:"remaining"`
+	WindowStart string  `json:"window_start,omitempty"`
+	Cooling     bool    `json:"cooling"`
+	Estimated   bool    `json:"estimated"`
+	Samples     int     `json:"samples"`
+}
+
+// usageRemaining 只读剩余用量估算；短 TTL + ETag（issue #101）。
+func (p *Panel) usageRemaining(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Quota == nil || p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "quota store or usage recorder not available")
+		return
+	}
+	now := time.Now()
+	rows, budgets, events := p.remainingRows(now)
+	etag := remainingETag(rows, events)
+	w.Header().Set("ETag", etag)
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"generated_at": now, "ttl_sec": 5, "rows": rows, "budgets": budgets,
+	})
+}
+
+// remainingRows 汇总账号×模型的已用/预算/窗口；同一 24h 窗口内按 resetAt-24h 起算。
+func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.Budget, int) {
+	budgets := p.cfg.Quota.Budgets()
+	events := p.cfg.Quota.Events()
+	y, m, d := now.Date()
+	daily := p.cfg.Usage.TokensByAccountModel(time.Date(y, m, d, 0, 0, 0, 0, now.Location()))
+	resetByKey := map[string]time.Time{}
+	modelsByUID := map[string]map[string]bool{}
+	for _, e := range events {
+		key := e.UID + "|" + e.Model
+		if e.ResetAt.After(resetByKey[key]) {
+			resetByKey[key] = e.ResetAt
+		}
+		if modelsByUID[e.UID] == nil {
+			modelsByUID[e.UID] = map[string]bool{}
+		}
+		modelsByUID[e.UID][e.Model] = true
+	}
+	rows := make([]remainingRow, 0)
+	for _, acct := range p.cfg.Pool.List() {
+		models := modelsByUID[acct.UID]
+		if models == nil {
+			models = map[string]bool{}
+		}
+		for model := range daily[acct.UID] {
+			models[model] = true
+		}
+		for model := range models {
+			rows = append(rows, p.remainingRow(acct, model, daily[acct.UID][model], resetByKey[acct.UID+"|"+model], budgets, now))
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remaining < rows[j].Remaining })
+	return rows, budgets, len(events)
+}
+
+// remainingRow 组装单行；有撞线重置时间时改用同窗口用量。
+func (p *Panel) remainingRow(acct pool.Status, model string, used int64, reset time.Time, budgets map[string]quota.Budget, now time.Time) remainingRow {
+	row := remainingRow{UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm, Model: model, Used: used}
+	if !reset.IsZero() {
+		row.WindowStart = reset.Add(-24 * time.Hour).Format(time.RFC3339)
+		row.Cooling = reset.After(now)
+		used = p.cfg.Usage.TokensSince(acct.Realm, acct.UID, model, reset.Add(-24*time.Hour))
+		row.Used = used
+	}
+	budget, ok := budgets[acct.Realm+"|"+model]
+	if !ok {
+		row.Estimated = true
+		row.Budget = float64(used)
+		row.Remaining = 0
+		return row
+	}
+	row.Budget = budget.Used
+	row.Remaining = max(0, budget.Used-float64(used))
+	row.Samples = budget.Samples
+	return row
+}
+
+// remainingETag 依据行与事件数生成弱 ETag。
+func remainingETag(rows []remainingRow, events int) string {
+	raw, err := json.Marshal(struct {
+		Rows   []remainingRow `json:"rows"`
+		Events int            `json:"events"`
+	}{Rows: rows, Events: events})
+	if err != nil {
+		return `"0"`
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf(`"%x"`, sum[:8])
 }

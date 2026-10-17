@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { api, LS_KEY, postJSON } from '@/lib/api';
 import {
-  CFG_FIELDS,
+  CFG_FIELD_BY_NAME,
   collectConfig,
-  dig,
+  configToValues,
   durationBad,
   DURATION_FIELDS,
   DURATION_TIP,
@@ -48,20 +48,14 @@ export function ConfigView() {
   const [note, setNote] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [clears, setClears] = useState<Record<string, boolean>>({});
 
   const load = async () => {
     try {
       const d = await api<{ path?: string; config?: unknown }>('config');
       setPath(d.path || '');
-      const cfg = d.config;
-      const next: Record<string, FieldValue> = {};
-      for (const f of CFG_FIELDS) {
-        const v = dig(cfg, f.path);
-        if (f.kind === 'checkbox') next[f.name] = !!v;
-        else if (Array.isArray(v)) next[f.name] = v.join(', ');
-        else next[f.name] = v == null ? '' : String(v);
-      }
-      setValues(next);
+      setValues(configToValues(d.config));
+      setClears({});
       setNote('');
     } catch (e) {
       toast('读取配置失败：' + (e as Error).message, 'err');
@@ -86,7 +80,22 @@ export function ConfigView() {
     }
     setSaving(true);
     try {
-      const r = await postJSON<{ restart_required?: string[] }>('config', collectConfig(values));
+      const payload = collectConfig(values);
+      // 显式清除的敏感字段：用空串覆盖，而不是走「空 = 不修改」。
+      for (const [name, on] of Object.entries(clears)) {
+        if (!on) continue;
+        const f = CFG_FIELD_BY_NAME[name];
+        if (f) {
+          let o: Record<string, unknown> = payload;
+          for (let i = 0; i < f.path.length - 1; i++) {
+            const k = f.path[i]!;
+            if (typeof o[k] !== 'object' || o[k] === null) o[k] = {};
+            o = o[k] as Record<string, unknown>;
+          }
+          o[f.path[f.path.length - 1]!] = '';
+        }
+      }
+      const r = await postJSON<{ restart_required?: string[] }>('config', payload);
       const n = (r.restart_required || []).length;
       toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
       const k = String(values.api_key ?? '').trim();
@@ -158,6 +167,11 @@ export function ConfigView() {
             <FieldLabel>单账号明细默认展示条数</FieldLabel>
             {num('package_detail_limit', { min: 1, placeholder: '5' })}
             <FieldDescription>积分构成页按最早到期展示，其余未用完包聚合</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel>聊天请求体上限（字节）</FieldLabel>
+            {num('max_body_bytes', { min: 0, placeholder: '16777216' })}
+            <FieldDescription>覆盖 chat / messages / count_tokens；超限返回 413。0 = 不限制。改动需重启进程</FieldDescription>
           </Field>
         </CardContent>
       </Card>
@@ -246,6 +260,11 @@ export function ConfigView() {
               <FieldDescription>global 域风控更紧，默认 2</FieldDescription>
             </Field>
             <Field>
+              <FieldLabel>全局在途上限</FieldLabel>
+              {num('max_in_flight_total', { min: 0, placeholder: '0' })}
+              <FieldDescription>整个实例的总并发上限；0 = 不限。热生效</FieldDescription>
+            </Field>
+            <Field>
               <FieldLabel>连续失败熔断阈值</FieldLabel>
               {num('breaker_threshold', { min: 1, placeholder: '3' })}
             </Field>
@@ -305,6 +324,21 @@ export function ConfigView() {
               <FieldDescription>余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</FieldDescription>
             </Field>
             <Field>
+              <FieldLabel>每日 Token 上限</FieldLabel>
+              {num('daily_tokens', { min: 0, placeholder: '0' })}
+              <FieldDescription>账号当日总 token 达限后不接单；0 = 关闭。本地 0 点重置</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>每日积分上限</FieldLabel>
+              {num('daily_credits', { min: 0, step: 0.1, placeholder: '0' })}
+              <FieldDescription>达限后只接免费模型；0 = 关闭</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>按模型每日 Token</FieldLabel>
+              {num('model_daily_tokens', { min: 0, placeholder: '0' })}
+              <FieldDescription>账号 × 模型当日 token 达限后只禁该模型；0 = 关闭</FieldDescription>
+            </Field>
+            <Field>
               <FieldLabel>快过期路由窗口</FieldLabel>
               {text('expiring_soon', { placeholder: '168h' })}
               <FieldDescription>窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭</FieldDescription>
@@ -345,8 +379,111 @@ export function ConfigView() {
           <div className="grid gap-x-5 md:grid-cols-2">
             <Field>
               <FieldLabel>出站 User-Agent</FieldLabel>
-              {text('user_agent', { placeholder: '留空 = CLI/2.63.2 CodeBuddy/2.63.2' })}
+              {text('user_agent', { placeholder: '留空 = 内置三段式 UA' })}
               <FieldDescription>影响官网积分记录「使用端」显示；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>客户端版本</FieldLabel>
+              {text('client_version', { placeholder: '留空 = 按 realm 内置默认' })}
+              <FieldDescription>UA 的 WorkBuddy/&lt;ver&gt; 段；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>CLI 版本</FieldLabel>
+              {text('cli_version', { placeholder: '留空 = 按 realm 内置默认' })}
+              <FieldDescription>UA 的 CLI/&lt;ver&gt; 段；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>用量归属名</FieldLabel>
+              {text('client_name', { placeholder: '留空 = WorkBuddy / SaaS' })}
+              <FieldDescription>X-Product 与 X-IDE-Name/Type 跟随该值；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>设备 Token</FieldLabel>
+              <div className="flex items-center gap-2">
+                {text('device_token', { type: 'password', placeholder: clears.device_token ? '保存后清除' : '留空 = 不修改' })}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant={clears.device_token ? 'destructive' : 'ghost'}
+                  onClick={() => setClears((prev) => ({ ...prev, device_token: !prev.device_token }))}
+                >
+                  {clears.device_token ? '取消清除' : '清除'}
+                </Button>
+              </div>
+              <FieldDescription>已设置时留空保持不变；点「清除」保存后置空；账号级 token 优先；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>设备 Token 文件</FieldLabel>
+              {text('device_token_file', { placeholder: '留空 = 不读取文件' })}
+              <FieldDescription>桌面端落盘 token 路径，5 分钟读取缓存；需重启</FieldDescription>
+            </Field>
+          </div>
+          {check('passthrough_ip', '向上游透传客户端 IP', '默认关闭；开启前确认反代信任边界，需重启')}
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-3">
+            <Field>
+              <FieldLabel>单请求最多换号</FieldLabel>
+              {num('rotate_max', { min: 1, placeholder: '3' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>轮换总时长预算</FieldLabel>
+              {text('rotate_budget', { placeholder: '0 = 不限' })}
+              <FieldDescription>如 90s；与换号次数先到先停；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>触发换号的状态码</FieldLabel>
+              {text('rotate_status_codes', { placeholder: '留空 = 按错误分类' })}
+              <FieldDescription>逗号分隔，如 429,500,502；需重启</FieldDescription>
+            </Field>
+          </div>
+          <Field>
+            <FieldLabel>出站代理列表</FieldLabel>
+            {text('proxies', { placeholder: 'http://user:pass@host:port, socks5://host:1080' })}
+            <FieldDescription>逗号分隔；非空按健康轮换，失败自动冷却；需重启</FieldDescription>
+          </Field>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-3">
+            <Field>
+              <FieldLabel>国际版路由</FieldLabel>
+              {check('global_enabled', '启用 global realm')}
+              <FieldDescription>关闭后不路由 global 账号与 global: 模型；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国际版 Chat Base</FieldLabel>
+              {text('global_chat_base', { placeholder: '留空 = 内置默认' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国际版 Billing Base</FieldLabel>
+              {text('global_billing_base', { placeholder: '留空 = 内置默认' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+          </div>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <Field>
+              <FieldLabel>Upstash URL</FieldLabel>
+              {text('upstash_url', { placeholder: 'rediss://... 或 https://xxx.upstash.io' })}
+              <FieldDescription>留空 = 纯内存模式；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>Upstash Token</FieldLabel>
+              {text('upstash_token', { type: 'password', placeholder: '留空 = 不修改' })}
+              <FieldDescription>已设置时留空保持不变；需重启</FieldDescription>
+            </Field>
+          </div>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <Field>
+              <FieldLabel>后台任务模型名单</FieldLabel>
+              {text('background_names', { placeholder: '如 gpt-5-background, memory-gen' })}
+              <FieldDescription>逗号分隔、大小写不敏感；命中后改写到目标模型。留空 = 关闭</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>后台任务改写目标</FieldLabel>
+              {text('background_target', { placeholder: 'deepseek-v4.1-flash' })}
+              <FieldDescription>只改 model 字段，其余请求原样透传；热生效</FieldDescription>
             </Field>
           </div>
           <Separator className="my-4" />
@@ -375,9 +512,19 @@ export function ConfigView() {
           <Separator className="my-4" />
           {check('sanitize_blacklist_fingerprints', '出站请求指纹脱敏')}
           {check('multimodal_routing', '多模态按能力路由（不匹配时改选支持该模态的模型；关闭则返回 400）')}
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <div>
+              {check('local_web_tools', 'Responses 本地代跑 web_search / web_fetch', '开启后每个工具轮次都会额外消耗一次上游额度')}
+            </div>
+            <Field>
+              <FieldLabel>本地工具最多轮数</FieldLabel>
+              {num('local_web_tool_rounds', { min: 1, max: 8, placeholder: '3' })}
+              <FieldDescription>默认 3，封顶 8；仅对 /v1/responses 生效</FieldDescription>
+            </Field>
+          </div>
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
-            Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。
+            本卡片字段均在启动期装配，保存后需重启进程；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。
           </p>
         </CardContent>
       </Card>

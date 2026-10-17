@@ -422,6 +422,11 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
 		return nil
 	}
+	if p.dailyBlocked(e, model, e.a.Realm(), now) {
+		log.Printf("WARN: [pool] daily limit: sticky acct=%s model=%s, unbind",
+			logfmt.Label(e.a.UID, e.a.Nickname), model)
+		return nil
+	}
 	if p.inFlightFull(e) {
 		return nil
 	}
@@ -574,6 +579,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
 		Realm:                    e.a.Realm(),
+		ProxySlot:                e.proxySlot,
 		Enterprise:               e.a.IsEnterprise(),
 		Nickname:                 e.a.Nickname,
 		Credits:                  e.credits,

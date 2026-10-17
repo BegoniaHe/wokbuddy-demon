@@ -59,6 +59,9 @@ type Record struct {
 	TotalTokens      int64      `json:"total_tokens"`
 	Rejected         int64      `json:"rejected,omitempty"`
 	Limits           Limits     `json:"limits,omitempty"`
+	// Realm 出口绑定（issue #94）：空 = 不绑定（跟随模型前缀/全局），
+	// cn / global = 固定该域。只影响 /v1/* 路由，不改变鉴权与管理面可见性。
+	Realm string `json:"realm,omitempty"`
 }
 
 // Limits 一把命名密钥的可选限制；零值 = 不限。进程内计数，单实例语义。
@@ -432,6 +435,46 @@ func (s *Store) ModelAllowed(id, model string) bool {
 		}
 	}
 	return false
+}
+
+// Realm 返回一把密钥的出口绑定（空 = 不绑定；不存在/已撤销返回空）。
+func (s *Store) Realm(id string) string {
+	if s == nil || id == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.records {
+		if s.records[i].ID == id && !s.records[i].Revoked {
+			return s.records[i].Realm
+		}
+	}
+	return ""
+}
+
+// SetRealm 更新一把密钥的出口绑定（issue #94）。realm 只接受 ""/cn/global，
+// 变更即时生效（下一个请求读取）；落盘失败回滚。
+func (s *Store) SetRealm(id, realm string) (bool, error) {
+	switch realm {
+	case "", "cn", "global":
+	default:
+		return false, fmt.Errorf("realm 必须是空、cn 或 global，当前 %q", realm)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.records {
+		if s.records[i].ID != id {
+			continue
+		}
+		old := s.records[i].Realm
+		s.records[i].Realm = realm
+		if err := s.persistLocked(); err != nil {
+			s.records[i].Realm = old
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 // UpdateLimits 替换一把密钥的限制（面板编辑用）。非法值在调用方校验。
