@@ -63,6 +63,11 @@ func (r *httpResponder) Error(status int, code, msg, hint string) {
 	writeOpenAIErrorHint(r.w, status, code, msg, hint)
 }
 
+// Header 设置响应头（必须在写响应体前调用）。
+func (r *httpResponder) Header(name, value string) {
+	r.w.Header().Set(name, value)
+}
+
 // Stream 把上游 SSE 透传给客户端。SSE 头与帧格式由 upstream.StreamHint 负责
 // （本仓出站协议层，未改动），适配器只负责挂接选项与写入目标。
 func (r *httpResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {

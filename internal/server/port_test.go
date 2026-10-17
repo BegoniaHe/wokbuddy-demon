@@ -28,6 +28,8 @@ func (f *fakeResponder) Error(status int, code, msg, hint string) {
 	f.errStatus, f.errCode, f.errMsg, f.errHint = status, code, msg, hint
 }
 
+func (f *fakeResponder) Header(string, string) {}
+
 func (f *fakeResponder) Stream(io.Reader, func(string) string, *upstream.MarkupRepair, func(string)) error {
 	return nil
 }
