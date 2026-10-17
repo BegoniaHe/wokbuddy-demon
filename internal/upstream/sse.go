@@ -14,18 +14,34 @@ import (
 )
 
 // errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
-// 用哨兵错误替代裸 fmt.Errorf：StreamHint 的调用方（handler 流式路径）需要区分
-// 「上游空流」与「客户端断连写失败」——空流是上游缺陷，应记 502 观测；写失败是
-// 客户端已走，日志口径不同。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
-var errEmptyStream = errors.New("upstream stream contained no valid data events")
+//
+// errTruncatedStream 上游未发 data: [DONE] 就以 EOF 收尾（连接被切 / 代理中断 /
+// 上游进程崩溃）。流式路径仍向客户端补一个 [DONE] 兜底收尾，但请求结果必须是
+// 失败——截断的 content 不是完整回答（issue #105）。
+//
+// 两者都是上游缺陷，不是「客户端已走」。用哨兵错误替代裸 fmt.Errorf：StreamHint
+// 的调用方（handler 流式路径）需要区分「上游空流/截断」与「客户端写失败」——
+// 前者是上游失败，应记失败观测并不再计账号成功；写失败是客户端断开，账号侧
+// 照常记成功。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
+// 读错误（io.EOF 之外的 Read 错误）原样上抛，调用方按传输错误处置。
+var (
+	errEmptyStream     = errors.New("upstream stream contained no valid data events")
+	errTruncatedStream = errors.New("upstream stream ended without [DONE]")
+)
 
 // IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
 // 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
-// Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
+// IsTruncatedStreamError 报告错误是否为「上游流被截断」（EOF 收尾但从未收到
+// data: [DONE]）。截断按上游失败处置：账号不记成功、不绑粘性（issue #105）。
+func IsTruncatedStreamError(err error) bool { return errors.Is(err, errTruncatedStream) }
+
+// Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
+// EOF 收尾但未见过 [DONE] → errTruncatedStream：截断的 content 不是完整回答，
+// 不返回残缺成功响应，由 handler 映射为 502 upstream_parse（issue #105）。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
 	a := newStreamAggregator()
@@ -261,12 +277,19 @@ func (a *streamAggregator) mergeToolCallsChunk(tcs []any) {
 	}
 }
 
-// result 由聚合状态构造最终的非流式响应；无有效事件返回 errEmptyStream。
+// result 由聚合状态构造最终的非流式响应；无有效事件返回 errEmptyStream，
+// EOF 截断（未见过 [DONE]）返回 errTruncatedStream——两者都不是成功响应。
 func (a *streamAggregator) result() (map[string]any, error) {
 	if a.validEvents == 0 {
 		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
 		return nil, errEmptyStream
+	}
+	if !a.sawDone {
+		// EOF 收尾但上游从未发 data: [DONE]（issue #105）：连接被切 / 代理中断 /
+		// 上游崩溃。累积的 content 只是截断片段，不能当完整回答返回——非流式没有
+		// 「补帧让客户端收尾」的余地，直接报上游解析失败，由 handler 映射 502。
+		return nil, errTruncatedStream
 	}
 	if a.id == "" {
 		a.id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -623,6 +646,10 @@ type streamWriter struct {
 	// writeTimeout 单次写帧/Flush 的截止时长；<=0 不设截止（测试可注入短值）。
 	writeTimeout time.Duration
 
+	// sawDone 上游是否显式发过 data: [DONE]（issue #105）。两条读取路径
+	// （普通 / keepalive）共用；收尾时据此区分「正常结束」与「EOF 截断」。
+	sawDone bool
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen map[int]bool
@@ -877,6 +904,8 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 }
 
 // stream 读取 r 并逐帧透传到 w（含空流兜底与尾部收尾）。
+// 上游读错误（io.EOF 之外的 Read 错误）原样上抛，供调用方与「客户端写失败」
+// 区分（issue #105）：读错误是上游/连接的问题，写失败是客户端已走。
 func (s *streamWriter) stream(r io.Reader) error {
 	// 流结束（含写失败）清掉写截止：连接可能被 keep-alive 复用，
 	// 残留的过期 deadline 会让后续请求的响应写立即失败。
@@ -891,7 +920,7 @@ func (s *streamWriter) stream(r io.Reader) error {
 		n, done, werr := s.handleStreamLine(line)
 		validFrames += n
 		if werr != nil {
-			return werr
+			return werr // 客户端写失败（或帧解析失败）：原样上抛
 		}
 		if done {
 			break
@@ -901,7 +930,7 @@ func (s *streamWriter) stream(r io.Reader) error {
 			if err == io.EOF {
 				break
 			}
-			return err
+			return err // 上游读错误：原样上抛（调用方按上游失败处置）
 		}
 	}
 	return s.finish(&validFrames)
@@ -1003,6 +1032,7 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 	case strings.HasPrefix(trimmed, "data: [DONE]"):
 		// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 		// [DONE] 统一在循环结束后写出，保证恰好一个。
+		s.sawDone = true
 		return 0, true, nil
 	case strings.HasPrefix(trimmed, "data: "):
 		n, werr := s.writeFrame(strings.TrimPrefix(trimmed, "data: "))
@@ -1017,6 +1047,9 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 }
 
 // finish 收尾：标记修复尾部回吐 + 空流兜底 error 帧 + 保证恰好一个 [DONE]。
+// s.sawDone 为上游是否显式发过 data: [DONE]；false（EOF 截断）时收尾后返回
+// errTruncatedStream，让调用方把这次请求记为上游失败（issue #105）。
+// [DONE] 兜底帧照写：客户端已开始读流，必须有一个收尾标记，不能中途悬挂。
 func (s *streamWriter) finish(validFrames *int) error {
 	if werr := s.finishRepair(validFrames); werr != nil {
 		return werr
@@ -1032,10 +1065,14 @@ func (s *streamWriter) finish(validFrames *int) error {
 	if err := s.writeAll("data: [DONE]\n\n"); err != nil {
 		return err
 	}
-	if *validFrames == 0 {
+	switch {
+	case *validFrames == 0:
 		return errEmptyStream
+	case !s.sawDone:
+		return errTruncatedStream
+	default:
+		return nil
 	}
-	return nil
 }
 
 // finishRepair 标记修复的尾部收尾：流结束时仍未判定的字节一律原文回吐（绝不吞字节，

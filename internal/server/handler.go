@@ -1152,7 +1152,7 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 	if f.stream {
 		return f.handleStreamSuccess(acct, rc, attemptStarted)
 	}
-	return f.handleNonStreamSuccess(acct, rc, attemptStarted)
+	return f.handleNonStreamSuccess(ctx, acct, rc, attemptStarted, i)
 }
 
 // handleTransportError 处置传输层错误（terr 非 nil 且非 *upstream.Error 信封）。
@@ -1325,10 +1325,12 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 	case upstream.IsEmptyStreamError(sErr):
 		// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE] 兜底（HTTP 头
 		// 已发出只能 200），但这是上游缺陷不是成功——观测收敛到 502，与非流式空流
-		// →502 upstream_parse 同语义。只认 IsEmptyStreamError：客户端断连的写失败不误标。
-		f.st.status = http.StatusBadGateway
-		f.st.outcome = reqlog.OutcomeStreamError
-		log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), f.bareModel)
+		// →502 upstream_parse 同语义。只认哨兵错误：客户端断连的写失败不误标。
+		f.failStreamUpstream(acct, "empty upstream stream (200+0 frames)")
+	case upstream.IsTruncatedStreamError(sErr):
+		// 上游未发 [DONE] 就以 EOF 收尾（issue #105）：StreamHint 已向客户端补一个
+		// [DONE] 兜底收尾，但截断的 content 不是完整回答——按上游失败处置账号。
+		f.failStreamUpstream(acct, "upstream stream truncated (EOF without [DONE])")
 	case errFrame != "":
 		// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并处置账号
 		// ——**不记成功、不清 11102 负缓存、不绑粘性**。
@@ -1351,6 +1353,18 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 	f.finishStreamStats(acct, stats, repair, attemptStarted)
 	rc.Close()
 	return rotDone
+}
+
+// failStreamUpstream 处置流式路径的上游失败（空流 / 截断，issue #105）：
+// HTTP 头已发出只能 200，但观测收敛到 502 upstream_parse 同语义；账号**不记成功、
+// 不绑粘性**。已向客户端写出过帧（截断流的常态）无法换号重试，此时至少解绑粘性，
+// 下次请求重新分配，不把会话钉在坏号上。
+func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
+	f.st.status = http.StatusBadGateway
+	f.st.outcome = reqlog.OutcomeStreamError
+	f.unbindSticky()
+	log.Printf("WARN: [server] stream acct=%s model=%s: %s (account not marked success)",
+		logfmt.Label(acct.UID, acct.Nickname), f.bareModel, reason)
 }
 
 // noteSuccessAndBind 记录账号成功、清 11102 负缓存，并让会话粘性跟随最终成功号。
@@ -1400,16 +1414,25 @@ func (f *chatFlow) finishStreamStats(acct *auth.Auth, stats *chatStatsReader, re
 }
 
 // handleNonStreamSuccess 非流式收尾：聚合 SSE、修复标记工具调用、记录用量并写响应。
-func (f *chatFlow) handleNonStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+// 聚合失败（空流 / EOF 截断，issue #105）时客户端尚未收到任何字节，换号重试。
+func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int) rotationAction {
 	resp, err := upstream.Aggregate(rc)
 	rc.Close()
 	if err != nil {
 		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
-		// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
-		f.out.Error(http.StatusBadGateway, "upstream_parse", err.Error(), "")
+		// 上游流解析失败（空流 / EOF 截断，issue #105）：截断的 content 不是完整
+		// 回答，绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试
+		// （空流/截断是上游缺陷，换个号大概率能拿到完整流）；轮转耗尽才回 502。
+		f.unbindSticky()
 		f.st.status = http.StatusBadGateway
-		f.st.outcome = reqlog.OutcomeHTTPError
-		return rotDone
+		f.lastErr = fmt.Errorf("upstream_parse: %w", err)
+		log.Printf("WARN: [server] non-stream acct=%s model=%s: %v (rotating)",
+			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, err)
+		if !rotateBackoff(ctx, i) {
+			return rotBreak
+		}
+		f.rotateReason = "parse"
+		return rotContinue
 	}
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
 	// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
@@ -1682,6 +1705,24 @@ func futureOrZero(t, now time.Time) time.Time {
 	return time.Time{}
 }
 
+// localErrorEnvelope 识别「本地分类」的轮转终止错误并给出专属信封（ok=true）：
+//   - errUpstreamTimeout：轮转已在传输层分支止损（见 isUpstreamTimeout），文案必须
+//     与 no_healthy_account 区分——两者的排查方向完全不同（前者是上游慢，后者是号全挂）。
+//   - 上游流截断/空流且所有号都如此（issue #105）：502 + upstream_parse，与「解析失败」
+//     同口径——客户端别把「上游坏了」读成「号全挂了」而盲目重试。
+func localErrorEnvelope(err error, fallbackStatus int, fallbackCode, fallbackMsg string) (status int, code, msg string, ok bool) {
+	switch {
+	case errors.Is(err, errUpstreamTimeout):
+		return fallbackStatus, "upstream_timeout",
+			"upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later",
+			true
+	case upstream.IsTruncatedStreamError(err), upstream.IsEmptyStreamError(err):
+		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	default:
+		return fallbackStatus, fallbackCode, fallbackMsg, false
+	}
+}
+
 // finalErrorEnvelope 由 lastErr 推导末端错误透传的状态码 / code / message / hint。
 // 上游返回（*upstream.Error）→ error.message 装**上游 body 原文**（code/msg/requestId
 // 原样保留）。HTTP 状态码按 OpenAI 兼容口径映射类别：ErrSoftRate → 429（限流语义、
@@ -1690,15 +1731,13 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 	status = http.StatusServiceUnavailable
 	code = "no_healthy_account"
 	msg = "all accounts are temporarily unavailable, please retry later"
-	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
-	// 的文案，别混进"没有可用账号"——两者的排查方向完全不同。
-	if errors.Is(f.lastErr, errUpstreamTimeout) {
-		code = "upstream_timeout"
-		msg = "upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later"
-	}
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint = upstream.NoHealthyAccountHint()
+	if s2, c2, m2, ok := localErrorEnvelope(f.lastErr, status, code, msg); ok {
+		// 本地分类错误（超时 / 截断 / 空流）：自带状态码与文案，直接透出。
+		return s2, c2, m2, hint, false
+	}
 	var ue *upstream.Error
 	if !errors.As(f.lastErr, &ue) {
 		return status, code, msg, hint, false

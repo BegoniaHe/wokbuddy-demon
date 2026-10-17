@@ -2060,3 +2060,108 @@ func TestChatModelBlockPlatformHint(t *testing.T) {
 		t.Errorf("model block hint should mark platform-level: %s", rec.Body)
 	}
 }
+
+// TestChatStreamTruncatedNoSuccess 上游流截断（EOF 无 [DONE]，issue #105）：
+// 客户端收到 200 与补写的 [DONE]，但账号不记成功、不绑粘性。
+func TestChatStreamTruncatedNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n", true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 客户端必须拿到一个 [DONE] 收尾。
+	if n := strings.Count(rec.Body.String(), "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, rec.Body)
+	}
+	// 截断不是成功：账号 success_count 保持 0，粘性不绑定。
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (truncated stream is not success)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("truncated stream must not bind sticky")
+	}
+}
+
+// TestChatStreamEmptyStreamNoSuccess 上游空流（200 + 0 有效帧，issue #105）：
+// 账号不记成功、不绑粘性（写头后无法换号，只记失败）。
+func TestChatStreamEmptyStreamNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, ": keepalive comment\n\n", true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (empty stream is not success)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("empty stream must not bind sticky")
+	}
+}
+
+// TestChatNonStreamTruncatedRotates 非流式截断：客户端未收到任何字节，换号重试；
+// 拿到完整流的号才记成功，截断号 success_count 保持 0（issue #105）。
+func TestChatNonStreamTruncatedRotates(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n", true
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want bad once + good once (rotate after truncation)", calls)
+	}
+	if s := statusOf(t, p, "bad").SuccessCount; s != 0 {
+		t.Errorf("bad success_count=%d want 0 (its stream was truncated)", s)
+	}
+	if s := statusOf(t, p, "good").SuccessCount; s != 1 {
+		t.Errorf("good success_count=%d want 1", s)
+	}
+}
+
+// TestChatNonStreamTruncatedAllAccountsFails502 非流式截断且所有号都截断：
+// 轮转耗尽后回 502，不把截断内容当成功写回（issue #105）。
+func TestChatNonStreamTruncatedAllAccountsFails502(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n", true
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d want 502 body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0", s)
+	}
+}
