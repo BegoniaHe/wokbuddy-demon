@@ -7,6 +7,7 @@ export interface UsageTotals {
   completion_tokens?: number;
   total_tokens?: number;
   avg_latency_ms?: number;
+  avg_ttft_ms?: number;
   avg_tokens_per_second?: number;
   credits?: number;
   credit_tokens?: number;
@@ -44,6 +45,8 @@ export interface SeriesPoint {
   completion_tokens?: number;
   total_tokens?: number;
   requests?: number;
+  avg_ttft_ms?: number;
+  credits?: number;
 }
 
 export interface UsageData {
