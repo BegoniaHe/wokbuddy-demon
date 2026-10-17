@@ -2,6 +2,7 @@ package panel
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
@@ -52,6 +55,7 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 		rows, records, err := p.backfillAccount(a, uid, start, end)
 		if err != nil {
 			failures[uid] = err.Error()
+			log.Printf("WARN: usage backfill %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 			continue
 		}
 		totalRecords += records
@@ -81,32 +85,30 @@ func (p *Panel) resolveBackfillUIDs(uid string) []string {
 	return uids
 }
 
-// backfillAccount 拉取单账号逐笔用量并按 (天, 模型) 聚合。分页上限 50 页防失控。
+// requestUsagePageSize 单页上限（实测 1000 可用；配合 50 页上限即最多 5 万条/账号）。
+const requestUsagePageSize = 1000
+
+// backfillAccount 拉取单账号逐笔用量并按 (天, 模型) 聚合。分页上限 50 页防失控；
+// requestId 跨页去重，避免上游分页重叠时重复计数。
 func (p *Panel) backfillAccount(a *auth.Auth, uid string, start, end time.Time) ([]usage.BackfillRow, int, error) {
 	realm := a.Realm()
 	rows := map[string]*usage.BackfillRow{}
+	seen := map[string]struct{}{}
+	fallbackDay := end.Local().Format("2006-01-02")
 	records := 0
 	for page := 1; page <= 50; page++ {
-		pg, err := p.cfg.Upstream.RequestUsage(a, start, end, page, 100)
+		pg, err := p.cfg.Upstream.RequestUsage(a, start, end, page, requestUsagePageSize)
 		if err != nil {
-			return nil, records, err
+			return nil, records, fmt.Errorf("page %d: %w", page, err)
 		}
+		newOnPage := 0
 		for _, rec := range pg.Records {
-			day := end.Local().Format("2006-01-02")
-			if !rec.Time.IsZero() {
-				day = rec.Time.Local().Format("2006-01-02")
+			if addBackfillRecord(rows, seen, realm, uid, fallbackDay, rec) {
+				records++
+				newOnPage++
 			}
-			key := day + "|" + rec.Model
-			row := rows[key]
-			if row == nil {
-				row = &usage.BackfillRow{Day: day, Realm: realm, UID: uid, Model: rec.Model}
-				rows[key] = row
-			}
-			row.Requests++
-			row.Credits += rec.Credit
-			records++
 		}
-		if pg.NextPage == 0 {
+		if len(pg.Records) == 0 || newOnPage == 0 || pg.NextPage == 0 {
 			break
 		}
 	}
@@ -115,4 +117,33 @@ func (p *Panel) backfillAccount(a *auth.Auth, uid string, start, end time.Time) 
 		out = append(out, *row)
 	}
 	return out, records, nil
+}
+
+// addBackfillRecord 把单笔记录聚合进 (天, 模型) 桶；requestId 重复返回 false。
+// 时间缺失的异常记录落到 fallbackDay，保证不丢请求数。
+func addBackfillRecord(
+	rows map[string]*usage.BackfillRow,
+	seen map[string]struct{},
+	realm, uid, fallbackDay string,
+	rec upstream.RequestUsageRecord,
+) bool {
+	if rec.RequestID != "" {
+		if _, ok := seen[rec.RequestID]; ok {
+			return false
+		}
+		seen[rec.RequestID] = struct{}{}
+	}
+	day := fallbackDay
+	if !rec.Time.IsZero() {
+		day = rec.Time.Local().Format("2006-01-02")
+	}
+	key := day + "|" + rec.Model
+	row := rows[key]
+	if row == nil {
+		row = &usage.BackfillRow{Day: day, Realm: realm, UID: uid, Model: rec.Model}
+		rows[key] = row
+	}
+	row.Requests++
+	row.Credits += rec.Credit
+	return true
 }

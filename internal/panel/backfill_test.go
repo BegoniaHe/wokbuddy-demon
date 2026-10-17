@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -20,8 +19,8 @@ import (
 func TestUsageBackfillEndpoint(t *testing.T) {
 	nowUnix := strconv.FormatInt(time.Now().Unix(), 10)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "get-user-request-usage") {
-			w.Write([]byte(`{"code":0,"data":{"total":2,"list":[` +
+		if r.URL.Path == "/billing/meter/get-user-request-usage" {
+			w.Write([]byte(`{"code":0,"data":{"total":2,"data":[` +
 				`{"requestId":"r1","model":"glm-5.2","credit":1.5,"requestTime":` + nowUnix + `},` +
 				`{"requestId":"r2","model":"glm-5.2","credit":0.5,"requestTime":` + nowUnix + `}]}}`))
 			return
@@ -57,5 +56,31 @@ func TestUsageBackfillEndpoint(t *testing.T) {
 	s := rec.Snapshot(0, nil)
 	if s.Totals.Requests != 2 || s.Totals.Credits != 2.0 {
 		t.Fatalf("backfilled totals=%+v want requests=2 credits=2", s.Totals)
+	}
+}
+
+// TestAddBackfillRecordDedup 同 requestId 跨页重复时只计一次，避免分页重叠放大用量。
+func TestAddBackfillRecordDedup(t *testing.T) {
+	rows := map[string]*usage.BackfillRow{}
+	seen := map[string]struct{}{}
+	rec := upstream.RequestUsageRecord{
+		RequestID: "r1",
+		Model:     "glm-5.2",
+		Credit:    1.5,
+		Time:      time.Now(),
+	}
+	if !addBackfillRecord(rows, seen, "cn", "u1", "2026-10-17", rec) {
+		t.Fatal("first record should be accepted")
+	}
+	if addBackfillRecord(rows, seen, "cn", "u1", "2026-10-17", rec) {
+		t.Fatal("duplicate request id should be skipped")
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+	for _, row := range rows {
+		if row.Requests != 1 || row.Credits != 1.5 {
+			t.Fatalf("row=%+v want requests=1 credits=1.5", row)
+		}
 	}
 }
