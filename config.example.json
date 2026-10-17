@@ -4,7 +4,8 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "read_timeout": "300s"
+    "read_timeout": "300s",
+    "cors_origins": []
   },
   "panel": {
     "package_detail_limit": 5

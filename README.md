@@ -344,6 +344,7 @@ claude
 | `logging.decision_trace_sample` | `0.1` | 决策链采样率：0/1 = 全部，0<v<1 按比例。改后需重启 |
 | `notify.webhook_url` | 空 | 告警 webhook（http/https）；空 = 关闭 |
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
+| `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `upstream.model_timeouts` | `{}` | 按模型覆盖 `header` / `idle` 超时（如 `{"cn:glm-5.2":{"header":"300s","idle":"600s"}}`）；未命中回落全局。改后需重启 |

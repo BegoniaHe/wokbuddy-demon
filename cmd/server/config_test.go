@@ -784,6 +784,33 @@ func TestServerReadTimeout(t *testing.T) {
 	}
 }
 
+// TestCORSOrigins 校验 server.cors_origins 的规范化与非法值拒绝（issue #91）。
+func TestCORSOrigins(t *testing.T) {
+	c := Default()
+	c.Server.CORSOrigins = []string{" HTTP://LocalHost:3000/ ", "http://localhost:3000", "https://app.example.com"}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	want := []string{"http://localhost:3000", "https://app.example.com"}
+	if len(c.Server.CORSOrigins) != len(want) {
+		t.Fatalf("origins=%v want %v", c.Server.CORSOrigins, want)
+	}
+	for i := range want {
+		if c.Server.CORSOrigins[i] != want[i] {
+			t.Errorf("origins[%d]=%q want %q", i, c.Server.CORSOrigins[i], want[i])
+		}
+	}
+
+	bad := []string{"*", "localhost:3000", "ftp://example.com", "https://example.com/path", "https://example.com?q=1", "https://u:p@example.com"}
+	for _, origin := range bad {
+		c := Default()
+		c.Server.CORSOrigins = []string{origin}
+		if err := c.normalize(); err == nil {
+			t.Errorf("origin %q should be rejected", origin)
+		}
+	}
+}
+
 // mustParseConfig 解析一段配置 JSON（不读环境变量），失败即终止测试。
 func mustParseConfig(t *testing.T, body string) *Config {
 	t.Helper()
