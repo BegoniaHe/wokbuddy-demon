@@ -55,7 +55,7 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 		rows, records, err := p.backfillAccount(a, uid, start, end)
 		if err != nil {
 			failures[uid] = err.Error()
-			log.Printf("WARN: usage backfill %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			log.Printf("WARN: [panel] usage backfill %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 			continue
 		}
 		totalRecords += records
@@ -163,7 +163,12 @@ func (p *Panel) fetchBackfillPages(
 ) ([]upstream.RequestUsageRecord, error) {
 	out := append([]upstream.RequestUsageRecord(nil), first.Records...)
 	next := first.NextPage
-	for page := 2; next != 0 && page <= requestUsageMaxPages; page++ {
+	for page := 2; next != 0; page++ {
+		// 翻到硬上限仍有下一页：宁可失败也不返回截断数据（回填是覆盖写入，
+		// 截断会把本地当天桶替换成不完整计数）。
+		if page > requestUsageMaxPages {
+			return nil, fmt.Errorf("window %v..%v exceeds %d pages", start, end, requestUsageMaxPages)
+		}
 		pg, err := p.cfg.Upstream.RequestUsage(a, start, end, page, requestUsagePageSize)
 		if err != nil {
 			return nil, fmt.Errorf("window %v..%v page %d: %w", start, end, page, err)

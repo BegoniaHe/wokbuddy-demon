@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,5 +133,27 @@ func TestFetchBackfillRecordsSplitsCappedWindow(t *testing.T) {
 	}
 	if calls < 3 {
 		t.Fatalf("calls=%d want >=3 (cap probe + two windows)", calls)
+	}
+}
+
+// TestFetchBackfillPagesRejectsTruncation 翻到分页硬上限仍有下一页时必须报错，
+// 不能把截断结果当作完整数据覆盖本地桶。
+func TestFetchBackfillPagesRejectsTruncation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"code":0,"data":{"total":100000,"data":[
+			{"requestId":"r","model":"m","credit":1}]}}`)
+	}))
+	defer srv.Close()
+
+	p := &Panel{cfg: Config{Upstream: &upstream.Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}}}
+	first := &upstream.RequestUsagePage{
+		Records:  []upstream.RequestUsageRecord{{RequestID: "r0", Model: "m"}},
+		Total:    100000,
+		NextPage: 2,
+	}
+	_, err := p.fetchBackfillPages(
+		&auth.Auth{AccessToken: "at"}, time.Now().Add(-time.Hour), time.Now(), first)
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err=%v want page-cap error", err)
 	}
 }

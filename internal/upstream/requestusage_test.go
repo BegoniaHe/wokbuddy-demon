@@ -140,8 +140,6 @@ func TestParseUsageTimeWallClockUTC8(t *testing.T) {
 	}
 }
 
-// TestRequestUsageMissingTotalStillPaginates 上游漏给 total 时，整页满仍需继续翻页，
-// 避免回填静默截断。
 // TestDoJSONLimitRejectsOversize 响应超限时必须报明确错误，不能把半截 body 交给
 // json.Unmarshal 变成 "unexpected end of JSON input"。
 func TestDoJSONLimitRejectsOversize(t *testing.T) {
@@ -157,6 +155,8 @@ func TestDoJSONLimitRejectsOversize(t *testing.T) {
 	}
 }
 
+// TestRequestUsageMissingTotalStillPaginates 上游漏给 total 时，整页满仍需继续翻页，
+// 避免回填静默截断。
 func TestRequestUsageMissingTotalStillPaginates(t *testing.T) {
 	var pages []int
 	c := testClient(func(r *http.Request) (*http.Response, error) {
