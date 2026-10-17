@@ -765,7 +765,10 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	if h.cfg.Session != nil && f.sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, f.bareModel); ok {
+		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
+		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
+		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
+		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, f.realm+":"+f.bareModel); ok {
 			f.stickyUID = uid
 		}
 	}

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -122,6 +124,61 @@ func TestModelsEndpointIncludesAliases(t *testing.T) {
 		}
 		if m["upstream_id"] != upstreamID {
 			t.Errorf("%s upstream_id=%v, want %s", id, m["upstream_id"], upstreamID)
+		}
+	}
+}
+
+// TestChatFlowAliasStickyKeepsRealm 别名目标省略 realm 时，粘性可用性过滤必须
+// 收到继承请求侧后的 "[realm:]model"：global 请求不能被当成 cn 绑定到 cn 账号。
+func TestChatFlowAliasStickyKeepsRealm(t *testing.T) {
+	var seen []string
+	sess := session.New(session.Config{
+		TTL:   time.Minute,
+		Store: newBindStore(),
+		AvailableForModel: func(model string) []string {
+			seen = append(seen, model)
+			switch model {
+			case "global:hy4":
+				return []string{"g1"}
+			case "cn:hy4":
+				return []string{"cn1"}
+			}
+			return nil
+		},
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", AccessToken: "at-cn", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "g1", Domain: "acct.workbuddy.ai", AccessToken: "at-g", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     upstream.New(),
+		Session:      sess,
+		ModelAliases: map[string]string{"codex": "hy4"},
+	})
+
+	cases := []struct {
+		model   string
+		wantSee string
+		wantUID string
+	}{
+		{"global:codex", "global:hy4", "g1"},
+		{"codex", "cn:hy4", "cn1"},
+	}
+	for _, tc := range cases {
+		seen = seen[:0]
+		f := h.newChatFlow(chatInput{
+			body:  []byte(`{"model":"` + tc.model + `","messages":[],"metadata":{"conversation_id":"` + tc.wantUID + `"}}`),
+			model: tc.model,
+		}, &fakeResponder{})
+		if len(seen) == 0 || seen[0] != tc.wantSee {
+			t.Errorf("%s: AvailableForModel 收到 %v，want 首个 %q", tc.model, seen, tc.wantSee)
+		}
+		if f.realm+":"+f.bareModel != tc.wantSee {
+			t.Errorf("%s: resolved=%s:%s，want %s", tc.model, f.realm, f.bareModel, tc.wantSee)
+		}
+		if f.stickyUID != tc.wantUID {
+			t.Errorf("%s: stickyUID=%q，want %q", tc.model, f.stickyUID, tc.wantUID)
 		}
 	}
 }
