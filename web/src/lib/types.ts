@@ -101,6 +101,8 @@ export interface Overview {
   version: string;
   redis_mode?: string;
   in_flight_full?: number;
+  in_flight_total?: number;
+  max_in_flight_total?: number;
   uptime_sec: number;
   accounts?: Account[];
   model_locks?: ModelLock[];

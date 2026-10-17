@@ -28,6 +28,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'include_disabled_in_tasks', path: ['schedule', 'include_disabled_in_tasks'], kind: 'checkbox' },
   { name: 'max_in_flight', path: ['pool', 'max_in_flight'], kind: 'number' },
   { name: 'max_in_flight_global', path: ['pool', 'max_in_flight_global'], kind: 'number' },
+  { name: 'max_in_flight_total', path: ['pool', 'max_in_flight_total'], kind: 'number' },
   { name: 'breaker_threshold', path: ['pool', 'breaker_threshold'], kind: 'number' },
   { name: 'soft_rate', path: ['cooldown', 'soft_rate'], kind: 'text' },
   { name: 'soft_rate_max', path: ['cooldown', 'soft_rate_max'], kind: 'text' },

@@ -106,6 +106,11 @@ export function AccountsView() {
           { value: data.paused ?? '-', label: '已暂停选号', tone: 'warn' },
           { value: creditsText, label: '积分剩余 / 总额' },
           { value: data.sticky_sessions, label: '粘性会话' },
+          {
+            value: (data.in_flight_total ?? 0) + ' / ' + (data.max_in_flight_total ? data.max_in_flight_total : '不限'),
+            label: '全局在途',
+            tone: data.max_in_flight_total && (data.in_flight_total ?? 0) >= data.max_in_flight_total ? 'warn' : undefined,
+          },
         ]}
       />
 

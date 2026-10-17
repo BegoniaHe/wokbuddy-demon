@@ -360,6 +360,7 @@ claude
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
 | `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
+| `pool.max_in_flight_total` | `0` | 网关级全局在途上限；满额新请求返回 503 且不选号；`0` = 不限。热生效 |
 | `pool.credit_floor` | `100` | 积分保底：余额低于该值不再参与收费模型轮换 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |

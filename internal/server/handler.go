@@ -963,6 +963,12 @@ func (f *chatFlow) fail(uid string) {
 // runRotation 执行选号 + 重试轮转。返回 true 表示已写出响应（成功或请求级错误）。
 // 「先到先停」：次数上限 MaxRotate 与总时长预算 RotateBudget（>0 时）任一先到即停。
 func (f *chatFlow) runRotation(ctx context.Context) bool {
+	// 全局在途满额：在选号前快速失败（issue #92），避免为一个注定拿不到名额的
+	// 请求做选号、粘性与轮换。并发竞态仍由 Acquire 的 CAS 兜底。
+	if f.h.cfg.Pool.GlobalInFlightFull() {
+		f.st.status = http.StatusServiceUnavailable
+		return false
+	}
 	var deadline time.Time
 	if f.h.cfg.RotateBudget > 0 {
 		deadline = time.Now().Add(f.h.cfg.RotateBudget)
@@ -1030,6 +1036,11 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 
 	// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 	if !f.h.cfg.Pool.Acquire(acct.UID) {
+		// 全局名额被并发抢走：直接终止，不再换号空转。
+		if f.h.cfg.Pool.GlobalInFlightFull() {
+			f.st.status = http.StatusServiceUnavailable
+			return rotBreak
+		}
 		return f.retryAcquireFailed(ctx, acct, i)
 	}
 	f.heldUID = acct.UID

@@ -1464,6 +1464,53 @@ func TestAcquireUnknownUID(t *testing.T) {
 	p.Release("nope") // 不 panic
 }
 
+func TestMaxInFlightTotal(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetMaxInFlightTotal(1)
+	if !p.Acquire("u1") {
+		t.Fatal("first acquire should succeed")
+	}
+	if p.InFlightTotal() != 1 {
+		t.Fatalf("in-flight total=%d want 1", p.InFlightTotal())
+	}
+	if p.Acquire("u2") {
+		t.Fatal("second acquire should fail on global limit")
+	}
+	if !p.GlobalInFlightFull() {
+		t.Error("GlobalInFlightFull should be true at limit")
+	}
+	p.Release("u1")
+	if !p.Acquire("u2") {
+		t.Fatal("acquire after global release should succeed")
+	}
+	p.Release("u2")
+	p.Release("u2") // 重复释放幂等
+	if p.InFlightTotal() != 0 {
+		t.Fatalf("in-flight total=%d want 0", p.InFlightTotal())
+	}
+}
+
+func TestMaxInFlightTotalUnlimited(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	for i := range 50 {
+		if !p.Acquire("u1") {
+			t.Fatalf("unlimited global acquire %d failed", i)
+		}
+	}
+	if p.InFlightTotal() != 50 {
+		t.Fatalf("in-flight total=%d want 50", p.InFlightTotal())
+	}
+	for range 50 {
+		p.Release("u1")
+	}
+	if p.InFlightTotal() != 0 {
+		t.Fatalf("in-flight total=%d want 0", p.InFlightTotal())
+	}
+}
+
 func TestPickSkipsInFlightFull(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
