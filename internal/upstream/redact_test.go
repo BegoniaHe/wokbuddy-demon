@@ -46,3 +46,19 @@ func TestRedactForLogKeepsBenignLongNames(t *testing.T) {
 		t.Errorf("benign model name redacted: %s", out)
 	}
 }
+
+func TestRedactForLogBareUUIDAndHex(t *testing.T) {
+	in := "id=550e8400-e29b-41d4-a716-446655440000 hex=deadbeefdeadbeefdeadbeefdeadbeef"
+	out := redactForLog(in, 0)
+	if strings.Contains(out, "550e8400") || strings.Contains(out, "deadbeef") {
+		t.Fatalf("bare token leaked: %s", out)
+	}
+}
+
+func TestRedactForLogBasicAndJSONAuthorization(t *testing.T) {
+	in := `{"authorization":"Basic dXNlcjpwYXNz"} header=Authorization: Basic dXNlcjpwYXNz`
+	out := redactForLog(in, 0)
+	if strings.Contains(out, "dXNlcjpwYXNz") {
+		t.Fatalf("basic credential leaked: %s", out)
+	}
+}

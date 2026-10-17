@@ -84,7 +84,7 @@ export function AgentsView() {
           <Field>
             <FieldLabel>网关地址</FieldLabel>
             <Input value={baseURL} onChange={(e) => setBaseURL(e.target.value)} placeholder="http://127.0.0.1:7863" />
-            <FieldDescription>不要带 /v1 后缀</FieldDescription>
+            <FieldDescription>填网关根地址；Codex / OpenCode 会自动补 /v1</FieldDescription>
           </Field>
           <Field>
             <FieldLabel>API key</FieldLabel>
@@ -126,7 +126,7 @@ export function AgentsView() {
             </div>
           ))}
           <p className="text-2xs text-muted-foreground">
-            Codex CLI 的 provider 使用环境变量 <code>WOKBUDDY_API_KEY</code>；写入后需在启动 Codex 的 shell 中导出同一把 key。
+            API key 直接写入各客户端配置（Codex 使用 <code>experimental_bearer_token</code>），无需额外导出环境变量。
           </p>
         </CardContent>
       </Card>

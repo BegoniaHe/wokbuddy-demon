@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { api, LS_KEY, postJSON } from '@/lib/api';
 import {
+  CFG_FIELD_BY_NAME,
   collectConfig,
   configToValues,
   durationBad,
@@ -47,12 +48,14 @@ export function ConfigView() {
   const [note, setNote] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [clears, setClears] = useState<Record<string, boolean>>({});
 
   const load = async () => {
     try {
       const d = await api<{ path?: string; config?: unknown }>('config');
       setPath(d.path || '');
       setValues(configToValues(d.config));
+      setClears({});
       setNote('');
     } catch (e) {
       toast('读取配置失败：' + (e as Error).message, 'err');
@@ -77,7 +80,22 @@ export function ConfigView() {
     }
     setSaving(true);
     try {
-      const r = await postJSON<{ restart_required?: string[] }>('config', collectConfig(values));
+      const payload = collectConfig(values);
+      // 显式清除的敏感字段：用空串覆盖，而不是走「空 = 不修改」。
+      for (const [name, on] of Object.entries(clears)) {
+        if (!on) continue;
+        const f = CFG_FIELD_BY_NAME[name];
+        if (f) {
+          let o: Record<string, unknown> = payload;
+          for (let i = 0; i < f.path.length - 1; i++) {
+            const k = f.path[i]!;
+            if (typeof o[k] !== 'object' || o[k] === null) o[k] = {};
+            o = o[k] as Record<string, unknown>;
+          }
+          o[f.path[f.path.length - 1]!] = '';
+        }
+      }
+      const r = await postJSON<{ restart_required?: string[] }>('config', payload);
       const n = (r.restart_required || []).length;
       toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
       const k = String(values.api_key ?? '').trim();
@@ -381,8 +399,18 @@ export function ConfigView() {
             </Field>
             <Field>
               <FieldLabel>设备 Token</FieldLabel>
-              {text('device_token', { type: 'password', placeholder: '留空 = 不修改' })}
-              <FieldDescription>已设置时留空保持不变；账号级 token 优先；需重启</FieldDescription>
+              <div className="flex items-center gap-2">
+                {text('device_token', { type: 'password', placeholder: clears.device_token ? '保存后清除' : '留空 = 不修改' })}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant={clears.device_token ? 'destructive' : 'ghost'}
+                  onClick={() => setClears((prev) => ({ ...prev, device_token: !prev.device_token }))}
+                >
+                  {clears.device_token ? '取消清除' : '清除'}
+                </Button>
+              </div>
+              <FieldDescription>已设置时留空保持不变；点「清除」保存后置空；账号级 token 优先；需重启</FieldDescription>
             </Field>
             <Field>
               <FieldLabel>设备 Token 文件</FieldLabel>

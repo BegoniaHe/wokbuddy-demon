@@ -1184,41 +1184,8 @@ func (p *Panel) usageRemaining(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
-	budgets := p.cfg.Quota.Budgets()
-	events := p.cfg.Quota.Events()
-	y, m, d := now.Date()
-	since := time.Date(y, m, d, 0, 0, 0, 0, now.Location())
-	daily := p.cfg.Usage.TokensByAccountModel(since)
-	resetByKey := map[string]time.Time{}
-	for _, e := range events {
-		key := e.UID + "|" + e.Model
-		if e.ResetAt.After(resetByKey[key]) {
-			resetByKey[key] = e.ResetAt
-		}
-	}
-	rows := make([]remainingRow, 0)
-	for _, acct := range p.cfg.Pool.List() {
-		for model, used := range daily[acct.UID] {
-			budget, ok := budgets[acct.Realm+"|"+model]
-			row := remainingRow{UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm, Model: model, Used: used}
-			if ok {
-				row.Budget = budget.Used
-				row.Remaining = max(0, budget.Used-float64(used))
-				row.Samples = budget.Samples
-				if reset := resetByKey[acct.UID+"|"+model]; !reset.IsZero() {
-					row.WindowStart = reset.Add(-24 * time.Hour).Format(time.RFC3339)
-					row.Cooling = reset.After(now)
-				}
-			} else {
-				row.Estimated = true
-				row.Budget = float64(used)
-				row.Remaining = 0
-			}
-			rows = append(rows, row)
-		}
-	}
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remaining < rows[j].Remaining })
-	etag := remainingETag(rows, len(events))
+	rows, budgets, events := p.remainingRows(now)
+	etag := remainingETag(rows, events)
 	w.Header().Set("ETag", etag)
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
@@ -1227,6 +1194,63 @@ func (p *Panel) usageRemaining(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"generated_at": now, "ttl_sec": 5, "rows": rows, "budgets": budgets,
 	})
+}
+
+// remainingRows 汇总账号×模型的已用/预算/窗口；同一 24h 窗口内按 resetAt-24h 起算。
+func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.Budget, int) {
+	budgets := p.cfg.Quota.Budgets()
+	events := p.cfg.Quota.Events()
+	y, m, d := now.Date()
+	daily := p.cfg.Usage.TokensByAccountModel(time.Date(y, m, d, 0, 0, 0, 0, now.Location()))
+	resetByKey := map[string]time.Time{}
+	modelsByUID := map[string]map[string]bool{}
+	for _, e := range events {
+		key := e.UID + "|" + e.Model
+		if e.ResetAt.After(resetByKey[key]) {
+			resetByKey[key] = e.ResetAt
+		}
+		if modelsByUID[e.UID] == nil {
+			modelsByUID[e.UID] = map[string]bool{}
+		}
+		modelsByUID[e.UID][e.Model] = true
+	}
+	rows := make([]remainingRow, 0)
+	for _, acct := range p.cfg.Pool.List() {
+		models := modelsByUID[acct.UID]
+		if models == nil {
+			models = map[string]bool{}
+		}
+		for model := range daily[acct.UID] {
+			models[model] = true
+		}
+		for model := range models {
+			rows = append(rows, p.remainingRow(acct, model, daily[acct.UID][model], resetByKey[acct.UID+"|"+model], budgets, now))
+		}
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remaining < rows[j].Remaining })
+	return rows, budgets, len(events)
+}
+
+// remainingRow 组装单行；有撞线重置时间时改用同窗口用量。
+func (p *Panel) remainingRow(acct pool.Status, model string, used int64, reset time.Time, budgets map[string]quota.Budget, now time.Time) remainingRow {
+	row := remainingRow{UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm, Model: model, Used: used}
+	if !reset.IsZero() {
+		row.WindowStart = reset.Add(-24 * time.Hour).Format(time.RFC3339)
+		row.Cooling = reset.After(now)
+		used = p.cfg.Usage.TokensSince(acct.Realm, acct.UID, model, reset.Add(-24*time.Hour))
+		row.Used = used
+	}
+	budget, ok := budgets[acct.Realm+"|"+model]
+	if !ok {
+		row.Estimated = true
+		row.Budget = float64(used)
+		row.Remaining = 0
+		return row
+	}
+	row.Budget = budget.Used
+	row.Remaining = max(0, budget.Used-float64(used))
+	row.Samples = budget.Samples
+	return row
 }
 
 // remainingETag 依据行与事件数生成弱 ETag。

@@ -910,6 +910,20 @@ func TestServerReadTimeout(t *testing.T) {
 	}
 }
 
+// TestBackgroundTargetPreserved 自定义后台模型目标不被 aliases / 空 checkin_hours 重置。
+func TestBackgroundTargetPreserved(t *testing.T) {
+	c := Default()
+	c.Models.BackgroundTarget = "custom-target"
+	c.Models.Aliases = map[string]string{"fast": "glm-5.2"}
+	c.Schedule.CheckinHours = nil
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Models.BackgroundTarget != "custom-target" {
+		t.Fatalf("target=%q want custom-target", c.Models.BackgroundTarget)
+	}
+}
+
 // TestDailyLimitsConfig 每日限额负值拒绝，0 = 关闭（issue #95）。
 func TestDailyLimitsConfig(t *testing.T) {
 	c := Default()
@@ -1109,5 +1123,23 @@ func checkLoggingArchive(t *testing.T, tag string, enabled bool, days, mb int, w
 	if enabled != wantEnabled || days != wantDays || mb != wantMB {
 		t.Fatalf("%s logging archive = enabled=%v days=%d mb=%d, want %v/%d/%d",
 			tag, enabled, days, mb, wantEnabled, wantDays, wantMB)
+	}
+}
+
+// TestCORSOriginDefaultPort 规范化时去掉默认端口，避免浏览器 Origin 精确匹配失败。
+func TestCORSOriginDefaultPort(t *testing.T) {
+	c := Default()
+	c.Server.CORSOrigins = []string{"https://Example.com:443", "http://Example.com:80", "http://[::1]:80"}
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"https://example.com", "http://example.com", "http://[::1]"}
+	if len(c.Server.CORSOrigins) != len(want) {
+		t.Fatalf("origins=%v want %v", c.Server.CORSOrigins, want)
+	}
+	for i := range want {
+		if c.Server.CORSOrigins[i] != want[i] {
+			t.Errorf("origins[%d]=%q want %q", i, c.Server.CORSOrigins[i], want[i])
+		}
 	}
 }

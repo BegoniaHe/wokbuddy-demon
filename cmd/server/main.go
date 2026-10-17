@@ -55,22 +55,37 @@ func stateSibling(stateFile, name string) string {
 	return filepath.Join(dir, name)
 }
 
+// preflightAPIKey 在加载前替换公开占位密钥；无法写回时返回仅供本进程使用的
+// 内存随机 key（重启后需重新设置），避免把 test_key 带进运行时。
+func preflightAPIKey(path string) (memoryKey string) {
+	key, replaced, err := ReplacePlaceholderAPIKey(path)
+	if err == nil && replaced {
+		log.Printf("config %s 使用公开占位 api_key，已替换为随机密钥（api_key=%s，记录在该文件里，可自行修改）", path, key)
+		return ""
+	}
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
+		return ""
+	}
+	key, kerr := randomAPIKey()
+	if kerr != nil {
+		return ""
+	}
+	log.Printf("WARN: 无法写回 config %s（%v）；本次进程临时使用随机 api_key（重启后需重新设置）", path, err)
+	return key
+}
+
 // loadConfig 加载配置，处理首次运行自动生成推荐配置的兜底：
 //   - 文件不存在 → 落一份推荐配置（含随机 api_key）再加载；
 //   - 生成失败（目录只读等）→ 退回纯默认 + env（旧行为兜底），不阻塞启动。
 //
 // errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
 func loadConfig(path string) (*Config, error) {
-	// 已存在的配置若仍是示例占位密钥，先替换为随机值再加载：Docker 镜像与
-	// `cp config.example.json config.json` 都把公开的 test_key 带进运行时，
-	// 不替换等于所有读者共享同一把可用密钥。显式设置的其他值保持不变。
-	if key, replaced, rerr := ReplacePlaceholderAPIKey(path); rerr == nil && replaced {
-		log.Printf("config %s 使用公开占位 api_key，已替换为随机密钥（api_key=%s，记录在该文件里，可自行修改）", path, key)
-	} else if rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
-		return nil, fmt.Errorf("replace placeholder api_key: %w", rerr)
-	}
+	memoryKey := preflightAPIKey(path)
 	cfg, err := Load(path)
 	if err == nil {
+		if memoryKey != "" && cfg.APIKey == placeholderAPIKey {
+			cfg.APIKey = memoryKey
+		}
 		return cfg, nil
 	}
 	if !errors.Is(err, fs.ErrNotExist) {
@@ -280,6 +295,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	startPricingRefresh(ctx, cfg, priceCat)
+	serve(ctx, cfg, h, p, up, sch)
+}
+
+// serve 启动定时任务与 HTTP 监听，并在收到退出信号后等待在途流排空。
+func serve(ctx context.Context, cfg *Config, h *server.Handler, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) {
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
@@ -315,7 +335,7 @@ func main() {
 		// 超时则记录未排空流数后由进程退出强制结束，不静默丢弃。
 		// 注意：Shutdown 关闭 listener 后 ListenAndServe 会立即返回 ErrServerClosed，
 		// 但排空等待仍在进行，main 必须等 shutdownDone 再退出，否则在途长流被直接丢弃。
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), server.ShutdownStreamGrace)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), server.ShutdownStreamGrace)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 		if n := h.ActiveStreams(); n > 0 {
@@ -560,14 +580,14 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		return nil, fmt.Errorf("parse submitted config: %w", err)
 	}
 	// 旧配置用于判断本次真正变化的字段；文件损坏时回落默认，最多多报重启项。
-	oldCfg, oldErr := ParseConfig(oldRaw)
+	oldCfg, oldErr := parseConfigWithEnv(oldRaw)
 	if oldErr != nil {
 		oldCfg = Default()
 	}
 	merged := mergeConfigMaps(cur, incoming)
 
 	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
-	newCfg, err := ParseConfig(mergedJSON(merged))
+	newCfg, err := parseConfigWithEnv(mergedJSON(merged))
 	if err != nil {
 		return nil, err
 	}

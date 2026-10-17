@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
@@ -370,6 +369,7 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Server.MaxBodyBytes = 16 << 20
+	c.Models.BackgroundTarget = defaultBackgroundTarget
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
@@ -379,7 +379,6 @@ func Default() *Config {
 	c.Logging.RequestClientInfo = true
 	// 与 README / config.example.json 对齐：开启决策链时默认只采样 10%，避免归档写入量突增。
 	c.Logging.DecisionTraceSample = 0.1
-	c.Models.BackgroundTarget = defaultBackgroundTarget
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -471,6 +470,20 @@ func ParseConfigInto(raw []byte, c *Config) (*Config, error) {
 // ParseConfig 基于默认值解析一段配置 JSON（等价于 Load 的文件分支，但不读环境变量）。
 func ParseConfig(raw []byte) (*Config, error) {
 	return ParseConfigInto(raw, Default())
+}
+
+// parseConfigWithEnv 解析配置后再叠加环境变量覆盖，供面板比较「当前生效值」。
+// 与 Load 同序：JSON → env → normalize，避免 env 覆盖的字段被误报为已变化。
+func parseConfigWithEnv(raw []byte) (*Config, error) {
+	c := Default()
+	if _, err := ParseConfigInto(raw, c); err != nil {
+		return nil, err
+	}
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
@@ -578,10 +591,7 @@ func writeConfigDoc(path string, doc map[string]json.RawMessage) error {
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
-	if err := atomicwrite.Rename(tmp, path); err != nil {
-		return fmt.Errorf("replace config: %w", err)
-	}
-	return nil
+	return replaceConfigFile(tmp, path, out)
 }
 
 func applyEnv(c *Config) {
@@ -709,32 +719,15 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.normalizeStaticDefaults()
-	if err := c.normalizeCORS(); err != nil {
-		return err
+	steps := []func() error{
+		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
+		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
+		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
 	}
-	if err := c.normalizeModelAliases(); err != nil {
-		return err
-	}
-	if err := c.normalizeBackgroundModels(); err != nil {
-		return err
-	}
-	if err := c.normalizeNotify(); err != nil {
-		return err
-	}
-	if err := c.normalizeCheckinDelay(); err != nil {
-		return err
-	}
-	if err := c.normalizeLogging(); err != nil {
-		return err
-	}
-	if err := c.normalizeSchedule(); err != nil {
-		return err
-	}
-	if err := c.normalizePrompt(); err != nil {
-		return err
-	}
-	if err := c.normalizeProxies(); err != nil {
-		return err
+	for _, step := range steps {
+		if err := step(); err != nil {
+			return err
+		}
 	}
 	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
 	return c.Validate()
@@ -765,7 +758,6 @@ func (c *Config) normalizeModelAliases() error {
 		}
 		out[name] = target
 	}
-	c.Models.BackgroundTarget = defaultBackgroundTarget
 	c.Models.Aliases = out
 	return nil
 }
@@ -1010,7 +1002,14 @@ func normalizeCORSOrigin(raw string) (string, error) {
 	if reason := invalidOriginReason(u); reason != "" {
 		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q（%s）", raw, reason)
 	}
-	return strings.ToLower(u.Scheme + "://" + u.Host), nil
+	host := strings.ToLower(u.Host)
+	switch u.Scheme {
+	case "http":
+		host = strings.TrimSuffix(host, ":80")
+	case "https":
+		host = strings.TrimSuffix(host, ":443")
+	}
+	return u.Scheme + "://" + host, nil
 }
 
 // invalidOriginReason 返回 Origin URL 不合规的原因；合规时返回空串。
@@ -1348,7 +1347,6 @@ func (c *Config) normalizeListenAndHours() {
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
 	if len(c.Schedule.CheckinHours) == 0 {
-		c.Models.BackgroundTarget = defaultBackgroundTarget
 		c.Schedule.CheckinHours = []int{9, 21}
 	}
 	if len(c.Schedule.TravelHours) == 0 {

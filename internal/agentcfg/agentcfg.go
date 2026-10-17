@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -263,7 +264,7 @@ func applyClaude(existing []byte, opts Options) ([]byte, error) {
 	if env == nil {
 		env = map[string]any{}
 	}
-	env["ANTHROPIC_BASE_URL"] = opts.BaseURL
+	env["ANTHROPIC_BASE_URL"] = gatewayRoot(opts.BaseURL)
 	env["ANTHROPIC_AUTH_TOKEN"] = opts.APIKey
 	env["ANTHROPIC_MODEL"] = opts.Model
 	doc["env"] = env
@@ -275,28 +276,80 @@ const (
 	codexEnd   = "# <<< wokbuddy-demon <<<"
 )
 
-func applyCodex(existing []byte, opts Options) ([]byte, error) {
-	block := fmt.Sprintf(`%s
-model_provider = "wokbuddy"
-model = %q
+var (
+	codexRootModel         = regexp.MustCompile(`(?m)^[ \t]*model[ \t]*=.*(?:\r?\n|$)`)
+	codexRootModelProvider = regexp.MustCompile(`(?m)^[ \t]*model_provider[ \t]*=.*(?:\r?\n|$)`)
+)
 
+// gatewayRoot 返回网关根地址：兼容用户误填的 /v1 后缀。
+func gatewayRoot(base string) string {
+	base = strings.TrimRight(strings.TrimSpace(base), "/")
+	return strings.TrimSuffix(base, "/v1")
+}
+
+// v1Base 返回 OpenAI 兼容 base_url（Codex / OpenCode 需要 /v1 前缀）。
+func v1Base(base string) string {
+	root := gatewayRoot(base)
+	return root + "/v1"
+}
+
+// applyCodex 写入 Codex 配置：根键必须位于首个表头之前，provider 表追加到文末。
+// 直接追加到文件末尾会把根键写进已有 [profiles.*] 表（TOML 语义），因此这里
+// 先拆出根段再重建，并清掉同名根键避免 duplicate key。
+func applyCodex(existing []byte, opts Options) ([]byte, error) {
+	text := removeCodexBlock(string(existing))
+	root, tables := splitCodexRoot(text)
+	root = codexRootModel.ReplaceAllString(root, "")
+	root = codexRootModelProvider.ReplaceAllString(root, "")
+	root = strings.TrimSpace(root)
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\nmodel_provider = \"wokbuddy\"\nmodel = %q\n", codexStart, opts.Model)
+	if root != "" {
+		b.WriteString("\n")
+		b.WriteString(root)
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, `
 [model_providers.wokbuddy]
 name = "WokBuddy Demon"
 base_url = %q
-env_key = "WOKBUDDY_API_KEY"
-%q = %q
-%s`, codexStart, opts.Model, strings.TrimRight(opts.BaseURL, "/"), "wokbuddy_api_key", opts.APIKey, codexEnd)
-	text := string(existing)
-	if start := strings.Index(text, codexStart); start >= 0 {
-		if end := strings.Index(text[start:], codexEnd); end >= 0 {
-			end += start + len(codexEnd)
-			return []byte(strings.TrimRight(text[:start], "\n") + "\n\n" + block + text[end:]), nil
+wire_api = "chat"
+experimental_bearer_token = %q
+%s
+`, v1Base(opts.BaseURL), opts.APIKey, codexEnd)
+	if tables = strings.TrimSpace(tables); tables != "" {
+		b.WriteString("\n")
+		b.WriteString(tables)
+		b.WriteString("\n")
+	}
+	return []byte(b.String()), nil
+}
+
+// removeCodexBlock 删除上一次写入的托管段（含标记），其余内容原样保留。
+func removeCodexBlock(text string) string {
+	start := strings.Index(text, codexStart)
+	if start < 0 {
+		return text
+	}
+	end := strings.Index(text[start:], codexEnd)
+	if end < 0 {
+		return text
+	}
+	end += start + len(codexEnd)
+	return text[:start] + strings.TrimPrefix(text[end:], "\r\n")
+}
+
+// splitCodexRoot 以首个 `[table]` 行为界拆分根段与表段。
+func splitCodexRoot(text string) (root, tables string) {
+	offset := 0
+	for _, line := range strings.SplitAfter(text, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			return text[:offset], text[offset:]
 		}
+		offset += len(line)
 	}
-	if strings.TrimSpace(text) == "" {
-		return []byte(block + "\n"), nil
-	}
-	return []byte(strings.TrimRight(text, "\n") + "\n\n" + block + "\n"), nil
+	return text, ""
 }
 
 func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
@@ -315,7 +368,7 @@ func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 		"npm":  "@ai-sdk/openai-compatible",
 		"name": "WokBuddy Demon",
 		"options": map[string]any{
-			"baseURL": strings.TrimRight(opts.BaseURL, "/"),
+			"baseURL": v1Base(opts.BaseURL),
 			"apiKey":  opts.APIKey,
 		},
 		"models": models,

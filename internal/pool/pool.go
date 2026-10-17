@@ -528,8 +528,11 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		p.upsertLocked(a)
 	}
 	changed := false
-	for uid := range p.byUID {
+	for uid, e := range p.byUID {
 		if !seen[uid] {
+			if n := e.inFlight.Swap(0); n > 0 {
+				p.inFlightTotal.Add(-n)
+			}
 			delete(p.byUID, uid)
 			changed = true
 		}
@@ -550,6 +553,9 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 		return nil
 	}
 	delete(p.byUID, uid)
+	if n := e.inFlight.Swap(0); n > 0 {
+		p.inFlightTotal.Add(-n)
+	}
 	p.dirty.Store(true)
 	p.saveLocked()
 	return e.a

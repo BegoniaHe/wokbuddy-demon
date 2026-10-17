@@ -156,7 +156,8 @@ export function collectConfig(values: Record<string, FieldValue>): Record<string
     } else {
       const trimmed = String(raw).trim();
       if (trimmed === '') {
-        v = CLEARABLE_CFG.has(field.name) ? '' : undefined;
+        if (field.kind === 'list' || field.kind === 'hours') v = [];
+        else v = CLEARABLE_CFG.has(field.name) ? '' : undefined;
       } else if (field.kind === 'hours') {
         v = trimmed.split(/[,，\s]+/).filter(Boolean).map(Number);
       } else if (field.kind === 'list') {

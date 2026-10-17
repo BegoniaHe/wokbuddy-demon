@@ -213,7 +213,7 @@ type entry struct {
 	reason   string
 	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// proxySlot 出站代理槽 ID（issue #96）；空 = 不绑定（走全局代理池/直连）。
-	// 持久化到 state.json，选中时同步到 auth.Auth.ProxySlot 供上游选择 Dialer。
+	// 持久化到 state.json；上游经 Pool.ProxySlotOf 取槽选择 Dialer。
 	proxySlot string
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个

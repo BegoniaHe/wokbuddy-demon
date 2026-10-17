@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -36,6 +37,11 @@ type Store struct {
 	path   string
 	events map[string]Event // key: uid|model|resetAt
 }
+
+const (
+	eventRetention = 7 * 24 * time.Hour
+	maxEvents      = 2048
+)
 
 // New 从 path 加载（空 path = 纯内存）。
 func New(path string) *Store {
@@ -75,6 +81,7 @@ func (s *Store) Add(e Event) bool {
 		return false
 	}
 	s.events[key] = e
+	s.pruneLocked(e.At)
 	s.persistLocked()
 	return true
 }
@@ -118,6 +125,32 @@ func (s *Store) Budgets() map[string]Budget {
 		out[key] = Budget{Used: sum / float64(len(accounts)), Samples: samples}
 	}
 	return out
+}
+
+// pruneLocked 删除超过保留期的旧事件，并在总数超限时丢弃最早的事件。
+// 必须持有 s.mu。
+func (s *Store) pruneLocked(now time.Time) {
+	cutoff := now.Add(-eventRetention)
+	for key, e := range s.events {
+		if e.At.Before(cutoff) {
+			delete(s.events, key)
+		}
+	}
+	if len(s.events) <= maxEvents {
+		return
+	}
+	type entry struct {
+		key string
+		at  time.Time
+	}
+	all := make([]entry, 0, len(s.events))
+	for key, e := range s.events {
+		all = append(all, entry{key, e.At})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	for _, item := range all[:len(all)-maxEvents] {
+		delete(s.events, item.key)
+	}
 }
 
 func (s *Store) persistLocked() {

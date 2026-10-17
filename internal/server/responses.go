@@ -41,8 +41,13 @@ type responsesReason struct {
 
 // responsesHandler 是 POST /v1/responses 入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) responsesHandler(w http.ResponseWriter, r *http.Request) {
+	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large", bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
@@ -75,6 +80,7 @@ func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, 
 		traceID:   r.Header.Get("X-Trace-Id"),
 		trace:     requestTraceFrom(r),
 		keyUsage:  keyUsageFrom(r.Context()),
+		keyRealm:  keyRealmFrom(r.Context()),
 	}
 	return in, &responsesResponder{w: w, model: model, instructions: instructions, keepalive: keepalive}, true
 }

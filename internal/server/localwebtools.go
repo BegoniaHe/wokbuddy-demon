@@ -116,10 +116,15 @@ func (h *Handler) runLocalWebToolLoop(r *http.Request, req map[string]any, msgs 
 		}
 		buf := &bufferResponder{}
 		in := chatInput{
-			body:     raw,
-			stream:   false,
-			model:    model,
-			keyUsage: keyUsageFrom(r.Context()),
+			body:      raw,
+			stream:    false,
+			model:     model,
+			clientIP:  upstream.ExtractClientIP(r),
+			convReqID: r.Header.Get("X-Conversation-Request-Id"),
+			traceID:   r.Header.Get("X-Trace-Id"),
+			trace:     requestTraceFrom(r),
+			keyUsage:  keyUsageFrom(r.Context()),
+			keyRealm:  keyRealmFrom(r.Context()),
 		}
 		h.serveChat(r, in, buf)
 		if buf.status != 0 {

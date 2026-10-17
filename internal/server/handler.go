@@ -251,13 +251,18 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 	allowed := origin != "" && h.cors[origin]
 	if allowed {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-ID")
 	}
 	if r.Method != http.MethodOptions {
 		return false
 	}
 	if allowed {
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Requested-With")
+		headers := r.Header.Get("Access-Control-Request-Headers")
+		if headers == "" {
+			headers = "Authorization, Content-Type, X-Requested-With"
+		}
+		w.Header().Set("Access-Control-Allow-Headers", headers)
 		w.Header().Set("Access-Control-Max-Age", "600")
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -274,7 +279,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
-		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages") {
+		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses") {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -110,13 +111,20 @@ func proxySlotInfos(cfg *Config) []panel.ProxySlotInfo {
 // configureAccountRouting 把账号代理槽接到上游 client（issue #96）。
 func configureAccountRouting(p *pool.Pool, up *upstream.Client, cfg *Config) {
 	slotDials := buildProxySlotDials(cfg)
+	var missingSlots sync.Map
 	up.AccountRoute = func(a *auth.Auth) (string, func(ctx context.Context, network, addr string) (net.Conn, error)) {
 		if a == nil {
 			return "", nil
 		}
 		slot := p.ProxySlotOf(a.UID)
+		if slot == "" {
+			return "", nil
+		}
 		if dial, ok := slotDials[slot]; ok {
 			return slot, dial
+		}
+		if _, warned := missingSlots.LoadOrStore(slot, true); !warned {
+			log.Printf("WARN: [server] 代理槽 %s 不可用（未配置或已禁用），已绑定账号回落默认出口", slot)
 		}
 		return "", nil
 	}
@@ -163,8 +171,11 @@ func startPricingRefresh(ctx context.Context, cfg *Config, cat *pricing.Catalog)
 func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
 	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
 	p.SetModelRateLimitHook(func(uid, model, realm string, resetAt time.Time) {
-		used := rec.TokensSince(realm, uid, model, resetAt.Add(-24*time.Hour))
-		store.Add(quota.Event{UID: uid, Realm: realm, Model: model, ResetAt: resetAt, Used: used})
+		// 回调在 pool 写锁内触发；扫描 usage 与重写 JSONL 放到后台，避免阻塞选号。
+		go func() {
+			used := rec.TokensSince(realm, uid, model, resetAt.Add(-24*time.Hour))
+			store.Add(quota.Event{UID: uid, Realm: realm, Model: model, ResetAt: resetAt, Used: used})
+		}()
 	})
 	return store
 }

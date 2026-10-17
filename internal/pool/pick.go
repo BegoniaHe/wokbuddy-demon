@@ -436,20 +436,29 @@ func (p *Pool) AllDailyBlocked(model, realm string) bool {
 	}
 	usage := p.dailyUsage()
 	now := p.now()
-	healthy := 0
+	candidates := 0
 	for _, e := range p.byUID {
-		if e.disabled || e.paused || !e.healthy(now) || !e.healthyForModel(now, model) {
+		if e.disabled || e.paused {
 			continue
 		}
 		if realm != "" && e.a.Realm() != realm {
 			continue
 		}
-		healthy++
+		candidates++
+		// 冷却/熔断/模型冷却可能在本地 0 点前恢复：此时应回 503 并由
+		// Retry-After 指向更早的恢复时间，而不是声称「日限到次日」。
+		// 硬冷却（余额耗尽，通常到次日 04:00）晚于日限重置，仍按日限处理。
+		if !e.healthyForModel(now, model) {
+			if resumesBeforeMidnight(e, now, model) {
+				return false
+			}
+			continue
+		}
 		if !p.dailyBlockedUsage(usage, e, model, realm, now) {
 			return false
 		}
 	}
-	return healthy > 0
+	return candidates > 0
 }
 
 // DailyLimitedUIDs 返回达到日 token 或日积分上限的账号（面板徽章用）。
@@ -462,14 +471,43 @@ func (p *Pool) DailyLimitedUIDs() []string {
 	usage := p.dailyUsage()
 	var out []string
 	for uid, e := range p.byUID {
-		lim := p.dailyLimitsFor(e.a.Realm())
-		u := usage[uid]
-		if (lim.Tokens > 0 && u.Tokens >= lim.Tokens) || (lim.Credits > 0 && u.Credits >= lim.Credits) {
+		if dailyLimitHit(p.dailyLimitsFor(e.a.Realm()), usage[uid]) {
 			out = append(out, uid)
 		}
 	}
 	sort.Strings(out)
 	return out
+}
+
+// resumesBeforeMidnight 报告账号/模型冷却是否早于本地次日 0 点恢复。
+func resumesBeforeMidnight(e *entry, now time.Time, model string) bool {
+	resume := e.until
+	if mc, ok := e.modelCooldowns[model]; ok && mc.Until.After(resume) {
+		resume = mc.Until
+	}
+	if !resume.After(now) {
+		resume = now
+	}
+	midnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	return resume.Before(midnight)
+}
+
+// dailyLimitHit 报告账号是否命中任一日限额（含账号×模型 token）。
+func dailyLimitHit(lim DailyLimits, u DailyUsage) bool {
+	if lim.Tokens > 0 && u.Tokens >= lim.Tokens {
+		return true
+	}
+	if lim.Credits > 0 && u.Credits >= lim.Credits {
+		return true
+	}
+	if lim.ModelTokens > 0 {
+		for _, tokens := range u.Models {
+			if tokens >= lim.ModelTokens {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。

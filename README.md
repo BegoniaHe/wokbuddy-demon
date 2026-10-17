@@ -505,7 +505,8 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 - 写入前把首次原件备份到 `data/agent-backups/<client>/`；还原按备份字节级恢复，网关新建的文件会被删除。
 - 若写入后用户手改过配置，还原前会提示并要求强制确认。
 - API key 只写入客户端本地配置，面板不回显。
-- Codex CLI 的 provider 使用环境变量 `WOKBUDDY_API_KEY`，写入后需在启动 Codex 的 shell 中导出同一把 key。
+- 网关地址填根地址（如 `http://127.0.0.1:7863`）；Claude Code 使用根地址，Codex CLI / OpenCode 自动补 `/v1`。
+- Codex CLI 使用 `experimental_bearer_token` 内嵌 key，无需额外导出环境变量。
 
 ### 面板需要鉴权吗？
 
