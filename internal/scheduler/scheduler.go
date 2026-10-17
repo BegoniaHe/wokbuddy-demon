@@ -85,6 +85,11 @@ type Scheduler struct {
 	rearmSchedule chan struct{}
 	rearmBalance  chan struct{}
 
+	// runMu/runs 批量任务运行级守卫与状态（issue #112，见 runs.go）：
+	// 同一任务族同一时刻最多一轮，调度器与面板共用一个守卫。
+	runMu sync.Mutex
+	runs  map[string]*runSlot
+
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
@@ -436,15 +441,15 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNowCtx(ctx)
+				s.runTaskSync(ctx, TaskCheckin, TriggerScheduler)
 			case taskTravel:
-				s.RunTravelNow()
+				s.runTaskSync(ctx, TaskTravel, TriggerScheduler)
 			case taskActivity:
-				s.runActivity(ctx)
+				s.runTaskSync(ctx, TaskActivity, TriggerScheduler)
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.runTaskSync(ctx, TaskKeepalive, TriggerScheduler)
 			case taskBlackcat:
-				s.RunBlackcatNow()
+				s.runTaskSync(ctx, TaskBlackcat, TriggerScheduler)
 			case taskGrowth:
 				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
 				s.schedMu.Lock()
@@ -476,31 +481,41 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻（无取消信号的便捷入口）。
+// 运行级互斥（issue #112）：同一任务族已在跑时直接返回。
 func (s *Scheduler) RunCheckinNow() { s.RunCheckinNowCtx(context.Background()) }
 
 // RunCheckinNowCtx 同 RunCheckinNow，账号间等待支持 ctx 取消（issue #59）。
+func (s *Scheduler) RunCheckinNowCtx(ctx context.Context) {
+	s.runTaskSync(ctx, TaskCheckin, TriggerManual)
+}
+
+// checkinAll 签到实体：返回本轮尝试账号数、成功/失败数。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
 // 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
-func (s *Scheduler) RunCheckinNowCtx(ctx context.Context) {
+func (s *Scheduler) checkinAll(ctx context.Context, trigger string) (total, success, failure int) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	delay := s.checkinDelay()
 	attempted := false
+	var c runCounters
 	for _, st := range s.cfg.Pool.List() {
 		a, ok := s.checkinAuth(st, includeDisabled)
 		if !ok {
 			continue
 		}
 		if attempted && !sleepCtx(ctx, delay) {
-			return // 优雅停机：不等限速睡满，剩余账号下轮再跑
+			// 优雅停机：不等限速睡满，剩余账号下轮再跑。
+			return c.total, c.success, c.failure
 		}
 		attempted = true
-		s.runCheckinAccount(st, a, expiringSoon)
+		c.record(s.runCheckinAccount(st, a, expiringSoon))
 	}
-	s.RunStreakBonusNow()
+	// 连登管家作为独立任务族运行（自己的守卫/状态）；已在跑时跳过。
+	s.runTaskSync(context.Background(), TaskStreak, trigger)
+	return c.total, c.success, c.failure
 }
 
 // checkinAuth 返回该账号本轮应使用的凭证；禁用/无 refresh token/global 跳过。
@@ -520,25 +535,28 @@ func (s *Scheduler) checkinAuth(st pool.Status, includeDisabled bool) (*auth.Aut
 }
 
 // runCheckinAccount 执行单账号签到（企业版跳过）+ 余额刷新。
-func (s *Scheduler) runCheckinAccount(st pool.Status, a *auth.Auth, expiringSoon time.Duration) {
+// 返回该账号本轮是否成功（签到失败或余额查询失败均记失败）。
+func (s *Scheduler) runCheckinAccount(st pool.Status, a *auth.Auth, expiringSoon time.Duration) bool {
+	ok := true
 	// 企业版无签到体系：上游直接 400；跳过签到，但余额查询照常跑
 	// （企业额度是 credit_floor 判定与面板额度展示的唯一数据源）。
 	if !a.IsEnterprise() {
-		s.checkinOne(st.UID, st.Nickname, a)
+		ok = s.checkinOne(st.UID, st.Nickname, a)
 	}
 	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 	if err != nil {
 		log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-		return
+		return false
 	}
 	s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
 	s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	s.notifyCreditLow(a, remain)
+	return ok
 }
 
 // checkinOne 单账号签到并落一行结果日志：按 CheckinResult 分类呈现——成功/幂等/
 // 活动未开启（非错误态）分开表述，只有真失败记 error 行；均不阻断后续余额查询。
-func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) {
+func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) bool {
 	err := s.cfg.Upstream.DailyCheckin(a)
 	switch upstream.ClassifyCheckin(err) {
 	case upstream.CheckinOK:
@@ -546,16 +564,20 @@ func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) {
 		// 重复触发时出现），成功也落一行。
 		s.cfg.Pool.NoteCheckinDone(uid)
 		log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
+		return true
 	case upstream.CheckinAlready:
 		// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不当失败打 error 行。
 		s.cfg.Pool.NoteCheckinDone(uid)
 		log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, nickname))
+		return true
 	case upstream.CheckinInactive:
 		// 活动未开启/已结束是上游非错误态：不标记已签、不打 error 行（issue #27）。
 		log.Printf("checkin %s: 签到活动未开启（跳过，非失败）", logfmt.Label(uid, nickname))
+		return true
 	default:
 		log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
 		s.notifyTaskFailed("checkin", uid, nickname, a.Realm())
+		return false
 	}
 }
 
@@ -567,13 +589,14 @@ func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) {
 // 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
 // RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
-// runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
+// runTaskSync → activityAll（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
-	s.runActivity(context.Background())
+	s.runTaskSync(context.Background(), TaskActivity, TriggerManual)
 }
 
-// runActivity 活跃上报遍历，随 ctx 取消立即退出。
-func (s *Scheduler) runActivity(ctx context.Context) {
+// activityAll 活跃上报遍历，随 ctx 取消立即退出；返回尝试/成功/失败账号数。
+func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure int) {
+	var c runCounters
 	first := true
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
@@ -598,7 +621,8 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// a190252 同口径修复）。checkin/travel 的 global 门控不受影响，仍跳过。
 		if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {
-				return // 优雅停机：不等限速睡满，剩余账号下轮再报
+				// 优雅停机：不等限速睡满，剩余账号下轮再报。
+				return c.total, c.success, c.failure
 			}
 		}
 		first = false
@@ -606,10 +630,13 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 			s.notifyTaskFailed("activity", a.UID, a.Nickname, a.Realm())
+			c.record(false)
 			continue
 		}
-		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检（自检异常不计失败）
+		c.record(true)
 	}
+	return c.total, c.success, c.failure
 }
 
 // checkActivityStreak 上报成功后回读连登天数（只读 oracle，发现静默失败）。
@@ -641,6 +668,12 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.runTaskSync(context.Background(), TaskKeepalive, TriggerManual)
+}
+
+// keepaliveAll token 刷新实体；返回尝试/成功/失败账号数。
+func (s *Scheduler) keepaliveAll() (total, success, failure int) {
+	var c runCounters
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -652,13 +685,16 @@ func (s *Scheduler) RunKeepaliveNow() {
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 			s.noteKeepaliveFailure(st, err)
+			c.record(false)
 			continue
 		}
 		s.cfg.Pool.ClearSessionDead(st.UID) // 刷新成功清误判计数，失败不该累计
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
+		c.record(true)
 	}
+	return c.total, c.success, c.failure
 }
 
 // noteKeepaliveFailure 刷新失败后的计数与日志：12153 session dead 连续累计到阈值才禁用

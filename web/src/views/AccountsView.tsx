@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, postJSON } from '@/lib/api';
-import type { Account, ModelLock, Overview } from '@/lib/types';
+import type { Account, ModelLock, Overview, TaskRun } from '@/lib/types';
 import {
   ago,
   dur,
@@ -55,6 +55,23 @@ export function AccountsView() {
     refetchInterval: 5000,
   });
 
+  const runsQ = useQuery({
+    queryKey: ['tasks/runs'],
+    queryFn: () => api<{ runs?: TaskRun[] }>('tasks/runs').catch((): { runs?: TaskRun[] } => ({ runs: [] })),
+    refetchInterval: 3000,
+  });
+  const runOf = (task: string): TaskRun | undefined => (runsQ.data?.runs || []).find((r) => r.task === task);
+  const startBatch = async (path: string, label: string) => {
+    try {
+      await postJSON(path);
+      toast(label + '已开始，结果见日志', 'ok');
+    } catch (e) {
+      toast((e as Error).message, 'err');
+    } finally {
+      void runsQ.refetch();
+    }
+  };
+
   const pkgQuery = useQuery({
     queryKey: ['packages'],
     queryFn: () => api<{ accounts?: PackageAccount[] }>('packages'),
@@ -76,15 +93,6 @@ export function AccountsView() {
 
   const afterAction = () => {
     void qc.invalidateQueries({ queryKey: ['overview'] });
-  };
-
-  const run = async (fn: () => Promise<void>) => {
-    try {
-      await fn();
-    } catch (e) {
-      toast((e as Error).message, 'err');
-    }
-    afterAction();
   };
 
   return (
@@ -117,10 +125,12 @@ export function AccountsView() {
               {data.in_flight_full ? (
                 <span className="text-xs text-muted-foreground">{data.in_flight_full} 个账号在途占满</span>
               ) : null}
-              <Button size="xs" onClick={() => void run(async () => { await postJSON('checkin_all'); toast('全部签到已开始，结果见日志', 'ok'); })}>全部签到</Button>
-              <Button size="xs" onClick={() => void run(async () => { await postJSON('travel_all'); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); })}>旅行巡检</Button>
-              <Button size="xs" onClick={() => void run(async () => { await postJSON('activity_all'); toast('活跃上报已开始，结果见日志', 'ok'); })}>活跃上报</Button>
-              <Button size="xs" onClick={() => void run(async () => { await postJSON('keepalive_all'); toast('全部保活已开始，结果见日志', 'ok'); })}>全部保活</Button>
+              <BatchButton run={runOf('checkin')} label="全部签到" onClick={() => void startBatch('checkin_all', '全部签到')} />
+              <BatchButton run={runOf('travel')} label="旅行巡检" onClick={() => void startBatch('travel_all', '旅行巡检')} />
+              <BatchButton run={runOf('activity')} label="活跃上报" onClick={() => void startBatch('activity_all', '活跃上报')} />
+              <BatchButton run={runOf('keepalive')} label="全部保活" onClick={() => void startBatch('keepalive_all', '全部保活')} />
+              <BatchButton run={runOf('blackcat')} label="夜猫子" onClick={() => void startBatch('blackcat_all', '夜猫子补足')} />
+              <BatchButton run={runOf('streak')} label="连登管家" onClick={() => void startBatch('streak_bonus_all', '连登管家')} />
             </div>
           </CardAction>
         </CardHeader>
@@ -696,5 +706,32 @@ function ModelLocks({ rows }: { rows?: ModelLock[] }) {
         </Table>
       </div>
     </Card>
+  );
+}
+
+// BatchButton：批量任务按钮。运行中禁用并显示当前轮来源/账号数；结束后 title
+// 展示最近一轮的成功/失败摘要（issue #112）。
+function BatchButton({
+  run,
+  label,
+  onClick,
+}: {
+  run?: TaskRun;
+  label: string;
+  onClick: () => void;
+}) {
+  const running = !!run?.running;
+  const summary = run && !running && (run.total ?? 0) > 0
+    ? '最近一轮：' + (run.total ?? 0) + ' 个账号，成功 ' + (run.success ?? 0) + ' / 失败 ' + (run.failure ?? 0)
+    : undefined;
+  return (
+    <Button
+      size="xs"
+      variant={running ? 'secondary' : 'default'}
+      disabled={running}
+      title={running ? '运行中（' + (run?.trigger || 'manual') + ' 触发）' : summary}
+      onClick={onClick}>
+      {running ? label + '中…' : label}
+    </Button>
   );
 }
