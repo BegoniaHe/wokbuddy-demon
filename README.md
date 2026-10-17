@@ -249,6 +249,27 @@ claude
 
 上游静默超过该间隔时，网关向客户端写一帧 `: keepalive` SSE 注释（不进入 JSON 帧白名单，不影响客户端解析）；上游持续输出时不额外插入。默认 `"0"` 关闭以保持逐字节透传行为。改后需重启。
 
+### Webhook 告警
+
+配置 `notify.webhook_url` 后，以下关键事件会以 POST JSON 异步推送（同事件 + 账号 10 分钟内去重，失败只记日志，不影响请求与任务）：
+
+- `session_dead`：账号 session 失效被禁用（需重新登录）
+- `pool_unavailable`：请求时池内无可用账号（健康/在途名额耗尽或模型级冷却）
+- `credit_low`：余额低于 `pool.credit_floor`
+- `waf_ip_blocked`：出口 IP 触发上游 WAF 级拦截
+- `task_failed`：签到 / 旅行 / 活跃 / 保活任务失败
+
+```json
+{
+  "notify": {
+    "webhook_url": "https://example.com/hook",
+    "events": ["session_dead", "credit_low"]
+  }
+}
+```
+
+载荷固定字段：`event`、`time`（RFC3339）、`uid`（仅 uid8）、`nickname`、`realm`、`summary`、`detail`。**不发送 token、完整 UID、请求体或凭证**；`webhook_url` 可内嵌 token，日志只记事件名与状态码。
+
 ### Prometheus 指标
 
 `GET /metrics` 按 Prometheus 文本格式（`text/plain; version=0.0.4`）导出核心指标，可直接配置为抓取目标：
@@ -277,6 +298,8 @@ claude
 | `state_file` | `./data/state.json` | 账号管家状态持久化文件 |
 | `logging.request_archive_enabled` | `true` | 请求元数据归档开关 |
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
+| `notify.webhook_url` | 空 | 告警 webhook（http/https）；空 = 关闭 |
+| `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `upstream.rotate_max` | `3` | 单请求最多换号次数 |

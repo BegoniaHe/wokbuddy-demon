@@ -13,6 +13,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -22,8 +23,10 @@ import (
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	// Notifier webhook 告警出口（可选；nil = 关闭）。
+	Notifier       *notify.Notifier
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -490,6 +493,7 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+		s.notifyCreditLow(a, remain)
 	}
 	s.RunStreakBonusNow()
 }
@@ -513,6 +517,7 @@ func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) {
 		log.Printf("checkin %s: 签到活动未开启（跳过，非失败）", logfmt.Label(uid, nickname))
 	default:
 		log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
+		s.notifyTaskFailed("checkin", uid, nickname, a.Realm())
 	}
 }
 
@@ -562,6 +567,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			s.notifyTaskFailed("activity", a.UID, a.Nickname, a.Realm())
 			continue
 		}
 		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
@@ -621,12 +627,42 @@ func (s *Scheduler) RunKeepaliveNow() {
 // （一次失败不杀号）；其余错误只落一行。已禁用账号不再重复计数 12153。
 func (s *Scheduler) noteKeepaliveFailure(st pool.Status, err error) {
 	log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+	s.notifyTaskFailed("keepalive", st.UID, st.Nickname, st.Realm)
 	var ue *upstream.Error
 	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
 		if s.cfg.Pool.NoteSessionDead(st.UID) {
 			log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+			s.notifyAccount(st.UID, st.Nickname, st.Realm, notify.EventSessionDead,
+				"账号连续 session 失效（12153），已禁用，需重新登录", map[string]any{"stage": "keepalive"})
 		}
 	}
+}
+
+// notifyAccount 发送账号级告警（uid 由通知层截为 uid8）。
+func (s *Scheduler) notifyAccount(uid, nickname, realm, event, summary string, detail map[string]any) {
+	if s.cfg.Notifier == nil {
+		return
+	}
+	s.cfg.Notifier.Notify(notify.Event{
+		Event: event, UID: uid, Nickname: nickname, Realm: realm,
+		Summary: summary, Detail: detail,
+	})
+}
+
+// notifyTaskFailed 定时任务失败告警；不携带上游错误原文（可能含敏感信息）。
+func (s *Scheduler) notifyTaskFailed(task, uid, nickname, realm string) {
+	s.notifyAccount(uid, nickname, realm, notify.EventTaskFailed, "定时任务执行失败",
+		map[string]any{"task": task})
+}
+
+// notifyCreditLow 余额低于 credit_floor 时告警（floor=0 关闭）。
+func (s *Scheduler) notifyCreditLow(a *auth.Auth, remain int64) {
+	floor := s.cfg.Pool.CreditFloor()
+	if floor <= 0 || remain >= floor || a == nil {
+		return
+	}
+	s.notifyAccount(a.UID, a.Nickname, a.Realm(), notify.EventCreditLow, "账号余额低于积分保底",
+		map[string]any{"credits": remain, "credit_floor": floor})
 }
 
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits。
@@ -658,6 +694,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+			s.notifyCreditLow(a, remain)
 		}(a, st.UID)
 	}
 	wg.Wait()

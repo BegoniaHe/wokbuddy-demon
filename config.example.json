@@ -15,6 +15,10 @@
     "request_archive_max_mb": 100,
     "request_client_info": true
   },
+  "notify": {
+    "webhook_url": "",
+    "events": []
+  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"
