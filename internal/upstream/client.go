@@ -1012,18 +1012,33 @@ func (c *Client) webBase(a *auth.Auth) string {
 	return "https://www.workbuddy.cn"
 }
 
+// defaultJSONBodyLimit doJSON 默认响应体上限（1 MiB）。
+const defaultJSONBodyLimit int64 = 1 << 20
+
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
+	return c.doJSONLimit(req, defaultJSONBodyLimit)
+}
+
+// doJSONLimit 同 doJSON，但允许调用方指定响应体上限。超限返回明确错误而不是把
+// 半截 body 交给 json.Unmarshal（后者只会报 "unexpected end of JSON input"）。
+func (c *Client) doJSONLimit(req *http.Request, maxBytes int64) (json.RawMessage, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultJSONBodyLimit
+	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if int64(len(raw)) > maxBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxBytes)
 	}
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))

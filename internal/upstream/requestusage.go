@@ -12,18 +12,23 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// get-user-request-usage 路径（realm 双路径 fallback 同 get-user-resource 族）。
+// get-user-request-usage 路径。实测 CN/global 的 Web 用量页均走无 /v2 的主路径；
+// /v2 当前两域都返回 404 Route Not Found，仅保留为路径迁移时的 404 兜底。
 const (
 	requestUsagePath   = "/billing/meter/get-user-request-usage"
 	requestUsagePathV2 = "/v2/billing/meter/get-user-request-usage"
 )
 
-// requestUsagePaths 按 realm 返回路径候选（global 先无 /v2 前缀，404 时回落 /v2）。
-func (c *Client) requestUsagePaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{requestUsagePath, requestUsagePathV2}
-	}
-	return []string{requestUsagePathV2}
+// requestUsageTimeLayout 上游逐笔用量接口的墙钟时间格式（UTC+8，无时区后缀）。
+const requestUsageTimeLayout = "2006-01-02 15:04:05"
+
+// requestUsageMaxRespBytes 逐笔用量单页响应上限。响应包含完整 prompt（input），
+// 实测 1000 条约 0.7~1.3 MiB；取 8 MiB 留足余量，同时避免无界缓冲。
+const requestUsageMaxRespBytes int64 = 8 << 20
+
+// requestUsagePaths 返回路径候选：先主路径，404 时再试 /v2（见上方注释）。
+func (c *Client) requestUsagePaths() []string {
+	return []string{requestUsagePath, requestUsagePathV2}
 }
 
 // RequestUsageRecord 单笔上游用量。
@@ -42,11 +47,17 @@ type RequestUsagePage struct {
 	NextPage int
 }
 
-// RequestUsage 分页拉取账号 [start,end) 的逐笔用量。
+// RequestUsage 分页拉取账号 [start,end] 的逐笔用量。
 //
-// 上游请求契约（假定，issue #31）：POST billing/meter/get-user-request-usage，
-// body {"startTime":unix秒,"endTime":unix秒,"page":n,"pageSize":m}；响应 data 含
-// 列表 + total。解析对字段名宽容（parseRequestUsage），以适配上游命名的可能差异。
+// 上游请求契约（实测 Web /profile/usage）：
+//
+//	POST billing/meter/get-user-request-usage
+//	{"startTime":"YYYY-MM-DD HH:mm:ss","endTime":"YYYY-MM-DD HH:mm:ss",
+//	 "pageNum":n,"pageSize":m}
+//
+// 时间是 UTC+8 墙钟字符串（不是 Unix 秒），分页字段是 pageNum（不是 page）；响应
+// data 含 data 列表 + total。解析对字段名宽容（parseRequestUsage），以适配上游命名
+// 的可能差异。
 func (c *Client) RequestUsage(a *auth.Auth, start, end time.Time, page, pageSize int) (*RequestUsagePage, error) {
 	if pageSize <= 0 {
 		pageSize = 100
@@ -54,13 +65,16 @@ func (c *Client) RequestUsage(a *auth.Auth, start, end time.Time, page, pageSize
 	if page <= 0 {
 		page = 1
 	}
+	if start.IsZero() || end.IsZero() || !end.After(start) {
+		return nil, fmt.Errorf("request usage: invalid time range %v..%v", start, end)
+	}
 	body := map[string]any{
-		"startTime": start.Unix(),
-		"endTime":   end.Unix(),
-		"page":      page,
+		"startTime": start.In(softRateResetLoc).Format(requestUsageTimeLayout),
+		"endTime":   end.In(softRateResetLoc).Format(requestUsageTimeLayout),
+		"pageNum":   page,
 		"pageSize":  pageSize,
 	}
-	data, err := c.billingMeterJSON(a, c.requestUsagePaths(a), body)
+	data, err := c.billingMeterJSONLimit(a, c.requestUsagePaths(), body, requestUsageMaxRespBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +89,8 @@ func parseRequestUsage(data json.RawMessage, page, pageSize int) (*RequestUsageP
 		return nil, fmt.Errorf("parse request usage: %w", err)
 	}
 	list := firstListField(root, "list", "records", "items", "rows", "data")
-	out := &RequestUsagePage{Total: firstIntField(root, "total", "totalCount", "count", "totalNum")}
+	reportedTotal := firstIntField(root, "total", "totalCount", "count", "totalNum")
+	out := &RequestUsagePage{Total: reportedTotal}
 	for _, item := range list {
 		m, ok := item.(map[string]any)
 		if !ok {
@@ -88,10 +103,13 @@ func parseRequestUsage(data json.RawMessage, page, pageSize int) (*RequestUsageP
 			Time:      parseUsageTime(firstAny(m, "requestTime", "time", "createTime", "timestamp", "requestTimeMs")),
 		})
 	}
-	if out.Total == 0 {
+	if out.Total <= 0 {
 		out.Total = len(out.Records)
 	}
-	if out.Total > page*pageSize && len(out.Records) > 0 {
+	// 正常路径按 total 判断；上游漏给 total 时，整页满即保守认为还有下一页，
+	// 具体页数由调用方上限兜底，避免 silently 截断。
+	if len(out.Records) > 0 &&
+		(out.Total > page*pageSize || (reportedTotal <= 0 && len(out.Records) >= pageSize)) {
 		out.NextPage = page + 1
 	}
 	return out, nil
@@ -158,19 +176,26 @@ func firstFloatField(m map[string]any, keys ...string) float64 {
 }
 
 // parseUsageTime 宽容解析时间：unix 秒/毫秒（数字或数字串）或常见字符串格式。
+//
+// 上游 requestTime 是 UTC+8 墙钟（实测 "2026-10-16 22:40:00"），无时区后缀的格式
+// 必须按 softRateResetLoc 解释；用 time.Local 会在非 UTC+8 部署上把日期算错。
+// 带时区的 RFC3339 仍按自身 offset 解析。
 func parseUsageTime(v any) time.Time {
 	switch t := v.(type) {
 	case float64:
 		return timeFromUnix(int64(t))
 	case string:
-		if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+		s := strings.TrimSpace(t)
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return timeFromUnix(n)
 		}
+		if ts, err := time.Parse(time.RFC3339, s); err == nil {
+			return ts
+		}
 		for _, layout := range []string{
-			"2006-01-02 15:04:05", "2006-01-02T15:04:05Z07:00",
-			"2006-01-02T15:04:05", "2006-01-02",
+			requestUsageTimeLayout, "2006-01-02T15:04:05", "2006-01-02",
 		} {
-			if ts, err := time.ParseInLocation(layout, strings.TrimSpace(t), time.Local); err == nil {
+			if ts, err := time.ParseInLocation(layout, s, softRateResetLoc); err == nil {
 				return ts
 			}
 		}
