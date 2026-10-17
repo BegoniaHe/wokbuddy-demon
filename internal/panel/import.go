@@ -8,9 +8,29 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+)
+
+// cockpit 导入的资源上限（issue #107）。
+//
+// 此前 ParseMultipartForm(32<<20) 的 32MiB 只是内存/临时文件切分阈值，不限制
+// 请求体总大小；随后 io.ReadAll(file) 无上限，accounts 数组也没有数量上限，
+// 循环内逐号同步签到/激活/余额查询——错误的客户端、误选大文件或恶意管理员
+// 都能造成内存/磁盘耗尽与上游请求风暴。
+const (
+	// cockpitMaxUploadBytes 请求体上限（与加密导入 secureMaxUploadBytes 同口径：
+	// 正常 cockpit 导出远小于此）。http.MaxBytesReader 在解析前兜住整个 body，
+	// io.LimitReader 作为第二道防线。
+	cockpitMaxUploadBytes = 8 << 20
+	// maxCockpitImportAccounts 单次导入账号数上限：超过整体拒绝（不静默截断，
+	// 避免用户以为全导入了）。
+	maxCockpitImportAccounts = 1000
+	// cockpitImportWorkers 导入后签到/激活/余额查询的并发上限。这些是逐号上游
+	// 调用，串行执行会让单请求长时间占用且放大延迟；无界并发又会瞬时打满上游。
+	cockpitImportWorkers = 3
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
@@ -42,6 +62,10 @@ type cockpitAccount struct {
 //
 // 返回 {ok, total, imported, skipped, errors}。
 func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
+	// 解析前先兜住请求体总大小（issue #107）：ParseMultipartForm 的 maxMemory
+	// 只决定内存/临时文件切分，不限制大小。超限时 ParseMultipartForm 返回错误，
+	// 不会把剩余 body 写满临时目录。
+	r.Body = http.MaxBytesReader(w, r.Body, cockpitMaxUploadBytes)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
 		return
@@ -53,9 +77,15 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	raw, err := io.ReadAll(file)
+	// 第二道防线：即使 multipart 解析路径变化，读取也不会无界扩容。
+	raw, err := io.ReadAll(io.LimitReader(file, cockpitMaxUploadBytes+1))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "read file: "+err.Error())
+		return
+	}
+	if len(raw) > cockpitMaxUploadBytes {
+		writeErr(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("file exceeds %d bytes", cockpitMaxUploadBytes))
 		return
 	}
 
@@ -68,21 +98,33 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "empty accounts array")
 		return
 	}
-
-	var total, imported, skipped int
-	var errs []string
-
-	for _, acc := range accounts {
-		ok, msg := p.importOneCockpitAccount(acc)
-		if ok {
-			imported++
-			continue
-		}
-		skipped++
-		errs = append(errs, msg)
+	if len(accounts) > maxCockpitImportAccounts {
+		// 整体拒绝：静默截断会让用户以为全部导入成功。
+		writeErr(w, http.StatusBadRequest,
+			fmt.Sprintf("too many accounts: %d (max %d per import)", len(accounts), maxCockpitImportAccounts))
+		return
 	}
 
-	total = len(accounts)
+	// 阶段 1（串行）：字段校验 + 落盘 + 热加载。落盘是本地操作且池写入不并发，
+	// 保持逐号顺序，失败项继续逐条返回（与旧实现逐字一致）。
+	importedAuths := make([]*auth.Auth, 0, len(accounts))
+	errs := make([]string, 0, len(accounts))
+	var imported, skipped int
+	for _, acc := range accounts {
+		a, msg := p.persistCockpitAccount(acc)
+		if a == nil {
+			skipped++
+			errs = append(errs, msg)
+			continue
+		}
+		imported++
+		importedAuths = append(importedAuths, a)
+	}
+
+	// 阶段 2（有界并发）：签到/激活/余额查询。失败仅记日志，不阻断导入。
+	p.postImportCockpitAccounts(importedAuths)
+
+	total := len(accounts)
 	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
@@ -93,32 +135,50 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// importOneCockpitAccount 导入单个 cockpit 账号：字段校验、落盘、热加载并顺带
-// 签到/激活。返回 (是否导入成功, 失败原因)；失败原因与旧实现逐字一致。
-func (p *Panel) importOneCockpitAccount(acc cockpitAccount) (bool, string) {
+// persistCockpitAccount 校验并落盘单个 cockpit 账号（含热加载进池）。
+// 返回 (账号, 空串) 表示导入成功；账号为 nil 时第二返回值是失败原因。
+// 失败原因与旧实现逐字一致。上游调用（签到/余额）不在此处，见阶段 2。
+func (p *Panel) persistCockpitAccount(acc cockpitAccount) (*auth.Auth, string) {
 	uid := strings.TrimSpace(acc.UID)
 	at := strings.TrimSpace(acc.AccessToken)
 	rt := strings.TrimSpace(acc.RefreshToken)
 	if uid == "" || at == "" || rt == "" {
-		return false, fmt.Sprintf("missing required fields (id=%s)", acc.ID)
+		return nil, fmt.Sprintf("missing required fields (id=%s)", acc.ID)
 	}
 	if !validImportUID(uid) {
-		return false, fmt.Sprintf("invalid uid (id=%s)", acc.ID)
+		return nil, fmt.Sprintf("invalid uid (id=%s)", acc.ID)
 	}
 
 	// 按 domain 推断 realm：workbuddy.ai 家族 → global，否则 cn。
 	realm := auth.ResolveRealm("", acc.Domain)
 	a := buildImportedAuth(acc, uid, at, rt, p.cfg.AuthDir)
 	if err := p.persistImportedAuth(a, realm, uid); err != nil {
-		return false, err.Error()
+		return nil, err.Error()
 	}
+	return a, ""
+}
 
-	// 顺带签到/激活（幂等；失败仅记日志，不阻断导入）。
-	p.importCheckin(a, uid)
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+// postImportCockpitAccounts 对已落盘的账号做签到/激活/余额查询，并发有上限
+// （issue #107）：逐号上游调用不再串行放大单请求时长，也不会无界并发打满上游。
+// 所有失败只记日志，不改变导入结果。
+func (p *Panel) postImportCockpitAccounts(accounts []*auth.Auth) {
+	sem := make(chan struct{}, cockpitImportWorkers)
+	var wg sync.WaitGroup
+	for _, a := range accounts {
+		wg.Add(1)
+		go func(a *auth.Auth) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			uid := a.UID
+			p.importCheckin(a, uid)
+			if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+				p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
+			}
+		}(a)
 	}
-	return true, ""
+	wg.Wait()
 }
 
 // buildImportedAuth 由 cockpit 账号构造 auth：expires_at 毫秒转秒（缺省 +365 天），
