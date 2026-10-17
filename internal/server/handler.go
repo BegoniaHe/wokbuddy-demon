@@ -105,6 +105,11 @@ type Config struct {
 	DecisionTrace       bool
 	DecisionTraceSample float64
 
+	// BackgroundNames 后台模型改写名单（小写；issue #103）；空 = 关闭。
+	BackgroundNames map[string]bool
+	// BackgroundTarget 后台模型改写目标（issue #103）。
+	BackgroundTarget string
+
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
@@ -137,6 +142,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		SoftCooldown:      h.cfg.SoftCooldown,
 		RecordClientInfo:  h.cfg.RecordClientInfo,
 		MultimodalRouting: h.cfg.MultimodalRouting,
+		BackgroundNames:   h.cfg.BackgroundNames,
+		BackgroundTarget:  h.cfg.BackgroundTarget,
 	}
 }
 
@@ -810,9 +817,28 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 	f.writeFinalError()
 }
 
+// backgroundTarget 返回后台模型改写目标；未命中或名单为空返回空串。
+func (h *Handler) backgroundTarget(model string) string {
+	live := h.loadLive()
+	if len(live.BackgroundNames) == 0 {
+		return ""
+	}
+	if !live.BackgroundNames[strings.ToLower(strings.TrimSpace(model))] {
+		return ""
+	}
+	return live.BackgroundTarget
+}
+
 // newChatFlow 由结构化输入组装统计、会话标识与轮转状态（传输无关）。
 // 入站 HTTP 解析（读 body / 提取头与 IP）已在 newChatInput 完成。
 func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
+	// 后台任务模型重定向（issue #103）：只改 model 字段，后续 realm/别名/选号/
+	// 记账全部基于改写后的模型。名单为空时不改变任何行为。
+	if target := h.backgroundTarget(in.model); target != "" {
+		log.Printf("INFO: [server] alias: background model %s -> %s", in.model, target)
+		in.body = rewriteModel(in.body, target)
+		in.model = target
+	}
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。

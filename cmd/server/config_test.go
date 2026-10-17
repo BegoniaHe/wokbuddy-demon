@@ -784,6 +784,27 @@ func TestServerReadTimeout(t *testing.T) {
 	}
 }
 
+// TestBackgroundModels 后台模型名单规范化与默认目标（issue #103）。
+func TestBackgroundModels(t *testing.T) {
+	c := Default()
+	if c.Models.BackgroundTarget != "deepseek-v4.1-flash" {
+		t.Errorf("default target=%q", c.Models.BackgroundTarget)
+	}
+	c.Models.BackgroundNames = []string{" GPT-5-Background ", "gpt-5-background", "", "memory-gen"}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	want := []string{"gpt-5-background", "memory-gen"}
+	if len(c.Models.BackgroundNames) != len(want) {
+		t.Fatalf("names=%v want %v", c.Models.BackgroundNames, want)
+	}
+	for i := range want {
+		if c.Models.BackgroundNames[i] != want[i] {
+			t.Errorf("names[%d]=%q want %q", i, c.Models.BackgroundNames[i], want[i])
+		}
+	}
+}
+
 // mustParseConfig 解析一段配置 JSON（不读环境变量），失败即终止测试。
 func mustParseConfig(t *testing.T, body string) *Config {
 	t.Helper()

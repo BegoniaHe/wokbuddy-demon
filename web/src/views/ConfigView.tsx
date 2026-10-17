@@ -352,6 +352,19 @@ export function ConfigView() {
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
             <Field>
+              <FieldLabel>后台任务模型名单</FieldLabel>
+              {text('background_names', { placeholder: '如 gpt-5-background, memory-gen' })}
+              <FieldDescription>逗号分隔、大小写不敏感；命中后改写到目标模型。留空 = 关闭</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>后台任务改写目标</FieldLabel>
+              {text('background_target', { placeholder: 'deepseek-v4.1-flash' })}
+              <FieldDescription>只改 model 字段，其余请求原样透传；热生效</FieldDescription>
+            </Field>
+          </div>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <Field>
               <FieldLabel>系统提示词模式</FieldLabel>
               <Select
                 items={selectOptionItems(PROMPT_MODE_OPTIONS)}

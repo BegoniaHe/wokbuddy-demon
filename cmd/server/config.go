@@ -18,6 +18,9 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
 
+// defaultBackgroundTarget 后台任务模型改写目标（issue #103）。
+const defaultBackgroundTarget = "deepseek-v4.1-flash"
+
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
@@ -126,6 +129,11 @@ type Config struct {
 	} `json:"schedule"`
 
 	Models struct {
+		// BackgroundNames 客户端后台任务使用的硬编码模型名（issue #103，大小写
+		// 不敏感）。命中后 model 改写为 BackgroundTarget；空 = 关闭。
+		BackgroundNames []string `json:"background_names"`
+		// BackgroundTarget 后台模型改写目标；默认 deepseek-v4.1-flash。
+		BackgroundTarget string `json:"background_target"`
 		// Aliases 客户端模型别名 → 上游模型（issue #52）：
 		// {"claude-sonnet-4-5": "cn:hy4", "gpt-5-codex": "hy4"}。
 		// 键必须是裸名（不含 realm 前缀，大小写敏感）；值沿用 "[realm:]model"
@@ -314,6 +322,7 @@ func Default() *Config {
 	c.Logging.RequestClientInfo = true
 	// 与 README / config.example.json 对齐：开启决策链时默认只采样 10%，避免归档写入量突增。
 	c.Logging.DecisionTraceSample = 0.1
+	c.Models.BackgroundTarget = defaultBackgroundTarget
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -568,6 +577,9 @@ func (c *Config) normalize() error {
 	if err := c.normalizeModelAliases(); err != nil {
 		return err
 	}
+	if err := c.normalizeBackgroundModels(); err != nil {
+		return err
+	}
 	if err := c.normalizeNotify(); err != nil {
 		return err
 	}
@@ -615,7 +627,33 @@ func (c *Config) normalizeModelAliases() error {
 		}
 		out[name] = target
 	}
+	c.Models.BackgroundTarget = defaultBackgroundTarget
 	c.Models.Aliases = out
+	return nil
+}
+
+// normalizeBackgroundModels 规范化后台模型名单（issue #103）：去空白、转小写、
+// 去重；目标缺省 deepseek-v4.1-flash。名单为空时仍保留目标，便于后续热开。
+func (c *Config) normalizeBackgroundModels() error {
+	if strings.TrimSpace(c.Models.BackgroundTarget) == "" {
+		c.Models.BackgroundTarget = defaultBackgroundTarget
+	}
+	c.Models.BackgroundTarget = strings.TrimSpace(c.Models.BackgroundTarget)
+	if len(c.Models.BackgroundNames) == 0 {
+		c.Models.BackgroundNames = nil
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Models.BackgroundNames))
+	out := make([]string, 0, len(c.Models.BackgroundNames))
+	for _, raw := range c.Models.BackgroundNames {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	c.Models.BackgroundNames = out
 	return nil
 }
 
@@ -1060,6 +1098,7 @@ func (c *Config) normalizeListenAndHours() {
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
 	if len(c.Schedule.CheckinHours) == 0 {
+		c.Models.BackgroundTarget = defaultBackgroundTarget
 		c.Schedule.CheckinHours = []int{9, 21}
 	}
 	if len(c.Schedule.TravelHours) == 0 {
