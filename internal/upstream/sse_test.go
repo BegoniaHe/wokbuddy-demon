@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1357,3 +1358,55 @@ func TestStreamClientWriteDeadlineCleared(t *testing.T) {
 		t.Fatalf("流结束后写截止未清空：%v", w.deadline)
 	}
 }
+
+// TestStreamKeepaliveOnSilence 上游静默超过间隔时写 SSE 注释心跳，且不丢后续帧。
+func TestStreamKeepaliveOnSilence(t *testing.T) {
+	pr, pw := io.Pipe()
+	rec := httptest.NewRecorder()
+	done := make(chan error, 1)
+	go func() {
+		done <- StreamHint(rec, pr, nil, WithKeepaliveInterval(20*time.Millisecond))
+	}()
+	time.Sleep(80 * time.Millisecond)
+	raw := "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+	if _, err := pw.Write([]byte(raw)); err != nil {
+		t.Fatalf("pipe write: %v", err)
+	}
+	_ = pw.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, ": keepalive\n\n") {
+		t.Fatalf("缺少 keepalive 注释帧:\n%s", out)
+	}
+	if !strings.Contains(out, `"content":"hi"`) || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("心跳后帧丢失:\n%s", out)
+	}
+}
+
+// TestStreamKeepaliveWriteFailure 客户端写失败时立即结束，不无限等待上游。
+func TestStreamKeepaliveWriteFailure(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	w := &keepaliveFailWriter{}
+	done := make(chan error, 1)
+	go func() {
+		done <- StreamHint(w, pr, nil, WithKeepaliveInterval(10*time.Millisecond))
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("写失败应返回错误")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("客户端写失败后流未结束")
+	}
+}
+
+type keepaliveFailWriter struct{}
+
+func (w *keepaliveFailWriter) Header() http.Header       { return http.Header{} }
+func (w *keepaliveFailWriter) Write([]byte) (int, error) { return 0, errors.New("client gone") }
+func (w *keepaliveFailWriter) WriteHeader(int)           {}
+func (w *keepaliveFailWriter) Flush()                    {}

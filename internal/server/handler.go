@@ -72,6 +72,10 @@ type Config struct {
 	// 命中后选号/粘性/成本台账/日志统一使用解析后的裸模型名（issue #52）。
 	ModelAliases map[string]string
 
+	// KeepaliveInterval 入站 SSE 主动心跳间隔（config upstream.keepalive_interval，
+	// issue #54）；0 = 关闭（保持逐字节行为）。
+	KeepaliveInterval time.Duration
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -712,7 +716,7 @@ const (
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 入站适配：解析 HTTP 请求为结构化输入，并构造输出端口（唯一的 net/http 边界）。
-	in, out, ok := newChatInput(w, r)
+	in, out, ok := newChatInput(w, r, h.cfg.KeepaliveInterval)
 	if !ok {
 		return
 	}

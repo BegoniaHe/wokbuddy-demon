@@ -139,6 +139,9 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// KeepaliveInterval 入站 SSE 主动心跳间隔（issue #54）：上游静默超过该时长
+		// 时向客户端写 ": keepalive" 注释帧，防反代空闲超时断流。"0"/空 = 关闭。
+		KeepaliveInterval string `json:"keepalive_interval"`
 		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
@@ -253,6 +256,8 @@ type Config struct {
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// RotateBudgetDur 解析后的轮换总时长预算（issue #17）；0 = 不限。
 	RotateBudgetDur time.Duration `json:"-"`
+	// KeepaliveIntervalDur 解析后的入站 SSE 心跳间隔（issue #54）；0 = 关闭。
+	KeepaliveIntervalDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -717,6 +722,9 @@ func (c *Config) normalizeUpstreamDefaults() {
 	if c.Upstream.RotateBudget == "" {
 		c.Upstream.RotateBudget = "0"
 	}
+	if c.Upstream.KeepaliveInterval == "" {
+		c.Upstream.KeepaliveInterval = "0"
+	}
 }
 
 // normalizeDurations 把字符串时长解析到对应的 *Dur 字段，并按需回落默认值。
@@ -737,6 +745,9 @@ func (c *Config) normalizeDurations() error {
 	if err := c.normalizeUpstreamRotate(); err != nil {
 		return err
 	}
+	if err := c.normalizeUpstreamKeepalive(); err != nil {
+		return err
+	}
 	return c.normalizeExpiringDurations()
 }
 
@@ -755,6 +766,24 @@ func (c *Config) normalizeUpstreamRotate() error {
 		return fmt.Errorf("upstream.rotate_budget: 负时长 %q 无意义", c.Upstream.RotateBudget)
 	}
 	c.RotateBudgetDur = d
+	return nil
+}
+
+// normalizeUpstreamKeepalive 解析入站 SSE 心跳间隔（issue #54）：空 = "0"（关闭）；
+// 负时长无意义 fail fast。
+func (c *Config) normalizeUpstreamKeepalive() error {
+	raw := c.Upstream.KeepaliveInterval
+	if raw == "" {
+		raw = "0"
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("upstream.keepalive_interval: %w", err)
+	}
+	if d < 0 {
+		return fmt.Errorf("upstream.keepalive_interval: 负时长 %q 无意义", c.Upstream.KeepaliveInterval)
+	}
+	c.KeepaliveIntervalDur = d
 	return nil
 }
 
