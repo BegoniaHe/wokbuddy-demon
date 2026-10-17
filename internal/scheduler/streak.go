@@ -7,6 +7,7 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"time"
@@ -19,6 +20,13 @@ import (
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
 // 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
 func (s *Scheduler) RunStreakBonusNow() {
+	s.runTaskSync(context.Background(), TaskStreak, TriggerManual)
+}
+
+// streakAll 连登兑换 + 抽奖实体；返回尝试/成功/失败账号数（门控跳过不计数）。
+func (s *Scheduler) streakAll(trigger string) (total, success, failure int) {
+	_ = trigger
+	var c runCounters
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -33,12 +41,14 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsEnterprise() {
 			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
 		}
-		s.streakBonusAccount(a)
+		c.record(s.streakBonusAccount(a))
 	}
+	return c.total, c.success, c.failure
 }
 
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
-func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
+// 返回 false 仅表示主链路（连登状态/抽奖次数）查询失败；可选的礼包/补签失败不改变结果。
+func (s *Scheduler) streakBonusAccount(a *auth.Auth) bool {
 	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
 	s.makeupYesterday(a)
 	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
@@ -47,7 +57,7 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
 	if err != nil {
 		log.Printf("streak-bonus %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
+		return false
 	}
 	s.redeemUnlockedTiers(a, full)
 
@@ -55,9 +65,10 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	chances, err := s.cfg.Upstream.LotteryChances(a)
 	if err != nil {
 		log.Printf("streak-bonus %s: lottery summary: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
+		return false
 	}
 	s.drawAllLottery(a, chances)
+	return true
 }
 
 // claimStreakGifts 领取新手礼包与补偿（各一次，业务错误静默跳过）。

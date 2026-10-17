@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -2058,5 +2059,206 @@ func TestChatModelBlockPlatformHint(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "platform-level") {
 		t.Errorf("model block hint should mark platform-level: %s", rec.Body)
+	}
+}
+
+// TestChatStreamTruncatedNoSuccess 上游流截断（EOF 无 [DONE]，issue #105）：
+// 客户端收到 200 与补写的 [DONE]，但账号不记成功、不绑粘性。
+func TestChatStreamTruncatedNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n", true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	// 客户端必须拿到一个 [DONE] 收尾。
+	if n := strings.Count(rec.Body.String(), "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, rec.Body)
+	}
+	// 截断不是成功：账号 success_count 保持 0，粘性不绑定。
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (truncated stream is not success)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("truncated stream must not bind sticky")
+	}
+}
+
+// TestChatStreamReadErrorNoSuccess 上游流中读错误（非 EOF，issue #105）：
+// 客户端已收到 200，但这是上游失败——账号不记成功、不绑粘性；客户端写失败
+// 才按 Interrupted 记成功（两者由 writeAll 的 errClientWrite 区分）。
+func TestChatStreamReadErrorNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(io.MultiReader(
+					strings.NewReader("data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n"),
+					iotest.ErrReader(errors.New("connection reset by peer")),
+				)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (upstream read error is not success)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("upstream read error must not bind sticky")
+	}
+}
+
+// TestChatStreamEmptyStreamNoSuccess 上游空流（200 + 0 有效帧，issue #105）：
+// 账号不记成功、不绑粘性（写头后无法换号，只记失败）。
+func TestChatStreamEmptyStreamNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, ": keepalive comment\n\n", true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (empty stream is not success)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("empty stream must not bind sticky")
+	}
+}
+
+// TestChatNonStreamTruncatedRotates 非流式截断：客户端未收到任何字节，换号重试；
+// 拿到完整流的号才记成功，截断号 success_count 保持 0（issue #105）。
+func TestChatNonStreamTruncatedRotates(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at-bad" {
+			return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n", true
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+		t.Errorf("calls=%v want bad once + good once (rotate after truncation)", calls)
+	}
+	if s := statusOf(t, p, "bad").SuccessCount; s != 0 {
+		t.Errorf("bad success_count=%d want 0 (its stream was truncated)", s)
+	}
+	if s := statusOf(t, p, "good").SuccessCount; s != 1 {
+		t.Errorf("good success_count=%d want 1", s)
+	}
+	// 截断号必须释放本轮在途租约：否则下一轮 heldUID 覆盖后名额永不归还。
+	if n := statusOf(t, p, "bad").InFlight; n != 0 {
+		t.Errorf("bad in_flight=%d want 0 (failed attempt must release lease)", n)
+	}
+}
+
+// TestChatNonStreamTruncatedAllAccountsFails502 非流式截断且所有号都截断：
+// 轮转耗尽后回 502，不把截断内容当成功写回（issue #105）。
+func TestChatNonStreamTruncatedAllAccountsFails502(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n", true
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d want 502 body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0", s)
+	}
+}
+
+// TestChatStreamLineTooLongNoSuccess 上游单行超过大小上限（issue #113）：
+// 客户端收到 200 + error 帧 + [DONE]，但账号不记成功、不绑粘性。
+func TestChatStreamLineTooLongNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		huge := strings.Repeat("x", upstream.MaxSSELineBytes+1024)
+		return 200, "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+			"data: " + huge + "\n\n", true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "exceeded size limit") {
+		t.Errorf("missing size-limit error frame: %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1: %q", n, body)
+	}
+	// 防御上限命中 = 上游异常：不记成功、不绑粘性。
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (size-limit hit is upstream failure)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("size-limit failure must not bind sticky")
+	}
+}
+
+// TestChatNonStreamLineTooLongRotates 非流式单行超限：换号重试；全部超限时
+// 回 502（issue #113），不把部分内容当完整回答。
+func TestChatNonStreamLineTooLongRotates(t *testing.T) {
+	huge := strings.Repeat("x", upstream.MaxSSELineBytes+1024)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: " + huge + "\n\n", true
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d want 502 body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0", s)
 	}
 }

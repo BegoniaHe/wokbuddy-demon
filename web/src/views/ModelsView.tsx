@@ -28,6 +28,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Tag } from '@/components/ui-kit';
+import { toast } from '@/components/Toaster';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
 
@@ -37,6 +38,18 @@ interface Probe {
   note?: string;
   tested_at?: string;
   verdict?: string;
+}
+
+// 面板主动探测的健康聚合（GET /panel/api/model_health，issue #110）。
+interface ModelHealth {
+  last?: { at?: string; ok?: boolean; ttft_ms?: number; error_class?: string; error?: string };
+  success?: number;
+  failure?: number;
+  avg_ttft_ms?: number;
+  p50_ttft_ms?: number;
+  p95_ttft_ms?: number;
+  last_probe_at?: string;
+  window?: number;
 }
 
 const fmtK = (n: unknown) => {
@@ -100,9 +113,40 @@ export function ModelsView() {
         (): { probes?: Record<string, Probe> } => ({ probes: {} }),
       ),
   });
+  const healthQ = useQuery({
+    queryKey: ['model_health'],
+    queryFn: () =>
+      api<{ models?: Record<string, ModelHealth> }>('model_health').catch(
+        (): { models?: Record<string, ModelHealth> } => ({ models: {} }),
+      ),
+  });
+  const [probing, setProbing] = useState<string | null>(null);
   const reload = () => {
     void modelsQ.refetch();
     void probesQ.refetch();
+    void healthQ.refetch();
+  };
+  const probe = async (entry: ModelEntry) => {
+    const i = entry.id.indexOf(':');
+    const realm = i > 0 ? entry.id.slice(0, i) : 'cn';
+    const model = i > 0 ? entry.id.slice(i + 1) : entry.id;
+    setProbing(entry.id);
+    try {
+      const r = await api<{ ok?: boolean; sample?: { ttft_ms?: number; error_class?: string; error?: string } }>(
+        'model_probes',
+        { method: 'POST', body: JSON.stringify({ model, realm }) },
+      );
+      if (r.ok) {
+        toast('探测成功：首字 ' + (r.sample?.ttft_ms ?? '?') + 'ms', 'ok');
+      } else {
+        toast('探测失败：' + (r.sample?.error_class || r.sample?.error || '未知错误'), 'err');
+      }
+      void healthQ.refetch();
+    } catch (e) {
+      toast((e as Error).message, 'err');
+    } finally {
+      setProbing(null);
+    }
   };
 
   const data = modelsQ.data;
@@ -110,6 +154,7 @@ export function ModelsView() {
   const error = modelsQ.error;
   const all = data?.models ?? [];
   const probes = probesQ.data?.probes ?? {};
+  const health = healthQ.data?.models ?? {};
   const probeKeys = Object.keys(probes);
   const probeOf = (id: string): Probe | undefined =>
     probes[id] || probes[probeKeys.find((k) => k.endsWith(':' + id)) ?? ''];
@@ -225,19 +270,30 @@ export function ModelsView() {
               <TableHead>支持的思考档位</TableHead>
               <TableHead>上下文长度</TableHead>
               <TableHead>最大输出</TableHead>
+              <TableHead>首字延迟</TableHead>
+              <TableHead className="w-[64px]">探测</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {error ? (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">{(error as Error).message}</TableCell>
+                <TableCell colSpan={9} className="py-10 text-center text-muted-foreground">{(error as Error).message}</TableCell>
               </TableRow>
             ) : list.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={7} className="py-10 text-center text-muted-foreground">{all.length ? '没有符合当前筛选条件的模型' : '正在向上游查询…'}</TableCell>
+                <TableCell colSpan={9} className="py-10 text-center text-muted-foreground">{all.length ? '没有符合当前筛选条件的模型' : '正在向上游查询…'}</TableCell>
               </TableRow>
             ) : (
-              list.map((m) => <ModelRow key={m.id} m={m} pr={probeOf(m.id)} />)
+              list.map((m) => (
+                <ModelRow
+                  key={m.id}
+                  m={m}
+                  pr={probeOf(m.id)}
+                  h={health[m.id]}
+                  probing={probing === m.id}
+                  onProbe={() => void probe(m)}
+                />
+              ))
             )}
           </TableBody>
         </Table>
@@ -312,7 +368,36 @@ function OutCell({ m, pr }: { m: ModelEntry; pr?: Probe }) {
   );
 }
 
-function ModelRow({ m, pr }: { m: ModelEntry; pr?: Probe }) {
+function TTFTCell({ h }: { h?: ModelHealth }) {
+  if (!h || (!h.last && !h.success)) return <span className="text-xs text-muted-foreground">未探测</span>;
+  if (h.last && h.last.ok && h.last.ttft_ms) {
+    return (
+      <span className="font-mono tabular-nums" title={'最近 ' + h.last.ttft_ms + 'ms · 均值 ' + (h.avg_ttft_ms ?? '—') + 'ms · p95 ' + (h.p95_ttft_ms ?? '—') + 'ms'}>
+        <b>{h.last.ttft_ms}ms</b>
+        {h.avg_ttft_ms ? <div className="text-2xs text-muted-foreground">均值 {h.avg_ttft_ms}ms</div> : null}
+      </span>
+    );
+  }
+  return (
+    <span className="text-2xs text-muted-foreground" title={h.last?.error || h.last?.error_class}>
+      失败{h.failure ? ' ×' + h.failure : ''}
+    </span>
+  );
+}
+
+function ModelRow({
+  m,
+  pr,
+  h,
+  probing,
+  onProbe,
+}: {
+  m: ModelEntry;
+  pr?: Probe;
+  h?: ModelHealth;
+  probing: boolean;
+  onProbe: () => void;
+}) {
   const eff = (m.supported_efforts || []).slice();
   if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
   const effs = eff.length ? (
@@ -353,6 +438,14 @@ function ModelRow({ m, pr }: { m: ModelEntry; pr?: Probe }) {
       </TableCell>
       <TableCell>
         <OutCell m={m} pr={pr} />
+      </TableCell>
+      <TableCell>
+        <TTFTCell h={h} />
+      </TableCell>
+      <TableCell className="text-right">
+        <Button size="xs" variant="ghost" disabled={probing} onClick={onProbe}>
+          {probing ? '探测中' : '探测'}
+        </Button>
       </TableCell>
     </TableRow>
   );

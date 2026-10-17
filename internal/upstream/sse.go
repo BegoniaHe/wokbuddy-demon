@@ -14,32 +14,60 @@ import (
 )
 
 // errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
-// 用哨兵错误替代裸 fmt.Errorf：StreamHint 的调用方（handler 流式路径）需要区分
-// 「上游空流」与「客户端断连写失败」——空流是上游缺陷，应记 502 观测；写失败是
-// 客户端已走，日志口径不同。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
-var errEmptyStream = errors.New("upstream stream contained no valid data events")
+//
+// errTruncatedStream 上游未发 data: [DONE] 就以 EOF 收尾（连接被切 / 代理中断 /
+// 上游进程崩溃）。流式路径仍向客户端补一个 [DONE] 兜底收尾，但请求结果必须是
+// 失败——截断的 content 不是完整回答（issue #105）。
+//
+// 两者都是上游缺陷，不是「客户端已走」。用哨兵错误替代裸 fmt.Errorf：StreamHint
+// 的调用方（handler 流式路径）需要区分「上游空流/截断」与「客户端写失败」——
+// 前者是上游失败，应记失败观测并不再计账号成功；写失败是客户端断开，账号侧
+// 照常记成功。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
+// 读错误（io.EOF 之外的 Read 错误）原样上抛，调用方按上游失败处置
+// （errClientWrite 只包装写目标失败，见 writeAll）。
+var (
+	errEmptyStream     = errors.New("upstream stream contained no valid data events")
+	errTruncatedStream = errors.New("upstream stream ended without [DONE]")
+	errClientWrite     = errors.New("client write failed")
+)
 
 // IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
 // 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
-// Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
-// 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
+// IsTruncatedStreamError 报告错误是否为「上游流被截断」（EOF 收尾但从未收到
+// data: [DONE]）。截断按上游失败处置：账号不记成功、不绑粘性（issue #105）。
+func IsTruncatedStreamError(err error) bool { return errors.Is(err, errTruncatedStream) }
+
+// IsClientWriteError 报告错误是否为「写客户端失败」（下游断连 / 写超时）。
+// 与上游读错误区分：客户端已走不是账号的错，handler 仍按 Interrupted 记、
+// 账号侧照常记成功（issue #105）。
+func IsClientWriteError(err error) bool { return errors.Is(err, errClientWrite) }
+
+// Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI 响应。
+// 分片/半行由 readSSELine 处理（单行上限 4 MiB，issue #113）；遇到 "data: [DONE]" 结束。
+// EOF 收尾但未见过 [DONE] → errTruncatedStream：截断的 content 不是完整回答，
+// 不返回残缺成功响应，由 handler 映射为 502 upstream_parse（issue #105）。
+// 聚合总量超 32 MiB → ErrSSEAggregateTooLong（issue #113），同样不返回残缺成功。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
 	a := newStreamAggregator()
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
-		line, err := br.ReadString('\n')
-		if err != nil && err != io.EOF {
+		line, err := readSSELine(br)
+		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, err
 		}
 		line = strings.TrimRight(line, "\r\n")
-		if a.handleLine(line) {
+		done, herr := a.handleLine(line)
+		if herr != nil {
+			return nil, herr // 聚合总量超限：立即失败，不返回残缺成功（issue #113）
+		}
+		if done {
 			break // 上游显式发过 data: [DONE]（正常收尾）
 		}
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 	}
@@ -66,6 +94,9 @@ type streamAggregator struct {
 	// idIndex id → 已分配的 index：跨帧持续（延续碎片的 id 常出现在后续帧），
 	// 供缺 index 时按 id 归位既有调用（见 mergeToolCallsChunk 注释）。
 	idIndex map[string]int
+	// guard 聚合总量上限（issue #113）：content/reasoning/tool_call arguments
+	// 三条写入路径都经它。超限即失败，不返回残缺成功响应。
+	guard aggregateGuard
 }
 
 // newStreamAggregator 初始化聚合状态（role/finish_reason 有默认值）。
@@ -79,39 +110,45 @@ func newStreamAggregator() *streamAggregator {
 }
 
 // handleLine 处理一行：data: 帧解析聚合，[DONE] 返回 true（调用方停止读取）。
-func (a *streamAggregator) handleLine(line string) bool {
+// 聚合总量超限时返回 ErrSSEAggregateTooLong（issue #113）。
+func (a *streamAggregator) handleLine(line string) (bool, error) {
 	if !strings.HasPrefix(line, "data: ") {
-		return false
+		return false, nil
 	}
 	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
 		// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
 		a.sawDone = true
-		return true
+		return true, nil
 	}
 	var chunk map[string]any
 	if json.Unmarshal([]byte(payload), &chunk) == nil {
 		// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
 		a.validEvents++
-		a.handleChunk(chunk)
+		if err := a.handleChunk(chunk); err != nil {
+			return false, err
+		}
 	}
-	return false
+	return false, nil
 }
 
-// handleChunk 并入一个数据帧的顶层字段与 choices。
-func (a *streamAggregator) handleChunk(chunk map[string]any) {
+// handleChunk 并入一个数据帧的顶层字段与 choices。聚合超限返回错误（issue #113）。
+func (a *streamAggregator) handleChunk(chunk map[string]any) error {
 	a.mergeChunkMeta(chunk)
 	ch, ok := chunk["choices"].([]any)
 	if !ok {
-		return
+		return nil
 	}
 	for _, ci := range ch {
 		c, _ := ci.(map[string]any)
 		if c == nil {
 			continue
 		}
-		a.handleChoice(c)
+		if err := a.handleChoice(c); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // mergeChunkMeta 并入数据帧的顶层标量字段（id/model/created 只取首个非空，usage 覆盖）。
@@ -131,54 +168,73 @@ func (a *streamAggregator) mergeChunkMeta(chunk map[string]any) {
 }
 
 // handleChoice 并入单个 choice：finish_reason + delta（或整条 message）。
-func (a *streamAggregator) handleChoice(c map[string]any) {
+// 聚合超限返回错误（issue #113）。
+func (a *streamAggregator) handleChoice(c map[string]any) error {
 	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
 		a.finishReason = fr
 	}
 	if delta, ok := c["delta"].(map[string]any); ok {
-		a.handleDelta(delta)
+		if err := a.handleDelta(delta); err != nil {
+			return err
+		}
 	}
 	// 有的上游把完整消息放在 message 里（非 delta）：整条并入（role/content/
 	// reasoning_content/tool_calls），与 delta 分支同构。delta 已取过正文
 	// （gotAnyContent）则跳过（避免与 delta 路径重复拼接——PR #134 的 latch 语义）。
 	if msg, ok := c["message"].(map[string]any); ok && !a.gotAnyContent {
-		a.mergeMessageFields(msg)
+		return a.mergeMessageFields(msg)
 	}
+	return nil
 }
 
 // handleDelta 并入一个流式 delta（role/content/reasoning_content/tool_calls）。
-func (a *streamAggregator) handleDelta(delta map[string]any) {
+// 聚合超限返回错误（issue #113）。
+func (a *streamAggregator) handleDelta(delta map[string]any) error {
 	if r2, ok := delta["role"].(string); ok && r2 != "" {
 		a.role = r2
 	}
 	if txt, ok := delta["content"].(string); ok {
-		a.appendContent(txt)
+		if err := a.appendContent(txt); err != nil {
+			return err
+		}
 	}
 	if rc, ok := delta["reasoning_content"].(string); ok {
+		if err := a.guard.add(len(rc)); err != nil {
+			return err
+		}
 		a.reasoning.WriteString(rc)
 	}
 	if tcs, ok := delta["tool_calls"].([]any); ok {
-		a.mergeToolCallsChunk(tcs)
+		if err := a.mergeToolCallsChunk(tcs); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // mergeMessageFields 把非 delta 的完整 message 内容并入聚合（message 是整条下发，
 // 非流式拼接，content 只取一次）。role/reasoning_content/tool_calls 与 delta 分支
 // 同构透出；content 同样置 gotAnyContent，与 delta 路径的 latch 语义一致
 // （一帧整条 message 之后，后续 delta 帧不重复追加）。
-func (a *streamAggregator) mergeMessageFields(msg map[string]any) {
+func (a *streamAggregator) mergeMessageFields(msg map[string]any) error {
 	if r2, ok := msg["role"].(string); ok && r2 != "" {
 		a.role = r2
 	}
 	if txt, ok := msg["content"].(string); ok {
-		a.appendContent(txt)
+		if err := a.appendContent(txt); err != nil {
+			return err
+		}
 	}
 	if rc, ok := msg["reasoning_content"].(string); ok {
+		if err := a.guard.add(len(rc)); err != nil {
+			return err
+		}
 		a.reasoning.WriteString(rc)
 	}
 	if tcs, ok := msg["tool_calls"].([]any); ok {
-		a.mergeToolCallsChunk(tcs)
+		return a.mergeToolCallsChunk(tcs)
 	}
+	return nil
 }
 
 // appendContent 是「已取到正文」（gotAnyContent latch）的唯一写入点：delta 与
@@ -188,12 +244,18 @@ func (a *streamAggregator) mergeMessageFields(msg map[string]any) {
 //	   （delta.content=""）和整条空 message 帧是常态帧，若空串置位 latch，
 //	   后续真正文会被 message 回退分支的 !gotAnyContent 守卫静默拒绝；
 //	S2 空串本身也无可追加字节，跳过 WriteString 与追加语义自洽。
-func (a *streamAggregator) appendContent(txt string) {
+//
+// 聚合总量超限返回错误（issue #113）。
+func (a *streamAggregator) appendContent(txt string) error {
 	if txt == "" {
-		return
+		return nil
+	}
+	if err := a.guard.add(len(txt)); err != nil {
+		return err
 	}
 	a.content.WriteString(txt)
 	a.gotAnyContent = true
+	return nil
 }
 
 // nextToolIndex 分配下一个不冲突的缺 index 序号：从 toolSeq 起递增跳过既有
@@ -238,7 +300,8 @@ func (a *streamAggregator) toolCallIndex(call map[string]any) int {
 // mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进累计表。
 // delta（流式分片，按 index 累积）与 message（非 delta 整条）共用同一合并逻辑，
 // 保证「上游给的身份/函数名不丢、arguments 拼接语义一致」。
-func (a *streamAggregator) mergeToolCallsChunk(tcs []any) {
+// arguments 累计量计入聚合总量上限，超限返回错误（issue #113）。
+func (a *streamAggregator) mergeToolCallsChunk(tcs []any) error {
 	for _, tc := range tcs {
 		call, ok := tc.(map[string]any)
 		if !ok {
@@ -258,15 +321,30 @@ func (a *streamAggregator) mergeToolCallsChunk(tcs []any) {
 			a.idIndex[cid] = idx
 		}
 		mergeToolCallDelta(merged, call)
+		if fn, _ := call["function"].(map[string]any); fn != nil {
+			if args, _ := fn["arguments"].(string); args != "" {
+				if err := a.guard.add(len(args)); err != nil {
+					return err
+				}
+			}
+		}
 	}
+	return nil
 }
 
-// result 由聚合状态构造最终的非流式响应；无有效事件返回 errEmptyStream。
+// result 由聚合状态构造最终的非流式响应；无有效事件返回 errEmptyStream，
+// EOF 截断（未见过 [DONE]）返回 errTruncatedStream——两者都不是成功响应。
 func (a *streamAggregator) result() (map[string]any, error) {
 	if a.validEvents == 0 {
 		// 上游返回 200 但没有任何有效数据事件（空流/只有 [DONE]/只有注释行）：
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
 		return nil, errEmptyStream
+	}
+	if !a.sawDone {
+		// EOF 收尾但上游从未发 data: [DONE]（issue #105）：连接被切 / 代理中断 /
+		// 上游崩溃。累积的 content 只是截断片段，不能当完整回答返回——非流式没有
+		// 「补帧让客户端收尾」的余地，直接报上游解析失败，由 handler 映射 502。
+		return nil, errTruncatedStream
 	}
 	if a.id == "" {
 		a.id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -623,6 +701,10 @@ type streamWriter struct {
 	// writeTimeout 单次写帧/Flush 的截止时长；<=0 不设截止（测试可注入短值）。
 	writeTimeout time.Duration
 
+	// sawDone 上游是否显式发过 data: [DONE]（issue #105）。两条读取路径
+	// （普通 / keepalive）共用；收尾时据此区分「正常结束」与「EOF 截断」。
+	sawDone bool
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen map[int]bool
@@ -675,10 +757,12 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 // ResponseRecorder 或中间件包装）忽略错误：拿不到截止支持不能反过来拒绝写流。
 // 每次写前重设 deadline；流结束后由 stream 清空，避免过期 deadline 污染
 // keep-alive 连接上的后续请求。
+// 写失败统一包 errClientWrite（issue #105）：调用方据此把「客户端已走」与
+// 「上游读失败」分开处置。
 func (s *streamWriter) writeAll(payload string) error {
 	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
 	if _, werr := io.WriteString(s.w, payload); werr != nil {
-		return werr
+		return fmt.Errorf("%w: %w", errClientWrite, werr)
 	}
 	if s.fl != nil {
 		s.fl.Flush()
@@ -877,6 +961,11 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 }
 
 // stream 读取 r 并逐帧透传到 w（含空流兜底与尾部收尾）。
+// 上游读错误（io.EOF 之外的 Read 错误）原样上抛，供调用方与「客户端写失败」
+// 区分（issue #105）：读错误是上游/连接的问题，写失败是客户端已走。
+// 单行超上限（issue #113）：向客户端写一帧明确 error 后收尾（[DONE] 照写），
+// 并返回 ErrSSELineTooLong——客户端不会把半截超长行当正常内容，调用方按上游
+// 失败处置账号。
 func (s *streamWriter) stream(r io.Reader) error {
 	// 流结束（含写失败）清掉写截止：连接可能被 keep-alive 复用，
 	// 残留的过期 deadline 会让后续请求的响应写立即失败。
@@ -887,21 +976,26 @@ func (s *streamWriter) stream(r io.Reader) error {
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
 	for {
-		line, err := br.ReadString('\n')
+		line, err := readSSELine(br)
+		if err != nil && !errors.Is(err, io.EOF) {
+			// 超长行（防御上限，issue #113）：先给客户端一个明确的 error 帧再收尾，
+			// 不把超限行的已读部分当内容透传（也不回退——那正是 OOM 的成因）。
+			if errors.Is(err, ErrSSELineTooLong) {
+				s.finishSizeLimit()
+			}
+			return err
+		}
 		n, done, werr := s.handleStreamLine(line)
 		validFrames += n
 		if werr != nil {
-			return werr
+			return werr // 客户端写失败（或帧解析失败）：原样上抛
 		}
 		if done {
 			break
 		}
 		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
+		if errors.Is(err, io.EOF) {
+			break
 		}
 	}
 	return s.finish(&validFrames)
@@ -933,6 +1027,11 @@ func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
 			n, stop, err := s.consumeLine(res, &lastWrite)
 			validFrames += n
 			if err != nil {
+				// 单行超限（issue #113）：keepalive 路径同样先写明确 error 帧 +
+				// [DONE]，再上抛让调用方按上游失败处置。
+				if errors.Is(err, ErrSSELineTooLong) {
+					s.finishSizeLimit()
+				}
 				return err
 			}
 			if stop {
@@ -953,7 +1052,7 @@ func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
 	done := make(chan struct{})
 	go func() {
 		for {
-			line, err := br.ReadString('\n')
+			line, err := readSSELine(br)
 			select {
 			case lines <- lineResult{line: line, err: err}:
 			case <-done:
@@ -1003,6 +1102,7 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 	case strings.HasPrefix(trimmed, "data: [DONE]"):
 		// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
 		// [DONE] 统一在循环结束后写出，保证恰好一个。
+		s.sawDone = true
 		return 0, true, nil
 	case strings.HasPrefix(trimmed, "data: "):
 		n, werr := s.writeFrame(strings.TrimPrefix(trimmed, "data: "))
@@ -1016,26 +1116,51 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 	return 0, false, nil
 }
 
+// finishSizeLimit 单行/总量超限的收尾（issue #113）：先写一帧明确 error
+// （绕过 normalizeFrame 保留 error 字段），再补 [DONE] 保证客户端能正常收尾。
+// 与空流兜底同形态：HTTP 头已发出只能 200，error 帧是客户端唯一能看到的失败信号。
+// 错误原因由 stream 原样返回给调用方（日志/观测），不在这里二次编造。
+func (s *streamWriter) finishSizeLimit() {
+	_ = s.writeRaw(`{"error":{"message":"upstream sse line exceeded size limit","type":"upstream_error","code":"upstream_parse"}}`)
+	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
+		return
+	}
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
 // finish 收尾：标记修复尾部回吐 + 空流兜底 error 帧 + 保证恰好一个 [DONE]。
+// s.sawDone 为上游是否显式发过 data: [DONE]；false（EOF 截断）时收尾后返回
+// errTruncatedStream，让调用方把这次请求记为上游失败（issue #105）。
+// [DONE] 兜底帧照写：客户端已开始读流，必须有一个收尾标记，不能中途悬挂。
 func (s *streamWriter) finish(validFrames *int) error {
 	if werr := s.finishRepair(validFrames); werr != nil {
 		return werr
 	}
-	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
-	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
-	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
-	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
-	if *validFrames == 0 {
+	// 空流 / 截断都不是完整回答：先写一帧 error（绕过 normalizeFrame 原样保留
+	// error 字段），再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方
+	// 记录。与 finishSizeLimit 同形态，客户端不能把半截内容读成正常完成。
+	// 网关本地兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
+	// 且 writeRaw 的 hintFn 闭包在兜底路径下可能携带上一帧的上下文造成误配。
+	switch {
+	case *validFrames == 0:
 		_ = s.writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
+	case !s.sawDone:
+		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if err := s.writeAll("data: [DONE]\n\n"); err != nil {
 		return err
 	}
-	if *validFrames == 0 {
+	switch {
+	case *validFrames == 0:
 		return errEmptyStream
+	case !s.sawDone:
+		return errTruncatedStream
+	default:
+		return nil
 	}
-	return nil
 }
 
 // finishRepair 标记修复的尾部收尾：流结束时仍未判定的字节一律原文回吐（绝不吞字节，

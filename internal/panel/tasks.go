@@ -49,6 +49,49 @@ func decodeTaskCode(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return body.TaskCode, true
 }
 
+// taskDenyReason 报告账号是否不具备 CN 签到/成长任务体系，返回给用户的跳过原因；
+// 空串表示可用（issue #108）。集中表达两条门控，避免各单号入口各写一份：
+//   - global（国际版）账号没有 CN 任务体系（scheduler 对 global 直接跳过签到/
+//     旅行/夜猫子）；
+//   - 企业版没有个人成长/签到体系（上游 400 code 10001「企业账号不支持该操作」，
+//     见 auth.IsEnterprise 注释）。
+//
+// 与 taskcenter 的扫描/队列门控同口径（IsGlobal() || IsEnterprise()）。
+func taskDenyReason(a *auth.Auth) string {
+	switch {
+	case a.IsGlobal():
+		return "国际版（global）账号没有 CN 签到/任务体系，已跳过"
+	case a.IsEnterprise():
+		return "企业版账号没有个人签到/成长任务体系，已跳过"
+	default:
+		return ""
+	}
+}
+
+// denyTask 写「账号类型不支持 CN 任务体系」的 409 跳过响应（issue #108）。
+// 不发任何上游请求：用户点到不可用入口时得到明确原因，而不是上游错误。
+func denyTask(w http.ResponseWriter, reason string) {
+	writeJSON(w, http.StatusConflict, map[string]any{
+		"ok":      false,
+		"skipped": true,
+		"error":   reason,
+	})
+}
+
+// eligibleTaskAccount 取账号并做任务能力门控（issue #108）：不存在写 404、
+// global/企业版写 409 跳过，两者都返回 nil。CN 个人号原样返回。
+func (p *Panel) eligibleTaskAccount(w http.ResponseWriter, uid string) *auth.Auth {
+	a := p.accountByUID(w, uid)
+	if a == nil {
+		return nil
+	}
+	if reason := taskDenyReason(a); reason != "" {
+		denyTask(w, reason)
+		return nil
+	}
+	return a
+}
+
 // accountByUID 取账号凭证；不存在时写 404 并返回 nil。
 func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -64,6 +107,13 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
+		return
+	}
+	if reason := taskDenyReason(a); reason != "" {
+		// 查询类：返回空列表 + 明确跳过原因（200），前端无需按错误处理。
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "skipped": true, "reason": reason, "tasks": []any{},
+		})
 		return
 	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
@@ -91,7 +141,7 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 // accountTaskAccept 接受任务（报名；幂等）。
 func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.eligibleTaskAccount(w, uid)
 	if a == nil {
 		return
 	}
@@ -118,7 +168,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 // 批量提交会分片（上游对 task_codes 数组长度无公开上限，保守每批 20 个）。
 func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.eligibleTaskAccount(w, uid)
 	if a == nil {
 		return
 	}
@@ -184,7 +234,7 @@ func (p *Panel) acceptMPPending(a *auth.Auth, uid string) (int, []string) {
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
 func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.eligibleTaskAccount(w, uid)
 	if a == nil {
 		return
 	}

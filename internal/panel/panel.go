@@ -70,6 +70,9 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+	// ProbeStateFile 面板主动探测（TTFT/成功失败历史）的状态文件（issue #110）。
+	// 与 ProbeFile 分离：不覆盖脚本生成的实测上限文件。空 = 探测可执行但不落盘。
+	ProbeStateFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -98,6 +101,12 @@ type Panel struct {
 
 	// authLimiter 鉴权失败按来源 IP 限速（issue #61）。
 	authLimiter *httpauth.Limiter
+
+	// 模型探测（modelhealth.go，issue #110）：单飞 + 全局并发名额 + 状态文件锁。
+	probeMu       sync.Mutex
+	probeInflight map[string]bool
+	probeSem      chan struct{}
+	probeStateMu  sync.Mutex
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -190,6 +199,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
+	p.mux.HandleFunc("POST /panel/api/blackcat_all", p.withAuth(p.blackcatAll))
+	p.mux.HandleFunc("POST /panel/api/streak_bonus_all", p.withAuth(p.streakBonusAll))
+	p.mux.HandleFunc("GET /panel/api/tasks/runs", p.withAuth(p.tasksRuns))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
@@ -201,6 +213,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAuth(p.keysDelete))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAuth(p.keysUpdateLimits))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	p.mux.HandleFunc("POST /panel/api/model_probes", p.withAuth(p.modelProbe))
+	p.mux.HandleFunc("GET /panel/api/model_health", p.withAuth(p.modelHealth))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
@@ -462,6 +476,10 @@ func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string
 	if mi.PromoNote != "" {
 		entry["promo_note"] = mi.PromoNote
 	}
+	if mods := mi.EffectiveInputModalities(); len(mods) > 0 {
+		// 输入模态（issue #109）：与 /v1/models 同口径，未知时省略（不宣称）。
+		entry["input_modalities"] = mods
+	}
 	if mi.MaxAllowedSize > 0 {
 		entry["max_allowed_size"] = mi.MaxAllowedSize
 	}
@@ -570,6 +588,29 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// runCheckin 执行单号签到并返回 (跳过原因, 是否已签, 说明文案)。
+// 跳过原因非空表示 global/企业版无 CN 签到体系（issue #108）：不发起上游调用。
+// 其余情况按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游
+// 非错误态，不标记已签、给出可区分文案（issue #27）；其余才是真失败。
+func (p *Panel) runCheckin(a *auth.Auth, uid string) (denyReason string, done bool, msg string) {
+	if denyReason = taskDenyReason(a); denyReason != "" {
+		return denyReason, false, denyReason
+	}
+	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+		switch upstream.ClassifyCheckin(err) {
+		case upstream.CheckinAlready:
+			p.cfg.Pool.NoteCheckinDone(uid)
+			return "", true, "今天已签到"
+		case upstream.CheckinInactive:
+			return "", false, "签到活动未开启（非失败）"
+		default:
+			return "", false, err.Error() // 业务错误照常查余额
+		}
+	}
+	p.cfg.Pool.NoteCheckinDone(uid)
+	return "", true, ""
+}
+
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
@@ -579,31 +620,18 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	checkinMsg := ""
-	checkinDone := false
-	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
-	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
-	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
-		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
-	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		// 按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游非错误态，
-		// 不标记已签、给出可区分文案（issue #27）；其余才是真失败。
-		switch upstream.ClassifyCheckin(err) {
-		case upstream.CheckinAlready:
-			p.cfg.Pool.NoteCheckinDone(uid)
-			checkinDone = true
-			checkinMsg = "今天已签到"
-		case upstream.CheckinInactive:
-			checkinMsg = "签到活动未开启（非失败）"
-		default:
-			checkinMsg = err.Error() // 业务错误照常查余额
-		}
-	} else {
-		p.cfg.Pool.NoteCheckinDone(uid)
-		checkinDone = true
-	}
+	// 账号体系门控（issue #108）：global 无 CN 签到体系，企业版无个人签到体系
+	// （上游 400 code 10001）。两者都不发起签到调用，端点退化为「刷新额度」
+	// ——额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
+	// 前端对这两类账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
+	// 前端仍可能调用）。
+	denyReason, checkinDone, checkinMsg := p.runCheckin(a, uid)
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	if denyReason != "" {
+		// 明确「跳过」而非「签到成功」：checkin_done 保持 false，reason 可读。
+		resp["skipped"] = true
+		resp["reason"] = denyReason
+	}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}
@@ -668,48 +696,62 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // 批量任务
 // ---------------------------------------------------------------------------
 
-// checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
-func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
+// startBatchTask 批量任务手动触发的统一入口（issue #112）：
+// 调度器与面板共用运行级守卫——同一任务族已在跑时返回 409，不并行第二轮。
+// 启动成功后立即返回 {ok,started,running}；本轮状态/结果经 /panel/api/tasks/runs 查询。
+func (p *Panel) startBatchTask(w http.ResponseWriter, task, label string) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	if !p.cfg.Scheduler.StartTask(task, scheduler.TriggerManual) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"ok": false, "started": false, "running": true, "task": task,
+			"error": label + "正在运行中，请等本轮结束",
+		})
+		return
+	}
+	log.Printf("panel: 手动全量%s已触发", label)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "task": task})
+}
+
+// checkinAll 手动触发全量签到（异步执行；含连登管家）。
+func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskCheckin, "签到")
 }
 
 // travelAll 手动触发全量猫猫旅行巡检（异步执行）。
 func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
-		writeErr(w, http.StatusNotImplemented, "scheduler not available")
-		return
-	}
-	go p.cfg.Scheduler.RunTravelNow()
-	log.Printf("panel: 手动全量旅行巡检已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	p.startBatchTask(w, scheduler.TaskTravel, "旅行巡检")
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
 func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
-		writeErr(w, http.StatusNotImplemented, "scheduler not available")
-		return
-	}
-	go p.cfg.Scheduler.RunActivityNow()
-	log.Printf("panel: 手动全量活跃上报已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	p.startBatchTask(w, scheduler.TaskActivity, "活跃上报")
 }
 
 // keepaliveAll 手动触发全量 token 保活（异步执行）。
 func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskKeepalive, "保活")
+}
+
+// blackcatAll 手动触发夜猫子补足（异步执行；窗口外由调度器跳过）。
+func (p *Panel) blackcatAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskBlackcat, "夜猫子")
+}
+
+// streakBonusAll 手动触发连登兑换 + 抽奖（异步执行）。
+func (p *Panel) streakBonusAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskStreak, "连登管家")
+}
+
+// tasksRuns 返回各批量任务族的当前/最近一轮运行状态（issue #112）。
+func (p *Panel) tasksRuns(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
-	log.Printf("panel: 手动全量保活已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": p.cfg.Scheduler.RunTaskStates()})
 }
 
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），

@@ -15,11 +15,16 @@ import {
   cacheRateTone,
   fmtTokTimeLabel,
   parsePointTime,
+  usDayHeatmap,
   usSortRows,
+  usTrendPoints,
   US_DIMS,
   type CreditDim,
   type DimKey,
+  type HeatDay,
+  type HeatMetric,
   type SeriesPoint,
+  type TrendMetric,
   type UsageData,
   type UsageRow,
   type UsSort,
@@ -40,6 +45,7 @@ import {
   Card,
   CardAction,
   CardContent,
+  CardDescription,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
@@ -61,6 +67,37 @@ const SORT_OPTIONS = [
   { value: 'errors', label: '失败数' },
   { value: 'latency', label: '平均延迟' },
 ] as const satisfies readonly SelectOption[];
+
+
+// 趋势指标（复用 /panel/api/usage 的 series，不新增上游请求）。
+const TREND_OPTIONS: readonly SelectOption[] = [
+  { value: 'tokens', label: 'Token' },
+  { value: 'requests', label: '请求数' },
+  { value: 'errors', label: '失败数' },
+  { value: 'ttft', label: '首字延迟 TTFT' },
+  { value: 'credits', label: '积分' },
+];
+
+// 热力图指标。
+const HEAT_OPTIONS: readonly SelectOption[] = [
+  { value: 'total_tokens', label: 'Token' },
+  { value: 'requests', label: '请求数' },
+  { value: 'credits', label: '积分' },
+];
+
+const HEAT_METRIC_LABEL: Record<HeatMetric, string> = {
+  total_tokens: 'Token',
+  requests: '请求数',
+  credits: '积分',
+};
+
+const TREND_METRIC_LABEL: Record<TrendMetric, string> = {
+  tokens: 'Token',
+  requests: '请求数',
+  errors: '失败数',
+  ttft: '首字延迟(ms)',
+  credits: '积分',
+};
 
 function usPct(part: unknown, total: unknown): string {
   const t = Number(total || 0);
@@ -115,6 +152,8 @@ export function UsageView() {
   const [dim, setDim] = useState<DimKey>('account');
   const [creditDim, setCreditDim] = useState<CreditDim>('account');
   const [sort, setSort] = useState<UsSort>('total');
+  const [heatMetric, setHeatMetric] = useState<HeatMetric>('total_tokens');
+  const [trendMetric, setTrendMetric] = useState<TrendMetric>('tokens');
   const [backfilling, setBackfilling] = useState(false);
 
   const rangeStr = trangeQuery(range, true).toString();
@@ -205,27 +244,77 @@ export function UsageView() {
               <Kpi value={fmtTok(ct)} label="completion" tone="ok" sub={'占比 ' + usPct(ct, total)} />
               <Kpi value={String(errs)} label="失败尝试" tone={errs ? 'warn' : 'mute'} sub={okRate == null ? '—' : errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%'} />
               <Kpi value={fmtMs(t.avg_latency_ms)} label="平均延迟" sub={t.avg_tokens_per_second ? '吐字 ' + usageRate(t.avg_tokens_per_second) : '无速率样本'} />
+              <Kpi
+                value={t.avg_ttft_ms ? fmtMs(t.avg_ttft_ms) : '—'}
+                label="首字延迟"
+                tone={t.avg_ttft_ms ? 'accent' : 'mute'}
+                sub={t.avg_ttft_ms ? 'TTFT 均值（流式样本）' : '无 TTFT 样本'}
+              />
             </Kpis>
 
             <CardContent className="pt-3.5">
               <div className="overflow-hidden rounded-lg border border-border/60 bg-secondary">
                 <div className="flex flex-wrap items-center gap-2.5 border-b border-border/60 px-3.5 py-2.5 text-xs">
-                  <span className="font-semibold text-muted-foreground">Token 时序</span>
+                  <span className="font-semibold text-muted-foreground">用量趋势</span>
+                  <Select
+                    items={selectOptionItems(TREND_OPTIONS)}
+                    value={trendMetric}
+                    onValueChange={(v) => setTrendMetric((v as TrendMetric) || 'tokens')}>
+                    <SelectTrigger size="sm" aria-label="趋势指标">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectOptions options={TREND_OPTIONS} />
+                    </SelectContent>
+                  </Select>
                   <span className="flex-1" />
                   <span className="flex items-center gap-1.5 text-2xs text-muted-foreground">
-                    <Legend color="var(--primary)">prompt</Legend>
-                    <Legend color="var(--success)">completion</Legend>
-                    <span className="mx-1 h-3 w-px bg-border" />
-                    <Legend color="var(--warning)">均值</Legend>
+                    {trendMetric === 'tokens' ? (
+                      <>
+                        <Legend color="var(--primary)">prompt</Legend>
+                        <Legend color="var(--success)">completion</Legend>
+                        <span className="mx-1 h-3 w-px bg-border" />
+                        <Legend color="var(--warning)">均值</Legend>
+                      </>
+                    ) : (
+                      <Legend color="var(--primary)">{TREND_OPTIONS.find((o) => o.value === trendMetric)?.label}</Legend>
+                    )}
                   </span>
                 </div>
                 <div className="px-2.5 pb-1 pt-2">
-                  <UsageChart series={data?.series || []} />
+                  {trendMetric === 'tokens' ? (
+                    <UsageChart series={data?.series || []} />
+                  ) : (
+                    <TrendChart points={usTrendPoints(data?.series || [], trendMetric)} metric={trendMetric} />
+                  )}
                 </div>
               </div>
             </CardContent>
           </>
         )}
+      </Card>
+
+      <Card className="mb-5">
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>日历热力图</CardTitle>
+          <CardDescription className="ml-1.5">按日聚合，仅统计当前查询范围；空白天 = 当日无数据</CardDescription>
+          <CardAction>
+            <Select
+              items={selectOptionItems(HEAT_OPTIONS)}
+              value={heatMetric}
+              onValueChange={(v) => setHeatMetric((v as HeatMetric) || 'total_tokens')}>
+              <SelectTrigger size="sm" aria-label="热力图指标">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectOptions options={HEAT_OPTIONS} />
+              </SelectContent>
+            </Select>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          <Heatmap days={usDayHeatmap(data?.series || [], heatMetric)} metric={heatMetric} />
+        </CardContent>
       </Card>
 
       <Card className="mb-5">
@@ -580,6 +669,154 @@ function UsageChart({ series }: { series: SeriesPoint[] }) {
       </svg>
       <div className="pb-1 text-2xs text-muted-foreground">
         {model.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + fmtTokTimeLabel({ t: peak.raw, scope: peak.scope }) + ' · 均值 ' + fmtTok(avg)}
+      </div>
+    </>
+  );
+}
+
+// ── 日历热力图（issue #111）───────────────────────────────────────────
+// 日键来自服务端日桶（服务端本地日），前端不再按浏览器时区重算。value 缺省 =
+// 当日无数据；0 是真实值（例如有请求但无积分），两者视觉与 tooltip 区分。
+function heatLevel(value: number | undefined, max: number): number {
+  if (value === undefined) return -1;
+  if (!(max > 0)) return 0;
+  return Math.min(4, Math.floor((value / max) * 5));
+}
+
+function Heatmap({ days, metric }: { days: HeatDay[]; metric: HeatMetric }) {
+  if (!days.length) {
+    return (
+      <div className="py-6 text-center text-xs text-muted-foreground">
+        当前查询范围内没有按日数据（自定义范围可能不足一天）。
+      </div>
+    );
+  }
+  const max = days.reduce((m, d) => Math.max(m, d.value ?? 0), 0);
+  const firstWeekday = new Date(days[0]!.date + 'T00:00:00Z').getUTCDay(); // 0=周日
+  const cells: (HeatDay | undefined)[] = [];
+  for (let i = 0; i < firstWeekday; i++) cells.push(undefined);
+  cells.push(...days);
+  while (cells.length % 7 !== 0) cells.push(undefined);
+  const weeks: (HeatDay | undefined)[][] = [];
+  for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+
+  return (
+    <div className="overflow-x-auto">
+      <div className="inline-flex items-start gap-[3px]">
+        {weeks.map((week, wi) => (
+          <div key={wi} className="flex flex-col gap-[3px]">
+            {week.map((day, di) => {
+              if (!day) return <span key={di} className="h-2.5 w-2.5" />;
+              const level = heatLevel(day.value, max);
+              const title =
+                day.date +
+                ' · ' +
+                (day.value === undefined
+                  ? '无数据'
+                  : HEAT_METRIC_LABEL[metric] + ' ' + (metric === 'credits' ? fmtCredit(day.value) : fmtTok(day.value)));
+              return (
+                <span
+                  key={di}
+                  title={title}
+                  className={
+                    'h-2.5 w-2.5 rounded-[2px] ' +
+                    (level < 0
+                      ? 'border border-dashed border-border/70'
+                      : level === 0
+                        ? 'bg-primary/10'
+                        : level === 1
+                          ? 'bg-primary/25'
+                          : level === 2
+                            ? 'bg-primary/45'
+                            : level === 3
+                              ? 'bg-primary/70'
+                              : 'bg-primary')
+                  }
+                />
+              );
+            })}
+          </div>
+        ))}
+      </div>
+      <div className="mt-2 flex items-center gap-2 text-2xs text-muted-foreground">
+        <span>{days[0]!.date}</span>
+        <span className="flex-1" />
+        <span>无数据</span>
+        <span className="h-2.5 w-2.5 rounded-[2px] border border-dashed border-border/70" />
+        <span>低</span>
+        <span className="h-2.5 w-2.5 rounded-[2px] bg-primary/25" />
+        <span className="h-2.5 w-2.5 rounded-[2px] bg-primary/45" />
+        <span className="h-2.5 w-2.5 rounded-[2px] bg-primary/70" />
+        <span className="h-2.5 w-2.5 rounded-[2px] bg-primary" />
+        <span>高</span>
+      </div>
+    </div>
+  );
+}
+
+// ── 单指标趋势图（issue #111）─────────────────────────────────────────
+function TrendChart({ points, metric }: { points: ReturnType<typeof usTrendPoints>; metric: TrendMetric }) {
+  if (!points.length) {
+    return <div className="py-8 text-center text-xs text-muted-foreground">所选指标在当前范围内没有数据。</div>;
+  }
+  const W = 1200;
+  const H = 200;
+  const PL = 58;
+  const PR = 14;
+  const PT = 18;
+  const PB = 30;
+  const iw = W - PL - PR;
+  const ih = H - PT - PB;
+  const t0 = points[0]!.t;
+  const t1 = points[points.length - 1]!.t;
+  const span = Math.max(1, t1 - t0);
+  const max = Math.max(1, ...points.map((p) => p.value));
+  const xOf = (t: number) => PL + ((t - t0) / span) * iw;
+  const yOf = (v: number) => PT + ih - ih * (v / max);
+  const line = points.map((p, i) => (i ? 'L' : 'M') + xOf(p.t).toFixed(1) + ' ' + yOf(p.value).toFixed(1)).join(' ');
+  const area =
+    'M' + xOf(points[0]!.t).toFixed(1) + ' ' + (PT + ih) + ' ' +
+    points.map((p) => 'L' + xOf(p.t).toFixed(1) + ' ' + yOf(p.value).toFixed(1)).join(' ') +
+    ' L' + xOf(points[points.length - 1]!.t).toFixed(1) + ' ' + (PT + ih) + ' Z';
+  const ticks = Math.min(6, points.length);
+  const fmtVal = (v: number) => (metric === 'credits' ? fmtCredit(v) : metric === 'ttft' ? fmtMs(v) : fmtTok(v));
+  return (
+    <>
+      <svg viewBox={`0 0 ${W} ${H}`} role="img" preserveAspectRatio="xMidYMid meet" className="block h-auto w-full">
+        {[0, 0.5, 1].map((f) => (
+          <g key={f}>
+            <line
+              x1={PL}
+              x2={W - PR}
+              y1={PT + ih * f}
+              y2={PT + ih * f}
+              stroke="var(--border)"
+              strokeDasharray={f === 1 ? undefined : '3 3'}
+            />
+            <text x={PL - 6} y={PT + ih * f + 3} textAnchor="end" className="fill-muted-foreground text-[10px]">
+              {fmtVal(max * (1 - f))}
+            </text>
+          </g>
+        ))}
+        <path d={area} fill="var(--primary)" opacity={0.12} />
+        <path d={line} fill="none" stroke="var(--primary)" strokeWidth={1.6} />
+        {points.map((p, i) => (
+          <circle key={i} cx={xOf(p.t)} cy={yOf(p.value)} r={1.8} fill="var(--primary)">
+            <title>{p.label + ' · ' + fmtVal(p.value)}</title>
+          </circle>
+        ))}
+        {Array.from({ length: ticks }).map((_, k) => {
+          const idx = Math.round((k / Math.max(1, ticks - 1)) * (points.length - 1));
+          const p = points[idx]!;
+          return (
+            <text key={k} x={xOf(p.t)} y={H - 10} textAnchor="middle" className="fill-muted-foreground text-[10px]">
+              {p.label}
+            </text>
+          );
+        })}
+      </svg>
+      <div className="mt-1 text-2xs text-muted-foreground">
+        {points.length + ' 个点 · 峰值 ' + fmtVal(Math.max(...points.map((p) => p.value))) + ' · 指标 ' + TREND_METRIC_LABEL[metric]}
       </div>
     </>
   );

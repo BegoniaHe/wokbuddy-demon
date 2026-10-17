@@ -170,6 +170,7 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		MultimodalRouting:    cfg.Features.MultimodalRouting,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -217,8 +218,9 @@ func main() {
 		Live:        live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
-		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
-		ConfigPath: *cfgPath,
+		ProbeFile:      stateSibling(cfg.StateFile, "output_probes.json"),
+		ProbeStateFile: stateSibling(cfg.StateFile, "model_probes.json"),
+		ConfigPath:     *cfgPath,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -573,6 +575,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
+		MultimodalRouting:    newCfg.Features.MultimodalRouting,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

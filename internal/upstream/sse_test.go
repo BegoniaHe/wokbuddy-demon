@@ -612,15 +612,21 @@ func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
 }
 
 func TestStreamDoneFallback(t *testing.T) {
-	// 上游流在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
+	// 上游流在无 [DONE] 时 EOF：Stream 仍必须兜底写一个 [DONE] 让客户端收尾，
+	// 但同时返回 errTruncatedStream——截断的 content 不是完整回答，请求结果必须是
+	// 失败（issue #105）。
 	rec := httptest.NewRecorder()
 	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
-	if err != nil {
-		t.Fatal(err)
+	if !IsTruncatedStreamError(err) {
+		t.Fatalf("err=%v want truncated stream", err)
 	}
 	body := rec.Body.String()
 	if !strings.HasSuffix(strings.TrimRight(body, "\n"), "data: [DONE]") {
 		t.Errorf("missing [DONE] fallback: %q", body)
+	}
+	// 有效帧照常透传：客户端拿到的已写内容不被撤回。
+	if !strings.Contains(body, "hi") {
+		t.Errorf("valid frame missing: %q", body)
 	}
 
 	// 已有 [DONE] 时只写一次，不重复
@@ -808,14 +814,15 @@ func TestStreamGarbageAfterDone(t *testing.T) {
 }
 
 // TestStreamNormalPassthroughRegression 校验正常透传回归：帧被 normalize 后透传、
-// 末尾恰好一个 [DONE]、无 error 帧；上游漏发 DONE 时自动补。
+// 末尾恰好一个 [DONE]、无 error 帧。
+// 「漏发 DONE」不再是正常回归用例（issue #105：截断必须报错），单独由
+// TestStreamTruncatedNoDone 覆盖。
 func TestStreamNormalPassthroughRegression(t *testing.T) {
 	cases := []struct {
 		name string
 		raw  string
 	}{
 		{"带 DONE 的正常流", sseFixture},
-		{"漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -1410,3 +1417,133 @@ func (w *keepaliveFailWriter) Header() http.Header       { return http.Header{} 
 func (w *keepaliveFailWriter) Write([]byte) (int, error) { return 0, errors.New("client gone") }
 func (w *keepaliveFailWriter) WriteHeader(int)           {}
 func (w *keepaliveFailWriter) Flush()                    {}
+
+// TestStreamTruncatedNoDone 上游未发 [DONE] 就 EOF（截断）：仍向客户端补一个
+// [DONE] 收尾、已写帧不撤回，同时写一帧 error（客户端无法区分半截回答与正常完成），
+// 并返回 errTruncatedStream（issue #105）——请求结果必须是失败。
+func TestStreamTruncatedNoDone(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw))
+	if !IsTruncatedStreamError(err) {
+		t.Fatalf("err=%v want truncated stream", err)
+	}
+	body := rec.Body.String()
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1 (客户端仍需收尾): %q", n, body)
+	}
+	if !strings.Contains(body, "hello") || !strings.Contains(body, "world") {
+		t.Errorf("已写帧被撤回: %q", body)
+	}
+	if !strings.Contains(body, "upstream stream truncated before [DONE]") || !strings.Contains(body, `"code":"upstream_parse"`) {
+		t.Errorf("截断必须带 error 帧，客户端不能读成正常完成: %q", body)
+	}
+	if IsEmptyStreamError(err) {
+		t.Errorf("截断不是空流，不得复用空流哨兵")
+	}
+}
+
+// TestStreamTruncatedNoFramesIsEmptyStream 0 有效帧且无 [DONE]：空流语义优先
+// （errEmptyStream），不与截断混淆——空流的 error 兜底帧照写。
+func TestStreamTruncatedNoFramesIsEmptyStream(t *testing.T) {
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"))
+	if err != nil {
+		t.Fatalf("带 [DONE] 的正常流不得报错: %v", err)
+	}
+	rec2 := httptest.NewRecorder()
+	err2 := Stream(rec2, strings.NewReader(": only comment\n\n"))
+	if !IsEmptyStreamError(err2) || IsTruncatedStreamError(err2) {
+		t.Fatalf("err=%v want empty stream only", err2)
+	}
+	assertEmptyStreamErrorFrame(t, rec2.Body.String())
+}
+
+// TestStreamReadErrorPropagates 流中读错误（非 EOF）必须原样上抛，不与客户端
+// 写失败、空流、截断混淆（issue #105：handler 按来源分别处置账号）。
+func TestStreamReadErrorPropagates(t *testing.T) {
+	boom := errors.New("connection reset by peer")
+	rec := httptest.NewRecorder()
+	err := Stream(rec, io.MultiReader(
+		strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"),
+		errReader{err: boom},
+	))
+	if !errors.Is(err, boom) {
+		t.Fatalf("err=%v want read error %v", err, boom)
+	}
+	if IsTruncatedStreamError(err) || IsEmptyStreamError(err) {
+		t.Errorf("读错误不得被归并为截断/空流: %v", err)
+	}
+	if IsClientWriteError(err) {
+		t.Errorf("上游读错误不得被误判为客户端写失败: %v", err)
+	}
+}
+
+// errReader 永远返回给定错误的 io.Reader。
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestStreamClientWriteFailurePropagates 客户端写失败（下游断开）原样上抛，
+// 不得伪装成上游截断/空流——客户端已走与上游缺陷的账号处置完全不同。
+func TestStreamClientWriteFailurePropagates(t *testing.T) {
+	w := &failingWriter{err: errors.New("client gone")}
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+	err := StreamHint(w, strings.NewReader(raw), nil)
+	if err == nil || !strings.Contains(err.Error(), "client gone") {
+		t.Fatalf("err=%v want client write failure", err)
+	}
+	if IsTruncatedStreamError(err) || IsEmptyStreamError(err) {
+		t.Errorf("客户端写失败不得归并为上游失败: %v", err)
+	}
+	if !IsClientWriteError(err) {
+		t.Errorf("客户端写失败必须可被 IsClientWriteError 识别: %v", err)
+	}
+}
+
+// failingWriter 写操作恒失败的 http.ResponseWriter（模拟客户端断开）。
+type failingWriter struct{ err error }
+
+func (w *failingWriter) Header() http.Header       { return http.Header{} }
+func (w *failingWriter) Write([]byte) (int, error) { return 0, w.err }
+func (w *failingWriter) WriteHeader(int)           {}
+
+// TestAggregateTruncatedNoDone 非流式聚合：EOF 收尾但无 [DONE] 必须报
+// errTruncatedStream，绝不把截断的 content 当完整回答返回（issue #105）。
+func TestAggregateTruncatedNoDone(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"half ans\"}}]}\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if !IsTruncatedStreamError(err) {
+		t.Fatalf("err=%v want truncated stream (resp=%v)", err, resp)
+	}
+	if resp != nil {
+		t.Errorf("截断流不得返回响应体: %v", resp)
+	}
+}
+
+// TestAggregateDoneThenEOF 正常流（有 [DONE]）不受截断语义影响：回归护栏。
+func TestAggregateDoneThenEOF(t *testing.T) {
+	raw := "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"full\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "full" {
+		t.Errorf("content=%q want full", msg["content"])
+	}
+}
+
+// TestAggregateReadErrorPropagates 非流式读错误原样上抛（不伪装成截断）。
+func TestAggregateReadErrorPropagates(t *testing.T) {
+	boom := errors.New("read tcp: connection reset")
+	_, err := Aggregate(io.MultiReader(
+		strings.NewReader("data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n"),
+		errReader{err: boom},
+	))
+	if !errors.Is(err, boom) {
+		t.Fatalf("err=%v want read error", err)
+	}
+}

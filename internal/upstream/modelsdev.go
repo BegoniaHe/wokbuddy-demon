@@ -96,6 +96,9 @@ type modelsDevFetcher struct {
 	// doc 文档解析后的裸 id 索引（多 provider 同名合并采值：vendor 优先/众数）。
 	// nil = 未拉取；空 map（非 nil）= 拉取过但索引为空（视作失败冷却）。
 	doc map[string]modelsDevEntry
+	// modalities 文档里的输入模态索引（issue #109）：裸 id → modalities.input。
+	// 与 doc 同一次拉取写入；vendor 官方源优先，否则取 provider 字典序最小（确定性）。
+	modalities map[string][]string
 
 	lastFetch time.Time // 最近一次拉取尝试（成功与失败都算，冷却节流）
 	fetched   bool      // 是否已拉取过（doc 字段区分成败）
@@ -110,6 +113,7 @@ var modelsDev = &modelsDevFetcher{}
 func resetModelsDev() {
 	modelsDev.mu.Lock()
 	modelsDev.doc = nil
+	modelsDev.modalities = nil
 	modelsDev.fetched = false
 	modelsDev.lastFetch = time.Time{}
 	modelsDev.negatives = nil
@@ -259,8 +263,15 @@ func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 		log.Printf("WARN: [upstream] models.dev parse failed (silent fallback to 1M): %v", err)
 		return
 	}
+	mods, err := parseModelsDevModalities(raw)
+	if err != nil {
+		// 模态索引是能力声明的兜底：解析失败不拖累 context 索引，静默降级。
+		log.Printf("WARN: [upstream] models.dev modalities parse failed (capabilities omitted): %v", err)
+		mods = nil
+	}
 	f.mu.Lock()
 	f.doc = doc
+	f.modalities = mods
 	f.mu.Unlock()
 	// 文档就绪后把「曾 miss 过的模型」回流 model.json（第 4 级 → 第 3 级，
 	// 下次 /v1/models 直接命中缓存）。仍查不到的保持负缓存。
@@ -385,4 +396,81 @@ func candidateBetter(c, cur modelsDevCandidate) bool {
 		return c.votes > cur.votes
 	}
 	return c.minProvider < cur.minProvider
+}
+
+// parseModelsDevModalities 解析 models.dev 文档的 modalities.input（issue #109）。
+//
+// 与 limit 的采值优先级一致：vendor 官方源（modelsDevVendorSources）优先；否则取
+// provider 字典序最小者（确定性 tie-break，避免 map 迭代序导致同 binary 两次拉取
+// 宣称不同模态）。只保留非空输入模态；值原样交给上游 normalizeModalities 过滤。
+func parseModelsDevModalities(raw []byte) (map[string][]string, error) {
+	var doc map[string]struct {
+		Models map[string]struct {
+			Modalities *struct {
+				Input []string `json:"input"`
+			} `json:"modalities"`
+		} `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("models.dev doc: %w", err)
+	}
+	best := map[string]modelsDevModalityPick{}
+	for provider, pv := range doc {
+		for fullID, mv := range pv.Models {
+			if mv.Modalities == nil || len(mv.Modalities.Input) == 0 {
+				continue
+			}
+			id := bareModelID(fullID)
+			if id == "" {
+				continue
+			}
+			cur, seen := best[id]
+			if seen && !modalityPickBeats(provider, cur) {
+				continue
+			}
+			best[id] = modelsDevModalityPick{mods: mv.Modalities.Input, vendor: modelsDevVendorSources[provider], provider: provider}
+		}
+	}
+	out := make(map[string][]string, len(best))
+	for id, p := range best {
+		out[id] = p.mods
+	}
+	return out, nil
+}
+
+// modelsDevModalityPick 同名模型的模态候选：vendor 官方源优先，否则 provider
+// 字典序最小者胜（确定性）。
+type modelsDevModalityPick struct {
+	mods     []string
+	vendor   bool
+	provider string
+}
+
+// modalityPickBeats 报告 provider 的候选是否应替换当前候选。
+func modalityPickBeats(provider string, cur modelsDevModalityPick) bool {
+	vendor := modelsDevVendorSources[provider]
+	switch {
+	case cur.vendor && !vendor:
+		return false // 已选官方源：非官方不覆盖
+	case vendor && !cur.vendor:
+		return true // 官方源覆盖非官方
+	default:
+		return provider < cur.provider // 同优先级取字典序更小者
+	}
+}
+
+// lookupModelsDevModalities 查 models.dev 已加载索引里的输入模态。只读内存索引、
+// **不触发网络拉取**（聊天热路径不能为能力判定等 5s 网络）；文档尚未加载 →
+// ok=false，调用方回落到 supports_images 推导。
+func lookupModelsDevModalities(model string) ([]string, bool) {
+	modelsDev.mu.Lock()
+	defer modelsDev.mu.Unlock()
+	if modelsDev.modalities == nil {
+		return nil, false
+	}
+	mods, ok := modelsDev.modalities[model]
+	if !ok || len(mods) == 0 {
+		return nil, false
+	}
+	return mods, true
 }

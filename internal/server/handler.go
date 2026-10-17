@@ -83,6 +83,10 @@ type Config struct {
 	// Notifier webhook 告警出口（可选；nil = 关闭）。发送失败不影响主路径。
 	Notifier notify.Sender
 
+	// MultimodalRouting 静态回落值（Live 为 nil 时使用）：请求模态与模型能力
+	// 不匹配时在同 realm 目录里改选支持该模态的模型（features.multimodal_routing）。
+	MultimodalRouting bool
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -129,9 +133,10 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
-		SoftCooldown:     h.cfg.SoftCooldown,
-		RecordClientInfo: h.cfg.RecordClientInfo,
+		APIKey:            h.cfg.APIKey,
+		SoftCooldown:      h.cfg.SoftCooldown,
+		RecordClientInfo:  h.cfg.RecordClientInfo,
+		MultimodalRouting: h.cfg.MultimodalRouting,
 	}
 }
 
@@ -466,8 +471,15 @@ func modelDescription(credits, description string) string {
 
 // applyModelInfoCapabilities 合入能力旗标 / 尺寸上限 / 推理档位字段（空值省略）。
 func applyModelInfoCapabilities(entry map[string]any, mi upstream.ModelInfo) {
-	if mi.SupportsImages {
-		entry["supports_images"] = true // 多模态能力透出
+	mods := mi.EffectiveInputModalities()
+	// 兼容字段与 input_modalities 同源：image 能力也可能来自 models.dev 推导。
+	if containsModality(mods, upstream.ModalityImage) {
+		entry["supports_images"] = true
+	}
+	// 输入模态（issue #109）：已知才宣称（未知 = 省略），normalize 后至少含 text/image
+	// 之类的确定值；supports_images 保留作为兼容字段。
+	if len(mods) > 0 {
+		entry["input_modalities"] = mods
 	}
 	if mi.SupportsReasoning {
 		entry["supports_reasoning"] = true
@@ -722,6 +734,9 @@ type chatFlow struct {
 	modelRate     string
 	declaredTools map[string]bool
 	reqHasImage   bool
+	// reqModalities 请求携带的非文本输入模态（issue #109，改写前取一次，
+	// 供 gateway_hint 与能力判定/路由共用，避免重复解析请求体）。
+	reqModalities []string
 
 	// 统计与追踪
 	st       *chatStat
@@ -783,6 +798,10 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 	defer f.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
 	defer f.recordKeyUsage()
+	// 模态能力判定/路由（issue #109）：在选号前完成，不匹配时写 400 并终止。
+	if !f.applyModalityRoute() {
+		return
+	}
 	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
 	if f.runRotation(r.Context()) {
 		return
@@ -811,6 +830,8 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = in.trace.clientIP, in.trace.userAgent
 	}
+	// 请求模态在改写前解析一次（gateway_hint + 能力判定/路由共用）。
+	reqMods := requestModalities(in.body)
 	f := &chatFlow{
 		h: h, out: out, clientIP: in.clientIP,
 		body:     in.body,
@@ -822,15 +843,16 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
 		declaredTools: upstream.ToolNameAllowlist(in.body),
-		// gateway_hint 判定所需的请求形态（image_url part）：在改写前取。
-		reqHasImage: hasImagePart(in.body),
-		bareModel:   bareModel,
-		modelRate:   modelRate,
-		st:          st,
-		keyUsage:    in.keyUsage,
-		tried:       map[string]bool{},
-		convReqID:   in.convReqID,
-		traceID:     in.traceID,
+		// gateway_hint 判定与模态能力判定所需的请求形态（多模态 part）：在改写前取。
+		reqHasImage:   containsModality(reqMods, upstream.ModalityImage),
+		reqModalities: reqMods,
+		bareModel:     bareModel,
+		modelRate:     modelRate,
+		st:            st,
+		keyUsage:      in.keyUsage,
+		tried:         map[string]bool{},
+		convReqID:     in.convReqID,
+		traceID:       in.traceID,
 	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，
@@ -1150,9 +1172,9 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 	// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 	// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核）。
 	if f.stream {
-		return f.handleStreamSuccess(acct, rc, attemptStarted)
+		return f.handleStreamSuccess(ctx, acct, rc, attemptStarted)
 	}
-	return f.handleNonStreamSuccess(acct, rc, attemptStarted)
+	return f.handleNonStreamSuccess(ctx, acct, rc, attemptStarted, i)
 }
 
 // handleTransportError 处置传输层错误（terr 非 nil 且非 *upstream.Error 信封）。
@@ -1305,7 +1327,7 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 }
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
-func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
 	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
 	f.h.streams.enter()
 	defer f.h.streams.leave()
@@ -1325,10 +1347,16 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 	case upstream.IsEmptyStreamError(sErr):
 		// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE] 兜底（HTTP 头
 		// 已发出只能 200），但这是上游缺陷不是成功——观测收敛到 502，与非流式空流
-		// →502 upstream_parse 同语义。只认 IsEmptyStreamError：客户端断连的写失败不误标。
-		f.st.status = http.StatusBadGateway
-		f.st.outcome = reqlog.OutcomeStreamError
-		log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), f.bareModel)
+		// →502 upstream_parse 同语义。只认哨兵错误：客户端断连的写失败不误标。
+		f.failStreamUpstream(acct, "empty upstream stream (200+0 frames)")
+	case upstream.IsTruncatedStreamError(sErr):
+		// 上游未发 [DONE] 就以 EOF 收尾（issue #105）：StreamHint 已向客户端补一个
+		// [DONE] 兜底收尾，但截断的 content 不是完整回答——按上游失败处置账号。
+		f.failStreamUpstream(acct, "upstream stream truncated (EOF without [DONE])")
+	case errors.Is(sErr, upstream.ErrSSELineTooLong):
+		// 上游单行超过大小上限（issue #113）：StreamHint 已写 error 帧 + [DONE] 收尾。
+		// 防御上限命中 = 上游/代理异常，按上游失败处置——绝不按客户端断连记成功。
+		f.failStreamUpstream(acct, sErr.Error())
 	case errFrame != "":
 		// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并处置账号
 		// ——**不记成功、不清 11102 负缓存、不绑粘性**。
@@ -1338,11 +1366,17 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 		f.st.outcome = reqlog.OutcomeStreamError
 		log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, kind, logfmt.Truncate(errFrame, 200))
-	case sErr != nil:
-		// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功（与 default
-		// 同语义），请求日志归为 Interrupted（人已走，未完成）。
+	case sErr != nil && (upstream.IsClientWriteError(sErr) || ctx.Err() != nil):
+		// 客户端写失败（断连 / 写超时）或请求 ctx 已取消：上游帧无恙，账号健康
+		// ——账号侧照常记成功（与 default 同语义），请求日志归为 Interrupted
+		// （人已走，未完成）。ctx 取消可能是客户端断开导致的上游读中断，不能
+		// 误判成上游失败（issue #105 non-goal）。
 		f.st.outcome = reqlog.OutcomeInterrupted
 		f.noteSuccessAndBind(acct)
+	case sErr != nil:
+		// 上游读错误（连接重置 / idle 超时等，issue #105）：账号不记成功、不绑粘性。
+		// 写路径失败已在 writeAll 包 errClientWrite，不会落到这里。
+		f.failStreamUpstream(acct, "upstream stream read error: "+sErr.Error())
 	default:
 		// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 		f.st.outcome = reqlog.OutcomeSuccess
@@ -1351,6 +1385,18 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 	f.finishStreamStats(acct, stats, repair, attemptStarted)
 	rc.Close()
 	return rotDone
+}
+
+// failStreamUpstream 处置流式路径的上游失败（空流 / 截断，issue #105）：
+// HTTP 头已发出只能 200，但观测收敛到 502 upstream_parse 同语义；账号**不记成功、
+// 不绑粘性**。已向客户端写出过帧（截断流的常态）无法换号重试，此时至少解绑粘性，
+// 下次请求重新分配，不把会话钉在坏号上。
+func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
+	f.st.status = http.StatusBadGateway
+	f.st.outcome = reqlog.OutcomeStreamError
+	f.unbindSticky()
+	log.Printf("WARN: [server] stream acct=%s model=%s: %s (account not marked success)",
+		logfmt.Label(acct.UID, acct.Nickname), f.bareModel, reason)
 }
 
 // noteSuccessAndBind 记录账号成功、清 11102 负缓存，并让会话粘性跟随最终成功号。
@@ -1400,16 +1446,27 @@ func (f *chatFlow) finishStreamStats(acct *auth.Auth, stats *chatStatsReader, re
 }
 
 // handleNonStreamSuccess 非流式收尾：聚合 SSE、修复标记工具调用、记录用量并写响应。
-func (f *chatFlow) handleNonStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+// 聚合失败（空流 / EOF 截断，issue #105）时客户端尚未收到任何字节，换号重试。
+func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int) rotationAction {
 	resp, err := upstream.Aggregate(rc)
 	rc.Close()
 	if err != nil {
 		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
-		// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
-		f.out.Error(http.StatusBadGateway, "upstream_parse", err.Error(), "")
+		// 上游流解析失败（空流 / EOF 截断，issue #105）：截断的 content 不是完整
+		// 回答，绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试
+		// （空流/截断是上游缺陷，换个号大概率能拿到完整流）；轮转耗尽才回 502。
+		// fail：释放本次在途租约（否则下一轮 heldUID 被覆盖后该账号名额永不归还）
+		// + 失败号正是粘性号时解绑。
+		f.fail(acct.UID)
 		f.st.status = http.StatusBadGateway
-		f.st.outcome = reqlog.OutcomeHTTPError
-		return rotDone
+		f.lastErr = fmt.Errorf("upstream_parse: %w", err)
+		log.Printf("WARN: [server] non-stream acct=%s model=%s: %v (rotating)",
+			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, err)
+		if !rotateBackoff(ctx, i) {
+			return rotBreak
+		}
+		f.rotateReason = "parse"
+		return rotContinue
 	}
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
 	// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
@@ -1682,6 +1739,32 @@ func futureOrZero(t, now time.Time) time.Time {
 	return time.Time{}
 }
 
+// localErrorEnvelope 识别「本地分类」的轮转终止错误并给出专属信封（ok=true）：
+//   - errUpstreamTimeout：轮转已在传输层分支止损（见 isUpstreamTimeout），文案必须
+//     与 no_healthy_account 区分——两者的排查方向完全不同（前者是上游慢，后者是号全挂）。
+//   - 上游流截断/空流且所有号都如此（issue #105）：502 + upstream_parse，与「解析失败」
+//     同口径——客户端别把「上游坏了」读成「号全挂了」而盲目重试。
+func localErrorEnvelope(err error, fallbackStatus int, fallbackCode, fallbackMsg string) (status int, code, msg string, ok bool) {
+	switch {
+	case errors.Is(err, errUpstreamTimeout):
+		return fallbackStatus, "upstream_timeout",
+			"upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later",
+			true
+	case upstream.IsTruncatedStreamError(err), upstream.IsEmptyStreamError(err):
+		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	case errors.Is(err, upstream.ErrSSELineTooLong):
+		// 上游单行超过防御上限（issue #113）：同样 502 upstream_parse。轮转耗尽
+		// 意味着每个号都吐超大行——上游/代理异常，客户端重试同一请求无意义。
+		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	case errors.Is(err, upstream.ErrSSEAggregateTooLong):
+		// 非流式聚合总量超限（issue #113）：同 502 upstream_parse，不落回
+		// no_healthy_account（那会把「上游吐了超大响应」表述成「号全挂了」）。
+		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	default:
+		return fallbackStatus, fallbackCode, fallbackMsg, false
+	}
+}
+
 // finalErrorEnvelope 由 lastErr 推导末端错误透传的状态码 / code / message / hint。
 // 上游返回（*upstream.Error）→ error.message 装**上游 body 原文**（code/msg/requestId
 // 原样保留）。HTTP 状态码按 OpenAI 兼容口径映射类别：ErrSoftRate → 429（限流语义、
@@ -1690,15 +1773,14 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 	status = http.StatusServiceUnavailable
 	code = "no_healthy_account"
 	msg = "all accounts are temporarily unavailable, please retry later"
-	// 上游超时：轮转已在传输层分支止损（见 isUpstreamTimeout），这里给一条**能区分**
-	// 的文案，别混进"没有可用账号"——两者的排查方向完全不同。
-	if errors.Is(f.lastErr, errUpstreamTimeout) {
-		code = "upstream_timeout"
-		msg = "upstream timed out: rotation stopped (another account would hit the same slow upstream), please retry later"
-	}
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint = upstream.NoHealthyAccountHint()
+	if s2, c2, m2, ok := localErrorEnvelope(f.lastErr, status, code, msg); ok {
+		// 本地分类错误（超时 / 截断 / 空流 / 大小超限）：属于上游或传输层异常，
+		// 不是号池调度失败，不透出 no_healthy_account hint（排查方向完全不同）。
+		return s2, c2, m2, "", false
+	}
 	var ue *upstream.Error
 	if !errors.As(f.lastErr, &ue) {
 		return status, code, msg, hint, false
@@ -2060,30 +2142,6 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 	})
 }
 
-// hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态
-// messages[].content[] {type:"image_url"}）。畸形/其他形态一律 false（hint 侧
-// 宁缺勿滥：判不出带图就不给「模型不支持图片」指向）。
-func hasImagePart(body []byte) bool {
-	var peek struct {
-		Messages []struct {
-			Content []struct {
-				Type string `json:"type"`
-			} `json:"content"`
-		} `json:"messages"`
-	}
-	if json.Unmarshal(body, &peek) != nil {
-		return false
-	}
-	for _, m := range peek.Messages {
-		for _, p := range m.Content {
-			if p.Type == "image_url" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // hintContext 组装 chatCompletions 的 gateway_hint 判定上下文：请求裸模型名 +
 // 是否带图 + 模型目录 supports_images 声明（目录未收录 → ModelInCatalog=false，
 // 不做「不支持」判定，防查不到误判）。仅错误路径调用（成功请求零开销）。
@@ -2100,7 +2158,7 @@ func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintCont
 	for _, mi := range cachedModelsSnapshot() {
 		if mi.ID == bareModel {
 			ctx.ModelInCatalog = true
-			ctx.ModelSupportsImages = mi.SupportsImages
+			ctx.ModelSupportsImages = mi.SupportsModality(upstream.ModalityImage)
 			return ctx
 		}
 	}
