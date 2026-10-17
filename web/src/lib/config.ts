@@ -12,6 +12,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'listen', path: ['listen'], kind: 'text' },
   { name: 'api_key', path: ['api_key'], kind: 'password' },
   { name: 'package_detail_limit', path: ['panel', 'package_detail_limit'], kind: 'number' },
+  { name: 'max_body_bytes', path: ['server', 'max_body_bytes'], kind: 'number' },
   { name: 'checkin_enabled', path: ['schedule', 'checkin_enabled'], kind: 'checkbox' },
   { name: 'checkin_hours', path: ['schedule', 'checkin_hours'], kind: 'hours' },
   { name: 'keepalive_enabled', path: ['schedule', 'keepalive_enabled'], kind: 'checkbox' },

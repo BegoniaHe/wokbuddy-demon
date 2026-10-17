@@ -784,6 +784,33 @@ func TestServerReadTimeout(t *testing.T) {
 	}
 }
 
+// TestServerMaxBodyBytes 聊天入口请求体上限（issue #86）：默认 16 MiB，
+// 0 = 不限制，负值 fail fast。
+func TestServerMaxBodyBytes(t *testing.T) {
+	c := Default()
+	if c.Server.MaxBodyBytes != 16<<20 {
+		t.Errorf("default max_body_bytes=%d want %d", c.Server.MaxBodyBytes, 16<<20)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+
+	c = Default()
+	c.Server.MaxBodyBytes = 0
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize zero: %v", err)
+	}
+	if c.Server.MaxBodyBytes != 0 {
+		t.Errorf("zero max_body_bytes=%d want 0", c.Server.MaxBodyBytes)
+	}
+
+	c = Default()
+	c.Server.MaxBodyBytes = -1
+	if err := c.normalize(); err == nil {
+		t.Error("negative max_body_bytes should fail fast")
+	}
+}
+
 // mustParseConfig 解析一段配置 JSON（不读环境变量），失败即终止测试。
 func mustParseConfig(t *testing.T, body string) *Config {
 	t.Helper()
