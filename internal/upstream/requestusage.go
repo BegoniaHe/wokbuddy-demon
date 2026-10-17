@@ -22,6 +22,10 @@ const (
 // requestUsageTimeLayout 上游逐笔用量接口的墙钟时间格式（UTC+8，无时区后缀）。
 const requestUsageTimeLayout = "2006-01-02 15:04:05"
 
+// requestUsageMaxRespBytes 逐笔用量单页响应上限。响应包含完整 prompt（input），
+// 实测 1000 条约 0.7~1.3 MiB；取 8 MiB 留足余量，同时避免无界缓冲。
+const requestUsageMaxRespBytes int64 = 8 << 20
+
 // requestUsagePaths 返回路径候选：先主路径，404 时再试 /v2（见上方注释）。
 func (c *Client) requestUsagePaths() []string {
 	return []string{requestUsagePath, requestUsagePathV2}
@@ -70,7 +74,7 @@ func (c *Client) RequestUsage(a *auth.Auth, start, end time.Time, page, pageSize
 		"pageNum":   page,
 		"pageSize":  pageSize,
 	}
-	data, err := c.billingMeterJSON(a, c.requestUsagePaths(), body)
+	data, err := c.billingMeterJSONLimit(a, c.requestUsagePaths(), body, requestUsageMaxRespBytes)
 	if err != nil {
 		return nil, err
 	}

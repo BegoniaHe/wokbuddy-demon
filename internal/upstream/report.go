@@ -26,12 +26,23 @@ const reportPath = "/v2/report"
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
 // report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
 func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessage, error) {
-	return c.domainJSON(a, c.billingBase(a), http.MethodPost, path, body)
+	return c.billingJSONLimit(a, path, body, defaultJSONBodyLimit)
+}
+
+// billingJSONLimit 同 billingJSON，允许调用方指定响应体上限（逐笔用量页含 prompt，
+// 单页 1000 条可超过 1 MiB）。
+func (c *Client) billingJSONLimit(a *auth.Auth, path string, body any, maxBytes int64) (json.RawMessage, error) {
+	return c.domainJSONLimit(a, c.billingBase(a), http.MethodPost, path, body, maxBytes)
 }
 
 // domainJSON 是 billingJSON / growthJSON 的唯一实现：对指定 base 域发请求并解信封。
 // body 为 nil 时不带请求体；请求头统一 BillingHeaders，错误语义同 doJSON。
 func (c *Client) domainJSON(a *auth.Auth, base, method, path string, body any) (json.RawMessage, error) {
+	return c.domainJSONLimit(a, base, method, path, body, defaultJSONBodyLimit)
+}
+
+// domainJSONLimit 同 domainJSON，仅额外指定响应体上限。
+func (c *Client) domainJSONLimit(a *auth.Auth, base, method, path string, body any, maxBytes int64) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -45,16 +56,21 @@ func (c *Client) domainJSON(a *auth.Auth, base, method, path string, body any) (
 		return nil, err
 	}
 	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	return c.doJSONLimit(req, maxBytes)
 }
 
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
 // 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
 // （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.RawMessage, error) {
+	return c.billingMeterJSONLimit(a, paths, body, defaultJSONBodyLimit)
+}
+
+// billingMeterJSONLimit 同 billingMeterJSON，允许调用方指定响应体上限。
+func (c *Client) billingMeterJSONLimit(a *auth.Auth, paths []string, body any, maxBytes int64) (json.RawMessage, error) {
 	var lastErr error
 	for i, path := range paths {
-		data, err := c.billingJSON(a, path, body)
+		data, err := c.billingJSONLimit(a, path, body, maxBytes)
 		if err == nil {
 			return data, nil
 		}

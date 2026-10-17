@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -141,6 +142,21 @@ func TestParseUsageTimeWallClockUTC8(t *testing.T) {
 
 // TestRequestUsageMissingTotalStillPaginates 上游漏给 total 时，整页满仍需继续翻页，
 // 避免回填静默截断。
+// TestDoJSONLimitRejectsOversize 响应超限时必须报明确错误，不能把半截 body 交给
+// json.Unmarshal 变成 "unexpected end of JSON input"。
+func TestDoJSONLimitRejectsOversize(t *testing.T) {
+	c := testClient(func(_ *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{}}`), nil
+	})
+	req, err := http.NewRequest(http.MethodPost, "https://billing.example/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.doJSONLimit(req, 8); err == nil || !strings.Contains(err.Error(), "response body exceeds") {
+		t.Fatalf("err=%v want body-limit error", err)
+	}
+}
+
 func TestRequestUsageMissingTotalStillPaginates(t *testing.T) {
 	var pages []int
 	c := testClient(func(r *http.Request) (*http.Response, error) {
