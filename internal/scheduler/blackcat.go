@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"log"
 	"time"
 
@@ -21,10 +22,16 @@ var nowForNightWindow = time.Now
 // RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
 // 由 blackcat_hours 排程（默认 [23]）触发；执行前二次校验 InNightWindow。
 func (s *Scheduler) RunBlackcatNow() {
+	s.runTaskSync(context.Background(), TaskBlackcat, TriggerManual)
+}
+
+// blackcatAll 夜猫子实体：返回尝试/成功/失败账号数（窗口外/门控跳过不计数）。
+func (s *Scheduler) blackcatAll() (total, success, failure int) {
 	if !upstream.InNightWindow(nowForNightWindow()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
-		return
+		return 0, 0, 0
 	}
+	var c runCounters
 	for _, st := range s.cfg.Pool.List() {
 		// 暂停选号（paused）账号跳过：夜猫子是全任务体系中唯一「整任务都是
 		// 真实模型对话」的（RunNightChats 逐条 ChatStream 发 glm-5.2 短对话），
@@ -42,25 +49,28 @@ func (s *Scheduler) RunBlackcatNow() {
 		if a.IsEnterprise() {
 			continue // 企业版门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」）
 		}
-		s.blackcatOne(a)
+		c.record(s.blackcatOne(a))
 	}
+	return c.total, c.success, c.failure
 }
 
 // blackcatOne 单账号夜猫子补足：查需补的对话数 → 跑夜间对话；已补足（need<=0）则跳过。
-func (s *Scheduler) blackcatOne(a *auth.Auth) {
+// 返回 false 仅表示上游查询/执行失败；已补足属正常跳过。
+func (s *Scheduler) blackcatOne(a *auth.Auth) bool {
 	need, err := s.cfg.Upstream.BlackcatNeed(a)
 	if err != nil {
 		log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-		return
+		return false
 	}
 	if need <= 0 {
-		return
+		return true
 	}
 	ok, err := s.cfg.Upstream.RunNightChats(a, int(need))
 	if err != nil {
 		log.Printf("blackcat %s: %d/%d 完成，中断: %v", logfmt.Label(a.UID, a.Nickname), ok, need, err)
-		return
+		return false
 	}
 	log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
 	time.Sleep(activityAccountDelay)
+	return true
 }

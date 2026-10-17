@@ -45,6 +45,18 @@ export interface Account {
   credits_earliest_remaining?: number;
 }
 
+// 批量任务运行状态（GET /panel/api/tasks/runs，issue #112）。
+export interface TaskRun {
+  task: string;
+  trigger?: string;
+  running?: boolean;
+  started_at?: string;
+  finished_at?: string;
+  total?: number;
+  success?: number;
+  failure?: number;
+}
+
 export interface ModelLock {
   model?: string;
   realm?: string;

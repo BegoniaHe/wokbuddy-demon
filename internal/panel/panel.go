@@ -190,6 +190,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
+	p.mux.HandleFunc("POST /panel/api/blackcat_all", p.withAuth(p.blackcatAll))
+	p.mux.HandleFunc("POST /panel/api/streak_bonus_all", p.withAuth(p.streakBonusAll))
+	p.mux.HandleFunc("GET /panel/api/tasks/runs", p.withAuth(p.tasksRuns))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
@@ -668,48 +671,62 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // 批量任务
 // ---------------------------------------------------------------------------
 
-// checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
-func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
+// startBatchTask 批量任务手动触发的统一入口（issue #112）：
+// 调度器与面板共用运行级守卫——同一任务族已在跑时返回 409，不并行第二轮。
+// 启动成功后立即返回 {ok,started,running}；本轮状态/结果经 /panel/api/tasks/runs 查询。
+func (p *Panel) startBatchTask(w http.ResponseWriter, task, label string) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	if !p.cfg.Scheduler.StartTask(task, scheduler.TriggerManual) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"ok": false, "started": false, "running": true, "task": task,
+			"error": label + "正在运行中，请等本轮结束",
+		})
+		return
+	}
+	log.Printf("panel: 手动全量%s已触发", label)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "task": task})
+}
+
+// checkinAll 手动触发全量签到（异步执行；含连登管家）。
+func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskCheckin, "签到")
 }
 
 // travelAll 手动触发全量猫猫旅行巡检（异步执行）。
 func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
-		writeErr(w, http.StatusNotImplemented, "scheduler not available")
-		return
-	}
-	go p.cfg.Scheduler.RunTravelNow()
-	log.Printf("panel: 手动全量旅行巡检已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	p.startBatchTask(w, scheduler.TaskTravel, "旅行巡检")
 }
 
 // activityAll 手动触发全量活跃上报（异步执行；点亮连登 + 解锁领养前置）。
 func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Scheduler == nil {
-		writeErr(w, http.StatusNotImplemented, "scheduler not available")
-		return
-	}
-	go p.cfg.Scheduler.RunActivityNow()
-	log.Printf("panel: 手动全量活跃上报已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	p.startBatchTask(w, scheduler.TaskActivity, "活跃上报")
 }
 
 // keepaliveAll 手动触发全量 token 保活（异步执行）。
 func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskKeepalive, "保活")
+}
+
+// blackcatAll 手动触发夜猫子补足（异步执行；窗口外由调度器跳过）。
+func (p *Panel) blackcatAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskBlackcat, "夜猫子")
+}
+
+// streakBonusAll 手动触发连登兑换 + 抽奖（异步执行）。
+func (p *Panel) streakBonusAll(w http.ResponseWriter, r *http.Request) {
+	p.startBatchTask(w, scheduler.TaskStreak, "连登管家")
+}
+
+// tasksRuns 返回各批量任务族的当前/最近一轮运行状态（issue #112）。
+func (p *Panel) tasksRuns(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
-	log.Printf("panel: 手动全量保活已触发")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": p.cfg.Scheduler.RunTaskStates()})
 }
 
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
