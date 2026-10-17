@@ -57,6 +57,9 @@ type Config struct {
 	// 选号**——pool.pick 侧的 disabled 过滤与本开关无关。
 	IncludeDisabledInTasks bool
 
+	// CheckinAccountDelay 签到任务账号间等待（issue #59）；0 = 不限。
+	CheckinAccountDelay time.Duration
+
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
@@ -146,6 +149,23 @@ func (s *Scheduler) includeDisabledInTasks() bool {
 	s.schedMu.Lock()
 	defer s.schedMu.Unlock()
 	return s.cfg.IncludeDisabledInTasks
+}
+
+// checkinDelay 返回签到账号间等待（读取时与热配置写在 schedMu 下同步）。
+func (s *Scheduler) checkinDelay() time.Duration {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.CheckinAccountDelay
+}
+
+// SetCheckinAccountDelay 热更新签到账号间等待（issue #59）。
+func (s *Scheduler) SetCheckinAccountDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.schedMu.Lock()
+	s.cfg.CheckinAccountDelay = d
+	s.schedMu.Unlock()
 }
 
 // SetIncludeDisabledInTasks 热更新「保号类任务是否覆盖禁用账号」
@@ -413,7 +433,7 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.RunCheckinNowCtx(ctx)
 			case taskTravel:
 				s.RunTravelNow()
 			case taskActivity:
@@ -452,46 +472,64 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
+// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻（无取消信号的便捷入口）。
+func (s *Scheduler) RunCheckinNow() { s.RunCheckinNowCtx(context.Background()) }
+
+// RunCheckinNowCtx 同 RunCheckinNow，账号间等待支持 ctx 取消（issue #59）。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
 // 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
-func (s *Scheduler) RunCheckinNow() {
+func (s *Scheduler) RunCheckinNowCtx(ctx context.Context) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	delay := s.checkinDelay()
+	attempted := false
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
+		a, ok := s.checkinAuth(st, includeDisabled)
+		if !ok {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
-			continue
+		if attempted && !sleepCtx(ctx, delay) {
+			return // 优雅停机：不等限速睡满，剩余账号下轮再跑
 		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
-		if a.IsGlobal() {
-			continue
-		}
-		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
-		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
-		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
-		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
-			s.checkinOne(st.UID, st.Nickname, a)
-		}
-		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
-		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			continue
-		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+		attempted = true
+		s.runCheckinAccount(st, a, expiringSoon)
 	}
 	s.RunStreakBonusNow()
+}
+
+// checkinAuth 返回该账号本轮应使用的凭证；禁用/无 refresh token/global 跳过。
+func (s *Scheduler) checkinAuth(st pool.Status, includeDisabled bool) (*auth.Auth, bool) {
+	if st.Disabled && !includeDisabled {
+		return nil, false
+	}
+	a := s.cfg.Pool.AuthByUID(st.UID)
+	if a == nil || a.RefreshTokenValue() == "" {
+		return nil, false
+	}
+	// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
+	if a.IsGlobal() {
+		return nil, false
+	}
+	return a, true
+}
+
+// runCheckinAccount 执行单账号签到（企业版跳过）+ 余额刷新。
+func (s *Scheduler) runCheckinAccount(st pool.Status, a *auth.Auth, expiringSoon time.Duration) {
+	// 企业版无签到体系：上游直接 400；跳过签到，但余额查询照常跑
+	// （企业额度是 credit_floor 判定与面板额度展示的唯一数据源）。
+	if !a.IsEnterprise() {
+		s.checkinOne(st.UID, st.Nickname, a)
+	}
+	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+	if err != nil {
+		log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		return
+	}
+	s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
+	s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 }
 
 // checkinOne 单账号签到并落一行结果日志：按 CheckinResult 分类呈现——成功/幂等/

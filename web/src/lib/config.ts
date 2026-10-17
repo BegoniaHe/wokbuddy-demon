@@ -22,6 +22,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'activity_hours', path: ['schedule', 'activity_hours'], kind: 'hours' },
   { name: 'balance_refresh_enabled', path: ['schedule', 'balance_refresh_enabled'], kind: 'checkbox' },
   { name: 'balance_refresh_minutes', path: ['schedule', 'balance_refresh_minutes'], kind: 'number' },
+  { name: 'checkin_account_delay', path: ['schedule', 'checkin_account_delay'], kind: 'text' },
   { name: 'growth_enabled', path: ['schedule', 'growth_enabled'], kind: 'checkbox' },
   { name: 'growth_hours', path: ['schedule', 'growth_hours'], kind: 'hours' },
   { name: 'include_disabled_in_tasks', path: ['schedule', 'include_disabled_in_tasks'], kind: 'checkbox' },
@@ -71,6 +72,7 @@ export const DURATION_FIELDS = new Set([
   'cost_explore_interval',
   'expiring_soon',
   'ttl',
+  'checkin_account_delay',
 ]);
 export const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 
