@@ -189,6 +189,8 @@ go build ./...
 go vet ./...
 go test ./...                      # 完整测试套件
 go run ./cmd/server -config config.json
+go install golang.org/x/vuln/cmd/govulncheck@latest
+govulncheck ./...                  # 依赖已知漏洞扫描（CI 同口径）
 
 # 仅当改动前端 web/ 时才需要（产物 internal/panel/dist 已提交）：
 make web                           # 构建前端（需 Bun）→ internal/panel/dist
