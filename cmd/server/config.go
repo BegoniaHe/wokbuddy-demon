@@ -13,10 +13,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
+
+// placeholderAPIKey 是 config.example.json 里的公开占位密钥。
+// 它只用于示例，任何读到它的部署都必须在启动时替换（issue #85）。
+const placeholderAPIKey = "test_key"
 
 // Config 顶层配置。
 type Config struct {
@@ -411,11 +416,10 @@ func ParseConfig(raw []byte) (*Config, error) {
 // 安全默认优于示例占位符（listen 绑定 0.0.0.0，空 key 会把网关裸暴露给局域网）。
 // 返回生成的 key 供启动日志透出。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
 func WriteDefault(path string) (string, error) {
-	raw := make([]byte, 18)
-	if _, err := rand.Read(raw); err != nil {
-		return "", fmt.Errorf("gen api_key: %w", err)
+	key, err := randomAPIKey()
+	if err != nil {
+		return "", err
 	}
-	key := "sk-" + base64.RawURLEncoding.EncodeToString(raw)
 	c := Default()
 	c.APIKey = key
 	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
@@ -438,6 +442,84 @@ func WriteDefault(path string) (string, error) {
 		return "", fmt.Errorf("write config: %w", err)
 	}
 	return key, nil
+}
+
+// randomAPIKey 生成 sk- 前缀的随机网关密钥。
+func randomAPIKey() (string, error) {
+	raw := make([]byte, 18)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("gen api_key: %w", err)
+	}
+	return "sk-" + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+// ReplacePlaceholderAPIKey 把 path 中仍为公开占位值的 api_key 替换成随机密钥并
+// 原子写回。只精确匹配 placeholderAPIKey：显式配置的其他值（含空串）一律不动，
+// 避免把用户有意设置的密钥静默改掉。
+//
+// 返回新密钥与实际是否发生替换。文件不存在时返回 fs.ErrNotExist，由调用方决定
+// 是否走首次运行生成路径；非普通文件（如 Docker bind mount 误建目录）不处理，
+// 交由 Load 给出更具体的错误。
+func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
+	doc, current, err := readConfigDoc(path)
+	if err != nil || current != placeholderAPIKey {
+		return "", false, err
+	}
+	key, err := randomAPIKey()
+	if err != nil {
+		return "", false, err
+	}
+	encoded, err := json.Marshal(key)
+	if err != nil {
+		return "", false, fmt.Errorf("marshal api_key: %w", err)
+	}
+	doc["api_key"] = encoded
+	if err := writeConfigDoc(path, doc); err != nil {
+		return "", false, err
+	}
+	return key, true, nil
+}
+
+// readConfigDoc 读取配置文件为可按顶层键修改的文档，并返回当前 api_key。
+func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, "", nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("read config: %w", err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, "", fmt.Errorf("parse config: %w", err)
+	}
+	var current string
+	if v, ok := doc["api_key"]; ok {
+		if err := json.Unmarshal(v, &current); err != nil {
+			return nil, "", fmt.Errorf("parse api_key: %w", err)
+		}
+	}
+	return doc, current, nil
+}
+
+// writeConfigDoc 原子写回配置文档（tmp + rename），保留所有未修改的顶层键。
+func writeConfigDoc(path string, doc map[string]json.RawMessage) error {
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := atomicwrite.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
+	}
+	return nil
 }
 
 func applyEnv(c *Config) {

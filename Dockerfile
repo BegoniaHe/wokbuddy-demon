@@ -29,8 +29,10 @@ COPY --from=build /out/credit /app/credit
 COPY login.sh signin.sh credit.sh /app/
 COPY scripts/probe_active.py /app/scripts/probe_active.py
 RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /app/login.sh /app/signin.sh /app/credit.sh
-# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）
+# 镜像不带真实配置：落 example 作为默认（生产由挂载卷 /app/config.json 覆盖）。
+# 归属改为 app：首次启动需要把示例里的公开占位 api_key 原子替换为随机值（issue #85）。
 COPY config.example.json /app/config.json
+RUN chown app:app /app/config.json
 USER app
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \

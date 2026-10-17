@@ -531,6 +531,116 @@ func TestWriteDefault(t *testing.T) {
 	}
 }
 
+func TestReplacePlaceholderAPIKey(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	raw := `{"api_key":"test_key","listen":":9000","custom":{"keep":true}}`
+	if err := os.WriteFile(fp, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key, replaced, err := ReplacePlaceholderAPIKey(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replaced || key == placeholderAPIKey || !strings.HasPrefix(key, "sk-") {
+		t.Fatalf("replaced=%v key=%q want random sk- key", replaced, key)
+	}
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.APIKey != key || c.Listen != ":9000" {
+		t.Fatalf("loaded api_key=%q listen=%q", c.APIKey, c.Listen)
+	}
+	assertConfigDocAPIKey(t, fp, key)
+}
+
+func TestReplacePlaceholderAPIKeyIdempotent(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(fp, []byte(`{"api_key":"test_key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ReplacePlaceholderAPIKey(fp); err != nil {
+		t.Fatal(err)
+	}
+	if _, replaced, err := ReplacePlaceholderAPIKey(fp); err != nil || replaced {
+		t.Fatalf("second run replaced=%v err=%v", replaced, err)
+	}
+}
+
+// assertConfigDocAPIKey 断言文件中 api_key 已写成 want，且未知顶层键仍保留。
+func assertConfigDocAPIKey(t *testing.T, fp, want string) {
+	t.Helper()
+	written, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(written, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := doc["custom"]; !ok {
+		t.Error("unknown key custom dropped")
+	}
+	var got string
+	if err := json.Unmarshal(doc["api_key"], &got); err != nil || got != want {
+		t.Fatalf("file api_key=%q err=%v want %q", got, err, want)
+	}
+}
+
+func TestReplacePlaceholderAPIKeyKeepsExplicitValues(t *testing.T) {
+	for _, explicit := range []string{"", "my-own-key"} {
+		t.Run(explicit, func(t *testing.T) {
+			dir := t.TempDir()
+			fp := filepath.Join(dir, "config.json")
+			raw, err := json.Marshal(map[string]any{"api_key": explicit, "listen": ":9000"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(fp, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			key, replaced, err := ReplacePlaceholderAPIKey(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if replaced || key != "" {
+				t.Fatalf("replaced=%v key=%q want untouched", replaced, key)
+			}
+			after, err := os.ReadFile(fp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != string(raw) {
+				t.Errorf("file changed for explicit value %q", explicit)
+			}
+		})
+	}
+}
+
+func TestLoadConfigReplacesPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(fp, []byte(`{"api_key":"test_key"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := loadConfig(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.APIKey == placeholderAPIKey || c.APIKey == "" {
+		t.Fatalf("api_key=%q want random", c.APIKey)
+	}
+	// 写回后的文件与运行时一致
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.APIKey != c.APIKey {
+		t.Errorf("file api_key=%q runtime=%q", c2.APIKey, c.APIKey)
+	}
+}
+
 // assertWrittenDefaults 断言 WriteDefault 产出的文件可加载、api_key 生效且推荐值齐备。
 func assertWrittenDefaults(t *testing.T, fp, key string) {
 	t.Helper()

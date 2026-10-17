@@ -147,7 +147,8 @@ cd wokbuddy-demon
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    示例里的 api_key 是公开占位值 test_key；程序启动时会自动替换为随机密钥
+#    并写回该文件（显式设置的其他值不会被覆盖）。也可先自行改成自己的密钥。
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -330,7 +331,7 @@ claude
 
 ## 配置说明
 
-**`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。下表为字段含义速查。
+**`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。启动时若 `api_key` 仍精确等于占位值 `test_key`，程序会生成随机密钥并原子写回配置文件；显式设置的其他值保持不变。检查生效值：`grep '"api_key"' config.json`（不要分享该输出）。下表为字段含义速查。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|

@@ -58,6 +58,14 @@ func stateSibling(stateFile, name string) string {
 //
 // errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
 func loadConfig(path string) (*Config, error) {
+	// 已存在的配置若仍是示例占位密钥，先替换为随机值再加载：Docker 镜像与
+	// `cp config.example.json config.json` 都把公开的 test_key 带进运行时，
+	// 不替换等于所有读者共享同一把可用密钥。显式设置的其他值保持不变。
+	if key, replaced, rerr := ReplacePlaceholderAPIKey(path); rerr == nil && replaced {
+		log.Printf("config %s 使用公开占位 api_key，已替换为随机密钥（api_key=%s，记录在该文件里，可自行修改）", path, key)
+	} else if rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+		return nil, fmt.Errorf("replace placeholder api_key: %w", rerr)
+	}
 	cfg, err := Load(path)
 	if err == nil {
 		return cfg, nil
