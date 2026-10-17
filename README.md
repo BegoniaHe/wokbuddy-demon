@@ -150,6 +150,13 @@ docker compose up -d --build
 curl -s http://localhost:7863/healthz
 ```
 
+Compose 默认把端口绑定到 `127.0.0.1`，仅本机可达（面板与网关无内置 TLS）。需要局域网访问时，把 `docker-compose.yml` 的 ports 改为 `"7863:7863"` 或指定内网 IP：
+
+```yaml
+ports:
+  - "192.168.1.10:7863:7863"
+```
+
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录。
 
 常用运维命令：
@@ -392,7 +399,8 @@ claude
 
 ### 2. 网络暴露与日志敏感度
 
-- 默认监听 `:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议置于 HTTPS 之后 / 仅内网可达
+- 默认监听 `:7863`，**无内置 TLS**；Docker Compose 默认仅绑定 `127.0.0.1`，需要局域网/公网访问时显式改端口映射
+- 公网部署必须设置 `api_key`，并置于 HTTPS 之后 / 仅内网可达
 - 日志字段不含任何 token 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**，代码无任何落盘日志文件
 
