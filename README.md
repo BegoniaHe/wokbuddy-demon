@@ -269,6 +269,16 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 ## 部署运维
 
+### 部署模型：单实例
+
+本网关按**单实例**设计，同一 `auth_dir` / `state_file`（以及同一 Redis）不要同时运行多个进程：
+
+- 定时任务（签到 / 旅行 / 活跃 / 保活 / 余额刷新）会在每个实例各执行一次；
+- 池状态以本地 `state_file` 为准，多实例会互相覆盖快照；
+- 冷却、在途名额、会话粘性与限流状态都是进程内状态，不跨实例共享，路由结果会不一致。
+
+`upstash` / Redis 仅作为**重启恢复镜像**：启动时读取状态快照与会话绑定，运行期异步写回；没有分布式锁、租约或 leader election，不提供多实例共享状态。需要高可用时，请使用反向代理指向**单个写入实例**，或由外部编排保证同一时刻只有一个实例运行。
+
 ### Docker 镜像
 
 多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：`wokbuddy-demon`（主服务）、`signin_bin`、`login`、`credit` + 工具脚本。以 `app` 用户（uid 10001）运行，内置 `HEALTHCHECK`。
