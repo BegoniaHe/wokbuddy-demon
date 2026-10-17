@@ -142,6 +142,9 @@ func normalizeModels(raw []string) ([]string, error) {
 		if i := strings.IndexByte(pat, ':'); i >= 0 && (pat[:i] == "cn" || pat[:i] == "global") {
 			bare = pat[i+1:]
 		}
+		if bare == "" {
+			return nil, fmt.Errorf("模型 glob %q 缺少模型名", item)
+		}
 		if _, err := pathpkg.Match(bare, "x"); err != nil {
 			return nil, fmt.Errorf("非法模型 glob %q: %w", item, err)
 		}

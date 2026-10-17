@@ -107,13 +107,26 @@ export function KeysView() {
 
   const saveLimits = () => {
     if (!limitsFor) return;
-    const num = (v: string) => (v.trim() === '' ? 0 : Number(v));
+    const parseLimit = (v: string): number | null => {
+      const trimmed = v.trim();
+      if (trimmed === '') return 0;
+      if (!/^\d+$/.test(trimmed)) return null;
+      const n = Number(trimmed);
+      return Number.isSafeInteger(n) ? n : null;
+    };
+    const nextRpm = parseLimit(rpm);
+    const nextTpm = parseLimit(tpm);
+    const nextConcurrent = parseLimit(concurrent);
+    if (nextRpm === null || nextTpm === null || nextConcurrent === null) {
+      toast('限制必须是非负整数', 'err');
+      return;
+    }
     limitsM.mutate({
       id: limitsFor.id,
       limits: {
-        rpm: num(rpm),
-        tpm: num(tpm),
-        max_concurrent: num(concurrent),
+        rpm: nextRpm,
+        tpm: nextTpm,
+        max_concurrent: nextConcurrent,
         models: models.split(/[,，\s]+/).filter(Boolean),
       },
     });

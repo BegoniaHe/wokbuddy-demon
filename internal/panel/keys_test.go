@@ -154,6 +154,8 @@ func TestKeysUpdateLimits(t *testing.T) {
 	for _, bad := range []string{
 		`{"limits":{"rpm":-1}}`,
 		`{"limits":{"models":["[bad"]}}`,
+		`{"limits":{"models":["cn:"]}}`,
+		`{"limits":{"models":["global:"]}}`,
 	} {
 		if code, resp := p.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/limits", bad); code != http.StatusBadRequest {
 			t.Errorf("bad %s: code=%d body=%s", bad, code, resp)
