@@ -738,6 +738,14 @@ type Client struct {
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
 
+	// ModelTimeouts 按模型覆盖聊天头/空闲超时（issue #58）。键可为
+	// "[realm:]model" 或裸模型名；未命中回落 HeaderTimeout/IdleTimeout。
+	ModelTimeouts map[string]ModelTimeout
+	// timeoutMu/timeoutClients 缓存按 header 超时克隆的 chat client（避免每请求克隆
+	// Transport 导致连接池碎片化；条目数受配置模型数约束）。
+	timeoutMu      sync.Mutex
+	timeoutClients map[time.Duration]*http.Client
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。
@@ -1189,6 +1197,15 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
 // #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
 // 反证，删了无回滚路径）。
+// modelFromBody 取聊天请求体里的 model（畸形/缺失 → 空串，走全局超时）。
+func modelFromBody(body []byte) string {
+	var peek struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(body, &peek)
+	return peek.Model
+}
+
 func (c *Client) ChatStreamContext(
 	ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta,
 ) (rc io.ReadCloser, status int, respBody []byte, err error) {
@@ -1199,6 +1216,8 @@ func (c *Client) ChatStreamContext(
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
+	headerTimeout, idleTimeout := c.modelTimeout(a.Realm(), modelFromBody(prepared))
+	chatHTTP := c.chatHTTPForHeader(headerTimeout)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
@@ -1213,14 +1232,14 @@ func (c *Client) ChatStreamContext(
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := chatHTTP.Do(req)
 		if err != nil {
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
-			roundTripCloseIdle(c.chatHTTP().Transport)
+			roundTripCloseIdle(chatHTTP.Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -1252,9 +1271,68 @@ func (c *Client) ChatStreamContext(
 		// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 		// 取消传播由 http.Transport 在 body Close / 父 ctx 取消时处理，连接正常清理。
 		//nolint:staticcheck // chatPaths 当前恒单元素，循环保留以支持未来多路径回退
-		return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+		return monitorBody(resp.Body, idleTimeout, cancel), resp.StatusCode, nil, nil
 	}
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
+}
+
+// ModelTimeout 单个模型的聊天超时覆盖；零值字段回落全局。
+type ModelTimeout struct {
+	Header time.Duration
+	Idle   time.Duration
+}
+
+// modelTimeout 返回该请求生效的 chat header/idle 超时：先查 "realm:model"，
+// 再查裸模型名，未命中回落全局值。
+func (c *Client) modelTimeout(realm, model string) (header, idle time.Duration) {
+	header, idle = c.HeaderTimeout, c.IdleTimeout
+	if model == "" {
+		return header, idle
+	}
+	if t, ok := c.ModelTimeouts[realm+":"+model]; ok {
+		return applyTimeout(t, header, idle)
+	}
+	if t, ok := c.ModelTimeouts[model]; ok {
+		return applyTimeout(t, header, idle)
+	}
+	return header, idle
+}
+
+// applyTimeout 用非零覆盖值替换全局默认。
+func applyTimeout(t ModelTimeout, header, idle time.Duration) (time.Duration, time.Duration) {
+	if t.Header > 0 {
+		header = t.Header
+	}
+	if t.Idle > 0 {
+		idle = t.Idle
+	}
+	return header, idle
+}
+
+// chatHTTPForHeader 返回 header 超时为 d 的 chat client：等于全局值时复用原 client，
+// 否则缓存一份 Transport 克隆（连接池按超时值隔离，仍复用同一拨号/代理配置）。
+func (c *Client) chatHTTPForHeader(d time.Duration) *http.Client {
+	base := c.chatHTTP()
+	if d <= 0 || d == c.HeaderTimeout {
+		return base
+	}
+	c.timeoutMu.Lock()
+	defer c.timeoutMu.Unlock()
+	if c.timeoutClients == nil {
+		c.timeoutClients = map[time.Duration]*http.Client{}
+	}
+	if client := c.timeoutClients[d]; client != nil {
+		return client
+	}
+	tr, ok := base.Transport.(*http.Transport)
+	if !ok {
+		return base
+	}
+	cloned := tr.Clone()
+	cloned.ResponseHeaderTimeout = d
+	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
+	c.timeoutClients[d] = client
+	return client
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens + 上游模型对象全字段）。
