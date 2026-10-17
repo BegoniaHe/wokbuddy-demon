@@ -14,7 +14,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
     ports:
-      - "7863:7863"
+      # 默认只绑定本机：面板/网关无内置 TLS，暴露到所有网卡风险高。
+      # 需要局域网/公网访问时改成 "7863:7863" 或指定内网 IP（如 "192.168.1.10:7863:7863"）。
+      - "127.0.0.1:7863:7863"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
