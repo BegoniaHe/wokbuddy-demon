@@ -170,6 +170,9 @@ func (p *Pool) excludeReason(e *entry, reqModel, realm string, now time.Time) st
 	if p.floorBlockedForRealmModel(e, reqModel, realm, now) {
 		return "credit_floor"
 	}
+	if p.dailyBlocked(e, reqModel, realm, now) {
+		return "daily_limit"
+	}
 	if p.inFlightFull(e) {
 		return "in_flight_full"
 	}
@@ -368,6 +371,15 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
 		return false
 	}
+	return p.paidModel(e, model, realm, now)
+}
+
+// paidModel 报告模型是否收费：本地实测优先，缺失时用上游目录倍率兜底。
+// 未知/空模型按不拦处理（与 credit_floor 的保守口径一致）。
+func (p *Pool) paidModel(e *entry, model, realm string, now time.Time) bool {
+	if model == "" {
+		return false
+	}
 	// 1) 本地实测台账：最权威（真实扣费证据）。
 	if mc, ok := e.modelCostOf(model, now); ok {
 		return mc.CostPer1k > 0
@@ -378,13 +390,86 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	}
 	rate := p.modelRateOf(realm, model)
 	if rate == "" {
-		return false // 目录未覆盖：未知，放行（见上方注释）
+		return false // 目录未覆盖：未知，放行
 	}
 	v, err := strconv.ParseFloat(rate, 64)
 	if err != nil {
 		return false // 倍率非数值（异常形态）：不据此惩罚账号
 	}
 	return v > 0
+}
+
+// dailyBlocked 报告账号是否被当日护栏拦下（issue #95）。调用方需已持 p.mu。
+func (p *Pool) dailyBlocked(e *entry, model, realm string, now time.Time) bool {
+	if p.dailyUsage == nil {
+		return false
+	}
+	return p.dailyBlockedUsage(p.dailyUsage(), e, model, realm, now)
+}
+
+// dailyBlockedUsage 用给定当日快照判定：token 达限 → 全模型；积分达限 →
+// 仅收费模型；按模型 token 达限 → 仅该模型。
+func (p *Pool) dailyBlockedUsage(usage map[string]DailyUsage, e *entry, model, realm string, now time.Time) bool {
+	lim := p.dailyLimitsFor(e.a.Realm())
+	if !lim.enabled() {
+		return false
+	}
+	u := usage[e.a.UID]
+	if lim.Tokens > 0 && u.Tokens >= lim.Tokens {
+		return true
+	}
+	if lim.ModelTokens > 0 && model != "" && u.Models[model] >= lim.ModelTokens {
+		return true
+	}
+	return lim.Credits > 0 && u.Credits >= lim.Credits && p.paidModel(e, model, realm, now)
+}
+
+// enabled 报告是否配置了任一每日护栏。
+func (l DailyLimits) enabled() bool { return l.Tokens > 0 || l.Credits > 0 || l.ModelTokens > 0 }
+
+// AllDailyBlocked 报告是否存在健康账号但全部被当日护栏拦下（issue #95）。
+func (p *Pool) AllDailyBlocked(model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.dailyUsage == nil {
+		return false
+	}
+	usage := p.dailyUsage()
+	now := p.now()
+	healthy := 0
+	for _, e := range p.byUID {
+		if e.disabled || e.paused || !e.healthy(now) || !e.healthyForModel(now, model) {
+			continue
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		healthy++
+		if !p.dailyBlockedUsage(usage, e, model, realm, now) {
+			return false
+		}
+	}
+	return healthy > 0
+}
+
+// DailyLimitedUIDs 返回达到日 token 或日积分上限的账号（面板徽章用）。
+func (p *Pool) DailyLimitedUIDs() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.dailyUsage == nil {
+		return nil
+	}
+	usage := p.dailyUsage()
+	var out []string
+	for uid, e := range p.byUID {
+		lim := p.dailyLimitsFor(e.a.Realm())
+		u := usage[uid]
+		if (lim.Tokens > 0 && u.Tokens >= lim.Tokens) || (lim.Credits > 0 && u.Credits >= lim.Credits) {
+			out = append(out, uid)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
@@ -442,6 +527,9 @@ func (p *Pool) fallbackEligible(e *entry, uid string, tried map[string]bool, rea
 	}
 	if p.floorBlockedForRealmModel(e, model, realm, now) {
 		return false // 积分保底：触底号不接收费模型（兜底路径同判据）
+	}
+	if p.dailyBlocked(e, model, realm, now) {
+		return false // 每日护栏（issue #95）：兜底路径同判据
 	}
 	return !p.inFlightFull(e)
 }

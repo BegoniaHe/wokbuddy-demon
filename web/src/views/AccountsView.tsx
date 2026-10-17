@@ -168,6 +168,7 @@ export function AccountsView() {
                     key={s.uid}
                     s={s}
                     maxCred={Math.max(1, ...accounts.map((x) => x.credits || 0))}
+                    dailyLimited={(data.daily_limited || []).includes(s.uid)}
                     onOpenTasks={() => setTaskUID(s.uid)}
                     onDone={afterAction}
                   />
@@ -378,11 +379,13 @@ function ExpiryBox({
 function AccountRow({
   s,
   maxCred,
+  dailyLimited,
   onOpenTasks,
   onDone,
 }: {
   s: Account;
   maxCred: number;
+  dailyLimited: boolean;
   onOpenTasks: () => void;
   onDone: () => void;
 }) {
@@ -526,6 +529,7 @@ function AccountRow({
           </span>
           {s.realm === 'global' ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">国际版</span> : null}
           {s.enterprise ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">企业版</span> : null}
+          {dailyLimited ? <Tag tone="warn" title="已达每日限额，本地 0 点恢复">日限</Tag> : null}
         </div>
         <div className="mt-px truncate font-mono text-2xs text-muted-foreground">{short}</div>
       </TableCell>

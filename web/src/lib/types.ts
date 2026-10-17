@@ -104,6 +104,8 @@ export interface Overview {
   in_flight_full?: number;
   in_flight_total?: number;
   max_in_flight_total?: number;
+  daily_limited?: string[];
+  daily_reset_at?: string;
   uptime_sec: number;
   accounts?: Account[];
   model_locks?: ModelLock[];

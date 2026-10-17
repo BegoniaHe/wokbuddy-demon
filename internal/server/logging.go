@@ -45,19 +45,21 @@ func SetChatLogOutput(w io.Writer) { chatLogOut = w }
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start            time.Time
-	model            string
-	mode             string // "stream" | "sync"
-	uid              string // 完整 uid，展示时只取前 8 位
-	nick             string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
-	ttfb             time.Duration
-	toks             int // <0 表示 usage 缺失 → 显示 "-"
-	status           int
-	requestID        string
-	outcome          string
-	attempts         int
-	credit           float64
-	hasCredit        bool
+	start     time.Time
+	model     string
+	mode      string // "stream" | "sync"
+	uid       string // 完整 uid，展示时只取前 8 位
+	nick      string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
+	ttfb      time.Duration
+	toks      int // <0 表示 usage 缺失 → 显示 "-"
+	status    int
+	requestID string
+	outcome   string
+	attempts  int
+	credit    float64
+	hasCredit bool
+	// dailyLimited 本次请求因账号每日护栏全池达限而终止（issue #95）。
+	dailyLimited     bool
 	promptTokens     int64
 	completionTokens int64
 	totalTokens      int64

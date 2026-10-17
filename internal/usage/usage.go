@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
@@ -95,6 +96,60 @@ type Recorder struct {
 	stopOnce sync.Once
 	stop     chan struct{}
 	done     chan struct{}
+	// dailyCache 当日聚合的 1 秒缓存（issue #95）：选号过滤会在一次请求内
+	// 多次读取，避免反复遍历全部桶。
+	dailyCache atomic.Pointer[dailyCacheEntry]
+}
+
+// DailyUsage 一个账号当日的用量聚合。
+type DailyUsage struct {
+	Tokens  int64
+	Credits float64
+	Models  map[string]int64
+}
+
+type dailyCacheEntry struct {
+	at   time.Time
+	data map[string]DailyUsage
+}
+
+// DailyTotals 聚合本地时区「今天」的小时桶与日桶（issue #95）。
+func (r *Recorder) DailyTotals(now time.Time) map[string]DailyUsage {
+	if r == nil {
+		return nil
+	}
+	day := now.Format(dayLayout)
+	hourPrefix := "h:" + day
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make(map[string]DailyUsage, len(r.buckets))
+	for _, b := range r.buckets {
+		if b.Scope != "d:"+day && !strings.HasPrefix(b.Scope, hourPrefix) {
+			continue
+		}
+		du := out[b.UID]
+		du.Tokens += b.TT
+		du.Credits += b.CR
+		if du.Models == nil {
+			du.Models = map[string]int64{}
+		}
+		du.Models[b.Model] += b.TT
+		out[b.UID] = du
+	}
+	return out
+}
+
+// DailyTotalsCached 同 DailyTotals，但 1 秒内复用同一份快照。
+func (r *Recorder) DailyTotalsCached(now time.Time) map[string]DailyUsage {
+	if r == nil {
+		return nil
+	}
+	if c := r.dailyCache.Load(); c != nil && now.Sub(c.at) < time.Second {
+		return c.data
+	}
+	data := r.DailyTotals(now)
+	r.dailyCache.Store(&dailyCacheEntry{at: now, data: data})
+	return data
 }
 
 // New 创建记录器。path 为空时禁用落盘（纯内存，测试用）。

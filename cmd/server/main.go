@@ -177,7 +177,8 @@ func main() {
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域 WAF 风控分档（P1-1）
-	p.SetMaxInFlightTotal(cfg.Pool.MaxInFlightTotal)   // 网关级全局在途上限（issue #92）
+	p.SetMaxInFlightTotal(cfg.Pool.MaxInFlightTotal) // 网关级全局在途上限（issue #92）
+	applyDailyLimits(p, cfg)
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
@@ -248,6 +249,7 @@ func main() {
 	rec := usage.New(usagePath)
 	rec.Start()
 	defer rec.Stop()
+	setDailyUsageProvider(p, rec)
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	// 命名密钥库：与 state 文件同目录（data/api_keys.json）。面板签发/撤销，
@@ -643,6 +645,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
 	p.SetMaxInFlightTotal(newCfg.Pool.MaxInFlightTotal)
+	applyDailyLimits(p, newCfg)
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）

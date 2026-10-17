@@ -315,6 +315,21 @@ export function ConfigView() {
               <FieldDescription>余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</FieldDescription>
             </Field>
             <Field>
+              <FieldLabel>每日 Token 上限</FieldLabel>
+              {num('daily_tokens', { min: 0, placeholder: '0' })}
+              <FieldDescription>账号当日总 token 达限后不接单；0 = 关闭。本地 0 点重置</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>每日积分上限</FieldLabel>
+              {num('daily_credits', { min: 0, step: 0.1, placeholder: '0' })}
+              <FieldDescription>达限后只接免费模型；0 = 关闭</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>按模型每日 Token</FieldLabel>
+              {num('model_daily_tokens', { min: 0, placeholder: '0' })}
+              <FieldDescription>账号 × 模型当日 token 达限后只禁该模型；0 = 关闭</FieldDescription>
+            </Field>
+            <Field>
               <FieldLabel>快过期路由窗口</FieldLabel>
               {text('expiring_soon', { placeholder: '168h' })}
               <FieldDescription>窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭</FieldDescription>

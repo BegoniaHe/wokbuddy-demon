@@ -2,6 +2,7 @@ package main
 
 import (
 	"strings"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
@@ -57,6 +58,30 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
 	}
 }
+
+// applyDailyLimits 把配置的每日护栏映射到 pool（issue #95）。
+func applyDailyLimits(p *pool.Pool, cfg *Config) {
+	toPool := func(r LimitRule) pool.DailyLimits {
+		return pool.DailyLimits{Tokens: r.DailyTokens, Credits: r.DailyCredits, ModelTokens: r.ModelDailyTokens}
+	}
+	def := pool.DailyLimits{
+		Tokens: cfg.Limits.DailyTokens, Credits: cfg.Limits.DailyCredits, ModelTokens: cfg.Limits.ModelDailyTokens,
+	}
+	p.SetDailyLimits(def, toPool(cfg.Limits.CN), toPool(cfg.Limits.Global))
+}
+
+// setDailyUsageProvider 把 usage 当日聚合接到 pool（issue #95）。
+func setDailyUsageProvider(p *pool.Pool, rec *usage.Recorder) {
+	p.SetDailyUsageProvider(func() map[string]pool.DailyUsage {
+		src := rec.DailyTotalsCached(time.Now())
+		out := make(map[string]pool.DailyUsage, len(src))
+		for uid, u := range src {
+			out[uid] = pool.DailyUsage{Tokens: u.Tokens, Credits: u.Credits, Models: u.Models}
+		}
+		return out
+	})
+}
+
 
 // handlerDeps 是构建 HTTP handler 所需的装配期依赖。
 type handlerDeps struct {

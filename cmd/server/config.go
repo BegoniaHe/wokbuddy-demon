@@ -248,6 +248,15 @@ type Config struct {
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
 
+	// Limits 账号级每日护栏（issue #95）：全局默认 + 可选 cn/global 字段级覆盖。
+	Limits struct {
+		DailyTokens      int64     `json:"daily_tokens"`
+		DailyCredits     float64   `json:"daily_credits"`
+		ModelDailyTokens int64     `json:"model_daily_tokens"`
+		CN               LimitRule `json:"cn"`
+		Global           LimitRule `json:"global"`
+	} `json:"limits"`
+
 	Pool struct {
 		MaxInFlight       int `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		MaxInFlightGlobal int `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
@@ -313,6 +322,13 @@ type Config struct {
 	RotateBudgetDur time.Duration `json:"-"`
 	// KeepaliveIntervalDur 解析后的入站 SSE 心跳间隔（issue #54）；0 = 关闭。
 	KeepaliveIntervalDur time.Duration `json:"-"`
+}
+
+// LimitRule 每日护栏的一组取值（cn/global 覆盖用）。
+type LimitRule struct {
+	DailyTokens      int64   `json:"daily_tokens"`
+	DailyCredits     float64 `json:"daily_credits"`
+	ModelDailyTokens int64   `json:"model_daily_tokens"`
 }
 
 // ModelTimeout 单个模型的超时覆盖；空/0 = 回落全局值。
@@ -862,6 +878,17 @@ func (c *Config) validateBackoffOrder() error {
 
 // validateRanges 字段范围：0 有明确语义（不限 / 关闭）的键不接受负值。
 func (c *Config) validateRanges() error {
+	if err := validateLimitRule("limits", LimitRule{
+		DailyTokens: c.Limits.DailyTokens, DailyCredits: c.Limits.DailyCredits, ModelDailyTokens: c.Limits.ModelDailyTokens,
+	}); err != nil {
+		return err
+	}
+	if err := validateLimitRule("limits.cn", c.Limits.CN); err != nil {
+		return err
+	}
+	if err := validateLimitRule("limits.global", c.Limits.Global); err != nil {
+		return err
+	}
 	if c.Pool.MaxInFlight < 0 {
 		return fmt.Errorf("pool.max_in_flight: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlight)
 	}
@@ -876,6 +903,14 @@ func (c *Config) validateRanges() error {
 	}
 	if c.SessionGCInterval <= 0 {
 		return fmt.Errorf("session_sticky.gc_interval: 必须为正时长，当前 %q", c.SessionSticky.GCInterval)
+	}
+	return nil
+}
+
+// validateLimitRule 校验一组每日限额非负（0 = 关闭）。
+func validateLimitRule(name string, r LimitRule) error {
+	if r.DailyTokens < 0 || r.DailyCredits < 0 || r.ModelDailyTokens < 0 {
+		return fmt.Errorf("%s: 每日限额不能为负（0 = 关闭）", name)
 	}
 	return nil
 }
