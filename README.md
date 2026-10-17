@@ -130,7 +130,7 @@ http://127.0.0.1:7863/panel/
 - **Docker + Docker Compose**（推荐）——或
 - **Windows / macOS / Linux 直接跑单文件二进制**
 - 一个或多个已注册的 CodeBuddy 账号，用于登录
-- 宿主机 Go ≥ 1.22（仅从源码构建时需要）
+- 宿主机 Go ≥ 1.27（仅从源码构建时需要）
 
 ### 方式一：Docker Compose（推荐）
 
@@ -271,7 +271,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 ### Docker 镜像
 
-多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：`wokbuddy-demon`（主服务）、`signin_bin`、`login`、`credit` + 工具脚本。以 `app` 用户（uid 10001）运行，内置 `HEALTHCHECK`。
+多阶段镜像（`golang:1.27-alpine` 构建 → `alpine:3.24` 运行）一次编译全部四个二进制并随镜像分发：`wokbuddy-demon`（主服务）、`signin_bin`、`login`、`credit` + 工具脚本。以 `app` 用户（uid 10001）运行，内置 `HEALTHCHECK`。
 
 ### 工具脚本
 
