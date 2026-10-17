@@ -165,3 +165,19 @@ func TestKeysUpdateLimits(t *testing.T) {
 		t.Errorf("unknown key code=%d", code)
 	}
 }
+
+func TestKeysRealmUpdate(t *testing.T) {
+	store := apikey.New("")
+	p := panelWithKeys(store)
+	_, rec := createKey(t, p, "client")
+	code, body := p.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/realm", `{"realm":"global"}`)
+	if code != http.StatusOK {
+		t.Fatalf("update realm code=%d body=%s", code, body)
+	}
+	if got := store.Realm(rec.ID); got != "global" {
+		t.Fatalf("realm=%q want global", got)
+	}
+	if code, _ := p.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/realm", `{"realm":"mars"}`); code != http.StatusBadRequest {
+		t.Errorf("invalid realm code=%d want 400", code)
+	}
+}

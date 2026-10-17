@@ -307,7 +307,11 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		defer release()
 		ku := &keyUsage{id: res.KeyID}
-		next(w, r.WithContext(context.WithValue(r.Context(), keyUsageKey{}, ku)))
+		ctx := context.WithValue(r.Context(), keyUsageKey{}, ku)
+		if realm := h.cfg.Keys.Realm(res.KeyID); realm != "" {
+			ctx = context.WithValue(ctx, keyRealmCtxKey{}, realm)
+		}
+		next(w, r.WithContext(ctx))
 		h.cfg.Keys.RecordUsage(ku.id, ku.prompt, ku.completion, ku.total)
 	}
 }
@@ -726,10 +730,13 @@ type chatFlow struct {
 	out chatResponder
 
 	// 请求体与解析结果
-	body          []byte
-	stream        bool
-	rawModel      string
-	realm         string
+	body     []byte
+	stream   bool
+	rawModel string
+	realm    string
+	// realmErr 命名密钥出口绑定与请求显式前缀冲突（issue #94）；非 nil 时
+	// serveChat 在选号前返回 400。
+	realmErr      error
 	bareModel     string
 	modelRate     string
 	declaredTools map[string]bool
@@ -793,6 +800,11 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 		return
 	}
 	f := h.newChatFlow(in, out)
+	if f.realmErr != nil {
+		f.out.Error(http.StatusBadRequest, "realm_binding_conflict", f.realmErr.Error(), "")
+		f.st.status = http.StatusBadRequest
+		return
+	}
 	// 出口统一释放：先释放在途租约，再落请求流水行（与原 defer 顺序一致）。
 	defer f.st.done()
 	defer f.releaseHeld()
@@ -816,6 +828,14 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveRequestModel(in.model, h.cfg.ModelAliases)
+	var realmErr error
+	if in.keyRealm != "" {
+		if err := checkKeyRealmBinding(in.model, h.cfg.ModelAliases, in.keyRealm); err != nil {
+			realmErr = err
+		} else {
+			realm = in.keyRealm
+		}
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -838,6 +858,7 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 		stream:   in.stream,
 		rawModel: in.model,
 		realm:    realm,
+		realmErr: realmErr,
 		// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 		// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前

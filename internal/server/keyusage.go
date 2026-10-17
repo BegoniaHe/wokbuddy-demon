@@ -33,3 +33,11 @@ func writeKeyLimitError(w http.ResponseWriter, retryAfter time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "api key rate limit exceeded")
 }
+
+// keyRealmCtxKey 承载命名密钥的出口绑定（issue #94）；默认密钥/未绑定不写入。
+type keyRealmCtxKey struct{}
+
+func keyRealmFrom(ctx context.Context) string {
+	realm, _ := ctx.Value(keyRealmCtxKey{}).(string)
+	return realm
+}

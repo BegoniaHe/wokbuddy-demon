@@ -1,6 +1,9 @@
 package server
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // splitRealm 解析模型名的 "[realm:]model" 前缀，并报告是否显式带前缀。
 // 取第一个 ":"，前段恰为 "cn"/"global" 才剥离；否则视为裸名，realm=cn。
@@ -49,4 +52,29 @@ func resolveRequestModel(model string, aliases map[string]string) (realm, bare s
 		return realm, bare
 	}
 	return targetRealm, targetBare
+}
+
+// checkKeyRealmBinding 校验命名密钥出口绑定（issue #94）是否与请求的显式 realm
+// 冲突。裸模型名不冲突：由 key 绑定决定出口；显式 "cn:"/"global:" 前缀或别名
+// 目标自带的 realm 才视为客户端明确指定，与绑定不同即报 400。
+func checkKeyRealmBinding(model string, aliases map[string]string, keyRealm string) error {
+	realm, explicit := explicitModelRealm(model, aliases)
+	if !explicit || realm == keyRealm {
+		return nil
+	}
+	return fmt.Errorf("该 API key 绑定 %s 出口，但请求模型 %q 指定了 %s；请去掉 realm 前缀或改用匹配的 key", keyRealm, model, realm)
+}
+
+// explicitModelRealm 报告请求模型是否显式指定 realm（前缀或别名目标的显式前缀）。
+func explicitModelRealm(model string, aliases map[string]string) (string, bool) {
+	realm, bare, prefixed := splitRealm(model)
+	if prefixed {
+		return realm, true
+	}
+	if target, ok := aliases[bare]; ok {
+		if targetRealm, _, targetPrefixed := splitRealm(target); targetPrefixed {
+			return targetRealm, true
+		}
+	}
+	return "", false
 }
