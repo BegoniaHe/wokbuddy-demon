@@ -76,12 +76,15 @@ jobs:
               tar czf "$NAME" wokbuddy-demon config.example.json README.md
               ;;
           esac
+          sha256sum "$NAME" > "$NAME.sha256"
           echo "name=$NAME" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.name }}
-          path: ${{ env.name }}
+          path: |
+            ${{ env.name }}
+            ${{ env.name }}.sha256
           retention-days: 14
 
   image:
