@@ -911,7 +911,9 @@ func (a *anthropicStreamWriter) ensureBlock(blockType string) error {
 	case "text":
 		start["content_block"] = map[string]any{"type": "text", "text": ""}
 	case "thinking":
-		start["content_block"] = map[string]any{"type": "thinking", "thinking": ""}
+		// signature 是 Anthropic thinking block 的必需字段；上游不给签名，
+		// 这里输出空串占位，保持事件结构可被 SDK 解析。
+		start["content_block"] = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
 	}
 	return a.event("content_block_start", start)
 }

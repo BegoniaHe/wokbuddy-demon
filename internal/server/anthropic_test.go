@@ -177,6 +177,30 @@ func TestAnthropicStreamText(t *testing.T) {
 	}
 }
 
+// TestAnthropicStreamThinkingBlock thinking 块必须具备 signature 字段（Anthropic
+// 事件结构要求）；上游 reasoning_content 增量映射为 thinking_delta。
+func TestAnthropicStreamThinkingBlock(t *testing.T) {
+	const thinkSSE = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"先想一下\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"答案\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, thinkSSE, true })
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"glm-5.2","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	out := rec.Body.String()
+	for _, want := range []string{
+		`"type":"thinking"`, `"signature":""`, `"type":"thinking_delta"`, `"thinking":"先想一下"`,
+		`"type":"text_delta"`, `"text":"答案"`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stream missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // TestAnthropicStreamToolUse tool_calls → tool_use 块 + input_json_delta。
 func TestAnthropicStreamToolUse(t *testing.T) {
 	const toolSSE = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\"}}]}}]}\n\n" +
