@@ -216,6 +216,16 @@ curl -s http://localhost:7863/healthz
 curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 ```
 
+### SSE 心跳
+
+反向代理（nginx / Cloudflare 等）通常有空闲超时（常见 60–100s）。长时间思考或排队时上游可能迟迟不发帧，网关默认只透传上游帧，连接会被反代切断。设置：
+
+```json
+{ "upstream": { "keepalive_interval": "15s" } }
+```
+
+上游静默超过该间隔时，网关向客户端写一帧 `: keepalive` SSE 注释（不进入 JSON 帧白名单，不影响客户端解析）；上游持续输出时不额外插入。默认 `"0"` 关闭以保持逐字节透传行为。改后需重启。
+
 ### Prometheus 指标
 
 `GET /metrics` 按 Prometheus 文本格式（`text/plain; version=0.0.4`）导出核心指标，可直接配置为抓取目标：
@@ -249,6 +259,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `upstream.rotate_max` | `3` | 单请求最多换号次数 |
 | `upstream.rotate_budget` | `0` | 轮换总时长预算（如 `90s`）；`0` = 不限。与 `rotate_max` 先到先停 |
 | `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
+| `upstream.keepalive_interval` | `0` | 入站 SSE 主动心跳间隔（如 `15s`）；上游静默时写 `: keepalive` 注释帧。`0` = 关闭 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |
 | `schedule.travel_hours` | `[9, 21]` | 每日整点推进猫猫旅行状态机 |

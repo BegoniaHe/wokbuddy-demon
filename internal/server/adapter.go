@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -17,7 +18,7 @@ import (
 
 // newChatInput 读取并解码入站请求，返回传输无关输入与输出端口。返回 false
 // 表示请求体读取失败、已写出 400（核心不启动）。
-func newChatInput(w http.ResponseWriter, r *http.Request) (chatInput, chatResponder, bool) {
+func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration) (chatInput, chatResponder, bool) {
 	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入。读错误只可能
 	// 来自客户端自己断流，就地 400，不把半截 JSON 喂上游 unmarshal（#41 防御语义）。
 	body, err := io.ReadAll(r.Body)
@@ -42,13 +43,14 @@ func newChatInput(w http.ResponseWriter, r *http.Request) (chatInput, chatRespon
 		trace:     requestTraceFrom(r),
 		keyUsage:  keyUsageFrom(r.Context()),
 	}
-	return in, &httpResponder{w: w}, true
+	return in, &httpResponder{w: w, keepalive: keepalive}, true
 }
 
 // httpResponder 把核心的结构化结果编码为 OpenAI 兼容 HTTP 响应。它是 chat 路径
 // 上唯一写 http.ResponseWriter 的类型。
 type httpResponder struct {
-	w http.ResponseWriter
+	w         http.ResponseWriter
+	keepalive time.Duration
 }
 
 // JSON 写出非流式成功响应（OpenAI JSON）。
@@ -69,5 +71,8 @@ func (r *httpResponder) Stream(rc io.Reader, hint func(string) string, repair *u
 		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
 	}
 	opts = append(opts, upstream.WithMarkupRepair(repair))
+	if r.keepalive > 0 {
+		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
+	}
 	return upstream.StreamHint(r.w, rc, hint, opts...)
 }

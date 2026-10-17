@@ -250,6 +250,8 @@ func main() {
 		MaxRotate:      cfg.Upstream.RotateMax,
 		RotateBudget:   cfg.RotateBudgetDur,
 		RotateStatuses: rotateStatusSet(cfg.Upstream.RotateStatusCodes),
+		// 入站 SSE 心跳（issue #54）：0 = 关闭；改后需重启。
+		KeepaliveInterval: cfg.KeepaliveIntervalDur,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -640,7 +642,7 @@ func restartRequiredFields(c *Config) []string {
 	// 轮换策略（rotate_max/rotate_budget/rotate_status_codes，issue #17）同样在装配期
 	// 被 server handler 捕获，改后需重启。
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds",
-		"upstream.idle_timeout_seconds", "upstream.user_agent",
+		"upstream.idle_timeout_seconds", "upstream.keepalive_interval", "upstream.user_agent",
 		"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
 		"upstream.proxies")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
