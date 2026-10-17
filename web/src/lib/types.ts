@@ -89,6 +89,7 @@ export interface ApiKey {
   total_tokens?: number;
   rejected?: number;
   limits?: ApiKeyLimits;
+  realm?: '' | 'cn' | 'global';
 }
 
 export interface Overview {

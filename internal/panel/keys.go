@@ -117,6 +117,33 @@ func (p *Panel) keysUpdateLimits(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// keysUpdateRealm 更新命名密钥的出口绑定（issue #94）：空 = 不绑定，cn/global = 固定。
+func (p *Panel) keysUpdateRealm(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Keys == nil {
+		writeErr(w, http.StatusNotImplemented, "api key store not available")
+		return
+	}
+	var body struct {
+		Realm string `json:"realm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	id := r.PathValue("id")
+	ok, err := p.cfg.Keys.SetRealm(id, strings.TrimSpace(body.Realm))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "key not found")
+		return
+	}
+	log.Printf("panel: 更新命名密钥出口 id=%s realm=%q", id, body.Realm)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
 // normalizeLimits 校验限制值并把模型 glob 去空白/去重。
 func normalizeLimits(in apikey.Limits) (apikey.Limits, error) {
 	if in.RPM < 0 || in.TPM < 0 || in.MaxConcurrent < 0 {

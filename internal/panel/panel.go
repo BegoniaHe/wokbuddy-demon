@@ -212,6 +212,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAuth(p.keysRevoke))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAuth(p.keysDelete))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAuth(p.keysUpdateLimits))
+	p.mux.HandleFunc("POST /panel/api/keys/{id}/realm", p.withAuth(p.keysUpdateRealm))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("POST /panel/api/model_probes", p.withAuth(p.modelProbe))
 	p.mux.HandleFunc("GET /panel/api/model_health", p.withAuth(p.modelHealth))

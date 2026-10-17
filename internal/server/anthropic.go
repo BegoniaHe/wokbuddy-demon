@@ -108,6 +108,7 @@ func newAnthropicChatInput(w http.ResponseWriter, r *http.Request, keepalive tim
 		traceID:   r.Header.Get("X-Trace-Id"),
 		trace:     requestTraceFrom(r),
 		keyUsage:  keyUsageFrom(r.Context()),
+		keyRealm:  keyRealmFrom(r.Context()),
 	}
 	return in, &anthropicResponder{w: w, model: model, keepalive: keepalive}, true
 }

@@ -49,6 +49,7 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 		traceID:   r.Header.Get("X-Trace-Id"),
 		trace:     requestTraceFrom(r),
 		keyUsage:  keyUsageFrom(r.Context()),
+		keyRealm:  keyRealmFrom(r.Context()),
 	}
 	return in, &httpResponder{w: w, keepalive: keepalive}, true
 }

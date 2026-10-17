@@ -175,3 +175,25 @@ func TestRecordUsageNilSafeAndCounts(t *testing.T) {
 		t.Error("last_used_at not set")
 	}
 }
+
+func TestSetRealmPersistsAndValidates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	s := New(path)
+	rec, _, err := s.Create("client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.SetRealm(rec.ID, "global"); !ok || err != nil {
+		t.Fatalf("set realm: ok=%v err=%v", ok, err)
+	}
+	if got := s.Realm(rec.ID); got != "global" {
+		t.Fatalf("realm=%q want global", got)
+	}
+	if _, err := s.SetRealm(rec.ID, "mars"); err == nil {
+		t.Error("invalid realm should fail")
+	}
+	reloaded := New(path)
+	if got := reloaded.Realm(rec.ID); got != "global" {
+		t.Errorf("reloaded realm=%q want global", got)
+	}
+}

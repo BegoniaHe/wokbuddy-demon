@@ -9,6 +9,15 @@ import { Button } from '@/components/ui/button';
 import { Field, FieldLabel, FieldDescription } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import {
+  Select,
+  SelectContent,
+  SelectOptions,
+  SelectTrigger,
+  SelectValue,
+  selectOptionItems,
+  type SelectOption,
+} from '@/components/ui/select';
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -38,6 +47,12 @@ import {
   DialogFooter,
 } from '@/components/ui/dialog';
 
+const REALM_OPTIONS = [
+  { value: 'auto', label: '跟随模型前缀 / 全局开关' },
+  { value: 'cn', label: '固定 cn' },
+  { value: 'global', label: '固定 global' },
+] as const satisfies readonly SelectOption[];
+
 // KeysView：命名 API 密钥管理。命名密钥只用于网关 /v1/*（chat/models）；
 // 面板与 /status、/metrics 仍只认 config.json 的默认 api_key。
 export function KeysView() {
@@ -50,6 +65,7 @@ export function KeysView() {
   const [tpm, setTpm] = useState('');
   const [concurrent, setConcurrent] = useState('');
   const [models, setModels] = useState('');
+  const [realm, setRealm] = useState<'' | 'cn' | 'global'>('');
 
   const keysQ = useQuery({
     queryKey: ['keys'],
@@ -87,10 +103,12 @@ export function KeysView() {
   });
 
   const limitsM = useMutation({
-    mutationFn: (v: { id: string; limits: ApiKeyLimits }) =>
-      postJSON('keys/' + v.id + '/limits', { limits: v.limits }),
+    mutationFn: async (v: { id: string; realm: '' | 'cn' | 'global'; limits: ApiKeyLimits }) => {
+      await postJSON('keys/' + v.id + '/realm', { realm: v.realm });
+      return postJSON('keys/' + v.id + '/limits', { limits: v.limits });
+    },
     onSuccess: () => {
-      toast('限制已保存，下一个请求生效', 'ok');
+      toast('设置已保存，下一个请求生效', 'ok');
       setLimitsFor(null);
       void invalidate();
     },
@@ -103,6 +121,7 @@ export function KeysView() {
     setTpm(String(k.limits?.tpm ?? ''));
     setConcurrent(String(k.limits?.max_concurrent ?? ''));
     setModels((k.limits?.models ?? []).join(', '));
+    setRealm(k.realm ?? '');
   };
 
   const saveLimits = () => {
@@ -123,6 +142,7 @@ export function KeysView() {
     }
     limitsM.mutate({
       id: limitsFor.id,
+      realm,
       limits: {
         rpm: nextRpm,
         tpm: nextTpm,
@@ -183,6 +203,7 @@ export function KeysView() {
                   <TableHead className="text-right">请求数</TableHead>
                   <TableHead className="text-right">Token</TableHead>
                   <TableHead className="text-right">拒绝</TableHead>
+                  <TableHead>出口</TableHead>
                   <TableHead>限制</TableHead>
                   <TableHead>创建</TableHead>
                   <TableHead>最近使用</TableHead>
@@ -204,6 +225,7 @@ export function KeysView() {
                     <TableCell className="text-right">
                       <span className="font-mono tabular-nums">{k.rejected ?? 0}</span>
                     </TableCell>
+                    <TableCell className="text-muted-foreground">{k.realm || '跟随模型'}</TableCell>
                     <TableCell className="text-muted-foreground">{limitsText(k)}</TableCell>
                     <TableCell className="text-muted-foreground">{ago(k.created_at)}</TableCell>
                     <TableCell className="text-muted-foreground">{k.last_used_at ? ago(k.last_used_at) : '—'}</TableCell>
@@ -309,6 +331,21 @@ export function KeysView() {
             <DialogTitle>限制「{limitsFor?.name}」</DialogTitle>
             <DialogDescription>0 或留空 = 不限制；保存后下一个请求生效。模型白名单支持 glob 与 cn:/global: 前缀。</DialogDescription>
           </DialogHeader>
+          <Field>
+            <FieldLabel>出口绑定</FieldLabel>
+            <Select
+              items={selectOptionItems(REALM_OPTIONS)}
+              value={realm || 'auto'}
+              onValueChange={(v) => setRealm((v === 'auto' ? '' : v) as '' | 'cn' | 'global')}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectOptions options={REALM_OPTIONS} />
+              </SelectContent>
+            </Select>
+            <FieldDescription>固定后该密钥只走对应域；与请求的显式 cn:/global: 前缀冲突时返回 400。</FieldDescription>
+          </Field>
           <div className="grid grid-cols-2 gap-3">
             <Field>
               <FieldLabel>RPM</FieldLabel>
