@@ -7,11 +7,19 @@ import { dtLocalParse, dtLocalValue } from '@/lib/format';
 import {
   Select,
   SelectContent,
-  SelectItem,
+  SelectOptions,
   SelectTrigger,
   SelectValue,
+  selectOptionItems,
+  type SelectOption,
 } from '@/components/ui/select';
 import { Input } from '@/components/ui/input';
+
+// 时间范围预设（value → 中文标签），同时驱动 items 映射与列表项。
+const PRESET_OPTIONS: readonly SelectOption[] = TRANGE_PRESETS.map(([value, label]) => ({
+  value,
+  label,
+}));
 
 // TimeRange：预设下拉 + 「自定义」时展开的起止时间。起止颠倒就地标红（不静默纠正）。
 export function TimeRange({
@@ -42,16 +50,12 @@ export function TimeRange({
 
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
-      <Select value={value.preset} onValueChange={setPreset}>
+      <Select items={selectOptionItems(PRESET_OPTIONS)} value={value.preset} onValueChange={setPreset}>
         <SelectTrigger size="sm" className="w-28">
           <SelectValue>{presetLabel}</SelectValue>
         </SelectTrigger>
         <SelectContent>
-          {TRANGE_PRESETS.map(([v, label]) => (
-            <SelectItem key={v} value={v}>
-              {label}
-            </SelectItem>
-          ))}
+          <SelectOptions options={PRESET_OPTIONS} />
         </SelectContent>
       </Select>
       {custom ? (

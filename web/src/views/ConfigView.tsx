@@ -17,9 +17,11 @@ import { Input } from '@/components/ui/input';
 import {
   Select,
   SelectContent,
-  SelectItem,
+  SelectOptions,
   SelectTrigger,
   SelectValue,
+  selectOptionItems,
+  type SelectOption,
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import {
@@ -31,6 +33,13 @@ import {
 } from '@/components/ui/card';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
+
+// 系统提示词注入模式。
+const PROMPT_MODE_OPTIONS = [
+  { value: 'custom', label: 'custom — 网关自有提示词（避免指纹误报）' },
+  { value: 'append', label: 'append — 客户端 system 后插网关提示词（并用）' },
+  { value: 'passthrough', label: 'passthrough — 透传客户端原始 system' },
+] as const satisfies readonly SelectOption[];
 
 export function ConfigView() {
   const qc = useQueryClient();
@@ -137,7 +146,7 @@ export function ConfigView() {
             <Field>
               <FieldLabel>API 密钥</FieldLabel>
               <div className="flex items-center gap-2">
-                {text('api_key', { type: showKey ? 'text' : 'password', placeholder: '留空 = 不鉴权' })}
+                {text('api_key', { type: showKey ? 'text' : 'password', autoComplete: 'new-password', placeholder: '留空 = 不鉴权' })}
                 <Button size="xs" onClick={() => setShowKey((s) => !s)}>
                   {showKey ? '隐藏' : '显示'}
                 </Button>
@@ -344,14 +353,15 @@ export function ConfigView() {
           <div className="grid gap-x-5 md:grid-cols-2">
             <Field>
               <FieldLabel>系统提示词模式</FieldLabel>
-              <Select value={String(values.prompt_mode ?? 'custom')} onValueChange={(v) => set('prompt_mode', v ?? 'custom')}>
+              <Select
+                items={selectOptionItems(PROMPT_MODE_OPTIONS)}
+                value={String(values.prompt_mode ?? 'custom')}
+                onValueChange={(v) => set('prompt_mode', v ?? 'custom')}>
                 <SelectTrigger>
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="custom">custom — 网关自有提示词（避免指纹误报）</SelectItem>
-                  <SelectItem value="append">append — 客户端 system 后插网关提示词（并用）</SelectItem>
-                  <SelectItem value="passthrough">passthrough — 透传客户端原始 system</SelectItem>
+                  <SelectOptions options={PROMPT_MODE_OPTIONS} />
                 </SelectContent>
               </Select>
               <FieldDescription>需重启</FieldDescription>

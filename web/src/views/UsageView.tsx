@@ -29,9 +29,11 @@ import { Button } from '@/components/ui/button';
 import {
   Select,
   SelectContent,
-  SelectItem,
+  SelectOptions,
   SelectTrigger,
   SelectValue,
+  selectOptionItems,
+  type SelectOption,
 } from '@/components/ui/select';
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import {
@@ -51,6 +53,14 @@ import {
 } from '@/components/ui/table';
 import { MixBar, Legend } from '@/components/ui-kit';
 import { TimeRange } from '@/components/TimeRange';
+
+// 用量明细排序选项。
+const SORT_OPTIONS = [
+  { value: 'total', label: '合计 Token' },
+  { value: 'requests', label: '请求数' },
+  { value: 'errors', label: '失败数' },
+  { value: 'latency', label: '平均延迟' },
+] as const satisfies readonly SelectOption[];
 
 function usPct(part: unknown, total: unknown): string {
   const t = Number(total || 0);
@@ -231,15 +241,15 @@ export function UsageView() {
           <CardAction>
             <div className="flex flex-wrap items-center gap-3">
               <span className="text-xs text-muted-foreground">{rows.length + ' 行 · 请求数含失败尝试'}</span>
-              <Select value={sort} onValueChange={(v) => setSort(v as UsSort)}>
+              <Select
+                items={selectOptionItems(SORT_OPTIONS)}
+                value={sort}
+                onValueChange={(v) => setSort(v as UsSort)}>
                 <SelectTrigger size="sm" className="w-32">
-                  <SelectValue placeholder="排序" />
+                  <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="total">合计 Token</SelectItem>
-                  <SelectItem value="requests">请求数</SelectItem>
-                  <SelectItem value="errors">失败数</SelectItem>
-                  <SelectItem value="latency">平均延迟</SelectItem>
+                  <SelectOptions options={SORT_OPTIONS} />
                 </SelectContent>
               </Select>
             </div>
