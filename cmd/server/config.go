@@ -117,6 +117,8 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+		// CheckinAccountDelay 签到任务账号间等待（issue #59）：如 "800ms"；"0" = 不限。
+		CheckinAccountDelay string `json:"checkin_account_delay"`
 	} `json:"schedule"`
 
 	Models struct {
@@ -263,6 +265,8 @@ type Config struct {
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
+	CheckinAccountDelayDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
@@ -316,6 +320,7 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.CheckinAccountDelay = "800ms"
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -551,6 +556,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	if err := c.normalizeNotify(); err != nil {
+		return err
+	}
+	if err := c.normalizeCheckinDelay(); err != nil {
 		return err
 	}
 	if err := c.normalizeSchedule(); err != nil {
@@ -990,6 +998,25 @@ func (c *Config) normalizeExpiringDurations() error {
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
 	}
+	return nil
+}
+
+// normalizeCheckinDelay 解析签到账号间等待（issue #59）：空回落 800ms，
+// "0" = 不限，负时长报错。
+func (c *Config) normalizeCheckinDelay() error {
+	raw := strings.TrimSpace(c.Schedule.CheckinAccountDelay)
+	if raw == "" {
+		raw = "800ms"
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("schedule.checkin_account_delay: %w", err)
+	}
+	if d < 0 {
+		return fmt.Errorf("schedule.checkin_account_delay: 负时长 %q 无意义", c.Schedule.CheckinAccountDelay)
+	}
+	c.Schedule.CheckinAccountDelay = raw
+	c.CheckinAccountDelayDur = d
 	return nil
 }
 

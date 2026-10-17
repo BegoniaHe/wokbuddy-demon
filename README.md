@@ -321,6 +321,7 @@ claude
 | `schedule.activity_hours` | `[10]` | 每日整点对话活跃上报 |
 | `schedule.keepalive_hours` | `[22]` | 每日整点刷新凭证保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
+| `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
 | `pool.credit_floor` | `100` | 积分保底：余额低于该值不再参与收费模型轮换 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |

@@ -158,6 +158,7 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		CheckinAccountDelay:    cfg.CheckinAccountDelayDur,
 	})
 	logScheduleConfig(cfg)
 
@@ -592,6 +593,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 
 	return restartRequiredFields(newCfg), nil
 }
