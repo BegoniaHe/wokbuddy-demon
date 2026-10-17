@@ -153,6 +153,8 @@ func NewHandler(cfg Config) *Handler {
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/messages", h.withClientAuth(h.anthropicMessagesHandler))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withClientAuth(h.anthropicCountTokensHandler))
 	h.mux.HandleFunc("GET /v1/models", h.withClientAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -183,8 +185,9 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
+		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages") {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
@@ -216,6 +219,16 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// writeClientAuthError 按入站协议写出鉴权失败：Anthropic 端点用 Anthropic 错误体，
+// 其余保持 OpenAI 错误体。
+func writeClientAuthError(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key", "")
+		return
+	}
+	writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+}
+
 // withClientAuth 网关 API 面（/v1/*）的鉴权：默认密钥或任一未撤销命名密钥。
 //
 // 命中命名密钥时挂一个用量累加器到 context，请求结束后计入该密钥的请求数/token
@@ -225,7 +238,7 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		res := httpauth.Authenticate(r, h.loadLive().APIKey, h.cfg.Keys.Keys())
 		if !res.OK {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			writeClientAuthError(w, r)
 			return
 		}
 		if res.IsDefault || h.cfg.Keys == nil {
@@ -652,6 +665,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	h.serveChat(r, in, out)
+}
+
+// serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
+func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 	f := h.newChatFlow(in, out)
 	// 出口统一释放：先释放在途租约，再落请求流水行（与原 defer 顺序一致）。
 	defer f.st.done()
