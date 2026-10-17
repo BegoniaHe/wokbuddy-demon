@@ -246,6 +246,8 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。
+		ModelAliases: cfg.Models.Aliases,
 		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
 		MaxRotate:      cfg.Upstream.RotateMax,
 		RotateBudget:   cfg.RotateBudgetDur,
@@ -646,7 +648,8 @@ func restartRequiredFields(c *Config) []string {
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval",
+	out = append(out, "models.aliases",
+		"session_sticky.ttl", "session_sticky.gc_interval",
 		"logging.request_archive_enabled", "logging.request_retention_days",
 		"logging.request_archive_max_mb", "server.read_timeout")
 	return out

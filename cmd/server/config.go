@@ -110,6 +110,15 @@ type Config struct {
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
 	} `json:"schedule"`
 
+	Models struct {
+		// Aliases 客户端模型别名 → 上游模型（issue #52）：
+		// {"claude-sonnet-4-5": "cn:hy4", "gpt-5-codex": "hy4"}。
+		// 键必须是裸名（不含 realm 前缀，大小写敏感）；值沿用 "[realm:]model"
+		// 语法，省略 realm 时继承请求侧的 realm（裸请求即 cn）。
+		// 命中别名后选号/粘性/成本台账/日志一律使用解析后的裸模型名。
+		Aliases map[string]string `json:"aliases"`
+	} `json:"models"`
+
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
 		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
@@ -511,6 +520,9 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.normalizeStaticDefaults()
+	if err := c.normalizeModelAliases(); err != nil {
+		return err
+	}
 	if err := c.normalizeSchedule(); err != nil {
 		return err
 	}
@@ -522,6 +534,53 @@ func (c *Config) normalize() error {
 	}
 	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
 	return c.Validate()
+}
+
+// normalizeModelAliases 校验并归一化模型别名（issue #52）：键必须是裸名，
+// 值必须是可解析的非空 "[realm:]model"；首尾空白去掉，去空白后重名直接报错
+// （否则 map 覆盖顺序不确定，配置会静默丢一项）。
+func (c *Config) normalizeModelAliases() error {
+	if len(c.Models.Aliases) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(c.Models.Aliases))
+	for key, value := range c.Models.Aliases {
+		name := strings.TrimSpace(key)
+		if name == "" {
+			return errors.New("models.aliases: 别名不能为空")
+		}
+		if strings.Contains(name, ":") {
+			return fmt.Errorf("models.aliases[%q]: 别名不得含 realm 前缀，请写成裸模型名", name)
+		}
+		target, err := normalizeAliasTarget(name, value)
+		if err != nil {
+			return err
+		}
+		if _, dup := out[name]; dup {
+			return fmt.Errorf("models.aliases: 别名 %q 去掉首尾空白后重复", name)
+		}
+		out[name] = target
+	}
+	c.Models.Aliases = out
+	return nil
+}
+
+// normalizeAliasTarget 去掉目标首尾空白并校验 "[realm:]model" 的裸名部分非空。
+func normalizeAliasTarget(name, value string) (string, error) {
+	target := strings.TrimSpace(value)
+	if target == "" {
+		return "", fmt.Errorf("models.aliases[%q]: 目标模型不能为空", name)
+	}
+	model := target
+	if i := strings.IndexByte(model, ':'); i >= 0 {
+		if prefix := model[:i]; prefix == "cn" || prefix == "global" {
+			model = model[i+1:]
+		}
+	}
+	if model == "" {
+		return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 缺少裸模型名", name, target)
+	}
+	return target, nil
 }
 
 // normalizeProxies 校验出站代理 URL（issue #15）：任一非法即拒绝（避免运行时才暴露）。

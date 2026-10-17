@@ -260,6 +260,29 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
+| `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
+
+### 模型别名
+
+`models.aliases` 把客户端惯用模型名映射到上游模型，免去逐客户端改配置：
+
+```json
+{
+  "models": {
+    "aliases": {
+      "claude-sonnet-4-5": "cn:hy4",
+      "gpt-5-codex": "cn:gpt-5.6-sol",
+      "claude-global": "global:hy4"
+    }
+  }
+}
+```
+
+- 键必须是裸模型名（不含 `cn:` / `global:` 前缀，大小写敏感）。
+- 值沿用 `[realm:]model` 语法；省略 realm 时继承请求侧 realm（裸请求即 `cn`）。
+- 先剥请求的 realm 前缀再查别名；未命中则原样透传，行为与未配置别名一致。
+- 命中后选号、会话粘性、成本台账与日志统一使用解析后的裸模型名；`GET /v1/models` 会追加别名条目并附带 `upstream_id`。
+- 别名在进程启动时装载，修改后需重启。
 
 ### 环境变量覆盖
 
