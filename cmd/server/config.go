@@ -260,6 +260,13 @@ type Config struct {
 		Global           LimitRule `json:"global"`
 	} `json:"limits"`
 
+	// Pricing OpenRouter 等价价格估算（issue #99）；只读展示，不参与调度。
+	Pricing struct {
+		Enabled        bool    `json:"enabled"`
+		RefreshMinutes int     `json:"refresh_minutes"`
+		ExchangeRate   float64 `json:"exchange_rate"`
+	} `json:"pricing"`
+
 	Pool struct {
 		MaxInFlight       int `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
 		MaxInFlightGlobal int `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2

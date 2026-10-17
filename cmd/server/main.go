@@ -276,6 +276,7 @@ func main() {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	priceCat := newPricingCatalog(cfg)
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -325,6 +326,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	startPricingRefresh(ctx, cfg, priceCat)
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 

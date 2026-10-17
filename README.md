@@ -383,6 +383,9 @@ claude
 | `limits.daily_credits` | `0` | 账号当日消耗积分达限后只接免费模型；`0` = 关闭 |
 | `limits.model_daily_tokens` | `0` | 账号 × 模型当日 token 达限后只禁该模型；`0` = 关闭 |
 | `limits.cn` / `limits.global` | 同全局 | 按域字段级覆盖（>0 生效） |
+| `pricing.enabled` | `false` | 在用量页展示 OpenRouter 公开价折算的等价花费；只读，不参与调度/计费 |
+| `pricing.refresh_minutes` | `0` | 价格自动刷新周期；`0` = 只在启动时拉取一次 |
+| `pricing.exchange_rate` | `1` | 展示币种换算系数（1 = USD） |
 | `pool.max_in_flight_total` | `0` | 网关级全局在途上限；满额新请求返回 503 且不选号；`0` = 不限。热生效 |
 | `pool.credit_floor` | `0`（示例 `100`） | 积分保底：余额低于该值不再参与收费模型轮换；`0` = 关闭 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |

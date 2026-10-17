@@ -14,6 +14,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/server"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
@@ -118,6 +119,43 @@ func configureAccountRouting(p *pool.Pool, up *upstream.Client, cfg *Config) {
 		}
 		return "", nil
 	}
+}
+
+// newPricingCatalog 按配置创建价格缓存（issue #99）；关闭时返回 nil。
+func newPricingCatalog(cfg *Config) *pricing.Catalog {
+	if !cfg.Pricing.Enabled {
+		return nil
+	}
+	return pricing.New("", nil)
+}
+
+// startPricingRefresh 启动 OpenRouter 价格拉取（issue #99）：启动即拉一次，
+// refresh_minutes > 0 时按周期刷新；失败保留旧快照并记日志。
+func startPricingRefresh(ctx context.Context, cfg *Config, cat *pricing.Catalog) {
+	if cat == nil {
+		return
+	}
+	refresh := func() {
+		if err := cat.Refresh(ctx); err != nil {
+			log.Printf("WARN: [pricing] 拉取 OpenRouter 价格失败（保留上次快照）: %v", err)
+		}
+	}
+	go refresh()
+	if cfg.Pricing.RefreshMinutes <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(time.Duration(cfg.Pricing.RefreshMinutes) * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				refresh()
+			}
+		}
+	}()
 }
 
 // handlerDeps 是构建 HTTP handler 所需的装配期依赖。
