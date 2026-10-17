@@ -28,7 +28,7 @@ func TestModelAliasesConfigRejectsInvalid(t *testing.T) {
 		{"别名含 realm 前缀", map[string]string{"cn:claude": "hy4"}},
 		{"空目标", map[string]string{"claude": " "}},
 		{"目标缺裸名", map[string]string{"claude": "cn:"}},
-		{"目标 realm 前缀未知", map[string]string{"claude": "gloabl:hy4"}},
+		{"目标 realm 前缀未知", map[string]string{"claude": "other:hy4"}},
 		{"目标 realm 前缀为空", map[string]string{"claude": ":hy4"}},
 		{"去空白后重名", map[string]string{"claude": "hy4", " claude ": "hy5"}},
 	}
