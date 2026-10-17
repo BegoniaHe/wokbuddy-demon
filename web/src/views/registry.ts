@@ -7,6 +7,7 @@ export const VIEWS = [
   'keys',
   'config',
   'logs',
+  'agents',
 ] as const;
 
 export type ViewId = (typeof VIEWS)[number];
@@ -20,4 +21,5 @@ export const VIEW_TITLES: Record<ViewId, string> = {
   keys: '密钥',
   config: '配置',
   logs: '运行日志',
+  agents: '智能体配置',
 };

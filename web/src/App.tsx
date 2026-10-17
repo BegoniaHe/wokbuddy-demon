@@ -17,6 +17,7 @@ import { ModelsView } from '@/views/ModelsView';
 import { KeysView } from '@/views/KeysView';
 import { ConfigView } from '@/views/ConfigView';
 import { LogsView } from '@/views/LogsView';
+import { AgentsView } from '@/views/AgentsView';
 
 export default function App() {
   const [view, go] = useHashRoute<ViewId>(VIEWS, 'accounts');
@@ -61,6 +62,8 @@ export default function App() {
         return <KeysView />;
       case 'config':
         return <ConfigView />;
+      case 'agents':
+        return <AgentsView />;
       case 'logs':
         return <LogsView />;
     }
