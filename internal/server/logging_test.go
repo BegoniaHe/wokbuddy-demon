@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // captureStdout 重定向 os.Stdout（连同 chatLogOut，见 SetChatLogOutput 的注入点）
@@ -493,5 +495,44 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestChatStatsReaderLineTooLong chatStatsReader 自己也是按行读取点：单行超过
+// upstream.MaxSSELineBytes 时必须上抛 ErrSSELineTooLong，不把超长行的部分字节
+// 拷贝给下游透传（issue #113）。
+func TestChatStatsReaderLineTooLong(t *testing.T) {
+	huge := strings.Repeat("x", upstream.MaxSSELineBytes+2048)
+	s := newChatStatsReaderSince(strings.NewReader("data: "+huge+"\n\n"), time.Now())
+	buf := make([]byte, 64*1024)
+	var err error
+	for range 1000 {
+		_, err = s.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+	if !errors.Is(err, upstream.ErrSSELineTooLong) {
+		t.Fatalf("err=%v want ErrSSELineTooLong", err)
+	}
+}
+
+// TestChatStatsReaderNormalLines 回归：正常 SSE 行的解析与透传不受上限影响。
+func TestChatStatsReaderNormalLines(t *testing.T) {
+	s := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	var out strings.Builder
+	buf := make([]byte, 4096)
+	for {
+		n, err := s.Read(buf)
+		out.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+	if !strings.Contains(out.String(), "data: [DONE]") {
+		t.Errorf("透传内容不完整: %q", out.String())
+	}
+	if s.TTFB() <= 0 {
+		t.Errorf("TTFB 未记录")
 	}
 }
