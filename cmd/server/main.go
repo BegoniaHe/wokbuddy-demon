@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/agentcfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -88,61 +89,6 @@ func loadConfig(path string) (*Config, error) {
 	return Load("")
 }
 
-// handlerDeps 是构建 HTTP handler 所需的装配期依赖。集中传递避免 main
-// 内联一个超长配置字面量，也让字段来源一目了然。
-type handlerDeps struct {
-	cfg         *Config
-	pool        *pool.Pool
-	up          *upstream.Client
-	keys        *apikey.Store
-	session     *session.Router
-	stickyCount func() int
-	redisMode   string
-	panel       *panel.Panel
-	live        *livecfg.Holder
-	usage       *usage.Recorder
-	requestLog  *reqlog.Recorder
-	notifier    notify.Sender
-}
-
-// buildHandler 把装配期依赖映射为 server.Config。装配期捕获的字段改动需重启。
-func buildHandler(d handlerDeps) *server.Handler {
-	return server.NewHandler(server.Config{
-		Pool:         d.pool,
-		Upstream:     d.up,
-		APIKey:       d.cfg.APIKey,
-		Keys:         d.keys,
-		Session:      d.session,
-		StickyCount:  d.stickyCount,
-		RedisMode:    d.redisMode,
-		SoftCooldown: d.cfg.SoftRateDur,
-		Panel:        d.panel,
-		Live:         d.live,
-		Usage:        d.usage,
-		RequestLog:   d.requestLog,
-		PromptMode:   d.cfg.Prompt.Mode,
-		PromptText:   d.cfg.PromptText,
-		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
-		// 裸用/测试路径拿到同一缺省值。
-		RecordClientInfo:    d.cfg.Logging.RequestClientInfo,
-		DecisionTrace:       d.cfg.Logging.DecisionTrace,
-		DecisionTraceSample: d.cfg.Logging.DecisionTraceSample,
-		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
-		GlobalEnabled: d.cfg.Global.Enabled,
-		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。
-		ModelAliases: d.cfg.Models.Aliases,
-		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
-		MaxRotate:      d.cfg.Upstream.RotateMax,
-		RotateBudget:   d.cfg.RotateBudgetDur,
-		RotateStatuses: rotateStatusSet(d.cfg.Upstream.RotateStatusCodes),
-		// 入站 SSE 心跳（issue #54）：0 = 关闭；改后需重启。
-		KeepaliveInterval: d.cfg.KeepaliveIntervalDur,
-		// 聊天入口请求体上限（issue #86）：0 = 不限制。
-		MaxBodyBytes: d.cfg.Server.MaxBodyBytes,
-		Notifier:     d.notifier,
-	})
-}
-
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 	flag.Parse()
@@ -177,7 +123,7 @@ func main() {
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(cfg.Pool.MaxInFlightGlobal) // global 域 WAF 风控分档（P1-1）
-	p.SetMaxInFlightTotal(cfg.Pool.MaxInFlightTotal) // 网关级全局在途上限（issue #92）
+	p.SetMaxInFlightTotal(cfg.Pool.MaxInFlightTotal)   // 网关级全局在途上限（issue #92）
 	applyDailyLimits(p, cfg)
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
@@ -278,6 +224,8 @@ func main() {
 	}
 
 	priceCat := newPricingCatalog(cfg)
+	home, _ := os.UserHomeDir()
+	agents := agentcfg.New(home, stateSibling(cfg.StateFile, "agent-backups"))
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Usage:       rec,
@@ -300,6 +248,7 @@ func main() {
 		Pricing:        priceCat,
 		PricingRate:    cfg.Pricing.ExchangeRate,
 		Quota:          quotaStore,
+		Agents:         agents,
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -314,7 +263,7 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := buildHandler(handlerDeps{
-         cfg,
+		cfg:         cfg,
 		pool:        p,
 		up:          up,
 		keys:        keyStore,

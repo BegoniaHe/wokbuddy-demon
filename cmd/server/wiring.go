@@ -157,6 +157,8 @@ func startPricingRefresh(ctx context.Context, cfg *Config, cat *pricing.Catalog)
 			}
 		}
 	}()
+}
+
 // setupQuota 创建撞线事件存储并接到 pool（issue #101）。
 func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
 	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
@@ -186,7 +188,7 @@ type handlerDeps struct {
 // buildHandler 把装配期依赖映射为 server.Config；这些字段改动需重启。
 func buildHandler(d handlerDeps) *server.Handler {
 	return server.NewHandler(server.Config{
-         d.pool,
+		Pool:         d.pool,
 		Upstream:     d.up,
 		APIKey:       d.cfg.APIKey,
 		Keys:         d.keys,

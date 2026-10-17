@@ -498,6 +498,15 @@ claude
 PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 ```
 
+### 智能体一键配置
+
+面板「智能体配置」页（仅本机回环可用）可检测 Claude Code / Codex CLI / OpenCode，并把网关 provider 增量写入各客户端配置：
+
+- 写入前把首次原件备份到 `data/agent-backups/<client>/`；还原按备份字节级恢复，网关新建的文件会被删除。
+- 若写入后用户手改过配置，还原前会提示并要求强制确认。
+- API key 只写入客户端本地配置，面板不回显。
+- Codex CLI 的 provider 使用环境变量 `WOKBUDDY_API_KEY`，写入后需在启动 Codex 的 shell 中导出同一把 key。
+
 ### 面板需要鉴权吗？
 
 `api_key` 非空时面板要求输入一次密钥（浏览器记住）；为空则直接可用。**公网部署务必设置 `api_key` 并置于 HTTPS 之后。**
