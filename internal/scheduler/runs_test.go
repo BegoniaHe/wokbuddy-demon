@@ -184,6 +184,17 @@ func TestBlackcatManualRespectsWindow(t *testing.T) {
 	}
 }
 
+// TestCheckinFollowupStreakTrigger 签到轮末尾触发的连登管家记录独立触发来源，
+// 与面板手动触发的 streak 区分（issue #112 后续观测性修正）。
+func TestCheckinFollowupStreakTrigger(t *testing.T) {
+	s := New(Config{Pool: pool.New(""), Upstream: &upstream.Client{}})
+	s.RunCheckinNow()
+	run := runStateOf(t, s, TaskStreak)
+	if run.Trigger != TriggerCheckinFollowup {
+		t.Fatalf("streak trigger=%q want %q", run.Trigger, TriggerCheckinFollowup)
+	}
+}
+
 // TestStreakManualGatesGlobalAndEnterprise 手动触发连登：global/企业版跳过，
 // 不发起上游调用（与调度器同口径）。
 func TestStreakManualGatesGlobalAndEnterprise(t *testing.T) {

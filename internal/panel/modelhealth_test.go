@@ -1,7 +1,9 @@
 package panel
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -275,5 +277,42 @@ func TestProbeStateSurvivesReload(t *testing.T) {
 	p2 := New(Config{Version: "test", APIKey: "k", Pool: pool.New(""), Upstream: pn.cfg.Upstream, ProbeStateFile: *stateFile})
 	if h := decodeHealth(t, getHealth(p2))["cn:glm-5.2"]; h.Success != 1 {
 		t.Fatalf("reloaded health=%+v want success=1", h)
+	}
+}
+
+// TestReadProbeLineLimit 无换行超长行在累计到上限时立即失败，不继续扩容。
+func TestReadProbeLineLimit(t *testing.T) {
+	br := bufio.NewReaderSize(strings.NewReader(strings.Repeat("x", 100)), 16)
+	line, n, err := readProbeLine(br, 32)
+	if !errors.Is(err, errProbeLineTooLong) {
+		t.Fatalf("err=%v want errProbeLineTooLong", err)
+	}
+	if line != "" {
+		t.Errorf("line=%q want empty（超限不返回部分行）", line)
+	}
+	if n > 32 {
+		t.Errorf("n=%d want <= 32", n)
+	}
+}
+
+// TestReadProbeLineMatchesReadString 末行无换行时返回该行 + io.EOF；完整行不含错误。
+func TestReadProbeLineMatchesReadString(t *testing.T) {
+	br := bufio.NewReaderSize(strings.NewReader("data: {}\nrest"), 1024)
+	line, n, err := readProbeLine(br, 1024)
+	if err != nil || line != "data: {}\n" || n != 9 {
+		t.Fatalf("line=%q n=%d err=%v", line, n, err)
+	}
+	line, n, err = readProbeLine(br, 1024)
+	if !errors.Is(err, io.EOF) || line != "rest" || n != 4 {
+		t.Fatalf("line=%q n=%d err=%v want rest/4/EOF", line, n, err)
+	}
+}
+
+// TestReadProbeStreamOverlongLine 无换行超长行按读取上限截断，按解析失败记录。
+func TestReadProbeStreamOverlongLine(t *testing.T) {
+	rc := strings.NewReader(strings.Repeat("x", modelProbeMaxReadBytes+10))
+	_, _, class, _ := readProbeStream(time.Now(), rc)
+	if class != "upstream_parse" {
+		t.Fatalf("class=%q want upstream_parse", class)
 	}
 }

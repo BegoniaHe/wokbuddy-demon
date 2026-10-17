@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
@@ -267,16 +268,42 @@ type probeChunk struct {
 	} `json:"choices"`
 }
 
-// readProbeStream 读探测流：首个内容帧耗时 = TTFT；末帧 usage 取输出 token。
-// 读上限 modelProbeMaxReadBytes；[DONE] 或 EOF 结束。
-// 限流必须包在 bufio 外层：ReadString 遇到无换行超长行会持续扩容，仅在行后
-// 检查累计字节挡不住单行 OOM（与 issue #113 的 SSE 单行上限同哲学）。
-func readProbeStream(start time.Time, rc io.Reader) (ttft, tokens int64, errClass, errMsg string) {
-	br := bufio.NewReaderSize(io.LimitReader(rc, modelProbeMaxReadBytes+1), 64*1024)
-	read := 0
+// errProbeLineTooLong 探测流单行超过剩余读取上限。
+var errProbeLineTooLong = errors.New("probe line exceeds size limit")
+
+// readProbeLine 读一行（含 '\n'），单行累计超过 limit 时立即失败，不继续扩容。
+// 语义对齐 bufio.Reader.ReadString：行尾不带 '\n' 时返回该行 + io.EOF。
+// 不用 ReadString：无换行超长行会被反复 concat，仅在行后检查挡不住单行溢出
+// （与 issue #113 的 SSE 单行上限同哲学）。
+func readProbeLine(br *bufio.Reader, limit int) (string, int, error) {
+	var sb strings.Builder
+	n := 0
 	for {
-		line, err := br.ReadString('\n')
-		read += len(line)
+		chunk, err := br.ReadSlice('\n')
+		if n+len(chunk) > limit {
+			return "", n, errProbeLineTooLong
+		}
+		sb.Write(chunk)
+		n += len(chunk)
+		if err == nil {
+			return sb.String(), n, nil
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return sb.String(), n, err
+	}
+}
+
+// readProbeStream 读探测流：首个内容帧耗时 = TTFT；末帧 usage 取输出 token。
+// 读上限 modelProbeMaxReadBytes；[DONE] 或 EOF 结束。单行与总量都在累积时
+// 检查，异常上游无法靠无换行长行把内存撑到上限之外。
+func readProbeStream(start time.Time, rc io.Reader) (ttft, tokens int64, errClass, errMsg string) {
+	br := bufio.NewReaderSize(rc, 64*1024)
+	read := 0
+	for read < modelProbeMaxReadBytes {
+		line, n, err := readProbeLine(br, modelProbeMaxReadBytes-read)
+		read += n
 		if payload, isData := ssePayload(trimLine(line)); isData {
 			done, t, tok, ec, em := handleProbeFrame(payload, start, ttft, tokens)
 			ttft, tokens = t, tok
@@ -287,7 +314,7 @@ func readProbeStream(start time.Time, rc io.Reader) (ttft, tokens int64, errClas
 				break
 			}
 		}
-		if err != nil || read >= modelProbeMaxReadBytes {
+		if err != nil {
 			break
 		}
 	}

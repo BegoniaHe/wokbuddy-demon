@@ -495,7 +495,7 @@ func (s *Scheduler) RunCheckinNowCtx(ctx context.Context) {
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
-func (s *Scheduler) checkinAll(ctx context.Context, trigger string) (total, success, failure int) {
+func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	delay := s.checkinDelay()
@@ -513,8 +513,11 @@ func (s *Scheduler) checkinAll(ctx context.Context, trigger string) (total, succ
 		attempted = true
 		c.record(s.runCheckinAccount(st, a, expiringSoon))
 	}
-	// 连登管家作为独立任务族运行（自己的守卫/状态）；已在跑时跳过。
-	s.runTaskSync(context.Background(), TaskStreak, trigger)
+	// 连登管家作为独立任务族运行（自己的守卫/状态），触发来源标记为签到后置，
+	// 与独立手动/排程区分；已在跑时跳过并留一行日志，避免用户误以为已执行。
+	if !s.runTaskSync(context.Background(), TaskStreak, TriggerCheckinFollowup) {
+		log.Printf("INFO: [scheduler] 连登管家已在运行，本轮签到后置触发跳过")
+	}
 	return c.total, c.success, c.failure
 }
 

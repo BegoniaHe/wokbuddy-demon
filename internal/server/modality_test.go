@@ -94,6 +94,36 @@ func partBody(model, partType string) string {
 	return `{"model":"` + model + `","messages":[{"role":"user","content":[{"type":"` + partType + `"}]}]}`
 }
 
+// TestRequestModalitiesMixedContent 字符串 content 与 part 数组混用：字符串消息
+// 视为纯文本，数组消息的 part 仍被识别（OpenAI 规范的常见形态）。
+func TestRequestModalitiesMixedContent(t *testing.T) {
+	body := `{"messages":[` +
+		`{"role":"system","content":"be nice"},` +
+		`{"role":"assistant","content":"ok"},` +
+		`{"role":"user","content":[{"type":"text","text":"what"},` +
+		`{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`
+	got := requestModalities([]byte(body))
+	if strings.Join(got, ",") != "image" {
+		t.Fatalf("modalities=%v want [image]", got)
+	}
+}
+
+// TestChatMixedContentModalityRejected 混用 content 的带图请求仍按模型能力拒绝，
+// 不因解析失败而静默送上游（issue #109）。
+func TestChatMixedContentModalityRejected(t *testing.T) {
+	h, _, calls := newModalityHandler(t, false)
+	body := `{"model":"text-only","messages":[` +
+		`{"role":"system","content":"be nice"},` +
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}`
+	rec := postChat(t, h, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	if n := atomic.LoadInt64(calls); n != 0 {
+		t.Errorf("upstream calls=%d want 0", n)
+	}
+}
+
 // TestChatRejectsUnsupportedModality 模型明确不支持图片：默认 400
 // model_capability，不发起任何上游调用，hint 列出可用模型（issue #109）。
 func TestChatRejectsUnsupportedModality(t *testing.T) {
@@ -165,6 +195,51 @@ func TestChatMultimodalRoutingRewritesModel(t *testing.T) {
 	}
 	if got := (*models)[0]; got != "vision" {
 		t.Errorf("outbound model=%q want vision（按模态改选）", got)
+	}
+}
+
+// TestChatMultimodalRoutingSkipsUnknownCapability 能力未知的模型不得作为改选
+// 候选（未知 ≠ 支持），只能选到明确声明支持该模态的模型。
+func TestChatMultimodalRoutingSkipsUnknownCapability(t *testing.T) {
+	setModelCatalog(t, []upstream.ModelInfo{
+		{ID: "unknown-first"}, // 目录第一位，但能力未知
+		{ID: "text-only", InputModalities: []string{"text"}},
+		{ID: "vision", InputModalities: []string{"text", "image"}},
+	})
+	up, models, calls := captureUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, SoftCooldown: time.Minute,
+		Live: livecfg.New(livecfg.Snapshot{MultimodalRouting: true}),
+	})
+	rec := postChat(t, h, imageBody("text-only"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if n := atomic.LoadInt64(calls); n != 1 {
+		t.Fatalf("upstream calls=%d want 1", n)
+	}
+	if got := (*models)[0]; got != "vision" {
+		t.Errorf("outbound model=%q want vision（未知能力模型不得入选）", got)
+	}
+}
+
+// TestRejectModalityHintSkipsUnknownCapability 400 提示只列明确声明支持的模型，
+// 不把能力未知的模型写成候选。
+func TestRejectModalityHintSkipsUnknownCapability(t *testing.T) {
+	setModelCatalog(t, []upstream.ModelInfo{
+		{ID: "unknown-first"},
+		{ID: "text-only", InputModalities: []string{"text"}},
+	})
+	up, _, _ := captureUpstream(t)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
+	rec := postChat(t, h, imageBody("text-only"))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	if strings.Contains(rec.Body.String(), "unknown-first") {
+		t.Errorf("body=%s 不应把能力未知模型列为候选", rec.Body)
 	}
 }
 

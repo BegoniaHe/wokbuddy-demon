@@ -22,14 +22,14 @@ import (
 )
 
 // requestModalities 解析聊天请求体里带有的非文本输入模态（去重、按出现顺序）。
-// 畸形 JSON / 非数组 content 一律返回 nil（请求体后续仍会原样送上游，不在这里
+// content 在 OpenAI 规范里既可以是字符串也可以是 part 数组，且同一请求里常混用
+// （system/assistant 历史用字符串、user 带图用数组）；逐条消息分别解析，字符串
+// content 视为纯文本。畸形 JSON 一律返回 nil（请求体后续仍会原样送上游，不在这里
 // 改变解析语义）。文本是隐含能力，不返回。
 func requestModalities(body []byte) []string {
 	var peek struct {
 		Messages []struct {
-			Content []struct {
-				Type string `json:"type"`
-			} `json:"content"`
+			Content json.RawMessage `json:"content"`
 		} `json:"messages"`
 	}
 	if json.Unmarshal(body, &peek) != nil {
@@ -38,7 +38,13 @@ func requestModalities(body []byte) []string {
 	var out []string
 	seen := map[string]bool{}
 	for _, m := range peek.Messages {
-		for _, part := range m.Content {
+		var parts []struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(m.Content, &parts) != nil {
+			continue // 字符串 content / 缺失：纯文本，无 part
+		}
+		for _, part := range parts {
 			mod := upstream.RequestPartModality(part.Type)
 			if mod == "" || seen[mod] {
 				continue
@@ -90,10 +96,15 @@ func missingModalities(mi upstream.ModelInfo, want []string) []string {
 	return missing
 }
 
-// modelsSupporting 返回目录里声明支持全部 want 模态的模型（保持目录顺序）。
+// modelsSupporting 返回目录里**明确声明**支持全部 want 模态的模型（保持目录顺序）。
+// 与请求侧「能力未知即放行」不同：改选/提示候选只在能力可证实时成立，未知模型
+// 不得凭「无法证明不支持」成为候选，否则开路由后可能把请求改选到纯文本模型。
 func modelsSupporting(infos []upstream.ModelInfo, want []string) []upstream.ModelInfo {
 	var out []upstream.ModelInfo
 	for _, mi := range infos {
+		if len(mi.EffectiveInputModalities()) == 0 {
+			continue // 能力未知：不作为候选
+		}
 		if len(missingModalities(mi, want)) == 0 {
 			out = append(out, mi)
 		}

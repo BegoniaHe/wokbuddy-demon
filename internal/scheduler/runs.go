@@ -6,6 +6,9 @@
 //
 // 状态只在进程内（重启丢失，Issue 明确不引入持久化队列）：每轮记录触发来源、
 // 开始/结束时间、尝试账号数与成功/失败数，供 GET /panel/api/tasks/runs 查询。
+//
+// 边界：任务中心「成长任务队列」有独立的 running 语义（panel.queueState），
+// 不接入本守卫，也不与这里六个批量任务族互斥；两类任务可同时运行。
 package scheduler
 
 import (
@@ -28,6 +31,9 @@ const (
 const (
 	TriggerScheduler = "scheduler"
 	TriggerManual    = "manual"
+	// TriggerCheckinFollowup 签到轮末尾顺带触发的连登管家：与独立手动/排程区分，
+	// 让面板能看出这一轮 streak 是签到闭环的一部分。
+	TriggerCheckinFollowup = "checkin"
 )
 
 // TaskRun 一轮批量任务的状态快照（当前轮或最近一轮）。
@@ -128,12 +134,14 @@ func (s *Scheduler) StartTask(task, trigger string) bool {
 
 // runTaskSync 同步执行一轮批量任务（调度器到点派发 + 既有同步调用方）。
 // 已在运行（如面板手动触发尚未结束）→ 直接跳过，不并行第二轮。
-func (s *Scheduler) runTaskSync(ctx context.Context, task, trigger string) {
+// 返回是否真正占用守卫并执行了本轮；调用方可用它区分「跑完」与「被跳过」。
+func (s *Scheduler) runTaskSync(ctx context.Context, task, trigger string) bool {
 	if !s.acquireRun(task, trigger) {
-		return
+		return false
 	}
 	total, success, failure := s.runTaskBody(ctx, task, trigger)
 	s.releaseRun(task, total, success, failure)
+	return true
 }
 
 // runTaskBody 按任务族执行实体，返回 (Total, Success, Failure)。
@@ -141,7 +149,7 @@ func (s *Scheduler) runTaskSync(ctx context.Context, task, trigger string) {
 func (s *Scheduler) runTaskBody(ctx context.Context, task, trigger string) (total, success, failure int) {
 	switch task {
 	case TaskCheckin:
-		return s.checkinAll(ctx, trigger)
+		return s.checkinAll(ctx)
 	case TaskTravel:
 		return s.travelAll()
 	case TaskActivity:
