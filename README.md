@@ -401,6 +401,7 @@ claude
 
 - 默认监听 `:7863`，**无内置 TLS**；Docker Compose 默认仅绑定 `127.0.0.1`，需要局域网/公网访问时显式改端口映射
 - 公网部署必须设置 `api_key`，并置于 HTTPS 之后 / 仅内网可达
+- `api_key` 非空时，面板与 `GET /status`、`GET /metrics` 对同一来源地址的鉴权失败做 1 分钟窗口计数，连续 10 次失败后返回 `429` + `Retry-After`；成功鉴权清零。来源只取 TCP `RemoteAddr`，不信任 `X-Forwarded-For`；经反向代理部署时所有客户端共享反代地址，需在反代层另行限速
 - 日志字段不含任何 token 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**，代码无任何落盘日志文件
 

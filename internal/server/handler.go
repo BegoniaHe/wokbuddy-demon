@@ -114,6 +114,8 @@ type Handler struct {
 	wafIP wafIPGate
 	// streams 在途 SSE 流注册表（issue #19）：关闭时显式等待排空并记录未排空数。
 	streams *streamTracker
+	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
+	authLimiter *httpauth.Limiter
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -164,7 +166,10 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker()}
+	h := &Handler{
+		cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
+		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+	}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
@@ -224,12 +229,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // withAuth 默认密钥鉴权（/status 等运维面）：只认 config.api_key。
+// api_key 非空时按来源 IP 限制连续失败（issue #61）：超限返回 429 + Retry-After；
+// 来源 IP 只认 RemoteAddr，不信任可伪造的转发头；成功鉴权清零窗口。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		key := h.loadLive().APIKey
+		if key == "" {
+			next(w, r)
+			return
+		}
+		ip := httpauth.RemoteIP(r)
+		if ok, retry := h.authLimiter.Allow(ip); !ok {
+			writeAuthFailLimit(w, retry)
+			return
+		}
+		if !httpauth.VerifyBearer(r, key) {
+			h.authLimiter.Fail(ip)
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
+		h.authLimiter.Reset(ip)
 		next(w, r)
 	}
 }
@@ -242,6 +261,16 @@ func writeClientAuthError(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+}
+
+// writeAuthFailLimit 运维面鉴权失败超限响应。
+func writeAuthFailLimit(w http.ResponseWriter, retry time.Duration) {
+	seconds := int((retry + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	writeOpenAIError(w, http.StatusTooManyRequests, "too_many_auth_failures", "too many authentication failures")
 }
 
 // withClientAuth 网关 API 面（/v1/*）的鉴权：默认密钥或任一未撤销命名密钥。
