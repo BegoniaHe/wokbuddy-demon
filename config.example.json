@@ -26,12 +26,26 @@
     "soft_rate_max": "2h"
   },
   "schedule": {
-    "checkin_hours": [9, 21],
-    "growth_hours": [1],
-    "travel_hours": [9, 21],
-    "activity_hours": [10],
-    "keepalive_hours": [22],
-    "blackcat_hours": [23],
+    "checkin_hours": [
+      9,
+      21
+    ],
+    "growth_hours": [
+      1
+    ],
+    "travel_hours": [
+      9,
+      21
+    ],
+    "activity_hours": [
+      10
+    ],
+    "keepalive_hours": [
+      22
+    ],
+    "blackcat_hours": [
+      23
+    ],
     "checkin_enabled": true,
     "growth_enabled": true,
     "travel_enabled": true,
@@ -70,7 +84,8 @@
     "proxies": []
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "multimodal_routing": false
   },
   "prompt": {
     "mode": "passthrough",

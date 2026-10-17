@@ -83,6 +83,10 @@ type Config struct {
 	// Notifier webhook 告警出口（可选；nil = 关闭）。发送失败不影响主路径。
 	Notifier notify.Sender
 
+	// MultimodalRouting 静态回落值（Live 为 nil 时使用）：请求模态与模型能力
+	// 不匹配时在同 realm 目录里改选支持该模态的模型（features.multimodal_routing）。
+	MultimodalRouting bool
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -129,9 +133,10 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		return h.cfg.Live.Load()
 	}
 	return livecfg.Snapshot{
-		APIKey:           h.cfg.APIKey,
-		SoftCooldown:     h.cfg.SoftCooldown,
-		RecordClientInfo: h.cfg.RecordClientInfo,
+		APIKey:            h.cfg.APIKey,
+		SoftCooldown:      h.cfg.SoftCooldown,
+		RecordClientInfo:  h.cfg.RecordClientInfo,
+		MultimodalRouting: h.cfg.MultimodalRouting,
 	}
 }
 
@@ -467,7 +472,12 @@ func modelDescription(credits, description string) string {
 // applyModelInfoCapabilities 合入能力旗标 / 尺寸上限 / 推理档位字段（空值省略）。
 func applyModelInfoCapabilities(entry map[string]any, mi upstream.ModelInfo) {
 	if mi.SupportsImages {
-		entry["supports_images"] = true // 多模态能力透出
+		entry["supports_images"] = true // 兼容字段：仅图片能力布尔
+	}
+	// 输入模态（issue #109）：已知才宣称（未知 = 省略），normalize 后至少含 text/image
+	// 之类的确定值；supports_images 保留作为兼容字段。
+	if mods := mi.EffectiveInputModalities(); len(mods) > 0 {
+		entry["input_modalities"] = mods
 	}
 	if mi.SupportsReasoning {
 		entry["supports_reasoning"] = true
@@ -722,6 +732,9 @@ type chatFlow struct {
 	modelRate     string
 	declaredTools map[string]bool
 	reqHasImage   bool
+	// reqModalities 请求携带的非文本输入模态（issue #109，改写前取一次，
+	// 供 gateway_hint 与能力判定/路由共用，避免重复解析请求体）。
+	reqModalities []string
 
 	// 统计与追踪
 	st       *chatStat
@@ -783,6 +796,10 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 	defer f.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
 	defer f.recordKeyUsage()
+	// 模态能力判定/路由（issue #109）：在选号前完成，不匹配时写 400 并终止。
+	if !f.applyModalityRoute() {
+		return
+	}
 	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
 	if f.runRotation(r.Context()) {
 		return
@@ -811,6 +828,8 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = in.trace.clientIP, in.trace.userAgent
 	}
+	// 请求模态在改写前解析一次（gateway_hint + 能力判定/路由共用）。
+	reqMods := requestModalities(in.body)
 	f := &chatFlow{
 		h: h, out: out, clientIP: in.clientIP,
 		body:     in.body,
@@ -822,15 +841,16 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
 		declaredTools: upstream.ToolNameAllowlist(in.body),
-		// gateway_hint 判定所需的请求形态（image_url part）：在改写前取。
-		reqHasImage: hasImagePart(in.body),
-		bareModel:   bareModel,
-		modelRate:   modelRate,
-		st:          st,
-		keyUsage:    in.keyUsage,
-		tried:       map[string]bool{},
-		convReqID:   in.convReqID,
-		traceID:     in.traceID,
+		// gateway_hint 判定与模态能力判定所需的请求形态（多模态 part）：在改写前取。
+		reqHasImage:   containsModality(reqMods, upstream.ModalityImage),
+		reqModalities: reqMods,
+		bareModel:     bareModel,
+		modelRate:     modelRate,
+		st:            st,
+		keyUsage:      in.keyUsage,
+		tried:         map[string]bool{},
+		convReqID:     in.convReqID,
+		traceID:       in.traceID,
 	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，
@@ -2060,30 +2080,6 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 	})
 }
 
-// hasImagePart 报告聊天请求体是否携带多模态 image_url part（OpenAI 兼容形态
-// messages[].content[] {type:"image_url"}）。畸形/其他形态一律 false（hint 侧
-// 宁缺勿滥：判不出带图就不给「模型不支持图片」指向）。
-func hasImagePart(body []byte) bool {
-	var peek struct {
-		Messages []struct {
-			Content []struct {
-				Type string `json:"type"`
-			} `json:"content"`
-		} `json:"messages"`
-	}
-	if json.Unmarshal(body, &peek) != nil {
-		return false
-	}
-	for _, m := range peek.Messages {
-		for _, p := range m.Content {
-			if p.Type == "image_url" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // hintContext 组装 chatCompletions 的 gateway_hint 判定上下文：请求裸模型名 +
 // 是否带图 + 模型目录 supports_images 声明（目录未收录 → ModelInCatalog=false，
 // 不做「不支持」判定，防查不到误判）。仅错误路径调用（成功请求零开销）。
@@ -2100,7 +2096,7 @@ func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintCont
 	for _, mi := range cachedModelsSnapshot() {
 		if mi.ID == bareModel {
 			ctx.ModelInCatalog = true
-			ctx.ModelSupportsImages = mi.SupportsImages
+			ctx.ModelSupportsImages = mi.SupportsModality(upstream.ModalityImage)
 			return ctx
 		}
 	}

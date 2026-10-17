@@ -123,6 +123,12 @@ http://127.0.0.1:7863/panel/
 
 「添加账号」对话框的「加密备份」页支持**加密导出 / 导入账号**：AES-256-GCM 加密、PBKDF2 派生密钥、每次导出随机 salt，密码不写入文件（无法找回），用于跨机迁移而不落明文凭证。
 
+### 多模态能力
+
+`/v1/models` 对已知能力的模型输出 `input_modalities`（`text` / `image` / `audio` / `file`），并保留 `supports_images` 兼容字段。能力来源优先级：上游模型对象字段 → `models.dev` 缓存 → `supports_images` 推导；三级都没有时视为未知，不宣称也不拦截。
+
+聊天请求里的 `image_url` / `input_audio` / `file` part 会参与能力判定：模型明确不支持该模态时默认返回 400 `model_capability`（`gateway_hint` 附可用模型），不把请求静默送给不支持的上游。设置 `features.multimodal_routing=true` 后改为在同域模型目录内改选支持该模态的模型，并重写请求的 `model`（日志记录改选结果）。纯文本请求的路由不受影响。
+
 ## 快速开始
 
 ### 环境要求
@@ -346,6 +352,7 @@ claude
 | `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
 | `upstream.keepalive_interval` | `0` | 入站 SSE 主动心跳间隔（如 `15s`）；上游静默时写 `: keepalive` 注释帧。`0` = 关闭 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
+| `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |
 | `schedule.travel_hours` | `[9, 21]` | 每日整点推进猫猫旅行状态机 |
 | `schedule.activity_hours` | `[10]` | 每日整点对话活跃上报 |

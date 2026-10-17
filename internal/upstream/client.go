@@ -1356,6 +1356,7 @@ type ModelInfo struct {
 	SupportsToolCall   bool     // supportsToolCall 是否支持工具调用
 	OnlyReasoning      bool     // onlyReasoning 是否纯推理模型
 	SupportsImages     bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
+	InputModalities    []string // 输入模态（inputModalities 或 modalities.input；空 = 未知）
 	MaxAllowedSize     int64    // maxAllowedSize 最大允许上下文（与 maxInputTokens 口径并列，上游各自下发）
 	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）
 	ReasoningEffort    string   // reasoning.effort 推理模式（与 supportedEfforts 数组不同源）
@@ -1392,10 +1393,16 @@ type dynModelEntry struct {
 	MaxAllowedSize  int64    `json:"maxAllowedSize"`
 	Disabled        bool     `json:"disabled"`
 	SupportsImages  bool     `json:"supportsImages"`
-	SupportsReason  bool     `json:"supportsReasoning"`
-	SupportsTool    bool     `json:"supportsToolCall"`
-	OnlyReasoning   bool     `json:"onlyReasoning"`
-	Reasoning       struct {
+	// 输入模态（issue #109）：兼容两种上游形态——扁平 inputModalities 数组，
+	// 或 models.dev 风格的 modalities.input。空 = 未下发。
+	InputModalities []string `json:"inputModalities"`
+	Modalities      struct {
+		Input []string `json:"input"`
+	} `json:"modalities"`
+	SupportsReason bool `json:"supportsReasoning"`
+	SupportsTool   bool `json:"supportsToolCall"`
+	OnlyReasoning  bool `json:"onlyReasoning"`
+	Reasoning      struct {
 		Effort             string   `json:"effort"`
 		Summary            string   `json:"summary"`
 		DefaultEffort      string   `json:"defaultEffort"`
@@ -1419,6 +1426,7 @@ func (m dynModelEntry) modelInfo() ModelInfo {
 		Efforts:            m.Reasoning.SupportedEfforts,
 		DefaultEffort:      def,
 		SupportsImages:     m.SupportsImages,
+		InputModalities:    firstNonEmptyModalities(m.InputModalities, m.Modalities.Input),
 		Description:        m.Description,
 		Credits:            m.Credits,
 		Tags:               m.Tags,

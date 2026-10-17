@@ -374,6 +374,7 @@ export function ConfigView() {
           </div>
           <Separator className="my-4" />
           {check('sanitize_blacklist_fingerprints', '出站请求指纹脱敏')}
+          {check('multimodal_routing', '多模态按能力路由（不匹配时改选支持该模态的模型；关闭则返回 400）')}
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
             Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。
