@@ -23,10 +23,12 @@ import (
 // 的调用方（handler 流式路径）需要区分「上游空流/截断」与「客户端写失败」——
 // 前者是上游失败，应记失败观测并不再计账号成功；写失败是客户端断开，账号侧
 // 照常记成功。Aggregate 与 StreamHint 共用同一哨兵（errors.Is 判定）。
-// 读错误（io.EOF 之外的 Read 错误）原样上抛，调用方按传输错误处置。
+// 读错误（io.EOF 之外的 Read 错误）原样上抛，调用方按上游失败处置
+// （errClientWrite 只包装写目标失败，见 writeAll）。
 var (
 	errEmptyStream     = errors.New("upstream stream contained no valid data events")
 	errTruncatedStream = errors.New("upstream stream ended without [DONE]")
+	errClientWrite     = errors.New("client write failed")
 )
 
 // IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
@@ -37,6 +39,11 @@ func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) 
 // IsTruncatedStreamError 报告错误是否为「上游流被截断」（EOF 收尾但从未收到
 // data: [DONE]）。截断按上游失败处置：账号不记成功、不绑粘性（issue #105）。
 func IsTruncatedStreamError(err error) bool { return errors.Is(err, errTruncatedStream) }
+
+// IsClientWriteError 报告错误是否为「写客户端失败」（下游断连 / 写超时）。
+// 与上游读错误区分：客户端已走不是账号的错，handler 仍按 Interrupted 记、
+// 账号侧照常记成功（issue #105）。
+func IsClientWriteError(err error) bool { return errors.Is(err, errClientWrite) }
 
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI 响应。
 // 分片/半行由 readSSELine 处理（单行上限 4 MiB，issue #113）；遇到 "data: [DONE]" 结束。
@@ -750,10 +757,12 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 // ResponseRecorder 或中间件包装）忽略错误：拿不到截止支持不能反过来拒绝写流。
 // 每次写前重设 deadline；流结束后由 stream 清空，避免过期 deadline 污染
 // keep-alive 连接上的后续请求。
+// 写失败统一包 errClientWrite（issue #105）：调用方据此把「客户端已走」与
+// 「上游读失败」分开处置。
 func (s *streamWriter) writeAll(payload string) error {
 	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
 	if _, werr := io.WriteString(s.w, payload); werr != nil {
-		return werr
+		return fmt.Errorf("%w: %w", errClientWrite, werr)
 	}
 	if s.fl != nil {
 		s.fl.Flush()

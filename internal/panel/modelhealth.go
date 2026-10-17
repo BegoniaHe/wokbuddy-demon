@@ -269,8 +269,10 @@ type probeChunk struct {
 
 // readProbeStream 读探测流：首个内容帧耗时 = TTFT；末帧 usage 取输出 token。
 // 读上限 modelProbeMaxReadBytes；[DONE] 或 EOF 结束。
+// 限流必须包在 bufio 外层：ReadString 遇到无换行超长行会持续扩容，仅在行后
+// 检查累计字节挡不住单行 OOM（与 issue #113 的 SSE 单行上限同哲学）。
 func readProbeStream(start time.Time, rc io.Reader) (ttft, tokens int64, errClass, errMsg string) {
-	br := bufio.NewReaderSize(rc, 64*1024)
+	br := bufio.NewReaderSize(io.LimitReader(rc, modelProbeMaxReadBytes+1), 64*1024)
 	read := 0
 	for {
 		line, err := br.ReadString('\n')

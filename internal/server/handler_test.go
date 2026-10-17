@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -2092,6 +2093,44 @@ func TestChatStreamTruncatedNoSuccess(t *testing.T) {
 	}
 }
 
+// TestChatStreamReadErrorNoSuccess 上游流中读错误（非 EOF，issue #105）：
+// 客户端已收到 200，但这是上游失败——账号不记成功、不绑粘性；客户端写失败
+// 才按 Interrupted 记成功（两者由 writeAll 的 errClientWrite 区分）。
+func TestChatStreamReadErrorNoSuccess(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"only"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(io.MultiReader(
+					strings.NewReader("data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"half\"}}]}\n\n"),
+					iotest.ErrReader(errors.New("connection reset by peer")),
+				)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if s := statusOf(t, p, "only").SuccessCount; s != 0 {
+		t.Errorf("success_count=%d want 0 (upstream read error is not success)", s)
+	}
+	if _, ok := st.lastUID("conv-1"); ok {
+		t.Errorf("upstream read error must not bind sticky")
+	}
+}
+
 // TestChatStreamEmptyStreamNoSuccess 上游空流（200 + 0 有效帧，issue #105）：
 // 账号不记成功、不绑粘性（写头后无法换号，只记失败）。
 func TestChatStreamEmptyStreamNoSuccess(t *testing.T) {
@@ -2146,6 +2185,10 @@ func TestChatNonStreamTruncatedRotates(t *testing.T) {
 	}
 	if s := statusOf(t, p, "good").SuccessCount; s != 1 {
 		t.Errorf("good success_count=%d want 1", s)
+	}
+	// 截断号必须释放本轮在途租约：否则下一轮 heldUID 覆盖后名额永不归还。
+	if n := statusOf(t, p, "bad").InFlight; n != 0 {
+		t.Errorf("bad in_flight=%d want 0 (failed attempt must release lease)", n)
 	}
 }
 

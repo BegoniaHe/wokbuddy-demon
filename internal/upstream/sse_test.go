@@ -1472,6 +1472,9 @@ func TestStreamReadErrorPropagates(t *testing.T) {
 	if IsTruncatedStreamError(err) || IsEmptyStreamError(err) {
 		t.Errorf("读错误不得被归并为截断/空流: %v", err)
 	}
+	if IsClientWriteError(err) {
+		t.Errorf("上游读错误不得被误判为客户端写失败: %v", err)
+	}
 }
 
 // errReader 永远返回给定错误的 io.Reader。
@@ -1490,6 +1493,9 @@ func TestStreamClientWriteFailurePropagates(t *testing.T) {
 	}
 	if IsTruncatedStreamError(err) || IsEmptyStreamError(err) {
 		t.Errorf("客户端写失败不得归并为上游失败: %v", err)
+	}
+	if !IsClientWriteError(err) {
+		t.Errorf("客户端写失败必须可被 IsClientWriteError 识别: %v", err)
 	}
 }
 

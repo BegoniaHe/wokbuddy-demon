@@ -1170,7 +1170,7 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 	// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 	// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核）。
 	if f.stream {
-		return f.handleStreamSuccess(acct, rc, attemptStarted)
+		return f.handleStreamSuccess(ctx, acct, rc, attemptStarted)
 	}
 	return f.handleNonStreamSuccess(ctx, acct, rc, attemptStarted, i)
 }
@@ -1325,7 +1325,7 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 }
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
-func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
 	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
 	f.h.streams.enter()
 	defer f.h.streams.leave()
@@ -1364,11 +1364,17 @@ func (f *chatFlow) handleStreamSuccess(acct *auth.Auth, rc io.ReadCloser, attemp
 		f.st.outcome = reqlog.OutcomeStreamError
 		log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, kind, logfmt.Truncate(errFrame, 200))
-	case sErr != nil:
-		// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功（与 default
-		// 同语义），请求日志归为 Interrupted（人已走，未完成）。
+	case sErr != nil && (upstream.IsClientWriteError(sErr) || ctx.Err() != nil):
+		// 客户端写失败（断连 / 写超时）或请求 ctx 已取消：上游帧无恙，账号健康
+		// ——账号侧照常记成功（与 default 同语义），请求日志归为 Interrupted
+		// （人已走，未完成）。ctx 取消可能是客户端断开导致的上游读中断，不能
+		// 误判成上游失败（issue #105 non-goal）。
 		f.st.outcome = reqlog.OutcomeInterrupted
 		f.noteSuccessAndBind(acct)
+	case sErr != nil:
+		// 上游读错误（连接重置 / idle 超时等，issue #105）：账号不记成功、不绑粘性。
+		// 写路径失败已在 writeAll 包 errClientWrite，不会落到这里。
+		f.failStreamUpstream(acct, "upstream stream read error: "+sErr.Error())
 	default:
 		// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 		f.st.outcome = reqlog.OutcomeSuccess
@@ -1447,7 +1453,9 @@ func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, 
 		// 上游流解析失败（空流 / EOF 截断，issue #105）：截断的 content 不是完整
 		// 回答，绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试
 		// （空流/截断是上游缺陷，换个号大概率能拿到完整流）；轮转耗尽才回 502。
-		f.unbindSticky()
+		// fail：释放本次在途租约（否则下一轮 heldUID 被覆盖后该账号名额永不归还）
+		// + 失败号正是粘性号时解绑。
+		f.fail(acct.UID)
 		f.st.status = http.StatusBadGateway
 		f.lastErr = fmt.Errorf("upstream_parse: %w", err)
 		log.Printf("WARN: [server] non-stream acct=%s model=%s: %v (rotating)",

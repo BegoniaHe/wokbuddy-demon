@@ -104,7 +104,7 @@ func modelsSupporting(infos []upstream.ModelInfo, want []string) []upstream.Mode
 // applyModalityRoute 在选号前做模态能力判定/路由（issue #109）。返回 false 表示
 // 已写出 400（请求不进入轮转）。
 func (f *chatFlow) applyModalityRoute() bool {
-	want := requestModalities(f.body)
+	want := f.reqModalities
 	if len(want) == 0 {
 		return true // 纯文本请求：既有路由零改动
 	}
