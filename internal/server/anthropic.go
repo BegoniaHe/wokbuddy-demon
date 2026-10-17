@@ -39,6 +39,14 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body", "")
 		return
 	}
+	if obj, ok := v.(map[string]any); ok {
+		model, _ := obj["model"].(string)
+		if ku := keyUsageFrom(r.Context()); ku != nil && !h.cfg.Keys.ModelAllowed(ku.id, model) {
+			h.cfg.Keys.RecordRejected(ku.id)
+			writeAnthropicError(w, http.StatusForbidden, "permission_error", "model is not allowed for this API key", "")
+			return
+		}
+	}
 	tokens := (countJSONTextBytes(v) + 3) / 4
 	if tokens < 1 {
 		tokens = 1

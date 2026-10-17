@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -56,6 +57,24 @@ type Record struct {
 	PromptTokens     int64      `json:"prompt_tokens"`
 	CompletionTokens int64      `json:"completion_tokens"`
 	TotalTokens      int64      `json:"total_tokens"`
+	Rejected         int64      `json:"rejected,omitempty"`
+	Limits           Limits     `json:"limits,omitempty"`
+}
+
+// Limits 一把命名密钥的可选限制；零值 = 不限。进程内计数，单实例语义。
+type Limits struct {
+	RPM           int      `json:"rpm,omitempty"`            // 每分钟请求数
+	TPM           int      `json:"tpm,omitempty"`            // 每分钟 token 数（按已完成请求累计）
+	MaxConcurrent int      `json:"max_concurrent,omitempty"` // 最大并发请求数
+	Models        []string `json:"models,omitempty"`         // 模型白名单（glob，可带 cn:/global: 前缀）
+}
+
+// limitRuntime 单把密钥的进程内限流状态（固定 1 分钟窗口）。
+type limitRuntime struct {
+	windowStart time.Time
+	rpm         int
+	tpm         int64
+	inflight    int
 }
 
 // file 落盘结构。
@@ -73,6 +92,9 @@ type Store struct {
 	keys  []httpauth.Key
 	dirty bool
 
+	limMu  sync.Mutex
+	limits map[string]*limitRuntime
+
 	started  atomic.Bool
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -82,9 +104,10 @@ type Store struct {
 // New 创建存储并从 path 加载（path 为空 = 纯内存，不落盘，测试用）。
 func New(path string) *Store {
 	s := &Store{
-		path: path,
-		stop: make(chan struct{}),
-		done: make(chan struct{}),
+		path:   path,
+		limits: map[string]*limitRuntime{},
+		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
 	}
 	if path != "" {
 		if err := s.load(); err != nil {
@@ -260,6 +283,10 @@ func (s *Store) RecordUsage(id string, prompt, completion, total int64) {
 		now := time.Now()
 		r.LastUsedAt = &now
 		s.dirty = true
+		s.limMu.Lock()
+		rt := s.runtimeLocked(id, now)
+		rt.tpm += total
+		s.limMu.Unlock()
 		return
 	}
 }
@@ -338,6 +365,151 @@ func (s *Store) rebuildKeysLocked() {
 		keys = append(keys, httpauth.Key{ID: s.records[i].ID, Hash: h})
 	}
 	s.keys = keys
+}
+
+// Acquire 按命名密钥限制尝试进入一次请求。返回 release（必须 defer 调用）、
+// 建议 Retry-After 与是否放行。未配置限制时直接放行（no-op release）。
+// model 白名单不在此检查（请求体尚未解析），见 ModelAllowed。
+func (s *Store) Acquire(id string) (release func(), retryAfter time.Duration, ok bool) {
+	limits, found := s.limitsOf(id)
+	if !found || !limits.enabled() {
+		return func() {}, 0, true
+	}
+	now := time.Now()
+	s.limMu.Lock()
+	defer s.limMu.Unlock()
+	rt := s.runtimeLocked(id, now)
+	if retry, ok := allowLocked(rt, limits); !ok {
+		return nil, retry, false
+	}
+	rt.rpm++
+	rt.inflight++
+	return func() {
+		s.limMu.Lock()
+		if rt.inflight > 0 {
+			rt.inflight--
+		}
+		s.limMu.Unlock()
+	}, 0, true
+}
+
+// enabled 报告是否配置了任一限流维度。
+func (l Limits) enabled() bool { return l.RPM > 0 || l.TPM > 0 || l.MaxConcurrent > 0 }
+
+// allowLocked 检查并发/RPM/TPM，返回建议等待时长。
+func allowLocked(rt *limitRuntime, limits Limits) (time.Duration, bool) {
+	if limits.MaxConcurrent > 0 && rt.inflight >= limits.MaxConcurrent {
+		return time.Second, false
+	}
+	retry := time.Until(rt.windowStart.Add(time.Minute))
+	if limits.RPM > 0 && rt.rpm >= limits.RPM {
+		return retry, false
+	}
+	if limits.TPM > 0 && rt.tpm >= int64(limits.TPM) {
+		return retry, false
+	}
+	return 0, true
+}
+
+// ModelAllowed 报告模型是否命中密钥白名单（未配置 = 全部允许）。
+// 模式支持 glob 与可选 realm 前缀；未带 realm 的模式匹配任意域。
+func (s *Store) ModelAllowed(id, model string) bool {
+	limits, found := s.limitsOf(id)
+	if !found || len(limits.Models) == 0 {
+		return true
+	}
+	modelRealm, modelBare := splitRealmName(model)
+	if modelRealm == "" {
+		modelRealm = "cn" // 裸模型名默认按 cn 路由（与 server.resolveModel 同口径）
+	}
+	for _, pattern := range limits.Models {
+		wantRealm, wantBare := splitRealmName(pattern)
+		if wantRealm != "" && wantRealm != modelRealm {
+			continue
+		}
+		if match, err := pathpkg.Match(wantBare, modelBare); err == nil && match {
+			return true
+		}
+	}
+	return false
+}
+
+// UpdateLimits 替换一把密钥的限制（面板编辑用）。非法值在调用方校验。
+func (s *Store) UpdateLimits(id string, limits Limits) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.records {
+		if s.records[i].ID != id {
+			continue
+		}
+		old := s.records[i].Limits
+		s.records[i].Limits = limits
+		if err := s.persistLocked(); err != nil {
+			s.records[i].Limits = old
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// RecordRejected 累计一次被限制拒绝的请求（面板展示）。
+func (s *Store) RecordRejected(id string) {
+	if s == nil || id == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.records {
+		if s.records[i].ID == id {
+			s.records[i].Rejected++
+			s.dirty = true
+			return
+		}
+	}
+}
+
+// limitsOf 读取记录限制（返回 false 表示密钥不存在）。
+func (s *Store) limitsOf(id string) (Limits, bool) {
+	if s == nil {
+		return Limits{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.records {
+		if s.records[i].ID == id && !s.records[i].Revoked {
+			return s.records[i].Limits, true
+		}
+	}
+	return Limits{}, false
+}
+
+// runtimeLocked 取/初始化密钥运行时；窗口过期时重置计数。
+func (s *Store) runtimeLocked(id string, now time.Time) *limitRuntime {
+	rt := s.limits[id]
+	if rt == nil {
+		rt = &limitRuntime{}
+		s.limits[id] = rt
+	}
+	if rt.windowStart.IsZero() || now.Sub(rt.windowStart) >= time.Minute {
+		rt.windowStart = now
+		rt.rpm = 0
+		rt.tpm = 0
+	}
+	return rt
+}
+
+// splitRealmName 拆出可选 realm 前缀（仅识别 cn/global），无前缀时 realm 为空。
+func splitRealmName(name string) (realm, bare string) {
+	idx := strings.IndexByte(name, ':')
+	if idx < 0 {
+		return "", name
+	}
+	prefix := name[:idx]
+	if prefix != "cn" && prefix != "global" {
+		return "", name
+	}
+	return prefix, name[idx+1:]
 }
 
 // newRecord 生成一把随机命名密钥及其记录（含哈希与展示前缀）。

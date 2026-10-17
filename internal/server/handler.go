@@ -260,6 +260,13 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
+		if !ok {
+			h.cfg.Keys.RecordRejected(res.KeyID)
+			writeKeyLimitError(w, retryAfter)
+			return
+		}
+		defer release()
 		ku := &keyUsage{id: res.KeyID}
 		next(w, r.WithContext(context.WithValue(r.Context(), keyUsageKey{}, ku)))
 		h.cfg.Keys.RecordUsage(ku.id, ku.prompt, ku.completion, ku.total)
@@ -731,6 +738,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
 func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
+	if ku := in.keyUsage; ku != nil && !h.cfg.Keys.ModelAllowed(ku.id, in.model) {
+		h.cfg.Keys.RecordRejected(ku.id)
+		out.Error(http.StatusForbidden, "model_not_allowed", "model is not allowed for this API key", "")
+		return
+	}
 	f := h.newChatFlow(in, out)
 	// 出口统一释放：先释放在途租约，再落请求流水行（与原 defer 顺序一致）。
 	defer f.st.done()
