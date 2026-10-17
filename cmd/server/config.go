@@ -268,7 +268,8 @@ func Default() *Config {
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	c.Logging.RequestClientInfo = true
-	c.Logging.DecisionTraceSample = 0
+	// 与 README / config.example.json 对齐：开启决策链时默认只采样 10%，避免归档写入量突增。
+	c.Logging.DecisionTraceSample = 0.1
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
