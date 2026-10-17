@@ -99,6 +99,12 @@ const TREND_METRIC_LABEL: Record<TrendMetric, string> = {
   credits: '积分',
 };
 
+// 回填范围：对齐官方用量页的 7/30 天口径；后端硬上限 90 天，UI 只放常用档。
+const BACKFILL_DAYS_OPTIONS: readonly SelectOption[] = [
+  { value: '7', label: '最近 7 天' },
+  { value: '30', label: '最近 30 天' },
+];
+
 function usPct(part: unknown, total: unknown): string {
   const t = Number(total || 0);
   if (!t) return '—';
@@ -155,6 +161,7 @@ export function UsageView() {
   const [heatMetric, setHeatMetric] = useState<HeatMetric>('total_tokens');
   const [trendMetric, setTrendMetric] = useState<TrendMetric>('tokens');
   const [backfilling, setBackfilling] = useState(false);
+  const [backfillDays, setBackfillDays] = useState('7');
 
   const rangeStr = trangeQuery(range, true).toString();
 
@@ -206,13 +213,26 @@ export function UsageView() {
             <div className="flex flex-wrap items-center gap-3">
               <span className="min-w-0 text-xs text-muted-foreground" title={note}>{note}</span>
               <TimeRange value={range} onChange={setRange} />
+              <Select
+                items={selectOptionItems(BACKFILL_DAYS_OPTIONS)}
+                value={backfillDays}
+                onValueChange={(v) => setBackfillDays((v as string) || '7')}
+              >
+                <SelectTrigger size="sm" aria-label="回填范围">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectOptions options={BACKFILL_DAYS_OPTIONS} />
+                </SelectContent>
+              </Select>
               <Button
                 size="xs"
                 disabled={backfilling}
                 onClick={() => {
-                  if (!confirm('从上游拉取最近 7 天逐笔用量并按天覆盖本地用量桶（用于对账/回填），继续？')) return;
+                  const days = Number(backfillDays) || 7;
+                  if (!confirm(`从上游拉取最近 ${days} 天逐笔用量并按天覆盖本地用量桶（用于对账/回填），继续？`)) return;
                   setBackfilling(true);
-                  void postJSON<{ records?: number; buckets?: number; failures?: Record<string, string> }>('usage/backfill', { days: 7 })
+                  void postJSON<{ records?: number; buckets?: number; failures?: Record<string, string> }>('usage/backfill', { days })
                     .then((r) => {
                       const failed = r.failures ? Object.keys(r.failures).length : 0;
                       toast('回填完成：' + (r.records ?? 0) + ' 条记录，覆盖 ' + (r.buckets ?? 0) + ' 个桶' + (failed ? '，' + failed + ' 个账号失败' : ''), failed ? 'err' : 'ok');
