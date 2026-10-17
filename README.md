@@ -216,6 +216,29 @@ curl -s http://localhost:7863/healthz
 curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 ```
 
+### 客户端接入（OpenAI / Claude Code）
+
+网关同时暴露 OpenAI 兼容与 Anthropic Messages 兼容协议面：
+
+| 协议 | 端点 |
+|---|---|
+| OpenAI | `POST /v1/chat/completions`、`GET /v1/models` |
+| Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
+
+Claude Code 接入示例（`api_key` 非空时填同一密钥）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7863
+export ANTHROPIC_AUTH_TOKEN=your-api-key
+export ANTHROPIC_MODEL=claude-sonnet-4-5   # 需在 models.aliases 中映射到上游模型
+claude
+```
+
+- 请求侧支持 `system`、文本/图片内容块、`tool_use` / `tool_result`、`tools`、`tool_choice`、`stop_sequences`、`thinking`；响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
+- 上游错误转换为 Anthropic `{"type":"error","error":{...}}`，`gateway_hint` 保留在 error 对象内。
+- `count_tokens` 无本地 tokenizer，按请求文本字节数近似估算，仅用于客户端上下文预算，不作计费依据。
+- 未配置模型别名时，Anthropic 客户端可直接请求上游裸模型名。
+
 ### Prometheus 指标
 
 `GET /metrics` 按 Prometheus 文本格式（`text/plain; version=0.0.4`）导出核心指标，可直接配置为抓取目标：
@@ -359,7 +382,7 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 面板「密钥」页可创建多把**命名密钥**（如 `sk-wb-xxxx…`），分发给不同客户端，并可逐把撤销或删除。规则：
 
 - 命名密钥以 **SHA-256 哈希**存储（`data/api_keys.json`），明文**仅在创建时回显一次**；
-- 命名密钥**只作用于网关 API 面**（`POST /v1/chat/completions`、`GET /v1/models`）；
+- 命名密钥**只作用于网关 API 面**（`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`）；
 - 面板、`GET /status`、`GET /metrics` 仍**只认**默认 `api_key`（命名密钥是给客户端的，不获得管理/运维可见性）；
 - 每把密钥记录 `last_used_at` 与请求数 / token 用量，面板可查看；
 - `api_key` 为空且未创建任何命名密钥时，网关仍为「不鉴权」放行（既有默认）。
