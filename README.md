@@ -280,12 +280,14 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `./login.sh` | 登录 → 落盘凭证 → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
+| `go run ./cmd/migrate-auths -dir auths` | 迁移旧版 snake_case 格式 auth 文件（预览；加 `-apply` 落盘） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑 |
 | `python3 scripts/probe_max_tokens.py` | 探测各模型真实输出上限 |
 
 ### 账号管理
 
 - 多账号复制 `auths/workbuddy-<uid>.json` 即可，管家启动时自动对齐目录
+- 旧版 snake_case 扁平形（`access_token` / `expires_at` 毫秒）不会被载入：`go run ./cmd/migrate-auths -dir auths -apply` 转换，原文件留存 `.legacy` 副本
 - 失效账号被禁用后，可用 `./login.sh` 重新登录覆盖凭证
 - 备份 = `auths/`（凭证）+ `data/state.json`（状态）
 
