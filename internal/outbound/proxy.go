@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -29,6 +30,17 @@ const (
 	dialTimeout   = 10 * time.Second
 	dialKeepAlive = 15 * time.Second
 )
+
+// handshakeTimeout 代理握手（HTTP CONNECT / SOCKS5 协商+认证+CONNECT）的一次性
+// deadline（issue #106）。DialContext 的 10s 只覆盖「连到代理」——代理接受 TCP
+// 后不返回握手应答时没有任何一层能打断，调用方 goroutine、fd 与账号池在途租约
+// 会一直占用（聊天路径 http.Client{Timeout:0} 最直接暴露）。与 dialTimeout 同值：
+// 握手与建连同属「到达代理并可用」的上界。
+//
+// deadline 是**一次性**的：握手成功后由 endHandshake(…, true) 清除，长流（聊天
+// SSE）从此只受上游 idle/写 deadline 约束。包级 var 仅为测试可注入小值（生产
+// 恒 10s，默认值不变）。
+var handshakeTimeout = dialTimeout
 
 // Proxy 单个出站代理（HTTP/HTTPS CONNECT 或 SOCKS5）。
 type Proxy struct {
@@ -91,12 +103,53 @@ func (p *Proxy) dialer() *net.Dialer {
 	return &net.Dialer{Timeout: dialTimeout, KeepAlive: dialKeepAlive}
 }
 
+// beginHandshake 在代理握手开始前给底层 conn 设置一次性 deadline，并启动
+// ctx watcher：ctx 取消（客户端断开 / 请求超时）时关闭连接，把阻塞在握手
+// 读/写里的 goroutine 放出来（issue #106）。返回的清理函数必须被调用
+// （成功路径清 deadline + 停 watcher；失败路径由调用方 defer 同样语义）。
+//
+// 为什么两个机制都要：deadline 覆盖「代理接受连接但不响应」的卡死；watcher
+// 覆盖「ctx 在 deadline 前被取消」——后者 deadline 到了自然也会失败，但
+// watcher 让取消**立即**生效，不等满 handshakeTimeout。
+func beginHandshake(ctx context.Context, conn net.Conn) (clearDeadline, stop func()) {
+	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+	done := make(chan struct{})
+	var once sync.Once
+	stopWatcher := func() { once.Do(func() { close(done) }) }
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close() // 唤醒阻塞中的握手读写
+		case <-done:
+		}
+	}()
+	clearDeadline = func() {
+		_ = conn.SetDeadline(time.Time{}) // 一次性 deadline：清掉，长流不受限
+	}
+	return clearDeadline, stopWatcher
+}
+
+// endHandshake 是握手出口的统一清理：stop 停 watcher（幂等），ok=true
+// （握手成功）时 clear 清掉一次性 deadline；ok=false（失败路径）时 deadline
+// 留着无害——连接随即被调用方 Close。
+func endHandshake(clearDeadline, stop func(), ok bool) {
+	stop()
+	if ok {
+		clearDeadline()
+	}
+}
+
 // dialHTTPConnect 经 HTTP/HTTPS 代理的 CONNECT 隧道建立连接。
 func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, error) {
 	conn, err := p.dialer().DialContext(ctx, "tcp", p.addr)
 	if err != nil {
 		return nil, err
 	}
+	// 握手期 deadline + ctx watcher（issue #106）：见 beginHandshake。
+	// defer 保证四条退出路径（TLS 握手失败 / 写失败 / 读应答失败 / 非 200）都停
+	// watcher，不留 goroutine。
+	clearDeadline, stop := beginHandshake(ctx, conn)
+	defer endHandshake(clearDeadline, stop, false)
 	if p.scheme == "https" {
 		tconn := tls.Client(conn, &tls.Config{ServerName: p.host})
 		if err := tconn.HandshakeContext(ctx); err != nil {
@@ -127,6 +180,9 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 		conn.Close()
 		return nil, fmt.Errorf("proxy CONNECT %s: %s", addr, resp.Status)
 	}
+	// 握手成功：清掉一次性 deadline（长流从此只受上游 idle/写 deadline 约束），
+	// 并显式停 watcher（defer 的 endHandshake(…, false) 不会重复清 deadline）。
+	endHandshake(clearDeadline, stop, true)
 	// br 可能已读入隧道首字节，包装以保留缓冲。
 	return &bufferedConn{Conn: conn, r: br}, nil
 }
@@ -146,10 +202,14 @@ func (p *Proxy) dialSOCKS5(ctx context.Context, addr string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 握手期 deadline + ctx watcher（issue #106）：见 beginHandshake。
+	clearDeadline, stop := beginHandshake(ctx, conn)
 	if err := p.socks5Handshake(conn, addr); err != nil {
+		endHandshake(clearDeadline, stop, false)
 		conn.Close()
 		return nil, err
 	}
+	endHandshake(clearDeadline, stop, true)
 	return conn, nil
 }
 
