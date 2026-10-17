@@ -14,6 +14,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"syscall"
 	"time"
 
@@ -556,6 +558,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err := json.Unmarshal(raw, &incoming); err != nil {
 		return nil, fmt.Errorf("parse submitted config: %w", err)
 	}
+	// 旧配置用于判断本次真正变化的字段；文件损坏时回落默认，最多多报重启项。
+	oldCfg, oldErr := ParseConfig(oldRaw)
+	if oldErr != nil {
+		oldCfg = Default()
+	}
 	merged := mergeConfigMaps(cur, incoming)
 
 	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
@@ -608,7 +615,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 
-	return restartRequiredFields(newCfg), nil
+	return restartRequiredFields(oldCfg, newCfg), nil
 }
 
 // replaceConfigFile 用 tmp 原子替换 path；单文件 Docker bind mount 无法被 rename
@@ -651,40 +658,71 @@ func writeConfigInPlace(tmp, path string, out []byte) error {
 	return nil
 }
 
-// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
+// restartFieldPaths 是装配期一次性捕获、修改后必须重启才能生效的字段路径。
+// 集中维护：新增装配期字段时只在这里加一行；JSON 路径同时覆盖嵌套结构。
+//
+// 路径在配置中缺失时新旧取值同为 nil，不会误报；字段存在后自动参与比较。
+var restartFieldPaths = []string{
+	"listen", "auth_dir", "state_file",
+	"server.read_timeout", "server.max_body_bytes",
+	// HTTP client / 出站身份 / 代理在 configureUpstream 一次性注入。
+	"upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds",
+	"upstream.keepalive_interval", "upstream.model_timeouts", "upstream.user_agent",
+	"upstream.client_version", "upstream.cli_version", "upstream.client_name",
+	"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip",
+	"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
+	"upstream.proxies",
+	// global 路由在 configureUpstream / auth / handler 构造期捕获。
+	"global.enabled", "global.chat_base", "global.billing_base",
+	// 提示词模式与文件在 handler 构造期解析。
+	"prompt.mode", "prompt.file",
+	// Redis 客户端在启动期装配。
+	"upstash.url", "upstash.token",
+	"models.aliases", "notify.webhook_url", "notify.events",
+	// 粘性路由器是否创建在装配期决定；TTL 类同样在启动期读取。
+	"session_sticky.enabled", "session_sticky.ttl", "session_sticky.gc_interval",
+	"logging.request_archive_enabled", "logging.request_retention_days",
+	"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
+}
+
+// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段路径。
+// 逐字段比较新旧配置，只返回实际变化的项（issue #87），避免面板恒提示全量。
+func restartRequiredFields(oldCfg, newCfg *Config) []string {
+	oldDoc, newDoc := configDoc(oldCfg), configDoc(newCfg)
 	var out []string
-	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
-		out = append(out, "listen")
+	for _, path := range restartFieldPaths {
+		if !reflect.DeepEqual(digJSONPath(oldDoc, path), digJSONPath(newDoc, path)) {
+			out = append(out, path)
+		}
 	}
-	if c.AuthDir != "" {
-		out = append(out, "auth_dir")
-	}
-	if c.StateFile != "" {
-		out = append(out, "state_file")
-	}
-	// upstream.timeout_seconds/header_timeout_seconds/idle_timeout_seconds 在装配期被
-	// HTTP client 捕获；upstream.user_agent 在装配期被写进出站 client（main.go 的
-	// up.UserAgent = ...），之后不再读取——不在 livecfg 热快照里，也无法热改。
-	// 此前漏列 user_agent，导致面板改完显示"已保存"却不提示需要重启（issue #102 附带发现 2）。
-	// 轮换策略（rotate_max/rotate_budget/rotate_status_codes，issue #17）同样在装配期
-	// 被 server handler 捕获，改后需重启。
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds",
-		"upstream.idle_timeout_seconds", "upstream.keepalive_interval", "upstream.model_timeouts",
-		"upstream.user_agent",
-		"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
-		"upstream.proxies")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
-	out = append(out, "models.aliases", "notify.webhook_url", "notify.events",
-		"session_sticky.ttl", "session_sticky.gc_interval",
-		"logging.request_archive_enabled", "logging.request_retention_days",
-		"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
-		"server.read_timeout")
 	return out
+}
+
+// configDoc 把配置序列化为按 JSON 路径取值的 map（解析后的 time.Duration
+// 字段带 json:"-"，不会参与比较）。
+func configDoc(c *Config) map[string]any {
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return nil
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil
+	}
+	return doc
+}
+
+// digJSONPath 按 "a.b.c" 路径取嵌套值；路径不存在返回 nil。
+func digJSONPath(doc map[string]any, path string) any {
+	var cur any = doc
+	for _, key := range strings.Split(path, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = m[key]
+	}
+	return cur
 }
 
 // mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。
