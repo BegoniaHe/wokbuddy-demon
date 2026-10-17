@@ -15,6 +15,9 @@ const (
 	// DefaultFailLimit / DefaultFailWindow 默认阈值：10 次/分钟。
 	DefaultFailLimit  = 10
 	DefaultFailWindow = time.Minute
+	// maxTrackedIPs 单进程最多保留的失败窗口数；超过后先清过期项，仍满则
+	// 淘汰最早窗口，防止轮换来源 IP 把内存撑大。
+	maxTrackedIPs = 4096
 )
 
 // Limiter 按来源 IP 的失败窗口计数器。
@@ -70,10 +73,39 @@ func (l *Limiter) Fail(ip string) {
 	defer l.mu.Unlock()
 	w := l.byIP[ip]
 	if w == nil || now.Sub(w.start) >= l.window {
+		if w == nil {
+			l.evictLocked(now)
+		}
 		l.byIP[ip] = &failWindow{start: now, count: 1}
 		return
 	}
 	w.count++
+}
+
+// evictLocked 在达到容量上限时为新的来源 IP 腾位置：先清过期窗口，仍满则
+// 淘汰最早开始的窗口（调用方已持有锁）。只在新增 IP 时触发，重复失败不扫描。
+func (l *Limiter) evictLocked(now time.Time) {
+	if len(l.byIP) < maxTrackedIPs {
+		return
+	}
+	for ip, w := range l.byIP {
+		if now.Sub(w.start) >= l.window {
+			delete(l.byIP, ip)
+		}
+	}
+	if len(l.byIP) < maxTrackedIPs {
+		return
+	}
+	oldestIP := ""
+	var oldest time.Time
+	for ip, w := range l.byIP {
+		if oldestIP == "" || w.start.Before(oldest) {
+			oldestIP, oldest = ip, w.start
+		}
+	}
+	if oldestIP != "" {
+		delete(l.byIP, oldestIP)
+	}
 }
 
 // Reset 成功鉴权后清零该 IP 的失败窗口。

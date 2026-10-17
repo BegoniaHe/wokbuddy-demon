@@ -1,6 +1,7 @@
 package httpauth
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -50,4 +51,17 @@ func TestNilLimiter(t *testing.T) {
 	}
 	l.Fail("x")
 	l.Reset("x")
+}
+
+// TestLimiterBoundsTrackedIPs 轮换来源 IP 时失败窗口表不会无界增长。
+func TestLimiterBoundsTrackedIPs(t *testing.T) {
+	l := NewLimiter(2, time.Hour)
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+	for i := 0; i < maxTrackedIPs+100; i++ {
+		l.Fail(fmt.Sprintf("198.51.100.%d", i))
+	}
+	if got := len(l.byIP); got > maxTrackedIPs {
+		t.Fatalf("byIP=%d，超过上限 %d", got, maxTrackedIPs)
+	}
 }
