@@ -570,6 +570,29 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// runCheckin 执行单号签到并返回 (跳过原因, 是否已签, 说明文案)。
+// 跳过原因非空表示 global/企业版无 CN 签到体系（issue #108）：不发起上游调用。
+// 其余情况按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游
+// 非错误态，不标记已签、给出可区分文案（issue #27）；其余才是真失败。
+func (p *Panel) runCheckin(a *auth.Auth, uid string) (denyReason string, done bool, msg string) {
+	if denyReason = taskDenyReason(a); denyReason != "" {
+		return denyReason, false, denyReason
+	}
+	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+		switch upstream.ClassifyCheckin(err) {
+		case upstream.CheckinAlready:
+			p.cfg.Pool.NoteCheckinDone(uid)
+			return "", true, "今天已签到"
+		case upstream.CheckinInactive:
+			return "", false, "签到活动未开启（非失败）"
+		default:
+			return "", false, err.Error() // 业务错误照常查余额
+		}
+	}
+	p.cfg.Pool.NoteCheckinDone(uid)
+	return "", true, ""
+}
+
 // accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
@@ -579,31 +602,18 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	checkinMsg := ""
-	checkinDone := false
-	// 企业版无签到体系（上游 400 code 10001「企业账号不支持该操作」）：不发起该调用，
-	// 端点退化为「刷新额度」——企业额度走 get-enterprise-user-usage 口径（见 upstream）。
-	// 前端对企业号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存前端仍可能调用）。
-	if a.IsEnterprise() {
-		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
-	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		// 按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游非错误态，
-		// 不标记已签、给出可区分文案（issue #27）；其余才是真失败。
-		switch upstream.ClassifyCheckin(err) {
-		case upstream.CheckinAlready:
-			p.cfg.Pool.NoteCheckinDone(uid)
-			checkinDone = true
-			checkinMsg = "今天已签到"
-		case upstream.CheckinInactive:
-			checkinMsg = "签到活动未开启（非失败）"
-		default:
-			checkinMsg = err.Error() // 业务错误照常查余额
-		}
-	} else {
-		p.cfg.Pool.NoteCheckinDone(uid)
-		checkinDone = true
-	}
+	// 账号体系门控（issue #108）：global 无 CN 签到体系，企业版无个人签到体系
+	// （上游 400 code 10001）。两者都不发起签到调用，端点退化为「刷新额度」
+	// ——额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
+	// 前端对这两类账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
+	// 前端仍可能调用）。
+	denyReason, checkinDone, checkinMsg := p.runCheckin(a, uid)
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	if denyReason != "" {
+		// 明确「跳过」而非「签到成功」：checkin_done 保持 false，reason 可读。
+		resp["skipped"] = true
+		resp["reason"] = denyReason
+	}
 	if a.IsEnterprise() {
 		resp["enterprise"] = true
 	}

@@ -652,7 +652,7 @@ func (p *Panel) marketExpertForMini(a *auth.Auth) (upstream.MarketExpert, string
 // accountTaskAuto 一键完成单个任务：执行对应动作 → 回读进度 → 汇报结果。
 func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.eligibleTaskAccount(w, uid)
 	if a == nil {
 		return
 	}
@@ -1252,7 +1252,7 @@ func (p *Panel) autoClaimItem(a *auth.Auth, code, msg string, item map[string]an
 // accountTaskAutoAll 一键完成该账号全部可自动任务。
 func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.accountByUID(w, uid)
+	a := p.eligibleTaskAccount(w, uid)
 	if a == nil {
 		return
 	}
