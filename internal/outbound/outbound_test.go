@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -264,4 +265,186 @@ func serveSOCKS5(c net.Conn) {
 	go func() { io.Copy(target, c); done <- struct{}{} }()
 	go func() { io.Copy(c, target); done <- struct{}{} }()
 	<-done
+}
+
+// hangProxy 起一个「接受 TCP 但永不响应握手」的代理（issue #106 的卡死形态）。
+func hangProxy(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			// 握住连接不写任何字节：握手读必然无限阻塞。
+			t.Cleanup(func() { c.Close() })
+		}
+	}()
+	return ln
+}
+
+// setHandshakeTimeout 在测试期替换握手超时（用完恢复）。
+func setHandshakeTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := handshakeTimeout
+	handshakeTimeout = d
+	t.Cleanup(func() { handshakeTimeout = old })
+}
+
+// TestHTTPConnectHandshakeTimeout HTTP CONNECT 代理接受连接但不响应：握手必须在
+// 设定超时内失败（issue #106），且 goroutine 不残留（watcher 随错误路径退出）。
+func TestHTTPConnectHandshakeTimeout(t *testing.T) {
+	setHandshakeTimeout(t, 150*time.Millisecond)
+	ln := hangProxy(t)
+	defer ln.Close()
+	p, err := ParseProxy("http://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := runtime.NumGoroutine()
+	start := time.Now()
+	_, err = p.dial(context.Background(), "tcp", "127.0.0.1:9")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("hang proxy must fail")
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("handshake took %v: deadline not enforced", elapsed)
+	}
+	// watcher goroutine 退出：等一小会儿再比对（Close 由 ctx watcher 或读失败触发）。
+	time.Sleep(100 * time.Millisecond)
+	if after := runtime.NumGoroutine(); after > before+2 {
+		t.Errorf("goroutines leaked: before=%d after=%d", before, after)
+	}
+}
+
+// TestSOCKS5HandshakeTimeout SOCKS5 代理接受连接但不响应：协商必须在设定
+// 超时内失败（issue #106）。
+func TestSOCKS5HandshakeTimeout(t *testing.T) {
+	setHandshakeTimeout(t, 150*time.Millisecond)
+	ln := hangProxy(t)
+	defer ln.Close()
+	p, err := ParseProxy("socks5://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = p.dial(context.Background(), "tcp", "127.0.0.1:9")
+	if err == nil {
+		t.Fatal("hang socks5 proxy must fail")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("handshake took %v: deadline not enforced", elapsed)
+	}
+}
+
+// TestHandshakeCtxCancel 握手读阻塞中取消 ctx：watcher 必须立即关闭连接、
+// 让 dial 快速失败（issue #106）——不等满 handshakeTimeout。
+func TestHandshakeCtxCancel(t *testing.T) {
+	setHandshakeTimeout(t, 30*time.Second) // 足够长：只有 ctx 取消能提前打断
+	ln := hangProxy(t)
+	defer ln.Close()
+	p, err := ParseProxy("http://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err = p.dial(ctx, "tcp", "127.0.0.1:9")
+	if err == nil {
+		t.Fatal("ctx cancel must interrupt handshake")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("cancel took %v: watcher not closing conn", elapsed)
+	}
+}
+
+// TestHandshakeSuccessClearsDeadline 握手成功后一次性 deadline 必须被清除：
+// 隧道连接上的长读（聊天 SSE）不受 handshakeTimeout 误杀（issue #106 验收）。
+// 行为断言：等到超过 handshakeTimeout 后再走隧道——若 deadline 未清，读会立即
+// 以 timeout 失败；能拿到响应即证明已清。
+func TestHandshakeSuccessClearsDeadline(t *testing.T) {
+	setHandshakeTimeout(t, 150*time.Millisecond)
+	proxy := connectProxy(t)
+	defer proxy.Close()
+	target := helloServer(t)
+	defer target.Close()
+
+	pool, err := New([]string{proxy.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := pool.DialContext(context.Background(), "tcp", target.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	// 静默超过握手超时：残留 deadline 会让后续读立即失败。
+	time.Sleep(300 * time.Millisecond)
+	if body := httpGetViaConn(t, conn, target.Listener.Addr().String()); !strings.Contains(body, "hello") {
+		t.Fatalf("tunnel broken after handshake (deadline not cleared?): %q", body)
+	}
+}
+
+// TestProxyDialFailuresWrapped 代理握手失败仍包装 ErrProxyDial（调用方据此
+// 不惩罚账号）——issue #106 不改变代理池的健康语义。
+func TestProxyDialFailuresWrapped(t *testing.T) {
+	setHandshakeTimeout(t, 150*time.Millisecond)
+	ln := hangProxy(t)
+	defer ln.Close()
+	pool, err := New([]string{"http://" + ln.Addr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.DialContext(context.Background(), "tcp", "127.0.0.1:9"); !errors.Is(err, ErrProxyDial) {
+		t.Fatalf("err=%v want ErrProxyDial", err)
+	}
+}
+
+// TestHandshakeFailureClosesConn 握手超时后底层连接必须被关闭（issue #106）：
+// 代理侧读到 EOF 即证明 fd 已回收，不是只让调用方返回而连接悬空。
+func TestHandshakeFailureClosesConn(t *testing.T) {
+	setHandshakeTimeout(t, 150*time.Millisecond)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	closed := make(chan struct{})
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		// 不响应握手；读方在客户端关闭时得到 EOF/错误。
+		buf := make([]byte, 256)
+		for {
+			if _, err := c.Read(buf); err != nil {
+				close(closed)
+				c.Close()
+				return
+			}
+		}
+	}()
+
+	pool, err := New([]string{"http://" + ln.Addr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.DialContext(context.Background(), "tcp", "127.0.0.1:9"); err == nil {
+		t.Fatal("hang proxy must fail")
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("proxy-side conn was not closed after handshake timeout")
+	}
 }
