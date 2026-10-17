@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
@@ -44,7 +45,19 @@ type Config struct {
 		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
+		// DecisionTrace 是否在请求归档里记录选号决策链（issue #63）；默认 false。
+		DecisionTrace bool `json:"decision_trace"`
+		// DecisionTraceSample 采样率：0 或 1 = 全部，0<v<1 按比例采样；>1 报错。
+		DecisionTraceSample float64 `json:"decision_trace_sample"`
 	} `json:"logging"`
+
+	Notify struct {
+		// WebhookURL 告警 webhook 地址；空 = 关闭。只支持 http/https，可内嵌 token。
+		WebhookURL string `json:"webhook_url"`
+		// Events 订阅的事件名；空 = 默认关键事件（session_dead/pool_unavailable/
+		// credit_low/waf_ip_blocked/task_failed）。
+		Events []string `json:"events"`
+	} `json:"notify"`
 
 	Server struct {
 		// ReadTimeout 入站请求读取（含 body 上传）总时长上限（issue #100）。
@@ -108,7 +121,18 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+		// CheckinAccountDelay 签到任务账号间等待（issue #59）：如 "800ms"；"0" = 不限。
+		CheckinAccountDelay string `json:"checkin_account_delay"`
 	} `json:"schedule"`
+
+	Models struct {
+		// Aliases 客户端模型别名 → 上游模型（issue #52）：
+		// {"claude-sonnet-4-5": "cn:hy4", "gpt-5-codex": "hy4"}。
+		// 键必须是裸名（不含 realm 前缀，大小写敏感）；值沿用 "[realm:]model"
+		// 语法，省略 realm 时继承请求侧的 realm（裸请求即 cn）。
+		// 命中别名后选号/粘性/成本台账/日志一律使用解析后的裸模型名。
+		Aliases map[string]string `json:"aliases"`
+	} `json:"models"`
 
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
@@ -130,6 +154,13 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// KeepaliveInterval 入站 SSE 主动心跳间隔（issue #54）：上游静默超过该时长
+		// 时向客户端写 ": keepalive" 注释帧，防反代空闲超时断流。"0"/空 = 关闭。
+		KeepaliveInterval string `json:"keepalive_interval"`
+		// ModelTimeouts 按模型覆盖聊天首字节/流中空闲超时（issue #58）：
+		// {"cn:glm-5.2": {"header": "300s", "idle": "600s"}}。键可带 realm 前缀，
+		// 未命中回落全局 header_timeout_seconds / idle_timeout_seconds。
+		ModelTimeouts map[string]ModelTimeout `json:"model_timeouts"`
 		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
@@ -238,12 +269,25 @@ type Config struct {
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
+	CheckinAccountDelayDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// RotateBudgetDur 解析后的轮换总时长预算（issue #17）；0 = 不限。
 	RotateBudgetDur time.Duration `json:"-"`
+	// KeepaliveIntervalDur 解析后的入站 SSE 心跳间隔（issue #54）；0 = 关闭。
+	KeepaliveIntervalDur time.Duration `json:"-"`
+}
+
+// ModelTimeout 单个模型的超时覆盖；空/0 = 回落全局值。
+type ModelTimeout struct {
+	Header string `json:"header"`
+	Idle   string `json:"idle"`
+	// 解析后（normalize 填充，不参与 JSON）。
+	HeaderDur time.Duration `json:"-"`
+	IdleDur   time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -264,6 +308,8 @@ func Default() *Config {
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	c.Logging.RequestClientInfo = true
+	// 与 README / config.example.json 对齐：开启决策链时默认只采样 10%，避免归档写入量突增。
+	c.Logging.DecisionTraceSample = 0.1
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -280,6 +326,7 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Schedule.CheckinAccountDelay = "800ms"
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -511,6 +558,18 @@ func (c *Config) normalize() error {
 		return err
 	}
 	c.normalizeStaticDefaults()
+	if err := c.normalizeModelAliases(); err != nil {
+		return err
+	}
+	if err := c.normalizeNotify(); err != nil {
+		return err
+	}
+	if err := c.normalizeCheckinDelay(); err != nil {
+		return err
+	}
+	if err := c.normalizeLogging(); err != nil {
+		return err
+	}
 	if err := c.normalizeSchedule(); err != nil {
 		return err
 	}
@@ -522,6 +581,91 @@ func (c *Config) normalize() error {
 	}
 	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
 	return c.Validate()
+}
+
+// normalizeModelAliases 校验并归一化模型别名（issue #52）：键必须是裸名，
+// 值必须是可解析的非空 "[realm:]model"；首尾空白去掉，去空白后重名直接报错
+// （否则 map 覆盖顺序不确定，配置会静默丢一项）。
+func (c *Config) normalizeModelAliases() error {
+	if len(c.Models.Aliases) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(c.Models.Aliases))
+	for key, value := range c.Models.Aliases {
+		name := strings.TrimSpace(key)
+		if name == "" {
+			return errors.New("models.aliases: 别名不能为空")
+		}
+		if strings.Contains(name, ":") {
+			return fmt.Errorf("models.aliases[%q]: 别名不得含 realm 前缀，请写成裸模型名", name)
+		}
+		target, err := normalizeAliasTarget(name, value)
+		if err != nil {
+			return err
+		}
+		if _, dup := out[name]; dup {
+			return fmt.Errorf("models.aliases: 别名 %q 去掉首尾空白后重复", name)
+		}
+		out[name] = target
+	}
+	c.Models.Aliases = out
+	return nil
+}
+
+// normalizeAliasTarget 去掉目标首尾空白并校验 "[realm:]model"：冒号前只允许
+// cn/global（未知前缀会与裸模型名混淆，必须在启动期拒绝），裸名部分必须非空。
+func normalizeAliasTarget(name, value string) (string, error) {
+	target := strings.TrimSpace(value)
+	if target == "" {
+		return "", fmt.Errorf("models.aliases[%q]: 目标模型不能为空", name)
+	}
+	model := target
+	if i := strings.IndexByte(model, ':'); i >= 0 {
+		prefix := model[:i]
+		if prefix != "cn" && prefix != "global" {
+			return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 的 realm 前缀必须是 cn 或 global", name, target)
+		}
+		model = model[i+1:]
+	}
+	if model == "" {
+		return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 缺少裸模型名", name, target)
+	}
+	return target, nil
+}
+
+// normalizeNotify 校验 webhook 与事件名，并去掉事件首尾空白/重复项。
+func (c *Config) normalizeNotify() error {
+	url := strings.TrimSpace(c.Notify.WebhookURL)
+	if err := notify.ValidateURL(url); err != nil {
+		return fmt.Errorf("notify.webhook_url: %w", err)
+	}
+	c.Notify.WebhookURL = url
+	if len(c.Notify.Events) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.Notify.Events))
+	events := make([]string, 0, len(c.Notify.Events))
+	for _, raw := range c.Notify.Events {
+		name := strings.TrimSpace(raw)
+		if !notify.ValidEvent(name) {
+			return fmt.Errorf("notify.events: 未知事件 %q", raw)
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		events = append(events, name)
+	}
+	c.Notify.Events = events
+	return nil
+}
+
+// normalizeLogging 校验决策链采样率（issue #63）：0/1 = 全部，0<v<1 采样，>1 报错。
+func (c *Config) normalizeLogging() error {
+	if c.Logging.DecisionTraceSample < 0 || c.Logging.DecisionTraceSample > 1 {
+		return fmt.Errorf("logging.decision_trace_sample: 必须在 [0,1]，当前 %v", c.Logging.DecisionTraceSample)
+	}
+	return nil
 }
 
 // normalizeProxies 校验出站代理 URL（issue #15）：任一非法即拒绝（避免运行时才暴露）。
@@ -655,6 +799,9 @@ func (c *Config) normalizeUpstreamDefaults() {
 	if c.Upstream.RotateBudget == "" {
 		c.Upstream.RotateBudget = "0"
 	}
+	if c.Upstream.KeepaliveInterval == "" {
+		c.Upstream.KeepaliveInterval = "0"
+	}
 }
 
 // normalizeDurations 把字符串时长解析到对应的 *Dur 字段，并按需回落默认值。
@@ -675,7 +822,73 @@ func (c *Config) normalizeDurations() error {
 	if err := c.normalizeUpstreamRotate(); err != nil {
 		return err
 	}
+	if err := c.normalizeUpstreamKeepalive(); err != nil {
+		return err
+	}
+	if err := c.normalizeModelTimeouts(); err != nil {
+		return err
+	}
 	return c.normalizeExpiringDurations()
+}
+
+// normalizeModelTimeouts 校验并解析按模型超时（issue #58）：键去空白后不得为空；
+// header/idle 非空时必须是合法非负时长，至少配置一项。
+func (c *Config) normalizeModelTimeouts() error {
+	if len(c.Upstream.ModelTimeouts) == 0 {
+		return nil
+	}
+	out := make(map[string]ModelTimeout, len(c.Upstream.ModelTimeouts))
+	for key, spec := range c.Upstream.ModelTimeouts {
+		name := strings.TrimSpace(key)
+		if name == "" {
+			return errors.New("upstream.model_timeouts: 模型名不能为空")
+		}
+		parsed, err := parseModelTimeout(name, spec)
+		if err != nil {
+			return err
+		}
+		if _, dup := out[name]; dup {
+			return fmt.Errorf("upstream.model_timeouts: 模型 %q 去空白后重复", name)
+		}
+		out[name] = parsed
+	}
+	c.Upstream.ModelTimeouts = out
+	return nil
+}
+
+// parseModelTimeout 解析单个模型的 header/idle 覆盖。
+func parseModelTimeout(name string, spec ModelTimeout) (ModelTimeout, error) {
+	header, err := parseOptionalDuration("upstream.model_timeouts["+name+"].header", spec.Header)
+	if err != nil {
+		return ModelTimeout{}, err
+	}
+	idle, err := parseOptionalDuration("upstream.model_timeouts["+name+"].idle", spec.Idle)
+	if err != nil {
+		return ModelTimeout{}, err
+	}
+	if header == 0 && idle == 0 {
+		return ModelTimeout{}, fmt.Errorf("upstream.model_timeouts[%q]: header/idle 至少配置一项", name)
+	}
+	spec.Header = strings.TrimSpace(spec.Header)
+	spec.Idle = strings.TrimSpace(spec.Idle)
+	spec.HeaderDur = header
+	spec.IdleDur = idle
+	return spec, nil
+}
+
+// parseOptionalDuration 解析可空时长；空 = 0，负值报错。
+func parseOptionalDuration(field, raw string) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s: 负时长 %q 无意义", field, raw)
+	}
+	return d, nil
 }
 
 // normalizeUpstreamRotate 解析轮换总时长预算（issue #17）：空 = "0"（不限）；
@@ -693,6 +906,24 @@ func (c *Config) normalizeUpstreamRotate() error {
 		return fmt.Errorf("upstream.rotate_budget: 负时长 %q 无意义", c.Upstream.RotateBudget)
 	}
 	c.RotateBudgetDur = d
+	return nil
+}
+
+// normalizeUpstreamKeepalive 解析入站 SSE 心跳间隔（issue #54）：空 = "0"（关闭）；
+// 负时长无意义 fail fast。
+func (c *Config) normalizeUpstreamKeepalive() error {
+	raw := c.Upstream.KeepaliveInterval
+	if raw == "" {
+		raw = "0"
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("upstream.keepalive_interval: %w", err)
+	}
+	if d < 0 {
+		return fmt.Errorf("upstream.keepalive_interval: 负时长 %q 无意义", c.Upstream.KeepaliveInterval)
+	}
+	c.KeepaliveIntervalDur = d
 	return nil
 }
 
@@ -784,6 +1015,25 @@ func (c *Config) normalizeExpiringDurations() error {
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
 	}
+	return nil
+}
+
+// normalizeCheckinDelay 解析签到账号间等待（issue #59）：空回落 800ms，
+// "0" = 不限，负时长报错。
+func (c *Config) normalizeCheckinDelay() error {
+	raw := strings.TrimSpace(c.Schedule.CheckinAccountDelay)
+	if raw == "" {
+		raw = "800ms"
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf("schedule.checkin_account_delay: %w", err)
+	}
+	if d < 0 {
+		return fmt.Errorf("schedule.checkin_account_delay: 负时长 %q 无意义", c.Schedule.CheckinAccountDelay)
+	}
+	c.Schedule.CheckinAccountDelay = raw
+	c.CheckinAccountDelayDur = d
 	return nil
 }
 

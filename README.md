@@ -130,7 +130,7 @@ http://127.0.0.1:7863/panel/
 - **Docker + Docker Compose**（推荐）——或
 - **Windows / macOS / Linux 直接跑单文件二进制**
 - 一个或多个已注册的 CodeBuddy 账号，用于登录
-- 宿主机 Go ≥ 1.22（仅从源码构建时需要）
+- 宿主机 Go ≥ 1.27（仅从源码构建时需要）
 
 ### 方式一：Docker Compose（推荐）
 
@@ -148,6 +148,13 @@ docker compose up -d --build
 
 # 4. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
+```
+
+Compose 默认把端口绑定到 `127.0.0.1`，仅本机可达（面板与网关无内置 TLS）。需要局域网访问时，把 `docker-compose.yml` 的 ports 改为 `"7863:7863"` 或指定内网 IP：
+
+```yaml
+ports:
+  - "192.168.1.10:7863:7863"
 ```
 
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录。
@@ -175,6 +182,20 @@ go build -trimpath -ldflags="-s -w" -o wokbuddy-demon.exe ./cmd/server
 
 exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
 
+### 校验 nightly 产物
+
+nightly 的每个二进制压缩包同目录附带 `.sha256`，下载后校验：
+
+```bash
+# Linux
+sha256sum -c wokbuddy-demon-nightly-*.sha256
+
+# macOS（文件名在文件里，需先进入下载目录）
+shasum -a 256 -c wokbuddy-demon-nightly-*.sha256
+```
+
+校验和覆盖压缩包本身；容器镜像的完整性由 GHCR digest 提供。
+
 ### 方式三：源码运行（开发调试）
 
 ```bash
@@ -182,6 +203,13 @@ go build ./...
 go vet ./...
 go test ./...                      # 完整测试套件
 go run ./cmd/server -config config.json
+go install golang.org/x/vuln/cmd/govulncheck@latest
+govulncheck ./...                  # 依赖已知漏洞扫描（CI 同口径）
+
+# 解析管线 fuzz（nightly CI 短跑；本地可调长时间）
+go test ./internal/upstream -run=^$ -fuzz=FuzzPrepareBodyOpt -fuzztime=30s
+go test ./internal/upstream -run=^$ -fuzz=FuzzNormalizeFrame -fuzztime=30s
+go test ./internal/upstream -run=^$ -fuzz=FuzzHandleStreamLine -fuzztime=30s
 
 # 仅当改动前端 web/ 时才需要（产物 internal/panel/dist 已提交）：
 make web                           # 构建前端（需 Bun）→ internal/panel/dist
@@ -216,6 +244,68 @@ curl -s http://localhost:7863/healthz
 curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 ```
 
+### 客户端接入（OpenAI / Claude Code）
+
+网关同时暴露 OpenAI 兼容与 Anthropic Messages 兼容协议面：
+
+| 协议 | 端点 |
+|---|---|
+| OpenAI | `POST /v1/chat/completions`、`GET /v1/models` |
+| Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
+
+Claude Code 接入示例（`api_key` 非空时填同一密钥）：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7863
+export ANTHROPIC_AUTH_TOKEN=your-api-key
+export ANTHROPIC_MODEL=claude-sonnet-4-5   # 需在 models.aliases 中映射到上游模型
+claude
+```
+
+- 请求侧支持 `system`、文本/图片内容块、`tool_use` / `tool_result`、`tools`、`tool_choice`、`stop_sequences`、`thinking`；响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
+- 上游错误转换为 Anthropic `{"type":"error","error":{...}}`，`gateway_hint` 保留在 error 对象内。
+- `count_tokens` 无本地 tokenizer，按请求文本字节数近似估算，仅用于客户端上下文预算，不作计费依据。
+- 未配置模型别名时，Anthropic 客户端可直接请求上游裸模型名。
+
+### SSE 心跳
+
+反向代理（nginx / Cloudflare 等）通常有空闲超时（常见 60–100s）。长时间思考或排队时上游可能迟迟不发帧，网关默认只透传上游帧，连接会被反代切断。设置：
+
+```json
+{ "upstream": { "keepalive_interval": "15s" } }
+```
+
+上游静默超过该间隔时，网关向客户端写一帧 `: keepalive` SSE 注释（不进入 JSON 帧白名单，不影响客户端解析）；上游持续输出时不额外插入。默认 `"0"` 关闭以保持逐字节透传行为。改后需重启。
+
+### Webhook 告警
+
+配置 `notify.webhook_url` 后，以下关键事件会以 POST JSON 异步推送（同事件 + 账号 10 分钟内去重，失败只记日志，不影响请求与任务）：
+
+- `session_dead`：账号 session 失效被禁用（需重新登录）
+- `pool_unavailable`：请求时池内无可用账号（健康/在途名额耗尽或模型级冷却）
+- `credit_low`：余额低于 `pool.credit_floor`
+- `waf_ip_blocked`：出口 IP 触发上游 WAF 级拦截
+- `task_failed`：签到 / 旅行 / 活跃 / 保活任务失败
+
+```json
+{
+  "notify": {
+    "webhook_url": "https://example.com/hook",
+    "events": ["session_dead", "credit_low"]
+  }
+}
+```
+
+载荷固定字段：`event`、`time`（RFC3339）、`uid`（仅 uid8）、`nickname`、`realm`、`summary`、`detail`。**不发送 token、完整 UID、请求体或凭证**；`webhook_url` 可内嵌 token，日志只记事件名与状态码。
+
+### 错误与重试
+
+网关在限流/无可用账号等可恢复错误上返回标准 `Retry-After` 头（秒）：
+
+- `429`：取账号级软冷却或模型级冷却的最早到期时间；上游明示 `Retry-After` 时一并对齐。
+- `503`：仅在能确定模型级最早解封时间时携带。
+- 无法确定可靠时间时不携带该头，客户端应使用自身退避策略。错误 JSON body 与 `gateway_hint` 保持原格式不变。
+
 ### Prometheus 指标
 
 `GET /metrics` 按 Prometheus 文本格式（`text/plain; version=0.0.4`）导出核心指标，可直接配置为抓取目标：
@@ -244,22 +334,52 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `state_file` | `./data/state.json` | 账号管家状态持久化文件 |
 | `logging.request_archive_enabled` | `true` | 请求元数据归档开关 |
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
+| `logging.decision_trace` | `false` | 请求归档记录选号决策链（候选/排除原因/成本层/Top-N/轮换） |
+| `logging.decision_trace_sample` | `0.1` | 决策链采样率：0/1 = 全部，0<v<1 按比例。改后需重启 |
+| `notify.webhook_url` | 空 | 告警 webhook（http/https）；空 = 关闭 |
+| `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
+| `upstream.model_timeouts` | `{}` | 按模型覆盖 `header` / `idle` 超时（如 `{"cn:glm-5.2":{"header":"300s","idle":"600s"}}`）；未命中回落全局。改后需重启 |
 | `upstream.rotate_max` | `3` | 单请求最多换号次数 |
 | `upstream.rotate_budget` | `0` | 轮换总时长预算（如 `90s`）；`0` = 不限。与 `rotate_max` 先到先停 |
 | `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
+| `upstream.keepalive_interval` | `0` | 入站 SSE 主动心跳间隔（如 `15s`）；上游静默时写 `: keepalive` 注释帧。`0` = 关闭 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |
 | `schedule.travel_hours` | `[9, 21]` | 每日整点推进猫猫旅行状态机 |
 | `schedule.activity_hours` | `[10]` | 每日整点对话活跃上报 |
 | `schedule.keepalive_hours` | `[22]` | 每日整点刷新凭证保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
+| `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
 | `pool.credit_floor` | `100` | 积分保底：余额低于该值不再参与收费模型轮换 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
+| `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
+
+### 模型别名
+
+`models.aliases` 把客户端惯用模型名映射到上游模型，免去逐客户端改配置：
+
+```json
+{
+  "models": {
+    "aliases": {
+      "claude-sonnet-4-5": "cn:hy4",
+      "gpt-5-codex": "cn:gpt-5.6-sol",
+      "claude-global": "global:hy4"
+    }
+  }
+}
+```
+
+- 键必须是裸模型名（不含 `cn:` / `global:` 前缀，大小写敏感）。
+- 值沿用 `[realm:]model` 语法；省略 realm 时继承请求侧 realm（裸请求即 `cn`）。
+- 先剥请求的 realm 前缀再查别名；未命中则原样透传，行为与未配置别名一致。
+- 命中后选号、会话粘性、成本台账与日志统一使用解析后的裸模型名；`GET /v1/models` 会追加别名条目并附带 `upstream_id`。
+- 别名在进程启动时装载，修改后需重启。
 
 ### 环境变量覆盖
 
@@ -269,9 +389,19 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 ## 部署运维
 
+### 部署模型：单实例
+
+本网关按**单实例**设计，同一 `auth_dir` / `state_file`（以及同一 Redis）不要同时运行多个进程：
+
+- 定时任务（签到 / 旅行 / 活跃 / 保活 / 余额刷新）会在每个实例各执行一次；
+- 池状态以本地 `state_file` 为准，多实例会互相覆盖快照；
+- 冷却、在途名额、会话粘性与限流状态都是进程内状态，不跨实例共享，路由结果会不一致。
+
+`upstash` / Redis 仅作为**重启恢复镜像**：启动时读取状态快照与会话绑定，运行期异步写回；没有分布式锁、租约或 leader election，不提供多实例共享状态。需要高可用时，请使用反向代理指向**单个写入实例**，或由外部编排保证同一时刻只有一个实例运行。
+
 ### Docker 镜像
 
-多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：`wokbuddy-demon`（主服务）、`signin_bin`、`login`、`credit` + 工具脚本。以 `app` 用户（uid 10001）运行，内置 `HEALTHCHECK`。
+多阶段镜像（`golang:1.27-alpine` 构建 → `alpine:3.24` 运行）一次编译全部四个二进制并随镜像分发：`wokbuddy-demon`（主服务）、`signin_bin`、`login`、`credit` + 工具脚本。以 `app` 用户（uid 10001）运行，内置 `HEALTHCHECK`。
 
 ### 工具脚本
 
@@ -280,12 +410,14 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | `./login.sh` | 登录 → 落盘凭证 → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
+| `go run ./cmd/migrate-auths -dir auths` | 迁移旧版 snake_case 格式 auth 文件（预览；加 `-apply` 落盘） |
 | `python3 scripts/probe_active.py` | 活跃上报手动诊断 / 补跑 |
 | `python3 scripts/probe_max_tokens.py` | 探测各模型真实输出上限 |
 
 ### 账号管理
 
 - 多账号复制 `auths/workbuddy-<uid>.json` 即可，管家启动时自动对齐目录
+- 旧版 snake_case 扁平形（`access_token` / `expires_at` 毫秒）不会被载入：`go run ./cmd/migrate-auths -dir auths -apply` 转换，原文件留存 `.legacy` 副本
 - 失效账号被禁用后，可用 `./login.sh` 重新登录覆盖凭证
 - 备份 = `auths/`（凭证）+ `data/state.json`（状态）
 
@@ -300,7 +432,9 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 ### 2. 网络暴露与日志敏感度
 
-- 默认监听 `:7863`，**无内置 TLS**；公网部署必须设置 `api_key`，建议置于 HTTPS 之后 / 仅内网可达
+- 默认监听 `:7863`，**无内置 TLS**；Docker Compose 默认仅绑定 `127.0.0.1`，需要局域网/公网访问时显式改端口映射
+- 公网部署必须设置 `api_key`，并置于 HTTPS 之后 / 仅内网可达
+- `api_key` 非空时，面板与 `GET /status`、`GET /metrics` 对同一来源地址的鉴权失败做 1 分钟窗口计数，连续 10 次失败后返回 `429` + `Retry-After`；成功鉴权清零。来源只取 TCP `RemoteAddr`，不信任 `X-Forwarded-For`；经反向代理部署时所有客户端共享反代地址，需在反代层另行限速
 - 日志字段不含任何 token 明文（不读取 `Authorization` 头）
 - 日志写 **stdout / stderr**，代码无任何落盘日志文件
 
@@ -334,9 +468,10 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 面板「密钥」页可创建多把**命名密钥**（如 `sk-wb-xxxx…`），分发给不同客户端，并可逐把撤销或删除。规则：
 
 - 命名密钥以 **SHA-256 哈希**存储（`data/api_keys.json`），明文**仅在创建时回显一次**；
-- 命名密钥**只作用于网关 API 面**（`POST /v1/chat/completions`、`GET /v1/models`）；
+- 命名密钥**只作用于网关 API 面**（`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`）；
 - 面板、`GET /status`、`GET /metrics` 仍**只认**默认 `api_key`（命名密钥是给客户端的，不获得管理/运维可见性）；
-- 每把密钥记录 `last_used_at` 与请求数 / token 用量，面板可查看；
+- 每把密钥记录 `last_used_at`、请求数 / token 用量与被限制拒绝数，面板可查看；
+- 面板「限制」可设置每把密钥的 `rpm` / `tpm` / `max_concurrent` / 模型白名单（glob，可带 `cn:` / `global:` 前缀）；超限返回 `429 + Retry-After`，白名单未命中返回 `403 model_not_allowed`；未配置限制的密钥行为不变。限流为进程内单实例计数；
 - `api_key` 为空且未创建任何命名密钥时，网关仍为「不鉴权」放行（既有默认）。
 
 本功能**不涉及任何计费**：不设额度、不设配额、不设账单。

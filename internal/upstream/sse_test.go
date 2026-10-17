@@ -3,8 +3,10 @@ package upstream
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1278,3 +1280,133 @@ func TestStreamWithoutMarkupRepairIsUnchanged(t *testing.T) {
 		t.Fatalf("未声明 tools 时输出被改动\nbase=%s\ngot =%s", base.Body.String(), disabled.Body.String())
 	}
 }
+
+// deadlineWriter 可控的 ResponseWriter：实现 SetWriteDeadline（模拟真实连接），
+// block=true 时 Write 阻塞到截止时间后返回超时错误，用于验证入站写截止。
+type deadlineWriter struct {
+	h        http.Header
+	block    bool
+	deadline time.Time
+	sets     int
+	writes   int
+}
+
+func (w *deadlineWriter) Header() http.Header {
+	if w.h == nil {
+		w.h = http.Header{}
+	}
+	return w.h
+}
+
+func (w *deadlineWriter) Write(p []byte) (int, error) {
+	w.writes++
+	if !w.block {
+		return len(p), nil
+	}
+	if d := w.deadline; !d.IsZero() {
+		if wait := time.Until(d); wait > 0 {
+			time.Sleep(wait)
+		}
+	}
+	return 0, os.ErrDeadlineExceeded
+}
+
+func (w *deadlineWriter) WriteHeader(int) {}
+
+func (w *deadlineWriter) Flush() {}
+
+func (w *deadlineWriter) SetWriteDeadline(t time.Time) error {
+	w.deadline = t
+	w.sets++
+	return nil
+}
+
+// TestStreamClientWriteDeadline 慢客户端不消费时，单次写必须在截止后失败返回，
+// 不能永久占住 goroutine（issue #53）。
+func TestStreamClientWriteDeadline(t *testing.T) {
+	w := &deadlineWriter{block: true}
+	sw := newStreamWriter(w, nil)
+	sw.writeTimeout = 40 * time.Millisecond
+
+	start := time.Now()
+	err := sw.stream(strings.NewReader("data: {\"choices\":[]}\n\n"))
+	if err == nil {
+		t.Fatal("写阻塞超过截止后应返回错误")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("写截止未生效，耗时 %v", elapsed)
+	}
+	if w.sets == 0 || w.writes == 0 {
+		t.Fatalf("未设置写截止或未尝试写：sets=%d writes=%d", w.sets, w.writes)
+	}
+}
+
+// TestStreamClientWriteDeadlineCleared 正常流不被误杀，且流结束后清空写截止，
+// 避免过期 deadline 污染 keep-alive 连接的后续请求。
+func TestStreamClientWriteDeadlineCleared(t *testing.T) {
+	w := &deadlineWriter{}
+	raw := "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	if err := StreamHint(w, strings.NewReader(raw), nil); err != nil {
+		t.Fatalf("正常流被误杀：%v", err)
+	}
+	if w.sets == 0 {
+		t.Fatal("支持 deadline 的 writer 应设置过写截止")
+	}
+	if !w.deadline.IsZero() {
+		t.Fatalf("流结束后写截止未清空：%v", w.deadline)
+	}
+}
+
+// TestStreamKeepaliveOnSilence 上游静默超过间隔时写 SSE 注释心跳，且不丢后续帧。
+func TestStreamKeepaliveOnSilence(t *testing.T) {
+	pr, pw := io.Pipe()
+	rec := httptest.NewRecorder()
+	done := make(chan error, 1)
+	go func() {
+		done <- StreamHint(rec, pr, nil, WithKeepaliveInterval(20*time.Millisecond))
+	}()
+	time.Sleep(80 * time.Millisecond)
+	raw := "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n"
+	if _, err := pw.Write([]byte(raw)); err != nil {
+		t.Fatalf("pipe write: %v", err)
+	}
+	_ = pw.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, ": keepalive\n\n") {
+		t.Fatalf("缺少 keepalive 注释帧:\n%s", out)
+	}
+	if !strings.Contains(out, `"content":"hi"`) || !strings.Contains(out, "data: [DONE]") {
+		t.Fatalf("心跳后帧丢失:\n%s", out)
+	}
+}
+
+// TestStreamKeepaliveWriteFailure 客户端写失败时立即结束，不无限等待上游。
+func TestStreamKeepaliveWriteFailure(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	w := &keepaliveFailWriter{}
+	done := make(chan error, 1)
+	go func() {
+		done <- StreamHint(w, pr, nil, WithKeepaliveInterval(10*time.Millisecond))
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("写失败应返回错误")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("客户端写失败后流未结束")
+	}
+}
+
+type keepaliveFailWriter struct{}
+
+func (w *keepaliveFailWriter) Header() http.Header       { return http.Header{} }
+func (w *keepaliveFailWriter) Write([]byte) (int, error) { return 0, errors.New("client gone") }
+func (w *keepaliveFailWriter) WriteHeader(int)           {}
+func (w *keepaliveFailWriter) Flush()                    {}

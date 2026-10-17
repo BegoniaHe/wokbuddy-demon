@@ -13,7 +13,13 @@
     "request_archive_enabled": true,
     "request_retention_days": 7,
     "request_archive_max_mb": 100,
-    "request_client_info": true
+    "request_client_info": true,
+    "decision_trace": false,
+    "decision_trace_sample": 0.1
+  },
+  "notify": {
+    "webhook_url": "",
+    "events": []
   },
   "cooldown": {
     "soft_rate": "600s",
@@ -34,7 +40,11 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
+    "checkin_account_delay": "800ms",
     "include_disabled_in_tasks": false
+  },
+  "models": {
+    "aliases": {}
   },
   "global": {
     "enabled": true,
@@ -45,6 +55,8 @@
     "timeout_seconds": 120,
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
+    "keepalive_interval": "0",
+    "model_timeouts": {},
     "user_agent": "",
     "client_version": "",
     "cli_version": "",

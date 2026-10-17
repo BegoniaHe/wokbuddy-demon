@@ -95,6 +95,9 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// authLimiter 鉴权失败按来源 IP 限速（issue #61）。
+	authLimiter *httpauth.Limiter
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -138,11 +141,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:         cfg,
+		mux:         http.NewServeMux(),
+		started:     time.Now(),
+		logs:        NewRing(500),
+		logins:      map[string]loginSession{},
+		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
 	}
 	p.routes()
 	return p
@@ -195,6 +199,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAuth(p.keysRevoke))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAuth(p.keysDelete))
+	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAuth(p.keysUpdateLimits))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -212,10 +217,27 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // 即用新值（无需重启）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		key := p.apiKey()
+		if key == "" {
+			next(w, r)
+			return
+		}
+		ip := httpauth.RemoteIP(r)
+		if ok, retry := p.authLimiter.Allow(ip); !ok {
+			seconds := int((retry + time.Second - 1) / time.Second)
+			if seconds < 1 {
+				seconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.Itoa(seconds))
+			writeErr(w, http.StatusTooManyRequests, "too_many_auth_failures")
+			return
+		}
+		if !httpauth.VerifyBearer(r, key) {
+			p.authLimiter.Fail(ip)
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}
+		p.authLimiter.Reset(ip)
 		next(w, r)
 	}
 }

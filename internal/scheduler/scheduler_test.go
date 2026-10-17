@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,6 +199,8 @@ func hasKind(kinds []taskKind, k taskKind) bool {
 // fakeUpstream 同时模拟 billing 与 refresh。
 type fakeUpstream struct {
 	checkinCalls   atomic.Int32
+	checkinMu      sync.Mutex
+	checkinAt      []time.Time
 	refreshCalls   atomic.Int32
 	travelCalls    atomic.Int32
 	resourceRemain int64
@@ -209,6 +212,9 @@ func (f *fakeUpstream) server() *httptest.Server {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
 			f.checkinCalls.Add(1)
+			f.checkinMu.Lock()
+			f.checkinAt = append(f.checkinAt, time.Now())
+			f.checkinMu.Unlock()
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
 			// remain 需 <= size（取数钳 [0,size]：脏数据 remain>size 会被钳到 size
@@ -233,6 +239,13 @@ func (f *fakeUpstream) server() *httptest.Server {
 			http.Error(w, "not found", http.StatusNotFound)
 		}
 	}))
+}
+
+// checkinTimes 返回签到请求到达时刻快照。
+func (f *fakeUpstream) checkinTimes() []time.Time {
+	f.checkinMu.Lock()
+	defer f.checkinMu.Unlock()
+	return append([]time.Time(nil), f.checkinAt...)
 }
 
 func jsonI64(v int64) string {

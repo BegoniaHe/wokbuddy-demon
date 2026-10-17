@@ -13,6 +13,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -22,8 +23,10 @@ import (
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
-	Pool           *pool.Pool
-	Upstream       *upstream.Client
+	Pool     *pool.Pool
+	Upstream *upstream.Client
+	// Notifier webhook 告警出口（可选；nil = 关闭）。
+	Notifier       *notify.Notifier
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -56,6 +59,9 @@ type Config struct {
 	// 缺省 false = 保持「禁用的跳过」既有语义；打开后禁用号照常签到保号，但**仍不参与
 	// 选号**——pool.pick 侧的 disabled 过滤与本开关无关。
 	IncludeDisabledInTasks bool
+
+	// CheckinAccountDelay 签到任务账号间等待（issue #59）；0 = 不限。
+	CheckinAccountDelay time.Duration
 
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
@@ -146,6 +152,23 @@ func (s *Scheduler) includeDisabledInTasks() bool {
 	s.schedMu.Lock()
 	defer s.schedMu.Unlock()
 	return s.cfg.IncludeDisabledInTasks
+}
+
+// checkinDelay 返回签到账号间等待（读取时与热配置写在 schedMu 下同步）。
+func (s *Scheduler) checkinDelay() time.Duration {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.CheckinAccountDelay
+}
+
+// SetCheckinAccountDelay 热更新签到账号间等待（issue #59）。
+func (s *Scheduler) SetCheckinAccountDelay(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.schedMu.Lock()
+	s.cfg.CheckinAccountDelay = d
+	s.schedMu.Unlock()
 }
 
 // SetIncludeDisabledInTasks 热更新「保号类任务是否覆盖禁用账号」
@@ -413,7 +436,7 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.RunCheckinNowCtx(ctx)
 			case taskTravel:
 				s.RunTravelNow()
 			case taskActivity:
@@ -452,46 +475,65 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
+// RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻（无取消信号的便捷入口）。
+func (s *Scheduler) RunCheckinNow() { s.RunCheckinNowCtx(context.Background()) }
+
+// RunCheckinNowCtx 同 RunCheckinNow，账号间等待支持 ctx 取消（issue #59）。
 // 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
 // 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
-func (s *Scheduler) RunCheckinNow() {
+func (s *Scheduler) RunCheckinNowCtx(ctx context.Context) {
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
+	delay := s.checkinDelay()
+	attempted := false
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled && !includeDisabled {
+		a, ok := s.checkinAuth(st, includeDisabled)
+		if !ok {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
-			continue
+		if attempted && !sleepCtx(ctx, delay) {
+			return // 优雅停机：不等限速睡满，剩余账号下轮再跑
 		}
-		// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
-		// 经 auth.Realm() 统一判定：逃生门（global.enabled=false）下 global 账号被降级为 cn、
-		// 按 CN 处理——这是逃生门的刻意语义（纯 CN 部署锁死一切 global），与引用处一致。
-		if a.IsGlobal() {
-			continue
-		}
-		// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
-		// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
-		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
-		// credit_floor 判定与面板额度展示的唯一数据源）。
-		if !a.IsEnterprise() {
-			s.checkinOne(st.UID, st.Nickname, a)
-		}
-		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
-		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-		if err != nil {
-			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
-			continue
-		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
-		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+		attempted = true
+		s.runCheckinAccount(st, a, expiringSoon)
 	}
 	s.RunStreakBonusNow()
+}
+
+// checkinAuth 返回该账号本轮应使用的凭证；禁用/无 refresh token/global 跳过。
+func (s *Scheduler) checkinAuth(st pool.Status, includeDisabled bool) (*auth.Auth, bool) {
+	if st.Disabled && !includeDisabled {
+		return nil, false
+	}
+	a := s.cfg.Pool.AuthByUID(st.UID)
+	if a == nil || a.RefreshTokenValue() == "" {
+		return nil, false
+	}
+	// D4 门控：realm=global 账号无签到体系，直接跳过（不发起任何上游调用，避免风控）。
+	if a.IsGlobal() {
+		return nil, false
+	}
+	return a, true
+}
+
+// runCheckinAccount 执行单账号签到（企业版跳过）+ 余额刷新。
+func (s *Scheduler) runCheckinAccount(st pool.Status, a *auth.Auth, expiringSoon time.Duration) {
+	// 企业版无签到体系：上游直接 400；跳过签到，但余额查询照常跑
+	// （企业额度是 credit_floor 判定与面板额度展示的唯一数据源）。
+	if !a.IsEnterprise() {
+		s.checkinOne(st.UID, st.Nickname, a)
+	}
+	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+	if err != nil {
+		log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+		return
+	}
+	s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
+	s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
+	s.notifyCreditLow(a, remain)
 }
 
 // checkinOne 单账号签到并落一行结果日志：按 CheckinResult 分类呈现——成功/幂等/
@@ -513,6 +555,7 @@ func (s *Scheduler) checkinOne(uid, nickname string, a *auth.Auth) {
 		log.Printf("checkin %s: 签到活动未开启（跳过，非失败）", logfmt.Label(uid, nickname))
 	default:
 		log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
+		s.notifyTaskFailed("checkin", uid, nickname, a.Realm())
 	}
 }
 
@@ -562,6 +605,7 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			s.notifyTaskFailed("activity", a.UID, a.Nickname, a.Realm())
 			continue
 		}
 		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
@@ -621,12 +665,42 @@ func (s *Scheduler) RunKeepaliveNow() {
 // （一次失败不杀号）；其余错误只落一行。已禁用账号不再重复计数 12153。
 func (s *Scheduler) noteKeepaliveFailure(st pool.Status, err error) {
 	log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+	s.notifyTaskFailed("keepalive", st.UID, st.Nickname, st.Realm)
 	var ue *upstream.Error
 	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
 		if s.cfg.Pool.NoteSessionDead(st.UID) {
 			log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
+			s.notifyAccount(st.UID, st.Nickname, st.Realm, notify.EventSessionDead,
+				"账号连续 session 失效（12153），已禁用，需重新登录", map[string]any{"stage": "keepalive"})
 		}
 	}
+}
+
+// notifyAccount 发送账号级告警（uid 由通知层截为 uid8）。
+func (s *Scheduler) notifyAccount(uid, nickname, realm, event, summary string, detail map[string]any) {
+	if s.cfg.Notifier == nil {
+		return
+	}
+	s.cfg.Notifier.Notify(notify.Event{
+		Event: event, UID: uid, Nickname: nickname, Realm: realm,
+		Summary: summary, Detail: detail,
+	})
+}
+
+// notifyTaskFailed 定时任务失败告警；不携带上游错误原文（可能含敏感信息）。
+func (s *Scheduler) notifyTaskFailed(task, uid, nickname, realm string) {
+	s.notifyAccount(uid, nickname, realm, notify.EventTaskFailed, "定时任务执行失败",
+		map[string]any{"task": task})
+}
+
+// notifyCreditLow 余额低于 credit_floor 时告警（floor=0 关闭）。
+func (s *Scheduler) notifyCreditLow(a *auth.Auth, remain int64) {
+	floor := s.cfg.Pool.CreditFloor()
+	if floor <= 0 || remain >= floor || a == nil {
+		return
+	}
+	s.notifyAccount(a.UID, a.Nickname, a.Realm(), notify.EventCreditLow, "账号余额低于积分保底",
+		map[string]any{"credits": remain, "credit_floor": floor})
 }
 
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits。
@@ -658,6 +732,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+			s.notifyCreditLow(a, remain)
 		}(a, st.UID)
 	}
 	wg.Wait()

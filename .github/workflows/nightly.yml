@@ -22,6 +22,18 @@ env:
   APP_VERSION_PKG: main
 
 jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      # nightly 短跑解析管线 fuzz；发现 crash 即失败。
+      - run: go test ./internal/upstream -run=^$ -fuzz=FuzzPrepareBodyOpt -fuzztime=20s
+      - run: go test ./internal/upstream -run=^$ -fuzz=FuzzNormalizeFrame -fuzztime=20s
+      - run: go test ./internal/upstream -run=^$ -fuzz=FuzzHandleStreamLine -fuzztime=20s
+
   binaries:
     runs-on: ubuntu-latest
     strategy:
@@ -76,12 +88,15 @@ jobs:
               tar czf "$NAME" wokbuddy-demon config.example.json README.md
               ;;
           esac
+          sha256sum "$NAME" > "$NAME.sha256"
           echo "name=$NAME" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.name }}
-          path: ${{ env.name }}
+          path: |
+            ${{ env.name }}
+            ${{ env.name }}.sha256
           retention-days: 14
 
   image:

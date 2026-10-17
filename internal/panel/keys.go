@@ -7,9 +7,14 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	pathpkg "path"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 )
 
 // keysList 列出全部命名密钥（不含哈希与明文）。
@@ -78,4 +83,76 @@ func (p *Panel) keysDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: 删除命名密钥 id=%s", id)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// keysUpdateLimits 更新一把密钥的 RPM/TPM/并发/模型白名单（下一个请求生效）。
+func (p *Panel) keysUpdateLimits(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Keys == nil {
+		writeErr(w, http.StatusNotImplemented, "api key store not available")
+		return
+	}
+	var body struct {
+		Limits apikey.Limits `json:"limits"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	limits, err := normalizeLimits(body.Limits)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	id := r.PathValue("id")
+	ok, err := p.cfg.Keys.UpdateLimits(id, limits)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "update limits: "+err.Error())
+		return
+	}
+	if !ok {
+		writeErr(w, http.StatusNotFound, "key not found")
+		return
+	}
+	log.Printf("panel: 更新命名密钥限制 id=%s rpm=%d tpm=%d concurrent=%d models=%v", id, limits.RPM, limits.TPM, limits.MaxConcurrent, limits.Models)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// normalizeLimits 校验限制值并把模型 glob 去空白/去重。
+func normalizeLimits(in apikey.Limits) (apikey.Limits, error) {
+	if in.RPM < 0 || in.TPM < 0 || in.MaxConcurrent < 0 {
+		return apikey.Limits{}, errors.New("limits 不能为负")
+	}
+	models, err := normalizeModels(in.Models)
+	if err != nil {
+		return apikey.Limits{}, err
+	}
+	return apikey.Limits{RPM: in.RPM, TPM: in.TPM, MaxConcurrent: in.MaxConcurrent, Models: models}, nil
+}
+
+// normalizeModels 去空白/去重并校验 glob 语法。
+func normalizeModels(raw []string) ([]string, error) {
+	seen := map[string]bool{}
+	models := make([]string, 0, len(raw))
+	for _, item := range raw {
+		pat := strings.TrimSpace(item)
+		if pat == "" {
+			continue
+		}
+		bare := pat
+		if i := strings.IndexByte(pat, ':'); i >= 0 && (pat[:i] == "cn" || pat[:i] == "global") {
+			bare = pat[i+1:]
+		}
+		if bare == "" {
+			return nil, fmt.Errorf("模型 glob %q 缺少模型名", item)
+		}
+		if _, err := pathpkg.Match(bare, "x"); err != nil {
+			return nil, fmt.Errorf("非法模型 glob %q: %w", item, err)
+		}
+		if seen[pat] {
+			continue
+		}
+		seen[pat] = true
+		models = append(models, pat)
+	}
+	return models, nil
 }

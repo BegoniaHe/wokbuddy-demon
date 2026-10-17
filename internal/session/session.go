@@ -35,7 +35,8 @@ type Config struct {
 	Store      redisstore.Store
 	Available  func() []string
 	// AvailableForModel 按请求模型返回"在该模型上可用"的账号（healthy 且未占满在途，
-	// 且未被该模型限流/限额）。nil 时回落 Available（无模型维度，行为与引入前一致）。
+	// 且未被该模型限流/限额）。model 为 "[realm:]model" 形式，由实现方剥前缀并按
+	// realm 过滤；nil 时回落 Available（无模型维度，行为与引入前一致）。
 	//
 	// 为什么粘性需要模型维度：绑定只记 uid，而同一个会话可能换模型。账号被 6004
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
@@ -140,6 +141,9 @@ func (r *Router) Resolve(key string) (string, bool) {
 // ResolveForModel 返回会话 key 在该模型上应绑定的账号 uid。
 // 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
 // 被该模型限流）走重新分配。
+//
+// model 沿用网关的 "[realm:]model" 语法：AvailableForModel 实现方剥前缀后按 realm
+// 过滤，避免 global 会话只传裸名时被当成 cn、绑定到错误域的账号。
 //
 // 为什么必须带模型：绑定只记 uid，同一个会话可能换模型；账号被 6004 模型级限额后
 // 对其他模型仍可用（见 pool.healthyForModel 的 softRateModel 豁免）。若只按账号级

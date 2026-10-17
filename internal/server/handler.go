@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +24,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
@@ -67,6 +72,17 @@ type Config struct {
 	// PromptText custom 模式下注入的系统提示词文本（来自 config.PromptText）。
 	PromptText string
 
+	// ModelAliases 客户端模型别名 → 上游 "[realm:]model"（config models.aliases）。
+	// 命中后选号/粘性/成本台账/日志统一使用解析后的裸模型名（issue #52）。
+	ModelAliases map[string]string
+
+	// KeepaliveInterval 入站 SSE 主动心跳间隔（config upstream.keepalive_interval，
+	// issue #54）；0 = 关闭（保持逐字节行为）。
+	KeepaliveInterval time.Duration
+
+	// Notifier webhook 告警出口（可选；nil = 关闭）。发送失败不影响主路径。
+	Notifier notify.Sender
+
 	// GlobalEnabled global realm 路由开关（config global.enabled，缺省 true）。
 	// handler 侧第三道闸（与 main 注入 auth 开关、upstream.GlobalEnabled 呼应）：
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
@@ -80,6 +96,10 @@ type Config struct {
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
+
+	// DecisionTrace / DecisionTraceSample 选号决策链记录开关与采样率（issue #63）。
+	DecisionTrace       bool
+	DecisionTraceSample float64
 
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
@@ -99,6 +119,8 @@ type Handler struct {
 	wafIP wafIPGate
 	// streams 在途 SSE 流注册表（issue #19）：关闭时显式等待排空并记录未排空数。
 	streams *streamTracker
+	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
+	authLimiter *httpauth.Limiter
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -149,10 +171,15 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker()}
+	h := &Handler{
+		cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
+		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+	}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/messages", h.withClientAuth(h.anthropicMessagesHandler))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withClientAuth(h.anthropicCountTokensHandler))
 	h.mux.HandleFunc("GET /v1/models", h.withClientAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -183,8 +210,9 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
-		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
+		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages") {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
@@ -206,14 +234,48 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // withAuth 默认密钥鉴权（/status 等运维面）：只认 config.api_key。
+// api_key 非空时按来源 IP 限制连续失败（issue #61）：超限返回 429 + Retry-After；
+// 来源 IP 只认 RemoteAddr，不信任可伪造的转发头；成功鉴权清零窗口。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		key := h.loadLive().APIKey
+		if key == "" {
+			next(w, r)
+			return
+		}
+		ip := httpauth.RemoteIP(r)
+		if ok, retry := h.authLimiter.Allow(ip); !ok {
+			writeAuthFailLimit(w, retry)
+			return
+		}
+		if !httpauth.VerifyBearer(r, key) {
+			h.authLimiter.Fail(ip)
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
+		h.authLimiter.Reset(ip)
 		next(w, r)
 	}
+}
+
+// writeClientAuthError 按入站协议写出鉴权失败：Anthropic 端点用 Anthropic 错误体，
+// 其余保持 OpenAI 错误体。
+func writeClientAuthError(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key", "")
+		return
+	}
+	writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+}
+
+// writeAuthFailLimit 运维面鉴权失败超限响应。
+func writeAuthFailLimit(w http.ResponseWriter, retry time.Duration) {
+	seconds := int((retry + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	writeOpenAIError(w, http.StatusTooManyRequests, "too_many_auth_failures", "too many authentication failures")
 }
 
 // withClientAuth 网关 API 面（/v1/*）的鉴权：默认密钥或任一未撤销命名密钥。
@@ -225,13 +287,20 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		res := httpauth.Authenticate(r, h.loadLive().APIKey, h.cfg.Keys.Keys())
 		if !res.OK {
-			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			writeClientAuthError(w, r)
 			return
 		}
 		if res.IsDefault || h.cfg.Keys == nil {
 			next(w, r)
 			return
 		}
+		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
+		if !ok {
+			h.cfg.Keys.RecordRejected(res.KeyID)
+			writeKeyLimitError(w, retryAfter)
+			return
+		}
+		defer release()
 		ku := &keyUsage{id: res.KeyID}
 		next(w, r.WithContext(context.WithValue(r.Context(), keyUsageKey{}, ku)))
 		h.cfg.Keys.RecordUsage(ku.id, ku.prompt, ku.completion, ku.total)
@@ -436,7 +505,53 @@ func (h *Handler) modelList() []map[string]any {
 	if h.cfg.GlobalEnabled {
 		out = append(out, h.globalModelEntries()...)
 	}
+	return h.appendAliasEntries(out)
+}
+
+// appendAliasEntries 把配置的模型别名追加到 /v1/models 列表（issue #52）。
+// 别名按名字排序保证输出稳定；与真实模型同 id 时以别名为准（请求解析同样
+// 别名优先），避免"列表显示一个、实际路由到另一个"。
+func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
+	if len(h.cfg.ModelAliases) == 0 {
+		return out
+	}
+	names := make([]string, 0, len(h.cfg.ModelAliases))
+	for name := range h.cfg.ModelAliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	index := make(map[string]int, len(out))
+	for i, entry := range out {
+		if id, ok := entry["id"].(string); ok {
+			index[id] = i
+		}
+	}
+	for _, name := range names {
+		entry := map[string]any{
+			"id":       name,
+			"object":   "model",
+			"created":  1753600000,
+			"owned_by": "workbuddy",
+			// upstream_id 保留配置里的 "[realm:]model" 原文；省略 realm 时
+			// 请求侧裸名按 cn 解析，这里也补上 cn: 便于客户端识别目标域。
+			"upstream_id": normalizeAliasTarget(h.cfg.ModelAliases[name]),
+		}
+		if i, ok := index[name]; ok {
+			out[i] = entry
+			continue
+		}
+		out = append(out, entry)
+	}
 	return out
+}
+
+// normalizeAliasTarget 把别名目标规范成 "[realm:]model"（缺省 realm 补 cn）。
+func normalizeAliasTarget(target string) string {
+	realm, bare, prefixed := splitRealm(target)
+	if !prefixed {
+		realm = "cn"
+	}
+	return realm + ":" + bare
 }
 
 // cnModelEntry 组装单个 CN 模型条目（realm 前缀 + 四级长度查找 + 全字段 + effort）。
@@ -648,8 +763,18 @@ const (
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 入站适配：解析 HTTP 请求为结构化输入，并构造输出端口（唯一的 net/http 边界）。
-	in, out, ok := newChatInput(w, r)
+	in, out, ok := newChatInput(w, r, h.cfg.KeepaliveInterval)
 	if !ok {
+		return
+	}
+	h.serveChat(r, in, out)
+}
+
+// serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
+func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
+	if ku := in.keyUsage; ku != nil && !h.cfg.Keys.ModelAllowed(ku.id, in.model) {
+		h.cfg.Keys.RecordRejected(ku.id)
+		out.Error(http.StatusForbidden, "model_not_allowed", "model is not allowed for this API key", "")
 		return
 	}
 	f := h.newChatFlow(in, out)
@@ -671,7 +796,7 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(in.model)
+	realm, bareModel := resolveRequestModel(in.model, h.cfg.ModelAliases)
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -679,6 +804,7 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), in.body, in.stream)
+	st.decision = h.sampleDecisionTrace()
 	if in.trace != nil {
 		in.trace.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -714,7 +840,10 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	if h.cfg.Session != nil && f.sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, in.model); ok {
+		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
+		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
+		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
+		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, f.realm+":"+f.bareModel); ok {
 			f.stickyUID = uid
 		}
 	}
@@ -830,6 +959,7 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 			// 重试、并非换号 → rotateReason 保持空，跳过计数。
 			if f.rotateReason != "" {
 				f.h.metrics.incRotation(f.rotateReason)
+				f.recordRotation()
 			}
 		case rotDone:
 			return true
@@ -838,6 +968,14 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 		}
 	}
 	return false
+}
+
+// recordRotation 把轮换原因写入决策链（上限 8 条）。
+func (f *chatFlow) recordRotation() {
+	if f.st.decision == nil || len(f.st.decision.Rotations) >= 8 {
+		return
+	}
+	f.st.decision.Rotations = append(f.st.decision.Rotations, f.rotateReason)
 }
 
 // attempt 执行一次「选号 → 占名额 → 刷新 token → 转发」尝试，返回控制流去向。
@@ -850,6 +988,17 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
 		// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 		f.modelBlock = f.h.cfg.Pool.ModelBlocked(f.bareModel)
+		detail := map[string]any{"model": f.bareModel}
+		if f.modelBlock.Blocked {
+			detail["model_blocked"] = true
+			detail["block_reason"] = f.modelBlock.Reason
+		}
+		f.h.notify(notify.Event{
+			Event:   notify.EventPoolUnavailable,
+			Realm:   f.realm,
+			Summary: "无可用账号（池健康或在途名额耗尽）",
+			Detail:  detail,
+		})
 		return rotBreak
 	}
 	f.st.uid = acct.UID
@@ -880,13 +1029,56 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 	if f.stickyUID != "" {
 		acct := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel)
 		if acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
+			if f.st.decision != nil {
+				f.st.decision.StickyHit = true
+				f.st.decision.FinalUID = logfmt.UID8(acct.UID)
+			}
 			return acct
 		}
 		// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 →
 		// 解绑，本次回落普通轮换。
 		f.unbindSticky()
 	}
+	if f.st.decision != nil {
+		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(f.tried, f.bareModel, f.realm)
+		mergePickTrace(f.st.decision, trace)
+		return acct
+	}
 	return f.h.cfg.Pool.PickExcludingForRealm(f.tried, f.bareModel, f.realm)
+}
+
+// sampleDecisionTrace 按开关与采样率决定本次是否记录决策链。
+func (h *Handler) sampleDecisionTrace() *reqlog.DecisionTrace {
+	if !h.cfg.DecisionTrace {
+		return nil
+	}
+	sample := h.cfg.DecisionTraceSample
+	if sample > 0 && sample < 1 && rand.Float64() >= sample {
+		return nil
+	}
+	return &reqlog.DecisionTrace{}
+}
+
+// mergePickTrace 把 pool 决策快照并入请求级决策链（Top 覆盖为最近一次尝试）。
+func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
+	dst.Candidates += src.Candidates
+	if dst.Excluded == nil {
+		dst.Excluded = map[string]int{}
+	}
+	for reason, n := range src.Excluded {
+		dst.Excluded[reason] += n
+	}
+	dst.CostTier = src.CostTier
+	dst.Explored = dst.Explored || src.Explored
+	if len(src.Top) > 0 {
+		dst.Top = make([]reqlog.DecisionCandidate, 0, len(src.Top))
+		for _, c := range src.Top {
+			dst.Top = append(dst.Top, reqlog.DecisionCandidate{UID: c.UID, Weight: c.Weight, Tier: c.Tier})
+		}
+	}
+	if src.FinalUID != "" {
+		dst.FinalUID = src.FinalUID
+	}
 }
 
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，
@@ -930,6 +1122,8 @@ func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
 	var ue *upstream.Error
 	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 		f.h.cfg.Pool.Disable(acct.UID, "refresh session dead")
+		f.h.notifyAccount(acct.UID, notify.EventSessionDead, "账号 session 失效，已禁用，需重新登录",
+			map[string]any{"stage": "refresh"})
 		return
 	}
 	f.h.cfg.Pool.NoteError(acct.UID)
@@ -1040,6 +1234,8 @@ func (f *chatFlow) handleHTTPError(
 	// WAF 403 喂入 IP 级状态机，若激活（短窗多号命中）则立即终止轮转，避免把请求放大
 	// MaxRotate 倍打同一出口 IP。账号级软冷却已在上方 applyErrorPolicy 照常记账。
 	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
+		f.h.notifyAccount(acct.UID, notify.EventWAFIPBlocked, "出口 IP 触发上游 WAF 级拦截，轮转已停止",
+			map[string]any{"model": f.bareModel})
 		return rotBreak
 	}
 	// 状态码换号闸（issue #17，默认关闭）：allowlist 非空时仅列出的状态码才换号；
@@ -1252,6 +1448,26 @@ func (f *chatFlow) handleNonStreamSuccess(acct *auth.Auth, rc io.ReadCloser, att
 	return rotDone
 }
 
+// notifyAccount 发送账号级告警（uid 由通知层截为 uid8；账号不存在时只带 uid）。
+func (h *Handler) notifyAccount(uid, event, summary string, detail map[string]any) {
+	if h.cfg.Notifier == nil {
+		return
+	}
+	e := notify.Event{Event: event, UID: uid, Summary: summary, Detail: detail}
+	if st, ok := h.cfg.Pool.Status(uid); ok {
+		e.Nickname = st.Nickname
+		e.Realm = st.Realm
+	}
+	h.notify(e)
+}
+
+// notify 发送事件（未配置时为空操作）。
+func (h *Handler) notify(e notify.Event) {
+	if h.cfg.Notifier != nil {
+		h.cfg.Notifier.Notify(e)
+	}
+}
+
 // recordAttempt 记录一次尝试的用量（唯一汇聚点：流式/非流式、成功/失败都走此，
 // 与 pool 的每账号累计器同源，两条口径不会漂移）。ttfb 首 token 等待仅流式有观测，
 // 非流式传 0（无观测，速率不扣减）。
@@ -1373,9 +1589,97 @@ func (f *chatFlow) recordKeyUsage() {
 func (f *chatFlow) writeFinalError() {
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
+	if seconds := f.retryAfterSeconds(status); seconds > 0 {
+		f.out.Header("Retry-After", strconv.Itoa(seconds))
+	}
 	f.out.Error(status, code, msg, hint)
 	f.st.status = status
 	f.st.outcome = reqlog.OutcomeHTTPError
+}
+
+// retryAfterSeconds 计算 Retry-After 秒数：仅 429/503 且存在可确定的最早解封时间
+// 时返回 >0；无可靠时间返回 0（不编造）。
+func (f *chatFlow) retryAfterSeconds(status int) int {
+	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
+		return 0
+	}
+	until := f.earliestRecovery(time.Now())
+	if until.IsZero() {
+		return 0
+	}
+	seconds := int(math.Ceil(time.Until(until).Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
+}
+
+// earliestRecovery 汇总账号/模型级冷却与上游 Retry-After，返回最早的未来解封时刻。
+func (f *chatFlow) earliestRecovery(now time.Time) time.Time {
+	var ue *upstream.Error
+	if errors.As(f.lastErr, &ue) && ue.RetryAfter > 0 {
+		return now.Add(ue.RetryAfter)
+	}
+	acc := f.accountRecovery(now)
+	model := f.modelRecovery(now)
+	switch {
+	case acc.IsZero():
+		return model
+	case model.IsZero() || acc.Before(model):
+		return acc
+	default:
+		return model
+	}
+}
+
+// accountRecovery 最近尝试账号的账号级/模型级冷却截止（无观测/已过期 → 零值）。
+func (f *chatFlow) accountRecovery(now time.Time) time.Time {
+	if f.h.cfg.Pool == nil || f.st == nil || f.st.uid == "" {
+		return time.Time{}
+	}
+	st, ok := f.h.cfg.Pool.Status(f.st.uid)
+	if !ok {
+		return time.Time{}
+	}
+	until := futureOrZero(st.Until, now)
+	for _, m := range st.RateLimitedModels {
+		// 只认当前模型：其他模型的冷却与本次请求无关，取它们的最早值会给出
+		// 偏短且必然失败的 Retry-After。
+		if f.bareModel != "" && m.Model != f.bareModel {
+			continue
+		}
+		until = earlierFuture(until, m.Until, now)
+	}
+	return until
+}
+
+// earlierFuture 返回 cur 与 cand 中更早的未来时刻；两者都已过期时返回零值。
+func earlierFuture(cur, cand, now time.Time) time.Time {
+	t := futureOrZero(cand, now)
+	if t.IsZero() || (!cur.IsZero() && !t.Before(cur)) {
+		return cur
+	}
+	return t
+}
+
+// modelRecovery 模型级全池冷却截止（未触发 → 零值）。
+func (f *chatFlow) modelRecovery(now time.Time) time.Time {
+	if f.h.cfg.Pool == nil {
+		return time.Time{}
+	}
+	mb := f.h.cfg.Pool.ModelBlocked(f.bareModel)
+	if !mb.Blocked {
+		return time.Time{}
+	}
+	return futureOrZero(mb.Until, now)
+}
+
+// futureOrZero 仅保留晚于 now 的时刻。
+func futureOrZero(t, now time.Time) time.Time {
+	if t.After(now) {
+		return t
+	}
+	return time.Time{}
 }
 
 // finalErrorEnvelope 由 lastErr 推导末端错误透传的状态码 / code / message / hint。
@@ -1696,6 +2000,8 @@ func (h *Handler) applyLifecyclePolicy(uid string, kind upstream.ErrKind) {
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.Disable(uid, "12153 session dead")
+		h.notifyAccount(uid, notify.EventSessionDead, "账号 session 失效（12153），已禁用，需重新登录",
+			map[string]any{"stage": "chat"})
 	case upstream.ErrNotFound:
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrServer:

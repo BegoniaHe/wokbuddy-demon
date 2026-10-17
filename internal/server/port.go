@@ -46,6 +46,8 @@ type chatResponder interface {
 	// Error 写出 OpenAI 错误信封（code/msg/hint 由核心按业务语义给出；hint 为空
 	// 时实现方省略该字段）。
 	Error(status int, code, msg, hint string)
+	// Header 设置响应头（如 Retry-After）；必须在写出响应体之前调用。
+	Header(name, value string)
 	// Stream 把上游流按 OpenAI SSE 透传给客户端，返回透传错误（如空流、
 	// 客户端写失败）。hint 为上游 error 帧的 gateway_hint 生成器；repair 为
 	// 原生工具调用标记修复器；onErrFrame 为上游 error 帧旁路观察者（可 nil）。

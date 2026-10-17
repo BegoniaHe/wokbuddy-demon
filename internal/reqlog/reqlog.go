@@ -84,6 +84,27 @@ type Event struct {
 	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
 	ClientIP        string `json:"client_ip,omitempty"`
 	UserAgent       string `json:"user_agent,omitempty"`
+	// Decision 可选选号决策链（logging.decision_trace，issue #63）；默认不记录。
+	Decision *DecisionTrace `json:"decision,omitempty"`
+}
+
+// DecisionTrace 一次请求的选号决策快照：固定字段 + 有界数组，不含提示词/正文/凭证。
+type DecisionTrace struct {
+	Candidates int                 `json:"candidates"`
+	Excluded   map[string]int      `json:"excluded,omitempty"`
+	CostTier   int                 `json:"cost_tier"`
+	Explored   bool                `json:"explored,omitempty"`
+	StickyHit  bool                `json:"sticky_hit,omitempty"`
+	Rotations  []string            `json:"rotations,omitempty"`
+	Top        []DecisionCandidate `json:"top,omitempty"`
+	FinalUID   string              `json:"final_uid,omitempty"`
+}
+
+// DecisionCandidate Top-N 候选（uid8 + 权重 + 成本层）。
+type DecisionCandidate struct {
+	UID    string  `json:"uid"`
+	Weight float64 `json:"weight"`
+	Tier   int     `json:"tier"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

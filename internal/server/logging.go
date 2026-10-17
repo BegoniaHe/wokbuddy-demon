@@ -70,6 +70,8 @@ type chatStat struct {
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
 	userAgent string
+	// decision 可选选号决策链（logging.decision_trace）；nil = 未启用/未采样。
+	decision *reqlog.DecisionTrace
 
 	logged bool
 }
@@ -357,6 +359,7 @@ type requestTraceKey struct{}
 // requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
 type requestTrace struct {
 	id    string
+	path  string
 	start time.Time
 	stat  *chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
@@ -414,7 +417,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	e := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
-		Path:      "/v1/chat/completions",
+		Path:      t.path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)
@@ -439,6 +442,9 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	if t.stat != nil {
+		e.Decision = t.stat.decision
+	}
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess

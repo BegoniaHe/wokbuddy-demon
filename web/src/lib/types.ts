@@ -57,6 +57,13 @@ export interface ModelLock {
   reason?: string;
 }
 
+export interface ApiKeyLimits {
+  rpm?: number;
+  tpm?: number;
+  max_concurrent?: number;
+  models?: string[];
+}
+
 export interface ApiKey {
   id: string;
   name: string;
@@ -68,6 +75,8 @@ export interface ApiKey {
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
+  rejected?: number;
+  limits?: ApiKeyLimits;
 }
 
 export interface Overview {

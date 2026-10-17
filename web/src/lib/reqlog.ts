@@ -1,6 +1,23 @@
 // 请求记录格式化与筛选（纯函数，便于测试）。
 import { fmtClockTime, fmtMs, fmtTok, trimFixed } from '@/lib/format';
 
+export interface DecisionCandidate {
+  uid: string;
+  weight: number;
+  tier: number;
+}
+
+export interface DecisionTrace {
+  candidates: number;
+  excluded?: Record<string, number>;
+  cost_tier: number;
+  explored?: boolean;
+  sticky_hit?: boolean;
+  rotations?: string[];
+  top?: DecisionCandidate[];
+  final_uid?: string;
+}
+
 export interface RequestEntry {
   time?: string;
   status?: number | string;
@@ -18,6 +35,7 @@ export interface RequestEntry {
   request_id?: string;
   cache_hit_tokens?: number;
   cache_miss_tokens?: number;
+  decision?: DecisionTrace;
 }
 
 export interface ReqFilter {

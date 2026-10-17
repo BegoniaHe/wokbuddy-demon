@@ -21,6 +21,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -134,9 +135,13 @@ func main() {
 
 	configureUpstream(cfg, up)
 
+	notifier := notify.New(notify.Config{URL: cfg.Notify.WebhookURL, Events: cfg.Notify.Events})
+	defer notifier.Close()
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
+		Notifier:       notifier,
 		CheckinHours:   cfg.Schedule.CheckinHours,
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
@@ -153,6 +158,7 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		CheckinAccountDelay:    cfg.CheckinAccountDelayDur,
 	})
 	logScheduleConfig(cfg)
 
@@ -243,13 +249,20 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
-		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		RecordClientInfo:    cfg.Logging.RequestClientInfo,
+		DecisionTrace:       cfg.Logging.DecisionTrace,
+		DecisionTraceSample: cfg.Logging.DecisionTraceSample,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。
+		ModelAliases: cfg.Models.Aliases,
 		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
 		MaxRotate:      cfg.Upstream.RotateMax,
 		RotateBudget:   cfg.RotateBudgetDur,
 		RotateStatuses: rotateStatusSet(cfg.Upstream.RotateStatusCodes),
+		// 入站 SSE 心跳（issue #54）：0 = 关闭；改后需重启。
+		KeepaliveInterval: cfg.KeepaliveIntervalDur,
+		Notifier:          notifier,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -398,6 +411,13 @@ func configureUpstream(cfg *Config, up *upstream.Client) {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	// 按模型超时覆盖（issue #58）：装配期一次性注入，改后需重启。
+	if len(cfg.Upstream.ModelTimeouts) > 0 {
+		up.ModelTimeouts = make(map[string]upstream.ModelTimeout, len(cfg.Upstream.ModelTimeouts))
+		for name, spec := range cfg.Upstream.ModelTimeouts {
+			up.ModelTimeouts[name] = upstream.ModelTimeout{Header: spec.HeaderDur, Idle: spec.IdleDur}
+		}
+	}
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
@@ -575,6 +595,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 
 	return restartRequiredFields(newCfg), nil
 }
@@ -640,15 +661,18 @@ func restartRequiredFields(c *Config) []string {
 	// 轮换策略（rotate_max/rotate_budget/rotate_status_codes，issue #17）同样在装配期
 	// 被 server handler 捕获，改后需重启。
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds",
-		"upstream.idle_timeout_seconds", "upstream.user_agent",
+		"upstream.idle_timeout_seconds", "upstream.keepalive_interval", "upstream.model_timeouts",
+		"upstream.user_agent",
 		"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
 		"upstream.proxies")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {
 		out = append(out, "upstash")
 	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval",
+	out = append(out, "models.aliases", "notify.webhook_url", "notify.events",
+		"session_sticky.ttl", "session_sticky.gc_interval",
 		"logging.request_archive_enabled", "logging.request_retention_days",
-		"logging.request_archive_max_mb", "server.read_timeout")
+		"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
+		"server.read_timeout")
 	return out
 }
 

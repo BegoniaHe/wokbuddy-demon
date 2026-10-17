@@ -563,6 +563,7 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	keepalive    time.Duration
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -574,6 +575,17 @@ type streamOptions struct {
 // 传 nil、或传入未启用的修复器（客户端没声明过 tools）→ 与 Stream 行为逐字节一致。
 func WithMarkupRepair(r *MarkupRepair) StreamOption {
 	return func(o *streamOptions) { o.markup = r }
+}
+
+// WithKeepaliveInterval 在上游静默超过 d 时向客户端写一帧 SSE 注释心跳
+// （": keepalive\n\n"），防止反代/Cloudflare 把长时间无帧的合法流当空闲连接切断
+// （issue #54）。d<=0 关闭（与未设置时逐字节一致）。
+func WithKeepaliveInterval(d time.Duration) StreamOption {
+	return func(o *streamOptions) {
+		if d > 0 {
+			o.keepalive = d
+		}
+	}
 }
 
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
@@ -593,12 +605,23 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	return newStreamWriter(w, hintFn, opts...).stream(r)
 }
 
+// clientWriteTimeout 单次向客户端写 SSE 帧（含 flush）的上限（issue #53）。
+// 服务端不设全局 WriteTimeout（会误杀合法长流），慢客户端/半死 TCP 下
+// Flush 可阻塞到内核重传超时，期间 goroutine 与账号在途租约都被占住。
+// 健康连接单帧毫秒级完成，30s 只作「客户端完全不消费」的 stall 上界。
+const clientWriteTimeout = 30 * time.Second
+
 // streamWriter SSE 透传写入器的跨帧状态（StreamHint 的拆解，降低单函数复杂度）。
 type streamWriter struct {
 	w      http.ResponseWriter
 	fl     http.Flusher
 	hintFn func(string) string
 	opts   streamOptions
+	// keepalive 上游静默超过该时长时写一帧 SSE 注释心跳；0 = 关闭。
+	keepalive time.Duration
+
+	// writeTimeout 单次写帧/Flush 的截止时长；<=0 不设截止（测试可注入短值）。
+	writeTimeout time.Duration
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
@@ -639,21 +662,41 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 		fl:           fl,
 		hintFn:       hintFn,
 		opts:         o,
+		writeTimeout: clientWriteTimeout,
+		keepalive:    o.keepalive,
 		toolCallSeen: map[int]bool{},
 		repair:       o.markup,
 		maxToolIdx:   -1,
 	}
 }
 
-// writeSSE 原样写出一帧并 flush。
-func (s *streamWriter) writeSSE(payload string) error {
-	if _, werr := io.WriteString(s.w, "data: "+payload+"\n\n"); werr != nil {
+// writeAll 写出原始字节并 flush，同时在支持 ResponseController 的连接上设置
+// 单次写截止（issue #53）。不支持 SetWriteDeadline 的 ResponseWriter（测试用
+// ResponseRecorder 或中间件包装）忽略错误：拿不到截止支持不能反过来拒绝写流。
+// 每次写前重设 deadline；流结束后由 stream 清空，避免过期 deadline 污染
+// keep-alive 连接上的后续请求。
+func (s *streamWriter) writeAll(payload string) error {
+	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
+	if _, werr := io.WriteString(s.w, payload); werr != nil {
 		return werr
 	}
 	if s.fl != nil {
 		s.fl.Flush()
 	}
 	return nil
+}
+
+// setWriteDeadline 设置/清空底层连接的写截止；writeTimeout<=0 时不设置。
+func (s *streamWriter) setWriteDeadline(deadline time.Time) {
+	if s.writeTimeout <= 0 {
+		return
+	}
+	_ = http.NewResponseController(s.w).SetWriteDeadline(deadline)
+}
+
+// writeSSE 原样写出一帧并 flush。
+func (s *streamWriter) writeSSE(payload string) error {
+	return s.writeAll("data: " + payload + "\n\n")
 }
 
 // writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
@@ -835,6 +878,12 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 
 // stream 读取 r 并逐帧透传到 w（含空流兜底与尾部收尾）。
 func (s *streamWriter) stream(r io.Reader) error {
+	// 流结束（含写失败）清掉写截止：连接可能被 keep-alive 复用，
+	// 残留的过期 deadline 会让后续请求的响应写立即失败。
+	defer s.setWriteDeadline(time.Time{})
+	if s.keepalive > 0 {
+		return s.streamWithKeepalive(r)
+	}
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
 	for {
@@ -858,6 +907,95 @@ func (s *streamWriter) stream(r io.Reader) error {
 	return s.finish(&validFrames)
 }
 
+// lineResult 上游读取 goroutine 交给主循环的一行结果。
+type lineResult struct {
+	line string
+	err  error
+}
+
+// streamWithKeepalive 在阻塞读取上游的同时按 keepalive 间隔写注释帧。
+// 读放在独立 goroutine，主循环 select 读结果与心跳定时器；退出时关闭 r
+// （若可关闭）以解除读阻塞，避免 goroutine 泄漏。
+func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
+	if c, ok := r.(io.Closer); ok {
+		defer c.Close()
+	}
+	lines, done := asyncLines(r)
+	defer close(done)
+
+	ticker := time.NewTicker(s.keepalive)
+	defer ticker.Stop()
+	lastWrite := time.Now()
+	validFrames := 0
+	for {
+		select {
+		case res := <-lines:
+			n, stop, err := s.consumeLine(res, &lastWrite)
+			validFrames += n
+			if err != nil {
+				return err
+			}
+			if stop {
+				return s.finish(&validFrames)
+			}
+		case <-ticker.C:
+			if err := s.keepaliveIfIdle(&lastWrite); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// asyncLines 启动逐行读取 goroutine；done 关闭后 goroutine 退出。
+func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
+	br := bufio.NewReaderSize(r, 64*1024)
+	lines := make(chan lineResult)
+	done := make(chan struct{})
+	go func() {
+		for {
+			line, err := br.ReadString('\n')
+			select {
+			case lines <- lineResult{line: line, err: err}:
+			case <-done:
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return lines, done
+}
+
+// consumeLine 处理一行并更新最近写出时间；stop=true 表示应进入收尾（[DONE]/EOF）。
+func (s *streamWriter) consumeLine(res lineResult, lastWrite *time.Time) (n int, stop bool, err error) {
+	n, stop, err = s.handleStreamLine(res.line)
+	if n > 0 || strings.TrimSpace(res.line) != "" {
+		*lastWrite = time.Now()
+	}
+	if err != nil || stop || res.err == nil {
+		return n, stop, err
+	}
+	if errors.Is(res.err, io.EOF) {
+		return n, true, nil
+	}
+	return n, false, res.err
+}
+
+// keepaliveIfIdle 静默超过间隔时写一帧 SSE 注释心跳。
+func (s *streamWriter) keepaliveIfIdle(lastWrite *time.Time) error {
+	if time.Since(*lastWrite) < s.keepalive {
+		return nil
+	}
+	// 复用逐行写路径：升级到带写截止的实现（如 issue #53）后，心跳同样受
+	// 单次写上限保护，不会在客户端不消费时无限阻塞。
+	if _, _, err := s.handleStreamLine(": keepalive\n\n"); err != nil {
+		return err
+	}
+	*lastWrite = time.Now()
+	return nil
+}
+
 // handleStreamLine 处理一行，返回写入的有效帧数；done=true 表示遇 [DONE] 停止。
 func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err error) {
 	trimmed := strings.TrimRight(line, "\r\n")
@@ -871,11 +1009,8 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 		return n, false, werr
 	case trimmed != "":
 		// 注释/其他行：原样透传
-		if _, werr := io.WriteString(s.w, line); werr != nil {
+		if werr := s.writeAll(line); werr != nil {
 			return 0, false, werr
-		}
-		if s.fl != nil {
-			s.fl.Flush()
 		}
 	}
 	return 0, false, nil
@@ -894,11 +1029,8 @@ func (s *streamWriter) finish(validFrames *int) error {
 		_ = s.writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
+	if err := s.writeAll("data: [DONE]\n\n"); err != nil {
 		return err
-	}
-	if s.fl != nil {
-		s.fl.Flush()
 	}
 	if *validFrames == 0 {
 		return errEmptyStream
