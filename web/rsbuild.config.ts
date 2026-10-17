@@ -13,6 +13,8 @@ export default defineConfig({
   },
   html: {
     template: './index.html',
+    // 注入 <link rel="icon">，避免浏览器回退请求 /favicon.ico（网关根路径无此资源，会 404）。
+    favicon: './src/assets/favicon.svg',
   },
   output: {
     distPath: { root: '../internal/panel/dist' },

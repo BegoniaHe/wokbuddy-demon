@@ -12,8 +12,24 @@ import {
 } from '@/lib/config';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Field, Input, Select, Switch } from '@/components/ui/field';
-import { Box, BoxBody, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
+import { Field, FieldLabel, FieldDescription } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Switch } from '@/components/ui/switch';
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 
 export function ConfigView() {
@@ -79,15 +95,22 @@ export function ConfigView() {
     <Input
       value={String(values[name] ?? '')}
       onChange={(e) => set(name, e.target.value)}
-      className={cn(DURATION_FIELDS.has(name) && durationBad(String(values[name] ?? '')) && 'border-bad bg-bad-soft')}
+      aria-invalid={DURATION_FIELDS.has(name) && durationBad(String(values[name] ?? ''))}
+      className={cn(DURATION_FIELDS.has(name) && durationBad(String(values[name] ?? '')) && 'border-destructive bg-destructive-soft')}
       title={DURATION_FIELDS.has(name) && durationBad(String(values[name] ?? '')) ? DURATION_TIP : undefined}
       {...props}
     />
   );
   const num = (name: string, props: React.ComponentProps<typeof Input> = {}) =>
     text(name, { type: 'number', ...props });
-  const check = (name: string, label: React.ReactNode) => (
-    <Switch label={label} checked={!!values[name]} onChange={(v) => set(name, v)} />
+  const check = (name: string, label: React.ReactNode, hint?: string) => (
+    <Field orientation="horizontal">
+      <FieldLabel className="flex-1">
+        <span>{label}</span>
+        {hint ? <FieldDescription className="mt-0.5">{hint}</FieldDescription> : null}
+      </FieldLabel>
+      <Switch checked={!!values[name]} onCheckedChange={(v) => set(name, v)} />
+    </Field>
   );
 
   return (
@@ -97,193 +120,283 @@ export function ConfigView() {
         void save();
       }}
     >
-      <Box>
-        <BoxHeader>
-          <BoxTitle>服务</BoxTitle>
-          <Grow />
-          <BoxNote>{path}</BoxNote>
-        </BoxHeader>
-        <BoxBody>
+      <Card className="mb-5">
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>服务</CardTitle>
+          <CardAction>
+            <span className="truncate text-xs text-muted-foreground">{path}</span>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
           <div className="grid gap-x-5 md:grid-cols-2">
-            <Field label="监听地址" hint="改动需重启进程">
+            <Field>
+              <FieldLabel>监听地址</FieldLabel>
               {text('listen', { placeholder: ':7863' })}
+              <FieldDescription>改动需重启进程</FieldDescription>
             </Field>
-            <Field label="API 密钥" hint="立即生效（含面板自身）">
+            <Field>
+              <FieldLabel>API 密钥</FieldLabel>
               <div className="flex items-center gap-2">
                 {text('api_key', { type: showKey ? 'text' : 'password', placeholder: '留空 = 不鉴权' })}
                 <Button size="xs" onClick={() => setShowKey((s) => !s)}>
                   {showKey ? '隐藏' : '显示'}
                 </Button>
               </div>
+              <FieldDescription>立即生效（含面板自身）</FieldDescription>
             </Field>
           </div>
-          <Field label="单账号明细默认展示条数" hint="积分构成页按最早到期展示，其余未用完包聚合">
+          <Field>
+            <FieldLabel>单账号明细默认展示条数</FieldLabel>
             {num('package_detail_limit', { min: 1, placeholder: '5' })}
+            <FieldDescription>积分构成页按最早到期展示，其余未用完包聚合</FieldDescription>
           </Field>
-        </BoxBody>
-      </Box>
+        </CardContent>
+      </Card>
 
-      <Box>
-        <BoxHeader>
-          <BoxTitle>定时任务</BoxTitle>
-        </BoxHeader>
-        <BoxBody>
+      <Card className="mb-5">
+        <CardHeader>
+          <CardTitle>定时任务</CardTitle>
+        </CardHeader>
+        <CardContent>
           <div className="grid gap-x-5 md:grid-cols-2">
             <div>
               {check('checkin_enabled', '自动签到')}
-              <Field label="签到时点（小时，逗号分隔）">{text('checkin_hours', { placeholder: '9, 21' })}</Field>
+              <Field>
+                <FieldLabel>签到时点（小时，逗号分隔）</FieldLabel>
+                {text('checkin_hours', { placeholder: '9, 21' })}
+              </Field>
             </div>
             <div>
               {check('keepalive_enabled', 'Token 保活')}
-              <Field label="保活时点（小时，逗号分隔）">{text('keepalive_hours', { placeholder: '22' })}</Field>
+              <Field>
+                <FieldLabel>保活时点（小时，逗号分隔）</FieldLabel>
+                {text('keepalive_hours', { placeholder: '22' })}
+              </Field>
             </div>
           </div>
-          <Hr />
+          <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
             <div>
               {check('travel_enabled', '猫猫旅行')}
-              <Field label="旅行时点（小时，逗号分隔）" hint="一趟派出 + 一趟领奖闭环">
+              <Field>
+                <FieldLabel>旅行时点（小时，逗号分隔）</FieldLabel>
                 {text('travel_hours', { placeholder: '9, 21' })}
+                <FieldDescription>一趟派出 + 一趟领奖闭环</FieldDescription>
               </Field>
             </div>
             <div>
               {check('activity_enabled', '活跃上报')}
-              <Field label="上报时点（小时，逗号分隔）" hint="点亮连登 + 解锁领养前置">
+              <Field>
+                <FieldLabel>上报时点（小时，逗号分隔）</FieldLabel>
                 {text('activity_hours', { placeholder: '10' })}
+                <FieldDescription>点亮连登 + 解锁领养前置</FieldDescription>
               </Field>
             </div>
           </div>
-          <Hr />
+          <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
             <div>{check('balance_refresh_enabled', '后台刷新余额')}</div>
-            <Field label="刷新间隔（分钟）">{num('balance_refresh_minutes', { min: 1, placeholder: '5' })}</Field>
-          </div>
-          <Hr />
-          <div className="grid gap-x-5 md:grid-cols-2">
-            <div>{check('growth_enabled', '成长任务自动执行')}</div>
-            <Field label="执行时点（小时，逗号分隔）" hint="每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）">
-              {text('growth_hours', { placeholder: '1' })}
+            <Field>
+              <FieldLabel>刷新间隔（分钟）</FieldLabel>
+              {num('balance_refresh_minutes', { min: 1, placeholder: '5' })}
             </Field>
           </div>
-          <Hr />
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <div>{check('growth_enabled', '成长任务自动执行')}</div>
+            <Field>
+              <FieldLabel>执行时点（小时，逗号分隔）</FieldLabel>
+              {text('growth_hours', { placeholder: '1' })}
+              <FieldDescription>每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</FieldDescription>
+            </Field>
+          </div>
+          <Separator className="my-4" />
           {check('include_disabled_in_tasks', '保号任务覆盖已禁用账号')}
-          <div className="text-2xs text-ink-3">
+          <p className="text-2xs text-muted-foreground">
             禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。
             <br />
             若只想让<b>单个</b>账号临时退出选号但保留保号，直接用账号行的「<b>暂停选号</b>」按钮（账号级，无需打开本开关）。
-          </div>
-        </BoxBody>
-      </Box>
+          </p>
+        </CardContent>
+      </Card>
 
-      <Box>
-        <BoxHeader>
-          <BoxTitle>账号池与流量治理</BoxTitle>
-        </BoxHeader>
-        <BoxBody>
+      <Card className="mb-5">
+        <CardHeader>
+          <CardTitle>账号池与流量治理</CardTitle>
+        </CardHeader>
+        <CardContent>
           <div className="grid gap-x-4 md:grid-cols-3">
-            <Field label="单账号最大在途" hint="0 = 不限制">{num('max_in_flight', { min: 0, placeholder: '3' })}</Field>
-            <Field label="国际版在途上限" hint="global 域风控更紧，默认 2">{num('max_in_flight_global', { min: 1, placeholder: '2' })}</Field>
-            <Field label="连续失败熔断阈值">{num('breaker_threshold', { min: 1, placeholder: '3' })}</Field>
+            <Field>
+              <FieldLabel>单账号最大在途</FieldLabel>
+              {num('max_in_flight', { min: 0, placeholder: '3' })}
+              <FieldDescription>0 = 不限制</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国际版在途上限</FieldLabel>
+              {num('max_in_flight_global', { min: 1, placeholder: '2' })}
+              <FieldDescription>global 域风控更紧，默认 2</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>连续失败熔断阈值</FieldLabel>
+              {num('breaker_threshold', { min: 1, placeholder: '3' })}
+            </Field>
           </div>
           <div className="grid gap-x-4 md:grid-cols-3">
-            <Field label="软限流冷却基数">{text('soft_rate', { placeholder: '600s' })}</Field>
-            <Field label="软冷却退避上限">{text('soft_rate_max', { placeholder: '2h' })}</Field>
-            <Field label="熔断基础时长">{text('breaker_cooldown', { placeholder: '30m' })}</Field>
+            <Field>
+              <FieldLabel>软限流冷却基数</FieldLabel>
+              {text('soft_rate', { placeholder: '600s' })}
+            </Field>
+            <Field>
+              <FieldLabel>软冷却退避上限</FieldLabel>
+              {text('soft_rate_max', { placeholder: '2h' })}
+            </Field>
+            <Field>
+              <FieldLabel>熔断基础时长</FieldLabel>
+              {text('breaker_cooldown', { placeholder: '30m' })}
+            </Field>
           </div>
           <div className="grid gap-x-4 md:grid-cols-3">
-            <Field label="熔断退避上限">{text('breaker_cooldown_max', { placeholder: '6h' })}</Field>
-            <Field label="连败降权阈值" hint="未知错误连败 N 次临时出池">{num('degrade_threshold', { min: 1, placeholder: '5' })}</Field>
-            <Field label="连败降权时长">{text('degrade_cooldown', { placeholder: '10m' })}</Field>
+            <Field>
+              <FieldLabel>熔断退避上限</FieldLabel>
+              {text('breaker_cooldown_max', { placeholder: '6h' })}
+            </Field>
+            <Field>
+              <FieldLabel>连败降权阈值</FieldLabel>
+              {num('degrade_threshold', { min: 1, placeholder: '5' })}
+              <FieldDescription>未知错误连败 N 次临时出池</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>连败降权时长</FieldLabel>
+              {text('degrade_cooldown', { placeholder: '10m' })}
+            </Field>
           </div>
           <div className="grid gap-x-4 md:grid-cols-3">
-            <Field label="连败降权上限">{text('degrade_cooldown_max', { placeholder: '2h' })}</Field>
-            <Field label="闲置补偿 / 小时">{num('idle_weight_per_hour', { step: 0.1, placeholder: '0.5' })}</Field>
-            <Field label="闲置补偿上限">{num('idle_weight_max', { step: 0.1, placeholder: '5' })}</Field>
+            <Field>
+              <FieldLabel>连败降权上限</FieldLabel>
+              {text('degrade_cooldown_max', { placeholder: '2h' })}
+            </Field>
+            <Field>
+              <FieldLabel>闲置补偿 / 小时</FieldLabel>
+              {num('idle_weight_per_hour', { step: 0.1, placeholder: '0.5' })}
+            </Field>
+            <Field>
+              <FieldLabel>闲置补偿上限</FieldLabel>
+              {num('idle_weight_max', { step: 0.1, placeholder: '5' })}
+            </Field>
           </div>
           <div className="grid gap-x-4 md:grid-cols-3">
-            <Field label="成本探索窗口" hint="垄断破除：免费层垄断时定期搭车探索未知号；0 关停">
+            <Field>
+              <FieldLabel>成本探索窗口</FieldLabel>
               {text('cost_explore_interval', { placeholder: '30m' })}
+              <FieldDescription>垄断破除：免费层垄断时定期搭车探索未知号；0 关停</FieldDescription>
             </Field>
-            <Field label="积分保底" hint="余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭">
+            <Field>
+              <FieldLabel>积分保底</FieldLabel>
               {num('credit_floor', { min: 0, placeholder: '100' })}
+              <FieldDescription>余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</FieldDescription>
             </Field>
-            <Field label="快过期路由窗口" hint="窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭">
+            <Field>
+              <FieldLabel>快过期路由窗口</FieldLabel>
               {text('expiring_soon', { placeholder: '168h' })}
+              <FieldDescription>窗口内有快过期批次的账号选号权重 ×3（不排序、与金额无关）；0 关闭</FieldDescription>
             </Field>
-            <Field label="会话粘性 TTL" hint="改动需重启进程">{text('ttl', { placeholder: '30m' })}</Field>
+            <Field>
+              <FieldLabel>会话粘性 TTL</FieldLabel>
+              {text('ttl', { placeholder: '30m' })}
+              <FieldDescription>改动需重启进程</FieldDescription>
+            </Field>
           </div>
           {check('prefer_expiring', '快过期积分优先')}
-        </BoxBody>
-      </Box>
+        </CardContent>
+      </Card>
 
-      <Box>
-        <BoxHeader>
-          <BoxTitle>上游与高级</BoxTitle>
-        </BoxHeader>
-        <BoxBody>
+      <Card className="mb-5">
+        <CardHeader>
+          <CardTitle>上游与高级</CardTitle>
+        </CardHeader>
+        <CardContent>
           <div className="grid gap-x-4 md:grid-cols-3">
-            <Field label="短请求超时" hint="需重启">{num('timeout_seconds', { min: 1, placeholder: '120' })}</Field>
-            <Field label="聊天首字节超时" hint="需重启">{num('header_timeout_seconds', { min: 1, placeholder: '120' })}</Field>
-            <Field label="流空闲超时" hint="需重启">{num('idle_timeout_seconds', { min: 1, placeholder: '300' })}</Field>
+            <Field>
+              <FieldLabel>短请求超时</FieldLabel>
+              {num('timeout_seconds', { min: 1, placeholder: '120' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>聊天首字节超时</FieldLabel>
+              {num('header_timeout_seconds', { min: 1, placeholder: '120' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>流空闲超时</FieldLabel>
+              {num('idle_timeout_seconds', { min: 1, placeholder: '300' })}
+              <FieldDescription>需重启</FieldDescription>
+            </Field>
           </div>
-          <Hr />
+          <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
-            <Field label="出站 User-Agent" hint="影响官网积分记录「使用端」显示；需重启">
+            <Field>
+              <FieldLabel>出站 User-Agent</FieldLabel>
               {text('user_agent', { placeholder: '留空 = CLI/2.63.2 CodeBuddy/2.63.2' })}
+              <FieldDescription>影响官网积分记录「使用端」显示；需重启</FieldDescription>
             </Field>
           </div>
-          <Hr />
+          <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
-            <Field label="系统提示词模式" hint="需重启">
-              <Select value={String(values.prompt_mode ?? '')} onChange={(e) => set('prompt_mode', e.target.value)}>
-                <option value="custom">custom — 网关自有提示词（避免指纹误报）</option>
-                <option value="append">append — 客户端 system 后插网关提示词（并用）</option>
-                <option value="passthrough">passthrough — 透传客户端原始 system</option>
+            <Field>
+              <FieldLabel>系统提示词模式</FieldLabel>
+              <Select value={String(values.prompt_mode ?? 'custom')} onValueChange={(v) => set('prompt_mode', v ?? 'custom')}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="custom">custom — 网关自有提示词（避免指纹误报）</SelectItem>
+                  <SelectItem value="append">append — 客户端 system 后插网关提示词（并用）</SelectItem>
+                  <SelectItem value="passthrough">passthrough — 透传客户端原始 system</SelectItem>
+                </SelectContent>
               </Select>
+              <FieldDescription>需重启</FieldDescription>
             </Field>
-            <Field label="提示词文件路径" hint="需重启">
+            <Field>
+              <FieldLabel>提示词文件路径</FieldLabel>
               {text('prompt_file', { placeholder: '留空 = 内置默认提示词' })}
+              <FieldDescription>需重启</FieldDescription>
             </Field>
           </div>
-          <Hr />
+          <Separator className="my-4" />
           {check('sanitize_blacklist_fingerprints', '出站请求指纹脱敏')}
           {check('session_sticky_enabled', '会话粘性路由')}
-          <div className="mt-2.5 text-2xs text-ink-3">
+          <p className="mt-2.5 text-2xs text-muted-foreground">
             Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。
-          </div>
-        </BoxBody>
-      </Box>
+          </p>
+        </CardContent>
+      </Card>
 
-      <Box>
-        <BoxHeader>
-          <BoxTitle>日志</BoxTitle>
-        </BoxHeader>
-        <BoxBody>
+      <Card className="mb-5">
+        <CardHeader>
+          <CardTitle>日志</CardTitle>
+        </CardHeader>
+        <CardContent>
           {check('request_client_info', '记录调用来源（客户端 IP / User-Agent）')}
-          <div className="text-2xs text-ink-3">
+          <p className="text-2xs text-muted-foreground">
             开启后，「运行日志」页的请求记录会显示每次调用来自哪个 IP、用什么客户端；关闭则归档与面板都不再出现来源信息。改动即时生效，无需重启。
-          </div>
-          <div className="mt-2 text-2xs text-ink-3">
+          </p>
+          <p className="mt-2 text-2xs text-muted-foreground">
             归档开关、保留天数与容量上限（<code>logging.request_archive_*</code>）需手工编辑配置文件。
-          </div>
-        </BoxBody>
-      </Box>
+          </p>
+        </CardContent>
+      </Card>
 
-      <div className="sticky bottom-0 flex items-center gap-3 border-t border-line-soft bg-surface-2 px-4 py-3">
-        <Grow />
-        {badFields.length ? <span className="text-xs text-warn">{DURATION_TIP}</span> : null}
-        <span className="text-xs text-warn">{note}</span>
+      <div className="sticky bottom-0 flex items-center gap-3 border-t border-border bg-secondary px-4 py-3">
+        <span className="flex-1" />
+        {badFields.length ? <span className="text-xs text-warning">{DURATION_TIP}</span> : null}
+        <span className="text-xs text-warning">{note}</span>
         <Button disabled={saving} onClick={() => void load()}>
           放弃修改
         </Button>
-        <Button type="submit" variant="primary" disabled={saving}>
+        <Button type="submit" variant="default" disabled={saving}>
           {saving ? '保存中…' : '保存配置'}
         </Button>
       </div>
     </form>
   );
-}
-
-function Hr() {
-  return <div className="my-1 mb-4 h-px bg-line-soft" />;
 }

@@ -4,8 +4,14 @@ import {
   type TimeRangeState,
 } from '@/lib/timeRange';
 import { dtLocalParse, dtLocalValue } from '@/lib/format';
-import { Input, Select } from '@/components/ui/field';
-import { cn } from '@/lib/utils';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import { Input } from '@/components/ui/input';
 
 // TimeRange：预设下拉 + 「自定义」时展开的起止时间。起止颠倒就地标红（不静默纠正）。
 export function TimeRange({
@@ -18,7 +24,8 @@ export function TimeRange({
   const custom = value.preset === 'custom';
   const bad = !!(value.from && value.to && value.from > value.to);
 
-  const setPreset = (preset: string) => {
+  const setPreset = (preset: string | null) => {
+    if (preset == null) return;
     const next: TimeRangeState = { ...value, preset };
     if (preset === 'custom' && (!next.from || !next.to)) {
       next.from = trangeMidnight();
@@ -31,36 +38,36 @@ export function TimeRange({
     onChange({ ...value, [which]: dtLocalParse(raw) });
   };
 
+  const presetLabel = TRANGE_PRESETS.find((p) => p[0] === value.preset)?.[1] ?? value.preset;
+
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
-      <Select
-        size="sm"
-        aria-label="时间范围"
-        value={value.preset}
-        onChange={(e) => setPreset(e.target.value)}
-      >
-        {TRANGE_PRESETS.map(([v, label]) => (
-          <option key={v} value={v}>
-            {label}
-          </option>
-        ))}
+      <Select value={value.preset} onValueChange={setPreset}>
+        <SelectTrigger size="sm" className="w-28">
+          <SelectValue>{presetLabel}</SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {TRANGE_PRESETS.map(([v, label]) => (
+            <SelectItem key={v} value={v}>
+              {label}
+            </SelectItem>
+          ))}
+        </SelectContent>
       </Select>
       {custom ? (
         <span className="inline-flex items-center gap-1.5">
           <Input
             type="datetime-local"
-            size="sm"
             aria-label="起始时间"
-            className={cn('font-mono', bad && 'border-bad bg-bad-soft')}
+            className={bad ? 'h-7 border-destructive bg-destructive-soft font-mono text-xs' : 'h-7 font-mono text-xs'}
             value={value.from ? dtLocalValue(value.from) : ''}
             onChange={(e) => readCustom('from', e.target.value)}
           />
-          <span className="text-xs text-ink-3">→</span>
+          <span className="text-xs text-muted-foreground">→</span>
           <Input
             type="datetime-local"
-            size="sm"
             aria-label="结束时间"
-            className={cn('font-mono', bad && 'border-bad bg-bad-soft')}
+            className={bad ? 'h-7 border-destructive bg-destructive-soft font-mono text-xs' : 'h-7 font-mono text-xs'}
             value={value.to ? dtLocalValue(value.to) : ''}
             onChange={(e) => readCustom('to', e.target.value)}
           />

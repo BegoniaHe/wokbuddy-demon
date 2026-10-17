@@ -16,8 +16,8 @@ import { api } from '@/lib/api';
 import type { Overview } from '@/lib/types';
 import { VIEW_TITLES, type ViewId } from '@/views/registry';
 import { Button } from '@/components/ui/button';
-import { Dot, type DotTone } from '@/components/ui/box';
 import { cn } from '@/lib/utils';
+import { Dot } from '@/components/ui-kit';
 
 const NAV: { id: ViewId; icon: LucideIcon }[] = [
   { id: 'accounts', icon: Users },
@@ -67,22 +67,20 @@ export function Shell({
   const healthy = data?.healthy ?? 0;
   const total = data?.total ?? 0;
   const stateText = healthy > 0 ? '服务正常' : total ? '无可用账号' : '待添加账号';
-  const statusTone: DotTone = healthy > 0 ? 'ok' : total ? 'warn' : 'bad';
+  const statusTone = healthy > 0 ? 'ok' : total ? 'warn' : 'bad';
 
   return (
-    <div className="grid min-h-screen grid-cols-1 md:grid-cols-[208px_1fr]">
-      <nav className="flex flex-col border-b border-line bg-surface md:sticky md:top-0 md:h-screen md:border-b-0 md:border-r">
-        <div className="flex items-center gap-3 border-b border-line-soft px-[18px] py-4 md:block">
-          <div className="text-lg font-semibold tracking-tight">WokBuddy Demon</div>
-          <div className="mt-0.5 font-mono text-2xs text-ink-3">
-            v{data?.version ?? '-'}
-          </div>
+    <div className="flex min-h-screen flex-col md:flex-row">
+      <nav className="flex flex-col border-b border-border bg-card md:sticky md:top-0 md:h-screen md:w-[224px] md:flex-none md:border-b-0 md:border-r">
+        <div className="flex items-center gap-2 px-4 py-3.5">
+          <div className="text-[15px] font-semibold tracking-tight">WokBuddy Demon</div>
+          <span className="font-mono text-2xs text-muted-foreground">v{data?.version ?? '-'}</span>
         </div>
         <ul className="flex flex-1 gap-0.5 overflow-x-auto p-2 md:flex-col md:overflow-visible">
           {NAV.map(({ id, icon: Icon }) => {
             const on = id === view;
             return (
-              <li key={id} className="shrink-0">
+              <li key={id} className="shrink-0 md:w-full">
                 <a
                   href={'#' + id}
                   onClick={(e) => {
@@ -90,20 +88,20 @@ export function Shell({
                     onNavigate(id);
                   }}
                   className={cn(
-                    'flex items-center gap-2.5 rounded-control px-2.5 py-2 text-sm no-underline',
+                    'flex items-center gap-2.5 rounded-md px-2.5 py-2 text-sm no-underline transition-colors',
                     on
-                      ? 'bg-accent-soft font-medium text-accent'
-                      : 'text-ink-2 hover:bg-surface-2 hover:text-ink',
+                      ? 'bg-accent-soft font-medium text-accent-foreground'
+                      : 'text-muted-foreground hover:bg-secondary hover:text-foreground',
                   )}
                 >
-                  <Icon className="h-[15px] w-[15px] flex-none opacity-85" />
+                  <Icon className="size-[15px] flex-none opacity-85" />
                   <span className="whitespace-nowrap">{VIEW_TITLES[id]}</span>
                 </a>
               </li>
             );
           })}
         </ul>
-        <div className="hidden border-t border-line-soft px-4 py-3 text-2xs text-ink-3 md:block">
+        <div className="hidden border-t border-border px-4 py-3 text-2xs text-muted-foreground md:block">
           <div className="flex items-center gap-2">
             <Dot tone={statusTone} />
             <span>{stateText}</span>
@@ -114,13 +112,14 @@ export function Shell({
         </div>
       </nav>
 
-      <div className="flex min-w-0 flex-col">
-        <div className="sticky top-0 z-20 flex items-center gap-3.5 border-b border-line bg-surface px-4 py-3.5 md:px-6">
-          <h2 className="text-lg font-semibold tracking-tight">{VIEW_TITLES[view]}</h2>
-          <span className="text-ink-3">/</span>
-          <span className="font-mono text-xs text-ink-3">
-            {data ? uptimeText(data.uptime_sec) : '-'}
-          </span>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-border bg-card px-4 md:px-6">
+          <div className="flex min-w-0 flex-col">
+            <h2 className="truncate text-[15px] font-semibold tracking-tight">{VIEW_TITLES[view]}</h2>
+            <span className="truncate font-mono text-2xs text-muted-foreground">
+              {data ? uptimeText(data.uptime_sec) : '—'}
+            </span>
+          </div>
           <span className="flex-1" />
           <Button
             variant="ghost"
@@ -129,17 +128,15 @@ export function Shell({
             aria-label="切换主题"
             onClick={onToggleTheme}
           >
-            {theme === 'light' ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
+            {theme === 'light' ? <Sun /> : <Moon />}
           </Button>
-          <Button disabled={refreshing} onClick={onRefresh}>
+          <Button variant="outline" disabled={refreshing} onClick={onRefresh}>
             {refreshing ? '刷新中…' : '刷新'}
           </Button>
-          <Button variant="primary" onClick={onAdd}>
-            添加账号
-          </Button>
-        </div>
+          <Button onClick={onAdd}>添加账号</Button>
+        </header>
 
-        <div className="mx-auto w-full max-w-[1560px] px-4 pb-16 pt-5 md:px-6">{children}</div>
+        <main className="mx-auto w-full max-w-[1560px] flex-1 px-4 pb-16 pt-6 md:px-6">{children}</main>
       </div>
     </div>
   );

@@ -15,13 +15,34 @@ import { expBatches, expDaysLeft, type Package } from '@/lib/expiry';
 import { fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Badge, Chip, Tag } from '@/components/ui/field';
-import { Bar } from '@/components/ui/bar';
-import { Box, BoxBody, BoxHeader, BoxHint, BoxNote, BoxTitle, Dot, Grow, type DotTone } from '@/components/ui/box';
-import { Empty, Num, RailCell, Table, TableWrap, Td, Th, type RailTone } from '@/components/ui/table';
-import { Stat, Stats } from '@/components/ui/stat';
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { Tag, Chip, Bar, Dot, type Tone } from '@/components/ui-kit';
 import { TasksDialog } from '@/components/TasksDialog';
 import { useState } from 'react';
+import { cn } from '@/lib/utils';
+import { MoreHorizontal } from 'lucide-react';
 
 // 账号池视图：统计条 + 积分到期提醒 + 账号表 + 模型锁池。
 export function AccountsView() {
@@ -42,10 +63,10 @@ export function AccountsView() {
   });
 
   if (error && !data) {
-    return <Empty>读取失败：{(error as Error).message}</Empty>;
+    return <Card><CardContent className="py-10 text-center text-muted-foreground">读取失败：{(error as Error).message}</CardContent></Card>;
   }
   if (!data) {
-    return <Empty>加载中…</Empty>;
+    return <Card><CardContent className="py-10 text-center text-muted-foreground">加载中…</CardContent></Card>;
   }
 
   const accounts = data.accounts ?? [];
@@ -68,15 +89,17 @@ export function AccountsView() {
 
   return (
     <>
-      <Stats>
-        <Stat value={data.total} label="账号总数" />
-        <Stat value={data.healthy} label="可用" tone="good" />
-        <Stat value={data.cooling} label="冷却中" tone="warn" />
-        <Stat value={data.disabled} label="已禁用" tone="bad" />
-        <Stat value={data.paused ?? '-'} label="已暂停选号" tone="warn" />
-        <Stat value={creditsText} label="积分剩余 / 总额" />
-        <Stat value={data.sticky_sessions} label="粘性会话" />
-      </Stats>
+      <Stats
+        stats={[
+          { value: data.total, label: '账号总数' },
+          { value: data.healthy, label: '可用', tone: 'good' },
+          { value: data.cooling, label: '冷却中', tone: 'warn' },
+          { value: data.disabled, label: '已禁用', tone: 'bad' },
+          { value: data.paused ?? '-', label: '已暂停选号', tone: 'warn' },
+          { value: creditsText, label: '积分剩余 / 总额' },
+          { value: data.sticky_sessions, label: '粘性会话' },
+        ]}
+      />
 
       <ExpiryBox
         overview={data}
@@ -86,41 +109,44 @@ export function AccountsView() {
         onCheck={() => void pkgQuery.refetch()}
       />
 
-      <Box>
-        <BoxHeader>
-          <BoxTitle>账号池</BoxTitle>
-          <Grow />
-          <BoxNote>{data.in_flight_full ? data.in_flight_full + ' 个账号在途占满' : ''}</BoxNote>
-          <Button size="xs" onClick={() => void run(async () => { await postJSON('checkin_all'); toast('全部签到已开始，结果见日志', 'ok'); })}>全部签到</Button>
-          <Button size="xs" onClick={() => void run(async () => { await postJSON('travel_all'); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); })}>旅行巡检</Button>
-          <Button size="xs" onClick={() => void run(async () => { await postJSON('activity_all'); toast('活跃上报已开始，结果见日志', 'ok'); })}>活跃上报</Button>
-          <Button size="xs" onClick={() => void run(async () => { await postJSON('keepalive_all'); toast('全部保活已开始，结果见日志', 'ok'); })}>全部保活</Button>
-        </BoxHeader>
-        <TableWrap>
+      <Card>
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>账号池</CardTitle>
+          <CardAction>
+            <div className="flex items-center gap-2">
+              {data.in_flight_full ? (
+                <span className="text-xs text-muted-foreground">{data.in_flight_full} 个账号在途占满</span>
+              ) : null}
+              <Button size="xs" onClick={() => void run(async () => { await postJSON('checkin_all'); toast('全部签到已开始，结果见日志', 'ok'); })}>全部签到</Button>
+              <Button size="xs" onClick={() => void run(async () => { await postJSON('travel_all'); toast('旅行巡检已开始（含领养链路），结果见日志', 'ok'); })}>旅行巡检</Button>
+              <Button size="xs" onClick={() => void run(async () => { await postJSON('activity_all'); toast('活跃上报已开始，结果见日志', 'ok'); })}>活跃上报</Button>
+              <Button size="xs" onClick={() => void run(async () => { await postJSON('keepalive_all'); toast('全部保活已开始，结果见日志', 'ok'); })}>全部保活</Button>
+            </div>
+          </CardAction>
+        </CardHeader>
+        <div className="overflow-x-auto">
           <Table>
-            <thead>
-              <tr>
-                <Th className="w-[3px] p-0" aria-hidden />
-                <Th>账号</Th>
-                <Th>状态</Th>
-                <Th>积分</Th>
-                <Th>成功 / 失败</Th>
-                <Th>在途</Th>
-                <Th>用量</Th>
-                <Th>最近成功</Th>
-                <Th />
-              </tr>
-            </thead>
-            <tbody>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-[3px] p-0" aria-hidden />
+                <TableHead>账号</TableHead>
+                <TableHead>状态</TableHead>
+                <TableHead>积分</TableHead>
+                <TableHead>成功 / 失败</TableHead>
+                <TableHead>在途</TableHead>
+                <TableHead>用量</TableHead>
+                <TableHead>最近成功</TableHead>
+                <TableHead />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {accounts.length === 0 ? (
-                <tr>
-                  <Td colSpan={9}>
-                    <Empty>
-                      <div className="mb-1.5 text-sm text-ink-2">账号池是空的</div>
-                      点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号
-                    </Empty>
-                  </Td>
-                </tr>
+                <TableRow>
+                  <TableCell colSpan={9} className="py-10 text-center text-muted-foreground">
+                    <div className="mb-1.5 text-sm text-foreground">账号池是空的</div>
+                    点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号
+                  </TableCell>
+                </TableRow>
               ) : (
                 accounts.map((s) => (
                   <AccountRow
@@ -132,10 +158,10 @@ export function AccountsView() {
                   />
                 ))
               )}
-            </tbody>
+            </TableBody>
           </Table>
-        </TableWrap>
-      </Box>
+        </div>
+      </Card>
 
       <ModelLocks rows={data.model_locks} />
 
@@ -149,6 +175,35 @@ interface PackageAccount {
   nickname?: string;
   error?: string;
   packages?: Package[];
+}
+
+interface StatItem {
+  value: React.ReactNode;
+  label: string;
+  tone?: 'default' | 'good' | 'warn' | 'bad';
+}
+
+// Stats：顶部统计条。窄屏降为 3 / 2 列。
+function Stats({ stats }: { stats: StatItem[] }) {
+  return (
+    <div className="mb-5 grid grid-cols-2 overflow-hidden rounded-xl border border-border bg-card sm:grid-cols-3 lg:grid-cols-7">
+      {stats.map((s) => (
+        <div key={s.label} className="border-b border-r border-border/60 px-4 py-3.5 last:border-b-0 lg:border-b-0 lg:last:border-r-0">
+          <div
+            className={cn(
+              'whitespace-nowrap font-mono text-[26px] font-semibold leading-tight tracking-tight tabular-nums',
+              s.tone === 'good' && 'text-success',
+              s.tone === 'warn' && 'text-warning',
+              s.tone === 'bad' && 'text-destructive',
+            )}
+          >
+            {s.value}
+          </div>
+          <div className="mt-1.5 text-2xs text-muted-foreground">{s.label}</div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function ExpiryBox({
@@ -190,20 +245,20 @@ function ExpiryBox({
       const nm = a.nickname || String(a.uid || '').slice(0, 8);
       if (a.error) {
         return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
-            <Dot tone="mute" className="mt-1 h-2.5 w-2.5" />
+          <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
+            <Dot tone="mute" className="mt-1 size-2.5" />
             <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-            <span className="text-bad">查询失败：{a.error}</span>
+            <span className="text-destructive">查询失败：{a.error}</span>
           </div>
         );
       }
       const bs = expBatches(a.packages).filter((b) => expDaysLeft(b.date, today) >= 0);
       if (!bs.length) {
         return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
-            <Dot tone="ok" className="mt-1 h-2.5 w-2.5" />
+          <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
+            <Dot tone="ok" className="mt-1 size-2.5" />
             <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-            <span className="text-ink-2">7 天内无到期积分</span>
+            <span className="text-muted-foreground">7 天内无到期积分</span>
           </div>
         );
       }
@@ -211,20 +266,20 @@ function ExpiryBox({
       const days = expDaysLeft(first.date, today);
       const daily = Math.ceil(first.remain / Math.max(1, days));
       const week = bs.filter((b) => expDaysLeft(b.date, today) <= 7).reduce((s, b) => s + b.remain, 0);
-      const dotTone: DotTone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
+      const dotTone: Tone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
       const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
       const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
       const rest = bs.slice(1, 4).map((b) => '随后 ' + b.date.slice(5) + ' · ' + fmtTok(b.remain)).join('　') + more;
       return (
-        <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
-          <Dot tone={dotTone} className="mt-1 h-2.5 w-2.5" />
+        <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
+          <Dot tone={dotTone} className="mt-1 size-2.5" />
           <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-          <span className="text-ink-2">
+          <span className="text-muted-foreground">
             最近到期 <b className="font-mono">{first.date}</b>（{dayWord}）· 该批{' '}
             <b className="font-mono">{fmtTok(first.remain)}</b> 积分 · 到期前日均需耗 ≥
             <b className="font-mono">{fmtTok(daily)}</b>
             {week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : ''}
-            {rest ? <div className="mt-0.5 text-2xs text-ink-3">{rest}</div> : null}
+            {rest ? <div className="mt-0.5 text-2xs text-muted-foreground/80">{rest}</div> : null}
           </span>
         </div>
       );
@@ -249,34 +304,34 @@ function ExpiryBox({
       if (x.key === null && y.key === null) return 0;
       if (x.key === null) return 1;
       if (y.key === null) return -1;
-      return x.key - y.key;
+      return x.key! - y.key!;
     });
     rows = keyed.map(({ a, ms }) => {
       const nm = a.nickname || String(a.uid || '').slice(0, 8);
       if (!ms || !a.credits_earliest_remaining) {
         return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
-            <Dot tone="ok" className="mt-1 h-2.5 w-2.5" />
+          <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
+            <Dot tone="ok" className="mt-1 size-2.5" />
             <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-            <span className="text-ink-2">无近期到期批次</span>
+            <span className="text-muted-foreground">无近期到期批次</span>
           </div>
         );
       }
       const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
       const remain = Number(a.credits_earliest_remaining || 0);
       const daily = Math.ceil(remain / Math.max(1, days));
-      const dotTone: DotTone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
+      const dotTone: Tone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
       const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
       const when = new Date(ms).toISOString().slice(0, 10);
       return (
-        <div key={nm} className="flex items-start gap-2.5 border-t border-line-soft py-2 text-xs first:border-t-0">
-          <Dot tone={dotTone} className="mt-1 h-2.5 w-2.5" />
+        <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
+          <Dot tone={dotTone} className="mt-1 size-2.5" />
           <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-          <span className="text-ink-2">
+          <span className="text-muted-foreground">
             最近到期 <b className="font-mono">{when}</b>（{dayWord}）· 该批{' '}
             <b className="font-mono">{fmtTok(remain)}</b> 积分 · 到期前日均需耗 ≥
             <b className="font-mono">{fmtTok(daily)}</b>
-            <div className="mt-0.5 text-2xs text-ink-3">仅最早一批，点「检查」看全部到期批次</div>
+            <div className="mt-0.5 text-2xs text-muted-foreground/80">仅最早一批，点「检查」看全部到期批次</div>
           </span>
         </div>
       );
@@ -285,20 +340,23 @@ function ExpiryBox({
   }
 
   return (
-    <Box>
-      <BoxHeader>
-        <BoxTitle>
+    <Card className="mb-5">
+      <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardTitle className="flex items-baseline">
           积分到期提醒
-          <BoxHint>按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</BoxHint>
-        </BoxTitle>
-        <Grow />
-        <BoxNote>{note}</BoxNote>
-        <Button size="xs" disabled={checking} onClick={onCheck}>
-          {checking ? '查询中…' : '检查'}
-        </Button>
-      </BoxHeader>
-      <BoxBody>{rows && (rows as unknown[])?.length ? rows : <Empty>没有账号</Empty>}</BoxBody>
-    </Box>
+          <CardDescription className="ml-1.5">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</CardDescription>
+        </CardTitle>
+        <CardAction>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground">{note}</span>
+            <Button size="xs" disabled={checking} onClick={onCheck}>
+              {checking ? '查询中…' : '检查'}
+            </Button>
+          </div>
+        </CardAction>
+      </CardHeader>
+      <CardContent>{rows && (rows as unknown[])?.length ? rows : <p className="py-4 text-center text-muted-foreground">没有账号</p>}</CardContent>
+    </Card>
   );
 }
 
@@ -436,22 +494,26 @@ function AccountRow({
   };
 
   const limits = (s.rate_limited_models || []).filter((r) => r && r.model);
-  const railTone: RailTone = s.disabled || s.paused ? 'bad' : cool > 0 ? 'warn' : 'ok';
+  const railTone = s.disabled || s.paused ? 'bad' : cool > 0 ? 'warn' : 'ok';
 
   return (
-    <tr className={cls} title={'uid: ' + s.uid}>
-      <RailCell tone={railTone} />
-      <Td>
-        <div className="font-medium">
-          {s.nickname ? s.nickname : <span className="text-ink-3">未命名</span>}
-          {s.realm === 'global' ? <Badge className="ml-1.5">国际版</Badge> : null}
-          {s.enterprise ? <Badge className="ml-1.5">企业版</Badge> : null}
+    <TableRow className={cls} title={'uid: ' + s.uid}>
+      <TableCell className="w-[3px] p-0">
+        <span className={cn('block h-full min-h-[36px] w-[3px]', railBg[railTone])} />
+      </TableCell>
+      <TableCell>
+        <div className="flex items-center gap-1.5">
+          <span className="truncate font-medium" title={s.nickname || undefined}>
+            {s.nickname ? s.nickname : <span className="text-muted-foreground">未命名</span>}
+          </span>
+          {s.realm === 'global' ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">国际版</span> : null}
+          {s.enterprise ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">企业版</span> : null}
         </div>
-        <div className="mt-px truncate font-mono text-2xs text-ink-3">{short}</div>
-      </Td>
-      <Td>
+        <div className="mt-px truncate font-mono text-2xs text-muted-foreground">{short}</div>
+      </TableCell>
+      <TableCell>
         {tag}
-        {s.reason ? <div className="mt-0.5 text-2xs text-ink-3">{s.reason}</div> : null}
+        {s.reason ? <div className="mt-0.5 text-2xs text-muted-foreground">{s.reason}</div> : null}
         {limits.length ? (
           <div className="mt-1.5 flex min-w-[210px] flex-col gap-1">
             {limits.map((row, i) => {
@@ -461,46 +523,46 @@ function AccountRow({
                   key={i}
                   title={m.title}
                   className={
-                    'flex items-baseline gap-1.5 rounded-control border px-1.5 py-1 text-2xs leading-tight ' +
+                    'flex items-baseline gap-1.5 rounded-md border px-1.5 py-1 text-2xs leading-tight ' +
                     (m.kind === 'model_unavailable'
-                      ? 'border-line bg-surface-2 text-ink-3'
-                      : 'border-warn/25 bg-warn-soft')
+                      ? 'border-border bg-secondary text-muted-foreground'
+                      : 'border-warning/25 bg-warning-soft')
                   }
                 >
-                  <b className="font-mono font-semibold text-ink">{m.model}</b>
-                  <span className="text-ink-2">{m.detail}</span>
+                  <b className="font-mono font-semibold text-foreground">{m.model}</b>
+                  <span className="text-muted-foreground">{m.detail}</span>
                 </div>
               );
             })}
           </div>
         ) : null}
-      </Td>
-      <Td title={credTip}>
+      </TableCell>
+      <TableCell title={credTip}>
         <div className="font-mono text-sm tabular-nums">{cred}</div>
         <Bar pct={pct} className="mt-1 max-w-[88px]" />
-      </Td>
-      <Td>
-        <Num>
-          {s.success_count || 0} <span className="text-ink-3">/</span>{' '}
-          <span className="text-bad">{s.err_total || 0}</span>
-        </Num>
-      </Td>
-      <Td>
-        <Num>{s.in_flight || 0}</Num>
-      </Td>
-      <Td title={usageTitle}>
+      </TableCell>
+      <TableCell>
+        <span className="font-mono tabular-nums whitespace-nowrap">
+          {s.success_count || 0} <span className="text-muted-foreground">/</span>{' '}
+          <span className="text-destructive">{s.err_total || 0}</span>
+        </span>
+      </TableCell>
+      <TableCell>
+        <span className="font-mono tabular-nums">{s.in_flight || 0}</span>
+      </TableCell>
+      <TableCell title={usageTitle}>
         <span className="inline-flex flex-wrap items-center gap-1">
           <Chip tone="accent" unit="次">{req}</Chip>
           <Chip tone="accent" unit={totalTok !== '—' ? 'tok' : undefined}>{totalTok}</Chip>
           <Chip tone="warn">{latency}</Chip>
           <Chip tone="ok">{rate}</Chip>
         </span>
-      </Td>
-      <Td>
-        <Num className="text-ink-3">{ago(s.last_success)}</Num>
-      </Td>
-      <Td>
-        <div className="flex justify-end gap-1.5 whitespace-nowrap">
+      </TableCell>
+      <TableCell>
+        <span className="font-mono text-xs tabular-nums text-muted-foreground">{ago(s.last_success)}</span>
+      </TableCell>
+      <TableCell>
+        <div className="flex justify-end items-center gap-1.5 whitespace-nowrap">
           {!s.enterprise ? (
             <Button size="xs" variant="ghost" title={s.checkin_done ? '今日已签到；点击可重新签到并刷新余额' : undefined} onClick={() => void act('checkin')}>
               {s.checkin_done ? '已签' : '签到'}
@@ -514,32 +576,44 @@ function AccountRow({
               任务
             </Button>
           ) : null}
-          {frozen ? (
-            <Button size="xs" variant="primary" onClick={() => void act('revive')}>
-              解冻
-            </Button>
-          ) : s.paused ? (
-            <Button size="xs" variant="primary" onClick={() => void act('resume')}>
-              恢复选号
-            </Button>
-          ) : (
-            <Button size="xs" variant="ghost" title={s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额'} onClick={() => void act('pause')}>
-              暂停选号
-            </Button>
-          )}
-          {s.disabled ? null : (
-            <Button size="xs" variant="ghost" onClick={() => void act('disable')}>
-              禁用
-            </Button>
-          )}
-          <Button size="xs" variant="danger" onClick={() => void act('remove')}>
-            移除
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={
+                <Button size="xs" variant="ghost" title="更多操作">
+                  <MoreHorizontal />
+                </Button>
+              }
+            />
+            <DropdownMenuContent align="end">
+              {frozen ? (
+                <DropdownMenuItem onClick={() => void act('revive')}>解冻</DropdownMenuItem>
+              ) : s.paused ? (
+                <DropdownMenuItem onClick={() => void act('resume')}>恢复选号</DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem onClick={() => void act('pause')} title={s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额'}>
+                  暂停选号
+                </DropdownMenuItem>
+              )}
+              {s.disabled ? null : (
+                <DropdownMenuItem onClick={() => void act('disable')}>禁用</DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              <DropdownMenuItem variant="destructive" onClick={() => void act('remove')}>
+                移除
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
-      </Td>
-    </tr>
+      </TableCell>
+    </TableRow>
   );
 }
+
+const railBg = {
+  ok: 'bg-success',
+  warn: 'bg-warning',
+  bad: 'bg-destructive',
+} as const;
 
 function ModelLocks({ rows }: { rows?: ModelLock[] }) {
   const list = rows ?? [];
@@ -554,70 +628,70 @@ function ModelLocks({ rows }: { rows?: ModelLock[] }) {
   };
   const bad = list.filter((r) => r.state === 'locked' || r.state === 'starved').length;
   return (
-    <Box>
-      <BoxHeader>
-        <BoxTitle>
-          模型锁池 <BoxHint>哪些模型不能用、还要锁多久</BoxHint>
-        </BoxTitle>
-        <Grow />
-        <BoxNote>{list.length ? (bad ? bad + ' 个模型整池不可用' : list.length + ' 个模型部分限流') : ''}</BoxNote>
-      </BoxHeader>
-      <TableWrap>
+    <Card className="mt-5">
+      <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardTitle className="flex items-baseline">
+          模型锁池
+          <CardDescription className="ml-1.5">哪些模型不能用、还要锁多久</CardDescription>
+        </CardTitle>
+        <CardAction>
+          <span className="text-xs text-muted-foreground">{list.length ? (bad ? bad + ' 个模型整池不可用' : list.length + ' 个模型部分限流') : ''}</span>
+        </CardAction>
+      </CardHeader>
+      <div className="overflow-x-auto">
         <Table>
-          <thead>
-            <tr>
-              <Th>模型</Th>
-              <Th>域</Th>
-              <Th>状态</Th>
-              <Th>可选 / 总数</Th>
-              <Th>锁定账号</Th>
-              <Th>最早解锁</Th>
-              <Th>全池解锁</Th>
-              <Th>原因</Th>
-            </tr>
-          </thead>
-          <tbody>
+          <TableHeader>
+            <TableRow>
+              <TableHead>模型</TableHead>
+              <TableHead>域</TableHead>
+              <TableHead>状态</TableHead>
+              <TableHead>可选 / 总数</TableHead>
+              <TableHead>锁定账号</TableHead>
+              <TableHead>最早解锁</TableHead>
+              <TableHead>全池解锁</TableHead>
+              <TableHead>原因</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {list.length === 0 ? (
-              <tr>
-                <Td colSpan={8}>
-                  <Empty>当前没有模型级限流 —— 所有模型均可选</Empty>
-                </Td>
-              </tr>
+              <TableRow>
+                <TableCell colSpan={8} className="py-10 text-center text-muted-foreground">当前没有模型级限流 —— 所有模型均可选</TableCell>
+              </TableRow>
             ) : (
               list.map((r, i) => {
                 const st = STATE[r.state || ''] || ['mute', r.state || '—'];
                 const realm = r.realm === 'global' ? '国际版' : '国内版';
                 return (
-                  <tr key={i}>
-                    <Td>{r.model}</Td>
-                    <Td>
-                      <Badge>{realm}</Badge>
-                    </Td>
-                    <Td>
+                  <TableRow key={i}>
+                    <TableCell>{r.model}</TableCell>
+                    <TableCell>
+                      <span className="rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">{realm}</span>
+                    </TableCell>
+                    <TableCell>
                       <Tag tone={st[0] as 'bad' | 'warn' | 'mute'}>{st[1]}</Tag>
-                    </Td>
-                    <Td>
-                      <Num>
+                    </TableCell>
+                    <TableCell>
+                      <span className="font-mono tabular-nums">
                         {r.servable || 0} / {r.total || 0}
-                      </Num>
-                    </Td>
-                    <Td>
-                      <Num>{r.locked || 0}</Num>
-                    </Td>
-                    <Td>
-                      <Num>{left(r.unlock_at || r.fully_unlock_at)}</Num>
-                    </Td>
-                    <Td>
-                      <Num>{left(r.fully_unlock_at)}</Num>
-                    </Td>
-                    <Td>{r.reason ? <span className="text-ink-2">{r.reason}</span> : '—'}</Td>
-                  </tr>
+                      </span>
+                    </TableCell>
+                    <TableCell>
+                      <span className="font-mono tabular-nums">{r.locked || 0}</span>
+                    </TableCell>
+                    <TableCell>
+                      <span className="font-mono tabular-nums">{left(r.unlock_at || r.fully_unlock_at)}</span>
+                    </TableCell>
+                    <TableCell>
+                      <span className="font-mono tabular-nums">{left(r.fully_unlock_at)}</span>
+                    </TableCell>
+                    <TableCell>{r.reason ? <span className="text-muted-foreground">{r.reason}</span> : '—'}</TableCell>
+                  </TableRow>
                 );
               })
             )}
-          </tbody>
+          </TableBody>
         </Table>
-      </TableWrap>
-    </Box>
+      </div>
+    </Card>
   );
 }

@@ -19,11 +19,30 @@ import {
   type PkgAccount,
 } from '@/lib/packages';
 import { Button } from '@/components/ui/button';
-import { Select } from '@/components/ui/field';
-import { Box, BoxBody, BoxHeader, BoxNote, BoxTitle, Grow } from '@/components/ui/box';
-import { Empty, RailCell, Table, TableWrap, Td, Th } from '@/components/ui/table';
-import { Legend } from '@/components/ui/bar';
-import { cn } from '@/lib/utils';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Legend } from '@/components/ui-kit';
 
 const LS_PK_SORT = 'pkSortMode';
 
@@ -65,42 +84,49 @@ export function PackagesView() {
 
   return (
     <>
-      <Box>
-        <BoxHeader>
-          <BoxTitle>积分到期分布</BoxTitle>
-          <Grow />
-          <BoxNote>按批次到期日聚合，颜色区分账号</BoxNote>
-        </BoxHeader>
-        <BoxBody>
+      <Card className="mb-5">
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>积分到期分布</CardTitle>
+          <CardDescription>按批次到期日聚合，颜色区分账号</CardDescription>
+        </CardHeader>
+        <CardContent>
           <ExpiryDistribution list={list} now={now} />
-        </BoxBody>
-      </Box>
+        </CardContent>
+      </Card>
 
-      <Box>
-        <BoxHeader>
-          <BoxTitle>账号对比</BoxTitle>
-          <Grow />
-          <BoxNote>{list.length ? list.length + ' 个账号 · 实时查询上游' : '—'}</BoxNote>
-          <Select size="sm" value={sortMode} onChange={(e) => changeSort(e.target.value)} title="逐包明细的排序规则">
-            <option value="end_asc">按到期时间</option>
-            <option value="size_desc">按面额大小</option>
-          </Select>
-          <Button size="xs" disabled={pkgQ.isFetching} onClick={() => void pkgQ.refetch()}>
-            刷新
-          </Button>
-        </BoxHeader>
-        <BoxBody>
+      <Card className="mb-5">
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>账号对比</CardTitle>
+          <CardAction>
+            <div className="flex flex-wrap items-center gap-3">
+              <CardDescription>{list.length ? list.length + ' 个账号 · 实时查询上游' : '—'}</CardDescription>
+              <Select value={sortMode} onValueChange={(v) => changeSort(v ?? 'end_asc')}>
+                <SelectTrigger size="sm" className="w-32" title="逐包明细的排序规则">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="end_asc">按到期时间</SelectItem>
+                  <SelectItem value="size_desc">按面额大小</SelectItem>
+                </SelectContent>
+              </Select>
+              <Button size="xs" disabled={pkgQ.isFetching} onClick={() => void pkgQ.refetch()}>
+                刷新
+              </Button>
+            </div>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
           {pkgQ.isLoading ? (
-            <Empty>查询中…（逐账号向上游实时查询）</Empty>
+            <p className="py-4 text-center text-muted-foreground">查询中…（逐账号向上游实时查询）</p>
           ) : pkgQ.error ? (
-            <Empty>读取失败：{(pkgQ.error as Error).message}</Empty>
+            <p className="py-4 text-center text-muted-foreground">读取失败：{(pkgQ.error as Error).message}</p>
           ) : list.length === 0 ? (
-            <Empty>没有账号</Empty>
+            <p className="py-4 text-center text-muted-foreground">没有账号</p>
           ) : (
             <ComparisonCards list={list} now={now} />
           )}
-        </BoxBody>
-      </Box>
+        </CardContent>
+      </Card>
 
       {list
         .filter((a) => !a.error)
@@ -123,13 +149,13 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
   const colors = useMemo(() => pkAccountColorMap(list), [list]);
 
   if (!summary.rows.length) {
-    return <div className="py-5 text-center text-xs text-ink-3">暂无可汇总积分</div>;
+    return <div className="py-5 text-center text-xs text-muted-foreground">暂无可汇总积分</div>;
   }
 
   const legend = list
     .filter((a) => a && !a.error && a.uid && pkAccountSegments(a, now).some((s) => s.days != null))
     .map((a) => (
-      <Legend key={a.uid} color={colors.get(String(a.uid)) || 'var(--accent)'}>
+      <Legend key={a.uid} color={colors.get(String(a.uid)) || 'var(--primary)'}>
         {a.nickname || String(a.uid).slice(0, 8)}
       </Legend>
     ));
@@ -138,7 +164,7 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
 
   return (
     <>
-      <div className="mb-1 grid grid-cols-[64px_minmax(80px,1fr)_72px] items-center gap-2.5 text-2xs text-ink-3">
+      <div className="mb-1 grid grid-cols-[64px_minmax(80px,1fr)_72px] items-center gap-2.5 text-2xs text-muted-foreground">
         <span>剩余天数</span>
         <span className="text-center">各账号该批剩余</span>
         <b className="text-right font-semibold">剩余积分</b>
@@ -148,10 +174,10 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
           const total = row.credits || 1;
           return (
             <div key={row.days} className="grid min-h-[30px] grid-cols-[64px_minmax(80px,1fr)_72px] items-center gap-2.5 pr-0.5">
-              <span className="text-2xs text-ink-3">{row.days === 0 ? '已到期' : row.days + ' 天'}</span>
-              <div className="flex h-[9px] items-stretch gap-0.5 overflow-hidden rounded-[5px] bg-surface-2">
+              <span className="text-2xs text-muted-foreground">{row.days === 0 ? '已到期' : row.days + ' 天'}</span>
+              <div className="flex h-[9px] items-stretch gap-0.5 overflow-hidden rounded-[5px] bg-secondary">
                 {row.segments.map((segment, i) => {
-                  const color = colors.get(segment.uid) || 'var(--accent)';
+                  const color = colors.get(segment.uid) || 'var(--primary)';
                   const title =
                     segment.source +
                     '\n' +
@@ -181,8 +207,8 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
           );
         })}
       </div>
-      {legend.length ? <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-ink-3">{legend}</div> : null}
-      <div className="mt-2 border-t border-line-soft pt-2 text-2xs text-ink-3">{foot}</div>
+      {legend.length ? <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-muted-foreground">{legend}</div> : null}
+      <div className="mt-2 border-t border-border/60 pt-2 text-2xs text-muted-foreground">{foot}</div>
     </>
   );
 }
@@ -207,12 +233,12 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
       {list.map((a) => {
         if (a.error) {
           return (
-            <div key={a.uid} className="min-w-[200px] flex-1 rounded-inner border border-line-soft p-3">
+            <div key={a.uid} className="min-w-[200px] flex-1 rounded-lg border border-border/60 p-3">
               <div className="flex items-baseline gap-1.5">
-                <span className="text-sm font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
-                <span className="font-mono text-2xs text-ink-3">{a.realm || ''}</span>
+                <span className="truncate text-sm font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
+                <span className="font-mono text-2xs text-muted-foreground">{a.realm || ''}</span>
               </div>
-              <div className="mt-1 text-xs text-warn">查询失败：{a.error}</div>
+              <div className="mt-1 text-xs text-warning">查询失败：{a.error}</div>
             </div>
           );
         }
@@ -220,18 +246,24 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
         const total = Math.max(1, Number(a.size || 0));
         const expiry = pkAccountSegments(a, now);
         const expiryTotal = Math.max(1, expiry.reduce((s, x) => s + x.amount, 0));
-        const expiryColor = expiryColors.get(String(a.uid)) || 'var(--accent)';
+        const expiryColor = expiryColors.get(String(a.uid)) || 'var(--primary)';
         return (
-          <div key={a.uid} className="min-w-[200px] flex-1 rounded-inner border border-line-soft p-3">
-            <div className="mb-1.5 flex items-baseline gap-1.5">
-              <span className="text-sm font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
-              <span className="font-mono text-2xs text-ink-3">{a.realm || ''}</span>
+          <div key={a.uid} className="min-w-[200px] flex-1 rounded-lg border border-border/60 p-3">
+            <div className="mb-1.5 flex items-center gap-1.5">
+              <span className="truncate text-sm font-semibold" title={a.nickname || String(a.uid).slice(0, 8)}>
+                {a.nickname || String(a.uid).slice(0, 8)}
+              </span>
+              {a.realm ? (
+                <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">
+                  {a.realm}
+                </span>
+              ) : null}
             </div>
             <div className="font-mono text-2xl font-semibold tabular-nums">{fmtTok(a.remain)}</div>
-            <div className="mt-0.5 text-2xs text-ink-3">
+            <div className="mt-0.5 text-2xs text-muted-foreground">
               共 {fmtTok(a.size)} · {(a.packages || []).length} 个包 · 占最高 {((Number(a.remain || 0) / maxRemain) * 100).toFixed(0)}%
             </div>
-            <div className="mt-2 flex h-[7px] overflow-hidden rounded bg-surface-2">
+            <div className="mt-2 flex h-[7px] overflow-hidden rounded bg-secondary">
               {srcs.map((s, i) => (
                 <i
                   key={i}
@@ -242,7 +274,7 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
               ))}
             </div>
             {expiry.length ? (
-              <div className="mt-1.5 flex h-[5px] overflow-hidden rounded bg-surface-2">
+              <div className="mt-1.5 flex h-[5px] overflow-hidden rounded bg-secondary">
                 {expiry.map((s, i) => (
                   <i
                     key={i}
@@ -257,7 +289,7 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
                 ))}
               </div>
             ) : null}
-            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-2xs text-ink-3">
+            <div className="mt-2 flex flex-col gap-y-0.5 text-2xs text-muted-foreground">
               {srcs.map((s, i) => (
                 <Legend key={i} color={colorOf(s.key)}>
                   {s.name.replace(/^CodeBuddy/, '') + ' x' + s.n + ' · ' + fmtTok(s.size) + (s.minCreated ? ' · 首发 ' + s.minCreated.slice(5) : '')}
@@ -297,18 +329,20 @@ function DetailBox({
     const sub =
       (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') || (p.package_code || '').replace(/^TCACA_/, '');
     return (
-      <tr key={k + '-' + i}>
-        <RailCell style={{ background: colorOf(k) }} />
-        <Td>
+      <TableRow key={k + '-' + i}>
+        <TableCell className="w-[3px] p-0">
+          <span className="block h-full min-h-[36px] w-[3px]" style={{ background: colorOf(k) }} />
+        </TableCell>
+        <TableCell>
           {p.name || '(未命名)'}
-          {sub ? <div className="text-2xs text-ink-3">{sub}</div> : null}
-        </Td>
-        <Td className="text-right font-mono tabular-nums">{fmtTok(p.size)}</Td>
-        <Td className="text-right font-mono tabular-nums">{fmtTok(p.remain)}</Td>
-        <Td className="text-right font-mono tabular-nums">{fmtTok(p.used)}</Td>
-        <Td className="text-right font-mono tabular-nums">{(p.created_at || '').slice(0, 16).replace('T', ' ') || '—'}</Td>
-        <Td className="text-right font-mono tabular-nums">{(p.end_time || '').slice(0, 10) || '—'}</Td>
-      </tr>
+          {sub ? <div className="text-2xs text-muted-foreground">{sub}</div> : null}
+        </TableCell>
+        <TableCell className="text-right font-mono tabular-nums">{fmtTok(p.size)}</TableCell>
+        <TableCell className="text-right font-mono tabular-nums">{fmtTok(p.remain)}</TableCell>
+        <TableCell className="text-right font-mono tabular-nums">{fmtTok(p.used)}</TableCell>
+        <TableCell className="text-right font-mono tabular-nums">{(p.created_at || '').slice(0, 16).replace('T', ' ') || '—'}</TableCell>
+        <TableCell className="text-right font-mono tabular-nums">{(p.end_time || '').slice(0, 10) || '—'}</TableCell>
+      </TableRow>
     );
   };
 
@@ -329,67 +363,66 @@ function DetailBox({
   const used = groups.used.length ? groupSummary('used', groups.used.length, groups.usedSize, 0) : null;
 
   return (
-    <Box>
-      <BoxHeader>
-        <BoxTitle>
+    <Card className="mb-5">
+      <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardTitle>
           {a.nickname || String(a.uid).slice(0, 8)} · {a.realm || ''}
-        </BoxTitle>
-        <Grow />
-        <BoxNote>
+        </CardTitle>
+        <CardDescription>
           余额 {fmtTok(a.remain)} / 总额 {fmtTok(a.size)} · 可用 {groups.visible.length + groups.rest.length} 个包
           {groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : ''} · 默认展示最早到期 {pkDetailLimitValue(limit)} 条（{PK_SORT_LABELS[mode] || ''}）
-        </BoxNote>
-      </BoxHeader>
-      <TableWrap>
+        </CardDescription>
+      </CardHeader>
+      <div className="overflow-x-auto">
         <Table>
-          <thead>
-            <tr>
-              <Th className="w-[3px] p-0" aria-hidden />
-              <Th>包名 / 来源</Th>
-              <Th className="text-right">面额</Th>
-              <Th className="text-right">剩余</Th>
-              <Th className="text-right">已用</Th>
-              <Th className="text-right">发放</Th>
-              <Th className="text-right">到期</Th>
-            </tr>
-          </thead>
-          <tbody>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="w-[3px] p-0" aria-hidden />
+              <TableHead>包名 / 来源</TableHead>
+              <TableHead className="text-right">面额</TableHead>
+              <TableHead className="text-right">剩余</TableHead>
+              <TableHead className="text-right">已用</TableHead>
+              <TableHead className="text-right">发放</TableHead>
+              <TableHead className="text-right">到期</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {groups.visible.map(rowOf)}
             {rest ? (
               <>
-                <tr className="bg-surface-2">
-                  <Td colSpan={7}>
+                <TableRow className="bg-secondary">
+                  <TableCell colSpan={7}>
                     <button
                       type="button"
-                      className={cn('w-full py-1 text-left text-ink-2 hover:text-accent')}
+                      className="w-full py-1 text-left text-muted-foreground hover:text-foreground"
                       onClick={() => onToggle(rest.key)}
                     >
                       {rest.text}
                     </button>
-                  </Td>
-                </tr>
+                  </TableCell>
+                </TableRow>
                 {rest.on ? groups.rest.map(rowOf) : null}
               </>
             ) : null}
             {used ? (
               <>
-                <tr className="bg-surface-2">
-                  <Td colSpan={7}>
+                <TableRow className="bg-secondary">
+                  <TableCell colSpan={7}>
                     <button
                       type="button"
-                      className={cn('w-full py-1 text-left text-ink-2 hover:text-accent')}
+                      className="w-full py-1 text-left text-muted-foreground hover:text-foreground"
                       onClick={() => onToggle(used.key)}
                     >
                       {used.text}
                     </button>
-                  </Td>
-                </tr>
+                  </TableCell>
+                </TableRow>
                 {used.on ? groups.used.map(rowOf) : null}
               </>
             ) : null}
-          </tbody>
+          </TableBody>
         </Table>
-      </TableWrap>
-    </Box>
+      </div>
+    </Card>
   );
 }

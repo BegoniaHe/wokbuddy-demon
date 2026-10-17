@@ -4,76 +4,136 @@
    与 Tailwind 默认的 prefers-color-scheme 解耦，故自定义 dark 变体。 */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-/* 设计令牌：冷石墨基调（仪表盘语言，非营销页）。底色分层 + 单一靛蓝强调（仅交互），
-   语义色只给状态。等宽数字承载所有观测值。 */
+/* 设计令牌：极简中性基调。底色分层 + 单一蓝色强调（仅交互），
+   语义色只给状态。等宽数字承载所有观测值。
+   命名沿用 shadcn 标准 token（primary/background/card/muted/...），
+   值沿用本面板的极简配色。 */
 :root {
-  --bg: #0c0e14;
-  --surface: #14171f;
-  --surface-2: #1a1e28;
-  --raise: #202531;
-  --line: #262c3a;
-  --line-soft: #1e232e;
-  --ink: #e8ebf2;
-  --ink-2: #a8b0c2;
-  --ink-3: #6b7488;
-  --accent: #5b7cfa;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(91, 124, 250, 0.13);
-  --ok: #3ddc97;
-  --ok-soft: rgba(61, 220, 151, 0.12);
-  --warn: #f5b544;
-  --warn-soft: rgba(245, 181, 68, 0.12);
-  --bad: #f0655f;
-  --bad-soft: rgba(240, 101, 95, 0.12);
-  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  --radius: 6px;
+  --background: #fafafa;
+  --foreground: #18181b;
+  --card: #ffffff;
+  --card-foreground: #18181b;
+  --popover: #ffffff;
+  --popover-foreground: #18181b;
+  --primary: #2563eb;
+  --primary-foreground: #ffffff;
+  --secondary: #f4f4f5;
+  --secondary-foreground: #18181b;
+  --muted: #f4f4f5;
+  --muted-foreground: #52525b;
+  --accent: rgba(37, 99, 235, 0.08);
+  --accent-foreground: #2563eb;
+  --destructive: #dc2626;
+  --destructive-foreground: #ffffff;
+  --border: #e4e4e7;
+  --input: #e4e4e7;
+  --ring: #2563eb;
+  --success: #16a34a;
+  --success-foreground: #ffffff;
+  --warning: #d97706;
+  --warning-foreground: #ffffff;
+
+  /* 状态软底（tag / chip / 行级提示用） */
+  --success-soft: rgba(22, 163, 74, 0.09);
+  --warning-soft: rgba(217, 119, 6, 0.1);
+  --destructive-soft: rgba(220, 38, 38, 0.08);
+  --accent-soft: rgba(37, 99, 235, 0.08);
+
+  /* 分层与弱化 */
+  --surface-2: #f4f4f5;
+  --raise: #ffffff;
+  --line: #e4e4e7;
+  --line-soft: #efeff1;
+  --ink-2: #52525b;
+  --ink-3: #a1a1aa;
+
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.04);
 }
 
-[data-theme="light"] {
-  --bg: #f4f5f8;
-  --surface: #ffffff;
-  --surface-2: #f8f9fb;
-  --raise: #ffffff;
-  --line: #e2e5ec;
-  --line-soft: #eceef3;
-  --ink: #14171f;
-  --ink-2: #545c6e;
-  --ink-3: #8b93a5;
-  --accent: #3d5fe0;
-  --accent-ink: #ffffff;
-  --accent-soft: rgba(61, 95, 224, 0.09);
-  --ok: #0f9d63;
-  --ok-soft: rgba(15, 157, 99, 0.1);
-  --warn: #b47611;
-  --warn-soft: rgba(180, 118, 17, 0.11);
-  --bad: #cf3b34;
-  --bad-soft: rgba(207, 59, 52, 0.09);
-  --shadow: 0 1px 2px rgba(16, 20, 32, 0.06), 0 8px 24px -14px rgba(16, 20, 32, 0.14);
+[data-theme="dark"] {
+  --background: #09090b;
+  --foreground: #fafafa;
+  --card: #111113;
+  --card-foreground: #fafafa;
+  --popover: #111113;
+  --popover-foreground: #fafafa;
+  --primary: #3b82f6;
+  --primary-foreground: #ffffff;
+  --secondary: #18181b;
+  --secondary-foreground: #fafafa;
+  --muted: #18181b;
+  --muted-foreground: #a1a1aa;
+  --accent: rgba(59, 130, 246, 0.14);
+  --accent-foreground: #3b82f6;
+  --destructive: #f87171;
+  --destructive-foreground: #09090b;
+  --border: #27272a;
+  --input: #27272a;
+  --ring: #3b82f6;
+  --success: #4ade80;
+  --success-foreground: #09090b;
+  --warning: #fbbf24;
+  --warning-foreground: #09090b;
+
+  --success-soft: rgba(74, 222, 128, 0.12);
+  --warning-soft: rgba(251, 191, 36, 0.12);
+  --destructive-soft: rgba(248, 113, 113, 0.12);
+  --accent-soft: rgba(59, 130, 246, 0.14);
+
+  --surface-2: #18181b;
+  --raise: #1c1c1f;
+  --line: #27272a;
+  --line-soft: #1f1f22;
+  --ink-2: #a1a1aa;
+  --ink-3: #71717a;
+
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.3);
 }
 
 @theme inline {
-  --color-bg: var(--bg);
-  --color-surface: var(--surface);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+
+  --color-success-soft: var(--success-soft);
+  --color-warning-soft: var(--warning-soft);
+  --color-destructive-soft: var(--destructive-soft);
+  --color-accent-soft: var(--accent-soft);
+
   --color-surface-2: var(--surface-2);
   --color-raise: var(--raise);
   --color-line: var(--line);
   --color-line-soft: var(--line-soft);
-  --color-ink: var(--ink);
   --color-ink-2: var(--ink-2);
   --color-ink-3: var(--ink-3);
-  --color-accent: var(--accent);
-  --color-accent-ink: var(--accent-ink);
-  --color-accent-soft: var(--accent-soft);
-  --color-ok: var(--ok);
-  --color-ok-soft: var(--ok-soft);
-  --color-warn: var(--warn);
-  --color-warn-soft: var(--warn-soft);
-  --color-bad: var(--bad);
-  --color-bad-soft: var(--bad-soft);
+
   --font-mono: var(--mono);
   --font-sans: var(--sans);
-  --shadow-panel: var(--shadow);
+  --shadow-panel: var(--shadow-panel);
+  --radius-panel: var(--radius);
 
   /* 成套字号（密集仪表盘 6 档，替代散落的 text-[Npx]）：
      3xs 徽标 · 2xs 提示 · xs 次要 · sm 正文 UI · base 段落 · lg 小标题。 */
@@ -88,11 +148,6 @@
   --text-base--line-height: 1.55;
   --text-lg: 0.9375rem;
   --text-lg--line-height: 1.45;
-
-  /* 成套圆角：control 控件 · inner 内层卡片 · surface 面板/弹窗。 */
-  --radius-control: 6px;
-  --radius-inner: 8px;
-  --radius-surface: 12px;
 }
 
 html,
@@ -102,8 +157,8 @@ body,
 }
 
 body {
-  background: var(--bg);
-  color: var(--ink);
+  background: var(--background);
+  color: var(--foreground);
   font: 14px/1.55 var(--sans);
   -webkit-font-smoothing: antialiased;
 }
@@ -113,7 +168,7 @@ body {
 }
 
 :focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
   border-radius: 4px;
 }

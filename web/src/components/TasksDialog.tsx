@@ -3,9 +3,23 @@ import { api, postJSON } from '@/lib/api';
 import { AUTO_TASKS } from '@/lib/autoTasks';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
-import { Table, TableWrap, Td, Th, RailCell } from '@/components/ui/table';
-import { Tag } from '@/components/ui/field';
-import { Modal, ModalBody, ModalFooter, ModalHeader, ModalHint, ModalTitle } from '@/components/ui/dialog';
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table';
+import { Tag } from '@/components/ui-kit';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
 
 interface Task {
   task_code: string;
@@ -130,34 +144,33 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
   };
 
   return (
-    <Modal open={open} onOpenChange={(v) => !v && onClose()} width={940}>
-      <ModalHeader>
-        <ModalTitle>积分任务 {uid ? <span className="font-mono text-xs text-ink-3">{uid.slice(0, 16)}</span> : null}</ModalTitle>
-        <ModalHint>
-          查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。
-        </ModalHint>
-      </ModalHeader>
-      <ModalBody>
+    <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
+      <DialogContent className="max-w-3xl" showCloseButton={false}>
+        <DialogHeader>
+          <DialogTitle>积分任务 {uid ? <span className="font-mono text-xs text-muted-foreground">{uid.slice(0, 16)}</span> : null}</DialogTitle>
+          <DialogDescription>
+            查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。
+          </DialogDescription>
+        </DialogHeader>
         {isLoading ? (
-          <div className="text-sm text-ink-2">加载中…</div>
+          <p className="text-sm text-muted-foreground">加载中…</p>
         ) : error ? (
-          <div className="text-sm text-bad">{(error as Error).message}</div>
+          <p className="text-sm text-destructive">{(error as Error).message}</p>
         ) : tasks.length === 0 ? (
-          <div className="text-sm text-ink-2">该账号暂无任务</div>
+          <p className="text-sm text-muted-foreground">该账号暂无任务</p>
         ) : (
-          <TableWrap>
-            <Table className="min-w-[700px]">
-              <thead>
-                <tr>
-                  <Th className="w-[3px] p-0" aria-hidden />
-                  <Th>任务</Th>
-                  <Th>进度</Th>
-                  <Th>奖励</Th>
-                  <Th>状态</Th>
-                  <Th />
-                </tr>
-              </thead>
-              <tbody>
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>任务</TableHead>
+                  <TableHead>进度</TableHead>
+                  <TableHead>奖励</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {tasks.map((t) => {
                   const cur = t.current ?? 0;
                   const tgt = t.target ?? 0;
@@ -182,27 +195,26 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
                     .filter(Boolean)
                     .join('\n');
                   return (
-                    <tr key={t.task_code} title={tip}>
-                      <RailCell tone="ok" />
-                      <Td>
+                    <TableRow key={t.task_code} title={tip}>
+                      <TableCell>
                         <div className="font-medium">{t.title || t.task_code}</div>
-                        <div className="font-mono text-2xs text-ink-3">
+                        <div className="font-mono text-2xs text-muted-foreground">
                           {t.task_code}
                           {t.tag ? ' · ' + t.tag : ''}
                         </div>
-                      </Td>
-                      <Td className="font-mono tabular-nums">{prog}</Td>
-                      <Td className="font-mono tabular-nums">{reward}</Td>
-                      <Td>{badge}</Td>
-                      <Td className="text-right">
+                      </TableCell>
+                      <TableCell className="font-mono tabular-nums">{prog}</TableCell>
+                      <TableCell className="font-mono tabular-nums">{reward}</TableCell>
+                      <TableCell>{badge}</TableCell>
+                      <TableCell className="text-right">
                         {t.claimed || t.locked ? null : t.claimable ? (
-                          <Button size="xs" variant="primary" onClick={() => void act('claim', t.task_code)}>
+                          <Button size="xs" variant="default" onClick={() => void act('claim', t.task_code)}>
                             领取
                           </Button>
                         ) : AUTO_TASKS[t.task_code] ? (
                           <Button
                             size="xs"
-                            variant="primary"
+                            variant="default"
                             title={AUTO_TASKS[t.task_code]}
                             onClick={() => void act('auto', t.task_code)}
                           >
@@ -213,24 +225,23 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
                             接受
                           </Button>
                         )}
-                      </Td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   );
                 })}
-              </tbody>
+              </TableBody>
             </Table>
-          </TableWrap>
+          </div>
         )}
-      </ModalBody>
-      <ModalFooter>
-        <span className="flex-1" />
-        <Button onClick={() => void acceptAll()}>全部接受</Button>
-        <Button variant="primary" onClick={() => void autoAll()}>
-          一键完成可自动任务
-        </Button>
-        <Button onClick={() => void refetch()}>重新查询</Button>
-        <Button onClick={onClose}>关闭</Button>
-      </ModalFooter>
-    </Modal>
+        <DialogFooter>
+          <Button onClick={() => void acceptAll()}>全部接受</Button>
+          <Button variant="default" onClick={() => void autoAll()}>
+            一键完成可自动任务
+          </Button>
+          <Button onClick={() => void refetch()}>重新查询</Button>
+          <Button onClick={onClose}>关闭</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
