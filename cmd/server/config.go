@@ -249,8 +249,11 @@ type Config struct {
 	} `json:"upstash"`
 
 	Pool struct {
-		MaxInFlight        int    `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
-		MaxInFlightGlobal  int    `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		MaxInFlight       int `json:"max_in_flight"`        // 单账号最大在途请求数，0 = 不限
+		MaxInFlightGlobal int `json:"max_in_flight_global"` // global 域单账号在途上限（WAF 风控紧域压低并发），0 = 回落默认 2
+		// MaxInFlightTotal 网关级全局在途上限（issue #92）；0 = 不限（默认）。
+		// 满额时新请求 503，不进入选号。热生效。
+		MaxInFlightTotal   int    `json:"max_in_flight_total"`
 		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
@@ -864,6 +867,9 @@ func (c *Config) validateRanges() error {
 	}
 	if c.Server.MaxBodyBytes < 0 {
 		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）", c.Server.MaxBodyBytes)
+	}
+	if c.Pool.MaxInFlightTotal < 0 {
+		return fmt.Errorf("pool.max_in_flight_total: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlightTotal)
 	}
 	if c.SessionTTL < 0 {
 		return fmt.Errorf("session_sticky.ttl: 负时长 %q 无意义", c.SessionSticky.TTL)

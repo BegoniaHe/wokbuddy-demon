@@ -274,6 +274,40 @@ func assertPortrait(t *testing.T, st pool.Status) {
 	}
 }
 
+// TestGlobalInFlightLimit 全局在途满额时在选号前 503，不打上游（issue #92）。
+func TestGlobalInFlightLimit(t *testing.T) {
+	var calls int
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return 200, sseOK, true
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetMaxInFlight(0) // 不限单账号，隔离出全局上限
+	p.SetMaxInFlightTotal(1)
+	if !p.Acquire("u1") {
+		t.Fatal("seed acquire failed")
+	}
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	body := []byte(`{"model":"glm-5.2","messages":[]}`)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s want 503", rec.Code, rec.Body)
+	}
+	if calls != 0 {
+		t.Errorf("upstream calls=%d want 0", calls)
+	}
+	p.Release("u1")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("after release code=%d body=%s", rec.Code, rec.Body)
+	}
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1", calls)
+	}
+}
+
 // TestChatLargeBodyUnlimitedWhenZero server.max_body_bytes=0 时不限制：
 // 数 MB 的合法 body 完整读入并照常打上游。
 // TestChatRequestBodyLimit 超过 server.max_body_bytes 时返回 413，

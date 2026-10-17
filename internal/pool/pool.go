@@ -65,6 +65,11 @@ type Pool struct {
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
 	// WAF 风控更紧，压低并发）；0 = 未设置，回落 maxInFlight（不分档，零回归）。
 	maxInFlightGlobal int
+	// maxInFlightTotal 网关级全局在途上限（issue #92）；0 = 不限（保持现状）。
+	maxInFlightTotal int
+	// inFlightTotal 当前全局在途数（所有账号租约之和）。无论是否设上限都累加，
+	// 供面板观测与上限判定；Release 仅在账号名额真正减一时同步递减，保证幂等。
+	inFlightTotal atomic.Int64
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
@@ -260,6 +265,32 @@ func (p *Pool) SetMaxInFlightGlobal(n int) {
 	}
 }
 
+// SetMaxInFlightTotal 注入网关级全局在途上限（issue #92）；0 = 不限。
+// 负值保留原值。
+func (p *Pool) SetMaxInFlightTotal(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.maxInFlightTotal = n
+	}
+}
+
+// MaxInFlightTotal 返回全局在途上限（0 = 不限）。
+func (p *Pool) MaxInFlightTotal() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.maxInFlightTotal
+}
+
+// InFlightTotal 返回当前全局在途请求数。
+func (p *Pool) InFlightTotal() int { return int(p.inFlightTotal.Load()) }
+
+// GlobalInFlightFull 报告全局在途是否已达上限（上限 0 = 恒 false）。
+func (p *Pool) GlobalInFlightFull() bool {
+	limit := p.MaxInFlightTotal()
+	return limit > 0 && p.inFlightTotal.Load() >= int64(limit)
+}
+
 // inFlightLimit 报告账号的生效在途上限（global 分档优先，回落 maxInFlight）；
 // 0 = 不限。调用方需已持 p.mu（或快照过 limit，见 Acquire）。
 func (p *Pool) inFlightLimit(e *entry) int {
@@ -291,9 +322,49 @@ func (p *Pool) Acquire(uid string) bool {
 		return false
 	}
 	limit := p.inFlightLimit(e)
+	totalLimit := p.maxInFlightTotal
 	p.mu.RUnlock()
+
+	// 先占全局名额（issue #92）：即使未设上限也计数，供观测与后续热开上限判定。
+	if !p.acquireTotal(totalLimit) {
+		return false
+	}
+	if !p.acquireAccount(e, limit) {
+		p.releaseTotal()
+		return false
+	}
+	return true
+}
+
+// acquireTotal 占一个全局在途名额；limit>0 时满额返回 false。
+func (p *Pool) acquireTotal(limit int) bool {
+	for {
+		cur := p.inFlightTotal.Load()
+		if limit > 0 && cur >= int64(limit) {
+			return false
+		}
+		if p.inFlightTotal.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// releaseTotal 归还一个全局名额；钳到 0，避免重复释放把计数扣成负数。
+func (p *Pool) releaseTotal() {
+	for {
+		cur := p.inFlightTotal.Load()
+		if cur <= 0 {
+			return
+		}
+		if p.inFlightTotal.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+// acquireAccount 占账号名额；limit<=0 时只计数不拒绝。
+func (p *Pool) acquireAccount(e *entry, limit int) bool {
 	if limit <= 0 {
-		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
 		return true
 	}
@@ -322,6 +393,8 @@ func (p *Pool) Release(uid string) {
 			return
 		}
 		if e.inFlight.CompareAndSwap(cur, cur-1) {
+			// 只有账号名额真正减一时才减全局，重复 Release 不会侵占他人的名额。
+			p.releaseTotal()
 			return
 		}
 	}

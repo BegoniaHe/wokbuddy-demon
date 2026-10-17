@@ -251,6 +251,11 @@ export function ConfigView() {
               <FieldDescription>global 域风控更紧，默认 2</FieldDescription>
             </Field>
             <Field>
+              <FieldLabel>全局在途上限</FieldLabel>
+              {num('max_in_flight_total', { min: 0, placeholder: '0' })}
+              <FieldDescription>整个实例的总并发上限；0 = 不限。热生效</FieldDescription>
+            </Field>
+            <Field>
               <FieldLabel>连续失败熔断阈值</FieldLabel>
               {num('breaker_threshold', { min: 1, placeholder: '3' })}
             </Field>

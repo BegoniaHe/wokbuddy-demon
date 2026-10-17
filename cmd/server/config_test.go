@@ -849,6 +849,22 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	}
 }
 
+// TestMaxInFlightTotalConfig 全局在途上限默认 0（不限），负值 fail fast。
+func TestMaxInFlightTotalConfig(t *testing.T) {
+	c := Default()
+	if c.Pool.MaxInFlightTotal != 0 {
+		t.Errorf("default max_in_flight_total=%d want 0", c.Pool.MaxInFlightTotal)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	c = Default()
+	c.Pool.MaxInFlightTotal = -1
+	if err := c.normalize(); err == nil {
+		t.Error("negative max_in_flight_total should fail fast")
+	}
+}
+
 // TestServerReadTimeout 入站读取上限（issue #100）：空值回落默认 300s；
 // "0" = 显式不限制（0 是合法值不回落）；负值 fail fast（静默钳 0 会把保护悄悄关掉）。
 func TestServerReadTimeout(t *testing.T) {
