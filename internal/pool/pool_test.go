@@ -2059,6 +2059,27 @@ func TestResumeIdempotent(t *testing.T) {
 	}
 }
 
+func TestSetProxySlotPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	p := New(path)
+	p.Add(&auth.Auth{UID: "u1"})
+	if !p.SetProxySlot("u1", "residential") {
+		t.Fatal("set proxy slot failed")
+	}
+	if got := p.ProxySlotOf("u1"); got != "residential" {
+		t.Fatalf("slot=%q want residential", got)
+	}
+	p.Flush()
+	p2 := New(path)
+	e := p2.byUID["u1"]
+	if e == nil || e.proxySlot != "residential" {
+		t.Fatalf("reloaded entry=%+v want proxy_slot residential", e)
+	}
+	if !p2.SetProxySlot("u1", "") || p2.ProxySlotOf("u1") != "" {
+		t.Fatal("unbind failed")
+	}
+}
+
 func TestDailyLimitTokens(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})

@@ -169,6 +169,7 @@ export function AccountsView() {
                     s={s}
                     maxCred={Math.max(1, ...accounts.map((x) => x.credits || 0))}
                     dailyLimited={(data.daily_limited || []).includes(s.uid)}
+                    proxySlots={data.proxy_slots || []}
                     onOpenTasks={() => setTaskUID(s.uid)}
                     onDone={afterAction}
                   />
@@ -380,12 +381,14 @@ function AccountRow({
   s,
   maxCred,
   dailyLimited,
+  proxySlots,
   onOpenTasks,
   onDone,
 }: {
   s: Account;
   maxCred: number;
   dailyLimited: boolean;
+  proxySlots: { id: string; name: string }[];
   onOpenTasks: () => void;
   onDone: () => void;
 }) {
@@ -530,6 +533,21 @@ function AccountRow({
           {s.realm === 'global' ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">国际版</span> : null}
           {s.enterprise ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">企业版</span> : null}
           {dailyLimited ? <Tag tone="warn" title="已达每日限额，本地 0 点恢复">日限</Tag> : null}
+          {proxySlots.length ? (
+            <select
+              className="flex-none rounded-md border border-border bg-secondary px-1 py-px text-2xs text-muted-foreground"
+              title="出站代理槽"
+              value={s.proxy_slot || ''}
+              onChange={(e) => void bindProxySlot(s.uid, e.target.value, onDone)}
+            >
+              <option value="">默认出口</option>
+              {proxySlots.map((slot) => (
+                <option key={slot.id} value={slot.id}>
+                  {slot.name || slot.id}
+                </option>
+              ))}
+            </select>
+          ) : null}
         </div>
         <div className="mt-px truncate font-mono text-2xs text-muted-foreground">{short}</div>
       </TableCell>
@@ -743,4 +761,15 @@ function BatchButton({
       {running ? label + '中…' : label}
     </Button>
   );
+}
+
+// bindProxySlot 绑定账号的出站代理槽（issue #96）。
+async function bindProxySlot(uid: string, slot: string, onDone: () => void) {
+  try {
+    await postJSON('accounts/' + encodeURIComponent(uid) + '/proxy_slot', { slot });
+    toast(slot ? '已绑定代理槽' : '已恢复默认出口', 'ok');
+  } catch (e) {
+    toast('绑定失败：' + (e as Error).message, 'err');
+  }
+  onDone();
 }

@@ -367,6 +367,7 @@ claude
 | `upstream.rotate_budget` | `0` | 轮换总时长预算（如 `90s`）；`0` = 不限。与 `rotate_max` 先到先停 |
 | `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
 | `upstream.keepalive_interval` | `0` | 入站 SSE 主动心跳间隔（如 `15s`）；上游静默时写 `: keepalive` 注释帧。`0` = 关闭 |
+| `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
 | `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |

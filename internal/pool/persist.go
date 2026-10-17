@@ -151,6 +151,7 @@ func buildEntryFromState(uid string, s stateAccount, now time.Time) *entry {
 	}
 	e := &entry{
 		a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+		proxySlot:                s.ProxySlot,
 		credits:                  s.Credits,
 		creditsTotal:             s.CreditsTotal,
 		creditsExpiring:          s.CreditsExpiring,
@@ -325,6 +326,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 // 已过期的熔断/降权截止与模型级冷却/成本账本（过期不写）。
 func buildStateAccount(e *entry, now time.Time) stateAccount {
 	s := stateAccount{
+		ProxySlot:                e.proxySlot,
 		Credits:                  e.credits,
 		CreditsTotal:             e.creditsTotal,
 		Disabled:                 e.disabled,

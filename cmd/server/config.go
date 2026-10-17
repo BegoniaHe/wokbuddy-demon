@@ -211,6 +211,9 @@ type Config struct {
 		// RotateStatusCodes 非空时，HTTP 状态码错误仅这些码触发换号（如
 		// [429,500,502,503,504]）；空 = 维持现有按错误分类的换号语义（默认）。
 		RotateStatusCodes []int `json:"rotate_status_codes"`
+		// ProxySlots 命名出站代理槽（issue #96）：账号绑定后使用独立 Transport，
+		// 未绑定账号继续走 Proxies 全局池/直连。
+		ProxySlots []ProxySlot `json:"proxy_slots"`
 		// Proxies 出站代理列表（issue #15）：支持 http://、https://、socks5://
 		// （可选 user:pass）；非空时出站按健康轮换，失败代理进入冷却。空 = 直连（默认）。
 		Proxies []string `json:"proxies"`
@@ -329,6 +332,14 @@ type LimitRule struct {
 	DailyTokens      int64   `json:"daily_tokens"`
 	DailyCredits     float64 `json:"daily_credits"`
 	ModelDailyTokens int64   `json:"model_daily_tokens"`
+}
+
+// ProxySlot 命名出站代理槽（issue #96）。
+type ProxySlot struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Enabled bool   `json:"enabled"`
 }
 
 // ModelTimeout 单个模型的超时覆盖；空/0 = 回落全局值。
@@ -838,6 +849,22 @@ func (c *Config) normalizeProxies() error {
 	for _, raw := range c.Upstream.Proxies {
 		if _, err := outbound.ParseProxy(raw); err != nil {
 			return fmt.Errorf("upstream.proxies: %w", err)
+		}
+	}
+	seen := make(map[string]bool, len(c.Upstream.ProxySlots))
+	for i := range c.Upstream.ProxySlots {
+		slot := &c.Upstream.ProxySlots[i]
+		slot.ID = strings.TrimSpace(slot.ID)
+		slot.Name = strings.TrimSpace(slot.Name)
+		if slot.ID == "" {
+			return fmt.Errorf("upstream.proxy_slots[%d]: id 不能为空", i)
+		}
+		if seen[slot.ID] {
+			return fmt.Errorf("upstream.proxy_slots: id %q 重复", slot.ID)
+		}
+		seen[slot.ID] = true
+		if _, err := outbound.ParseProxy(slot.URL); err != nil {
+			return fmt.Errorf("upstream.proxy_slots[%s]: %w", slot.ID, err)
 		}
 	}
 	return nil

@@ -20,6 +20,7 @@ export interface AccountTokenUsage {
 }
 
 export interface Account {
+  proxy_slot?: string;
   uid: string;
   nickname?: string;
   realm?: string;
@@ -106,6 +107,7 @@ export interface Overview {
   max_in_flight_total?: number;
   daily_limited?: string[];
   daily_reset_at?: string;
+  proxy_slots?: { id: string; name: string }[];
   uptime_sec: number;
   accounts?: Account[];
   model_locks?: ModelLock[];

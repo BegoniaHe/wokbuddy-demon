@@ -50,6 +50,8 @@ type Config struct {
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
 	// nil 时配置页返回 501。
 	ConfigPath string
+	// ProxySlots 可供账号绑定的出站代理槽（issue #96）。
+	ProxySlots []ProxySlotInfo
 	LoadConfig func() (any, error)
 	// SaveConfig 校验并落盘配置，返回需要重启才能生效的字段列表；随后由 main 注入的
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
@@ -73,6 +75,12 @@ type Config struct {
 	// ProbeStateFile 面板主动探测（TTFT/成功失败历史）的状态文件（issue #110）。
 	// 与 ProbeFile 分离：不覆盖脚本生成的实测上限文件。空 = 探测可执行但不落盘。
 	ProbeStateFile string
+}
+
+// ProxySlotInfo 账号可绑定的代理槽展示信息。
+type ProxySlotInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -182,6 +190,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAuth(p.accountResume))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy_slot", p.withAuth(p.accountProxySlot))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
@@ -302,6 +311,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"max_in_flight_total": p.cfg.Pool.MaxInFlightTotal(),
 		"daily_limited":       p.cfg.Pool.DailyLimitedUIDs(),
 		"daily_reset_at":      nextLocalMidnight(),
+		"proxy_slots":         p.cfg.ProxySlots,
 		"accounts":            p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
@@ -546,6 +556,38 @@ func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 
 // accountRevive 手动复活：清禁用 + 冷却 + 熔断（运维口径无条件恢复）。
+// accountProxySlot 绑定/解绑账号的出站代理槽（issue #96）；空串 = 解绑。
+func (p *Panel) accountProxySlot(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Slot string `json:"slot"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	slot := strings.TrimSpace(body.Slot)
+	if slot != "" && !p.hasProxySlot(slot) {
+		writeErr(w, http.StatusBadRequest, "unknown proxy slot")
+		return
+	}
+	uid := r.PathValue("uid")
+	if !p.cfg.Pool.SetProxySlot(uid, slot) {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	log.Printf("panel: 账号 %s 绑定代理槽 %q", uid, slot)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (p *Panel) hasProxySlot(id string) bool {
+	for _, slot := range p.cfg.ProxySlots {
+		if slot.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	if _, ok := p.cfg.Pool.Status(uid); !ok {

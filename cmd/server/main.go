@@ -201,6 +201,7 @@ func main() {
 	p.SetModelRateOf(func(realm, model string) string { return up.ModelRate(realm, model) })
 
 	configureUpstream(cfg, up)
+	configureAccountRouting(p, up, cfg)
 
 	notifier := notify.New(notify.Config{URL: cfg.Notify.WebhookURL, Events: cfg.Notify.Events})
 	defer notifier.Close()
@@ -293,6 +294,7 @@ func main() {
 		ProbeFile:      stateSibling(cfg.StateFile, "output_probes.json"),
 		ProbeStateFile: stateSibling(cfg.StateFile, "model_probes.json"),
 		ConfigPath:     *cfgPath,
+		ProxySlots:     proxySlotInfos(cfg),
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
