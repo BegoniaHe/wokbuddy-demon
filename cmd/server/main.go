@@ -408,6 +408,13 @@ func configureUpstream(cfg *Config, up *upstream.Client) {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
+	// 按模型超时覆盖（issue #58）：装配期一次性注入，改后需重启。
+	if len(cfg.Upstream.ModelTimeouts) > 0 {
+		up.ModelTimeouts = make(map[string]upstream.ModelTimeout, len(cfg.Upstream.ModelTimeouts))
+		for name, spec := range cfg.Upstream.ModelTimeouts {
+			up.ModelTimeouts[name] = upstream.ModelTimeout{Header: spec.HeaderDur, Idle: spec.IdleDur}
+		}
+	}
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
@@ -650,7 +657,8 @@ func restartRequiredFields(c *Config) []string {
 	// 轮换策略（rotate_max/rotate_budget/rotate_status_codes，issue #17）同样在装配期
 	// 被 server handler 捕获，改后需重启。
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds",
-		"upstream.idle_timeout_seconds", "upstream.keepalive_interval", "upstream.user_agent",
+		"upstream.idle_timeout_seconds", "upstream.keepalive_interval", "upstream.model_timeouts",
+		"upstream.user_agent",
 		"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
 		"upstream.proxies")
 	if c.Upstash.URL != "" || c.Upstash.Token != "" {

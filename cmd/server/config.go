@@ -151,6 +151,10 @@ type Config struct {
 		// KeepaliveInterval 入站 SSE 主动心跳间隔（issue #54）：上游静默超过该时长
 		// 时向客户端写 ": keepalive" 注释帧，防反代空闲超时断流。"0"/空 = 关闭。
 		KeepaliveInterval string `json:"keepalive_interval"`
+		// ModelTimeouts 按模型覆盖聊天首字节/流中空闲超时（issue #58）：
+		// {"cn:glm-5.2": {"header": "300s", "idle": "600s"}}。键可带 realm 前缀，
+		// 未命中回落全局 header_timeout_seconds / idle_timeout_seconds。
+		ModelTimeouts map[string]ModelTimeout `json:"model_timeouts"`
 		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
@@ -267,6 +271,15 @@ type Config struct {
 	RotateBudgetDur time.Duration `json:"-"`
 	// KeepaliveIntervalDur 解析后的入站 SSE 心跳间隔（issue #54）；0 = 关闭。
 	KeepaliveIntervalDur time.Duration `json:"-"`
+}
+
+// ModelTimeout 单个模型的超时覆盖；空/0 = 回落全局值。
+type ModelTimeout struct {
+	Header string `json:"header"`
+	Idle   string `json:"idle"`
+	// 解析后（normalize 填充，不参与 JSON）。
+	HeaderDur time.Duration `json:"-"`
+	IdleDur   time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -787,7 +800,70 @@ func (c *Config) normalizeDurations() error {
 	if err := c.normalizeUpstreamKeepalive(); err != nil {
 		return err
 	}
+	if err := c.normalizeModelTimeouts(); err != nil {
+		return err
+	}
 	return c.normalizeExpiringDurations()
+}
+
+// normalizeModelTimeouts 校验并解析按模型超时（issue #58）：键去空白后不得为空；
+// header/idle 非空时必须是合法非负时长，至少配置一项。
+func (c *Config) normalizeModelTimeouts() error {
+	if len(c.Upstream.ModelTimeouts) == 0 {
+		return nil
+	}
+	out := make(map[string]ModelTimeout, len(c.Upstream.ModelTimeouts))
+	for key, spec := range c.Upstream.ModelTimeouts {
+		name := strings.TrimSpace(key)
+		if name == "" {
+			return errors.New("upstream.model_timeouts: 模型名不能为空")
+		}
+		parsed, err := parseModelTimeout(name, spec)
+		if err != nil {
+			return err
+		}
+		if _, dup := out[name]; dup {
+			return fmt.Errorf("upstream.model_timeouts: 模型 %q 去空白后重复", name)
+		}
+		out[name] = parsed
+	}
+	c.Upstream.ModelTimeouts = out
+	return nil
+}
+
+// parseModelTimeout 解析单个模型的 header/idle 覆盖。
+func parseModelTimeout(name string, spec ModelTimeout) (ModelTimeout, error) {
+	header, err := parseOptionalDuration("upstream.model_timeouts["+name+"].header", spec.Header)
+	if err != nil {
+		return ModelTimeout{}, err
+	}
+	idle, err := parseOptionalDuration("upstream.model_timeouts["+name+"].idle", spec.Idle)
+	if err != nil {
+		return ModelTimeout{}, err
+	}
+	if header == 0 && idle == 0 {
+		return ModelTimeout{}, fmt.Errorf("upstream.model_timeouts[%q]: header/idle 至少配置一项", name)
+	}
+	spec.Header = strings.TrimSpace(spec.Header)
+	spec.Idle = strings.TrimSpace(spec.Idle)
+	spec.HeaderDur = header
+	spec.IdleDur = idle
+	return spec, nil
+}
+
+// parseOptionalDuration 解析可空时长；空 = 0，负值报错。
+func parseOptionalDuration(field, raw string) (time.Duration, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s: 负时长 %q 无意义", field, raw)
+	}
+	return d, nil
 }
 
 // normalizeUpstreamRotate 解析轮换总时长预算（issue #17）：空 = "0"（不限）；
