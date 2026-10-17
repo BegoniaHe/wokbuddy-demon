@@ -32,7 +32,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		return src
 	}
 	var obj map[string]any
-	if err := json.Unmarshal(src, &obj); err != nil {
+	if err := json.Unmarshal(src, &obj); err != nil || obj == nil {
 		return src
 	}
 	obj["stream"] = true

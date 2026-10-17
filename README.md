@@ -183,6 +183,11 @@ go vet ./...
 go test ./...                      # 完整测试套件
 go run ./cmd/server -config config.json
 
+# 解析管线 fuzz（nightly CI 短跑；本地可调长时间）
+go test ./internal/upstream -run=^$ -fuzz=FuzzPrepareBodyOpt -fuzztime=30s
+go test ./internal/upstream -run=^$ -fuzz=FuzzNormalizeFrame -fuzztime=30s
+go test ./internal/upstream -run=^$ -fuzz=FuzzHandleStreamLine -fuzztime=30s
+
 # 仅当改动前端 web/ 时才需要（产物 internal/panel/dist 已提交）：
 make web                           # 构建前端（需 Bun）→ internal/panel/dist
 make web-check                     # 前端类型检查 + 单元测试
