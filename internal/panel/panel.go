@@ -988,16 +988,7 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 // 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Realm    string                   `json:"realm"`
-		Remain   int64                    `json:"remain"`
-		Size     int64                    `json:"size"`
-		Packages []upstream.CreditPackage `json:"packages"`
-		Error    string                   `json:"error,omitempty"`
-	}
-	out := make([]row, len(accts))
+	out := make([]packageAccountRow, len(accts))
 
 	sem := make(chan struct{}, 3)
 	var wg sync.WaitGroup
@@ -1008,7 +999,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			it := packageAccountRow{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
 			a := p.cfg.Pool.AuthByUID(s.UID)
 			if a == nil {
 				it.Error = "account not loaded"
@@ -1031,7 +1022,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "grants": creditGrants(out)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -1074,4 +1065,86 @@ func (p *Panel) pricingHandler(w http.ResponseWriter, r *http.Request) {
 		"prices":        snap.Prices,
 	})
 }
+// packageAccountRow packages 接口的逐账号行。
+type packageAccountRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Realm    string                   `json:"realm"`
+	Remain   int64                    `json:"remain"`
+	Size     int64                    `json:"size"`
+	Packages []upstream.CreditPackage `json:"packages"`
+	Error    string                   `json:"error,omitempty"`
+}
+
+// creditGrant 积分包获取历史的一行（issue #100，只读快照）。
+type creditGrant struct {
+	UID       string `json:"uid"`
+	Nickname  string `json:"nickname"`
+	Realm     string `json:"realm"`
+	Name      string `json:"name"`
+	Source    string `json:"source"`
+	Inferred  bool   `json:"inferred"`
+	Size      int64  `json:"size"`
+	Remain    int64  `json:"remain"`
+	CreatedAt string `json:"created_at,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty"`
+	Status    string `json:"status"`
+}
+
+// creditGrants 把全部账号的积分包摊平成获取历史，按发放时间倒序。
+func creditGrants(accounts []packageAccountRow) []creditGrant {
+	now := time.Now()
+	out := make([]creditGrant, 0)
+	for _, acct := range accounts {
+		for _, pkg := range acct.Packages {
+			source := inferGrantSource(pkg)
+			out = append(out, creditGrant{
+				UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm,
+				Name: pkg.Name, Source: source, Inferred: true,
+				Size: pkg.Size, Remain: pkg.Remain, CreatedAt: pkg.CreatedAt,
+				ExpiresAt: pkg.ExpiresAt, Status: grantStatus(pkg, now),
+			})
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	return out
+}
+
+// inferGrantSource 按包名/编码推断来源；上游没给来源字段，故明确标注推断。
+func inferGrantSource(pkg upstream.CreditPackage) string {
+	text := strings.ToLower(pkg.Name + " " + pkg.PackageCode + " " + pkg.SubProductName)
+	for _, rule := range grantSourceRules {
+		for _, needle := range rule.needles {
+			if strings.Contains(text, needle) {
+				return rule.source
+			}
+		}
+	}
+	if pkg.Size >= 1500 {
+		return "首次授权（按面额推断）"
+	}
+	return "未知"
+}
+
+var grantSourceRules = []struct {
+	source  string
+	needles []string
+}{
+	{"签到/连登", []string{"签到", "checkin", "streak"}},
+	{"活动奖励", []string{"活动", "运营", "裂变", "拉新"}},
+	{"首次授权", []string{"首登", "首次", "授权", "新手"}},
+}
+
+// grantStatus 按剩余量与到期时间归类；"生效中"无法从上游快照判断，不编造。
+func grantStatus(pkg upstream.CreditPackage, now time.Time) string {
+	if pkg.ExpiresAt > 0 && pkg.ExpiresAt < now.UnixMilli() {
+		return "已过期"
+	}
+	if pkg.Remain <= 0 {
+		return "已用完"
+	}
+	if pkg.ExpiresAt == 0 {
+		return "可用（不过期）"
+	}
+	return "可用"
 }

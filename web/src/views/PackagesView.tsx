@@ -65,7 +65,7 @@ export function PackagesView() {
 
   const pkgQ = useQuery({
     queryKey: ['packages'],
-    queryFn: () => api<{ accounts?: PkgAccount[] }>('packages'),
+    queryFn: () => api<{ accounts?: PkgAccount[]; grants?: Grant[] }>('packages'),
     staleTime: 2 * 60 * 1000,
   });
   const cfgQ = useQuery({
@@ -101,6 +101,20 @@ export function PackagesView() {
         </CardHeader>
         <CardContent>
           <ExpiryDistribution list={list} now={now} />
+        </CardContent>
+      </Card>
+
+      <Card className="mb-5">
+        <CardHeader className="flex-row flex-wrap items-center gap-3">
+          <CardTitle>获取历史</CardTitle>
+          <CardAction>
+            <CardDescription>
+              {(pkgQ.data?.grants || []).length} 笔 · 快照 {new Date(pkgQ.dataUpdatedAt).toLocaleString()}
+            </CardDescription>
+          </CardAction>
+        </CardHeader>
+        <CardContent>
+          <GrantHistory grants={pkgQ.data?.grants || []} />
         </CardContent>
       </Card>
 
@@ -436,5 +450,65 @@ function DetailBox({
         </Table>
       </div>
     </Card>
+  );
+}
+
+type Grant = {
+  uid: string;
+  nickname?: string;
+  realm?: string;
+  name?: string;
+  source?: string;
+  inferred?: boolean;
+  size?: number;
+  remain?: number;
+  created_at?: string;
+  expires_at?: number;
+  status?: string;
+};
+
+// GrantHistory 只读积分包获取历史（issue #100），数据来自现有积分包快照。
+function GrantHistory({ grants }: { grants: Grant[] }) {
+  if (!grants.length) return <p className="text-sm text-muted-foreground">暂无积分包数据。</p>;
+  return (
+    <div className="overflow-x-auto">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>发放时间</TableHead>
+            <TableHead>账号</TableHead>
+            <TableHead>realm</TableHead>
+            <TableHead>名称</TableHead>
+            <TableHead>来源</TableHead>
+            <TableHead className="text-right">面额</TableHead>
+            <TableHead className="text-right">剩余</TableHead>
+            <TableHead>到期</TableHead>
+            <TableHead>状态</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {grants.map((g, i) => (
+            <TableRow key={g.uid + '|' + (g.name || '') + '|' + (g.created_at || '') + '|' + i}>
+              <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                {g.created_at ? g.created_at.replace('T', ' ').slice(0, 16) : '—'}
+              </TableCell>
+              <TableCell>{g.nickname || g.uid.slice(0, 8)}</TableCell>
+              <TableCell className="text-muted-foreground">{g.realm || '—'}</TableCell>
+              <TableCell>{g.name || '—'}</TableCell>
+              <TableCell>
+                {g.source || '未知'}
+                {g.inferred ? <span className="ml-1 text-2xs text-muted-foreground">推断</span> : null}
+              </TableCell>
+              <TableCell className="text-right tabular-nums">{fmtTok(g.size || 0)}</TableCell>
+              <TableCell className="text-right tabular-nums">{fmtTok(g.remain || 0)}</TableCell>
+              <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                {g.expires_at ? new Date(g.expires_at).toLocaleDateString() : '不过期'}
+              </TableCell>
+              <TableCell className="text-xs">{g.status || '—'}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </div>
   );
 }
