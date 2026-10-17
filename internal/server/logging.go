@@ -70,6 +70,8 @@ type chatStat struct {
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
 	clientIP  string
 	userAgent string
+	// decision 可选选号决策链（logging.decision_trace）；nil = 未启用/未采样。
+	decision *reqlog.DecisionTrace
 
 	logged bool
 }
@@ -440,6 +442,9 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
+	if t.stat != nil {
+		e.Decision = t.stat.decision
+	}
 	if e.Outcome == "" {
 		if status >= 200 && status < 300 {
 			e.Outcome = reqlog.OutcomeSuccess

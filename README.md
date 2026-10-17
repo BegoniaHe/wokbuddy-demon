@@ -313,6 +313,8 @@ claude
 | `state_file` | `./data/state.json` | 账号管家状态持久化文件 |
 | `logging.request_archive_enabled` | `true` | 请求元数据归档开关 |
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
+| `logging.decision_trace` | `false` | 请求归档记录选号决策链（候选/排除原因/成本层/Top-N/轮换） |
+| `logging.decision_trace_sample` | `0.1` | 决策链采样率：0/1 = 全部，0<v<1 按比例。改后需重启 |
 | `notify.webhook_url` | 空 | 告警 webhook（http/https）；空 = 关闭 |
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |

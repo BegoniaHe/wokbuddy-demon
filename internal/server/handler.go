@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -95,6 +96,10 @@ type Config struct {
 
 	// RequestLog 请求指标与脱敏 JSONL 归档（可选；nil = 不记录）。
 	RequestLog *reqlog.Recorder
+
+	// DecisionTrace / DecisionTraceSample 选号决策链记录开关与采样率（issue #63）。
+	DecisionTrace       bool
+	DecisionTraceSample float64
 
 	// RecordClientInfo 是否在请求日志里记录调用来源（客户端 IP / User-Agent）。
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
@@ -799,6 +804,7 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), in.body, in.stream)
+	st.decision = h.sampleDecisionTrace()
 	if in.trace != nil {
 		in.trace.stat = st
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
@@ -953,6 +959,7 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 			// 重试、并非换号 → rotateReason 保持空，跳过计数。
 			if f.rotateReason != "" {
 				f.h.metrics.incRotation(f.rotateReason)
+				f.recordRotation()
 			}
 		case rotDone:
 			return true
@@ -961,6 +968,14 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 		}
 	}
 	return false
+}
+
+// recordRotation 把轮换原因写入决策链（上限 8 条）。
+func (f *chatFlow) recordRotation() {
+	if f.st.decision == nil || len(f.st.decision.Rotations) >= 8 {
+		return
+	}
+	f.st.decision.Rotations = append(f.st.decision.Rotations, f.rotateReason)
 }
 
 // attempt 执行一次「选号 → 占名额 → 刷新 token → 转发」尝试，返回控制流去向。
@@ -1014,13 +1029,56 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 	if f.stickyUID != "" {
 		acct := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel)
 		if acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
+			if f.st.decision != nil {
+				f.st.decision.StickyHit = true
+				f.st.decision.FinalUID = logfmt.UID8(acct.UID)
+			}
 			return acct
 		}
 		// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 →
 		// 解绑，本次回落普通轮换。
 		f.unbindSticky()
 	}
+	if f.st.decision != nil {
+		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(f.tried, f.bareModel, f.realm)
+		mergePickTrace(f.st.decision, trace)
+		return acct
+	}
 	return f.h.cfg.Pool.PickExcludingForRealm(f.tried, f.bareModel, f.realm)
+}
+
+// sampleDecisionTrace 按开关与采样率决定本次是否记录决策链。
+func (h *Handler) sampleDecisionTrace() *reqlog.DecisionTrace {
+	if !h.cfg.DecisionTrace {
+		return nil
+	}
+	sample := h.cfg.DecisionTraceSample
+	if sample > 0 && sample < 1 && rand.Float64() >= sample {
+		return nil
+	}
+	return &reqlog.DecisionTrace{}
+}
+
+// mergePickTrace 把 pool 决策快照并入请求级决策链（Top 覆盖为最近一次尝试）。
+func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
+	dst.Candidates += src.Candidates
+	if dst.Excluded == nil {
+		dst.Excluded = map[string]int{}
+	}
+	for reason, n := range src.Excluded {
+		dst.Excluded[reason] += n
+	}
+	dst.CostTier = src.CostTier
+	dst.Explored = dst.Explored || src.Explored
+	if len(src.Top) > 0 {
+		dst.Top = make([]reqlog.DecisionCandidate, 0, len(src.Top))
+		for _, c := range src.Top {
+			dst.Top = append(dst.Top, reqlog.DecisionCandidate{UID: c.UID, Weight: c.Weight, Tier: c.Tier})
+		}
+	}
+	if src.FinalUID != "" {
+		dst.FinalUID = src.FinalUID
+	}
 }
 
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，

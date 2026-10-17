@@ -44,19 +44,60 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
 // 拆成「收集候选 → 定成本层 → 排序 → 选号」四段，各段独立可读。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pickTraceWith(tried, reqModel, realm, nil)
+}
+
+// PickTrace 一次选号的决策快照（issue #63）：字段有界，不含凭证/提示词。
+type PickTrace struct {
+	Candidates int             `json:"candidates"`
+	Excluded   map[string]int  `json:"excluded,omitempty"`
+	CostTier   int             `json:"cost_tier"`
+	Explored   bool            `json:"explored,omitempty"`
+	Top        []PickCandidate `json:"top,omitempty"`
+	FinalUID   string          `json:"final_uid,omitempty"`
+}
+
+// PickCandidate Top-N 候选的权重快照（uid8 + 权重 + 成本层）。
+type PickCandidate struct {
+	UID    string  `json:"uid"`
+	Weight float64 `json:"weight"`
+	Tier   int     `json:"tier"`
+}
+
+// PickExcludingForRealmTrace 同 PickExcludingForRealm，并返回决策链快照（issue #63）。
+func (p *Pool) PickExcludingForRealmTrace(tried map[string]bool, reqModel, realm string) (*auth.Auth, PickTrace) {
+	trace := PickTrace{Excluded: map[string]int{}}
+	acct := p.pickTraceWith(tried, reqModel, realm, &trace)
+	return acct, trace
+}
+
+// pickTraceWith 选号并收集决策链；trace=nil 时不分配排除原因 map（常规热路径）。
+func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trace *PickTrace) *auth.Auth {
+	var local PickTrace
+	if trace == nil {
+		trace = &local
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
-	cands := p.pickCandidates(tried, reqModel, realm, now)
+	cands := p.pickCandidates(tried, reqModel, realm, now, trace)
+	trace.Candidates = len(cands)
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+		acct := p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+		if acct != nil {
+			trace.FinalUID = logfmt.UID8(acct.UID)
+		}
+		return acct
 	}
 	maxCredits := maxCreditsOf(cands)
 	bestTier, explored := p.resolveCostTier(cands, reqModel, realm, now)
+	trace.CostTier, trace.Explored = bestTier, explored
 	ordered, top := p.rankCandidates(cands, reqModel, bestTier, maxCredits, now)
+	trace.Top = topTrace(top, reqModel, now, p, maxCredits)
 	e := p.selectCandidate(ordered, top, reqModel, now)
+	trace.FinalUID = logfmt.UID8(e.a.UID)
 	if explored {
 		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
 		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
@@ -70,13 +111,35 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	return e.a
 }
 
+// topTrace 截取 Top-N 候选的权重快照（最多 5 条）。
+func topTrace(top []*entry, model string, now time.Time, p *Pool, maxCredits int64) []PickCandidate {
+	if len(top) == 0 {
+		return nil
+	}
+	limit := len(top)
+	if limit > 5 {
+		limit = 5
+	}
+	out := make([]PickCandidate, 0, limit)
+	for _, e := range top[:limit] {
+		tier, _ := e.costTier(model, now)
+		out = append(out, PickCandidate{
+			UID:    logfmt.UID8(e.a.UID),
+			Weight: p.routingWeightOf(e, maxCredits, model, now),
+			Tier:   tier,
+		})
+	}
+	return out
+}
+
 // pickCandidates 收集本次 pick 的 healthy 候选：跳过 tried、惰性清理过期模型级
 // 冷却/成本台账、按模型与域判定健康、应用积分保底拦截与在途占满过滤。
 // 调用方必须已持有 p.mu 写锁。
-func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now time.Time) []*entry {
+func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace) []*entry {
 	var cands []*entry
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
+			trace.addExcluded("tried")
 			continue
 		}
 		// 惰性清理过期的模型级冷却与成本台账（两者的 map 都不无限膨胀；
@@ -84,30 +147,41 @@ func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now
 		e.pruneExpiredModelCooldowns(now)
 		e.pruneExpiredModelCosts(now)
 		e.pruneExpiredHealth(now)
-		if !e.healthyInRealm(now, reqModel, realm) {
+		if reason := p.excludeReason(e, reqModel, realm, now); reason != "" {
+			trace.addExcluded(reason)
 			continue
-		}
-		if p.floorBlockedForRealmModel(e, reqModel, realm, now) {
-			continue // 积分保底：触底号不接实测收费模型（tier 0/1 不受限）
-		}
-		if p.inFlightFull(e) {
-			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
 		cands = append(cands, e)
 	}
 	return cands
 }
 
-// healthyInRealm 报告账号在指定域与请求模型下是否可选：realm 非空时叠加域过滤，
-// reqModel 非空时用 healthyForModel（模型级冷却豁免），否则用账号级 healthy。
-func (e *entry) healthyInRealm(now time.Time, reqModel, realm string) bool {
+// excludeReason 返回账号被排除的原因（空 = 入选）；供决策链统计。
+func (p *Pool) excludeReason(e *entry, reqModel, realm string, now time.Time) string {
 	if realm != "" && e.a.Realm() != realm {
-		return false
+		return "realm"
 	}
-	if reqModel != "" {
-		return e.healthyForModel(now, reqModel)
+	if reqModel != "" && e.modelCooled(now, reqModel) {
+		return "model_cooldown"
 	}
-	return e.healthy(now)
+	if !e.healthy(now) {
+		return "cooling"
+	}
+	if p.floorBlockedForRealmModel(e, reqModel, realm, now) {
+		return "credit_floor"
+	}
+	if p.inFlightFull(e) {
+		return "in_flight_full"
+	}
+	return ""
+}
+
+// addExcluded 累加一种排除原因（nil/空 trace 安全）。
+func (t *PickTrace) addExcluded(reason string) {
+	if t == nil || t.Excluded == nil {
+		return
+	}
+	t.Excluded[reason]++
 }
 
 // maxCreditsOf 返回候选集中的最大 credits（权重归一基准）。

@@ -45,6 +45,10 @@ type Config struct {
 		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
 		// 热生效（经 livecfg 快照），无需重启。
 		RequestClientInfo bool `json:"request_client_info"`
+		// DecisionTrace 是否在请求归档里记录选号决策链（issue #63）；默认 false。
+		DecisionTrace bool `json:"decision_trace"`
+		// DecisionTraceSample 采样率：0 或 1 = 全部，0<v<1 按比例采样；>1 报错。
+		DecisionTraceSample float64 `json:"decision_trace_sample"`
 	} `json:"logging"`
 
 	Notify struct {
@@ -304,6 +308,8 @@ func Default() *Config {
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	c.Logging.RequestClientInfo = true
+	// 与 README / config.example.json 对齐：开启决策链时默认只采样 10%，避免归档写入量突增。
+	c.Logging.DecisionTraceSample = 0.1
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -561,6 +567,9 @@ func (c *Config) normalize() error {
 	if err := c.normalizeCheckinDelay(); err != nil {
 		return err
 	}
+	if err := c.normalizeLogging(); err != nil {
+		return err
+	}
 	if err := c.normalizeSchedule(); err != nil {
 		return err
 	}
@@ -648,6 +657,14 @@ func (c *Config) normalizeNotify() error {
 		events = append(events, name)
 	}
 	c.Notify.Events = events
+	return nil
+}
+
+// normalizeLogging 校验决策链采样率（issue #63）：0/1 = 全部，0<v<1 采样，>1 报错。
+func (c *Config) normalizeLogging() error {
+	if c.Logging.DecisionTraceSample < 0 || c.Logging.DecisionTraceSample > 1 {
+		return fmt.Errorf("logging.decision_trace_sample: 必须在 [0,1]，当前 %v", c.Logging.DecisionTraceSample)
+	}
 	return nil
 }
 
