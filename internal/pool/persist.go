@@ -128,20 +128,25 @@ func (p *Pool) startFlusher() {
 	}()
 }
 
-// Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
+// Flush 同步把内存状态落盘（幂等：无变更且无在途快照时不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
 	p.mu.Lock()
 	pending := p.dirty.Swap(false)
+	// dirty 为 false 仍可能有一个由 flusher 生成、尚未落盘的快照：
+	// 此时必须补写一份最新快照，否则进程紧接着退出会丢掉最后一笔状态。
+	// stateFp 为空 = 不落盘，persistState 直接返回，无需补写。
+	unsaved := p.stateFp != "" && p.persistSeq > p.savedSeq.Load()
+	needPersist := pending || unsaved
 
 	var seq uint64
 
 	var stateSnap stateFile
-	if pending {
+	if needPersist {
 		seq, stateSnap = p.snapshotStateLocked()
 	}
 	p.mu.Unlock()
 
-	if pending {
+	if needPersist {
 		p.persistState(seq, stateSnap)
 	}
 }
@@ -322,7 +327,7 @@ func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 	p.persistMu.Lock()
 	defer p.persistMu.Unlock()
 
-	if seq <= p.savedSeq {
+	if seq <= p.savedSeq.Load() {
 		return
 	}
 
@@ -347,7 +352,7 @@ func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 		return
 	}
 
-	p.savedSeq = seq
+	p.savedSeq.Store(seq)
 
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。

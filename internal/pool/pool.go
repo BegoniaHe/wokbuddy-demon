@@ -92,10 +92,11 @@ type Pool struct {
 	// persistMu 串行化锁外落盘（marshal / 写 tmp / rename / Redis 镜像）。
 	// p.mu 只负责生成一致快照，磁盘 IO 不再占用选号写锁。
 	persistMu sync.Mutex
-	// persistSeq/savedSeq 快照序号：persistSeq 在 p.mu 写锁内自增，savedSeq 在
-	// persistMu 内更新。并发落盘时旧快照不得覆盖已落盘的新快照。
+	// persistSeq/savedSeq 快照序号：persistSeq 在 p.mu 写锁内自增，savedSeq 由
+	// persistMu 串行更新（atomic 供 Flush 在 p.mu 内判断是否还有未落盘快照）。
+	// 并发落盘时旧快照不得覆盖已落盘的新快照。
 	persistSeq uint64
-	savedSeq   uint64
+	savedSeq   atomic.Uint64
 	// pickCands/pickWeightBuf/pickWeights/pickOrdered/pickEligible 选号中间切片（仅 p.mu 写锁内
 	// 使用，天然串行）。复用避免每次 Pick 为候选/排序/抽签各分配一次。
 	pickCands     []*entry
