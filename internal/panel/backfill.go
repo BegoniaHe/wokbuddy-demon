@@ -55,7 +55,7 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 		rows, records, err := p.backfillAccount(a, uid, start, end)
 		if err != nil {
 			failures[uid] = err.Error()
-			log.Printf("WARN: [panel] usage backfill %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+			log.Printf("WARN: [panel] usage backfill %s: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 			continue
 		}
 		totalRecords += records

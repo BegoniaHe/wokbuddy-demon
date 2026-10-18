@@ -83,8 +83,8 @@ func (s *Scheduler) travelAll() (total, success, failure int) {
 func (s *Scheduler) travelOne(a *auth.Auth) bool {
 	buddy, err := s.cfg.Upstream.BuddyInfo(a)
 	if err != nil {
-		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
-		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
+		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+		s.notifyTaskFailed("travel", a.UID, a.NicknameValue(), a.Realm())
 		return false
 	}
 	if buddy == nil {
@@ -92,8 +92,8 @@ func (s *Scheduler) travelOne(a *auth.Auth) bool {
 	}
 	ts, err := s.cfg.Upstream.TravelStatus(a)
 	if err != nil {
-		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.Nickname), err)
-		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
+		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+		s.notifyTaskFailed("travel", a.UID, a.NicknameValue(), a.Realm())
 		return false
 	}
 	switch ts.State {
@@ -102,10 +102,10 @@ func (s *Scheduler) travelOne(a *auth.Auth) bool {
 	case travelStateIdle:
 		return s.travelDepart(a, ts)
 	case travelStateTraveling:
-		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.Nickname), ts.RecordID)
+		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID)
 		return true
 	default:
-		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.Nickname), ts.State)
+		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(a.UID, a.NicknameValue()), ts.State)
 		return true
 	}
 }
@@ -113,31 +113,31 @@ func (s *Scheduler) travelOne(a *auth.Auth) bool {
 // travelDepart 空闲且未达当日上限时派出（每日 1 次，自然日 00:00 CST 重置）。
 func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) bool {
 	if ts.DailyLimitReached {
-		log.Printf("travel %s: skip (daily limit reached)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: skip (daily limit reached)", logfmt.Label(a.UID, a.NicknameValue()))
 		return true
 	}
 	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
-		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.Nickname), err)
-		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
+		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+		s.notifyTaskFailed("travel", a.UID, a.NicknameValue(), a.Realm())
 		return false
 	}
-	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.Nickname), travelLocationID)
+	log.Printf("travel %s: depart ok location=%d", logfmt.Label(a.UID, a.NicknameValue()), travelLocationID)
 	return true
 }
 
 // travelClaim 到站领奖（必须带 record_id）。
 func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) bool {
 	if ts.RecordID == 0 {
-		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.NicknameValue()))
 		return true
 	}
 	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
 	if err != nil {
-		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
-		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
+		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID, err)
+		s.notifyTaskFailed("travel", a.UID, a.NicknameValue(), a.Realm())
 		return false
 	}
-	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.Nickname), ts.RecordID, reward)
+	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(a.UID, a.NicknameValue()), ts.RecordID, reward)
 	return true
 }
 
@@ -154,27 +154,27 @@ func (s *Scheduler) travelAdopt(a *auth.Auth) bool {
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
 	if err := s.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
-		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 	} else {
 		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）
 	}
 	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
-		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.Nickname), err)
-		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
+		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+		s.notifyTaskFailed("travel", a.UID, a.NicknameValue(), a.Realm())
 		return false
 	}
 	err := s.cfg.Upstream.BuddyFirst(a)
 	switch {
 	case err == nil:
-		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.NicknameValue()))
 		return true
 	case upstream.IsBuddyTaskIncomplete(err):
 		s.markAdoptTried(a.UID)
-		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("travel %s: adopt skipped (conversation threshold not reached, retry tomorrow)", logfmt.Label(a.UID, a.NicknameValue()))
 		return true
 	default:
-		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.Nickname), err)
-		s.notifyTaskFailed("travel", a.UID, a.Nickname, a.Realm())
+		log.Printf("travel %s: adopt: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+		s.notifyTaskFailed("travel", a.UID, a.NicknameValue(), a.Realm())
 		return false
 	}
 }

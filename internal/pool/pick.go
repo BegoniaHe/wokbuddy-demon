@@ -107,7 +107,7 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
 		// 常规路径）。
 		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
-			reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+			reqModel, realm, logfmt.Label(e.a.UID, e.a.NicknameValue()), p.costExploreInterval)
 	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
@@ -535,7 +535,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		return nil
 	}
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s",
-		logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+		logfmt.Label(best.a.UID, best.a.NicknameValue()), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = p.now()
 	// 单飞探针（issue #116 P0-3）：刚解封账号只允许一个兜底请求先试探，其余并发
 	// 在 probeWindow 内直接失败，避免二次踩爆。

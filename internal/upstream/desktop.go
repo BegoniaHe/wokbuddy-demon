@@ -102,8 +102,8 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
 		"userId":       a.UID,
-		"username":     a.Nickname,
-		"userNickname": a.Nickname,
+		"username":     a.NicknameValue(),
+		"userNickname": a.NicknameValue(),
 		"product":      "SaaS",
 		"releaseDate":  b.releaseDate,
 		"commit":       b.commit,
@@ -309,7 +309,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": ua,
 		"machineId": deriveID(a, "webmachine"), "userId": a.UID,
-		"userNickname": a.Nickname, "enterpriseId": a.EnterpriseID,
+		"userNickname": a.NicknameValue(), "enterpriseId": a.EnterpriseID,
 	}
 	raw, err := json.Marshal([]map[string]any{ev})
 	if err != nil {

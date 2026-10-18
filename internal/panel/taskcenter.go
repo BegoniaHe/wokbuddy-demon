@@ -71,7 +71,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a == nil {
 				return
 			}
-			items[i].UID, items[i].Nickname = uid, a.Nickname
+			items[i].UID, items[i].Nickname = uid, a.NicknameValue()
 			items[i].Growth, items[i].GrowthErr = p.scanAccountGrowth(a)
 		}(i, st.UID)
 	}
@@ -216,7 +216,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	var items []queueItem
 	for _, one := range accts {
 		for _, t := range one.grow {
-			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode, Status: "pending"})
+			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.NicknameValue(), Kind: "growth", Code: t.TaskCode, Status: "pending"})
 		}
 	}
 	if len(items) == 0 {
@@ -508,7 +508,7 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			it := row{UID: a.UID, Nickname: a.Nickname}
+			it := row{UID: a.UID, Nickname: a.NicknameValue()}
 			switch {
 			case a.IsGlobal():
 				it.Err = "global realm（无开学季活动）"
