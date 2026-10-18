@@ -338,10 +338,17 @@ claude
 | `wokbuddy_tokens_total{model,kind}` | counter | 按模型与类别的 Token 数（`kind` = `prompt` / `completion` / `total`） |
 | `wokbuddy_request_duration_seconds{result}` | histogram | 上游尝试耗时（秒），按成功/失败分流（`result` = `ok` / `error`） |
 | `wokbuddy_upstream_rotations_total{reason}` | counter | 上游换号次数（`reason` 为触发分类；degrade 同号重试不计入） |
+| `wokbuddy_pool_in_flight` | gauge | 当前全局在途上游请求数（所有账号租约之和） |
+| `wokbuddy_pool_cooling` | gauge | 冷却中或熔断中的账号数 |
+| `wokbuddy_model_ttft_ms{model}` | gauge | 按模型聚合的账号 TTFT EWMA 均值（ms）；只统计最近 30 分钟有观测的条目 |
 
 `result` 口径：`ok` 表示本次上游尝试**拿到了 `usage`**（与面板用量账本同源），并非 HTTP 成功。客户端显式设置 `stream_options.include_usage=false` 时，即便 200 成功响应也会因无 usage 计入 `error`。
 
-账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram 与换号计数为进程内生命周期，重启清零。鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
+账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram、换号计数与路由熔断为进程内生命周期，重启清零。
+
+同一 `(realm, model)` 在 60 秒内出现 3 次模型级失败（11102 / 6004）后，整条路由冷却 5 分钟；期间选号直接返回不可用（`503`，可带 `Retry-After`），不再逐号重试消耗配额。任一账号在该组合上成功即立即清除。
+
+鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
 
 ## 配置说明
 

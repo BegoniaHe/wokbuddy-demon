@@ -3,6 +3,7 @@ package pool
 
 import (
 	"sort"
+	"time"
 )
 
 // expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例权重。
@@ -44,6 +45,14 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := p.now()
+	if p.routeCoolingLocked(realm, model, now) {
+		return nil
+	}
+	return p.weightedAvailableLocked(model, realm, now)
+}
+
+// weightedAvailableLocked 过滤可用账号并按快过期实例数展开；调用方需已持 p.mu。
+func (p *Pool) weightedAvailableLocked(model, realm string, now time.Time) []string {
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {

@@ -639,7 +639,7 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
 
 	for i := 1; i <= 3; i++ {
-		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", nil)
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, "", "", "", nil)
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft_rate 冷却: %+v", i, st)
@@ -663,7 +663,7 @@ func TestApplyErrorPolicyNotFoundUsesFixedBase(t *testing.T) {
 
 	notFoundSec := int64(notFoundCooldown / time.Second)
 	for i := 1; i <= 3; i++ {
-		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "", nil)
+		h.applyErrorPolicy("u1", upstream.ErrNotFound, "", "", "", nil)
 		st, _ := p.Status("u1")
 		if !st.Cooling || st.CoolKind != "soft_rate" {
 			t.Fatalf("call %d: 应为 soft 冷却: %+v", i, st)

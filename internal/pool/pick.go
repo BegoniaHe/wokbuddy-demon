@@ -80,6 +80,10 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
+	if p.routeCoolingLocked(realm, reqModel, now) {
+		trace.addExcluded("route_cooldown")
+		return nil
+	}
 	cands := p.pickCandidates(tried, reqModel, realm, now, trace)
 	trace.Candidates = len(cands)
 	if len(cands) == 0 {

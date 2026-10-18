@@ -1168,7 +1168,7 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
 	if f.stickyUID != "" {
-		acct := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel)
+		acct := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
 		if acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
 			if f.st.decision != nil {
 				f.st.decision.StickyHit = true
@@ -1369,7 +1369,7 @@ func (f *chatFlow) handleHTTPError(
 	// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义要求原文
 	// 全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 	f.lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.bareModel, uerr)
+	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
 	f.fail(acct.UID)
 	// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：该次
 	// WAF 403 喂入 IP 级状态机，若激活（短窗多号命中）则立即终止轮转，避免把请求放大
@@ -1412,7 +1412,7 @@ func failFastKind(kind upstream.ErrKind) bool {
 //   - ErrImageInvalid：图片格式/数据无效，同一 body 换号仍是同样解析错误。
 //   - ErrBadParams（11101）：请求体解析失败，继续轮转会把确定失败伪装成"号不可用"。
 func (f *chatFlow) handleRequestLevelError(acct *auth.Auth, kind upstream.ErrKind, respBody []byte, uerr *upstream.Error) {
-	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.bareModel, uerr)
+	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
 	f.fail(acct.UID)
 	raw := string(respBody)
 	code, fallback := requestLevelErrorCode(kind)
@@ -1480,7 +1480,7 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 		// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并处置账号
 		// ——**不记成功、不清 11102 负缓存、不绑粘性**。
 		kind := upstream.FrameKind(errFrame)
-		f.h.applyErrorPolicy(acct.UID, kind, errFrame, f.bareModel, nil)
+		f.h.applyErrorPolicy(acct.UID, kind, errFrame, f.realm, f.bareModel, nil)
 		f.st.status = http.StatusServiceUnavailable
 		f.st.outcome = reqlog.OutcomeStreamError
 		log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
@@ -1521,6 +1521,7 @@ func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
 // noteSuccessAndBind 记录账号成功、清 11102 负缓存，并让会话粘性跟随最终成功号。
 func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	f.h.cfg.Pool.NoteSuccess(acct.UID)
+	f.h.cfg.Pool.NoteRouteSuccess(f.realm, f.bareModel)
 	// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 	// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 	f.h.cfg.Pool.BlockModelClear(acct.UID, f.bareModel)
@@ -1853,10 +1854,11 @@ func (f *chatFlow) modelRecovery(now time.Time) time.Time {
 		return time.Time{}
 	}
 	mb := f.h.cfg.Pool.ModelBlocked(f.bareModel)
+	route := f.h.cfg.Pool.RouteRecovery(f.realm, f.bareModel)
 	if !mb.Blocked {
-		return time.Time{}
+		return futureOrZero(route, now)
 	}
-	return futureOrZero(mb.Until, now)
+	return earlierFuture(futureOrZero(mb.Until, now), route, now)
 }
 
 // futureOrZero 仅保留晚于 now 的时刻。
@@ -2110,10 +2112,10 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 // body 仅在 ErrSoftRate/ErrAccountFault 分支用于解析重置时间/分野；model 为请求
 // 携带的模型名。uerr 是 ChatStreamContext 返回的分类信封（可携带 RetryAfter）；
 // 零值/防御路径下为 nil，冷却时长回落既有计算。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, realm, model string, uerr *upstream.Error) {
 	switch kind {
 	case upstream.ErrSoftRate:
-		h.applySoftRatePolicy(uid, body, model, uerr)
+		h.applySoftRatePolicy(uid, body, realm, model, uerr)
 	case upstream.ErrWafBlock:
 		h.applyWafPolicy(uid, uerr)
 	case upstream.ErrAccountFault:
@@ -2125,6 +2127,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		h.cfg.Pool.NoteRouteFailure(realm, model)
 	case upstream.ErrClient:
 		// 未知 4xx 喂连败计数（issue #114）：连续 N 次该形态失败 → 账号临时出池
 		// （NoteFailures 达阈降权），单次/偶发不罚（不误伤）。
@@ -2138,12 +2141,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 
 // applySoftRatePolicy 处置 429/限流文案：优先对齐上游重置墙钟，其次 Retry-After
 // 头，最后账号级有界退避。6004 走模型级豁免，非 6004 走账号级。
-func (h *Handler) applySoftRatePolicy(uid, body, model string, uerr *upstream.Error) {
+func (h *Handler) applySoftRatePolicy(uid, body, realm, model string, uerr *upstream.Error) {
 	// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
 	// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
 	//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
 	//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
 	modelRateLimited := upstream.IsModelRateLimit(body)
+	if modelRateLimited {
+		h.cfg.Pool.NoteRouteFailure(realm, model)
+	}
 	if resetAt, ok := upstream.ParseRateReset(body); ok {
 		if modelRateLimited {
 			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
