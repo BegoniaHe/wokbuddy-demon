@@ -147,9 +147,28 @@ type chatStatsReader struct {
 	pend         []byte // 已读未返回的行缓存
 }
 
+// statsReaderPool 复用 64KB 的 SSE 统计读取缓冲，避免每个流式请求一次大分配。
+var statsReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, 64*1024) },
+}
+
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
-	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
+	br := statsReaderPool.Get().(*bufio.Reader)
+	br.Reset(r)
+
+	return &chatStatsReader{br: br, start: since}
+}
+
+// release 归还底层缓冲（幂等）。调用方必须保证此后不再读取该 reader。
+func (s *chatStatsReader) release() {
+	if s == nil || s.br == nil {
+		return
+	}
+
+	s.br.Reset(nil)
+	statsReaderPool.Put(s.br)
+	s.br = nil
 }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。

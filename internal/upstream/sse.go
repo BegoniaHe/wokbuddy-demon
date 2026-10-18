@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,10 +53,34 @@ func IsClientWriteError(err error) bool { return errors.Is(err, errClientWrite) 
 // 不返回残缺成功响应，由 handler 映射为 502 upstream_parse（issue #105）。
 // 聚合总量超 32 MiB → ErrSSEAggregateTooLong（issue #113），同样不返回残缺成功。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+// sseReaderPool 复用 64KB 的 SSE 行读取缓冲：每个流式请求都会创建一层
+// bufio.Reader，池化后避免每请求一次 64KB 分配。归还前 Reset(nil)，不持有
+// 上游 body 引用。
+var sseReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, 64*1024) },
+}
+
+func getSSEReader(r io.Reader) *bufio.Reader {
+	br := sseReaderPool.Get().(*bufio.Reader)
+	br.Reset(r)
+
+	return br
+}
+
+func putSSEReader(br *bufio.Reader) {
+	if br == nil {
+		return
+	}
+
+	br.Reset(nil)
+	sseReaderPool.Put(br)
+}
+
 func Aggregate(r io.Reader) (map[string]any, error) {
 	streamAggregator2 := newStreamAggregator()
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	br := getSSEReader(r)
+	defer putSSEReader(br)
 	for {
 		line, err := readSSELine(br)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -1124,7 +1149,9 @@ func (s *streamWriter) stream(r io.Reader) error {
 		return s.streamWithKeepalive(r)
 	}
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	br := getSSEReader(r)
+	defer putSSEReader(br)
+
 	validFrames := 0
 
 	for {
@@ -1210,11 +1237,13 @@ func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
 
 // asyncLines 启动逐行读取 goroutine；done 关闭后 goroutine 退出。
 func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
-	reader := bufio.NewReaderSize(r, 64*1024)
+	reader := getSSEReader(r)
 	lines := make(chan lineResult)
 	done := make(chan struct{})
 
 	go func() {
+		defer putSSEReader(reader)
+
 		for {
 			line, err := readSSELine(reader)
 			select {

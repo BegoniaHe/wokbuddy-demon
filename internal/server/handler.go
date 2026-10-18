@@ -1850,6 +1850,7 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 	// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 	f.st.status = http.StatusOK
 	stats := newChatStatsReaderSince(rc, f.st.start)
+	defer stats.release()
 	// errFrame：上游 error 帧原文（观察者旁路采集），用于流尾的账号处置。
 	var errFrame string
 	// 标记修复：上游在没有 tools 的请求里会把工具调用吐成原生标记文本，这里在透传前
