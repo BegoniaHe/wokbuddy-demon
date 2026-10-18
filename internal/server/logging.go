@@ -41,23 +41,29 @@ var chatLogEnabled = func() *atomic.Bool {
 	return enabled
 }()
 
-// chatLogOut 聊天表格日志的输出目标（atomic 持有 io.Writer）。生产默认 os.Stdout；
+// chatLogOut 聊天表格日志的输出目标（atomic 持有 *io.Writer）。生产默认 os.Stdout；
 // main 在启用管理面板时经 SetChatLogOutput 注入 MultiWriter，把每行镜像进
 // /panel/api/logs 的环形缓冲，stdout 行为不变。
+//
+// 用 atomic.Pointer[io.Writer] 而非 atomic.Value：后者要求每次 Store 的具体类型
+// 一致（*os.File 与 io.MultiWriter 的 *multiWriter 不同），混用会 panic。
 var (
-	chatLogOut     atomic.Value
+	chatLogOut     atomic.Pointer[io.Writer]
 	chatLogOutOnce sync.Once
 )
 
 func ensureChatLogOut() {
-	chatLogOutOnce.Do(func() { chatLogOut.Store(io.Writer(os.Stdout)) })
+	chatLogOutOnce.Do(func() {
+		w := io.Writer(os.Stdout)
+		chatLogOut.Store(&w)
+	})
 }
 
 // SetChatLogOutput 替换聊天表格日志输出目标。
 func SetChatLogOutput(w io.Writer) {
 	if w != nil {
 		ensureChatLogOut()
-		chatLogOut.Store(w)
+		chatLogOut.Store(&w)
 	}
 }
 
@@ -65,8 +71,8 @@ func SetChatLogOutput(w io.Writer) {
 func currentChatLogOutput() io.Writer {
 	ensureChatLogOut()
 
-	if w, ok := chatLogOut.Load().(io.Writer); ok {
-		return w
+	if w := chatLogOut.Load(); w != nil {
+		return *w
 	}
 
 	return os.Stdout

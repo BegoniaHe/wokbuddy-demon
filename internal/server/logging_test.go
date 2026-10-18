@@ -46,6 +46,26 @@ func captureStdout(t *testing.T, fn func()) string {
 	return string(raw)
 }
 
+// TestSetChatLogOutputAcceptsDifferentWriterTypes：输出目标会从 *os.File
+// （默认 stdout）切换为 io.MultiWriter（生产 main 注入面板镜像）。atomic.Value
+// 在具体类型不一致时 Store 会 panic，故用 atomic.Pointer[io.Writer]。
+//
+//nolint:paralleltest // 该用例改写进程级日志出口，必须串行执行
+func TestSetChatLogOutputAcceptsDifferentWriterTypes(t *testing.T) {
+	old := currentChatLogOutput()
+
+	t.Cleanup(func() { SetChatLogOutput(old) })
+
+	SetChatLogOutput(os.Stdout)
+
+	multi := io.MultiWriter(io.Discard, io.Discard)
+	SetChatLogOutput(multi)
+
+	if got := currentChatLogOutput(); got != multi {
+		t.Fatalf("currentChatLogOutput() = %T, want injected MultiWriter", got)
+	}
+}
+
 // withChatLog 临时开启聊天表格日志（TestMain 默认关闭），测试结束后恢复。
 // 仅供断言表格行输出的用例使用。
 func withChatLog(t *testing.T) {
