@@ -23,7 +23,8 @@ const (
 	auditFileMaxBytes = 8 << 20
 	// auditBackups 保留的历史文件数（不含当前文件）。总上限约 40 MiB。
 	auditBackups = 4
-	// auditMaxLineBytes 单条记录上限，防止异常字段撑大文件。
+	// auditMaxLineBytes 单条记录上限（含换行），防止异常字段撑大文件；
+	// 与 readAuditFile 的 scanner 缓冲上限同值，保证能读回自己写入的每一条。
 	auditMaxLineBytes = 64 << 10
 )
 
@@ -92,7 +93,9 @@ func (a *auditLog) encode(entry *auditEntry) ([]byte, bool) {
 		return nil, false
 	}
 
-	if len(line) > auditMaxLineBytes {
+	// 换行也算进上限：否则恰好写满上限的记录会超出 scanner 缓冲，
+	// 读取时该行报错并中断，文件后半段全部不可见。
+	if len(line)+1 > auditMaxLineBytes {
 		// 字段都由本包截断/生成，正常不会触发；宁可丢一条也不写半截 JSON。
 		log.Printf("panel: 审计记录超长已丢弃（%d 字节）", len(line))
 

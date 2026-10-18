@@ -60,9 +60,13 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 //
 // 取值顺序：
 //  1. 对端不可信 → 对端地址；
-//  2. 可采信 X-Real-IP（反代通常以 $remote_addr 覆盖写入）；
-//  3. 从 X-Forwarded-For 右往左跳过可信反代，取第一个非可信地址；
-//  4. 全部可信 → 最左侧地址；都取不到 → 对端地址。
+//  2. 从 X-Forwarded-For 右往左跳过可信反代，取第一个非可信地址；
+//  3. 全部可信 → 最左侧地址；
+//  4. 没有可用的 XFF 时才回落 X-Real-IP；都取不到 → 对端地址。
+//
+// XFF 优先于 X-Real-IP：主流反代（Caddy 缺省、nginx 常见配置）都会处理
+// X-Forwarded-For，但 Caddy 缺省**不写** X-Real-IP，客户端自带的该头会原样
+// 透传。若先信 X-Real-IP，攻击者可在可信反代后任意伪造来源，绕过限速与锁定。
 func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 	if r == nil {
 		return ""
@@ -71,10 +75,6 @@ func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 	peer := normalizeIP(r.RemoteAddr)
 	if len(trusted) == 0 || !inNets(peer, trusted) {
 		return peer
-	}
-
-	if realIP := normalizeIP(r.Header.Get("X-Real-IP")); realIP != "" {
-		return realIP
 	}
 
 	parts := splitForwarded(r.Header.Values("X-Forwarded-For"))
@@ -88,6 +88,10 @@ func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 
 	if len(parts) > 0 {
 		return parts[0]
+	}
+
+	if realIP := normalizeIP(r.Header.Get("X-Real-IP")); realIP != "" {
+		return realIP
 	}
 
 	return peer

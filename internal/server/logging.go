@@ -460,17 +460,10 @@ func (t *requestTrace) captureClientInfo(r *http.Request, trusted []*net.IPNet) 
 // X-Real-IP），因为它的用途是把客户端 IP **透传给上游**，回落到网关自身地址会
 // 污染上游风控判据。日志场景相反：只有 TCP 对端属于配置的可信反代网段时才采信
 // 转发头，否则一律用 RemoteAddr——否则任何客户端都能用伪造的 X-Forwarded-For
-// 污染请求日志与审计记录。
+// 污染请求日志与审计记录。对端地址解析失败时保持空串（面板显示 "-"），
+// 不再回落到可伪造的代理头。
 func clientIPForLog(r *http.Request, trusted []*net.IPNet) string {
-	if r == nil {
-		return ""
-	}
-
-	if ip := httpauth.ClientIP(r, trusted); ip != "" {
-		return ip
-	}
-
-	return upstream.ExtractClientIP(r)
+	return httpauth.ClientIP(r, trusted)
 }
 
 // dashIfEmpty 空串统一显示 "-"（来源字段未采集时不留空白列）。

@@ -45,7 +45,9 @@ func TestClientIPIgnoresForwardedFromUntrustedPeer(t *testing.T) {
 	}
 }
 
-func TestClientIPTrustsRealIPFromProxy(t *testing.T) {
+// XFF 优先于 X-Real-IP：Caddy 缺省会透传客户端自带的 X-Real-IP，
+// 只处理 X-Forwarded-For，先信 X-Real-IP 会留下任意伪造来源的口子。
+func TestClientIPPrefersForwardedForOverRealIP(t *testing.T) {
 	t.Parallel()
 
 	trusted := mustProxies(t, "127.0.0.1/32")
@@ -54,8 +56,21 @@ func TestClientIPTrustsRealIPFromProxy(t *testing.T) {
 	req.Header.Set("X-Real-IP", "203.0.113.1")
 	req.Header.Set("X-Forwarded-For", "203.0.113.2")
 
+	if got := ClientIP(req, trusted); got != "203.0.113.2" {
+		t.Fatalf("ClientIP=%q want X-Forwarded-For", got)
+	}
+}
+
+func TestClientIPFallsBackToRealIPWithoutForwardedFor(t *testing.T) {
+	t.Parallel()
+
+	trusted := mustProxies(t, "127.0.0.1/32")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Header.Set("X-Real-IP", "203.0.113.1")
+
 	if got := ClientIP(req, trusted); got != "203.0.113.1" {
-		t.Fatalf("ClientIP=%q want X-Real-IP", got)
+		t.Fatalf("ClientIP=%q want X-Real-IP fallback", got)
 	}
 }
 

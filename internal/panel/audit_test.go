@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -33,6 +34,35 @@ func TestAuditAppendAndRecent(t *testing.T) {
 
 	if only := audit.Recent(1); len(only) != 1 || only[0].Path != "/panel/api/b" {
 		t.Fatalf("limit not applied: %+v", only)
+	}
+}
+
+// 恰好写满上限的记录必须能重新读回：scanner 缓冲上限要覆盖行尾换行。
+func TestAuditMaxLineIsReadable(t *testing.T) {
+	t.Parallel()
+
+	base, err := json.Marshal(&auditEntry{Method: "POST", Path: "/panel/api/x", Time: time.Unix(0, 0).UTC().Format(time.RFC3339)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/panel/api/" + strings.Repeat("a", auditMaxLineBytes-len(base))
+
+	line, err := json.Marshal(&auditEntry{Method: "POST", Path: path, Time: time.Unix(0, 0).UTC().Format(time.RFC3339)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(line)+1 != auditMaxLineBytes {
+		t.Fatalf("line=%d want %d", len(line)+1, auditMaxLineBytes)
+	}
+
+	dir := t.TempDir()
+	audit := newAuditLog(dir)
+	audit.Append(&auditEntry{Method: "POST", Path: path})
+
+	if got := audit.Recent(1); len(got) != 1 || got[0].Path != path {
+		t.Fatalf("max-sized line not readable: %d entries", len(got))
 	}
 }
 
