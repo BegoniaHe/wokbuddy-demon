@@ -444,6 +444,10 @@ func fetchRaw(ctx context.Context, rawURL string, maxBytes int64) ([]byte, strin
 			}
 			return validateWebURL(req.Context(), req.URL.String())
 		},
+		// 用实际拨号地址兜底校验，关闭 validateWebURL 解析与 http.Client 再解析之间
+		// 的 DNS rebinding 窗口。显式不用 HTTP(S)_PROXY：代理会在网关之外解析目标，
+		// 使这里的 IP 校验失效。
+		Transport: &http.Transport{DialContext: dialWebFetch},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, http.NoBody)
 	if err != nil {
@@ -510,4 +514,43 @@ func isBlockedIP(ip net.IP) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast()
+}
+
+// dialWebFetch 解析目标域名，校验所有解析结果后直接连接已验证的 IP。
+// 只校验再交给默认 dialer 重新解析仍留有 DNS rebinding 窗口，故这里不二次解析。
+func dialWebFetch(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	if ip := net.ParseIP(host); ip != nil {
+		ips = []net.IP{ip}
+	} else {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, fmt.Errorf("解析域名失败: %w", err)
+		}
+		for _, a := range addrs {
+			ips = append(ips, a.IP)
+		}
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("域名 %s 无解析结果", host)
+	}
+	for _, ip := range ips {
+		if isBlockedIP(ip) {
+			return nil, fmt.Errorf("拒绝访问内网地址 %s（解析自 %s）", ip, host)
+		}
+	}
+	var dialer net.Dialer
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
