@@ -203,16 +203,14 @@ export function KeysView() {
         ) : list.length === 0 ? (
           <CardContent className="py-10 text-center text-muted-foreground">暂无命名密钥。创建后即可分发给不同客户端，并在此查看各自的请求与 token 用量。</CardContent>
         ) : (
-          <>
-          {keysQ.error ? (
-            <CardContent>
+          <div className="overflow-x-auto">
+            {keysQ.error ? (
               <LoadError
+                className="m-3"
                 message={'刷新失败：' + (keysQ.error as Error).message}
                 onRetry={() => void keysQ.refetch()}
               />
-            </CardContent>
-          ) : null}
-          <div className="overflow-x-auto">
+            ) : null}
             <Table>
               <TableHeader>
                 <TableRow>
@@ -300,7 +298,6 @@ export function KeysView() {
               </TableBody>
             </Table>
           </div>
-          </>
         )}
       </Card>
 
