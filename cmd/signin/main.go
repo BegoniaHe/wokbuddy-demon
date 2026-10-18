@@ -20,7 +20,7 @@ type row struct {
 	file     string
 	uid      string
 	nick     string
-	status   string // OK | ALREADY | FAIL | AUTH_INVALID | LOAD_ERR
+	status   string // OK | ALREADY | INACTIVE | FAIL | AUTH_INVALID | LOAD_ERR
 	detail   string
 	remain   int64
 	hasQuota bool
@@ -39,7 +39,7 @@ func main() {
 	sort.Strings(files)
 	up := upstream.New()
 
-	rows, okN, alreadyN, failN := processAccounts(files, up)
+	rows, okN, alreadyN, inactiveN, failN := processAccounts(files, up)
 
 	// 报告
 	fmt.Printf("uid                                  | nick        | status       | remain | detail\n")
@@ -52,11 +52,11 @@ func main() {
 		fmt.Printf("%-36s | %-11s | %-12s | %-6s | %s\n",
 			trunc(r.uid, 36), trunc(r.nick, 11), r.status, remain, r.detail)
 	}
-	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
+	fmt.Printf("\ntotal=%d ok=%d already=%d inactive=%d fail=%d\n", len(rows), okN, alreadyN, inactiveN, failN)
 }
 
 // processAccounts 逐个账号签到并计数：OK / ALREADY 分别计数，其余状态一律计入 fail。
-func processAccounts(files []string, up *upstream.Client) (rows []row, okN, alreadyN, failN int) {
+func processAccounts(files []string, up *upstream.Client) (rows []row, okN, alreadyN, inactiveN, failN int) {
 	for _, f := range files {
 		r := processAccount(f, up)
 		rows = append(rows, r)
@@ -65,11 +65,13 @@ func processAccounts(files []string, up *upstream.Client) (rows []row, okN, alre
 			okN++
 		case "ALREADY":
 			alreadyN++
+		case "INACTIVE":
+			inactiveN++
 		default:
 			failN++
 		}
 	}
-	return rows, okN, alreadyN, failN
+	return rows, okN, alreadyN, inactiveN, failN
 }
 
 // processAccount 处理单个 auth 文件：读取/解析、按需 refresh、签到、顺手查余额。
@@ -102,16 +104,16 @@ func processAccount(f string, up *upstream.Client) row {
 	}
 
 	err = up.DailyCheckin(a)
-	switch err {
-	case nil:
+	switch upstream.ClassifyCheckin(err) {
+	case upstream.CheckinOK:
 		r.status = "OK"
+	case upstream.CheckinAlready:
+		r.status = "ALREADY"
+	case upstream.CheckinInactive:
+		r.status = "INACTIVE"
+		r.detail = short(err.Error())
 	default:
-		// DailyCheckin 已签到返回 code!=0 错误
-		if isAlready(err.Error()) {
-			r.status = "ALREADY"
-		} else {
-			r.status = "FAIL"
-		}
+		r.status = "FAIL"
 		r.detail = short(err.Error())
 	}
 	// 顺手查余额
@@ -134,15 +136,6 @@ func refreshIfNeeded(a *auth.Auth, up *upstream.Client) error {
 		log.Printf("signin %q save: %q", a.UID, err.Error()) //nolint:gosec // 参数经 %q 转义，无注入面
 	}
 	return nil
-}
-
-// 已签判定：code 非 0 且含 "已签到"/"already"/"checkin" 等字样。
-func isAlready(msg string) bool {
-	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already") ||
-		strings.Contains(s, "checkin") ||
-		strings.Contains(s, "code=400")
 }
 
 func trunc(s string, n int) string {
