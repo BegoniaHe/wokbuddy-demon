@@ -157,15 +157,16 @@ func TestPanelTaskEndpointsAllowCN(t *testing.T) {
 	}
 }
 
-// TestPanelCheckinGating global/企业版单号签到不发起签到调用，但仍刷新额度；
-// CN 号照常签到（issue #108）。
+// TestPanelCheckinGating 企业版单号签到不发起签到调用，但仍刷新额度；
+// CN 与 global 号照常签到（global 与调度器同口径，issue #108 的 global 门控
+// 只适用于成长/任务体系，不适用于签到）。
 func TestPanelCheckinGating(t *testing.T) {
-	t.Run("global", func(t *testing.T) { assertCheckinSkipped(t, "global") })
+	t.Run("global", func(t *testing.T) { assertCheckinAllowed(t, "global") })
 	t.Run("enterprise", func(t *testing.T) { assertCheckinSkipped(t, "enterprise") })
 	t.Run("cn", func(t *testing.T) { assertCheckinAllowed(t, "cn") })
 }
 
-// assertCheckinSkipped 断言 global/企业版签到被跳过：checkin_done=false、
+// assertCheckinSkipped 断言企业版签到被跳过：checkin_done=false、
 // 有可读原因，但额度刷新照常发起上游调用。
 func assertCheckinSkipped(t *testing.T, kind string) {
 	t.Helper()
@@ -193,7 +194,7 @@ func assertCheckinSkipped(t *testing.T, kind string) {
 	}
 }
 
-// assertCheckinAllowed 断言 CN 号不被跳过，且签到 + 余额各发起一次上游调用。
+// assertCheckinAllowed 断言账号不被跳过，且签到 + 余额各发起一次上游调用。
 func assertCheckinAllowed(t *testing.T, kind string) {
 	t.Helper()
 	pn, calls := newGatingPanel(t)
@@ -207,9 +208,9 @@ func assertCheckinAllowed(t *testing.T, kind string) {
 		t.Fatal(err)
 	}
 	if resp["skipped"] == true {
-		t.Errorf("CN 号不得被跳过: %s", rec.Body)
+		t.Errorf("账号不得被跳过: %s", rec.Body)
 	}
 	if n := atomic.LoadInt64(calls) - before; n < 2 {
-		t.Errorf("CN 签到应发起签到 + 余额两次上游调用，got %d", n)
+		t.Errorf("签到应发起签到 + 余额两次上游调用，got %d", n)
 	}
 }

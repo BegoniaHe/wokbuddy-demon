@@ -457,9 +457,11 @@ function AccountRow({
   }
 
   const frozen = s.disabled || cool > 0;
-  // 单号任务入口能力门控（issue #108）：global 无 CN 签到/任务体系，企业版无个人
-  // 成长/签到体系；与后端 taskDenyReason、任务中心的扫描/队列门控同口径。
-  const canUseTasks = !s.enterprise && s.realm !== 'global';
+  // 单号任务入口能力门控（issue #108）：企业版无个人签到/任务体系；global 可签到
+  // （与调度器同口径），但没有 CN 成长/任务体系。与后端 checkinDenyReason、
+  // taskDenyReason 及任务中心的扫描/队列门控同口径。
+  const canCheckin = !s.enterprise;
+  const canUseTasks = canCheckin && s.realm !== 'global';
   const tu = s.token_usage || {};
   const req = tu.request_count || 0;
   const totalTok = formatTokenCount(tu.total_tokens);
@@ -603,7 +605,7 @@ function AccountRow({
       </TableCell>
       <TableCell>
         <div className="flex justify-end items-center gap-1.5 whitespace-nowrap">
-          {canUseTasks ? (
+          {canCheckin ? (
             <Button size="xs" variant="ghost" title={s.checkin_done ? '今日已签到；点击可重新签到并刷新余额' : undefined} onClick={() => void act('checkin')}>
               {s.checkin_done ? '已签' : '签到'}
             </Button>

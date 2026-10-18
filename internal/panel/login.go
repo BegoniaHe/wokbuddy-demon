@@ -301,8 +301,8 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 }
 
 // postLoginTasks 登录完成后的签到/激活与余额刷新，返回 (提示消息, 余额, 总额)。
-// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取
-// （D4 门控同 scheduler：CN 任务端点对 global 不发起任何调用）。
+// realm 分支：CN 走 DailyCheckin；global 登录时改为注册激活 + trial 领取（签到由
+// 调度器统一执行，与 CN 同口径）；企业版跳过签到（上游不支持）。
 func (p *Panel) postLoginTasks(a *auth.Auth, realm, uid string) (string, int64, int64) {
 	checkinMsg := ""
 	if realm == "global" {

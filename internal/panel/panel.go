@@ -658,11 +658,12 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 }
 
 // runCheckin 执行单号签到并返回 (跳过原因, 是否已签, 说明文案)。
-// 跳过原因非空表示 global/企业版无 CN 签到体系（issue #108）：不发起上游调用。
+// 跳过原因非空表示企业版无个人签到体系（issue #108）：不发起上游调用。
+// global 账号与调度器同口径正常签到（upstream.DailyCheckin 按 realm 分流）。
 // 其余情况按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游
 // 非错误态，不标记已签、给出可区分文案（issue #27）；其余才是真失败。
 func (p *Panel) runCheckin(a *auth.Auth, uid string) (denyReason string, done bool, msg string) {
-	if denyReason = taskDenyReason(a); denyReason != "" {
+	if denyReason = checkinDenyReason(a); denyReason != "" {
 		return denyReason, false, denyReason
 	}
 	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
@@ -689,10 +690,10 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	// 账号体系门控（issue #108）：global 无 CN 签到体系，企业版无个人签到体系
-	// （上游 400 code 10001）。两者都不发起签到调用，端点退化为「刷新额度」
-	// ——额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
-	// 前端对这两类账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
+	// 账号体系门控（issue #108）：企业版无个人签到体系（上游 400 code 10001），
+	// 不发起签到调用，端点退化为「刷新额度」；global 账号与调度器一致走签到。
+	// 额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
+	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
 	denyReason, checkinDone, checkinMsg := p.runCheckin(a, uid)
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
@@ -746,6 +747,8 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	// 先失效凭证再删文件：在途 refresh 的 SaveAtomic 会拒绝写回，避免文件复活。
+	a.Retire()
 	fileMsg := ""
 	if a.FilePath != "" {
 		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {

@@ -49,10 +49,10 @@ func decodeTaskCode(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return body.TaskCode, true
 }
 
-// taskDenyReason 报告账号是否不具备 CN 签到/成长任务体系，返回给用户的跳过原因；
+// taskDenyReason 报告账号是否不具备 CN 成长/任务体系，返回给用户的跳过原因；
 // 空串表示可用（issue #108）。集中表达两条门控，避免各单号入口各写一份：
-//   - global（国际版）账号没有 CN 任务体系（scheduler 对 global 直接跳过签到/
-//     旅行/夜猫子）；
+//   - global（国际版）账号没有 CN 成长/旅行/夜猫子任务（scheduler 对 global
+//     直接跳过这些任务；签到除外，见 checkinDenyReason）；
 //   - 企业版没有个人成长/签到体系（上游 400 code 10001「企业账号不支持该操作」，
 //     见 auth.IsEnterprise 注释）。
 //
@@ -60,12 +60,22 @@ func decodeTaskCode(w http.ResponseWriter, r *http.Request) (string, bool) {
 func taskDenyReason(a *auth.Auth) string {
 	switch {
 	case a.IsGlobal():
-		return "国际版（global）账号没有 CN 签到/任务体系，已跳过"
+		return "国际版（global）账号没有 CN 成长/任务体系，已跳过"
 	case a.IsEnterprise():
 		return "企业版账号没有个人签到/成长任务体系，已跳过"
 	default:
 		return ""
 	}
+}
+
+// checkinDenyReason 报告账号是否不具备签到能力。与 taskDenyReason 的区别：
+// global 账号支持签到（调度器与 upstream.DailyCheckin 均按 realm 分流），
+// 只有企业版没有个人签到体系。
+func checkinDenyReason(a *auth.Auth) string {
+	if a.IsEnterprise() {
+		return "企业版账号没有个人签到体系，已跳过"
+	}
+	return ""
 }
 
 // denyTask 写「账号类型不支持 CN 任务体系」的 409 跳过响应（issue #108）。
