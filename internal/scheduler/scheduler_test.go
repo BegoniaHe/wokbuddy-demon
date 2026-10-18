@@ -447,6 +447,35 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	}
 }
 
+// TestStartBalanceRefreshHotEnableFromPaused 启动时关闭（interval=0）也必须起 worker：
+// 运行期 SetBalanceInterval 热开后才会有周期刷新，无需重启。
+func TestStartBalanceRefreshHotEnableFromPaused(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 777}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.StartBalanceRefresh(ctx, 0)
+	s.SetBalanceInterval(5 * time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if st, ok := p.Status("u1"); ok && st.Credits == 777 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("启动时暂停的余额刷新在热开 interval 后仍未运行")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestNextWakeGrowthSlot growth 排程进候选 + 禁用退场（每日自动执行成长任务队列）。
 func TestNextWakeGrowthSlot(t *testing.T) {
 	s := New(Config{GrowthHours: []int{1}})

@@ -630,8 +630,8 @@ func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure in
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
-			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-			s.notifyTaskFailed("activity", a.UID, a.Nickname, a.Realm())
+			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.NicknameValue()), err)
+			s.notifyTaskFailed("activity", a.UID, a.NicknameValue(), a.Realm())
 			c.record(false)
 			continue
 		}
@@ -651,14 +651,14 @@ func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure in
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(a)
 	if err != nil {
-		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.NicknameValue()), err)
 		return true
 	}
 	if days == 0 {
-		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.Nickname))
+		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(a.UID, a.NicknameValue()))
 		return true
 	}
-	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.Nickname), days)
+	log.Printf("activity %s: streak days=%d", logfmt.Label(a.UID, a.NicknameValue()), days)
 	return false
 }
 
@@ -737,7 +737,7 @@ func (s *Scheduler) notifyCreditLow(a *auth.Auth, remain int64) {
 	if floor <= 0 || remain >= floor || a == nil {
 		return
 	}
-	s.notifyAccount(a.UID, a.Nickname, a.Realm(), notify.EventCreditLow, "账号余额低于积分保底",
+	s.notifyAccount(a.UID, a.NicknameValue(), a.Realm(), notify.EventCreditLow, "账号余额低于积分保底",
 		map[string]any{"credits": remain, "credit_floor": floor})
 }
 
@@ -765,7 +765,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			defer wg.Done()
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
 			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+				log.Printf("balance %s: %v", logfmt.Label(uid, a.NicknameValue()), err)
 				return
 			}
 			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
@@ -777,12 +777,13 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
-// interval<=0 不启动（schedule.balance_refresh_enabled=false 时 main 不调用即可）。
+// interval<=0 以暂停状态启动并等待 SetBalanceInterval 唤醒：启动时关闭
+// schedule.balance_refresh_enabled、运行期再热开也能生效（无需重启）。
 // 独立于 Run 的小时制排程：余额是分钟级观测量，不值得为它扩展 nextFire 的粒度。
 // 运行期可用 SetBalanceInterval 热改间隔（下一轮生效）。
 func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		return
+	if interval < 0 {
+		interval = 0
 	}
 	s.balanceInterval.Store(int64(interval))
 	go func() {
