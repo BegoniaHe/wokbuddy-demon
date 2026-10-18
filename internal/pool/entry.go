@@ -185,6 +185,9 @@ type entry struct {
 	a            *auth.Auth
 	credits      int64
 	creditsTotal int64 // 积分总额度（UserResource 聚合；0 = 未知）
+	// reservedCredits 请求级预扣（issue #116）：在途请求已估算但尚未实扣的积分。
+	// 运行态、不持久化；ReleaseReservation 或进程退出清零。
+	reservedCredits float64
 	// creditsExpiring 配置窗口内即将过期的可用积分子集，是 credits 的一部分。
 	// creditsEarliestExpiry / creditsEarliestRemaining 是全部未来到期批次中的最早一批；
 	// 两者均由签到/余额刷新更新，供 earliest-expiry 路由和状态观测使用。
@@ -220,6 +223,9 @@ type entry struct {
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
 	// usedSeq 提供严格全序，与时间精度无关。运行态，不持久化。
 	usedSeq uint64
+	// probeUntil 兜底单飞探针窗口（issue #116 P0-3）：该账号被全冷却兜底选中后，
+	// 窗口内不再接受第二次兜底选中；成功/到期后恢复。运行态、不持久化。
+	probeUntil time.Time
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。

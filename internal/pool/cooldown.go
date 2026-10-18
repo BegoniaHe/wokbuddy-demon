@@ -179,7 +179,7 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 		// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
 		// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
 		if e.coolKind != CoolSoft || !now.Before(e.until) {
-			d := p.softDurationLocked(base, e.softStreak+1)
+			d := p.jitterSoftDurationLocked(base, e.softStreak+1)
 			e.softStreak++
 			e.until = now.Add(d)
 		}
@@ -436,7 +436,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 			e.until = p.cappedSoftUntilLocked(now, resetAt)
 		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
 			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
-			d := p.softDurationLocked(base, e.softStreak+1)
+			d := p.jitterSoftDurationLocked(base, e.softStreak+1)
 			e.softStreak++
 			e.until = now.Add(d)
 		}
@@ -489,6 +489,16 @@ func (p *Pool) softDurationLocked(d time.Duration, streak int) time.Duration {
 	}
 	if d > capMax || d <= 0 { // d<=0：左移溢出成负数/零，同样按封顶兜底
 		d = capMax
+	}
+	return d
+}
+
+// jitterSoftDurationLocked 给软冷却叠加 ±10% 抖动，并再次按 softRateMax 封顶，
+// 保证抖动不突破既有最晚封顶。
+func (p *Pool) jitterSoftDurationLocked(base time.Duration, streak int) time.Duration {
+	d := jitterCooldown(p.softDurationLocked(base, streak))
+	if capMax := p.softRateMaxOr(); d > capMax {
+		return capMax
 	}
 	return d
 }

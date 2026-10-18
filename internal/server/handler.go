@@ -849,6 +849,9 @@ type chatFlow struct {
 	modelBlock      pool.ModelBlockStatus
 	degradedApplied bool
 	heldUID         string
+	// 请求级积分预扣（issue #116 P1-1）：reservedUID 非空时释放时归还。
+	reservedUID     string
+	reservedCredits float64
 	// rotateReason 本轮换号原因（供 /metrics 的 wokbuddy_upstream_rotations_total
 	// 标签）。各换号 return rotContinue 分支写入；degrade 复用同号重试、不算换号，
 	// 保持空值即跳过计数。
@@ -1058,11 +1061,21 @@ func (f *chatFlow) buildChatMeta() {
 	f.chatMeta.TraceID = f.traceID
 }
 
-// releaseHeld 释放在途租约（幂等）。
+// releaseHeld 释放在途租约与请求级预扣（幂等）。
 func (f *chatFlow) releaseHeld() {
 	if f.heldUID != "" {
 		f.h.cfg.Pool.Release(f.heldUID)
 		f.heldUID = ""
+	}
+	f.releaseReservation()
+}
+
+// releaseReservation 归还请求级预扣积分（幂等）。
+func (f *chatFlow) releaseReservation() {
+	if f.reservedUID != "" {
+		f.h.cfg.Pool.ReleaseReservation(f.reservedUID, f.reservedCredits)
+		f.reservedUID = ""
+		f.reservedCredits = 0
 	}
 }
 
@@ -1157,13 +1170,23 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		})
 		return rotBreak
 	}
+	f.tried[acct.UID] = true
+	if !f.reserveCredits(acct) {
+		log.Printf("WARN: [server] credit reserve: acct=%s model=%s credits below floor after estimate, skip",
+			logfmt.Label(acct.UID, acct.Nickname), f.bareModel)
+		f.rotateReason = "credit_reserve"
+		if !rotateBackoff(ctx, i) {
+			return rotBreak
+		}
+		return rotContinue
+	}
 	f.st.uid = acct.UID
 	// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 	f.st.nick = acct.Nickname
-	f.tried[acct.UID] = true
 
 	// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 	if !f.h.cfg.Pool.Acquire(acct.UID) {
+		f.releaseReservation()
 		// 全局名额被并发抢走：直接终止，不再换号空转。
 		if f.h.cfg.Pool.GlobalInFlightFull() {
 			f.st.status = http.StatusServiceUnavailable
@@ -1184,21 +1207,57 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 	return f.dispatch(ctx, acct, i)
 }
 
+// reserveCredits 请求级预扣（issue #116 P1-1）：按请求体估算 prompt 与 max_tokens，
+// 在 credits 中预留估算成本；余额不足时返回 false，调用方跳过该账号。
+func (f *chatFlow) reserveCredits(acct *auth.Auth) bool {
+	amount, ok := f.h.cfg.Pool.ReserveForRequest(
+		acct.UID, f.bareModel, acct.Realm(),
+		pool.EstimatePromptTokens(f.body), maxOutputTokensFromBody(f.body),
+	)
+	if !ok {
+		return false
+	}
+	f.reservedUID = acct.UID
+	f.reservedCredits = amount
+	return true
+}
+
+// maxOutputTokensFromBody 读取客户端的输出上限；缺失/非正时回落保守默认值。
+func maxOutputTokensFromBody(body []byte) int {
+	var req struct {
+		MaxTokens           int `json:"max_tokens"`
+		MaxCompletionTokens int `json:"max_completion_tokens"`
+		MaxOutputTokens     int `json:"max_output_tokens"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return 0 // 由 pool 回落 reserveOutputTokens
+	}
+	for _, n := range []int{req.MaxTokens, req.MaxCompletionTokens, req.MaxOutputTokens} {
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// degradeSticky 软逃逸后把会话置入降级窗口，并清空本次 stickyUID。
+func (f *chatFlow) degradeSticky() {
+	uid := f.stickyUID
+	if f.h.cfg.Session != nil {
+		f.h.cfg.Session.Degrade(f.sessKey, uid, pool.StickyDegradeWindow)
+	}
+	log.Printf("INFO: [server] sticky soft escape acct=%s model=%s: degrade %s",
+		logfmt.UID8(uid), f.bareModel, pool.StickyDegradeWindow)
+	f.stickyUID = ""
+}
+
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
 	if f.stickyUID != "" {
-		acct := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
-		if acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
-			if f.st.decision != nil {
-				f.st.decision.StickyHit = true
-				f.st.decision.FinalUID = logfmt.UID8(acct.UID)
-			}
+		if acct, ok := f.trySticky(); ok {
 			return acct
 		}
-		// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 →
-		// 解绑，本次回落普通轮换。
-		f.unbindSticky()
 	}
 	if f.st.decision != nil {
 		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(f.tried, f.bareModel, f.realm)
@@ -1206,6 +1265,24 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 		return acct
 	}
 	return f.h.cfg.Pool.PickExcludingForRealm(f.tried, f.bareModel, f.realm)
+}
+
+// trySticky 尝试复用会话绑定号；ok=false 表示已解绑/降级，调用方回落普通轮换。
+func (f *chatFlow) trySticky() (*auth.Auth, bool) {
+	acct, picked := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
+	if picked == pool.StickyPicked && acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
+		if f.st.decision != nil {
+			f.st.decision.StickyHit = true
+			f.st.decision.FinalUID = logfmt.UID8(acct.UID)
+		}
+		return acct, true
+	}
+	if picked == pool.StickyEscaped {
+		f.degradeSticky()
+	} else {
+		f.unbindSticky()
+	}
+	return nil, false
 }
 
 // sampleDecisionTrace 按开关与采样率决定本次是否记录决策链。

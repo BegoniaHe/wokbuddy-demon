@@ -183,6 +183,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.sessionDeadFails = 0
 		e.consecutiveFails = 0
 		e.degradeUntil = time.Time{}
+		e.probeUntil = time.Time{}
 		p.dirty.Store(true)
 	}
 }
@@ -396,24 +397,38 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	return uids
 }
 
+// StickyPick 粘性命中结果：命中 / 硬不可用 / 软逃逸（负载或健康因子越界）。
+type StickyPick int
+
+const (
+	// StickyPicked 命中且可继续使用。
+	StickyPicked StickyPick = iota
+	// StickyUnavailable 冷却/占满/积分保底/日限/路由冷却：解绑即可。
+	StickyUnavailable
+	// StickyEscaped 健康但负载/健康因子达到软逃逸阈值：解绑并进入短窗口降级。
+	StickyEscaped
+)
+
 // PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
-// 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
+// 6004 限流时返回不可用，让调用方（handler）解绑并回落普通轮换。
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 // realm 与普通选号同口径：路由冷却期间粘性命中也必须解绑。
-func (p *Pool) PickByUIDForModel(uid, model, realm string) *auth.Auth {
+// 软逃逸（issue #116）：在途达到 stickyEscapeRatio×上限或健康因子过低时返回
+// StickyEscaped，让同一会话的子请求提前溢出，而不是等满载才解绑。
+func (p *Pool) PickByUIDForModel(uid, model, realm string) (*auth.Auth, StickyPick) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
-		return nil
+		return nil, StickyUnavailable
 	}
 	now := p.now()
 	if p.routeCoolingLocked(realm, model, now) {
-		return nil
+		return nil, StickyUnavailable
 	}
 	if !e.healthyForModel(now, model) {
-		return nil
+		return nil, StickyUnavailable
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
 	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
@@ -424,20 +439,20 @@ func (p *Pool) PickByUIDForModel(uid, model, realm string) *auth.Auth {
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
 			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
-		return nil
+		return nil, StickyUnavailable
 	}
 	if p.dailyBlocked(e, model, e.a.Realm(), now) {
 		log.Printf("WARN: [pool] daily limit: sticky acct=%s model=%s, unbind",
 			logfmt.Label(e.a.UID, e.a.Nickname), model)
-		return nil
+		return nil, StickyUnavailable
 	}
-	if p.inFlightFull(e) {
-		return nil
+	if p.stickyEscapedLocked(e, model, now) {
+		return nil, StickyEscaped
 	}
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
-	return e.a
+	return e.a, StickyPicked
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；

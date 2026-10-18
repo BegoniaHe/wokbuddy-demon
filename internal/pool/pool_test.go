@@ -668,6 +668,10 @@ func wantCoolSec(t *testing.T, p *Pool, uid string, want, tol int64) {
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("%s should be in soft_rate cooling: %+v", uid, st)
 	}
+	// 软冷却写入口叠加 ±10% 抖动（issue #116 P0-3），断言按抖动上界放宽。
+	if jitterTol := want/10 + 2; jitterTol > tol {
+		tol = jitterTol
+	}
 	if got := st.CoolRemaining; got < want-tol || got > want+tol {
 		t.Errorf("cool_remaining_sec=%d want ~%d (±%d)", got, want, tol)
 	}

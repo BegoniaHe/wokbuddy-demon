@@ -372,7 +372,7 @@ func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Tim
 // floorBlockedForRealmModel 同上，但带 realm 上下文（倍率按 (realm, 模型) 分桶，
 // 同名模型在 CN / global 两域倍率可不同）。realm 为空时按倍率表的空域键查。
 func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time.Time) bool {
-	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
+	if p.creditFloor <= 0 || model == "" || float64(e.credits)-e.reservedCredits >= float64(p.creditFloor) {
 		return false
 	}
 	return p.paidModel(e, model, realm, now)
@@ -543,6 +543,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s",
 		logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = p.now()
+	// 单飞探针（issue #116 P0-3）：刚解封账号只允许一个兜底请求先试探，其余并发
+	// 在 probeWindow 内直接失败，避免二次踩爆。
+	best.probeUntil = now.Add(probeWindow)
 	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
 	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
 	// LRU 兜底（按 usedSeq 取最旧）眼里永远是「最旧」，刚被用过就被立刻再选——
@@ -573,7 +576,12 @@ func (p *Pool) fallbackEligible(e *entry, uid string, tried map[string]bool, rea
 	if p.dailyBlocked(e, model, realm, now) {
 		return false // 每日护栏（issue #95）：兜底路径同判据
 	}
-	return !p.inFlightFull(e)
+	return p.fallbackLoadOK(e, now)
+}
+
+// fallbackLoadOK 报告兜底候选是否可接收本次探针：不在单飞窗口且未占满在途。
+func (p *Pool) fallbackLoadOK(e *entry, now time.Time) bool {
+	return !now.Before(e.probeUntil) && !p.inFlightFull(e)
 }
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；
@@ -660,7 +668,9 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, model string, now time.Time)
 	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
 	// 4. 实时健康因子（issue #16）：TTFT 慢 / 错误率高的号按模型降权（半衰期衰减，
 	// 可恢复）。无观测时因子恒 1，不改变既有权重。
-	return w * e.healthFactor(model, now)
+	w *= e.healthFactor(model, now)
+	// 5. 并发压力（issue #116 P0-2）：在途越接近上限权重越低，死区内不打折。
+	return w * p.pressureFactor(e)
 }
 
 // expiringNow 报告账号是否存在当前仍有效的快过期积分批次。

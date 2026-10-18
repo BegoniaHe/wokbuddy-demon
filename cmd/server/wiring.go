@@ -57,6 +57,14 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 	}
 }
 
+// realmAwareStickyLowLoad 构造粘性降级窗口结束后的低水位判定闭包。
+func realmAwareStickyLowLoad(p *pool.Pool) func(model, uid string) bool {
+	return func(model, uid string) bool {
+		realm, bare := server.ResolveModel(model)
+		return p.StickyLowLoad(uid, bare, realm)
+	}
+}
+
 // applyDailyLimits 把配置的每日护栏映射到 pool（issue #95）。
 func applyDailyLimits(p *pool.Pool, cfg *Config) {
 	toPool := func(r LimitRule) pool.DailyLimits {
