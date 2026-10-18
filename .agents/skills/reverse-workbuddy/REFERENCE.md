@@ -13,6 +13,23 @@
   ```
 
   该脚本不依赖 `@electron/asar`，纯 Node 内置模块实现 ASAR 头解析。
+- `scripts/download_latest.mjs`：查官方更新接口并下载最新安装包。
+
+  ```bash
+  node download_latest.mjs --dry-run                 # 只看版本与 URL
+  node download_latest.mjs                           # cn + global，当前机器平台
+  node download_latest.mjs --realm cn --platform all # 指定 realm / 全部平台
+  ```
+
+  接口：`https://www.workbuddy.ai/v2/update?platform=<p>`（global）与
+  `https://www.workbuddy.cn/v2/update?platform=<p>`（cn），返回
+  `{version,url,productVersion,sha256hash,...}`。平台名：
+  `workbuddy-darwin-arm64` / `workbuddy-darwin-x64` /
+  `workbuddy-win32-x64-user` / `workbuddy-linux-{x64,arm64}-{deb,rpm}`。
+  macOS 接口给 `.zip`（自动更新包），网站实际下载同版本 `.dmg`；脚本对
+  darwin 把后缀换成 `.dmg`。`sha256hash` 只对应接口原 URL（zip），dmg 不校验。
+  落盘路径：`.tmp/workbuddy/<realm>/<version>/`，`<version>` 取文件名中的
+  完整版本串（含构建 hash，如 `5.8.4.41366630-73952edb`）。
 
 ## 已知数据形态（2026-10-17 核对）
 

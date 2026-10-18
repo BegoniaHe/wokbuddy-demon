@@ -1,9 +1,9 @@
 ---
 name: reverse-workbuddy
 description: >
-  解包 WorkBuddy 官方分发包（.tmp/workbuddy/ 下 cn / global 各版本 dmg 与
-  app-asar），调研客户端协议面并与本仓库 internal/upstream/ 实现做差异比对。
-  Use when investigating new client releases, upstream protocol drift,
+  自动下载并解包 WorkBuddy 官方分发包（.tmp/workbuddy/ 下 cn / global 各版本
+  dmg 与 app-asar），调研客户端协议面并与本仓库 internal/upstream/ 实现做差异
+  比对。Use when investigating new client releases, upstream protocol drift,
   realm/version differences, or re-verifying the current protocol baseline.
   不用于 git 历史形态的上游同步（那走 sync-upstream）。
 ---
@@ -42,7 +42,22 @@ description: >
 
 ## 工作流
 
-1. **定位与解包**。确认 `.tmp/workbuddy/<realm>/<version>/` 下已有产物：
+1. **取最新安装包**。默认同时查 cn / global、按当前机器平台下载到
+   `.tmp/workbuddy/<realm>/<version>/`：
+
+   ```bash
+   # 先看将下载什么（推荐）
+   node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs --dry-run
+   # 下载（已存在则跳过；--force 覆盖）
+   node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs
+   # 指定 realm / 平台
+   node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs --realm all --platform darwin-arm64
+   ```
+
+   脚本查 `https://www.workbuddy.ai|www.workbuddy.cn/v2/update?platform=...`，
+   macOS 取接口同版本 `.dmg`（接口默认给 `.zip`）。需要历史版本时手工放置到
+   同目录结构。
+2. **定位与解包**。确认 `.tmp/workbuddy/<realm>/<version>/` 下已有产物：
    - `app-asar/`：已解包的 ASAR 树（直接可用）；
    - `asar-extract.mjs`：同目录提取脚本，缺 `app-asar/` 时对 `WorkBuddy.app`
      内的 `app.asar` 重跑：
@@ -50,7 +65,7 @@ description: >
      （unpackedRoot 用 `.app/Contents/Resources/app.unpacked`，缺则空目录）。
    - `extracted/`：dmg 挂载拷贝出的 `.app`（取 `Contents/Resources/` 下的
      `app.asar` 与 `app.unpacked`）。
- 2. **粗扫协议面**（每次调研必做，秒级）：
+3. **粗扫协议面**（每次调研必做，秒级）：
 
     ```bash
     node .agents/skills/reverse-workbuddy/scripts/protocol_sweep.mjs --root .tmp/workbuddy
@@ -60,7 +75,7 @@ description: >
    扫描 `main/cli/renderer/preload` 下 `*.js|mjs|cjs` 的端点路径字面量、
    `X-*` 头族与 UA 模板，汇总成 JSON。压缩主进程是单行大文件，rg 逐条 grep
    慢且噪声大，先用本脚本拿集合。
-3. **取权威事实源**（按优先级，命中即记，冲突时以更靠上游者为准）：
+4. **取权威事实源**（按优先级，命中即记，冲突时以更靠上游者为准）：
    - `<app-asar>/cli/product.json`：`endpoint` / `officialEndpoints` /
      `authentication.id` / `authentication.type` / `authentication.attributes`
      （含 `internalDomain` / `externalDomain` / `iOADomain` / `prefixPath`）。
@@ -74,7 +89,7 @@ description: >
      `X-Stainless-*` 族即来自该 SDK（`internal/detect-platform.js` 有字面量）。
    - `<app-asar>/main/server.js` 等：`/v2/report` 上报指纹字段
      （ideName/extName/product/commit/releaseDate）。
-4. **与本仓库实现比对**。事实源锚点：
+5. **与本仓库实现比对**。事实源锚点：
    - realm 分域常量与 UA：`internal/upstream/headers.go`（`cnClientVersion`
      / `globalClientVersion` / `cnCliVersion` / `globalCliVersion`、
      `originRefererCN/Global`、`userAgent` 三段形态）。
@@ -87,7 +102,7 @@ description: >
    - 桌面指纹上报：`internal/upstream/desktop.go`（`cnDesktopCommit` /
      `globalDesktopCommit` 等固定指纹）。
    - 注册激活：`internal/upstream/global_register.go`（链路注释即此前逆向结论）。
-5. **写差异报告**到 `.tmp/workbuddy-diff/<date>-<a>_vs_<b>.md`，章节：
+6. **写差异报告**到 `.tmp/workbuddy-diff/<date>-<a>_vs_<b>.md`，章节：
    - 对比对象（版本目录、realm、`product.json` endpoint/auth id）。
    - 端点集差异（新增 / 消失 / 路径迁移，如 `/billing/meter/*` 有无 `/v2` 前缀）。
    - 请求头族差异（桌面三段 UA、`X-IDE-*`、`X-Agent-*`、`X-Conversation-*`、
@@ -98,7 +113,7 @@ description: >
    粗扫答不上的问题（某 header 挂哪个模块的哪条请求、两版本同一端点的调用方
    是否同源、DMG 成员清单）再上 REA 深挖，编排见
    `references/rea-toolchain.md`（先 summary 后翻页，全程只读）。
-6. **验证**。只做静态调研时无需构建；若落地代码改动：
+7. **验证**。只做静态调研时无需构建；若落地代码改动：
    `go build ./... && go test ./internal/upstream/...`，头部常量改动补
    `internal/upstream/desktop_test.go` / `headers` 相关用例，再
    `make fmt-check`。
@@ -115,11 +130,14 @@ description: >
 - `references/protocol-anchors.md`：协议面事实源与本仓库 `path:line` 锚点速查。
 - `references/rea-toolchain.md`：REA 静态分析编排（ASAR 应用图、版本比对、
   抓包归档归纳）与约束。默认先用 `scripts/protocol_sweep.mjs`，不够再上 REA。
+- `scripts/download_latest.mjs`：查官方更新接口并下载 cn / global 最新包。
 - `scripts/extract_asar.mjs`：ASAR 提取；`scripts/protocol_sweep.mjs`：粗扫。
 
 ## Verify
 
 - 报告每条差异都能追到一个客户端文件位置或一个本仓库 `path:line`。
+- `node scripts/download_latest.mjs --dry-run` 给出的版本与 `.tmp/workbuddy/`
+  下解包目录所用版本一致（或明确说明只调研历史版本）。
 - `node scripts/extract_asar.mjs` 重跑结果与既有 `app-asar/` 目录一致
   （抽样比对若干文件字节）。
 - `node scripts/protocol_sweep.mjs` 的端点集合与报告引用的端点集合一致。
