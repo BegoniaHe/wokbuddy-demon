@@ -2,6 +2,7 @@ package redisstore
 
 import (
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -75,4 +76,29 @@ func TestBindKeyPrefix(t *testing.T) {
 	if got := bindKey("abc"); got != bindPrefix+"abc" {
 		t.Errorf("bindKey=%q want prefix", got)
 	}
+}
+
+// TestZeroValueConcurrentInit（R3）：零值 Upstash 并发 goWrite/Close 时
+// sem/done 只能初始化一次，不能出现字段写竞争。
+func TestZeroValueConcurrentInit(t *testing.T) {
+	t.Parallel()
+
+	var u Upstash
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			u.goWrite(func() {})
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = u.Close()
+	}()
+
+	wg.Wait()
 }
