@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -168,7 +170,7 @@ func decodeAnthropicRequest(body []byte) (*anthropicRequest, error) {
 func buildOpenAIRequest(req *anthropicRequest) (map[string]any, error) {
 	out := map[string]any{"model": req.Model, "stream": req.Stream}
 	msgs := make([]any, 0, len(req.Messages)+1)
-	if system := anthropicText(req.System); system != "" {
+	if system := anthropicSystemContent(req.System); system != nil {
 		msgs = append(msgs, map[string]any{"role": "system", "content": system})
 	}
 	for _, raw := range req.Messages {
@@ -206,6 +208,60 @@ func applyAnthropicParams(out map[string]any, req *anthropicRequest) {
 	if thinking := anthropicThinking(req.Thinking); thinking != nil {
 		out["thinking"] = thinking
 	}
+}
+
+// anthropicSystemContent 转换 system：无 cache_control 时压成字符串（与旧行为一致），
+// 带 cache_control 时保留 text part 数组，让上游 prompt cache 标记不被网关吞掉。
+func anthropicSystemContent(raw json.RawMessage) any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		if text == "" {
+			return nil
+		}
+		return text
+	}
+	var blocks []map[string]any
+	if json.Unmarshal(raw, &blocks) != nil {
+		return nil
+	}
+	parts := textParts(blocks)
+	if len(parts) == 0 {
+		return nil
+	}
+	if !hasCacheControl(parts) {
+		return anthropicText(raw) // 无缓存标记：保持旧版 \n\n 拼接
+	}
+	return parts
+}
+
+// textParts 提取 text block（保留 cache_control），忽略其它类型。
+func textParts(blocks []map[string]any) []any {
+	parts := make([]any, 0, len(blocks))
+	for _, block := range blocks {
+		if part := textPart(block); part != nil {
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
+// textPart 把单个 Anthropic text block 转为 OpenAI text part（保留 cache_control）。
+func textPart(block map[string]any) map[string]any {
+	if block["type"] != "text" {
+		return nil
+	}
+	text, _ := block["text"].(string)
+	if text == "" {
+		return nil
+	}
+	part := map[string]any{"type": "text", "text": text}
+	if cc, ok := block["cache_control"]; ok {
+		part["cache_control"] = cc
+	}
+	return part
 }
 
 // anthropicText 提取 Anthropic system / 内容块里的纯文本（字符串、raw JSON
@@ -305,6 +361,9 @@ func anthropicAssistantMessage(blocks []map[string]any) ([]any, error) {
 		}
 	}
 	msg := map[string]any{"role": "assistant", "content": strings.Join(texts, "\n")}
+	if parts := textParts(blocks); hasCacheControl(parts) {
+		msg["content"] = parts
+	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
 	}
@@ -318,8 +377,8 @@ func anthropicUserMessage(blocks []map[string]any) []any {
 	for _, block := range blocks {
 		switch block["type"] {
 		case "text":
-			if text, ok := block["text"].(string); ok && text != "" {
-				parts = append(parts, map[string]any{"type": "text", "text": text})
+			if part := textPart(block); part != nil {
+				parts = append(parts, part)
 			}
 		case "image":
 			if part := anthropicImagePart(block); part != nil {
@@ -369,6 +428,18 @@ func anthropicImagePart(block map[string]any) map[string]any {
 	return nil
 }
 
+// hasCacheControl 报告 parts 中是否有 cache_control（有则不压缩成字符串）。
+func hasCacheControl(parts []any) bool {
+	for _, part := range parts {
+		if m, ok := part.(map[string]any); ok {
+			if _, exists := m["cache_control"]; exists {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // openAIContent 纯文本时压成字符串，含图片时保留 parts 数组（上游多模态形态）。
 func openAIContent(parts []any) any {
 	allText := true
@@ -377,6 +448,10 @@ func openAIContent(parts []any) any {
 		m, _ := part.(map[string]any)
 		if m == nil || m["type"] != "text" {
 			allText = false
+			break
+		}
+		if _, ok := m["cache_control"]; ok {
+			allText = false // 保留 parts 数组，cache_control 不能在压缩成字符串时丢失
 			break
 		}
 		text, _ := m["text"].(string)
@@ -665,6 +740,8 @@ type anthropicToolBlock struct {
 	index int
 	id    string
 	name  string
+	// args 聚合本块所有 input_json_delta 分片，供收尾时校验是否可解析。
+	args strings.Builder
 }
 
 // Header 透传底层响应头（StreamHint 在此设置 SSE 头）。
@@ -868,6 +945,7 @@ func (a *anthropicStreamWriter) emitToolCalls(raw any) error {
 			return err
 		}
 		if args := toolCallArguments(call); args != "" {
+			block.args.WriteString(args)
 			if err := a.event("content_block_delta", map[string]any{
 				"type":  "content_block_delta",
 				"index": block.index,
@@ -963,6 +1041,19 @@ func (a *anthropicStreamWriter) closeBlock() error {
 	})
 }
 
+// validateToolArguments 在流收尾时校验各工具块聚合后的参数是否为合法 JSON。
+// 本期只观测，不改写分片：上游截断会在这里留下可检索的 WARN（不含参数原文）。
+func (a *anthropicStreamWriter) validateToolArguments() {
+	for _, block := range a.toolBlocks {
+		args := strings.TrimSpace(block.args.String())
+		if args == "" || json.Valid([]byte(args)) {
+			continue
+		}
+		log.Printf("WARN: [anthropic] invalid tool arguments model=%s tool=%s id=%s bytes=%d",
+			logfmt.Truncate(a.model, 64), logfmt.Truncate(block.name, 64), logfmt.Truncate(block.id, 64), len(args))
+	}
+}
+
 // finish 关闭块并写出 message_delta / message_stop（错误流不补正常收尾）。
 func (a *anthropicStreamWriter) finish() error {
 	if a.finished {
@@ -980,6 +1071,7 @@ func (a *anthropicStreamWriter) finish() error {
 	if err := a.closeBlock(); err != nil {
 		return err
 	}
+	a.validateToolArguments()
 	reason := a.stopReason
 	if reason == "" {
 		reason = "end_turn"

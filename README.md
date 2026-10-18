@@ -284,6 +284,8 @@ claude
 ```
 
 - 请求侧支持 `system`、文本/图片内容块、`tool_use` / `tool_result`、`tools`、`tool_choice`、`stop_sequences`、`thinking`；响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
+- system 与 message text 块上的 `cache_control` 会保留到出站 content parts，供上游 prompt cache 使用。
+- 流结束时校验各工具块聚合后的 `input_json_delta` 是否为合法 JSON；截断/非法时记 WARN（不含参数原文），本期不改写分片。
 - 上游错误转换为 Anthropic `{"type":"error","error":{...}}`，`gateway_hint` 保留在 error 对象内。
 - `count_tokens` 无本地 tokenizer，按请求文本字节数近似估算，仅用于客户端上下文预算，不作计费依据。
 - 未配置模型别名时，Anthropic 客户端可直接请求上游裸模型名。
