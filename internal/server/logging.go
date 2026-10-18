@@ -142,6 +142,7 @@ func (s *chatStat) done() {
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
 	br                  *bufio.Reader
+	src                 io.Closer // 底层上游 body（可为 nil）；Close 透传以解除异步读取阻塞
 	start               time.Time
 	ttfb                time.Duration
 	seen                bool // 已见过首个 data 帧（TTFB 只记一次）
@@ -164,6 +165,10 @@ type chatStatsReader struct {
 	pend         []byte // 已读未返回的行缓存
 }
 
+// chatStatsReader 必须实现 io.Closer：keepalive 流返回前由 upstream 关闭并等待
+// 读 goroutine 退出，之后才能安全地把 br 归还池中。
+var _ io.Closer = (*chatStatsReader)(nil)
+
 // statsReaderPool 复用 64KB 的 SSE 统计读取缓冲，避免每个流式请求一次大分配。
 var statsReaderPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, 64*1024) },
@@ -178,7 +183,20 @@ func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
 
 	reader.Reset(r)
 
-	return &chatStatsReader{br: reader, start: since}
+	src, _ := r.(io.Closer)
+
+	return &chatStatsReader{br: reader, src: src, start: since}
+}
+
+// Close 关闭底层上游 body。streamWithKeepalive 会在返回前关闭包装 reader 以
+// 解除异步逐行读取的阻塞，然后等待读 goroutine 退出——否则本对象可能被归还
+// 复用缓冲池时仍有 goroutine 在 Read（数据竞争 / nil 解引用）。
+func (s *chatStatsReader) Close() error {
+	if s == nil || s.src == nil {
+		return nil
+	}
+
+	return s.src.Close()
 }
 
 // release 归还底层缓冲（幂等）。调用方必须保证此后不再读取该 reader。

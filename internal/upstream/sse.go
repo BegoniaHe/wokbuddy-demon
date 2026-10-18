@@ -1200,12 +1200,19 @@ type lineResult struct {
 // 读放在独立 goroutine，主循环 select 读结果与心跳定时器；退出时关闭 r
 // （若可关闭）以解除读阻塞，避免 goroutine 泄漏。
 func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
-	if c, ok := r.(io.Closer); ok {
-		defer c.Close()
-	}
+	lines, done, finished := asyncLines(r)
+	// 返回前先关 done 再 Close 底层 reader（解除阻塞中的 Read），最后等读 goroutine
+	// 真正退出。只关 done 不等待会让调用方在 goroutine 仍读 r 时继续使用/释放 r
+	// （统计 reader 会把它包装的 bufio.Reader 归还池中，造成并发读写）。
+	defer func() {
+		close(done)
 
-	lines, done := asyncLines(r)
-	defer close(done)
+		if c, ok := r.(io.Closer); ok {
+			_ = c.Close()
+
+			<-finished
+		}
+	}()
 
 	ticker := time.NewTicker(s.keepalive)
 	defer ticker.Stop()
@@ -1241,12 +1248,15 @@ func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
 }
 
 // asyncLines 启动逐行读取 goroutine；done 关闭后 goroutine 退出。
-func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
+func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}, <-chan struct{}) {
 	reader := getSSEReader(r)
 	lines := make(chan lineResult)
 	done := make(chan struct{})
+	finished := make(chan struct{})
 
 	go func() {
+		// LIFO：先归还 reader 再宣告退出，等待方看到 finished 时 reader 已不在使用。
+		defer close(finished)
 		defer putSSEReader(reader)
 
 		for {
@@ -1263,7 +1273,7 @@ func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
 		}
 	}()
 
-	return lines, done
+	return lines, done, finished
 }
 
 // consumeLine 处理一行并更新最近写出时间；stop=true 表示应进入收尾（[DONE]/EOF）。
