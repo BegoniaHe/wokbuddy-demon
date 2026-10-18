@@ -769,6 +769,10 @@ var restartFieldPaths = []string{
 	"listen", "auth_dir", "state_file",
 	"server.read_timeout", "server.max_body_bytes",
 	"server.request_accept_grace_seconds", "server.shutdown_grace_seconds",
+	// CORS 允许列表在 handler 构造期复制，运行期无热更新。
+	"server.cors_origins",
+	// Pricing 目录与刷新协程在启动期创建。
+	"pricing.enabled", "pricing.refresh_minutes", "pricing.exchange_rate",
 	// HTTP client / 出站身份 / 代理在 configureUpstream 一次性注入。
 	"upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds",
 	"upstream.keepalive_interval", "upstream.model_timeouts", "upstream.user_agent",
