@@ -52,6 +52,10 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// retired 标记该凭证已从账号池删除：SaveAtomic 在此后拒绝写回，防止
+	// 删除时仍在途的 token refresh 把 auth 文件重新创建出来。
+	retired bool
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -59,6 +63,14 @@ func (a *Auth) Lock() { a.mu.Lock() }
 
 // Unlock 释放 a.Lock 获取的锁。
 func (a *Auth) Unlock() { a.mu.Unlock() }
+
+// Retire 标记凭证已从账号池删除，此后 SaveAtomic 拒绝写回。用于删除账号时
+// 阻断在途 refresh 的落盘，避免已删除的 auth 文件被重新创建、下次启动又载入。
+func (a *Auth) Retire() {
+	a.mu.Lock()
+	a.retired = true
+	a.mu.Unlock()
+}
 
 // AccessTokenValue 加锁读取 AccessToken（出站请求头一律经此取值，勿直读字段）。
 //
@@ -108,6 +120,16 @@ func (a *Auth) RefreshTokenValue() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.RefreshToken
+}
+
+// NicknameValue 加锁读取 Nickname（Pool.SetNickname 会在运行期改写它）。
+func (a *Auth) NicknameValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Nickname
 }
 
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
@@ -267,7 +289,7 @@ func realmFromIssuer(accessToken string) string {
 	var claims struct {
 		Iss string `json:"iss"`
 	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
+	if uerr := json.Unmarshal(payload, &claims); uerr != nil {
 		return ""
 	}
 	u, err := url.Parse(strings.TrimSpace(claims.Iss))
@@ -373,6 +395,9 @@ func Parse(raw []byte) (*Auth, error) {
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.retired {
+		return fmt.Errorf("save refused: auth removed (uid=%s)", a.UID)
+	}
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
 	}

@@ -9,6 +9,20 @@ import (
 	"testing"
 )
 
+// TestRetireBlocksSaveAtomic 删除账号后 Retire 必须让在途 refresh 的写回失败，
+// 不得重新创建 auth 文件。
+func TestRetireBlocksSaveAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "workbuddy-u1.json")
+	a := &Auth{UID: "u1", AccessToken: "at", FilePath: path}
+	a.Retire()
+	if err := a.SaveAtomic(); err == nil {
+		t.Fatal("Retire 后 SaveAtomic 应失败")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("Retire 后不应创建文件: %v", err)
+	}
+}
+
 func TestParseNested(t *testing.T) {
 	raw := []byte(`{"auth":{"accessToken":"at","refreshToken":"rt","expiresAt":1753600000,"domain":""},"account":{"uid":"u1","enterpriseId":"e1","nickname":"n1"}}`)
 	sa, err := Parse(raw)
