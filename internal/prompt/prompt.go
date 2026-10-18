@@ -34,10 +34,12 @@ func Load(mode, file string) (string, error) {
 	if file == "" {
 		return defaultPrompt, nil
 	}
+
 	raw, err := os.ReadFile(file)
 	if err != nil {
 		return "", fmt.Errorf("prompt file %s: %w", file, err)
 	}
+
 	return string(raw), nil
 }
 
@@ -53,6 +55,7 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 	if !ok {
 		return body
 	}
+
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
 		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
@@ -65,10 +68,12 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 		if isSystemMsg(m) {
 			continue
 		}
+
 		kept = append(kept, m)
 	}
 	// 头部插入单条 system 消息（prepend 避免整体重排语义）。
 	obj["messages"] = append([]any{systemMsg(systemPrompt)}, kept...)
+
 	return marshalOr(obj, body)
 }
 
@@ -93,6 +98,7 @@ func Append(body []byte, systemPrompt string) []byte {
 	if !ok {
 		return body
 	}
+
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
 		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
@@ -101,10 +107,12 @@ func Append(body []byte, systemPrompt string) []byte {
 	}
 	// 扫描开头连续 system/developer 块，遇第一条非 system/developer 即停。
 	insertAt := 0
+
 	for _, m := range msgs {
 		if !isSystemMsg(m) {
 			break
 		}
+
 		insertAt++
 	}
 	// 已有消息逐字不动：只在插入点拼接，不重排、不改写任何元素。
@@ -113,6 +121,7 @@ func Append(body []byte, systemPrompt string) []byte {
 	rewritten = append(rewritten, systemMsg(systemPrompt))
 	rewritten = append(rewritten, msgs[insertAt:]...)
 	obj["messages"] = rewritten
+
 	return marshalOr(obj, body)
 }
 
@@ -123,10 +132,12 @@ func decodeBody(body []byte, systemPrompt string) (map[string]any, bool) {
 	if len(body) == 0 || systemPrompt == "" {
 		return nil, false
 	}
+
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, false
 	}
+
 	return obj, true
 }
 
@@ -142,7 +153,9 @@ func isSystemMsg(m any) bool {
 	if !ok {
 		return false
 	}
+
 	role, _ := mm["role"].(string)
+
 	return role == "system" || role == "developer"
 }
 
@@ -152,5 +165,6 @@ func marshalOr(obj map[string]any, fallback []byte) []byte {
 	if err != nil {
 		return fallback
 	}
+
 	return out
 }

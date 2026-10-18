@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"sort"
 	"strings"
@@ -52,26 +53,32 @@ func IsClientWriteError(err error) bool { return errors.Is(err, errClientWrite) 
 // 聚合总量超 32 MiB → ErrSSEAggregateTooLong（issue #113），同样不返回残缺成功。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
 func Aggregate(r io.Reader) (map[string]any, error) {
-	a := newStreamAggregator()
+	streamAggregator2 := newStreamAggregator()
+
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
 		line, err := readSSELine(br)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, err
 		}
+
 		line = strings.TrimRight(line, "\r\n")
-		done, herr := a.handleLine(line)
+
+		done, herr := streamAggregator2.handleLine(line)
 		if herr != nil {
 			return nil, herr // 聚合总量超限：立即失败，不返回残缺成功（issue #113）
 		}
+
 		if done {
 			break // 上游显式发过 data: [DONE]（正常收尾）
 		}
+
 		if errors.Is(err, io.EOF) {
 			break
 		}
 	}
-	return a.result()
+
+	return streamAggregator2.result()
 }
 
 // streamAggregator Aggregate 的聚合状态机：把逐帧解析拆到方法上，降低单函数复杂度。
@@ -87,13 +94,9 @@ type streamAggregator struct {
 	validEvents   int
 	sawDone       bool // 上游显式发过 data: [DONE]（正常收尾）
 	toolCalls     map[int]map[string]any
-	toolOrder     []int
-	// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
-	// 同帧内递增（见 mergeToolCallsChunk 注释）。
-	toolSeq int
-	// idIndex id → 已分配的 index：跨帧持续（延续碎片的 id 常出现在后续帧），
-	// 供缺 index 时按 id 归位既有调用（见 mergeToolCallsChunk 注释）。
-	idIndex map[string]int
+	// tools 解析 tool_call 归属 index（兼容上游省略 index 的形态）；聚合与逐帧
+	// 透传路径共用同一套规则。
+	tools *toolIndex
 	// guard 聚合总量上限（issue #113）：content/reasoning/tool_call arguments
 	// 三条写入路径都经它。超限即失败，不返回残缺成功响应。
 	guard aggregateGuard
@@ -105,7 +108,7 @@ func newStreamAggregator() *streamAggregator {
 		role:         "assistant",
 		finishReason: "stop",
 		toolCalls:    map[int]map[string]any{},
-		idIndex:      map[string]int{},
+		tools:        newToolIndex(),
 	}
 }
 
@@ -115,12 +118,14 @@ func (a *streamAggregator) handleLine(line string) (bool, error) {
 	if !strings.HasPrefix(line, "data: ") {
 		return false, nil
 	}
+
 	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
 		// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
 		a.sawDone = true
 		return true, nil
 	}
+
 	var chunk map[string]any
 	if json.Unmarshal([]byte(payload), &chunk) == nil {
 		// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
@@ -129,25 +134,30 @@ func (a *streamAggregator) handleLine(line string) (bool, error) {
 			return false, err
 		}
 	}
+
 	return false, nil
 }
 
 // handleChunk 并入一个数据帧的顶层字段与 choices。聚合超限返回错误（issue #113）。
 func (a *streamAggregator) handleChunk(chunk map[string]any) error {
 	a.mergeChunkMeta(chunk)
+
 	ch, ok := chunk["choices"].([]any)
 	if !ok {
 		return nil
 	}
+
 	for _, ci := range ch {
 		c, _ := ci.(map[string]any)
 		if c == nil {
 			continue
 		}
+
 		if err := a.handleChoice(c); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -156,12 +166,15 @@ func (a *streamAggregator) mergeChunkMeta(chunk map[string]any) {
 	if v, ok := chunk["id"].(string); ok && a.id == "" {
 		a.id = v
 	}
+
 	if v, ok := chunk["model"].(string); ok && a.model == "" {
 		a.model = v
 	}
+
 	if v, ok := chunk["created"].(float64); ok && a.created == 0 {
 		a.created = v
 	}
+
 	if u, ok := chunk["usage"].(map[string]any); ok {
 		a.usage = u
 	}
@@ -169,11 +182,12 @@ func (a *streamAggregator) mergeChunkMeta(chunk map[string]any) {
 
 // handleChoice 并入单个 choice：finish_reason + delta（或整条 message）。
 // 聚合超限返回错误（issue #113）。
-func (a *streamAggregator) handleChoice(c map[string]any) error {
-	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+func (a *streamAggregator) handleChoice(table3 map[string]any) error {
+	if fr, ok := table3["finish_reason"].(string); ok && fr != "" {
 		a.finishReason = fr
 	}
-	if delta, ok := c["delta"].(map[string]any); ok {
+
+	if delta, ok := table3["delta"].(map[string]any); ok {
 		if err := a.handleDelta(delta); err != nil {
 			return err
 		}
@@ -181,9 +195,10 @@ func (a *streamAggregator) handleChoice(c map[string]any) error {
 	// 有的上游把完整消息放在 message 里（非 delta）：整条并入（role/content/
 	// reasoning_content/tool_calls），与 delta 分支同构。delta 已取过正文
 	// （gotAnyContent）则跳过（避免与 delta 路径重复拼接——PR #134 的 latch 语义）。
-	if msg, ok := c["message"].(map[string]any); ok && !a.gotAnyContent {
+	if msg, ok := table3["message"].(map[string]any); ok && !a.gotAnyContent {
 		return a.mergeMessageFields(msg)
 	}
+
 	return nil
 }
 
@@ -193,22 +208,27 @@ func (a *streamAggregator) handleDelta(delta map[string]any) error {
 	if r2, ok := delta["role"].(string); ok && r2 != "" {
 		a.role = r2
 	}
+
 	if txt, ok := delta["content"].(string); ok {
 		if err := a.appendContent(txt); err != nil {
 			return err
 		}
 	}
+
 	if rc, ok := delta["reasoning_content"].(string); ok {
 		if err := a.guard.add(len(rc)); err != nil {
 			return err
 		}
+
 		a.reasoning.WriteString(rc)
 	}
+
 	if tcs, ok := delta["tool_calls"].([]any); ok {
 		if err := a.mergeToolCallsChunk(tcs); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -220,20 +240,25 @@ func (a *streamAggregator) mergeMessageFields(msg map[string]any) error {
 	if r2, ok := msg["role"].(string); ok && r2 != "" {
 		a.role = r2
 	}
+
 	if txt, ok := msg["content"].(string); ok {
 		if err := a.appendContent(txt); err != nil {
 			return err
 		}
 	}
+
 	if rc, ok := msg["reasoning_content"].(string); ok {
 		if err := a.guard.add(len(rc)); err != nil {
 			return err
 		}
+
 		a.reasoning.WriteString(rc)
 	}
+
 	if tcs, ok := msg["tool_calls"].([]any); ok {
 		return a.mergeToolCallsChunk(tcs)
 	}
+
 	return nil
 }
 
@@ -250,51 +275,100 @@ func (a *streamAggregator) appendContent(txt string) error {
 	if txt == "" {
 		return nil
 	}
+
 	if err := a.guard.add(len(txt)); err != nil {
 		return err
 	}
+
 	a.content.WriteString(txt)
 	a.gotAnyContent = true
+
 	return nil
 }
 
-// nextToolIndex 分配下一个不冲突的缺 index 序号：从 toolSeq 起递增跳过既有
-// index（合规流的 index 是 0..N-1，缺 index 的补位不能覆盖它们）。
-func (a *streamAggregator) nextToolIndex() int {
-	for {
-		idx := a.toolSeq
-		a.toolSeq++
-		if _, used := a.toolCalls[idx]; !used {
-			return idx
-		}
-	}
-}
-
-// toolCallIndex 解析单个 tool_call 的归属 index，兼容上游省略 index 的形态。
+// toolIndex 解析 tool_call 的归属 index，兼容上游省略 index 的形态。
 //
 // index 缺失兼容：OpenAI 规范要求 delta 帧的 tool_call 带 index（标记分片归属），
 // 但部分上游省略它。此前缺 index 一律归 0——多调用场景下不同 call 被合并进同一
-// index 槽，arguments 串联、name 互相覆盖（数据污染）。修法按「id 优先、lastIdx 兜底」：
+// index 槽，arguments 串联、name 互相覆盖（数据污染）。归位规则：
 //   - 带 index → 按 index 累积（合规形态，零改动）；
 //   - 缺 index 带 id 且 id 已见过 → 延续该 id 所在 index；
 //   - 缺 index 带 id 且 id 是新的 → 开新序号（多调用不合并）；
 //   - 缺 index 无 id → 追加到最近收到碎片的 index（单个调用的延续分片无 id
 //     是标准形态），无既往则开新号。
-func (a *streamAggregator) toolCallIndex(call map[string]any) int {
-	if v, ok := call["index"].(float64); ok {
-		return int(v)
-	}
-	cid, _ := call["id"].(string)
-	if cid != "" {
-		if mid, seen := a.idIndex[cid]; seen {
-			return mid // 该 id 已归位过：延续既有调用（跨帧有效）
+//
+// 聚合路径与逐帧透传路径共用本类型，避免两条路径对「缺 index」给出不同结论。
+type toolIndex struct {
+	seq      int
+	order    []int
+	byID     map[string]int
+	occupied map[int]bool
+}
+
+func newToolIndex() *toolIndex {
+	return &toolIndex{byID: map[string]int{}, occupied: map[int]bool{}}
+}
+
+// next 分配下一个不冲突的缺 index 序号：从 seq 起递增跳过既有 index
+// （合规流的 index 是 0..N-1，缺 index 的补位不能覆盖它们）。
+func (t *toolIndex) next() int {
+	for {
+		idx := t.seq
+
+		t.seq++
+		if !t.occupied[idx] {
+			return idx
 		}
-		return a.nextToolIndex()
 	}
-	if len(a.toolOrder) > 0 {
-		return a.toolOrder[len(a.toolOrder)-1] // 无 id 碎片：延续最近调用
+}
+
+// resolve 返回单个 tool_call 的归属 index，并把 index/id 记入跨帧状态。
+func (t *toolIndex) resolve(call map[string]any) int {
+	if v, ok := call["index"].(float64); ok {
+		idx := int(v)
+		t.occupy(idx)
+		t.remember(call, idx)
+
+		return idx
 	}
-	return a.nextToolIndex()
+
+	if cid, _ := call["id"].(string); cid != "" {
+		if idx, seen := t.byID[cid]; seen {
+			return idx
+		}
+
+		idx := t.next()
+		t.occupy(idx)
+		t.byID[cid] = idx
+
+		return idx
+	}
+
+	if len(t.order) > 0 {
+		return t.order[len(t.order)-1] // 无 id 碎片：延续最近调用
+	}
+
+	idx := t.next()
+	t.occupy(idx)
+
+	return idx
+}
+
+// occupy 记录 index 已使用；首次出现时同步 order（结果按出现顺序输出）。
+func (t *toolIndex) occupy(idx int) {
+	if t.occupied[idx] {
+		return
+	}
+
+	t.occupied[idx] = true
+	t.order = append(t.order, idx)
+}
+
+// remember 记录 id → index，供后续缺 index 分片归位。
+func (t *toolIndex) remember(call map[string]any, idx int) {
+	if cid, _ := call["id"].(string); cid != "" {
+		t.byID[cid] = idx
+	}
 }
 
 // mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进累计表。
@@ -307,20 +381,17 @@ func (a *streamAggregator) mergeToolCallsChunk(tcs []any) error {
 		if !ok {
 			continue
 		}
-		idx := a.toolCallIndex(call)
+
+		idx := a.tools.resolve(call)
+
 		merged, seen := a.toolCalls[idx]
 		if !seen {
 			merged = map[string]any{"index": idx}
 			a.toolCalls[idx] = merged
-			a.toolOrder = append(a.toolOrder, idx)
 		}
-		if cid, _ := call["id"].(string); cid != "" {
-			a.idIndex[cid] = idx
-		}
-		if cid, _ := merged["id"].(string); cid != "" {
-			a.idIndex[cid] = idx
-		}
+
 		mergeToolCallDelta(merged, call)
+
 		if fn, _ := call["function"].(map[string]any); fn != nil {
 			if args, _ := fn["arguments"].(string); args != "" {
 				if err := a.guard.add(len(args)); err != nil {
@@ -329,6 +400,7 @@ func (a *streamAggregator) mergeToolCallsChunk(tcs []any) error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -340,18 +412,22 @@ func (a *streamAggregator) result() (map[string]any, error) {
 		// 不再合成空 content 的假成功响应，直接报错，由 handler 映射为 502 upstream_parse。
 		return nil, errEmptyStream
 	}
+
 	if !a.sawDone {
 		// EOF 收尾但上游从未发 data: [DONE]（issue #105）：连接被切 / 代理中断 /
 		// 上游崩溃。累积的 content 只是截断片段，不能当完整回答返回——非流式没有
 		// 「补帧让客户端收尾」的余地，直接报上游解析失败，由 handler 映射 502。
 		return nil, errTruncatedStream
 	}
+
 	if a.id == "" {
 		a.id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	}
+
 	if a.created == 0 {
 		a.created = float64(time.Now().Unix())
 	}
+
 	message := map[string]any{
 		"role":    a.role,
 		"content": a.content.String(),
@@ -359,7 +435,9 @@ func (a *streamAggregator) result() (map[string]any, error) {
 	if a.reasoning.Len() > 0 {
 		message["reasoning_content"] = a.reasoning.String()
 	}
+
 	a.attachToolCalls(message)
+
 	resp := map[string]any{
 		"id":      a.id,
 		"object":  "chat.completion",
@@ -380,17 +458,20 @@ func (a *streamAggregator) result() (map[string]any, error) {
 		// （不臆造：单边有值无法合成可信的 total）。
 		resp["usage"] = normalizeUsageCacheAliases(ensureUsageTotal(a.usage))
 	}
+
 	return resp, nil
 }
 
 // attachToolCalls 把累计的 tool_calls 按序写入 message（截断流剔除残缺参数）。
 func (a *streamAggregator) attachToolCalls(message map[string]any) {
-	if len(a.toolOrder) == 0 {
+	if len(a.tools.order) == 0 {
 		return
 	}
-	sort.Ints(a.toolOrder)
-	calls := make([]map[string]any, 0, len(a.toolOrder))
-	for _, idx := range a.toolOrder {
+
+	sort.Ints(a.tools.order)
+
+	calls := make([]map[string]any, 0, len(a.tools.order))
+	for _, idx := range a.tools.order {
 		calls = append(calls, a.toolCalls[idx])
 	}
 	// P1b：流被截断时 tool_call 的 arguments 是残缺 JSON（解析失败），不把脏参数
@@ -402,6 +483,7 @@ func (a *streamAggregator) attachToolCalls(message map[string]any) {
 	if a.finishReason == "length" || !a.sawDone {
 		calls = dropTruncatedToolCalls(calls)
 	}
+
 	if len(calls) > 0 {
 		message["tool_calls"] = calls
 	}
@@ -410,20 +492,22 @@ func (a *streamAggregator) attachToolCalls(message map[string]any) {
 // ensureUsageTotal 在 usage 缺 total_tokens 但 prompt_tokens/completion_tokens 都在时
 // 补齐 total = prompt + completion（通过新 map 合并，不修改原上游 map）。
 // 任一缺失或已有 total 时原样返回。
-func ensureUsageTotal(u map[string]any) map[string]any {
-	if _, ok := u["total_tokens"]; ok {
-		return u
+func ensureUsageTotal(table map[string]any) map[string]any {
+	if _, ok := table["total_tokens"]; ok {
+		return table
 	}
-	pt, pok := num64(u["prompt_tokens"])
-	ct, cok := num64(u["completion_tokens"])
+
+	num, pok := num64(table["prompt_tokens"])
+
+	num2, cok := num64(table["completion_tokens"])
 	if !pok || !cok {
-		return u
+		return table
 	}
-	out := make(map[string]any, len(u)+1)
-	for k, v := range u {
-		out[k] = v
-	}
-	out["total_tokens"] = pt + ct
+
+	out := make(map[string]any, len(table)+1)
+	maps.Copy(out, table)
+	out["total_tokens"] = num + num2
+
 	return out
 }
 
@@ -449,17 +533,20 @@ func num64(v any) (float64, bool) {
 func mergeToolCallDelta(merged, delta map[string]any) {
 	setStringIfNonEmpty(merged, delta, "id")
 	setStringIfNonEmpty(merged, delta, "type")
-	df, _ := delta["function"].(map[string]any)
-	if df == nil {
+
+	table2, _ := delta["function"].(map[string]any)
+	if table2 == nil {
 		return
 	}
-	mf, _ := merged["function"].(map[string]any)
-	if mf == nil {
-		mf = map[string]any{}
-		merged["function"] = mf
+
+	table, _ := merged["function"].(map[string]any)
+	if table == nil {
+		table = map[string]any{}
+		merged["function"] = table
 	}
-	setStringIfNonEmpty(mf, df, "name")
-	appendStringIfNonEmpty(mf, df, "arguments")
+
+	setStringIfNonEmpty(table, table2, "name")
+	appendStringIfNonEmpty(table, table2, "arguments")
 }
 
 // setStringIfNonEmpty 把 src[key] 的非空字符串覆盖写入 dst[key]（缺失/空串不动）。
@@ -471,14 +558,15 @@ func setStringIfNonEmpty(dst, src map[string]any, key string) {
 
 // appendStringIfNonEmpty 把 src[key] 的非空字符串拼接到 dst[key] 已有字符串之后。
 func appendStringIfNonEmpty(dst, src map[string]any, key string) {
-	v, ok := src[key].(string)
-	if !ok || v == "" {
+	str, ok := src[key].(string)
+	if !ok || str == "" {
 		return
 	}
+
 	if prev, _ := dst[key].(string); prev != "" {
-		dst[key] = prev + v
+		dst[key] = prev + str
 	} else {
-		dst[key] = v
+		dst[key] = str
 	}
 }
 
@@ -497,32 +585,33 @@ func appendStringIfNonEmpty(dst, src map[string]any, key string) {
 //
 // seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
 // 只动 function.name 键，id/type/arguments 原样透传。
-func stripToolCallNames(obj map[string]any, seen map[int]bool) {
+func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
 		if c == nil {
 			continue
 		}
+
 		delta, _ := c["delta"].(map[string]any)
 		if delta == nil {
 			continue
 		}
+
 		tcs, _ := delta["tool_calls"].([]any)
 		for _, tci := range tcs {
-			tc, _ := tci.(map[string]any)
-			if tc == nil {
+			table, _ := tci.(map[string]any)
+			if table == nil {
 				continue
 			}
-			idx := 0
-			if v, ok := tc["index"].(float64); ok {
-				idx = int(v)
-			}
+
+			idx := tools.resolve(table)
 			if seen[idx] {
 				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
-				if fn, _ := tc["function"].(map[string]any); fn != nil {
+				if fn, _ := table["function"].(map[string]any); fn != nil {
 					delete(fn, "name")
 				}
+
 				continue
 			}
 			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
@@ -538,17 +627,21 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 // usage 缺失 → null，保证任意标准客户端按规范解析。
 func normalizeFrame(obj map[string]any) map[string]any {
 	out := map[string]any{}
+
 	for _, k := range []string{"id", "object", "created", "model", "system_fingerprint", "service_tier"} {
 		if v, ok := obj[k]; ok && v != nil {
 			out[k] = v
 		}
 	}
+
 	if _, ok := out["object"]; !ok {
 		out["object"] = "chat.completion.chunk"
 	}
+
 	if _, ok := out["id"]; !ok {
 		out["id"] = "chatcmpl-wb2api"
 	}
+
 	if chs, ok := obj["choices"].([]any); ok {
 		nchs := make([]any, 0, len(chs))
 		for _, ci := range chs {
@@ -556,49 +649,59 @@ func normalizeFrame(obj map[string]any) map[string]any {
 				nchs = append(nchs, normalizeChoice(c))
 			}
 		}
+
 		out["choices"] = nchs
 	}
+
 	out["usage"] = normalizeFrameUsage(obj["usage"])
+
 	return out
 }
 
 // normalizeChoice 以白名单重建单个 choice（index + 规范化 delta + finish_reason）。
-func normalizeChoice(c map[string]any) map[string]any {
-	nc := map[string]any{}
-	if idx, ok := c["index"]; ok {
-		nc["index"] = idx
+func normalizeChoice(table2 map[string]any) map[string]any {
+	table := map[string]any{}
+	if idx, ok := table2["index"]; ok {
+		table["index"] = idx
 	}
-	nc["delta"] = normalizeDelta(c["delta"])
-	if fr, ok := c["finish_reason"].(string); ok && fr != "" {
-		nc["finish_reason"] = fr
+
+	table["delta"] = normalizeDelta(table2["delta"])
+	if fr, ok := table2["finish_reason"].(string); ok && fr != "" {
+		table["finish_reason"] = fr
 	} else {
-		nc["finish_reason"] = nil
+		table["finish_reason"] = nil
 	}
-	return nc
+
+	return table
 }
 
 // normalizeDelta 以白名单重建 delta：仅保留非空的 role/content/reasoning_content/
 // refusal，非空 tool_calls，以及非空占位的 function_call。
 func normalizeDelta(raw any) map[string]any {
-	d, ok := raw.(map[string]any)
+	table, ok := raw.(map[string]any)
 	if !ok {
 		return map[string]any{}
 	}
+
 	delta := map[string]any{}
+
 	for _, k := range []string{"role", "content", "reasoning_content", "refusal"} {
-		if v, ok := d[k].(string); ok && v != "" {
+		if v, ok := table[k].(string); ok && v != "" {
 			delta[k] = v
 		}
 	}
-	if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
+
+	if tcs, ok := table["tool_calls"].([]any); ok && len(tcs) > 0 {
 		delta["tool_calls"] = tcs
 	}
-	if fc, ok := d["function_call"]; ok && fc != nil {
+
+	if fc, ok := table["function_call"]; ok && fc != nil {
 		// 空占位 function_call（name/arguments 全空）视为噪声剔除。
 		if keepFunctionCall(fc) {
 			delta["function_call"] = fc
 		}
 	}
+
 	return delta
 }
 
@@ -609,8 +712,10 @@ func keepFunctionCall(fc any) bool {
 	if !ok {
 		return true
 	}
+
 	n, _ := fcm["name"].(string)
 	a, _ := fcm["arguments"].(string)
+
 	return n != "" || a != ""
 }
 
@@ -619,6 +724,7 @@ func normalizeFrameUsage(rawUsage any) any {
 	if u, ok := rawUsage.(map[string]any); ok {
 		return normalizeUsageCacheAliases(u)
 	}
+
 	return rawUsage
 }
 
@@ -709,6 +815,10 @@ type streamWriter struct {
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen map[int]bool
 
+	// tools 与聚合路径共用同一套 tool_call index 归位规则：缺 index 时按
+	// id/最近调用归属，避免不同调用被当成同一 index 而误删 name。
+	tools *toolIndex
+
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
@@ -727,27 +837,32 @@ type streamWriter struct {
 
 // newStreamWriter 初始化 SSE 透传写入器（设置 SSE headers + 跨帧状态）。
 func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...StreamOption) *streamWriter {
-	var o streamOptions
+	var streamOptions2 streamOptions
+
 	for _, f := range opts {
 		if f != nil {
-			f(&o)
+			f(&streamOptions2)
 		}
 	}
+
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
+
 	fl, _ := w.(http.Flusher)
+
 	return &streamWriter{
 		w:            w,
 		fl:           fl,
 		hintFn:       hintFn,
-		opts:         o,
+		opts:         streamOptions2,
 		writeTimeout: clientWriteTimeout,
-		keepalive:    o.keepalive,
+		keepalive:    streamOptions2.keepalive,
 		toolCallSeen: map[int]bool{},
-		repair:       o.markup,
+		tools:        newToolIndex(),
+		repair:       streamOptions2.markup,
 		maxToolIdx:   -1,
 	}
 }
@@ -761,12 +876,15 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 // 「上游读失败」分开处置。
 func (s *streamWriter) writeAll(payload string) error {
 	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
+
 	if _, werr := io.WriteString(s.w, payload); werr != nil {
 		return fmt.Errorf("%w: %w", errClientWrite, werr)
 	}
+
 	if s.fl != nil {
 		s.fl.Flush()
 	}
+
 	return nil
 }
 
@@ -775,6 +893,7 @@ func (s *streamWriter) setWriteDeadline(deadline time.Time) {
 	if s.writeTimeout <= 0 {
 		return
 	}
+
 	_ = http.NewResponseController(s.w).SetWriteDeadline(deadline)
 }
 
@@ -792,6 +911,7 @@ func (s *streamWriter) writeRaw(payload string) error {
 	if hint := frameGatewayHint(s.hintFn, payload); hint != "" {
 		payload = attachHintToErrorFrame(payload, hint)
 	}
+
 	return s.writeSSE(payload)
 }
 
@@ -801,13 +921,15 @@ func (s *streamWriter) writeRaw(payload string) error {
 // fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 func (s *streamWriter) writeChunk(obj map[string]any, fallback string) error {
 	// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
-	stripToolCallNames(obj, s.toolCallSeen)
+	stripToolCallNames(obj, s.tools, s.toolCallSeen)
 	s.continueMessageID(obj)
 	s.trackMaxToolIdx(obj)
+
 	raw, err := json.Marshal(normalizeFrame(obj))
 	if err != nil {
 		return s.writeSSE(fallback)
 	}
+
 	return s.writeSSE(string(raw))
 }
 
@@ -818,8 +940,10 @@ func (s *streamWriter) continueMessageID(obj map[string]any) {
 		if v, ok := obj["id"].(string); ok && v != "" {
 			s.firstID = v
 		}
+
 		return
 	}
+
 	if v, ok := obj["id"].(string); !ok || v == "" {
 		obj["id"] = s.firstID
 	}
@@ -831,21 +955,25 @@ func (s *streamWriter) trackMaxToolIdx(obj map[string]any) {
 	if !ok {
 		return
 	}
+
 	for _, ci := range chs {
 		c, _ := ci.(map[string]any)
 		if c == nil {
 			continue
 		}
+
 		d, _ := c["delta"].(map[string]any)
 		if d == nil {
 			continue
 		}
+
 		tcs, _ := d["tool_calls"].([]any)
 		for _, tci := range tcs {
 			tc, _ := tci.(map[string]any)
 			if tc == nil {
 				continue
 			}
+
 			if v, ok := tc["index"].(float64); ok && int(v) > s.maxToolIdx {
 				s.maxToolIdx = int(v)
 			}
@@ -860,10 +988,12 @@ func (s *streamWriter) repairFrame(obj map[string]any) []map[string]any {
 	if !s.repair.Enabled() {
 		return []map[string]any{obj}
 	}
+
 	chs, ok := obj["choices"].([]any)
 	if !ok {
 		return []map[string]any{obj}
 	}
+
 	calls := s.feedRepair(chs)
 	if len(calls) == 0 {
 		// 本帧没命中标记；但本流此前还原过调用 → 把上游的 stop 收尾改写成
@@ -871,8 +1001,10 @@ func (s *streamWriter) repairFrame(obj map[string]any) []map[string]any {
 		if s.synthIdx > 0 && rewriteFinishReason(obj, "tool_calls") {
 			s.toolFinishSent = true
 		}
+
 		return []map[string]any{obj}
 	}
+
 	return s.expandMarkupCalls(obj, calls)
 }
 
@@ -880,27 +1012,33 @@ func (s *streamWriter) repairFrame(obj map[string]any) []map[string]any {
 // 正文（标记摘除后为空则删 content 键）。
 func (s *streamWriter) feedRepair(chs []any) []MarkupCall {
 	var calls []MarkupCall
+
 	for _, ci := range chs {
 		c, ok := ci.(map[string]any)
 		if !ok {
 			continue
 		}
-		d, ok := c["delta"].(map[string]any)
+
+		table, ok := c["delta"].(map[string]any)
 		if !ok {
 			continue
 		}
-		txt, ok := d["content"].(string)
+
+		txt, ok := table["content"].(string)
 		if !ok || txt == "" {
 			continue
 		}
+
 		emit, got := s.repair.Feed(txt)
 		calls = append(calls, got...)
+
 		if emit == "" {
-			delete(d, "content")
+			delete(table, "content")
 		} else {
-			d["content"] = emit
+			table["content"] = emit
 		}
 	}
+
 	return calls
 }
 
@@ -909,21 +1047,27 @@ func (s *streamWriter) feedRepair(chs []any) []MarkupCall {
 // 已经结束。注意「本帧本来没有 finish_reason」时**不得**补一帧收尾——上游的收尾帧
 // 随后就到，补了会变成两个 finish_reason（后续那个由 rewriteFinishReason 改写）。
 func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall) []map[string]any {
-	fr := takeFinishReason(obj)
+	str := takeFinishReason(obj)
 	out := []map[string]any{obj}
+
 	for _, call := range calls {
 		idx := s.maxToolIdx + 1 + s.synthIdx
 		s.synthIdx++
+
 		out = append(out, markupCallFrame(obj, idx, call))
 	}
-	if fr == "" {
+
+	if str == "" {
 		return out
 	}
-	if fr == "stop" {
-		fr = "tool_calls"
+
+	if str == "stop" {
+		str = "tool_calls"
 	}
-	out = append(out, finishOnlyFrame(obj, fr))
-	s.toolFinishSent = fr == "tool_calls"
+
+	out = append(out, finishOnlyFrame(obj, str))
+	s.toolFinishSent = str == "tool_calls"
+
 	return out
 }
 
@@ -936,6 +1080,7 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 		if werr := s.writeSSE(payload); werr != nil {
 			return 0, werr
 		}
+
 		return 0, nil
 	}
 	// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
@@ -947,16 +1092,20 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 		if s.opts.onErrorFrame != nil {
 			s.opts.onErrorFrame(payload)
 		}
+
 		if werr := s.writeRaw(payload); werr != nil {
 			return 0, werr
 		}
+
 		return 1, nil
 	}
+
 	for _, ch := range s.repairFrame(obj) {
 		if werr := s.writeChunk(ch, payload); werr != nil {
 			return 0, werr
 		}
 	}
+
 	return 1, nil
 }
 
@@ -970,11 +1119,14 @@ func (s *streamWriter) stream(r io.Reader) error {
 	// 流结束（含写失败）清掉写截止：连接可能被 keep-alive 复用，
 	// 残留的过期 deadline 会让后续请求的响应写立即失败。
 	defer s.setWriteDeadline(time.Time{})
+
 	if s.keepalive > 0 {
 		return s.streamWithKeepalive(r)
 	}
+
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+
 	for {
 		line, err := readSSELine(br)
 		if err != nil && !errors.Is(err, io.EOF) {
@@ -983,13 +1135,17 @@ func (s *streamWriter) stream(r io.Reader) error {
 			if errors.Is(err, ErrSSELineTooLong) {
 				s.finishSizeLimit()
 			}
+
 			return err
 		}
+
 		n, done, werr := s.handleStreamLine(line)
 		validFrames += n
+
 		if werr != nil {
 			return werr // 客户端写失败（或帧解析失败）：原样上抛
 		}
+
 		if done {
 			break
 		}
@@ -998,6 +1154,7 @@ func (s *streamWriter) stream(r io.Reader) error {
 			break
 		}
 	}
+
 	return s.finish(&validFrames)
 }
 
@@ -1014,26 +1171,32 @@ func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
 	if c, ok := r.(io.Closer); ok {
 		defer c.Close()
 	}
+
 	lines, done := asyncLines(r)
 	defer close(done)
 
 	ticker := time.NewTicker(s.keepalive)
 	defer ticker.Stop()
+
 	lastWrite := time.Now()
 	validFrames := 0
+
 	for {
 		select {
 		case res := <-lines:
 			n, stop, err := s.consumeLine(res, &lastWrite)
 			validFrames += n
+
 			if err != nil {
 				// 单行超限（issue #113）：keepalive 路径同样先写明确 error 帧 +
 				// [DONE]，再上抛让调用方按上游失败处置。
 				if errors.Is(err, ErrSSELineTooLong) {
 					s.finishSizeLimit()
 				}
+
 				return err
 			}
+
 			if stop {
 				return s.finish(&validFrames)
 			}
@@ -1047,22 +1210,25 @@ func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
 
 // asyncLines 启动逐行读取 goroutine；done 关闭后 goroutine 退出。
 func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
-	br := bufio.NewReaderSize(r, 64*1024)
+	reader := bufio.NewReaderSize(r, 64*1024)
 	lines := make(chan lineResult)
 	done := make(chan struct{})
+
 	go func() {
 		for {
-			line, err := readSSELine(br)
+			line, err := readSSELine(reader)
 			select {
 			case lines <- lineResult{line: line, err: err}:
 			case <-done:
 				return
 			}
+
 			if err != nil {
 				return
 			}
 		}
 	}()
+
 	return lines, done
 }
 
@@ -1072,12 +1238,15 @@ func (s *streamWriter) consumeLine(res lineResult, lastWrite *time.Time) (n int,
 	if n > 0 || strings.TrimSpace(res.line) != "" {
 		*lastWrite = time.Now()
 	}
+
 	if err != nil || stop || res.err == nil {
 		return n, stop, err
 	}
+
 	if errors.Is(res.err, io.EOF) {
 		return n, true, nil
 	}
+
 	return n, false, res.err
 }
 
@@ -1091,7 +1260,9 @@ func (s *streamWriter) keepaliveIfIdle(lastWrite *time.Time) error {
 	if _, _, err := s.handleStreamLine(": keepalive\n\n"); err != nil {
 		return err
 	}
+
 	*lastWrite = time.Now()
+
 	return nil
 }
 
@@ -1113,6 +1284,7 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 			return 0, false, werr
 		}
 	}
+
 	return 0, false, nil
 }
 
@@ -1125,6 +1297,7 @@ func (s *streamWriter) finishSizeLimit() {
 	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
 		return
 	}
+
 	if s.fl != nil {
 		s.fl.Flush()
 	}
@@ -1153,6 +1326,7 @@ func (s *streamWriter) finish(validFrames *int) error {
 	if err := s.writeAll("data: [DONE]\n\n"); err != nil {
 		return err
 	}
+
 	switch {
 	case *validFrames == 0:
 		return errEmptyStream
@@ -1170,6 +1344,7 @@ func (s *streamWriter) finishRepair(validFrames *int) error {
 	if !s.repair.Enabled() {
 		return nil
 	}
+
 	if tail := s.repair.Flush(); tail != "" {
 		tailObj := map[string]any{
 			"object": "chat.completion.chunk",
@@ -1181,13 +1356,16 @@ func (s *streamWriter) finishRepair(validFrames *int) error {
 		if werr := s.writeChunk(tailObj, ""); werr != nil {
 			return werr
 		}
+
 		*validFrames++
 	}
+
 	if s.synthIdx > 0 && !s.toolFinishSent {
 		if werr := s.writeChunk(finishOnlyFrame(map[string]any{}, "tool_calls"), ""); werr != nil {
 			return werr
 		}
 	}
+
 	return nil
 }
 
@@ -1198,6 +1376,7 @@ func frameGatewayHint(hintFn func(string) string, payload string) string {
 	}
 	// panic 隔离：hint 判定是补充功能，任何实现缺陷不得击穿流透传主路径。
 	defer func() { _ = recover() }()
+
 	return strings.TrimSpace(hintFn(payload))
 }
 
@@ -1209,15 +1388,19 @@ func attachHintToErrorFrame(payload, hint string) string {
 	if json.Unmarshal([]byte(payload), &obj) != nil {
 		return payload
 	}
+
 	e, ok := obj["error"].(map[string]any)
 	if !ok {
 		return payload
 	}
+
 	e["gateway_hint"] = hint
+
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return payload
 	}
+
 	return string(out)
 }
 
@@ -1225,19 +1408,23 @@ func attachHintToErrorFrame(payload, hint string) string {
 // 标记修复把一帧拆成多帧时需要它：finish_reason 必须落在工具调用帧之后，否则
 // 客户端在读到调用之前就认为回合结束了。
 func takeFinishReason(obj map[string]any) string {
-	fr := ""
+	str := ""
+
 	chs, _ := obj["choices"].([]any)
 	for _, ci := range chs {
-		c, _ := ci.(map[string]any)
-		if c == nil {
+		table, _ := ci.(map[string]any)
+		if table == nil {
 			continue
 		}
-		if v, ok := c["finish_reason"].(string); ok && v != "" && fr == "" {
-			fr = v
+
+		if v, ok := table["finish_reason"].(string); ok && v != "" && str == "" {
+			str = v
 		}
-		delete(c, "finish_reason")
+
+		delete(table, "finish_reason")
 	}
-	return fr
+
+	return str
 }
 
 // rewriteFinishReason 把 choice 上「已有且为 stop」的 finish_reason 改写成 want。
@@ -1246,17 +1433,20 @@ func takeFinishReason(obj map[string]any) string {
 // 返回是否发生了改写。
 func rewriteFinishReason(obj map[string]any, want string) bool {
 	changed := false
+
 	chs, _ := obj["choices"].([]any)
 	for _, ci := range chs {
-		c, _ := ci.(map[string]any)
-		if c == nil {
+		table, _ := ci.(map[string]any)
+		if table == nil {
 			continue
 		}
-		if v, ok := c["finish_reason"].(string); ok && v == "stop" {
-			c["finish_reason"] = want
+
+		if v, ok := table["finish_reason"].(string); ok && v == "stop" {
+			table["finish_reason"] = want
 			changed = true
 		}
 	}
+
 	return changed
 }
 
@@ -1272,11 +1462,13 @@ func markupCallFrame(src map[string]any, idx int, call MarkupCall) map[string]an
 			},
 		}},
 	}
+
 	for _, k := range []string{"created", "model"} {
 		if v, ok := src[k]; ok && v != nil {
 			frame[k] = v
 		}
 	}
+
 	return frame
 }
 
@@ -1290,10 +1482,12 @@ func finishOnlyFrame(src map[string]any, finish string) map[string]any {
 			"finish_reason": finish,
 		}},
 	}
+
 	for _, k := range []string{"created", "model"} {
 		if v, ok := src[k]; ok && v != nil {
 			frame[k] = v
 		}
 	}
+
 	return frame
 }

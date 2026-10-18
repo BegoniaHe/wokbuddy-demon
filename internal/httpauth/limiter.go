@@ -39,9 +39,11 @@ func NewLimiter(limit int, window time.Duration) *Limiter {
 	if limit <= 0 {
 		limit = DefaultFailLimit
 	}
+
 	if window <= 0 {
 		window = DefaultFailWindow
 	}
+
 	return &Limiter{limit: limit, window: window, now: time.Now, byIP: map[string]*failWindow{}}
 }
 
@@ -50,16 +52,20 @@ func (l *Limiter) Allow(ip string) (bool, time.Duration) {
 	if l == nil {
 		return true, 0
 	}
+
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	w := l.byIP[ip]
 	if w == nil || now.Sub(w.start) >= l.window {
 		return true, 0
 	}
+
 	if w.count < l.limit {
 		return true, 0
 	}
+
 	return false, w.start.Add(l.window).Sub(now)
 }
 
@@ -68,17 +74,22 @@ func (l *Limiter) Fail(ip string) {
 	if l == nil {
 		return
 	}
+
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
 	w := l.byIP[ip]
 	if w == nil || now.Sub(w.start) >= l.window {
 		if w == nil {
 			l.evictLocked(now)
 		}
+
 		l.byIP[ip] = &failWindow{start: now, count: 1}
+
 		return
 	}
+
 	w.count++
 }
 
@@ -88,21 +99,26 @@ func (l *Limiter) evictLocked(now time.Time) {
 	if len(l.byIP) < maxTrackedIPs {
 		return
 	}
+
 	for ip, w := range l.byIP {
 		if now.Sub(w.start) >= l.window {
 			delete(l.byIP, ip)
 		}
 	}
+
 	if len(l.byIP) < maxTrackedIPs {
 		return
 	}
+
 	oldestIP := ""
+
 	var oldest time.Time
 	for ip, w := range l.byIP {
 		if oldestIP == "" || w.start.Before(oldest) {
 			oldestIP, oldest = ip, w.start
 		}
 	}
+
 	if oldestIP != "" {
 		delete(l.byIP, oldestIP)
 	}
@@ -113,6 +129,7 @@ func (l *Limiter) Reset(ip string) {
 	if l == nil {
 		return
 	}
+
 	l.mu.Lock()
 	delete(l.byIP, ip)
 	l.mu.Unlock()
@@ -124,9 +141,11 @@ func RemoteIP(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
+
 	addr := strings.TrimSpace(r.RemoteAddr)
 	if host, _, err := net.SplitHostPort(addr); err == nil {
 		return host
 	}
+
 	return addr
 }

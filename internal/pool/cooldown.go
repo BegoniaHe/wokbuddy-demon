@@ -12,9 +12,11 @@ import (
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
 		e.creditsTotal = total
+
 		p.dirty.Store(true)
 	}
 }
@@ -26,26 +28,33 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 	if uid == "" || nickname == "" {
 		return false
 	}
+
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	entry2, ok := p.byUID[uid]
 	p.mu.RUnlock()
+
 	if !ok {
 		return false
 	}
-	a := e.a
-	a.Lock()
-	changed := a.Nickname != nickname
+
+	auth := entry2.a
+	auth.Lock()
+
+	changed := auth.Nickname != nickname
 	if changed {
-		a.Nickname = nickname
+		auth.Nickname = nickname
 	}
-	a.Unlock()
+	auth.Unlock()
+
 	if !changed {
 		return false
 	}
-	if err := a.SaveAtomic(); err != nil {
+
+	if err := auth.SaveAtomic(); err != nil {
 		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
 		return false
 	}
+
 	return true
 }
 
@@ -54,10 +63,12 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 func (p *Pool) NoteCheckinDone(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if e, ok := p.byUID[uid]; ok {
 		day := p.now().Format("2006-01-02")
 		if e.lastCheckinDay != day {
 			e.lastCheckinDay = day
+
 			p.dirty.Store(true)
 		}
 	}
@@ -69,41 +80,55 @@ func (p *Pool) NoteCheckinDone(uid string) {
 func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return
 	}
+
 	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(p.now(), credits, expiring, earliestAt, earliestRemaining)
-	e.credits = credits
-	e.creditsTotal = total
-	e.creditsExpiring = expiring
-	e.creditsEarliestExpiry = earliestAt
-	e.creditsEarliestRemaining = earliestRemaining
+	entry2.credits = credits
+	entry2.creditsTotal = total
+	entry2.creditsExpiring = expiring
+	entry2.creditsEarliestExpiry = earliestAt
+	entry2.creditsEarliestRemaining = earliestRemaining
+
 	p.dirty.Store(true)
 }
 
 // clampCreditsDetailed 把上游余额/到期明细钳到合法区间：负数归零、子集不超过总额，
 // 最早到期批次不在未来（或剩余为零）时整体清空。纯函数，便于单点校验。
-func clampCreditsDetailed(now time.Time, credits, expiring int64, earliestAt time.Time, earliestRemaining int64) (int64, int64, time.Time, int64) {
+func clampCreditsDetailed(
+	now time.Time,
+	credits, expiring int64,
+	earliestAt time.Time,
+	earliestRemaining int64,
+) (int64, int64, time.Time, int64) {
 	if credits < 0 {
 		credits = 0
 	}
+
 	if expiring < 0 {
 		expiring = 0
 	}
+
 	if expiring > credits {
 		expiring = credits
 	}
+
 	if earliestRemaining < 0 {
 		earliestRemaining = 0
 	}
+
 	if earliestRemaining > credits {
 		earliestRemaining = credits
 	}
+
 	if earliestAt.IsZero() || !earliestAt.After(now) || earliestRemaining == 0 {
 		earliestAt = time.Time{}
 		earliestRemaining = 0
 	}
+
 	return credits, expiring, earliestAt, earliestRemaining
 }
 
@@ -112,11 +137,13 @@ func clampCreditsDetailed(now time.Time, credits, expiring int64, earliestAt tim
 func (p *Pool) ClearExpiringSnapshots() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	for _, e := range p.byUID {
 		e.creditsExpiring = 0
 		e.creditsEarliestExpiry = time.Time{}
 		e.creditsEarliestRemaining = 0
 	}
+
 	p.dirty.Store(true)
 }
 
@@ -131,13 +158,14 @@ func (p *Pool) ClearExpiringSnapshots() {
 func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.until = p.now().Add(d)
-		e.coolKind = kind
-		e.reason = reason
+
+	if entry2, ok := p.byUID[uid]; ok {
+		entry2.until = p.now().Add(d)
+		entry2.coolKind = kind
+		entry2.reason = reason
 		// 非模型级冷却入口：清空会参与路由的模型级冷却，避免上一次
 		// 模型豁免泄漏到账号级冷却上；AuditOnly 条目不影响路由，保留展示。
-		clearRoutingModelCooldownsLocked(e)
+		clearRoutingModelCooldownsLocked(entry2)
 		p.dirty.Store(true)
 	}
 }
@@ -157,36 +185,42 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return
 	}
+
 	now := p.now()
+
 	if !resetAt.IsZero() {
 		// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
-		if e.modelCooldowns == nil {
-			e.modelCooldowns = map[string]modelCooldown{}
+		if entry2.modelCooldowns == nil {
+			entry2.modelCooldowns = map[string]modelCooldown{}
 		}
-		e.modelCooldowns[model] = modelCooldown{
+
+		entry2.modelCooldowns[model] = modelCooldown{
 			Until:   p.cappedSoftUntilLocked(now, resetAt),
 			ResetAt: resetAt,
 			Reason:  reason,
 		}
 		if p.onModelRateLimit != nil {
-			p.onModelRateLimit(uid, model, e.a.Realm(), resetAt)
+			p.onModelRateLimit(uid, model, entry2.a.Realm(), resetAt)
 		}
 	} else {
 		// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
 		// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
-		if e.coolKind != CoolSoft || !now.Before(e.until) {
-			d := p.jitterSoftDurationLocked(base, e.softStreak+1)
-			e.softStreak++
-			e.until = now.Add(d)
+		if entry2.coolKind != CoolSoft || !now.Before(entry2.until) {
+			d := p.jitterSoftDurationLocked(base, entry2.softStreak+1)
+			entry2.softStreak++
+			entry2.until = now.Add(d)
 		}
-		e.coolKind = CoolSoft
-		e.reason = reason
-		clearRoutingModelCooldownsLocked(e)
+
+		entry2.coolKind = CoolSoft
+		entry2.reason = reason
+		clearRoutingModelCooldownsLocked(entry2)
 	}
+
 	p.dirty.Store(true)
 }
 
@@ -197,41 +231,49 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return
 	}
+
 	now := p.now()
-	if old, exists := e.modelCooldowns[model]; exists && !old.AuditOnly && old.Until.After(now) {
+	if old, exists := entry2.modelCooldowns[model]; exists && !old.AuditOnly && old.Until.After(now) {
 		return // 已有真实模型冷却，审计记录不得覆盖路由截止
 	}
-	until := e.until
+
+	until := entry2.until
 	if until.IsZero() || !until.After(now) {
 		until = now.Add(p.softRateMaxOr())
 	}
-	if e.modelCooldowns == nil {
-		e.modelCooldowns = make(map[string]modelCooldown)
+
+	if entry2.modelCooldowns == nil {
+		entry2.modelCooldowns = make(map[string]modelCooldown)
 	}
-	e.modelCooldowns[model] = modelCooldown{
+
+	entry2.modelCooldowns[model] = modelCooldown{
 		Until:     until,
 		Reason:    reason,
 		AuditOnly: true,
 	}
+
 	p.dirty.Store(true)
 }
 
 // clearRoutingModelCooldownsLocked 删除参与选号豁免的模型冷却，保留 AuditOnly 台账。
 // 调用方必须已持有 p.mu 写锁。
-func clearRoutingModelCooldownsLocked(e *entry) {
-	for model, mc := range e.modelCooldowns {
+func clearRoutingModelCooldownsLocked(entry3 *entry) {
+	for model, mc := range entry3.modelCooldowns {
 		if !mc.AuditOnly {
-			delete(e.modelCooldowns, model)
+			delete(entry3.modelCooldowns, model)
 		}
 	}
-	if len(e.modelCooldowns) == 0 {
-		e.modelCooldowns = nil
+
+	if len(entry3.modelCooldowns) == 0 {
+		entry3.modelCooldowns = nil
 	}
 }
 
@@ -257,32 +299,41 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return
 	}
+
 	now := p.now()
+
 	hits := 0
-	if e.modelCooldowns != nil {
-		hits = e.modelCooldowns[model].Hits
+	if entry2.modelCooldowns != nil {
+		hits = entry2.modelCooldowns[model].Hits
 	}
+
 	hits++
+
 	ttl := modelBlockBaseTTL
 	if d := ttl * (1 << uint(min(hits-1, modelBlockShift))); d < modelBlockMaxTTL {
 		ttl = d
 	} else {
 		ttl = modelBlockMaxTTL
 	}
-	if e.modelCooldowns == nil {
-		e.modelCooldowns = map[string]modelCooldown{}
+
+	if entry2.modelCooldowns == nil {
+		entry2.modelCooldowns = map[string]modelCooldown{}
 	}
-	e.modelCooldowns[model] = modelCooldown{
+
+	entry2.modelCooldowns[model] = modelCooldown{
 		Until:  now.Add(ttl),
 		Reason: reason,
 		Hits:   hits,
 	}
+
 	p.dirty.Store(true)
 }
 
@@ -294,20 +345,26 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok || len(e.modelCooldowns) == 0 {
+
+	entry2, ok := p.byUID[uid]
+	if !ok || len(entry2.modelCooldowns) == 0 {
 		return
 	}
-	mc, exists := e.modelCooldowns[model]
+
+	mc, exists := entry2.modelCooldowns[model]
 	if !exists || !strings.HasPrefix(mc.Reason, "11102") {
 		return
 	}
-	delete(e.modelCooldowns, model)
-	if len(e.modelCooldowns) == 0 {
-		e.modelCooldowns = nil
+
+	delete(entry2.modelCooldowns, model)
+
+	if len(entry2.modelCooldowns) == 0 {
+		entry2.modelCooldowns = nil
 	}
+
 	p.dirty.Store(true)
 }
 
@@ -339,6 +396,7 @@ func modelBlockScope(total, withReset, distinctResets int, shared time.Time) (st
 	if total >= 2 && withReset == total && distinctResets == 1 && !shared.IsZero() {
 		return ModelBlockScopePlatform, shared
 	}
+
 	return ModelBlockScopeAccount, time.Time{}
 }
 
@@ -360,11 +418,13 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	if model == "" {
 		return ModelBlockStatus{}
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	now := p.now()
 
-	var st ModelBlockStatus
+	var modelBlockStatus ModelBlockStatus
 	// 重置时刻一致性统计（issue #29）：distinct 用集合去重，withReset 计带非零
 	// ResetAt 的账号数，shared 记唯一值。
 	var (
@@ -372,45 +432,54 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 		distinct  = make(map[time.Time]struct{})
 		shared    time.Time
 	)
-	for _, e := range p.byUID {
+
+	for _, item := range p.byUID {
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的
 		// 证明不成立——否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」。
-		if e.disabled || e.paused {
+		if item.disabled || item.paused {
 			continue // 禁用/暂停号不参与：它们的不可用与模型无关
 		}
-		if !e.modelCooled(now, model) {
+
+		if !item.modelCooled(now, model) {
 			// 还有账号能服务这个模型 → 不是模型级阻塞。
 			return ModelBlockStatus{}
 		}
-		st.Count++
-		mc, ok := e.modelCooldowns[model]
-		st.mergeModelCooldown(mc, ok)
-		if ok && !mc.ResetAt.IsZero() {
+
+		modelBlockStatus.Count++
+		modelCooldown2, ok := item.modelCooldowns[model]
+		modelBlockStatus.mergeModelCooldown(&modelCooldown2, ok)
+
+		if ok && !modelCooldown2.ResetAt.IsZero() {
 			withReset++
-			distinct[mc.ResetAt] = struct{}{}
-			shared = mc.ResetAt
+			distinct[modelCooldown2.ResetAt] = struct{}{}
+			shared = modelCooldown2.ResetAt
 		}
 	}
-	if st.Count == 0 {
+
+	if modelBlockStatus.Count == 0 {
 		// 池里压根没有非禁用账号：这是"真的没号"，不是模型问题。
 		return ModelBlockStatus{}
 	}
-	st.Blocked = true
-	st.Scope, st.SharedResetAt = modelBlockScope(st.Count, withReset, len(distinct), shared)
-	return st
+
+	modelBlockStatus.Blocked = true
+	modelBlockStatus.Scope, modelBlockStatus.SharedResetAt = modelBlockScope(modelBlockStatus.Count, withReset, len(distinct), shared)
+
+	return modelBlockStatus
 }
 
 // mergeModelCooldown 把单个账号的模型级冷却并入全池阻塞画像：记录首个非空原因，
 // 并取最早解封时刻（那才是"再等多久值得重试"的答案）。
-func (st *ModelBlockStatus) mergeModelCooldown(mc modelCooldown, ok bool) {
+func (st *ModelBlockStatus) mergeModelCooldown(modelCooldown2 *modelCooldown, ok bool) {
 	if !ok {
 		return
 	}
+
 	if st.Reason == "" {
-		st.Reason = mc.Reason
+		st.Reason = modelCooldown2.Reason
 	}
-	if !mc.Until.IsZero() && (st.Until.IsZero() || mc.Until.Before(st.Until)) {
-		st.Until = mc.Until
+
+	if !modelCooldown2.Until.IsZero() && (st.Until.IsZero() || modelCooldown2.Until.Before(st.Until)) {
+		st.Until = modelCooldown2.Until
 	}
 }
 
@@ -430,19 +499,21 @@ func (st *ModelBlockStatus) mergeModelCooldown(mc modelCooldown, ok bool) {
 func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Time, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+
+	if entry2, ok := p.byUID[uid]; ok {
 		now := p.now()
 		if !resetAt.IsZero() {
-			e.until = p.cappedSoftUntilLocked(now, resetAt)
-		} else if e.coolKind != CoolSoft || !now.Before(e.until) {
+			entry2.until = p.cappedSoftUntilLocked(now, resetAt)
+		} else if entry2.coolKind != CoolSoft || !now.Before(entry2.until) {
 			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
-			d := p.jitterSoftDurationLocked(base, e.softStreak+1)
-			e.softStreak++
-			e.until = now.Add(d)
+			d := p.jitterSoftDurationLocked(base, entry2.softStreak+1)
+			entry2.softStreak++
+			entry2.until = now.Add(d)
 		}
-		e.coolKind = CoolSoft
-		e.reason = reason
-		clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
+
+		entry2.coolKind = CoolSoft
+		entry2.reason = reason
+		clearRoutingModelCooldownsLocked(entry2) // 账号级软冷却：清路由豁免，保留审计台账
 		p.dirty.Store(true)
 	}
 }
@@ -455,9 +526,11 @@ func (p *Pool) cappedSoftUntilLocked(now, resetAt time.Time) time.Time {
 	if resetAt.After(capUntil) {
 		return capUntil
 	}
+
 	if resetAt.After(now) {
 		return resetAt
 	}
+
 	return now.Add(time.Millisecond)
 }
 
@@ -467,6 +540,7 @@ func (p *Pool) softRateMaxOr() time.Duration {
 	if p.softRateMax > 0 {
 		return p.softRateMax
 	}
+
 	return defaultSoftRateMax
 }
 
@@ -474,23 +548,24 @@ func (p *Pool) softRateMaxOr() time.Duration {
 // softRateMax 未注入（<=0）时按 defaultSoftRateMax 算。streak<=1 时原样返回 d。
 // 左移位数受 softStreakShiftMax 限制，避免 streak 极大时移位溢出。
 // 调用方必须已持有 p.mu。
-func (p *Pool) softDurationLocked(d time.Duration, streak int) time.Duration {
+func (p *Pool) softDurationLocked(duration time.Duration, streak int) time.Duration {
 	if streak <= 1 {
-		return d
+		return duration
 	}
-	shift := streak - 1
-	if shift > softStreakShiftMax {
-		shift = softStreakShiftMax
-	}
-	d <<= shift
+
+	shift := min(streak-1, softStreakShiftMax)
+	duration <<= shift
+
 	capMax := p.softRateMax
 	if capMax <= 0 {
 		capMax = defaultSoftRateMax
 	}
-	if d > capMax || d <= 0 { // d<=0：左移溢出成负数/零，同样按封顶兜底
-		d = capMax
+
+	if duration > capMax || duration <= 0 { // d<=0：左移溢出成负数/零，同样按封顶兜底
+		duration = capMax
 	}
-	return d
+
+	return duration
 }
 
 // jitterSoftDurationLocked 给软冷却叠加 ±10% 抖动，并再次按 softRateMax 封顶，
@@ -500,29 +575,31 @@ func (p *Pool) jitterSoftDurationLocked(base time.Duration, streak int) time.Dur
 	if capMax := p.softRateMaxOr(); d > capMax {
 		return capMax
 	}
+
 	return d
 }
 
 // recordBreakerFailureLocked 累计一次熔断失败；达到阈值则按指数退避熔断。
 // 熔断与冷却（until）解耦：冷却按错误类别给固定时长，熔断则对"反复失败"逐次加长封禁。
 // 调用方必须已持有 p.mu。
-func (p *Pool) recordBreakerFailureLocked(e *entry) {
-	e.fails++
-	if e.fails < p.breakerThreshold {
+func (p *Pool) recordBreakerFailureLocked(entry2 *entry) {
+	entry2.fails++
+	if entry2.fails < p.breakerThreshold {
 		return
 	}
-	d := p.breakerCooldown
-	for range e.retryCount {
-		d *= 2
-		if d >= p.breakerCooldownMax {
-			d = p.breakerCooldownMax
+
+	duration := p.breakerCooldown
+	for range entry2.retryCount {
+		duration *= 2
+		if duration >= p.breakerCooldownMax {
+			duration = p.breakerCooldownMax
 			break
 		}
 	}
 	// 触发熔断：重置失败计数供下一轮重新累计；retryCount 递增放大退避指数。
-	e.fails = 0
-	e.retryCount++
-	e.breakerUntil = p.now().Add(d)
+	entry2.fails = 0
+	entry2.retryCount++
+	entry2.breakerUntil = p.now().Add(duration)
 }
 
 // CooldownUntilTomorrow4AM 冷却到下一个 04:00（本地时区）。
@@ -541,6 +618,7 @@ func nextDay4AM(now time.Time) time.Time {
 	if now.Hour() < 4 {
 		return time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
 	}
+
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 

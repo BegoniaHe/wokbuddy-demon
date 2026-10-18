@@ -3,23 +3,30 @@ package main
 import "testing"
 
 func TestModelAliasesConfig(t *testing.T) {
-	c := Default()
-	c.Models.Aliases = map[string]string{
+	t.Parallel()
+
+	config := Default()
+
+	config.Models.Aliases = map[string]string{
 		" claude-sonnet-4-5 ": " cn:hy4 ",
 		"gpt-5-codex":         "hy4",
 	}
-	if err := c.normalize(); err != nil {
+	if err := config.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	if got := c.Models.Aliases["claude-sonnet-4-5"]; got != "cn:hy4" {
+
+	if got := config.Models.Aliases["claude-sonnet-4-5"]; got != "cn:hy4" {
 		t.Fatalf("trimmed alias = %q, want cn:hy4", got)
 	}
-	if got := c.Models.Aliases["gpt-5-codex"]; got != "hy4" {
+
+	if got := config.Models.Aliases["gpt-5-codex"]; got != "hy4" {
 		t.Fatalf("alias = %q, want hy4", got)
 	}
 }
 
 func TestModelAliasesConfigRejectsInvalid(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name    string
 		aliases map[string]string
@@ -34,6 +41,7 @@ func TestModelAliasesConfigRejectsInvalid(t *testing.T) {
 	}
 	for _, tc := range cases {
 		c := Default()
+
 		c.Models.Aliases = tc.aliases
 		if err := c.normalize(); err == nil {
 			t.Errorf("%s: normalize 应报错", tc.name)

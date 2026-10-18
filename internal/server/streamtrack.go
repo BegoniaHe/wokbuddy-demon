@@ -33,6 +33,7 @@ func (t *streamTracker) enter() {
 // leave 标记一个流结束；归零时广播唤醒等待者。
 func (t *streamTracker) leave() {
 	t.mu.Lock()
+
 	t.active--
 	if t.active <= 0 {
 		t.active = 0
@@ -46,6 +47,7 @@ func (t *streamTracker) leave() {
 func (t *streamTracker) Active() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	return t.active
 }
 
@@ -57,8 +59,10 @@ func (t *streamTracker) WaitDrained(ctx context.Context) bool {
 			t.mu.Unlock()
 			return true
 		}
+
 		ch := t.zero
 		t.mu.Unlock()
+
 		select {
 		case <-ch:
 		case <-ctx.Done():

@@ -25,15 +25,18 @@ const (
 // jitterDur 给时长施加 ±jitterFraction 的均匀抖动，返回 [d·(1-f), d·(1+f)] 区间值。
 // d<=0 原样返回（零等待不抖动）。抖动目的是打散多请求同相位重试（WAF 频控按
 // 密度判罚，齐步走的退避会以固定周期再次聚团）。
-func jitterDur(d time.Duration) time.Duration {
-	if d <= 0 {
-		return d
+func jitterDur(duration time.Duration) time.Duration {
+	if duration <= 0 {
+		return duration
 	}
+
 	f := 1 + (rand.Float64()*2-1)*jitterFraction
-	out := time.Duration(float64(d) * f)
+
+	out := time.Duration(float64(duration) * f)
 	if out < 0 {
 		return 0
 	}
+
 	return out
 }
 
@@ -41,20 +44,23 @@ func jitterDur(d time.Duration) time.Duration {
 // base·2^n 封顶 rotateBackoffCap，再施加 ±25% 抖动。base 置 0（测试）时恒 0。
 // 用逐次翻倍而非位移：base 调整后无需同步维护移位上限，溢出由封顶比较兜底。
 func backoffAfter(n int) time.Duration {
-	d := rotateBackoffBase
-	if d <= 0 {
+	duration := rotateBackoffBase
+	if duration <= 0 {
 		return 0
 	}
-	for k := 0; k < n && d < rotateBackoffCap; k++ {
-		d *= 2
-		if d <= 0 { // 翻倍溢出成非正数：直接按封顶处理
+
+	for k := 0; k < n && duration < rotateBackoffCap; k++ {
+		duration *= 2
+		if duration <= 0 { // 翻倍溢出成非正数：直接按封顶处理
 			return jitterDur(rotateBackoffCap)
 		}
 	}
-	if d > rotateBackoffCap {
-		d = rotateBackoffCap
+
+	if duration > rotateBackoffCap {
+		duration = rotateBackoffCap
 	}
-	return jitterDur(d)
+
+	return jitterDur(duration)
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（客户端断连/优雅停机不必等退避
@@ -64,8 +70,10 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if d <= 0 {
 		return ctx.Err() == nil
 	}
+
 	t := time.NewTimer(d)
 	defer t.Stop()
+
 	select {
 	case <-ctx.Done():
 		return false

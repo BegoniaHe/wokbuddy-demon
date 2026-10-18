@@ -9,6 +9,7 @@ package server
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -27,7 +28,8 @@ const maxPanicStack = 64 << 10
 // 中间件的 defer（如命名密钥 release）不会执行。
 func (h *Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rw := &recoveryWriter{ResponseWriter: w}
+		recoveryWriter2 := &recoveryWriter{ResponseWriter: w}
+
 		defer func() {
 			rec := recover()
 			if rec == nil {
@@ -38,22 +40,28 @@ func (h *Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
 			if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 				panic(rec)
 			}
+
 			stack := debug.Stack()
 			if len(stack) > maxPanicStack {
 				stack = stack[:maxPanicStack]
 			}
+
 			log.Printf("ERR: [server] panic recovered method=%q path=%q type=%T\n%s",
 				logfmt.Truncate(r.Method, 16), logfmt.Truncate(r.URL.Path, 256), rec, stack)
-			if rw.wroteHeader {
+
+			if recoveryWriter2.wroteHeader {
 				return
 			}
+
 			if strings.HasPrefix(r.URL.Path, "/v1/messages") {
-				writeAnthropicError(rw, http.StatusInternalServerError, "api_error", "internal gateway error", "")
+				writeAnthropicError(recoveryWriter2, http.StatusInternalServerError, "api_error", "internal gateway error", "")
 				return
 			}
-			writeOpenAIError(rw, http.StatusInternalServerError, "internal_error", "internal gateway error")
+
+			writeOpenAIError(recoveryWriter2, http.StatusInternalServerError, "internal_error", "internal gateway error")
 		}()
-		next(rw, r)
+
+		next(recoveryWriter2, r)
 	}
 }
 
@@ -72,6 +80,7 @@ func (w *recoveryWriter) WriteHeader(code int) {
 
 func (w *recoveryWriter) Write(p []byte) (int, error) {
 	w.wroteHeader = true
+
 	return w.ResponseWriter.Write(p)
 }
 
@@ -85,6 +94,7 @@ func (w *recoveryWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
 		return hj.Hijack()
 	}
+
 	return nil, nil, http.ErrNotSupported
 }
 
@@ -92,6 +102,7 @@ func (w *recoveryWriter) Push(target string, opts *http.PushOptions) error {
 	if p, ok := w.ResponseWriter.(http.Pusher); ok {
 		return p.Push(target, opts)
 	}
+
 	return http.ErrNotSupported
 }
 
@@ -99,7 +110,13 @@ func (w *recoveryWriter) ReadFrom(r io.Reader) (int64, error) {
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
 	}
-	return io.Copy(w.ResponseWriter, r)
+
+	written, err := io.Copy(w.ResponseWriter, r)
+	if err != nil {
+		return written, fmt.Errorf("copy response: %w", err)
+	}
+
+	return written, nil
 }
 
 func (w *recoveryWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

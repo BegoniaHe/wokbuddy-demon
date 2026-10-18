@@ -15,26 +15,32 @@ import (
 
 // TestRetryAfterSecondsFromAccountCooldown 429 取账号冷却截止（取整到秒）。
 func TestRetryAfterSecondsFromAccountCooldown(t *testing.T) {
+	t.Parallel()
+
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
 	p.CooldownSoftRate("u1", time.Minute, time.Now().Add(90*time.Second), "429")
-	h := NewHandler(Config{Pool: p})
-	f := &chatFlow{h: h, bareModel: "m", st: &chatStat{uid: "u1"}}
+	h := NewHandler(&Config{Pool: p})
+	chatFlow2 := &chatFlow{h: h, bareModel: "m", st: &chatStat{uid: "u1"}}
 
-	got := f.retryAfterSeconds(http.StatusTooManyRequests)
+	got := chatFlow2.retryAfterSeconds(http.StatusTooManyRequests)
 	if got < 89 || got > 91 {
 		t.Fatalf("Retry-After=%d want ~90", got)
 	}
-	if got := f.retryAfterSeconds(http.StatusBadRequest); got != 0 {
+
+	if got := chatFlow2.retryAfterSeconds(http.StatusBadRequest); got != 0 {
 		t.Fatalf("400 不应带 Retry-After，got %d", got)
 	}
 }
 
 // TestRetryAfterSecondsFromModelBlock 503 取模型级最早解封时间。
 func TestRetryAfterSecondsFromModelBlock(t *testing.T) {
+	t.Parallel()
+
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Second), "m", "6004")
-	h := NewHandler(Config{Pool: p})
+	h := NewHandler(&Config{Pool: p})
 	f := &chatFlow{h: h, bareModel: "m", st: &chatStat{}}
+
 	got := f.retryAfterSeconds(http.StatusServiceUnavailable)
 	if got < 29 || got > 30 {
 		t.Fatalf("Retry-After=%d want ~30", got)
@@ -43,7 +49,9 @@ func TestRetryAfterSecondsFromModelBlock(t *testing.T) {
 
 // TestRetryAfterHeaderOn429 端到端：上游 429 + Retry-After → 客户端响应带该头。
 func TestRetryAfterHeaderOn429(t *testing.T) {
-	up := &upstream.Client{
+	t.Parallel()
+
+	client := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusTooManyRequests,
@@ -58,18 +66,21 @@ func TestRetryAfterHeaderOn429(t *testing.T) {
 		BillingBaseCN: "https://fake.example",
 	}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(&Config{Pool: p, Upstream: client})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
+
 	got := rec.Header().Get("Retry-After")
 	if got == "" {
 		t.Fatal("429 响应缺少 Retry-After")
 	}
+
 	n, err := strconv.Atoi(got)
 	if err != nil || n < 1 || n > 2 {
 		t.Fatalf("Retry-After=%q", got)
@@ -78,14 +89,18 @@ func TestRetryAfterHeaderOn429(t *testing.T) {
 
 // TestRetryAfterAbsentWhenUnknown 503 无可靠解封时间时不带该头。
 func TestRetryAfterAbsentWhenUnknown(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith()})
+	t.Parallel()
+
+	h := NewHandler(&Config{Pool: testPoolWith()})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
+
 	if got := rec.Header().Get("Retry-After"); got != "" {
 		t.Fatalf("不可确定时不应带 Retry-After，got %q", got)
 	}
@@ -94,10 +109,12 @@ func TestRetryAfterAbsentWhenUnknown(t *testing.T) {
 // TestRetryAfterSecondsOnlyCurrentModel 账号上有多个模型冷却时，只取当前模型的
 // 截止时间，避免返回一个客户端按此重试仍会失败的过短等待。
 func TestRetryAfterSecondsOnlyCurrentModel(t *testing.T) {
+	t.Parallel()
+
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(10*time.Second), "other", "6004")
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(90*time.Second), "m", "6004")
-	h := NewHandler(Config{Pool: p})
+	h := NewHandler(&Config{Pool: p})
 	f := &chatFlow{h: h, bareModel: "m", st: &chatStat{uid: "u1"}}
 
 	got := f.retryAfterSeconds(http.StatusTooManyRequests)

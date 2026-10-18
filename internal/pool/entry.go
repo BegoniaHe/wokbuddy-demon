@@ -22,6 +22,7 @@ func (k CoolKind) String() string {
 	case CoolSoft:
 		return "soft_rate"
 	}
+
 	return "unknown"
 }
 
@@ -37,7 +38,7 @@ type TokenUsage struct {
 	// 与 LastLatencyMs（端到端）区分：TTFT 不受输出长度影响，是延迟健康信号。
 	LastTTFTMs          int64     `json:"last_ttft_ms,omitempty"`
 	LastTokensPerSecond *float64  `json:"last_tokens_per_second,omitempty"`
-	LastUsedAt          time.Time `json:"last_used_at,omitempty"`
+	LastUsedAt          time.Time `json:"last_used_at,omitzero"`
 	LastModel           string    `json:"last_model,omitempty"`
 }
 
@@ -69,12 +70,12 @@ type Status struct {
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
 	CreditsExpiring          int64     `json:"credits_expiring,omitempty"`
-	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitzero"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
 	Cooling                  bool      `json:"cooling"`
 	CoolKind                 string    `json:"cool_kind,omitempty"`
 	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
-	Until                    time.Time `json:"until,omitempty"`
+	Until                    time.Time `json:"until,omitzero"`
 	Reason                   string    `json:"reason,omitempty"`
 	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
@@ -99,12 +100,12 @@ type Status struct {
 	Paused          bool      `json:"paused,omitempty"`
 	SuccessCount    int64     `json:"success_count,omitempty"`
 	ErrTotal        int64     `json:"err_total,omitempty"`
-	LastSuccessTime time.Time `json:"last_success,omitempty"`
-	LastErrTime     time.Time `json:"last_err,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitzero"`
+	LastErrTime     time.Time `json:"last_err,omitzero"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
 	CheckinDone bool       `json:"checkin_done,omitempty"`
-	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitzero"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	// 「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -114,11 +115,11 @@ type Status struct {
 	// 零值也透出（运维口径：与 err_total/session_dead_fails 一致，零值缺失会让人
 	// 误以为"没记录"，实际是零值被 omitempty 省略）。
 	ConsecutiveFails int       `json:"consecutive_fails"`
-	DegradeUntil     time.Time `json:"degrade_until,omitempty"` // 连败降权截止（非零且未过 = 降权中）
+	DegradeUntil     time.Time `json:"degrade_until,omitzero"` // 连败降权截止（非零且未过 = 降权中）
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
-	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+	BreakerUntil time.Time `json:"breaker_until,omitzero"`
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
@@ -141,10 +142,10 @@ type RateLimitedModel struct {
 	Kind string `json:"kind"`
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
-	Until time.Time `json:"until,omitempty"`
+	Until time.Time `json:"until,omitzero"`
 	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）；
 	// 截断后 Until==ResetAt 时省略 ResetAt 让台账自然减少一列。
-	ResetAt time.Time `json:"reset_at,omitempty"`
+	ResetAt time.Time `json:"reset_at,omitzero"`
 	// Reason 触发原因（运维可读文案）。
 	Reason string `json:"reason,omitempty"`
 }
@@ -276,14 +277,17 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 	if model == "" || len(e.modelCost) == 0 {
 		return modelCostEntry{}, false
 	}
-	mc, ok := e.modelCost[model]
+
+	modelCostEntry2, ok := e.modelCost[model]
 	if !ok {
 		return modelCostEntry{}, false
 	}
-	if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
+
+	if modelCostEntry2.LastSeen.IsZero() || now.Sub(modelCostEntry2.LastSeen) > modelCostTTL {
 		return modelCostEntry{}, false // 过期：时段性优惠（夜间免费）不得跨时段生效
 	}
-	return mc, true
+
+	return modelCostEntry2, true
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
@@ -293,15 +297,19 @@ func (e *entry) healthy(now time.Time) bool {
 	if e.disabled || e.paused {
 		return false
 	}
+
 	if !e.until.IsZero() && now.Before(e.until) {
 		return false
 	}
+
 	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
 		return false
 	}
+
 	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
 		return false
 	}
+
 	return true
 }
 
@@ -314,11 +322,13 @@ func (e *entry) modelExempt() bool {
 	if e.disabled || e.paused || !e.until.IsZero() || !e.degradeUntil.IsZero() || !e.breakerUntil.IsZero() {
 		return false
 	}
+
 	for _, mc := range e.modelCooldowns {
 		if !mc.AuditOnly && !mc.Until.IsZero() {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -334,10 +344,12 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	if reqModel == "" {
 		return false
 	}
+
 	mc, ok := e.modelCooldowns[reqModel]
 	if !ok || mc.AuditOnly {
 		return false
 	}
+
 	return !mc.Until.IsZero() && now.Before(mc.Until)
 }
 
@@ -354,6 +366,7 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if e.disabled || e.paused {
 		return false
 	}
+
 	if e.modelCooled(now, reqModel) {
 		// 该模型在 6004 独立冷却中 → 不可选。
 		return false
@@ -381,6 +394,7 @@ func (e *entry) pruneExpiredModelCosts(now time.Time) {
 	if len(e.modelCost) == 0 {
 		return
 	}
+
 	for m, mc := range e.modelCost {
 		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
 			delete(e.modelCost, m)
@@ -395,6 +409,7 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	if len(e.modelCooldowns) == 0 {
 		return
 	}
+
 	for m, mc := range e.modelCooldowns {
 		if mc.Until.IsZero() || !now.Before(mc.Until) {
 			delete(e.modelCooldowns, m)
@@ -407,9 +422,11 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 // 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard 才被排除）。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
+
 	t = earlierActive(t, e.until, now)
 	t = earlierActive(t, e.breakerUntil, now)
 	t = earlierActive(t, e.degradeUntil, now)
+
 	return t
 }
 
@@ -419,9 +436,11 @@ func earlierActive(cur, cand, now time.Time) time.Time {
 	if cand.IsZero() || !now.Before(cand) {
 		return cur
 	}
+
 	if cur.IsZero() || cand.Before(cur) {
 		return cand
 	}
+
 	return cur
 }
 
@@ -435,6 +454,7 @@ func (e *entry) fallbackKind(now time.Time) string {
 			return "breaker"
 		}
 	}
+
 	return "soft"
 }
 
@@ -445,19 +465,19 @@ type stateAccount struct {
 	Disabled     bool      `json:"disabled"`
 	Paused       bool      `json:"paused,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
-	Until        time.Time `json:"until,omitempty"`
+	Until        time.Time `json:"until,omitzero"`
 	CoolKind     CoolKind  `json:"cool_kind"`
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
 	ErrTotal    int64     `json:"err_total,omitempty"`
 	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess time.Time `json:"last_success,omitempty"`
-	LastErr     time.Time `json:"last_err,omitempty"`
+	LastSuccess time.Time `json:"last_success,omitzero"`
+	LastErr     time.Time `json:"last_err,omitzero"`
 	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
 	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
 	LastCheckinDay string     `json:"last_checkin_day,omitempty"`
-	TokenUsage     TokenUsage `json:"token_usage,omitempty"`
+	TokenUsage     TokenUsage `json:"token_usage,omitzero"`
 	// 运行态计数（soft_streak/session_dead_fails/credits_expiring）不用 omitempty：
 	// 零值缺失会让人误以为"没记录"，实际是零值被省略。
 	SoftStreak int `json:"soft_streak"`
@@ -483,7 +503,7 @@ type stateAccount struct {
 	CreditsExpiring int64 `json:"credits_expiring"`
 	// CreditsEarliestExpiry / CreditsEarliestRemaining 最早未来到期批次及剩余量。
 	// 与 CreditsExpiring 一并持久化，重启后首次请求仍可沿用最近一次余额快照。
-	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitempty"`
+	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitzero"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
 	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 / 11102
 	// 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达数小时，
@@ -504,7 +524,7 @@ type stateAccount struct {
 // Hits 不落盘（重启后 11102 退避从 6h 基数重新学习，同 modelCost 口径）。
 type stateModelCooldown struct {
 	Until     time.Time `json:"until"`
-	ResetAt   time.Time `json:"reset_at,omitempty"`
+	ResetAt   time.Time `json:"reset_at,omitzero"`
 	Reason    string    `json:"reason,omitempty"`
 	AuditOnly bool      `json:"audit_only,omitempty"`
 }

@@ -26,10 +26,7 @@ func keyUsageFrom(ctx context.Context) *keyUsage {
 
 // writeKeyLimitError 命名密钥超限响应：429 + Retry-After（秒，至少 1）。
 func writeKeyLimitError(w http.ResponseWriter, retryAfter time.Duration) {
-	seconds := int((retryAfter + time.Second - 1) / time.Second)
-	if seconds < 1 {
-		seconds = 1
-	}
+	seconds := max(int((retryAfter+time.Second-1)/time.Second), 1)
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "api key rate limit exceeded")
 }

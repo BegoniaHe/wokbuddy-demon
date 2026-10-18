@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +12,8 @@ import (
 // 上游 role 白名单不含 developer（OpenAI 新规范的 system 别名），
 // 命中即 HTTP 400 code=11128；此处走 PrepareBodyOptWithEfforts 全链路断言。
 func TestNormalizeRoles(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name      string
 		body      string
@@ -85,6 +88,7 @@ func TestNormalizeRoles(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			// 全程 sanitize=false：验证 role 归一与内容脱敏开关无关（D4）。
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
 			assertRoles(t, rolesFromBody(t, out), c.wantRoles)
@@ -93,11 +97,15 @@ func TestNormalizeRoles(t *testing.T) {
 
 	// messages 缺失时，其余字段必须原样保留（除强制 stream）。
 	t.Run("messages 缺失时其余字段不变", func(t *testing.T) {
+		t.Parallel()
+
 		out := PrepareBodyOptWithEfforts([]byte(`{"model":"glm-5.2","temperature":0.7}`), false, nil)
+
 		var obj map[string]any
 		if err := json.Unmarshal(out, &obj); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
+
 		if obj["model"] != "glm-5.2" || obj["temperature"] != 0.7 {
 			t.Errorf("其余字段被改动: %v", obj)
 		}
@@ -108,31 +116,38 @@ func TestNormalizeRoles(t *testing.T) {
 // （非对象元素跳过，不 panic）。
 func rolesFromBody(t *testing.T, out []byte) []string {
 	t.Helper()
+
 	var obj map[string]any
 	if err := json.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
+
 	var got []string
+
 	if msgs, ok := obj["messages"].([]any); ok {
 		for _, m := range msgs {
 			msg, ok := m.(map[string]any)
 			if !ok {
 				continue
 			}
+
 			if role, ok := msg["role"].(string); ok {
 				got = append(got, role)
 			}
 		}
 	}
+
 	return got
 }
 
 // assertRoles 断言 got 与 want 逐条相等。
 func assertRoles(t *testing.T, got, want []string) {
 	t.Helper()
+
 	if len(got) != len(want) {
 		t.Fatalf("role 数量不符: got %v (%d) want %v (%d)", got, len(got), want, len(want))
 	}
+
 	for i := range got {
 		if got[i] != want[i] {
 			t.Errorf("role[%d] = %q want %q", i, got[i], want[i])
@@ -141,11 +156,14 @@ func assertRoles(t *testing.T, got, want []string) {
 }
 
 func TestPrepareBodyOptWithEfforts(t *testing.T) {
+	t.Parallel()
+
 	efforts := map[string][]string{
 		"glm-5.2":      {"off", "low", "high"},
 		"glm-5.2-mini": {"low", "medium"},
 		"glm-5.2-max":  {"high", "xhigh"},
 	}
+
 	cases := []struct {
 		name    string
 		body    string
@@ -192,25 +210,32 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 			`{"model":"glm-5.2","reasoning_effort":"max"}`, nil, "reasoning_effort", "max",
 		},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			out := PrepareBodyOptWithEfforts([]byte(c.body), false, c.efforts)
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := PrepareBodyOptWithEfforts([]byte(item.body), false, item.efforts)
+
 			var m map[string]any
 			if err := json.Unmarshal(out, &m); err != nil {
 				t.Fatalf("unmarshal: %v (body=%s)", err, out)
 			}
-			if c.wantKey == "" {
+
+			if item.wantKey == "" {
 				if _, ok := m["reasoning_effort"]; ok {
 					t.Errorf("reasoning_effort should be absent, got %v", m["reasoning_effort"])
 				}
+
 				if _, ok := m["reasoningEffort"]; ok {
 					t.Errorf("reasoningEffort should be absent, got %v", m["reasoningEffort"])
 				}
+
 				return
 			}
-			got, ok := m[c.wantKey].(string)
-			if !ok || got != c.wantVal {
-				t.Errorf("%s: got %v (%T) want %q", c.wantKey, m[c.wantKey], m[c.wantKey], c.wantVal)
+
+			got, ok := m[item.wantKey].(string)
+			if !ok || got != item.wantVal {
+				t.Errorf("%s: got %v (%T) want %q", item.wantKey, m[item.wantKey], m[item.wantKey], item.wantVal)
 			}
 		})
 	}
@@ -219,28 +244,36 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 // TestPrepareBodyStreamOptions body 未显式带 stream_options 时注入
 // {include_usage: true}（D7，官方 CLI 流式必发）；body 已带则不覆盖。
 func TestPrepareBodyStreamOptions(t *testing.T) {
+	t.Parallel()
+
 	out := PrepareBodyOptWithEfforts([]byte(`{"model":"glm-5.2","messages":[]}`), false, nil)
+
 	var obj map[string]any
 	if err := json.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
-	so, ok := obj["stream_options"].(map[string]any)
+
+	table, ok := obj["stream_options"].(map[string]any)
 	if !ok {
 		t.Fatalf("stream_options not injected: %v", obj["stream_options"])
 	}
-	if so["include_usage"] != true {
-		t.Errorf("stream_options.include_usage = %v want true", so["include_usage"])
+
+	if table["include_usage"] != true {
+		t.Errorf("stream_options.include_usage = %v want true", table["include_usage"])
 	}
 
 	out2 := PrepareBodyOptWithEffertsPreserve(t, `{"model":"glm-5.2","messages":[],"stream_options":{"include_usage":false}}`)
+
 	obj2, err := decodeBody(out2)
 	if err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
+
 	so2, ok := obj2["stream_options"].(map[string]any)
 	if !ok {
 		t.Fatalf("stream_options lost: %v", obj2["stream_options"])
 	}
+
 	if so2["include_usage"] != false {
 		t.Errorf("stream_options.include_usage = %v want false (not overwritten)", so2["include_usage"])
 	}
@@ -255,13 +288,20 @@ func PrepareBodyOptWithEffertsPreserve(t *testing.T, body string) []byte {
 // decodeBody helper：解析 body JSON。
 func decodeBody(b []byte) (map[string]any, error) {
 	var obj map[string]any
+
 	err := json.Unmarshal(b, &obj)
-	return obj, err
+	if err != nil {
+		return obj, fmt.Errorf("decodeBody: %w", err)
+	}
+
+	return obj, nil
 }
 
 // TestPrepareBodyDeterministic 序列化稳定性：同输入跑多遍出站字节级一致
 // （prompt_cache_key 前缀命中的前提——链中不得注入时间/随机/ID 类不确定源）。
 func TestPrepareBodyDeterministic(t *testing.T) {
+	t.Parallel()
+
 	inputs := []string{
 		`{"model":"glm-5.2","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"你好"}],"reasoning_effort":"high"}`,
 		`{"model":"deepseek-v4","messages":[{"role":"user","content":"写个函数"}],"tool_choice":{"type":"auto"},"tools":[{"type":"function","function":{"name":"f"}}]}`,
@@ -269,12 +309,14 @@ func TestPrepareBodyDeterministic(t *testing.T) {
 	}
 	for i, in := range inputs {
 		var first []byte
+
 		for round := range 5 {
 			out := PrepareBodyOptWithEfforts([]byte(in), true, map[string][]string{"glm-5.2": {"off", "low", "high"}})
 			if round == 0 {
 				first = out
 				continue
 			}
+
 			if string(out) != string(first) {
 				t.Fatalf("input #%d round %d differs from round 0:\n%s\n%s", i, round, first, out)
 			}
@@ -286,6 +328,8 @@ func TestPrepareBodyDeterministic(t *testing.T) {
 // 字符串形态必须转为上游需要的对象形态；对象形态及其中字段必须原样保留；
 // 无效输入不补默认值，继续交给上游返回真实错误。
 func TestNormalizeImageURL(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		body string
@@ -323,19 +367,24 @@ func TestNormalizeImageURL(t *testing.T) {
 		},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
 			for _, sanitize := range []bool{false, true} {
-				out := PrepareBodyOptWithEfforts([]byte(tc.body), sanitize, nil)
+				out := PrepareBodyOptWithEfforts([]byte(testCase.body), sanitize, nil)
+
 				part := findImageURLPart(t, out, sanitize)
-				if tc.want == nil {
+				if testCase.want == nil {
 					if _, exists := part["image_url"]; exists {
 						t.Fatalf("sanitize=%v: missing image_url should stay missing, got %#v", sanitize, part)
 					}
+
 					continue
 				}
-				if got := part["image_url"]; !reflect.DeepEqual(got, tc.want) {
-					t.Errorf("sanitize=%v: image_url=%#v want %#v", sanitize, got, tc.want)
+
+				if got := part["image_url"]; !reflect.DeepEqual(got, testCase.want) {
+					t.Errorf("sanitize=%v: image_url=%#v want %#v", sanitize, got, testCase.want)
 				}
 			}
 		})
@@ -345,29 +394,37 @@ func TestNormalizeImageURL(t *testing.T) {
 // findImageURLPart 从 PrepareBodyOptWithEfforts 输出里定位第一个 image_url part。
 func findImageURLPart(t *testing.T, out []byte, sanitize bool) map[string]any {
 	t.Helper()
+
 	obj, err := decodeBody(out)
 	if err != nil {
 		t.Fatalf("sanitize=%v unmarshal: %v (out=%s)", sanitize, err, out)
 	}
+
 	msgs := obj["messages"].([]any)
+
 	content := msgs[0].(map[string]any)["content"].([]any)
 	for _, rawPart := range content {
 		if candidate, ok := rawPart.(map[string]any); ok && candidate["type"] == "image_url" {
 			return candidate
 		}
 	}
+
 	t.Fatal("image_url part not found")
+
 	return nil
 }
 
 // lookupToolPattern 沿 path（string 键 / int 下标）下钻取 body 里的字符串值。
 func lookupToolPattern(t *testing.T, body string, path ...any) string {
 	t.Helper()
+
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(body), &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
+
 	cur := any(obj)
+
 	for _, p := range path {
 		switch k := p.(type) {
 		case string:
@@ -375,16 +432,20 @@ func lookupToolPattern(t *testing.T, body string, path ...any) string {
 			if !ok {
 				t.Fatalf("path %v: want object, got %T", path, cur)
 			}
+
 			cur = m[k]
 		case int:
 			l, ok := cur.([]any)
 			if !ok || k >= len(l) {
 				t.Fatalf("path %v: bad array at %T", path, cur)
 			}
+
 			cur = l[k]
 		}
 	}
+
 	s, _ := cur.(string)
+
 	return s
 }
 
@@ -393,21 +454,47 @@ func lookupToolPattern(t *testing.T, body string, path ...any) string {
 // 覆盖：function.parameters 与裸 parameters 两形态、嵌套 schema、patternProperties
 // 键、消息正文不碰、无 tools no-op、sanitize 开关两态一致。
 func TestNormalizeToolPatterns(t *testing.T) {
-	t.Run("exa agent_run pattern normalized", testAgentRunPatternNormalized)
-	t.Run("nested anyOf items pattern normalized", testNestedAnyOfPatternNormalized)
-	t.Run("bare tool parameters form normalized", testBareToolParametersNormalized)
-	t.Run("patternProperties key normalized", testPatternPropertiesKeyNormalized)
-	t.Run("message content backslash untouched", testMessageContentBackslashUntouched)
-	t.Run("clean pattern untouched", testCleanPatternUntouched)
-	t.Run("no tools is no-op", testNoToolsNoop)
-	t.Run("sanitize on and off behave the same", testSanitizeOnOffSame)
+	t.Parallel()
+	t.Run("exa agent_run pattern normalized", func(t *testing.T) {
+		t.Parallel()
+		testAgentRunPatternNormalized(t)
+	})
+	t.Run("nested anyOf items pattern normalized", func(t *testing.T) {
+		t.Parallel()
+		testNestedAnyOfPatternNormalized(t)
+	})
+	t.Run("bare tool parameters form normalized", func(t *testing.T) {
+		t.Parallel()
+		testBareToolParametersNormalized(t)
+	})
+	t.Run("patternProperties key normalized", func(t *testing.T) {
+		t.Parallel()
+		testPatternPropertiesKeyNormalized(t)
+	})
+	t.Run("message content backslash untouched", func(t *testing.T) {
+		t.Parallel()
+		testMessageContentBackslashUntouched(t)
+	})
+	t.Run("clean pattern untouched", func(t *testing.T) {
+		t.Parallel()
+		testCleanPatternUntouched(t)
+	})
+	t.Run("no tools is no-op", func(t *testing.T) {
+		t.Parallel()
+		testNoToolsNoop(t)
+	})
+	t.Run("sanitize on and off behave the same", func(t *testing.T) {
+		t.Parallel()
+		testSanitizeOnOffSame(t)
+	})
 }
 
-// bs 反斜杠：测试体经工具链多层转义易被吞，运行时拼装保真。
-const bs = `\`
+// str 反斜杠：测试体经工具链多层转义易被吞，运行时拼装保真。
+const str = `\`
 
 func testAgentRunPatternNormalized(t *testing.T) {
-	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"agent_run","parameters":{"type":"object","properties":{"runId":{"type":"string","pattern":"^agent` + bs + bs + `_run` + bs + bs + `_"}` + `,"query":{"type":"string"}},"required":["query"]}}}]}` //nolint:lll // 实案 body 原样
+	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"agent_run","parameters":{"type":"object","properties":{"runId":{"type":"string","pattern":"^agent` + str + str + `_run` + str + str + `_"}` + `,"query":{"type":"string"}},"required":["query"]}}}]}` //nolint:lll // 实案 body 原样
+
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "runId", "pattern"); got != `^agent_run_` {
 		t.Fatalf("pattern = %q, want %q", got, `^agent_run_`)
@@ -419,7 +506,8 @@ func testAgentRunPatternNormalized(t *testing.T) {
 }
 
 func testNestedAnyOfPatternNormalized(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"anyOf":[{"properties":{"code":{"pattern":"x` + bs + bs + `_y"}}},{"type":"string"}]}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"anyOf":[{"properties":{"code":{"pattern":"x` + str + str + `_y"}}},{"type":"string"}]}}}]}` //nolint:lll
+
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "anyOf", 0, "properties", "code", "pattern"); got != "x_y" {
 		t.Fatalf("nested pattern = %q, want %q", got, "x_y")
@@ -427,7 +515,8 @@ func testNestedAnyOfPatternNormalized(t *testing.T) {
 }
 
 func testBareToolParametersNormalized(t *testing.T) {
-	body := `{"messages":[],"tools":[{"name":"t","parameters":{"properties":{"id":{"pattern":"p` + bs + bs + `_q"}}}}]}`
+	body := `{"messages":[],"tools":[{"name":"t","parameters":{"properties":{"id":{"pattern":"p` + str + str + `_q"}}}}]}`
+
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 	if got := lookupToolPattern(t, out, "tools", 0, "parameters", "properties", "id", "pattern"); got != "p_q" {
 		t.Fatalf("bare parameters pattern = %q, want %q", got, "p_q")
@@ -435,31 +524,38 @@ func testBareToolParametersNormalized(t *testing.T) {
 }
 
 func testPatternPropertiesKeyNormalized(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"patternProperties":{"^a` + bs + bs + `_b` + bs + bs + `_":{"type":"string"}}}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"patternProperties":{"^a` + str + str + `_b` + str + str + `_":{"type":"string"}}}}}]}` //nolint:lll
+
 	var obj map[string]any
+
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 	if err := json.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
+
 	tool := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+
 	props := tool["patternProperties"].(map[string]any)
 	if _, ok := props["^a_b_"]; !ok {
 		t.Fatalf("normalized key missing: %v", props)
 	}
+
 	for k := range props {
-		if strings.Contains(k, bs) {
+		if strings.Contains(k, str) {
 			t.Fatalf("patternProperties key not normalized: %q", k)
 		}
 	}
 }
 
 func testMessageContentBackslashUntouched(t *testing.T) {
-	raw := `{"messages":[{"role":"user","content":"path C:` + bs + bs + `_dir and regex a` + bs + bs + `_b"}],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"q` + bs + bs + `_r"}}}}}]}` //nolint:lll
+	raw := `{"messages":[{"role":"user","content":"path C:` + str + str + `_dir and regex a` + str + str + `_b"}],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"q` + str + str + `_r"}}}}}]}` //nolint:lll
 	out := string(PrepareBodyOptWithEfforts([]byte(raw), false, nil))
+
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(out), &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
+
 	msg := obj["messages"].([]any)[0].(map[string]any)
 	if got := msg["content"]; got != `path C:\_dir and regex a\_b` {
 		t.Fatalf("message content mutated: %q", got)
@@ -467,7 +563,8 @@ func testMessageContentBackslashUntouched(t *testing.T) {
 }
 
 func testCleanPatternUntouched(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"^[a-z]+` + bs + bs + `d_$"}}}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"^[a-z]+` + str + str + `d_$"}}}}}]}` //nolint:lll
+
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != `^[a-z]+\d_$` {
 		t.Fatalf("clean pattern mutated: %q", got)
@@ -475,27 +572,32 @@ func testCleanPatternUntouched(t *testing.T) {
 }
 
 func testNoToolsNoop(t *testing.T) {
-	body := `{"model":"m","messages":[{"role":"user","content":"a` + bs + bs + `_b"}]}`
+	body := `{"model":"m","messages":[{"role":"user","content":"a` + str + str + `_b"}]}`
+
 	var inObj, outObj map[string]any
 	if err := json.Unmarshal([]byte(body), &inObj); err != nil {
 		t.Fatal(err)
 	}
+
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 	if err := json.Unmarshal(out, &outObj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
+
 	inMsg, _ := json.Marshal(inObj["messages"])
+
 	outMsg, _ := json.Marshal(outObj["messages"])
 	if string(inMsg) != string(outMsg) {
 		t.Fatalf("messages changed without tools: %s -> %s", inMsg, outMsg)
 	}
+
 	if _, has := outObj["tools"]; has {
 		t.Fatal("tools appeared out of nowhere")
 	}
 }
 
 func testSanitizeOnOffSame(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"a` + bs + bs + `_b"}}}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"a` + str + str + `_b"}}}}}]}` //nolint:lll
 	for _, sanitize := range []bool{false, true} {
 		out := string(PrepareBodyOptWithEfforts([]byte(body), sanitize, nil))
 		if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != "a_b" {
@@ -508,6 +610,8 @@ func testSanitizeOnOffSame(t *testing.T) {
 // gpt-5.6-sol：15 → 400 code=11133 model_param_invalid，16 → 200）。Claude Code 切
 // 模型时的探针请求 max_tokens 极小，全号轮转同样被拒 → 客户端 503。非 GPT 模型不动。
 func TestClampGPTMinMaxTokens(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		body string
@@ -521,21 +625,26 @@ func TestClampGPTMinMaxTokens(t *testing.T) {
 		{"gpt absent untouched", `{"model":"gpt-6-sol","messages":[]}`, nil},
 		{"non-gpt untouched", `{"model":"hy4-preview-f","max_tokens":1,"messages":[]}`, float64(1)},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			obj, err := decodeBody(PrepareBodyOptWithEffertsPreserve(t, c.body))
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			obj, err := decodeBody(PrepareBodyOptWithEffertsPreserve(t, item.body))
 			if err != nil {
 				t.Fatalf("unmarshal: %v", err)
 			}
+
 			got, has := obj["max_tokens"]
-			if c.want == nil {
+			if item.want == nil {
 				if has {
 					t.Fatalf("max_tokens = %v, want absent", got)
 				}
+
 				return
 			}
-			if got != c.want {
-				t.Fatalf("max_tokens = %v, want %v", got, c.want)
+
+			if got != item.want {
+				t.Fatalf("max_tokens = %v, want %v", got, item.want)
 			}
 		})
 	}

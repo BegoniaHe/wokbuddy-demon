@@ -34,35 +34,42 @@ func (p *Pool) NoteRouteFailure(realm, model string) {
 	if p == nil || model == "" {
 		return
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	now := p.now()
 	key := routeKey(realm, model)
-	st := p.routeCooldowns[key]
-	if st == nil {
-		st = &routeState{}
-		p.routeCooldowns[key] = st
+
+	routeState2 := p.routeCooldowns[key]
+	if routeState2 == nil {
+		routeState2 = &routeState{}
+		p.routeCooldowns[key] = routeState2
 	}
 	// 冷却已过期：在写锁内清理残留的截止时间与失败窗口。
-	if !st.until.IsZero() && !now.Before(st.until) {
-		st.until = time.Time{}
-		st.failures = nil
+	if !routeState2.until.IsZero() && !now.Before(routeState2.until) {
+		routeState2.until = time.Time{}
+		routeState2.failures = nil
 	}
 	// 滑动窗口：丢弃过旧失败，避免低频偶发失败跨天累计后误熔断。
 	cutoff := now.Add(-routeFailureWindow)
-	kept := make([]time.Time, 0, len(st.failures)+1)
-	for _, at := range st.failures {
+
+	kept := make([]time.Time, 0, len(routeState2.failures)+1)
+	for _, at := range routeState2.failures {
 		if at.After(cutoff) {
 			kept = append(kept, at)
 		}
 	}
+
 	kept = append(kept, now)
-	st.failures = kept
-	if len(st.failures) < routeFailureThreshold {
+
+	routeState2.failures = kept
+	if len(routeState2.failures) < routeFailureThreshold {
 		return
 	}
-	st.failures = nil
-	st.until = now.Add(routeCooldownDuration)
+
+	routeState2.failures = nil
+	routeState2.until = now.Add(routeCooldownDuration)
 	log.Printf("WARN: [pool] route cooldown realm=%q model=%q for %s after %d failures",
 		realm, model, routeCooldownDuration, routeFailureThreshold)
 }
@@ -72,6 +79,7 @@ func (p *Pool) NoteRouteSuccess(realm, model string) {
 	if p == nil || model == "" {
 		return
 	}
+
 	p.mu.Lock()
 	delete(p.routeCooldowns, routeKey(realm, model))
 	p.mu.Unlock()
@@ -84,7 +92,9 @@ func (p *Pool) routeCoolingLocked(realm, model string, now time.Time) bool {
 	if p == nil || model == "" || len(p.routeCooldowns) == 0 {
 		return false
 	}
+
 	st := p.routeCooldowns[routeKey(realm, model)]
+
 	return st != nil && now.Before(st.until)
 }
 
@@ -93,11 +103,14 @@ func (p *Pool) RouteRecovery(realm, model string) time.Time {
 	if p == nil || model == "" {
 		return time.Time{}
 	}
+
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	st := p.routeCooldowns[routeKey(realm, model)]
 	if st == nil || !st.until.After(p.now()) {
 		return time.Time{}
 	}
+
 	return st.until
 }

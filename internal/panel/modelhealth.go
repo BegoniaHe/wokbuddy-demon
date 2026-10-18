@@ -17,11 +17,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -91,19 +92,23 @@ func (p *Panel) modelProbe(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
+
 	model := trimModelPrefix(req.Model)
 	if model == "" {
 		writeErr(w, http.StatusBadRequest, "model required")
 		return
 	}
+
 	realm := req.Realm
 	if realm == "" {
 		realm = modelRealm(req.Model)
 	}
+
 	if realm != "cn" && realm != "global" {
 		writeErr(w, http.StatusBadRequest, "realm must be cn or global")
 		return
 	}
+
 	key := realm + ":" + model
 	if !p.tryStartProbe(key) {
 		writeErr(w, http.StatusConflict, "该模型正在探测中，请稍后")
@@ -118,17 +123,19 @@ func (p *Panel) modelProbe(w http.ResponseWriter, r *http.Request) {
 	defer p.releaseProbeSlot()
 
 	sample := p.runModelProbe(r.Context(), realm, model)
-	p.recordProbeSample(key, sample)
+	p.recordProbeSample(key, &sample)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": sample.OK, "key": key, "sample": sample})
 }
 
 // modelHealth 返回所有已探测模型的滚动健康聚合。
 func (p *Panel) modelHealth(w http.ResponseWriter, r *http.Request) {
 	state := p.loadProbeState()
+
 	out := make(map[string]modelProbeHealth, len(state.Samples))
 	for key, samples := range state.Samples {
 		out[key] = summarizeProbeSamples(samples)
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
@@ -137,9 +144,11 @@ func modelRealm(model string) string {
 	if len(model) > 7 && model[:7] == "global:" {
 		return "global"
 	}
+
 	if len(model) > 3 && model[:3] == "cn:" {
 		return "cn"
 	}
+
 	return "cn"
 }
 
@@ -159,13 +168,17 @@ func trimModelPrefix(model string) string {
 func (p *Panel) tryStartProbe(key string) bool {
 	p.probeMu.Lock()
 	defer p.probeMu.Unlock()
+
 	if p.probeInflight == nil {
 		p.probeInflight = map[string]bool{}
 	}
+
 	if p.probeInflight[key] {
 		return false
 	}
+
 	p.probeInflight[key] = true
+
 	return true
 }
 
@@ -182,8 +195,10 @@ func (p *Panel) acquireProbeSlot(ctx context.Context) bool {
 	if p.probeSem == nil {
 		p.probeSem = make(chan struct{}, modelProbeMaxConcurrent)
 	}
+
 	sem := p.probeSem
 	p.probeMu.Unlock()
+
 	select {
 	case sem <- struct{}{}:
 		return true
@@ -197,6 +212,7 @@ func (p *Panel) releaseProbeSlot() {
 	p.probeMu.Lock()
 	sem := p.probeSem
 	p.probeMu.Unlock()
+
 	if sem != nil {
 		<-sem
 	}
@@ -206,52 +222,53 @@ func (p *Panel) releaseProbeSlot() {
 func (p *Panel) runModelProbe(parent context.Context, realm, model string) modelProbeSample {
 	start := time.Now()
 	sample := modelProbeSample{At: start}
-	ctx, cancel := context.WithTimeout(parent, modelProbeTimeout)
+
+	ctx, cancel := context.WithTimeout(parent, p.probeTimeout)
 	defer cancel()
 
 	uids := p.cfg.Pool.AvailableUIDsForRealm(realm)
 	if len(uids) == 0 {
-		sample.ErrorClass, sample.Error = "no_account", "no available account in realm "+realm
-		sample.DurationMs = time.Since(start).Milliseconds()
-		return sample
+		return probeFailure(start, "no_account", "no available account in realm "+realm)
 	}
-	a := p.cfg.Pool.AuthByUID(uids[0])
-	if a == nil {
-		sample.ErrorClass, sample.Error = "no_account", "account not loaded"
-		sample.DurationMs = time.Since(start).Milliseconds()
-		return sample
+
+	auth := p.cfg.Pool.AuthByUID(uids[0])
+	if auth == nil {
+		return probeFailure(start, "no_account", "account not loaded")
 	}
 
 	body, err := json.Marshal(probeRequestBody(model))
 	if err != nil {
-		sample.ErrorClass, sample.Error = "internal", err.Error()
-		sample.DurationMs = time.Since(start).Milliseconds()
-		return sample
+		return probeFailure(start, "internal", err.Error())
 	}
-	rc, status, respBody, err := p.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{})
+
+	rc, status, respBody, err := p.cfg.Upstream.ChatStreamContext(ctx, auth, body, "", upstream.ChatMeta{})
 	if err != nil {
-		sample.ErrorClass = probeErrorClass(err)
-		sample.Error = err.Error()
-		sample.DurationMs = time.Since(start).Milliseconds()
-		return sample
+		return probeFailure(start, probeErrorClass(err), err.Error())
 	}
 	defer rc.Close()
+
 	if status >= http.StatusBadRequest {
-		sample.ErrorClass = upstream.Classify(status, string(respBody)).String()
-		sample.Error = truncateProbeError(string(respBody))
-		sample.DurationMs = time.Since(start).Milliseconds()
-		return sample
+		return probeFailure(start, upstream.Classify(status, string(respBody)).String(), truncateProbeError(string(respBody)))
 	}
 
 	ttft, tokens, errClass, errMsg := readProbeStream(start, rc)
+
 	sample.DurationMs = time.Since(start).Milliseconds()
 	if errClass != "" {
-		sample.ErrorClass, sample.Error = errClass, errMsg
-		return sample
+		return probeFailure(start, errClass, errMsg)
 	}
+
 	sample.OK = true
 	sample.TTFTMs = ttft
 	sample.OutputTokens = tokens
+
+	return sample
+}
+
+func probeFailure(start time.Time, class, msg string) modelProbeSample {
+	sample := modelProbeSample{At: start, ErrorClass: class, Error: msg}
+	sample.DurationMs = time.Since(start).Milliseconds()
+
 	return sample
 }
 
@@ -279,23 +296,29 @@ var errProbeLineTooLong = errors.New("probe line exceeds size limit")
 // 语义对齐 bufio.Reader.ReadString：行尾不带 '\n' 时返回该行 + io.EOF。
 // 不用 ReadString：无换行超长行会被反复 concat，仅在行后检查挡不住单行溢出
 // （与 issue #113 的 SSE 单行上限同哲学）。
-func readProbeLine(br *bufio.Reader, limit int) (string, int, error) {
-	var sb strings.Builder
+func readProbeLine(reader *bufio.Reader, limit int) (string, int, error) {
+	var builder strings.Builder
+
 	n := 0
+
 	for {
-		chunk, err := br.ReadSlice('\n')
+		chunk, err := reader.ReadSlice('\n')
 		if n+len(chunk) > limit {
 			return "", n, errProbeLineTooLong
 		}
-		sb.Write(chunk)
+
+		builder.Write(chunk)
+
 		n += len(chunk)
 		if err == nil {
-			return sb.String(), n, nil
+			return builder.String(), n, nil
 		}
+
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		return sb.String(), n, err
+
+		return builder.String(), n, err
 	}
 }
 
@@ -304,28 +327,35 @@ func readProbeLine(br *bufio.Reader, limit int) (string, int, error) {
 // 检查，异常上游无法靠无换行长行把内存撑到上限之外。
 func readProbeStream(start time.Time, rc io.Reader) (ttft, tokens int64, errClass, errMsg string) {
 	br := bufio.NewReaderSize(rc, 64*1024)
+
 	read := 0
 	for read < modelProbeMaxReadBytes {
 		line, n, err := readProbeLine(br, modelProbeMaxReadBytes-read)
 		read += n
+
 		if payload, isData := ssePayload(trimLine(line)); isData {
 			done, t, tok, ec, em := handleProbeFrame(payload, start, ttft, tokens)
 			ttft, tokens = t, tok
+
 			if ec != "" {
 				return 0, 0, ec, em
 			}
+
 			if done {
 				break
 			}
 		}
+
 		if err != nil {
 			break
 		}
 	}
+
 	if ttft == 0 {
 		// 有响应但没等到内容帧：空流/只有注释——按解析失败记录，不伪造首字。
 		return 0, tokens, "upstream_parse", "probe stream produced no content frame"
 	}
+
 	return ttft, tokens, "", ""
 }
 
@@ -334,19 +364,24 @@ func handleProbeFrame(payload string, start time.Time, ttft, tokens int64) (done
 	if payload == "[DONE]" {
 		return true, ttft, tokens, "", ""
 	}
+
 	var chunk probeChunk
 	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return false, ttft, tokens, "", "" // 非 JSON 帧：探测忽略
 	}
+
 	if chunk.Error != nil {
 		return true, 0, 0, upstream.FrameKind(payload).String(), truncateProbeError(payload)
 	}
+
 	if ttft == 0 && chunkHasContent(chunk) {
 		ttft = sinceMs(start)
 	}
+
 	if chunk.Usage != nil && chunk.Usage.CompletionTokens != nil {
 		tokens = *chunk.Usage.CompletionTokens
 	}
+
 	return false, ttft, tokens, "", ""
 }
 
@@ -359,6 +394,7 @@ func chunkHasContent(c probeChunk) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -368,6 +404,7 @@ func sinceMs(start time.Time) int64 {
 	if ms < 1 {
 		return 1
 	}
+
 	return ms
 }
 
@@ -376,6 +413,7 @@ func trimLine(line string) string {
 	for line != "" && (line[len(line)-1] == '\n' || line[len(line)-1] == '\r') {
 		line = line[:len(line)-1]
 	}
+
 	return line
 }
 
@@ -385,41 +423,47 @@ func ssePayload(line string) (string, bool) {
 	if len(line) <= len(prefix) || line[:len(prefix)] != prefix {
 		return "", false
 	}
+
 	return line[len(prefix):], true
 }
 
 // probeErrorClass 把传输层错误归一为可读分类（探测只做观测，不参与路由）。
 func probeErrorClass(err error) string {
-	var ue *upstream.Error
-	if errors.As(err, &ue) {
+	if ue, ok := errors.AsType[*upstream.Error](err); ok {
 		return ue.Kind.String()
 	}
+
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "timeout"
 	}
+
 	return "transport"
 }
 
 // truncateProbeError 截断错误原文（面板展示用；不写日志、不含凭证）。
-func truncateProbeError(s string) string {
+func truncateProbeError(str string) string {
 	const maxLen = 200
-	if len(s) > maxLen {
-		return s[:maxLen] + "…"
+	if len(str) > maxLen {
+		return str[:maxLen] + "…"
 	}
-	return s
+
+	return str
 }
 
 // recordProbeSample 追加样本并落盘（滚动裁剪到 modelProbeSamplesPerModel）。
-func (p *Panel) recordProbeSample(key string, sample modelProbeSample) {
+func (p *Panel) recordProbeSample(key string, sample *modelProbeSample) {
 	// 读-改-写全程持锁：并发探测不同模型时避免后写覆盖先写（丢样本）。
 	p.probeStateMu.Lock()
 	defer p.probeStateMu.Unlock()
+
 	state := p.loadProbeState()
 	samples := state.Samples[key]
-	samples = append(samples, sample)
+
+	samples = append(samples, *sample)
 	if len(samples) > modelProbeSamplesPerModel {
 		samples = samples[len(samples)-modelProbeSamplesPerModel:]
 	}
+
 	state.Samples[key] = samples
 	if err := p.saveProbeState(state); err != nil {
 		log.Printf("WARN: [panel] save model probe state failed: %v", err)
@@ -432,21 +476,26 @@ func (p *Panel) loadProbeState() *modelProbeState {
 	if p.cfg.ProbeStateFile == "" {
 		return state
 	}
+
 	raw, err := os.ReadFile(p.cfg.ProbeStateFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("WARN: [panel] read model probe state: %v", err)
 		}
+
 		return state
 	}
+
 	var loaded modelProbeState
 	if err := json.Unmarshal(raw, &loaded); err != nil {
 		log.Printf("WARN: [panel] parse model probe state: %v", err)
 		return state
 	}
+
 	if loaded.Samples != nil {
 		state.Samples = loaded.Samples
 	}
+
 	return state
 }
 
@@ -455,52 +504,70 @@ func (p *Panel) saveProbeState(state *modelProbeState) error {
 	if p.cfg.ProbeStateFile == "" {
 		return nil
 	}
+
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("saveProbeState: %w", err)
 	}
+
 	tmp := p.cfg.ProbeStateFile + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
+		return fmt.Errorf("saveProbeState: %w", err)
 	}
-	return atomicwrite.Rename(tmp, p.cfg.ProbeStateFile)
+
+	if err := atomicwrite.Rename(tmp, p.cfg.ProbeStateFile); err != nil {
+		return fmt.Errorf("saveProbeState: %w", err)
+	}
+
+	return nil
 }
 
 // summarizeProbeSamples 聚合最近 modelProbeWindow 个样本：成功/失败数、avg/p50/p95 TTFT。
 func summarizeProbeSamples(samples []modelProbeSample) modelProbeHealth {
-	h := modelProbeHealth{Window: modelProbeWindow}
+	modelProbeHealth2 := modelProbeHealth{Window: modelProbeWindow}
 	if len(samples) == 0 {
-		return h
+		return modelProbeHealth2
 	}
+
 	last := samples[len(samples)-1]
-	h.Last = &last
-	h.LastProbeAt = last.At.Format(time.RFC3339)
+	modelProbeHealth2.Last = &last
+	modelProbeHealth2.LastProbeAt = last.At.Format(time.RFC3339)
+
 	window := samples
 	if len(window) > modelProbeWindow {
 		window = window[len(window)-modelProbeWindow:]
 	}
+
 	var ttfts []int64
+
 	for _, s := range window {
 		if s.OK {
-			h.Success++
+			modelProbeHealth2.Success++
+
 			if s.TTFTMs > 0 {
 				ttfts = append(ttfts, s.TTFTMs)
 			}
+
 			continue
 		}
-		h.Failure++
+
+		modelProbeHealth2.Failure++
 	}
+
 	if len(ttfts) > 0 {
-		sort.Slice(ttfts, func(i, j int) bool { return ttfts[i] < ttfts[j] })
+		slices.Sort(ttfts)
+
 		var sum int64
 		for _, v := range ttfts {
 			sum += v
 		}
-		h.AvgTTFTMs = sum / int64(len(ttfts))
-		h.P50TTFTMs = percentile(ttfts, 50)
-		h.P95TTFTMs = percentile(ttfts, 95)
+
+		modelProbeHealth2.AvgTTFTMs = sum / int64(len(ttfts))
+		modelProbeHealth2.P50TTFTMs = percentile(ttfts, 50)
+		modelProbeHealth2.P95TTFTMs = percentile(ttfts, 95)
 	}
-	return h
+
+	return modelProbeHealth2
 }
 
 // percentile 取有序切片的 p 分位（最近秩法，p ∈ [0,100]）。
@@ -510,12 +577,9 @@ func percentile(sorted []int64, p int) int64 {
 	}
 	// 最近秩法：idx = ceil(p·n/100)-1（p95/10 个样本取第 10 个）。
 	idx := (p*len(sorted)+99)/100 - 1
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
+	idx = max(idx, 0)
+	idx = min(idx, len(sorted)-1)
+
 	return sorted[idx]
 }
 
@@ -538,6 +602,7 @@ func probeRequestBody(model string) struct {
 			Content string `json:"content"`
 		} `json:"messages"`
 	}
+
 	body.Model = model
 	body.Stream = true
 	body.MaxTokens = modelProbeMaxTokens
@@ -545,5 +610,6 @@ func probeRequestBody(model string) struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
 	}{{Role: "user", Content: "ping"}}
+
 	return body
 }

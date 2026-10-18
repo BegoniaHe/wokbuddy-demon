@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"sort"
 	"strconv"
@@ -59,22 +60,27 @@ func (m *metricsRegistry) observeRequestDuration(seconds float64, ok bool) {
 	if m == nil {
 		return
 	}
+
 	result := resultError
 	if ok {
 		result = resultOK
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	hist := m.dur[result]
 	if hist == nil {
 		hist = &durationHist{buckets: make([]uint64, len(durationBuckets))}
 		m.dur[result] = hist
 	}
+
 	for i, ub := range durationBuckets {
 		if seconds <= ub {
 			hist.buckets[i]++
 		}
 	}
+
 	hist.sum += seconds
 	hist.count++
 }
@@ -84,6 +90,7 @@ func (m *metricsRegistry) incRotation(reason string) {
 	if m == nil {
 		return
 	}
+
 	m.mu.Lock()
 	m.rotations[reason]++
 	m.mu.Unlock()
@@ -91,15 +98,15 @@ func (m *metricsRegistry) incRotation(reason string) {
 
 // metricsHandler 渲染 Prometheus 文本格式指标。鉴权与主服务同口径（withAuth 包裹）。
 func (h *Handler) metricsHandler(w http.ResponseWriter, _ *http.Request) {
-	var b strings.Builder
-	h.writeAccountMetrics(&b)
-	h.writePoolMetrics(&b)
-	h.writeModelMetrics(&b)
-	h.writeDurationMetrics(&b)
-	h.writeRotationMetrics(&b)
+	var builder strings.Builder
+	h.writeAccountMetrics(&builder)
+	h.writePoolMetrics(&builder)
+	h.writeModelMetrics(&builder)
+	h.writeDurationMetrics(&builder)
+	h.writeRotationMetrics(&builder)
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	_, _ = io.WriteString(w, b.String())
+	_, _ = io.WriteString(w, builder.String())
 }
 
 // writeAccountMetrics 账号分状态计数（复用 pool.CountsDetailedWithPaused）。
@@ -109,10 +116,12 @@ func (h *Handler) metricsHandler(w http.ResponseWriter, _ *http.Request) {
 // state 是互斥分区，sum(wokbuddy_accounts) 恒等于账号总数。CountsDetailedWithPaused
 // 的 healthy 含 in_flight_full（在途满载仍是状态机意义上的健康），故此处 ok 取
 // healthy-in_flight_full，避免满载号被 ok 与 in_flight_full 重复计。
-func (h *Handler) writeAccountMetrics(b *strings.Builder) {
+func (h *Handler) writeAccountMetrics(builder *strings.Builder) {
 	_, healthy, cooling, disabled, paused, inFlightFull := h.cfg.Pool.CountsDetailedWithPaused()
-	writeHelpType(b, "wokbuddy_accounts", "Number of accounts by state.", "gauge")
-	for _, s := range []struct {
+
+	writeHelpType(builder, "wokbuddy_accounts", "Number of accounts by state.", "gauge")
+
+	for _, item := range []struct {
 		state string
 		value int
 	}{
@@ -122,68 +131,76 @@ func (h *Handler) writeAccountMetrics(b *strings.Builder) {
 		{"paused", paused},
 		{"in_flight_full", inFlightFull},
 	} {
-		writeSample(b, "wokbuddy_accounts", label("state", s.state), float64(s.value))
+		writeSample(builder, "wokbuddy_accounts", label("state", item.state), float64(item.value))
 	}
 }
 
 // writePoolMetrics 池级运行态 gauge：全局在途、冷却账号数与按模型 TTFT 均值。
 // 都读现有状态（InFlightTotal / CountsDetailed / TTFTByModel），不新增记账。
-func (h *Handler) writePoolMetrics(b *strings.Builder) {
+func (h *Handler) writePoolMetrics(builder3 *strings.Builder) {
 	if h.cfg.Pool == nil {
 		return
 	}
-	writeHelpType(b, "wokbuddy_pool_in_flight", "Current in-flight upstream requests across all accounts.", "gauge")
-	writeSample(b, "wokbuddy_pool_in_flight", "", float64(h.cfg.Pool.InFlightTotal()))
+
+	writeHelpType(builder3, "wokbuddy_pool_in_flight", "Current in-flight upstream requests across all accounts.", "gauge")
+	writeSample(builder3, "wokbuddy_pool_in_flight", "", float64(h.cfg.Pool.InFlightTotal()))
 	_, _, cooling, _, _ := h.cfg.Pool.CountsDetailed() //nolint:dogsled // 只需要 cooling
-	writeHelpType(b, "wokbuddy_pool_cooling", "Cooling or breaker-open accounts.", "gauge")
-	writeSample(b, "wokbuddy_pool_cooling", "", float64(cooling))
-	writeHelpType(b, "wokbuddy_model_ttft_ms", "Average account TTFT EWMA in milliseconds by model.", "gauge")
+
+	writeHelpType(builder3, "wokbuddy_pool_cooling", "Cooling or breaker-open accounts.", "gauge")
+	writeSample(builder3, "wokbuddy_pool_cooling", "", float64(cooling))
+	writeHelpType(builder3, "wokbuddy_model_ttft_ms", "Average account TTFT EWMA in milliseconds by model.", "gauge")
+
 	ttft := h.cfg.Pool.TTFTByModel()
+
 	models := make([]string, 0, len(ttft))
 	for model := range ttft {
 		models = append(models, model)
 	}
+
 	sort.Strings(models)
+
 	for _, model := range models {
-		writeSample(b, "wokbuddy_model_ttft_ms", label("model", model), ttft[model])
+		writeSample(builder3, "wokbuddy_model_ttft_ms", label("model", model), ttft[model])
 	}
 }
 
 // writeModelMetrics 按模型导出请求数与 Token（复用 usage 全历史聚合）。
 // 口径为「逐上游尝试」（含失败尝试），与 recordAttempt 同源，不另起账本。
-func (h *Handler) writeModelMetrics(b *strings.Builder) {
+func (h *Handler) writeModelMetrics(builder5 *strings.Builder) {
 	if h.cfg.Usage == nil {
 		return
 	}
+
 	rows := h.cfg.Usage.AggregateByModel()
 	// 每族样本连续输出（HELP/TYPE 紧邻其样本），符合 exposition 惯例。
-	writeHelpType(b, "wokbuddy_requests_total", "Total upstream request attempts by model and result.", "counter")
+	writeHelpType(builder5, "wokbuddy_requests_total", "Total upstream request attempts by model and result.", "counter")
+
 	for i := range rows {
 		row := &rows[i]
-		ok := row.Requests - row.Errors
-		if ok < 0 {
-			ok = 0
-		}
-		writeSample(b, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "ok"), float64(ok))
-		writeSample(b, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "error"), float64(row.Errors))
+		ok := max(row.Requests-row.Errors, 0)
+		writeSample(builder5, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "ok"), float64(ok))
+		writeSample(builder5, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "error"), float64(row.Errors))
 	}
-	writeHelpType(b, "wokbuddy_tokens_total", "Total tokens by model and kind.", "counter")
+
+	writeHelpType(builder5, "wokbuddy_tokens_total", "Total tokens by model and kind.", "counter")
+
 	for i := range rows {
 		row := &rows[i]
-		writeSample(b, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "prompt"), float64(row.PromptTokens))
-		writeSample(b, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "completion"), float64(row.CompletionTok))
-		writeSample(b, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "total"), float64(row.TotalTokens))
+		writeSample(builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "prompt"), float64(row.PromptTokens))
+		writeSample(builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "completion"), float64(row.CompletionTok))
+		writeSample(builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "total"), float64(row.TotalTokens))
 	}
 }
 
 // writeDurationMetrics 渲染按 result 分流的耗时 histogram（进程内累计）。
-func (h *Handler) writeDurationMetrics(b *strings.Builder) {
-	writeHelpType(b, "wokbuddy_request_duration_seconds", "Upstream attempt duration in seconds by result.", "histogram")
+func (h *Handler) writeDurationMetrics(builder2 *strings.Builder) {
+	writeHelpType(builder2, "wokbuddy_request_duration_seconds", "Upstream attempt duration in seconds by result.", "histogram")
 	// 先快照再渲染：ok/error 恒输出（无观测即全零），保证序列集稳定。
 	snapshot := make(map[string]durationHist, len(durationResults))
 	for _, result := range durationResults {
 		snapshot[result] = durationHist{buckets: make([]uint64, len(durationBuckets))}
 	}
+
 	if m := h.metrics; m != nil {
 		m.mu.Lock()
 		for result, hist := range m.dur {
@@ -195,37 +212,47 @@ func (h *Handler) writeDurationMetrics(b *strings.Builder) {
 		}
 		m.mu.Unlock()
 	}
+
 	for _, result := range durationResults {
 		hist := snapshot[result]
 		for i, ub := range durationBuckets {
-			writeSample(b, "wokbuddy_request_duration_seconds_bucket", labelPair("result", result, "le", formatFloat(ub)), float64(hist.buckets[i]))
+			writeSample(
+				builder2,
+				"wokbuddy_request_duration_seconds_bucket",
+				labelPair("result", result, "le", formatFloat(ub)),
+				float64(hist.buckets[i]),
+			)
 		}
-		writeSample(b, "wokbuddy_request_duration_seconds_bucket", labelPair("result", result, "le", "+Inf"), float64(hist.count))
-		writeSample(b, "wokbuddy_request_duration_seconds_sum", label("result", result), hist.sum)
-		writeSample(b, "wokbuddy_request_duration_seconds_count", label("result", result), float64(hist.count))
+
+		writeSample(builder2, "wokbuddy_request_duration_seconds_bucket", labelPair("result", result, "le", "+Inf"), float64(hist.count))
+		writeSample(builder2, "wokbuddy_request_duration_seconds_sum", label("result", result), hist.sum)
+		writeSample(builder2, "wokbuddy_request_duration_seconds_count", label("result", result), float64(hist.count))
 	}
 }
 
 // writeRotationMetrics 渲染上游换号计数（进程内累计，按原因标签）。
-func (h *Handler) writeRotationMetrics(b *strings.Builder) {
+func (h *Handler) writeRotationMetrics(builder4 *strings.Builder) {
 	m := h.metrics
 	if m == nil {
 		return
 	}
-	writeHelpType(b, "wokbuddy_upstream_rotations_total", "Total upstream account rotations by reason.", "counter")
+
+	writeHelpType(builder4, "wokbuddy_upstream_rotations_total", "Total upstream account rotations by reason.", "counter")
 	m.mu.Lock()
+
 	reasons := make([]string, 0, len(m.rotations))
 	for reason := range m.rotations {
 		reasons = append(reasons, reason)
 	}
+
 	sort.Strings(reasons)
+
 	counts := make(map[string]uint64, len(m.rotations))
-	for reason, n := range m.rotations {
-		counts[reason] = n
-	}
+	maps.Copy(counts, m.rotations)
 	m.mu.Unlock()
+
 	for _, reason := range reasons {
-		writeSample(b, "wokbuddy_upstream_rotations_total", label("reason", reason), float64(counts[reason]))
+		writeSample(builder4, "wokbuddy_upstream_rotations_total", label("reason", reason), float64(counts[reason]))
 	}
 }
 
@@ -253,20 +280,24 @@ func formatFloat(v float64) string {
 func label(k, v string) string { return labelPair(k, v) }
 
 // labelPair 渲染 "k1=\"v1\",k2=\"v2\"..."，值按 Prometheus 文本格式转义。
-func labelPair(kv ...string) string {
-	var sb strings.Builder
-	sb.WriteByte('{')
-	for i := 0; i+1 < len(kv); i += 2 {
+func labelPair(strs ...string) string {
+	var builder strings.Builder
+	builder.WriteByte('{')
+
+	for i := 0; i+1 < len(strs); i += 2 {
 		if i > 0 {
-			sb.WriteByte(',')
+			builder.WriteByte(',')
 		}
-		sb.WriteString(kv[i])
-		sb.WriteString(`="`)
-		sb.WriteString(escapeLabelValue(kv[i+1]))
-		sb.WriteByte('"')
+
+		builder.WriteString(strs[i])
+		builder.WriteString(`="`)
+		builder.WriteString(escapeLabelValue(strs[i+1]))
+		builder.WriteByte('"')
 	}
-	sb.WriteByte('}')
-	return sb.String()
+
+	builder.WriteByte('}')
+
+	return builder.String()
 }
 
 // escapeLabelValue 转义标签值中的反斜杠、双引号与换行（Prometheus 文本格式）。
@@ -274,5 +305,6 @@ func escapeLabelValue(s string) string {
 	if !strings.ContainsAny(s, "\\\"\n") {
 		return s
 	}
+
 	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(s)
 }

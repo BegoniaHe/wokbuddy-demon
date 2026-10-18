@@ -15,7 +15,17 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
+var (
+	errTestRefreshSuccessFailed          = errors.New("TestRefreshSuccess failed")
+	errMissingXRefreshToken              = errors.New("missing X-Refresh-Token")
+	errTestUserResourceAggregationFailed = errors.New("TestUserResourceAggregation failed")
+	errWantPOST                          = errors.New("want POST")
+	errWrongPath2                        = errors.New("wrong path")
+)
+
 func TestClassify(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		status int
 		body   string
@@ -125,6 +135,8 @@ func TestClassify(t *testing.T) {
 
 // TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
 func TestIsModelRateLimit(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		body string
 		want bool
@@ -145,31 +157,38 @@ func TestIsModelRateLimit(t *testing.T) {
 
 // TestParseSoftRateReset 解析上游 429 6004 msg 里的「将在 … 重置」时间（## UTC+8）。
 func TestParseSoftRateReset(t *testing.T) {
+	t.Parallel()
+
 	future := time.Now().Add(35 * time.Minute)
-	ts := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
+	str := future.In(softRateResetLoc).Format("2006-01-02 15:04:05")
+
 	cases := []struct {
 		name string
 		body string
 		ok   bool
 	}{
-		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
-		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
+		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + str + ` UTC+8 重置"}`, true},
+		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + str + ` 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
-		{"非 6004 但带时间（ParseRateReset 统一解析；模型级豁免由调用侧按 6004 判定）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
+		{"非 6004 但带时间（ParseRateReset 统一解析；模型级豁免由调用侧按 6004 判定）", `{"code":11140,"msg":"将在 ` + str + ` UTC+8 重置"}`, true},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, ok := ParseRateReset(c.body)
-			if ok != c.ok {
-				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, ok := ParseRateReset(item.body)
+			if ok != item.ok {
+				t.Fatalf("ok=%v want %v (body=%s)", ok, item.ok, item.body)
 			}
+
 			if ok {
 				// 解析结果 = ts 在 UTC+8 解释下的墙钟（截断到分钟），应与 future 相差 ±2 分钟。
 				if d := got.Sub(future); d < -2*time.Minute || d > 2*time.Minute {
 					t.Errorf("parsed=%v want ~%v (diff %v)", got, future, d)
 				}
+
 				if got.Location() != time.UTC {
 					// 不同指针的 FixedZone 实例相等性按 offset 判，这里只断言 offset。
 					if _, off := got.Zone(); off != 8*60*60 {
@@ -202,45 +221,59 @@ func testClient(fn rtFunc) *Client {
 }
 
 func TestRefreshSuccess(t *testing.T) {
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
-			return nil, errors.New("wrong path: " + r.URL.Path)
+			return nil, fmt.Errorf("%s: %w", "wrong path: "+r.URL.Path, errTestRefreshSuccessFailed)
 		}
+
 		if r.Header.Get("X-Refresh-Token") != "oldrt" {
-			return nil, errors.New("missing X-Refresh-Token")
+			return nil, errMissingXRefreshToken
 		}
+
 		return jsonResp(200, `{"code":0,"msg":"ok","data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":3600}}`), nil
 	})
-	a := &auth.Auth{AccessToken: "at", RefreshToken: "oldrt", ExpiresAt: 1}
-	if err := c.RefreshToken(a); err != nil {
+
+	account := &auth.Auth{AccessToken: "at", RefreshToken: "oldrt", ExpiresAt: 1}
+	if err := client.RefreshToken(account); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if a.AccessToken != "newat" || a.RefreshToken != "newrt" {
-		t.Errorf("tokens not updated: %+v", a)
+
+	if account.AccessToken != "newat" || account.RefreshToken != "newrt" {
+		t.Errorf("tokens not updated: %+v", account)
 	}
-	if a.ExpiresAt <= 1 {
-		t.Errorf("expiresAt not advanced: %d", a.ExpiresAt)
+
+	if account.ExpiresAt <= 1 {
+		t.Errorf("expiresAt not advanced: %d", account.ExpiresAt)
 	}
 }
 
 func TestRefreshPreservesExpiryWhenOmitted(t *testing.T) {
+	t.Parallel()
+
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"accessToken":"newat"}}`), nil
 	})
-	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1753600000}
-	if err := c.RefreshToken(a); err != nil {
+
+	account := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1753600000}
+	if err := c.RefreshToken(account); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
-	if a.ExpiresAt != 1753600000 {
-		t.Errorf("expiresAt should be preserved, got %d", a.ExpiresAt)
+
+	if account.ExpiresAt != 1753600000 {
+		t.Errorf("expiresAt should be preserved, got %d", account.ExpiresAt)
 	}
-	if a.RefreshToken != "rt" {
-		t.Errorf("refreshToken should be preserved, got %s", a.RefreshToken)
+
+	if account.RefreshToken != "rt" {
+		t.Errorf("refreshToken should be preserved, got %s", account.RefreshToken)
 	}
 }
 
 func TestRefreshSessionDead(t *testing.T) {
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusUnauthorized,
 			Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -248,30 +281,39 @@ func TestRefreshSessionDead(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
-	err := c.RefreshToken(a)
+
+	err := client.RefreshToken(a)
 	if err == nil {
 		t.Fatal("want error")
 	}
-	var ue *Error
-	if !errors.As(err, &ue) {
+
+	var error *Error
+	if !errors.As(err, &error) {
 		t.Fatalf("want *Error, got %T %v", err, err)
 	}
-	if ue.Kind != ErrSessionDead {
-		t.Errorf("kind=%v want ErrSessionDead", ue.Kind)
+
+	if error.Kind != ErrSessionDead {
+		t.Errorf("kind=%v want ErrSessionDead", error.Kind)
 	}
 }
 
 func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
+	t.Parallel()
+
 	got := map[string]string{}
+
 	var gotBody []byte
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		for _, k := range []string{
 			"Authorization", "X-User-Id", "X-Product", "X-Agent-Intent",
 			"X-Private-Data", "X-Ide-Type", "X-Ide-Version",
 		} {
 			got[k] = r.Header.Get(k)
 		}
+
 		gotBody, _ = io.ReadAll(r.Body)
+
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -279,13 +321,16 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
+
+	rc, status, respBody, err := client.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
+
 	if respBody != nil {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
+
 	rc.Close()
 	// 官方桌面端 chat 指纹：X-Product=SaaS、X-IDE-Type=WorkBuddy、X-IDE-Version=realm 版本、
 	// X-Agent-Intent=craft、X-Private-Data=true。
@@ -303,14 +348,18 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 			t.Errorf("header %s=%q want %q", k, got[k], w)
 		}
 	}
+
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
 		t.Errorf("stream not forced: %s", gotBody)
 	}
 }
 
 func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
+	t.Parallel()
+
 	var outbound []byte
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
 			return jsonResp(200, `{"code":0,"data":{"models":[
@@ -320,6 +369,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 			return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 		default:
 			outbound, _ = io.ReadAll(r.Body)
+
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -327,16 +377,18 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 			}, nil
 		}
 	})
-	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	infos, err := c.FetchModels(a)
+	account := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	infos, err := client.FetchModels(account)
 	if err != nil {
 		t.Fatalf("fetch models: %v", err)
 	}
 	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
+	rc, status, _, err := client.ChatStream(account, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
+
 	rc.Close()
 	assertEffortsDowngrade(t, infos, outbound)
 }
@@ -345,6 +397,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 // low/high，请求 max 应降级为 high）。
 func assertEffortsDowngrade(t *testing.T, infos []ModelInfo, outbound []byte) {
 	t.Helper()
+
 	if len(infos) != 1 {
 		t.Fatalf("infos=%+v", infos)
 	}
@@ -352,23 +405,29 @@ func assertEffortsDowngrade(t *testing.T, infos []ModelInfo, outbound []byte) {
 	if len(infos[0].Efforts) != 2 || infos[0].Efforts[0] != "low" {
 		t.Errorf("infos[0].Efforts=%v", infos[0].Efforts)
 	}
+
 	if infos[0].DefaultEffort != "high" {
 		t.Errorf("infos[0].DefaultEffort=%q want high", infos[0].DefaultEffort)
 	}
+
 	var m map[string]any
 	if err := json.Unmarshal(outbound, &m); err != nil {
 		t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
 	}
+
 	if got, _ := m["reasoning_effort"].(string); got != "high" {
 		t.Errorf("reasoning_effort=%v want high (outbound=%s)", m["reasoning_effort"], outbound)
 	}
 }
 
 func TestChatStreamHardCreditError(t *testing.T) {
+	t.Parallel()
+
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+
 	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if status != 402 {
 		t.Errorf("status=%d", status)
@@ -378,6 +437,7 @@ func TestChatStreamHardCreditError(t *testing.T) {
 	if !errors.As(err, &ue) || ue.Kind != ErrHardCredit {
 		t.Fatalf("hard credit should return classified *Error envelope, got %v", err)
 	}
+
 	if len(respBody) == 0 {
 		t.Errorf("body should still be returned for passthrough")
 	}
@@ -386,44 +446,57 @@ func TestChatStreamHardCreditError(t *testing.T) {
 // TestChatStreamReadsMultipleChunksOverRealTransport 走真实 net/http 传输层，
 // 回归 defer cancel() 导致第二块起 body Read 返回 context canceled 的断流 bug。
 func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
+	t.Parallel()
+
 	const frames = 6
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
+
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			t.Error("http.ResponseWriter does not implement http.Flusher")
 			return
 		}
+
 		for i := 1; i <= frames; i++ {
 			if _, err := fmt.Fprintf(w, "data: chunk-%d\n\n", i); err != nil {
 				return
 			}
+
 			flusher.Flush()
 			time.Sleep(20 * time.Millisecond)
 		}
 	}))
 	defer srv.Close()
 
-	c := New()
-	c.ChatBaseCN = srv.URL
-	c.IdleTimeout = 5 * time.Second
+	client := New()
+	client.ChatBaseCN = srv.URL
+	client.IdleTimeout = 5 * time.Second
 
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
+
+	rc, status, _, err := client.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
 	defer rc.Close()
 
 	buf := make([]byte, 1)
-	var got string
-	var gotSb391 strings.Builder
+
+	var (
+		got      string
+		gotSb391 strings.Builder
+	)
+
 	for i := range frames {
 		if _, err := io.ReadFull(rc, buf); err != nil {
 			t.Fatalf("read %d: %v (real transport body must not be cut)", i, err)
 		}
+
 		gotSb391.WriteString(string(buf))
 	}
+
 	got += gotSb391.String()
 	if strings.Contains(got, "context canceled") {
 		t.Fatalf("body read hit context canceled, got %q", got)
@@ -431,106 +504,132 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 }
 
 func TestUserResourceAggregation(t *testing.T) {
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
-			return nil, errors.New("wrong path: " + r.URL.Path)
+			return nil, fmt.Errorf("%s: %w", "wrong path: "+r.URL.Path, errTestUserResourceAggregationFailed)
 		}
+
 		if r.Method != http.MethodPost {
-			return nil, errors.New("want POST")
+			return nil, errWantPOST
 		}
+
 		body, _ := io.ReadAll(r.Body)
 		if !bytes.Contains(body, []byte(`"ProductCode":"p_tcaca"`)) {
-			return nil, errors.New("missing ProductCode: " + string(body))
+			return nil, fmt.Errorf("%s: %w", "missing ProductCode: "+string(body), errTestUserResourceAggregationFailed)
 		}
+
 		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"TotalCount":2,"TotalDosage":3000,"Accounts":[
 			{"PackageName":"签到包","CapacitySize":2000,"CapacityRemain":1200,"CapacityUsed":800,"CycleCapacitySize":2000,"CycleCapacityRemain":1200,"CycleCapacityUsed":800},
 			{"PackageName":"体验包","CapacitySize":1000,"CapacityRemain":300,"CapacityUsed":700,"CycleCapacitySize":1000,"CycleCapacityRemain":300,"CycleCapacityUsed":700}
 		]}}}}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	remain, total, err := c.UserResource(a)
+
+	remain, total, err := client.UserResource(a)
 	if err != nil {
 		t.Fatalf("resource: %v", err)
 	}
+
 	if remain != 1500 {
 		t.Errorf("remain=%d want 1500", remain)
 	}
+
 	if total != 3000 {
 		t.Errorf("total=%d want 3000", total)
 	}
 }
 
 func TestUserResourceNegativeClamped(t *testing.T) {
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
 			{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":-50,"CycleCapacityUsed":150}
 		]}}}}`), nil
 	})
-	remain, total, err := c.UserResource(&auth.Auth{AccessToken: "at"})
+
+	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at"})
 	if err != nil || remain != 0 {
 		t.Errorf("remain=%d err=%v, want 0 (clamped)", remain, err)
 	}
+
 	if total != 100 {
 		t.Errorf("total=%d want 100", total)
 	}
 }
 
 func TestDailyCheckinAlready(t *testing.T) {
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/daily-checkin") {
-			return nil, errors.New("wrong path")
+			return nil, errWrongPath2
 		}
+
 		return jsonResp(200, `{"code":14001,"msg":"今日已签到"}`), nil
 	})
-	err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
+
+	err := client.DailyCheckin(&auth.Auth{AccessToken: "at"})
 	if err == nil || !strings.Contains(err.Error(), "已签到") {
 		t.Errorf("err=%v", err)
 	}
 }
 
 func TestBasesAlwaysCN(t *testing.T) {
-	c := testClient(nil)
-	cn := &auth.Auth{Domain: ""}
+	t.Parallel()
+
+	client := testClient(nil)
+	account := &auth.Auth{Domain: ""}
 	other := &auth.Auth{Domain: "example.com"}
-	if c.chatBase(cn) != "https://chat.example" || c.billingBase(cn) != "https://billing.example" {
+
+	if client.chatBase(account) != "https://chat.example" || client.billingBase(account) != "https://billing.example" {
 		t.Error("cn bases wrong")
 	}
 	// 恒 CN：domain 不同不改变上游 host。
-	if c.chatBase(other) != c.chatBase(cn) || c.billingBase(other) != c.billingBase(cn) {
+	if client.chatBase(other) != client.chatBase(account) || client.billingBase(other) != client.billingBase(account) {
 		t.Error("bases must be CN regardless of domain")
 	}
 }
 
 func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
-	c := New()
-	if c.ChatHTTP == nil {
+	t.Parallel()
+
+	client := New()
+	if client.ChatHTTP == nil {
 		t.Fatal("ChatHTTP should be initialized")
 	}
-	if c.ChatHTTP.Timeout != 0 {
-		t.Errorf("ChatHTTP.Timeout=%v want 0 (no total cap)", c.ChatHTTP.Timeout)
+
+	if client.ChatHTTP.Timeout != 0 {
+		t.Errorf("ChatHTTP.Timeout=%v want 0 (no total cap)", client.ChatHTTP.Timeout)
 	}
 	// 共享同一个 Transport 实例，连接池不重复。
-	if c.ChatHTTP.Transport != c.HTTP.Transport {
+	if client.ChatHTTP.Transport != client.HTTP.Transport {
 		t.Errorf("ChatHTTP and HTTP must share the same *http.Transport")
 	}
-	htr, ok := c.ChatHTTP.Transport.(*http.Transport)
+
+	htr, ok := client.ChatHTTP.Transport.(*http.Transport)
 	if !ok {
-		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
+		t.Fatalf("Transport type=%T", client.ChatHTTP.Transport)
 	}
+
 	if htr.ResponseHeaderTimeout != 60*time.Second { // 连接层加固：响应头上限从 120s 收到 60s（慢冷启动留 3.75× 余量）
 		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
 	}
 }
 
 func TestChatStreamRoutesToChatHTTP(t *testing.T) {
+	t.Parallel()
 	// 显式注入 ChatHTTP（可辨识标记），验证 ChatStream 走它而非 HTTP。
 	chatHit, httpHit := false, false
-	c := testClient(func(*http.Request) (*http.Response, error) {
+	client := testClient(func(*http.Request) (*http.Response, error) {
 		httpHit = true
 		return jsonResp(200, `{}`), nil
 	})
-	c.ChatHTTP = &http.Client{Transport: rtFunc(func(*http.Request) (*http.Response, error) {
+	client.ChatHTTP = &http.Client{Transport: rtFunc(func(*http.Request) (*http.Response, error) {
 		chatHit = true
+
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -538,103 +637,128 @@ func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 		}, nil
 	})}
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
+
+	rc, status, _, err := client.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
+
 	rc.Close()
+
 	if !chatHit {
 		t.Error("ChatStream should use ChatHTTP")
 	}
+
 	if httpHit {
 		t.Error("ChatStream must not use HTTP")
 	}
 }
 
 func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
-	c := testClient(func(*http.Request) (*http.Response, error) {
+	t.Parallel()
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
 		}, nil
 	})
-	if c.chatHTTP() != c.HTTP {
+	if client.chatHTTP() != client.HTTP {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
 	}
 }
 
 func TestFetchModelsDefaultEffortDualKeyAndSizes(t *testing.T) {
+	t.Parallel()
 	// 上游双键：老模型 reasoning.effort（auto），新模型（glm-5.3 系）只有 reasoning.defaultEffort；
 	// credits/maxAllowedSize/canDisableThinking/supportsReasoning 等尺寸与能力字段应一并透出。
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"models":[
 			{"id":"glm-5.3","maxInputTokens":1000000,"maxOutputTokens":48000,"maxAllowedSize":1000000,"credits":"x0.79","supportsReasoning":true,"reasoning":{"defaultEffort":"high","canDisableThinking":true,"supportedEfforts":["low","high","max"]}},
 			{"id":"auto","maxInputTokens":168000,"maxOutputTokens":32000,"supportsReasoning":true,"reasoning":{"effort":"high"}}
 		],"agents":[{"name":"cli","models":["glm-5.3","auto"]}]}}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	infos, err := c.FetchModels(a)
+
+	infos, err := client.FetchModels(a)
 	if err != nil {
 		t.Fatalf("fetch models: %v", err)
 	}
+
 	byID := map[string]ModelInfo{}
 	for _, mi := range infos {
 		byID[mi.ID] = mi
 	}
-	assertDefaultEffortDualKey(t, byID, c)
+
+	assertDefaultEffortDualKey(t, byID, client)
 }
 
 // assertDefaultEffortDualKey 断言 defaultEffort 新键与 effort 老键双通道解析出的字段。
-func assertDefaultEffortDualKey(t *testing.T, byID map[string]ModelInfo, c *Client) {
+func assertDefaultEffortDualKey(t *testing.T, byID map[string]ModelInfo, client *Client) {
 	t.Helper()
-	g := byID["glm-5.3"]
-	if g.DefaultEffort != "high" {
-		t.Errorf("glm-5.3 DefaultEffort=%q want high (from defaultEffort key)", g.DefaultEffort)
+
+	modelInfo := byID["glm-5.3"]
+	if modelInfo.DefaultEffort != "high" {
+		t.Errorf("glm-5.3 DefaultEffort=%q want high (from defaultEffort key)", modelInfo.DefaultEffort)
 	}
-	if !g.CanDisableThinking || !g.SupportsReasoning {
-		t.Errorf("glm-5.3 capability flags: canDisable=%v supportsReasoning=%v want true/true", g.CanDisableThinking, g.SupportsReasoning)
+
+	if !modelInfo.CanDisableThinking || !modelInfo.SupportsReasoning {
+		t.Errorf("glm-5.3 capability flags: canDisable=%v supportsReasoning=%v want true/true", modelInfo.CanDisableThinking, modelInfo.SupportsReasoning)
 	}
-	if g.MaxAllowedSize != 1000000 || g.MaxTokens != 48000 || g.Credits != "x0.79" {
-		t.Errorf("glm-5.3 sizes: maxAllowed=%d maxOut=%d credits=%q", g.MaxAllowedSize, g.MaxTokens, g.Credits)
+
+	if modelInfo.MaxAllowedSize != 1000000 || modelInfo.MaxTokens != 48000 || modelInfo.Credits != "x0.79" {
+		t.Errorf("glm-5.3 sizes: maxAllowed=%d maxOut=%d credits=%q", modelInfo.MaxAllowedSize, modelInfo.MaxTokens, modelInfo.Credits)
 	}
-	if got := c.ModelRate("cn", "glm-5.3"); got != "0.79" {
+
+	if got := client.ModelRate("cn", "glm-5.3"); got != "0.79" {
 		t.Errorf("glm-5.3 ModelRate=%q want 0.79", got)
 	}
+
 	if au := byID["auto"]; au.DefaultEffort != "high" {
 		t.Errorf("auto DefaultEffort=%q want high (from legacy effort key)", au.DefaultEffort)
 	}
 }
 
 func TestModelRateCacheEffectiveAndNormalized(t *testing.T) {
-	c := New()
+	t.Parallel()
+
+	client := New()
 	factor := 0.5
-	c.storeModelRates("cn", []ModelInfo{
+	client.storeModelRates("cn", []ModelInfo{
 		{ID: "base", Credits: "x0.50 credits"},
 		{ID: "promo", Credits: "x0.80", PromoFactor: &factor, PromoCredits: "0.50x"},
 	})
-	if got := c.ModelRate("cn", "base"); got != "0.5" {
+
+	if got := client.ModelRate("cn", "base"); got != "0.5" {
 		t.Fatalf("base rate=%q want 0.5", got)
 	}
-	if got := c.ModelRate("cn", "promo"); got != "0.5" {
+
+	if got := client.ModelRate("cn", "promo"); got != "0.5" {
 		t.Fatalf("promo rate=%q want 0.5", got)
 	}
+
 	if got := normalizeModelRate("x0.05 credits"); got != "0.05" {
 		t.Fatalf("normalizeModelRate=%q want 0.05", got)
 	}
-	c.storeModelRates("cn", []ModelInfo{{ID: "base", Credits: "x0.79"}})
-	if got := c.ModelRate("cn", "base"); got != "0.79" {
+
+	client.storeModelRates("cn", []ModelInfo{{ID: "base", Credits: "x0.79"}})
+
+	if got := client.ModelRate("cn", "base"); got != "0.79" {
 		t.Fatalf("refreshed base rate=%q want 0.79", got)
 	}
-	if got := c.ModelRate("cn", "promo"); got != "" {
+
+	if got := client.ModelRate("cn", "promo"); got != "" {
 		t.Fatalf("stale promo rate=%q want empty after full refresh", got)
 	}
 }
 
 func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
+	t.Parallel()
 	// CLI 目录给 flash 精简字段（128K / 固定 high）；IDE /v3/config 给完整能力。
 	var sawIDE bool
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
 			return jsonResp(200, `{"code":0,"data":{"models":[
@@ -642,7 +766,9 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			sawIDE = true
+
 			assertV3ConfigHeaders(t, r)
+
 			return jsonResp(200, `{"code":0,"data":{"models":[
 				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.03","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"defaultEffort":"high","summary":"auto","supportedEfforts":["low","high","max"]}}
 			]}}`), nil
@@ -652,49 +778,61 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 		}
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "copilot.tencent.com"}
-	infos, err := c.FetchModels(a)
+
+	infos, err := client.FetchModels(a)
 	if err != nil {
 		t.Fatalf("fetch models: %v", err)
 	}
+
 	if !sawIDE {
 		t.Fatal("expected /v3/config request")
 	}
+
 	if len(infos) != 1 {
 		t.Fatalf("infos=%+v", infos)
 	}
+
 	assertV3Overlay(t, infos[0])
 }
 
 // assertV3ConfigHeaders 断言 /v3/config 请求带 IDE UA 与 SaaS 产品头。
 func assertV3ConfigHeaders(t *testing.T, r *http.Request) {
 	t.Helper()
+
 	if r.Header.Get("User-Agent") != codeBuddyIDEUA {
 		t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
 	}
+
 	if r.Header.Get("X-Product") != "SaaS" {
 		t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
 	}
+
 	if r.Header.Get("X-User-Id") != "u1" {
 		t.Errorf("X-User-Id=%q want u1", r.Header.Get("X-User-Id"))
 	}
 }
 
 // assertV3Overlay 断言 /v3/config 的完整能力字段覆盖了 CLI 精简字段。
-func assertV3Overlay(t *testing.T, mi ModelInfo) {
+func assertV3Overlay(t *testing.T, modelInfo ModelInfo) {
 	t.Helper()
-	if mi.MaxTokens != 393216 {
-		t.Errorf("MaxTokens=%d want 393216", mi.MaxTokens)
+
+	if modelInfo.MaxTokens != 393216 {
+		t.Errorf("MaxTokens=%d want 393216", modelInfo.MaxTokens)
 	}
-	if mi.ContextWindow != 1000000 {
-		t.Errorf("ContextWindow=%d want 1000000", mi.ContextWindow)
+
+	if modelInfo.ContextWindow != 1000000 {
+		t.Errorf("ContextWindow=%d want 1000000", modelInfo.ContextWindow)
 	}
-	if !mi.CanDisableThinking || !mi.SupportsReasoning {
-		t.Errorf("flags canDisable=%v supportsReasoning=%v", mi.CanDisableThinking, mi.SupportsReasoning)
+
+	if !modelInfo.CanDisableThinking || !modelInfo.SupportsReasoning {
+		t.Errorf("flags canDisable=%v supportsReasoning=%v", modelInfo.CanDisableThinking, modelInfo.SupportsReasoning)
 	}
-	if mi.DefaultEffort != "high" {
-		t.Errorf("DefaultEffort=%q want high", mi.DefaultEffort)
+
+	if modelInfo.DefaultEffort != "high" {
+		t.Errorf("DefaultEffort=%q want high", modelInfo.DefaultEffort)
 	}
-	if got := strings.Join(mi.Efforts, ","); got != "low,high,max" {
-		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
+
+	if got := strings.Join(modelInfo.Efforts, ","); got != "low,high,max" {
+		t.Errorf("Efforts=%v want low,high,max", modelInfo.Efforts)
 	}
 }

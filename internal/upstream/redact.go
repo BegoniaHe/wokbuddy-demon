@@ -41,34 +41,39 @@ func redactForLog(s string, limit int) string {
 	clean = reQueryValue.ReplaceAllString(clean, `$1`+redacted)
 	clean = reUUID.ReplaceAllString(clean, redacted)
 	clean = reHexToken.ReplaceAllStringFunc(clean, redactHexToken)
+
 	clean = reLongToken.ReplaceAllStringFunc(clean, redactHighEntropy)
 	if limit > 0 {
 		clean = logfmt.Truncate(clean, limit)
 	}
+
 	return clean
 }
 
 // sanitizeLogLine 把换行/制表符与其他控制字符压成空格，避免日志注入与多行伪造。
-func sanitizeLogLine(s string) string {
+func sanitizeLogLine(str2 string) string {
 	return strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
 			return ' '
 		}
+
 		return r
-	}, s)
+	}, str2)
 }
 
 // redactHighEntropy 只替换明显像 token 的长串：同时含大小写与数字，或含
 // 非字母数字符号（_ / + = 等）。长模型名通常只有小写与连字符，保持原样。
-func redactHighEntropy(s string) string {
-	lower := strings.IndexFunc(s, isLowerASCII) >= 0
-	upper := strings.IndexFunc(s, isUpperASCII) >= 0
-	digit := strings.IndexFunc(s, isDigitASCII) >= 0
-	symbol := strings.ContainsAny(s, "_+=~/")
+func redactHighEntropy(str string) string {
+	lower := strings.IndexFunc(str, isLowerASCII) >= 0
+	upper := strings.IndexFunc(str, isUpperASCII) >= 0
+	digit := strings.IndexFunc(str, isDigitASCII) >= 0
+
+	symbol := strings.ContainsAny(str, "_+=~/")
 	if (lower && upper && digit) || symbol {
 		return redacted
 	}
-	return s
+
+	return str
 }
 
 // redactHexToken 只替换含数字的长 hex 串；纯字母长词（如重复填充）保持原样。
@@ -76,6 +81,7 @@ func redactHexToken(s string) string {
 	if strings.IndexFunc(s, isDigitASCII) >= 0 {
 		return redacted
 	}
+
 	return s
 }
 

@@ -16,6 +16,8 @@ const (
 	proxyCooldownMax  = 10 * time.Minute
 )
 
+var errNoProxyAvailable = errors.New("no proxy available")
+
 // Pool 出站代理池：按健康轮换，失败代理进入指数冷却，成功重置。
 // 无代理时退化为直连（与未配置代理的行为一致）。
 type Pool struct {
@@ -39,8 +41,10 @@ func New(rawURLs []string) (*Pool, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		states = append(states, &proxyState{proxy: p})
 	}
+
 	return &Pool{states: states, now: time.Now}, nil
 }
 
@@ -48,6 +52,7 @@ func New(rawURLs []string) (*Pool, error) {
 func (pool *Pool) SetClock(fn func() time.Time) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+
 	pool.now = fn
 }
 
@@ -59,8 +64,14 @@ func (pool *Pool) Len() int { return len(pool.states) }
 // 全部失败返回包装 ErrProxyDial 的错误（调用方据此不惩罚账号）。
 func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	if len(pool.states) == 0 {
-		return (&net.Dialer{Timeout: dialTimeout, KeepAlive: dialKeepAlive}).DialContext(ctx, network, addr)
+		conn, err := (&net.Dialer{Timeout: dialTimeout, KeepAlive: dialKeepAlive}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, fmt.Errorf("direct dial: %w", err)
+		}
+
+		return conn, nil
 	}
+
 	pool.mu.Lock()
 	start := int(pool.next % uint64(len(pool.states))) //nolint:gosec // len(states) 远小于 int 上限
 	pool.next++
@@ -68,36 +79,48 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 	pool.mu.Unlock()
 
 	var lastErr error
+
 	attempted := false
+
 	n := len(pool.states)
 	for i := range n {
-		st := pool.states[(start+i)%n]
-		if pool.inCooldown(st, now) {
+		proxyState3 := pool.states[(start+i)%n]
+		if pool.inCooldown(proxyState3, now) {
 			continue
 		}
+
 		attempted = true
-		conn, err := st.proxy.dial(ctx, network, addr)
+
+		conn, err := proxyState3.proxy.dial(ctx, network, addr)
 		if err == nil {
-			pool.recordSuccess(st)
+			pool.recordSuccess(proxyState3)
 			return conn, nil
 		}
+
 		lastErr = err
-		pool.recordFailure(st, now)
+
+		pool.recordFailure(proxyState3, now)
 	}
+
 	if !attempted {
 		// 全部冷却：半开探测冷却最早者，避免整段冷却期完全不可用。
-		st := pool.earliest()
-		conn, err := st.proxy.dial(ctx, network, addr)
+		proxyState2 := pool.earliest()
+
+		conn, err := proxyState2.proxy.dial(ctx, network, addr)
 		if err == nil {
-			pool.recordSuccess(st)
+			pool.recordSuccess(proxyState2)
 			return conn, nil
 		}
+
 		lastErr = err
-		pool.recordFailure(st, now)
+
+		pool.recordFailure(proxyState2, now)
 	}
+
 	if lastErr == nil {
-		lastErr = errors.New("no proxy available")
+		lastErr = errNoProxyAvailable
 	}
+
 	return nil, fmt.Errorf("%w: %w", ErrProxyDial, lastErr)
 }
 
@@ -106,6 +129,7 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 func (pool *Pool) inCooldown(st *proxyState, now time.Time) bool {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+
 	return now.Before(st.cooldownTill)
 }
 
@@ -113,34 +137,41 @@ func (pool *Pool) inCooldown(st *proxyState, now time.Time) bool {
 func (pool *Pool) earliest() *proxyState {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+
 	best := pool.states[0]
 	for _, st := range pool.states[1:] {
 		if st.cooldownTill.Before(best.cooldownTill) {
 			best = st
 		}
 	}
+
 	return best
 }
 
 // recordFailure 记一次失败：failures++ 并按指数退避设置冷却截止。
-func (pool *Pool) recordFailure(st *proxyState, now time.Time) {
+func (pool *Pool) recordFailure(proxyState2 *proxyState, now time.Time) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-	st.failures++
-	d := proxyCooldownBase
-	for i := 1; i < st.failures && d < proxyCooldownMax; i++ {
-		d *= 2
+
+	proxyState2.failures++
+
+	duration := proxyCooldownBase
+	for i := 1; i < proxyState2.failures && duration < proxyCooldownMax; i++ {
+		duration *= 2
 	}
-	if d > proxyCooldownMax {
-		d = proxyCooldownMax
+
+	if duration > proxyCooldownMax {
+		duration = proxyCooldownMax
 	}
-	st.cooldownTill = now.Add(d)
+
+	proxyState2.cooldownTill = now.Add(duration)
 }
 
 // recordSuccess 记一次成功：清零失败与冷却。
 func (pool *Pool) recordSuccess(st *proxyState) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+
 	st.failures = 0
 	st.cooldownTill = time.Time{}
 }

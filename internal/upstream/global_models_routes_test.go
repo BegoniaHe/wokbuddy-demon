@@ -7,34 +7,39 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
+var errV3ConfigStatus500 = errors.New("v3/config status 500")
+
 // TestMergeV3RoutesPriority 主路字段权威：同 id 在三路都出现时，字段取自主路
 // （桌面端 UA），后续路不得覆盖其窗口/effort/credits。
 func TestMergeV3RoutesPriority(t *testing.T) {
-	mk := func(id string, ctx, out int64, credits string, efforts []string) ModelInfo {
+	t.Parallel()
+
+	callback := func(id string, ctx, out int64, credits string, efforts []string) ModelInfo {
 		return ModelInfo{ID: id, ContextWindow: ctx, MaxTokens: out, Credits: credits, Efforts: efforts}
 	}
 	desktop := probeResult{
 		names: []string{"shared", "only-desktop"},
 		infos: []ModelInfo{
-			mk("shared", 1000000, 128000, "x1.33", []string{"low", "high"}),
-			mk("only-desktop", 500000, 64000, "x0.10", []string{"medium"}),
+			callback("shared", 1000000, 128000, "x1.33", []string{"low", "high"}),
+			callback("only-desktop", 500000, 64000, "x0.10", []string{"medium"}),
 		},
 	}
 	ide := probeResult{
 		names: []string{"shared", "only-ide"},
 		infos: []ModelInfo{
 			// 同 id 但字段不同：不得覆盖主路。
-			mk("shared", 176000, 24000, "x9.99", []string{"max"}),
-			mk("only-ide", 200000, 32000, "x0.20", nil),
+			callback("shared", 176000, 24000, "x9.99", []string{"max"}),
+			callback("only-ide", 200000, 32000, "x0.20", nil),
 		},
 	}
 	cli := probeResult{
 		names: []string{"shared", "only-cli"},
 		infos: []ModelInfo{
-			mk("shared", 272000, 72000, "x8.88", []string{"xhigh"}),
-			mk("only-cli", 256000, 32000, "x0.30", nil),
+			callback("shared", 272000, 72000, "x8.88", []string{"xhigh"}),
+			callback("only-cli", 256000, 32000, "x0.30", nil),
 		},
 	}
+
 	got := mergeV3Routes([]struct {
 		label string
 		res   probeResult
@@ -46,6 +51,7 @@ func TestMergeV3RoutesPriority(t *testing.T) {
 	if got.err != nil {
 		t.Fatalf("unexpected err: %v", got.err)
 	}
+
 	assertV3Names(t, got.names, []string{"shared", "only-desktop", "only-ide", "only-cli"})
 	// 主路字段权威：shared 的窗口必须是主路值。
 	assertSharedFromPrimary(t, got.infos)
@@ -54,9 +60,11 @@ func TestMergeV3RoutesPriority(t *testing.T) {
 // assertV3Names 断言合并后的 names 顺序与期望一致。
 func assertV3Names(t *testing.T, got, want []string) {
 	t.Helper()
+
 	if len(got) != len(want) {
 		t.Fatalf("names = %v, want %v", got, want)
 	}
+
 	for i, id := range want {
 		if got[i] != id {
 			t.Errorf("names[%d] = %q, want %q (full %v)", i, got[i], id, got)
@@ -67,21 +75,27 @@ func assertV3Names(t *testing.T, got, want []string) {
 // assertSharedFromPrimary 断言同 id "shared" 的字段取自主路（桌面端）。
 func assertSharedFromPrimary(t *testing.T, infos []ModelInfo) {
 	t.Helper()
+
 	var shared *ModelInfo
+
 	for i := range infos {
 		if infos[i].ID == "shared" {
 			shared = &infos[i]
 		}
 	}
+
 	if shared == nil {
 		t.Fatal("shared model missing from infos")
 	}
+
 	if shared.ContextWindow != 1000000 || shared.MaxTokens != 128000 {
 		t.Errorf("shared window = %d/%d, want 1000000/128000 (primary route must win)", shared.ContextWindow, shared.MaxTokens)
 	}
+
 	if shared.Credits != "x1.33" {
 		t.Errorf("shared credits = %q, want x1.33", shared.Credits)
 	}
+
 	if len(shared.Efforts) != 2 || shared.Efforts[0] != "low" {
 		t.Errorf("shared efforts = %v, want [low high]", shared.Efforts)
 	}
@@ -90,9 +104,11 @@ func assertSharedFromPrimary(t *testing.T, infos []ModelInfo) {
 // TestMergeV3RoutesPartialFailure 单路失败不拖垮整次探测：失败的路由被跳过，
 // 成功路并集照常产出；全路失败才返回 err。
 func TestMergeV3RoutesPartialFailure(t *testing.T) {
+	t.Parallel()
+
 	mk := func(id string) ModelInfo { return ModelInfo{ID: id} }
 	ok := probeResult{names: []string{"a"}, infos: []ModelInfo{mk("a")}}
-	bad := probeResult{err: errors.New("v3/config status 500")}
+	bad := probeResult{err: errV3ConfigStatus500}
 
 	got := mergeV3Routes([]struct {
 		label string
@@ -105,6 +121,7 @@ func TestMergeV3RoutesPartialFailure(t *testing.T) {
 	if got.err != nil {
 		t.Fatalf("partial failure should not error, got %v", got.err)
 	}
+
 	if len(got.names) != 1 || got.names[0] != "a" {
 		t.Errorf("names = %v, want [a]", got.names)
 	}
@@ -127,6 +144,8 @@ func TestMergeV3RoutesPartialFailure(t *testing.T) {
 // 回归用例：nonChatModel 早期只拦 text-to-image，桌面端目录下的
 // text-to-video / image-to-video（seedance 系列）会漏过并混进 /v1/models。
 func TestNonChatModelGenerationTags(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		id   string
@@ -155,23 +174,29 @@ func TestNonChatModelGenerationTags(t *testing.T) {
 // （CN 5.8.2 / global 5.7.6 的 daemon UA 字面量均如此），无 realm 品牌差异；
 // 仅版本号按 realm 分档。探测主路用这个 UA，与 chat 路径同源。
 func TestDesktopUAForGlobalAccount(t *testing.T) {
-	c := New()
+	t.Parallel()
+
+	client := New()
 	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
 	global.BackfillRealm()
-	ua := c.defaultWorkBuddyUAFor(global)
-	if want := "WorkBuddy/5.7.6"; !contains(ua, want) {
-		t.Errorf("global desktop UA = %q, want it to contain %q", ua, want)
+
+	str := client.defaultWorkBuddyUAFor(global)
+	if want := "WorkBuddy/5.7.6"; !contains(str, want) {
+		t.Errorf("global desktop UA = %q, want it to contain %q", str, want)
 	}
-	if !contains(ua, "CLI/2.156.0") {
-		t.Errorf("global desktop UA = %q, want CLI/2.156.0 segment", ua)
+
+	if !contains(str, "CLI/2.156.0") {
+		t.Errorf("global desktop UA = %q, want CLI/2.156.0 segment", str)
 	}
-	if contains(ua, "WorkBuddy AI") {
-		t.Errorf("global desktop UA = %q, must not contain 'WorkBuddy AI' (两份官方包均无)", ua)
+
+	if contains(str, "WorkBuddy AI") {
+		t.Errorf("global desktop UA = %q, must not contain 'WorkBuddy AI' (两份官方包均无)", str)
 	}
 	// CN 账号版本分档为 5.8.2。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
-	if ua := c.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/5.8.2") {
+
+	if ua := client.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/5.8.2") {
 		t.Errorf("cn desktop UA = %q, want WorkBuddy/5.8.2", ua)
 	}
 }
@@ -182,5 +207,6 @@ func contains(s, sub string) bool {
 			return true
 		}
 	}
+
 	return false
 }

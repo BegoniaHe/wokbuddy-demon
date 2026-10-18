@@ -121,6 +121,7 @@ func (r *MarkupRepair) Converted() int {
 	if r == nil {
 		return 0
 	}
+
 	return r.converted
 }
 
@@ -129,6 +130,7 @@ func (r *MarkupRepair) Seen() int {
 	if r == nil {
 		return 0
 	}
+
 	return r.seen
 }
 
@@ -138,6 +140,7 @@ func (r *MarkupRepair) Rejected() int {
 	if r == nil {
 		return 0
 	}
+
 	return r.rejected
 }
 
@@ -150,56 +153,93 @@ func (r *MarkupRepair) Feed(text string) (string, []MarkupCall) {
 	if !r.Enabled() {
 		return text, nil
 	}
-	s := r.hold + text
+
+	str := r.hold + text
 	r.hold = ""
-	var emit strings.Builder
-	var calls []MarkupCall
+
+	var (
+		emit  strings.Builder
+		calls []MarkupCall
+	)
+
 	for {
-		if !r.inBlock {
-			i := markupStartCandidate(s)
-			if i < 0 {
-				emit.WriteString(s)
-				break
-			}
-			if len(s)-i < len(markupOpen) {
-				// 起点被截断在增量边界（上游把标记切成了两片）：留到下一片再判定。
-				emit.WriteString(s[:i])
-				r.hold = s[i:]
-				break
-			}
-			emit.WriteString(s[:i])
-			s = s[i+len(markupOpen):]
-			r.inBlock = true
-			continue
+		var done bool
+		if r.inBlock {
+			done = r.consumeBlock(&str, &emit, &calls)
+		} else {
+			done = r.consumeOpen(&str, &emit)
 		}
-		k := strings.Index(s, markupClose)
-		if k < 0 {
-			if len(s) > markupMaxBlockBytes {
-				// 超长未闭合：不是标记，原文回吐并退出块态。
-				emit.WriteString(markupOpen)
-				emit.WriteString(s)
-				r.inBlock = false
-				break
-			}
-			r.hold = s
+
+		if done {
 			break
 		}
-		inner := s[:k]
-		s = s[k+len(markupClose):]
-		r.inBlock = false
-		r.seen++
-		if got, ok := parseMarkupBlock(inner, r.allowed); ok {
-			calls = append(calls, got...)
-			r.converted += len(got)
-			continue
-		}
-		// 块内不是纯调用（夹带正文 / 工具名不合规 / 参数畸形）：原文回吐，绝不吞字节。
-		r.rejected++
-		emit.WriteString(markupOpen)
-		emit.WriteString(inner)
-		emit.WriteString(markupClose)
 	}
+
 	return emit.String(), calls
+}
+
+// consumeOpen 处理块外正文：找到下一个标记起点并透出前文；返回 true 表示本轮结束。
+func (r *MarkupRepair) consumeOpen(str3 *string, emit *strings.Builder) bool {
+	i := markupStartCandidate(*str3)
+	if i < 0 {
+		emit.WriteString(*str3)
+		return true
+	}
+
+	if len(*str3)-i < len(markupOpen) {
+		// 起点被截断在增量边界（上游把标记切成了两片）：留到下一片再判定。
+		emit.WriteString((*str3)[:i])
+		r.hold = (*str3)[i:]
+
+		return true
+	}
+
+	emit.WriteString((*str3)[:i])
+	*str3 = (*str3)[i+len(markupOpen):]
+	r.inBlock = true
+
+	return false
+}
+
+// consumeBlock 处理块内正文：闭合则尝试还原调用，未闭合则留待下一片；
+// 返回 true 表示本轮结束。
+func (r *MarkupRepair) consumeBlock(str2 *string, emit *strings.Builder, calls *[]MarkupCall) bool {
+	k := strings.Index(*str2, markupClose)
+	if k < 0 {
+		if len(*str2) > markupMaxBlockBytes {
+			// 超长未闭合：不是标记，原文回吐并退出块态。
+			emit.WriteString(markupOpen)
+			emit.WriteString(*str2)
+
+			r.inBlock = false
+
+			return true
+		}
+
+		r.hold = *str2
+
+		return true
+	}
+
+	inner := (*str2)[:k]
+	*str2 = (*str2)[k+len(markupClose):]
+	r.inBlock = false
+
+	r.seen++
+	if got, ok := parseMarkupBlock(inner, r.allowed); ok {
+		*calls = append(*calls, got...)
+		r.converted += len(got)
+
+		return false
+	}
+	// 块内不是纯调用（夹带正文 / 工具名不合规 / 参数畸形）：原文回吐，绝不吞字节。
+	r.rejected++
+
+	emit.WriteString(markupOpen)
+	emit.WriteString(inner)
+	emit.WriteString(markupClose)
+
+	return false
 }
 
 // Flush 在响应流结束时调用：把仍未判定的尾部缓冲原文交还。未闭合的块连同起始标记
@@ -208,34 +248,41 @@ func (r *MarkupRepair) Flush() string {
 	if !r.Enabled() {
 		return ""
 	}
+
 	out := r.hold
 	if r.inBlock {
 		out = markupOpen + r.hold
 	}
+
 	r.hold = ""
 	r.inBlock = false
+
 	return out
 }
 
 // markupStartCandidate 返回 s 中最早的「可能是 markupOpen 起点」的下标：该位置之后
 // 要么正好是完整的 markupOpen，要么是 markupOpen 的一个前缀（被增量边界截断）。
 // 没有候选返回 -1。
-func markupStartCandidate(s string) int {
-	for i := range len(s) {
-		if s[i] != '<' {
+func markupStartCandidate(str string) int {
+	for i := range len(str) {
+		if str[i] != '<' {
 			continue
 		}
-		rest := s[i:]
+
+		rest := str[i:]
 		if len(rest) >= len(markupOpen) {
 			if rest[:len(markupOpen)] == markupOpen {
 				return i
 			}
+
 			continue
 		}
+
 		if strings.HasPrefix(markupOpen, rest) {
 			return i
 		}
 	}
+
 	return -1
 }
 
@@ -246,39 +293,51 @@ func markupStartCandidate(s string) int {
 // 名单非空走严格比对，名单为空走形态检查。任一不满足返回 ok=false，由调用方原文回吐。
 func parseMarkupBlock(inner string, allowed map[string]bool) ([]MarkupCall, bool) {
 	strict := len(allowed) > 0
+
 	var out []MarkupCall
+
 	pos := 0
 	for {
 		loc := markupInvokeRe.FindStringSubmatchIndex(inner[pos:])
 		if loc == nil {
 			break
 		}
+
 		if strings.TrimSpace(inner[pos:pos+loc[0]]) != "" {
 			return nil, false // invoke 之前夹带了正文
 		}
+
 		name := inner[pos+loc[2] : pos+loc[3]]
 		bodyStart := pos + loc[1]
+
 		end := strings.Index(inner[bodyStart:], markupInvokeClose)
 		if end < 0 {
 			return nil, false // invoke 未闭合
 		}
+
 		body := inner[bodyStart : bodyStart+end]
 		pos = bodyStart + end + len(markupInvokeClose)
+
 		args, ok := parseMarkupParams(body)
 		if !ok {
 			return nil, false
 		}
+
 		if !markupNameAllowed(name, allowed, strict) {
 			return nil, false // 工具名不在声明里 / 名单缺失且名字不像工具名 → 原文透出
 		}
+
 		out = append(out, MarkupCall{Name: name, Arguments: args})
 	}
+
 	if len(out) == 0 {
 		return nil, false
 	}
+
 	if strings.TrimSpace(inner[pos:]) != "" {
 		return nil, false // 最后一个 invoke 之后夹带了正文
 	}
+
 	return out, true
 }
 
@@ -288,6 +347,7 @@ func markupNameAllowed(name string, allowed map[string]bool, strict bool) bool {
 	if strict {
 		return allowed[name]
 	}
+
 	return markupToolNameRe.MatchString(name)
 }
 
@@ -298,28 +358,35 @@ func markupNameAllowed(name string, allowed map[string]bool, strict bool) bool {
 // 是类型不如模型本意。无参数的工具产出 "{}"。
 func parseMarkupParams(body string) (string, bool) {
 	args := map[string]any{}
+
 	pos := 0
 	for {
 		loc := markupParamRe.FindStringSubmatchIndex(body[pos:])
 		if loc == nil {
 			break
 		}
+
 		if strings.TrimSpace(body[pos:pos+loc[0]]) != "" {
 			return "", false
 		}
+
 		name := body[pos+loc[2] : pos+loc[3]]
 		isString := loc[4] >= 0 && body[pos+loc[4]:pos+loc[5]] == "true"
 		valStart := pos + loc[1]
+
 		end := strings.Index(body[valStart:], markupParamClose)
 		if end < 0 {
 			return "", false
 		}
+
 		raw := body[valStart : valStart+end]
 		pos = valStart + end + len(markupParamClose)
+
 		if isString {
 			args[name] = raw
 			continue
 		}
+
 		var v any
 		if json.Unmarshal([]byte(strings.TrimSpace(raw)), &v) == nil {
 			args[name] = v
@@ -327,13 +394,16 @@ func parseMarkupParams(body string) (string, bool) {
 			args[name] = raw
 		}
 	}
+
 	if strings.TrimSpace(body[pos:]) != "" {
 		return "", false
 	}
+
 	out, err := json.Marshal(args)
 	if err != nil {
 		return "", false
 	}
+
 	return string(out), true
 }
 
@@ -353,12 +423,15 @@ func ToolNameAllowlist(body []byte) map[string]bool {
 	if json.Unmarshal(body, &req) != nil {
 		return nil
 	}
+
 	names := map[string]bool{}
 	addToolDeclarations(names, req.Tools, req.Functions)
 	addHistoryToolNames(names, req.Messages)
+
 	if len(names) == 0 {
 		return nil
 	}
+
 	return names
 }
 
@@ -395,10 +468,12 @@ func addToolDeclarations(names map[string]bool, tools []toolNameTool, functions 
 			names[t.Function.Name] = true
 			continue
 		}
+
 		if t.Name != "" {
 			names[t.Name] = true
 		}
 	}
+
 	for _, f := range functions {
 		if f.Name != "" {
 			names[f.Name] = true
@@ -415,6 +490,7 @@ func addHistoryToolNames(names map[string]bool, messages []toolNameMessage) {
 				names[tc.Function.Name] = true
 			}
 		}
+
 		if m.FunctionCall != nil && m.FunctionCall.Name != "" {
 			names[m.FunctionCall.Name] = true
 		}
@@ -434,42 +510,52 @@ func RepairAggregatedResponse(resp map[string]any, allowed map[string]bool, allo
 	if !r.Enabled() {
 		return r
 	}
+
 	choices, ok := resp["choices"].([]any)
 	if !ok {
 		return r
 	}
+
 	for _, ci := range choices {
 		if c, ok := ci.(map[string]any); ok {
 			r.repairChoice(c)
 		}
 	}
+
 	return r
 }
 
 // repairChoice 尝试把单个 choice 的正文标记还原为 tool_calls。返回是否发生转换。
-func (r *MarkupRepair) repairChoice(c map[string]any) bool {
-	msg, ok := c["message"].(map[string]any)
+func (r *MarkupRepair) repairChoice(table map[string]any) bool {
+	msg, ok := table["message"].(map[string]any)
 	if !ok {
 		return false
 	}
+
 	if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
 		return false
 	}
-	if fr, _ := c["finish_reason"].(string); fr != "stop" {
+
+	if fr, _ := table["finish_reason"].(string); fr != "stop" {
 		return false
 	}
+
 	text, _ := msg["content"].(string)
 	if text == "" || !strings.Contains(text, markupPipe) {
 		return false
 	}
+
 	emit, calls := r.Feed(text)
 	emit += r.Flush()
+
 	if len(calls) == 0 {
 		return false
 	}
+
 	msg["content"] = emit
 	msg["tool_calls"] = markupMessageToolCalls(calls)
-	c["finish_reason"] = "tool_calls"
+	table["finish_reason"] = "tool_calls"
+
 	return true
 }
 
@@ -488,6 +574,7 @@ func markupMessageToolCalls(calls []MarkupCall) []any {
 			},
 		})
 	}
+
 	return out
 }
 
@@ -511,6 +598,7 @@ func markupToolCalls(calls []MarkupCall, base int) []any {
 			},
 		})
 	}
+
 	return out
 }
 

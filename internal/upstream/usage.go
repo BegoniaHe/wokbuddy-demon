@@ -1,6 +1,9 @@
 package upstream
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"maps"
+)
 
 // normalizeUsageCacheAliases keeps cache-hit aliases consistent before the
 // response leaves the gateway. Some WorkBuddy responses carry the real hit in
@@ -52,10 +55,12 @@ func bestUsageCacheHitTokens(usage map[string]any) (float64, bool) {
 		} else if details, ok := usage[path.section].(map[string]any); ok {
 			value = details[path.key]
 		}
+
 		if tokens, ok := positiveUsageNumber(value); ok {
 			return tokens, true
 		}
 	}
+
 	return 0, false
 }
 
@@ -85,18 +90,16 @@ func positiveUsageNumber(value any) (float64, bool) {
 
 func cloneUsageMap(usage map[string]any) map[string]any {
 	out := make(map[string]any, len(usage))
-	for key, value := range usage {
-		out[key] = value
-	}
+	maps.Copy(out, usage)
+
 	return out
 }
 
 func cloneUsageDetails(usage map[string]any, key string) map[string]any {
 	out := make(map[string]any)
 	details, _ := usage[key].(map[string]any)
-	for detailKey, value := range details {
-		out[detailKey] = value
-	}
+	maps.Copy(out, details)
+
 	return out
 }
 
@@ -107,6 +110,7 @@ func UsageCacheHitTokens(usage map[string]any) (float64, bool) {
 	if usage == nil {
 		return 0, false
 	}
+
 	return bestUsageCacheHitTokens(usage)
 }
 
@@ -117,14 +121,18 @@ func UsageCacheMissTokens(usage map[string]any) (float64, bool) {
 	if usage == nil {
 		return 0, false
 	}
+
 	if miss, ok := usageNumber(usage, "prompt_cache_miss_tokens"); ok {
 		return miss, true
 	}
+
 	prompt, okP := usageNumber(usage, "prompt_tokens")
+
 	hit, okH := UsageCacheHitTokens(usage)
 	if okP && okH && prompt-hit >= 0 {
 		return prompt - hit, true
 	}
+
 	return 0, false
 }
 
@@ -134,6 +142,7 @@ func usageNumber(usage map[string]any, key string) (float64, bool) {
 	if !ok {
 		return 0, false
 	}
+
 	switch n := v.(type) {
 	case float64:
 		return n, true
@@ -145,5 +154,6 @@ func usageNumber(usage map[string]any, key string) (float64, bool) {
 		f, err := n.Float64()
 		return f, err == nil
 	}
+
 	return 0, false
 }

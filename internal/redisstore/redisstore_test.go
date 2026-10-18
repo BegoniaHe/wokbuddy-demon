@@ -7,6 +7,8 @@ import (
 )
 
 func TestNormalizeURL(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name  string
 		url   string
@@ -20,6 +22,8 @@ func TestNormalizeURL(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
 			if got := normalizeURL(c.url, c.token); got != c.want {
 				t.Errorf("normalizeURL(%q,%q)=%q want %q", c.url, c.token, got, c.want)
 			}
@@ -28,6 +32,7 @@ func TestNormalizeURL(t *testing.T) {
 }
 
 func TestNormalizeURLStripsTrailingPath(t *testing.T) {
+	t.Parallel()
 	// 用户照抄 Upstash 控制台的 REST 地址，可能带任意路径——剥 scheme 只取 host:port 之前段。
 	got := normalizeURL("https://foo.upstash.io", "t")
 	if strings.Contains(got, "://foo.upstash.io") && !strings.HasSuffix(got, "foo.upstash.io:6379") {
@@ -36,12 +41,15 @@ func TestNormalizeURLStripsTrailingPath(t *testing.T) {
 }
 
 func TestNewEmptyURLReturnsNoop(t *testing.T) {
+	t.Parallel()
+
 	if _, ok := New("", "").(Noop); !ok {
 		t.Fatalf("empty url should return Noop")
 	}
 }
 
 func TestNewBadSchemeReturnsNoop(t *testing.T) {
+	t.Parallel()
 	// 组装出的连接串含空格 → ParseURL 解析失败 → 降级 Noop，不 panic、不发网络请求。
 	if _, ok := New("://bad host", "").(Noop); !ok {
 		t.Fatalf("bad url should return Noop")
@@ -49,16 +57,21 @@ func TestNewBadSchemeReturnsNoop(t *testing.T) {
 }
 
 func TestNoopMethods(t *testing.T) {
+	t.Parallel()
+
 	n := Noop{}
 	n.SetBind("k", "u", time.Minute) // 不 panic
 	n.DelBind("k")
 	n.SaveState([]byte("{}"))
+
 	if _, ok := n.LoadState(); ok {
 		t.Error("Noop.LoadState should report not-found")
 	}
 }
 
 func TestBindKeyPrefix(t *testing.T) {
+	t.Parallel()
+
 	if got := bindKey("abc"); got != bindPrefix+"abc" {
 		t.Errorf("bindKey=%q want prefix", got)
 	}

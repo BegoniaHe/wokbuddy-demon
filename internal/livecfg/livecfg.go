@@ -41,6 +41,7 @@ type Holder struct {
 func New(s Snapshot) *Holder {
 	h := &Holder{}
 	h.Store(s)
+
 	return h
 }
 
@@ -49,9 +50,11 @@ func (h *Holder) Load() Snapshot {
 	if h == nil {
 		return Snapshot{}
 	}
+
 	if s := h.p.Load(); s != nil {
 		return *s
 	}
+
 	return Snapshot{}
 }
 

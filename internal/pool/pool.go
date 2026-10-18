@@ -37,6 +37,8 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// pickGap 防并发撞号窗口（默认 minPickGap；测试可注入 0/超大值）。
+	pickGap time.Duration
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -100,7 +102,7 @@ type Pool struct {
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
 func New(stateFp string) *Pool {
-	p := &Pool{
+	pool := &Pool{
 		byUID:              map[string]*entry{},
 		routeCooldowns:     map[string]*routeState{},
 		stateFp:            stateFp,
@@ -117,12 +119,14 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		pickGap:             minPickGap,
 	}
 	if stateFp != "" {
-		p.load()
-		p.startFlusher()
+		pool.load()
+		pool.startFlusher()
 	}
-	return p
+
+	return pool
 }
 
 // Close 停止后台落盘 goroutine 并做最后一次落盘（幂等）。
@@ -132,6 +136,7 @@ func (p *Pool) Close() {
 	if p.stopCh == nil {
 		return
 	}
+
 	p.closeOnce.Do(func() {
 		close(p.stopCh)
 	})
@@ -142,12 +147,15 @@ func (p *Pool) Close() {
 func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if threshold > 0 {
 		p.breakerThreshold = threshold
 	}
+
 	if cooldown > 0 {
 		p.breakerCooldown = cooldown
 	}
+
 	if cooldownMax > 0 {
 		p.breakerCooldownMax = cooldownMax
 	}
@@ -158,6 +166,7 @@ func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 func (p *Pool) SetSoftRateMax(d time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if d > 0 {
 		p.softRateMax = d
 	}
@@ -167,13 +176,15 @@ func (p *Pool) SetSoftRateMax(d time.Duration) {
 // issue #136）。0 = 关停（完全回到现状行为）；正值覆盖默认 30m。
 // 注意：与 SetSoftRateMax「非正值保留默认」不同，0 在这里是**合法值**（关停开关，
 // 与 config 的 "0" 关停语义对齐）——不设 0 语义就无法关停探索。
-func (p *Pool) SetCostExploreInterval(d time.Duration) {
+func (p *Pool) SetCostExploreInterval(duration time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if d < 0 {
+
+	if duration < 0 {
 		return // 负值非法，保留现值
 	}
-	p.costExploreInterval = d
+
+	p.costExploreInterval = duration
 }
 
 // CostExploreStatus 透出探索台账（/status 用）：累计探索事件数 + 各 (域, 模型)
@@ -183,11 +194,13 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	last = make(map[string]time.Time, len(p.exploreLast))
 	for k, ts := range p.exploreLast {
 		// 键 realm+"\x1f"+model → 输出 "|"（JSON 安全可读；\x1f 不可打印）。
 		last[strings.ReplaceAll(k, "\x1f", "|")] = ts
 	}
+
 	return p.costExploreEvents, last
 }
 
@@ -195,9 +208,11 @@ func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
 func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if idlePerHour > 0 {
 		p.idleWeightPerHour = idlePerHour
 	}
+
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
 	}
@@ -207,6 +222,7 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.preferExpiring = enabled
 }
 
@@ -215,12 +231,15 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if threshold > 0 {
 		p.degradeThreshold = threshold
 	}
+
 	if cooldown > 0 {
 		p.degradeCooldown = cooldown
 	}
+
 	if cooldownMax > 0 {
 		p.degradeCooldownMax = cooldownMax
 	}
@@ -230,6 +249,7 @@ func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
 func (p *Pool) CreditFloor() int64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	return p.creditFloor
 }
 
@@ -239,6 +259,7 @@ func (p *Pool) CreditFloor() int64 {
 func (p *Pool) SetCreditFloor(n int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if n >= 0 {
 		p.creditFloor = n
 	}
@@ -262,6 +283,7 @@ type DailyUsage struct {
 func (p *Pool) SetDailyLimits(def, cn, global DailyLimits) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.dailyDefault, p.dailyCN, p.dailyGlobal = def, cn, global
 }
 
@@ -269,6 +291,7 @@ func (p *Pool) SetDailyLimits(def, cn, global DailyLimits) {
 func (p *Pool) SetDailyUsageProvider(fn func() map[string]DailyUsage) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.dailyUsage = fn
 }
 
@@ -276,21 +299,26 @@ func (p *Pool) SetDailyUsageProvider(fn func() map[string]DailyUsage) {
 // 调用方需已持 p.mu。
 func (p *Pool) dailyLimitsFor(realm string) DailyLimits {
 	out := p.dailyDefault
+
 	var r DailyLimits
 	if realm == "global" {
 		r = p.dailyGlobal
 	} else {
 		r = p.dailyCN
 	}
+
 	if r.Tokens > 0 {
 		out.Tokens = r.Tokens
 	}
+
 	if r.Credits > 0 {
 		out.Credits = r.Credits
 	}
+
 	if r.ModelTokens > 0 {
 		out.ModelTokens = r.ModelTokens
 	}
+
 	return out
 }
 
@@ -302,6 +330,7 @@ func (p *Pool) dailyLimitsFor(realm string) DailyLimits {
 func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.modelRateOf = fn
 }
 
@@ -309,9 +338,11 @@ func (p *Pool) SetModelRateOf(fn func(realm, model string) string) {
 func (p *Pool) ProxySlotOf(uid string) string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	if e, ok := p.byUID[uid]; ok {
 		return e.proxySlot
 	}
+
 	return ""
 }
 
@@ -319,12 +350,16 @@ func (p *Pool) ProxySlotOf(uid string) string {
 func (p *Pool) SetProxySlot(uid, slot string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	e, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
+
 	e.proxySlot = strings.TrimSpace(slot)
+
 	p.dirty.Store(true)
+
 	return true
 }
 
@@ -332,6 +367,7 @@ func (p *Pool) SetProxySlot(uid, slot string) bool {
 func (p *Pool) SetModelRateLimitHook(fn func(uid, model, realm string, resetAt time.Time)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.onModelRateLimit = fn
 }
 
@@ -339,6 +375,7 @@ func (p *Pool) SetModelRateLimitHook(fn func(uid, model, realm string, resetAt t
 func (p *Pool) SetMaxInFlight(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if n >= 0 {
 		p.maxInFlight = n
 	}
@@ -349,6 +386,7 @@ func (p *Pool) SetMaxInFlight(n int) {
 func (p *Pool) SetMaxInFlightGlobal(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if n >= 0 {
 		p.maxInFlightGlobal = n
 	}
@@ -359,6 +397,7 @@ func (p *Pool) SetMaxInFlightGlobal(n int) {
 func (p *Pool) SetMaxInFlightTotal(n int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if n >= 0 {
 		p.maxInFlightTotal = n
 	}
@@ -368,6 +407,7 @@ func (p *Pool) SetMaxInFlightTotal(n int) {
 func (p *Pool) MaxInFlightTotal() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	return p.maxInFlightTotal
 }
 
@@ -386,6 +426,7 @@ func (p *Pool) inFlightLimit(e *entry) int {
 	if p.maxInFlightGlobal > 0 && e.a.Realm() == "global" {
 		return p.maxInFlightGlobal
 	}
+
 	return p.maxInFlight
 }
 
@@ -394,6 +435,7 @@ func (p *Pool) inFlightLimit(e *entry) int {
 func (p *Pool) SetStore(s StoreSnapshotter) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.store = s
 }
 
@@ -406,11 +448,13 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
-	limit := p.inFlightLimit(e)
+
+	limit := p.inFlightLimit(entry2)
 	totalLimit := p.maxInFlightTotal
 
 	// 名额自增必须仍在读锁内：否则 Remove 可能在 byUID 读取与自增之间删除条目并
@@ -420,10 +464,12 @@ func (p *Pool) Acquire(uid string) bool {
 	if !p.acquireTotal(totalLimit) {
 		return false
 	}
-	if !p.acquireAccount(e, limit) {
+
+	if !p.acquireAccount(entry2, limit) {
 		p.releaseTotal()
 		return false
 	}
+
 	return true
 }
 
@@ -434,6 +480,7 @@ func (p *Pool) acquireTotal(limit int) bool {
 		if limit > 0 && cur >= int64(limit) {
 			return false
 		}
+
 		if p.inFlightTotal.CompareAndSwap(cur, cur+1) {
 			return true
 		}
@@ -447,6 +494,7 @@ func (p *Pool) releaseTotal() {
 		if cur <= 0 {
 			return
 		}
+
 		if p.inFlightTotal.CompareAndSwap(cur, cur-1) {
 			return
 		}
@@ -454,17 +502,19 @@ func (p *Pool) releaseTotal() {
 }
 
 // acquireAccount 占账号名额；limit<=0 时只计数不拒绝。
-func (p *Pool) acquireAccount(e *entry, limit int) bool {
+func (p *Pool) acquireAccount(entry2 *entry, limit int) bool {
 	if limit <= 0 {
-		e.inFlight.Add(1)
+		entry2.inFlight.Add(1)
 		return true
 	}
+
 	for {
-		cur := e.inFlight.Load()
+		cur := entry2.inFlight.Load()
 		if cur >= int64(limit) {
 			return false
 		}
-		if e.inFlight.CompareAndSwap(cur, cur+1) {
+
+		if entry2.inFlight.CompareAndSwap(cur, cur+1) {
 			return true
 		}
 	}
@@ -473,17 +523,20 @@ func (p *Pool) acquireAccount(e *entry, limit int) bool {
 // Release 释放一个在途名额。幂等减到 0 为止（防重复释放扣成负数）。
 func (p *Pool) Release(uid string) {
 	p.mu.RLock()
-	e, ok := p.byUID[uid]
+	entry2, ok := p.byUID[uid]
 	p.mu.RUnlock()
+
 	if !ok {
 		return
 	}
+
 	for {
-		cur := e.inFlight.Load()
+		cur := entry2.inFlight.Load()
 		if cur <= 0 {
 			return
 		}
-		if e.inFlight.CompareAndSwap(cur, cur-1) {
+
+		if entry2.inFlight.CompareAndSwap(cur, cur-1) {
 			// 只有账号名额真正减一时才减全局，重复 Release 不会侵占他人的名额。
 			p.releaseTotal()
 			return
@@ -496,6 +549,7 @@ func (p *Pool) Release(uid string) {
 func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.randInt64N = fn
 }
 
@@ -504,6 +558,7 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 func (p *Pool) SetClock(fn func() time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.nowFn = fn
 }
 
@@ -513,6 +568,7 @@ func (p *Pool) now() time.Time {
 	if p.nowFn != nil {
 		return p.nowFn()
 	}
+
 	return time.Now()
 }
 
@@ -520,6 +576,7 @@ func (p *Pool) now() time.Time {
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.upsertLocked(a)
 }
 
@@ -528,21 +585,27 @@ func (p *Pool) Add(a *auth.Auth) {
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
 		p.upsertLocked(a)
 	}
+
 	changed := false
+
 	for uid, e := range p.byUID {
 		if !seen[uid] {
 			if n := e.inFlight.Swap(0); n > 0 {
 				p.inFlightTotal.Add(-n)
 			}
+
 			delete(p.byUID, uid)
+
 			changed = true
 		}
 	}
+
 	if changed {
 		p.saveLocked()
 	}
@@ -554,27 +617,33 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return nil
 	}
+
 	delete(p.byUID, uid)
-	if n := e.inFlight.Swap(0); n > 0 {
+
+	if n := entry2.inFlight.Swap(0); n > 0 {
 		p.inFlightTotal.Add(-n)
 	}
+
 	p.dirty.Store(true)
 	p.saveLocked()
-	return e.a
+
+	return entry2.a
 }
 
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
-func (p *Pool) upsertLocked(a *auth.Auth) {
-	if e, ok := p.byUID[a.UID]; ok {
-		e.a = a // 保留 credits/cooling 状态
+func (p *Pool) upsertLocked(account *auth.Auth) {
+	if e, ok := p.byUID[account.UID]; ok {
+		e.a = account // 保留 credits/cooling 状态
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+
+	p.byUID[account.UID] = &entry{a: account}
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

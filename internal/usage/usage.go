@@ -123,24 +123,31 @@ func (r *Recorder) DailyTotals(now time.Time) map[string]DailyUsage {
 	if r == nil {
 		return nil
 	}
+
 	day := now.Format(dayLayout)
 	hourPrefix := "h:" + day
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	out := make(map[string]DailyUsage, len(r.buckets))
-	for _, b := range r.buckets {
-		if b.Scope != "d:"+day && !strings.HasPrefix(b.Scope, hourPrefix) {
+	for _, item := range r.buckets {
+		if item.Scope != "d:"+day && !strings.HasPrefix(item.Scope, hourPrefix) {
 			continue
 		}
-		du := out[b.UID]
-		du.Tokens += b.TT
-		du.Credits += b.CR
-		if du.Models == nil {
-			du.Models = map[string]int64{}
+
+		dailyUsage := out[item.UID]
+		dailyUsage.Tokens += item.TT
+
+		dailyUsage.Credits += item.CR
+		if dailyUsage.Models == nil {
+			dailyUsage.Models = map[string]int64{}
 		}
-		du.Models[b.Model] += b.TT
-		out[b.UID] = du
+
+		dailyUsage.Models[item.Model] += item.TT
+		out[item.UID] = dailyUsage
 	}
+
 	return out
 }
 
@@ -149,11 +156,14 @@ func (r *Recorder) DailyTotalsCached(now time.Time) map[string]DailyUsage {
 	if r == nil {
 		return nil
 	}
+
 	if c := r.dailyCache.Load(); c != nil && now.Sub(c.at) < time.Second {
 		return c.data
 	}
+
 	data := r.DailyTotals(now)
 	r.dailyCache.Store(&dailyCacheEntry{at: now, data: data})
+
 	return data
 }
 
@@ -171,6 +181,7 @@ func New(path string) *Recorder {
 			log.Printf("[usage] 读取 %s 失败（从零开始）: %v", path, err)
 		}
 	}
+
 	return r
 }
 
@@ -181,8 +192,10 @@ func (r *Recorder) Start() {
 	}
 	go func() {
 		defer close(r.done)
+
 		t := time.NewTicker(flushInterval)
 		defer t.Stop()
+
 		for {
 			select {
 			case <-r.stop:
@@ -192,9 +205,11 @@ func (r *Recorder) Start() {
 				r.mu.Lock()
 				n := len(r.buckets)
 				r.mu.Unlock()
+
 				if n > maxBuckets {
 					r.Rollup(time.Now())
 				}
+
 				r.flush(false)
 			}
 		}
@@ -207,6 +222,7 @@ func (r *Recorder) Stop() {
 		r.flush(true)
 		return
 	}
+
 	r.stopOnce.Do(func() { close(r.stop) })
 	<-r.done
 }
@@ -238,28 +254,33 @@ type Delta struct {
 //
 // ok=false 表示该次尝试失败（传输错误 / 上游 >=400 / 解析失败）。失败尝试通常
 // 没有 usage，但**仍要计入请求数与失败数**——重试放大正是靠这一列才看得出来。
-func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool) {
+func (r *Recorder) Add(now time.Time, realm, uid, model string, delta *Delta, ok bool) {
 	if r == nil {
 		return
 	}
+
 	if realm == "" {
 		realm = "cn"
 	}
+
 	if model == "" {
 		model = "(unknown)"
 	}
+
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
+	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + delta.ModelRate
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	b := r.buckets[key]
-	if b == nil {
-		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
-		r.buckets[key] = b
+	bucket2 := r.buckets[key]
+	if bucket2 == nil {
+		bucket2 = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: delta.ModelRate}
+		r.buckets[key] = bucket2
 	}
-	b.apply(d, ok)
+
+	bucket2.apply(delta, ok)
+
 	r.dirty = true
 }
 
@@ -268,22 +289,29 @@ func (r *Recorder) TokensByAccountModel(since time.Time) map[string]map[string]i
 	if r == nil {
 		return nil
 	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	out := map[string]map[string]int64{}
-	for _, b := range r.buckets {
-		if !strings.HasPrefix(b.Scope, "h:") {
+
+	for _, item := range r.buckets {
+		if !strings.HasPrefix(item.Scope, "h:") {
 			continue
 		}
-		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+
+		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(item.Scope, "h:"), time.Local)
 		if err != nil || t.Before(since) {
 			continue
 		}
-		if out[b.UID] == nil {
-			out[b.UID] = map[string]int64{}
+
+		if out[item.UID] == nil {
+			out[item.UID] = map[string]int64{}
 		}
-		out[b.UID][b.Model] += b.TT
+
+		out[item.UID][item.Model] += item.TT
 	}
+
 	return out
 }
 
@@ -292,19 +320,25 @@ func (r *Recorder) TokensSince(realm, uid, model string, since time.Time) int64 
 	if r == nil {
 		return 0
 	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	var total int64
-	for _, b := range r.buckets {
-		if b.Realm != realm || b.UID != uid || b.Model != model || !strings.HasPrefix(b.Scope, "h:") {
+
+	for _, item := range r.buckets {
+		if item.Realm != realm || item.UID != uid || item.Model != model || !strings.HasPrefix(item.Scope, "h:") {
 			continue
 		}
-		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+
+		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(item.Scope, "h:"), time.Local)
 		if err != nil || t.Before(since) {
 			continue
 		}
-		total += b.TT
+
+		total += item.TT
 	}
+
 	return total
 }
 
@@ -329,55 +363,73 @@ func (r *Recorder) Backfill(rows []BackfillRow) int {
 	if r == nil {
 		return 0
 	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	n := 0
+
 	for _, row := range rows {
 		if row.Day == "" || row.UID == "" {
 			continue
 		}
-		r.applyBackfillLocked(row)
+
+		r.applyBackfillLocked(&row)
+
 		n++
 	}
+
 	if n > 0 {
 		r.dirty = true
 	}
+
 	return n
 }
 
 // applyBackfillLocked 覆盖单个 (天, realm, uid, model) 的桶：先聚合本地不可从上游
 // 恢复的维度（token / 延迟 / 缓存），删除本地桶后写入携带这些维度、标记 Synced 的日桶。
-func (r *Recorder) applyBackfillLocked(row BackfillRow) {
+func (r *Recorder) applyBackfillLocked(row *BackfillRow) {
 	realm := row.Realm
 	if realm == "" {
 		realm = "cn"
 	}
+
 	model := row.Model
 	if model == "" {
 		model = "(unknown)"
 	}
+
 	dayScope := "d:" + row.Day
 	hourPrefix := "h:" + row.Day + "T"
+
 	var local bucket
-	for k, b := range r.buckets {
-		if b.UID != row.UID || b.Realm != realm || b.Model != model ||
-			(b.Scope != dayScope && !strings.HasPrefix(b.Scope, hourPrefix)) {
+
+	for strVal, bucket2 := range r.buckets {
+		if bucket2.UID != row.UID || bucket2.Realm != realm || bucket2.Model != model ||
+			(bucket2.Scope != dayScope && !strings.HasPrefix(bucket2.Scope, hourPrefix)) {
 			continue
 		}
-		local.PT += b.PT
-		local.CT += b.CT
-		local.TT += b.TT
-		local.LatMs += b.LatMs
-		local.LatN += b.LatN
-		local.TFMs += b.TFMs
-		local.TFN += b.TFN
-		local.TPS += b.TPS
-		local.TPSN += b.TPSN
-		local.CH += b.CH
-		local.CM += b.CM
-		delete(r.buckets, k)
+
+		local.PT += bucket2.PT
+		local.CT += bucket2.CT
+		local.TT += bucket2.TT
+		local.LatMs += bucket2.LatMs
+		local.LatN += bucket2.LatN
+		local.TFMs += bucket2.TFMs
+		local.TFN += bucket2.TFN
+		local.TPS += bucket2.TPS
+		local.TPSN += bucket2.TPSN
+		local.CH += bucket2.CH
+		local.CM += bucket2.CM
+
+		delete(r.buckets, strVal)
 	}
-	b := &bucket{
+
+	r.buckets[dayScope+"|"+realm+"|"+row.UID+"|"+model+"|"] = backfilledBucket(row, realm, model, dayScope, &local)
+}
+
+func backfilledBucket(row *BackfillRow, realm, model, dayScope string, local *bucket) *bucket {
+	bucket2 := &bucket{
 		Scope:  dayScope,
 		Realm:  realm,
 		UID:    row.UID,
@@ -397,59 +449,69 @@ func (r *Recorder) applyBackfillLocked(row BackfillRow) {
 		Synced: true,
 	}
 	if row.Credits != 0 {
-		b.CR = row.Credits
-		b.CRN = row.Requests
-		b.CRT = local.TT
+		bucket2.CR = row.Credits
+		bucket2.CRN = row.Requests
+		bucket2.CRT = local.TT
 	}
-	r.buckets[dayScope+"|"+realm+"|"+row.UID+"|"+model+"|"] = b
+
+	return bucket2
 }
 
 // tokenTotal 返回本次尝试的 token 合计：优先上游给的 total，缺省用 pt+ct 兜底，
 // 保证总量口径连续（两条链路——总量与积分比例分母——共用同一口径）。
-func (d Delta) tokenTotal() int64 {
+func (d *Delta) tokenTotal() int64 {
 	if d.HasTotal {
 		return d.TotalTokens
 	}
+
 	if d.HasPromptTokens || d.HasCompletion {
 		return d.PromptTokens + d.CompletionTokens
 	}
+
 	return 0
 }
 
 // apply 把一次尝试的增量并入桶。
-func (b *bucket) apply(d Delta, ok bool) {
+func (b *bucket) apply(delta2 *Delta, ok bool) {
 	b.Req++
 	if !ok {
 		b.Err++
 	}
-	if d.HasPromptTokens {
-		b.PT += d.PromptTokens
+
+	if delta2.HasPromptTokens {
+		b.PT += delta2.PromptTokens
 	}
-	if d.HasCompletion {
-		b.CT += d.CompletionTokens
+
+	if delta2.HasCompletion {
+		b.CT += delta2.CompletionTokens
 	}
-	b.TT += d.tokenTotal()
-	if d.HasCredit {
-		b.CR += d.Credit
+
+	b.TT += delta2.tokenTotal()
+	if delta2.HasCredit {
+		b.CR += delta2.Credit
 		b.CRN++
 		// 比例只使用同一次请求同时具备 credit 与 token 的样本，避免把
 		// 仅 token 的旧记录或仅 credit 的观测混进分母。
-		b.CRT += d.tokenTotal()
+		b.CRT += delta2.tokenTotal()
 	}
-	if d.HasCacheTokens {
-		b.CH += d.CacheHitTokens
-		b.CM += d.CacheMissTokens
+
+	if delta2.HasCacheTokens {
+		b.CH += delta2.CacheHitTokens
+		b.CM += delta2.CacheMissTokens
 	}
-	if d.HasLatency {
-		b.LatMs += d.LatencyMs
+
+	if delta2.HasLatency {
+		b.LatMs += delta2.LatencyMs
 		b.LatN++
 	}
-	if d.HasTTFT {
-		b.TFMs += d.TTFTMs
+
+	if delta2.HasTTFT {
+		b.TFMs += delta2.TTFTMs
 		b.TFN++
 	}
-	if d.HasTPS {
-		b.TPS += d.TokensPerSecond
+
+	if delta2.HasTPS {
+		b.TPS += delta2.TokensPerSecond
 		b.TPSN++
 	}
 }
@@ -460,59 +522,73 @@ func (r *Recorder) Rollup(now time.Time) {
 	if r == nil {
 		return
 	}
+
 	cutoff := now.Add(-hourlyKeep)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	type move struct{ from, to string }
+
 	var moves []move
-	for k, b := range r.buckets {
-		if !strings.HasPrefix(b.Scope, "h:") {
+
+	for strVal, bucket2 := range r.buckets {
+		if !strings.HasPrefix(bucket2.Scope, "h:") {
 			continue
 		}
-		ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+
+		ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(bucket2.Scope, "h:"), time.Local)
 		if err != nil || !ts.Before(cutoff) {
 			continue
 		}
+
 		day := "d:" + ts.Format(dayLayout)
-		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate})
+		moves = append(moves, move{from: strVal, to: day + "|" + bucket2.Realm + "|" + bucket2.UID + "|" + bucket2.Model + "|" + bucket2.Rate})
 	}
+
 	for _, m := range moves {
-		src := r.buckets[m.from]
-		if src == nil {
-			continue
-		}
-		dst := r.buckets[m.to]
-		if dst == nil {
-			cp := *src
-			cp.Scope = strings.SplitN(m.to, "|", 2)[0]
-			dst = &cp
-			r.buckets[m.to] = dst
-		} else {
-			dst.Req += src.Req
-			dst.Err += src.Err
-			dst.PT += src.PT
-			dst.CT += src.CT
-			dst.TT += src.TT
-			dst.LatMs += src.LatMs
-			dst.LatN += src.LatN
-			dst.TFMs += src.TFMs
-			dst.TFN += src.TFN
-			dst.TPS += src.TPS
-			dst.TPSN += src.TPSN
-			dst.CR += src.CR
-			dst.CRN += src.CRN
-			dst.CRT += src.CRT
-			dst.CH += src.CH
-			dst.CM += src.CM
-		}
-		delete(r.buckets, m.from)
+		r.mergeHourly(m.from, m.to)
 	}
+
 	if len(moves) > 0 {
 		r.dirty = true
+
 		log.Printf("[usage] 折叠 %d 个小时桶为日桶（保留 %v 细粒度）", len(moves), hourlyKeep)
 	}
+}
+
+func (r *Recorder) mergeHourly(from, to string) {
+	src := r.buckets[from]
+	if src == nil {
+		return
+	}
+
+	dst := r.buckets[to]
+	if dst == nil {
+		cp := *src
+		cp.Scope = strings.SplitN(to, "|", 2)[0]
+		dst = &cp
+		r.buckets[to] = dst
+	} else {
+		dst.Req += src.Req
+		dst.Err += src.Err
+		dst.PT += src.PT
+		dst.CT += src.CT
+		dst.TT += src.TT
+		dst.LatMs += src.LatMs
+		dst.LatN += src.LatN
+		dst.TFMs += src.TFMs
+		dst.TFN += src.TFN
+		dst.TPS += src.TPS
+		dst.TPSN += src.TPSN
+		dst.CR += src.CR
+		dst.CRN += src.CRN
+		dst.CRT += src.CRT
+		dst.CH += src.CH
+		dst.CM += src.CM
+	}
+
+	delete(r.buckets, from)
 }
 
 // ---------------------------------------------------------------- 持久化 ----
@@ -523,17 +599,22 @@ func (r *Recorder) load() error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+
+		return fmt.Errorf("load: %w", err)
 	}
-	var f file
-	if err := json.Unmarshal(raw, &f); err != nil {
-		return err
+
+	var file2 file
+	if err := json.Unmarshal(raw, &file2); err != nil {
+		return fmt.Errorf("load: %w", err)
 	}
-	for i := range f.Buckets {
-		b := f.Buckets[i]
+
+	for i := range file2.Buckets {
+		b := file2.Buckets[i]
 		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model+"|"+b.Rate] = &b
 	}
+
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
+
 	return nil
 }
 
@@ -541,17 +622,21 @@ func (r *Recorder) flush(force bool) {
 	if r == nil || r.path == "" {
 		return
 	}
+
 	r.flushMu.Lock()
 	defer r.flushMu.Unlock()
+
 	r.mu.Lock()
 	if !r.dirty && !force {
 		r.mu.Unlock()
 		return
 	}
+
 	snap := file{Version: fileVersion, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
 	for _, b := range r.buckets {
 		snap.Buckets = append(snap.Buckets, *b)
 	}
+
 	r.dirty = false
 	r.mu.Unlock()
 
@@ -562,26 +647,35 @@ func (r *Recorder) flush(force bool) {
 		r.dirty = true
 		r.mu.Unlock()
 	}
+
 	raw, err := json.Marshal(snap)
 	if err != nil {
 		log.Printf("[usage] 序列化失败: %v", err)
 		markDirty()
+
 		return
 	}
+
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
 		log.Printf("[usage] 建目录失败: %v", err)
 		markDirty()
+
 		return
 	}
+
 	tmp := r.path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		log.Printf("[usage] 写临时文件失败: %v", err)
 		markDirty()
+
 		return
 	}
+
 	if err := atomicwrite.Rename(tmp, r.path); err != nil {
 		log.Printf("[usage] 原子替换失败: %v", err)
+
 		_ = os.Remove(tmp)
+
 		markDirty()
 	}
 }
@@ -623,43 +717,48 @@ type aggAcc struct {
 	tpsSamples  int64
 }
 
-func (g *aggAcc) add(b *bucket) {
-	g.Requests += b.Req
-	g.Errors += b.Err
-	g.PromptTokens += b.PT
-	g.CompletionTok += b.CT
-	g.TotalTokens += b.TT
-	g.Credits += b.CR
-	g.CreditSamples += b.CRN
-	g.CreditTokens += b.CRT
-	g.CacheHitTokens += b.CH
-	g.CacheMissTokens += b.CM
-	g.latSum += b.LatMs
-	g.latSamples += b.LatN
-	g.ttftSum += b.TFMs
-	g.ttftSamples += b.TFN
-	g.tpsSum += b.TPS
-	g.tpsSamples += b.TPSN
+func (g *aggAcc) add(bucket5 *bucket) {
+	g.Requests += bucket5.Req
+	g.Errors += bucket5.Err
+	g.PromptTokens += bucket5.PT
+	g.CompletionTok += bucket5.CT
+	g.TotalTokens += bucket5.TT
+	g.Credits += bucket5.CR
+	g.CreditSamples += bucket5.CRN
+	g.CreditTokens += bucket5.CRT
+	g.CacheHitTokens += bucket5.CH
+	g.CacheMissTokens += bucket5.CM
+	g.latSum += bucket5.LatMs
+	g.latSamples += bucket5.LatN
+	g.ttftSum += bucket5.TFMs
+	g.ttftSamples += bucket5.TFN
+	g.tpsSum += bucket5.TPS
+	g.tpsSamples += bucket5.TPSN
 }
 
 func (g *aggAcc) finish() Agg {
-	a := g.Agg
+	agg := g.Agg
 	if g.latSamples > 0 {
-		a.AvgLatencyMs = float64(g.latSum) / float64(g.latSamples)
+		agg.AvgLatencyMs = float64(g.latSum) / float64(g.latSamples)
 	}
+
 	if g.ttftSamples > 0 {
-		a.AvgTTFTMs = float64(g.ttftSum) / float64(g.ttftSamples)
+		agg.AvgTTFTMs = float64(g.ttftSum) / float64(g.ttftSamples)
 	}
+
 	if g.tpsSamples > 0 {
-		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)
+		agg.AvgTPS = g.tpsSum / float64(g.tpsSamples)
 	}
+
 	if g.CreditTokens > 0 {
-		a.CreditsPer1MTokens = g.Credits / float64(g.CreditTokens) * 1_000_000
+		agg.CreditsPer1MTokens = g.Credits / float64(g.CreditTokens) * 1_000_000
 	}
+
 	if total := g.CacheHitTokens + g.CacheMissTokens; total > 0 {
-		a.CacheHitRate = float64(g.CacheHitTokens) / float64(total) * 100
+		agg.CacheHitRate = float64(g.CacheHitTokens) / float64(total) * 100
 	}
-	return a
+
+	return agg
 }
 
 // KeyedAgg 按某个维度聚合的一行。
@@ -700,13 +799,13 @@ type creditAcc struct {
 	CreditAgg
 }
 
-func (a *creditAcc) add(b *bucket) {
-	a.Requests += b.Req
-	a.Credits += b.CR
-	a.CreditSamples += b.CRN
-	a.CreditTokens += b.CRT
-	a.CacheHitTokens += b.CH
-	a.CacheMissTokens += b.CM
+func (a *creditAcc) add(bucket4 *bucket) {
+	a.Requests += bucket4.Req
+	a.Credits += bucket4.CR
+	a.CreditSamples += bucket4.CRN
+	a.CreditTokens += bucket4.CRT
+	a.CacheHitTokens += bucket4.CH
+	a.CacheMissTokens += bucket4.CM
 }
 
 func (a *creditAcc) finish() CreditAgg {
@@ -714,9 +813,11 @@ func (a *creditAcc) finish() CreditAgg {
 	if a.CreditTokens > 0 {
 		out.CreditsPer1MTokens = a.Credits / float64(a.CreditTokens) * 1_000_000
 	}
+
 	if total := a.CacheHitTokens + a.CacheMissTokens; total > 0 {
 		out.CacheHitRate = float64(a.CacheHitTokens) / float64(total) * 100
 	}
+
 	return out
 }
 
@@ -759,23 +860,25 @@ func (w Window) bounds() (time.Time, time.Time) {
 	if !w.From.IsZero() || !w.To.IsZero() {
 		return w.From, w.To
 	}
+
 	if w.Hours <= 0 {
 		return time.Time{}, time.Time{}
 	}
-	h := w.Hours
-	if h > 24*60 {
-		h = 24 * 60
-	}
+
+	h := min(w.Hours, 24*60)
+
 	return time.Now().Truncate(time.Hour).Add(-time.Duration(h-1) * time.Hour), time.Time{}
 }
 
 // bucketTime 把桶 scope 解析成本地时间；脏 scope 返回 false（不进任何口径）。
 func bucketTime(scope string) (time.Time, bool) {
-	if strings.HasPrefix(scope, "h:") {
-		ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(scope, "h:"), time.Local)
+	if hour, ok := strings.CutPrefix(scope, "h:"); ok {
+		ts, err := time.ParseInLocation(hourLayout, hour, time.Local)
 		return ts, err == nil
 	}
+
 	ts, err := time.ParseInLocation(dayLayout, strings.TrimPrefix(scope, "d:"), time.Local)
+
 	return ts, err == nil
 }
 
@@ -796,7 +899,7 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 // SnapshotWithRates 与 Snapshot 相同，但允许为缺少历史倍率的旧桶提供当前
 // 模型倍率回填。currentRate 返回空串时该行按“未知倍率”聚合，不伪造价格。
 func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, currentRate func(realm, model string) string) Snapshot {
-	return r.SnapshotWindow(Window{Hours: hours}, nicks, currentRate)
+	return r.SnapshotWindow(Window{Hours: hours, From: time.Time{}, To: time.Time{}}, nicks, currentRate)
 }
 
 // SnapshotWindow 聚合**所选窗口内**的桶，产出面板一次拉取的全部用量视图数据。
@@ -810,13 +913,15 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	if r == nil {
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
 	}
+
 	from, to := w.bounds()
 	windowed := !from.IsZero() || !to.IsZero()
 
 	r.mu.Lock()
-	bs := make([]bucket, 0, len(r.buckets))
+
+	buckets2 := make([]bucket, 0, len(r.buckets))
 	for _, b := range r.buckets {
-		bs = append(bs, *b)
+		buckets2 = append(buckets2, *b)
 	}
 	r.mu.Unlock()
 
@@ -825,22 +930,27 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	// 即时间序（同前缀内同格式排序；"d:" 恒早于 "h:"——日桶只来自 90 天前的小时折叠）。
 	since := ""
 	matched := 0
-	for i := range bs {
-		b := &bs[i]
-		if since == "" || b.Scope < since {
-			since = b.Scope
+
+	for i := range buckets2 {
+		bucket2 := &buckets2[i]
+		if since == "" || bucket2.Scope < since {
+			since = bucket2.Scope
 		}
-		if !inWindow(b.Scope, from, to, windowed) {
+
+		if !inWindow(bucket2.Scope, from, to, windowed) {
 			continue
 		}
+
 		matched++
-		acc.add(b)
+
+		acc.add(bucket2)
 	}
 
 	snap := acc.snapshot(matched)
 	snap.Since = strings.TrimPrefix(strings.TrimPrefix(since, "h:"), "d:")
 	snap.FileBytes = r.fileBytes()
 	snap.WindowFrom, snap.WindowTo = w.echoBounds()
+
 	return snap
 }
 
@@ -854,24 +964,28 @@ func (r *Recorder) AggregateByModel() []KeyedAgg {
 	if r == nil {
 		return []KeyedAgg{}
 	}
+
 	agg := make(map[string]*aggAcc)
+
 	r.mu.Lock()
-	for _, b := range r.buckets {
-		acc := agg[b.Model]
+	for _, item := range r.buckets {
+		acc := agg[item.Model]
 		if acc == nil {
 			acc = &aggAcc{}
-			agg[b.Model] = acc
+			agg[item.Model] = acc
 		}
-		acc.add(b)
+
+		acc.add(item)
 	}
 	r.mu.Unlock()
 
 	out := make([]KeyedAgg, 0, len(agg))
 	for k, v := range agg {
-		out = append(out, KeyedAgg{Key: k, Agg: v.finish()})
+		out = append(out, KeyedAgg{Key: k, Agg: v.finish(), Realm: "", Extra: ""})
 	}
 	// 按 key 升序，保证 /metrics 输出稳定（Prometheus 虽无序，但稳定输出便于 diff）。
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+
 	return out
 }
 
@@ -881,16 +995,20 @@ func inWindow(scope string, from, to time.Time, windowed bool) bool {
 	if !windowed {
 		return true
 	}
-	ts, ok := bucketTime(scope)
+
+	stamp, ok := bucketTime(scope)
 	if !ok {
 		return false
 	}
-	if !from.IsZero() && ts.Before(from) {
+
+	if !from.IsZero() && stamp.Before(from) {
 		return false
 	}
-	if !to.IsZero() && ts.After(to) {
+
+	if !to.IsZero() && stamp.After(to) {
 		return false
 	}
+
 	return true
 }
 
@@ -900,13 +1018,16 @@ func (w Window) echoBounds() (string, string) {
 	if w.From.IsZero() && w.To.IsZero() {
 		return "", ""
 	}
+
 	var from, to string
 	if !w.From.IsZero() {
 		from = w.From.Format(time.RFC3339)
 	}
+
 	if !w.To.IsZero() {
 		to = w.To.Format(time.RFC3339)
 	}
+
 	return from, to
 }
 
@@ -915,9 +1036,11 @@ func (r *Recorder) fileBytes() int64 {
 	if r.path == "" {
 		return 0
 	}
+
 	if fi, err := os.Stat(r.path); err == nil {
 		return fi.Size()
 	}
+
 	return 0
 }
 
@@ -953,24 +1076,26 @@ func newSnapshotAcc(nicks map[string]string, currentRate func(realm, model strin
 	}
 }
 
-func (a *snapshotAcc) add(b *bucket) {
-	a.total.add(b)
-	a.addKeyed(a.realmAgg, b.Realm, b)
-	a.addKeyed(a.acctAgg, b.UID, b)
+func (a *snapshotAcc) add(bucket2 *bucket) {
+	a.total.add(bucket2)
+	a.addKeyed(a.realmAgg, bucket2.Realm, bucket2)
+	a.addKeyed(a.acctAgg, bucket2.UID, bucket2)
 	// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；keyed() 的 Realm
 	// 字段默认是空的（它按 key 分组，不知道 realm）。
-	if a.acctRealm[b.UID] == "" {
-		a.acctRealm[b.UID] = b.Realm
+	if a.acctRealm[bucket2.UID] == "" {
+		a.acctRealm[bucket2.UID] = bucket2.Realm
 	}
-	a.addKeyed(a.modelAgg, b.Model, b)
 
-	if strings.HasPrefix(b.Scope, "h:") {
-		a.addKeyed(a.hourSeries, strings.TrimPrefix(b.Scope, "h:"), b)
+	a.addKeyed(a.modelAgg, bucket2.Model, bucket2)
+
+	if hour, ok := strings.CutPrefix(bucket2.Scope, "h:"); ok {
+		a.addKeyed(a.hourSeries, hour, bucket2)
 	} else {
-		a.addKeyed(a.daySeries, strings.TrimPrefix(b.Scope, "d:"), b)
+		a.addKeyed(a.daySeries, strings.TrimPrefix(bucket2.Scope, "d:"), bucket2)
 	}
-	if b.CRN > 0 {
-		a.addCredit(b)
+
+	if bucket2.CRN > 0 {
+		a.addCredit(bucket2)
 	}
 }
 
@@ -979,31 +1104,31 @@ func (a *snapshotAcc) addKeyed(m map[string]*aggAcc, key string, b *bucket) {
 	if m[key] == nil {
 		m[key] = &aggAcc{}
 	}
+
 	m[key].add(b)
 }
 
 // addCredit 并入积分维度：账号行与「裸模型名 + 生效倍率」行。
-func (a *snapshotAcc) addCredit(b *bucket) {
-	ca := a.creditAcctAgg[b.UID]
-	if ca == nil {
-		ca = &creditAcc{CreditAgg: CreditAgg{
-			Key:      b.UID,
-			Realm:    b.Realm,
-			Nickname: a.nicks[b.UID],
-		}}
-		a.creditAcctAgg[b.UID] = ca
+func (a *snapshotAcc) addCredit(bucket3 *bucket) {
+	creditAcc3 := a.creditAcctAgg[bucket3.UID]
+	if creditAcc3 == nil {
+		creditAcc3 = &creditAcc{Key: bucket3.UID, Realm: bucket3.Realm, Nickname: a.nicks[bucket3.UID]}
+		a.creditAcctAgg[bucket3.UID] = creditAcc3
 	}
-	ca.add(b)
 
-	model := canonicalUsageModel(b.Model)
-	rate := a.resolveRate(b.Realm, model, b.Rate)
+	creditAcc3.add(bucket3)
+
+	model := canonicalUsageModel(bucket3.Model)
+	rate := a.resolveRate(bucket3.Realm, model, bucket3.Rate)
 	modelKey := model + "\x00" + rate
-	cm := a.creditModelAgg[modelKey]
-	if cm == nil {
-		cm = &creditAcc{CreditAgg: CreditAgg{Key: model, Rate: rate}}
-		a.creditModelAgg[modelKey] = cm
+
+	creditAcc2 := a.creditModelAgg[modelKey]
+	if creditAcc2 == nil {
+		creditAcc2 = &creditAcc{Key: model, Rate: rate}
+		a.creditModelAgg[modelKey] = creditAcc2
 	}
-	cm.add(b)
+
+	creditAcc2.add(bucket3)
 }
 
 // resolveRate 旧桶缺倍率时用当前目录倍率回填（带缓存）。rate 非空或未注入
@@ -1012,12 +1137,15 @@ func (a *snapshotAcc) resolveRate(realm, model, rate string) string {
 	if rate != "" || a.currentRate == nil {
 		return rate
 	}
+
 	cacheKey := realm + "\x00" + model
 	if cached, ok := a.rateCache[cacheKey]; ok {
 		return cached
 	}
+
 	rate = a.currentRate(realm, model)
 	a.rateCache[cacheKey] = rate
+
 	return rate
 }
 
@@ -1042,6 +1170,7 @@ func (a *snapshotAcc) snapshot(matched int) Snapshot {
 	}
 	// 日点（升序）+ 小时点（升序）拼成一条连续时序。
 	snap.Series = append(seriesPoints(a.daySeries, "day"), seriesPoints(a.hourSeries, "hour")...)
+
 	return snap
 }
 
@@ -1051,29 +1180,35 @@ func seriesPoints(m map[string]*aggAcc, scope string) []Point {
 	if len(m) == 0 {
 		return nil
 	}
+
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
+
 	sort.Strings(keys)
+
 	pts := make([]Point, 0, len(keys))
 	for _, k := range keys {
 		pts = append(pts, Point{T: k, Scope: scope, Agg: m[k].finish()})
 	}
+
 	return pts
 }
 
 func canonicalUsageModel(model string) string {
 	model = strings.TrimSpace(model)
 	for _, prefix := range []string{"cn:", "global:"} {
-		if strings.HasPrefix(model, prefix) {
-			model = strings.TrimPrefix(model, prefix)
+		if rest, ok := strings.CutPrefix(model, prefix); ok {
+			model = rest
 			break
 		}
 	}
+
 	if model == "" {
 		return "(unknown)"
 	}
+
 	return model
 }
 
@@ -1082,18 +1217,23 @@ func creditKeyed(m map[string]*creditAcc) []CreditAgg {
 	for _, v := range m {
 		out = append(out, v.finish())
 	}
+
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Credits != out[j].Credits {
 			return out[i].Credits > out[j].Credits
 		}
+
 		if out[i].CreditTokens != out[j].CreditTokens {
 			return out[i].CreditTokens > out[j].CreditTokens
 		}
+
 		if out[i].Key != out[j].Key {
 			return out[i].Key < out[j].Key
 		}
+
 		return out[i].Rate < out[j].Rate
 	})
+
 	return out
 }
 
@@ -1101,18 +1241,21 @@ func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg
 	out := make([]KeyedAgg, 0, len(m))
 	for k, v := range m {
 		key, extra := label(k)
-		out = append(out, KeyedAgg{Key: key, Extra: extra, Agg: v.finish()})
+		out = append(out, KeyedAgg{Key: key, Extra: extra, Agg: v.finish(), Realm: ""})
 	}
 	// 按总量降序；同量按 key 升序，保证输出稳定（前端 diff 不抖）。
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].TotalTokens != out[j].TotalTokens {
 			return out[i].TotalTokens > out[j].TotalTokens
 		}
+
 		if out[i].Requests != out[j].Requests {
 			return out[i].Requests > out[j].Requests
 		}
+
 		return out[i].Key < out[j].Key
 	})
+
 	return out
 }
 
@@ -1121,9 +1264,11 @@ func (r *Recorder) Describe() string {
 	if r == nil {
 		return "disabled"
 	}
+
 	r.mu.Lock()
 	n := len(r.buckets)
 	r.mu.Unlock()
 	sz := r.fileBytes()
+
 	return fmt.Sprintf("%d buckets, file %d bytes", n, sz)
 }

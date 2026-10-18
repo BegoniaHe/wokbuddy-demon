@@ -76,16 +76,19 @@ type chatStat struct {
 	// decision 可选选号决策链（logging.decision_trace）；nil = 未启用/未采样。
 	decision *reqlog.DecisionTrace
 
-	logged bool
+	out     io.Writer
+	enabled bool
+	logged  bool
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
-func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
+func newChatStat(now time.Time, body []byte, stream bool, out io.Writer, enabled bool) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, out: out, enabled: enabled}
 }
 
 // done 幂等落一行表格日志。
@@ -93,8 +96,9 @@ func (s *chatStat) done() {
 	if s.logged {
 		return
 	}
+
 	s.logged = true
-	logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
+	logChatRowEx(s.out, s.enabled, s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
 		s.requestID, s.outcome, s.attempts, s.credit, s.hasCredit, s.clientIP, s.userAgent)
 }
 
@@ -143,8 +147,8 @@ func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredi
 func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
 
 // Usage 返回流式响应中已收到的 token usage 字段。
-func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
-	return pool.TokenUsageDelta{
+func (s *chatStatsReader) Usage() *pool.TokenUsageDelta {
+	return &pool.TokenUsageDelta{
 		HasPromptTokens:     s.hasPromptTokens,
 		PromptTokens:        int64(s.promptTokens),
 		HasCompletionTokens: s.hasCompletionTokens,
@@ -176,52 +180,63 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if !strings.HasPrefix(line, "data: ") {
 		return
 	}
+
 	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
 		return
 	}
+
 	if !s.seen {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
+
 	var chunk sseChunkFrame
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
 			s.errorFrame = true
 		}
+
 		return
 	}
+
 	if len(chunk.Error) > 0 {
 		s.errorFrame = true
 	}
+
 	s.applyUsage(chunk.Usage)
 }
 
 // applyUsage 把末帧 usage 的非空字段写入统计（缺失字段不动，保留上一帧值）。
-func (s *chatStatsReader) applyUsage(u *sseUsageFrame) {
-	if u.PromptTokens != nil {
+func (s *chatStatsReader) applyUsage(sseUsageFrame2 *sseUsageFrame) {
+	if sseUsageFrame2.PromptTokens != nil {
 		s.hasPromptTokens = true
-		s.promptTokens = *u.PromptTokens
+		s.promptTokens = *sseUsageFrame2.PromptTokens
 	}
-	if u.CompletionTokens != nil {
+
+	if sseUsageFrame2.CompletionTokens != nil {
 		s.hasCompletionTokens = true
-		s.completionTokens = *u.CompletionTokens
+		s.completionTokens = *sseUsageFrame2.CompletionTokens
 	}
-	if u.TotalTokens != nil {
+
+	if sseUsageFrame2.TotalTokens != nil {
 		s.hasTotalTokens = true
-		s.totalTokens = *u.TotalTokens
+		s.totalTokens = *sseUsageFrame2.TotalTokens
 	}
-	if u.Credit != nil {
+
+	if sseUsageFrame2.Credit != nil {
 		s.hasCredit = true
-		s.credit = *u.Credit
+		s.credit = *sseUsageFrame2.Credit
 	}
-	if u.PromptCacheHitTokens != nil {
+
+	if sseUsageFrame2.PromptCacheHitTokens != nil {
 		s.hasCacheHit = true
-		s.cacheHit = *u.PromptCacheHitTokens
+		s.cacheHit = *sseUsageFrame2.PromptCacheHitTokens
 	}
-	if u.PromptCacheMissTok != nil {
+
+	if sseUsageFrame2.PromptCacheMissTok != nil {
 		s.hasCacheMiss = true
-		s.cacheMiss = *u.PromptCacheMissTok
+		s.cacheMiss = *sseUsageFrame2.PromptCacheMissTok
 	}
 }
 
@@ -231,14 +246,18 @@ func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 	if !s.hasCacheHit {
 		return 0, 0, false
 	}
+
 	hit = int64(s.cacheHit)
+
 	miss = int64(s.cacheMiss)
 	if !s.hasCacheMiss {
 		if !s.hasPromptTokens || s.promptTokens < s.cacheHit {
 			return hit, 0, true
 		}
+
 		miss = int64(s.promptTokens - s.cacheHit)
 	}
+
 	return hit, miss, true
 }
 
@@ -248,23 +267,28 @@ func (s *chatStatsReader) SawErrorFrame() bool { return s.errorFrame }
 // Read 返回原始数据，同时解析统计 TTFB/token。
 // 单行上限与 upstream SSE 读取同口径（upstream.MaxSSELineBytes，issue #113）：
 // 统计层自己也是按行读取点，不设限会把超长行原样拷贝给下游透传。
-func (s *chatStatsReader) Read(p []byte) (int, error) {
+func (s *chatStatsReader) Read(nums []byte) (int, error) {
 	if len(s.pend) > 0 {
-		n := copy(p, s.pend)
+		n := copy(nums, s.pend)
 		s.pend = s.pend[n:]
+
 		return n, nil
 	}
+
 	line, err := readSSEStatsLine(s.br)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return 0, err // 超长行 / 读错误：上抛，不拷贝部分行
 	}
+
 	if line != "" {
 		s.parseSSELine(line)
 		s.pend = []byte(line)
-		n := copy(p, s.pend)
+		n := copy(nums, s.pend)
 		s.pend = s.pend[n:]
+
 		return n, nil
 	}
+
 	return 0, err
 }
 
@@ -273,20 +297,25 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 // 时返回该行 + io.EOF。自己按 chunk 累积，超限立即失败（ReadString 的字符串
 // 拼接会把超长行 concat 成任意大小）。
 func readSSEStatsLine(br *bufio.Reader) (string, error) {
-	var sb strings.Builder
+	var builder strings.Builder
+
 	for {
 		chunk, err := br.ReadSlice('\n')
-		if sb.Len()+len(chunk) > upstream.MaxSSELineBytes {
+		if builder.Len()+len(chunk) > upstream.MaxSSELineBytes {
 			return "", fmt.Errorf("%w: > %d bytes", upstream.ErrSSELineTooLong, upstream.MaxSSELineBytes)
 		}
-		sb.Write(chunk)
+
+		builder.Write(chunk)
+
 		if err == nil {
-			return sb.String(), nil
+			return builder.String(), nil
 		}
+
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		return sb.String(), err
+
+		return builder.String(), err
 	}
 }
 
@@ -296,18 +325,23 @@ func rewriteModel(body []byte, bare string) []byte {
 	if len(body) == 0 || bare == "" {
 		return body
 	}
+
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
+
 	if cur, ok := obj["model"].(string); !ok || cur == bare {
 		return body
 	}
+
 	obj["model"] = bare
+
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
 	}
+
 	return out
 }
 
@@ -319,25 +353,31 @@ func parseModelFromBody(body []byte) string {
 	if err := json.Unmarshal(body, &obj); err != nil || obj.Model == "" {
 		return "-"
 	}
+
 	return obj.Model
 }
 
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段。
-func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
-	delta := pool.TokenUsageDelta{}
-	u, ok := resp["usage"].(map[string]any)
+func usageDeltaFromResponse(resp map[string]any) *pool.TokenUsageDelta {
+	delta := &pool.TokenUsageDelta{}
+
+	table, ok := resp["usage"].(map[string]any)
 	if !ok {
 		return delta
 	}
-	if n, ok := readUsageInt(u, "prompt_tokens"); ok {
+
+	if n, ok := readUsageInt(table, "prompt_tokens"); ok {
 		delta.HasPromptTokens, delta.PromptTokens = true, n
 	}
-	if n, ok := readUsageInt(u, "completion_tokens"); ok {
+
+	if n, ok := readUsageInt(table, "completion_tokens"); ok {
 		delta.HasCompletionTokens, delta.CompletionTokens = true, n
 	}
-	if n, ok := readUsageInt(u, "total_tokens"); ok {
+
+	if n, ok := readUsageInt(table, "total_tokens"); ok {
 		delta.HasTotalTokens, delta.TotalTokens = true, n
 	}
+
 	return delta
 }
 
@@ -347,6 +387,7 @@ func readUsageInt(u map[string]any, key string) (int64, bool) {
 	if !ok {
 		return 0, false
 	}
+
 	switch n := v.(type) {
 	case float64:
 		return int64(n), true
@@ -370,10 +411,12 @@ func completionTokens(resp map[string]any) int {
 	if !ok {
 		return -1
 	}
+
 	v, ok := u["completion_tokens"].(float64)
 	if !ok {
 		return -1
 	}
+
 	return int(v)
 }
 
@@ -403,6 +446,7 @@ func (t *requestTrace) captureClientInfo(r *http.Request) {
 	if t == nil || r == nil {
 		return
 	}
+
 	t.clientIP = clientIPForLog(r)
 	t.userAgent = logfmt.Truncate(r.UserAgent(), maxUserAgentLen)
 }
@@ -417,13 +461,16 @@ func clientIPForLog(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
+
 	if ip := upstream.ExtractClientIP(r); ip != "" {
 		return ip
 	}
+
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
 		return strings.TrimSpace(r.RemoteAddr)
 	}
+
 	return host
 }
 
@@ -432,6 +479,7 @@ func dashIfEmpty(s string) string {
 	if strings.TrimSpace(s) == "" {
 		return "-"
 	}
+
 	return s
 }
 
@@ -439,51 +487,56 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 	if r == nil {
 		return nil
 	}
+
 	tr, _ := r.Context().Value(requestTraceKey{}).(*requestTrace)
+
 	return tr
 }
 
 func (t *requestTrace) event(status int) reqlog.Event {
-	e := reqlog.Event{
+	event := reqlog.Event{
 		Time:      t.start,
 		RequestID: t.id,
 		Path:      t.path,
 		Status:    status,
 	}
 	duration := time.Since(t.start)
-	e.DurationMs = duration.Milliseconds()
-	if e.DurationMs < 1 {
-		e.DurationMs = 1
-	}
+	event.DurationMs = max(duration.Milliseconds(), 1)
+
 	if t.stat != nil {
-		s := t.stat
-		e.Account = logfmt.Label(s.uid, s.nick)
-		e.Model = s.model
-		e.Outcome = s.outcome
-		e.TTFBMs = s.ttfb.Milliseconds()
-		e.Attempts = s.attempts
-		e.PromptTokens = s.promptTokens
-		e.CompletionTokens = s.completionTokens
-		e.TotalTokens = s.totalTokens
-		e.Credit = s.credit
-		e.HasCredit = s.hasCredit
-		e.CacheHitTokens = s.cacheHit
-		e.CacheMissTokens = s.cacheMiss
+		chatStat2 := t.stat
+		event.Account = logfmt.Label(chatStat2.uid, chatStat2.nick)
+		event.Model = chatStat2.model
+		event.Outcome = chatStat2.outcome
+		event.TTFBMs = chatStat2.ttfb.Milliseconds()
+		event.Attempts = chatStat2.attempts
+		event.PromptTokens = chatStat2.promptTokens
+		event.CompletionTokens = chatStat2.completionTokens
+		event.TotalTokens = chatStat2.totalTokens
+		event.Credit = chatStat2.credit
+		event.HasCredit = chatStat2.hasCredit
+		event.CacheHitTokens = chatStat2.cacheHit
+		event.CacheMissTokens = chatStat2.cacheMiss
 	}
-	e.ClientIP = t.clientIP
-	e.UserAgent = t.userAgent
+
+	event.ClientIP = t.clientIP
+
+	event.UserAgent = t.userAgent
 	if t.stat != nil {
-		e.Decision = t.stat.decision
+		event.Decision = t.stat.decision
 	}
-	if e.Outcome == "" {
+
+	if event.Outcome == "" {
 		if status >= 200 && status < 300 {
-			e.Outcome = reqlog.OutcomeSuccess
+			event.Outcome = reqlog.OutcomeSuccess
 		} else {
-			e.Outcome = reqlog.OutcomeHTTPError
+			event.Outcome = reqlog.OutcomeHTTPError
 		}
 	}
-	e.OK = status >= 200 && status < 300 && e.Outcome == reqlog.OutcomeSuccess
-	return e
+
+	event.OK = status >= 200 && status < 300 && event.Outcome == reqlog.OutcomeSuccess
+
+	return event
 }
 
 // responseObserver 捕获 handler 实际写出的 HTTP 状态，同时保留 Flusher/Unwrap，
@@ -498,6 +551,7 @@ func (o *responseObserver) WriteHeader(code int) {
 	if o.status == 0 {
 		o.status = code
 	}
+
 	o.ResponseWriter.WriteHeader(code)
 }
 
@@ -505,6 +559,7 @@ func (o *responseObserver) Write(p []byte) (int, error) {
 	if o.status == 0 {
 		o.status = http.StatusOK
 	}
+
 	return o.ResponseWriter.Write(p)
 }
 
@@ -537,31 +592,34 @@ const (
 //   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
 //     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
 //   - toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status, toks int) {
-	logChatRowEx(ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
+func logChatRow(out io.Writer, ttfb, total time.Duration, model, mode, uid, nick string, status, toks int) {
+	logChatRowEx(out, true, ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
 }
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
-func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status, toks int,
+func logChatRowEx(out io.Writer, enabled bool, ttfb, total time.Duration, model, mode, uid, nick string, status, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
 	clientIP, userAgent string,
 ) {
-	if !chatLogEnabled {
+	if !enabled {
 		return
 	}
+
 	seq := chatSeq.Add(1)
 	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
 	// 账号标签只补不截：超宽时宁可让该行变宽，也不丢昵称信息（昵称是排查的主线索）。
 	acct := logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
 	tokField, tokpsField := tokFields(toks, total, ttfb)
+
 	ttfbMS := "-"
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
+
 	extra := extraFields(requestID, outcome, status, attempts, credit, hasCredit)
 	src := sourceFields(clientIP, userAgent)
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
+	fmt.Fprintf(out, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |%s%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -583,10 +641,12 @@ func tokFields(toks int, total, ttfb time.Duration) (tokField, tokpsField string
 	if toks < 0 {
 		return "-", "-"
 	}
+
 	tokField = strconv.Itoa(toks)
 	if tps, ok := tokensPerSecond(int64(toks), total, ttfb); ok {
 		return tokField, fmt.Sprintf("%.1ftok/s", tps)
 	}
+
 	return tokField, "0.0tok/s"
 }
 
@@ -596,16 +656,19 @@ func extraFields(requestID, outcome string, status, attempts int, credit float64
 	if requestID == "" {
 		return ""
 	}
+
 	if outcome == "" {
 		outcome = reqlog.OutcomeHTTPError
 		if status >= 200 && status < 300 {
 			outcome = reqlog.OutcomeSuccess
 		}
 	}
+
 	creditField := "-"
 	if hasCredit {
 		creditField = fmt.Sprintf("%.4f", credit)
 	}
+
 	return fmt.Sprintf(" rid=%s | out=%s | try=%d | credit=%s |", requestID, outcome, attempts, creditField)
 }
 
@@ -616,10 +679,12 @@ func sourceFields(clientIP, userAgent string) string {
 	if clientIP == "" && userAgent == "" {
 		return ""
 	}
+
 	ua := "-"
 	if s := logfmt.ShortUA(userAgent); s != "" {
 		ua = `"` + s + `"`
 	}
+
 	return fmt.Sprintf(" src=%s ua=%s |", dashIfEmpty(clientIP), ua)
 }
 
@@ -644,8 +709,10 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	if model == "" {
 		return
 	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	if hit > 0 {
 		c.everHit[model] = true
 		return
@@ -655,16 +722,20 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	if prompt < 1000 {
 		return
 	}
+
 	if miss <= 0 {
 		miss = prompt
 	}
+
 	if !c.everHit[model] {
 		return
 	}
+
 	now := time.Now()
 	if t, ok := c.last[model]; ok && now.Sub(t) < cacheMissWarnEvery {
 		return
 	}
+
 	c.last[model] = now
 	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
 }

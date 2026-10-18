@@ -25,10 +25,17 @@ import (
 type entry struct {
 	uid        string
 	lastActive time.Time
-	// avoidUID/avoidUntil 软逃逸后的回纳抑制（issue #116 P0-1）：窗口内不再绑定回
-	// 原账号；窗口结束后仍需 LowLoad 回落低水位才允许复用。
-	avoidUID   string
-	avoidUntil time.Time
+}
+
+// avoidance 软逃逸后的回纳抑制（issue #116 P0-1）：窗口内不再绑定回原账号；
+// 窗口结束后仍需 LowLoad 回落低水位才允许复用。独立于当前绑定保存，重新分配
+// 或 Unbind 后仍然有效，不会因 entry 被覆盖/删除而丢失。
+//
+// 同一会话按账号保存多条窗口：换绑后的新账号再次降级时，旧账号未过期的窗口
+// 必须保留，否则下一轮分配可能立刻回到旧账号。
+type avoidance struct {
+	uid   string
+	until time.Time
 }
 
 // Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
@@ -55,6 +62,7 @@ type Config struct {
 type Router struct {
 	mu      sync.RWMutex
 	entries map[string]entry
+	avoid   map[string][]avoidance
 	cfg     Config
 	stop    chan struct{}
 }
@@ -65,13 +73,16 @@ func New(cfg Config) *Router {
 	if cfg.Store == nil {
 		cfg.Store = redisstore.Noop{}
 	}
+
 	if cfg.TTL <= 0 {
 		cfg.TTL = 30 * time.Minute
 	}
+
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = 5 * time.Minute
 	}
-	return &Router{entries: map[string]entry{}, cfg: cfg}
+
+	return &Router{entries: map[string]entry{}, avoid: map[string][]avoidance{}, cfg: cfg}
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -88,6 +99,7 @@ func (r *Router) StartGC() {
 		r.mu.Unlock()
 		return
 	}
+
 	stop := make(chan struct{})
 	r.stop = stop
 	r.mu.Unlock()
@@ -95,6 +107,7 @@ func (r *Router) StartGC() {
 	go func() {
 		t := time.NewTicker(r.cfg.GCInterval)
 		defer t.Stop()
+
 		for {
 			select {
 			case <-stop:
@@ -110,6 +123,7 @@ func (r *Router) StartGC() {
 func (r *Router) StopGC() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	if r.stop != nil {
 		close(r.stop)
 		r.stop = nil
@@ -123,17 +137,22 @@ func (r *Router) LoadFromStore() {
 	if len(binds) == 0 {
 		return
 	}
+
 	now := time.Now()
+
 	r.mu.Lock()
 	loaded := 0
+
 	for key, uid := range binds {
 		if _, exists := r.entries[key]; exists {
 			continue
 		}
+
 		r.entries[key] = entry{uid: uid, lastActive: now}
 		loaded++
 	}
 	r.mu.Unlock()
+
 	if loaded > 0 {
 		log.Printf("[session] 从 Redis 恢复 %d 条粘性会话绑定", loaded)
 	}
@@ -161,33 +180,42 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
-	e, found := r.entries[key]
+	entry2, found := r.entries[key]
+	a, hasAvoid := r.avoid[key]
+	// avoidActive 必须在锁内判定：Degrade/touch/Bind 会原地改写同一底层切片，
+	// 只复制 slice header 出锁再遍历仍会与写方并发。
+	avoid := r.avoidActive(a, hasAvoid, entry2, model, now)
 	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) && available[e.uid] && !r.avoidActive(e, model, now) {
-		r.touch(key, e.uid, now)
-		return e.uid, true
+
+	if found && !expired(entry2, now, r.cfg.TTL) && available[entry2.uid] && !avoid {
+		r.touch(key, entry2.uid, model, now)
+		return entry2.uid, true
 	}
 	// 未命中/失效，或绑定号已冷却/占满 → 落入慢路径重分配。
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	return r.resolveSlowLocked(key, model, now, available)
 }
 
 // resolveSlowLocked 在写锁内完成 re-check 与分配（见 ResolveForModel 头注）。
 func (r *Router) resolveSlowLocked(key, model string, now time.Time, available map[string]bool) (string, bool) {
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
-	if e2, found := r.entries[key]; found && !expired(e2, now, r.cfg.TTL) {
-		avoid := r.avoidActive(e2, model, now)
-		if available[e2.uid] && !avoid {
-			r.entries[key] = entry{uid: e2.uid, lastActive: now}
-			return e2.uid, true
+	if entry2, found := r.entries[key]; found && !expired(entry2, now, r.cfg.TTL) {
+		a, hasAvoid := r.avoid[key]
+
+		avoid := r.avoidActive(a, hasAvoid, entry2, model, now)
+		if available[entry2.uid] && !avoid {
+			r.entries[key] = entry{uid: entry2.uid, lastActive: now}
+			return entry2.uid, true
 		}
+
 		if !avoid {
 			delete(r.entries, key) // 失效：清掉再分配
 		}
-		// 降级抑制中：保留原条目，让 pickUID 读取 avoidUID 后避开原账号。
+		// 降级抑制中：保留原条目，让 pickUID 读取 avoid 记录后避开原账号。
 	}
 
 	uids := r.availableSlice(model)
@@ -197,11 +225,14 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 
 	uid := r.pickUID(key, uids, model, now)
 	prev, existed := r.entries[key]
+
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	if existed && prev.uid != uid {
 		r.cfg.Store.DelBind(key)
 	}
+
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+
 	return uid, true
 }
 
@@ -211,72 +242,135 @@ func (r *Router) pickUID(key string, uids []string, model string, now time.Time)
 	for _, v := range r.entries {
 		bound[v.uid] = true
 	}
-	avoidUID := r.avoidedUID(key, model, now)
+
+	avoided := r.avoidedUIDs(key, model, now)
+
 	var idle []string
-	for _, u := range uids {
-		if u == avoidUID {
+
+	for _, item := range uids {
+		if avoided[item] {
 			continue
 		}
-		if !bound[u] {
-			idle = append(idle, u)
+
+		if !bound[item] {
+			idle = append(idle, item)
 		}
 	}
+
 	pool := idle
 	if len(pool) == 0 {
 		pool = uids
 	}
-	if avoidUID != "" {
-		if filtered := withoutUID(pool, avoidUID); len(filtered) > 0 {
+
+	if len(avoided) > 0 {
+		if filtered := withoutUIDs(pool, avoided); len(filtered) > 0 {
 			pool = filtered
 		}
 	}
+
 	return pool[hashIndex(key, len(pool))]
 }
 
-// avoidedUID 返回当前降级抑制中的账号（无则空串）。
-func (r *Router) avoidedUID(key, model string, now time.Time) string {
-	e, ok := r.entries[key]
-	if !ok || !r.avoidActive(e, model, now) {
-		return ""
+// avoidedUIDs 返回当前降级抑制中的账号集合。窗口内始终避开；窗口结束后仅在
+// LowLoad 未回落低水位时继续避开。
+func (r *Router) avoidedUIDs(key, model string, now time.Time) map[string]bool {
+	var out map[string]bool
+
+	for _, item := range r.avoid[key] {
+		if item.uid == "" {
+			continue
+		}
+
+		if now.Before(item.until) || (r.cfg.LowLoad != nil && !r.cfg.LowLoad(model, item.uid)) {
+			if out == nil {
+				out = map[string]bool{}
+			}
+
+			out[item.uid] = true
+		}
 	}
-	return e.avoidUID
+
+	return out
 }
 
-// withoutUID 返回去掉指定 uid 的副本；结果为空时保持原列表（单账号池不饿死）。
-func withoutUID(uids []string, uid string) []string {
+// withoutUIDs 返回去掉指定账号的副本；结果为空时保持原列表（单账号池不饿死）。
+func withoutUIDs(uids []string, avoided map[string]bool) []string {
 	out := make([]string, 0, len(uids))
 	for _, u := range uids {
-		if u != uid {
+		if !avoided[u] {
 			out = append(out, u)
 		}
 	}
+
 	return out
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
-// 写锁内 re-check：快路径读取与 touch 之间可能发生 Degrade（写入 avoid*）或
+// 写锁内 re-check：快路径读取与 touch 之间可能发生 Degrade（写入 avoid）或
 // Unbind（删除条目）；直接覆盖会把降级窗口清掉/让已解绑的会话复活。
-func (r *Router) touch(key, uid string, now time.Time) {
+//
+// 清理已过期窗口时必须区分账号：当前绑定号被 touch 说明它已被重新选中，
+// 其窗口可清；其他账号的窗口即使过了时间窗，只要 LowLoad 仍判定未回落低水位，
+// 就仍是有效抑制，不能因为本会话在别的账号上成功就一并清掉。
+func (r *Router) touch(key, uid, model string, now time.Time) {
 	r.mu.Lock()
-	e, ok := r.entries[key]
-	if !ok || e.uid != uid {
+
+	entry2, ok := r.entries[key]
+	if !ok || entry2.uid != uid {
 		r.mu.Unlock()
 		return
 	}
-	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；窗口已过期则顺手清掉
-	// avoid*，否则该会话会永久受 LowLoad 低水位门控。
-	suppressed := e.avoidUID == uid && now.Before(e.avoidUntil)
-	if !suppressed && e.avoidUID != "" && !now.Before(e.avoidUntil) {
-		e.avoidUID = ""
-		e.avoidUntil = time.Time{}
-	}
-	e.lastActive = now
-	r.entries[key] = e
+	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；已过期且不再抑制的窗口顺手清掉。
+	suppressed := r.pruneAvoidLocked(key, uid, model, now)
+
+	entry2.lastActive = now
+	r.entries[key] = entry2
 	r.mu.Unlock()
+
 	if suppressed {
 		return
 	}
+
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+}
+
+// pruneAvoidLocked 清理该会话已失效的抑制窗口，返回当前绑定是否仍被抑制。
+// 当前绑定号（uid）一旦被 touch 即视为回纳证据；其他账号过窗后仍需 lowLoad
+// 放行才可清理，否则 LowLoad 门控会因本会话在别处成功而丢失。
+func (r *Router) pruneAvoidLocked(key, uid, model string, now time.Time) bool {
+	list, ok := r.avoid[key]
+	if !ok {
+		return false
+	}
+
+	suppressed := false
+	kept := list[:0]
+
+	for _, item := range list {
+		expired := !now.Before(item.until)
+		if expired && (item.uid == uid || r.lowLoad(model, item.uid)) {
+			continue
+		}
+
+		if item.uid == uid {
+			suppressed = true
+		}
+
+		kept = append(kept, item)
+	}
+
+	if len(kept) == 0 {
+		delete(r.avoid, key)
+	} else {
+		r.avoid[key] = kept
+	}
+
+	return suppressed
+}
+
+// lowLoad 报告账号是否已回落低水位；未配置判定时视为始终可回纳。
+func (r *Router) lowLoad(model, uid string) bool {
+	return r.cfg.LowLoad == nil || r.cfg.LowLoad(model, uid)
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -286,42 +380,103 @@ func (r *Router) Bind(key, uid string) {
 	if key == "" || uid == "" {
 		return
 	}
+
 	now := time.Now()
+
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	// 绑定成功即回纳证据：只清除该账号的抑制；换绑到其他账号时保留其余窗口
+	// （含已过期但 LowLoad 仍未回落的），防止旧账号立刻又被重新绑定。
+	if list, ok := r.avoid[key]; ok {
+		kept := list[:0]
+		for _, a := range list {
+			if a.uid == uid {
+				continue
+			}
+
+			kept = append(kept, a)
+		}
+
+		if len(kept) == 0 {
+			delete(r.avoid, key)
+		} else {
+			r.avoid[key] = kept
+		}
+	}
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
-// avoidActive 报告会话是否仍处于降级抑制：窗口内禁止复用原账号；窗口结束后
-// 仍要求 LowLoad 低水位。未配置 LowLoad 时窗口结束即解除。
-func (r *Router) avoidActive(e entry, model string, now time.Time) bool {
-	if e.avoidUID == "" || e.avoidUID != e.uid {
+// avoidActive 报告会话当前绑定是否仍处于降级抑制：窗口内禁止复用原账号；
+// 窗口结束后仍要求 LowLoad 低水位。绑定已换到其他账号时不再抑制。
+// 调用方须持有 r.mu（读锁或写锁）并在锁内调用：Degrade/Bind/touch 会原地改写
+// 切片元素，锁外遍历同一底层数组会与写方数据竞争。
+func (r *Router) avoidActive(list []avoidance, found bool, entry2 entry, model string, now time.Time) bool {
+	if !found || entry2.uid == "" {
 		return false
 	}
-	if now.Before(e.avoidUntil) {
+
+	var until time.Time
+	for _, a := range list {
+		if a.uid == entry2.uid && a.until.After(until) {
+			until = a.until
+		}
+	}
+
+	if until.IsZero() {
+		return false
+	}
+
+	if now.Before(until) {
 		return true
 	}
-	return r.cfg.LowLoad != nil && !r.cfg.LowLoad(model, e.uid)
+
+	return r.cfg.LowLoad != nil && !r.cfg.LowLoad(model, entry2.uid)
 }
 
-// Degrade 软逃逸后把当前绑定置为降级：窗口内不绑定回原账号，并删除 Redis 镜像。
-// 绑定本身保留在内存，用于窗口结束后做低水位回纳判定。
-func (r *Router) Degrade(key, uid string, d time.Duration) {
+// Degrade 软逃逸后把账号置为降级：窗口内不绑定回原账号，并删除 Redis 镜像。
+// 抑制独立于当前绑定保存，重新分配/解绑后仍然有效，直到窗口结束且低水位回纳。
+// 同一会话可同时抑制多个账号；重复降级同一账号取更晚的窗口结束时间。
+func (r *Router) Degrade(key, uid string, duration time.Duration) {
 	if key == "" || uid == "" {
 		return
 	}
+
 	now := time.Now()
+
 	r.mu.Lock()
-	e, ok := r.entries[key]
-	if !ok || e.uid != uid {
+
+	entry2, ok := r.entries[key]
+	if !ok || entry2.uid != uid {
 		r.mu.Unlock()
 		return
 	}
-	e.avoidUID = uid
-	e.avoidUntil = now.Add(d)
-	e.lastActive = now
-	r.entries[key] = e
+
+	until := now.Add(duration)
+	list := r.avoid[key]
+	merged := false
+
+	for i := range list {
+		if list[i].uid != uid {
+			continue
+		}
+
+		if until.After(list[i].until) {
+			list[i].until = until
+		}
+
+		merged = true
+
+		break
+	}
+
+	if !merged {
+		list = append(list, avoidance{uid: uid, until: until})
+	}
+
+	r.avoid[key] = list
+	entry2.lastActive = now
+	r.entries[key] = entry2
 	r.mu.Unlock()
 	r.cfg.Store.DelBind(key)
 }
@@ -329,14 +484,17 @@ func (r *Router) Degrade(key, uid string, d time.Duration) {
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
 func (r *Router) Unbind(key string) bool {
 	r.mu.Lock()
+
 	_, found := r.entries[key]
 	if found {
 		delete(r.entries, key)
 	}
 	r.mu.Unlock()
+
 	if found {
 		r.cfg.Store.DelBind(key)
 	}
+
 	return found
 }
 
@@ -344,35 +502,64 @@ func (r *Router) Unbind(key string) bool {
 func (r *Router) Count() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+
 	return len(r.entries)
 }
 
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
 func (r *Router) gcOnce(now time.Time) int {
 	r.mu.Lock()
+
 	var expiredKeys []string
+
 	for key, e := range r.entries {
 		if now.Sub(e.lastActive) > r.cfg.TTL {
 			expiredKeys = append(expiredKeys, key)
 		}
 	}
+
 	for _, key := range expiredKeys {
 		delete(r.entries, key)
+		delete(r.avoid, key)
+	}
+	// 已解绑且窗口过期的抑制记录不再有用（绑定中的过期记录保留给 LowLoad 门控，
+	// 由 touch 在回纳时清除）。
+	for key, list := range r.avoid {
+		if _, bound := r.entries[key]; bound {
+			continue
+		}
+
+		kept := list[:0]
+		for _, a := range list {
+			if now.Before(a.until) {
+				kept = append(kept, a)
+			}
+		}
+
+		if len(kept) == 0 {
+			delete(r.avoid, key)
+		} else {
+			r.avoid[key] = kept
+		}
 	}
 	r.mu.Unlock()
+
 	for _, key := range expiredKeys {
 		r.cfg.Store.DelBind(key)
 	}
+
 	return len(expiredKeys)
 }
 
 // availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
 func (r *Router) availableSet(model string) map[string]bool {
 	uids := r.availableSlice(model)
+
 	set := make(map[string]bool, len(uids))
 	for _, u := range uids {
 		set[u] = true
 	}
+
 	return set
 }
 
@@ -381,9 +568,11 @@ func (r *Router) availableSlice(model string) []string {
 	if r.cfg.AvailableForModel != nil {
 		return r.cfg.AvailableForModel(model)
 	}
+
 	if r.cfg.Available == nil {
 		return nil
 	}
+
 	return r.cfg.Available()
 }
 
@@ -393,12 +582,13 @@ func expired(e entry, now time.Time, ttl time.Duration) bool {
 
 // hashIndex FNV-1a 哈希取模（antigravity 双段分配的稳定散列）。
 func hashIndex(key string, n int) int {
-	var h uint32 = 2166136261
+	var num uint32 = 2166136261
 	for i := range len(key) {
-		h ^= uint32(key[i])
-		h *= 16777619
+		num ^= uint32(key[i])
+		num *= 16777619
 	}
-	return int(h % uint32(n)) //nolint:gosec // n 为账号池规模，恒远小于 2^32
+
+	return int(num % uint32(n)) //nolint:gosec // n 为账号池规模，恒远小于 2^32
 }
 
 // ExtractKey 从请求体提取会话键；按下列顺序依次尝试，找不到时回退到
@@ -436,21 +626,26 @@ func ExtractKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
+
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
+
 	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v
 		}
+
 		if v := strOrEmpty(meta["conversationId"]); v != "" {
 			return v
 		}
 	}
+
 	if v := strOrEmpty(obj["conversation_id"]); v != "" {
 		return v
 	}
+
 	if v := strOrEmpty(obj["conversationId"]); v != "" {
 		return v
 	}
@@ -463,6 +658,7 @@ func ExtractKey(body []byte) string {
 	if hasUserIDKey(obj) {
 		return ""
 	}
+
 	return deriveKey(obj)
 }
 
@@ -474,6 +670,7 @@ func hasUserIDKey(obj map[string]any) bool {
 			return true
 		}
 	}
+
 	return strOrEmpty(obj["user_id"]) != ""
 }
 
@@ -494,11 +691,14 @@ func deriveKey(obj map[string]any) string {
 	if !ok || len(msgs) == 0 {
 		return ""
 	}
+
 	systemText, firstUserText := scanDeriveTexts(msgs)
 	if firstUserText == "" {
 		return "" // 无用户消息：无从归属会话
 	}
+
 	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
 }
 
@@ -513,6 +713,7 @@ func scanDeriveTexts(msgs []any) (systemText, firstUserText string) {
 		if !ok {
 			continue
 		}
+
 		text := messageText(msg["content"])
 		switch strOrEmpty(msg["role"]) {
 		case "system", "developer":
@@ -524,10 +725,12 @@ func scanDeriveTexts(msgs []any) (systemText, firstUserText string) {
 				firstUserText = userContentSignature(msg["content"])
 			}
 		}
+
 		if firstUserText != "" && systemText != "" {
 			break // 都已拿到：停止遍历长历史
 		}
 	}
+
 	return systemText, firstUserText
 }
 
@@ -544,18 +747,22 @@ func userContentSignature(content any) string {
 	if err != nil {
 		return ""
 	}
-	st := strings.TrimSpace(string(raw))
-	if st == "" || st == "null" {
+
+	str2 := strings.TrimSpace(string(raw))
+	if str2 == "" || str2 == "null" {
 		return ""
 	}
-	if st[0] == '"' {
+
+	if str2[0] == '"' {
 		var str string
 		if json.Unmarshal(raw, &str) != nil {
 			return ""
 		}
+
 		return str
 	}
-	if st[0] != '[' {
+
+	if str2[0] != '[' {
 		return ""
 	}
 	// 非文本 part 只入 "[type]" 占位，不入内容摘要（保证派生键随图片 URL 变化
@@ -568,18 +775,21 @@ func userContentSignature(content any) string {
 // messageText 提取消息 content 的文本表示。
 // 兼容：字符串 / [{type:"text",text:"..."}] 数组（OpenAI 多模态）；其他类型取空。
 func messageText(content any) string {
-	switch v := content.(type) {
+	switch item := content.(type) {
 	case string:
-		return v
+		return item
 	case []any:
-		var sb strings.Builder
-		for _, part := range v {
+		var builder strings.Builder
+
+		for _, part := range item {
 			if p, ok := part.(map[string]any); ok {
-				sb.WriteString(strOrEmpty(p["text"]))
+				builder.WriteString(strOrEmpty(p["text"]))
 			}
 		}
-		return sb.String()
+
+		return builder.String()
 	}
+
 	return ""
 }
 

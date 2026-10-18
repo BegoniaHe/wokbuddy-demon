@@ -17,37 +17,47 @@ import (
 
 // TestDeviceTokenInjected_WhenSet auth.Auth.DeviceToken 非空时 chat/billing 请求均注入。
 func TestDeviceTokenInjected_WhenSet(t *testing.T) {
-	a := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth"}
+	t.Parallel()
+
+	account := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth"}
 	// 用 server 端验证而非 RoundTripper 捕获：更贴近真实注入路径。
-	for _, tc := range []struct {
+	for _, testCase := range []struct {
 		name     string
 		apply    func(c *Client, req *http.Request)
 		wantPath string
 	}{
-		{"chat", func(c *Client, req *http.Request) { c.ChatHeaders(req, a, "", ChatMeta{}) }, "/v2/chat/completions"},
-		{"billing", func(c *Client, req *http.Request) { c.BillingHeaders(req, a) }, "/v2/report"},
+		{"chat", func(c *Client, req *http.Request) { c.ChatHeaders(req, account, "", ChatMeta{}) }, "/v2/chat/completions"},
+		{"billing", func(c *Client, req *http.Request) { c.BillingHeaders(req, account) }, "/v2/report"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
 			var got string
+
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				got = r.Header.Get("X-Device-Token")
+
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{"code":0}`))
 			}))
 			defer srv.Close()
-			c := &Client{
+
+			client := &Client{
 				HTTP:          srv.Client(),
 				ChatHTTP:      srv.Client(),
 				ChatBaseCN:    srv.URL,
 				BillingBaseCN: srv.URL,
 			}
-			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+tc.wantPath, nil)
-			tc.apply(c, req)
-			resp, err := c.HTTP.Do(req)
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+testCase.wantPath, nil)
+			testCase.apply(client, req)
+
+			resp, err := client.HTTP.Do(req)
 			if err != nil {
 				t.Fatalf("do: %v", err)
 			}
+
 			resp.Body.Close()
+
 			if got != "tok-from-auth" {
 				t.Errorf("X-Device-Token = %q want %q", got, "tok-from-auth")
 			}
@@ -57,15 +67,21 @@ func TestDeviceTokenInjected_WhenSet(t *testing.T) {
 
 // TestDeviceTokenNotInjected_WhenEmpty 所有来源皆空时不注入该头。
 func TestDeviceTokenNotInjected_WhenEmpty(t *testing.T) {
-	a := &auth.Auth{AccessToken: "at", UID: "u1"} // DeviceToken 空
+	t.Parallel()
+
+	account := &auth.Auth{AccessToken: "at", UID: "u1"} // DeviceToken 空
+
 	var got string
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Get("X-Device-Token")
+
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"code":0}`))
 	}))
 	defer srv.Close()
-	c := &Client{
+
+	client := &Client{
 		HTTP:          srv.Client(),
 		ChatHTTP:      srv.Client(),
 		ChatBaseCN:    srv.URL,
@@ -73,12 +89,15 @@ func TestDeviceTokenNotInjected_WhenEmpty(t *testing.T) {
 		// DeviceToken / DeviceTokenFile 皆空
 	}
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/v2/chat/completions", nil)
-	c.ChatHeaders(req, a, "", ChatMeta{})
-	resp, err := c.HTTP.Do(req)
+	client.ChatHeaders(req, account, "", ChatMeta{})
+
+	resp, err := client.HTTP.Do(req)
 	if err != nil {
 		t.Fatalf("do: %v", err)
 	}
+
 	resp.Body.Close()
+
 	if got != "" {
 		t.Errorf("X-Device-Token = %q want empty (not injected)", got)
 	}
@@ -87,9 +106,11 @@ func TestDeviceTokenNotInjected_WhenEmpty(t *testing.T) {
 // TestDeviceTokenFromConfigOrFile_Overrides 优先级：auth > config > 文件。
 // auth 有值时覆盖 config；auth 空时 config 兜底；auth 与 config 皆空时读文件。
 func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	fp := filepath.Join(dir, "device_token")
-	if err := os.WriteFile(fp, []byte("tok-from-file\n"), 0o600); err != nil {
+
+	filePath := filepath.Join(dir, "device_token")
+	if err := os.WriteFile(filePath, []byte("tok-from-file\n"), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 
@@ -103,36 +124,45 @@ func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
 		{"config_when_auth_empty", "", "tok-config", "tok-config"},
 		{"file_when_auth_and_config_empty", "", "", "tok-from-file"},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 			// 每个用例用独立缓存：device token 文件缓存 5 分钟，case 间会串扰。
-			save := resetDeviceTokenFileCache(fp)
+			save := resetDeviceTokenFileCache(filePath)
 			defer save()
-			a := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: tc.auth}
+
+			account := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: testCase.auth}
+
 			var got string
+
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				got = r.Header.Get("X-Device-Token")
+
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{"code":0}`))
 			}))
 			defer srv.Close()
-			c := &Client{
+
+			client := &Client{
 				HTTP:            srv.Client(),
 				ChatHTTP:        srv.Client(),
 				ChatBaseCN:      srv.URL,
 				BillingBaseCN:   srv.URL,
-				DeviceToken:     tc.cfg,
-				DeviceTokenFile: fp,
+				DeviceToken:     testCase.cfg,
+				DeviceTokenFile: filePath,
 			}
 			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/v2/chat/completions", nil)
-			c.ChatHeaders(req, a, "", ChatMeta{})
-			resp, err := c.HTTP.Do(req)
+			client.ChatHeaders(req, account, "", ChatMeta{})
+
+			resp, err := client.HTTP.Do(req)
 			if err != nil {
 				t.Fatalf("do: %v", err)
 			}
+
 			resp.Body.Close()
-			if got != tc.want {
-				t.Errorf("X-Device-Token = %q want %q", got, tc.want)
+
+			if got != testCase.want {
+				t.Errorf("X-Device-Token = %q want %q", got, testCase.want)
 			}
 		})
 	}
@@ -140,15 +170,20 @@ func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
 
 // TestDeviceTokenFileTooLarge 文件超过 1KB 时忽略不注入。
 func TestDeviceTokenFileTooLarge(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
-	fp := filepath.Join(dir, "device_token")
-	if err := os.WriteFile(fp, []byte(strings.Repeat("x", 2048)), 0o600); err != nil {
+
+	filePath := filepath.Join(dir, "device_token")
+	if err := os.WriteFile(filePath, []byte(strings.Repeat("x", 2048)), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	save := resetDeviceTokenFileCache(fp)
+
+	save := resetDeviceTokenFileCache(filePath)
 	defer save()
+
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	c := &Client{DeviceTokenFile: fp}
+
+	c := &Client{DeviceTokenFile: filePath}
 	if tok := c.resolveDeviceToken(a); tok != "" {
 		t.Errorf("resolveDeviceToken() = %q want empty (file too large)", tok)
 	}
@@ -167,7 +202,9 @@ func resetDeviceTokenFileCache(path string) (restore func()) {
 	dtFileCache.readAt = time.Time{}
 	dtFileCache.lastErr = nil
 	dtFileCache.mu.Unlock()
+
 	var once sync.Once
+
 	return func() {
 		once.Do(func() {
 			dtFileCache.mu.Lock()

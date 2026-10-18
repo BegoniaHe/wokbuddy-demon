@@ -36,6 +36,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	if len(body) == 0 {
 		return body
 	}
+
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
@@ -51,12 +52,15 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	} else if v := strField(obj, "conversationId"); v != "" {
 		conv = v
 	}
+
 	key := buildCacheKey(uid, conv)
 	obj["prompt_cache_key"] = key
+
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
 	}
+
 	return out
 }
 
@@ -70,11 +74,14 @@ func buildCacheKey(uid, conversation string) string {
 	if len(uid8) > 8 {
 		uid8 = uid8[:8]
 	}
+
 	if uid8 == "" {
 		uid8 = "-"
 	}
+
 	sum := sha256.Sum256([]byte(uid + "|" + conversation))
 	convHex := hex.EncodeToString(sum[:16])
+
 	return "wb2a-" + uid8 + "-" + convHex
 }
 
@@ -84,5 +91,6 @@ func strField(obj map[string]any, key string) string {
 	if !ok {
 		return ""
 	}
+
 	return strings.TrimSpace(v)
 }

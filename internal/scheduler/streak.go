@@ -26,63 +26,76 @@ func (s *Scheduler) RunStreakBonusNow() {
 // streakAll 连登兑换 + 抽奖实体；返回尝试/成功/失败账号数（门控跳过不计数）。
 func (s *Scheduler) streakAll(trigger string) (total, success, failure int) {
 	_ = trigger
-	var c runCounters
-	for _, st := range s.cfg.Pool.List() {
+
+	var runCounters2 runCounters
+
+	list := s.cfg.Pool.List()
+	for i := range list {
+		st := &list[i]
 		if st.Disabled {
 			continue
 		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.AccessTokenValue() == "" {
+
+		account := s.cfg.Pool.AuthByUID(st.UID)
+		if account == nil || account.AccessTokenValue() == "" {
 			continue
 		}
-		if a.IsGlobal() {
+
+		if account.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		if a.IsEnterprise() {
+
+		if account.IsEnterprise() {
 			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
 		}
-		c.record(s.streakBonusAccount(a))
+
+		runCounters2.record(s.streakBonusAccount(account))
 	}
-	return c.total, c.success, c.failure
+
+	return runCounters2.total, runCounters2.success, runCounters2.failure
 }
 
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
 // 返回 false 仅表示主链路（连登状态/抽奖次数）查询失败；可选的礼包/补签失败不改变结果。
-func (s *Scheduler) streakBonusAccount(a *auth.Auth) bool {
+func (s *Scheduler) streakBonusAccount(account3 *auth.Auth) bool {
 	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
-	s.makeupYesterday(a)
+	s.makeupYesterday(account3)
 	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
-	s.claimStreakGifts(a)
+	s.claimStreakGifts(account3)
 
-	full, err := s.cfg.Upstream.GrowthStreakFull(a)
+	full, err := s.cfg.Upstream.GrowthStreakFull(account3)
 	if err != nil {
-		log.Printf("streak-bonus %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("streak-bonus %s: %v", logfmt.Label(account3.UID, account3.NicknameValue()), err)
 		return false
 	}
-	s.redeemUnlockedTiers(a, full)
+
+	s.redeemUnlockedTiers(account3, full)
 
 	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
-	chances, err := s.cfg.Upstream.LotteryChances(a)
+	chances, err := s.cfg.Upstream.LotteryChances(account3)
 	if err != nil {
-		log.Printf("streak-bonus %s: lottery summary: %v", logfmt.Label(a.UID, a.Nickname), err)
+		log.Printf("streak-bonus %s: lottery summary: %v", logfmt.Label(account3.UID, account3.NicknameValue()), err)
 		return false
 	}
-	s.drawAllLottery(a, chances)
+
+	s.drawAllLottery(account3, chances)
+
 	return true
 }
 
 // claimStreakGifts 领取新手礼包与补偿（各一次，业务错误静默跳过）。
-func (s *Scheduler) claimStreakGifts(a *auth.Auth) {
-	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
+func (s *Scheduler) claimStreakGifts(account4 *auth.Auth) {
+	if credit, err := s.cfg.Upstream.ClaimGift(account4); err == nil {
+		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(account4.UID, account4.NicknameValue()), credit)
 	}
-	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
-		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(a.UID, a.Nickname), credit)
+
+	if credit, err := s.cfg.Upstream.ClaimCompensation(account4); err == nil {
+		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(account4.UID, account4.NicknameValue()), credit)
 	}
 }
 
 // redeemUnlockedTiers 兑换所有已解锁档位（locked/claimed 跳过；未解锁 403 静默）。
-func (s *Scheduler) redeemUnlockedTiers(a *auth.Auth, full *upstream.StreakFull) {
+func (s *Scheduler) redeemUnlockedTiers(account *auth.Auth, full *upstream.StreakFull) {
 	statuses := map[string]string{
 		"7d":  full.RedemptionStatus.Tier7dStatus,
 		"14d": full.RedemptionStatus.Tier14dStatus,
@@ -93,28 +106,32 @@ func (s *Scheduler) redeemUnlockedTiers(a *auth.Auth, full *upstream.StreakFull)
 		if status == "locked" || status == "claimed" {
 			continue
 		}
-		if err := s.cfg.Upstream.GrowthRedeemTier(a, tier.Tier); err != nil {
+
+		if err := s.cfg.Upstream.GrowthRedeemTier(account, tier.Tier); err != nil {
 			// 未解锁（403）属预期，静默；其余记日志。
-			log.Printf("streak-bonus %s: redeem %s: %v", logfmt.Label(a.UID, a.Nickname), tier.Tier, err)
+			log.Printf("streak-bonus %s: redeem %s: %v", logfmt.Label(account.UID, account.NicknameValue()), tier.Tier, err)
 			continue
 		}
+
 		log.Printf("streak-bonus %s: ★ 兑换 %s 档（+%dc +%de 卡×%d 抽奖×%d）",
-			a.UID, tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
+			account.UID, tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
 	}
 }
 
 // drawAllLottery 按当前抽奖次数全部抽完，遇错即停。
-func (s *Scheduler) drawAllLottery(a *auth.Auth, chances int) {
+func (s *Scheduler) drawAllLottery(account5 *auth.Auth, chances int) {
 	for i := range chances {
-		raw, err := s.cfg.Upstream.LotteryDraw(a)
+		raw, err := s.cfg.Upstream.LotteryDraw(account5)
 		if err != nil {
-			log.Printf("streak-bonus %s: draw: %v", logfmt.Label(a.UID, a.Nickname), err)
+			log.Printf("streak-bonus %s: draw: %v", logfmt.Label(account5.UID, account5.NicknameValue()), err)
 			return
 		}
-		log.Printf("streak-bonus %s: 🎲 第%d抽 %s", logfmt.Label(a.UID, a.Nickname), i+1, compactJSON(raw))
+
+		log.Printf("streak-bonus %s: 🎲 第%d抽 %s", logfmt.Label(account5.UID, account5.NicknameValue()), i+1, compactJSON(raw))
 	}
+
 	if chances > 0 {
-		log.Printf("streak-bonus %s: 抽奖完成 %d 次", logfmt.Label(a.UID, a.Nickname), chances)
+		log.Printf("streak-bonus %s: 抽奖完成 %d 次", logfmt.Label(account5.UID, account5.NicknameValue()), chances)
 	}
 }
 
@@ -124,24 +141,28 @@ func compactJSON(raw json.RawMessage) string {
 	if len(s) > 220 {
 		return s[:220] + "…"
 	}
+
 	return s
 }
 
 // makeupYesterday 昨日漏签且有补签卡时自动补签（保住连登连续天数）。
 // 无卡 / 无漏签 / 查询失败均静默（不影响主流程）。
-func (s *Scheduler) makeupYesterday(a *auth.Auth) {
-	missed, err := s.cfg.Upstream.HeatmapYesterdayMissed(a)
+func (s *Scheduler) makeupYesterday(account2 *auth.Auth) {
+	missed, err := s.cfg.Upstream.HeatmapYesterdayMissed(account2)
 	if err != nil || !missed {
 		return
 	}
-	full, err := s.cfg.Upstream.GrowthStreakFull(a)
+
+	full, err := s.cfg.Upstream.GrowthStreakFull(account2)
 	if err != nil || full.MakeupCards.Balance <= 0 {
 		return
 	}
+
 	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
-	if err := s.cfg.Upstream.UseMakeupCard(a, yesterday); err != nil {
-		log.Printf("streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(a.UID, a.Nickname), yesterday, err)
+	if err := s.cfg.Upstream.UseMakeupCard(account2, yesterday); err != nil {
+		log.Printf("streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(account2.UID, account2.NicknameValue()), yesterday, err)
 		return
 	}
-	log.Printf("streak-bonus %s: ★ 已用补签卡补签 %s（保连登）", logfmt.Label(a.UID, a.Nickname), yesterday)
+
+	log.Printf("streak-bonus %s: ★ 已用补签卡补签 %s（保连登）", logfmt.Label(account2.UID, account2.NicknameValue()), yesterday)
 }

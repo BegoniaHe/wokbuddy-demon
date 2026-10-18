@@ -11,8 +11,11 @@ import (
 )
 
 func TestDailyLimitAllBlockedReturns429(t *testing.T) {
+	t.Parallel()
+
 	var calls int
-	up := newFakeUpstream(t, func(string) (int, string, bool) {
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
 		calls++
 		return 200, sseOK, true
 	})
@@ -21,16 +24,19 @@ func TestDailyLimitAllBlockedReturns429(t *testing.T) {
 	p.SetDailyUsageProvider(func() map[string]pool.DailyUsage {
 		return map[string]pool.DailyUsage{"u1": {Tokens: 10}}
 	})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(&Config{Pool: p, Upstream: client})
 	rec := httptest.NewRecorder()
 	body := `{"model":"glm-5.2","messages":[]}`
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("code=%d body=%s want 429", rec.Code, rec.Body)
 	}
+
 	if rec.Header().Get("Retry-After") == "" {
 		t.Error("missing Retry-After for daily limit reset")
 	}
+
 	if calls != 0 {
 		t.Errorf("upstream calls=%d want 0", calls)
 	}

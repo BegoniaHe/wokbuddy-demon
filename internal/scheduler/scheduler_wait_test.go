@@ -10,7 +10,7 @@ import (
 )
 
 func newTestScheduler() *Scheduler {
-	s := New(Config{})
+	s := New(&Config{})
 	return s
 }
 
@@ -18,20 +18,24 @@ func newTestScheduler() *Scheduler {
 //   - next 已过（墙钟已越过时点、timer 尚未设置的形态）→ 立即返回，不等下一段；
 //   - next 未到（多段等待）→ 到点才返回，且不早于计划时刻。
 func TestWaitSlotFiresAtWallclock(t *testing.T) {
-	s := newTestScheduler()
+	t.Parallel()
+
+	scheduler := newTestScheduler()
 
 	// 墙钟已越过的形态：修复目标——睡眠冻结 timer 后醒来第一件事就是发现已到点。
 	past := time.Now().Add(-time.Second)
-	if got := s.waitSlot(t.Context(), past, time.Hour); got != slotFired {
+	if got := scheduler.waitSlot(t.Context(), past, time.Hour); got != slotFired {
 		t.Fatalf("已越过时点应立即 slotFired，got %v", got)
 	}
 
 	// 未来时点：多段等待到点。
 	next := time.Now().Add(45 * time.Millisecond)
 	start := time.Now()
-	if got := s.waitSlot(t.Context(), next, 10*time.Millisecond); got != slotFired {
+
+	if got := scheduler.waitSlot(t.Context(), next, 10*time.Millisecond); got != slotFired {
 		t.Fatalf("到点应 slotFired，got %v", got)
 	}
+
 	if time.Since(start) < 40*time.Millisecond {
 		t.Errorf("提前返回：等待 %v，未到计划时刻", time.Since(start))
 	}
@@ -40,17 +44,23 @@ func TestWaitSlotFiresAtWallclock(t *testing.T) {
 // TestWaitSlotRearm 等待中收到 rearmSchedule（在线改配置重排）→ 立即 slotRearm，
 // 不等满剩余时长（段长不影响 rearm 响应性）。
 func TestWaitSlotRearm(t *testing.T) {
-	s := newTestScheduler()
+	t.Parallel()
+
+	scheduler := newTestScheduler()
 	next := time.Now().Add(2 * time.Second)
 
 	go func() {
 		time.Sleep(30 * time.Millisecond)
-		s.rearmSchedule <- struct{}{}
+
+		scheduler.rearmSchedule <- struct{}{}
 	}()
+
 	start := time.Now()
-	if got := s.waitSlot(t.Context(), next, 10*time.Millisecond); got != slotRearm {
+
+	if got := scheduler.waitSlot(t.Context(), next, 10*time.Millisecond); got != slotRearm {
 		t.Fatalf("rearm 应返回 slotRearm，got %v", got)
 	}
+
 	if time.Since(start) > 500*time.Millisecond {
 		t.Errorf("rearm 响应过慢：%v", time.Since(start))
 	}
@@ -58,7 +68,9 @@ func TestWaitSlotRearm(t *testing.T) {
 
 // TestWaitSlotCancel ctx 取消 → slotCancel，优雅退出。
 func TestWaitSlotCancel(t *testing.T) {
-	s := newTestScheduler()
+	t.Parallel()
+
+	scheduler := newTestScheduler()
 	ctx, cancel := context.WithCancel(t.Context())
 	next := time.Now().Add(2 * time.Second)
 
@@ -66,10 +78,13 @@ func TestWaitSlotCancel(t *testing.T) {
 		time.Sleep(30 * time.Millisecond)
 		cancel()
 	}()
+
 	start := time.Now()
-	if got := s.waitSlot(ctx, next, 10*time.Millisecond); got != slotCancel {
+
+	if got := scheduler.waitSlot(ctx, next, 10*time.Millisecond); got != slotCancel {
 		t.Fatalf("取消应返回 slotCancel，got %v", got)
 	}
+
 	if time.Since(start) > 500*time.Millisecond {
 		t.Errorf("取消响应过慢：%v", time.Since(start))
 	}

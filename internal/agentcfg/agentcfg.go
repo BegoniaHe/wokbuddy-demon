@@ -28,6 +28,13 @@ var ErrModified = errors.New("配置文件在上次写入后被修改，需确�
 var ErrNotApplied = errors.New("没有可还原的写入记录")
 
 // Options 写入参数。
+var (
+	errAPIKey        = errors.New("api_key 不能为空")
+	errBaseURLHTTPS  = errors.New("base_url 必须是 http(s) 地址")
+	errApplyFailed   = errors.New("Apply failed")
+	errRestoreFailed = errors.New("Restore failed")
+)
+
 type Options struct {
 	BaseURL string `json:"base_url"`
 	APIKey  string `json:"api_key"`
@@ -87,6 +94,7 @@ func (m *Manager) client(id string) (client, bool) {
 			return c, true
 		}
 	}
+
 	return client{}, false
 }
 
@@ -100,71 +108,88 @@ func (m *Manager) Status() []Status {
 	out := make([]Status, 0, len(clients))
 	for _, c := range clients {
 		path := c.path(m.Home)
-		st := Status{ID: c.id, Name: c.name, Path: path, Detected: detected(path)}
+
+		status := Status{ID: c.id, Name: c.name, Path: path, Detected: detected(path), Applied: false, Modified: false, AppliedAt: ""}
 		if mt, err := m.readMeta(c.id); err == nil {
-			st.Applied = true
-			st.AppliedAt = mt.AppliedAt.Format(time.RFC3339)
+			status.Applied = true
+
+			status.AppliedAt = mt.AppliedAt.Format(time.RFC3339)
 			if raw, err := os.ReadFile(path); err == nil {
-				st.Modified = hash(raw) != mt.AppliedHash
+				status.Modified = hash(raw) != mt.AppliedHash
 			} else {
-				st.Modified = true
+				status.Modified = true
 			}
 		}
-		out = append(out, st)
+
+		out = append(out, status)
 	}
+
 	return out
 }
 
 // validateOptions 校验写入参数并补默认模型。
 func validateOptions(opts *Options) error {
 	if strings.TrimSpace(opts.APIKey) == "" {
-		return errors.New("api_key 不能为空")
+		return errAPIKey
 	}
+
 	if !strings.HasPrefix(opts.BaseURL, "http://") && !strings.HasPrefix(opts.BaseURL, "https://") {
-		return errors.New("base_url 必须是 http(s) 地址")
+		return errBaseURLHTTPS
 	}
+
 	if strings.TrimSpace(opts.Model) == "" {
 		opts.Model = "glm-5.2"
 	}
+
 	return nil
 }
 
 // Apply 写入网关专属配置。
 func (m *Manager) Apply(id string, opts Options) (Status, error) {
-	c, ok := m.client(id)
+	client2, ok := m.client(id)
 	if !ok {
-		return Status{}, fmt.Errorf("unknown client %q", id)
+		return Status{}, fmt.Errorf("unknown client %q: %w", id, errApplyFailed)
 	}
+
 	if err := validateOptions(&opts); err != nil {
 		return Status{}, err
 	}
-	path := c.path(m.Home)
+
+	path := client2.path(m.Home)
+
 	existing, existed, err := readFile(path)
 	if err != nil {
 		return Status{}, err
 	}
+
 	mt, err := m.prepareMeta(id, existing, existed)
 	if err != nil {
 		return Status{}, err
 	}
-	out, err := c.apply(existing, opts)
+
+	out, err := client2.apply(existing, opts)
 	if err != nil {
 		return Status{}, err
 	}
+
 	if err := writeFile(path, out); err != nil {
 		return Status{}, err
 	}
+
 	mt.AppliedHash = hash(out)
+
 	mt.AppliedAt = time.Now()
 	if err := m.writeMeta(id, mt); err != nil {
 		return Status{}, err
 	}
+
 	for _, st := range m.Status() {
 		if st.ID == id {
 			return st, nil
 		}
 	}
-	return Status{ID: id, Name: c.name, Path: path}, nil
+
+	return Status{ID: id, Name: client2.name, Path: path, Detected: false, Applied: false, Modified: false, AppliedAt: ""}, nil
 }
 
 // prepareMeta 首次写入时备份原件；已有写入记录时校验文件未被外部修改。
@@ -174,40 +199,52 @@ func (m *Manager) prepareMeta(id string, existing []byte, existed bool) (meta, e
 		if err := m.saveOriginal(id, existing, existed); err != nil {
 			return meta{}, err
 		}
+
 		return meta{Existed: existed}, nil
 	}
+
 	if hash(existing) != mt.AppliedHash {
 		return meta{}, ErrModified
 	}
+
 	return mt, nil
 }
 
 // Restore 还原到首次写入前；网关新建的文件会被删除。
 func (m *Manager) Restore(id string, force bool) error {
-	c, ok := m.client(id)
+	client2, ok := m.client(id)
 	if !ok {
-		return fmt.Errorf("unknown client %q", id)
+		return fmt.Errorf("unknown client %q: %w", id, errRestoreFailed)
 	}
+
 	mt, err := m.readMeta(id)
 	if err != nil {
 		return ErrNotApplied
 	}
-	path := c.path(m.Home)
+
+	path := client2.path(m.Home)
 	if raw, err := os.ReadFile(path); err == nil && hash(raw) != mt.AppliedHash && !force {
 		return ErrModified
 	}
+
 	if !mt.Existed {
 		return m.removeCreated(id, path)
 	}
+
 	return m.restoreOriginal(id, path)
 }
 
 // removeCreated 删除网关新建的配置文件与写入记录。
 func (m *Manager) removeCreated(id, path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
+		return fmt.Errorf("removeCreated: %w", err)
 	}
-	return os.Remove(m.metaPath(id))
+
+	if err := os.Remove(m.metaPath(id)); err != nil {
+		return fmt.Errorf("removeCreated: %w", err)
+	}
+
+	return nil
 }
 
 // restoreOriginal 用首次原件覆盖当前文件并清除写入记录。
@@ -216,41 +253,65 @@ func (m *Manager) restoreOriginal(id, path string) error {
 	if err != nil {
 		return fmt.Errorf("读取备份失败: %w", err)
 	}
+
 	if err := writeFile(path, original); err != nil {
 		return err
 	}
-	return os.Remove(m.metaPath(id))
+
+	if err := os.Remove(m.metaPath(id)); err != nil {
+		return fmt.Errorf("restoreOriginal: %w", err)
+	}
+
+	return nil
 }
 
 func (m *Manager) saveOriginal(id string, raw []byte, existed bool) error {
 	if err := os.MkdirAll(m.backupDir(id), 0o700); err != nil {
-		return err
+		return fmt.Errorf("saveOriginal: %w", err)
 	}
+
 	if !existed {
 		return nil
 	}
-	return os.WriteFile(m.originalPath(id), raw, 0o600)
+
+	if err := os.WriteFile(m.originalPath(id), raw, 0o600); err != nil {
+		return fmt.Errorf("saveOriginal: %w", err)
+	}
+
+	return nil
 }
 
 func (m *Manager) readMeta(id string) (meta, error) {
 	var mt meta
+
 	raw, err := os.ReadFile(m.metaPath(id))
 	if err != nil {
-		return mt, err
+		return mt, fmt.Errorf("readMeta: %w", err)
 	}
+
 	err = json.Unmarshal(raw, &mt)
-	return mt, err
+	if err != nil {
+		return mt, fmt.Errorf("readMeta: %w", err)
+	}
+
+	return mt, nil
 }
 
 func (m *Manager) writeMeta(id string, mt meta) error {
 	raw, err := json.MarshalIndent(mt, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("writeMeta: %w", err)
 	}
+
 	if err := os.MkdirAll(m.backupDir(id), 0o700); err != nil {
-		return err
+		return fmt.Errorf("writeMeta: %w", err)
 	}
-	return os.WriteFile(m.metaPath(id), raw, 0o600)
+
+	if err := os.WriteFile(m.metaPath(id), raw, 0o600); err != nil {
+		return fmt.Errorf("writeMeta: %w", err)
+	}
+
+	return nil
 }
 
 func applyClaude(existing []byte, opts Options) ([]byte, error) {
@@ -260,15 +321,23 @@ func applyClaude(existing []byte, opts Options) ([]byte, error) {
 			return nil, fmt.Errorf("现有 Claude 配置不是合法 JSON: %w", err)
 		}
 	}
+
 	env, _ := doc["env"].(map[string]any)
 	if env == nil {
 		env = map[string]any{}
 	}
+
 	env["ANTHROPIC_BASE_URL"] = gatewayRoot(opts.BaseURL)
 	env["ANTHROPIC_AUTH_TOKEN"] = opts.APIKey
 	env["ANTHROPIC_MODEL"] = opts.Model
 	doc["env"] = env
-	return json.MarshalIndent(doc, "", "  ")
+
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("applyClaude: %w", err)
+	}
+
+	return raw, nil
 }
 
 const (
@@ -303,14 +372,16 @@ func applyCodex(existing []byte, opts Options) ([]byte, error) {
 	root = codexRootModelProvider.ReplaceAllString(root, "")
 	root = strings.TrimSpace(root)
 
-	var b strings.Builder
-	fmt.Fprintf(&b, "%s\nmodel_provider = \"wokbuddy\"\nmodel = %q\n", codexStart, opts.Model)
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "%s\nmodel_provider = \"wokbuddy\"\nmodel = %q\n", codexStart, opts.Model)
+
 	if root != "" {
-		b.WriteString("\n")
-		b.WriteString(root)
-		b.WriteString("\n")
+		builder.WriteString("\n")
+		builder.WriteString(root)
+		builder.WriteString("\n")
 	}
-	fmt.Fprintf(&b, `
+
+	fmt.Fprintf(&builder, `
 [model_providers.wokbuddy]
 name = "WokBuddy Demon"
 base_url = %q
@@ -318,12 +389,14 @@ wire_api = "chat"
 experimental_bearer_token = %q
 %s
 `, v1Base(opts.BaseURL), opts.APIKey, codexEnd)
+
 	if tables = strings.TrimSpace(tables); tables != "" {
-		b.WriteString("\n")
-		b.WriteString(tables)
-		b.WriteString("\n")
+		builder.WriteString("\n")
+		builder.WriteString(tables)
+		builder.WriteString("\n")
 	}
-	return []byte(b.String()), nil
+
+	return []byte(builder.String()), nil
 }
 
 // removeCodexBlock 删除上一次写入的托管段（含标记），其余内容原样保留。
@@ -332,23 +405,29 @@ func removeCodexBlock(text string) string {
 	if start < 0 {
 		return text
 	}
+
 	end := strings.Index(text[start:], codexEnd)
 	if end < 0 {
 		return text
 	}
+
 	end += start + len(codexEnd)
+
 	return text[:start] + strings.TrimPrefix(text[end:], "\r\n")
 }
 
 // splitCodexRoot 以首个 `[table]` 行为界拆分根段与表段。
 func splitCodexRoot(text string) (root, tables string) {
 	offset := 0
+
 	for _, line := range strings.SplitAfter(text, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "[") {
 			return text[:offset], text[offset:]
 		}
+
 		offset += len(line)
 	}
+
 	return text, ""
 }
 
@@ -359,10 +438,12 @@ func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 			return nil, fmt.Errorf("现有 OpenCode 配置不是合法 JSON: %w", err)
 		}
 	}
+
 	provider, _ := doc["provider"].(map[string]any)
 	if provider == nil {
 		provider = map[string]any{}
 	}
+
 	models := map[string]any{opts.Model: map[string]any{}}
 	provider["wokbuddy"] = map[string]any{
 		"npm":  "@ai-sdk/openai-compatible",
@@ -374,7 +455,13 @@ func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 		"models": models,
 	}
 	doc["provider"] = provider
-	return json.MarshalIndent(doc, "", "  ")
+
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("applyOpenCode: %w", err)
+	}
+
+	return raw, nil
 }
 
 func detected(path string) bool {
@@ -385,6 +472,7 @@ func detected(path string) bool {
 	if st, err := os.Stat(filepath.Dir(path)); err == nil && st.IsDir() {
 		return true
 	}
+
 	return false
 }
 
@@ -393,21 +481,29 @@ func readFile(path string) ([]byte, bool, error) {
 	if err == nil {
 		return raw, true, nil
 	}
+
 	if os.IsNotExist(err) {
 		return nil, false, nil
 	}
-	return nil, false, err
+
+	return nil, false, fmt.Errorf("readFile: %w", err)
 }
 
 func writeFile(path string, raw []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
+		return fmt.Errorf("writeFile: %w", err)
 	}
+
 	tmp := path + ".wokbuddy.tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
+		return fmt.Errorf("writeFile: %w", err)
 	}
-	return atomicwrite.Rename(tmp, path)
+
+	if err := atomicwrite.Rename(tmp, path); err != nil {
+		return fmt.Errorf("writeFile: %w", err)
+	}
+
+	return nil
 }
 
 func hash(raw []byte) string {

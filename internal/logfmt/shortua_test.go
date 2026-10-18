@@ -3,6 +3,8 @@ package logfmt
 import "testing"
 
 func TestShortUA(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		ua   string
@@ -29,6 +31,8 @@ func TestShortUA(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if got := ShortUA(tc.ua); got != tc.want {
 				t.Fatalf("ShortUA(%q) = %q want %q", tc.ua, got, tc.want)
 			}
@@ -38,6 +42,8 @@ func TestShortUA(t *testing.T) {
 
 // ShortUA 的返回值必须有界：UA 是客户端可控自由文本，超长值不能原样带进日志列。
 func TestShortUABounded(t *testing.T) {
+	t.Parallel()
+
 	long := "VeryLongClientNameThatKeepsGoingAndGoing/1.2.3"
 	if got := ShortUA(long); len(got) > maxShortUALen {
 		t.Fatalf("len(ShortUA) = %d want <= %d (%q)", len(got), maxShortUALen, got)

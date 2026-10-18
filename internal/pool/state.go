@@ -15,6 +15,7 @@ import (
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if e, ok := p.byUID[uid]; ok {
 		p.disableLocked(e, reason)
 	}
@@ -32,17 +33,21 @@ func (p *Pool) Disable(uid, reason string) {
 func (p *Pool) NoteSessionDead(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
-	e.sessionDeadFails++
-	if e.sessionDeadFails < sessionDeadThreshold {
+
+	entry2.sessionDeadFails++
+	if entry2.sessionDeadFails < sessionDeadThreshold {
 		p.dirty.Store(true) // 计数本身也持久化，未达阈值也要落盘
 		return false
 	}
-	e.sessionDeadFails = 0
-	p.disableLocked(e, sessionDeadReason)
+
+	entry2.sessionDeadFails = 0
+	p.disableLocked(entry2, sessionDeadReason)
+
 	return true
 }
 
@@ -51,8 +56,10 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 func (p *Pool) ClearSessionDead(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if e, ok := p.byUID[uid]; ok && e.sessionDeadFails != 0 {
 		e.sessionDeadFails = 0
+
 		p.dirty.Store(true)
 	}
 }
@@ -64,10 +71,12 @@ func (p *Pool) ClearSessionDead(uid string) {
 func (p *Pool) ReviveDisabled(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if e, ok := p.byUID[uid]; ok && e.disabled {
 		e.disabled = false
 		e.reason = ""
 		e.sessionDeadFails = 0
+
 		p.dirty.Store(true)
 	}
 }
@@ -79,25 +88,29 @@ func (p *Pool) ReviveDisabled(uid string) {
 func (p *Pool) Revive(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
-	e.disabled = false
-	e.paused = false // 解冻是全清：暂停选号一并解除
-	e.until = time.Time{}
-	e.coolKind = 0
-	e.reason = ""
-	e.softStreak = 0
-	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
-	e.sessionDeadFails = 0
-	e.consecutiveFails = 0 // 连败降权计数/截止一并清，否则「解冻」后仍可能被降权期挡住
-	e.degradeUntil = time.Time{}
-	e.probeUntil = time.Time{}
-	e.fails = 0
-	e.retryCount = 0
-	e.breakerUntil = time.Time{}
+
+	entry2.disabled = false
+	entry2.paused = false // 解冻是全清：暂停选号一并解除
+	entry2.until = time.Time{}
+	entry2.coolKind = 0
+	entry2.reason = ""
+	entry2.softStreak = 0
+	entry2.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
+	entry2.sessionDeadFails = 0
+	entry2.consecutiveFails = 0 // 连败降权计数/截止一并清，否则「解冻」后仍可能被降权期挡住
+	entry2.degradeUntil = time.Time{}
+	entry2.probeUntil = time.Time{}
+	entry2.fails = 0
+	entry2.retryCount = 0
+	entry2.breakerUntil = time.Time{}
+
 	p.dirty.Store(true)
+
 	return true
 }
 
@@ -108,11 +121,14 @@ func (p *Pool) Revive(uid string) bool {
 func (p *Pool) Pause(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	e, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
+
 	p.pauseLocked(e)
+
 	return true
 }
 
@@ -120,11 +136,14 @@ func (p *Pool) Pause(uid string) bool {
 func (p *Pool) Resume(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	e, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
+
 	p.resumeLocked(e)
+
 	return true
 }
 
@@ -137,18 +156,20 @@ func (p *Pool) Resume(uid string) bool {
 func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain, total)
+
+	if entry2, ok := p.byUID[uid]; ok {
+		if remain > 0 && !entry2.disabled {
+			p.reviveCoolingLocked(entry2, remain, total)
 		} else {
-			e.credits = remain
-			e.creditsTotal = total
+			entry2.credits = remain
+			entry2.creditsTotal = total
 		}
 		// ReenableIfCredits 只有聚合余额上下文；到期明细必须由 SetCreditsDetailed
 		// 重新写入，不能沿用旧窗口/旧批次的缓存。
-		e.creditsExpiring = 0
-		e.creditsEarliestExpiry = time.Time{}
-		e.creditsEarliestRemaining = 0
+		entry2.creditsExpiring = 0
+		entry2.creditsEarliestExpiry = time.Time{}
+		entry2.creditsEarliestRemaining = 0
+
 		p.dirty.Store(true)
 	}
 }
@@ -158,6 +179,7 @@ func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 func (p *Pool) NoteError(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if e, ok := p.byUID[uid]; ok {
 		e.errTotal++
 		e.lastErr = p.now()
@@ -178,17 +200,19 @@ func (p *Pool) NoteError(uid string) {
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.successCount++
-		e.lastSuccess = p.now()
-		e.fails = 0
-		e.retryCount = 0
-		e.breakerUntil = time.Time{}
-		e.softStreak = 0
-		e.sessionDeadFails = 0
-		e.consecutiveFails = 0
-		e.degradeUntil = time.Time{}
-		e.probeUntil = time.Time{}
+
+	if entry2, ok := p.byUID[uid]; ok {
+		entry2.successCount++
+		entry2.lastSuccess = p.now()
+		entry2.fails = 0
+		entry2.retryCount = 0
+		entry2.breakerUntil = time.Time{}
+		entry2.softStreak = 0
+		entry2.sessionDeadFails = 0
+		entry2.consecutiveFails = 0
+		entry2.degradeUntil = time.Time{}
+		entry2.probeUntil = time.Time{}
+
 		p.dirty.Store(true)
 	}
 }
@@ -220,40 +244,43 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	if per1k < 0 {
 		per1k = 0
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return
 	}
+
 	if credit > 0 {
-		d := int64(credit + 0.5) // 四舍五入
-		if d > e.credits {
-			d = e.credits // 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额
-		}
-		e.deductCredit(d)
+		// 钳 0：扣穿（对账延迟/消费早于记账）不产生负余额。
+		d := min(int64(credit+0.5), entry2.credits) // 四舍五入
+		entry2.deductCredit(d)
 	}
-	e.observeModelCost(p.now(), uid, model, per1k)
+
+	entry2.observeModelCost(p.now(), uid, model, per1k)
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
 }
 
 // deductCredit 从账号余额扣减 d（已四舍五入并钳到不超过 credits），并同步扣减
 // 快过期/最早到期批次。各批次钳 0，不产生负值。
-func (e *entry) deductCredit(d int64) {
-	e.credits -= d
+func (e *entry) deductCredit(num int64) {
+	e.credits -= num
 	if e.creditsExpiring > 0 {
-		if d > e.creditsExpiring {
+		if num > e.creditsExpiring {
 			e.creditsExpiring = 0
 		} else {
-			e.creditsExpiring -= d
+			e.creditsExpiring -= num
 		}
 	}
+
 	if e.creditsEarliestRemaining > 0 {
-		if d >= e.creditsEarliestRemaining {
+		if num >= e.creditsEarliestRemaining {
 			e.creditsEarliestRemaining = 0
 			e.creditsEarliestExpiry = time.Time{}
 		} else {
-			e.creditsEarliestRemaining -= d
+			e.creditsEarliestRemaining -= num
 		}
 	}
 }
@@ -264,7 +291,9 @@ func (e *entry) observeModelCost(now time.Time, uid, model string, per1k float64
 	if e.modelCost == nil {
 		e.modelCost = make(map[string]modelCostEntry)
 	}
+
 	const alpha = 0.3
+
 	prev, seen := e.modelCost[model]
 	if !seen {
 		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: now, Samples: 1}
@@ -275,6 +304,7 @@ func (e *entry) observeModelCost(now time.Time, uid, model string, per1k float64
 	if prev.CostPer1k <= 0 && per1k > 0 {
 		log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
 	}
+
 	e.modelCost[model] = modelCostEntry{
 		CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
 		LastSeen:  now,
@@ -284,13 +314,15 @@ func (e *entry) observeModelCost(now time.Time, uid, model string, per1k float64
 
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
 // usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
-func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
+func (p *Pool) RecordTokenUsage(uid string, delta *TokenUsageDelta) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	e, ok := p.byUID[uid]
 	if !ok {
 		return
 	}
+
 	e.tokenUsage.applyDelta(p.now(), delta)
 	p.dirty.Store(true)
 }
@@ -298,19 +330,24 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 // applyDelta 把一次聊天尝试的 usage 增量并入累计摘要：请求次数与最近使用时刻总是累计，
 // 仅明确存在（Has*）且非负的 token 字段参与累加；有任一 token 字段命中即计一次
 // UsageCount。缺 completion_tokens 时清空上次吞吐速度，避免展示陈旧值。
-func (u *TokenUsage) applyDelta(now time.Time, delta TokenUsageDelta) {
+func (u *TokenUsage) applyDelta(now time.Time, delta *TokenUsageDelta) {
 	u.RequestCount++
+
 	u.LastUsedAt = now
 	if delta.Model != "" {
 		u.LastModel = delta.Model
 	}
+
 	known := addToken(&u.PromptTokens, delta.HasPromptTokens, delta.PromptTokens)
 	known = addToken(&u.CompletionTokens, delta.HasCompletionTokens, delta.CompletionTokens) || known
+
 	known = addToken(&u.TotalTokens, delta.HasTotalTokens, delta.TotalTokens) || known
 	if known {
 		u.UsageCount++
 	}
+
 	u.setLatestLatency(delta)
+
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
 		speed := delta.TokensPerSecond
 		u.LastTokensPerSecond = &speed
@@ -322,10 +359,11 @@ func (u *TokenUsage) applyDelta(now time.Time, delta TokenUsageDelta) {
 
 // setLatestLatency 更新最近一次延迟观测：端到端延迟与首字节延迟（TTFT）分别记录，
 // 仅在字段明确存在且非负时覆盖（缺观测保留旧值）。TTFT 仅流式有观测。
-func (u *TokenUsage) setLatestLatency(delta TokenUsageDelta) {
+func (u *TokenUsage) setLatestLatency(delta *TokenUsageDelta) {
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
 		u.LastLatencyMs = delta.LatencyMs
 	}
+
 	if delta.HasTTFTMs && delta.TTFTMs >= 0 {
 		u.LastTTFTMs = delta.TTFTMs
 	}
@@ -336,7 +374,9 @@ func addToken(dst *int64, has bool, v int64) bool {
 	if !has || v < 0 {
 		return false
 	}
+
 	*dst += v
+
 	return true
 }
 
@@ -344,10 +384,12 @@ func addToken(dst *int64, has bool, v int64) bool {
 func (p *Pool) Status(uid string) (Status, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	e, ok := p.byUID[uid]
 	if !ok {
 		return Status{}, false
 	}
+
 	return p.statusOf(uid, e), true
 }
 
@@ -355,9 +397,11 @@ func (p *Pool) Status(uid string) (Status, bool) {
 func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	if e, ok := p.byUID[uid]; ok {
 		return e.a
 	}
+
 	return nil
 }
 
@@ -366,18 +410,24 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 func (p *Pool) AvailableUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
+
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthy(now) {
 			continue
 		}
+
 		if p.inFlightFull(e) {
 			continue
 		}
+
 		uids = append(uids, uid)
 	}
+
 	sort.Strings(uids)
+
 	return uids
 }
 
@@ -387,18 +437,24 @@ func (p *Pool) AvailableUIDs() []string {
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
+
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if !e.healthyForModel(now, model) {
 			continue
 		}
+
 		if p.inFlightFull(e) {
 			continue
 		}
+
 		uids = append(uids, uid)
 	}
+
 	sort.Strings(uids)
+
 	return uids
 }
 
@@ -424,15 +480,18 @@ const (
 func (p *Pool) PickByUIDForModel(uid, model, realm string) (*auth.Auth, StickyPick) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return nil, StickyUnavailable
 	}
+
 	now := p.now()
 	if p.routeCoolingLocked(realm, model, now) {
 		return nil, StickyUnavailable
 	}
-	if !e.healthyForModel(now, model) {
+
+	if !entry2.healthyForModel(now, model) {
 		return nil, StickyUnavailable
 	}
 	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
@@ -441,23 +500,29 @@ func (p *Pool) PickByUIDForModel(uid, model, realm string) (*auth.Auth, StickyPi
 	// 后下次会话重新绑定。
 	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
 	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
-	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
+	if p.floorBlockedForRealmModel(entry2, model, entry2.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
-			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+			logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()), model, entry2.credits, p.creditFloor)
+
 		return nil, StickyUnavailable
 	}
-	if p.dailyBlocked(e, model, e.a.Realm(), now) {
+
+	if p.dailyBlocked(entry2, model, entry2.a.Realm(), now) {
 		log.Printf("WARN: [pool] daily limit: sticky acct=%s model=%s, unbind",
-			logfmt.Label(e.a.UID, e.a.Nickname), model)
+			logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()), model)
+
 		return nil, StickyUnavailable
 	}
-	if p.stickyEscapedLocked(e, model, now) {
+
+	if p.stickyEscapedLocked(entry2, model, now) {
 		return nil, StickyEscaped
 	}
-	e.lastUsed = now
+
+	entry2.lastUsed = now
 	p.pickSeq++
-	e.usedSeq = p.pickSeq
-	return e.a, StickyPicked
+	entry2.usedSeq = p.pickSeq
+
+	return entry2.a, StickyPicked
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
@@ -465,21 +530,26 @@ func (p *Pool) PickByUIDForModel(uid, model, realm string) (*auth.Auth, StickyPi
 func (p *Pool) PickByUID(uid string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return nil
 	}
+
 	now := p.now()
-	if !e.healthy(now) {
+	if !entry2.healthy(now) {
 		return nil
 	}
-	if p.inFlightFull(e) {
+
+	if p.inFlightFull(entry2) {
 		return nil
 	}
-	e.lastUsed = now
+
+	entry2.lastUsed = now
 	p.pickSeq++
-	e.usedSeq = p.pickSeq
-	return e.a
+	entry2.usedSeq = p.pickSeq
+
+	return entry2.a
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。
@@ -520,28 +590,33 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
-	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+	for _, item := range p.byUID {
+		if realm != "" && item.a.Realm() != realm {
 			continue
 		}
+
 		total++
+
 		switch {
-		case e.disabled:
+		case item.disabled:
 			disabled++
-		case e.paused:
+		case item.paused:
 			// 暂停选号：退出选号候选，但照常签到 / 活跃上报 / 保活 / 刷新余额。
 			// 它与「禁用」是两种运维状态，这里分开计；要不要合并由调用方决定。
 			paused++
-		case !e.healthy(now):
+		case !item.healthy(now):
 			cooling++
 		default:
 			healthy++
-			if p.inFlightFull(e) {
+
+			if p.inFlightFull(item) {
 				inFlightFull++
 			}
 		}
 	}
+
 	return total, healthy, cooling, disabled, paused, inFlightFull
 }
 
@@ -559,21 +634,24 @@ func (p *Pool) ServableNow() bool {
 func (p *Pool) ServableForRealm(realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
-	for _, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+	for _, item := range p.byUID {
+		if realm != "" && item.a.Realm() != realm {
 			continue
 		}
-		if p.inFlightFull(e) {
+
+		if p.inFlightFull(item) {
 			continue
 		}
 		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
 		// 对触发模型不可用，对其他模型仍可选）。探活无请求模型上下文，取"存在可服务
 		// 模型"与 chat 实际可达性等价（issue #31 探活侧补齐）。
-		if e.healthy(now) || e.modelExempt() {
+		if item.healthy(now) || item.modelExempt() {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -581,108 +659,122 @@ func (p *Pool) ServableForRealm(realm string) bool {
 func (p *Pool) List() []Status {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	uids := make([]string, 0, len(p.byUID))
 	for uid := range p.byUID {
 		uids = append(uids, uid)
 	}
+
 	sort.Strings(uids)
+
 	out := make([]Status, 0, len(uids))
 	for _, uid := range uids {
 		out = append(out, p.statusOf(uid, p.byUID[uid]))
 	}
+
 	return out
 }
 
-func (p *Pool) statusOf(uid string, e *entry) Status {
+func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 	now := p.now()
-	st := Status{
+
+	status := Status{
 		UID: uid,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
 		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
 		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
-		RateLimitedModels:        p.rateLimitedModelsLocked(e, now),
-		Realm:                    e.a.Realm(),
-		ProxySlot:                e.proxySlot,
-		Enterprise:               e.a.IsEnterprise(),
-		Nickname:                 e.a.Nickname,
-		Credits:                  e.credits,
-		CreditsTotal:             e.creditsTotal,
-		CreditsExpiring:          e.creditsExpiring,
-		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
-		CreditsEarliestRemaining: e.creditsEarliestRemaining,
-		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
-		Reason:                   e.reason,
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:         e.consecutiveFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
+		RateLimitedModels:        p.rateLimitedModelsLocked(entry2, now),
+		Realm:                    entry2.a.Realm(),
+		ProxySlot:                entry2.proxySlot,
+		Enterprise:               entry2.a.IsEnterprise(),
+		Nickname:                 entry2.a.NicknameValue(),
+		Credits:                  entry2.credits,
+		CreditsTotal:             entry2.creditsTotal,
+		CreditsExpiring:          entry2.creditsExpiring,
+		CreditsEarliestExpiry:    entry2.creditsEarliestExpiry,
+		CreditsEarliestRemaining: entry2.creditsEarliestRemaining,
+		Cooling:                  now.Before(entry2.until) || now.Before(entry2.breakerUntil),
+		Reason:                   entry2.reason,
+		Disabled:                 entry2.disabled,
+		Paused:                   entry2.paused,
+		SuccessCount:             entry2.successCount,
+		ErrTotal:                 entry2.errTotal,
+		CheckinDone:              entry2.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:               entry2.tokenUsage,
+		LastSuccessTime:          entry2.lastSuccess,
+		LastErrTime:              entry2.lastErr,
+		Until:                    entry2.until,
+		SoftStreak:               entry2.softStreak,
+		ModelCosts:               p.modelCostsStatusLocked(entry2, now),
+		ConsecutiveFails:         entry2.consecutiveFails,
+		DegradeUntil:             entry2.degradeUntil,
+		InFlight:                 int(entry2.inFlight.Load()),
+		BreakerFails:             entry2.fails,
+		BreakerUntil:             entry2.breakerUntil,
 	}
-	if st.Disabled {
+	if status.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
-		st.DisabledReason = e.reason
+		status.DisabledReason = entry2.reason
 	}
-	if st.Cooling {
-		fillCoolingStatus(&st, e, now)
+
+	if status.Cooling {
+		fillCoolingStatus(&status, entry2, now)
 	}
-	return st
+
+	return status
 }
 
 // fillCoolingStatus 填充冷却剩余秒数（向上取整，避免 0 显示为已到期）与冷却类型。
 // 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，取仍在未来且更晚
 // 截止的那个，避免仅熔断期时误报 0 / unknown。
-func fillCoolingStatus(st *Status, e *entry, now time.Time) {
+func fillCoolingStatus(status *Status, entry2 *entry, now time.Time) {
 	var remaining int64
-	if now.Before(e.until) {
-		if r := int64(time.Until(e.until).Seconds() + 0.999); r > remaining {
+	if now.Before(entry2.until) {
+		if r := int64(time.Until(entry2.until).Seconds() + 0.999); r > remaining {
 			remaining = r
 		}
 	}
-	if now.Before(e.breakerUntil) {
-		if r := int64(time.Until(e.breakerUntil).Seconds() + 0.999); r > remaining {
+
+	if now.Before(entry2.breakerUntil) {
+		if r := int64(time.Until(entry2.breakerUntil).Seconds() + 0.999); r > remaining {
 			remaining = r
-			st.CoolKind = "breaker"
+			status.CoolKind = "breaker"
 		}
 	}
-	st.CoolRemaining = remaining
-	if st.CoolKind == "" {
-		st.CoolKind = e.coolKind.String()
+
+	status.CoolRemaining = remaining
+	if status.CoolKind == "" {
+		status.CoolKind = entry2.coolKind.String()
 	}
 }
 
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。
 // 仅 modelCostTTL 内的观测进台账（过期/零值跳过，与选号读取侧同口径）；
 // 模型名稳定排序。调用方必须已持有锁。
-func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus {
-	if len(e.modelCost) == 0 {
+func (p *Pool) modelCostsStatusLocked(entry3 *entry, now time.Time) []ModelCostStatus {
+	if len(entry3.modelCost) == 0 {
 		return nil
 	}
-	models := make([]string, 0, len(e.modelCost))
-	for m, mc := range e.modelCost {
+
+	models := make([]string, 0, len(entry3.modelCost))
+	for m, mc := range entry3.modelCost {
 		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
 			continue // 过期/零值：不进台账（与选号读取侧同口径）
 		}
+
 		models = append(models, m)
 	}
+
 	if len(models) == 0 {
 		return nil
 	}
+
 	sort.Strings(models)
+
 	rows := make([]ModelCostStatus, 0, len(models))
 	for _, m := range models {
-		mc := e.modelCost[m]
+		mc := entry3.modelCost[m]
 		rows = append(rows, ModelCostStatus{
 			Model:     m,
 			CostPer1k: mc.CostPer1k,
@@ -690,6 +782,7 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 			Samples:   mc.Samples,
 		})
 	}
+
 	return rows
 }
 
@@ -700,39 +793,46 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 // rateLimitedModelsLocked 收集账号当前仍在限额的模型台账行（issue #36）。
 // modelCooldowns 未到期条目按模型名稳定排序输出；全部到期/空表返回 nil。
 // 调用方必须已持有锁（statusOf 只读路径持 RLock，本函数只读不写）。
-func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
-	if len(e.modelCooldowns) == 0 {
+func (p *Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimitedModel {
+	if len(entry4.modelCooldowns) == 0 {
 		return nil
 	}
 	// 先排序模型名，保证输出稳定（map 遍历无序）。
-	models := make([]string, 0, len(e.modelCooldowns))
-	for m := range e.modelCooldowns {
+	models := make([]string, 0, len(entry4.modelCooldowns))
+	for m := range entry4.modelCooldowns {
 		models = append(models, m)
 	}
+
 	sort.Strings(models)
+
 	rows := make([]RateLimitedModel, 0, len(models))
 	for _, m := range models {
-		mc := e.modelCooldowns[m]
-		if !mc.Until.IsZero() && now.Before(mc.Until) {
+		modelCooldown2 := entry4.modelCooldowns[m]
+		if !modelCooldown2.Until.IsZero() && now.Before(modelCooldown2.Until) {
 			kind := "rate_limit"
-			if strings.HasPrefix(mc.Reason, "11102") {
+			if strings.HasPrefix(modelCooldown2.Reason, "11102") {
 				kind = "model_unavailable"
 			}
+
 			row := RateLimitedModel{
-				Model:  m,
-				Kind:   kind,
-				Until:  mc.Until,
-				Reason: mc.Reason,
+				Model:   m,
+				Kind:    kind,
+				Until:   modelCooldown2.Until,
+				Reason:  modelCooldown2.Reason,
+				ResetAt: time.Time{},
 			}
 			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
-				row.ResetAt = mc.ResetAt
+			if !modelCooldown2.ResetAt.IsZero() && !modelCooldown2.ResetAt.Equal(modelCooldown2.Until) {
+				row.ResetAt = modelCooldown2.ResetAt
 			}
+
 			rows = append(rows, row)
 		}
 	}
+
 	if len(rows) == 0 {
 		return nil
 	}
+
 	return rows
 }
