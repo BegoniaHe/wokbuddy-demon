@@ -86,9 +86,16 @@ type Pool struct {
 	// nowFn 仅供测试注入确定性时钟（退避 / EWMA / 冷却计算的时间来源）；
 	// nil 时用系统时钟 time.Now（生产默认）。见 SetClock 与 p.now。
 	nowFn func() time.Time
-	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
+	// persistFails 本地 state.json 连续落盘失败计数（由 persistMu 保护）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
+	// persistMu 串行化锁外落盘（marshal / 写 tmp / rename / Redis 镜像）。
+	// p.mu 只负责生成一致快照，磁盘 IO 不再占用选号写锁。
+	persistMu sync.Mutex
+	// persistSeq/savedSeq 快照序号：persistSeq 在 p.mu 写锁内自增，savedSeq 在
+	// persistMu 内更新。并发落盘时旧快照不得覆盖已落盘的新快照。
+	persistSeq uint64
+	savedSeq   uint64
 	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
 	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
@@ -614,14 +621,20 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 		}
 	}
 
+	var seq uint64
+	var sf stateFile
 	if changed {
-		p.saveLocked()
+		seq, sf = p.snapshotStateLocked()
 	}
 
 	p.mu.Unlock()
 
 	for _, old := range replaced {
 		old.Retire()
+	}
+
+	if changed {
+		p.persistState(seq, sf)
 	}
 }
 
@@ -630,10 +643,11 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
 func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	entry2, ok := p.byUID[uid]
 	if !ok {
+		p.mu.Unlock()
+
 		return nil
 	}
 
@@ -643,8 +657,10 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 		p.inFlightTotal.Add(-n)
 	}
 
-	p.dirty.Store(true)
-	p.saveLocked()
+	seq, sf := p.snapshotStateLocked()
+	p.mu.Unlock()
+
+	p.persistState(seq, sf)
 
 	return entry2.a
 }

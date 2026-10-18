@@ -3,6 +3,8 @@ package pool
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -46,5 +48,40 @@ func TestPersistFailureKeepsDirty(t *testing.T) {
 
 	if _, err := os.Stat(pool.stateFp); err != nil {
 		t.Fatalf("重试后应生成 state.json: %v", err)
+	}
+}
+
+// TestConcurrentPersistKeepsNewestSnapshot（E3）：并发 Flush 时快照序号必须
+// 保证后生成的状态覆盖先生成的，旧快照不得回写；最终落盘是最后一次写入。
+func TestConcurrentPersistKeepsNewestSnapshot(t *testing.T) {
+	t.Parallel()
+
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := newTestPool(t, fp)
+	p.Add(&auth.Auth{UID: "u1"})
+
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			p.SetCredits("u1", int64(i+1), 0)
+			p.Flush()
+		}()
+	}
+	wg.Wait()
+
+	p.SetCredits("u1", 999, 0)
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(raw), `"credits": 999`) {
+		t.Fatalf("newest snapshot not persisted: %s", raw)
 	}
 }
