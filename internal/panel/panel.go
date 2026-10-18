@@ -199,6 +199,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	p.mux.HandleFunc("GET /panel/api/import/desktop/scan", p.withAuth(p.desktopScan))
+	p.mux.HandleFunc("POST /panel/api/import/desktop", p.withAuth(p.desktopImport))
 	p.mux.HandleFunc("POST /panel/api/export/encrypted", p.withAuth(p.exportEncrypted))
 	p.mux.HandleFunc("POST /panel/api/import/encrypted", p.withAuth(p.importEncrypted))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))

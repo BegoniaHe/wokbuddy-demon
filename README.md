@@ -128,6 +128,8 @@ http://127.0.0.1:7863/panel/
 
 「添加账号」对话框的「加密备份」页支持**加密导出 / 导入账号**：AES-256-GCM 加密、PBKDF2 派生密钥、每次导出随机 salt，密码不写入文件（无法找回），用于跨机迁移而不落明文凭证。
 
+「本机客户端」页可**只读扫描**已登录官方客户端的凭据目录（macOS `~/Library/Application Support/WorkBuddy{ AI}/Data/Public/auth/*.info`、Windows `%LOCALAPPDATA%\WorkBuddy{ AI}\...`、Linux `~/.local/share/WorkBuddy{ AI}/...`，以及 `~/.workbuddy`）。客户端加密字段为 `$wbEncrypted`（AES-256-GCM，字段级 AAD）；需在面板输入客户端的 at-rest secret（32 字节 base64），密钥仅在本次导入的内存中使用，不落盘、不写日志，响应只返回账号元数据。拿不到密钥时请改用浏览器登录。
+
 ### 多模态能力
 
 `/v1/models` 对已知能力的模型输出 `input_modalities`（`text` / `image` / `audio` / `file`），并保留 `supports_images` 兼容字段。能力来源优先级：上游模型对象字段 → `models.dev` 缓存 → `supports_images` 推导；三级都没有时视为未知，不宣称也不拦截。
