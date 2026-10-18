@@ -270,6 +270,9 @@ func main() {
 		SaveConfig: func(raw []byte) ([]string, error) {
 			return saveConfig(raw, *cfgPath, live, p, up, sch)
 		},
+		RestoreConfig: func() ([]string, error) {
+			return restoreConfig(*cfgPath, live, p, up, sch)
+		},
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
@@ -330,12 +333,20 @@ func serve(ctx context.Context, cfg *Config, h *server.Handler, p *pool.Pool, up
 	go func() {
 		defer close(shutdownDone)
 		<-ctx.Done()
+		// 两阶段停机（issue #147）：先把 /healthz 置 503 让反代/LB 摘流，
+		// 宽限期内 listener 仍受理请求；之后再 Shutdown 等待在途 SSE 排空。
+		h.BeginShutdown()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		// 优雅停机（issue #19）：等待在途 SSE 长流排空，最多 ShutdownStreamGrace；
+		if grace := time.Duration(cfg.Server.RequestAcceptGraceSeconds) * time.Second; grace > 0 {
+			log.Printf("Draining: /healthz -> 503, keeping listener open for %s before shutdown", grace)
+			time.Sleep(grace)
+		}
+		// 优雅停机（issue #19）：等待在途 SSE 长流排空，最多 shutdown_grace_seconds；
 		// 超时则记录未排空流数后由进程退出强制结束，不静默丢弃。
 		// 注意：Shutdown 关闭 listener 后 ListenAndServe 会立即返回 ErrServerClosed，
 		// 但排空等待仍在进行，main 必须等 shutdownDone 再退出，否则在途长流被直接丢弃。
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), server.ShutdownStreamGrace)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx),
+			time.Duration(cfg.Server.ShutdownGraceSeconds)*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 		if n := h.ActiveStreams(); n > 0 {
@@ -419,6 +430,7 @@ func setupSessionRouter(cfg *Config, store redisstore.Store, p *pool.Pool) (*ses
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
 			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
 			AvailableForModel: realmAwareAvailableForModel(p),
+			LowLoad:           realmAwareStickyLowLoad(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -567,35 +579,44 @@ func panelListenPath(listen string) string {
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
-	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
+	return saveConfigInternal(raw, path, live, p, up, sch, true, true)
+}
+
+// restoreConfig 用 config.json.1 覆盖当前配置。恢复是整体替换（不 merge 当前文件），
+// 否则被改坏的未知键会继续残留；同时不再滚动备份，保留同一份 .1 供重复恢复。
+func restoreConfig(path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+	raw, err := os.ReadFile(configBackupPath(path))
+	if err != nil {
+		return nil, fmt.Errorf("read config backup: %w", err)
+	}
+	return saveConfigInternal(raw, path, live, p, up, sch, false, false)
+}
+
+// saveConfigInternal 是保存/恢复的共同管线：校验 → 备份（可选）→ 原子落盘 → 热应用。
+// merge=true 时把提交键深合并进当前文件（面板表单只提交它管理的键）；false 时整体替换。
+func saveConfigInternal(
+	raw []byte, path string, live *livecfg.Holder, p *pool.Pool,
+	up *upstream.Client, sch *scheduler.Scheduler, merge, makeBackup bool,
+) ([]string, error) {
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read current config: %w", err)
 	}
-	var cur, incoming map[string]any
-	if err := json.Unmarshal(oldRaw, &cur); err != nil {
-		cur = map[string]any{}
-	}
-	if err := json.Unmarshal(raw, &incoming); err != nil {
-		return nil, fmt.Errorf("parse submitted config: %w", err)
-	}
-	// 旧配置用于判断本次真正变化的字段；文件损坏时回落默认，最多多报重启项。
-	oldCfg, oldErr := parseConfigWithEnv(oldRaw)
-	if oldErr != nil {
-		oldCfg = Default()
-	}
-	merged := mergeConfigMaps(cur, incoming)
-
-	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
-	newCfg, err := parseConfigWithEnv(mergedJSON(merged))
+	merged, oldCfg, newCfg, err := prepareConfigMerge(oldRaw, raw, merge)
 	if err != nil {
 		return nil, err
 	}
-
-	// 3) 落盘（原子替换）。
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+
+	// 落盘前留一代旧配置（issue #147）。只在校验与序列化成功后备份，避免把无效
+	// 提交当作「上一版」；恢复路径跳过备份，保留原 .1。
+	if makeBackup {
+		if err := backupConfigFile(path, oldRaw); err != nil {
+			return nil, err
+		}
 	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
@@ -605,7 +626,38 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		return nil, err
 	}
 
-	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	applyRuntimeConfig(newCfg, live, p, up, sch)
+	return restartRequiredFields(oldCfg, newCfg), nil
+}
+
+// prepareConfigMerge 解析旧配置与提交内容，产出待落盘 map、旧配置与新配置。
+// 旧配置用于重启字段 diff；文件损坏时回落默认，最多多报重启项。
+func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config, *Config, error) {
+	var incoming map[string]any
+	if err := json.Unmarshal(raw, &incoming); err != nil {
+		return nil, nil, nil, fmt.Errorf("parse submitted config: %w", err)
+	}
+	oldCfg, oldErr := parseConfigWithEnv(oldRaw)
+	if oldErr != nil {
+		oldCfg = Default()
+	}
+	merged := incoming
+	if merge {
+		var cur map[string]any
+		if err := json.Unmarshal(oldRaw, &cur); err != nil {
+			cur = map[string]any{}
+		}
+		merged = mergeConfigMaps(cur, incoming)
+	}
+	newCfg, err := parseConfigWithEnv(mergedJSON(merged))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return merged, oldCfg, newCfg, nil
+}
+
+// applyRuntimeConfig 应用可热生效字段（池参数 / 排程 / 密钥 / 脱敏）。
+func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) {
 	live.Store(livecfg.Snapshot{
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
@@ -641,8 +693,23 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
+}
 
-	return restartRequiredFields(oldCfg, newCfg), nil
+// configBackupPath 单代配置备份路径（只留上一版，KISS）。
+func configBackupPath(path string) string { return path + ".1" }
+
+// backupConfigFile 把旧配置写入 config.json.1（0600，含 api_key，不得进版本库）。
+func backupConfigFile(path string, raw []byte) error {
+	backup := configBackupPath(path)
+	tmp := backup + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("write config backup: %w", err)
+	}
+	if err := atomicwrite.Rename(tmp, backup); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace config backup: %w", err)
+	}
+	return nil
 }
 
 // replaceConfigFile 用 tmp 原子替换 path；单文件 Docker bind mount 无法被 rename
@@ -692,6 +759,7 @@ func writeConfigInPlace(tmp, path string, out []byte) error {
 var restartFieldPaths = []string{
 	"listen", "auth_dir", "state_file",
 	"server.read_timeout", "server.max_body_bytes",
+	"server.request_accept_grace_seconds", "server.shutdown_grace_seconds",
 	// HTTP client / 出站身份 / 代理在 configureUpstream 一次性注入。
 	"upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds",
 	"upstream.keepalive_interval", "upstream.model_timeouts", "upstream.user_agent",

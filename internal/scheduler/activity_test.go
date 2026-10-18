@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -579,14 +580,16 @@ func TestRunActivityNowGlobalErrorDoesNotSkipCN(t *testing.T) {
 	}
 }
 
-// TestCheckinStillSkipsGlobal 回归护栏：本次只放开活跃上报，签到仍跳过 global
-// （上游 a190252 明确「checkin/travel 门控不动」）。误删该 gate 会让国际版去打
-// CN 专属签到端点。
-func TestCheckinStillSkipsGlobal(t *testing.T) {
+// TestCheckinGlobalUsesDailyReward 国际版账号也必须执行 daily-checkin：
+// 官方国际版客户端使用 `/billing/meter/daily-checkin`（无 /v2 前缀优先），
+// 此前 D4 门控导致每日活跃奖励永远不闭环（issue #97）。
+func TestCheckinGlobalUsesDailyReward(t *testing.T) {
 	withGlobalSwitch(t)
-	var hits atomic.Int32
+	var checkinHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits.Add(1)
+		if strings.HasSuffix(r.URL.Path, "/billing/meter/daily-checkin") {
+			checkinHits.Add(1)
+		}
 		w.Write([]byte(`{"code":0,"data":{}}`))
 	}))
 	defer srv.Close()
@@ -605,7 +608,10 @@ func TestCheckinStillSkipsGlobal(t *testing.T) {
 
 	s.RunCheckinNow()
 
-	if n := hits.Load(); n != 0 {
-		t.Errorf("checkin global 上游调用=%d want 0（签到仍应跳过 global）", n)
+	if n := checkinHits.Load(); n != 1 {
+		t.Errorf("global daily-checkin hits=%d want 1（国际版每日奖励必须打卡）", n)
+	}
+	if st, _ := p.Status("g1"); !st.CheckinDone {
+		t.Error("global 账号签到成功后应标记 CheckinDone")
 	}
 }

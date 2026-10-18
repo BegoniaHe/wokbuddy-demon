@@ -12,11 +12,13 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -142,6 +144,9 @@ type Handler struct {
 	streams *streamTracker
 	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
 	authLimiter *httpauth.Limiter
+	// shuttingDown 停机第一阶段置位（issue #147）：/healthz 立即 503，
+	// 让反代/LB 摘流；listener 仍继续受理宽限期内的请求。
+	shuttingDown atomic.Bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -207,26 +212,39 @@ func NewHandler(cfg Config) *Handler {
 	}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
-	h.mux.HandleFunc("POST /v1/responses", h.withClientAuth(h.responsesHandler))
-	h.mux.HandleFunc("POST /v1/messages", h.withClientAuth(h.anthropicMessagesHandler))
-	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withClientAuth(h.anthropicCountTokensHandler))
-	h.mux.HandleFunc("GET /v1/models", h.withClientAuth(h.models))
-	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
-	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// withRecovery 必须包在最外层：内层 withClientAuth 的命名密钥 release 依赖
+	// defer 正常执行，recover 放在鉴权之内会让 panic 跳过租约释放（issue #146）。
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
+	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
+	h.mux.HandleFunc("POST /v1/messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withRecovery(h.withClientAuth(h.anthropicCountTokensHandler)))
+	h.mux.HandleFunc("GET /v1/models", h.withRecovery(h.withClientAuth(h.models)))
+	h.mux.HandleFunc("GET /status", h.withRecovery(h.withAuth(h.status)))
+	h.mux.HandleFunc("GET /healthz", h.withRecovery(h.healthz))
 	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
-	h.mux.HandleFunc("GET /metrics", h.withAuth(h.metricsHandler))
+	h.mux.HandleFunc("GET /metrics", h.withRecovery(h.withAuth(h.metricsHandler)))
+	// 运行时 profiling（issue #146）：与 /metrics 同口径走 withAuth，避免 goroutine
+	// 栈与调用细节在公网裸奔。pprof.Index 自行按路径分发 allocs/goroutine 等子 profile。
+	h.mux.HandleFunc("/debug/pprof/", h.withRecovery(h.withAuth(pprof.Index)))
+	h.mux.HandleFunc("/debug/pprof/cmdline", h.withRecovery(h.withAuth(pprof.Cmdline)))
+	h.mux.HandleFunc("/debug/pprof/profile", h.withRecovery(h.withAuth(pprof.Profile)))
+	h.mux.HandleFunc("/debug/pprof/symbol", h.withRecovery(h.withAuth(pprof.Symbol)))
+	h.mux.HandleFunc("/debug/pprof/trace", h.withRecovery(h.withAuth(pprof.Trace)))
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
 	// 未注册路径兜底（Issue #12）：返回 OpenAI 风格 JSON 错误体，而非 ServeMux 裸 404。
 	// 注册在最具体的路由之后；ServeMux 优先精确/更长前缀，故不会遮蔽上面的端点。
-	h.mux.HandleFunc("/", h.notFound)
+	h.mux.HandleFunc("/", h.withRecovery(h.notFound))
 	return h
 }
 
 // ActiveStreams 返回当前在途 SSE 流数（供优雅关闭记录未排空情况，issue #19）。
 func (h *Handler) ActiveStreams() int { return h.streams.Active() }
+
+// BeginShutdown 进入停机第一阶段：/healthz 立即返回 503，但 HTTP server 尚未
+// Shutdown，宽限期内仍可受理在途请求（issue #147）。
+func (h *Handler) BeginShutdown() { h.shuttingDown.Store(true) }
 
 // notFound 未注册路径的统一出口：OpenAI 风格 404 JSON（不鉴权——未知路径无需泄露
 // 鉴权存在性，也不暴露端点清单）。协议面（OpenAI 兼容 API）只承诺
@@ -384,7 +402,8 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
 	// 否则负载均衡器会把流量持续打进无法受理的实例。
 	status := http.StatusOK
-	if !h.cfg.Pool.ServableNow() {
+	shuttingDown := h.shuttingDown.Load()
+	if shuttingDown || !h.cfg.Pool.ServableNow() {
 		status = http.StatusServiceUnavailable
 	}
 	// realm_servable 域可服务维度：不改判活语义（存在性探活保持不变），
@@ -400,6 +419,7 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		"total":          total,
 		"service":        ServiceName,
 		"realm_servable": realmServable,
+		"shutting_down":  shuttingDown,
 	})
 }
 
@@ -829,6 +849,9 @@ type chatFlow struct {
 	modelBlock      pool.ModelBlockStatus
 	degradedApplied bool
 	heldUID         string
+	// 请求级积分预扣（issue #116 P1-1）：reservedUID 非空时释放时归还。
+	reservedUID     string
+	reservedCredits float64
 	// rotateReason 本轮换号原因（供 /metrics 的 wokbuddy_upstream_rotations_total
 	// 标签）。各换号 return rotContinue 分支写入；degrade 复用同号重试、不算换号，
 	// 保持空值即跳过计数。
@@ -1038,11 +1061,21 @@ func (f *chatFlow) buildChatMeta() {
 	f.chatMeta.TraceID = f.traceID
 }
 
-// releaseHeld 释放在途租约（幂等）。
+// releaseHeld 释放在途租约与请求级预扣（幂等）。
 func (f *chatFlow) releaseHeld() {
 	if f.heldUID != "" {
 		f.h.cfg.Pool.Release(f.heldUID)
 		f.heldUID = ""
+	}
+	f.releaseReservation()
+}
+
+// releaseReservation 归还请求级预扣积分（幂等）。
+func (f *chatFlow) releaseReservation() {
+	if f.reservedUID != "" {
+		f.h.cfg.Pool.ReleaseReservation(f.reservedUID, f.reservedCredits)
+		f.reservedUID = ""
+		f.reservedCredits = 0
 	}
 }
 
@@ -1137,13 +1170,17 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		})
 		return rotBreak
 	}
+	f.tried[acct.UID] = true
+	if !f.reserveCredits(acct) {
+		return f.skipReserved(ctx, acct, i)
+	}
 	f.st.uid = acct.UID
 	// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 	f.st.nick = acct.Nickname
-	f.tried[acct.UID] = true
 
 	// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 	if !f.h.cfg.Pool.Acquire(acct.UID) {
+		f.releaseReservation()
 		// 全局名额被并发抢走：直接终止，不再换号空转。
 		if f.h.cfg.Pool.GlobalInFlightFull() {
 			f.st.status = http.StatusServiceUnavailable
@@ -1164,21 +1201,72 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 	return f.dispatch(ctx, acct, i)
 }
 
+// skipReserved 处置预扣失败：解绑粘性号（否则每次轮转都重新命中同一个号），
+// 按既有退避节奏换号。
+func (f *chatFlow) skipReserved(ctx context.Context, acct *auth.Auth, i int) rotationAction {
+	log.Printf("WARN: [server] credit reserve: acct=%s model=%s credits below floor after estimate, skip",
+		logfmt.Label(acct.UID, acct.Nickname), f.bareModel)
+	if f.stickyUID != "" && acct.UID == f.stickyUID {
+		f.unbindSticky()
+	}
+	f.rotateReason = "credit_reserve"
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+	return rotContinue
+}
+
+// reserveCredits 请求级预扣（issue #116 P1-1）：按请求体估算 prompt 与 max_tokens，
+// 在 credits 中预留估算成本；余额不足时返回 false，调用方跳过该账号。
+func (f *chatFlow) reserveCredits(acct *auth.Auth) bool {
+	amount, ok := f.h.cfg.Pool.ReserveForRequest(
+		acct.UID, f.bareModel, acct.Realm(),
+		pool.EstimatePromptTokens(f.body), maxOutputTokensFromBody(f.body),
+	)
+	if !ok {
+		return false
+	}
+	f.reservedUID = acct.UID
+	f.reservedCredits = amount
+	return true
+}
+
+// maxOutputTokensFromBody 读取客户端的输出上限；缺失/非正时回落保守默认值。
+func maxOutputTokensFromBody(body []byte) int {
+	var req struct {
+		MaxTokens           int `json:"max_tokens"`
+		MaxCompletionTokens int `json:"max_completion_tokens"`
+		MaxOutputTokens     int `json:"max_output_tokens"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return 0 // 由 pool 回落 reserveOutputTokens
+	}
+	for _, n := range []int{req.MaxTokens, req.MaxCompletionTokens, req.MaxOutputTokens} {
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// degradeSticky 软逃逸后把会话置入降级窗口，并清空本次 stickyUID。
+func (f *chatFlow) degradeSticky() {
+	uid := f.stickyUID
+	if f.h.cfg.Session != nil {
+		f.h.cfg.Session.Degrade(f.sessKey, uid, pool.StickyDegradeWindow)
+	}
+	log.Printf("INFO: [server] sticky soft escape acct=%s model=%s: degrade %s",
+		logfmt.UID8(uid), f.bareModel, pool.StickyDegradeWindow)
+	f.stickyUID = ""
+}
+
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
 	if f.stickyUID != "" {
-		acct := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel)
-		if acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
-			if f.st.decision != nil {
-				f.st.decision.StickyHit = true
-				f.st.decision.FinalUID = logfmt.UID8(acct.UID)
-			}
+		if acct, ok := f.trySticky(); ok {
 			return acct
 		}
-		// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 →
-		// 解绑，本次回落普通轮换。
-		f.unbindSticky()
 	}
 	if f.st.decision != nil {
 		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(f.tried, f.bareModel, f.realm)
@@ -1186,6 +1274,24 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 		return acct
 	}
 	return f.h.cfg.Pool.PickExcludingForRealm(f.tried, f.bareModel, f.realm)
+}
+
+// trySticky 尝试复用会话绑定号；ok=false 表示已解绑/降级，调用方回落普通轮换。
+func (f *chatFlow) trySticky() (*auth.Auth, bool) {
+	acct, picked := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
+	if picked == pool.StickyPicked && acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
+		if f.st.decision != nil {
+			f.st.decision.StickyHit = true
+			f.st.decision.FinalUID = logfmt.UID8(acct.UID)
+		}
+		return acct, true
+	}
+	if picked == pool.StickyEscaped {
+		f.degradeSticky()
+	} else {
+		f.unbindSticky()
+	}
+	return nil, false
 }
 
 // sampleDecisionTrace 按开关与采样率决定本次是否记录决策链。
@@ -1369,7 +1475,7 @@ func (f *chatFlow) handleHTTPError(
 	// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义要求原文
 	// 全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 	f.lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
-	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.bareModel, uerr)
+	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
 	f.fail(acct.UID)
 	// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：该次
 	// WAF 403 喂入 IP 级状态机，若激活（短窗多号命中）则立即终止轮转，避免把请求放大
@@ -1412,7 +1518,7 @@ func failFastKind(kind upstream.ErrKind) bool {
 //   - ErrImageInvalid：图片格式/数据无效，同一 body 换号仍是同样解析错误。
 //   - ErrBadParams（11101）：请求体解析失败，继续轮转会把确定失败伪装成"号不可用"。
 func (f *chatFlow) handleRequestLevelError(acct *auth.Auth, kind upstream.ErrKind, respBody []byte, uerr *upstream.Error) {
-	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.bareModel, uerr)
+	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
 	f.fail(acct.UID)
 	raw := string(respBody)
 	code, fallback := requestLevelErrorCode(kind)
@@ -1480,7 +1586,7 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 		// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并处置账号
 		// ——**不记成功、不清 11102 负缓存、不绑粘性**。
 		kind := upstream.FrameKind(errFrame)
-		f.h.applyErrorPolicy(acct.UID, kind, errFrame, f.bareModel, nil)
+		f.h.applyErrorPolicy(acct.UID, kind, errFrame, f.realm, f.bareModel, nil)
 		f.st.status = http.StatusServiceUnavailable
 		f.st.outcome = reqlog.OutcomeStreamError
 		log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
@@ -1521,6 +1627,7 @@ func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
 // noteSuccessAndBind 记录账号成功、清 11102 负缓存，并让会话粘性跟随最终成功号。
 func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	f.h.cfg.Pool.NoteSuccess(acct.UID)
+	f.h.cfg.Pool.NoteRouteSuccess(f.realm, f.bareModel)
 	// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 	// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 	f.h.cfg.Pool.BlockModelClear(acct.UID, f.bareModel)
@@ -1853,10 +1960,11 @@ func (f *chatFlow) modelRecovery(now time.Time) time.Time {
 		return time.Time{}
 	}
 	mb := f.h.cfg.Pool.ModelBlocked(f.bareModel)
+	route := f.h.cfg.Pool.RouteRecovery(f.realm, f.bareModel)
 	if !mb.Blocked {
-		return time.Time{}
+		return futureOrZero(route, now)
 	}
-	return futureOrZero(mb.Until, now)
+	return earlierFuture(futureOrZero(mb.Until, now), route, now)
 }
 
 // futureOrZero 仅保留晚于 now 的时刻。
@@ -2110,10 +2218,10 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 // body 仅在 ErrSoftRate/ErrAccountFault 分支用于解析重置时间/分野；model 为请求
 // 携带的模型名。uerr 是 ChatStreamContext 返回的分类信封（可携带 RetryAfter）；
 // 零值/防御路径下为 nil，冷却时长回落既有计算。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, model string, uerr *upstream.Error) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, realm, model string, uerr *upstream.Error) {
 	switch kind {
 	case upstream.ErrSoftRate:
-		h.applySoftRatePolicy(uid, body, model, uerr)
+		h.applySoftRatePolicy(uid, body, realm, model, uerr)
 	case upstream.ErrWafBlock:
 		h.applyWafPolicy(uid, uerr)
 	case upstream.ErrAccountFault:
@@ -2125,6 +2233,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		h.cfg.Pool.NoteRouteFailure(realm, model)
 	case upstream.ErrClient:
 		// 未知 4xx 喂连败计数（issue #114）：连续 N 次该形态失败 → 账号临时出池
 		// （NoteFailures 达阈降权），单次/偶发不罚（不误伤）。
@@ -2138,12 +2247,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
 
 // applySoftRatePolicy 处置 429/限流文案：优先对齐上游重置墙钟，其次 Retry-After
 // 头，最后账号级有界退避。6004 走模型级豁免，非 6004 走账号级。
-func (h *Handler) applySoftRatePolicy(uid, body, model string, uerr *upstream.Error) {
+func (h *Handler) applySoftRatePolicy(uid, body, realm, model string, uerr *upstream.Error) {
 	// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
 	// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
 	//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
 	//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
 	modelRateLimited := upstream.IsModelRateLimit(body)
+	if modelRateLimited {
+		h.cfg.Pool.NoteRouteFailure(realm, model)
+	}
 	if resetAt, ok := upstream.ParseRateReset(body); ok {
 		if modelRateLimited {
 			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")

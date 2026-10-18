@@ -14,7 +14,17 @@ import {
 } from '@/components/ui/dialog';
 
 type Phase = 'pick' | 'load' | 'ready' | 'done' | 'err';
-type Tab = 'login' | 'import' | 'secure';
+type Tab = 'login' | 'import' | 'secure' | 'desktop';
+
+type DesktopAccount = {
+  path: string;
+  uid: string;
+  nickname?: string;
+  domain?: string;
+  realm: string;
+  expires_at?: number;
+  encrypted: boolean;
+};
 
 export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (v: boolean) => void }) {
   const qc = useQueryClient();
@@ -29,6 +39,10 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   const [secPass, setSecPass] = useState('');
   const [secMsg, setSecMsg] = useState('');
   const [secErr, setSecErr] = useState('');
+  const [desktopAccounts, setDesktopAccounts] = useState<DesktopAccount[]>([]);
+  const [desktopKey, setDesktopKey] = useState('');
+  const [desktopMsg, setDesktopMsg] = useState('');
+  const [desktopErr, setDesktopErr] = useState('');
   const stateRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
 
@@ -51,6 +65,10 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
       setSecPass('');
       setSecMsg('');
       setSecErr('');
+      setDesktopAccounts([]);
+      setDesktopKey('');
+      setDesktopMsg('');
+      setDesktopErr('');
       stateRef.current = null;
       stopPoll();
     } else {
@@ -175,6 +193,39 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
     }
   };
 
+  const scanDesktop = async () => {
+    setDesktopMsg('');
+    setDesktopErr('');
+    try {
+      const r = await api<{ accounts?: DesktopAccount[] }>('import/desktop/scan');
+      setDesktopAccounts(r.accounts || []);
+      if (!(r.accounts || []).length) setDesktopMsg('未发现本机客户端凭据（确认已登录官方客户端）');
+    } catch (e) {
+      setDesktopErr('扫描失败：' + (e as Error).message);
+    }
+  };
+
+  const importDesktop = async () => {
+    setDesktopMsg('');
+    setDesktopErr('');
+    if (!desktopAccounts.length) {
+      setDesktopErr('请先扫描');
+      return;
+    }
+    try {
+      const r = await postJSON<{ imported?: number; skipped?: number; errors?: string[] }>('import/desktop', {
+        key: desktopKey.trim(),
+        paths: desktopAccounts.map((a) => a.path),
+      });
+      const errs = r.errors || [];
+      setDesktopMsg('导入完成：成功 ' + (r.imported || 0) + ' 个' + (r.skipped ? '，跳过 ' + r.skipped + ' 个' : ''));
+      if (errs.length) setDesktopErr(errs.join('；'));
+      void qc.invalidateQueries({ queryKey: ['overview'] });
+    } catch (e) {
+      setDesktopErr('导入失败：' + (e as Error).message);
+    }
+  };
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg" showCloseButton={false}>
@@ -186,6 +237,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
                 <TabsTrigger value="login">浏览器登录</TabsTrigger>
                 <TabsTrigger value="import">导入 JSON</TabsTrigger>
                 <TabsTrigger value="secure">加密备份</TabsTrigger>
+                <TabsTrigger value="desktop">本机客户端</TabsTrigger>
               </TabsList>
             </Tabs>
           </div>
@@ -233,7 +285,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
               {importMsg ? <p className="text-sm text-success">{importMsg}</p> : null}
               {importErr ? <p className="text-sm text-destructive">{importErr}</p> : null}
             </>
-          ) : (
+          ) : tab === 'secure' ? (
             <>
               <p className="text-2xs text-muted-foreground">
                 AES-256-GCM 加密的账号备份（含登录态 token）。设置密码后导出为加密文件；导入需同一密码。密码不会写入文件，也无法找回。
@@ -262,6 +314,40 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
               />
               {secMsg ? <p className="text-sm text-success">{secMsg}</p> : null}
               {secErr ? <p className="text-sm text-destructive">{secErr}</p> : null}
+            </>
+          ) : (
+            <>
+              <p className="text-2xs text-muted-foreground">
+                只读扫描本机已登录的 WorkBuddy 桌面客户端凭据。加密 token 需要客户端 at-rest secret（AES-256-GCM 密钥，base64）；密钥仅用于本次导入，不落盘、不写日志。
+              </p>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" onClick={() => void scanDesktop()}>
+                  扫描本机客户端
+                </Button>
+                <span className="text-2xs text-muted-foreground">只读，不修改客户端文件</span>
+              </div>
+              {desktopAccounts.length ? (
+                <div className="max-h-48 overflow-auto rounded-lg border border-border">
+                  {desktopAccounts.map((a) => (
+                    <div key={a.path} className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 text-xs last:border-b-0">
+                      <span className="min-w-0 truncate">{a.nickname || a.uid}</span>
+                      <span className="shrink-0 text-muted-foreground">{a.realm === 'global' ? '国际版' : '国内版'}{a.encrypted ? ' · 加密' : ''}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              <Input
+                type="password"
+                autoComplete="off"
+                placeholder="at-rest secret（base64；明文凭据可留空）"
+                value={desktopKey}
+                onChange={(e) => setDesktopKey(e.target.value)}
+              />
+              <Button variant="default" onClick={() => void importDesktop()} disabled={!desktopAccounts.length}>
+                导入已扫描账号
+              </Button>
+              {desktopMsg ? <p className="text-sm text-success">{desktopMsg}</p> : null}
+              {desktopErr ? <p className="text-sm text-destructive">{desktopErr}</p> : null}
             </>
           )}
         </div>

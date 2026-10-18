@@ -17,6 +17,8 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'state_file', path: ['state_file'], kind: 'text' },
   { name: 'package_detail_limit', path: ['panel', 'package_detail_limit'], kind: 'number' },
   { name: 'max_body_bytes', path: ['server', 'max_body_bytes'], kind: 'number' },
+  { name: 'request_accept_grace_seconds', path: ['server', 'request_accept_grace_seconds'], kind: 'number' },
+  { name: 'shutdown_grace_seconds', path: ['server', 'shutdown_grace_seconds'], kind: 'number' },
   { name: 'checkin_enabled', path: ['schedule', 'checkin_enabled'], kind: 'checkbox' },
   { name: 'checkin_hours', path: ['schedule', 'checkin_hours'], kind: 'hours' },
   { name: 'keepalive_enabled', path: ['schedule', 'keepalive_enabled'], kind: 'checkbox' },

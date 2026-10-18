@@ -25,6 +25,10 @@ import (
 type entry struct {
 	uid        string
 	lastActive time.Time
+	// avoidUID/avoidUntil 软逃逸后的回纳抑制（issue #116 P0-1）：窗口内不再绑定回
+	// 原账号；窗口结束后仍需 LowLoad 回落低水位才允许复用。
+	avoidUID   string
+	avoidUntil time.Time
 }
 
 // Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
@@ -42,6 +46,9 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// LowLoad 报告账号是否回落到可重新接收粘性绑定的低水位（降级窗口结束后使用）。
+	// model 为 "[realm:]model"；nil 时视为始终可回纳。
+	LowLoad func(model, uid string) bool
 }
 
 // Router 会话粘性路由器。
@@ -156,7 +163,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) && available[e.uid] {
+	if found && !expired(e, now, r.cfg.TTL) && available[e.uid] && !r.avoidActive(e, model, now) {
 		r.touch(key, e.uid, now)
 		return e.uid, true
 	}
@@ -172,11 +179,15 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 func (r *Router) resolveSlowLocked(key, model string, now time.Time, available map[string]bool) (string, bool) {
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found := r.entries[key]; found && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
+		avoid := r.avoidActive(e2, model, now)
+		if available[e2.uid] && !avoid {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
 		}
-		delete(r.entries, key) // 失效：清掉再分配
+		if !avoid {
+			delete(r.entries, key) // 失效：清掉再分配
+		}
+		// 降级抑制中：保留原条目，让 pickUID 读取 avoidUID 后避开原账号。
 	}
 
 	uids := r.availableSlice(model)
@@ -184,7 +195,7 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 		return "", false
 	}
 
-	uid := r.pickUID(key, uids)
+	uid := r.pickUID(key, uids, model, now)
 	prev, existed := r.entries[key]
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	if existed && prev.uid != uid {
@@ -195,13 +206,17 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 }
 
 // pickUID 双段分配：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
-func (r *Router) pickUID(key string, uids []string) string {
+func (r *Router) pickUID(key string, uids []string, model string, now time.Time) string {
 	bound := map[string]bool{}
 	for _, v := range r.entries {
 		bound[v.uid] = true
 	}
+	avoidUID := r.avoidedUID(key, model, now)
 	var idle []string
 	for _, u := range uids {
+		if u == avoidUID {
+			continue
+		}
 		if !bound[u] {
 			idle = append(idle, u)
 		}
@@ -210,7 +225,32 @@ func (r *Router) pickUID(key string, uids []string) string {
 	if len(pool) == 0 {
 		pool = uids
 	}
+	if avoidUID != "" {
+		if filtered := withoutUID(pool, avoidUID); len(filtered) > 0 {
+			pool = filtered
+		}
+	}
 	return pool[hashIndex(key, len(pool))]
+}
+
+// avoidedUID 返回当前降级抑制中的账号（无则空串）。
+func (r *Router) avoidedUID(key, model string, now time.Time) string {
+	e, ok := r.entries[key]
+	if !ok || !r.avoidActive(e, model, now) {
+		return ""
+	}
+	return e.avoidUID
+}
+
+// withoutUID 返回去掉指定 uid 的副本；结果为空时保持原列表（单账号池不饿死）。
+func withoutUID(uids []string, uid string) []string {
+	out := make([]string, 0, len(uids))
+	for _, u := range uids {
+		if u != uid {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
@@ -233,6 +273,39 @@ func (r *Router) Bind(key, uid string) {
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+}
+
+// avoidActive 报告会话是否仍处于降级抑制：窗口内禁止复用原账号；窗口结束后
+// 仍要求 LowLoad 低水位。未配置 LowLoad 时窗口结束即解除。
+func (r *Router) avoidActive(e entry, model string, now time.Time) bool {
+	if e.avoidUID == "" || e.avoidUID != e.uid {
+		return false
+	}
+	if now.Before(e.avoidUntil) {
+		return true
+	}
+	return r.cfg.LowLoad != nil && !r.cfg.LowLoad(model, e.uid)
+}
+
+// Degrade 软逃逸后把当前绑定置为降级：窗口内不绑定回原账号，并删除 Redis 镜像。
+// 绑定本身保留在内存，用于窗口结束后做低水位回纳判定。
+func (r *Router) Degrade(key, uid string, d time.Duration) {
+	if key == "" || uid == "" {
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	e, ok := r.entries[key]
+	if !ok || e.uid != uid {
+		r.mu.Unlock()
+		return
+	}
+	e.avoidUID = uid
+	e.avoidUntil = now.Add(d)
+	e.lastActive = now
+	r.entries[key] = e
+	r.mu.Unlock()
+	r.cfg.Store.DelBind(key)
 }
 
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。

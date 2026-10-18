@@ -38,8 +38,8 @@ WokBuddy Demon 是一个**自托管的 CodeBuddy 账号成长伴侣**：一只�
 |---|---|
 | 🔑 **一键登录** | `login.sh` 或面板「添加账号」走设备授权流程，自动落盘凭证并加载新账号 |
 | 🐱 **账号管家** | 多账号统一打理：快过期积分加权 + 成本分层 + 加权随机轮换，Top-5 候选 + 防惊群 |
-| 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断 |
-| 🧲 **会话粘性** | 同一会话尽量绑定同一账号，TTL 滚动续期，失败自动解绑 |
+| 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（±10% 抖动）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断 |
+| 🧲 **会话粘性** | 同一会话尽量绑定同一账号，TTL 滚动续期；负载/健康变差时软逃逸并降级 20s，失败自动解绑 |
 | ⏰ **定时任务** | 签到（09/21 点）+ 活跃上报（10 点）+ 猫猫旅行（09/21 点）+ 保活（22 点）+ 夜猫子（23 点），各自独立开关 |
 | 🎯 **成长任务一键完成** | 18 个成长任务中 **17 个一键纯自动化**，推进进度、等待计分落定并**自动领奖** |
 | 🎲 **连登管家** | 签到末尾自动兑换连登档位 + 抽完抽奖次数，全程无需人工盯 |
@@ -102,6 +102,8 @@ WokBuddy Demon 是一个**自托管的 CodeBuddy 账号成长伴侣**：一只�
 
 **连登管家**（挂在每日签到末尾，幂等）：成长中心连登档位（连续登录 7/14/28 天）解锁后自动兑换，抽奖次数自动全部抽完，奖品记日志。到天数那天自动完成「兑换 → 抽奖」，无需人工盯。
 
+国际版（global）账号同样执行每日 `daily-checkin`（官方国际版客户端同路径，优先无 `/v2` 前缀），重复执行由上游幂等拒绝，不会重复领取；活跃上报仍独立执行，用于点亮连登。
+
 ## 🖥️ Web 管理面板
 
 内嵌式管理面板（React 19 + Tailwind 4 构建，产物打进二进制；`go build` 本身无需 Node/Bun），服务启动后访问：
@@ -127,6 +129,8 @@ http://127.0.0.1:7863/panel/
 顶部另有「刷新」（向官方全量查询真实余额并回写）与「添加账号」（浏览器内完成授权登录，凭证落盘并**热加载，免重启**）。
 
 「添加账号」对话框的「加密备份」页支持**加密导出 / 导入账号**：AES-256-GCM 加密、PBKDF2 派生密钥、每次导出随机 salt，密码不写入文件（无法找回），用于跨机迁移而不落明文凭证。
+
+「本机客户端」页可**只读扫描**已登录官方客户端的凭据目录（macOS `~/Library/Application Support/WorkBuddy{ AI}/Data/Public/auth/*.info`、Windows `%LOCALAPPDATA%\WorkBuddy{ AI}\...`、Linux `~/.local/share/WorkBuddy{ AI}/...`，以及 `~/.workbuddy`）。客户端加密字段为 `$wbEncrypted`（AES-256-GCM，字段级 AAD）；需在面板输入客户端的 at-rest secret（32 字节 base64），密钥仅在本次导入的内存中使用，不落盘、不写日志，响应只返回账号元数据。拿不到密钥时请改用浏览器登录。
 
 ### 多模态能力
 
@@ -284,6 +288,8 @@ claude
 ```
 
 - 请求侧支持 `system`、文本/图片内容块、`tool_use` / `tool_result`、`tools`、`tool_choice`、`stop_sequences`、`thinking`；响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
+- system 与 message text 块上的 `cache_control` 会保留到出站 content parts，供上游 prompt cache 使用。
+- 流结束时校验各工具块聚合后的 `input_json_delta` 是否为合法 JSON；截断/非法时记 WARN（不含参数原文），本期不改写分片。
 - 上游错误转换为 Anthropic `{"type":"error","error":{...}}`，`gateway_hint` 保留在 error 对象内。
 - `count_tokens` 无本地 tokenizer，按请求文本字节数近似估算，仅用于客户端上下文预算，不作计费依据。
 - 未配置模型别名时，Anthropic 客户端可直接请求上游裸模型名。
@@ -338,10 +344,19 @@ claude
 | `wokbuddy_tokens_total{model,kind}` | counter | 按模型与类别的 Token 数（`kind` = `prompt` / `completion` / `total`） |
 | `wokbuddy_request_duration_seconds{result}` | histogram | 上游尝试耗时（秒），按成功/失败分流（`result` = `ok` / `error`） |
 | `wokbuddy_upstream_rotations_total{reason}` | counter | 上游换号次数（`reason` 为触发分类；degrade 同号重试不计入） |
+| `wokbuddy_pool_in_flight` | gauge | 当前全局在途上游请求数（所有账号租约之和） |
+| `wokbuddy_pool_cooling` | gauge | 冷却中或熔断中的账号数 |
+| `wokbuddy_model_ttft_ms{model}` | gauge | 按模型聚合的账号 TTFT EWMA 均值（ms）；只统计最近 30 分钟有观测的条目 |
 
 `result` 口径：`ok` 表示本次上游尝试**拿到了 `usage`**（与面板用量账本同源），并非 HTTP 成功。客户端显式设置 `stream_options.include_usage=false` 时，即便 200 成功响应也会因无 usage 计入 `error`。
 
-账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram 与换号计数为进程内生命周期，重启清零。鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
+账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram、换号计数与路由熔断为进程内生命周期，重启清零。
+
+同一 `(realm, model)` 在 60 秒内出现 3 次模型级失败（11102 / 6004）后，整条路由冷却 5 分钟；期间选号直接返回不可用（`503`，可带 `Retry-After`），不再逐号重试消耗配额。任一账号在该组合上成功即立即清除。
+
+鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
+
+运行时性能分析走标准库 `net/http/pprof`：`/debug/pprof/`（含 `cmdline` / `profile` / `symbol` / `trace` 与各命名 profile）。与 `/metrics` 同口径鉴权，`api_key` 为空时同样放行——公网部署必须设置 `api_key`，否则 goroutine 栈与调用细节会暴露。示例：`curl -H "Authorization: Bearer <api_key>" -o heap.pprof http://127.0.0.1:7863/debug/pprof/heap && go tool pprof heap.pprof`。
 
 ## 配置说明
 
@@ -361,6 +376,8 @@ claude
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；`0` = 不限制。改后需重启 |
 | `server.max_body_bytes` | `16777216` | 聊天类入站请求体上限（字节，16 MiB），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413 `payload_too_large`；`0` = 不限制。改后需重启 |
+| `server.request_accept_grace_seconds` | `0` | 停机摘流宽限（秒）：收到 SIGTERM 后 `/healthz` 立即 503，listener 继续受理该时长再关闭；`0` = 立即停机。改后需重启 |
+| `server.shutdown_grace_seconds` | `30` | listener 关闭后等待在途 SSE 流排空的上限（秒）；`0` 回落 30，负值报错。改后需重启 |
 | `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
@@ -396,6 +413,13 @@ claude
 | `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
 | `models.background_names` | `[]` | 客户端后台任务硬编码模型名（大小写不敏感）；命中后把 `model` 改写为 `background_target`。留空 = 关闭。热生效 |
 | `models.background_target` | `deepseek-v4.1-flash` | 后台模型改写目标；只改 `model`，其余请求原样透传 |
+
+调度补充说明：
+
+- 同一账号在途达到 `ceil(0.66 × max_in_flight)`（或健康因子低于 0.5）时，会话粘性命中会软逃逸；解绑后 20 秒内不再绑定回原号，窗口结束仍需回落到 `max_in_flight` 的 30% 以下。
+- 在途压力以 `1/(1+7×pressure²)` 乘性降权（负载率 40% 以下不打折），Top-5 排序与加权抽签同口径。
+- 全冷却兜底选中账号后进入 30 秒单飞探针窗口，其余并发不再选中同一号。
+- 开启 `pool.credit_floor` 时，请求前按 prompt 长度 + `max_tokens` 估算并预扣积分；余额不足以覆盖保底时跳过该号，所有成功/失败/断流路径都会释放预扣。
 
 ### 模型别名
 
@@ -458,6 +482,7 @@ claude
 - 旧版 snake_case 扁平形（`access_token` / `expires_at` 毫秒）不会被载入：`go run ./cmd/migrate-auths -dir auths -apply` 转换，原文件留存 `.legacy` 副本
 - 失效账号被禁用后，可用 `./login.sh` 重新登录覆盖凭证
 - 备份 = `auths/`（凭证）+ `data/state.json`（状态）
+- 面板每次成功保存配置前会把上一版写为 `config.json.1`（0600，含 `api_key`，不要分享）；配置页「恢复上一版」可整体回滚。只保留一代，恢复操作本身不再滚动备份
 
 ## 安全与合规
 

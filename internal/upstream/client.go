@@ -961,35 +961,30 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	return body
 }
 
-// effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
+// effortsSnapshot 返回 effort 能力缓存的只读快照；nil 表示未知（透传不降级）。
+// storeEfforts 在写入时已克隆输入并整体替换桶，快照发布后不可变，读路径零拷贝。
+// 调用方只读，不得修改返回的 map/slice。
 func (c *Client) effortsSnapshot(realm string) map[string][]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	bucket, ok := c.efforts[realmKey(realm)]
-	if !ok || len(bucket) == 0 {
+	bucket := c.efforts[realmKey(realm)]
+	if len(bucket) == 0 {
 		return nil
 	}
-	cp := make(map[string][]string, len(bucket))
-	for k, v := range bucket {
-		cp[k] = v
-	}
-	return cp
+	return bucket
 }
 
-// defaultEffortsSnapshot 返回指定 realm 的模型 defaultEffort 缓存副本；
+// defaultEffortsSnapshot 返回指定 realm 的模型 defaultEffort 只读快照；
 // 该域无探测或无声明默认档 → nil（thinking.go 回退硬编码 high）。
+// 与 effortsSnapshot 同契约：写入时克隆，快照不可变，调用方只读。
 func (c *Client) defaultEffortsSnapshot(realm string) map[string]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
-	bucket, ok := c.defaultEfforts[realmKey(realm)]
-	if !ok || len(bucket) == 0 {
+	bucket := c.defaultEfforts[realmKey(realm)]
+	if len(bucket) == 0 {
 		return nil
 	}
-	cp := make(map[string]string, len(bucket))
-	for k, v := range bucket {
-		cp[k] = v
-	}
-	return cp
+	return bucket
 }
 
 // realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
@@ -1941,8 +1936,31 @@ func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs ma
 		delete(c.defaultEfforts, k)
 		return
 	}
-	c.efforts[k] = efforts
-	c.defaultEfforts[k] = defs
+	// 写入边界克隆一次（刷新频率低），让读路径直接返回不可变快照，无需每请求拷贝。
+	c.efforts[k] = cloneEffortMap(efforts)
+	c.defaultEfforts[k] = cloneStringMap(defs)
+}
+
+func cloneEffortMap(src map[string][]string) map[string][]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string][]string, len(src))
+	for k, v := range src {
+		dst[k] = append([]string(nil), v...)
+	}
+	return dst
+}
+
+func cloneStringMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
 }
 
 // normalizeModelRate 把上游倍率原文规范化为可比较的数值键。
@@ -2010,9 +2028,9 @@ func (c *Client) ModelRate(realm, model string) string {
 	return c.modelRates[realmKey(realm)][model]
 }
 
-// GlobalEffortSnapshot 导出 global 域 effort 能力缓存（探测下发 ∪ 静态兜底合并后的桶），
-// 供 /v1/models 输出 reasoning_supported_efforts / reasoning_default_effort。
-// 返回副本；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。
+// GlobalEffortSnapshot 导出 global 域 effort 能力缓存，供 /v1/models 输出
+// reasoning_supported_efforts / reasoning_default_effort。返回只读快照（调用方
+// 不得修改）；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。
 func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults map[string]string) {
 	return c.effortsSnapshot("global"), c.defaultEffortsSnapshot("global")
 }
