@@ -265,8 +265,18 @@ func (p *Panel) routes() {
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
 // 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
+// panelAPIMaxBodyBytes 管理面请求体统一上限（字节）。个别导入端点另有更小的
+// 内部上限；这里兜住未来新增的 handler，避免未设上限的读 body 占满内存。
+const panelAPIMaxBodyBytes = 16 << 20
+
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+	if strings.HasPrefix(r.URL.Path, "/panel/api/") {
+		// 敏感数据（配置、账号、密钥）不允许浏览器或中间代理缓存。
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		limitPanelBody(w, r)
+	}
 	if p.audit != nil && r.Method != http.MethodGet && r.Method != http.MethodHead &&
 		strings.HasPrefix(r.URL.Path, "/panel/api/") {
 		aw := &auditResponseWriter{w: w}
@@ -288,6 +298,15 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.mux.ServeHTTP(w, r)
+}
+
+// limitPanelBody 给管理面请求体套上统一上限。超限在 handler 读取时返回错误
+// （MaxBytesReader 负责），不会先把整个 body 缓冲进内存。
+func limitPanelBody(w http.ResponseWriter, r *http.Request) {
+	if r.Body == nil {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, panelAPIMaxBodyBytes)
 }
 
 // withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
