@@ -215,18 +215,15 @@ func TestConcurrentApplyRestore(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(2)
-
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, _ = m.Apply("claude", opts)
-		}()
+		})
 
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_ = m.Restore("claude", true)
-		}()
+		})
 	}
+
 	wg.Wait()
 
 	if _, err := m.Apply("claude", opts); err != nil {

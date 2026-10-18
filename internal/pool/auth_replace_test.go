@@ -12,16 +12,16 @@ import (
 func TestAddRetiresReplacedAuth(t *testing.T) {
 	t.Parallel()
 
-	p := newTestPool(t, "")
+	testPool := newTestPool(t, "")
 	fp := filepath.Join(t.TempDir(), "workbuddy-u1.json")
 
 	oldAuth := &auth.Auth{UID: "u1", AccessToken: "old", RefreshToken: "old-rt", FilePath: fp}
-	p.Add(oldAuth)
+	testPool.Add(oldAuth)
 
 	replaced := &auth.Auth{UID: "u1", AccessToken: "new", RefreshToken: "new-rt", FilePath: fp}
-	p.Add(replaced)
+	testPool.Add(replaced)
 
-	if got := p.AuthByUID("u1"); got != replaced {
+	if got := testPool.AuthByUID("u1"); got != replaced {
 		t.Fatalf("pool kept %p, want new auth %p", got, replaced)
 	}
 
@@ -38,12 +38,12 @@ func TestAddRetiresReplacedAuth(t *testing.T) {
 func TestAddSameAuthPointerNotRetired(t *testing.T) {
 	t.Parallel()
 
-	p := newTestPool(t, "")
+	testPool := newTestPool(t, "")
 	fp := filepath.Join(t.TempDir(), "workbuddy-u2.json")
 	account := &auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", FilePath: fp}
 
-	p.Add(account)
-	p.Add(account)
+	testPool.Add(account)
+	testPool.Add(account)
 
 	if err := account.SaveAtomic(); err != nil {
 		t.Fatalf("same-pointer upsert retired the active auth: %v", err)

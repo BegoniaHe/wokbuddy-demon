@@ -83,22 +83,18 @@ func TestBindKeyPrefix(t *testing.T) {
 func TestZeroValueConcurrentInit(t *testing.T) {
 	t.Parallel()
 
-	var u Upstash
+	var store Upstash
 
 	var wg sync.WaitGroup
 	for range 16 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			u.goWrite(func() {})
-		}()
+		wg.Go(func() {
+			store.goWrite(func() {})
+		})
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_ = u.Close()
-	}()
+	wg.Go(func() {
+		_ = store.Close()
+	})
 
 	wg.Wait()
 }

@@ -56,27 +56,24 @@ func TestPersistFailureKeepsDirty(t *testing.T) {
 func TestConcurrentPersistKeepsNewestSnapshot(t *testing.T) {
 	t.Parallel()
 
-	fp := filepath.Join(t.TempDir(), "state.json")
-	p := newTestPool(t, fp)
-	p.Add(&auth.Auth{UID: "u1"})
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	testPool := newTestPool(t, statePath)
+	testPool.Add(&auth.Auth{UID: "u1"})
 
 	var wg sync.WaitGroup
 	for i := range 16 {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			p.SetCredits("u1", int64(i+1), 0)
-			p.Flush()
-		}()
+		wg.Go(func() {
+			testPool.SetCredits("u1", int64(i+1), 0)
+			testPool.Flush()
+		})
 	}
+
 	wg.Wait()
 
-	p.SetCredits("u1", 999, 0)
-	p.Flush()
+	testPool.SetCredits("u1", 999, 0)
+	testPool.Flush()
 
-	raw, err := os.ReadFile(fp)
+	raw, err := os.ReadFile(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}

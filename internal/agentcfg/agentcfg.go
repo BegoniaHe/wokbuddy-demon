@@ -328,6 +328,7 @@ func (m *Manager) writeMeta(id string, mt meta) error {
 	}
 
 	path := m.metaPath(id)
+
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return fmt.Errorf("writeMeta: %w", err)

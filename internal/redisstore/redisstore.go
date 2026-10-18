@@ -152,6 +152,7 @@ func (u *Upstash) goWrite(fn func()) {
 	// 新的 Add；Wait 与 Add 不并发（否则零计数下并发 Add 属 WaitGroup 误用）。
 	u.wg.Add(1)
 	u.submitMu.Unlock()
+
 	go func() {
 		defer u.wg.Done()
 		// 只阻塞抢写槽，不检查 done：此处若select done，已阻塞排队的写会在

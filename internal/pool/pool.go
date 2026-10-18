@@ -629,9 +629,10 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	}
 
 	var seq uint64
-	var sf stateFile
+
+	var stateSnap stateFile
 	if changed {
-		seq, sf = p.snapshotStateLocked()
+		seq, stateSnap = p.snapshotStateLocked()
 	}
 
 	p.mu.Unlock()
@@ -641,7 +642,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	}
 
 	if changed {
-		p.persistState(seq, sf)
+		p.persistState(seq, stateSnap)
 	}
 }
 
@@ -664,10 +665,10 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 		p.inFlightTotal.Add(-n)
 	}
 
-	seq, sf := p.snapshotStateLocked()
+	seq, stateSnap := p.snapshotStateLocked()
 	p.mu.Unlock()
 
-	p.persistState(seq, sf)
+	p.persistState(seq, stateSnap)
 
 	return entry2.a
 }

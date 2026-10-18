@@ -61,28 +61,33 @@ var sseReaderPool = sync.Pool{
 }
 
 func getSSEReader(r io.Reader) *bufio.Reader {
-	br := sseReaderPool.Get().(*bufio.Reader)
-	br.Reset(r)
+	reader, _ := sseReaderPool.Get().(*bufio.Reader)
+	if reader == nil {
+		reader = bufio.NewReaderSize(nil, 64*1024)
+	}
 
-	return br
+	reader.Reset(r)
+
+	return reader
 }
 
-func putSSEReader(br *bufio.Reader) {
-	if br == nil {
+func putSSEReader(reader *bufio.Reader) {
+	if reader == nil {
 		return
 	}
 
-	br.Reset(nil)
-	sseReaderPool.Put(br)
+	reader.Reset(nil)
+	sseReaderPool.Put(reader)
 }
 
 func Aggregate(r io.Reader) (map[string]any, error) {
 	streamAggregator2 := newStreamAggregator()
 
-	br := getSSEReader(r)
-	defer putSSEReader(br)
+	reader := getSSEReader(r)
+	defer putSSEReader(reader)
+
 	for {
-		line, err := readSSELine(br)
+		line, err := readSSELine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, err
 		}
@@ -1149,13 +1154,13 @@ func (s *streamWriter) stream(r io.Reader) error {
 		return s.streamWithKeepalive(r)
 	}
 
-	br := getSSEReader(r)
-	defer putSSEReader(br)
+	reader := getSSEReader(r)
+	defer putSSEReader(reader)
 
 	validFrames := 0
 
 	for {
-		line, err := readSSELine(br)
+		line, err := readSSELine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			// 超长行（防御上限，issue #113）：先给客户端一个明确的 error 帧再收尾，
 			// 不把超限行的已读部分当内容透传（也不回退——那正是 OOM 的成因）。

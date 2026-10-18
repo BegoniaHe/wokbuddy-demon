@@ -33,27 +33,38 @@ const maxUserAgentLen = 200
 var chatSeq atomic.Int64
 
 // chatLogEnabled 聊天表格日志总开关。生产恒 true；测试可并发改写，故用 atomic。
-var chatLogEnabled atomic.Bool
+// 包级函数表达式完成默认值初始化（不用 init 函数）。
+var chatLogEnabled = func() *atomic.Bool {
+	enabled := &atomic.Bool{}
+	enabled.Store(true)
+
+	return enabled
+}()
 
 // chatLogOut 聊天表格日志的输出目标（atomic 持有 io.Writer）。生产默认 os.Stdout；
 // main 在启用管理面板时经 SetChatLogOutput 注入 MultiWriter，把每行镜像进
 // /panel/api/logs 的环形缓冲，stdout 行为不变。
-var chatLogOut atomic.Value
+var (
+	chatLogOut     atomic.Value
+	chatLogOutOnce sync.Once
+)
 
-func init() {
-	chatLogEnabled.Store(true)
-	chatLogOut.Store(io.Writer(os.Stdout))
+func ensureChatLogOut() {
+	chatLogOutOnce.Do(func() { chatLogOut.Store(io.Writer(os.Stdout)) })
 }
 
 // SetChatLogOutput 替换聊天表格日志输出目标。
 func SetChatLogOutput(w io.Writer) {
 	if w != nil {
+		ensureChatLogOut()
 		chatLogOut.Store(w)
 	}
 }
 
-// currentChatLogOutput 读取当前输出目标；init 已写入默认值，零值不会出现。
+// currentChatLogOutput 读取当前输出目标。
 func currentChatLogOutput() io.Writer {
+	ensureChatLogOut()
+
 	if w, ok := chatLogOut.Load().(io.Writer); ok {
 		return w
 	}
@@ -154,10 +165,14 @@ var statsReaderPool = sync.Pool{
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
-	br := statsReaderPool.Get().(*bufio.Reader)
-	br.Reset(r)
+	reader, _ := statsReaderPool.Get().(*bufio.Reader)
+	if reader == nil {
+		reader = bufio.NewReaderSize(nil, 64*1024)
+	}
 
-	return &chatStatsReader{br: br, start: since}
+	reader.Reset(r)
+
+	return &chatStatsReader{br: reader, start: since}
 }
 
 // release 归还底层缓冲（幂等）。调用方必须保证此后不再读取该 reader。

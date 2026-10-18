@@ -108,6 +108,7 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	maxCredits := maxCreditsOf(cands)
 	bestTier, explored := p.resolveCostTier(cands, reqModel, realm, now)
 	trace.CostTier, trace.Explored = bestTier, explored
+
 	ordered, top := p.rankCandidates(cands, reqModel, bestTier, maxCredits, now)
 	if collect {
 		trace.Top = topTrace(top, reqModel, now, p, maxCredits)
@@ -317,6 +318,7 @@ type weightedEntry struct {
 
 func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, maxCredits int64, now time.Time) (ordered, top []*entry) {
 	weightedEntries := p.pickWeightBuf[:0]
+
 	for _, e := range cands {
 		ti, ci := e.costTier(reqModel, now)
 		if ti == bestTier {
@@ -334,37 +336,8 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 		}
 	}
 
-	slices.SortStableFunc(weightedEntries, func(a, b weightedEntry) int {
-		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
-		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
-		if a.cost1k != b.cost1k {
-			if a.cost1k < b.cost1k {
-				return -1 // 收费层：单价低的在前
-			}
-
-			return 1
-		}
-
-		if a.w != b.w {
-			if a.w > b.w {
-				return -1
-			}
-
-			return 1
-		}
-
-		if shuffled {
-			return 0 // 保持洗牌后的相对顺序
-		}
-
-		switch {
-		case a.e.a.UID < b.e.a.UID:
-			return -1
-		case a.e.a.UID > b.e.a.UID:
-			return 1
-		default:
-			return 0
-		}
+	slices.SortStableFunc(weightedEntries, func(left, right weightedEntry) int {
+		return compareWeighted(left, right, shuffled)
 	})
 
 	ordered = p.pickOrdered[:0]
@@ -380,6 +353,41 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 	}
 
 	return ordered, ordered
+}
+
+// compareWeighted 是 rankCandidates 的排序比较器：先按单价升序，再按权重降序；
+// 洗牌后用稳定排序保持随机相对序，否则用 UID 兜底稳定输出。
+func compareWeighted(left, right weightedEntry, shuffled bool) int {
+	// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
+	// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
+	if left.cost1k != right.cost1k {
+		if left.cost1k < right.cost1k {
+			return -1 // 收费层：单价低的在前
+		}
+
+		return 1
+	}
+
+	if left.w != right.w {
+		if left.w > right.w {
+			return -1
+		}
+
+		return 1
+	}
+
+	if shuffled {
+		return 0 // 保持洗牌后的相对顺序
+	}
+
+	switch {
+	case left.e.a.UID < right.e.a.UID:
+		return -1
+	case left.e.a.UID > right.e.a.UID:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // selectCandidate 从有序候选中选出最终账号：先按 minPickGap 过滤（防并发撞号，

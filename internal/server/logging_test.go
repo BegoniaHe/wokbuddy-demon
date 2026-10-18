@@ -37,7 +37,9 @@ func captureStdout(t *testing.T, fn func()) string {
 	fn()
 
 	os.Stdout = old
+
 	SetChatLogOutput(oldOut)
+
 	_ = w.Close()
 	raw, _ := io.ReadAll(r)
 

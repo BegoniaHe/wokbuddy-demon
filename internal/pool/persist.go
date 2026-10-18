@@ -111,14 +111,15 @@ func (p *Pool) startFlusher() {
 				pending := p.dirty.Swap(false)
 
 				var seq uint64
-				var sf stateFile
+
+				var stateSnap stateFile
 				if pending {
-					seq, sf = p.snapshotStateLocked()
+					seq, stateSnap = p.snapshotStateLocked()
 				}
 				p.mu.Unlock()
 
 				if pending {
-					p.persistState(seq, sf)
+					p.persistState(seq, stateSnap)
 				}
 			case <-stopCh:
 				return
@@ -133,14 +134,15 @@ func (p *Pool) Flush() {
 	pending := p.dirty.Swap(false)
 
 	var seq uint64
-	var sf stateFile
+
+	var stateSnap stateFile
 	if pending {
-		seq, sf = p.snapshotStateLocked()
+		seq, stateSnap = p.snapshotStateLocked()
 	}
 	p.mu.Unlock()
 
 	if pending {
-		p.persistState(seq, sf)
+		p.persistState(seq, stateSnap)
 	}
 }
 

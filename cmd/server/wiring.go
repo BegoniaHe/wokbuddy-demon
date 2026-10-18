@@ -215,7 +215,7 @@ type quotaEvent struct {
 }
 
 // setupQuota 创建撞线事件存储并接到 pool（issue #101）。
-func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
+func setupQuota(poolRef *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
 	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
 
 	queue := make(chan quotaEvent, quotaQueueSize)
@@ -229,7 +229,7 @@ func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
 		}
 	}()
 
-	p.SetModelRateLimitHook(func(uid, model, realm string, resetAt time.Time) {
+	poolRef.SetModelRateLimitHook(func(uid, model, realm string, resetAt time.Time) {
 		// 回调在 pool 写锁内触发：只做非阻塞入队，扫描 usage 与写 JSONL 由 worker 串行处理。
 		select {
 		case queue <- quotaEvent{uid: uid, model: model, realm: realm, resetAt: resetAt}:
