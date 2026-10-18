@@ -573,23 +573,31 @@ func (p *Pool) now() time.Time {
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+// 被替换的旧凭证立即退役：它可能仍被在途请求与调度器持有，退役后其 SaveAtomic
+// 拒绝写回，避免两个 Auth 实例并发写同一 auth 文件（锁与 tmp 名都是实例私有的）。
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	replaced := p.upsertLocked(a)
+	p.mu.Unlock()
 
-	p.upsertLocked(a)
+	if replaced != nil {
+		replaced.Retire()
+	}
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+
+	var replaced []*auth.Auth
 
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
-		p.upsertLocked(a)
+		if old := p.upsertLocked(a); old != nil {
+			replaced = append(replaced, old)
+		}
 	}
 
 	changed := false
@@ -608,6 +616,12 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 
 	if changed {
 		p.saveLocked()
+	}
+
+	p.mu.Unlock()
+
+	for _, old := range replaced {
+		old.Retire()
 	}
 }
 
@@ -636,14 +650,23 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 }
 
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
+// 返回被替换的旧凭证（供调用方在锁外退役）；同指针重复 upsert 返回 nil。
 // 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
-func (p *Pool) upsertLocked(account *auth.Auth) {
+func (p *Pool) upsertLocked(account *auth.Auth) *auth.Auth {
 	if e, ok := p.byUID[account.UID]; ok {
+		old := e.a
 		e.a = account // 保留 credits/cooling 状态
-		return
+
+		if old == account {
+			return nil
+		}
+
+		return old
 	}
 
 	p.byUID[account.UID] = &entry{a: account}
+
+	return nil
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
