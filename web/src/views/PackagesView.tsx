@@ -143,7 +143,7 @@ export function PackagesView() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          {pkgQ.error && list.length > 0 ? (
+          {pkgQ.data !== undefined && pkgQ.error ? (
             <LoadError
               className="mb-3"
               message={'刷新失败：' + (pkgQ.error as Error).message}
@@ -152,7 +152,7 @@ export function PackagesView() {
           ) : null}
           {pkgQ.isLoading ? (
             <p className="py-4 text-center text-muted-foreground">查询中…（逐账号向上游实时查询）</p>
-          ) : pkgQ.error && list.length === 0 ? (
+          ) : pkgQ.error && pkgQ.data === undefined ? (
             <LoadError
               variant="page"
               message={'读取失败：' + (pkgQ.error as Error).message}

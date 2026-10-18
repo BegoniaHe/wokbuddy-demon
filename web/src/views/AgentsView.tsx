@@ -124,8 +124,8 @@ export function AgentsView() {
         <CardContent className="space-y-3">
           {q.error ? (
             <LoadError
-              variant={clients.length > 0 ? 'inline' : 'page'}
-              message={(clients.length > 0 ? '刷新失败：' : '读取失败：') + (q.error as Error).message}
+              variant={q.data === undefined ? 'page' : 'inline'}
+              message={(q.data === undefined ? '读取失败：' : '刷新失败：') + (q.error as Error).message}
               onRetry={() => void q.refetch()}
             />
           ) : null}

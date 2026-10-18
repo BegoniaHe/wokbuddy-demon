@@ -45,6 +45,9 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   const [desktopErr, setDesktopErr] = useState('');
   const stateRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
+  // 当前正在轮询的 state：标签页唤醒可能和 setInterval 同时触发，同一 state
+  // 并发轮询会让「已完成」与「state 已删除」两个响应互相覆盖（账号已添加却显示失败）。
+  const pollBusyRef = useRef<string | null>(null);
 
   const stopPoll = () => {
     if (timerRef.current) {
@@ -94,11 +97,15 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   };
 
   const poll = async () => {
-    if (!stateRef.current) return;
+    const state = stateRef.current;
+    if (!state || pollBusyRef.current === state) return;
+    pollBusyRef.current = state;
     try {
       const r = await api<{ done?: boolean; nickname?: string; uid?: string; realm?: string; credits?: number; credits_total?: number }>(
-        'login/poll?state=' + encodeURIComponent(stateRef.current),
+        'login/poll?state=' + encodeURIComponent(state),
       );
+      // state 已更换或本次登录已结算：丢弃过期响应，避免覆盖「已完成 / 已失败」。
+      if (stateRef.current !== state) return;
       if (r.done) {
         stopPoll();
         stateRef.current = null;
@@ -116,10 +123,13 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
         }, 1600);
       }
     } catch (e) {
+      if (stateRef.current !== state) return;
       stopPoll();
       stateRef.current = null;
       setPhase('err');
       setErrMsg((e as Error).message + '（关闭后重新添加）');
+    } finally {
+      if (pollBusyRef.current === state) pollBusyRef.current = null;
     }
   };
 

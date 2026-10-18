@@ -190,9 +190,16 @@ export function KeysView() {
             </div>
           </CardAction>
         </CardHeader>
+        {keysQ.data !== undefined && keysQ.error ? (
+          <LoadError
+            className="mx-3 mt-3"
+            message={'刷新失败：' + (keysQ.error as Error).message}
+            onRetry={() => void keysQ.refetch()}
+          />
+        ) : null}
         {keysQ.isLoading ? (
           <CardContent className="py-10 text-center text-muted-foreground">加载中…</CardContent>
-        ) : keysQ.error && list.length === 0 ? (
+        ) : keysQ.error && keysQ.data === undefined ? (
           <CardContent>
             <LoadError
               variant="page"
@@ -204,13 +211,6 @@ export function KeysView() {
           <CardContent className="py-10 text-center text-muted-foreground">暂无命名密钥。创建后即可分发给不同客户端，并在此查看各自的请求与 token 用量。</CardContent>
         ) : (
           <div className="overflow-x-auto">
-            {keysQ.error ? (
-              <LoadError
-                className="m-3"
-                message={'刷新失败：' + (keysQ.error as Error).message}
-                onRetry={() => void keysQ.refetch()}
-              />
-            ) : null}
             <Table>
               <TableHeader>
                 <TableRow>
