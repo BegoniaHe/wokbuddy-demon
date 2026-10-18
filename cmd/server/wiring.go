@@ -195,16 +195,39 @@ func startPricingRefresh(ctx context.Context, cfg *Config, cat *pricing.Catalog)
 	}()
 }
 
+// quotaQueueSize 撞线事件队列容量。事件只用于面板对账，满时丢弃不阻塞选号；
+// 固定 worker 避免每次事件起一个 goroutine 的无界堆积。
+const quotaQueueSize = 256
+
+type quotaEvent struct {
+	uid     string
+	model   string
+	realm   string
+	resetAt time.Time
+}
+
 // setupQuota 创建撞线事件存储并接到 pool（issue #101）。
 func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
 	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
 
+	queue := make(chan quotaEvent, quotaQueueSize)
+	go func() {
+		for ev := range queue {
+			used := rec.TokensSince(ev.realm, ev.uid, ev.model, ev.resetAt.Add(-24*time.Hour))
+			store.Add(&quota.Event{
+				UID: ev.uid, Realm: ev.realm, Model: ev.model,
+				ResetAt: ev.resetAt, Used: used, At: time.Time{},
+			})
+		}
+	}()
+
 	p.SetModelRateLimitHook(func(uid, model, realm string, resetAt time.Time) {
-		// 回调在 pool 写锁内触发；扫描 usage 与重写 JSONL 放到后台，避免阻塞选号。
-		go func() {
-			used := rec.TokensSince(realm, uid, model, resetAt.Add(-24*time.Hour))
-			store.Add(&quota.Event{UID: uid, Realm: realm, Model: model, ResetAt: resetAt, Used: used, At: time.Time{}})
-		}()
+		// 回调在 pool 写锁内触发：只做非阻塞入队，扫描 usage 与写 JSONL 由 worker 串行处理。
+		select {
+		case queue <- quotaEvent{uid: uid, model: model, realm: realm, resetAt: resetAt}:
+		default:
+			log.Printf("WARN: [quota] 撞线事件队列已满，丢弃 uid=%s model=%s", uid, model)
+		}
 	})
 
 	return store
