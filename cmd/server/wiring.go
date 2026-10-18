@@ -190,18 +190,19 @@ func setupQuota(p *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
 
 // handlerDeps 是构建 HTTP handler 所需的装配期依赖。
 type handlerDeps struct {
-	cfg         *Config
-	pool        *pool.Pool
-	up          *upstream.Client
-	keys        *apikey.Store
-	session     *session.Router
-	stickyCount func() int
-	redisMode   string
-	panel       *panel.Panel
-	live        *livecfg.Holder
-	usage       *usage.Recorder
-	requestLog  *reqlog.Recorder
-	notifier    notify.Sender
+	cfg            *Config
+	pool           *pool.Pool
+	up             *upstream.Client
+	keys           *apikey.Store
+	session        *session.Router
+	stickyCount    func() int
+	redisMode      string
+	panel          *panel.Panel
+	live           *livecfg.Holder
+	usage          *usage.Recorder
+	requestLog     *reqlog.Recorder
+	notifier       notify.Sender
+	trustedProxies []*net.IPNet
 }
 
 // buildHandler 把装配期依赖映射为 server.Config；这些字段改动需重启。
@@ -243,6 +244,8 @@ func buildHandler(d handlerDeps) *server.Handler {
 		KeepaliveInterval: d.cfg.KeepaliveIntervalDur,
 		// CORS 允许源（issue #91）：空 = 关闭。
 		CORSOrigins: d.cfg.Server.CORSOrigins,
-		Notifier:    d.notifier,
+		// 可信反代网段：仅当 TCP 对端命中时才采信转发头。
+		TrustedProxies: d.trustedProxies,
+		Notifier:       d.notifier,
 	})
 }

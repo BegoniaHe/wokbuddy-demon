@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -45,8 +46,11 @@ type Config struct {
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	// TrustedProxies 可信反向代理网段；只有 TCP 对端命中时才采信转发头。
+	// 空 = 只认 RemoteAddr（直连部署的安全默认）。
+	TrustedProxies []*net.IPNet
+	RedisMode      string // "upstash" / "noop"，仅观测透出
+	Version        string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -268,7 +272,7 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		ip := httpauth.RemoteIP(r)
+		ip := httpauth.ClientIP(r, p.cfg.TrustedProxies)
 		if ok, retry := p.authLimiter.Allow(ip); !ok {
 			seconds := int((retry + time.Second - 1) / time.Second)
 			if seconds < 1 {

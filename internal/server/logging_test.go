@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -154,20 +155,26 @@ func assertRequestEvent(t *testing.T, e reqlog.Event) {
 	}
 }
 
-// 调用来源必须进归档事件：X-Forwarded-For 首段（反代后真实客户端）+ 截断后的 UA。
+// 调用来源必须进归档事件：可信反代下取 XFF 中第一个非可信地址 + 截断后的 UA。
 func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
 		return 200, sseOK, true
 	})
 	reqLog := reqlog.New(reqlog.Config{})
+	trusted, err := httpauth.ParseTrustedProxies([]string{"127.0.0.1/32", "10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	h := NewHandler(Config{
 		Pool:             testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream:         up,
 		RequestLog:       reqLog,
 		RecordClientInfo: true,
+		TrustedProxies:   trusted,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
 	req.Header.Set("User-Agent", "python-requests/2.31.0")
 	rec := httptest.NewRecorder()
@@ -219,20 +226,36 @@ func TestRequestMetricsClientInfoDisabled(t *testing.T) {
 func TestClientIPForLogFallsBackToRemoteAddr(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.RemoteAddr = "198.51.100.9:54321"
-	if got := clientIPForLog(req); got != "198.51.100.9" {
+	if got := clientIPForLog(req, nil); got != "198.51.100.9" {
 		t.Errorf("got %q want 198.51.100.9", got)
 	}
-	// 代理头优先（X-Real-IP 兜底 XFF）。
+	// 对端不在可信网段：伪造的转发头必须被忽略。
 	req.Header.Set("X-Real-IP", "192.0.2.5")
-	if got := clientIPForLog(req); got != "192.0.2.5" {
+	req.Header.Set("X-Forwarded-For", "192.0.2.9, 10.1.1.1")
+	if got := clientIPForLog(req, nil); got != "198.51.100.9" {
+		t.Errorf("untrusted peer got %q want 198.51.100.9", got)
+	}
+	if got := clientIPForLog(nil, nil); got != "" {
+		t.Errorf("nil request got %q want empty", got)
+	}
+}
+
+// 可信反代下才采信转发头：X-Real-IP 优先，XFF 从右往左跳过可信跳。
+func TestClientIPForLogUsesTrustedProxy(t *testing.T) {
+	trusted, err := httpauth.ParseTrustedProxies([]string{"127.0.0.1/32"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("X-Real-IP", "192.0.2.5")
+	if got := clientIPForLog(req, trusted); got != "192.0.2.5" {
 		t.Errorf("X-Real-IP got %q want 192.0.2.5", got)
 	}
+	req.Header.Del("X-Real-IP")
 	req.Header.Set("X-Forwarded-For", "192.0.2.9, 10.1.1.1")
-	if got := clientIPForLog(req); got != "192.0.2.9" {
-		t.Errorf("XFF got %q want 192.0.2.9", got)
-	}
-	if got := clientIPForLog(nil); got != "" {
-		t.Errorf("nil request got %q want empty", got)
+	if got := clientIPForLog(req, trusted); got != "10.1.1.1" {
+		t.Errorf("XFF got %q want rightmost non-trusted 10.1.1.1", got)
 	}
 }
 
@@ -242,7 +265,7 @@ func TestCaptureClientInfoTruncatesUserAgent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.RemoteAddr = "198.51.100.9:1234"
 	req.Header.Set("User-Agent", strings.Repeat("A", 5000))
-	tr.captureClientInfo(req)
+	tr.captureClientInfo(req, nil)
 	if len(tr.userAgent) != maxUserAgentLen {
 		t.Fatalf("ua len = %d want %d", len(tr.userAgent), maxUserAgentLen)
 	}

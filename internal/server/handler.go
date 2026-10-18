@@ -113,6 +113,10 @@ type Config struct {
 
 	// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin（已规范化）；空 = 关闭。
 	CORSOrigins []string
+	// TrustedProxies 可信反向代理网段。只有 TCP 对端落在这些网段内时，才采信
+	// X-Real-IP / X-Forwarded-For 作为真实来源；否则一律用 RemoteAddr。
+	// 空 = 不信任任何转发头（直连部署的安全默认）。
+	TrustedProxies []*net.IPNet
 	// LocalWebTools 是否允许 Responses 本地 web 工具代跑（issue #104）。
 	LocalWebTools bool
 	// LocalWebToolRounds 本地工具代跑轮数（0 回落默认 3，封顶 8）。
@@ -144,6 +148,9 @@ type Handler struct {
 	streams *streamTracker
 	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
 	authLimiter *httpauth.Limiter
+	// clientAuthLimiter 网关 API 面（/v1/*）鉴权失败按 IP 限速。命名密钥熵很高，
+	// 但用户仍可能把默认 api_key 设成弱口令；公网入口不能无限次试。
+	clientAuthLimiter *httpauth.Limiter
 	// shuttingDown 停机第一阶段置位（issue #147）：/healthz 立即 503，
 	// 让反代/LB 摘流；listener 仍继续受理宽限期内的请求。
 	shuttingDown atomic.Bool
@@ -204,8 +211,9 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{
 		cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
-		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
-		cors:        make(map[string]bool, len(cfg.CORSOrigins)),
+		authLimiter:       httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+		clientAuthLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit*3, httpauth.DefaultFailWindow),
+		cors:              make(map[string]bool, len(cfg.CORSOrigins)),
 	}
 	for _, origin := range cfg.CORSOrigins {
 		h.cors[origin] = true
@@ -300,7 +308,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses") {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
-			trace.captureClientInfo(r)
+			trace.captureClientInfo(r, h.cfg.TrustedProxies)
 		}
 		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
 		obs := &responseObserver{ResponseWriter: w}
@@ -329,7 +337,7 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		ip := httpauth.RemoteIP(r)
+		ip := httpauth.ClientIP(r, h.cfg.TrustedProxies)
 		if ok, retry := h.authLimiter.Allow(ip); !ok {
 			writeAuthFailLimit(w, retry)
 			return
@@ -364,6 +372,21 @@ func writeAuthFailLimit(w http.ResponseWriter, retry time.Duration) {
 	writeOpenAIError(w, http.StatusTooManyRequests, "too_many_auth_failures", "too many authentication failures")
 }
 
+// writeClientAuthFailLimit 网关 API 面鉴权失败超限：按入站协议写错误体。
+func writeClientAuthFailLimit(w http.ResponseWriter, r *http.Request, retry time.Duration) {
+	seconds := int((retry + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error",
+			"too many authentication failures", "")
+		return
+	}
+	writeOpenAIError(w, http.StatusTooManyRequests, "too_many_auth_failures", "too many authentication failures")
+}
+
 // withClientAuth 网关 API 面（/v1/*）的鉴权：默认密钥或任一未撤销命名密钥。
 //
 // 命中命名密钥时挂一个用量累加器到 context，请求结束后计入该密钥的请求数/token
@@ -371,11 +394,18 @@ func writeAuthFailLimit(w http.ResponseWriter, retry time.Duration) {
 // 空默认密钥 + 无命名密钥 = 不鉴权（既有默认，见 httpauth.Authenticate）。
 func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := httpauth.ClientIP(r, h.cfg.TrustedProxies)
+		if ok, retry := h.clientAuthLimiter.Allow(ip); !ok {
+			writeClientAuthFailLimit(w, r, retry)
+			return
+		}
 		res := httpauth.Authenticate(r, h.loadLive().APIKey, h.cfg.Keys.Keys())
 		if !res.OK {
+			h.clientAuthLimiter.Fail(ip)
 			writeClientAuthError(w, r)
 			return
 		}
+		h.clientAuthLimiter.Reset(ip)
 		if res.IsDefault || h.cfg.Keys == nil {
 			next(w, r)
 			return

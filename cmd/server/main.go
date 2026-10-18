@@ -24,6 +24,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
@@ -112,6 +113,12 @@ func main() {
 	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
+	}
+
+	// 可信反代网段：解析一次，供网关与面板共用。配置已在 Load 阶段校验。
+	trustedProxies, err := httpauth.ParseTrustedProxies(cfg.Server.TrustedProxies)
+	if err != nil {
+		log.Fatalf("parse trusted_proxies: %v", err)
 	}
 
 	auths, err := auth.LoadDir(cfg.AuthDir)
@@ -243,18 +250,19 @@ func main() {
 	home, _ := os.UserHomeDir()
 	agents := agentcfg.New(home, stateSibling(cfg.StateFile, "agent-backups"))
 	pn := panel.New(panel.Config{
-		Pool:        p,
-		Usage:       rec,
-		RequestLog:  requestLog,
-		Keys:        keyStore,
-		Upstream:    up,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
-		RedisMode:   redisMode,
-		StickyCount: sessCount,
-		Version:     appVersion,
-		Live:        live,
+		Pool:           p,
+		Usage:          rec,
+		RequestLog:     requestLog,
+		Keys:           keyStore,
+		Upstream:       up,
+		Scheduler:      sch,
+		AuthDir:        cfg.AuthDir,
+		APIKey:         cfg.APIKey,
+		TrustedProxies: trustedProxies,
+		RedisMode:      redisMode,
+		StickyCount:    sessCount,
+		Version:        appVersion,
+		Live:           live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:      stateSibling(cfg.StateFile, "output_probes.json"),
@@ -282,18 +290,19 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := buildHandler(handlerDeps{
-		cfg:         cfg,
-		pool:        p,
-		up:          up,
-		keys:        keyStore,
-		session:     sessRouter,
-		stickyCount: sessCount,
-		redisMode:   redisMode,
-		panel:       pn,
-		live:        live,
-		usage:       rec,
-		requestLog:  requestLog,
-		notifier:    notifier,
+		cfg:            cfg,
+		pool:           p,
+		up:             up,
+		keys:           keyStore,
+		session:        sessRouter,
+		stickyCount:    sessCount,
+		redisMode:      redisMode,
+		panel:          pn,
+		live:           live,
+		usage:          rec,
+		requestLog:     requestLog,
+		notifier:       notifier,
+		trustedProxies: trustedProxies,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

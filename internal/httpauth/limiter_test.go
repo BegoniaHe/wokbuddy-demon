@@ -58,10 +58,28 @@ func TestLimiterBoundsTrackedIPs(t *testing.T) {
 	l := NewLimiter(2, time.Hour)
 	now := time.Unix(1000, 0)
 	l.now = func() time.Time { return now }
+	for i := range maxTrackedIPsHard + 100 {
+		l.Fail(fmt.Sprintf("198.51.100.%d", i))
+	}
+	if got := len(l.byIP); got > maxTrackedIPsHard {
+		t.Fatalf("byIP=%d，超过硬上限 %d", got, maxTrackedIPsHard)
+	}
+}
+
+// TestLimiterFloodKeepsActiveLockout 灌入大量仍在窗口内的来源 IP 时，目标 IP
+// 的锁定不能被顺带淘汰——否则攻击者轮换 IPv6 就能抹掉自己的失败计数。
+func TestLimiterFloodKeepsActiveLockout(t *testing.T) {
+	l := NewLimiter(2, time.Minute)
+	now := time.Unix(1000, 0)
+	l.now = func() time.Time { return now }
+	const victim = "203.0.113.7"
+	l.Fail(victim)
+	l.Fail(victim)
+
 	for i := range maxTrackedIPs + 100 {
 		l.Fail(fmt.Sprintf("198.51.100.%d", i))
 	}
-	if got := len(l.byIP); got > maxTrackedIPs {
-		t.Fatalf("byIP=%d，超过上限 %d", got, maxTrackedIPs)
+	if ok, _ := l.Allow(victim); ok {
+		t.Fatal("灌表后目标 IP 的锁定被抹掉了")
 	}
 }
