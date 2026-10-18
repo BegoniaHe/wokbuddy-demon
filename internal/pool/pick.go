@@ -266,9 +266,10 @@ func anyTier1(cands []*entry, model string, now time.Time) bool {
 // （ordered）与截断的 top5（top）。
 //
 // 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n)
-// 次冗余浮点计算。等权重洗牌：仅当存在权重相等且候选数超过 top5 时才对 ws 做
-// Fisher-Yates 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的
-// 确定性语义），否则按字典序截断会让 uid 靠后的账号永远进不了 top5。
+// 次冗余浮点计算。候选超过 top5 时先做 Fisher-Yates 洗牌（**不消耗 p.randInt64N
+// 注入源**，避免改变 pickWeighted 的确定性语义），让并列权重在截断时随机出线；
+// 洗牌后排序不得再用 uid 作 tie-break，否则并列组会被重新排成字典序，uid 靠后的
+// 账号照样进不了 top5。候选不超过 top5 时保留 uid 兜底，给人少场景一个稳定顺序。
 // weightedEntry 权重排序中间态（rankCandidates 用）。
 type weightedEntry struct {
 	e      *entry
@@ -284,7 +285,8 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 			ws = append(ws, weightedEntry{e: e, w: p.routingWeightOf(e, maxCredits, reqModel, now), cost1k: ci})
 		}
 	}
-	if len(ws) > 5 && hasWeightTie(ws) {
+	shuffled := len(ws) > 5
+	if shuffled {
 		shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
 		shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
 	}
@@ -297,7 +299,10 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
-		return ws[i].e.a.UID < ws[j].e.a.UID // 稳定兜底（洗牌后此项几乎不触发）
+		if shuffled {
+			return false // 保持洗牌后的相对顺序
+		}
+		return ws[i].e.a.UID < ws[j].e.a.UID
 	})
 	ordered = make([]*entry, len(ws))
 	for i, c := range ws {
@@ -307,17 +312,6 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 		return ordered, ordered[:5]
 	}
 	return ordered, ordered
-}
-
-// hasWeightTie 报告是否存在与首元素权重并列的候选（存在并列时按字典序截断会饿死
-// uid 靠后的等权重账号，故需先洗牌）。
-func hasWeightTie(ws []weightedEntry) bool {
-	for i := 1; i < len(ws); i++ {
-		if ws[i].w == ws[0].w {
-			return true
-		}
-	}
-	return false
 }
 
 // selectCandidate 从有序候选中选出最终账号：先按 minPickGap 过滤（防并发撞号，

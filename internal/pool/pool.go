@@ -405,15 +405,17 @@ func (p *Pool) SetStore(s StoreSnapshotter) {
 // （global 档 maxInFlightGlobal，P1-1；未设置回落 maxInFlight）。
 func (p *Pool) Acquire(uid string) bool {
 	p.mu.RLock()
+	defer p.mu.RUnlock()
 	e, ok := p.byUID[uid]
 	if !ok {
-		p.mu.RUnlock()
 		return false
 	}
 	limit := p.inFlightLimit(e)
 	totalLimit := p.maxInFlightTotal
-	p.mu.RUnlock()
 
+	// 名额自增必须仍在读锁内：否则 Remove 可能在 byUID 读取与自增之间删除条目并
+	// Swap(0)，随后这次自增落在已被移除的 entry 上，Release 又因 uid 不存在提前
+	// 返回，全局在途计数永久泄漏。RUnlock 会等 Remove 完成，两者不会交错。
 	// 先占全局名额（issue #92）：即使未设上限也计数，供观测与后续热开上限判定。
 	if !p.acquireTotal(totalLimit) {
 		return false

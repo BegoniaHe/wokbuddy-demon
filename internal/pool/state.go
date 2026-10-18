@@ -89,6 +89,9 @@ func (p *Pool) Revive(uid string) bool {
 	e.softStreak = 0
 	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
 	e.sessionDeadFails = 0
+	e.consecutiveFails = 0 // 连败降权计数/截止一并清，否则「解冻」后仍可能被降权期挡住
+	e.degradeUntil = time.Time{}
+	e.probeUntil = time.Time{}
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
