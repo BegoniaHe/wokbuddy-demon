@@ -188,7 +188,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	r.mu.RUnlock()
 
 	if found && !expired(entry2, now, r.cfg.TTL) && available[entry2.uid] && !avoid {
-		r.touch(key, entry2.uid, now)
+		r.touch(key, entry2.uid, model, now)
 		return entry2.uid, true
 	}
 	// 未命中/失效，或绑定号已冷却/占满 → 落入慢路径重分配。
@@ -308,7 +308,11 @@ func withoutUIDs(uids []string, avoided map[string]bool) []string {
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
 // 写锁内 re-check：快路径读取与 touch 之间可能发生 Degrade（写入 avoid）或
 // Unbind（删除条目）；直接覆盖会把降级窗口清掉/让已解绑的会话复活。
-func (r *Router) touch(key, uid string, now time.Time) {
+//
+// 清理已过期窗口时必须区分账号：当前绑定号被 touch 说明它已被重新选中，
+// 其窗口可清；其他账号的窗口即使过了时间窗，只要 LowLoad 仍判定未回落低水位，
+// 就仍是有效抑制，不能因为本会话在别的账号上成功就一并清掉。
+func (r *Router) touch(key, uid, model string, now time.Time) {
 	r.mu.Lock()
 
 	entry2, ok := r.entries[key]
@@ -316,30 +320,8 @@ func (r *Router) touch(key, uid string, now time.Time) {
 		r.mu.Unlock()
 		return
 	}
-	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；已过期窗口顺手清掉，
-	// 否则该会话会永久受 LowLoad 低水位门控。
-	suppressed := false
-
-	if list, hasAvoid := r.avoid[key]; hasAvoid {
-		kept := list[:0]
-		for _, item := range list {
-			if !now.Before(item.until) {
-				continue
-			}
-
-			if item.uid == uid {
-				suppressed = true
-			}
-
-			kept = append(kept, item)
-		}
-
-		if len(kept) == 0 {
-			delete(r.avoid, key)
-		} else {
-			r.avoid[key] = kept
-		}
-	}
+	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；已过期且不再抑制的窗口顺手清掉。
+	suppressed := r.pruneAvoidLocked(key, uid, model, now)
 
 	entry2.lastActive = now
 	r.entries[key] = entry2
@@ -350,6 +332,45 @@ func (r *Router) touch(key, uid string, now time.Time) {
 	}
 
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+}
+
+// pruneAvoidLocked 清理该会话已失效的抑制窗口，返回当前绑定是否仍被抑制。
+// 当前绑定号（uid）一旦被 touch 即视为回纳证据；其他账号过窗后仍需 lowLoad
+// 放行才可清理，否则 LowLoad 门控会因本会话在别处成功而丢失。
+func (r *Router) pruneAvoidLocked(key, uid, model string, now time.Time) bool {
+	list, ok := r.avoid[key]
+	if !ok {
+		return false
+	}
+
+	suppressed := false
+	kept := list[:0]
+
+	for _, item := range list {
+		expired := !now.Before(item.until)
+		if expired && (item.uid == uid || r.lowLoad(model, item.uid)) {
+			continue
+		}
+
+		if item.uid == uid {
+			suppressed = true
+		}
+
+		kept = append(kept, item)
+	}
+
+	if len(kept) == 0 {
+		delete(r.avoid, key)
+	} else {
+		r.avoid[key] = kept
+	}
+
+	return suppressed
+}
+
+// lowLoad 报告账号是否已回落低水位；未配置判定时视为始终可回纳。
+func (r *Router) lowLoad(model, uid string) bool {
+	return r.cfg.LowLoad == nil || r.cfg.LowLoad(model, uid)
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -364,12 +385,12 @@ func (r *Router) Bind(key, uid string) {
 
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
-	// 绑定成功即回纳证据：清除该账号的抑制与已过期窗口；换绑到其他账号时
-	// 保留其余未过期窗口，防止旧账号立刻又被重新绑定。
+	// 绑定成功即回纳证据：只清除该账号的抑制；换绑到其他账号时保留其余窗口
+	// （含已过期但 LowLoad 仍未回落的），防止旧账号立刻又被重新绑定。
 	if list, ok := r.avoid[key]; ok {
 		kept := list[:0]
 		for _, a := range list {
-			if a.uid == uid || !now.Before(a.until) {
+			if a.uid == uid {
 				continue
 			}
 

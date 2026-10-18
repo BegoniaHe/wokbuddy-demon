@@ -153,7 +153,7 @@ func TestTouchPreservesDegrade(t *testing.T) {
 	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)
 	r.Bind("c1", "a1")
 	r.Degrade("c1", "a1", time.Minute)
-	r.touch("c1", "a1", time.Now())
+	r.touch("c1", "a1", "m", time.Now())
 
 	r.mu.RLock()
 	_, ok := r.entries["c1"]
@@ -181,7 +181,7 @@ func TestTouchSkipsMirrorDuringDegrade(t *testing.T) {
 	before := countingStore2.setBinds
 	countingStore2.mu.Unlock()
 
-	r.touch("c1", "a1", time.Now())
+	r.touch("c1", "a1", "m", time.Now())
 
 	countingStore2.mu.Lock()
 	after := countingStore2.setBinds
@@ -227,6 +227,84 @@ func TestTouchClearsExpiredAvoid(t *testing.T) {
 	}
 }
 
+// TestTouchKeepsOtherAccountLowLoadGate 窗口过期但 LowLoad 未回落时，本会话在
+// 其他账号上的 touch 不得顺手清掉原账号的抑制；否则下一次重分配会立刻回到原账号。
+func TestTouchKeepsOtherAccountLowLoadGate(t *testing.T) {
+	t.Parallel()
+
+	avail := []string{"a1", "a2", "a3"}
+	r := New(Config{TTL: time.Minute, Available: func() []string { return avail }})
+
+	key := ""
+
+	for i := range 1000 {
+		k := fmt.Sprintf("gate-%d", i)
+		if hashIndex(k, 3) == 0 {
+			key = k
+			break
+		}
+	}
+
+	if key == "" {
+		t.Fatal("no key hashes to a1")
+	}
+
+	r.Bind(key, "a1")
+	r.Degrade(key, "a1", 10*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	r.cfg.LowLoad = func(_, uid string) bool { return uid != "a1" }
+
+	if uid, ok := r.Resolve(key); !ok || uid == "a1" {
+		t.Fatalf("首次重分配 bind=%s ok=%v", uid, ok)
+	}
+	// 第二次命中绑定快路径并 touch：a1 已过窗口但 LowLoad=false，门控必须保留。
+	if uid, ok := r.Resolve(key); !ok || uid == "a1" {
+		t.Fatalf("快路径 bind=%s ok=%v", uid, ok)
+	}
+
+	r.Unbind(key)
+
+	if uid, ok := r.Resolve(key); !ok || uid == "a1" {
+		t.Fatalf("touch 后低水位门控丢失: bind=%s ok=%v", uid, ok)
+	}
+}
+
+// TestBindKeepsOtherAccountExpiredLowLoadGate Bind 到新账号只回纳该账号；其他账号
+// 已过窗口但 LowLoad 仍未回落的抑制必须保留，否则换绑即丢失门控。
+func TestBindKeepsOtherAccountExpiredLowLoadGate(t *testing.T) {
+	t.Parallel()
+
+	avail := []string{"a1", "a2", "a3"}
+	r := New(Config{TTL: time.Minute, Available: func() []string { return avail }})
+
+	key := ""
+
+	for i := range 1000 {
+		k := fmt.Sprintf("bind-gate-%d", i)
+		if hashIndex(k, 3) == 0 {
+			key = k
+			break
+		}
+	}
+
+	if key == "" {
+		t.Fatal("no key hashes to a1")
+	}
+
+	r.Bind(key, "a1")
+	r.Degrade(key, "a1", 10*time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+
+	r.cfg.LowLoad = func(_, uid string) bool { return uid != "a1" }
+	r.Bind(key, "a2")
+	r.Unbind(key)
+
+	if uid, ok := r.Resolve(key); !ok || uid == "a1" {
+		t.Fatalf("Bind 后低水位门控丢失: bind=%s ok=%v", uid, ok)
+	}
+}
+
 // TestTouchDoesNotResurrectUnbound 快路径读后发生 Unbind，touch 不得把已删除的绑定写回。
 func TestTouchDoesNotResurrectUnbound(t *testing.T) {
 	t.Parallel()
@@ -234,7 +312,7 @@ func TestTouchDoesNotResurrectUnbound(t *testing.T) {
 	r := routerWith(newCountingStore(), []string{"a1"}, time.Minute)
 	r.Bind("c1", "a1")
 	r.Unbind("c1")
-	r.touch("c1", "a1", time.Now())
+	r.touch("c1", "a1", "m", time.Now())
 
 	if r.Count() != 0 {
 		t.Fatalf("touch 复活了已解绑的会话，count=%d", r.Count())
