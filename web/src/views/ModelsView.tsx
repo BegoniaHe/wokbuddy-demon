@@ -171,7 +171,7 @@ export function ModelsView() {
 
   return (
     <Card>
-      <CardHeader className="flex-row flex-wrap items-center gap-3">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <CardTitle className="flex items-baseline">
           模型能力
           <CardDescription className="ml-1.5">max_tokens bug 已修复目前可以正常透传最大输出，但是官方返回的最大输出仅为参考，不保证完全正确</CardDescription>

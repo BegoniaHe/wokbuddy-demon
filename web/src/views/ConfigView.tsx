@@ -170,7 +170,7 @@ export function ConfigView() {
       }}
     >
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>服务</CardTitle>
           <CardAction>
             <span className="truncate text-xs text-muted-foreground">{path}</span>

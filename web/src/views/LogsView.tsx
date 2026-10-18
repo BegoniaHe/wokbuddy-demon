@@ -163,7 +163,7 @@ export function LogsView() {
   return (
     <>
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle className="flex items-baseline">
             请求记录
             <span className="ml-1.5 text-2xs font-normal text-muted-foreground">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span>
@@ -250,7 +250,7 @@ export function LogsView() {
       </Card>
 
       <Card className="mt-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>运行日志</CardTitle>
           <Tabs value={ch} onValueChange={(v) => setCh(v ?? 'all')}>
             <TabsList>

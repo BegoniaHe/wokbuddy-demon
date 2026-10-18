@@ -174,7 +174,7 @@ export function TasksCenterView() {
   return (
     <>
       <Card>
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle className="flex items-baseline">
             成长任务队列
             <span className="ml-1.5 text-2xs font-normal text-muted-foreground">{total ? total + ' 项' : ''}</span>
@@ -229,7 +229,7 @@ export function TasksCenterView() {
             </div>
           </div>
         ) : (
-          <div className="pb-2.5">
+          <div className="overflow-x-auto pb-2.5">
             {groups.map((g) => (
               <div key={g.uid} className="border-t border-border/60 py-1 first:border-t-0">
                 <header className="flex items-baseline gap-2.5 px-4 pb-1.5 pt-2.5">
@@ -261,7 +261,7 @@ function QueueRow({ it, title }: { it: QRow; title: string }) {
   const stWord = it.status === 'scan' ? '待执行' : ST_WORDS[it.status] || it.status;
   return (
     <div
-      className="grid grid-cols-[118px_1fr_52px_84px_minmax(120px,240px)] items-center gap-2.5 px-4 py-[7.5px] text-sm hover:bg-secondary"
+      className="grid min-w-[600px] grid-cols-[118px_1fr_52px_84px_minmax(120px,240px)] items-center gap-2.5 px-4 py-[7.5px] text-sm hover:bg-secondary"
       title={it.message || ''}
     >
       <span className="truncate font-mono text-2xs text-muted-foreground">{it.code}</span>

@@ -96,7 +96,7 @@ export function PackagesView() {
   return (
     <>
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="items-center gap-3">
           <CardTitle>积分到期分布</CardTitle>
           <CardDescription>按批次到期日聚合，颜色区分账号</CardDescription>
         </CardHeader>
@@ -106,7 +106,7 @@ export function PackagesView() {
       </Card>
 
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="items-center gap-3">
           <CardTitle>获取历史</CardTitle>
           <CardAction>
             <CardDescription>
@@ -120,7 +120,7 @@ export function PackagesView() {
       </Card>
 
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="items-center gap-3">
           <CardTitle>账号对比</CardTitle>
           <CardAction>
             <div className="flex flex-wrap items-center gap-3">
@@ -402,7 +402,7 @@ function DetailBox({
 
   return (
     <Card className="mb-5">
-      <CardHeader className="flex-row flex-wrap items-center gap-3">
+      <CardHeader className="items-center gap-3">
         <CardTitle>
           {a.nickname || String(a.uid).slice(0, 8)} · {a.realm || ''}
         </CardTitle>

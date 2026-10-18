@@ -131,21 +131,25 @@ function Kpi({
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border border-border/60 bg-secondary py-2.5 pl-4 pr-3.5">
       <div className="truncate text-2xs text-muted-foreground">{label}</div>
-      <div className={toneCls + ' mt-1 whitespace-nowrap font-mono text-[23px] font-semibold leading-tight tracking-tight tabular-nums'}>
+      <div className={toneCls + ' mt-1 truncate font-mono text-[21px] font-semibold xl:text-[23px] leading-tight tracking-tight tabular-nums'}>
         {value}
       </div>
-      {sub ? <div className="mt-1 truncate text-2xs text-muted-foreground">{sub}</div> : null}
+      {sub ? <div className="mt-1 text-pretty text-2xs text-muted-foreground">{sub}</div> : null}
       {children}
     </div>
   );
 }
 
-function Kpis({ children, cols = 6, className }: { children: ReactNode; cols?: 4 | 6; className?: string }) {
+function Kpis({ children, cols = 7, className }: { children: ReactNode; cols?: 4 | 5 | 7; className?: string }) {
   return (
     <div
       className={
         'grid gap-2.5 px-4 pt-3.5 ' +
-        (cols === 4 ? 'grid-cols-2 lg:grid-cols-4' : 'grid-cols-2 sm:grid-cols-3 xl:grid-cols-6') +
+        (cols === 4
+          ? 'grid-cols-2 lg:grid-cols-4'
+          : cols === 5
+            ? 'grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 [&>*:last-child]:col-span-2 sm:[&>*:last-child]:col-span-1'
+            : 'grid-cols-2 sm:grid-cols-4 xl:grid-cols-7') +
         (className ? ' ' + className : '')
       }
     >
@@ -224,7 +228,7 @@ export function UsageView() {
       {remainingQ.data?.rows?.length ? <RemainingCard payload={remainingQ.data} /> : null}
 
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>用量总览</CardTitle>
           <CardAction>
             <div className="flex flex-wrap items-center gap-3">
@@ -340,7 +344,7 @@ export function UsageView() {
       </Card>
 
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>日历热力图</CardTitle>
           <CardDescription className="ml-1.5">按日聚合，仅统计当前查询范围；空白天 = 当日无数据</CardDescription>
           <CardAction>
@@ -363,7 +367,7 @@ export function UsageView() {
       </Card>
 
       <Card className="mb-5">
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>用量明细</CardTitle>
           <Tabs value={dim} onValueChange={(v) => setDim(v as DimKey)}>
             <TabsList>
@@ -421,7 +425,7 @@ export function UsageView() {
       </Card>
 
       <Card>
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>积分扣除历史</CardTitle>
           <Tabs value={creditDim} onValueChange={(v) => setCreditDim(v as CreditDim)}>
             <TabsList>
@@ -435,7 +439,7 @@ export function UsageView() {
             </span>
           </CardAction>
         </CardHeader>
-        <Kpis cols={4}>
+        <Kpis cols={5}>
           <Kpi value={fmtCredit(t.credits)} label="扣除积分" tone="accent" sub="按上游 usage.credit 累计" />
           <Kpi value={fmtTok(t.credit_tokens)} label="匹配 Token" sub="与积分同时观测到的 Token" />
           <Kpi value={fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens)} label="平均积分 / 1M Token" tone="ok" sub="越低越划算" />
@@ -907,7 +911,7 @@ function PricingCard({ rows, payload }: { rows: UsageRow[]; payload: PricingPayl
 
   return (
     <Card className="mb-5">
-      <CardHeader className="flex-row flex-wrap items-center gap-3">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <CardTitle>等价花费（参考）</CardTitle>
         <CardAction>
           <span className="text-xs text-muted-foreground">
@@ -958,7 +962,7 @@ function RemainingCard({ payload }: { payload: RemainingPayload }) {
   const rows = payload.rows || [];
   return (
     <Card className="mb-5">
-      <CardHeader className="flex-row flex-wrap items-center gap-3">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <CardTitle>剩余用量估算</CardTitle>
         <CardAction>
           <span className="text-xs text-muted-foreground">只读估算 · {rows.length} 行</span>

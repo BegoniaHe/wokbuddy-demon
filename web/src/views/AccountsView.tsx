@@ -127,10 +127,10 @@ export function AccountsView() {
       />
 
       <Card>
-        <CardHeader className="flex-row flex-wrap items-center gap-3">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <CardTitle>账号池</CardTitle>
           <CardAction>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               {data.in_flight_full ? (
                 <span className="text-xs text-muted-foreground">{data.in_flight_full} 个账号在途占满</span>
               ) : null}
@@ -206,15 +206,15 @@ interface StatItem {
   tone?: 'default' | 'good' | 'warn' | 'bad';
 }
 
-// Stats：顶部统计条。窄屏降为 3 / 2 列。
+// Stats：顶部统计条。窄屏 2 列，宽屏 4 列。
 function Stats({ stats }: { stats: StatItem[] }) {
   return (
-    <div className="mb-5 grid grid-cols-2 overflow-hidden rounded-xl border border-border bg-card sm:grid-cols-3 lg:grid-cols-7">
+    <div className="mb-5 grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4">
       {stats.map((s) => (
-        <div key={s.label} className="border-b border-r border-border/60 px-4 py-3.5 last:border-b-0 lg:border-b-0 lg:last:border-r-0">
+        <div key={s.label} className="bg-card px-4 py-3.5">
           <div
             className={cn(
-              'whitespace-nowrap font-mono text-[26px] font-semibold leading-tight tracking-tight tabular-nums',
+              'truncate font-mono text-[24px] font-semibold leading-tight tracking-tight tabular-nums lg:text-[26px]',
               s.tone === 'good' && 'text-success',
               s.tone === 'warn' && 'text-warning',
               s.tone === 'bad' && 'text-destructive',
@@ -364,13 +364,13 @@ function ExpiryBox({
 
   return (
     <Card className="mb-5">
-      <CardHeader className="flex-row flex-wrap items-center gap-3">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <CardTitle className="flex items-baseline">
           积分到期提醒
           <CardDescription className="ml-1.5">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</CardDescription>
         </CardTitle>
         <CardAction>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <span className="text-xs text-muted-foreground">{note}</span>
             <Button size="xs" disabled={checking} onClick={onCheck}>
               {checking ? '查询中…' : '检查'}
@@ -692,7 +692,7 @@ function ModelLocks({ rows }: { rows?: ModelLock[] }) {
   const bad = list.filter((r) => r.state === 'locked' || r.state === 'starved').length;
   return (
     <Card className="mt-5">
-      <CardHeader className="flex-row flex-wrap items-center gap-3">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <CardTitle className="flex items-baseline">
           模型锁池
           <CardDescription className="ml-1.5">哪些模型不能用、还要锁多久</CardDescription>
