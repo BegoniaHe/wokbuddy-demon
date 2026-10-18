@@ -257,6 +257,7 @@ func main() {
 		Upstream:       up,
 		Scheduler:      sch,
 		AuthDir:        cfg.AuthDir,
+		AuditDir:       stateSibling(cfg.StateFile, "audit"),
 		APIKey:         cfg.APIKey,
 		TrustedProxies: trustedProxies,
 		RedisMode:      redisMode,

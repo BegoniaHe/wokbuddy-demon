@@ -30,6 +30,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
@@ -45,6 +46,7 @@ type Config struct {
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
+	AuditDir  string               // 管理面写操作审计目录（空 = 关闭审计）
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
 	// TrustedProxies 可信反向代理网段；只有 TCP 对端命中时才采信转发头。
 	// 空 = 只认 RemoteAddr（直连部署的安全默认）。
@@ -128,6 +130,9 @@ type Panel struct {
 	// authLimiter 鉴权失败按来源 IP 限速（issue #61）。
 	authLimiter *httpauth.Limiter
 
+	// audit 管理面写操作审计（JSONL，按大小轮转）。nil = 未配置目录。
+	audit *auditLog
+
 	// 模型探测（modelhealth.go，issue #110）：单飞 + 全局并发名额 + 状态文件锁。
 	probeMu       sync.Mutex
 	probeInflight map[string]bool
@@ -183,6 +188,8 @@ func New(cfg Config) *Panel {
 		logins:      map[string]loginSession{},
 		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
 	}
+	p.audit = newAuditLog(cfg.AuditDir)
+	p.audit.initAuditSize()
 	p.routes()
 	return p
 }
@@ -253,12 +260,33 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("POST /panel/api/config/restore", p.withAuth(p.restoreConfig))
+	p.mux.HandleFunc("GET /panel/api/audit", p.withAuth(p.auditList))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
 // 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+	if p.audit != nil && r.Method != http.MethodGet && r.Method != http.MethodHead &&
+		strings.HasPrefix(r.URL.Path, "/panel/api/") {
+		aw := &auditResponseWriter{w: w}
+		p.mux.ServeHTTP(aw, r)
+		status := aw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		p.audit.Append(auditEntry{
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			Pattern:    r.Pattern,
+			Status:     status,
+			OK:         status < 400,
+			IP:         httpauth.ClientIP(r, p.cfg.TrustedProxies),
+			UserAgent:  logfmt.Truncate(r.UserAgent(), 200),
+			AuthFailed: status == http.StatusUnauthorized || status == http.StatusForbidden,
+		})
+		return
+	}
 	p.mux.ServeHTTP(w, r)
 }
 
