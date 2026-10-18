@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -38,5 +39,32 @@ func TestDegradeReincludesWhenLowLoad(t *testing.T) {
 	uid, ok := r.Resolve("c1")
 	if !ok || uid != "a1" {
 		t.Fatalf("bind=%s ok=%v want a1 after low-load re-inclusion", uid, ok)
+	}
+}
+
+// TestDegradeAvoidsRebindWhenHashFallsOnOriginal 回归：慢路径重分配前若丢弃降级条目，
+// pickUID 就读不到 avoidUID，哈希恰好落在原账号时会把会话立即绑回去。
+func TestDegradeAvoidsRebindWhenHashFallsOnOriginal(t *testing.T) {
+	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)
+	key := ""
+	for i := range 1000 {
+		k := fmt.Sprintf("degrade-%d", i)
+		if hashIndex(k, 2) == 0 {
+			key = k
+			break
+		}
+	}
+	if key == "" {
+		t.Fatal("no key hashes to a1")
+	}
+	r.Bind(key, "a1")
+	r.Degrade(key, "a1", time.Minute)
+
+	uid, ok := r.Resolve(key)
+	if !ok {
+		t.Fatal("resolve should fall back to another account")
+	}
+	if uid == "a1" {
+		t.Fatalf("degraded account rebound despite avoid window: %s", uid)
 	}
 }

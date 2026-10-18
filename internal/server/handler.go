@@ -1172,13 +1172,7 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 	}
 	f.tried[acct.UID] = true
 	if !f.reserveCredits(acct) {
-		log.Printf("WARN: [server] credit reserve: acct=%s model=%s credits below floor after estimate, skip",
-			logfmt.Label(acct.UID, acct.Nickname), f.bareModel)
-		f.rotateReason = "credit_reserve"
-		if !rotateBackoff(ctx, i) {
-			return rotBreak
-		}
-		return rotContinue
+		return f.skipReserved(ctx, acct, i)
 	}
 	f.st.uid = acct.UID
 	// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
@@ -1205,6 +1199,21 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		return rotContinue
 	}
 	return f.dispatch(ctx, acct, i)
+}
+
+// skipReserved 处置预扣失败：解绑粘性号（否则每次轮转都重新命中同一个号），
+// 按既有退避节奏换号。
+func (f *chatFlow) skipReserved(ctx context.Context, acct *auth.Auth, i int) rotationAction {
+	log.Printf("WARN: [server] credit reserve: acct=%s model=%s credits below floor after estimate, skip",
+		logfmt.Label(acct.UID, acct.Nickname), f.bareModel)
+	if f.stickyUID != "" && acct.UID == f.stickyUID {
+		f.unbindSticky()
+	}
+	f.rotateReason = "credit_reserve"
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+	return rotContinue
 }
 
 // reserveCredits 请求级预扣（issue #116 P1-1）：按请求体估算 prompt 与 max_tokens，

@@ -179,11 +179,15 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 func (r *Router) resolveSlowLocked(key, model string, now time.Time, available map[string]bool) (string, bool) {
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found := r.entries[key]; found && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] && !r.avoidActive(e2, model, now) {
+		avoid := r.avoidActive(e2, model, now)
+		if available[e2.uid] && !avoid {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
 		}
-		delete(r.entries, key) // 失效：清掉再分配
+		if !avoid {
+			delete(r.entries, key) // 失效：清掉再分配
+		}
+		// 降级抑制中：保留原条目，让 pickUID 读取 avoidUID 后避开原账号。
 	}
 
 	uids := r.availableSlice(model)

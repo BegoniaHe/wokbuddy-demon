@@ -143,3 +143,15 @@ func TestDiscoverRoot(t *testing.T) {
 		t.Fatalf("discoverRoot=%v want [%s]", got, path)
 	}
 }
+
+func TestRootsIncludeWorkbuddyBase(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	want := filepath.Join(home, ".workbuddy")
+	for _, root := range Roots() {
+		if root == want {
+			return
+		}
+	}
+	t.Fatalf("Roots() missing %s: %v", want, Roots())
+}

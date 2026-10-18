@@ -43,6 +43,11 @@ func (p *Pool) NoteRouteFailure(realm, model string) {
 		st = &routeState{}
 		p.routeCooldowns[key] = st
 	}
+	// 冷却已过期：在写锁内清理残留的截止时间与失败窗口。
+	if !st.until.IsZero() && !now.Before(st.until) {
+		st.until = time.Time{}
+		st.failures = nil
+	}
 	// 滑动窗口：丢弃过旧失败，避免低频偶发失败跨天累计后误熔断。
 	cutoff := now.Add(-routeFailureWindow)
 	kept := make([]time.Time, 0, len(st.failures)+1)
@@ -72,24 +77,15 @@ func (p *Pool) NoteRouteSuccess(realm, model string) {
 	p.mu.Unlock()
 }
 
-// routeCoolingLocked 报告该路由是否处于冷却期；到期条目惰性删除。
-// 调用方必须已持有 p.mu（读或写）。
+// routeCoolingLocked 报告该路由是否处于冷却期。
+// 调用方可能只持读锁（WeightedAvailableUIDsForModelRealm），因此这里不得删除
+// 条目；过期条目由 NoteRouteFailure 在写锁内清理（或一直保留到该路由再次失败/成功）。
 func (p *Pool) routeCoolingLocked(realm, model string, now time.Time) bool {
 	if p == nil || model == "" || len(p.routeCooldowns) == 0 {
 		return false
 	}
-	key := routeKey(realm, model)
-	st := p.routeCooldowns[key]
-	if st == nil {
-		return false
-	}
-	if now.Before(st.until) {
-		return true
-	}
-	if !st.until.IsZero() {
-		delete(p.routeCooldowns, key)
-	}
-	return false
+	st := p.routeCooldowns[routeKey(realm, model)]
+	return st != nil && now.Before(st.until)
 }
 
 // RouteRecovery 返回该路由冷却的截止时刻；无冷却返回零值。供 Retry-After 使用。

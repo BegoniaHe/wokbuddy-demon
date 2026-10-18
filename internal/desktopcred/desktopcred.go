@@ -52,23 +52,28 @@ func Roots() []string {
 	case "linux":
 		bases = []string{filepath.Join(home, ".local", "share"), filepath.Join(home, ".config")}
 	}
-	bases = append(bases, filepath.Join(home, ".workbuddy"))
 	names := []string{"WorkBuddy", "WorkBuddy AI"}
 	if v := strings.TrimSpace(os.Getenv("WORKBUDDY_APP_NAME")); v != "" {
 		names = append(names, v)
 	}
 	seen := map[string]bool{}
 	var out []string
+	add := func(root string) {
+		root = filepath.Clean(root)
+		if seen[root] {
+			return
+		}
+		seen[root] = true
+		out = append(out, root)
+	}
 	for _, base := range bases {
 		for _, name := range names {
-			root := filepath.Join(base, name)
-			if seen[root] {
-				continue
-			}
-			seen[root] = true
-			out = append(out, root)
+			add(filepath.Join(base, name))
 		}
 	}
+	// CN 桌面客户端的 dataFolderName 为 .workbuddy：sharedDataPath 直接位于
+	// ~/.workbuddy/Data/Public，而不是 ~/.workbuddy/<产品名>/Data/Public。
+	add(filepath.Join(home, ".workbuddy"))
 	return out
 }
 
