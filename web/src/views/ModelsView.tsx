@@ -189,8 +189,7 @@ export function ModelsView() {
       <div className="flex flex-wrap items-center gap-2 border-y border-border/60 bg-secondary px-4 py-2.5">
         <Input
           type="search"
-          h-7 text-xs
-          className="min-w-[200px] flex-[0_1_280px]"
+          className="h-7 min-w-[200px] flex-[0_1_280px] text-xs"
           placeholder="搜索模型 ID / 名称 / 描述 / 厂商"
           aria-label="搜索模型"
           value={q}
