@@ -36,44 +36,58 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 	if len(messages) < 3 {
 		return messages, false
 	}
+
 	out := make([]any, 0, len(messages))
 	changed := false
+
 	i := 0
 	for i < len(messages) {
 		m, ok := messages[i].(map[string]any)
 		if !ok || m["role"] != "assistant" {
 			out = append(out, messages[i])
 			i++
+
 			continue
 		}
+
 		tcs, hasCalls := m["tool_calls"].([]any)
 		if !hasCalls || len(tcs) == 0 {
 			out = append(out, messages[i])
 			i++
+
 			continue
 		}
+
 		want := toolCallIDs(tcs)
 		// 收集紧随其后（允许被其他消息打断）的同批 tool 结果，按原相对顺序。
 		out = append(out, messages[i])
 		i++
-		var results, between []any
-		var separated bool
+
+		var (
+			results, between []any
+			separated        bool
+		)
+
 		i, results, between, separated = collectToolResults(messages, i, want)
 		if separated {
 			changed = true
 		}
+
 		out = append(out, results...)
 		out = append(out, between...)
 	}
+
 	if !changed {
 		return messages, false
 	}
+
 	return out, true
 }
 
 // toolCallIDs 收集 assistant.tool_calls 的 id 集合。
 func toolCallIDs(tcs []any) map[string]bool {
 	want := map[string]bool{}
+
 	for _, tci := range tcs {
 		if tc, ok := tci.(map[string]any); ok {
 			if id, _ := tc["id"].(string); id != "" {
@@ -81,6 +95,7 @@ func toolCallIDs(tcs []any) map[string]bool {
 			}
 		}
 	}
+
 	return want
 }
 
@@ -89,24 +104,31 @@ func toolCallIDs(tcs []any) map[string]bool {
 func collectToolResults(messages []any, start int, want map[string]bool) (next int, results, between []any, separated bool) {
 	i := start
 	sawNonTool := false
+
 	for i < len(messages) {
-		mm, ok := messages[i].(map[string]any)
+		table, ok := messages[i].(map[string]any)
 		if !ok {
 			break
 		}
-		role, _ := mm["role"].(string)
+
+		role, _ := table["role"].(string)
 		if role == "tool" {
-			id, _ := mm["tool_call_id"].(string)
+			id, _ := table["tool_call_id"].(string)
 			if !want[id] {
 				break
 			}
+
 			results = append(results, messages[i])
+
 			if sawNonTool {
 				separated = true
 			}
+
 			i++
+
 			continue
 		}
+
 		if len(results) == 0 {
 			break // assistant 后没有结果：交由 cleanupOrphanToolCalls 处理
 		}
@@ -114,7 +136,7 @@ func collectToolResults(messages []any, start int, want map[string]bool) (next i
 		// between，它永远不再被外层循环当作组头处理，它自己那批结果也就永远得不
 		// 到重排（真实会话 msg[181] 正是这样漏掉的）。必须 break 交还外层循环。
 		if role == "assistant" {
-			if next, _ := mm["tool_calls"].([]any); len(next) > 0 {
+			if next, _ := table["tool_calls"].([]any); len(next) > 0 {
 				break
 			}
 		}
@@ -123,6 +145,7 @@ func collectToolResults(messages []any, start int, want map[string]bool) (next i
 		sawNonTool = true
 		i++
 	}
+
 	return i, results, between, separated
 }
 
@@ -141,10 +164,12 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	if len(messages) == 0 {
 		return messages, false
 	}
+
 	callIDs, resultIDs, nameBadIDs, hasTraffic := collectToolPairing(messages)
 	if !hasTraffic {
 		return messages, false
 	}
+
 	keepCalls := computeKeepCalls(callIDs, resultIDs, nameBadIDs)
 	// 1) assistant.tool_calls：按 keepCalls 对称裁剪——只留有结果的调用，过滤后为空则删键。
 	//
@@ -160,9 +185,11 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	if dropped {
 		changed = true
 	}
+
 	if !changed {
 		return messages, false
 	}
+
 	return kept, true
 }
 
@@ -172,11 +199,13 @@ func collectToolPairing(messages []any) (callIDs, resultIDs, nameBadIDs map[stri
 	callIDs = map[string]bool{}
 	resultIDs = map[string]bool{}
 	nameBadIDs = map[string]bool{}
+
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		switch msg["role"] {
 		case "tool":
 			if id, _ := msg["tool_call_id"].(string); id != "" {
@@ -189,6 +218,7 @@ func collectToolPairing(messages []any) (callIDs, resultIDs, nameBadIDs map[stri
 			}
 		}
 	}
+
 	return callIDs, resultIDs, nameBadIDs, hasTraffic
 }
 
@@ -199,20 +229,25 @@ func collectAssistantCalls(msg map[string]any, callIDs, nameBadIDs map[string]bo
 	if !ok {
 		return false
 	}
+
 	found := false
+
 	for _, tci := range tcs {
-		tc, ok := tci.(map[string]any)
+		table, ok := tci.(map[string]any)
 		if !ok {
 			continue
 		}
-		if id, _ := tc["id"].(string); id != "" {
+
+		if id, _ := table["id"].(string); id != "" {
 			callIDs[id] = true
-			if toolCallNameEmpty(tc) {
+			if toolCallNameEmpty(table) {
 				nameBadIDs[id] = true
 			}
+
 			found = true
 		}
 	}
+
 	return found
 }
 
@@ -224,32 +259,39 @@ func collectAssistantCalls(msg map[string]any, callIDs, nameBadIDs map[string]bo
 // 原样出站，正是线上 503 的成因。删除动作完全复用两侧对称裁剪。
 func computeKeepCalls(callIDs, resultIDs, nameBadIDs map[string]bool) map[string]bool {
 	keepCalls := map[string]bool{}
+
 	for id := range callIDs {
 		if nameBadIDs[id] {
 			continue
 		}
+
 		if resultIDs[id] {
 			keepCalls[id] = true
 		}
 	}
+
 	return keepCalls
 }
 
 // trimAssistantToolCalls 按 keepCalls 对称裁剪各 assistant.tool_calls。返回是否有改动。
 func trimAssistantToolCalls(messages []any, keepCalls map[string]bool) bool {
 	changed := false
+
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		if role, _ := msg["role"].(string); role != "assistant" {
 			continue
 		}
+
 		if trimOneAssistantCalls(msg, keepCalls) {
 			changed = true
 		}
 	}
+
 	return changed
 }
 
@@ -259,24 +301,30 @@ func trimOneAssistantCalls(msg map[string]any, keepCalls map[string]bool) bool {
 	if !ok || len(tcs) == 0 {
 		return false
 	}
+
 	keptCalls := make([]any, 0, len(tcs))
 	for _, tci := range tcs {
-		tc, ok := tci.(map[string]any)
+		table, ok := tci.(map[string]any)
 		if !ok {
 			continue
 		}
-		if id, _ := tc["id"].(string); keepCalls[id] {
-			keptCalls = append(keptCalls, tc)
+
+		if id, _ := table["id"].(string); keepCalls[id] {
+			keptCalls = append(keptCalls, table)
 		}
 	}
+
 	if len(keptCalls) == len(tcs) {
 		return false // 整批齐全：零改动
 	}
+
 	if len(keptCalls) == 0 {
 		delete(msg, "tool_calls")
 		return true
 	}
+
 	msg["tool_calls"] = keptCalls
+
 	return true
 }
 
@@ -285,12 +333,14 @@ func trimOneAssistantCalls(msg map[string]any, keepCalls map[string]bool) bool {
 func dropOrphanToolResults(messages []any, keepCalls map[string]bool) ([]any, bool) {
 	kept := make([]any, 0, len(messages))
 	changed := false
+
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			kept = append(kept, m)
 			continue
 		}
+
 		if role, _ := msg["role"].(string); role == "tool" {
 			id, _ := msg["tool_call_id"].(string)
 			if !keepCalls[id] {
@@ -298,8 +348,10 @@ func dropOrphanToolResults(messages []any, keepCalls map[string]bool) ([]any, bo
 				continue
 			}
 		}
+
 		kept = append(kept, m)
 	}
+
 	return kept, changed
 }
 
@@ -338,29 +390,36 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 	if len(messages) < 2 {
 		return messages, false
 	}
+
 	out := make([]any, 0, len(messages))
 	changed := false
+
 	for _, m := range messages {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			out = append(out, m)
 			continue
 		}
+
 		if role, _ := msg["role"].(string); role == "assistant" && len(out) > 0 {
 			if mergeForwardToolCalls(out, msg) {
 				changed = true
 				continue // 本条已并入上一条，不再单独出站
 			}
+
 			if mergeBackwardToolCalls(out, msg) {
 				changed = true
 				continue // 正文已折进上一条
 			}
 		}
+
 		out = append(out, m)
 	}
+
 	if !changed {
 		return messages, false
 	}
+
 	return out, true
 }
 
@@ -371,19 +430,24 @@ func mergeForwardToolCalls(out []any, msg map[string]any) bool {
 	if !ok || len(tcs) == 0 || !emptyContent(msg["content"]) {
 		return false
 	}
+
 	prev, ok := out[len(out)-1].(map[string]any)
 	if !ok {
 		return false
 	}
+
 	if prevRole, _ := prev["role"].(string); prevRole != "assistant" {
 		return false
 	}
+
 	prevCalls, ok := prev["tool_calls"].([]any)
 	if !ok || len(prevCalls) == 0 {
 		return false
 	}
+
 	prev["tool_calls"] = append(prevCalls, tcs...)
 	mergeReasoningContent(prev, msg)
+
 	return true
 }
 
@@ -400,23 +464,29 @@ func mergeBackwardToolCalls(out []any, msg map[string]any) bool {
 	if _, hasCalls := msg["tool_calls"]; hasCalls {
 		return false
 	}
+
 	txt, ok := msg["content"].(string)
 	if !ok || txt == "" {
 		return false
 	}
+
 	prev, ok := out[len(out)-1].(map[string]any)
 	if !ok {
 		return false
 	}
+
 	if prevRole, _ := prev["role"].(string); prevRole != "assistant" {
 		return false
 	}
+
 	prevCalls, ok := prev["tool_calls"].([]any)
 	if !ok || len(prevCalls) == 0 || !emptyContent(prev["content"]) {
 		return false
 	}
+
 	prev["content"] = txt
 	mergeReasoningContent(prev, msg)
+
 	return true
 }
 
@@ -427,10 +497,12 @@ func mergeReasoningContent(dst, src map[string]any) {
 	if rc == "" {
 		return
 	}
+
 	if prevRC, _ := dst["reasoning_content"].(string); prevRC != "" {
 		dst["reasoning_content"] = prevRC + "\n" + rc
 		return
 	}
+
 	dst["reasoning_content"] = rc
 }
 
@@ -440,14 +512,15 @@ func mergeReasoningContent(dst, src map[string]any) {
 // deepseek 系判 11148（正是 mergeAdjacentToolCalls 要挡的形态，条件漏了 []）。
 // 非空数组仍视为有内容：宁可漏合并，也不丢内容。
 func emptyContent(v any) bool {
-	switch c := v.(type) {
+	switch item := v.(type) {
 	case nil:
 		return true
 	case string:
-		return c == ""
+		return item == ""
 	case []any:
-		return len(c) == 0
+		return len(item) == 0
 	}
+
 	return false
 }
 
@@ -460,9 +533,11 @@ func toolCallNameEmpty(tc map[string]any) bool {
 	if !ok {
 		return false
 	}
+
 	name, ok := fn["name"].(string)
 	if !ok {
 		return false
 	}
+
 	return strings.TrimSpace(name) == ""
 }

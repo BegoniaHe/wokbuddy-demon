@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"strings"
 )
 
@@ -26,21 +27,26 @@ func ResolveConversationID(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
+
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
+
 	if meta, ok := obj["metadata"].(map[string]any); ok {
 		if v := strOrEmpty(meta["conversation_id"]); v != "" {
 			return v
 		}
+
 		if v := strOrEmpty(meta["conversationId"]); v != "" {
 			return v
 		}
 	}
+
 	if v := strOrEmpty(obj["conversation_id"]); v != "" {
 		return v
 	}
+
 	return strOrEmpty(obj["conversationId"])
 }
 
@@ -74,7 +80,9 @@ func RequestIDForKey(key string) string {
 	if key == "" {
 		return NewMessageID()
 	}
+
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + key))
+
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -99,6 +107,7 @@ func TurnKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
+
 	var obj struct {
 		Messages []struct {
 			Role    string          `json:"role"`
@@ -108,18 +117,22 @@ func TurnKey(body []byte) string {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
-	for i := len(obj.Messages) - 1; i >= 0; i-- {
-		if obj.Messages[i].Role != "user" {
+
+	for i, msg := range slices.Backward(obj.Messages) {
+		if msg.Role != "user" {
 			continue
 		}
-		sig := contentSignature(obj.Messages[i].Content)
+
+		sig := contentSignature(msg.Content)
 		if sig == "" {
 			// 最后一条 user 消息没有可签名内容（空/null/空 parts）→ 本轮不建立聚合键。
 			// 不继续往前找：整轮内该消息位置恒定，往前找反而会让键随 step 漂移。
 			return ""
 		}
+
 		return fmt.Sprintf("u%d:%s", i, sig)
 	}
+
 	return ""
 }
 
@@ -136,19 +149,21 @@ func TurnKey(body []byte) string {
 // 调用方回落原有的空键语义）。TurnKey 与 firstUserText（粘性兜底）共用本函数，
 // 两条链路的图片盲区一并修复。
 func contentSignature(raw json.RawMessage) string {
-	s := strings.TrimSpace(string(raw))
-	if s == "" || s == "null" {
+	str2 := strings.TrimSpace(string(raw))
+	if str2 == "" || str2 == "null" {
 		return ""
 	}
 	// 字符串形态：纯文本路径签名 == contentText 结果（键值零漂移）。
-	if s[0] == '"' {
+	if str2[0] == '"' {
 		var str string
 		if err := json.Unmarshal(raw, &str); err != nil {
 			return ""
 		}
+
 		return str
 	}
-	if s[0] != '[' {
+
+	if str2[0] != '[' {
 		return ""
 	}
 	// 非文本 part：type + 原文 sha256 前 8 hex（超长 data: URL 只入短摘要）。
@@ -168,27 +183,35 @@ func partsSignature(raw json.RawMessage, renderNonText func(typeName string, raw
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return ""
 	}
-	var b strings.Builder
+
+	var builder strings.Builder
+
 	hasNonText := false
-	for _, pr := range parts {
-		var p struct {
+
+	for _, item2 := range parts {
+		var item struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		}
-		if err := json.Unmarshal(pr, &p); err != nil {
+		if err := json.Unmarshal(item2, &item); err != nil {
 			return ""
 		}
-		if p.Type == "" || p.Type == "text" {
-			b.WriteString(p.Text)
+
+		if item.Type == "" || item.Type == "text" {
+			builder.WriteString(item.Text)
 			continue
 		}
+
 		hasNonText = true
-		b.WriteString(renderNonText(p.Type, pr))
+
+		builder.WriteString(renderNonText(item.Type, item2))
 	}
-	out := b.String()
+
+	out := builder.String()
 	if !hasNonText {
 		return out
 	}
+
 	return strings.TrimSpace(out)
 }
 
@@ -203,6 +226,8 @@ func TurnRequestID(turnKey string) string {
 	if turnKey == "" {
 		return NewMessageID()
 	}
+
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
+
 	return hex.EncodeToString(sum[:16])
 }

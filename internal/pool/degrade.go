@@ -20,23 +20,27 @@ import "time"
 func (p *Pool) NoteFailures(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return
 	}
-	e.consecutiveFails++
-	if e.consecutiveFails < p.degradeThreshold {
+
+	entry2.consecutiveFails++
+	if entry2.consecutiveFails < p.degradeThreshold {
 		p.dirty.Store(true)
 		return
 	}
-	e.consecutiveFails = 0
-	if !e.degradeUntil.IsZero() && p.now().Before(e.degradeUntil) {
+
+	entry2.consecutiveFails = 0
+	if !entry2.degradeUntil.IsZero() && p.now().Before(entry2.degradeUntil) {
 		// 降权期内的连败达阈：不延长（取更长者语义由 healthy 或门保证）。计数
 		// 已清零——到期放行后需重新连败满阈值才再降。
 		p.dirty.Store(true)
 		return
 	}
-	e.degradeUntil = p.now().Add(p.degradeDurationLocked())
+
+	entry2.degradeUntil = p.now().Add(p.degradeDurationLocked())
 	p.dirty.Store(true)
 }
 
@@ -45,16 +49,19 @@ func (p *Pool) NoteFailures(uid string) {
 // 清零、不持久化历史触发次数，档位不可推导；固定时长已满足「临时出池一段时间」
 // 的语义（真持续坏号会在下一轮 5 连败里再降一次）。调用方必须已持有 p.mu。
 func (p *Pool) degradeDurationLocked() time.Duration {
-	d := p.degradeCooldown
-	if d <= 0 {
-		d = defaultDegradeCooldown
+	duration := p.degradeCooldown
+	if duration <= 0 {
+		duration = defaultDegradeCooldown
 	}
+
 	capMax := p.degradeCooldownMax
 	if capMax <= 0 {
 		capMax = defaultDegradeCooldownMax
 	}
-	if d > capMax {
-		d = capMax
+
+	if duration > capMax {
+		duration = capMax
 	}
-	return d
+
+	return duration
 }

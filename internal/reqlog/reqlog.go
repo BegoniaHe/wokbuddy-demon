@@ -35,6 +35,7 @@ func NewRequestID() string {
 	if _, err := rand.Read(b[:]); err == nil {
 		return fmt.Sprintf("req-%x", b[:])
 	}
+
 	return fmt.Sprintf("req-%d", time.Now().UnixNano())
 }
 
@@ -162,11 +163,14 @@ func New(cfg Config) *Recorder {
 	if cfg.FileMaxBytes <= 0 {
 		cfg.FileMaxBytes = defaultFileMax
 	}
+
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueue
 	}
+
 	r := &Recorder{started: time.Now(), recent: make([]Event, 0, recentLimit)}
 	r.archive = newArchiveWriter(cfg)
+
 	return r
 }
 
@@ -175,25 +179,30 @@ func (r *Recorder) Begin() {
 	if r == nil {
 		return
 	}
+
 	r.mu.Lock()
 	r.inFlight++
 	r.mu.Unlock()
 }
 
 // Record 记录一个请求完成事件并写入归档队列。
-func (r *Recorder) Record(e Event) {
+func (r *Recorder) Record(e *Event) {
 	if r == nil {
 		return
 	}
-	if e.Time.IsZero() {
-		e.Time = time.Now()
+
+	event := *e
+	if event.Time.IsZero() {
+		event.Time = time.Now()
 	}
-	e.normalizeOutcome()
+
+	event.normalizeOutcome()
 	r.mu.Lock()
-	r.observe(e)
+	r.observe(&event)
 	r.mu.Unlock()
+
 	if r.archive != nil {
-		r.archive.enqueue(e)
+		r.archive.enqueue(&event)
 	}
 }
 
@@ -202,27 +211,33 @@ func (e *Event) normalizeOutcome() {
 	if e.Outcome != "" {
 		return
 	}
+
 	if e.Status == 200 && e.OK {
 		e.Outcome = OutcomeSuccess
 		return
 	}
+
 	e.Outcome = OutcomeHTTPError
 }
 
 // observe 在持锁状态下累计内存指标并保留最近事件。
-func (r *Recorder) observe(e Event) {
+func (r *Recorder) observe(event3 *Event) {
 	if r.inFlight > 0 {
 		r.inFlight--
 	}
+
 	r.completed++
-	if e.OK {
+	if event3.OK {
 		r.succeeded++
 	}
-	if e.Status >= 200 && e.Status < 300 {
+
+	if event3.Status >= 200 && event3.Status < 300 {
 		r.httpSuccess++
 	}
-	r.durationSum += e.DurationMs
-	r.recent = append([]Event{e}, r.recent...)
+
+	r.durationSum += event3.DurationMs
+
+	r.recent = append([]Event{*event3}, r.recent...)
 	if len(r.recent) > recentLimit {
 		r.recent = r.recent[:recentLimit]
 	}
@@ -233,8 +248,10 @@ func (r *Recorder) Snapshot() Snapshot {
 	if r == nil {
 		return Snapshot{}
 	}
+
 	r.mu.Lock()
-	s := Snapshot{
+
+	snapshot := Snapshot{
 		StartedAt: r.started,
 		Completed: r.completed,
 		InFlight:  r.inFlight,
@@ -242,23 +259,26 @@ func (r *Recorder) Snapshot() Snapshot {
 		Recent:    append([]Event(nil), r.recent...),
 	}
 	if r.completed > 0 {
-		s.Failed = r.completed - r.succeeded
-		s.SuccessRate = round1(float64(r.succeeded) / float64(r.completed) * 100)
-		s.HTTPSuccessRate = round1(float64(r.httpSuccess) / float64(r.completed) * 100)
-		s.AvgDurationMs = float64(r.durationSum) / float64(r.completed)
+		snapshot.Failed = r.completed - r.succeeded
+		snapshot.SuccessRate = round1(float64(r.succeeded) / float64(r.completed) * 100)
+		snapshot.HTTPSuccessRate = round1(float64(r.httpSuccess) / float64(r.completed) * 100)
+		snapshot.AvgDurationMs = float64(r.durationSum) / float64(r.completed)
 	}
 	r.mu.Unlock()
+
 	if r.archive != nil {
-		s.Archive = r.archive.stats()
+		snapshot.Archive = r.archive.stats()
 	}
-	return s
+
+	return snapshot
 }
 
 // ReadArchive 返回最近的归档事件（按时间倒序）。limit<=0 时回落 200，最大 1000。
-func (r *Recorder) ReadArchive(limit int, filter Filter) ([]Event, error) {
+func (r *Recorder) ReadArchive(limit int, filter *Filter) ([]Event, error) {
 	if r == nil || r.archive == nil {
 		return nil, nil
 	}
+
 	return r.archive.read(limit, filter)
 }
 
@@ -267,6 +287,7 @@ func (r *Recorder) Close() {
 	if r == nil || r.archive == nil {
 		return
 	}
+
 	r.archive.close()
 }
 
@@ -295,18 +316,23 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 	if !cfg.Enabled || strings.TrimSpace(cfg.Dir) == "" {
 		return &archiveWriter{cfg: cfg}
 	}
+
 	if cfg.RetentionDays <= 0 {
 		cfg.RetentionDays = 7
 	}
+
 	if cfg.MaxBytes <= 0 {
 		cfg.MaxBytes = 100 << 20
 	}
+
 	if cfg.FileMaxBytes <= 0 {
 		cfg.FileMaxBytes = defaultFileMax
 	}
+
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueue
 	}
+
 	w := &archiveWriter{
 		cfg:  cfg,
 		ch:   make(chan Event, cfg.QueueSize),
@@ -317,9 +343,12 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 		w.setErr(err)
 		w.cfg.Enabled = false
 		close(w.done)
+
 		return w
 	}
+
 	go w.run()
+
 	return w
 }
 
@@ -327,12 +356,13 @@ func (w *archiveWriter) enabled() bool {
 	return w != nil && w.cfg.Enabled && w.cfg.Dir != "" && w.done != nil
 }
 
-func (w *archiveWriter) enqueue(e Event) {
+func (w *archiveWriter) enqueue(event *Event) {
 	if !w.enabled() {
 		return
 	}
+
 	select {
-	case w.ch <- e:
+	case w.ch <- *event:
 	default:
 		w.dropped.Add(1)
 	}
@@ -340,12 +370,14 @@ func (w *archiveWriter) enqueue(e Event) {
 
 func (w *archiveWriter) run() {
 	defer close(w.done)
+
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case e := <-w.ch:
-			w.writeEvent(e)
+			w.writeEvent(&e)
 		case <-ticker.C:
 			w.flush()
 			w.prune()
@@ -353,10 +385,11 @@ func (w *archiveWriter) run() {
 			for {
 				select {
 				case e := <-w.ch:
-					w.writeEvent(e)
+					w.writeEvent(&e)
 				default:
 					w.flush()
 					w.closeFile()
+
 					return
 				}
 			}
@@ -364,28 +397,33 @@ func (w *archiveWriter) run() {
 	}
 }
 
-func (w *archiveWriter) writeEvent(e Event) {
-	raw, err := json.Marshal(e)
+func (w *archiveWriter) writeEvent(event2 *Event) {
+	raw, err := json.Marshal(event2)
 	if err != nil {
 		w.setErr(err)
 		return
 	}
-	now := e.Time
+
+	now := event2.Time
 	if now.IsZero() {
 		now = time.Now()
 	}
+
 	if err := w.ensureFile(now, len(raw)); err != nil {
 		w.setErr(err)
 		return
 	}
+
 	if _, err := w.buf.Write(raw); err != nil {
 		w.setErr(err)
 		return
 	}
+
 	if err := w.buf.WriteByte('\n'); err != nil {
 		w.setErr(err)
 		return
 	}
+
 	w.size += int64(len(raw)) + 1
 }
 
@@ -397,40 +435,49 @@ func (w *archiveWriter) ensureFile(now time.Time, rawLen int) error {
 			return err
 		}
 	}
+
 	if w.size > 0 && w.size+int64(rawLen)+1 > w.cfg.FileMaxBytes {
 		if err := w.openFile(now, true); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
 func (w *archiveWriter) openFile(now time.Time, rotate bool) error {
 	w.closeFile()
+
 	day := now.Format("2006-01-02")
+
 	if err := os.MkdirAll(w.cfg.Dir, 0o700); err != nil {
-		return err
+		return fmt.Errorf("openFile: %w", err)
 	}
+
 	path := filepath.Join(w.cfg.Dir, "requests-"+day+".jsonl")
 	if rotate {
 		path = nextArchivePath(w.cfg.Dir, day)
 	} else if latest := latestArchiveForDay(w.cfg.Dir, day); latest != "" {
 		path = filepath.Join(w.cfg.Dir, latest)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+
+	file2, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
-		return err
+		return fmt.Errorf("openFile: %w", err)
 	}
-	info, err := f.Stat()
+
+	info, err := file2.Stat()
 	if err != nil {
-		_ = f.Close()
-		return err
+		_ = file2.Close()
+		return fmt.Errorf("openFile: %w", err)
 	}
-	w.file = f
-	w.buf = bufio.NewWriterSize(f, 64<<10)
+
+	w.file = file2
+	w.buf = bufio.NewWriterSize(file2, 64<<10)
 	w.path = path
 	w.day = day
 	w.size = info.Size()
+
 	return nil
 }
 
@@ -439,43 +486,55 @@ func latestArchiveForDay(dir, day string) string {
 	if err != nil {
 		return ""
 	}
+
 	prefix := "requests-" + day
 	best := ""
 	bestIndex := -1
+
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
+
 		name := entry.Name()
 		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".jsonl") {
 			continue
 		}
+
 		idx := 0
+
 		if name[len(prefix):len(name)-len(".jsonl")] != "" {
 			part := strings.TrimSuffix(strings.TrimPrefix(name[len(prefix):], "."), ".jsonl")
+
 			n, err := strconv.Atoi(part)
 			if err != nil {
 				continue
 			}
+
 			idx = n
 		}
+
 		if idx > bestIndex {
 			bestIndex = idx
 			best = name
 		}
 	}
+
 	if best == "" {
 		return ""
 	}
+
 	return best
 }
 
 func nextArchivePath(dir, day string) string {
 	base := filepath.Join(dir, "requests-"+day)
+
 	path := base + ".jsonl"
 	for i := 1; fileExists(path); i++ {
 		path = fmt.Sprintf("%s.%d.jsonl", base, i)
 	}
+
 	return path
 }
 
@@ -488,6 +547,7 @@ func (w *archiveWriter) flush() {
 	if w.buf == nil {
 		return
 	}
+
 	if err := w.buf.Flush(); err != nil {
 		w.setErr(err)
 	}
@@ -497,9 +557,11 @@ func (w *archiveWriter) closeFile() {
 	if w.buf != nil {
 		_ = w.buf.Flush()
 	}
+
 	if w.file != nil {
 		_ = w.file.Close()
 	}
+
 	w.file = nil
 	w.buf = nil
 	w.path = ""
@@ -519,7 +581,9 @@ func isArchiveFile(entry os.DirEntry) bool {
 	if entry.IsDir() {
 		return false
 	}
+
 	name := entry.Name()
+
 	return strings.HasPrefix(name, "requests-") && strings.HasSuffix(name, ".jsonl")
 }
 
@@ -527,21 +591,27 @@ func isArchiveFile(entry os.DirEntry) bool {
 func scanArchiveItems(dir string) ([]archiveItem, int64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("scanArchiveItems: %w", err)
 	}
+
 	items := make([]archiveItem, 0, len(entries))
+
 	var total int64
+
 	for _, entry := range entries {
 		if !isArchiveFile(entry) {
 			continue
 		}
+
 		info, err := entry.Info()
 		if err != nil {
 			continue
 		}
+
 		items = append(items, archiveItem{path: filepath.Join(dir, entry.Name()), size: info.Size(), mtime: info.ModTime()})
 		total += info.Size()
 	}
+
 	return items, total, nil
 }
 
@@ -549,15 +619,18 @@ func (w *archiveWriter) prune() {
 	if !w.enabled() {
 		return
 	}
+
 	items, total, err := scanArchiveItems(w.cfg.Dir)
 	if err != nil {
 		w.setErr(err)
 		return
 	}
+
 	sort.Slice(items, func(i, j int) bool {
 		if items[i].mtime.Equal(items[j].mtime) {
 			return items[i].path < items[j].path
 		}
+
 		return items[i].mtime.Before(items[j].mtime)
 	})
 	w.removeExpired(items, total)
@@ -566,45 +639,53 @@ func (w *archiveWriter) prune() {
 // removeExpired 按「最早优先」删除过期或超额的归档文件，跳过当前写入文件。
 func (w *archiveWriter) removeExpired(items []archiveItem, total int64) {
 	cutoff := time.Now().AddDate(0, 0, -w.cfg.RetentionDays)
-	for _, it := range items {
-		if it.path == w.path || (!it.mtime.Before(cutoff) && total <= w.cfg.MaxBytes) {
+	for _, item := range items {
+		if item.path == w.path || (!item.mtime.Before(cutoff) && total <= w.cfg.MaxBytes) {
 			continue
 		}
-		if err := os.Remove(it.path); err == nil {
-			total -= it.size
+
+		if err := os.Remove(item.path); err == nil {
+			total -= item.size
 		}
 	}
 }
 
-func (w *archiveWriter) read(limit int, filter Filter) ([]Event, error) {
+func (w *archiveWriter) read(limit int, filter *Filter) ([]Event, error) {
 	if !w.enabled() {
 		return nil, nil
 	}
+
 	limit = clampReadLimit(limit)
+
 	entries, err := os.ReadDir(w.cfg.Dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read: %w", err)
 	}
 	// 文件读取顺序无关紧要：结果一律按事件时间排序。不能依赖归档文件的 mtime 还原时间
 	// 顺序——同一秒内连续轮转写出的多个文件 mtime 经常完全相同（Linux 文件时间戳粒度粗），
 	// os.ReadDir 的字典序又会把装着最早事件的基准文件 requests-<day>.jsonl 排在
 	// requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复备份后 mtime 更不可信。
 	var out []Event
+
 	for _, entry := range entries {
 		if !isArchiveFile(entry) {
 			continue
 		}
+
 		rows, err := readFile(filepath.Join(w.cfg.Dir, entry.Name()), filter)
 		if err != nil {
 			return out, err
 		}
+
 		out = append(out, rows...)
 	}
 	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+
 	if len(out) > limit {
 		out = out[:limit]
 	}
+
 	return out, nil
 }
 
@@ -613,43 +694,56 @@ func clampReadLimit(limit int) int {
 	if limit <= 0 {
 		return 200
 	}
+
 	if limit > defaultReadMax {
 		return defaultReadMax
 	}
+
 	return limit
 }
 
-func readFile(path string, filter Filter) ([]Event, error) {
-	f, err := os.Open(path)
+func readFile(path string, filter *Filter) ([]Event, error) {
+	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("readFile: %w", err)
 	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+
 	var out []Event
+
 	for scanner.Scan() {
 		var e Event
-		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(e) {
+		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(&e) {
 			continue
 		}
+
 		out = append(out, e)
 	}
-	return out, scanner.Err()
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("read archive: %w", err)
+	}
+
+	return out, nil
 }
 
-func (f Filter) match(e Event) bool {
-	if f.Outcome != "" && e.Outcome != f.Outcome {
+func (f *Filter) match(event4 *Event) bool {
+	if f.Outcome != "" && event4.Outcome != f.Outcome {
 		return false
 	}
-	if !f.matchTextFields(e) {
+
+	if !f.matchTextFields(event4) {
 		return false
 	}
-	return f.matchTimeRange(e.Time)
+
+	return f.matchTimeRange(event4.Time)
 }
 
 // matchTextFields 对所有字符串字段做大小写不敏感的包含匹配，全部命中才返回 true。
-func (f Filter) matchTextFields(e Event) bool {
+func (f *Filter) matchTextFields(e *Event) bool {
 	return containsFold(e.Account, f.Account) &&
 		containsFold(e.Model, f.Model) &&
 		containsFold(e.ClientIP, f.ClientIP) &&
@@ -657,13 +751,15 @@ func (f Filter) matchTextFields(e Event) bool {
 }
 
 // matchTimeRange 闭区间时间过滤，From/To 任一侧零值即该侧不设界。
-func (f Filter) matchTimeRange(t time.Time) bool {
+func (f *Filter) matchTimeRange(t time.Time) bool {
 	if !f.From.IsZero() && t.Before(f.From) {
 		return false
 	}
+
 	if !f.To.IsZero() && t.After(f.To) {
 		return false
 	}
+
 	return true
 }
 
@@ -672,35 +768,48 @@ func containsFold(haystack, needle string) bool {
 	if needle == "" {
 		return true
 	}
+
 	return strings.Contains(strings.ToLower(haystack), strings.ToLower(needle))
 }
 
 func (w *archiveWriter) stats() ArchiveStats {
-	s := ArchiveStats{Enabled: w.enabled(), Dir: w.cfg.Dir, DroppedWrites: w.dropped.Load(), LastError: w.errString()}
-	if !s.Enabled {
-		return s
+	archiveStats := ArchiveStats{
+		Enabled:       w.enabled(),
+		Dir:           w.cfg.Dir,
+		DroppedWrites: w.dropped.Load(),
+		LastError:     w.errString(),
+		Files:         0,
+		Bytes:         0,
 	}
+	if !archiveStats.Enabled {
+		return archiveStats
+	}
+
 	entries, err := os.ReadDir(w.cfg.Dir)
 	if err != nil {
-		s.LastError = err.Error()
-		return s
+		archiveStats.LastError = err.Error()
+		return archiveStats
 	}
+
 	for _, entry := range entries {
 		if !isArchiveFile(entry) {
 			continue
 		}
+
 		if info, err := entry.Info(); err == nil {
-			s.Files++
-			s.Bytes += info.Size()
+			archiveStats.Files++
+			archiveStats.Bytes += info.Size()
 		}
 	}
-	return s
+
+	return archiveStats
 }
 
 func (w *archiveWriter) close() {
 	if !w.enabled() {
 		return
 	}
+
 	w.closeOnce.Do(func() {
 		close(w.stop)
 		<-w.done
@@ -711,6 +820,7 @@ func (w *archiveWriter) setErr(err error) {
 	if err == nil {
 		return
 	}
+
 	w.lastErrMu.Lock()
 	w.lastErr = err.Error()
 	w.lastErrMu.Unlock()
@@ -719,5 +829,6 @@ func (w *archiveWriter) setErr(err error) {
 func (w *archiveWriter) errString() string {
 	w.lastErrMu.Lock()
 	defer w.lastErrMu.Unlock()
+
 	return w.lastErr
 }

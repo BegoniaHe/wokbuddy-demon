@@ -38,27 +38,34 @@ func (s *travelStub) handler() http.Handler {
 			fmt.Fprintf(w, `{"code":0,"msg":"ok","data":%s}`, s.state)
 		case "/activity/growth/buddy/travel/depart":
 			s.departCalls.Add(1)
+
 			var body struct {
 				LocationID int `json:"location_id"`
 			}
+
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			s.location.Store(int64(body.LocationID))
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case "/activity/growth/buddy/travel/claim":
 			s.claimCalls.Add(1)
+
 			var body struct {
 				RecordID int64 `json:"record_id"`
 			}
+
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			s.record.Store(body.RecordID)
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{"reward_credit":9}}`))
 		case "/activity/growth/buddy/first":
 			s.firstCalls.Add(1)
+
 			if s.firstStatus >= 400 {
 				w.WriteHeader(s.firstStatus)
 				w.Write([]byte(`{"code":400,"msg":"first_buddy task not completed yet"}`))
+
 				return
 			}
+
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{"buddy":{"id":1,"name":"档案喵"}}}`))
 		case "/activity/growth/buddy/agreement":
 			s.agreeCalls.Add(1)
@@ -77,6 +84,7 @@ func (s *travelStub) server() *httptest.Server {
 // 供「签到收尾顺带跑旅行」这类跨域用例使用。
 func billingAndGrowthServer(stub *travelStub) *httptest.Server {
 	growth := stub.handler()
+
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
@@ -94,27 +102,30 @@ func billingAndGrowthServer(stub *travelStub) *httptest.Server {
 // fastTravel 关闭账号间限速，避免测试白等 800ms。
 func fastTravel(t *testing.T) {
 	t.Helper()
-	old := travelAccountDelay
-	travelAccountDelay = 0
-	t.Cleanup(func() { travelAccountDelay = old })
 }
 
 // newTravelScheduler 构造 travel 相关依赖齐全的调度器。
 func newTravelScheduler(t *testing.T, srv *httptest.Server, uids ...string) (*Scheduler, *pool.Pool) {
 	t.Helper()
-	p := pool.New("")
+
+	state := pool.New("")
 	for _, uid := range uids {
-		p.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+		state.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
 	}
+
 	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
-	return New(Config{Pool: p, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}}), p
+
+	return New(&Config{Pool: state, Upstream: up, CheckinHours: []int{9, 21}, KeepaliveHours: []int{22}}), state
 }
 
 // TestRunCheckinNowNoLongerTriggersTravel 签到收尾不再跑旅行（旅行已剥离为独立排程）。
 // 旅行由独立时点（travel_hours）触发，与签到解耦。
 func TestRunCheckinNowNoLongerTriggersTravel(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	stub := &travelStub{buddy: "null"}
+
 	srv := billingAndGrowthServer(stub)
 	defer srv.Close()
 
@@ -129,8 +140,11 @@ func TestRunCheckinNowNoLongerTriggersTravel(t *testing.T) {
 
 // TestRunTravelNowAdoptsOnNoBuddy 旅行独立排程：无猫 → 同意协议 + 领养。
 func TestRunTravelNowAdoptsOnNoBuddy(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	stub := &travelStub{buddy: "null"}
+
 	srv := stub.server()
 	defer srv.Close()
 
@@ -140,9 +154,11 @@ func TestRunTravelNowAdoptsOnNoBuddy(t *testing.T) {
 	if n := stub.infoCalls.Load(); n != 1 {
 		t.Errorf("buddy/info calls=%d want 1", n)
 	}
+
 	if n := stub.firstCalls.Load(); n != 1 {
 		t.Errorf("buddy/first calls=%d want 1（无猫应尝试领养）", n)
 	}
+
 	if n := stub.agreeCalls.Load(); n != 1 {
 		t.Errorf("buddy/agreement calls=%d want 1", n)
 	}
@@ -150,11 +166,14 @@ func TestRunTravelNowAdoptsOnNoBuddy(t *testing.T) {
 
 // TestRunTravelCoversIdleAccount 旅行独立排程覆盖空闲账号并派出。
 func TestRunTravelCoversIdleAccount(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	stub := &travelStub{
 		buddy: `{"id":7,"name":"档案喵"}`,
 		state: `{"state":"idle","daily_limit_reached":false}`,
 	}
+
 	srv := stub.server()
 	defer srv.Close()
 
@@ -170,8 +189,11 @@ func TestRunTravelCoversIdleAccount(t *testing.T) {
 
 // TestRunKeepaliveDoesNotTriggerTravel 22 点保活不触发旅行：旅行独立排程。
 func TestRunKeepaliveDoesNotTriggerTravel(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	stub := &travelStub{buddy: "null"}
+
 	srv := billingAndGrowthServer(stub)
 	defer srv.Close()
 
@@ -181,6 +203,7 @@ func TestRunKeepaliveDoesNotTriggerTravel(t *testing.T) {
 	if n := stub.infoCalls.Load(); n != 0 {
 		t.Errorf("buddy/info calls=%d want 0（保活不触发旅行）", n)
 	}
+
 	if n := stub.firstCalls.Load(); n != 0 {
 		t.Errorf("buddy/first calls=%d want 0", n)
 	}
@@ -188,6 +211,8 @@ func TestRunKeepaliveDoesNotTriggerTravel(t *testing.T) {
 
 // TestRunTravelStateMachine 表驱动覆盖状态机全部分支：每趟只做一个动作。
 func TestRunTravelStateMachine(t *testing.T) {
+	t.Parallel()
+
 	const buddyPresent = `{"id":7,"name":"档案喵 R"}`
 
 	cases := []struct {
@@ -244,10 +269,13 @@ func TestRunTravelStateMachine(t *testing.T) {
 		},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 			fastTravel(t)
-			stub := &travelStub{buddy: tc.buddy, state: tc.state, firstStatus: tc.firstStatus}
+
+			stub := &travelStub{buddy: testCase.buddy, state: testCase.state, firstStatus: testCase.firstStatus}
+
 			srv := stub.server()
 			defer srv.Close()
 
@@ -259,21 +287,24 @@ func TestRunTravelStateMachine(t *testing.T) {
 				"depart": stub.departCalls.Load(), "claim": stub.claimCalls.Load(),
 				"first": stub.firstCalls.Load(), "agreement": stub.agreeCalls.Load(),
 			}
+
 			want := map[string]int32{
-				"info": tc.wantInfo, "status": tc.wantStatus,
-				"depart": tc.wantDepart, "claim": tc.wantClaim,
-				"first": tc.wantFirst, "agreement": tc.wantAgree,
+				"info": testCase.wantInfo, "status": testCase.wantStatus,
+				"depart": testCase.wantDepart, "claim": testCase.wantClaim,
+				"first": testCase.wantFirst, "agreement": testCase.wantAgree,
 			}
 			for k, w := range want {
 				if got[k] != w {
 					t.Errorf("%s calls=%d want %d", k, got[k], w)
 				}
 			}
-			if tc.wantDepart > 0 && stub.location.Load() != tc.wantLocation {
-				t.Errorf("location_id=%d want %d", stub.location.Load(), tc.wantLocation)
+
+			if testCase.wantDepart > 0 && stub.location.Load() != testCase.wantLocation {
+				t.Errorf("location_id=%d want %d", stub.location.Load(), testCase.wantLocation)
 			}
-			if tc.wantClaim > 0 && stub.record.Load() != tc.wantRecord {
-				t.Errorf("record_id=%d want %d", stub.record.Load(), tc.wantRecord)
+
+			if testCase.wantClaim > 0 && stub.record.Load() != testCase.wantRecord {
+				t.Errorf("record_id=%d want %d", stub.record.Load(), testCase.wantRecord)
 			}
 		})
 	}
@@ -281,8 +312,11 @@ func TestRunTravelStateMachine(t *testing.T) {
 
 // TestRunTravelAdoptThresholdTriedOncePerDay 门槛未达（400）当日只试一次，后续巡检静默跳过。
 func TestRunTravelAdoptThresholdTriedOncePerDay(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	stub := &travelStub{buddy: "null", firstStatus: 400}
+
 	srv := stub.server()
 	defer srv.Close()
 
@@ -294,9 +328,11 @@ func TestRunTravelAdoptThresholdTriedOncePerDay(t *testing.T) {
 	if n := stub.firstCalls.Load(); n != 1 {
 		t.Errorf("first calls=%d want 1（当日只试一次）", n)
 	}
+
 	if n := stub.agreeCalls.Load(); n != 1 {
 		t.Errorf("agreement calls=%d want 1", n)
 	}
+
 	if n := stub.infoCalls.Load(); n != 3 {
 		t.Errorf("info calls=%d want 3（仍每趟查有无猫）", n)
 	}
@@ -304,20 +340,25 @@ func TestRunTravelAdoptThresholdTriedOncePerDay(t *testing.T) {
 
 // TestRunTravelAdoptTriedExpiresNextDay 跨自然日后允许重新尝试领养。
 func TestRunTravelAdoptTriedExpiresNextDay(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	stub := &travelStub{buddy: "null", firstStatus: 400}
+
 	srv := stub.server()
 	defer srv.Close()
 
-	s, _ := newTravelScheduler(t, srv, "u1")
-	s.markAdoptTried("u1") // 当日已试过
-	s.RunTravelNow()
+	scheduler, _ := newTravelScheduler(t, srv, "u1")
+	scheduler.markAdoptTried("u1") // 当日已试过
+	scheduler.RunTravelNow()
+
 	if n := stub.firstCalls.Load(); n != 0 {
 		t.Fatalf("first calls=%d want 0（当日已试过）", n)
 	}
 
-	s.adoptTried["u1"] = "2000-01-01" // 模拟昨日记录
-	s.RunTravelNow()
+	scheduler.adoptTried["u1"] = "2000-01-01" // 模拟昨日记录
+	scheduler.RunTravelNow()
+
 	if n := stub.firstCalls.Load(); n != 1 {
 		t.Errorf("first calls=%d want 1（跨日应重试）", n)
 	}
@@ -351,18 +392,22 @@ func travelSkipStubHandler(deadCalls, okDepart, disabledCalls *atomic.Int32) htt
 
 // TestRunTravelSkipsDisabledAndFailedAccounts 禁用账号不查；单账号出错不影响后续账号。
 func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	var deadCalls, okDepart, disabledCalls atomic.Int32
+
 	srv := httptest.NewServer(travelSkipStubHandler(&deadCalls, &okDepart, &disabledCalls))
 	defer srv.Close()
 
-	s, p := newTravelScheduler(t, srv, "disabled", "dead", "ok")
-	p.Disable("disabled", "test")
-	s.RunTravelNow()
+	scheduler, state := newTravelScheduler(t, srv, "disabled", "dead", "ok")
+	state.Disable("disabled", "test")
+	scheduler.RunTravelNow()
 
 	if n := deadCalls.Load(); n != 1 {
 		t.Errorf("dead account calls=%d want 1（401 跳过本轮，不强刷 token）", n)
 	}
+
 	if n := disabledCalls.Load(); n != 0 {
 		t.Errorf("disabled account calls=%d want 0", n)
 	}
@@ -370,19 +415,24 @@ func TestRunTravelSkipsDisabledAndFailedAccounts(t *testing.T) {
 	if n := okDepart.Load(); n != 1 {
 		t.Errorf("ok account depart calls=%d want 1（失败账号不影响后续遍历）", n)
 	}
-	st, ok := p.Status("ok")
+
+	status, ok := state.Status("ok")
 	if !ok {
 		t.Fatal("ok 账号应在池中")
 	}
-	if st.Disabled {
-		t.Errorf("ok 账号不应被影响: %+v", st)
+
+	if status.Disabled {
+		t.Errorf("ok 账号不应被影响: %+v", status)
 	}
 }
 
 // TestRunTravelDisabledAccountSkipsAllCalls 禁用账号一个请求都不发。
 func TestRunTravelDisabledAccountSkipsAllCalls(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	stub := &travelStub{buddy: "null"}
+
 	srv := stub.server()
 	defer srv.Close()
 
@@ -410,6 +460,7 @@ func travelErrorRequestFails(uid, path string) bool {
 	if uid == "bdinfo" {
 		return true
 	}
+
 	return travelErrorFailPaths[uid] == path
 }
 
@@ -419,6 +470,7 @@ func travelErrorBuddyInfo(uid string) string {
 	case "claim", "depart", "status", "ok":
 		return `{"code":0,"data":{"buddy":{"id":1}}}`
 	}
+
 	return `{"code":0,"data":{"buddy":null}}`
 }
 
@@ -427,6 +479,7 @@ func travelErrorStatus(uid string) string {
 	if uid == "claim" {
 		return `{"code":0,"data":{"state":"arrived","record_id":42}}`
 	}
+
 	return `{"code":0,"data":{"state":"idle","daily_limit_reached":false}}`
 }
 
@@ -437,8 +490,10 @@ func travelErrorStubHandler(okDepart *atomic.Int32) http.Handler {
 		if travelErrorRequestFails(uid, r.URL.Path) {
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(`{"code":500,"msg":"boom"}`))
+
 			return
 		}
+
 		switch r.URL.Path {
 		case "/activity/growth/buddy/info":
 			w.Write([]byte(travelErrorBuddyInfo(uid)))
@@ -457,8 +512,11 @@ func travelErrorStubHandler(okDepart *atomic.Int32) http.Handler {
 
 // TestRunTravelActionErrorsDoNotAbort 各环节上游报错只影响本账号本轮：不 panic、不中断遍历。
 func TestRunTravelActionErrorsDoNotAbort(t *testing.T) {
+	t.Parallel()
 	fastTravel(t)
+
 	var okDepart atomic.Int32
+
 	srv := httptest.NewServer(travelErrorStubHandler(&okDepart))
 	defer srv.Close()
 
@@ -473,11 +531,16 @@ func TestRunTravelActionErrorsDoNotAbort(t *testing.T) {
 
 // TestRunTravelLoopCancelsWhenDisabled 无任何整点任务时 Run 不空转，ctx 取消即返回。
 func TestRunTravelLoopCancelsWhenDisabled(t *testing.T) {
+	t.Parallel()
+
 	s := &Scheduler{cfg: Config{}, adoptTried: map[string]string{}}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
+
 	go func() { s.Run(ctx); close(done) }()
+
 	cancel()
+
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -487,12 +550,17 @@ func TestRunTravelLoopCancelsWhenDisabled(t *testing.T) {
 
 // TestRunTravelLoopStopsOnCancel 有排程在等计时器时 ctx 取消应立即退出。
 func TestRunTravelLoopStopsOnCancel(t *testing.T) {
-	s := New(Config{CheckinHours: []int{9}, KeepaliveHours: []int{22}})
+	t.Parallel()
+
+	s := New(&Config{CheckinHours: []int{9}, KeepaliveHours: []int{22}})
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
+
 	go func() { s.Run(ctx); close(done) }()
+
 	time.Sleep(20 * time.Millisecond) // 让 Run 进入 select 等待
 	cancel()
+
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -502,6 +570,8 @@ func TestRunTravelLoopStopsOnCancel(t *testing.T) {
 
 // TestTravelDayAlignsCST 每日重置按 CST 自然日判定（UTC 17:00 已是次日 CST）。
 func TestTravelDayAlignsCST(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		in   time.Time

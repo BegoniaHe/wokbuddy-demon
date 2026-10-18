@@ -20,12 +20,18 @@ import (
 // desktopImportMaxBody 导入请求体上限；key 与路径列表都很小。
 const desktopImportMaxBody = 64 << 10
 
+var (
+	errRequestBodyTooLarge = errors.New("request body too large")
+	errAtRestSecretTooLong = errors.New("at-rest secret too long")
+)
+
 // desktopScan 扫描本机桌面客户端凭据目录，只返回元数据（不含 token）。
 func (p *Panel) desktopScan(w http.ResponseWriter, _ *http.Request) {
 	accounts := desktopcred.Scan()
 	if accounts == nil {
 		accounts = []desktopcred.Account{}
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": accounts})
 }
 
@@ -37,21 +43,26 @@ func (p *Panel) desktopImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	discovered := desktopcred.Discover()
+
 	allowed := make(map[string]bool, len(discovered))
 	for _, path := range discovered {
 		allowed[path] = true
 	}
+
 	targets := req.Paths
 	if len(targets) == 0 {
 		targets = discovered
 	}
+
 	if len(targets) > 100 {
 		writeErr(w, http.StatusBadRequest, "too many credential files")
 		return
 	}
+
 	imported, errs, importedAuths := p.importDesktopFiles(targets, allowed, req.Key)
-	p.postImportCockpitAccounts(importedAuths)
+	p.postImportAccounts(importedAuths)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"total":    len(targets),
@@ -70,27 +81,34 @@ func parseDesktopImport(r *http.Request) (struct {
 		Key   string   `json:"key"`
 		Paths []string `json:"paths"`
 	}
+
 	raw, err := io.ReadAll(io.LimitReader(r.Body, desktopImportMaxBody+1))
 	if err != nil {
 		return req, fmt.Errorf("read body: %w", err)
 	}
+
 	if len(raw) > desktopImportMaxBody {
-		return req, errors.New("request body too large")
+		return req, errRequestBodyTooLarge
 	}
+
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return req, fmt.Errorf("invalid json: %w", err)
 	}
+
 	req.Key = strings.TrimSpace(req.Key)
 	if len(req.Key) > 1024 {
-		return req, errors.New("at-rest secret too long")
+		return req, errAtRestSecretTooLong
 	}
+
 	return req, nil
 }
 
 // importDesktopFiles 逐文件导入；只允许发现列表内的路径，避免任意文件读取。
 func (p *Panel) importDesktopFiles(targets []string, allowed map[string]bool, key string) (int, []string, []*auth.Auth) {
 	var imported int
+
 	errs := make([]string, 0, len(targets))
+
 	importedAuths := make([]*auth.Auth, 0, len(targets))
 	for _, path := range targets {
 		base := filepath.Base(path)
@@ -98,23 +116,29 @@ func (p *Panel) importDesktopFiles(targets []string, allowed map[string]bool, ke
 			errs = append(errs, base+": not a discovered credential file")
 			continue
 		}
-		a, err := desktopcred.ImportFile(path, key)
+
+		account, err := desktopcred.ImportFile(path, key)
 		if err != nil {
 			errs = append(errs, base+": "+err.Error())
 			continue
 		}
-		uid := strings.TrimSpace(a.UID)
+
+		uid := strings.TrimSpace(account.UID)
 		if !validImportUID(uid) {
 			errs = append(errs, base+": invalid uid")
 			continue
 		}
-		a.FilePath = filepath.Join(p.cfg.AuthDir, "workbuddy-"+uid+".json")
-		if err := p.persistImportedAuth(a, a.Realm(), uid); err != nil {
+
+		account.FilePath = filepath.Join(p.cfg.AuthDir, "workbuddy-"+uid+".json")
+		if err := p.persistImportedAuth(account, account.Realm(), uid); err != nil {
 			errs = append(errs, err.Error())
 			continue
 		}
+
 		imported++
-		importedAuths = append(importedAuths, a)
+
+		importedAuths = append(importedAuths, account)
 	}
+
 	return imported, errs, importedAuths
 }

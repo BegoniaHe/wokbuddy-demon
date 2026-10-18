@@ -37,40 +37,49 @@ func (f *fakeResponder) Stream(io.Reader, func(string) string, *upstream.MarkupR
 // TestChatFlowEmitsThroughPort 核心（chatFlow）只通过 chatResponder 端口写出结果：
 // 不经 httptest / http.ResponseWriter，也能驱动末端错误透传。
 func TestChatFlowEmitsThroughPort(t *testing.T) {
+	t.Parallel()
+
 	h := &Handler{cfg: Config{}}
 	out := &fakeResponder{}
-	f := h.newChatFlow(chatInput{
+	chatFlow2 := h.newChatFlow(&chatInput{
 		body:  []byte(`{"model":"cn:glm-5.2","stream":false}`),
 		model: "cn:glm-5.2",
 	}, out)
 
-	f.writeFinalError()
+	chatFlow2.writeFinalError()
 
 	if out.errStatus != http.StatusServiceUnavailable {
 		t.Fatalf("errStatus=%d want 503", out.errStatus)
 	}
+
 	if out.errCode != "no_healthy_account" {
 		t.Fatalf("errCode=%q want no_healthy_account", out.errCode)
 	}
-	if f.st.status != http.StatusServiceUnavailable {
-		t.Fatalf("stat status=%d want 503", f.st.status)
+
+	if chatFlow2.st.status != http.StatusServiceUnavailable {
+		t.Fatalf("stat status=%d want 503", chatFlow2.st.status)
 	}
 }
 
 // TestUnknownPathReturnsOpenAIError 未注册路径返回 OpenAI 风格 JSON 404，
 // 而非 ServeMux 裸 404；含方法不匹配（GET /v1/chat/completions）也落同一兜底。
 func TestUnknownPathReturnsOpenAIError(t *testing.T) {
-	h := NewHandler(Config{})
-	for _, tc := range []struct{ method, path string }{
+	t.Parallel()
+
+	handler := NewHandler(&Config{})
+
+	for _, testCase := range []struct{ method, path string }{
 		{http.MethodGet, "/v1/unknown"},
 		{http.MethodPost, "/v1/embeddings"},
 		{http.MethodGet, "/v1/chat/completions"},
 	} {
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		handler.ServeHTTP(rec, httptest.NewRequest(testCase.method, testCase.path, nil))
+
 		if rec.Code != http.StatusNotFound {
-			t.Errorf("%s %s: status=%d want 404", tc.method, tc.path, rec.Code)
+			t.Errorf("%s %s: status=%d want 404", testCase.method, testCase.path, rec.Code)
 		}
+
 		var body struct {
 			Error struct {
 				Message string `json:"message"`
@@ -78,13 +87,15 @@ func TestUnknownPathReturnsOpenAIError(t *testing.T) {
 			} `json:"error"`
 		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-			t.Fatalf("%s %s: not json: %v (body=%q)", tc.method, tc.path, err, rec.Body.String())
+			t.Fatalf("%s %s: not json: %v (body=%q)", testCase.method, testCase.path, err, rec.Body.String())
 		}
+
 		if body.Error.Type != "invalid_request_error" {
-			t.Errorf("%s %s: type=%q want invalid_request_error", tc.method, tc.path, body.Error.Type)
+			t.Errorf("%s %s: type=%q want invalid_request_error", testCase.method, testCase.path, body.Error.Type)
 		}
+
 		if body.Error.Message == "" {
-			t.Errorf("%s %s: empty message", tc.method, tc.path)
+			t.Errorf("%s %s: empty message", testCase.method, testCase.path)
 		}
 	}
 }

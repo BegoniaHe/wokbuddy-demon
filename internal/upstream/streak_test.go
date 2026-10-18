@@ -10,22 +10,28 @@ import (
 
 // TestGrowthStreakParsesDays 解析 data.streak.days（probe_active.py 同口径）。
 func TestGrowthStreakParsesDays(t *testing.T) {
+	t.Parallel()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/activity/growth/streak" {
 			t.Errorf("path=%s want /activity/growth/streak", r.URL.Path)
 		}
+
 		if r.Method != http.MethodGet {
 			t.Errorf("method=%s want GET", r.Method)
 		}
+
 		w.Write([]byte(`{"code":0,"msg":"ok","data":{"streak":{"days":3,"total_rewards":1}}}`))
 	}))
 	defer srv.Close()
 
 	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+
 	days, err := c.GrowthStreak(&auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil {
 		t.Fatalf("GrowthStreak: %v", err)
 	}
+
 	if days != 3 {
 		t.Errorf("days=%d want 3", days)
 	}
@@ -33,16 +39,20 @@ func TestGrowthStreakParsesDays(t *testing.T) {
 
 // TestGrowthStreakDefaultZero 缺 streak/days 字段 → 0（days==0 即自检告警信号）。
 func TestGrowthStreakDefaultZero(t *testing.T) {
+	t.Parallel()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"code":0,"data":{}}`))
 	}))
 	defer srv.Close()
 
 	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+
 	days, err := c.GrowthStreak(&auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil {
 		t.Fatalf("GrowthStreak: %v", err)
 	}
+
 	if days != 0 {
 		t.Errorf("days=%d want 0（缺字段零值）", days)
 	}
@@ -50,6 +60,8 @@ func TestGrowthStreakDefaultZero(t *testing.T) {
 
 // TestGrowthStreakServerError HTTP 非 2xx → *Error。
 func TestGrowthStreakServerError(t *testing.T) {
+	t.Parallel()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(`boom`))
@@ -64,6 +76,8 @@ func TestGrowthStreakServerError(t *testing.T) {
 
 // TestGrowthStreakBusinessCode 业务 code 非 0 → 错误（非 2xx 之外的静默失败也要能被观测）。
 func TestGrowthStreakBusinessCode(t *testing.T) {
+	t.Parallel()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"code":12000,"msg":"internal"}`))

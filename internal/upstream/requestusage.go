@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -25,6 +26,8 @@ const requestUsageTimeLayout = "2006-01-02 15:04:05"
 // requestUsageMaxRespBytes 逐笔用量单页响应上限。响应包含完整 prompt（input），
 // 实测 1000 条约 0.7~1.3 MiB；取 8 MiB 留足余量，同时避免无界缓冲。
 const requestUsageMaxRespBytes int64 = 8 << 20
+
+var errRequestUsageFailed = errors.New("RequestUsage failed")
 
 // requestUsagePaths 返回路径候选：先主路径，404 时再试 /v2（见上方注释）。
 func (c *Client) requestUsagePaths() []string {
@@ -58,26 +61,31 @@ type RequestUsagePage struct {
 // 时间是 UTC+8 墙钟字符串（不是 Unix 秒），分页字段是 pageNum（不是 page）；响应
 // data 含 data 列表 + total。解析对字段名宽容（parseRequestUsage），以适配上游命名
 // 的可能差异。
-func (c *Client) RequestUsage(a *auth.Auth, start, end time.Time, page, pageSize int) (*RequestUsagePage, error) {
+func (c *Client) RequestUsage(account *auth.Auth, start, end time.Time, page, pageSize int) (*RequestUsagePage, error) {
 	if pageSize <= 0 {
 		pageSize = 100
 	}
+
 	if page <= 0 {
 		page = 1
 	}
+
 	if start.IsZero() || end.IsZero() || !end.After(start) {
-		return nil, fmt.Errorf("request usage: invalid time range %v..%v", start, end)
+		return nil, fmt.Errorf("request usage: invalid time range %v..%v: %w", start, end, errRequestUsageFailed)
 	}
+
 	body := map[string]any{
 		"startTime": start.In(softRateResetLoc).Format(requestUsageTimeLayout),
 		"endTime":   end.In(softRateResetLoc).Format(requestUsageTimeLayout),
 		"pageNum":   page,
 		"pageSize":  pageSize,
 	}
-	data, err := c.billingMeterJSONLimit(a, c.requestUsagePaths(), body, requestUsageMaxRespBytes)
+
+	data, err := c.billingMeterJSONLimit(account, c.requestUsagePaths(), body, requestUsageMaxRespBytes)
 	if err != nil {
 		return nil, err
 	}
+
 	return parseRequestUsage(data, page, pageSize)
 }
 
@@ -88,14 +96,17 @@ func parseRequestUsage(data json.RawMessage, page, pageSize int) (*RequestUsageP
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil, fmt.Errorf("parse request usage: %w", err)
 	}
+
 	list := firstListField(root, "list", "records", "items", "rows", "data")
 	reportedTotal := firstIntField(root, "total", "totalCount", "count", "totalNum")
-	out := &RequestUsagePage{Total: reportedTotal}
+	out := &RequestUsagePage{Total: reportedTotal, Records: nil, NextPage: 0}
+
 	for _, item := range list {
 		m, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		out.Records = append(out.Records, RequestUsageRecord{
 			RequestID: firstStringField(m, "requestId", "requestID", "id"),
 			Model:     firstStringField(m, "model", "modelName", "requestModel", "requestModelName"),
@@ -103,6 +114,7 @@ func parseRequestUsage(data json.RawMessage, page, pageSize int) (*RequestUsageP
 			Time:      parseUsageTime(firstAny(m, "requestTime", "time", "createTime", "timestamp", "requestTimeMs")),
 		})
 	}
+
 	if out.Total <= 0 {
 		out.Total = len(out.Records)
 	}
@@ -112,6 +124,7 @@ func parseRequestUsage(data json.RawMessage, page, pageSize int) (*RequestUsageP
 		(out.Total > page*pageSize || (reportedTotal <= 0 && len(out.Records) >= pageSize)) {
 		out.NextPage = page + 1
 	}
+
 	return out, nil
 }
 
@@ -122,6 +135,7 @@ func firstListField(m map[string]any, keys ...string) []any {
 			return v
 		}
 	}
+
 	return nil
 }
 
@@ -132,6 +146,7 @@ func firstAny(m map[string]any, keys ...string) any {
 			return v
 		}
 	}
+
 	return nil
 }
 
@@ -142,6 +157,7 @@ func firstStringField(m map[string]any, keys ...string) string {
 			return v
 		}
 	}
+
 	return ""
 }
 
@@ -157,6 +173,7 @@ func firstIntField(m map[string]any, keys ...string) int {
 			}
 		}
 	}
+
 	return 0
 }
 
@@ -172,6 +189,7 @@ func firstFloatField(m map[string]any, keys ...string) float64 {
 			}
 		}
 	}
+
 	return 0
 }
 
@@ -185,21 +203,24 @@ func parseUsageTime(v any) time.Time {
 	case float64:
 		return timeFromUnix(int64(t))
 	case string:
-		s := strings.TrimSpace(t)
-		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		str := strings.TrimSpace(t)
+		if n, err := strconv.ParseInt(str, 10, 64); err == nil {
 			return timeFromUnix(n)
 		}
-		if ts, err := time.Parse(time.RFC3339, s); err == nil {
+
+		if ts, err := time.Parse(time.RFC3339, str); err == nil {
 			return ts
 		}
+
 		for _, layout := range []string{
 			requestUsageTimeLayout, "2006-01-02T15:04:05", "2006-01-02",
 		} {
-			if ts, err := time.ParseInLocation(layout, s, softRateResetLoc); err == nil {
+			if ts, err := time.ParseInLocation(layout, str, softRateResetLoc); err == nil {
 				return ts
 			}
 		}
 	}
+
 	return time.Time{}
 }
 
@@ -208,8 +229,10 @@ func timeFromUnix(n int64) time.Time {
 	if n <= 0 {
 		return time.Time{}
 	}
+
 	if n >= 1_000_000_000_000 {
 		return time.UnixMilli(n)
 	}
+
 	return time.Unix(n, 0)
 }

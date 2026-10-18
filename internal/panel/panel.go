@@ -100,10 +100,11 @@ type ProxySlotInfo struct {
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
 // 本 mux 的 pattern 均带 /panel 前缀（外层不做前缀剥离）。
 type Panel struct {
-	cfg     Config
-	mux     *http.ServeMux
-	started time.Time
-	logs    *Ring
+	cfg          Config
+	mux          *http.ServeMux
+	started      time.Time
+	logs         *Ring
+	probeTimeout time.Duration
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -137,12 +138,14 @@ func (p *Panel) tryLockAccount(uid string) bool {
 	if p.taskLocks == nil {
 		p.taskLocks = make(map[string]*sync.Mutex)
 	}
+
 	mu := p.taskLocks[uid]
 	if mu == nil {
 		mu = &sync.Mutex{}
 		p.taskLocks[uid] = mu
 	}
 	p.taskMu.Unlock()
+
 	return mu.TryLock()
 }
 
@@ -151,6 +154,7 @@ func (p *Panel) unlockAccount(uid string) {
 	p.taskMu.Lock()
 	mu := p.taskLocks[uid]
 	p.taskMu.Unlock()
+
 	if mu != nil {
 		mu.Unlock()
 	}
@@ -167,44 +171,53 @@ type loginSession struct {
 }
 
 // New 构建面板。
-func New(cfg Config) *Panel {
-	if cfg.RedisMode == "" {
-		cfg.RedisMode = "noop"
+func New(cfg *Config) *Panel {
+	config := *cfg
+	if config.RedisMode == "" {
+		config.RedisMode = "noop"
 	}
-	p := &Panel{
-		cfg:         cfg,
-		mux:         http.NewServeMux(),
-		started:     time.Now(),
-		logs:        NewRing(500),
-		logins:      map[string]loginSession{},
-		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+
+	panel := &Panel{
+		cfg:          config,
+		mux:          http.NewServeMux(),
+		started:      time.Now(),
+		logs:         NewRing(500),
+		probeTimeout: modelProbeTimeout,
+		logins:       map[string]loginSession{},
+		authLimiter:  httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
 	}
-	p.routes()
-	return p
+	panel.routes()
+
+	return panel
 }
 
 // Logs 返回日志环形缓冲（main 经 MultiWriter 镜像 log 与 chat 表格日志进来）。
 func (p *Panel) Logs() *Ring { return p.logs }
 
 func (p *Panel) routes() {
+	p.routesPages()
+	p.routesAccounts()
+	p.routesTasks()
+	p.routesImport()
+	p.routesUsage()
+	p.routesKeys()
+	p.routesConfig()
+	p.routesModels()
+}
+
+func (p *Panel) routesPages() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/{path...}", p.asset)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
-	p.mux.HandleFunc("GET /panel/api/agents", p.withAuth(p.agentsStatus))
-	p.mux.HandleFunc("POST /panel/api/agents/{client}/apply", p.withAuth(p.agentsApply))
-	p.mux.HandleFunc("POST /panel/api/agents/{client}/restore", p.withAuth(p.agentsRestore))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
-	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
-	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
-	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
-	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
-	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
-	p.mux.HandleFunc("GET /panel/api/import/desktop/scan", p.withAuth(p.desktopScan))
-	p.mux.HandleFunc("POST /panel/api/import/desktop", p.withAuth(p.desktopImport))
-	p.mux.HandleFunc("POST /panel/api/export/encrypted", p.withAuth(p.exportEncrypted))
-	p.mux.HandleFunc("POST /panel/api/import/encrypted", p.withAuth(p.importEncrypted))
+	p.mux.HandleFunc("GET /panel/api/agents", p.withAuth(p.agentsStatus))
+	p.mux.HandleFunc("POST /panel/api/agents/{client}/apply", p.withAuth(p.agentsApply))
+	p.mux.HandleFunc("POST /panel/api/agents/{client}/restore", p.withAuth(p.agentsRestore))
+}
+
+func (p *Panel) routesAccounts() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAuth(p.accountPause))
@@ -213,6 +226,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+}
+
+func (p *Panel) routesTasks() {
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -222,6 +238,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAuth(p.tasksScanAll))
 	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAuth(p.tasksRunQueue))
 	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withAuth(p.tasksQueueStatus))
+	p.mux.HandleFunc("GET /panel/api/tasks/runs", p.withAuth(p.tasksRuns))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAuth(p.checkinAll))
 	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAuth(p.travelAll))
@@ -229,13 +246,29 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/blackcat_all", p.withAuth(p.blackcatAll))
 	p.mux.HandleFunc("POST /panel/api/streak_bonus_all", p.withAuth(p.streakBonusAll))
-	p.mux.HandleFunc("GET /panel/api/tasks/runs", p.withAuth(p.tasksRuns))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
+}
+
+func (p *Panel) routesImport() {
+	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
+	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
+	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
+	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAuth(p.importCockpit))
+	p.mux.HandleFunc("GET /panel/api/import/desktop/scan", p.withAuth(p.desktopScan))
+	p.mux.HandleFunc("POST /panel/api/import/desktop", p.withAuth(p.desktopImport))
+	p.mux.HandleFunc("POST /panel/api/export/encrypted", p.withAuth(p.exportEncrypted))
+	p.mux.HandleFunc("POST /panel/api/import/encrypted", p.withAuth(p.importEncrypted))
+}
+
+func (p *Panel) routesUsage() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/usage/remaining", p.withAuth(p.usageRemaining))
 	p.mux.HandleFunc("POST /panel/api/usage/backfill", p.withAuth(p.usageBackfill))
+}
+
+func (p *Panel) routesKeys() {
 	p.mux.HandleFunc("GET /panel/api/keys", p.withAuth(p.keysList))
 	p.mux.HandleFunc("POST /panel/api/keys", p.withAuth(p.keysCreate))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAuth(p.keysRevoke))
@@ -243,9 +276,16 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/pricing", p.withAuth(p.pricingHandler))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAuth(p.keysUpdateLimits))
 	p.mux.HandleFunc("POST /panel/api/keys/{id}/realm", p.withAuth(p.keysUpdateRealm))
+}
+
+func (p *Panel) routesModels() {
+	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("POST /panel/api/model_probes", p.withAuth(p.modelProbe))
 	p.mux.HandleFunc("GET /panel/api/model_health", p.withAuth(p.modelHealth))
+}
+
+func (p *Panel) routesConfig() {
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 	p.mux.HandleFunc("POST /panel/api/config/restore", p.withAuth(p.restoreConfig))
@@ -268,21 +308,23 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+
 		ip := httpauth.RemoteIP(r)
 		if ok, retry := p.authLimiter.Allow(ip); !ok {
-			seconds := int((retry + time.Second - 1) / time.Second)
-			if seconds < 1 {
-				seconds = 1
-			}
+			seconds := max(int((retry+time.Second-1)/time.Second), 1)
 			w.Header().Set("Retry-After", strconv.Itoa(seconds))
 			writeErr(w, http.StatusTooManyRequests, "too_many_auth_failures")
+
 			return
 		}
+
 		if !httpauth.VerifyBearer(r, key) {
 			p.authLimiter.Fail(ip)
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
+
 			return
 		}
+
 		p.authLimiter.Reset(ip)
 		next(w, r)
 	}
@@ -293,6 +335,7 @@ func (p *Panel) apiKey() string {
 	if p.cfg.Live != nil {
 		return p.cfg.Live.Load().APIKey
 	}
+
 	return p.cfg.APIKey
 }
 
@@ -301,6 +344,7 @@ func (p *Panel) expiringSoonWindow() time.Duration {
 	if p.cfg.Scheduler == nil {
 		return 0
 	}
+
 	return p.cfg.Scheduler.ExpiringSoonWindow()
 }
 
@@ -313,10 +357,12 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 用 WithPaused 而不是 CountsDetailed：后者把暂停号并进 disabled（/status 的
 	// 「不可用」口径），而概况卡片要分开展示（issue #125）。
 	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
+
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":             p.cfg.Version,
 		"uptime_sec":          int(time.Since(p.started).Seconds()),
@@ -352,6 +398,7 @@ func (p *Panel) requestMetrics(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "request logger not available")
 		return
 	}
+
 	writeJSON(w, http.StatusOK, p.cfg.RequestLog.Snapshot())
 }
 
@@ -364,24 +411,29 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "request logger not available")
 		return
 	}
+
 	limit := 200
+
 	if v := r.URL.Query().Get("limit"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			limit = n
 		}
 	}
+
 	if limit > 1000 {
 		limit = 1000
 	}
-	q := r.URL.Query()
-	rows, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{
-		Outcome:   q.Get("outcome"),
-		Account:   q.Get("account"),
-		Model:     q.Get("model"),
-		ClientIP:  q.Get("client_ip"),
-		UserAgent: q.Get("user_agent"),
-		From:      parseTimeParam(q.Get("from")),
-		To:        parseTimeParam(q.Get("to")),
+
+	values := r.URL.Query()
+
+	rows, err := p.cfg.RequestLog.ReadArchive(limit, &reqlog.Filter{
+		Outcome:   values.Get("outcome"),
+		Account:   values.Get("account"),
+		Model:     values.Get("model"),
+		ClientIP:  values.Get("client_ip"),
+		UserAgent: values.Get("user_agent"),
+		From:      parseTimeParam(values.Get("from")),
+		To:        parseTimeParam(values.Get("to")),
 	})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
@@ -392,6 +444,7 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []reqlog.Event{}
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
 }
 
@@ -403,6 +456,7 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
+
 	var fetchErrs []string
 
 	if entries, errMsg := p.collectCNModels(); len(entries) > 0 || errMsg != "" {
@@ -411,6 +465,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			fetchErrs = append(fetchErrs, errMsg)
 		}
 	}
+
 	if entries, errMsg := p.collectGlobalModels(); len(entries) > 0 || errMsg != "" {
 		out = append(out, entries...)
 		if errMsg != "" {
@@ -423,9 +478,12 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
 			return
 		}
+
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
@@ -437,18 +495,22 @@ func (p *Panel) collectCNModels() ([]map[string]any, string) {
 	if len(uids) == 0 {
 		return nil, ""
 	}
+
 	acct := p.cfg.Pool.AuthByUID(uids[0])
 	if acct == nil {
 		return nil, ""
 	}
+
 	infos, err := p.cfg.Upstream.FetchModels(acct)
 	if err != nil {
 		return nil, "cn: " + err.Error()
 	}
+
 	out := make([]map[string]any, 0, len(infos))
-	for _, mi := range infos {
-		out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+	for i := range infos {
+		out = append(out, panelModelEntry("cn", &infos[i], infos[i].Efforts, infos[i].DefaultEffort, p.cfg.Upstream.HTTP))
 	}
+
 	return out, ""
 }
 
@@ -459,77 +521,96 @@ func (p *Panel) collectGlobalModels() ([]map[string]any, string) {
 	if !p.cfg.Upstream.GlobalEnabled {
 		return nil, ""
 	}
+
 	uids := p.cfg.Pool.AvailableUIDsForRealm("global")
 	if len(uids) == 0 {
 		return nil, ""
 	}
+
 	acct := p.cfg.Pool.AuthByUID(uids[0])
 	if acct == nil {
 		return nil, ""
 	}
+
 	infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
 	if len(infos) == 0 {
 		return nil, "global: 上游未返回可用模型"
 	}
+
 	efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
+
 	out := make([]map[string]any, 0, len(infos))
-	for _, mi := range infos {
-		out = append(out, panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP))
+	for i := range infos {
+		out = append(out, panelModelEntry("global", &infos[i], efforts[infos[i].ID], defaults[infos[i].ID], p.cfg.Upstream.HTTP))
 	}
+
 	return out, ""
 }
 
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
 // context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
 // EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
-func panelModelEntry(realm string, mi upstream.ModelInfo, remoteEfforts []string, remoteDefault string, httpc *http.Client) map[string]any {
+func panelModelEntry(
+	realm string,
+	modelInfo *upstream.ModelInfo,
+	remoteEfforts []string,
+	remoteDefault string,
+	httpc *http.Client,
+) map[string]any {
 	entry := map[string]any{
-		"id":                   realm + ":" + mi.ID,
-		"name":                 mi.Name,
-		"default_effort":       mi.DefaultEffort,
-		"supported_efforts":    mi.Efforts,
-		"can_disable_thinking": mi.CanDisableThinking,
-		"supports_reasoning":   mi.SupportsReasoning,
-		"supports_images":      mi.SupportsImages,
-		"credits":              mi.Credits,
-		"description":          mi.Description,
-		"tags":                 mi.Tags,
-		"vendor":               mi.Vendor,
-		"is_default":           mi.IsDefault,
-		"supports_tool_call":   mi.SupportsToolCall,
-		"only_reasoning":       mi.OnlyReasoning,
-		"reasoning_effort":     mi.ReasoningEffort,
-		"reasoning_summary":    mi.ReasoningSummary,
+		"id":                   realm + ":" + modelInfo.ID,
+		"name":                 modelInfo.Name,
+		"default_effort":       modelInfo.DefaultEffort,
+		"supported_efforts":    modelInfo.Efforts,
+		"can_disable_thinking": modelInfo.CanDisableThinking,
+		"supports_reasoning":   modelInfo.SupportsReasoning,
+		"supports_images":      modelInfo.SupportsImages,
+		"credits":              modelInfo.Credits,
+		"description":          modelInfo.Description,
+		"tags":                 modelInfo.Tags,
+		"vendor":               modelInfo.Vendor,
+		"is_default":           modelInfo.IsDefault,
+		"supports_tool_call":   modelInfo.SupportsToolCall,
+		"only_reasoning":       modelInfo.OnlyReasoning,
+		"reasoning_effort":     modelInfo.ReasoningEffort,
+		"reasoning_summary":    modelInfo.ReasoningSummary,
 	}
 	// 限时优惠（modelPromotions）：credits 是牌价，promo_* 是当前生效折扣
 	// （WorkBuddy 客户端显示的就是这个生效价）。前端据此显示「生效价+标签+划线牌价」。
-	if mi.PromoFactor != nil {
-		entry["promo_factor"] = *mi.PromoFactor
-		entry["promo_credits"] = mi.PromoCredits
+	if modelInfo.PromoFactor != nil {
+		entry["promo_factor"] = *modelInfo.PromoFactor
+		entry["promo_credits"] = modelInfo.PromoCredits
 	}
-	if mi.PromoLabel != "" {
-		entry["promo_label"] = mi.PromoLabel
+
+	if modelInfo.PromoLabel != "" {
+		entry["promo_label"] = modelInfo.PromoLabel
 	}
-	if mi.PromoNote != "" {
-		entry["promo_note"] = mi.PromoNote
+
+	if modelInfo.PromoNote != "" {
+		entry["promo_note"] = modelInfo.PromoNote
 	}
-	if mods := mi.EffectiveInputModalities(); len(mods) > 0 {
+
+	if mods := modelInfo.EffectiveInputModalities(); len(mods) > 0 {
 		// 输入模态（issue #109）：与 /v1/models 同口径，未知时省略（不宣称）。
 		entry["input_modalities"] = mods
 	}
-	if mi.MaxAllowedSize > 0 {
-		entry["max_allowed_size"] = mi.MaxAllowedSize
+
+	if modelInfo.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = modelInfo.MaxAllowedSize
 	}
-	entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, httpc)
-	if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, httpc); ok {
+
+	entry["context_length"] = upstream.ContextWindowListingV4(modelInfo.ID, modelInfo.ContextWindow, httpc)
+	if mo, ok := upstream.MaxOutputTokensListingV4(modelInfo.ID, modelInfo.MaxTokens, httpc); ok {
 		entry["max_output_tokens"] = mo
 	}
-	if efforts, def := upstream.EffortListing(realm, mi.ID, remoteEfforts, remoteDefault); efforts != nil {
+
+	if efforts, def := upstream.EffortListing(realm, modelInfo.ID, remoteEfforts, remoteDefault); efforts != nil {
 		entry["supported_efforts"] = efforts
 		if def != "" {
 			entry["default_effort"] = def
 		}
 	}
+
 	return entry
 }
 
@@ -545,31 +626,39 @@ func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
+
 	raw, err := os.ReadFile(p.cfg.ProbeFile)
 	if err != nil {
 		if os.IsNotExist(err) {
 			writeJSON(w, http.StatusOK, out)
 			return
 		}
+
 		writeErr(w, http.StatusInternalServerError, "read probes: "+err.Error())
+
 		return
 	}
-	var f struct {
+
+	var item struct {
 		Version int                        `json:"version"`
 		Probes  map[string]json.RawMessage `json:"probes"`
 	}
-	if err := json.Unmarshal(raw, &f); err != nil {
+	if err := json.Unmarshal(raw, &item); err != nil {
 		writeErr(w, http.StatusBadGateway, "parse probes: "+err.Error())
 		return
 	}
-	if f.Probes == nil {
-		f.Probes = map[string]json.RawMessage{}
+
+	if item.Probes == nil {
+		item.Probes = map[string]json.RawMessage{}
 	}
-	out["probes"] = f.Probes
+
+	out["probes"] = item.Probes
+
 	out["exists"] = true
 	if fi, err := os.Stat(p.cfg.ProbeFile); err == nil {
 		out["updated_at"] = fi.ModTime().Format(time.RFC3339)
 	}
+
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -587,16 +676,19 @@ func (p *Panel) accountProxySlot(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
+
 	slot := strings.TrimSpace(body.Slot)
 	if slot != "" && !p.hasProxySlot(slot) {
 		writeErr(w, http.StatusBadRequest, "unknown proxy slot")
 		return
 	}
+
 	uid := r.PathValue("uid")
 	if !p.cfg.Pool.SetProxySlot(uid, slot) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+
 	log.Printf("panel: 账号 %s 绑定代理槽 %q", uid, slot)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -607,6 +699,7 @@ func (p *Panel) hasProxySlot(id string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -616,6 +709,7 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+
 	p.cfg.Pool.Revive(uid)
 	log.Printf("panel: revive uid=%s（人工清除禁用/冷却/熔断）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -628,6 +722,7 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+
 	p.cfg.Pool.Disable(uid, "manual disable (panel)")
 	log.Printf("panel: disable uid=%s（人工禁用）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -642,6 +737,7 @@ func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+
 	log.Printf("panel: pause uid=%s（暂停选号，保号任务照常）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -653,18 +749,21 @@ func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+
 	log.Printf("panel: resume uid=%s（恢复参与选号）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // runCheckin 执行单号签到并返回 (跳过原因, 是否已签, 说明文案)。
-// 跳过原因非空表示 global/企业版无 CN 签到体系（issue #108）：不发起上游调用。
+// 跳过原因非空表示企业版无个人签到体系（issue #108）：不发起上游调用。
+// global 账号与调度器同口径正常签到（upstream.DailyCheckin 按 realm 分流）。
 // 其余情况按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游
 // 非错误态，不标记已签、给出可区分文案（issue #27）；其余才是真失败。
 func (p *Panel) runCheckin(a *auth.Auth, uid string) (denyReason string, done bool, msg string) {
-	if denyReason = taskDenyReason(a); denyReason != "" {
+	if denyReason = checkinDenyReason(a); denyReason != "" {
 		return denyReason, false, denyReason
 	}
+
 	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		switch upstream.ClassifyCheckin(err) {
 		case upstream.CheckinAlready:
@@ -676,7 +775,9 @@ func (p *Panel) runCheckin(a *auth.Auth, uid string) (denyReason string, done bo
 			return "", false, err.Error() // 业务错误照常查余额
 		}
 	}
+
 	p.cfg.Pool.NoteCheckinDone(uid)
+
 	return "", true, ""
 }
 
@@ -684,35 +785,45 @@ func (p *Panel) runCheckin(a *auth.Auth, uid string) (denyReason string, done bo
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
+
+	account := p.cfg.Pool.AuthByUID(uid)
+	if account == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	// 账号体系门控（issue #108）：global 无 CN 签到体系，企业版无个人签到体系
-	// （上游 400 code 10001）。两者都不发起签到调用，端点退化为「刷新额度」
-	// ——额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
-	// 前端对这两类账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
+	// 账号体系门控（issue #108）：企业版无个人签到体系（上游 400 code 10001），
+	// 不发起签到调用，端点退化为「刷新额度」；global 账号与调度器一致走签到。
+	// 额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
+	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
-	denyReason, checkinDone, checkinMsg := p.runCheckin(a, uid)
+	denyReason, checkinDone, checkinMsg := p.runCheckin(account, uid)
+
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
 	if denyReason != "" {
 		// 明确「跳过」而非「签到成功」：checkin_done 保持 false，reason 可读。
 		resp["skipped"] = true
 		resp["reason"] = denyReason
 	}
-	if a.IsEnterprise() {
+
+	if account.IsEnterprise() {
 		resp["enterprise"] = true
 	}
+
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(
+		account,
+		p.expiringSoonWindow(),
+	)
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
+
 		return
 	}
+
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	resp["credits"] = remain
@@ -724,16 +835,22 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 // accountBalance 单号余额刷新：更新余额与到期快照，不触碰冷却状态。
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.AuthByUID(uid)
-	if a == nil {
+
+	account := p.cfg.Pool.AuthByUID(uid)
+	if account == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(
+		account,
+		p.expiringSoonWindow(),
+	)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
+
 	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
@@ -741,22 +858,30 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 // accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
-	a := p.cfg.Pool.Remove(uid)
-	if a == nil {
+
+	account := p.cfg.Pool.Remove(uid)
+	if account == nil {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	// 先失效凭证再删文件：在途 refresh 的 SaveAtomic 会拒绝写回，避免文件复活。
+	account.Retire()
+
 	fileMsg := ""
-	if a.FilePath != "" {
-		if err := os.Remove(a.FilePath); err != nil && !os.IsNotExist(err) {
+
+	if account.FilePath != "" {
+		if err := os.Remove(account.FilePath); err != nil && !os.IsNotExist(err) {
 			fileMsg = err.Error()
 		}
 	}
+
 	if fileMsg != "" {
 		log.Printf("panel: remove uid=%s（auth 文件删除失败: %s）", uid, fileMsg)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file_error": fileMsg})
+
 		return
 	}
+
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -773,13 +898,16 @@ func (p *Panel) startBatchTask(w http.ResponseWriter, task, label string) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
+
 	if !p.cfg.Scheduler.StartTask(task, scheduler.TriggerManual) {
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"ok": false, "started": false, "running": true, "task": task,
 			"error": label + "正在运行中，请等本轮结束",
 		})
+
 		return
 	}
+
 	log.Printf("panel: 手动全量%s已触发", label)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "task": task})
 }
@@ -820,6 +948,7 @@ func (p *Panel) tasksRuns(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "runs": p.cfg.Scheduler.RunTaskStates()})
 }
 
@@ -831,6 +960,7 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
+
 	p.cfg.Scheduler.RunBalanceRefreshNow()
 	p.syncNicknames()
 	log.Printf("panel: 手动全量余额刷新完成")
@@ -847,6 +977,7 @@ func (p *Panel) syncNicknames() {
 	if len(jobs) == 0 {
 		return
 	}
+
 	var (
 		mu      sync.Mutex
 		updated int
@@ -858,19 +989,24 @@ func (p *Panel) syncNicknames() {
 		wg.Add(1)
 		go func(j nicknameJob) {
 			defer wg.Done()
+
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			u, f := p.fetchNickname(j)
-			if u == 0 && f == 0 {
+
+			numVal, num2 := p.fetchNickname(j)
+			if numVal == 0 && num2 == 0 {
 				return
 			}
+
 			mu.Lock()
-			updated += u
-			failed += f
+			updated += numVal
+			failed += num2
 			mu.Unlock()
 		}(j)
 	}
+
 	wg.Wait()
+
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
 	}
@@ -885,16 +1021,21 @@ type nicknameJob struct {
 // collectNicknameJobs 收集需要同步昵称的账号：跳过禁用号与无 access token 的号。
 func (p *Panel) collectNicknameJobs() []nicknameJob {
 	var jobs []nicknameJob
-	for _, st := range p.cfg.Pool.List() {
-		if st.Disabled {
+
+	all := p.cfg.Pool.List()
+	for i := range all {
+		if all[i].Disabled {
 			continue
 		}
-		a := p.cfg.Pool.AuthByUID(st.UID)
+
+		a := p.cfg.Pool.AuthByUID(all[i].UID)
 		if a == nil || a.AccessTokenValue() == "" {
 			continue
 		}
-		jobs = append(jobs, nicknameJob{uid: st.UID, a: a})
+
+		jobs = append(jobs, nicknameJob{uid: all[i].UID, a: a})
 	}
+
 	return jobs
 }
 
@@ -904,9 +1045,11 @@ func (p *Panel) fetchNickname(j nicknameJob) (int, int) {
 	if err != nil {
 		return 0, 1
 	}
+
 	if p.cfg.Pool.SetNickname(j.uid, nick) {
 		return 1, 0
 	}
+
 	return 0, 0
 }
 
@@ -925,52 +1068,63 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
 		return
 	}
+
 	win := parseUsageWindow(r)
 	// 昵称仅用于展示，取自池快照（不含任何凭证）。
 	nicks := map[string]string{}
-	for _, s := range p.cfg.Pool.List() {
-		if s.Nickname != "" {
-			nicks[s.UID] = s.Nickname
+
+	all := p.cfg.Pool.List()
+	for i := range all {
+		if all[i].Nickname != "" {
+			nicks[all[i].UID] = all[i].Nickname
 		}
 	}
+
 	var currentRate func(realm, model string) string
 	if p.cfg.Upstream != nil {
 		currentRate = p.cfg.Upstream.ModelRate
 	}
+
 	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(win, nicks, currentRate))
 }
 
 // parseUsageWindow 解析用量统计窗口：from/to 任一给出则用显式区间；否则用 hours
 // 滚动窗口（默认 72、上限 1440），显式 hours=0 表示全部历史。区间与 hours 互斥。
 func parseUsageWindow(r *http.Request) usage.Window {
-	q := r.URL.Query()
-	win := usage.Window{}
-	win.From = parseTimeParam(q.Get("from"))
-	win.To = parseTimeParam(q.Get("to"))
+	values := r.URL.Query()
+	win := usage.Window{Hours: 0, From: time.Time{}, To: time.Time{}}
+	win.From = parseTimeParam(values.Get("from"))
+
+	win.To = parseTimeParam(values.Get("to"))
 	if !win.From.IsZero() || !win.To.IsZero() {
 		return win
 	}
+
 	win.Hours = 72
-	if v := q.Get("hours"); v != "" {
+
+	if v := values.Get("hours"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			win.Hours = n
 		}
 	}
+
 	if win.Hours > 1440 {
 		win.Hours = 1440
 	}
+
 	return win
 }
 
 // parseTimeParam 解析时间查询参数：unix 秒（前端默认）或 RFC3339（便于手工调
 // 接口/写脚本）。空串与非法值都返回零值 = 该侧不设界，不报错——区间参数是可选
 // 增强，拼错一个 from 不该让整页用量打不开。
-func parseTimeParam(v string) time.Time {
-	v = strings.TrimSpace(v)
-	if v == "" {
+func parseTimeParam(str string) time.Time {
+	str = strings.TrimSpace(str)
+	if str == "" {
 		return time.Time{}
 	}
-	if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+
+	if n, err := strconv.ParseInt(str, 10, 64); err == nil {
 		if n <= 0 {
 			return time.Time{}
 		}
@@ -978,14 +1132,18 @@ func parseTimeParam(v string) time.Time {
 		if n > 1e12 {
 			return time.UnixMilli(n)
 		}
+
 		return time.Unix(n, 0)
 	}
-	if t, err := time.Parse(time.RFC3339, v); err == nil {
+
+	if t, err := time.Parse(time.RFC3339, str); err == nil {
 		return t
 	}
-	if t, err := time.ParseInLocation("2006-01-02T15:04", v, time.Local); err == nil {
+
+	if t, err := time.ParseInLocation("2006-01-02T15:04", str, time.Local); err == nil {
 		return t
 	}
+
 	return time.Time{}
 }
 
@@ -995,6 +1153,7 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
 		return
 	}
+
 	p.cfg.Usage.Save()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1008,33 +1167,44 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	out := make([]packageAccountRow, len(accts))
 
 	sem := make(chan struct{}, 3)
+
 	var wg sync.WaitGroup
-	for i, s := range accts {
+
+	for i := range accts {
+		status := &accts[i]
+
 		wg.Add(1)
-		go func(i int, s pool.Status) {
+		go func(i int, status *pool.Status) {
 			defer wg.Done()
+
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			it := packageAccountRow{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
-			a := p.cfg.Pool.AuthByUID(s.UID)
-			if a == nil {
-				it.Error = "account not loaded"
-				out[i] = it
+			packageAccountRow2 := packageAccountRow{UID: status.UID, Nickname: status.Nickname, Realm: status.Realm}
+
+			account := p.cfg.Pool.AuthByUID(status.UID)
+			if account == nil {
+				packageAccountRow2.Error = "account not loaded"
+				out[i] = packageAccountRow2
+
 				return
 			}
-			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+
+			packs, remain, size, err := p.cfg.Upstream.CreditPackages(account)
 			if err != nil {
-				it.Error = err.Error()
-				out[i] = it
+				packageAccountRow2.Error = err.Error()
+				out[i] = packageAccountRow2
+
 				return
 			}
-			it.Packages = packs
-			it.Remain = remain
-			it.Size = size
-			out[i] = it
-		}(i, s)
+
+			packageAccountRow2.Packages = packs
+			packageAccountRow2.Remain = remain
+			packageAccountRow2.Size = size
+			out[i] = packageAccountRow2
+		}(i, status)
 	}
+
 	wg.Wait()
 
 	// 余额降序：多的在前，便于和少的对比。
@@ -1048,6 +1218,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		http.Error(w, "internal encode error", http.StatusInternalServerError)
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
@@ -1061,6 +1232,7 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 func nextLocalMidnight() time.Time {
 	now := time.Now()
 	y, m, d := now.Date()
+
 	return time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
 }
 
@@ -1071,8 +1243,10 @@ func (p *Panel) pricingHandler(w http.ResponseWriter, r *http.Request) {
 			"enabled":       false,
 			"exchange_rate": p.cfg.PricingRate,
 		})
+
 		return
 	}
+
 	snap := p.cfg.Pricing.Snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":       true,
@@ -1113,24 +1287,28 @@ type creditGrant struct {
 func creditGrants(accounts []packageAccountRow) []creditGrant {
 	now := time.Now()
 	out := make([]creditGrant, 0)
-	for _, acct := range accounts {
-		for _, pkg := range acct.Packages {
-			source := inferGrantSource(pkg)
+
+	for i := range accounts {
+		for j := range accounts[i].Packages {
+			pkg := &accounts[i].Packages[j]
 			out = append(out, creditGrant{
-				UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm,
-				Name: pkg.Name, Source: source, Inferred: true,
+				UID: accounts[i].UID, Nickname: accounts[i].Nickname, Realm: accounts[i].Realm,
+				Name: pkg.Name, Source: inferGrantSource(pkg), Inferred: true,
 				Size: pkg.Size, Remain: pkg.Remain, CreatedAt: pkg.CreatedAt,
 				ExpiresAt: pkg.ExpiresAt, Status: grantStatus(pkg, now),
 			})
 		}
 	}
+
 	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+
 	return out
 }
 
 // inferGrantSource 按包名/编码推断来源；上游没给来源字段，故明确标注推断。
-func inferGrantSource(pkg upstream.CreditPackage) string {
+func inferGrantSource(pkg *upstream.CreditPackage) string {
 	text := strings.ToLower(pkg.Name + " " + pkg.PackageCode + " " + pkg.SubProductName)
+
 	for _, rule := range grantSourceRules {
 		for _, needle := range rule.needles {
 			if strings.Contains(text, needle) {
@@ -1138,9 +1316,11 @@ func inferGrantSource(pkg upstream.CreditPackage) string {
 			}
 		}
 	}
+
 	if pkg.Size >= 1500 {
 		return "首次授权（按面额推断）"
 	}
+
 	return "未知"
 }
 
@@ -1154,16 +1334,19 @@ var grantSourceRules = []struct {
 }
 
 // grantStatus 按剩余量与到期时间归类；"生效中"无法从上游快照判断，不编造。
-func grantStatus(pkg upstream.CreditPackage, now time.Time) string {
+func grantStatus(pkg *upstream.CreditPackage, now time.Time) string {
 	if pkg.ExpiresAt > 0 && pkg.ExpiresAt < now.UnixMilli() {
 		return "已过期"
 	}
+
 	if pkg.Remain <= 0 {
 		return "已用完"
 	}
+
 	if pkg.ExpiresAt == 0 {
 		return "可用（不过期）"
 	}
+
 	return "可用"
 }
 
@@ -1188,14 +1371,17 @@ func (p *Panel) usageRemaining(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "quota store or usage recorder not available")
 		return
 	}
+
 	now := time.Now()
 	rows, budgets, events := p.remainingRows(now)
 	etag := remainingETag(rows, events)
 	w.Header().Set("ETag", etag)
+
 	if r.Header.Get("If-None-Match") == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"generated_at": now, "ttl_sec": 5, "rows": rows, "budgets": budgets,
 	})
@@ -1209,35 +1395,54 @@ func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.B
 	daily := p.cfg.Usage.TokensByAccountModel(time.Date(y, m, d, 0, 0, 0, 0, now.Location()))
 	resetByKey := map[string]time.Time{}
 	modelsByUID := map[string]map[string]bool{}
-	for _, e := range events {
-		key := e.UID + "|" + e.Model
-		if e.ResetAt.After(resetByKey[key]) {
-			resetByKey[key] = e.ResetAt
+
+	for _, item := range events {
+		key := item.UID + "|" + item.Model
+		if item.ResetAt.After(resetByKey[key]) {
+			resetByKey[key] = item.ResetAt
 		}
-		if modelsByUID[e.UID] == nil {
-			modelsByUID[e.UID] = map[string]bool{}
+
+		if modelsByUID[item.UID] == nil {
+			modelsByUID[item.UID] = map[string]bool{}
 		}
-		modelsByUID[e.UID][e.Model] = true
+
+		modelsByUID[item.UID][item.Model] = true
 	}
+
 	rows := make([]remainingRow, 0)
-	for _, acct := range p.cfg.Pool.List() {
+
+	all := p.cfg.Pool.List()
+	for i := range all {
+		acct := &all[i]
+
 		models := modelsByUID[acct.UID]
 		if models == nil {
 			models = map[string]bool{}
 		}
+
 		for model := range daily[acct.UID] {
 			models[model] = true
 		}
+
 		for model := range models {
 			rows = append(rows, p.remainingRow(acct, model, daily[acct.UID][model], resetByKey[acct.UID+"|"+model], budgets, now))
 		}
 	}
+
 	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remaining < rows[j].Remaining })
+
 	return rows, budgets, len(events)
 }
 
 // remainingRow 组装单行；有撞线重置时间时改用同窗口用量。
-func (p *Panel) remainingRow(acct pool.Status, model string, used int64, reset time.Time, budgets map[string]quota.Budget, now time.Time) remainingRow {
+func (p *Panel) remainingRow(
+	acct *pool.Status,
+	model string,
+	used int64,
+	reset time.Time,
+	budgets map[string]quota.Budget,
+	now time.Time,
+) remainingRow {
 	row := remainingRow{UID: acct.UID, Nickname: acct.Nickname, Realm: acct.Realm, Model: model, Used: used}
 	if !reset.IsZero() {
 		row.WindowStart = reset.Add(-24 * time.Hour).Format(time.RFC3339)
@@ -1245,16 +1450,20 @@ func (p *Panel) remainingRow(acct pool.Status, model string, used int64, reset t
 		used = p.cfg.Usage.TokensSince(acct.Realm, acct.UID, model, reset.Add(-24*time.Hour))
 		row.Used = used
 	}
+
 	budget, ok := budgets[acct.Realm+"|"+model]
 	if !ok {
 		row.Estimated = true
 		row.Budget = float64(used)
 		row.Remaining = 0
+
 		return row
 	}
+
 	row.Budget = budget.Used
 	row.Remaining = max(0, budget.Used-float64(used))
 	row.Samples = budget.Samples
+
 	return row
 }
 
@@ -1267,6 +1476,8 @@ func remainingETag(rows []remainingRow, events int) string {
 	if err != nil {
 		return `"0"`
 	}
+
 	sum := sha256.Sum256(raw)
+
 	return fmt.Sprintf(`"%x"`, sum[:8])
 }

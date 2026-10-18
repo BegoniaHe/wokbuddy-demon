@@ -17,18 +17,23 @@ import (
 // 运维查账时一并看到保底线（结合 accounts[].credits 与 model_costs 即可判定
 // 某号为何对某模型不出票）。关闭（0）时也显式透出——缺失会让人误以为没记录。
 func TestStatusCreditFloor(t *testing.T) {
+	t.Parallel()
+
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
 	p.SetCreditFloor(100)
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	h := NewHandler(&Config{Pool: p, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
+
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
+
 	if body["credit_floor"] != float64(100) {
 		t.Errorf("credit_floor=%v want 100", body["credit_floor"])
 	}
@@ -36,14 +41,18 @@ func TestStatusCreditFloor(t *testing.T) {
 
 // TestStatusCreditFloorZeroOff 未配置（默认 0）同样透出 0（显式写出，零值不省略）。
 func TestStatusCreditFloorZeroOff(t *testing.T) {
+	t.Parallel()
+
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	h := NewHandler(&Config{Pool: p, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
+
 	if body["credit_floor"] != float64(0) {
 		t.Errorf("credit_floor=%v want 0 (off)", body["credit_floor"])
 	}
@@ -57,30 +66,36 @@ func TestStatusCreditFloorZeroOff(t *testing.T) {
 // 真正证明拦截落在选号层的是**对照断言**：对照组（不开 floor）必须能选到 poor，
 // 实验组（开 floor）必须在同一条件下选不到号。
 func TestCreditFloorBlocksPaidRequest(t *testing.T) {
+	t.Parallel()
+
 	const body = `{"model":"paid-model","messages":[{"role":"user","content":"hi"}]}`
 	// 对照组：不设 floor，其余逐字相同（同一触底号、同一 tier 2 观测）。
 	ctlPool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
 	ctlPool.SetCredits("poor", 30, 0)
 	ctlPool.NoteModelCost("poor", "paid-model", 2.9, 1000)
+
 	if a := ctlPool.PickExcludingForRealm(nil, "paid-model", ""); a == nil {
 		t.Fatal("对照组前置失效：未设 floor 时应选到 poor（否则本用例不构成对照）")
 	}
 
 	// 实验组：开 floor 100。
-	p := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
-	p.SetCreditFloor(100)
-	p.SetCredits("poor", 30, 0)
-	p.NoteModelCost("poor", "paid-model", 2.9, 1000)
-	if a := p.PickExcludingForRealm(nil, "paid-model", ""); a != nil {
+	pool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
+	pool.SetCreditFloor(100)
+	pool.SetCredits("poor", 30, 0)
+	pool.NoteModelCost("poor", "paid-model", 2.9, 1000)
+
+	if a := pool.PickExcludingForRealm(nil, "paid-model", ""); a != nil {
 		t.Fatalf("floor 应在 pool 层拦住触底号，got %v（拦截必须发生在选号层，而非靠上游报错）", a.UID)
 	}
 
-	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+	h := NewHandler(&Config{Pool: pool, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body)))
+
 	if rec.Code != 503 {
 		t.Fatalf("code=%d want 503（全池触底 + 收费模型 → 不放行）, body=%s", rec.Code, rec.Body)
 	}
+
 	if !strings.Contains(rec.Body.String(), "no_healthy_account") {
 		t.Errorf("body=%s want no_healthy_account", rec.Body)
 	}
@@ -89,17 +104,19 @@ func TestCreditFloorBlocksPaidRequest(t *testing.T) {
 // TestCreditFloorAllowsFreeRequest 端到端：同一触底号打免费模型照常透出（非 503）。
 // 这是保底的立身之本——保完了就得还能用。
 func TestCreditFloorAllowsFreeRequest(t *testing.T) {
-	p := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
-	p.SetCreditFloor(100)
-	p.SetCredits("poor", 30, 0)
-	p.NoteModelCost("poor", "free-model", 0, 1000)
+	t.Parallel()
+
+	pool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
+	pool.SetCreditFloor(100)
+	pool.SetCredits("poor", 30, 0)
+	pool.NoteModelCost("poor", "free-model", 0, 1000)
 
 	// 选号层面必须出票（上游转发失败与否不在本用例关心范围，见 TestCreditFloor* 单测）。
-	if a := p.PickExcludingForRealm(nil, "free-model", ""); a == nil || a.UID != "poor" {
+	if a := pool.PickExcludingForRealm(nil, "free-model", ""); a == nil || a.UID != "poor" {
 		t.Fatalf("触底号打免费模型应选到号，got %v", a)
 	}
 	// pool 层与 handler 层口径一致（避免 handler 绕过 pool 的 floor 判定）。
-	if a, _ := p.PickByUIDForModel("poor", "free-model", ""); a == nil {
+	if a, _ := pool.PickByUIDForModel("poor", "free-model", ""); a == nil {
 		t.Error("粘性路径对免费模型不应被 floor 拦")
 	}
 }
@@ -107,15 +124,18 @@ func TestCreditFloorAllowsFreeRequest(t *testing.T) {
 // TestCreditFloorPersistsAcquireRelease 保底拦截不影响在途租约语义：
 // 触底 + 收费 → Acquire 仍可占名额（floor 只在选号层拦），释放幂等。
 func TestCreditFloorPersistsAcquireRelease(t *testing.T) {
-	p := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
-	p.SetCreditFloor(100)
-	p.SetCredits("poor", 30, 0)
-	p.NoteModelCost("poor", "paid-model", 2.9, 1000)
-	p.SetMaxInFlight(2)
+	t.Parallel()
 
-	if !p.Acquire("poor") {
+	pool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
+	pool.SetCreditFloor(100)
+	pool.SetCredits("poor", 30, 0)
+	pool.NoteModelCost("poor", "paid-model", 2.9, 1000)
+	pool.SetMaxInFlight(2)
+
+	if !pool.Acquire("poor") {
 		t.Fatal("Acquire 应成功（floor 不介入租约语义）")
 	}
-	p.Release("poor")
-	p.Release("poor") // 幂等释放不扣成负数
+
+	pool.Release("poor")
+	pool.Release("poor") // 幂等释放不扣成负数
 }

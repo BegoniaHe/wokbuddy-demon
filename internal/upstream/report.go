@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -42,20 +43,25 @@ func (c *Client) domainJSON(a *auth.Auth, base, method, path string, body any) (
 }
 
 // domainJSONLimit 同 domainJSON，仅额外指定响应体上限。
-func (c *Client) domainJSONLimit(a *auth.Auth, base, method, path string, body any, maxBytes int64) (json.RawMessage, error) {
+func (c *Client) domainJSONLimit(account *auth.Auth, base, method, path string, body any, maxBytes int64) (json.RawMessage, error) {
 	var rdr io.Reader
+
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("domainJSONLimit: %w", err)
 		}
+
 		rdr = bytes.NewReader(raw)
 	}
+
 	req, err := http.NewRequestWithContext(context.Background(), method, base+path, rdr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("domainJSONLimit: %w", err)
 	}
-	c.BillingHeaders(req, a)
+
+	c.BillingHeaders(req, account)
+
 	return c.doJSONLimit(req, maxBytes)
 }
 
@@ -69,11 +75,13 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.
 // billingMeterJSONLimit 同 billingMeterJSON，允许调用方指定响应体上限。
 func (c *Client) billingMeterJSONLimit(a *auth.Auth, paths []string, body any, maxBytes int64) (json.RawMessage, error) {
 	var lastErr error
+
 	for i, path := range paths {
 		data, err := c.billingJSONLimit(a, path, body, maxBytes)
 		if err == nil {
 			return data, nil
 		}
+
 		lastErr = err
 		// 仅 404 换路径（路径不存在才值得 fallback）；其他错误直接返回。
 		var ue *Error
@@ -81,6 +89,7 @@ func (c *Client) billingMeterJSONLimit(a *auth.Auth, paths []string, body any, m
 			return nil, err
 		}
 	}
+
 	return nil, lastErr
 }
 
@@ -94,6 +103,7 @@ func (c *Client) retryDelay() time.Duration {
 	if c.RetryDelay > 0 {
 		return c.RetryDelay
 	}
+
 	return billingRetryDelay
 }
 
@@ -105,10 +115,11 @@ func isTransientBillingErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	var ue *Error
-	if errors.As(err, &ue) {
+
+	if ue, ok := errors.AsType[*Error](err); ok {
 		return ue.Kind == ErrServer
 	}
+
 	return true
 }
 
@@ -120,13 +131,16 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 	if err == nil || !isTransientBillingErr(err) {
 		return err
 	}
+
 	delay := c.retryDelay()
 	for i := 1; i <= 2; i++ {
 		time.Sleep(time.Duration(i) * delay)
+
 		if err = fn(); err == nil || !isTransientBillingErr(err) {
 			return err
 		}
 	}
+
 	return err
 }
 
@@ -181,18 +195,21 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 
 // ReportChatActivityModel 同上，但可指定上报携带的模型：供「体验某模型」类任务
 // 对齐实际模型（如 Model_chat_GLM5.2 需 requestModelId=glm-5.2 与独立 requestID）。
-func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID, modelID, modelName string) error {
+func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, requestID, modelID, modelName string) error {
 	if requestID == "" {
 		requestID = conversationID
 	}
+
 	if modelID == "" {
 		modelID = "deepseek-v4-flash"
 	}
+
 	if modelName == "" {
 		modelName = modelID
 	}
+
 	now := time.Now().UnixMilli()
-	ev := chatRequestEvent{
+	chatRequestEvent2 := chatRequestEvent{
 		EventCode:             "chat_request_send",
 		Timestamp:             now,
 		ReportDelay:           0,
@@ -228,12 +245,15 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		ParentConversationID:  conversationID,
 		AgentName:             "default",
 		AgentType:             "conversation",
-		UserID:                a.UID,
+		UserID:                account2.UID,
 	}
-	raw, err := json.Marshal([]chatRequestEvent{ev})
+
+	raw, err := json.Marshal([]chatRequestEvent{chatRequestEvent2})
 	if err != nil {
-		return err
+		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
-	_, err = c.billingJSON(a, reportPath, json.RawMessage(raw))
+
+	_, err = c.billingJSON(account2, reportPath, json.RawMessage(raw))
+
 	return err
 }

@@ -42,6 +42,11 @@ const (
 // errSecureDecrypt 通用解密失败：不区分「密码错」与「文件损坏」（避免侧信道）。
 var errSecureDecrypt = errors.New("解密失败：密码错误或文件损坏")
 
+var (
+	errStatic3                      = errors.New("账号数组为空")
+	errValidateSecureAccountsFailed = errors.New("validateSecureAccounts failed")
+)
+
 // secureAccount 加密备份中的单个账号（含可恢复登录态的 token）。
 type secureAccount struct {
 	UID          string `json:"uid"`
@@ -69,26 +74,35 @@ type secureEnvelope struct {
 func encryptPayload(password string, plaintext []byte) ([]byte, error) {
 	salt := make([]byte, secureSaltLen)
 	if _, err := rand.Read(salt); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("encryptPayload: %w", err)
 	}
+
 	gcm, err := secureGCM(password, salt, secureIterations)
 	if err != nil {
 		return nil, err
 	}
+
 	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
+	if _, readErr := rand.Read(nonce); readErr != nil {
+		return nil, fmt.Errorf("encryptPayload: %w", readErr)
 	}
-	ct := gcm.Seal(nil, nonce, plaintext, nil)
+
+	nums := gcm.Seal(nil, nonce, plaintext, nil)
 	env := secureEnvelope{
 		Version: secureEnvelopeVersion,
 		KDF:     secureKDF,
 		Iter:    secureIterations,
 		Salt:    base64.StdEncoding.EncodeToString(salt),
 		Nonce:   base64.StdEncoding.EncodeToString(nonce),
-		Cipher:  base64.StdEncoding.EncodeToString(ct),
+		Cipher:  base64.StdEncoding.EncodeToString(nums),
 	}
-	return json.Marshal(env)
+
+	raw, err := json.Marshal(env)
+	if err != nil {
+		return nil, fmt.Errorf("encryptPayload: %w", err)
+	}
+
+	return raw, nil
 }
 
 // decryptPayload 校验 envelope 并解密；任何失败（含 GCM auth tag 校验失败）统一返回
@@ -98,12 +112,15 @@ func decryptPayload(password string, raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	salt, e1 := base64.StdEncoding.DecodeString(env.Salt)
 	nonce, e2 := base64.StdEncoding.DecodeString(env.Nonce)
-	ct, e3 := base64.StdEncoding.DecodeString(env.Cipher)
+
+	nums, e3 := base64.StdEncoding.DecodeString(env.Cipher)
 	if e1 != nil || e2 != nil || e3 != nil {
 		return nil, errSecureDecrypt
 	}
+
 	gcm, err := secureGCM(password, salt, env.Iter)
 	if err != nil {
 		return nil, err
@@ -113,10 +130,12 @@ func decryptPayload(password string, raw []byte) ([]byte, error) {
 	if len(nonce) != gcm.NonceSize() {
 		return nil, errSecureDecrypt
 	}
-	pt, err := gcm.Open(nil, nonce, ct, nil)
+
+	pt, err := gcm.Open(nil, nonce, nums, nil)
 	if err != nil {
 		return nil, errSecureDecrypt
 	}
+
 	return pt, nil
 }
 
@@ -126,10 +145,12 @@ func parseSecureEnvelope(raw []byte) (secureEnvelope, error) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return env, errSecureDecrypt
 	}
+
 	if env.Version != secureEnvelopeVersion || env.KDF != secureKDF ||
 		env.Iter <= 0 || env.Iter > secureMaxIter {
 		return env, errSecureDecrypt
 	}
+
 	return env, nil
 }
 
@@ -139,39 +160,46 @@ func secureGCM(password string, salt []byte, iter int) (cipher.AEAD, error) {
 	if err != nil {
 		return nil, errSecureDecrypt
 	}
+
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, errSecureDecrypt
 	}
+
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
 		return nil, errSecureDecrypt
 	}
+
 	return gcm, nil
 }
 
 // collectSecureAccounts 汇总池内全部账号的可导出凭证（token 原样，加密后传输）。
-// 经加锁访问器读取会被 refresh 改写的字段；UID/Nickname/EnterpriseID/DeviceToken
+// 经加锁访问器读取会被 refresh/改名改写的字段；UID/EnterpriseID/DeviceToken
 // 解析后不再改写，直接读。
 func (p *Panel) collectSecureAccounts() []secureAccount {
 	var out []secureAccount
-	for _, st := range p.cfg.Pool.List() {
-		a := p.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
+
+	all := p.cfg.Pool.List()
+	for i := range all {
+		account := p.cfg.Pool.AuthByUID(all[i].UID)
+		if account == nil {
 			continue
 		}
+
 		out = append(out, secureAccount{
-			UID:          a.UID,
-			Nickname:     a.Nickname,
-			AccessToken:  a.AccessTokenValue(),
-			RefreshToken: a.RefreshTokenValue(),
-			ExpiresAt:    a.ExpiresAtValue(),
-			Domain:       a.DomainValue(),
-			Realm:        a.Realm(),
-			EnterpriseID: a.EnterpriseID,
-			DeviceToken:  a.DeviceToken,
+			UID:          account.UID,
+			Nickname:     account.NicknameValue(),
+			AccessToken:  account.AccessTokenValue(),
+			RefreshToken: account.RefreshTokenValue(),
+			ExpiresAt:    account.ExpiresAtValue(),
+			Domain:       account.DomainValue(),
+			Realm:        account.Realm(),
+			EnterpriseID: account.EnterpriseID,
+			DeviceToken:  account.DeviceToken,
 		})
 	}
+
 	return out
 }
 
@@ -188,29 +216,36 @@ func (p *Panel) exportEncrypted(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}
+
 	if len(req.Password) < secureMinPass {
 		writeErr(w, http.StatusBadRequest, fmt.Sprintf("密码至少 %d 位", secureMinPass))
 		return
 	}
+
 	accounts := p.collectSecureAccounts()
 	if len(accounts) == 0 {
 		writeErr(w, http.StatusBadRequest, "池内无账号可导出")
 		return
 	}
+
 	plain, err := json.Marshal(accounts)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "序列化失败")
 		return
 	}
+
 	env, err := encryptPayload(req.Password, plain)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "加密失败")
 		return
 	}
+
 	name := "wokbuddy-accounts-" + time.Now().Format("20060102-150405") + ".wbenc.json"
+
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	_, _ = w.Write(env)
+
 	log.Printf("panel: 加密导出 %d 个账号（明文 token 未落日志）", len(accounts))
 }
 
@@ -222,52 +257,15 @@ func (p *Panel) exportEncrypted(w http.ResponseWriter, r *http.Request) {
 //
 // 返回 {ok, total, imported, skipped, errors}。
 func (p *Panel) importEncrypted(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, secureMaxUploadBytes)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
-		return
-	}
-	file, _, err := r.FormFile("file")
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "missing file field: "+err.Error())
-		return
-	}
-	defer file.Close()
-	raw, err := io.ReadAll(file)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "read file: "+err.Error())
-		return
-	}
-	password := r.FormValue("password")
-	if password == "" {
-		writeErr(w, http.StatusBadRequest, "missing password")
-		return
-	}
-	plain, err := decryptPayload(password, raw)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	var accounts []secureAccount
-	if err := json.Unmarshal(plain, &accounts); err != nil {
-		writeErr(w, http.StatusBadRequest, "解密后内容不是有效账号数组")
-		return
-	}
-	if len(accounts) == 0 {
-		writeErr(w, http.StatusBadRequest, "账号数组为空")
+	accounts, ok := readSecureAccounts(w, r)
+	if !ok {
 		return
 	}
 
-	var imported, skipped int
-	var errs []string
-	for _, acc := range accounts {
-		if ok, msg := p.importSecureAccount(acc); ok {
-			imported++
-		} else {
-			skipped++
-			errs = append(errs, msg)
-		}
-	}
+	importedAuths, imported, skipped, errs := p.persistSecureAccounts(accounts)
+
+	// 阶段 2（有界并发）：签到/激活/余额查询，与其它批量导入同策略。
+	p.postImportAccounts(importedAuths)
 	log.Printf("panel: 加密导入 finished total=%d imported=%d skipped=%d", len(accounts), imported, skipped)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
@@ -278,48 +276,138 @@ func (p *Panel) importEncrypted(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// importSecureAccount 导入单个解密账号：字段校验、落盘、热加载并顺带签到/激活。
+// readSecureAccounts 解析上传文件、解密并校验账号数组；失败时已写回响应。
+func readSecureAccounts(w http.ResponseWriter, r *http.Request) ([]secureAccount, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, secureMaxUploadBytes)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		writeErr(w, http.StatusBadRequest, "parse form: "+err.Error())
+		return nil, false
+	}
+
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "missing file field: "+err.Error())
+		return nil, false
+	}
+	defer file.Close()
+
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "read file: "+err.Error())
+		return nil, false
+	}
+
+	password := r.FormValue("password")
+	if password == "" {
+		writeErr(w, http.StatusBadRequest, "missing password")
+		return nil, false
+	}
+
+	plain, err := decryptPayload(password, raw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return nil, false
+	}
+
+	var accounts []secureAccount
+	if err := json.Unmarshal(plain, &accounts); err != nil {
+		writeErr(w, http.StatusBadRequest, "解密后内容不是有效账号数组")
+		return nil, false
+	}
+
+	if err := validateSecureAccounts(accounts); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return nil, false
+	}
+
+	return accounts, true
+}
+
+// persistSecureAccounts 串行落盘并热加载；失败项逐条返回原因。
+func (p *Panel) persistSecureAccounts(accounts []secureAccount) ([]*auth.Auth, int, int, []string) {
+	// 阶段 1（串行）：字段校验 + 落盘 + 热加载。
+	importedAuths := make([]*auth.Auth, 0, len(accounts))
+	errs := make([]string, 0, len(accounts))
+
+	var imported, skipped int
+
+	for i := range accounts {
+		account, msg := p.persistSecureAccount(&accounts[i])
+		if account == nil {
+			skipped++
+
+			errs = append(errs, msg)
+
+			continue
+		}
+
+		imported++
+
+		importedAuths = append(importedAuths, account)
+	}
+
+	return importedAuths, imported, skipped, errs
+}
+
+// validateSecureAccounts 校验解密后的账号数量：空数组与超上限整体拒绝。
+func validateSecureAccounts(accounts []secureAccount) error {
+	if len(accounts) == 0 {
+		return errStatic3
+	}
+
+	if len(accounts) > maxImportAccounts {
+		return fmt.Errorf("too many accounts: %d (max %d per import): %w", len(accounts), maxImportAccounts, errValidateSecureAccountsFailed)
+	}
+
+	return nil
+}
+
+// persistSecureAccount 校验并落盘单个解密账号（含热加载进池）。
+// 返回 (账号, 空串) 表示导入成功；账号为 nil 时第二返回值是失败原因。
+// 上游调用（签到/余额）不在此处，见 postImportAccounts。
 // 失败原因不回显 token（只标 uid）。
-func (p *Panel) importSecureAccount(acc secureAccount) (bool, string) {
+func (p *Panel) persistSecureAccount(acc *secureAccount) (*auth.Auth, string) {
 	uid := strings.TrimSpace(acc.UID)
 	at := strings.TrimSpace(acc.AccessToken)
-	rt := strings.TrimSpace(acc.RefreshToken)
-	if uid == "" || at == "" || rt == "" {
-		return false, fmt.Sprintf("missing required fields (uid=%q)", acc.UID)
+
+	str := strings.TrimSpace(acc.RefreshToken)
+	if uid == "" || at == "" || str == "" {
+		return nil, fmt.Sprintf("missing required fields (uid=%q)", acc.UID)
 	}
+
 	if !validImportUID(uid) {
-		return false, fmt.Sprintf("invalid uid (uid=%q)", acc.UID)
+		return nil, fmt.Sprintf("invalid uid (uid=%q)", acc.UID)
 	}
+
 	realm := strings.TrimSpace(acc.Realm)
 	if realm == "" {
 		realm = auth.ResolveRealm("", acc.Domain)
 	}
-	a := buildSecureAuth(acc, uid, at, rt, p.cfg.AuthDir)
+
+	a := buildSecureAuth(acc, uid, at, str, p.cfg.AuthDir)
 	if err := p.persistImportedAuth(a, realm, uid); err != nil {
-		return false, err.Error()
+		return nil, err.Error()
 	}
-	p.importCheckin(a, uid)
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
-	}
-	return true, ""
+
+	return a, ""
 }
 
 // buildSecureAuth 由解密账号构造 auth：ExpiresAt 缺失时回落 +365 天。
-func buildSecureAuth(acc secureAccount, uid, at, rt, authDir string) *auth.Auth {
+func buildSecureAuth(acc *secureAccount, strVal, at, str, authDir string) *auth.Auth {
 	expiresAt := acc.ExpiresAt
 	if expiresAt <= 0 {
 		expiresAt = time.Now().Add(365 * 24 * time.Hour).Unix()
 	}
+
 	return &auth.Auth{
 		AccessToken:  at,
-		RefreshToken: rt,
+		RefreshToken: str,
 		ExpiresAt:    expiresAt,
 		Domain:       acc.Domain,
-		UID:          uid,
+		UID:          strVal,
 		Nickname:     acc.Nickname,
 		EnterpriseID: acc.EnterpriseID,
 		DeviceToken:  acc.DeviceToken,
-		FilePath:     filepath.Join(authDir, fmt.Sprintf("workbuddy-%s.json", uid)),
+		FilePath:     filepath.Join(authDir, fmt.Sprintf("workbuddy-%s.json", strVal)),
 	}
 }

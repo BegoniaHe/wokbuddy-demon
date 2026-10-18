@@ -58,15 +58,18 @@ func HashKey(key string) []byte { return digest(key) }
 // subtle.ConstantTimeCompare；不因命中位置提前返回，不泄露匹配前缀或候选数量形状。
 func Authenticate(r *http.Request, defaultKey string, keys []Key) AuthResult {
 	if defaultKey == "" && len(keys) == 0 {
-		return AuthResult{OK: true, IsDefault: true}
+		return AuthResult{OK: true, IsDefault: true, KeyID: ""}
 	}
+
 	got := digest(bearerToken(r))
 
 	defaultMatch := 0
 	if defaultKey != "" {
 		defaultMatch = subtle.ConstantTimeCompare(got, digest(defaultKey))
 	}
+
 	matched := -1
+
 	for i := range keys {
 		eq := subtle.ConstantTimeCompare(got, keys[i].Hash)
 		// 命中后仍继续比较其余候选，保持恒定遍历（不短路）。
@@ -74,13 +77,16 @@ func Authenticate(r *http.Request, defaultKey string, keys []Key) AuthResult {
 			matched = i
 		}
 	}
+
 	if defaultMatch == 1 {
-		return AuthResult{OK: true, IsDefault: true}
+		return AuthResult{OK: true, IsDefault: true, KeyID: ""}
 	}
+
 	if matched >= 0 {
-		return AuthResult{OK: true, KeyID: keys[matched].ID}
+		return AuthResult{OK: true, KeyID: keys[matched].ID, IsDefault: false}
 	}
-	return AuthResult{}
+
+	return AuthResult{OK: false, KeyID: "", IsDefault: false}
 }
 
 // bearerToken 从 Authorization 头提取 Bearer token；缺头或方案不符返回空串
@@ -90,6 +96,7 @@ func bearerToken(r *http.Request) string {
 	if !strings.HasPrefix(authz, bearerPrefix) {
 		return ""
 	}
+
 	return authz[len(bearerPrefix):]
 }
 

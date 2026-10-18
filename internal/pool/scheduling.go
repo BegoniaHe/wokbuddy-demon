@@ -37,16 +37,19 @@ const (
 )
 
 // stickyEscapedLocked 报告粘性命中是否应软逃逸。调用方需已持 p.mu。
-func (p *Pool) stickyEscapedLocked(e *entry, model string, now time.Time) bool {
-	if e.healthFactor(model, now) < stickyEscapeHealth {
+func (p *Pool) stickyEscapedLocked(entry2 *entry, model string, now time.Time) bool {
+	if entry2.healthFactor(model, now) < stickyEscapeHealth {
 		return true
 	}
-	limit := p.inFlightLimit(e)
+
+	limit := p.inFlightLimit(entry2)
 	if limit <= 0 {
 		return false
 	}
+
 	threshold := int(math.Ceil(stickyEscapeRatio * float64(limit)))
-	return int(e.inFlight.Load()) >= threshold
+
+	return int(entry2.inFlight.Load()) >= threshold
 }
 
 // StickyLowLoad 报告账号是否回落到可重新接收粘性绑定的低水位。
@@ -54,52 +57,62 @@ func (p *Pool) stickyEscapedLocked(e *entry, model string, now time.Time) bool {
 func (p *Pool) StickyLowLoad(uid, model, realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
-	if realm != "" && e.a.Realm() != realm {
+
+	if realm != "" && entry2.a.Realm() != realm {
 		return false
 	}
-	limit := p.inFlightLimit(e)
+
+	limit := p.inFlightLimit(entry2)
 	if limit <= 0 {
 		return true
 	}
-	return int(e.inFlight.Load()) <= int(math.Floor(stickyReuseLoadRatio*float64(limit)))
+
+	return int(entry2.inFlight.Load()) <= int(math.Floor(stickyReuseLoadRatio*float64(limit)))
 }
 
 // pressureFactor 并发压力对权重的乘性折扣：limit<=0 或低于死区时 1.0。
 // 与 healthFactor 一样只降权，不改可用性判定。
-func (p *Pool) pressureFactor(e *entry) float64 {
-	limit := p.inFlightLimit(e)
+func (p *Pool) pressureFactor(entry3 *entry) float64 {
+	limit := p.inFlightLimit(entry3)
 	if limit <= 0 {
 		return 1
 	}
-	r := float64(e.inFlight.Load()) / float64(limit)
+
+	r := float64(entry3.inFlight.Load()) / float64(limit)
 	if r <= pressureDeadband {
 		return 1
 	}
+
 	x := (r - pressureDeadband) / (1 - pressureDeadband)
+
 	return 1 / (1 + pressureAlpha*x*x)
 }
 
 // jitterCooldown 给固定冷却时长叠加 ±10% 有界抖动，打散多账号同相位解封。
 // 使用进程级随机源（非测试注入源），不改变冷却语义，只改变蜂拥的到达时刻。
-func jitterCooldown(d time.Duration) time.Duration {
-	if d <= 0 {
-		return d
+func jitterCooldown(duration time.Duration) time.Duration {
+	if duration <= 0 {
+		return duration
 	}
-	delta := int64(float64(d) * 0.1)
+
+	delta := int64(float64(duration) * 0.1)
 	if delta <= 0 {
-		return d
+		return duration
 	}
-	return d - time.Duration(delta) + time.Duration(rand.Int64N(2*delta+1))
+
+	return duration - time.Duration(delta) + time.Duration(rand.Int64N(2*delta+1))
 }
 
 // EstimatePromptTokens 粗略估算请求的 prompt token：ASCII ≈ 4 字节/token，
 // CJK ≈ 1.5 字节/token。只用于请求前预扣，不参与计费或 usage 统计。
 func EstimatePromptTokens(body []byte) int {
 	ascii, cjk := 0, 0
+
 	for _, r := range string(body) {
 		if r >= 0x2E80 {
 			cjk++
@@ -107,6 +120,7 @@ func EstimatePromptTokens(body []byte) int {
 			ascii++
 		}
 	}
+
 	return ascii/4 + int(float64(cjk)/1.5)
 }
 
@@ -119,29 +133,37 @@ func EstimatePromptTokens(body []byte) int {
 func (p *Pool) ReserveForRequest(uid, model, realm string, promptTokens, outputTokens int) (float64, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
+
+	entry2, ok := p.byUID[uid]
 	if !ok {
 		return 0, false
 	}
+
 	if p.creditFloor <= 0 || model == "" {
 		return 0, true
 	}
+
 	if outputTokens <= 0 {
 		outputTokens = reserveOutputTokens
 	}
-	price, paid := p.reserveUnitCostLocked(e, model, realm, p.now())
+
+	price, paid := p.reserveUnitCostLocked(entry2, model, realm, p.now())
 	if !paid || price <= 0 {
 		return 0, true
 	}
+
 	amount := price * float64(promptTokens+outputTokens) / 1000
 	if amount <= 0 {
 		return 0, true
 	}
-	available := float64(e.credits) - e.reservedCredits
+
+	available := float64(entry2.credits) - entry2.reservedCredits
 	if available-amount < float64(p.creditFloor) {
 		return 0, false
 	}
-	e.reservedCredits += amount
+
+	entry2.reservedCredits += amount
+
 	return amount, true
 }
 
@@ -151,20 +173,25 @@ func (p *Pool) reserveUnitCostLocked(e *entry, model, realm string, now time.Tim
 	if mc, ok := e.modelCostOf(model, now); ok {
 		return mc.CostPer1k, mc.CostPer1k > 0
 	}
+
 	if p.modelRateOf == nil {
 		return 0, false
 	}
+
 	rate := p.modelRateOf(realm, model)
 	if strings.TrimSpace(rate) == "" {
 		return 0, false
 	}
+
 	v, err := strconv.ParseFloat(rate, 64)
 	if err != nil {
 		return 0, false
 	}
+
 	if v <= 0 {
 		return 0, false
 	}
+
 	return reserveDefaultCostPer1K, true
 }
 
@@ -173,8 +200,10 @@ func (p *Pool) ReleaseReservation(uid string, amount float64) {
 	if amount <= 0 {
 		return
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if e, ok := p.byUID[uid]; ok {
 		e.reservedCredits -= amount
 		if e.reservedCredits < 0 {

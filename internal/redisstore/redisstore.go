@@ -10,6 +10,7 @@ package redisstore
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -61,23 +62,30 @@ func New(url, token string) Store {
 	}
 
 	full := normalizeURL(url, token)
+
 	opt, err := redis.ParseURL(full)
 	if err != nil {
 		log.Printf("[redisstore] 警告: redis 连接串解析失败 (%v)，降级 Noop", err)
 		return Noop{}
 	}
+
 	opt.ReadTimeout = readTimeout
 	opt.WriteTimeout = readTimeout
 	client := redis.NewClient(opt)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+
 	if err := client.Ping(ctx).Err(); err != nil {
 		log.Printf("[redisstore] 警告: upstash 连接失败 (%v)，降级 Noop（纯内存模式）", err)
+
 		_ = client.Close()
+
 		return Noop{}
 	}
+
 	log.Printf("[redisstore] upstash 已连接 (addr=%s)", opt.Addr)
+
 	return &Upstash{
 		client: client,
 		sem:    make(chan struct{}, writeConcurrencyLimit),
@@ -94,10 +102,12 @@ func normalizeURL(url, token string) string {
 	if len(url) >= 8 && (url[:8] == "rediss:/" || url[:7] == "redis:/") {
 		return url
 	}
+
 	host := url
 	if i := strings.Index(host, "://"); i >= 0 {
 		host = host[i+3:]
 	}
+
 	return "rediss://default:" + token + "@" + host + ":6379"
 }
 
@@ -131,13 +141,16 @@ func (u *Upstash) goWrite(fn func()) {
 	u.closeOnceGuard()
 	u.submitMu.Lock()
 	u.wg.Add(1)
+
 	select {
 	case <-u.done:
 		u.submitMu.Unlock()
 		u.wg.Done() // 关停后提交的写：登记即撤销，直接丢弃
+
 		return
 	default:
 	}
+
 	u.submitMu.Unlock()
 	go func() {
 		defer u.wg.Done()
@@ -149,6 +162,7 @@ func (u *Upstash) goWrite(fn func()) {
 		// wg 中，Close 的 wg.Wait 必然等到它执行完。
 		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
+
 		fn()
 	}()
 }
@@ -173,14 +187,18 @@ func (u *Upstash) Close() error {
 	u.submitMu.Lock()
 	u.closeOnce.Do(func() { close(u.done) })
 	u.submitMu.Unlock()
+
 	done := make(chan struct{})
+
 	go func() { u.wg.Wait(); close(done) }()
+
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		// 兜底超时（单写上限 5s，10s 富余）：卡死的写不应阻塞进程退出。
 		log.Printf("[redisstore] WARN: Close 等待在途写超时，放弃（镜像可能未写完）")
 	}
+
 	return u.closeClient()
 }
 
@@ -189,7 +207,12 @@ func (u *Upstash) closeClient() error {
 	if u.client == nil {
 		return nil
 	}
-	return u.client.Close()
+
+	if err := u.client.Close(); err != nil {
+		return fmt.Errorf("close redis client: %w", err)
+	}
+
+	return nil
 }
 
 func bindKey(key string) string { return bindPrefix + key }
@@ -199,9 +222,11 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = keyTTL
 	}
+
 	u.goWrite(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
 		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
 			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
 		}
@@ -213,6 +238,7 @@ func (u *Upstash) DelBind(key string) {
 	u.goWrite(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
 		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
 			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
 		}
@@ -224,6 +250,7 @@ func (u *Upstash) SaveState(data []byte) {
 	u.goWrite(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+
 		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {
 			log.Printf("[redisstore] debug: SaveState: %v", err)
 		}
@@ -234,27 +261,34 @@ func (u *Upstash) SaveState(data []byte) {
 func (u *Upstash) LoadState() ([]byte, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
+
 	v, err := u.client.Get(ctx, stateKey).Bytes()
 	if err != nil {
 		return nil, false
 	}
+
 	return v, true
 }
 
 // LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀）。
 func (u *Upstash) LoadBinds() map[string]string {
 	out := map[string]string{}
+
 	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
+
 	iter := u.client.Scan(ctx, 0, bindPrefix+"*", 200).Iterator()
 	for iter.Next(ctx) {
 		key := iter.Val()
+
 		v, err := u.client.Get(ctx, key).Result()
 		if err != nil {
 			continue
 		}
+
 		out[strings.TrimPrefix(key, bindPrefix)] = v
 	}
+
 	return out
 }
 

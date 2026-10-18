@@ -38,6 +38,13 @@ const (
 	statusFailed   = "FAILED"        // 读写失败
 )
 
+var (
+	errWriteBackupFailed   = errors.New("writeBackup failed")
+	errMissingUID          = errors.New("missing uid")
+	errMissingAccessToken  = errors.New("missing access_token")
+	errMissingRefreshToken = errors.New("missing refresh_token")
+)
+
 type row struct {
 	file   string
 	uid    string
@@ -57,66 +64,80 @@ type counts struct {
 func main() {
 	dir := flag.String("dir", "auths", "auth 目录")
 	apply := flag.Bool("apply", false, "实际写盘（缺省 dry-run 仅预览）")
+
 	flag.Parse()
 
 	files, err := filepath.Glob(filepath.Join(*dir, "workbuddy*.json"))
 	if err != nil {
 		failf("glob: %v", err)
 	}
+
 	if len(files) == 0 {
 		failf("no auth files in %s", *dir)
 	}
+
 	sort.Strings(files)
 
-	rows, c := migrateAll(files, *apply)
+	rows, counts2 := migrateAll(files, *apply)
 	printTable(rows)
-	report(c, len(rows), *apply)
-	if c.invalid > 0 || c.failed > 0 {
+	report(counts2, len(rows), *apply)
+
+	if counts2.invalid > 0 || counts2.failed > 0 {
 		exitFunc(1)
 	}
-	if *apply && !reportLoadable(*dir, c.current+c.converted) {
+
+	if *apply && !reportLoadable(*dir, counts2.current+counts2.converted) {
 		exitFunc(1)
 	}
 }
 
 // migrateAll 逐个迁移并汇总状态；重复 UID 按 LoadDir 同口径告警（后者覆盖前者）。
 func migrateAll(files []string, apply bool) ([]row, counts) {
-	var c counts
+	var counts2 counts
+
 	rows := make([]row, 0, len(files))
+
 	seen := make(map[string]string, len(files))
 	for _, f := range files {
 		r := migrateFile(f, apply)
+
 		rows = append(rows, r)
 		switch r.status {
 		case statusMigrated, statusWould:
-			c.converted++
+			counts2.converted++
 		case statusCurrent:
-			c.current++
+			counts2.current++
 		case statusInvalid:
-			c.invalid++
+			counts2.invalid++
 		default:
-			c.failed++
+			counts2.failed++
 		}
+
 		if r.uid == "" {
 			continue
 		}
+
 		if prev, ok := seen[r.uid]; ok {
 			fmt.Printf("WARN: uid %s 重复（%s 与 %s），加载时后者覆盖前者\n", r.uid, prev, r.file)
 		}
+
 		seen[r.uid] = r.file
 	}
-	return rows, c
+
+	return rows, counts2
 }
 
 // report 打印汇总与下一步提示。
-func report(c counts, total int, apply bool) {
+func report(counts2 counts, total int, apply bool) {
 	verb := "可迁移"
 	if apply {
 		verb = "已迁移"
 	}
+
 	fmt.Printf("\ntotal=%d %s=%d current=%d invalid=%d failed=%d\n",
-		total, verb, c.converted, c.current, c.invalid, c.failed)
-	if !apply && c.converted > 0 {
+		total, verb, counts2.converted, counts2.current, counts2.invalid, counts2.failed)
+
+	if !apply && counts2.converted > 0 {
 		fmt.Println("dry-run：加 -apply 实际写盘（原文件留存 .legacy 副本）")
 	}
 }
@@ -125,40 +146,51 @@ func report(c counts, total int, apply bool) {
 // apply 时先留存 .legacy 副本，再经 SaveAtomic 原子写回。
 func migrateFile(path string, apply bool) row {
 	r := row{file: filepath.Base(path)}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		r.status, r.detail = statusFailed, err.Error()
 		return r
 	}
-	if a, err := auth.Parse(raw); err == nil {
+
+	if a, perr := auth.Parse(raw); perr == nil {
 		r.uid, r.nick = a.UID, a.Nickname
 		r.status, r.detail = statusCurrent, "已是当前格式"
+
 		return r
 	}
-	a, err := convertLegacy(raw)
+
+	account, err := convertLegacy(raw)
 	if err != nil {
 		r.status, r.detail = statusInvalid, err.Error()
 		return r
 	}
-	r.uid, r.nick = a.UID, a.Nickname
-	r.detail = fmt.Sprintf("realm=%s expiresAt=%d", a.RealmStored(), a.ExpiresAt)
-	if a.NeedsRefresh(0) {
+
+	r.uid, r.nick = account.UID, account.Nickname
+
+	r.detail = fmt.Sprintf("realm=%s expiresAt=%d", account.RealmStored(), account.ExpiresAt)
+	if account.NeedsRefresh(0) {
 		r.detail += "（token 已过期，启动后自动刷新）"
 	}
+
 	if !apply {
 		r.status = statusWould
 		return r
 	}
+
 	if err := writeBackup(path, raw); err != nil {
 		r.status, r.detail = statusFailed, "备份 .legacy: "+err.Error()
 		return r
 	}
-	a.FilePath = path
-	if err := a.SaveAtomic(); err != nil {
+
+	account.FilePath = path
+	if err := account.SaveAtomic(); err != nil {
 		r.status, r.detail = statusFailed, "写回: "+err.Error()
 		return r
 	}
+
 	r.status = statusMigrated
+
 	return r
 }
 
@@ -166,17 +198,24 @@ func migrateFile(path string, apply bool) row {
 // 重跑），内容不一致则拒绝覆盖——避免毁掉更早一次迁移留下的原始文件。
 func writeBackup(path string, raw []byte) error {
 	backup := path + ".legacy"
+
 	existing, err := os.ReadFile(backup)
 	switch {
 	case err == nil:
 		if !bytes.Equal(existing, raw) {
-			return fmt.Errorf("%s 已存在且内容不同，拒绝覆盖（确认无用后手动删除）", filepath.Base(backup))
+			return fmt.Errorf("%s 已存在且内容不同，拒绝覆盖（确认无用后手动删除）: %w", filepath.Base(backup), errWriteBackupFailed)
 		}
+
 		return nil
 	case !errors.Is(err, fs.ErrNotExist):
-		return err
+		return fmt.Errorf("writeBackup: %w", err)
 	}
-	return os.WriteFile(backup, raw, 0o600)
+
+	if err := os.WriteFile(backup, raw, 0o600); err != nil {
+		return fmt.Errorf("write backup: %w", err)
+	}
+
+	return nil
 }
 
 // convertLegacy 把旧版 snake_case 扁平内容解析为 *auth.Auth：
@@ -185,7 +224,7 @@ func writeBackup(path string, raw []byte) error {
 // 以 access token 的 iss claim 兜底（复用 auth.BackfillRealm）。
 // 必需字段（uid / access_token / refresh_token）缺失返回 error。
 func convertLegacy(raw []byte) (*auth.Auth, error) {
-	var lg struct {
+	var item struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		ExpiresAt    int64  `json:"expires_at"`
@@ -196,35 +235,38 @@ func convertLegacy(raw []byte) (*auth.Auth, error) {
 		Nickname     string `json:"nickname"`
 		DeviceToken  string `json:"device_token"`
 	}
-	if err := json.Unmarshal(raw, &lg); err != nil {
+	if err := json.Unmarshal(raw, &item); err != nil {
 		return nil, fmt.Errorf("legacy json: %w", err)
 	}
+
 	switch {
-	case strings.TrimSpace(lg.UID) == "":
-		return nil, errors.New("missing uid")
-	case strings.TrimSpace(lg.AccessToken) == "":
-		return nil, errors.New("missing access_token")
-	case strings.TrimSpace(lg.RefreshToken) == "":
-		return nil, errors.New("missing refresh_token")
+	case strings.TrimSpace(item.UID) == "":
+		return nil, errMissingUID
+	case strings.TrimSpace(item.AccessToken) == "":
+		return nil, errMissingAccessToken
+	case strings.TrimSpace(item.RefreshToken) == "":
+		return nil, errMissingRefreshToken
 	}
-	a := &auth.Auth{
-		AccessToken:  lg.AccessToken,
-		RefreshToken: lg.RefreshToken,
-		ExpiresAt:    normalizeExpiry(lg.ExpiresAt),
-		Domain:       lg.Domain,
-		UID:          lg.UID,
-		EnterpriseID: lg.EnterpriseID,
-		Nickname:     lg.Nickname,
-		DeviceToken:  lg.DeviceToken,
+
+	account := &auth.Auth{
+		AccessToken:  item.AccessToken,
+		RefreshToken: item.RefreshToken,
+		ExpiresAt:    normalizeExpiry(item.ExpiresAt),
+		Domain:       item.Domain,
+		UID:          item.UID,
+		EnterpriseID: item.EnterpriseID,
+		Nickname:     item.Nickname,
+		DeviceToken:  item.DeviceToken,
 	}
-	if r := strings.TrimSpace(lg.Realm); r != "" {
-		if _, err := auth.BackfillRealmFor(a, r); err != nil {
+	if r := strings.TrimSpace(item.Realm); r != "" {
+		if _, err := auth.BackfillRealmFor(account, r); err != nil {
 			return nil, fmt.Errorf("realm %q: %w", r, err)
 		}
 	} else {
-		a.BackfillRealm()
+		account.BackfillRealm()
 	}
-	return a, nil
+
+	return account, nil
 }
 
 // normalizeExpiry 归一化过期时间戳为 Unix 秒：大于 1e11 视为毫秒（旧版工具导出
@@ -233,6 +275,7 @@ func normalizeExpiry(v int64) int64 {
 	if v > 100_000_000_000 {
 		return v / 1000
 	}
+
 	return v
 }
 
@@ -245,17 +288,21 @@ func reportLoadable(dir string, want int) bool {
 		fmt.Printf("校验失败：auth.LoadDir: %v\n", err)
 		return false
 	}
+
 	if len(list) != want {
 		fmt.Printf("校验失败：auth.LoadDir 载入 %d 个账号，期望 %d（检查被跳过的文件）\n", len(list), want)
 		return false
 	}
+
 	fmt.Printf("校验：auth.LoadDir 载入 %d 个账号\n", len(list))
+
 	return true
 }
 
 func printTable(rows []row) {
 	fmt.Printf("%-32s | %-36s | %-11s | %-13s | %s\n", "file", "uid", "nick", "status", "detail")
 	fmt.Println(strings.Repeat("-", 120))
+
 	for _, r := range rows {
 		fmt.Printf("%-32s | %-36s | %-11s | %-13s | %s\n",
 			trunc(r.file, 32), trunc(r.uid, 36), trunc(r.nick, 11), r.status, r.detail)
@@ -263,12 +310,13 @@ func printTable(rows []row) {
 }
 
 // trunc 按字符截断，避免切断 UTF-8 多字节序列（昵称常为中文）。
-func trunc(s string, n int) string {
-	r := []rune(s)
+func trunc(str string, n int) string {
+	r := []rune(str)
 	if len(r) > n {
 		return string(r[:n])
 	}
-	return s
+
+	return str
 }
 
 // exitFunc 供测试替换（默认 os.Exit；与 cmd/login 同款）。

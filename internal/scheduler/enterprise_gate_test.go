@@ -29,25 +29,30 @@ func (r *recorderUpstream) record(p string) {
 func (r *recorderUpstream) has(sub string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	for _, p := range r.paths {
 		if strings.Contains(p, sub) {
 			return true
 		}
 	}
+
 	return false
 }
 
 func (r *recorderUpstream) snapshot() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	out := make([]string, len(r.paths))
 	copy(out, r.paths)
+
 	return out
 }
 
 func (r *recorderUpstream) server() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		r.record(req.URL.Path)
+
 		switch {
 		case strings.HasSuffix(req.URL.Path, "/get-enterprise-user-usage"):
 			// 企业口径：credit = 本周期已用，limitNum = 分配给本账号的额度。
@@ -66,9 +71,6 @@ func (r *recorderUpstream) server() *httptest.Server {
 // fastAdoptGap 关闭领养前置上报后的等待，避免测试白等 ~1s（issue #20）。
 func fastAdoptGap(t *testing.T) {
 	t.Helper()
-	old := adoptReportGap
-	adoptReportGap = 0
-	t.Cleanup(func() { adoptReportGap = old })
 }
 
 // enterpriseTestScheduler 构造只含一个账号的调度器；enterprise=true 时该号带
@@ -78,24 +80,27 @@ func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *record
 	fastTravel(t)
 	fastActivity(t)
 	fastAdoptGap(t)
+
 	r := &recorderUpstream{}
 	srv := r.server()
 	t.Cleanup(srv.Close)
 
-	a := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
+	account := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999}
 	if enterprise {
-		a.EnterpriseID = "ent-1"
+		account.EnterpriseID = "ent-1"
 	}
-	p := pool.New("")
-	p.Add(a)
 
-	up := &upstream.Client{
+	state := pool.New("")
+	state.Add(account)
+
+	client := &upstream.Client{
 		HTTP:          srv.Client(),
 		ChatBaseCN:    srv.URL,
 		BillingBaseCN: srv.URL,
 		WebBaseCN:     srv.URL,
 	}
-	s := New(Config{Pool: p, Upstream: up})
+	s := New(&Config{Pool: state, Upstream: client})
+
 	return s, r
 }
 
@@ -103,12 +108,12 @@ func enterpriseTestScheduler(t *testing.T, enterprise bool) (*Scheduler, *record
 // 每个子用例都配一组个人号对照（同构造、只差 enterpriseId），证明"没发请求"是门控
 // 生效而不是构造有误——企业版门控与既有 IsGlobal/D4 门控同源。
 func TestEnterpriseGateSkipsGrowthTasks(t *testing.T) {
+	t.Parallel()
+
 	// 把夜猫子的窗口判定钉在窗口内：守卫先于账号循环，不钉住时钟则该用例的
 	// 判别力取决于运行环境的墙钟（本机白天跑 = 什么都没测）。钉住后五个用例
 	// 在任何环境、任何时刻都真正执行。
-	restoreClock := nowForNightWindow
-	nowForNightWindow = func() time.Time { return time.Date(2026, 10, 7, 23, 30, 0, 0, time.Local) }
-	t.Cleanup(func() { nowForNightWindow = restoreClock })
+	night := func() time.Time { return time.Date(2026, 10, 7, 23, 30, 0, 0, time.Local) }
 
 	cases := []struct {
 		name string
@@ -126,18 +131,24 @@ func TestEnterpriseGateSkipsGrowthTasks(t *testing.T) {
 		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
 		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
 			sEnt, rEnt := enterpriseTestScheduler(t, true)
-			c.run(sEnt)
-			if rEnt.has(c.endpoint) {
-				t.Errorf("企业号不应发起 %s，实际请求=%v", c.endpoint, rEnt.snapshot())
+			sEnt.nowFn = night
+			item.run(sEnt)
+
+			if rEnt.has(item.endpoint) {
+				t.Errorf("企业号不应发起 %s，实际请求=%v", item.endpoint, rEnt.snapshot())
 			}
 
 			sPer, rPer := enterpriseTestScheduler(t, false)
-			c.run(sPer)
-			if !rPer.has(c.endpoint) {
-				t.Errorf("个人号对照应发起 %s，实际请求=%v", c.endpoint, rPer.snapshot())
+			sPer.nowFn = night
+			item.run(sPer)
+
+			if !rPer.has(item.endpoint) {
+				t.Errorf("个人号对照应发起 %s，实际请求=%v", item.endpoint, rPer.snapshot())
 			}
 		})
 	}
@@ -147,34 +158,42 @@ func TestEnterpriseGateSkipsGrowthTasks(t *testing.T) {
 // （否则额度永远不更新，面板与 credit_floor 都失去数据源）——这正是只 skip 签到、
 // 不 continue 整轮的原因。
 func TestEnterpriseCheckinStillRefreshesCredits(t *testing.T) {
-	s, r := enterpriseTestScheduler(t, true)
-	s.RunCheckinNow()
+	t.Parallel()
+
+	scheduler, r := enterpriseTestScheduler(t, true)
+	scheduler.RunCheckinNow()
 
 	if !r.has("/get-enterprise-user-usage") {
 		t.Fatalf("企业号应走企业口径额度查询，实际请求=%v", r.snapshot())
 	}
+
 	if r.has("/billing/meter/get-user-resource") {
 		t.Errorf("企业号不应再走个人资源包端点，实际请求=%v", r.snapshot())
 	}
-	st, ok := s.cfg.Pool.Status("u1")
+
+	status, ok := scheduler.cfg.Pool.Status("u1")
 	if !ok {
 		t.Fatal("status not found")
 	}
 	// limitNum - round(credit) = 2000 - 812 = 1188。
-	if st.Credits != 1188 || st.CreditsTotal != 2000 {
-		t.Errorf("企业额度映射错误：credits=%d total=%d want 1188/2000", st.Credits, st.CreditsTotal)
+	if status.Credits != 1188 || status.CreditsTotal != 2000 {
+		t.Errorf("企业额度映射错误：credits=%d total=%d want 1188/2000", status.Credits, status.CreditsTotal)
 	}
 }
 
 // TestEnterpriseGateKeepsKeepaliveAndBalance 企业版照常参与保活与选号前置能力
 // （token 会过期、且它照常接流量），不受成长体系门控影响。
 func TestEnterpriseGateKeepsKeepaliveAndBalance(t *testing.T) {
-	s, r := enterpriseTestScheduler(t, true)
-	s.RunKeepaliveNow()
+	t.Parallel()
+
+	scheduler, r := enterpriseTestScheduler(t, true)
+	scheduler.RunKeepaliveNow()
+
 	if !r.has("/token/refresh") {
 		t.Errorf("企业号必须照常保活，实际请求=%v", r.snapshot())
 	}
-	if s.cfg.Pool == nil {
+
+	if scheduler.cfg.Pool == nil {
 		t.Fatal("pool missing")
 	}
 }

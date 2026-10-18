@@ -19,13 +19,22 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
+var (
+	errEmptyRequestBody       = errors.New("empty request body")
+	errModelIsRequired        = errors.New("model is required")
+	errMessagesIsRequired     = errors.New("messages is required")
+	errAnthropicMessageFailed = errors.New("anthropicMessage failed")
+	errToolUseNameIsRequired  = errors.New("tool_use name is required")
+)
+
 // anthropicMessagesHandler 是 /v1/messages 的入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	in, out, ok := newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
-	h.serveChat(r, in, out)
+
+	h.serveChat(r, &in, out)
 }
 
 // anthropicCountTokensHandler 返回 Anthropic 形态的输入 token 估算。
@@ -33,33 +42,66 @@ func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Reques
 // 只用于客户端上下文预算，不作为计费依据。
 func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Request) {
 	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if isBodyTooLarge(err) {
-			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+
 			return
 		}
+
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
+
 		return
 	}
-	var v any
-	if err := json.Unmarshal(body, &v); err != nil {
+
+	var iface any
+	if err := json.Unmarshal(body, &iface); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body", "")
 		return
 	}
-	if obj, ok := v.(map[string]any); ok {
-		model, _ := obj["model"].(string)
-		if ku := keyUsageFrom(r.Context()); ku != nil && !h.cfg.Keys.ModelAllowed(ku.id, model) {
-			h.cfg.Keys.RecordRejected(ku.id)
-			writeAnthropicError(w, http.StatusForbidden, "permission_error", "model is not allowed for this API key", "")
-			return
-		}
+
+	obj, _ := iface.(map[string]any)
+	model, _ := obj["model"].(string)
+	// 与 /v1/messages 同口径：白名单校验前先应用后台模型改写，避免同一模型在
+	// 两个端点上判定不一致。
+	if target := h.backgroundTarget(model); target != "" {
+		model = target
 	}
-	tokens := (countJSONTextBytes(v) + 3) / 4
-	if tokens < 1 {
-		tokens = 1
+
+	if !h.countTokensModelAllowed(w, r, model) {
+		return
 	}
+
+	tokens := max((countJSONTextBytes(iface)+3)/4, 1)
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": tokens})
+}
+
+// countTokensModelAllowed 校验 count_tokens 的命名密钥模型白名单；与
+// /v1/messages 同口径：先解析别名与 key 出口绑定，再按最终 realm:bare 匹配。
+// 返回 false 时已写出 Anthropic 错误。
+func (h *Handler) countTokensModelAllowed(w http.ResponseWriter, r *http.Request, model string) bool {
+	keyUsage2 := keyUsageFrom(r.Context())
+	if keyUsage2 == nil {
+		return true
+	}
+
+	realm, bare, err := resolveKeyModel(model, h.cfg.ModelAliases, keyRealmFrom(r.Context()))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		return false
+	}
+
+	if h.cfg.Keys.ModelAllowed(keyUsage2.id, realm+":"+bare) {
+		return true
+	}
+
+	h.cfg.Keys.RecordRejected(keyUsage2.id)
+	writeAnthropicError(w, http.StatusForbidden, "permission_error", "model is not allowed for this API key", "")
+
+	return false
 }
 
 // countJSONTextBytes 汇总 JSON 中所有字符串值的字节数（键名与结构符号不计）。
@@ -72,12 +114,14 @@ func countJSONTextBytes(v any) int {
 		for _, item := range x {
 			n += countJSONTextBytes(item)
 		}
+
 		return n
 	case map[string]any:
 		n := 0
 		for _, item := range x {
 			n += countJSONTextBytes(item)
 		}
+
 		return n
 	default:
 		return 0
@@ -85,23 +129,35 @@ func countJSONTextBytes(v any) int {
 }
 
 // newAnthropicChatInput 读取并转换 Anthropic 请求体；失败时已写出 Anthropic 错误。
-func newAnthropicChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration, maxBodyBytes int64) (chatInput, chatResponder, bool) {
+func newAnthropicChatInput(
+	w http.ResponseWriter,
+	r *http.Request,
+	keepalive time.Duration,
+	maxBodyBytes int64,
+) (chatInput, chatResponder, bool) {
 	limitRequestBody(w, r, maxBodyBytes)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if isBodyTooLarge(err) {
-			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large", bodyTooLargeMessage(maxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				bodyTooLargeMessage(maxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+
 			return chatInput{}, nil, false
 		}
+
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
+
 		return chatInput{}, nil, false
 	}
+
 	openAI, model, stream, err := anthropicToOpenAI(body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
 		return chatInput{}, nil, false
 	}
-	in := chatInput{
+
+	chatInput2 := chatInput{
 		body:      openAI,
 		stream:    stream,
 		model:     model,
@@ -112,7 +168,8 @@ func newAnthropicChatInput(w http.ResponseWriter, r *http.Request, keepalive tim
 		keyUsage:  keyUsageFrom(r.Context()),
 		keyRealm:  keyRealmFrom(r.Context()),
 	}
-	return in, &anthropicResponder{w: w, model: model, keepalive: keepalive}, true
+
+	return chatInput2, &anthropicResponder{w: w, model: model, keepalive: keepalive}, true
 }
 
 // anthropicRequest 只声明转换需要的字段；未知字段由客户端协议自行演进，忽略。
@@ -137,51 +194,63 @@ func anthropicToOpenAI(body []byte) ([]byte, string, bool, error) {
 	if err != nil {
 		return nil, "", false, err
 	}
+
 	out, err := buildOpenAIRequest(req)
 	if err != nil {
 		return nil, "", false, err
 	}
+
 	converted, err := json.Marshal(out)
 	if err != nil {
 		return nil, "", false, fmt.Errorf("encode request: %w", err)
 	}
+
 	return converted, req.Model, req.Stream, nil
 }
 
 // decodeAnthropicRequest 解码并校验必填字段。
 func decodeAnthropicRequest(body []byte) (*anthropicRequest, error) {
 	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, errors.New("empty request body")
+		return nil, errEmptyRequestBody
 	}
+
 	var req anthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid JSON body: %w", err)
 	}
+
 	if strings.TrimSpace(req.Model) == "" {
-		return nil, errors.New("model is required")
+		return nil, errModelIsRequired
 	}
+
 	if len(req.Messages) == 0 {
-		return nil, errors.New("messages is required")
+		return nil, errMessagesIsRequired
 	}
+
 	return &req, nil
 }
 
 // buildOpenAIRequest 组装 OpenAI chat 请求体。
 func buildOpenAIRequest(req *anthropicRequest) (map[string]any, error) {
 	out := map[string]any{"model": req.Model, "stream": req.Stream}
+
 	msgs := make([]any, 0, len(req.Messages)+1)
 	if system := anthropicSystemContent(req.System); system != nil {
 		msgs = append(msgs, map[string]any{"role": "system", "content": system})
 	}
+
 	for _, raw := range req.Messages {
 		converted, err := anthropicMessage(raw)
 		if err != nil {
 			return nil, err
 		}
+
 		msgs = append(msgs, converted...)
 	}
+
 	out["messages"] = msgs
 	applyAnthropicParams(out, req)
+
 	return out, nil
 }
 
@@ -190,21 +259,27 @@ func applyAnthropicParams(out map[string]any, req *anthropicRequest) {
 	if req.MaxTokens > 0 {
 		out["max_tokens"] = req.MaxTokens
 	}
+
 	if req.Temperature != nil {
 		out["temperature"] = *req.Temperature
 	}
+
 	if req.TopP != nil {
 		out["top_p"] = *req.TopP
 	}
+
 	if len(req.StopSequences) > 0 {
 		out["stop"] = req.StopSequences
 	}
+
 	if len(req.Tools) > 0 {
 		out["tools"] = anthropicTools(req.Tools)
 	}
+
 	if choice := anthropicToolChoice(req.ToolChoice); choice != nil {
 		out["tool_choice"] = choice
 	}
+
 	if thinking := anthropicThinking(req.Thinking); thinking != nil {
 		out["thinking"] = thinking
 	}
@@ -216,24 +291,30 @@ func anthropicSystemContent(raw json.RawMessage) any {
 	if len(raw) == 0 {
 		return nil
 	}
+
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
 		if text == "" {
 			return nil
 		}
+
 		return text
 	}
+
 	var blocks []map[string]any
 	if json.Unmarshal(raw, &blocks) != nil {
 		return nil
 	}
+
 	parts := textParts(blocks)
 	if len(parts) == 0 {
 		return nil
 	}
+
 	if !hasCacheControl(parts) {
 		return anthropicText(raw) // 无缓存标记：保持旧版 \n\n 拼接
 	}
+
 	return parts
 }
 
@@ -245,6 +326,7 @@ func textParts(blocks []map[string]any) []any {
 			parts = append(parts, part)
 		}
 	}
+
 	return parts
 }
 
@@ -253,38 +335,43 @@ func textPart(block map[string]any) map[string]any {
 	if block["type"] != "text" {
 		return nil
 	}
+
 	text, _ := block["text"].(string)
 	if text == "" {
 		return nil
 	}
+
 	part := map[string]any{"type": "text", "text": text}
 	if cc, ok := block["cache_control"]; ok {
 		part["cache_control"] = cc
 	}
+
 	return part
 }
 
 // anthropicText 提取 Anthropic system / 内容块里的纯文本（字符串、raw JSON
 // 或 text block 数组）。
 func anthropicText(raw any) string {
-	switch v := raw.(type) {
+	switch item := raw.(type) {
 	case nil:
 		return ""
 	case string:
-		return v
+		return item
 	case json.RawMessage:
 		var decoded any
-		if json.Unmarshal(v, &decoded) != nil {
+		if json.Unmarshal(item, &decoded) != nil {
 			return ""
 		}
+
 		return anthropicText(decoded)
 	case []any:
-		return anthropicTextBlocks(v)
+		return anthropicTextBlocks(item)
 	case map[string]any:
-		if v["type"] == "text" {
-			text, _ := v["text"].(string)
+		if item["type"] == "text" {
+			text, _ := item["text"].(string)
 			return text
 		}
+
 		return ""
 	default:
 		return ""
@@ -299,6 +386,7 @@ func anthropicTextBlocks(blocks []any) string {
 			parts = append(parts, text)
 		}
 	}
+
 	return strings.Join(parts, "\n\n")
 }
 
@@ -313,27 +401,35 @@ func anthropicMessage(raw json.RawMessage) ([]any, error) {
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return nil, fmt.Errorf("invalid message: %w", err)
 	}
+
 	if msg.Role != "user" && msg.Role != "assistant" {
-		return nil, fmt.Errorf("unsupported message role %q", msg.Role)
+		return nil, fmt.Errorf("unsupported message role %q: %w", msg.Role, errAnthropicMessageFailed)
 	}
+
 	var text string
 	if json.Unmarshal(msg.Content, &text) == nil {
 		return []any{map[string]any{"role": msg.Role, "content": text}}, nil
 	}
+
 	var blocks []map[string]any
 	if err := json.Unmarshal(msg.Content, &blocks); err != nil {
 		return nil, fmt.Errorf("invalid %s content: %w", msg.Role, err)
 	}
+
 	if msg.Role == "assistant" {
 		return anthropicAssistantMessage(blocks)
 	}
+
 	return anthropicUserMessage(blocks), nil
 }
 
 // anthropicAssistantMessage 合并 assistant 文本与 tool_use 为一条 OpenAI 消息。
 func anthropicAssistantMessage(blocks []map[string]any) ([]any, error) {
-	var texts []string
-	var toolCalls []any
+	var (
+		texts     []string
+		toolCalls []any
+	)
+
 	for _, block := range blocks {
 		switch block["type"] {
 		case "text":
@@ -343,13 +439,16 @@ func anthropicAssistantMessage(blocks []map[string]any) ([]any, error) {
 		case "tool_use":
 			id, _ := block["id"].(string)
 			name, _ := block["name"].(string)
+
 			args, err := json.Marshal(block["input"])
 			if err != nil {
 				return nil, fmt.Errorf("tool_use input: %w", err)
 			}
+
 			if name == "" {
-				return nil, errors.New("tool_use name is required")
+				return nil, errToolUseNameIsRequired
 			}
+
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   id,
 				"type": "function",
@@ -360,20 +459,25 @@ func anthropicAssistantMessage(blocks []map[string]any) ([]any, error) {
 			})
 		}
 	}
+
 	msg := map[string]any{"role": "assistant", "content": strings.Join(texts, "\n")}
 	if parts := textParts(blocks); hasCacheControl(parts) {
 		msg["content"] = parts
 	}
+
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
 	}
+
 	return []any{msg}, nil
 }
 
 // anthropicUserMessage 把 tool_result 拆成独立 tool 消息，其余文本/图片合并为 user。
 func anthropicUserMessage(blocks []map[string]any) []any {
 	out := make([]any, 0, len(blocks))
+
 	var parts []any
+
 	for _, block := range blocks {
 		switch block["type"] {
 		case "text":
@@ -394,12 +498,15 @@ func anthropicUserMessage(blocks []map[string]any) []any {
 			})
 		}
 	}
+
 	if len(parts) > 0 {
 		out = append(out, map[string]any{"role": "user", "content": openAIContent(parts)})
 	}
+
 	if len(out) == 0 {
 		out = append(out, map[string]any{"role": "user", "content": ""})
 	}
+
 	return out
 }
 
@@ -409,13 +516,16 @@ func anthropicImagePart(block map[string]any) map[string]any {
 	if source == nil {
 		return nil
 	}
+
 	switch source["type"] {
 	case "base64":
 		media, _ := source["media_type"].(string)
+
 		data, _ := source["data"].(string)
 		if data == "" {
 			return nil
 		}
+
 		return map[string]any{
 			"type":      "image_url",
 			"image_url": map[string]any{"url": "data:" + media + ";base64," + data},
@@ -425,6 +535,7 @@ func anthropicImagePart(block map[string]any) map[string]any {
 			return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
 		}
 	}
+
 	return nil
 }
 
@@ -437,32 +548,41 @@ func hasCacheControl(parts []any) bool {
 			}
 		}
 	}
+
 	return false
 }
 
 // openAIContent 纯文本时压成字符串，含图片时保留 parts 数组（上游多模态形态）。
 func openAIContent(parts []any) any {
 	allText := true
-	var sb strings.Builder
+
+	var builder strings.Builder
+
 	for _, part := range parts {
 		m, _ := part.(map[string]any)
 		if m == nil || m["type"] != "text" {
 			allText = false
 			break
 		}
+
 		if _, ok := m["cache_control"]; ok {
 			allText = false // 保留 parts 数组，cache_control 不能在压缩成字符串时丢失
 			break
 		}
+
 		text, _ := m["text"].(string)
-		if sb.Len() > 0 {
-			sb.WriteString("\n")
+
+		if builder.Len() > 0 {
+			builder.WriteString("\n")
 		}
-		sb.WriteString(text)
+
+		builder.WriteString(text)
 	}
+
 	if allText {
-		return sb.String()
+		return builder.String()
 	}
+
 	return parts
 }
 
@@ -474,15 +594,19 @@ func anthropicTools(tools []map[string]any) []any {
 		if name == "" {
 			continue
 		}
+
 		fn := map[string]any{"name": name}
 		if desc, _ := tool["description"].(string); desc != "" {
 			fn["description"] = desc
 		}
+
 		if schema, ok := tool["input_schema"]; ok {
 			fn["parameters"] = schema
 		}
+
 		out = append(out, map[string]any{"type": "function", "function": fn})
 	}
+
 	return out
 }
 
@@ -491,6 +615,7 @@ func anthropicToolChoice(raw json.RawMessage) any {
 	if len(raw) == 0 {
 		return nil
 	}
+
 	var choice struct {
 		Type string `json:"type"`
 		Name string `json:"name"`
@@ -498,6 +623,7 @@ func anthropicToolChoice(raw json.RawMessage) any {
 	if json.Unmarshal(raw, &choice) != nil {
 		return nil
 	}
+
 	switch choice.Type {
 	case "auto":
 		return "auto"
@@ -509,6 +635,7 @@ func anthropicToolChoice(raw json.RawMessage) any {
 		if choice.Name == "" {
 			return nil
 		}
+
 		return map[string]any{"type": "function", "function": map[string]any{"name": choice.Name}}
 	default:
 		return nil
@@ -520,13 +647,15 @@ func anthropicThinking(raw json.RawMessage) map[string]any {
 	if len(raw) == 0 {
 		return nil
 	}
-	var th struct {
+
+	var item struct {
 		Type string `json:"type"`
 	}
-	if json.Unmarshal(raw, &th) != nil {
+	if json.Unmarshal(raw, &item) != nil {
 		return nil
 	}
-	switch th.Type {
+
+	switch item.Type {
 	case "enabled":
 		return map[string]any{"type": "enabled"}
 	case "disabled":
@@ -560,41 +689,55 @@ func (r *anthropicResponder) Header(name, value string) {
 
 // Stream 读取上游 OpenAI SSE，逐帧转换为 Anthropic SSE 事件。
 func (r *anthropicResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
-	tw := newAnthropicStreamWriter(r.w, r.model)
+	anthropicStreamWriter2 := newAnthropicStreamWriter(r.w, r.model)
+
 	opts := make([]upstream.StreamOption, 0, 2)
 	if onErrFrame != nil {
 		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
 	}
+
 	opts = append(opts, upstream.WithMarkupRepair(repair))
 	if r.keepalive > 0 {
 		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
 	}
-	return upstream.StreamHint(tw, rc, hint, opts...)
+
+	if err := upstream.StreamHint(anthropicStreamWriter2, rc, hint, opts...); err != nil {
+		return fmt.Errorf("stream hint: %w", err)
+	}
+
+	return nil
 }
 
 // anthropicMessageFromOpenAI 把聚合后的 OpenAI chat.completion 转为 Anthropic Message。
 func anthropicMessageFromOpenAI(body any, model string) map[string]any {
 	obj, _ := body.(map[string]any)
+
 	id, _ := obj["id"].(string)
 	if id == "" {
 		id = "msg_gateway"
 	}
+
 	choice := firstOpenAIChoice(obj)
 	content := make([]any, 0, 2)
 	stopReason := "end_turn"
+
 	if choice != nil {
 		msg, _ := choice["message"].(map[string]any)
 		if text, _ := msg["content"].(string); text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
+
 		tools := anthropicToolUseBlocks(msg["tool_calls"])
 		content = append(content, tools...)
 		stopReason = anthropicStopReason(stringValue(choice["finish_reason"]), len(tools) > 0)
 	}
+
 	if len(content) == 0 {
 		content = append(content, map[string]any{"type": "text", "text": ""})
 	}
+
 	usage := anthropicUsage(obj["usage"])
+
 	return map[string]any{
 		"id":            id,
 		"type":          "message",
@@ -613,29 +756,36 @@ func firstOpenAIChoice(obj map[string]any) map[string]any {
 	if len(choices) == 0 {
 		return nil
 	}
+
 	choice, _ := choices[0].(map[string]any)
+
 	return choice
 }
 
 // anthropicToolUseBlocks 把 OpenAI tool_calls 转为 Anthropic tool_use 块。
 func anthropicToolUseBlocks(raw any) []any {
 	calls, _ := raw.([]any)
+
 	out := make([]any, 0, len(calls))
 	for i, item := range calls {
 		call, _ := item.(map[string]any)
 		fn, _ := call["function"].(map[string]any)
+
 		name, _ := fn["name"].(string)
 		if name == "" {
 			continue
 		}
+
 		id, _ := call["id"].(string)
 		if id == "" {
 			id = fmt.Sprintf("toolu_%d", i)
 		}
+
 		input := map[string]any{}
 		if args, _ := fn["arguments"].(string); args != "" {
 			_ = json.Unmarshal([]byte(args), &input)
 		}
+
 		out = append(out, map[string]any{
 			"type":  "tool_use",
 			"id":    id,
@@ -643,12 +793,14 @@ func anthropicToolUseBlocks(raw any) []any {
 			"input": input,
 		})
 	}
+
 	return out
 }
 
 // anthropicUsage 映射 token 计数；上游缺失时给 0（Anthropic 要求字段存在）。
 func anthropicUsage(raw any) map[string]any {
 	usage, _ := raw.(map[string]any)
+
 	return map[string]any{
 		"input_tokens":  intValue(usage["prompt_tokens"]),
 		"output_tokens": intValue(usage["completion_tokens"]),
@@ -668,6 +820,7 @@ func anthropicStopReason(reason string, hasTool bool) string {
 		if hasTool {
 			return "tool_use"
 		}
+
 		return "end_turn"
 	default:
 		return "end_turn"
@@ -702,6 +855,7 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, msg, hint s
 	if hint != "" {
 		e["gateway_hint"] = hint
 	}
+
 	writeJSON(w, status, map[string]any{"type": "error", "error": e})
 }
 
@@ -709,9 +863,10 @@ func writeAnthropicError(w http.ResponseWriter, status int, errType, msg, hint s
 // Anthropic SSE 事件。实现 http.ResponseWriter + Flusher + Unwrap，使上游写路径
 // 的响应头、逐帧 flush 与写截止（issue #53）继续作用于底层连接。
 type anthropicStreamWriter struct {
-	w     http.ResponseWriter
-	fl    http.Flusher
-	model string
+	w      http.ResponseWriter
+	fl     http.Flusher
+	model  string
+	logger *log.Logger
 
 	pending      []byte
 	started      bool
@@ -729,9 +884,11 @@ type anthropicStreamWriter struct {
 
 func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStreamWriter {
 	fl, _ := w.(http.Flusher)
+
 	return &anthropicStreamWriter{
 		w: w, fl: fl, model: model, blockIndex: -1, toolIndex: -1,
 		toolBlocks: map[int]*anthropicToolBlock{},
+		logger:     log.Default(),
 	}
 }
 
@@ -761,20 +918,23 @@ func (a *anthropicStreamWriter) Flush() {
 }
 
 // Write 按行拆分开源 SSE，转换 data 帧；返回错误会中止上游透传。
-func (a *anthropicStreamWriter) Write(p []byte) (int, error) {
-	a.pending = append(a.pending, p...)
+func (a *anthropicStreamWriter) Write(nums []byte) (int, error) {
+	a.pending = append(a.pending, nums...)
 	for {
 		i := bytes.IndexByte(a.pending, '\n')
 		if i < 0 {
 			break
 		}
+
 		line := strings.TrimRight(string(a.pending[:i]), "\r")
+
 		a.pending = a.pending[i+1:]
 		if err := a.handleLine(line); err != nil {
 			return 0, err
 		}
 	}
-	return len(p), nil
+
+	return len(nums), nil
 }
 
 // handleLine 处理单行：data 帧转换，[DONE] 收尾，注释/空行忽略。
@@ -786,18 +946,22 @@ func (a *anthropicStreamWriter) handleLine(line string) error {
 	// 单次写截止，这里只负责补帧尾并 flush。
 	if strings.HasPrefix(line, ":") {
 		if _, err := io.WriteString(a.w, line+"\n\n"); err != nil {
-			return err
+			return fmt.Errorf("handleLine: %w", err)
 		}
+
 		a.Flush()
+
 		return nil
 	}
-	if strings.HasPrefix(line, "data: ") {
-		payload := strings.TrimPrefix(line, "data: ")
+
+	if payload, ok := strings.CutPrefix(line, "data: "); ok {
 		if payload == "[DONE]" {
 			return a.finish()
 		}
+
 		return a.handleChunk(payload)
 	}
+
 	return nil
 }
 
@@ -807,25 +971,32 @@ func (a *anthropicStreamWriter) handleChunk(payload string) error {
 	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return nil //nolint:nilerr // 非 JSON 数据帧（上游噪声）直接丢弃
 	}
+
 	if errObj, ok := chunk["error"].(map[string]any); ok {
 		return a.handleUpstreamError(errObj)
 	}
+
 	if err := a.ensureStart(chunk); err != nil {
 		return err
 	}
+
 	a.captureUsage(chunk)
+
 	choice := firstOpenAIChoice(chunk)
 	if choice == nil {
 		return nil
 	}
+
 	if delta, _ := choice["delta"].(map[string]any); delta != nil {
 		if err := a.applyDelta(delta); err != nil {
 			return err
 		}
 	}
+
 	if reason := stringValue(choice["finish_reason"]); reason != "" {
 		a.stopReason = anthropicStopReason(reason, len(a.toolBlocks) > 0)
 	}
+
 	return nil
 }
 
@@ -835,12 +1006,14 @@ func (a *anthropicStreamWriter) handleUpstreamError(errObj map[string]any) error
 	if msg == "" {
 		msg = "upstream stream error"
 	}
+
 	a.errored = true
 	errBody := map[string]any{"type": "api_error", "message": msg}
 	// gateway_hint 由上游流层附在 error 帧上；流式错误不能把它丢掉。
 	if hint, _ := errObj["gateway_hint"].(string); hint != "" {
 		errBody["gateway_hint"] = hint
 	}
+
 	return a.event("error", map[string]any{"type": "error", "error": errBody})
 }
 
@@ -851,11 +1024,13 @@ func (a *anthropicStreamWriter) applyDelta(delta map[string]any) error {
 			return err
 		}
 	}
+
 	if reasoning := deltaReasoning(delta); reasoning != "" {
 		if err := a.emitText(reasoning, "thinking_delta", "thinking"); err != nil {
 			return err
 		}
 	}
+
 	return a.emitToolCalls(delta["tool_calls"])
 }
 
@@ -864,7 +1039,9 @@ func deltaReasoning(delta map[string]any) string {
 	if reasoning, _ := delta["reasoning_content"].(string); reasoning != "" {
 		return reasoning
 	}
+
 	reasoning, _ := delta["reasoning"].(string)
+
 	return reasoning
 }
 
@@ -873,14 +1050,18 @@ func (a *anthropicStreamWriter) ensureStart(chunk map[string]any) error {
 	if a.started {
 		return nil
 	}
+
 	a.started = true
 	a.captureUsage(chunk)
+
 	id := "msg_gateway"
+
 	if chunk != nil {
 		if v, _ := chunk["id"].(string); v != "" {
 			id = v
 		}
 	}
+
 	return a.event("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -902,9 +1083,11 @@ func (a *anthropicStreamWriter) captureUsage(chunk map[string]any) {
 	if usage == nil {
 		return
 	}
+
 	if n := intValue(usage["prompt_tokens"]); n > 0 {
 		a.inputTokens = n
 	}
+
 	if n := intValue(usage["completion_tokens"]); n > 0 {
 		a.outputTokens = n
 	}
@@ -915,12 +1098,14 @@ func (a *anthropicStreamWriter) emitText(text, deltaType, blockType string) erro
 	if err := a.ensureBlock(blockType); err != nil {
 		return err
 	}
+
 	delta := map[string]any{"type": deltaType}
 	if blockType == "thinking" {
 		delta["thinking"] = text
 	} else {
 		delta["text"] = text
 	}
+
 	return a.event("content_block_delta", map[string]any{
 		"type":  "content_block_delta",
 		"index": a.blockIndex,
@@ -937,15 +1122,19 @@ func (a *anthropicStreamWriter) emitToolCalls(raw any) error {
 	for _, item := range calls {
 		call, _ := item.(map[string]any)
 		idx := intValue(call["index"])
+
 		block, err := a.ensureToolBlock(idx, call)
 		if errors.Is(err, errToolCallSkipped) {
 			continue
 		}
+
 		if err != nil {
 			return err
 		}
+
 		if args := toolCallArguments(call); args != "" {
 			block.args.WriteString(args)
+
 			if err := a.event("content_block_delta", map[string]any{
 				"type":  "content_block_delta",
 				"index": block.index,
@@ -955,6 +1144,7 @@ func (a *anthropicStreamWriter) emitToolCalls(raw any) error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -967,31 +1157,39 @@ func (a *anthropicStreamWriter) ensureToolBlock(idx int, call map[string]any) (*
 		if name == "" {
 			return nil, errToolCallSkipped
 		}
+
 		if id == "" {
 			id = fmt.Sprintf("toolu_%d", idx)
 		}
+
 		if err := a.closeBlock(); err != nil {
 			return nil, err
 		}
+
 		a.blockIndex++
 		block = &anthropicToolBlock{index: a.blockIndex, id: id, name: name}
 		a.toolBlocks[idx] = block
 		a.toolIndex = idx
 		a.blockOpen = true
 		a.blockType = "tool_use"
+
 		return block, a.toolBlockStart(block)
 	}
+
 	if a.blockOpen && a.blockType == "tool_use" && a.toolIndex == idx {
 		return block, nil
 	}
+
 	if err := a.closeBlock(); err != nil {
 		return nil, err
 	}
+
 	a.blockIndex++
 	block.index = a.blockIndex
 	a.toolIndex = idx
 	a.blockOpen = true
 	a.blockType = "tool_use"
+
 	return block, a.toolBlockStart(block)
 }
 
@@ -1011,13 +1209,16 @@ func (a *anthropicStreamWriter) ensureBlock(blockType string) error {
 	if a.blockOpen && a.blockType == blockType {
 		return nil
 	}
+
 	if err := a.closeBlock(); err != nil {
 		return err
 	}
+
 	a.blockOpen = true
 	a.blockType = blockType
 	a.blockIndex++
 	start := map[string]any{"type": "content_block_start", "index": a.blockIndex}
+
 	switch blockType {
 	case "text":
 		start["content_block"] = map[string]any{"type": "text", "text": ""}
@@ -1026,6 +1227,7 @@ func (a *anthropicStreamWriter) ensureBlock(blockType string) error {
 		// 这里输出空串占位，保持事件结构可被 SDK 解析。
 		start["content_block"] = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
 	}
+
 	return a.event("content_block_start", start)
 }
 
@@ -1034,7 +1236,9 @@ func (a *anthropicStreamWriter) closeBlock() error {
 	if !a.blockOpen {
 		return nil
 	}
+
 	a.blockOpen = false
+
 	return a.event("content_block_stop", map[string]any{
 		"type":  "content_block_stop",
 		"index": a.blockIndex,
@@ -1049,7 +1253,8 @@ func (a *anthropicStreamWriter) validateToolArguments() {
 		if args == "" || json.Valid([]byte(args)) {
 			continue
 		}
-		log.Printf("WARN: [anthropic] invalid tool arguments model=%s tool=%s id=%s bytes=%d",
+
+		a.logger.Printf("WARN: [anthropic] invalid tool arguments model=%s tool=%s id=%s bytes=%d",
 			logfmt.Truncate(a.model, 64), logfmt.Truncate(block.name, 64), logfmt.Truncate(block.id, 64), len(args))
 	}
 }
@@ -1059,23 +1264,29 @@ func (a *anthropicStreamWriter) finish() error {
 	if a.finished {
 		return nil
 	}
+
 	a.finished = true
 	if a.errored {
 		return nil
 	}
+
 	if !a.started {
 		if err := a.ensureStart(nil); err != nil {
 			return err
 		}
 	}
+
 	if err := a.closeBlock(); err != nil {
 		return err
 	}
+
 	a.validateToolArguments()
+
 	reason := a.stopReason
 	if reason == "" {
 		reason = "end_turn"
 	}
+
 	if err := a.event("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": reason, "stop_sequence": nil},
@@ -1083,6 +1294,7 @@ func (a *anthropicStreamWriter) finish() error {
 	}); err != nil {
 		return err
 	}
+
 	return a.event("message_stop", map[string]any{"type": "message_stop"})
 }
 
@@ -1090,12 +1302,15 @@ func (a *anthropicStreamWriter) finish() error {
 func (a *anthropicStreamWriter) event(name string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("event: %w", err)
 	}
+
 	if _, err := fmt.Fprintf(a.w, "event: %s\ndata: %s\n\n", name, raw); err != nil {
-		return err
+		return fmt.Errorf("event: %w", err)
 	}
+
 	a.Flush()
+
 	return nil
 }
 
@@ -1104,6 +1319,7 @@ func toolCallIdentity(call map[string]any) (name, id string) {
 	id, _ = call["id"].(string)
 	fn, _ := call["function"].(map[string]any)
 	name, _ = fn["name"].(string)
+
 	return name, id
 }
 
@@ -1111,6 +1327,7 @@ func toolCallIdentity(call map[string]any) (name, id string) {
 func toolCallArguments(call map[string]any) string {
 	fn, _ := call["function"].(map[string]any)
 	args, _ := fn["arguments"].(string)
+
 	return args
 }
 

@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -66,6 +67,7 @@ func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return parseGrowthTasks(data)
 }
 
@@ -80,26 +82,32 @@ func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return parseGrowthTasks(data)
 }
 
 // growthJSONMP 发 growth 域请求（小程序口径：叠加 X-Client-Platform: miniprogram）
 // 并解信封。语义同 growthJSON。
-func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+func (c *Client) growthJSONMP(account2 *auth.Auth, method, path string, body any) (json.RawMessage, error) {
 	var rdr io.Reader
+
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("growthJSONMP: %w", err)
 		}
+
 		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequestWithContext(context.Background(), method, c.chatBase(a)+path, rdr)
+
+	req, err := http.NewRequestWithContext(context.Background(), method, c.chatBase(account2)+path, rdr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("growthJSONMP: %w", err)
 	}
-	c.BillingHeaders(req, a)
+
+	c.BillingHeaders(req, account2)
 	req.Header.Set("X-Client-Platform", mpPlatform)
+
 	return c.doJSON(req)
 }
 
@@ -113,23 +121,27 @@ func (c *Client) AcceptTasksMP(a *auth.Auth, taskCodes []string) error {
 // ClaimRewardMP 领取小程序限定任务奖励：chat 域 /activity/growth/tasks/{code}/claim
 // + mp 头（上游 task_runner claim_one(mp=True) 同款）；chat 域 400 时降级 Web 域
 // 领奖端点（ClaimReward，x-client-platform: web 形态）。返回 (credit, energy, err)。
-func (c *Client) ClaimRewardMP(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
+func (c *Client) ClaimRewardMP(account *auth.Auth, taskCode string) (credit, energy int64, err error) {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		c.chatBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
+		c.chatBase(account)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("ClaimRewardMP: %w", err)
 	}
-	c.BillingHeaders(req, a)
+
+	c.BillingHeaders(req, account)
 	req.Header.Set("X-Client-Platform", mpPlatform)
+
 	data, err := c.doJSON(req)
 	if err != nil {
 		// chat 域对该路径 400（部分任务/租户形态）→ Web 域降级（已实测可领）。
 		ue := &Error{}
 		if errors.As(err, &ue) {
-			return c.ClaimReward(a, taskCode)
+			return c.ClaimReward(account, taskCode)
 		}
+
 		return 0, 0, err
 	}
+
 	return parseClaimReward(data)
 }
 
@@ -141,12 +153,30 @@ func parseClaimReward(data json.RawMessage) (credit, energy int64, err error) {
 		Energy         int64 `json:"energy"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("parseClaimReward: %w", err)
 	}
+
 	return resp.Credit, resp.Energy, nil
 }
 
 // parseGrowthTasks 解析 growth 任务列表 data.tasks[]（默认与 mp 口径共用）。
+func growthProgress(raw json.RawMessage, cur, tgt int64) (int64, int64) {
+	// progress 可能是 {current,target} 对象（实测口径），覆盖平铺字段。
+	if len(raw) == 0 || string(raw) == "null" {
+		return cur, tgt
+	}
+
+	var pr struct {
+		Current int64 `json:"current"`
+		Target  int64 `json:"target"`
+	}
+	if json.Unmarshal(raw, &pr) == nil && (pr.Target > 0 || pr.Current > 0) {
+		return pr.Current, pr.Target
+	}
+
+	return cur, tgt
+}
+
 func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 	var resp struct {
 		Tasks []struct {
@@ -170,21 +200,14 @@ func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 		} `json:"tasks"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parseGrowthTasks: %w", err)
 	}
+
 	out := make([]Task, 0, len(resp.Tasks))
-	for _, t := range resp.Tasks {
-		cur, tgt := t.Current, t.Target
-		// progress 可能是 {current,target} 对象（实测口径），覆盖平铺字段。
-		if len(t.Progress) > 0 && string(t.Progress) != "null" {
-			var pr struct {
-				Current int64 `json:"current"`
-				Target  int64 `json:"target"`
-			}
-			if json.Unmarshal(t.Progress, &pr) == nil && (pr.Target > 0 || pr.Current > 0) {
-				cur, tgt = pr.Current, pr.Target
-			}
-		}
+	for i := range resp.Tasks {
+		t := &resp.Tasks[i]
+		cur, tgt := growthProgress(t.Progress, t.Current, t.Target)
+
 		claimed := t.AcceptStatus == "claimed"
 		out = append(out, Task{
 			TaskCode:     t.TaskCode,
@@ -207,6 +230,7 @@ func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 			Claimed:      claimed,
 		})
 	}
+
 	return out, nil
 }
 
@@ -227,31 +251,35 @@ func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
 // /v2/activity/growth/tasks/reward/claim（task_code 放 body），该路径**不存在**，
 // 一直返回 400 "task not completed"，是此前领奖失败的真实原因。
 // 本实现返回 (credit, energy, err)：credit/energy 为本次到账奖励（已领取过时为 0）。
-func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
+func (c *Client) ClaimReward(account3 *auth.Auth, taskCode string) (credit, energy int64, err error) {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		c.webBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
+		c.webBase(account3)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("ClaimReward: %w", err)
 	}
 	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 指向 workbuddy.cn 成长中心，
 	// 带 x-client-platform: web 标记来源端。
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	req.Header.Set("Authorization", "Bearer "+account3.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", "https://www.workbuddy.cn")
 	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
 	req.Header.Set("X-Client-Platform", "web")
-	if ua := c.userAgent(a); ua != "" {
+
+	if ua := c.userAgent(account3); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+
+	if account3.UID != "" {
+		req.Header.Set("X-User-Id", account3.UID)
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+
+	if account3.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", account3.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", account3.EnterpriseID)
 	}
-	if d := a.DomainValue(); d != "" {
+
+	if d := account3.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
 	}
 
@@ -266,10 +294,12 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 		Energy         int64 `json:"energy"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, err
+		return 0, 0, fmt.Errorf("ClaimReward: %w", err)
 	}
+
 	if resp.AlreadyClaimed {
 		return 0, 0, nil // 幂等：重复领取不算错误，但无新增奖励
 	}
+
 	return resp.Credit, resp.Energy, nil
 }

@@ -8,8 +8,10 @@ import (
 )
 
 func TestRestoreConfigEndpoint(t *testing.T) {
+	t.Parallel()
+
 	called := false
-	p := New(Config{
+	panel := New(&Config{
 		Version: "test",
 		RestoreConfig: func() ([]string, error) {
 			called = true
@@ -17,13 +19,16 @@ func TestRestoreConfigEndpoint(t *testing.T) {
 		},
 	})
 	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/panel/api/config/restore", nil))
+	panel.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/panel/api/config/restore", nil))
+
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
+
 	if !called {
 		t.Fatal("RestoreConfig not called")
 	}
+
 	if body := rec.Body.String(); body == "" || !containsAll(body, `"ok":true`, `"listen"`) {
 		t.Fatalf("body=%s", body)
 	}
@@ -35,5 +40,6 @@ func containsAll(s string, subs ...string) bool {
 			return false
 		}
 	}
+
 	return true
 }

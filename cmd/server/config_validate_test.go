@@ -8,6 +8,8 @@ import (
 // TestValidateRejectsInvalidConfig 钉住保存/加载前的显式校验：非法 / 自相矛盾配置
 // 返回可读错误、不落盘；合法配置（含 Default）不受影响。
 func TestValidateRejectsInvalidConfig(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name    string
 		raw     string
@@ -24,20 +26,25 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		{"global-disabled-no-base", `{"global":{"enabled":false}}`, ""},
 		{"max-in-flight-zero-ok", `{"pool":{"max_in_flight":0}}`, ""},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			_, err := ParseConfig([]byte(c.raw))
-			if c.wantErr == "" {
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := ParseConfig([]byte(item.raw))
+			if item.wantErr == "" {
 				if err != nil {
 					t.Fatalf("want ok, got err=%v", err)
 				}
+
 				return
 			}
+
 			if err == nil {
-				t.Fatalf("want error containing %q, got nil", c.wantErr)
+				t.Fatalf("want error containing %q, got nil", item.wantErr)
 			}
-			if !strings.Contains(err.Error(), c.wantErr) {
-				t.Fatalf("err=%q want contains %q", err.Error(), c.wantErr)
+
+			if !strings.Contains(err.Error(), item.wantErr) {
+				t.Fatalf("err=%q want contains %q", err.Error(), item.wantErr)
 			}
 		})
 	}
@@ -45,6 +52,8 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 
 // TestDefaultConfigValidates Default() 归一化后必须通过校验（推荐配置自洽）。
 func TestDefaultConfigValidates(t *testing.T) {
+	t.Parallel()
+
 	if err := Default().normalize(); err != nil {
 		t.Fatalf("default config must validate: %v", err)
 	}

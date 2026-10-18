@@ -19,20 +19,23 @@ import (
 // Truncate 截断字符串到 n 字节上限（先 TrimSpace，与旧 upstream/内部实现口径
 // 一致），切点落在多字节字符中间时回退到 UTF-8 rune 边界——错误 body 多为中文
 // （"将在 … 重置"），按字节切会出半截序列乱码。短于 n 原样返回；n<=0 返回空串。
-func Truncate(s string, n int) string {
+func Truncate(str2 string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	s = strings.TrimSpace(s)
-	if len(s) > n {
+
+	str2 = strings.TrimSpace(str2)
+	if len(str2) > n {
 		// s[n] 是切点后的首字节：是 rune 的后续字节（continuation）说明切点落在
 		// 多字节字符中间，逐字节回退到 rune 边界（该字符整个让出）。
-		for n > 0 && !utf8.RuneStart(s[n]) {
+		for n > 0 && !utf8.RuneStart(str2[n]) {
 			n--
 		}
-		return s[:n]
+
+		return str2[:n]
 	}
-	return s
+
+	return str2
 }
 
 // UID8 返回 uid 的前 8 位；空 uid 返回 "-"（与 server.uidPrefix 对齐）。
@@ -43,9 +46,11 @@ func UID8(uid string) string {
 	if uid == "" {
 		return "-"
 	}
+
 	if len(uid) > 8 {
 		return uid[:8]
 	}
+
 	return uid
 }
 
@@ -59,10 +64,12 @@ func UID8(uid string) string {
 // uid 与 nick 同时为空时返回 "-"（与 UID8 口径一致，避免打出 "(-)"）。
 func Label(uid, nick string) string {
 	short := UID8(uid)
+
 	nick = strings.TrimSpace(nick)
 	if nick == "" {
 		return short
 	}
+
 	return nick + "(" + short + ")"
 }
 
@@ -76,19 +83,22 @@ func DisplayWidth(s string) int {
 	for _, r := range s {
 		w += runeWidth(r)
 	}
+
 	return w
 }
 
 // Pad 把 s 右补空格到 width 显示列宽；已超宽或 width<=0 时原样返回（不截断）。
 // 只补不截：截断会丢信息，超宽时让该行自然变宽，保持内容完整。
-func Pad(s string, width int) string {
+func Pad(str string, width int) string {
 	if width <= 0 {
-		return s
+		return str
 	}
-	if d := width - DisplayWidth(s); d > 0 {
-		return s + strings.Repeat(" ", d)
+
+	if d := width - DisplayWidth(str); d > 0 {
+		return str + strings.Repeat(" ", d)
 	}
-	return s
+
+	return str
 }
 
 // maxShortUALen ShortUA 的返回上限（显示列宽足够放下 "WorkBuddy/5.5.6"、
@@ -111,23 +121,28 @@ var shortUAEngines = map[string]bool{
 //
 // 规则：取第一个形如 name/version 且 name 不是渲染引擎的 token；没有则回落整串
 // 的前 maxShortUALen 字节（纯产品名 UA，如 "node"）。空 UA 返回空串。
-func ShortUA(ua string) string {
-	ua = strings.TrimSpace(ua)
-	if ua == "" {
+func ShortUA(str3 string) string {
+	str3 = strings.TrimSpace(str3)
+	if str3 == "" {
 		return ""
 	}
-	for _, tok := range strings.Fields(ua) {
+
+	for tok := range strings.FieldsSeq(str3) {
 		tok = strings.Trim(tok, "(),;")
+
 		name, _, ok := strings.Cut(tok, "/")
 		if !ok || name == "" {
 			continue
 		}
+
 		if shortUAEngines[strings.ToLower(name)] {
 			continue
 		}
+
 		return Truncate(tok, maxShortUALen)
 	}
-	return Truncate(ua, maxShortUALen)
+
+	return Truncate(str3, maxShortUALen)
 }
 
 // wideRanges 记 2 列宽字符的区段（闭区间），取自 Unicode East Asian Width 的
@@ -151,11 +166,13 @@ func isWide(r rune) bool {
 	if r == 0x303f { // 窄字符，落在 0x2e80…0xa4cf 段内需单独排除
 		return false
 	}
+
 	for _, rg := range wideRanges {
 		if r >= rg[0] && r <= rg[1] {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -170,5 +187,6 @@ func runeWidth(r rune) int {
 	case isWide(r):
 		return 2
 	}
+
 	return 1
 }

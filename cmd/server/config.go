@@ -26,6 +26,35 @@ const placeholderAPIKey = "test_key"
 // defaultBackgroundTarget 后台任务模型改写目标（issue #103）。
 const defaultBackgroundTarget = "deepseek-v4.1-flash"
 
+var (
+	errLoadFailed                       = errors.New("Load failed")
+	errModelsAliases                    = errors.New("models.aliases: 别名不能为空")
+	errNormalizeModelAliasesFailed      = errors.New("normalizeModelAliases failed")
+	errNormalizeAliasTargetFailed       = errors.New("normalizeAliasTarget failed")
+	errNormalizeNotifyFailed            = errors.New("normalizeNotify failed")
+	errNormalizeLoggingFailed           = errors.New("normalizeLogging failed")
+	errNormalizeProxiesFailed           = errors.New("normalizeProxies failed")
+	errValidateBackoffOrderFailed       = errors.New("validateBackoffOrder failed")
+	errValidateServerRangesFailed       = errors.New("validateServerRanges failed")
+	errValidateRangesFailed             = errors.New("validateRanges failed")
+	errValidateLimitRuleFailed          = errors.New("validateLimitRule failed")
+	errGlobalEnabledFalseGlobalChatBase = errors.New(
+		"global.enabled=false 与 global.chat_base / global.billing_base 同时设置自相矛盾：请清空 base 或开启 global",
+	)
+	errServerCorsOriginsOrigin          = errors.New("server.cors_origins: 不支持通配 \"*\"，请逐项列出允许的 Origin")
+	errNormalizeCORSOriginFailed        = errors.New("normalizeCORSOrigin failed")
+	errUpstreamModelTimeouts            = errors.New("upstream.model_timeouts: 模型名不能为空")
+	errNormalizeModelTimeoutsFailed     = errors.New("normalizeModelTimeouts failed")
+	errParseModelTimeoutFailed          = errors.New("parseModelTimeout failed")
+	errParseOptionalDurationFailed      = errors.New("parseOptionalDuration failed")
+	errNormalizeUpstreamRotateFailed    = errors.New("normalizeUpstreamRotate failed")
+	errNormalizeUpstreamKeepaliveFailed = errors.New("normalizeUpstreamKeepalive failed")
+	errNormalizeServerDurationFailed    = errors.New("normalizeServerDuration failed")
+	errNormalizeCheckinDelayFailed      = errors.New("normalizeCheckinDelay failed")
+	errNormalizePromptFailed            = errors.New("normalizePrompt failed")
+	errCheckHourRangeFailed             = errors.New("checkHourRange failed")
+)
+
 // Config 顶层配置。
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
@@ -366,114 +395,143 @@ type ModelTimeout struct {
 
 // Default 默认配置。
 func Default() *Config {
-	c := &Config{
+	c := baseDefaults()
+	applyScheduleDefaults(c)
+	applyUpstreamDefaults(c)
+	applyPoolDefaults(c)
+
+	return c
+}
+
+func baseDefaults() *Config {
+	config := &Config{
 		Listen:    ":7863",
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
 	}
-	c.Cooldown.SoftRate = "600s"
-	c.Cooldown.SoftRateMax = "2h"
-	c.Server.ReadTimeout = "300s"
-	c.Server.MaxBodyBytes = 16 << 20
-	c.Server.RequestAcceptGraceSeconds = 0
-	c.Server.ShutdownGraceSeconds = 30
-	c.Models.BackgroundTarget = defaultBackgroundTarget
-	c.Panel.PackageDetailLimit = 5
-	c.Logging.RequestArchiveEnabled = true
-	c.Logging.RequestRetentionDays = 7
-	c.Logging.RequestArchiveMaxMB = 100
+	config.Cooldown.SoftRate = "600s"
+	config.Cooldown.SoftRateMax = "2h"
+	config.Server.ReadTimeout = "300s"
+	config.Server.MaxBodyBytes = 16 << 20
+	config.Server.RequestAcceptGraceSeconds = 0
+	config.Server.ShutdownGraceSeconds = 30
+	config.Models.BackgroundTarget = defaultBackgroundTarget
+	config.Panel.PackageDetailLimit = 5
+	config.Logging.RequestArchiveEnabled = true
+	config.Logging.RequestRetentionDays = 7
+	config.Logging.RequestArchiveMaxMB = 100
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
-	c.Logging.RequestClientInfo = true
+	config.Logging.RequestClientInfo = true
 	// 与 README / config.example.json 对齐：开启决策链时默认只采样 10%，避免归档写入量突增。
-	c.Logging.DecisionTraceSample = 0.1
-	c.Schedule.CheckinHours = []int{9, 21}
-	c.Schedule.TravelHours = []int{9, 21}
-	c.Schedule.ActivityHours = []int{10}
-	c.Schedule.KeepaliveHours = []int{22}
-	c.Schedule.BlackcatHours = []int{23}
-	c.Schedule.GrowthHours = []int{1}
+	config.Logging.DecisionTraceSample = 0.1
+
+	return config
+}
+
+func applyScheduleDefaults(config2 *Config) {
+	config2.Schedule.CheckinHours = []int{9, 21}
+	config2.Schedule.TravelHours = []int{9, 21}
+	config2.Schedule.ActivityHours = []int{10}
+	config2.Schedule.KeepaliveHours = []int{22}
+	config2.Schedule.BlackcatHours = []int{23}
+	config2.Schedule.GrowthHours = []int{1}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
-	c.Schedule.CheckinEnabled = true
-	c.Schedule.GrowthEnabled = true
-	c.Schedule.TravelEnabled = true
-	c.Schedule.ActivityEnabled = true
-	c.Schedule.KeepaliveEnabled = true
-	c.Schedule.BlackcatEnabled = true
-	c.Schedule.BalanceRefreshEnabled = true
-	c.Schedule.BalanceRefreshMinutes = 5
-	c.Schedule.CheckinAccountDelay = "800ms"
-	c.Upstream.TimeoutSeconds = 120
+	config2.Schedule.CheckinEnabled = true
+	config2.Schedule.GrowthEnabled = true
+	config2.Schedule.TravelEnabled = true
+	config2.Schedule.ActivityEnabled = true
+	config2.Schedule.KeepaliveEnabled = true
+	config2.Schedule.BlackcatEnabled = true
+	config2.Schedule.BalanceRefreshEnabled = true
+	config2.Schedule.BalanceRefreshMinutes = 5
+	config2.Schedule.CheckinAccountDelay = "800ms"
+}
+
+func applyUpstreamDefaults(config7 *Config) {
+	config7.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
-	c.Upstream.HeaderTimeoutSeconds = 0
-	c.Upstream.IdleTimeoutSeconds = 0
+	config7.Upstream.HeaderTimeoutSeconds = 0
+	config7.Upstream.IdleTimeoutSeconds = 0
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
-	c.Global.Enabled = true
-	c.Features.SanitizeBlacklistFingerprints = true
-	c.Features.LocalWebToolRounds = 3
-	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
-	c.Pool.MaxInFlight = 3
+	config7.Global.Enabled = true
+	config7.Features.SanitizeBlacklistFingerprints = true
+	config7.Features.LocalWebToolRounds = 3
+	config7.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+}
+
+func applyPoolDefaults(config4 *Config) {
+	config4.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
 	// 的 0 没有合理语义，回退分档默认最稳）。
-	c.Pool.MaxInFlightGlobal = 2
-	c.Pool.BreakerThreshold = 3
-	c.Pool.BreakerCooldown = "30m"
-	c.Pool.BreakerCooldownMax = "6h"
-	c.Pool.DegradeThreshold = 5
-	c.Pool.DegradeCooldown = "10m"
-	c.Pool.DegradeCooldownMax = "2h"
-	c.Pool.IdleWeightPerHour = 0.5
-	c.Pool.IdleWeightMax = 5.0
-	c.Pool.PreferExpiring = true
-	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	config4.Pool.MaxInFlightGlobal = 2
+	config4.Pool.BreakerThreshold = 3
+	config4.Pool.BreakerCooldown = "30m"
+	config4.Pool.BreakerCooldownMax = "6h"
+	config4.Pool.DegradeThreshold = 5
+	config4.Pool.DegradeCooldown = "10m"
+	config4.Pool.DegradeCooldownMax = "2h"
+	config4.Pool.IdleWeightPerHour = 0.5
+	config4.Pool.IdleWeightMax = 5.0
+	config4.Pool.PreferExpiring = true
+	config4.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
-	c.Pool.CostExploreInterval = "30m"
-	c.SessionSticky.Enabled = true
-	c.SessionSticky.TTL = "30m"
-	c.SessionSticky.GCInterval = "5m"
-	return c
+	config4.Pool.CostExploreInterval = "30m"
+	config4.SessionSticky.Enabled = true
+	config4.SessionSticky.TTL = "30m"
+	config4.SessionSticky.GCInterval = "5m"
 }
 
 // Load 从文件读，再用 WB2A_* env 覆盖。
 func Load(path string) (*Config, error) {
-	c := Default()
+	config := Default()
+
 	if path != "" {
 		// 目录检查：Docker bind mount 在宿主机文件缺失时会静默创建同名目录，
 		// 直接 ReadFile 会报 "Incorrect function" 之类晦涩错误，这里给出可操作提示。
 		if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
-			return nil, fmt.Errorf("config %s 是目录而非文件——"+
-				"Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
-				"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）", path)
+			return nil, fmt.Errorf(
+				"config %s 是目录而非文件——Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）: %w",
+				path,
+				errLoadFailed,
+			)
 		}
+
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
-		if _, err := ParseConfigInto(raw, c); err != nil {
+
+		if _, err := ParseConfigInto(raw, config); err != nil {
 			return nil, err
 		}
 	}
-	applyEnv(c)
-	if err := c.normalize(); err != nil {
+
+	applyEnv(config)
+
+	if err := config.normalize(); err != nil {
 		return nil, err
 	}
-	return c, nil
+
+	return config, nil
 }
 
 // ParseConfigInto 把 JSON 覆盖到 c 上并 normalize（不做 env、不读文件）。
 // 面板保存配置走这条路径：与 Load 完全同一套解析/校验逻辑，避免两处漂移。
-func ParseConfigInto(raw []byte, c *Config) (*Config, error) {
-	if err := json.Unmarshal(raw, c); err != nil {
+func ParseConfigInto(raw []byte, config3 *Config) (*Config, error) {
+	if err := json.Unmarshal(raw, config3); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if err := c.normalize(); err != nil {
+
+	if err := config3.normalize(); err != nil {
 		return nil, err
 	}
-	return c, nil
+
+	return config3, nil
 }
 
 // ParseConfig 基于默认值解析一段配置 JSON（等价于 Load 的文件分支，但不读环境变量）。
@@ -484,15 +542,18 @@ func ParseConfig(raw []byte) (*Config, error) {
 // parseConfigWithEnv 解析配置后再叠加环境变量覆盖，供面板比较「当前生效值」。
 // 与 Load 同序：JSON → env → normalize，避免 env 覆盖的字段被误报为已变化。
 func parseConfigWithEnv(raw []byte) (*Config, error) {
-	c := Default()
-	if _, err := ParseConfigInto(raw, c); err != nil {
+	config := Default()
+	if _, err := ParseConfigInto(raw, config); err != nil {
 		return nil, err
 	}
-	applyEnv(c)
-	if err := c.normalize(); err != nil {
+
+	applyEnv(config)
+
+	if err := config.normalize(); err != nil {
 		return nil, err
 	}
-	return c, nil
+
+	return config, nil
 }
 
 // WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
@@ -504,27 +565,32 @@ func WriteDefault(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	c := Default()
 	c.APIKey = key
 	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
+
 	out, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("marshal config: %w", err)
 	}
+
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("mkdir config dir: %w", err)
+		if merr := os.MkdirAll(dir, 0o755); merr != nil {
+			return "", fmt.Errorf("mkdir config dir: %w", merr)
 		}
 	}
 	// O_EXCL 原子拒绝覆盖：即使调用方漏判"不存在"，也绝不悄悄改写用户已有配置。
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}
-	defer f.Close()
-	if _, err := f.Write(out); err != nil {
+	defer file.Close()
+
+	if _, err := file.Write(out); err != nil {
 		return "", fmt.Errorf("write config: %w", err)
 	}
+
 	return key, nil
 }
 
@@ -534,6 +600,7 @@ func randomAPIKey() (string, error) {
 	if _, err := rand.Read(raw); err != nil {
 		return "", fmt.Errorf("gen api_key: %w", err)
 	}
+
 	return "sk-" + base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
@@ -549,18 +616,22 @@ func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
 	if err != nil || current != placeholderAPIKey {
 		return "", false, err
 	}
+
 	key, err := randomAPIKey()
 	if err != nil {
 		return "", false, err
 	}
+
 	encoded, err := json.Marshal(key)
 	if err != nil {
 		return "", false, fmt.Errorf("marshal api_key: %w", err)
 	}
+
 	doc["api_key"] = encoded
 	if err := writeConfigDoc(path, doc); err != nil {
 		return "", false, err
 	}
+
 	return key, true, nil
 }
 
@@ -568,25 +639,30 @@ func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
 func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
 	st, err := os.Stat(path)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("readConfigDoc: %w", err)
 	}
+
 	if !st.Mode().IsRegular() {
 		return nil, "", nil
 	}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, "", fmt.Errorf("read config: %w", err)
 	}
+
 	var doc map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, "", fmt.Errorf("parse config: %w", err)
 	}
+
 	var current string
 	if v, ok := doc["api_key"]; ok {
 		if err := json.Unmarshal(v, &current); err != nil {
 			return nil, "", fmt.Errorf("parse api_key: %w", err)
 		}
 	}
+
 	return doc, current, nil
 }
 
@@ -596,10 +672,12 @@ func writeConfigDoc(path string, doc map[string]json.RawMessage) error {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
+
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, out, 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
+
 	return replaceConfigFile(tmp, path, out)
 }
 
@@ -611,84 +689,102 @@ func applyEnv(c *Config) {
 }
 
 // applyEnvCore 覆盖监听 / 鉴权 / 路径与冷却基数。
-func applyEnvCore(c *Config) {
+func applyEnvCore(config8 *Config) {
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
-		c.Listen = v
+		config8.Listen = v
 	}
+
 	if v := os.Getenv("WB2A_API_KEY"); v != "" {
-		c.APIKey = v
+		config8.APIKey = v
 	}
+
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
-		c.AuthDir = v
+		config8.AuthDir = v
 	}
+
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
-		c.StateFile = v
+		config8.StateFile = v
 	}
+
 	if v := os.Getenv("WB2A_SOFT_RATE"); v != "" {
-		c.Cooldown.SoftRate = v
+		config8.Cooldown.SoftRate = v
 	}
+
 	if v := os.Getenv("WB2A_SOFT_RATE_MAX"); v != "" {
-		c.Cooldown.SoftRateMax = v
+		config8.Cooldown.SoftRateMax = v
 	}
 }
 
 // applyEnvTimeouts 覆盖出站 HTTP 三段超时（短 RPC / 首字节前 / 流中空闲）。
-func applyEnvTimeouts(c *Config) {
+func applyEnvTimeouts(config5 *Config) {
 	if n, ok := envInt("WB2A_TIMEOUT_SECONDS"); ok {
-		c.Upstream.TimeoutSeconds = n
+		config5.Upstream.TimeoutSeconds = n
 	}
+
 	if n, ok := envInt("WB2A_HEADER_TIMEOUT_SECONDS"); ok {
-		c.Upstream.HeaderTimeoutSeconds = n
+		config5.Upstream.HeaderTimeoutSeconds = n
 	}
+
 	if n, ok := envInt("WB2A_IDLE_TIMEOUT_SECONDS"); ok {
-		c.Upstream.IdleTimeoutSeconds = n
+		config5.Upstream.IdleTimeoutSeconds = n
 	}
 }
 
 // applyEnvIdentity 覆盖出站 UA / 归属头 / 设备 token 与 IP 透传开关。
-func applyEnvIdentity(c *Config) {
+func applyEnvIdentity(config *Config) {
 	if v := os.Getenv("WB2A_USER_AGENT"); v != "" {
-		c.Upstream.UserAgent = v
+		config.Upstream.UserAgent = v
 	}
+
 	if v := os.Getenv("WB2A_CLIENT_VERSION"); v != "" {
-		c.Upstream.ClientVersion = v
+		config.Upstream.ClientVersion = v
 	}
+
 	if v := os.Getenv("WB2A_CLI_VERSION"); v != "" {
-		c.Upstream.CliVersion = v
+		config.Upstream.CliVersion = v
 	}
+
 	if v := os.Getenv("WB2A_CLIENT_NAME"); v != "" {
-		c.Upstream.ClientName = v
+		config.Upstream.ClientName = v
 	}
+
 	if v := os.Getenv("WB2A_DEVICE_TOKEN"); v != "" {
-		c.Upstream.DeviceToken = v
+		config.Upstream.DeviceToken = v
 	}
+
 	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
-		c.Upstream.DeviceTokenFile = v
+		config.Upstream.DeviceTokenFile = v
 	}
+
 	if b, ok := envBool("WB2A_PASSTHROUGH_IP"); ok {
-		c.Upstream.PassthroughIP = b
+		config.Upstream.PassthroughIP = b
 	}
 }
 
 // applyEnvFeatures 覆盖脱敏开关、prompt 模式 / 文件与积分过期相关项。
-func applyEnvFeatures(c *Config) {
+func applyEnvFeatures(config6 *Config) {
 	if b, ok := envBool("WB2A_SANITIZE_FINGERPRINTS"); ok {
-		c.Features.SanitizeBlacklistFingerprints = b
+		config6.Features.SanitizeBlacklistFingerprints = b
 	}
+
 	if b, ok := envBool("WB2A_MULTIMODAL_ROUTING"); ok {
-		c.Features.MultimodalRouting = b
+		config6.Features.MultimodalRouting = b
 	}
+
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
-		c.Prompt.Mode = v
+		config6.Prompt.Mode = v
 	}
+
 	if v := os.Getenv("WB2A_PROMPT_FILE"); v != "" {
-		c.Prompt.File = v
+		config6.Prompt.File = v
 	}
+
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
-		c.Pool.ExpiringSoon = v
+		config6.Pool.ExpiringSoon = v
 	}
+
 	if b, ok := envBool("WB2A_PREFER_EXPIRING"); ok {
-		c.Pool.PreferExpiring = b
+		config6.Pool.PreferExpiring = b
 	}
 }
 
@@ -699,10 +795,12 @@ func envInt(key string) (int, bool) {
 	if v == "" {
 		return 0, false
 	}
+
 	n, err := strconv.Atoi(v)
 	if err != nil {
 		return 0, false
 	}
+
 	return n, true
 }
 
@@ -712,10 +810,12 @@ func envBool(key string) (bool, bool) {
 	if v == "" {
 		return false, false
 	}
+
 	b, err := strconv.ParseBool(v)
 	if err != nil {
 		return false, false
 	}
+
 	return b, true
 }
 
@@ -727,7 +827,9 @@ func (c *Config) normalize() error {
 	if err := c.normalizeDurations(); err != nil {
 		return err
 	}
+
 	c.normalizeStaticDefaults()
+
 	steps := []func() error{
 		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
@@ -749,25 +851,32 @@ func (c *Config) normalizeModelAliases() error {
 	if len(c.Models.Aliases) == 0 {
 		return nil
 	}
+
 	out := make(map[string]string, len(c.Models.Aliases))
 	for key, value := range c.Models.Aliases {
 		name := strings.TrimSpace(key)
 		if name == "" {
-			return errors.New("models.aliases: 别名不能为空")
+			return errModelsAliases
 		}
+
 		if strings.Contains(name, ":") {
-			return fmt.Errorf("models.aliases[%q]: 别名不得含 realm 前缀，请写成裸模型名", name)
+			return fmt.Errorf("models.aliases[%q]: 别名不得含 realm 前缀，请写成裸模型名: %w", name, errNormalizeModelAliasesFailed)
 		}
+
 		target, err := normalizeAliasTarget(name, value)
 		if err != nil {
 			return err
 		}
+
 		if _, dup := out[name]; dup {
-			return fmt.Errorf("models.aliases: 别名 %q 去掉首尾空白后重复", name)
+			return fmt.Errorf("models.aliases: 别名 %q 去掉首尾空白后重复: %w", name, errNormalizeModelAliasesFailed)
 		}
+
 		out[name] = target
 	}
+
 	c.Models.Aliases = out
+
 	return nil
 }
 
@@ -777,22 +886,28 @@ func (c *Config) normalizeBackgroundModels() error {
 	if strings.TrimSpace(c.Models.BackgroundTarget) == "" {
 		c.Models.BackgroundTarget = defaultBackgroundTarget
 	}
+
 	c.Models.BackgroundTarget = strings.TrimSpace(c.Models.BackgroundTarget)
 	if len(c.Models.BackgroundNames) == 0 {
 		c.Models.BackgroundNames = nil
 		return nil
 	}
+
 	seen := make(map[string]bool, len(c.Models.BackgroundNames))
+
 	out := make([]string, 0, len(c.Models.BackgroundNames))
 	for _, raw := range c.Models.BackgroundNames {
 		name := strings.ToLower(strings.TrimSpace(raw))
 		if name == "" || seen[name] {
 			continue
 		}
+
 		seen[name] = true
 		out = append(out, name)
 	}
+
 	c.Models.BackgroundNames = out
+
 	return nil
 }
 
@@ -801,19 +916,23 @@ func (c *Config) normalizeBackgroundModels() error {
 func normalizeAliasTarget(name, value string) (string, error) {
 	target := strings.TrimSpace(value)
 	if target == "" {
-		return "", fmt.Errorf("models.aliases[%q]: 目标模型不能为空", name)
+		return "", fmt.Errorf("models.aliases[%q]: 目标模型不能为空: %w", name, errNormalizeAliasTargetFailed)
 	}
+
 	model := target
 	if i := strings.IndexByte(model, ':'); i >= 0 {
 		prefix := model[:i]
 		if prefix != "cn" && prefix != "global" {
-			return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 的 realm 前缀必须是 cn 或 global", name, target)
+			return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 的 realm 前缀必须是 cn 或 global: %w", name, target, errNormalizeAliasTargetFailed)
 		}
+
 		model = model[i+1:]
 	}
+
 	if model == "" {
-		return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 缺少裸模型名", name, target)
+		return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 缺少裸模型名: %w", name, target, errNormalizeAliasTargetFailed)
 	}
+
 	return target, nil
 }
 
@@ -823,32 +942,40 @@ func (c *Config) normalizeNotify() error {
 	if err := notify.ValidateURL(webhook); err != nil {
 		return fmt.Errorf("notify.webhook_url: %w", err)
 	}
+
 	c.Notify.WebhookURL = webhook
 	if len(c.Notify.Events) == 0 {
 		return nil
 	}
+
 	seen := make(map[string]bool, len(c.Notify.Events))
+
 	events := make([]string, 0, len(c.Notify.Events))
 	for _, raw := range c.Notify.Events {
 		name := strings.TrimSpace(raw)
 		if !notify.ValidEvent(name) {
-			return fmt.Errorf("notify.events: 未知事件 %q", raw)
+			return fmt.Errorf("notify.events: 未知事件 %q: %w", raw, errNormalizeNotifyFailed)
 		}
+
 		if seen[name] {
 			continue
 		}
+
 		seen[name] = true
 		events = append(events, name)
 	}
+
 	c.Notify.Events = events
+
 	return nil
 }
 
 // normalizeLogging 校验决策链采样率（issue #63）：0/1 = 全部，0<v<1 采样，>1 报错。
 func (c *Config) normalizeLogging() error {
 	if c.Logging.DecisionTraceSample < 0 || c.Logging.DecisionTraceSample > 1 {
-		return fmt.Errorf("logging.decision_trace_sample: 必须在 [0,1]，当前 %v", c.Logging.DecisionTraceSample)
+		return fmt.Errorf("logging.decision_trace_sample: 必须在 [0,1]，当前 %v: %w", c.Logging.DecisionTraceSample, errNormalizeLoggingFailed)
 	}
+
 	return nil
 }
 
@@ -859,22 +986,27 @@ func (c *Config) normalizeProxies() error {
 			return fmt.Errorf("upstream.proxies: %w", err)
 		}
 	}
+
 	seen := make(map[string]bool, len(c.Upstream.ProxySlots))
 	for i := range c.Upstream.ProxySlots {
 		slot := &c.Upstream.ProxySlots[i]
 		slot.ID = strings.TrimSpace(slot.ID)
+
 		slot.Name = strings.TrimSpace(slot.Name)
 		if slot.ID == "" {
-			return fmt.Errorf("upstream.proxy_slots[%d]: id 不能为空", i)
+			return fmt.Errorf("upstream.proxy_slots[%d]: id 不能为空: %w", i, errNormalizeProxiesFailed)
 		}
+
 		if seen[slot.ID] {
-			return fmt.Errorf("upstream.proxy_slots: id %q 重复", slot.ID)
+			return fmt.Errorf("upstream.proxy_slots: id %q 重复: %w", slot.ID, errNormalizeProxiesFailed)
 		}
+
 		seen[slot.ID] = true
 		if _, err := outbound.ParseProxy(slot.URL); err != nil {
 			return fmt.Errorf("upstream.proxy_slots[%s]: %w", slot.ID, err)
 		}
 	}
+
 	return nil
 }
 
@@ -888,40 +1020,52 @@ func (c *Config) Validate() error {
 	if err := c.validateBackoffOrder(); err != nil {
 		return err
 	}
+
 	if err := c.validateRanges(); err != nil {
 		return err
 	}
+
 	return c.validateGlobalMutex()
 }
 
 // validateBackoffOrder 跨字段：指数退避封顶不得小于基数（否则封顶形同虚设）。
 func (c *Config) validateBackoffOrder() error {
 	if c.SoftRateDur > 0 && c.SoftRateMaxDur > 0 && c.SoftRateMaxDur < c.SoftRateDur {
-		return fmt.Errorf("cooldown.soft_rate_max (%s) 不得小于 cooldown.soft_rate (%s)",
-			c.Cooldown.SoftRateMax, c.Cooldown.SoftRate)
+		return fmt.Errorf("cooldown.soft_rate_max (%s) 不得小于 cooldown.soft_rate (%s): %w",
+			c.Cooldown.SoftRateMax, c.Cooldown.SoftRate, errValidateBackoffOrderFailed)
 	}
+
 	if c.BreakerCooldownDur > 0 && c.BreakerCooldownMaxD > 0 && c.BreakerCooldownMaxD < c.BreakerCooldownDur {
-		return fmt.Errorf("pool.breaker_cooldown_max (%s) 不得小于 pool.breaker_cooldown (%s)",
-			c.Pool.BreakerCooldownMax, c.Pool.BreakerCooldown)
+		return fmt.Errorf("pool.breaker_cooldown_max (%s) 不得小于 pool.breaker_cooldown (%s): %w",
+			c.Pool.BreakerCooldownMax, c.Pool.BreakerCooldown, errValidateBackoffOrderFailed)
 	}
+
 	if c.DegradeCooldownDur > 0 && c.DegradeCooldownMaxD > 0 && c.DegradeCooldownMaxD < c.DegradeCooldownDur {
-		return fmt.Errorf("pool.degrade_cooldown_max (%s) 不得小于 pool.degrade_cooldown (%s)",
-			c.Pool.DegradeCooldownMax, c.Pool.DegradeCooldown)
+		return fmt.Errorf("pool.degrade_cooldown_max (%s) 不得小于 pool.degrade_cooldown (%s): %w",
+			c.Pool.DegradeCooldownMax, c.Pool.DegradeCooldown, errValidateBackoffOrderFailed)
 	}
+
 	return nil
 }
 
 // validateServerRanges server.* 的非负校验（0 分别表示不限制 / 立即停机）。
 func (c *Config) validateServerRanges() error {
 	if c.Server.MaxBodyBytes < 0 {
-		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）", c.Server.MaxBodyBytes)
+		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）: %w", c.Server.MaxBodyBytes, errValidateServerRangesFailed)
 	}
+
 	if c.Server.RequestAcceptGraceSeconds < 0 {
-		return fmt.Errorf("server.request_accept_grace_seconds: 负值 %d 无意义（0 = 立即停机）", c.Server.RequestAcceptGraceSeconds)
+		return fmt.Errorf(
+			"server.request_accept_grace_seconds: 负值 %d 无意义（0 = 立即停机）: %w",
+			c.Server.RequestAcceptGraceSeconds,
+			errValidateServerRangesFailed,
+		)
 	}
+
 	if c.Server.ShutdownGraceSeconds < 0 {
-		return fmt.Errorf("server.shutdown_grace_seconds: 负值 %d 无意义", c.Server.ShutdownGraceSeconds)
+		return fmt.Errorf("server.shutdown_grace_seconds: 负值 %d 无意义: %w", c.Server.ShutdownGraceSeconds, errValidateServerRangesFailed)
 	}
+
 	return nil
 }
 
@@ -932,43 +1076,53 @@ func (c *Config) validateRanges() error {
 	}); err != nil {
 		return err
 	}
+
 	if err := validateLimitRule("limits.cn", c.Limits.CN); err != nil {
 		return err
 	}
+
 	if err := validateLimitRule("limits.global", c.Limits.Global); err != nil {
 		return err
 	}
+
 	if c.Pool.MaxInFlight < 0 {
-		return fmt.Errorf("pool.max_in_flight: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlight)
+		return fmt.Errorf("pool.max_in_flight: 负值 %d 无意义（0 = 不限）: %w", c.Pool.MaxInFlight, errValidateRangesFailed)
 	}
+
 	if err := c.validateServerRanges(); err != nil {
 		return err
 	}
+
 	if c.Pool.MaxInFlightTotal < 0 {
-		return fmt.Errorf("pool.max_in_flight_total: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlightTotal)
+		return fmt.Errorf("pool.max_in_flight_total: 负值 %d 无意义（0 = 不限）: %w", c.Pool.MaxInFlightTotal, errValidateRangesFailed)
 	}
+
 	if c.SessionTTL < 0 {
-		return fmt.Errorf("session_sticky.ttl: 负时长 %q 无意义", c.SessionSticky.TTL)
+		return fmt.Errorf("session_sticky.ttl: 负时长 %q 无意义: %w", c.SessionSticky.TTL, errValidateRangesFailed)
 	}
+
 	if c.SessionGCInterval <= 0 {
-		return fmt.Errorf("session_sticky.gc_interval: 必须为正时长，当前 %q", c.SessionSticky.GCInterval)
+		return fmt.Errorf("session_sticky.gc_interval: 必须为正时长，当前 %q: %w", c.SessionSticky.GCInterval, errValidateRangesFailed)
 	}
+
 	return nil
 }
 
 // validateLimitRule 校验一组每日限额非负（0 = 关闭）。
 func validateLimitRule(name string, r LimitRule) error {
 	if r.DailyTokens < 0 || r.DailyCredits < 0 || r.ModelDailyTokens < 0 {
-		return fmt.Errorf("%s: 每日限额不能为负（0 = 关闭）", name)
+		return fmt.Errorf("%s: 每日限额不能为负（0 = 关闭）: %w", name, errValidateLimitRuleFailed)
 	}
+
 	return nil
 }
 
 // validateGlobalMutex 互斥：global 路由关闭时再配 global base 自相矛盾（base 永不会被使用）。
 func (c *Config) validateGlobalMutex() error {
 	if !c.Global.Enabled && (strings.TrimSpace(c.Global.ChatBase) != "" || strings.TrimSpace(c.Global.BillingBase) != "") {
-		return errors.New("global.enabled=false 与 global.chat_base / global.billing_base 同时设置自相矛盾：请清空 base 或开启 global")
+		return errGlobalEnabledFalseGlobalChatBase
 	}
+
 	return nil
 }
 
@@ -978,9 +1132,11 @@ func (c *Config) normalizeStaticDefaults() {
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
+
 	if c.Logging.RequestRetentionDays <= 0 {
 		c.Logging.RequestRetentionDays = 7
 	}
+
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
 	}
@@ -988,6 +1144,7 @@ func (c *Config) normalizeStaticDefaults() {
 	if c.Server.ShutdownGraceSeconds == 0 {
 		c.Server.ShutdownGraceSeconds = 30
 	}
+
 	c.normalizeLocalWebToolRounds()
 	c.normalizePoolDefaults()
 	c.normalizeUpstreamDefaults()
@@ -999,20 +1156,26 @@ func (c *Config) normalizeCORS() error {
 	if len(c.Server.CORSOrigins) == 0 {
 		return nil
 	}
+
 	seen := make(map[string]bool, len(c.Server.CORSOrigins))
+
 	out := make([]string, 0, len(c.Server.CORSOrigins))
 	for _, raw := range c.Server.CORSOrigins {
 		norm, err := normalizeCORSOrigin(raw)
 		if err != nil {
 			return err
 		}
+
 		if seen[norm] {
 			continue
 		}
+
 		seen[norm] = true
 		out = append(out, norm)
 	}
+
 	c.Server.CORSOrigins = out
+
 	return nil
 }
 
@@ -1020,39 +1183,43 @@ func (c *Config) normalizeCORS() error {
 func normalizeCORSOrigin(raw string) (string, error) {
 	origin := strings.TrimSpace(raw)
 	if origin == "*" {
-		return "", errors.New(`server.cors_origins: 不支持通配 "*"，请逐项列出允许的 Origin`)
+		return "", errServerCorsOriginsOrigin
 	}
-	u, err := url.Parse(origin)
+
+	url2, err := url.Parse(origin)
 	if err != nil {
 		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q: %w", raw, err)
 	}
-	if reason := invalidOriginReason(u); reason != "" {
-		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q（%s）", raw, reason)
+
+	if reason := invalidOriginReason(url2); reason != "" {
+		return "", fmt.Errorf("server.cors_origins: 非法 Origin %q（%s）: %w", raw, reason, errNormalizeCORSOriginFailed)
 	}
-	host := strings.ToLower(u.Host)
-	switch u.Scheme {
+
+	host := strings.ToLower(url2.Host)
+	switch url2.Scheme {
 	case "http":
 		host = strings.TrimSuffix(host, ":80")
 	case "https":
 		host = strings.TrimSuffix(host, ":443")
 	}
-	return u.Scheme + "://" + host, nil
+
+	return url2.Scheme + "://" + host, nil
 }
 
 // invalidOriginReason 返回 Origin URL 不合规的原因；合规时返回空串。
-func invalidOriginReason(u *url.URL) string {
+func invalidOriginReason(url2 *url.URL) string {
 	switch {
-	case u.Scheme != "http" && u.Scheme != "https":
+	case url2.Scheme != "http" && url2.Scheme != "https":
 		return "scheme 必须是 http 或 https"
-	case u.Host == "":
+	case url2.Host == "":
 		return "缺少 host"
-	case u.User != nil:
+	case url2.User != nil:
 		return "不能包含用户凭证"
-	case u.RawQuery != "":
+	case url2.RawQuery != "":
 		return "不能包含查询参数"
-	case u.Fragment != "":
+	case url2.Fragment != "":
 		return "不能包含 fragment"
-	case u.Path != "" && u.Path != "/":
+	case url2.Path != "" && url2.Path != "/":
 		return "不能包含路径"
 	default:
 		return ""
@@ -1065,6 +1232,7 @@ func (c *Config) normalizeLocalWebToolRounds() {
 	if c.Features.LocalWebToolRounds <= 0 {
 		c.Features.LocalWebToolRounds = 3
 	}
+
 	if c.Features.LocalWebToolRounds > 8 {
 		c.Features.LocalWebToolRounds = 8
 	}
@@ -1076,6 +1244,7 @@ func (c *Config) normalizePoolDefaults() {
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
 	}
+
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -1083,9 +1252,11 @@ func (c *Config) normalizePoolDefaults() {
 	if c.Pool.DegradeThreshold <= 0 {
 		c.Pool.DegradeThreshold = 5
 	}
+
 	if c.Pool.DegradeCooldown == "" {
 		c.Pool.DegradeCooldown = "10m"
 	}
+
 	if c.Pool.DegradeCooldownMax == "" {
 		c.Pool.DegradeCooldownMax = "2h"
 	}
@@ -1093,9 +1264,11 @@ func (c *Config) normalizePoolDefaults() {
 	if c.Pool.MaxInFlightGlobal <= 0 {
 		c.Pool.MaxInFlightGlobal = 2
 	}
+
 	if c.Pool.IdleWeightPerHour <= 0 {
 		c.Pool.IdleWeightPerHour = 0.5
 	}
+
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
 	}
@@ -1111,15 +1284,19 @@ func (c *Config) normalizeUpstreamDefaults() {
 	if c.Upstream.HeaderTimeoutSeconds <= 0 {
 		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
 	}
+
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
+
 	if c.Upstream.RotateMax <= 0 {
 		c.Upstream.RotateMax = 3
 	}
+
 	if c.Upstream.RotateBudget == "" {
 		c.Upstream.RotateBudget = "0"
 	}
+
 	if c.Upstream.KeepaliveInterval == "" {
 		c.Upstream.KeepaliveInterval = "0"
 	}
@@ -1131,24 +1308,31 @@ func (c *Config) normalizeDurations() error {
 	if err := c.normalizeServerDuration(); err != nil {
 		return err
 	}
+
 	if err := c.normalizeCooldownDurations(); err != nil {
 		return err
 	}
+
 	if err := c.normalizePoolDurations(); err != nil {
 		return err
 	}
+
 	if err := c.normalizeSessionDurations(); err != nil {
 		return err
 	}
+
 	if err := c.normalizeUpstreamRotate(); err != nil {
 		return err
 	}
+
 	if err := c.normalizeUpstreamKeepalive(); err != nil {
 		return err
 	}
+
 	if err := c.normalizeModelTimeouts(); err != nil {
 		return err
 	}
+
 	return c.normalizeExpiringDurations()
 }
 
@@ -1158,22 +1342,28 @@ func (c *Config) normalizeModelTimeouts() error {
 	if len(c.Upstream.ModelTimeouts) == 0 {
 		return nil
 	}
+
 	out := make(map[string]ModelTimeout, len(c.Upstream.ModelTimeouts))
 	for key, spec := range c.Upstream.ModelTimeouts {
 		name := strings.TrimSpace(key)
 		if name == "" {
-			return errors.New("upstream.model_timeouts: 模型名不能为空")
+			return errUpstreamModelTimeouts
 		}
+
 		parsed, err := parseModelTimeout(name, spec)
 		if err != nil {
 			return err
 		}
+
 		if _, dup := out[name]; dup {
-			return fmt.Errorf("upstream.model_timeouts: 模型 %q 去空白后重复", name)
+			return fmt.Errorf("upstream.model_timeouts: 模型 %q 去空白后重复: %w", name, errNormalizeModelTimeoutsFailed)
 		}
+
 		out[name] = parsed
 	}
+
 	c.Upstream.ModelTimeouts = out
+
 	return nil
 }
 
@@ -1183,17 +1373,21 @@ func parseModelTimeout(name string, spec ModelTimeout) (ModelTimeout, error) {
 	if err != nil {
 		return ModelTimeout{}, err
 	}
+
 	idle, err := parseOptionalDuration("upstream.model_timeouts["+name+"].idle", spec.Idle)
 	if err != nil {
 		return ModelTimeout{}, err
 	}
+
 	if header == 0 && idle == 0 {
-		return ModelTimeout{}, fmt.Errorf("upstream.model_timeouts[%q]: header/idle 至少配置一项", name)
+		return ModelTimeout{}, fmt.Errorf("upstream.model_timeouts[%q]: header/idle 至少配置一项: %w", name, errParseModelTimeoutFailed)
 	}
+
 	spec.Header = strings.TrimSpace(spec.Header)
 	spec.Idle = strings.TrimSpace(spec.Idle)
 	spec.HeaderDur = header
 	spec.IdleDur = idle
+
 	return spec, nil
 }
 
@@ -1202,14 +1396,17 @@ func parseOptionalDuration(field, raw string) (time.Duration, error) {
 	if strings.TrimSpace(raw) == "" {
 		return 0, nil
 	}
-	d, err := time.ParseDuration(strings.TrimSpace(raw))
+
+	duration, err := time.ParseDuration(strings.TrimSpace(raw))
 	if err != nil {
 		return 0, fmt.Errorf("%s: %w", field, err)
 	}
-	if d < 0 {
-		return 0, fmt.Errorf("%s: 负时长 %q 无意义", field, raw)
+
+	if duration < 0 {
+		return 0, fmt.Errorf("%s: 负时长 %q 无意义: %w", field, raw, errParseOptionalDurationFailed)
 	}
-	return d, nil
+
+	return duration, nil
 }
 
 // normalizeUpstreamRotate 解析轮换总时长预算（issue #17）：空 = "0"（不限）；
@@ -1219,14 +1416,18 @@ func (c *Config) normalizeUpstreamRotate() error {
 	if budget == "" {
 		budget = "0"
 	}
-	d, err := time.ParseDuration(budget)
+
+	duration, err := time.ParseDuration(budget)
 	if err != nil {
 		return fmt.Errorf("upstream.rotate_budget: %w", err)
 	}
-	if d < 0 {
-		return fmt.Errorf("upstream.rotate_budget: 负时长 %q 无意义", c.Upstream.RotateBudget)
+
+	if duration < 0 {
+		return fmt.Errorf("upstream.rotate_budget: 负时长 %q 无意义: %w", c.Upstream.RotateBudget, errNormalizeUpstreamRotateFailed)
 	}
-	c.RotateBudgetDur = d
+
+	c.RotateBudgetDur = duration
+
 	return nil
 }
 
@@ -1237,14 +1438,18 @@ func (c *Config) normalizeUpstreamKeepalive() error {
 	if raw == "" {
 		raw = "0"
 	}
-	d, err := time.ParseDuration(raw)
+
+	duration, err := time.ParseDuration(raw)
 	if err != nil {
 		return fmt.Errorf("upstream.keepalive_interval: %w", err)
 	}
-	if d < 0 {
-		return fmt.Errorf("upstream.keepalive_interval: 负时长 %q 无意义", c.Upstream.KeepaliveInterval)
+
+	if duration < 0 {
+		return fmt.Errorf("upstream.keepalive_interval: 负时长 %q 无意义: %w", c.Upstream.KeepaliveInterval, errNormalizeUpstreamKeepaliveFailed)
 	}
-	c.KeepaliveIntervalDur = d
+
+	c.KeepaliveIntervalDur = duration
+
 	return nil
 }
 
@@ -1255,13 +1460,16 @@ func (c *Config) normalizeServerDuration() error {
 	if c.Server.ReadTimeout == "" {
 		c.Server.ReadTimeout = "300s"
 	}
+
 	var err error
 	if c.ServerReadTimeoutDur, err = time.ParseDuration(c.Server.ReadTimeout); err != nil {
 		return fmt.Errorf("server.read_timeout: %w", err)
 	}
+
 	if c.ServerReadTimeoutDur < 0 {
-		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义: %w", c.Server.ReadTimeout, errNormalizeServerDurationFailed)
 	}
+
 	return nil
 }
 
@@ -1275,9 +1483,11 @@ func (c *Config) normalizeCooldownDurations() error {
 	if c.Cooldown.SoftRateMax == "" {
 		c.Cooldown.SoftRateMax = "2h"
 	}
+
 	if c.SoftRateMaxDur, err = time.ParseDuration(c.Cooldown.SoftRateMax); err != nil {
 		return fmt.Errorf("cooldown.soft_rate_max: %w", err)
 	}
+
 	return nil
 }
 
@@ -1287,15 +1497,19 @@ func (c *Config) normalizePoolDurations() error {
 	if c.BreakerCooldownDur, err = time.ParseDuration(c.Pool.BreakerCooldown); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown: %w", err)
 	}
+
 	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
 	}
+
 	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
 		return fmt.Errorf("pool.degrade_cooldown: %w", err)
 	}
+
 	if c.DegradeCooldownMaxD, err = time.ParseDuration(c.Pool.DegradeCooldownMax); err != nil {
 		return fmt.Errorf("pool.degrade_cooldown_max: %w", err)
 	}
+
 	return nil
 }
 
@@ -1305,9 +1519,11 @@ func (c *Config) normalizeSessionDurations() error {
 	if c.SessionTTL, err = time.ParseDuration(c.SessionSticky.TTL); err != nil {
 		return fmt.Errorf("session_sticky.ttl: %w", err)
 	}
+
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
 	}
+
 	return nil
 }
 
@@ -1320,6 +1536,7 @@ func (c *Config) normalizeExpiringDurations() error {
 			return fmt.Errorf("pool.expiring_soon: %w", err)
 		}
 	}
+
 	if c.ExpiringSoonDur < 0 {
 		c.ExpiringSoonDur = 0
 		c.Pool.ExpiringSoon = "0"
@@ -1330,12 +1547,15 @@ func (c *Config) normalizeExpiringDurations() error {
 	if c.Pool.CostExploreInterval == "" {
 		c.Pool.CostExploreInterval = "30m"
 	}
+
 	if c.CostExploreIntervalDur, err = time.ParseDuration(c.Pool.CostExploreInterval); err != nil {
 		return fmt.Errorf("pool.cost_explore_interval: %w", err)
 	}
+
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
 	}
+
 	return nil
 }
 
@@ -1346,15 +1566,19 @@ func (c *Config) normalizeCheckinDelay() error {
 	if raw == "" {
 		raw = "800ms"
 	}
-	d, err := time.ParseDuration(raw)
+
+	duration, err := time.ParseDuration(raw)
 	if err != nil {
 		return fmt.Errorf("schedule.checkin_account_delay: %w", err)
 	}
-	if d < 0 {
-		return fmt.Errorf("schedule.checkin_account_delay: 负时长 %q 无意义", c.Schedule.CheckinAccountDelay)
+
+	if duration < 0 {
+		return fmt.Errorf("schedule.checkin_account_delay: 负时长 %q 无意义: %w", c.Schedule.CheckinAccountDelay, errNormalizeCheckinDelayFailed)
 	}
+
 	c.Schedule.CheckinAccountDelay = raw
-	c.CheckinAccountDelayDur = d
+	c.CheckinAccountDelayDur = duration
+
 	return nil
 }
 
@@ -1363,6 +1587,7 @@ func (c *Config) normalizeCheckinDelay() error {
 func (c *Config) normalizeSchedule() error {
 	c.normalizeListenAndHours()
 	c.normalizeBalanceRefresh()
+
 	return c.validateScheduleHours()
 }
 
@@ -1376,18 +1601,23 @@ func (c *Config) normalizeListenAndHours() {
 	if len(c.Schedule.CheckinHours) == 0 {
 		c.Schedule.CheckinHours = []int{9, 21}
 	}
+
 	if len(c.Schedule.TravelHours) == 0 {
 		c.Schedule.TravelHours = []int{9, 21}
 	}
+
 	if len(c.Schedule.ActivityHours) == 0 {
 		c.Schedule.ActivityHours = []int{10}
 	}
+
 	if len(c.Schedule.KeepaliveHours) == 0 {
 		c.Schedule.KeepaliveHours = []int{22}
 	}
+
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
 	}
+
 	if len(c.Schedule.GrowthHours) == 0 {
 		c.Schedule.GrowthHours = []int{1}
 	}
@@ -1400,6 +1630,7 @@ func (c *Config) normalizeBalanceRefresh() {
 		if c.Schedule.BalanceRefreshMinutes <= 0 {
 			c.Schedule.BalanceRefreshMinutes = 5
 		}
+
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
 	}
 }
@@ -1419,15 +1650,18 @@ func (c *Config) normalizePrompt() error {
 	case "append":
 		c.Prompt.Mode = "append"
 	default:
-		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）", c.Prompt.Mode)
+		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）: %w", c.Prompt.Mode, errNormalizePromptFailed)
 	}
+
 	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" {
 		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
 		if err != nil {
-			return err
+			return fmt.Errorf("normalizePrompt: %w", err)
 		}
+
 		c.PromptText = text
 	}
+
 	return nil
 }
 
@@ -1440,26 +1674,32 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.checkin_hours", "checkin_enabled", c.Schedule.CheckinHours); err != nil {
 		return err
 	}
+
 	if err := checkHourRange("schedule.travel_hours", "travel_enabled", c.Schedule.TravelHours); err != nil {
 		return err
 	}
+
 	if err := checkHourRange("schedule.activity_hours", "activity_enabled", c.Schedule.ActivityHours); err != nil {
 		return err
 	}
+
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
+
 	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
 		return err
 	}
+
 	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {
 	for _, h := range hours {
 		if h < 0 || h > 23 {
-			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false", field, h, switchKey)
+			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false: %w", field, h, switchKey, errCheckHourRangeFailed)
 		}
 	}
+
 	return nil
 }

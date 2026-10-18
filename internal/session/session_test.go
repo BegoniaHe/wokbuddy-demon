@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"testing"
@@ -41,10 +42,10 @@ func (c *countingStore) DelBind(key string) {
 func (c *countingStore) LoadBinds() map[string]string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	out := map[string]string{}
-	for k, v := range c.binds {
-		out[k] = v
-	}
+	maps.Copy(out, c.binds)
+
 	return out
 }
 
@@ -57,6 +58,8 @@ func routerWith(store redisstore.Store, avail []string, ttl time.Duration) *Rout
 }
 
 func TestWeightedVirtualCandidatesBiasNewSessions(t *testing.T) {
+	t.Parallel()
+
 	st := newCountingStore()
 	// 一个普通账号 1 个虚拟实例，一个快过期账号 3 个虚拟实例。
 	r := routerWith(st, []string{"regular", "expiring", "expiring", "expiring"}, time.Minute)
@@ -67,13 +70,16 @@ func TestWeightedVirtualCandidatesBiasNewSessions(t *testing.T) {
 	r.Bind("warm-expiring", "expiring")
 
 	counts := map[string]int{}
+
 	const n = 4000
 	for i := range n {
 		key := fmt.Sprintf("session-%d", i)
+
 		uid, ok := r.Resolve(key)
 		if !ok {
 			t.Fatal("Resolve returned !ok")
 		}
+
 		counts[uid]++
 	}
 
@@ -84,55 +90,71 @@ func TestWeightedVirtualCandidatesBiasNewSessions(t *testing.T) {
 }
 
 func TestSameKeySameAccount(t *testing.T) {
+	t.Parallel()
+
 	r := routerWith(newCountingStore(), []string{"a1", "a2"}, time.Minute)
 	u1, ok1 := r.Resolve("c1")
+
 	u2, ok2 := r.Resolve("c1")
 	if !ok1 || !ok2 || u1 != u2 {
 		t.Fatalf("same key should map to same account: %s vs %s", u1, u2)
 	}
+
 	if r.Count() != 1 {
 		t.Errorf("count=%d want 1", r.Count())
 	}
 }
 
 func TestTTLExpiryReassigns(t *testing.T) {
+	t.Parallel()
+
 	st := newCountingStore()
 	r := routerWith(st, []string{"a1", "a2"}, 10*time.Millisecond)
-	u1, _ := r.Resolve("c1")
+	str2, _ := r.Resolve("c1")
+
 	time.Sleep(20 * time.Millisecond)
-	u2, ok := r.Resolve("c1")
+
+	str, ok := r.Resolve("c1")
 	if !ok {
 		t.Fatal("resolve after expiry should still succeed")
 	}
 	// 过期后可重新分配（可能巧合同号，但至少返回有效账号）。
-	_ = u1
-	_ = u2
+	_ = str2
+	_ = str
+
 	if r.Count() != 1 {
 		t.Errorf("count=%d want 1 (reassigned, not duplicated)", r.Count())
 	}
 }
 
 func TestBoundAccountCooldownReassigns(t *testing.T) {
+	t.Parallel()
+
 	r := routerWith(newCountingStore(), []string{"a1"}, time.Minute)
-	u1, _ := r.Resolve("c1")
-	if u1 != "a1" {
-		t.Fatalf("initial bind=%s want a1", u1)
+
+	str, _ := r.Resolve("c1")
+	if str != "a1" {
+		t.Fatalf("initial bind=%s want a1", str)
 	}
 	// a1 冷却 → 可用列表只剩 a2 → 重新分配必须换到 a2。
 	r.cfg.Available = func() []string { return []string{"a2"} }
-	u2, ok := r.Resolve("c1")
+
+	str2, ok := r.Resolve("c1")
 	if !ok {
 		t.Fatal("resolve should succeed with fallback account")
 	}
-	if u2 == u1 {
-		t.Fatalf("bound account %s cooled but still assigned", u1)
+
+	if str2 == str {
+		t.Fatalf("bound account %s cooled but still assigned", str)
 	}
-	if u2 != "a2" {
-		t.Fatalf("reassigned to %s want a2", u2)
+
+	if str2 != "a2" {
+		t.Fatalf("reassigned to %s want a2", str2)
 	}
 }
 
 func TestNoSessionKeyPassthrough(t *testing.T) {
+	t.Parallel()
 	// ExtractKey 找不到任何会话键 → 空串（调用方据空串走普通 Pick；router 不会被调用）。
 	got := ExtractKey([]byte(`{"model":"x","messages":[]}`))
 	if got != "" {
@@ -141,6 +163,8 @@ func TestNoSessionKeyPassthrough(t *testing.T) {
 }
 
 func TestExtractKeyPriority(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		body string
 		want string
@@ -167,37 +191,47 @@ func TestExtractKeyPriority(t *testing.T) {
 }
 
 func TestConcurrentSameKeyAssignsOnce(t *testing.T) {
+	t.Parallel()
+
 	avail := []string{"a1", "a2", "a3", "a4", "a5"}
 	r := routerWith(newCountingStore(), avail, time.Minute)
 
 	const N = 100
+
 	uids := make([]string, N)
+
 	var wg sync.WaitGroup
 	for i := range N {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+
 			u, ok := r.Resolve("same-key")
 			if ok {
 				uids[idx] = u
 			}
 		}(i)
 	}
+
 	wg.Wait()
 
 	// 所有 goroutine 必须拿到同一个账号（写锁 re-check 防重复分配）。
 	first := ""
-	for _, u := range uids {
-		if u == "" {
+
+	for _, str := range uids {
+		if str == "" {
 			t.Fatal("some goroutine failed to resolve")
 		}
+
 		if first == "" {
-			first = u
+			first = str
 		}
-		if u != first {
-			t.Fatalf("concurrent resolve assigned different accounts: %s vs %s", first, u)
+
+		if str != first {
+			t.Fatalf("concurrent resolve assigned different accounts: %s vs %s", first, str)
 		}
 	}
+
 	if r.Count() != 1 {
 		t.Errorf("count=%d want 1 (single binding)", r.Count())
 	}
@@ -208,112 +242,142 @@ func (r *Router) boundUID(key string) (string, bool) {
 	r.mu.RLock()
 	e, ok := r.entries[key]
 	r.mu.RUnlock()
+
 	return e.uid, ok
 }
 
 func TestBindOverridesAndMirrors(t *testing.T) {
+	t.Parallel()
 	// Bind 幂等覆盖旧值，并异步镜像 SetBind。
-	st := newCountingStore()
-	r := routerWith(st, []string{"a1", "a2"}, time.Minute)
+	countingStore2 := newCountingStore()
+	r := routerWith(countingStore2, []string{"a1", "a2"}, time.Minute)
 	r.Bind("c1", "a1")
+
 	if u, ok := r.boundUID("c1"); !ok || u != "a1" {
 		t.Fatalf("bind c1->a1 then bound=%s ok=%v", u, ok)
 	}
 	// 覆盖到 a2
 	r.Bind("c1", "a2")
+
 	if u, _ := r.boundUID("c1"); u != "a2" {
 		t.Fatalf("bind override should map c1->a2, got %s", u)
 	}
+
 	if r.Count() != 1 {
 		t.Errorf("bind override must not duplicate entries, count=%d", r.Count())
 	}
-	st.mu.Lock()
-	n := st.setBinds
+
+	countingStore2.mu.Lock()
+	n := countingStore2.setBinds
 	binds := map[string]string{}
-	for k, v := range st.binds {
-		binds[k] = v
-	}
-	st.mu.Unlock()
+	maps.Copy(binds, countingStore2.binds)
+	countingStore2.mu.Unlock()
+
 	if n != 2 {
 		t.Errorf("SetBind mirror count=%d want 2", n)
 	}
+
 	if binds["c1"] != "a2" {
 		t.Errorf("mirrored bind should be a2, got %s", binds["c1"])
 	}
 }
 
 func TestBindIgnoresEmptyKey(t *testing.T) {
-	st := newCountingStore()
-	r := routerWith(st, []string{"a1"}, time.Minute)
+	t.Parallel()
+
+	countingStore2 := newCountingStore()
+	r := routerWith(countingStore2, []string{"a1"}, time.Minute)
 	r.Bind("", "a1")
 	r.Bind("c1", "")
+
 	if r.Count() != 0 {
 		t.Errorf("Bind with empty key/uid must be no-op, count=%d", r.Count())
 	}
-	st.mu.Lock()
-	n := st.setBinds
-	st.mu.Unlock()
+
+	countingStore2.mu.Lock()
+	n := countingStore2.setBinds
+	countingStore2.mu.Unlock()
+
 	if n != 0 {
 		t.Errorf("empty-key Bind must not mirror, setBinds=%d", n)
 	}
 }
 
 func TestBindThenUnbindLifecycle(t *testing.T) {
-	st := newCountingStore()
-	r := routerWith(st, []string{"a1"}, time.Minute)
+	t.Parallel()
+
+	countingStore2 := newCountingStore()
+	r := routerWith(countingStore2, []string{"a1"}, time.Minute)
 	r.Bind("c1", "a1")
+
 	if !r.Unbind("c1") {
 		t.Fatal("Unbind should report found")
 	}
+
 	if r.Count() != 0 {
 		t.Errorf("count after unbind=%d want 0", r.Count())
 	}
-	st.mu.Lock()
-	del := st.delBinds
-	st.mu.Unlock()
+
+	countingStore2.mu.Lock()
+	del := countingStore2.delBinds
+	countingStore2.mu.Unlock()
+
 	if del != 1 {
 		t.Errorf("DelBind mirror count=%d want 1", del)
 	}
 }
 
 func TestRedisMirrorSetBindCount(t *testing.T) {
-	st := newCountingStore()
-	r := routerWith(st, []string{"a1", "a2"}, time.Minute)
+	t.Parallel()
+
+	countingStore2 := newCountingStore()
+	r := routerWith(countingStore2, []string{"a1", "a2"}, time.Minute)
 	r.Resolve("c1")
 	r.Resolve("c1") // 快路径 touch → 又镜像一次
-	if st.setBinds < 1 {
-		t.Errorf("SetBind mirror count=%d want >=1", st.setBinds)
+
+	if countingStore2.setBinds < 1 {
+		t.Errorf("SetBind mirror count=%d want >=1", countingStore2.setBinds)
 	}
+
 	r.Unbind("c1")
-	if st.delBinds != 1 {
-		t.Errorf("DelBind mirror count=%d want 1", st.delBinds)
+
+	if countingStore2.delBinds != 1 {
+		t.Errorf("DelBind mirror count=%d want 1", countingStore2.delBinds)
 	}
 }
 
 func TestGCCleansExpired(t *testing.T) {
+	t.Parallel()
+
 	st := newCountingStore()
 	r := routerWith(st, []string{"a1"}, 10*time.Millisecond)
 	r.Resolve("c1")
 	r.Resolve("c2")
 	time.Sleep(20 * time.Millisecond)
+
 	removed := r.gcOnce(time.Now())
 	if removed != 2 {
 		t.Errorf("gc removed=%d want 2", removed)
 	}
+
 	if r.Count() != 0 {
 		t.Errorf("count after gc=%d want 0", r.Count())
 	}
 }
 
 func TestLoadFromStoreRestores(t *testing.T) {
+	t.Parallel()
+
 	st := newCountingStore()
 	st.binds["c1"] = "a1"
 	st.binds["c2"] = "a2"
 	r := routerWith(st, []string{"a1", "a2"}, time.Minute)
 	r.LoadFromStore()
+
 	if r.Count() != 2 {
 		t.Fatalf("restored count=%d want 2", r.Count())
 	}
+
 	u, ok := r.Resolve("c1")
 	if !ok || u != "a1" {
 		t.Errorf("restored c1 -> %s want a1", u)
@@ -323,23 +387,27 @@ func TestLoadFromStoreRestores(t *testing.T) {
 // TestExtractKeyDerivedFromContent 客户端不发会话 id 时回退到内容派生键：
 // 同一对话多轮（历史追加）→ 键稳定不变；不同对话 → 键不同。
 func TestExtractKeyDerivedFromContent(t *testing.T) {
+	t.Parallel()
 	// 第一轮
 	turn1 := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"}]}`
 	// 第二轮：历史追加了 assistant 与新的 user（system 与首条 user 不变）
 	turn2 := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"},{"role":"assistant","content":"好的"},{"role":"user","content":"换成快排"}]}`
-	k1, k2 := ExtractKey([]byte(turn1)), ExtractKey([]byte(turn2))
-	if k1 == "" {
+
+	str, key2 := ExtractKey([]byte(turn1)), ExtractKey([]byte(turn2))
+	if str == "" {
 		t.Fatal("derived key should not be empty when messages present")
 	}
-	if k1 != k2 {
-		t.Errorf("derived key must be stable across turns: turn1=%q turn2=%q", k1, k2)
+
+	if str != key2 {
+		t.Errorf("derived key must be stable across turns: turn1=%q turn2=%q", str, key2)
 	}
-	if !strings.HasPrefix(k1, "d-") {
-		t.Errorf("derived key should carry prefix d-: %q", k1)
+
+	if !strings.HasPrefix(str, "d-") {
+		t.Errorf("derived key should carry prefix d-: %q", str)
 	}
 	// 不同对话（首条 user 不同）→ 不同键
 	other := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"翻译这段话"}]}`
-	if ExtractKey([]byte(other)) == k1 {
+	if ExtractKey([]byte(other)) == str {
 		t.Error("different first user message must yield a different derived key")
 	}
 	// 显式 id 优先于派生键
@@ -351,6 +419,7 @@ func TestExtractKeyDerivedFromContent(t *testing.T) {
 	if got := ExtractKey([]byte(`{"model":"x"}`)); got != "" {
 		t.Errorf("no messages should yield empty key, got %q", got)
 	}
+
 	if got := ExtractKey([]byte(`{"messages":[{"role":"user","content":[]}]}`)); got != "" {
 		t.Errorf("text-less content should yield empty key, got %q", got)
 	}
@@ -358,7 +427,10 @@ func TestExtractKeyDerivedFromContent(t *testing.T) {
 
 // TestExtractKeyMultimodalContent 多模态 content 数组取文本部分派生。
 func TestExtractKeyMultimodalContent(t *testing.T) {
+	t.Parallel()
+
 	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`
+
 	k := ExtractKey([]byte(body))
 	if k == "" || !strings.HasPrefix(k, "d-") {
 		t.Fatalf("multimodal text should derive a key, got %q", k)
@@ -371,12 +443,14 @@ func TestExtractKeyMultimodalContent(t *testing.T) {
 	// 纯图片首条 user（无 text part）也应派生非空键（首图会话粘性盲区修复；
 	// 图片只入类型占位，同图重发/换 URL 均同键）。
 	imgOnly := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`
-	k2 := ExtractKey([]byte(imgOnly))
-	if k2 == "" || !strings.HasPrefix(k2, "d-") {
-		t.Fatalf("pure-image first user should derive a key, got %q", k2)
+
+	str := ExtractKey([]byte(imgOnly))
+	if str == "" || !strings.HasPrefix(str, "d-") {
+		t.Fatalf("pure-image first user should derive a key, got %q", str)
 	}
+
 	imgOnly2 := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
-	if ExtractKey([]byte(imgOnly2)) != k2 {
+	if ExtractKey([]byte(imgOnly2)) != str {
 		t.Error("pure-image url changes must keep same derived key")
 	}
 }

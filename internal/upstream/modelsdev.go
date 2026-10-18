@@ -131,6 +131,7 @@ func resetModelsDev() {
 func (f *modelsDevFetcher) lookup(model string) (modelsDevEntry, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	if f.doc != nil {
 		if e, ok := f.doc[model]; ok {
 			return e, true
@@ -138,6 +139,7 @@ func (f *modelsDevFetcher) lookup(model string) (modelsDevEntry, bool) {
 	}
 	// 未命中（索引在但模型不在，或索引尚未就绪）：记 miss。
 	f.recordNegativeMiss(model, time.Now())
+
 	return modelsDevEntry{}, false
 }
 
@@ -156,6 +158,7 @@ func (f *modelsDevFetcher) recordNegativeMiss(model string, now time.Time) {
 	if _, seen := f.negatives[model]; !seen {
 		f.negatives[model] = now
 	}
+
 	f.pruneNegatives(now)
 }
 
@@ -179,11 +182,14 @@ func (f *modelsDevFetcher) pruneNegatives(now time.Time) {
 	// （纯性能优化：负缓存 miss 只会多查一次进程内索引，丢条目无语义影响）。
 	if len(f.negatives) > modelsDevNegativesHardCap {
 		cut := len(f.negatives) - modelsDevNegativesSoftCap
+
 		oldest := make([]string, 0, len(f.negatives))
 		for m := range f.negatives {
 			oldest = append(oldest, m)
 		}
+
 		sort.Slice(oldest, func(i, j int) bool { return f.negatives[oldest[i]].Before(f.negatives[oldest[j]]) })
+
 		for _, m := range oldest[:cut] {
 			delete(f.negatives, m)
 		}
@@ -194,7 +200,9 @@ func (f *modelsDevFetcher) pruneNegatives(now time.Time) {
 func (f *modelsDevFetcher) negativeFresh(model string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
 	t, ok := f.negatives[model]
+
 	return ok && time.Since(t) < modelsDevNegativeTTL
 }
 
@@ -208,6 +216,7 @@ func (f *modelsDevFetcher) ensureDocAsync(client *http.Client, baseOverride stri
 		f.mu.Unlock()
 		return
 	}
+
 	if f.fetched && time.Since(f.lastFetch) < modelsDevFetchCooldown {
 		// 拉取过（成功或失败）且冷却期内：不再打 models.dev。
 		f.mu.Unlock()
@@ -232,43 +241,53 @@ func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 		log.Printf("WARN: [upstream] models.dev fetch: nil client rejected (no DefaultClient fallback, silent fallback to 1M)")
 		return
 	}
+
 	url := ModelsDevURL
 	if baseOverride != "" {
 		url = baseOverride
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), modelsDevTimeout)
 	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		log.Printf("WARN: [upstream] models.dev fetch: build request: %v", err)
 		return
 	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("WARN: [upstream] models.dev fetch failed (silent fallback to 1M): %v", err)
 		return
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("WARN: [upstream] models.dev fetch status %d (silent fallback to 1M)", resp.StatusCode)
 		return
 	}
+
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, modelsDevMaxBody))
 	if err != nil {
 		log.Printf("WARN: [upstream] models.dev fetch read: %v", err)
 		return
 	}
+
 	doc, err := parseModelsDevDoc(raw)
 	if err != nil {
 		log.Printf("WARN: [upstream] models.dev parse failed (silent fallback to 1M): %v", err)
 		return
 	}
+
 	mods, err := parseModelsDevModalities(raw)
 	if err != nil {
 		// 模态索引是能力声明的兜底：解析失败不拖累 context 索引，静默降级。
 		log.Printf("WARN: [upstream] models.dev modalities parse failed (capabilities omitted): %v", err)
+
 		mods = nil
 	}
+
 	f.mu.Lock()
 	f.doc = doc
 	f.modalities = mods
@@ -298,25 +317,31 @@ func parseModelsDevDoc(raw []byte) (map[string]modelsDevEntry, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("models.dev doc: %w", err)
 	}
+
 	byModel := map[string][]modelsDevCandidate{}
+
 	for provider, pv := range doc {
 		for fullID, mv := range pv.Models {
 			if mv.Limit == nil {
 				continue
 			}
+
 			ctx, out := mv.Limit.Context, mv.Limit.Output
 			if !validModelsDevLimit(ctx, out) {
 				continue
 			}
+
 			if id := bareModelID(fullID); id != "" {
 				byModel[id] = accumulateCandidate(byModel[id], provider, ctx, out)
 			}
 		}
 	}
+
 	out := make(map[string]modelsDevEntry, len(byModel))
 	for id, cs := range byModel {
 		out[id] = bestCandidate(cs).entry
 	}
+
 	return out, nil
 }
 
@@ -335,35 +360,41 @@ func validModelsDevLimit(ctx, out int64) bool {
 	if ctx <= 0 || ctx > modelsDevValueMax {
 		return false
 	}
+
 	return out >= 0 && out <= modelsDevValueMax
 }
 
 // bareModelID 从 fullID 取最后一段作为裸模型 id（无 "/" 时即自身）。
 func bareModelID(fullID string) string {
-	if i := strings.LastIndex(fullID, "/"); i >= 0 {
-		return fullID[i+1:]
+	if _, bare, ok := strings.CutLast(fullID, "/"); ok {
+		return bare
 	}
+
 	return fullID
 }
 
 // accumulateCandidate 把 (provider, ctx, out) 并入候选列表：同值聚合投票并维护
 // vendor/minProvider，新值追加候选。
-func accumulateCandidate(cs []modelsDevCandidate, provider string, ctx, out int64) []modelsDevCandidate {
+func accumulateCandidate(modelsDevCandidates []modelsDevCandidate, provider string, ctx, out int64) []modelsDevCandidate {
 	key := fmt.Sprintf("%d/%d", ctx, out)
-	for i := range cs {
-		if cs[i].aggKey != key {
+	for i := range modelsDevCandidates {
+		if modelsDevCandidates[i].aggKey != key {
 			continue
 		}
-		cs[i].votes++
+
+		modelsDevCandidates[i].votes++
 		if modelsDevVendorSources[provider] {
-			cs[i].vendor = true
+			modelsDevCandidates[i].vendor = true
 		}
-		if provider < cs[i].minProvider {
-			cs[i].minProvider = provider
+
+		if provider < modelsDevCandidates[i].minProvider {
+			modelsDevCandidates[i].minProvider = provider
 		}
-		return cs
+
+		return modelsDevCandidates
 	}
-	return append(cs, modelsDevCandidate{
+
+	return append(modelsDevCandidates, modelsDevCandidate{
 		entry:       modelsDevEntry{Context: ctx, Output: out},
 		vendor:      modelsDevVendorSources[provider],
 		votes:       1,
@@ -374,28 +405,32 @@ func accumulateCandidate(cs []modelsDevCandidate, provider string, ctx, out int6
 
 // bestCandidate 按优先级选最佳候选：官方 vendor 源 > 票数众数 > provider 字典序
 // （tie-break 确定性）。
-func bestCandidate(cs []modelsDevCandidate) modelsDevCandidate {
+func bestCandidate(modelsDevCandidates2 []modelsDevCandidate) modelsDevCandidate {
 	best := 0
-	for i, c := range cs {
-		if candidateBetter(c, cs[best]) {
+	for i, c := range modelsDevCandidates2 {
+		if candidateBetter(c, modelsDevCandidates2[best]) {
 			best = i
 		}
 	}
-	return cs[best]
+
+	return modelsDevCandidates2[best]
 }
 
 // candidateBetter 报告 c 是否优于 cur（官方 vendor 源 > 票数众数 > provider 字典序）。
-func candidateBetter(c, cur modelsDevCandidate) bool {
-	if c.vendor && !cur.vendor {
+func candidateBetter(modelsDevCandidate2, cur modelsDevCandidate) bool {
+	if modelsDevCandidate2.vendor && !cur.vendor {
 		return true
 	}
-	if c.vendor != cur.vendor {
+
+	if modelsDevCandidate2.vendor != cur.vendor {
 		return false
 	}
-	if c.votes != cur.votes {
-		return c.votes > cur.votes
+
+	if modelsDevCandidate2.votes != cur.votes {
+		return modelsDevCandidate2.votes > cur.votes
 	}
-	return c.minProvider < cur.minProvider
+
+	return modelsDevCandidate2.minProvider < cur.minProvider
 }
 
 // parseModelsDevModalities 解析 models.dev 文档的 modalities.input（issue #109）。
@@ -414,27 +449,34 @@ func parseModelsDevModalities(raw []byte) (map[string][]string, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("models.dev doc: %w", err)
 	}
+
 	best := map[string]modelsDevModalityPick{}
+
 	for provider, pv := range doc {
-		for fullID, mv := range pv.Models {
-			if mv.Modalities == nil || len(mv.Modalities.Input) == 0 {
+		for strVal, item := range pv.Models {
+			if item.Modalities == nil || len(item.Modalities.Input) == 0 {
 				continue
 			}
-			id := bareModelID(fullID)
+
+			id := bareModelID(strVal)
 			if id == "" {
 				continue
 			}
+
 			cur, seen := best[id]
 			if seen && !modalityPickBeats(provider, cur) {
 				continue
 			}
-			best[id] = modelsDevModalityPick{mods: mv.Modalities.Input, vendor: modelsDevVendorSources[provider], provider: provider}
+
+			best[id] = modelsDevModalityPick{mods: item.Modalities.Input, vendor: modelsDevVendorSources[provider], provider: provider}
 		}
 	}
+
 	out := make(map[string][]string, len(best))
 	for id, p := range best {
 		out[id] = p.mods
 	}
+
 	return out, nil
 }
 
@@ -465,12 +507,15 @@ func modalityPickBeats(provider string, cur modelsDevModalityPick) bool {
 func lookupModelsDevModalities(model string) ([]string, bool) {
 	modelsDev.mu.Lock()
 	defer modelsDev.mu.Unlock()
+
 	if modelsDev.modalities == nil {
 		return nil, false
 	}
+
 	mods, ok := modelsDev.modalities[model]
 	if !ok || len(mods) == 0 {
 		return nil, false
 	}
+
 	return mods, true
 }

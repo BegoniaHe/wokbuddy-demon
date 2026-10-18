@@ -22,6 +22,7 @@ type degradeGate struct {
 func (g *degradeGate) Active() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	return time.Now().Before(g.until)
 }
 
@@ -30,6 +31,7 @@ func (g *degradeGate) Active() bool {
 func (g *degradeGate) Trigger() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	if !time.Now().Before(g.until) {
 		// 已过期/未触发 → 设新的 until；未过期则保持原 until（不续期）。
 		g.until = nextMidnightCST(time.Now())
@@ -47,9 +49,11 @@ func nextMidnightCST(now time.Time) time.Time {
 	cst := time.FixedZone("CST", 8*60*60)
 	// 把 now 转到 CST 视角取当天 00:00，再加一天；若该 00:00 <= now 则再加一天。
 	y, m, d := now.In(cst).Date()
+
 	midnight := time.Date(y, m, d, 0, 0, 0, 0, cst)
 	for !midnight.After(now) {
 		midnight = midnight.Add(24 * time.Hour)
 	}
+
 	return midnight
 }

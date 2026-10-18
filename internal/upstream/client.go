@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +25,19 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+)
+
+var (
+	errDoJSONLimitFailed            = errors.New("doJSONLimit failed")
+	errNoRefreshToken               = errors.New("no refreshToken")
+	errRefreshFailedNoAccessTokenIn = errors.New("refresh_failed: no accessToken in response — re-login required")
+	errModelsAPIReturnedEmptyList   = errors.New("models api returned empty list")
+	errFetchEnterpriseModelsFailed  = errors.New("fetchEnterpriseModels failed")
+	errParseEnterpriseModelsFailed  = errors.New("parseEnterpriseModels failed")
+	errNoCLIAgentModelsFound        = errors.New("no cli agent models found")
+	errV3ConfigReturnedEmptyModels  = errors.New("v3/config returned empty models")
+	errFetchV3ConfigModelMapFailed  = errors.New("fetchV3ConfigModelMap failed")
+	errParseV3ConfigEnvFailed       = errors.New("parseV3ConfigEnv failed")
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -67,6 +82,7 @@ func (k ErrKind) String() string {
 	if name, ok := errKindNames[k]; ok {
 		return name
 	}
+
 	return "none"
 }
 
@@ -269,14 +285,17 @@ func IsModelBlocked(status int, body string) bool {
 	if !strings.Contains(body, modelBlockCode) && !strings.Contains(strings.ToLower(body), modelBlockMsgMarker) {
 		return false
 	}
+
 	var root map[string]any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
 		return false
 	}
+
 	code, msg := modelBlockFields(root)
 	if code == modelBlockCode {
 		return true
 	}
+
 	return strings.Contains(strings.ToLower(msg), modelBlockMsgMarker)
 }
 
@@ -287,10 +306,12 @@ func modelBlockFields(root map[string]any) (code, msg string) {
 	if inner, ok := root["error"].(map[string]any); ok {
 		nodes = append(nodes, inner)
 	}
+
 	for _, node := range nodes {
 		code = firstCodeField(node, code)
 		msg = firstMsgField(node, msg)
 	}
+
 	return code, msg
 }
 
@@ -300,6 +321,7 @@ func firstCodeField(node map[string]any, current string) string {
 	if current != "" {
 		return current
 	}
+
 	for _, key := range []string{"code", "errCode", "error_code"} {
 		if v, ok := node[key]; ok && v != nil {
 			// 空串（含纯空白）不算命中：继续尝试同节点内的后备键，与旧内联循环
@@ -310,6 +332,7 @@ func firstCodeField(node map[string]any, current string) string {
 			}
 		}
 	}
+
 	return current
 }
 
@@ -319,6 +342,7 @@ func firstMsgField(node map[string]any, current string) string {
 	if current != "" {
 		return current
 	}
+
 	for _, key := range []string{"msg", "message"} {
 		if v, ok := node[key].(string); ok && v != "" {
 			// 纯空白串 TrimSpace 后为空不算命中：继续尝试同节点内的后备键，与旧内联
@@ -328,6 +352,7 @@ func firstMsgField(node map[string]any, current string) string {
 			}
 		}
 	}
+
 	return current
 }
 
@@ -339,27 +364,30 @@ func hasBusinessCode(body, want string) bool {
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
 		return false
 	}
+
 	var walk func(any) bool
+
 	walk = func(value any) bool {
 		switch node := value.(type) {
 		case map[string]any:
 			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
 				return true
 			}
+
 			for _, child := range node {
 				if walk(child) {
 					return true
 				}
 			}
 		case []any:
-			for _, child := range node {
-				if walk(child) {
-					return true
-				}
+			if slices.ContainsFunc(node, walk) {
+				return true
 			}
 		}
+
 		return false
 	}
+
 	return walk(root)
 }
 
@@ -397,22 +425,27 @@ const retryAfterSanity = 2 * time.Hour
 // 全部不可用返回 false（调用方回落既有计算值，绝不臆造等待时长）。
 func ParseRetryAfter(h http.Header) (time.Duration, bool) {
 	for _, name := range retryAfterHeaderCandidates {
-		v := strings.TrimSpace(h.Get(name))
-		if v == "" {
+		str := strings.TrimSpace(h.Get(name))
+		if str == "" {
 			continue
 		}
-		if !isAllDigits(v) {
+
+		if !isAllDigits(str) {
 			continue // 非纯数字（如 HTTP-Date）不解析，宁缺毋滥
 		}
-		n, ok := parseRetryNumber(v, name)
+
+		n, ok := parseRetryNumber(str, name)
 		if !ok {
 			continue
 		}
+
 		if n <= 0 || n > retryAfterSanity {
 			continue // 非正/异常大：丢弃（回落本地计算）
 		}
+
 		return n, true
 	}
+
 	return 0, false
 }
 
@@ -421,11 +454,13 @@ func isAllDigits(s string) bool {
 	if s == "" {
 		return false
 	}
+
 	for _, r := range s {
 		if r < '0' || r > '9' {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -433,15 +468,17 @@ func isAllDigits(s string) bool {
 // epoch 时刻而非时长：秒口径（10 位）与毫秒口径（13 位）都按「now+ 该时刻
 // 的剩余量」折算，已在过去则不可用。位数不足（8 位以下）无法判定 epoch
 // 语义的丢弃（宁缺毋滥：短串多半是序号之类的误用头）。
-func parseRetryNumber(v, headerName string) (time.Duration, bool) {
+func parseRetryNumber(str, headerName string) (time.Duration, bool) {
 	// 上限 16 位防 int64 溢出（超过 epoch 毫秒的现实量级必非法）。
-	if len(v) > 16 {
+	if len(str) > 16 {
 		return 0, false
 	}
+
 	var n int64
-	for _, r := range v {
+	for _, r := range str {
 		n = n*10 + int64(r-'0')
 	}
+
 	switch headerName {
 	case "Retry-After":
 		// 先做上限校验再乘 time.Second：16 位数字乘 1e9 会溢出 int64 回绕成
@@ -449,18 +486,22 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 		if n > int64(retryAfterSanity/time.Second) {
 			return 0, false
 		}
+
 		return time.Duration(n) * time.Second, true
 	case "Retry-After-Ms":
 		if n > int64(retryAfterSanity/time.Millisecond) {
 			return 0, false
 		}
+
 		return time.Duration(n) * time.Millisecond, true
 	default: // X-Ratelimit-Reset：epoch → 剩余量
 		sec := n
-		if len(v) >= 12 { // 毫秒口径（13 位）；11 位边界按秒（误判代价是多算 1000 倍）
+		if len(str) >= 12 { // 毫秒口径（13 位）；11 位边界按秒（误判代价是多算 1000 倍）
 			sec = n / 1000
 		}
+
 		remain := time.Until(time.Unix(sec, 0))
+
 		return remain, true
 	}
 }
@@ -480,15 +521,19 @@ func ParseRateReset(body string) (time.Time, bool) {
 	if len(m) < 2 {
 		m = reSoftRateResetEN.FindStringSubmatch(body)
 	}
+
 	if len(m) < 2 {
 		return time.Time{}, false
 	}
+
 	ts := strings.TrimSpace(m[1])
 	ts = strings.TrimSuffix(ts, " UTC+8") // 去掉后缀，固定按 softRateResetLoc 解释
+
 	t, err := time.ParseInLocation(softRateTimeLayout, ts, softRateResetLoc)
 	if err != nil {
 		return time.Time{}, false
 	}
+
 	return t, true
 }
 
@@ -537,6 +582,7 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
+
 	lower := strings.ToLower(body)
 	// sessionDead / accountFault 先于 status==429：账号级终态等不来自愈，限流状态码
 	// 不得掩盖它们（429+14017 必须 accountFault，401+12153 混排 "rate limit" 必须
@@ -544,9 +590,11 @@ func Classify(status int, body string) ErrKind {
 	if kind, ok := classifySessionOrAccount(lower, body); ok {
 		return kind
 	}
+
 	if kind, ok := classifyRateLimit(status, body); ok {
 		return kind
 	}
+
 	if kind, ok := classifyBillingOrRate(lower, body); ok {
 		return kind
 	}
@@ -556,9 +604,11 @@ func Classify(status int, body string) ErrKind {
 	if kind, ok := classifyPromptTooLong(status, lower, body); ok {
 		return kind
 	}
+
 	if kind, ok := classifyStatusFallback(status, body); ok {
 		return kind
 	}
+
 	if kind, ok := classifyGeneric4xx(status, lower, body); ok {
 		return kind
 	}
@@ -575,9 +625,11 @@ func classifySessionOrAccount(lower, body string) (ErrKind, bool) {
 			return ErrSessionDead, true
 		}
 	}
+
 	if containsAnyDual(lower, body, accountFaultMarkers) {
 		return ErrAccountFault, true
 	}
+
 	return ErrNone, false
 }
 
@@ -595,9 +647,11 @@ func classifyRateLimit(status int, body string) (ErrKind, bool) {
 	if status != http.StatusTooManyRequests {
 		return ErrNone, false
 	}
+
 	if hasBusinessCode(body, "14018") {
 		return ErrHardCredit, true
 	}
+
 	return ErrSoftRate, true
 }
 
@@ -607,6 +661,7 @@ func classifyPromptTooLong(status int, lower, body string) (ErrKind, bool) {
 	if isPromptTooLongStatus(status) && isPromptTooLongBody(lower, body) {
 		return ErrPromptTooLong, true
 	}
+
 	return ErrNone, false
 }
 
@@ -620,12 +675,15 @@ func classifyStatusFallback(status int, body string) (ErrKind, bool) {
 	if status == http.StatusNotFound {
 		return ErrNotFound, true
 	}
+
 	if status >= 500 {
 		return ErrServer, true
 	}
+
 	if IsWafBlocked(status, body) {
 		return ErrWafBlock, true
 	}
+
 	return ErrNone, false
 }
 
@@ -635,9 +693,11 @@ func classifyBillingOrRate(lower, body string) (ErrKind, bool) {
 	if containsAnyDual(lower, body, hardMarkers) {
 		return ErrHardCredit, true
 	}
+
 	if containsAnyDual(lower, body, softRateMarkers) {
 		return ErrSoftRate, true
 	}
+
 	return ErrNone, false
 }
 
@@ -648,6 +708,7 @@ func containsAnyDual(lower, body string, markers []string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -659,6 +720,7 @@ func isPromptTooLongBody(lower, body string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -670,9 +732,11 @@ func isImageInvalid(status int, lower string) bool {
 	if status != http.StatusBadRequest {
 		return false
 	}
+
 	if codeMarker(lower, "11135") {
 		return true
 	}
+
 	return containsAnyLower(lower, invalidImageMarkers)
 }
 
@@ -683,6 +747,7 @@ func containsAnyLower(lower string, markers []string) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -693,6 +758,7 @@ func classifyGeneric4xx(status int, lower, body string) (ErrKind, bool) {
 	if isImageInvalid(status, lower) {
 		return ErrImageInvalid, true
 	}
+
 	if status < http.StatusBadRequest {
 		return ErrNone, false
 	}
@@ -710,6 +776,7 @@ func classifyGeneric4xx(status int, lower, body string) (ErrKind, bool) {
 	if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 		return ErrBadParams, true
 	}
+
 	return ErrClient, true
 }
 
@@ -825,7 +892,7 @@ type Client struct {
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
 	tr := newTransport()
-	c := &Client{
+	client := &Client{
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		ChatBaseCN:    "https://copilot.tencent.com",
@@ -835,8 +902,9 @@ func New() *Client {
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
 	}
-	c.SanitizeFingerprints.Store(true)
-	return c
+	client.SanitizeFingerprints.Store(true)
+
+	return client
 }
 
 // SetDialer 替换出站底层拨号器（代理池接入点，issue #15）。base 为 nil 时回落
@@ -846,17 +914,21 @@ func (c *Client) SetDialer(base func(ctx context.Context, network, addr string) 
 	if base == nil {
 		base = newDialer().DialContext
 	}
-	wt := writeTimeout
+
+	duration := writeTimeout
+
 	wrap := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := base(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		return &writeDeadlineConn{Conn: conn, writeTimeout: wt}, nil
+
+		return &writeDeadlineConn{Conn: conn, writeTimeout: duration}, nil
 	}
 	if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
 		tr.DialContext = wrap
 	}
+
 	if c.ChatHTTP != nil {
 		if tr, ok := c.ChatHTTP.Transport.(*http.Transport); ok {
 			tr.DialContext = wrap
@@ -869,6 +941,7 @@ func (c *Client) chatHTTP() *http.Client {
 	if c.ChatHTTP != nil {
 		return c.ChatHTTP
 	}
+
 	return c.HTTP
 }
 
@@ -880,6 +953,7 @@ func (c *Client) globalChatBase() string {
 	if c.ChatBaseGlobal != "" {
 		return c.ChatBaseGlobal
 	}
+
 	return defaultGlobalBase
 }
 
@@ -888,6 +962,7 @@ func (c *Client) globalBillingBase() string {
 	if c.BillingBaseGlobal != "" {
 		return c.BillingBaseGlobal
 	}
+
 	return defaultGlobalBase
 }
 
@@ -926,6 +1001,7 @@ func (c *Client) billingMeterPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
 		return []string{billingMeterPath, billingMeterPathV2}
 	}
+
 	return []string{billingMeterPathV2}
 }
 
@@ -934,6 +1010,7 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
 		return []string{dailyCheckinPath, dailyCheckinPathV2}
 	}
+
 	return []string{dailyCheckinPathV2}
 }
 
@@ -941,6 +1018,7 @@ func (c *Client) chatBase(a *auth.Auth) string {
 	if c.globalOn(a) {
 		return c.globalChatBase()
 	}
+
 	return c.ChatBaseCN
 }
 
@@ -954,10 +1032,12 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		// （issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
+
 	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
+
 	return body
 }
 
@@ -967,10 +1047,12 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 func (c *Client) effortsSnapshot(realm string) map[string][]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
+
 	bucket := c.efforts[realmKey(realm)]
 	if len(bucket) == 0 {
 		return nil
 	}
+
 	return bucket
 }
 
@@ -980,10 +1062,12 @@ func (c *Client) effortsSnapshot(realm string) map[string][]string {
 func (c *Client) defaultEffortsSnapshot(realm string) map[string]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
+
 	bucket := c.defaultEfforts[realmKey(realm)]
 	if len(bucket) == 0 {
 		return nil
 	}
+
 	return bucket
 }
 
@@ -992,6 +1076,7 @@ func realmKey(realm string) string {
 	if realm == "" {
 		return "cn"
 	}
+
 	return realm
 }
 
@@ -999,6 +1084,7 @@ func (c *Client) billingBase(a *auth.Auth) string {
 	if c.globalOn(a) {
 		return c.globalBillingBase()
 	}
+
 	return c.BillingBaseCN
 }
 
@@ -1008,9 +1094,11 @@ func (c *Client) webBase(a *auth.Auth) string {
 	if c.globalOn(a) {
 		return defaultGlobalBase
 	}
+
 	if c.WebBaseCN != "" {
 		return c.WebBaseCN
 	}
+
 	return "https://www.workbuddy.cn"
 }
 
@@ -1030,33 +1118,41 @@ func (c *Client) doJSONLimit(req *http.Request, maxBytes int64) (json.RawMessage
 	if maxBytes <= 0 {
 		maxBytes = defaultJSONBodyLimit
 	}
+
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("doJSONLimit: %w", err)
 	}
 	defer resp.Body.Close()
+
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
+
 	if int64(len(raw)) > maxBytes {
-		return nil, fmt.Errorf("response body exceeds %d bytes", maxBytes)
+		return nil, fmt.Errorf("response body exceeds %d bytes: %w", maxBytes, errDoJSONLimitFailed)
 	}
+
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 	}
+
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
 	}
+
 	if env.Code != 0 {
 		kind := Classify(resp.StatusCode, env.Msg)
 		if kind == ErrNone {
 			kind = ErrClient
 		}
+
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
 	}
+
 	return env.Data, nil
 }
 
@@ -1079,34 +1175,36 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
 //   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
 //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
-func (c *Client) RefreshToken(a *auth.Auth) error {
+func (c *Client) RefreshToken(account10 *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
-	rtSnapshot, atBefore, err := refreshTokenSnapshot(a)
+	rtSnapshot, atBefore, err := refreshTokenSnapshot(account10)
 	if err != nil {
 		return err
 	}
 
-	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
+	endpoint := c.chatBase(account10) + "/v2/plugin/auth/token/refresh"
+
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
 	if err != nil {
-		return err
+		return fmt.Errorf("RefreshToken: %w", err)
 	}
 	// RefreshHeaders 读取 a 的字段（domain/uid 等）注入请求头——需在锁内取快照值，
 	// 用一个显式逐字段拷贝的临时 auth 构造头（不拷贝 sync.Mutex，避免 vet copies-lock）。
-	a.Lock()
+	account10.Lock()
 	hdrSnapshot := auth.Auth{
-		AccessToken:  a.AccessToken,
+		AccessToken:  account10.AccessToken,
 		RefreshToken: rtSnapshot,
-		ExpiresAt:    a.ExpiresAt,
-		Domain:       a.Domain,
-		UID:          a.UID,
-		EnterpriseID: a.EnterpriseID,
-		Nickname:     a.Nickname,
-		DeviceToken:  a.DeviceToken,
+		ExpiresAt:    account10.ExpiresAt,
+		Domain:       account10.Domain,
+		UID:          account10.UID,
+		EnterpriseID: account10.EnterpriseID,
+		Nickname:     account10.Nickname,
+		DeviceToken:  account10.DeviceToken,
 	}
-	a.Unlock()
+	account10.Unlock()
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
@@ -1114,13 +1212,15 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	if err != nil {
 		return err
 	}
+
 	tok, err := parseRefreshResponse(data)
 	if err != nil {
 		return err
 	}
 
 	// 第 2 段（锁内）：校验快照一致后写回。
-	commitRefreshedToken(a, tok, atBefore, rtSnapshot)
+	commitRefreshedToken(account10, tok, atBefore, rtSnapshot)
+
 	return nil
 }
 
@@ -1139,9 +1239,11 @@ func refreshTokenSnapshot(a *auth.Auth) (rtSnapshot, atBefore string, err error)
 	rtSnapshot = a.RefreshToken
 	atBefore = a.AccessToken
 	a.Unlock()
+
 	if strings.TrimSpace(rtSnapshot) == "" {
-		return "", "", errors.New("no refreshToken")
+		return "", "", errNoRefreshToken
 	}
+
 	return rtSnapshot, atBefore, nil
 }
 
@@ -1149,32 +1251,35 @@ func refreshTokenSnapshot(a *auth.Auth) (rtSnapshot, atBefore string, err error)
 func parseRefreshResponse(data []byte) (refreshTokenResponse, error) {
 	var tok refreshTokenResponse
 	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return refreshTokenResponse{}, errors.New("refresh_failed: no accessToken in response — re-login required")
+		return refreshTokenResponse{}, errRefreshFailedNoAccessTokenIn
 	}
+
 	return tok, nil
 }
 
 // commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
-func commitRefreshedToken(a *auth.Auth, tok refreshTokenResponse, atBefore, rtSnapshot string) {
-	a.Lock()
-	defer a.Unlock()
+func commitRefreshedToken(account4 *auth.Auth, tok refreshTokenResponse, atBefore, rtSnapshot string) {
+	account4.Lock()
+	defer account4.Unlock()
 	// 写回守卫是 AND 语义：锁外期间另一刷新已完成 → 两 token 必同时变化（实测 R-D：
 	// refresh 响应 accessToken/refreshToken 总是一起 rotate，写回也同时写两个），AND
 	// 即「并发刷新已完成」判据；AND 与 OR 在真实形态下等价。唯 OR 会额外放弃的
 	// 「只有单 token 变化」（如手工只改 auth 文件一个字段）不构成放弃条件——本次
 	// 结果覆盖手工编辑。
-	if a.AccessToken != atBefore && a.RefreshToken != rtSnapshot {
+	if account4.AccessToken != atBefore && account4.RefreshToken != rtSnapshot {
 		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
 		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
 		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
 		return
 	}
-	a.AccessToken = tok.AccessToken
+
+	account4.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
-		a.RefreshToken = tok.RefreshToken
+		account4.RefreshToken = tok.RefreshToken
 	}
+
 	if tok.Domain != "" {
-		a.Domain = tok.Domain
+		account4.Domain = tok.Domain
 	}
 	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
 	// 实测 R-D 响应恒带 expiresIn=5184000（60d）——缺省分支仅为防御，保留旧值
@@ -1183,7 +1288,7 @@ func commitRefreshedToken(a *auth.Auth, tok refreshTokenResponse, atBefore, rtSn
 	// 照写会把 ExpiresAt 推到荒谬未来 → NeedsRefresh 永假 → token 永不刷新
 	// 反而真过期失效。
 	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
-		a.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+		account4.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
 	}
 }
 
@@ -1193,7 +1298,12 @@ func commitRefreshedToken(a *auth.Auth, tok refreshTokenResponse, atBefore, rtSn
 //
 // global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
 // （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
-func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStream(
+	a *auth.Auth,
+	body []byte,
+	clientIP string,
+	meta ChatMeta,
+) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
 }
 
@@ -1219,46 +1329,55 @@ func modelFromBody(body []byte) string {
 	var peek struct {
 		Model string `json:"model"`
 	}
+
 	_ = json.Unmarshal(body, &peek)
+
 	return peek.Model
 }
 
 func (c *Client) ChatStreamContext(
-	ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta,
+	ctx context.Context, account3 *auth.Auth, body []byte, clientIP string, meta ChatMeta,
 ) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
-	if c.globalOn(a) {
+
+	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID)
+	if c.globalOn(account3) {
 		prepared = ensureConsoleSystem(prepared)
 	}
-	headerTimeout, idleTimeout := c.modelTimeout(a.Realm(), modelFromBody(prepared))
-	chatHTTP := c.chatHTTPForAccount(a, headerTimeout)
+
+	headerTimeout, idleTimeout := c.modelTimeout(account3.Realm(), modelFromBody(prepared))
+	chatHTTP := c.chatHTTPForAccount(account3, headerTimeout)
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
-	for _, path := range c.chatPaths(a) {
-		endpoint := c.chatBase(a) + path
+	for _, path := range c.chatPaths(account3) {
+		endpoint := c.chatBase(account3) + path
+
 		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, endpoint, bytes.NewReader(prepared))
 		if err != nil {
-			return nil, 0, nil, err
+			return nil, 0, nil, fmt.Errorf("ChatStreamContext: %w", err)
 		}
-		c.ChatHeaders(req, a, clientIP, meta)
+
+		c.ChatHeaders(req, account3, clientIP, meta)
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
+
 		resp, err := chatHTTP.Do(req)
 		if err != nil {
 			cancel()
-			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
+			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(account3.UID, account3.NicknameValue()), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
 			roundTripCloseIdle(chatHTTP.Transport)
-			return nil, 0, nil, err
+
+			return nil, 0, nil, fmt.Errorf("ChatStreamContext: %w", err)
 		}
+
 		if resp.StatusCode >= 400 {
 			raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
@@ -1266,22 +1385,25 @@ func (c *Client) ChatStreamContext(
 			// body 读失败（掐流/截断）→ 传输层错误：半截 raw 不交回调用方进 Classify，
 			// 否则 handler 侧 applyErrorPolicy 会按误判分类罚号。
 			if rerr != nil {
-				log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v", logfmt.Label(a.UID, a.Nickname), rerr)
+				log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v", logfmt.Label(account3.UID, account3.NicknameValue()), rerr)
 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
 			}
+
 			kind := Classify(resp.StatusCode, string(raw))
 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
-				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, redactForLog(string(raw), 200))
+				logfmt.Label(account3.UID, account3.NicknameValue()), resp.StatusCode, kind, redactForLog(string(raw), 200))
 			// ≥400 直接返回（#119 后 global 单路径 /v2，chat 层无 fallback 链）。
 			// 分类一次、随 Kind 信封返回（含 Retry-After 头解析）：
 			// ErrNone 是防御分支（≥400 不应产生 None），返回原文让 handler 兜底。
 			if kind == ErrNone {
 				return nil, resp.StatusCode, raw, nil
 			}
+
 			ue := &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 			if d, ok := ParseRetryAfter(resp.Header); ok {
 				ue.RetryAfter = d
 			}
+
 			return nil, resp.StatusCode, raw, ue
 		}
 		// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
@@ -1290,6 +1412,7 @@ func (c *Client) ChatStreamContext(
 		//nolint:staticcheck // chatPaths 当前恒单元素，循环保留以支持未来多路径回退
 		return monitorBody(resp.Body, idleTimeout, cancel), resp.StatusCode, nil, nil
 	}
+
 	panic("unreachable: chatPaths is never empty") // for range 空集时编译器仍要求兜底 return；chatPaths 恒非空（构造保证），永不触达
 }
 
@@ -1306,12 +1429,15 @@ func (c *Client) modelTimeout(realm, model string) (header, idle time.Duration) 
 	if model == "" {
 		return header, idle
 	}
+
 	if t, ok := c.ModelTimeouts[realm+":"+model]; ok {
 		return applyTimeout(t, header, idle)
 	}
+
 	if t, ok := c.ModelTimeouts[model]; ok {
 		return applyTimeout(t, header, idle)
 	}
+
 	return header, idle
 }
 
@@ -1320,73 +1446,91 @@ func applyTimeout(t ModelTimeout, header, idle time.Duration) (time.Duration, ti
 	if t.Header > 0 {
 		header = t.Header
 	}
+
 	if t.Idle > 0 {
 		idle = t.Idle
 	}
+
 	return header, idle
 }
 
 // chatHTTPForHeader 返回 header 超时为 d 的 chat client：等于全局值时复用原 client，
 // 否则缓存一份 Transport 克隆（连接池按超时值隔离，仍复用同一拨号/代理配置）。
-func (c *Client) chatHTTPForHeader(d time.Duration) *http.Client {
+func (c *Client) chatHTTPForHeader(duration time.Duration) *http.Client {
 	base := c.chatHTTP()
-	if d <= 0 || d == c.HeaderTimeout {
+	if duration <= 0 || duration == c.HeaderTimeout {
 		return base
 	}
+
 	c.timeoutMu.Lock()
 	defer c.timeoutMu.Unlock()
+
 	if c.timeoutClients == nil {
 		c.timeoutClients = map[time.Duration]*http.Client{}
 	}
-	if client := c.timeoutClients[d]; client != nil {
+
+	if client := c.timeoutClients[duration]; client != nil {
 		return client
 	}
+
 	tr, ok := base.Transport.(*http.Transport)
 	if !ok {
 		return base
 	}
+
 	cloned := tr.Clone()
-	cloned.ResponseHeaderTimeout = d
+	cloned.ResponseHeaderTimeout = duration
 	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
-	c.timeoutClients[d] = client
+	c.timeoutClients[duration] = client
+
 	return client
 }
 
 // chatHTTPForAccount 返回账号代理槽专用的 chat client（issue #96）。未绑定槽
 // 或未配置路由时回落到默认 client；每个槽使用独立 Transport，连接池不跨账号共享。
-func (c *Client) chatHTTPForAccount(a *auth.Auth, d time.Duration) *http.Client {
-	base := c.chatHTTPForHeader(d)
-	if c.AccountRoute == nil || a == nil {
+func (c *Client) chatHTTPForAccount(account5 *auth.Auth, duration2 time.Duration) *http.Client {
+	base := c.chatHTTPForHeader(duration2)
+	if c.AccountRoute == nil || account5 == nil {
 		return base
 	}
-	slot, dial := c.AccountRoute(a)
+
+	slot, dial := c.AccountRoute(account5)
 	if slot == "" || dial == nil {
 		return base
 	}
-	key := slot + "|" + d.String()
+
+	key := slot + "|" + duration2.String()
+
 	c.slotMu.Lock()
 	defer c.slotMu.Unlock()
+
 	if client := c.slotClients[key]; client != nil {
 		return client
 	}
+
 	tr, ok := base.Transport.(*http.Transport)
 	if !ok {
 		return base
 	}
+
 	cloned := tr.Clone()
-	wt := writeTimeout
+	duration := writeTimeout
 	cloned.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, err := dial(ctx, network, addr)
 		if err != nil {
 			return nil, err
 		}
-		return &writeDeadlineConn{Conn: conn, writeTimeout: wt}, nil
+
+		return &writeDeadlineConn{Conn: conn, writeTimeout: duration}, nil
 	}
 	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
+
 	if c.slotClients == nil {
 		c.slotClients = map[string]*http.Client{}
 	}
+
 	c.slotClients[key] = client
+
 	return client
 }
 
@@ -1468,11 +1612,12 @@ type dynModelEntry struct {
 
 // modelInfo 按解析条目构造 ModelInfo（dynEntry→ModelInfo 映射的单一事实来源）。
 // defaultEffort 新老双键兼容：defaultEffort 优先，缺省回落 effort。
-func (m dynModelEntry) modelInfo() ModelInfo {
+func (m *dynModelEntry) modelInfo() ModelInfo {
 	def := m.Reasoning.DefaultEffort
 	if def == "" {
 		def = m.Reasoning.Effort
 	}
+
 	return ModelInfo{
 		ID:                 m.ID,
 		Name:               m.Name,
@@ -1515,15 +1660,18 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 			return true
 		}
 	}
+
 	if maxOutputTokens > 0 && maxOutputTokens <= 256 {
 		return true
 	}
+
 	for _, t := range tags {
 		switch t {
 		case "text-to-image", "image-to-image", "text-to-video", "image-to-video":
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -1553,38 +1701,46 @@ const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 // v3 条目优先（credits 等字段以 v3 为准），企业端点只补 v3 缺失的模型。
 // /v3 失败（400/网络错/解析失败）不拖累企业端点结果——降级为仅企业端点，warn 日志；
 // 反之亦然（两路独立容错）。
-func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 	type probeResult struct {
 		infos []ModelInfo
 		err   error
 	}
+
 	enterpriseCh := make(chan probeResult, 1)
 	v3Ch := make(chan probeResult, 1)
+
 	go func() {
-		infos, err := c.fetchEnterpriseModels(a)
+		infos, err := c.fetchEnterpriseModels(account9)
 		enterpriseCh <- probeResult{infos, err}
 	}()
 	go func() {
-		infos, err := c.fetchV3Models(a)
+		infos, err := c.fetchV3Models(account9)
 		v3Ch <- probeResult{infos, err}
 	}()
+
 	enterprise := <-enterpriseCh
-	v3 := <-v3Ch
-	if enterprise.err != nil && v3.err != nil {
+
+	probeResult2 := <-v3Ch
+	if enterprise.err != nil && probeResult2.err != nil {
 		return nil, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
 	}
-	if v3.err != nil {
+
+	if probeResult2.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
-		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", v3.err)
+		log.Printf("WARN: [upstream] fetch models: v3/config probe failed (degraded to enterprise endpoint): %v", probeResult2.err)
 	}
+
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
 	}
-	out := mergeModelInfos(v3.infos, enterprise.infos)
+
+	out := mergeModelInfos(probeResult2.infos, enterprise.infos)
 	if len(out) == 0 {
-		return nil, errors.New("models api returned empty list")
+		return nil, errModelsAPIReturnedEmptyList
 	}
-	c.storeModelRates(a.Realm(), out)
+
+	c.storeModelRates(account9.Realm(), out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
 	cache, defCache := buildEffortCaches(out)
@@ -1592,7 +1748,8 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		return out, nil
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.storeEfforts(a.Realm(), cache, defCache)
+	c.storeEfforts(account9.Realm(), cache, defCache)
+
 	return out, nil
 }
 
@@ -1600,15 +1757,19 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 // 有 defaultEffort 的入 defCache（供请求体降级）。
 func buildEffortCaches(out []ModelInfo) (cache map[string][]string, defCache map[string]string) {
 	cache = make(map[string][]string, len(out))
+
 	defCache = make(map[string]string, len(out))
-	for _, mi := range out {
-		if len(mi.Efforts) > 0 {
-			cache[mi.ID] = mi.Efforts
+	for i := range out {
+		modelInfo := &out[i]
+		if len(modelInfo.Efforts) > 0 {
+			cache[modelInfo.ID] = modelInfo.Efforts
 		}
-		if mi.DefaultEffort != "" {
-			defCache[mi.ID] = mi.DefaultEffort
+
+		if modelInfo.DefaultEffort != "" {
+			defCache[modelInfo.ID] = modelInfo.DefaultEffort
 		}
 	}
+
 	return cache, defCache
 }
 
@@ -1620,58 +1781,74 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 	if len(secondary) == 0 {
 		return primary
 	}
+
 	seen := make(map[string]bool, len(primary)+len(secondary))
+
 	out := make([]ModelInfo, 0, len(primary)+len(secondary))
-	for _, mi := range primary {
-		if mi.ID == "" || seen[mi.ID] {
+	for i := range primary {
+		modelInfo := &primary[i]
+		if modelInfo.ID == "" || seen[modelInfo.ID] {
 			continue
 		}
-		seen[mi.ID] = true
-		out = append(out, mi)
+
+		seen[modelInfo.ID] = true
+		out = append(out, *modelInfo)
 	}
-	for _, mi := range secondary {
-		if mi.ID == "" || seen[mi.ID] {
+
+	for i := range secondary {
+		modelInfo2 := &secondary[i]
+		if modelInfo2.ID == "" || seen[modelInfo2.ID] {
 			continue
 		}
-		seen[mi.ID] = true
-		out = append(out, mi)
+
+		seen[modelInfo2.ID] = true
+		out = append(out, *modelInfo2)
 	}
+
 	return out
 }
 
 // fetchEnterpriseModels 单路探测企业模型端点（/console/enterprises/personal/models）。
 // 解析口径：agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除。
-func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
+func (c *Client) fetchEnterpriseModels(account7 *auth.Auth) ([]ModelInfo, error) {
 	// 局部变量名避开 url（本包已 import net/url，同名会造成阅读混淆）。
-	endpoint := c.chatBase(a) + "/console/enterprises/personal/models"
+	endpoint := c.chatBase(account7) + "/console/enterprises/personal/models"
+
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetchEnterpriseModels: %w", err)
 	}
-	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
+
+	c.CommonHeaders(req, account7) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	req.Header.Set("Authorization", "Bearer "+account7.AccessTokenValue())
+
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetchEnterpriseModels: %w", err)
 	}
 	defer resp.Body.Close()
+
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		// 读失败 → 传输层错误（handler 侧该路径不 NoteError）。
 		return nil, fmt.Errorf("read body: %w", err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, fmt.Errorf("models api status %d: %s: %w", resp.StatusCode, truncate(string(raw), 120), errFetchEnterpriseModelsFailed)
 	}
+
 	cliIDs, dynMap, err := parseEnterpriseModels(raw)
 	if err != nil {
 		return nil, err
 	}
+
 	out := collectEnterpriseModels(cliIDs, dynMap)
 	if len(out) == 0 {
-		return nil, errors.New("models api returned empty list")
+		return nil, errModelsAPIReturnedEmptyList
 	}
+
 	return out, nil
 }
 
@@ -1694,29 +1871,36 @@ func parseEnterpriseModels(raw []byte) ([]string, map[string]dynModelEntry, erro
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, nil, fmt.Errorf("models parse: %w", err)
 	}
+
 	if env.Code != 0 {
-		return nil, nil, fmt.Errorf("models api code=%d", env.Code)
+		return nil, nil, fmt.Errorf("models api code=%d: %w", env.Code, errParseEnterpriseModelsFailed)
 	}
+
 	var cliIDs []string
+
 	for _, ag := range env.Data.Agents {
 		if ag.Name == "cli" {
 			cliIDs = ag.Models
 			break
 		}
 	}
+
 	if len(cliIDs) == 0 {
-		return nil, nil, errors.New("no cli agent models found")
+		return nil, nil, errNoCLIAgentModelsFound
 	}
 	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
 	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
 	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
 	dynMap := make(map[string]dynModelEntry, len(env.Data.Models))
-	for _, m := range env.Data.Models {
+	for i := range env.Data.Models {
+		m := &env.Data.Models[i]
 		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
 			continue
 		}
-		dynMap[m.ID] = m
+
+		dynMap[m.ID] = *m
 	}
+
 	return cliIDs, dynMap, nil
 }
 
@@ -1728,6 +1912,7 @@ func collectEnterpriseModels(cliIDs []string, dynMap map[string]dynModelEntry) [
 			out = append(out, m.modelInfo())
 		}
 	}
+
 	return out
 }
 
@@ -1740,16 +1925,21 @@ func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	out := make([]ModelInfo, 0, len(byID))
-	for _, mi := range byID {
+	for id := range byID {
+		mi := byID[id]
 		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
+
 		out = append(out, mi)
 	}
+
 	if len(out) == 0 {
-		return nil, errors.New("v3/config returned empty models")
+		return nil, errV3ConfigReturnedEmptyModels
 	}
+
 	return out, nil
 }
 
@@ -1798,12 +1988,15 @@ func promoClock(hhmm string) (int, bool) {
 	if len(parts) != 2 {
 		return -1, false
 	}
-	h, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+
+	num, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
+
 	m, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if err1 != nil || err2 != nil || h < 0 || h > 24 || m < 0 || m > 59 {
+	if err1 != nil || err2 != nil || num < 0 || num > 24 || m < 0 || m > 59 {
 		return -1, false
 	}
-	return h*60 + m, true
+
+	return num*60 + m, true
 }
 
 // promoActive 评估优惠在 now 是否生效：enabled + validFrom/validUntil 内 + 落在
@@ -1812,54 +2005,66 @@ func promoActive(p *v3ModelPromotion, now time.Time) bool {
 	if !p.Enabled {
 		return false
 	}
-	sc := p.Schedule
-	if sc == nil {
+
+	v3PromoSchedule2 := p.Schedule
+	if v3PromoSchedule2 == nil {
 		return true
 	}
-	if !promoWithinValidRange(sc, now) {
+
+	if !promoWithinValidRange(v3PromoSchedule2, now) {
 		return false
 	}
-	if len(sc.Daily) == 0 {
+
+	if len(v3PromoSchedule2.Daily) == 0 {
 		return true
 	}
-	return promoInDailyWindow(sc.Daily, now)
+
+	return promoInDailyWindow(v3PromoSchedule2.Daily, now)
 }
 
 // promoWithinValidRange 报告 now 是否落在 validFrom/validUntil 区间内（缺省或
 // 解析失败视为不设限）。
-func promoWithinValidRange(sc *v3PromoSchedule, now time.Time) bool {
-	if sc.ValidFrom != "" {
-		if from, err := time.Parse(time.RFC3339, sc.ValidFrom); err == nil && now.Before(from) {
+func promoWithinValidRange(v3PromoSchedule2 *v3PromoSchedule, now time.Time) bool {
+	if v3PromoSchedule2.ValidFrom != "" {
+		if from, err := time.Parse(time.RFC3339, v3PromoSchedule2.ValidFrom); err == nil && now.Before(from) {
 			return false
 		}
 	}
-	if sc.ValidUntil != "" {
-		if until, err := time.Parse(time.RFC3339, sc.ValidUntil); err == nil && !now.Before(until) {
+
+	if v3PromoSchedule2.ValidUntil != "" {
+		if until, err := time.Parse(time.RFC3339, v3PromoSchedule2.ValidUntil); err == nil && !now.Before(until) {
 			return false
 		}
 	}
+
 	return true
 }
 
 // promoInDailyWindow 报告 now 是否落在任一 daily 窗口内（支持跨午夜，如 23:00→7:50）。
 func promoInDailyWindow(daily []v3PromoWindow, now time.Time) bool {
 	cur := now.Hour()*60 + now.Minute()
+
 	for _, w := range daily {
-		st, ok1 := promoClock(w.Start)
-		ed, ok2 := promoClock(w.End)
+		num, ok1 := promoClock(w.Start)
+
+		num2, ok2 := promoClock(w.End)
 		if !ok1 || !ok2 {
 			continue
 		}
-		if st <= ed {
-			if cur >= st && cur < ed {
+
+		if num <= num2 {
+			if cur >= num && cur < num2 {
 				return true
 			}
+
 			continue
 		}
-		if cur >= st || cur < ed { // 跨午夜（23:00→7:50）
+
+		if cur >= num || cur < num2 { // 跨午夜（23:00→7:50）
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -1870,6 +2075,7 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 	if len(promos) == 0 || len(out) == 0 {
 		return
 	}
+
 	now := time.Now().In(promoZone)
 	for id, p := range bestPromotions(out, promos, now) {
 		mi := out[id]
@@ -1883,37 +2089,43 @@ func applyModelPromotions(out map[string]ModelInfo, promos []v3ModelPromotion) {
 func bestPromotions(out map[string]ModelInfo, promos []v3ModelPromotion, now time.Time) map[string]*v3ModelPromotion {
 	best := make(map[string]*v3ModelPromotion)
 	bestPrio := make(map[string]int)
+
 	for i := range promos {
-		p := &promos[i]
-		if !promoActive(p, now) {
+		v3ModelPromotion2 := &promos[i]
+		if !promoActive(v3ModelPromotion2, now) {
 			continue
 		}
-		for _, id := range p.ModelIDs {
+
+		for _, id := range v3ModelPromotion2.ModelIDs {
 			if _, ok := out[id]; !ok {
 				continue // 目录外模型（如同名 global 变体）不挂
 			}
-			if prio, seen := bestPrio[id]; !seen || p.Priority > prio {
-				best[id] = p
-				bestPrio[id] = p.Priority
+
+			if prio, seen := bestPrio[id]; !seen || v3ModelPromotion2.Priority > prio {
+				best[id] = v3ModelPromotion2
+				bestPrio[id] = v3ModelPromotion2.Priority
 			}
 		}
 	}
+
 	return best
 }
 
 // applyPromo 把单条优惠的标签/说明/折扣价挂到目录条目（无 discount 对象的条目也
 // 挂标签/说明，错峰类 PromoFactor 留 nil）。
-func applyPromo(mi *ModelInfo, p *v3ModelPromotion) {
-	if p.Badge != nil {
-		mi.PromoLabel = p.Badge.Label
+func applyPromo(modelInfo *ModelInfo, v3ModelPromotion2 *v3ModelPromotion) {
+	if v3ModelPromotion2.Badge != nil {
+		modelInfo.PromoLabel = v3ModelPromotion2.Badge.Label
 	}
-	if p.Hover != nil {
-		mi.PromoNote = p.Hover.TextZh
+
+	if v3ModelPromotion2.Hover != nil {
+		modelInfo.PromoNote = v3ModelPromotion2.Hover.TextZh
 	}
-	if p.Discount != nil {
-		f := p.Discount.Factor
-		mi.PromoFactor = &f
-		mi.PromoCredits = p.Discount.DiscountedCredits
+
+	if v3ModelPromotion2.Discount != nil {
+		f := v3ModelPromotion2.Discount.Factor
+		modelInfo.PromoFactor = &f
+		modelInfo.PromoCredits = v3ModelPromotion2.Discount.DiscountedCredits
 	}
 }
 
@@ -1924,16 +2136,20 @@ func applyPromo(mi *ModelInfo, p *v3ModelPromotion) {
 func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs map[string]string) {
 	c.effortsMu.Lock()
 	defer c.effortsMu.Unlock()
+
 	if c.efforts == nil {
 		c.efforts = make(map[string]map[string][]string)
 	}
+
 	if c.defaultEfforts == nil {
 		c.defaultEfforts = make(map[string]map[string]string)
 	}
+
 	k := realmKey(realm)
 	if len(efforts) == 0 && len(defs) == 0 {
 		delete(c.efforts, k)
 		delete(c.defaultEfforts, k)
+
 		return
 	}
 	// 写入边界克隆一次（刷新频率低），让读路径直接返回不可变快照，无需每请求拷贝。
@@ -1945,10 +2161,12 @@ func cloneEffortMap(src map[string][]string) map[string][]string {
 	if len(src) == 0 {
 		return nil
 	}
+
 	dst := make(map[string][]string, len(src))
 	for k, v := range src {
 		dst[k] = append([]string(nil), v...)
 	}
+
 	return dst
 }
 
@@ -1956,10 +2174,10 @@ func cloneStringMap(src map[string]string) map[string]string {
 	if len(src) == 0 {
 		return nil
 	}
+
 	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
+	maps.Copy(dst, src)
+
 	return dst
 }
 
@@ -1967,34 +2185,40 @@ func cloneStringMap(src map[string]string) map[string]string {
 // 兼容 "x0.05" / "x0.05 credits" / "0.50x" 等形态；无法数值化时保留去除
 // credits 后缀与空白后的原文，避免编造倍率。
 func normalizeModelRate(raw string) string {
-	s := strings.TrimSpace(raw)
-	if s == "" {
+	str := strings.TrimSpace(raw)
+	if str == "" {
 		return ""
 	}
-	if strings.HasSuffix(strings.ToLower(s), "credits") {
-		s = strings.TrimSpace(s[:len(s)-len("credits")])
+
+	if strings.HasSuffix(strings.ToLower(str), "credits") {
+		str = strings.TrimSpace(str[:len(str)-len("credits")])
 	}
-	if strings.HasPrefix(strings.ToLower(s), "x") {
-		s = strings.TrimSpace(s[1:])
-	} else if strings.HasSuffix(strings.ToLower(s), "x") {
-		s = strings.TrimSpace(s[:len(s)-1])
+
+	if strings.HasPrefix(strings.ToLower(str), "x") {
+		str = strings.TrimSpace(str[1:])
+	} else if strings.HasSuffix(strings.ToLower(str), "x") {
+		str = strings.TrimSpace(str[:len(str)-1])
 	}
-	if s == "" {
+
+	if str == "" {
 		return ""
 	}
-	v, err := strconv.ParseFloat(s, 64)
+
+	v, err := strconv.ParseFloat(str, 64)
 	if err != nil {
 		return strings.TrimSpace(raw)
 	}
+
 	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // effectiveModelRate 返回模型当前生效倍率：有机器可读优惠时取折扣价，
 // 否则取牌价；两者均缺省时为空。
-func effectiveModelRate(mi ModelInfo) string {
+func effectiveModelRate(mi *ModelInfo) string {
 	if mi.PromoFactor != nil && strings.TrimSpace(mi.PromoCredits) != "" {
 		return normalizeModelRate(mi.PromoCredits)
 	}
+
 	return normalizeModelRate(mi.Credits)
 }
 
@@ -2002,19 +2226,24 @@ func effectiveModelRate(mi ModelInfo) string {
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
 func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
-	for _, mi := range infos {
-		if mi.ID == "" {
+	for i := range infos {
+		modelInfo := &infos[i]
+		if modelInfo.ID == "" {
 			continue
 		}
-		if rate := effectiveModelRate(mi); rate != "" {
-			rates[mi.ID] = rate
+
+		if rate := effectiveModelRate(modelInfo); rate != "" {
+			rates[modelInfo.ID] = rate
 		}
 	}
+
 	c.effortsMu.Lock()
 	defer c.effortsMu.Unlock()
+
 	if c.modelRates == nil {
 		c.modelRates = make(map[string]map[string]string)
 	}
+
 	c.modelRates[realmKey(realm)] = rates
 }
 
@@ -2023,8 +2252,10 @@ func (c *Client) ModelRate(realm, model string) string {
 	if c == nil || model == "" {
 		return ""
 	}
+
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
+
 	return c.modelRates[realmKey(realm)][model]
 }
 
@@ -2042,12 +2273,15 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 		if d := strings.TrimSpace(a.DomainValue()); d != "" {
 			d = strings.TrimPrefix(d, "https://")
 			d = strings.TrimPrefix(d, "http://")
+
 			return strings.TrimSuffix(d, "/")
 		}
 	}
+
 	if u, err := url.Parse(chatBase); err == nil && u.Host != "" {
 		return u.Host
 	}
+
 	return "copilot.tencent.com"
 }
 
@@ -2060,56 +2294,69 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	if err != nil {
 		return nil, err
 	}
+
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetchV3ConfigModelMap: %w", err)
 	}
 	defer resp.Body.Close()
+
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（不罚号）。
 		return nil, fmt.Errorf("read body: %w", err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("v3/config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, fmt.Errorf("v3/config status %d: %s: %w", resp.StatusCode, truncate(string(raw), 120), errFetchV3ConfigModelMapFailed)
 	}
+
 	env, err := parseV3ConfigEnv(raw)
 	if err != nil {
 		return nil, err
 	}
+
 	out := buildV3ModelMap(env.Data.Models)
 	mergeTrialBannerModels(out, env.Data.ProductFeaturesConfig.ModelTrialBanner.Banners)
 	// 挂当前生效的限时优惠（modelPromotions）：Credits 字段是**牌价**（转正后基准
 	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
 	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
 	applyModelPromotions(out, env.Data.ModelPromotions)
+
 	if len(out) == 0 {
-		return nil, errors.New("v3/config returned empty models")
+		return nil, errV3ConfigReturnedEmptyModels
 	}
+
 	return out, nil
 }
 
 // newV3ConfigRequest 构造 /v3/config 请求（该端点对 UA 敏感：必须带
 // CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403；空串等价 codeBuddyIDEUA）。
-func (c *Client) newV3ConfigRequest(a *auth.Auth, ua string) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, c.chatBase(a)+"/v3/config", http.NoBody)
+func (c *Client) newV3ConfigRequest(account8 *auth.Auth, str string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, c.chatBase(account8)+"/v3/config", http.NoBody)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("newV3ConfigRequest: %w", err)
 	}
+
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	// AccessToken 加锁快照（同 fetchEnterpriseModels）。
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	if a != nil && a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+	req.Header.Set("Authorization", "Bearer "+account8.AccessTokenValue())
+
+	if account8 != nil && account8.UID != "" {
+		req.Header.Set("X-User-Id", account8.UID)
 	}
-	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
+
+	req.Header.Set("X-Domain", v3ConfigDomain(account8, c.chatBase(account8)))
 	req.Header.Set("X-Product", "SaaS")
-	if ua == "" {
-		ua = codeBuddyIDEUA
+
+	if str == "" {
+		str = codeBuddyIDEUA
 	}
-	req.Header.Set("User-Agent", ua)
+
+	req.Header.Set("User-Agent", str)
 	c.injectCodeBuddyRequest(req)
+
 	return req, nil
 }
 
@@ -2145,21 +2392,26 @@ func parseV3ConfigEnv(raw []byte) (v3ConfigEnv, error) {
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return v3ConfigEnv{}, fmt.Errorf("v3/config parse: %w", err)
 	}
+
 	if env.Code != 0 {
-		return v3ConfigEnv{}, fmt.Errorf("v3/config code=%d", env.Code)
+		return v3ConfigEnv{}, fmt.Errorf("v3/config code=%d: %w", env.Code, errParseV3ConfigEnvFailed)
 	}
+
 	return env, nil
 }
 
 // buildV3ModelMap 按模型 id 建能力表（空 id 跳过）。
 func buildV3ModelMap(models []dynModelEntry) map[string]ModelInfo {
 	out := make(map[string]ModelInfo, len(models))
-	for _, m := range models {
+	for i := range models {
+		m := &models[i]
 		if strings.TrimSpace(m.ID) == "" {
 			continue
 		}
+
 		out[m.ID] = m.modelInfo()
 	}
+
 	return out
 }
 
@@ -2174,24 +2426,28 @@ func buildV3ModelMap(models []dynModelEntry) map[string]ModelInfo {
 //
 // firstUseTimeKey / trialDays 属**账号级**试用状态，不透出给下游。
 func mergeTrialBannerModels(out map[string]ModelInfo, banners []v3TrialBanner) {
-	for _, b := range banners {
-		id := strings.TrimSpace(b.ModelID)
+	for _, item := range banners {
+		id := strings.TrimSpace(item.ModelID)
 		if id == "" {
 			continue
 		}
+
 		if _, exists := out[id]; exists {
 			continue
 		}
-		mi := ModelInfo{ID: id}
-		if tgt := strings.TrimSpace(b.TargetModelID); tgt != "" {
+
+		modelInfo := ModelInfo{ID: id}
+
+		if tgt := strings.TrimSpace(item.TargetModelID); tgt != "" {
 			if base, ok := out[tgt]; ok {
-				mi = base
-				mi.ID = id
+				modelInfo = base
+				modelInfo.ID = id
 			}
 		}
-		mi.Credits = ""
-		mi.Tags = nil
-		out[id] = mi
+
+		modelInfo.Credits = ""
+		modelInfo.Tags = nil
+		out[id] = modelInfo
 	}
 }
 
@@ -2231,7 +2487,7 @@ type CreditPackage struct {
 //
 // 字段选择与 UserResourceDetailed 的聚合口径一致：CycleCapacitySize > 0 时按
 // 周期字段算，否则按 Capacity 字段算——两条路径不能混，否则同一个包会被算两次。
-func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, error) {
+func (c *Client) CreditPackages(account2 *auth.Auth) ([]CreditPackage, int64, int64, error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -2241,7 +2497,8 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), body)
+
+	data, err := c.billingMeterJSON(account2, c.billingMeterPaths(account2), body)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -2252,17 +2509,21 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, 0, 0, fmt.Errorf("packages parse: %w", err)
 	}
+
 	packs := resp.Response.Data.Accounts
 	out := make([]CreditPackage, 0, len(packs))
+
 	var sumRemain, sumSize int64
-	for _, p := range packs {
-		cp := creditPackageFromAccount(p)
+
+	for i := range packs {
+		cp := creditPackageFromAccount(&packs[i])
 		sumRemain += cp.Remain
 		sumSize += cp.Size
 		out = append(out, cp)
 	}
 	// 面额降序：大包一眼可见，正是差异最可能出现的地方。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Size > out[j].Size })
+
 	return out, sumRemain, sumSize, nil
 }
 
@@ -2304,67 +2565,82 @@ type billingPackageAccount struct {
 }
 
 // creditPackageFromAccount 把单个上游积分包映射为面板用的 CreditPackage。
-func creditPackageFromAccount(p billingPackageAccount) CreditPackage {
-	cp := CreditPackage{
-		Name:           p.PackageName,
-		PackageCode:    p.PackageCode,
-		SubProductCode: p.SubProductCode,
-		SubProductName: p.SubProductName,
+func creditPackageFromAccount(billingPackageAccount3 *billingPackageAccount) CreditPackage {
+	creditPackage := CreditPackage{
+		Name:           billingPackageAccount3.PackageName,
+		PackageCode:    billingPackageAccount3.PackageCode,
+		SubProductCode: billingPackageAccount3.SubProductCode,
+		SubProductName: billingPackageAccount3.SubProductName,
+		Remain:         0,
+		Used:           0,
+		Size:           0,
+		EndTime:        "",
+		ExpiresAt:      0,
+		CreatedAt:      "",
+		Cycle:          false,
 	}
-	cp.EndTime, cp.ExpiresAt = creditPackageExpiry(p)
-	if cp.ExpiresAt == 0 && cp.EndTime != "" {
-		if end, perr := time.ParseInLocation(packageEndLayout, cp.EndTime, softRateResetLoc); perr == nil {
-			cp.ExpiresAt = end.UnixMilli()
+
+	creditPackage.EndTime, creditPackage.ExpiresAt = creditPackageExpiry(billingPackageAccount3)
+	if creditPackage.ExpiresAt == 0 && creditPackage.EndTime != "" {
+		if end, perr := time.ParseInLocation(packageEndLayout, creditPackage.EndTime, softRateResetLoc); perr == nil {
+			creditPackage.ExpiresAt = end.UnixMilli()
 		}
 	}
 	// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
-	if p.CreateTime > 0 {
-		cp.CreatedAt = time.UnixMilli(p.CreateTime).Format(time.RFC3339)
+	if billingPackageAccount3.CreateTime > 0 {
+		creditPackage.CreatedAt = time.UnixMilli(billingPackageAccount3.CreateTime).Format(time.RFC3339)
 	}
-	cp.Cycle, cp.Remain, cp.Used, cp.Size = creditPackageAmounts(p)
-	return cp
+
+	creditPackage.Cycle, creditPackage.Remain, creditPackage.Used, creditPackage.Size = creditPackageAmounts(billingPackageAccount3)
+
+	return creditPackage
 }
 
 // creditPackageExpiry 按上游口径选出失效时刻：DeductionEndTime 优先（epoch 毫秒，
 // 真「用不完就没了」），依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
 // 返回 RFC3339 文本与同源 Unix 毫秒（后者仅在 DeductionEndTime 分支有值）。
-func creditPackageExpiry(p billingPackageAccount) (endTime string, expiresAt int64) {
+func creditPackageExpiry(billingPackageAccount4 *billingPackageAccount) (endTime string, expiresAt int64) {
 	switch {
-	case p.DeductionEndTime > 0:
+	case billingPackageAccount4.DeductionEndTime > 0:
 		// 真失效时刻（可抵扣窗口结束），语义见字段注释：判「用不完就没了」
 		// 用它而不是周期边界。epoch 毫秒 → RFC3339，与 CycleEndTime 字符串口径
 		// 共存（前端统一 slice(0,10) 取日期）。ExpiresAt 直接用原始毫秒——
 		// RFC3339 不是 packageEndLayout 形态，交给调用方解析会静默失败得 0。
-		return time.UnixMilli(p.DeductionEndTime).Format(time.RFC3339), p.DeductionEndTime
-	case p.ExpiredTime != "":
-		return p.ExpiredTime, 0
-	case p.PackageEndTime != "":
-		return p.PackageEndTime, 0
+		return time.UnixMilli(billingPackageAccount4.DeductionEndTime).Format(time.RFC3339), billingPackageAccount4.DeductionEndTime
+	case billingPackageAccount4.ExpiredTime != "":
+		return billingPackageAccount4.ExpiredTime, 0
+	case billingPackageAccount4.PackageEndTime != "":
+		return billingPackageAccount4.PackageEndTime, 0
 	default:
-		return p.CycleEndTime, 0
+		return billingPackageAccount4.CycleEndTime, 0
 	}
 }
 
 // creditPackageAmounts 按周期字段优先口径算出包的 remain/used/size（与
 // UserResourceDetailed 的 packageRemainUsed 同构，两处口径不能混）。
-func creditPackageAmounts(p billingPackageAccount) (cycle bool, remain, used, size int64) {
-	if p.CycleCapacitySize > 0 {
+func creditPackageAmounts(billingPackageAccount2 *billingPackageAccount) (cycle bool, remain, used, size int64) {
+	if billingPackageAccount2.CycleCapacitySize > 0 {
 		cycle = true
-		remain, size = p.CycleCapacityRemain, p.CycleCapacitySize
+		remain, size = billingPackageAccount2.CycleCapacityRemain, billingPackageAccount2.CycleCapacitySize
+
 		used = size - remain
-		if p.CycleCapacityUsed > used {
-			used = p.CycleCapacityUsed
+		if billingPackageAccount2.CycleCapacityUsed > used {
+			used = billingPackageAccount2.CycleCapacityUsed
 			remain = size - used
 		}
+
 		if remain < 0 {
 			remain = 0
 		}
+
 		return cycle, remain, used, size
 	}
-	remain, used, size = p.CapacityRemain, p.CapacityUsed, p.CapacitySize
+
+	remain, used, size = billingPackageAccount2.CapacityRemain, billingPackageAccount2.CapacityUsed, billingPackageAccount2.CapacitySize
 	if used == 0 && size > remain {
 		used = size - remain
 	}
+
 	return cycle, remain, used, size
 }
 
@@ -2382,10 +2658,12 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 	if raw == "" {
 		return time.Time{}, false
 	}
+
 	t, err := time.ParseInLocation(packageEndLayout, raw, softRateResetLoc)
 	if err != nil {
 		return time.Time{}, false
 	}
+
 	return t, true
 }
 
@@ -2441,13 +2719,16 @@ const (
 // cycleEndTime 作为唯一到期批次——周期末企业号会被 prefer_expiring 优先选中（期望行为）。
 // limitNum < 0（不限量）无作废语义，不参与分桶。
 func (c *Client) enterpriseResource(
-	a *auth.Auth, soon time.Duration,
+	account6 *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	// 与个人口径一致：余额是签到后的紧邻调用，偶发 500 值得有界重试。
 	var data json.RawMessage
+
 	err = c.retryBillingTransient(func() error {
 		var e error
-		data, e = c.billingJSON(a, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
+
+		data, e = c.billingJSON(account6, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
+
 		return e
 	})
 	if err != nil {
@@ -2462,13 +2743,12 @@ func (c *Client) enterpriseResource(
 	if limit < 0 {
 		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
 	}
-	remain = limit - roundHalfUp(used)
-	if remain < 0 {
-		remain = 0
-	}
+
+	remain = max(limit-roundHalfUp(used), 0)
 	total = limit
 	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
 	earliestAt, earliestRemaining, expiring = enterpriseExpiryBucket(cycleEnd, cycleReset, remain, time.Now(), soon)
+
 	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }
 
@@ -2488,14 +2768,17 @@ func parseEnterpriseQuota(data json.RawMessage) (limit int64, used float64, cycl
 	if uerr := json.Unmarshal(data, &resp); uerr != nil {
 		return 0, 0, "", "", fmt.Errorf("enterprise resource parse: %w", uerr)
 	}
+
 	limit = resp.LimitNum
 	if limit == 0 && resp.LimitNumSnake != 0 {
 		limit = resp.LimitNumSnake
 	}
+
 	used = resp.Credit
 	if used == 0 && resp.UsedNum != 0 {
 		used = resp.UsedNum
 	}
+
 	return limit, used, resp.CycleEndTime, resp.CycleResetTime, nil
 }
 
@@ -2506,6 +2789,7 @@ func roundHalfUp(used float64) int64 {
 	if used-float64(usedInt) >= 0.5 {
 		usedInt++
 	}
+
 	return usedInt
 }
 
@@ -2518,13 +2802,16 @@ func enterpriseExpiryBucket(
 	if !ok {
 		end, ok = parsePackageEndTime(cycleReset)
 	}
+
 	if !ok || remain <= 0 || !end.After(now) {
 		return time.Time{}, 0, 0
 	}
+
 	earliestAt, earliestRemaining = end, remain
 	if soon > 0 && !end.After(now.Add(soon)) {
 		expiring = remain
 	}
+
 	return earliestAt, earliestRemaining, expiring
 }
 
@@ -2532,13 +2819,14 @@ func enterpriseExpiryBucket(
 // earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
 // 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
 func (c *Client) UserResourceDetailedWithExpiry(
-	a *auth.Auth, soon time.Duration,
+	account *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
-	if a.IsEnterprise() {
-		return c.enterpriseResource(a, soon)
+	if account.IsEnterprise() {
+		return c.enterpriseResource(account, soon)
 	}
+
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -2551,22 +2839,28 @@ func (c *Client) UserResourceDetailedWithExpiry(
 	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
 	var data json.RawMessage
+
 	err = c.retryBillingTransient(func() error {
 		var e error
-		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), body)
+
+		data, e = c.billingMeterJSON(account, c.billingMeterPaths(account), body)
+
 		return e
 	})
 	if err != nil {
 		return 0, 0, 0, time.Time{}, 0, err
 	}
+
 	var resp resourceDetailedResp
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
 	}
+
 	var totals resourceTotals
 	for _, acct := range resp.Response.Data.Accounts {
-		totals.add(acct, now, soon)
+		totals.add(&acct, now, soon)
 	}
+
 	return totals.remain, totals.total, totals.expiring, totals.earliestAt, totals.earliestRemaining, nil
 }
 
@@ -2599,7 +2893,7 @@ type resourceTotals struct {
 }
 
 // add 累加单个套餐的余额与到期批次（余额钳非负、size 不高于 remain）。
-func (t *resourceTotals) add(acct resourceAccount, now time.Time, soon time.Duration) {
+func (t *resourceTotals) add(acct *resourceAccount, now time.Time, soon time.Duration) {
 	r, _, size := packageRemainUsed(respAccount{
 		CapacityRemain:      acct.CapacityRemain,
 		CapacityUsed:        acct.CapacityUsed,
@@ -2611,18 +2905,23 @@ func (t *resourceTotals) add(acct resourceAccount, now time.Time, soon time.Dura
 	if r < 0 {
 		r = 0
 	}
+
 	if size < r {
 		size = r
 	}
+
 	t.remain += r
 	t.total += size
+
 	if r <= 0 {
 		return
 	}
+
 	end, ok := parsePackageEndTime(acct.CycleEndTime)
 	if !ok || !end.After(now) {
 		return
 	}
+
 	t.addExpiry(end, r, now, soon)
 }
 
@@ -2653,37 +2952,34 @@ type respAccount struct {
 // packageRemainUsed 聚合单套餐的 remain/used/size（与 CreditPackages/cmd/credit 的
 // 历史口径一致，收敛至此作为单一事实来源）。Cycle 期套餐优先：用 CycleCapacity
 // 三字段，used 取 CycleUsed 与 size-remain 的较大者；否则回退 Capacity 三字段。
-func packageRemainUsed(a respAccount) (remain, used, size int64) {
-	if a.CycleCapacitySize > 0 {
-		return cyclePackageAmounts(a)
+func packageRemainUsed(respAccount2 respAccount) (remain, used, size int64) {
+	if respAccount2.CycleCapacitySize > 0 {
+		return cyclePackageAmounts(respAccount2)
 	}
-	remain = a.CapacityRemain
-	used = a.CapacityUsed
-	size = a.CapacitySize
+
+	remain = respAccount2.CapacityRemain
+	used = respAccount2.CapacityUsed
+
+	size = respAccount2.CapacitySize
 	if used == 0 && size > remain {
 		used = size - remain
 	}
+
 	return remain, used, size
 }
 
 // cyclePackageAmounts 周期套餐的 remain/used/size：remain 先钳 [0,size]，used 取
 // size-remain 与 CycleUsed 的较大者。
 func cyclePackageAmounts(a respAccount) (remain, used, size int64) {
-	remain = a.CycleCapacityRemain
+	remain = max(a.CycleCapacityRemain, 0)
 	size = a.CycleCapacitySize
-	if remain < 0 {
-		remain = 0
-	}
-	if remain > size {
-		remain = size
-	}
-	used = size - remain
-	if a.CycleCapacityUsed > used {
-		used = a.CycleCapacityUsed
-	}
+	remain = min(remain, size)
+
+	used = max(size-remain, a.CycleCapacityUsed)
 	if size >= used {
 		remain = size - used
 	}
+
 	return remain, used, size
 }
 
@@ -2713,16 +3009,18 @@ func IsCheckinInactive(err error) bool {
 
 // matchCheckinMarker 对 *Error.Msg 做大小写不敏感的关键词包含匹配。
 func matchCheckinMarker(err error, markers []string) bool {
-	var ue *Error
-	if !errors.As(err, &ue) {
+	var upErr *Error
+	if !errors.As(err, &upErr) {
 		return false
 	}
-	lower := strings.ToLower(ue.Msg)
+
+	lower := strings.ToLower(upErr.Msg)
 	for _, m := range markers {
-		if strings.Contains(ue.Msg, m) || strings.Contains(lower, strings.ToLower(m)) {
+		if strings.Contains(upErr.Msg, m) || strings.Contains(lower, strings.ToLower(m)) {
 			return true
 		}
 	}
+
 	return false
 }
 

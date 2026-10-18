@@ -9,27 +9,33 @@ import (
 // 返回的切片与 messages 中 assistant 消息一一对应（非 assistant 消息跳过）。
 func assistantRC(t *testing.T, out []byte) []string {
 	t.Helper()
+
 	var m map[string]any
 	if err := json.Unmarshal(out, &m); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
+
 	var got []string
+
 	msgs, _ := m["messages"].([]any)
 	for _, mm := range msgs {
 		msg, ok := mm.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		role, _ := msg["role"].(string)
 		if role != "assistant" {
 			continue
 		}
+
 		if v, ok := msg["reasoning_content"].(string); ok {
 			got = append(got, v)
 		} else {
 			got = append(got, "<absent>")
 		}
 	}
+
 	return got
 }
 
@@ -37,6 +43,8 @@ func assistantRC(t *testing.T, out []byte) []string {
 // reasoning 痕迹时，所有 assistant 消息必须带 reasoning_content（string）。
 // 对齐官方 requiresReasoningContentOnAssistantMessages 行为。
 func TestBackfillReasoningContentDeepSeek(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		body string
@@ -96,17 +104,22 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 			[]string{""},
 		},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := PrepareBodyOptWithEfforts([]byte(item.body), false, nil)
+
 			got := assistantRC(t, out)
-			if len(got) != c.wantCount {
-				t.Fatalf("assistant 消息数 = %d want %d (out=%s)", len(got), c.wantCount, out)
+			if len(got) != item.wantCount {
+				t.Fatalf("assistant 消息数 = %d want %d (out=%s)", len(got), item.wantCount, out)
 			}
-			for i, want := range c.wantVals {
+
+			for i, want := range item.wantVals {
 				if want == "" {
 					continue // 任意 string（补空串/复制都接受，但必须存在）
 				}
+
 				if got[i] != want {
 					t.Errorf("assistant[%d].reasoning_content = %q want %q (out=%s)", i, got[i], want, out)
 				}
@@ -122,6 +135,8 @@ func TestBackfillReasoningContentDeepSeek(t *testing.T) {
 // 现按新契约收紧为 disabled 形态——纯 text + enabled 补空串由
 // TestBackfillZeroTraceThinkingEnabled 覆盖）。
 func TestBackfillReasoningContentNoTrace(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		body string
@@ -144,6 +159,8 @@ func TestBackfillReasoningContentNoTrace(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
 			for _, rc := range assistantRC(t, out) {
 				if rc != "<absent>" {
@@ -157,8 +174,11 @@ func TestBackfillReasoningContentNoTrace(t *testing.T) {
 // TestBackfillReasoningContentNonDeepSeek 非 deepseek 模型零改动：
 // reasoning 字段保持原样，不新增 reasoning_content。
 func TestBackfillReasoningContentNonDeepSeek(t *testing.T) {
+	t.Parallel()
+
 	body := `{"model":"glm-5.2","messages":[
 		{"role":"assistant","content":"a","reasoning":"thought"}]}`
+
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 	for _, rc := range assistantRC(t, out) {
 		if rc != "<absent>" {
@@ -170,9 +190,12 @@ func TestBackfillReasoningContentNonDeepSeek(t *testing.T) {
 // TestBackfillReasoningContentBothFields 同时带 reasoning 与 reasoning_content：
 // 以 reasoning_content 为准（不覆盖），reasoning 字段保留（兼容）——对齐客户端 matches 规则。
 func TestBackfillReasoningContentBothFields(t *testing.T) {
+	t.Parallel()
+
 	body := `{"model":"deepseek-v4-flash","messages":[
 		{"role":"assistant","content":"a","reasoning":"t","reasoning_content":"existing"}]}`
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+
 	got := assistantRC(t, out)
 	if len(got) != 1 || got[0] != "existing" {
 		t.Errorf("reasoning_content 应以已有值为准: got %v (out=%s)", got, out)
@@ -182,7 +205,9 @@ func TestBackfillReasoningContentBothFields(t *testing.T) {
 	if err := json.Unmarshal(out, &m); err != nil {
 		t.Fatal(err)
 	}
+
 	msgs, _ := m["messages"].([]any)
+
 	first, _ := msgs[0].(map[string]any)
 	if r, ok := first["reasoning"].(string); !ok || r != "t" {
 		t.Errorf("reasoning 字段被改动: %v (out=%s)", first, out)
@@ -193,18 +218,22 @@ func TestBackfillReasoningContentBothFields(t *testing.T) {
 // 显式 disabled 时 reasoning_effort 被删，但 backfill 的 hasTrace 半边照常生效
 // （多轮一致性不因关思维链而丢）；disabled + 零痕迹则零改动（thinkingEnabled 半边不亮）。
 func TestBackfillComposesWithInjectThinking(t *testing.T) {
+	t.Parallel()
 	// R6：disabled + 有痕迹 → 照补（复制 reasoning）。
 	body := `{"model":"DEEPSEEK-v4-flash","thinking":{"type":"disabled"},"reasoning_effort":"high","messages":[
 		{"role":"user","content":"u"},
 		{"role":"assistant","content":"a","reasoning":"thought"}]}`
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+
 	got := assistantRC(t, out)
 	if len(got) != 1 || got[0] != "thought" {
 		t.Errorf("disabled 时 backfill 仍应生效: got %v (out=%s)", got, out)
 	}
+
 	if typ, present := getThinkingType(t, out); !present || typ != "disabled" {
 		t.Errorf("thinking.type 应保留 disabled, got %q present=%v", typ, present)
 	}
+
 	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
 		if _, ok := objFieldString(t, out, k); ok {
 			t.Errorf("%s 应被删除（disabled 时）", k)
@@ -215,6 +244,7 @@ func TestBackfillComposesWithInjectThinking(t *testing.T) {
 	body = `{"model":"DEEPSEEK-v4-flash","thinking":{"type":"disabled"},"messages":[
 		{"role":"user","content":"u"},
 		{"role":"assistant","content":"plain"}]}`
+
 	out = PrepareBodyOptWithEfforts([]byte(body), false, nil)
 	for _, rc := range assistantRC(t, out) {
 		if rc != "<absent>" {
@@ -229,6 +259,8 @@ func TestBackfillComposesWithInjectThinking(t *testing.T) {
 // 官方 ReasoningContentBackfillRule 的门控是 thinkingEnabled || hasTrace，
 // 第三方客户端丢推理回传（零痕迹）形态下官方仍补，网关此前只移植了 hasTrace 半边。
 func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
+	t.Parallel()
+
 	body := `{"model":"deepseek-v4-flash","messages":[
 		{"role":"user","content":"u1"},
 		{"role":"assistant","content":"a1"},
@@ -240,10 +272,12 @@ func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
 	if typ, present := getThinkingType(t, out); !present || typ != "enabled" {
 		t.Fatalf("thinking.type=%q present=%v want enabled (out=%s)", typ, present, out)
 	}
+
 	got := assistantRC(t, out)
 	if len(got) != 2 {
 		t.Fatalf("assistant 消息数 = %d want 2 (out=%s)", len(got), out)
 	}
+
 	for i, rc := range got {
 		if rc != "" { // 既有 string（含空串）即满足；<absent>（键不存在）不满足
 			t.Errorf("零痕迹 enabled 形态下 assistant[%d].reasoning_content = %q want 存在且为 \"\" (out=%s)", i, rc, out)
@@ -256,6 +290,8 @@ func TestBackfillZeroTraceThinkingEnabled(t *testing.T) {
 // 的 if _, ok（键存在即跳过）当「已有」跳过，新契约归一化为 ""。
 // 注意 hasTrace 半边：reasoning_content 键存在本身即痕迹，门控必然亮。
 func TestBackfillNullAndNonStringNormalized(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		body string
@@ -273,11 +309,15 @@ func TestBackfillNullAndNonStringNormalized(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
 			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
+
 			got := assistantRC(t, out)
 			if len(got) != 1 {
 				t.Fatalf("assistant 消息数 = %d want 1 (out=%s)", len(got), out)
 			}
+
 			if got[0] != "" || got[0] == "<absent>" {
 				t.Errorf("reasoning_content 应归一化为 \"\", got %q (out=%s)", got[0], out)
 			}

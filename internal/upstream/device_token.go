@@ -8,6 +8,7 @@ package upstream
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -47,22 +48,27 @@ func readDeviceTokenFile(path string) string {
 	// 部署形态，再上 singleflight 包住重读段（YAGNI，现在不做）。
 	dtFileCache.mu.Lock()
 	defer dtFileCache.mu.Unlock()
+
 	if path == dtFileCache.path && time.Since(dtFileCache.readAt) < deviceTokenFileTTL {
 		return dtFileCache.token
 	}
 	// 缓存未命中或过期：重新读文件。
 	dtFileCache.path = path
+
 	tok, err := readTrimmedFile(path, deviceTokenFileMaxLen)
 	if err != nil {
 		// 读失败：清空缓存 token，避免注入过期/错误的值。
 		dtFileCache.token = ""
 		dtFileCache.lastErr = err
 		dtFileCache.readAt = time.Now()
+
 		return ""
 	}
+
 	dtFileCache.token = tok
 	dtFileCache.lastErr = nil
 	dtFileCache.readAt = time.Now()
+
 	return tok
 }
 
@@ -70,14 +76,17 @@ func readDeviceTokenFile(path string) string {
 func readTrimmedFile(path string, maxLen int) (string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("readTrimmedFile: %w", err)
 	}
+
 	if info.Size() > int64(maxLen) {
 		return "", errDeviceTokenTooLarge
 	}
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("readTrimmedFile: %w", err)
 	}
+
 	return strings.TrimSpace(string(raw)), nil
 }

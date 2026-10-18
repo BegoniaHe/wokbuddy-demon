@@ -13,7 +13,10 @@
 // 会误拒真实支持 audio/file 的新模型，故未知时不推导。
 package upstream
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // 输入模态取值（OpenAI/主流网关通用命名）。
 const (
@@ -34,65 +37,70 @@ var knownModalities = map[string]bool{
 }
 
 // normalizeModalities 归一化模态列表（小写、去重、过滤未知值，保持首次出现顺序）。
-func normalizeModalities(in []string) []string {
-	if len(in) == 0 {
+func normalizeModalities(strs []string) []string {
+	if len(strs) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(in))
+
+	out := make([]string, 0, len(strs))
 	seen := map[string]bool{}
-	for _, raw := range in {
+
+	for _, raw := range strs {
 		m := strings.ToLower(strings.TrimSpace(raw))
 		if m == "" || !knownModalities[m] || seen[m] {
 			continue
 		}
+
 		seen[m] = true
 		out = append(out, m)
 	}
+
 	if len(out) == 0 {
 		return nil
 	}
+
 	return out
 }
 
 // DeclaredInputModalities 返回上游字段或 models.dev 明确声明的输入模态；nil =
 // 没有完整声明。只有完整声明才能用于「缺少某模态 → 拒绝」，因为
 // supports_images 只能证明图片能力，不能证明音频/文件缺失。
-func (m ModelInfo) DeclaredInputModalities() []string {
+func (m *ModelInfo) DeclaredInputModalities() []string {
 	if mods := normalizeModalities(m.InputModalities); len(mods) > 0 {
 		return mods
 	}
+
 	if mods, ok := lookupModelsDevModalities(m.ID); ok {
 		return normalizeModalities(mods)
 	}
+
 	return nil
 }
 
 // EffectiveInputModalities 返回模型的有效输入模态；nil = 能力未知（不宣称、
 // 不做能力拒绝）。来源见文件头三级优先级。
-func (m ModelInfo) EffectiveInputModalities() []string {
+func (m *ModelInfo) EffectiveInputModalities() []string {
 	if mods := m.DeclaredInputModalities(); len(mods) > 0 {
 		return mods
 	}
+
 	if m.SupportsImages {
 		// 兼容推导：supports_images=true 即支持图片输入（文本恒隐含）。
 		return []string{ModalityText, ModalityImage}
 	}
+
 	return nil
 }
 
 // SupportsModality 报告模型是否声明支持某个输入模态。能力未知（EffectiveInput
 // Modalities 为 nil）时返回 true——无法证明不支持就不拒绝（宁缺勿滥）。
-func (m ModelInfo) SupportsModality(modality string) bool {
+func (m *ModelInfo) SupportsModality(modality string) bool {
 	mods := m.EffectiveInputModalities()
 	if len(mods) == 0 {
 		return true
 	}
-	for _, m2 := range mods {
-		if m2 == modality {
-			return true
-		}
-	}
-	return false
+
+	return slices.Contains(mods, modality)
 }
 
 // RequestPartModality 把 OpenAI 消息 content part 的 type 映射为输入模态；
@@ -123,5 +131,6 @@ func firstNonEmptyModalities(lists ...[]string) []string {
 			return l
 		}
 	}
+
 	return nil
 }

@@ -11,28 +11,40 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
+var (
+	errWrongPath3                     = errors.New("wrong path")
+	errMissingBearerWebPlatformHeader = errors.New("missing bearer / web platform header")
+)
+
 func TestFetchAccountProfile(t *testing.T) {
-	c := testClient(func(r *http.Request) (*http.Response, error) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
 		if !strings.HasSuffix(r.URL.Path, "/console/account") {
-			return nil, errors.New("wrong path")
+			return nil, errWrongPath3
 		}
+
 		if r.Header.Get("Authorization") == "" || r.Header.Get("X-Client-Platform") != "web" {
-			return nil, errors.New("missing bearer / web platform header")
+			return nil, errMissingBearerWebPlatformHeader
 		}
 		// 响应刻意带 phoneNumber：方法必须只解析 nickname/uid，敏感字段不得进入返回值。
 		return jsonResp(200, `{"code":0,"msg":"OK","data":{"uid":"u1","nickname":"新名字","phoneNumber":"13800000000"}}`), nil
 	})
-	c.WebBaseCN = "https://web.example"
-	nick, err := c.FetchAccountProfile(&auth.Auth{UID: "u1", AccessToken: "at"})
+	client.WebBaseCN = "https://web.example"
+
+	nick, err := client.FetchAccountProfile(&auth.Auth{UID: "u1", AccessToken: "at"})
 	if err != nil || nick != "新名字" {
 		t.Fatalf("nick=%q err=%v, want 新名字 nil", nick, err)
 	}
 }
 
 func TestFetchAccountProfileUIDMismatch(t *testing.T) {
+	t.Parallel()
+
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(200, `{"code":0,"data":{"uid":"someone-else","nickname":"x"}}`), nil
 	})
+
 	c.WebBaseCN = "https://web.example"
 	if _, err := c.FetchAccountProfile(&auth.Auth{UID: "u1", AccessToken: "at"}); err == nil {
 		t.Fatal("uid 不一致应报错（防串号）")
@@ -40,9 +52,12 @@ func TestFetchAccountProfileUIDMismatch(t *testing.T) {
 }
 
 func TestFetchAccountProfileBusinessError(t *testing.T) {
+	t.Parallel()
+
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(401, `{"code":1002,"msg":"unauthorized"}`), nil
 	})
+
 	c.WebBaseCN = "https://web.example"
 	if _, err := c.FetchAccountProfile(&auth.Auth{UID: "u1", AccessToken: "bad"}); err == nil {
 		t.Fatal("401 应返回错误")

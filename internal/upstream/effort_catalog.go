@@ -14,6 +14,8 @@
 // 但其档位是「可枚举单档」而非「无选择器」，照抄参考仓库如实暴露。
 package upstream
 
+import "slices"
+
 // effortCap 一个模型的档位能力（对齐产品兜底表条目 reasoningEfforts + defaultReasoningEffort）。
 type effortCap struct {
 	efforts       []string
@@ -72,6 +74,7 @@ func staticEffortCap(realm, model string) effortCap {
 	if realmKey(realm) == "global" {
 		table = globalEffortFallback
 	}
+
 	return table[model]
 }
 
@@ -87,30 +90,29 @@ func staticEffortCap(realm, model string) effortCap {
 // 静态兜底档位就用静态默认档，避免跨源拼接出「档位是静态、默认档是 remote」的矛盾组合。
 func EffortListing(realm, model string, remoteEfforts []string, remoteDefault string) (efforts []string, defaultEffort string) {
 	var src effortCap
+
 	switch {
 	case len(remoteEfforts) > 0:
 		src = effortCap{efforts: remoteEfforts, defaultEffort: remoteDefault}
 	default:
 		src = staticEffortCap(realm, model)
 	}
+
 	if len(src.efforts) == 0 {
 		return nil, ""
 	}
+
 	efforts = append([]string(nil), src.efforts...)
 	if src.defaultEffort != "" && containsEffort(efforts, src.defaultEffort) {
 		defaultEffort = src.defaultEffort
 	}
+
 	return efforts, defaultEffort
 }
 
 // containsEffort 档位成员判定（精确匹配，对齐参考仓库 `efforts.includes(defaultEffort)`）。
 func containsEffort(efforts []string, want string) bool {
-	for _, e := range efforts {
-		if e == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(efforts, want)
 }
 
 // globalEffortMap global 域降级用的 effort 能力表：静态兜底表为基，远端桶覆盖（权威优先）。
@@ -136,10 +138,12 @@ func globalEffortMap(remoteEfforts map[string][]string, remoteDefaults map[strin
 			efforts[id] = v
 		}
 	}
+
 	for id, v := range remoteDefaults {
 		if v != "" {
 			defs[id] = v
 		}
 	}
+
 	return efforts, defs
 }

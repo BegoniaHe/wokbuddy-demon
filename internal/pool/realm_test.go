@@ -12,38 +12,43 @@ import (
 func realmPool(t *testing.T) *Pool {
 	t.Helper()
 	withNoPickGap(t)
-	auth.SetGlobalEnabled(true)
-	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
-	p := New("")
+
+	pool := New("")
 	// CN 账号（显式 cn realm 或空 realm+cn domain 均可）→ Realm()=="cn"
-	p.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
-	p.Add(&auth.Auth{UID: "cn2", Domain: ""}) // 空 domain → cn
+	pool.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
+	pool.Add(&auth.Auth{UID: "cn2", Domain: ""}) // 空 domain → cn
 	// global 账号 → Realm()=="global"
-	p.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
-	p.Add(&auth.Auth{UID: "g2", Domain: "workbuddy.ai"})
-	return p
+	pool.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
+	pool.Add(&auth.Auth{UID: "g2", Domain: "workbuddy.ai"})
+
+	return pool
 }
 
 // realmOf 直接读账号 realm（等价 e.a.Realm()）。
 func realmOf(a *auth.Auth) string { return a.Realm() }
 
 func TestAvailableUIDsForRealm(t *testing.T) {
-	p := realmPool(t)
+	t.Parallel()
+	pool := realmPool(t)
 
 	// 全部 healthy → cn 集合只有 cn1/cn2，global 集合只有 g1/g2。
-	got := p.AvailableUIDsForRealm("cn")
+	got := pool.AvailableUIDsForRealm("cn")
+
 	want := []string{"cn1", "cn2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AvailableUIDsForRealm(cn)=%v want %v", got, want)
 	}
-	got = p.AvailableUIDsForRealm("global")
+
+	got = pool.AvailableUIDsForRealm("global")
+
 	want = []string{"g1", "g2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AvailableUIDsForRealm(global)=%v want %v", got, want)
 	}
 
 	// realm=="" 退化为现状（等价 AvailableUIDs：全部 healthy）。
-	got = p.AvailableUIDsForRealm("")
+	got = pool.AvailableUIDsForRealm("")
+
 	want = []string{"cn1", "cn2", "g1", "g2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AvailableUIDsForRealm()=%v want %v", got, want)
@@ -51,22 +56,26 @@ func TestAvailableUIDsForRealm(t *testing.T) {
 }
 
 func TestAvailableUIDsForModelRealm(t *testing.T) {
-	p := realmPool(t)
+	t.Parallel()
+	pool := realmPool(t)
 	// 6004 模型冷却只落在 cn-1 上 → AvailableUIDsForModelRealm("glm-5.2","cn") 排除它，
 	// 但 cn 集合至少还保底 cn-2；global 集合不受 cn 冷却影响。
-	p.CooldownSoftForModel("cn1", 10*time.Minute, time.Now().Add(30*time.Minute), "glm-5.2", "model 6004")
+	pool.CooldownSoftForModel("cn1", 10*time.Minute, time.Now().Add(30*time.Minute), "glm-5.2", "model 6004")
 
-	got := p.AvailableUIDsForModelRealm("glm-5.2", "cn")
+	got := pool.AvailableUIDsForModelRealm("glm-5.2", "cn")
 	if len(got) != 1 || got[0] != "cn2" {
 		t.Errorf("AvailableUIDsForModelRealm(glm-5.2,cn)=%v want [cn2]", got)
 	}
-	got = p.AvailableUIDsForModelRealm("glm-5.2", "global")
+
+	got = pool.AvailableUIDsForModelRealm("glm-5.2", "global")
+
 	want := []string{"g1", "g2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AvailableUIDsForModelRealm(glm-5.2,global)=%v want %v", got, want)
 	}
 	// realm=="" → 等价 AvailableUIDsForModel（模型豁免照常：cn1 仍被该模型冷却排除）。
-	got = p.AvailableUIDsForModelRealm("glm-5.2", "")
+	got = pool.AvailableUIDsForModelRealm("glm-5.2", "")
+
 	want = []string{"cn2", "g1", "g2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AvailableUIDsForModelRealm(glm-5.2)=%v want %v", got, want)
@@ -74,31 +83,38 @@ func TestAvailableUIDsForModelRealm(t *testing.T) {
 }
 
 func TestWeightedAvailableUIDsForModelRealm(t *testing.T) {
-	p := realmPool(t)
+	t.Parallel()
+	pool := realmPool(t)
 	now := time.Now()
-	p.SetCreditsDetailed("cn2", 100, 100, 100, now.Add(time.Hour), 100)
+	pool.SetCreditsDetailed("cn2", 100, 100, 100, now.Add(time.Hour), 100)
 
-	got := p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
+	got := pool.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
+
 	want := []string{"cn1", "cn2", "cn2", "cn2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("weighted cn candidates=%v want %v", got, want)
 	}
 
 	// 在途满载账号不进入候选，快过期权重不得突破现有并发上限。
-	p.SetMaxInFlight(1)
-	if !p.Acquire("cn2") {
+	pool.SetMaxInFlight(1)
+
+	if !pool.Acquire("cn2") {
 		t.Fatal("failed to acquire cn2")
 	}
-	got = p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
+
+	got = pool.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
 	want = []string{"cn1"}
-	p.Release("cn2")
+
+	pool.Release("cn2")
+
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("in-flight-full weighted candidates=%v want %v", got, want)
 	}
 
 	// 关闭总开关后逐账号只出现一次，旧行为完全恢复。
-	p.SetPreferExpiring(false)
-	got = p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
+	pool.SetPreferExpiring(false)
+	got = pool.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
+
 	want = []string{"cn1", "cn2"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("disabled weighted cn candidates=%v want %v", got, want)
@@ -106,32 +122,36 @@ func TestWeightedAvailableUIDsForModelRealm(t *testing.T) {
 }
 
 func TestPickExcludingForRealm(t *testing.T) {
-	p := realmPool(t)
+	t.Parallel()
+	pool := realmPool(t)
 	// realm=cn → 只从 cn 集合选。
 	seen := map[string]bool{}
+
 	for range 50 {
-		a := p.PickExcludingForRealm(nil, "", "cn")
-		if a == nil {
+		account2 := pool.PickExcludingForRealm(nil, "", "cn")
+		if account2 == nil {
 			t.Fatal("PickExcludingForRealm(cn) returned nil")
 		}
-		seen[a.UID] = true
-		if realmOf(a) != "cn" {
-			t.Fatalf("PickExcludingForRealm(cn) returned global account %s", a.UID)
+
+		seen[account2.UID] = true
+		if realmOf(account2) != "cn" {
+			t.Fatalf("PickExcludingForRealm(cn) returned global account %s", account2.UID)
 		}
 	}
 	// global 同样只从 global 集合。
 	for range 50 {
-		a := p.PickExcludingForRealm(nil, "", "global")
-		if a == nil {
+		account := pool.PickExcludingForRealm(nil, "", "global")
+		if account == nil {
 			t.Fatal("PickExcludingForRealm(global) returned nil")
 		}
-		if realmOf(a) != "global" {
-			t.Fatalf("PickExcludingForRealm(global) returned cn account %s", a.UID)
+
+		if realmOf(account) != "global" {
+			t.Fatalf("PickExcludingForRealm(global) returned cn account %s", account.UID)
 		}
 	}
 	// realm=="" → 退化现状：所有 healthy 都能选。
 	for range 50 {
-		a := p.PickExcludingForRealm(nil, "", "")
+		a := pool.PickExcludingForRealm(nil, "", "")
 		if a == nil {
 			t.Fatal("PickExcludingForRealm() returned nil")
 		}
@@ -139,16 +159,19 @@ func TestPickExcludingForRealm(t *testing.T) {
 }
 
 func TestPickExcludingForRealmTried(t *testing.T) {
+	t.Parallel()
 	p := realmPool(t)
 	// tried 排除在 realm 过滤之后（维持请求级轮换语义）。
-	a := p.PickExcludingForRealm(map[string]bool{"cn1": true}, "", "cn")
-	if a == nil {
+	account := p.PickExcludingForRealm(map[string]bool{"cn1": true}, "", "cn")
+	if account == nil {
 		t.Fatal("tried cn1 → nil")
 	}
-	if a.UID == "cn1" {
-		t.Fatalf("tried cn1 still picked: %s", a.UID)
+
+	if account.UID == "cn1" {
+		t.Fatalf("tried cn1 still picked: %s", account.UID)
 	}
-	if realmOf(a) != "cn" {
-		t.Fatalf("picked non-cn %s", a.UID)
+
+	if realmOf(account) != "cn" {
+		t.Fatalf("picked non-cn %s", account.UID)
 	}
 }

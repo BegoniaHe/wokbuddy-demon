@@ -18,21 +18,26 @@ const trialPath = "/billing/ide/trial"
 // - `"code":14051`：HTTP ≥400 时 doJSON 把原始 JSON body 直接塞进 Msg。
 var trialAlreadyMarkers = []string{"code=14051", `"code":14051`}
 
+var errClaimTrialOnlyGlobalAccounts = errors.New("claim trial: only global accounts")
+
 // ClaimTrial 领取一次性 trial 加油包。仅 global 账号可调（CN 无此端点）：
 // 非 global → 直接报错（工具层还会再拦一道，这里是客户端侧防线）。
 // 返回 claimed：true=成功新领；false=已领过（幂等，不算失败）。
 func (c *Client) ClaimTrial(a *auth.Auth) (claimed bool, err error) {
 	if a == nil || a.Realm() != "global" {
-		return false, errors.New("claim trial: only global accounts")
+		return false, errClaimTrialOnlyGlobalAccounts
 	}
+
 	_, err = c.billingJSON(a, trialPath, nil)
 	if err != nil {
 		var ue *Error
 		if errors.As(err, &ue) && trialAlreadyErr(ue.Msg) {
 			return false, nil // 已领过：幂等成功，非错误
 		}
+
 		return false, err
 	}
+
 	return true, nil
 }
 
@@ -43,5 +48,6 @@ func trialAlreadyErr(msg string) bool {
 			return true
 		}
 	}
+
 	return false
 }

@@ -47,20 +47,25 @@ func (p *Pool) RestoreFromSnapshot() {
 	if store == nil || p.stateFp == "" {
 		return
 	}
+
 	localInfo, localErr := os.Stat(p.stateFp)
+
 	raw, ok := store.LoadState()
 	if !ok {
 		if localErr == nil {
 			log.Printf("pool: 恢复来源=本地 state.json（无 Redis 快照）")
 		}
+
 		return
 	}
+
 	var snap snapshot
 	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
 		// 快照无 savedAt：无法比较新旧，本地优先。
 		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
 	}
+
 	if localErr != nil {
 		// 本地不可用 → 采用快照（本地没有可"优先"的状态）。
 		//
@@ -71,12 +76,15 @@ func (p *Pool) RestoreFromSnapshot() {
 		p.adoptSnapshot(snap)
 		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)（本地 state.json 不可用: %v）",
 			snap.SavedAt.Format(time.RFC3339), localErr)
+
 		return
 	}
+
 	if !localInfo.ModTime().After(snap.SavedAt) {
 		// 快照不早于本地 → 采用快照。
 		p.adoptSnapshot(snap)
 		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
+
 		return
 	}
 	// 走到这里必然是「本地存在且严格新于快照」，日志结论属实。
@@ -90,10 +98,12 @@ func (p *Pool) startFlusher() {
 	// 在启动 goroutine 前同步写入（避免与测试对 flushInterval 的恢复写竞争）；
 	// stopCh 同步登记，Close 才能可靠停止（New 与 startFlusher 之间无并发窗口）。
 	p.stopCh = stopCh
+
 	interval := flushInterval
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
+
 		for {
 			select {
 			case <-t.C:
@@ -124,10 +134,12 @@ func (p *Pool) load() {
 	if err != nil {
 		return
 	}
+
 	var sf stateFile
 	if json.Unmarshal(raw, &sf) != nil {
 		return
 	}
+
 	p.applyAccountsLocked(sf.Accounts)
 }
 
@@ -135,77 +147,80 @@ func (p *Pool) load() {
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
 func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 	now := p.now()
-	for uid, s := range accounts {
-		p.byUID[uid] = buildEntryFromState(uid, s, now)
+
+	for uid := range accounts {
+		s := accounts[uid]
+		p.byUID[uid] = buildEntryFromState(uid, &s, now)
 	}
 }
 
 // buildEntryFromState 由持久化账号状态构造运行态 entry（placeholder 凭证，Add 时换全），
 // 并按当前时刻惰性清洗到期快照/熔断/降权/模型级冷却/成本账本等脏数据。
-func buildEntryFromState(uid string, s stateAccount, now time.Time) *entry {
+func buildEntryFromState(uid string, stateAccount2 *stateAccount, now time.Time) *entry {
 	// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 	// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
-	errTotal := s.ErrTotal
-	if int64(s.ErrCount) > errTotal {
-		errTotal = int64(s.ErrCount)
-	}
-	e := &entry{
+	errTotal := max(stateAccount2.ErrTotal, int64(stateAccount2.ErrCount))
+	entry2 := &entry{
 		a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-		proxySlot:                s.ProxySlot,
-		credits:                  s.Credits,
-		creditsTotal:             s.CreditsTotal,
-		creditsExpiring:          s.CreditsExpiring,
-		creditsEarliestExpiry:    s.CreditsEarliestExpiry,
-		creditsEarliestRemaining: s.CreditsEarliestRemaining,
-		disabled:                 s.Disabled,
-		paused:                   s.Paused,
-		reason:                   s.Reason,
-		until:                    s.Until,
-		coolKind:                 s.CoolKind,
-		successCount:             s.SuccessCount,
+		proxySlot:                stateAccount2.ProxySlot,
+		credits:                  stateAccount2.Credits,
+		creditsTotal:             stateAccount2.CreditsTotal,
+		creditsExpiring:          stateAccount2.CreditsExpiring,
+		creditsEarliestExpiry:    stateAccount2.CreditsEarliestExpiry,
+		creditsEarliestRemaining: stateAccount2.CreditsEarliestRemaining,
+		disabled:                 stateAccount2.Disabled,
+		paused:                   stateAccount2.Paused,
+		reason:                   stateAccount2.Reason,
+		until:                    stateAccount2.Until,
+		coolKind:                 stateAccount2.CoolKind,
+		successCount:             stateAccount2.SuccessCount,
 		errTotal:                 errTotal,
-		lastErr:                  s.LastErr,
-		lastSuccess:              s.LastSuccess,
-		lastCheckinDay:           s.LastCheckinDay,
-		tokenUsage:               s.TokenUsage,
-		softStreak:               s.SoftStreak,
-		sessionDeadFails:         s.SessionDeadFails,
-		consecutiveFails:         s.ConsecutiveFails,
+		lastErr:                  stateAccount2.LastErr,
+		lastSuccess:              stateAccount2.LastSuccess,
+		lastCheckinDay:           stateAccount2.LastCheckinDay,
+		tokenUsage:               stateAccount2.TokenUsage,
+		softStreak:               stateAccount2.SoftStreak,
+		sessionDeadFails:         stateAccount2.SessionDeadFails,
+		consecutiveFails:         stateAccount2.ConsecutiveFails,
 	}
 	// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
-	clampRestoredCredits(e, now)
+	clampRestoredCredits(entry2, now)
 	// 熔断器持久化恢复：breakerUntil 未过期才恢复（过期不复活），retryCount 仅在
 	// 熔断仍有效时保留（否则归零，不保留无用退避指数）。
-	if s.BreakerUntil != nil && now.Before(*s.BreakerUntil) {
-		e.breakerUntil = *s.BreakerUntil
-		e.retryCount = s.RetryCount
+	if stateAccount2.BreakerUntil != nil && now.Before(*stateAccount2.BreakerUntil) {
+		entry2.breakerUntil = *stateAccount2.BreakerUntil
+		entry2.retryCount = stateAccount2.RetryCount
 	}
 	// 连败降权：未过期才恢复（过期/零值不写不复活）。
-	if s.DegradeUntil != nil && now.Before(*s.DegradeUntil) {
-		e.degradeUntil = *s.DegradeUntil
+	if stateAccount2.DegradeUntil != nil && now.Before(*stateAccount2.DegradeUntil) {
+		entry2.degradeUntil = *stateAccount2.DegradeUntil
 	}
 	// 模型级独立冷却（6004 重置墙钟 / 11102 负缓存）：惰性过滤已过期条目。
-	e.modelCooldowns = restoreModelCooldowns(s.ModelCooldowns, now)
+	entry2.modelCooldowns = restoreModelCooldowns(stateAccount2.ModelCooldowns, now)
 	// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
 	// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
-	e.modelCost = restoreModelCosts(s.ModelCosts, now)
-	return e
+	entry2.modelCost = restoreModelCosts(stateAccount2.ModelCosts, now)
+
+	return entry2
 }
 
 // clampRestoredCredits 清洗恢复的到期快照：已过期、零剩余或超出总余额的脏数据不恢复。
-func clampRestoredCredits(e *entry, now time.Time) {
-	if e.creditsExpiring < 0 {
-		e.creditsExpiring = 0
+func clampRestoredCredits(entry4 *entry, now time.Time) {
+	if entry4.creditsExpiring < 0 {
+		entry4.creditsExpiring = 0
 	}
-	if e.creditsExpiring > e.credits {
-		e.creditsExpiring = e.credits
+
+	if entry4.creditsExpiring > entry4.credits {
+		entry4.creditsExpiring = entry4.credits
 	}
-	if e.creditsEarliestRemaining < 0 || e.creditsEarliestRemaining > e.credits {
-		e.creditsEarliestRemaining = 0
+
+	if entry4.creditsEarliestRemaining < 0 || entry4.creditsEarliestRemaining > entry4.credits {
+		entry4.creditsEarliestRemaining = 0
 	}
-	if e.creditsEarliestRemaining == 0 || e.creditsEarliestExpiry.IsZero() || !now.Before(e.creditsEarliestExpiry) {
-		e.creditsEarliestExpiry = time.Time{}
-		e.creditsEarliestRemaining = 0
+
+	if entry4.creditsEarliestRemaining == 0 || entry4.creditsEarliestExpiry.IsZero() || !now.Before(entry4.creditsEarliestExpiry) {
+		entry4.creditsEarliestExpiry = time.Time{}
+		entry4.creditsEarliestRemaining = 0
 	}
 }
 
@@ -215,16 +230,21 @@ func restoreModelCooldowns(src map[string]stateModelCooldown, now time.Time) map
 	if len(src) == 0 {
 		return nil
 	}
+
 	out := map[string]modelCooldown{}
+
 	for m, mc := range src {
 		if mc.Until.IsZero() || !now.Before(mc.Until) {
 			continue
 		}
+
 		out[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 	}
+
 	if len(out) == 0 {
 		return nil
 	}
+
 	return out
 }
 
@@ -234,16 +254,21 @@ func restoreModelCosts(src map[string]stateModelCost, now time.Time) map[string]
 	if len(src) == 0 {
 		return nil
 	}
+
 	out := map[string]modelCostEntry{}
+
 	for m, mc := range src {
 		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL || mc.CostPer1k < 0 {
 			continue
 		}
+
 		out[m] = modelCostEntry(mc)
 	}
+
 	if len(out) == 0 {
 		return nil
 	}
+
 	return out
 }
 
@@ -266,24 +291,30 @@ func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
 		return
 	}
-	sf := p.stateOverviewLocked()
-	raw, err := json.MarshalIndent(sf, "", "  ")
+
+	stateFile2 := p.stateOverviewLocked()
+
+	raw, err := json.MarshalIndent(stateFile2, "", "  ")
 	if err != nil {
 		p.notePersistFail(err)
 		return
 	}
+
 	if dir := filepath.Dir(p.stateFp); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
+
 	tmp := p.stateFp + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		p.notePersistFail(err)
 		return
 	}
+
 	if err := atomicwrite.Rename(tmp, p.stateFp); err != nil {
 		p.notePersistFail(err)
 		return
 	}
+
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
 		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
@@ -291,7 +322,7 @@ func (p *Pool) saveLocked() {
 	}
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
 	if p.store != nil {
-		snapRaw, err := json.Marshal(snapshot{stateFile: sf, SavedAt: p.now()})
+		snapRaw, err := json.Marshal(snapshot{stateFile: stateFile2, SavedAt: p.now()})
 		if err == nil {
 			p.store.SaveState(snapRaw)
 		}
@@ -308,99 +339,114 @@ func (p *Pool) saveLocked() {
 // 无事可做，运行态只能停留内存直至进程退出。
 func (p *Pool) notePersistFail(err error) {
 	p.dirty.Store(true)
+
 	if p.persistFails == 0 {
 		log.Printf("pool: state.json 落盘失败: %v", err)
 	} else if p.persistFails%persistLogEvery == 0 {
 		log.Printf("pool: state.json 连续落盘失败 %d 次: %v", p.persistFails, err)
 	}
+
 	p.persistFails++
 }
 
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := p.now()
+
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = buildStateAccount(e, now)
 	}
+
 	return sf
 }
 
 // buildStateAccount 把运行态 entry 序列化为持久化 stateAccount，并按当前时刻惰性过滤
 // 已过期的熔断/降权截止与模型级冷却/成本账本（过期不写）。
-func buildStateAccount(e *entry, now time.Time) stateAccount {
-	s := stateAccount{
-		ProxySlot:                e.proxySlot,
-		Credits:                  e.credits,
-		CreditsTotal:             e.creditsTotal,
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		Reason:                   e.reason,
-		Until:                    e.until,
-		CoolKind:                 e.coolKind,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		LastSuccess:              e.lastSuccess,
-		LastErr:                  e.lastErr,
-		LastCheckinDay:           e.lastCheckinDay,
-		TokenUsage:               e.tokenUsage,
-		SoftStreak:               e.softStreak,
-		SessionDeadFails:         e.sessionDeadFails,
-		ConsecutiveFails:         e.consecutiveFails,
-		CreditsExpiring:          e.creditsExpiring,
-		CreditsEarliestExpiry:    e.creditsEarliestExpiry,
-		CreditsEarliestRemaining: e.creditsEarliestRemaining,
+func buildStateAccount(entry5 *entry, now time.Time) stateAccount {
+	stateAccount2 := stateAccount{
+		ProxySlot:                entry5.proxySlot,
+		Credits:                  entry5.credits,
+		CreditsTotal:             entry5.creditsTotal,
+		Disabled:                 entry5.disabled,
+		Paused:                   entry5.paused,
+		Reason:                   entry5.reason,
+		Until:                    entry5.until,
+		CoolKind:                 entry5.coolKind,
+		SuccessCount:             entry5.successCount,
+		ErrTotal:                 entry5.errTotal,
+		LastSuccess:              entry5.lastSuccess,
+		LastErr:                  entry5.lastErr,
+		LastCheckinDay:           entry5.lastCheckinDay,
+		TokenUsage:               entry5.tokenUsage,
+		SoftStreak:               entry5.softStreak,
+		SessionDeadFails:         entry5.sessionDeadFails,
+		ConsecutiveFails:         entry5.consecutiveFails,
+		CreditsExpiring:          entry5.creditsExpiring,
+		CreditsEarliestExpiry:    entry5.creditsEarliestExpiry,
+		CreditsEarliestRemaining: entry5.creditsEarliestRemaining,
 	}
 	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
-	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
-		u := e.breakerUntil
-		s.BreakerUntil = &u
-		s.RetryCount = e.retryCount
+	if !entry5.breakerUntil.IsZero() && now.Before(entry5.breakerUntil) {
+		u := entry5.breakerUntil
+		stateAccount2.BreakerUntil = &u
+		stateAccount2.RetryCount = entry5.retryCount
 	}
 	// 连败降权截止：仅未过期才落盘。
-	if !e.degradeUntil.IsZero() && now.Before(e.degradeUntil) {
-		u := e.degradeUntil
-		s.DegradeUntil = &u
+	if !entry5.degradeUntil.IsZero() && now.Before(entry5.degradeUntil) {
+		u := entry5.degradeUntil
+		stateAccount2.DegradeUntil = &u
 	}
 	// 模型级独立冷却：惰性过滤已过期条目（Hits 不落盘，重启后 11102 退避从基数重学）。
-	s.ModelCooldowns = stateModelCooldownsOf(e, now)
+	stateAccount2.ModelCooldowns = stateModelCooldownsOf(entry5, now)
 	// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。
-	s.ModelCosts = stateModelCostsOf(e, now)
-	return s
+	stateAccount2.ModelCosts = stateModelCostsOf(entry5, now)
+
+	return stateAccount2
 }
 
 // stateModelCooldownsOf 收集未过期的模型级冷却为持久化记录；无有效条目返回 nil。
-func stateModelCooldownsOf(e *entry, now time.Time) map[string]stateModelCooldown {
-	if len(e.modelCooldowns) == 0 {
+func stateModelCooldownsOf(entry2 *entry, now time.Time) map[string]stateModelCooldown {
+	if len(entry2.modelCooldowns) == 0 {
 		return nil
 	}
+
 	out := map[string]stateModelCooldown{}
-	for m, mc := range e.modelCooldowns {
+
+	for m, mc := range entry2.modelCooldowns {
 		if mc.Until.IsZero() || !now.Before(mc.Until) {
 			continue
 		}
+
 		out[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 	}
+
 	if len(out) == 0 {
 		return nil
 	}
+
 	return out
 }
 
 // stateModelCostsOf 收集未过期的成本观测为持久化记录；无有效条目返回 nil。
-func stateModelCostsOf(e *entry, now time.Time) map[string]stateModelCost {
-	if len(e.modelCost) == 0 {
+func stateModelCostsOf(entry3 *entry, now time.Time) map[string]stateModelCost {
+	if len(entry3.modelCost) == 0 {
 		return nil
 	}
+
 	out := map[string]stateModelCost{}
-	for m, mc := range e.modelCost {
+
+	for m, mc := range entry3.modelCost {
 		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
 			continue
 		}
+
 		out[m] = stateModelCost(mc)
 	}
+
 	if len(out) == 0 {
 		return nil
 	}
+
 	return out
 }

@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -32,6 +33,8 @@ const (
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
+var errDoJSONFailed = errors.New("doJSON failed")
+
 // loginEndpoints 按 realm 返回设备授权三端点（auth/state、token、account）+ Origin。
 // realm=="global" → 国际版（workbuddy.ai 同域）；cn/非法/缺省 → CN（零回归）。
 // auth/state 的 platform 参数取官方 product.json authentication.attributes.platform
@@ -39,12 +42,15 @@ const (
 func loginEndpoints(realm string) (state, token, account, origin string) {
 	if realm == "global" {
 		base := upstreamBaseGlobal
+
 		return base + "/v2/plugin/auth/state?platform=workbuddy-ai",
 			base + "/v2/plugin/auth/token?state=",
 			base + "/v2/plugin/login/account?state=",
 			originRefererGlobal
 	}
+
 	base := upstreamBaseCN
+
 	return base + "/v2/plugin/auth/state?platform=workbuddy",
 		base + "/v2/plugin/auth/token?state=",
 		base + "/v2/plugin/login/account?state=",
@@ -70,6 +76,7 @@ func validUID(uid string) bool {
 	if uid == "" || len(uid) > 64 {
 		return false
 	}
+
 	for _, c := range uid {
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
@@ -77,6 +84,7 @@ func validUID(uid string) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -91,9 +99,11 @@ type apiEnvelope struct {
 func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json.RawMessage, int, error) {
 	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
+
 	commonHeaders(req, origin)
+
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	} else {
@@ -104,22 +114,27 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	req.Header.Set("X-No-User-Id", "true")
 	req.Header.Set("X-No-Enterprise-Id", "true")
 	req.Header.Set("X-No-Department-Info", "true")
+
 	resp, err := loginHTTP.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
 	defer resp.Body.Close()
+
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %w", resp.StatusCode, errDoJSONFailed)
 	}
+
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
 	}
+
 	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s: %w", env.Code, env.Msg, errDoJSONFailed)
 	}
+
 	return env.Data, resp.StatusCode, nil
 }
 
@@ -127,6 +142,7 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 // body 可带 {"realm":"global"}（缺省 cn）；state 会话记 realm，poll 同 realm 落盘。
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	realm := "cn"
+
 	if r.Body != nil {
 		var reqBody struct {
 			Realm string `json:"realm"`
@@ -137,20 +153,24 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+
 	epState, _, _, origin := loginEndpoints(realm)
+
 	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
 		return
 	}
-	var st struct {
+
+	var item struct {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
-	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
+	if err := json.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
 		writeErr(w, http.StatusBadGateway, "auth state: missing state or authUrl")
 		return
 	}
+
 	p.loginMu.Lock()
 	// 顺手回收过期会话，防"开弹窗走开"的 state 滞留。
 	for s, sess := range p.logins {
@@ -158,10 +178,11 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 			delete(p.logins, s)
 		}
 	}
-	p.logins[st.State] = loginSession{created: time.Now(), realm: realm}
+
+	p.logins[item.State] = loginSession{created: time.Now(), realm: realm}
 	p.loginMu.Unlock()
-	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, st.State[:min(8, len(st.State))])
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": st.AuthURL, "state": st.State, "realm": realm})
+	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, item.State[:min(8, len(item.State))])
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": item.AuthURL, "state": item.State, "realm": realm})
 }
 
 // loginToken auth/token 端点返回的凭证字段。
@@ -186,9 +207,18 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "missing state")
 		return
 	}
+
 	p.loginMu.Lock()
 	sess, known := p.logins[state]
+	// 超时会话直接回收：loginTTL 是授权 URL 的最长有效期，过期后不得再
+	// 继续 poll（否则一次发起即可无限期占用 state，且持续打上游）。
+	if known && time.Since(sess.created) > loginTTL {
+		delete(p.logins, state)
+
+		known = false
+	}
 	p.loginMu.Unlock()
+
 	if !known {
 		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
 		return
@@ -200,20 +230,22 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
 		return
 	}
+
 	if pending {
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "waiting for login"})
 		return
 	}
 
 	acct := fetchLoginAccount(sess.realm, state, tok.AccessToken)
-	a, status, msg := p.persistLoginAuth(sess.realm, tok, acct)
+
+	account, status, msg := p.persistLoginAuth(sess.realm, tok, acct)
 	if status != 0 {
 		writeErr(w, status, msg)
 		return
 	}
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
-	checkinMsg, remain, total := p.postLoginTasks(a, sess.realm, acct.UID)
+	checkinMsg, remain, total := p.postLoginTasks(account, sess.realm, acct.UID)
 
 	p.loginMu.Lock()
 	delete(p.logins, state)
@@ -234,25 +266,31 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 // 就绪返回 pending=true；成功返回解析后的凭证。
 func pollLoginToken(realm, state string) (loginToken, bool, error) {
 	_, epToken, _, origin := loginEndpoints(realm)
+
 	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
 	if err != nil {
 		return loginToken{}, false, err
 	}
+
 	var tok loginToken
+
 	_ = json.Unmarshal(tokRaw, &tok)
 	if tok.AccessToken == "" {
-		return loginToken{}, true, nil
+		return loginToken{AccessToken: "", RefreshToken: "", ExpiresIn: 0, Domain: ""}, true, nil
 	}
+
 	return tok, false, nil
 }
 
 // fetchLoginAccount 取 uid/nickname（失败不阻塞，仅缺展示名）。
 func fetchLoginAccount(realm, state, bearer string) loginAccount {
 	_, _, epAcct, origin := loginEndpoints(realm)
+
 	var acct loginAccount
 	if acctRaw, _, err := doJSON(http.MethodGet, epAcct+state, bearer, nil, origin); err == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
+
 	return acct
 }
 
@@ -273,7 +311,8 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 	if err := os.MkdirAll(p.cfg.AuthDir, 0o755); err != nil {
 		return nil, http.StatusInternalServerError, "mkdir auth dir: " + err.Error()
 	}
-	a := &auth.Auth{
+
+	account := &auth.Auth{
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
 		ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
@@ -285,77 +324,87 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 	}
 	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
 	if realm == "global" {
-		if _, err := auth.BackfillRealmFor(a, "global"); err != nil {
+		if _, err := auth.BackfillRealmFor(account, "global"); err != nil {
 			return nil, http.StatusInternalServerError, "set realm: " + err.Error()
 		}
 	} else {
 		// CN 也显式补 realm 键（幂等），让 auth 文件形态统一（与 LoadDir 存量迁移对齐）。
-		_, _ = a.BackfillRealm()
+		_, _ = account.BackfillRealm()
 	}
-	if err := a.SaveAtomic(); err != nil {
+
+	if err := account.SaveAtomic(); err != nil {
 		return nil, http.StatusInternalServerError, "save auth: " + err.Error()
 	}
-	p.cfg.Pool.Add(a)
+
+	p.cfg.Pool.Add(account)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
-	return a, 0, ""
+
+	return account, 0, ""
 }
 
 // postLoginTasks 登录完成后的签到/激活与余额刷新，返回 (提示消息, 余额, 总额)。
-// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取
-// （D4 门控同 scheduler：CN 任务端点对 global 不发起任何调用）。
-func (p *Panel) postLoginTasks(a *auth.Auth, realm, uid string) (string, int64, int64) {
+// realm 分支：CN 走 DailyCheckin；global 登录时改为注册激活 + trial 领取（签到由
+// 调度器统一执行，与 CN 同口径）；企业版跳过签到（上游不支持）。
+func (p *Panel) postLoginTasks(account2 *auth.Auth, realm, uid string) (string, int64, int64) {
 	checkinMsg := ""
 	if realm == "global" {
-		checkinMsg = p.activateGlobalLogin(a, uid)
-	} else if !a.IsEnterprise() {
+		checkinMsg = p.activateGlobalLogin(account2, uid)
+	} else if !account2.IsEnterprise() {
 		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
 		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
 		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
-		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+		if err := p.cfg.Upstream.DailyCheckin(account2); err != nil {
 			checkinMsg = err.Error()
 		}
 	}
+
 	remain, total := int64(-1), int64(0)
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+	if rm, tt, err := p.cfg.Upstream.UserResource(account2); err == nil {
 		remain, total = rm, tt
 		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 	}
+
 	return checkinMsg, remain, total
 }
 
 // activateGlobalLogin global 登录的注册激活 + trial 领取（幂等；失败不阻断登录结果，
 // auth 已落盘，只在返回字段里体现）。
-func (p *Panel) activateGlobalLogin(a *auth.Auth, uid string) string {
+func (p *Panel) activateGlobalLogin(account *auth.Auth, uid string) string {
 	checkinMsg := ""
 	// 注册激活（幂等）：region required 时自动补地区（白名单首个，HK）后重新激活。
-	if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(a); err != nil {
+	if activated, err := p.cfg.Upstream.GlobalCompleteRegistration(account); err != nil {
 		checkinMsg = "注册激活失败: " + err.Error()
 		log.Printf("panel: global 注册激活 uid=%s: %v", uid, err)
 	} else if activated {
 		log.Printf("panel: global 注册激活 uid=%s 完成", uid)
 	}
 	// trial 加油包（幂等 14051 = 已领过，非错误）。
-	if claimed, err := p.cfg.Upstream.ClaimTrial(a); err != nil {
+	if claimed, err := p.cfg.Upstream.ClaimTrial(account); err != nil {
 		checkinMsg = joinMsg(checkinMsg, "trial 领取失败: "+err.Error())
 		log.Printf("panel: global trial uid=%s: %v", uid, err)
 	} else if claimed {
 		log.Printf("panel: global trial uid=%s 已领", uid)
 	}
+
 	return checkinMsg
 }
 
 // joinMsg 拼接 login 完成后的提示消息（多段用「；」连接，空段跳过）。
 func joinMsg(parts ...string) string {
 	out := ""
-	for _, s := range parts {
-		if s == "" {
+
+	for _, item := range parts {
+		if item == "" {
 			continue
 		}
+
 		if out != "" {
 			out += "；"
 		}
-		out += s
+
+		out += item
 	}
+
 	return out
 }
 
