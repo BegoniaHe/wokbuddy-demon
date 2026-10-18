@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, postJSON } from '@/lib/api';
 import { AUTO_TASKS } from '@/lib/autoTasks';
 import { toast } from '@/components/Toaster';
+import { useConfirm } from '@/components/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import {
   Table,
@@ -40,6 +41,7 @@ interface Task {
 }
 
 export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () => void }) {
+  const { confirm, confirmDialog } = useConfirm();
   const qc = useQueryClient();
   const open = !!uid;
 
@@ -82,9 +84,12 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
   const autoAll = async () => {
     if (!uid) return;
     if (
-      !confirm(
-        '将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。\n过程约 1-2 分钟（含真实对话），确认继续？',
-      )
+      !(await confirm({
+        title: '执行一键任务？',
+        description:
+          '将依次执行：补报对话事件、领取 Buddy、glm-5.2 对话、尝试上报。过程约 1-2 分钟（含真实对话）。',
+        confirmText: '开始执行',
+      }))
     )
       return;
     try {
@@ -144,6 +149,7 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
   };
 
   return (
+    <>
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
       <DialogContent className="max-w-3xl" showCloseButton={false}>
         <DialogHeader>
@@ -243,5 +249,7 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
         </DialogFooter>
       </DialogContent>
     </Dialog>
+    {confirmDialog}
+    </>
   );
 }

@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, postJSON } from '@/lib/api';
 import { toast } from '@/components/Toaster';
+import { useConfirm } from '@/components/ConfirmDialog';
+import { LoadError } from '@/components/LoadError';
 import { Button } from '@/components/ui/button';
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
@@ -24,6 +26,7 @@ export function AgentsView() {
   const [baseURL, setBaseURL] = useState('http://127.0.0.1:7863');
   const [model, setModel] = useState('glm-5.2');
   const [busy, setBusy] = useState('');
+  const { confirm, confirmDialog } = useConfirm();
 
   const q = useQuery({
     queryKey: ['agents'],
@@ -49,7 +52,15 @@ export function AgentsView() {
   };
 
   const restore = async (c: AgentStatus) => {
-    if (!confirm('还原「' + c.name + '」到首次写入前？网关新建的文件会被删除。')) return;
+    if (
+      !(await confirm({
+        title: '还原「' + c.name + '」？',
+        description: '还原到首次写入前，网关新建的文件会被删除。',
+        confirmText: '还原',
+        destructive: true,
+      }))
+    )
+      return;
     setBusy(c.id);
     try {
       await postJSON('agents/' + c.id + '/restore', {});
@@ -57,7 +68,15 @@ export function AgentsView() {
     } catch (e) {
       const msg = (e as Error).message;
       if (msg.includes('修改')) {
-        if (!confirm(msg + '\n\n仍要强制还原？')) return;
+        if (
+          !(await confirm({
+            title: '仍要强制还原？',
+            description: msg,
+            confirmText: '强制还原',
+            destructive: true,
+          }))
+        )
+          return;
         try {
           await postJSON('agents/' + c.id + '/restore', { force: true });
           toast('已强制还原', 'ok');
@@ -103,7 +122,13 @@ export function AgentsView() {
           <CardDescription>写入前备份首次原件；还原按备份恢复。</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {q.error ? <p className="text-sm text-destructive">读取失败：{(q.error as Error).message}</p> : null}
+          {q.error ? (
+            <LoadError
+              variant={q.data === undefined ? 'page' : 'inline'}
+              message={(q.data === undefined ? '读取失败：' : '刷新失败：') + (q.error as Error).message}
+              onRetry={() => void q.refetch()}
+            />
+          ) : null}
           {clients.map((c) => (
             <div key={c.id} className="flex flex-wrap items-center gap-3 rounded-md border border-border p-3">
               <div className="min-w-0 flex-1">
@@ -130,6 +155,7 @@ export function AgentsView() {
           </p>
         </CardContent>
       </Card>
+      {confirmDialog}
     </>
   );
 }

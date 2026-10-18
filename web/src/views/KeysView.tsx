@@ -4,6 +4,8 @@ import { MoreHorizontal } from 'lucide-react';
 import { api, postJSON } from '@/lib/api';
 import { ago, fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
+import { useConfirm } from '@/components/ConfirmDialog';
+import { LoadError } from '@/components/LoadError';
 import type { ApiKey, ApiKeyLimits } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { Field, FieldLabel, FieldDescription } from '@/components/ui/field';
@@ -66,6 +68,7 @@ export function KeysView() {
   const [concurrent, setConcurrent] = useState('');
   const [models, setModels] = useState('');
   const [realm, setRealm] = useState<'' | 'cn' | 'global'>('');
+  const { confirm, confirmDialog } = useConfirm();
 
   const keysQ = useQuery({
     queryKey: ['keys'],
@@ -187,10 +190,23 @@ export function KeysView() {
             </div>
           </CardAction>
         </CardHeader>
+        {keysQ.data !== undefined && keysQ.error ? (
+          <LoadError
+            className="mx-3 mt-3"
+            message={'刷新失败：' + (keysQ.error as Error).message}
+            onRetry={() => void keysQ.refetch()}
+          />
+        ) : null}
         {keysQ.isLoading ? (
           <CardContent className="py-10 text-center text-muted-foreground">加载中…</CardContent>
-        ) : keysQ.error ? (
-          <CardContent className="py-10 text-center text-muted-foreground">读取失败：{(keysQ.error as Error).message}</CardContent>
+        ) : keysQ.error && keysQ.data === undefined ? (
+          <CardContent>
+            <LoadError
+              variant="page"
+              message={'读取失败：' + (keysQ.error as Error).message}
+              onRetry={() => void keysQ.refetch()}
+            />
+          </CardContent>
         ) : list.length === 0 ? (
           <CardContent className="py-10 text-center text-muted-foreground">暂无命名密钥。创建后即可分发给不同客户端，并在此查看各自的请求与 token 用量。</CardContent>
         ) : (
@@ -259,8 +275,16 @@ export function KeysView() {
                         <DropdownMenuContent align="end">
                           <DropdownMenuItem variant="destructive"
                             disabled={deleteM.isPending}
-                            onClick={() => {
-                              if (!confirm('删除密钥「' + k.name + '」将同时清除其用量记录，且不可恢复。确认删除？')) return;
+                            onClick={async () => {
+                              if (
+                                !(await confirm({
+                                  title: '删除密钥「' + k.name + '」？',
+                                  description: '将同时清除其用量记录，且不可恢复。',
+                                  confirmText: '删除',
+                                  destructive: true,
+                                }))
+                              )
+                                return;
                               deleteM.mutate(k.id);
                             }}
                           >
@@ -337,7 +361,7 @@ export function KeysView() {
               items={selectOptionItems(REALM_OPTIONS)}
               value={realm || 'auto'}
               onValueChange={(v) => setRealm((v === 'auto' ? '' : v) as '' | 'cn' | 'global')}>
-              <SelectTrigger>
+              <SelectTrigger aria-label="出口绑定">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -371,6 +395,7 @@ export function KeysView() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+      {confirmDialog}
     </>
   );
 }

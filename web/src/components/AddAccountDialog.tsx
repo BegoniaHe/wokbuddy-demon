@@ -45,6 +45,9 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   const [desktopErr, setDesktopErr] = useState('');
   const stateRef = useRef<string | null>(null);
   const timerRef = useRef<number | null>(null);
+  // 当前正在轮询的 state：标签页唤醒可能和 setInterval 同时触发，同一 state
+  // 并发轮询会让「已完成」与「state 已删除」两个响应互相覆盖（账号已添加却显示失败）。
+  const pollBusyRef = useRef<string | null>(null);
 
   const stopPoll = () => {
     if (timerRef.current) {
@@ -94,13 +97,18 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   };
 
   const poll = async () => {
-    if (!stateRef.current) return;
+    const state = stateRef.current;
+    if (!state || pollBusyRef.current === state) return;
+    pollBusyRef.current = state;
     try {
       const r = await api<{ done?: boolean; nickname?: string; uid?: string; realm?: string; credits?: number; credits_total?: number }>(
-        'login/poll?state=' + encodeURIComponent(stateRef.current),
+        'login/poll?state=' + encodeURIComponent(state),
       );
+      // state 已更换或本次登录已结算：丢弃过期响应，避免覆盖「已完成 / 已失败」。
+      if (stateRef.current !== state) return;
       if (r.done) {
         stopPoll();
+        stateRef.current = null;
         setPhase('done');
         setDoneMsg(
           '已添加 ' +
@@ -115,11 +123,33 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
         }, 1600);
       }
     } catch (e) {
+      if (stateRef.current !== state) return;
       stopPoll();
+      stateRef.current = null;
       setPhase('err');
       setErrMsg((e as Error).message + '（关闭后重新添加）');
+    } finally {
+      if (pollBusyRef.current === state) pollBusyRef.current = null;
     }
   };
+
+  // 标签页切回 / 窗口获得焦点 / 点击页面时立即补一次轮询。
+  // 浏览器会把后台定时器压到约 1 次/分钟，只靠 setInterval 会让用户扫码后
+  // 切回来仍停在「等待」；被遮挡（非隐藏）的窗口还不触发 visibilitychange。
+  useEffect(() => {
+    if (!open) return;
+    const wake = () => {
+      if (!document.hidden && stateRef.current) void poll();
+    };
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('focus', wake);
+    window.addEventListener('pointerdown', wake);
+    return () => {
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('focus', wake);
+      window.removeEventListener('pointerdown', wake);
+    };
+  }, [open]);
 
   const onImport = async (file: File) => {
     setImportMsg('');

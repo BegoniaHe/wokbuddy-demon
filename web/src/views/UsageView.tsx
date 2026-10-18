@@ -2,6 +2,7 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api, postJSON } from '@/lib/api';
 import { toast } from '@/components/Toaster';
+import { useConfirm } from '@/components/ConfirmDialog';
 import {
   fmtCredit,
   fmtCreditRatio,
@@ -162,6 +163,7 @@ export function UsageView() {
   const [trendMetric, setTrendMetric] = useState<TrendMetric>('tokens');
   const [backfilling, setBackfilling] = useState(false);
   const [backfillDays, setBackfillDays] = useState('7');
+  const { confirm, confirmDialog } = useConfirm();
 
   const rangeStr = trangeQuery(range, true).toString();
 
@@ -243,9 +245,17 @@ export function UsageView() {
               <Button
                 size="xs"
                 disabled={backfilling}
-                onClick={() => {
+                onClick={async () => {
                   const days = Number(backfillDays) || 7;
-                  if (!confirm(`从上游拉取最近 ${days} 天逐笔用量并按天覆盖本地用量桶（用于对账/回填），继续？`)) return;
+                  if (
+                    !(await confirm({
+                      title: '回填上游用量？',
+                      description:
+                        `从上游拉取最近 ${days} 天逐笔用量，并按天覆盖本地用量桶（用于对账/回填）。`,
+                      confirmText: '开始回填',
+                    }))
+                  )
+                    return;
                   setBackfilling(true);
                   void postJSON<{ records?: number; buckets?: number; failures?: Record<string, string> }>('usage/backfill', { days })
                     .then((r) => {
@@ -369,7 +379,7 @@ export function UsageView() {
                 items={selectOptionItems(SORT_OPTIONS)}
                 value={sort}
                 onValueChange={(v) => setSort(v as UsSort)}>
-                <SelectTrigger size="sm" className="w-32">
+                <SelectTrigger size="sm" className="w-32" aria-label="排序方式">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -499,6 +509,7 @@ export function UsageView() {
           </Table>
         </div>
       </Card>
+      {confirmDialog}
     </>
   );
 }
