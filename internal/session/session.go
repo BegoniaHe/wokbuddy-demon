@@ -263,9 +263,19 @@ func (r *Router) touch(key, uid string, now time.Time) {
 		r.mu.Unlock()
 		return
 	}
+	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；窗口已过期则顺手清掉
+	// avoid*，否则该会话会永久受 LowLoad 低水位门控。
+	suppressed := e.avoidUID == uid && now.Before(e.avoidUntil)
+	if !suppressed && e.avoidUID != "" && !now.Before(e.avoidUntil) {
+		e.avoidUID = ""
+		e.avoidUntil = time.Time{}
+	}
 	e.lastActive = now
 	r.entries[key] = e
 	r.mu.Unlock()
+	if suppressed {
+		return
+	}
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 

@@ -493,6 +493,19 @@ func TestStopWithoutStartDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestStopWithoutStartFlushes 未启动后台循环时 Stop 也应落盘一次。
+func TestStopWithoutStartFlushes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	r := New(path)
+	r.Add(time.Now(), "cn", "u1", "m", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
+
+	r.Stop()
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("Stop 未落盘: %v", err)
+	}
+}
+
 // TestStartIdempotent 重复 Start 不得启动两个循环（否则 Stop 会重复 close(done)）。
 func TestStartIdempotent(t *testing.T) {
 	r := New("")
