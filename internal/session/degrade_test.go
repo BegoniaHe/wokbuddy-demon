@@ -69,6 +69,59 @@ func TestDegradeAvoidsRebindWhenHashFallsOnOriginal(t *testing.T) {
 	}
 }
 
+// TestDegradeWindowSurvivesRebindAndUnbind 降级窗口独立于当前绑定：重新分配
+// 到其他账号后，即使该绑定失效或解绑，窗口内也不得绑回原账号。
+func TestDegradeWindowSurvivesRebindAndUnbind(t *testing.T) {
+	avail := []string{"a1", "a2", "a3"}
+	r := New(Config{TTL: time.Minute, Available: func() []string { return avail }})
+
+	r.Bind("c1", "a1")
+	r.Degrade("c1", "a1", time.Minute)
+	if uid, ok := r.Resolve("c1"); !ok || uid == "a1" {
+		t.Fatalf("降级后首次重分配 bind=%s ok=%v", uid, ok)
+	}
+
+	// a2 失效：重新分配必须避开 a1，落到 a3。
+	avail = []string{"a1", "a3"}
+	if uid, ok := r.Resolve("c1"); !ok || uid == "a1" {
+		t.Fatalf("降级窗口内换绑失效后回到原账号: bind=%s ok=%v", uid, ok)
+	}
+
+	// 解绑后重新分配同样不得回到 a1。
+	avail = []string{"a1", "a2", "a3"}
+	r.Unbind("c1")
+	if uid, ok := r.Resolve("c1"); !ok || uid == "a1" {
+		t.Fatalf("降级窗口内解绑后回到原账号: bind=%s ok=%v", uid, ok)
+	}
+}
+
+// TestDegradeKeepsPreviousWindow 换绑后的新账号再次降级，不得丢弃旧账号未过期的窗口。
+// 键 "tw-window-0" 只避开 a2 时哈希恰好落在 a1，能暴露单槽覆盖。
+func TestDegradeKeepsPreviousWindow(t *testing.T) {
+	const key = "tw-window-0"
+	r := routerWith(newCountingStore(), []string{"a1", "a2", "a3"}, time.Minute)
+	r.Bind(key, "a1")
+	r.Degrade(key, "a1", time.Minute)
+	r.Bind(key, "a2")
+	r.Degrade(key, "a2", time.Minute)
+
+	r.mu.RLock()
+	list := r.avoid[key]
+	r.mu.RUnlock()
+	if len(list) != 2 {
+		t.Fatalf("未保留两条降级窗口: %#v", list)
+	}
+
+	// a1/a2 都在窗口内：反复重分配只能落到 a3。
+	for range 20 {
+		r.Unbind(key)
+		uid, ok := r.Resolve(key)
+		if !ok || uid != "a3" {
+			t.Fatalf("多窗口下重分配 bind=%s ok=%v want a3", uid, ok)
+		}
+	}
+}
+
 // TestTouchPreservesDegrade touch 只滚动 lastActive，不得覆盖并发 Degrade 写入的
 // avoid 窗口（快路径读与 touch 之间可能已完成降级）。
 func TestTouchPreservesDegrade(t *testing.T) {
@@ -78,13 +131,13 @@ func TestTouchPreservesDegrade(t *testing.T) {
 	r.touch("c1", "a1", time.Now())
 
 	r.mu.RLock()
-	e, ok := r.entries["c1"]
+	_, ok := r.entries["c1"]
 	r.mu.RUnlock()
 	if !ok {
 		t.Fatal("降级中的条目应保留")
 	}
-	if e.avoidUID != "a1" || !e.avoidUntil.After(time.Now()) {
-		t.Fatalf("touch 不得清掉降级窗口: avoidUID=%q avoidUntil=%v", e.avoidUID, e.avoidUntil)
+	if list, ok := r.avoid["c1"]; !ok || len(list) != 1 || list[0].uid != "a1" || !list[0].until.After(time.Now()) {
+		t.Fatalf("touch 不得清掉降级窗口: %#v", list)
 	}
 }
 
@@ -126,10 +179,10 @@ func TestTouchClearsExpiredAvoid(t *testing.T) {
 		t.Fatalf("bind=%s ok=%v want a1 after low-load re-inclusion", uid, ok)
 	}
 	r.mu.RLock()
-	e := r.entries["c1"]
+	_, hasAvoid := r.avoid["c1"]
 	r.mu.RUnlock()
-	if e.avoidUID != "" {
-		t.Fatalf("回纳后 avoid 未清除: avoidUID=%q", e.avoidUID)
+	if hasAvoid {
+		t.Fatal("回纳后 avoid 未清除")
 	}
 
 	r.cfg.LowLoad = func(string, string) bool { return false }

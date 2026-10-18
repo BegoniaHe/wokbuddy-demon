@@ -25,10 +25,17 @@ import (
 type entry struct {
 	uid        string
 	lastActive time.Time
-	// avoidUID/avoidUntil 软逃逸后的回纳抑制（issue #116 P0-1）：窗口内不再绑定回
-	// 原账号；窗口结束后仍需 LowLoad 回落低水位才允许复用。
-	avoidUID   string
-	avoidUntil time.Time
+}
+
+// avoidance 软逃逸后的回纳抑制（issue #116 P0-1）：窗口内不再绑定回原账号；
+// 窗口结束后仍需 LowLoad 回落低水位才允许复用。独立于当前绑定保存，重新分配
+// 或 Unbind 后仍然有效，不会因 entry 被覆盖/删除而丢失。
+//
+// 同一会话按账号保存多条窗口：换绑后的新账号再次降级时，旧账号未过期的窗口
+// 必须保留，否则下一轮分配可能立刻回到旧账号。
+type avoidance struct {
+	uid   string
+	until time.Time
 }
 
 // Config 路由依赖；Available 返回"可用账号"（healthy 且未占满在途）的有序 uid 列表，
@@ -55,6 +62,7 @@ type Config struct {
 type Router struct {
 	mu      sync.RWMutex
 	entries map[string]entry
+	avoid   map[string][]avoidance
 	cfg     Config
 	stop    chan struct{}
 }
@@ -71,7 +79,7 @@ func New(cfg Config) *Router {
 	if cfg.GCInterval <= 0 {
 		cfg.GCInterval = 5 * time.Minute
 	}
-	return &Router{entries: map[string]entry{}, cfg: cfg}
+	return &Router{entries: map[string]entry{}, avoid: map[string][]avoidance{}, cfg: cfg}
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -162,8 +170,12 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
 	e, found := r.entries[key]
+	a, hasAvoid := r.avoid[key]
+	// avoidActive 必须在锁内判定：Degrade/touch/Bind 会原地改写同一底层切片，
+	// 只复制 slice header 出锁再遍历仍会与写方并发。
+	avoid := r.avoidActive(a, hasAvoid, e, model, now)
 	r.mu.RUnlock()
-	if found && !expired(e, now, r.cfg.TTL) && available[e.uid] && !r.avoidActive(e, model, now) {
+	if found && !expired(e, now, r.cfg.TTL) && available[e.uid] && !avoid {
 		r.touch(key, e.uid, now)
 		return e.uid, true
 	}
@@ -179,7 +191,8 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 func (r *Router) resolveSlowLocked(key, model string, now time.Time, available map[string]bool) (string, bool) {
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found := r.entries[key]; found && !expired(e2, now, r.cfg.TTL) {
-		avoid := r.avoidActive(e2, model, now)
+		a, hasAvoid := r.avoid[key]
+		avoid := r.avoidActive(a, hasAvoid, e2, model, now)
 		if available[e2.uid] && !avoid {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
@@ -187,7 +200,7 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 		if !avoid {
 			delete(r.entries, key) // 失效：清掉再分配
 		}
-		// 降级抑制中：保留原条目，让 pickUID 读取 avoidUID 后避开原账号。
+		// 降级抑制中：保留原条目，让 pickUID 读取 avoid 记录后避开原账号。
 	}
 
 	uids := r.availableSlice(model)
@@ -211,10 +224,10 @@ func (r *Router) pickUID(key string, uids []string, model string, now time.Time)
 	for _, v := range r.entries {
 		bound[v.uid] = true
 	}
-	avoidUID := r.avoidedUID(key, model, now)
+	avoided := r.avoidedUIDs(key, model, now)
 	var idle []string
 	for _, u := range uids {
-		if u == avoidUID {
+		if avoided[u] {
 			continue
 		}
 		if !bound[u] {
@@ -225,28 +238,37 @@ func (r *Router) pickUID(key string, uids []string, model string, now time.Time)
 	if len(pool) == 0 {
 		pool = uids
 	}
-	if avoidUID != "" {
-		if filtered := withoutUID(pool, avoidUID); len(filtered) > 0 {
+	if len(avoided) > 0 {
+		if filtered := withoutUIDs(pool, avoided); len(filtered) > 0 {
 			pool = filtered
 		}
 	}
 	return pool[hashIndex(key, len(pool))]
 }
 
-// avoidedUID 返回当前降级抑制中的账号（无则空串）。
-func (r *Router) avoidedUID(key, model string, now time.Time) string {
-	e, ok := r.entries[key]
-	if !ok || !r.avoidActive(e, model, now) {
-		return ""
+// avoidedUIDs 返回当前降级抑制中的账号集合。窗口内始终避开；窗口结束后仅在
+// LowLoad 未回落低水位时继续避开。
+func (r *Router) avoidedUIDs(key, model string, now time.Time) map[string]bool {
+	var out map[string]bool
+	for _, a := range r.avoid[key] {
+		if a.uid == "" {
+			continue
+		}
+		if now.Before(a.until) || (r.cfg.LowLoad != nil && !r.cfg.LowLoad(model, a.uid)) {
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[a.uid] = true
+		}
 	}
-	return e.avoidUID
+	return out
 }
 
-// withoutUID 返回去掉指定 uid 的副本；结果为空时保持原列表（单账号池不饿死）。
-func withoutUID(uids []string, uid string) []string {
+// withoutUIDs 返回去掉指定账号的副本；结果为空时保持原列表（单账号池不饿死）。
+func withoutUIDs(uids []string, avoided map[string]bool) []string {
 	out := make([]string, 0, len(uids))
 	for _, u := range uids {
-		if u != uid {
+		if !avoided[u] {
 			out = append(out, u)
 		}
 	}
@@ -254,7 +276,7 @@ func withoutUID(uids []string, uid string) []string {
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
-// 写锁内 re-check：快路径读取与 touch 之间可能发生 Degrade（写入 avoid*）或
+// 写锁内 re-check：快路径读取与 touch 之间可能发生 Degrade（写入 avoid）或
 // Unbind（删除条目）；直接覆盖会把降级窗口清掉/让已解绑的会话复活。
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
@@ -263,12 +285,25 @@ func (r *Router) touch(key, uid string, now time.Time) {
 		r.mu.Unlock()
 		return
 	}
-	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；窗口已过期则顺手清掉
-	// avoid*，否则该会话会永久受 LowLoad 低水位门控。
-	suppressed := e.avoidUID == uid && now.Before(e.avoidUntil)
-	if !suppressed && e.avoidUID != "" && !now.Before(e.avoidUntil) {
-		e.avoidUID = ""
-		e.avoidUntil = time.Time{}
+	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；已过期窗口顺手清掉，
+	// 否则该会话会永久受 LowLoad 低水位门控。
+	suppressed := false
+	if list, hasAvoid := r.avoid[key]; hasAvoid {
+		kept := list[:0]
+		for _, a := range list {
+			if !now.Before(a.until) {
+				continue
+			}
+			if a.uid == uid {
+				suppressed = true
+			}
+			kept = append(kept, a)
+		}
+		if len(kept) == 0 {
+			delete(r.avoid, key)
+		} else {
+			r.avoid[key] = kept
+		}
 	}
 	e.lastActive = now
 	r.entries[key] = e
@@ -289,24 +324,52 @@ func (r *Router) Bind(key, uid string) {
 	now := time.Now()
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
+	// 绑定成功即回纳证据：清除该账号的抑制与已过期窗口；换绑到其他账号时
+	// 保留其余未过期窗口，防止旧账号立刻又被重新绑定。
+	if list, ok := r.avoid[key]; ok {
+		kept := list[:0]
+		for _, a := range list {
+			if a.uid == uid || !now.Before(a.until) {
+				continue
+			}
+			kept = append(kept, a)
+		}
+		if len(kept) == 0 {
+			delete(r.avoid, key)
+		} else {
+			r.avoid[key] = kept
+		}
+	}
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
-// avoidActive 报告会话是否仍处于降级抑制：窗口内禁止复用原账号；窗口结束后
-// 仍要求 LowLoad 低水位。未配置 LowLoad 时窗口结束即解除。
-func (r *Router) avoidActive(e entry, model string, now time.Time) bool {
-	if e.avoidUID == "" || e.avoidUID != e.uid {
+// avoidActive 报告会话当前绑定是否仍处于降级抑制：窗口内禁止复用原账号；
+// 窗口结束后仍要求 LowLoad 低水位。绑定已换到其他账号时不再抑制。
+// 调用方须持有 r.mu（读锁或写锁）并在锁内调用：Degrade/Bind/touch 会原地改写
+// 切片元素，锁外遍历同一底层数组会与写方数据竞争。
+func (r *Router) avoidActive(list []avoidance, found bool, e entry, model string, now time.Time) bool {
+	if !found || e.uid == "" {
 		return false
 	}
-	if now.Before(e.avoidUntil) {
+	var until time.Time
+	for _, a := range list {
+		if a.uid == e.uid && a.until.After(until) {
+			until = a.until
+		}
+	}
+	if until.IsZero() {
+		return false
+	}
+	if now.Before(until) {
 		return true
 	}
 	return r.cfg.LowLoad != nil && !r.cfg.LowLoad(model, e.uid)
 }
 
-// Degrade 软逃逸后把当前绑定置为降级：窗口内不绑定回原账号，并删除 Redis 镜像。
-// 绑定本身保留在内存，用于窗口结束后做低水位回纳判定。
+// Degrade 软逃逸后把账号置为降级：窗口内不绑定回原账号，并删除 Redis 镜像。
+// 抑制独立于当前绑定保存，重新分配/解绑后仍然有效，直到窗口结束且低水位回纳。
+// 同一会话可同时抑制多个账号；重复降级同一账号取更晚的窗口结束时间。
 func (r *Router) Degrade(key, uid string, d time.Duration) {
 	if key == "" || uid == "" {
 		return
@@ -318,8 +381,23 @@ func (r *Router) Degrade(key, uid string, d time.Duration) {
 		r.mu.Unlock()
 		return
 	}
-	e.avoidUID = uid
-	e.avoidUntil = now.Add(d)
+	until := now.Add(d)
+	list := r.avoid[key]
+	merged := false
+	for i := range list {
+		if list[i].uid != uid {
+			continue
+		}
+		if until.After(list[i].until) {
+			list[i].until = until
+		}
+		merged = true
+		break
+	}
+	if !merged {
+		list = append(list, avoidance{uid: uid, until: until})
+	}
+	r.avoid[key] = list
 	e.lastActive = now
 	r.entries[key] = e
 	r.mu.Unlock()
@@ -358,6 +436,25 @@ func (r *Router) gcOnce(now time.Time) int {
 	}
 	for _, key := range expiredKeys {
 		delete(r.entries, key)
+		delete(r.avoid, key)
+	}
+	// 已解绑且窗口过期的抑制记录不再有用（绑定中的过期记录保留给 LowLoad 门控，
+	// 由 touch 在回纳时清除）。
+	for key, list := range r.avoid {
+		if _, bound := r.entries[key]; bound {
+			continue
+		}
+		kept := list[:0]
+		for _, a := range list {
+			if now.Before(a.until) {
+				kept = append(kept, a)
+			}
+		}
+		if len(kept) == 0 {
+			delete(r.avoid, key)
+		} else {
+			r.avoid[key] = kept
+		}
 	}
 	r.mu.Unlock()
 	for _, key := range expiredKeys {
