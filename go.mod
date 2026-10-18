@@ -2,7 +2,10 @@ module github.com/BegoniaHe/wokbuddy-demon
 
 go 1.27
 
-require github.com/redis/go-redis/v9 v9.23.0
+require (
+	github.com/redis/go-redis/v9 v9.23.0
+	go.uber.org/goleak v1.3.0
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

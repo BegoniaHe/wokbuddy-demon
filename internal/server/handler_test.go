@@ -7,13 +7,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/iotest"
 	"time"
+
+	"go.uber.org/goleak"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -32,7 +33,12 @@ func TestMain(m *testing.M) {
 	// 测试期去掉轮换退避的真实等待（默认 500ms/次，16 条轮换用例累计约 7s）。
 	// 仅影响轮换间 sleep，不改任何换号/退避决策语义（无测试断言其时长）。
 	rotateBackoffBase = 0
-	os.Exit(m.Run())
+	goleak.VerifyTestMain(m,
+		// 测试用的 httptest 服务与自定义 Transport 会保留 keep-alive 空闲连接，
+		// 其读写循环属标准库连接池，不是被测代码泄漏的 goroutine。
+		goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
+		goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
+	)
 }
 
 const sseOK = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"你好\"}}]}\n\n" +
