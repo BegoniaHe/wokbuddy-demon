@@ -42,8 +42,9 @@ type auditEntry struct {
 	IP         string `json:"ip,omitempty"`
 	UserAgent  string `json:"user_agent,omitempty"`
 	AuthFailed bool   `json:"auth_failed,omitempty"`
-	// Panic 标记 handler 在写出响应前 panic（此时 Status 记为 500）。审计不能
-	// 因为 panic 跳过：部分写操作可能已生效，缺记录会留下无法追溯的变更。
+	// Panic 标记 handler 发生 panic（未写出响应头时 Status 记为 500；已写出
+	// 的响应仍按实际状态记录）。审计不能因为 panic 跳过：部分写操作可能已
+	// 生效，缺记录会留下无法追溯的变更。
 	Panic bool `json:"panic,omitempty"`
 }
 

@@ -79,11 +79,13 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// 先取名额再起 goroutine：账号多时只会有 scanWorkers 个 goroutine
+		// 同时在跑，而不是每个账号都留一个阻塞在信号量上的 goroutine。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(i int, uid string) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			account := p.cfg.Pool.AuthByUID(uid)
@@ -307,11 +309,13 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 			continue
 		}
 
+		// 先取名额再起 goroutine（同 tasksScanAll）：账号多时不在信号量上
+		// 堆积阻塞的 goroutine。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(idx int, queueAcct *auth.Auth) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			one := queueAccount{a: queueAcct}
