@@ -87,13 +87,9 @@ type streamAggregator struct {
 	validEvents   int
 	sawDone       bool // 上游显式发过 data: [DONE]（正常收尾）
 	toolCalls     map[int]map[string]any
-	toolOrder     []int
-	// toolSeq 缺 index 的 tool_call 的分配序号源：跨帧延续「最近分配」槽位，
-	// 同帧内递增（见 mergeToolCallsChunk 注释）。
-	toolSeq int
-	// idIndex id → 已分配的 index：跨帧持续（延续碎片的 id 常出现在后续帧），
-	// 供缺 index 时按 id 归位既有调用（见 mergeToolCallsChunk 注释）。
-	idIndex map[string]int
+	// tools 解析 tool_call 归属 index（兼容上游省略 index 的形态）；聚合与逐帧
+	// 透传路径共用同一套规则。
+	tools *toolIndex
 	// guard 聚合总量上限（issue #113）：content/reasoning/tool_call arguments
 	// 三条写入路径都经它。超限即失败，不返回残缺成功响应。
 	guard aggregateGuard
@@ -105,7 +101,7 @@ func newStreamAggregator() *streamAggregator {
 		role:         "assistant",
 		finishReason: "stop",
 		toolCalls:    map[int]map[string]any{},
-		idIndex:      map[string]int{},
+		tools:        newToolIndex(),
 	}
 }
 
@@ -258,43 +254,80 @@ func (a *streamAggregator) appendContent(txt string) error {
 	return nil
 }
 
-// nextToolIndex 分配下一个不冲突的缺 index 序号：从 toolSeq 起递增跳过既有
-// index（合规流的 index 是 0..N-1，缺 index 的补位不能覆盖它们）。
-func (a *streamAggregator) nextToolIndex() int {
-	for {
-		idx := a.toolSeq
-		a.toolSeq++
-		if _, used := a.toolCalls[idx]; !used {
-			return idx
-		}
-	}
-}
-
-// toolCallIndex 解析单个 tool_call 的归属 index，兼容上游省略 index 的形态。
+// toolIndex 解析 tool_call 的归属 index，兼容上游省略 index 的形态。
 //
 // index 缺失兼容：OpenAI 规范要求 delta 帧的 tool_call 带 index（标记分片归属），
 // 但部分上游省略它。此前缺 index 一律归 0——多调用场景下不同 call 被合并进同一
-// index 槽，arguments 串联、name 互相覆盖（数据污染）。修法按「id 优先、lastIdx 兜底」：
+// index 槽，arguments 串联、name 互相覆盖（数据污染）。归位规则：
 //   - 带 index → 按 index 累积（合规形态，零改动）；
 //   - 缺 index 带 id 且 id 已见过 → 延续该 id 所在 index；
 //   - 缺 index 带 id 且 id 是新的 → 开新序号（多调用不合并）；
 //   - 缺 index 无 id → 追加到最近收到碎片的 index（单个调用的延续分片无 id
 //     是标准形态），无既往则开新号。
-func (a *streamAggregator) toolCallIndex(call map[string]any) int {
-	if v, ok := call["index"].(float64); ok {
-		return int(v)
-	}
-	cid, _ := call["id"].(string)
-	if cid != "" {
-		if mid, seen := a.idIndex[cid]; seen {
-			return mid // 该 id 已归位过：延续既有调用（跨帧有效）
+//
+// 聚合路径与逐帧透传路径共用本类型，避免两条路径对「缺 index」给出不同结论。
+type toolIndex struct {
+	seq      int
+	order    []int
+	byID     map[string]int
+	occupied map[int]bool
+}
+
+func newToolIndex() *toolIndex {
+	return &toolIndex{byID: map[string]int{}, occupied: map[int]bool{}}
+}
+
+// next 分配下一个不冲突的缺 index 序号：从 seq 起递增跳过既有 index
+// （合规流的 index 是 0..N-1，缺 index 的补位不能覆盖它们）。
+func (t *toolIndex) next() int {
+	for {
+		idx := t.seq
+		t.seq++
+		if !t.occupied[idx] {
+			return idx
 		}
-		return a.nextToolIndex()
 	}
-	if len(a.toolOrder) > 0 {
-		return a.toolOrder[len(a.toolOrder)-1] // 无 id 碎片：延续最近调用
+}
+
+// resolve 返回单个 tool_call 的归属 index，并把 index/id 记入跨帧状态。
+func (t *toolIndex) resolve(call map[string]any) int {
+	if v, ok := call["index"].(float64); ok {
+		idx := int(v)
+		t.occupy(idx)
+		t.remember(call, idx)
+		return idx
 	}
-	return a.nextToolIndex()
+	if cid, _ := call["id"].(string); cid != "" {
+		if idx, seen := t.byID[cid]; seen {
+			return idx
+		}
+		idx := t.next()
+		t.occupy(idx)
+		t.byID[cid] = idx
+		return idx
+	}
+	if len(t.order) > 0 {
+		return t.order[len(t.order)-1] // 无 id 碎片：延续最近调用
+	}
+	idx := t.next()
+	t.occupy(idx)
+	return idx
+}
+
+// occupy 记录 index 已使用；首次出现时同步 order（结果按出现顺序输出）。
+func (t *toolIndex) occupy(idx int) {
+	if t.occupied[idx] {
+		return
+	}
+	t.occupied[idx] = true
+	t.order = append(t.order, idx)
+}
+
+// remember 记录 id → index，供后续缺 index 分片归位。
+func (t *toolIndex) remember(call map[string]any, idx int) {
+	if cid, _ := call["id"].(string); cid != "" {
+		t.byID[cid] = idx
+	}
 }
 
 // mergeToolCallsChunk 把一段 tool_calls 数组按 index 合并进累计表。
@@ -307,18 +340,11 @@ func (a *streamAggregator) mergeToolCallsChunk(tcs []any) error {
 		if !ok {
 			continue
 		}
-		idx := a.toolCallIndex(call)
+		idx := a.tools.resolve(call)
 		merged, seen := a.toolCalls[idx]
 		if !seen {
 			merged = map[string]any{"index": idx}
 			a.toolCalls[idx] = merged
-			a.toolOrder = append(a.toolOrder, idx)
-		}
-		if cid, _ := call["id"].(string); cid != "" {
-			a.idIndex[cid] = idx
-		}
-		if cid, _ := merged["id"].(string); cid != "" {
-			a.idIndex[cid] = idx
 		}
 		mergeToolCallDelta(merged, call)
 		if fn, _ := call["function"].(map[string]any); fn != nil {
@@ -385,12 +411,12 @@ func (a *streamAggregator) result() (map[string]any, error) {
 
 // attachToolCalls 把累计的 tool_calls 按序写入 message（截断流剔除残缺参数）。
 func (a *streamAggregator) attachToolCalls(message map[string]any) {
-	if len(a.toolOrder) == 0 {
+	if len(a.tools.order) == 0 {
 		return
 	}
-	sort.Ints(a.toolOrder)
-	calls := make([]map[string]any, 0, len(a.toolOrder))
-	for _, idx := range a.toolOrder {
+	sort.Ints(a.tools.order)
+	calls := make([]map[string]any, 0, len(a.tools.order))
+	for _, idx := range a.tools.order {
 		calls = append(calls, a.toolCalls[idx])
 	}
 	// P1b：流被截断时 tool_call 的 arguments 是残缺 JSON（解析失败），不把脏参数
@@ -497,7 +523,7 @@ func appendStringIfNonEmpty(dst, src map[string]any, key string) {
 //
 // seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
 // 只动 function.name 键，id/type/arguments 原样透传。
-func stripToolCallNames(obj map[string]any, seen map[int]bool) {
+func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
@@ -514,10 +540,7 @@ func stripToolCallNames(obj map[string]any, seen map[int]bool) {
 			if tc == nil {
 				continue
 			}
-			idx := 0
-			if v, ok := tc["index"].(float64); ok {
-				idx = int(v)
-			}
+			idx := tools.resolve(tc)
 			if seen[idx] {
 				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
 				if fn, _ := tc["function"].(map[string]any); fn != nil {
@@ -709,6 +732,10 @@ type streamWriter struct {
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen map[int]bool
 
+	// tools 与聚合路径共用同一套 tool_call index 归位规则：缺 index 时按
+	// id/最近调用归属，避免不同调用被当成同一 index 而误删 name。
+	tools *toolIndex
+
 	// firstID 透传流的消息级 id 基准：缓存首个非空上游 id，后续帧缺失/空串时复用
 	// （issue #35：同一条 SSE 消息所有帧共用一个真实 id，后台按 id 归并；此前中间帧
 	// 一律补 chatcmpl-wb2api 哨兵，造成同流 id 分裂）。全流无真实 id → 才出现哨兵。
@@ -747,6 +774,7 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 		writeTimeout: clientWriteTimeout,
 		keepalive:    o.keepalive,
 		toolCallSeen: map[int]bool{},
+		tools:        newToolIndex(),
 		repair:       o.markup,
 		maxToolIdx:   -1,
 	}
@@ -801,7 +829,7 @@ func (s *streamWriter) writeRaw(payload string) error {
 // fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 func (s *streamWriter) writeChunk(obj map[string]any, fallback string) error {
 	// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
-	stripToolCallNames(obj, s.toolCallSeen)
+	stripToolCallNames(obj, s.tools, s.toolCallSeen)
 	s.continueMessageID(obj)
 	s.trackMaxToolIdx(obj)
 	raw, err := json.Marshal(normalizeFrame(obj))

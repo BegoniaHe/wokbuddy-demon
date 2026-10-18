@@ -158,11 +158,54 @@ data: [DONE]
 // TestStripToolCallNames 直测跨帧 name 收敛：首片保留 name、同 index 后续分片删除
 // name 键（空串或重复非空串都删），不同 index 互不串扰，非 tool_calls 帧零影响。
 func TestStripToolCallNames(t *testing.T) {
+	tools := newToolIndex()
 	seen := map[int]bool{}
-	assertStripFirstChunk(t, seen)
-	assertStripSubsequentChunks(t, seen)
-	assertStripOtherIndex(t, seen)
-	assertStripContentOnlyUntouched(t, seen)
+	assertStripFirstChunk(t, tools, seen)
+	assertStripSubsequentChunks(t, tools, seen)
+	assertStripOtherIndex(t, tools, seen)
+	assertStripContentOnlyUntouched(t, tools, seen)
+}
+
+// TestStripToolCallNamesMissingIndex 上游省略 index 时按 id 归位：同帧第二个
+// 调用及跨帧的新调用不得被当成同一 index 的首片重复而删除 name。
+func TestStripToolCallNamesMissingIndex(t *testing.T) {
+	tools := newToolIndex()
+	seen := map[int]bool{}
+	frame := func(id, name string) map[string]any {
+		return map[string]any{"choices": []any{
+			map[string]any{"delta": map[string]any{"tool_calls": []any{
+				map[string]any{"id": id, "function": map[string]any{"name": name}},
+			}}},
+		}}
+	}
+	f := map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{"tool_calls": []any{
+			map[string]any{"id": "call_a", "function": map[string]any{"name": "Bash"}},
+			map[string]any{"id": "call_b", "function": map[string]any{"name": "Read"}},
+		}}},
+	}}
+	stripToolCallNames(f, tools, seen)
+	tcs := f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)
+	for i, want := range []string{"Bash", "Read"} {
+		fn := tcs[i].(map[string]any)["function"].(map[string]any)
+		if fn["name"] != want {
+			t.Errorf("同帧调用 %d name=%v want %s", i, fn["name"], want)
+		}
+	}
+	// 跨帧的新调用（缺 index、新 id）同样保留 name。
+	f = frame("call_c", "Grep")
+	stripToolCallNames(f, tools, seen)
+	fn := f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "Grep" {
+		t.Errorf("跨帧新调用 name=%v want Grep", fn["name"])
+	}
+	// 同 id 的后续分片仍按原 index 收敛 name。
+	f = frame("call_a", "Bash")
+	stripToolCallNames(f, tools, seen)
+	fn = f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	if _, ok := fn["name"]; ok {
+		t.Errorf("同 id 后续分片应删除 name: %#v", fn)
+	}
 }
 
 // stripTestFrame 构造单 tool_call 的 delta 帧（name/args 为空则不写对应键）。
@@ -187,10 +230,10 @@ func stripTestFn(f map[string]any) map[string]any {
 }
 
 // assertStripFirstChunk 首片带 name：保留，seen 建立。
-func assertStripFirstChunk(t *testing.T, seen map[int]bool) {
+func assertStripFirstChunk(t *testing.T, tools *toolIndex, seen map[int]bool) {
 	t.Helper()
 	f0 := stripTestFrame(0, "lookup", "")
-	stripToolCallNames(f0, seen)
+	stripToolCallNames(f0, tools, seen)
 	if !seen[0] {
 		t.Fatal("index 0 should be marked seen after first chunk")
 	}
@@ -201,11 +244,11 @@ func assertStripFirstChunk(t *testing.T, seen map[int]bool) {
 
 // assertStripSubsequentChunks 同 index 后续分片（空串或重复非空 name）删除 name 键，
 // arguments 原样保留。
-func assertStripSubsequentChunks(t *testing.T, seen map[int]bool) {
+func assertStripSubsequentChunks(t *testing.T, tools *toolIndex, seen map[int]bool) {
 	t.Helper()
 	// 后续 chunk name 为空串：删除 name 键
 	f1 := stripTestFrame(0, "", `{"term":"x"}`)
-	stripToolCallNames(f1, seen)
+	stripToolCallNames(f1, tools, seen)
 	if _, ok := stripTestFn(f1)["name"]; ok {
 		t.Errorf("subsequent empty name should be stripped: %#v", stripTestFn(f1))
 	}
@@ -214,7 +257,7 @@ func assertStripSubsequentChunks(t *testing.T, seen map[int]bool) {
 	}
 	// 后续 chunk 重复非空 name（上游噪声）：同样删除，arguments 原样
 	f2 := stripTestFrame(0, "lookup", "y")
-	stripToolCallNames(f2, seen)
+	stripToolCallNames(f2, tools, seen)
 	if _, ok := stripTestFn(f2)["name"]; ok {
 		t.Errorf("subsequent duplicate non-empty name should be stripped: %#v", stripTestFn(f2))
 	}
@@ -224,10 +267,10 @@ func assertStripSubsequentChunks(t *testing.T, seen map[int]bool) {
 }
 
 // assertStripOtherIndex 不同 index 互不串扰：index 1 首片保留 name。
-func assertStripOtherIndex(t *testing.T, seen map[int]bool) {
+func assertStripOtherIndex(t *testing.T, tools *toolIndex, seen map[int]bool) {
 	t.Helper()
 	f3 := stripTestFrame(1, "other", "")
-	stripToolCallNames(f3, seen)
+	stripToolCallNames(f3, tools, seen)
 	if stripTestFn(f3)["name"] != "other" {
 		t.Errorf("index 1 first name=%v want other", stripTestFn(f3)["name"])
 	}
@@ -237,12 +280,12 @@ func assertStripOtherIndex(t *testing.T, seen map[int]bool) {
 }
 
 // assertStripContentOnlyUntouched 非 tool_calls 帧（content only）零影响。
-func assertStripContentOnlyUntouched(t *testing.T, seen map[int]bool) {
+func assertStripContentOnlyUntouched(t *testing.T, tools *toolIndex, seen map[int]bool) {
 	t.Helper()
 	f4 := map[string]any{"choices": []any{
 		map[string]any{"delta": map[string]any{"content": "hi"}},
 	}}
-	stripToolCallNames(f4, seen)
+	stripToolCallNames(f4, tools, seen)
 	if got := f4["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any); len(got) != 1 || got["content"] != "hi" {
 		t.Errorf("content-only frame altered: %#v", got)
 	}
