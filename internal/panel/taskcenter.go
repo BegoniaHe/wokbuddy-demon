@@ -59,11 +59,17 @@ func growthPending(t *upstream.Task) bool {
 	return autoActionFor(t.TaskCode) != nil
 }
 
+// scanWorkers 扫描 / 队列收集时并发上游调用的上限。导入上限是 1000 个账号，
+// 无界 goroutine 会瞬时打满上游限流；与批量导入后置任务（importWorkers）同量级。
+const scanWorkers = 5
+
 // tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
-// 只读操作，并发拉取（账号数个位数）。
+// 只读操作，并发拉取（受 scanWorkers 约束）。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
+
+	sem := make(chan struct{}, scanWorkers)
 
 	var wg sync.WaitGroup
 
@@ -76,6 +82,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, uid string) {
 			defer wg.Done()
+
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			account := p.cfg.Pool.AuthByUID(uid)
 			if account == nil {
@@ -283,6 +292,8 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 	// 顺序随 goroutine 调度漂移（与「保持原顺序」契约不符）。
 	results := make([]*queueAccount, len(states))
 
+	sem := make(chan struct{}, scanWorkers)
+
 	var wg sync.WaitGroup
 
 	for i := range states {
@@ -297,12 +308,15 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 		}
 
 		wg.Add(1)
-		go func(idx int, a *auth.Auth) {
+		go func(idx int, queueAcct *auth.Auth) {
 			defer wg.Done()
 
-			one := queueAccount{a: a}
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			one := queueAccount{a: queueAcct}
 			if growth {
-				one.grow = p.queueAccountGrowth(a)
+				one.grow = p.queueAccountGrowth(queueAcct)
 			}
 
 			if len(one.grow) > 0 {
