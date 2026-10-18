@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -56,10 +57,15 @@ func ValidateURL(raw string) error {
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return err
+		// 不回显原始 URL：webhook 地址本身通常就是 bearer token。
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			err = uerr.Err
+		}
+		return fmt.Errorf("webhook_url 必须是 http(s) 绝对地址: %w", err)
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("webhook_url %q 必须是 http(s) 绝对地址", raw)
+		return errors.New("webhook_url 必须是 http(s) 绝对地址")
 	}
 	return nil
 }

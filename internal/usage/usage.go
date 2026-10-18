@@ -93,9 +93,14 @@ type Recorder struct {
 	dirty   bool
 	started time.Time
 
-	stopOnce sync.Once
-	stop     chan struct{}
-	done     chan struct{}
+	// flushMu 串行化「快照 + 写临时文件 + rename」：ticker 的 flush 与面板 Save
+	// 可并发，共用同名 tmp 会互相截断/残留尾部，最终把残缺 JSON 发布为 usage.json。
+	flushMu sync.Mutex
+
+	runStarted atomic.Bool
+	stopOnce   sync.Once
+	stop       chan struct{}
+	done       chan struct{}
 	// dailyCache 当日聚合的 1 秒缓存（issue #95）：选号过滤会在一次请求内
 	// 多次读取，避免反复遍历全部桶。
 	dailyCache atomic.Pointer[dailyCacheEntry]
@@ -169,8 +174,11 @@ func New(path string) *Recorder {
 	return r
 }
 
-// Start 启动后台防抖落盘与折叠。Stop 前一直运行。
+// Start 启动后台防抖落盘与折叠。Stop 前一直运行；重复调用幂等。
 func (r *Recorder) Start() {
+	if !r.runStarted.CompareAndSwap(false, true) {
+		return
+	}
 	go func() {
 		defer close(r.done)
 		t := time.NewTicker(flushInterval)
@@ -193,8 +201,12 @@ func (r *Recorder) Start() {
 	}()
 }
 
-// Stop 停止后台循环并做最后一次落盘。
+// Stop 停止后台循环并做最后一次落盘（未 Start 时只做一次落盘，不阻塞）。
 func (r *Recorder) Stop() {
+	if !r.runStarted.Load() {
+		r.flush(true)
+		return
+	}
 	r.stopOnce.Do(func() { close(r.stop) })
 	<-r.done
 }
@@ -529,6 +541,8 @@ func (r *Recorder) flush(force bool) {
 	if r == nil || r.path == "" {
 		return
 	}
+	r.flushMu.Lock()
+	defer r.flushMu.Unlock()
 	r.mu.Lock()
 	if !r.dirty && !force {
 		r.mu.Unlock()

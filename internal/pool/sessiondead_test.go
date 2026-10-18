@@ -160,3 +160,42 @@ func TestStatusDisabledReasonClearedByRevive(t *testing.T) {
 		t.Errorf("revive 后 reason=%q want 空", st.Reason)
 	}
 }
+
+// TestSessionDeadCountPersists 未达阈值的计数也要落盘：重启后继续累计，
+// 否则连续 12153 的进度归零、账号迟迟不被禁用。
+func TestSessionDeadCountPersists(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	defer p.Close()
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.Flush()
+
+	p2 := New(fp)
+	defer p2.Close()
+	p2.Add(&auth.Auth{UID: "u1"})
+	if !p2.NoteSessionDead("u1") {
+		t.Fatal("重启后应累计到第 3 次并禁用")
+	}
+}
+
+// TestClearSessionDeadPersists 清零计数同样需要落盘：重启后不得恢复旧进度。
+func TestClearSessionDeadPersists(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	defer p.Close()
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDead("u1")
+	p.Flush()
+	p.ClearSessionDead("u1")
+	p.Flush()
+
+	p2 := New(fp)
+	defer p2.Close()
+	p2.Add(&auth.Auth{UID: "u1"})
+	if p2.NoteSessionDead("u1") {
+		t.Fatal("清计数应持久化，重启后第 1 次不应禁用")
+	}
+}

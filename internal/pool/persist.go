@@ -303,7 +303,11 @@ func (p *Pool) saveLocked() {
 // 其余连续失败静默（flusher 5s 一把，磁盘持续满时不刷屏）。
 // 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
 // "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
+//
+// 失败后重新置脏：调用方已在尝试落盘前清过 dirty，不置回会让 flusher/Flush 认为
+// 无事可做，运行态只能停留内存直至进程退出。
 func (p *Pool) notePersistFail(err error) {
+	p.dirty.Store(true)
 	if p.persistFails == 0 {
 		log.Printf("pool: state.json 落盘失败: %v", err)
 	} else if p.persistFails%persistLogEvery == 0 {
