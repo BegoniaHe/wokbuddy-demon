@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -29,6 +29,9 @@ export function useConfirm() {
   const resolver = useRef<((ok: boolean) => void) | null>(null);
 
   const confirm = useCallback((next: ConfirmOptions): Promise<boolean> => {
+    // 上一次确认还没结算就再次触发（连点/并发调用）：按取消结算，
+    // 避免旧 Promise 永远挂起。
+    resolver.current?.(false);
     setOpts(next);
     setOpen(true);
     return new Promise<boolean>((resolve) => {
@@ -41,6 +44,14 @@ export function useConfirm() {
     resolver.current = null;
     setOpen(false);
   }, []);
+
+  useEffect(
+    () => () => {
+      resolver.current?.(false);
+      resolver.current = null;
+    },
+    [],
+  );
 
   const confirmDialog = (
     <Dialog
