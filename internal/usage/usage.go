@@ -541,22 +541,34 @@ func (r *Recorder) flush(force bool) {
 	r.dirty = false
 	r.mu.Unlock()
 
+	// 落盘失败后重新置脏：否则下一轮 tick 因 dirty=false 直接跳过，最新用量
+	// 只能等优雅退出时的强制 flush。并发写入者已在此期间置脏，这里只追加不覆盖。
+	markDirty := func() {
+		r.mu.Lock()
+		r.dirty = true
+		r.mu.Unlock()
+	}
 	raw, err := json.Marshal(snap)
 	if err != nil {
 		log.Printf("[usage] 序列化失败: %v", err)
+		markDirty()
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
 		log.Printf("[usage] 建目录失败: %v", err)
+		markDirty()
 		return
 	}
 	tmp := r.path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		log.Printf("[usage] 写临时文件失败: %v", err)
+		markDirty()
 		return
 	}
 	if err := atomicwrite.Rename(tmp, r.path); err != nil {
 		log.Printf("[usage] 原子替换失败: %v", err)
+		_ = os.Remove(tmp)
+		markDirty()
 	}
 }
 
