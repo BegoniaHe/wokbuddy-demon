@@ -140,17 +140,17 @@ type Upstash struct {
 func (u *Upstash) goWrite(fn func()) {
 	u.ensureInit()
 	u.submitMu.Lock()
-	u.wg.Add(1)
 
 	select {
 	case <-u.done:
-		u.submitMu.Unlock()
-		u.wg.Done() // 关停后提交的写：登记即撤销，直接丢弃
+		u.submitMu.Unlock() // 关停后提交的写：直接丢弃
 
 		return
 	default:
 	}
-
+	// 先检查 done 再 Add：Close 在同一把 submitMu 下关 done，因此关停后不会再有
+	// 新的 Add；Wait 与 Add 不并发（否则零计数下并发 Add 属 WaitGroup 误用）。
+	u.wg.Add(1)
 	u.submitMu.Unlock()
 	go func() {
 		defer u.wg.Done()
