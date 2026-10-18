@@ -1,6 +1,6 @@
 // limiter.go 鉴权失败按来源 IP 限速（issue #61）：固定窗口内失败次数达阈值后
 // 直接返回 429，成功鉴权清零。面板、/status、/metrics 与 /v1/* 共用该实现
-//（阈值不同）；/healthz 无鉴权不经过限速。单实例进程内状态，不跨进程共享。
+// （阈值不同）；/healthz 无鉴权不经过限速。单实例进程内状态，不跨进程共享。
 package httpauth
 
 import (
@@ -113,13 +113,19 @@ func (l *Limiter) evictLocked(now time.Time) {
 		return
 	}
 
+	l.dropOldestLocked()
+}
+
+// dropOldestLocked 淘汰最早开始的窗口：优先丢未达锁定阈值的条目，把仍在
+// 生效的锁定留到最后（调用方已持有锁）。
+func (l *Limiter) dropOldestLocked() {
 	oldestOpenIP := ""
 
 	var oldestOpen time.Time
 
-	oldestIP := ""
+	oldestLockedIP := ""
 
-	var oldest time.Time
+	var oldestLocked time.Time
 
 	for ip, w := range l.byIP {
 		if w.count < l.limit {
@@ -130,18 +136,18 @@ func (l *Limiter) evictLocked(now time.Time) {
 			continue
 		}
 
-		if oldestIP == "" || w.start.Before(oldest) {
-			oldestIP, oldest = ip, w.start
+		if oldestLockedIP == "" || w.start.Before(oldestLocked) {
+			oldestLockedIP, oldestLocked = ip, w.start
 		}
 	}
 
+	evictIP := oldestLockedIP
 	if oldestOpenIP != "" {
-		delete(l.byIP, oldestOpenIP)
-		return
+		evictIP = oldestOpenIP
 	}
 
-	if oldestIP != "" {
-		delete(l.byIP, oldestIP)
+	if evictIP != "" {
+		delete(l.byIP, evictIP)
 	}
 }
 

@@ -92,3 +92,28 @@ func TestLimiterFloodKeepsActiveLockout(t *testing.T) {
 		t.Fatal("灌表后目标 IP 的锁定被抹掉了")
 	}
 }
+
+// TestLimiterHardCapKeepsLockedIP 触发硬上限淘汰时先丢未锁定的窗口；
+// 目标 IP 开始得最早也不能因此丢掉仍在生效的锁定。
+func TestLimiterHardCapKeepsLockedIP(t *testing.T) {
+	t.Parallel()
+
+	limiter := NewLimiter(2, time.Minute)
+	now := time.Unix(1000, 0)
+
+	limiter.now = func() time.Time { return now }
+
+	const victim = "203.0.113.7"
+
+	limiter.byIP[victim] = &failWindow{start: now.Add(-time.Second), count: 2}
+
+	for i := range maxTrackedIPsHard - 1 {
+		limiter.byIP[fmt.Sprintf("198.18.%d.%d", i/256, i%256)] = &failWindow{start: now, count: 1}
+	}
+
+	limiter.Fail("192.0.2.200")
+
+	if ok, _ := limiter.Allow(victim); ok {
+		t.Fatal("硬上限淘汰抹掉了仍生效的锁定")
+	}
+}
