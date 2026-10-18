@@ -14,6 +14,8 @@ import {
 import { expBatches, expDaysLeft, type Package } from '@/lib/expiry';
 import { fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
+import { useConfirm, type ConfirmOptions } from '@/components/ConfirmDialog';
+import { LoadError } from '@/components/LoadError';
 import { Button } from '@/components/ui/button';
 import {
   Card,
@@ -48,8 +50,9 @@ import { MoreHorizontal } from 'lucide-react';
 export function AccountsView() {
   const qc = useQueryClient();
   const [taskUID, setTaskUID] = useState<string | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
 
-  const { data, error } = useQuery({
+  const { data, error, refetch } = useQuery({
     queryKey: ['overview'],
     queryFn: () => api<Overview>('overview'),
     refetchInterval: 5000,
@@ -80,7 +83,7 @@ export function AccountsView() {
   });
 
   if (error && !data) {
-    return <Card><CardContent className="py-10 text-center text-muted-foreground">读取失败：{(error as Error).message}</CardContent></Card>;
+    return <LoadError variant="page" message={'读取失败：' + (error as Error).message} onRetry={() => void refetch()} />;
   }
   if (!data) {
     return <Card><CardContent className="py-10 text-center text-muted-foreground">加载中…</CardContent></Card>;
@@ -97,6 +100,7 @@ export function AccountsView() {
 
   return (
     <>
+      {error ? <LoadError className="mb-4" message={'刷新失败：' + (error as Error).message} onRetry={() => void refetch()} /> : null}
       <Stats
         stats={[
           { value: data.total, label: '账号总数' },
@@ -172,6 +176,7 @@ export function AccountsView() {
                     proxySlots={data.proxy_slots || []}
                     onOpenTasks={() => setTaskUID(s.uid)}
                     onDone={afterAction}
+                    confirm={confirm}
                   />
                 ))
               )}
@@ -183,6 +188,7 @@ export function AccountsView() {
       <ModelLocks rows={data.model_locks} />
 
       <TasksDialog uid={taskUID} onClose={() => setTaskUID(null)} />
+      {confirmDialog}
     </>
   );
 }
@@ -384,6 +390,7 @@ function AccountRow({
   proxySlots,
   onOpenTasks,
   onDone,
+  confirm,
 }: {
   s: Account;
   maxCred: number;
@@ -391,6 +398,7 @@ function AccountRow({
   proxySlots: { id: string; name: string }[];
   onOpenTasks: () => void;
   onDone: () => void;
+  confirm: (opts: ConfirmOptions) => Promise<boolean>;
 }) {
   const now = Date.now();
   const bl = (new Date(s.breaker_until || 0).getTime() - now) / 1000;
@@ -469,12 +477,25 @@ function AccountRow({
 
   const act = async (a: string) => {
     const u = s.uid;
-    if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
+    if (
+      a === 'remove' &&
+      !(await confirm({
+        title: '移除账号？',
+        description: '移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。',
+        confirmText: '移除',
+        destructive: true,
+      }))
+    )
+      return;
     if (
       a === 'disable' &&
-      !confirm(
-        '禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？',
-      )
+      !(await confirm({
+        title: '禁用账号？',
+        description:
+          '禁用后该账号不再参与选号（保号任务默认也跳过），需手动解冻才能恢复。若只是想临时让位、仍要保号，请改用「暂停选号」。',
+        confirmText: '禁用',
+        destructive: true,
+      }))
     )
       return;
     try {

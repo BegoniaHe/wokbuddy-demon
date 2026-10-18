@@ -11,6 +11,7 @@ import {
   type FieldValue,
 } from '@/lib/config';
 import { toast } from '@/components/Toaster';
+import { useConfirm } from '@/components/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import { Field, FieldLabel, FieldDescription } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
@@ -50,6 +51,7 @@ export function ConfigView() {
   const [saving, setSaving] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [clears, setClears] = useState<Record<string, boolean>>({});
+  const { confirm, confirmDialog } = useConfirm();
 
   const load = async () => {
     try {
@@ -111,7 +113,15 @@ export function ConfigView() {
   };
 
   const restore = async () => {
-    if (!confirm('用 config.json.1 覆盖当前配置？当前配置不会自动再备份。')) return;
+    if (
+      !(await confirm({
+        title: '恢复上一版配置？',
+        description: '用 config.json.1 覆盖当前配置，当前配置不会自动再备份。',
+        confirmText: '恢复',
+        destructive: true,
+      }))
+    )
+      return;
     setRestoring(true);
     try {
       const r = await postJSON<{ restart_required?: string[] }>('config/restore');
@@ -144,7 +154,11 @@ export function ConfigView() {
         <span>{label}</span>
         {hint ? <FieldDescription className="mt-0.5">{hint}</FieldDescription> : null}
       </FieldLabel>
-      <Switch checked={!!values[name]} onCheckedChange={(v) => set(name, v)} />
+      <Switch
+        checked={!!values[name]}
+        onCheckedChange={(v) => set(name, v)}
+        aria-label={typeof label === 'string' ? label : name}
+      />
     </Field>
   );
 
@@ -511,7 +525,7 @@ export function ConfigView() {
                 items={selectOptionItems(PROMPT_MODE_OPTIONS)}
                 value={String(values.prompt_mode ?? 'custom')}
                 onValueChange={(v) => set('prompt_mode', v ?? 'custom')}>
-                <SelectTrigger>
+                <SelectTrigger aria-label="系统提示词模式">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -575,6 +589,7 @@ export function ConfigView() {
           {saving ? '保存中…' : '保存配置'}
         </Button>
       </div>
+      {confirmDialog}
     </form>
   );
 }

@@ -101,6 +101,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
       );
       if (r.done) {
         stopPoll();
+        stateRef.current = null;
         setPhase('done');
         setDoneMsg(
           '已添加 ' +
@@ -116,10 +117,29 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
       }
     } catch (e) {
       stopPoll();
+      stateRef.current = null;
       setPhase('err');
       setErrMsg((e as Error).message + '（关闭后重新添加）');
     }
   };
+
+  // 标签页切回 / 窗口获得焦点 / 点击页面时立即补一次轮询。
+  // 浏览器会把后台定时器压到约 1 次/分钟，只靠 setInterval 会让用户扫码后
+  // 切回来仍停在「等待」；被遮挡（非隐藏）的窗口还不触发 visibilitychange。
+  useEffect(() => {
+    if (!open) return;
+    const wake = () => {
+      if (!document.hidden && stateRef.current) void poll();
+    };
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('focus', wake);
+    window.addEventListener('pointerdown', wake);
+    return () => {
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('focus', wake);
+      window.removeEventListener('pointerdown', wake);
+    };
+  }, [open]);
 
   const onImport = async (file: File) => {
     setImportMsg('');

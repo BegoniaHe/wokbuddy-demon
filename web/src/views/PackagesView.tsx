@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { fmtTok } from '@/lib/format';
 import { dig } from '@/lib/config';
+import { LoadError } from '@/components/LoadError';
 import {
   pkAccountColorMap,
   pkAccountSegments,
@@ -128,7 +129,7 @@ export function PackagesView() {
                 items={selectOptionItems(PK_SORT_OPTIONS)}
                 value={sortMode}
                 onValueChange={(v) => changeSort(v ?? 'end_asc')}>
-                <SelectTrigger size="sm" className="w-32" title="逐包明细的排序规则">
+                <SelectTrigger size="sm" className="w-32" aria-label="排序规则" title="逐包明细的排序规则">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -142,10 +143,21 @@ export function PackagesView() {
           </CardAction>
         </CardHeader>
         <CardContent>
+          {pkgQ.error && list.length > 0 ? (
+            <LoadError
+              className="mb-3"
+              message={'刷新失败：' + (pkgQ.error as Error).message}
+              onRetry={() => void pkgQ.refetch()}
+            />
+          ) : null}
           {pkgQ.isLoading ? (
             <p className="py-4 text-center text-muted-foreground">查询中…（逐账号向上游实时查询）</p>
-          ) : pkgQ.error ? (
-            <p className="py-4 text-center text-muted-foreground">读取失败：{(pkgQ.error as Error).message}</p>
+          ) : pkgQ.error && list.length === 0 ? (
+            <LoadError
+              variant="page"
+              message={'读取失败：' + (pkgQ.error as Error).message}
+              onRetry={() => void pkgQ.refetch()}
+            />
           ) : list.length === 0 ? (
             <p className="py-4 text-center text-muted-foreground">没有账号</p>
           ) : (

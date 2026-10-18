@@ -51,7 +51,7 @@ export function TimeRange({
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
       <Select items={selectOptionItems(PRESET_OPTIONS)} value={value.preset} onValueChange={setPreset}>
-        <SelectTrigger size="sm" className="w-28">
+        <SelectTrigger size="sm" className="w-28" aria-label="时间范围">
           <SelectValue>{presetLabel}</SelectValue>
         </SelectTrigger>
         <SelectContent>

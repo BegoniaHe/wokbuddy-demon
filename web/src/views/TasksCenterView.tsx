@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, postJSON } from '@/lib/api';
 import { toast } from '@/components/Toaster';
+import { useConfirm } from '@/components/ConfirmDialog';
 import { Button } from '@/components/ui/button';
 import {
   Select,
@@ -62,6 +63,7 @@ export function TasksCenterView() {
   const [scanning, setScanning] = useState(false);
   const [starting, setStarting] = useState(false);
   const [vouchersOpen, setVouchersOpen] = useState(false);
+  const { confirm, confirmDialog } = useConfirm();
   const titlesRef = useRef<Record<string, string>>({});
   const seqRef = useRef(0);
   const timerRef = useRef<number | null>(null);
@@ -122,7 +124,15 @@ export function TasksCenterView() {
 
   const runQueue = async () => {
     const c = Number(conc) || 1;
-    if (!confirm('扫描全部账号待办并排队执行（账号并发 ' + c + '，账号内串行）。\n含真实对话的任务耗时较长，确认继续？')) return;
+    if (
+      !(await confirm({
+        title: '执行全部待办？',
+        description:
+          '扫描全部账号待办并排队执行（账号并发 ' + c + '，账号内串行）。含真实对话的任务耗时较长。',
+        confirmText: '开始执行',
+      }))
+    )
+      return;
     setStarting(true);
     try {
       const r = await postJSON<{ started?: boolean; message?: string; seq?: number; total?: number }>('tasks/run_queue', { concurrency: c });
@@ -175,7 +185,7 @@ export function TasksCenterView() {
                 查询券码
               </Button>
               <Select items={selectOptionItems(CONC_OPTIONS)} value={conc} onValueChange={(v) => setConc(v ?? '1')}>
-                <SelectTrigger size="sm" className="w-16">
+                <SelectTrigger size="sm" className="w-16" aria-label="并发档位">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -236,6 +246,7 @@ export function TasksCenterView() {
       </Card>
 
       <VouchersDialog open={vouchersOpen} onOpenChange={setVouchersOpen} />
+      {confirmDialog}
     </>
   );
 }
