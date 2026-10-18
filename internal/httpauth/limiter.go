@@ -4,9 +4,6 @@
 package httpauth
 
 import (
-	"net"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -136,19 +133,4 @@ func (l *Limiter) Reset(ip string) {
 	l.mu.Lock()
 	delete(l.byIP, ip)
 	l.mu.Unlock()
-}
-
-// RemoteIP 提取来源 IP：只认 RemoteAddr，不信任未配置的转发头（X-Forwarded-For
-// 可被客户端伪造，用于爆破限速会绕过）。反代场景由反代自身限速或后续信任配置处理。
-func RemoteIP(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-
-	addr := strings.TrimSpace(r.RemoteAddr)
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		return host
-	}
-
-	return addr
 }

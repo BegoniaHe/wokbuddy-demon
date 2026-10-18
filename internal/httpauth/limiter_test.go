@@ -2,8 +2,6 @@ package httpauth
 
 import (
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -40,18 +38,6 @@ func TestLimiterWindowAndReset(t *testing.T) {
 
 	if ok, _ := limiter.Allow(ip); !ok {
 		t.Fatal("窗口过后应恢复")
-	}
-}
-
-func TestRemoteIPIgnoresForwardedHeaders(t *testing.T) {
-	t.Parallel()
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "198.51.100.9:1234"
-	req.Header.Set("X-Forwarded-For", "203.0.113.1")
-
-	if got := RemoteIP(req); got != "198.51.100.9" {
-		t.Fatalf("RemoteIP=%q", got)
 	}
 }
 
