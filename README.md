@@ -361,6 +361,8 @@ claude
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；`0` = 不限制。改后需重启 |
 | `server.max_body_bytes` | `16777216` | 聊天类入站请求体上限（字节，16 MiB），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413 `payload_too_large`；`0` = 不限制。改后需重启 |
+| `server.request_accept_grace_seconds` | `0` | 停机摘流宽限（秒）：收到 SIGTERM 后 `/healthz` 立即 503，listener 继续受理该时长再关闭；`0` = 立即停机。改后需重启 |
+| `server.shutdown_grace_seconds` | `30` | listener 关闭后等待在途 SSE 流排空的上限（秒）；`0` 回落 30，负值报错。改后需重启 |
 | `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
@@ -458,6 +460,7 @@ claude
 - 旧版 snake_case 扁平形（`access_token` / `expires_at` 毫秒）不会被载入：`go run ./cmd/migrate-auths -dir auths -apply` 转换，原文件留存 `.legacy` 副本
 - 失效账号被禁用后，可用 `./login.sh` 重新登录覆盖凭证
 - 备份 = `auths/`（凭证）+ `data/state.json`（状态）
+- 面板每次成功保存配置前会把上一版写为 `config.json.1`（0600，含 `api_key`，不要分享）；配置页「恢复上一版」可整体回滚。只保留一代，恢复操作本身不再滚动备份
 
 ## 安全与合规
 

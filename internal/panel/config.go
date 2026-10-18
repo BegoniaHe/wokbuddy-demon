@@ -55,3 +55,24 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		"restart_required": restartRequired,
 	})
 }
+
+// restoreConfig 从 config.json.1 恢复上一版配置；恢复后仍走同一套热应用与重启提示。
+func (p *Panel) restoreConfig(w http.ResponseWriter, _ *http.Request) {
+	if p.cfg.RestoreConfig == nil {
+		writeErr(w, http.StatusNotImplemented, "config restore not available")
+		return
+	}
+	restartRequired, err := p.cfg.RestoreConfig()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if restartRequired == nil {
+		restartRequired = []string{}
+	}
+	log.Printf("panel: 配置已恢复上一版（需重启字段 %d 个）", len(restartRequired))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":               true,
+		"restart_required": restartRequired,
+	})
+}

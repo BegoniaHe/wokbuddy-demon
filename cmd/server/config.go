@@ -78,6 +78,13 @@ type Config struct {
 		// /v1/chat/completions、/v1/messages 与 count_tokens。超限在解析前返回
 		// 413，不进入选号。缺省 16 MiB；0 = 不限制。改动需重启进程。
 		MaxBodyBytes int64 `json:"max_body_bytes"`
+		// RequestAcceptGraceSeconds 停机第一阶段：收到 SIGTERM 后先把 /healthz
+		// 置 503，并继续受理请求的宽限时长（秒），供反代/LB 完成摘流。缺省 0 =
+		// 立即关闭 listener（保持旧行为）；改动需重启进程。
+		RequestAcceptGraceSeconds int `json:"request_accept_grace_seconds"`
+		// ShutdownGraceSeconds 第二阶段：listener 关闭后等待在途 SSE 流排空的
+		// 上限（秒）。缺省 30；0 = 回落 30，负值报错。改动需重启进程。
+		ShutdownGraceSeconds int `json:"shutdown_grace_seconds"`
 		// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin 列表（如
 		// "http://localhost:3000"）。空 = 关闭 CORS，行为不变。只精确匹配
 		// scheme://host[:port]；不支持 "*"，管理面不参与。
@@ -369,6 +376,8 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Server.MaxBodyBytes = 16 << 20
+	c.Server.RequestAcceptGraceSeconds = 0
+	c.Server.ShutdownGraceSeconds = 30
 	c.Models.BackgroundTarget = defaultBackgroundTarget
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
@@ -902,6 +911,20 @@ func (c *Config) validateBackoffOrder() error {
 	return nil
 }
 
+// validateServerRanges server.* 的非负校验（0 分别表示不限制 / 立即停机）。
+func (c *Config) validateServerRanges() error {
+	if c.Server.MaxBodyBytes < 0 {
+		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）", c.Server.MaxBodyBytes)
+	}
+	if c.Server.RequestAcceptGraceSeconds < 0 {
+		return fmt.Errorf("server.request_accept_grace_seconds: 负值 %d 无意义（0 = 立即停机）", c.Server.RequestAcceptGraceSeconds)
+	}
+	if c.Server.ShutdownGraceSeconds < 0 {
+		return fmt.Errorf("server.shutdown_grace_seconds: 负值 %d 无意义", c.Server.ShutdownGraceSeconds)
+	}
+	return nil
+}
+
 // validateRanges 字段范围：0 有明确语义（不限 / 关闭）的键不接受负值。
 func (c *Config) validateRanges() error {
 	if err := validateLimitRule("limits", LimitRule{
@@ -918,8 +941,8 @@ func (c *Config) validateRanges() error {
 	if c.Pool.MaxInFlight < 0 {
 		return fmt.Errorf("pool.max_in_flight: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlight)
 	}
-	if c.Server.MaxBodyBytes < 0 {
-		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）", c.Server.MaxBodyBytes)
+	if err := c.validateServerRanges(); err != nil {
+		return err
 	}
 	if c.Pool.MaxInFlightTotal < 0 {
 		return fmt.Errorf("pool.max_in_flight_total: 负值 %d 无意义（0 = 不限）", c.Pool.MaxInFlightTotal)
@@ -960,6 +983,10 @@ func (c *Config) normalizeStaticDefaults() {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+	}
+	// 停机排空窗口 0/负数视为未设置：缺省 30s，避免配置笔误把在途 SSE 直接掐断。
+	if c.Server.ShutdownGraceSeconds == 0 {
+		c.Server.ShutdownGraceSeconds = 30
 	}
 	c.normalizeLocalWebToolRounds()
 	c.normalizePoolDefaults()

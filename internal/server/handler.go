@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -142,6 +143,9 @@ type Handler struct {
 	streams *streamTracker
 	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
 	authLimiter *httpauth.Limiter
+	// shuttingDown 停机第一阶段置位（issue #147）：/healthz 立即 503，
+	// 让反代/LB 摘流；listener 仍继续受理宽限期内的请求。
+	shuttingDown atomic.Bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -227,6 +231,10 @@ func NewHandler(cfg Config) *Handler {
 
 // ActiveStreams 返回当前在途 SSE 流数（供优雅关闭记录未排空情况，issue #19）。
 func (h *Handler) ActiveStreams() int { return h.streams.Active() }
+
+// BeginShutdown 进入停机第一阶段：/healthz 立即返回 503，但 HTTP server 尚未
+// Shutdown，宽限期内仍可受理在途请求（issue #147）。
+func (h *Handler) BeginShutdown() { h.shuttingDown.Store(true) }
 
 // notFound 未注册路径的统一出口：OpenAI 风格 404 JSON（不鉴权——未知路径无需泄露
 // 鉴权存在性，也不暴露端点清单）。协议面（OpenAI 兼容 API）只承诺
@@ -384,7 +392,8 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
 	// 否则负载均衡器会把流量持续打进无法受理的实例。
 	status := http.StatusOK
-	if !h.cfg.Pool.ServableNow() {
+	shuttingDown := h.shuttingDown.Load()
+	if shuttingDown || !h.cfg.Pool.ServableNow() {
 		status = http.StatusServiceUnavailable
 	}
 	// realm_servable 域可服务维度：不改判活语义（存在性探活保持不变），
@@ -400,6 +409,7 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 		"total":          total,
 		"service":        ServiceName,
 		"realm_servable": realmServable,
+		"shutting_down":  shuttingDown,
 	})
 }
 

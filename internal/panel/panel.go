@@ -68,6 +68,8 @@ type Config struct {
 	// SaveConfig 校验并落盘配置，返回需要重启才能生效的字段列表；随后由 main 注入的
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
 	SaveConfig func(raw []byte) (restartRequired []string, err error)
+	// RestoreConfig 用单代备份覆盖当前配置，返回仍需重启的字段；nil 时接口返回 501。
+	RestoreConfig func() (restartRequired []string, err error)
 
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
@@ -244,6 +246,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_health", p.withAuth(p.modelHealth))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("POST /panel/api/config/restore", p.withAuth(p.restoreConfig))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API

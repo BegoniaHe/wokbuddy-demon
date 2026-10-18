@@ -8,12 +8,7 @@ package server
 import (
 	"context"
 	"sync"
-	"time"
 )
-
-// ShutdownStreamGrace 优雅关闭等待在途 SSE 流排空的上限：超过即放弃等待、由进程退出
-// 强制结束（main 记 WARN）。取 30s 覆盖多数流式生成的自然收尾，又不至于让停机无限拖延。
-const ShutdownStreamGrace = 30 * time.Second
 
 // streamTracker 计数在途 SSE 流，并提供带 ctx 上限的排空等待。
 type streamTracker struct {
