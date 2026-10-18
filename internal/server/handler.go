@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sort"
 	"strconv"
@@ -207,21 +208,30 @@ func NewHandler(cfg Config) *Handler {
 	}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withClientAuth(h.chatCompletions))
-	h.mux.HandleFunc("POST /v1/responses", h.withClientAuth(h.responsesHandler))
-	h.mux.HandleFunc("POST /v1/messages", h.withClientAuth(h.anthropicMessagesHandler))
-	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withClientAuth(h.anthropicCountTokensHandler))
-	h.mux.HandleFunc("GET /v1/models", h.withClientAuth(h.models))
-	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
-	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// withRecovery 必须包在最外层：内层 withClientAuth 的命名密钥 release 依赖
+	// defer 正常执行，recover 放在鉴权之内会让 panic 跳过租约释放（issue #146）。
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
+	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
+	h.mux.HandleFunc("POST /v1/messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withRecovery(h.withClientAuth(h.anthropicCountTokensHandler)))
+	h.mux.HandleFunc("GET /v1/models", h.withRecovery(h.withClientAuth(h.models)))
+	h.mux.HandleFunc("GET /status", h.withRecovery(h.withAuth(h.status)))
+	h.mux.HandleFunc("GET /healthz", h.withRecovery(h.healthz))
 	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
-	h.mux.HandleFunc("GET /metrics", h.withAuth(h.metricsHandler))
+	h.mux.HandleFunc("GET /metrics", h.withRecovery(h.withAuth(h.metricsHandler)))
+	// 运行时 profiling（issue #146）：与 /metrics 同口径走 withAuth，避免 goroutine
+	// 栈与调用细节在公网裸奔。pprof.Index 自行按路径分发 allocs/goroutine 等子 profile。
+	h.mux.HandleFunc("/debug/pprof/", h.withRecovery(h.withAuth(pprof.Index)))
+	h.mux.HandleFunc("/debug/pprof/cmdline", h.withRecovery(h.withAuth(pprof.Cmdline)))
+	h.mux.HandleFunc("/debug/pprof/profile", h.withRecovery(h.withAuth(pprof.Profile)))
+	h.mux.HandleFunc("/debug/pprof/symbol", h.withRecovery(h.withAuth(pprof.Symbol)))
+	h.mux.HandleFunc("/debug/pprof/trace", h.withRecovery(h.withAuth(pprof.Trace)))
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
 	// 未注册路径兜底（Issue #12）：返回 OpenAI 风格 JSON 错误体，而非 ServeMux 裸 404。
 	// 注册在最具体的路由之后；ServeMux 优先精确/更长前缀，故不会遮蔽上面的端点。
-	h.mux.HandleFunc("/", h.notFound)
+	h.mux.HandleFunc("/", h.withRecovery(h.notFound))
 	return h
 }
 

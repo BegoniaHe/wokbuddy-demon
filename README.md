@@ -343,6 +343,8 @@ claude
 
 账号 / 请求 / Token 三类复用面板同一份计数（`internal/pool`、`internal/usage`），不重复记账；耗时 histogram 与换号计数为进程内生命周期，重启清零。鉴权与主服务同口径：`api_key` 非空时需 `Authorization: Bearer <api_key>`，为空则直接可抓取。
 
+运行时性能分析走标准库 `net/http/pprof`：`/debug/pprof/`（含 `cmdline` / `profile` / `symbol` / `trace` 与各命名 profile）。与 `/metrics` 同口径鉴权，`api_key` 为空时同样放行——公网部署必须设置 `api_key`，否则 goroutine 栈与调用细节会暴露。示例：`curl -H "Authorization: Bearer <api_key>" -o heap.pprof http://127.0.0.1:7863/debug/pprof/heap && go tool pprof heap.pprof`。
+
 ## 配置说明
 
 **`config.example.json` 是配置项最完整的参考**：每个字段、默认值与结构都能在其中找到，示例值一律是 `test_key` 之类占位符，**不含任何真实密钥**。启动时若 `api_key` 仍精确等于占位值 `test_key`，程序会生成随机密钥并原子写回配置文件；显式设置的其他值保持不变。检查生效值：`grep '"api_key"' config.json`（不要分享该输出）。下表为字段含义速查。面板保存后返回的「需重启」字段只包含本次实际变化的装配期字段；未提示的字段已热生效。面板「配置」页覆盖服务、定时任务、账号池、上游身份与代理、global、提示词、Upstash、路径与日志字段；设备 Token 与 Upstash Token 以密码框展示，已设置时留空保存即保持原值。

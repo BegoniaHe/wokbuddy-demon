@@ -1,0 +1,105 @@
+// recovery.go 网关路由 panic 兜底（issue #146）。
+//
+// net/http 只保证 panic 不拖垮进程，但会静默 abort 连接：客户端只看到 EOF，
+// reqlog 归档缺失，SSE 在途计数也可能漏减。这里在最外层 recover，未写响应头时
+// 按入站协议返回统一错误体；已写头（流式已开始）时只记录，避免 superfluous
+// WriteHeader 与半截错误体污染。
+package server
+
+import (
+	"bufio"
+	"errors"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"runtime/debug"
+	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+)
+
+// maxPanicStack 日志里保留的 stack 上限。panic 栈通常 < 16KiB，64KiB 足以覆盖
+// 深调用链，同时防止异常递归把单行日志撑到不可读。
+const maxPanicStack = 64 << 10
+
+// withRecovery 包裹单个 handler。必须放在鉴权/限流中间件最外层：否则内层
+// 中间件的 defer（如命名密钥 release）不会执行。
+func (h *Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rw := &recoveryWriter{ResponseWriter: w}
+		defer func() {
+			rec := recover()
+			if rec == nil {
+				return
+			}
+			// 客户端已断开：net/http 用 ErrAbortHandler 表示「主动中止」，不是 bug，
+			// 原样抛回让标准库按既有语义处理。
+			if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				panic(rec)
+			}
+			stack := debug.Stack()
+			if len(stack) > maxPanicStack {
+				stack = stack[:maxPanicStack]
+			}
+			log.Printf("ERR: [server] panic recovered method=%q path=%q type=%T\n%s",
+				logfmt.Truncate(r.Method, 16), logfmt.Truncate(r.URL.Path, 256), rec, stack)
+			if rw.wroteHeader {
+				return
+			}
+			if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+				writeAnthropicError(rw, http.StatusInternalServerError, "api_error", "internal gateway error", "")
+				return
+			}
+			writeOpenAIError(rw, http.StatusInternalServerError, "internal_error", "internal gateway error")
+		}()
+		next(rw, r)
+	}
+}
+
+// recoveryWriter 记录响应头是否已写出，并透传 Flusher/Hijacker/Pusher/ReaderFrom，
+// 保证 SSE、WebSocket 升级与 sendfile 路径不被兜底中间件降级。
+type recoveryWriter struct {
+	http.ResponseWriter
+
+	wroteHeader bool
+}
+
+func (w *recoveryWriter) WriteHeader(code int) {
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *recoveryWriter) Write(p []byte) (int, error) {
+	w.wroteHeader = true
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *recoveryWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (w *recoveryWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
+		return hj.Hijack()
+	}
+	return nil, nil, http.ErrNotSupported
+}
+
+func (w *recoveryWriter) Push(target string, opts *http.PushOptions) error {
+	if p, ok := w.ResponseWriter.(http.Pusher); ok {
+		return p.Push(target, opts)
+	}
+	return http.ErrNotSupported
+}
+
+func (w *recoveryWriter) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(w.ResponseWriter, r)
+}
+
+func (w *recoveryWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
