@@ -260,7 +260,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-lg" showCloseButton={false}>
         <DialogHeader>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center">
             <DialogTitle>添加账号</DialogTitle>
             <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
               <TabsList>
