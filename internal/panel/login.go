@@ -210,6 +210,13 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 
 	p.loginMu.Lock()
 	sess, known := p.logins[state]
+	// 超时会话直接回收：loginTTL 是授权 URL 的最长有效期，过期后不得再
+	// 继续 poll（否则一次发起即可无限期占用 state，且持续打上游）。
+	if known && time.Since(sess.created) > loginTTL {
+		delete(p.logins, state)
+
+		known = false
+	}
 	p.loginMu.Unlock()
 
 	if !known {

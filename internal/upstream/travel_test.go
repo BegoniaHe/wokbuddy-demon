@@ -174,6 +174,25 @@ func TestBuddyInfoNullMeansNoBuddy(t *testing.T) {
 	}
 }
 
+// TestBuddyInfoEmptyObjectMeansNoBuddy data.buddy 为空对象时同样视为无猫
+// （id=0 不是合法档案），避免调度器把它当成有猫继续查询/派出。
+func TestBuddyInfoEmptyObjectMeansNoBuddy(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"msg":"ok","data":{"buddy":{}}}`), nil
+	})
+
+	buddy, err := client.BuddyInfo(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("buddy info: %v", err)
+	}
+
+	if buddy != nil {
+		t.Errorf("buddy=%+v want nil (无猫)", buddy)
+	}
+}
+
 func TestBuddyInfoPresent(t *testing.T) {
 	t.Parallel()
 

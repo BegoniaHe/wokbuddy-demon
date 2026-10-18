@@ -104,12 +104,17 @@ func (c *Client) BuddyInfo(a *auth.Auth) (*Buddy, error) {
 		return nil, nil //nolint:nilnil // 无猫状态返回 (nil,nil)，调用方以 nil 判定
 	}
 
-	var b Buddy
-	if err := json.Unmarshal(resp.Buddy, &b); err != nil {
+	var buddy Buddy
+	if err := json.Unmarshal(resp.Buddy, &buddy); err != nil {
 		return nil, fmt.Errorf("BuddyInfo: %w", err)
 	}
+	// 空对象（{}）等价于无猫：id=0 不是合法档案，继续当成有猫会让调度器
+	// 多发一次 travel/status 并在 idle 时直接派出。
+	if buddy.ID == 0 && strings.TrimSpace(buddy.Name) == "" {
+		return nil, nil //nolint:nilnil // 无猫状态返回 (nil,nil)，调用方以 nil 判定
+	}
 
-	return &b, nil
+	return &buddy, nil
 }
 
 // BuddyFirst 领养第一只猫。无猫且已过 conversation 门槛时送 300 分。

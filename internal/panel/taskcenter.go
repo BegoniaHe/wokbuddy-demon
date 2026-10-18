@@ -275,15 +275,15 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 }
 
 // collectQueueAccounts 并发拉取各账号待办成长任务（复用扫描逻辑的拉取部分），
-// 返回待办非空的账号（保持原顺序）。growth=false 时不做上游拉取。
+// 返回待办非空的账号（保持 Pool.List 的原顺序）。growth=false 时不做上游拉取。
 func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 	states := p.cfg.Pool.List()
 
-	var (
-		accts []queueAccount
-		wg    sync.WaitGroup
-		mu    sync.Mutex
-	)
+	// 按下标写回：并发拉取完成顺序不确定，不能直接 append，否则队列账号
+	// 顺序随 goroutine 调度漂移（与「保持原顺序」契约不符）。
+	results := make([]*queueAccount, len(states))
+
+	var wg sync.WaitGroup
 
 	for i := range states {
 		st := &states[i]
@@ -297,7 +297,7 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 		}
 
 		wg.Add(1)
-		go func(a *auth.Auth) {
+		go func(idx int, a *auth.Auth) {
 			defer wg.Done()
 
 			one := queueAccount{a: a}
@@ -306,15 +306,20 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 			}
 
 			if len(one.grow) > 0 {
-				mu.Lock()
-
-				accts = append(accts, one)
-				mu.Unlock()
+				results[idx] = &one
 			}
-		}(account)
+		}(i, account)
 	}
 
 	wg.Wait()
+
+	accts := make([]queueAccount, 0, len(states))
+
+	for _, one := range results {
+		if one != nil {
+			accts = append(accts, *one)
+		}
+	}
 
 	return accts
 }
