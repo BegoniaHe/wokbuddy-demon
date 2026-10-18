@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
@@ -56,6 +57,11 @@ type Status struct {
 type Manager struct {
 	Home    string // 用户主目录
 	DataDir string // 备份目录（data/agent-backups）
+
+	// mu 串行化 Apply/Restore/Status 的读-改-写序列。三者都是「读现有配置 →
+	// 改 → 写回」或读备份元数据；面板允许并发请求，无锁会丢更新、让后写覆盖
+	// 先写，甚至写出与 meta 不一致的状态。
+	mu sync.Mutex
 }
 
 // New 构造管理器。
@@ -105,6 +111,14 @@ func (m *Manager) originalPath(id string) string { return filepath.Join(m.backup
 
 // Status 返回全部客户端状态。
 func (m *Manager) Status() []Status {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	return m.statusLocked()
+}
+
+// statusLocked 无锁实现；调用方已持 m.mu。
+func (m *Manager) statusLocked() []Status {
 	out := make([]Status, 0, len(clients))
 	for _, c := range clients {
 		path := c.path(m.Home)
@@ -146,6 +160,9 @@ func validateOptions(opts *Options) error {
 
 // Apply 写入网关专属配置。
 func (m *Manager) Apply(id string, opts Options) (Status, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	client2, ok := m.client(id)
 	if !ok {
 		return Status{}, fmt.Errorf("unknown client %q: %w", id, errApplyFailed)
@@ -183,7 +200,7 @@ func (m *Manager) Apply(id string, opts Options) (Status, error) {
 		return Status{}, err
 	}
 
-	for _, st := range m.Status() {
+	for _, st := range m.statusLocked() {
 		if st.ID == id {
 			return st, nil
 		}
@@ -212,6 +229,9 @@ func (m *Manager) prepareMeta(id string, existing []byte, existed bool) (meta, e
 
 // Restore 还原到首次写入前；网关新建的文件会被删除。
 func (m *Manager) Restore(id string, force bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	client2, ok := m.client(id)
 	if !ok {
 		return fmt.Errorf("unknown client %q: %w", id, errRestoreFailed)
@@ -307,7 +327,13 @@ func (m *Manager) writeMeta(id string, mt meta) error {
 		return fmt.Errorf("writeMeta: %w", err)
 	}
 
-	if err := os.WriteFile(m.metaPath(id), raw, 0o600); err != nil {
+	path := m.metaPath(id)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("writeMeta: %w", err)
+	}
+
+	if err := atomicwrite.Rename(tmp, path); err != nil {
 		return fmt.Errorf("writeMeta: %w", err)
 	}
 

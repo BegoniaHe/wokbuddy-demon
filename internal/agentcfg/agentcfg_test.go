@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -196,5 +197,46 @@ func TestClaudeUsesGatewayRoot(t *testing.T) {
 	if !strings.Contains(string(raw), `"ANTHROPIC_BASE_URL":"http://127.0.0.1:7863"`) &&
 		!strings.Contains(string(raw), `"ANTHROPIC_BASE_URL": "http://127.0.0.1:7863"`) {
 		t.Fatalf("claude should use root without /v1:\n%s", raw)
+	}
+}
+
+// TestConcurrentApplyRestore（R2）：并发 Apply/Restore 必须串行化，不能出现
+// meta 与配置内容不一致（此前读-改-写无锁，-race 下会丢更新）。
+func TestConcurrentApplyRestore(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	m := New(home, filepath.Join(home, "backups"))
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk-test", Model: "glm-5.2"}
+
+	if _, err := m.Apply("claude", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			_, _ = m.Apply("claude", opts)
+		}()
+
+		go func() {
+			defer wg.Done()
+			_ = m.Restore("claude", true)
+		}()
+	}
+	wg.Wait()
+
+	if _, err := m.Apply("claude", opts); err != nil {
+		t.Fatalf("apply after concurrent churn: %v", err)
+	}
+
+	status := m.Status()
+	for _, item := range status {
+		if item.ID == "claude" && item.Modified {
+			t.Fatalf("meta and config diverged after concurrent writes: %+v", item)
+		}
 	}
 }
