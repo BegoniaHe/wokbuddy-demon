@@ -16,32 +16,43 @@ import (
 )
 
 func TestShutdownConfigDefaultsAndNormalize(t *testing.T) {
-	c := Default()
-	if c.Server.RequestAcceptGraceSeconds != 0 || c.Server.ShutdownGraceSeconds != 30 {
+	t.Parallel()
+
+	config := Default()
+	if config.Server.RequestAcceptGraceSeconds != 0 || config.Server.ShutdownGraceSeconds != 30 {
 		t.Fatalf("defaults grace=%d shutdown=%d want 0/30",
-			c.Server.RequestAcceptGraceSeconds, c.Server.ShutdownGraceSeconds)
+			config.Server.RequestAcceptGraceSeconds, config.Server.ShutdownGraceSeconds)
 	}
-	c = Default()
-	c.Server.ShutdownGraceSeconds = 0
-	if err := c.normalize(); err != nil {
+
+	config = Default()
+
+	config.Server.ShutdownGraceSeconds = 0
+	if err := config.normalize(); err != nil {
 		t.Fatal(err)
 	}
-	if c.Server.ShutdownGraceSeconds != 30 {
-		t.Fatalf("shutdown grace=%d want 30 after normalize", c.Server.ShutdownGraceSeconds)
+
+	if config.Server.ShutdownGraceSeconds != 30 {
+		t.Fatalf("shutdown grace=%d want 30 after normalize", config.Server.ShutdownGraceSeconds)
 	}
-	c = Default()
-	c.Server.RequestAcceptGraceSeconds = -1
-	if err := c.normalize(); err == nil {
+
+	config = Default()
+
+	config.Server.RequestAcceptGraceSeconds = -1
+	if err := config.normalize(); err == nil {
 		t.Fatal("negative request_accept_grace_seconds should fail")
 	}
-	c = Default()
-	c.Server.ShutdownGraceSeconds = -1
-	if err := c.normalize(); err == nil {
+
+	config = Default()
+
+	config.Server.ShutdownGraceSeconds = -1
+	if err := config.normalize(); err == nil {
 		t.Fatal("negative shutdown_grace_seconds should fail")
 	}
 }
 
 func TestRestartRequiredIncludesShutdownGrace(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		field  string
 		mutate func(*Config)
@@ -49,39 +60,44 @@ func TestRestartRequiredIncludesShutdownGrace(t *testing.T) {
 		{"server.request_accept_grace_seconds", func(c *Config) { c.Server.RequestAcceptGraceSeconds = 5 }},
 		{"server.shutdown_grace_seconds", func(c *Config) { c.Server.ShutdownGraceSeconds = 10 }},
 	}
-	for _, tc := range cases {
+	for _, testCase := range cases {
 		oldCfg := Default()
 		newCfg := Default()
-		tc.mutate(newCfg)
+		testCase.mutate(newCfg)
 		got := restartRequiredFields(oldCfg, newCfg)
 		found := false
+
 		for _, f := range got {
-			if f == tc.field {
+			if f == testCase.field {
 				found = true
 			}
 		}
+
 		if !found {
-			t.Errorf("restart fields %v missing %q", got, tc.field)
+			t.Errorf("restart fields %v missing %q", got, testCase.field)
 		}
 	}
 }
 
 func TestSaveConfigBackupAndRestore(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
+
 	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, []byte(`{"api_key":"old-key","listen":":7863"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p := pool.New("")
-	up := upstream.New()
-	sch := scheduler.New(scheduler.Config{})
+
+	state := pool.New("")
+	client := upstream.New()
+	sch := scheduler.New(&scheduler.Config{})
 	live := livecfg.New(livecfg.Snapshot{APIKey: "old-key"})
 
-	mustSaveConfig(t, path, live, p, up, sch)
+	mustSaveConfig(t, path, live, state, client, sch)
 	assertFileContains(t, configBackupPath(path), `"old-key"`)
 	assertLiveKey(t, live, "new-key")
 
-	mustRestoreConfig(t, path, live, p, up, sch)
+	mustRestoreConfig(t, path, live, state, client, sch)
 	assertFileContains(t, path, `"old-key"`)
 	assertLiveKey(t, live, "old-key")
 	// 恢复不滚动备份：同一份 .1 仍可再次恢复。
@@ -90,6 +106,7 @@ func TestSaveConfigBackupAndRestore(t *testing.T) {
 
 func mustSaveConfig(t *testing.T, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) {
 	t.Helper()
+
 	if _, err := saveConfig([]byte(`{"api_key":"new-key"}`), path, live, p, up, sch); err != nil {
 		t.Fatalf("saveConfig: %v", err)
 	}
@@ -97,6 +114,7 @@ func mustSaveConfig(t *testing.T, path string, live *livecfg.Holder, p *pool.Poo
 
 func mustRestoreConfig(t *testing.T, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) {
 	t.Helper()
+
 	if _, err := restoreConfig(path, live, p, up, sch); err != nil {
 		t.Fatalf("restoreConfig: %v", err)
 	}
@@ -104,10 +122,12 @@ func mustRestoreConfig(t *testing.T, path string, live *livecfg.Holder, p *pool.
 
 func assertFileContains(t *testing.T, path, want string) {
 	t.Helper()
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
+
 	if !strings.Contains(string(raw), want) {
 		t.Fatalf("%s=%s want %s", path, raw, want)
 	}
@@ -115,6 +135,7 @@ func assertFileContains(t *testing.T, path, want string) {
 
 func assertLiveKey(t *testing.T, live *livecfg.Holder, want string) {
 	t.Helper()
+
 	if got := live.Load().APIKey; got != want {
 		t.Fatalf("live api_key=%q want %q", got, want)
 	}
@@ -122,27 +143,35 @@ func assertLiveKey(t *testing.T, live *livecfg.Holder, want string) {
 
 // 并发保存必须串行化：共用 config.json.tmp 时交错写入会产出半截 JSON。
 func TestSaveConfigConcurrentStaysValid(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
+
 	path := filepath.Join(dir, "config.json")
 	if err := os.WriteFile(path, []byte(`{"api_key":"old-key"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p := pool.New("")
-	up := upstream.New()
-	sch := scheduler.New(scheduler.Config{})
+
+	state := pool.New("")
+	client := upstream.New()
+	sch := scheduler.New(&scheduler.Config{})
 	live := livecfg.New(livecfg.Snapshot{APIKey: "old-key"})
 
 	const n = 8
+
 	errs := make([]error, n)
+
 	var wg sync.WaitGroup
 	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = saveConfig([]byte(fmt.Sprintf(`{"api_key":"k-%d"}`, i)), path, live, p, up, sch)
+
+			_, errs[i] = saveConfig([]byte(fmt.Sprintf(`{"api_key":"k-%d"}`, i)), path, live, state, client, sch)
 		}(i)
 	}
+
 	wg.Wait()
+
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("save %d: %v", i, err)
@@ -153,10 +182,12 @@ func TestSaveConfigConcurrentStaysValid(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	var got map[string]any
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("并发保存后配置不是有效 JSON: %v\n%s", err, raw)
 	}
+
 	if _, ok := got["api_key"].(string); !ok {
 		t.Fatalf("api_key 丢失: %s", raw)
 	}

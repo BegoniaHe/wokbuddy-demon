@@ -7,6 +7,8 @@ import (
 )
 
 func TestClassifyLine(t *testing.T) {
+	t.Parallel()
+
 	cases := map[string]string{
 		"| #001 | glm-5.2 | stream | 200 | uid=c8a3e793 | TTFB=120ms |": ChChat,
 		"school c8a3e793: ★ 分享任务完成":                                     ChTask,
@@ -27,24 +29,31 @@ func TestClassifyLine(t *testing.T) {
 }
 
 func TestRingWriteStripsTimestamp(t *testing.T) {
+	t.Parallel()
+
 	r := NewRing(4)
 	if _, err := r.Write([]byte("2026/09/14 00:12:34 school x: done\n")); err != nil {
 		t.Fatal(err)
 	}
+
 	if _, err := r.Write([]byte("| #002 | glm | stream | 200 | ok |")); err != nil {
 		t.Fatal(err)
 	}
-	es := r.Snapshot()
-	if len(es) != 2 {
-		t.Fatalf("entries=%d want 2", len(es))
+
+	logEntries := r.Snapshot()
+	if len(logEntries) != 2 {
+		t.Fatalf("entries=%d want 2", len(logEntries))
 	}
-	if strings.HasPrefix(es[0].Text, "2026/") {
-		t.Errorf("timestamp not stripped: %q", es[0].Text)
+
+	if strings.HasPrefix(logEntries[0].Text, "2026/") {
+		t.Errorf("timestamp not stripped: %q", logEntries[0].Text)
 	}
-	if es[0].Ch != ChTask || es[1].Ch != ChChat {
-		t.Errorf("channels: %q %q", es[0].Ch, es[1].Ch)
+
+	if logEntries[0].Ch != ChTask || logEntries[1].Ch != ChChat {
+		t.Errorf("channels: %q %q", logEntries[0].Ch, logEntries[1].Ch)
 	}
-	if time.Since(es[0].TS) > 5*time.Second {
-		t.Errorf("stale ts: %v", es[0].TS)
+
+	if time.Since(logEntries[0].TS) > 5*time.Second {
+		t.Errorf("stale ts: %v", logEntries[0].TS)
 	}
 }

@@ -21,12 +21,14 @@ func FuzzPrepareBodyOpt(f *testing.F) {
 	for _, s := range seeds {
 		f.Add([]byte(s))
 	}
+
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out := PrepareBodyOptWithEffortsAndDefault(data, true,
 			map[string][]string{"m": {"low", "high"}}, map[string]string{"m": "high"})
 		if !json.Valid(data) {
 			return
 		}
+
 		if !json.Valid(out) {
 			t.Fatalf("合法输入产出了非法 JSON: in=%q out=%q", data, out)
 		}
@@ -45,11 +47,13 @@ func FuzzNormalizeFrame(f *testing.F) {
 	for _, s := range seeds {
 		f.Add([]byte(s))
 	}
+
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		var obj map[string]any
 		if json.Unmarshal(raw, &obj) != nil {
 			return
 		}
+
 		out := normalizeFrame(obj)
 		if _, err := json.Marshal(out); err != nil {
 			t.Fatalf("normalizeFrame 输出不可 marshal: %v", err)
@@ -62,10 +66,12 @@ type fuzzWriter struct {
 	buf bytes.Buffer
 }
 
-func (w *fuzzWriter) Header() http.Header         { return http.Header{} }
-func (w *fuzzWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
-func (w *fuzzWriter) WriteHeader(int)             {}
-func (w *fuzzWriter) Flush()                      {}
+func (w *fuzzWriter) Header() http.Header { return http.Header{} }
+func (w *fuzzWriter) Write(p []byte) (int, error) {
+	return w.buf.Write(p) //nolint:wrapcheck // io.Writer 必须原样透传底层 n 与 err
+}
+func (w *fuzzWriter) WriteHeader(int) {}
+func (w *fuzzWriter) Flush()          {}
 
 // FuzzHandleStreamLine SSE 行处理：任意输入不 panic，写出量有界。
 func FuzzHandleStreamLine(f *testing.F) {
@@ -80,9 +86,11 @@ func FuzzHandleStreamLine(f *testing.F) {
 	for _, s := range seeds {
 		f.Add(s)
 	}
+
 	f.Fuzz(func(t *testing.T, line string) {
 		w := &fuzzWriter{}
 		sw := newStreamWriter(w, nil)
+
 		_, _, _ = sw.handleStreamLine(line)
 		if w.buf.Len() > len(line)*2+4096 {
 			t.Fatalf("单行输出异常放大: in=%d out=%d", len(line), w.buf.Len())

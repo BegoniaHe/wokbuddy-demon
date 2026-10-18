@@ -17,11 +17,13 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "config api not available")
 		return
 	}
+
 	cfg, err := p.cfg.LoadConfig()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "load config: "+err.Error())
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"path":   p.cfg.ConfigPath,
@@ -36,19 +38,23 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "config api not available")
 		return
 	}
+
 	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
 		return
 	}
+
 	restartRequired, err := p.cfg.SaveConfig(raw)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if restartRequired == nil {
 		restartRequired = []string{}
 	}
+
 	log.Printf("panel: 配置已保存（热生效完成；需重启字段 %d 个）", len(restartRequired))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":               true,
@@ -62,14 +68,17 @@ func (p *Panel) restoreConfig(w http.ResponseWriter, _ *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "config restore not available")
 		return
 	}
+
 	restartRequired, err := p.cfg.RestoreConfig()
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
 	if restartRequired == nil {
 		restartRequired = []string{}
 	}
+
 	log.Printf("panel: 配置已恢复上一版（需重启字段 %d 个）", len(restartRequired))
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":               true,

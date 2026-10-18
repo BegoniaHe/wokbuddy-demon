@@ -11,6 +11,8 @@ import (
 // 这条测试的价值在于把"没有观测就不扣"这一条钉住：非流式回复没有首个 data 帧，
 // 若实现改成"没测到就按某个默认 TTFB 扣"，速率会虚高，而单看代码很难发现。
 func TestTokensPerSecond(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name      string
 		tokens    int64
@@ -34,17 +36,19 @@ func TestTokensPerSecond(t *testing.T) {
 		{"零耗时", 10, 0, 0, 0, false, 0},
 		{"零 token 但有效耗时", 0, time.Second, 0, 0, true, 0.01},
 	}
-	for _, c := range cases {
-		got, ok := tokensPerSecond(c.tokens, c.total, c.ttfb)
-		if ok != c.wantOk {
-			t.Errorf("%s: ok=%v want %v", c.name, ok, c.wantOk)
+	for _, item := range cases {
+		got, ok := tokensPerSecond(item.tokens, item.total, item.ttfb)
+		if ok != item.wantOk {
+			t.Errorf("%s: ok=%v want %v", item.name, ok, item.wantOk)
 			continue
 		}
+
 		if !ok {
 			continue
 		}
-		if math.Abs(got-c.want) > c.tolerance {
-			t.Errorf("%s: got %.3f want %.3f", c.name, got, c.want)
+
+		if math.Abs(got-item.want) > item.tolerance {
+			t.Errorf("%s: got %.3f want %.3f", item.name, got, item.want)
 		}
 	}
 }
@@ -52,7 +56,10 @@ func TestTokensPerSecond(t *testing.T) {
 // TestTokensPerSecondTTFBMonotonic 语义回归：TTFB 越大，扣减越多、速率越高。
 // 这正是 issue #34 的核心——修复前两者相等（TTFB 完全不影响结果）。
 func TestTokensPerSecondTTFBMonotonic(t *testing.T) {
+	t.Parallel()
+
 	const tok = 200
+
 	total := 2 * time.Second
 	without, _ := tokensPerSecond(tok, total, 0)
 	with200, _ := tokensPerSecond(tok, total, 200*time.Millisecond)
@@ -66,6 +73,7 @@ func TestTokensPerSecondTTFBMonotonic(t *testing.T) {
 	if math.Abs(without-100) > 0.01 {
 		t.Errorf("无 TTFB 时应等于端到端口径 100，得到 %.2f", without)
 	}
+
 	if math.Abs(with200-111.11) > 0.05 {
 		t.Errorf("扣 200ms 后应约 111.11，得到 %.2f", with200)
 	}

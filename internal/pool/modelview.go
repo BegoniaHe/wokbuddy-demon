@@ -73,7 +73,9 @@ type modelLockAgg struct {
 func (p *Pool) ModelLockView() []ModelLockRow {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
+
 	rows, routable := p.aggregateModelLocks(now)
 	if len(rows) == 0 {
 		return nil
@@ -83,15 +85,19 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 	for key, a := range rows {
 		out = append(out, p.buildModelLockRow(key, a, routable, now))
 	}
+
 	sort.Slice(out, func(i, j int) bool {
 		if ri, rj := modelLockRank(out[i].State), modelLockRank(out[j].State); ri != rj {
 			return ri < rj
 		}
+
 		if out[i].Model != out[j].Model {
 			return out[i].Model < out[j].Model
 		}
+
 		return out[i].Realm < out[j].Realm
 	})
+
 	return out
 }
 
@@ -101,84 +107,97 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 func (p *Pool) aggregateModelLocks(now time.Time) (map[string]*modelLockAgg, map[string]int) {
 	rows := make(map[string]*modelLockAgg)
 	routable := make(map[string]int) // realm → 参与选号的账号数
-	for _, e := range p.byUID {
-		realm := e.a.Realm()
-		if e.disabled || e.paused {
+
+	for _, item := range p.byUID {
+		realm := item.a.Realm()
+		if item.disabled || item.paused {
 			continue
 		}
+
 		routable[realm]++
-		for model, mc := range e.modelCooldowns {
-			aggregateModelLock(rows, realm, model, mc, now)
+		for model, mc := range item.modelCooldowns {
+			aggregateModelLock(rows, realm, model, &mc, now)
 		}
 	}
+
 	return rows, routable
 }
 
 // activeModelCooldown 报告模型级冷却是否真正拦路由：AuditOnly 台账（无重置时间的
 // 6004）不改变选号，过期/零截止不算锁。
-func activeModelCooldown(mc modelCooldown, now time.Time) bool {
+func activeModelCooldown(mc *modelCooldown, now time.Time) bool {
 	return !mc.AuditOnly && !mc.Until.IsZero() && now.Before(mc.Until)
 }
 
 // aggregateModelLock 把单个账号的单个模型冷却并入 (域, 模型) 聚合态：累计被锁账号数，
 // 记录最早/最晚解锁时刻与最早解锁账号的上游原因。
-func aggregateModelLock(rows map[string]*modelLockAgg, realm, model string, mc modelCooldown, now time.Time) {
-	if !activeModelCooldown(mc, now) {
+func aggregateModelLock(rows map[string]*modelLockAgg, realm, model string, modelCooldown2 *modelCooldown, now time.Time) {
+	if !activeModelCooldown(modelCooldown2, now) {
 		return
 	}
+
 	key := realm + "\x1f" + model
-	a := rows[key]
-	if a == nil {
-		a = &modelLockAgg{}
-		rows[key] = a
+
+	modelLockAgg2 := rows[key]
+	if modelLockAgg2 == nil {
+		modelLockAgg2 = &modelLockAgg{}
+		rows[key] = modelLockAgg2
 	}
-	a.locked++
-	if a.unlockAt.IsZero() || mc.Until.Before(a.unlockAt) {
-		a.unlockAt = mc.Until
-		a.reason = mc.Reason
+
+	modelLockAgg2.locked++
+	if modelLockAgg2.unlockAt.IsZero() || modelCooldown2.Until.Before(modelLockAgg2.unlockAt) {
+		modelLockAgg2.unlockAt = modelCooldown2.Until
+		modelLockAgg2.reason = modelCooldown2.Reason
 	}
-	if a.fullyAt.IsZero() || mc.Until.After(a.fullyAt) {
-		a.fullyAt = mc.Until
+
+	if modelLockAgg2.fullyAt.IsZero() || modelCooldown2.Until.After(modelLockAgg2.fullyAt) {
+		modelLockAgg2.fullyAt = modelCooldown2.Until
 	}
-	if !mc.ResetAt.IsZero() {
-		if a.resetCounts == nil {
-			a.resetCounts = make(map[time.Time]int)
+
+	if !modelCooldown2.ResetAt.IsZero() {
+		if modelLockAgg2.resetCounts == nil {
+			modelLockAgg2.resetCounts = make(map[time.Time]int)
 		}
-		a.resetCounts[mc.ResetAt]++
-		a.withReset++
+
+		modelLockAgg2.resetCounts[modelCooldown2.ResetAt]++
+		modelLockAgg2.withReset++
 	}
 }
 
 // buildModelLockRow 由聚合态构造单行画像：补上 Servable 计数（该域内
 // healthyForModel 且未在途占满的账号数）并推导 State。调用方必须已持有 p.mu。
-func (p *Pool) buildModelLockRow(key string, a *modelLockAgg, routable map[string]int, now time.Time) ModelLockRow {
+func (p *Pool) buildModelLockRow(key string, modelLockAgg2 *modelLockAgg, routable map[string]int, now time.Time) ModelLockRow {
 	sep := strings.IndexByte(key, '\x1f')
 	realm, model := key[:sep], key[sep+1:]
+
 	row := ModelLockRow{
 		Model:         model,
 		Realm:         realm,
 		Total:         routable[realm],
-		Locked:        a.locked,
-		UnlockAt:      a.unlockAt,
-		FullyUnlockAt: a.fullyAt,
-		Reason:        a.reason,
+		Locked:        modelLockAgg2.locked,
+		UnlockAt:      modelLockAgg2.unlockAt,
+		FullyUnlockAt: modelLockAgg2.fullyAt,
+		Reason:        modelLockAgg2.reason,
 	}
 	for _, e := range p.byUID {
 		if e.a.Realm() != realm {
 			continue
 		}
+
 		if e.healthyForModel(now, model) && !p.inFlightFull(e) {
 			row.Servable++
 		}
 	}
 	// 锁范围（issue #29）：全部被锁账号共享同一非零上游重置时刻 → 平台级。
 	var shared time.Time
-	if len(a.resetCounts) == 1 {
-		for t := range a.resetCounts {
+
+	if len(modelLockAgg2.resetCounts) == 1 {
+		for t := range modelLockAgg2.resetCounts {
 			shared = t
 		}
 	}
-	row.Scope, _ = modelBlockScope(a.locked, a.withReset, len(a.resetCounts), shared)
+
+	row.Scope, _ = modelBlockScope(modelLockAgg2.locked, modelLockAgg2.withReset, len(modelLockAgg2.resetCounts), shared)
 	switch {
 	case row.Servable > 0:
 		row.State = "partial"
@@ -188,6 +207,7 @@ func (p *Pool) buildModelLockRow(key string, a *modelLockAgg, routable map[strin
 	default:
 		row.State = "starved"
 	}
+
 	return row
 }
 

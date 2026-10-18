@@ -34,6 +34,7 @@ func originRefererFor(a *auth.Auth) string {
 	if a != nil && a.IsGlobal() {
 		return originRefererGlobal
 	}
+
 	return originRefererCN
 }
 
@@ -43,9 +44,11 @@ func (c *Client) clientVersionFor(a *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
 	}
+
 	if a != nil && a.IsGlobal() {
 		return globalClientVersion
 	}
+
 	return cnClientVersion
 }
 
@@ -55,9 +58,11 @@ func (c *Client) cliVersionFor(a *auth.Auth) string {
 	if c != nil && c.CliVersion != "" {
 		return c.CliVersion
 	}
+
 	if a != nil && a.IsGlobal() {
 		return globalCliVersion
 	}
+
 	return cnCliVersion
 }
 
@@ -79,6 +84,7 @@ func (c *Client) userAgent(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
 	}
+
 	return c.defaultWorkBuddyUAFor(a)
 }
 
@@ -89,6 +95,7 @@ func (c *Client) billingUA(a *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
 	}
+
 	return "WorkBuddy/" + c.clientVersionFor(a)
 }
 
@@ -99,12 +106,15 @@ func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	if a != nil && a.DeviceToken != "" {
 		return a.DeviceToken
 	}
+
 	if c != nil && c.DeviceToken != "" {
 		return c.DeviceToken
 	}
+
 	if c != nil && c.DeviceTokenFile != "" {
 		return readDeviceTokenFile(c.DeviceTokenFile)
 	}
+
 	return ""
 }
 
@@ -135,34 +145,36 @@ func deriveAccountStableID(uid, purpose string) string {
 
 // injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
 // 派生，跨重启固定、账号间互异。uid 为空时不注入（匿名请求无设备标识，上游不要求）。
-func (c *Client) injectAccountStableHeaders(req *http.Request, a *auth.Auth) {
-	if a == nil || a.UID == "" {
+func (c *Client) injectAccountStableHeaders(req *http.Request, account5 *auth.Auth) {
+	if account5 == nil || account5.UID == "" {
 		return
 	}
-	req.Header.Set("X-Machine-Id", deriveAccountStableID(a.UID, "machine"))
-	req.Header.Set("X-Session-Id", deriveAccountStableID(a.UID, "session"))
+
+	req.Header.Set("X-Machine-Id", deriveAccountStableID(account5.UID, "machine"))
+	req.Header.Set("X-Session-Id", deriveAccountStableID(account5.UID, "session"))
 }
 
 // CommonHeaders 设置所有 API 共享的请求头。
-func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
+func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
 	// chat 流式路径在 ChatHeaders 覆盖为 event-stream。
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	origin := originRefererFor(a)
+
+	origin := originRefererFor(account2)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", c.userAgent(a))
+	req.Header.Set("User-Agent", c.userAgent(account2))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-Codebuddy-Request", "1")
 	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
 	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	req.Header.Set("Accept-Language", acceptLanguageFor(account2))
 	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
 	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
 	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
-	c.injectAccountStableHeaders(req, a)
+	c.injectAccountStableHeaders(req, account2)
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -170,6 +182,7 @@ func acceptLanguageFor(a *auth.Auth) string {
 	if a != nil && a.IsGlobal() {
 		return "en-US"
 	}
+
 	return "zh-CN"
 }
 
@@ -195,19 +208,20 @@ type ChatMeta struct {
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
 // meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
-func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
-	c.CommonHeaders(req, a)
+func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP string, meta ChatMeta) {
+	c.CommonHeaders(req, account3)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
-	if at := a.AccessTokenValue(); at != "" {
+	if at := account3.AccessTokenValue(); at != "" {
 		req.Header.Set("Authorization", "Bearer "+at)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+
+	if account3.UID != "" {
+		req.Header.Set("X-User-Id", account3.UID)
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}
@@ -216,29 +230,30 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	// global 账号由 injectGlobalChatHeaders 统一覆写为国际客户端形态
 	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
 	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
-	if a != nil && !a.IsGlobal() {
-		injectCNChatHeaders(req, a)
+	if account3 != nil && !account3.IsGlobal() {
+		injectCNChatHeaders(req, account3)
 	} else {
-		c.injectGlobalChatHeaders(req, a)
+		c.injectGlobalChatHeaders(req, account3)
 	}
 	// 用量归属头：默认伪造官方桌面端指纹（client_name 非空 = 自定义归属逃生门）。
-	c.injectAttribution(req, a)
+	c.injectAttribution(req, account3)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
-	c.injectDeviceToken(req, a)
+	c.injectDeviceToken(req, account3)
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
 }
 
 // injectCNChatHeaders CN 账号的 chat 域头：企业 ID 与 Domain 原样透传（缺省 X-No-*）。
-func injectCNChatHeaders(req *http.Request, a *auth.Auth) {
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+func injectCNChatHeaders(req *http.Request, account *auth.Auth) {
+	if account.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	if d := a.DomainValue(); d != "" {
+
+	if d := account.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
@@ -255,6 +270,7 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 	if a == nil || !a.IsGlobal() {
 		return
 	}
+
 	req.Header.Set("X-No-Enterprise-Id", "1")
 	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
@@ -281,24 +297,31 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 		// 本级补一个 32 hex，调用方（handler）已生成稳定的不走到这里。
 		convReqID = session.NewMessageID()
 	}
+
 	messageID := session.NewMessageID()
+
 	if meta.ConversationID != "" {
 		req.Header.Set("X-Conversation-Id", meta.ConversationID)
 		req.Header.Set("Acp-Connection-Id", acpConnectionID(meta.ConversationID))
 	}
+
 	req.Header.Set("X-Conversation-Request-Id", convReqID)
 	req.Header.Set("X-Conversation-Message-Id", messageID)
 	req.Header.Set("X-Request-ID", messageID)
 	req.Header.Set("X-Root-Request-Id", convReqID)
+
 	traceID := meta.TraceID
 	if traceID == "" {
 		traceID = convReqID
 	}
+
 	req.Header.Set("X-Trace-Id", traceID)
+
 	b3Trace := convReqID
 	if !validTraceID(b3Trace) {
 		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
 	}
+
 	spanID := messageID[:16]
 	parentSpanID := session.NewMessageID()[:16]
 	// traceparent（W3C）：00-<32hex trace>-<16hex span>-01；b3（单头）：<trace>-<span>-1-<parent>。
@@ -315,22 +338,25 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 func acpConnectionID(conversationID string) string {
 	sum := sha256.Sum256([]byte("wb2a:acp:" + conversationID))
 	h := hex.EncodeToString(sum[:16]) // 32 hex
+
 	return h[0:8] + "-" + h[8:12] + "-4" + h[13:16] + "-a" + h[17:20] + "-" + h[20:32]
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
 // 官方客户端生成的 conversationRequestId 是 32 位 hex（UUID 去横线），入站透传值
 // 可能是任意形状（含横线/超长/非 hex），直接塞进 B3 头会破坏链路关联（issue #35）。
-func validTraceID(s string) bool {
-	if len(s) != 16 && len(s) != 32 {
+func validTraceID(str string) bool {
+	if len(str) != 16 && len(str) != 32 {
 		return false
 	}
-	for i := range len(s) {
-		ch := s[i]
+
+	for i := range len(str) {
+		ch := str[i]
 		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') && (ch < 'A' || ch > 'F') {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -340,6 +366,7 @@ func (c *Client) attributionClientName() string {
 	if c != nil && c.ClientName != "" {
 		return c.ClientName
 	}
+
 	return "WorkBuddy"
 }
 
@@ -353,20 +380,23 @@ func (c *Client) attributionClientName() string {
 //	X-Product=SaaS（=deploymentType）。
 //
 // 显式 ClientName 非空时 X-Product 与 X-IDE-Name/Type 跟随该值（自定义归因逃生门）。
-func (c *Client) injectAttribution(req *http.Request, a *auth.Auth) {
+func (c *Client) injectAttribution(req *http.Request, account4 *auth.Auth) {
 	req.Header.Set("X-Agent-Purpose", "conversation")
 	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Agent-Type", "main")
 	req.Header.Set("X-Private-Data", "true")
+
 	name := "WorkBuddy"
 	product := "SaaS" // 官方 chat X-Product=deploymentType（SaaS）
+
 	if c != nil && c.ClientName != "" {
 		name = c.ClientName
 		product = c.ClientName
 	}
+
 	req.Header.Set("X-Ide-Name", name)
 	req.Header.Set("X-Ide-Type", name)
-	req.Header.Set("X-Ide-Version", c.clientVersionFor(a))
+	req.Header.Set("X-Ide-Version", c.clientVersionFor(account4))
 	req.Header.Set("X-Product", product)
 }
 
@@ -375,6 +405,7 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 	if c == nil || !c.PassthroughIP || clientIP == "" {
 		return
 	}
+
 	req.Header.Set("X-Forwarded-For", clientIP)
 	req.Header.Set("X-Real-IP", clientIP)
 	req.Header.Set("X-Client-Ip", clientIP)
@@ -385,54 +416,63 @@ func ExtractClientIP(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
+
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		for i := range len(xff) {
 			if xff[i] == ',' {
 				return strings.TrimSpace(xff[:i])
 			}
 		}
+
 		return strings.TrimSpace(xff)
 	}
+
 	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
 		return realIP
 	}
+
 	return ""
 }
 
 // BillingHeaders billing 接口请求头。
 // UA 语义：默认**不设置**（保持现状，Go 客户端自带默认 UA）；仅当显式配置
 // c.UserAgent 非空才覆盖——避免默认路径给 billing 引入新的 UA 指纹。
-func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
+func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 	// AccessToken 加锁快照（同 ChatHeaders：keepalive 可在 a.mu 内改写）。
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+	req.Header.Set("Authorization", "Bearer "+account6.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
 	// Accept-Language 按 realm 切（D5，billing 域未走 CommonHeaders，单独注入）。
-	req.Header.Set("Accept-Language", acceptLanguageFor(a))
+	req.Header.Set("Accept-Language", acceptLanguageFor(account6))
+
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
-	} else if ua := c.billingUA(a); ua != "" {
+	} else if ua := c.billingUA(account6); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+
+	if account6.UID != "" {
+		req.Header.Set("X-User-Id", account6.UID)
 	}
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", a.EnterpriseID)
+
+	if account6.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", account6.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", account6.EnterpriseID)
 	}
-	if d := a.DomainValue(); d != "" {
+
+	if d := account6.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
 	}
 	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
-	c.injectDeviceToken(req, a)
+	c.injectDeviceToken(req, account6)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
 func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
 	c.CommonHeaders(req, a)
 	req.Header.Set("X-Refresh-Token", a.RefreshToken)
+
 	if a.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
 	}

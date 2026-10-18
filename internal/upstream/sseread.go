@@ -42,21 +42,25 @@ var ErrSSEAggregateTooLong = errors.New("sse aggregate exceeds size limit")
 // 实现不依赖 ReadString 的字符串拼接：超长行会被 ReadString 反复 concat 成
 // 任意大小。这里自己按 chunk 累积，超限立即失败。
 func readSSELine(br *bufio.Reader) (string, error) {
-	var sb strings.Builder
+	var builder strings.Builder
+
 	for {
 		chunk, err := br.ReadSlice('\n')
-		if sb.Len()+len(chunk) > MaxSSELineBytes {
+		if builder.Len()+len(chunk) > MaxSSELineBytes {
 			return "", fmt.Errorf("%w: > %d bytes", ErrSSELineTooLong, MaxSSELineBytes)
 		}
-		sb.Write(chunk)
+
+		builder.Write(chunk)
+
 		if err == nil {
-			return sb.String(), nil // 读到 '\n'：完整一行
+			return builder.String(), nil // 读到 '\n'：完整一行
 		}
+
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue // 行还没完：继续累积（上限由上方的累计检查兜住）
 		}
 		// io.EOF 或其他读错误：连同已读内容返回，语义同 ReadString。
-		return sb.String(), err
+		return builder.String(), err
 	}
 }
 
@@ -73,5 +77,6 @@ func (g *aggregateGuard) add(n int) error {
 	if g.total > maxSSEAggregateBytes {
 		return fmt.Errorf("%w: > %d bytes", ErrSSEAggregateTooLong, maxSSEAggregateBytes)
 	}
+
 	return nil
 }

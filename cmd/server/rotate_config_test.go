@@ -7,40 +7,52 @@ import (
 
 // TestRotateConfigDefaults 缺省：次数 3、预算 0（不限）、状态码空（按分类换号）。
 func TestRotateConfigDefaults(t *testing.T) {
-	c, err := ParseConfig([]byte(`{}`))
+	t.Parallel()
+
+	config, err := ParseConfig([]byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Upstream.RotateMax != 3 {
-		t.Errorf("rotate_max=%d want 3", c.Upstream.RotateMax)
+
+	if config.Upstream.RotateMax != 3 {
+		t.Errorf("rotate_max=%d want 3", config.Upstream.RotateMax)
 	}
-	if c.RotateBudgetDur != 0 {
-		t.Errorf("rotate_budget dur=%v want 0", c.RotateBudgetDur)
+
+	if config.RotateBudgetDur != 0 {
+		t.Errorf("rotate_budget dur=%v want 0", config.RotateBudgetDur)
 	}
-	if len(c.Upstream.RotateStatusCodes) != 0 {
-		t.Errorf("rotate_status_codes=%v want empty", c.Upstream.RotateStatusCodes)
+
+	if len(config.Upstream.RotateStatusCodes) != 0 {
+		t.Errorf("rotate_status_codes=%v want empty", config.Upstream.RotateStatusCodes)
 	}
 }
 
 // TestRotateConfigParsed 显式配置生效。
 func TestRotateConfigParsed(t *testing.T) {
-	c, err := ParseConfig([]byte(`{"upstream":{"rotate_max":5,"rotate_budget":"90s","rotate_status_codes":[429,503]}}`))
+	t.Parallel()
+
+	config, err := ParseConfig([]byte(`{"upstream":{"rotate_max":5,"rotate_budget":"90s","rotate_status_codes":[429,503]}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Upstream.RotateMax != 5 {
-		t.Errorf("rotate_max=%d want 5", c.Upstream.RotateMax)
+
+	if config.Upstream.RotateMax != 5 {
+		t.Errorf("rotate_max=%d want 5", config.Upstream.RotateMax)
 	}
-	if c.RotateBudgetDur != 90*time.Second {
-		t.Errorf("rotate_budget dur=%v want 90s", c.RotateBudgetDur)
+
+	if config.RotateBudgetDur != 90*time.Second {
+		t.Errorf("rotate_budget dur=%v want 90s", config.RotateBudgetDur)
 	}
-	if len(c.Upstream.RotateStatusCodes) != 2 {
-		t.Errorf("rotate_status_codes=%v want 2 items", c.Upstream.RotateStatusCodes)
+
+	if len(config.Upstream.RotateStatusCodes) != 2 {
+		t.Errorf("rotate_status_codes=%v want 2 items", config.Upstream.RotateStatusCodes)
 	}
 }
 
 // TestRotateConfigInvalid 非法预算报错（不落盘）。
 func TestRotateConfigInvalid(t *testing.T) {
+	t.Parallel()
+
 	for _, raw := range []string{
 		`{"upstream":{"rotate_budget":"oops"}}`,
 		`{"upstream":{"rotate_budget":"-5s"}}`,

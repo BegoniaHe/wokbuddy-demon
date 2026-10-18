@@ -17,7 +17,7 @@ VERSION  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 LDFLAGS  := -s -w -X main.appVersion=$(VERSION)
 
 .PHONY: all build build-all build-tools run dev restart stop status logs config \
-	test test-short test-race bench cover lint fmt fmt-check vet tidy clean ci \
+	test test-short test-race bench cover lint fmt fmt-check vet escape tidy clean ci \
 	web web-install web-dev web-check web-check-dist \
 	docker-build docker-up docker-down docker-logs help
 
@@ -37,6 +37,7 @@ help:
 	@echo "  make build-all    构建全部二进制（server/signin/login/credit）"
 	@echo "  make test         全量测试      make test-short  快速测试"
 	@echo "  make lint/fmt     静态检查 / 格式化"
+	@echo "  make escape       逃逸分析（-gcflags=-m）"
 	@echo "  make web          构建前端（web/ → internal/panel/dist，需 Bun）"
 	@echo "  make web-dev      前端开发服务器   make web-check  前端类型检查 + 单测"
 	@echo "  make docker-up    构建并后台启动 Docker 服务"
@@ -151,6 +152,10 @@ fmt-check:
 
 vet:
 	go vet $(PKG)
+
+# 编译器逃逸分析：查看变量是否逃逸到堆及原因；需要更详细的内联/逃逸链时用 -gcflags='-m -m'。
+escape:
+	go build -gcflags='-m' $(PKG) 2>&1
 
 tidy:
 	go mod tidy

@@ -10,34 +10,42 @@ import (
 )
 
 func TestNotifierSendsAndDeduplicates(t *testing.T) {
+	t.Parallel()
+
 	got := make(chan payload, 4)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			t.Errorf("decode: %v", err)
 		}
+
 		got <- p
+
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
 
 	n := New(Config{URL: srv.URL, DedupeWindow: time.Minute})
 	defer n.Close()
-	e := Event{Event: EventSessionDead, UID: "abcdefghijk", Nickname: "nick", Realm: "cn", Summary: "dead"}
-	n.Notify(e)
-	n.Notify(e) // 同事件同账号窗口内去重
+
+	e := Event{Event: EventSessionDead, UID: "abcdefghijk", Nickname: "nick", Realm: "cn", Summary: "dead", Time: time.Time{}, Detail: nil}
+	n.Notify(&e)
+	n.Notify(&e) // 同事件同账号窗口内去重
 
 	select {
-	case p := <-got:
-		if p.Event != EventSessionDead || p.UID != "abcdefgh" {
-			t.Fatalf("payload=%+v", p)
+	case payload2 := <-got:
+		if payload2.Event != EventSessionDead || payload2.UID != "abcdefgh" {
+			t.Fatalf("payload=%+v", payload2)
 		}
-		if _, err := time.Parse(time.RFC3339, p.Time); err != nil {
-			t.Fatalf("time=%q not RFC3339: %v", p.Time, err)
+
+		if _, err := time.Parse(time.RFC3339, payload2.Time); err != nil {
+			t.Fatalf("time=%q not RFC3339: %v", payload2.Time, err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("webhook 未收到事件")
 	}
+
 	select {
 	case p := <-got:
 		t.Fatalf("去重失败，重复发送: %+v", p)
@@ -46,9 +54,13 @@ func TestNotifierSendsAndDeduplicates(t *testing.T) {
 }
 
 func TestNotifierEventFilter(t *testing.T) {
+	t.Parallel()
+
 	got := make(chan payload, 4)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
+
 		_ = json.NewDecoder(r.Body).Decode(&p)
 		got <- p
 	}))
@@ -56,8 +68,10 @@ func TestNotifierEventFilter(t *testing.T) {
 
 	n := New(Config{URL: srv.URL, Events: []string{EventCreditLow}})
 	defer n.Close()
-	n.Notify(Event{Event: EventSessionDead, UID: "u1"})
-	n.Notify(Event{Event: EventCreditLow, UID: "u2"})
+
+	n.Notify(&Event{Event: EventSessionDead, UID: "u1", Time: time.Time{}, Nickname: "", Realm: "", Summary: "", Detail: nil})
+	n.Notify(&Event{Event: EventCreditLow, UID: "u2", Time: time.Time{}, Nickname: "", Realm: "", Summary: "", Detail: nil})
+
 	select {
 	case p := <-got:
 		if p.Event != EventCreditLow {
@@ -69,16 +83,20 @@ func TestNotifierEventFilter(t *testing.T) {
 }
 
 func TestNotifierDisabledAndInvalidURL(t *testing.T) {
+	t.Parallel()
+
 	n := New(Config{})
-	n.Notify(Event{Event: EventSessionDead})
+	n.Notify(&Event{Event: EventSessionDead, Time: time.Time{}, UID: "", Nickname: "", Realm: "", Summary: "", Detail: nil})
 	n.Close() // 不应 panic
 
 	if err := ValidateURL("ftp://example.com"); err == nil {
 		t.Fatal("ftp URL 应被拒绝")
 	}
+
 	if err := ValidateURL("https://example.com/hook"); err != nil {
 		t.Fatalf("合法 URL: %v", err)
 	}
+
 	if err := ValidateURL(""); err != nil {
 		t.Fatalf("空 URL 应允许: %v", err)
 	}
@@ -86,17 +104,22 @@ func TestNotifierDisabledAndInvalidURL(t *testing.T) {
 
 // TestNotifierSendFailureDoesNotBlock 上游 5xx 只记日志，Notify/Close 正常返回。
 func TestNotifierSendFailureDoesNotBlock(t *testing.T) {
+	t.Parallel()
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	}))
 	defer srv.Close()
+
 	n := New(Config{URL: srv.URL})
-	n.Notify(Event{Event: EventTaskFailed, UID: "u1"})
+	n.Notify(&Event{Event: EventTaskFailed, UID: "u1", Time: time.Time{}, Nickname: "", Realm: "", Summary: "", Detail: nil})
 	n.Close()
 }
 
 // TestValidateURLRedactsCredentials 校验错误不得回显 webhook URL（通常即 bearer token）。
 func TestValidateURLRedactsCredentials(t *testing.T) {
+	t.Parallel()
+
 	for _, raw := range []string{
 		"ftp://user:secret@example.com/hook",
 		"http://user:secret@example.com/%zz",
@@ -105,6 +128,7 @@ func TestValidateURLRedactsCredentials(t *testing.T) {
 		if err == nil {
 			t.Fatalf("ValidateURL(%q) 应报错", raw)
 		}
+
 		if strings.Contains(err.Error(), "secret") {
 			t.Fatalf("错误回显了凭证: %v", err)
 		}

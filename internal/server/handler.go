@@ -38,10 +38,12 @@ import (
 
 // Config handler 依赖。
 type Config struct {
-	Pool      *pool.Pool
-	Upstream  *upstream.Client
-	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	// modelsCache 可选的模型目录缓存（测试注入；nil 用进程级默认缓存）。
+	modelsCache *modelsCache
+	Pool        *pool.Pool
+	Upstream    *upstream.Client
+	APIKey      string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
+	MaxRotate   int    // 单请求最多换号次数，默认 3
 	// RotateBudget 轮换总时长预算：从首个尝试起累计耗时达此值即停止换号（0 = 不限）。
 	// 与 MaxRotate 构成「先到先停」——避免慢上游下 MaxRotate × header_timeout 把
 	// 客户端拖很久（issue #17）。
@@ -147,6 +149,14 @@ type Handler struct {
 	// shuttingDown 停机第一阶段置位（issue #147）：/healthz 立即 503，
 	// 让反代/LB 摘流；listener 仍继续受理宽限期内的请求。
 	shuttingDown atomic.Bool
+	// webSearch/webFetch 本地 web 工具实现（默认包级函数；测试可注入）。
+	webSearch func(string) (string, error)
+	webFetch  func(string) (string, error)
+	// modelsCache 动态模型缓存（默认进程级；测试可注入独立实例）。
+	modelsCache *modelsCache
+	// chatLogOut/chatLogEnabled 请求表格日志出口与开关（测试可注入本地 buffer）。
+	chatLogOut     io.Writer
+	chatLogEnabled bool
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -154,6 +164,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 	if h.cfg.Live != nil {
 		return h.cfg.Live.Load()
 	}
+
 	return livecfg.Snapshot{
 		APIKey:             h.cfg.APIKey,
 		SoftCooldown:       h.cfg.SoftCooldown,
@@ -171,9 +182,11 @@ func (h *Handler) softCooldown() time.Duration {
 	if d := h.loadLive().SoftCooldown; d > 0 {
 		return d
 	}
+
 	if h.cfg.SoftCooldown > 0 {
 		return h.cfg.SoftCooldown
 	}
+
 	return 600 * time.Second
 }
 
@@ -189,54 +202,74 @@ const notFoundCooldown = 60 * time.Second
 const ServiceName = "wokbuddy-demon"
 
 // NewHandler 构建 handler。
-func NewHandler(cfg Config) *Handler {
-	if cfg.MaxRotate <= 0 {
-		cfg.MaxRotate = 3
+func NewHandler(cfg *Config) *Handler {
+	config := *cfg
+	if config.MaxRotate <= 0 {
+		config.MaxRotate = 3
 	}
-	if cfg.SoftCooldown <= 0 {
-		cfg.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
+
+	if config.SoftCooldown <= 0 {
+		config.SoftCooldown = 600 * time.Second // 软限流基数（连续触发按指数退避放大）
 	}
-	if cfg.RefreshSkew <= 0 {
-		cfg.RefreshSkew = 10 * time.Minute
+
+	if config.RefreshSkew <= 0 {
+		config.RefreshSkew = 10 * time.Minute
 	}
-	if cfg.PromptMode == "" {
-		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
+
+	if config.PromptMode == "" {
+		config.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{
-		cfg: cfg, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
-		authLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
-		cors:        make(map[string]bool, len(cfg.CORSOrigins)),
+
+	cache := config.modelsCache
+	if cache == nil {
+		cache = &dynamicModelsCache
 	}
-	for _, origin := range cfg.CORSOrigins {
-		h.cors[origin] = true
+
+	handler := &Handler{
+		cfg: config, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
+		authLimiter:    httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+		cors:           make(map[string]bool, len(config.CORSOrigins)),
+		webSearch:      webSearchFn,
+		webFetch:       webFetchFn,
+		modelsCache:    cache,
+		chatLogOut:     chatLogOut,
+		chatLogEnabled: chatLogEnabled,
+	}
+	for _, origin := range config.CORSOrigins {
+		handler.cors[origin] = true
 	}
 	// 网关 API 面（/v1/*）接受默认密钥或任一命名密钥；/status、/metrics 属运维面，
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	// withRecovery 必须包在最外层：内层 withClientAuth 的命名密钥 release 依赖
 	// defer 正常执行，recover 放在鉴权之内会让 panic 跳过租约释放（issue #146）。
-	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
-	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
-	h.mux.HandleFunc("POST /v1/messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
-	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withRecovery(h.withClientAuth(h.anthropicCountTokensHandler)))
-	h.mux.HandleFunc("GET /v1/models", h.withRecovery(h.withClientAuth(h.models)))
-	h.mux.HandleFunc("GET /status", h.withRecovery(h.withAuth(h.status)))
-	h.mux.HandleFunc("GET /healthz", h.withRecovery(h.healthz))
+	handler.mux.HandleFunc("POST /v1/chat/completions", handler.withRecovery(handler.withClientAuth(handler.chatCompletions)))
+	handler.mux.HandleFunc("POST /v1/responses", handler.withRecovery(handler.withClientAuth(handler.responsesHandler)))
+	handler.mux.HandleFunc("POST /v1/messages", handler.withRecovery(handler.withClientAuth(handler.anthropicMessagesHandler)))
+	handler.mux.HandleFunc(
+		"POST /v1/messages/count_tokens",
+		handler.withRecovery(handler.withClientAuth(handler.anthropicCountTokensHandler)),
+	)
+	handler.mux.HandleFunc("GET /v1/models", handler.withRecovery(handler.withClientAuth(handler.models)))
+	handler.mux.HandleFunc("GET /status", handler.withRecovery(handler.withAuth(handler.status)))
+	handler.mux.HandleFunc("GET /healthz", handler.withRecovery(handler.healthz))
 	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
-	h.mux.HandleFunc("GET /metrics", h.withRecovery(h.withAuth(h.metricsHandler)))
+	handler.mux.HandleFunc("GET /metrics", handler.withRecovery(handler.withAuth(handler.metricsHandler)))
 	// 运行时 profiling（issue #146）：与 /metrics 同口径走 withAuth，避免 goroutine
 	// 栈与调用细节在公网裸奔。pprof.Index 自行按路径分发 allocs/goroutine 等子 profile。
-	h.mux.HandleFunc("/debug/pprof/", h.withRecovery(h.withAuth(pprof.Index)))
-	h.mux.HandleFunc("/debug/pprof/cmdline", h.withRecovery(h.withAuth(pprof.Cmdline)))
-	h.mux.HandleFunc("/debug/pprof/profile", h.withRecovery(h.withAuth(pprof.Profile)))
-	h.mux.HandleFunc("/debug/pprof/symbol", h.withRecovery(h.withAuth(pprof.Symbol)))
-	h.mux.HandleFunc("/debug/pprof/trace", h.withRecovery(h.withAuth(pprof.Trace)))
+	handler.mux.HandleFunc("/debug/pprof/", handler.withRecovery(handler.withAuth(pprof.Index)))
+	handler.mux.HandleFunc("/debug/pprof/cmdline", handler.withRecovery(handler.withAuth(pprof.Cmdline)))
+	handler.mux.HandleFunc("/debug/pprof/profile", handler.withRecovery(handler.withAuth(pprof.Profile)))
+	handler.mux.HandleFunc("/debug/pprof/symbol", handler.withRecovery(handler.withAuth(pprof.Symbol)))
+	handler.mux.HandleFunc("/debug/pprof/trace", handler.withRecovery(handler.withAuth(pprof.Trace)))
+
 	if cfg.Panel != nil {
-		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
+		handler.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
 	}
 	// 未注册路径兜底（Issue #12）：返回 OpenAI 风格 JSON 错误体，而非 ServeMux 裸 404。
 	// 注册在最具体的路由之后；ServeMux 优先精确/更长前缀，故不会遮蔽上面的端点。
-	h.mux.HandleFunc("/", h.withRecovery(h.notFound))
-	return h
+	handler.mux.HandleFunc("/", handler.withRecovery(handler.notFound))
+
+	return handler
 }
 
 // ActiveStreams 返回当前在途 SSE 流数（供优雅关闭记录未排空情况，issue #19）。
@@ -264,26 +297,34 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 	if len(h.cors) == 0 || !isV1Path(r.URL.Path) {
 		return false
 	}
+
 	w.Header().Add("Vary", "Origin")
 	origin := strings.ToLower(r.Header.Get("Origin"))
+
 	allowed := origin != "" && h.cors[origin]
 	if allowed {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-ID")
 	}
+
 	if r.Method != http.MethodOptions {
 		return false
 	}
+
 	if allowed {
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+
 		headers := r.Header.Get("Access-Control-Request-Headers")
 		if headers == "" {
 			headers = "Authorization, Content-Type, X-Requested-With"
 		}
+
 		w.Header().Set("Access-Control-Allow-Headers", headers)
 		w.Header().Set("Access-Control-Max-Age", "600")
 	}
+
 	w.WriteHeader(http.StatusNoContent)
+
 	return true
 }
 
@@ -296,26 +337,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.handleCORS(w, r) {
 		return
 	}
+
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
 		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses") {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r)
 		}
+
 		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
 		obs := &responseObserver{ResponseWriter: w}
 		w.Header().Set("X-Request-ID", trace.id)
 		h.cfg.RequestLog.Begin()
+
 		defer func() {
 			status := obs.status
 			if status == 0 {
 				status = http.StatusOK
 			}
-			h.cfg.RequestLog.Record(trace.event(status))
+
+			ev := trace.event(status)
+			h.cfg.RequestLog.Record(&ev)
 		}()
+
 		h.mux.ServeHTTP(obs, r)
+
 		return
 	}
+
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -329,16 +378,20 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+
 		ip := httpauth.RemoteIP(r)
 		if ok, retry := h.authLimiter.Allow(ip); !ok {
 			writeAuthFailLimit(w, retry)
 			return
 		}
+
 		if !httpauth.VerifyBearer(r, key) {
 			h.authLimiter.Fail(ip)
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+
 			return
 		}
+
 		h.authLimiter.Reset(ip)
 		next(w, r)
 	}
@@ -351,15 +404,13 @@ func writeClientAuthError(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key", "")
 		return
 	}
+
 	writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 }
 
 // writeAuthFailLimit 运维面鉴权失败超限响应。
 func writeAuthFailLimit(w http.ResponseWriter, retry time.Duration) {
-	seconds := int((retry + time.Second - 1) / time.Second)
-	if seconds < 1 {
-		seconds = 1
-	}
+	seconds := max(int((retry+time.Second-1)/time.Second), 1)
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 	writeOpenAIError(w, http.StatusTooManyRequests, "too_many_auth_failures", "too many authentication failures")
 }
@@ -376,24 +427,30 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 			writeClientAuthError(w, r)
 			return
 		}
+
 		if res.IsDefault || h.cfg.Keys == nil {
 			next(w, r)
 			return
 		}
+
 		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
 		if !ok {
 			h.cfg.Keys.RecordRejected(res.KeyID)
 			writeKeyLimitError(w, retryAfter)
+
 			return
 		}
 		defer release()
-		ku := &keyUsage{id: res.KeyID}
-		ctx := context.WithValue(r.Context(), keyUsageKey{}, ku)
+
+		keyUsage2 := &keyUsage{id: res.KeyID}
+
+		ctx := context.WithValue(r.Context(), keyUsageKey{}, keyUsage2)
 		if realm := h.cfg.Keys.Realm(res.KeyID); realm != "" {
 			ctx = context.WithValue(ctx, keyRealmCtxKey{}, realm)
 		}
+
 		next(w, r.WithContext(ctx))
-		h.cfg.Keys.RecordUsage(ku.id, ku.prompt, ku.completion, ku.total)
+		h.cfg.Keys.RecordUsage(keyUsage2.id, keyUsage2.prompt, keyUsage2.completion, keyUsage2.total)
 	}
 }
 
@@ -402,6 +459,7 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	// 用 ServableNow 判定：healthy>0 但全占满在途时 chat 会 503，探活必须同口径，
 	// 否则负载均衡器会把流量持续打进无法受理的实例。
 	status := http.StatusOK
+
 	shuttingDown := h.shuttingDown.Load()
 	if shuttingDown || !h.cfg.Pool.ServableNow() {
 		status = http.StatusServiceUnavailable
@@ -425,10 +483,12 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	total, healthy, cooling, disabled, inFlightFull := h.cfg.Pool.CountsDetailed()
+
 	sticky := 0
 	if h.cfg.StickyCount != nil {
 		sticky = h.cfg.StickyCount()
 	}
+
 	redisMode := h.cfg.RedisMode
 	if redisMode == "" {
 		redisMode = "noop"
@@ -479,14 +539,17 @@ func countsMapFrom(total, healthy, cooling, disabled, inFlightFull int) map[stri
 	}
 }
 
-// dynamicModelsCache 动态模型缓存。
-var dynamicModelsCache struct {
+// modelsCache 动态模型缓存（每个 Handler 独立；零值可用）。
+type modelsCache struct {
 	sync.RWMutex
 
 	ids      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
 }
+
+// dynamicModelsCache 生产默认缓存（NewHandler 未注入 modelsCache 时使用）。
+var dynamicModelsCache modelsCache
 
 const (
 	// dynamicModelsTTL 模型目录缓存时长。曾是 1h；缩到 10min 对齐「面板实时、
@@ -509,13 +572,15 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // 上游格式不统一："x0.05 credits" / "x0.29" / "x0.00 credits" 等，
 // 统一提取 x数字 部分，去 "credits" 后缀。
 func fmtCreditsPrefix(raw string) string {
-	s := strings.TrimSpace(raw)
-	s = strings.TrimSuffix(s, "credits")
-	s = strings.TrimSpace(s)
-	if s == "" {
+	str := strings.TrimSpace(raw)
+	str = strings.TrimSuffix(str, "credits")
+
+	str = strings.TrimSpace(str)
+	if str == "" {
 		return ""
 	}
-	return "[" + s + " credit]"
+
+	return "[" + str + " credit]"
 }
 
 // applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
@@ -524,26 +589,33 @@ func fmtCreditsPrefix(raw string) string {
 // 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
 // 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
 // 字段（零值）整体省略——不编造。
-func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[string]any {
-	if mi.Name != "" {
-		entry["name"] = mi.Name
+func applyModelInfoFields(entry map[string]any, modelInfo *upstream.ModelInfo) map[string]any {
+	if modelInfo.Name != "" {
+		entry["name"] = modelInfo.Name
 	}
-	if mi.Description != "" {
-		entry["description"] = modelDescription(mi.Credits, mi.Description)
+
+	if modelInfo.Description != "" {
+		entry["description"] = modelDescription(modelInfo.Credits, modelInfo.Description)
 	}
-	if mi.Credits != "" {
-		entry["credits"] = mi.Credits // 积分倍率原文（如 "x0.05"），仅展示
+
+	if modelInfo.Credits != "" {
+		entry["credits"] = modelInfo.Credits // 积分倍率原文（如 "x0.05"），仅展示
 	}
-	if len(mi.Tags) > 0 {
-		entry["tags"] = mi.Tags
+
+	if len(modelInfo.Tags) > 0 {
+		entry["tags"] = modelInfo.Tags
 	}
-	if mi.Vendor != "" {
-		entry["vendor"] = mi.Vendor
+
+	if modelInfo.Vendor != "" {
+		entry["vendor"] = modelInfo.Vendor
 	}
-	if mi.IsDefault {
+
+	if modelInfo.IsDefault {
 		entry["is_default"] = true
 	}
-	applyModelInfoCapabilities(entry, mi)
+
+	applyModelInfoCapabilities(entry, modelInfo)
+
 	return entry
 }
 
@@ -553,12 +625,13 @@ func modelDescription(credits, description string) string {
 	if credits != "" {
 		return fmtCreditsPrefix(credits) + " " + description
 	}
+
 	return description
 }
 
 // applyModelInfoCapabilities 合入能力旗标 / 尺寸上限 / 推理档位字段（空值省略）。
-func applyModelInfoCapabilities(entry map[string]any, mi upstream.ModelInfo) {
-	mods := mi.EffectiveInputModalities()
+func applyModelInfoCapabilities(entry map[string]any, modelInfo3 *upstream.ModelInfo) {
+	mods := modelInfo3.EffectiveInputModalities()
 	// 兼容字段与 input_modalities 同源：image 能力也可能来自 models.dev 推导。
 	if containsModality(mods, upstream.ModalityImage) {
 		entry["supports_images"] = true
@@ -568,26 +641,32 @@ func applyModelInfoCapabilities(entry map[string]any, mi upstream.ModelInfo) {
 	if len(mods) > 0 {
 		entry["input_modalities"] = mods
 	}
-	if mi.SupportsReasoning {
+
+	if modelInfo3.SupportsReasoning {
 		entry["supports_reasoning"] = true
-		if mi.CanDisableThinking {
+		if modelInfo3.CanDisableThinking {
 			entry["can_disable_thinking"] = true
 		}
 	}
-	if mi.SupportsToolCall {
+
+	if modelInfo3.SupportsToolCall {
 		entry["supports_tool_call"] = true
 	}
-	if mi.OnlyReasoning {
+
+	if modelInfo3.OnlyReasoning {
 		entry["only_reasoning"] = true
 	}
-	if mi.MaxAllowedSize > 0 {
-		entry["max_allowed_size"] = mi.MaxAllowedSize
+
+	if modelInfo3.MaxAllowedSize > 0 {
+		entry["max_allowed_size"] = modelInfo3.MaxAllowedSize
 	}
-	if mi.ReasoningEffort != "" {
-		entry["reasoning_effort"] = mi.ReasoningEffort
+
+	if modelInfo3.ReasoningEffort != "" {
+		entry["reasoning_effort"] = modelInfo3.ReasoningEffort
 	}
-	if mi.ReasoningSummary != "" {
-		entry["reasoning_summary"] = mi.ReasoningSummary
+
+	if modelInfo3.ReasoningSummary != "" {
+		entry["reasoning_summary"] = modelInfo3.ReasoningSummary
 	}
 }
 
@@ -596,14 +675,17 @@ func applyModelInfoCapabilities(entry map[string]any, mi upstream.ModelInfo) {
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
-	for _, mi := range h.fetchDynamicModels() {
-		out = append(out, h.cnModelEntry(mi))
+
+	models := h.fetchDynamicModels()
+	for i := range models {
+		out = append(out, h.cnModelEntry(&models[i]))
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
 	// 名单 = 纯动态探测结果（fetchGlobalModels，失败/无号 → 空）。
 	if h.cfg.GlobalEnabled {
 		out = append(out, h.globalModelEntries()...)
 	}
+
 	return h.appendAliasEntries(out)
 }
 
@@ -614,17 +696,21 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 	if len(h.cfg.ModelAliases) == 0 {
 		return out
 	}
+
 	names := make([]string, 0, len(h.cfg.ModelAliases))
 	for name := range h.cfg.ModelAliases {
 		names = append(names, name)
 	}
+
 	sort.Strings(names)
+
 	index := make(map[string]int, len(out))
 	for i, entry := range out {
 		if id, ok := entry["id"].(string); ok {
 			index[id] = i
 		}
 	}
+
 	for _, name := range names {
 		entry := map[string]any{
 			"id":       name,
@@ -639,8 +725,10 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 			out[i] = entry
 			continue
 		}
+
 		out = append(out, entry)
 	}
+
 	return out
 }
 
@@ -650,13 +738,14 @@ func normalizeAliasTarget(target string) string {
 	if !prefixed {
 		realm = "cn"
 	}
+
 	return realm + ":" + bare
 }
 
 // cnModelEntry 组装单个 CN 模型条目（realm 前缀 + 四级长度查找 + 全字段 + effort）。
-func (h *Handler) cnModelEntry(mi upstream.ModelInfo) map[string]any {
+func (h *Handler) cnModelEntry(modelInfo4 *upstream.ModelInfo) map[string]any {
 	entry := map[string]any{
-		"id":       "cn:" + mi.ID,
+		"id":       "cn:" + modelInfo4.ID,
 		"object":   "model",
 		"created":  1753600000,
 		"owned_by": "workbuddy",
@@ -667,20 +756,21 @@ func (h *Handler) cnModelEntry(mi upstream.ModelInfo) map[string]any {
 	// 写 model.json 供下次命中）→ 1M 兜底 / max_output_tokens 省略。
 	// 上游零值不再透出假 131072（误导 Codex/ZCode 等按 context_length 提前
 	// 截断、白白丢上下文）。
-	entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, h.cfg.Upstream.HTTP)
-	if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, h.cfg.Upstream.HTTP); ok {
+	entry["context_length"] = upstream.ContextWindowListingV4(modelInfo4.ID, modelInfo4.ContextWindow, h.cfg.Upstream.HTTP)
+	if mo, ok := upstream.MaxOutputTokensListingV4(modelInfo4.ID, modelInfo4.MaxTokens, h.cfg.Upstream.HTTP); ok {
 		entry["max_output_tokens"] = mo
 	}
 	// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
-	entry = applyModelInfoFields(entry, mi)
+	entry = applyModelInfoFields(entry, modelInfo4)
 	// effort 能力透出——远端 supportedEfforts 权威，缺失落到 CN 静态兜底表
 	// （客户端可发现档位，不再盲传）。无档位 → 省略字段。
-	if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+	if efforts, def := upstream.EffortListing("cn", modelInfo4.ID, modelInfo4.Efforts, modelInfo4.DefaultEffort); efforts != nil {
 		entry["reasoning_supported_efforts"] = efforts
 		if def != "" {
 			entry["reasoning_default_effort"] = def
 		}
 	}
+
 	return entry
 }
 
@@ -692,36 +782,45 @@ func (h *Handler) globalModelEntries() []map[string]any {
 	// 命中 id 才透出富字段；窄表/失败 → 零值 ModelInfo（applyModelInfoFields 全空省略）。
 	// globalAccount 为 nil（无 global 号）时 FetchGlobalModelInfos 返回 nil。
 	globalInfos := map[string]upstream.ModelInfo{}
-	for _, mi := range h.cfg.Upstream.FetchGlobalModelInfos(globalAccount) {
-		globalInfos[mi.ID] = mi
+
+	infos := h.cfg.Upstream.FetchGlobalModelInfos(globalAccount)
+	for i := range infos {
+		globalInfos[infos[i].ID] = infos[i]
 	}
+
 	globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
+
 	out := make([]map[string]any, 0, len(globalIDs))
 	for _, id := range globalIDs {
-		out = append(out, h.globalModelEntry(id, globalInfos[id], globalEfforts[id], globalDefaults[id]))
+		mi := globalInfos[id]
+		out = append(out, h.globalModelEntry(id, &mi, globalEfforts[id], globalDefaults[id]))
 	}
+
 	return out
 }
 
 // globalModelEntry 组装单个 global 模型条目（与 CN 动态分支同口径）。
-func (h *Handler) globalModelEntry(id string, mi upstream.ModelInfo, effort []string, defaultEffort string) map[string]any {
+func (h *Handler) globalModelEntry(id string, modelInfo2 *upstream.ModelInfo, effort []string, defaultEffort string) map[string]any {
 	entry := map[string]any{
 		"id":       "global:" + id,
 		"object":   "model",
 		"created":  1753600000,
 		"owned_by": "workbuddy",
 	}
-	entry = applyModelInfoFields(entry, mi)
-	entry["context_length"] = upstream.ContextWindowListingV4(id, mi.ContextWindow, h.cfg.Upstream.HTTP)
-	if mo, ok := upstream.MaxOutputTokensListingV4(id, mi.MaxTokens, h.cfg.Upstream.HTTP); ok {
+	entry = applyModelInfoFields(entry, modelInfo2)
+
+	entry["context_length"] = upstream.ContextWindowListingV4(id, modelInfo2.ContextWindow, h.cfg.Upstream.HTTP)
+	if mo, ok := upstream.MaxOutputTokensListingV4(id, modelInfo2.MaxTokens, h.cfg.Upstream.HTTP); ok {
 		entry["max_output_tokens"] = mo
 	}
+
 	if efforts, def := upstream.EffortListing("global", id, effort, defaultEffort); efforts != nil {
 		entry["reasoning_supported_efforts"] = efforts
 		if def != "" {
 			entry["reasoning_default_effort"] = def
 		}
 	}
+
 	return entry
 }
 
@@ -736,6 +835,7 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 	if acct == nil {
 		return nil, nil
 	}
+
 	return h.cfg.Upstream.FetchGlobalModels(acct), acct
 }
 
@@ -749,55 +849,65 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 // 无冷却窗口，客户端重试即放大请求量——负缓存正是为此设计（见 handler_test 吸收
 // 上游 9832283 的注释）；且 cachedModelsSnapshot（gateway_hint 判定）依赖缓存写入。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
+	h.modelsCache.RLock()
+
+	if len(h.modelsCache.ids) > 0 && time.Since(h.modelsCache.fetched) < dynamicModelsTTL {
+		out := h.modelsCache.ids
+		h.modelsCache.RUnlock()
+
 		return out
 	}
 	// 失败负缓存：冷却期内不再请求上游。
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
+	if !h.modelsCache.lastFail.IsZero() && time.Since(h.modelsCache.lastFail) < modelsFetchFailCooldown {
+		h.modelsCache.RUnlock()
 		return nil
 	}
-	dynamicModelsCache.RUnlock()
+
+	h.modelsCache.RUnlock()
 
 	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
 	if len(uids) == 0 {
 		return nil
 	}
+
 	acct := h.cfg.Pool.AuthByUID(uids[0])
 	if acct == nil {
 		return nil
 	}
+
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
 		// 拉取失败只进负缓存（5min lastFail），不 NoteError：NoteError 喂的是 chat
 		// 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；
 		// models 拉取失败 ≠ 账号 chat 不可用。
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
+		h.modelsCache.Lock()
+		h.modelsCache.lastFail = time.Now()
+		h.modelsCache.Unlock()
+
 		return nil
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	dynamicModelsCache.Unlock()
+
+	h.modelsCache.Lock()
+	h.modelsCache.ids = infos
+	h.modelsCache.fetched = time.Now()
+	h.modelsCache.lastFail = time.Time{} // 成功则清空负缓存
+	h.modelsCache.Unlock()
+
 	return infos
 }
 
 // cachedModelsSnapshot 只读模型目录缓存（TTL 内快照）；缓存冷/空 → nil。
 // 不发起任何上游调用（hint 判定用：错误路径加一次 FetchModels 网络调用既拖慢
 // 错误响应、又污染上游调用语义）。
-func cachedModelsSnapshot() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	defer dynamicModelsCache.RUnlock()
-	if len(dynamicModelsCache.ids) == 0 || time.Since(dynamicModelsCache.fetched) >= dynamicModelsTTL {
+func (h *Handler) cachedModelsSnapshot() []upstream.ModelInfo {
+	h.modelsCache.RLock()
+	defer h.modelsCache.RUnlock()
+
+	if len(h.modelsCache.ids) == 0 || time.Since(h.modelsCache.fetched) >= dynamicModelsTTL {
 		return nil
 	}
-	return dynamicModelsCache.ids
+
+	return h.modelsCache.ids
 }
 
 // chatFlow 一次 /v1/chat/completions 请求的可变状态与阶段方法。
@@ -875,40 +985,43 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	h.serveChat(r, in, out)
+
+	h.serveChat(r, &in, out)
 }
 
 // serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
-func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
-	f := h.newChatFlow(in, out)
-	if f.realmErr != nil {
-		f.out.Error(http.StatusBadRequest, "realm_binding_conflict", f.realmErr.Error(), "")
-		f.st.status = http.StatusBadRequest
+func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
+	chatFlow2 := h.newChatFlow(in, out)
+	if chatFlow2.realmErr != nil {
+		chatFlow2.out.Error(http.StatusBadRequest, "realm_binding_conflict", chatFlow2.realmErr.Error(), "")
+		chatFlow2.st.status = http.StatusBadRequest
+
 		return
 	}
 	// 出口统一释放：先释放在途租约，再落请求流水行（与原 defer 顺序一致）。
-	defer f.st.done()
-	defer f.releaseHeld()
+	defer chatFlow2.st.done()
+	defer chatFlow2.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
-	defer f.recordKeyUsage()
+	defer chatFlow2.recordKeyUsage()
 	// 模型白名单必须在后台改写/别名解析之后校验：此时 f.realm/f.bareModel 才是
 	// 实际选号与出站使用的最终模型（裸名不再固定按 cn 误判 global key）。
-	if !f.checkModelAllowed() {
+	if !chatFlow2.checkModelAllowed() {
 		return
 	}
 	// 模态能力判定/路由（issue #109）：在选号前完成，不匹配时写 400 并终止。
-	if !f.applyModalityRoute() {
+	if !chatFlow2.applyModalityRoute() {
 		return
 	}
 	// 模态路由可能改写模型：按改写后的最终模型复核白名单，避免绕过。
-	if !f.checkModelAllowed() {
+	if !chatFlow2.checkModelAllowed() {
 		return
 	}
 	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
-	if f.runRotation(r.Context()) {
+	if chatFlow2.runRotation(r.Context()) {
 		return
 	}
-	f.writeFinalError()
+
+	chatFlow2.writeFinalError()
 }
 
 // checkModelAllowed 校验命名密钥模型白名单。调用时机必须在别名/后台改写/模态
@@ -918,13 +1031,16 @@ func (f *chatFlow) checkModelAllowed() bool {
 	if f.keyUsage == nil {
 		return true
 	}
+
 	if f.h.cfg.Keys.ModelAllowed(f.keyUsage.id, f.realm+":"+f.bareModel) {
 		return true
 	}
+
 	f.h.cfg.Keys.RecordRejected(f.keyUsage.id)
 	f.out.Error(http.StatusForbidden, "model_not_allowed", "model is not allowed for this API key", "")
 	f.st.status = http.StatusForbidden
 	f.st.outcome = reqlog.OutcomeHTTPError
+
 	return false
 }
 
@@ -934,94 +1050,102 @@ func (h *Handler) backgroundTarget(model string) string {
 	if len(live.BackgroundNames) == 0 {
 		return ""
 	}
+
 	if !live.BackgroundNames[strings.ToLower(strings.TrimSpace(model))] {
 		return ""
 	}
+
 	return live.BackgroundTarget
 }
 
 // newChatFlow 由结构化输入组装统计、会话标识与轮转状态（传输无关）。
 // 入站 HTTP 解析（读 body / 提取头与 IP）已在 newChatInput 完成。
-func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
+func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlow {
+	ci := *chatInput2
+	chatInput2 = &ci
 	// 后台任务模型重定向（issue #103）：只改 model 字段，后续 realm/别名/选号/
 	// 记账全部基于改写后的模型。名单为空时不改变任何行为。
-	if target := h.backgroundTarget(in.model); target != "" {
-		log.Printf("INFO: [server] alias: background model %s -> %s", in.model, target)
-		in.body = rewriteModel(in.body, target)
-		in.model = target
+	if target := h.backgroundTarget(chatInput2.model); target != "" {
+		log.Printf("INFO: [server] alias: background model %s -> %s", chatInput2.model, target)
+		chatInput2.body = rewriteModel(chatInput2.body, target)
+		chatInput2.model = target
 	}
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归；命名密钥出口绑定在此一并覆盖 realm。
-	realm, bareModel, realmErr := resolveKeyModel(in.model, h.cfg.ModelAliases, in.keyRealm)
+	realm, bareModel, realmErr := resolveKeyModel(chatInput2.model, h.cfg.ModelAliases, chatInput2.keyRealm)
+
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	st := newChatStat(time.Now(), in.body, in.stream)
-	st.decision = h.sampleDecisionTrace()
-	if in.trace != nil {
-		in.trace.stat = st
+	chatStat2 := newChatStat(time.Now(), chatInput2.body, chatInput2.stream, h.chatLogOut, h.chatLogEnabled)
+
+	chatStat2.decision = h.sampleDecisionTrace()
+	if chatInput2.trace != nil {
+		chatInput2.trace.stat = chatStat2
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
-		st.clientIP, st.userAgent = in.trace.clientIP, in.trace.userAgent
+		chatStat2.clientIP, chatStat2.userAgent = chatInput2.trace.clientIP, chatInput2.trace.userAgent
 	}
 	// 请求模态在改写前解析一次（gateway_hint + 能力判定/路由共用）。
-	reqMods := requestModalities(in.body)
-	f := &chatFlow{
-		h: h, out: out, clientIP: in.clientIP,
-		body:     in.body,
-		stream:   in.stream,
-		rawModel: in.model,
+	reqMods := requestModalities(chatInput2.body)
+	chatFlow2 := &chatFlow{
+		h: h, out: out, clientIP: chatInput2.clientIP,
+		body:     chatInput2.body,
+		stream:   chatInput2.stream,
+		rawModel: chatInput2.model,
 		realm:    realm,
 		realmErr: realmErr,
 		// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 		// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
-		declaredTools: upstream.ToolNameAllowlist(in.body),
+		declaredTools: upstream.ToolNameAllowlist(chatInput2.body),
 		// gateway_hint 判定与模态能力判定所需的请求形态（多模态 part）：在改写前取。
 		reqHasImage:   containsModality(reqMods, upstream.ModalityImage),
 		reqModalities: reqMods,
 		bareModel:     bareModel,
 		modelRate:     modelRate,
-		st:            st,
-		keyUsage:      in.keyUsage,
+		st:            chatStat2,
+		keyUsage:      chatInput2.keyUsage,
 		tried:         map[string]bool{},
-		convReqID:     in.convReqID,
-		traceID:       in.traceID,
+		convReqID:     chatInput2.convReqID,
+		traceID:       chatInput2.traceID,
 	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，
 	// 走普通轮换）。ExtractKey 与粘性开关解耦：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级。
-	f.sessKey = session.ExtractKey(in.body)
-	if h.cfg.Session != nil && f.sessKey != "" {
+	chatFlow2.sessKey = session.ExtractKey(chatInput2.body)
+	if h.cfg.Session != nil && chatFlow2.sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
 		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
 		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
 		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
-		if uid, ok := h.cfg.Session.ResolveForModel(f.sessKey, f.realm+":"+f.bareModel); ok {
-			f.stickyUID = uid
+		if uid, ok := h.cfg.Session.ResolveForModel(chatFlow2.sessKey, chatFlow2.realm+":"+chatFlow2.bareModel); ok {
+			chatFlow2.stickyUID = uid
 		}
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生。必须在 prompt.Rewrite 之前取
 	// ——改写会动 messages 内容，之后取会让键漂移。
-	f.turnKey = session.TurnKey(in.body)
+	chatFlow2.turnKey = session.TurnKey(chatInput2.body)
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
-	f.applyPromptRewrite()
+	chatFlow2.applyPromptRewrite()
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
-	if bareModel != in.model {
-		f.body = rewriteModel(f.body, bareModel)
+	if bareModel != chatInput2.model {
+		chatFlow2.body = rewriteModel(chatFlow2.body, bareModel)
 	}
-	f.buildChatMeta()
-	return f
+
+	chatFlow2.buildChatMeta()
+
+	return chatFlow2
 }
 
 // applyPromptRewrite 按 PromptMode 改写出站提示词（轮转前、每请求一次）。
@@ -1055,6 +1179,7 @@ func (f *chatFlow) buildChatMeta() {
 	if convID == "" {
 		convID = f.sessKey
 	}
+
 	f.chatMeta = upstream.ChatMeta{ConversationID: convID}
 	if v := f.convReqID; v != "" {
 		f.chatMeta.ConversationRequestID = v
@@ -1071,6 +1196,7 @@ func (f *chatFlow) buildChatMeta() {
 		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
 		f.chatMeta.ConversationRequestID = session.TurnRequestID("")
 	}
+
 	f.chatMeta.TraceID = f.traceID
 }
 
@@ -1080,6 +1206,7 @@ func (f *chatFlow) releaseHeld() {
 		f.h.cfg.Pool.Release(f.heldUID)
 		f.heldUID = ""
 	}
+
 	f.releaseReservation()
 }
 
@@ -1104,6 +1231,7 @@ func (f *chatFlow) unbindSticky() {
 // fail 在轮转失败分支统一：释放租约 + 若失败号正是粘性号则解绑（下次请求重新分配）。
 func (f *chatFlow) fail(uid string) {
 	f.releaseHeld()
+
 	if f.stickyUID != "" && uid == f.stickyUID {
 		f.unbindSticky()
 	}
@@ -1118,17 +1246,21 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 		f.st.status = http.StatusServiceUnavailable
 		return false
 	}
+
 	var deadline time.Time
 	if f.h.cfg.RotateBudget > 0 {
 		deadline = time.Now().Add(f.h.cfg.RotateBudget)
 	}
+
 	for i := range f.h.cfg.MaxRotate {
 		// 预算检查放在循环顶部（含上一轮退避之后）：退避已把耗时推过预算时立即停。
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			log.Printf("WARN: [server] rotate budget %s exhausted after %d attempt(s): stop rotating",
 				f.h.cfg.RotateBudget, i)
+
 			return false
 		}
+
 		f.rotateReason = ""
 		switch f.attempt(ctx, i) {
 		case rotContinue:
@@ -1144,6 +1276,7 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 			return false
 		}
 	}
+
 	return false
 }
 
@@ -1152,7 +1285,34 @@ func (f *chatFlow) recordRotation() {
 	if f.st.decision == nil || len(f.st.decision.Rotations) >= 8 {
 		return
 	}
+
 	f.st.decision.Rotations = append(f.st.decision.Rotations, f.rotateReason)
+}
+
+// reportNoAccount 记录"无可用账号"的状态与告警：区分账号级冷却与模型级阻塞。
+func (f *chatFlow) reportNoAccount() {
+	f.st.status = http.StatusServiceUnavailable
+	// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
+	//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
+	//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
+	// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
+	f.modelBlock = f.h.cfg.Pool.ModelBlocked(f.bareModel)
+
+	detail := map[string]any{"model": f.bareModel}
+	if f.modelBlock.Blocked {
+		detail["model_blocked"] = true
+		detail["block_reason"] = f.modelBlock.Reason
+	}
+
+	f.h.notify(&notify.Event{
+		Event:    notify.EventPoolUnavailable,
+		Realm:    f.realm,
+		Summary:  "无可用账号（池健康或在途名额耗尽）",
+		Detail:   detail,
+		Time:     time.Time{},
+		UID:      "",
+		Nickname: "",
+	})
 }
 
 // attempt 执行一次「选号 → 占名额 → 刷新 token → 转发」尝试，返回控制流去向。
@@ -1162,31 +1322,20 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		if f.h.cfg.Pool.AllDailyBlocked(f.bareModel, f.realm) {
 			f.st.dailyLimited = true
 			f.st.status = http.StatusTooManyRequests
+
 			return rotBreak
 		}
-		f.st.status = http.StatusServiceUnavailable
-		// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
-		//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
-		//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
-		// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
-		f.modelBlock = f.h.cfg.Pool.ModelBlocked(f.bareModel)
-		detail := map[string]any{"model": f.bareModel}
-		if f.modelBlock.Blocked {
-			detail["model_blocked"] = true
-			detail["block_reason"] = f.modelBlock.Reason
-		}
-		f.h.notify(notify.Event{
-			Event:   notify.EventPoolUnavailable,
-			Realm:   f.realm,
-			Summary: "无可用账号（池健康或在途名额耗尽）",
-			Detail:  detail,
-		})
+
+		f.reportNoAccount()
+
 		return rotBreak
 	}
+
 	f.tried[acct.UID] = true
 	if !f.reserveCredits(acct) {
 		return f.skipReserved(ctx, acct, i)
 	}
+
 	f.st.uid = acct.UID
 	// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 	f.st.nick = acct.NicknameValue()
@@ -1199,8 +1348,10 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 			f.st.status = http.StatusServiceUnavailable
 			return rotBreak
 		}
+
 		return f.retryAcquireFailed(ctx, acct, i)
 	}
+
 	f.heldUID = acct.UID
 
 	// token 临近过期 → 先 refresh（失败冷却换号）。
@@ -1208,9 +1359,12 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		if stop {
 			return rotBreak
 		}
+
 		f.rotateReason = "refresh"
+
 		return rotContinue
 	}
+
 	return f.dispatch(ctx, acct, i)
 }
 
@@ -1219,13 +1373,17 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 func (f *chatFlow) skipReserved(ctx context.Context, acct *auth.Auth, i int) rotationAction {
 	log.Printf("WARN: [server] credit reserve: acct=%s model=%s credits below floor after estimate, skip",
 		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
 	if f.stickyUID != "" && acct.UID == f.stickyUID {
 		f.unbindSticky()
 	}
+
 	f.rotateReason = "credit_reserve"
+
 	if !rotateBackoff(ctx, i) {
 		return rotBreak
 	}
+
 	return rotContinue
 }
 
@@ -1239,8 +1397,10 @@ func (f *chatFlow) reserveCredits(acct *auth.Auth) bool {
 	if !ok {
 		return false
 	}
+
 	f.reservedUID = acct.UID
 	f.reservedCredits = amount
+
 	return true
 }
 
@@ -1254,11 +1414,13 @@ func maxOutputTokensFromBody(body []byte) int {
 	if json.Unmarshal(body, &req) != nil {
 		return 0 // 由 pool 回落 reserveOutputTokens
 	}
+
 	for _, n := range []int{req.MaxTokens, req.MaxCompletionTokens, req.MaxOutputTokens} {
 		if n > 0 {
 			return n
 		}
 	}
+
 	return 0
 }
 
@@ -1268,9 +1430,11 @@ func (f *chatFlow) degradeSticky() string {
 	if f.h.cfg.Session != nil {
 		f.h.cfg.Session.Degrade(f.sessKey, uid, pool.StickyDegradeWindow)
 	}
+
 	log.Printf("INFO: [server] sticky soft escape acct=%s model=%s: degrade %s",
 		logfmt.UID8(uid), f.bareModel, pool.StickyDegradeWindow)
 	f.stickyUID = ""
+
 	return uid
 }
 
@@ -1278,11 +1442,13 @@ func (f *chatFlow) degradeSticky() string {
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
 	escapedUID := ""
+
 	if f.stickyUID != "" {
 		acct, ok, escaped := f.trySticky()
 		if ok {
 			return acct
 		}
+
 		escapedUID = escaped
 	}
 	// 软逃逸是为了分流：优先在排除原号后选，避免立刻又选回它。若排除后无号
@@ -1292,12 +1458,14 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 		for uid := range f.tried {
 			excluded[uid] = true
 		}
+
 		excluded[escapedUID] = true
 		if acct := f.pickWith(excluded); acct != nil {
 			f.tried[escapedUID] = true
 			return acct
 		}
 	}
+
 	return f.pickWith(f.tried)
 }
 
@@ -1306,8 +1474,10 @@ func (f *chatFlow) pickWith(tried map[string]bool) *auth.Auth {
 	if f.st.decision != nil {
 		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(tried, f.bareModel, f.realm)
 		mergePickTrace(f.st.decision, trace)
+
 		return acct
 	}
+
 	return f.h.cfg.Pool.PickExcludingForRealm(tried, f.bareModel, f.realm)
 }
 
@@ -1320,12 +1490,16 @@ func (f *chatFlow) trySticky() (*auth.Auth, bool, string) {
 			f.st.decision.StickyHit = true
 			f.st.decision.FinalUID = logfmt.UID8(acct.UID)
 		}
+
 		return acct, true, ""
 	}
+
 	if picked == pool.StickyEscaped {
 		return nil, false, f.degradeSticky()
 	}
+
 	f.unbindSticky()
+
 	return nil, false, ""
 }
 
@@ -1334,11 +1508,22 @@ func (h *Handler) sampleDecisionTrace() *reqlog.DecisionTrace {
 	if !h.cfg.DecisionTrace {
 		return nil
 	}
+
 	sample := h.cfg.DecisionTraceSample
 	if sample > 0 && sample < 1 && rand.Float64() >= sample {
 		return nil
 	}
-	return &reqlog.DecisionTrace{}
+
+	return &reqlog.DecisionTrace{
+		Candidates: 0,
+		Excluded:   nil,
+		CostTier:   0,
+		Explored:   false,
+		StickyHit:  false,
+		Rotations:  nil,
+		Top:        nil,
+		FinalUID:   "",
+	}
 }
 
 // mergePickTrace 把 pool 决策快照并入请求级决策链（Top 覆盖为最近一次尝试）。
@@ -1347,10 +1532,13 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	if dst.Excluded == nil {
 		dst.Excluded = map[string]int{}
 	}
+
 	for reason, n := range src.Excluded {
 		dst.Excluded[reason] += n
 	}
+
 	dst.CostTier = src.CostTier
+
 	dst.Explored = dst.Explored || src.Explored
 	if len(src.Top) > 0 {
 		dst.Top = make([]reqlog.DecisionCandidate, 0, len(src.Top))
@@ -1358,6 +1546,7 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 			dst.Top = append(dst.Top, reqlog.DecisionCandidate{UID: c.UID, Weight: c.Weight, Tier: c.Tier})
 		}
 	}
+
 	if src.FinalUID != "" {
 		dst.FinalUID = src.FinalUID
 	}
@@ -1369,11 +1558,14 @@ func (f *chatFlow) retryAcquireFailed(ctx context.Context, acct *auth.Auth, i in
 	if f.stickyUID != "" && acct.UID == f.stickyUID {
 		f.unbindSticky()
 	}
+
 	if !rotateBackoff(ctx, i) {
 		// 客户端已断连：换号重试无意义，终止轮转走末端错误透传。
 		return rotBreak
 	}
+
 	f.rotateReason = "acquire"
+
 	return rotContinue
 }
 
@@ -1383,19 +1575,24 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 	if !acct.NeedsRefresh(f.h.cfg.RefreshSkew) {
 		return true, false
 	}
+
 	if err := f.h.cfg.Upstream.RefreshToken(acct); err != nil {
 		f.lastErr = err
 		f.penalizeRefreshFailure(acct, err)
 		f.fail(acct.UID)
+
 		if !rotateBackoff(ctx, i) {
 			return false, true // ctx 取消：终止轮转（refresh 失败换号退避）
 		}
+
 		return false, false
 	}
+
 	if err := acct.SaveAtomic(); err != nil {
 		// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露。
 		log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.NicknameValue()), err)
 	}
+
 	return true, false
 }
 
@@ -1406,8 +1603,10 @@ func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
 		f.h.cfg.Pool.Disable(acct.UID, "refresh session dead")
 		f.h.notifyAccount(acct.UID, notify.EventSessionDead, "账号 session 失效，已禁用，需重新登录",
 			map[string]any{"stage": "refresh"})
+
 		return
 	}
+
 	f.h.cfg.Pool.NoteError(acct.UID)
 }
 
@@ -1423,9 +1622,11 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 	if errors.As(terr, &uerr) {
 		status = uerr.Status
 	}
+
 	if uerr == nil && terr != nil {
 		return f.handleTransportError(ctx, acct, terr, attemptStarted, i)
 	}
+
 	if status >= 400 {
 		return f.handleHTTPError(ctx, acct, status, respBody, uerr, attemptStarted, i)
 	}
@@ -1434,6 +1635,7 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 	if f.stream {
 		return f.handleStreamSuccess(ctx, acct, rc, attemptStarted)
 	}
+
 	return f.handleNonStreamSuccess(ctx, acct, rc, attemptStarted, i)
 }
 
@@ -1443,11 +1645,12 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 	// 别的号撞上的是同一个慢上游，只会把客户端拖到 MaxRotate × header_timeout。
 	// 判定三态见 isUpstreamTimeout；客户端主动断连时 ctx 已取消，走抖动分支。
 	if isUpstreamTimeout(terr, ctx.Err() != nil) {
-		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 		f.st.status = http.StatusServiceUnavailable
 		f.lastErr = fmt.Errorf("%w: %w", errUpstreamTimeout, terr)
 		log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 			logfmt.Label(acct.UID, acct.NicknameValue()), terr)
+
 		return rotBreak
 	}
 	// 出站代理层拨号失败（issue #15）：不是账号的问题，且同一请求换号仍走同一代理池
@@ -1458,19 +1661,23 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 		f.lastErr = fmt.Errorf("proxy: %w", terr)
 		log.Printf("WARN: [server] outbound proxy dial failed acct=%s: %v (rotation stopped, account not penalized)",
 			logfmt.Label(acct.UID, acct.NicknameValue()), terr)
+
 		return rotBreak
 	}
 	// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 	// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」。
-	f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	f.st.status = http.StatusServiceUnavailable
 	f.lastErr = terr
 	f.h.cfg.Pool.NoteFailures(acct.UID)
 	f.fail(acct.UID)
+
 	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（传输层错误换号退避）
 	}
+
 	f.rotateReason = "transport"
+
 	return rotContinue
 }
 
@@ -1479,8 +1686,9 @@ func (f *chatFlow) handleHTTPError(
 	ctx context.Context, acct *auth.Auth, status int, respBody []byte,
 	uerr *upstream.Error, attemptStarted time.Time, i int,
 ) rotationAction {
-	f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	f.st.status = status
+
 	var kind upstream.ErrKind
 	if uerr != nil {
 		kind = uerr.Kind
@@ -1499,6 +1707,7 @@ func (f *chatFlow) handleHTTPError(
 		delete(f.tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 		f.releaseHeld()
 		log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+
 		return rotContinue
 	}
 	// 请求级错误（内容防火墙 / 上下文超限 / 图片无效 / 请求体畸形）：换任何账号都会
@@ -1518,6 +1727,7 @@ func (f *chatFlow) handleHTTPError(
 	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
 		f.h.notifyAccount(acct.UID, notify.EventWAFIPBlocked, "出口 IP 触发上游 WAF 级拦截，轮转已停止",
 			map[string]any{"model": f.bareModel})
+
 		return rotBreak
 	}
 	// 状态码换号闸（issue #17，默认关闭）：allowlist 非空时仅列出的状态码才换号；
@@ -1525,10 +1735,13 @@ func (f *chatFlow) handleHTTPError(
 	if !f.rotateAllowedForStatus(status) {
 		return rotBreak
 	}
+
 	if !rotateBackoff(ctx, i) {
 		return rotBreak // ctx 取消：终止轮转（分类错误换号退避）
 	}
+
 	f.rotateReason = kind.String()
+
 	return rotContinue
 }
 
@@ -1538,6 +1751,7 @@ func (f *chatFlow) rotateAllowedForStatus(status int) bool {
 	if len(f.h.cfg.RotateStatuses) == 0 {
 		return true
 	}
+
 	return f.h.cfg.RotateStatuses[status]
 }
 
@@ -1555,8 +1769,10 @@ func failFastKind(kind upstream.ErrKind) bool {
 func (f *chatFlow) handleRequestLevelError(acct *auth.Auth, kind upstream.ErrKind, respBody []byte, uerr *upstream.Error) {
 	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
 	f.fail(acct.UID)
+
 	raw := string(respBody)
 	code, fallback := requestLevelErrorCode(kind)
+
 	msg := raw
 	if kind == upstream.ErrPromptTooLong {
 		msg = promptTooLongMessage(raw)
@@ -1564,6 +1780,7 @@ func (f *chatFlow) handleRequestLevelError(acct *auth.Auth, kind upstream.ErrKin
 		// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 		msg = fallback
 	}
+
 	f.out.Error(http.StatusBadRequest, code, msg,
 		f.h.hintOf(kind, raw, f.bareModel, f.reqHasImage, uerr))
 	f.st.status = http.StatusBadRequest
@@ -1600,6 +1817,7 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 	// 还原成 delta.tool_calls（见 upstream/dsml.go）。第二参数 true = 名单为空时启用
 	// 弱判定——tools 声明在链路上丢失是实测最常见的泄漏成因。
 	repair := upstream.NewMarkupRepair(f.declaredTools, true)
+
 	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
 		return f.h.hintContext(f.bareModel, f.reqHasImage)
 	}), repair, func(payload string) { errFrame = payload })
@@ -1642,8 +1860,10 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 		f.st.outcome = reqlog.OutcomeSuccess
 		f.noteSuccessAndBind(acct)
 	}
+
 	f.finishStreamStats(acct, stats, repair, attemptStarted)
 	rc.Close()
+
 	return rotDone
 }
 
@@ -1666,6 +1886,7 @@ func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 	// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 	f.h.cfg.Pool.BlockModelClear(acct.UID, f.bareModel)
+
 	if f.sessKey != "" && f.h.cfg.Session != nil {
 		f.h.cfg.Session.Bind(f.sessKey, acct.UID)
 	}
@@ -1677,11 +1898,13 @@ func (f *chatFlow) finishStreamStats(acct *auth.Auth, stats *chatStatsReader, re
 	if hit, miss, ok := stats.CacheTokens(); ok {
 		f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = hit, miss, true
 	}
+
 	f.recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
 	// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 	if f.st.hasCache {
 		cacheMissWarn.noteCacheTokens(f.bareModel, f.st.promptTokens, f.st.cacheHit, f.st.cacheMiss)
 	}
+
 	if n := repair.Converted(); n > 0 {
 		// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
 		log.Printf("INFO: [server] stream acct=%s model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
@@ -1691,6 +1914,7 @@ func (f *chatFlow) finishStreamStats(acct *auth.Auth, stats *chatStatsReader, re
 		log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, m, len(f.declaredTools))
 	}
+
 	f.st.ttfb = stats.TTFB()
 	// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），不写入零值。
 	if toks, hasUsage := stats.Tokens(); hasUsage {
@@ -1699,6 +1923,7 @@ func (f *chatFlow) finishStreamStats(acct *auth.Auth, stats *chatStatsReader, re
 	// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价。
 	if hasCredit {
 		f.st.credit = credit
+
 		f.st.hasCredit = true
 		if total, tok := stats.TotalTokens(); tok && total > 0 {
 			f.h.cfg.Pool.NoteModelCost(acct.UID, f.bareModel, credit, total)
@@ -1708,11 +1933,18 @@ func (f *chatFlow) finishStreamStats(acct *auth.Auth, stats *chatStatsReader, re
 
 // handleNonStreamSuccess 非流式收尾：聚合 SSE、修复标记工具调用、记录用量并写响应。
 // 聚合失败（空流 / EOF 截断，issue #105）时客户端尚未收到任何字节，换号重试。
-func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int) rotationAction {
+func (f *chatFlow) handleNonStreamSuccess(
+	ctx context.Context,
+	acct *auth.Auth,
+	rc io.ReadCloser,
+	attemptStarted time.Time,
+	i int,
+) rotationAction {
 	resp, err := upstream.Aggregate(rc)
 	rc.Close()
+
 	if err != nil {
-		f.recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 		// 上游流解析失败（空流 / EOF 截断，issue #105）：截断的 content 不是完整
 		// 回答，绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试
 		// （空流/截断是上游缺陷，换个号大概率能拿到完整流）；轮转耗尽才回 502。
@@ -1723,10 +1955,13 @@ func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, 
 		f.lastErr = fmt.Errorf("upstream_parse: %w", err)
 		log.Printf("WARN: [server] non-stream acct=%s model=%s: %v (rotating)",
 			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, err)
+
 		if !rotateBackoff(ctx, i) {
 			return rotBreak
 		}
+
 		f.rotateReason = "parse"
+
 		return rotContinue
 	}
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
@@ -1740,6 +1975,7 @@ func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, 
 		log.Printf("WARN: [server] non-stream model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
 			f.bareModel, m, len(f.declaredTools))
 	}
+
 	credit, total, hasCredit := usageCreditTotal(resp)
 	if usageMap, ok := resp["usage"].(map[string]any); ok {
 		if hit, okH := upstream.UsageCacheHitTokens(usageMap); okH {
@@ -1747,10 +1983,13 @@ func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, 
 			f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = int64(hit), int64(miss), true
 		}
 	}
+
 	f.recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
+
 	if f.st.hasCache {
 		cacheMissWarn.noteCacheTokens(f.bareModel, f.st.promptTokens, f.st.cacheHit, f.st.cacheMiss)
 	}
+
 	f.out.JSON(http.StatusOK, resp)
 	f.st.status = http.StatusOK
 	f.st.outcome = reqlog.OutcomeSuccess
@@ -1763,6 +2002,7 @@ func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, 
 		f.st.hasCredit = true
 		f.h.cfg.Pool.NoteModelCost(acct.UID, f.bareModel, credit, total)
 	}
+
 	return rotDone
 }
 
@@ -1771,16 +2011,18 @@ func (h *Handler) notifyAccount(uid, event, summary string, detail map[string]an
 	if h.cfg.Notifier == nil {
 		return
 	}
-	e := notify.Event{Event: event, UID: uid, Summary: summary, Detail: detail}
+
+	event2 := notify.Event{Event: event, UID: uid, Summary: summary, Detail: detail, Time: time.Time{}, Nickname: "", Realm: ""}
 	if st, ok := h.cfg.Pool.Status(uid); ok {
-		e.Nickname = st.Nickname
-		e.Realm = st.Realm
+		event2.Nickname = st.Nickname
+		event2.Realm = st.Realm
 	}
-	h.notify(e)
+
+	h.notify(&event2)
 }
 
 // notify 发送事件（未配置时为空操作）。
-func (h *Handler) notify(e notify.Event) {
+func (h *Handler) notify(e *notify.Event) {
 	if h.cfg.Notifier != nil {
 		h.cfg.Notifier.Notify(e)
 	}
@@ -1789,7 +2031,14 @@ func (h *Handler) notify(e notify.Event) {
 // recordAttempt 记录一次尝试的用量（唯一汇聚点：流式/非流式、成功/失败都走此，
 // 与 pool 的每账号累计器同源，两条口径不会漂移）。ttfb 首 token 等待仅流式有观测，
 // 非流式传 0（无观测，速率不扣减）。
-func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit float64, hasCredit bool, started time.Time, ttfb time.Duration) {
+func (f *chatFlow) recordAttempt(
+	uid string,
+	delta *pool.TokenUsageDelta,
+	credit float64,
+	hasCredit bool,
+	started time.Time,
+	ttfb time.Duration,
+) {
 	f.st.attempts++
 	f.applyDeltaToStat(delta)
 	delta.Model = f.modelName()
@@ -1798,10 +2047,7 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 	delta.LatencyMs = latencyMs
 	// TTFT 采样（issue #16）：仅流式有观测（首 data 帧）；非流式 ttfb=0 不写。
 	if ttfb > 0 {
-		ttftMs := ttfb.Milliseconds()
-		if ttftMs < 1 {
-			ttftMs = 1
-		}
+		ttftMs := max(ttfb.Milliseconds(), 1)
 		delta.HasTTFTMs = true
 		delta.TTFTMs = ttftMs
 	}
@@ -1816,6 +2062,7 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 			delta.TokensPerSecond = tps
 		}
 	}
+
 	f.h.cfg.Pool.RecordTokenUsage(uid, delta)
 	// 健康台账（issue #16）：成功口径同 usage（deltaHasUsage），TTFT 有观测才并入。
 	// 只供选号降权，不改判定语义。
@@ -1826,13 +2073,15 @@ func (f *chatFlow) recordAttempt(uid string, delta pool.TokenUsageDelta, credit 
 }
 
 // applyDeltaToStat 把本次 delta 的 token 观测写入请求统计。
-func (f *chatFlow) applyDeltaToStat(delta pool.TokenUsageDelta) {
+func (f *chatFlow) applyDeltaToStat(delta *pool.TokenUsageDelta) {
 	if delta.HasPromptTokens {
 		f.st.promptTokens = delta.PromptTokens
 	}
+
 	if delta.HasCompletionTokens {
 		f.st.completionTokens = delta.CompletionTokens
 	}
+
 	if delta.HasTotalTokens {
 		f.st.totalTokens = delta.TotalTokens
 	} else if delta.HasPromptTokens || delta.HasCompletionTokens {
@@ -1845,6 +2094,7 @@ func attemptLatencyMs(started time.Time) int64 {
 	if ms := time.Since(started).Milliseconds(); ms >= 1 {
 		return ms
 	}
+
 	return 1
 }
 
@@ -1853,19 +2103,22 @@ func (f *chatFlow) modelName() string {
 	if f.bareModel != "" {
 		return f.bareModel
 	}
+
 	return f.rawModel
 }
 
 // recordUsage 写入逐请求用量记录（含缓存/速率/倍率维度）。
-func (f *chatFlow) recordUsage(uid string, delta pool.TokenUsageDelta, credit float64, hasCredit bool) {
+func (f *chatFlow) recordUsage(uid string, delta *pool.TokenUsageDelta, credit float64, hasCredit bool) {
 	if f.h.cfg.Usage == nil {
 		return
 	}
+
 	realm := "cn"
 	if a, ok := f.h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 		realm = a.Realm
 	}
-	f.h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+
+	f.h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, &usage.Delta{
 		PromptTokens:     delta.PromptTokens,
 		HasPromptTokens:  delta.HasPromptTokens,
 		CompletionTokens: delta.CompletionTokens,
@@ -1888,7 +2141,7 @@ func (f *chatFlow) recordUsage(uid string, delta pool.TokenUsageDelta, credit fl
 }
 
 // deltaHasUsage 报告本次尝试是否拿到上游 usage（成功口径，与 recordUsage 的 ok 一致）。
-func deltaHasUsage(delta pool.TokenUsageDelta) bool {
+func deltaHasUsage(delta *pool.TokenUsageDelta) bool {
 	return delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens
 }
 
@@ -1900,6 +2153,7 @@ func (f *chatFlow) recordKeyUsage() {
 	if f.keyUsage == nil {
 		return
 	}
+
 	f.keyUsage.prompt += f.st.promptTokens
 	f.keyUsage.completion += f.st.completionTokens
 	f.keyUsage.total += f.st.totalTokens
@@ -1914,13 +2168,17 @@ func (f *chatFlow) writeFinalError() {
 			"daily account limits reached; retry after local midnight", "")
 		f.st.status = http.StatusTooManyRequests
 		f.st.outcome = reqlog.OutcomeHTTPError
+
 		return
 	}
+
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
+
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
 	if seconds := f.retryAfterSeconds(status); seconds > 0 {
 		f.out.Header("Retry-After", strconv.Itoa(seconds))
 	}
+
 	f.out.Error(status, code, msg, hint)
 	f.st.status = status
 	f.st.outcome = reqlog.OutcomeHTTPError
@@ -1932,14 +2190,14 @@ func (f *chatFlow) retryAfterSeconds(status int) int {
 	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
 		return 0
 	}
+
 	until := f.earliestRecovery(time.Now())
 	if until.IsZero() {
 		return 0
 	}
-	seconds := int(math.Ceil(time.Until(until).Seconds()))
-	if seconds < 1 {
-		seconds = 1
-	}
+
+	seconds := max(int(math.Ceil(time.Until(until).Seconds())), 1)
+
 	return seconds
 }
 
@@ -1949,7 +2207,9 @@ func (f *chatFlow) earliestRecovery(now time.Time) time.Time {
 	if errors.As(f.lastErr, &ue) && ue.RetryAfter > 0 {
 		return now.Add(ue.RetryAfter)
 	}
+
 	acc := f.accountRecovery(now)
+
 	model := f.modelRecovery(now)
 	switch {
 	case acc.IsZero():
@@ -1966,19 +2226,23 @@ func (f *chatFlow) accountRecovery(now time.Time) time.Time {
 	if f.h.cfg.Pool == nil || f.st == nil || f.st.uid == "" {
 		return time.Time{}
 	}
-	st, ok := f.h.cfg.Pool.Status(f.st.uid)
+
+	status, ok := f.h.cfg.Pool.Status(f.st.uid)
 	if !ok {
 		return time.Time{}
 	}
-	until := futureOrZero(st.Until, now)
-	for _, m := range st.RateLimitedModels {
+
+	until := futureOrZero(status.Until, now)
+	for _, m := range status.RateLimitedModels {
 		// 只认当前模型：其他模型的冷却与本次请求无关，取它们的最早值会给出
 		// 偏短且必然失败的 Retry-After。
 		if f.bareModel != "" && m.Model != f.bareModel {
 			continue
 		}
+
 		until = earlierFuture(until, m.Until, now)
 	}
+
 	return until
 }
 
@@ -1988,6 +2252,7 @@ func earlierFuture(cur, cand, now time.Time) time.Time {
 	if t.IsZero() || (!cur.IsZero() && !t.Before(cur)) {
 		return cur
 	}
+
 	return t
 }
 
@@ -1996,12 +2261,15 @@ func (f *chatFlow) modelRecovery(now time.Time) time.Time {
 	if f.h.cfg.Pool == nil {
 		return time.Time{}
 	}
-	mb := f.h.cfg.Pool.ModelBlocked(f.bareModel)
+
+	modelBlockStatus := f.h.cfg.Pool.ModelBlocked(f.bareModel)
+
 	route := f.h.cfg.Pool.RouteRecovery(f.realm, f.bareModel)
-	if !mb.Blocked {
+	if !modelBlockStatus.Blocked {
 		return futureOrZero(route, now)
 	}
-	return earlierFuture(futureOrZero(mb.Until, now), route, now)
+
+	return earlierFuture(futureOrZero(modelBlockStatus.Until, now), route, now)
 }
 
 // futureOrZero 仅保留晚于 now 的时刻。
@@ -2009,6 +2277,7 @@ func futureOrZero(t, now time.Time) time.Time {
 	if t.After(now) {
 		return t
 	}
+
 	return time.Time{}
 }
 
@@ -2049,17 +2318,20 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
 	hint = upstream.NoHealthyAccountHint()
+
 	if s2, c2, m2, ok := localErrorEnvelope(f.lastErr, status, code, msg); ok {
 		// 本地分类错误（超时 / 截断 / 空流 / 大小超限）：属于上游或传输层异常，
 		// 不是号池调度失败，不透出 no_healthy_account hint（排查方向完全不同）。
 		return s2, c2, m2, "", false
 	}
-	var ue *upstream.Error
-	if !errors.As(f.lastErr, &ue) {
+
+	var upErr *upstream.Error
+	if !errors.As(f.lastErr, &upErr) {
 		return status, code, msg, hint, false
 	}
-	hint = f.h.hintOf(ue.Kind, ue.Msg, f.bareModel, f.reqHasImage, ue)
-	switch ue.Kind {
+
+	hint = f.h.hintOf(upErr.Kind, upErr.Msg, f.bareModel, f.reqHasImage, upErr)
+	switch upErr.Kind {
 	case upstream.ErrSoftRate:
 		status = http.StatusTooManyRequests
 		code = "rate_limit_exceeded"
@@ -2080,11 +2352,13 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 	default:
 		// 其余错误（ErrNone 等）：保持通用 503 + no_healthy_account 文案。
 	}
-	if s := strings.TrimSpace(ue.Msg); s != "" {
+
+	if s := strings.TrimSpace(upErr.Msg); s != "" {
 		// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
 		msg = s
 		upstreamMsgPassed = true
 	}
+
 	return status, code, msg, hint, upstreamMsgPassed
 }
 
@@ -2097,6 +2371,7 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 	if !f.modelBlock.Blocked {
 		return status, code, msg, hint
 	}
+
 	code = "model_unavailable"
 	// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号被挡、
 	// 最早何时解封"这类本地调度信息放进 gateway_hint。
@@ -2106,16 +2381,22 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 	// 阻塞范围（issue #29）：平台级（上游统一限流，等上游恢复）与账号级（换号/等本号
 	// 恢复）对运维的处置完全不同，在 hint 里点明。
 	if f.modelBlock.Scope == pool.ModelBlockScopePlatform {
-		hint = fmt.Sprintf("model_blocked: upstream platform-level rate limit on this model (%d account(s) share the same reset)", f.modelBlock.Count)
+		hint = fmt.Sprintf(
+			"model_blocked: upstream platform-level rate limit on this model (%d account(s) share the same reset)",
+			f.modelBlock.Count,
+		)
 	} else {
 		hint = fmt.Sprintf("model_blocked: %d account(s) cooling down this model (account-level)", f.modelBlock.Count)
 	}
+
 	if !f.modelBlock.Until.IsZero() {
 		hint += "; earliest unblock at " + f.modelBlock.Until.Format(time.RFC3339)
 	}
+
 	if s := strings.TrimSpace(f.modelBlock.Reason); s != "" {
 		hint += "; upstream: " + s
 	}
+
 	return http.StatusBadRequest, code, msg, hint
 }
 
@@ -2146,12 +2427,14 @@ func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64
 	if completionTokens < 0 || total <= 0 {
 		return 0, false
 	}
+
 	gen := total
 	if ttfb > 0 {
 		if g := total - ttfb; g >= minGenWindow {
 			gen = g
 		}
 	}
+
 	return float64(completionTokens) / gen.Seconds(), true
 }
 
@@ -2167,6 +2450,7 @@ func promptTooLongMessage(body string) string {
 	if strings.TrimSpace(body) == "" {
 		return "prompt is too long"
 	}
+
 	return body
 }
 
@@ -2177,12 +2461,15 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 	if usageMap == nil {
 		return 0, 0, false
 	}
-	c, _ := usageMap["credit"].(float64)
+
+	num, _ := usageMap["credit"].(float64)
+
 	t, _ := usageMap["total_tokens"].(float64)
 	if t <= 0 {
 		return 0, 0, false
 	}
-	return c, int(t), true
+
+	return num, int(t), true
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败
@@ -2195,10 +2482,12 @@ func rotateBackoff(ctx context.Context, i int) bool {
 	if d <= 0 {
 		return ctx.Err() == nil
 	}
+
 	if !sleepCtx(ctx, d) {
 		log.Printf("WARN: [server] rotate backoff aborted: ctx canceled")
 		return false
 	}
+
 	return true
 }
 
@@ -2212,13 +2501,16 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 	if err == nil {
 		return false
 	}
+
 	var ne net.Error
 	if errors.As(err, &ne) && ne.Timeout() {
 		return true
 	}
+
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
 	}
+
 	return !clientGone && errors.Is(err, context.Canceled)
 }
 
@@ -2293,27 +2585,33 @@ func (h *Handler) applySoftRatePolicy(uid, body, realm, model string, uerr *upst
 	if modelRateLimited {
 		h.cfg.Pool.NoteRouteFailure(realm, model)
 	}
+
 	if resetAt, ok := upstream.ParseRateReset(body); ok {
 		if modelRateLimited {
 			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 			return
 		}
+
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+
 		return
 	}
 	// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
 	// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
 	if uerr != nil && uerr.RetryAfter > 0 {
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
+
 		if modelRateLimited {
 			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 		}
+
 		return
 	}
 	// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 	// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 	// （热改优先），管理面板改 soft_rate 后立即生效。
 	h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
+
 	if modelRateLimited {
 		h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 	}
@@ -2328,6 +2626,7 @@ func (h *Handler) applyWafPolicy(uid string, uerr *upstream.Error) {
 		h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Now().Add(uerr.RetryAfter), "waf 403 block (retry-after)")
 		return
 	}
+
 	h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 }
 
@@ -2343,6 +2642,7 @@ func (h *Handler) applyAccountFaultPolicy(uid, body string) {
 		h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
 		return
 	}
+
 	h.cfg.Pool.Cooldown(uid, pool.CoolSoft, h.softCooldown(), "account fault (14017)")
 }
 
@@ -2379,6 +2679,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 		http.Error(w, "internal encode error", http.StatusInternalServerError)
 		return
 	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
@@ -2409,6 +2710,7 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 		writeOpenAIError(w, status, code, msg)
 		return
 	}
+
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message":      msg,
@@ -2432,13 +2734,17 @@ func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintCont
 	if bareModel == "" {
 		return ctx
 	}
-	for _, mi := range cachedModelsSnapshot() {
-		if mi.ID == bareModel {
+
+	models := h.cachedModelsSnapshot()
+	for i := range models {
+		if models[i].ID == bareModel {
 			ctx.ModelInCatalog = true
-			ctx.ModelSupportsImages = mi.SupportsModality(upstream.ModalityImage)
+			ctx.ModelSupportsImages = models[i].SupportsModality(upstream.ModalityImage)
+
 			return ctx
 		}
 	}
+
 	return ctx
 }
 
@@ -2451,6 +2757,7 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 	if uerr != nil && uerr.Msg != "" {
 		msg = uerr.Msg
 	}
+
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
 }
 
@@ -2458,9 +2765,11 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 func secondsUntilLocalMidnight(now time.Time) int {
 	y, m, d := now.Date()
 	next := time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
+
 	sec := int(math.Ceil(next.Sub(now).Seconds()))
 	if sec < 1 {
 		return 1
 	}
+
 	return sec
 }

@@ -38,6 +38,7 @@ func lookupDefaultEffort(defaultEfforts map[string]string, model string) string 
 	if len(defaultEfforts) == 0 || model == "" {
 		return ""
 	}
+
 	return defaultEfforts[model]
 }
 
@@ -72,6 +73,7 @@ func backfillReasoningContent(obj map[string]any) {
 	if !isDeepSeekModel(model) {
 		return
 	}
+
 	msgs, ok := obj["messages"].([]any)
 	if !ok || len(msgs) == 0 {
 		return
@@ -95,6 +97,7 @@ func backfillReasoningContent(obj map[string]any) {
 		if !ok {
 			continue
 		}
+
 		if role, _ := msg["role"].(string); role == "assistant" {
 			backfillAssistantReasoning(msg)
 		}
@@ -107,7 +110,9 @@ func thinkingEnabledFrom(obj map[string]any) bool {
 	if !ok {
 		return false
 	}
+
 	typ, _ := th["type"].(string)
+
 	return strings.EqualFold(strings.TrimSpace(typ), "enabled")
 }
 
@@ -119,13 +124,16 @@ func messagesHaveReasoningTrace(msgs []any) bool {
 		if !ok {
 			continue
 		}
+
 		if r, ok := msg["reasoning"].(string); ok && r != "" {
 			return true
 		}
+
 		if _, ok := msg["reasoning_content"]; ok {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -139,12 +147,14 @@ func backfillAssistantReasoning(msg map[string]any) {
 		} else {
 			rc = ""
 		}
+
 		msg["reasoning_content"] = rc
 	}
 	// 镜像：reasoning 缺失/null/空串 → 归一化（非空 rc 优先，皆无补 " "）。
 	if r, ok := msg["reasoning"].(string); ok && r != "" {
 		return // 已非空 → 不覆盖
 	}
+
 	if rc != "" {
 		msg["reasoning"] = rc
 	} else {
@@ -167,10 +177,12 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 	if !isDeepSeekModel(model) {
 		return
 	}
-	th, ok := obj["thinking"].(map[string]any)
+
+	table, ok := obj["thinking"].(map[string]any)
+
 	typ := ""
 	if ok {
-		typ, _ = th["type"].(string)
+		typ, _ = table["type"].(string)
 		typ = strings.TrimSpace(typ)
 	}
 	// 显式控制分支：type 非空（enabled/disabled 均为明确意图）→ 不改 type。
@@ -178,9 +190,12 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 		if strings.EqualFold(typ, "disabled") {
 			delete(obj, "reasoning_effort")
 			delete(obj, "reasoningEffort")
+
 			return // disabled：关思考且不带任何 effort（照抄客户端 case 行为）
 		}
+
 		ensureDeepSeekEffort(obj, defaultEffort) // 显式 enabled 缺 effort → 补默认档
+
 		return
 	}
 	// 无 thinking（或 thinking 非法非对象值）或 thinking 对象 type 缺失/为空：
@@ -189,8 +204,9 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 	if !ok {
 		obj["thinking"] = map[string]any{"type": "enabled"}
 	} else {
-		th["type"] = "enabled"
+		table["type"] = "enabled"
 	}
+
 	ensureDeepSeekEffort(obj, defaultEffort)
 }
 
@@ -202,12 +218,15 @@ func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
 	if hasSnake {
 		return
 	}
+
 	_, hasCamel := obj["reasoningEffort"]
 	if hasCamel {
 		return
 	}
+
 	if defaultEffort == "" {
 		defaultEffort = defaultDeepSeekEffort
 	}
+
 	obj["reasoning_effort"] = defaultEffort
 }

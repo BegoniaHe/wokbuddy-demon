@@ -91,12 +91,13 @@ type writeDeadlineConn struct {
 	writeTimeout time.Duration
 }
 
-func (c *writeDeadlineConn) Write(b []byte) (int, error) {
+func (c *writeDeadlineConn) Write(nums []byte) (int, error) {
 	if c.writeTimeout > 0 {
 		// 与标准库一致：设 deadline 失败只忽略（网络层下次写自会报错）。
 		_ = c.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
-	return c.Conn.Write(b)
+
+	return c.Conn.Write(nums)
 }
 
 // newTransport 构造共享出站 Transport（HTTP 与 ChatHTTP 同一实例，连接池不重复）。
@@ -115,16 +116,18 @@ func newTransport() *http.Transport {
 
 // newTransportWithWriteTimeout 是 newTransport 的可测构造：writeTimeout 参数化，
 // 便于测试用小超时验证写 deadline（wt<=0 关闭写 deadline）。
-func newTransportWithWriteTimeout(wt time.Duration) *http.Transport {
+func newTransportWithWriteTimeout(duration time.Duration) *http.Transport {
 	dialer := newDialer()
 	base := dialer.DialContext
+
 	return &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			conn, err := base(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
-			return &writeDeadlineConn{Conn: conn, writeTimeout: wt}, nil
+
+			return &writeDeadlineConn{Conn: conn, writeTimeout: duration}, nil
 		},
 		// 空 TLSNextProto（非 nil）真正禁 h2：见函数注释。必须 make 而非 nil——
 		// nil 表示「让标准库注入默认 h2 映射」（kongjianguan 实测：设
@@ -161,6 +164,7 @@ func roundTripCloseIdle(rt http.RoundTripper) {
 	if rt == nil {
 		return
 	}
+
 	if ci, ok := rt.(closeIdler); ok {
 		ci.CloseIdleConnections()
 	}

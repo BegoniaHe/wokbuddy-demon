@@ -16,6 +16,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -44,6 +45,8 @@ const (
 	flushInterval = 30 * time.Second
 )
 
+var errSetRealmFailed = errors.New("SetRealm failed")
+
 // Record 一把命名密钥的持久化记录。Hash 为 SHA-256 十六进制串，绝不回显。
 type Record struct {
 	ID               string     `json:"id"`
@@ -58,7 +61,7 @@ type Record struct {
 	CompletionTokens int64      `json:"completion_tokens"`
 	TotalTokens      int64      `json:"total_tokens"`
 	Rejected         int64      `json:"rejected,omitempty"`
-	Limits           Limits     `json:"limits,omitempty"`
+	Limits           Limits     `json:"limits,omitzero"`
 	// Realm 出口绑定（issue #94）：空 = 不绑定（跟随模型前缀/全局），
 	// cn / global = 固定该域。只影响 /v1/* 路由，不改变鉴权与管理面可见性。
 	Realm string `json:"realm,omitempty"`
@@ -106,18 +109,19 @@ type Store struct {
 
 // New 创建存储并从 path 加载（path 为空 = 纯内存，不落盘，测试用）。
 func New(path string) *Store {
-	s := &Store{
+	store := &Store{
 		path:   path,
 		limits: map[string]*limitRuntime{},
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
 	if path != "" {
-		if err := s.load(); err != nil {
+		if err := store.load(); err != nil {
 			log.Printf("[apikey] 读取 %s 失败（从零开始）: %v", path, err)
 		}
 	}
-	return s
+
+	return store
 }
 
 // load 读取落盘文件并重建校验快照。
@@ -127,19 +131,24 @@ func (s *Store) load() error {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+
+		return fmt.Errorf("load: %w", err)
 	}
-	var f file
-	if err := json.Unmarshal(raw, &f); err != nil {
-		return err
+
+	var file2 file
+	if err := json.Unmarshal(raw, &file2); err != nil {
+		return fmt.Errorf("load: %w", err)
 	}
+
 	s.mu.Lock()
-	s.records = f.Keys
+	s.records = file2.Keys
 	s.rebuildKeysLocked()
 	s.mu.Unlock()
-	if n := len(f.Keys); n > 0 {
+
+	if n := len(file2.Keys); n > 0 {
 		log.Printf("[apikey] 已恢复 %d 把命名密钥（%s）", n, s.path)
 	}
+
 	return nil
 }
 
@@ -150,8 +159,10 @@ func (s *Store) Start() {
 	}
 	go func() {
 		defer close(s.done)
+
 		t := time.NewTicker(flushInterval)
 		defer t.Stop()
+
 		for {
 			select {
 			case <-s.stop:
@@ -169,11 +180,14 @@ func (s *Store) Stop() {
 	if s == nil {
 		return
 	}
+
 	s.stopOnce.Do(func() { close(s.stop) })
+
 	if s.started.Load() {
 		<-s.done
 		return
 	}
+
 	s.flush()
 }
 
@@ -184,16 +198,21 @@ func (s *Store) Create(name string) (Record, string, error) {
 	if err != nil {
 		return Record{}, "", err
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	s.records = append(s.records, rec)
 	if err := s.persistLocked(); err != nil {
 		s.records = s.records[:len(s.records)-1]
 		return Record{}, "", err
 	}
+
 	s.rebuildKeysLocked()
+
 	out := rec
 	out.Hash = ""
+
 	return out, raw, nil
 }
 
@@ -202,14 +221,18 @@ func (s *Store) List() []Record {
 	if s == nil {
 		return nil
 	}
+
 	s.mu.Lock()
 	out := make([]Record, len(s.records))
 	copy(out, s.records)
 	s.mu.Unlock()
+
 	for i := range out {
 		out[i].Hash = ""
 	}
+
 	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+
 	return out
 }
 
@@ -217,21 +240,27 @@ func (s *Store) List() []Record {
 func (s *Store) Revoke(id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID != id {
 			continue
 		}
+
 		if s.records[i].Revoked {
 			return false, nil
 		}
+
 		s.records[i].Revoked = true
 		if err := s.persistLocked(); err != nil {
 			s.records[i].Revoked = false
 			return false, err
 		}
+
 		s.rebuildKeysLocked()
+
 		return true, nil
 	}
+
 	return false, nil
 }
 
@@ -239,21 +268,28 @@ func (s *Store) Revoke(id string) (bool, error) {
 func (s *Store) Delete(id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID != id {
 			continue
 		}
+
 		removed := s.records[i]
+
 		s.records = append(s.records[:i], s.records[i+1:]...)
 		if err := s.persistLocked(); err != nil {
 			s.records = append(s.records, Record{})
 			copy(s.records[i+1:], s.records[i:])
 			s.records[i] = removed
+
 			return false, err
 		}
+
 		s.rebuildKeysLocked()
+
 		return true, nil
 	}
+
 	return false, nil
 }
 
@@ -262,8 +298,10 @@ func (s *Store) Keys() []httpauth.Key {
 	if s == nil {
 		return nil
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	return s.keys
 }
 
@@ -272,12 +310,15 @@ func (s *Store) RecordUsage(id string, prompt, completion, total int64) {
 	if s == nil || id == "" {
 		return
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID != id {
 			continue
 		}
+
 		r := &s.records[i]
 		r.Requests++
 		r.PromptTokens += prompt
@@ -290,6 +331,7 @@ func (s *Store) RecordUsage(id string, prompt, completion, total int64) {
 		rt := s.runtimeLocked(id, now)
 		rt.tpm += total
 		s.limMu.Unlock()
+
 		return
 	}
 }
@@ -299,8 +341,10 @@ func (s *Store) Flush() {
 	if s == nil {
 		return
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if err := s.persistLocked(); err != nil {
 		log.Printf("[apikey] 落盘失败: %v", err)
 	}
@@ -313,11 +357,14 @@ func (s *Store) flush() {
 	if s == nil {
 		return
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	if s.path == "" || !s.dirty {
 		return
 	}
+
 	if err := s.persistLocked(); err != nil {
 		log.Printf("[apikey] 落盘失败: %v", err)
 	}
@@ -329,10 +376,13 @@ func (s *Store) persistLocked() error {
 		s.dirty = false
 		return nil
 	}
+
 	if err := writeRecords(s.path, s.records); err != nil {
 		return err
 	}
+
 	s.dirty = false
+
 	return nil
 }
 
@@ -340,18 +390,25 @@ func (s *Store) persistLocked() error {
 func writeRecords(path string, records []Record) error {
 	raw, err := json.MarshalIndent(file{Version: fileVersion, Keys: records}, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("writeRecords: %w", err)
 	}
+
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
+			return fmt.Errorf("writeRecords: %w", err)
 		}
 	}
+
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
+		return fmt.Errorf("writeRecords: %w", err)
 	}
-	return atomicwrite.Rename(tmp, path)
+
+	if err := atomicwrite.Rename(tmp, path); err != nil {
+		return fmt.Errorf("writeRecords: %w", err)
+	}
+
+	return nil
 }
 
 // rebuildKeysLocked 由 records 重建未撤销密钥的校验快照。
@@ -361,12 +418,15 @@ func (s *Store) rebuildKeysLocked() {
 		if s.records[i].Revoked {
 			continue
 		}
+
 		h, err := hex.DecodeString(s.records[i].Hash)
 		if err != nil || len(h) != 32 {
 			continue
 		}
+
 		keys = append(keys, httpauth.Key{ID: s.records[i].ID, Hash: h})
 	}
+
 	s.keys = keys
 }
 
@@ -378,19 +438,24 @@ func (s *Store) Acquire(id string) (release func(), retryAfter time.Duration, ok
 	if !found || !limits.enabled() {
 		return func() {}, 0, true
 	}
+
 	now := time.Now()
+
 	s.limMu.Lock()
 	defer s.limMu.Unlock()
-	rt := s.runtimeLocked(id, now)
-	if retry, ok := allowLocked(rt, limits); !ok {
+
+	limitRuntime2 := s.runtimeLocked(id, now)
+	if retry, ok := allowLocked(limitRuntime2, limits); !ok {
 		return nil, retry, false
 	}
-	rt.rpm++
-	rt.inflight++
+
+	limitRuntime2.rpm++
+	limitRuntime2.inflight++
+
 	return func() {
 		s.limMu.Lock()
-		if rt.inflight > 0 {
-			rt.inflight--
+		if limitRuntime2.inflight > 0 {
+			limitRuntime2.inflight--
 		}
 		s.limMu.Unlock()
 	}, 0, true
@@ -400,17 +465,20 @@ func (s *Store) Acquire(id string) (release func(), retryAfter time.Duration, ok
 func (l Limits) enabled() bool { return l.RPM > 0 || l.TPM > 0 || l.MaxConcurrent > 0 }
 
 // allowLocked 检查并发/RPM/TPM，返回建议等待时长。
-func allowLocked(rt *limitRuntime, limits Limits) (time.Duration, bool) {
-	if limits.MaxConcurrent > 0 && rt.inflight >= limits.MaxConcurrent {
+func allowLocked(limitRuntime2 *limitRuntime, limits Limits) (time.Duration, bool) {
+	if limits.MaxConcurrent > 0 && limitRuntime2.inflight >= limits.MaxConcurrent {
 		return time.Second, false
 	}
-	retry := time.Until(rt.windowStart.Add(time.Minute))
-	if limits.RPM > 0 && rt.rpm >= limits.RPM {
+
+	retry := time.Until(limitRuntime2.windowStart.Add(time.Minute))
+	if limits.RPM > 0 && limitRuntime2.rpm >= limits.RPM {
 		return retry, false
 	}
-	if limits.TPM > 0 && rt.tpm >= int64(limits.TPM) {
+
+	if limits.TPM > 0 && limitRuntime2.tpm >= int64(limits.TPM) {
 		return retry, false
 	}
+
 	return 0, true
 }
 
@@ -421,19 +489,23 @@ func (s *Store) ModelAllowed(id, model string) bool {
 	if !found || len(limits.Models) == 0 {
 		return true
 	}
+
 	modelRealm, modelBare := splitRealmName(model)
 	if modelRealm == "" {
 		modelRealm = "cn" // 裸模型名默认按 cn 路由（与 server.resolveModel 同口径）
 	}
+
 	for _, pattern := range limits.Models {
 		wantRealm, wantBare := splitRealmName(pattern)
 		if wantRealm != "" && wantRealm != modelRealm {
 			continue
 		}
+
 		if match, err := pathpkg.Match(wantBare, modelBare); err == nil && match {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -442,13 +514,16 @@ func (s *Store) Realm(id string) string {
 	if s == nil || id == "" {
 		return ""
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID == id && !s.records[i].Revoked {
 			return s.records[i].Realm
 		}
 	}
+
 	return ""
 }
 
@@ -458,22 +533,28 @@ func (s *Store) SetRealm(id, realm string) (bool, error) {
 	switch realm {
 	case "", "cn", "global":
 	default:
-		return false, fmt.Errorf("realm 必须是空、cn 或 global，当前 %q", realm)
+		return false, fmt.Errorf("realm 必须是空、cn 或 global，当前 %q: %w", realm, errSetRealmFailed)
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID != id {
 			continue
 		}
+
 		old := s.records[i].Realm
+
 		s.records[i].Realm = realm
 		if err := s.persistLocked(); err != nil {
 			s.records[i].Realm = old
 			return false, err
 		}
+
 		return true, nil
 	}
+
 	return false, nil
 }
 
@@ -481,18 +562,23 @@ func (s *Store) SetRealm(id, realm string) (bool, error) {
 func (s *Store) UpdateLimits(id string, limits Limits) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID != id {
 			continue
 		}
+
 		old := s.records[i].Limits
+
 		s.records[i].Limits = limits
 		if err := s.persistLocked(); err != nil {
 			s.records[i].Limits = old
 			return false, err
 		}
+
 		return true, nil
 	}
+
 	return false, nil
 }
 
@@ -501,12 +587,15 @@ func (s *Store) RecordRejected(id string) {
 	if s == nil || id == "" {
 		return
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID == id {
 			s.records[i].Rejected++
 			s.dirty = true
+
 			return
 		}
 	}
@@ -515,44 +604,46 @@ func (s *Store) RecordRejected(id string) {
 // limitsOf 读取记录限制（返回 false 表示密钥不存在）。
 func (s *Store) limitsOf(id string) (Limits, bool) {
 	if s == nil {
-		return Limits{}, false
+		return Limits{RPM: 0, TPM: 0, MaxConcurrent: 0, Models: nil}, false
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	for i := range s.records {
 		if s.records[i].ID == id && !s.records[i].Revoked {
 			return s.records[i].Limits, true
 		}
 	}
-	return Limits{}, false
+
+	return Limits{RPM: 0, TPM: 0, MaxConcurrent: 0, Models: nil}, false
 }
 
 // runtimeLocked 取/初始化密钥运行时；窗口过期时重置计数。
 func (s *Store) runtimeLocked(id string, now time.Time) *limitRuntime {
-	rt := s.limits[id]
-	if rt == nil {
-		rt = &limitRuntime{}
-		s.limits[id] = rt
+	limitRuntime2 := s.limits[id]
+	if limitRuntime2 == nil {
+		limitRuntime2 = &limitRuntime{}
+		s.limits[id] = limitRuntime2
 	}
-	if rt.windowStart.IsZero() || now.Sub(rt.windowStart) >= time.Minute {
-		rt.windowStart = now
-		rt.rpm = 0
-		rt.tpm = 0
+
+	if limitRuntime2.windowStart.IsZero() || now.Sub(limitRuntime2.windowStart) >= time.Minute {
+		limitRuntime2.windowStart = now
+		limitRuntime2.rpm = 0
+		limitRuntime2.tpm = 0
 	}
-	return rt
+
+	return limitRuntime2
 }
 
 // splitRealmName 拆出可选 realm 前缀（仅识别 cn/global），无前缀时 realm 为空。
 func splitRealmName(name string) (realm, bare string) {
-	idx := strings.IndexByte(name, ':')
-	if idx < 0 {
+	prefix, rest, ok := strings.Cut(name, ":")
+	if !ok || (prefix != "cn" && prefix != "global") {
 		return "", name
 	}
-	prefix := name[:idx]
-	if prefix != "cn" && prefix != "global" {
-		return "", name
-	}
-	return prefix, name[idx+1:]
+
+	return prefix, rest
 }
 
 // newRecord 生成一把随机命名密钥及其记录（含哈希与展示前缀）。
@@ -561,19 +652,24 @@ func newRecord(name string) (string, Record, error) {
 	if _, err := rand.Read(buf); err != nil {
 		return "", Record{}, fmt.Errorf("gen key: %w", err)
 	}
+
 	idb := make([]byte, 8)
 	if _, err := rand.Read(idb); err != nil {
 		return "", Record{}, fmt.Errorf("gen key id: %w", err)
 	}
+
 	raw := keyPrefix + base64.RawURLEncoding.EncodeToString(buf)
+
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "API key"
 	}
+
 	prefix := raw
 	if len(prefix) > prefixLen {
 		prefix = prefix[:prefixLen]
 	}
+
 	rec := Record{
 		ID:        hex.EncodeToString(idb),
 		Name:      name,
@@ -581,5 +677,6 @@ func newRecord(name string) (string, Record, error) {
 		Hash:      hex.EncodeToString(httpauth.HashKey(raw)),
 		CreatedAt: time.Now(),
 	}
+
 	return raw, rec, nil
 }

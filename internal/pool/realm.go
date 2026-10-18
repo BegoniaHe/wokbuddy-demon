@@ -15,21 +15,28 @@ const expiringVirtualSlots = 3
 func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
+
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+	for strVal, entry2 := range p.byUID {
+		if realm != "" && entry2.a.Realm() != realm {
 			continue
 		}
-		if !e.healthy(now) {
+
+		if !entry2.healthy(now) {
 			continue
 		}
-		if p.inFlightFull(e) {
+
+		if p.inFlightFull(entry2) {
 			continue
 		}
-		uids = append(uids, uid)
+
+		uids = append(uids, strVal)
 	}
+
 	sort.Strings(uids)
+
 	return uids
 }
 
@@ -44,42 +51,51 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
 	if p.routeCoolingLocked(realm, model, now) {
 		return nil
 	}
+
 	return p.weightedAvailableLocked(model, realm, now)
 }
 
 // weightedAvailableLocked 过滤可用账号并按快过期实例数展开；调用方需已持 p.mu。
 func (p *Pool) weightedAvailableLocked(model, realm string, now time.Time) []string {
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+	for strVal, entry2 := range p.byUID {
+		if realm != "" && entry2.a.Realm() != realm {
 			continue
 		}
-		if !e.healthyForModel(now, model) {
+
+		if !entry2.healthyForModel(now, model) {
 			continue
 		}
-		if p.inFlightFull(e) {
+
+		if p.inFlightFull(entry2) {
 			continue
 		}
-		uids = append(uids, uid)
+
+		uids = append(uids, strVal)
 	}
+
 	sort.Strings(uids)
 
 	out := make([]string, 0, len(uids))
 	for _, uid := range uids {
 		slots := 1
+
 		if p.preferExpiring {
 			if e := p.byUID[uid]; expiringNow(e, now) {
 				slots = expiringVirtualSlots
 			}
 		}
+
 		for range slots {
 			out = append(out, uid)
 		}
 	}
+
 	return out
 }
 
@@ -88,20 +104,27 @@ func (p *Pool) weightedAvailableLocked(model, realm string, now time.Time) []str
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
+
 	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if realm != "" && e.a.Realm() != realm {
+	for strVal, entry2 := range p.byUID {
+		if realm != "" && entry2.a.Realm() != realm {
 			continue
 		}
-		if !e.healthyForModel(now, model) {
+
+		if !entry2.healthyForModel(now, model) {
 			continue
 		}
-		if p.inFlightFull(e) {
+
+		if p.inFlightFull(entry2) {
 			continue
 		}
-		uids = append(uids, uid)
+
+		uids = append(uids, strVal)
 	}
+
 	sort.Strings(uids)
+
 	return uids
 }

@@ -68,6 +68,7 @@ type PickCandidate struct {
 func (p *Pool) PickExcludingForRealmTrace(tried map[string]bool, reqModel, realm string) (*auth.Auth, PickTrace) {
 	trace := PickTrace{Excluded: map[string]int{}}
 	acct := p.pickTraceWith(tried, reqModel, realm, &trace)
+
 	return acct, trace
 }
 
@@ -77,14 +78,18 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	if trace == nil {
 		trace = &local
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	now := p.now()
 	if p.routeCoolingLocked(realm, reqModel, now) {
 		trace.addExcluded("route_cooldown")
 		return nil
 	}
+
 	cands := p.pickCandidates(tried, reqModel, realm, now, trace)
+
 	trace.Candidates = len(cands)
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
@@ -93,46 +98,51 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 		if acct != nil {
 			trace.FinalUID = logfmt.UID8(acct.UID)
 		}
+
 		return acct
 	}
+
 	maxCredits := maxCreditsOf(cands)
 	bestTier, explored := p.resolveCostTier(cands, reqModel, realm, now)
 	trace.CostTier, trace.Explored = bestTier, explored
 	ordered, top := p.rankCandidates(cands, reqModel, bestTier, maxCredits, now)
 	trace.Top = topTrace(top, reqModel, now, p, maxCredits)
-	e := p.selectCandidate(ordered, top, reqModel, now)
-	trace.FinalUID = logfmt.UID8(e.a.UID)
+	entry2 := p.selectCandidate(ordered, top, reqModel, now)
+
+	trace.FinalUID = logfmt.UID8(entry2.a.UID)
 	if explored {
 		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
 		// 毕业结果由相邻的既有日志闭环（免费号无日志、收费号走 NoteModelCost
 		// 常规路径）。
 		log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s",
-			reqModel, realm, logfmt.Label(e.a.UID, e.a.NicknameValue()), p.costExploreInterval)
+			reqModel, realm, logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()), p.costExploreInterval)
 	}
-	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
+
+	entry2.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
-	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
-	return e.a
+	entry2.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+
+	return entry2.a
 }
 
 // topTrace 截取 Top-N 候选的权重快照（最多 5 条）。
-func topTrace(top []*entry, model string, now time.Time, p *Pool, maxCredits int64) []PickCandidate {
+func topTrace(top []*entry, model string, now time.Time, pool *Pool, maxCredits int64) []PickCandidate {
 	if len(top) == 0 {
 		return nil
 	}
-	limit := len(top)
-	if limit > 5 {
-		limit = 5
-	}
+
+	limit := min(len(top), 5)
+
 	out := make([]PickCandidate, 0, limit)
 	for _, e := range top[:limit] {
 		tier, _ := e.costTier(model, now)
 		out = append(out, PickCandidate{
 			UID:    logfmt.UID8(e.a.UID),
-			Weight: p.routingWeightOf(e, maxCredits, model, now),
+			Weight: pool.routingWeightOf(e, maxCredits, model, now),
 			Tier:   tier,
 		})
 	}
+
 	return out
 }
 
@@ -141,45 +151,55 @@ func topTrace(top []*entry, model string, now time.Time, p *Pool, maxCredits int
 // 调用方必须已持有 p.mu 写锁。
 func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace) []*entry {
 	var cands []*entry
-	for uid, e := range p.byUID {
-		if tried != nil && tried[uid] {
+
+	for strVal, entry2 := range p.byUID {
+		if tried != nil && tried[strVal] {
 			trace.addExcluded("tried")
 			continue
 		}
 		// 惰性清理过期的模型级冷却与成本台账（两者的 map 都不无限膨胀；
 		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
-		e.pruneExpiredModelCooldowns(now)
-		e.pruneExpiredModelCosts(now)
-		e.pruneExpiredHealth(now)
-		if reason := p.excludeReason(e, reqModel, realm, now); reason != "" {
+		entry2.pruneExpiredModelCooldowns(now)
+		entry2.pruneExpiredModelCosts(now)
+		entry2.pruneExpiredHealth(now)
+
+		if reason := p.excludeReason(entry2, reqModel, realm, now); reason != "" {
 			trace.addExcluded(reason)
 			continue
 		}
-		cands = append(cands, e)
+
+		cands = append(cands, entry2)
 	}
+
 	return cands
 }
 
 // excludeReason 返回账号被排除的原因（空 = 入选）；供决策链统计。
-func (p *Pool) excludeReason(e *entry, reqModel, realm string, now time.Time) string {
-	if realm != "" && e.a.Realm() != realm {
+func (p *Pool) excludeReason(entry5 *entry, reqModel, realm string, now time.Time) string {
+	if realm != "" && entry5.a.Realm() != realm {
 		return "realm"
 	}
-	if reqModel != "" && e.modelCooled(now, reqModel) {
+
+	if reqModel != "" && entry5.modelCooled(now, reqModel) {
 		return "model_cooldown"
 	}
-	if !e.healthy(now) {
+
+	if !entry5.healthy(now) {
 		return "cooling"
 	}
-	if p.floorBlockedForRealmModel(e, reqModel, realm, now) {
+
+	if p.floorBlockedForRealmModel(entry5, reqModel, realm, now) {
 		return "credit_floor"
 	}
-	if p.dailyBlocked(e, reqModel, realm, now) {
+
+	if p.dailyBlocked(entry5, reqModel, realm, now) {
 		return "daily_limit"
 	}
-	if p.inFlightFull(e) {
+
+	if p.inFlightFull(entry5) {
 		return "in_flight_full"
 	}
+
 	return ""
 }
 
@@ -188,6 +208,7 @@ func (t *PickTrace) addExcluded(reason string) {
 	if t == nil || t.Excluded == nil {
 		return
 	}
+
 	t.Excluded[reason]++
 }
 
@@ -199,6 +220,7 @@ func maxCreditsOf(cands []*entry) int64 {
 			maxCredits = e.credits
 		}
 	}
+
 	return maxCredits
 }
 
@@ -211,14 +233,16 @@ func maxCreditsOf(cands []*entry) int64 {
 // "无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，若已知收费的号
 // 恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
 func (e *entry) costTier(model string, now time.Time) (int, float64) {
-	mc, ok := e.modelCostOf(model, now)
+	modelCostEntry2, ok := e.modelCostOf(model, now)
 	if !ok {
 		return 1, 0
 	}
-	if mc.CostPer1k <= 0 {
+
+	if modelCostEntry2.CostPer1k <= 0 {
 		return 0, 0
 	}
-	return 2, mc.CostPer1k
+
+	return 2, modelCostEntry2.CostPer1k
 }
 
 // resolveCostTier 计算本次 pick 生效的成本层，并按条件探索（issue #136 方案 a′）
@@ -237,18 +261,23 @@ func (p *Pool) resolveCostTier(cands []*entry, reqModel, realm string, now time.
 			bestTier = ti
 		}
 	}
+
 	if p.costExploreInterval <= 0 || bestTier != 0 || reqModel == "" {
 		return bestTier, false
 	}
+
 	if !anyTier1(cands, reqModel, now) {
 		return bestTier, false
 	}
+
 	key := realm + "\x1f" + reqModel
 	if now.Sub(p.exploreLast[key]) < p.costExploreInterval {
 		return bestTier, false
 	}
+
 	p.exploreLast[key] = now
 	p.costExploreEvents++
+
 	return 1, true
 }
 
@@ -259,6 +288,7 @@ func anyTier1(cands []*entry, model string, now time.Time) bool {
 			return true
 		}
 	}
+
 	return false
 }
 
@@ -278,39 +308,47 @@ type weightedEntry struct {
 }
 
 func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, maxCredits int64, now time.Time) (ordered, top []*entry) {
-	ws := make([]weightedEntry, 0, len(cands))
+	weightedEntries := make([]weightedEntry, 0, len(cands))
 	for _, e := range cands {
 		ti, ci := e.costTier(reqModel, now)
 		if ti == bestTier {
-			ws = append(ws, weightedEntry{e: e, w: p.routingWeightOf(e, maxCredits, reqModel, now), cost1k: ci})
+			weightedEntries = append(weightedEntries, weightedEntry{e: e, w: p.routingWeightOf(e, maxCredits, reqModel, now), cost1k: ci})
 		}
 	}
-	shuffled := len(ws) > 5
+
+	shuffled := len(weightedEntries) > 5
 	if shuffled {
-		shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(ws))))
-		shuf.Shuffle(len(ws), func(i, j int) { ws[i], ws[j] = ws[j], ws[i] })
+		shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(weightedEntries))))
+		shuf.Shuffle(len(weightedEntries), func(i, j int) { weightedEntries[i], weightedEntries[j] = weightedEntries[j], weightedEntries[i] })
 	}
-	sort.SliceStable(ws, func(i, j int) bool {
+
+	sort.SliceStable(weightedEntries, func(i, j int) bool {
 		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
 		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
-		if ws[i].cost1k != ws[j].cost1k {
-			return ws[i].cost1k < ws[j].cost1k // 收费层：单价低的在前
+		if weightedEntries[i].cost1k != weightedEntries[j].cost1k {
+			return weightedEntries[i].cost1k < weightedEntries[j].cost1k // 收费层：单价低的在前
 		}
-		if ws[i].w != ws[j].w {
-			return ws[i].w > ws[j].w
+
+		if weightedEntries[i].w != weightedEntries[j].w {
+			return weightedEntries[i].w > weightedEntries[j].w
 		}
+
 		if shuffled {
 			return false // 保持洗牌后的相对顺序
 		}
-		return ws[i].e.a.UID < ws[j].e.a.UID
+
+		return weightedEntries[i].e.a.UID < weightedEntries[j].e.a.UID
 	})
-	ordered = make([]*entry, len(ws))
-	for i, c := range ws {
+
+	ordered = make([]*entry, len(weightedEntries))
+	for i, c := range weightedEntries {
 		ordered[i] = c.e
 	}
+
 	if len(ordered) > 5 {
 		return ordered, ordered[:5]
 	}
+
 	return ordered, ordered
 }
 
@@ -320,22 +358,25 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Time) *entry {
 	eligible := make([]*entry, 0, len(top))
 	for _, c := range top {
-		if now.Sub(c.lastUsed) >= minPickGap {
+		if now.Sub(c.lastUsed) >= p.pickGap {
 			eligible = append(eligible, c)
 		}
 	}
+
 	if len(eligible) == 0 {
 		// top5 全部刚被用过：LRU 兜底，在**全候选**里选最旧者。用 usedSeq 单调序号
 		// 而非 lastUsed 墙钟比较：Windows 等平台 time.Now() 精度 ~0.5ms，快速连续
 		// 选号时所有 lastUsed 完全相等，Before 全 false 会恒选 ordered[0] 导致集中。
-		e := ordered[0]
+		entry2 := ordered[0]
 		for _, c := range ordered[1:] {
-			if c.usedSeq < e.usedSeq {
-				e = c
+			if c.usedSeq < entry2.usedSeq {
+				entry2 = c
 			}
 		}
-		return e
+
+		return entry2
 	}
+
 	return p.pickWeighted(eligible, model) // eligible 保序 = top5 降序子集
 }
 
@@ -369,6 +410,7 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.creditFloor <= 0 || model == "" || float64(e.credits)-e.reservedCredits >= float64(p.creditFloor) {
 		return false
 	}
+
 	return p.paidModel(e, model, realm, now)
 }
 
@@ -386,14 +428,17 @@ func (p *Pool) paidModel(e *entry, model, realm string, now time.Time) bool {
 	if p.modelRateOf == nil {
 		return false
 	}
+
 	rate := p.modelRateOf(realm, model)
 	if rate == "" {
 		return false // 目录未覆盖：未知，放行
 	}
+
 	v, err := strconv.ParseFloat(rate, 64)
 	if err != nil {
 		return false // 倍率非数值（异常形态）：不据此惩罚账号
 	}
+
 	return v > 0
 }
 
@@ -402,24 +447,28 @@ func (p *Pool) dailyBlocked(e *entry, model, realm string, now time.Time) bool {
 	if p.dailyUsage == nil {
 		return false
 	}
+
 	return p.dailyBlockedUsage(p.dailyUsage(), e, model, realm, now)
 }
 
 // dailyBlockedUsage 用给定当日快照判定：token 达限 → 全模型；积分达限 →
 // 仅收费模型；按模型 token 达限 → 仅该模型。
-func (p *Pool) dailyBlockedUsage(usage map[string]DailyUsage, e *entry, model, realm string, now time.Time) bool {
-	lim := p.dailyLimitsFor(e.a.Realm())
+func (p *Pool) dailyBlockedUsage(usage map[string]DailyUsage, entry3 *entry, model, realm string, now time.Time) bool {
+	lim := p.dailyLimitsFor(entry3.a.Realm())
 	if !lim.enabled() {
 		return false
 	}
-	u := usage[e.a.UID]
-	if lim.Tokens > 0 && u.Tokens >= lim.Tokens {
+
+	dailyUsage := usage[entry3.a.UID]
+	if lim.Tokens > 0 && dailyUsage.Tokens >= lim.Tokens {
 		return true
 	}
-	if lim.ModelTokens > 0 && model != "" && u.Models[model] >= lim.ModelTokens {
+
+	if lim.ModelTokens > 0 && model != "" && dailyUsage.Models[model] >= lim.ModelTokens {
 		return true
 	}
-	return lim.Credits > 0 && u.Credits >= lim.Credits && p.paidModel(e, model, realm, now)
+
+	return lim.Credits > 0 && dailyUsage.Credits >= lim.Credits && p.paidModel(entry3, model, realm, now)
 }
 
 // enabled 报告是否配置了任一每日护栏。
@@ -429,33 +478,41 @@ func (l DailyLimits) enabled() bool { return l.Tokens > 0 || l.Credits > 0 || l.
 func (p *Pool) AllDailyBlocked(model, realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	if p.dailyUsage == nil {
 		return false
 	}
+
 	usage := p.dailyUsage()
 	now := p.now()
 	candidates := 0
-	for _, e := range p.byUID {
-		if e.disabled || e.paused {
+
+	for _, item := range p.byUID {
+		if item.disabled || item.paused {
 			continue
 		}
-		if realm != "" && e.a.Realm() != realm {
+
+		if realm != "" && item.a.Realm() != realm {
 			continue
 		}
+
 		candidates++
 		// 冷却/熔断/模型冷却可能在本地 0 点前恢复：此时应回 503 并由
 		// Retry-After 指向更早的恢复时间，而不是声称「日限到次日」。
 		// 硬冷却（余额耗尽，通常到次日 04:00）晚于日限重置，仍按日限处理。
-		if !e.healthyForModel(now, model) {
-			if resumesBeforeMidnight(e, now, model) {
+		if !item.healthyForModel(now, model) {
+			if resumesBeforeMidnight(item, now, model) {
 				return false
 			}
+
 			continue
 		}
-		if !p.dailyBlockedUsage(usage, e, model, realm, now) {
+
+		if !p.dailyBlockedUsage(usage, item, model, realm, now) {
 			return false
 		}
 	}
+
 	return candidates > 0
 }
 
@@ -463,17 +520,23 @@ func (p *Pool) AllDailyBlocked(model, realm string) bool {
 func (p *Pool) DailyLimitedUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	if p.dailyUsage == nil {
 		return nil
 	}
+
 	usage := p.dailyUsage()
+
 	var out []string
+
 	for uid, e := range p.byUID {
 		if dailyLimitHit(p.dailyLimitsFor(e.a.Realm()), usage[uid]) {
 			out = append(out, uid)
 		}
 	}
+
 	sort.Strings(out)
+
 	return out
 }
 
@@ -483,28 +546,34 @@ func resumesBeforeMidnight(e *entry, now time.Time, model string) bool {
 	if mc, ok := e.modelCooldowns[model]; ok && mc.Until.After(resume) {
 		resume = mc.Until
 	}
+
 	if !resume.After(now) {
 		resume = now
 	}
+
 	midnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+
 	return resume.Before(midnight)
 }
 
 // dailyLimitHit 报告账号是否命中任一日限额（含账号×模型 token）。
-func dailyLimitHit(lim DailyLimits, u DailyUsage) bool {
-	if lim.Tokens > 0 && u.Tokens >= lim.Tokens {
+func dailyLimitHit(lim DailyLimits, dailyUsage DailyUsage) bool {
+	if lim.Tokens > 0 && dailyUsage.Tokens >= lim.Tokens {
 		return true
 	}
-	if lim.Credits > 0 && u.Credits >= lim.Credits {
+
+	if lim.Credits > 0 && dailyUsage.Credits >= lim.Credits {
 		return true
 	}
+
 	if lim.ModelTokens > 0 {
-		for _, tokens := range u.Models {
+		for _, tokens := range dailyUsage.Models {
 			if tokens >= lim.ModelTokens {
 				return true
 			}
 		}
 	}
+
 	return false
 }
 
@@ -519,21 +588,26 @@ func dailyLimitHit(lim DailyLimits, u DailyUsage) bool {
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
 func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
 	var best *entry
-	for uid, e := range p.byUID {
-		if !p.fallbackEligible(e, uid, tried, realm, model, now) {
+
+	for strVal, entry2 := range p.byUID {
+		if !p.fallbackEligible(entry2, strVal, tried, realm, model, now) {
 			continue
 		}
-		exp := e.expiry(now)
+
+		exp := entry2.expiry(now)
 		if exp.IsZero() {
 			continue
 		}
+
 		if best == nil || exp.Before(best.expiry(now)) {
-			best = e
+			best = entry2
 		}
 	}
+
 	if best == nil {
 		return nil
 	}
+
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s",
 		logfmt.Label(best.a.UID, best.a.NicknameValue()), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = p.now()
@@ -546,31 +620,38 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
+
 	return best.a
 }
 
 // fallbackEligible 判定账号是否可参与全冷却兜底：排除 tried/跨域/禁用暂停/
 // 有效 hard 冷却（调了必 402）/积分保底拦截/在途占满。调用方需已持 p.mu。
-func (p *Pool) fallbackEligible(e *entry, uid string, tried map[string]bool, realm, model string, now time.Time) bool {
+func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool, realm, model string, now time.Time) bool {
 	if tried != nil && tried[uid] {
 		return false
 	}
-	if realm != "" && e.a.Realm() != realm {
+
+	if realm != "" && entry2.a.Realm() != realm {
 		return false // 域过滤：池内跨 realm 的冷却账号不参与本 realm 兜底
 	}
-	if e.disabled || e.paused {
+
+	if entry2.disabled || entry2.paused {
 		return false // 禁用/暂停选号的账号永不参与兜底
 	}
-	if e.hardCoolingActive(now) {
+
+	if entry2.hardCoolingActive(now) {
 		return false // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
 	}
-	if p.floorBlockedForRealmModel(e, model, realm, now) {
+
+	if p.floorBlockedForRealmModel(entry2, model, realm, now) {
 		return false // 积分保底：触底号不接收费模型（兜底路径同判据）
 	}
-	if p.dailyBlocked(e, model, realm, now) {
+
+	if p.dailyBlocked(entry2, model, realm, now) {
 		return false // 每日护栏（issue #95）：兜底路径同判据
 	}
-	return p.fallbackLoadOK(e, now)
+
+	return p.fallbackLoadOK(entry2, now)
 }
 
 // fallbackLoadOK 报告兜底候选是否可接收本次探针：不在单飞窗口且未占满在途。
@@ -580,12 +661,13 @@ func (p *Pool) fallbackLoadOK(e *entry, now time.Time) bool {
 
 // inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；
 // limit=0 不限 → 恒 false）。调用方需已持 p.mu（读锁或写锁均可，本方法只读上限）。
-func (p *Pool) inFlightFull(e *entry) bool {
-	limit := p.inFlightLimit(e)
+func (p *Pool) inFlightFull(entry4 *entry) bool {
+	limit := p.inFlightLimit(entry4)
 	if limit <= 0 {
 		return false
 	}
-	return e.inFlight.Load() >= int64(limit)
+
+	return entry4.inFlight.Load() >= int64(limit)
 }
 
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
@@ -604,28 +686,37 @@ var minPickGap = 100 * time.Millisecond
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
 func (p *Pool) pickWeighted(cands []*entry, model string) *entry {
 	now := p.now()
+
 	var maxCredits int64
 	for _, e := range cands {
 		if e.credits > maxCredits {
 			maxCredits = e.credits
 		}
 	}
+
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
+
 	weights := make([]int64, len(cands))
+
 	var total int64
+
 	for i, e := range cands {
 		w := p.routingWeightOf(e, maxCredits, model, now)
 		weights[i] = int64(w * scale)
 		total += weights[i]
 	}
+
 	rnd := rand.Int64N
 	if p.randInt64N != nil {
 		rnd = p.randInt64N
 	}
+
 	if total <= 0 {
 		return cands[int(rnd(int64(len(cands))))]
 	}
+
 	r := rnd(total)
+
 	var acc int64
 	for i, e := range cands {
 		acc += weights[i]
@@ -633,28 +724,32 @@ func (p *Pool) pickWeighted(cands []*entry, model string) *entry {
 			return e
 		}
 	}
+
 	return cands[len(cands)-1]
 }
 
 // weightOf 计算单个账号的普通加权分值（model 用于叠加该模型上的健康降权因子）。
-func (p *Pool) weightOf(e *entry, maxCredits int64, model string, now time.Time) float64 {
+func (p *Pool) weightOf(entry6 *entry, maxCredits int64, model string, now time.Time) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
 	if maxCredits > 0 {
-		w += float64(e.credits) / float64(maxCredits) * 10
+		w += float64(entry6.credits) / float64(maxCredits) * 10
 	}
 	// 2. 闲置补偿。
-	if e.lastUsed.IsZero() {
+	if entry6.lastUsed.IsZero() {
 		w += p.idleWeightMax // 从未使用 → 满分
 	} else {
-		hours := now.Sub(e.lastUsed).Hours()
+		hours := now.Sub(entry6.lastUsed).Hours()
+
 		idleW := hours * p.idleWeightPerHour
 		if idleW > p.idleWeightMax {
 			idleW = p.idleWeightMax
 		}
+
 		if idleW < 0 {
 			idleW = 0 // lastUsed 在未来（时钟回拨）时钳 0
 		}
+
 		w += idleW
 	}
 	// 3.（原「成功率 ×3」因子已删，对齐上游 success-ema-review：errTotal 是终身
@@ -662,9 +757,9 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, model string, now time.Time)
 	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
 	// 4. 实时健康因子（issue #16）：TTFT 慢 / 错误率高的号按模型降权（半衰期衰减，
 	// 可恢复）。无观测时因子恒 1，不改变既有权重。
-	w *= e.healthFactor(model, now)
+	w *= entry6.healthFactor(model, now)
 	// 5. 并发压力（issue #116 P0-2）：在途越接近上限权重越低，死区内不打折。
-	return w * p.pressureFactor(e)
+	return w * p.pressureFactor(entry6)
 }
 
 // expiringNow 报告账号是否存在当前仍有效的快过期积分批次。
@@ -682,6 +777,7 @@ func (p *Pool) routingWeightOf(e *entry, maxCredits int64, model string, now tim
 	if p.preferExpiring && expiringNow(e, now) {
 		return w * expiringVirtualSlots
 	}
+
 	return w
 }
 

@@ -69,31 +69,38 @@ func (c *modelCatalog) initLocked() {
 	if c.loaded {
 		return
 	}
+
 	c.entries = map[string]ModelCapEntry{}
+
 	c.loaded = true
 	if c.path == "" {
 		c.loadSeedLocked()
 		return
 	}
+
 	raw, err := os.ReadFile(c.path)
 	if err != nil {
 		// 不存在 / 不可读 → 种子（首次启动形态）。
 		c.loadSeedLocked()
 		return
 	}
+
 	var file map[string]ModelCapEntry
 	if err := json.Unmarshal(raw, &file); err != nil {
 		// 整体损坏：降级种子 + WARN 不崩溃（任务书 §手动维护入口容错）。
 		log.Printf("WARN: [upstream] model.json 损坏（降级内置种子表）: path=%s err=%v", c.path, err)
 		c.loadSeedLocked()
+
 		return
 	}
-	for id, e := range file {
-		if !validCapEntry(e) {
-			log.Printf("WARN: [upstream] model.json 条目非法剔除: model=%s entry=%+v", id, e)
+
+	for strVal, modelCapEntry := range file {
+		if !validCapEntry(modelCapEntry) {
+			log.Printf("WARN: [upstream] model.json 条目非法剔除: model=%s entry=%+v", strVal, modelCapEntry)
 			continue
 		}
-		c.entries[id] = e
+
+		c.entries[strVal] = modelCapEntry
 	}
 }
 
@@ -105,10 +112,12 @@ func (c *modelCatalog) loadSeedLocked() {
 		// 查找链第 2 级本来就会兜，这里只需保持 entries 为空）。
 		return
 	}
+
 	var seed map[string]ModelCapEntry
 	if err := json.Unmarshal(raw, &seed); err != nil {
 		return
 	}
+
 	for id, e := range seed {
 		if validCapEntry(e) {
 			c.entries[id] = e
@@ -126,25 +135,30 @@ func validCapEntry(e ModelCapEntry) bool {
 func (c *modelCatalog) get(model string) (ModelCapEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	c.initLocked()
+
 	e, ok := c.entries[model]
 	if !ok || !validCapEntry(e) {
-		return ModelCapEntry{}, false
+		return ModelCapEntry{ContextLength: 0, MaxOutputTokens: 0, FetchedAt: "", Source: ""}, false
 	}
+
 	return e, true
 }
 
 // put 写一条缓存（第 4 级拉取成功后调用）并落盘。同模型已存在（用户手动维护过）
 // 仍覆盖——运行时拉取值采信 models.dev 官方源优先口径，比手编更可信；
 // 若不希望覆盖，删掉 model.json 里对应条目即可（加载后手编值只在本次进程生效）。
-func (c *modelCatalog) put(model string, e ModelCapEntry) {
-	if model == "" || !validCapEntry(e) {
+func (c *modelCatalog) put(model string, modelCapEntry ModelCapEntry) {
+	if model == "" || !validCapEntry(modelCapEntry) {
 		return
 	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	c.initLocked()
-	c.entries[model] = e
+	c.entries[model] = modelCapEntry
 	c.saveLocked()
 }
 
@@ -154,18 +168,22 @@ func (c *modelCatalog) saveLocked() {
 	if c.path == "" {
 		return
 	}
+
 	raw, err := json.MarshalIndent(c.entries, "", "  ")
 	if err != nil {
 		return
 	}
+
 	if dir := filepath.Dir(c.path); dir != "" {
 		_ = os.MkdirAll(dir, 0o755)
 	}
+
 	tmp := c.path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		log.Printf("WARN: [upstream] model.json 落盘失败（内存缓存仍生效）: path=%s err=%v", c.path, err)
 		return
 	}
+
 	if err := atomicwrite.Rename(tmp, c.path); err != nil {
 		log.Printf("WARN: [upstream] model.json 落盘改名失败: path=%s err=%v", c.path, err)
 	}
@@ -180,6 +198,7 @@ func SetModelCatalogPath(path string) {
 	c := catalogState
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	c.path = path
 }
 
@@ -205,12 +224,13 @@ func modelCatalogPutSourced(model string, context, maxOutput int64, source strin
 
 // resetModelCatalog 测试隔离：清空单例状态（entries/path/loaded）。
 func resetModelCatalog() {
-	c := catalogState
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.entries = nil
-	c.path = ""
-	c.loaded = false
+	modelCatalog2 := catalogState
+	modelCatalog2.mu.Lock()
+	defer modelCatalog2.mu.Unlock()
+
+	modelCatalog2.entries = nil
+	modelCatalog2.path = ""
+	modelCatalog2.loaded = false
 }
 
 // ResetLookupChainForTest 跨包测试钩子：清空 model.json 缓存与 models.dev fetcher
@@ -234,15 +254,19 @@ func ContextWindowListingV4(model string, remote int64, client *http.Client) int
 	if remote > 0 {
 		return remote
 	}
+
 	if model == "" {
 		return DefaultContextWindow
 	}
+
 	if entry, ok := contextCapFallback[model]; ok && entry.context > 0 {
 		return entry.context // 第 2 级：静态种子表（编译期兜底，永远可用）
 	}
+
 	if e, ok := modelCatalogGet(model); ok {
 		return e.ContextLength // 第 3 级：model.json
 	}
+
 	if !modelsDev.negativeFresh(model) {
 		// 第 4 级触发：先查进程内文档索引（拉过一次即常驻），命中直接入缓存
 		// 返回（不等待异步拉取）；未命中 → 记负缓存 + 异步拉取（本次先回 1M）。
@@ -250,8 +274,10 @@ func ContextWindowListingV4(model string, remote int64, client *http.Client) int
 			modelCatalogPut(model, e.Context, e.Output)
 			return e.Context
 		}
+
 		modelsDev.ensureDocAsync(client, "")
 	}
+
 	return DefaultContextWindow // 第 4 级兜底：1M（本次先回，拉到后下次命中）
 }
 
@@ -261,15 +287,19 @@ func MaxOutputTokensListingV4(model string, remote int64, client *http.Client) (
 	if remote > 0 {
 		return remote, true
 	}
+
 	if model == "" {
 		return 0, false
 	}
+
 	if entry, ok := contextCapFallback[model]; ok && entry.maxOutput > 0 {
 		return entry.maxOutput, true // 第 2 级
 	}
+
 	if e, ok := modelCatalogGet(model); ok && e.MaxOutputTokens > 0 {
 		return e.MaxOutputTokens, true // 第 3 级
 	}
+
 	if !modelsDev.negativeFresh(model) {
 		// 与 ContextWindowListingV4 同触发：lookup 命中先入缓存再返回
 		// （两条查找链并发 miss 同一模型时，第二调用方直接拿到刚写入的值）。
@@ -277,8 +307,10 @@ func MaxOutputTokensListingV4(model string, remote int64, client *http.Client) (
 			modelCatalogPut(model, e.Context, e.Output)
 			return e.Output, e.Output > 0
 		}
+
 		modelsDev.ensureDocAsync(client, "")
 	}
+
 	return 0, false // 第 4 级兜底：省略（输出上限不编造）
 }
 
@@ -290,19 +322,23 @@ func MaxOutputTokensListingV4(model string, remote int64, client *http.Client) (
 func (f *modelsDevFetcher) backfillMisses() {
 	f.mu.Lock()
 	doc := f.doc
+
 	missed := make([]string, 0, len(f.negatives))
 	for m := range f.negatives {
 		missed = append(missed, m)
 	}
 	f.mu.Unlock()
+
 	if doc == nil {
 		return
 	}
+
 	for _, m := range missed {
 		e, ok := doc[m]
 		if !ok {
 			continue // 仍查不到：负缓存 24h 生效，不写
 		}
+
 		modelCatalogPut(m, e.Context, e.Output)
 		// 回流成功：清除负缓存条目（该模型已有值，后续走第 3 级缓存，
 		// 不再进本清单）。

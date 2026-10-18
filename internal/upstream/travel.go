@@ -5,6 +5,7 @@ package upstream
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -51,10 +52,12 @@ func (c *Client) TravelStatus(a *auth.Auth) (*TravelState, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var st TravelState
 	if err := json.Unmarshal(data, &st); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("TravelStatus: %w", err)
 	}
+
 	return &st, nil
 }
 
@@ -70,6 +73,7 @@ func (c *Client) TravelClaim(a *auth.Auth, recordID int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+
 	var resp struct {
 		RewardCredit int64 `json:"reward_credit"`
 	}
@@ -77,6 +81,7 @@ func (c *Client) TravelClaim(a *auth.Auth, recordID int64) (int64, error) {
 		// 奖励字段缺失不视为失败：调用方按 0 记日志即可。
 		_ = json.Unmarshal(data, &resp)
 	}
+
 	return resp.RewardCredit, nil
 }
 
@@ -86,21 +91,24 @@ func (c *Client) BuddyInfo(a *auth.Auth) (*Buddy, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	var resp struct {
 		Buddy json.RawMessage `json:"buddy"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("BuddyInfo: %w", err)
 	}
 	// null / 缺字段 / 空对象都按无猫处理。
 	trimmed := strings.TrimSpace(string(resp.Buddy))
 	if trimmed == "" || trimmed == "null" {
 		return nil, nil //nolint:nilnil // 无猫状态返回 (nil,nil)，调用方以 nil 判定
 	}
+
 	var b Buddy
 	if err := json.Unmarshal(resp.Buddy, &b); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("BuddyInfo: %w", err)
 	}
+
 	return &b, nil
 }
 
@@ -126,14 +134,16 @@ func (c *Client) GrowthStreak(a *auth.Auth) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
 	var resp struct {
 		Streak struct {
 			Days int `json:"days"`
 		} `json:"streak"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("GrowthStreak: %w", err)
 	}
+
 	return resp.Streak.Days, nil
 }
 
@@ -143,9 +153,11 @@ func IsBuddyTaskIncomplete(err error) bool {
 	if err == nil {
 		return false
 	}
+
 	var ue *Error
 	if !errors.As(err, &ue) || ue.Status != http.StatusBadRequest {
 		return false
 	}
+
 	return strings.Contains(strings.ToLower(ue.Msg), buddyTaskIncompleteMarker)
 }

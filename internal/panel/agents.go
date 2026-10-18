@@ -16,10 +16,12 @@ func (p *Panel) agentsStatus(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "仅允许本机回环访问")
 		return
 	}
+
 	if p.cfg.Agents == nil {
 		writeErr(w, http.StatusNotImplemented, "agent config manager not available")
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"clients": p.cfg.Agents.Status()})
 }
 
@@ -29,25 +31,30 @@ func (p *Panel) agentsApply(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "仅允许本机回环访问")
 		return
 	}
+
 	if p.cfg.Agents == nil {
 		writeErr(w, http.StatusNotImplemented, "agent config manager not available")
 		return
 	}
+
 	var opts agentcfg.Options
 	if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	st, err := p.cfg.Agents.Apply(r.PathValue("client"), opts)
+
+	status, err := p.cfg.Agents.Apply(r.PathValue("client"), opts)
 	if errors.Is(err, agentcfg.ErrModified) {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
+
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"client": st})
+
+	writeJSON(w, http.StatusOK, map[string]any{"client": status})
 }
 
 // agentsRestore 还原首次写入前的配置。
@@ -56,27 +63,34 @@ func (p *Panel) agentsRestore(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "仅允许本机回环访问")
 		return
 	}
+
 	if p.cfg.Agents == nil {
 		writeErr(w, http.StatusNotImplemented, "agent config manager not available")
 		return
 	}
+
 	var body struct {
 		Force bool `json:"force"`
 	}
+
 	_ = json.NewDecoder(r.Body).Decode(&body)
+
 	err := p.cfg.Agents.Restore(r.PathValue("client"), body.Force)
 	if errors.Is(err, agentcfg.ErrModified) {
 		writeErr(w, http.StatusConflict, err.Error())
 		return
 	}
+
 	if errors.Is(err, agentcfg.ErrNotApplied) {
 		writeErr(w, http.StatusNotFound, err.Error())
 		return
 	}
+
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -86,6 +100,8 @@ func loopbackRequest(r *http.Request) bool {
 	if err != nil {
 		host = r.RemoteAddr
 	}
+
 	ip := net.ParseIP(host)
+
 	return ip != nil && ip.IsLoopback()
 }

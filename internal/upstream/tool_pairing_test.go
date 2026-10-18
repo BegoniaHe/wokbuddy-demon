@@ -14,10 +14,12 @@ import (
 // msgs 解析测试用的 messages JSON 数组。
 func msgs(t *testing.T, s string) []any {
 	t.Helper()
+
 	var v []any
 	if err := json.Unmarshal([]byte(s), &v); err != nil {
 		t.Fatalf("parse messages: %v", err)
 	}
+
 	return v
 }
 
@@ -31,13 +33,17 @@ func summarize(messages []any) []string {
 			out = append(out, "<non-object>")
 			continue
 		}
+
 		role, _ := msg["role"].(string)
 		if role == "tool" {
 			id, _ := msg["tool_call_id"].(string)
 			out = append(out, "tool("+id+")")
+
 			continue
 		}
+
 		ids := []string{}
+
 		if tcs, ok := msg["tool_calls"].([]any); ok {
 			for _, tci := range tcs {
 				if tc, ok := tci.(map[string]any); ok {
@@ -46,20 +52,25 @@ func summarize(messages []any) []string {
 				}
 			}
 		}
+
 		if len(ids) > 0 {
 			out = append(out, role+"("+strings.Join(ids, ",")+")")
 			continue
 		}
+
 		out = append(out, role+"(-)")
 	}
+
 	return out
 }
 
 func assertSummary(t *testing.T, got, want []string) {
 	t.Helper()
+
 	if len(got) != len(want) {
 		t.Fatalf("消息数不符:\n got %v\nwant %v", got, want)
 	}
+
 	for i := range got {
 		if got[i] != want[i] {
 			t.Errorf("消息[%d] = %s want %s\n got %v\nwant %v", i, got[i], want[i], got, want)
@@ -72,15 +83,43 @@ func assertSummary(t *testing.T, got, want []string) {
 // 这是部分 OpenAI 兼容 agent 客户端回放并行工具调用的报文形状（同一批调用
 // 拆成多条独立 assistant 消息），上游 deepseek 系模型对它判 11148。
 func TestMergeAdjacentToolCalls(t *testing.T) {
-	t.Run("并行两条合成一条（修复目标形态）", testMergeAdjacentParallelTwo)
-	t.Run("三条连续全并", testMergeAdjacentThree)
-	t.Run("已是规范形态原样返回且零改动", testMergeAdjacentCanonical)
-	t.Run("中间隔着消息不合并（非背靠背）", testMergeAdjacentSeparated)
-	t.Run("后一条 content 非空不合并", testMergeAdjacentNonEmptyContent)
-	t.Run("前一条无 tool_calls 不合并", testMergeAdjacentNoPrevCalls)
-	t.Run("reasoning_content 逐条保留（换行拼接）", testMergeAdjacentReasoning)
-	t.Run("首条即 assistant.tool_calls 不越界", testMergeAdjacentSingle)
-	t.Run("非对象元素原样保留且不阻断后续合并", testMergeAdjacentNonObject)
+	t.Parallel()
+	t.Run("并行两条合成一条（修复目标形态）", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentParallelTwo(t)
+	})
+	t.Run("三条连续全并", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentThree(t)
+	})
+	t.Run("已是规范形态原样返回且零改动", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentCanonical(t)
+	})
+	t.Run("中间隔着消息不合并（非背靠背）", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentSeparated(t)
+	})
+	t.Run("后一条 content 非空不合并", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentNonEmptyContent(t)
+	})
+	t.Run("前一条无 tool_calls 不合并", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentNoPrevCalls(t)
+	})
+	t.Run("reasoning_content 逐条保留（换行拼接）", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentReasoning(t)
+	})
+	t.Run("首条即 assistant.tool_calls 不越界", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentSingle(t)
+	})
+	t.Run("非对象元素原样保留且不阻断后续合并", func(t *testing.T) {
+		t.Parallel()
+		testMergeAdjacentNonObject(t)
+	})
 }
 
 const (
@@ -93,10 +132,12 @@ const (
 func testMergeAdjacentParallelTwo(t *testing.T) {
 	// 输入即线上复现 11148 的报文：assistant(c00) 之后紧跟 assistant(c01)。
 	in := msgs(t, "["+tpANil+","+tpAC01+","+tpTC00+","+tpTC01+"]")
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if !changed {
 		t.Fatal("changed=false，期望发生合并")
 	}
+
 	assertSummary(t, summarize(out), []string{"assistant(c00,c01)", "tool(c00)", "tool(c01)"})
 	// 拼接顺序必须是声明顺序（= 结果的 wire 顺序），不得反转。
 	tcs := out[0].(map[string]any)["tool_calls"].([]any)
@@ -108,10 +149,12 @@ func testMergeAdjacentParallelTwo(t *testing.T) {
 func testMergeAdjacentThree(t *testing.T) {
 	aC02 := `{"role":"assistant","content":null,"tool_calls":[{"id":"c02","type":"function","function":{"name":"f","arguments":"{}"}}]}`
 	in := msgs(t, "["+tpANil+","+tpAC01+","+aC02+"]")
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if !changed {
 		t.Fatal("changed=false，期望发生合并")
 	}
+
 	assertSummary(t, summarize(out), []string{"assistant(c00,c01,c02)"})
 }
 
@@ -119,49 +162,59 @@ func testMergeAdjacentCanonical(t *testing.T) {
 	// chat 规范形态（一条 assistant 带全部 tool_calls）：不得改动，便于上层判断 no-op。
 	merged := `{"role":"assistant","content":null,"tool_calls":[{"id":"c00"},{"id":"c01"}]}`
 	in := msgs(t, "["+merged+","+tpTC00+","+tpTC01+"]")
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if changed {
 		t.Error("changed=true，规范形态不应被改动")
 	}
+
 	assertSummary(t, summarize(out), []string{"assistant(c00,c01)", "tool(c00)", "tool(c01)"})
 }
 
 func testMergeAdjacentSeparated(t *testing.T) {
 	// 隔了 user 消息 = 两条独立声明，不是同一批；擅自合并会改变语义。
 	in := msgs(t, "["+tpANil+`,{"role":"user","content":"x"},`+tpAC01+","+tpTC00+","+tpTC01+"]")
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if changed {
 		t.Error("changed=true，非相邻不应合并")
 	}
+
 	assertSummary(t, summarize(out), []string{"assistant(c00)", "user(-)", "assistant(c01)", "tool(c00)", "tool(c01)"})
 }
 
 func testMergeAdjacentNonEmptyContent(t *testing.T) {
 	// content 非空无法无损拼接：不猜语义，原样交给上游。
 	in := msgs(t, "["+tpANil+`,{"role":"assistant","content":"text","tool_calls":[{"id":"c01"}]}`+"]")
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if changed {
 		t.Error("changed=true，content 非空不应合并")
 	}
+
 	assertSummary(t, summarize(out), []string{"assistant(c00)", "assistant(c01)"})
 }
 
 func testMergeAdjacentNoPrevCalls(t *testing.T) {
 	in := msgs(t, `[{"role":"assistant","content":"hi"},`+tpANil+"]")
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if changed {
 		t.Error("changed=true，前一条无 tool_calls 不应合并")
 	}
+
 	assertSummary(t, summarize(out), []string{"assistant(-)", "assistant(c00)"})
 }
 
 func testMergeAdjacentReasoning(t *testing.T) {
 	// deepseek 多轮要求 assistant 带回填思维链，丢弃会换一个错误，故必须搬过去。
 	in := msgs(t, `[{"role":"assistant","content":null,"reasoning_content":"r1","tool_calls":[{"id":"c00"}]},{"role":"assistant","content":null,"reasoning_content":"r2","tool_calls":[{"id":"c01"}]}]`)
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if !changed {
 		t.Fatal("changed=false，期望合并")
 	}
+
 	rc, _ := out[0].(map[string]any)["reasoning_content"].(string)
 	if rc != "r1\nr2" {
 		t.Errorf("reasoning_content = %q want %q", rc, "r1\nr2")
@@ -173,15 +226,18 @@ func testMergeAdjacentSingle(t *testing.T) {
 	if changed {
 		t.Error("单条消息不应改动")
 	}
+
 	assertSummary(t, summarize(out), []string{"assistant(c00)"})
 }
 
 func testMergeAdjacentNonObject(t *testing.T) {
 	in := msgs(t, `["str",`+tpANil+","+tpAC01+"]")
+
 	out, changed := mergeAdjacentToolCalls(in)
 	if !changed {
 		t.Fatal("changed=false，期望 aNil/aC01 合并")
 	}
+
 	assertSummary(t, summarize(out), []string{"<non-object>", "assistant(c00,c01)"})
 }
 
@@ -191,6 +247,8 @@ func testMergeAdjacentNonObject(t *testing.T) {
 // 断言的正是线上对照实验的结论：合成一条 assistant（本测试期望的输出形态）→ 200；
 // 拆成两条 → deepseek 系模型 503/11148。
 func TestPrepareBodyMergesSplitParallelToolCalls(t *testing.T) {
+	t.Parallel()
+
 	body := `{"model":"deepseek-v4.1-flash","messages":[
 		{"role":"user","content":"跑两个命令"},
 		{"role":"assistant","content":null,"tool_calls":[{"id":"call_00_a","type":"function","function":{"name":"exec_command","arguments":"{\"cmd\":\"pwd\"}"}}]},
@@ -199,50 +257,61 @@ func TestPrepareBodyMergesSplitParallelToolCalls(t *testing.T) {
 		{"role":"tool","tool_call_id":"call_01_b","content":"a b c"}
 	]}`
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+
 	var obj map[string]any
 	if err := json.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal 出站 body: %v", err)
 	}
+
 	messages, _ := obj["messages"].([]any)
 	assertSummary(t, summarize(messages), []string{
 		"user(-)", "assistant(call_00_a,call_01_b)", "tool(call_00_a)", "tool(call_01_b)",
 	})
 	// 逐条复核：不得出现「带 tool_calls 的 assistant 紧跟另一条带 tool_calls 的 assistant」。
 	prevHadCalls := false
+
 	for i, m := range messages {
 		msg, _ := m.(map[string]any)
+
 		hasCalls := false
 		if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
 			hasCalls = true
 		}
+
 		if prevHadCalls && hasCalls {
 			t.Fatalf("消息[%d] 仍是两条相邻的 assistant.tool_calls（上游判 11148）: %v", i, summarize(messages))
 		}
+
 		prevHadCalls = hasCalls
 	}
 }
 
 // TestRepackToolResultBlocks 结果之间的插入消息必须挪到整组之后（上游判配对断裂的另一形态）。
 func TestRepackToolResultBlocks(t *testing.T) {
+	t.Parallel()
 	t.Run("插在结果中间的消息后移", func(t *testing.T) {
-		in := msgs(t, `[
+		t.Parallel()
+		ifaces := msgs(t, `[
 			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"},{"id":"c01"}]},
 			{"role":"tool","tool_call_id":"c00","content":"r0"},
 			{"role":"system","content":"<image_resize_notice>"},
 			{"role":"tool","tool_call_id":"c01","content":"r1"}
 		]`)
-		out, changed := repackToolResultBlocks(in)
+
+		out, changed := repackToolResultBlocks(ifaces)
 		if !changed {
 			t.Fatal("changed=false，期望重排")
 		}
+
 		assertSummary(t, summarize(out), []string{"assistant(c00,c01)", "tool(c00)", "tool(c01)", "system(-)"})
 	})
 
 	t.Run("下一组组头不被吞掉", func(t *testing.T) {
+		t.Parallel()
 		// 真实会话漏排的形态：第一组结果后跟着插入消息、再接第二组组头。组头必须交还外层
 		// 循环当组头处理——否则它会被当成插入物挪走，它自己那批结果（t(c10) 与 t(c11)
 		// 之间夹着 system）永远得不到重排，上游判配对断裂。
-		in := msgs(t, `[
+		ifaces := msgs(t, `[
 			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
 			{"role":"tool","tool_call_id":"c00","content":"r0"},
 			{"role":"system","content":"notice1"},
@@ -251,10 +320,12 @@ func TestRepackToolResultBlocks(t *testing.T) {
 			{"role":"system","content":"notice2"},
 			{"role":"tool","tool_call_id":"c11","content":"r11"}
 		]`)
-		out, changed := repackToolResultBlocks(in)
+
+		out, changed := repackToolResultBlocks(ifaces)
 		if !changed {
 			t.Fatal("changed=false，第二组的插入消息应被后移")
 		}
+
 		assertSummary(t, summarize(out), []string{
 			"assistant(c00)", "tool(c00)", "system(-)",
 			"assistant(c10,c11)", "tool(c10)", "tool(c11)", "system(-)",
@@ -262,10 +333,12 @@ func TestRepackToolResultBlocks(t *testing.T) {
 	})
 
 	t.Run("无可重排内容时零改动", func(t *testing.T) {
+		t.Parallel()
 		in := msgs(t, `[
 			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
 			{"role":"tool","tool_call_id":"c00","content":"r0"}
 		]`)
+
 		_, changed := repackToolResultBlocks(in)
 		if changed {
 			t.Error("changed=true，规范形态不应重排")
@@ -275,64 +348,81 @@ func TestRepackToolResultBlocks(t *testing.T) {
 
 // TestCleanupOrphanToolCalls 缺一侧的配对必须两侧同口径剔除（否则残留半截配对 → 11148）。
 func TestCleanupOrphanToolCalls(t *testing.T) {
+	t.Parallel()
 	t.Run("批内部分缺结果：调用侧对称裁剪", func(t *testing.T) {
+		t.Parallel()
 		// 历史缺陷形态：批 [c1,c2] 只回了 c1 时整批删调用、却留下 tool{c1}，
 		// 出站变成「无 tool_calls 的 assistant + 孤儿 tool」→ 11148。
 		in := msgs(t, `[
 			{"role":"assistant","content":null,"tool_calls":[{"id":"c1"},{"id":"c2"}]},
 			{"role":"tool","tool_call_id":"c1","content":"r1"}
 		]`)
+
 		out, changed := cleanupOrphanToolCalls(in)
 		if !changed {
 			t.Fatal("changed=false，期望裁剪")
 		}
+
 		assertSummary(t, summarize(out), []string{"assistant(c1)", "tool(c1)"})
 	})
 
 	t.Run("调用无任何结果：删 tool_calls 键", func(t *testing.T) {
+		t.Parallel()
 		in := msgs(t, `[{"role":"assistant","content":"hi","tool_calls":[{"id":"c1"}]}]`)
+
 		out, changed := cleanupOrphanToolCalls(in)
 		if !changed {
 			t.Fatal("changed=false，期望删除 tool_calls")
 		}
+
 		msg := out[0].(map[string]any)
 		if _, has := msg["tool_calls"]; has {
 			t.Error("孤儿调用应删除整个 tool_calls 键")
 		}
+
 		if msg["content"] != "hi" {
 			t.Errorf("content 被误改: %v", msg["content"])
 		}
 	})
 
 	t.Run("孤儿结果整条删除", func(t *testing.T) {
+		t.Parallel()
 		in := msgs(t, `[{"role":"user","content":"x"},{"role":"tool","tool_call_id":"c9","content":"r"}]`)
+
 		out, changed := cleanupOrphanToolCalls(in)
 		if !changed {
 			t.Fatal("changed=false，期望删除孤儿结果")
 		}
+
 		assertSummary(t, summarize(out), []string{"user(-)"})
 	})
 
 	t.Run("完整配对零改动", func(t *testing.T) {
-		in := msgs(t, `[
+		t.Parallel()
+		ifaces := msgs(t, `[
 			{"role":"assistant","content":null,"tool_calls":[{"id":"c1"},{"id":"c2"}]},
 			{"role":"tool","tool_call_id":"c1","content":"r1"},
 			{"role":"tool","tool_call_id":"c2","content":"r2"}
 		]`)
-		out, changed := cleanupOrphanToolCalls(in)
+
+		out, changed := cleanupOrphanToolCalls(ifaces)
 		if changed {
 			t.Error("changed=true，完整配对不应改动")
 		}
+
 		assertSummary(t, summarize(out), []string{"assistant(c1,c2)", "tool(c1)", "tool(c2)"})
 	})
 
 	t.Run("无工具流量零改动", func(t *testing.T) {
+		t.Parallel()
+
 		if _, changed := cleanupOrphanToolCalls(msgs(t, `[{"role":"user","content":"x"}]`)); changed {
 			t.Error("changed=true，无工具流量不应改动")
 		}
 	})
 
 	t.Run("空 id 双侧不识别为工具流量", func(t *testing.T) {
+		t.Parallel()
 		// 已知边界：id 为空的配对无法按 id 判定，两侧都不计入工具流量 → 原样透传。
 		// 这是刻意保留的行为（不猜哪条结果属于哪条调用），此处钉桩以免被误改。
 		in := msgs(t, `[
@@ -349,19 +439,23 @@ func TestCleanupOrphanToolCalls(t *testing.T) {
 // 有客户端把"没有正文"发成 `content: []`（而不是 null），此前 emptyContent 只认
 // nil / 空串 → 背靠背的 assistant(tool_calls) 不合并 → 上游 deepseek 系判 11148。
 func TestMergeAdjacentToolCallsEmptyArrayContent(t *testing.T) {
-	in := msgs(t, `[
+	t.Parallel()
+	ifaces := msgs(t, `[
 		{"role":"assistant","content":[],"tool_calls":[{"id":"c1","type":"function","function":{"name":"A","arguments":"{}"}}]},
 		{"role":"assistant","content":[],"tool_calls":[{"id":"c2","type":"function","function":{"name":"B","arguments":"{}"}}]},
 		{"role":"tool","tool_call_id":"c1","content":"r1"},
 		{"role":"tool","tool_call_id":"c2","content":"r2"}
 	]`)
-	out, changed := mergeAdjacentToolCalls(in)
+
+	out, changed := mergeAdjacentToolCalls(ifaces)
 	if !changed {
 		t.Fatal("content:[] 的两条 assistant(tool_calls) 未合并（11148 残留形态）")
 	}
+
 	if len(out) != 3 {
 		t.Fatalf("合并后长度 = %d, want 3", len(out))
 	}
+
 	tcs, _ := out[0].(map[string]any)["tool_calls"].([]any)
 	if len(tcs) != 2 {
 		t.Fatalf("首条 tool_calls = %d, want 2", len(tcs))
@@ -373,14 +467,17 @@ func TestMergeAdjacentToolCallsEmptyArrayContent(t *testing.T) {
 		{"role":"assistant","content":[{"type":"text","text":"hi"}],"tool_calls":[{"id":"c1","type":"function","function":{"name":"A","arguments":"{}"}}]},
 		{"role":"assistant","content":[],"tool_calls":[{"id":"c2","type":"function","function":{"name":"B","arguments":"{}"}}]}
 	]`)
+
 	out2, changed2 := mergeAdjacentToolCalls(in2)
 	if !changed2 {
 		t.Fatal("后一条 content 为空数组时应合并")
 	}
+
 	first, _ := out2[0].(map[string]any)
 	if c, ok := first["content"].([]any); !ok || len(c) != 1 {
 		t.Fatalf("合并后前一条 content 丢失: %#v", first["content"])
 	}
+
 	if tcs, _ := first["tool_calls"].([]any); len(tcs) != 2 {
 		t.Fatalf("合并后 tool_calls = %d, want 2", len(tcs))
 	}
@@ -390,22 +487,27 @@ func TestMergeAdjacentToolCallsEmptyArrayContent(t *testing.T) {
 // 本条是纯正文 assistant（正文排在工具调用之后）——折进前一条，合成
 // assistant(正文 + tool_calls)，让"工具调用紧跟自己的结果"在两种拆分顺序下都成立。
 func TestFoldTextIntoPrevToolCall(t *testing.T) {
-	in := msgs(t, `[
+	t.Parallel()
+	ifaces := msgs(t, `[
 		{"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"A","arguments":"{}"}}]},
 		{"role":"assistant","content":"我来解释一下"},
 		{"role":"tool","tool_call_id":"c1","content":"r1"}
 	]`)
-	out, changed := mergeAdjacentToolCalls(in)
+
+	out, changed := mergeAdjacentToolCalls(ifaces)
 	if !changed {
 		t.Fatal("正文未折进前一条工具调用")
 	}
+
 	if len(out) != 2 {
 		t.Fatalf("合并后长度 = %d, want 2", len(out))
 	}
+
 	first, _ := out[0].(map[string]any)
 	if first["content"] != "我来解释一下" {
 		t.Fatalf("content = %#v, want 正文", first["content"])
 	}
+
 	if tcs, _ := first["tool_calls"].([]any); len(tcs) != 1 {
 		t.Fatalf("tool_calls = %d, want 1", len(tcs))
 	}
@@ -449,31 +551,38 @@ func TestFoldTextIntoPrevToolCall(t *testing.T) {
 // 边界与既有「空 id 双侧不识别」用例同理：function 或 name 字段缺失的占位条目
 // 不判脏（toolCallNameEmpty 只认「function 存在且 name 为空白串」），避免扩大打击面。
 func TestCleanupOrphanToolCallsEmptyName(t *testing.T) {
+	t.Parallel()
 	t.Run("空name带结果：调用与结果成对剔除，assistant保留", func(t *testing.T) {
-		in := msgs(t, `[
+		t.Parallel()
+		ifaces := msgs(t, `[
 {"role":"user","content":"q"},
 {"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"","arguments":"{}"}}]},
 {"role":"tool","tool_call_id":"c1","content":"r1"},
 {"role":"user","content":"next"}
 ]`)
-		out, changed := cleanupOrphanToolCalls(in)
+
+		out, changed := cleanupOrphanToolCalls(ifaces)
 		if !changed {
 			t.Fatal("changed=false，期望剔除空 name 调用")
 		}
+
 		assertSummary(t, summarize(out), []string{"user(-)", "assistant(-)", "user(-)"})
 	})
 
 	t.Run("空name且无结果：仍走孤儿路径删除", func(t *testing.T) {
+		t.Parallel()
 		// 回归钉桩：若改成「空 name 不登记 callIDs」，hasTraffic 会被判 false 早退，
 		// 该脏条目反而漏出站。必须仍删除。
 		in := msgs(t, `[
 {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"","arguments":"{}"}}]},
 {"role":"user","content":"go"}
 ]`)
+
 		out, changed := cleanupOrphanToolCalls(in)
 		if !changed {
 			t.Fatal("changed=false，期望删除空 name 孤儿调用")
 		}
+
 		msg := out[0].(map[string]any)
 		if _, has := msg["tool_calls"]; has {
 			t.Error("空 name 孤儿调用的 tool_calls 键应被删除")
@@ -481,19 +590,23 @@ func TestCleanupOrphanToolCallsEmptyName(t *testing.T) {
 	})
 
 	t.Run("纯空白name判脏", func(t *testing.T) {
+		t.Parallel()
 		in := msgs(t, `[
 {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"   ","arguments":"{}"}}]},
 {"role":"tool","tool_call_id":"c1","content":"r1"}
 ]`)
+
 		out, changed := cleanupOrphanToolCalls(in)
 		if !changed {
 			t.Fatal("changed=false，纯空白 name 应与空串同判")
 		}
+
 		assertSummary(t, summarize(out), []string{"assistant(-)"})
 	})
 
 	t.Run("批内混合：只剔脏项，健康项不动", func(t *testing.T) {
-		in := msgs(t, `[
+		t.Parallel()
+		ifaces := msgs(t, `[
 {"role":"assistant","content":null,"tool_calls":[
 {"id":"c1","type":"function","function":{"name":"","arguments":"{}"}},
 {"id":"c2","type":"function","function":{"name":"read","arguments":"{}"}}
@@ -501,25 +614,30 @@ func TestCleanupOrphanToolCallsEmptyName(t *testing.T) {
 {"role":"tool","tool_call_id":"c1","content":"r1"},
 {"role":"tool","tool_call_id":"c2","content":"r2"}
 ]`)
-		out, changed := cleanupOrphanToolCalls(in)
+
+		out, changed := cleanupOrphanToolCalls(ifaces)
 		if !changed {
 			t.Fatal("changed=false，期望对称裁剪脏项")
 		}
+
 		assertSummary(t, summarize(out), []string{"assistant(c2)", "tool(c2)"})
 	})
 
 	t.Run("function或name缺失不判脏（不扩大打击面）", func(t *testing.T) {
+		t.Parallel()
 		// 与既有 TestCleanupOrphanToolCalls 各子用例口径一致：无 function 字段的
 		// 占位条目仍按原配对规则处理，空 name 判定不误伤。
-		in := msgs(t, `[
+		ifaces := msgs(t, `[
 {"role":"assistant","content":null,"tool_calls":[{"id":"c1"},{"id":"c2"}]},
 {"role":"tool","tool_call_id":"c1","content":"r1"},
 {"role":"tool","tool_call_id":"c2","content":"r2"}
 ]`)
-		out, changed := cleanupOrphanToolCalls(in)
+
+		out, changed := cleanupOrphanToolCalls(ifaces)
 		if changed {
 			t.Error("changed=true，缺 function 字段不应判脏")
 		}
+
 		assertSummary(t, summarize(out), []string{"assistant(c1,c2)", "tool(c1)", "tool(c2)"})
 	})
 }

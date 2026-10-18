@@ -55,12 +55,20 @@ var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
 // exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
 var exitFunc = os.Exit
 
+var (
+	errDoJSONFailed             = errors.New("doJSON failed")
+	errRealmRequiresAValue      = errors.New("--realm requires a value")
+	errParseRealmArgsFailed     = errors.New("parseRealmArgs failed")
+	errValidateRealmMatchFailed = errors.New("validateRealmMatch failed")
+)
+
 // realmConfig 按 realm 返回上游 base 与 Origin/Referer origin：global →
 // (www.workbuddy.ai, www.workbuddy.ai)；cn/非法/缺省 → (copilot.tencent.com, codebuddy.cn)。
 func realmConfig(realm string) (base, origin string) {
 	if realm == realmGlobal {
 		return upstreamBaseGlobal, originRefererGlobal
 	}
+
 	return upstreamBaseCN, originRefererCN
 }
 
@@ -71,6 +79,7 @@ func authPlatform(realm string) string {
 	if realm == realmGlobal {
 		return "workbuddy-ai"
 	}
+
 	return "workbuddy"
 }
 
@@ -110,33 +119,40 @@ type apiEnvelope struct {
 func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
 	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
+
 	if headers != nil {
 		headers(req)
 	} else {
 		// 缺省头：CN origin（与原 commonHeaders() 行为一致，零回归）
 		commonHeaders(originRefererCN)(req)
 	}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
 	defer resp.Body.Close()
+
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %w", resp.StatusCode, errDoJSONFailed)
 	}
+
 	if resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream redirect %d", resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream redirect %d: %w", resp.StatusCode, errDoJSONFailed)
 	}
+
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
 	}
+
 	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s", env.Code, env.Msg)
+		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s: %w", env.Code, env.Msg, errDoJSONFailed)
 	}
+
 	return env.Data, resp.StatusCode, nil
 }
 
@@ -175,29 +191,38 @@ const (
 // 大小写不敏感归一化；非法值/缺值报错。桌椅剩余参数（子命令）顺序不变。
 func parseRealmArgs(args []string) (realm string, rest []string, err error) {
 	realm = realmCN
+
 	for i := 0; i < len(args); i++ {
-		a := args[i]
+		str := args[i]
 		switch {
-		case a == "--realm":
+		case str == "--realm":
 			if i+1 >= len(args) {
-				return "", nil, errors.New("--realm requires a value")
+				return "", nil, errRealmRequiresAValue
 			}
-			v := strings.ToLower(strings.TrimSpace(args[i+1])) //nolint:gosec // 上方已校验 i+1 < len(args)
-			if v != realmCN && v != realmGlobal {
-				return "", nil, fmt.Errorf("invalid --realm %q (want cn|global)", args[i+1]) //nolint:gosec // 同上
+
+			realmValue := strings.ToLower(strings.TrimSpace(args[i+1])) //nolint:gosec // 上方已校验 i+1 < len(args)
+			if realmValue != realmCN && realmValue != realmGlobal {
+				return "", nil, fmt.Errorf(
+					"invalid --realm %q (want cn|global): %w",
+					args[i+1], //nolint:gosec // 上方已校验 i+1 < len(args)
+					errParseRealmArgsFailed,
+				)
 			}
-			realm = v
+
+			realm = realmValue
 			i++
-		case strings.HasPrefix(a, "--realm="):
-			v := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(a, "--realm=")))
+		case strings.HasPrefix(str, "--realm="):
+			v := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(str, "--realm=")))
 			if v != realmCN && v != realmGlobal {
-				return "", nil, fmt.Errorf("invalid --realm %q (want cn|global)", v)
+				return "", nil, fmt.Errorf("invalid --realm %q (want cn|global): %w", v, errParseRealmArgsFailed)
 			}
+
 			realm = v
 		default:
-			rest = append(rest, a)
+			rest = append(rest, str)
 		}
 	}
+
 	return realm, rest, nil
 }
 
@@ -214,6 +239,7 @@ func resolveRealmInput(input string) (string, bool) {
 	case "2", "global":
 		return realmGlobal, true
 	}
+
 	return "", false
 }
 
@@ -221,15 +247,19 @@ func resolveRealmInput(input string) (string, bool) {
 // 从 in 读一行，返回归一化 realm。非法输入警告后回落 cn；EOF（非交互/管道）回落 cn。
 func promptRealm(in io.Reader, out io.Writer) string {
 	fmt.Fprintln(out, "选择登录版本: 1) 国内版(cn) 2) 国际版(global) [默认 1/cn]: ")
+
 	line, err := bufio.NewReader(in).ReadString('\n')
 	if err != nil && line == "" {
 		// EOF/非交互 → 回落默认 cn
 		return realmCN
 	}
+
 	if realm, ok := resolveRealmInput(line); ok {
 		return realm
 	}
+
 	fmt.Fprintln(out, "无效选择，默认国内版 cn")
+
 	return realmCN
 }
 
@@ -237,8 +267,14 @@ func promptRealm(in io.Reader, out io.Writer) string {
 // state 无 realm（旧文件）放行；非空且不一致 → error。
 func validateRealmMatch(stateRealm, cliRealm string) error {
 	if stateRealm != "" && stateRealm != cliRealm {
-		return fmt.Errorf("realm mismatch: state file realm=%q, command --realm=%q（url 与 poll 需同一 realm）", stateRealm, cliRealm)
+		return fmt.Errorf(
+			"realm mismatch: state file realm=%q, command --realm=%q（url 与 poll 需同一 realm）: %w",
+			stateRealm,
+			cliRealm,
+			errValidateRealmMatchFailed,
+		)
 	}
+
 	return nil
 }
 
@@ -247,42 +283,50 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
 func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
 	headers := noAuthHeaders(commonHeaders(origin))
-	data, _, err := doJSON(client, http.MethodPost, base+"/v2/plugin/auth/state?platform="+authPlatform(realm), headers, bytes.NewReader([]byte("{}")))
+	url := base + "/v2/plugin/auth/state?platform=" + authPlatform(realm)
+
+	data, _, err := doJSON(client, http.MethodPost, url, headers, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		fatalf("auth state failed: %v", err)
 	}
-	var st struct {
+
+	var item struct {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
-	if err := json.Unmarshal(data, &st); err != nil || st.State == "" || st.AuthURL == "" {
+	if err := json.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
 		fatalf("auth state: missing state or authUrl")
 	}
-	raw, merr := json.Marshal(loginState{State: st.State, Realm: realm})
+
+	raw, merr := json.Marshal(loginState{State: item.State, Realm: realm})
 	if merr != nil {
 		fatalf("marshal state: %v", merr)
 	}
+
 	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
 		fatalf("write state: %v", err)
 	}
-	fmt.Fprintln(out, st.AuthURL)
+
+	fmt.Fprintln(out, item.AuthURL)
 }
 
 // runPoll 执行 poll 子命令：读 state 文件（realm 校验），向 upstreamBase 的 token 端点
 // GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
 // statePath 可注入临时文件便于测试。
 func runPoll(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
-	ls := loadLoginState(statePath, realm)
+	loginState2 := loadLoginState(statePath, realm)
 	headers := commonHeaders(origin)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-	tok := pollToken(base, ls.State, noAuthHeaders(headers), client)
+	tok := pollToken(base, loginState2.State, noAuthHeaders(headers), client)
 	// login/account 拿 uid/nickname（带 Bearer）
-	acct := pollAccount(base, ls.State, tok.AccessToken, headers, client)
+	acct := pollAccount(base, loginState2.State, tok.AccessToken, headers, client)
+
 	oraw, oerr := json.Marshal(buildLoginOutput(tok, realm, acct))
 	if oerr != nil {
 		fatalf("marshal output: %v", oerr)
 	}
+
 	fmt.Fprintln(out, string(oraw))
 	os.Remove(statePath)
 }
@@ -294,14 +338,17 @@ func loadLoginState(statePath, realm string) loginState {
 	if err != nil {
 		fatalf("read state: %v (先跑 login url)", err)
 	}
-	var ls loginState
-	if err := json.Unmarshal(raw, &ls); err != nil {
+
+	var loginState2 loginState
+	if err := json.Unmarshal(raw, &loginState2); err != nil {
 		fatalf("parse state: %v", err)
 	}
-	if err := validateRealmMatch(ls.Realm, realm); err != nil {
+
+	if err := validateRealmMatch(loginState2.Realm, realm); err != nil {
 		fatalf("%v", err)
 	}
-	return ls
+
+	return loginState2
 }
 
 // pollToken 向 token 端点 GET 一次：pending（业务 code 非 0）或服务端错误时 fatal，
@@ -312,18 +359,22 @@ func pollToken(base, state string, headers func(*http.Request), client *http.Cli
 		if status == 0 || status >= 500 {
 			fatalf("token endpoint error: %v", errTok)
 		}
+
 		fatalf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
 	}
+
 	var tok tokenBundle
 	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
 		fatalf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
 	}
+
 	return tok
 }
 
 // pollAccount 带 Bearer 拉取 login/account；失败时返回零值（与旧行为一致，不中断输出）。
 func pollAccount(base, state, accessToken string, headers func(*http.Request), client *http.Client) accountInfo {
 	var acct accountInfo
+
 	acctHeaders := func(r *http.Request) {
 		headers(r)
 		r.Header.Set("Authorization", "Bearer "+accessToken)
@@ -332,9 +383,16 @@ func pollAccount(base, state, accessToken string, headers func(*http.Request), c
 		r.Header.Set("X-No-Enterprise-Id", "true")
 		r.Header.Set("X-No-Department-Info", "true")
 	}
-	if acctRaw, _, errAcct := doJSON(client, http.MethodGet, base+"/v2/plugin/login/account?state="+state, acctHeaders, nil); errAcct == nil {
+	if acctRaw, _, errAcct := doJSON(
+		client,
+		http.MethodGet,
+		base+"/v2/plugin/login/account?state="+state,
+		acctHeaders,
+		nil,
+	); errAcct == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
+
 	return acct
 }
 
@@ -359,6 +417,7 @@ func main() {
 	if err != nil {
 		fatalf("%v (usage: login [--realm=cn|global] <url|poll|realm>)", err)
 	}
+
 	if len(rest) < 1 {
 		fatalf("usage: login [--realm=cn|global] <url|poll>")
 	}

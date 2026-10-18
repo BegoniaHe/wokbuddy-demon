@@ -28,16 +28,21 @@ func Rename(oldpath, newpath string) error {
 // 提供，跨平台单测可注入假 rename 覆盖「重试后成功 / 重试耗尽 / 不可重试」。
 func renameWithRetry(oldpath, newpath string, doRename func(string, string) error, retryable func(error) bool) error {
 	var err error
+
 	delay := renameBaseDelay
+
 	for attempt := range renameMaxAttempts {
 		err = doRename(oldpath, newpath)
 		if err == nil {
 			return nil
 		}
+
 		if !retryable(err) || attempt == renameMaxAttempts-1 {
 			return err
 		}
+
 		time.Sleep(delay)
+
 		if delay < renameMaxDelay {
 			delay *= 2
 			if delay > renameMaxDelay {
@@ -45,5 +50,6 @@ func renameWithRetry(oldpath, newpath string, doRename func(string, string) erro
 			}
 		}
 	}
+
 	return err
 }

@@ -36,6 +36,7 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		if ctx.HasImage && ctx.ModelInCatalog && !ctx.ModelSupportsImages {
 			return "model " + ctx.Model + " does not support images; pick one with supports_images=true from /v1/models"
 		}
+
 		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	}
 	// 11135 invalid_image_data 家族（图片数据无效，Discussion #77 实测形态）。
@@ -90,6 +91,7 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 		if payload == "" || payload == "[DONE]" {
 			return ""
 		}
+
 		return GatewayHint(FrameKind(payload), payload, ctxFn())
 	}
 }
@@ -101,15 +103,17 @@ func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
 	}
-	var f struct {
+
+	var item struct {
 		Error struct {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(payload), &f) != nil || f.Error.Message == "" {
+	if json.Unmarshal([]byte(payload), &item) != nil || item.Error.Message == "" {
 		return ErrNone
 	}
-	return Classify(http.StatusBadRequest, f.Error.Message)
+
+	return Classify(http.StatusBadRequest, item.Error.Message)
 }
 
 // isModelParamInvalid 上游 11133 body 判定（code 11133 / extError.code=
@@ -117,6 +121,7 @@ func FrameKind(payload string) ErrKind {
 // 宁宽勿漏。
 func isModelParamInvalid(body string) bool {
 	lower := strings.ToLower(body)
+
 	return codeMarker(lower, "11133") ||
 		strings.Contains(lower, "model_param_invalid") ||
 		strings.Contains(lower, "invalid request parameters") ||
@@ -127,6 +132,7 @@ func isModelParamInvalid(body string) bool {
 // "replace the image" msg 家族）。
 func isInvalidImageData(body string) bool {
 	lower := strings.ToLower(body)
+
 	return codeMarker(lower, "11135") ||
 		strings.Contains(lower, "invalid_image_data") ||
 		strings.Contains(lower, "replace the image")
@@ -135,7 +141,7 @@ func isInvalidImageData(body string) bool {
 // codeMarker JSON code 字段命中（`"code":N` / `"code": N` / `"code":"N"` 形态，
 // 与 IsModelBlocked 的 code 判定同容差口径）。lower 须为小写 body。
 func codeMarker(lower, code string) bool {
-	for _, v := range []string{
+	for _, item := range []string{
 		`"code":` + code,
 		`"code": ` + code,
 		`"code":"` + code + `"`,
@@ -143,9 +149,10 @@ func codeMarker(lower, code string) bool {
 		`"code":" ` + code + `"`,
 		`"code": '` + code + `'`,
 	} {
-		if strings.Contains(lower, v) {
+		if strings.Contains(lower, item) {
 			return true
 		}
 	}
+
 	return false
 }

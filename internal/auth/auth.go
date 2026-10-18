@@ -27,6 +27,15 @@ const (
 	realmGlobal = "global"
 )
 
+var (
+	errNilAuth                      = errors.New("nil auth")
+	errBackfillRealmForFailed       = errors.New("BackfillRealmFor failed")
+	errEmptyAuthStorage             = errors.New("empty auth storage")
+	errParseErrorMissingAccessToken = errors.New("parse_error: missing accessToken")
+	errSaveAtomicFailed             = errors.New("SaveAtomic failed")
+	errNoFilePathSet                = errors.New("no FilePath set")
+)
+
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
 type Auth struct {
 	// mu 串行化 RefreshToken 写与 SaveAtomic 读，防止并发写回半更新 token。
@@ -85,8 +94,10 @@ func (a *Auth) AccessTokenValue() string {
 	if a == nil {
 		return ""
 	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	return a.AccessToken
 }
 
@@ -95,8 +106,10 @@ func (a *Auth) DomainValue() string {
 	if a == nil {
 		return ""
 	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	return a.Domain
 }
 
@@ -105,8 +118,10 @@ func (a *Auth) ExpiresAtValue() int64 {
 	if a == nil {
 		return 0
 	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	return a.ExpiresAt
 }
 
@@ -117,8 +132,10 @@ func (a *Auth) RefreshTokenValue() string {
 	if a == nil {
 		return ""
 	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	return a.RefreshToken
 }
 
@@ -127,25 +144,25 @@ func (a *Auth) NicknameValue() string {
 	if a == nil {
 		return ""
 	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	return a.Nickname
 }
 
-// globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
-// 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
-// domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭
+// globalDisabled 全局开关：global realm 是否路由（D5 双保险）。
+// 默认关闭（零值）：与 config global.enabled 缺省 true 一致，Realm() 正常按显式
+// realm/domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）
 // → 逃生门：纯 CN 部署，即便 auth 文件写了 realm=global 或 domain 为 .workbuddy.ai
 // 也恒判 cn——「关了才锁死」的单一闸口集中收敛在 Realm()/IsGlobal() 里。
-var globalEnabled atomic.Bool
-
-func init() { globalEnabled.Store(true) }
+var globalDisabled atomic.Bool
 
 // SetGlobalEnabled 注入 global realm 路由开关（false = 锁死纯 CN，逃生门）。
-func SetGlobalEnabled(enabled bool) { globalEnabled.Store(enabled) }
+func SetGlobalEnabled(enabled bool) { globalDisabled.Store(!enabled) }
 
 // GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
-func GlobalEnabled() bool { return globalEnabled.Load() }
+func GlobalEnabled() bool { return !globalDisabled.Load() }
 
 // Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，
 // 否则 "cn"。显式 global 优先于 domain 回落（D1）。
@@ -154,6 +171,7 @@ func GlobalEnabled() bool { return globalEnabled.Load() }
 func (a *Auth) Realm() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	return a.realmLocked()
 }
 
@@ -161,9 +179,10 @@ func (a *Auth) Realm() string {
 // 锁内再调 Realm() 会自锁）。realm 由 BackfillRealm 改写、Domain 由 RefreshToken 在锁内
 // 改写，故读取必须与写方同锁（理由见 AccessTokenValue 注释）。
 func (a *Auth) realmLocked() string {
-	if !globalEnabled.Load() {
+	if globalDisabled.Load() {
 		return realmCN
 	}
+
 	if strings.TrimSpace(a.realm) == realmGlobal || isGlobalDomain(a.Domain) {
 		return realmGlobal
 	}
@@ -173,6 +192,7 @@ func (a *Auth) realmLocked() string {
 		realmFromIssuer(a.AccessToken) == realmGlobal {
 		return realmGlobal
 	}
+
 	return realmCN
 }
 
@@ -183,9 +203,11 @@ func ResolveRealm(explicit, domain string) string {
 	if r := strings.TrimSpace(explicit); r != "" {
 		return r
 	}
+
 	if isGlobalDomain(domain) {
 		return realmGlobal
 	}
+
 	return realmCN
 }
 
@@ -198,16 +220,20 @@ func ResolveRealm(explicit, domain string) string {
 func (a *Auth) BackfillRealm() (bool, string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	if strings.TrimSpace(a.realm) != "" {
 		return false, a.realm
 	}
+
 	r := ResolveRealm("", a.Domain)
 	// 兜底：domain 也缺失时，从 access token 的 iss claim 反推（仅认 global 家族）。
 	// 与 realmLocked 同口径：未知 / 非法 token 保持 ResolveRealm 的 cn 结果。
 	if strings.TrimSpace(a.Domain) == "" && realmFromIssuer(a.AccessToken) == realmGlobal {
 		r = realmGlobal
 	}
+
 	a.realm = r
+
 	return true, r
 }
 
@@ -215,27 +241,33 @@ func (a *Auth) BackfillRealm() (bool, string) {
 func (a *Auth) RealmStored() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	return a.realm
 }
 
 // BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
 // global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
 // 非法值报错（防写脏）。返回是否发生变更。
-func BackfillRealmFor(a *Auth, realm string) (bool, error) {
-	if a == nil {
-		return false, errors.New("nil auth")
+func BackfillRealmFor(auth *Auth, realm string) (bool, error) {
+	if auth == nil {
+		return false, errNilAuth
 	}
+
 	switch strings.TrimSpace(realm) {
 	case realmCN, realmGlobal:
 	default:
-		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
+		return false, fmt.Errorf("realm must be cn/global, got %q: %w", realm, errBackfillRealmForFailed)
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.realm == realm {
+
+	auth.mu.Lock()
+	defer auth.mu.Unlock()
+
+	if auth.realm == realm {
 		return false, nil
 	}
-	a.realm = realm
+
+	auth.realm = realm
+
 	return true, nil
 }
 
@@ -278,6 +310,7 @@ func realmFromIssuer(accessToken string) string {
 	if len(parts) < 2 {
 		return ""
 	}
+
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
 		// 容错：部分实现带 padding。
@@ -286,19 +319,23 @@ func realmFromIssuer(accessToken string) string {
 			return ""
 		}
 	}
+
 	var claims struct {
 		Iss string `json:"iss"`
 	}
 	if uerr := json.Unmarshal(payload, &claims); uerr != nil {
 		return ""
 	}
+
 	u, err := url.Parse(strings.TrimSpace(claims.Iss))
 	if err != nil {
 		return ""
 	}
+
 	if isGlobalDomain(u.Hostname()) {
 		return realmGlobal
 	}
+
 	return ""
 }
 
@@ -306,9 +343,11 @@ func realmFromIssuer(accessToken string) string {
 func (a *Auth) NeedsRefresh(within time.Duration) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	if a.ExpiresAt <= 0 {
 		return true
 	}
+
 	return time.Now().Add(within).Unix() >= a.ExpiresAt
 }
 
@@ -318,75 +357,98 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 //	扁平形 {"accessToken":...,"uid":...}   （手写/旧版）
 func Parse(raw []byte) (*Auth, error) {
 	if len(raw) == 0 {
-		return nil, errors.New("empty auth storage")
+		return nil, errEmptyAuthStorage
 	}
+
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
-	var a Auth
+
+	auth, err := parseAuthDoc(raw, probe)
+	if err != nil {
+		return nil, err
+	}
+
+	if strings.TrimSpace(auth.AccessToken) == "" {
+		return nil, errParseErrorMissingAccessToken
+	}
+
+	return &auth, nil
+}
+
+// parseAuthDoc 按磁盘形态选择解析器：存在 "auth" 键即嵌套形，否则扁平形。
+func parseAuthDoc(raw []byte, probe map[string]json.RawMessage) (Auth, error) {
 	if _, nested := probe["auth"]; nested {
-		var n struct {
-			Auth struct {
-				AccessToken  string `json:"accessToken"`
-				RefreshToken string `json:"refreshToken"`
-				ExpiresAt    int64  `json:"expiresAt"`
-				Domain       string `json:"domain"`
-				Realm        string `json:"realm"`
-			} `json:"auth"`
-			Account struct {
-				UID          string `json:"uid"`
-				EnterpriseID string `json:"enterpriseId"`
-				Nickname     string `json:"nickname"`
-			} `json:"account"`
-			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
-			DeviceToken string `json:"device_token"`
-		}
-		if err := json.Unmarshal(raw, &n); err != nil {
-			return nil, fmt.Errorf("storage_parse_error: %w", err)
-		}
-		a = Auth{
-			AccessToken:  n.Auth.AccessToken,
-			RefreshToken: n.Auth.RefreshToken,
-			ExpiresAt:    n.Auth.ExpiresAt,
-			Domain:       n.Auth.Domain,
-			realm:        n.Auth.Realm,
-			UID:          n.Account.UID,
-			EnterpriseID: n.Account.EnterpriseID,
-			Nickname:     n.Account.Nickname,
-			DeviceToken:  n.DeviceToken,
-		}
-	} else {
-		var f struct {
+		return parseNestedAuth(raw)
+	}
+
+	return parseFlatAuth(raw)
+}
+
+// parseNestedAuth 解析插件 OAuth 输出的嵌套形 {"auth":{...},"account":{...}}。
+func parseNestedAuth(raw []byte) (Auth, error) {
+	var n struct {
+		Auth struct {
 			AccessToken  string `json:"accessToken"`
 			RefreshToken string `json:"refreshToken"`
 			ExpiresAt    int64  `json:"expiresAt"`
 			Domain       string `json:"domain"`
 			Realm        string `json:"realm"`
+		} `json:"auth"`
+		Account struct {
 			UID          string `json:"uid"`
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
-			DeviceToken  string `json:"device_token"`
-		}
-		if err := json.Unmarshal(raw, &f); err != nil {
-			return nil, fmt.Errorf("storage_parse_error: %w", err)
-		}
-		a = Auth{
-			AccessToken:  f.AccessToken,
-			RefreshToken: f.RefreshToken,
-			ExpiresAt:    f.ExpiresAt,
-			Domain:       f.Domain,
-			realm:        f.Realm,
-			UID:          f.UID,
-			EnterpriseID: f.EnterpriseID,
-			Nickname:     f.Nickname,
-			DeviceToken:  f.DeviceToken,
-		}
+		} `json:"account"`
+		// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
+		DeviceToken string `json:"device_token"`
 	}
-	if strings.TrimSpace(a.AccessToken) == "" {
-		return nil, errors.New("parse_error: missing accessToken")
+	if err := json.Unmarshal(raw, &n); err != nil {
+		return Auth{}, fmt.Errorf("storage_parse_error: %w", err)
 	}
-	return &a, nil
+
+	return Auth{
+		AccessToken:  n.Auth.AccessToken,
+		RefreshToken: n.Auth.RefreshToken,
+		ExpiresAt:    n.Auth.ExpiresAt,
+		Domain:       n.Auth.Domain,
+		realm:        n.Auth.Realm,
+		UID:          n.Account.UID,
+		EnterpriseID: n.Account.EnterpriseID,
+		Nickname:     n.Account.Nickname,
+		DeviceToken:  n.DeviceToken,
+	}, nil
+}
+
+// parseFlatAuth 解析手写/旧版扁平形 {"accessToken":...,"uid":...}。
+func parseFlatAuth(raw []byte) (Auth, error) {
+	var item struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresAt    int64  `json:"expiresAt"`
+		Domain       string `json:"domain"`
+		Realm        string `json:"realm"`
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+		DeviceToken  string `json:"device_token"`
+	}
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return Auth{}, fmt.Errorf("storage_parse_error: %w", err)
+	}
+
+	return Auth{
+		AccessToken:  item.AccessToken,
+		RefreshToken: item.RefreshToken,
+		ExpiresAt:    item.ExpiresAt,
+		Domain:       item.Domain,
+		realm:        item.Realm,
+		UID:          item.UID,
+		EnterpriseID: item.EnterpriseID,
+		Nickname:     item.Nickname,
+		DeviceToken:  item.DeviceToken,
+	}, nil
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
@@ -395,15 +457,19 @@ func Parse(raw []byte) (*Auth, error) {
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
 	if a.retired {
-		return fmt.Errorf("save refused: auth removed (uid=%s)", a.UID)
+		return fmt.Errorf("save refused: auth removed (uid=%s): %w", a.UID, errSaveAtomicFailed)
 	}
+
 	if strings.TrimSpace(a.AccessToken) == "" {
-		return fmt.Errorf("save refused: empty accessToken (uid=%s)", a.UID)
+		return fmt.Errorf("save refused: empty accessToken (uid=%s): %w", a.UID, errSaveAtomicFailed)
 	}
+
 	if a.FilePath == "" {
-		return errors.New("no FilePath set")
+		return errNoFilePathSet
 	}
+
 	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
@@ -423,10 +489,12 @@ func (a *Auth) SaveAtomic() error {
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
 	}
+
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("SaveAtomic: %w", err)
 	}
+
 	tmp := a.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
@@ -438,9 +506,15 @@ func (a *Auth) SaveAtomic() error {
 				"2) sudo chown -R 10001:10001 ./auths ./data ./config.json；" +
 				"3) compose 设 user: \"0:0\" 以 root 运行）"
 		}
-		return errors.New(msg)
+
+		return fmt.Errorf("%s: %w", msg, errSaveAtomicFailed)
 	}
-	return atomicwrite.Rename(tmp, a.FilePath)
+
+	if err := atomicwrite.Rename(tmp, a.FilePath); err != nil {
+		return fmt.Errorf("saveAtomic: %w", err)
+	}
+
+	return nil
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
@@ -450,37 +524,44 @@ func (a *Auth) SaveAtomic() error {
 func LoadDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("LoadDir: %w", err)
 	}
 	// seenUID 重复 UID 检测：同 UID 出现在多个文件时（双 realm 同名 UID 概率近零）
 	// 打 WARN 告警含两文件路径，由「后载入者胜出」保持现状行为（不改变加载结果）。
 	seenUID := make(map[string]string, len(files))
+
 	var out []*Auth
-	for _, f := range files {
-		raw, err := os.ReadFile(f)
+
+	for _, item := range files {
+		raw, err := os.ReadFile(item)
 		if err != nil {
 			continue
 		}
-		a, err := Parse(raw)
+
+		auth, err := Parse(raw)
 		if err != nil {
 			continue
 		}
-		a.FilePath = f
-		if prev, ok := seenUID[a.UID]; ok {
+
+		auth.FilePath = item
+		if prev, ok := seenUID[auth.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
-				logfmt.Label(a.UID, a.Nickname), prev, f)
+				logfmt.Label(auth.UID, auth.Nickname), prev, item)
 		}
-		seenUID[a.UID] = f
-		if a.RealmStored() == "" {
-			if changed, r := a.BackfillRealm(); changed {
-				if err := a.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(a.UID, a.Nickname), err)
+
+		seenUID[auth.UID] = item
+		if auth.RealmStored() == "" {
+			if changed, r := auth.BackfillRealm(); changed {
+				if err := auth.SaveAtomic(); err != nil {
+					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(auth.UID, auth.Nickname), err)
 				} else if r == realmGlobal {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(a.UID, a.Nickname), a.Domain)
+					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(auth.UID, auth.Nickname), auth.Domain)
 				}
 			}
 		}
-		out = append(out, a)
+
+		out = append(out, auth)
 	}
+
 	return out, nil
 }

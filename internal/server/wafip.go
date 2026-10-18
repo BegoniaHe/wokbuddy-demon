@@ -49,27 +49,34 @@ type wafIPGate struct {
 //     （打一条 WARN 供观测），清空判定窗（解除后需全新命中重新判定，不叠旧账）。
 func (g *wafIPGate) noteWaf(uid string) bool {
 	now := time.Now()
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	if now.Before(g.until) {
 		return true // 激活期内新命中：不续期（自然解除语义，任务书第 3 条）
 	}
+
 	if g.hits == nil {
 		g.hits = map[string]time.Time{}
 	}
+
 	g.hits[uid] = now
 	for u, t := range g.hits {
 		if now.Sub(t) > wafIPWindow {
 			delete(g.hits, u)
 		}
 	}
+
 	if len(g.hits) >= wafIPThreshold {
 		g.until = now.Add(wafIPWindow)
 		log.Printf("WARN: [server] waf ip-level block: %d accounts hit waf 403 within %s, rotate fail-fast until %s",
 			len(g.hits), wafIPWindow, g.until.Format(time.RFC3339))
 		g.hits = map[string]time.Time{}
+
 		return true
 	}
+
 	return false
 }
 
@@ -77,5 +84,6 @@ func (g *wafIPGate) noteWaf(uid string) bool {
 func (g *wafIPGate) active() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
 	return time.Now().Before(g.until)
 }

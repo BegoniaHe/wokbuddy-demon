@@ -15,6 +15,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
 	"net/http"
 	"time"
 
@@ -26,33 +28,45 @@ const schoolBase = "/portal/activity/school"
 // mpExtVersion 小程序自身版本号（覆盖 mpEventBase 默认的 2.4.0）。
 const mpExtVersion = "2.2.8"
 
+var errMpReportNoEvents = errors.New("mp report: no events")
+
 // schoolJSON 学院活动 API 请求（剥信封，业务 code≠0 返回带 msg 的 error）。
-func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]any, out any) error {
+func (c *Client) schoolJSON(account3 *auth.Auth, method, path string, body map[string]any, out any) error {
 	var raw []byte
+
 	if body != nil {
 		b, merr := json.Marshal(body)
 		if merr != nil {
-			return merr
+			return fmt.Errorf("schoolJSON: %w", merr)
 		}
+
 		raw = b
 	}
-	req, err := http.NewRequestWithContext(context.Background(), method, c.billingBase(a)+schoolBase+path, bytes.NewReader(raw))
+
+	req, err := http.NewRequestWithContext(context.Background(), method, c.billingBase(account3)+schoolBase+path, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return fmt.Errorf("schoolJSON: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+
+	req.Header.Set("Authorization", "Bearer "+account3.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+
+	if account3.UID != "" {
+		req.Header.Set("X-User-Id", account3.UID)
 	}
+
 	data, err := c.doJSON(req)
 	if err != nil {
 		return err
 	}
+
 	if out != nil {
-		return json.Unmarshal(data, out)
+		if err := json.Unmarshal(data, out); err != nil {
+			return fmt.Errorf("decode school response: %w", err)
+		}
 	}
+
 	return nil
 }
 
@@ -67,7 +81,7 @@ const mpReportPath = "/v2/report"
 const schoolOpenDayActivityID = "school_open_day_2026"
 
 // mpEventBase 小程序埋点公共指纹（appservice wQ()+Ao() 对齐）。
-func mpEventBase(a *auth.Auth) map[string]any {
+func mpEventBase(account2 *auth.Auth) map[string]any {
 	return map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"ideType":      "WorkBuddy_MP",
@@ -82,53 +96,58 @@ func mpEventBase(a *auth.Auth) map[string]any {
 		"arch":         "x64",
 		"machineId":    "0655736a-607f-4d9d-b430-58176ee9a090",
 		"timezone":     "Asia/Shanghai",
-		"userId":       a.UID,
-		"userNickname": a.NicknameValue(),
+		"userId":       account2.UID,
+		"userNickname": account2.NicknameValue(),
 	}
 }
 
 // ReportMPEvent 以小程序指纹向 www.codebuddy.cn/v2/report 批量上报事件。
-func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
+func (c *Client) ReportMPEvent(account *auth.Auth, events ...map[string]any) error {
 	if len(events) == 0 {
-		return errors.New("mp report: no events")
+		return errMpReportNoEvents
 	}
-	base := mpEventBase(a)
+
+	base := mpEventBase(account)
+
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}
-		for k, v := range base {
-			m[k] = v
-		}
-		for k, v := range ev {
-			m[k] = v
-		}
+		maps.Copy(m, base)
+		maps.Copy(m, ev)
 		arr = append(arr, m)
 	}
+
 	raw, err := json.Marshal(arr)
 	if err != nil {
-		return err
+		return fmt.Errorf("ReportMPEvent: %w", err)
 	}
+
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.BillingBaseCN+mpReportPath, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return fmt.Errorf("ReportMPEvent: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
+
+	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if a.UID != "" {
-		req.Header.Set("X-User-Id", a.UID)
+
+	if account.UID != "" {
+		req.Header.Set("X-User-Id", account.UID)
 	}
+
 	req.Header.Set("X-Client-Product", "workbuddy-mp")
 	req.Header.Set("X-Client-Version", "2.4.0")
 	req.Header.Set("X-Client-Platform", "mp-weixin")
 	req.Header.Set("X-Platform", "wechatmp")
 	_, err = c.doJSON(req)
+
 	return err
 }
 
 // SchoolChatTimesEvents 构造一条 chat_request_send 事件（chat_3_times 计数）。
 func SchoolChatTimesEvents(conversationID string) map[string]any {
 	rid := "wb2api-" + clientToken()
+
 	return map[string]any{
 		"eventCode":   "chat_request_send",
 		"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
@@ -153,6 +172,7 @@ func SchoolChatTimesEvents(conversationID string) map[string]any {
 func SchoolSeasonChatEvent(conversationID string) map[string]any {
 	ev := SchoolChatTimesEvents(conversationID)
 	ev["activityId"] = schoolOpenDayActivityID
+
 	return ev
 }
 
@@ -169,9 +189,11 @@ func MiniExpertUseEvent(expertID, expertName, expertType string) map[string]any 
 	if expertType == "" {
 		expertType = "agent"
 	}
+
 	if expertName == "" {
 		expertName = expertID
 	}
+
 	return map[string]any{
 		"eventCode": "expert_actual_use", "reportDelay": 0,
 		"extVersion": mpExtVersion, "source": "mini_program",
@@ -189,6 +211,7 @@ func MiniChatModelEvent(conversationID, modelID, modelName string) map[string]an
 	ev := SchoolChatTimesEvents(conversationID)
 	ev["requestModelId"] = modelID
 	ev["requestModelName"] = modelName
+
 	return ev
 }
 
@@ -207,18 +230,16 @@ func MiniPlaybookEvents(caseID, caseName string) []map[string]any {
 		"eventCode": "playbook_cta_click", "source": "discover", "position": 1,
 		"extVersion": mpExtVersion,
 	}
-	for k, v := range base {
-		cta[k] = v
-	}
+	maps.Copy(cta, base)
+
 	send := map[string]any{
 		"eventCode": "playbook_prompt_send", "source": "discover",
 		"promptLength": 96, "isOfficial": 1,
 		"conversationId": "wb2api-mp-pb-" + clientToken(),
 		"extVersion":     mpExtVersion,
 	}
-	for k, v := range base {
-		send[k] = v
-	}
+	maps.Copy(send, base)
+
 	return []map[string]any{cta, send}
 }
 
@@ -246,5 +267,6 @@ func (c *Client) SchoolVouchers(a *auth.Auth) ([]SchoolVoucher, error) {
 	if err := c.schoolJSON(a, http.MethodGet, "/vouchers", nil, &out); err != nil {
 		return nil, err
 	}
+
 	return out.Items, nil
 }

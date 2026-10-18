@@ -24,13 +24,18 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 	// 解析前先套上网关侧上限（server.max_body_bytes，0 = 不限制）：Content-Length
 	// 与 chunked 都由 MaxBytesReader 约束，超限不进入选号与上游请求。
 	limitRequestBody(w, r, maxBodyBytes)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if isBodyTooLarge(err) {
-			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large", bodyTooLargeMessage(maxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+				bodyTooLargeMessage(maxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+
 			return chatInput{}, nil, false
 		}
+
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+
 		return chatInput{}, nil, false
 	}
 	// 只 peek stream/model 两个路由必需字段；其余字段原样透传，不做协议解码。
@@ -38,9 +43,10 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 		Stream bool   `json:"stream"`
 		Model  string `json:"model"`
 	}
+
 	_ = json.Unmarshal(body, &peek)
 
-	in := chatInput{
+	chatInput2 := chatInput{
 		body:      body,
 		stream:    peek.Stream,
 		model:     peek.Model,
@@ -51,7 +57,8 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 		keyUsage:  keyUsageFrom(r.Context()),
 		keyRealm:  keyRealmFrom(r.Context()),
 	}
-	return in, &httpResponder{w: w, keepalive: keepalive}, true
+
+	return chatInput2, &httpResponder{w: w, keepalive: keepalive}, true
 }
 
 // limitRequestBody 用 http.MaxBytesReader 包住请求体；limit<=0 表示不限制。
@@ -101,9 +108,15 @@ func (r *httpResponder) Stream(rc io.Reader, hint func(string) string, repair *u
 	if onErrFrame != nil {
 		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
 	}
+
 	opts = append(opts, upstream.WithMarkupRepair(repair))
 	if r.keepalive > 0 {
 		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
 	}
-	return upstream.StreamHint(r.w, rc, hint, opts...)
+
+	if err := upstream.StreamHint(r.w, rc, hint, opts...); err != nil {
+		return fmt.Errorf("stream hint: %w", err)
+	}
+
+	return nil
 }

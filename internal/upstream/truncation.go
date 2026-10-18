@@ -23,7 +23,9 @@ func isTruncatedArguments(raw string) bool {
 	if trimmed == "" {
 		return false
 	}
+
 	var v any
+
 	return json.Unmarshal([]byte(trimmed), &v) != nil
 }
 
@@ -37,11 +39,14 @@ func dropTruncatedToolCalls(calls []map[string]any) []map[string]any {
 			kept = append(kept, call)
 			continue
 		}
+
 		args, _ := fn["arguments"].(string)
 		if isTruncatedArguments(args) {
 			continue
 		}
+
 		kept = append(kept, call)
 	}
+
 	return kept
 }

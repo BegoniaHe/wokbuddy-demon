@@ -42,44 +42,65 @@ const (
 // 恒 10s，默认值不变）。
 var handshakeTimeout = dialTimeout
 
+var (
+	errURL                   = errors.New("非法 URL")
+	errParseProxyFailed      = errors.New("ParseProxy failed")
+	errProxyHost             = errors.New("proxy 地址缺少 host")
+	errDialFailed            = errors.New("dial failed")
+	errDialHTTPConnectFailed = errors.New("dialHTTPConnect failed")
+	errSocks5                = errors.New("socks5: 版本不符")
+	errSocks52               = errors.New("socks5: 无可接受认证方式")
+	errSocks5NegotiateFailed = errors.New("socks5Negotiate failed")
+	errSocks5ConnectFailed   = errors.New("socks5Connect failed")
+	errSocks5Host            = errors.New("socks5: host 过长")
+	errSocks53               = errors.New("socks5: 应答版本不符")
+	errSocks5ReadReplyFailed = errors.New("socks5ReadReply failed")
+	errSocks54               = errors.New("socks5: 凭据过长")
+	errSocks55               = errors.New("socks5: 认证被拒")
+)
+
 // Proxy 单个出站代理（HTTP/HTTPS CONNECT 或 SOCKS5）。
 type Proxy struct {
-	raw    string
-	scheme string // http / https / socks5 / socks5h
-	host   string
-	addr   string // host:port
-	user   string
-	pass   string
+	raw              string
+	scheme           string // http / https / socks5 / socks5h
+	host             string
+	addr             string // host:port
+	user             string
+	pass             string
+	handshakeTimeout time.Duration
 }
 
 // redactURLError 去掉 url.Error 携带的原始 URL（可能含 user:pass），只保留解析原因。
 func redactURLError(err error) error {
-	var uerr *url.Error
-	if errors.As(err, &uerr) {
+	if uerr, ok := errors.AsType[*url.Error](err); ok {
 		return uerr.Err
 	}
-	return errors.New("非法 URL")
+
+	return errURL
 }
 
 // ParseProxy 解析代理 URL：支持 http://、https://、socks5://、socks5h://，
 // 可选 user:pass 认证；缺省端口按 scheme 回落（80/443/1080）。
 func ParseProxy(raw string) (*Proxy, error) {
-	u, err := url.Parse(strings.TrimSpace(raw))
+	url2, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
 		// 不直接回显 raw / err：两者都可能含 user:pass。
 		return nil, fmt.Errorf("proxy 地址解析失败: %w", redactURLError(err))
 	}
-	scheme := strings.ToLower(u.Scheme)
+
+	scheme := strings.ToLower(url2.Scheme)
 	switch scheme {
 	case "http", "https", "socks5", "socks5h":
 	default:
-		return nil, fmt.Errorf("proxy: 不支持的 scheme %q（http/https/socks5/socks5h）", u.Scheme)
+		return nil, fmt.Errorf("proxy: 不支持的 scheme %q（http/https/socks5/socks5h）: %w", url2.Scheme, errParseProxyFailed)
 	}
-	host := u.Hostname()
+
+	host := url2.Hostname()
 	if host == "" {
-		return nil, errors.New("proxy 地址缺少 host")
+		return nil, errProxyHost
 	}
-	port := u.Port()
+
+	port := url2.Port()
 	if port == "" {
 		switch scheme {
 		case "http":
@@ -90,22 +111,32 @@ func ParseProxy(raw string) (*Proxy, error) {
 			port = "1080"
 		}
 	}
-	p := &Proxy{raw: raw, scheme: scheme, host: host, addr: net.JoinHostPort(host, port)}
-	if u.User != nil {
-		p.user = u.User.Username()
-		p.pass, _ = u.User.Password()
+
+	proxy := &Proxy{
+		raw:              raw,
+		scheme:           scheme,
+		host:             host,
+		addr:             net.JoinHostPort(host, port),
+		handshakeTimeout: handshakeTimeout,
 	}
-	return p, nil
+	if url2.User != nil {
+		proxy.user = url2.User.Username()
+		proxy.pass, _ = url2.User.Password()
+	}
+
+	return proxy, nil
 }
 
 // dial 经本代理建立到 addr 的连接（network 仅支持 tcp）。
 func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
-		return nil, fmt.Errorf("proxy: 不支持的 network %q", network)
+		return nil, fmt.Errorf("proxy: 不支持的 network %q: %w", network, errDialFailed)
 	}
+
 	if p.scheme == "socks5" || p.scheme == "socks5h" {
 		return p.dialSOCKS5(ctx, addr)
 	}
+
 	return p.dialHTTPConnect(ctx, addr)
 }
 
@@ -121,11 +152,14 @@ func (p *Proxy) dialer() *net.Dialer {
 // 为什么两个机制都要：deadline 覆盖「代理接受连接但不响应」的卡死；watcher
 // 覆盖「ctx 在 deadline 前被取消」——后者 deadline 到了自然也会失败，但
 // watcher 让取消**立即**生效，不等满 handshakeTimeout。
-func beginHandshake(ctx context.Context, conn net.Conn) (clearDeadline, stop func()) {
-	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
+func beginHandshake(ctx context.Context, conn net.Conn, timeout time.Duration) (clearDeadline, stop func()) {
+	_ = conn.SetDeadline(time.Now().Add(timeout))
 	done := make(chan struct{})
+
 	var once sync.Once
+
 	stopWatcher := func() { once.Do(func() { close(done) }) }
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -133,9 +167,11 @@ func beginHandshake(ctx context.Context, conn net.Conn) (clearDeadline, stop fun
 		case <-done:
 		}
 	}()
+
 	clearDeadline = func() {
 		_ = conn.SetDeadline(time.Time{}) // 一次性 deadline：清掉，长流不受限
 	}
+
 	return clearDeadline, stopWatcher
 }
 
@@ -144,6 +180,7 @@ func beginHandshake(ctx context.Context, conn net.Conn) (clearDeadline, stop fun
 // 留着无害——连接随即被调用方 Close。
 func endHandshake(clearDeadline, stop func(), ok bool) {
 	stop()
+
 	if ok {
 		clearDeadline()
 	}
@@ -153,48 +190,56 @@ func endHandshake(clearDeadline, stop func(), ok bool) {
 func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, error) {
 	conn, err := p.dialer().DialContext(ctx, "tcp", p.addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dialHTTPConnect: %w", err)
 	}
 	// 握手期 deadline + ctx watcher（issue #106）：见 beginHandshake。
 	// defer 保证四条退出路径（TLS 握手失败 / 写失败 / 读应答失败 / 非 200）都停
 	// watcher，不留 goroutine。
-	clearDeadline, stop := beginHandshake(ctx, conn)
+	clearDeadline, stop := beginHandshake(ctx, conn, p.handshakeTimeout)
 	defer endHandshake(clearDeadline, stop, false)
+
 	if p.scheme == "https" {
 		tconn := tls.Client(conn, &tls.Config{ServerName: p.host})
 		if herr := tconn.HandshakeContext(ctx); herr != nil {
 			conn.Close()
-			return nil, herr
+			return nil, fmt.Errorf("dialHTTPConnect: %w", herr)
 		}
+
 		conn = tconn
 	}
-	var b strings.Builder
-	b.WriteString("CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n")
+
+	var builder strings.Builder
+	builder.WriteString("CONNECT " + addr + " HTTP/1.1\r\nHost: " + addr + "\r\n")
+
 	if p.user != "" {
-		b.WriteString("Proxy-Authorization: Basic " +
+		builder.WriteString("Proxy-Authorization: Basic " +
 			base64.StdEncoding.EncodeToString([]byte(p.user+":"+p.pass)) + "\r\n")
 	}
-	b.WriteString("\r\n")
-	if _, werr := io.WriteString(conn, b.String()); werr != nil {
+
+	builder.WriteString("\r\n")
+
+	if _, werr := io.WriteString(conn, builder.String()); werr != nil {
 		conn.Close()
-		return nil, werr
+		return nil, fmt.Errorf("dialHTTPConnect: %w", werr)
 	}
-	br := bufio.NewReader(conn)
+
+	reader := bufio.NewReader(conn)
 	// CONNECT 的 200 响应无 body；不读 resp.Body（它即隧道本体），仅取状态码。
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect}) //nolint:bodyclose // CONNECT 200 的 resp.Body 即隧道本体，不可关闭
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect}) //nolint:bodyclose // CONNECT 200 的 resp.Body 即隧道本体，不可关闭
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("dialHTTPConnect: %w", err)
 	}
+
 	if resp.StatusCode != http.StatusOK {
 		conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT %s: %s", addr, resp.Status)
+		return nil, fmt.Errorf("proxy CONNECT %s: %s: %w", addr, resp.Status, errDialHTTPConnectFailed)
 	}
 	// 握手成功：清掉一次性 deadline（长流从此只受上游 idle/写 deadline 约束），
 	// 并显式停 watcher（defer 的 endHandshake(…, false) 不会重复清 deadline）。
 	endHandshake(clearDeadline, stop, true)
 	// br 可能已读入隧道首字节，包装以保留缓冲。
-	return &bufferedConn{Conn: conn, r: br}, nil
+	return &bufferedConn{Conn: conn, r: reader}, nil
 }
 
 // bufferedConn 保留 CONNECT 响应读取时缓冲的隧道字节。
@@ -204,22 +249,27 @@ type bufferedConn struct {
 	r *bufio.Reader
 }
 
-func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+func (c *bufferedConn) Read(b []byte) (int, error) {
+	return c.r.Read(b) //nolint:wrapcheck // io.Reader 必须原样透传 io.EOF，包装会破坏 io.Copy 的等值判断
+}
 
 // dialSOCKS5 经 SOCKS5 代理建立到 addr 的连接（自实现握手，无第三方依赖）。
 func (p *Proxy) dialSOCKS5(ctx context.Context, addr string) (net.Conn, error) {
 	conn, err := p.dialer().DialContext(ctx, "tcp", p.addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dialSOCKS5: %w", err)
 	}
 	// 握手期 deadline + ctx watcher（issue #106）：见 beginHandshake。
-	clearDeadline, stop := beginHandshake(ctx, conn)
+	clearDeadline, stop := beginHandshake(ctx, conn, p.handshakeTimeout)
 	if err := p.socks5Handshake(conn, addr); err != nil {
 		endHandshake(clearDeadline, stop, false)
 		conn.Close()
+
 		return nil, err
 	}
+
 	endHandshake(clearDeadline, stop, true)
+
 	return conn, nil
 }
 
@@ -228,6 +278,7 @@ func (p *Proxy) socks5Handshake(conn net.Conn, addr string) error {
 	if err := p.socks5Negotiate(conn); err != nil {
 		return err
 	}
+
 	return p.socks5Connect(conn, addr)
 }
 
@@ -237,26 +288,30 @@ func (p *Proxy) socks5Negotiate(conn net.Conn) error {
 	if p.user != "" {
 		methods = []byte{0x00, 0x02} // no-auth + username/password
 	}
+
 	greet := append([]byte{0x05, byte(len(methods))}, methods...) //nolint:gosec // methods 长度固定 ≤2
 	if _, err := conn.Write(greet); err != nil {
-		return err
+		return fmt.Errorf("socks5Negotiate: %w", err)
 	}
+
 	var sel [2]byte
 	if _, err := io.ReadFull(conn, sel[:]); err != nil {
-		return err
+		return fmt.Errorf("socks5Negotiate: %w", err)
 	}
+
 	if sel[0] != 0x05 {
-		return errors.New("socks5: 版本不符")
+		return errSocks5
 	}
+
 	switch sel[1] {
 	case 0x00:
 		return nil
 	case 0x02:
 		return p.socks5UserPass(conn)
 	case 0xff:
-		return errors.New("socks5: 无可接受认证方式")
+		return errSocks52
 	default:
-		return fmt.Errorf("socks5: 不支持的认证方式 %#x", sel[1])
+		return fmt.Errorf("socks5: 不支持的认证方式 %#x: %w", sel[1], errSocks5NegotiateFailed)
 	}
 }
 
@@ -264,18 +319,22 @@ func (p *Proxy) socks5Negotiate(conn net.Conn) error {
 func (p *Proxy) socks5Connect(conn net.Conn, addr string) error {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
-		return err
+		return fmt.Errorf("socks5Connect: %w", err)
 	}
+
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 0 || port > 65535 {
-		return fmt.Errorf("socks5: 非法端口 %q", portStr)
+		return fmt.Errorf("socks5: 非法端口 %q: %w", portStr, errSocks5ConnectFailed)
 	}
+
 	req := []byte{0x05, 0x01, 0x00} // CONNECT
+
 	switch ip := net.ParseIP(host); {
 	case ip == nil:
 		if len(host) > 255 {
-			return errors.New("socks5: host 过长")
+			return errSocks5Host
 		}
+
 		req = append(req, 0x03, byte(len(host))) //nolint:gosec // len ≤255 已校验
 		req = append(req, host...)
 	case ip.To4() != nil:
@@ -285,10 +344,12 @@ func (p *Proxy) socks5Connect(conn net.Conn, addr string) error {
 		req = append(req, 0x04)
 		req = append(req, ip.To16()...)
 	}
+
 	req = append(req, byte(port>>8), byte(port)) //nolint:gosec // port 已钳 [0,65535]
 	if _, err := conn.Write(req); err != nil {
-		return err
+		return fmt.Errorf("socks5Connect: %w", err)
 	}
+
 	return socks5ReadReply(conn)
 }
 
@@ -296,15 +357,19 @@ func (p *Proxy) socks5Connect(conn net.Conn, addr string) error {
 func socks5ReadReply(conn net.Conn) error {
 	var head [4]byte
 	if _, err := io.ReadFull(conn, head[:]); err != nil {
-		return err
+		return fmt.Errorf("socks5ReadReply: %w", err)
 	}
+
 	if head[0] != 0x05 {
-		return errors.New("socks5: 应答版本不符")
+		return errSocks53
 	}
+
 	if head[1] != 0x00 {
-		return fmt.Errorf("socks5: CONNECT 失败（rep=%#x）", head[1])
+		return fmt.Errorf("socks5: CONNECT 失败（rep=%#x）: %w", head[1], errSocks5ReadReplyFailed)
 	}
+
 	var n int
+
 	switch head[3] {
 	case 0x01:
 		n = 4
@@ -313,35 +378,46 @@ func socks5ReadReply(conn net.Conn) error {
 	case 0x03:
 		var l [1]byte
 		if _, err := io.ReadFull(conn, l[:]); err != nil {
-			return err
+			return fmt.Errorf("socks5ReadReply: %w", err)
 		}
+
 		n = int(l[0])
 	default:
-		return fmt.Errorf("socks5: 非法 ATYP %#x", head[3])
+		return fmt.Errorf("socks5: 非法 ATYP %#x: %w", head[3], errSocks5ReadReplyFailed)
 	}
+
 	_, err := io.ReadFull(conn, make([]byte, n+2)) // 丢弃 BND.ADDR + BND.PORT
-	return err
+	if err != nil {
+		return fmt.Errorf("socks5ReadReply: %w", err)
+	}
+
+	return nil
 }
 
 // socks5UserPass 完成 SOCKS5 用户名/密码认证（RFC 1929）。
 func (p *Proxy) socks5UserPass(conn net.Conn) error {
 	if len(p.user) > 255 || len(p.pass) > 255 {
-		return errors.New("socks5: 凭据过长")
+		return errSocks54
 	}
+
 	buf := make([]byte, 0, 2+len(p.user)+1+len(p.pass))
 	buf = append(buf, 0x01, byte(len(p.user))) //nolint:gosec // len ≤255 已校验
 	buf = append(buf, p.user...)
 	buf = append(buf, byte(len(p.pass))) //nolint:gosec // len ≤255 已校验
+
 	buf = append(buf, p.pass...)
 	if _, err := conn.Write(buf); err != nil {
-		return err
+		return fmt.Errorf("socks5UserPass: %w", err)
 	}
+
 	var rep [2]byte
 	if _, err := io.ReadFull(conn, rep[:]); err != nil {
-		return err
+		return fmt.Errorf("socks5UserPass: %w", err)
 	}
+
 	if rep[1] != 0x00 {
-		return errors.New("socks5: 认证被拒")
+		return errSocks55
 	}
+
 	return nil
 }

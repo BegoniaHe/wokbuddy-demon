@@ -36,6 +36,8 @@ var defaultEvents = []string{
 	EventTaskFailed,
 }
 
+var errWebhookURLHTTPS = errors.New("webhook_url 必须是 http(s) 绝对地址")
+
 // DefaultEvents 返回默认订阅的事件集合。
 func DefaultEvents() []string { return append([]string(nil), defaultEvents...) }
 
@@ -55,18 +57,21 @@ func ValidateURL(raw string) error {
 	if raw == "" {
 		return nil
 	}
-	u, err := url.Parse(raw)
+
+	url2, err := url.Parse(raw)
 	if err != nil {
 		// 不回显原始 URL：webhook 地址本身通常就是 bearer token。
-		var uerr *url.Error
-		if errors.As(err, &uerr) {
+		if uerr, ok := errors.AsType[*url.Error](err); ok {
 			err = uerr.Err
 		}
+
 		return fmt.Errorf("webhook_url 必须是 http(s) 绝对地址: %w", err)
 	}
-	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return errors.New("webhook_url 必须是 http(s) 绝对地址")
+
+	if (url2.Scheme != "http" && url2.Scheme != "https") || url2.Host == "" {
+		return errWebhookURLHTTPS
 	}
+
 	return nil
 }
 
@@ -111,7 +116,7 @@ const (
 
 // Sender 告警投递接口（测试可注入 fake）。
 type Sender interface {
-	Notify(event Event)
+	Notify(event *Event)
 }
 
 // Notifier 异步 webhook 发送器；URL 为空时所有方法为空操作（nil 也可安全调用）。
@@ -142,13 +147,17 @@ func New(cfg Config) *Notifier {
 	}
 	n.applyTimeConfig(cfg)
 	n.applyClientConfig(cfg)
+
 	if n.url == "" {
 		return n
 	}
+
 	n.queue = make(chan payload, queueSize)
 	n.done = make(chan struct{})
+
 	n.wg.Add(1)
 	go n.run()
+
 	return n
 }
 
@@ -158,11 +167,13 @@ func eventSet(events []string) map[string]bool {
 	for _, e := range events {
 		out[e] = true
 	}
+
 	if len(out) == 0 {
 		for _, e := range defaultEvents {
 			out[e] = true
 		}
 	}
+
 	return out
 }
 
@@ -172,6 +183,7 @@ func (n *Notifier) applyTimeConfig(cfg Config) {
 	if n.now == nil {
 		n.now = time.Now
 	}
+
 	n.window = cfg.DedupeWindow
 	if n.window <= 0 {
 		n.window = defaultDedupeWindow
@@ -184,60 +196,69 @@ func (n *Notifier) applyClientConfig(cfg Config) {
 	if n.timeout <= 0 && n.client != nil {
 		n.timeout = n.client.Timeout
 	}
+
 	if n.timeout <= 0 {
 		n.timeout = defaultTimeout
 	}
+
 	if n.client == nil {
 		n.client = &http.Client{Timeout: n.timeout}
 	}
 }
 
 // Notify 投递一条事件：未订阅/去重窗口内重复时丢弃；队列满时丢新事件并计数。
-func (n *Notifier) Notify(e Event) {
-	if n == nil || n.url == "" || !n.events[e.Event] {
+func (n *Notifier) Notify(event *Event) {
+	if n == nil || n.url == "" || !n.events[event.Event] {
 		return
 	}
-	if !n.allow(e) {
+
+	if !n.allow(event) {
 		return
 	}
-	p := payload{
-		Event:    e.Event,
+
+	payload2 := payload{
+		Event:    event.Event,
 		Time:     n.now().UTC().Format(time.RFC3339),
-		Nickname: e.Nickname,
-		Realm:    e.Realm,
-		Summary:  e.Summary,
-		Detail:   e.Detail,
+		Nickname: event.Nickname,
+		Realm:    event.Realm,
+		Summary:  event.Summary,
+		Detail:   event.Detail,
 	}
-	if e.UID != "" {
-		p.UID = logfmt.UID8(e.UID)
+	if event.UID != "" {
+		payload2.UID = logfmt.UID8(event.UID)
 	}
+
 	select {
-	case n.queue <- p:
+	case n.queue <- payload2:
 	default:
-		log.Printf("WARN: [notify] event=%s dropped: queue full", p.Event)
+		log.Printf("WARN: [notify] event=%s dropped: queue full", payload2.Event)
 	}
 }
 
 // allow 做同事件 + 账号的窗口去重。
-func (n *Notifier) allow(e Event) bool {
+func (n *Notifier) allow(e *Event) bool {
 	key := e.Event + "\x00" + e.UID
 	now := n.now()
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
 	if last, ok := n.last[key]; ok && now.Sub(last) < n.window {
 		return false
 	}
+
 	n.last[key] = now
+
 	return true
 }
 
 // run 串行发送（单 worker，天然限频；失败不影响下一事件）。
 func (n *Notifier) run() {
 	defer n.wg.Done()
+
 	for {
 		select {
 		case p := <-n.queue:
-			n.send(p)
+			n.send(&p)
 		case <-n.done:
 			return
 		}
@@ -245,28 +266,33 @@ func (n *Notifier) run() {
 }
 
 // send POST JSON；失败只记事件名，不带 URL（URL 可能内嵌 token）。
-func (n *Notifier) send(p payload) {
-	raw, err := json.Marshal(p)
+func (n *Notifier) send(payload2 *payload) {
+	raw, err := json.Marshal(payload2)
 	if err != nil {
-		log.Printf("WARN: [notify] event=%s encode failed", p.Event)
+		log.Printf("WARN: [notify] event=%s encode failed", payload2.Event)
 		return
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), n.timeout)
 	defer cancel()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.url, bytes.NewReader(raw))
 	if err != nil {
-		log.Printf("WARN: [notify] event=%s request build failed", p.Event)
+		log.Printf("WARN: [notify] event=%s request build failed", payload2.Event)
 		return
 	}
+
 	req.Header.Set("Content-Type", "application/json")
+
 	resp, err := n.client.Do(req)
 	if err != nil {
-		log.Printf("WARN: [notify] event=%s send failed", p.Event)
+		log.Printf("WARN: [notify] event=%s send failed", payload2.Event)
 		return
 	}
+
 	_ = resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		log.Printf("WARN: [notify] event=%s send failed: status=%d", p.Event, resp.StatusCode)
+		log.Printf("WARN: [notify] event=%s send failed: status=%d", payload2.Event, resp.StatusCode)
 	}
 }
 
@@ -275,6 +301,7 @@ func (n *Notifier) Close() {
 	if n == nil || n.done == nil {
 		return
 	}
+
 	n.once.Do(func() {
 		close(n.done)
 		n.wg.Wait()

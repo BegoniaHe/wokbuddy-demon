@@ -22,31 +22,42 @@ linters:
     - durationcheck
     - dupword
     - embeddedstructfieldcheck
+    - err113
     - errcheck
     - errchkjson
     - errname
     - errorlint
     - exhaustive
+    - exhaustruct_v5
+    - exptostd
     - fatcontext
     - forbidigo
     - forcetypeassert
+    - funlen
     - gocheckcompilerdirectives
+    - gochecknoinits
+    - gochecksumtype
     - gocognit
     - gocritic
     - godot
+    - godox
+    - gomoddirectives
     - goprintffuncname
     - gosec
     - govet
     - grouper
+    - iface
     - inamedparam
     - ineffassign
     - interfacebloat
     - intrange
+    - iotamixing
     - lll
     - maintidx
     - makezero
     - mirror
     - misspell
+    - modernize
     - musttag
     - nakedret
     - nestif
@@ -55,6 +66,7 @@ linters:
     - nilnil
     - noctx
     - nolintlint
+    - paralleltest
     - perfsprint
     - prealloc
     - predeclared
@@ -66,6 +78,7 @@ linters:
     - sqlclosecheck
     - staticcheck
     - tagalign
+    - testableexamples
     - testifylint
     - thelper
     - unconvert
@@ -73,8 +86,11 @@ linters:
     - unused
     - usestdlibvars
     - usetesting
+    - varnamelen
     - wastedassign
     - whitespace
+    - wrapcheck
+    - wsl_v5
 
   settings:
     errcheck:
@@ -83,17 +99,17 @@ linters:
       exclude-functions:
         - (io.Closer).Close
     govet:
+      # enable-all 包含 shadow（变量遮蔽）与 nilness 等 Go 官方分析器。
       enable-all: true
       disable:
         - fieldalignment
     gocritic:
       enabled-tags:
         - diagnostic
+        - experimental
         - performance
         - style
       disabled-checks:
-        - hugeParam
-        - rangeValCopy
         - ifElseChain
         # 项目既有 API 一致返回多值、匿名返回；重命名会波及大量调用点，
         # 属风格取舍而非缺陷。
@@ -123,9 +139,9 @@ linters:
     # godot：仅要求声明注释以句号收尾（接受中文句号「。」），不约束行内注释。
     godot:
       scope: declarations
-    # lll：源码行宽上限 160（测试内的长 JSON 字面量另行豁免，见 exclusions）。
+    # lll：源码行宽上限 140（测试内的长 JSON 字面量另行豁免，见 exclusions）。
     lll:
-      line-length: 160
+      line-length: 140
     # dupl：150 token 的重复片段视为可提取（当前无命中，作为回归护栏）。
     dupl:
       threshold: 150
@@ -140,6 +156,11 @@ linters:
     # interfacebloat：接口方法数上限，超过即拆分为更小的角色接口。
     interfacebloat:
       max: 10
+    # funlen：函数行数/语句数上限。线性装配与配置默认值同样受约束，
+    # 超过即按职责拆分（避免「看起来简单但一路写到底」的上帝函数）。
+    funlen:
+      lines: 60
+      statements: 40
     # 以下为补充的「结构/异味」护栏（当前均 0 命中，作为回归拦截）：
     #   containedctx 禁止把 context.Context 收进结构体（应显式传参）；
     #   decorder     约束声明顺序（const/var/type/func）；
@@ -188,6 +209,48 @@ linters:
     usetesting:
       context-background: true
       context-todo: true
+    # varnamelen：短名只在声明附近可读；跨行长作用域必须用完整语义名。
+    # 下列为 Go 社区惯用短名（循环下标、ctx/err、io 读写器、测试 t 等），不强制改写。
+    varnamelen:
+      ignore-names: [i, j, k, x, y, z, id, ok, err, ctx, db, tx, wg, mu, r, w, n, m, t, rc, fn, ip, mt, at, to, do]
+    # wrapcheck：跨包返回的 error 必须用 %w 附加上下文。实现 io/net/http
+    # 接口的包装方法必须原样透传底层 n 与 err——包装 io.EOF 会破坏 io.Copy 的等值
+    # 判断，包装 net.Error 会丢失 Timeout()，故仅对这些接口实现按签名豁免。
+    wrapcheck:
+      ignore-interface-regexps:
+        - ^(io\.(Reader|ReadCloser|Closer|ReaderFrom)|net\.Conn|http\.(ResponseWriter|Hijacker|Pusher)|context\.Context)$
+      ignore-sig-regexps:
+        - ^func \((net/http\.(ResponseWriter|Hijacker|Pusher)|io\.(ReaderFrom|Closer)|context\.Context|net\.Conn)\)\.
+    # exhaustruct_v5：显式模式只对「全字段都应显式给出」的 DTO 生效；
+    # 配置/状态结构含大量可选零值字段，逐个补零只会制造噪音，故不纳入。
+    exhaustruct_v5:
+      explicit-mode: true
+      # 成功路径用零值表示「无此对象」（如上游无可用专家），与 err 无关。
+      allow-empty-returns: true
+      enforce-patterns:
+        - '.*/internal/apikey\.Limits$'
+        - '.*/internal/httpauth\.AuthResult$'
+        - '.*/internal/usage\.Window$'
+        - '.*/internal/notify\.Event$'
+        - '.*/internal/quota\.Event$'
+        - '.*/internal/reqlog\.ArchiveStats$'
+        - '.*/internal/scheduler\.runSlot$'
+        - '.*/internal/upstream\.MarketExpert$'
+        - '.*/internal/panel\.loginToken$'
+        - '.*/internal/usage\.BackfillRow$'
+        - '.*/internal/pool\.RateLimitedModel$'
+        - '.*/internal/agentcfg\.Status$'
+        - '.*/internal/desktopcred\.Account$'
+        - '.*/internal/panel\.queueItem$'
+        - '.*/internal/panel\.row$'
+        - '.*/internal/pricing\.Snapshot$'
+        - '.*/internal/usage\.KeyedAgg$'
+        - '.*/internal/upstream\.CreditPackage$'
+        - '.*/internal/upstream\.ModelCapEntry$'
+        - '.*/internal/upstream\.RequestUsagePage$'
+        - '.*/internal/reqlog\.DecisionTrace$'
+        - '.*/cmd/credit\.accountResult$'
+    # wrapcheck：跨包返回的 error 必须用 %w 附加上下文。
 
   exclusions:
     generated: lax
@@ -201,6 +264,8 @@ linters:
         linters:
           - errcheck
           - forcetypeassert
+          # 表驱动测试把用例平铺在一起最易读，按行数硬拆只会割裂断言上下文。
+          - funlen
           - gosec
           - unparam
           - gocritic

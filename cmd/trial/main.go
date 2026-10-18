@@ -64,11 +64,13 @@ func main() {
 	if len(os.Args) > 1 {
 		authDir = os.Args[1]
 	}
+
 	files, err := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
 	if err != nil || len(files) == 0 {
 		fmt.Fprintf(os.Stderr, "no auth files in %s\n", authDir)
 		os.Exit(1)
 	}
+
 	sort.Strings(files)
 
 	up := upstream.New()
@@ -79,11 +81,14 @@ func main() {
 	rows := collectTrialRows(files, up)
 
 	var okN, alreadyN, notAppN, failN int
+
 	fmt.Printf("uid                                  | nick        | status  | detail\n")
 	fmt.Printf("-------------------------------------+-------------+---------+------------------------------\n")
+
 	for _, r := range rows {
 		fmt.Printf("%-36s | %-11s | %-7s | %s\n",
 			trunc(r.uid, 36), trunc(r.nick, 11), r.status, r.detail)
+
 		switch r.status {
 		case trialOK:
 			okN++
@@ -95,6 +100,7 @@ func main() {
 			failN++
 		}
 	}
+
 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
 		len(rows), okN, alreadyN, notAppN, failN)
 }
@@ -105,32 +111,38 @@ func collectTrialRows(files []string, up *upstream.Client) []trialRow {
 	for _, f := range files {
 		rows = append(rows, trialForFile(f, up))
 	}
+
 	return rows
 }
 
 // trialForFile 处理单个账号：读取/解析失败记 FAIL；非 global 账号明确不适用（不发请求）；
 // 其余调用 ClaimTrial 归一化结果。
-func trialForFile(f string, up *upstream.Client) trialRow {
-	r := trialRow{uid: filepath.Base(f)}
-	raw, err := os.ReadFile(f)
+func trialForFile(str string, client *upstream.Client) trialRow {
+	r := trialRow{uid: filepath.Base(str)}
+
+	raw, err := os.ReadFile(str)
 	if err != nil {
 		r.status, r.detail = trialFailed, "load: "+err.Error()
 		return r
 	}
-	a, err := auth.Parse(raw)
+
+	account, err := auth.Parse(raw)
 	if err != nil {
 		r.status, r.detail = trialFailed, "parse: "+err.Error()
 		return r
 	}
-	a.FilePath = f
-	r.uid, r.nick = a.UID, a.Nickname
+
+	account.FilePath = str
+	r.uid, r.nick = account.UID, account.Nickname
 
 	// 仅 global 账号适用：CN 明确提示不适用，不发任何请求。
-	if !a.IsGlobal() {
+	if !account.IsGlobal() {
 		r.status, r.detail = trialNotApp, "CN account not applicable"
 		return r
 	}
-	r.status, r.detail = classifyTrial(up.ClaimTrial(a))
+
+	r.status, r.detail = classifyTrial(client.ClaimTrial(account))
+
 	return r
 }
 
@@ -138,5 +150,6 @@ func trunc(s string, n int) string {
 	if len(s) > n {
 		return s[:n]
 	}
+
 	return s
 }

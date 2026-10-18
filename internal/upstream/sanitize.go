@@ -83,12 +83,15 @@ func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
 		return text
 	}
+
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
+
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
+
 	if strings.Contains(text, "cc_") {
 		prev := ""
 		for prev != text { // 清尾随裸 kv（cc_version=...; cc_entrypoint=...;）
@@ -98,6 +101,7 @@ func sanitizeText(text string) string {
 	}
 	// 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）。
 	text = sanitizeBareHdrRe.ReplaceAllString(text, "x-anthropic-billing-hdr")
+
 	return strings.TrimSpace(text)
 }
 
@@ -112,35 +116,41 @@ func hasFingerprint(text string) bool {
 			return true
 		}
 	}
+
 	return sanitizeBareHdrRe.MatchString(text)
 }
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
 // 返回净化后的值及是否发生变化。
-func sanitizeContent(v any) (any, bool) {
-	switch c := v.(type) {
+func sanitizeContent(iface any) (any, bool) {
+	switch item := iface.(type) {
 	case string:
-		s := sanitizeText(c)
-		return s, s != c
+		s := sanitizeText(item)
+		return s, s != item
 	case []any:
 		changed := false
-		for _, p := range c {
+
+		for _, p := range item {
 			m, ok := p.(map[string]any)
 			if !ok {
 				continue
 			}
+
 			text, ok := m["text"].(string)
 			if !ok {
 				continue
 			}
+
 			if s := sanitizeText(text); s != text {
 				m["text"] = s
 				changed = true
 			}
 		}
-		return c, changed
+
+		return item, changed
 	}
-	return v, false
+
+	return iface, false
 }
 
 // sanitizeToolCalls 净化 assistant.tool_calls[].function.arguments。
@@ -154,31 +164,38 @@ func sanitizeToolCalls(v any) bool {
 	if !ok {
 		return false
 	}
+
 	changed := false
+
 	for _, c := range callList {
 		call, ok := c.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		fn, ok := call["function"].(map[string]any)
 		if !ok {
 			continue
 		}
+
 		args, ok := fn["arguments"].(string)
 		if !ok {
 			continue
 		}
+
 		if s := sanitizeText(args); s != args {
 			fn["arguments"] = s
 			changed = true
 		}
 	}
+
 	return changed
 }
 
 // sanitizeMessages 净化 messages 中的 content 与 tool_calls；任一命中返回 true。
 func sanitizeMessages(messages []any) bool {
 	changed := false
+
 	for _, msg := range messages {
 		m, ok := msg.(map[string]any)
 		if !ok {
@@ -204,12 +221,14 @@ func sanitizeMessages(messages []any) bool {
 		if sanitizeStringField(m, "reasoning") {
 			changed = true
 		}
+
 		if tc, ok := m["tool_calls"]; ok {
 			if sanitizeToolCalls(tc) {
 				changed = true
 			}
 		}
 	}
+
 	return changed
 }
 
@@ -219,9 +238,11 @@ func sanitizeStringField(m map[string]any, key string) bool {
 	if !ok {
 		return false
 	}
+
 	if out := sanitizeText(s); out != s {
 		m[key] = out
 		return true
 	}
+
 	return false
 }

@@ -7,7 +7,14 @@ import (
 	"testing"
 )
 
+var (
+	errConnectionReset = errors.New("connection reset")
+	errStatic          = errors.New("活动未开启")
+)
+
 func TestClassifyCheckin(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name string
 		err  error
@@ -24,10 +31,12 @@ func TestClassifyCheckin(t *testing.T) {
 		{"failed-凭证已过期", &Error{Kind: ErrNone, Status: 200, Msg: "登录态已过期，请重新登录"}, CheckinFailed},
 		{"failed-未开启子串无活动", &Error{Kind: ErrNone, Status: 200, Msg: "功能未开启"}, CheckinFailed},
 		{"failed-5xx", &Error{Kind: ErrNone, Status: 500, Msg: "internal error"}, CheckinFailed},
-		{"failed-网络层", errors.New("connection reset"), CheckinFailed},
+		{"failed-网络层", errConnectionReset, CheckinFailed},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
 			if got := ClassifyCheckin(c.err); got != c.want {
 				t.Errorf("ClassifyCheckin(%v)=%v want %v", c.err, got, c.want)
 			}
@@ -37,7 +46,9 @@ func TestClassifyCheckin(t *testing.T) {
 
 // TestIsCheckinInactiveNonError 非 *Error 永不判 inactive（避免把网络抖动当活动未开启）。
 func TestIsCheckinInactiveNonError(t *testing.T) {
-	if IsCheckinInactive(errors.New("活动未开启")) {
+	t.Parallel()
+
+	if IsCheckinInactive(errStatic) {
 		t.Error("plain error 不应判 inactive（只认 *Error.Msg）")
 	}
 }

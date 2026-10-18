@@ -85,9 +85,11 @@ func ContextWindowListing(model string, remote int64) int64 {
 	if remote > 0 {
 		return remote
 	}
+
 	if entry, ok := contextCapFallback[model]; ok && entry.context > 0 {
 		return entry.context
 	}
+
 	return DefaultContextWindow
 }
 
@@ -99,8 +101,10 @@ func MaxOutputTokensListing(model string, remote int64) (int64, bool) {
 	if remote > 0 {
 		return remote, true
 	}
+
 	if entry, ok := contextCapFallback[model]; ok && entry.maxOutput > 0 {
 		return entry.maxOutput, true
 	}
+
 	return 0, false
 }

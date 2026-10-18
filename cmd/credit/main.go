@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,11 @@ const billingBaseCN = "https://www.codebuddy.cn"
 // www.codebuddy.cn 不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
 const billingBaseGlobal = "https://www.workbuddy.ai"
 
+var (
+	errFetchUserResourceFailed = errors.New("fetchUserResource failed")
+	errParseUserResourceFailed = errors.New("parseUserResource failed")
+)
+
 // billingBaseFor 按账号 realm 选择计费域。
 //
 // 判定口径与 internal/auth.Realm() 一致：显式 realm=global 或 domain 落在
@@ -43,10 +49,12 @@ func billingBaseFor(af *authFile) string {
 	if strings.EqualFold(strings.TrimSpace(af.Auth.Realm), "global") {
 		return billingBaseGlobal
 	}
+
 	d := strings.ToLower(strings.TrimSpace(af.Auth.Domain))
 	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
 		return billingBaseGlobal
 	}
+
 	return billingBaseCN
 }
 
@@ -84,37 +92,41 @@ type resourcePackage struct {
 }
 
 // packageRemainUsed 与 billing.go:203-258 一致。
-func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
-	if a.CycleCapacitySize > 0 {
-		return cycleRemainUsed(a)
+func packageRemainUsed(resourcePackage3 resourcePackage) (remain, used, size int64) {
+	if resourcePackage3.CycleCapacitySize > 0 {
+		return cycleRemainUsed(resourcePackage3)
 	}
-	remain = a.CapacityRemain
-	used = a.CapacityUsed
-	size = a.CapacitySize
+
+	remain = resourcePackage3.CapacityRemain
+	used = resourcePackage3.CapacityUsed
+
+	size = resourcePackage3.CapacitySize
 	if used == 0 && size > remain {
 		used = size - remain
 	}
+
 	return remain, used, size
 }
 
 // cycleRemainUsed 处理带周期（Cycle）的套餐：以 CycleCapacitySize 为上限，
 // remain 夹到 [0,size]，used 取周期用量与 size-remain 的较大值。
-func cycleRemainUsed(a resourcePackage) (remain, used, size int64) {
-	remain = a.CycleCapacityRemain
-	size = a.CycleCapacitySize
+func cycleRemainUsed(resourcePackage2 resourcePackage) (remain, used, size int64) {
+	remain = resourcePackage2.CycleCapacityRemain
+	size = resourcePackage2.CycleCapacitySize
+
 	if remain < 0 {
 		remain = 0
 	}
+
 	if remain > size {
 		remain = size
 	}
-	used = size - remain
-	if a.CycleCapacityUsed > used {
-		used = a.CycleCapacityUsed
-	}
+
+	used = max(size-remain, resourcePackage2.CycleCapacityUsed)
 	if size >= used {
 		remain = size - used
 	}
+
 	return remain, used, size
 }
 
@@ -123,22 +135,27 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
+
 	client := &http.Client{Timeout: 20 * time.Second}
+
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, fmt.Errorf("fetchUserResource: %w", err)
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode >= 400 {
-		return 0, 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
+		return 0, 0, 0, 0, fmt.Errorf("http %d: %w", resp.StatusCode, errFetchUserResourceFailed)
 	}
+
 	return parseUserResource(resp.Body)
 }
 
 // newUserResourceRequest 构造 meter/get-user-resource 请求：按 realm 选计费域与路径，
 // 并带上账号身份头（X-User-Id / X-Enterprise-Id / X-Tenant-Id / X-Domain）。
-func newUserResourceRequest(af *authFile) (*http.Request, error) {
+func newUserResourceRequest(authFile2 *authFile) (*http.Request, error) {
 	now := time.Now()
+
 	body, err := json.Marshal(map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
@@ -148,31 +165,38 @@ func newUserResourceRequest(af *authFile) (*http.Request, error) {
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("newUserResourceRequest: %w", err)
 	}
-	base := billingBaseFor(af)
+
+	base := billingBaseFor(authFile2)
 	// global 域无 /v2 前缀（与 internal/upstream 的 billingMeterPaths 同口径）。
 	path := "/v2/billing/meter/get-user-resource"
 	if base == billingBaseGlobal {
 		path = "/billing/meter/get-user-resource"
 	}
+
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, base+path, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("newUserResourceRequest: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+af.Auth.AccessToken)
+
+	req.Header.Set("Authorization", "Bearer "+authFile2.Auth.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	if af.Account.UID != "" {
-		req.Header.Set("X-User-Id", af.Account.UID)
+
+	if authFile2.Account.UID != "" {
+		req.Header.Set("X-User-Id", authFile2.Account.UID)
 	}
-	if af.Account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", af.Account.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", af.Account.EnterpriseID)
+
+	if authFile2.Account.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", authFile2.Account.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", authFile2.Account.EnterpriseID)
 	}
-	if af.Auth.Domain != "" {
-		req.Header.Set("X-Domain", af.Auth.Domain)
+
+	if authFile2.Auth.Domain != "" {
+		req.Header.Set("X-Domain", authFile2.Auth.Domain)
 	}
+
 	return req, nil
 }
 
@@ -192,38 +216,46 @@ func parseUserResource(body io.Reader) (remain, used, size int64, packs int, err
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(body).Decode(&env); err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, fmt.Errorf("parseUserResource: %w", err)
 	}
+
 	if env.Code != 0 {
-		return 0, 0, 0, 0, fmt.Errorf("code=%d %s", env.Code, env.Msg)
+		return 0, 0, 0, 0, fmt.Errorf("code=%d %s: %w", env.Code, env.Msg, errParseUserResourceFailed)
 	}
+
 	for _, a := range env.Data.Response.Data.Accounts {
 		r, u, s := packageRemainUsed(a)
 		remain += r
 		used += u
 		size += s
 	}
+
 	packs = len(env.Data.Response.Data.Accounts)
+
 	if size > 0 {
 		if derived := size - remain; derived > used {
 			used = derived
 		}
 	}
+
 	if dosage := env.Data.Response.Data.TotalDosage; dosage > size {
 		size = dosage
 		if derived := size - remain; derived > used {
 			used = derived
 		}
 	}
+
 	return remain, used, size, packs, nil
 }
 
 func main() {
 	pretty := len(os.Args) > 1 && os.Args[1] == "-pretty"
+
 	authDir := "./auths"
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
 		authDir = v
 	}
+
 	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
 	sort.Strings(files)
 
@@ -234,6 +266,7 @@ func main() {
 		printPretty(accounts, totalRemain, totalUsed, totalSize, okCount)
 		return
 	}
+
 	out := map[string]any{
 		"service": "workbuddy",
 		"ts":      time.Now().Unix(),
@@ -247,11 +280,13 @@ func main() {
 		},
 		"accounts": accounts,
 	}
+
 	raw, err := json.Marshal(out)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "marshal output:", err)
 		os.Exit(1)
 	}
+
 	fmt.Println(string(raw))
 }
 
@@ -260,18 +295,31 @@ func main() {
 func collectAccounts(files []string) []accountResult {
 	accounts := make([]accountResult, 0, len(files))
 	for _, f := range files {
-		var af authFile
+		var authFile2 authFile
+
 		raw, err := os.ReadFile(f)
-		if err != nil || json.Unmarshal(raw, &af) != nil {
+		if err != nil || json.Unmarshal(raw, &authFile2) != nil {
 			continue
 		}
-		res := accountResult{UID: af.Account.UID, Nickname: af.Account.Nickname}
-		if af.Auth.AccessToken == "" {
+
+		res := accountResult{
+			UID:      authFile2.Account.UID,
+			Nickname: authFile2.Account.Nickname,
+			Remain:   nil,
+			Used:     nil,
+			Size:     nil,
+			Packages: 0,
+			OK:       false,
+			Error:    "",
+		}
+		if authFile2.Auth.AccessToken == "" {
 			res.Error = "no accessToken"
 			accounts = append(accounts, res)
+
 			continue
 		}
-		remain, used, size, packs, err := fetchUserResource(&af)
+
+		remain, used, size, packs, err := fetchUserResource(&authFile2)
 		if err != nil {
 			res.Error = err.Error()
 		} else {
@@ -281,56 +329,71 @@ func collectAccounts(files []string) []accountResult {
 			res.Packages = packs
 			res.OK = true
 		}
+
 		accounts = append(accounts, res)
+
 		time.Sleep(200 * time.Millisecond)
 	}
+
 	return accounts
 }
 
 // summarize 汇总成功账号的余额与成功计数（failed = len(accounts) - ok）。
 func summarize(accounts []accountResult) (totalRemain, totalUsed, totalSize int64, okCount int) {
-	for _, a := range accounts {
-		if !a.OK {
+	for _, item := range accounts {
+		if !item.OK {
 			continue
 		}
+
 		okCount++
-		if a.Remain != nil {
-			totalRemain += *a.Remain
+
+		if item.Remain != nil {
+			totalRemain += *item.Remain
 		}
-		if a.Used != nil {
-			totalUsed += *a.Used
+
+		if item.Used != nil {
+			totalUsed += *item.Used
 		}
-		if a.Size != nil {
-			totalSize += *a.Size
+
+		if item.Size != nil {
+			totalSize += *item.Size
 		}
 	}
+
 	return totalRemain, totalUsed, totalSize, okCount
 }
 
 // printPretty 人类可读日报：四行汇总，无账号明细。
 func printPretty(accounts []accountResult, totalRemain, _, totalSize int64, _ int) {
 	withBalance := 0
+
 	var failed []string
-	for _, a := range accounts {
-		if a.OK && a.Remain != nil && *a.Remain > 0 {
+
+	for _, item := range accounts {
+		if item.OK && item.Remain != nil && *item.Remain > 0 {
 			withBalance++
 		}
-		if !a.OK {
-			name := a.Nickname
-			if name == "" && len(a.UID) >= 8 {
-				name = a.UID[:8]
+
+		if !item.OK {
+			name := item.Nickname
+			if name == "" && len(item.UID) >= 8 {
+				name = item.UID[:8]
 			}
-			failed = append(failed, name+" "+a.Error)
+
+			failed = append(failed, name+" "+item.Error)
 		}
 	}
+
 	pct := int64(0)
 	if totalSize > 0 {
 		pct = totalRemain * 100 / totalSize
 	}
+
 	fmt.Printf("📊 WorkBuddy 积分日报\n")
 	fmt.Printf("账号: %d/%d\n", withBalance, len(accounts))
 	fmt.Printf("总计: %d/%d\n", totalRemain, totalSize)
 	fmt.Printf("剩余: %d%%\n", pct)
+
 	for _, f := range failed {
 		fmt.Printf("⚠️ %s\n", f)
 	}

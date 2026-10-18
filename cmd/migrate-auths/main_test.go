@@ -45,31 +45,41 @@ const currentSample = `{
 }`
 
 func TestConvertLegacy(t *testing.T) {
-	a, err := convertLegacy([]byte(legacySample))
+	t.Parallel()
+
+	account, err := convertLegacy([]byte(legacySample))
 	if err != nil {
 		t.Fatalf("convertLegacy: %v", err)
 	}
-	if a.UID != "fa1380f4-df9a-4b31-8027-576a51b512fc" {
-		t.Errorf("uid = %q", a.UID)
+
+	if account.UID != "fa1380f4-df9a-4b31-8027-576a51b512fc" {
+		t.Errorf("uid = %q", account.UID)
 	}
-	if a.AccessToken != "at" || a.RefreshToken != "rt" {
-		t.Errorf("tokens = %q/%q", a.AccessToken, a.RefreshToken)
+
+	if account.AccessToken != "at" || account.RefreshToken != "rt" {
+		t.Errorf("tokens = %q/%q", account.AccessToken, account.RefreshToken)
 	}
-	if a.ExpiresAt != 1794642387 {
-		t.Errorf("expiresAt = %d, want 1794642387（毫秒转秒）", a.ExpiresAt)
+
+	if account.ExpiresAt != 1794642387 {
+		t.Errorf("expiresAt = %d, want 1794642387（毫秒转秒）", account.ExpiresAt)
 	}
-	if a.Domain != "www.codebuddy.cn" {
-		t.Errorf("domain = %q", a.Domain)
+
+	if account.Domain != "www.codebuddy.cn" {
+		t.Errorf("domain = %q", account.Domain)
 	}
-	if a.Realm() != "cn" {
-		t.Errorf("realm = %q", a.Realm())
+
+	if account.Realm() != "cn" {
+		t.Errorf("realm = %q", account.Realm())
 	}
-	if a.Nickname != "70983726" {
-		t.Errorf("nickname = %q", a.Nickname)
+
+	if account.Nickname != "70983726" {
+		t.Errorf("nickname = %q", account.Nickname)
 	}
 }
 
 func TestConvertLegacyRealmInfer(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name   string
 		realm  string
@@ -87,26 +97,33 @@ func TestConvertLegacyRealmInfer(t *testing.T) {
 		{name: "iss 兜底 cn", iss: "https://www.codebuddy.cn/auth/realms/copilot", want: "cn"},
 		{name: "全缺失回落 cn", want: "cn"},
 	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
 			at := "at"
-			if tc.iss != "" {
-				at = fakeJWT(tc.iss)
+			if testCase.iss != "" {
+				at = fakeJWT(testCase.iss)
 			}
+
 			raw := `{"uid":"u1","access_token":"` + at + `","refresh_token":"rt",` +
-				`"realm":"` + tc.realm + `","domain":"` + tc.domain + `"}`
+				`"realm":"` + testCase.realm + `","domain":"` + testCase.domain + `"}`
+
 			a, err := convertLegacy([]byte(raw))
 			if err != nil {
 				t.Fatalf("convertLegacy: %v", err)
 			}
-			if got := a.Realm(); got != tc.want {
-				t.Errorf("realm = %q, want %q", got, tc.want)
+
+			if got := a.Realm(); got != testCase.want {
+				t.Errorf("realm = %q, want %q", got, testCase.want)
 			}
 		})
 	}
 }
 
 func TestConvertLegacyInvalid(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct {
 		name string
 		raw  string
@@ -119,6 +136,8 @@ func TestConvertLegacyInvalid(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if _, err := convertLegacy([]byte(tc.raw)); err == nil {
 				t.Fatal("want error, got nil")
 			}
@@ -127,6 +146,8 @@ func TestConvertLegacyInvalid(t *testing.T) {
 }
 
 func TestNormalizeExpiry(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct{ in, want int64 }{
 		{0, 0},
 		{1794642387, 1794642387},
@@ -142,6 +163,7 @@ func TestNormalizeExpiry(t *testing.T) {
 }
 
 func TestMigrateFileApply(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := writeTemp(t, dir, "workbuddy-70983726.json", legacySample)
 
@@ -149,13 +171,16 @@ func TestMigrateFileApply(t *testing.T) {
 	requireContent(t, path, legacySample)
 
 	requireStatus(t, migrateFile(path, true), statusMigrated)
-	a, err := auth.Parse([]byte(readTemp(t, path)))
+
+	account, err := auth.Parse([]byte(readTemp(t, path)))
 	if err != nil {
 		t.Fatalf("迁移产物无法被 auth.Parse 解析: %v", err)
 	}
-	if a.UID != "fa1380f4-df9a-4b31-8027-576a51b512fc" || a.ExpiresAt != 1794642387 {
-		t.Errorf("迁移产物字段不符: uid=%q expiresAt=%d", a.UID, a.ExpiresAt)
+
+	if account.UID != "fa1380f4-df9a-4b31-8027-576a51b512fc" || account.ExpiresAt != 1794642387 {
+		t.Errorf("迁移产物字段不符: uid=%q expiresAt=%d", account.UID, account.ExpiresAt)
 	}
+
 	requireContent(t, path+".legacy", legacySample)
 
 	// 幂等：重跑应判定为当前格式。
@@ -163,36 +188,45 @@ func TestMigrateFileApply(t *testing.T) {
 }
 
 func TestMigrateFileCurrent(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := writeTemp(t, dir, "workbuddy-u1.json", currentSample)
 	r := migrateFile(path, true)
 	requireStatus(t, r, statusCurrent)
+
 	if r.uid != "fa1380f4-df9a-4b31-8027-576a51b512fc" || r.nick != "70983726" {
 		t.Errorf("当前格式应回填 uid/nick 供重复检测: uid=%q nick=%q", r.uid, r.nick)
 	}
+
 	if _, err := os.Stat(path + ".legacy"); !os.IsNotExist(err) {
 		t.Error("当前格式不应产生 .legacy 备份")
 	}
+
 	requireContent(t, path, currentSample)
 }
 
 func TestWriteBackup(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := writeTemp(t, dir, "workbuddy-u1.json", "current")
 
 	if err := writeBackup(path, []byte("v1")); err != nil {
 		t.Fatalf("首次备份: %v", err)
 	}
+
 	if err := writeBackup(path, []byte("v1")); err != nil {
 		t.Fatalf("同内容重跑应幂等: %v", err)
 	}
+
 	if err := writeBackup(path, []byte("v2")); err == nil {
 		t.Fatal("内容不同应拒绝覆盖既有备份")
 	}
+
 	requireContent(t, path+".legacy", "v1")
 }
 
 func TestMigrateFileBackupConflict(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	path := writeTemp(t, dir, "workbuddy-70983726.json", legacySample)
 	writeTemp(t, dir, "workbuddy-70983726.json.legacy", "other original")
@@ -202,6 +236,8 @@ func TestMigrateFileBackupConflict(t *testing.T) {
 }
 
 func TestTruncUTF8(t *testing.T) {
+	t.Parallel()
+
 	got := trunc("中文昵称", 2)
 	if got != "中文" || !utf8.ValidString(got) {
 		t.Errorf("trunc = %q（valid=%v），应按字符截断", got, utf8.ValidString(got))
@@ -210,24 +246,29 @@ func TestTruncUTF8(t *testing.T) {
 
 func writeTemp(t *testing.T, dir, name, content string) string {
 	t.Helper()
+
 	path := filepath.Join(dir, name)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+
 	return path
 }
 
 func readTemp(t *testing.T, path string) string {
 	t.Helper()
+
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return string(raw)
 }
 
 func requireStatus(t *testing.T, r row, want string) {
 	t.Helper()
+
 	if r.status != want {
 		t.Fatalf("status = %s, want %s（detail: %s）", r.status, want, r.detail)
 	}
@@ -235,6 +276,7 @@ func requireStatus(t *testing.T, r row, want string) {
 
 func requireContent(t *testing.T, path, want string) {
 	t.Helper()
+
 	if got := readTemp(t, path); got != want {
 		t.Fatalf("%s 内容不符（want %d bytes, got %d bytes）", path, len(want), len(got))
 	}
@@ -244,5 +286,6 @@ func requireContent(t *testing.T, path, want string) {
 func fakeJWT(iss string) string {
 	h := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256"}`))
 	p := base64.RawURLEncoding.EncodeToString([]byte(`{"iss":"` + iss + `"}`))
+
 	return h + "." + p + ".sig"
 }

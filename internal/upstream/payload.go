@@ -31,10 +31,12 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if len(src) == 0 {
 		return src
 	}
+
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil || obj == nil {
 		return src
 	}
+
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
 	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段；
@@ -48,6 +50,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if _, has := obj["stream_options"]; !has {
 		obj["stream_options"] = map[string]any{"include_usage": true}
 	}
+
 	normalizeToolChoice(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
@@ -79,15 +82,18 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
+
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
 		}
 	}
+
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
 	}
+
 	return out
 }
 
@@ -100,26 +106,28 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 func translateMaxCompletionTokens(obj map[string]any) {
 	alias, has := obj["max_completion_tokens"]
 	delete(obj, "max_completion_tokens") // 无论翻译与否，别名一律删（减少 body 体积与排障噪音）
+
 	if !has {
 		return
 	}
+
 	if _, explicit := obj["max_tokens"]; explicit {
 		return // 显式 max_tokens 优先：别名只删不译
 	}
 	// json.Unmarshal 数字 → float64（整数去整后回写，避免 1.28e5 科学计数法/小数
 	// 尾巴进上游 body）；其他数值类型防御性兼容（int 家族——手构造 map 的调用方）。
-	switch v := alias.(type) {
+	switch item := alias.(type) {
 	case float64:
-		if v > 0 && v == float64(int64(v)) {
-			obj["max_tokens"] = int64(v)
+		if item > 0 && item == float64(int64(item)) {
+			obj["max_tokens"] = int64(item)
 		}
 	case int64:
-		if v > 0 {
-			obj["max_tokens"] = v
+		if item > 0 {
+			obj["max_tokens"] = item
 		}
 	case int:
-		if v > 0 {
-			obj["max_tokens"] = int64(v)
+		if item > 0 {
+			obj["max_tokens"] = int64(item)
 		}
 	}
 }
@@ -139,20 +147,23 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 	if !strings.Contains(strings.ToLower(model), "gpt-") {
 		return
 	}
-	var v int64
+
+	var num int64
+
 	switch n := obj["max_tokens"].(type) {
 	case float64:
-		v = int64(n)
+		num = int64(n)
 	case int64:
-		v = n
+		num = n
 	case int:
-		v = int64(n)
+		num = int64(n)
 	default:
 		return
 	}
-	if v < gptMinMaxTokens {
+
+	if num < gptMinMaxTokens {
 		obj["max_tokens"] = int64(gptMinMaxTokens)
-		log.Printf("max_tokens clamped model=%s %d -> %d", model, v, gptMinMaxTokens)
+		log.Printf("max_tokens clamped model=%s %d -> %d", model, num, gptMinMaxTokens)
 	}
 }
 
@@ -168,14 +179,17 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if len(efforts) == 0 {
 		return
 	}
+
 	model, _ := obj["model"].(string)
 	if model == "" {
 		return
 	}
+
 	supported, ok := efforts[model]
 	if !ok || len(supported) == 0 {
 		return
 	}
+
 	key, reqStr, reqIdx, known := resolveRequestEffort(obj)
 	if !known {
 		return
@@ -201,43 +215,52 @@ func resolveRequestEffort(obj map[string]any) (key, reqStr string, reqIdx int, k
 	} else {
 		return "", "", 0, false
 	}
+
 	raw, ok := obj[key].(string)
 	if !ok {
 		return "", "", 0, false
 	}
+
 	reqStr = strings.TrimSpace(strings.ToLower(raw))
 	reqIdx, known = effortRank[reqStr]
+
 	return key, reqStr, reqIdx, known
 }
 
 // applyBestEffort 命中「≤请求档的最高支持档」时改写 obj[key]；返回是否命中。
 func applyBestEffort(obj map[string]any, key, model, reqStr string, supported []string, reqIdx int) bool {
 	best, bestIdx := "", -1
+
 	for _, s := range supported {
 		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
 		if k && idx <= reqIdx && idx > bestIdx {
 			best, bestIdx = s, idx
 		}
 	}
+
 	if best == "" {
 		return false
 	}
+
 	if !strings.EqualFold(best, reqStr) {
 		obj[key] = best
 		log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
 	}
+
 	return true
 }
 
 // pickLowestEffort 取 supported 里 rank 最低的有效档位；无有效档返回 ""。
 func pickLowestEffort(supported []string) string {
 	lowest, lowestIdx := "", 1<<30
+
 	for _, s := range supported {
 		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
 		if k && idx < lowestIdx {
 			lowest, lowestIdx = s, idx
 		}
 	}
+
 	return lowest
 }
 
@@ -257,17 +280,21 @@ func normalizeRoles(obj map[string]any) {
 	if !ok {
 		return
 	}
+
 	for i, m := range msgs {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		role, ok := msg["role"].(string)
 		if !ok {
 			continue
 		}
+
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
+
 			log.Printf("role normalized developer->system idx=%d", i)
 		}
 	}
@@ -287,24 +314,29 @@ func normalizeImageURL(obj map[string]any) {
 	if !ok {
 		return
 	}
+
 	for _, rawMsg := range msgs {
 		msg, ok := rawMsg.(map[string]any)
 		if !ok {
 			continue
 		}
+
 		parts, ok := msg["content"].([]any)
 		if !ok {
 			continue
 		}
+
 		for _, rawPart := range parts {
 			part, ok := rawPart.(map[string]any)
 			if !ok || part["type"] != "image_url" {
 				continue
 			}
+
 			imageURL, ok := part["image_url"].(string)
 			if !ok || imageURL == "" {
 				continue
 			}
+
 			part["image_url"] = map[string]any{"url": imageURL}
 		}
 	}
@@ -318,25 +350,31 @@ func ensureConsoleSystem(body []byte) []byte {
 	if len(body) == 0 {
 		return body
 	}
+
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
+
 	msgs, ok := obj["messages"].([]any)
 	if !ok || len(msgs) == 0 {
 		return body
 	}
+
 	first, ok := msgs[0].(map[string]any)
 	if ok {
 		if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
 			return body // 首条已是 system：不注入
 		}
 	}
+
 	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
+
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return body
 	}
+
 	return out
 }
 
@@ -351,53 +389,59 @@ func normalizeToolChoice(obj map[string]any) {
 		delete(obj, "tools")
 		delete(obj, "functions")
 	}
+
 	tc, present := obj["tool_choice"]
 	if !present {
 		return
 	}
-	switch v := tc.(type) {
+
+	switch item := tc.(type) {
 	case string:
-		if strings.EqualFold(strings.TrimSpace(v), "none") {
+		if strings.EqualFold(strings.TrimSpace(item), "none") {
 			delete(obj, "tool_choice")
 			suppress()
 		}
 	case map[string]any:
-		normalizeToolChoiceObject(obj, v, suppress)
+		normalizeToolChoiceObject(obj, item, suppress)
 	default:
 		delete(obj, "tool_choice")
 	}
 }
 
 // normalizeToolChoiceObject 处理对象形态的 tool_choice（type 决定改写/删除）。
-func normalizeToolChoiceObject(obj, v map[string]any, suppress func()) {
-	typ, _ := v["type"].(string)
+func normalizeToolChoiceObject(item, table2 map[string]any, suppress func()) {
+	typ, _ := table2["type"].(string)
+
 	typ = strings.ToLower(strings.TrimSpace(typ))
 	switch typ {
 	case "none":
-		delete(obj, "tool_choice")
+		delete(item, "tool_choice")
 		suppress()
 	case "auto", "required":
-		obj["tool_choice"] = typ
+		item["tool_choice"] = typ
 	case "function":
-		obj["tool_choice"] = toolChoiceFunctionName(v)
+		item["tool_choice"] = toolChoiceFunctionName(table2)
 	default:
-		delete(obj, "tool_choice")
+		delete(item, "tool_choice")
 	}
 }
 
 // toolChoiceFunctionName 取 function 形态里的工具名（function.name 优先，回落裸 name）；
 // 缺失/空串回落 "auto"。
-func toolChoiceFunctionName(v map[string]any) string {
+func toolChoiceFunctionName(table map[string]any) string {
 	name := ""
-	if fn, ok := v["function"].(map[string]any); ok {
+	if fn, ok := table["function"].(map[string]any); ok {
 		name, _ = fn["name"].(string)
 	}
+
 	if name == "" {
-		name, _ = v["name"].(string)
+		name, _ = table["name"].(string)
 	}
+
 	if name = strings.TrimSpace(name); name != "" {
 		return name
 	}
+
 	return "auto"
 }
 
@@ -421,6 +465,7 @@ func normalizeToolPatterns(obj map[string]any) {
 	if !ok {
 		return
 	}
+
 	for _, raw := range rawTools {
 		tool, ok := raw.(map[string]any)
 		if !ok {
@@ -430,6 +475,7 @@ func normalizeToolPatterns(obj map[string]any) {
 		if fn, ok := tool["function"].(map[string]any); ok {
 			unescapePatternLiteralEscapes(fn["parameters"])
 		}
+
 		unescapePatternLiteralEscapes(tool["parameters"])
 	}
 }
@@ -443,7 +489,9 @@ func unescapePatternLiteralEscapes(node any) {
 		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
 			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
 		}
+
 		unescapePatternProperties(n)
+
 		for _, v := range n {
 			unescapePatternLiteralEscapes(v)
 		}
@@ -461,15 +509,19 @@ func unescapePatternProperties(n map[string]any) {
 	if !ok {
 		return
 	}
+
 	rebuilt := false
+
 	fixed := make(map[string]any, len(props))
-	for k, v := range props {
-		if strings.Contains(k, `\_`) {
-			k = strings.ReplaceAll(k, `\_`, `_`)
+	for item, iface := range props {
+		if strings.Contains(item, `\_`) {
+			item = strings.ReplaceAll(item, `\_`, `_`)
 			rebuilt = true
 		}
-		fixed[k] = v
+
+		fixed[item] = iface
 	}
+
 	if rebuilt {
 		n["patternProperties"] = fixed
 	}

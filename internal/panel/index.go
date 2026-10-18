@@ -20,14 +20,15 @@ import (
 var distFS embed.FS
 
 // panelFS 是去掉 dist/ 前缀后的资源文件系统（index.html + static/**）。
-var panelFS fs.FS
+var panelFS = mustSubFS(distFS, "dist")
 
-func init() {
-	sub, err := fs.Sub(distFS, "dist")
+func mustSubFS(fsys fs.FS, dir string) fs.FS {
+	sub, err := fs.Sub(fsys, dir)
 	if err != nil {
 		panic("panel: 无法解析内嵌 dist 资源: " + err.Error())
 	}
-	panelFS = sub
+
+	return sub
 }
 
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
@@ -63,6 +64,7 @@ func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "panel: 缺少内嵌 index.html", http.StatusInternalServerError)
 		return
 	}
+
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -78,11 +80,14 @@ func (p *Panel) asset(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+
 	if _, err := fs.Stat(panelFS, rel); err != nil {
 		http.NotFound(w, r)
 		return
 	}
+
 	setSecurityHeaders(w)
+
 	if rel == "index.html" {
 		// 直接访问 /panel/index.html 时也不可强缓存（须回源取最新资源引用）。
 		w.Header().Set("Cache-Control", "no-cache")
@@ -90,5 +95,6 @@ func (p *Panel) asset(w http.ResponseWriter, r *http.Request) {
 		// 产物文件名带内容哈希，可长期强缓存（immutable）。
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
+
 	http.ServeFileFS(w, r, panelFS, rel)
 }

@@ -43,11 +43,13 @@ func classifyLine(line string) string {
 	if strings.HasPrefix(line, "| #") { // chat 表格日志（server/logging.go logChatRow）
 		return ChChat
 	}
+
 	for _, p := range taskPrefixes {
 		if strings.HasPrefix(line, p) {
 			return ChTask
 		}
 	}
+
 	return ChSys
 }
 
@@ -63,32 +65,40 @@ func NewRing(capacity int) *Ring {
 	if capacity <= 0 {
 		capacity = 500
 	}
+
 	return &Ring{cap: capacity}
 }
 
 // Write 按 \n 切分入环（实现 io.Writer）。空行丢弃；超容量淘汰最旧行。
-func (r *Ring) Write(p []byte) (int, error) {
+func (r *Ring) Write(nums []byte) (int, error) {
 	now := time.Now()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, line := range strings.Split(strings.TrimRight(string(p), "\r\n"), "\n") {
+
+	for line := range strings.SplitSeq(strings.TrimRight(string(nums), "\r\n"), "\n") {
 		if line == "" {
 			continue
 		}
+
 		text := tsPrefixRe.ReplaceAllString(line, "")
+
 		r.entries = append(r.entries, LogEntry{TS: now, Ch: classifyLine(text), Text: text})
 		if overflow := len(r.entries) - r.cap; overflow > 0 {
 			r.entries = r.entries[overflow:]
 		}
 	}
-	return len(p), nil
+
+	return len(nums), nil
 }
 
 // Snapshot 按写入顺序返回缓冲内全部条目（拷贝，调用方可安全持有）。
 func (r *Ring) Snapshot() []LogEntry {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	out := make([]LogEntry, len(r.entries))
 	copy(out, r.entries)
+
 	return out
 }

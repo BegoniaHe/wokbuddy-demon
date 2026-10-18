@@ -3,6 +3,7 @@ package upstream
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -27,19 +28,26 @@ func (b *idleMonitoringBody) Read(p []byte) (int, error) {
 		b.lastRead = time.Now()
 		b.mu.Unlock()
 	}
-	return n, err
+
+	if err != nil {
+		return n, fmt.Errorf("Read: %w", err)
+	}
+
+	return n, nil
 }
 
 // Close 停掉后台 goroutine、取消请求 context、关闭底流，保证无泄漏。
 func (b *idleMonitoringBody) Close() error {
 	b.stopOnce.Do(func() { close(b.stopCh) })
 	b.cancel()
+
 	return b.rc.Close()
 }
 
 func (b *idleMonitoringBody) idleFor() time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
 	return time.Since(b.lastRead)
 }
 
@@ -50,38 +58,35 @@ func monitorBody(rc io.ReadCloser, idle time.Duration, cancel context.CancelFunc
 	if idle <= 0 {
 		return rc
 	}
-	b := &idleMonitoringBody{
+
+	idleMonitoringBody2 := &idleMonitoringBody{
 		rc:       rc,
 		lastRead: time.Now(),
 		stopCh:   make(chan struct{}),
 		cancel:   cancel,
 	}
+
 	go func() {
 		t := time.NewTicker(idleTick(idle))
 		defer t.Stop()
+
 		for {
 			select {
-			case <-b.stopCh:
+			case <-idleMonitoringBody2.stopCh:
 				return
 			case <-t.C:
-				if b.idleFor() > idle {
+				if idleMonitoringBody2.idleFor() > idle {
 					cancel()
 					return
 				}
 			}
 		}
 	}()
-	return b
+
+	return idleMonitoringBody2
 }
 
 // idleTick 返回监控周期：idle/4，钳在 [10ms, 1s]。小 idle 也能快速发现，大小值避免空转。
 func idleTick(idle time.Duration) time.Duration {
-	d := idle / 4
-	if d > time.Second {
-		d = time.Second
-	}
-	if d < 10*time.Millisecond {
-		d = 10 * time.Millisecond
-	}
-	return d
+	return max(min(idle/4, time.Second), 10*time.Millisecond)
 }

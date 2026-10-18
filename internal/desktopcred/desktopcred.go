@@ -28,6 +28,25 @@ import (
 )
 
 // Account 扫描结果：只含面板展示所需元数据，不含 token。
+var (
+	errAuthObjectMissing                    = errors.New("auth object missing")
+	errAccessTokenRefreshTokenIsEmpty       = errors.New("accessToken/refreshToken is empty")
+	errInvalidAtRestSecretExpectedCanonical = errors.New("invalid at-rest secret: expected canonical base64 of 32 bytes")
+	errDecryptFieldFailed                   = errors.New("decryptField failed")
+	errUnsupportedWBEncryptedVersion        = errors.New("unsupported $wbEncrypted version")
+	errOpenWrapperFailed                    = errors.New("openWrapper failed")
+	errEncryptedWrapperMissingEnvelope      = errors.New("encrypted wrapper missing envelope")
+	errEncryptedCredentialNeedsAtRestSecret = errors.New("encrypted credential needs at-rest secret")
+	errAtRestSecretDoesNotMatch             = errors.New("at-rest secret does not match this credential")
+	errEnvelopeIsNotCanonicalBase64         = errors.New("envelope is not canonical base64")
+	errParseEnvelopeFailed                  = errors.New("parseEnvelope failed")
+	errInvalidEnvelopeNonce                 = errors.New("invalid envelope nonce")
+	errInvalidEnvelopeAuthTag               = errors.New("invalid envelope authTag")
+	errInvalidEnvelopeCiphertext            = errors.New("invalid envelope ciphertext")
+	errDecryptFailedWrongKeyOrCorrupted     = errors.New("decrypt failed: wrong key or corrupted credential")
+	errNotCanonicalBase64                   = errors.New("not canonical base64")
+)
+
 type Account struct {
 	Path      string `json:"path"`
 	UID       string `json:"uid"`
@@ -42,6 +61,7 @@ type Account struct {
 func Roots() []string {
 	home, _ := os.UserHomeDir()
 	bases := make([]string, 0, 1)
+
 	switch runtime.GOOS {
 	case "darwin":
 		bases = []string{filepath.Join(home, "Library", "Application Support")}
@@ -52,20 +72,26 @@ func Roots() []string {
 	case "linux":
 		bases = []string{filepath.Join(home, ".local", "share"), filepath.Join(home, ".config")}
 	}
+
 	names := []string{"WorkBuddy", "WorkBuddy AI"}
 	if v := strings.TrimSpace(os.Getenv("WORKBUDDY_APP_NAME")); v != "" {
 		names = append(names, v)
 	}
+
 	seen := map[string]bool{}
+
 	var out []string
+
 	add := func(root string) {
 		root = filepath.Clean(root)
 		if seen[root] {
 			return
 		}
+
 		seen[root] = true
 		out = append(out, root)
 	}
+
 	for _, base := range bases {
 		for _, name := range names {
 			add(filepath.Join(base, name))
@@ -74,13 +100,16 @@ func Roots() []string {
 	// CN 桌面客户端的 dataFolderName 为 .workbuddy：sharedDataPath 直接位于
 	// ~/.workbuddy/Data/Public，而不是 ~/.workbuddy/<产品名>/Data/Public。
 	add(filepath.Join(home, ".workbuddy"))
+
 	return out
 }
 
 // Discover 扫描本机所有候选目录，返回 *.info 路径（已去重、排序）。
 func Discover() []string {
 	seen := map[string]bool{}
+
 	var out []string
+
 	for _, root := range Roots() {
 		for _, p := range discoverRoot(root) {
 			if !seen[p] {
@@ -89,18 +118,22 @@ func Discover() []string {
 			}
 		}
 	}
+
 	sort.Strings(out)
+
 	return out
 }
 
 // Scan 扫描并返回账号元数据；单个文件损坏不影响其它账号。
 func Scan() []Account {
 	out := make([]Account, 0, 4)
+
 	for _, p := range Discover() {
 		if a, err := InspectFile(p); err == nil {
 			out = append(out, a)
 		}
 	}
+
 	return out
 }
 
@@ -110,11 +143,14 @@ func discoverRoot(root string) []string {
 		filepath.Join(root, "Data", "Public", "auth", "*.info"),
 		filepath.Join(root, "data", "public", "auth", "*.info"),
 	}
+
 	var out []string
+
 	for _, pattern := range patterns {
 		matches, _ := filepath.Glob(pattern)
 		out = append(out, matches...)
 	}
+
 	return out
 }
 
@@ -124,26 +160,33 @@ func InspectFile(path string) (Account, error) {
 	if err != nil {
 		return Account{}, err
 	}
-	a := Account{Path: path}
+
+	account := Account{Path: path, UID: "", Nickname: "", Domain: "", Realm: "", ExpiresAt: 0, Encrypted: false}
 	if m := object(doc["auth"]); m != nil {
-		a.Domain, _ = m["domain"].(string)
+		account.Domain, _ = m["domain"].(string)
 		if n, ok := int64Value(m["expiresAt"]); ok {
-			a.ExpiresAt = n
+			account.ExpiresAt = n
 		}
+
 		if n, ok := int64Value(m["expires_at"]); ok {
-			a.ExpiresAt = n
+			account.ExpiresAt = n
 		}
+
 		if s, ok := m["realm"].(string); ok {
-			a.Realm = s
+			account.Realm = s
 		}
-		a.Encrypted = isEncrypted(m["accessToken"]) || isEncrypted(m["refreshToken"])
+
+		account.Encrypted = isEncrypted(m["accessToken"]) || isEncrypted(m["refreshToken"])
 	}
+
 	if m := object(doc["account"]); m != nil {
-		a.UID, _ = m["uid"].(string)
-		a.Nickname, _ = m["nickname"].(string)
+		account.UID, _ = m["uid"].(string)
+		account.Nickname, _ = m["nickname"].(string)
 	}
-	a.Realm = auth.ResolveRealm(a.Realm, a.Domain)
-	return a, nil
+
+	account.Realm = auth.ResolveRealm(account.Realm, account.Domain)
+
+	return account, nil
 }
 
 // ImportFile 解密并构造网关 Auth。secret 为客户端 at-rest secret 的 base64 原文；
@@ -153,20 +196,25 @@ func ImportFile(path, secret string) (*auth.Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	authObj, accountObj := authObjects(doc)
 	if authObj == nil {
-		return nil, errors.New("auth object missing")
+		return nil, errAuthObjectMissing
 	}
+
 	key, err := keyFromSecret(secret)
 	if err != nil {
 		return nil, err
 	}
-	a, err := buildAuth(doc, authObj, accountObj, key)
+
+	account, err := buildAuth(doc, authObj, accountObj, key)
 	if err != nil {
 		return nil, err
 	}
-	applyRealm(a, stringField(authObj, "realm"))
-	return a, nil
+
+	applyRealm(account, stringField(authObj, "realm"))
+
+	return account, nil
 }
 
 // authObjects 兼容嵌套形与扁平形：{auth,account} 或顶层 accessToken/uid。
@@ -175,10 +223,12 @@ func authObjects(doc map[string]any) (map[string]any, map[string]any) {
 	if authObj == nil && doc["accessToken"] != nil {
 		authObj = doc
 	}
+
 	accountObj := object(doc["account"])
 	if accountObj == nil && doc["uid"] != nil {
 		accountObj = doc
 	}
+
 	return authObj, accountObj
 }
 
@@ -187,6 +237,7 @@ func keyFromSecret(secret string) (keyMaterial, error) {
 	if strings.TrimSpace(secret) == "" {
 		return keyMaterial{}, nil
 	}
+
 	return deriveKey(secret)
 }
 
@@ -196,16 +247,19 @@ func buildAuth(doc, authObj, accountObj map[string]any, key keyMaterial) (*auth.
 	if err != nil {
 		return nil, fmt.Errorf("decrypt accessToken: %w", err)
 	}
-	rt, err := decryptField(authObj["refreshToken"], key)
+
+	str, err := decryptField(authObj["refreshToken"], key)
 	if err != nil {
 		return nil, fmt.Errorf("decrypt refreshToken: %w", err)
 	}
-	if strings.TrimSpace(at) == "" || strings.TrimSpace(rt) == "" {
-		return nil, errors.New("accessToken/refreshToken is empty")
+
+	if strings.TrimSpace(at) == "" || strings.TrimSpace(str) == "" {
+		return nil, errAccessTokenRefreshTokenIsEmpty
 	}
-	a := &auth.Auth{
+
+	account := &auth.Auth{
 		AccessToken:  at,
-		RefreshToken: rt,
+		RefreshToken: str,
 		Domain:       stringField(authObj, "domain"),
 		UID:          stringField(accountObj, "uid"),
 		EnterpriseID: stringField(accountObj, "enterpriseId"),
@@ -213,10 +267,11 @@ func buildAuth(doc, authObj, accountObj map[string]any, key keyMaterial) (*auth.
 		ExpiresAt:    authExpiry(authObj),
 		DeviceToken:  deviceToken(doc, key),
 	}
-	if a.Nickname == "" {
-		a.Nickname = stringField(accountObj, "email")
+	if account.Nickname == "" {
+		account.Nickname = stringField(accountObj, "email")
 	}
-	return a, nil
+
+	return account, nil
 }
 
 func authExpiry(authObj map[string]any) int64 {
@@ -225,6 +280,7 @@ func authExpiry(authObj map[string]any) int64 {
 			return n
 		}
 	}
+
 	return time.Now().Add(365 * 24 * time.Hour).Unix()
 }
 
@@ -234,15 +290,17 @@ func deviceToken(doc map[string]any, key keyMaterial) string {
 			return v
 		}
 	}
+
 	return ""
 }
 
-func applyRealm(a *auth.Auth, explicit string) {
+func applyRealm(account *auth.Auth, explicit string) {
 	if explicit != "" {
-		_, _ = auth.BackfillRealmFor(a, explicit)
+		_, _ = auth.BackfillRealmFor(account, explicit)
 		return
 	}
-	_, _ = a.BackfillRealm()
+
+	_, _ = account.BackfillRealm()
 }
 
 // keyMaterial 派生后的 AES key 与 keyId（不导出，避免误打印）。
@@ -253,12 +311,15 @@ type keyMaterial struct {
 
 func deriveKey(secret string) (keyMaterial, error) {
 	secret = strings.TrimSpace(secret)
+
 	raw, err := base64.StdEncoding.DecodeString(secret)
 	if err != nil || len(raw) != 32 || base64.StdEncoding.EncodeToString(raw) != secret {
-		return keyMaterial{}, errors.New("invalid at-rest secret: expected canonical base64 of 32 bytes")
+		return keyMaterial{}, errInvalidAtRestSecretExpectedCanonical
 	}
+
 	sum := sha256.Sum256([]byte(secret))
 	keyIDSum := sha256.Sum256(sum[:])
+
 	return keyMaterial{key: sum[:], keyID: hex.EncodeToString(keyIDSum[:])[:16]}, nil
 }
 
@@ -276,113 +337,133 @@ func isEncrypted(raw any) bool {
 	if m == nil {
 		return false
 	}
+
 	_, ok := m["$wbEncrypted"]
+
 	return ok
 }
 
 func decryptField(raw any, key keyMaterial) (string, error) {
-	switch v := raw.(type) {
+	switch item := raw.(type) {
 	case nil:
 		return "", nil
 	case string:
-		return v, nil
+		return item, nil
 	case map[string]any:
-		return openWrapper(v, key)
+		return openWrapper(item, key)
 	default:
-		return "", fmt.Errorf("unexpected token value %T", raw)
+		return "", fmt.Errorf("unexpected token value %T: %w", raw, errDecryptFieldFailed)
 	}
 }
 
 func openWrapper(m map[string]any, key keyMaterial) (string, error) {
 	if v, ok := int64Value(m["$wbEncrypted"]); !ok || v != 1 {
-		return "", errors.New("unsupported $wbEncrypted version")
+		return "", errUnsupportedWBEncryptedVersion
 	}
+
 	if scheme, _ := m["scheme"].(string); scheme != "" {
-		return "", fmt.Errorf("unsupported encryption scheme %q (only sym-v1)", scheme)
+		return "", fmt.Errorf("unsupported encryption scheme %q (only sym-v1): %w", scheme, errOpenWrapperFailed)
 	}
+
 	envB64, _ := m["envelope"].(string)
 	if envB64 == "" {
-		return "", errors.New("encrypted wrapper missing envelope")
+		return "", errEncryptedWrapperMissingEnvelope
 	}
+
 	if key.keyID == "" {
-		return "", errors.New("encrypted credential needs at-rest secret")
+		return "", errEncryptedCredentialNeedsAtRestSecret
 	}
-	env, nonce, tag, ct, err := parseEnvelope(envB64)
+
+	encryptedEnvelope3, nonce, tag, nums, err := parseEnvelope(envB64)
 	if err != nil {
 		return "", err
 	}
-	if env.KeyID != key.keyID {
-		return "", errors.New("at-rest secret does not match this credential")
+
+	if encryptedEnvelope3.KeyID != key.keyID {
+		return "", errAtRestSecretDoesNotMatch
 	}
-	return decryptAESGCM(key.key, nonce, tag, ct, fieldAAD(key.keyID))
+
+	return decryptAESGCM(key.key, nonce, tag, nums, fieldAAD(key.keyID))
 }
 
 // parseEnvelope 校验 wrapper envelope 的 canonical base64 与固定长度字段。
 func parseEnvelope(envB64 string) (encryptedEnvelope, []byte, []byte, []byte, error) {
 	var env encryptedEnvelope
+
 	envRaw, err := base64.StdEncoding.DecodeString(envB64)
 	if err != nil || base64.StdEncoding.EncodeToString(envRaw) != envB64 {
-		return env, nil, nil, nil, errors.New("envelope is not canonical base64")
+		return env, nil, nil, nil, errEnvelopeIsNotCanonicalBase64
 	}
+
 	if uerr := json.Unmarshal(envRaw, &env); uerr != nil {
 		return env, nil, nil, nil, fmt.Errorf("invalid envelope: %w", uerr)
 	}
+
 	if env.Suite != 1 {
-		return env, nil, nil, nil, fmt.Errorf("unsupported envelope suite %d", env.Suite)
+		return env, nil, nil, nil, fmt.Errorf("unsupported envelope suite %d: %w", env.Suite, errParseEnvelopeFailed)
 	}
+
 	nonce, err := decodeCanonical(env.Nonce)
 	if err != nil || len(nonce) != 12 {
-		return env, nil, nil, nil, errors.New("invalid envelope nonce")
+		return env, nil, nil, nil, errInvalidEnvelopeNonce
 	}
+
 	tag, err := decodeCanonical(env.AuthTag)
 	if err != nil || len(tag) != 16 {
-		return env, nil, nil, nil, errors.New("invalid envelope authTag")
+		return env, nil, nil, nil, errInvalidEnvelopeAuthTag
 	}
+
 	ct, err := decodeCanonical(env.Ciphertext)
 	if err != nil {
-		return env, nil, nil, nil, errors.New("invalid envelope ciphertext")
+		return env, nil, nil, nil, errInvalidEnvelopeCiphertext
 	}
+
 	return env, nonce, tag, ct, nil
 }
 
-func decryptAESGCM(key, nonce, tag, ct, aad []byte) (string, error) {
-	block, err := aes.NewCipher(key)
+func decryptAESGCM(numsVal, nonce, tag, nums, aad []byte) (string, error) {
+	block, err := aes.NewCipher(numsVal)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("decryptAESGCM: %w", err)
 	}
+
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("decryptAESGCM: %w", err)
 	}
-	pt, err := gcm.Open(nil, nonce, append(append([]byte(nil), ct...), tag...), aad)
+
+	pt, err := gcm.Open(nil, nonce, append(append([]byte(nil), nums...), tag...), aad)
 	if err != nil {
-		return "", errors.New("decrypt failed: wrong key or corrupted credential")
+		return "", errDecryptFailedWrongKeyOrCorrupted
 	}
+
 	return string(pt), nil
 }
 
 func decodeCanonical(s string) ([]byte, error) {
 	raw, err := base64.StdEncoding.DecodeString(s)
 	if err != nil || base64.StdEncoding.EncodeToString(raw) != s {
-		return nil, errors.New("not canonical base64")
+		return nil, errNotCanonicalBase64
 	}
+
 	return raw, nil
 }
 
 // fieldAAD 复刻客户端 buildAuthenticatedContextAad（sym-v1, framing=field）：
 // WB-AAD\0 | version=1 | "WBEV1" | "sym-v1" | suite=1 | keyId | framing=2 | no-seq | final=0。
 func fieldAAD(keyID string) []byte {
-	var b bytes.Buffer
-	b.WriteString("WB-AAD\x00")
-	b.WriteByte(1)
-	writeLP(&b, "WBEV1")
-	writeLP(&b, "sym-v1")
-	writeU32(&b, 1)
-	writeLP(&b, keyID)
-	b.WriteByte(2)
-	b.WriteByte(0)
-	b.WriteByte(0)
-	return b.Bytes()
+	var buffer bytes.Buffer
+	buffer.WriteString("WB-AAD\x00")
+	buffer.WriteByte(1)
+	writeLP(&buffer, "WBEV1")
+	writeLP(&buffer, "sym-v1")
+	writeU32(&buffer, 1)
+	writeLP(&buffer, keyID)
+	buffer.WriteByte(2)
+	buffer.WriteByte(0)
+	buffer.WriteByte(0)
+
+	return buffer.Bytes()
 }
 
 func writeU32(b *bytes.Buffer, v uint32) {
@@ -391,25 +472,29 @@ func writeU32(b *bytes.Buffer, v uint32) {
 	b.Write(raw[:])
 }
 
-func writeLP(b *bytes.Buffer, s string) {
-	if uint64(len(s)) > uint64(^uint32(0)) {
+func writeLP(buffer *bytes.Buffer, str string) {
+	if uint64(len(str)) > uint64(^uint32(0)) {
 		panic("aad component too long")
 	}
-	writeU32(b, uint32(len(s))) //nolint:gosec // 长度已在上方校验
-	b.WriteString(s)
+
+	writeU32(buffer, uint32(len(str))) //nolint:gosec // 长度已在上方校验
+	buffer.WriteString(str)
 }
 
 func readDoc(path string) (map[string]any, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("readDoc: %w", err)
 	}
+
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
+
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("parse auth file: %w", err)
 	}
+
 	return doc, nil
 }
 
@@ -422,21 +507,23 @@ func stringField(m map[string]any, key string) string {
 	if m == nil {
 		return ""
 	}
+
 	s, _ := m[key].(string)
+
 	return s
 }
 
 func int64Value(raw any) (int64, bool) {
-	switch v := raw.(type) {
+	switch item := raw.(type) {
 	case json.Number:
-		n, err := v.Int64()
+		n, err := item.Int64()
 		return n, err == nil
 	case float64:
-		return int64(v), true
+		return int64(item), true
 	case int64:
-		return v, true
+		return item, true
 	case string:
-		n, err := strconv.ParseInt(v, 10, 64)
+		n, err := strconv.ParseInt(item, 10, 64)
 		return n, err == nil
 	default:
 		return 0, false

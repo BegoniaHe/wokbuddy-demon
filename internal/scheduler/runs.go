@@ -42,7 +42,7 @@ type TaskRun struct {
 	Trigger    string    `json:"trigger,omitempty"`
 	Running    bool      `json:"running"`
 	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
+	FinishedAt time.Time `json:"finished_at,omitzero"`
 	// Total 本轮实际尝试的账号数（已跳过禁用/global/企业等不适用账号）。
 	Total   int `json:"total"`
 	Success int `json:"success"`
@@ -67,20 +67,26 @@ func (s *Scheduler) initRunsLocked() {
 func (s *Scheduler) acquireRun(task, trigger string) bool {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+
 	s.initRunsLocked()
+
 	slot := s.runs[task]
 	if slot != nil && slot.Running {
 		return false
 	}
+
 	s.runs[task] = &runSlot{
-		TaskRun: TaskRun{
-			Task:      task,
-			Trigger:   trigger,
-			Running:   true,
-			StartedAt: time.Now(),
-		},
-		done: make(chan struct{}),
+		Task:       task,
+		Trigger:    trigger,
+		Running:    true,
+		StartedAt:  time.Now(),
+		FinishedAt: time.Time{},
+		Total:      0,
+		Success:    0,
+		Failure:    0,
+		done:       make(chan struct{}),
 	}
+
 	return true
 }
 
@@ -88,10 +94,12 @@ func (s *Scheduler) acquireRun(task, trigger string) bool {
 func (s *Scheduler) releaseRun(task string, total, success, failure int) {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+
 	slot := s.runs[task]
 	if slot == nil {
 		return
 	}
+
 	slot.Running = false
 	slot.FinishedAt = time.Now()
 	slot.Total, slot.Success, slot.Failure = total, success, failure
@@ -103,11 +111,14 @@ func (s *Scheduler) releaseRun(task string, total, success, failure int) {
 func (s *Scheduler) RunTaskStates() []TaskRun {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+
 	out := make([]TaskRun, 0, len(s.runs))
 	for _, slot := range s.runs {
 		out = append(out, slot.TaskRun)
 	}
+
 	sort.Slice(out, func(i, j int) bool { return out[i].Task < out[j].Task })
+
 	return out
 }
 
@@ -115,7 +126,9 @@ func (s *Scheduler) RunTaskStates() []TaskRun {
 func (s *Scheduler) TaskRunning(task string) bool {
 	s.runMu.Lock()
 	defer s.runMu.Unlock()
+
 	slot := s.runs[task]
+
 	return slot != nil && slot.Running
 }
 
@@ -129,6 +142,7 @@ func (s *Scheduler) StartTask(task, trigger string) bool {
 		total, success, failure := s.runTaskBody(context.Background(), task, trigger)
 		s.releaseRun(task, total, success, failure)
 	}()
+
 	return true
 }
 
@@ -139,8 +153,10 @@ func (s *Scheduler) runTaskSync(ctx context.Context, task, trigger string) bool 
 	if !s.acquireRun(task, trigger) {
 		return false
 	}
+
 	total, success, failure := s.runTaskBody(ctx, task, trigger)
 	s.releaseRun(task, total, success, failure)
+
 	return true
 }
 

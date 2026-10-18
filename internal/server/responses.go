@@ -19,6 +19,16 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
+var (
+	errEmptyRequestBody2           = errors.New("empty request body")
+	errModelIsRequired2            = errors.New("model is required")
+	errInputIsRequired             = errors.New("input is required")
+	errResponsesInputItemFailed    = errors.New("responsesInputItem failed")
+	errResponsesInputMessageFailed = errors.New("responsesInputMessage failed")
+	errFunctionCallNameIsRequired  = errors.New("function_call name is required")
+	errFunctionCallOutputCallIDIs  = errors.New("function_call_output call_id is required")
+)
+
 // responsesRequest 只声明转换所需的字段；未知字段忽略，便于协议演进。
 type responsesRequest struct {
 	Model             string           `json:"model"`
@@ -42,26 +52,34 @@ type responsesReason struct {
 // responsesHandler 是 POST /v1/responses 入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) responsesHandler(w http.ResponseWriter, r *http.Request) {
 	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if isBodyTooLarge(err) {
-			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large", bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+
 			return
 		}
+
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+
 		return
 	}
+
 	if h.loadLive().LocalWebTools {
 		if wanted, ok := declaredLocalWebTools(body); ok {
 			h.serveResponsesWithLocalTools(w, r, body, wanted)
 			return
 		}
 	}
+
 	in, out, ok := newResponsesChatInput(w, r, body, h.cfg.KeepaliveInterval)
 	if !ok {
 		return
 	}
-	h.serveChat(r, in, out)
+
+	h.serveChat(r, &in, out)
 }
 
 // newResponsesChatInput 把已读取的 Responses 请求转换为内部 chatInput。
@@ -71,7 +89,8 @@ func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, 
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return chatInput{}, nil, false
 	}
-	in := chatInput{
+
+	chatInput2 := chatInput{
 		body:      openAI,
 		stream:    stream,
 		model:     model,
@@ -82,7 +101,8 @@ func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, 
 		keyUsage:  keyUsageFrom(r.Context()),
 		keyRealm:  keyRealmFrom(r.Context()),
 	}
-	return in, &responsesResponder{w: w, model: model, instructions: instructions, keepalive: keepalive}, true
+
+	return chatInput2, &responsesResponder{w: w, model: model, instructions: instructions, keepalive: keepalive}, true
 }
 
 // responsesToOpenAI 转换请求体，返回内部 chat body、原始模型名、instructions 与 stream。
@@ -91,30 +111,37 @@ func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
 	if err != nil {
 		return nil, "", "", false, err
 	}
+
 	msgs, err := responsesMessages(req)
 	if err != nil {
 		return nil, "", "", false, err
 	}
+
 	out := map[string]any{"model": req.Model, "stream": req.Stream, "messages": msgs}
 	applyResponsesParams(out, req)
+
 	converted, err := json.Marshal(out)
 	if err != nil {
 		return nil, "", "", false, fmt.Errorf("encode request: %w", err)
 	}
+
 	return converted, req.Model, req.Instructions, req.Stream, nil
 }
 
 func decodeResponsesRequest(body []byte) (*responsesRequest, error) {
 	if len(bytes.TrimSpace(body)) == 0 {
-		return nil, errors.New("empty request body")
+		return nil, errEmptyRequestBody2
 	}
+
 	var req responsesRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid JSON body: %w", err)
 	}
+
 	if strings.TrimSpace(req.Model) == "" {
-		return nil, errors.New("model is required")
+		return nil, errModelIsRequired2
 	}
+
 	return &req, nil
 }
 
@@ -124,27 +151,34 @@ func responsesMessages(req *responsesRequest) ([]any, error) {
 	if text := strings.TrimSpace(req.Instructions); text != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": text})
 	}
+
 	if len(bytes.TrimSpace(req.Input)) == 0 {
-		return nil, errors.New("input is required")
+		return nil, errInputIsRequired
 	}
+
 	var text string
 	if json.Unmarshal(req.Input, &text) == nil {
 		return append(msgs, map[string]any{"role": "user", "content": text}), nil
 	}
+
 	var items []map[string]any
 	if err := json.Unmarshal(req.Input, &items); err != nil {
 		return nil, fmt.Errorf("invalid input: %w", err)
 	}
+
 	if len(items) == 0 {
-		return nil, errors.New("input is required")
+		return nil, errInputIsRequired
 	}
+
 	for _, item := range items {
 		converted, err := responsesInputItem(item)
 		if err != nil {
 			return nil, err
 		}
+
 		msgs = append(msgs, converted)
 	}
+
 	return msgs, nil
 }
 
@@ -158,7 +192,7 @@ func responsesInputItem(item map[string]any) (any, error) {
 	case "function_call_output":
 		return responsesInputFunctionOutput(item)
 	default:
-		return nil, fmt.Errorf("unsupported input item type %q", stringValue(item["type"]))
+		return nil, fmt.Errorf("unsupported input item type %q: %w", stringValue(item["type"]), errResponsesInputItemFailed)
 	}
 }
 
@@ -167,12 +201,15 @@ func responsesInputMessage(item map[string]any) (any, error) {
 	if role == "" {
 		role = "user"
 	}
+
 	if role == "developer" {
 		role = "system"
 	}
+
 	if role != "user" && role != "assistant" && role != "system" {
-		return nil, fmt.Errorf("unsupported message role %q", role)
+		return nil, fmt.Errorf("unsupported message role %q: %w", role, errResponsesInputMessageFailed)
 	}
+
 	return map[string]any{"role": role, "content": responsesContent(item["content"])}, nil
 }
 
@@ -180,16 +217,19 @@ func responsesInputMessage(item map[string]any) (any, error) {
 func responsesInputFunctionCall(item map[string]any) (any, error) {
 	name := stringValue(item["name"])
 	if name == "" {
-		return nil, errors.New("function_call name is required")
+		return nil, errFunctionCallNameIsRequired
 	}
+
 	callID := stringValue(item["call_id"])
 	if callID == "" {
 		callID = stringValue(item["id"])
 	}
+
 	args := stringValue(item["arguments"])
 	if args == "" {
 		args = "{}"
 	}
+
 	return map[string]any{
 		"role":    "assistant",
 		"content": "",
@@ -204,8 +244,9 @@ func responsesInputFunctionCall(item map[string]any) (any, error) {
 func responsesInputFunctionOutput(item map[string]any) (any, error) {
 	callID := stringValue(item["call_id"])
 	if callID == "" {
-		return nil, errors.New("function_call_output call_id is required")
+		return nil, errFunctionCallOutputCallIDIs
 	}
+
 	return map[string]any{
 		"role":         "tool",
 		"tool_call_id": callID,
@@ -218,24 +259,30 @@ func responsesToolOutput(raw any) string {
 	if s, ok := raw.(string); ok {
 		return s
 	}
+
 	parts, ok := raw.([]any)
 	if !ok {
 		if raw == nil {
 			return ""
 		}
+
 		data, err := json.Marshal(raw)
 		if err != nil {
 			return ""
 		}
+
 		return string(data)
 	}
+
 	var texts []string
+
 	for _, part := range parts {
 		m, _ := part.(map[string]any)
 		if text, _ := m["text"].(string); text != "" {
 			texts = append(texts, text)
 		}
 	}
+
 	return strings.Join(texts, "\n")
 }
 
@@ -244,38 +291,48 @@ func responsesContent(raw any) any {
 	if raw == nil {
 		return ""
 	}
+
 	if text, ok := raw.(string); ok {
 		return text
 	}
+
 	arr, ok := raw.([]any)
 	if !ok {
 		if m, ok := raw.(map[string]any); ok {
 			return responsesContentPart(m)
 		}
+
 		return ""
 	}
+
 	parts := make([]any, 0, len(arr))
 	texts := make([]string, 0, len(arr))
 	allText := true
+
 	for _, value := range arr {
 		m, _ := value.(map[string]any)
 		if m == nil {
 			continue
 		}
+
 		part := responsesContentPart(m)
 		if part == nil {
 			continue
 		}
+
 		parts = append(parts, part)
 		if part["type"] == "text" {
 			texts = append(texts, stringValue(part["text"]))
 			continue
 		}
+
 		allText = false
 	}
+
 	if allText {
 		return strings.Join(texts, "\n")
 	}
+
 	return parts
 }
 
@@ -289,6 +346,7 @@ func responsesContentPart(part map[string]any) map[string]any {
 			return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
 		}
 	}
+
 	return nil
 }
 
@@ -296,9 +354,11 @@ func responsesImageURL(raw any) string {
 	if s, ok := raw.(string); ok {
 		return s
 	}
+
 	if m, ok := raw.(map[string]any); ok {
 		return stringValue(m["url"])
 	}
+
 	return ""
 }
 
@@ -307,18 +367,23 @@ func applyResponsesParams(out map[string]any, req *responsesRequest) {
 	if req.MaxOutputTokens > 0 {
 		out["max_tokens"] = req.MaxOutputTokens
 	}
+
 	if req.Temperature != nil {
 		out["temperature"] = *req.Temperature
 	}
+
 	if req.TopP != nil {
 		out["top_p"] = *req.TopP
 	}
+
 	if tools := responsesTools(req.Tools); len(tools) > 0 {
 		out["tools"] = tools
 	}
+
 	if choice := responsesToolChoice(req.ToolChoice); choice != nil {
 		out["tool_choice"] = choice
 	}
+
 	if req.Reasoning != nil && req.Reasoning.Effort != "" {
 		out["reasoning_effort"] = req.Reasoning.Effort
 	}
@@ -332,22 +397,28 @@ func responsesTools(tools []map[string]any) []any {
 		if nested, ok := tool["function"].(map[string]any); ok {
 			fn = nested
 		}
+
 		name := stringValue(fn["name"])
 		if name == "" {
 			continue
 		}
+
 		spec := map[string]any{"name": name}
 		if desc := stringValue(fn["description"]); desc != "" {
 			spec["description"] = desc
 		}
+
 		if params, ok := fn["parameters"]; ok {
 			spec["parameters"] = params
 		}
+
 		if strict, ok := fn["strict"].(bool); ok {
 			spec["strict"] = strict
 		}
+
 		out = append(out, map[string]any{"type": "function", "function": spec})
 	}
+
 	return out
 }
 
@@ -356,6 +427,7 @@ func responsesToolChoice(raw json.RawMessage) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
+
 	var choice string
 	if json.Unmarshal(raw, &choice) == nil {
 		switch choice {
@@ -365,6 +437,7 @@ func responsesToolChoice(raw json.RawMessage) any {
 			return nil
 		}
 	}
+
 	var obj struct {
 		Type string `json:"type"`
 		Name string `json:"name"`
@@ -372,6 +445,7 @@ func responsesToolChoice(raw json.RawMessage) any {
 	if json.Unmarshal(raw, &obj) != nil || obj.Name == "" {
 		return nil
 	}
+
 	return map[string]any{"type": "function", "function": map[string]any{"name": obj.Name}}
 }
 
@@ -395,16 +469,23 @@ func (r *responsesResponder) Error(status int, code, msg, hint string) {
 func (r *responsesResponder) Header(name, value string) { r.w.Header().Set(name, value) }
 
 func (r *responsesResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
-	tw := newResponsesStreamWriter(r.w, r.model, r.instructions)
+	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions)
+
 	opts := make([]upstream.StreamOption, 0, 2)
 	if onErrFrame != nil {
 		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
 	}
+
 	opts = append(opts, upstream.WithMarkupRepair(repair))
 	if r.keepalive > 0 {
 		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
 	}
-	return upstream.StreamHint(tw, rc, hint, opts...)
+
+	if err := upstream.StreamHint(responsesStreamWriter2, rc, hint, opts...); err != nil {
+		return fmt.Errorf("stream hint: %w", err)
+	}
+
+	return nil
 }
 
 // responsesFromOpenAI 把聚合后的 chat.completion 转成 Responses 对象。
@@ -413,18 +494,22 @@ func responsesFromOpenAI(body any, model, instructions string) map[string]any {
 	choice := firstOpenAIChoice(obj)
 	output, text, status := responsesOutput(choice)
 	usage := responsesUsage(obj["usage"])
+
 	id := stringValue(obj["id"])
 	if id == "" {
 		id = "resp_gateway"
 	}
+
 	created := intValue(obj["created"])
 	if created == 0 {
 		created = int(time.Now().Unix())
 	}
+
 	resp := responsesObject(id, model, instructions, int64(created), status, output, text, usage)
 	if status == "incomplete" {
 		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
 	}
+
 	return resp
 }
 
@@ -433,20 +518,25 @@ func responsesOutput(choice map[string]any) ([]any, string, string) {
 	if choice == nil {
 		return []any{}, "", "completed"
 	}
+
 	msg, _ := choice["message"].(map[string]any)
 	text := responsesMessageText(msg["content"])
+
 	output := make([]any, 0, 2)
 	if text != "" {
 		output = append(output, responsesMessageItem("msg_gateway", text, "completed"))
 	}
+
 	output = append(output, responsesFunctionItems(msg["tool_calls"])...)
 	if len(output) == 0 {
 		output = append(output, responsesMessageItem("msg_gateway", "", "completed"))
 	}
+
 	status := "completed"
 	if stringValue(choice["finish_reason"]) == "length" {
 		status = "incomplete"
 	}
+
 	return output, text, status
 }
 
@@ -455,17 +545,21 @@ func responsesMessageText(raw any) string {
 	if s, ok := raw.(string); ok {
 		return s
 	}
+
 	parts, ok := raw.([]any)
 	if !ok {
 		return ""
 	}
+
 	var texts []string
+
 	for _, part := range parts {
 		m, _ := part.(map[string]any)
 		if text := stringValue(m["text"]); text != "" {
 			texts = append(texts, text)
 		}
 	}
+
 	return strings.Join(texts, "")
 }
 
@@ -478,23 +572,28 @@ func responsesMessageItem(id, text, status string) map[string]any {
 
 func responsesFunctionItems(raw any) []any {
 	calls, _ := raw.([]any)
+
 	out := make([]any, 0, len(calls))
 	for i, item := range calls {
 		call, _ := item.(map[string]any)
 		fn, _ := call["function"].(map[string]any)
+
 		name := stringValue(fn["name"])
 		if name == "" {
 			continue
 		}
+
 		callID := stringValue(call["id"])
 		if callID == "" {
 			callID = fmt.Sprintf("call_%d", i)
 		}
+
 		out = append(out, map[string]any{
 			"type": "function_call", "id": "fc_" + callID, "call_id": callID,
 			"name": name, "arguments": stringValue(fn["arguments"]), "status": "completed",
 		})
 	}
+
 	return out
 }
 
@@ -502,12 +601,20 @@ func responsesUsage(raw any) map[string]any {
 	usage, _ := raw.(map[string]any)
 	input := intValue(usage["prompt_tokens"])
 	output := intValue(usage["completion_tokens"])
+
 	return map[string]any{
 		"input_tokens": input, "output_tokens": output, "total_tokens": input + output,
 	}
 }
 
-func responsesObject(id, model, instructions string, created int64, status string, output []any, text string, usage map[string]any) map[string]any {
+func responsesObject(
+	id, model, instructions string,
+	created int64,
+	status string,
+	output []any,
+	text string,
+	usage map[string]any,
+) map[string]any {
 	return map[string]any{
 		"id": id, "object": "response", "created_at": created, "status": status,
 		"model": model, "instructions": instructions, "output": output, "output_text": text,
@@ -562,6 +669,7 @@ type responsesToolState struct {
 
 func newResponsesStreamWriter(w http.ResponseWriter, model, instructions string) *responsesStreamWriter {
 	fl, _ := w.(http.Flusher)
+
 	return &responsesStreamWriter{
 		w: w, fl: fl, model: model, instructions: instructions,
 		created: time.Now().Unix(), tools: map[int]*responsesToolState{},
@@ -577,40 +685,49 @@ func (s *responsesStreamWriter) Flush() {
 	}
 }
 
-func (s *responsesStreamWriter) Write(p []byte) (int, error) {
-	s.pending = append(s.pending, p...)
+func (s *responsesStreamWriter) Write(nums []byte) (int, error) {
+	s.pending = append(s.pending, nums...)
 	for {
 		i := bytes.IndexByte(s.pending, '\n')
 		if i < 0 {
 			break
 		}
+
 		line := strings.TrimRight(string(s.pending[:i]), "\r")
+
 		s.pending = s.pending[i+1:]
 		if err := s.handleLine(line); err != nil {
 			return 0, err
 		}
 	}
-	return len(p), nil
+
+	return len(nums), nil
 }
 
 func (s *responsesStreamWriter) handleLine(line string) error {
 	if s.finished {
 		return nil
 	}
+
 	if strings.HasPrefix(line, ":") {
 		if _, err := io.WriteString(s.w, line+"\n\n"); err != nil {
-			return err
+			return fmt.Errorf("handleLine: %w", err)
 		}
+
 		s.Flush()
+
 		return nil
 	}
+
 	if !strings.HasPrefix(line, "data: ") {
 		return nil
 	}
+
 	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
 		return s.finish()
 	}
+
 	return s.handleChunk(payload)
 }
 
@@ -619,22 +736,28 @@ func (s *responsesStreamWriter) handleChunk(payload string) error {
 	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return nil //nolint:nilerr // 非 JSON 噪声帧丢弃
 	}
+
 	if errObj, ok := chunk["error"].(map[string]any); ok {
 		return s.handleUpstreamError(errObj)
 	}
+
 	if err := s.ensureStart(chunk); err != nil {
 		return err
 	}
+
 	s.captureUsage(chunk)
+
 	choice := firstOpenAIChoice(chunk)
 	if choice == nil {
 		return nil
 	}
+
 	if delta, _ := choice["delta"].(map[string]any); delta != nil {
 		if err := s.applyDelta(delta); err != nil {
 			return err
 		}
 	}
+
 	return nil
 }
 
@@ -643,11 +766,14 @@ func (s *responsesStreamWriter) handleUpstreamError(errObj map[string]any) error
 	if msg == "" {
 		msg = "upstream stream error"
 	}
+
 	body := map[string]any{"type": "api_error", "message": msg}
 	if hint := stringValue(errObj["gateway_hint"]); hint != "" {
 		body["gateway_hint"] = hint
 	}
+
 	s.errored = true
+
 	return s.event("error", map[string]any{"type": "error", "error": body})
 }
 
@@ -656,20 +782,24 @@ func (s *responsesStreamWriter) ensureStart(chunk map[string]any) error {
 	if s.started {
 		return nil
 	}
+
 	s.started = true
 	if id := stringValue(chunk["id"]); id != "" {
 		s.id = id
 	} else {
 		s.id = "resp_gateway"
 	}
+
 	created := intValue(chunk["created"])
 	if created != 0 {
 		s.created = int64(created)
 	}
+
 	resp := s.responseObject("in_progress")
 	if err := s.event("response.created", map[string]any{"type": "response.created", "response": resp}); err != nil {
 		return err
 	}
+
 	return s.event("response.in_progress", map[string]any{"type": "response.in_progress", "response": resp})
 }
 
@@ -679,18 +809,21 @@ func (s *responsesStreamWriter) applyDelta(delta map[string]any) error {
 			return err
 		}
 	}
+
 	return s.emitTools(delta["tool_calls"])
 }
 
 func (s *responsesStreamWriter) emitText(text string) error {
 	if s.msg == nil {
 		s.msg = &responsesMessageState{id: fmt.Sprintf("msg_%d", s.nextIdx), index: s.nextIdx, open: true}
+
 		s.nextIdx++
 		if err := s.event("response.output_item.added", map[string]any{
 			"type": "response.output_item.added", "output_index": s.msg.index, "item": s.messageItem("in_progress"),
 		}); err != nil {
 			return err
 		}
+
 		if err := s.event("response.content_part.added", map[string]any{
 			"type": "response.content_part.added", "item_id": s.msg.id, "output_index": s.msg.index,
 			"content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
@@ -698,7 +831,9 @@ func (s *responsesStreamWriter) emitText(text string) error {
 			return err
 		}
 	}
+
 	s.msg.text.WriteString(text)
+
 	return s.event("response.output_text.delta", map[string]any{
 		"type": "response.output_text.delta", "item_id": s.msg.id, "output_index": s.msg.index,
 		"content_index": 0, "delta": text,
@@ -712,13 +847,17 @@ func (s *responsesStreamWriter) emitTools(raw any) error {
 		if call == nil {
 			continue
 		}
+
 		idx := intValue(call["index"])
+
 		state := s.toolState(idx, call)
 		if state == nil {
 			continue
 		}
+
 		if args := toolCallArguments(call); args != "" {
 			state.args.WriteString(args)
+
 			if err := s.event("response.function_call_arguments.delta", map[string]any{
 				"type": "response.function_call_arguments.delta", "item_id": state.id,
 				"output_index": state.index, "delta": args,
@@ -727,6 +866,7 @@ func (s *responsesStreamWriter) emitTools(raw any) error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -735,13 +875,16 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 	if state, ok := s.tools[idx]; ok {
 		return state
 	}
+
 	name, callID := toolCallIdentity(call)
 	if name == "" {
 		return nil
 	}
+
 	if callID == "" {
 		callID = fmt.Sprintf("call_%d", idx)
 	}
+
 	state := &responsesToolState{
 		id: "fc_" + callID, callID: callID, name: name, index: s.nextIdx, started: true,
 	}
@@ -751,6 +894,7 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 	_ = s.event("response.output_item.added", map[string]any{
 		"type": "response.output_item.added", "output_index": state.index, "item": s.functionItem(state, "in_progress"),
 	})
+
 	return state
 }
 
@@ -758,28 +902,34 @@ func (s *responsesStreamWriter) finish() error {
 	if s.finished {
 		return nil
 	}
+
 	s.finished = true
 	if s.errored {
 		return nil
 	}
+
 	if !s.started {
 		if err := s.ensureStart(nil); err != nil {
 			return err
 		}
 	}
+
 	if err := s.closeMessage(); err != nil {
 		return err
 	}
+
 	for _, idx := range s.toolSeq {
 		if err := s.closeTool(s.tools[idx]); err != nil {
 			return err
 		}
 	}
+
 	if len(s.outputs) == 0 {
 		if err := s.closeEmptyMessage(); err != nil {
 			return err
 		}
 	}
+
 	return s.event("response.completed", map[string]any{
 		"type": "response.completed", "response": s.responseObject("completed"),
 	})
@@ -789,7 +939,9 @@ func (s *responsesStreamWriter) closeMessage() error {
 	if s.msg == nil || !s.msg.open {
 		return nil
 	}
+
 	s.msg.open = false
+
 	text := s.msg.text.String()
 	if err := s.event("response.output_text.done", map[string]any{
 		"type": "response.output_text.done", "item_id": s.msg.id, "output_index": s.msg.index,
@@ -797,30 +949,36 @@ func (s *responsesStreamWriter) closeMessage() error {
 	}); err != nil {
 		return err
 	}
+
 	if err := s.event("response.content_part.done", map[string]any{
 		"type": "response.content_part.done", "item_id": s.msg.id, "output_index": s.msg.index,
 		"content_index": 0, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
 	}); err != nil {
 		return err
 	}
+
 	item := s.messageItem("completed")
 	if err := s.event("response.output_item.done", map[string]any{
 		"type": "response.output_item.done", "output_index": s.msg.index, "item": item,
 	}); err != nil {
 		return err
 	}
+
 	s.outputs = append(s.outputs, responsesIndexedItem{index: s.msg.index, item: item})
+
 	return nil
 }
 
 func (s *responsesStreamWriter) closeEmptyMessage() error {
 	s.msg = &responsesMessageState{id: fmt.Sprintf("msg_%d", s.nextIdx), index: s.nextIdx, open: true}
+
 	s.nextIdx++
 	if err := s.event("response.output_item.added", map[string]any{
 		"type": "response.output_item.added", "output_index": s.msg.index, "item": s.messageItem("in_progress"),
 	}); err != nil {
 		return err
 	}
+
 	return s.closeMessage()
 }
 
@@ -828,6 +986,7 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 	if state == nil || !state.started {
 		return nil
 	}
+
 	args := state.args.String()
 	if err := s.event("response.function_call_arguments.done", map[string]any{
 		"type": "response.function_call_arguments.done", "item_id": state.id,
@@ -835,13 +994,16 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 	}); err != nil {
 		return err
 	}
+
 	item := s.functionItem(state, "completed")
 	if err := s.event("response.output_item.done", map[string]any{
 		"type": "response.output_item.done", "output_index": state.index, "item": item,
 	}); err != nil {
 		return err
 	}
+
 	s.outputs = append(s.outputs, responsesIndexedItem{index: state.index, item: item})
+
 	return nil
 }
 
@@ -860,12 +1022,15 @@ func (s *responsesStreamWriter) responseObject(status string) map[string]any {
 	sorted := append([]responsesIndexedItem(nil), s.outputs...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].index < sorted[j].index })
 	output := make([]any, 0, len(sorted))
+
 	var text strings.Builder
+
 	for _, item := range sorted {
 		output = append(output, item.item)
 		if item.item["type"] != "message" {
 			continue
 		}
+
 		parts, _ := item.item["content"].([]any)
 		for _, part := range parts {
 			if m, ok := part.(map[string]any); ok && m["type"] == "output_text" {
@@ -873,10 +1038,12 @@ func (s *responsesStreamWriter) responseObject(status string) map[string]any {
 			}
 		}
 	}
+
 	usage := map[string]any{
 		"input_tokens": s.inputTokens, "output_tokens": s.outputTokens,
 		"total_tokens": s.inputTokens + s.outputTokens,
 	}
+
 	return responsesObject(s.id, s.model, s.instructions, s.created, status, output, text.String(), usage)
 }
 
@@ -885,9 +1052,11 @@ func (s *responsesStreamWriter) captureUsage(chunk map[string]any) {
 	if usage == nil {
 		return
 	}
+
 	if n := intValue(usage["prompt_tokens"]); n > 0 {
 		s.inputTokens = n
 	}
+
 	if n := intValue(usage["completion_tokens"]); n > 0 {
 		s.outputTokens = n
 	}
@@ -896,11 +1065,14 @@ func (s *responsesStreamWriter) captureUsage(chunk map[string]any) {
 func (s *responsesStreamWriter) event(name string, payload map[string]any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return fmt.Errorf("event: %w", err)
 	}
+
 	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", name, raw); err != nil {
-		return err
+		return fmt.Errorf("event: %w", err)
 	}
+
 	s.Flush()
+
 	return nil
 }

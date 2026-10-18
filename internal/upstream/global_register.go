@@ -31,6 +31,16 @@ import (
 const globalWebUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 	"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+var (
+	errFetchCountriesOnlyGlobalAccounts = errors.New("fetch countries: only global accounts")
+	errGlobalFetchCountriesFailed       = errors.New("GlobalFetchCountries failed")
+	errRegisterStatusOnlyGlobalAccounts = errors.New("register status: only global accounts")
+	errSubmitRegionOnlyGlobalAccounts   = errors.New("submit region: only global accounts")
+	errGlobalSubmitRegionFailed         = errors.New("GlobalSubmitRegion failed")
+	errGlobalCompleteRegistrationFailed = errors.New("GlobalCompleteRegistration failed")
+	errNoCountriesAvailable             = errors.New("no countries available")
+)
+
 // GlobalCountry 可选注册地区（对应 get-country-code 的 list 元素）。
 type GlobalCountry struct {
 	EnName string `json:"EnName"` // 英文全名（countryFullName）
@@ -46,32 +56,40 @@ func (c *Client) globalRegisterBase() string {
 	if c.BillingBaseGlobal != "" {
 		return c.BillingBaseGlobal
 	}
+
 	return defaultGlobalBase
 }
 
 // globalRegisterReq 注册链路通用请求构造：web 指纹 UA + Origin/Referer 同域 + Bearer。
 func (c *Client) globalRegisterReq(method, url, token string, body any) (*http.Request, error) {
 	var rdr io.Reader
+
 	if body != nil {
 		raw, err := json.Marshal(body)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("globalRegisterReq: %w", err)
 		}
+
 		rdr = bytes.NewReader(raw)
 	}
+
 	req, err := http.NewRequestWithContext(context.Background(), method, url, rdr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("globalRegisterReq: %w", err)
 	}
+
 	base := c.globalRegisterBase()
+
 	req.Header.Set("User-Agent", globalWebUA)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Origin", base)
 	req.Header.Set("Referer", base+"/")
+
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
+
 	return req, nil
 }
 
@@ -79,10 +97,12 @@ func (c *Client) globalRegisterReq(method, url, token string, body any) (*http.R
 func (c *Client) globalRegisterJSON(req *http.Request) (code int, msg string, raw json.RawMessage, err error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return 0, "", nil, err
+		return 0, "", nil, fmt.Errorf("globalRegisterJSON: %w", err)
 	}
 	defer resp.Body.Close()
+
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
 	var env struct {
 		Code int             `json:"code"`
 		Msg  string          `json:"msg"`
@@ -91,32 +111,37 @@ func (c *Client) globalRegisterJSON(req *http.Request) (code int, msg string, ra
 	if err := json.Unmarshal(data, &env); err != nil {
 		return 0, "", nil, fmt.Errorf("global register parse: %w", err)
 	}
+
 	return env.Code, env.Msg, env.Data, nil
 }
 
 // GlobalFetchCountries 拉取可选注册地区列表（global 账号登录后调用）。
 // intlOnly=true 时按国际版 web 白名单过滤（HK/MO/SG/TH/PH/MY/ID，对齐 web 展示集）。
-func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCountry, error) {
-	if a == nil || a.Realm() != "global" {
-		return nil, errors.New("fetch countries: only global accounts")
+func (c *Client) GlobalFetchCountries(account2 *auth.Auth, intlOnly bool) ([]GlobalCountry, error) {
+	if account2 == nil || account2.Realm() != "global" {
+		return nil, errFetchCountriesOnlyGlobalAccounts
 	}
+
 	req, err := c.globalRegisterReq(http.MethodPost,
-		c.globalRegisterBase()+"/billing/area/get-country-code", a.AccessTokenValue(), map[string]any{"filterForbidden": 1})
+		c.globalRegisterBase()+"/billing/area/get-country-code", account2.AccessTokenValue(), map[string]any{"filterForbidden": 1})
 	if err != nil {
 		return nil, err
 	}
+
 	code, msg, raw, err := c.globalRegisterJSON(req)
 	if err != nil {
 		return nil, err
 	}
+
 	if code != 0 {
-		return nil, fmt.Errorf("get-country-code: %s (code=%d)", msg, code)
+		return nil, fmt.Errorf("get-country-code: %s (code=%d): %w", msg, code, errGlobalFetchCountriesFailed)
 	}
 	// data 是 JSON 字符串（双层信封）或对象，需二次解析。
 	raw, err = unwrapCountryData(raw)
 	if err != nil {
 		return nil, err
 	}
+
 	var inner struct {
 		Data struct {
 			List []GlobalCountry `json:"list"`
@@ -125,10 +150,12 @@ func (c *Client) GlobalFetchCountries(a *auth.Auth, intlOnly bool) ([]GlobalCoun
 	if err := json.Unmarshal(raw, &inner); err != nil {
 		return nil, fmt.Errorf("country list parse: %w", err)
 	}
+
 	list := inner.Data.List
 	if !intlOnly {
 		return list, nil
 	}
+
 	return filterIntlCountries(list), nil
 }
 
@@ -139,8 +166,10 @@ func unwrapCountryData(raw json.RawMessage) (json.RawMessage, error) {
 		if err := json.Unmarshal(raw, &s2); err != nil {
 			return nil, fmt.Errorf("country list unwrap: %w", err)
 		}
+
 		return json.RawMessage(s2), nil
 	}
+
 	return raw, nil
 }
 
@@ -148,35 +177,42 @@ func unwrapCountryData(raw json.RawMessage) (json.RawMessage, error) {
 // web 展示）。
 func filterIntlCountries(list []GlobalCountry) []GlobalCountry {
 	whitelist := []string{"HK", "MO", "SG", "TH", "PH", "MY", "ID"}
+
 	byCode := make(map[string]GlobalCountry, len(list))
 	for _, ctry := range list {
 		byCode[ctry.IOS2] = ctry
 	}
+
 	out := make([]GlobalCountry, 0, len(whitelist))
 	for _, code := range whitelist {
 		if ctry, ok := byCode[code]; ok {
 			out = append(out, ctry)
 		}
 	}
+
 	return out
 }
 
 // GlobalRegisterStatus 报告 global 账号注册激活状态：是否需要补地区、是否已激活。
-func (c *Client) GlobalRegisterStatus(a *auth.Auth) (activated, needsRegion bool, msg string, err error) {
-	if a == nil || a.Realm() != "global" {
-		return false, false, "", errors.New("register status: only global accounts")
+func (c *Client) GlobalRegisterStatus(account *auth.Auth) (activated, needsRegion bool, msg string, err error) {
+	if account == nil || account.Realm() != "global" {
+		return false, false, "", errRegisterStatusOnlyGlobalAccounts
 	}
+
 	req, err := c.globalRegisterReq(http.MethodGet,
-		c.globalRegisterBase()+"/auth/realms/copilot/overseas/user/register?userId="+a.UID,
-		a.AccessTokenValue(), nil)
+		c.globalRegisterBase()+"/auth/realms/copilot/overseas/user/register?userId="+account.UID,
+		account.AccessTokenValue(), nil)
 	if err != nil {
 		return false, false, "", err
 	}
-	req.Header.Set("X-User-Id", a.UID)
+
+	req.Header.Set("X-User-Id", account.UID)
+
 	code, m, _, err := c.globalRegisterJSON(req)
 	if err != nil {
 		return false, false, "", err
 	}
+
 	switch {
 	case code == 200:
 		return true, false, "register success", nil
@@ -188,62 +224,73 @@ func (c *Client) GlobalRegisterStatus(a *auth.Auth) (activated, needsRegion bool
 }
 
 // GlobalSubmitRegion 提交注册地区（幂等）。country 来自 GlobalFetchCountries。
-func (c *Client) GlobalSubmitRegion(a *auth.Auth, country GlobalCountry) error {
-	if a == nil || a.Realm() != "global" {
-		return errors.New("submit region: only global accounts")
+func (c *Client) GlobalSubmitRegion(account3 *auth.Auth, country *GlobalCountry) error {
+	if account3 == nil || account3.Realm() != "global" {
+		return errSubmitRegionOnlyGlobalAccounts
 	}
+
 	attrs := map[string]any{
 		"countryCode":     []string{country.Code},
 		"countryFullName": []string{country.EnName},
 		"countryName":     []string{country.IOS2},
 	}
+
 	req, err := c.globalRegisterReq(http.MethodPost, c.globalRegisterBase()+"/console/login/account",
-		a.AccessTokenValue(), map[string]any{"attributes": attrs})
+		account3.AccessTokenValue(), map[string]any{"attributes": attrs})
 	if err != nil {
 		return err
 	}
+
 	code, msg, _, err := c.globalRegisterJSON(req)
 	if err != nil {
 		return err
 	}
+
 	if code != 0 {
-		return fmt.Errorf("submit region: %s (code=%d)", msg, code)
+		return fmt.Errorf("submit region: %s (code=%d): %w", msg, code, errGlobalSubmitRegionFailed)
 	}
+
 	return nil
 }
 
 // GlobalCompleteRegistration 一键注册激活：先查状态，需补地区则按默认地区（白名单首个，
 // 通常 HK）提交后重新激活。activated 表示调用后账号已激活可用。幂等（已激活直接返回）。
 // 失败不阻断调用方（panel login 已落盘），仅返回错误供日志。
-func (c *Client) GlobalCompleteRegistration(a *auth.Auth) (activated bool, err error) {
-	activated, needsRegion, msg, err := c.GlobalRegisterStatus(a)
+func (c *Client) GlobalCompleteRegistration(account4 *auth.Auth) (activated bool, err error) {
+	activated, needsRegion, msg, err := c.GlobalRegisterStatus(account4)
 	if err != nil {
 		return false, err
 	}
+
 	if activated {
 		return true, nil
 	}
+
 	if !needsRegion {
-		return false, fmt.Errorf("register not activated: %s", msg)
+		return false, fmt.Errorf("register not activated: %s: %w", msg, errGlobalCompleteRegistrationFailed)
 	}
 	// 需补地区：拉白名单，取首个（HK）提交。
-	countries, err := c.GlobalFetchCountries(a, true)
+	countries, err := c.GlobalFetchCountries(account4, true)
 	if err != nil {
 		return false, fmt.Errorf("fetch countries: %w", err)
 	}
+
 	if len(countries) == 0 {
-		return false, errors.New("no countries available")
+		return false, errNoCountriesAvailable
 	}
-	if serr := c.GlobalSubmitRegion(a, countries[0]); serr != nil {
+
+	if serr := c.GlobalSubmitRegion(account4, &countries[0]); serr != nil {
 		return false, fmt.Errorf("submit region: %w", serr)
 	}
 	// 重新激活验证。
-	activated, _, msg, err = c.GlobalRegisterStatus(a)
+	activated, _, msg, err = c.GlobalRegisterStatus(account4)
 	if err != nil {
 		return false, err
 	}
+
 	if !activated {
-		return false, fmt.Errorf("register still not activated after region submit: %s", msg)
+		return false, fmt.Errorf("register still not activated after region submit: %s: %w", msg, errGlobalCompleteRegistrationFailed)
 	}
+
 	return true, nil
 }

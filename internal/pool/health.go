@@ -42,10 +42,12 @@ func (mh *modelHealth) decayedErr(now time.Time) float64 {
 	if mh.errScore <= 0 || mh.lastErr.IsZero() {
 		return 0
 	}
+
 	elapsed := now.Sub(mh.lastErr)
 	if elapsed <= 0 {
 		return mh.errScore
 	}
+
 	return mh.errScore * math.Pow(0.5, float64(elapsed)/float64(healthErrHalfLife))
 }
 
@@ -53,9 +55,11 @@ func (mh *modelHealth) decayedErr(now time.Time) float64 {
 func (mh *modelHealth) observeError(now time.Time, ok bool) {
 	mh.errScore = mh.decayedErr(now)
 	mh.lastErr = now
+
 	if ok {
 		return
 	}
+
 	mh.errScore += healthErrStep
 	if mh.errScore > 1 {
 		mh.errScore = 1
@@ -67,8 +71,10 @@ func (mh *modelHealth) observeTTFT(ttftMs int64) {
 	if !mh.hasTTFT {
 		mh.ttftMs = float64(ttftMs)
 		mh.hasTTFT = true
+
 		return
 	}
+
 	mh.ttftMs = mh.ttftMs*(1-healthAlpha) + float64(ttftMs)*healthAlpha
 }
 
@@ -79,26 +85,34 @@ func (p *Pool) RecordModelHealth(uid, model string, ttftMs int64, hasTTFT, ok bo
 	if uid == "" || model == "" {
 		return
 	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, found := p.byUID[uid]
+
+	entry2, found := p.byUID[uid]
 	if !found {
 		return
 	}
-	if e.health == nil {
-		e.health = make(map[string]*modelHealth)
+
+	if entry2.health == nil {
+		entry2.health = make(map[string]*modelHealth)
 	}
+
 	now := p.now()
-	mh := e.health[model]
-	if mh == nil {
-		mh = &modelHealth{}
-		e.health[model] = mh
+
+	modelHealth2 := entry2.health[model]
+	if modelHealth2 == nil {
+		modelHealth2 = &modelHealth{}
+		entry2.health[model] = modelHealth2
 	}
-	mh.observeError(now, ok)
+
+	modelHealth2.observeError(now, ok)
+
 	if hasTTFT && ttftMs > 0 {
-		mh.observeTTFT(ttftMs)
+		modelHealth2.observeTTFT(ttftMs)
 	}
-	mh.lastSeen = now
+
+	modelHealth2.lastSeen = now
 }
 
 // healthFactor 返回该账号在 model 上的健康降权系数 ∈ [healthFloor, 1]。
@@ -107,24 +121,30 @@ func (e *entry) healthFactor(model string, now time.Time) float64 {
 	if model == "" || len(e.health) == 0 {
 		return 1
 	}
-	mh := e.health[model]
-	if mh == nil {
+
+	modelHealth2 := e.health[model]
+	if modelHealth2 == nil {
 		return 1
 	}
-	f := 1.0
-	if mh.hasTTFT && mh.ttftMs > healthLatencyRefMs {
-		f *= float64(healthLatencyRefMs) / mh.ttftMs
+
+	num := 1.0
+	if modelHealth2.hasTTFT && modelHealth2.ttftMs > healthLatencyRefMs {
+		num *= float64(healthLatencyRefMs) / modelHealth2.ttftMs
 	}
-	if errScore := mh.decayedErr(now); errScore > 0 {
-		f *= 1 - healthErrWeight*errScore
+
+	if errScore := modelHealth2.decayedErr(now); errScore > 0 {
+		num *= 1 - healthErrWeight*errScore
 	}
-	if f < healthFloor {
-		f = healthFloor
+
+	if num < healthFloor {
+		num = healthFloor
 	}
-	if f > 1 {
-		f = 1
+
+	if num > 1 {
+		num = 1
 	}
-	return f
+
+	return num
 }
 
 // pruneExpiredHealth 删除超过 healthTTL 无观测的健康条目（惰性清理，防 map 膨胀）。
@@ -133,6 +153,7 @@ func (e *entry) pruneExpiredHealth(now time.Time) {
 	if len(e.health) == 0 {
 		return
 	}
+
 	for model, mh := range e.health {
 		if now.Sub(mh.lastSeen) > healthTTL {
 			delete(e.health, model)
@@ -146,21 +167,26 @@ func (e *entry) pruneExpiredHealth(now time.Time) {
 func (p *Pool) TTFTByModel() map[string]float64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+
 	now := p.now()
 	sum := map[string]float64{}
 	count := map[string]int{}
+
 	for _, e := range p.byUID {
 		for model, mh := range e.health {
 			if !mh.hasTTFT || mh.ttftMs <= 0 || now.Sub(mh.lastSeen) > healthTTL {
 				continue
 			}
+
 			sum[model] += mh.ttftMs
 			count[model]++
 		}
 	}
+
 	out := make(map[string]float64, len(sum))
 	for model, s := range sum {
 		out[model] = s / float64(count[model])
 	}
+
 	return out
 }

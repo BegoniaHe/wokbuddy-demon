@@ -11,6 +11,8 @@ import (
 )
 
 func TestResponsesRequestMapping(t *testing.T) {
+	t.Parallel()
+
 	body := `{
 		"model":"cn:glm-5.2",
 		"instructions":"sys",
@@ -24,24 +26,30 @@ func TestResponsesRequestMapping(t *testing.T) {
 		"max_output_tokens":128,
 		"stream":true
 	}`
+
 	raw, model, instructions, stream, err := responsesToOpenAI([]byte(body))
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if model != "cn:glm-5.2" || instructions != "sys" || !stream {
 		t.Fatalf("model=%q instructions=%q stream=%v", model, instructions, stream)
 	}
+
 	var got map[string]any
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
+
 	if got["max_tokens"] != float64(128) || got["stream"] != true {
 		t.Errorf("params=%v", got)
 	}
+
 	msgs, _ := got["messages"].([]any)
 	if len(msgs) != 4 {
 		t.Fatalf("messages=%d want 4: %v", len(msgs), msgs)
 	}
+
 	assertResponsesMessages(t, msgs)
 	assertResponsesTools(t, got)
 }
@@ -54,11 +62,14 @@ func assertResponsesMessages(t *testing.T, msgs []any) {
 
 func assertResponsesSystemUser(t *testing.T, msgs []any) {
 	t.Helper()
+
 	sys := msgs[0].(map[string]any)
 	user := msgs[1].(map[string]any)
+
 	if sys["role"] != "system" || sys["content"] != "sys" {
 		t.Errorf("system=%v", sys)
 	}
+
 	if user["role"] != "user" || user["content"] != "hi" {
 		t.Errorf("user=%v", user)
 	}
@@ -66,16 +77,20 @@ func assertResponsesSystemUser(t *testing.T, msgs []any) {
 
 func assertResponsesToolRoundTrip(t *testing.T, msgs []any) {
 	t.Helper()
+
 	assistant := msgs[2].(map[string]any)
 	tool := msgs[3].(map[string]any)
+
 	calls, _ := assistant["tool_calls"].([]any)
 	if len(calls) != 1 {
 		t.Fatalf("tool_calls=%v", assistant)
 	}
+
 	fn := calls[0].(map[string]any)["function"].(map[string]any)
 	if fn["name"] != "lookup" || fn["arguments"] != `{"q":1}` {
 		t.Errorf("function=%v", fn)
 	}
+
 	if tool["role"] != "tool" || tool["tool_call_id"] != "c1" || tool["content"] != "ok" {
 		t.Errorf("tool=%v", tool)
 	}
@@ -83,14 +98,17 @@ func assertResponsesToolRoundTrip(t *testing.T, msgs []any) {
 
 func assertResponsesTools(t *testing.T, got map[string]any) {
 	t.Helper()
+
 	tools, _ := got["tools"].([]any)
 	if len(tools) != 1 {
 		t.Fatalf("tools=%v", got["tools"])
 	}
+
 	fn := tools[0].(map[string]any)["function"].(map[string]any)
 	if fn["name"] != "lookup" || fn["description"] != "d" {
 		t.Errorf("tool function=%v", fn)
 	}
+
 	choice := got["tool_choice"].(map[string]any)
 	if choice["type"] != "function" {
 		t.Errorf("tool_choice=%v", choice)
@@ -98,6 +116,8 @@ func assertResponsesTools(t *testing.T, got map[string]any) {
 }
 
 func TestResponsesRequestRejectsUnknownItem(t *testing.T) {
+	t.Parallel()
+
 	body := `{"model":"m","input":[{"type":"custom_tool_call"}]}`
 	if _, _, _, _, err := responsesToOpenAI([]byte(body)); err == nil {
 		t.Fatal("unknown input item should fail")
@@ -105,6 +125,8 @@ func TestResponsesRequestRejectsUnknownItem(t *testing.T) {
 }
 
 func TestResponsesFromOpenAI(t *testing.T) {
+	t.Parallel()
+
 	body := map[string]any{
 		"id": "chatcmpl-1", "created": float64(1753600000),
 		"choices": []any{map[string]any{
@@ -119,17 +141,21 @@ func TestResponsesFromOpenAI(t *testing.T) {
 		}},
 		"usage": map[string]any{"prompt_tokens": float64(3), "completion_tokens": float64(2)},
 	}
+
 	resp := responsesFromOpenAI(body, "glm-5.2", "sys")
 	if resp["object"] != "response" || resp["output_text"] != "hello" {
 		t.Fatalf("response=%v", resp)
 	}
+
 	output, _ := resp["output"].([]any)
 	if len(output) != 2 {
 		t.Fatalf("output=%v", output)
 	}
+
 	if output[0].(map[string]any)["type"] != "message" || output[1].(map[string]any)["type"] != "function_call" {
 		t.Errorf("output types=%v", output)
 	}
+
 	usage, _ := resp["usage"].(map[string]any)
 	if usage["total_tokens"] != 5 {
 		t.Errorf("usage=%v", usage)
@@ -137,8 +163,11 @@ func TestResponsesFromOpenAI(t *testing.T) {
 }
 
 func TestResponsesStreamWriter(t *testing.T) {
+	t.Parallel()
+
 	rec := httptest.NewRecorder()
 	w := newResponsesStreamWriter(rec, "glm-5.2", "sys")
+
 	chunks := `data: {"id":"chatcmpl-1","created":1753600000,"choices":[{"index":0,"delta":{"content":"he"}}]}` + "\n\n" +
 		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"llo"}}]}` + "\n\n" +
 		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"lookup","arguments":"{\"q\":"}}]}}]}` + "\n\n" +
@@ -148,6 +177,7 @@ func TestResponsesStreamWriter(t *testing.T) {
 	if _, err := w.Write([]byte(chunks)); err != nil {
 		t.Fatal(err)
 	}
+
 	out := rec.Body.String()
 	for _, want := range []string{
 		"event: response.created", "event: response.output_item.added",
@@ -163,38 +193,46 @@ func TestResponsesStreamWriter(t *testing.T) {
 }
 
 func TestResponsesEndpointNonStream(t *testing.T) {
+	t.Parallel()
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(&Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hi"}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
+
 	var resp map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
+
 	if resp["output_text"] != "你好" {
 		t.Errorf("output_text=%v", resp["output_text"])
 	}
 }
 
 func TestResponsesEndpointStream(t *testing.T) {
+	t.Parallel()
 	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(Config{Pool: p, Upstream: up})
+	h := NewHandler(&Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"glm-5.2","input":"hi","stream":true}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
+
 	out := rec.Body.String()
 	if !strings.Contains(out, "event: response.created") || !strings.Contains(out, "event: response.completed") {
 		t.Fatalf("missing responses events:\n%s", out)
 	}
+
 	if !strings.Contains(out, `"delta":"你好"`) {
 		t.Errorf("missing text delta:\n%s", out)
 	}

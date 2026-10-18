@@ -27,6 +27,7 @@ const (
 func clientToken() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
+
 	return fmt.Sprintf("%s-%s-%s-%s-%s",
 		hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]), hex.EncodeToString(b[6:8]),
 		hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16]))
@@ -66,10 +67,12 @@ func (c *Client) GrowthStreakFull(a *auth.Auth) (*StreakFull, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	out := &StreakFull{}
 	if err := json.Unmarshal(data, out); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("GrowthStreakFull: %w", err)
 	}
+
 	return out, nil
 }
 
@@ -78,6 +81,7 @@ func (c *Client) GrowthStreakFull(a *auth.Auth) (*StreakFull, error) {
 func (c *Client) GrowthRedeemTier(a *auth.Auth, tier string) error {
 	_, err := c.growthJSON(a, http.MethodPost, streakRedeemPath,
 		map[string]any{"tier": tier, "client_token": clientToken()})
+
 	return err
 }
 
@@ -87,6 +91,7 @@ func (c *Client) LotteryChances(a *auth.Auth) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+
 	var resp struct {
 		Chances int `json:"chances"`
 		Module  struct {
@@ -94,8 +99,9 @@ func (c *Client) LotteryChances(a *auth.Auth) (int, error) {
 		} `json:"module"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, err
+		return 0, fmt.Errorf("LotteryChances: %w", err)
 	}
+
 	return resp.Chances, nil
 }
 

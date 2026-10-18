@@ -49,6 +49,7 @@ func New(path string) *Store {
 	if path != "" {
 		s.load()
 	}
+
 	return s
 }
 
@@ -57,32 +58,40 @@ func (s *Store) load() {
 	if err != nil {
 		return
 	}
+
 	for _, line := range splitLines(raw) {
 		var e Event
 		if json.Unmarshal(line, &e) != nil || e.UID == "" || e.Model == "" {
 			continue
 		}
-		s.events[eventKey(e)] = e
+
+		s.events[eventKey(&e)] = e
 	}
 }
 
 // Add 记录一条撞线事件；同「账号+模型+重置时刻」重复事件被忽略。
-func (s *Store) Add(e Event) bool {
+func (s *Store) Add(e *Event) bool {
 	if s == nil || e.UID == "" || e.Model == "" {
 		return false
 	}
-	if e.At.IsZero() {
-		e.At = time.Now()
+
+	event := *e
+	if event.At.IsZero() {
+		event.At = time.Now()
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := eventKey(e)
+
+	key := eventKey(&event)
 	if _, exists := s.events[key]; exists {
 		return false
 	}
-	s.events[key] = e
-	s.pruneLocked(e.At)
+
+	s.events[key] = event
+	s.pruneLocked(event.At)
 	s.persistLocked()
+
 	return true
 }
 
@@ -91,12 +100,15 @@ func (s *Store) Events() []Event {
 	if s == nil {
 		return nil
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	out := make([]Event, 0, len(s.events))
 	for _, e := range s.events {
 		out = append(out, e)
 	}
+
 	return out
 }
 
@@ -105,25 +117,32 @@ func (s *Store) Budgets() map[string]Budget {
 	events := s.Events()
 	perAccount := map[string]map[string]float64{} // modelKey -> uid -> sum
 	counts := map[string]map[string]int{}
-	for _, e := range events {
-		key := e.Realm + "|" + e.Model
+
+	for _, item := range events {
+		key := item.Realm + "|" + item.Model
 		if perAccount[key] == nil {
 			perAccount[key] = map[string]float64{}
 			counts[key] = map[string]int{}
 		}
-		perAccount[key][e.UID] += float64(e.Used)
-		counts[key][e.UID]++
+
+		perAccount[key][item.UID] += float64(item.Used)
+		counts[key][item.UID]++
 	}
+
 	out := make(map[string]Budget, len(perAccount))
 	for key, accounts := range perAccount {
 		var sum float64
+
 		samples := 0
+
 		for uid, total := range accounts {
 			sum += total / float64(counts[key][uid])
 			samples += counts[key][uid]
 		}
+
 		out[key] = Budget{Used: sum / float64(len(accounts)), Samples: samples}
 	}
+
 	return out
 }
 
@@ -136,18 +155,23 @@ func (s *Store) pruneLocked(now time.Time) {
 			delete(s.events, key)
 		}
 	}
+
 	if len(s.events) <= maxEvents {
 		return
 	}
+
 	type entry struct {
 		key string
 		at  time.Time
 	}
+
 	all := make([]entry, 0, len(s.events))
 	for key, e := range s.events {
 		all = append(all, entry{key, e.At})
 	}
+
 	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+
 	for _, item := range all[:len(all)-maxEvents] {
 		delete(s.events, item.key)
 	}
@@ -157,41 +181,50 @@ func (s *Store) persistLocked() {
 	if s.path == "" {
 		return
 	}
+
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
 		return
 	}
+
 	raw := make([]byte, 0, len(s.events)*128)
 	for _, e := range s.events {
 		line, err := json.Marshal(e)
 		if err != nil {
 			continue
 		}
+
 		raw = append(raw, line...)
 		raw = append(raw, '\n')
 	}
+
 	tmp := s.path + ".tmp"
 	if os.WriteFile(tmp, raw, 0o600) == nil {
 		_ = atomicwrite.Rename(tmp, s.path)
 	}
 }
 
-func eventKey(e Event) string {
+func eventKey(e *Event) string {
 	return e.UID + "|" + e.Model + "|" + e.ResetAt.UTC().Format(time.RFC3339)
 }
 
 func splitLines(raw []byte) [][]byte {
 	var out [][]byte
+
 	start := 0
+
 	for i, b := range raw {
 		if b == '\n' {
 			if i > start {
 				out = append(out, raw[start:i])
 			}
+
 			start = i + 1
 		}
 	}
+
 	if start < len(raw) {
 		out = append(out, raw[start:])
 	}
+
 	return out
 }

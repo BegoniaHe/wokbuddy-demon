@@ -13,18 +13,20 @@ import (
 
 // benchPool 构建 46 账号的池（对齐生产规模），全部 healthy 且 credits 各不相同。
 func benchPool(b *testing.B) *Pool {
-	p := New("")
+	pool := New("")
 	for i := range 46 {
-		p.Add(&auth.Auth{UID: fmt.Sprintf("u%02d", i)})
-		p.SetCredits(fmt.Sprintf("u%02d", i), int64(1000-i*13%900), 0)
+		pool.Add(&auth.Auth{UID: fmt.Sprintf("u%02d", i)})
+		pool.SetCredits(fmt.Sprintf("u%02d", i), int64(1000-i*13%900), 0)
 	}
-	return p
+
+	return pool
 }
 
 // BenchmarkPick46Accounts P1：46 账号全扫描 + 全排序 + 三因子权重抽签的每次耗时。
 func BenchmarkPick46Accounts(b *testing.B) {
 	p := benchPool(b)
 	b.ResetTimer()
+
 	for range b.N {
 		p.Pick()
 	}
@@ -37,6 +39,7 @@ func BenchmarkStateSerialize46Accounts(b *testing.B) {
 	sf := p.stateOverviewLocked()
 	p.mu.Unlock()
 	b.ResetTimer()
+
 	for range b.N {
 		if _, err := json.MarshalIndent(sf, "", "  "); err != nil {
 			b.Fatal(err)
@@ -51,6 +54,7 @@ func BenchmarkStateSerializeCompact46(b *testing.B) {
 	sf := p.stateOverviewLocked()
 	p.mu.Unlock()
 	b.ResetTimer()
+
 	for range b.N {
 		if _, err := json.Marshal(sf); err != nil {
 			b.Fatal(err)
@@ -62,12 +66,13 @@ func BenchmarkStateSerializeCompact46(b *testing.B) {
 func BenchmarkSnapshotMarshal46(b *testing.B) {
 	p := benchPool(b)
 	p.mu.Lock()
-	sf := p.stateOverviewLocked()
+	stateFile2 := p.stateOverviewLocked()
 	p.mu.Unlock()
 	b.ResetTimer()
+
 	for range b.N {
 		now := time.Now()
-		if _, err := json.Marshal(snapshot{stateFile: sf, SavedAt: now}); err != nil {
+		if _, err := json.Marshal(snapshot{stateFile: stateFile2, SavedAt: now}); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -79,6 +84,7 @@ func BenchmarkSnapshotMarshal46(b *testing.B) {
 //	网络走 5s 超时 fire-and-forget）。
 func BenchmarkGoroutineSpawn(b *testing.B) {
 	b.ResetTimer()
+
 	for range b.N {
 		go func() { _ = 1 }()
 	}

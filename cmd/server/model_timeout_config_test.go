@@ -6,22 +6,28 @@ import (
 )
 
 func TestModelTimeoutConfig(t *testing.T) {
-	c := Default()
-	c.Upstream.ModelTimeouts = map[string]ModelTimeout{
+	t.Parallel()
+
+	config := Default()
+
+	config.Upstream.ModelTimeouts = map[string]ModelTimeout{
 		" cn:glm-5.2 ": {Header: "300s", Idle: "600s"},
 		"gpt-5.6-sol":  {Header: "120s"},
 	}
-	if err := c.normalize(); err != nil {
+	if err := config.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
 	}
-	spec := c.Upstream.ModelTimeouts["cn:glm-5.2"]
+
+	spec := config.Upstream.ModelTimeouts["cn:glm-5.2"]
 	if spec.HeaderDur != 300*time.Second || spec.IdleDur != 600*time.Second {
 		t.Fatalf("spec=%+v", spec)
 	}
 }
 
 func TestModelTimeoutConfigRejectsInvalid(t *testing.T) {
-	for _, tc := range []struct {
+	t.Parallel()
+
+	for _, testCase := range []struct {
 		name string
 		spec ModelTimeout
 	}{
@@ -30,9 +36,10 @@ func TestModelTimeoutConfigRejectsInvalid(t *testing.T) {
 		{"两项皆空", ModelTimeout{}},
 	} {
 		c := Default()
-		c.Upstream.ModelTimeouts = map[string]ModelTimeout{"m": tc.spec}
+
+		c.Upstream.ModelTimeouts = map[string]ModelTimeout{"m": testCase.spec}
 		if err := c.normalize(); err == nil {
-			t.Errorf("%s: normalize 应报错", tc.name)
+			t.Errorf("%s: normalize 应报错", testCase.name)
 		}
 	}
 }

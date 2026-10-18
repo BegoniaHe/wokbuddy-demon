@@ -53,6 +53,7 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 	e.disabled = true
 	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason
+
 	p.dirty.Store(true)
 }
 
@@ -64,12 +65,14 @@ func (p *Pool) disableLocked(e *entry, reason string) {
 // 活跃上报/保活/余额刷新——这正是「暂停选号但不掉保号」的实现基础。
 func (p *Pool) pauseLocked(e *entry) {
 	e.paused = true
+
 	p.dirty.Store(true)
 }
 
 // resumeLocked 解除暂停选号（幂等）：只清 paused，账号若不在其它惩罚期即恢复可选。
 func (p *Pool) resumeLocked(e *entry) {
 	e.paused = false
+
 	p.dirty.Store(true)
 }
 
@@ -85,12 +88,13 @@ func (p *Pool) resumeLocked(e *entry) {
 // 收敛。硬冷却（CoolHard）的权威恢复证据正是余额恢复（remain>0），照旧解冻。
 // 不动熔断器（fails/retryCount/breakerUntil）——签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康。调用方必须已持有 p.mu。
-func (p *Pool) reviveCoolingLocked(e *entry, credits, total int64) {
-	e.credits = credits
-	e.creditsTotal = total
-	if e.coolKind == CoolHard {
-		e.until = time.Time{}
-		e.coolKind = 0
-		e.reason = ""
+func (p *Pool) reviveCoolingLocked(entry2 *entry, credits, total int64) {
+	entry2.credits = credits
+
+	entry2.creditsTotal = total
+	if entry2.coolKind == CoolHard {
+		entry2.until = time.Time{}
+		entry2.coolKind = 0
+		entry2.reason = ""
 	}
 }

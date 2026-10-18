@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
@@ -35,8 +36,11 @@ func requestModalities(body []byte) []string {
 	if json.Unmarshal(body, &peek) != nil {
 		return nil
 	}
+
 	var out []string
+
 	seen := map[string]bool{}
+
 	for _, m := range peek.Messages {
 		var parts []struct {
 			Type string `json:"type"`
@@ -44,15 +48,18 @@ func requestModalities(body []byte) []string {
 		if json.Unmarshal(m.Content, &parts) != nil {
 			continue // 字符串 content / 缺失：纯文本，无 part
 		}
+
 		for _, part := range parts {
 			mod := upstream.RequestPartModality(part.Type)
 			if mod == "" || seen[mod] {
 				continue
 			}
+
 			seen[mod] = true
 			out = append(out, mod)
 		}
 	}
+
 	return out
 }
 
@@ -63,37 +70,43 @@ func (h *Handler) modelInfosSnapshot(realm string) []upstream.ModelInfo {
 	if realm == "global" {
 		return h.cfg.Upstream.CachedGlobalModelInfos()
 	}
-	return cachedModelsSnapshot()
+
+	return h.cachedModelsSnapshot()
 }
 
 // findModelInfo 在目录快照里按裸 id 查模型。
 func findModelInfo(infos []upstream.ModelInfo, id string) (upstream.ModelInfo, bool) {
-	for _, mi := range infos {
-		if mi.ID == id {
-			return mi, true
+	for i := range infos {
+		if infos[i].ID == id {
+			return infos[i], true
 		}
 	}
+
 	return upstream.ModelInfo{}, false
 }
 
 // missingModalities 返回 request 中有、而模型**明确声明**里没有的模态。
 // 只依据完整声明（上游字段/models.dev）：能力未知 → nil（放行）；仅
 // supports_images 推导时只能证明图片能力，不能据此判 audio/file 缺失。
-func missingModalities(mi upstream.ModelInfo, want []string) []string {
+func missingModalities(mi *upstream.ModelInfo, want []string) []string {
 	have := mi.DeclaredInputModalities()
 	if len(have) == 0 {
 		return nil
 	}
+
 	has := map[string]bool{}
 	for _, m := range have {
 		has[m] = true
 	}
+
 	var missing []string
+
 	for _, m := range want {
 		if !has[m] {
 			missing = append(missing, m)
 		}
 	}
+
 	return missing
 }
 
@@ -102,30 +115,36 @@ func missingModalities(mi upstream.ModelInfo, want []string) []string {
 // 不得凭「无法证明不支持」成为候选，否则开路由后可能把请求改选到纯文本模型。
 func modelsSupporting(infos []upstream.ModelInfo, want []string) []upstream.ModelInfo {
 	var out []upstream.ModelInfo
-	for _, mi := range infos {
-		if modelSupportsAll(mi, want) {
-			out = append(out, mi)
+
+	for i := range infos {
+		if modelSupportsAll(&infos[i], want) {
+			out = append(out, infos[i])
 		}
 	}
+
 	return out
 }
 
 // modelSupportsAll 报告模型是否能被证明支持全部 want 模态：完整声明优先，
 // supports_images 仅用于证明图片能力；其余无法证明的一律视为不支持。
-func modelSupportsAll(mi upstream.ModelInfo, want []string) bool {
+func modelSupportsAll(modelInfo *upstream.ModelInfo, want []string) bool {
 	has := map[string]bool{}
-	for _, m := range mi.DeclaredInputModalities() {
+	for _, m := range modelInfo.DeclaredInputModalities() {
 		has[m] = true
 	}
+
 	for _, m := range want {
 		if has[m] {
 			continue
 		}
-		if m == upstream.ModalityImage && mi.SupportsImages {
+
+		if m == upstream.ModalityImage && modelInfo.SupportsImages {
 			continue
 		}
+
 		return false
 	}
+
 	return true
 }
 
@@ -136,33 +155,38 @@ func (f *chatFlow) applyModalityRoute() bool {
 	if len(want) == 0 {
 		return true // 纯文本请求：既有路由零改动
 	}
+
 	infos := f.h.modelInfosSnapshot(f.realm)
 	if len(infos) == 0 {
 		return true // 目录缓存冷：无法判定，不拦（宁缺勿滥）
 	}
-	mi, ok := findModelInfo(infos, f.bareModel)
+
+	modelInfo, ok := findModelInfo(infos, f.bareModel)
 	if !ok {
 		return true // 目录未收录（新模型/别名）：交给上游
 	}
-	missing := missingModalities(mi, want)
+
+	missing := missingModalities(&modelInfo, want)
 	if len(missing) == 0 {
 		return true
 	}
 	// 默认拒绝：明确告诉客户端模型缺哪个模态，并给出几个可用模型。
 	if !f.h.multimodalRoutingEnabled() {
-		f.rejectModality(mi.ID, missing, infos)
+		f.rejectModality(modelInfo.ID, missing, infos)
 		return false
 	}
 	// 按模态路由：同 realm 目录里找支持全部模态的候选（首选目录第一条）。
 	cands := modelsSupporting(infos, want)
 	if len(cands) == 0 {
-		f.rejectModality(mi.ID, missing, infos)
+		f.rejectModality(modelInfo.ID, missing, infos)
 		return false
 	}
+
 	chosen := cands[0]
 	log.Printf("INFO: [server] multimodal routing: model=%s -> %s (requested modalities=%v, acct realm=%s)",
 		f.bareModel, chosen.ID, want, f.realm)
 	f.rewriteModelForRouting(chosen.ID)
+
 	return true
 }
 
@@ -172,19 +196,24 @@ func (f *chatFlow) rejectModality(model string, missing []string, infos []upstre
 	msg := "model \"" + model + "\" does not support " + strings.Join(missing, "/") + " input"
 	cands := modelsSupporting(infos, missing)
 	hint := ""
+
 	if len(cands) > 0 {
 		names := make([]string, 0, 3)
-		for _, c := range cands {
+		for i := range cands {
 			if len(names) == 3 {
 				break
 			}
-			names = append(names, c.ID)
+
+			names = append(names, cands[i].ID)
 		}
+
 		hint = "models supporting " + strings.Join(missing, "/") + " input: " + strings.Join(names, ", ")
 	}
+
 	f.out.Error(http.StatusBadRequest, "model_capability", msg, hint)
 	f.st.status = http.StatusBadRequest
 	f.st.outcome = reqlog.OutcomeHTTPError
+
 	log.Printf("WARN: [server] model=%s lacks modalities=%v (request rejected before upstream call) hint=%s",
 		logfmt.Truncate(model, 80), missing, hint)
 }
@@ -193,6 +222,7 @@ func (f *chatFlow) rejectModality(model string, missing []string, infos []upstre
 // bareModel 与倍率（选号、粘性、用量维度都以 bareModel 为准）。
 func (f *chatFlow) rewriteModelForRouting(bare string) {
 	f.body = rewriteModel(f.body, bare)
+
 	f.bareModel = bare
 	if f.h.cfg.Upstream != nil {
 		f.modelRate = f.h.cfg.Upstream.ModelRate(f.realm, bare)
@@ -206,10 +236,5 @@ func (h *Handler) multimodalRoutingEnabled() bool {
 
 // containsModality 报告模态列表是否包含目标值。
 func containsModality(mods []string, want string) bool {
-	for _, m := range mods {
-		if m == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(mods, want)
 }
