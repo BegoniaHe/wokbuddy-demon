@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -58,9 +59,9 @@ func stateSibling(stateFile, name string) string {
 // preflightAPIKey 在加载前替换公开占位密钥；无法写回时返回仅供本进程使用的
 // 内存随机 key（重启后需重新设置），避免把 test_key 带进运行时。
 func preflightAPIKey(path string) (memoryKey string) {
-	key, replaced, err := ReplacePlaceholderAPIKey(path)
+	_, replaced, err := ReplacePlaceholderAPIKey(path)
 	if err == nil && replaced {
-		log.Printf("config %s 使用公开占位 api_key，已替换为随机密钥（api_key=%s，记录在该文件里，可自行修改）", path, key)
+		log.Printf("config %s 使用公开占位 api_key，已替换为随机密钥（记录在该文件里，可自行修改）", path)
 		return ""
 	}
 	if err == nil || errors.Is(err, fs.ErrNotExist) {
@@ -93,8 +94,8 @@ func loadConfig(path string) (*Config, error) {
 	}
 	// 首次运行：目录下没有配置 → 自动落一份推荐配置再加载。
 	// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
-	if key, werr := WriteDefault(path); werr == nil {
-		log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", path, key)
+	if _, werr := WriteDefault(path); werr == nil {
+		log.Printf("config %s 不存在，已生成推荐配置（api_key 记录在该文件里，可自行修改）", path)
 		if cfg, err = Load(path); err == nil {
 			return cfg, nil
 		}
@@ -579,12 +580,20 @@ func panelListenPath(listen string) string {
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
 func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	return saveConfigInternal(raw, path, live, p, up, sch, true, true)
 }
+
+// configWriteMu 串行化配置写盘。save/restore 都是「读旧文件 → 合并 → 写 tmp →
+// rename」的读改写序列；并发请求共用同名 tmp 会交错写入，甚至 rename 出半截 JSON。
+var configWriteMu sync.Mutex
 
 // restoreConfig 用 config.json.1 覆盖当前配置。恢复是整体替换（不 merge 当前文件），
 // 否则被改坏的未知键会继续残留；同时不再滚动备份，保留同一份 .1 供重复恢复。
 func restoreConfig(path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
 	raw, err := os.ReadFile(configBackupPath(path))
 	if err != nil {
 		return nil, fmt.Errorf("read config backup: %w", err)
