@@ -11,7 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -200,15 +202,23 @@ func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 	client := newFakeUpstream(t, func(string) (int, string, bool) {
 		return 200, sseOK, true
 	})
+
+	trusted, err := httpauth.ParseTrustedProxies([]string{"127.0.0.1/32", "10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	reqLog := reqlog.New(reqlog.Config{})
 	handler := NewHandler(&Config{
 		Pool:             testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream:         client,
 		RequestLog:       reqLog,
 		RecordClientInfo: true,
+		TrustedProxies:   trusted,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	req.RemoteAddr = "127.0.0.1:1234"
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
 	req.Header.Set("User-Agent", "python-requests/2.31.0")
 
@@ -225,7 +235,7 @@ func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 	}
 
 	if got := snapshot.Recent[0].ClientIP; got != "203.0.113.7" {
-		t.Errorf("client ip = %q want 203.0.113.7 (XFF first hop)", got)
+		t.Errorf("client ip = %q want 203.0.113.7", got)
 	}
 
 	if got := snapshot.Recent[0].UserAgent; got != "python-requests/2.31.0" {
@@ -272,24 +282,44 @@ func TestClientIPForLogFallsBackToRemoteAddr(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	req.RemoteAddr = "198.51.100.9:54321"
-	if got := clientIPForLog(req); got != "198.51.100.9" {
+	if got := clientIPForLog(req, nil); got != "198.51.100.9" {
 		t.Errorf("got %q want 198.51.100.9", got)
 	}
-	// 代理头优先（X-Real-IP 兜底 XFF）。
+	// 对端不在可信网段：伪造的转发头必须被忽略。
+	req.Header.Set("X-Real-IP", "192.0.2.5")
+	req.Header.Set("X-Forwarded-For", "192.0.2.9, 10.1.1.1")
+
+	if got := clientIPForLog(req, nil); got != "198.51.100.9" {
+		t.Errorf("untrusted peer got %q want 198.51.100.9", got)
+	}
+
+	if got := clientIPForLog(nil, nil); got != "" {
+		t.Errorf("nil request got %q want empty", got)
+	}
+}
+
+// 可信反代下才采信转发头：X-Real-IP 优先，XFF 从右往左跳过可信跳。
+func TestClientIPForLogUsesTrustedProxy(t *testing.T) {
+	t.Parallel()
+
+	trusted, err := httpauth.ParseTrustedProxies([]string{"127.0.0.1/32"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
 	req.Header.Set("X-Real-IP", "192.0.2.5")
 
-	if got := clientIPForLog(req); got != "192.0.2.5" {
+	if got := clientIPForLog(req, trusted); got != "192.0.2.5" {
 		t.Errorf("X-Real-IP got %q want 192.0.2.5", got)
 	}
 
+	req.Header.Del("X-Real-IP")
 	req.Header.Set("X-Forwarded-For", "192.0.2.9, 10.1.1.1")
 
-	if got := clientIPForLog(req); got != "192.0.2.9" {
-		t.Errorf("XFF got %q want 192.0.2.9", got)
-	}
-
-	if got := clientIPForLog(nil); got != "" {
-		t.Errorf("nil request got %q want empty", got)
+	if got := clientIPForLog(req, trusted); got != "10.1.1.1" {
+		t.Errorf("XFF got %q want rightmost non-trusted 10.1.1.1", got)
 	}
 }
 
@@ -301,7 +331,7 @@ func TestCaptureClientInfoTruncatesUserAgent(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.RemoteAddr = "198.51.100.9:1234"
 	req.Header.Set("User-Agent", strings.Repeat("A", 5000))
-	requestTrace2.captureClientInfo(req)
+	requestTrace2.captureClientInfo(req, nil)
 
 	if len(requestTrace2.userAgent) != maxUserAgentLen {
 		t.Fatalf("ua len = %d want %d", len(requestTrace2.userAgent), maxUserAgentLen)
@@ -675,5 +705,42 @@ func TestChatStatsReaderNormalLines(t *testing.T) {
 
 	if chatStatsReader2.TTFB() <= 0 {
 		t.Errorf("TTFB 未记录")
+	}
+}
+
+// 命名密钥请求把 key_id 写进归档；默认密钥保持空。
+func TestRequestMetricsRecordsNamedKeyID(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+
+	keyRecord, raw, err := store.Create("client-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	reqLog := reqlog.New(reqlog.Config{})
+	handler := NewHandler(&Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   client,
+		Keys:       store,
+		RequestLog: reqLog,
+		APIKey:     "default-key",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	snapshot := reqLog.Snapshot()
+	if len(snapshot.Recent) != 1 || snapshot.Recent[0].KeyID != keyRecord.ID {
+		t.Fatalf("key id = %q want %q", snapshot.Recent[0].KeyID, keyRecord.ID)
 	}
 }

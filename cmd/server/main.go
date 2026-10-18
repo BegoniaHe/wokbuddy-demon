@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +25,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
@@ -127,6 +129,12 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 
+	// 可信反代网段：解析一次，供网关与面板共用。配置已在 Load 阶段校验。
+	trustedProxies, err := httpauth.ParseTrustedProxies(cfg.Server.TrustedProxies)
+	if err != nil {
+		log.Fatalf("parse trusted_proxies: %v", err)
+	}
+
 	state, store, sessRouter, redisMode, sessCount := setupPool(cfg, auths)
 	// 停机序：先 pool.Close()（最后一次 Flush → SaveState 已提交到 store），
 	// 再 store.Close() 排空在途异步写（最后一笔 Redis 镜像必须写完才关连接）。
@@ -147,7 +155,7 @@ func main() {
 	defer obs.keys.Stop()
 	defer obs.reqlog.Close()
 
-	panel2 := newPanel(cfg, *cfgPath, state, client, sch, redisMode, sessCount, obs)
+	panel2 := newPanel(cfg, *cfgPath, state, client, sch, redisMode, sessCount, obs, trustedProxies)
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(panel2.RunGrowthQueueOnce)
@@ -155,18 +163,19 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, panel2.Logs()))
 
 	handler := buildHandler(&handlerDeps{
-		cfg:         cfg,
-		pool:        state,
-		up:          client,
-		keys:        obs.keys,
-		session:     sessRouter,
-		stickyCount: sessCount,
-		redisMode:   redisMode,
-		panel:       panel2,
-		live:        obs.live,
-		usage:       obs.usage,
-		requestLog:  obs.reqlog,
-		notifier:    notifier,
+		cfg:            cfg,
+		pool:           state,
+		up:             client,
+		keys:           obs.keys,
+		session:        sessRouter,
+		stickyCount:    sessCount,
+		redisMode:      redisMode,
+		panel:          panel2,
+		live:           obs.live,
+		usage:          obs.usage,
+		requestLog:     obs.reqlog,
+		notifier:       notifier,
+		trustedProxies: trustedProxies,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -278,21 +287,23 @@ type observability struct {
 // newPanel 构造管理面板：所有可热改字段经 live 快照读取，重启项由 cfg 静态持有。
 func newPanel(
 	cfg *Config, cfgPath string, state *pool.Pool, client4 *upstream.Client, sch *scheduler.Scheduler,
-	redisMode string, sessCount func() int, obs *observability,
+	redisMode string, sessCount func() int, obs *observability, trustedProxies []*net.IPNet,
 ) *panel.Panel {
 	return panel.New(&panel.Config{
-		Pool:        state,
-		Usage:       obs.usage,
-		RequestLog:  obs.reqlog,
-		Keys:        obs.keys,
-		Upstream:    client4,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
-		RedisMode:   redisMode,
-		StickyCount: sessCount,
-		Version:     appVersion,
-		Live:        obs.live,
+		Pool:           state,
+		Usage:          obs.usage,
+		RequestLog:     obs.reqlog,
+		Keys:           obs.keys,
+		Upstream:       client4,
+		Scheduler:      sch,
+		AuthDir:        cfg.AuthDir,
+		AuditDir:       stateSibling(cfg.StateFile, "audit"),
+		APIKey:         cfg.APIKey,
+		TrustedProxies: trustedProxies,
+		RedisMode:      redisMode,
+		StickyCount:    sessCount,
+		Version:        appVersion,
+		Live:           obs.live,
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:      stateSibling(cfg.StateFile, "output_probes.json"),
@@ -911,6 +922,8 @@ var restartFieldPaths = []string{
 	"server.request_accept_grace_seconds", "server.shutdown_grace_seconds",
 	// CORS 允许列表在 handler 构造期复制，运行期无热更新。
 	"server.cors_origins",
+	// 可信反代网段在启动期解析为 *net.IPNet，运行期无热更新。
+	"server.trusted_proxies",
 	// Pricing 目录与刷新协程在启动期创建。
 	"pricing.enabled", "pricing.refresh_minutes", "pricing.exchange_rate",
 	// HTTP client / 出站身份 / 代理在 configureUpstream 一次性注入。

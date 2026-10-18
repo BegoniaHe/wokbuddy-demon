@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -438,16 +439,18 @@ type requestTrace struct {
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+	// keyID 命中的命名密钥 ID；默认密钥 / 未鉴权为空。由 withClientAuth 回填。
+	keyID string
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
 // 来源信息比 token 计数敏感，是否落盘由 logging.request_client_info 决定。
-func (t *requestTrace) captureClientInfo(r *http.Request) {
+func (t *requestTrace) captureClientInfo(r *http.Request, trusted []*net.IPNet) {
 	if t == nil || r == nil {
 		return
 	}
 
-	t.clientIP = clientIPForLog(r)
+	t.clientIP = clientIPForLog(r, trusted)
 	t.userAgent = logfmt.Truncate(r.UserAgent(), maxUserAgentLen)
 }
 
@@ -455,23 +458,19 @@ func (t *requestTrace) captureClientInfo(r *http.Request) {
 //
 // 与 upstream.ExtractClientIP 的差别：后者只认代理头（X-Forwarded-For 首段 →
 // X-Real-IP），因为它的用途是把客户端 IP **透传给上游**，回落到网关自身地址会
-// 污染上游风控判据；日志场景相反——直连（无反代）时 RemoteAddr 就是唯一线索，
-// 必须回落，否则面板里所有来源都显示 "-"。代理头优先保证反代后拿到真实客户端。
-func clientIPForLog(r *http.Request) string {
+// 污染上游风控判据。日志场景相反：只有 TCP 对端属于配置的可信反代网段时才采信
+// 转发头，否则一律用 RemoteAddr——否则任何客户端都能用伪造的 X-Forwarded-For
+// 污染请求日志与审计记录。
+func clientIPForLog(r *http.Request, trusted []*net.IPNet) string {
 	if r == nil {
 		return ""
 	}
 
-	if ip := upstream.ExtractClientIP(r); ip != "" {
+	if ip := httpauth.ClientIP(r, trusted); ip != "" {
 		return ip
 	}
 
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err != nil {
-		return strings.TrimSpace(r.RemoteAddr)
-	}
-
-	return host
+	return upstream.ExtractClientIP(r)
 }
 
 // dashIfEmpty 空串统一显示 "-"（来源字段未采集时不留空白列）。
@@ -519,6 +518,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		event.CacheMissTokens = chatStat2.cacheMiss
 	}
 
+	event.KeyID = t.keyID
 	event.ClientIP = t.clientIP
 
 	event.UserAgent = t.userAgent

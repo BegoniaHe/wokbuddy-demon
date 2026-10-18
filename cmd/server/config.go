@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
@@ -118,6 +119,11 @@ type Config struct {
 		// "http://localhost:3000"）。空 = 关闭 CORS，行为不变。只精确匹配
 		// scheme://host[:port]；不支持 "*"，管理面不参与。
 		CORSOrigins []string `json:"cors_origins"`
+		// TrustedProxies 可信反向代理网段（CIDR 或单个 IP）。只有 TCP 对端落在
+		// 这些网段内时，才采信 X-Real-IP / X-Forwarded-For 作为真实来源；否则
+		// 一律使用 RemoteAddr。缺省只信任本机回环，供同机反代使用。
+		// 改动需重启进程。
+		TrustedProxies []string `json:"trusted_proxies"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -414,6 +420,9 @@ func baseDefaults() *Config {
 	config.Cooldown.SoftRateMax = "2h"
 	config.Server.ReadTimeout = "300s"
 	config.Server.MaxBodyBytes = 16 << 20
+	// 缺省只信任本机回环：同机 nginx / Caddy 反代可直接拿到真实客户端 IP。
+	// 反代在另一台机器时必须显式配置，否则来源一律是反代地址。
+	config.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128"}
 	config.Server.RequestAcceptGraceSeconds = 0
 	config.Server.ShutdownGraceSeconds = 30
 	config.Models.BackgroundTarget = defaultBackgroundTarget
@@ -1064,6 +1073,10 @@ func (c *Config) validateServerRanges() error {
 
 	if c.Server.ShutdownGraceSeconds < 0 {
 		return fmt.Errorf("server.shutdown_grace_seconds: 负值 %d 无意义: %w", c.Server.ShutdownGraceSeconds, errValidateServerRangesFailed)
+	}
+
+	if _, err := httpauth.ParseTrustedProxies(c.Server.TrustedProxies); err != nil {
+		return fmt.Errorf("server.%w", err)
 	}
 
 	return nil

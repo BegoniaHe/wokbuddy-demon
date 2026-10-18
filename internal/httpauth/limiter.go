@@ -15,9 +15,12 @@ const (
 	// DefaultFailLimit / DefaultFailWindow 默认阈值：10 次/分钟。
 	DefaultFailLimit  = 10
 	DefaultFailWindow = time.Minute
-	// maxTrackedIPs 单进程最多保留的失败窗口数；超过后先清过期项，仍满则
-	// 淘汰最早窗口，防止轮换来源 IP 把内存撑大。
+	// maxTrackedIPs 单进程常规保留的失败窗口数。
 	maxTrackedIPs = 4096
+	// maxTrackedIPsHard 极端洪水下的内存兜底上限。达到后才允许淘汰仍在窗口内
+	// 的条目——正常清理只删过期项，避免攻击者用大量来源 IP 灌满表、顺手抹掉
+	// 目标 IP 正在生效的锁定。
+	maxTrackedIPsHard = maxTrackedIPs * 4
 )
 
 // Limiter 按来源 IP 的失败窗口计数器。
@@ -106,7 +109,7 @@ func (l *Limiter) evictLocked(now time.Time) {
 		}
 	}
 
-	if len(l.byIP) < maxTrackedIPs {
+	if len(l.byIP) < maxTrackedIPsHard {
 		return
 	}
 
