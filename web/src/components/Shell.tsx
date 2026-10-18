@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import {
   BarChart3,
+  Bot,
   Boxes,
   KeyRound,
   MessageSquare,
@@ -27,6 +28,7 @@ const NAV: { id: ViewId; icon: LucideIcon }[] = [
   { id: 'models', icon: Boxes },
   { id: 'keys', icon: KeyRound },
   { id: 'config', icon: Settings },
+  { id: 'agents', icon: Bot },
   { id: 'logs', icon: ScrollText },
 ];
 
@@ -83,6 +85,7 @@ export function Shell({
               <li key={id} className="shrink-0 md:w-full">
                 <a
                   href={'#' + id}
+                  aria-current={on ? 'page' : undefined}
                   onClick={(e) => {
                     e.preventDefault();
                     onNavigate(id);
