@@ -460,3 +460,20 @@ func TestDailyTotals(t *testing.T) {
 		t.Errorf("cached totals=%+v", cached)
 	}
 }
+
+// 落盘失败后必须保持 dirty，下一轮 tick 才会重试。
+func TestFlushFailureKeepsDirty(t *testing.T) {
+	dir := t.TempDir()
+	r := New("")
+	r.Add(time.Now(), "cn", "u1", "m", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
+	r.path = dir // rename 目标为目录 → 原子替换失败
+
+	r.flush(false)
+
+	r.mu.Lock()
+	dirty := r.dirty
+	r.mu.Unlock()
+	if !dirty {
+		t.Fatal("flush 失败后 dirty=false，后续 tick 不会重试")
+	}
+}

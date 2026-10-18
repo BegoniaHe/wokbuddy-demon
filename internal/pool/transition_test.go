@@ -178,3 +178,30 @@ func TestTransitionReviveUnfreezesHardCooling(t *testing.T) {
 		t.Errorf("余额恢复应解冻 CoolHard：until=%v kind=%v reason=%q", until, kind, reason)
 	}
 }
+
+func TestReviveClearsDegradeState(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	p := New("")
+	p.SetClock(func() time.Time { return now })
+	p.Add(&auth.Auth{UID: "u1"})
+	for range defaultDegradeThreshold {
+		p.NoteFailures("u1")
+	}
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	degraded := !e.degradeUntil.IsZero() && now.Before(e.degradeUntil)
+	p.mu.RUnlock()
+	if !degraded {
+		t.Fatal("precondition: 连败达阈后应进入降权期")
+	}
+
+	p.Revive("u1")
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e.consecutiveFails != 0 || !e.degradeUntil.IsZero() || !e.probeUntil.IsZero() {
+		t.Fatalf("Revive 未清连败降权态: fails=%d degradeUntil=%v probeUntil=%v",
+			e.consecutiveFails, e.degradeUntil, e.probeUntil)
+	}
+}

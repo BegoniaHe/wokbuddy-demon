@@ -108,6 +108,11 @@ func decryptPayload(password string, raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// GCM.Open 对错误 nonce 长度直接 panic（不是返回 error）；先在解密前拦下，
+	// 否则畸形备份文件可以把面板请求打成 panic。
+	if len(nonce) != gcm.NonceSize() {
+		return nil, errSecureDecrypt
+	}
 	pt, err := gcm.Open(nil, nonce, ct, nil)
 	if err != nil {
 		return nil, errSecureDecrypt

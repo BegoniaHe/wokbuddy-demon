@@ -39,6 +39,9 @@ func TestDecryptRejectsMalformed(t *testing.T) {
 		[]byte(`{"v":1,"kdf":"scrypt","iter":1000,"salt":"","nonce":"","ct":""}`),
 		[]byte(`{"v":1,"kdf":"pbkdf2-sha256","iter":99999999,"salt":"","nonce":"","ct":""}`),
 		[]byte(`{"v":1,"kdf":"pbkdf2-sha256","iter":1000,"salt":"!!!","nonce":"","ct":""}`),
+		// 合法头部 + 错误 nonce 长度：GCM.Open 会 panic，必须在解密前拒绝。
+		[]byte(`{"v":1,"kdf":"pbkdf2-sha256","iter":1000,"salt":"c2FsdA==","nonce":"","ct":""}`),
+		[]byte(`{"v":1,"kdf":"pbkdf2-sha256","iter":1000,"salt":"c2FsdA==","nonce":"YQ==","ct":""}`),
 	}
 	for _, raw := range cases {
 		if _, err := decryptPayload("pw", raw); !errors.Is(err, errSecureDecrypt) {

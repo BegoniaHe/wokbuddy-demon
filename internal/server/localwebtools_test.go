@@ -154,3 +154,14 @@ func TestLocalWebToolsDisabled(t *testing.T) {
 		t.Fatalf("upstream calls=%d want 1", len(seen))
 	}
 }
+
+// 拨号阶段必须拦截内网 IP，闭合 validateWebURL 与连接之间的 DNS rebinding 窗口。
+func TestDialWebFetchRejectsBlockedIP(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:80", "10.0.0.1:80", "192.168.1.1:443", "[::1]:80"} {
+		if _, err := dialWebFetch(context.Background(), "tcp", addr); err == nil {
+			t.Errorf("%s should be rejected", addr)
+		} else if !strings.Contains(err.Error(), "内网") {
+			t.Errorf("%s err=%v want 内网 address rejection", addr, err)
+		}
+	}
+}

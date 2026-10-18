@@ -29,3 +29,26 @@ func TestPickTrace(t *testing.T) {
 		t.Fatalf("top=%+v", trace.Top[0])
 	}
 }
+
+// 等权重候选超过 top5 时必须真正打散，不能被 uid 排序重新钉死。
+func TestRankCandidatesTieNotStarvedByUID(t *testing.T) {
+	p := New("")
+	for _, uid := range []string{"u0", "u1", "u2", "u3", "u4", "u5"} {
+		p.Add(&auth.Auth{UID: uid})
+	}
+	cands := p.pickCandidates(nil, "", "", p.now(), nil)
+	if len(cands) != 6 {
+		t.Fatalf("candidates=%d want 6", len(cands))
+	}
+
+	base := time.Now()
+	for i := range 200 {
+		_, top := p.rankCandidates(cands, "", 1, 0, base.Add(time.Duration(i)*time.Nanosecond))
+		for _, e := range top {
+			if e.a.UID == "u5" {
+				return
+			}
+		}
+	}
+	t.Fatal("权重并列时 u5 从未进入 top5：uid tie-break 仍在生效")
+}

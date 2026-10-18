@@ -1249,8 +1249,8 @@ func maxOutputTokensFromBody(body []byte) int {
 	return 0
 }
 
-// degradeSticky 软逃逸后把会话置入降级窗口，并清空本次 stickyUID。
-func (f *chatFlow) degradeSticky() {
+// degradeSticky 软逃逸后把会话置入降级窗口，清空本次 stickyUID，返回被降级的号。
+func (f *chatFlow) degradeSticky() string {
 	uid := f.stickyUID
 	if f.h.cfg.Session != nil {
 		f.h.cfg.Session.Degrade(f.sessKey, uid, pool.StickyDegradeWindow)
@@ -1258,40 +1258,62 @@ func (f *chatFlow) degradeSticky() {
 	log.Printf("INFO: [server] sticky soft escape acct=%s model=%s: degrade %s",
 		logfmt.UID8(uid), f.bareModel, pool.StickyDegradeWindow)
 	f.stickyUID = ""
+	return uid
 }
 
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
+	escapedUID := ""
 	if f.stickyUID != "" {
-		if acct, ok := f.trySticky(); ok {
+		acct, ok, escaped := f.trySticky()
+		if ok {
+			return acct
+		}
+		escapedUID = escaped
+	}
+	// 软逃逸是为了分流：优先在排除原号后选，避免立刻又选回它。若排除后无号
+	// 可用（单号池），回落到不排除，保持请求可服务而不是直接 503。
+	if escapedUID != "" {
+		excluded := make(map[string]bool, len(f.tried)+1)
+		for uid := range f.tried {
+			excluded[uid] = true
+		}
+		excluded[escapedUID] = true
+		if acct := f.pickWith(excluded); acct != nil {
+			f.tried[escapedUID] = true
 			return acct
 		}
 	}
+	return f.pickWith(f.tried)
+}
+
+// pickWith 普通轮换选号，tried 为本轮已尝试的 uid 集合。
+func (f *chatFlow) pickWith(tried map[string]bool) *auth.Auth {
 	if f.st.decision != nil {
-		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(f.tried, f.bareModel, f.realm)
+		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(tried, f.bareModel, f.realm)
 		mergePickTrace(f.st.decision, trace)
 		return acct
 	}
-	return f.h.cfg.Pool.PickExcludingForRealm(f.tried, f.bareModel, f.realm)
+	return f.h.cfg.Pool.PickExcludingForRealm(tried, f.bareModel, f.realm)
 }
 
 // trySticky 尝试复用会话绑定号；ok=false 表示已解绑/降级，调用方回落普通轮换。
-func (f *chatFlow) trySticky() (*auth.Auth, bool) {
+// 第三个返回值是软逃逸被降级的 uid，供调用方在本轮排除。
+func (f *chatFlow) trySticky() (*auth.Auth, bool, string) {
 	acct, picked := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
 	if picked == pool.StickyPicked && acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
 		if f.st.decision != nil {
 			f.st.decision.StickyHit = true
 			f.st.decision.FinalUID = logfmt.UID8(acct.UID)
 		}
-		return acct, true
+		return acct, true, ""
 	}
 	if picked == pool.StickyEscaped {
-		f.degradeSticky()
-	} else {
-		f.unbindSticky()
+		return nil, false, f.degradeSticky()
 	}
-	return nil, false
+	f.unbindSticky()
+	return nil, false, ""
 }
 
 // sampleDecisionTrace 按开关与采样率决定本次是否记录决策链。
@@ -1857,15 +1879,17 @@ func deltaHasUsage(delta pool.TokenUsageDelta) bool {
 	return delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens
 }
 
-// recordKeyUsage 把本次请求的 token 观测回填到命名密钥用量累加器（无累加器时空操作）。
+// recordKeyUsage 把本次请求的 token 观测累加进命名密钥用量累加器（无累加器时空操作）。
 // 由 chatCompletions 在出口 defer 调用，早于 withClientAuth 的落账。
+// 累加而非覆盖：本地 web 工具循环会在同一请求内多次调用 serveChat，共用同一个
+// keyUsage，覆盖会只记最后一轮。
 func (f *chatFlow) recordKeyUsage() {
 	if f.keyUsage == nil {
 		return
 	}
-	f.keyUsage.prompt = f.st.promptTokens
-	f.keyUsage.completion = f.st.completionTokens
-	f.keyUsage.total = f.st.totalTokens
+	f.keyUsage.prompt += f.st.promptTokens
+	f.keyUsage.completion += f.st.completionTokens
+	f.keyUsage.total += f.st.totalTokens
 }
 
 // writeFinalError 末端错误透传：轮转耗尽/提前终止后写出最终错误响应。

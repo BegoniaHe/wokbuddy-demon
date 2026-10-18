@@ -2346,3 +2346,72 @@ func TestChatNonStreamLineTooLongRotates(t *testing.T) {
 		t.Errorf("success_count=%d want 0", s)
 	}
 }
+
+// 粘性软逃逸后应优先分流到其他账号，而不是在同一轮立刻选回原号。
+func TestChatStickySoftEscapePrefersOtherAccount(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"busy", "good"} },
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "busy", AccessToken: "at-busy", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	p.SetMaxInFlight(3)
+	p.SetCredits("busy", 1000, 0)
+	p.SetRandomSource(func(n int64) int64 { return 0 }) // 不排除时必选权重更高的 busy
+	p.Acquire("busy")
+	p.Acquire("busy")
+
+	var used string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		used = authz
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-1", "busy")
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if used != "Bearer at-good" {
+		t.Fatalf("soft escape 后仍选回原号: authz=%q", used)
+	}
+}
+
+// 单号池软逃逸后无其他账号可选：应回落原号继续服务，而不是 503。
+func TestChatStickySoftEscapeFallsBackWhenNoAlternative(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     st,
+		Available: func() []string { return []string{"busy"} },
+	})
+	p := testPoolWith(&auth.Auth{UID: "busy", AccessToken: "at-busy", ExpiresAt: 9999999999})
+	p.SetMaxInFlight(3)
+	p.Acquire("busy")
+	p.Acquire("busy")
+
+	var used string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		used = authz
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-1", "busy")
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("单号池软逃逸不应失败: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if used != "Bearer at-busy" {
+		t.Fatalf("单号池应回落原号: authz=%q", used)
+	}
+}
