@@ -5,8 +5,9 @@
   "state_file": "./data/state.json",
   "server": {
     "read_timeout": "300s",
-    "read_timeout": "300s",
     "max_body_bytes": 16777216,
+    "request_accept_grace_seconds": 0,
+    "shutdown_grace_seconds": 30,
     "cors_origins": []
   },
   "panel": {

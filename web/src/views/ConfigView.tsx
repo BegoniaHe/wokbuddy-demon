@@ -48,6 +48,7 @@ export function ConfigView() {
   const [note, setNote] = useState('');
   const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [clears, setClears] = useState<Record<string, boolean>>({});
 
   const load = async () => {
@@ -106,6 +107,22 @@ export function ConfigView() {
       toast('保存失败：' + (e as Error).message, 'err');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const restore = async () => {
+    if (!confirm('用 config.json.1 覆盖当前配置？当前配置不会自动再备份。')) return;
+    setRestoring(true);
+    try {
+      const r = await postJSON<{ restart_required?: string[] }>('config/restore');
+      const n = (r.restart_required || []).length;
+      toast(n ? '已恢复上一版，其中 ' + n + ' 项需重启进程生效' : '已恢复上一版并立即生效', 'ok');
+      await load();
+      await qc.invalidateQueries({ queryKey: ['overview'] });
+    } catch (e) {
+      toast('恢复失败：' + (e as Error).message, 'err');
+    } finally {
+      setRestoring(false);
     }
   };
 
@@ -548,10 +565,13 @@ export function ConfigView() {
         <span className="flex-1" />
         {badFields.length ? <span className="text-xs text-warning">{DURATION_TIP}</span> : null}
         <span className="text-xs text-warning">{note}</span>
-        <Button disabled={saving} onClick={() => void load()}>
+        <Button variant="outline" disabled={saving || restoring} onClick={() => void restore()}>
+          {restoring ? '恢复中…' : '恢复上一版'}
+        </Button>
+        <Button disabled={saving || restoring} onClick={() => void load()}>
           放弃修改
         </Button>
-        <Button type="submit" variant="default" disabled={saving}>
+        <Button type="submit" variant="default" disabled={saving || restoring}>
           {saving ? '保存中…' : '保存配置'}
         </Button>
       </div>
