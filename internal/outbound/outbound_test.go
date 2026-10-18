@@ -420,14 +420,14 @@ func TestHandshakeFailureClosesConn(t *testing.T) {
 	defer ln.Close()
 	closed := make(chan struct{})
 	go func() {
-		c, err := ln.Accept()
-		if err != nil {
+		c, aerr := ln.Accept()
+		if aerr != nil {
 			return
 		}
 		// 不响应握手；读方在客户端关闭时得到 EOF/错误。
 		buf := make([]byte, 256)
 		for {
-			if _, err := c.Read(buf); err != nil {
+			if _, rerr := c.Read(buf); rerr != nil {
 				close(closed)
 				c.Close()
 				return

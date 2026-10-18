@@ -130,7 +130,7 @@ func migrateFile(path string, apply bool) row {
 		r.status, r.detail = statusFailed, err.Error()
 		return r
 	}
-	if a, err := auth.Parse(raw); err == nil {
+	if a, perr := auth.Parse(raw); perr == nil {
 		r.uid, r.nick = a.UID, a.Nickname
 		r.status, r.detail = statusCurrent, "已是当前格式"
 		return r

@@ -234,8 +234,8 @@ func (c *Client) GlobalCompleteRegistration(a *auth.Auth) (activated bool, err e
 	if len(countries) == 0 {
 		return false, errors.New("no countries available")
 	}
-	if err := c.GlobalSubmitRegion(a, countries[0]); err != nil {
-		return false, fmt.Errorf("submit region: %w", err)
+	if serr := c.GlobalSubmitRegion(a, countries[0]); serr != nil {
+		return false, fmt.Errorf("submit region: %w", serr)
 	}
 	// 重新激活验证。
 	activated, _, msg, err = c.GlobalRegisterStatus(a)

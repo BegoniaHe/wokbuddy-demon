@@ -86,7 +86,6 @@ linters:
       enable-all: true
       disable:
         - fieldalignment
-        - shadow
     gocritic:
       enabled-tags:
         - diagnostic

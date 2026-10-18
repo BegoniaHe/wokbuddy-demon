@@ -109,8 +109,8 @@ func (c *Client) fetchGlobalModelsOnce(a *auth.Auth) (names []string, infos []Mo
 		// 逃生门兜底：账号不路由 global 上游 → 不探测（零上游调用）。
 		return nil, nil
 	}
-	if names, infos, hit := c.globalModelsCacheHit(); hit {
-		return names, infos
+	if cachedNames, cachedInfos, hit := c.globalModelsCacheHit(); hit {
+		return cachedNames, cachedInfos
 	}
 
 	names, infos, efforts, defaults, err := c.probeGlobalModels(a)

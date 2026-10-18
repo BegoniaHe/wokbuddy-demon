@@ -597,12 +597,12 @@ func TestReplacePlaceholderAPIKeyKeepsExplicitValues(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(fp, raw, 0o600); err != nil {
-				t.Fatal(err)
+			if werr := os.WriteFile(fp, raw, 0o600); werr != nil {
+				t.Fatal(werr)
 			}
-			key, replaced, err := ReplacePlaceholderAPIKey(fp)
-			if err != nil {
-				t.Fatal(err)
+			key, replaced, rerr := ReplacePlaceholderAPIKey(fp)
+			if rerr != nil {
+				t.Fatal(rerr)
 			}
 			if replaced || key != "" {
 				t.Fatalf("replaced=%v key=%q want untouched", replaced, key)
@@ -813,8 +813,8 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
 		t.Errorf("user_agent=%q want WorkBuddy/1.2.3", c.Upstream.UserAgent)
 	}
 	// 缺省为空
-	if c2, err := Load(""); err != nil || c2.Upstream.UserAgent != "" {
-		t.Errorf("default user_agent=%q want empty (err=%v)", c2.Upstream.UserAgent, err)
+	if c2, lerr := Load(""); lerr != nil || c2.Upstream.UserAgent != "" {
+		t.Errorf("default user_agent=%q want empty (err=%v)", c2.Upstream.UserAgent, lerr)
 	}
 	// env 覆盖
 	t.Setenv("WB2A_USER_AGENT", "EnvAgent/9")

@@ -30,8 +30,8 @@ func sealField(t *testing.T, secret, plaintext string) map[string]any {
 		t.Fatal(err)
 	}
 	nonce := make([]byte, 12)
-	if _, err := rand.Read(nonce); err != nil {
-		t.Fatal(err)
+	if _, rerr := rand.Read(nonce); rerr != nil {
+		t.Fatal(rerr)
 	}
 	block, err := aes.NewCipher(km.key)
 	if err != nil {

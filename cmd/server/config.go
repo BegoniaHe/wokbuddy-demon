@@ -512,8 +512,8 @@ func WriteDefault(path string) (string, error) {
 		return "", fmt.Errorf("marshal config: %w", err)
 	}
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("mkdir config dir: %w", err)
+		if merr := os.MkdirAll(dir, 0o755); merr != nil {
+			return "", fmt.Errorf("mkdir config dir: %w", merr)
 		}
 	}
 	// O_EXCL 原子拒绝覆盖：即使调用方漏判"不存在"，也绝不悄悄改写用户已有配置。

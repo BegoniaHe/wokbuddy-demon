@@ -324,8 +324,8 @@ func parseEnvelope(envB64 string) (encryptedEnvelope, []byte, []byte, []byte, er
 	if err != nil || base64.StdEncoding.EncodeToString(envRaw) != envB64 {
 		return env, nil, nil, nil, errors.New("envelope is not canonical base64")
 	}
-	if err := json.Unmarshal(envRaw, &env); err != nil {
-		return env, nil, nil, nil, fmt.Errorf("invalid envelope: %w", err)
+	if uerr := json.Unmarshal(envRaw, &env); uerr != nil {
+		return env, nil, nil, nil, fmt.Errorf("invalid envelope: %w", uerr)
 	}
 	if env.Suite != 1 {
 		return env, nil, nil, nil, fmt.Errorf("unsupported envelope suite %d", env.Suite)

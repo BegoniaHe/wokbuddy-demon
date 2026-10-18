@@ -92,14 +92,14 @@ func processAccount(f string, up *upstream.Client) row {
 	r.uid, r.nick = a.UID, a.Nickname
 
 	// refresh 过期 token
-	if err := refreshIfNeeded(a, up); err != nil {
+	if rerr := refreshIfNeeded(a, up); rerr != nil {
 		ue := &upstream.Error{}
-		if errors.As(err, &ue) {
+		if errors.As(rerr, &ue) {
 			r.status = "AUTH_INVALID"
 		} else {
 			r.status = "FAIL"
 		}
-		r.detail = "refresh: " + short(err.Error())
+		r.detail = "refresh: " + short(rerr.Error())
 		return r
 	}
 

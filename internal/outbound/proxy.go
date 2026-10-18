@@ -162,9 +162,9 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 	defer endHandshake(clearDeadline, stop, false)
 	if p.scheme == "https" {
 		tconn := tls.Client(conn, &tls.Config{ServerName: p.host})
-		if err := tconn.HandshakeContext(ctx); err != nil {
+		if herr := tconn.HandshakeContext(ctx); herr != nil {
 			conn.Close()
-			return nil, err
+			return nil, herr
 		}
 		conn = tconn
 	}
@@ -175,9 +175,9 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 			base64.StdEncoding.EncodeToString([]byte(p.user+":"+p.pass)) + "\r\n")
 	}
 	b.WriteString("\r\n")
-	if _, err := io.WriteString(conn, b.String()); err != nil {
+	if _, werr := io.WriteString(conn, b.String()); werr != nil {
 		conn.Close()
-		return nil, err
+		return nil, werr
 	}
 	br := bufio.NewReader(conn)
 	// CONNECT 的 200 响应无 body；不读 resp.Body（它即隧道本体），仅取状态码。

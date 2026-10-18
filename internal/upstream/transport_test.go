@@ -85,8 +85,8 @@ func TestNewTransportWrapsDialedConn(t *testing.T) {
 	defer ln.Close()
 	done := make(chan struct{})
 	go func() {
-		c, err := ln.Accept()
-		if err != nil {
+		c, aerr := ln.Accept()
+		if aerr != nil {
 			return
 		}
 		defer c.Close()
@@ -137,8 +137,8 @@ func TestTransportWriteDeadlineStalledPeer(t *testing.T) {
 	defer ln.Close()
 	done := make(chan struct{})
 	go func() {
-		c, err := ln.Accept()
-		if err != nil {
+		c, aerr := ln.Accept()
+		if aerr != nil {
 			return
 		}
 		defer c.Close()

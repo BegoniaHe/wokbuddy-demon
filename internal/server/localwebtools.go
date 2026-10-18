@@ -83,7 +83,7 @@ func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Re
 		return
 	}
 	var req map[string]any
-	if err := json.Unmarshal(openAI, &req); err != nil {
+	if uerr := json.Unmarshal(openAI, &req); uerr != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid converted request")
 		return
 	}
