@@ -454,3 +454,35 @@ func TestExtractKeyMultimodalContent(t *testing.T) {
 		t.Error("pure-image url changes must keep same derived key")
 	}
 }
+
+// TestResolveFastPathUsesAvailableOne（E1）：快路径命中时只查单账号可用性，
+// 不得构建全池可用集合。
+func TestResolveFastPathUsesAvailableOne(t *testing.T) {
+	t.Parallel()
+
+	var oneCalls, allCalls int
+
+	r := New(Config{
+		TTL: time.Hour,
+		Available: func() []string {
+			allCalls++
+
+			return []string{"u1"}
+		},
+		AvailableOne: func(model, uid string) bool {
+			oneCalls++
+
+			return uid == "u1"
+		},
+	})
+	r.Bind("session-a", "u1")
+
+	uid, ok := r.ResolveForModel("session-a", "cn:glm-5.2")
+	if !ok || uid != "u1" {
+		t.Fatalf("resolve = (%q,%v), want (u1,true)", uid, ok)
+	}
+
+	if oneCalls != 1 || allCalls != 0 {
+		t.Fatalf("fast path calls: AvailableOne=%d Available=%d, want 1/0", oneCalls, allCalls)
+	}
+}

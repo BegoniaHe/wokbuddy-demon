@@ -99,6 +99,29 @@ func (p *Pool) weightedAvailableLocked(model, realm string, now time.Time) []str
 	return out
 }
 
+// IsAvailableForModel 报告指定账号在该模型上是否可用（健康、未占满在途、
+// 且 (realm, model) 路由未处于冷却）。供会话粘性快路径单账号判定。
+func (p *Pool) IsAvailableForModel(model, realm, uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := p.now()
+	if p.routeCoolingLocked(realm, model, now) {
+		return false
+	}
+
+	entry2, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+
+	if realm != "" && entry2.a.Realm() != realm {
+		return false
+	}
+
+	return entry2.healthyForModel(now, model) && !p.inFlightFull(entry2)
+}
+
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号
 // （6004 模型豁免照常生效）。realm=="" 退化为 AvailableUIDsForModel。
 func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {

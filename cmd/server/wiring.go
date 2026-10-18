@@ -61,6 +61,14 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 	}
 }
 
+// realmAwareAvailableOne 构造会话粘性快路径的单账号可用性闭包。
+func realmAwareAvailableOne(p *pool.Pool) func(model, uid string) bool {
+	return func(model, uid string) bool {
+		realm, bare := server.ResolveModel(model)
+		return p.IsAvailableForModel(bare, realm, uid)
+	}
+}
+
 // realmAwareStickyLowLoad 构造粘性降级窗口结束后的低水位判定闭包。
 func realmAwareStickyLowLoad(p *pool.Pool) func(model, uid string) bool {
 	return func(model, uid string) bool {

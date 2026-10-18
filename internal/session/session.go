@@ -53,6 +53,10 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// AvailableOne 单账号可用性判定（model 语法同上）。快路径命中时只查绑定账号，
+	// 避免为一次检查构建全池列表与集合；nil 时回落 AvailableForModel/Available
+	// （行为不变，代价是全池扫描）。
+	AvailableOne func(model, uid string) bool
 	// LowLoad 报告账号是否回落到可重新接收粘性绑定的低水位（降级窗口结束后使用）。
 	// model 为 "[realm:]model"；nil 时视为始终可回纳。
 	LowLoad func(model, uid string) bool
@@ -176,7 +180,6 @@ func (r *Router) Resolve(key string) (string, bool) {
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
@@ -187,17 +190,29 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	avoid := r.avoidActive(a, hasAvoid, entry2, model, now)
 	r.mu.RUnlock()
 
-	if found && !expired(entry2, now, r.cfg.TTL) && available[entry2.uid] && !avoid {
+	// 命中只判定绑定账号本身，不构建全池可用集合（每请求 O(N log N) + map 分配）。
+	if found && !expired(entry2, now, r.cfg.TTL) && r.availableOne(model, entry2.uid) && !avoid {
 		r.touch(key, entry2.uid, model, now)
 		return entry2.uid, true
 	}
 	// 未命中/失效，或绑定号已冷却/占满 → 落入慢路径重分配。
+
+	available := r.availableSet(model)
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	return r.resolveSlowLocked(key, model, now, available)
+}
+
+// availableOne 查询单账号可用性；未注入闭包时回退全池集合（兼容旧配置/测试）。
+func (r *Router) availableOne(model, uid string) bool {
+	if r.cfg.AvailableOne != nil {
+		return r.cfg.AvailableOne(model, uid)
+	}
+
+	return r.availableSet(model)[uid]
 }
 
 // resolveSlowLocked 在写锁内完成 re-check 与分配（见 ResolveForModel 头注）。
