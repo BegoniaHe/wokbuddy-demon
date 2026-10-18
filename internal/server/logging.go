@@ -32,17 +32,34 @@ const maxUserAgentLen = 200
 // chatSeq 进程级请求序号。
 var chatSeq atomic.Int64
 
-// chatLogEnabled 聊天表格日志总开关。生产恒 true；
-// 测试包经 TestMain 置 false 关闭 stdout 噪音，需要断言行输出的测试用 withChatLog 临时开启（R5）。
-var chatLogEnabled = true
+// chatLogEnabled 聊天表格日志总开关。生产恒 true；测试可并发改写，故用 atomic。
+var chatLogEnabled atomic.Bool
 
-// chatLogOut 聊天表格日志的输出目标。生产默认 os.Stdout；main 在启用管理面板时
-// 经 SetChatLogOutput 注入 MultiWriter，把每行镜像进 /panel/api/logs 的环形缓冲，
-// stdout 行为不变。需在开始服务前调用一次（无并发竞争窗口）。
-var chatLogOut io.Writer = os.Stdout
+// chatLogOut 聊天表格日志的输出目标（atomic 持有 io.Writer）。生产默认 os.Stdout；
+// main 在启用管理面板时经 SetChatLogOutput 注入 MultiWriter，把每行镜像进
+// /panel/api/logs 的环形缓冲，stdout 行为不变。
+var chatLogOut atomic.Value
 
-// SetChatLogOutput 替换聊天表格日志输出目标（仅 main 启动期调用一次）。
-func SetChatLogOutput(w io.Writer) { chatLogOut = w }
+func init() {
+	chatLogEnabled.Store(true)
+	chatLogOut.Store(io.Writer(os.Stdout))
+}
+
+// SetChatLogOutput 替换聊天表格日志输出目标。
+func SetChatLogOutput(w io.Writer) {
+	if w != nil {
+		chatLogOut.Store(w)
+	}
+}
+
+// currentChatLogOutput 读取当前输出目标；init 已写入默认值，零值不会出现。
+func currentChatLogOutput() io.Writer {
+	if w, ok := chatLogOut.Load().(io.Writer); ok {
+		return w
+	}
+
+	return os.Stdout
+}
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {

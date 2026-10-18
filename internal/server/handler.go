@@ -240,8 +240,8 @@ func NewHandler(cfg *Config) *Handler {
 		webSearch:         webSearchFn,
 		webFetch:          webFetchFn,
 		modelsCache:       cache,
-		chatLogOut:        chatLogOut,
-		chatLogEnabled:    chatLogEnabled,
+		chatLogOut:        currentChatLogOutput(),
+		chatLogEnabled:    chatLogEnabled.Load(),
 	}
 	for _, origin := range config.CORSOrigins {
 		handler.cors[origin] = true

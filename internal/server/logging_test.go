@@ -24,7 +24,7 @@ func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 
 	old := os.Stdout
-	oldOut := chatLogOut
+	oldOut := currentChatLogOutput()
 
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -32,12 +32,12 @@ func captureStdout(t *testing.T, fn func()) string {
 	}
 
 	os.Stdout = w
-	chatLogOut = w
+	SetChatLogOutput(w)
 
 	fn()
 
 	os.Stdout = old
-	chatLogOut = oldOut
+	SetChatLogOutput(oldOut)
 	_ = w.Close()
 	raw, _ := io.ReadAll(r)
 
@@ -49,10 +49,10 @@ func captureStdout(t *testing.T, fn func()) string {
 func withChatLog(t *testing.T) {
 	t.Helper()
 
-	old := chatLogEnabled
-	chatLogEnabled = true
+	old := chatLogEnabled.Load()
+	chatLogEnabled.Store(true)
 
-	t.Cleanup(func() { chatLogEnabled = old })
+	t.Cleanup(func() { chatLogEnabled.Store(old) })
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {
