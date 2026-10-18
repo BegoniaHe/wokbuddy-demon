@@ -880,11 +880,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
 func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
-	if ku := in.keyUsage; ku != nil && !h.cfg.Keys.ModelAllowed(ku.id, in.model) {
-		h.cfg.Keys.RecordRejected(ku.id)
-		out.Error(http.StatusForbidden, "model_not_allowed", "model is not allowed for this API key", "")
-		return
-	}
 	f := h.newChatFlow(in, out)
 	if f.realmErr != nil {
 		f.out.Error(http.StatusBadRequest, "realm_binding_conflict", f.realmErr.Error(), "")
@@ -896,8 +891,17 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 	defer f.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
 	defer f.recordKeyUsage()
+	// 模型白名单必须在后台改写/别名解析之后校验：此时 f.realm/f.bareModel 才是
+	// 实际选号与出站使用的最终模型（裸名不再固定按 cn 误判 global key）。
+	if !f.checkModelAllowed() {
+		return
+	}
 	// 模态能力判定/路由（issue #109）：在选号前完成，不匹配时写 400 并终止。
 	if !f.applyModalityRoute() {
+		return
+	}
+	// 模态路由可能改写模型：按改写后的最终模型复核白名单，避免绕过。
+	if !f.checkModelAllowed() {
 		return
 	}
 	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
@@ -905,6 +909,23 @@ func (h *Handler) serveChat(r *http.Request, in chatInput, out chatResponder) {
 		return
 	}
 	f.writeFinalError()
+}
+
+// checkModelAllowed 校验命名密钥模型白名单。调用时机必须在别名/后台改写/模态
+// 路由之后，用最终 (realm, bareModel) 匹配：裸名固定按 cn 会误判 global key，
+// 而白名单校验早于改写则会让改写后的模型绕过限制。
+func (f *chatFlow) checkModelAllowed() bool {
+	if f.keyUsage == nil {
+		return true
+	}
+	if f.h.cfg.Keys.ModelAllowed(f.keyUsage.id, f.realm+":"+f.bareModel) {
+		return true
+	}
+	f.h.cfg.Keys.RecordRejected(f.keyUsage.id)
+	f.out.Error(http.StatusForbidden, "model_not_allowed", "model is not allowed for this API key", "")
+	f.st.status = http.StatusForbidden
+	f.st.outcome = reqlog.OutcomeHTTPError
+	return false
 }
 
 // backgroundTarget 返回后台模型改写目标；未命中或名单为空返回空串。
@@ -931,16 +952,8 @@ func (h *Handler) newChatFlow(in chatInput, out chatResponder) *chatFlow {
 	}
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
-	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveRequestModel(in.model, h.cfg.ModelAliases)
-	var realmErr error
-	if in.keyRealm != "" {
-		if err := checkKeyRealmBinding(in.model, h.cfg.ModelAliases, in.keyRealm); err != nil {
-			realmErr = err
-		} else {
-			realm = in.keyRealm
-		}
-	}
+	// 裸名 → ("cn", 原串)，CN 现状零回归；命名密钥出口绑定在此一并覆盖 realm。
+	realm, bareModel, realmErr := resolveKeyModel(in.model, h.cfg.ModelAliases, in.keyRealm)
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -1176,7 +1189,7 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 	}
 	f.st.uid = acct.UID
 	// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
-	f.st.nick = acct.Nickname
+	f.st.nick = acct.NicknameValue()
 
 	// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 	if !f.h.cfg.Pool.Acquire(acct.UID) {
@@ -1205,7 +1218,7 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 // 按既有退避节奏换号。
 func (f *chatFlow) skipReserved(ctx context.Context, acct *auth.Auth, i int) rotationAction {
 	log.Printf("WARN: [server] credit reserve: acct=%s model=%s credits below floor after estimate, skip",
-		logfmt.Label(acct.UID, acct.Nickname), f.bareModel)
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
 	if f.stickyUID != "" && acct.UID == f.stickyUID {
 		f.unbindSticky()
 	}
@@ -1381,7 +1394,7 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 	}
 	if err := acct.SaveAtomic(); err != nil {
 		// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露。
-		log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.Nickname), err)
+		log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.NicknameValue()), err)
 	}
 	return true, false
 }
@@ -1434,7 +1447,7 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 		f.st.status = http.StatusServiceUnavailable
 		f.lastErr = fmt.Errorf("%w: %w", errUpstreamTimeout, terr)
 		log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
-			logfmt.Label(acct.UID, acct.Nickname), terr)
+			logfmt.Label(acct.UID, acct.NicknameValue()), terr)
 		return rotBreak
 	}
 	// 出站代理层拨号失败（issue #15）：不是账号的问题，且同一请求换号仍走同一代理池
@@ -1444,7 +1457,7 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 		f.st.status = http.StatusServiceUnavailable
 		f.lastErr = fmt.Errorf("proxy: %w", terr)
 		log.Printf("WARN: [server] outbound proxy dial failed acct=%s: %v (rotation stopped, account not penalized)",
-			logfmt.Label(acct.UID, acct.Nickname), terr)
+			logfmt.Label(acct.UID, acct.NicknameValue()), terr)
 		return rotBreak
 	}
 	// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
@@ -1612,7 +1625,7 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 		f.st.status = http.StatusServiceUnavailable
 		f.st.outcome = reqlog.OutcomeStreamError
 		log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
-			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, kind, logfmt.Truncate(errFrame, 200))
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(errFrame, 200))
 	case sErr != nil && (upstream.IsClientWriteError(sErr) || ctx.Err() != nil):
 		// 客户端写失败（断连 / 写超时）或请求 ctx 已取消：上游帧无恙，账号健康
 		// ——账号侧照常记成功（与 default 同语义），请求日志归为 Interrupted
@@ -1643,7 +1656,7 @@ func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
 	f.st.outcome = reqlog.OutcomeStreamError
 	f.unbindSticky()
 	log.Printf("WARN: [server] stream acct=%s model=%s: %s (account not marked success)",
-		logfmt.Label(acct.UID, acct.Nickname), f.bareModel, reason)
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, reason)
 }
 
 // noteSuccessAndBind 记录账号成功、清 11102 负缓存，并让会话粘性跟随最终成功号。
@@ -1672,11 +1685,11 @@ func (f *chatFlow) finishStreamStats(acct *auth.Auth, stats *chatStatsReader, re
 	if n := repair.Converted(); n > 0 {
 		// 修复命中：上游本来会把工具调用吐成正文标记，这里已还原成 tool_calls。
 		log.Printf("INFO: [server] stream acct=%s model=%s: repaired %d native tool call(s) from assistant text (tool names known=%d)",
-			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, n, len(f.declaredTools))
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, n, len(f.declaredTools))
 	} else if m := repair.Seen(); m > 0 {
 		// 识别到标记却没还原：单独记一行，排障时能一眼区分「没识别到」与「识别到但拒绝」。
 		log.Printf("WARN: [server] stream acct=%s model=%s: saw %d native tool call block(s) but repaired none (tool names known=%d)",
-			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, m, len(f.declaredTools))
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, m, len(f.declaredTools))
 	}
 	f.st.ttfb = stats.TTFB()
 	// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），不写入零值。
@@ -1709,7 +1722,7 @@ func (f *chatFlow) handleNonStreamSuccess(ctx context.Context, acct *auth.Auth, 
 		f.st.status = http.StatusBadGateway
 		f.lastErr = fmt.Errorf("upstream_parse: %w", err)
 		log.Printf("WARN: [server] non-stream acct=%s model=%s: %v (rotating)",
-			logfmt.Label(acct.UID, acct.Nickname), f.bareModel, err)
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, err)
 		if !rotateBackoff(ctx, i) {
 			return rotBreak
 		}

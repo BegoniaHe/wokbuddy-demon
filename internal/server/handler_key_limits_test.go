@@ -126,3 +126,112 @@ func TestNamedKeyModelWhitelistAnthropic(t *testing.T) {
 		t.Fatalf("count_tokens 拒绝应为 Anthropic 错误体: %s", denied.Body)
 	}
 }
+
+// TestNamedKeyModelWhitelistBackgroundAnthropic 后台模型改写后的目标同样参与
+// Anthropic 两个端点的白名单校验，避免 count_tokens 与 /v1/messages 口径不一致。
+func TestNamedKeyModelWhitelistBackgroundAnthropic(t *testing.T) {
+	store := apikey.New("")
+	rec, raw, _ := store.Create("limited")
+	setModels := func(models ...string) {
+		t.Helper()
+		if _, err := store.UpdateLimits(rec.ID, apikey.Limits{Models: models}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h := NewHandler(Config{
+		Pool:             testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:         newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true }),
+		APIKey:           "secret",
+		Keys:             store,
+		BackgroundNames:  map[string]bool{"gpt-5-background": true},
+		BackgroundTarget: "deepseek-v4.1-flash",
+	})
+	do := func(path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+raw)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		return recorder
+	}
+	msg := `{"model":"gpt-5-background","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`
+
+	setModels("deepseek-v4.1-flash")
+	if code := do("/v1/messages/count_tokens", `{"model":"gpt-5-background"}`).Code; code != http.StatusOK {
+		t.Fatalf("白名单目标模型 count_tokens code=%d", code)
+	}
+
+	// 只写原模型名不再生效：两个端点都按改写目标判定。
+	setModels("gpt-5-background")
+	if code := do("/v1/messages", msg).Code; code != http.StatusForbidden {
+		t.Fatalf("原模型名不应绕过 /v1/messages 白名单 code=%d", code)
+	}
+	if code := do("/v1/messages/count_tokens", `{"model":"gpt-5-background"}`).Code; code != http.StatusForbidden {
+		t.Fatalf("原模型名不应绕过 count_tokens 白名单 code=%d", code)
+	}
+}
+
+// TestNamedKeyModelWhitelistUsesFinalRealm 白名单按最终出口匹配：key 绑定 global
+// 时裸模型名不得被固定按 cn 误判。
+func TestNamedKeyModelWhitelistUsesFinalRealm(t *testing.T) {
+	store := apikey.New("")
+	rec, raw, _ := store.Create("global-key")
+	if _, err := store.UpdateLimits(rec.ID, apikey.Limits{Models: []string{"global:glm-*"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetRealm(rec.ID, "global"); err != nil {
+		t.Fatal(err)
+	}
+	acct := &auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999}
+	if _, err := auth.BackfillRealmFor(acct, "global"); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{
+		Pool:     testPoolWith(acct),
+		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true }),
+		APIKey:   "secret",
+		Keys:     store,
+	})
+	do := func(model string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"model":"`+model+`","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer "+raw)
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, req)
+		return recorder
+	}
+	if code := do("glm-5.2").Code; code != http.StatusOK {
+		t.Fatalf("global key 裸名应命中 global 白名单 code=%d", code)
+	}
+	// 改成只允许 cn：同一请求必须被拒，不能因裸名默认 cn 而放行。
+	if _, err := store.UpdateLimits(rec.ID, apikey.Limits{Models: []string{"cn:glm-*"}}); err != nil {
+		t.Fatal(err)
+	}
+	if code := do("glm-5.2").Code; code != http.StatusForbidden {
+		t.Fatalf("global key 不应命中 cn 白名单 code=%d", code)
+	}
+}
+
+// TestNamedKeyModelWhitelistUsesAliasTarget 白名单校验别名解析后的目标模型，
+// 避免用别名绕过限制。
+func TestNamedKeyModelWhitelistUsesAliasTarget(t *testing.T) {
+	store := apikey.New("")
+	rec, raw, _ := store.Create("alias-key")
+	if _, err := store.UpdateLimits(rec.ID, apikey.Limits{Models: []string{"cn:glm-*"}}); err != nil {
+		t.Fatal(err)
+	}
+	h := NewHandler(Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream:     newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true }),
+		APIKey:       "secret",
+		Keys:         store,
+		ModelAliases: map[string]string{"fast": "cn:gpt-5"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"fast","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("别名目标不在白名单内应拒绝 code=%d", recorder.Code)
+	}
+}

@@ -47,19 +47,42 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body", "")
 		return
 	}
-	if obj, ok := v.(map[string]any); ok {
-		model, _ := obj["model"].(string)
-		if ku := keyUsageFrom(r.Context()); ku != nil && !h.cfg.Keys.ModelAllowed(ku.id, model) {
-			h.cfg.Keys.RecordRejected(ku.id)
-			writeAnthropicError(w, http.StatusForbidden, "permission_error", "model is not allowed for this API key", "")
-			return
-		}
+	obj, _ := v.(map[string]any)
+	model, _ := obj["model"].(string)
+	// 与 /v1/messages 同口径：白名单校验前先应用后台模型改写，避免同一模型在
+	// 两个端点上判定不一致。
+	if target := h.backgroundTarget(model); target != "" {
+		model = target
+	}
+	if !h.countTokensModelAllowed(w, r, model) {
+		return
 	}
 	tokens := (countJSONTextBytes(v) + 3) / 4
 	if tokens < 1 {
 		tokens = 1
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": tokens})
+}
+
+// countTokensModelAllowed 校验 count_tokens 的命名密钥模型白名单；与
+// /v1/messages 同口径：先解析别名与 key 出口绑定，再按最终 realm:bare 匹配。
+// 返回 false 时已写出 Anthropic 错误。
+func (h *Handler) countTokensModelAllowed(w http.ResponseWriter, r *http.Request, model string) bool {
+	ku := keyUsageFrom(r.Context())
+	if ku == nil {
+		return true
+	}
+	realm, bare, err := resolveKeyModel(model, h.cfg.ModelAliases, keyRealmFrom(r.Context()))
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		return false
+	}
+	if h.cfg.Keys.ModelAllowed(ku.id, realm+":"+bare) {
+		return true
+	}
+	h.cfg.Keys.RecordRejected(ku.id)
+	writeAnthropicError(w, http.StatusForbidden, "permission_error", "model is not allowed for this API key", "")
+	return false
 }
 
 // countJSONTextBytes 汇总 JSON 中所有字符串值的字节数（键名与结构符号不计）。

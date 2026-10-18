@@ -54,6 +54,20 @@ func resolveRequestModel(model string, aliases map[string]string) (realm, bare s
 	return targetRealm, targetBare
 }
 
+// resolveKeyModel 解析模型白名单校验所需的最终出口与裸模型名：先应用别名，
+// 再按命名密钥出口绑定（issue #94）覆盖 realm。绑定与请求显式 realm 冲突时
+// 返回错误，调用方按 400 处理。
+func resolveKeyModel(model string, aliases map[string]string, keyRealm string) (realm, bare string, err error) {
+	realm, bare = resolveRequestModel(model, aliases)
+	if keyRealm == "" {
+		return realm, bare, nil
+	}
+	if err := checkKeyRealmBinding(model, aliases, keyRealm); err != nil {
+		return realm, bare, err
+	}
+	return keyRealm, bare, nil
+}
+
 // checkKeyRealmBinding 校验命名密钥出口绑定（issue #94）是否与请求的显式 realm
 // 冲突。裸模型名不冲突：由 key 绑定决定出口；显式 "cn:"/"global:" 前缀或别名
 // 目标自带的 realm 才视为客户端明确指定，与绑定不同即报 400。
