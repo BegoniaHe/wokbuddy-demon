@@ -2,8 +2,6 @@ package httpauth
 
 import (
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -43,18 +41,6 @@ func TestLimiterWindowAndReset(t *testing.T) {
 	}
 }
 
-func TestRemoteIPIgnoresForwardedHeaders(t *testing.T) {
-	t.Parallel()
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "198.51.100.9:1234"
-	req.Header.Set("X-Forwarded-For", "203.0.113.1")
-
-	if got := RemoteIP(req); got != "198.51.100.9" {
-		t.Fatalf("RemoteIP=%q", got)
-	}
-}
-
 func TestNilLimiter(t *testing.T) {
 	t.Parallel()
 
@@ -75,11 +61,59 @@ func TestLimiterBoundsTrackedIPs(t *testing.T) {
 	now := time.Unix(1000, 0)
 
 	limiter.now = func() time.Time { return now }
+	for i := range maxTrackedIPsHard + 100 {
+		limiter.Fail(fmt.Sprintf("198.51.100.%d", i))
+	}
+
+	if got := len(limiter.byIP); got > maxTrackedIPsHard {
+		t.Fatalf("byIP=%d，超过硬上限 %d", got, maxTrackedIPsHard)
+	}
+}
+
+// TestLimiterFloodKeepsActiveLockout 灌入大量仍在窗口内的来源 IP 时，目标 IP
+// 的锁定不能被顺带淘汰——否则攻击者轮换 IPv6 就能抹掉自己的失败计数。
+func TestLimiterFloodKeepsActiveLockout(t *testing.T) {
+	t.Parallel()
+
+	limiter := NewLimiter(2, time.Minute)
+	now := time.Unix(1000, 0)
+
+	limiter.now = func() time.Time { return now }
+
+	const victim = "203.0.113.7"
+	limiter.Fail(victim)
+	limiter.Fail(victim)
+
 	for i := range maxTrackedIPs + 100 {
 		limiter.Fail(fmt.Sprintf("198.51.100.%d", i))
 	}
 
-	if got := len(limiter.byIP); got > maxTrackedIPs {
-		t.Fatalf("byIP=%d，超过上限 %d", got, maxTrackedIPs)
+	if ok, _ := limiter.Allow(victim); ok {
+		t.Fatal("灌表后目标 IP 的锁定被抹掉了")
+	}
+}
+
+// TestLimiterHardCapKeepsLockedIP 触发硬上限淘汰时先丢未锁定的窗口；
+// 目标 IP 开始得最早也不能因此丢掉仍在生效的锁定。
+func TestLimiterHardCapKeepsLockedIP(t *testing.T) {
+	t.Parallel()
+
+	limiter := NewLimiter(2, time.Minute)
+	now := time.Unix(1000, 0)
+
+	limiter.now = func() time.Time { return now }
+
+	const victim = "203.0.113.7"
+
+	limiter.byIP[victim] = &failWindow{start: now.Add(-time.Second), count: 2}
+
+	for i := range maxTrackedIPsHard - 1 {
+		limiter.byIP[fmt.Sprintf("198.18.%d.%d", i/256, i%256)] = &failWindow{start: now, count: 1}
+	}
+
+	limiter.Fail("192.0.2.200")
+
+	if ok, _ := limiter.Allow(victim); ok {
+		t.Fatal("硬上限淘汰抹掉了仍生效的锁定")
 	}
 }

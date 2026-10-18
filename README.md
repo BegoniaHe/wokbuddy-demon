@@ -379,6 +379,7 @@ claude
 | `server.request_accept_grace_seconds` | `0` | 停机摘流宽限（秒）：收到 SIGTERM 后 `/healthz` 立即 503，listener 继续受理该时长再关闭；`0` = 立即停机。改后需重启 |
 | `server.shutdown_grace_seconds` | `30` | listener 关闭后等待在途 SSE 流排空的上限（秒）；`0` 回落 30，负值报错。改后需重启 |
 | `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
+| `server.trusted_proxies` | `["127.0.0.1/32","::1/128"]` | 可信反向代理网段（CIDR 或单个 IP）。仅当 TCP 对端命中时才采信 `X-Real-IP` / `X-Forwarded-For`；反代在另一台机器时显式加入其网段。**反代必须自行覆盖或追加** `X-Forwarded-For`，透传客户端自带值等于让客户端伪造来源。改后需重启 |
 | `cooldown.soft_rate` | `600s` | 软限流冷却基数；连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `upstream.model_timeouts` | `{}` | 按模型覆盖 `header` / `idle` 超时（如 `{"cn:glm-5.2":{"header":"300s","idle":"600s"}}`）；未命中回落全局。改后需重启 |
@@ -498,9 +499,10 @@ claude
 - 默认监听 `:7863`，**无内置 TLS**；Docker Compose 默认仅绑定 `127.0.0.1`，需要局域网/公网访问时显式改端口映射
 - 公网部署必须设置 `api_key`，并置于 HTTPS 之后 / 仅内网可达
 - 聊天请求体默认上限 16 MiB（`server.max_body_bytes`，0 = 不限制），超限在解析前返回 413
-- `api_key` 非空时，面板与 `GET /status`、`GET /metrics` 对同一来源地址的鉴权失败做 1 分钟窗口计数，连续 10 次失败后返回 `429` + `Retry-After`；成功鉴权清零。来源只取 TCP `RemoteAddr`，不信任 `X-Forwarded-For`；经反向代理部署时所有客户端共享反代地址，需在反代层另行限速
+- `api_key` 非空时，面板与 `GET /status`、`GET /metrics` 对同一来源地址的鉴权失败做 1 分钟窗口计数，连续 10 次失败后返回 `429` + `Retry-After`；`/v1/*` 的鉴权失败阈值为 30 次/分钟；成功鉴权清零。来源地址默认只取 TCP `RemoteAddr`；只有对端命中 `server.trusted_proxies`（缺省本机回环）时才采信 `X-Real-IP` / `X-Forwarded-For`。反代在另一台机器时需把其网段加入该配置，否则限速与日志都会把所有人算成反代地址；反代必须覆盖或追加 `X-Forwarded-For`，不能透传客户端提供的转发头
 - 日志字段不含任何 token 明文（不读取 `Authorization` 头）
-- 日志写 **stdout / stderr**，代码无任何落盘日志文件
+- **管理面写操作审计**：面板的 `POST` / `PUT` / `PATCH` / `DELETE` 请求追加到 `data/audit/audit.jsonl`（8 MiB × 5 轮转），只记方法、路径、状态码、来源 IP 与 UA，**不记请求体与凭证**；`GET /panel/api/audit?limit=` 可查询最近记录
+- 日志写 **stdout / stderr**，代码无任何落盘日志文件（审计例外，见上）
 
 ### 3. 使用边界
 

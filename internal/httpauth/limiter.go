@@ -1,12 +1,9 @@
 // limiter.go 鉴权失败按来源 IP 限速（issue #61）：固定窗口内失败次数达阈值后
-// 直接返回 429，成功鉴权清零。只用于面板与 /status、/metrics 等运维面；
-// /healthz 无鉴权不经过限速。单实例进程内状态，不跨进程共享。
+// 直接返回 429，成功鉴权清零。面板、/status、/metrics 与 /v1/* 共用该实现
+// （阈值不同）；/healthz 无鉴权不经过限速。单实例进程内状态，不跨进程共享。
 package httpauth
 
 import (
-	"net"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 )
@@ -15,9 +12,12 @@ const (
 	// DefaultFailLimit / DefaultFailWindow 默认阈值：10 次/分钟。
 	DefaultFailLimit  = 10
 	DefaultFailWindow = time.Minute
-	// maxTrackedIPs 单进程最多保留的失败窗口数；超过后先清过期项，仍满则
-	// 淘汰最早窗口，防止轮换来源 IP 把内存撑大。
+	// maxTrackedIPs 单进程常规保留的失败窗口数。
 	maxTrackedIPs = 4096
+	// maxTrackedIPsHard 极端洪水下的内存兜底上限。达到后才允许淘汰仍在窗口内
+	// 的条目——正常清理只删过期项，避免攻击者用大量来源 IP 灌满表、顺手抹掉
+	// 目标 IP 正在生效的锁定。
+	maxTrackedIPsHard = maxTrackedIPs * 4
 )
 
 // Limiter 按来源 IP 的失败窗口计数器。
@@ -95,6 +95,9 @@ func (l *Limiter) Fail(ip string) {
 
 // evictLocked 在达到容量上限时为新的来源 IP 腾位置：先清过期窗口，仍满则
 // 淘汰最早开始的窗口（调用方已持有锁）。只在新增 IP 时触发，重复失败不扫描。
+//
+// 硬上限下必须淘汰仍在窗口内的条目：优先丢未达锁定阈值的窗口，把已锁定的
+// 窗口留到最后，避免攻击者轮换来源 IP 灌表、顺手抹掉目标 IP 的生效锁定。
 func (l *Limiter) evictLocked(now time.Time) {
 	if len(l.byIP) < maxTrackedIPs {
 		return
@@ -106,21 +109,45 @@ func (l *Limiter) evictLocked(now time.Time) {
 		}
 	}
 
-	if len(l.byIP) < maxTrackedIPs {
+	if len(l.byIP) < maxTrackedIPsHard {
 		return
 	}
 
-	oldestIP := ""
+	l.dropOldestLocked()
+}
 
-	var oldest time.Time
+// dropOldestLocked 淘汰最早开始的窗口：优先丢未达锁定阈值的条目，把仍在
+// 生效的锁定留到最后（调用方已持有锁）。
+func (l *Limiter) dropOldestLocked() {
+	oldestOpenIP := ""
+
+	var oldestOpen time.Time
+
+	oldestLockedIP := ""
+
+	var oldestLocked time.Time
+
 	for ip, w := range l.byIP {
-		if oldestIP == "" || w.start.Before(oldest) {
-			oldestIP, oldest = ip, w.start
+		if w.count < l.limit {
+			if oldestOpenIP == "" || w.start.Before(oldestOpen) {
+				oldestOpenIP, oldestOpen = ip, w.start
+			}
+
+			continue
+		}
+
+		if oldestLockedIP == "" || w.start.Before(oldestLocked) {
+			oldestLockedIP, oldestLocked = ip, w.start
 		}
 	}
 
-	if oldestIP != "" {
-		delete(l.byIP, oldestIP)
+	evictIP := oldestLockedIP
+	if oldestOpenIP != "" {
+		evictIP = oldestOpenIP
+	}
+
+	if evictIP != "" {
+		delete(l.byIP, evictIP)
 	}
 }
 
@@ -133,19 +160,4 @@ func (l *Limiter) Reset(ip string) {
 	l.mu.Lock()
 	delete(l.byIP, ip)
 	l.mu.Unlock()
-}
-
-// RemoteIP 提取来源 IP：只认 RemoteAddr，不信任未配置的转发头（X-Forwarded-For
-// 可被客户端伪造，用于爆破限速会绕过）。反代场景由反代自身限速或后续信任配置处理。
-func RemoteIP(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-
-	addr := strings.TrimSpace(r.RemoteAddr)
-	if host, _, err := net.SplitHostPort(addr); err == nil {
-		return host
-	}
-
-	return addr
 }

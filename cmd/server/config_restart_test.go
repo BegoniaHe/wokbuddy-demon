@@ -38,6 +38,7 @@ func TestRestartRequiredFieldsAssemblyChanges(t *testing.T) {
 		{"state_file", func(c *Config) { c.StateFile = "./data/other.json" }},
 		{"server.read_timeout", func(c *Config) { c.Server.ReadTimeout = "60s" }},
 		{"server.cors_origins", func(c *Config) { c.Server.CORSOrigins = []string{"https://example.test"} }},
+		{"server.trusted_proxies", func(c *Config) { c.Server.TrustedProxies = []string{"10.0.0.0/8"} }},
 		{"pricing.enabled", func(c *Config) { c.Pricing.Enabled = !c.Pricing.Enabled }},
 		{"pricing.refresh_minutes", func(c *Config) { c.Pricing.RefreshMinutes++ }},
 		{"pricing.exchange_rate", func(c *Config) { c.Pricing.ExchangeRate += 0.1 }},

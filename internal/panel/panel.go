@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -29,6 +30,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
@@ -44,9 +46,13 @@ type Config struct {
 	Upstream  *upstream.Client
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
+	AuditDir  string               // 管理面写操作审计目录（空 = 关闭审计）
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
-	RedisMode string               // "upstash" / "noop"，仅观测透出
-	Version   string               // 面板版本号（展示用）
+	// TrustedProxies 可信反向代理网段；只有 TCP 对端命中时才采信转发头。
+	// 空 = 只认 RemoteAddr（直连部署的安全默认）。
+	TrustedProxies []*net.IPNet
+	RedisMode      string // "upstash" / "noop"，仅观测透出
+	Version        string // 面板版本号（展示用）
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -125,6 +131,9 @@ type Panel struct {
 	// authLimiter 鉴权失败按来源 IP 限速（issue #61）。
 	authLimiter *httpauth.Limiter
 
+	// audit 管理面写操作审计（JSONL，按大小轮转）。nil = 未配置目录。
+	audit *auditLog
+
 	// 模型探测（modelhealth.go，issue #110）：单飞 + 全局并发名额 + 状态文件锁。
 	probeMu       sync.Mutex
 	probeInflight map[string]bool
@@ -186,6 +195,8 @@ func New(cfg *Config) *Panel {
 		logins:       map[string]loginSession{},
 		authLimiter:  httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
 	}
+	panel.audit = newAuditLog(config.AuditDir)
+	panel.audit.initAuditSize()
 	panel.routes()
 
 	return panel
@@ -212,6 +223,7 @@ func (p *Panel) routesPages() {
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
+	p.mux.HandleFunc("GET /panel/api/audit", p.withAuth(p.auditList))
 	p.mux.HandleFunc("GET /panel/api/agents", p.withAuth(p.agentsStatus))
 	p.mux.HandleFunc("POST /panel/api/agents/{client}/apply", p.withAuth(p.agentsApply))
 	p.mux.HandleFunc("POST /panel/api/agents/{client}/restore", p.withAuth(p.agentsRestore))
@@ -293,9 +305,55 @@ func (p *Panel) routesConfig() {
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
 // 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
+// panelAPIMaxBodyBytes 管理面请求体统一上限（字节）。个别导入端点另有更小的
+// 内部上限；这里兜住未来新增的 handler，避免未设上限的读 body 占满内存。
+const panelAPIMaxBodyBytes = 16 << 20
+
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
+
+	if strings.HasPrefix(r.URL.Path, "/panel/api/") {
+		// 敏感数据（配置、账号、密钥）不允许浏览器或中间代理缓存。
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		limitPanelBody(w, r)
+	}
+
+	if p.audit != nil && r.Method != http.MethodGet && r.Method != http.MethodHead &&
+		strings.HasPrefix(r.URL.Path, "/panel/api/") {
+		aw := &auditResponseWriter{w: w}
+		p.mux.ServeHTTP(aw, r)
+
+		status := aw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+
+		p.audit.Append(&auditEntry{
+			Method:     r.Method,
+			Path:       r.URL.Path,
+			Pattern:    r.Pattern,
+			Status:     status,
+			OK:         status < 400,
+			IP:         httpauth.ClientIP(r, p.cfg.TrustedProxies),
+			UserAgent:  logfmt.Truncate(r.UserAgent(), 200),
+			AuthFailed: status == http.StatusUnauthorized || status == http.StatusForbidden,
+		})
+
+		return
+	}
+
 	p.mux.ServeHTTP(w, r)
+}
+
+// limitPanelBody 给管理面请求体套上统一上限。超限在 handler 读取时返回错误
+// （MaxBytesReader 负责），不会先把整个 body 缓冲进内存。
+func limitPanelBody(w http.ResponseWriter, r *http.Request) {
+	if r.Body == nil {
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, panelAPIMaxBodyBytes)
 }
 
 // withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
@@ -309,7 +367,7 @@ func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		ip := httpauth.RemoteIP(r)
+		ip := httpauth.ClientIP(r, p.cfg.TrustedProxies)
 		if ok, retry := p.authLimiter.Allow(ip); !ok {
 			seconds := max(int((retry+time.Second-1)/time.Second), 1)
 			w.Header().Set("Retry-After", strconv.Itoa(seconds))
@@ -429,6 +487,7 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	rows, err := p.cfg.RequestLog.ReadArchive(limit, &reqlog.Filter{
 		Outcome:   values.Get("outcome"),
 		Account:   values.Get("account"),
+		KeyID:     values.Get("key_id"),
 		Model:     values.Get("model"),
 		ClientIP:  values.Get("client_ip"),
 		UserAgent: values.Get("user_agent"),

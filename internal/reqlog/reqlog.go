@@ -63,22 +63,25 @@ type Config struct {
 // 归档里不会出现来源字段）——来源信息比 token 计数敏感，运营可自行决定是否落盘。
 // 仍然不写提示词、响应正文、Authorization 或其它凭证。
 type Event struct {
-	Time             time.Time `json:"time"`
-	RequestID        string    `json:"request_id"`
-	Path             string    `json:"path"`
-	Account          string    `json:"account,omitempty"`
-	Model            string    `json:"model,omitempty"`
-	Status           int       `json:"status"`
-	OK               bool      `json:"ok"`
-	Outcome          string    `json:"outcome"`
-	DurationMs       int64     `json:"duration_ms"`
-	TTFBMs           int64     `json:"ttfb_ms,omitempty"`
-	Attempts         int       `json:"attempts,omitempty"`
-	PromptTokens     int64     `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64     `json:"completion_tokens,omitempty"`
-	TotalTokens      int64     `json:"total_tokens,omitempty"`
-	Credit           float64   `json:"credit,omitempty"`
-	HasCredit        bool      `json:"credit_known"`
+	Time      time.Time `json:"time"`
+	RequestID string    `json:"request_id"`
+	Path      string    `json:"path"`
+	Account   string    `json:"account,omitempty"`
+	// KeyID 本次请求命中的命名密钥 ID（默认密钥 / 未鉴权为空）。只记 ID，
+	// 不记密钥前缀或明文；面板可用它把请求归到具体分发对象。
+	KeyID            string  `json:"key_id,omitempty"`
+	Model            string  `json:"model,omitempty"`
+	Status           int     `json:"status"`
+	OK               bool    `json:"ok"`
+	Outcome          string  `json:"outcome"`
+	DurationMs       int64   `json:"duration_ms"`
+	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
+	Attempts         int     `json:"attempts,omitempty"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty"`
+	TotalTokens      int64   `json:"total_tokens,omitempty"`
+	Credit           float64 `json:"credit,omitempty"`
+	HasCredit        bool    `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
 	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
@@ -114,6 +117,7 @@ type DecisionCandidate struct {
 type Filter struct {
 	Outcome   string
 	Account   string
+	KeyID     string
 	Model     string
 	ClientIP  string
 	UserAgent string
@@ -745,6 +749,7 @@ func (f *Filter) match(event4 *Event) bool {
 // matchTextFields 对所有字符串字段做大小写不敏感的包含匹配，全部命中才返回 true。
 func (f *Filter) matchTextFields(e *Event) bool {
 	return containsFold(e.Account, f.Account) &&
+		containsFold(e.KeyID, f.KeyID) &&
 		containsFold(e.Model, f.Model) &&
 		containsFold(e.ClientIP, f.ClientIP) &&
 		containsFold(e.UserAgent, f.UserAgent)
