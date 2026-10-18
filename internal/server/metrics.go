@@ -93,6 +93,7 @@ func (m *metricsRegistry) incRotation(reason string) {
 func (h *Handler) metricsHandler(w http.ResponseWriter, _ *http.Request) {
 	var b strings.Builder
 	h.writeAccountMetrics(&b)
+	h.writePoolMetrics(&b)
 	h.writeModelMetrics(&b)
 	h.writeDurationMetrics(&b)
 	h.writeRotationMetrics(&b)
@@ -122,6 +123,29 @@ func (h *Handler) writeAccountMetrics(b *strings.Builder) {
 		{"in_flight_full", inFlightFull},
 	} {
 		writeSample(b, "wokbuddy_accounts", label("state", s.state), float64(s.value))
+	}
+}
+
+// writePoolMetrics 池级运行态 gauge：全局在途、冷却账号数与按模型 TTFT 均值。
+// 都读现有状态（InFlightTotal / CountsDetailed / TTFTByModel），不新增记账。
+func (h *Handler) writePoolMetrics(b *strings.Builder) {
+	if h.cfg.Pool == nil {
+		return
+	}
+	writeHelpType(b, "wokbuddy_pool_in_flight", "Current in-flight upstream requests across all accounts.", "gauge")
+	writeSample(b, "wokbuddy_pool_in_flight", "", float64(h.cfg.Pool.InFlightTotal()))
+	_, _, cooling, _, _ := h.cfg.Pool.CountsDetailed() //nolint:dogsled // 只需要 cooling
+	writeHelpType(b, "wokbuddy_pool_cooling", "Cooling or breaker-open accounts.", "gauge")
+	writeSample(b, "wokbuddy_pool_cooling", "", float64(cooling))
+	writeHelpType(b, "wokbuddy_model_ttft_ms", "Average account TTFT EWMA in milliseconds by model.", "gauge")
+	ttft := h.cfg.Pool.TTFTByModel()
+	models := make([]string, 0, len(ttft))
+	for model := range ttft {
+		models = append(models, model)
+	}
+	sort.Strings(models)
+	for _, model := range models {
+		writeSample(b, "wokbuddy_model_ttft_ms", label("model", model), ttft[model])
 	}
 }
 

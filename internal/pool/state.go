@@ -400,7 +400,8 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
-func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+// realm 与普通选号同口径：路由冷却期间粘性命中也必须解绑。
+func (p *Pool) PickByUIDForModel(uid, model, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -408,6 +409,9 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 		return nil
 	}
 	now := p.now()
+	if p.routeCoolingLocked(realm, model, now) {
+		return nil
+	}
 	if !e.healthyForModel(now, model) {
 		return nil
 	}

@@ -52,6 +52,9 @@ type Pool struct {
 	// 每日护栏（issue #95）：全局默认 + cn/global 字段级覆盖；0 = 关闭。
 	dailyDefault, dailyCN, dailyGlobal DailyLimits
 	dailyUsage                         func() map[string]DailyUsage
+	// routeCooldowns (realm, model) 路由级熔断台账（issue #149）；运行态、不持久化。
+	// 键为 realm + "\x1f" + model，值为滑动窗口失败时刻与冷却截止。
+	routeCooldowns map[string]*routeState
 	// modelRateOf 按 (realm, 模型) 查上游目录积分倍率（"0.79" / "" = 未知）。
 	// 由 main 用 upstream.Client.ModelRate 注入——pool 不依赖 upstream 包（避免
 	// 循环依赖与分层破坏），nil 时倍率兜底不生效（退化为仅本地台账判定）。
@@ -99,6 +102,7 @@ type Pool struct {
 func New(stateFp string) *Pool {
 	p := &Pool{
 		byUID:              map[string]*entry{},
+		routeCooldowns:     map[string]*routeState{},
 		stateFp:            stateFp,
 		breakerThreshold:   defaultBreakerThreshold,
 		breakerCooldown:    defaultBreakerCooldown,

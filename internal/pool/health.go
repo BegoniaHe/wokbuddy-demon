@@ -139,3 +139,28 @@ func (e *entry) pruneExpiredHealth(now time.Time) {
 		}
 	}
 }
+
+// TTFTByModel 返回各模型当前 TTFT EWMA 的账号均值（ms）。只统计 healthTTL 内有
+// 观测且 hasTTFT 的 (账号, 模型) 条目；无观测的模型不输出（不编造 0）。
+// 供 /metrics 导出，读路径不写台账。
+func (p *Pool) TTFTByModel() map[string]float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := p.now()
+	sum := map[string]float64{}
+	count := map[string]int{}
+	for _, e := range p.byUID {
+		for model, mh := range e.health {
+			if !mh.hasTTFT || mh.ttftMs <= 0 || now.Sub(mh.lastSeen) > healthTTL {
+				continue
+			}
+			sum[model] += mh.ttftMs
+			count[model]++
+		}
+	}
+	out := make(map[string]float64, len(sum))
+	for model, s := range sum {
+		out[model] = s / float64(count[model])
+	}
+	return out
+}

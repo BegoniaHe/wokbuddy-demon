@@ -173,12 +173,12 @@ func TestCreditFloorStickyPathBlocked(t *testing.T) {
 	p.SetCredits("sticky", 30, 0)
 	p.NoteModelCost("sticky", "hy4-preview", 2.9, 1000)
 
-	if a := p.PickByUIDForModel("sticky", "hy4-preview"); a != nil {
+	if a := p.PickByUIDForModel("sticky", "hy4-preview", ""); a != nil {
 		t.Fatalf("粘性号触底 + 收费模型应被 floor 拦（want nil），got %v", a.UID)
 	}
 	// 免费模型不受影响：同一粘性号照常出票。
 	p.NoteModelCost("sticky", "free-model", 0, 1000)
-	if a := p.PickByUIDForModel("sticky", "free-model"); a == nil {
+	if a := p.PickByUIDForModel("sticky", "free-model", ""); a == nil {
 		t.Fatal("粘性号触底 + 免费模型应照常出票，got nil")
 	}
 }
@@ -376,12 +376,12 @@ func TestCreditFloorStickyBlockedByCatalogRate(t *testing.T) {
 	p.Add(g)
 	p.SetCredits("poor", 30, 0)
 
-	if a := p.PickByUIDForModel("poor", "kimi-k3-1"); a != nil {
+	if a := p.PickByUIDForModel("poor", "kimi-k3-1", ""); a != nil {
 		t.Fatalf("粘性号触底且目录判收费应返回 nil（解绑换号），got %v", a)
 	}
 	// 回血后恢复：越过 floor 即放行。
 	p.SetCredits("poor", 500, 0)
-	if a := p.PickByUIDForModel("poor", "kimi-k3-1"); a == nil {
+	if a := p.PickByUIDForModel("poor", "kimi-k3-1", ""); a == nil {
 		t.Fatal("回血越过 floor 后粘性号应恢复可选，got nil")
 	}
 }

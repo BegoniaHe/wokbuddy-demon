@@ -217,3 +217,24 @@ func TestMetricsAccountsPartition(t *testing.T) {
 		t.Errorf("in_flight_full want 1:\n%s", body)
 	}
 }
+
+// TestMetricsPoolGauges 池级 gauge：在途、冷却账号数与按模型 TTFT 均值。
+func TestMetricsPoolGauges(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.RecordModelHealth("u1", "glm-5.2", 1200, true, true)
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+
+	body := getMetrics(t, h, nil).Body.String()
+	for _, want := range []string{
+		"# TYPE wokbuddy_pool_in_flight gauge",
+		"wokbuddy_pool_in_flight 0",
+		"# TYPE wokbuddy_pool_cooling gauge",
+		"wokbuddy_pool_cooling 0",
+		"# TYPE wokbuddy_model_ttft_ms gauge",
+		`wokbuddy_model_ttft_ms{model="glm-5.2"} 1200`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics body missing %q\n---\n%s", want, body)
+		}
+	}
+}
