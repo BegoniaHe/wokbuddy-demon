@@ -52,22 +52,32 @@ type Proxy struct {
 	pass   string
 }
 
+// redactURLError 去掉 url.Error 携带的原始 URL（可能含 user:pass），只保留解析原因。
+func redactURLError(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return uerr.Err
+	}
+	return errors.New("非法 URL")
+}
+
 // ParseProxy 解析代理 URL：支持 http://、https://、socks5://、socks5h://，
 // 可选 user:pass 认证；缺省端口按 scheme 回落（80/443/1080）。
 func ParseProxy(raw string) (*Proxy, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return nil, fmt.Errorf("proxy %q: %w", raw, err)
+		// 不直接回显 raw / err：两者都可能含 user:pass。
+		return nil, fmt.Errorf("proxy 地址解析失败: %w", redactURLError(err))
 	}
 	scheme := strings.ToLower(u.Scheme)
 	switch scheme {
 	case "http", "https", "socks5", "socks5h":
 	default:
-		return nil, fmt.Errorf("proxy %q: 不支持的 scheme %q（http/https/socks5/socks5h）", raw, u.Scheme)
+		return nil, fmt.Errorf("proxy: 不支持的 scheme %q（http/https/socks5/socks5h）", u.Scheme)
 	}
 	host := u.Hostname()
 	if host == "" {
-		return nil, fmt.Errorf("proxy %q: 缺少 host", raw)
+		return nil, errors.New("proxy 地址缺少 host")
 	}
 	port := u.Port()
 	if port == "" {

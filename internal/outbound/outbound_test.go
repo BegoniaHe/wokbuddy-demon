@@ -448,3 +448,20 @@ func TestHandshakeFailureClosesConn(t *testing.T) {
 		t.Fatal("proxy-side conn was not closed after handshake timeout")
 	}
 }
+
+// TestParseProxyErrorRedactsCredentials 解析/校验错误不得回显代理 URL 中的 user:pass。
+func TestParseProxyErrorRedactsCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"http://user:secret@host/%zz",
+		"ftp://user:secret@host:21",
+		"http://user:secret@",
+	} {
+		_, err := ParseProxy(raw)
+		if err == nil {
+			t.Fatalf("ParseProxy(%q) 应报错", raw)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("错误回显了代理密码: %v", err)
+		}
+	}
+}

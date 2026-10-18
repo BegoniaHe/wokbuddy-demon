@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -92,4 +93,20 @@ func TestNotifierSendFailureDoesNotBlock(t *testing.T) {
 	n := New(Config{URL: srv.URL})
 	n.Notify(Event{Event: EventTaskFailed, UID: "u1"})
 	n.Close()
+}
+
+// TestValidateURLRedactsCredentials 校验错误不得回显 webhook URL（通常即 bearer token）。
+func TestValidateURLRedactsCredentials(t *testing.T) {
+	for _, raw := range []string{
+		"ftp://user:secret@example.com/hook",
+		"http://user:secret@example.com/%zz",
+	} {
+		err := ValidateURL(raw)
+		if err == nil {
+			t.Fatalf("ValidateURL(%q) 应报错", raw)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("错误回显了凭证: %v", err)
+		}
+	}
 }

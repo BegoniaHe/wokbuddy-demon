@@ -254,10 +254,28 @@ func withoutUID(uids []string, uid string) []string {
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
+// 写锁内 re-check：快路径读取与 touch 之间可能发生 Degrade（写入 avoid*）或
+// Unbind（删除条目）；直接覆盖会把降级窗口清掉/让已解绑的会话复活。
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
+	e, ok := r.entries[key]
+	if !ok || e.uid != uid {
+		r.mu.Unlock()
+		return
+	}
+	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；窗口已过期则顺手清掉
+	// avoid*，否则该会话会永久受 LowLoad 低水位门控。
+	suppressed := e.avoidUID == uid && now.Before(e.avoidUntil)
+	if !suppressed && e.avoidUID != "" && !now.Before(e.avoidUntil) {
+		e.avoidUID = ""
+		e.avoidUntil = time.Time{}
+	}
+	e.lastActive = now
+	r.entries[key] = e
 	r.mu.Unlock()
+	if suppressed {
+		return
+	}
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
