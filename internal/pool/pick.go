@@ -150,7 +150,7 @@ func topTrace(top []*entry, model string, now time.Time, pool *Pool, maxCredits 
 // 冷却/成本台账、按模型与域判定健康、应用积分保底拦截与在途占满过滤。
 // 调用方必须已持有 p.mu 写锁。
 func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace) []*entry {
-	var cands []*entry
+	cands := p.pickCands[:0]
 
 	for strVal, entry2 := range p.byUID {
 		if tried != nil && tried[strVal] {
@@ -170,6 +170,8 @@ func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now
 
 		cands = append(cands, entry2)
 	}
+
+	p.pickCands = cands
 
 	return cands
 }
@@ -308,7 +310,7 @@ type weightedEntry struct {
 }
 
 func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, maxCredits int64, now time.Time) (ordered, top []*entry) {
-	weightedEntries := make([]weightedEntry, 0, len(cands))
+	weightedEntries := p.pickWeightBuf[:0]
 	for _, e := range cands {
 		ti, ci := e.costTier(reqModel, now)
 		if ti == bestTier {
@@ -340,10 +342,13 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 		return weightedEntries[i].e.a.UID < weightedEntries[j].e.a.UID
 	})
 
-	ordered = make([]*entry, len(weightedEntries))
-	for i, c := range weightedEntries {
-		ordered[i] = c.e
+	ordered = p.pickOrdered[:0]
+	for _, c := range weightedEntries {
+		ordered = append(ordered, c.e)
 	}
+
+	p.pickWeightBuf = weightedEntries
+	p.pickOrdered = ordered
 
 	if len(ordered) > 5 {
 		return ordered, ordered[:5]
@@ -356,7 +361,7 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 // 同一账号在窗口内不重复被选中），全部刚被用过时在**全候选**里按 usedSeq 取最旧者
 // （LRU 兜底，避免 top5 字典序截断把等权重靠后账号饿死），否则在 top5 内加权抽签。
 func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Time) *entry {
-	eligible := make([]*entry, 0, len(top))
+	eligible := p.pickEligible[:0]
 	for _, c := range top {
 		if now.Sub(c.lastUsed) >= p.pickGap {
 			eligible = append(eligible, c)
@@ -376,6 +381,8 @@ func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Tim
 
 		return entry2
 	}
+
+	p.pickEligible = eligible
 
 	return p.pickWeighted(eligible, model) // eligible 保序 = top5 降序子集
 }

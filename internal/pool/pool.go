@@ -96,6 +96,12 @@ type Pool struct {
 	// persistMu 内更新。并发落盘时旧快照不得覆盖已落盘的新快照。
 	persistSeq uint64
 	savedSeq   uint64
+	// pickCands/pickWeighted/pickOrdered/pickEligible 选号中间切片（仅 p.mu 写锁内
+	// 使用，天然串行）。复用避免每次 Pick 为候选/排序/抽签各分配一次。
+	pickCands     []*entry
+	pickWeightBuf []weightedEntry
+	pickOrdered   []*entry
+	pickEligible  []*entry
 	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
 	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
