@@ -14,7 +14,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// cockpit 导入的资源上限（issue #107）。
+// 批量导入（cockpit / 桌面端 / 加密备份）共用的资源上限（issue #107）。
 //
 // 此前 ParseMultipartForm(32<<20) 的 32MiB 只是内存/临时文件切分阈值，不限制
 // 请求体总大小；随后 io.ReadAll(file) 无上限，accounts 数组也没有数量上限，
@@ -25,12 +25,12 @@ const (
 	// 正常 cockpit 导出远小于此）。http.MaxBytesReader 在解析前兜住整个 body，
 	// io.LimitReader 作为第二道防线。
 	cockpitMaxUploadBytes = 8 << 20
-	// maxCockpitImportAccounts 单次导入账号数上限：超过整体拒绝（不静默截断，
+	// maxImportAccounts 单次导入账号数上限：超过整体拒绝（不静默截断，
 	// 避免用户以为全导入了）。
-	maxCockpitImportAccounts = 1000
-	// cockpitImportWorkers 导入后签到/激活/余额查询的并发上限。这些是逐号上游
+	maxImportAccounts = 1000
+	// importWorkers 导入后签到/激活/余额查询的并发上限。这些是逐号上游
 	// 调用，串行执行会让单请求长时间占用且放大延迟；无界并发又会瞬时打满上游。
-	cockpitImportWorkers = 3
+	importWorkers = 3
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号。
@@ -98,10 +98,10 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "empty accounts array")
 		return
 	}
-	if len(accounts) > maxCockpitImportAccounts {
+	if len(accounts) > maxImportAccounts {
 		// 整体拒绝：静默截断会让用户以为全部导入成功。
 		writeErr(w, http.StatusBadRequest,
-			fmt.Sprintf("too many accounts: %d (max %d per import)", len(accounts), maxCockpitImportAccounts))
+			fmt.Sprintf("too many accounts: %d (max %d per import)", len(accounts), maxImportAccounts))
 		return
 	}
 
@@ -122,7 +122,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 阶段 2（有界并发）：签到/激活/余额查询。失败仅记日志，不阻断导入。
-	p.postImportCockpitAccounts(importedAuths)
+	p.postImportAccounts(importedAuths)
 
 	total := len(accounts)
 	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
@@ -158,11 +158,12 @@ func (p *Panel) persistCockpitAccount(acc cockpitAccount) (*auth.Auth, string) {
 	return a, ""
 }
 
-// postImportCockpitAccounts 对已落盘的账号做签到/激活/余额查询，并发有上限
+// postImportAccounts 对已落盘的账号做签到/激活/余额查询，并发有上限
 // （issue #107）：逐号上游调用不再串行放大单请求时长，也不会无界并发打满上游。
+// cockpit / 桌面端 / 加密备份导入共用（加密备份此前串行逐号调用）。
 // 所有失败只记日志，不改变导入结果。
-func (p *Panel) postImportCockpitAccounts(accounts []*auth.Auth) {
-	sem := make(chan struct{}, cockpitImportWorkers)
+func (p *Panel) postImportAccounts(accounts []*auth.Auth) {
+	sem := make(chan struct{}, importWorkers)
 	var wg sync.WaitGroup
 	for _, a := range accounts {
 		wg.Add(1)

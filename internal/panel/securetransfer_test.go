@@ -7,6 +7,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -126,6 +127,39 @@ func TestImportEncryptedRejectsOversized(t *testing.T) {
 	pn.importEncrypted(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestImportEncryptedRejectsTooManyAccounts 超过账号数上限：整体拒绝，不落盘、不导入。
+func TestImportEncryptedRejectsTooManyAccounts(t *testing.T) {
+	pn, p, _ := newSecurePanel(t)
+	accounts := make([]secureAccount, maxImportAccounts+1)
+	plain, err := json.Marshal(accounts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := encryptPayload("correct horse battery", plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("file", "too-many.json")
+	fw.Write(env)
+	mw.WriteField("password", "correct horse battery")
+	mw.Close()
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/import/encrypted", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	rec := httptest.NewRecorder()
+	pn.importEncrypted(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "too many accounts") {
+		t.Errorf("body=%s want readable limit error", rec.Body)
+	}
+	if len(p.List()) != 0 {
+		t.Errorf("rejected import must not add accounts")
 	}
 }
 

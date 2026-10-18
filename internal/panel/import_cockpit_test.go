@@ -121,7 +121,7 @@ func TestCockpitImportRejectsOversizedBody(t *testing.T) {
 // 不导入任何账号、不发起上游调用（issue #107）。
 func TestCockpitImportRejectsTooManyAccounts(t *testing.T) {
 	pn, p, calls, _ := newCockpitPanel(t)
-	payload := cockpitAccountsJSON(t, maxCockpitImportAccounts+1)
+	payload := cockpitAccountsJSON(t, maxImportAccounts+1)
 	rec := doCockpitImport(t, pn, payload)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
@@ -206,7 +206,7 @@ func TestCockpitImportPartialFailure(t *testing.T) {
 }
 
 // TestCockpitImportBoundedConcurrency 导入后的上游调用并发有界（issue #107）：
-// 12 个账号时同时在途的请求不得超过 cockpitImportWorkers。
+// 12 个账号时同时在途的请求不得超过 importWorkers。
 func TestCockpitImportBoundedConcurrency(t *testing.T) {
 	pn, _, _, maxInFlight := newCockpitPanel(t)
 	const n = 12
@@ -214,7 +214,7 @@ func TestCockpitImportBoundedConcurrency(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if got := atomic.LoadInt32(maxInFlight); got > cockpitImportWorkers {
-		t.Errorf("max concurrent upstream calls=%d want <= %d", got, cockpitImportWorkers)
+	if got := atomic.LoadInt32(maxInFlight); got > importWorkers {
+		t.Errorf("max concurrent upstream calls=%d want <= %d", got, importWorkers)
 	}
 }

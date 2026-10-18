@@ -151,7 +151,7 @@ func secureGCM(password string, salt []byte, iter int) (cipher.AEAD, error) {
 }
 
 // collectSecureAccounts 汇总池内全部账号的可导出凭证（token 原样，加密后传输）。
-// 经加锁访问器读取会被 refresh 改写的字段；UID/Nickname/EnterpriseID/DeviceToken
+// 经加锁访问器读取会被 refresh/改名改写的字段；UID/EnterpriseID/DeviceToken
 // 解析后不再改写，直接读。
 func (p *Panel) collectSecureAccounts() []secureAccount {
 	var out []secureAccount
@@ -162,7 +162,7 @@ func (p *Panel) collectSecureAccounts() []secureAccount {
 		}
 		out = append(out, secureAccount{
 			UID:          a.UID,
-			Nickname:     a.Nickname,
+			Nickname:     a.NicknameValue(),
 			AccessToken:  a.AccessTokenValue(),
 			RefreshToken: a.RefreshTokenValue(),
 			ExpiresAt:    a.ExpiresAtValue(),
@@ -253,21 +253,28 @@ func (p *Panel) importEncrypted(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "解密后内容不是有效账号数组")
 		return
 	}
-	if len(accounts) == 0 {
-		writeErr(w, http.StatusBadRequest, "账号数组为空")
+	if err := validateSecureAccounts(accounts); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
+	// 阶段 1（串行）：字段校验 + 落盘 + 热加载。
+	importedAuths := make([]*auth.Auth, 0, len(accounts))
+	errs := make([]string, 0, len(accounts))
 	var imported, skipped int
-	var errs []string
 	for _, acc := range accounts {
-		if ok, msg := p.importSecureAccount(acc); ok {
-			imported++
-		} else {
+		a, msg := p.persistSecureAccount(acc)
+		if a == nil {
 			skipped++
 			errs = append(errs, msg)
+			continue
 		}
+		imported++
+		importedAuths = append(importedAuths, a)
 	}
+
+	// 阶段 2（有界并发）：签到/激活/余额查询，与其它批量导入同策略。
+	p.postImportAccounts(importedAuths)
 	log.Printf("panel: 加密导入 finished total=%d imported=%d skipped=%d", len(accounts), imported, skipped)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
@@ -278,17 +285,30 @@ func (p *Panel) importEncrypted(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// importSecureAccount 导入单个解密账号：字段校验、落盘、热加载并顺带签到/激活。
+// validateSecureAccounts 校验解密后的账号数量：空数组与超上限整体拒绝。
+func validateSecureAccounts(accounts []secureAccount) error {
+	if len(accounts) == 0 {
+		return errors.New("账号数组为空")
+	}
+	if len(accounts) > maxImportAccounts {
+		return fmt.Errorf("too many accounts: %d (max %d per import)", len(accounts), maxImportAccounts)
+	}
+	return nil
+}
+
+// persistSecureAccount 校验并落盘单个解密账号（含热加载进池）。
+// 返回 (账号, 空串) 表示导入成功；账号为 nil 时第二返回值是失败原因。
+// 上游调用（签到/余额）不在此处，见 postImportAccounts。
 // 失败原因不回显 token（只标 uid）。
-func (p *Panel) importSecureAccount(acc secureAccount) (bool, string) {
+func (p *Panel) persistSecureAccount(acc secureAccount) (*auth.Auth, string) {
 	uid := strings.TrimSpace(acc.UID)
 	at := strings.TrimSpace(acc.AccessToken)
 	rt := strings.TrimSpace(acc.RefreshToken)
 	if uid == "" || at == "" || rt == "" {
-		return false, fmt.Sprintf("missing required fields (uid=%q)", acc.UID)
+		return nil, fmt.Sprintf("missing required fields (uid=%q)", acc.UID)
 	}
 	if !validImportUID(uid) {
-		return false, fmt.Sprintf("invalid uid (uid=%q)", acc.UID)
+		return nil, fmt.Sprintf("invalid uid (uid=%q)", acc.UID)
 	}
 	realm := strings.TrimSpace(acc.Realm)
 	if realm == "" {
@@ -296,13 +316,9 @@ func (p *Panel) importSecureAccount(acc secureAccount) (bool, string) {
 	}
 	a := buildSecureAuth(acc, uid, at, rt, p.cfg.AuthDir)
 	if err := p.persistImportedAuth(a, realm, uid); err != nil {
-		return false, err.Error()
+		return nil, err.Error()
 	}
-	p.importCheckin(a, uid)
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
-		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
-	}
-	return true, ""
+	return a, ""
 }
 
 // buildSecureAuth 由解密账号构造 auth：ExpiresAt 缺失时回落 +365 天。
