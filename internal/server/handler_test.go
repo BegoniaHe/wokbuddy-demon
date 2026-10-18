@@ -616,7 +616,7 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 	}
 	assertCalls(t, calls, map[string]int{"Bearer at-bad": 1, "Bearer at-good": 1})
 	// 冷却时长取自注入的 SoftCooldown，不依赖真实等待。
-	assertSoftRateCooling(t, statusOf(t, p, "bad"), int64(soft/time.Second))
+	assertSoftRateCooling(t, statusOf(t, p, "bad"), int64(soft/time.Second)+int64(soft/time.Second)/10+1)
 
 	// 冷却生效：同一账号在冷却期内不得再被选中。
 	before := calls["Bearer at-bad"]
@@ -647,8 +647,8 @@ func TestApplyErrorPolicySoftRateExponentialBackoff(t *testing.T) {
 		if st.SoftStreak != 1 {
 			t.Errorf("call %d: 冷却中兜底探测不应推进 soft_streak, got %d", i, st.SoftStreak)
 		}
-		if st.CoolRemaining < 600-3 || st.CoolRemaining > 600 {
-			t.Errorf("call %d: cool_remaining_sec=%d want ~600（不堆加）", i, st.CoolRemaining)
+		if st.CoolRemaining < 540 || st.CoolRemaining > 660 {
+			t.Errorf("call %d: cool_remaining_sec=%d want ~600±10%%（不堆加）", i, st.CoolRemaining)
 		}
 	}
 }
@@ -704,8 +704,8 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 	if !st.Cooling || st.CoolKind != "soft_rate" {
 		t.Fatalf("bad 应进入 soft_rate 冷却: %+v", st)
 	}
-	if st.CoolRemaining <= 599 || st.CoolRemaining > 600 {
-		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600", st.CoolRemaining)
+	if st.CoolRemaining < 540 || st.CoolRemaining > 660 {
+		t.Errorf("default soft cooldown cool_remaining_sec=%d want 600±10%%", st.CoolRemaining)
 	}
 }
 
@@ -941,8 +941,8 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 		t.Fatalf("bad should be soft cooling: %+v", st)
 	}
 	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
-		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
+	if st.CoolRemaining <= 0 || st.CoolRemaining > 66 {
+		t.Errorf("cool_remaining_sec=%d want ~60±10%% (soft base, not parsed)", st.CoolRemaining)
 	}
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" || st.RateLimitedModels[0].Kind != "rate_limit" {
 		t.Fatalf("rate-limited models=%+v, want audit row for glm-5.3", st.RateLimitedModels)
