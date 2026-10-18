@@ -410,6 +410,10 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
+		// 请求日志归属：默认密钥不写（空），命名密钥记 ID。只影响归档元数据。
+		if tr := requestTraceFrom(r); tr != nil {
+			tr.keyID = res.KeyID
+		}
 		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
 		if !ok {
 			h.cfg.Keys.RecordRejected(res.KeyID)

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -557,5 +558,35 @@ func TestChatStatsReaderNormalLines(t *testing.T) {
 	}
 	if s.TTFB() <= 0 {
 		t.Errorf("TTFB 未记录")
+	}
+}
+
+// 命名密钥请求把 key_id 写进归档；默认密钥保持空。
+func TestRequestMetricsRecordsNamedKeyID(t *testing.T) {
+	store := apikey.New("")
+	rec, raw, err := store.Create("client-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   up,
+		Keys:       store,
+		RequestLog: reqLog,
+		APIKey:     "default-key",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", recorder.Code, recorder.Body)
+	}
+	s := reqLog.Snapshot()
+	if len(s.Recent) != 1 || s.Recent[0].KeyID != rec.ID {
+		t.Fatalf("key id = %q want %q", s.Recent[0].KeyID, rec.ID)
 	}
 }

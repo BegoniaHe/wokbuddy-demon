@@ -381,6 +381,7 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 	rows, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{
 		Outcome:   q.Get("outcome"),
 		Account:   q.Get("account"),
+		KeyID:     q.Get("key_id"),
 		Model:     q.Get("model"),
 		ClientIP:  q.Get("client_ip"),
 		UserAgent: q.Get("user_agent"),

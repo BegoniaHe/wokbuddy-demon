@@ -396,6 +396,8 @@ type requestTrace struct {
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
+	// keyID 命中的命名密钥 ID；默认密钥 / 未鉴权为空。由 withClientAuth 回填。
+	keyID string
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -468,6 +470,7 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
 	}
+	e.KeyID = t.keyID
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent
 	if t.stat != nil {
