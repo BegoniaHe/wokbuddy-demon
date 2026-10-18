@@ -30,7 +30,6 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
-	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
@@ -321,24 +320,20 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if p.audit != nil && r.Method != http.MethodGet && r.Method != http.MethodHead &&
 		strings.HasPrefix(r.URL.Path, "/panel/api/") {
-		aw := &auditResponseWriter{w: w}
-		p.mux.ServeHTTP(aw, r)
+		auditedWriter := &auditResponseWriter{w: w}
 
-		status := aw.status
-		if status == 0 {
-			status = http.StatusOK
-		}
+		// panic 也要留审计：handler 可能已经写了部分状态变更，直接 abort 连接
+		// 会让这次写操作不可追溯。记录后原样抛回，保持 net/http 的中止语义。
+		defer func() {
+			if rec := recover(); rec != nil {
+				p.audit.Append(p.auditEntryFor(auditedWriter, r, true))
+				panic(rec)
+			}
 
-		p.audit.Append(&auditEntry{
-			Method:     r.Method,
-			Path:       r.URL.Path,
-			Pattern:    r.Pattern,
-			Status:     status,
-			OK:         status < 400,
-			IP:         httpauth.ClientIP(r, p.cfg.TrustedProxies),
-			UserAgent:  logfmt.Truncate(r.UserAgent(), 200),
-			AuthFailed: status == http.StatusUnauthorized || status == http.StatusForbidden,
-		})
+			p.audit.Append(p.auditEntryFor(auditedWriter, r, false))
+		}()
+
+		p.mux.ServeHTTP(auditedWriter, r)
 
 		return
 	}

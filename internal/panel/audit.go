@@ -16,6 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
 const (
@@ -39,6 +42,9 @@ type auditEntry struct {
 	IP         string `json:"ip,omitempty"`
 	UserAgent  string `json:"user_agent,omitempty"`
 	AuthFailed bool   `json:"auth_failed,omitempty"`
+	// Panic 标记 handler 在写出响应前 panic（此时 Status 记为 500）。审计不能
+	// 因为 panic 跳过：部分写操作可能已生效，缺记录会留下无法追溯的变更。
+	Panic bool `json:"panic,omitempty"`
 }
 
 // auditLog 并发安全的追加写入器。零值不可用；用 newAuditLog 构造。
@@ -216,6 +222,30 @@ func (a *auditLog) initAuditSize() {
 
 	if stat, err := os.Stat(a.path); err == nil {
 		a.size = stat.Size()
+	}
+}
+
+// auditEntryFor 由响应状态构造一条审计记录。panicked=true 且尚未写出响应头时
+// 状态按 500 记；已写出 2xx 但随后 panic 的请求也不计为成功。
+func (p *Panel) auditEntryFor(auditedWriter *auditResponseWriter, r *http.Request, panicked bool) *auditEntry {
+	status := auditedWriter.status
+	switch {
+	case panicked && status == 0:
+		status = http.StatusInternalServerError
+	case status == 0:
+		status = http.StatusOK
+	}
+
+	return &auditEntry{
+		Method:     r.Method,
+		Path:       r.URL.Path,
+		Pattern:    r.Pattern,
+		Status:     status,
+		OK:         status < 400 && !panicked,
+		IP:         httpauth.ClientIP(r, p.cfg.TrustedProxies),
+		UserAgent:  logfmt.Truncate(r.UserAgent(), 200),
+		AuthFailed: status == http.StatusUnauthorized || status == http.StatusForbidden,
+		Panic:      panicked,
 	}
 }
 

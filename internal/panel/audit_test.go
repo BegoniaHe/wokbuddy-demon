@@ -134,3 +134,33 @@ func TestAuditMiddlewareRecordsMutationsOnly(t *testing.T) {
 		t.Fatalf("GET should not be audited, entries=%d", got)
 	}
 }
+
+// panic 的管理面写操作也必须留审计：handler 可能在 panic 前已改了部分状态，
+// 否则这类变更完全不可追溯（且响应是 500）。
+func TestAuditRecordsPanickedMutation(t *testing.T) {
+	t.Parallel()
+
+	panel := New(&Config{Version: "test", AuditDir: t.TempDir()})
+	panel.mux.HandleFunc("POST /panel/api/panic", func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("panic should propagate to net/http")
+			}
+		}()
+
+		panel.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/panel/api/panic", nil))
+	}()
+
+	entries := panel.audit.Recent(1)
+	if len(entries) != 1 {
+		t.Fatalf("entries=%d want 1", len(entries))
+	}
+
+	if !entries[0].Panic || entries[0].Status != http.StatusInternalServerError || entries[0].OK {
+		t.Fatalf("entry=%+v want panic/500/not-ok", entries[0])
+	}
+}
