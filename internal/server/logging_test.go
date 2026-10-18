@@ -298,7 +298,7 @@ func TestClientIPForLogFallsBackToRemoteAddr(t *testing.T) {
 	}
 }
 
-// 可信反代下才采信转发头：X-Real-IP 优先，XFF 从右往左跳过可信跳。
+// 可信反代下才采信转发头：XFF 从右往左跳过可信跳，缺失时才回落 X-Real-IP。
 func TestClientIPForLogUsesTrustedProxy(t *testing.T) {
 	t.Parallel()
 

@@ -378,7 +378,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // withAuth 默认密钥鉴权（/status 等运维面）：只认 config.api_key。
 // api_key 非空时按来源 IP 限制连续失败（issue #61）：超限返回 429 + Retry-After；
-// 来源 IP 只认 RemoteAddr，不信任可伪造的转发头；成功鉴权清零窗口。
+// 来源 IP 由 httpauth.ClientIP 解析：只有 TCP 对端命中 server.trusted_proxies
+// 时才采信转发头；成功鉴权清零窗口。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := h.loadLive().APIKey
