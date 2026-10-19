@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -164,5 +165,40 @@ func TestSetAppearanceTheme(t *testing.T) {
 
 	if got["kind"] != "theme" || got["resource_key"] != "theme-tkmw7j" {
 		t.Errorf("body=%v want kind=theme resource_key=theme-tkmw7j", got)
+	}
+}
+
+// TestDesktopReportHostDomainAndEnterprise X-Domain 为 host 形态，企业字段按需出现。
+func TestDesktopReportHostDomainAndEnterprise(t *testing.T) {
+	t.Parallel()
+
+	var header http.Header
+
+	var got []map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header = r.Header.Clone()
+
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	account := &auth.Auth{AccessToken: "at", UID: "u-dt", EnterpriseID: "ent-1"}
+
+	if err := c.ReportDesktopEvent(account, DesktopEvent{"eventCode": "x"}); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	host := strings.TrimPrefix(strings.TrimPrefix(srv.URL, "https://"), "http://")
+	if got := header.Get("X-Domain"); got != host {
+		t.Errorf("X-Domain=%q want host %q", got, host)
+	}
+
+	if got[0]["enterpriseId"] != "ent-1" || got[0]["enterprise"] != "ent-1" {
+		t.Errorf("enterprise fields=%v/%v", got[0]["enterpriseId"], got[0]["enterprise"])
 	}
 }

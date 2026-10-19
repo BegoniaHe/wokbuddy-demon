@@ -93,7 +93,9 @@ func (h *Handler) countTokensModelAllowed(w http.ResponseWriter, r *http.Request
 		return true
 	}
 
-	realm, bare, err := resolveKeyModel(model, h.cfg.ModelAliases, keyRealmFrom(r.Context()))
+	keyRealm := keyRealmFrom(r.Context())
+
+	realm, bare, err := resolveKeyModel(model, h.requestModelAliases(model, keyRealm), keyRealm)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
 		return false
@@ -163,15 +165,16 @@ func newAnthropicChatInput(
 	}
 
 	chatInput2 := chatInput{
-		body:      openAI,
-		stream:    stream,
-		model:     model,
-		clientIP:  upstream.ExtractClientIP(r),
-		convReqID: r.Header.Get("X-Conversation-Request-Id"),
-		traceID:   r.Header.Get("X-Trace-Id"),
-		trace:     requestTraceFrom(r),
-		keyUsage:  keyUsageFrom(r.Context()),
-		keyRealm:  keyRealmFrom(r.Context()),
+		body:           openAI,
+		stream:         stream,
+		model:          model,
+		clientIP:       upstream.ExtractClientIP(r),
+		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
+		traceID:        r.Header.Get("X-Trace-Id"),
+		inboundSession: inboundSessionMetaFrom(r),
+		trace:          requestTraceFrom(r),
+		keyUsage:       keyUsageFrom(r.Context()),
+		keyRealm:       keyRealmFrom(r.Context()),
 	}
 
 	return chatInput2, &anthropicResponder{w: w, model: model, keepalive: keepalive}, true

@@ -320,6 +320,21 @@ gemini
 
 上游静默超过该间隔时，网关向客户端写一帧 `: keepalive` SSE 注释（不进入 JSON 帧白名单，不影响客户端解析）；上游持续输出时不额外插入。默认 `"0"` 关闭以保持逐字节透传行为。改后需重启。
 
+### 官方客户端协议对齐
+
+网关按 WorkBuddy Desktop CN `5.8.3` / global `5.8.4` 的静态包内行为对齐协议：
+
+- **CN origin**：默认主域 `www.workbuddy.cn`；chat / refresh / 登录在首 token 前遇到传输错误或 `408/502/503/504` 时依次回落 `copilot.tencent.com`、`wb.tencentbuddy.com`。显式覆盖 chat base 时只用该值。
+- **身份头**：企业账号同时发送 `X-Enterprise-Id` 与 `X-Tenant-Id`；个人 global 账号发送 `X-No-Enterprise-Id: 1`。账号带 `domain` 时透传为 `X-Domain`，global 缺省回落 `www.workbuddy.ai`。
+- **入站会话元数据**：`X-Conversation-ID`、`X-Root-Request-ID`、`X-Parent-Conversation-ID`、`X-Agent-Intent/Purpose/Type`、`X-Compaction`、`X-Context-Compacted` 原样透传；缺失时保持网关默认。
+- **401 重放**：上游 chat 返回 401 时，同账号刷新一次 token 并重放同一请求；再次 401 回到既有轮换策略。refresh 端点 401/403 视为会话失效，按 keepalive 阈值禁用。
+- **SSE**：兼容 `delta.reasoning`（归一为 `reasoning_content`）、重复 `tool_calls[].id` 去重；已收到 `finish_reason` 后 EOF 视为正常完成。只有 reasoning、没有正文/工具调用/拒答的流不记成功。
+- **队列与额度业务码**：`6020` 返回 429 + `Retry-After`（不换号）；`6021/6022` 返回容量/并发错误（不轮转）；`14001/14012-14014/14018/14019` 归为额度耗尽，`14015` 会话失效，`14016/14017` 账号未激活。
+- **签到 / 余额**：两 realm 均优先 `/v2/billing/meter/daily-checkin`，404 回落旧路径；`1001` 视为已签到，`1002/1003` 视为活动未开启。余额以 `get-user-resource-summary` 为主，失败回落 `get-user-resource`，并解析精确容量、切片额度与到期字段。
+- **模型目录**：应用 `availableModels` / `disabled` / `aliases` 过滤；CN 在 `/console` 无 CLI 过滤集时回落 `/v2/enterprises/personal/models`，`/v3/config` 同时使用桌面端与 IDE UA。上游 alias 参与请求解析，`models.aliases` 配置优先。
+- **growth / travel**：Bearer 通道优先 `/v2/activity/growth/*`，404 回落旧路径；travel claim 支持带 `record_id` 与空 body 两种形态，并发送 `X-Product-Code: workbuddy`。
+- **桌面指纹**：`X-Domain` 使用 host 形态；企业账号上报事件带 `enterpriseId` / `enterprise`；不伪造 `qimei36`。
+
 ### Webhook 告警
 
 配置 `notify.webhook_url` 后，以下关键事件会以 POST JSON 异步推送（同事件 + 账号 10 分钟内去重，失败只记日志，不影响请求与任务）：
@@ -391,7 +406,7 @@ gemini
 | `notify.webhook_url` | 空 | 告警 webhook（http/https）；空 = 关闭 |
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；`0` = 不限制。改后需重启 |
-| `server.max_body_bytes` | `16777216` | 聊天类入站请求体上限（字节，16 MiB），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413 `payload_too_large`；`0` = 不限制。改后需重启 |
+| `server.max_body_bytes` | `33554432` | 聊天类入站请求体上限（字节，32 MiB，对齐官方桌面端 VLM 代理），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413 `payload_too_large`；`0` = 不限制。改后需重启 |
 | `server.request_accept_grace_seconds` | `0` | 停机摘流宽限（秒）：收到 SIGTERM 后 `/healthz` 立即 503，listener 继续受理该时长再关闭；`0` = 立即停机。改后需重启 |
 | `server.shutdown_grace_seconds` | `30` | listener 关闭后等待在途 SSE 流排空的上限（秒）；`0` 回落 30，负值报错。改后需重启 |
 | `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
@@ -403,6 +418,8 @@ gemini
 | `upstream.rotate_budget` | `0` | 轮换总时长预算（如 `90s`）；`0` = 不限。与 `rotate_max` 先到先停 |
 | `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
 | `upstream.keepalive_interval` | `0` | 入站 SSE 主动心跳间隔（如 `15s`）；上游静默时写 `: keepalive` 注释帧。`0` = 关闭 |
+| `upstream.header_timeout_seconds` | `1200` | 聊天 SSE 首字节前上限（秒，对齐官方客户端）；`0` = 默认 1200。`upstream.model_timeouts` 优先 |
+| `upstream.idle_timeout_seconds` | `1200` | 聊天 SSE 流中空闲上限（秒，对齐官方客户端）；活跃吐数据会续命；`0` = 默认 1200。`upstream.model_timeouts` 优先 |
 | `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
@@ -514,7 +531,7 @@ gemini
 
 - 默认监听 `:7863`，**无内置 TLS**；Docker Compose 默认仅绑定 `127.0.0.1`，需要局域网/公网访问时显式改端口映射
 - 公网部署必须设置 `api_key`，并置于 HTTPS 之后 / 仅内网可达
-- 聊天请求体默认上限 16 MiB（`server.max_body_bytes`，0 = 不限制），超限在解析前返回 413
+- 聊天请求体默认上限 32 MiB（`server.max_body_bytes`，0 = 不限制），超限在解析前返回 413
 - `api_key` 非空时，面板与 `GET /status`、`GET /metrics` 对同一来源地址的鉴权失败做 1 分钟窗口计数，连续 10 次失败后返回 `429` + `Retry-After`；`/v1/*` 的鉴权失败阈值为 30 次/分钟；成功鉴权清零。来源地址默认只取 TCP `RemoteAddr`；只有对端命中 `server.trusted_proxies`（缺省本机回环）时才采信 `X-Real-IP` / `X-Forwarded-For`。反代在另一台机器时需把其网段加入该配置，否则限速与日志都会把所有人算成反代地址；反代必须覆盖或追加 `X-Forwarded-For`，不能透传客户端提供的转发头
 - 日志字段不含任何 token 明文（不读取 `Authorization` 头）
 - **管理面写操作审计**：面板的 `POST` / `PUT` / `PATCH` / `DELETE` 请求追加到 `data/audit/audit.jsonl`（8 MiB × 5 轮转），只记方法、路径、状态码、来源 IP 与 UA，**不记请求体与凭证**；`GET /panel/api/audit?limit=` 可查询最近记录

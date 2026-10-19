@@ -21,9 +21,9 @@ var (
 	errBoom                 = errors.New("boom")
 )
 
-// travelPath 断言请求打到 growth 域的正确路径（BASE 走 chatBase，无 /v2 前缀）。
+// travelPath 断言请求打到 growth 域的正确路径（/v2 优先，旧无前缀路径为 fallback）。
 func travelPath(r *http.Request, want string) error {
-	if r.URL.Path != want {
+	if r.URL.Path != want && r.URL.Path != "/v2"+want {
 		return fmt.Errorf("%s: %w", "wrong path: "+r.URL.Path, errTravelPathFailed)
 	}
 
@@ -315,5 +315,123 @@ func TestTravel401ClassifiedSessionDead(t *testing.T) {
 	var ue *Error
 	if !errors.As(err, &ue) || ue.Kind != ErrSessionDead {
 		t.Fatalf("err=%v want ErrSessionDead", err)
+	}
+}
+
+// TestTravelClaimEmptyBodyFallback 带 record_id 收到参数错误后，空 body 重试一次；
+// 两种请求都携带 X-Product-Code。
+func TestTravelClaimEmptyBodyFallback(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		if r.Header.Get("X-Product-Code") != "workbuddy" {
+			t.Errorf("X-Product-Code=%q want workbuddy", r.Header.Get("X-Product-Code"))
+		}
+
+		calls++
+
+		var body []byte
+		if r.Body != nil {
+			body, _ = io.ReadAll(r.Body)
+		}
+
+		if calls == 1 {
+			if !bytes.Contains(body, []byte(`"record_id":42`)) {
+				t.Errorf("first body=%s want record_id", body)
+			}
+
+			return jsonResp(400, `{"code":400,"msg":"parameter error"}`), nil
+		}
+
+		if len(body) != 0 {
+			t.Errorf("fallback body=%s want empty", body)
+		}
+
+		return jsonResp(200, `{"code":0,"data":{"reward_credit":5}}`), nil
+	})
+
+	reward, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 42)
+	if err != nil || reward != 5 {
+		t.Fatalf("reward=%d err=%v", reward, err)
+	}
+
+	if calls != 2 {
+		t.Errorf("calls=%d want 2", calls)
+	}
+}
+
+// TestGrowthUsesV2First Bearer growth 通道 /v2 路径优先。
+func TestGrowthUsesV2First(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path == "/v2/activity/growth/streak" {
+			return jsonResp(200, `{"code":0,"data":{"streak":{"days":3}}}`), nil
+		}
+
+		return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
+	})
+
+	days, err := client.GrowthStreak(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil || days != 3 {
+		t.Fatalf("days=%d err=%v", days, err)
+	}
+
+	if len(paths) != 1 || paths[0] != "/v2/activity/growth/streak" {
+		t.Errorf("paths=%v want only /v2 first", paths)
+	}
+}
+
+// TestGrowthPathAlreadyV2NotDoubled 已带 /v2 的任务路径不能被 growthJSON 再拼一次前缀。
+func TestGrowthPathAlreadyV2NotDoubled(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+
+		return jsonResp(200, `{"code":0,"data":{"tasks":[]}}`), nil
+	})
+
+	if _, err := client.ListTasks(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+
+	if len(paths) != 1 || paths[0] != "/v2/activity/growth/tasks" {
+		t.Errorf("paths=%v want only /v2/activity/growth/tasks", paths)
+	}
+}
+
+// TestTravelClaimReturnsLastError 空 body 重试失败时返回最后一次错误分类，
+// 不被更早的参数错误覆盖。
+func TestTravelClaimReturnsLastError(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return jsonResp(400, `{"code":400,"msg":"parameter error"}`), nil
+		}
+
+		return jsonResp(500, `{"code":500,"msg":"boom"}`), nil
+	})
+
+	_, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 42)
+
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Kind != ErrServer {
+		t.Errorf("err=%v want ErrServer (last attempt)", err)
+	}
+
+	if calls != 2 {
+		t.Errorf("calls=%d want 2", calls)
 	}
 }

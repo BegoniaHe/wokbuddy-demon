@@ -36,14 +36,15 @@ func (c *Client) billingJSONLimit(a *auth.Auth, path string, body any, maxBytes 
 	return c.domainJSONLimit(a, c.billingBase(a), http.MethodPost, path, body, maxBytes)
 }
 
-// domainJSON 是 billingJSON / growthJSON 的唯一实现：对指定 base 域发请求并解信封。
-// body 为 nil 时不带请求体；请求头统一 BillingHeaders，错误语义同 doJSON。
-func (c *Client) domainJSON(a *auth.Auth, base, method, path string, body any) (json.RawMessage, error) {
-	return c.domainJSONLimit(a, base, method, path, body, defaultJSONBodyLimit)
+// domainJSONLimit 对指定 base 域发请求并解信封，额外指定响应体上限。
+func (c *Client) domainJSONLimit(account *auth.Auth, base, method, path string, body any, maxBytes int64) (json.RawMessage, error) {
+	return c.domainJSONLimitHeaders(account, base, method, path, body, maxBytes, nil)
 }
 
-// domainJSONLimit 同 domainJSON，仅额外指定响应体上限。
-func (c *Client) domainJSONLimit(account *auth.Auth, base, method, path string, body any, maxBytes int64) (json.RawMessage, error) {
+// domainJSONLimitHeaders 同 domainJSONLimit，额外注入调用方指定的请求头。
+func (c *Client) domainJSONLimitHeaders(
+	account *auth.Auth, base, method, path string, body any, maxBytes int64, headers map[string]string,
+) (json.RawMessage, error) {
 	var rdr io.Reader
 
 	if body != nil {
@@ -61,6 +62,10 @@ func (c *Client) domainJSONLimit(account *auth.Auth, base, method, path string, 
 	}
 
 	c.BillingHeaders(req, account)
+
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 
 	return c.doJSONLimit(req, maxBytes)
 }

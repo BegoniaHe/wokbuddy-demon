@@ -135,6 +135,7 @@ func (c *Client) fetchGlobalModelsOnce(account *auth.Auth) (names []string, info
 	}
 
 	c.storeModelRates("global", infos)
+	c.storeModelAliases("global", infos)
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
 	// 不注入 costTier。
@@ -541,6 +542,8 @@ func (c *Client) globalModelsOnce(account3 *auth.Auth, path string) ([]string, [
 	}
 
 	c.CommonHeaders(req, account3) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
+	injectEnterpriseHeaders(req, account3)
+	injectChatDomain(req, account3)
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account3.AccessTokenValue())
 
@@ -594,21 +597,109 @@ func parseGlobalModelNames(
 	if !ok {
 		return nil, nil, nil, nil, errGlobalModelsEmptyList
 	}
+
+	available := resolveAvailableModels(payload)
 	// 主形态：对象数组 → dynModelEntry 全字段（与 CN FetchModels 共用解析，零口径漂移）。
-	if names, infos, efforts, defaults, ok := parseGlobalModelEntries(arr); ok {
-		return names, infos, efforts, defaults, nil
+	if entryNames, entryInfos, entryEfforts, entryDefaults, ok := parseGlobalModelEntries(arr); ok {
+		entryNames, entryInfos = filterGlobalCatalog(entryNames, entryInfos, available)
+		return entryNames, entryInfos, entryEfforts, entryDefaults, nil
 	}
 	// 可用条目为 0（键名全对不上）：落入下方动态兜底，不在这里报空。
 	// 窄表：字符串数组 → 仅 ID（无 effort 元数据、无对象字段 → infos nil）。
-	if names, isStr := parseGlobalNarrowTable(arr); isStr {
-		if len(names) > 0 {
-			return names, nil, nil, nil, nil
+	if narrowNames, isStr := parseGlobalNarrowTable(arr); isStr {
+		if len(narrowNames) > 0 {
+			narrowNames, _ = filterGlobalCatalog(narrowNames, nil, available)
+			return narrowNames, nil, nil, nil, nil
 		}
 
 		return nil, nil, nil, nil, errGlobalModelsEmptyList
 	}
 	// 动态兜底：逐对象宽松解析（上游换键名时不至于整域空列表）。
-	return parseGlobalModelLooseArray(arr)
+	names, infos, efforts, defaults, err = parseGlobalModelLooseArray(arr)
+	if err == nil {
+		names, infos = filterGlobalCatalog(names, infos, available)
+	}
+
+	return names, infos, efforts, defaults, err
+}
+
+// resolveAvailableModels 从 payload 任意层级提取 availableModels。
+// 支持字符串数组与对象数组（_meta["codebuddy.ai"].availableModels 为对象形态）。
+//
+//nolint:cyclop,modernize // 递归遍历多信封，抽取 availableModels。
+func resolveAvailableModels(payload json.RawMessage) []string {
+	var root any
+	if json.Unmarshal(payload, &root) != nil {
+		return nil
+	}
+
+	var found []string
+
+	var walk func(any) bool
+
+	walk = func(value any) bool {
+		switch node := value.(type) {
+		case map[string]any:
+			if raw, ok := node["availableModels"]; ok {
+				encoded, err := json.Marshal(raw)
+				if err == nil {
+					var ids modelIDList
+					if json.Unmarshal(encoded, &ids) == nil && len(ids) > 0 {
+						found = ids
+						return true
+					}
+				}
+			}
+
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	walk(root)
+
+	return found
+}
+
+// filterGlobalCatalog 按 availableModels 过滤模型名单与对象条目（空集合不限制）。
+func filterGlobalCatalog(names []string, infos []ModelInfo, available []string) ([]string, []ModelInfo) {
+	set := availableModelSet(available)
+	if set == nil {
+		return names, infos
+	}
+
+	keep := func(id string) bool { return set[id] || set[stripCustomLocalModelPrefix(id)] }
+
+	outNames := make([]string, 0, len(names))
+	for _, id := range names {
+		if keep(id) {
+			outNames = append(outNames, id)
+		}
+	}
+
+	if infos == nil {
+		return outNames, nil
+	}
+
+	outInfos := make([]ModelInfo, 0, len(infos))
+	for i := range infos {
+		if keep(infos[i].ID) {
+			outInfos = append(outInfos, infos[i])
+		}
+	}
+
+	return outNames, outInfos
 }
 
 // resolveGlobalPayload 解信封：code 非 0 拒绝（字段缺失 = 放行，兼容无信封直出的目录

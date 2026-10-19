@@ -152,15 +152,16 @@ func (h *Handler) runLocalWebToolLoop(r *http.Request, req map[string]any, msgs 
 
 		buf := &bufferResponder{}
 		chatInput2 := chatInput{
-			body:      raw,
-			stream:    false,
-			model:     model,
-			clientIP:  upstream.ExtractClientIP(r),
-			convReqID: r.Header.Get("X-Conversation-Request-Id"),
-			traceID:   r.Header.Get("X-Trace-Id"),
-			trace:     requestTraceFrom(r),
-			keyUsage:  keyUsageFrom(r.Context()),
-			keyRealm:  keyRealmFrom(r.Context()),
+			body:           raw,
+			stream:         false,
+			model:          model,
+			clientIP:       upstream.ExtractClientIP(r),
+			convReqID:      r.Header.Get("X-Conversation-Request-Id"),
+			traceID:        r.Header.Get("X-Trace-Id"),
+			inboundSession: inboundSessionMetaFrom(r),
+			trace:          requestTraceFrom(r),
+			keyUsage:       keyUsageFrom(r.Context()),
+			keyRealm:       keyRealmFrom(r.Context()),
 		}
 		h.serveChat(r, &chatInput2, buf)
 

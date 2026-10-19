@@ -581,8 +581,8 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 
 // checkinAuth 返回该账号本轮应使用的凭证；禁用/无 refresh token 跳过。
 // global 账号同样签到：官方国际版客户端使用同一 `/billing/meter/daily-checkin`
-// （无 /v2 前缀优先，见 upstream.checkinMeterPaths），此前 D4 门控会让国际版
-// 每日活跃奖励永远不闭环（issue #97）。
+// （两 realm 均 /v2 优先、404 回落旧路径，见 upstream.checkinMeterPaths），此前
+// D4 门控会让国际版每日活跃奖励永远不闭环（issue #97）。
 func (s *Scheduler) checkinAuth(st *pool.Status, includeDisabled bool) (*auth.Auth, bool) {
 	if st.Disabled && !includeDisabled {
 		return nil, false
@@ -622,6 +622,14 @@ func (s *Scheduler) runCheckinAccount(status *pool.Status, account *auth.Auth, e
 // checkinOne 单账号签到并落一行结果日志：按 CheckinResult 分类呈现——成功/幂等/
 // 活动未开启（非错误态）分开表述，只有真失败记 error 行；均不阻断后续余额查询。
 func (s *Scheduler) checkinOne(uid, nickname string, account *auth.Auth) bool {
+	// 先查签到活动状态：今日已签则跳过重复请求；状态查询失败时回落直接签到。
+	if checked, err := s.cfg.Upstream.CheckinActivityStatus(account); err == nil && checked {
+		s.cfg.Pool.NoteCheckinDone(uid)
+		s.logger.Printf("checkin %s: 今天已签到（状态预检）", logfmt.Label(uid, nickname))
+
+		return true
+	}
+
 	err := s.cfg.Upstream.DailyCheckin(account)
 	switch upstream.ClassifyCheckin(err) {
 	case upstream.CheckinOK:

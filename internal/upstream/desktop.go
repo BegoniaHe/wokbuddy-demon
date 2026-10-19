@@ -1,12 +1,12 @@
 // desktop.go 桌面客户端（WorkBuddy Desktop）行为指纹上报。
 //
 // 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）+ 官方分发包
-// app.asar 逆向（CN 5.8.2 / global 5.7.6）。桌面端点亮「需电脑端」类任务的关键
+// app.asar 逆向（CN 5.8.3 / global 5.8.4）。桌面端点亮「需电脑端」类任务的关键
 // 不是独立端点，而是同一 POST /v2/report 通道上**不同的客户端指纹**：
 //
-//	POST https://copilot.tencent.com/v2/report        ← chatBase（CLI 上报走 billingBase）
+//	POST https://www.workbuddy.cn/v2/report           ← chatBase（CLI 上报走 billingBase）
 //	User-Agent: WorkBuddy/<realm 版本>
-//	X-Domain: copilot.tencent.com, X-Product: SaaS, X-User-Id: <uid>
+//	X-Domain: www.workbuddy.cn（host 形态）, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
 // 每个事件除业务字段外必带桌面指纹（ideName/ideType=WorkBuddy、
@@ -33,9 +33,11 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -47,13 +49,13 @@ const (
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
 
 	// 官方桌面分发包构建指纹（realm 分档，取自各包 cli/product.json）。
-	//   cn     5.8.2  commit b8f6c953…  date 2026-10-12T12:02:33.293Z
-	//   global 5.7.6  commit 306add2a…  date 2026-10-04T12:03:58.867Z
+	//   cn     5.8.3  commit 64d249be…  date 2026-10-14T10:11:49.257Z
+	//   global 5.8.4  commit 73952edb…  date 2026-10-15T11:17:03.116Z
 	// 上报事件 product/releaseDate/commit/ideVersion/extVersion 取此组，与 UA 版本自洽。
-	cnDesktopCommit          = "b8f6c953610cb16e2bd275c003ded4bc315ec528"
-	cnDesktopReleaseDate     = int64(1791806553293) // 2026-10-12T12:02:33.293Z
-	globalDesktopCommit      = "306add2a5dfafacf97769081cd17c3d172f6e60d"
-	globalDesktopReleaseDate = int64(1791115438867) // 2026-10-04T12:03:58.867Z
+	cnDesktopCommit          = "64d249bed3dec40edd720537d96f27e70a3f6a4f"
+	cnDesktopReleaseDate     = int64(1791972709257) // 2026-10-14T10:11:49.257Z
+	globalDesktopCommit      = "73952edb48da46bd0b244661efe22f4f247c4977"
+	globalDesktopReleaseDate = int64(1792063023116) // 2026-10-15T11:17:03.116Z
 )
 
 // desktopLocal 桌面端事件中 source/mode 字段的本地标记值（官方分发端恒发此值）。
@@ -87,8 +89,18 @@ func desktopUAFor(a *auth.Auth) string {
 	return "WorkBuddy/" + desktopBuildFor(a).version
 }
 
-// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
+// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（CN 默认 www.workbuddy.cn）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
+
+// desktopDomain 桌面端 X-Domain 取 base 的 host 形态（官方不发送完整 URL）。
+func (c *Client) desktopDomain(a *auth.Auth) string {
+	base := c.desktopBase(a)
+	if u, err := url.Parse(base); err == nil && u.Host != "" {
+		return u.Host
+	}
+
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
+}
 
 // deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
@@ -107,7 +119,7 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 	desktopBuild2 := desktopBuildFor(account7)
 	now := time.Now().UnixMilli()
 
-	return map[string]any{
+	fingerprint := map[string]any{
 		"timezone":     "Asia/Shanghai",
 		"reportDelay":  2000,
 		"userId":       account7.UID,
@@ -131,9 +143,16 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"timestamp":    now,
 		"presentAt":    now,
 	}
+
+	if account7.EnterpriseID != "" {
+		fingerprint["enterpriseId"] = account7.EnterpriseID
+		fingerprint["enterprise"] = account7.EnterpriseID
+	}
+
+	return fingerprint
 }
 
-// ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
+// ReportDesktopEvent 以桌面客户端指纹向 chatBase 的 /v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
 // 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
 func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent) error {
@@ -170,8 +189,9 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("User-Agent", desktopUAFor(account2))
-	req.Header.Set("X-Domain", c.desktopBase(account2))
+	req.Header.Set("X-Domain", c.desktopDomain(account2))
 	req.Header.Set("X-Product", "SaaS")
+	injectEnterpriseHeaders(req, account2)
 	req.Header.Set("X-Request-ID", deriveID(account2, "req")+strconv.FormatInt(time.Now().UnixNano()%1e6, 10))
 
 	if account2.UID != "" {
@@ -280,7 +300,7 @@ func desktopRequestResponse(conversationID, requestID string) DesktopEvent {
 	})
 }
 
-// SetAppearanceTheme 应用外观主题（实测：POST copilot.tencent.com/v2/user-asset/appearance/set，
+// SetAppearanceTheme 应用外观主题（实测：POST chatBase/v2/user-asset/appearance/set，
 // 和品主题 resource_key 为 "theme-tkmw7j"，浅色 "light"、深色 "dark"）。纯 API set 不计
 // Hp_Appearance 分（需客户端切主题后真实活跃），保留供调色/还原与后续验证用。
 func (c *Client) SetAppearanceTheme(account *auth.Auth, resourceKey string) error {
@@ -496,7 +516,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 	req.Header.Set("Authorization", "Bearer "+account4.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", desktopUAFor(account4))
-	req.Header.Set("X-Domain", c.chatBase(account4))
+	req.Header.Set("X-Domain", c.desktopDomain(account4))
 	req.Header.Set("X-Product", "SaaS")
 
 	if account4.UID != "" {
@@ -593,8 +613,9 @@ func (c *Client) setDesktopExpertHeaders(req *http.Request, account5 *auth.Auth,
 	header.Set("Content-Type", "application/json")
 	header.Set("Accept", "text/event-stream")
 	header.Set("User-Agent", c.userAgent(account5))
-	header.Set("X-Domain", c.chatBase(account5))
+	header.Set("X-Domain", c.desktopDomain(account5))
 	header.Set("X-Product", "SaaS")
+	injectEnterpriseHeaders(req, account5)
 	header.Set("X-User-Id", account5.UID)
 	header.Set("X-Conversation-Id", conversationID)
 	header.Set("X-Conversation-Request-Id", requestID)

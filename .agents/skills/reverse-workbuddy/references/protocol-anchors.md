@@ -12,12 +12,14 @@
 ## Base 与路径
 
 - `internal/upstream/client.go`
-  - `ChatBaseCN`（默认 `https://copilot.tencent.com`）、`ChatBaseGlobal`；
+  - `ChatBaseCN`（默认 `https://www.workbuddy.cn`）、`ChatBaseGlobal`；
     `globalOn()` 双闸（config `upstream.global_enabled` + 账号 realm）。
   - `chatCompletionsPath = "/v2/chat/completions"` 与 `chatPaths()`
     （global 曾走 `/console` 路径，因 WAF body 规则改回 `/v2` 单路径）。
-  - `billingMeterPaths()` / `checkinMeterPaths()`：global 无 `/v2` 前缀优先，
-    404 回落；CN 只用 `/v2/...`。
+  - `chatOrigins()` / `RefreshToken()`：CN 首 token 前按 workbuddy.cn →
+    copilot.tencent.com → wb.tencentbuddy.com 回落。
+  - `billingMeterPaths()`：global 无 `/v2` 前缀优先，404 回落；CN 只用
+    `/v2/...`。`checkinMeterPaths()`：两 realm 均 `/v2` 优先，404 回落旧路径。
   - `WebBaseCN`（`https://www.workbuddy.cn`）：任务领奖 / profile 域。
   - `/v3/config` 拉取 + `X-Domain`：见 `internal/upstream/client.go` 1874 附近。
 - 桌面指纹上报：`internal/upstream/desktop.go`：`/v2/report`、

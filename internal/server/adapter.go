@@ -47,15 +47,16 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 	_ = json.Unmarshal(body, &peek)
 
 	chatInput2 := chatInput{
-		body:      body,
-		stream:    peek.Stream,
-		model:     peek.Model,
-		clientIP:  upstream.ExtractClientIP(r),
-		convReqID: r.Header.Get("X-Conversation-Request-Id"),
-		traceID:   r.Header.Get("X-Trace-Id"),
-		trace:     requestTraceFrom(r),
-		keyUsage:  keyUsageFrom(r.Context()),
-		keyRealm:  keyRealmFrom(r.Context()),
+		body:           body,
+		stream:         peek.Stream,
+		model:          peek.Model,
+		clientIP:       upstream.ExtractClientIP(r),
+		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
+		traceID:        r.Header.Get("X-Trace-Id"),
+		inboundSession: inboundSessionMetaFrom(r),
+		trace:          requestTraceFrom(r),
+		keyUsage:       keyUsageFrom(r.Context()),
+		keyRealm:       keyRealmFrom(r.Context()),
 	}
 
 	return chatInput2, &httpResponder{w: w, keepalive: keepalive}, true

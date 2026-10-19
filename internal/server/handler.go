@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"math"
 	"math/rand/v2"
 	"net"
@@ -786,6 +787,10 @@ func applyModelInfoFields(entry map[string]any, modelInfo *upstream.ModelInfo) m
 		entry["tags"] = modelInfo.Tags
 	}
 
+	if len(modelInfo.Aliases) > 0 {
+		entry["aliases"] = modelInfo.Aliases
+	}
+
 	if modelInfo.Vendor != "" {
 		entry["vendor"] = modelInfo.Vendor
 	}
@@ -1125,8 +1130,9 @@ type chatFlow struct {
 	keyUsage *keyUsage
 
 	// 入站头（适配器提取；供 buildChatMeta 组装会话头族）
-	convReqID string
-	traceID   string
+	convReqID      string
+	traceID        string
+	inboundSession inboundSessionMeta
 
 	// 会话标识
 	sessKey   string
@@ -1134,7 +1140,9 @@ type chatFlow struct {
 	stickyUID string
 
 	// 轮转状态
-	tried           map[string]bool
+	tried map[string]bool
+	// authReplay 记录本次请求已对哪些账号做过 401 refresh+replay，保证同号最多一次。
+	authReplay      map[string]bool
 	lastErr         error
 	modelBlock      pool.ModelBlockStatus
 	degradedApplied bool
@@ -1238,6 +1246,45 @@ func (h *Handler) backgroundTarget(model string) string {
 	return live.BackgroundTarget
 }
 
+// requestModelAliases 合并上游目录别名与配置别名；配置别名优先（覆盖同名上游别名）。
+// 裸名按命名密钥出口绑定选 realm（未绑定才回落到请求侧默认 cn），否则 global
+// key 会拿到 cn 目录的别名，global 上游 alias 永远解析不到。
+func (h *Handler) requestModelAliases(model, keyRealm string) map[string]string {
+	realm, _, prefixed := splitRealm(model)
+	if !prefixed && keyRealm != "" {
+		realm = keyRealm
+	}
+
+	var merged map[string]string
+
+	if h.cfg.Upstream != nil {
+		for name, target := range h.cfg.Upstream.UpstreamAliases(realm) {
+			if merged == nil {
+				merged = map[string]string{}
+			}
+
+			merged[name] = target
+		}
+	}
+
+	if len(h.cfg.ModelAliases) == 0 {
+		return merged
+	}
+
+	if merged == nil {
+		merged = make(map[string]string, len(h.cfg.ModelAliases))
+	}
+
+	maps.Copy(merged, h.cfg.ModelAliases)
+
+	return merged
+}
+
+// resolveFlowModel 解析请求模型 → (realm, bareModel)：别名按最终出口 realm 选取。
+func (h *Handler) resolveFlowModel(in *chatInput) (realm, bareModel string, err error) {
+	return resolveKeyModel(in.model, h.requestModelAliases(in.model, in.keyRealm), in.keyRealm)
+}
+
 // newChatFlow 由结构化输入组装统计、会话标识与轮转状态（传输无关）。
 // 入站 HTTP 解析（读 body / 提取头与 IP）已在 newChatInput 完成。
 func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlow {
@@ -1253,7 +1300,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归；命名密钥出口绑定在此一并覆盖 realm。
-	realm, bareModel, realmErr := resolveKeyModel(chatInput2.model, h.cfg.ModelAliases, chatInput2.keyRealm)
+	realm, bareModel, realmErr := h.resolveFlowModel(chatInput2)
 
 	modelRate := ""
 	if h.cfg.Upstream != nil {
@@ -1285,15 +1332,17 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
 		declaredTools: upstream.ToolNameAllowlist(chatInput2.body),
 		// gateway_hint 判定与模态能力判定所需的请求形态（多模态 part）：在改写前取。
-		reqHasImage:   containsModality(reqMods, upstream.ModalityImage),
-		reqModalities: reqMods,
-		bareModel:     bareModel,
-		modelRate:     modelRate,
-		st:            chatStat2,
-		keyUsage:      chatInput2.keyUsage,
-		tried:         map[string]bool{},
-		convReqID:     chatInput2.convReqID,
-		traceID:       chatInput2.traceID,
+		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
+		reqModalities:  reqMods,
+		bareModel:      bareModel,
+		modelRate:      modelRate,
+		st:             chatStat2,
+		keyUsage:       chatInput2.keyUsage,
+		tried:          map[string]bool{},
+		authReplay:     map[string]bool{},
+		convReqID:      chatInput2.convReqID,
+		traceID:        chatInput2.traceID,
+		inboundSession: chatInput2.inboundSession,
 	}
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，
@@ -1355,12 +1404,25 @@ func (f *chatFlow) canDegrade() bool {
 //   - conversationRequestID：入站 X-Conversation-Request-Id 透传优先，否则按粘性 key
 //     进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID）。
 func (f *chatFlow) buildChatMeta() {
-	convID := session.ResolveConversationID(f.body)
+	convID := f.inboundSession.conversationID
+	if convID == "" {
+		convID = session.ResolveConversationID(f.body)
+	}
+
 	if convID == "" {
 		convID = f.sessKey
 	}
 
-	f.chatMeta = upstream.ChatMeta{ConversationID: convID}
+	f.chatMeta = upstream.ChatMeta{
+		ConversationID:       convID,
+		RootRequestID:        f.inboundSession.rootRequestID,
+		ParentConversationID: f.inboundSession.parentConversationID,
+		AgentIntent:          f.inboundSession.agentIntent,
+		AgentPurpose:         f.inboundSession.agentPurpose,
+		AgentType:            f.inboundSession.agentType,
+		Compaction:           f.inboundSession.compaction,
+		ContextCompacted:     f.inboundSession.contextCompacted,
+	}
 	if v := f.convReqID; v != "" {
 		f.chatMeta.ConversationRequestID = v
 	} else if f.turnKey != "" && f.sessKey != "" {
@@ -1780,9 +1842,14 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
 	var ue *upstream.Error
 	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-		f.h.cfg.Pool.Disable(acct.UID, "refresh session dead")
-		f.h.notifyAccount(acct.UID, notify.EventSessionDead, "账号 session 失效，已禁用，需重新登录",
-			map[string]any{"stage": "refresh"})
+		// 与 keepalive 同口径：refresh 401/403 是猜测性终态，连续达到阈值才禁用，
+		// 避免一次上游抖动/并发 refresh 竞态直接杀号。
+		if f.h.cfg.Pool.NoteSessionDead(acct.UID) {
+			log.Printf("WARN: [server] refresh acct=%s: 连续 %d 次 session dead — 禁用",
+				logfmt.Label(acct.UID, acct.NicknameValue()), pool.SessionDeadThreshold())
+			f.h.notifyAccount(acct.UID, notify.EventSessionDead, "账号连续 session 失效，已禁用，需重新登录",
+				map[string]any{"stage": "refresh"})
+		}
 
 		return
 	}
@@ -1805,6 +1872,27 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 
 	if uerr == nil && terr != nil {
 		return f.handleTransportError(ctx, acct, terr, attemptStarted, i)
+	}
+
+	// 上游 401：官方 VLM 代理会在同号 refresh 后重放同一请求。此处只在同号首次
+	// 401 时执行一次；重放后仍 401 则回到既有轮转/错误策略，绝不二次刷新循环。
+	if status == http.StatusUnauthorized && !f.authReplay[acct.UID] {
+		f.authReplay[acct.UID] = true
+
+		err := f.h.cfg.Upstream.RefreshToken(acct)
+		if err == nil {
+			if saveErr := acct.SaveAtomic(); saveErr != nil {
+				log.Printf("ERR: [server] chat 401 refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.NicknameValue()), saveErr)
+			}
+
+			log.Printf("INFO: [server] chat 401 acct=%s model=%s: refreshed token, replaying once",
+				logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+			return f.dispatch(ctx, acct, i)
+		}
+
+		f.lastErr = err
+		f.penalizeRefreshFailure(acct, err)
 	}
 
 	if status >= 400 {
@@ -1861,6 +1949,22 @@ func (f *chatFlow) handleTransportError(ctx context.Context, acct *auth.Auth, te
 	return rotContinue
 }
 
+// retryContentBlocked 内容拦截首次命中时切降级提示词同请求重试。
+func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth) bool {
+	if kind != upstream.ErrContentBlocked || !f.canDegrade() || f.degradedApplied {
+		return false
+	}
+
+	f.h.degrade.Trigger()
+	f.body = prompt.Rewrite(f.body, prompt.Degraded)
+	f.degradedApplied = true
+	delete(f.tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
+	f.releaseHeld()
+	log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+
+	return true
+}
+
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
 func (f *chatFlow) handleHTTPError(
 	ctx context.Context, acct *auth.Auth, status int, respBody []byte,
@@ -1880,15 +1984,14 @@ func (f *chatFlow) handleHTTPError(
 	// 到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append 降级重试同样退化
 	// 为 replace——原文在场只会确定性再撞 400）。第二次仍被拦 → 回内容防火墙错误。
 	// 内容问题非账号问题：applyErrorPolicy 不罚账号。
-	if kind == upstream.ErrContentBlocked && f.canDegrade() && !f.degradedApplied {
-		f.h.degrade.Trigger()
-		f.body = prompt.Rewrite(f.body, prompt.Degraded)
-		f.degradedApplied = true
-		delete(f.tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
-		f.releaseHeld()
-		log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
-
+	if f.retryContentBlocked(kind, acct) {
 		return rotContinue
+	}
+	// 队列/并发业务码（6020/6021/6022）：账号本身健康，换号不会改变队列位置；
+	// 直接返回可重试或容量错误，不进入账号冷却/轮转。
+	if kind == upstream.ErrQueueWaiting || kind == upstream.ErrQueueFull {
+		f.handleQueueError(kind, respBody, uerr)
+		return rotDone
 	}
 	// 请求级错误（内容防火墙 / 上下文超限 / 图片无效 / 请求体畸形）：换任何账号都会
 	// 撞同一结果，轮转纯属浪费，透传上游原文立即返回。
@@ -1939,6 +2042,43 @@ func (f *chatFlow) rotateAllowedForStatus(status int) bool {
 func failFastKind(kind upstream.ErrKind) bool {
 	return kind == upstream.ErrContentBlocked || kind == upstream.ErrPromptTooLong ||
 		kind == upstream.ErrImageInvalid || kind == upstream.ErrBadParams
+}
+
+// handleQueueError 处置官方客户端的队列/并发业务码：
+//   - 6020 WAITING：429 + Retry-After（上游未给则 5s），客户端可重试，不换号；
+//   - 6021 FULL：503 队列已满；
+//   - 6022 USER_LIMIT：429 用户并发上限。
+func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr *upstream.Error) {
+	msg := strings.TrimSpace(string(respBody))
+	if msg == "" && uerr != nil {
+		msg = uerr.Msg
+	}
+
+	code := upstream.QueueCode(string(respBody))
+	f.st.outcome = reqlog.OutcomeHTTPError
+	f.st.status = http.StatusTooManyRequests
+
+	switch {
+	case kind == upstream.ErrQueueWaiting:
+		retry := 5
+		if uerr != nil && uerr.RetryAfter > 0 {
+			retry = int(uerr.RetryAfter / time.Second)
+			if retry <= 0 {
+				retry = 1
+			}
+		}
+
+		f.out.Header("Retry-After", strconv.Itoa(retry))
+		f.out.Error(http.StatusTooManyRequests, "queue_waiting", msg, "队列排队中，按 Retry-After 重试")
+	case code == "6022":
+		f.st.status = http.StatusTooManyRequests
+		f.out.Error(http.StatusTooManyRequests, "user_concurrency_limit", msg, "并发请求数已达上限，稍后重试")
+	default:
+		f.st.status = http.StatusServiceUnavailable
+		f.out.Error(http.StatusServiceUnavailable, "queue_full", msg, "上游队列已满，稍后重试")
+	}
+
+	f.lastErr = &upstream.Error{Kind: kind, Status: f.st.status, Msg: msg}
 }
 
 // handleRequestLevelError 透传请求级错误：不轮转、message 装上游原文、附 gateway_hint。
@@ -2003,6 +2143,18 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
 		return f.h.hintContext(f.bareModel, f.reqHasImage)
 	}), repair, func(payload string) { errFrame = payload })
+	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
+
+	f.finishStreamStats(acct, stats, repair, attemptStarted)
+	rc.Close()
+
+	return rotDone
+}
+
+// applyStreamOutcome 根据流结束形态给账号与请求日志定性。
+//
+//nolint:cyclop // 流结束形态集中分支，拆散会让调用顺序更难追踪。
+func (f *chatFlow) applyStreamOutcome(ctx context.Context, acct *auth.Auth, stats *chatStatsReader, errFrame string, sErr error) {
 	switch {
 	case upstream.IsEmptyStreamError(sErr):
 		// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE] 兜底（HTTP 头
@@ -2018,14 +2170,7 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 		// 防御上限命中 = 上游/代理异常，按上游失败处置——绝不按客户端断连记成功。
 		f.failStreamUpstream(acct, sErr.Error())
 	case errFrame != "":
-		// 上游以 error 帧报错（6004 限流 / 内容拦截 / 审核）：按帧内容分类并处置账号
-		// ——**不记成功、不清 11102 负缓存、不绑粘性**。
-		kind := upstream.FrameKind(errFrame)
-		f.h.applyErrorPolicy(acct.UID, kind, errFrame, f.realm, f.bareModel, nil)
-		f.st.status = http.StatusServiceUnavailable
-		f.st.outcome = reqlog.OutcomeStreamError
-		log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
-			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(errFrame, 200))
+		f.applyStreamErrorFrame(acct, errFrame)
 	case sErr != nil && (upstream.IsClientWriteError(sErr) || ctx.Err() != nil):
 		// 客户端写失败（断连 / 写超时）或请求 ctx 已取消：上游帧无恙，账号健康
 		// ——账号侧照常记成功（与 default 同语义），请求日志归为 Interrupted
@@ -2037,16 +2182,28 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 		// 上游读错误（连接重置 / idle 超时等，issue #105）：账号不记成功、不绑粘性。
 		// 写路径失败已在 writeAll 包 errClientWrite，不会落到这里。
 		f.failStreamUpstream(acct, "upstream stream read error: "+sErr.Error())
+	case stats.FailedFinish():
+		// finish_reason=error/length 且没有正文、工具调用或拒答：上游已明确失败/截断。
+		f.failStreamUpstream(acct, "upstream finished with "+stats.FinishReason()+" without substantive output")
+	case !stats.HasSubstantiveOutput():
+		// 只有 reasoning/reasoning_content 的流不是完成的回答（官方客户端同样不消费
+		// 为成功答案）：按上游失败处置，解绑粘性。
+		f.failStreamUpstream(acct, "upstream stream produced no substantive output (reasoning-only)")
 	default:
 		// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 		f.st.outcome = reqlog.OutcomeSuccess
 		f.noteSuccessAndBind(acct)
 	}
+}
 
-	f.finishStreamStats(acct, stats, repair, attemptStarted)
-	rc.Close()
-
-	return rotDone
+// applyStreamErrorFrame 处置上游 error 帧：按帧内容分类并处置账号。
+func (f *chatFlow) applyStreamErrorFrame(acct *auth.Auth, errFrame string) {
+	kind := upstream.FrameKind(errFrame)
+	f.h.applyErrorPolicy(acct.UID, kind, errFrame, f.realm, f.bareModel, nil)
+	f.st.status = http.StatusServiceUnavailable
+	f.st.outcome = reqlog.OutcomeStreamError
+	log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(errFrame, 200))
 }
 
 // failStreamUpstream 处置流式路径的上游失败（空流 / 截断，issue #105）：

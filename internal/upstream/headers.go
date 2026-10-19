@@ -15,14 +15,14 @@ import (
 const (
 	// 官方分发包版本（按 realm 分档）。UA 的 `WorkBuddy/<ver>`、白名单头组
 	// X-IDE-Version、桌面上报指纹的 ideVersion/extVersion 均取此值。
-	//   cn     → WorkBuddy Desktop 5.8.2（内嵌 CLI 2.161.0）
-	//   global → WorkBuddy AI Desktop 5.7.6（内嵌 CLI 2.156.0）
+	//   cn     → WorkBuddy Desktop 5.8.3（内嵌 CLI 2.161.0）
+	//   global → WorkBuddy AI Desktop 5.8.4（内嵌 CLI 2.161.0）
 	// 两份官方包的 daemon UA 第二段均为 `WorkBuddy`（无 realm 品牌差异，仅版本不同）。
 	// config upstream.client_version / cli_version 可整体覆盖（空 = 按 realm 取内置默认）。
-	cnClientVersion     = "5.8.2"
+	cnClientVersion     = "5.8.3"
 	cnCliVersion        = "2.161.0"
-	globalClientVersion = "5.7.6"
-	globalCliVersion    = "2.156.0"
+	globalClientVersion = "5.8.4"
+	globalCliVersion    = "2.161.0"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -39,7 +39,7 @@ func originRefererFor(a *auth.Auth) string {
 }
 
 // clientVersionFor 生效的 WorkBuddy 客户端版本：Client.ClientVersion 非空则取之
-// （全局覆盖），否则按账号 realm 取内置默认（cn 5.8.2 / global 5.7.6）。nil 账号按 cn。
+// （全局覆盖），否则按账号 realm 取内置默认（cn 5.8.3 / global 5.8.4）。nil 账号按 cn。
 func (c *Client) clientVersionFor(a *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
@@ -53,7 +53,7 @@ func (c *Client) clientVersionFor(a *auth.Auth) string {
 }
 
 // cliVersionFor 生效的 CLI 版本：Client.CliVersion 非空则取之（全局覆盖），
-// 否则按账号 realm 取内置默认（cn 2.161.0 / global 2.156.0）。nil 账号按 cn。
+// 否则按账号 realm 取内置默认（cn 2.161.0 / global 2.161.0）。nil 账号按 cn。
 func (c *Client) cliVersionFor(a *auth.Auth) string {
 	if c != nil && c.CliVersion != "" {
 		return c.CliVersion
@@ -68,7 +68,7 @@ func (c *Client) cliVersionFor(a *auth.Auth) string {
 
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 daemon 代理层形状）：
 // `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`。
-// 两份官方分发包（CN 5.8.2 / global 5.7.6）的 daemon UA 第二段均为 `WorkBuddy`
+// 两份官方分发包（CN 5.8.3 / global 5.8.4）的 daemon UA 第二段均为 `WorkBuddy`
 // （`buildVlmGatewayHeaders` / `Jr` 字面量），无 realm 品牌差异；仅版本号按 realm 分档。
 // 官方无任何 UA 随机化，故默认确定性。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
@@ -198,8 +198,15 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：body 提取的入站值，空则不发（透传优先，不伪造）
-	ConversationRequestID string // X-Conversation-Request-ID / X-Root-Request-ID：聚合主键，必发
+	ConversationID        string // X-Conversation-ID：入站头/body 提取值，空则不发（透传优先，不伪造）
+	ConversationRequestID string // X-Conversation-Request-ID：聚合主键，必发
+	RootRequestID         string // X-Root-Request-ID：入站透传值，空则回落 conversationRequestID
+	ParentConversationID  string // X-Parent-Conversation-ID：入站透传值，空则不发
+	AgentIntent           string // X-Agent-Intent：入站透传值，空则保留默认指纹
+	AgentPurpose          string // X-Agent-Purpose：入站透传值，空则保留默认指纹
+	AgentType             string // X-Agent-Type：入站透传值，空则保留默认指纹
+	Compaction            string // X-Compaction：入站透传值，空则不发
+	ContextCompacted      string // X-Context-Compacted：入站透传值，空则不发
 	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
 }
 
@@ -208,6 +215,8 @@ type ChatMeta struct {
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
 // meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
+//
+//nolint:gocritic // ChatMeta 值传递保持公开 API 简单。
 func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, account3)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
@@ -227,9 +236,9 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
 	// 企业与域头按 realm 分发：CN 走既有分支（EnterpriseID/Domain 原样透传，缺省 X-No-*）；
-	// global 账号由 injectGlobalChatHeaders 统一覆写为国际客户端形态
-	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
-	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
+	// global 账号由 injectGlobalChatHeaders 统一注入国际客户端形态
+	// （企业：X-Enterprise-Id + X-Tenant-Id；个人：X-No-Enterprise-Id=1；
+	// X-Domain 账号 domain 优先，缺省 www.workbuddy.ai）。
 	if account3 != nil && !account3.IsGlobal() {
 		injectCNChatHeaders(req, account3)
 	} else {
@@ -245,34 +254,56 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	c.injectConversationHeaders(req, meta)
 }
 
-// injectCNChatHeaders CN 账号的 chat 域头：企业 ID 与 Domain 原样透传（缺省 X-No-*）。
+// injectCNChatHeaders CN 账号的 chat 域头：企业 ID / 租户 ID 与 Domain 原样透传
+// （缺省 X-No-*）。
 func injectCNChatHeaders(req *http.Request, account *auth.Auth) {
-	if account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
-	} else {
-		req.Header.Set("X-No-Enterprise-Id", "1")
-	}
-
-	if d := account.DomainValue(); d != "" {
-		req.Header.Set("X-Domain", d)
-	} else {
-		req.Header.Set("X-No-Department-Info", "1")
-	}
+	injectEnterpriseHeaders(req, account)
+	injectChatDomain(req, account)
 }
 
-// injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
-// （ANALYSIS-global-chat-solutions.md）：
-//   - X-No-Enterprise-Id: 1  个人账号无企业 ID，显式声明（避免上游按缺省/可疑判定）
-//   - X-Domain: www.workbuddy.ai  显式声明国际版域（与 Origin/Referer 同域）
-//
-// 仅 global realm 注入；CN 账号走既有 X-No-Department-Info 等分支，零回归。
-func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
-	if a == nil || !a.IsGlobal() {
+// injectEnterpriseHeaders 按账号企业身份注入企业/租户头。
+// 官方桌面端企业账号同时发 X-Enterprise-Id 与 X-Tenant-Id；个人账号显式声明
+// X-No-Enterprise-Id=1，避免上游按缺失头做可疑判定。
+func injectEnterpriseHeaders(req *http.Request, account *auth.Auth) {
+	if account != nil && account.EnterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
+		req.Header.Set("X-Tenant-Id", account.EnterpriseID)
+
 		return
 	}
 
 	req.Header.Set("X-No-Enterprise-Id", "1")
-	req.Header.Set("X-Domain", "www.workbuddy.ai")
+}
+
+// injectChatDomain 注入 chat 域头：账号 domain 优先；global 无 domain 时回落
+// 国际版域 www.workbuddy.ai；CN 无 domain 保持既有 X-No-Department-Info 声明。
+func injectChatDomain(req *http.Request, account *auth.Auth) {
+	if d := account.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
+
+		return
+	}
+
+	if account != nil && account.IsGlobal() {
+		req.Header.Set("X-Domain", "www.workbuddy.ai")
+
+		return
+	}
+
+	req.Header.Set("X-No-Department-Info", "1")
+}
+
+// injectGlobalChatHeaders global 账号的 chat 专属声明头，对齐官方国际客户端：
+//   - 企业账号：X-Enterprise-Id + X-Tenant-Id
+//   - 个人账号：X-No-Enterprise-Id: 1
+//   - X-Domain：账号 domain 优先，缺省 www.workbuddy.ai
+func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
+	if account == nil || !account.IsGlobal() {
+		return
+	}
+
+	injectEnterpriseHeaders(req, account)
+	injectChatDomain(req, account)
 }
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
@@ -290,6 +321,8 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
 //     回落 messageID（恒 32 hex），SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
 //   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
 //     conversationId 稳定派生 v4 形态 UUID；无 conversationId 时不注入。
+//
+//nolint:gocritic // ChatMeta 值传递保持公开 API 简单。
 func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
@@ -308,7 +341,19 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-Conversation-Request-Id", convReqID)
 	req.Header.Set("X-Conversation-Message-Id", messageID)
 	req.Header.Set("X-Request-ID", messageID)
-	req.Header.Set("X-Root-Request-Id", convReqID)
+
+	if meta.RootRequestID != "" {
+		req.Header.Set("X-Root-Request-Id", meta.RootRequestID)
+	} else {
+		req.Header.Set("X-Root-Request-Id", convReqID)
+	}
+
+	setHeaderIfNonEmpty(req, "X-Parent-Conversation-Id", meta.ParentConversationID)
+	setHeaderIfNonEmpty(req, "X-Agent-Intent", meta.AgentIntent)
+	setHeaderIfNonEmpty(req, "X-Agent-Purpose", meta.AgentPurpose)
+	setHeaderIfNonEmpty(req, "X-Agent-Type", meta.AgentType)
+	setHeaderIfNonEmpty(req, "X-Compaction", meta.Compaction)
+	setHeaderIfNonEmpty(req, "X-Context-Compacted", meta.ContextCompacted)
 
 	traceID := meta.TraceID
 	if traceID == "" {
@@ -331,6 +376,13 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-B3-Parentspanid", parentSpanID)
 	req.Header.Set("X-B3-Spanid", spanID)
 	req.Header.Set("X-B3-Sampled", "1")
+}
+
+// setHeaderIfNonEmpty 仅在 value 非空时设置请求头。
+func setHeaderIfNonEmpty(req *http.Request, name, value string) {
+	if value != "" {
+		req.Header.Set(name, value)
+	}
 }
 
 // acpConnectionID 由会话 id 稳定派生 acp-connection-id（官方桌面端为会话级 UUID）。
@@ -469,12 +521,16 @@ func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
-func (c *Client) RefreshHeaders(req *http.Request, a *auth.Auth) {
-	c.CommonHeaders(req, a)
-	req.Header.Set("X-Refresh-Token", a.RefreshToken)
+func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
+	c.CommonHeaders(req, account)
+	req.Header.Set("X-Refresh-Token", account.RefreshToken)
 
-	if a.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", a.EnterpriseID)
+	injectEnterpriseHeaders(req, account)
+
+	if d := account.DomainValue(); d != "" {
+		req.Header.Set("X-Domain", d)
+	} else if account.IsGlobal() {
+		req.Header.Set("X-Domain", "www.workbuddy.ai")
 	}
 	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")

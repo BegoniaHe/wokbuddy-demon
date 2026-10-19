@@ -52,7 +52,28 @@
 4. **溯源完整性**：本文件与 `LICENSE` 共同保留原始作者与各 fork 的署名；每次吸收的
    逐提交决策记录于 `upstream-decisions.jsonl`（决策账本），游标见 `upstream-sync.yaml`。
 
-## 六、上游同步工具（sync-upstream 技能）
+## 六、官方客户端协议基线
+
+本仓库的协议对齐以官方 WorkBuddy Desktop 静态包为基线（不运行官方客户端、不请求上游）：
+
+| realm | 客户端版本 | CLI | commit | releaseDate |
+| --- | --- | --- | --- | --- |
+| cn | `5.8.3` | `2.161.0` | `64d249bed3dec40edd720537d96f27e70a3f6a4f` | `1791972709257` |
+| global | `5.8.4` | `2.161.0` | `73952edb48da46bd0b244661efe22f4f247c4977` | `1792063023116` |
+
+采用的桌面端 / CLI 行为：
+
+- CN origin 主域 `www.workbuddy.cn`，首 token 前可回落 `copilot.tencent.com` / `wb.tencentbuddy.com`。
+- 企业账号 chat 同时发 `X-Enterprise-Id` / `X-Tenant-Id`；个人 global 发 `X-No-Enterprise-Id: 1`。
+- 401 同号 refresh + replay；refresh 401/403 映射会话失效。
+- SSE 接受 `delta.reasoning`、重复 tool id 去重、`finish_reason` 后 EOF 正常收尾；reasoning-only 不记成功。
+- 签到两 realm `/v2` 优先；余额 summary 为主、旧端点兜底；模型目录应用 `availableModels` / `disabled` / `aliases`。
+- growth `/v2` 优先；travel claim 支持 `record_id` 与空 body；桌面 report `X-Domain` 为 host 形态。
+- 队列业务码 `6020/6021/6022` 与额度/认证码分类按客户端枚举实现。
+
+桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。
+
+## 七、上游同步工具（sync-upstream 技能）
 
 - 技能位置：`.agents/skills/sync-upstream/`（OpenCode 经 `.opencode/opencode.json`
   的 `skills.paths` 加载）。

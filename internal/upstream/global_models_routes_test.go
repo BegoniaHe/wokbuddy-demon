@@ -171,7 +171,7 @@ func TestNonChatModelGenerationTags(t *testing.T) {
 }
 
 // TestDesktopUAForGlobalAccount 桌面端 UA 第二段按官方分发包恒为 `WorkBuddy`
-// （CN 5.8.2 / global 5.7.6 的 daemon UA 字面量均如此），无 realm 品牌差异；
+// （CN 5.8.3 / global 5.8.4 的 daemon UA 字面量均如此），无 realm 品牌差异；
 // 仅版本号按 realm 分档。探测主路用这个 UA，与 chat 路径同源。
 func TestDesktopUAForGlobalAccount(t *testing.T) {
 	t.Parallel()
@@ -181,23 +181,23 @@ func TestDesktopUAForGlobalAccount(t *testing.T) {
 	global.BackfillRealm()
 
 	str := client.defaultWorkBuddyUAFor(global)
-	if want := "WorkBuddy/5.7.6"; !contains(str, want) {
+	if want := "WorkBuddy/5.8.4"; !contains(str, want) {
 		t.Errorf("global desktop UA = %q, want it to contain %q", str, want)
 	}
 
-	if !contains(str, "CLI/2.156.0") {
-		t.Errorf("global desktop UA = %q, want CLI/2.156.0 segment", str)
+	if !contains(str, "CLI/2.161.0") {
+		t.Errorf("global desktop UA = %q, want CLI/2.161.0 segment", str)
 	}
 
 	if contains(str, "WorkBuddy AI") {
 		t.Errorf("global desktop UA = %q, must not contain 'WorkBuddy AI' (两份官方包均无)", str)
 	}
-	// CN 账号版本分档为 5.8.2。
+	// CN 账号版本分档为 5.8.3。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
 
-	if ua := client.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/5.8.2") {
-		t.Errorf("cn desktop UA = %q, want WorkBuddy/5.8.2", ua)
+	if ua := client.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/5.8.3") {
+		t.Errorf("cn desktop UA = %q, want WorkBuddy/5.8.3", ua)
 	}
 }
 

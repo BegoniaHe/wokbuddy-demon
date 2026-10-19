@@ -5,7 +5,7 @@ import (
 )
 
 // TestLoginEndpoints realm→端点映射：global 三端点全在 workbuddy.ai 域，
-// cn/空/非法值 → copilot.tencent.com（零回归兜底）。
+// cn/空/非法值 → workbuddy.cn（官方主域）。
 func TestLoginEndpoints(t *testing.T) {
 	t.Parallel()
 
@@ -15,9 +15,9 @@ func TestLoginEndpoints(t *testing.T) {
 		wantOrigin string
 	}{
 		{"global", "https://www.workbuddy.ai/v2/plugin/auth/state?platform=workbuddy-ai", "https://www.workbuddy.ai"},
-		{"cn", "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
-		{"", "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
-		{"weird", "https://copilot.tencent.com/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
+		{"cn", "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
+		{"", "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
+		{"weird", "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
 	}
 	for _, item := range cases {
 		t.Run(item.realm, func(t *testing.T) {
@@ -38,11 +38,38 @@ func TestLoginEndpoints(t *testing.T) {
 					t.Errorf("global token/account endpoints should be workbuddy.ai: %q %q", tok, acct)
 				}
 			} else {
-				if tok[:len("https://copilot.tencent.com")] != "https://copilot.tencent.com" ||
-					acct[:len("https://copilot.tencent.com")] != "https://copilot.tencent.com" {
-					t.Errorf("cn token/account endpoints should be copilot.tencent.com: %q %q", tok, acct)
+				if tok[:len("https://www.workbuddy.cn")] != "https://www.workbuddy.cn" ||
+					acct[:len("https://www.workbuddy.cn")] != "https://www.workbuddy.cn" {
+					t.Errorf("cn token/account endpoints should be workbuddy.cn: %q %q", tok, acct)
 				}
 			}
 		})
+	}
+}
+
+// TestLoginCandidatesCNFallback CN origin 顺序与 chat/refresh 一致：主域后回落旧域。
+func TestLoginCandidatesCNFallback(t *testing.T) {
+	t.Parallel()
+
+	candidates := loginCandidates("cn")
+
+	want := []string{
+		"https://www.workbuddy.cn",
+		"https://copilot.tencent.com",
+		"https://wb.tencentbuddy.com",
+	}
+	if len(candidates) != len(want) {
+		t.Fatalf("candidates=%d want %d", len(candidates), len(want))
+	}
+
+	for i := range want {
+		if candidates[i].base != want[i] {
+			t.Errorf("candidate[%d]=%q want %q", i, candidates[i].base, want[i])
+		}
+	}
+
+	preferred := loginCandidatesPrefer("cn", "https://copilot.tencent.com")
+	if preferred[0].base != "https://copilot.tencent.com" {
+		t.Errorf("preferred base=%q", preferred[0].base)
 	}
 }

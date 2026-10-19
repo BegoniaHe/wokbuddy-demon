@@ -106,7 +106,7 @@ type Config struct {
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
 		// MaxBodyBytes 聊天类入站请求体上限（字节，issue #86），覆盖
 		// /v1/chat/completions、/v1/messages 与 count_tokens。超限在解析前返回
-		// 413，不进入选号。缺省 16 MiB；0 = 不限制。改动需重启进程。
+		// 413，不进入选号。缺省 32 MiB；0 = 不限制。改动需重启进程。
 		MaxBodyBytes int64 `json:"max_body_bytes"`
 		// RequestAcceptGraceSeconds 停机第一阶段：收到 SIGTERM 后先把 /healthz
 		// 置 503，并继续受理请求的宽限时长（秒），供反代/LB 完成摘流。缺省 0 =
@@ -213,9 +213,9 @@ type Config struct {
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
-		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落 TimeoutSeconds。
+		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落默认 1200。
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
-		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
+		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 1200。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 		// KeepaliveInterval 入站 SSE 主动心跳间隔（issue #54）：上游静默超过该时长
 		// 时向客户端写 ": keepalive" 注释帧，防反代空闲超时断流。"0"/空 = 关闭。
@@ -229,10 +229,10 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 按 realm 取内置默认（cn 5.8.2 / global 5.7.6，对齐官方分发包）。
+		// X-IDE-Version）。空 = 按 realm 取内置默认（cn 5.8.3 / global 5.8.4，对齐官方分发包）。
 		ClientVersion string `json:"client_version"`
 		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 按 realm 取内置默认
-		// （cn 2.161.0 / global 2.156.0，对齐官方内置 CLI）。
+		// （cn 2.161.0 / global 2.161.0，对齐官方内置 CLI）。
 		CliVersion string `json:"cli_version"`
 		// ClientName 自定义用量归属名：非空时 X-Product 与 X-IDE-Name/Type 跟随该值。
 		// 空 = 官方桌面端默认（X-Product="SaaS"、X-IDE-Name/Type="WorkBuddy"）。
@@ -419,7 +419,7 @@ func baseDefaults() *Config {
 	config.Cooldown.SoftRate = "600s"
 	config.Cooldown.SoftRateMax = "2h"
 	config.Server.ReadTimeout = "300s"
-	config.Server.MaxBodyBytes = 16 << 20
+	config.Server.MaxBodyBytes = 32 << 20
 	// 缺省只信任本机回环：同机 nginx / Caddy 反代可直接拿到真实客户端 IP。
 	// 反代在另一台机器时必须显式配置，否则来源一律是反代地址。
 	config.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128"}
@@ -1287,19 +1287,19 @@ func (c *Config) normalizePoolDefaults() {
 	}
 }
 
-// normalizeUpstreamDefaults 补齐出站超时缺省值（header 回落 timeout、idle 走内置大值）。
+// normalizeUpstreamDefaults 补齐出站超时缺省值（对齐官方客户端 1200s）。
 func (c *Config) normalizeUpstreamDefaults() {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
-	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
-	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。
+	// chat 首字节 / 流空闲缺省 1200s（官方客户端普通对话口径）；model_timeouts
+	// 仍按模型覆盖。0 一律视为"未设置"走默认。
 	if c.Upstream.HeaderTimeoutSeconds <= 0 {
-		c.Upstream.HeaderTimeoutSeconds = c.Upstream.TimeoutSeconds
+		c.Upstream.HeaderTimeoutSeconds = 1200
 	}
 
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
-		c.Upstream.IdleTimeoutSeconds = 300
+		c.Upstream.IdleTimeoutSeconds = 1200
 	}
 
 	if c.Upstream.RotateMax <= 0 {

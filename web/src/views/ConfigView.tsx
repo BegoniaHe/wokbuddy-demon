@@ -201,7 +201,7 @@ export function ConfigView() {
           </Field>
           <Field>
             <FieldLabel>聊天请求体上限（字节）</FieldLabel>
-            {num('max_body_bytes', { min: 0, placeholder: '16777216' })}
+            {num('max_body_bytes', { min: 0, placeholder: '33554432' })}
             <FieldDescription>覆盖 chat / messages / count_tokens；超限返回 413。0 = 不限制。改动需重启进程</FieldDescription>
           </Field>
         </CardContent>
@@ -397,12 +397,12 @@ export function ConfigView() {
             </Field>
             <Field>
               <FieldLabel>聊天首字节超时</FieldLabel>
-              {num('header_timeout_seconds', { min: 1, placeholder: '120' })}
+              {num('header_timeout_seconds', { min: 1, placeholder: '1200' })}
               <FieldDescription>需重启</FieldDescription>
             </Field>
             <Field>
               <FieldLabel>流空闲超时</FieldLabel>
-              {num('idle_timeout_seconds', { min: 1, placeholder: '300' })}
+              {num('idle_timeout_seconds', { min: 1, placeholder: '1200' })}
               <FieldDescription>需重启</FieldDescription>
             </Field>
           </div>

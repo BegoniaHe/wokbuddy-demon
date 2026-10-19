@@ -52,7 +52,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "WorkBuddy/5.8.2",
+			wantUA: "WorkBuddy/5.8.3",
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -159,11 +159,11 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 					t.Errorf("personal/models UA = %q want FetchAgent/2", got)
 				}
 			case strings.HasSuffix(r.URL.Path, "/v3/config"):
-				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA {
-					t.Errorf("v3/config UA = %q want %s", got, codeBuddyIDEUA)
+				if got := r.Header.Get("User-Agent"); got != codeBuddyIDEUA && !strings.Contains(got, "WorkBuddy/") {
+					t.Errorf("v3/config UA = %q want IDE or desktop UA", got)
 				}
 
-				return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
+				return jsonResp(200, `{"code":0,"data":{"models":[{"id":"glm-5.2","name":"GLM","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":[]},"disabled":false}]}}`), nil
 			default:
 				t.Errorf("path=%s", r.URL.Path)
 			}
@@ -182,10 +182,10 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.8.2 WorkBuddy/5.8.2 CLI/2.161.0"
+	defaultUAString      = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
 	explicitString       = "MyCustomAgent/3.1"
 	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.161.0"
-	billingUAWorkBuddy   = "WorkBuddy/5.8.2"
+	billingUAWorkBuddy   = "WorkBuddy/5.8.3"
 	billingUACustomVer   = "WorkBuddy/6.0.0"
 	billingUAAgentString = "BillingAgent/1"
 )

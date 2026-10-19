@@ -292,7 +292,7 @@ func TestBadBreakerCooldown(t *testing.T) {
 
 func TestUpstreamTimeoutDefaults(t *testing.T) {
 	t.Parallel()
-	// 默认：header 回落 timeout，idle 回落 300。
+	// 默认：header / idle 均对齐官方客户端 1200s，不再跟随短 RPC timeout。
 	config := Default()
 	if err := config.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -302,18 +302,18 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 		t.Errorf("timeout_seconds=%d want 120", config.Upstream.TimeoutSeconds)
 	}
 
-	if config.Upstream.HeaderTimeoutSeconds != 120 {
-		t.Errorf("header_timeout_seconds=%d want fallback 120", config.Upstream.HeaderTimeoutSeconds)
+	if config.Upstream.HeaderTimeoutSeconds != 1200 {
+		t.Errorf("header_timeout_seconds=%d want fallback 1200", config.Upstream.HeaderTimeoutSeconds)
 	}
 
-	if config.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", config.Upstream.IdleTimeoutSeconds)
+	if config.Upstream.IdleTimeoutSeconds != 1200 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 1200", config.Upstream.IdleTimeoutSeconds)
 	}
 }
 
-func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
+func TestUpstreamHeaderTimeoutIndependentOfRPCTimeout(t *testing.T) {
 	t.Parallel()
-	// 只设 timeout_seconds：header 回落同值，idle 回落 300。
+	// 只设 timeout_seconds：header / idle 仍取 1200s 默认（短 RPC 超时不外溢）。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
 	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)
@@ -323,12 +323,12 @@ func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if config.Upstream.HeaderTimeoutSeconds != 60 {
-		t.Errorf("header_timeout_seconds=%d want fallback 60", config.Upstream.HeaderTimeoutSeconds)
+	if config.Upstream.HeaderTimeoutSeconds != 1200 {
+		t.Errorf("header_timeout_seconds=%d want fallback 1200", config.Upstream.HeaderTimeoutSeconds)
 	}
 
-	if config.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", config.Upstream.IdleTimeoutSeconds)
+	if config.Upstream.IdleTimeoutSeconds != 1200 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 1200", config.Upstream.IdleTimeoutSeconds)
 	}
 }
 
@@ -1135,14 +1135,14 @@ func TestDailyLimitsConfig(t *testing.T) {
 	}
 }
 
-// TestServerMaxBodyBytes 聊天入口请求体上限（issue #86）：默认 16 MiB，
+// TestServerMaxBodyBytes 聊天入口请求体上限（issue #86）：默认 32 MiB，
 // 0 = 不限制，负值 fail fast。
 func TestServerMaxBodyBytes(t *testing.T) {
 	t.Parallel()
 
 	config := Default()
-	if config.Server.MaxBodyBytes != 16<<20 {
-		t.Errorf("default max_body_bytes=%d want %d", config.Server.MaxBodyBytes, 16<<20)
+	if config.Server.MaxBodyBytes != 32<<20 {
+		t.Errorf("default max_body_bytes=%d want %d", config.Server.MaxBodyBytes, 32<<20)
 	}
 
 	if err := config.normalize(); err != nil {
