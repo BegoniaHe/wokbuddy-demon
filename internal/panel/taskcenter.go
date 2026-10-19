@@ -10,9 +10,9 @@
 package panel
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -64,8 +64,9 @@ func growthPending(t *upstream.Task) bool {
 const scanWorkers = 5
 
 // tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
-// 只读操作，并发拉取（受 scanWorkers 约束）。
+// 只读操作，并发拉取（受 scanWorkers 约束）；客户端断开后不再派发剩余账号。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
 
@@ -81,7 +82,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 
 		// 先取名额再起 goroutine：账号多时只会有 scanWorkers 个 goroutine
 		// 同时在跑，而不是每个账号都留一个阻塞在信号量上的 goroutine。
-		sem <- struct{}{}
+		if !acquireSem(ctx, sem) {
+			break
+		}
 
 		wg.Add(1)
 		go func(i int, uid string) {
@@ -99,6 +102,10 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wg.Wait()
+
+	if ctx.Err() != nil {
+		return // 客户端已断开：不必统计与写回执
+	}
 
 	pending := 0
 	for _, it := range items {
@@ -197,7 +204,13 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		Growth      bool `json:"growth"`
 	}
 
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	// 空 body 允许（全部走默认值）；畸形 JSON 必须拒绝，避免错误输入触发一次
+	// 全账号扫描与队列执行。
+	if err := decodeJSONBody(r.Body, &body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
 	if !body.Growth {
 		body.Growth = true
 	}
@@ -399,12 +412,15 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 	sem := make(chan struct{}, concurrency)
 
 	var wg sync.WaitGroup
+
 	for _, one := range accts {
+		// 先取名额再起 goroutine（同 collectQueueAccounts）：账号多时不在信号量上
+		// 堆积阻塞协程。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(one queueAccount) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			// per-account 互斥：与单任务/一键完成共用一把锁。
 			if !p.tryLockAccount(one.a.UID) {
@@ -584,61 +600,74 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
-// 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
-func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
-	accts := p.cfg.Pool.List()
+// schoolVoucherRow 单个账号的券码查询结果。
+type schoolVoucherRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Vouchers []upstream.SchoolVoucher `json:"vouchers"`
+	Err      string                   `json:"error,omitempty"`
+}
 
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
-		Err      string                   `json:"error,omitempty"`
+// schoolVoucherRowFor 查询单账号券码；global 账号无开学季，不发上游调用。
+func (p *Panel) schoolVoucherRowFor(account *auth.Auth) schoolVoucherRow {
+	row := schoolVoucherRow{UID: account.UID, Nickname: account.NicknameValue()}
+
+	if account.IsGlobal() {
+		row.Err = "global realm（无开学季活动）"
+		return row
 	}
 
-	out := make([]row, len(accts))
+	vouchers, err := p.cfg.Upstream.SchoolVouchers(account)
+	if err != nil {
+		row.Err = err.Error()
+		return row
+	}
+
+	row.Vouchers = vouchers
+
+	return row
+}
+
+// schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
+// 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
+// 客户端断开后不再派发剩余账号。
+func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	accts := p.cfg.Pool.List()
+	out := make([]schoolVoucherRow, len(accts))
 	sem := make(chan struct{}, 3)
 
 	var wg sync.WaitGroup
 
 	for i := range accts {
 		st := &accts[i]
-		if st.Disabled {
+
+		account := p.cfg.Pool.AuthByUID(st.UID)
+		if st.Disabled || account == nil {
 			continue // 未占位，行末统一压掉
 		}
 
-		account := p.cfg.Pool.AuthByUID(st.UID)
-		if account == nil {
-			continue
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		if !acquireSem(ctx, sem) {
+			break
 		}
 
 		wg.Add(1)
 		go func(i int, account5 *auth.Auth) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			row2 := row{UID: account5.UID, Nickname: account5.NicknameValue(), Vouchers: nil, Err: ""}
-			switch {
-			case account5.IsGlobal():
-				row2.Err = "global realm（无开学季活动）"
-			default:
-				vs, err := p.cfg.Upstream.SchoolVouchers(account5)
-				if err != nil {
-					row2.Err = err.Error()
-				} else {
-					row2.Vouchers = vs
-				}
-			}
-
-			out[i] = row2
+			out[i] = p.schoolVoucherRowFor(account5)
 		}(i, account)
 	}
 
 	wg.Wait()
 
-	res := make([]row, 0, len(out))
+	if ctx.Err() != nil {
+		return // 客户端已断开：不必组装与写回执
+	}
+
+	res := make([]schoolVoucherRow, 0, len(out))
 	for _, it := range out {
 		if it.UID != "" {
 			res = append(res, it)

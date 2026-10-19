@@ -126,10 +126,10 @@ type Upstash struct {
 	initOnce sync.Once
 	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
 	closeOnce sync.Once
-	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先登记 wg 再查 done，
+	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先查 done 再登记 wg，
 	// Close 先关 done 再等 wg——两侧互斥后，「Close 前提交的写必然执行」
 	// 不再依赖 goroutine 调度时序（83d18ae 原版存在窗口：排队写在 Close
-	// 关 done 之后才跑到检查点会被误丢，close_test.go:138 稳定复现）。
+	// 关 done 之后才跑到检查点会被误丢；TestCloseDrainsQueuedWrites 覆盖该契约）。
 	submitMu sync.Mutex
 	// wg 已提交未完成的写（Close 排空用）。
 	wg sync.WaitGroup
@@ -157,10 +157,9 @@ func (u *Upstash) goWrite(fn func()) {
 		defer u.wg.Done()
 		// 只阻塞抢写槽，不检查 done：此处若select done，已阻塞排队的写会在
 		// close(done) 唤醒时全部走丢弃分支（selrand5 实测 100%），「Close 前
-		// 提交的写（含排队中）必然执行」的契约被内部检查破坏——close_test.go:138
-		// 因此间歇失败（约 20%：取决于 write-1/write-2 谁先抢到唯一槽）。丢弃
-		// 语义已由提交点（submitMu 下的 done 检查）唯一承担；此处提交已冻结在
-		// wg 中，Close 的 wg.Wait 必然等到它执行完。
+		// 提交的写（含排队中）必然执行」的契约被内部检查破坏——旧实现在此检查
+		// 会让排队写被间歇丢弃。丢弃语义已由提交点（submitMu 下的 done 检查）
+		// 唯一承担；此处提交已冻结在 wg 中，Close 的 wg.Wait 必然等到它执行完。
 		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
 

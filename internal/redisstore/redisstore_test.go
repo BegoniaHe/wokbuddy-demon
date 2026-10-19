@@ -3,6 +3,7 @@ package redisstore
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -97,4 +98,63 @@ func TestZeroValueConcurrentInit(t *testing.T) {
 	})
 
 	wg.Wait()
+}
+
+// TestCloseDrainsQueuedWrites 锁定 Close 的停机契约：写槽占满时排在 sem 上
+// 的写也必须在 Close 返回前执行，不能因 close(done) 被丢弃。
+func TestCloseDrainsQueuedWrites(t *testing.T) {
+	t.Parallel()
+
+	var store Upstash
+
+	release := make(chan struct{})
+
+	var started sync.WaitGroup
+
+	var ran atomic.Int64
+
+	for range writeConcurrencyLimit {
+		started.Add(1)
+		store.goWrite(func() {
+			started.Done()
+			<-release
+			ran.Add(1)
+		})
+	}
+
+	started.Wait()
+
+	// 写槽已满：这 3 个写只能排在 sem 上，模拟 Close 前已提交但未执行的写。
+	const queued = 3
+
+	for range queued {
+		store.goWrite(func() { ran.Add(1) })
+	}
+
+	closed := make(chan struct{})
+
+	go func() {
+		_ = store.Close()
+
+		close(closed)
+	}()
+
+	// Close 必须等待排队写，不能在它们执行前返回。
+	select {
+	case <-closed:
+		t.Fatal("Close returned before queued writes ran")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after writes completed")
+	}
+
+	if got, want := ran.Load(), int64(writeConcurrencyLimit+queued); got != want {
+		t.Fatalf("ran=%d want %d (queued writes must run before Close returns)", got, want)
+	}
 }

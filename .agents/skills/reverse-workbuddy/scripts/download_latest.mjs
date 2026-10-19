@@ -14,6 +14,10 @@ const REALMS = {
   global: 'https://www.workbuddy.ai',
 };
 
+// 元数据接口与安装包下载都设超时：DNS/连接卡住时脚本不会无限期挂起。
+const META_TIMEOUT_MS = 15_000;
+const DOWNLOAD_TIMEOUT_MS = 30 * 60_000;
+
 const PLATFORM_API = {
   'darwin-arm64': 'workbuddy-darwin-arm64',
   'darwin-x64': 'workbuddy-darwin-x64',
@@ -65,7 +69,10 @@ function apiUrl(realm, platform) {
 
 async function fetchMeta(realm, platform) {
   const url = apiUrl(realm, platform);
-  const res = await fetch(url, { headers: { accept: 'application/json' } });
+  const res = await fetch(url, {
+    headers: { accept: 'application/json' },
+    signal: AbortSignal.timeout(META_TIMEOUT_MS),
+  });
   if (!res.ok) throw new Error(`${url} 返回 HTTP ${res.status}`);
   const data = await res.json();
   if (data.code) throw new Error(`${url} 返回 ${data.code}: ${data.msg || 'unknown error'}`);
@@ -91,7 +98,7 @@ function versionDirName(meta, platform, fileUrl) {
 async function download(url, dest, expectedSha) {
   const tmp = dest + '.part';
   fs.rmSync(tmp, { force: true });
-  const res = await fetch(url);
+  const res = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`${url} 返回 HTTP ${res.status}`);
   const type = res.headers.get('content-type') || '';
   if (type.includes('text/html')) throw new Error(`${url} 返回 HTML 而不是安装包（可能被重定向到登录/错误页）`);

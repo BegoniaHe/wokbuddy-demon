@@ -5,7 +5,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -55,7 +54,7 @@ func decodeTaskCode(w http.ResponseWriter, r *http.Request) (string, bool) {
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
+	if err := decodeJSONBody(r.Body, &body); err != nil || body.TaskCode == "" {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return "", false
 	}
@@ -184,7 +183,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TaskCodes []string `json:"task_codes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskCodes) == 0 {
+	if err := decodeJSONBody(r.Body, &body); err != nil || len(body.TaskCodes) == 0 {
 		writeErr(w, http.StatusBadRequest, "task_codes required")
 		return
 	}
@@ -299,7 +298,7 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		TaskCode string `json:"task_code"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TaskCode == "" {
+	if err := decodeJSONBody(r.Body, &body); err != nil || body.TaskCode == "" {
 		writeErr(w, http.StatusBadRequest, "task_code required")
 		return
 	}

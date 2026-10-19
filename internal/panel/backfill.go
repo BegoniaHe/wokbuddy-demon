@@ -1,7 +1,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,7 +30,7 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 		UID  string `json:"uid"`
 		Days int    `json:"days"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := decodeJSONBody(io.LimitReader(r.Body, 1<<20), &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}

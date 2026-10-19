@@ -93,6 +93,10 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+	// balanceSem/balanceSemOnce 余额刷新逐号上游调用的全局并发上限：后台周期与
+	// 面板手动刷新会并发触发，各持一个信号量会把总在途请求放大到 2 倍以上。
+	balanceSemOnce sync.Once
+	balanceSem     chan struct{}
 
 	// nowFn 窗口判定时钟（测试注入固定时刻；nil 回退 time.Now）。
 	nowFn func() time.Time
@@ -831,7 +835,21 @@ func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
 		map[string]any{"credits": remain, "credit_floor": floor})
 }
 
-// RunBalanceRefreshNow 并发查询余额并更新池内 credits。
+// balanceRefreshWorkers 余额刷新逐号上游调用的并发上限：导入上限 1000 个账号时
+// 无界 fan-out 会瞬时耗尽 fd 并打满上游限流。后台周期与面板手动刷新共享同一个
+// 信号量（见 balanceSemaphore），避免两个入口并发时总在途请求翻倍。
+const balanceRefreshWorkers = 5
+
+// balanceSemaphore 返回跨入口共享的余额刷新信号量（零值 Scheduler 也可用）。
+func (s *Scheduler) balanceSemaphore() chan struct{} {
+	s.balanceSemOnce.Do(func() {
+		s.balanceSem = make(chan struct{}, balanceRefreshWorkers)
+	})
+
+	return s.balanceSem
+}
+
+// RunBalanceRefreshNow 并发查询余额并更新池内 credits（无取消信号的便捷入口）。
 // 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
 // no-op，所以本开关**不会**导致禁用号被自动解冻——它只让已有账号的积分保持新鲜。
@@ -839,12 +857,23 @@ func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
+	s.RunBalanceRefreshNowCtx(context.Background())
+}
+
+// RunBalanceRefreshNowCtx 同 RunBalanceRefreshNow，ctx 取消后不再派发新的逐号
+// 请求（已派发的等其完成）。限并发到 balanceRefreshWorkers 后，1000 个账号
+// 遇上上游超时可能让整轮拖上数小时；面板请求断开或进程停机时应尽早停止派发。
+func (s *Scheduler) RunBalanceRefreshNowCtx(ctx context.Context) {
 	var wg sync.WaitGroup
+
+	sem := s.balanceSemaphore()
 
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 
 	list := s.cfg.Pool.List()
+
+loop:
 	for i := range list {
 		status := &list[i]
 		if status.Disabled && !includeDisabled {
@@ -856,9 +885,28 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			continue
 		}
 
+		// 已取消（含请求开始前就取消）：不再派发，避免无谓的上游调用。
+		if ctx.Err() != nil {
+			break
+		}
+
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		select {
+		case sem <- struct{}{}:
+			// select 同时就绪时随机选择：拿到名额后再确认一次，覆盖「检查后、
+			// 取名额前」刚好取消的窗口；已取消则立即归还名额并停止派发。
+			if ctx.Err() != nil {
+				<-sem
+				break loop
+			}
+		case <-ctx.Done():
+			break loop
+		}
+
 		wg.Add(1)
 		go func(account4 *auth.Auth, uid string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account4, expiringSoon)
 			if err != nil {
@@ -915,7 +963,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 			case <-s.rearmBalance:
 				timer.Stop() // 间隔已变：立刻按新值重算
 			case <-timer.C:
-				s.RunBalanceRefreshNow()
+				s.RunBalanceRefreshNowCtx(ctx)
 			}
 		}
 	}()

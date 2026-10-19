@@ -12,9 +12,12 @@
 package panel
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -726,7 +729,7 @@ func (p *Panel) accountProxySlot(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Slot string `json:"slot"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r.Body, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -909,7 +912,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
-// accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
+// accountRemove 移除账号：先出池（池内退役凭证并立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 
@@ -918,8 +921,6 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	// 先失效凭证再删文件：在途 refresh 的 SaveAtomic 会拒绝写回，避免文件复活。
-	account.Retire()
 
 	fileMsg := ""
 
@@ -1007,26 +1008,59 @@ func (p *Panel) tasksRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
-// 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
-// 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+// 完成后返回——面板紧接着拉 overview 即是最新值。同步等待（逐号并发有界）
+// 比"触发后盲刷"体验更确定；客户端断开则停止派发剩余账号，不空跑上游。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
 
-	p.cfg.Scheduler.RunBalanceRefreshNow()
-	p.syncNicknames()
+	ctx := r.Context()
+	p.cfg.Scheduler.RunBalanceRefreshNowCtx(ctx)
+
+	if ctx.Err() != nil {
+		return // 客户端已断开：不再同步昵称或写回执
+	}
+
+	p.syncNicknames(ctx)
+
+	if ctx.Err() != nil {
+		return // 昵称同步期间客户端断开：不再写回执
+	}
+
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+}
+
+// acquireSem 在 ctx 取消前占用一个信号量名额；已取消或等待中取消返回 false。
+// 已有取消时不能只靠 select：sem 有空位会与 ctx.Done 同时就绪，随机选择仍可能派发。
+func acquireSem(ctx context.Context, sem chan struct{}) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	select {
+	case sem <- struct{}{}:
+		// select 同时就绪时随机选择：拿到名额后再确认一次，覆盖「检查后、
+		// 取名额前」刚好取消的窗口；已取消则立即归还名额。
+		if ctx.Err() != nil {
+			<-sem
+			return false
+		}
+
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。
 // 只在面板手动「刷新」路径调用——后台余额定时器不触发（用户明确要求资料接口
 // 仅手动触达）。逐号拉 /console/account，只取 nickname（手机号等敏感字段在
 // upstream.FetchAccountProfile 内即被丢弃）；单号失败静默跳过，不打断余额刷新
-// 的既有结果。
-func (p *Panel) syncNicknames() {
+// 的既有结果。ctx 取消后不再派发剩余账号（客户端断开时不必空跑上游）。
+func (p *Panel) syncNicknames(ctx context.Context) {
 	jobs := p.collectNicknameJobs()
 	if len(jobs) == 0 {
 		return
@@ -1039,12 +1073,16 @@ func (p *Panel) syncNicknames() {
 		sem     = make(chan struct{}, 3)
 		wg      sync.WaitGroup
 	)
+
 	for _, j := range jobs {
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		if !acquireSem(ctx, sem) {
+			break
+		}
+
 		wg.Add(1)
 		go func(j nicknameJob) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			numVal, num2 := p.fetchNickname(j)
@@ -1060,6 +1098,10 @@ func (p *Panel) syncNicknames() {
 	}
 
 	wg.Wait()
+
+	if ctx.Err() != nil {
+		return
+	}
 
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)
@@ -1215,8 +1257,10 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 // packages 返回全部账号的积分包构成，供「积分构成」视图对比。
 //
 // 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
-// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。客户端断开后
+// 不再派发剩余账号。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	accts := p.cfg.Pool.List()
 	out := make([]packageAccountRow, len(accts))
 
@@ -1227,11 +1271,14 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	for i := range accts {
 		status := &accts[i]
 
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		if !acquireSem(ctx, sem) {
+			break
+		}
+
 		wg.Add(1)
 		go func(i int, status *pool.Status) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			packageAccountRow2 := packageAccountRow{UID: status.UID, Nickname: status.Nickname, Realm: status.Realm}
@@ -1261,6 +1308,10 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
+	if ctx.Err() != nil {
+		return // 客户端已断开：不必排序与写回执
+	}
+
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "grants": creditGrants(out)})
@@ -1280,6 +1331,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+var errTrailingJSON = errors.New("unexpected data after JSON body")
+
+// decodeJSONBody 解码请求体中的单个 JSON 值：首个值之后的非空数据同样视为
+// 畸形请求，避免 `{"force":true} garbage` 被静默接受并执行写操作。
+func decodeJSONBody(body io.Reader, v any) error {
+	dec := json.NewDecoder(body)
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("decode json body: %w", err)
+	}
+
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errTrailingJSON
+	}
+
+	return nil
 }
 
 // nextLocalMidnight 返回本地次日 0 点（日限额恢复时间，issue #95）。

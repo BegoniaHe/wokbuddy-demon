@@ -190,6 +190,7 @@ func TestKeysUpdateLimits(t *testing.T) {
 		`{"limits":{"models":["[bad"]}}`,
 		`{"limits":{"models":["cn:"]}}`,
 		`{"limits":{"models":["global:"]}}`,
+		`{"limits":{"rpm":99}} trailing`,
 	} {
 		if code, resp := panel.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/limits", bad); code != http.StatusBadRequest {
 			t.Errorf("bad %s: code=%d body=%s", bad, code, resp)
@@ -219,5 +220,67 @@ func TestKeysRealmUpdate(t *testing.T) {
 
 	if code, _ := panel.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/realm", `{"realm":"mars"}`); code != http.StatusBadRequest {
 		t.Errorf("invalid realm code=%d want 400", code)
+	}
+
+	if code, _ := panel.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/realm", `{"realm":"cn"} trailing`); code != http.StatusBadRequest {
+		t.Errorf("trailing data code=%d want 400", code)
+	}
+
+	if got := store.Realm(rec.ID); got != "global" {
+		t.Errorf("trailing data changed realm: %q", got)
+	}
+}
+
+// TestKeysCreateRejectsMalformedJSON 畸形请求体不得签发密钥：否则错误输入会
+// 静默创建一把默认名密钥，调用方却以为请求失败。
+func TestKeysCreateRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+	panel := panelWithKeys(store)
+
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", `{"name":`); code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", code, body)
+	}
+
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", `{"name":"x"} trailing`); code != http.StatusBadRequest {
+		t.Fatalf("trailing data: code=%d body=%s, want 400", code, body)
+	}
+
+	if keys := store.List(); len(keys) != 0 {
+		t.Fatalf("malformed request created keys: %+v", keys)
+	}
+}
+
+// TestKeysCreateRejectsEmptyBody 空 body 同样视为无效请求，避免无 body 的 POST
+// 静默创建默认名密钥。前端始终发送 {"name": ...}，不受影响。
+func TestKeysCreateRejectsEmptyBody(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+	panel := panelWithKeys(store)
+
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", ""); code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", code, body)
+	}
+
+	if keys := store.List(); len(keys) != 0 {
+		t.Fatalf("empty body created keys: %+v", keys)
+	}
+}
+
+// TestKeysCreateRejectsNullBody null 等价于空 body，同样不得签发密钥。
+func TestKeysCreateRejectsNullBody(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+	panel := panelWithKeys(store)
+
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", "null"); code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", code, body)
+	}
+
+	if keys := store.List(); len(keys) != 0 {
+		t.Fatalf("null body created keys: %+v", keys)
 	}
 }

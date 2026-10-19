@@ -199,12 +199,14 @@ func (p *Panel) postImportAccounts(accounts []*auth.Auth) {
 	sem := make(chan struct{}, importWorkers)
 
 	var wg sync.WaitGroup
+
 	for _, item := range accounts {
+		// 先取名额再起 goroutine：导入上限 1000 个账号时不在信号量上堆积阻塞协程。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(account3 *auth.Auth) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			uid := account3.UID

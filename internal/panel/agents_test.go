@@ -68,3 +68,48 @@ func TestAgentsRejectNonLoopback(t *testing.T) {
 		t.Fatalf("code=%d want 403", rec.Code)
 	}
 }
+
+// TestAgentsApplyRejectsMalformedJSON 畸形请求体返回 400，不得把尾随数据静默
+// 忽略后仍写入客户端配置。
+func TestAgentsApplyRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+	panel, _ := agentsPanel(t, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/agents/claude/apply",
+		strings.NewReader(`{"base_url":"http://127.0.0.1:7863","api_key":"sk-test"} trailing`))
+	req.RemoteAddr = "127.0.0.1:12345"
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", rec.Code, rec.Body)
+	}
+}
+
+// TestAgentsRestoreRejectsMalformedJSON 畸形请求体返回 400，不得把 force 当
+// 默认 false 继续执行还原。
+func TestAgentsRestoreRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+	panel, _ := agentsPanel(t, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/agents/claude/restore", strings.NewReader(`{"force":`))
+	req.RemoteAddr = "127.0.0.1:12345"
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", rec.Code, rec.Body)
+	}
+
+	trailing := httptest.NewRequest(http.MethodPost, "/panel/api/agents/claude/restore", strings.NewReader(`{"force":true} trailing`))
+	trailing.RemoteAddr = "127.0.0.1:12345"
+
+	rec = httptest.NewRecorder()
+	panel.ServeHTTP(rec, trailing)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("trailing data: code=%d body=%s, want 400", rec.Code, rec.Body)
+	}
+}

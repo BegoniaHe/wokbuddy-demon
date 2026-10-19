@@ -2,8 +2,8 @@
 package panel
 
 import (
-	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 
@@ -38,7 +38,7 @@ func (p *Panel) agentsApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var opts agentcfg.Options
-	if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+	if err := decodeJSONBody(r.Body, &opts); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -73,7 +73,10 @@ func (p *Panel) agentsRestore(w http.ResponseWriter, r *http.Request) {
 		Force bool `json:"force"`
 	}
 
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := decodeJSONBody(r.Body, &body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
 
 	err := p.cfg.Agents.Restore(r.PathValue("client"), body.Force)
 	if errors.Is(err, agentcfg.ErrModified) {
