@@ -406,12 +406,15 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 	sem := make(chan struct{}, concurrency)
 
 	var wg sync.WaitGroup
+
 	for _, one := range accts {
+		// 先取名额再起 goroutine（同 collectQueueAccounts）：账号多时不在信号量上
+		// 堆积阻塞协程。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(one queueAccount) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			// per-account 互斥：与单任务/一键完成共用一把锁。
 			if !p.tryLockAccount(one.a.UID) {
@@ -619,11 +622,12 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(i int, account5 *auth.Auth) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			row2 := row{UID: account5.UID, Nickname: account5.NicknameValue(), Vouchers: nil, Err: ""}

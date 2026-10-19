@@ -1040,11 +1040,12 @@ func (p *Panel) syncNicknames() {
 		wg      sync.WaitGroup
 	)
 	for _, j := range jobs {
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(j nicknameJob) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			numVal, num2 := p.fetchNickname(j)
@@ -1227,11 +1228,12 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	for i := range accts {
 		status := &accts[i]
 
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(i int, status *pool.Status) {
 			defer wg.Done()
-
-			sem <- struct{}{}
 			defer func() { <-sem }()
 
 			packageAccountRow2 := packageAccountRow{UID: status.UID, Nickname: status.Nickname, Realm: status.Realm}
