@@ -300,7 +300,7 @@ func desktopRequestResponse(conversationID, requestID string) DesktopEvent {
 	})
 }
 
-// SetAppearanceTheme 应用外观主题（实测：POST copilot.tencent.com/v2/user-asset/appearance/set，
+// SetAppearanceTheme 应用外观主题（实测：POST chatBase/v2/user-asset/appearance/set，
 // 和品主题 resource_key 为 "theme-tkmw7j"，浅色 "light"、深色 "dark"）。纯 API set 不计
 // Hp_Appearance 分（需客户端切主题后真实活跃），保留供调色/还原与后续验证用。
 func (c *Client) SetAppearanceTheme(account *auth.Auth, resourceKey string) error {

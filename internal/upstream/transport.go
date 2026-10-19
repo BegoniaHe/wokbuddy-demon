@@ -43,9 +43,8 @@ const (
 	//
 	// 注意：本常量只是 newTransport 的构造默认，main.go 会按 config
 	// upstream.header_timeout_seconds 无条件覆盖。因此生产生效值 = config
-	// 解析值（未配置时 normalize 回落 timeout_seconds，默认 120），本 60s 仅作
-	// 「Config 未接线/测试裸用」时的安全网——与 config.example.json 的取值
-	// 对齐避免三处口径漂移（transport 60 / config 回落 120 / example 60）。
+	// 解析值（未配置时 normalize 回落 1200s），本 60s 仅作
+	// 「Config 未接线/测试裸用」时的安全网。
 	responseHeaderTimeout = 60 * time.Second
 	// writeTimeout 单次出站 Write 的上限（每次 Write 前重设，非整请求总时长）。
 	// 现役此前完全缺失写方向 deadline：聊天 SSE 路径用 http.Client{Timeout:0}

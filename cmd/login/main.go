@@ -11,7 +11,8 @@
 //
 // --realm 默认 cn。按 realm 切换上游端点与 Origin/Referer：
 //
-//	cn     → https://copilot.tencent.com（Origin: https://www.codebuddy.cn）
+//	cn     → https://www.workbuddy.cn（Origin: https://www.codebuddy.cn），
+//	         首 token 前可回落 copilot.tencent.com / wb.tencentbuddy.com
 //	global → https://www.workbuddy.ai（Origin: https://www.workbuddy.ai）
 //
 // state 落盘带 realm，poll 读回校验与命令行 --realm 一致（防混域）。
@@ -175,6 +176,7 @@ func fatalf(format string, args ...any) {
 type loginState struct {
 	State string `json:"state"`
 	Realm string `json:"realm,omitempty"` // url 落盘时写回的 realm，poll 读回校验防混域
+	Base  string `json:"base,omitempty"`  // url 命中 origin，poll 优先同源
 }
 
 // tokenBundle 是 auth/token 成功返回的凭证包。
@@ -295,22 +297,33 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
 	headers := noAuthHeaders(commonHeaders(origin))
 
-	var data []byte
-
-	var lastErr error
+	var (
+		data     []byte
+		lastErr  error
+		usedBase string
+	)
 
 	for _, candidate := range realmBases(realm, base) {
 		url := candidate + "/v2/plugin/auth/state?platform=" + authPlatform(realm)
 
-		var err error
+		var (
+			status int
+			err    error
+		)
 
-		data, _, err = doJSON(client, http.MethodPost, url, headers, bytes.NewReader([]byte("{}")))
+		data, status, err = doJSON(client, http.MethodPost, url, headers, bytes.NewReader([]byte("{}")))
 		if err == nil {
 			lastErr = nil
+			usedBase = candidate
+
 			break
 		}
 
 		lastErr = err
+
+		if !loginReplayableStatus(status) {
+			break
+		}
 	}
 
 	if lastErr != nil {
@@ -325,7 +338,7 @@ func runURL(base, origin, realm, statePath string, client *http.Client, out io.W
 		fatalf("auth state: missing state or authUrl")
 	}
 
-	raw, merr := json.Marshal(loginState{State: item.State, Realm: realm})
+	raw, merr := json.Marshal(loginState{State: item.State, Realm: realm, Base: usedBase})
 	if merr != nil {
 		fatalf("marshal state: %v", merr)
 	}
@@ -345,7 +358,7 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	headers := commonHeaders(origin)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-	tok, usedBase, err := pollTokenWithFallback(base, realm, loginState2.State, headers, client)
+	tok, usedBase, err := pollTokenWithFallback(base, realm, loginState2.Base, loginState2.State, headers, client)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -361,11 +374,14 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	os.Remove(statePath)
 }
 
-// pollTokenWithFallback 按 origin 候选拉取 token，仅在传输/网关错误时切换。
-func pollTokenWithFallback(base, realm, state string, headers func(*http.Request), client *http.Client) (tokenBundle, string, error) {
+// pollTokenWithFallback 按 origin 候选拉取 token，仅在传输/网关错误时切换；
+// preferredBase（url 阶段命中的 origin）优先。
+func pollTokenWithFallback(
+	base, realm, preferredBase, state string, headers func(*http.Request), client *http.Client,
+) (tokenBundle, string, error) {
 	var lastErr error
 
-	for _, candidate := range realmBases(realm, base) {
+	for _, candidate := range preferBase(realmBases(realm, base), preferredBase) {
 		tok, status, err := pollTokenOnce(candidate, state, noAuthHeaders(headers), client)
 		if err == nil {
 			return tok, candidate, nil
@@ -373,14 +389,39 @@ func pollTokenWithFallback(base, realm, state string, headers func(*http.Request
 
 		lastErr = err
 
-		if status != 0 && status < 500 && status != http.StatusRequestTimeout &&
-			status != http.StatusBadGateway && status != http.StatusServiceUnavailable &&
-			status != http.StatusGatewayTimeout {
+		if !loginReplayableStatus(status) {
 			break
 		}
 	}
 
 	return tokenBundle{}, "", lastErr
+}
+
+// loginReplayableStatus 报告登录请求失败是否值得换 origin：仅传输错误与网关类状态码。
+func loginReplayableStatus(status int) bool {
+	switch status {
+	case 0, http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
+}
+
+// preferBase 把 preferred 提到候选首位（不存在时保持原序）。
+func preferBase(candidates []string, preferred string) []string {
+	if preferred == "" {
+		return candidates
+	}
+
+	for i := range candidates {
+		if candidates[i] == preferred {
+			candidates[0], candidates[i] = candidates[i], candidates[0]
+
+			break
+		}
+	}
+
+	return candidates
 }
 
 // loadLoginState 读取并解析 state 文件，校验 realm 与命令行 --realm 一致（防混域），

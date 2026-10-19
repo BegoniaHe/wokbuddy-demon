@@ -106,7 +106,7 @@ type Config struct {
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
 		// MaxBodyBytes 聊天类入站请求体上限（字节，issue #86），覆盖
 		// /v1/chat/completions、/v1/messages 与 count_tokens。超限在解析前返回
-		// 413，不进入选号。缺省 16 MiB；0 = 不限制。改动需重启进程。
+		// 413，不进入选号。缺省 32 MiB；0 = 不限制。改动需重启进程。
 		MaxBodyBytes int64 `json:"max_body_bytes"`
 		// RequestAcceptGraceSeconds 停机第一阶段：收到 SIGTERM 后先把 /healthz
 		// 置 503，并继续受理请求的宽限时长（秒），供反代/LB 完成摘流。缺省 0 =

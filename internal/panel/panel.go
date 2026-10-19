@@ -179,6 +179,7 @@ const loginTTL = 15 * time.Minute
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
+	base    string // 发起登录命中的 origin（CN 回落时 poll 优先同源）
 }
 
 // New 构建面板。

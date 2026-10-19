@@ -858,7 +858,8 @@ type Client struct {
 	// <=0 回落包级默认 billingRetryDelay（2s）。仅供测试注入更短间隔，生产不设置。
 	RetryDelay time.Duration
 
-	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
+	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（生产由 config
+	// normalize 到 1200s；裸用回落 transport 构造默认）。
 	HeaderTimeout time.Duration
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
@@ -1458,8 +1459,8 @@ func commitRefreshedToken(account4 *auth.Auth, tok refreshTokenResponse, atBefor
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 需要客户端断开联动的调用方用 ChatStreamContext 传入请求 ctx。
 //
-// global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
-// （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
+// 两 realm 均走 /v2/chat/completions；CN 默认主域在首 token 前可按
+// 408/502/503/504 或传输错误回落旧 origin，global 单 origin。
 //
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单。
 func (c *Client) ChatStream(
@@ -3035,8 +3036,9 @@ func creditPackageFromAccount(billingPackageAccount3 *billingPackageAccount) Cre
 	return creditPackage
 }
 
-// creditPackageExpiry 按上游口径选出失效时刻：DeductionEndTime 优先（epoch 毫秒，
-// 真「用不完就没了」），依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
+// creditPackageExpiry 按上游口径选出失效时刻：切片型（CapacityType=4）以
+// CycleEndTime 为周期边界；其余 DeductionEndTime 优先（epoch 毫秒，真「用不完就
+// 没了」），依次回落 ExpiredTime / PackageEndTime / CycleEndTime。
 // 返回 RFC3339 文本与同源 Unix 毫秒（后者仅在 DeductionEndTime 分支有值）。
 func creditPackageExpiry(billingPackageAccount4 *billingPackageAccount) (endTime string, expiresAt int64) {
 	// 切片型（含每日免费包）以周期边界为准；其余按可抵扣窗口 → ExpiredTime →

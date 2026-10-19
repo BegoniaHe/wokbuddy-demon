@@ -26,35 +26,105 @@ import (
 )
 
 const (
-	upstreamBaseCN      = "https://copilot.tencent.com"
+	upstreamBaseCN      = "https://www.workbuddy.cn"
 	upstreamBaseGlobal  = "https://www.workbuddy.ai"
 	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
+// CN 登录 origin 回落顺序：与 cmd/login、chat/refresh 保持同一口径。
+var cnLoginFallbackBases = []string{"https://copilot.tencent.com", "https://wb.tencentbuddy.com"}
+
 var errDoJSONFailed = errors.New("doJSON failed")
 
-// loginEndpoints 按 realm 返回设备授权三端点（auth/state、token、account）+ Origin。
-// realm=="global" → 国际版（workbuddy.ai 同域）；cn/非法/缺省 → CN（零回归）。
+// loginEndpoint 单 realm 的一组设备授权端点与 Origin。
+type loginEndpoint struct {
+	base    string
+	state   string
+	token   string
+	account string
+	origin  string
+}
+
+// loginEndpointForBase 按 realm/base 拼出设备授权三端点。
 // auth/state 的 platform 参数取官方 product.json authentication.attributes.platform
 // （cn "workbuddy" / global "workbuddy-ai"）。
-func loginEndpoints(realm string) (state, token, account, origin string) {
+func loginEndpointForBase(realm, base string) loginEndpoint {
 	if realm == "global" {
-		base := upstreamBaseGlobal
-
-		return base + "/v2/plugin/auth/state?platform=workbuddy-ai",
-			base + "/v2/plugin/auth/token?state=",
-			base + "/v2/plugin/login/account?state=",
-			originRefererGlobal
+		return loginEndpoint{
+			base:    base,
+			state:   base + "/v2/plugin/auth/state?platform=workbuddy-ai",
+			token:   base + "/v2/plugin/auth/token?state=",
+			account: base + "/v2/plugin/login/account?state=",
+			origin:  originRefererGlobal,
+		}
 	}
 
-	base := upstreamBaseCN
+	return loginEndpoint{
+		base:    base,
+		state:   base + "/v2/plugin/auth/state?platform=workbuddy",
+		token:   base + "/v2/plugin/auth/token?state=",
+		account: base + "/v2/plugin/login/account?state=",
+		origin:  originRefererCN,
+	}
+}
 
-	return base + "/v2/plugin/auth/state?platform=workbuddy",
-		base + "/v2/plugin/auth/token?state=",
-		base + "/v2/plugin/login/account?state=",
-		originRefererCN
+// loginEndpoints 按 realm 返回主 origin 的设备授权三端点 + Origin。
+// realm=="global" → 国际版（workbuddy.ai 同域）；cn/非法/缺省 → CN（workbuddy.cn）。
+func loginEndpoints(realm string) (state, token, account, origin string) {
+	base := upstreamBaseCN
+	if realm == "global" {
+		base = upstreamBaseGlobal
+	}
+
+	ep := loginEndpointForBase(realm, base)
+
+	return ep.state, ep.token, ep.account, ep.origin
+}
+
+// loginCandidates 返回该 realm 可尝试的 origin 顺序；CN 主域失败时可回落旧域。
+func loginCandidates(realm string) []loginEndpoint {
+	if realm == "global" {
+		return []loginEndpoint{loginEndpointForBase(realm, upstreamBaseGlobal)}
+	}
+
+	out := make([]loginEndpoint, 0, 1+len(cnLoginFallbackBases))
+	out = append(out, loginEndpointForBase("cn", upstreamBaseCN))
+
+	for _, base := range cnLoginFallbackBases {
+		out = append(out, loginEndpointForBase("cn", base))
+	}
+
+	return out
+}
+
+// loginCandidatesPrefer 把 preferredBase 提到候选首位（发起登录用的 origin 优先）。
+func loginCandidatesPrefer(realm, preferredBase string) []loginEndpoint {
+	candidates := loginCandidates(realm)
+	if preferredBase == "" {
+		return candidates
+	}
+
+	for i := range candidates {
+		if candidates[i].base == preferredBase {
+			candidates[0], candidates[i] = candidates[i], candidates[0]
+
+			break
+		}
+	}
+
+	return candidates
+}
+
+// loginReplayable 报告登录请求失败是否值得换 origin：仅传输错误与网关类状态码。
+func loginReplayable(status int) bool {
+	switch status {
+	case 0, http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 // loginHTTP 设备授权专用 client：短超时、无 cookie（每请求携带 state，无会话态）。
@@ -138,6 +208,28 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin string) (json
 	return env.Data, resp.StatusCode, nil
 }
 
+// loginStartState 按 origin 候选发起 auth/state，返回响应、命中的 endpoint 与最后状态。
+func loginStartState(realm string) (json.RawMessage, loginEndpoint, int, error) {
+	var (
+		lastStatus int
+		lastErr    error
+	)
+
+	for _, endpoint := range loginCandidates(realm) {
+		data, status, err := doJSON(http.MethodPost, endpoint.state, "", bytes.NewReader([]byte("{}")), endpoint.origin)
+		if err == nil {
+			return data, endpoint, status, nil
+		}
+
+		lastStatus, lastErr = status, err
+		if !loginReplayable(status) {
+			break
+		}
+	}
+
+	return nil, loginEndpoint{}, lastStatus, lastErr
+}
+
 // loginStart 发起设备授权：POST auth/state 拿授权 URL。
 // body 可带 {"realm":"global"}（缺省 cn）；state 会话记 realm，poll 同 realm 落盘。
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
@@ -154,11 +246,10 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	epState, _, _, origin := loginEndpoints(realm)
-
-	data, status, err := doJSON(http.MethodPost, epState, "", bytes.NewReader([]byte("{}")), origin)
+	data, used, status, err := loginStartState(realm)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, fmt.Sprintf("auth state (upstream %d): %v", status, err))
+
 		return
 	}
 
@@ -179,7 +270,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	p.logins[item.State] = loginSession{created: time.Now(), realm: realm}
+	p.logins[item.State] = loginSession{created: time.Now(), realm: realm, base: used.base}
 	p.loginMu.Unlock()
 	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, item.State[:min(8, len(item.State))])
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": item.AuthURL, "state": item.State, "realm": realm})
@@ -224,7 +315,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, pending, err := pollLoginToken(sess.realm, state)
+	tok, pending, endpoint, err := pollLoginToken(sess.realm, sess.base, state)
 	if err != nil {
 		// pending / 未完成：面板前端继续轮询。
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
@@ -236,7 +327,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	acct := fetchLoginAccount(sess.realm, state, tok.AccessToken)
+	acct := fetchLoginAccount(&endpoint, state, tok.AccessToken)
 
 	account, status, msg := p.persistLoginAuth(sess.realm, tok, acct)
 	if status != 0 {
@@ -263,31 +354,39 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 // pollLoginToken 查 auth/token：请求失败返回 err（面板按 pending 处理）；token 尚未
-// 就绪返回 pending=true；成功返回解析后的凭证。
-func pollLoginToken(realm, state string) (loginToken, bool, error) {
-	_, epToken, _, origin := loginEndpoints(realm)
+// 就绪返回 pending=true；成功返回解析后的凭证与命中的 origin（account 端点同源）。
+func pollLoginToken(realm, preferredBase, state string) (loginToken, bool, loginEndpoint, error) {
+	var lastErr error
 
-	tokRaw, _, err := doJSON(http.MethodGet, epToken+state, "", nil, origin)
-	if err != nil {
-		return loginToken{}, false, err
+	for _, endpoint := range loginCandidatesPrefer(realm, preferredBase) {
+		tokRaw, status, err := doJSON(http.MethodGet, endpoint.token+state, "", nil, endpoint.origin)
+		if err != nil {
+			lastErr = err
+
+			if loginReplayable(status) {
+				continue
+			}
+
+			return loginToken{}, false, loginEndpoint{}, err
+		}
+
+		var tok loginToken
+
+		_ = json.Unmarshal(tokRaw, &tok)
+		if tok.AccessToken == "" {
+			return loginToken{}, true, endpoint, nil
+		}
+
+		return tok, false, endpoint, nil
 	}
 
-	var tok loginToken
-
-	_ = json.Unmarshal(tokRaw, &tok)
-	if tok.AccessToken == "" {
-		return loginToken{AccessToken: "", RefreshToken: "", ExpiresIn: 0, Domain: ""}, true, nil
-	}
-
-	return tok, false, nil
+	return loginToken{}, false, loginEndpoint{}, lastErr
 }
 
 // fetchLoginAccount 取 uid/nickname（失败不阻塞，仅缺展示名）。
-func fetchLoginAccount(realm, state, bearer string) loginAccount {
-	_, _, epAcct, origin := loginEndpoints(realm)
-
+func fetchLoginAccount(endpoint *loginEndpoint, state, bearer string) loginAccount {
 	var acct loginAccount
-	if acctRaw, _, err := doJSON(http.MethodGet, epAcct+state, bearer, nil, origin); err == nil {
+	if acctRaw, _, err := doJSON(http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin); err == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 

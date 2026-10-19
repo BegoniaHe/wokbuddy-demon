@@ -975,7 +975,7 @@ func runModelChat(panel9 *Panel, account18 *auth.Auth) (string, error) {
 
 // runRichMeow 完成 RichMeow_Chat（桌面端对话1次）。
 // 2026-09-12 三账号实测验证：以桌面指纹（extName=workbuddy-desktop）向
-// copilot.tencent.com/v2/report 上报完整对话事件链（agent_task_created →
+// chatBase 的 /v2/report 上报完整对话事件链（agent_task_created →
 // chat_message_response isSuccessful=true 等 6 事件），纯 API 即可点亮并领奖
 // （紫川/人杰2 两账号无桌面客户端登录状态下 3 秒内 0/1 → 1/1）。
 // Hp_Appearance 的纯 API set 不计分（需客户端在主题下活跃），区别对待。
