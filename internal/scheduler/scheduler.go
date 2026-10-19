@@ -93,6 +93,10 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+	// balanceSem/balanceSemOnce 余额刷新逐号上游调用的全局并发上限：后台周期与
+	// 面板手动刷新会并发触发，各持一个信号量会把总在途请求放大到 2 倍以上。
+	balanceSemOnce sync.Once
+	balanceSem     chan struct{}
 
 	// nowFn 窗口判定时钟（测试注入固定时刻；nil 回退 time.Now）。
 	nowFn func() time.Time
@@ -832,8 +836,18 @@ func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
 }
 
 // balanceRefreshWorkers 余额刷新逐号上游调用的并发上限：导入上限 1000 个账号时
-// 无界 fan-out 会瞬时耗尽 fd 并打满上游限流。
+// 无界 fan-out 会瞬时耗尽 fd 并打满上游限流。后台周期与面板手动刷新共享同一个
+// 信号量（见 balanceSemaphore），避免两个入口并发时总在途请求翻倍。
 const balanceRefreshWorkers = 5
+
+// balanceSemaphore 返回跨入口共享的余额刷新信号量（零值 Scheduler 也可用）。
+func (s *Scheduler) balanceSemaphore() chan struct{} {
+	s.balanceSemOnce.Do(func() {
+		s.balanceSem = make(chan struct{}, balanceRefreshWorkers)
+	})
+
+	return s.balanceSem
+}
 
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits（无取消信号的便捷入口）。
 // 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
@@ -852,7 +866,7 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 func (s *Scheduler) RunBalanceRefreshNowCtx(ctx context.Context) {
 	var wg sync.WaitGroup
 
-	sem := make(chan struct{}, balanceRefreshWorkers)
+	sem := s.balanceSemaphore()
 
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()

@@ -581,6 +581,45 @@ func TestRunBalanceRefreshNowBoundsConcurrency(t *testing.T) {
 	}
 }
 
+// TestRunBalanceRefreshNowSharesConcurrencyAcrossCalls 后台周期刷新与面板手动
+// 刷新可能并发触发：两个入口必须共享同一个并发上限，否则总在途请求翻倍。
+func TestRunBalanceRefreshNowSharesConcurrencyAcrossCalls(t *testing.T) {
+	t.Parallel()
+
+	const accounts = 20
+
+	fake := &fakeUpstream{resourceRemain: 1, resourceDelay: 20 * time.Millisecond}
+
+	srv := fake.server()
+	defer srv.Close()
+
+	state := pool.New("")
+
+	for i := range accounts {
+		uid := fmt.Sprintf("u%02d", i)
+		state.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	}
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(&Config{Pool: state, Upstream: up})
+
+	var wg sync.WaitGroup
+
+	for range 2 {
+		wg.Go(func() { s.RunBalanceRefreshNowCtx(t.Context()) })
+	}
+
+	wg.Wait()
+
+	if got := fake.resourcePeak.Load(); got > balanceRefreshWorkers {
+		t.Fatalf("peak concurrency=%d want <= %d across concurrent refreshes", got, balanceRefreshWorkers)
+	}
+
+	if got := fake.resourceCalls.Load(); got != 2*accounts {
+		t.Fatalf("resource calls=%d want %d", got, 2*accounts)
+	}
+}
+
 // TestRunBalanceRefreshNowCtxCanceledStopsDispatch 已取消的 ctx 不得再派发逐号
 // 上游请求：面板请求断开或进程停机时不应继续空跑。
 func TestRunBalanceRefreshNowCtxCanceledStopsDispatch(t *testing.T) {
