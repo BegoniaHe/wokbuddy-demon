@@ -266,9 +266,10 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 
 | 协议 | 端点 |
 |---|---|
-| OpenAI Chat Completions | `POST /v1/chat/completions`、`GET /v1/models` |
-| OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function tools） |
-| Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
+| OpenAI Chat Completions | `POST /v1/chat/completions`、`GET /v1/models`、`GET /v1/models/{model}` |
+| OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function/custom tools、结构化输出；reasoning/compaction 等状态 item 忽略） |
+| Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
+| Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
 
 Codex CLI 等使用 Responses API 的客户端：
 
@@ -287,12 +288,25 @@ export ANTHROPIC_MODEL=claude-sonnet-4-5   # 需在 models.aliases 中映射到�
 claude
 ```
 
-- 请求侧支持 `system`、文本/图片内容块、`tool_use` / `tool_result`、`tools`、`tool_choice`、`stop_sequences`、`thinking`；响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
+- 鉴权同时接受 `Authorization: Bearer` 与 Anthropic SDK 的 `X-Api-Key`，两者走同一常量时间比较。
+- 请求侧支持 `system`、文本/图片内容块、`tool_use` / `tool_result`、`tools`、`tool_choice`（含 `disable_parallel_tool_use`）、`stop_sequences`、`thinking`；响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
 - system 与 message text 块上的 `cache_control` 会保留到出站 content parts，供上游 prompt cache 使用。
 - 流结束时校验各工具块聚合后的 `input_json_delta` 是否为合法 JSON；截断/非法时记 WARN（不含参数原文），本期不改写分片。
 - 上游错误转换为 Anthropic `{"type":"error","error":{...}}`，`gateway_hint` 保留在 error 对象内。
 - `count_tokens` 无本地 tokenizer，按请求文本字节数近似估算，仅用于客户端上下文预算，不作计费依据。
 - 未配置模型别名时，Anthropic 客户端可直接请求上游裸模型名。
+
+Gemini CLI（GATEWAY 模式）接入：
+
+```bash
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:7863
+export GEMINI_API_KEY=your-api-key   # 可用 x-goog-api-key 头，空 api_key 时留空
+gemini
+```
+
+- 支持 `contents`、`systemInstruction`、functionDeclarations / functionCall / functionResponse、图片 `inlineData`、`generationConfig`（采样参数、停用词、结构化输出、thinkingLevel/thinkingBudget）与 `toolConfig.functionCallingMode`。
+- 响应映射为 Gemini `GenerateContentResponse` / SSE 分片；流式不输出 `[DONE]`。`countTokens` 与 Anthropic 一致按文本字节近似。
+- Google 内置工具（googleSearch / codeExecution 等）、embedContent 与多模态文件（PDF/音频/视频）暂不代跑；相关声明或内容会被忽略。
 
 ### SSE 心跳
 
