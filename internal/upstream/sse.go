@@ -681,8 +681,9 @@ func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool)
 
 			idx := tools.resolve(table)
 			// OpenAI 流要求每片 tool_call 带 index；上游省略时按解析结果补齐，
-			// 否则 SDK 的累加器拿到 None index 会丢调用。
-			table["index"] = idx
+			// 否则 SDK 的累加器拿到 None index 会丢调用。写 float64 与 JSON 解码
+			// 形态一致：trackMaxToolIdx 等下游按 float64 读取。
+			table["index"] = float64(idx)
 			if seen[idx] {
 				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
 				if fn, _ := table["function"].(map[string]any); fn != nil {
