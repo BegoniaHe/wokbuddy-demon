@@ -386,3 +386,31 @@ func TestGrowthUsesV2First(t *testing.T) {
 		t.Errorf("paths=%v want only /v2 first", paths)
 	}
 }
+
+// TestTravelClaimReturnsLastError 空 body 重试失败时返回最后一次错误分类，
+// 不被更早的参数错误覆盖。
+func TestTravelClaimReturnsLastError(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return jsonResp(400, `{"code":400,"msg":"parameter error"}`), nil
+		}
+
+		return jsonResp(500, `{"code":500,"msg":"boom"}`), nil
+	})
+
+	_, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 42)
+
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Kind != ErrServer {
+		t.Errorf("err=%v want ErrServer (last attempt)", err)
+	}
+
+	if calls != 2 {
+		t.Errorf("calls=%d want 2", calls)
+	}
+}

@@ -451,3 +451,33 @@ func TestNormalizeChatBase(t *testing.T) {
 		}
 	}
 }
+
+// TestRefresh403WAFNotSessionDead CDN/WAF 403（无业务信封）不得被 refresh 路径
+// 误判为会话失效而永久禁用账号。
+func TestRefresh403WAFNotSessionDead(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(http.StatusForbidden, `<html><body>blocked</body></html>`), nil
+	})
+
+	err := client.RefreshToken(&auth.Auth{AccessToken: "at", RefreshToken: "rt"})
+
+	var ue *Error
+	if !asError(err, &ue) || ue.Kind != ErrWafBlock {
+		t.Errorf("err=%v want ErrWafBlock", err)
+	}
+}
+
+// TestCheckinBusinessCodeExactMatch 业务码按完整数字匹配，10012 不得命中 1001。
+func TestCheckinBusinessCodeExactMatch(t *testing.T) {
+	t.Parallel()
+
+	if got := ClassifyCheckin(&Error{Status: 200, Msg: "code=10012 msg=unknown"}); got != CheckinFailed {
+		t.Errorf("ClassifyCheckin(code=10012)=%v want CheckinFailed", got)
+	}
+
+	if got := ClassifyCheckin(&Error{Status: 200, Msg: "code=1001 msg=already"}); got != CheckinAlready {
+		t.Errorf("ClassifyCheckin(code=1001)=%v want CheckinAlready", got)
+	}
+}

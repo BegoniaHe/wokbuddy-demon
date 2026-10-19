@@ -98,9 +98,9 @@ func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) 
 	}
 
 	if err != nil && claimNeedsEmptyBody(err) {
-		if emptyData, emptyErr := c.growthJSONPath(account, http.MethodPost, lastPath, nil, headers); emptyErr == nil {
-			data, err = emptyData, nil
-		}
+		// 空 body 重试的成败都覆盖上一次：失败时保留最后一次错误分类
+		// （如会话失效/服务端错误），不被更早的参数错误掩盖。
+		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, nil, headers)
 	}
 
 	if err != nil {

@@ -839,7 +839,9 @@ func (h *Handler) geminiCountTokensAllowed(w http.ResponseWriter, r *http.Reques
 		return true
 	}
 
-	realm, bare, err := resolveKeyModel(model, h.cfg.ModelAliases, keyRealmFrom(r.Context()))
+	keyRealm := keyRealmFrom(r.Context())
+
+	realm, bare, err := resolveKeyModel(model, h.requestModelAliases(model, keyRealm), keyRealm)
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, err.Error(), "")
 		return false

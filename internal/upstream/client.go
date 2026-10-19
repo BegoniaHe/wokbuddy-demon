@@ -1353,17 +1353,26 @@ func (c *Client) RefreshToken(account10 *auth.Auth) error {
 	return nil
 }
 
-// classifyRefreshError 把 refresh 端点的 401/403 统一映射为会话失效。
-// 刷新端点拒绝凭证（HTTP 401/403）说明 refresh token 本身已不可用，属于
-// 会话级终态，必须进入既有 session-dead 累计/禁用路径；仅 12153 业务码
-// 命中时保持原分类。传输层错误不在此改写。
+// classifyRefreshError 把 refresh 端点的「纯凭证拒绝」映射为会话失效。
+// 刷新端点 HTTP 401/403 且无更具体分类（ErrClient/ErrNone）时，说明 refresh
+// token 本身已不可用，进入 session-dead 累计/禁用路径。WAF 403、账号封禁、
+// 额度耗尽等已有更权威分类的错误保持原样，避免 CDN/WAF 403 被误判成会话死亡
+// 而永久禁用账号。传输层错误不在此改写。
 func classifyRefreshError(err error) error {
-	var ue *Error
-	if errors.As(err, &ue) && (ue.Status == http.StatusUnauthorized || ue.Status == http.StatusForbidden) {
-		return &Error{Kind: ErrSessionDead, Status: ue.Status, Msg: ue.Msg}
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) {
+		return err
 	}
 
-	return err
+	if upstreamErr.Status != http.StatusUnauthorized && upstreamErr.Status != http.StatusForbidden {
+		return err
+	}
+
+	if upstreamErr.Kind != ErrNone && upstreamErr.Kind != ErrClient {
+		return err
+	}
+
+	return &Error{Kind: ErrSessionDead, Status: upstreamErr.Status, Msg: upstreamErr.Msg}
 }
 
 // refreshReplayable 报告 refresh 失败是否值得换 origin 重试：仅传输层错误与
@@ -1518,6 +1527,12 @@ func (c *Client) ChatStreamContext(
 
 		lastErr = attempt.err
 		if attempt.replay && index < len(origins)-1 {
+			// 调用方已取消（客户端断连/超时）时不再向后续 origin 重放：
+			// 请求已无消费者，继续发只会放大上游请求量。
+			if ctx.Err() != nil {
+				return nil, attempt.status, attempt.body, attempt.err
+			}
+
 			continue
 		}
 
@@ -3820,13 +3835,31 @@ func checkinBusinessCode(err error) string {
 	}
 
 	for _, code := range []string{"1001", "1002", "1003"} {
-		if strings.Contains(upstreamErr.Msg, "code="+code) || strings.Contains(upstreamErr.Msg, `"code":`+code) ||
-			strings.Contains(upstreamErr.Msg, `"code": `+code) {
+		if matchBusinessCode(upstreamErr.Msg, code) {
 			return code
 		}
 	}
 
 	return ""
+}
+
+// matchBusinessCode 匹配完整业务码，避免 code=10012 被前缀匹配成 code=1001。
+func matchBusinessCode(msg, code string) bool {
+	for _, marker := range []string{"code=" + code, `"code":` + code, `"code": ` + code} {
+		idx := strings.Index(msg, marker)
+		if idx < 0 {
+			continue
+		}
+
+		end := idx + len(marker)
+		if end < len(msg) && msg[end] >= '0' && msg[end] <= '9' {
+			continue
+		}
+
+		return true
+	}
+
+	return false
 }
 
 func truncate(s string, n int) string {
