@@ -893,6 +893,12 @@ loop:
 		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
 		select {
 		case sem <- struct{}{}:
+			// select 同时就绪时随机选择：拿到名额后再确认一次，覆盖「检查后、
+			// 取名额前」刚好取消的窗口；已取消则立即归还名额并停止派发。
+			if ctx.Err() != nil {
+				<-sem
+				break loop
+			}
 		case <-ctx.Done():
 			break loop
 		}
