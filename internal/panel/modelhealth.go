@@ -88,7 +88,7 @@ func (p *Panel) modelProbe(w http.ResponseWriter, r *http.Request) {
 		Model string `json:"model"`
 		Realm string `json:"realm"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r.Body, &req); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return
 	}

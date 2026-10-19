@@ -6,7 +6,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -116,7 +115,7 @@ func (p *Panel) keysUpdateLimits(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Limits apikey.Limits `json:"limits"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r.Body, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
@@ -154,7 +153,7 @@ func (p *Panel) keysUpdateRealm(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Realm string `json:"realm"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r.Body, &body); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

@@ -190,6 +190,7 @@ func TestKeysUpdateLimits(t *testing.T) {
 		`{"limits":{"models":["[bad"]}}`,
 		`{"limits":{"models":["cn:"]}}`,
 		`{"limits":{"models":["global:"]}}`,
+		`{"limits":{"rpm":99}} trailing`,
 	} {
 		if code, resp := panel.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/limits", bad); code != http.StatusBadRequest {
 			t.Errorf("bad %s: code=%d body=%s", bad, code, resp)
@@ -219,6 +220,14 @@ func TestKeysRealmUpdate(t *testing.T) {
 
 	if code, _ := panel.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/realm", `{"realm":"mars"}`); code != http.StatusBadRequest {
 		t.Errorf("invalid realm code=%d want 400", code)
+	}
+
+	if code, _ := panel.doKeys(http.MethodPost, "/panel/api/keys/"+rec.ID+"/realm", `{"realm":"cn"} trailing`); code != http.StatusBadRequest {
+		t.Errorf("trailing data code=%d want 400", code)
+	}
+
+	if got := store.Realm(rec.ID); got != "global" {
+		t.Errorf("trailing data changed realm: %q", got)
 	}
 }
 

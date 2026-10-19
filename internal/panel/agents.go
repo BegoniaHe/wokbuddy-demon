@@ -2,7 +2,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -39,7 +38,7 @@ func (p *Panel) agentsApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var opts agentcfg.Options
-	if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+	if err := decodeJSONBody(r.Body, &opts); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
