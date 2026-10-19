@@ -2,6 +2,7 @@ package server
 
 import (
 	"io"
+	"net/http"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -31,6 +32,8 @@ type chatInput struct {
 	convReqID string
 	// traceID 入站 X-Trace-Id（缺省空串）。
 	traceID string
+	// inboundSession 入站官方会话元数据（缺省零值，不伪造）。
+	inboundSession inboundSessionMeta
 	// trace 请求观测状态（请求日志出口回填统计）；nil = 未启用请求日志。
 	trace *requestTrace
 	// keyUsage 命名密钥用量累加器（由 withClientAuth 经 context 注入）；
@@ -54,4 +57,31 @@ type chatResponder interface {
 	// 客户端写失败）。hint 为上游 error 帧的 gateway_hint 生成器；repair 为
 	// 原生工具调用标记修复器；onErrFrame 为上游 error 帧旁路观察者（可 nil）。
 	Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error
+}
+
+// inboundSessionMeta 入站官方会话元数据（来自客户端 X-* 头）。
+// 网关只透传客户端显式给出的值，不自行补默认。
+type inboundSessionMeta struct {
+	conversationID       string
+	rootRequestID        string
+	parentConversationID string
+	agentIntent          string
+	agentPurpose         string
+	agentType            string
+	compaction           string
+	contextCompacted     string
+}
+
+// inboundSessionMetaFrom 从入站请求头提取官方会话元数据。
+func inboundSessionMetaFrom(r *http.Request) inboundSessionMeta {
+	return inboundSessionMeta{
+		conversationID:       r.Header.Get("X-Conversation-Id"),
+		rootRequestID:        r.Header.Get("X-Root-Request-Id"),
+		parentConversationID: r.Header.Get("X-Parent-Conversation-Id"),
+		agentIntent:          r.Header.Get("X-Agent-Intent"),
+		agentPurpose:         r.Header.Get("X-Agent-Purpose"),
+		agentType:            r.Header.Get("X-Agent-Type"),
+		compaction:           r.Header.Get("X-Compaction"),
+		contextCompacted:     r.Header.Get("X-Context-Compacted"),
+	}
 }

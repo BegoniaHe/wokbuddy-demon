@@ -385,6 +385,28 @@ func assertStripContentOnlyUntouched(t *testing.T, tools *toolIndex, seen map[in
 	}
 }
 
+// TestStreamFinishReasonWithoutDoneCompletes 已见 finish_reason 后 EOF 视为正常完成：
+// 官方客户端在 finish_reason 后允许无 [DONE] 收尾，网关补齐 [DONE] 但不报截断。
+func TestStreamFinishReasonWithoutDoneCompletes(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n"
+	rec := httptest.NewRecorder()
+
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatalf("err=%v want nil", err)
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "truncated before [DONE]") {
+		t.Errorf("finish_reason 后 EOF 不应写截断 error 帧: %q", body)
+	}
+
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] count=%d want 1", n)
+	}
+}
+
 // TestStreamToolCallNameOnce 11 帧 tool_call：首帧 name=Bash，后续 10 帧不得携带
 // name 键，arguments 逐帧原样透传（issue #82：累加型客户端把每个分片 name 拼接成
 // Bash×帧数；正确行为是 name 只在首帧出现一次）。
@@ -1828,7 +1850,7 @@ func TestStreamTruncatedNoDone(t *testing.T) {
 	t.Parallel()
 
 	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"}}]}\n\n" +
-		"data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}]}\n\n"
+		"data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"}}]}\n\n"
 	rec := httptest.NewRecorder()
 
 	err := Stream(rec, strings.NewReader(raw))

@@ -146,6 +146,7 @@ type streamAggregator struct {
 	gotAnyContent bool
 	validEvents   int
 	sawDone       bool // 上游显式发过 data: [DONE]（正常收尾）
+	sawFinish     bool // 收到过非空 finish_reason（EOF 无 [DONE] 时视为完整收尾）
 	toolCalls     map[int]map[string]any
 	// tools 解析 tool_call 归属 index（兼容上游省略 index 的形态）；聚合与逐帧
 	// 透传路径共用同一套规则。
@@ -247,6 +248,7 @@ func (a *streamAggregator) mergeChunkMeta(chunk map[string]any) {
 func (a *streamAggregator) handleChoice(table3 map[string]any) error {
 	if fr, ok := table3["finish_reason"].(string); ok && fr != "" {
 		a.finishReason = fr
+		a.sawFinish = true
 	}
 
 	if delta, ok := table3["delta"].(map[string]any); ok {
@@ -264,6 +266,18 @@ func (a *streamAggregator) handleChoice(table3 map[string]any) error {
 	return nil
 }
 
+// deltaReasoning 读取推理文本：优先 reasoning_content，兼容官方 CLI 的
+// delta.reasoning 别名。两者同时存在时以 reasoning_content 为准。
+func deltaReasoning(node map[string]any) (string, bool) {
+	if rc, ok := node["reasoning_content"].(string); ok {
+		return rc, true
+	}
+
+	rc, ok := node["reasoning"].(string)
+
+	return rc, ok
+}
+
 // handleDelta 并入一个流式 delta（role/content/reasoning_content/tool_calls）。
 // 聚合超限返回错误（issue #113）。
 func (a *streamAggregator) handleDelta(delta map[string]any) error {
@@ -277,7 +291,7 @@ func (a *streamAggregator) handleDelta(delta map[string]any) error {
 		}
 	}
 
-	if rc, ok := delta["reasoning_content"].(string); ok {
+	if rc, ok := deltaReasoning(delta); ok {
 		if err := a.guard.add(len(rc)); err != nil {
 			return err
 		}
@@ -313,7 +327,7 @@ func (a *streamAggregator) mergeMessageFields(msg map[string]any) error {
 		}
 	}
 
-	if rc, ok := msg["reasoning_content"].(string); ok {
+	if rc, ok := deltaReasoning(msg); ok {
 		if err := a.guard.add(len(rc)); err != nil {
 			return err
 		}
@@ -483,7 +497,7 @@ func (a *streamAggregator) result() (map[string]any, error) {
 		return nil, errEmptyStream
 	}
 
-	if !a.sawDone {
+	if !a.sawDone && !a.sawFinish {
 		// EOF 收尾但上游从未发 data: [DONE]（issue #105）：连接被切 / 代理中断 /
 		// 上游崩溃。累积的 content 只是截断片段，不能当完整回答返回——非流式没有
 		// 「补帧让客户端收尾」的余地，直接报上游解析失败，由 handler 映射 502。
@@ -699,6 +713,62 @@ func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool)
 	}
 }
 
+// stripToolCallIDs 去除同一 tool_call index 后续分片里重复的 id 键。
+// 官方流首片带 id，后续分片可能重复携带同一 id；累加型客户端会把 id 当字符串
+// 拼接。保留首个 id，后续同 index 的 id 键删除。
+func stripToolCallIDs(obj map[string]any, tools *toolIndex, seen map[int]string) {
+	choices, _ := obj["choices"].([]any)
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+
+		delta, _ := c["delta"].(map[string]any)
+		if delta == nil {
+			continue
+		}
+
+		tcs, _ := delta["tool_calls"].([]any)
+		for _, tci := range tcs {
+			table, _ := tci.(map[string]any)
+			if table == nil {
+				continue
+			}
+
+			idx := tools.resolve(table)
+
+			cid, _ := table["id"].(string)
+			if first, ok := seen[idx]; ok {
+				if cid != "" && cid == first {
+					delete(table, "id")
+				}
+
+				continue
+			}
+
+			if cid != "" {
+				seen[idx] = cid
+			}
+		}
+	}
+}
+
+// trackFinishReason 记录本流是否已收到非空 finish_reason。
+func (s *streamWriter) trackFinishReason(obj map[string]any) {
+	choices, _ := obj["choices"].([]any)
+	for _, ci := range choices {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+
+		if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+			s.sawFinish = true
+		}
+	}
+}
+
 // normalizeFrame 以 OpenAI 流式规范白名单重建帧：仅保留标准字段，
 // 剔除上游噪声（finish_reason:"" → null、空 content/refusal、空 tool_calls 列表、
 // 空占位 function_call、顶层未知字段），空 delta 键一律省略，
@@ -769,18 +839,36 @@ func normalizeDelta(raw any) map[string]any {
 		}
 	}
 
+	applyReasoningAlias(delta, table)
+
 	if tcs, ok := table["tool_calls"].([]any); ok && len(tcs) > 0 {
 		delta["tool_calls"] = tcs
 	}
 
-	if fc, ok := table["function_call"]; ok && fc != nil {
-		// 空占位 function_call（name/arguments 全空）视为噪声剔除。
-		if keepFunctionCall(fc) {
-			delta["function_call"] = fc
-		}
-	}
+	applyFunctionCallDelta(delta, table)
 
 	return delta
+}
+
+// applyReasoningAlias 把 reasoning 别名归一为 reasoning_content。
+func applyReasoningAlias(delta, table map[string]any) {
+	if _, ok := delta["reasoning_content"]; ok {
+		return
+	}
+
+	if v, ok := table["reasoning"].(string); ok && v != "" {
+		delta["reasoning_content"] = v
+	}
+}
+
+// applyFunctionCallDelta 保留非空占位 function_call；空占位视为噪声剔除。
+func applyFunctionCallDelta(delta, table map[string]any) {
+	fc, ok := table["function_call"]
+	if !ok || fc == nil || !keepFunctionCall(fc) {
+		return
+	}
+
+	delta["function_call"] = fc
 }
 
 // keepFunctionCall 报告 function_call 是否非空占位：空占位（name/arguments 全空）
@@ -874,6 +962,8 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 const clientWriteTimeout = 30 * time.Second
 
 // streamWriter SSE 透传写入器的跨帧状态（StreamHint 的拆解，降低单函数复杂度）。
+//
+//nolint:gocritic // 类型与实现方法紧邻，拆分文件无收益。
 type streamWriter struct {
 	w      http.ResponseWriter
 	fl     http.Flusher
@@ -892,6 +982,10 @@ type streamWriter struct {
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen map[int]bool
+	// toolCallIDs 跨帧记录每个 index 已发出的首个 tool_call id，供后续重复 id 去重。
+	toolCallIDs map[int]string
+	// sawFinish 本流是否已收到非空 finish_reason（用于 EOF 无 [DONE] 的优雅收尾）。
+	sawFinish bool
 
 	// tools 与聚合路径共用同一套 tool_call index 归位规则：缺 index 时按
 	// id/最近调用归属，避免不同调用被当成同一 index 而误删 name。
@@ -939,6 +1033,7 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 		writeTimeout: clientWriteTimeout,
 		keepalive:    streamOptions2.keepalive,
 		toolCallSeen: map[int]bool{},
+		toolCallIDs:  map[int]string{},
 		tools:        newToolIndex(),
 		repair:       streamOptions2.markup,
 		maxToolIdx:   -1,
@@ -998,8 +1093,10 @@ func (s *streamWriter) writeRaw(payload string) error {
 // 已用过的最大 tool_call index（供标记修复接续编号）。
 // fallback 是规范化失败时的兜底原文（与修复前「marshal 失败即原样透传」一致）。
 func (s *streamWriter) writeChunk(obj map[string]any, fallback string) error {
-	// 先按 index 收敛 tool_calls name（每 index 仅首片保留，后续分片删 name 键），再规范化透传。
+	// 先按 index 收敛 tool_calls name/id（每 index 仅首片保留），再规范化透传。
 	stripToolCallNames(obj, s.tools, s.toolCallSeen)
+	stripToolCallIDs(obj, s.tools, s.toolCallIDs)
+	s.trackFinishReason(obj)
 	s.continueMessageID(obj)
 	s.trackMaxToolIdx(obj)
 
@@ -1411,7 +1508,7 @@ func (s *streamWriter) finish(validFrames *int) error {
 	switch {
 	case *validFrames == 0:
 		_ = s.writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
-	case !s.sawDone:
+	case !s.sawDone && !s.sawFinish:
 		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
@@ -1422,7 +1519,7 @@ func (s *streamWriter) finish(validFrames *int) error {
 	switch {
 	case *validFrames == 0:
 		return errEmptyStream
-	case !s.sawDone:
+	case !s.sawDone && !s.sawFinish:
 		return errTruncatedStream
 	default:
 		return nil

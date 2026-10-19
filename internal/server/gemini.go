@@ -107,15 +107,16 @@ func newGeminiChatInput(
 	}
 
 	return chatInput{
-		body:      converted,
-		stream:    stream,
-		model:     model,
-		clientIP:  upstream.ExtractClientIP(r),
-		convReqID: r.Header.Get("X-Conversation-Request-Id"),
-		traceID:   r.Header.Get("X-Trace-Id"),
-		trace:     requestTraceFrom(r),
-		keyUsage:  keyUsageFrom(r.Context()),
-		keyRealm:  keyRealmFrom(r.Context()),
+		body:           converted,
+		stream:         stream,
+		model:          model,
+		clientIP:       upstream.ExtractClientIP(r),
+		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
+		traceID:        r.Header.Get("X-Trace-Id"),
+		inboundSession: inboundSessionMetaFrom(r),
+		trace:          requestTraceFrom(r),
+		keyUsage:       keyUsageFrom(r.Context()),
+		keyRealm:       keyRealmFrom(r.Context()),
 	}, &geminiResponder{
 		w: w, model: model, keepalive: keepalive,
 	}, true

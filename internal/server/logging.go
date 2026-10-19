@@ -141,6 +141,10 @@ func (s *chatStat) done() {
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
+	hasContent          bool
+	hasToolCall         bool
+	hasRefusal          bool
+	finishReason        string
 	br                  *bufio.Reader
 	src                 io.Closer // 底层上游 body（可为 nil）；Close 透传以解除异步读取阻塞
 	start               time.Time
@@ -244,10 +248,27 @@ type sseUsageFrame struct {
 	PromptCacheMissTok   *int     `json:"prompt_cache_miss_tokens"`
 }
 
-// sseChunkFrame SSE data 帧的最小解析形态：error 原文 + usage。
+// sseDeltaFrame 流式增量中与「是否产生实质输出」相关的字段。
+type sseDeltaFrame struct {
+	Content          *string         `json:"content"`
+	ReasoningContent *string         `json:"reasoning_content"`
+	Reasoning        *string         `json:"reasoning"`
+	Refusal          *string         `json:"refusal"`
+	ToolCalls        json.RawMessage `json:"tool_calls"`
+}
+
+// sseChoiceFrame 单个 choice 的收尾与增量形态。
+type sseChoiceFrame struct {
+	Delta        sseDeltaFrame `json:"delta"`
+	Message      sseDeltaFrame `json:"message"`
+	FinishReason *string       `json:"finish_reason"`
+}
+
+// sseChunkFrame SSE data 帧的最小解析形态：error 原文 + usage + 输出健康度。
 type sseChunkFrame struct {
-	Error json.RawMessage `json:"error"`
-	Usage *sseUsageFrame  `json:"usage"`
+	Error   json.RawMessage  `json:"error"`
+	Usage   *sseUsageFrame   `json:"usage"`
+	Choices []sseChoiceFrame `json:"choices"`
 }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
@@ -268,11 +289,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 
 	var chunk sseChunkFrame
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
-		if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
-			s.errorFrame = true
-		}
-
+	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return
 	}
 
@@ -280,8 +297,54 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.errorFrame = true
 	}
 
-	s.applyUsage(chunk.Usage)
+	s.noteChoices(chunk.Choices)
+
+	if chunk.Usage != nil {
+		s.applyUsage(chunk.Usage)
+	}
 }
+
+// noteChoices 记录流式输出健康度：是否有实质输出与最终 finish_reason。
+func (s *chatStatsReader) noteChoices(choices []sseChoiceFrame) {
+	for i := range choices {
+		c := &choices[i]
+		s.noteDelta(&c.Delta)
+		s.noteDelta(&c.Message)
+
+		if c.FinishReason != nil && *c.FinishReason != "" {
+			s.finishReason = *c.FinishReason
+		}
+	}
+}
+
+// noteDelta 合并单个增量/完整消息的实质输出标记。
+func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
+	if delta.Content != nil && *delta.Content != "" {
+		s.hasContent = true
+	}
+
+	if delta.Refusal != nil && *delta.Refusal != "" {
+		s.hasRefusal = true
+	}
+
+	if tc := strings.TrimSpace(string(delta.ToolCalls)); tc != "" && tc != "null" && tc != "[]" {
+		s.hasToolCall = true
+	}
+}
+
+// HasSubstantiveOutput 报告流中是否产生正文、工具调用或拒答。
+// 仅有 reasoning/reasoning_content 的流不算完成的回答。
+func (s *chatStatsReader) HasSubstantiveOutput() bool {
+	return s.hasContent || s.hasToolCall || s.hasRefusal
+}
+
+// FailedFinish 报告流是否以下游无法消费的 finish_reason 结束且没有实质输出。
+func (s *chatStatsReader) FailedFinish() bool {
+	return !s.HasSubstantiveOutput() && (s.finishReason == "error" || s.finishReason == "length")
+}
+
+// FinishReason 返回最近一个非空 finish_reason（空 = 未观测到）。
+func (s *chatStatsReader) FinishReason() string { return s.finishReason }
 
 // applyUsage 把末帧 usage 的非空字段写入统计（缺失字段不动，保留上一帧值）。
 func (s *chatStatsReader) applyUsage(sseUsageFrame2 *sseUsageFrame) {

@@ -5,7 +5,7 @@
   "state_file": "./data/state.json",
   "server": {
     "read_timeout": "300s",
-    "max_body_bytes": 16777216,
+    "max_body_bytes": 33554432,
     "request_accept_grace_seconds": 0,
     "shutdown_grace_seconds": 30,
     "cors_origins": [],
@@ -74,8 +74,8 @@
   },
   "upstream": {
     "timeout_seconds": 120,
-    "header_timeout_seconds": 120,
-    "idle_timeout_seconds": 300,
+    "header_timeout_seconds": 1200,
+    "idle_timeout_seconds": 1200,
     "keepalive_interval": "0",
     "model_timeouts": {},
     "user_agent": "",

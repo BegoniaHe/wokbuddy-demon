@@ -302,12 +302,12 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 		t.Errorf("timeout_seconds=%d want 120", config.Upstream.TimeoutSeconds)
 	}
 
-	if config.Upstream.HeaderTimeoutSeconds != 120 {
-		t.Errorf("header_timeout_seconds=%d want fallback 120", config.Upstream.HeaderTimeoutSeconds)
+	if config.Upstream.HeaderTimeoutSeconds != 1200 {
+		t.Errorf("header_timeout_seconds=%d want fallback 1200", config.Upstream.HeaderTimeoutSeconds)
 	}
 
-	if config.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", config.Upstream.IdleTimeoutSeconds)
+	if config.Upstream.IdleTimeoutSeconds != 1200 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 1200", config.Upstream.IdleTimeoutSeconds)
 	}
 }
 
@@ -323,12 +323,12 @@ func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if config.Upstream.HeaderTimeoutSeconds != 60 {
-		t.Errorf("header_timeout_seconds=%d want fallback 60", config.Upstream.HeaderTimeoutSeconds)
+	if config.Upstream.HeaderTimeoutSeconds != 1200 {
+		t.Errorf("header_timeout_seconds=%d want fallback 1200", config.Upstream.HeaderTimeoutSeconds)
 	}
 
-	if config.Upstream.IdleTimeoutSeconds != 300 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 300", config.Upstream.IdleTimeoutSeconds)
+	if config.Upstream.IdleTimeoutSeconds != 1200 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 1200", config.Upstream.IdleTimeoutSeconds)
 	}
 }
 
@@ -1135,14 +1135,14 @@ func TestDailyLimitsConfig(t *testing.T) {
 	}
 }
 
-// TestServerMaxBodyBytes 聊天入口请求体上限（issue #86）：默认 16 MiB，
+// TestServerMaxBodyBytes 聊天入口请求体上限（issue #86）：默认 32 MiB，
 // 0 = 不限制，负值 fail fast。
 func TestServerMaxBodyBytes(t *testing.T) {
 	t.Parallel()
 
 	config := Default()
-	if config.Server.MaxBodyBytes != 16<<20 {
-		t.Errorf("default max_body_bytes=%d want %d", config.Server.MaxBodyBytes, 16<<20)
+	if config.Server.MaxBodyBytes != 32<<20 {
+		t.Errorf("default max_body_bytes=%d want %d", config.Server.MaxBodyBytes, 32<<20)
 	}
 
 	if err := config.normalize(); err != nil {

@@ -13,7 +13,7 @@ func TestGrowthStreakParsesDays(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/activity/growth/streak" {
+		if r.URL.Path != "/v2/activity/growth/streak" && r.URL.Path != "/activity/growth/streak" {
 			t.Errorf("path=%s want /activity/growth/streak", r.URL.Path)
 		}
 

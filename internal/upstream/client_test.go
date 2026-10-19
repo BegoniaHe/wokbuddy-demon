@@ -799,8 +799,8 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 func assertV3ConfigHeaders(t *testing.T, r *http.Request) {
 	t.Helper()
 
-	if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-		t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+	if ua := r.Header.Get("User-Agent"); ua != codeBuddyIDEUA && !strings.Contains(ua, "WorkBuddy/") {
+		t.Errorf("v3/config UA=%q want IDE or desktop UA", ua)
 	}
 
 	if r.Header.Get("X-Product") != "SaaS" {

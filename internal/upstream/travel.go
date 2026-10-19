@@ -41,9 +41,25 @@ type TravelState struct {
 }
 
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
+// /v2 前缀优先（官方 Bearer 通道），仅 404 时回落无 /v2 旧路径。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
-func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
-	return c.domainJSON(a, c.chatBase(a), method, path, body)
+func (c *Client) growthJSON(account *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	data, err := c.growthJSONPath(account, method, "/v2"+path, body, nil)
+	if err == nil {
+		return data, nil
+	}
+
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrNotFound {
+		return nil, err
+	}
+
+	return c.growthJSONPath(account, method, path, body, nil)
+}
+
+// growthJSONPath 单路径 growth 请求，可附加额外请求头。
+func (c *Client) growthJSONPath(account *auth.Auth, method, path string, body any, headers map[string]string) (json.RawMessage, error) {
+	return c.domainJSONLimitHeaders(account, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers)
 }
 
 // TravelStatus 查询猫猫旅行状态。
@@ -68,9 +84,31 @@ func (c *Client) TravelDepart(a *auth.Auth, locationID int) error {
 }
 
 // TravelClaim 领取到站奖励，返回 reward_credit。
-func (c *Client) TravelClaim(a *auth.Auth, recordID int64) (int64, error) {
-	data, err := c.growthJSON(a, http.MethodPost, travelClaimPath, map[string]any{"record_id": recordID})
+// 官方客户端存在两种请求形态：带 record_id 与空 body。带 record_id 收到参数错误
+// 或 404 时，用空 body 重试一次；两种都失败时返回原始错误。
+func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) {
+	headers := map[string]string{"X-Product-Code": "workbuddy"}
+	lastPath := "/v2" + travelClaimPath
+
+	data, err := c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers)
+	firstErr := err
+
+	if err != nil && isKind(err, ErrNotFound) {
+		lastPath = travelClaimPath
+		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers)
+	}
+
+	if err != nil && claimNeedsEmptyBody(err) {
+		if emptyData, emptyErr := c.growthJSONPath(account, http.MethodPost, lastPath, nil, headers); emptyErr == nil {
+			data, err = emptyData, nil
+		}
+	}
+
 	if err != nil {
+		if firstErr != nil {
+			return 0, firstErr
+		}
+
 		return 0, err
 	}
 
@@ -150,6 +188,23 @@ func (c *Client) GrowthStreak(a *auth.Auth) (int, error) {
 	}
 
 	return resp.Streak.Days, nil
+}
+
+// isKind 判断上游错误分类是否为目标类型。
+func isKind(err error, kind ErrKind) bool {
+	var upstreamErr *Error
+
+	return errors.As(err, &upstreamErr) && upstreamErr.Kind == kind
+}
+
+// claimNeedsEmptyBody 判定 claim 是否需要空 body 重试：404 或参数错误。
+func claimNeedsEmptyBody(err error) bool {
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) {
+		return false
+	}
+
+	return upstreamErr.Kind == ErrNotFound || upstreamErr.Status == http.StatusBadRequest
 }
 
 // IsBuddyTaskIncomplete 判定「领养门槛未达标」：HTTP 400 + first_buddy 关键词。

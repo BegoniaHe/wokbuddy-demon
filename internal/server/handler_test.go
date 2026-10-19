@@ -1524,9 +1524,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	// 一轮探测 = 2 次上游调用（企业端点 + /v3/config 并发，两路全失败才进负缓存）。
-	if got := calls.Load(); got != 2 {
-		t.Errorf("want 2 probes (console + v3), got %d", got)
+	// 一轮探测 = 4 次上游调用（企业 /console + /v2 兜底 + 桌面/IDE 两路 /v3，全部失败才进负缓存）。
+	if got := calls.Load(); got != 4 {
+		t.Errorf("want 4 probes (console + v2 + desktop/IDE v3), got %d", got)
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1541,8 +1541,8 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
 
-	if got := calls.Load(); got != 4 {
-		t.Errorf("want 4 probes after cooldown (2 rounds x 2), got %d", got)
+	if got := calls.Load(); got != 8 {
+		t.Errorf("want 8 probes after cooldown (2 rounds x 4), got %d", got)
 	}
 }
 

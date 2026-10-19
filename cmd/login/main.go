@@ -36,10 +36,10 @@ import (
 	auth2 "github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
+// 上游常量：CN → www.workbuddy.cn（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
 // （base 与 Origin/Referer 同域）。端点 URL 由 realmConfig 按 realm 动态拼出，不再硬编码。
 const (
-	upstreamBaseCN      = "https://copilot.tencent.com"
+	upstreamBaseCN      = "https://www.workbuddy.cn"
 	upstreamBaseGlobal  = "https://www.workbuddy.ai"
 	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
 	originRefererCN     = "https://www.codebuddy.cn"
@@ -60,16 +60,27 @@ var (
 	errRealmRequiresAValue      = errors.New("--realm requires a value")
 	errParseRealmArgsFailed     = errors.New("parseRealmArgs failed")
 	errValidateRealmMatchFailed = errors.New("validateRealmMatch failed")
+	errLoginPending             = errors.New("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
 )
 
 // realmConfig 按 realm 返回上游 base 与 Origin/Referer origin：global →
-// (www.workbuddy.ai, www.workbuddy.ai)；cn/非法/缺省 → (copilot.tencent.com, codebuddy.cn)。
+// (www.workbuddy.ai, www.workbuddy.ai)；cn/非法/缺省 → (www.workbuddy.cn, codebuddy.cn)。
 func realmConfig(realm string) (base, origin string) {
 	if realm == realmGlobal {
 		return upstreamBaseGlobal, originRefererGlobal
 	}
 
 	return upstreamBaseCN, originRefererCN
+}
+
+// realmBases 返回该 realm 的 origin 候选顺序。CN 默认主域 + 兜底；显式自定义
+// base（测试/自建）只返回该 base。global 单 base。
+func realmBases(realm, base string) []string {
+	if realm == realmGlobal || base != upstreamBaseCN {
+		return []string{base}
+	}
+
+	return []string{upstreamBaseCN, "https://copilot.tencent.com", "https://wb.tencentbuddy.com"}
 }
 
 // authPlatform 按 realm 返回 auth/state 的 platform 查询参数值。官方桌面端取
@@ -283,11 +294,27 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
 func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
 	headers := noAuthHeaders(commonHeaders(origin))
-	url := base + "/v2/plugin/auth/state?platform=" + authPlatform(realm)
 
-	data, _, err := doJSON(client, http.MethodPost, url, headers, bytes.NewReader([]byte("{}")))
-	if err != nil {
-		fatalf("auth state failed: %v", err)
+	var data []byte
+
+	var lastErr error
+
+	for _, candidate := range realmBases(realm, base) {
+		url := candidate + "/v2/plugin/auth/state?platform=" + authPlatform(realm)
+
+		var err error
+
+		data, _, err = doJSON(client, http.MethodPost, url, headers, bytes.NewReader([]byte("{}")))
+		if err == nil {
+			lastErr = nil
+			break
+		}
+
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		fatalf("auth state failed: %v", lastErr)
 	}
 
 	var item struct {
@@ -318,9 +345,12 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 	headers := commonHeaders(origin)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
-	tok := pollToken(base, loginState2.State, noAuthHeaders(headers), client)
+	tok, usedBase, err := pollTokenWithFallback(base, realm, loginState2.State, headers, client)
+	if err != nil {
+		fatalf("%v", err)
+	}
 	// login/account 拿 uid/nickname（带 Bearer）
-	acct := pollAccount(base, loginState2.State, tok.AccessToken, headers, client)
+	acct := pollAccount(usedBase, loginState2.State, tok.AccessToken, headers, client)
 
 	oraw, oerr := json.Marshal(buildLoginOutput(tok, realm, acct))
 	if oerr != nil {
@@ -329,6 +359,28 @@ func runPoll(base, origin, realm, statePath string, client *http.Client, out io.
 
 	fmt.Fprintln(out, string(oraw))
 	os.Remove(statePath)
+}
+
+// pollTokenWithFallback 按 origin 候选拉取 token，仅在传输/网关错误时切换。
+func pollTokenWithFallback(base, realm, state string, headers func(*http.Request), client *http.Client) (tokenBundle, string, error) {
+	var lastErr error
+
+	for _, candidate := range realmBases(realm, base) {
+		tok, status, err := pollTokenOnce(candidate, state, noAuthHeaders(headers), client)
+		if err == nil {
+			return tok, candidate, nil
+		}
+
+		lastErr = err
+
+		if status != 0 && status < 500 && status != http.StatusRequestTimeout &&
+			status != http.StatusBadGateway && status != http.StatusServiceUnavailable &&
+			status != http.StatusGatewayTimeout {
+			break
+		}
+	}
+
+	return tokenBundle{}, "", lastErr
 }
 
 // loadLoginState 读取并解析 state 文件，校验 realm 与命令行 --realm 一致（防混域），
@@ -351,24 +403,23 @@ func loadLoginState(statePath, realm string) loginState {
 	return loginState2
 }
 
-// pollToken 向 token 端点 GET 一次：pending（业务 code 非 0）或服务端错误时 fatal，
-// 成功返回 token bundle。
-func pollToken(base, state string, headers func(*http.Request), client *http.Client) tokenBundle {
+// pollTokenOnce 单 origin 拉取 token；transient 错误返回给调用方决定是否换 origin。
+func pollTokenOnce(base, state string, headers func(*http.Request), client *http.Client) (tokenBundle, int, error) {
 	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil)
 	if errTok != nil {
 		if status == 0 || status >= 500 {
-			fatalf("token endpoint error: %v", errTok)
+			return tokenBundle{}, status, fmt.Errorf("token endpoint error: %w", errTok)
 		}
 
-		fatalf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+		return tokenBundle{}, status, fmt.Errorf("%w: %w", errLoginPending, errTok)
 	}
 
 	var tok tokenBundle
 	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
-		fatalf("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+		return tokenBundle{}, status, errLoginPending
 	}
 
-	return tok
+	return tok, status, nil
 }
 
 // pollAccount 带 Bearer 拉取 login/account；失败时返回零值（与旧行为一致，不中断输出）。
