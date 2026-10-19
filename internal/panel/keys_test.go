@@ -238,3 +238,20 @@ func TestKeysCreateRejectsMalformedJSON(t *testing.T) {
 		t.Fatalf("malformed request created keys: %+v", keys)
 	}
 }
+
+// TestKeysCreateRejectsEmptyBody 空 body 同样视为无效请求，避免无 body 的 POST
+// 静默创建默认名密钥。前端始终发送 {"name": ...}，不受影响。
+func TestKeysCreateRejectsEmptyBody(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+	panel := panelWithKeys(store)
+
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", ""); code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", code, body)
+	}
+
+	if keys := store.List(); len(keys) != 0 {
+		t.Fatalf("empty body created keys: %+v", keys)
+	}
+}
