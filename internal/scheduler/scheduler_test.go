@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -238,13 +239,36 @@ func hasKind(kinds []taskKind, k taskKind) bool {
 
 // fakeUpstream 同时模拟 billing 与 refresh。
 type fakeUpstream struct {
-	checkinCalls   atomic.Int32
-	checkinMu      sync.Mutex
-	checkinAt      []time.Time
-	refreshCalls   atomic.Int32
-	travelCalls    atomic.Int32
-	resourceRemain int64
-	resourceEnd    string
+	checkinCalls     atomic.Int32
+	checkinMu        sync.Mutex
+	checkinAt        []time.Time
+	refreshCalls     atomic.Int32
+	travelCalls      atomic.Int32
+	resourceCalls    atomic.Int32
+	resourceInFlight atomic.Int32
+	resourcePeak     atomic.Int32
+	resourceDelay    time.Duration
+	resourceRemain   int64
+	resourceEnd      string
+}
+
+// beginResource 记录一次余额查询的并发峰值与调用数，返回递减在途计数的函数。
+func (f *fakeUpstream) beginResource() func() {
+	cur := f.resourceInFlight.Add(1)
+	for {
+		peak := f.resourcePeak.Load()
+		if cur <= peak || f.resourcePeak.CompareAndSwap(peak, cur) {
+			break
+		}
+	}
+
+	if f.resourceDelay > 0 {
+		time.Sleep(f.resourceDelay)
+	}
+
+	f.resourceCalls.Add(1)
+
+	return func() { f.resourceInFlight.Add(-1) }
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -257,6 +281,7 @@ func (f *fakeUpstream) server() *httptest.Server {
 			f.checkinMu.Unlock()
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
+			defer f.beginResource()()
 			// remain 需 <= size（取数钳 [0,size]：脏数据 remain>size 会被钳到 size
 			// ——上游真实数据恒一致，实测 Cycle{17,482,500}）。
 			end := ""
@@ -521,6 +546,38 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	// 禁用账号不参与：其 credits 保持 0（未被 UserResource 覆盖解冻）。
 	if st2, _ := state.Status("u2"); !st2.Disabled {
 		t.Errorf("u2 must stay disabled")
+	}
+}
+
+// TestRunBalanceRefreshNowBoundsConcurrency 余额刷新逐号上游调用必须有界：
+// 账号量大时不得一次性 fan-out 全部请求。用延迟保证并发窗口重叠，再断言峰值。
+func TestRunBalanceRefreshNowBoundsConcurrency(t *testing.T) {
+	t.Parallel()
+
+	const accounts = 20
+
+	fake := &fakeUpstream{resourceRemain: 1, resourceDelay: 20 * time.Millisecond}
+
+	srv := fake.server()
+	defer srv.Close()
+
+	state := pool.New("")
+
+	for i := range accounts {
+		uid := fmt.Sprintf("u%02d", i)
+		state.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	}
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(&Config{Pool: state, Upstream: up})
+	s.RunBalanceRefreshNow()
+
+	if got := fake.resourcePeak.Load(); got > balanceRefreshWorkers {
+		t.Fatalf("peak concurrency=%d want <= %d", got, balanceRefreshWorkers)
+	}
+
+	if got := fake.resourceCalls.Load(); got != accounts {
+		t.Fatalf("resource calls=%d want %d", got, accounts)
 	}
 }
 

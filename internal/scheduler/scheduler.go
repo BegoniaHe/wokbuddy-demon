@@ -831,6 +831,10 @@ func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
 		map[string]any{"credits": remain, "credit_floor": floor})
 }
 
+// balanceRefreshWorkers 余额刷新逐号上游调用的并发上限：导入上限 1000 个账号时
+// 无界 fan-out 会瞬时耗尽 fd 并打满上游限流。
+const balanceRefreshWorkers = 5
+
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits。
 // 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
@@ -840,6 +844,8 @@ func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
+
+	sem := make(chan struct{}, balanceRefreshWorkers)
 
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
@@ -856,9 +862,13 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			continue
 		}
 
+		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
+		sem <- struct{}{}
+
 		wg.Add(1)
 		go func(account4 *auth.Auth, uid string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 
 			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account4, expiringSoon)
 			if err != nil {
