@@ -258,6 +258,8 @@ func NewHandler(cfg *Config) *Handler {
 		handler.withRecovery(handler.withClientAuth(handler.anthropicCountTokensHandler)),
 	)
 	handler.mux.HandleFunc("GET /v1/models", handler.withRecovery(handler.withClientAuth(handler.models)))
+	handler.mux.HandleFunc("GET /v1/models/{model}", handler.withRecovery(handler.withClientAuth(handler.modelRetrieve)))
+	handler.registerGeminiRoutes()
 	handler.mux.HandleFunc("GET /status", handler.withRecovery(handler.withAuth(handler.status)))
 	handler.mux.HandleFunc("GET /healthz", handler.withRecovery(handler.healthz))
 	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
@@ -280,6 +282,16 @@ func NewHandler(cfg *Config) *Handler {
 	return handler
 }
 
+// registerGeminiRoutes 注册 Gemini CLI GATEWAY 模式的 models 动作端点：
+// 模型与动作同段（`/models/{model}:generateContent`），由 geminiModelsHandler
+// 按最后一个冒号拆分；v1beta 为 SDK 默认，其余版本兼容显式 API version。
+func (h *Handler) registerGeminiRoutes() {
+	for _, version := range []string{"v1beta", "v1alpha", "v1"} {
+		h.mux.HandleFunc("POST /"+version+"/models/{rest}",
+			h.withRecovery(h.withClientAuth(h.geminiModelsHandler)))
+	}
+}
+
 // ActiveStreams 返回当前在途 SSE 流数（供优雅关闭记录未排空情况，issue #19）。
 func (h *Handler) ActiveStreams() int { return h.streams.Active() }
 
@@ -291,9 +303,21 @@ func (h *Handler) BeginShutdown() { h.shuttingDown.Store(true) }
 // 鉴权存在性，也不暴露端点清单）。协议面（OpenAI 兼容 API）只承诺
 // POST /v1/chat/completions 与 GET /v1/models；其余一律落到这里。
 func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
+	message := "unknown endpoint: " + r.Method + " " + r.URL.Path
+
+	if requestsGemini(r) {
+		writeGeminiError(w, http.StatusNotFound, message, "")
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", message, "")
+		return
+	}
+
 	writeJSON(w, http.StatusNotFound, map[string]any{
 		"error": map[string]any{
-			"message": "unknown endpoint: " + r.Method + " " + r.URL.Path,
+			"message": message,
 			"type":    "invalid_request_error",
 		},
 	})
@@ -324,7 +348,7 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 
 		headers := r.Header.Get("Access-Control-Request-Headers")
 		if headers == "" {
-			headers = "Authorization, Content-Type, X-Requested-With"
+			headers = "Authorization, Content-Type, X-Requested-With, X-Api-Key, X-Goog-Api-Key, Anthropic-Version"
 		}
 
 		w.Header().Set("Access-Control-Allow-Headers", headers)
@@ -336,9 +360,11 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// isV1Path 仅匹配网关 API 面（/v1 及其子路径），管理面不参与 CORS。
+// isV1Path 仅匹配网关 API 面（/v1 及其子路径，含 Gemini 的 /v1beta、/v1alpha），
+// 管理面不参与 CORS。
 func isV1Path(path string) bool {
-	return path == "/v1" || strings.HasPrefix(path, "/v1/")
+	return path == "/v1" || strings.HasPrefix(path, "/v1/") ||
+		strings.HasPrefix(path, "/v1beta/") || strings.HasPrefix(path, "/v1alpha/")
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -347,7 +373,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
-		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/responses") {
+		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" ||
+			r.URL.Path == "/v1/responses" || requestsGemini(r)) {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r, h.cfg.TrustedProxies)
@@ -409,7 +436,12 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 // writeClientAuthError 按入站协议写出鉴权失败：Anthropic 端点用 Anthropic 错误体，
 // 其余保持 OpenAI 错误体。
 func writeClientAuthError(w http.ResponseWriter, r *http.Request) {
-	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+	if requestsGemini(r) {
+		writeGeminiError(w, http.StatusUnauthorized, "missing or invalid API key", "")
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") || requestsAnthropicModels(r) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key", "")
 		return
 	}
@@ -429,7 +461,12 @@ func writeClientAuthFailLimit(w http.ResponseWriter, r *http.Request, retry time
 	seconds := max(int((retry+time.Second-1)/time.Second), 1)
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 
-	if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+	if requestsGemini(r) {
+		writeGeminiError(w, http.StatusTooManyRequests, "too many authentication failures", "")
+		return
+	}
+
+	if strings.HasPrefix(r.URL.Path, "/v1/messages") || requestsAnthropicModels(r) {
 		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error",
 			"too many authentication failures", "")
 
@@ -600,11 +637,115 @@ const (
 
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
+// Anthropic SDK 固定带 anthropic-version 头，按 Anthropic 分页形态返回。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	list := h.modelList()
+	if requestsAnthropicModels(r) {
+		writeJSON(w, http.StatusOK, anthropicModelList(list))
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   list,
 	})
+}
+
+// modelRetrieve 返回单个模型（OpenAI `GET /v1/models/{model}` 与 Anthropic
+// `GET /v1/models/{model_id}` 共用；按请求头选择响应形态）。
+func (h *Handler) modelRetrieve(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("model")
+
+	for _, entry := range h.modelList() {
+		if stringValue(entry["id"]) == id {
+			if requestsAnthropicModels(r) {
+				writeJSON(w, http.StatusOK, anthropicModelEntry(entry))
+				return
+			}
+
+			writeJSON(w, http.StatusOK, entry)
+
+			return
+		}
+	}
+
+	if requestsAnthropicModels(r) {
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "model not found", "")
+		return
+	}
+
+	writeOpenAIError(w, http.StatusNotFound, "model_not_found", "model not found")
+}
+
+// requestsAnthropicModels 判断调用方是否按 Anthropic Models API 解析响应。
+func requestsAnthropicModels(r *http.Request) bool {
+	return strings.TrimSpace(r.Header.Get("Anthropic-Version")) != ""
+}
+
+// requestsGemini 判断请求是否走 Gemini GenerateContent 协议面（含 /v1 版本）。
+func requestsGemini(r *http.Request) bool {
+	path := r.URL.Path
+	if strings.HasPrefix(path, "/v1beta/") || strings.HasPrefix(path, "/v1alpha/") {
+		return true
+	}
+
+	return strings.Contains(path, ":generateContent") ||
+		strings.Contains(path, ":streamGenerateContent") ||
+		strings.Contains(path, ":countTokens")
+}
+
+// anthropicModelList 把 /v1/models 条目转成 Anthropic 分页形态。
+func anthropicModelList(entries []map[string]any) map[string]any {
+	data := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		data = append(data, anthropicModelEntry(entry))
+	}
+
+	var firstID, lastID any
+
+	if len(data) > 0 {
+		if first, ok := data[0].(map[string]any); ok {
+			firstID = first["id"]
+		}
+
+		if last, ok := data[len(data)-1].(map[string]any); ok {
+			lastID = last["id"]
+		}
+	}
+
+	return map[string]any{
+		"data": data, "has_more": false, "first_id": firstID, "last_id": lastID,
+	}
+}
+
+// anthropicModelEntry 把单个 OpenAI 模型条目转成 Anthropic ModelInfo。
+func anthropicModelEntry(entry map[string]any) map[string]any {
+	id := stringValue(entry["id"])
+
+	display := stringValue(entry["name"])
+	if display == "" {
+		display = id
+	}
+
+	created := intValue(entry["created"])
+	if created == 0 {
+		created = 1753600000
+	}
+
+	out := map[string]any{
+		"id": id, "type": "model", "display_name": display,
+		"created_at": time.Unix(int64(created), 0).UTC().Format(time.RFC3339),
+		"lifecycle":  "active",
+	}
+	if maxTokens := intValue(entry["max_output_tokens"]); maxTokens > 0 {
+		out["max_tokens"] = maxTokens
+	}
+
+	if maxInput := intValue(entry["context_length"]); maxInput > 0 {
+		out["max_input_tokens"] = maxInput
+	}
+
+	return out
 }
 
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
@@ -1985,25 +2126,11 @@ func (f *chatFlow) handleNonStreamSuccess(
 	rc.Close()
 
 	if err != nil {
-		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
-		// 上游流解析失败（空流 / EOF 截断，issue #105）：截断的 content 不是完整
-		// 回答，绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试
-		// （空流/截断是上游缺陷，换个号大概率能拿到完整流）；轮转耗尽才回 502。
-		// fail：释放本次在途租约（否则下一轮 heldUID 被覆盖后该账号名额永不归还）
-		// + 失败号正是粘性号时解绑。
-		f.fail(acct.UID)
-		f.st.status = http.StatusBadGateway
-		f.lastErr = fmt.Errorf("upstream_parse: %w", err)
-		log.Printf("WARN: [server] non-stream acct=%s model=%s: %v (rotating)",
-			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, err)
-
-		if !rotateBackoff(ctx, i) {
-			return rotBreak
+		if payload := upstream.ErrorFramePayload(err); payload != "" {
+			return f.handleNonStreamErrorFrame(ctx, acct, payload, attemptStarted, i)
 		}
 
-		f.rotateReason = "parse"
-
-		return rotContinue
+		return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
 	}
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
 	// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
@@ -2045,6 +2172,60 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	return rotDone
+}
+
+// retryNonStreamAggregateError 处置空流 / EOF 截断：截断的 content 不是完整回答，
+// 绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试；轮转耗尽才回 502。
+func (f *chatFlow) retryNonStreamAggregateError(
+	ctx context.Context, acct *auth.Auth, err error, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	// fail：释放本次在途租约（否则下一轮 heldUID 被覆盖后该账号名额永不归还）
+	// + 失败号正是粘性号时解绑。
+	f.fail(acct.UID)
+	f.st.status = http.StatusBadGateway
+	f.lastErr = fmt.Errorf("upstream_parse: %w", err)
+	log.Printf("WARN: [server] non-stream acct=%s model=%s: %v (rotating)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, err)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = "parse"
+
+	return rotContinue
+}
+
+// handleNonStreamErrorFrame 处置非流式聚合中遇到的上游 error 帧（HTTP 200 + error）：
+// 与流式路径同口径按帧内容分类，但非流式尚未向客户端写字节，可继续换号重试。
+// 请求级错误（内容拦截 / 上下文超限等）换号必然同样失败，直接透传。
+func (f *chatFlow) handleNonStreamErrorFrame(
+	ctx context.Context, acct *auth.Auth, payload string, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	kind := upstream.FrameKind(payload)
+	uerr := &upstream.Error{Kind: kind, Status: http.StatusOK, Msg: payload}
+
+	if failFastKind(kind) {
+		f.handleRequestLevelError(acct, kind, []byte(payload), uerr)
+		return rotDone
+	}
+
+	f.lastErr = uerr
+	f.h.applyErrorPolicy(acct.UID, kind, payload, f.realm, f.bareModel, nil)
+	f.fail(acct.UID)
+	log.Printf("WARN: [server] non-stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(payload, 200))
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = "error_frame"
+
+	return rotContinue
 }
 
 // notifyAccount 发送账号级告警（uid 由通知层截为 uid8；账号不存在时只带 uid）。

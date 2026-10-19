@@ -64,7 +64,12 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	obj, _ := iface.(map[string]any)
+
 	model, _ := obj["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", errModelIsRequired.Error(), "")
+		return
+	}
 	// 与 /v1/messages 同口径：白名单校验前先应用后台模型改写，避免同一模型在
 	// 两个端点上判定不一致。
 	if target := h.backgroundTarget(model); target != "" {
@@ -185,6 +190,7 @@ type anthropicRequest struct {
 	StopSequences []string          `json:"stop_sequences"`
 	Stream        bool              `json:"stream"`
 	Thinking      json.RawMessage   `json:"thinking"`
+	OutputConfig  json.RawMessage   `json:"output_config"`
 }
 
 // anthropicToOpenAI 把 Anthropic Messages 请求转换为 OpenAI chat/completions 请求体。
@@ -256,6 +262,13 @@ func buildOpenAIRequest(req *anthropicRequest) (map[string]any, error) {
 
 // applyAnthropicParams 映射采样参数、工具与 thinking 等可选字段。
 func applyAnthropicParams(out map[string]any, req *anthropicRequest) {
+	applyAnthropicSampling(out, req)
+	applyAnthropicTools(out, req)
+	applyAnthropicThinking(out, req)
+}
+
+// applyAnthropicSampling 映射 max_tokens / temperature / top_p / stop。
+func applyAnthropicSampling(out map[string]any, req *anthropicRequest) {
 	if req.MaxTokens > 0 {
 		out["max_tokens"] = req.MaxTokens
 	}
@@ -271,17 +284,79 @@ func applyAnthropicParams(out map[string]any, req *anthropicRequest) {
 	if len(req.StopSequences) > 0 {
 		out["stop"] = req.StopSequences
 	}
+}
 
+// applyAnthropicTools 映射 tools / tool_choice 与并行控制。
+func applyAnthropicTools(out map[string]any, req *anthropicRequest) {
 	if len(req.Tools) > 0 {
 		out["tools"] = anthropicTools(req.Tools)
 	}
 
-	if choice := anthropicToolChoice(req.ToolChoice); choice != nil {
-		out["tool_choice"] = choice
+	choice := anthropicToolChoice(req.ToolChoice)
+	if choice == nil {
+		return
 	}
 
+	out["tool_choice"] = choice
+	// Anthropic 把并行控制放在 tool_choice.disable_parallel_tool_use；
+	// chat/completions 用独立字段表达。
+	if anthropicDisableParallel(req.ToolChoice) {
+		out["parallel_tool_calls"] = false
+	}
+}
+
+// applyAnthropicThinking 映射 thinking 与 output_config。
+func applyAnthropicThinking(out map[string]any, req *anthropicRequest) {
 	if thinking := anthropicThinking(req.Thinking); thinking != nil {
 		out["thinking"] = thinking
+	}
+
+	effort, format := anthropicOutputConfig(req.OutputConfig)
+	if format != nil {
+		out["response_format"] = format
+	}
+
+	if effort != "" {
+		out["reasoning_effort"] = effort
+	}
+}
+
+// anthropicOutputConfig 读取 output_config.effort / output_config.format。
+// format 是 Anthropic 的结构化输出扩展，映射到 chat/completions response_format。
+func anthropicOutputConfig(raw json.RawMessage) (string, any) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return "", nil
+	}
+
+	var cfg struct {
+		Effort string         `json:"effort"`
+		Format map[string]any `json:"format"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return "", nil
+	}
+
+	format := anthropicJSONOutputFormat(cfg.Format)
+
+	return strings.TrimSpace(cfg.Effort), format
+}
+
+// anthropicJSONOutputFormat 把 Anthropic JSONOutputFormat 转成 chat response_format。
+func anthropicJSONOutputFormat(format map[string]any) any {
+	if format == nil || stringValue(format["type"]) != "json_schema" {
+		return nil
+	}
+
+	schema, ok := format["schema"]
+	if !ok {
+		return nil
+	}
+
+	return map[string]any{
+		"type": "json_schema",
+		"json_schema": map[string]any{
+			"name": "output", "schema": schema, "strict": true,
+		},
 	}
 }
 
@@ -437,26 +512,12 @@ func anthropicAssistantMessage(blocks []map[string]any) ([]any, error) {
 				texts = append(texts, text)
 			}
 		case "tool_use":
-			id, _ := block["id"].(string)
-			name, _ := block["name"].(string)
-
-			args, err := json.Marshal(block["input"])
+			call, err := anthropicToolUseCall(block)
 			if err != nil {
-				return nil, fmt.Errorf("tool_use input: %w", err)
+				return nil, err
 			}
 
-			if name == "" {
-				return nil, errToolUseNameIsRequired
-			}
-
-			toolCalls = append(toolCalls, map[string]any{
-				"id":   id,
-				"type": "function",
-				"function": map[string]any{
-					"name":      name,
-					"arguments": string(args),
-				},
-			})
+			toolCalls = append(toolCalls, call)
 		}
 	}
 
@@ -470,6 +531,35 @@ func anthropicAssistantMessage(blocks []map[string]any) ([]any, error) {
 	}
 
 	return []any{msg}, nil
+}
+
+// anthropicToolUseCall 把单个 tool_use 块转成 OpenAI tool_call。
+func anthropicToolUseCall(block map[string]any) (any, error) {
+	id, _ := block["id"].(string)
+
+	name, _ := block["name"].(string)
+	if name == "" {
+		return nil, errToolUseNameIsRequired
+	}
+
+	input := block["input"]
+	if input == nil {
+		input = map[string]any{}
+	}
+
+	args, err := json.Marshal(input)
+	if err != nil {
+		return nil, fmt.Errorf("tool_use input: %w", err)
+	}
+
+	return map[string]any{
+		"id":   id,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": string(args),
+		},
+	}, nil
 }
 
 // anthropicUserMessage 把 tool_result 拆成独立 tool 消息，其余文本/图片合并为 user。
@@ -490,11 +580,12 @@ func anthropicUserMessage(blocks []map[string]any) []any {
 			}
 		case "tool_result":
 			id, _ := block["tool_use_id"].(string)
-			content := anthropicText(block["content"])
+			text, images := anthropicToolResult(block["content"])
+			parts = append(parts, images...)
 			out = append(out, map[string]any{
 				"role":         "tool",
 				"tool_call_id": id,
-				"content":      content,
+				"content":      text,
 			})
 		}
 	}
@@ -508,6 +599,40 @@ func anthropicUserMessage(blocks []map[string]any) []any {
 	}
 
 	return out
+}
+
+// anthropicToolResult 拆分 tool_result.content：文本压成 tool 消息，图片转成
+// user content parts（Chat Completions 的 tool 消息不承载图片）。
+func anthropicToolResult(raw any) (string, []any) {
+	blocks, ok := raw.([]any)
+	if !ok {
+		return anthropicText(raw), nil
+	}
+
+	var texts []string
+
+	images := make([]any, 0)
+
+	for _, item := range blocks {
+		block, _ := item.(map[string]any)
+		if block == nil {
+			continue
+		}
+
+		if block["type"] == "image" {
+			if image := anthropicImagePart(block); image != nil {
+				images = append(images, image)
+			}
+
+			continue
+		}
+
+		if text := anthropicText(block); text != "" {
+			texts = append(texts, text)
+		}
+	}
+
+	return strings.Join(texts, "\n\n"), images
 }
 
 // anthropicImagePart 把 Anthropic image block 转为 OpenAI image_url part。
@@ -642,6 +767,22 @@ func anthropicToolChoice(raw json.RawMessage) any {
 	}
 }
 
+// anthropicDisableParallel 读取 tool_choice.disable_parallel_tool_use。
+func anthropicDisableParallel(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+
+	var choice struct {
+		DisableParallel bool `json:"disable_parallel_tool_use"`
+	}
+	if json.Unmarshal(raw, &choice) != nil {
+		return false
+	}
+
+	return choice.DisableParallel
+}
+
 // anthropicThinking 把 Anthropic thinking 开关映射为上游 thinking 字段。
 func anthropicThinking(raw json.RawMessage) map[string]any {
 	if len(raw) == 0 {
@@ -723,7 +864,18 @@ func anthropicMessageFromOpenAI(body any, model string) map[string]any {
 
 	if choice != nil {
 		msg, _ := choice["message"].(map[string]any)
-		if text, _ := msg["content"].(string); text != "" {
+		if reasoning := deltaReasoning(msg); reasoning != "" {
+			content = append(content, map[string]any{
+				"type": "thinking", "thinking": reasoning, "signature": "",
+			})
+		}
+
+		text := responsesMessageText(msg["content"])
+		if text == "" {
+			text = stringValue(msg["refusal"])
+		}
+
+		if text != "" {
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
 
@@ -764,11 +916,10 @@ func firstOpenAIChoice(obj map[string]any) map[string]any {
 
 // anthropicToolUseBlocks 把 OpenAI tool_calls 转为 Anthropic tool_use 块。
 func anthropicToolUseBlocks(raw any) []any {
-	calls, _ := raw.([]any)
+	calls := mapItems(raw)
 
 	out := make([]any, 0, len(calls))
-	for i, item := range calls {
-		call, _ := item.(map[string]any)
+	for i, call := range calls {
 		fn, _ := call["function"].(map[string]any)
 
 		name, _ := fn["name"].(string)
@@ -800,11 +951,23 @@ func anthropicToolUseBlocks(raw any) []any {
 // anthropicUsage 映射 token 计数；上游缺失时给 0（Anthropic 要求字段存在）。
 func anthropicUsage(raw any) map[string]any {
 	usage, _ := raw.(map[string]any)
+	input := intValue(usage["prompt_tokens"])
+	output := intValue(usage["completion_tokens"])
+	cached, cacheWrite := responsesCachedTokens(usage)
+	// Anthropic 的 input_tokens 不含缓存命中/写入；OpenAI 的 prompt_tokens 含。
+	input = max(input-cached-cacheWrite, 0)
 
-	return map[string]any{
-		"input_tokens":  intValue(usage["prompt_tokens"]),
-		"output_tokens": intValue(usage["completion_tokens"]),
+	usageOut := map[string]any{
+		"input_tokens":                input,
+		"output_tokens":               output,
+		"cache_creation_input_tokens": cacheWrite,
+		"cache_read_input_tokens":     cached,
 	}
+	if thinking := responsesReasoningTokens(usage); thinking > 0 {
+		usageOut["output_tokens_details"] = map[string]any{"thinking_tokens": thinking}
+	}
+
+	return usageOut
 }
 
 // anthropicStopReason 映射 OpenAI finish_reason → Anthropic stop_reason。
@@ -868,18 +1031,21 @@ type anthropicStreamWriter struct {
 	model  string
 	logger *log.Logger
 
-	pending      []byte
-	started      bool
-	errored      bool
-	finished     bool
-	blockOpen    bool
-	blockIndex   int
-	blockType    string // text / thinking / tool_use
-	toolIndex    int    // 当前活动工具块对应的 OpenAI delta.tool_calls index
-	toolBlocks   map[int]*anthropicToolBlock
-	stopReason   string
-	inputTokens  int
-	outputTokens int
+	pending         []byte
+	started         bool
+	errored         bool
+	finished        bool
+	blockOpen       bool
+	blockIndex      int
+	blockType       string // text / thinking / tool_use
+	toolIndex       int    // 当前活动工具块对应的 OpenAI delta.tool_calls index
+	toolBlocks      map[int]*anthropicToolBlock
+	stopReason      string
+	inputTokens     int
+	outputTokens    int
+	cachedTokens    int
+	cacheWrite      int
+	reasoningTokens int
 }
 
 func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStreamWriter {
@@ -1019,7 +1185,12 @@ func (a *anthropicStreamWriter) handleUpstreamError(errObj map[string]any) error
 
 // applyDelta 处理一个 choice delta 的文本、思考与工具调用增量。
 func (a *anthropicStreamWriter) applyDelta(delta map[string]any) error {
-	if text, _ := delta["content"].(string); text != "" {
+	text, _ := delta["content"].(string)
+	if text == "" {
+		text, _ = delta["refusal"].(string)
+	}
+
+	if text != "" {
 		if err := a.emitText(text, "text_delta", "text"); err != nil {
 			return err
 		}
@@ -1091,6 +1262,14 @@ func (a *anthropicStreamWriter) captureUsage(chunk map[string]any) {
 	if n := intValue(usage["completion_tokens"]); n > 0 {
 		a.outputTokens = n
 	}
+
+	if cached, cacheWrite := responsesCachedTokens(usage); cached > 0 || cacheWrite > 0 {
+		a.cachedTokens, a.cacheWrite = cached, cacheWrite
+	}
+
+	if n := responsesReasoningTokens(usage); n > 0 {
+		a.reasoningTokens = n
+	}
 }
 
 // emitText 追加文本/思考增量；块类型变化时先关闭旧块再开新块。
@@ -1118,9 +1297,7 @@ var errToolCallSkipped = errors.New("tool call without name")
 
 // emitToolCalls 处理 OpenAI delta.tool_calls：首片开 tool_use 块，后续片发参数增量。
 func (a *anthropicStreamWriter) emitToolCalls(raw any) error {
-	calls, _ := raw.([]any)
-	for _, item := range calls {
-		call, _ := item.(map[string]any)
+	for _, call := range mapItems(raw) {
 		idx := intValue(call["index"])
 
 		block, err := a.ensureToolBlock(idx, call)
@@ -1287,10 +1464,20 @@ func (a *anthropicStreamWriter) finish() error {
 		reason = "end_turn"
 	}
 
+	usage := map[string]any{
+		"input_tokens":                max(a.inputTokens-a.cachedTokens-a.cacheWrite, 0),
+		"output_tokens":               a.outputTokens,
+		"cache_creation_input_tokens": a.cacheWrite,
+		"cache_read_input_tokens":     a.cachedTokens,
+	}
+	if a.reasoningTokens > 0 {
+		usage["output_tokens_details"] = map[string]any{"thinking_tokens": a.reasoningTokens}
+	}
+
 	if err := a.event("message_delta", map[string]any{
 		"type":  "message_delta",
 		"delta": map[string]any{"stop_reason": reason, "stop_sequence": nil},
-		"usage": map[string]any{"output_tokens": a.outputTokens},
+		"usage": usage,
 	}); err != nil {
 		return err
 	}
@@ -1337,13 +1524,23 @@ func stringValue(v any) string {
 	return s
 }
 
-// intValue 读取 JSON 数字（float64）并转 int。
+// intValue 读取 JSON/内部数值并转 int。内部聚合层会把 created 与模型目录字段
+// 构造成 int64，不能只认 JSON 解码的 float64。
 func intValue(v any) int {
 	switch n := v.(type) {
 	case float64:
 		return int(n)
 	case int:
 		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		parsed, err := n.Int64()
+		if err != nil {
+			return 0
+		}
+
+		return int(parsed)
 	default:
 		return 0
 	}

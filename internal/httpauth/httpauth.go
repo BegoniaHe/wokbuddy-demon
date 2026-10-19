@@ -1,4 +1,4 @@
-// Package httpauth 网关与面板共用的 Bearer 鉴权原语。
+// Package httpauth 网关与面板共用的 Bearer / X-Api-Key 鉴权原语。
 //
 // 单独成包的原因：server（/v1/*、/status）与 panel（/panel/api/*）两处鉴权
 // 必须完全同口径——此前各自复制了一份"字符串直接比较"的实现，既容易漂移，
@@ -15,7 +15,7 @@ import (
 // bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
 const bearerPrefix = "Bearer "
 
-// VerifyBearer 校验请求头是否携带正确的 Bearer 密钥。
+// VerifyBearer 校验请求头是否携带正确的 Bearer 密钥（或 Anthropic 客户端的 X-Api-Key）。
 //
 // key 为空表示"未启用鉴权"，恒返回 true（调用方据此放行）。
 // 比较用 SHA-256 摘要 + subtle.ConstantTimeCompare：
@@ -89,15 +89,22 @@ func Authenticate(r *http.Request, defaultKey string, keys []Key) AuthResult {
 	return AuthResult{OK: false, KeyID: "", IsDefault: false}
 }
 
-// bearerToken 从 Authorization 头提取 Bearer token；缺头或方案不符返回空串
-// （调用方仍会摘要后参与比较，保持耗时形状一致）。
+// bearerToken 从 Authorization 头提取 Bearer token；缺头或方案不符时回退到
+// Anthropic 客户端使用的 X-Api-Key 头。两者都缺失返回空串（调用方仍会摘要后
+// 参与比较，保持耗时形状一致）。
 func bearerToken(r *http.Request) string {
 	authz := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authz, bearerPrefix) {
-		return ""
+	if strings.HasPrefix(authz, bearerPrefix) {
+		return authz[len(bearerPrefix):]
 	}
 
-	return authz[len(bearerPrefix):]
+	// Anthropic SDK 在 api_key 模式下只发 x-api-key；Gemini CLI/SDK 发
+	// x-goog-api-key。与 Bearer 同口径比较，不新增第二条鉴权路径。
+	if key := strings.TrimSpace(r.Header.Get("X-Api-Key")); key != "" {
+		return key
+	}
+
+	return strings.TrimSpace(r.Header.Get("X-Goog-Api-Key"))
 }
 
 // digest 返回 s 的 SHA-256（定长 32 字节，供常量时间比较）。

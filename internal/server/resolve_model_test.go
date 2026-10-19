@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,6 +141,104 @@ func TestModelsEndpointIncludesAliases(t *testing.T) {
 		if m["upstream_id"] != upstreamID {
 			t.Errorf("%s upstream_id=%v, want %s", id, m["upstream_id"], upstreamID)
 		}
+	}
+}
+
+func modelsTestHandler() *Handler {
+	return NewHandler(&Config{
+		Pool:     testPoolWith(),
+		Upstream: upstream.New(),
+		ModelAliases: map[string]string{
+			"claude-sonnet-4-5": "cn:hy4",
+		},
+	})
+}
+
+func doModelsRequest(handler *Handler, path string, anthropic bool) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	if anthropic {
+		req.Header.Set("Anthropic-Version", "2023-06-01")
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	return rec
+}
+
+// TestModelsRetrieveOpenAI 覆盖 OpenAI SDK 的 models.retrieve。
+func TestModelsRetrieveOpenAI(t *testing.T) {
+	t.Parallel()
+
+	rec := doModelsRequest(modelsTestHandler(), "/v1/models/claude-sonnet-4-5", false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+
+	if entry["id"] != "claude-sonnet-4-5" || entry["object"] != "model" {
+		t.Errorf("entry=%v", entry)
+	}
+}
+
+// TestModelsRetrieveAnthropic 覆盖 Anthropic SDK 的 models.retrieve 形态。
+func TestModelsRetrieveAnthropic(t *testing.T) {
+	t.Parallel()
+
+	rec := doModelsRequest(modelsTestHandler(), "/v1/models/claude-sonnet-4-5", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var entry map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
+		t.Fatal(err)
+	}
+
+	if entry["type"] != "model" || entry["display_name"] != "claude-sonnet-4-5" || entry["lifecycle"] != "active" {
+		t.Errorf("entry=%v", entry)
+	}
+}
+
+// TestModelsListAnthropic Anthropic SDK models.list 的分页字段与条目类型。
+func TestModelsListAnthropic(t *testing.T) {
+	t.Parallel()
+
+	rec := doModelsRequest(modelsTestHandler(), "/v1/models", true)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var page struct {
+		Data    []map[string]any `json:"data"`
+		HasMore bool             `json:"has_more"`
+		FirstID string           `json:"first_id"`
+		LastID  string           `json:"last_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(page.Data) != 1 || page.Data[0]["type"] != "model" || page.HasMore {
+		t.Fatalf("page=%v", page)
+	}
+
+	if page.FirstID != "claude-sonnet-4-5" || page.LastID != "claude-sonnet-4-5" {
+		t.Errorf("pagination first=%q last=%q", page.FirstID, page.LastID)
+	}
+}
+
+// TestModelsRetrieveMissing 未收录模型返回 OpenAI 错误信封。
+func TestModelsRetrieveMissing(t *testing.T) {
+	t.Parallel()
+
+	rec := doModelsRequest(modelsTestHandler(), "/v1/models/missing", false)
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "model_not_found") {
+		t.Errorf("code=%d body=%s", rec.Code, rec.Body)
 	}
 }
 

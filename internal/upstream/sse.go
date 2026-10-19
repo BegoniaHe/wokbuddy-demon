@@ -31,7 +31,29 @@ var (
 	errEmptyStream     = errors.New("upstream stream contained no valid data events")
 	errTruncatedStream = errors.New("upstream stream ended without [DONE]")
 	errClientWrite     = errors.New("client write failed")
+	errErrorFrame      = errors.New("upstream stream returned an error frame")
 )
+
+// FrameError 上游以 `data: {"error":...}` 帧报错（HTTP 200 + error 帧）。
+// 非流式聚合必须识别并上抛，否则会被当成空 content 的成功响应。
+type FrameError struct {
+	Payload string
+}
+
+func (e *FrameError) Error() string { return errErrorFrame.Error() + ": " + e.Payload }
+func (e *FrameError) Unwrap() error { return errErrorFrame }
+
+// IsErrorFrameError 报告错误是否为上游 error 帧。
+func IsErrorFrameError(err error) bool { return errors.Is(err, errErrorFrame) }
+
+// ErrorFramePayload 返回 error 帧原始 JSON；非该类型返回空串。
+func ErrorFramePayload(err error) string {
+	if frame, ok := errors.AsType[*FrameError](err); ok {
+		return frame.Payload
+	}
+
+	return ""
+}
 
 // IsEmptyStreamError 报告错误是否为「上游空流」（无有效 SSE 帧）——供 handler
 // 在流式路径把空流记为失败观测（HTTP 头已发出只能 200，但日志/状态应收敛到
@@ -117,6 +139,7 @@ type streamAggregator struct {
 	created       float64
 	content       strings.Builder
 	reasoning     strings.Builder
+	refusal       strings.Builder
 	role          string
 	finishReason  string
 	usage         map[string]any
@@ -170,6 +193,15 @@ func (a *streamAggregator) handleLine(line string) (bool, error) {
 
 // handleChunk 并入一个数据帧的顶层字段与 choices。聚合超限返回错误（issue #113）。
 func (a *streamAggregator) handleChunk(chunk map[string]any) error {
+	if errObj, ok := chunk["error"]; ok && errObj != nil {
+		payload, err := json.Marshal(chunk)
+		if err != nil {
+			return fmt.Errorf("marshal error frame: %w", err)
+		}
+
+		return &FrameError{Payload: string(payload)}
+	}
+
 	a.mergeChunkMeta(chunk)
 
 	ch, ok := chunk["choices"].([]any)
@@ -253,6 +285,10 @@ func (a *streamAggregator) handleDelta(delta map[string]any) error {
 		a.reasoning.WriteString(rc)
 	}
 
+	if refusal, ok := delta["refusal"].(string); ok {
+		a.refusal.WriteString(refusal)
+	}
+
 	if tcs, ok := delta["tool_calls"].([]any); ok {
 		if err := a.mergeToolCallsChunk(tcs); err != nil {
 			return err
@@ -283,6 +319,10 @@ func (a *streamAggregator) mergeMessageFields(msg map[string]any) error {
 		}
 
 		a.reasoning.WriteString(rc)
+	}
+
+	if refusal, ok := msg["refusal"].(string); ok {
+		a.refusal.WriteString(refusal)
 	}
 
 	if tcs, ok := msg["tool_calls"].([]any); ok {
@@ -466,6 +506,10 @@ func (a *streamAggregator) result() (map[string]any, error) {
 		message["reasoning_content"] = a.reasoning.String()
 	}
 
+	if a.refusal.Len() > 0 {
+		message["refusal"] = a.refusal.String()
+	}
+
 	a.attachToolCalls(message)
 
 	resp := map[string]any{
@@ -636,6 +680,10 @@ func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool)
 			}
 
 			idx := tools.resolve(table)
+			// OpenAI 流要求每片 tool_call 带 index；上游省略时按解析结果补齐，
+			// 否则 SDK 的累加器拿到 None index 会丢调用。写 float64 与 JSON 解码
+			// 形态一致：trackMaxToolIdx 等下游按 float64 读取。
+			table["index"] = float64(idx)
 			if seen[idx] {
 				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
 				if fn, _ := table["function"].(map[string]any); fn != nil {

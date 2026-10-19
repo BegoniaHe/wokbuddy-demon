@@ -57,6 +57,39 @@ func TestVerifyBearerWithoutHeaderStillCompares(t *testing.T) {
 	}
 }
 
+// TestVerifyBearerAcceptXAPIKey Anthropic SDK 的 api_key 模式只发 x-api-key，
+// 与 Bearer 同口径比较；Authorization 优先。
+func TestVerifyBearerAcceptXAPIKey(t *testing.T) {
+	t.Parallel()
+
+	r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+	r.Header.Set("X-Api-Key", "sk-anthropic")
+
+	if !VerifyBearer(r, "sk-anthropic") {
+		t.Error("x-api-key 正确密钥应通过")
+	}
+
+	r.Header.Set("X-Api-Key", "sk-wrong")
+
+	if VerifyBearer(r, "sk-anthropic") {
+		t.Error("x-api-key 错误密钥不应通过")
+	}
+
+	r.Header.Set("X-Api-Key", "sk-anthropic")
+	r.Header.Set("Authorization", "Bearer sk-bearer")
+
+	if !VerifyBearer(r, "sk-bearer") {
+		t.Error("Authorization 应优先于 x-api-key")
+	}
+
+	gemini := httptest.NewRequest(http.MethodPost, "/v1beta/models/x:generateContent", nil)
+	gemini.Header.Set("X-Goog-Api-Key", "sk-gemini")
+
+	if !VerifyBearer(gemini, "sk-gemini") {
+		t.Error("x-goog-api-key 正确密钥应通过")
+	}
+}
+
 func TestAuthenticate(t *testing.T) {
 	t.Parallel()
 

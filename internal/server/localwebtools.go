@@ -63,6 +63,7 @@ var (
 func declaredLocalWebTools(body []byte) (map[string]bool, bool) {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
+		Input json.RawMessage  `json:"input"`
 	}
 	if json.Unmarshal(body, &req) != nil {
 		return nil, false
@@ -70,7 +71,9 @@ func declaredLocalWebTools(body []byte) (map[string]bool, bool) {
 
 	wanted := map[string]bool{}
 
-	for _, tool := range req.Tools {
+	// Codex 0.162+ 把工具放进 input.additional_tools；与 responsesToOpenAI 的
+	// 合并口径保持一致，否则本地 web 工具不会触发、反而被透传给上游。
+	for _, tool := range append(req.Tools, responsesAdditionalTools(req.Input)...) {
 		switch stringValue(tool["type"]) {
 		case "web_search", "web_search_preview":
 			wanted["web_search"] = true
@@ -98,7 +101,9 @@ func (h *Handler) localWebToolRounds() int {
 
 // serveResponsesWithLocalTools 执行本地工具循环并写回最终响应。
 func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Request, body []byte, wanted map[string]bool) {
-	openAI, model, instructions, stream, err := responsesToOpenAI(body)
+	openAI, model, instructions, stream, err := responsesToOpenAIWithClient(
+		body, h.responsesHTTPClient(), h.cfg.ModelAliases,
+	)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -119,7 +124,10 @@ func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	resp := responsesFromOpenAI(final, model, instructions)
+	resp := responsesFromOpenAIWithNamespaces(
+		final, model, instructions,
+		responsesCustomTools(body), responsesToolNamespacesFromBody(body),
+	)
 	if stream {
 		writeResponsesObjectSSE(w, resp)
 		return
@@ -342,7 +350,11 @@ func writeResponsesObjectSSE(w http.ResponseWriter, resp map[string]any) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
+	seq := 0
 	event := func(name string, payload map[string]any) {
+		payload["sequence_number"] = seq
+		seq++
+
 		raw, err := json.Marshal(payload)
 		if err != nil {
 			return
@@ -387,15 +399,15 @@ func emitBufferedMessage(event func(string, map[string]any), item map[string]any
 
 		event("response.content_part.added", map[string]any{
 			"type": "response.content_part.added", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+			"content_index": partIndex, "part": responsesOutputText(""),
 		})
 		event("response.output_text.delta", map[string]any{
 			"type": "response.output_text.delta", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "delta": text,
+			"content_index": partIndex, "delta": text, "logprobs": []any{},
 		})
 		event("response.output_text.done", map[string]any{
 			"type": "response.output_text.done", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "text": text,
+			"content_index": partIndex, "text": text, "logprobs": []any{},
 		})
 	}
 }

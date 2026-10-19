@@ -23,10 +23,11 @@ var (
 	errEmptyRequestBody2           = errors.New("empty request body")
 	errModelIsRequired2            = errors.New("model is required")
 	errInputIsRequired             = errors.New("input is required")
-	errResponsesInputItemFailed    = errors.New("responsesInputItem failed")
+	errNoConvertibleItems          = errors.New("input has no convertible items")
 	errResponsesInputMessageFailed = errors.New("responsesInputMessage failed")
 	errFunctionCallNameIsRequired  = errors.New("function_call name is required")
-	errFunctionCallOutputCallIDIs  = errors.New("function_call_output call_id is required")
+	errCustomToolCallNameIs        = errors.New("custom_tool_call name is required")
+	errCustomToolCallOutputCallID  = errors.New("custom_tool_call_output call_id is required")
 )
 
 // responsesRequest 只声明转换所需的字段；未知字段忽略，便于协议演进。
@@ -39,6 +40,8 @@ type responsesRequest struct {
 	MaxOutputTokens   int              `json:"max_output_tokens"`
 	Temperature       *float64         `json:"temperature"`
 	TopP              *float64         `json:"top_p"`
+	PresencePenalty   *float64         `json:"presence_penalty"`
+	FrequencyPenalty  *float64         `json:"frequency_penalty"`
 	Stream            bool             `json:"stream"`
 	ParallelToolCalls *bool            `json:"parallel_tool_calls"`
 	Reasoning         *responsesReason `json:"reasoning"`
@@ -74,17 +77,35 @@ func (h *Handler) responsesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	in, out, ok := newResponsesChatInput(w, r, body, h.cfg.KeepaliveInterval)
+	chatIn, responder, ok := newResponsesChatInput(
+		w, r, body, h.cfg.KeepaliveInterval, h.responsesHTTPClient(), h.cfg.ModelAliases,
+	)
 	if !ok {
 		return
 	}
 
-	h.serveChat(r, &in, out)
+	h.serveChat(r, &chatIn, responder)
+}
+
+// responsesHTTPClient 返回模型目录查询用的 HTTP client；测试/裸用未装配上游时为 nil。
+func (h *Handler) responsesHTTPClient() *http.Client {
+	if h.cfg.Upstream == nil {
+		return nil
+	}
+
+	return h.cfg.Upstream.HTTP
 }
 
 // newResponsesChatInput 把已读取的 Responses 请求转换为内部 chatInput。
-func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, keepalive time.Duration) (chatInput, chatResponder, bool) {
-	openAI, model, instructions, stream, err := responsesToOpenAI(body)
+func newResponsesChatInput(
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	keepalive time.Duration,
+	httpClient *http.Client,
+	aliases map[string]string,
+) (chatInput, chatResponder, bool) {
+	openAI, model, instructions, stream, err := responsesToOpenAIWithClient(body, httpClient, aliases)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return chatInput{}, nil, false
@@ -102,15 +123,117 @@ func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, 
 		keyRealm:  keyRealmFrom(r.Context()),
 	}
 
-	return chatInput2, &responsesResponder{w: w, model: model, instructions: instructions, keepalive: keepalive}, true
+	return chatInput2, &responsesResponder{
+		w: w, model: model, instructions: instructions, keepalive: keepalive,
+		customTools: responsesCustomTools(body),
+		namespaces:  responsesToolNamespacesFromBody(body),
+	}, true
 }
 
-// responsesToOpenAI 转换请求体，返回内部 chat body、原始模型名、instructions 与 stream。
+// responsesAdditionalTools 从 input 数组里的 additional_tools 条目收集工具。
+// 新版 Codex（0.162+）在 use_responses_lite 下把工具整份放进 input，顶层 tools
+// 为空；不合并就等于上游看不到任何工具。
+func responsesAdditionalTools(input json.RawMessage) []map[string]any {
+	trimmed := bytes.TrimSpace(input)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil
+	}
+
+	var items []map[string]any
+	if json.Unmarshal(trimmed, &items) != nil {
+		return nil
+	}
+
+	var out []map[string]any
+
+	for _, item := range items {
+		if stringValue(item["type"]) != "additional_tools" {
+			continue
+		}
+
+		tools, _ := item["tools"].([]any)
+		for _, tool := range tools {
+			if m, ok := tool.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+	}
+
+	return out
+}
+
+// responsesCustomTools 收集请求声明的 custom（freeform）工具名。
+// 上游只接受 JSON function 工具，custom 工具由 responsesTools 降级为单 input
+// 参数的 function；响应侧再按名单还原成 custom_tool_call。
+func responsesCustomTools(body []byte) map[string]bool {
+	var req struct {
+		Tools []map[string]any `json:"tools"`
+		Input json.RawMessage  `json:"input"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return nil
+	}
+
+	return responsesCustomToolSet(append(req.Tools, responsesAdditionalTools(req.Input)...))
+}
+
+// responsesCustomToolSet 递归收集 custom 工具名（含 namespace 内的自由格式工具）。
+func responsesCustomToolSet(tools []map[string]any) map[string]bool {
+	var out map[string]bool
+
+	var walk func(tool map[string]any, depth int)
+
+	walk = func(tool map[string]any, depth int) {
+		if tool == nil || depth > responsesMaxNamespaceDepth {
+			return
+		}
+
+		switch stringValue(tool["type"]) {
+		case "custom":
+			name := stringValue(tool["name"])
+			if name == "" {
+				return
+			}
+
+			if out == nil {
+				out = map[string]bool{}
+			}
+
+			out[name] = true
+		case "namespace":
+			for _, sub := range responsesNamespaceChildren(tool) {
+				if child, ok := sub.(map[string]any); ok {
+					walk(child, depth+1)
+				}
+			}
+		}
+	}
+
+	for _, tool := range tools {
+		walk(tool, 0)
+	}
+
+	return out
+}
+
+// responsesToOpenAI 转换请求体（无上游 client，供测试与不查动态目录的调用方）。
 func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
+	return responsesToOpenAIWithClient(body, nil, nil)
+}
+
+// responsesToOpenAIWithClient 转换请求体，返回内部 chat body、原始模型名、instructions 与 stream。
+// httpClient/aliases 仅用于模型目录的 max_output_tokens 查找；nil 时只查静态表。
+func responsesToOpenAIWithClient(
+	body []byte,
+	httpClient *http.Client,
+	aliases map[string]string,
+) ([]byte, string, string, bool, error) {
 	req, err := decodeResponsesRequest(body)
 	if err != nil {
 		return nil, "", "", false, err
 	}
+	// Codex 0.162+ 把工具放在 input 的 additional_tools 条目里（顶层 tools 为空）。
+	req.Tools = append(req.Tools, responsesAdditionalTools(req.Input)...)
 
 	msgs, err := responsesMessages(req)
 	if err != nil {
@@ -119,6 +242,7 @@ func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
 
 	out := map[string]any{"model": req.Model, "stream": req.Stream, "messages": msgs}
 	applyResponsesParams(out, req)
+	applyResponsesDefaultMaxTokens(out, req.Model, httpClient, aliases)
 
 	converted, err := json.Marshal(out)
 	if err != nil {
@@ -126,6 +250,40 @@ func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
 	}
 
 	return converted, req.Model, req.Instructions, req.Stream, nil
+}
+
+// applyResponsesDefaultMaxTokens 在客户端未传 max_output_tokens 时按模型目录补全
+// 上游 max_tokens。Codex 0.162+ 不再携带该字段，上游会回落到默认 32k 输出预算；
+// 长推理（thinking 与正文共享预算）被截断后模型往往只吐一句进度就结束回合。
+// 与 hub 的 #121 修复同口径：客户端显式值永远优先，未知模型不编造。
+func applyResponsesDefaultMaxTokens(
+	out map[string]any,
+	model string,
+	httpClient *http.Client,
+	aliases map[string]string,
+) {
+	if _, ok := out["max_tokens"]; ok {
+		return
+	}
+
+	_, bare := resolveRequestModel(model, aliases)
+	if bare == "" {
+		return
+	}
+
+	if n, ok := upstream.MaxOutputTokensListing(bare, 0); ok {
+		out["max_tokens"] = n
+
+		return
+	}
+
+	if httpClient == nil {
+		return
+	}
+
+	if n, ok := upstream.MaxOutputTokensListingV4(bare, 0, httpClient); ok {
+		out["max_tokens"] = n
+	}
 }
 
 func decodeResponsesRequest(body []byte) (*responsesRequest, error) {
@@ -156,8 +314,7 @@ func responsesMessages(req *responsesRequest) ([]any, error) {
 		return nil, errInputIsRequired
 	}
 
-	var text string
-	if json.Unmarshal(req.Input, &text) == nil {
+	if text, ok := responsesStringInput(req.Input); ok {
 		return append(msgs, map[string]any{"role": "user", "content": text}), nil
 	}
 
@@ -170,29 +327,130 @@ func responsesMessages(req *responsesRequest) ([]any, error) {
 		return nil, errInputIsRequired
 	}
 
+	convertedItems := 0
+	builder := &responsesInputMessages{msgs: msgs}
+
 	for _, item := range items {
-		converted, err := responsesInputItem(item)
+		converted, images, ok, err := responsesInputItem(item)
 		if err != nil {
 			return nil, err
 		}
 
-		msgs = append(msgs, converted)
+		if !ok {
+			continue
+		}
+
+		builder.add(converted, images)
+
+		convertedItems++
 	}
 
-	return msgs, nil
+	if convertedItems == 0 {
+		return nil, errNoConvertibleItems
+	}
+
+	builder.flushImages()
+
+	return builder.msgs, nil
 }
 
-// responsesInputItem 转换单条 input item：message / function_call / function_call_output。
-func responsesInputItem(item map[string]any) (any, error) {
+// responsesInputMessages 在追加输入消息时维护工具图片的归属：图片必须贴着
+// 所属工具结果，跨过后续消息再追加会把历史图片挪到会话末尾。
+type responsesInputMessages struct {
+	msgs       []any
+	toolImages []any
+}
+
+func (b *responsesInputMessages) add(converted, images []any) {
+	if len(b.toolImages) > 0 && !responsesIsToolMessage(converted) {
+		b.flushImages()
+	}
+
+	b.msgs = append(b.msgs, converted...)
+	if responsesIsToolMessage(converted) {
+		b.toolImages = append(b.toolImages, images...)
+
+		return
+	}
+
+	if len(images) > 0 {
+		b.msgs = append(b.msgs, responsesToolImageMessage(images))
+	}
+}
+
+func (b *responsesInputMessages) flushImages() {
+	if len(b.toolImages) == 0 {
+		return
+	}
+
+	b.msgs = append(b.msgs, responsesToolImageMessage(b.toolImages))
+	b.toolImages = nil
+}
+
+// responsesStringInput 识别 Responses 的字符串 input；null 视为未提供。
+func responsesStringInput(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || trimmed[0] != '"' {
+		return "", false
+	}
+
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		return "", false
+	}
+
+	return text, true
+}
+
+// responsesIsToolMessage 报告转换结果是否为单条 role=tool 消息。
+func responsesIsToolMessage(msgs []any) bool {
+	if len(msgs) != 1 {
+		return false
+	}
+
+	msg, _ := msgs[0].(map[string]any)
+
+	return stringValue(msg["role"]) == "tool"
+}
+
+// responsesToolImageMessage 把工具结果里不能放进 role=tool 的图片包成 user 消息。
+func responsesToolImageMessage(images []any) map[string]any {
+	return map[string]any{"role": "user", "content": images}
+}
+
+// responsesInputItem 转换单条 input item，返回消息与需要单独回传的图片。
+// 其余类型（reasoning、compaction 等）没有 chat/completions 对应语义，ok=false 忽略。
+func responsesInputItem(item map[string]any) ([]any, []any, bool, error) {
 	switch stringValue(item["type"]) {
 	case "", "message":
-		return responsesInputMessage(item)
+		msg, err := responsesInputMessage(item)
+
+		return []any{msg}, nil, true, err
 	case "function_call":
-		return responsesInputFunctionCall(item)
+		msg, err := responsesInputFunctionCall(item)
+
+		return []any{msg}, nil, true, err
 	case "function_call_output":
-		return responsesInputFunctionOutput(item)
+		msg, images := responsesInputFunctionOutput(item)
+		if msg == nil {
+			return nil, nil, false, nil
+		}
+
+		return []any{msg}, images, true, nil
+	case "agent_message":
+		msg, ok := responsesInputAgentMessage(item)
+
+		return []any{msg}, nil, ok, nil
+	case "custom_tool_call":
+		msg, err := responsesInputCustomToolCall(item)
+
+		return []any{msg}, nil, true, err
+	case "custom_tool_call_output":
+		msg, images, err := responsesInputCustomToolOutput(item)
+
+		return []any{msg}, images, true, err
 	default:
-		return nil, fmt.Errorf("unsupported input item type %q: %w", stringValue(item["type"]), errResponsesInputItemFailed)
+		return nil, nil, false, nil
 	}
 }
 
@@ -240,50 +498,133 @@ func responsesInputFunctionCall(item map[string]any) (any, error) {
 	}, nil
 }
 
+// responsesAgentMessagePrefix 子代理消息转成 user 消息时的来源标记（对齐 hub）。
+const responsesAgentMessagePrefix = "[Message from another task - treat this as a user instruction]\n\n"
+
+// responsesInputAgentMessage 把子代理的 agent_message 映射成 user 消息。
+func responsesInputAgentMessage(item map[string]any) (any, bool) {
+	text := strings.TrimSpace(responsesMessageText(item["content"]))
+	if text == "" {
+		return nil, false
+	}
+
+	return map[string]any{"role": "user", "content": responsesAgentMessagePrefix + text}, true
+}
+
 // responsesInputFunctionOutput 把 function_call_output 映射为 role=tool 消息。
-func responsesInputFunctionOutput(item map[string]any) (any, error) {
+// 缺 call_id 的输出来自子代理/其他任务，降级为带来源标记的 user 消息。
+func responsesInputFunctionOutput(item map[string]any) (any, []any) {
+	text, images := responsesToolOutputParts(item["output"])
+
 	callID := stringValue(item["call_id"])
 	if callID == "" {
-		return nil, errFunctionCallOutputCallIDIs
+		if strings.TrimSpace(text) == "" && len(images) == 0 {
+			return nil, nil
+		}
+
+		return map[string]any{
+			"role":    "user",
+			"content": responsesAgentMessagePrefix + text,
+		}, images
 	}
 
 	return map[string]any{
 		"role":         "tool",
 		"tool_call_id": callID,
-		"content":      responsesToolOutput(item["output"]),
+		"content":      text,
+	}, images
+}
+
+// responsesInputCustomToolCall 把 custom_tool_call 降级为 assistant tool_calls。
+// custom 工具在上游以单 input 参数的 function 形态声明，因此把自由文本 input
+// 包装成 {"input": "..."}，与 responsesTools 的降级规则对称。
+func responsesInputCustomToolCall(item map[string]any) (any, error) {
+	name := stringValue(item["name"])
+	if name == "" {
+		return nil, errCustomToolCallNameIs
+	}
+
+	callID := stringValue(item["call_id"])
+	if callID == "" {
+		callID = stringValue(item["id"])
+	}
+
+	args, err := json.Marshal(map[string]any{"input": stringValue(item["input"])})
+	if err != nil {
+		return nil, fmt.Errorf("custom_tool_call input: %w", err)
+	}
+
+	return map[string]any{
+		"role":    "assistant",
+		"content": "",
+		"tool_calls": []any{map[string]any{
+			"id": callID, "type": "function",
+			"function": map[string]any{"name": name, "arguments": string(args)},
+		}},
 	}, nil
 }
 
-// responsesToolOutput 把工具输出（字符串或内容块数组）压成文本。
-func responsesToolOutput(raw any) string {
-	if s, ok := raw.(string); ok {
-		return s
+// responsesInputCustomToolOutput 把 custom_tool_call_output 映射为 role=tool 消息。
+// 输出格式与 function_call_output 同构（字符串或内容块数组）。
+func responsesInputCustomToolOutput(item map[string]any) (any, []any, error) {
+	callID := stringValue(item["call_id"])
+	if callID == "" {
+		return nil, nil, errCustomToolCallOutputCallID
+	}
+
+	text, images := responsesToolOutputParts(item["output"])
+
+	return map[string]any{
+		"role":         "tool",
+		"tool_call_id": callID,
+		"content":      text,
+	}, images, nil
+}
+
+// responsesToolOutputParts 拆分工具输出：文本压成字符串，图片保留为 content parts。
+func responsesToolOutputParts(raw any) (string, []any) {
+	if text, ok := raw.(string); ok {
+		return text, nil
 	}
 
 	parts, ok := raw.([]any)
 	if !ok {
 		if raw == nil {
-			return ""
+			return "", nil
 		}
 
 		data, err := json.Marshal(raw)
 		if err != nil {
-			return ""
+			return "", nil
 		}
 
-		return string(data)
+		return string(data), nil
 	}
 
 	var texts []string
 
+	images := make([]any, 0)
+
 	for _, part := range parts {
 		m, _ := part.(map[string]any)
-		if text, _ := m["text"].(string); text != "" {
+		if m == nil {
+			continue
+		}
+
+		if stringValue(m["type"]) == "input_image" {
+			if image := responsesContentPart(m); image != nil {
+				images = append(images, image)
+			}
+
+			continue
+		}
+
+		if text := stringValue(m["text"]); text != "" {
 			texts = append(texts, text)
 		}
 	}
 
-	return strings.Join(texts, "\n")
+	return strings.Join(texts, "\n"), images
 }
 
 // responsesContent 把消息内容转成 OpenAI content（纯文本压成字符串，含图片保留 parts）。
@@ -343,7 +684,18 @@ func responsesContentPart(part map[string]any) map[string]any {
 		return map[string]any{"type": "text", "text": stringValue(part["text"])}
 	case "input_image":
 		if url := responsesImageURL(part["image_url"]); url != "" {
-			return map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}}
+			image := map[string]any{"url": url}
+
+			if detail := stringValue(part["detail"]); detail != "" {
+				// Responses 允许 original；chat/completions 只接受 auto/low/high。
+				if detail == "original" {
+					detail = "high"
+				}
+
+				image["detail"] = detail
+			}
+
+			return map[string]any{"type": "image_url", "image_url": image}
 		}
 	}
 
@@ -364,6 +716,31 @@ func responsesImageURL(raw any) string {
 
 // applyResponsesParams 映射采样参数、工具与推理强度。
 func applyResponsesParams(out map[string]any, req *responsesRequest) {
+	applyResponsesSampling(out, req)
+
+	if tools, _ := responsesTools(req.Tools); len(tools) > 0 {
+		out["tools"] = tools
+	}
+
+	if choice := responsesToolChoice(req.ToolChoice); choice != nil {
+		out["tool_choice"] = choice
+	}
+
+	if req.ParallelToolCalls != nil {
+		out["parallel_tool_calls"] = *req.ParallelToolCalls
+	}
+
+	if format := responsesTextFormat(req.Text); format != nil {
+		out["response_format"] = format
+	}
+
+	if req.Reasoning != nil && req.Reasoning.Effort != "" {
+		out["reasoning_effort"] = req.Reasoning.Effort
+	}
+}
+
+// applyResponsesSampling 映射 max_output_tokens / 采样惩罚参数。
+func applyResponsesSampling(out map[string]any, req *responsesRequest) {
 	if req.MaxOutputTokens > 0 {
 		out["max_tokens"] = req.MaxOutputTokens
 	}
@@ -376,50 +753,322 @@ func applyResponsesParams(out map[string]any, req *responsesRequest) {
 		out["top_p"] = *req.TopP
 	}
 
-	if tools := responsesTools(req.Tools); len(tools) > 0 {
-		out["tools"] = tools
+	if req.PresencePenalty != nil {
+		out["presence_penalty"] = *req.PresencePenalty
 	}
 
-	if choice := responsesToolChoice(req.ToolChoice); choice != nil {
-		out["tool_choice"] = choice
-	}
-
-	if req.Reasoning != nil && req.Reasoning.Effort != "" {
-		out["reasoning_effort"] = req.Reasoning.Effort
+	if req.FrequencyPenalty != nil {
+		out["frequency_penalty"] = *req.FrequencyPenalty
 	}
 }
 
-// responsesTools 只保留 function 工具（其他内置工具本网关不执行，直接忽略）。
-func responsesTools(tools []map[string]any) []any {
-	out := make([]any, 0, len(tools))
-	for _, tool := range tools {
-		fn := tool
-		if nested, ok := tool["function"].(map[string]any); ok {
-			fn = nested
-		}
+// responsesTextFormat 把 Responses text.format 映射为 chat/completions response_format。
+// 只映射上游认识的 text / json_object / json_schema；缺失或未知格式返回 nil。
+func responsesTextFormat(raw json.RawMessage) any {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
 
-		name := stringValue(fn["name"])
-		if name == "" {
+	var text struct {
+		Format map[string]any `json:"format"`
+	}
+	if json.Unmarshal(raw, &text) != nil || text.Format == nil {
+		return nil
+	}
+
+	switch stringValue(text.Format["type"]) {
+	case "text":
+		return map[string]any{"type": "text"}
+	case "json_object":
+		return map[string]any{"type": "json_object"}
+	case "json_schema":
+		return responsesJSONSchemaFormat(text.Format)
+	default:
+		return nil
+	}
+}
+
+// responsesJSONSchemaFormat 把 Responses text.format 的 json_schema 形态转成
+// chat/completions 的 response_format.json_schema。
+func responsesJSONSchemaFormat(format map[string]any) any {
+	schema, ok := format["schema"]
+	if !ok {
+		return nil
+	}
+
+	spec := map[string]any{"schema": schema}
+
+	for _, key := range []string{"name", "description", "strict"} {
+		if v, ok := format[key]; ok {
+			spec[key] = v
+		}
+	}
+
+	return map[string]any{"type": "json_schema", "json_schema": spec}
+}
+
+// responsesMaxNamespaceDepth namespace 展开的最大深度（防御异常嵌套）。
+const responsesMaxNamespaceDepth = 4
+
+// responsesToolRef 是上游扁平工具名到客户端 (bare, namespace) 身份的映射。
+// 名字全局唯一时 key 即 bare；不同 namespace 出现同名工具时 key 改用限定名，
+// 否则后出现者会被去重丢弃，模型永远看不到它。
+type responsesToolRef struct {
+	bare      string
+	namespace string
+}
+
+// responsesToolSpec 是展开 namespace 后的待声明工具。
+type responsesToolSpec struct {
+	name      string
+	namespace string
+	spec      map[string]any
+}
+
+// responsesTools 转换 function / custom 工具，并把 namespace 容器展开成 flat
+// function。上游 Chat Completions 不认识 namespace；客户端回程又需要
+// (name, namespace) 两个字段才能找到执行器，所以展开时记录声明名 → 身份，
+// 响应侧由 responsesResolveToolName 还原。内置工具（web_search 等）仍忽略。
+//
+// 不同 namespace 的同名工具必须区分：直接按 bare 名去重会让后一个工具整体消失。
+// 只在检测到重名时使用带回 namespace 的限定名，唯一工具保持裸名，避免无谓地
+// 改变模型看到的工具名。
+func responsesTools(tools []map[string]any) ([]any, map[string]responsesToolRef) {
+	specs := responsesCollectTools(tools)
+
+	// 同一 (namespace, name) 在 tools 与 additional_tools 里重复出现是同一个工具，
+	// 不能据此判定重名并改名；只有不同 namespace 的同名工具才需要限定。
+	counts := make(map[string]int, len(specs))
+	identities := make(map[string]bool, len(specs))
+
+	for _, spec := range specs {
+		identity := spec.namespace + "\x00" + spec.name
+		if identities[identity] {
 			continue
 		}
 
-		spec := map[string]any{"name": name}
-		if desc := stringValue(fn["description"]); desc != "" {
-			spec["description"] = desc
+		identities[identity] = true
+		counts[spec.name]++
+	}
+
+	out := make([]any, 0, len(specs))
+	refs := make(map[string]responsesToolRef, len(specs))
+	seen := make(map[string]bool, len(specs))
+
+	for _, spec := range specs {
+		declared := spec.name
+		if counts[spec.name] > 1 && spec.namespace != "" {
+			declared = responsesQualifiedToolName(spec.namespace, spec.name)
 		}
 
-		if params, ok := fn["parameters"]; ok {
-			spec["parameters"] = params
+		// 同名同 namespace 的重复声明仍然只保留一次，避免上游 schema 冲突。
+		if seen[declared] {
+			continue
 		}
 
-		if strict, ok := fn["strict"].(bool); ok {
-			spec["strict"] = strict
+		seen[declared] = true
+		// 顶层唯一工具名无需映射：responsesResolveToolName 未命中时原样返回。
+		if spec.namespace != "" || declared != spec.name {
+			refs[declared] = responsesToolRef{bare: spec.name, namespace: spec.namespace}
 		}
 
-		out = append(out, map[string]any{"type": "function", "function": spec})
+		if declared != spec.name {
+			responsesSetToolSpecName(spec.spec, declared)
+		}
+
+		out = append(out, spec.spec)
+	}
+
+	return out, refs
+}
+
+// responsesCollectTools 递归展开工具树，先收集再统一分配声明名。
+func responsesCollectTools(tools []map[string]any) []responsesToolSpec {
+	var out []responsesToolSpec
+
+	for _, tool := range tools {
+		responsesCollectTool(&out, tool, "", 0)
 	}
 
 	return out
+}
+
+// responsesCollectTool 递归展开单个工具；namespace 记录当前所处的命名空间。
+func responsesCollectTool(out *[]responsesToolSpec, tool map[string]any, namespace string, depth int) {
+	if tool == nil || depth > responsesMaxNamespaceDepth {
+		return
+	}
+
+	switch typ := stringValue(tool["type"]); typ {
+	case "", "function":
+		responsesAppendToolSpec(out, responsesFunctionTool(tool), namespace)
+	case "custom":
+		responsesAppendToolSpec(out, responsesCustomTool(tool), namespace)
+	case "namespace":
+		childNS := stringValue(tool["name"])
+		if childNS == "" {
+			childNS = namespace
+		}
+
+		for _, sub := range responsesNamespaceChildren(tool) {
+			if child, ok := sub.(map[string]any); ok {
+				responsesCollectTool(out, child, childNS, depth+1)
+			}
+		}
+	}
+}
+
+// responsesAppendToolSpec 追加已转换的 function spec；无名工具忽略。
+func responsesAppendToolSpec(out *[]responsesToolSpec, spec map[string]any, namespace string) {
+	if spec == nil {
+		return
+	}
+
+	name := responsesToolSpecName(spec)
+	if name == "" {
+		return
+	}
+
+	*out = append(*out, responsesToolSpec{name: name, namespace: namespace, spec: spec})
+}
+
+// responsesQualifiedToolName 生成 namespace 内的限定工具名。Codex 的 namespace
+// 通常以 "__" 结尾（如 mcp__server__），此时直接拼接即可得到模型习惯的全名。
+func responsesQualifiedToolName(namespace, name string) string {
+	if strings.HasSuffix(namespace, "__") {
+		return namespace + name
+	}
+
+	return namespace + "__" + name
+}
+
+// responsesSetToolSpecName 回写 chat function spec 的工具名。
+func responsesSetToolSpecName(spec map[string]any, name string) {
+	fn, _ := spec["function"].(map[string]any)
+	if fn != nil {
+		fn["name"] = name
+	}
+}
+
+// responsesNamespaceChildren 读取 namespace 容器的子工具列表（兼容 tools/children/functions）。
+func responsesNamespaceChildren(tool map[string]any) []any {
+	for _, key := range []string{"tools", "children", "functions"} {
+		if children, ok := tool[key].([]any); ok {
+			return children
+		}
+	}
+
+	return nil
+}
+
+// responsesToolSpecName 读取已构造 chat function spec 的工具名。
+func responsesToolSpecName(spec map[string]any) string {
+	fn, _ := spec["function"].(map[string]any)
+	return stringValue(fn["name"])
+}
+
+// responsesToolNamespaces 从请求工具声明里收集声明名 → 工具身份。
+func responsesToolNamespaces(tools []map[string]any) map[string]responsesToolRef {
+	_, refs := responsesTools(tools)
+	return refs
+}
+
+// responsesToolNamespacesFromBody 从原始 Responses 请求体收集 namespace 映射。
+func responsesToolNamespacesFromBody(body []byte) map[string]responsesToolRef {
+	var req struct {
+		Tools []map[string]any `json:"tools"`
+		Input json.RawMessage  `json:"input"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return nil
+	}
+
+	return responsesToolNamespaces(append(req.Tools, responsesAdditionalTools(req.Input)...))
+}
+
+// responsesResolveToolName 把模型回传的工具名解析成 (bare, namespace)。
+// 正常路径是声明名直接命中映射；兼容模型自行拼出的 ns__tool / ns::tool /
+// Codex 全名 ns+tool（namespace 以 "__" 结尾）。
+func responsesResolveToolName(name string, refs map[string]responsesToolRef) (string, string) {
+	if ref, ok := refs[name]; ok {
+		return ref.bare, ref.namespace
+	}
+
+	for _, ref := range refs {
+		if ref.namespace == "" {
+			continue
+		}
+
+		if name == ref.namespace+ref.bare || name == ref.namespace+"__"+ref.bare || name == ref.namespace+"::"+ref.bare {
+			return ref.bare, ref.namespace
+		}
+	}
+
+	return name, ""
+}
+
+// responsesFunctionTool 读取 function 工具定义（兼容嵌套 function 形态）。
+func responsesFunctionTool(tool map[string]any) map[string]any {
+	fn := tool
+	if nested, ok := tool["function"].(map[string]any); ok {
+		fn = nested
+	}
+
+	name := stringValue(fn["name"])
+	if name == "" {
+		return nil
+	}
+
+	spec := map[string]any{"name": name}
+	if desc := stringValue(fn["description"]); desc != "" {
+		spec["description"] = desc
+	}
+
+	if params, ok := fn["parameters"]; ok {
+		spec["parameters"] = params
+	}
+
+	if strict, ok := fn["strict"].(bool); ok {
+		spec["strict"] = strict
+	}
+
+	return map[string]any{"type": "function", "function": spec}
+}
+
+// responsesCustomTool 把 custom 工具降级为单 input 字符串参数的 function。
+func responsesCustomTool(tool map[string]any) map[string]any {
+	name := stringValue(tool["name"])
+	if name == "" {
+		return nil
+	}
+
+	desc := stringValue(tool["description"])
+	if format, ok := tool["format"].(map[string]any); ok {
+		if definition := stringValue(format["definition"]); definition != "" {
+			if desc != "" {
+				desc += "\n\n"
+			}
+
+			desc += definition
+		}
+	}
+
+	spec := map[string]any{
+		"name": name,
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"input": map[string]any{"type": "string", "description": "Raw tool input."},
+			},
+			"required":             []any{"input"},
+			"additionalProperties": false,
+		},
+	}
+	if desc != "" {
+		spec["description"] = desc
+	}
+
+	return map[string]any{"type": "function", "function": spec}
 }
 
 // responsesToolChoice 映射 Responses tool_choice 到 OpenAI tool_choice。
@@ -441,8 +1090,22 @@ func responsesToolChoice(raw json.RawMessage) any {
 	var obj struct {
 		Type string `json:"type"`
 		Name string `json:"name"`
+		Mode string `json:"mode"`
 	}
-	if json.Unmarshal(raw, &obj) != nil || obj.Name == "" {
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil
+	}
+
+	if obj.Type == "allowed_tools" {
+		switch obj.Mode {
+		case "auto", "none", "required":
+			return obj.Mode
+		default:
+			return nil
+		}
+	}
+
+	if obj.Name == "" {
 		return nil
 	}
 
@@ -455,10 +1118,12 @@ type responsesResponder struct {
 	model        string
 	instructions string
 	keepalive    time.Duration
+	customTools  map[string]bool
+	namespaces   map[string]responsesToolRef
 }
 
 func (r *responsesResponder) JSON(status int, body any) {
-	writeJSON(r.w, status, responsesFromOpenAI(body, r.model, r.instructions))
+	writeJSON(r.w, status, responsesFromOpenAIWithNamespaces(body, r.model, r.instructions, r.customTools, r.namespaces))
 }
 
 // Error 保持 OpenAI 错误信封（Responses 客户端同样识别）。
@@ -469,7 +1134,7 @@ func (r *responsesResponder) Error(status int, code, msg, hint string) {
 func (r *responsesResponder) Header(name, value string) { r.w.Header().Set(name, value) }
 
 func (r *responsesResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
-	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions)
+	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions, r.customTools, r.namespaces)
 
 	opts := make([]upstream.StreamOption, 0, 2)
 	if onErrFrame != nil {
@@ -489,10 +1154,26 @@ func (r *responsesResponder) Stream(rc io.Reader, hint func(string) string, repa
 }
 
 // responsesFromOpenAI 把聚合后的 chat.completion 转成 Responses 对象。
-func responsesFromOpenAI(body any, model, instructions string) map[string]any {
+func responsesFromOpenAI(body any, model, instructions string, customTools ...map[string]bool) map[string]any {
+	custom := map[string]bool{}
+	if len(customTools) > 0 {
+		custom = customTools[0]
+	}
+
+	return responsesFromOpenAIWithNamespaces(body, model, instructions, custom, nil)
+}
+
+// responsesFromOpenAIWithNamespaces 在 Responses 对象里还原 namespace 工具。
+func responsesFromOpenAIWithNamespaces(
+	body any,
+	model, instructions string,
+	customTools map[string]bool,
+	namespaces map[string]responsesToolRef,
+) map[string]any {
 	obj, _ := body.(map[string]any)
 	choice := firstOpenAIChoice(obj)
-	output, text, status := responsesOutput(choice)
+
+	output, text, status := responsesOutput(choice, customTools, namespaces)
 	usage := responsesUsage(obj["usage"])
 
 	id := stringValue(obj["id"])
@@ -507,33 +1188,51 @@ func responsesFromOpenAI(body any, model, instructions string) map[string]any {
 
 	resp := responsesObject(id, model, instructions, int64(created), status, output, text, usage)
 	if status == "incomplete" {
-		resp["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+		resp["incomplete_details"] = map[string]any{"reason": responsesIncompleteReason(choice)}
 	}
 
 	return resp
 }
 
+// responsesIncompleteReason 映射 finish_reason → Responses incomplete_details.reason。
+func responsesIncompleteReason(choice map[string]any) string {
+	switch stringValue(choice["finish_reason"]) {
+	case "content_filter":
+		return "content_filter"
+	default:
+		return "max_output_tokens"
+	}
+}
+
 // responsesOutput 从 choices[0] 构建 output 数组、output_text 与状态。
-func responsesOutput(choice map[string]any) ([]any, string, string) {
+func responsesOutput(choice map[string]any, customTools map[string]bool, namespaces map[string]responsesToolRef) ([]any, string, string) {
 	if choice == nil {
 		return []any{}, "", "completed"
 	}
 
 	msg, _ := choice["message"].(map[string]any)
+
 	text := responsesMessageText(msg["content"])
+	if text == "" {
+		// Chat refusal 没有 Responses output_text 对应字段；作为可见文本保留，
+		// 同时 finish_reason=content_filter 仍映射为 incomplete。
+		text = stringValue(msg["refusal"])
+	}
 
 	output := make([]any, 0, 2)
 	if text != "" {
 		output = append(output, responsesMessageItem("msg_gateway", text, "completed"))
 	}
 
-	output = append(output, responsesFunctionItems(msg["tool_calls"])...)
+	output = append(output, responsesFunctionItems(msg["tool_calls"], customTools, namespaces)...)
 	if len(output) == 0 {
 		output = append(output, responsesMessageItem("msg_gateway", "", "completed"))
 	}
 
 	status := "completed"
-	if stringValue(choice["finish_reason"]) == "length" {
+
+	switch stringValue(choice["finish_reason"]) {
+	case "length", "content_filter":
 		status = "incomplete"
 	}
 
@@ -566,19 +1265,43 @@ func responsesMessageText(raw any) string {
 func responsesMessageItem(id, text, status string) map[string]any {
 	return map[string]any{
 		"type": "message", "id": id, "status": status, "role": "assistant",
-		"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+		"content": []any{responsesOutputText(text)},
 	}
 }
 
-func responsesFunctionItems(raw any) []any {
-	calls, _ := raw.([]any)
+// responsesOutputText 构造 OpenAI Responses 的 output_text 内容块。
+func responsesOutputText(text string) map[string]any {
+	return map[string]any{"type": "output_text", "text": text, "annotations": []any{}, "logprobs": []any{}}
+}
+
+// mapItems 接受 JSON 解码后的 []any 与内部聚合产生的 []map[string]any，
+// 统一成 map 切片。非流式聚合路径（upstream.Aggregate）产出的是后者。
+func mapItems(raw any) []map[string]any {
+	switch value := raw.(type) {
+	case []map[string]any:
+		return value
+	case []any:
+		out := make([]map[string]any, 0, len(value))
+		for _, item := range value {
+			if m, ok := item.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+
+		return out
+	default:
+		return nil
+	}
+}
+
+func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map[string]responsesToolRef) []any {
+	calls := mapItems(raw)
 
 	out := make([]any, 0, len(calls))
-	for i, item := range calls {
-		call, _ := item.(map[string]any)
+	for i, call := range calls {
 		fn, _ := call["function"].(map[string]any)
 
-		name := stringValue(fn["name"])
+		name, namespace := responsesResolveToolName(stringValue(fn["name"]), namespaces)
 		if name == "" {
 			continue
 		}
@@ -588,22 +1311,107 @@ func responsesFunctionItems(raw any) []any {
 			callID = fmt.Sprintf("call_%d", i)
 		}
 
-		out = append(out, map[string]any{
+		args := stringValue(fn["arguments"])
+		if customTools[name] {
+			item := map[string]any{
+				"type": "custom_tool_call", "id": "ctc_" + callID, "call_id": callID,
+				"name": name, "input": responsesCustomToolInput(args), "status": "completed",
+			}
+			responsesSetNamespace(item, namespace)
+			out = append(out, item)
+
+			continue
+		}
+
+		item := map[string]any{
 			"type": "function_call", "id": "fc_" + callID, "call_id": callID,
-			"name": name, "arguments": stringValue(fn["arguments"]), "status": "completed",
-		})
+			"name": name, "arguments": args, "status": "completed",
+		}
+		responsesSetNamespace(item, namespace)
+		out = append(out, item)
 	}
 
 	return out
+}
+
+// responsesSetNamespace 把 namespace 写进 function_call / custom_tool_call。
+func responsesSetNamespace(item map[string]any, namespace string) {
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
+}
+
+// responsesCustomToolInput 从降级后的 {"input":"..."} 参数里还原 freeform 文本。
+// 模型未按约定输出时退回原始 arguments，避免丢调用。只有 input 键存在且为字符串
+// 才解包；否则 {"patch":"..."} 这类偏差会被当成空 input 丢掉。
+func responsesCustomToolInput(args string) string {
+	var payload map[string]json.RawMessage
+	if json.Unmarshal([]byte(args), &payload) != nil {
+		return args
+	}
+
+	raw, ok := payload["input"]
+	if !ok {
+		return args
+	}
+
+	var input string
+	if json.Unmarshal(raw, &input) != nil {
+		return args
+	}
+
+	return input
 }
 
 func responsesUsage(raw any) map[string]any {
 	usage, _ := raw.(map[string]any)
 	input := intValue(usage["prompt_tokens"])
 	output := intValue(usage["completion_tokens"])
+	cached, cacheWrite := responsesCachedTokens(usage)
 
 	return map[string]any{
 		"input_tokens": input, "output_tokens": output, "total_tokens": input + output,
+		"input_tokens_details": map[string]any{
+			"cached_tokens": cached, "cache_write_tokens": cacheWrite,
+		},
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": responsesReasoningTokens(usage),
+		},
+	}
+}
+
+// responsesCachedTokens 读取上游 prompt cache 统计（兼容 details 与扁平字段）。
+func responsesCachedTokens(usage map[string]any) (cached, cacheWrite int) {
+	details, _ := usage["prompt_tokens_details"].(map[string]any)
+	cached = intValue(details["cached_tokens"])
+
+	if cached == 0 {
+		cached = intValue(usage["cached_tokens"])
+	}
+
+	cacheWrite = intValue(details["cache_write_tokens"])
+	if cacheWrite == 0 {
+		cacheWrite = intValue(usage["cache_write_tokens"])
+	}
+
+	return cached, cacheWrite
+}
+
+// responsesReasoningTokens 读取 completion_tokens_details.reasoning_tokens。
+func responsesReasoningTokens(usage map[string]any) int {
+	details, _ := usage["completion_tokens_details"].(map[string]any)
+	return intValue(details["reasoning_tokens"])
+}
+
+// errorCodeString 把上游 error.code（字符串或数字）统一成字符串。
+func errorCodeString(raw any) string {
+	switch v := raw.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	default:
+		return ""
 	}
 }
 
@@ -619,6 +1427,10 @@ func responsesObject(
 		"id": id, "object": "response", "created_at": created, "status": status,
 		"model": model, "instructions": instructions, "output": output, "output_text": text,
 		"usage": usage, "error": nil, "incomplete_details": nil,
+		"tools": []any{}, "tool_choice": "auto", "parallel_tool_calls": true,
+		"background": false, "metadata": map[string]any{},
+		"previous_response_id": nil, "reasoning": nil,
+		"text": map[string]any{"format": map[string]any{"type": "text"}},
 	}
 }
 
@@ -628,6 +1440,8 @@ type responsesStreamWriter struct {
 	fl           http.Flusher
 	model        string
 	instructions string
+	customTools  map[string]bool
+	namespaces   map[string]responsesToolRef
 
 	pending  []byte
 	started  bool
@@ -641,9 +1455,14 @@ type responsesStreamWriter struct {
 	msg     *responsesMessageState
 	tools   map[int]*responsesToolState
 	toolSeq []int
+	seq     int
 
-	inputTokens  int
-	outputTokens int
+	finishReason    string
+	inputTokens     int
+	outputTokens    int
+	cachedTokens    int
+	cacheWrite      int
+	reasoningTokens int
 }
 
 type responsesIndexedItem struct {
@@ -659,20 +1478,28 @@ type responsesMessageState struct {
 }
 
 type responsesToolState struct {
-	id      string
-	callID  string
-	name    string
-	index   int
-	args    strings.Builder
-	started bool
+	id        string
+	callID    string
+	name      string
+	namespace string
+	index     int
+	args      strings.Builder
+	started   bool
+	custom    bool
 }
 
-func newResponsesStreamWriter(w http.ResponseWriter, model, instructions string) *responsesStreamWriter {
+func newResponsesStreamWriter(
+	w http.ResponseWriter,
+	model, instructions string,
+	customTools map[string]bool,
+	namespaces map[string]responsesToolRef,
+) *responsesStreamWriter {
 	fl, _ := w.(http.Flusher)
 
 	return &responsesStreamWriter{
-		w: w, fl: fl, model: model, instructions: instructions,
-		created: time.Now().Unix(), tools: map[int]*responsesToolState{},
+		w: w, fl: fl, model: model, instructions: instructions, customTools: customTools,
+		namespaces: namespaces,
+		created:    time.Now().Unix(), tools: map[int]*responsesToolState{},
 	}
 }
 
@@ -758,6 +1585,10 @@ func (s *responsesStreamWriter) handleChunk(payload string) error {
 		}
 	}
 
+	if reason := stringValue(choice["finish_reason"]); reason != "" {
+		s.finishReason = reason
+	}
+
 	return nil
 }
 
@@ -767,14 +1598,34 @@ func (s *responsesStreamWriter) handleUpstreamError(errObj map[string]any) error
 		msg = "upstream stream error"
 	}
 
-	body := map[string]any{"type": "api_error", "message": msg}
+	code := errorCodeString(errObj["code"])
+	if code == "" {
+		code = "upstream_error"
+	}
+
+	body := map[string]any{"type": "api_error", "message": msg, "code": code}
 	if hint := stringValue(errObj["gateway_hint"]); hint != "" {
 		body["gateway_hint"] = hint
 	}
 
 	s.errored = true
+	if err := s.ensureStart(nil); err != nil {
+		return err
+	}
+	// OpenAI 兼容客户端识别顶层 message/code；Codex 还从 error 字段读取 flex 错误，
+	// 两处都保留。随后补 response.failed，避免客户端只看到流被关闭。
+	event := map[string]any{
+		"type": "error", "message": msg, "code": code, "param": nil,
+		"error": body,
+	}
+	if err := s.event("error", event); err != nil {
+		return err
+	}
 
-	return s.event("error", map[string]any{"type": "error", "error": body})
+	resp := s.responseObject("failed")
+	resp["error"] = body
+
+	return s.event("response.failed", map[string]any{"type": "response.failed", "response": resp})
 }
 
 // ensureStart 写出 response.created / response.in_progress。
@@ -804,7 +1655,12 @@ func (s *responsesStreamWriter) ensureStart(chunk map[string]any) error {
 }
 
 func (s *responsesStreamWriter) applyDelta(delta map[string]any) error {
-	if text := stringValue(delta["content"]); text != "" {
+	text := stringValue(delta["content"])
+	if text == "" {
+		text = stringValue(delta["refusal"])
+	}
+
+	if text != "" {
 		if err := s.emitText(text); err != nil {
 			return err
 		}
@@ -826,7 +1682,7 @@ func (s *responsesStreamWriter) emitText(text string) error {
 
 		if err := s.event("response.content_part.added", map[string]any{
 			"type": "response.content_part.added", "item_id": s.msg.id, "output_index": s.msg.index,
-			"content_index": 0, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+			"content_index": 0, "part": responsesOutputText(""),
 		}); err != nil {
 			return err
 		}
@@ -836,14 +1692,12 @@ func (s *responsesStreamWriter) emitText(text string) error {
 
 	return s.event("response.output_text.delta", map[string]any{
 		"type": "response.output_text.delta", "item_id": s.msg.id, "output_index": s.msg.index,
-		"content_index": 0, "delta": text,
+		"content_index": 0, "delta": text, "logprobs": []any{},
 	})
 }
 
 func (s *responsesStreamWriter) emitTools(raw any) error {
-	calls, _ := raw.([]any)
-	for _, value := range calls {
-		call, _ := value.(map[string]any)
+	for _, call := range mapItems(raw) {
 		if call == nil {
 			continue
 		}
@@ -857,6 +1711,12 @@ func (s *responsesStreamWriter) emitTools(raw any) error {
 
 		if args := toolCallArguments(call); args != "" {
 			state.args.WriteString(args)
+
+			// custom 工具的增量是 JSON 包装的 {"input":...}，无法逐片还原为
+			// freeform 文本；只在 done 事件给最终 input，避免把包装层透给客户端。
+			if state.custom {
+				continue
+			}
 
 			if err := s.event("response.function_call_arguments.delta", map[string]any{
 				"type": "response.function_call_arguments.delta", "item_id": state.id,
@@ -877,6 +1737,8 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 	}
 
 	name, callID := toolCallIdentity(call)
+	name, namespace := responsesResolveToolName(name, s.namespaces)
+
 	if name == "" {
 		return nil
 	}
@@ -885,8 +1747,16 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 		callID = fmt.Sprintf("call_%d", idx)
 	}
 
+	custom := s.customTools[name]
+
+	prefix := "fc_"
+	if custom {
+		prefix = "ctc_"
+	}
+
 	state := &responsesToolState{
-		id: "fc_" + callID, callID: callID, name: name, index: s.nextIdx, started: true,
+		id: prefix + callID, callID: callID, name: name, namespace: namespace,
+		index: s.nextIdx, started: true, custom: custom,
 	}
 	s.nextIdx++
 	s.tools[idx] = state
@@ -930,9 +1800,31 @@ func (s *responsesStreamWriter) finish() error {
 		}
 	}
 
-	return s.event("response.completed", map[string]any{
-		"type": "response.completed", "response": s.responseObject("completed"),
-	})
+	return s.emitCompletion()
+}
+
+// emitCompletion 写出 response.completed / response.incomplete。
+func (s *responsesStreamWriter) emitCompletion() error {
+	status, eventName, reason := s.completionStatus()
+
+	resp := s.responseObject(status)
+	if reason != "" {
+		resp["incomplete_details"] = map[string]any{"reason": reason}
+	}
+
+	return s.event(eventName, map[string]any{"type": eventName, "response": resp})
+}
+
+// completionStatus 由 finish_reason 决定最终状态、事件名与 incomplete reason。
+func (s *responsesStreamWriter) completionStatus() (status, eventName, reason string) {
+	switch s.finishReason {
+	case "length":
+		return "incomplete", "response.incomplete", "max_output_tokens"
+	case "content_filter":
+		return "incomplete", "response.incomplete", "content_filter"
+	default:
+		return "completed", "response.completed", ""
+	}
 }
 
 func (s *responsesStreamWriter) closeMessage() error {
@@ -945,14 +1837,14 @@ func (s *responsesStreamWriter) closeMessage() error {
 	text := s.msg.text.String()
 	if err := s.event("response.output_text.done", map[string]any{
 		"type": "response.output_text.done", "item_id": s.msg.id, "output_index": s.msg.index,
-		"content_index": 0, "text": text,
+		"content_index": 0, "text": text, "logprobs": []any{},
 	}); err != nil {
 		return err
 	}
 
 	if err := s.event("response.content_part.done", map[string]any{
 		"type": "response.content_part.done", "item_id": s.msg.id, "output_index": s.msg.index,
-		"content_index": 0, "part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+		"content_index": 0, "part": responsesOutputText(text),
 	}); err != nil {
 		return err
 	}
@@ -988,7 +1880,14 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 	}
 
 	args := state.args.String()
-	if err := s.event("response.function_call_arguments.done", map[string]any{
+	if state.custom {
+		if err := s.event("response.custom_tool_call_input.done", map[string]any{
+			"type": "response.custom_tool_call_input.done", "item_id": state.id,
+			"output_index": state.index, "input": responsesCustomToolInput(args),
+		}); err != nil {
+			return err
+		}
+	} else if err := s.event("response.function_call_arguments.done", map[string]any{
 		"type": "response.function_call_arguments.done", "item_id": state.id,
 		"output_index": state.index, "arguments": args,
 	}); err != nil {
@@ -1012,10 +1911,25 @@ func (s *responsesStreamWriter) messageItem(status string) map[string]any {
 }
 
 func (s *responsesStreamWriter) functionItem(state *responsesToolState, status string) map[string]any {
-	return map[string]any{
+	namespace := state.namespace
+
+	if state.custom {
+		item := map[string]any{
+			"type": "custom_tool_call", "id": state.id, "call_id": state.callID,
+			"name": state.name, "input": responsesCustomToolInput(state.args.String()), "status": status,
+		}
+		responsesSetNamespace(item, namespace)
+
+		return item
+	}
+
+	item := map[string]any{
 		"type": "function_call", "id": state.id, "call_id": state.callID,
 		"name": state.name, "arguments": state.args.String(), "status": status,
 	}
+	responsesSetNamespace(item, namespace)
+
+	return item
 }
 
 func (s *responsesStreamWriter) responseObject(status string) map[string]any {
@@ -1042,6 +1956,12 @@ func (s *responsesStreamWriter) responseObject(status string) map[string]any {
 	usage := map[string]any{
 		"input_tokens": s.inputTokens, "output_tokens": s.outputTokens,
 		"total_tokens": s.inputTokens + s.outputTokens,
+		"input_tokens_details": map[string]any{
+			"cached_tokens": s.cachedTokens, "cache_write_tokens": s.cacheWrite,
+		},
+		"output_tokens_details": map[string]any{
+			"reasoning_tokens": s.reasoningTokens,
+		},
 	}
 
 	return responsesObject(s.id, s.model, s.instructions, s.created, status, output, text.String(), usage)
@@ -1060,9 +1980,20 @@ func (s *responsesStreamWriter) captureUsage(chunk map[string]any) {
 	if n := intValue(usage["completion_tokens"]); n > 0 {
 		s.outputTokens = n
 	}
+
+	if cached, cacheWrite := responsesCachedTokens(usage); cached > 0 || cacheWrite > 0 {
+		s.cachedTokens, s.cacheWrite = cached, cacheWrite
+	}
+
+	if n := responsesReasoningTokens(usage); n > 0 {
+		s.reasoningTokens = n
+	}
 }
 
 func (s *responsesStreamWriter) event(name string, payload map[string]any) error {
+	payload["sequence_number"] = s.seq
+	s.seq++
+
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event: %w", err)

@@ -145,6 +145,22 @@ func TestAggregate(t *testing.T) {
 	}
 }
 
+func TestAggregateErrorFrame(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"error\":{\"code\":6004,\"message\":\"limited\"}}\n\n" +
+		"data: [DONE]\n\n"
+
+	_, err := Aggregate(strings.NewReader(raw))
+	if !IsErrorFrameError(err) {
+		t.Fatalf("err=%v want error frame", err)
+	}
+
+	if payload := ErrorFramePayload(err); !strings.Contains(payload, "6004") {
+		t.Fatalf("payload=%q", payload)
+	}
+}
+
 func TestAggregateSkipsNonDataLines(t *testing.T) {
 	t.Parallel()
 
@@ -244,7 +260,12 @@ func TestStripToolCallNamesMissingIndex(t *testing.T) {
 
 	tcs := table["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)
 	for i, want := range []string{"Bash", "Read"} {
-		fn := tcs[i].(map[string]any)["function"].(map[string]any)
+		call := tcs[i].(map[string]any)
+		if call["index"] != float64(i) {
+			t.Errorf("同帧调用 %d index=%v want %d", i, call["index"], i)
+		}
+
+		fn := call["function"].(map[string]any)
 		if fn["name"] != want {
 			t.Errorf("同帧调用 %d name=%v want %s", i, fn["name"], want)
 		}
@@ -1382,6 +1403,59 @@ func TestStreamMarkupRepairEndToEnd(t *testing.T) {
 	if markupRepairSummary2.finishIdx < markupRepairSummary2.lastCallIdx {
 		t.Fatalf("收尾帧（第 %d 帧）必须排在最后一个调用帧（第 %d 帧）之后", markupRepairSummary2.finishIdx, markupRepairSummary2.lastCallIdx)
 	}
+}
+
+// TestStreamMarkupRepairIndexAfterRealToolCall 同一流里已有结构化 tool_call 时，
+// 标记还原出的调用必须接续其后 index。此前 stripToolCallNames 把 index 写成 int，
+// trackMaxToolIdx 按 float64 读取失败，合成调用会复用 index 0 并在 name 收敛时丢失。
+func TestStreamMarkupRepairIndexAfterRealToolCall(t *testing.T) {
+	t.Parallel()
+
+	var raw strings.Builder
+
+	writeFrame := func(payload map[string]any) {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		raw.WriteString("data: " + string(encoded) + "\n\n")
+	}
+
+	writeFrame(map[string]any{
+		"id": "resp-1", "object": "chat.completion.chunk",
+		"choices": []any{map[string]any{
+			"index": 0,
+			"delta": map[string]any{
+				"tool_calls": []any{map[string]any{
+					"index": 0, "id": "call_real", "type": "function",
+					"function": map[string]any{"name": "exec_command", "arguments": `{"cmd":"ls"}`},
+				}},
+			},
+		}},
+	})
+	writeFrame(map[string]any{
+		"id": "resp-1", "object": "chat.completion.chunk",
+		"choices": []any{map[string]any{
+			"index": 0,
+			"delta": map[string]any{"content": mkBlock(mkInvoke("exec_command", mkParam("cmd", "pwd")))},
+		}},
+	})
+	writeFrame(map[string]any{
+		"id": "resp-1", "object": "chat.completion.chunk",
+		"choices": []any{map[string]any{
+			"index": 0, "delta": map[string]any{}, "finish_reason": "stop",
+		}},
+	})
+	raw.WriteString("data: [DONE]\n\n")
+
+	rec := httptest.NewRecorder()
+	if err := StreamHint(rec, strings.NewReader(raw.String()), nil, WithMarkupRepair(NewMarkupRepair(testTools, false))); err != nil {
+		t.Fatal(err)
+	}
+
+	summary := summarizeMarkupFrames(viewSSE(t, rec.Body.String()))
+	assertMarkupRepairCalls(t, summary.calls, []string{"ls", "pwd"})
 }
 
 // markupRepairSummary 汇总透传帧：正文、调用帧、收尾帧位置。
