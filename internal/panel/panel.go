@@ -12,6 +12,7 @@
 package panel
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -1007,16 +1008,22 @@ func (p *Panel) tasksRuns(w http.ResponseWriter, r *http.Request) {
 }
 
 // balanceAll 手动全量刷新余额：并发查上游、写回池内 credits（含解冻语义），
-// 完成后返回——面板紧接着拉 overview 即是最新值。账号量小（个位数），
-// 同步等待（上限受短 RPC 超时约束）比"触发后盲刷"体验更确定。
+// 完成后返回——面板紧接着拉 overview 即是最新值。同步等待（逐号并发有界）
+// 比"触发后盲刷"体验更确定；客户端断开则停止派发剩余账号，不空跑上游。
 func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
 
-	p.cfg.Scheduler.RunBalanceRefreshNow()
-	p.syncNicknames()
+	ctx := r.Context()
+	p.cfg.Scheduler.RunBalanceRefreshNowCtx(ctx)
+
+	if ctx.Err() != nil {
+		return // 客户端已断开：不再同步昵称或写回执
+	}
+
+	p.syncNicknames(ctx)
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
 }
@@ -1025,8 +1032,8 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // 只在面板手动「刷新」路径调用——后台余额定时器不触发（用户明确要求资料接口
 // 仅手动触达）。逐号拉 /console/account，只取 nickname（手机号等敏感字段在
 // upstream.FetchAccountProfile 内即被丢弃）；单号失败静默跳过，不打断余额刷新
-// 的既有结果。
-func (p *Panel) syncNicknames() {
+// 的既有结果。ctx 取消后不再派发剩余账号（客户端断开时不必空跑上游）。
+func (p *Panel) syncNicknames(ctx context.Context) {
 	jobs := p.collectNicknameJobs()
 	if len(jobs) == 0 {
 		return
@@ -1039,9 +1046,15 @@ func (p *Panel) syncNicknames() {
 		sem     = make(chan struct{}, 3)
 		wg      sync.WaitGroup
 	)
+
+loop:
 	for _, j := range jobs {
 		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break loop
+		}
 
 		wg.Add(1)
 		go func(j nicknameJob) {
@@ -1061,6 +1074,10 @@ func (p *Panel) syncNicknames() {
 	}
 
 	wg.Wait()
+
+	if ctx.Err() != nil {
+		return
+	}
 
 	if updated > 0 || failed > 0 {
 		log.Printf("panel: 昵称同步：更新 %d 个，失败 %d 个（未变化不计数）", updated, failed)

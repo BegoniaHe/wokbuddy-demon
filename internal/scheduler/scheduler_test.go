@@ -581,6 +581,38 @@ func TestRunBalanceRefreshNowBoundsConcurrency(t *testing.T) {
 	}
 }
 
+// TestRunBalanceRefreshNowCtxCanceledStopsDispatch 已取消的 ctx 不得再派发逐号
+// 上游请求：面板请求断开或进程停机时不应继续空跑。
+func TestRunBalanceRefreshNowCtxCanceledStopsDispatch(t *testing.T) {
+	t.Parallel()
+
+	const accounts = 5
+
+	fake := &fakeUpstream{resourceRemain: 1}
+
+	srv := fake.server()
+	defer srv.Close()
+
+	state := pool.New("")
+
+	for i := range accounts {
+		uid := fmt.Sprintf("u%02d", i)
+		state.Add(&auth.Auth{UID: uid, AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	}
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(&Config{Pool: state, Upstream: up})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	s.RunBalanceRefreshNowCtx(ctx)
+
+	if got := fake.resourceCalls.Load(); got != 0 {
+		t.Fatalf("resource calls=%d want 0 after canceled ctx", got)
+	}
+}
+
 // TestStartBalanceRefreshHotEnableFromPaused 启动时关闭（interval=0）也必须起 worker：
 // 运行期 SetBalanceInterval 热开后才会有周期刷新，无需重启。
 func TestStartBalanceRefreshHotEnableFromPaused(t *testing.T) {

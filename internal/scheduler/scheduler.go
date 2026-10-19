@@ -835,7 +835,7 @@ func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
 // 无界 fan-out 会瞬时耗尽 fd 并打满上游限流。
 const balanceRefreshWorkers = 5
 
-// RunBalanceRefreshNow 并发查询余额并更新池内 credits。
+// RunBalanceRefreshNow 并发查询余额并更新池内 credits（无取消信号的便捷入口）。
 // 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
 // no-op，所以本开关**不会**导致禁用号被自动解冻——它只让已有账号的积分保持新鲜。
@@ -843,6 +843,13 @@ const balanceRefreshWorkers = 5
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
+	s.RunBalanceRefreshNowCtx(context.Background())
+}
+
+// RunBalanceRefreshNowCtx 同 RunBalanceRefreshNow，ctx 取消后不再派发新的逐号
+// 请求（已派发的等其完成）。限并发到 balanceRefreshWorkers 后，1000 个账号
+// 遇上上游超时可能让整轮拖上数小时；面板请求断开或进程停机时应尽早停止派发。
+func (s *Scheduler) RunBalanceRefreshNowCtx(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	sem := make(chan struct{}, balanceRefreshWorkers)
@@ -851,6 +858,8 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	includeDisabled := s.includeDisabledInTasks()
 
 	list := s.cfg.Pool.List()
+
+loop:
 	for i := range list {
 		status := &list[i]
 		if status.Disabled && !includeDisabled {
@@ -862,8 +871,17 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 			continue
 		}
 
+		// 已取消（含请求开始前就取消）：不再派发，避免无谓的上游调用。
+		if ctx.Err() != nil {
+			break
+		}
+
 		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			break loop
+		}
 
 		wg.Add(1)
 		go func(account4 *auth.Auth, uid string) {
@@ -925,7 +943,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 			case <-s.rearmBalance:
 				timer.Stop() // 间隔已变：立刻按新值重算
 			case <-timer.C:
-				s.RunBalanceRefreshNow()
+				s.RunBalanceRefreshNowCtx(ctx)
 			}
 		}
 	}()
