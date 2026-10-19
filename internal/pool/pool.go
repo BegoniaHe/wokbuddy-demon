@@ -674,6 +674,9 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	p.mu.Unlock()
 
 	p.persistState(seq, stateSnap)
+	// 移除即退役：调用方只负责删 auth 文件；在途 refresh 的 SaveAtomic 会被拒绝，
+	// 不依赖每个调用点都记得先 Retire（SyncToDir 同口径）。
+	entry2.a.Retire()
 
 	return entry2.a
 }

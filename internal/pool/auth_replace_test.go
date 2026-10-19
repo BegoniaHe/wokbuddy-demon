@@ -50,6 +50,26 @@ func TestAddSameAuthPointerNotRetired(t *testing.T) {
 	}
 }
 
+// TestRemoveRetiresAuth：面板移除账号时必须在池内完成退役，调用方只负责删文件；
+// 否则在途 refresh 仍可把已删账号的 auth 文件写回来。
+func TestRemoveRetiresAuth(t *testing.T) {
+	t.Parallel()
+
+	testPool := newTestPool(t, "")
+	fp := filepath.Join(t.TempDir(), "workbuddy-u1.json")
+	account := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", FilePath: fp}
+
+	testPool.Add(account)
+
+	if got := testPool.Remove("u1"); got != account {
+		t.Fatalf("Remove returned %p, want %p", got, account)
+	}
+
+	if err := account.SaveAtomic(); err == nil {
+		t.Fatal("removed auth SaveAtomic should be refused")
+	}
+}
+
 // TestSyncToDirRetiresRemovedAuth：目录扫描剔除的账号也必须退役，
 // 否则在途 token refresh 仍可把已删账号的 auth 文件写回来。
 func TestSyncToDirRetiresRemovedAuth(t *testing.T) {
