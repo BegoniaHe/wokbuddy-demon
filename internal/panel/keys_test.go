@@ -255,3 +255,19 @@ func TestKeysCreateRejectsEmptyBody(t *testing.T) {
 		t.Fatalf("empty body created keys: %+v", keys)
 	}
 }
+
+// TestKeysCreateRejectsNullBody null 等价于空 body，同样不得签发密钥。
+func TestKeysCreateRejectsNullBody(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+	panel := panelWithKeys(store)
+
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", "null"); code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", code, body)
+	}
+
+	if keys := store.List(); len(keys) != 0 {
+		t.Fatalf("null body created keys: %+v", keys)
+	}
+}

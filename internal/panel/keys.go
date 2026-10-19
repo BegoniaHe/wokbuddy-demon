@@ -39,11 +39,11 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body struct {
+	var body *struct {
 		Name string `json:"name"`
 	}
-
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	// 指针接收：空 body / 畸形 JSON / 字面量 null 都拒绝，避免静默签发默认名密钥。
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body == nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
