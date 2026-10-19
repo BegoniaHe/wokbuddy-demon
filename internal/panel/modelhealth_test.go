@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -424,4 +425,27 @@ func TestReadProbeStreamToolCallIsFirstToken(t *testing.T) {
 	if ttft <= 0 {
 		t.Errorf("ttft=%d want > 0（tool_calls 也是首字）", ttft)
 	}
+}
+
+// TestAcquireProbeSlotCanceledContext 已取消的 ctx 不得占用探测名额：sem 有空位
+// 时 select 会与 ctx.Done 随机二选一，仅靠 select 无法保证取消后不再派发。
+func TestAcquireProbeSlotCanceledContext(t *testing.T) {
+	t.Parallel()
+
+	panel := &Panel{}
+
+	for range 100 {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		if panel.acquireProbeSlot(ctx) {
+			t.Fatal("canceled ctx acquired probe slot")
+		}
+	}
+
+	if !panel.acquireProbeSlot(t.Context()) {
+		t.Fatal("live ctx failed to acquire probe slot")
+	}
+
+	panel.releaseProbeSlot()
 }

@@ -190,7 +190,13 @@ func (p *Panel) finishProbe(key string) {
 }
 
 // acquireProbeSlot 获取全局并发探测名额；ctx 取消时返回 false。
+// 已取消时不能只靠 select：sem 有空位会与 ctx.Done 同时就绪，随机选择仍可能
+// 占用名额并空跑一次上游探测（与 acquireSem 同口径）。
 func (p *Panel) acquireProbeSlot(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
 	p.probeMu.Lock()
 	if p.probeSem == nil {
 		p.probeSem = make(chan struct{}, modelProbeMaxConcurrent)
@@ -201,6 +207,12 @@ func (p *Panel) acquireProbeSlot(ctx context.Context) bool {
 
 	select {
 	case sem <- struct{}{}:
+		// 覆盖「检查后、取名额前」刚取消的窗口；已取消则立即归还名额。
+		if ctx.Err() != nil {
+			<-sem
+			return false
+		}
+
 		return true
 	case <-ctx.Done():
 		return false
