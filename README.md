@@ -279,6 +279,8 @@ export OPENAI_API_KEY=test_key   # 换成 config.json 中生效的 api_key
 codex
 ```
 
+- `/v1/responses` 会合并 `input` 里的 `additional_tools`（Codex 0.162+ 的工具下发形态之一），展开 `namespace` 工具并在回程补回 `namespace`；客户端未传 `max_output_tokens` 时按模型目录补全 `max_tokens`，避免上游回落到默认 32k 输出预算截断长推理。
+
 Claude Code 接入示例（`api_key` 非空时填同一密钥）：
 
 ```bash

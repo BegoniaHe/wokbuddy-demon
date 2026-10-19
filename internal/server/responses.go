@@ -26,7 +26,6 @@ var (
 	errNoConvertibleItems          = errors.New("input has no convertible items")
 	errResponsesInputMessageFailed = errors.New("responsesInputMessage failed")
 	errFunctionCallNameIsRequired  = errors.New("function_call name is required")
-	errFunctionCallOutputCallIDIs  = errors.New("function_call_output call_id is required")
 	errCustomToolCallNameIs        = errors.New("custom_tool_call name is required")
 	errCustomToolCallOutputCallID  = errors.New("custom_tool_call_output call_id is required")
 )
@@ -78,17 +77,35 @@ func (h *Handler) responsesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	in, out, ok := newResponsesChatInput(w, r, body, h.cfg.KeepaliveInterval)
+	chatIn, responder, ok := newResponsesChatInput(
+		w, r, body, h.cfg.KeepaliveInterval, h.responsesHTTPClient(), h.cfg.ModelAliases,
+	)
 	if !ok {
 		return
 	}
 
-	h.serveChat(r, &in, out)
+	h.serveChat(r, &chatIn, responder)
+}
+
+// responsesHTTPClient 返回模型目录查询用的 HTTP client；测试/裸用未装配上游时为 nil。
+func (h *Handler) responsesHTTPClient() *http.Client {
+	if h.cfg.Upstream == nil {
+		return nil
+	}
+
+	return h.cfg.Upstream.HTTP
 }
 
 // newResponsesChatInput 把已读取的 Responses 请求转换为内部 chatInput。
-func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, keepalive time.Duration) (chatInput, chatResponder, bool) {
-	openAI, model, instructions, stream, err := responsesToOpenAI(body)
+func newResponsesChatInput(
+	w http.ResponseWriter,
+	r *http.Request,
+	body []byte,
+	keepalive time.Duration,
+	httpClient *http.Client,
+	aliases map[string]string,
+) (chatInput, chatResponder, bool) {
+	openAI, model, instructions, stream, err := responsesToOpenAIWithClient(body, httpClient, aliases)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return chatInput{}, nil, false
@@ -109,7 +126,40 @@ func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, 
 	return chatInput2, &responsesResponder{
 		w: w, model: model, instructions: instructions, keepalive: keepalive,
 		customTools: responsesCustomTools(body),
+		namespaces:  responsesToolNamespacesFromBody(body),
 	}, true
+}
+
+// responsesAdditionalTools 从 input 数组里的 additional_tools 条目收集工具。
+// 新版 Codex（0.162+）在 use_responses_lite 下把工具整份放进 input，顶层 tools
+// 为空；不合并就等于上游看不到任何工具。
+func responsesAdditionalTools(input json.RawMessage) []map[string]any {
+	trimmed := bytes.TrimSpace(input)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil
+	}
+
+	var items []map[string]any
+	if json.Unmarshal(trimmed, &items) != nil {
+		return nil
+	}
+
+	var out []map[string]any
+
+	for _, item := range items {
+		if stringValue(item["type"]) != "additional_tools" {
+			continue
+		}
+
+		tools, _ := item["tools"].([]any)
+		for _, tool := range tools {
+			if m, ok := tool.(map[string]any); ok {
+				out = append(out, m)
+			}
+		}
+	}
+
+	return out
 }
 
 // responsesCustomTools 收集请求声明的 custom（freeform）工具名。
@@ -118,39 +168,72 @@ func newResponsesChatInput(w http.ResponseWriter, r *http.Request, body []byte, 
 func responsesCustomTools(body []byte) map[string]bool {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
+		Input json.RawMessage  `json:"input"`
 	}
 	if json.Unmarshal(body, &req) != nil {
 		return nil
 	}
 
+	return responsesCustomToolSet(append(req.Tools, responsesAdditionalTools(req.Input)...))
+}
+
+// responsesCustomToolSet 递归收集 custom 工具名（含 namespace 内的自由格式工具）。
+func responsesCustomToolSet(tools []map[string]any) map[string]bool {
 	var out map[string]bool
 
-	for _, tool := range req.Tools {
-		if stringValue(tool["type"]) != "custom" {
-			continue
+	var walk func(tool map[string]any, depth int)
+
+	walk = func(tool map[string]any, depth int) {
+		if tool == nil || depth > responsesMaxNamespaceDepth {
+			return
 		}
 
-		name := stringValue(tool["name"])
-		if name == "" {
-			continue
-		}
+		switch stringValue(tool["type"]) {
+		case "custom":
+			name := stringValue(tool["name"])
+			if name == "" {
+				return
+			}
 
-		if out == nil {
-			out = map[string]bool{}
-		}
+			if out == nil {
+				out = map[string]bool{}
+			}
 
-		out[name] = true
+			out[name] = true
+		case "namespace":
+			for _, sub := range responsesNamespaceChildren(tool) {
+				if child, ok := sub.(map[string]any); ok {
+					walk(child, depth+1)
+				}
+			}
+		}
+	}
+
+	for _, tool := range tools {
+		walk(tool, 0)
 	}
 
 	return out
 }
 
-// responsesToOpenAI 转换请求体，返回内部 chat body、原始模型名、instructions 与 stream。
+// responsesToOpenAI 转换请求体（无上游 client，供测试与不查动态目录的调用方）。
 func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
+	return responsesToOpenAIWithClient(body, nil, nil)
+}
+
+// responsesToOpenAIWithClient 转换请求体，返回内部 chat body、原始模型名、instructions 与 stream。
+// httpClient/aliases 仅用于模型目录的 max_output_tokens 查找；nil 时只查静态表。
+func responsesToOpenAIWithClient(
+	body []byte,
+	httpClient *http.Client,
+	aliases map[string]string,
+) ([]byte, string, string, bool, error) {
 	req, err := decodeResponsesRequest(body)
 	if err != nil {
 		return nil, "", "", false, err
 	}
+	// Codex 0.162+ 把工具放在 input 的 additional_tools 条目里（顶层 tools 为空）。
+	req.Tools = append(req.Tools, responsesAdditionalTools(req.Input)...)
 
 	msgs, err := responsesMessages(req)
 	if err != nil {
@@ -159,6 +242,7 @@ func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
 
 	out := map[string]any{"model": req.Model, "stream": req.Stream, "messages": msgs}
 	applyResponsesParams(out, req)
+	applyResponsesDefaultMaxTokens(out, req.Model, httpClient, aliases)
 
 	converted, err := json.Marshal(out)
 	if err != nil {
@@ -166,6 +250,40 @@ func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
 	}
 
 	return converted, req.Model, req.Instructions, req.Stream, nil
+}
+
+// applyResponsesDefaultMaxTokens 在客户端未传 max_output_tokens 时按模型目录补全
+// 上游 max_tokens。Codex 0.162+ 不再携带该字段，上游会回落到默认 32k 输出预算；
+// 长推理（thinking 与正文共享预算）被截断后模型往往只吐一句进度就结束回合。
+// 与 hub 的 #121 修复同口径：客户端显式值永远优先，未知模型不编造。
+func applyResponsesDefaultMaxTokens(
+	out map[string]any,
+	model string,
+	httpClient *http.Client,
+	aliases map[string]string,
+) {
+	if _, ok := out["max_tokens"]; ok {
+		return
+	}
+
+	_, bare := resolveRequestModel(model, aliases)
+	if bare == "" {
+		return
+	}
+
+	if n, ok := upstream.MaxOutputTokensListing(bare, 0); ok {
+		out["max_tokens"] = n
+
+		return
+	}
+
+	if httpClient == nil {
+		return
+	}
+
+	if n, ok := upstream.MaxOutputTokensListingV4(bare, 0, httpClient); ok {
+		out["max_tokens"] = n
+	}
 }
 
 func decodeResponsesRequest(body []byte) (*responsesRequest, error) {
@@ -272,9 +390,16 @@ func responsesInputItem(item map[string]any) ([]any, []any, bool, error) {
 
 		return []any{msg}, nil, true, err
 	case "function_call_output":
-		msg, images, err := responsesInputFunctionOutput(item)
+		msg, images := responsesInputFunctionOutput(item)
+		if msg == nil {
+			return nil, nil, false, nil
+		}
 
-		return []any{msg}, images, true, err
+		return []any{msg}, images, true, nil
+	case "agent_message":
+		msg, ok := responsesInputAgentMessage(item)
+
+		return []any{msg}, nil, ok, nil
 	case "custom_tool_call":
 		msg, err := responsesInputCustomToolCall(item)
 
@@ -332,20 +457,41 @@ func responsesInputFunctionCall(item map[string]any) (any, error) {
 	}, nil
 }
 
-// responsesInputFunctionOutput 把 function_call_output 映射为 role=tool 消息。
-func responsesInputFunctionOutput(item map[string]any) (any, []any, error) {
-	callID := stringValue(item["call_id"])
-	if callID == "" {
-		return nil, nil, errFunctionCallOutputCallIDIs
+// responsesAgentMessagePrefix 子代理消息转成 user 消息时的来源标记（对齐 hub）。
+const responsesAgentMessagePrefix = "[Message from another task - treat this as a user instruction]\n\n"
+
+// responsesInputAgentMessage 把子代理的 agent_message 映射成 user 消息。
+func responsesInputAgentMessage(item map[string]any) (any, bool) {
+	text := strings.TrimSpace(responsesMessageText(item["content"]))
+	if text == "" {
+		return nil, false
 	}
 
+	return map[string]any{"role": "user", "content": responsesAgentMessagePrefix + text}, true
+}
+
+// responsesInputFunctionOutput 把 function_call_output 映射为 role=tool 消息。
+// 缺 call_id 的输出来自子代理/其他任务，降级为带来源标记的 user 消息。
+func responsesInputFunctionOutput(item map[string]any) (any, []any) {
 	text, images := responsesToolOutputParts(item["output"])
+
+	callID := stringValue(item["call_id"])
+	if callID == "" {
+		if strings.TrimSpace(text) == "" && len(images) == 0 {
+			return nil, nil
+		}
+
+		return map[string]any{
+			"role":    "user",
+			"content": responsesAgentMessagePrefix + text,
+		}, images
+	}
 
 	return map[string]any{
 		"role":         "tool",
 		"tool_call_id": callID,
 		"content":      text,
-	}, images, nil
+	}, images
 }
 
 // responsesInputCustomToolCall 把 custom_tool_call 降级为 assistant tool_calls。
@@ -531,7 +677,7 @@ func responsesImageURL(raw any) string {
 func applyResponsesParams(out map[string]any, req *responsesRequest) {
 	applyResponsesSampling(out, req)
 
-	if tools := responsesTools(req.Tools); len(tools) > 0 {
+	if tools, _ := responsesTools(req.Tools); len(tools) > 0 {
 		out["tools"] = tools
 	}
 
@@ -620,25 +766,132 @@ func responsesJSONSchemaFormat(format map[string]any) any {
 	return map[string]any{"type": "json_schema", "json_schema": spec}
 }
 
-// responsesTools 转换 function / custom 工具。内置工具（web_search 等）与
-// namespace 容器本网关不执行，直接忽略；custom（freeform）工具降级为单
-// input 字符串参数的 function，响应侧按 responsesCustomTools 名单还原。
-func responsesTools(tools []map[string]any) []any {
+// responsesMaxNamespaceDepth namespace 展开的最大深度（防御异常嵌套）。
+const responsesMaxNamespaceDepth = 4
+
+// responsesTools 转换 function / custom 工具，并把 namespace 容器展开成 flat
+// function。上游 Chat Completions 不认识 namespace；客户端回程又需要
+// (name, namespace) 两个字段才能找到执行器，所以展开时记录 name → namespace，
+// 响应侧由 responsesResolveToolName 还原。内置工具（web_search 等）仍忽略。
+func responsesTools(tools []map[string]any) ([]any, map[string]string) {
 	out := make([]any, 0, len(tools))
+	namespaces := map[string]string{}
+	seen := map[string]bool{}
+
 	for _, tool := range tools {
-		switch typ := stringValue(tool["type"]); typ {
-		case "", "function":
-			if spec := responsesFunctionTool(tool); spec != nil {
-				out = append(out, spec)
-			}
-		case "custom":
-			if spec := responsesCustomTool(tool); spec != nil {
-				out = append(out, spec)
+		responsesAddTool(&out, namespaces, seen, tool, "", 0)
+	}
+
+	return out, namespaces
+}
+
+// responsesAddTool 递归展开单个工具；namespace 记录扁平名到命名空间的映射。
+func responsesAddTool(
+	out *[]any,
+	namespaces map[string]string,
+	seen map[string]bool,
+	tool map[string]any,
+	namespace string,
+	depth int,
+) {
+	if tool == nil || depth > responsesMaxNamespaceDepth {
+		return
+	}
+
+	switch typ := stringValue(tool["type"]); typ {
+	case "", "function":
+		responsesAddFlatTool(out, namespaces, seen, responsesFunctionTool(tool), namespace)
+	case "custom":
+		responsesAddFlatTool(out, namespaces, seen, responsesCustomTool(tool), namespace)
+	case "namespace":
+		childNS := stringValue(tool["name"])
+		if childNS == "" {
+			childNS = namespace
+		}
+
+		for _, sub := range responsesNamespaceChildren(tool) {
+			if child, ok := sub.(map[string]any); ok {
+				responsesAddTool(out, namespaces, seen, child, childNS, depth+1)
 			}
 		}
 	}
+}
 
-	return out
+// responsesAddFlatTool 把已转换的 function spec 追加到结果，首次出现的名字生效。
+func responsesAddFlatTool(
+	out *[]any,
+	namespaces map[string]string,
+	seen map[string]bool,
+	spec map[string]any,
+	namespace string,
+) {
+	if spec == nil {
+		return
+	}
+
+	name := responsesToolSpecName(spec)
+	if name == "" || seen[name] {
+		return
+	}
+
+	seen[name] = true
+	if namespace != "" {
+		namespaces[name] = namespace
+	}
+
+	*out = append(*out, spec)
+}
+
+// responsesNamespaceChildren 读取 namespace 容器的子工具列表（兼容 tools/children/functions）。
+func responsesNamespaceChildren(tool map[string]any) []any {
+	for _, key := range []string{"tools", "children", "functions"} {
+		if children, ok := tool[key].([]any); ok {
+			return children
+		}
+	}
+
+	return nil
+}
+
+// responsesToolSpecName 读取已构造 chat function spec 的工具名。
+func responsesToolSpecName(spec map[string]any) string {
+	fn, _ := spec["function"].(map[string]any)
+	return stringValue(fn["name"])
+}
+
+// responsesToolNamespaces 从请求工具声明里收集 name → namespace。
+func responsesToolNamespaces(tools []map[string]any) map[string]string {
+	_, namespaces := responsesTools(tools)
+	return namespaces
+}
+
+// responsesToolNamespacesFromBody 从原始 Responses 请求体收集 namespace 映射。
+func responsesToolNamespacesFromBody(body []byte) map[string]string {
+	var req struct {
+		Tools []map[string]any `json:"tools"`
+		Input json.RawMessage  `json:"input"`
+	}
+	if json.Unmarshal(body, &req) != nil {
+		return nil
+	}
+
+	return responsesToolNamespaces(append(req.Tools, responsesAdditionalTools(req.Input)...))
+}
+
+// responsesResolveToolName 把模型回传的工具名解析成 (bare, namespace)。
+// 正常路径是 flat 名直接命中映射；兼容模型自行拼出的 ns__tool / ns::tool。
+func responsesResolveToolName(name string, namespaces map[string]string) (string, string) {
+	if ns, ok := namespaces[name]; ok {
+		return name, ns
+	}
+
+	for bare, ns := range namespaces {
+		if name == ns+"__"+bare || name == ns+"::"+bare {
+			return bare, ns
+		}
+	}
+
+	return name, ""
 }
 
 // responsesFunctionTool 读取 function 工具定义（兼容嵌套 function 形态）。
@@ -753,10 +1006,11 @@ type responsesResponder struct {
 	instructions string
 	keepalive    time.Duration
 	customTools  map[string]bool
+	namespaces   map[string]string
 }
 
 func (r *responsesResponder) JSON(status int, body any) {
-	writeJSON(r.w, status, responsesFromOpenAI(body, r.model, r.instructions, r.customTools))
+	writeJSON(r.w, status, responsesFromOpenAIWithNamespaces(body, r.model, r.instructions, r.customTools, r.namespaces))
 }
 
 // Error 保持 OpenAI 错误信封（Responses 客户端同样识别）。
@@ -767,7 +1021,7 @@ func (r *responsesResponder) Error(status int, code, msg, hint string) {
 func (r *responsesResponder) Header(name, value string) { r.w.Header().Set(name, value) }
 
 func (r *responsesResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
-	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions, r.customTools)
+	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions, r.customTools, r.namespaces)
 
 	opts := make([]upstream.StreamOption, 0, 2)
 	if onErrFrame != nil {
@@ -788,15 +1042,25 @@ func (r *responsesResponder) Stream(rc io.Reader, hint func(string) string, repa
 
 // responsesFromOpenAI 把聚合后的 chat.completion 转成 Responses 对象。
 func responsesFromOpenAI(body any, model, instructions string, customTools ...map[string]bool) map[string]any {
-	obj, _ := body.(map[string]any)
-	choice := firstOpenAIChoice(obj)
-
 	custom := map[string]bool{}
 	if len(customTools) > 0 {
 		custom = customTools[0]
 	}
 
-	output, text, status := responsesOutput(choice, custom)
+	return responsesFromOpenAIWithNamespaces(body, model, instructions, custom, nil)
+}
+
+// responsesFromOpenAIWithNamespaces 在 Responses 对象里还原 namespace 工具。
+func responsesFromOpenAIWithNamespaces(
+	body any,
+	model, instructions string,
+	customTools map[string]bool,
+	namespaces map[string]string,
+) map[string]any {
+	obj, _ := body.(map[string]any)
+	choice := firstOpenAIChoice(obj)
+
+	output, text, status := responsesOutput(choice, customTools, namespaces)
 	usage := responsesUsage(obj["usage"])
 
 	id := stringValue(obj["id"])
@@ -828,7 +1092,7 @@ func responsesIncompleteReason(choice map[string]any) string {
 }
 
 // responsesOutput 从 choices[0] 构建 output 数组、output_text 与状态。
-func responsesOutput(choice map[string]any, customTools map[string]bool) ([]any, string, string) {
+func responsesOutput(choice map[string]any, customTools map[string]bool, namespaces map[string]string) ([]any, string, string) {
 	if choice == nil {
 		return []any{}, "", "completed"
 	}
@@ -847,7 +1111,7 @@ func responsesOutput(choice map[string]any, customTools map[string]bool) ([]any,
 		output = append(output, responsesMessageItem("msg_gateway", text, "completed"))
 	}
 
-	output = append(output, responsesFunctionItems(msg["tool_calls"], customTools)...)
+	output = append(output, responsesFunctionItems(msg["tool_calls"], customTools, namespaces)...)
 	if len(output) == 0 {
 		output = append(output, responsesMessageItem("msg_gateway", "", "completed"))
 	}
@@ -917,14 +1181,14 @@ func mapItems(raw any) []map[string]any {
 	}
 }
 
-func responsesFunctionItems(raw any, customTools map[string]bool) []any {
+func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map[string]string) []any {
 	calls := mapItems(raw)
 
 	out := make([]any, 0, len(calls))
 	for i, call := range calls {
 		fn, _ := call["function"].(map[string]any)
 
-		name := stringValue(fn["name"])
+		name, namespace := responsesResolveToolName(stringValue(fn["name"]), namespaces)
 		if name == "" {
 			continue
 		}
@@ -936,21 +1200,32 @@ func responsesFunctionItems(raw any, customTools map[string]bool) []any {
 
 		args := stringValue(fn["arguments"])
 		if customTools[name] {
-			out = append(out, map[string]any{
+			item := map[string]any{
 				"type": "custom_tool_call", "id": "ctc_" + callID, "call_id": callID,
 				"name": name, "input": responsesCustomToolInput(args), "status": "completed",
-			})
+			}
+			responsesSetNamespace(item, namespace)
+			out = append(out, item)
 
 			continue
 		}
 
-		out = append(out, map[string]any{
+		item := map[string]any{
 			"type": "function_call", "id": "fc_" + callID, "call_id": callID,
 			"name": name, "arguments": args, "status": "completed",
-		})
+		}
+		responsesSetNamespace(item, namespace)
+		out = append(out, item)
 	}
 
 	return out
+}
+
+// responsesSetNamespace 把 namespace 写进 function_call / custom_tool_call。
+func responsesSetNamespace(item map[string]any, namespace string) {
+	if namespace != "" {
+		item["namespace"] = namespace
+	}
 }
 
 // responsesCustomToolInput 从降级后的 {"input":"..."} 参数里还原 freeform 文本。
@@ -1044,6 +1319,7 @@ type responsesStreamWriter struct {
 	model        string
 	instructions string
 	customTools  map[string]bool
+	namespaces   map[string]string
 
 	pending  []byte
 	started  bool
@@ -1093,12 +1369,14 @@ func newResponsesStreamWriter(
 	w http.ResponseWriter,
 	model, instructions string,
 	customTools map[string]bool,
+	namespaces map[string]string,
 ) *responsesStreamWriter {
 	fl, _ := w.(http.Flusher)
 
 	return &responsesStreamWriter{
 		w: w, fl: fl, model: model, instructions: instructions, customTools: customTools,
-		created: time.Now().Unix(), tools: map[int]*responsesToolState{},
+		namespaces: namespaces,
+		created:    time.Now().Unix(), tools: map[int]*responsesToolState{},
 	}
 }
 
@@ -1336,6 +1614,8 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 	}
 
 	name, callID := toolCallIdentity(call)
+	name, _ = responsesResolveToolName(name, s.namespaces)
+
 	if name == "" {
 		return nil
 	}
@@ -1507,17 +1787,25 @@ func (s *responsesStreamWriter) messageItem(status string) map[string]any {
 }
 
 func (s *responsesStreamWriter) functionItem(state *responsesToolState, status string) map[string]any {
+	namespace := s.namespaces[state.name]
+
 	if state.custom {
-		return map[string]any{
+		item := map[string]any{
 			"type": "custom_tool_call", "id": state.id, "call_id": state.callID,
 			"name": state.name, "input": responsesCustomToolInput(state.args.String()), "status": status,
 		}
+		responsesSetNamespace(item, namespace)
+
+		return item
 	}
 
-	return map[string]any{
+	item := map[string]any{
 		"type": "function_call", "id": state.id, "call_id": state.callID,
 		"name": state.name, "arguments": state.args.String(), "status": status,
 	}
+	responsesSetNamespace(item, namespace)
+
+	return item
 }
 
 func (s *responsesStreamWriter) responseObject(status string) map[string]any {

@@ -98,7 +98,9 @@ func (h *Handler) localWebToolRounds() int {
 
 // serveResponsesWithLocalTools 执行本地工具循环并写回最终响应。
 func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Request, body []byte, wanted map[string]bool) {
-	openAI, model, instructions, stream, err := responsesToOpenAI(body)
+	openAI, model, instructions, stream, err := responsesToOpenAIWithClient(
+		body, h.responsesHTTPClient(), h.cfg.ModelAliases,
+	)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -119,7 +121,10 @@ func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	resp := responsesFromOpenAI(final, model, instructions, responsesCustomTools(body))
+	resp := responsesFromOpenAIWithNamespaces(
+		final, model, instructions,
+		responsesCustomTools(body), responsesToolNamespacesFromBody(body),
+	)
 	if stream {
 		writeResponsesObjectSSE(w, resp)
 		return

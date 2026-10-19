@@ -60,6 +60,72 @@ func TestResponsesRequestMapping(t *testing.T) {
 	assertResponsesParams(t, got)
 }
 
+// TestResponsesRequestDefaultsMaxOutputTokens Codex 0.162+ 不再携带
+// max_output_tokens；网关必须按模型目录补全，否则上游回落到 32k 输出预算。
+func TestResponsesRequestDefaultsMaxOutputTokens(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"cn:deepseek-v4.1-flash","input":"hi"}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got["max_tokens"] != float64(384000) {
+		t.Errorf("max_tokens=%v want 384000", got["max_tokens"])
+	}
+}
+
+// TestResponsesAliasDefaultMaxOutputTokens 别名解析后同样按目标模型补全。
+func TestResponsesAliasDefaultMaxOutputTokens(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"codex","input":"hi"}`
+
+	raw, _, _, _, err := responsesToOpenAIWithClient(
+		[]byte(body), nil, map[string]string{"codex": "cn:deepseek-v4.1-flash"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got["max_tokens"] != float64(384000) {
+		t.Errorf("max_tokens=%v want 384000", got["max_tokens"])
+	}
+}
+
+// TestResponsesRequestUnknownModelNoDefaultMaxTokens 未知模型不编造输出上限。
+func TestResponsesRequestUnknownModelNoDefaultMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"unknown-model","input":"hi"}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := got["max_tokens"]; ok {
+		t.Errorf("unknown model should not get max_tokens: %v", got["max_tokens"])
+	}
+}
+
 func assertResponsesParams(t *testing.T, got map[string]any) {
 	t.Helper()
 
@@ -205,6 +271,232 @@ func TestResponsesRequestCustomToolRoundTrip(t *testing.T) {
 	params := tools[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
 	if params["properties"].(map[string]any)["input"] == nil {
 		t.Errorf("custom tool parameters=%v", params)
+	}
+}
+
+// TestResponsesAdditionalTools Codex 0.162+ 把工具放在 input.additional_tools，
+// 顶层 tools 为空；转换后必须合并进 chat tools，custom 工具也要被识别。
+func TestResponsesAdditionalTools(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"m",
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[
+				{"type":"function","name":"exec_command","parameters":{"type":"object"}},
+				{"type":"custom","name":"apply_patch","description":"patch"}
+			]},
+			{"type":"message","role":"user","content":"hi"}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 2 {
+		t.Fatalf("tools=%d want 2: %v", len(tools), tools)
+	}
+
+	names := map[string]bool{}
+	for _, tool := range tools {
+		names[tool.(map[string]any)["function"].(map[string]any)["name"].(string)] = true
+	}
+
+	if !names["exec_command"] || !names["apply_patch"] {
+		t.Errorf("tools=%v", names)
+	}
+
+	custom := responsesCustomTools([]byte(body))
+	if !custom["apply_patch"] {
+		t.Errorf("custom tools=%v", custom)
+	}
+}
+
+// TestResponsesNamespaceTools namespace 容器展开成 flat 工具，并记录回程映射。
+func TestResponsesNamespaceTools(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"m",
+		"input":"hi",
+		"tools":[
+			{"type":"function","name":"exec_command","parameters":{"type":"object"}},
+			{"type":"namespace","name":"multi_agent_v1","tools":[
+				{"type":"function","name":"spawn_agent","parameters":{"type":"object"}},
+				{"type":"custom","name":"exec","description":"run js"}
+			]}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	tools, _ := got["tools"].([]any)
+	if len(tools) != 3 {
+		t.Fatalf("tools=%d want 3: %v", len(tools), tools)
+	}
+
+	assertResponsesFlatToolNames(t, tools, "exec_command", "spawn_agent", "exec")
+
+	if !responsesCustomTools([]byte(body))["exec"] {
+		t.Error("namespace 内的 custom 工具未被识别")
+	}
+
+	namespaces := responsesToolNamespacesFromBody([]byte(body))
+	if namespaces["spawn_agent"] != "multi_agent_v1" || namespaces["exec"] != "multi_agent_v1" {
+		t.Errorf("namespaces=%v", namespaces)
+	}
+
+	if _, ok := namespaces["exec_command"]; ok {
+		t.Errorf("top-level tool should not have namespace: %v", namespaces)
+	}
+}
+
+// assertResponsesFlatToolNames 校验转换后的 chat tools 名字集合。
+func assertResponsesFlatToolNames(t *testing.T, tools []any, want ...string) {
+	t.Helper()
+
+	names := map[string]bool{}
+	for _, tool := range tools {
+		names[tool.(map[string]any)["function"].(map[string]any)["name"].(string)] = true
+	}
+
+	for _, name := range want {
+		if !names[name] {
+			t.Errorf("missing flat tool %q: %v", name, names)
+		}
+	}
+}
+
+// TestResponsesAdditionalNamespaceTools Codex lite 的真实形状：
+// input.additional_tools 里是 namespace 容器，需要先合并再展开。
+func TestResponsesAdditionalNamespaceTools(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"m",
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[
+				{"type":"namespace","name":"functions","tools":[
+					{"type":"function","name":"exec_command","parameters":{"type":"object"}}
+				]}
+			]},
+			{"type":"message","role":"user","content":"hi"}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	assertResponsesFlatToolNames(t, got["tools"].([]any), "exec_command")
+}
+
+// TestResponsesFunctionItemsNamespace 非流式回程补回 namespace。
+func TestResponsesFunctionItemsNamespace(t *testing.T) {
+	t.Parallel()
+
+	body := map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"content": "",
+				"tool_calls": []any{map[string]any{
+					"id": "call_1", "type": "function",
+					"function": map[string]any{"name": "spawn_agent", "arguments": "{}"},
+				}},
+			},
+		}},
+	}
+
+	resp := responsesFromOpenAIWithNamespaces(body, "m", "", nil, map[string]string{"spawn_agent": "multi_agent_v1"})
+
+	output, _ := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%v", output)
+	}
+
+	item := output[0].(map[string]any)
+	if item["name"] != "spawn_agent" || item["namespace"] != "multi_agent_v1" {
+		t.Errorf("item=%v", item)
+	}
+}
+
+// TestResponsesStreamWriterNamespace 流式 output_item 补回 namespace。
+func TestResponsesStreamWriterNamespace(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	w := newResponsesStreamWriter(rec, "m", "", nil, map[string]string{"spawn_agent": "multi_agent_v1"})
+
+	chunks := `data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"spawn_agent","arguments":"{}"}}]}}]}` + "\n\n" +
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	if _, err := w.Write([]byte(chunks)); err != nil {
+		t.Fatal(err)
+	}
+
+	out := rec.Body.String()
+	for _, want := range []string{`"name":"spawn_agent"`, `"namespace":"multi_agent_v1"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stream missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestResponsesAgentMessage 子代理消息与无 call_id 的工具输出降级为 user 消息。
+func TestResponsesAgentMessage(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"m",
+		"input":[
+			{"type":"agent_message","content":[{"type":"text","text":"child result"}]},
+			{"type":"function_call_output","output":"orphan output"}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages=%d want 2: %v", len(msgs), msgs)
+	}
+
+	for i, want := range []string{"child result", "orphan output"} {
+		msg := msgs[i].(map[string]any)
+		if msg["role"] != "user" || !strings.Contains(msg["content"].(string), want) {
+			t.Errorf("message[%d]=%v", i, msg)
+		}
 	}
 }
 
@@ -367,7 +659,7 @@ func TestResponsesFunctionItemsAggregatedShape(t *testing.T) {
 	items := responsesFunctionItems([]map[string]any{{
 		"id": "call_1", "type": "function",
 		"function": map[string]any{"name": "lookup", "arguments": `{"q":1}`},
-	}}, nil)
+	}}, nil, nil)
 
 	if len(items) != 1 {
 		t.Fatalf("items=%v", items)
@@ -408,7 +700,7 @@ func TestResponsesStreamWriter(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
-	w := newResponsesStreamWriter(rec, "glm-5.2", "sys", nil)
+	w := newResponsesStreamWriter(rec, "glm-5.2", "sys", nil, nil)
 
 	chunks := `data: {"id":"chatcmpl-1","created":1753600000,"choices":[{"index":0,"delta":{"content":"he"}}]}` + "\n\n" +
 		`data: {"id":"chatcmpl-1","choices":[{"index":0,"delta":{"content":"llo"}}]}` + "\n\n" +
@@ -441,7 +733,7 @@ func TestResponsesStreamWriterCustomTool(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
-	w := newResponsesStreamWriter(rec, "m", "", map[string]bool{"apply_patch": true})
+	w := newResponsesStreamWriter(rec, "m", "", map[string]bool{"apply_patch": true}, nil)
 
 	chunks := `data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"apply_patch","arguments":"{\"input\":\"patch\"}"}}]}}]}` + "\n\n" +
 		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
