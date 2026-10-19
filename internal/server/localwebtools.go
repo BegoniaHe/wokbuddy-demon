@@ -119,7 +119,7 @@ func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	resp := responsesFromOpenAI(final, model, instructions)
+	resp := responsesFromOpenAI(final, model, instructions, responsesCustomTools(body))
 	if stream {
 		writeResponsesObjectSSE(w, resp)
 		return
@@ -342,7 +342,11 @@ func writeResponsesObjectSSE(w http.ResponseWriter, resp map[string]any) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
+	seq := 0
 	event := func(name string, payload map[string]any) {
+		payload["sequence_number"] = seq
+		seq++
+
 		raw, err := json.Marshal(payload)
 		if err != nil {
 			return
@@ -387,15 +391,15 @@ func emitBufferedMessage(event func(string, map[string]any), item map[string]any
 
 		event("response.content_part.added", map[string]any{
 			"type": "response.content_part.added", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+			"content_index": partIndex, "part": responsesOutputText(""),
 		})
 		event("response.output_text.delta", map[string]any{
 			"type": "response.output_text.delta", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "delta": text,
+			"content_index": partIndex, "delta": text, "logprobs": []any{},
 		})
 		event("response.output_text.done", map[string]any{
 			"type": "response.output_text.done", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "text": text,
+			"content_index": partIndex, "text": text, "logprobs": []any{},
 		})
 	}
 }

@@ -98,6 +98,47 @@ func assertAnthropicToolRoundTrip(t *testing.T, msgs []any) {
 	}
 }
 
+// TestAnthropicToolResultImage tool_result 里的图片转为后续 user 图片消息。
+func TestAnthropicToolResultImage(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model":"m","max_tokens":32,
+		"messages":[
+			{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"view","input":{}}]},
+			{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[
+				{"type":"text","text":"shot"},
+				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}
+			]}]}
+		]
+	}`)
+
+	raw, _, _, err := anthropicToOpenAI(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages=%d want 3: %v", len(msgs), msgs)
+	}
+
+	image := msgs[2].(map[string]any)
+	if image["role"] != "user" {
+		t.Fatalf("image message=%v", image)
+	}
+
+	parts := image["content"].([]any)
+	if parts[0].(map[string]any)["type"] != "image_url" {
+		t.Errorf("parts=%v", parts)
+	}
+}
+
 // TestAnthropicToOpenAITools tools / tool_choice 映射。
 func TestAnthropicToOpenAITools(t *testing.T) {
 	t.Parallel()
@@ -319,6 +360,141 @@ func TestAnthropicCountTokens(t *testing.T) {
 	}
 }
 
+func TestAnthropicCountTokensRequiresModel(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(&Config{})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens",
+		strings.NewReader(`{"messages":[{"role":"user","content":"hi"}]}`)))
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_request_error") {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestAnthropicRequestDisableParallel tool_choice.disable_parallel_tool_use
+// 必须映射为 chat/completions 的 parallel_tool_calls=false。
+func TestAnthropicRequestDisableParallel(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model":"m","messages":[{"role":"user","content":"hi"}],
+		"tools":[{"name":"f","input_schema":{"type":"object"}}],
+		"tool_choice":{"type":"auto","disable_parallel_tool_use":true}
+	}`)
+
+	raw, _, _, err := anthropicToOpenAI(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got["parallel_tool_calls"] != false {
+		t.Fatalf("parallel_tool_calls=%v", got["parallel_tool_calls"])
+	}
+}
+
+// TestAnthropicOutputConfig output_config 的 effort 与 json_schema 格式映射。
+func TestAnthropicOutputConfig(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model":"m","messages":[{"role":"user","content":"hi"}],
+		"output_config":{
+			"effort":"high",
+			"format":{"type":"json_schema","schema":{"type":"object","properties":{"x":{"type":"string"}}}}
+		}
+	}`)
+
+	raw, _, _, err := anthropicToOpenAI(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if got["reasoning_effort"] != "high" {
+		t.Errorf("reasoning_effort=%v", got["reasoning_effort"])
+	}
+
+	format, _ := got["response_format"].(map[string]any)
+	if format["type"] != "json_schema" {
+		t.Fatalf("response_format=%v", format)
+	}
+}
+
+// TestAnthropicUsageCacheDetails OpenAI 缓存统计映射为 Anthropic cache 字段，
+// 且 input_tokens 不再包含缓存命中部分。
+func TestAnthropicUsageCacheDetails(t *testing.T) {
+	t.Parallel()
+
+	usage := anthropicUsage(map[string]any{
+		"prompt_tokens":     float64(100),
+		"completion_tokens": float64(7),
+		"prompt_tokens_details": map[string]any{
+			"cached_tokens":      float64(40),
+			"cache_write_tokens": float64(5),
+		},
+	})
+
+	if usage["input_tokens"] != 55 || usage["output_tokens"] != 7 {
+		t.Fatalf("usage=%v", usage)
+	}
+
+	if usage["cache_read_input_tokens"] != 40 || usage["cache_creation_input_tokens"] != 5 {
+		t.Fatalf("cache usage=%v", usage)
+	}
+}
+
+// TestAnthropicNonStreamContentParts 上游以 text parts 返回时必须拼成文本块。
+func TestAnthropicNonStreamContentParts(t *testing.T) {
+	t.Parallel()
+
+	msg := anthropicMessageFromOpenAI(map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"content": []any{
+					map[string]any{"type": "text", "text": "he"},
+					map[string]any{"type": "text", "text": "llo"},
+				},
+			},
+			"finish_reason": "stop",
+		}},
+	}, "m")
+
+	content := msg["content"].([]any)
+	if len(content) != 1 || content[0].(map[string]any)["text"] != "hello" {
+		t.Fatalf("content=%v", content)
+	}
+}
+
+// TestAnthropicXAPIKeyAuth Anthropic SDK api_key 模式只发 x-api-key。
+func TestAnthropicXAPIKeyAuth(t *testing.T) {
+	t.Parallel()
+
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{APIKey: "secret", Pool: p, Upstream: up})
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"glm-5.2","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Api-Key", "secret")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("x-api-key code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
 // TestAnthropicAuthErrorShape 鉴权失败使用 Anthropic 错误体。
 func TestAnthropicAuthErrorShape(t *testing.T) {
 	t.Parallel()
@@ -345,6 +521,20 @@ func TestAnthropicAuthErrorShape(t *testing.T) {
 	e := resp["error"].(map[string]any)
 	if e["type"] != "authentication_error" {
 		t.Fatalf("error.type=%v", e["type"])
+	}
+}
+
+// TestAnthropicToolUseAggregatedShape 非流式聚合产出 []map[string]any。
+func TestAnthropicToolUseAggregatedShape(t *testing.T) {
+	t.Parallel()
+
+	blocks := anthropicToolUseBlocks([]map[string]any{{
+		"id": "call_1", "type": "function",
+		"function": map[string]any{"name": "lookup", "arguments": `{"q":1}`},
+	}})
+
+	if len(blocks) != 1 || blocks[0].(map[string]any)["name"] != "lookup" {
+		t.Fatalf("blocks=%v", blocks)
 	}
 }
 
