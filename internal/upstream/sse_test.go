@@ -145,6 +145,22 @@ func TestAggregate(t *testing.T) {
 	}
 }
 
+func TestAggregateErrorFrame(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"error\":{\"code\":6004,\"message\":\"limited\"}}\n\n" +
+		"data: [DONE]\n\n"
+
+	_, err := Aggregate(strings.NewReader(raw))
+	if !IsErrorFrameError(err) {
+		t.Fatalf("err=%v want error frame", err)
+	}
+
+	if payload := ErrorFramePayload(err); !strings.Contains(payload, "6004") {
+		t.Fatalf("payload=%q", payload)
+	}
+}
+
 func TestAggregateSkipsNonDataLines(t *testing.T) {
 	t.Parallel()
 
@@ -244,7 +260,12 @@ func TestStripToolCallNamesMissingIndex(t *testing.T) {
 
 	tcs := table["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)
 	for i, want := range []string{"Bash", "Read"} {
-		fn := tcs[i].(map[string]any)["function"].(map[string]any)
+		call := tcs[i].(map[string]any)
+		if call["index"] != i {
+			t.Errorf("同帧调用 %d index=%v want %d", i, call["index"], i)
+		}
+
+		fn := call["function"].(map[string]any)
 		if fn["name"] != want {
 			t.Errorf("同帧调用 %d name=%v want %s", i, fn["name"], want)
 		}
