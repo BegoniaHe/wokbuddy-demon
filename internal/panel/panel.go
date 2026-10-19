@@ -1024,8 +1024,28 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.syncNicknames(ctx)
+
+	if ctx.Err() != nil {
+		return // 昵称同步期间客户端断开：不再写回执
+	}
+
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
+}
+
+// acquireSem 在 ctx 取消前占用一个信号量名额；已取消或等待中取消返回 false。
+// 已有取消时不能只靠 select：sem 有空位会与 ctx.Done 同时就绪，随机选择仍可能派发。
+func acquireSem(ctx context.Context, sem chan struct{}) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	select {
+	case sem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // syncNicknames 手动刷新时的昵称同步（issue #94：上游改名免重登）。
@@ -1047,13 +1067,10 @@ func (p *Panel) syncNicknames(ctx context.Context) {
 		wg      sync.WaitGroup
 	)
 
-loop:
 	for _, j := range jobs {
 		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			break loop
+		if !acquireSem(ctx, sem) {
+			break
 		}
 
 		wg.Add(1)
