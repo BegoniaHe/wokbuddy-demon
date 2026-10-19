@@ -605,25 +605,29 @@ func (p *Pool) Add(a *auth.Auth) {
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 
-	var replaced []*auth.Auth
+	// 被替换与被剔除的凭证都要在锁外退役：它们可能仍被在途请求 / 调度器持有，
+	// 退役后其 SaveAtomic 拒绝写回，避免扫描删号后旧 refresh 把 auth 文件写回来。
+	var retired []*auth.Auth
 
 	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
 		seen[a.UID] = true
 		if old := p.upsertLocked(a); old != nil {
-			replaced = append(replaced, old)
+			retired = append(retired, old)
 		}
 	}
 
 	changed := false
 
-	for uid, e := range p.byUID {
+	for uid, entry2 := range p.byUID {
 		if !seen[uid] {
-			if n := e.inFlight.Swap(0); n > 0 {
+			if n := entry2.inFlight.Swap(0); n > 0 {
 				p.inFlightTotal.Add(-n)
 			}
 
 			delete(p.byUID, uid)
+
+			retired = append(retired, entry2.a)
 
 			changed = true
 		}
@@ -638,7 +642,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 
 	p.mu.Unlock()
 
-	for _, old := range replaced {
+	for _, old := range retired {
 		old.Retire()
 	}
 

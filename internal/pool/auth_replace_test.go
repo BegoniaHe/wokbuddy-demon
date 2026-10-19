@@ -49,3 +49,28 @@ func TestAddSameAuthPointerNotRetired(t *testing.T) {
 		t.Fatalf("same-pointer upsert retired the active auth: %v", err)
 	}
 }
+
+// TestSyncToDirRetiresRemovedAuth：目录扫描剔除的账号也必须退役，
+// 否则在途 token refresh 仍可把已删账号的 auth 文件写回来。
+func TestSyncToDirRetiresRemovedAuth(t *testing.T) {
+	t.Parallel()
+
+	testPool := newTestPool(t, "")
+	dir := t.TempDir()
+	removedPath := filepath.Join(dir, "workbuddy-u1.json")
+	keptPath := filepath.Join(dir, "workbuddy-u2.json")
+
+	removed := &auth.Auth{UID: "u1", AccessToken: "at1", RefreshToken: "rt1", FilePath: removedPath}
+	kept := &auth.Auth{UID: "u2", AccessToken: "at2", RefreshToken: "rt2", FilePath: keptPath}
+
+	testPool.SyncToDir([]*auth.Auth{removed, kept})
+	testPool.SyncToDir([]*auth.Auth{kept})
+
+	if err := removed.SaveAtomic(); err == nil {
+		t.Fatal("removed auth SaveAtomic should be refused")
+	}
+
+	if err := kept.SaveAtomic(); err != nil {
+		t.Fatalf("kept auth was retired: %v", err)
+	}
+}
