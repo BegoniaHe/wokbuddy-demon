@@ -3,6 +3,8 @@ package pool
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -46,5 +48,71 @@ func TestPersistFailureKeepsDirty(t *testing.T) {
 
 	if _, err := os.Stat(pool.stateFp); err != nil {
 		t.Fatalf("重试后应生成 state.json: %v", err)
+	}
+}
+
+// TestFlushPersistsSnapshotTakenByFlusher：后台 flusher 已清 dirty 并生成快照、
+// 但尚未落盘时调用 Flush，Flush 返回后 state.json 必须已包含最新状态——否则
+// 进程恰在此刻退出会丢掉最后一笔（旧实现只检查 dirty，会直接返回）。
+func TestFlushPersistsSnapshotTakenByFlusher(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	testPool := newTestPool(t, statePath)
+	testPool.Add(&auth.Auth{UID: "u1"})
+	testPool.SetCredits("u1", 42, 0)
+
+	// 模拟 flusher 的「已生成快照、尚未 persistState」窗口：丢弃快照本身，
+	// 只保留 persistSeq 已推进、savedSeq 未推进的状态。
+	testPool.mu.Lock()
+	if !testPool.dirty.Swap(false) {
+		testPool.mu.Unlock()
+		t.Fatal("expected dirty state")
+	}
+
+	_, _ = testPool.snapshotStateLocked()
+	testPool.mu.Unlock()
+
+	testPool.Flush()
+
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("Flush 应等待/补写在途快照: %v", err)
+	}
+
+	if !strings.Contains(string(raw), `"credits": 42`) {
+		t.Fatalf("state.json 未包含最新状态: %s", raw)
+	}
+}
+
+// TestConcurrentPersistKeepsNewestSnapshot（E3）：并发 Flush 时快照序号必须
+// 保证后生成的状态覆盖先生成的，旧快照不得回写；最终落盘是最后一次写入。
+func TestConcurrentPersistKeepsNewestSnapshot(t *testing.T) {
+	t.Parallel()
+
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	testPool := newTestPool(t, statePath)
+	testPool.Add(&auth.Auth{UID: "u1"})
+
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			testPool.SetCredits("u1", int64(i+1), 0)
+			testPool.Flush()
+		})
+	}
+
+	wg.Wait()
+
+	testPool.SetCredits("u1", 999, 0)
+	testPool.Flush()
+
+	raw, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(raw), `"credits": 999`) {
+		t.Fatalf("newest snapshot not persisted: %s", raw)
 	}
 }

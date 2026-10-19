@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,12 +53,41 @@ func IsClientWriteError(err error) bool { return errors.Is(err, errClientWrite) 
 // 不返回残缺成功响应，由 handler 映射为 502 upstream_parse（issue #105）。
 // 聚合总量超 32 MiB → ErrSSEAggregateTooLong（issue #113），同样不返回残缺成功。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+// sseReaderPool 复用 64KB 的 SSE 行读取缓冲：每个流式请求都会创建一层
+// bufio.Reader，池化后避免每请求一次 64KB 分配。归还前 Reset(nil)，不持有
+// 上游 body 引用。
+var sseReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, 64*1024) },
+}
+
+func getSSEReader(r io.Reader) *bufio.Reader {
+	reader, _ := sseReaderPool.Get().(*bufio.Reader)
+	if reader == nil {
+		reader = bufio.NewReaderSize(nil, 64*1024)
+	}
+
+	reader.Reset(r)
+
+	return reader
+}
+
+func putSSEReader(reader *bufio.Reader) {
+	if reader == nil {
+		return
+	}
+
+	reader.Reset(nil)
+	sseReaderPool.Put(reader)
+}
+
 func Aggregate(r io.Reader) (map[string]any, error) {
 	streamAggregator2 := newStreamAggregator()
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	reader := getSSEReader(r)
+	defer putSSEReader(reader)
+
 	for {
-		line, err := readSSELine(br)
+		line, err := readSSELine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, err
 		}
@@ -1124,11 +1154,13 @@ func (s *streamWriter) stream(r io.Reader) error {
 		return s.streamWithKeepalive(r)
 	}
 
-	br := bufio.NewReaderSize(r, 64*1024)
+	reader := getSSEReader(r)
+	defer putSSEReader(reader)
+
 	validFrames := 0
 
 	for {
-		line, err := readSSELine(br)
+		line, err := readSSELine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			// 超长行（防御上限，issue #113）：先给客户端一个明确的 error 帧再收尾，
 			// 不把超限行的已读部分当内容透传（也不回退——那正是 OOM 的成因）。
@@ -1168,12 +1200,19 @@ type lineResult struct {
 // 读放在独立 goroutine，主循环 select 读结果与心跳定时器；退出时关闭 r
 // （若可关闭）以解除读阻塞，避免 goroutine 泄漏。
 func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
-	if c, ok := r.(io.Closer); ok {
-		defer c.Close()
-	}
+	lines, done, finished := asyncLines(r)
+	// 返回前先关 done 再 Close 底层 reader（解除阻塞中的 Read），最后等读 goroutine
+	// 真正退出。只关 done 不等待会让调用方在 goroutine 仍读 r 时继续使用/释放 r
+	// （统计 reader 会把它包装的 bufio.Reader 归还池中，造成并发读写）。
+	defer func() {
+		close(done)
 
-	lines, done := asyncLines(r)
-	defer close(done)
+		if c, ok := r.(io.Closer); ok {
+			_ = c.Close()
+
+			<-finished
+		}
+	}()
 
 	ticker := time.NewTicker(s.keepalive)
 	defer ticker.Stop()
@@ -1209,12 +1248,17 @@ func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
 }
 
 // asyncLines 启动逐行读取 goroutine；done 关闭后 goroutine 退出。
-func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
-	reader := bufio.NewReaderSize(r, 64*1024)
+func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}, <-chan struct{}) {
+	reader := getSSEReader(r)
 	lines := make(chan lineResult)
 	done := make(chan struct{})
+	finished := make(chan struct{})
 
 	go func() {
+		// LIFO：先归还 reader 再宣告退出，等待方看到 finished 时 reader 已不在使用。
+		defer close(finished)
+		defer putSSEReader(reader)
+
 		for {
 			line, err := readSSELine(reader)
 			select {
@@ -1229,7 +1273,7 @@ func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}) {
 		}
 	}()
 
-	return lines, done
+	return lines, done, finished
 }
 
 // consumeLine 处理一行并更新最近写出时间；stop=true 表示应进入收尾（[DONE]/EOF）。

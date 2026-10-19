@@ -32,17 +32,51 @@ const maxUserAgentLen = 200
 // chatSeq 进程级请求序号。
 var chatSeq atomic.Int64
 
-// chatLogEnabled 聊天表格日志总开关。生产恒 true；
-// 测试包经 TestMain 置 false 关闭 stdout 噪音，需要断言行输出的测试用 withChatLog 临时开启（R5）。
-var chatLogEnabled = true
+// chatLogEnabled 聊天表格日志总开关。生产恒 true；测试可并发改写，故用 atomic。
+// 包级函数表达式完成默认值初始化（不用 init 函数）。
+var chatLogEnabled = func() *atomic.Bool {
+	enabled := &atomic.Bool{}
+	enabled.Store(true)
 
-// chatLogOut 聊天表格日志的输出目标。生产默认 os.Stdout；main 在启用管理面板时
-// 经 SetChatLogOutput 注入 MultiWriter，把每行镜像进 /panel/api/logs 的环形缓冲，
-// stdout 行为不变。需在开始服务前调用一次（无并发竞争窗口）。
-var chatLogOut io.Writer = os.Stdout
+	return enabled
+}()
 
-// SetChatLogOutput 替换聊天表格日志输出目标（仅 main 启动期调用一次）。
-func SetChatLogOutput(w io.Writer) { chatLogOut = w }
+// chatLogOut 聊天表格日志的输出目标（atomic 持有 *io.Writer）。生产默认 os.Stdout；
+// main 在启用管理面板时经 SetChatLogOutput 注入 MultiWriter，把每行镜像进
+// /panel/api/logs 的环形缓冲，stdout 行为不变。
+//
+// 用 atomic.Pointer[io.Writer] 而非 atomic.Value：后者要求每次 Store 的具体类型
+// 一致（*os.File 与 io.MultiWriter 的 *multiWriter 不同），混用会 panic。
+var (
+	chatLogOut     atomic.Pointer[io.Writer]
+	chatLogOutOnce sync.Once
+)
+
+func ensureChatLogOut() {
+	chatLogOutOnce.Do(func() {
+		w := io.Writer(os.Stdout)
+		chatLogOut.Store(&w)
+	})
+}
+
+// SetChatLogOutput 替换聊天表格日志输出目标。
+func SetChatLogOutput(w io.Writer) {
+	if w != nil {
+		ensureChatLogOut()
+		chatLogOut.Store(&w)
+	}
+}
+
+// currentChatLogOutput 读取当前输出目标。
+func currentChatLogOutput() io.Writer {
+	ensureChatLogOut()
+
+	if w := chatLogOut.Load(); w != nil {
+		return *w
+	}
+
+	return os.Stdout
+}
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
@@ -108,6 +142,7 @@ func (s *chatStat) done() {
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
 	br                  *bufio.Reader
+	src                 io.Closer // 底层上游 body（可为 nil）；Close 透传以解除异步读取阻塞
 	start               time.Time
 	ttfb                time.Duration
 	seen                bool // 已见过首个 data 帧（TTFB 只记一次）
@@ -130,9 +165,49 @@ type chatStatsReader struct {
 	pend         []byte // 已读未返回的行缓存
 }
 
+// chatStatsReader 必须实现 io.Closer：keepalive 流返回前由 upstream 关闭并等待
+// 读 goroutine 退出，之后才能安全地把 br 归还池中。
+var _ io.Closer = (*chatStatsReader)(nil)
+
+// statsReaderPool 复用 64KB 的 SSE 统计读取缓冲，避免每个流式请求一次大分配。
+var statsReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, 64*1024) },
+}
+
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
-	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
+	reader, _ := statsReaderPool.Get().(*bufio.Reader)
+	if reader == nil {
+		reader = bufio.NewReaderSize(nil, 64*1024)
+	}
+
+	reader.Reset(r)
+
+	src, _ := r.(io.Closer)
+
+	return &chatStatsReader{br: reader, src: src, start: since}
+}
+
+// Close 关闭底层上游 body。streamWithKeepalive 会在返回前关闭包装 reader 以
+// 解除异步逐行读取的阻塞，然后等待读 goroutine 退出——否则本对象可能被归还
+// 复用缓冲池时仍有 goroutine 在 Read（数据竞争 / nil 解引用）。
+func (s *chatStatsReader) Close() error {
+	if s == nil || s.src == nil {
+		return nil
+	}
+
+	return s.src.Close()
+}
+
+// release 归还底层缓冲（幂等）。调用方必须保证此后不再读取该 reader。
+func (s *chatStatsReader) release() {
+	if s == nil || s.br == nil {
+		return
+	}
+
+	s.br.Reset(nil)
+	statsReaderPool.Put(s.br)
+	s.br = nil
 }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。

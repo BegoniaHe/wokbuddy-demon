@@ -108,10 +108,19 @@ func (p *Pool) startFlusher() {
 			select {
 			case <-t.C:
 				p.mu.Lock()
-				if p.dirty.Swap(false) {
-					p.saveLocked()
+				pending := p.dirty.Swap(false)
+
+				var seq uint64
+
+				var stateSnap stateFile
+				if pending {
+					seq, stateSnap = p.snapshotStateLocked()
 				}
 				p.mu.Unlock()
+
+				if pending {
+					p.persistState(seq, stateSnap)
+				}
 			case <-stopCh:
 				return
 			}
@@ -119,13 +128,27 @@ func (p *Pool) startFlusher() {
 	}()
 }
 
-// Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
+// Flush 同步把内存状态落盘（幂等：无变更且无在途快照时不写盘）。供进程退出前调用。
 func (p *Pool) Flush() {
 	p.mu.Lock()
-	if p.dirty.Swap(false) {
-		p.saveLocked()
+	pending := p.dirty.Swap(false)
+	// dirty 为 false 仍可能有一个由 flusher 生成、尚未落盘的快照：
+	// 此时必须补写一份最新快照，否则进程紧接着退出会丢掉最后一笔状态。
+	// stateFp 为空 = 不落盘，persistState 直接返回，无需补写。
+	unsaved := p.stateFp != "" && p.persistSeq > p.savedSeq.Load()
+	needPersist := pending || unsaved
+
+	var seq uint64
+
+	var stateSnap stateFile
+	if needPersist {
+		seq, stateSnap = p.snapshotStateLocked()
 	}
 	p.mu.Unlock()
+
+	if needPersist {
+		p.persistState(seq, stateSnap)
+	}
 }
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
@@ -287,12 +310,26 @@ func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.applyAccountsLocked(s.Accounts)
 }
 
-func (p *Pool) saveLocked() {
+// snapshotStateLocked 生成一份带单调序号的一致快照；调用方必须已持有 p.mu。
+func (p *Pool) snapshotStateLocked() (uint64, stateFile) {
+	p.persistSeq++
+
+	return p.persistSeq, p.stateOverviewLocked()
+}
+
+// persistState 落盘一份快照。marshal 与磁盘 IO 均在 p.mu 之外执行；
+// persistMu 串行化写盘，savedSeq 保证乱序到达的旧快照不会覆盖新快照。
+func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 	if p.stateFp == "" {
 		return
 	}
 
-	stateFile2 := p.stateOverviewLocked()
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
+
+	if seq <= p.savedSeq.Load() {
+		return
+	}
 
 	raw, err := json.MarshalIndent(stateFile2, "", "  ")
 	if err != nil {
@@ -315,6 +352,8 @@ func (p *Pool) saveLocked() {
 		return
 	}
 
+	p.savedSeq.Store(seq)
+
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
 		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
@@ -332,8 +371,9 @@ func (p *Pool) saveLocked() {
 // notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：
 // 首败（状态成功→失败）打完整错误、每 persistLogEvery 次连续失败打一条提醒、
 // 其余连续失败静默（flusher 5s 一把，磁盘持续满时不刷屏）。
-// 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
+// 恢复成功的日志由 persistState 在成功路径统一打。与 redisstore 三处异步写的
 // "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
+// 调用方已持有 persistMu。
 //
 // 失败后重新置脏：调用方已在尝试落盘前清过 dirty，不置回会让 flusher/Flush 认为
 // 无事可做，运行态只能停留内存直至进程退出。

@@ -4,6 +4,7 @@ package pool
 import (
 	"log"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -75,8 +76,10 @@ func (p *Pool) PickExcludingForRealmTrace(tried map[string]bool, reqModel, realm
 // pickTraceWith 选号并收集决策链；trace=nil 时不分配排除原因 map（常规热路径）。
 func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trace *PickTrace) *auth.Auth {
 	var local PickTrace
-	if trace == nil {
-		trace = &local
+
+	collect := trace != nil
+	if !collect {
+		trace = &local // 仅承载计数写入；不分配 Excluded/Top（常规热路径）
 	}
 
 	p.mu.Lock()
@@ -105,8 +108,12 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	maxCredits := maxCreditsOf(cands)
 	bestTier, explored := p.resolveCostTier(cands, reqModel, realm, now)
 	trace.CostTier, trace.Explored = bestTier, explored
+
 	ordered, top := p.rankCandidates(cands, reqModel, bestTier, maxCredits, now)
-	trace.Top = topTrace(top, reqModel, now, p, maxCredits)
+	if collect {
+		trace.Top = topTrace(top, reqModel, now, p, maxCredits)
+	}
+
 	entry2 := p.selectCandidate(ordered, top, reqModel, now)
 
 	trace.FinalUID = logfmt.UID8(entry2.a.UID)
@@ -150,7 +157,7 @@ func topTrace(top []*entry, model string, now time.Time, pool *Pool, maxCredits 
 // 冷却/成本台账、按模型与域判定健康、应用积分保底拦截与在途占满过滤。
 // 调用方必须已持有 p.mu 写锁。
 func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace) []*entry {
-	var cands []*entry
+	cands := p.pickCands[:0]
 
 	for strVal, entry2 := range p.byUID {
 		if tried != nil && tried[strVal] {
@@ -170,6 +177,8 @@ func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now
 
 		cands = append(cands, entry2)
 	}
+
+	p.pickCands = cands
 
 	return cands
 }
@@ -308,7 +317,8 @@ type weightedEntry struct {
 }
 
 func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, maxCredits int64, now time.Time) (ordered, top []*entry) {
-	weightedEntries := make([]weightedEntry, 0, len(cands))
+	weightedEntries := p.pickWeightBuf[:0]
+
 	for _, e := range cands {
 		ti, ci := e.costTier(reqModel, now)
 		if ti == bestTier {
@@ -318,32 +328,25 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 
 	shuffled := len(weightedEntries) > 5
 	if shuffled {
-		shuf := rand.New(rand.NewPCG(uint64(now.UnixNano()), uint64(len(weightedEntries))))
-		shuf.Shuffle(len(weightedEntries), func(i, j int) { weightedEntries[i], weightedEntries[j] = weightedEntries[j], weightedEntries[i] })
+		// 手写 Fisher-Yates：使用并发安全的全局源，不消耗 p.randInt64N 注入源，
+		// 也避免每次 Pick 分配 PCG 与 Shuffle 闭包。
+		for i := len(weightedEntries) - 1; i > 0; i-- {
+			j := rand.IntN(i + 1)
+			weightedEntries[i], weightedEntries[j] = weightedEntries[j], weightedEntries[i]
+		}
 	}
 
-	sort.SliceStable(weightedEntries, func(i, j int) bool {
-		// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
-		// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
-		if weightedEntries[i].cost1k != weightedEntries[j].cost1k {
-			return weightedEntries[i].cost1k < weightedEntries[j].cost1k // 收费层：单价低的在前
-		}
-
-		if weightedEntries[i].w != weightedEntries[j].w {
-			return weightedEntries[i].w > weightedEntries[j].w
-		}
-
-		if shuffled {
-			return false // 保持洗牌后的相对顺序
-		}
-
-		return weightedEntries[i].e.a.UID < weightedEntries[j].e.a.UID
+	slices.SortStableFunc(weightedEntries, func(left, right weightedEntry) int {
+		return compareWeighted(left, right, shuffled)
 	})
 
-	ordered = make([]*entry, len(weightedEntries))
-	for i, c := range weightedEntries {
-		ordered[i] = c.e
+	ordered = p.pickOrdered[:0]
+	for _, c := range weightedEntries {
+		ordered = append(ordered, c.e)
 	}
+
+	p.pickWeightBuf = weightedEntries
+	p.pickOrdered = ordered
 
 	if len(ordered) > 5 {
 		return ordered, ordered[:5]
@@ -352,11 +355,46 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 	return ordered, ordered
 }
 
+// compareWeighted 是 rankCandidates 的排序比较器：先按单价升序，再按权重降序；
+// 洗牌后用稳定排序保持随机相对序，否则用 UID 兜底稳定输出。
+func compareWeighted(left, right weightedEntry, shuffled bool) int {
+	// costTier 硬过滤后 ws 全员同层，但仍按 cost1k 升序排（tier 2 层内单价低者
+	// 在前；tier 0/1 层 cost1k 恒 0，本比较退化为权重比较）——读缓存字段不现算。
+	if left.cost1k != right.cost1k {
+		if left.cost1k < right.cost1k {
+			return -1 // 收费层：单价低的在前
+		}
+
+		return 1
+	}
+
+	if left.w != right.w {
+		if left.w > right.w {
+			return -1
+		}
+
+		return 1
+	}
+
+	if shuffled {
+		return 0 // 保持洗牌后的相对顺序
+	}
+
+	switch {
+	case left.e.a.UID < right.e.a.UID:
+		return -1
+	case left.e.a.UID > right.e.a.UID:
+		return 1
+	default:
+		return 0
+	}
+}
+
 // selectCandidate 从有序候选中选出最终账号：先按 minPickGap 过滤（防并发撞号，
 // 同一账号在窗口内不重复被选中），全部刚被用过时在**全候选**里按 usedSeq 取最旧者
 // （LRU 兜底，避免 top5 字典序截断把等权重靠后账号饿死），否则在 top5 内加权抽签。
 func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Time) *entry {
-	eligible := make([]*entry, 0, len(top))
+	eligible := p.pickEligible[:0]
 	for _, c := range top {
 		if now.Sub(c.lastUsed) >= p.pickGap {
 			eligible = append(eligible, c)
@@ -376,6 +414,8 @@ func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Tim
 
 		return entry2
 	}
+
+	p.pickEligible = eligible
 
 	return p.pickWeighted(eligible, model) // eligible 保序 = top5 降序子集
 }
@@ -696,15 +736,20 @@ func (p *Pool) pickWeighted(cands []*entry, model string) *entry {
 
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 
-	weights := make([]int64, len(cands))
+	weights := p.pickWeights[:0]
+	if cap(weights) < len(cands) {
+		weights = make([]int64, 0, len(cands))
+	}
 
 	var total int64
 
-	for i, e := range cands {
-		w := p.routingWeightOf(e, maxCredits, model, now)
-		weights[i] = int64(w * scale)
-		total += weights[i]
+	for _, e := range cands {
+		w := int64(p.routingWeightOf(e, maxCredits, model, now) * scale)
+		weights = append(weights, w)
+		total += w
 	}
+
+	p.pickWeights = weights
 
 	rnd := rand.Int64N
 	if p.randInt64N != nil {

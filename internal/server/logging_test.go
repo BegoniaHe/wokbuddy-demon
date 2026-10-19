@@ -24,7 +24,7 @@ func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 
 	old := os.Stdout
-	oldOut := chatLogOut
+	oldOut := currentChatLogOutput()
 
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -32,16 +32,38 @@ func captureStdout(t *testing.T, fn func()) string {
 	}
 
 	os.Stdout = w
-	chatLogOut = w
+	SetChatLogOutput(w)
 
 	fn()
 
 	os.Stdout = old
-	chatLogOut = oldOut
+
+	SetChatLogOutput(oldOut)
+
 	_ = w.Close()
 	raw, _ := io.ReadAll(r)
 
 	return string(raw)
+}
+
+// TestSetChatLogOutputAcceptsDifferentWriterTypes：输出目标会从 *os.File
+// （默认 stdout）切换为 io.MultiWriter（生产 main 注入面板镜像）。atomic.Value
+// 在具体类型不一致时 Store 会 panic，故用 atomic.Pointer[io.Writer]。
+//
+//nolint:paralleltest // 该用例改写进程级日志出口，必须串行执行
+func TestSetChatLogOutputAcceptsDifferentWriterTypes(t *testing.T) {
+	old := currentChatLogOutput()
+
+	t.Cleanup(func() { SetChatLogOutput(old) })
+
+	SetChatLogOutput(os.Stdout)
+
+	multi := io.MultiWriter(io.Discard, io.Discard)
+	SetChatLogOutput(multi)
+
+	if got := currentChatLogOutput(); got != multi {
+		t.Fatalf("currentChatLogOutput() = %T, want injected MultiWriter", got)
+	}
 }
 
 // withChatLog 临时开启聊天表格日志（TestMain 默认关闭），测试结束后恢复。
@@ -49,10 +71,10 @@ func captureStdout(t *testing.T, fn func()) string {
 func withChatLog(t *testing.T) {
 	t.Helper()
 
-	old := chatLogEnabled
-	chatLogEnabled = true
+	old := chatLogEnabled.Load()
+	chatLogEnabled.Store(true)
 
-	t.Cleanup(func() { chatLogEnabled = old })
+	t.Cleanup(func() { chatLogEnabled.Store(old) })
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {

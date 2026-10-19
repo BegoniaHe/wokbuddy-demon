@@ -1,7 +1,7 @@
 interface:
   display_name: 'Reverse WorkBuddy Client'
   short_description: 'Unpack WorkBuddy builds and diff protocol vs internal/upstream'
-  default_prompt: 'Use $reverse-workbuddy to unpack the WorkBuddy clients under .tmp/workbuddy/, sweep the protocol surface with scripts/protocol_sweep.mjs, escalate to REA when grep cannot answer, and write the diff report under .tmp/workbuddy-diff/.'
+  default_prompt: 'Use $reverse-workbuddy to download the latest cn/global WorkBuddy installers with scripts/download_latest.mjs, unpack them under .tmp/workbuddy/, sweep the protocol surface with scripts/protocol_sweep.mjs, escalate to REA when grep cannot answer, and write the diff report under .tmp/workbuddy-diff/.'
 
 policy:
   allow_implicit_invocation: true

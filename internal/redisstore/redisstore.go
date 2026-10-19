@@ -86,11 +86,10 @@ func New(url, token string) Store {
 
 	log.Printf("[redisstore] upstash 已连接 (addr=%s)", opt.Addr)
 
-	return &Upstash{
-		client: client,
-		sem:    make(chan struct{}, writeConcurrencyLimit),
-		done:   make(chan struct{}),
-	}
+	u := &Upstash{client: client}
+	u.ensureInit()
+
+	return u
 }
 
 // normalizeURL 把 url+token 归一化为可直接 ParseURL 的完整 rediss:// URL。
@@ -119,11 +118,12 @@ func normalizeURL(url, token string) string {
 // 的写直接丢弃。
 type Upstash struct {
 	client *redis.Client
-	// sem 写信号量（有界在途写）。cap=1 时退化为串行写，供测试观察调度语义。
-	sem chan struct{}
-	// done 关停标志（Close 关闭）。sem 与 done 由 New 初始化；测试可直接构造
-	// （client=nil，goWrite/Close 不触网络）。
+	// sem 写信号量（有界在途写）与 done 关停标志（Close 关闭）由 ensureInit 一次性
+	// 初始化：New 与测试零值构造共用，避免并发首用时无锁写这两个字段。
+	sem  chan struct{}
 	done chan struct{}
+	// initOnce 保证 sem/done 的初始化只发生一次（并发 goWrite/Close 安全）。
+	initOnce sync.Once
 	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
 	closeOnce sync.Once
 	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先登记 wg 再查 done，
@@ -138,20 +138,21 @@ type Upstash struct {
 // goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
 // 必然执行（停机镜像完整性），Close 后提交的写直接丢弃（进程已在退出）。
 func (u *Upstash) goWrite(fn func()) {
-	u.closeOnceGuard()
+	u.ensureInit()
 	u.submitMu.Lock()
-	u.wg.Add(1)
 
 	select {
 	case <-u.done:
-		u.submitMu.Unlock()
-		u.wg.Done() // 关停后提交的写：登记即撤销，直接丢弃
+		u.submitMu.Unlock() // 关停后提交的写：直接丢弃
 
 		return
 	default:
 	}
-
+	// 先检查 done 再 Add：Close 在同一把 submitMu 下关 done，因此关停后不会再有
+	// 新的 Add；Wait 与 Add 不并发（否则零计数下并发 Add 属 WaitGroup 误用）。
+	u.wg.Add(1)
 	u.submitMu.Unlock()
+
 	go func() {
 		defer u.wg.Done()
 		// 只阻塞抢写槽，不检查 done：此处若select done，已阻塞排队的写会在
@@ -167,20 +168,25 @@ func (u *Upstash) goWrite(fn func()) {
 	}()
 }
 
-// closeOnceGuard 防零值 Upstash（未经 New 构造）在 goWrite/Close 上 nil-map 式崩溃：
-// sem/done 为 nil 时补建（cap=1）。仅测试会走到该路径。
-func (u *Upstash) closeOnceGuard() {
-	if u.sem == nil || u.done == nil {
-		u.sem = make(chan struct{}, 1)
-		u.done = make(chan struct{})
-	}
+// ensureInit 初始化 sem/done（幂等）。New 与测试零值构造共用同一入口；
+// sync.Once 保证并发 goWrite/Close 首用时不会竞争写字段。
+func (u *Upstash) ensureInit() {
+	u.initOnce.Do(func() {
+		if u.sem == nil {
+			u.sem = make(chan struct{}, writeConcurrencyLimit)
+		}
+
+		if u.done == nil {
+			u.done = make(chan struct{})
+		}
+	})
 }
 
 // Close 等待已提交的异步写全部执行完毕，再关底层 redis 连接；幂等。
 // 之后新提交的写直接丢弃（goWrite 的 done 检查）。停机路径在 pool.Close() 后调用：
 // pool 的最后一次 Flush→SaveState 已提交，本方法保证它写完才返回。
 func (u *Upstash) Close() error {
-	u.closeOnceGuard()
+	u.ensureInit()
 	// 先关 done 再等 wg：与 goWrite 的 submitMu 互斥后，此时「已提交的写」集合
 	// 已冻结（此后新提交的直接丢弃），wg.Wait 排空即覆盖在途 + 排队两层——
 	// 原 sem 探测法在排队写尚未跑到抢槽点时会误判已排空（83d18ae 竞态）。
