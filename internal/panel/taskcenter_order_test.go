@@ -53,3 +53,18 @@ func TestCollectQueueAccountsPreservesPoolOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestRunQueueRejectsMalformedJSON 畸形请求体不得触发全账号扫描与队列执行；
+// 空 body 仍走默认值（保持既有语义）。
+func TestRunQueueRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+
+	panel := New(&Config{Version: "test", APIKey: "test-key"})
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, authed(http.MethodPost, "/panel/api/tasks/run_queue", `{"concurrency":`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
+}

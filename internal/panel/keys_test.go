@@ -221,3 +221,20 @@ func TestKeysRealmUpdate(t *testing.T) {
 		t.Errorf("invalid realm code=%d want 400", code)
 	}
 }
+
+// TestKeysCreateRejectsMalformedJSON 畸形请求体不得签发密钥：否则错误输入会
+// 静默创建一把默认名密钥，调用方却以为请求失败。
+func TestKeysCreateRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+	panel := panelWithKeys(store)
+
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", `{"name":`); code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", code, body)
+	}
+
+	if keys := store.List(); len(keys) != 0 {
+		t.Fatalf("malformed request created keys: %+v", keys)
+	}
+}

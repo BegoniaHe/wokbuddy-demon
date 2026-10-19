@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sort"
@@ -197,7 +198,13 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		Growth      bool `json:"growth"`
 	}
 
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	// 空 body 允许（全部走默认值）；畸形 JSON 必须拒绝，避免错误输入触发一次
+	// 全账号扫描与队列执行。
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
 	if !body.Growth {
 		body.Growth = true
 	}

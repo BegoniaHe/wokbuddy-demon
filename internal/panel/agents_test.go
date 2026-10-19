@@ -68,3 +68,20 @@ func TestAgentsRejectNonLoopback(t *testing.T) {
 		t.Fatalf("code=%d want 403", rec.Code)
 	}
 }
+
+// TestAgentsRestoreRejectsMalformedJSON 畸形请求体返回 400，不得把 force 当
+// 默认 false 继续执行还原。
+func TestAgentsRestoreRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+	panel, _ := agentsPanel(t, "")
+
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/agents/claude/restore", strings.NewReader(`{"force":`))
+	req.RemoteAddr = "127.0.0.1:12345"
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s, want 400", rec.Code, rec.Body)
+	}
+}

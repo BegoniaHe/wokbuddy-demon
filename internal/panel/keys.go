@@ -43,7 +43,10 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 
-	_ = json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
 
 	rec, raw, err := p.cfg.Keys.Create(strings.TrimSpace(body.Name))
 	if err != nil {
