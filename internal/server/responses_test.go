@@ -358,12 +358,111 @@ func TestResponsesNamespaceTools(t *testing.T) {
 	}
 
 	namespaces := responsesToolNamespacesFromBody([]byte(body))
-	if namespaces["spawn_agent"] != "multi_agent_v1" || namespaces["exec"] != "multi_agent_v1" {
+	if namespaces["spawn_agent"].namespace != "multi_agent_v1" || namespaces["exec"].namespace != "multi_agent_v1" {
 		t.Errorf("namespaces=%v", namespaces)
 	}
 
 	if _, ok := namespaces["exec_command"]; ok {
 		t.Errorf("top-level tool should not have namespace: %v", namespaces)
+	}
+}
+
+// TestResponsesNamespaceToolCollision 不同 namespace 的同名工具都要下发给上游。
+// 重名时用限定名区分，回程再还原成裸名 + namespace，避免后一个工具被去重丢弃。
+func TestResponsesNamespaceToolCollision(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model":"m",
+		"input":"hi",
+		"tools":[
+			{"type":"namespace","name":"mcp__a__","tools":[
+				{"type":"function","name":"search","parameters":{"type":"object"}}
+			]},
+			{"type":"namespace","name":"mcp__b__","tools":[
+				{"type":"function","name":"search","parameters":{"type":"object"}}
+			]}
+		]
+	}`)
+
+	raw, _, _, _, err := responsesToOpenAI(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	assertResponsesFlatToolNames(t, got["tools"].([]any), "mcp__a__search", "mcp__b__search")
+
+	refs := responsesToolNamespacesFromBody(body)
+	assertNamespaceCollisionRefs(t, refs)
+	assertNamespaceCollisionResponse(t, refs)
+	assertNamespaceCollisionStream(t, refs)
+}
+
+func assertNamespaceCollisionRefs(t *testing.T, refs map[string]responsesToolRef) {
+	t.Helper()
+
+	for _, testCase := range []struct {
+		declared  string
+		namespace string
+	}{
+		{"mcp__a__search", "mcp__a__"},
+		{"mcp__b__search", "mcp__b__"},
+	} {
+		bare, namespace := responsesResolveToolName(testCase.declared, refs)
+		if bare != "search" || namespace != testCase.namespace {
+			t.Errorf("resolve %s = (%q, %q)", testCase.declared, bare, namespace)
+		}
+	}
+}
+
+func assertNamespaceCollisionResponse(t *testing.T, refs map[string]responsesToolRef) {
+	t.Helper()
+
+	resp := responsesFromOpenAIWithNamespaces(map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"content": "",
+				"tool_calls": []any{map[string]any{
+					"id": "call_b", "type": "function",
+					"function": map[string]any{"name": "mcp__b__search", "arguments": "{}"},
+				}},
+			},
+		}},
+	}, "m", "", nil, refs)
+
+	output, _ := resp["output"].([]any)
+	if len(output) != 1 {
+		t.Fatalf("output=%v", output)
+	}
+
+	item := output[0].(map[string]any)
+	if item["name"] != "search" || item["namespace"] != "mcp__b__" {
+		t.Errorf("item=%v", item)
+	}
+}
+
+func assertNamespaceCollisionStream(t *testing.T, refs map[string]responsesToolRef) {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	writer := newResponsesStreamWriter(rec, "m", "", nil, refs)
+
+	stream := `data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","function":{"name":"mcp__b__search","arguments":"{}"}}]}}]}` + "\n\n" +
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	if _, err := writer.Write([]byte(stream)); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{`"name":"search"`, `"namespace":"mcp__b__"`} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Errorf("stream missing %q:\n%s", want, rec.Body)
+		}
 	}
 }
 
@@ -429,7 +528,7 @@ func TestResponsesFunctionItemsNamespace(t *testing.T) {
 		}},
 	}
 
-	resp := responsesFromOpenAIWithNamespaces(body, "m", "", nil, map[string]string{"spawn_agent": "multi_agent_v1"})
+	resp := responsesFromOpenAIWithNamespaces(body, "m", "", nil, map[string]responsesToolRef{"spawn_agent": {bare: "spawn_agent", namespace: "multi_agent_v1"}})
 
 	output, _ := resp["output"].([]any)
 	if len(output) != 1 {
@@ -447,7 +546,7 @@ func TestResponsesStreamWriterNamespace(t *testing.T) {
 	t.Parallel()
 
 	rec := httptest.NewRecorder()
-	w := newResponsesStreamWriter(rec, "m", "", nil, map[string]string{"spawn_agent": "multi_agent_v1"})
+	w := newResponsesStreamWriter(rec, "m", "", nil, map[string]responsesToolRef{"spawn_agent": {bare: "spawn_agent", namespace: "multi_agent_v1"}})
 
 	chunks := `data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"spawn_agent","arguments":"{}"}}]}}]}` + "\n\n" +
 		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}` + "\n\n" +

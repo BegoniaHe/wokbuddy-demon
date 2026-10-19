@@ -810,40 +810,100 @@ func responsesJSONSchemaFormat(format map[string]any) any {
 // responsesMaxNamespaceDepth namespace 展开的最大深度（防御异常嵌套）。
 const responsesMaxNamespaceDepth = 4
 
-// responsesTools 转换 function / custom 工具，并把 namespace 容器展开成 flat
-// function。上游 Chat Completions 不认识 namespace；客户端回程又需要
-// (name, namespace) 两个字段才能找到执行器，所以展开时记录 name → namespace，
-// 响应侧由 responsesResolveToolName 还原。内置工具（web_search 等）仍忽略。
-func responsesTools(tools []map[string]any) ([]any, map[string]string) {
-	out := make([]any, 0, len(tools))
-	namespaces := map[string]string{}
-	seen := map[string]bool{}
-
-	for _, tool := range tools {
-		responsesAddTool(&out, namespaces, seen, tool, "", 0)
-	}
-
-	return out, namespaces
+// responsesToolRef 是上游扁平工具名到客户端 (bare, namespace) 身份的映射。
+// 名字全局唯一时 key 即 bare；不同 namespace 出现同名工具时 key 改用限定名，
+// 否则后出现者会被去重丢弃，模型永远看不到它。
+type responsesToolRef struct {
+	bare      string
+	namespace string
 }
 
-// responsesAddTool 递归展开单个工具；namespace 记录扁平名到命名空间的映射。
-func responsesAddTool(
-	out *[]any,
-	namespaces map[string]string,
-	seen map[string]bool,
-	tool map[string]any,
-	namespace string,
-	depth int,
-) {
+// responsesToolSpec 是展开 namespace 后的待声明工具。
+type responsesToolSpec struct {
+	name      string
+	namespace string
+	spec      map[string]any
+}
+
+// responsesTools 转换 function / custom 工具，并把 namespace 容器展开成 flat
+// function。上游 Chat Completions 不认识 namespace；客户端回程又需要
+// (name, namespace) 两个字段才能找到执行器，所以展开时记录声明名 → 身份，
+// 响应侧由 responsesResolveToolName 还原。内置工具（web_search 等）仍忽略。
+//
+// 不同 namespace 的同名工具必须区分：直接按 bare 名去重会让后一个工具整体消失。
+// 只在检测到重名时使用带回 namespace 的限定名，唯一工具保持裸名，避免无谓地
+// 改变模型看到的工具名。
+func responsesTools(tools []map[string]any) ([]any, map[string]responsesToolRef) {
+	specs := responsesCollectTools(tools)
+
+	// 同一 (namespace, name) 在 tools 与 additional_tools 里重复出现是同一个工具，
+	// 不能据此判定重名并改名；只有不同 namespace 的同名工具才需要限定。
+	counts := make(map[string]int, len(specs))
+	identities := make(map[string]bool, len(specs))
+
+	for _, spec := range specs {
+		identity := spec.namespace + "\x00" + spec.name
+		if identities[identity] {
+			continue
+		}
+
+		identities[identity] = true
+		counts[spec.name]++
+	}
+
+	out := make([]any, 0, len(specs))
+	refs := make(map[string]responsesToolRef, len(specs))
+	seen := make(map[string]bool, len(specs))
+
+	for _, spec := range specs {
+		declared := spec.name
+		if counts[spec.name] > 1 && spec.namespace != "" {
+			declared = responsesQualifiedToolName(spec.namespace, spec.name)
+		}
+
+		// 同名同 namespace 的重复声明仍然只保留一次，避免上游 schema 冲突。
+		if seen[declared] {
+			continue
+		}
+
+		seen[declared] = true
+		// 顶层唯一工具名无需映射：responsesResolveToolName 未命中时原样返回。
+		if spec.namespace != "" || declared != spec.name {
+			refs[declared] = responsesToolRef{bare: spec.name, namespace: spec.namespace}
+		}
+
+		if declared != spec.name {
+			responsesSetToolSpecName(spec.spec, declared)
+		}
+
+		out = append(out, spec.spec)
+	}
+
+	return out, refs
+}
+
+// responsesCollectTools 递归展开工具树，先收集再统一分配声明名。
+func responsesCollectTools(tools []map[string]any) []responsesToolSpec {
+	var out []responsesToolSpec
+
+	for _, tool := range tools {
+		responsesCollectTool(&out, tool, "", 0)
+	}
+
+	return out
+}
+
+// responsesCollectTool 递归展开单个工具；namespace 记录当前所处的命名空间。
+func responsesCollectTool(out *[]responsesToolSpec, tool map[string]any, namespace string, depth int) {
 	if tool == nil || depth > responsesMaxNamespaceDepth {
 		return
 	}
 
 	switch typ := stringValue(tool["type"]); typ {
 	case "", "function":
-		responsesAddFlatTool(out, namespaces, seen, responsesFunctionTool(tool), namespace)
+		responsesAppendToolSpec(out, responsesFunctionTool(tool), namespace)
 	case "custom":
-		responsesAddFlatTool(out, namespaces, seen, responsesCustomTool(tool), namespace)
+		responsesAppendToolSpec(out, responsesCustomTool(tool), namespace)
 	case "namespace":
 		childNS := stringValue(tool["name"])
 		if childNS == "" {
@@ -852,35 +912,42 @@ func responsesAddTool(
 
 		for _, sub := range responsesNamespaceChildren(tool) {
 			if child, ok := sub.(map[string]any); ok {
-				responsesAddTool(out, namespaces, seen, child, childNS, depth+1)
+				responsesCollectTool(out, child, childNS, depth+1)
 			}
 		}
 	}
 }
 
-// responsesAddFlatTool 把已转换的 function spec 追加到结果，首次出现的名字生效。
-func responsesAddFlatTool(
-	out *[]any,
-	namespaces map[string]string,
-	seen map[string]bool,
-	spec map[string]any,
-	namespace string,
-) {
+// responsesAppendToolSpec 追加已转换的 function spec；无名工具忽略。
+func responsesAppendToolSpec(out *[]responsesToolSpec, spec map[string]any, namespace string) {
 	if spec == nil {
 		return
 	}
 
 	name := responsesToolSpecName(spec)
-	if name == "" || seen[name] {
+	if name == "" {
 		return
 	}
 
-	seen[name] = true
-	if namespace != "" {
-		namespaces[name] = namespace
+	*out = append(*out, responsesToolSpec{name: name, namespace: namespace, spec: spec})
+}
+
+// responsesQualifiedToolName 生成 namespace 内的限定工具名。Codex 的 namespace
+// 通常以 "__" 结尾（如 mcp__server__），此时直接拼接即可得到模型习惯的全名。
+func responsesQualifiedToolName(namespace, name string) string {
+	if strings.HasSuffix(namespace, "__") {
+		return namespace + name
 	}
 
-	*out = append(*out, spec)
+	return namespace + "__" + name
+}
+
+// responsesSetToolSpecName 回写 chat function spec 的工具名。
+func responsesSetToolSpecName(spec map[string]any, name string) {
+	fn, _ := spec["function"].(map[string]any)
+	if fn != nil {
+		fn["name"] = name
+	}
 }
 
 // responsesNamespaceChildren 读取 namespace 容器的子工具列表（兼容 tools/children/functions）。
@@ -900,14 +967,14 @@ func responsesToolSpecName(spec map[string]any) string {
 	return stringValue(fn["name"])
 }
 
-// responsesToolNamespaces 从请求工具声明里收集 name → namespace。
-func responsesToolNamespaces(tools []map[string]any) map[string]string {
-	_, namespaces := responsesTools(tools)
-	return namespaces
+// responsesToolNamespaces 从请求工具声明里收集声明名 → 工具身份。
+func responsesToolNamespaces(tools []map[string]any) map[string]responsesToolRef {
+	_, refs := responsesTools(tools)
+	return refs
 }
 
 // responsesToolNamespacesFromBody 从原始 Responses 请求体收集 namespace 映射。
-func responsesToolNamespacesFromBody(body []byte) map[string]string {
+func responsesToolNamespacesFromBody(body []byte) map[string]responsesToolRef {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
 		Input json.RawMessage  `json:"input"`
@@ -920,15 +987,20 @@ func responsesToolNamespacesFromBody(body []byte) map[string]string {
 }
 
 // responsesResolveToolName 把模型回传的工具名解析成 (bare, namespace)。
-// 正常路径是 flat 名直接命中映射；兼容模型自行拼出的 ns__tool / ns::tool。
-func responsesResolveToolName(name string, namespaces map[string]string) (string, string) {
-	if ns, ok := namespaces[name]; ok {
-		return name, ns
+// 正常路径是声明名直接命中映射；兼容模型自行拼出的 ns__tool / ns::tool /
+// Codex 全名 ns+tool（namespace 以 "__" 结尾）。
+func responsesResolveToolName(name string, refs map[string]responsesToolRef) (string, string) {
+	if ref, ok := refs[name]; ok {
+		return ref.bare, ref.namespace
 	}
 
-	for bare, ns := range namespaces {
-		if name == ns+"__"+bare || name == ns+"::"+bare {
-			return bare, ns
+	for _, ref := range refs {
+		if ref.namespace == "" {
+			continue
+		}
+
+		if name == ref.namespace+ref.bare || name == ref.namespace+"__"+ref.bare || name == ref.namespace+"::"+ref.bare {
+			return ref.bare, ref.namespace
 		}
 	}
 
@@ -1047,7 +1119,7 @@ type responsesResponder struct {
 	instructions string
 	keepalive    time.Duration
 	customTools  map[string]bool
-	namespaces   map[string]string
+	namespaces   map[string]responsesToolRef
 }
 
 func (r *responsesResponder) JSON(status int, body any) {
@@ -1096,7 +1168,7 @@ func responsesFromOpenAIWithNamespaces(
 	body any,
 	model, instructions string,
 	customTools map[string]bool,
-	namespaces map[string]string,
+	namespaces map[string]responsesToolRef,
 ) map[string]any {
 	obj, _ := body.(map[string]any)
 	choice := firstOpenAIChoice(obj)
@@ -1133,7 +1205,7 @@ func responsesIncompleteReason(choice map[string]any) string {
 }
 
 // responsesOutput 从 choices[0] 构建 output 数组、output_text 与状态。
-func responsesOutput(choice map[string]any, customTools map[string]bool, namespaces map[string]string) ([]any, string, string) {
+func responsesOutput(choice map[string]any, customTools map[string]bool, namespaces map[string]responsesToolRef) ([]any, string, string) {
 	if choice == nil {
 		return []any{}, "", "completed"
 	}
@@ -1222,7 +1294,7 @@ func mapItems(raw any) []map[string]any {
 	}
 }
 
-func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map[string]string) []any {
+func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map[string]responsesToolRef) []any {
 	calls := mapItems(raw)
 
 	out := make([]any, 0, len(calls))
@@ -1369,7 +1441,7 @@ type responsesStreamWriter struct {
 	model        string
 	instructions string
 	customTools  map[string]bool
-	namespaces   map[string]string
+	namespaces   map[string]responsesToolRef
 
 	pending  []byte
 	started  bool
@@ -1406,20 +1478,21 @@ type responsesMessageState struct {
 }
 
 type responsesToolState struct {
-	id      string
-	callID  string
-	name    string
-	index   int
-	args    strings.Builder
-	started bool
-	custom  bool
+	id        string
+	callID    string
+	name      string
+	namespace string
+	index     int
+	args      strings.Builder
+	started   bool
+	custom    bool
 }
 
 func newResponsesStreamWriter(
 	w http.ResponseWriter,
 	model, instructions string,
 	customTools map[string]bool,
-	namespaces map[string]string,
+	namespaces map[string]responsesToolRef,
 ) *responsesStreamWriter {
 	fl, _ := w.(http.Flusher)
 
@@ -1664,7 +1737,7 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 	}
 
 	name, callID := toolCallIdentity(call)
-	name, _ = responsesResolveToolName(name, s.namespaces)
+	name, namespace := responsesResolveToolName(name, s.namespaces)
 
 	if name == "" {
 		return nil
@@ -1682,7 +1755,8 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 	}
 
 	state := &responsesToolState{
-		id: prefix + callID, callID: callID, name: name, index: s.nextIdx, started: true, custom: custom,
+		id: prefix + callID, callID: callID, name: name, namespace: namespace,
+		index: s.nextIdx, started: true, custom: custom,
 	}
 	s.nextIdx++
 	s.tools[idx] = state
@@ -1837,7 +1911,7 @@ func (s *responsesStreamWriter) messageItem(status string) map[string]any {
 }
 
 func (s *responsesStreamWriter) functionItem(state *responsesToolState, status string) map[string]any {
-	namespace := s.namespaces[state.name]
+	namespace := state.namespace
 
 	if state.custom {
 		item := map[string]any{
