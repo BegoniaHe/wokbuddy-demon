@@ -237,7 +237,7 @@ func TestPrecisePackageCapacityPrecedence(t *testing.T) {
 
 	remain, used, size := packageRemainUsed(respAccount{
 		CapacityRemain: 10, CapacityUsed: 90, CapacitySize: 100,
-		CapacityRemainPrecise: 75, CapacityUsedPrecise: 25, CapacitySizePrecise: 100,
+		CapacityRemainPrecise: "75", CapacityUsedPrecise: "25", CapacitySizePrecise: "100",
 	})
 	if remain != 75 || used != 25 || size != 100 {
 		t.Errorf("precise=%d/%d/%d want 75/25/100", remain, used, size)
@@ -247,7 +247,7 @@ func TestPrecisePackageCapacityPrecedence(t *testing.T) {
 		CapacityType:   4,
 		CapacityRemain: 10, CapacityUsed: 90, CapacitySize: 100,
 		SlicePeriodUsageDetails: []slicePeriodUsage{{
-			SlicePeriodCapacitySizePrecise: 50, SlicePeriodCapacityRemainPrecise: 20,
+			SlicePeriodCapacitySizePrecise: "50", SlicePeriodCapacityRemainPrecise: "20",
 		}},
 	})
 	if remain != 20 || used != 30 || size != 50 {
@@ -256,8 +256,8 @@ func TestPrecisePackageCapacityPrecedence(t *testing.T) {
 
 	// 周期套餐同时下发 Capacity* 与 Cycle* 精确字段时，仍以 Cycle* 为准。
 	remain, used, size = packageRemainUsed(respAccount{
-		CapacitySizePrecise: 1000, CapacityRemainPrecise: 900, CapacityUsedPrecise: 100,
-		CycleCapacitySizePrecise: 100, CycleCapacityRemainPrecise: 40, CycleCapacityUsedPrecise: 60,
+		CapacitySizePrecise: "1000", CapacityRemainPrecise: "900", CapacityUsedPrecise: "100",
+		CycleCapacitySizePrecise: "100", CycleCapacityRemainPrecise: "40", CycleCapacityUsedPrecise: "60",
 	})
 	if remain != 40 || used != 60 || size != 100 {
 		t.Errorf("cycle precise=%d/%d/%d want 40/60/100", remain, used, size)
@@ -534,5 +534,136 @@ func TestCheckinBusinessCodeExactMatch(t *testing.T) {
 
 	if got := ClassifyCheckin(&Error{Status: 200, Msg: "code=1001 msg=already"}); got != CheckinAlready {
 		t.Errorf("ClassifyCheckin(code=1001)=%v want CheckinAlready", got)
+	}
+}
+
+// TestStringPreciseCapacityDecoded 上游 precise 容量实为 JSON 字符串；解码后应
+// 仍按精确字段聚合，而不是让 packages/resource 解析报 string into int64。
+func TestStringPreciseCapacityDecoded(t *testing.T) {
+	t.Parallel()
+
+	var pkg billingPackageAccount
+
+	rawPackage := `{
+		"CapacityType":2,
+		"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":100,
+		"CapacityRemainPrecise":"75","CapacityUsedPrecise":"25","CapacitySizePrecise":"100",
+		"CycleCapacitySizePrecise":"0"
+	}`
+	if err := json.Unmarshal([]byte(rawPackage), &pkg); err != nil {
+		t.Fatalf("package unmarshal: %v", err)
+	}
+
+	cycle, remain, used, size := creditPackageAmounts(&pkg)
+	if cycle || remain != 75 || used != 25 || size != 100 {
+		t.Errorf("package amounts=%v/%d/%d/%d want false/75/25/100", cycle, remain, used, size)
+	}
+
+	var acct resourceAccount
+
+	rawAccount := `{
+		"CapacityType":2,
+		"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":100,
+		"CapacityRemainPrecise":"75","CapacityUsedPrecise":"25","CapacitySizePrecise":"100"
+	}`
+	if err := json.Unmarshal([]byte(rawAccount), &acct); err != nil {
+		t.Fatalf("resource unmarshal: %v", err)
+	}
+
+	remain, used, size = packageRemainUsed(respAccount{
+		CapacityType:          acct.CapacityType,
+		CapacityRemain:        acct.CapacityRemain,
+		CapacityUsed:          acct.CapacityUsed,
+		CapacitySize:          acct.CapacitySize,
+		CapacityRemainPrecise: acct.CapacityRemainPrecise,
+		CapacityUsedPrecise:   acct.CapacityUsedPrecise,
+		CapacitySizePrecise:   acct.CapacitySizePrecise,
+	})
+	if remain != 75 || used != 25 || size != 100 {
+		t.Errorf("resource amounts=%d/%d/%d want 75/25/100", remain, used, size)
+	}
+}
+
+// TestMalformedPreciseCapacityFallsBack 非法精确值不得吞掉整包，回落整数容量字段。
+func TestMalformedPreciseCapacityFallsBack(t *testing.T) {
+	t.Parallel()
+
+	var pkg billingPackageAccount
+	if err := json.Unmarshal([]byte(`{
+		"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":100,
+		"CapacitySizePrecise":"bad"
+	}`), &pkg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	_, remain, used, size := creditPackageAmounts(&pkg)
+	if remain != 10 || used != 90 || size != 100 {
+		t.Errorf("fallback=%d/%d/%d want 10/90/100", remain, used, size)
+	}
+
+	// CycleSize 有效但 CycleRemain 非法：整体回落整数，不得改用 Capacity 精确值
+	// （Capacity* 是总额，不能覆盖当周期余额）。
+	if err := json.Unmarshal([]byte(`{
+		"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":100,
+		"CapacityRemainPrecise":"50","CapacityUsedPrecise":"50","CapacitySizePrecise":"50",
+		"CycleCapacitySize":100,"CycleCapacityRemain":40,"CycleCapacityUsed":60,
+		"CycleCapacitySizePrecise":"100","CycleCapacityRemainPrecise":"bad","CycleCapacityUsedPrecise":"0"
+	}`), &pkg); err != nil {
+		t.Fatalf("cycle unmarshal: %v", err)
+	}
+
+	cycle, remain, used, size := creditPackageAmounts(&pkg)
+	if !cycle || remain != 40 || used != 60 || size != 100 {
+		t.Errorf("cycle fallback=%v/%d/%d/%d want true/40/60/100", cycle, remain, used, size)
+	}
+}
+
+// TestStringPreciseCapacityBranches 覆盖字符串 precise 的切片/周期分支解码。
+func TestStringPreciseCapacityBranches(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		raw       string
+		wantCycle bool
+		remain    int64
+		used      int64
+		size      int64
+	}{
+		{
+			name: "slice",
+			raw: `{
+				"CapacityType":4,
+				"SlicePeriodUsageDetails":[{
+					"SlicePeriodCapacitySizePrecise":"50",
+					"SlicePeriodCapacityRemainPrecise":"20",
+					"SlicePeriodCapacityUsedPrecise":"30"
+				}]
+			}`,
+			wantCycle: true, remain: 20, used: 30, size: 50,
+		},
+		{
+			name: "cycle",
+			raw: `{
+				"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":1000,
+				"CapacityRemainPrecise":"900","CapacityUsedPrecise":"100","CapacitySizePrecise":"1000",
+				"CycleCapacityRemain":0,"CycleCapacityUsed":0,"CycleCapacitySize":100,
+				"CycleCapacitySizePrecise":"100","CycleCapacityRemainPrecise":"40","CycleCapacityUsedPrecise":"60"
+			}`,
+			wantCycle: true, remain: 40, used: 60, size: 100,
+		},
+	}
+	for _, testCase := range cases {
+		var pkg billingPackageAccount
+		if err := json.Unmarshal([]byte(testCase.raw), &pkg); err != nil {
+			t.Fatalf("%s unmarshal: %v", testCase.name, err)
+		}
+
+		cycle, remain, used, size := creditPackageAmounts(&pkg)
+		if cycle != testCase.wantCycle || remain != testCase.remain || used != testCase.used || size != testCase.size {
+			t.Errorf("%s amounts=%v/%d/%d/%d want %v/%d/%d/%d",
+				testCase.name, cycle, remain, used, size,
+				testCase.wantCycle, testCase.remain, testCase.used, testCase.size)
+		}
 	}
 }

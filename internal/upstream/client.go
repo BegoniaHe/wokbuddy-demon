@@ -2952,11 +2952,52 @@ func (m *modelIDList) UnmarshalJSON(raw []byte) error {
 	return nil
 }
 
+// parsePreciseCapacity 解析上游精确容量字段。上游以 JSON 字符串下发（如 "100"），
+// 空串表示未提供（按 0 处理）；非法值返回 ok=false，调用方回落整数容量字段。
+func parsePreciseCapacity(raw string) (int64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, true
+	}
+
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+
+	return value, true
+}
+
+// preciseTriple 解析一组 (remain, used, size) 精确容量；size 缺失/非正时视为不可用。
+func preciseTriple(remainRaw, usedRaw, sizeRaw string) (remain, used, size int64, ok bool) {
+	size, ok = parsePreciseCapacity(sizeRaw)
+	if !ok || size <= 0 {
+		return 0, 0, 0, false
+	}
+
+	return preciseTripleSize(remainRaw, usedRaw, size)
+}
+
+// preciseTripleSize 在 size 已解析的前提下取 remain/used。
+func preciseTripleSize(remainRaw, usedRaw string, total int64) (remain, used, size int64, ok bool) {
+	remain, ok = parsePreciseCapacity(remainRaw)
+	if !ok {
+		return 0, 0, 0, false
+	}
+
+	used, ok = parsePreciseCapacity(usedRaw)
+	if !ok {
+		return 0, 0, 0, false
+	}
+
+	return normalizePreciseAmounts(remain, used, total)
+}
+
 // slicePeriodUsage 切片型额度（CapacityType=4）的周期用量明细。
 type slicePeriodUsage struct {
-	SlicePeriodCapacitySizePrecise   int64 `json:"SlicePeriodCapacitySizePrecise"`
-	SlicePeriodCapacityRemainPrecise int64 `json:"SlicePeriodCapacityRemainPrecise"`
-	SlicePeriodCapacityUsedPrecise   int64 `json:"SlicePeriodCapacityUsedPrecise"`
+	SlicePeriodCapacitySizePrecise   string `json:"SlicePeriodCapacitySizePrecise"`
+	SlicePeriodCapacityRemainPrecise string `json:"SlicePeriodCapacityRemainPrecise"`
+	SlicePeriodCapacityUsedPrecise   string `json:"SlicePeriodCapacityUsedPrecise"`
 }
 
 // billingPackagesResp 积分包列表响应信封（从 Response 起，见上方层级注释）。
@@ -2976,15 +3017,15 @@ type billingPackageAccount struct {
 	CapacityRemain             int64              `json:"CapacityRemain"`
 	CapacityUsed               int64              `json:"CapacityUsed"`
 	CapacitySize               int64              `json:"CapacitySize"`
-	CapacityRemainPrecise      int64              `json:"CapacityRemainPrecise"`
-	CapacityUsedPrecise        int64              `json:"CapacityUsedPrecise"`
-	CapacitySizePrecise        int64              `json:"CapacitySizePrecise"`
+	CapacityRemainPrecise      string             `json:"CapacityRemainPrecise"`
+	CapacityUsedPrecise        string             `json:"CapacityUsedPrecise"`
+	CapacitySizePrecise        string             `json:"CapacitySizePrecise"`
 	CycleCapacityRemain        int64              `json:"CycleCapacityRemain"`
 	CycleCapacityUsed          int64              `json:"CycleCapacityUsed"`
 	CycleCapacitySize          int64              `json:"CycleCapacitySize"`
-	CycleCapacityRemainPrecise int64              `json:"CycleCapacityRemainPrecise"`
-	CycleCapacityUsedPrecise   int64              `json:"CycleCapacityUsedPrecise"`
-	CycleCapacitySizePrecise   int64              `json:"CycleCapacitySizePrecise"`
+	CycleCapacityRemainPrecise string             `json:"CycleCapacityRemainPrecise"`
+	CycleCapacityUsedPrecise   string             `json:"CycleCapacityUsedPrecise"`
+	CycleCapacitySizePrecise   string             `json:"CycleCapacitySizePrecise"`
 	// 到期时间字段名在上游存在三种口径：ExpiredTime / PackageEndTime
 	// 在 CN/global 实测字段全集里均恒 miss（见 UserResourceDetailed
 	// 处注释），真实下发的是 CycleEndTime——三者都读，谁有值用谁。
@@ -3066,7 +3107,7 @@ func creditPackageExpiry(billingPackageAccount4 *billingPackageAccount) (endTime
 // creditPackageAmounts 按周期字段优先口径算出包的 remain/used/size（与
 // UserResourceDetailed 的 packageRemainUsed 同构，两处口径不能混）。
 func creditPackageAmounts(billingPackageAccount2 *billingPackageAccount) (cycle bool, remain, used, size int64) {
-	if preciseRemain, preciseUsed, preciseSize, ok := preciseAmounts(respAccount{
+	if preciseRemain, preciseUsed, preciseSize, isCycle, ok := preciseAmounts(respAccount{
 		CapacityType:               billingPackageAccount2.CapacityType,
 		SlicePeriodUsageDetails:    billingPackageAccount2.SlicePeriodUsageDetails,
 		CapacityRemainPrecise:      billingPackageAccount2.CapacityRemainPrecise,
@@ -3076,8 +3117,6 @@ func creditPackageAmounts(billingPackageAccount2 *billingPackageAccount) (cycle 
 		CycleCapacityUsedPrecise:   billingPackageAccount2.CycleCapacityUsedPrecise,
 		CycleCapacitySizePrecise:   billingPackageAccount2.CycleCapacitySizePrecise,
 	}); ok {
-		isCycle := billingPackageAccount2.CycleCapacitySizePrecise > 0 || billingPackageAccount2.CapacityType == 4
-
 		return isCycle, preciseRemain, preciseUsed, preciseSize
 	}
 
@@ -3540,15 +3579,15 @@ type resourceAccount struct {
 	CapacitySize               int64              `json:"CapacitySize"`
 	CapacityRemain             int64              `json:"CapacityRemain"`
 	CapacityUsed               int64              `json:"CapacityUsed"`
-	CapacitySizePrecise        int64              `json:"CapacitySizePrecise"`
-	CapacityRemainPrecise      int64              `json:"CapacityRemainPrecise"`
-	CapacityUsedPrecise        int64              `json:"CapacityUsedPrecise"`
+	CapacitySizePrecise        string             `json:"CapacitySizePrecise"`
+	CapacityRemainPrecise      string             `json:"CapacityRemainPrecise"`
+	CapacityUsedPrecise        string             `json:"CapacityUsedPrecise"`
 	CycleCapacitySize          int64              `json:"CycleCapacitySize"`
 	CycleCapacityRemain        int64              `json:"CycleCapacityRemain"`
 	CycleCapacityUsed          int64              `json:"CycleCapacityUsed"`
-	CycleCapacitySizePrecise   int64              `json:"CycleCapacitySizePrecise"`
-	CycleCapacityRemainPrecise int64              `json:"CycleCapacityRemainPrecise"`
-	CycleCapacityUsedPrecise   int64              `json:"CycleCapacityUsedPrecise"`
+	CycleCapacitySizePrecise   string             `json:"CycleCapacitySizePrecise"`
+	CycleCapacityRemainPrecise string             `json:"CycleCapacityRemainPrecise"`
+	CycleCapacityUsedPrecise   string             `json:"CycleCapacityUsedPrecise"`
 }
 
 // resourceTotals 个人资源聚合累加器。
@@ -3641,48 +3680,63 @@ type respAccount struct {
 	CapacityRemain             int64
 	CapacityUsed               int64
 	CapacitySize               int64
-	CapacityRemainPrecise      int64
-	CapacityUsedPrecise        int64
-	CapacitySizePrecise        int64
+	CapacityRemainPrecise      string
+	CapacityUsedPrecise        string
+	CapacitySizePrecise        string
 	CycleCapacityRemain        int64
 	CycleCapacityUsed          int64
 	CycleCapacitySize          int64
-	CycleCapacityRemainPrecise int64
-	CycleCapacityUsedPrecise   int64
-	CycleCapacitySizePrecise   int64
+	CycleCapacityRemainPrecise string
+	CycleCapacityUsedPrecise   string
+	CycleCapacitySizePrecise   string
 }
 
 // preciseAmounts 优先使用上游精确容量字段；CapacityType=4 时取首个切片周期明细。
-// 返回 ok=false 表示没有可用的精确字段，调用方回落旧的整数字段。
+// 返回 ok=false 表示没有可用的精确字段，调用方回落旧的整数字段；cycle 标识实际
+// 采用的周期分支（切片型与 Cycle* 为 true），供上层设置 CreditPackage.Cycle。
 //
 //nolint:gocritic // respAccount 为一次性解析结构，值传递不影响性能。
-func preciseAmounts(account respAccount) (remain, used, size int64, ok bool) {
+func preciseAmounts(account respAccount) (remain, used, size int64, cycle, ok bool) {
 	if account.CapacityType == 4 && len(account.SlicePeriodUsageDetails) > 0 {
-		return preciseSliceAmounts(account.SlicePeriodUsageDetails[0])
+		remain, used, size, ok = preciseSliceAmounts(account.SlicePeriodUsageDetails[0])
+
+		return remain, used, size, true, ok
 	}
 
 	// 周期套餐优先 Cycle*（与旧整数口径一致）；两者都下发时 Capacity* 是总额，
-	// 不能覆盖当周期余额。
-	switch {
-	case account.CycleCapacitySizePrecise > 0:
-		size, remain, used = account.CycleCapacitySizePrecise, account.CycleCapacityRemainPrecise, account.CycleCapacityUsedPrecise
-	case account.CapacitySizePrecise > 0:
-		size, remain, used = account.CapacitySizePrecise, account.CapacityRemainPrecise, account.CapacityUsedPrecise
-	default:
-		return 0, 0, 0, false
+	// 不能覆盖当周期余额。CycleSize 非法时直接回落整数容量字段，避免把总额
+	// 当周期余额，或把周期分支的畸形值混入 Capacity 分支。
+	cycleSize, ok := parsePreciseCapacity(account.CycleCapacitySizePrecise)
+	if !ok {
+		return 0, 0, 0, false, false
 	}
 
-	return normalizePreciseAmounts(remain, used, size)
+	if cycleSize > 0 {
+		remain, used, size, ok = preciseTripleSize(
+			account.CycleCapacityRemainPrecise,
+			account.CycleCapacityUsedPrecise,
+			cycleSize,
+		)
+
+		return remain, used, size, true, ok
+	}
+
+	remain, used, size, ok = preciseTriple(
+		account.CapacityRemainPrecise,
+		account.CapacityUsedPrecise,
+		account.CapacitySizePrecise,
+	)
+
+	return remain, used, size, false, ok
 }
 
 // preciseSliceAmounts 从首个切片周期明细取精确容量。
 func preciseSliceAmounts(usage slicePeriodUsage) (remain, used, size int64, ok bool) {
-	size = usage.SlicePeriodCapacitySizePrecise
-	if size <= 0 {
-		return 0, 0, 0, false
-	}
-
-	return normalizePreciseAmounts(usage.SlicePeriodCapacityRemainPrecise, usage.SlicePeriodCapacityUsedPrecise, size)
+	return preciseTriple(
+		usage.SlicePeriodCapacityRemainPrecise,
+		usage.SlicePeriodCapacityUsedPrecise,
+		usage.SlicePeriodCapacitySizePrecise,
+	)
 }
 
 // normalizePreciseAmounts 修正 used/remain 的缺失与越界（钳 [0,size]）。
@@ -3705,7 +3759,7 @@ func normalizePreciseAmounts(remain, used, size int64) (int64, int64, int64, boo
 //
 //nolint:gocritic // respAccount 为一次性解析结构，值传递不影响性能。
 func packageRemainUsed(account respAccount) (remain, used, size int64) {
-	if r, u, sz, ok := preciseAmounts(account); ok {
+	if r, u, sz, _, ok := preciseAmounts(account); ok {
 		return r, u, sz
 	}
 
