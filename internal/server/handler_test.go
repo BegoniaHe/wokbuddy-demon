@@ -1135,6 +1135,28 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	}
 }
 
+// TestChatNonStreamErrorFrame 上游 HTTP 200 + error 帧不能被聚合成空成功；
+// 非流式路径应按错误分类返回错误信封并冷却账号/模型。
+func TestChatNonStreamErrorFrame(t *testing.T) {
+	t.Parallel()
+
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, "data: {\"error\":{\"code\":6004,\"message\":\"模型限流，将在 2026-09-27 01:00:00 重置\"}}\n\n" +
+			"data: [DONE]\n\n", true
+	})
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: state, Upstream: up, MaxRotate: 1})
+
+	rec := postChat(t, handler, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusTooManyRequests && rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), "6004") && !strings.Contains(rec.Body.String(), "rate") {
+		t.Errorf("error body lost upstream reason: %s", rec.Body)
+	}
+}
+
 func TestChatAllUnavailableReturns503(t *testing.T) {
 	t.Parallel()
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
