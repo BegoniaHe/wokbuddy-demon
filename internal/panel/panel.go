@@ -15,7 +15,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -1331,6 +1333,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+var errTrailingJSON = errors.New("unexpected data after JSON body")
+
+// decodeJSONBody 解码请求体中的单个 JSON 值：首个值之后的非空数据同样视为
+// 畸形请求，避免 `{"force":true} garbage` 被静默接受并执行写操作。
+func decodeJSONBody(body io.Reader, v any) error {
+	dec := json.NewDecoder(body)
+	if err := dec.Decode(v); err != nil {
+		return fmt.Errorf("decode json body: %w", err)
+	}
+
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errTrailingJSON
+	}
+
+	return nil
 }
 
 // nextLocalMidnight 返回本地次日 0 点（日限额恢复时间，issue #95）。

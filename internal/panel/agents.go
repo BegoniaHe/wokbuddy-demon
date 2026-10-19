@@ -74,7 +74,7 @@ func (p *Panel) agentsRestore(w http.ResponseWriter, r *http.Request) {
 		Force bool `json:"force"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+	if err := decodeJSONBody(r.Body, &body); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}

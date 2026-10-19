@@ -84,4 +84,14 @@ func TestAgentsRestoreRejectsMalformedJSON(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code=%d body=%s, want 400", rec.Code, rec.Body)
 	}
+
+	trailing := httptest.NewRequest(http.MethodPost, "/panel/api/agents/claude/restore", strings.NewReader(`{"force":true} trailing`))
+	trailing.RemoteAddr = "127.0.0.1:12345"
+
+	rec = httptest.NewRecorder()
+	panel.ServeHTTP(rec, trailing)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("trailing data: code=%d body=%s, want 400", rec.Code, rec.Body)
+	}
 }

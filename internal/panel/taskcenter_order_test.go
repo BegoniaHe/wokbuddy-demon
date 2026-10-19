@@ -67,4 +67,11 @@ func TestRunQueueRejectsMalformedJSON(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code=%d body=%s, want 400", rec.Code, rec.Body.String())
 	}
+
+	rec = httptest.NewRecorder()
+	panel.ServeHTTP(rec, authed(http.MethodPost, "/panel/api/tasks/run_queue", `{"concurrency":1} trailing`))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("trailing data: code=%d body=%s, want 400", rec.Code, rec.Body.String())
+	}
 }

@@ -234,6 +234,10 @@ func TestKeysCreateRejectsMalformedJSON(t *testing.T) {
 		t.Fatalf("code=%d body=%s, want 400", code, body)
 	}
 
+	if code, body := panel.doKeys(http.MethodPost, "/panel/api/keys", `{"name":"x"} trailing`); code != http.StatusBadRequest {
+		t.Fatalf("trailing data: code=%d body=%s, want 400", code, body)
+	}
+
 	if keys := store.List(); len(keys) != 0 {
 		t.Fatalf("malformed request created keys: %+v", keys)
 	}
