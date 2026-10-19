@@ -28,7 +28,11 @@ const args = process.argv.slice(2);
 function opt(name, dflt) {
   const i = args.indexOf('--' + name);
   if (i === -1) return dflt;
-  return args[i + 1];
+  const value = args[i + 1];
+  if (value === undefined || value.startsWith('--')) {
+    throw new Error(`--${name} 缺少参数值`);
+  }
+  return value;
 }
 const has = name => args.includes('--' + name);
 
@@ -45,7 +49,7 @@ function hostPlatform() {
   throw new Error(`无法识别当前平台: ${process.platform}/${process.arch}，请用 --platform 指定`);
 }
 
-const platformArg = opt('platform', hostPlatform());
+const platformArg = opt('platform', null) ?? hostPlatform();
 const platformList = platformArg === 'all' ? Object.keys(PLATFORM_API) : platformArg.split(',').map(s => s.trim());
 for (const platform of platformList) {
   if (!PLATFORM_API[platform]) throw new Error(`未知 platform: ${platform}（可选 ${Object.keys(PLATFORM_API).join('/')} 或 all）`);
