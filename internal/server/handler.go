@@ -1842,9 +1842,14 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
 	var ue *upstream.Error
 	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-		f.h.cfg.Pool.Disable(acct.UID, "refresh session dead")
-		f.h.notifyAccount(acct.UID, notify.EventSessionDead, "账号 session 失效，已禁用，需重新登录",
-			map[string]any{"stage": "refresh"})
+		// 与 keepalive 同口径：refresh 401/403 是猜测性终态，连续达到阈值才禁用，
+		// 避免一次上游抖动/并发 refresh 竞态直接杀号。
+		if f.h.cfg.Pool.NoteSessionDead(acct.UID) {
+			log.Printf("WARN: [server] refresh acct=%s: 连续 %d 次 session dead — 禁用",
+				logfmt.Label(acct.UID, acct.NicknameValue()), pool.SessionDeadThreshold())
+			f.h.notifyAccount(acct.UID, notify.EventSessionDead, "账号连续 session 失效，已禁用，需重新登录",
+				map[string]any{"stage": "refresh"})
+		}
 
 		return
 	}

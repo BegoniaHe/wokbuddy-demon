@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -251,6 +252,60 @@ func TestPrecisePackageCapacityPrecedence(t *testing.T) {
 	})
 	if remain != 20 || used != 30 || size != 50 {
 		t.Errorf("slice=%d/%d/%d want 20/30/50", remain, used, size)
+	}
+
+	// 周期套餐同时下发 Capacity* 与 Cycle* 精确字段时，仍以 Cycle* 为准。
+	remain, used, size = packageRemainUsed(respAccount{
+		CapacitySizePrecise: 1000, CapacityRemainPrecise: 900, CapacityUsedPrecise: 100,
+		CycleCapacitySizePrecise: 100, CycleCapacityRemainPrecise: 40, CycleCapacityUsedPrecise: 60,
+	})
+	if remain != 40 || used != 60 || size != 100 {
+		t.Errorf("cycle precise=%d/%d/%d want 40/60/100", remain, used, size)
+	}
+}
+
+// TestSummaryTotalsDefaultsSizeToRemain 汇总包缺失总额时按剩余兜底，不能报 0/0。
+func TestSummaryTotalsDefaultsSizeToRemain(t *testing.T) {
+	t.Parallel()
+
+	var summary resourceSummaryResp
+	if err := json.Unmarshal([]byte(`{"Packages":[
+		{"CycleTotalCapacity":0,"CycleRemainCapacity":12}
+	]}`), &summary); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	remain, total := summary.summaryTotals()
+	if remain != 12 || total != 12 {
+		t.Errorf("summary=%d/%d want 12/12", remain, total)
+	}
+}
+
+// TestResourcePackageDayWindowUsesCST 免费包切片窗口按 UTC+8 取「今天」，
+// 不能使用部署机本地时区（非 UTC+8 环境会错一天）。
+func TestResourcePackageDayWindowUsesCST(t *testing.T) {
+	t.Parallel()
+
+	var freeBody []byte
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(r.URL.Path, "/get-user-resource-free-packages") {
+			freeBody, _ = io.ReadAll(r.Body)
+		}
+
+		return jsonResp(200, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`), nil
+	})
+
+	// UTC 2026-10-19 17:30 = CST 2026-10-20 01:30。
+	now := time.Date(2026, 10, 19, 17, 30, 0, 0, time.UTC)
+
+	if _, _, _ = client.resourcePackageExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, now, 0); len(freeBody) == 0 {
+		t.Fatal("free package request not captured")
+	}
+
+	if !strings.Contains(string(freeBody), `"SlicePeriodStartTime":"2026-10-20 00:00:00"`) ||
+		!strings.Contains(string(freeBody), `"SlicePeriodEndTime":"2026-10-20 23:59:59"`) {
+		t.Errorf("free package window=%s want CST 2026-10-20", freeBody)
 	}
 }
 

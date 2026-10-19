@@ -9,8 +9,40 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
+
+// TestRefreshSessionDeadHonorsThreshold refresh 401/403 进入会话失效分类后仍按连续
+// 阈值禁用，不能一次失败就杀号。
+func TestRefreshSessionDeadHonorsThreshold(t *testing.T) {
+	t.Parallel()
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt"})
+	h := NewHandler(&Config{Pool: state, Upstream: &upstream.Client{}})
+	flow := &chatFlow{h: h}
+
+	acct := state.AuthByUID("u1")
+	if acct == nil {
+		t.Fatal("account missing")
+	}
+
+	refreshErr := &upstream.Error{Kind: upstream.ErrSessionDead, Status: http.StatusUnauthorized}
+
+	for i := 1; i < pool.SessionDeadThreshold(); i++ {
+		flow.penalizeRefreshFailure(acct, refreshErr)
+
+		if statusOf(t, state, "u1").Disabled {
+			t.Fatalf("disabled after %d failure(s), want threshold %d", i, pool.SessionDeadThreshold())
+		}
+	}
+
+	flow.penalizeRefreshFailure(acct, refreshErr)
+
+	if !statusOf(t, state, "u1").Disabled {
+		t.Fatalf("not disabled after %d consecutive failures", pool.SessionDeadThreshold())
+	}
+}
 
 // TestChat401RefreshesAndReplaysOnce 上游 401 后同号刷新并重放一次。
 func TestChat401RefreshesAndReplaysOnce(t *testing.T) {

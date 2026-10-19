@@ -3308,9 +3308,10 @@ func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, 
 func (r *resourceSummaryResp) summaryTotals() (remain, total int64) {
 	for _, pkg := range r.Packages {
 		size := max(pkg.CycleTotalCapacity, 0)
-
 		left := max(pkg.CycleRemainCapacity, 0)
-		left = min(left, size)
+		// 总额缺失/为 0 时按剩余兜底，避免「有余额却 total=0」被旧端点聚合口径
+		// 覆盖成 0/0（credit_floor 会因此误停账号）。
+		size = max(size, left)
 
 		remain += left
 		total += size
@@ -3346,7 +3347,10 @@ func (c *Client) resourcePackageExpiry(account *auth.Auth, now time.Time, soon t
 ) {
 	var totals resourceTotals
 
-	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, softRateResetLoc)
+	// 切片日期窗口按上游 UTC+8 墙钟计算；用部署机本地时区会在非 UTC+8 环境把
+	// 「今天」算错一天，拿到错误周期的免费包。
+	nowCST := now.In(softRateResetLoc)
+	dayStart := time.Date(nowCST.Year(), nowCST.Month(), nowCST.Day(), 0, 0, 0, 0, softRateResetLoc)
 	dayEnd := dayStart.Add(24*time.Hour - time.Second)
 
 	specs := []struct {
@@ -3655,11 +3659,13 @@ func preciseAmounts(account respAccount) (remain, used, size int64, ok bool) {
 		return preciseSliceAmounts(account.SlicePeriodUsageDetails[0])
 	}
 
+	// 周期套餐优先 Cycle*（与旧整数口径一致）；两者都下发时 Capacity* 是总额，
+	// 不能覆盖当周期余额。
 	switch {
-	case account.CapacitySizePrecise > 0:
-		size, remain, used = account.CapacitySizePrecise, account.CapacityRemainPrecise, account.CapacityUsedPrecise
 	case account.CycleCapacitySizePrecise > 0:
 		size, remain, used = account.CycleCapacitySizePrecise, account.CycleCapacityRemainPrecise, account.CycleCapacityUsedPrecise
+	case account.CapacitySizePrecise > 0:
+		size, remain, used = account.CapacitySizePrecise, account.CapacityRemainPrecise, account.CapacityUsedPrecise
 	default:
 		return 0, 0, 0, false
 	}

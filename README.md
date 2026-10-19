@@ -531,7 +531,7 @@ gemini
 
 - 默认监听 `:7863`，**无内置 TLS**；Docker Compose 默认仅绑定 `127.0.0.1`，需要局域网/公网访问时显式改端口映射
 - 公网部署必须设置 `api_key`，并置于 HTTPS 之后 / 仅内网可达
-- 聊天请求体默认上限 16 MiB（`server.max_body_bytes`，0 = 不限制），超限在解析前返回 413
+- 聊天请求体默认上限 32 MiB（`server.max_body_bytes`，0 = 不限制），超限在解析前返回 413
 - `api_key` 非空时，面板与 `GET /status`、`GET /metrics` 对同一来源地址的鉴权失败做 1 分钟窗口计数，连续 10 次失败后返回 `429` + `Retry-After`；`/v1/*` 的鉴权失败阈值为 30 次/分钟；成功鉴权清零。来源地址默认只取 TCP `RemoteAddr`；只有对端命中 `server.trusted_proxies`（缺省本机回环）时才采信 `X-Real-IP` / `X-Forwarded-For`。反代在另一台机器时需把其网段加入该配置，否则限速与日志都会把所有人算成反代地址；反代必须覆盖或追加 `X-Forwarded-For`，不能透传客户端提供的转发头
 - 日志字段不含任何 token 明文（不读取 `Authorization` 头）
 - **管理面写操作审计**：面板的 `POST` / `PUT` / `PATCH` / `DELETE` 请求追加到 `data/audit/audit.jsonl`（8 MiB × 5 轮转），只记方法、路径、状态码、来源 IP 与 UA，**不记请求体与凭证**；`GET /panel/api/audit?limit=` 可查询最近记录

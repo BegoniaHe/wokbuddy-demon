@@ -1,5 +1,5 @@
 // travel.go growth 域「猫猫旅行」接口：状态查询 / 派出 / 领奖 / 领养 / 协议。
-// 全部走 chatBase（copilot.tencent.com，不带 /v2 前缀）+ BillingHeaders，信封同 doJSON。
+// 全部走 chatBase + BillingHeaders，信封同 doJSON；路径默认 /v2 优先、404 回落旧路径。
 package upstream
 
 import (
@@ -44,6 +44,11 @@ type TravelState struct {
 // /v2 前缀优先（官方 Bearer 通道），仅 404 时回落无 /v2 旧路径。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) growthJSON(account *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	// 已带 /v2 的路径（任务族）直接使用，避免拼成 /v2/v2/...；它们没有旧路径可回落。
+	if strings.HasPrefix(path, "/v2/") {
+		return c.growthJSONPath(account, method, path, body, nil)
+	}
+
 	data, err := c.growthJSONPath(account, method, "/v2"+path, body, nil)
 	if err == nil {
 		return data, nil

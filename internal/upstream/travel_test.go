@@ -387,6 +387,27 @@ func TestGrowthUsesV2First(t *testing.T) {
 	}
 }
 
+// TestGrowthPathAlreadyV2NotDoubled 已带 /v2 的任务路径不能被 growthJSON 再拼一次前缀。
+func TestGrowthPathAlreadyV2NotDoubled(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+
+		return jsonResp(200, `{"code":0,"data":{"tasks":[]}}`), nil
+	})
+
+	if _, err := client.ListTasks(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+
+	if len(paths) != 1 || paths[0] != "/v2/activity/growth/tasks" {
+		t.Errorf("paths=%v want only /v2/activity/growth/tasks", paths)
+	}
+}
+
 // TestTravelClaimReturnsLastError 空 body 重试失败时返回最后一次错误分类，
 // 不被更早的参数错误覆盖。
 func TestTravelClaimReturnsLastError(t *testing.T) {
