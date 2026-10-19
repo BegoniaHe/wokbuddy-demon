@@ -1524,13 +1524,23 @@ func stringValue(v any) string {
 	return s
 }
 
-// intValue 读取 JSON 数字（float64）并转 int。
+// intValue 读取 JSON/内部数值并转 int。内部聚合层会把 created 与模型目录字段
+// 构造成 int64，不能只认 JSON 解码的 float64。
 func intValue(v any) int {
 	switch n := v.(type) {
 	case float64:
 		return int(n)
 	case int:
 		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		parsed, err := n.Int64()
+		if err != nil {
+			return 0
+		}
+
+		return int(parsed)
 	default:
 		return 0
 	}

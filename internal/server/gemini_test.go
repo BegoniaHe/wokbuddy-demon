@@ -322,3 +322,28 @@ func TestGeminiXGoogAPIKeyAuth(t *testing.T) {
 		t.Fatalf("x-goog-api-key code=%d body=%s", rec.Code, rec.Body)
 	}
 }
+
+// TestGeminiStreamRequestLevelError 流式请求级错误应返回 400 INVALID_ARGUMENT，
+// 不能把内容拦截/上下文超限伪装成可重试的 UNAVAILABLE。
+func TestGeminiStreamRequestLevelError(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	w := newGeminiStreamWriter(rec, "m")
+
+	raw := `data: {"error":{"code":400,"message":"blocked by security policy"}}` + "\n\n"
+	if _, err := w.Write([]byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	out := rec.Body.String()
+	for _, want := range []string{`"code":400`, `"status":"INVALID_ARGUMENT"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stream error missing %q:\n%s", want, out)
+		}
+	}
+
+	if strings.Contains(out, "UNAVAILABLE") {
+		t.Errorf("请求级错误不应返回 UNAVAILABLE:\n%s", out)
+	}
+}

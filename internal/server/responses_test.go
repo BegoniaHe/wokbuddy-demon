@@ -547,6 +547,71 @@ func TestResponsesFunctionOutputImage(t *testing.T) {
 	}
 }
 
+// TestResponsesToolImagesStayWithToolRun 历史工具图片必须紧跟该轮工具结果，
+// 不能因为会话后面还有消息就被挪到最末尾。
+func TestResponsesToolImagesStayWithToolRun(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"m",
+		"input":[
+			{"type":"message","role":"user","content":"look"},
+			{"type":"function_call","call_id":"c1","name":"view_image","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":[
+				{"type":"input_image","image_url":"data:image/png;base64,abc"}
+			]},
+			{"type":"message","role":"user","content":"next"}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 5 {
+		t.Fatalf("messages=%d want 5: %v", len(msgs), msgs)
+	}
+
+	image := msgs[3].(map[string]any)
+	if image["role"] != "user" {
+		t.Fatalf("image 应紧跟 tool 消息: %v", msgs)
+	}
+
+	if parts, _ := image["content"].([]any); len(parts) != 1 || parts[0].(map[string]any)["type"] != "image_url" {
+		t.Errorf("image message=%v", image)
+	}
+
+	if next := msgs[4].(map[string]any); next["role"] != "user" || next["content"] != "next" {
+		t.Errorf("后续消息被挤到图片之后: %v", msgs[4])
+	}
+}
+
+func TestResponsesCustomToolInputFallback(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name string
+		args string
+		want string
+	}{
+		{"约定形态", `{"input":"*** Begin Patch"}`, "*** Begin Patch"},
+		{"缺 input 键保留原文", `{"patch":"*** Begin Patch"}`, `{"patch":"*** Begin Patch"}`},
+		{"input 非字符串保留原文", `{"input":123}`, `{"input":123}`},
+		{"非法 JSON 保留原文", `not-json`, `not-json`},
+	} {
+		if got := responsesCustomToolInput(testCase.args); got != testCase.want {
+			t.Errorf("%s: got %q want %q", testCase.name, got, testCase.want)
+		}
+	}
+}
+
 func TestResponsesRequestRejectsNullInput(t *testing.T) {
 	t.Parallel()
 

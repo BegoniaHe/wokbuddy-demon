@@ -194,3 +194,22 @@ func TestDialWebFetchRejectsBlockedIP(t *testing.T) {
 		}
 	}
 }
+
+// TestDeclaredLocalWebToolsAdditionalTools Codex 0.162+ 把工具放在
+// input.additional_tools 时，本地 web 工具识别必须与工具声明合并同口径。
+func TestDeclaredLocalWebToolsAdditionalTools(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{
+		"model":"m",
+		"input":[
+			{"type":"additional_tools","role":"developer","tools":[{"type":"web_search"},{"type":"web_fetch"}]},
+			{"type":"message","role":"user","content":"hi"}
+		]
+	}`)
+
+	wanted, ok := declaredLocalWebTools(body)
+	if !ok || !wanted["web_search"] || !wanted["web_fetch"] {
+		t.Fatalf("wanted=%v ok=%v", wanted, ok)
+	}
+}

@@ -631,3 +631,24 @@ func TestAnthropicStreamKeepalive(t *testing.T) {
 		t.Fatalf("心跳后 Anthropic 事件丢失:\n%s", out)
 	}
 }
+
+// TestAnthropicModelEntryInt64Fields 模型目录的 created / max_output_tokens
+// 是内部 int64，转换层不能因数值类型不同而静默丢字段。
+func TestAnthropicModelEntryInt64Fields(t *testing.T) {
+	t.Parallel()
+
+	const created = int64(1700000000)
+
+	entry := anthropicModelEntry(map[string]any{
+		"id": "cn:m", "name": "M", "created": created,
+		"max_output_tokens": int64(8192), "context_length": int64(200000),
+	})
+
+	if entry["max_tokens"] != 8192 || entry["max_input_tokens"] != 200000 {
+		t.Fatalf("entry=%v", entry)
+	}
+
+	if entry["created_at"] != time.Unix(created, 0).UTC().Format(time.RFC3339) {
+		t.Errorf("created_at=%v", entry["created_at"])
+	}
+}

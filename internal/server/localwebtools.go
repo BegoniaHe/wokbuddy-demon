@@ -63,6 +63,7 @@ var (
 func declaredLocalWebTools(body []byte) (map[string]bool, bool) {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
+		Input json.RawMessage  `json:"input"`
 	}
 	if json.Unmarshal(body, &req) != nil {
 		return nil, false
@@ -70,7 +71,9 @@ func declaredLocalWebTools(body []byte) (map[string]bool, bool) {
 
 	wanted := map[string]bool{}
 
-	for _, tool := range req.Tools {
+	// Codex 0.162+ 把工具放进 input.additional_tools；与 responsesToOpenAI 的
+	// 合并口径保持一致，否则本地 web 工具不会触发、反而被透传给上游。
+	for _, tool := range append(req.Tools, responsesAdditionalTools(req.Input)...) {
 		switch stringValue(tool["type"]) {
 		case "web_search", "web_search_preview":
 			wanted["web_search"] = true

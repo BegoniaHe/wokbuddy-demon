@@ -328,7 +328,7 @@ func responsesMessages(req *responsesRequest) ([]any, error) {
 	}
 
 	convertedItems := 0
-	toolImages := make([]any, 0)
+	builder := &responsesInputMessages{msgs: msgs}
 
 	for _, item := range items {
 		converted, images, ok, err := responsesInputItem(item)
@@ -340,8 +340,8 @@ func responsesMessages(req *responsesRequest) ([]any, error) {
 			continue
 		}
 
-		msgs = append(msgs, converted...)
-		toolImages = append(toolImages, images...)
+		builder.add(converted, images)
+
 		convertedItems++
 	}
 
@@ -349,7 +349,42 @@ func responsesMessages(req *responsesRequest) ([]any, error) {
 		return nil, errNoConvertibleItems
 	}
 
-	return appendToolImages(msgs, toolImages), nil
+	builder.flushImages()
+
+	return builder.msgs, nil
+}
+
+// responsesInputMessages 在追加输入消息时维护工具图片的归属：图片必须贴着
+// 所属工具结果，跨过后续消息再追加会把历史图片挪到会话末尾。
+type responsesInputMessages struct {
+	msgs       []any
+	toolImages []any
+}
+
+func (b *responsesInputMessages) add(converted, images []any) {
+	if len(b.toolImages) > 0 && !responsesIsToolMessage(converted) {
+		b.flushImages()
+	}
+
+	b.msgs = append(b.msgs, converted...)
+	if responsesIsToolMessage(converted) {
+		b.toolImages = append(b.toolImages, images...)
+
+		return
+	}
+
+	if len(images) > 0 {
+		b.msgs = append(b.msgs, responsesToolImageMessage(images))
+	}
+}
+
+func (b *responsesInputMessages) flushImages() {
+	if len(b.toolImages) == 0 {
+		return
+	}
+
+	b.msgs = append(b.msgs, responsesToolImageMessage(b.toolImages))
+	b.toolImages = nil
 }
 
 // responsesStringInput 识别 Responses 的字符串 input；null 视为未提供。
@@ -367,14 +402,20 @@ func responsesStringInput(raw json.RawMessage) (string, bool) {
 	return text, true
 }
 
-// appendToolImages 把 function_call_output 里的图片（Codex view_image 等）统一
-// 追加为一条 user 图片消息，避免多工具结果之间插入 user 消息打断 tool 序列。
-func appendToolImages(msgs, images []any) []any {
-	if len(images) == 0 {
-		return msgs
+// responsesIsToolMessage 报告转换结果是否为单条 role=tool 消息。
+func responsesIsToolMessage(msgs []any) bool {
+	if len(msgs) != 1 {
+		return false
 	}
 
-	return append(msgs, map[string]any{"role": "user", "content": images})
+	msg, _ := msgs[0].(map[string]any)
+
+	return stringValue(msg["role"]) == "tool"
+}
+
+// responsesToolImageMessage 把工具结果里不能放进 role=tool 的图片包成 user 消息。
+func responsesToolImageMessage(images []any) map[string]any {
+	return map[string]any{"role": "user", "content": images}
 }
 
 // responsesInputItem 转换单条 input item，返回消息与需要单独回传的图片。
@@ -1229,16 +1270,25 @@ func responsesSetNamespace(item map[string]any, namespace string) {
 }
 
 // responsesCustomToolInput 从降级后的 {"input":"..."} 参数里还原 freeform 文本。
-// 模型未按约定输出时退回原始 arguments，避免丢调用。
+// 模型未按约定输出时退回原始 arguments，避免丢调用。只有 input 键存在且为字符串
+// 才解包；否则 {"patch":"..."} 这类偏差会被当成空 input 丢掉。
 func responsesCustomToolInput(args string) string {
-	var payload struct {
-		Input string `json:"input"`
-	}
-	if json.Unmarshal([]byte(args), &payload) == nil {
-		return payload.Input
+	var payload map[string]json.RawMessage
+	if json.Unmarshal([]byte(args), &payload) != nil {
+		return args
 	}
 
-	return args
+	raw, ok := payload["input"]
+	if !ok {
+		return args
+	}
+
+	var input string
+	if json.Unmarshal(raw, &input) != nil {
+		return args
+	}
+
+	return input
 }
 
 func responsesUsage(raw any) map[string]any {

@@ -1172,7 +1172,7 @@ func (g *geminiStreamWriter) handleChunk(payload string) error {
 	}
 
 	if errObj, ok := chunk["error"].(map[string]any); ok {
-		return g.handleUpstreamError(errObj)
+		return g.handleUpstreamError(errObj, payload)
 	}
 
 	if id := stringValue(chunk["id"]); id != "" && g.id == "" {
@@ -1263,7 +1263,7 @@ func (g *geminiStreamWriter) collectToolCalls(raw any) error {
 	return nil
 }
 
-func (g *geminiStreamWriter) handleUpstreamError(errObj map[string]any) error {
+func (g *geminiStreamWriter) handleUpstreamError(errObj map[string]any, payload string) error {
 	g.errored = true
 
 	msg := stringValue(errObj["message"])
@@ -1271,7 +1271,9 @@ func (g *geminiStreamWriter) handleUpstreamError(errObj map[string]any) error {
 		msg = "upstream stream error"
 	}
 
-	e := map[string]any{"code": http.StatusServiceUnavailable, "message": msg, "status": "UNAVAILABLE"}
+	status := geminiStreamErrorStatus(upstream.FrameKind(payload))
+
+	e := map[string]any{"code": status, "message": msg, "status": geminiStatus(status)}
 	if hint := stringValue(errObj["gateway_hint"]); hint != "" {
 		e["gateway_hint"] = hint
 	}
@@ -1283,6 +1285,19 @@ func (g *geminiStreamWriter) handleUpstreamError(errObj map[string]any) error {
 	g.finished = true
 
 	return nil
+}
+
+// geminiStreamErrorStatus 把上游错误分类映射回 Gemini 错误码：请求级错误换号
+// 必然同样失败，应返回 400 而不是让客户端把 UNAVAILABLE 当成可重试的过载。
+func geminiStreamErrorStatus(kind upstream.ErrKind) int {
+	switch {
+	case failFastKind(kind), kind == upstream.ErrModelBlocked:
+		return http.StatusBadRequest
+	case kind == upstream.ErrSoftRate:
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusServiceUnavailable
+	}
 }
 
 func (g *geminiStreamWriter) finish() error {
