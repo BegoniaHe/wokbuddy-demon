@@ -65,8 +65,9 @@ func growthPending(t *upstream.Task) bool {
 const scanWorkers = 5
 
 // tasksScanAll 扫描全部账号：成长任务（未完成+可自动化，含 mp 口径合并）。
-// 只读操作，并发拉取（受 scanWorkers 约束）。
+// 只读操作，并发拉取（受 scanWorkers 约束）；客户端断开后不再派发剩余账号。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
 
@@ -82,7 +83,9 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 
 		// 先取名额再起 goroutine：账号多时只会有 scanWorkers 个 goroutine
 		// 同时在跑，而不是每个账号都留一个阻塞在信号量上的 goroutine。
-		sem <- struct{}{}
+		if !acquireSem(ctx, sem) {
+			break
+		}
 
 		wg.Add(1)
 		go func(i int, uid string) {
@@ -100,6 +103,10 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wg.Wait()
+
+	if ctx.Err() != nil {
+		return // 客户端已断开：不必统计与写回执
+	}
 
 	pending := 0
 	for _, it := range items {
@@ -596,6 +603,7 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 
 // schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
 // 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
+// 客户端断开后不再派发剩余账号。
 func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
 
@@ -623,7 +631,9 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
-		sem <- struct{}{}
+		if !acquireSem(r.Context(), sem) {
+			break
+		}
 
 		wg.Add(1)
 		go func(i int, account5 *auth.Auth) {

@@ -1257,8 +1257,10 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 // packages 返回全部账号的积分包构成，供「积分构成」视图对比。
 //
 // 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
-// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。客户端断开后
+// 不再派发剩余账号。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	accts := p.cfg.Pool.List()
 	out := make([]packageAccountRow, len(accts))
 
@@ -1270,7 +1272,9 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 		status := &accts[i]
 
 		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
-		sem <- struct{}{}
+		if !acquireSem(ctx, sem) {
+			break
+		}
 
 		wg.Add(1)
 		go func(i int, status *pool.Status) {
@@ -1303,6 +1307,10 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	wg.Wait()
+
+	if ctx.Err() != nil {
+		return // 客户端已断开：不必排序与写回执
+	}
 
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
