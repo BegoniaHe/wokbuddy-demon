@@ -122,6 +122,38 @@ func TestChatStatsReaderNoUsage(t *testing.T) {
 	}
 }
 
+// TestChatStatsReaderSubstantiveOutput 实质输出判定：正文/工具调用/拒绝都算，
+// 旧式 function_call 不能因新加的 reasoning-only 护栏被误判为空回答。
+func TestChatStatsReaderSubstantiveOutput(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"content", `data: {"choices":[{"delta":{"content":"hi"}}]}`, true},
+		{"tool_calls", `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c"}]}}]}`, true},
+		{"refusal", `data: {"choices":[{"delta":{"refusal":"no"}}]}`, true},
+		{"function_call", `data: {"choices":[{"delta":{"function_call":{"name":"Bash"}}}]}`, true},
+		{"empty_function_call", `data: {"choices":[{"delta":{"function_call":{}}}]}`, false},
+		{"reasoning_only", `data: {"choices":[{"delta":{"reasoning":"think"}}]}`, false},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var stats chatStatsReader
+			stats.parseSSELine(testCase.line)
+
+			if got := stats.HasSubstantiveOutput(); got != testCase.want {
+				t.Errorf("HasSubstantiveOutput=%v want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestChatStatsReaderLastFrameUsageWins(t *testing.T) {
 	t.Parallel()
 

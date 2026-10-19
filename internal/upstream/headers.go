@@ -236,9 +236,9 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
 	// 企业与域头按 realm 分发：CN 走既有分支（EnterpriseID/Domain 原样透传，缺省 X-No-*）；
-	// global 账号由 injectGlobalChatHeaders 统一覆写为国际客户端形态
-	// （X-No-Enterprise-Id=1 声明无企业 + X-Domain=www.workbuddy.ai 声明国际版域），
-	// 且不回退 X-Domain 到登录会话原值——对齐 intl 项目出站头。
+	// global 账号由 injectGlobalChatHeaders 统一注入国际客户端形态
+	// （企业：X-Enterprise-Id + X-Tenant-Id；个人：X-No-Enterprise-Id=1；
+	// X-Domain 账号 domain 优先，缺省 www.workbuddy.ai）。
 	if account3 != nil && !account3.IsGlobal() {
 		injectCNChatHeaders(req, account3)
 	} else {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -396,6 +397,42 @@ func TestChatOriginFailover(t *testing.T) {
 
 	if len(hosts) != 1 || hosts[0] != "chat.example" {
 		t.Errorf("configured hosts=%v want only chat.example", hosts)
+	}
+}
+
+// TestCollectPackageExpiryStopsOnEmptyPage TotalCount 与过滤后页数不一致时，
+// 空页必须立即终止，避免余额刷新空翻到 100 页上限。
+func TestCollectPackageExpiryStopsOnEmptyPage(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		calls++
+
+		return jsonResp(200, `{"code":0,"data":{"Accounts":[],"TotalCount":500}}`), nil
+	})
+
+	var totals resourceTotals
+	if err := client.collectPackageExpiry(
+		&auth.Auth{AccessToken: "at", UID: "u1"},
+		"/billing/meter/get-user-resource-paid-packages", map[string]any{}, time.Now(), 0, &totals,
+	); err != nil {
+		t.Fatalf("collect: %v", err)
+	}
+
+	if calls != 1 {
+		t.Errorf("calls=%d want 1 (stop on empty page)", calls)
+	}
+}
+
+// TestCreditPackageExpiryFallsBackToPackageEndTime 仅下发 PackageEndTime 的包仍能取到到期时刻。
+func TestCreditPackageExpiryFallsBackToPackageEndTime(t *testing.T) {
+	t.Parallel()
+
+	got, expiresAt := creditPackageExpiry(&billingPackageAccount{PackageEndTime: "2026-10-20 00:00:00"})
+	if got != "2026-10-20 00:00:00" || expiresAt != 0 {
+		t.Errorf("expiry=%q/%d want PackageEndTime", got, expiresAt)
 	}
 }
 

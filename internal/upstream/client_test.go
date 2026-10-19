@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -756,7 +757,7 @@ func TestModelRateCacheEffectiveAndNormalized(t *testing.T) {
 func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 	t.Parallel()
 	// CLI 目录给 flash 精简字段（128K / 固定 high）；IDE /v3/config 给完整能力。
-	var sawIDE bool
+	var sawIDE atomic.Bool
 
 	client := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
@@ -765,7 +766,7 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":128000,"credits":"x0.03 credits","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"effort":"high","summary":"auto"}}
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
-			sawIDE = true
+			sawIDE.Store(true)
 
 			assertV3ConfigHeaders(t, r)
 
@@ -784,7 +785,7 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 		t.Fatalf("fetch models: %v", err)
 	}
 
-	if !sawIDE {
+	if !sawIDE.Load() {
 		t.Fatal("expected /v3/config request")
 	}
 

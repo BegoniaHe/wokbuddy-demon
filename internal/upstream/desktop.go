@@ -89,7 +89,7 @@ func desktopUAFor(a *auth.Auth) string {
 	return "WorkBuddy/" + desktopBuildFor(a).version
 }
 
-// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
+// desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（CN 默认 www.workbuddy.cn）。
 func (c *Client) desktopBase(a *auth.Auth) string { return c.chatBase(a) }
 
 // desktopDomain 桌面端 X-Domain 取 base 的 host 形态（官方不发送完整 URL）。
@@ -152,7 +152,7 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 	return fingerprint
 }
 
-// ReportDesktopEvent 以桌面客户端指纹向 copilot.tencent.com/v2/report 批量上报事件。
+// ReportDesktopEvent 以桌面客户端指纹向 chatBase 的 /v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
 // 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
 func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent) error {

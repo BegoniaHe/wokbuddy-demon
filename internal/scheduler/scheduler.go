@@ -581,8 +581,8 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 
 // checkinAuth 返回该账号本轮应使用的凭证；禁用/无 refresh token 跳过。
 // global 账号同样签到：官方国际版客户端使用同一 `/billing/meter/daily-checkin`
-// （无 /v2 前缀优先，见 upstream.checkinMeterPaths），此前 D4 门控会让国际版
-// 每日活跃奖励永远不闭环（issue #97）。
+// （两 realm 均 /v2 优先、404 回落旧路径，见 upstream.checkinMeterPaths），此前
+// D4 门控会让国际版每日活跃奖励永远不闭环（issue #97）。
 func (s *Scheduler) checkinAuth(st *pool.Status, includeDisabled bool) (*auth.Auth, bool) {
 	if st.Disabled && !includeDisabled {
 		return nil, false

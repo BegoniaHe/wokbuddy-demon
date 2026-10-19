@@ -255,6 +255,7 @@ type sseDeltaFrame struct {
 	Reasoning        *string         `json:"reasoning"`
 	Refusal          *string         `json:"refusal"`
 	ToolCalls        json.RawMessage `json:"tool_calls"`
+	FunctionCall     json.RawMessage `json:"function_call"`
 }
 
 // sseChoiceFrame 单个 choice 的收尾与增量形态。
@@ -327,9 +328,20 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 		s.hasRefusal = true
 	}
 
-	if tc := strings.TrimSpace(string(delta.ToolCalls)); tc != "" && tc != "null" && tc != "[]" {
+	if rawPayloadPresent(delta.ToolCalls) {
 		s.hasToolCall = true
 	}
+	// 旧式 function_call（非 tool_calls）同样是可消费的实质输出；空占位 {} 除外。
+	if rawPayloadPresent(delta.FunctionCall) {
+		s.hasToolCall = true
+	}
+}
+
+// rawPayloadPresent 报告 JSON 片段是否是有效负载（排除空值/空数组/空对象占位）。
+func rawPayloadPresent(raw json.RawMessage) bool {
+	value := strings.TrimSpace(string(raw))
+
+	return value != "" && value != "null" && value != "[]" && value != "{}"
 }
 
 // HasSubstantiveOutput 报告流中是否产生正文、工具调用或拒答。

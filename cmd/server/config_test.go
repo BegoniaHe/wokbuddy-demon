@@ -292,7 +292,7 @@ func TestBadBreakerCooldown(t *testing.T) {
 
 func TestUpstreamTimeoutDefaults(t *testing.T) {
 	t.Parallel()
-	// 默认：header 回落 timeout，idle 回落 300。
+	// 默认：header / idle 均对齐官方客户端 1200s，不再跟随短 RPC timeout。
 	config := Default()
 	if err := config.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -311,9 +311,9 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 	}
 }
 
-func TestUpstreamHeaderFallsBackToTimeout(t *testing.T) {
+func TestUpstreamHeaderTimeoutIndependentOfRPCTimeout(t *testing.T) {
 	t.Parallel()
-	// 只设 timeout_seconds：header 回落同值，idle 回落 300。
+	// 只设 timeout_seconds：header / idle 仍取 1200s 默认（短 RPC 超时不外溢）。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
 	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)

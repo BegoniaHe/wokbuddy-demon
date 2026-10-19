@@ -1876,7 +1876,7 @@ const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 //  1. 旧注释称「CLI UA 拿到精简目录、IDE UA 才返回完整能力」——实测模型数量恰好相反，
 //     但 **IDE 响应体积更大**（26003B vs 21111B），故「完整能力」应理解为**单条字段更全**，
 //     而非模型更多。两路各有独有模型，缺一不可。
-//  2. 该常量仅用于 global 侧第二路探测；CN 侧仍走 codeBuddyIDEUA 单路。
+//  2. 该常量用于 global 侧第二路探测；CN 侧按官方客户端同时探测桌面端 UA 与 IDE UA。
 const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
@@ -2131,7 +2131,7 @@ func collectEnterpriseModels(cliIDs []string, dynMap map[string]dynModelEntry) [
 	return out
 }
 
-// fetchV3Models 单路探测 /v3/config（IDE UA 完整能力版，见 codeBuddyIDEUA）。
+// fetchV3Models 并发探测 /v3/config（桌面端 UA 为主 + IDE UA 补缺，见 codeBuddyIDEUA）。
 // v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致），按同一
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
@@ -3039,6 +3039,8 @@ func creditPackageExpiry(billingPackageAccount4 *billingPackageAccount) (endTime
 		return time.UnixMilli(billingPackageAccount4.DeductionEndTime).Format(time.RFC3339), billingPackageAccount4.DeductionEndTime
 	case billingPackageAccount4.ExpiredTime != "":
 		return billingPackageAccount4.ExpiredTime, 0
+	case billingPackageAccount4.PackageEndTime != "":
+		return billingPackageAccount4.PackageEndTime, 0
 	default:
 		return billingPackageAccount4.CycleEndTime, 0
 	}
@@ -3376,6 +3378,12 @@ func (c *Client) collectPackageExpiry(
 		}
 
 		addPackageExpiry(resp.Accounts, now, soon, totals)
+
+		// 空页必须终止：TotalCount 与过滤后页数不一致时，单靠 seen>=TotalCount
+		// 会空翻到 100 页上限，给每个账号的余额刷新放大成上百次上游请求。
+		if len(resp.Accounts) == 0 {
+			break
+		}
 
 		seen += len(resp.Accounts)
 		if resp.TotalCount > 0 {

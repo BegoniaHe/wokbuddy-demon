@@ -85,14 +85,13 @@ func (c *Client) TravelDepart(a *auth.Auth, locationID int) error {
 
 // TravelClaim 领取到站奖励，返回 reward_credit。
 // 官方客户端存在两种请求形态：带 record_id 与空 body。带 record_id 收到参数错误
-// 或 404 时，用空 body 重试一次；两种都失败时返回原始错误。
+// 或 404 时，用空 body 重试一次；多次尝试都失败时返回最后一次错误（避免用首个
+// 404 覆盖会话失效/服务端错误，让调用方仍能按真实分类处置账号）。
 func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) {
 	headers := map[string]string{"X-Product-Code": "workbuddy"}
 	lastPath := "/v2" + travelClaimPath
 
 	data, err := c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers)
-	firstErr := err
-
 	if err != nil && isKind(err, ErrNotFound) {
 		lastPath = travelClaimPath
 		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers)
@@ -105,10 +104,6 @@ func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) 
 	}
 
 	if err != nil {
-		if firstErr != nil {
-			return 0, firstErr
-		}
-
 		return 0, err
 	}
 

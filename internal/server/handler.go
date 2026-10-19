@@ -1247,8 +1247,13 @@ func (h *Handler) backgroundTarget(model string) string {
 }
 
 // requestModelAliases 合并上游目录别名与配置别名；配置别名优先（覆盖同名上游别名）。
-func (h *Handler) requestModelAliases(model string) map[string]string {
-	realm, _, _ := splitRealm(model)
+// 裸名按命名密钥出口绑定选 realm（未绑定才回落到请求侧默认 cn），否则 global
+// key 会拿到 cn 目录的别名，global 上游 alias 永远解析不到。
+func (h *Handler) requestModelAliases(model, keyRealm string) map[string]string {
+	realm, _, prefixed := splitRealm(model)
+	if !prefixed && keyRealm != "" {
+		realm = keyRealm
+	}
 
 	var merged map[string]string
 
@@ -1275,6 +1280,11 @@ func (h *Handler) requestModelAliases(model string) map[string]string {
 	return merged
 }
 
+// resolveFlowModel 解析请求模型 → (realm, bareModel)：别名按最终出口 realm 选取。
+func (h *Handler) resolveFlowModel(in *chatInput) (realm, bareModel string, err error) {
+	return resolveKeyModel(in.model, h.requestModelAliases(in.model, in.keyRealm), in.keyRealm)
+}
+
 // newChatFlow 由结构化输入组装统计、会话标识与轮转状态（传输无关）。
 // 入站 HTTP 解析（读 body / 提取头与 IP）已在 newChatInput 完成。
 func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlow {
@@ -1290,7 +1300,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归；命名密钥出口绑定在此一并覆盖 realm。
-	realm, bareModel, realmErr := resolveKeyModel(chatInput2.model, h.requestModelAliases(chatInput2.model), chatInput2.keyRealm)
+	realm, bareModel, realmErr := h.resolveFlowModel(chatInput2)
 
 	modelRate := ""
 	if h.cfg.Upstream != nil {
