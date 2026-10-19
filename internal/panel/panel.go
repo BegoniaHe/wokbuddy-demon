@@ -912,7 +912,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 
-// accountRemove 移除账号：先出池（立即落盘 state），再删 auth 文件。
+// accountRemove 移除账号：先出池（池内退役凭证并立即落盘 state），再删 auth 文件。
 func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 
@@ -921,8 +921,6 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	// 先失效凭证再删文件：在途 refresh 的 SaveAtomic 会拒绝写回，避免文件复活。
-	account.Retire()
 
 	fileMsg := ""
 
