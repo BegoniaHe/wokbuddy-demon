@@ -1042,6 +1042,13 @@ func acquireSem(ctx context.Context, sem chan struct{}) bool {
 
 	select {
 	case sem <- struct{}{}:
+		// select 同时就绪时随机选择：拿到名额后再确认一次，覆盖「检查后、
+		// 取名额前」刚好取消的窗口；已取消则立即归还名额。
+		if ctx.Err() != nil {
+			<-sem
+			return false
+		}
+
 		return true
 	case <-ctx.Done():
 		return false
