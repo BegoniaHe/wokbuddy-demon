@@ -601,37 +601,55 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// schoolVoucherRow 单个账号的券码查询结果。
+type schoolVoucherRow struct {
+	UID      string                   `json:"uid"`
+	Nickname string                   `json:"nickname"`
+	Vouchers []upstream.SchoolVoucher `json:"vouchers"`
+	Err      string                   `json:"error,omitempty"`
+}
+
+// schoolVoucherRowFor 查询单账号券码；global 账号无开学季，不发上游调用。
+func (p *Panel) schoolVoucherRowFor(account *auth.Auth) schoolVoucherRow {
+	row := schoolVoucherRow{UID: account.UID, Nickname: account.NicknameValue()}
+
+	if account.IsGlobal() {
+		row.Err = "global realm（无开学季活动）"
+		return row
+	}
+
+	vouchers, err := p.cfg.Upstream.SchoolVouchers(account)
+	if err != nil {
+		row.Err = err.Error()
+		return row
+	}
+
+	row.Vouchers = vouchers
+
+	return row
+}
+
 // schoolVouchers 我的券码：逐 CN 账号查开学季 /vouchers（3 并发，与 packages
 // 同款限流），失败只在对应账号标 error。global 账号无开学季，不发上游调用。
 // 客户端断开后不再派发剩余账号。
 func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	accts := p.cfg.Pool.List()
-
-	type row struct {
-		UID      string                   `json:"uid"`
-		Nickname string                   `json:"nickname"`
-		Vouchers []upstream.SchoolVoucher `json:"vouchers"`
-		Err      string                   `json:"error,omitempty"`
-	}
-
-	out := make([]row, len(accts))
+	out := make([]schoolVoucherRow, len(accts))
 	sem := make(chan struct{}, 3)
 
 	var wg sync.WaitGroup
 
 	for i := range accts {
 		st := &accts[i]
-		if st.Disabled {
+
+		account := p.cfg.Pool.AuthByUID(st.UID)
+		if st.Disabled || account == nil {
 			continue // 未占位，行末统一压掉
 		}
 
-		account := p.cfg.Pool.AuthByUID(st.UID)
-		if account == nil {
-			continue
-		}
-
 		// 先取名额再起 goroutine：账号多时不在信号量上堆积阻塞协程。
-		if !acquireSem(r.Context(), sem) {
+		if !acquireSem(ctx, sem) {
 			break
 		}
 
@@ -640,26 +658,17 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			row2 := row{UID: account5.UID, Nickname: account5.NicknameValue(), Vouchers: nil, Err: ""}
-			switch {
-			case account5.IsGlobal():
-				row2.Err = "global realm（无开学季活动）"
-			default:
-				vs, err := p.cfg.Upstream.SchoolVouchers(account5)
-				if err != nil {
-					row2.Err = err.Error()
-				} else {
-					row2.Vouchers = vs
-				}
-			}
-
-			out[i] = row2
+			out[i] = p.schoolVoucherRowFor(account5)
 		}(i, account)
 	}
 
 	wg.Wait()
 
-	res := make([]row, 0, len(out))
+	if ctx.Err() != nil {
+		return // 客户端已断开：不必组装与写回执
+	}
+
+	res := make([]schoolVoucherRow, 0, len(out))
 	for _, it := range out {
 		if it.UID != "" {
 			res = append(res, it)

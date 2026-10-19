@@ -56,5 +56,9 @@ func TestReadonlyFanoutStopsOnCanceledContext(t *testing.T) {
 		if got := calls.Load(); got != 0 {
 			t.Fatalf("%s: upstream calls=%d want 0 after canceled ctx", name, got)
 		}
+
+		if rec.Body.Len() != 0 {
+			t.Fatalf("%s: wrote body after canceled ctx: %s", name, rec.Body)
+		}
 	}
 }
