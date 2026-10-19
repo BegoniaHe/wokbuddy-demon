@@ -126,7 +126,7 @@ type Upstash struct {
 	initOnce sync.Once
 	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
 	closeOnce sync.Once
-	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先登记 wg 再查 done，
+	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先查 done 再登记 wg，
 	// Close 先关 done 再等 wg——两侧互斥后，「Close 前提交的写必然执行」
 	// 不再依赖 goroutine 调度时序（83d18ae 原版存在窗口：排队写在 Close
 	// 关 done 之后才跑到检查点会被误丢，close_test.go:138 稳定复现）。
