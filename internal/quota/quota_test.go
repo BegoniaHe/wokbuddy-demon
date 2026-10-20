@@ -1,6 +1,8 @@
 package quota
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -31,15 +33,34 @@ func TestBudgetsAndDedup(t *testing.T) {
 
 // TestLoadPrunesExpiredEvents 加载后必须按保留期裁剪：重启时文件里的旧事件
 // 不应短暂参与预算聚合，等下一次 Add 才被清掉。
+//
+// 事件直接写进文件而不是走 Add：Add 落盘前已按自身时间裁剪，文件里不会留下
+// 过期事件，用例就测不到 load 的裁剪分支（删掉 load 里的 pruneLocked 也照样通过）。
 func TestLoadPrunesExpiredEvents(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "quota.jsonl")
-	store := New(path)
+	now := time.Now()
+	old := now.Add(-eventRetention - 24*time.Hour)
 
-	old := time.Now().Add(-eventRetention - 24*time.Hour)
-	store.Add(&Event{UID: "u1", Realm: "cn", Model: "m", ResetAt: old, Used: 100, At: old})
-	store.Add(&Event{UID: "u2", Realm: "cn", Model: "m", ResetAt: time.Now(), Used: 300, At: time.Time{}})
+	var raw []byte
+
+	for _, event := range []Event{
+		{UID: "u1", Realm: "cn", Model: "m", ResetAt: old, Used: 100, At: old},
+		{UID: "u2", Realm: "cn", Model: "m", ResetAt: now, Used: 300, At: now},
+	} {
+		line, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+
+		raw = append(raw, line...)
+		raw = append(raw, '\n')
+	}
+
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("write quota file: %v", err)
+	}
 
 	reloaded := New(path)
 	if got := len(reloaded.Events()); got != 1 {
