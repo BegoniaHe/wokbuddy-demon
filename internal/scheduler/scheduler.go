@@ -260,10 +260,14 @@ func poke(ch chan struct{}) {
 func nextFire(now time.Time, hours []int) time.Time {
 	var earliest time.Time
 
-	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+	for _, hour := range hours {
+		t := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location())
 		if !t.After(now) {
-			t = t.Add(24 * time.Hour)
+			// 用 time.Date 重算次日同一墙钟小时，而不是 Add(24h)：夏令时切换日
+			// 24h 不等于一个日历日，Add 会把 09:00 推到 08:00（回拨日）或
+			// 10:00（拨快日），导致任务在错误的小时触发。
+			// time.Date 对日溢出自动进位（月末→下月 1 号、年末→下年 1 号）。
+			t = time.Date(now.Year(), now.Month(), now.Day()+1, hour, 0, 0, 0, now.Location())
 		}
 
 		if earliest.IsZero() || t.Before(earliest) {

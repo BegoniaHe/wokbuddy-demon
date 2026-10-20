@@ -274,10 +274,10 @@ func TestWindowBounds(t *testing.T) {
 	if !gotFrom.Equal(from) || !gotTo.IsZero() {
 		t.Fatalf("From 应优先于 Hours: from=%v to=%v", gotFrom, gotTo)
 	}
-	// 只有 Hours：起点 = 当前整点往回 Hours-1 小时。
+	// 只有 Hours：起点 = 当前本地整点往回 Hours-1 小时。
 	f, to := Window{Hours: 24, From: time.Time{}, To: time.Time{}}.bounds()
 
-	want := time.Now().Truncate(time.Hour).Add(-23 * time.Hour)
+	want := localHourStart(time.Now()).Add(-23 * time.Hour)
 	if !f.Equal(want) || !to.IsZero() {
 		t.Fatalf("24h bounds = %v/%v, want %v/零值", f, to, want)
 	}
@@ -288,9 +288,29 @@ func TestWindowBounds(t *testing.T) {
 	// 上限 60 天。
 	f60, _ := Window{Hours: 100000, From: time.Time{}, To: time.Time{}}.bounds()
 
-	want60 := time.Now().Truncate(time.Hour).Add(-(24*60 - 1) * time.Hour)
+	want60 := localHourStart(time.Now()).Add(-(24*60 - 1) * time.Hour)
 	if !f60.Equal(want60) {
 		t.Fatalf("超限 Hours 未被夹到 60 天: %v want %v", f60, want60)
+	}
+}
+
+// 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
+// Truncate(time.Hour) 会得到 :30，当前小时的桶被整段排除，短窗口恒为空。
+func TestWindowBoundsLocalHourOffset(t *testing.T) {
+	t.Parallel()
+
+	loc := time.FixedZone("UTC+5:30", 5*60*60+30*60)
+	now := time.Date(2026, 10, 20, 14, 47, 0, 0, loc)
+
+	from, _ := (Window{Hours: 1, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+
+	want := time.Date(2026, 10, 20, 14, 0, 0, 0, loc)
+	if !from.Equal(want) {
+		t.Fatalf("from=%v want %v", from, want)
+	}
+
+	if !inWindow("h:"+now.Format(hourLayout), from, time.Time{}, true) {
+		t.Fatal("当前小时的桶应落在最近 1 小时窗口内")
 	}
 }
 

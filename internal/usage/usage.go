@@ -857,6 +857,11 @@ type Window struct {
 
 // bounds 解析出实际生效的 [from, to]；零值表示该侧不设界。
 func (w Window) bounds() (time.Time, time.Time) {
+	return w.boundsAt(time.Now())
+}
+
+// boundsAt 同 bounds，但用调用方给定的 now 计算滚动窗口起点（单测注入）。
+func (w Window) boundsAt(now time.Time) (time.Time, time.Time) {
 	if !w.From.IsZero() || !w.To.IsZero() {
 		return w.From, w.To
 	}
@@ -867,7 +872,17 @@ func (w Window) bounds() (time.Time, time.Time) {
 
 	h := min(w.Hours, 24*60)
 
-	return time.Now().Truncate(time.Hour).Add(-time.Duration(h-1) * time.Hour), time.Time{}
+	return localHourStart(now).Add(-time.Duration(h-1) * time.Hour), time.Time{}
+}
+
+// localHourStart 返回 now 所在本地墙钟整点。
+//
+// 不能用 time.Truncate(time.Hour)：它按「自零值起的小时倍数」截断，而零值是
+// UTC 基准——非整小时偏移的时区（如 +05:30）会得到 :30 的“整点”。滚动窗口
+// 起点随之后移半小时，当前小时的桶（:00）被整段排除在窗口外，面板「最近 1 小时」
+// 等短窗口会直接显示为空。
+func localHourStart(now time.Time) time.Time {
+	return time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
 }
 
 // bucketTime 把桶 scope 解析成本地时间；脏 scope 返回 false（不进任何口径）。

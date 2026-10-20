@@ -1016,3 +1016,26 @@ func TestPausedStillTravels(t *testing.T) {
 		t.Errorf("travel status calls=%d want 2（u1 + 暂停号 u2 照常旅行）", got)
 	}
 }
+
+// TestNextFireAcrossDST 夏令时切换日 24h 不等于一个日历日：次日槽位必须仍是
+// 同一墙钟小时，不能因为 Add(24h) 漂移到 08:00/10:00。
+func TestNextFireAcrossDST(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 2026-10-25 03:00 CEST 回拨到 02:00 CET：Add(24h) 会把 09:00 变成 08:00。
+	now := time.Date(2026, 10, 24, 10, 0, 0, 0, loc)
+	if next := nextFire(now, []int{9}); next.Hour() != 9 || next.Day() != 25 {
+		t.Errorf("回拨日 next=%v want 2026-10-25 09:00", next)
+	}
+
+	// 2026-03-29 02:00 CET 拨快到 03:00 CEST：Add(24h) 会把 09:00 变成 10:00。
+	now = time.Date(2026, 3, 28, 10, 0, 0, 0, loc)
+	if next := nextFire(now, []int{9}); next.Hour() != 9 || next.Day() != 29 {
+		t.Errorf("拨快日 next=%v want 2026-03-29 09:00", next)
+	}
+}
