@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -216,6 +217,32 @@ func TestSnapshotWindowFilter(t *testing.T) {
 	}
 }
 
+// wallHourStarts 返回 now 所在本地整点往回 count 个互不相同的墙钟小时桶起点
+// （升序）。桶 scope 按本地墙钟整点归档，用绝对 Add 取相邻小时会在夏令时切换日
+// 失真：回拨日的重复小时生成重复 scope（6 条记录只剩 5 个桶），拨快日不存在的
+// 整点被归一成同一时刻。这里按墙钟小时回退并按 Unix 时刻去重，保证每个返回
+// 时刻都是一个独立桶的起点。
+func wallHourStarts(now time.Time, count int) []time.Time {
+	base := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+
+	out := make([]time.Time, 0, count)
+	seen := make(map[int64]struct{}, count)
+
+	for k := 0; len(out) < count; k++ {
+		t := time.Date(base.Year(), base.Month(), base.Day(), base.Hour()-k, 0, 0, 0, base.Location())
+		if _, dup := seen[t.Unix()]; dup {
+			continue
+		}
+
+		seen[t.Unix()] = struct{}{}
+		out = append(out, t)
+	}
+
+	slices.Reverse(out)
+
+	return out
+}
+
 // 显式区间（「今天」/「自定义」）与滚动窗口走同一套全口径过滤；区间是闭区间
 // （桶起点落在 [From, To] 内即命中），且 From/To 会回显给面板确认口径。
 func TestSnapshotExplicitWindow(t *testing.T) {
@@ -223,17 +250,14 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 
 	r := New("")
 
-	// 桶 scope 按本地墙钟整点归档，base 也必须对齐本地整点：Truncate(time.Hour)
-	// 在 +05:30 等非整小时偏移时区得到 :30，桶会被归到下一个整点，窗口取不中。
-	base := localHourStart(time.Now()).Add(-5 * time.Hour)
-	for i := range 6 {
-		r.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u", "m",
-			&Delta{PromptTokens: 10, HasPromptTokens: true}, true)
+	hours := wallHourStarts(time.Now(), 6)
+	for _, at := range hours {
+		r.Add(at, "cn", "u", "m", &Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	}
-	// 只取中间两小时（base+2h、base+3h）。
+	// 只取中间两小时（hours[2]、hours[3]）。
 	snapshot := r.SnapshotWindow(Window{
-		From:  base.Add(2 * time.Hour),
-		To:    base.Add(3 * time.Hour),
+		From:  hours[2],
+		To:    hours[3],
 		Hours: 0,
 	}, nil, nil)
 	wantEq(t, "显式区间 requests", snapshot.Totals.Requests, int64(2))
@@ -250,7 +274,7 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 	}
 
 	// 只有 From（「今天」的形态）：从该点起到最新，全量命中。
-	only := r.SnapshotWindow(Window{From: base.Add(4 * time.Hour), Hours: 0, To: time.Time{}}, nil, nil)
+	only := r.SnapshotWindow(Window{From: hours[4], Hours: 0, To: time.Time{}}, nil, nil)
 	wantEq(t, "仅 From 的 requests", only.Totals.Requests, int64(2))
 
 	if only.WindowFrom == "" || only.WindowTo != "" {
