@@ -410,6 +410,25 @@ func TestWindowBoundsTwoHourFallBack(t *testing.T) {
 	}
 }
 
+// 30 分钟拨快的时区（Australia/Lord_Howe：01:30+10:30 → 02:30+11）里
+// time.Date(02:00) 会归一化成 02:30；若把它当成上一桶起点，hours=2 只含当前
+// 小时桶，01 点桶被整段排除。
+func TestWindowBoundsPartialSpringForward(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	now := time.Date(2026, 10, 4, 3, 10, 0, 0, loc)
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 10, 4, 1, 0, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（02:00 不存在，上一桶是 01:00）", from, want)
+	}
+}
+
 // 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
 // Truncate(time.Hour) 会得到 :30，当前小时的桶被整段排除，短窗口恒为空。
 func TestWindowBoundsLocalHourOffset(t *testing.T) {
