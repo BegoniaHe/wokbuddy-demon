@@ -1277,8 +1277,15 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 func TestModelsEndpoint(t *testing.T) {
 	t.Parallel()
 
+	// 每条都带权威 context/maxOutput（查找链第 1 级）：未知模型（如 gpt-6-sol）
+	// 缺这两个值会让四级查找链在后台拉真实 models.dev；用例耗时随网络抖动，
+	// goleak 在 make ci 的并行负载下可能抓到尚未退出的拉取 goroutine。
 	cache := modelCatalog([]upstream.ModelInfo{
-		{ID: "glm-5.2"}, {ID: "glm-5"}, {ID: "gpt-6-sol"}, {ID: "deepseek-v4-flash"}, {ID: "hy4"},
+		{ID: "glm-5.2", ContextWindow: 1_000_000, MaxTokens: 131_072},
+		{ID: "glm-5", ContextWindow: 1_000_000, MaxTokens: 131_072},
+		{ID: "gpt-6-sol", ContextWindow: 1_000_000, MaxTokens: 131_072},
+		{ID: "deepseek-v4-flash", ContextWindow: 1_000_000, MaxTokens: 384_000},
+		{ID: "hy4", ContextWindow: 200_000, MaxTokens: 64_000},
 	})
 	handler := NewHandler(&Config{
 		Pool:        testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
