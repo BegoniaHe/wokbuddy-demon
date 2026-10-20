@@ -882,7 +882,15 @@ func (w Window) boundsAt(now time.Time) (time.Time, time.Time) {
 // 起点随之后移半小时，当前小时的桶（:00）被整段排除在窗口外，面板「最近 1 小时」
 // 等短窗口会直接显示为空。
 func localHourStart(now time.Time) time.Time {
-	return time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+	t := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+	if !t.After(now) {
+		return t
+	}
+	// 夏令时回拨的重复小时里 time.Date 可能选到更晚的那次 occurrence，得到晚于
+	// now 的「起点」——滚动窗口落到未来，hours=1 尚能命中桶，hours>=2 会少算上一
+	// 小时。此时按 now 的实际偏移回退到当前小时的起点。
+	return now.Add(-(time.Duration(now.Minute())*time.Minute +
+		time.Duration(now.Second())*time.Second + time.Duration(now.Nanosecond()))).Round(0)
 }
 
 // bucketTime 把桶 scope 解析成本地时间；脏 scope 返回 false（不进任何口径）。

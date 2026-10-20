@@ -296,6 +296,34 @@ func TestWindowBounds(t *testing.T) {
 	}
 }
 
+// 夏令时回拨的重复小时里 time.Date 可能选到更晚的那次 occurrence，让滚动窗口
+// 起点落到 now 之后：hours=1 还能命中桶，hours>=2 会少算上一小时。
+func TestLocalHourStartAcrossFallBack(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 2026-10-25 03:00 CEST 回拨到 02:00 CET：00:17 UTC 是第一次 02:17 CEST。
+	now := time.Date(2026, 10, 25, 0, 17, 0, 0, time.UTC).In(loc)
+
+	got := localHourStart(now)
+	if got.After(now) {
+		t.Fatalf("hour start=%v 晚于 now=%v（重复小时选了更晚的 occurrence）", got, now)
+	}
+
+	if want := now.Add(-17 * time.Minute); !got.Equal(want) {
+		t.Fatalf("hour start=%v want %v", got, want)
+	}
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := now.Add(-time.Hour - 17*time.Minute); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v", from, want)
+	}
+}
+
 // 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
 // Truncate(time.Hour) 会得到 :30，当前小时的桶被整段排除，短窗口恒为空。
 func TestWindowBoundsLocalHourOffset(t *testing.T) {
