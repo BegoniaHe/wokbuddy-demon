@@ -281,6 +281,23 @@ func TestSummaryTotalsDefaultsSizeToRemain(t *testing.T) {
 	}
 }
 
+// TestSummaryTotalsAcceptsStringCapacity 上游把容量字段下发为字符串时仍能解析。
+func TestSummaryTotalsAcceptsStringCapacity(t *testing.T) {
+	t.Parallel()
+
+	var summary resourceSummaryResp
+	if err := json.Unmarshal([]byte(`{"Packages":[
+		{"CycleTotalCapacity":" 1000 ","CycleRemainCapacity":"700.0","CycleUsedCapacity":"300"}
+	]}`), &summary); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	remain, total := summary.summaryTotals()
+	if remain != 700 || total != 1000 {
+		t.Errorf("summary=%d/%d want 700/1000", remain, total)
+	}
+}
+
 // TestResourcePackageDayWindowUsesCST 免费包切片窗口按 UTC+8 取「今天」，
 // 不能使用部署机本地时区（非 UTC+8 环境会错一天）。
 func TestResourcePackageDayWindowUsesCST(t *testing.T) {

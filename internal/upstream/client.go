@@ -38,6 +38,7 @@ var (
 	errV3ConfigReturnedEmptyModels  = errors.New("v3/config returned empty models")
 	errFetchV3ConfigModelMapFailed  = errors.New("fetchV3ConfigModelMap failed")
 	errParseV3ConfigEnvFailed       = errors.New("parseV3ConfigEnv failed")
+	errFlexInt64Invalid             = errors.New("flexInt64: 容量值无法解析")
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -3316,13 +3317,40 @@ func enterpriseExpiryBucket(
 	return earliestAt, earliestRemaining, expiring
 }
 
+// flexInt64 兼容上游把整数字段下发为 JSON 数字或字符串（如 "1000"）两种形态。
+type flexInt64 int64
+
+// UnmarshalJSON 接受 1000 / "1000" / "1000.0"；null 与空串按 0 处理。
+func (f *flexInt64) UnmarshalJSON(raw []byte) error {
+	text := strings.TrimSpace(strings.Trim(strings.TrimSpace(string(raw)), `"`))
+	if text == "" || text == "null" {
+		*f = 0
+		return nil
+	}
+
+	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+		*f = flexInt64(n)
+		return nil
+	}
+
+	// 少数账号的容量以浮点串下发，截断取整。
+	n, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return fmt.Errorf("%w: %q", errFlexInt64Invalid, text)
+	}
+
+	*f = flexInt64(int64(n))
+
+	return nil
+}
+
 // resourceSummaryResp get-user-resource-summary 响应（doJSON 已解信封）。
 type resourceSummaryResp struct {
 	Packages []struct {
-		PackageCode         string `json:"PackageCode"`
-		CycleTotalCapacity  int64  `json:"CycleTotalCapacity"`
-		CycleRemainCapacity int64  `json:"CycleRemainCapacity"`
-		CycleUsedCapacity   int64  `json:"CycleUsedCapacity"`
+		PackageCode         string    `json:"PackageCode"`
+		CycleTotalCapacity  flexInt64 `json:"CycleTotalCapacity"`
+		CycleRemainCapacity flexInt64 `json:"CycleRemainCapacity"`
+		CycleUsedCapacity   flexInt64 `json:"CycleUsedCapacity"`
 	} `json:"Packages"`
 }
 
@@ -3348,8 +3376,8 @@ func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, 
 // summaryTotals 汇总 summary 包的 remain/total（负值钳 0，remain 不超过 total）。
 func (r *resourceSummaryResp) summaryTotals() (remain, total int64) {
 	for _, pkg := range r.Packages {
-		size := max(pkg.CycleTotalCapacity, 0)
-		left := max(pkg.CycleRemainCapacity, 0)
+		size := max(int64(pkg.CycleTotalCapacity), 0)
+		left := max(int64(pkg.CycleRemainCapacity), 0)
 		// 总额缺失/为 0 时按剩余兜底，避免「有余额却 total=0」被旧端点聚合口径
 		// 覆盖成 0/0（credit_floor 会因此误停账号）。
 		size = max(size, left)
