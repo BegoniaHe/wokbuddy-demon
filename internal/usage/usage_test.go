@@ -398,6 +398,16 @@ func TestWindowBoundsTwoHourFallBack(t *testing.T) {
 	if want := time.Date(2026, 10, 24, 22, 0, 0, 0, time.UTC); !from.Equal(want) {
 		t.Fatalf("hours=3 from=%v want %v", from.UTC(), want)
 	}
+
+	// 02:17 UTC 是第二次 02:17+00（回拨已完成）：上一墙钟小时 01 在 time.Date
+	// 里选到更晚的 01:00+00，若据此按墙钟再取整会得到 00:00 UTC（墙钟 02 的
+	// 第一次 occurrence），漏掉 00 点桶。起点必须仍是 00:00+02 = 22:00 UTC。
+	now = time.Date(2026, 10, 25, 2, 17, 0, 0, time.UTC).In(loc)
+
+	from, _ = (Window{Hours: 3, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 10, 24, 22, 0, 0, 0, time.UTC); !from.Equal(want) {
+		t.Fatalf("hours=3（第二次 02 点）from=%v want %v", from.UTC(), want)
+	}
 }
 
 // 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
