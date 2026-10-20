@@ -1294,6 +1294,8 @@ func (g *geminiStreamWriter) handleUpstreamError(errObj map[string]any, payload 
 // 必然同样失败，应返回 400 而不是让客户端把 UNAVAILABLE 当成可重试的过载。
 func geminiStreamErrorStatus(kind upstream.ErrKind) int {
 	switch {
+	case kind == upstream.ErrModelNotFound:
+		return http.StatusNotFound
 	case failFastKind(kind), kind == upstream.ErrModelBlocked:
 		return http.StatusBadRequest
 	case kind == upstream.ErrSoftRate:
