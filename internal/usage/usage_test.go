@@ -276,10 +276,13 @@ func TestWindowBounds(t *testing.T) {
 	if !gotFrom.Equal(from) || !gotTo.IsZero() {
 		t.Fatalf("From 应优先于 Hours: from=%v to=%v", gotFrom, gotTo)
 	}
-	// 只有 Hours：起点 = 当前本地整点往回 Hours-1 小时。
-	f, to := Window{Hours: 24, From: time.Time{}, To: time.Time{}}.bounds()
+	// 只有 Hours：起点 = 当前整点桶往回 Hours-1 个桶。用 UTC 固定时刻注入，
+	// 避免宿主机时区（尤其 Lord Howe 这类 30 分钟 DST）影响期望值。
+	now := time.Date(2026, 10, 20, 14, 37, 0, 0, time.UTC)
 
-	want := localHourStart(time.Now()).Add(-23 * time.Hour)
+	f, to := Window{Hours: 24, From: time.Time{}, To: time.Time{}}.boundsAt(now)
+
+	want := time.Date(2026, 10, 19, 15, 0, 0, 0, time.UTC)
 	if !f.Equal(want) || !to.IsZero() {
 		t.Fatalf("24h bounds = %v/%v, want %v/零值", f, to, want)
 	}
@@ -288,9 +291,9 @@ func TestWindowBounds(t *testing.T) {
 		t.Fatalf("空窗口 bounds = %v/%v, want 零值/零值", f, to)
 	}
 	// 上限 60 天。
-	f60, _ := Window{Hours: 100000, From: time.Time{}, To: time.Time{}}.bounds()
+	f60, _ := Window{Hours: 100000, From: time.Time{}, To: time.Time{}}.boundsAt(now)
 
-	want60 := localHourStart(time.Now()).Add(-(24*60 - 1) * time.Hour)
+	want60 := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
 	if !f60.Equal(want60) {
 		t.Fatalf("超限 Hours 未被夹到 60 天: %v want %v", f60, want60)
 	}
