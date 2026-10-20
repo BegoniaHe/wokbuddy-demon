@@ -992,10 +992,14 @@ func bucketTime(scope string) (time.Time, bool) {
 			return parsed, false
 		}
 		// ParseInLocation 与 time.Date 同样会把不存在的整点平移（Chatham 的
-		// 03:00 → 04:00）；用该墙钟小时的首个实际时刻，窗口入界才与
-		// previousHourStart 的起点一致。整小时被抹掉时保留原解析结果。
-		if start, ok := hourFirst(parsed.Year(), parsed.Month(), parsed.Day(), parsed.Hour(), time.Local); ok {
-			return start, true
+		// 03:00 → 04:00、午夜拨快日的 23:00 → 次日 00:00），平移后的小时/
+		// 日期已不是 key 表达的那一小时。用 UTC 再解析一次拿到字面墙钟字段，
+		// 找回该桶真正的起点，窗口入界才与 previousHourStart 一致；整小时被
+		// 抹掉时保留平移结果（即跳过区间之后的第一个实际时刻）。
+		if wall, err := time.ParseInLocation(hourLayout, hour, time.UTC); err == nil {
+			if start, ok := hourFirst(wall.Year(), wall.Month(), wall.Day(), wall.Hour(), time.Local); ok {
+				return start, true
+			}
 		}
 
 		return parsed, true

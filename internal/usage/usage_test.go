@@ -486,6 +486,34 @@ func TestHourFirstPartialGap(t *testing.T) {
 	}
 }
 
+// 桶键按写入时的墙钟小时生成；部分分钟被拨快跳过时，本地解析会把该键平移
+// 到下一小时（Chatham 的 03:00 → 04:00）。bucketTime 必须按键里的字面小时
+// 找回桶起点 03:45，否则显式区间会把 03 点桶算到 04 点。
+//
+// 本用例临时替换 time.Local，不能 t.Parallel（并行用例不得与全局状态共存）。
+//
+//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
+func TestBucketTimePartialGap(t *testing.T) {
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	orig := time.Local
+	time.Local = chatham
+
+	t.Cleanup(func() { time.Local = orig })
+
+	got, ok := bucketTime("h:2026-09-27T03")
+	if !ok {
+		t.Fatal("bucketTime 解析失败")
+	}
+
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, chatham); !got.Equal(want) {
+		t.Fatalf("bucketTime = %v, want %v", got, want)
+	}
+}
+
 // 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
 // Truncate(time.Hour) 会得到 :30，当前小时的桶被整段排除，短窗口恒为空。
 func TestWindowBoundsLocalHourOffset(t *testing.T) {
