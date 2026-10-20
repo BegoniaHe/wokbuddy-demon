@@ -453,6 +453,12 @@ func TestPoolCtxCancelDoesNotCoolDownProxy(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 拉长握手超时：TestMain 把包级 handshakeTimeout 压到 150ms，用例在 100ms
+	// 取消 ctx，两者仅差 50ms——高负载/竞态检测下握手超时可能先触发，走进
+	// 「真实失败」分支给代理记冷却，用例就误报。与本文件 TestHandshakeCtxCancel
+	// 同口径，只留 ctx 取消这一条失败路径。
+	pool.states[0].proxy.handshakeTimeout = 30 * time.Second
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() {
