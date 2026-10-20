@@ -679,10 +679,10 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 
 	status := Status{
 		UID: uid,
-		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
-		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
-		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
-		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
+		// 限额台账（issue #36）：任一未到期的模型级条目都会输出一行——6004 限流、
+		// 11136 权限缺失 / 11141 模型下线，以及无重置时间的 6004 审计项；多模型同时
+		// 冷却全部展示。到期判据 = 该模型的独立冷却 until 未过；普通软冷却（无模型级
+		// 表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(entry2, now),
 		Realm:                    entry2.a.Realm(),
 		ProxySlot:                entry2.proxySlot,

@@ -79,8 +79,8 @@ type Status struct {
 	Reason                   string    `json:"reason,omitempty"`
 	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额/避让的模型列表（issue #36 台账）。
-	// 任一未过期的非审计模型级条目（modelCooldowns）都会成行：6004 限流为
-	// rate_limit，11136 权限缺失 / 11141 模型下线为 model_unavailable。
+	// 任一未过期的模型级条目（modelCooldowns，含无重置时间的 6004 审计项）都会成行：
+	// 6004 限流为 rate_limit，11136 权限缺失 / 11141 模型下线为 model_unavailable。
 	// 运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
