@@ -410,9 +410,9 @@ func TestWindowBoundsTwoHourFallBack(t *testing.T) {
 	}
 }
 
-// 30 分钟拨快的时区（Australia/Lord_Howe：01:30+10:30 → 02:30+11）里
-// time.Date(02:00) 会归一化成 02:30；若把它当成上一桶起点，hours=2 只含当前
-// 小时桶，01 点桶被整段排除。
+// 30 分钟拨快的时区（Australia/Lord_Howe：02:00+10:30 → 02:30+11）里
+// time.Date(02:00) 与桶键 "T02" 都归一化成 02:30——那就是 02 点桶的起点。
+// hours=2 必须恰好含 02、03 两个桶，不能退到 01:00 把 01 点桶也带进来。
 func TestWindowBoundsPartialSpringForward(t *testing.T) {
 	t.Parallel()
 
@@ -424,8 +424,14 @@ func TestWindowBoundsPartialSpringForward(t *testing.T) {
 	now := time.Date(2026, 10, 4, 3, 10, 0, 0, loc)
 
 	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
-	if want := time.Date(2026, 10, 4, 1, 0, 0, 0, loc); !from.Equal(want) {
-		t.Fatalf("hours=2 from=%v want %v（02:00 不存在，上一桶是 01:00）", from, want)
+	if want := time.Date(2026, 10, 4, 2, 0, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（02:00 不存在，归一化为 02:30）", from, want)
+	}
+
+	// 01 点桶必须排除：hours=2 是当前桶 03 加上一桶 02，多算一小时会让面板
+	// 「最近 2 小时」在拨快日偏大。
+	if from.Before(time.Date(2026, 10, 4, 1, 0, 0, 0, loc)) {
+		t.Fatalf("hours=2 from=%v 落到了 01 点桶之前", from)
 	}
 }
 

@@ -893,20 +893,18 @@ func previousHourStart(t time.Time) time.Time {
 
 	// 优先直接取墙钟上一小时：夏令时回拨的重复小时里 time.Date 会选更晚的
 	// occurrence，但它仍严格早于 t 时就是我们要的实例（如 Lord Howe 的 30 分钟
-	// 回拨，t=02:00+10:30 → 01:00+11）。
+	// 回拨，t=02:00+10:30 → 01:00+11）。拨快抹掉部分小时时归一化结果落在跳过
+	// 区间之后（Lord Howe 02:00 → 02:30），与桶键经 bucketTime 解析出的落点一致，
+	// 仍是该桶的起点；只有归一化跳到别的墙钟小时（Berlin 02:00 → 03:00）才走
+	// 下面的绝对回退。
 	candidate := time.Date(t.Year(), t.Month(), t.Day(), t.Hour()-1, 0, 0, 0, t.Location())
-	if candidate.Before(t) && candidate.Hour() == wantHour &&
-		candidate.Minute() == 0 && candidate.Second() == 0 && candidate.Nanosecond() == 0 {
+	if candidate.Before(t) && candidate.Hour() == wantHour {
 		return candidate
 	}
-	// 上一墙钟小时被拨快抹掉（time.Date 归一化到跳过区间另一侧），或 2 小时回拨
+	// 上一墙钟小时被拨快整段抹掉（time.Date 归一化到跳过区间之后），或 2 小时回拨
 	// （Antarctica/Troll：03:00+02 → 01:00+00）里 time.Date 选到更晚的 occurrence。
 	// 以绝对回退一小时选中的实例为基准，去掉分秒、保留该实例的偏移——不能重新按
 	// 墙钟字段取整，那会再次落到更晚的 occurrence，起点反而前进。
-	//
-	// 30 分钟拨快的时区（Australia/Lord_Howe：01:30+10:30 → 02:30+11）里
-	// time.Date(02:00) 会归一化成 02:30；那是跳过区间后的首个实际时刻，但不是
-	// 桶起点，保留它会把 01 点桶排除在 hours>=2 的窗口外。
 	prev := t.Add(-time.Hour)
 
 	return prev.Add(-(time.Duration(prev.Minute())*time.Minute +

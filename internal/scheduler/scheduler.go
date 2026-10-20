@@ -282,7 +282,7 @@ func nextFire(now time.Time, hours []int) time.Time {
 }
 
 // slotOn 返回 day 当天墙钟 hour:00 的实际时刻；该墙钟时刻被夏令时拨快抹掉时，
-// 取跳过后的第一个整点。
+// 取跳过区间之后的第一个实际时刻（部分小时被跳过时可能是 02:30/03:45）。
 //
 // time.Date 对不存在的墙钟时刻归一化方向不固定：Berlin 的 02:00 → 03:00（同日），
 // 而午夜拨快的时区（America/Santiago、America/Havana 的 00:00 → 01:00）会把
