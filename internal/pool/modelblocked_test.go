@@ -112,6 +112,23 @@ func TestModelBlockedFallbackSkipsModelCooled(t *testing.T) {
 	}
 }
 
+// TestFallbackSkipsModelRateLimited 请求模型仍在账号 6004 模型级冷却中时，即使该
+// 账号另有账号级软冷却（expiry 非零、会进入兜底候选），也不得被兜底选中——探测
+// 必然继续 429。
+func TestFallbackSkipsModelRateLimited(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	// 先写账号级软冷却，再写 6004 模型级冷却，构造两态共存。
+	pool.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	pool.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "glm-5.3", "6004 model rate limit")
+
+	if acct := pool.PickExcludingForRealm(nil, "glm-5.3", ""); acct != nil {
+		t.Fatalf("模型限流中的账号不应被兜底选中，got %s", acct.UID)
+	}
+}
+
 // TestModelBlockedDisabledDoesNotCount 禁用号不参与判定：它不可用与模型无关，
 // 既不构成"还能服务"的证明，也不该被算进被挡账号数。
 func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
