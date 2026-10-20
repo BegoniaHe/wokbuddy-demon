@@ -2625,6 +2625,10 @@ func TestChatModelBlockPlatformHint(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "platform-level") {
 		t.Errorf("model block hint should mark platform-level: %s", rec.Body)
 	}
+	// 429 必须带 Retry-After：解封时刻已知，客户端据此等待而不是立刻重试。
+	if got := rec.Header().Get("Retry-After"); got == "" {
+		t.Errorf("模型级 429 应带 Retry-After: header 缺失")
+	}
 }
 
 // TestChatStreamTruncatedNoSuccess 上游流截断（EOF 无 [DONE]，issue #105）：
