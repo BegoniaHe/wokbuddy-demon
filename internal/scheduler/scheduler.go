@@ -295,14 +295,29 @@ func slotOn(day time.Time, hour int) time.Time {
 
 	t := time.Date(year, month, dayOfMonth, hour, 0, 0, 0, loc)
 	// 被抹掉的小时可能归一化到跳过区间任一侧，甚至跳过目标日剩余时间
-	// （Godthab 的 23:00 → 次日 00:00）；越过目标墙钟时刻即取跳过后的
-	// 第一个实例。
+	// （Godthab 的 23:00 → 次日 00:00）。
+	if wallBefore(t, year, month, dayOfMonth, hour) {
+		// 归一化到目标之前：向前推进到首个不早于目标的实例。
+		for range 26 * 60 {
+			if !wallBefore(t, year, month, dayOfMonth, hour) {
+				break
+			}
+
+			t = t.Add(time.Minute)
+		}
+
+		return t
+	}
+	// time.Date 也可能越过目标小时（Pacific/Chatham 的 03:00 → 04:00），
+	// 此时向前推进只会停在更晚的整点。回退到首个不早于目标的实例，保住
+	// 跳过区间末端（03:45）这个真正该触发的时刻。
 	for range 26 * 60 {
-		if !wallBefore(t, year, month, dayOfMonth, hour) {
+		prev := t.Add(-time.Minute)
+		if wallBefore(prev, year, month, dayOfMonth, hour) {
 			break
 		}
 
-		t = t.Add(time.Minute)
+		t = prev
 	}
 
 	return t

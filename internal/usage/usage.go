@@ -885,30 +885,84 @@ func (w Window) boundsAt(now time.Time) (time.Time, time.Time) {
 //
 // 不能只做 Add(-time.Hour)：夏令时回拨的重复小时里绝对回退一小时仍落在同一个
 // 墙钟小时（02:00 CET - 1h = 02:00 CEST），起点不前进，hours>=2 会少算上一个
-// 整点桶。优先按墙钟字段取上一小时；该小时被拨快抹掉或 time.Date 选到的实例
-// 不早于 t（2 小时回拨）时，再按绝对回退实例去掉分秒，兼容 30 分钟偏移的
-// 夏令时（如 Australia/Lord_Howe，Add 后会落在 :30）。
+// 整点桶。优先取 t 的墙钟上一小时的首个实际时刻；该小时被拨快整段抹掉或
+// time.Date 选到的实例不早于 t（2 小时回拨）时，再按绝对回退实例去掉分秒，
+// 兼容 30 分钟偏移的夏令时（如 Australia/Lord_Howe，Add 后会落在 :30）。
 func previousHourStart(t time.Time) time.Time {
 	wantHour := (t.Hour() + 23) % 24
 
-	// 优先直接取墙钟上一小时：夏令时回拨的重复小时里 time.Date 会选更晚的
-	// occurrence，但它仍严格早于 t 时就是我们要的实例（如 Lord Howe 的 30 分钟
-	// 回拨，t=02:00+10:30 → 01:00+11）。拨快抹掉部分小时时归一化结果落在跳过
-	// 区间之后（Lord Howe 02:00 → 02:30），与桶键经 bucketTime 解析出的落点一致，
-	// 仍是该桶的起点；只有归一化跳到别的墙钟小时（Berlin 02:00 → 03:00）才走
-	// 下面的绝对回退。
-	candidate := time.Date(t.Year(), t.Month(), t.Day(), t.Hour()-1, 0, 0, 0, t.Location())
-	if candidate.Before(t) && candidate.Hour() == wantHour {
-		return candidate
+	// 优先取墙钟上一小时的首个实际时刻。hourFirst 处理两种不存在的整点：
+	// 被拨快整段抹掉（ok=false，走绝对回退），以及只跳过部分分钟
+	// （Pacific/Chatham 03:00 → 03:45，返回该桶真正的起点）。
+	if prev, ok := hourFirst(t.Year(), t.Month(), t.Day(), wantHour, t.Location()); ok && prev.Before(t) {
+		return prev
 	}
-	// 上一墙钟小时被拨快整段抹掉（time.Date 归一化到跳过区间之后），或 2 小时回拨
-	// （Antarctica/Troll：03:00+02 → 01:00+00）里 time.Date 选到更晚的 occurrence。
-	// 以绝对回退一小时选中的实例为基准，去掉分秒、保留该实例的偏移——不能重新按
-	// 墙钟字段取整，那会再次落到更晚的 occurrence，起点反而前进。
+	// 上一墙钟小时整段被抹掉，或 2 小时回拨（Antarctica/Troll：03:00+02 →
+	// 01:00+00）里墙上一个小时的实例不早于 t。以绝对回退一小时选中的实例为
+	// 基准，去掉分秒、保留该实例的偏移——不能重新按墙钟字段取整，那会再次落到
+	// 更晚的 occurrence，起点反而前进。
 	prev := t.Add(-time.Hour)
 
 	return prev.Add(-(time.Duration(prev.Minute())*time.Minute +
 		time.Duration(prev.Second())*time.Second + time.Duration(prev.Nanosecond())))
+}
+
+// hourFirst 返回本地日期 year-month-day 的墙钟 hour 点首个实际时刻；该小时被
+// 夏令时拨快整段抹掉时 ok=false。
+//
+// time.Date 对不存在的墙钟时刻按 DST 差值平移，跳过区间起点不在整点时不保证
+// 落在区间之后：Pacific/Chatham 的 03:00 会被归一化成 04:00，而该小时真正的
+// 起点是 03:45。先信任 time.Date 落在目标小时的常见路径；只有它落到别的
+// 小时/日期时才在附近逐分钟找回目标小时的首个实际时刻。
+func hourFirst(year int, month time.Month, day, hour int, loc *time.Location) (time.Time, bool) {
+	nominal := time.Date(year, month, day, hour, 0, 0, 0, loc)
+	if !sameWallDate(nominal, year, month, day) || nominal.Hour() != hour {
+		return hourFirstNear(nominal, year, month, day, hour)
+	}
+
+	if nominal.Minute() == 0 && nominal.Second() == 0 && nominal.Nanosecond() == 0 {
+		return nominal, true
+	}
+
+	// 归一化落在目标小时的中间：跳过区间末端就在 nominal 之前，向前回退到
+	// 该小时首个实际分钟（30 分钟拨快 02:45 → 03:15 时 Date(03:00)=03:30）。
+	// 被回拨的重复小时落到 :00，不会进入这里，仍保留 time.Date 选的 occurrence。
+	return hourFirstMinute(nominal, year, month, day, hour), true
+}
+
+// hourFirstMinute 从 t 向前回退到同一墙钟小时的首个实际分钟。
+func hourFirstMinute(t time.Time, year int, month time.Month, day, hour int) time.Time {
+	for {
+		prev := t.Add(-time.Minute)
+		if !sameWallDate(prev, year, month, day) || prev.Hour() != hour {
+			return t
+		}
+
+		t = prev
+	}
+}
+
+// hourFirstNear 在 nominal 附近逐分钟找目标墙钟小时的首个实际时刻。
+//
+// 现代 tzdata 的 DST 差值不超过 2 小时；±4 小时足以覆盖归一化落点与跳过区间
+// （切换点都在整分，步进不引入误差）。
+func hourFirstNear(nominal time.Time, year int, month time.Month, day, hour int) (time.Time, bool) {
+	start := nominal.Add(-4 * time.Hour)
+	end := nominal.Add(4 * time.Hour)
+
+	for t := start; !t.After(end); t = t.Add(time.Minute) {
+		if sameWallDate(t, year, month, day) && t.Hour() == hour {
+			return t, true
+		}
+	}
+
+	return time.Time{}, false
+}
+
+func sameWallDate(t time.Time, year int, month time.Month, day int) bool {
+	y, m, d := t.Date()
+
+	return y == year && m == month && d == day
 }
 
 // localHourStart 返回 now 所在本地墙钟整点。
@@ -918,9 +972,10 @@ func previousHourStart(t time.Time) time.Time {
 // 起点随之后移半小时，当前小时的桶（:00）被整段排除在窗口外，面板「最近 1 小时」
 // 等短窗口会直接显示为空。
 func localHourStart(now time.Time) time.Time {
-	t := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
-	if !t.After(now) {
-		return t
+	// 取当前墙钟小时的首个实际时刻；部分小时被拨快跳过时它是跳过区间末端
+	// （Chatham 03:45），保证 hours=1 不会把上一小时的桶带进来。
+	if start, ok := hourFirst(now.Year(), now.Month(), now.Day(), now.Hour(), now.Location()); ok && !start.After(now) {
+		return start
 	}
 	// 夏令时回拨的重复小时里 time.Date 可能选到更晚的那次 occurrence，得到晚于
 	// now 的「起点」——滚动窗口落到未来，hours=1 尚能命中桶，hours>=2 会少算上一
@@ -932,8 +987,18 @@ func localHourStart(now time.Time) time.Time {
 // bucketTime 把桶 scope 解析成本地时间；脏 scope 返回 false（不进任何口径）。
 func bucketTime(scope string) (time.Time, bool) {
 	if hour, ok := strings.CutPrefix(scope, "h:"); ok {
-		ts, err := time.ParseInLocation(hourLayout, hour, time.Local)
-		return ts, err == nil
+		parsed, err := time.ParseInLocation(hourLayout, hour, time.Local)
+		if err != nil {
+			return parsed, false
+		}
+		// ParseInLocation 与 time.Date 同样会把不存在的整点平移（Chatham 的
+		// 03:00 → 04:00）；用该墙钟小时的首个实际时刻，窗口入界才与
+		// previousHourStart 的起点一致。整小时被抹掉时保留原解析结果。
+		if start, ok := hourFirst(parsed.Year(), parsed.Month(), parsed.Day(), parsed.Hour(), time.Local); ok {
+			return start, true
+		}
+
+		return parsed, true
 	}
 
 	ts, err := time.ParseInLocation(dayLayout, strings.TrimPrefix(scope, "d:"), time.Local)

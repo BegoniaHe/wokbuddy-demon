@@ -430,8 +430,59 @@ func TestWindowBoundsPartialSpringForward(t *testing.T) {
 
 	// 01 点桶必须排除：hours=2 是当前桶 03 加上一桶 02，多算一小时会让面板
 	// 「最近 2 小时」在拨快日偏大。
-	if from.Before(time.Date(2026, 10, 4, 1, 0, 0, 0, loc)) {
-		t.Fatalf("hours=2 from=%v 落到了 01 点桶之前", from)
+	if !from.After(time.Date(2026, 10, 4, 1, 0, 0, 0, loc)) {
+		t.Fatalf("hours=2 from=%v 仍落在 01 点桶", from)
+	}
+}
+
+// 部分小时被拨快跳过、且跳过区间起点不在整点时（Pacific/Chatham 2026-09-27
+// 02:45 → 03:45），time.Date/ParseInLocation 会把 03:00 归一化成 04:00。窗口
+// 起点必须是该小时真正的首个实际时刻 03:45，否则 hours=1 会把 02 点桶也算进来。
+func TestWindowBoundsPartialSpringForwardMidHour(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 拨快完成后：当前桶 04，上一桶应从 03:45 起算。
+	now := time.Date(2026, 9, 27, 4, 30, 0, 0, loc)
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（03:00 不存在，首个实际时刻是 03:45）", from, want)
+	}
+
+	// 当前就在被跳过后的半小时里：hours=1 的起点同样是 03:45，不能退到 02:00。
+	now = time.Date(2026, 9, 27, 3, 50, 0, 0, loc)
+
+	from, _ = (Window{Hours: 1, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=1 from=%v want %v", from, want)
+	}
+}
+
+// hourFirst 必须返回墙钟小时的首个实际时刻；整小时被抹掉时明确失败。
+func TestHourFirstPartialGap(t *testing.T) {
+	t.Parallel()
+
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	if got, ok := hourFirst(2026, 9, 27, 3, chatham); !ok || !got.Equal(time.Date(2026, 9, 27, 3, 45, 0, 0, chatham)) {
+		t.Fatalf("Chatham 03:00 首个实际时刻 = %v/%v, want 03:45/true", got, ok)
+	}
+
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	if got, ok := hourFirst(2026, 3, 29, 2, berlin); ok {
+		t.Fatalf("Berlin 02:00 整小时被抹掉，hourFirst 不应成功: %v", got)
 	}
 }
 
