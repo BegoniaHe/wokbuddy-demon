@@ -1,6 +1,7 @@
 // 冷却与熔断：Cooldown（固定时长账号级冷却）、CooldownSoftRate（账号级软冷却，对齐
 // 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
-// BlockModelBackoff/Clear（11136 负缓存）、软冷却封顶、熔断失败累计、签到解冻。
+// BlockModelBackoff/Clear（11136/11141 模型不可用负缓存）、软冷却封顶、熔断失败累计、
+// 签到解冻。
 package pool
 
 import (
@@ -277,7 +278,7 @@ func clearRoutingModelCooldownsLocked(entry3 *entry) {
 	}
 }
 
-// modelBlock TTL 常量（11136 负缓存退避）：
+// modelBlock TTL 常量（11136/11141 模型不可用负缓存退避）：
 // 首次命中 6h；半开到期后允许放行重试，再次命中 TTL = base × 2^min(hits-1, shift)；
 // 封顶 24h（最多一天再试一次）。该模型请求成功即由 BlockModelClear 清除。
 const (
@@ -286,15 +287,16 @@ const (
 	modelBlockMaxTTL  = 24 * time.Hour
 )
 
-// BlockModelBackoff 11136「该账号无该模型权限」的 (账号, 模型) 负缓存入口
-// （handler.applyErrorPolicy 调用）。复用 modelCooldowns 机制（不新建平行状态）：
-// 写 modelCooldowns[model]，Until 为指数退避 TTL，选号侧 healthyForModel 自动对该
-// 账号避开该模型。
+// BlockModelBackoff 「(账号, 模型) 不可用」负缓存入口（handler.applyErrorPolicy 调用），
+// 承载 11136 账号无该模型权限与 11141 模型下线两类原因。复用 modelCooldowns 机制
+// （不新建平行状态）：写 modelCooldowns[model]，Until 为指数退避 TTL，选号侧
+// healthyForModel 自动对该账号避开该模型。
 //
 // 语义与 6004 正交：6004 是「模型被限流、对齐重置墙钟」，本入口是「官方确定该后端
-// 无该模型权限、本账号重试无意义，换号仍可能成功」。resetAt 无需传（11136 无重置文案），
-// ResetAt 保持零值，与 6004 台账共用 Until 判定——11136 条目会以 11136 reason 出现在
-// /status 台账，运维可见。
+// 不可用、本账号重试无意义，换号仍可能成功（11136）或只会同样失败（11141）」。
+// resetAt 无需传（两族都无重置文案），ResetAt 保持零值，与 6004 台账共用 Until
+// 判定——条目以各自 reason 前缀出现在 /status 台账，运维可见。成功实测后由
+// BlockModelClear 按前缀清除。
 func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return

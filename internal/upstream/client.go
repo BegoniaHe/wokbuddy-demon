@@ -281,8 +281,8 @@ const modelBlockCode = "11102"
 const modelBlockMsgMarker = "service info not found"
 
 // ModelBlockReason 11136 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
-// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11136" 前缀识别条目
-// （与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
+// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11136"/"11141" 前缀识别
+// 可恢复的模型避让条目（与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
 const ModelBlockReason = "11136 model not permitted"
 
 // IsModelBlocked 报告 body 是否是「上游模型目录无此模型」(11102) 的确定性答复。
