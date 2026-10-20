@@ -619,7 +619,8 @@ func dailyLimitHit(lim DailyLimits, dailyUsage DailyUsage) bool {
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// 请求模型仍在该账号模型级冷却中（11136/11141/6004）的账号也排除——探测必然得到同样的失败；
+// 其余 CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 //
 // 积分保底同样在此生效（model 非空时）：floor 把健康号全部拦掉后 cands 为空会走到
@@ -665,7 +666,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 }
 
 // fallbackEligible 判定账号是否可参与全冷却兜底：排除 tried/跨域/禁用暂停/
-// 有效 hard 冷却（调了必 402）/积分保底拦截/在途占满。调用方需已持 p.mu。
+// 有效 hard 冷却（调了必 402）/请求模型的模型级冷却/积分保底拦截/在途占满。
+// 调用方需已持 p.mu。
 func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool, realm, model string, now time.Time) bool {
 	if tried != nil && tried[uid] {
 		return false
@@ -695,7 +697,8 @@ func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool
 }
 
 // fallbackCoolingBlocks 兜底前的冷却判定：余额耗尽号调了必 402；请求模型仍在本
-// 账号模型级冷却中（11136/6004）则探测也必然失败，两者都不参与兜底。
+// 账号模型级冷却中（11136 权限缺失 / 11141 已下线 / 6004 限流）则探测也必然失败，
+// 两者都不参与兜底。
 func (p *Pool) fallbackCoolingBlocks(entry2 *entry, model string, now time.Time) bool {
 	if entry2.hardCoolingActive(now) {
 		return true

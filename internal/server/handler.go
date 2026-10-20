@@ -1536,7 +1536,7 @@ func (f *chatFlow) reportNoAccount() {
 	f.st.status = http.StatusServiceUnavailable
 	// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 	//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
-	//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11136/6004）。
+	//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11136/11141/6004）。
 	// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 	f.modelBlock = f.h.cfg.Pool.ModelBlocked(f.bareModel)
 

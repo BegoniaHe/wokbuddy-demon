@@ -445,7 +445,8 @@ func earlierActive(cur, cand, now time.Time) time.Time {
 }
 
 // fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却/连败降权；breaker：熔断期）。
-// 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryLocked 排除）。判定口径：
+// 只对参与兜底的账号调用（CoolHard 与请求模型级冷却账号已被 pickEarliestExpiryLocked
+// 排除）。判定口径：
 // 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft
 // （连败降权与软冷却同归 soft：都按各自截止到期放行，兜底处置无差异）。
 func (e *entry) fallbackKind(now time.Time) string {
