@@ -559,7 +559,9 @@ func (p *Pool) AllDailyBlocked(model, realm string) bool {
 //     冷却的模型冷却走原有口径（max 截止仍跨 0 点则按日限）。
 func (p *Pool) dailyBlockClass(item *entry, usage map[string]DailyUsage, model, realm string, now time.Time) (serveable, onlyModel bool) {
 	if item.modelCooled(now, model) && item.healthy(now) && !p.dailyBlockedUsage(usage, item, model, realm, now) {
-		return false, true
+		// 会在 0 点前恢复 → 不算「今天没号」：即使其他账号已触日限，也应让上层
+		// 用更早的模型级恢复时间，而不是把少数账号的日限放大成整池等次日。
+		return resumesBeforeMidnight(item, now, model), true
 	}
 
 	if !item.healthyForModel(now, model) {

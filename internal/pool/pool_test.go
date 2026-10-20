@@ -2645,6 +2645,30 @@ func TestAllDailyBlockedModelCooldownPastMidnight(t *testing.T) {
 	}
 }
 
+// TestAllDailyBlockedMixedModelCooldownBeforeMidnight 模型级冷却会在 0 点前恢复时，
+// 即使其他账号已触日限，也不能报「日限到次日」：前者冷却到期即可服务，上层应回
+// 更早的模型级恢复时间，而不是把少数账号的日限放大成整池等待。
+func TestAllDailyBlockedMixedModelCooldownBeforeMidnight(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	now := time.Date(2026, 10, 20, 18, 0, 0, 0, time.Local)
+
+	pool.SetClock(func() time.Time { return now })
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	pool.SetDailyLimits(DailyLimits{Tokens: 100}, DailyLimits{}, DailyLimits{})
+	pool.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u2": {Tokens: 100}}
+	})
+	// u1 模型级冷却 20:00 恢复（早于次日 0 点）；u2 已触日限。
+	pool.CooldownSoftForModel("u1", time.Minute, now.Add(2*time.Hour), "m", "6004 model rate limit")
+
+	if pool.AllDailyBlocked("m", "cn") {
+		t.Fatal("模型级冷却早于 0 点恢复时不应报日限")
+	}
+}
+
 // TestAllDailyBlockedAccountCoolingPastMidnight 对照：账号级冷却跨 0 点仍按既有
 // 口径归入「今天没号可用」，避免本次修复扩大到账号级冷却。
 func TestAllDailyBlockedAccountCoolingPastMidnight(t *testing.T) {
