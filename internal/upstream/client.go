@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -3333,9 +3334,11 @@ func (f *flexInt64) UnmarshalJSON(raw []byte) error {
 		return nil
 	}
 
-	// 少数账号的容量以浮点串下发，截断取整。
+	// 少数账号的容量以浮点串下发，截断取整。NaN/Inf 与超出 int64 范围的浮点
+	// 转换到 int64 属实现相关行为，必须在转换前拒绝，否则会静默变成 0 并跳过
+	// 旧端点回退，让余额误报为 0。
 	n, err := strconv.ParseFloat(text, 64)
-	if err != nil {
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= math.MaxInt64 || n < math.MinInt64 {
 		return fmt.Errorf("%w: %q", errFlexInt64Invalid, text)
 	}
 

@@ -281,6 +281,76 @@ func TestSummaryTotalsDefaultsSizeToRemain(t *testing.T) {
 	}
 }
 
+// TestFlexInt64Shapes 容量字段兼容数字/字符串/浮点串，非法值与溢出值必须报错，
+// 以便调用方继续回落旧端点。
+func TestFlexInt64Shapes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		{name: "number", raw: `1000`, want: 1000},
+		{name: "string", raw: `"1000"`, want: 1000},
+		{name: "string-spaces", raw: `" 1000 "`, want: 1000},
+		{name: "negative", raw: `"-5"`, want: -5},
+		{name: "float-string", raw: `"700.9"`, want: 700},
+		{name: "scientific-string", raw: `"1e3"`, want: 1000},
+		{name: "empty-string", raw: `""`, want: 0},
+		{name: "null", raw: `null`, want: 0},
+		{name: "text", raw: `"abc"`, wantErr: true},
+		{name: "nan", raw: `"NaN"`, wantErr: true},
+		{name: "inf", raw: `"Inf"`, wantErr: true},
+		{name: "overflow", raw: `"1e19"`, wantErr: true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var got flexInt64
+
+			err := got.UnmarshalJSON([]byte(testCase.raw))
+			if testCase.wantErr {
+				if !errors.Is(err, errFlexInt64Invalid) {
+					t.Fatalf("raw=%s err=%v want errFlexInt64Invalid", testCase.raw, err)
+				}
+
+				return
+			}
+
+			if err != nil || int64(got) != testCase.want {
+				t.Fatalf("raw=%s got=%d err=%v want %d", testCase.raw, int64(got), err, testCase.want)
+			}
+		})
+	}
+}
+
+// TestSummaryResourceFallbackOnInvalidCapacity 容量值非法时 summary 解码失败并
+// 回落旧端点，不能静默按 0 计。
+func TestSummaryResourceFallbackOnInvalidCapacity(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "get-user-resource-summary") {
+			return jsonResp(200, `{"code":0,"data":{"Packages":[
+				{"CycleTotalCapacity":"abc","CycleRemainCapacity":"1"}
+			]}}`), nil
+		}
+
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"CycleCapacitySize":500,"CycleCapacityRemain":400,"CycleCapacityUsed":100}
+		]}}}}`), nil
+	})
+
+	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil || remain != 400 || total != 500 {
+		t.Fatalf("remain=%d total=%d err=%v want fallback 400/500", remain, total, err)
+	}
+}
+
 // TestSummaryTotalsAcceptsStringCapacity 上游把容量字段下发为字符串时仍能解析。
 func TestSummaryTotalsAcceptsStringCapacity(t *testing.T) {
 	t.Parallel()
