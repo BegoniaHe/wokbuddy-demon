@@ -129,6 +129,29 @@ func TestFallbackSkipsModelRateLimited(t *testing.T) {
 	}
 }
 
+// TestModelBlockedRateLimited 全池被挡原因清一色 6004 限流时标 RateLimited（上层
+// 回 429 + Retry-After）；混入 11136 后按"模型不可用"处理（换模型才有用）。
+func TestModelBlockedRateLimited(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	reset := time.Now().Add(time.Hour)
+	pool.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+	pool.CooldownSoftForModel("u2", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+
+	if st := pool.ModelBlocked("glm-5.3"); !st.Blocked || !st.RateLimited {
+		t.Fatalf("全池 6004 应标记 RateLimited，got %+v", st)
+	}
+
+	pool.BlockModelBackoff("u2", "glm-5.3", "11136 model not permitted")
+
+	if st := pool.ModelBlocked("glm-5.3"); !st.Blocked || st.RateLimited {
+		t.Fatalf("混入 11136 后不应再报限流，got %+v", st)
+	}
+}
+
 // TestModelBlockedDisabledDoesNotCount 禁用号不参与判定：它不可用与模型无关，
 // 既不构成"还能服务"的证明，也不该被算进被挡账号数。
 func TestModelBlockedDisabledDoesNotCount(t *testing.T) {

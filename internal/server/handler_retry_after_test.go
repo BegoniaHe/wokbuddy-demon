@@ -122,3 +122,27 @@ func TestRetryAfterSecondsOnlyCurrentModel(t *testing.T) {
 		t.Fatalf("Retry-After=%d want ~90（当前模型冷却）", got)
 	}
 }
+
+// TestModelBlockOverrideRateLimited 全池 6004：模型级阻塞必须回 429
+// rate_limit_exceeded 并带 Retry-After，不能报成 400 model_unavailable。
+func TestModelBlockOverrideRateLimited(t *testing.T) {
+	t.Parallel()
+
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(45*time.Second), "m", "6004 model rate limit")
+	h := NewHandler(&Config{Pool: p})
+	flow := &chatFlow{h: h, bareModel: "m", st: &chatStat{}, modelBlock: p.ModelBlocked("m")}
+
+	status, code, _, hint := flow.applyModelBlockOverride(http.StatusServiceUnavailable, "no_healthy_account", "x", "", false)
+	if status != http.StatusTooManyRequests || code != "rate_limit_exceeded" {
+		t.Fatalf("status=%d code=%q want 429 rate_limit_exceeded", status, code)
+	}
+
+	if hint == "" {
+		t.Fatal("hint 应说明模型级冷却")
+	}
+
+	if got := flow.retryAfterSeconds(status); got < 44 || got > 46 {
+		t.Fatalf("Retry-After=%d want ~45", got)
+	}
+}

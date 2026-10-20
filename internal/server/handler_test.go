@@ -2618,8 +2618,8 @@ func TestChatModelBlockPlatformHint(t *testing.T) {
 	h := NewHandler(&Config{Pool: state, Upstream: client})
 
 	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("code=%d body=%s want 429 rate_limit_exceeded", rec.Code, rec.Body)
 	}
 
 	if !strings.Contains(rec.Body.String(), "platform-level") {

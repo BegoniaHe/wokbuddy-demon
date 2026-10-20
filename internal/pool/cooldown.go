@@ -344,6 +344,12 @@ func modelUnavailableReason(reason string) bool {
 	return strings.HasPrefix(reason, "11136") || strings.HasPrefix(reason, "11141")
 }
 
+// modelRateLimitReason 判定模型级冷却原因是否来自 6004 模型级限流。与
+// modelUnavailableReason 互斥：前者是"等等再试"，后者是"换模型才有用"。
+func modelRateLimitReason(reason string) bool {
+	return strings.HasPrefix(reason, "6004")
+}
+
 // BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。半开探测
 // 或正常请求对该模型成功后调用（handler 成功路径）。只清 11136/11141 两类
 // 可恢复避让条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
@@ -389,6 +395,9 @@ type ModelBlockStatus struct {
 	Reason  string    // 冷却原因（通常为上游原文，如 "11136 no model permission"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// RateLimited true = 被挡原因全部是 6004 模型级限流（等上游重置），
+	// 而非 11136/11141 的模型不可用（换模型才有用）。上层据此选 429 还是 400。
+	RateLimited bool
 	// Scope 阻塞范围：platform / account（见常量）。只读诊断，不参与选号。
 	Scope string
 	// SharedResetAt 平台级时的共享上游重置时刻（账号级为零值）。
@@ -430,7 +439,8 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 
 	now := p.now()
 
-	var modelBlockStatus ModelBlockStatus
+	// RateLimited 默认按限流起步，merge 遇到非 6004 原因时清零。
+	modelBlockStatus := ModelBlockStatus{RateLimited: true}
 	// 重置时刻一致性统计（issue #29）：distinct 用集合去重，withReset 计带非零
 	// ResetAt 的账号数，shared 记唯一值。
 	var (
@@ -477,11 +487,16 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 // 并取最早解封时刻（那才是"再等多久值得重试"的答案）。
 func (st *ModelBlockStatus) mergeModelCooldown(modelCooldown2 *modelCooldown, ok bool) {
 	if !ok {
+		st.RateLimited = false
 		return
 	}
 
 	if st.Reason == "" {
 		st.Reason = modelCooldown2.Reason
+	}
+
+	if !modelRateLimitReason(modelCooldown2.Reason) {
+		st.RateLimited = false
 	}
 
 	if !modelCooldown2.Until.IsZero() && (st.Until.IsZero() || modelCooldown2.Until.Before(st.Until)) {

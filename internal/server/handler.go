@@ -2756,18 +2756,29 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 // applyModelBlockOverride 模型级阻塞覆盖通用文案（放在最后 = 优先级最高）。
 // 为什么能覆盖 code 而不丢信息：modelBlock.Reason 就是 BlockModelBackoff 存下的上游
 // 原因，已在 hint 里原样带出，所以覆盖 message 不会丢掉上游信息，反而补上了上游不会
-// 告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。用 400 而非 503：
-// 这是"你选的这个模型当前不可用"，不是"服务端暂时过载"，换号重试必然同样失败。
+// 告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。
+// 状态码按阻塞原因分档：11136/11141 是模型不可用（换模型才有用），用 400；
+// 全池 6004 模型级限流是"等上游重置"，用 429 并带 Retry-After（不能报成不可用）。
 func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, upstreamMsgPassed bool) (int, string, string, string) {
 	if !f.modelBlock.Blocked {
 		return status, code, msg, hint
 	}
 
-	code = "model_unavailable"
-	// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号被挡、
-	// 最早何时解封"这类本地调度信息放进 gateway_hint。
-	if !upstreamMsgPassed {
-		msg = "model is unavailable on every account (per-model cooldown), try another model"
+	if f.modelBlock.RateLimited {
+		status = http.StatusTooManyRequests
+		code = "rate_limit_exceeded"
+
+		if !upstreamMsgPassed {
+			msg = "rate limited: this model is cooling down on every account, retry later"
+		}
+	} else {
+		status = http.StatusBadRequest
+		code = "model_unavailable"
+		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号被挡、
+		// 最早何时解封"这类本地调度信息放进 gateway_hint。
+		if !upstreamMsgPassed {
+			msg = "model is unavailable on every account (per-model cooldown), try another model"
+		}
 	}
 	// 阻塞范围（issue #29）：平台级（上游统一限流，等上游恢复）与账号级（换号/等本号
 	// 恢复）对运维的处置完全不同，在 hint 里点明。
@@ -2788,7 +2799,7 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 		hint += "; upstream: " + s
 	}
 
-	return http.StatusBadRequest, code, msg, hint
+	return status, code, msg, hint
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
