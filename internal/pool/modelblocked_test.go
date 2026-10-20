@@ -77,8 +77,8 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 }
 
 // TestModelBlockedAccountsNotPicked 全部账号都被 11136 挡住时选号返回 nil
-// （handler 据此走 503 fast-fail）。11136 不写路由熔断后，这条口径保证「全池
-// 无权限」不会退化成每个请求逐号轮转。
+// （handler 据此 fast-fail，不再逐号轮转）。11136 不写路由熔断后，这条口径
+// 保证「全池无权限」不会退化成每个请求逐号轮转。
 func TestModelBlockedAccountsNotPicked(t *testing.T) {
 	t.Parallel()
 

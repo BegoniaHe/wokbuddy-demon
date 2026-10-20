@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -106,5 +108,40 @@ func TestModelPermissionFailuresDoNotStarvePermittedAccount(t *testing.T) {
 	acct := state.PickExcludingForRealm(nil, "m1", "cn")
 	if acct == nil || acct.UID != "u4" {
 		t.Fatalf("仍有权限的 u4 应可选，got %+v", acct)
+	}
+}
+
+// TestChatAllAccountsLackModelPermission 全池 11136：每个号只试一次，随后由
+// (账号,模型) 负缓存挡住选号，返回 400 model_unavailable；不写路由冷却。
+func TestChatAllAccountsLackModelPermission(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return http.StatusBadRequest, `{"code":11136,"msg":"no model permission"}`, false
+	})
+	state := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, h, `{"model":"glm-5.3","messages":[]}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("code=%d body=%s want 400 model_unavailable", rec.Code, rec.Body)
+	}
+
+	if calls != 2 {
+		t.Errorf("upstream calls=%d want 2（每号一次，不逐号轮转）", calls)
+	}
+
+	if until := state.RouteRecovery("cn", "glm-5.3"); !until.IsZero() {
+		t.Errorf("11136 不应写路由熔断，got until=%v", until)
+	}
+
+	if st := state.ModelBlocked("glm-5.3"); !st.Blocked || st.Count != 2 {
+		t.Errorf("全池应写入 (账号,模型) 负缓存，status=%+v", st)
 	}
 }
