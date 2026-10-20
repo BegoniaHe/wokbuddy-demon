@@ -515,6 +515,8 @@ func (p *Pool) dailyBlockedUsage(usage map[string]DailyUsage, entry3 *entry, mod
 func (l DailyLimits) enabled() bool { return l.Tokens > 0 || l.Credits > 0 || l.ModelTokens > 0 }
 
 // AllDailyBlocked 报告是否存在健康账号但全部被当日护栏拦下（issue #95）。
+// 纯模型级阻塞不算日限：即使解封时刻跨过本地 0 点，也应交给 ModelBlocked 回
+// 400/429（换模型或等上游重置），否则「模型不可用」会被误报成「日限到次日」。
 func (p *Pool) AllDailyBlocked(model, realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -526,34 +528,49 @@ func (p *Pool) AllDailyBlocked(model, realm string) bool {
 	usage := p.dailyUsage()
 	now := p.now()
 	candidates := 0
+	modelOnly := 0
 
 	for _, item := range p.byUID {
-		if item.disabled || item.paused {
-			continue
-		}
-
-		if realm != "" && item.a.Realm() != realm {
+		if item.disabled || item.paused || (realm != "" && item.a.Realm() != realm) {
 			continue
 		}
 
 		candidates++
-		// 冷却/熔断/模型冷却可能在本地 0 点前恢复：此时应回 503 并由
-		// Retry-After 指向更早的恢复时间，而不是声称「日限到次日」。
-		// 硬冷却（余额耗尽，通常到次日 04:00）晚于日限重置，仍按日限处理。
-		if !item.healthyForModel(now, model) {
-			if resumesBeforeMidnight(item, now, model) {
-				return false
-			}
 
-			continue
+		serveable, onlyModel := p.dailyBlockClass(item, usage, model, realm, now)
+		if serveable {
+			return false
 		}
 
-		if !p.dailyBlockedUsage(usage, item, model, realm, now) {
-			return false
+		if onlyModel {
+			modelOnly++
 		}
 	}
 
-	return candidates > 0
+	return candidates > 0 && modelOnly != candidates
+}
+
+// dailyBlockClass 把单个账号归类到日限判定：
+//   - serveable=true：账号能服务该模型，或冷却会在本地 0 点前恢复（应回 503，
+//     由 Retry-After 指向更早的恢复时间，而不是声称「日限到次日」）；
+//   - onlyModel=true：账号级健康且未命中真实日限，唯一阻塞是模型级冷却。换模型
+//     仍可能可用，不算日限，全部候选如此时由 ModelBlocked 回 400/429；
+//   - 两者都为 false：当日不可用且不会在 0 点前恢复，计入日限。同时带账号级
+//     冷却的模型冷却走原有口径（max 截止仍跨 0 点则按日限）。
+func (p *Pool) dailyBlockClass(item *entry, usage map[string]DailyUsage, model, realm string, now time.Time) (serveable, onlyModel bool) {
+	if item.modelCooled(now, model) && item.healthy(now) && !p.dailyBlockedUsage(usage, item, model, realm, now) {
+		return false, true
+	}
+
+	if !item.healthyForModel(now, model) {
+		return resumesBeforeMidnight(item, now, model), false
+	}
+
+	if !p.dailyBlockedUsage(usage, item, model, realm, now) {
+		return true, false
+	}
+
+	return false, false
 }
 
 // DailyLimitedUIDs 返回达到日 token 或日积分上限的账号（面板徽章用）。
