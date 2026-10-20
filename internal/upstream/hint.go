@@ -61,8 +61,10 @@ var gatewayHintByKind = map[ErrKind]string{
 		"the gateway will rotate or disable this account",
 	ErrSessionDead: "account session expired at upstream; the account is disabled until re-login",
 	ErrHardCredit:  "account credits exhausted at upstream; waiting for daily check-in to restore",
-	ErrModelBlocked: "upstream has no such model on this backend; " +
-		"switch model or retry on another account",
+	ErrModelBlocked: "this account lacks permission for the requested model; " +
+		"the gateway will retry on another account",
+	ErrModelNotFound: "upstream model catalog has no such model; " +
+		"check /v1/models and switch to a supported model",
 	ErrModelAccess: "this account cannot use the requested model; " +
 		"switch model or try another account",
 	// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径

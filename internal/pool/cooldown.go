@@ -1,6 +1,6 @@
 // 冷却与熔断：Cooldown（固定时长账号级冷却）、CooldownSoftRate（账号级软冷却，对齐
 // 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
-// BlockModelBackoff/Clear（11102 负缓存）、软冷却封顶、熔断失败累计、签到解冻。
+// BlockModelBackoff/Clear（11136 负缓存）、软冷却封顶、熔断失败累计、签到解冻。
 package pool
 
 import (
@@ -277,7 +277,7 @@ func clearRoutingModelCooldownsLocked(entry3 *entry) {
 	}
 }
 
-// modelBlock TTL 常量（11102 负缓存退避）：
+// modelBlock TTL 常量（11136 负缓存退避）：
 // 首次命中 6h；半开到期后允许放行重试，再次命中 TTL = base × 2^min(hits-1, shift)；
 // 封顶 24h（最多一天再试一次）。该模型请求成功即由 BlockModelClear 清除。
 const (
@@ -286,14 +286,14 @@ const (
 	modelBlockMaxTTL  = 24 * time.Hour
 )
 
-// BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口
+// BlockModelBackoff 11136「该账号无该模型权限」的 (账号, 模型) 负缓存入口
 // （handler.applyErrorPolicy 调用）。复用 modelCooldowns 机制（不新建平行状态）：
 // 写 modelCooldowns[model]，Until 为指数退避 TTL，选号侧 healthyForModel 自动对该
 // 账号避开该模型。
 //
 // 语义与 6004 正交：6004 是「模型被限流、对齐重置墙钟」，本入口是「官方确定该后端
-// 无此模型、重试无意义，只能换模型/换账号」。resetAt 无需传（11102 无重置文案），
-// ResetAt 保持零值，与 6004 台账共用 Until 判定——11102 条目会以 11102 reason 出现在
+// 无该模型权限、本账号重试无意义，换号仍可能成功」。resetAt 无需传（11136 无重置文案），
+// ResetAt 保持零值，与 6004 台账共用 Until 判定——11136 条目会以 11136 reason 出现在
 // /status 台账，运维可见。
 func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if uid == "" || model == "" {
@@ -338,9 +338,9 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 }
 
 // BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。半开探测
-// 或正常请求对该模型成功后调用（handler 成功路径）。只清 11102/11136/11141 三类
+// 或正常请求对该模型成功后调用（handler 成功路径）。只清 11136/11141 两类
 // 可恢复避让条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
-// reason 前缀判定区分：11102/11136 见 upstream.ModelBlockReason，11141 见
+// reason 前缀判定区分：11136 见 upstream.ModelBlockReason，11141 见
 // upstream.ModelAccessReason。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
@@ -356,7 +356,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	}
 
 	mc, exists := entry2.modelCooldowns[model]
-	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11141")) {
+	if !exists || (!strings.HasPrefix(mc.Reason, "11136") && !strings.HasPrefix(mc.Reason, "11141")) {
 		return
 	}
 
@@ -381,7 +381,7 @@ const (
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
 type ModelBlockStatus struct {
 	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
-	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
+	Reason  string    // 冷却原因（通常为上游原文，如 "11136 no model permission"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
 	// Scope 阻塞范围：platform / account（见常量）。只读诊断，不参与选号。

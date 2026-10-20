@@ -24,10 +24,10 @@ func TestModelBlockedAllAccountsCooled(t *testing.T) {
 	// 两个号对同一模型都有冷却，解封时间不同 → 应取最早的。
 	pool.mu.Lock()
 	pool.byUID["u1"].modelCooldowns = map[string]modelCooldown{
-		"glm-5.3": {Until: base.Add(2 * time.Hour), Reason: "11102 model [glm-5.3] service info not found"},
+		"glm-5.3": {Until: base.Add(2 * time.Hour), Reason: "11136 model not permitted"},
 	}
 	pool.byUID["u2"].modelCooldowns = map[string]modelCooldown{
-		"glm-5.3": {Until: base.Add(1 * time.Hour), Reason: "11102 model [glm-5.3] service info not found"},
+		"glm-5.3": {Until: base.Add(1 * time.Hour), Reason: "11136 model not permitted"},
 	}
 	pool.mu.Unlock()
 
@@ -59,7 +59,7 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	pool.Add(&auth.Auth{UID: "u2"})
 	pool.mu.Lock()
 	pool.byUID["u1"].modelCooldowns = map[string]modelCooldown{
-		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
+		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11136 ..."},
 	}
 	pool.mu.Unlock()
 
@@ -86,7 +86,7 @@ func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
 	pool.Add(&auth.Auth{UID: "u2"})
 	pool.mu.Lock()
 	pool.byUID["u1"].modelCooldowns = map[string]modelCooldown{
-		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
+		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11136 ..."},
 	}
 	pool.byUID["u2"].disabled = true // 唯一还能服务的号被禁用了
 	pool.mu.Unlock()
@@ -127,7 +127,7 @@ func TestModelBlockedExpiredNotBlocking(t *testing.T) {
 	pool.Add(&auth.Auth{UID: "u1"})
 	pool.mu.Lock()
 	pool.byUID["u1"].modelCooldowns = map[string]modelCooldown{
-		"glm-5.3": {Until: time.Now().Add(-time.Minute), Reason: "11102 ..."},
+		"glm-5.3": {Until: time.Now().Add(-time.Minute), Reason: "11136 ..."},
 	}
 	pool.mu.Unlock()
 
@@ -162,7 +162,7 @@ func TestModelBlockedThenClear(t *testing.T) {
 	pool := New("")
 	pool.Add(&auth.Auth{UID: "u1"})
 
-	pool.BlockModelBackoff("u1", "glm-5.3", "11102 model [glm-5.3] service info not found")
+	pool.BlockModelBackoff("u1", "glm-5.3", "11136 model not permitted")
 
 	st := pool.ModelBlocked("glm-5.3")
 	if !st.Blocked || st.Count != 1 {
@@ -181,7 +181,7 @@ func TestModelBlockedThenClear(t *testing.T) {
 }
 
 // TestModelAccessBlockedThenClear 11141 的模型避让条目也应在成功后清除，
-// 与 11102 同通道但独立 reason；6004 限流台账不得被顺手清掉。
+// 与 11136 同通道但独立 reason；6004 限流台账不得被顺手清掉。
 func TestModelAccessBlockedThenClear(t *testing.T) {
 	t.Parallel()
 
@@ -227,7 +227,7 @@ func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 	pool.Add(&auth.Auth{UID: "u2"})
 	pool.mu.Lock()
 	pool.byUID["u1"].modelCooldowns = map[string]modelCooldown{
-		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11102 ..."},
+		"glm-5.3": {Until: time.Now().Add(time.Hour), Reason: "11136 ..."},
 	}
 	pool.byUID["u2"].paused = true // 唯一「健康」的号在暂停让位
 	pool.mu.Unlock()
@@ -287,7 +287,7 @@ func TestModelBlockedScope(t *testing.T) {
 				pool2.mu.Lock()
 				for _, uid := range []string{"u1", "u2"} {
 					pool2.byUID[uid].modelCooldowns = map[string]modelCooldown{
-						"m": {Until: reset, Reason: "11102 model not found"},
+						"m": {Until: reset, Reason: "11136 model not permitted"},
 					}
 				}
 				pool2.mu.Unlock()
