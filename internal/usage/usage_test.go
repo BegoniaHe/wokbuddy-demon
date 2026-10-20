@@ -324,6 +324,34 @@ func TestLocalHourStartAcrossFallBack(t *testing.T) {
 	}
 }
 
+// 回拨日的第二次 02:xx（CET）同样要按墙钟桶回退：此刻 02 点桶的起点是第二次
+// occurrence，绝对回退一小时仍停在 02 点，hours>=2 会漏掉 01 点桶。
+func TestWindowBoundsFallBackSecondOccurrence(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 2026-10-25 03:00 CEST 回拨到 02:00 CET：01:17 UTC 是第二次 02:17 CET。
+	now := time.Date(2026, 10, 25, 1, 17, 0, 0, time.UTC).In(loc)
+
+	cases := []struct {
+		hours int
+		want  time.Time // UTC 时刻，对应墙钟 01:00 / 00:00 CEST
+	}{
+		{2, time.Date(2026, 10, 24, 23, 0, 0, 0, time.UTC)},
+		{3, time.Date(2026, 10, 24, 22, 0, 0, 0, time.UTC)},
+	}
+	for _, item := range cases {
+		from, _ := (Window{Hours: item.hours, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+		if !from.Equal(item.want) {
+			t.Errorf("hours=%d from=%v want %v", item.hours, from.UTC(), item.want)
+		}
+	}
+}
+
 // 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
 // Truncate(time.Hour) 会得到 :30，当前小时的桶被整段排除，短窗口恒为空。
 func TestWindowBoundsLocalHourOffset(t *testing.T) {

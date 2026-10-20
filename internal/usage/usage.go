@@ -843,7 +843,8 @@ type Snapshot struct {
 
 // Window 用量统计窗口。三种口径按优先级解析（见 bounds）：
 //   - From/To 任一非零 → 显式区间 [From, To]（To 零值 = 不设上界）
-//   - 否则 Hours>0     → 滚动窗口：当前整点往回 Hours-1 小时
+//   - 否则 Hours>0     → 滚动窗口：当前整点桶往回 Hours-1 个整点桶（按墙钟；
+//     夏令时回拨的重复小时只算一个桶）
 //   - 否则             → 全部历史
 //
 // 为什么显式区间用「桶起点落在 [From, To] 内」判定而不是求交集：小时桶的粒度
@@ -872,7 +873,27 @@ func (w Window) boundsAt(now time.Time) (time.Time, time.Time) {
 
 	h := min(w.Hours, 24*60)
 
-	return localHourStart(now).Add(-time.Duration(h-1) * time.Hour), time.Time{}
+	start := localHourStart(now)
+	for range h - 1 {
+		start = previousHourStart(start)
+	}
+
+	return start, time.Time{}
+}
+
+// previousHourStart 返回 t（墙钟整点）之前的上一个整点桶起点。
+//
+// 不能只做 Add(-time.Hour)：夏令时回拨的重复小时里绝对回退一小时仍落在同一个
+// 墙钟小时（02:00 CET - 1h = 02:00 CEST），起点不前进，hours>=2 会少算上一个
+// 整点桶。此时按墙钟字段回上一小时；正常路径也重新取整点起点，兼容 30 分钟
+// 偏移的夏令时（如 Australia/Lord_Howe，Add 后会落在 :30）。
+func previousHourStart(t time.Time) time.Time {
+	prev := t.Add(-time.Hour)
+	if prev.Hour() == t.Hour() {
+		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour()-1, 0, 0, 0, t.Location())
+	}
+
+	return time.Date(prev.Year(), prev.Month(), prev.Day(), prev.Hour(), 0, 0, 0, t.Location())
 }
 
 // localHourStart 返回 now 所在本地墙钟整点。
