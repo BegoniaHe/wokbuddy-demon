@@ -3553,6 +3553,35 @@ func packageExpiryTime(pkg *billingPackageAccount) (time.Time, bool) {
 	return parsePackageEndTime(endTime)
 }
 
+// 官方桌面端按包类型拆分查询，且上游要求显式下发 PackageCodes（缺失直接返回
+// 10001 PackageCodes required）。付费包与免费/赠送包分属两个端点，码表不可混用。
+var (
+	paidResourcePackageCodes = []string{
+		"TCACA_code_002_AkiJS3ZHF5",
+		"TCACA_code_005_maRGyrHhw1",
+		"TCACA_code_003_FAnt7lcmRT",
+		"TCACA_code_023_4xbGhMrE6q",
+		"TCACA_code_026_BaESVICNoi",
+		"TCACA_code_027_0FCGVA6vSa",
+		"TCACA_code_009_0XmEQc2xOf",
+		"TCACA_code_038_OhvqZtiPKr",
+		"TCACA_code_036_lupO5WgNdG",
+	}
+	freeResourcePackageCodes = []string{
+		"TCACA_code_001_PqouKr6QWV",
+		"TCACA_code_008_cfWoLwvjU4",
+		"TCACA_code_035_ArVxJcGDsm",
+		"TCACA_code_006_DbXS0lrypC",
+		"TCACA_code_039_KRcQj7wUat",
+		"TCACA_code_040_mi9rCYg46x",
+		"TCACA_code_007_nzdH5h4Nl0",
+		"TCACA_code_028_NtpWi0jzXs",
+		"TCACA_code_037_WxOD3MpI2o",
+		"TCACA_code_029_6wCGEWquYy",
+		"TCACA_code_030_BjSt89qTvr",
+	}
+)
+
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
 func (c *Client) resourcePackageExpiry(account *auth.Auth, now time.Time, soon time.Duration) (
@@ -3572,12 +3601,16 @@ func (c *Client) resourcePackageExpiry(account *auth.Auth, now time.Time, soon t
 	}{
 		{
 			path: "/billing/meter/get-user-resource-paid-packages",
-			body: map[string]any{"NeedRenewInfo": true, "Status": []int{0, 3}, "IsDisplayTotalInfo": true},
+			body: map[string]any{
+				"NeedRenewInfo": true, "Status": []int{0, 3}, "IsDisplayTotalInfo": true,
+				"PackageCodes": paidResourcePackageCodes,
+			},
 		},
 		{
 			path: "/billing/meter/get-user-resource-free-packages",
 			body: map[string]any{
 				"Status": []int{0, 3}, "IsDisplayTotalInfo": true,
+				"PackageCodes":         freeResourcePackageCodes,
 				"SlicePeriodStartTime": dayStart.Format(packageEndLayout),
 				"SlicePeriodEndTime":   dayEnd.Format(packageEndLayout),
 			},

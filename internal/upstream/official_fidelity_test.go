@@ -443,6 +443,39 @@ func TestResourcePackageDayWindowUsesCST(t *testing.T) {
 	}
 }
 
+// TestResourcePackageExpirySendsPackageCodes 上游要求显式 PackageCodes；
+// paid/free 两个端点必须各带自己的码表，且不能混用。
+func TestResourcePackageExpirySendsPackageCodes(t *testing.T) {
+	t.Parallel()
+
+	bodies := make(map[string]string)
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		for _, key := range []string{"paid", "free"} {
+			if strings.HasSuffix(r.URL.Path, "/get-user-resource-"+key+"-packages") {
+				bodies[key] = string(body)
+			}
+		}
+
+		return jsonResp(200, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`), nil
+	})
+
+	if _, _, _ = client.resourcePackageExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, time.Now(), 0); len(bodies) != 2 {
+		t.Fatalf("captured bodies=%v want paid and free", bodies)
+	}
+
+	if !strings.Contains(bodies["paid"], paidResourcePackageCodes[0]) ||
+		strings.Contains(bodies["paid"], freeResourcePackageCodes[0]) {
+		t.Errorf("paid body=%s want paid codes only", bodies["paid"])
+	}
+
+	if !strings.Contains(bodies["free"], freeResourcePackageCodes[0]) ||
+		strings.Contains(bodies["free"], paidResourcePackageCodes[0]) {
+		t.Errorf("free body=%s want free codes only", bodies["free"])
+	}
+}
+
 // TestSlicePackageUsesCycleEndTime 切片/每日包到期以 CycleEndTime 为准。
 func TestSlicePackageUsesCycleEndTime(t *testing.T) {
 	t.Parallel()
