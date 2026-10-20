@@ -126,9 +126,9 @@ func TestChatAllAccountsLackModelPermission(t *testing.T) {
 		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
 	)
-	h := NewHandler(&Config{Pool: state, Upstream: client})
+	handler := NewHandler(&Config{Pool: state, Upstream: client})
 
-	rec := postChat(t, h, `{"model":"glm-5.3","messages":[]}`)
+	rec := postChat(t, handler, `{"model":"glm-5.3","messages":[]}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
 		t.Fatalf("code=%d body=%s want 400 model_unavailable", rec.Code, rec.Body)
 	}
@@ -137,7 +137,7 @@ func TestChatAllAccountsLackModelPermission(t *testing.T) {
 		t.Errorf("upstream calls=%d want 2（每号一次，不逐号轮转）", calls)
 	}
 
-	rec = postChat(t, h, `{"model":"glm-5.3","messages":[]}`)
+	rec = postChat(t, handler, `{"model":"glm-5.3","messages":[]}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
 		t.Errorf("second request: code=%d body=%s want 400 model_unavailable", rec.Code, rec.Body)
 	}
