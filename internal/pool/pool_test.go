@@ -2625,3 +2625,61 @@ func TestDailyLimitPerModel(t *testing.T) {
 		t.Fatal("other model should still be served")
 	}
 }
+
+// TestAllDailyBlockedModelCooldownPastMidnight 纯模型级冷却跨过本地 0 点不能算日限：
+// 换模型仍可能可用，必须由 ModelBlocked 回模型级 400/429，而不是 daily_limit_reached。
+func TestAllDailyBlockedModelCooldownPastMidnight(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.SetSoftRateMax(48 * time.Hour)
+	pool.SetDailyUsageProvider(func() map[string]DailyUsage { return map[string]DailyUsage{} })
+
+	now := time.Now()
+	midnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	pool.CooldownSoftForModel("u1", time.Minute, midnight.Add(time.Hour), "m", "6004 model rate limit")
+
+	if pool.AllDailyBlocked("m", "cn") {
+		t.Fatal("模型级冷却跨 0 点不应被当作日限")
+	}
+}
+
+// TestAllDailyBlockedMixedModelCooldownBeforeMidnight 模型级冷却会在 0 点前恢复时，
+// 即使其他账号已触日限，也不能报「日限到次日」：前者冷却到期即可服务，上层应回
+// 更早的模型级恢复时间，而不是把少数账号的日限放大成整池等待。
+func TestAllDailyBlockedMixedModelCooldownBeforeMidnight(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	now := time.Date(2026, 10, 20, 18, 0, 0, 0, time.Local)
+
+	pool.SetClock(func() time.Time { return now })
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	pool.SetDailyLimits(DailyLimits{Tokens: 100}, DailyLimits{}, DailyLimits{})
+	pool.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u2": {Tokens: 100}}
+	})
+	// u1 模型级冷却 20:00 恢复（早于次日 0 点）；u2 已触日限。
+	pool.CooldownSoftForModel("u1", time.Minute, now.Add(2*time.Hour), "m", "6004 model rate limit")
+
+	if pool.AllDailyBlocked("m", "cn") {
+		t.Fatal("模型级冷却早于 0 点恢复时不应报日限")
+	}
+}
+
+// TestAllDailyBlockedAccountCoolingPastMidnight 对照：账号级冷却跨 0 点仍按既有
+// 口径归入「今天没号可用」，避免本次修复扩大到账号级冷却。
+func TestAllDailyBlockedAccountCoolingPastMidnight(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.SetDailyUsageProvider(func() map[string]DailyUsage { return map[string]DailyUsage{} })
+	pool.Cooldown("u1", CoolSoft, 30*time.Hour, "429 rate limit")
+
+	if !pool.AllDailyBlocked("m", "cn") {
+		t.Fatal("账号级冷却跨 0 点应保持既有日限口径")
+	}
+}

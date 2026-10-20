@@ -78,9 +78,10 @@ type Status struct {
 	Until                    time.Time `json:"until,omitzero"`
 	Reason                   string    `json:"reason,omitempty"`
 	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
-	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
-	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
-	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
+	// RateLimitedModels 当前仍在限额/避让的模型列表（issue #36 台账）。
+	// 任一未过期的模型级条目（modelCooldowns，含无重置时间的 6004 审计项）都会成行：
+	// 6004 限流为 rate_limit，11136 权限缺失 / 11141 模型下线为 model_unavailable。
+	// 运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
@@ -138,7 +139,7 @@ type ModelCostStatus struct {
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
 type RateLimitedModel struct {
 	Model string `json:"model"`
-	// Kind 区分限流与模型不可用：6004 是 rate_limit，11136 是 model_unavailable。
+	// Kind 区分限流与模型不可用：6004 是 rate_limit，11136/11141 是 model_unavailable。
 	Kind string `json:"kind"`
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
@@ -155,16 +156,17 @@ type RateLimitedModel struct {
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
 //   - 11136 账号无该模型权限：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
 //     累计命中次数驱动退避（6004 无 hits 概念，Hits 恒 0）。
+//   - 11141 模型下线：与 11136 共用负缓存形态（Until 为退避 TTL），成功或到期清除。
 type modelCooldown struct {
-	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11136：now+退避 TTL）。
+	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11136/11141：now+退避 TTL）。
 	Until time.Time
 	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）。
 	// 与 Until 的区别同：Until 可能截断，ResetAt 是上游权威恢复时刻。
-	// 11136 无重置文案，ResetAt 恒零值。
+	// 11136/11141 无重置文案，ResetAt 恒零值。
 	ResetAt time.Time
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string
-	// Hits 11136 负缓存的累计命中次数（驱动指数退避）。6004 条目 Hits 恒 0。
+	// Hits 11136/11141 负缓存的累计命中次数（驱动指数退避）。6004 条目 Hits 恒 0。
 	Hits int
 	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
 	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
@@ -238,11 +240,12 @@ type entry struct {
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
 	// 持久化（stateAccount.SoftStreak）：重启后软限流仍在退避，不因重启回到基数。
 	softStreak int
-	// modelCooldowns 6004 模型级 limit 的**独立**冷却表：model → 该模型的冷却截止/重置。
-	// 与 until（全账号级）正交：6004 只写本表、不写 until，因此多个模型同时 6004 时
+	// modelCooldowns (账号, 模型) 级独立冷却表：model → 该模型的冷却截止/重置。
+	// 承载 6004 限流（带重置时间时只写本表、不写 until）与 11136/11141 负缓存
+	// （只写本表、不影响 until）。与 until（全账号级）正交：多个模型同时冷却时
 	// 各自独立计时，互不覆盖（A 触发后 B 再触发，A 的冷却截止不被 B 覆盖——这是
-	// 单 until 字段做不到的）。仅 6004 触发时记录；空 map = 无模型级限流（不豁免）。
-	// 运行态语义（不持久化）：重启清零，退化为仅账号级 until 冷却的现状。
+	// 单 until 字段做不到的）。空 map = 无模型级避让（不豁免）。
+	// 持久化（stateAccount.ModelCooldowns）：重启后仍避开已知不可用的模型。
 	modelCooldowns map[string]modelCooldown
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
@@ -313,9 +316,9 @@ func (e *entry) healthy(now time.Time) bool {
 	return true
 }
 
-// modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
-// 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
+// modelExempt 报告账号是否处于「模型级冷却」形态：存在任一有效的非审计模型级
+// 冷却（6004 限流 / 11136 权限缺失 / 11141 模型下线），且尚未禁用、未熔断。
+// 此形态下账号仅对冷却中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
@@ -338,7 +341,8 @@ func (e *entry) hardCoolingActive(now time.Time) bool {
 	return e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until)
 }
 
-// modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
+// modelCooled 报告账号对指定 model 是否正处模型级冷却（该模型的独立冷却未过期：
+// 6004 限流 / 11136 权限缺失 / 11141 模型下线）。AuditOnly 仅展示、不参与判定。
 // 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
 func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	if reqModel == "" {
@@ -353,10 +357,10 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	return !mc.Until.IsZero() && now.Before(mc.Until)
 }
 
-// healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
+// healthyForModel 报告账号对指定 model 是否可选（含模型级独立冷却判定）：
 //   - disabled → 永不可选（最高优先级）；
-//   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
-//     （多模型限流时各自独立，互不影响）；
+//   - 该模型正处模型级冷却（modelCooldowns[reqModel] 未过期：6004/11136/11141）
+//     → 不可选（多模型冷却时各自独立，互不影响）；
 //   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
 //
 // 对比旧实现（softRateModel 单字段豁免"仅锁一个模型、其他豁免"），新语义天然支持
@@ -368,7 +372,7 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	}
 
 	if e.modelCooled(now, reqModel) {
-		// 该模型在 6004 独立冷却中 → 不可选。
+		// 该模型在模型级冷却中 → 不可选。
 		return false
 	}
 	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
@@ -419,7 +423,8 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 
 // expiry 返回账号当前仍在生效的最近冷却/熔断/降权截止时间（三个截止取最早者）；不在冷却期返回零值。
 // 供全冷却兜底选取"最早到期"账号用。连败降权计入兜底口径：降权号参与兜底（其失败
-// 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard 才被排除）。
+// 形态是「不知道原因」，到期放行半开试探正是兜底语义）。CoolHard 与请求模型的
+// 模型级冷却由 fallbackEligible 先排除，故本函数只归并账号级截止。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
 
@@ -445,7 +450,8 @@ func earlierActive(cur, cand, now time.Time) time.Time {
 }
 
 // fallbackKind 报告兜底账号属于哪一类冷却（soft：即时软冷却/连败降权；breaker：熔断期）。
-// 只对参与兜底的账号调用（CoolHard 已被 pickEarliestExpiryLocked 排除）。判定口径：
+// 只对参与兜底的账号调用（CoolHard 与请求模型级冷却账号已被 pickEarliestExpiryLocked
+// 排除）。判定口径：
 // 若熔断截止是当前生效的最近截止（含"仅有熔断无软冷却"），记为 breaker；否则记为 soft
 // （连败降权与软冷却同归 soft：都按各自截止到期放行，兜底处置无差异）。
 func (e *entry) fallbackKind(now time.Time) string {
@@ -505,9 +511,9 @@ type stateAccount struct {
 	// 与 CreditsExpiring 一并持久化，重启后首次请求仍可沿用最近一次余额快照。
 	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitzero"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
-	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 / 11136
-	// 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达数小时，
-	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。
+	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 /
+	// 11136/11141 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达
+	// 数小时，跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。
 	// 恢复时惰性过滤已过期条目。
 	ModelCooldowns map[string]stateModelCooldown `json:"model_cooldowns,omitempty"`
 	// ModelCosts 实测扣费账本（model → 单价观测，见 entry.modelCost）。持久化
@@ -521,7 +527,7 @@ type stateAccount struct {
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态
 // modelCooldown 同构（Until/ResetAt/Reason 字段名与语义对齐），落盘/恢复往返无损。
-// Hits 不落盘（重启后 11136 退避从 6h 基数重新学习，同 modelCost 口径）。
+// Hits 不落盘（重启后 11136/11141 退避从 6h 基数重新学习，同 modelCost 口径）。
 type stateModelCooldown struct {
 	Until     time.Time `json:"until"`
 	ResetAt   time.Time `json:"reset_at,omitzero"`

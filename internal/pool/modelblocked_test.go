@@ -76,6 +76,82 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	}
 }
 
+// TestModelBlockedAccountsNotPicked 全部账号都被 11136 挡住时选号返回 nil
+// （handler 据此 fast-fail，不再逐号轮转）。11136 不写路由熔断后，这条口径
+// 保证「全池无权限」不会退化成每个请求逐号轮转。
+func TestModelBlockedAccountsNotPicked(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	pool.BlockModelBackoff("u1", "glm-5.3", "11136 model not permitted")
+	pool.BlockModelBackoff("u2", "glm-5.3", "11136 model not permitted")
+
+	if acct := pool.PickExcludingForRealm(nil, "glm-5.3", ""); acct != nil {
+		t.Fatalf("全部账号无该模型权限时不应兜底选中，got %s", acct.UID)
+	}
+}
+
+// TestModelBlockedFallbackSkipsModelCooled 全池都有 11136 负缓存时，即使某个账号
+// 同时还有账号级软冷却（until 非零、会进入全冷却兜底候选），也不得被兜底选中——
+// 否则「全池无权限」仍会逐请求打上游，违背 11136 负缓存的避让语义。
+func TestModelBlockedFallbackSkipsModelCooled(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	// 先写账号级冷却（该入口会清理模型级条目），再写 11136，构造两态共存。
+	pool.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	pool.BlockModelBackoff("u1", "glm-5.3", "11136 model not permitted")
+	pool.BlockModelBackoff("u2", "glm-5.3", "11136 model not permitted")
+
+	if acct := pool.PickExcludingForRealm(nil, "glm-5.3", ""); acct != nil {
+		t.Fatalf("模型级冷却中的账号不应被兜底选中，got %s", acct.UID)
+	}
+}
+
+// TestFallbackSkipsModelRateLimited 请求模型仍在账号 6004 模型级冷却中时，即使该
+// 账号另有账号级软冷却（expiry 非零、会进入兜底候选），也不得被兜底选中——探测
+// 必然继续 429。
+func TestFallbackSkipsModelRateLimited(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	// 先写账号级软冷却，再写 6004 模型级冷却，构造两态共存。
+	pool.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	pool.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "glm-5.3", "6004 model rate limit")
+
+	if acct := pool.PickExcludingForRealm(nil, "glm-5.3", ""); acct != nil {
+		t.Fatalf("模型限流中的账号不应被兜底选中，got %s", acct.UID)
+	}
+}
+
+// TestModelBlockedRateLimited 全池被挡原因清一色 6004 限流时标 RateLimited（上层
+// 回 429 + Retry-After）；混入 11136 后按"模型不可用"处理（换模型才有用）。
+func TestModelBlockedRateLimited(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	reset := time.Now().Add(time.Hour)
+	pool.CooldownSoftForModel("u1", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+	pool.CooldownSoftForModel("u2", time.Minute, reset, "glm-5.3", "6004 model rate limit")
+
+	if st := pool.ModelBlocked("glm-5.3"); !st.Blocked || !st.RateLimited {
+		t.Fatalf("全池 6004 应标记 RateLimited，got %+v", st)
+	}
+
+	pool.BlockModelBackoff("u2", "glm-5.3", "11136 model not permitted")
+
+	if st := pool.ModelBlocked("glm-5.3"); !st.Blocked || st.RateLimited {
+		t.Fatalf("混入 11136 后不应再报限流，got %+v", st)
+	}
+}
+
 // TestModelBlockedDisabledDoesNotCount 禁用号不参与判定：它不可用与模型无关，
 // 既不构成"还能服务"的证明，也不该被算进被挡账号数。
 func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
@@ -329,5 +405,29 @@ func TestModelBlockedScope(t *testing.T) {
 				t.Errorf("shared reset=%v want %v", modelBlockStatus.SharedResetAt, reset)
 			}
 		})
+	}
+}
+
+// TestModelBlockedRealmScoped 模型阻塞判定必须与选号同口径按 realm 统计：
+// 本域账号全被 6004 挡住时，异域健康号不能让本域请求退化成「池子没号」。
+func TestModelBlockedRealmScoped(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
+	pool.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
+	pool.CooldownSoftForModel("cn1", time.Minute, time.Now().Add(time.Hour), "glm-5.3", "6004 model rate limit")
+
+	if st := pool.ModelBlocked("glm-5.3"); st.Blocked {
+		t.Fatalf("不过滤 realm 时异域健康号参与判定，不应报告全池阻塞，got %+v", st)
+	}
+
+	st := pool.ModelBlockedForRealm("glm-5.3", "cn")
+	if !st.Blocked || !st.RateLimited || st.Count != 1 {
+		t.Fatalf("cn 域全被 6004 挡住应报阻塞+限流，got %+v", st)
+	}
+
+	if st := pool.ModelBlockedForRealm("glm-5.3", "global"); st.Blocked {
+		t.Fatalf("global 域账号健康，不应报阻塞，got %+v", st)
 	}
 }

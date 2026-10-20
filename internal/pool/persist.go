@@ -218,7 +218,7 @@ func buildEntryFromState(uid string, stateAccount2 *stateAccount, now time.Time)
 	if stateAccount2.DegradeUntil != nil && now.Before(*stateAccount2.DegradeUntil) {
 		entry2.degradeUntil = *stateAccount2.DegradeUntil
 	}
-	// 模型级独立冷却（6004 重置墙钟 / 11136 负缓存）：惰性过滤已过期条目。
+	// 模型级独立冷却（6004 重置墙钟 / 11136/11141 负缓存）：惰性过滤已过期条目。
 	entry2.modelCooldowns = restoreModelCooldowns(stateAccount2.ModelCooldowns, now)
 	// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
 	// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
@@ -437,7 +437,7 @@ func buildStateAccount(entry5 *entry, now time.Time) stateAccount {
 		u := entry5.degradeUntil
 		stateAccount2.DegradeUntil = &u
 	}
-	// 模型级独立冷却：惰性过滤已过期条目（Hits 不落盘，重启后 11136 退避从基数重学）。
+	// 模型级独立冷却：惰性过滤已过期条目（Hits 不落盘，重启后 11136/11141 退避从基数重学）。
 	stateAccount2.ModelCooldowns = stateModelCooldownsOf(entry5, now)
 	// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。
 	stateAccount2.ModelCosts = stateModelCostsOf(entry5, now)

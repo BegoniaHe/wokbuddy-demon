@@ -384,6 +384,21 @@ func TestRateLimitedModelKindModelUnavailable(t *testing.T) {
 	}
 }
 
+// 11141（模型下线）与 11136 同属「模型不可用」，台账不能显示成 rate_limit：
+// 面板会按限流口径给出「上游重置：时间未知」，把下线误读成可等待恢复。
+func TestRateLimitedModelKindModelRetired(t *testing.T) {
+	t.Parallel()
+
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.BlockModelBackoff("u1", "retired-model", "11141 model retired")
+
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Kind != "model_unavailable" {
+		t.Fatalf("rows=%+v want model_unavailable", st.RateLimitedModels)
+	}
+}
+
 // AuditOnly 标记必须跨重启保留，否则无重置时间的 6004 展示项会失忆并参与路由。
 func TestModelRateLimitAuditPersists(t *testing.T) {
 	t.Parallel()

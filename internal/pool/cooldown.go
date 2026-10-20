@@ -1,6 +1,7 @@
 // 冷却与熔断：Cooldown（固定时长账号级冷却）、CooldownSoftRate（账号级软冷却，对齐
 // 上游重置时间或有界退避）、CooldownSoftForModel（模型级软冷却，对齐重置墙钟）、
-// BlockModelBackoff/Clear（11136 负缓存）、软冷却封顶、熔断失败累计、签到解冻。
+// BlockModelBackoff/Clear（11136/11141 模型不可用负缓存）、软冷却封顶、熔断失败累计、
+// 签到解冻。
 package pool
 
 import (
@@ -277,7 +278,7 @@ func clearRoutingModelCooldownsLocked(entry3 *entry) {
 	}
 }
 
-// modelBlock TTL 常量（11136 负缓存退避）：
+// modelBlock TTL 常量（11136/11141 模型不可用负缓存退避）：
 // 首次命中 6h；半开到期后允许放行重试，再次命中 TTL = base × 2^min(hits-1, shift)；
 // 封顶 24h（最多一天再试一次）。该模型请求成功即由 BlockModelClear 清除。
 const (
@@ -286,15 +287,16 @@ const (
 	modelBlockMaxTTL  = 24 * time.Hour
 )
 
-// BlockModelBackoff 11136「该账号无该模型权限」的 (账号, 模型) 负缓存入口
-// （handler.applyErrorPolicy 调用）。复用 modelCooldowns 机制（不新建平行状态）：
-// 写 modelCooldowns[model]，Until 为指数退避 TTL，选号侧 healthyForModel 自动对该
-// 账号避开该模型。
+// BlockModelBackoff 「(账号, 模型) 不可用」负缓存入口（handler.applyErrorPolicy 调用），
+// 承载 11136 账号无该模型权限与 11141 模型下线两类原因。复用 modelCooldowns 机制
+// （不新建平行状态）：写 modelCooldowns[model]，Until 为指数退避 TTL，选号侧
+// healthyForModel 自动对该账号避开该模型。
 //
 // 语义与 6004 正交：6004 是「模型被限流、对齐重置墙钟」，本入口是「官方确定该后端
-// 无该模型权限、本账号重试无意义，换号仍可能成功」。resetAt 无需传（11136 无重置文案），
-// ResetAt 保持零值，与 6004 台账共用 Until 判定——11136 条目会以 11136 reason 出现在
-// /status 台账，运维可见。
+// 不可用、本账号重试无意义，换号仍可能成功（11136）或只会同样失败（11141）」。
+// resetAt 无需传（两族都无重置文案），ResetAt 保持零值，与 6004 台账共用 Until
+// 判定——条目以各自 reason 前缀出现在 /status 台账，运维可见。成功实测后由
+// BlockModelClear 按前缀清除。
 func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	if uid == "" || model == "" {
 		return
@@ -337,11 +339,24 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
-// BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。半开探测
-// 或正常请求对该模型成功后调用（handler 成功路径）。只清 11136/11141 两类
-// 可恢复避让条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
-// reason 前缀判定区分：11136 见 upstream.ModelBlockReason，11141 见
-// upstream.ModelAccessReason。
+// modelUnavailableReason 判定模型级冷却原因是否属于「模型不可用」负缓存：
+// 11136 账号权限缺失（upstream.ModelBlockReason）与 11141 模型下线
+// （upstream.ModelAccessReason）共用该口径；6004 限流不算。
+func modelUnavailableReason(reason string) bool {
+	return strings.HasPrefix(reason, "11136") || strings.HasPrefix(reason, "11141")
+}
+
+// modelRateLimitReason 判定模型级冷却原因是否来自 6004 模型级限流。与
+// modelUnavailableReason 互斥：前者是"等等再试"，后者是"换模型才有用"。
+func modelRateLimitReason(reason string) bool {
+	return strings.HasPrefix(reason, "6004")
+}
+
+// BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。handler 在
+// 成功路径调用。负缓存到期前选号不会命中被避让账号（全冷却兜底也已排除），所以常规
+// 恢复靠 TTL 到期；本入口主要覆盖并发下「成功与负缓存新写入交错」的窗口。只清
+// 11136/11141 两类可恢复避让条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟
+// 语义，成功不该抹掉。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
@@ -356,7 +371,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	}
 
 	mc, exists := entry2.modelCooldowns[model]
-	if !exists || (!strings.HasPrefix(mc.Reason, "11136") && !strings.HasPrefix(mc.Reason, "11141")) {
+	if !exists || !modelUnavailableReason(mc.Reason) {
 		return
 	}
 
@@ -384,6 +399,9 @@ type ModelBlockStatus struct {
 	Reason  string    // 冷却原因（通常为上游原文，如 "11136 no model permission"）
 	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
 	Count   int       // 因此被挡的账号数
+	// RateLimited true = 被挡原因全部是 6004 模型级限流（等上游重置），
+	// 而非 11136/11141 的模型不可用（换模型才有用）。上层据此选 429 还是 400。
+	RateLimited bool
 	// Scope 阻塞范围：platform / account（见常量）。只读诊断，不参与选号。
 	Scope string
 	// SharedResetAt 平台级时的共享上游重置时刻（账号级为零值）。
@@ -409,13 +427,24 @@ func modelBlockScope(total, withReset, distinctResets int, shared time.Time) (st
 // （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"
 // （issue #102 附带发现 1）。上游原文与解封时间在那里被丢掉。
 //
-// 跨 realm 判定：调用方失败前已依次尝试过各域，所以只要有**任意**账号还能服务该
-// 模型，就不能算全池阻塞 —— 此时返回 Blocked=false，让上层继续用原有的
-// no_healthy_account 文案（选号失败另有原因：在途占满/积分保底/账号级冷却）。
-//
 // 口径必须与选号一致：用 modelCooled 而非直接查 map，这样 AuditOnly 条目
-// （只审计不拦截）不会被误报成阻塞。
+// （只审计不拦截）不会被误报成阻塞；选号按 realm 分流时也要按 realm 统计
+// （见 ModelBlockedForRealm），不能用异域健康号否定本域的阻塞结论。
 func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
+	return p.ModelBlockedForRealm(model, "")
+}
+
+// modelBlockIgnores 报告账号是否不参与全池模型阻塞统计：禁用/暂停号不可选，
+// 异域账号（realm 非空且不匹配）与本次选号无关。
+func modelBlockIgnores(entry2 *entry, realm string) bool {
+	return entry2.disabled || entry2.paused || (realm != "" && entry2.a.Realm() != realm)
+}
+
+// ModelBlockedForRealm 同 ModelBlocked，但只统计 Realm()==realm 的账号
+// （realm 空 = 不过滤）。选号只在本域内挑号，阻塞判定必须同口径：否则混合池里
+// 「本域账号全被模型级冷却挡住、异域还有健康号」会返回 Blocked=false，把
+// 11136/11141 的 400 与 6004 的 429 + Retry-After 退化成 503 no_healthy_account。
+func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 	if model == "" {
 		return ModelBlockStatus{}
 	}
@@ -425,7 +454,8 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 
 	now := p.now()
 
-	var modelBlockStatus ModelBlockStatus
+	// RateLimited 默认按限流起步，merge 遇到非 6004 原因时清零。
+	modelBlockStatus := ModelBlockStatus{RateLimited: true}
 	// 重置时刻一致性统计（issue #29）：distinct 用集合去重，withReset 计带非零
 	// ResetAt 的账号数，shared 记唯一值。
 	var (
@@ -437,8 +467,8 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	for _, item := range p.byUID {
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的
 		// 证明不成立——否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」。
-		if item.disabled || item.paused {
-			continue // 禁用/暂停号不参与：它们的不可用与模型无关
+		if modelBlockIgnores(item, realm) {
+			continue
 		}
 
 		if !item.modelCooled(now, model) {
@@ -472,11 +502,16 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 // 并取最早解封时刻（那才是"再等多久值得重试"的答案）。
 func (st *ModelBlockStatus) mergeModelCooldown(modelCooldown2 *modelCooldown, ok bool) {
 	if !ok {
+		st.RateLimited = false
 		return
 	}
 
 	if st.Reason == "" {
 		st.Reason = modelCooldown2.Reason
+	}
+
+	if !modelRateLimitReason(modelCooldown2.Reason) {
+		st.RateLimited = false
 	}
 
 	if !modelCooldown2.Until.IsZero() && (st.Until.IsZero() || modelCooldown2.Until.Before(st.Until)) {

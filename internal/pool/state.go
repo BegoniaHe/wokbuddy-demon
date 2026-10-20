@@ -5,7 +5,6 @@ package pool
 import (
 	"log"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -195,7 +194,7 @@ func (p *Pool) NoteError(uid string) {
 // 成功证明账号当前可用，连败计数与临时出池截止一并归零。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
-// 冷却（Cooldown/reviveCoolingLocked）清除。11136 条目的成功清理由 handler 在
+// 冷却（Cooldown/reviveCoolingLocked）清除。11136/11141 条目的成功清理由 handler 在
 // 成功且模型命中时显式调 BlockModelClear（6004 不清，语义不同）。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
@@ -680,10 +679,10 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 
 	status := Status{
 		UID: uid,
-		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
-		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
-		// 到期判据 = 该模型的独立冷却 until 未过；条件满足才输出，随到期自然消失，
-		// 普通软冷却（无模型级表）/硬冷却不产生台账（零回归）。
+		// 限额台账（issue #36）：任一未到期的模型级条目都会输出一行——6004 限流、
+		// 11136 权限缺失 / 11141 模型下线，以及无重置时间的 6004 审计项；多模型同时
+		// 冷却全部展示。到期判据 = 该模型的独立冷却 until 未过；普通软冷却（无模型级
+		// 表）/硬冷却不产生台账（零回归）。
 		RateLimitedModels:        p.rateLimitedModelsLocked(entry2, now),
 		Realm:                    entry2.a.Realm(),
 		ProxySlot:                entry2.proxySlot,
@@ -810,7 +809,7 @@ func (p *Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimit
 		modelCooldown2 := entry4.modelCooldowns[m]
 		if !modelCooldown2.Until.IsZero() && now.Before(modelCooldown2.Until) {
 			kind := "rate_limit"
-			if strings.HasPrefix(modelCooldown2.Reason, "11136") {
+			if modelUnavailableReason(modelCooldown2.Reason) {
 				kind = "model_unavailable"
 			}
 

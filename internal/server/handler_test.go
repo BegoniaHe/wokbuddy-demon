@@ -2618,12 +2618,16 @@ func TestChatModelBlockPlatformHint(t *testing.T) {
 	h := NewHandler(&Config{Pool: state, Upstream: client})
 
 	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("code=%d body=%s want 429 rate_limit_exceeded", rec.Code, rec.Body)
 	}
 
 	if !strings.Contains(rec.Body.String(), "platform-level") {
 		t.Errorf("model block hint should mark platform-level: %s", rec.Body)
+	}
+	// 429 必须带 Retry-After：解封时刻已知，客户端据此等待而不是立刻重试。
+	if got := rec.Header().Get("Retry-After"); got == "" {
+		t.Errorf("模型级 429 应带 Retry-After: header 缺失")
 	}
 }
 

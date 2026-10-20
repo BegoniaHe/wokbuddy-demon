@@ -122,3 +122,50 @@ func TestRetryAfterSecondsOnlyCurrentModel(t *testing.T) {
 		t.Fatalf("Retry-After=%d want ~90（当前模型冷却）", got)
 	}
 }
+
+// TestModelBlockOverrideRateLimited 全池 6004：模型级阻塞必须回 429
+// rate_limit_exceeded 并带 Retry-After，不能报成 400 model_unavailable。
+func TestModelBlockOverrideRateLimited(t *testing.T) {
+	t.Parallel()
+
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(45*time.Second), "m", "6004 model rate limit")
+	h := NewHandler(&Config{Pool: p})
+	flow := &chatFlow{h: h, bareModel: "m", st: &chatStat{}, modelBlock: p.ModelBlocked("m")}
+
+	status, code, _, hint := flow.applyModelBlockOverride(http.StatusServiceUnavailable, "no_healthy_account", "x", "", false)
+	if status != http.StatusTooManyRequests || code != "rate_limit_exceeded" {
+		t.Fatalf("status=%d code=%q want 429 rate_limit_exceeded", status, code)
+	}
+
+	if hint == "" {
+		t.Fatal("hint 应说明模型级冷却")
+	}
+
+	if got := flow.retryAfterSeconds(status); got < 44 || got > 46 {
+		t.Fatalf("Retry-After=%d want ~45", got)
+	}
+}
+
+// TestModelBlockRateLimitedScopedToRealm 混合池里 cn 账号全被 6004 挡住、
+// global 账号健康：bare 模型走 cn 出口，必须回 429 而不是 503 no_healthy_account。
+func TestModelBlockRateLimitedScopedToRealm(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "atg", ExpiresAt: 9999999999},
+	)
+	p.CooldownSoftForModel("cn1", time.Minute, time.Now().Add(time.Hour), "glm-5.2", "6004 model rate limit")
+	h := NewHandler(&Config{Pool: p, Upstream: client})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("code=%d body=%s want 429 rate_limit_exceeded", rec.Code, rec.Body)
+	}
+
+	if got := rec.Header().Get("Retry-After"); got == "" {
+		t.Error("模型级 429 应带 Retry-After: header 缺失")
+	}
+}

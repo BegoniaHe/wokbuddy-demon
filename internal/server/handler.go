@@ -1536,9 +1536,9 @@ func (f *chatFlow) reportNoAccount() {
 	f.st.status = http.StatusServiceUnavailable
 	// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 	//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
-	//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11136/6004）。
+	//   (b) 本 realm 的号都在，但每个号都对这个模型处于模型级冷却（11136/11141/6004）。
 	// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
-	f.modelBlock = f.h.cfg.Pool.ModelBlocked(f.bareModel)
+	f.modelBlock = f.h.cfg.Pool.ModelBlockedForRealm(f.bareModel, f.realm)
 
 	detail := map[string]any{"model": f.bareModel}
 	if f.modelBlock.Blocked {
@@ -2230,12 +2230,12 @@ func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
 		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, reason)
 }
 
-// noteSuccessAndBind 记录账号成功、清 11136 负缓存，并让会话粘性跟随最终成功号。
+// noteSuccessAndBind 记录账号成功、清 11136/11141 负缓存，并让会话粘性跟随最终成功号。
 func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	f.h.cfg.Pool.NoteSuccess(acct.UID)
 	f.h.cfg.Pool.NoteRouteSuccess(f.realm, f.bareModel)
-	// 11136 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-	// BlockModelClear 按 "11136" reason 前缀识别，只清 11136 条目、不碰 6004 独立冷却。
+	// 11136/11141 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+	// BlockModelClear 按 reason 前缀识别两族，不碰 6004 独立冷却。
 	f.h.cfg.Pool.BlockModelClear(acct.UID, f.bareModel)
 
 	if f.sessKey != "" && f.h.cfg.Session != nil {
@@ -2653,7 +2653,7 @@ func (f *chatFlow) modelRecovery(now time.Time) time.Time {
 		return time.Time{}
 	}
 
-	modelBlockStatus := f.h.cfg.Pool.ModelBlocked(f.bareModel)
+	modelBlockStatus := f.h.cfg.Pool.ModelBlockedForRealm(f.bareModel, f.realm)
 
 	route := f.h.cfg.Pool.RouteRecovery(f.realm, f.bareModel)
 	if !modelBlockStatus.Blocked {
@@ -2756,18 +2756,29 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 // applyModelBlockOverride 模型级阻塞覆盖通用文案（放在最后 = 优先级最高）。
 // 为什么能覆盖 code 而不丢信息：modelBlock.Reason 就是 BlockModelBackoff 存下的上游
 // 原因，已在 hint 里原样带出，所以覆盖 message 不会丢掉上游信息，反而补上了上游不会
-// 告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。用 400 而非 503：
-// 这是"你选的这个模型当前不可用"，不是"服务端暂时过载"，换号重试必然同样失败。
+// 告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。
+// 状态码按阻塞原因分档：11136/11141 是模型不可用（换模型才有用），用 400；
+// 全池 6004 模型级限流是"等上游重置"，用 429 并带 Retry-After（不能报成不可用）。
 func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, upstreamMsgPassed bool) (int, string, string, string) {
 	if !f.modelBlock.Blocked {
 		return status, code, msg, hint
 	}
 
-	code = "model_unavailable"
-	// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号被挡、
-	// 最早何时解封"这类本地调度信息放进 gateway_hint。
-	if !upstreamMsgPassed {
-		msg = "model is unavailable on every account (per-model cooldown), try another model"
+	if f.modelBlock.RateLimited {
+		status = http.StatusTooManyRequests
+		code = "rate_limit_exceeded"
+
+		if !upstreamMsgPassed {
+			msg = "rate limited: this model is cooling down on every account, retry later"
+		}
+	} else {
+		status = http.StatusBadRequest
+		code = "model_unavailable"
+		// 有上游原文时保留它（含 requestId，用户要拿去向上游反馈），只把"有几个号被挡、
+		// 最早何时解封"这类本地调度信息放进 gateway_hint。
+		if !upstreamMsgPassed {
+			msg = "model is unavailable on every account (per-model cooldown), try another model"
+		}
 	}
 	// 阻塞范围（issue #29）：平台级（上游统一限流，等上游恢复）与账号级（换号/等本号
 	// 恢复）对运维的处置完全不同，在 hint 里点明。
@@ -2788,7 +2799,7 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 		hint += "; upstream: " + s
 	}
 
-	return http.StatusBadRequest, code, msg, hint
+	return status, code, msg, hint
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
@@ -2910,7 +2921,7 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
 // 会立即 400 返回，其余种类 continue 换号（continue 前由 rotateBackoff 退避）。
 //
-// 十条路径，各司其职：
+// 以下分类各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
@@ -2919,6 +2930,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
+//   - ErrAccountFault → 11140「request illegal」→ Disable（上游风控，需人工重登）；
+//     14017 等未激活/授权故障 → Cooldown(CoolSoft) 有界退避。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
@@ -2929,7 +2942,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11136 负缓存避让。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11136 负缓存避让；
+//     权限是账号维度，不写路由熔断（其他账号可能仍有权限）。
 //   - ErrModelNotFound → 11102 上游目录无此模型：请求级 fail-fast（404），
 //     不罚账号、不轮转、不写 (账号,模型) 负缓存与路由熔断。
 //   - ErrModelAccess → BlockModelBackoff + NoteRouteFailure：11141 模型级
@@ -2956,8 +2970,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 		// 11136「该账号无该模型权限」：(账号, 模型) 负缓存避让。复用 modelCooldowns
 		// 机制（与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
+		// 权限是账号维度：其他账号可能仍有权限，不能写 (realm, model) 路由熔断——
+		// 否则少数无权限账号连续失败会冷却整条路由，把本可服务的账号一并挡在门外。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
-		h.cfg.Pool.NoteRouteFailure(realm, model)
 	case upstream.ErrModelAccess:
 		// 11141 模型已下线：请求级 fail-fast（不罚账号、不轮转），
 		// 同时写 (账号,模型) 负缓存，后续请求不再命中同一组合。与 11136 同机制但

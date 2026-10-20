@@ -515,6 +515,8 @@ func (p *Pool) dailyBlockedUsage(usage map[string]DailyUsage, entry3 *entry, mod
 func (l DailyLimits) enabled() bool { return l.Tokens > 0 || l.Credits > 0 || l.ModelTokens > 0 }
 
 // AllDailyBlocked 报告是否存在健康账号但全部被当日护栏拦下（issue #95）。
+// 纯模型级阻塞不算日限：即使解封时刻跨过本地 0 点，也应交给 ModelBlocked 回
+// 400/429（换模型或等上游重置），否则「模型不可用」会被误报成「日限到次日」。
 func (p *Pool) AllDailyBlocked(model, realm string) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -526,34 +528,51 @@ func (p *Pool) AllDailyBlocked(model, realm string) bool {
 	usage := p.dailyUsage()
 	now := p.now()
 	candidates := 0
+	modelOnly := 0
 
 	for _, item := range p.byUID {
-		if item.disabled || item.paused {
-			continue
-		}
-
-		if realm != "" && item.a.Realm() != realm {
+		if item.disabled || item.paused || (realm != "" && item.a.Realm() != realm) {
 			continue
 		}
 
 		candidates++
-		// 冷却/熔断/模型冷却可能在本地 0 点前恢复：此时应回 503 并由
-		// Retry-After 指向更早的恢复时间，而不是声称「日限到次日」。
-		// 硬冷却（余额耗尽，通常到次日 04:00）晚于日限重置，仍按日限处理。
-		if !item.healthyForModel(now, model) {
-			if resumesBeforeMidnight(item, now, model) {
-				return false
-			}
 
-			continue
+		serveable, onlyModel := p.dailyBlockClass(item, usage, model, realm, now)
+		if serveable {
+			return false
 		}
 
-		if !p.dailyBlockedUsage(usage, item, model, realm, now) {
-			return false
+		if onlyModel {
+			modelOnly++
 		}
 	}
 
-	return candidates > 0
+	return candidates > 0 && modelOnly != candidates
+}
+
+// dailyBlockClass 把单个账号归类到日限判定：
+//   - serveable=true：账号能服务该模型，或冷却会在本地 0 点前恢复（应回 503，
+//     由 Retry-After 指向更早的恢复时间，而不是声称「日限到次日」）；
+//   - onlyModel=true：账号级健康且未命中真实日限，唯一阻塞是模型级冷却。换模型
+//     仍可能可用，不算日限，全部候选如此时由 ModelBlocked 回 400/429；
+//   - 两者都为 false：当日不可用且不会在 0 点前恢复，计入日限。同时带账号级
+//     冷却的模型冷却走原有口径（max 截止仍跨 0 点则按日限）。
+func (p *Pool) dailyBlockClass(item *entry, usage map[string]DailyUsage, model, realm string, now time.Time) (serveable, onlyModel bool) {
+	if item.modelCooled(now, model) && item.healthy(now) && !p.dailyBlockedUsage(usage, item, model, realm, now) {
+		// 会在 0 点前恢复 → 不算「今天没号」：即使其他账号已触日限，也不能把
+		// 少数账号的日限放大成整池等次日；恢复时刻仍由选号/模型阻塞路径处理。
+		return resumesBeforeMidnight(item, now, model), true
+	}
+
+	if !item.healthyForModel(now, model) {
+		return resumesBeforeMidnight(item, now, model), false
+	}
+
+	if !p.dailyBlockedUsage(usage, item, model, realm, now) {
+		return true, false
+	}
+
+	return false, false
 }
 
 // DailyLimitedUIDs 返回达到日 token 或日积分上限的账号（面板徽章用）。
@@ -619,7 +638,8 @@ func dailyLimitHit(lim DailyLimits, dailyUsage DailyUsage) bool {
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
-// CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
+// 请求模型仍在该账号模型级冷却中（11136/11141/6004）的账号也排除——探测必然得到同样的失败；
+// 其余 CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
 // 被 tried 排除、在途占满的账号同样跳过（维持请求级轮换 + 租约语义）。无任何可用返回 nil。
 //
 // 积分保底同样在此生效（model 非空时）：floor 把健康号全部拦掉后 cands 为空会走到
@@ -665,7 +685,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 }
 
 // fallbackEligible 判定账号是否可参与全冷却兜底：排除 tried/跨域/禁用暂停/
-// 有效 hard 冷却（调了必 402）/积分保底拦截/在途占满。调用方需已持 p.mu。
+// 有效 hard 冷却（调了必 402）/请求模型的模型级冷却/积分保底拦截/在途占满。
+// 调用方需已持 p.mu。
 func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool, realm, model string, now time.Time) bool {
 	if tried != nil && tried[uid] {
 		return false
@@ -679,8 +700,8 @@ func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool
 		return false // 禁用/暂停选号的账号永不参与兜底
 	}
 
-	if entry2.hardCoolingActive(now) {
-		return false // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+	if p.fallbackCoolingBlocks(entry2, model, now) {
+		return false
 	}
 
 	if p.floorBlockedForRealmModel(entry2, model, realm, now) {
@@ -692,6 +713,17 @@ func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool
 	}
 
 	return p.fallbackLoadOK(entry2, now)
+}
+
+// fallbackCoolingBlocks 兜底前的冷却判定：余额耗尽号调了必 402；请求模型仍在本
+// 账号模型级冷却中（11136 权限缺失 / 11141 已下线 / 6004 限流）则探测也必然失败，
+// 两者都不参与兜底。
+func (p *Pool) fallbackCoolingBlocks(entry2 *entry, model string, now time.Time) bool {
+	if entry2.hardCoolingActive(now) {
+		return true
+	}
+
+	return model != "" && entry2.modelCooled(now, model)
 }
 
 // fallbackLoadOK 报告兜底候选是否可接收本次探针：不在单飞窗口且未占满在途。
