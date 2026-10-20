@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -304,6 +305,7 @@ func TestFlexInt64Shapes(t *testing.T) {
 		{name: "nan", raw: `"NaN"`, wantErr: true},
 		{name: "inf", raw: `"Inf"`, wantErr: true},
 		{name: "overflow", raw: `"1e19"`, wantErr: true},
+		{name: "negative-overflow", raw: `"-9223372036854775809"`, wantErr: true},
 	}
 
 	for _, testCase := range cases {
@@ -329,12 +331,16 @@ func TestFlexInt64Shapes(t *testing.T) {
 }
 
 // TestSummaryResourceFallbackOnInvalidCapacity 容量值非法时 summary 解码失败并
-// 回落旧端点，不能静默按 0 计。
+// 回落旧端点，不能静默按 0 计；解码失败是确定性错误，不能触发瞬时重试。
 func TestSummaryResourceFallbackOnInvalidCapacity(t *testing.T) {
 	t.Parallel()
 
+	var summaryCalls atomic.Int32
+
 	client := testClient(func(r *http.Request) (*http.Response, error) {
 		if strings.Contains(r.URL.Path, "get-user-resource-summary") {
+			summaryCalls.Add(1)
+
 			return jsonResp(200, `{"code":0,"data":{"Packages":[
 				{"CycleTotalCapacity":"abc","CycleRemainCapacity":"1"}
 			]}}`), nil
@@ -348,6 +354,10 @@ func TestSummaryResourceFallbackOnInvalidCapacity(t *testing.T) {
 	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil || remain != 400 || total != 500 {
 		t.Fatalf("remain=%d total=%d err=%v want fallback 400/500", remain, total, err)
+	}
+
+	if got := summaryCalls.Load(); got != 1 {
+		t.Fatalf("summary calls=%d want 1 (decode failure must not retry)", got)
 	}
 }
 

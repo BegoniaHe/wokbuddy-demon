@@ -3338,7 +3338,9 @@ func (f *flexInt64) UnmarshalJSON(raw []byte) error {
 	// 转换到 int64 属实现相关行为，必须在转换前拒绝，否则会静默变成 0 并跳过
 	// 旧端点回退，让余额误报为 0。
 	n, err := strconv.ParseFloat(text, 64)
-	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= math.MaxInt64 || n < math.MinInt64 {
+	// 边界取闭区间两侧都拒绝：float64 无法精确表示 MinInt64 附近的差值，
+	// "-9223372036854775809" 会被舍入成 MinInt64，放行后截断成合法整数。
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= math.MaxInt64 || n <= math.MinInt64 {
 		return fmt.Errorf("%w: %q", errFlexInt64Invalid, text)
 	}
 
@@ -3359,21 +3361,30 @@ type resourceSummaryResp struct {
 
 // fetchResourceSummary 查询额度汇总（官方桌面端主路径）。
 func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, error) {
-	var out resourceSummaryResp
+	var data json.RawMessage
 
 	err := c.retryBillingTransient(func() error {
-		data, err := c.billingMeterJSON(account, []string{
+		var fetchErr error
+
+		data, fetchErr = c.billingMeterJSON(account, []string{
 			"/v2/billing/meter/get-user-resource-summary",
 			"/billing/meter/get-user-resource-summary",
 		}, map[string]any{})
-		if err != nil {
-			return err
-		}
 
-		return json.Unmarshal(data, &out)
+		return fetchErr
 	})
+	if err != nil {
+		return resourceSummaryResp{}, err
+	}
 
-	return out, err
+	// 解码失败是确定性错误，不参与瞬时重试（否则每次余额刷新都要白等 2s+4s）；
+	// 与 enterpriseResource / UserResourceDetailedWithExpiry 的重试范围保持一致。
+	var out resourceSummaryResp
+	if err := json.Unmarshal(data, &out); err != nil {
+		return resourceSummaryResp{}, fmt.Errorf("resource summary parse: %w", err)
+	}
+
+	return out, nil
 }
 
 // summaryTotals 汇总 summary 包的 remain/total（负值钳 0，remain 不超过 total）。
