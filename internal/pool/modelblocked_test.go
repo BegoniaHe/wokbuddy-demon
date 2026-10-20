@@ -93,6 +93,25 @@ func TestModelBlockedAccountsNotPicked(t *testing.T) {
 	}
 }
 
+// TestModelBlockedFallbackSkipsModelCooled 全池都有 11136 负缓存时，即使某个账号
+// 同时还有账号级软冷却（until 非零、会进入全冷却兜底候选），也不得被兜底选中——
+// 否则「全池无权限」仍会逐请求打上游，违背 11136 负缓存的避让语义。
+func TestModelBlockedFallbackSkipsModelCooled(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	// 先写账号级冷却（该入口会清理模型级条目），再写 11136，构造两态共存。
+	pool.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
+	pool.BlockModelBackoff("u1", "glm-5.3", "11136 model not permitted")
+	pool.BlockModelBackoff("u2", "glm-5.3", "11136 model not permitted")
+
+	if acct := pool.PickExcludingForRealm(nil, "glm-5.3", ""); acct != nil {
+		t.Fatalf("模型级冷却中的账号不应被兜底选中，got %s", acct.UID)
+	}
+}
+
 // TestModelBlockedDisabledDoesNotCount 禁用号不参与判定：它不可用与模型无关，
 // 既不构成"还能服务"的证明，也不该被算进被挡账号数。
 func TestModelBlockedDisabledDoesNotCount(t *testing.T) {

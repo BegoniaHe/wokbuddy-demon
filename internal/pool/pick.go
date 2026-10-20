@@ -679,8 +679,8 @@ func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool
 		return false // 禁用/暂停选号的账号永不参与兜底
 	}
 
-	if entry2.hardCoolingActive(now) {
-		return false // 余额耗尽号（处于有效 hard 冷却期）不参与兜底：等签到恢复，调了必 402
+	if p.fallbackCoolingBlocks(entry2, model, now) {
+		return false
 	}
 
 	if p.floorBlockedForRealmModel(entry2, model, realm, now) {
@@ -692,6 +692,16 @@ func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool
 	}
 
 	return p.fallbackLoadOK(entry2, now)
+}
+
+// fallbackCoolingBlocks 兜底前的冷却判定：余额耗尽号调了必 402；请求模型仍在本
+// 账号模型级冷却中（11136/6004）则探测也必然失败，两者都不参与兜底。
+func (p *Pool) fallbackCoolingBlocks(entry2 *entry, model string, now time.Time) bool {
+	if entry2.hardCoolingActive(now) {
+		return true
+	}
+
+	return model != "" && entry2.modelCooled(now, model)
 }
 
 // fallbackLoadOK 报告兜底候选是否可接收本次探针：不在单飞窗口且未占满在途。
