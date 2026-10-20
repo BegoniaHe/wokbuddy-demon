@@ -889,12 +889,23 @@ func (w Window) boundsAt(now time.Time) (time.Time, time.Time) {
 // time.Date 选到的实例不早于 t（2 小时回拨）时，再按绝对回退实例去掉分秒，
 // 兼容 30 分钟偏移的夏令时（如 Australia/Lord_Howe，Add 后会落在 :30）。
 func previousHourStart(t time.Time) time.Time {
-	wantHour := (t.Hour() + 23) % 24
+	year, month, day := t.Date()
+
+	wantHour := t.Hour() - 1
+	if wantHour < 0 {
+		wantHour = 23
+		// 午夜要回退到前一日 23 点。目标日期取 t-1h 的日期而不是 t.Date()：
+		// 午夜拨回当日 00:00 不存在时（America/Santiago 2026-04-05 00:00 -03
+		// → 前一日 23:00 -04），按 t.Date() 会取到当日 23 点（未来），再落到
+		// 绝对回退的第二次 23 点，与桶键解析出的首次 occurrence 不一致，
+		// hours>=2 会漏掉整个前一日 23 点桶。
+		year, month, day = t.Add(-time.Hour).Date()
+	}
 
 	// 优先取墙钟上一小时的首个实际时刻。hourFirst 处理两种不存在的整点：
 	// 被拨快整段抹掉（ok=false，走绝对回退），以及只跳过部分分钟
 	// （Pacific/Chatham 03:00 → 03:45，返回该桶真正的起点）。
-	if prev, ok := hourFirst(t.Year(), t.Month(), t.Day(), wantHour, t.Location()); ok && prev.Before(t) {
+	if prev, ok := hourFirst(year, month, day, wantHour, t.Location()); ok && prev.Before(t) {
 		return prev
 	}
 	// 上一墙钟小时整段被抹掉，或 2 小时回拨（Antarctica/Troll：03:00+02 →

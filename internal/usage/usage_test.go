@@ -410,6 +410,37 @@ func TestWindowBoundsTwoHourFallBack(t *testing.T) {
 	}
 }
 
+// 午夜拨回（America/Santiago 2026-04-05 00:00 -03 → 前一日 23:00 -04）让前一
+// 日 23 点出现两次。滚动窗口的上一桶必须取首个 occurrence，才能与 bucketTime
+// 解析出的桶起点一致；目标日期若误取当日（未来），绝对回退会停在第二次 23 点，
+// hours=2 会把整个前一日 23 点桶排除在窗口外。
+//
+// 本用例临时替换 time.Local，不能 t.Parallel（并行用例不得与全局状态共存）。
+//
+//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
+func TestWindowBoundsMidnightFallBack(t *testing.T) {
+	loc, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	orig := time.Local
+	time.Local = loc
+
+	t.Cleanup(func() { time.Local = orig })
+
+	now := time.Date(2026, 4, 5, 0, 9, 0, 0, loc)
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 4, 4, 23, 0, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（前一日 23 点首个 occurrence）", from, want)
+	}
+
+	if !inWindow("h:2026-04-04T23", from, time.Time{}, true) {
+		t.Fatalf("hours=2 漏掉前一日 23 点桶（from=%v）", from)
+	}
+}
+
 // 30 分钟拨快的时区（Australia/Lord_Howe：02:00+10:30 → 02:30+11）里
 // time.Date(02:00) 与桶键 "T02" 都归一化成 02:30——那就是 02 点桶的起点。
 // hours=2 必须恰好含 02、03 两个桶，不能退到 01:00 把 01 点桶也带进来。
