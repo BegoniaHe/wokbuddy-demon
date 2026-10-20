@@ -885,15 +885,19 @@ func (w Window) boundsAt(now time.Time) (time.Time, time.Time) {
 //
 // 不能只做 Add(-time.Hour)：夏令时回拨的重复小时里绝对回退一小时仍落在同一个
 // 墙钟小时（02:00 CET - 1h = 02:00 CEST），起点不前进，hours>=2 会少算上一个
-// 整点桶。此时按墙钟字段回上一小时；正常路径也重新取整点起点，兼容 30 分钟
-// 偏移的夏令时（如 Australia/Lord_Howe，Add 后会落在 :30）。
+// 整点桶。此时按墙钟字段回上一小时；正常路径也去掉分秒，兼容 30 分钟偏移的
+// 夏令时（如 Australia/Lord_Howe，Add 后会落在 :30）。
 func previousHourStart(t time.Time) time.Time {
 	prev := t.Add(-time.Hour)
 	if prev.Hour() == t.Hour() {
 		return time.Date(t.Year(), t.Month(), t.Day(), t.Hour()-1, 0, 0, 0, t.Location())
 	}
-
-	return time.Date(prev.Year(), prev.Month(), prev.Day(), prev.Hour(), 0, 0, 0, t.Location())
+	// 不做 time.Date(...prev 的墙钟字段...)：在 2 小时回拨的时区（如
+	// Antarctica/Troll，03:00+02 → 01:00+00）里，重复小时的 time.Date 会选更晚
+	// 的 occurrence，得到晚于 t 的“上一小时”，窗口起点反而前进。直接按 prev 的
+	// 实际偏移去掉分秒，保留 Add(-1h) 选中的那次 occurrence。
+	return prev.Add(-(time.Duration(prev.Minute())*time.Minute +
+		time.Duration(prev.Second())*time.Second + time.Duration(prev.Nanosecond())))
 }
 
 // localHourStart 返回 now 所在本地墙钟整点。

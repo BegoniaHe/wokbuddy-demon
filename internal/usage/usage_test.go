@@ -379,6 +379,27 @@ func TestWindowBoundsFallBackSecondOccurrence(t *testing.T) {
 	}
 }
 
+// 2 小时回拨的时区（Antarctica/Troll：03:00+02 → 01:00+00）里重复小时的
+// time.Date 会选更晚的 occurrence；回退上一小时若重新按墙钟字段取整，会落到 t
+// 之后，hours>=3 反而漏掉更早的桶。必须按 prev 的实际偏移去掉分秒。
+func TestWindowBoundsTwoHourFallBack(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Antarctica/Troll")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 00:17 UTC 是第一次 02:17+02（第二次在 02:17+00）：窗口应覆盖墙钟
+	// 00/01/02 三个桶，起点是 00:00+02 = 前一日 22:00 UTC。
+	now := time.Date(2026, 10, 25, 0, 17, 0, 0, time.UTC).In(loc)
+
+	from, _ := (Window{Hours: 3, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 10, 24, 22, 0, 0, 0, time.UTC); !from.Equal(want) {
+		t.Fatalf("hours=3 from=%v want %v", from.UTC(), want)
+	}
+}
+
 // 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
 // Truncate(time.Hour) 会得到 :30，当前小时的桶被整段排除，短窗口恒为空。
 func TestWindowBoundsLocalHourOffset(t *testing.T) {
