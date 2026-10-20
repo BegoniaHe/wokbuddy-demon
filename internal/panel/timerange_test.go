@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -12,6 +13,30 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
+
+// wallHourStarts 返回 now 所在本地整点往回 count 个互不相同的墙钟小时桶起点
+// （升序）。桶 scope 按本地墙钟整点归档，用绝对 Add 取相邻小时会在夏令时切换日
+// 失真：回拨日的重复小时生成重复 scope，拨快日不存在的整点被归一成同一时刻。
+func wallHourStarts(now time.Time, count int) []time.Time {
+	base := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+
+	out := make([]time.Time, 0, count)
+	seen := make(map[int64]struct{}, count)
+
+	for k := 0; len(out) < count; k++ {
+		t := time.Date(base.Year(), base.Month(), base.Day(), base.Hour()-k, 0, 0, 0, base.Location())
+		if _, dup := seen[t.Unix()]; dup {
+			continue
+		}
+
+		seen[t.Unix()] = struct{}{}
+		out = append(out, t)
+	}
+
+	slices.Reverse(out)
+
+	return out
+}
 
 // parseTimeParam 是「今天 / 自定义」区间的唯一入口：前端默认发 unix 秒，手工
 // 调接口时可以用 RFC3339 / datetime-local；非法值与空串一律回落"不设界"，
@@ -55,16 +80,18 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 
 	rec := usage.New("")
 
-	base := time.Now().Truncate(time.Hour).Add(-5 * time.Hour)
-	for i := range 6 {
-		rec.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u1", "glm-5.2",
+	// 桶 scope 按本地墙钟整点归档，相邻桶必须按墙钟小时构造：绝对 Add 在
+	// 夏令时回拨/拨快日会生成重复或缺失的整点，显式区间取不中两个桶。
+	hours := wallHourStarts(time.Now(), 6)
+	for _, at := range hours {
+		rec.Add(at, "cn", "u1", "glm-5.2",
 			&usage.Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	}
 
 	panel := New(&Config{Version: "test", APIKey: "k", Usage: rec, Pool: pool.New("")})
 
-	from := base.Add(2 * time.Hour).Unix()
-	to := base.Add(3 * time.Hour).Unix()
+	from := hours[2].Unix()
+	to := hours[3].Unix()
 	// 同时带上 hours=720：区间参数应优先，否则会被算成 30 天全量。
 	got := usageGET(t, panel, "?hours=720&from="+strconv.FormatInt(from, 10)+"&to="+strconv.FormatInt(to, 10))
 	if reqs := usageRequests(t, got); reqs != 2 {

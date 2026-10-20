@@ -202,3 +202,41 @@ func TestDesktopReportHostDomainAndEnterprise(t *testing.T) {
 		t.Errorf("enterprise fields=%v/%v", got[0]["enterpriseId"], got[0]["enterprise"])
 	}
 }
+
+// TestReadServerRequestIDSkipsEmptyID 空 id（`"id":""`）不得卡住扫描：此前
+// searchFrom 不推进，同一位置每个 Read 都被重复命中，合法 id 永远读不到。
+func TestReadServerRequestIDSkipsEmptyID(t *testing.T) {
+	t.Parallel()
+
+	want := strings.Repeat("ab", 16)
+	sse := `data: {"id":"","object":"chat.completion.chunk"}` + "\n\n" +
+		`data: {"id":"` + want + `"}` + "\n\n"
+
+	got, err := readServerRequestID(strings.NewReader(sse))
+	if err != nil {
+		t.Fatalf("readServerRequestID: %v", err)
+	}
+
+	if got != want {
+		t.Fatalf("requestID=%q want %q", got, want)
+	}
+}
+
+// TestReadServerRequestIDSkipsInvalidID 同一批数据里先出现形状不合法的 id 时，
+// 应在本次扫描内继续推进到后续合法 id，而不是等下一次 Read。
+func TestReadServerRequestIDSkipsInvalidID(t *testing.T) {
+	t.Parallel()
+
+	want := strings.Repeat("0f", 16)
+	sse := `data: {"id":"not-a-server-id"}` + "\n\n" +
+		`data: {"id":"` + want + `"}` + "\n\n"
+
+	got, err := readServerRequestID(strings.NewReader(sse))
+	if err != nil {
+		t.Fatalf("readServerRequestID: %v", err)
+	}
+
+	if got != want {
+		t.Fatalf("requestID=%q want %q", got, want)
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -216,6 +217,32 @@ func TestSnapshotWindowFilter(t *testing.T) {
 	}
 }
 
+// wallHourStarts 返回 now 所在本地整点往回 count 个互不相同的墙钟小时桶起点
+// （升序）。桶 scope 按本地墙钟整点归档，用绝对 Add 取相邻小时会在夏令时切换日
+// 失真：回拨日的重复小时生成重复 scope（6 条记录只剩 5 个桶），拨快日不存在的
+// 整点被归一成同一时刻。这里按墙钟小时回退并按 Unix 时刻去重，保证每个返回
+// 时刻都是一个独立桶的起点。
+func wallHourStarts(now time.Time, count int) []time.Time {
+	base := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+
+	out := make([]time.Time, 0, count)
+	seen := make(map[int64]struct{}, count)
+
+	for k := 0; len(out) < count; k++ {
+		t := time.Date(base.Year(), base.Month(), base.Day(), base.Hour()-k, 0, 0, 0, base.Location())
+		if _, dup := seen[t.Unix()]; dup {
+			continue
+		}
+
+		seen[t.Unix()] = struct{}{}
+		out = append(out, t)
+	}
+
+	slices.Reverse(out)
+
+	return out
+}
+
 // 显式区间（「今天」/「自定义」）与滚动窗口走同一套全口径过滤；区间是闭区间
 // （桶起点落在 [From, To] 内即命中），且 From/To 会回显给面板确认口径。
 func TestSnapshotExplicitWindow(t *testing.T) {
@@ -223,15 +250,14 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 
 	r := New("")
 
-	base := time.Now().Truncate(time.Hour).Add(-5 * time.Hour)
-	for i := range 6 {
-		r.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u", "m",
-			&Delta{PromptTokens: 10, HasPromptTokens: true}, true)
+	hours := wallHourStarts(time.Now(), 6)
+	for _, at := range hours {
+		r.Add(at, "cn", "u", "m", &Delta{PromptTokens: 10, HasPromptTokens: true}, true)
 	}
-	// 只取中间两小时（base+2h、base+3h）。
+	// 只取中间两小时（hours[2]、hours[3]）。
 	snapshot := r.SnapshotWindow(Window{
-		From:  base.Add(2 * time.Hour),
-		To:    base.Add(3 * time.Hour),
+		From:  hours[2],
+		To:    hours[3],
 		Hours: 0,
 	}, nil, nil)
 	wantEq(t, "显式区间 requests", snapshot.Totals.Requests, int64(2))
@@ -248,7 +274,7 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 	}
 
 	// 只有 From（「今天」的形态）：从该点起到最新，全量命中。
-	only := r.SnapshotWindow(Window{From: base.Add(4 * time.Hour), Hours: 0, To: time.Time{}}, nil, nil)
+	only := r.SnapshotWindow(Window{From: hours[4], Hours: 0, To: time.Time{}}, nil, nil)
 	wantEq(t, "仅 From 的 requests", only.Totals.Requests, int64(2))
 
 	if only.WindowFrom == "" || only.WindowTo != "" {
@@ -274,10 +300,13 @@ func TestWindowBounds(t *testing.T) {
 	if !gotFrom.Equal(from) || !gotTo.IsZero() {
 		t.Fatalf("From 应优先于 Hours: from=%v to=%v", gotFrom, gotTo)
 	}
-	// 只有 Hours：起点 = 当前整点往回 Hours-1 小时。
-	f, to := Window{Hours: 24, From: time.Time{}, To: time.Time{}}.bounds()
+	// 只有 Hours：起点 = 当前整点桶往回 Hours-1 个桶。用 UTC 固定时刻注入，
+	// 避免宿主机时区（尤其 Lord Howe 这类 30 分钟 DST）影响期望值。
+	now := time.Date(2026, 10, 20, 14, 37, 0, 0, time.UTC)
 
-	want := time.Now().Truncate(time.Hour).Add(-23 * time.Hour)
+	f, to := Window{Hours: 24, From: time.Time{}, To: time.Time{}}.boundsAt(now)
+
+	want := time.Date(2026, 10, 19, 15, 0, 0, 0, time.UTC)
 	if !f.Equal(want) || !to.IsZero() {
 		t.Fatalf("24h bounds = %v/%v, want %v/零值", f, to, want)
 	}
@@ -286,11 +315,140 @@ func TestWindowBounds(t *testing.T) {
 		t.Fatalf("空窗口 bounds = %v/%v, want 零值/零值", f, to)
 	}
 	// 上限 60 天。
-	f60, _ := Window{Hours: 100000, From: time.Time{}, To: time.Time{}}.bounds()
+	f60, _ := Window{Hours: 100000, From: time.Time{}, To: time.Time{}}.boundsAt(now)
 
-	want60 := time.Now().Truncate(time.Hour).Add(-(24*60 - 1) * time.Hour)
+	want60 := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
 	if !f60.Equal(want60) {
 		t.Fatalf("超限 Hours 未被夹到 60 天: %v want %v", f60, want60)
+	}
+}
+
+// 夏令时回拨的重复小时里 time.Date 可能选到更晚的那次 occurrence，让滚动窗口
+// 起点落到 now 之后：hours=1 还能命中桶，hours>=2 会少算上一小时。
+func TestLocalHourStartAcrossFallBack(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 2026-10-25 03:00 CEST 回拨到 02:00 CET：00:17 UTC 是第一次 02:17 CEST。
+	now := time.Date(2026, 10, 25, 0, 17, 0, 0, time.UTC).In(loc)
+
+	got := localHourStart(now)
+	if got.After(now) {
+		t.Fatalf("hour start=%v 晚于 now=%v（重复小时选了更晚的 occurrence）", got, now)
+	}
+
+	if want := now.Add(-17 * time.Minute); !got.Equal(want) {
+		t.Fatalf("hour start=%v want %v", got, want)
+	}
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := now.Add(-time.Hour - 17*time.Minute); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v", from, want)
+	}
+}
+
+// 回拨日的第二次 02:xx（CET）同样要按墙钟桶回退：此刻 02 点桶的起点是第二次
+// occurrence，绝对回退一小时仍停在 02 点，hours>=2 会漏掉 01 点桶。
+func TestWindowBoundsFallBackSecondOccurrence(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 2026-10-25 03:00 CEST 回拨到 02:00 CET：01:17 UTC 是第二次 02:17 CET。
+	now := time.Date(2026, 10, 25, 1, 17, 0, 0, time.UTC).In(loc)
+
+	cases := []struct {
+		hours int
+		want  time.Time // UTC 时刻，对应墙钟 01:00 / 00:00 CEST
+	}{
+		{2, time.Date(2026, 10, 24, 23, 0, 0, 0, time.UTC)},
+		{3, time.Date(2026, 10, 24, 22, 0, 0, 0, time.UTC)},
+	}
+	for _, item := range cases {
+		from, _ := (Window{Hours: item.hours, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+		if !from.Equal(item.want) {
+			t.Errorf("hours=%d from=%v want %v", item.hours, from.UTC(), item.want)
+		}
+	}
+}
+
+// 2 小时回拨的时区（Antarctica/Troll：03:00+02 → 01:00+00）里重复小时的
+// time.Date 会选更晚的 occurrence；回退上一小时若重新按墙钟字段取整，会落到 t
+// 之后，hours>=3 反而漏掉更早的桶。必须按 prev 的实际偏移去掉分秒。
+func TestWindowBoundsTwoHourFallBack(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Antarctica/Troll")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 00:17 UTC 是第一次 02:17+02（第二次在 02:17+00）：窗口应覆盖墙钟
+	// 00/01/02 三个桶，起点是 00:00+02 = 前一日 22:00 UTC。
+	now := time.Date(2026, 10, 25, 0, 17, 0, 0, time.UTC).In(loc)
+
+	from, _ := (Window{Hours: 3, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 10, 24, 22, 0, 0, 0, time.UTC); !from.Equal(want) {
+		t.Fatalf("hours=3 from=%v want %v", from.UTC(), want)
+	}
+
+	// 02:17 UTC 是第二次 02:17+00（回拨已完成）：上一墙钟小时 01 在 time.Date
+	// 里选到更晚的 01:00+00，若据此按墙钟再取整会得到 00:00 UTC（墙钟 02 的
+	// 第一次 occurrence），漏掉 00 点桶。起点必须仍是 00:00+02 = 22:00 UTC。
+	now = time.Date(2026, 10, 25, 2, 17, 0, 0, time.UTC).In(loc)
+
+	from, _ = (Window{Hours: 3, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 10, 24, 22, 0, 0, 0, time.UTC); !from.Equal(want) {
+		t.Fatalf("hours=3（第二次 02 点）from=%v want %v", from.UTC(), want)
+	}
+}
+
+// 30 分钟拨快的时区（Australia/Lord_Howe：01:30+10:30 → 02:30+11）里
+// time.Date(02:00) 会归一化成 02:30；若把它当成上一桶起点，hours=2 只含当前
+// 小时桶，01 点桶被整段排除。
+func TestWindowBoundsPartialSpringForward(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	now := time.Date(2026, 10, 4, 3, 10, 0, 0, loc)
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 10, 4, 1, 0, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（02:00 不存在，上一桶是 01:00）", from, want)
+	}
+}
+
+// 非整小时偏移时区（如 +05:30）的滚动窗口必须按本地墙钟整点对齐：
+// Truncate(time.Hour) 会得到 :30，当前小时的桶被整段排除，短窗口恒为空。
+func TestWindowBoundsLocalHourOffset(t *testing.T) {
+	t.Parallel()
+
+	loc := time.FixedZone("UTC+5:30", 5*60*60+30*60)
+	now := time.Date(2026, 10, 20, 14, 47, 0, 0, loc)
+
+	from, _ := (Window{Hours: 1, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+
+	want := time.Date(2026, 10, 20, 14, 0, 0, 0, loc)
+	if !from.Equal(want) {
+		t.Fatalf("from=%v want %v", from, want)
+	}
+	// 不能再用 inWindow 断言「当前小时桶在窗口内」：桶 scope 由 bucketTime 按
+	// time.Local 解析，而这里注入的是 FixedZone，宿主机时区不同会得到相反结论
+	// （CI 的 UTC 通过、Asia/Shanghai 失败）。生产路径 now.Location() 恒等于
+	// time.Local，bounds 对齐本地整点即已覆盖该语义。
+	if from.Minute() != 0 || from.Second() != 0 {
+		t.Fatalf("窗口起点未对齐本地整点: %v", from)
 	}
 }
 

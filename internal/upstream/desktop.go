@@ -688,34 +688,46 @@ func readServerRequestID(body io.Reader) (string, error) {
 	return "", errSSERequestID
 }
 
-// scanBufferedRequestID 在 buf[searchFrom:] 中定位首个 `"id":"..."`：命中形状合法的 id
-// 返回 (id, true, _)；命中但 id 不合法则推进搜索偏移（next）并返回 matched=false，
-// 避免同一位置被反复命中。
+// scanBufferedRequestID 在 buf[searchFrom:] 中定位首个形状合法的 `"id":"..."`。
+// 不合法/空 id 的命中点在同一次调用内被跳过（不返回），只有找不到可继续的位置
+// （模式不存在或首个命中的闭合引号尚未到达）时才返回 matched=false 与未推进的
+// searchFrom，让调用方读取更多数据后重扫。
 //
 // 从上次搜索位置继续：SSE 里 `"id":"` 可能先出现在消息 id 等字段，若不推进偏移，
 // 首个不匹配的 id 会让循环永远重复命中同一位置，读满 1MB 后误报"未找到 requestId"。
 func scanBufferedRequestID(buf []byte, searchFrom int) (id string, matched bool, next int) {
-	i := bytes.Index(buf[searchFrom:], []byte(`"id":"`))
-	if i < 0 {
-		return "", false, searchFrom
+	// 一次调用内连续跳过形状不合法的命中点：调用方每次 Read 后只扫描一次，
+	// 若这里只跳过一个就返回，同一批数据里的后续合法 id 要等下一次 Read 才可能
+	// 被看见（数据已读完时直接漏掉）。
+	for {
+		i := bytes.Index(buf[searchFrom:], []byte(`"id":"`))
+		if i < 0 {
+			return "", false, searchFrom
+		}
+
+		abs := searchFrom + i
+		rest := buf[abs+6:]
+
+		end := bytes.IndexByte(rest, '"')
+		if end < 0 {
+			return "", false, searchFrom // 闭合引号尚未到达：等更多数据
+		}
+		// 空 id（`"id":""`）：不是候选，跳过这个命中点继续扫，否则 searchFrom
+		// 原地不动会让后续每次 Read 都重复命中同一位置，直到 1MB 上限误报未找到。
+		if end == 0 {
+			searchFrom = abs + 6
+			continue
+		}
+
+		id = string(rest[:end])
+		debugChatID(id)
+
+		if idRegex.MatchString(id) {
+			return id, true, searchFrom
+		}
+
+		searchFrom = abs + 1
 	}
-
-	abs := searchFrom + i
-	rest := buf[abs+6:]
-
-	end := bytes.IndexByte(rest, '"')
-	if end <= 0 {
-		return "", false, searchFrom
-	}
-
-	id = string(rest[:end])
-	debugChatID(id)
-
-	if idRegex.MatchString(id) {
-		return id, true, searchFrom
-	}
-
-	return "", false, abs + 1
 }
 
 // debugChatRead 调试输出单次读取的字节（仅 WB2A_DEBUG_CHAT 非空时）。

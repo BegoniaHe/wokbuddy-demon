@@ -148,6 +148,9 @@ func modelsTestHandler() *Handler {
 	return NewHandler(&Config{
 		Pool:     testPoolWith(),
 		Upstream: upstream.New(),
+		// 独立缓存：nil 会落到进程级 dynamicModelsCache，并行用例填充后
+		// /v1/models 会混入别的目录，列表断言随执行顺序漂移。
+		modelsCache: &modelsCache{},
 		ModelAliases: map[string]string{
 			"claude-sonnet-4-5": "cn:hy4",
 		},

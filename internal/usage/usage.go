@@ -843,7 +843,8 @@ type Snapshot struct {
 
 // Window 用量统计窗口。三种口径按优先级解析（见 bounds）：
 //   - From/To 任一非零 → 显式区间 [From, To]（To 零值 = 不设上界）
-//   - 否则 Hours>0     → 滚动窗口：当前整点往回 Hours-1 小时
+//   - 否则 Hours>0     → 滚动窗口：当前整点桶往回 Hours-1 个整点桶（按墙钟；
+//     夏令时回拨的重复小时只算一个桶）
 //   - 否则             → 全部历史
 //
 // 为什么显式区间用「桶起点落在 [From, To] 内」判定而不是求交集：小时桶的粒度
@@ -857,6 +858,11 @@ type Window struct {
 
 // bounds 解析出实际生效的 [from, to]；零值表示该侧不设界。
 func (w Window) bounds() (time.Time, time.Time) {
+	return w.boundsAt(time.Now())
+}
+
+// boundsAt 同 bounds，但用调用方给定的 now 计算滚动窗口起点（单测注入）。
+func (w Window) boundsAt(now time.Time) (time.Time, time.Time) {
 	if !w.From.IsZero() || !w.To.IsZero() {
 		return w.From, w.To
 	}
@@ -867,7 +873,62 @@ func (w Window) bounds() (time.Time, time.Time) {
 
 	h := min(w.Hours, 24*60)
 
-	return time.Now().Truncate(time.Hour).Add(-time.Duration(h-1) * time.Hour), time.Time{}
+	start := localHourStart(now)
+	for range h - 1 {
+		start = previousHourStart(start)
+	}
+
+	return start, time.Time{}
+}
+
+// previousHourStart 返回 t（墙钟整点）之前的上一个整点桶起点。
+//
+// 不能只做 Add(-time.Hour)：夏令时回拨的重复小时里绝对回退一小时仍落在同一个
+// 墙钟小时（02:00 CET - 1h = 02:00 CEST），起点不前进，hours>=2 会少算上一个
+// 整点桶。优先按墙钟字段取上一小时；该小时被拨快抹掉或 time.Date 选到的实例
+// 不早于 t（2 小时回拨）时，再按绝对回退实例去掉分秒，兼容 30 分钟偏移的
+// 夏令时（如 Australia/Lord_Howe，Add 后会落在 :30）。
+func previousHourStart(t time.Time) time.Time {
+	wantHour := (t.Hour() + 23) % 24
+
+	// 优先直接取墙钟上一小时：夏令时回拨的重复小时里 time.Date 会选更晚的
+	// occurrence，但它仍严格早于 t 时就是我们要的实例（如 Lord Howe 的 30 分钟
+	// 回拨，t=02:00+10:30 → 01:00+11）。
+	candidate := time.Date(t.Year(), t.Month(), t.Day(), t.Hour()-1, 0, 0, 0, t.Location())
+	if candidate.Before(t) && candidate.Hour() == wantHour &&
+		candidate.Minute() == 0 && candidate.Second() == 0 && candidate.Nanosecond() == 0 {
+		return candidate
+	}
+	// 上一墙钟小时被拨快抹掉（time.Date 归一化到跳过区间另一侧），或 2 小时回拨
+	// （Antarctica/Troll：03:00+02 → 01:00+00）里 time.Date 选到更晚的 occurrence。
+	// 以绝对回退一小时选中的实例为基准，去掉分秒、保留该实例的偏移——不能重新按
+	// 墙钟字段取整，那会再次落到更晚的 occurrence，起点反而前进。
+	//
+	// 30 分钟拨快的时区（Australia/Lord_Howe：01:30+10:30 → 02:30+11）里
+	// time.Date(02:00) 会归一化成 02:30；那是跳过区间后的首个实际时刻，但不是
+	// 桶起点，保留它会把 01 点桶排除在 hours>=2 的窗口外。
+	prev := t.Add(-time.Hour)
+
+	return prev.Add(-(time.Duration(prev.Minute())*time.Minute +
+		time.Duration(prev.Second())*time.Second + time.Duration(prev.Nanosecond())))
+}
+
+// localHourStart 返回 now 所在本地墙钟整点。
+//
+// 不能用 time.Truncate(time.Hour)：它按「自零值起的小时倍数」截断，而零值是
+// UTC 基准——非整小时偏移的时区（如 +05:30）会得到 :30 的“整点”。滚动窗口
+// 起点随之后移半小时，当前小时的桶（:00）被整段排除在窗口外，面板「最近 1 小时」
+// 等短窗口会直接显示为空。
+func localHourStart(now time.Time) time.Time {
+	t := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location())
+	if !t.After(now) {
+		return t
+	}
+	// 夏令时回拨的重复小时里 time.Date 可能选到更晚的那次 occurrence，得到晚于
+	// now 的「起点」——滚动窗口落到未来，hours=1 尚能命中桶，hours>=2 会少算上一
+	// 小时。此时按 now 的实际偏移回退到当前小时的起点。
+	return now.Add(-(time.Duration(now.Minute())*time.Minute +
+		time.Duration(now.Second())*time.Second + time.Duration(now.Nanosecond()))).Round(0)
 }
 
 // bucketTime 把桶 scope 解析成本地时间；脏 scope 返回 false（不进任何口径）。
