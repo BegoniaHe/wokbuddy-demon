@@ -223,7 +223,9 @@ func TestSnapshotExplicitWindow(t *testing.T) {
 
 	r := New("")
 
-	base := time.Now().Truncate(time.Hour).Add(-5 * time.Hour)
+	// 桶 scope 按本地墙钟整点归档，base 也必须对齐本地整点：Truncate(time.Hour)
+	// 在 +05:30 等非整小时偏移时区得到 :30，桶会被归到下一个整点，窗口取不中。
+	base := localHourStart(time.Now()).Add(-5 * time.Hour)
 	for i := range 6 {
 		r.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u", "m",
 			&Delta{PromptTokens: 10, HasPromptTokens: true}, true)
@@ -308,9 +310,12 @@ func TestWindowBoundsLocalHourOffset(t *testing.T) {
 	if !from.Equal(want) {
 		t.Fatalf("from=%v want %v", from, want)
 	}
-
-	if !inWindow("h:"+now.Format(hourLayout), from, time.Time{}, true) {
-		t.Fatal("当前小时的桶应落在最近 1 小时窗口内")
+	// 不能再用 inWindow 断言「当前小时桶在窗口内」：桶 scope 由 bucketTime 按
+	// time.Local 解析，而这里注入的是 FixedZone，宿主机时区不同会得到相反结论
+	// （CI 的 UTC 通过、Asia/Shanghai 失败）。生产路径 now.Location() 恒等于
+	// time.Local，bounds 对齐本地整点即已覆盖该语义。
+	if from.Minute() != 0 || from.Second() != 0 {
+		t.Fatalf("窗口起点未对齐本地整点: %v", from)
 	}
 }
 

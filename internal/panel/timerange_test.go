@@ -55,7 +55,11 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 
 	rec := usage.New("")
 
-	base := time.Now().Truncate(time.Hour).Add(-5 * time.Hour)
+	// 桶 scope 按本地墙钟整点归档，base 也必须对齐本地整点：Truncate(time.Hour)
+	// 在 +05:30 等非整小时偏移时区得到 :30，桶会被归到下一个整点，窗口取不中。
+	now := time.Now()
+
+	base := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), 0, 0, 0, now.Location()).Add(-5 * time.Hour)
 	for i := range 6 {
 		rec.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u1", "glm-5.2",
 			&usage.Delta{PromptTokens: 10, HasPromptTokens: true}, true)
