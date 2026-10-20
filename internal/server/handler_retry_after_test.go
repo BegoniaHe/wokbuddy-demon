@@ -146,3 +146,26 @@ func TestModelBlockOverrideRateLimited(t *testing.T) {
 		t.Fatalf("Retry-After=%d want ~45", got)
 	}
 }
+
+// TestModelBlockRateLimitedScopedToRealm 混合池里 cn 账号全被 6004 挡住、
+// global 账号健康：bare 模型走 cn 出口，必须回 429 而不是 503 no_healthy_account。
+func TestModelBlockRateLimitedScopedToRealm(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	p := testPoolWith(
+		&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai", AccessToken: "atg", ExpiresAt: 9999999999},
+	)
+	p.CooldownSoftForModel("cn1", time.Minute, time.Now().Add(time.Hour), "glm-5.2", "6004 model rate limit")
+	h := NewHandler(&Config{Pool: p, Upstream: client})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "rate_limit_exceeded") {
+		t.Fatalf("code=%d body=%s want 429 rate_limit_exceeded", rec.Code, rec.Body)
+	}
+
+	if got := rec.Header().Get("Retry-After"); got == "" {
+		t.Error("模型级 429 应带 Retry-After: header 缺失")
+	}
+}

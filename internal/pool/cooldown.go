@@ -425,13 +425,24 @@ func modelBlockScope(total, withReset, distinctResets int, shared time.Time) (st
 // （lastErr 非空），一旦负缓存写入，后续请求 lastErr 为空，就只剩"池子没号"
 // （issue #102 附带发现 1）。上游原文与解封时间在那里被丢掉。
 //
-// 跨 realm 判定：调用方失败前已依次尝试过各域，所以只要有**任意**账号还能服务该
-// 模型，就不能算全池阻塞 —— 此时返回 Blocked=false，让上层继续用原有的
-// no_healthy_account 文案（选号失败另有原因：在途占满/积分保底/账号级冷却）。
-//
 // 口径必须与选号一致：用 modelCooled 而非直接查 map，这样 AuditOnly 条目
-// （只审计不拦截）不会被误报成阻塞。
+// （只审计不拦截）不会被误报成阻塞；选号按 realm 分流时也要按 realm 统计
+// （见 ModelBlockedForRealm），不能用异域健康号否定本域的阻塞结论。
 func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
+	return p.ModelBlockedForRealm(model, "")
+}
+
+// modelBlockIgnores 报告账号是否不参与全池模型阻塞统计：禁用/暂停号不可选，
+// 异域账号（realm 非空且不匹配）与本次选号无关。
+func modelBlockIgnores(entry2 *entry, realm string) bool {
+	return entry2.disabled || entry2.paused || (realm != "" && entry2.a.Realm() != realm)
+}
+
+// ModelBlockedForRealm 同 ModelBlocked，但只统计 Realm()==realm 的账号
+// （realm 空 = 不过滤）。选号只在本域内挑号，阻塞判定必须同口径：否则混合池里
+// 「本域账号全被模型级冷却挡住、异域还有健康号」会返回 Blocked=false，把
+// 11136/11141 的 400 与 6004 的 429 + Retry-After 退化成 503 no_healthy_account。
+func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 	if model == "" {
 		return ModelBlockStatus{}
 	}
@@ -454,8 +465,8 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	for _, item := range p.byUID {
 		// 暂停选号（paused）号与禁用号同口径跳过：它此刻不可选，「能服务」的
 		// 证明不成立——否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」。
-		if item.disabled || item.paused {
-			continue // 禁用/暂停号不参与：它们的不可用与模型无关
+		if modelBlockIgnores(item, realm) {
+			continue
 		}
 
 		if !item.modelCooled(now, model) {

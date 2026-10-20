@@ -407,3 +407,27 @@ func TestModelBlockedScope(t *testing.T) {
 		})
 	}
 }
+
+// TestModelBlockedRealmScoped 模型阻塞判定必须与选号同口径按 realm 统计：
+// 本域账号全被 6004 挡住时，异域健康号不能让本域请求退化成「池子没号」。
+func TestModelBlockedRealmScoped(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "cn1", Domain: "www.codebuddy.cn"})
+	pool.Add(&auth.Auth{UID: "g1", Domain: "www.workbuddy.ai"})
+	pool.CooldownSoftForModel("cn1", time.Minute, time.Now().Add(time.Hour), "glm-5.3", "6004 model rate limit")
+
+	if st := pool.ModelBlocked("glm-5.3"); st.Blocked {
+		t.Fatalf("不过滤 realm 时异域健康号参与判定，不应报告全池阻塞，got %+v", st)
+	}
+
+	st := pool.ModelBlockedForRealm("glm-5.3", "cn")
+	if !st.Blocked || !st.RateLimited || st.Count != 1 {
+		t.Fatalf("cn 域全被 6004 挡住应报阻塞+限流，got %+v", st)
+	}
+
+	if st := pool.ModelBlockedForRealm("glm-5.3", "global"); st.Blocked {
+		t.Fatalf("global 域账号健康，不应报阻塞，got %+v", st)
+	}
+}
