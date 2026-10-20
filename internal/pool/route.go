@@ -1,8 +1,12 @@
 // route.go (realm, model) 路由级熔断（issue #149）。
 //
 // 账号级 modelCooldowns 只能表达「某账号在某模型不可用」；当全池对同一模型统一
-// 返 11136/6004 时，网关仍会逐号重试到 rotate_max 才放弃。这里补一层全池级别的
-// 组合短路：滑动窗口内失败达阈值 → 整条 (realm, model) 冷却一段时间。
+// 返 11141（模型已下线）/ 6004（模型级限流）时，网关仍会逐号重试到 rotate_max
+// 才放弃。这里补一层全池级别的组合短路：滑动窗口内失败达阈值 → 整条
+// (realm, model) 冷却一段时间。
+//
+// 11136（账号无该模型权限）不进本层：权限是账号维度，换号仍可能成功；把少数
+// 无权限账号的连续失败升级成整条路由冷却会饿死仍有权限的账号。
 package pool
 
 import (
@@ -28,7 +32,7 @@ type routeState struct {
 // routeKey 组合键：realm 为空表示「未指定域」，与选号时的 realm 参数同口径。
 func routeKey(realm, model string) string { return realm + "\x1f" + model }
 
-// NoteRouteFailure 记录一次模型级路由失败（11136 / 6004）。达阈值后整条路由冷却。
+// NoteRouteFailure 记录一次平台级模型路由失败（11141 / 6004）。达阈值后整条路由冷却。
 // model 为空时忽略（无模型维度无法定位路由）。
 func (p *Pool) NoteRouteFailure(realm, model string) {
 	if p == nil || model == "" {

@@ -2929,7 +2929,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11136 负缓存避让。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11136 负缓存避让；
+//     权限是账号维度，不写路由熔断（其他账号可能仍有权限）。
 //   - ErrModelNotFound → 11102 上游目录无此模型：请求级 fail-fast（404），
 //     不罚账号、不轮转、不写 (账号,模型) 负缓存与路由熔断。
 //   - ErrModelAccess → BlockModelBackoff + NoteRouteFailure：11141 模型级
@@ -2956,8 +2957,9 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 		// 11136「该账号无该模型权限」：(账号, 模型) 负缓存避让。复用 modelCooldowns
 		// 机制（与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
+		// 权限是账号维度：其他账号可能仍有权限，不能写 (realm, model) 路由熔断——
+		// 否则少数无权限账号连续失败会冷却整条路由，把本可服务的账号一并挡在门外。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
-		h.cfg.Pool.NoteRouteFailure(realm, model)
 	case upstream.ErrModelAccess:
 		// 11141 模型已下线：请求级 fail-fast（不罚账号、不轮转），
 		// 同时写 (账号,模型) 负缓存，后续请求不再命中同一组合。与 11136 同机制但
