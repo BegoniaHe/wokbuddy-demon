@@ -1039,3 +1039,31 @@ func TestNextFireAcrossDST(t *testing.T) {
 		t.Errorf("拨快日 next=%v want 2026-03-29 09:00", next)
 	}
 }
+
+// TestNextFireSkippedMidnight 午夜拨快的时区（America/Santiago 2026-09-06
+// 00:00 → 01:00）里次日 00:00 不存在，time.Date 会把它归一化到前一日 23:00：
+// 未过 23:00 时在错误小时触发，已过 23:00 时是过去时刻——waitSlot 立即到点、
+// 任务被反复补跑。应取被抹掉小时之后的第一个实际实例。
+func TestNextFireSkippedMidnight(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	for _, now := range []time.Time{
+		time.Date(2026, 9, 5, 22, 0, 0, 0, loc),  // 归一化结果 23:00 在未来但小时错误
+		time.Date(2026, 9, 5, 23, 30, 0, 0, loc), // 归一化结果 23:00 已是过去时刻
+	} {
+		next := nextFire(now, []int{0})
+		if !next.After(now) {
+			t.Fatalf("now=%v next=%v 未晚于 now（过去时刻会让调度器空转）", now, next)
+		}
+
+		want := time.Date(2026, 9, 6, 1, 0, 0, 0, loc)
+		if !next.Equal(want) {
+			t.Fatalf("now=%v next=%v want %v（00:00 被拨快抹掉，取 01:00）", now, next, want)
+		}
+	}
+}

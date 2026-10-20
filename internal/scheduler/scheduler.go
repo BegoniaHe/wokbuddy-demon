@@ -261,13 +261,16 @@ func nextFire(now time.Time, hours []int) time.Time {
 	var earliest time.Time
 
 	for _, hour := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), hour, 0, 0, 0, now.Location())
+		t := slotOn(now, hour)
 		if !t.After(now) {
-			// 用 time.Date 重算次日同一墙钟小时，而不是 Add(24h)：夏令时切换日
-			// 24h 不等于一个日历日，Add 会把 09:00 推到 08:00（回拨日）或
+			// 按墙钟日重算次日同一小时，而不是 Add(24h)：夏令时切换日 24h
+			// 不等于一个日历日，Add 会把 09:00 推到 08:00（回拨日）或
 			// 10:00（拨快日），导致任务在错误的小时触发。
-			// time.Date 对日溢出自动进位（月末→下月 1 号、年末→下年 1 号）。
-			t = time.Date(now.Year(), now.Month(), now.Day()+1, hour, 0, 0, 0, now.Location())
+			// 次日日期用中午锚点推进：now 自身可能落在被拨快抹掉的墙钟时刻里，
+			// AddDate 会被 time.Date 归一化回前一日（America/Santiago 的
+			// 00:xx）。time.Date 对日溢出自动进位（月末→下月 1 号）。
+			y, m, d := now.Date()
+			t = slotOn(time.Date(y, m, d+1, 12, 0, 0, 0, now.Location()), hour)
 		}
 
 		if earliest.IsZero() || t.Before(earliest) {
@@ -276,6 +279,51 @@ func nextFire(now time.Time, hours []int) time.Time {
 	}
 
 	return earliest
+}
+
+// slotOn 返回 day 当天墙钟 hour:00 的实际时刻；该墙钟时刻被夏令时拨快抹掉时，
+// 取跳过后的第一个整点。
+//
+// time.Date 对不存在的墙钟时刻归一化方向不固定：Berlin 的 02:00 → 03:00（同日），
+// 而午夜拨快的时区（America/Santiago、America/Havana 的 00:00 → 01:00）会把
+// 次日 00:00 归一化到前一日 23:00——既可能早于 now（调度器立即重排、空转），
+// 也可能在错误的小时触发。这里逐分钟推进到目标日第一个不早于目标小时的时刻；
+// tzdata 的切换点都在整分，步进不引入误差。上限覆盖整日被跳过的极端情况。
+func slotOn(day time.Time, hour int) time.Time {
+	loc := day.Location()
+	year, month, dayOfMonth := day.Date()
+
+	t := time.Date(year, month, dayOfMonth, hour, 0, 0, 0, loc)
+	// 被抹掉的小时可能归一化到跳过区间任一侧，甚至跳过目标日剩余时间
+	// （Godthab 的 23:00 → 次日 00:00）；越过目标墙钟时刻即取跳过后的
+	// 第一个实例。
+	for range 26 * 60 {
+		if !wallBefore(t, year, month, dayOfMonth, hour) {
+			break
+		}
+
+		t = t.Add(time.Minute)
+	}
+
+	return t
+}
+
+// wallBefore 报告 t 的本地墙钟时刻是否早于 (year, month, day, hour):00。
+func wallBefore(t time.Time, year int, month time.Month, day, hour int) bool {
+	tYear, tMonth, tDay := t.Date()
+	if tYear != year {
+		return tYear < year
+	}
+
+	if tMonth != month {
+		return tMonth < month
+	}
+
+	if tDay != day {
+		return tDay < day
+	}
+
+	return t.Hour() < hour
 }
 
 // taskKind 调度任务类型。
