@@ -67,6 +67,10 @@ func (s *Store) load() {
 
 		s.events[eventKey(&e)] = e
 	}
+
+	// 加载后立即按保留期/条数上限裁剪：文件里的旧事件不应在重启后短暂参与
+	// 预算聚合，等下一次 Add 才被清掉。
+	s.pruneLocked(time.Now())
 }
 
 // Add 记录一条撞线事件；同「账号+模型+重置时刻」重复事件被忽略。

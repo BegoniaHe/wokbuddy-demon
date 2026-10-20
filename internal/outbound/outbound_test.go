@@ -440,6 +440,40 @@ func TestHandshakeCtxCancel(t *testing.T) {
 	}
 }
 
+// TestPoolCtxCancelDoesNotCoolDownProxy 调用方取消（客户端断开/请求超时）不是
+// 代理不健康的证据：不得给代理记失败冷却，否则一次用户中断会让代理被误封。
+func TestPoolCtxCancelDoesNotCoolDownProxy(t *testing.T) {
+	t.Parallel()
+
+	ln := hangProxy(t)
+	defer ln.Close()
+
+	pool, err := New([]string{"http://" + ln.Addr().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	if _, err := pool.DialContext(ctx, "tcp", "127.0.0.1:9"); !errors.Is(err, ErrProxyDial) {
+		t.Fatalf("err=%v want ErrProxyDial", err)
+	}
+
+	pool.mu.Lock()
+	failures := pool.states[0].failures
+	cooldown := pool.states[0].cooldownTill
+	pool.mu.Unlock()
+
+	if failures != 0 || !cooldown.IsZero() {
+		t.Fatalf("ctx cancel must not punish proxy: failures=%d cooldown=%v", failures, cooldown)
+	}
+}
+
 // TestHandshakeSuccessClearsDeadline 握手成功后一次性 deadline 必须被清除：
 // 隧道连接上的长读（聊天 SSE）不受 handshakeTimeout 误杀（issue #106 验收）。
 // 行为断言：等到超过 handshakeTimeout 后再走隧道——若 deadline 未清，读会立即

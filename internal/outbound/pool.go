@@ -78,7 +78,7 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 	now := pool.now()
 	pool.mu.Unlock()
 
-	var lastErr error
+	lastErr := errNoProxyAvailable
 
 	attempted := false
 
@@ -91,37 +91,49 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 
 		attempted = true
 
-		conn, err := proxyState3.proxy.dial(ctx, network, addr)
+		conn, err := pool.dialProxy(ctx, proxyState3, now, network, addr)
 		if err == nil {
-			pool.recordSuccess(proxyState3)
 			return conn, nil
 		}
 
 		lastErr = err
 
-		pool.recordFailure(proxyState3, now)
+		if ctx.Err() != nil {
+			break // 调用方已取消：不再轮换其余代理
+		}
 	}
 
 	if !attempted {
 		// 全部冷却：半开探测冷却最早者，避免整段冷却期完全不可用。
-		proxyState2 := pool.earliest()
-
-		conn, err := proxyState2.proxy.dial(ctx, network, addr)
+		conn, err := pool.dialProxy(ctx, pool.earliest(), now, network, addr)
 		if err == nil {
-			pool.recordSuccess(proxyState2)
 			return conn, nil
 		}
 
 		lastErr = err
-
-		pool.recordFailure(proxyState2, now)
-	}
-
-	if lastErr == nil {
-		lastErr = errNoProxyAvailable
 	}
 
 	return nil, fmt.Errorf("%w: %w", ErrProxyDial, lastErr)
+}
+
+// dialProxy 对单个代理拨号并据此更新健康状态。
+//
+// 调用方取消/超时导致的失败不算代理不健康：客户端断开或请求超时会让握手读
+// 被 watcher 打断，错误形态是“连接已关闭”而非 context.Canceled，故以
+// ctx.Err() 判定，不记失败冷却。
+func (pool *Pool) dialProxy(ctx context.Context, proxyState2 *proxyState, now time.Time, network, addr string) (net.Conn, error) {
+	conn, err := proxyState2.proxy.dial(ctx, network, addr)
+	if err != nil {
+		if ctx.Err() == nil {
+			pool.recordFailure(proxyState2, now)
+		}
+
+		return nil, err
+	}
+
+	pool.recordSuccess(proxyState2)
+
+	return conn, nil
 }
 
 // inCooldown 报告代理是否处于有效冷却期。内部加锁，可在未持 pool.mu 时调用
