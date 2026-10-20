@@ -2910,7 +2910,7 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 // 此处不再按原始 status 二次判断。仅在 chatCompletions 轮转循环内调用：内容拦截
 // 会立即 400 返回，其余种类 continue 换号（continue 前由 rotateBackoff 退避）。
 //
-// 十条路径，各司其职：
+// 以下分类各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
 //     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
@@ -2919,6 +2919,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
 //     基数经 jitterDur 抖动（防多账号同相位冷却到期再聚团）。
+//   - ErrAccountFault → 11140「request illegal」→ Disable（上游风控，需人工重登）；
+//     14017 等未激活/授权故障 → Cooldown(CoolSoft) 有界退避。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
