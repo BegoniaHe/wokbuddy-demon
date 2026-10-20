@@ -12,6 +12,7 @@ package upstream
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -62,6 +63,8 @@ var gatewayHintByKind = map[ErrKind]string{
 	ErrHardCredit:  "account credits exhausted at upstream; waiting for daily check-in to restore",
 	ErrModelBlocked: "upstream has no such model on this backend; " +
 		"switch model or retry on another account",
+	ErrModelAccess: "this account cannot use the requested model; " +
+		"switch model or try another account",
 	// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 	// （handler_test 的泄漏守卫），hint 遵守同一口径。
 	ErrContentBlocked: "request content was rejected by content policy; adjust the prompt and retry",
@@ -97,23 +100,74 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 }
 
 // FrameKind 从 SSE error 帧 payload 判定 ErrKind：6004 模型级限流的流式形态
-// （IsModelRateLimit 对帧 JSON 直接命中）优先；其余取帧内 error.message 走
-// Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
+// （IsModelRateLimit 对帧 JSON 直接命中）优先；其余先取帧内业务码
+// （error.code / error.data.code / data.code，字符串或数字），取不到再回落
+// error.message 走 Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
 func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
 	}
 
-	var item struct {
+	var frame struct {
+		Data struct {
+			Code json.RawMessage `json:"code"`
+		} `json:"data"`
 		Error struct {
-			Message string `json:"message"`
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
+			Data    struct {
+				Code json.RawMessage `json:"code"`
+			} `json:"data"`
 		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(payload), &item) != nil || item.Error.Message == "" {
+	if json.Unmarshal([]byte(payload), &frame) != nil {
 		return ErrNone
 	}
 
-	return Classify(http.StatusBadRequest, item.Error.Message)
+	message := strings.TrimSpace(frame.Error.Message)
+	if code := firstJSONCode(frame.Error.Code, frame.Error.Data.Code, frame.Data.Code); code != "" {
+		// 合成信封保留 code 与 message：已知码按码分类，未知码仍可由文案兜底。
+		probe, err := json.Marshal(struct {
+			Code string `json:"code"`
+			Msg  string `json:"msg"`
+		}{Code: code, Msg: message})
+		if err == nil {
+			if kind := Classify(http.StatusBadRequest, string(probe)); kind != ErrNone && kind != ErrClient {
+				return kind
+			}
+		}
+	}
+
+	if message == "" {
+		return ErrNone
+	}
+
+	return Classify(http.StatusBadRequest, message)
+}
+
+// firstJSONCode 返回首个非空的 JSON code 值（字符串或数字），空/非法返回空串。
+func firstJSONCode(raws ...json.RawMessage) string {
+	for _, raw := range raws {
+		if len(raw) == 0 {
+			continue
+		}
+
+		var value any
+		if json.Unmarshal(raw, &value) != nil {
+			continue
+		}
+
+		switch code := value.(type) {
+		case string:
+			if code = strings.TrimSpace(code); code != "" {
+				return code
+			}
+		case float64:
+			return strconv.FormatFloat(code, 'f', -1, 64)
+		}
+	}
+
+	return ""
 }
 
 // isModelParamInvalid 上游 11133 body 判定（code 11133 / extError.code=

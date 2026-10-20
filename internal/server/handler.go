@@ -2041,7 +2041,8 @@ func (f *chatFlow) rotateAllowedForStatus(status int) bool {
 // failFastKind 报告 kind 是否属于「换号必然同样失败」的请求级错误。
 func failFastKind(kind upstream.ErrKind) bool {
 	return kind == upstream.ErrContentBlocked || kind == upstream.ErrPromptTooLong ||
-		kind == upstream.ErrImageInvalid || kind == upstream.ErrBadParams
+		kind == upstream.ErrImageInvalid || kind == upstream.ErrBadParams ||
+		kind == upstream.ErrModelAccess
 }
 
 // handleQueueError 处置官方客户端的队列/并发业务码：
@@ -2118,6 +2119,8 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 		return "image_invalid", "image request was rejected by upstream"
 	case upstream.ErrBadParams:
 		return "bad_params", "chat request body was rejected by upstream"
+	case upstream.ErrModelAccess:
+		return "model_unavailable", "model is unavailable for this account"
 	default:
 		return "invalid_request", ""
 	}
@@ -2722,10 +2725,10 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 			code = "waf_ip_blocked"
 			msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 		}
-	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」：上游原文已经写清原因，但 code 此前停在默认的
-		// no_healthy_account（"服务端过载"语义，客户端会不断重试）。用 400 + 明确 code
-		// 把不可重试的性质讲清楚——真正该做的是换个模型。
+	case upstream.ErrModelBlocked, upstream.ErrModelAccess:
+		// 11102/11136 模型在该账号不可用、11141 平台下线：上游原文已经写清原因，
+		// 但 code 此前停在默认的 no_healthy_account（"服务端过载"语义，客户端会不断
+		// 重试）。用 400 + 明确 code 把不可重试的性质讲清楚——真正该做的是换个模型。
 		code = "model_unavailable"
 		status = http.StatusBadRequest
 	default:
@@ -2917,7 +2920,9 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102/11136 负缓存避让。
+//   - ErrModelAccess → BlockModelBackoff + NoteRouteFailure：11141 模型级
+//     避让；请求级 fail-fast 已在 handleRequestLevelError 提前返回，不罚账号。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
@@ -2942,14 +2947,20 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 		h.cfg.Pool.NoteRouteFailure(realm, model)
+	case upstream.ErrModelAccess:
+		// 11141 模型已下线：请求级 fail-fast（不罚账号、不轮转），
+		// 同时写 (账号,模型) 负缓存，后续请求不再命中同一组合。与 11102 同机制但
+		// 独立 reason，避免把两种语义混进同一条台账。
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelAccessReason)
+		h.cfg.Pool.NoteRouteFailure(realm, model)
 	case upstream.ErrClient:
 		// 未知 4xx 喂连败计数（issue #114）：连续 N 次该形态失败 → 账号临时出池
 		// （NoteFailures 达阈降权），单次/偶发不罚（不误伤）。
 		h.cfg.Pool.NoteFailures(uid)
 	default:
 		// ErrNone 与请求/内容类错误（ErrContentBlocked/ErrPromptTooLong/
-		// ErrImageInvalid/ErrBadParams）：内容问题非账号问题，零动作不罚账号
-		// （无冷却/熔断/NoteError）。ErrNone 属防御路径，语义不明不喂。
+		// ErrImageInvalid/ErrBadParams/ErrModelAccess）：请求或内容问题非账号问题，
+		// 零动作不罚账号（无冷却/熔断/NoteError）。ErrNone 属防御路径，语义不明不喂。
 	}
 }
 

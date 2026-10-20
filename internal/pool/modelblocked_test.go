@@ -180,6 +180,42 @@ func TestModelBlockedThenClear(t *testing.T) {
 	}
 }
 
+// TestModelAccessBlockedThenClear 11141 的模型避让条目也应在成功后清除，
+// 与 11102 同通道但独立 reason；6004 限流台账不得被顺手清掉。
+func TestModelAccessBlockedThenClear(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+
+	pool.BlockModelBackoff("u1", "glm-5.3", "11141 model retired")
+
+	if st := pool.ModelBlocked("glm-5.3"); !st.Blocked {
+		t.Fatalf("写入 11141 避让后应阻塞：%+v", st)
+	}
+
+	pool.BlockModelClear("u1", "glm-5.3")
+
+	if st := pool.ModelBlocked("glm-5.3"); st.Blocked {
+		t.Fatalf("清除后不应再阻塞：%+v", st)
+	}
+}
+
+// TestModelRateLimitNotCleared 6004 限流台账不受 BlockModelClear 影响。
+func TestModelRateLimitNotCleared(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+
+	pool.CooldownSoftForModel("u1", time.Minute, time.Now().Add(time.Hour), "glm-5.3", "6004 model rate limit")
+	pool.BlockModelClear("u1", "glm-5.3")
+
+	if st := pool.ModelBlocked("glm-5.3"); !st.Blocked {
+		t.Fatalf("6004 模型限流不应被成功清除：%+v", st)
+	}
+}
+
 // TestModelBlockedPausedDoesNotMaskBlock 暂停号不构成「能服务」的证明：
 // 除暂停号外全部模型冷却时仍应判定阻塞（合并 #113 时补的口径——
 // 否则一个暂停的健康号会掩盖「其余号全被模型级冷却挡住」）。

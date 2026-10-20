@@ -5,18 +5,12 @@ package upstream
 
 import (
 	"errors"
-	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
 // trialPath global trial 加油包端点（Maquer/workbuddy-checkin 实测）。
 const trialPath = "/billing/ide/trial"
-
-// trialAlreadyMarkers 幂等码 14051「已领取过」的两种指纹：
-// - "code=14051"：doJSON 对 HTTP 200 + 业务 code 非 0 时拼出的 Msg 格式；
-// - `"code":14051`：HTTP ≥400 时 doJSON 把原始 JSON body 直接塞进 Msg。
-var trialAlreadyMarkers = []string{"code=14051", `"code":14051`}
 
 var errClaimTrialOnlyGlobalAccounts = errors.New("claim trial: only global accounts")
 
@@ -31,7 +25,7 @@ func (c *Client) ClaimTrial(a *auth.Auth) (claimed bool, err error) {
 	_, err = c.billingJSON(a, trialPath, nil)
 	if err != nil {
 		var ue *Error
-		if errors.As(err, &ue) && trialAlreadyErr(ue.Msg) {
+		if errors.As(err, &ue) && trialAlreadyErr(ue) {
 			return false, nil // 已领过：幂等成功，非错误
 		}
 
@@ -41,13 +35,8 @@ func (c *Client) ClaimTrial(a *auth.Auth) (claimed bool, err error) {
 	return true, nil
 }
 
-// trialAlreadyErr 判定错误 Msg 是否携带幂等码 14051（已领取过）。
-func trialAlreadyErr(msg string) bool {
-	for _, m := range trialAlreadyMarkers {
-		if strings.Contains(msg, m) {
-			return true
-		}
-	}
-
-	return false
+// trialAlreadyErr 判定错误是否携带幂等码 14051（已领取过）。优先看结构化 Code
+// （Msg 会被截断到 200 字符），再回落原始信封文本。
+func trialAlreadyErr(ue *Error) bool {
+	return ue.Code == "14051" || hasBusinessCode(ue.Msg, "14051")
 }

@@ -220,9 +220,9 @@ func TestCheckinBusinessCodes(t *testing.T) {
 		msg  string
 		want CheckinResult
 	}{
-		{"code=1001 msg=already", CheckinAlready},
-		{"code=1002 msg=not eligible", CheckinInactive},
-		{"code=1003 msg=event ended", CheckinInactive},
+		{`{"code":1001,"msg":"already"}`, CheckinAlready},
+		{`{"code":1002,"msg":"not eligible"}`, CheckinInactive},
+		{`{"code":1003,"msg":"event ended"}`, CheckinInactive},
 	}
 
 	for _, testCase := range cases {
@@ -440,6 +440,39 @@ func TestResourcePackageDayWindowUsesCST(t *testing.T) {
 	if !strings.Contains(string(freeBody), `"SlicePeriodStartTime":"2026-10-20 00:00:00"`) ||
 		!strings.Contains(string(freeBody), `"SlicePeriodEndTime":"2026-10-20 23:59:59"`) {
 		t.Errorf("free package window=%s want CST 2026-10-20", freeBody)
+	}
+}
+
+// TestResourcePackageExpirySendsPackageCodes 上游要求显式 PackageCodes；
+// paid/free 两个端点必须各带自己的码表，且不能混用。
+func TestResourcePackageExpirySendsPackageCodes(t *testing.T) {
+	t.Parallel()
+
+	bodies := make(map[string]string)
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(r.Body)
+		for _, key := range []string{"paid", "free"} {
+			if strings.HasSuffix(r.URL.Path, "/get-user-resource-"+key+"-packages") {
+				bodies[key] = string(body)
+			}
+		}
+
+		return jsonResp(200, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`), nil
+	})
+
+	if _, _, _ = client.resourcePackageExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, time.Now(), 0); len(bodies) != 2 {
+		t.Fatalf("captured bodies=%v want paid and free", bodies)
+	}
+
+	if !strings.Contains(bodies["paid"], paidResourcePackageCodes[0]) ||
+		strings.Contains(bodies["paid"], freeResourcePackageCodes[0]) {
+		t.Errorf("paid body=%s want paid codes only", bodies["paid"])
+	}
+
+	if !strings.Contains(bodies["free"], freeResourcePackageCodes[0]) ||
+		strings.Contains(bodies["free"], paidResourcePackageCodes[0]) {
+		t.Errorf("free body=%s want free codes only", bodies["free"])
 	}
 }
 
@@ -662,11 +695,11 @@ func TestRefresh403WAFNotSessionDead(t *testing.T) {
 func TestCheckinBusinessCodeExactMatch(t *testing.T) {
 	t.Parallel()
 
-	if got := ClassifyCheckin(&Error{Status: 200, Msg: "code=10012 msg=unknown"}); got != CheckinFailed {
+	if got := ClassifyCheckin(&Error{Status: 200, Msg: `{"code":10012,"msg":"unknown"}`}); got != CheckinFailed {
 		t.Errorf("ClassifyCheckin(code=10012)=%v want CheckinFailed", got)
 	}
 
-	if got := ClassifyCheckin(&Error{Status: 200, Msg: "code=1001 msg=already"}); got != CheckinAlready {
+	if got := ClassifyCheckin(&Error{Status: 200, Msg: `{"code":1001,"msg":"already"}`}); got != CheckinAlready {
 		t.Errorf("ClassifyCheckin(code=1001)=%v want CheckinAlready", got)
 	}
 }
