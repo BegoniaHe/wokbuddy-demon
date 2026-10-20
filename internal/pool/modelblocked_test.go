@@ -76,6 +76,23 @@ func TestModelBlockedOneAccountStillServes(t *testing.T) {
 	}
 }
 
+// TestModelBlockedAccountsNotPicked 全部账号都被 11136 挡住时选号返回 nil
+// （handler 据此走 503 fast-fail）。11136 不写路由熔断后，这条口径保证「全池
+// 无权限」不会退化成每个请求逐号轮转。
+func TestModelBlockedAccountsNotPicked(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Add(&auth.Auth{UID: "u2"})
+	pool.BlockModelBackoff("u1", "glm-5.3", "11136 model not permitted")
+	pool.BlockModelBackoff("u2", "glm-5.3", "11136 model not permitted")
+
+	if acct := pool.PickExcludingForRealm(nil, "glm-5.3", ""); acct != nil {
+		t.Fatalf("全部账号无该模型权限时不应兜底选中，got %s", acct.UID)
+	}
+}
+
 // TestModelBlockedDisabledDoesNotCount 禁用号不参与判定：它不可用与模型无关，
 // 既不构成"还能服务"的证明，也不该被算进被挡账号数。
 func TestModelBlockedDisabledDoesNotCount(t *testing.T) {
