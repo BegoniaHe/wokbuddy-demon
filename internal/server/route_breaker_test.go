@@ -137,6 +137,15 @@ func TestChatAllAccountsLackModelPermission(t *testing.T) {
 		t.Errorf("upstream calls=%d want 2（每号一次，不逐号轮转）", calls)
 	}
 
+	rec = postChat(t, h, `{"model":"glm-5.3","messages":[]}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Errorf("second request: code=%d body=%s want 400 model_unavailable", rec.Code, rec.Body)
+	}
+
+	if calls != 2 {
+		t.Errorf("second request must fast-fail without upstream calls, calls=%d", calls)
+	}
+
 	if until := state.RouteRecovery("cn", "glm-5.3"); !until.IsZero() {
 		t.Errorf("11136 不应写路由熔断，got until=%v", until)
 	}
