@@ -792,7 +792,7 @@ var modelAccessCodes = []string{"11136"}
 var modelRetiredCodes = []string{"11141"}
 
 // ModelAccessReason 11141 负缓存条目的 reason 前缀。pool.BlockModelClear
-// 按前缀识别可恢复的模型避让条目（11102 与 11141 两族），不碰 6004 限流台账。
+// 按前缀识别可恢复的模型避让条目（11136 与 11141 两族），不碰 6004 限流台账。
 const ModelAccessReason = "11141 model retired"
 
 // accountLimitCodes 账号级使用上限（10105 活跃会话数、15001 联网搜索次数）。
