@@ -423,7 +423,8 @@ func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 
 // expiry 返回账号当前仍在生效的最近冷却/熔断/降权截止时间（三个截止取最早者）；不在冷却期返回零值。
 // 供全冷却兜底选取"最早到期"账号用。连败降权计入兜底口径：降权号参与兜底（其失败
-// 形态是「不知道原因」，到期放行半开试探正是兜底语义——CoolHard 才被排除）。
+// 形态是「不知道原因」，到期放行半开试探正是兜底语义）。CoolHard 与请求模型的
+// 模型级冷却由 fallbackEligible 先排除，故本函数只归并账号级截止。
 func (e *entry) expiry(now time.Time) time.Time {
 	var t time.Time
 
