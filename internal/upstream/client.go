@@ -3321,15 +3321,20 @@ func enterpriseExpiryBucket(
 // flexInt64 兼容上游把整数字段下发为 JSON 数字或字符串（如 "1000"）两种形态。
 type flexInt64 int64
 
-// UnmarshalJSON 接受 1000 / "1000" / "1000.0"；null 与空串按 0 处理。
+// UnmarshalJSON 接受 1000 / "1000" / "1000.0"；JSON null 按 0 处理。
+// 空串按非法值处理：静默按 0 会跳过旧端点回退，让余额误报为 0。
 func (f *flexInt64) UnmarshalJSON(raw []byte) error {
-	text := strings.TrimSpace(strings.Trim(strings.TrimSpace(string(raw)), `"`))
-	if text == "" || text == "null" {
+	if strings.TrimSpace(string(raw)) == "null" {
 		*f = 0
 		return nil
 	}
 
-	if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+	text, textErr := flexNumberText(raw)
+	if textErr != nil {
+		return textErr
+	}
+
+	if n, parseErr := strconv.ParseInt(text, 10, 64); parseErr == nil {
 		*f = flexInt64(n)
 		return nil
 	}
@@ -3337,16 +3342,36 @@ func (f *flexInt64) UnmarshalJSON(raw []byte) error {
 	// 少数账号的容量以浮点串下发，截断取整。NaN/Inf 与超出 int64 范围的浮点
 	// 转换到 int64 属实现相关行为，必须在转换前拒绝，否则会静默变成 0 并跳过
 	// 旧端点回退，让余额误报为 0。
-	n, err := strconv.ParseFloat(text, 64)
+	n, parseErr := strconv.ParseFloat(text, 64)
 	// 边界取闭区间两侧都拒绝：float64 无法精确表示 MinInt64 附近的差值，
 	// "-9223372036854775809" 会被舍入成 MinInt64，放行后截断成合法整数。
-	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= math.MaxInt64 || n <= math.MinInt64 {
+	if parseErr != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= math.MaxInt64 || n <= math.MinInt64 {
 		return fmt.Errorf("%w: %q", errFlexInt64Invalid, text)
 	}
 
 	*f = flexInt64(int64(n))
 
 	return nil
+}
+
+// flexNumberText 归一容量标量文本：字符串形态按 JSON 规则解转义（\u0031 等）并
+// 去空白，其余形态原样返回。空串非法——静默按 0 会跳过旧端点回退并误报余额。
+func flexNumberText(raw []byte) (string, error) {
+	text := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(text, `"`) {
+		var decoded string
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			return "", fmt.Errorf("%w: %w", errFlexInt64Invalid, err)
+		}
+
+		text = strings.TrimSpace(decoded)
+	}
+
+	if text == "" {
+		return "", fmt.Errorf("%w: 空容量值", errFlexInt64Invalid)
+	}
+
+	return text, nil
 }
 
 // resourceSummaryResp get-user-resource-summary 响应（doJSON 已解信封）。

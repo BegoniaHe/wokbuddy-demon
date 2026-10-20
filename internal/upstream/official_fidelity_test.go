@@ -299,8 +299,11 @@ func TestFlexInt64Shapes(t *testing.T) {
 		{name: "negative", raw: `"-5"`, want: -5},
 		{name: "float-string", raw: `"700.9"`, want: 700},
 		{name: "scientific-string", raw: `"1e3"`, want: 1000},
-		{name: "empty-string", raw: `""`, want: 0},
+		{name: "escaped-string", raw: `"\u0031000"`, want: 1000},
 		{name: "null", raw: `null`, want: 0},
+		{name: "empty-string", raw: `""`, wantErr: true},
+		{name: "blank-string", raw: `"  "`, wantErr: true},
+		{name: "quoted-null", raw: `"null"`, wantErr: true},
 		{name: "text", raw: `"abc"`, wantErr: true},
 		{name: "nan", raw: `"NaN"`, wantErr: true},
 		{name: "inf", raw: `"Inf"`, wantErr: true},
@@ -375,6 +378,40 @@ func TestSummaryTotalsAcceptsStringCapacity(t *testing.T) {
 	remain, total := summary.summaryTotals()
 	if remain != 700 || total != 1000 {
 		t.Errorf("summary=%d/%d want 700/1000", remain, total)
+	}
+}
+
+// TestSummaryResourceAcceptsStringCapacity 端到端覆盖上游以字符串下发容量字段：
+// summary 解码成功后直接采用汇总值，不回落旧端点。
+func TestSummaryResourceAcceptsStringCapacity(t *testing.T) {
+	t.Parallel()
+
+	var fallbackCalls atomic.Int32
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "get-user-resource-summary"):
+			return jsonResp(200, `{"code":0,"data":{"Packages":[
+				{"PackageCode":"p","CycleTotalCapacity":"1000","CycleRemainCapacity":"700","CycleUsedCapacity":"300"}
+			]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "get-user-resource"):
+			fallbackCalls.Add(1)
+
+			return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+				{"CycleCapacitySize":1,"CycleCapacityRemain":1,"CycleCapacityUsed":0}
+			]}}}}`), nil
+		default:
+			return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
+		}
+	})
+
+	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil || remain != 700 || total != 1000 {
+		t.Fatalf("remain=%d total=%d err=%v want summary 700/1000", remain, total, err)
+	}
+
+	if got := fallbackCalls.Load(); got != 0 {
+		t.Fatalf("fallback calls=%d want 0 (string summary must decode)", got)
 	}
 }
 
