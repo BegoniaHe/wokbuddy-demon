@@ -337,11 +337,16 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
+// modelUnavailableReason 判定模型级冷却原因是否属于「模型不可用」负缓存：
+// 11136 账号权限缺失（upstream.ModelBlockReason）与 11141 模型下线
+// （upstream.ModelAccessReason）共用该口径；6004 限流不算。
+func modelUnavailableReason(reason string) bool {
+	return strings.HasPrefix(reason, "11136") || strings.HasPrefix(reason, "11141")
+}
+
 // BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。半开探测
 // 或正常请求对该模型成功后调用（handler 成功路径）。只清 11136/11141 两类
 // 可恢复避让条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
-// reason 前缀判定区分：11136 见 upstream.ModelBlockReason，11141 见
-// upstream.ModelAccessReason。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
@@ -356,7 +361,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	}
 
 	mc, exists := entry2.modelCooldowns[model]
-	if !exists || (!strings.HasPrefix(mc.Reason, "11136") && !strings.HasPrefix(mc.Reason, "11141")) {
+	if !exists || !modelUnavailableReason(mc.Reason) {
 		return
 	}
 

@@ -2230,12 +2230,12 @@ func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
 		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, reason)
 }
 
-// noteSuccessAndBind 记录账号成功、清 11136 负缓存，并让会话粘性跟随最终成功号。
+// noteSuccessAndBind 记录账号成功、清 11136/11141 负缓存，并让会话粘性跟随最终成功号。
 func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	f.h.cfg.Pool.NoteSuccess(acct.UID)
 	f.h.cfg.Pool.NoteRouteSuccess(f.realm, f.bareModel)
-	// 11136 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-	// BlockModelClear 按 "11136" reason 前缀识别，只清 11136 条目、不碰 6004 独立冷却。
+	// 11136/11141 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+	// BlockModelClear 按 reason 前缀识别两族，不碰 6004 独立冷却。
 	f.h.cfg.Pool.BlockModelClear(acct.UID, f.bareModel)
 
 	if f.sessKey != "" && f.h.cfg.Session != nil {

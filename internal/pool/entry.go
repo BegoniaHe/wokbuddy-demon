@@ -138,7 +138,7 @@ type ModelCostStatus struct {
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
 type RateLimitedModel struct {
 	Model string `json:"model"`
-	// Kind 区分限流与模型不可用：6004 是 rate_limit，11136 是 model_unavailable。
+	// Kind 区分限流与模型不可用：6004 是 rate_limit，11136/11141 是 model_unavailable。
 	Kind string `json:"kind"`
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
@@ -155,8 +155,9 @@ type RateLimitedModel struct {
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
 //   - 11136 账号无该模型权限：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
 //     累计命中次数驱动退避（6004 无 hits 概念，Hits 恒 0）。
+//   - 11141 模型下线：与 11136 共用负缓存形态（Until 为退避 TTL），成功或到期清除。
 type modelCooldown struct {
-	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11136：now+退避 TTL）。
+	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11136/11141：now+退避 TTL）。
 	Until time.Time
 	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）。
 	// 与 Until 的区别同：Until 可能截断，ResetAt 是上游权威恢复时刻。
@@ -313,9 +314,9 @@ func (e *entry) healthy(now time.Time) bool {
 	return true
 }
 
-// modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
-// 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
+// modelExempt 报告账号是否处于「模型级冷却」形态：存在任一有效的非审计模型级
+// 冷却（6004 限流 / 11136 权限缺失 / 11141 模型下线），且尚未禁用、未熔断。
+// 此形态下账号仅对冷却中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
@@ -338,7 +339,8 @@ func (e *entry) hardCoolingActive(now time.Time) bool {
 	return e.coolKind == CoolHard && !e.until.IsZero() && now.Before(e.until)
 }
 
-// modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
+// modelCooled 报告账号对指定 model 是否正处模型级冷却（该模型的独立冷却未过期：
+// 6004 限流 / 11136 权限缺失 / 11141 模型下线）。AuditOnly 仅展示、不参与判定。
 // 空 reqModel / 未记录 → false（不因模型级维度限制账号）。
 func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	if reqModel == "" {
@@ -353,10 +355,10 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 	return !mc.Until.IsZero() && now.Before(mc.Until)
 }
 
-// healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
+// healthyForModel 报告账号对指定 model 是否可选（含模型级独立冷却判定）：
 //   - disabled → 永不可选（最高优先级）；
-//   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
-//     （多模型限流时各自独立，互不影响）；
+//   - 该模型正处模型级冷却（modelCooldowns[reqModel] 未过期：6004/11136/11141）
+//     → 不可选（多模型冷却时各自独立，互不影响）；
 //   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
 //
 // 对比旧实现（softRateModel 单字段豁免"仅锁一个模型、其他豁免"），新语义天然支持
@@ -368,7 +370,7 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	}
 
 	if e.modelCooled(now, reqModel) {
-		// 该模型在 6004 独立冷却中 → 不可选。
+		// 该模型在模型级冷却中 → 不可选。
 		return false
 	}
 	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
