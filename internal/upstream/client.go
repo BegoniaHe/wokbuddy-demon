@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,6 +39,7 @@ var (
 	errV3ConfigReturnedEmptyModels  = errors.New("v3/config returned empty models")
 	errFetchV3ConfigModelMapFailed  = errors.New("fetchV3ConfigModelMap failed")
 	errParseV3ConfigEnvFailed       = errors.New("parseV3ConfigEnv failed")
+	errFlexInt64Invalid             = errors.New("flexInt64: 容量值无法解析")
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -3316,40 +3318,105 @@ func enterpriseExpiryBucket(
 	return earliestAt, earliestRemaining, expiring
 }
 
+// flexInt64 兼容上游把整数字段下发为 JSON 数字或字符串（如 "1000"）两种形态。
+type flexInt64 int64
+
+// UnmarshalJSON 接受 1000 / "1000" / "1000.0"；JSON null 按 0 处理。
+// 空串按非法值处理：静默按 0 会跳过旧端点回退，让余额误报为 0。
+func (f *flexInt64) UnmarshalJSON(raw []byte) error {
+	if strings.TrimSpace(string(raw)) == "null" {
+		*f = 0
+		return nil
+	}
+
+	text, textErr := flexNumberText(raw)
+	if textErr != nil {
+		return textErr
+	}
+
+	if n, parseErr := strconv.ParseInt(text, 10, 64); parseErr == nil {
+		*f = flexInt64(n)
+		return nil
+	}
+
+	// 少数账号的容量以浮点串下发，截断取整。NaN/Inf 与超出 int64 范围的浮点
+	// 转换到 int64 属实现相关行为，必须在转换前拒绝，否则会静默变成 0 并跳过
+	// 旧端点回退，让余额误报为 0。
+	n, parseErr := strconv.ParseFloat(text, 64)
+	// 边界取闭区间两侧都拒绝：float64 无法精确表示 MinInt64 附近的差值，
+	// "-9223372036854775809" 会被舍入成 MinInt64，放行后截断成合法整数。
+	if parseErr != nil || math.IsNaN(n) || math.IsInf(n, 0) || n >= math.MaxInt64 || n <= math.MinInt64 {
+		return fmt.Errorf("%w: %q", errFlexInt64Invalid, text)
+	}
+
+	*f = flexInt64(int64(n))
+
+	return nil
+}
+
+// flexNumberText 归一容量标量文本：字符串形态按 JSON 规则解转义（\u0031 等）并
+// 去空白，其余形态原样返回。空串非法——静默按 0 会跳过旧端点回退并误报余额。
+func flexNumberText(raw []byte) (string, error) {
+	text := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(text, `"`) {
+		var decoded string
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			return "", fmt.Errorf("%w: %w", errFlexInt64Invalid, err)
+		}
+
+		text = strings.TrimSpace(decoded)
+	}
+
+	if text == "" {
+		return "", fmt.Errorf("%w: 空容量值", errFlexInt64Invalid)
+	}
+
+	return text, nil
+}
+
 // resourceSummaryResp get-user-resource-summary 响应（doJSON 已解信封）。
 type resourceSummaryResp struct {
 	Packages []struct {
-		PackageCode         string `json:"PackageCode"`
-		CycleTotalCapacity  int64  `json:"CycleTotalCapacity"`
-		CycleRemainCapacity int64  `json:"CycleRemainCapacity"`
-		CycleUsedCapacity   int64  `json:"CycleUsedCapacity"`
+		PackageCode         string    `json:"PackageCode"`
+		CycleTotalCapacity  flexInt64 `json:"CycleTotalCapacity"`
+		CycleRemainCapacity flexInt64 `json:"CycleRemainCapacity"`
+		CycleUsedCapacity   flexInt64 `json:"CycleUsedCapacity"`
 	} `json:"Packages"`
 }
 
 // fetchResourceSummary 查询额度汇总（官方桌面端主路径）。
 func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, error) {
-	var out resourceSummaryResp
+	var data json.RawMessage
 
 	err := c.retryBillingTransient(func() error {
-		data, err := c.billingMeterJSON(account, []string{
+		var fetchErr error
+
+		data, fetchErr = c.billingMeterJSON(account, []string{
 			"/v2/billing/meter/get-user-resource-summary",
 			"/billing/meter/get-user-resource-summary",
 		}, map[string]any{})
-		if err != nil {
-			return err
-		}
 
-		return json.Unmarshal(data, &out)
+		return fetchErr
 	})
+	if err != nil {
+		return resourceSummaryResp{}, err
+	}
 
-	return out, err
+	// 解码失败是确定性错误，不参与瞬时重试（否则每次余额刷新都要白等 2s+4s）；
+	// 与 enterpriseResource / UserResourceDetailedWithExpiry 的重试范围保持一致。
+	var out resourceSummaryResp
+	if err := json.Unmarshal(data, &out); err != nil {
+		return resourceSummaryResp{}, fmt.Errorf("resource summary parse: %w", err)
+	}
+
+	return out, nil
 }
 
 // summaryTotals 汇总 summary 包的 remain/total（负值钳 0，remain 不超过 total）。
 func (r *resourceSummaryResp) summaryTotals() (remain, total int64) {
 	for _, pkg := range r.Packages {
-		size := max(pkg.CycleTotalCapacity, 0)
-		left := max(pkg.CycleRemainCapacity, 0)
+		size := max(int64(pkg.CycleTotalCapacity), 0)
+		left := max(int64(pkg.CycleRemainCapacity), 0)
 		// 总额缺失/为 0 时按剩余兜底，避免「有余额却 total=0」被旧端点聚合口径
 		// 覆盖成 0/0（credit_floor 会因此误停账号）。
 		size = max(size, left)

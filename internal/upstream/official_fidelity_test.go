@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -278,6 +279,139 @@ func TestSummaryTotalsDefaultsSizeToRemain(t *testing.T) {
 	remain, total := summary.summaryTotals()
 	if remain != 12 || total != 12 {
 		t.Errorf("summary=%d/%d want 12/12", remain, total)
+	}
+}
+
+// TestFlexInt64Shapes 容量字段兼容数字/字符串/浮点串，非法值与溢出值必须报错，
+// 以便调用方继续回落旧端点。
+func TestFlexInt64Shapes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		raw     string
+		want    int64
+		wantErr bool
+	}{
+		{name: "number", raw: `1000`, want: 1000},
+		{name: "string", raw: `"1000"`, want: 1000},
+		{name: "string-spaces", raw: `" 1000 "`, want: 1000},
+		{name: "negative", raw: `"-5"`, want: -5},
+		{name: "float-string", raw: `"700.9"`, want: 700},
+		{name: "scientific-string", raw: `"1e3"`, want: 1000},
+		{name: "escaped-string", raw: `"\u0031000"`, want: 1000},
+		{name: "null", raw: `null`, want: 0},
+		{name: "empty-string", raw: `""`, wantErr: true},
+		{name: "blank-string", raw: `"  "`, wantErr: true},
+		{name: "quoted-null", raw: `"null"`, wantErr: true},
+		{name: "text", raw: `"abc"`, wantErr: true},
+		{name: "nan", raw: `"NaN"`, wantErr: true},
+		{name: "inf", raw: `"Inf"`, wantErr: true},
+		{name: "overflow", raw: `"1e19"`, wantErr: true},
+		{name: "negative-overflow", raw: `"-9223372036854775809"`, wantErr: true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var got flexInt64
+
+			err := got.UnmarshalJSON([]byte(testCase.raw))
+			if testCase.wantErr {
+				if !errors.Is(err, errFlexInt64Invalid) {
+					t.Fatalf("raw=%s err=%v want errFlexInt64Invalid", testCase.raw, err)
+				}
+
+				return
+			}
+
+			if err != nil || int64(got) != testCase.want {
+				t.Fatalf("raw=%s got=%d err=%v want %d", testCase.raw, int64(got), err, testCase.want)
+			}
+		})
+	}
+}
+
+// TestSummaryResourceFallbackOnInvalidCapacity 容量值非法时 summary 解码失败并
+// 回落旧端点，不能静默按 0 计；解码失败是确定性错误，不能触发瞬时重试。
+func TestSummaryResourceFallbackOnInvalidCapacity(t *testing.T) {
+	t.Parallel()
+
+	var summaryCalls atomic.Int32
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "get-user-resource-summary") {
+			summaryCalls.Add(1)
+
+			return jsonResp(200, `{"code":0,"data":{"Packages":[
+				{"CycleTotalCapacity":"abc","CycleRemainCapacity":"1"}
+			]}}`), nil
+		}
+
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"CycleCapacitySize":500,"CycleCapacityRemain":400,"CycleCapacityUsed":100}
+		]}}}}`), nil
+	})
+
+	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil || remain != 400 || total != 500 {
+		t.Fatalf("remain=%d total=%d err=%v want fallback 400/500", remain, total, err)
+	}
+
+	if got := summaryCalls.Load(); got != 1 {
+		t.Fatalf("summary calls=%d want 1 (decode failure must not retry)", got)
+	}
+}
+
+// TestSummaryTotalsAcceptsStringCapacity 上游把容量字段下发为字符串时仍能解析。
+func TestSummaryTotalsAcceptsStringCapacity(t *testing.T) {
+	t.Parallel()
+
+	var summary resourceSummaryResp
+	if err := json.Unmarshal([]byte(`{"Packages":[
+		{"CycleTotalCapacity":" 1000 ","CycleRemainCapacity":"700.0","CycleUsedCapacity":"300"}
+	]}`), &summary); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	remain, total := summary.summaryTotals()
+	if remain != 700 || total != 1000 {
+		t.Errorf("summary=%d/%d want 700/1000", remain, total)
+	}
+}
+
+// TestSummaryResourceAcceptsStringCapacity 端到端覆盖上游以字符串下发容量字段：
+// summary 解码成功后直接采用汇总值，不回落旧端点。
+func TestSummaryResourceAcceptsStringCapacity(t *testing.T) {
+	t.Parallel()
+
+	var fallbackCalls atomic.Int32
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "get-user-resource-summary"):
+			return jsonResp(200, `{"code":0,"data":{"Packages":[
+				{"PackageCode":"p","CycleTotalCapacity":"1000","CycleRemainCapacity":"700","CycleUsedCapacity":"300"}
+			]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "get-user-resource"):
+			fallbackCalls.Add(1)
+
+			return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+				{"CycleCapacitySize":1,"CycleCapacityRemain":1,"CycleCapacityUsed":0}
+			]}}}}`), nil
+		default:
+			return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
+		}
+	})
+
+	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil || remain != 700 || total != 1000 {
+		t.Fatalf("remain=%d total=%d err=%v want summary 700/1000", remain, total, err)
+	}
+
+	if got := fallbackCalls.Load(); got != 0 {
+		t.Fatalf("fallback calls=%d want 0 (string summary must decode)", got)
 	}
 }
 
