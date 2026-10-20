@@ -20,7 +20,8 @@ func TestFrameKindCodeExtraction(t *testing.T) {
 		{"error.code 字符串", `{"error":{"code":"14015","message":"auth expired"}}`, ErrSessionDead},
 		{"error.data.code", `{"error":{"data":{"code":11129},"message":"tool schema invalid"}}`, ErrBadParams},
 		{"data.code", `{"data":{"code":6002},"message":"minute usage limit"}`, ErrSoftRate},
-		{"模型权限码", `{"error":{"code":11141,"message":"model offline"}}`, ErrModelAccess},
+		{"模型权限码", `{"error":{"code":11136,"message":"no model permission"}}`, ErrModelBlocked},
+		{"模型下线码", `{"error":{"code":11141,"message":"model offline"}}`, ErrModelAccess},
 		{"6004 特判保留", `{"error":{"code":6004,"message":"daily model limit"}}`, ErrSoftRate},
 		{"帧内内容拦截码", `{"error":{"code":"11-128","message":"request intercepted"}}`, ErrContentBlocked},
 		{"无码回落 message", `{"error":{"message":"prompt is too long"}}`, ErrPromptTooLong},
@@ -85,5 +86,40 @@ func TestDoJSONPreservesStructuredCode(t *testing.T) {
 				t.Errorf("msg=%q 应保留结构化 code，不得拼 code=N 纯文本", uerr.Msg)
 			}
 		})
+	}
+}
+
+// TestDoJSONKeepsCodeBeyondTruncation 结构化业务码长度超过 Msg 截断阈值时，
+// 消费方仍应能通过 Error.Code 识别（签到/trial 幂等判定依赖它）。
+func TestDoJSONKeepsCodeBeyondTruncation(t *testing.T) {
+	t.Parallel()
+
+	body := `{"code":14051,"msg":"` + strings.Repeat("x", 250) + `"}`
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		return jsonResp(http.StatusOK, body), nil
+	})
+
+	req, err := http.NewRequest(http.MethodPost, "https://billing.example/x", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = client.doJSON(req)
+
+	var uerr *Error
+	if !errors.As(err, &uerr) {
+		t.Fatalf("err=%v want *Error", err)
+	}
+
+	if uerr.Code != "14051" {
+		t.Errorf("code=%q want 14051", uerr.Code)
+	}
+
+	if !trialAlreadyErr(uerr) {
+		t.Error("trialAlreadyErr 应通过 Code 识别截断后的 14051")
+	}
+
+	if len(uerr.Msg) != 200 {
+		t.Errorf("msg len=%d want truncated 200", len(uerr.Msg))
 	}
 }

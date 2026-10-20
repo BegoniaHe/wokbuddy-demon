@@ -2726,7 +2726,7 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 			msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 		}
 	case upstream.ErrModelBlocked, upstream.ErrModelAccess:
-		// 11102「该后端无此模型」/ 11136/11141 模型不可用：上游原文已经写清原因，
+		// 11102/11136 模型在该账号不可用、11141 平台下线：上游原文已经写清原因，
 		// 但 code 此前停在默认的 no_healthy_account（"服务端过载"语义，客户端会不断
 		// 重试）。用 400 + 明确 code 把不可重试的性质讲清楚——真正该做的是换个模型。
 		code = "model_unavailable"
@@ -2920,8 +2920,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102 负缓存避让。
-//   - ErrModelAccess → BlockModelBackoff + NoteRouteFailure：11136/11141 模型级
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102/11136 负缓存避让。
+//   - ErrModelAccess → BlockModelBackoff + NoteRouteFailure：11141 模型级
 //     避让；请求级 fail-fast 已在 handleRequestLevelError 提前返回，不罚账号。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
@@ -2948,7 +2948,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 		h.cfg.Pool.NoteRouteFailure(realm, model)
 	case upstream.ErrModelAccess:
-		// 11136/11141 无该模型权限/模型已下线：请求级 fail-fast（不罚账号、不轮转），
+		// 11141 模型已下线：请求级 fail-fast（不罚账号、不轮转），
 		// 同时写 (账号,模型) 负缓存，后续请求不再命中同一组合。与 11102 同机制但
 		// 独立 reason，避免把两种语义混进同一条台账。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelAccessReason)

@@ -137,19 +137,20 @@ func TestClassify(t *testing.T) {
 		{400, `{"error":{"data":{"code":11129}}}`, ErrBadParams},
 		{400, `{"bizCode":11129,"msg":"tool schema invalid"}`, ErrBadParams},
 		{400, `{"bizCode":"11148"}`, ErrBadParams},
-		// 11136/11141：请求级 fail-fast + (账号,模型) 避让，不能混入 11102。
-		{400, `{"code":11136,"msg":"no model permission"}`, ErrModelAccess},
+		// 11136 账号级权限缺失 → 换号 + 模型避让；11141 平台下线 → fail-fast。
+		{400, `{"code":11136,"msg":"no model permission"}`, ErrModelBlocked},
 		{400, `{"code":11141,"msg":"model offline"}`, ErrModelAccess},
 		{400, `{"error":{"data":{"code":11141}}}`, ErrModelAccess},
-		{400, `{"bizCode":11136}`, ErrModelAccess},
+		{400, `{"bizCode":11136}`, ErrModelBlocked},
 		// 11-128 入站内容拦截（与出站 sanitize 同语义），不依赖文案 marker。
 		{400, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
 		{200, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
 		// 额度族新增码与中文 hard marker。
 		{400, `{"code":11145,"msg":"TokenPlan exhausted"}`, ErrHardCredit},
 		{200, `{"code":14002,"msg":"agent quota exhausted"}`, ErrHardCredit},
-		{200, `{"code":10105,"msg":"quota exhausted"}`, ErrHardCredit},
-		{200, `{"code":15001,"msg":"quota exhausted"}`, ErrHardCredit},
+		// 10105/15001 是账号级使用上限（会话数/联网搜索），软限流而非硬冷却。
+		{200, `{"code":10105,"msg":"quota exhausted"}`, ErrSoftRate},
+		{200, `{"code":15001,"msg":"quota exhausted"}`, ErrSoftRate},
 		{400, `{"code":1,"msg":"余额已耗尽"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度已达上限"}`, ErrHardCredit},
 		// 429 仍先于 hardMarkers：中文额度文案不得把限流硬冷却到次日。
@@ -352,6 +353,30 @@ func TestRefreshSessionDead(t *testing.T) {
 
 	if error.Kind != ErrSessionDead {
 		t.Errorf("kind=%v want ErrSessionDead", error.Kind)
+	}
+}
+
+func TestRefreshAuthRequiredIsSessionDead(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusForbidden,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":11142,"msg":"auth required"}`)),
+		}, nil
+	})
+	a := &auth.Auth{AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}
+
+	err := client.RefreshToken(a)
+
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("want *Error, got %T %v", err, err)
+	}
+
+	if upstreamErr.Kind != ErrSessionDead {
+		t.Errorf("kind=%v want ErrSessionDead", upstreamErr.Kind)
 	}
 }
 

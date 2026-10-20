@@ -180,7 +180,7 @@ func TestModelBlockedThenClear(t *testing.T) {
 	}
 }
 
-// TestModelAccessBlockedThenClear 11136/11141 的模型避让条目也应在成功后清除，
+// TestModelAccessBlockedThenClear 11141 的模型避让条目也应在成功后清除，
 // 与 11102 同通道但独立 reason；6004 限流台账不得被顺手清掉。
 func TestModelAccessBlockedThenClear(t *testing.T) {
 	t.Parallel()
@@ -188,10 +188,10 @@ func TestModelAccessBlockedThenClear(t *testing.T) {
 	pool := New("")
 	pool.Add(&auth.Auth{UID: "u1"})
 
-	pool.BlockModelBackoff("u1", "glm-5.3", "11136/11141 model access denied")
+	pool.BlockModelBackoff("u1", "glm-5.3", "11141 model retired")
 
 	if st := pool.ModelBlocked("glm-5.3"); !st.Blocked {
-		t.Fatalf("写入 11136 避让后应阻塞：%+v", st)
+		t.Fatalf("写入 11141 避让后应阻塞：%+v", st)
 	}
 
 	pool.BlockModelClear("u1", "glm-5.3")

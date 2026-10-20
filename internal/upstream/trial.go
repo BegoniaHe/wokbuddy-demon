@@ -25,7 +25,7 @@ func (c *Client) ClaimTrial(a *auth.Auth) (claimed bool, err error) {
 	_, err = c.billingJSON(a, trialPath, nil)
 	if err != nil {
 		var ue *Error
-		if errors.As(err, &ue) && trialAlreadyErr(ue.Msg) {
+		if errors.As(err, &ue) && trialAlreadyErr(ue) {
 			return false, nil // 已领过：幂等成功，非错误
 		}
 
@@ -35,7 +35,8 @@ func (c *Client) ClaimTrial(a *auth.Auth) (claimed bool, err error) {
 	return true, nil
 }
 
-// trialAlreadyErr 判定错误 Msg（原始 JSON 信封）是否携带幂等码 14051（已领取过）。
-func trialAlreadyErr(msg string) bool {
-	return hasBusinessCode(msg, "14051")
+// trialAlreadyErr 判定错误是否携带幂等码 14051（已领取过）。优先看结构化 Code
+// （Msg 会被截断到 200 字符），再回落原始信封文本。
+func trialAlreadyErr(ue *Error) bool {
+	return ue.Code == "14051" || hasBusinessCode(ue.Msg, "14051")
 }
