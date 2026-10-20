@@ -337,10 +337,11 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
-// BlockModelClear 清除 (账号, 模型) 的 11102 负缓存条目（该模型实测又通了）。半开探测
-// 或正常请求对该模型成功后调用（handler 成功路径）。只清 11102 条目、不碰 6004 独立
-// 冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。reason 前缀判定区分两者：
-// 11102 条目的 reason 恒以 "11102" 开头（见 upstream.BlockModelReason）。
+// BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。半开探测
+// 或正常请求对该模型成功后调用（handler 成功路径）。只清 11102/11136 两类可恢复
+// 避让条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟语义，成功不该抹掉。
+// reason 前缀判定区分：11102 见 upstream.ModelBlockReason，11136/11141 见
+// upstream.ModelAccessReason。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
@@ -355,7 +356,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 	}
 
 	mc, exists := entry2.modelCooldowns[model]
-	if !exists || !strings.HasPrefix(mc.Reason, "11102") {
+	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11136")) {
 		return
 	}
 

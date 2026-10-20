@@ -220,9 +220,9 @@ func TestCheckinBusinessCodes(t *testing.T) {
 		msg  string
 		want CheckinResult
 	}{
-		{"code=1001 msg=already", CheckinAlready},
-		{"code=1002 msg=not eligible", CheckinInactive},
-		{"code=1003 msg=event ended", CheckinInactive},
+		{`{"code":1001,"msg":"already"}`, CheckinAlready},
+		{`{"code":1002,"msg":"not eligible"}`, CheckinInactive},
+		{`{"code":1003,"msg":"event ended"}`, CheckinInactive},
 	}
 
 	for _, testCase := range cases {
@@ -662,11 +662,11 @@ func TestRefresh403WAFNotSessionDead(t *testing.T) {
 func TestCheckinBusinessCodeExactMatch(t *testing.T) {
 	t.Parallel()
 
-	if got := ClassifyCheckin(&Error{Status: 200, Msg: "code=10012 msg=unknown"}); got != CheckinFailed {
+	if got := ClassifyCheckin(&Error{Status: 200, Msg: `{"code":10012,"msg":"unknown"}`}); got != CheckinFailed {
 		t.Errorf("ClassifyCheckin(code=10012)=%v want CheckinFailed", got)
 	}
 
-	if got := ClassifyCheckin(&Error{Status: 200, Msg: "code=1001 msg=already"}); got != CheckinAlready {
+	if got := ClassifyCheckin(&Error{Status: 200, Msg: `{"code":1001,"msg":"already"}`}); got != CheckinAlready {
 		t.Errorf("ClassifyCheckin(code=1001)=%v want CheckinAlready", got)
 	}
 }

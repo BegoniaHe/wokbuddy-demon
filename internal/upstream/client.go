@@ -56,6 +56,7 @@ const (
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrModelAccess                   // 11136/11141 无该模型权限/模型已下线 → 请求级 fail-fast + (账号,模型) 负缓存避让
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
@@ -75,6 +76,7 @@ var errKindNames = map[ErrKind]string{
 	ErrContentBlocked: "content_blocked",
 	ErrBadParams:      "bad_params",
 	ErrModelBlocked:   "model_blocked",
+	ErrModelAccess:    "model_access",
 	ErrWafBlock:       "waf_block",
 	ErrPromptTooLong:  "prompt_too_long",
 	ErrImageInvalid:   "image_invalid",
@@ -114,6 +116,7 @@ var hardMarkers = []string{
 	"quota exceeded", "quota exhaust", "payment required", "credit not enough",
 	"not enough credit",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽", "没有积分",
+	"余额已耗尽", "额度已达上限",
 }
 
 // softRateMarkers 限流/节流关键词（小写比较 + 中文原文比较双通道）。
@@ -132,7 +135,7 @@ var softRateMarkers = []string{
 	"too many requests",
 	"too many",
 	"usage limit", // usage limit reached / model usage limit exceeded（用量节流，非计费余额）
-	"请求过于频繁", "限流",
+	"请求过于频繁", "限流", "用量已达上限",
 }
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
@@ -328,7 +331,7 @@ func firstCodeField(node map[string]any, current string) string {
 		return current
 	}
 
-	for _, key := range []string{"code", "errCode", "error_code"} {
+	for _, key := range []string{"code", "bizCode", "errCode", "error_code"} {
 		if v, ok := node[key]; ok && v != nil {
 			// 空串（含纯空白）不算命中：继续尝试同节点内的后备键，与旧内联循环
 			// 「code 仍为空则继续」的口径一致（否则 {"code":"","errCode":"11102"}
@@ -362,10 +365,27 @@ func firstMsgField(node map[string]any, current string) string {
 	return current
 }
 
-// hasBusinessCode reports whether a JSON error envelope contains an exact
-// business code in a field named "code". Upstream envelopes vary between
-// top-level and nested error/data objects, so walk the decoded structure.
+// businessCodeFields 业务码字段名。code 是主字段；bizCode 是客户端
+// parseErrorMeta 的同义字段，协议漂移时避免静默漏判。
+var businessCodeFields = []string{"code", "bizCode"}
+
+// hasBusinessCode 报告 JSON 错误信封是否携带指定业务码。信封可能在顶层、
+// error 或 data（含 error.data）下，递归遍历解码后的结构。
 func hasBusinessCode(body, want string) bool {
+	return hasAnyBusinessCode(body, want)
+}
+
+// hasAnyBusinessCode 报告 body 是否命中 wants 中任一业务码。先做子串预检，
+// 大多数不含目标码的错误体零 JSON 解析开销。
+func hasAnyBusinessCode(body string, wants ...string) bool {
+	if body == "" || len(wants) == 0 {
+		return false
+	}
+
+	if !slices.ContainsFunc(wants, func(want string) bool { return strings.Contains(body, want) }) {
+		return false
+	}
+
 	var root any
 	if err := json.Unmarshal([]byte(body), &root); err != nil {
 		return false
@@ -376,7 +396,7 @@ func hasBusinessCode(body, want string) bool {
 	walk = func(value any) bool {
 		switch node := value.(type) {
 		case map[string]any:
-			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
+			if nodeHasBusinessCode(node, wants) {
 				return true
 			}
 
@@ -386,15 +406,29 @@ func hasBusinessCode(body, want string) bool {
 				}
 			}
 		case []any:
-			if slices.ContainsFunc(node, walk) {
-				return true
-			}
+			return slices.ContainsFunc(node, walk)
 		}
 
 		return false
 	}
 
 	return walk(root)
+}
+
+// nodeHasBusinessCode 报告节点自身是否携带 wants 中任一业务码。
+func nodeHasBusinessCode(node map[string]any, wants []string) bool {
+	for _, key := range businessCodeFields {
+		code, ok := node[key]
+		if !ok || code == nil {
+			continue
+		}
+
+		if slices.Contains(wants, strings.TrimSpace(fmt.Sprint(code))) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // hasBusinessEnvelope 报告错误 body 是否携带上游业务信封形态（JSON 且含
@@ -543,50 +577,69 @@ func ParseRateReset(body string) (time.Time, bool) {
 	return t, true
 }
 
+// classifyEarly 判定优先级最高的几类：模型不存在、402、11-128 内容拦截、
+// 客户端明确的请求级业务码。顺序即优先级。
+func classifyEarly(status int, body string) (ErrKind, bool) {
+	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
+	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
+	// 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
+	// 只认 400/404（见 IsModelBlocked），429+11102 落 status==429 层走限流语义。
+	if IsModelBlocked(status, body) {
+		return ErrModelBlocked, true
+	}
+	// 402：真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
+	if status == http.StatusPaymentRequired {
+		return ErrHardCredit, true
+	}
+	// 11-128 是上游内容审核/反探测拦截码（常见形态是非法 JSON `"code":11-128`）。
+	// 入站与出站 sanitize 同语义：内容问题非账号问题，归 ErrContentBlocked 走降级重试。
+	if strings.Contains(body, "11-128") {
+		return ErrContentBlocked, true
+	}
+
+	// 客户端明确的请求级业务码先于账号/限流层：同一 body 换号结果不变。
+	return classifyRequestLevel(body)
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
 //  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
-//     （只认 400/404，429+11102 属限流语义走第 4 层）。
+//     （只认 400/404，429+11102 属限流语义走 status==429 层）。
 //  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
-//  2. sessionDeadMarkers —— 需要人工重登的终态。若 401 body 同时含 "12153" 与
-//     "rate limit"（如网关错误页混排），归 session_dead：短冷却救不活失效 session，
-//     误判为限流会让该死号留在池中反复被选中；且此层 marker 是精确词（12153 等），
-//     比限流层的大范围子串更具体，具体优先于宽泛。
-//  3. accountFaultMarkers —— 账号级授权/配额故障（11140 request illegal auth 风控、
-//     14017 trial not activated register 未完成）。必须先于 status==429 判定：
-//     14017 常带 429 状态码，若落到 status==429 会误归 soft_rate（"限流"语义不符：
-//     限流可指数退避等自愈，账号级故障等不来）。11140 的 model 级限流变体
-//     （rate-limiting 文案）因 marker 不含该文案而天然落到 softRateMarkers 层，
-//     不受影响。
-//  4. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（issue #175）。
+//  2. 11-128 —— 上游内容审核/反探测拦截码（常见形态是非法 JSON），按内容拦截
+//     处理，不罚账号、可降级重试。
+//  3. requestLevelCodes —— 客户端判为 editInput/newTask/reupload 的确定性请求
+//     错误（11125/11129/.../11155、12654、14405）：不罚号、不轮转。11136/11141
+//     另归 ErrModelAccess 做 (账号,模型) 避让。
+//  4. sessionDeadMarkers / accountFaultMarkers / 11142 —— 需要人工重登的终态或
+//     账号级授权/配额故障。若 401 body 同时含 "12153" 与 "rate limit"（如网关
+//     错误页混排），归 session_dead：短冷却救不活失效 session，误判为限流会让该死号
+//     留在池中反复被选中。14017 常带 429，若落到 status==429 会误归 soft_rate
+//     （账号级故障等不来自愈）。11140 的 model 级限流变体因 marker 不含该文案而
+//     天然落到 softRateMarkers 层，不受影响。
+//  5. 队列/额度/限流业务码 —— 6020-6022、6000-6008、14015/14016/14017、
+//     11145/14002/10105/15001 等结构化码。
+//  6. 429 + code 14018 —— 明确的账号积分耗尽，归 ErrHardCredit（issue #175）。
 //     只认结构化业务码，不靠可能跨计费/限流两界的文案猜测。
-//  5. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
+//  7. status==429 —— 限流状态码兜底（先于 hardMarkers）：429 body 高频携带
 //     "quota exceeded"/"额度不足" 等跨计费/限流两界的措辞，hardMarkers 先判会把
 //     限流误归 ErrHardCredit 硬冷却到次日 04:00，白扔号约 12h。状态码是比关键词
-//     更权威的信号；真正的余额耗尽由 402（第 1 层）或 14018（第 4 层）捕获，
-//     非 429 状态码的 quota 措辞仍走下方 hardMarkers（第 6 层）。
-//  6. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
-//  7. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
+//     更权威的信号；真正的余额耗尽由 402（第 1 层）或结构化额度码捕获，
+//     非 429 状态码的 quota 措辞仍走下方 hardMarkers。
+//  8. hardMarkers —— 非 429 响应携带计费关键词（200 业务信封 / 403 信封等）。
+//  9. softRateMarkers —— 非 429 状态码携带限流文案（issue #28 修复点）。
 //     位于此处可覆盖 200/400/403/5xx 各状态码。
-//  8. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
+//  10. 11115 —— 「prompt is too long」请求级语义：判在 404/5xx 与通用 4xx 兜底
 //     之前（404 上打 11115 若落 ErrNotFound 会误冷却账号——上下文超限与账号无关）。
-//  9. 404 / 5xx —— 与限流无关的常规分类。
-//  10. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
+//  11. 404 / 5xx —— 与限流无关的常规分类。
+//  12. IsWafBlocked —— 403 且无业务信封（HTML 拦截页/空体/纯文本）：APISIX WAF
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
-//  11. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//  13. 内容策略/参数错误/其他 4xx —— 通用兜底。
 func Classify(status int, body string) ErrKind {
-	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
-	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
-	// 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
-	// 只认 400/404（见 IsModelBlocked），429+11102 落下方 status==429 层走限流语义。
-	if IsModelBlocked(status, body) {
-		return ErrModelBlocked
-	}
-	// 402：真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
-	if status == http.StatusPaymentRequired {
-		return ErrHardCredit
+	if kind, ok := classifyEarly(status, body); ok {
+		return kind
 	}
 
 	lower := strings.ToLower(body)
@@ -636,6 +689,12 @@ func classifySessionOrAccount(lower, body string) (ErrKind, bool) {
 		}
 	}
 
+	// 11142 auth_required：结构化账号级认证故障。与 11140 不同，该码不承载
+	// 限流文案，可安全按 code 判定（429+11142 仍先于限流层归账号故障）。
+	if hasBusinessCode(body, "11142") {
+		return ErrAccountFault, true
+	}
+
 	if containsAnyDual(lower, body, accountFaultMarkers) {
 		return ErrAccountFault, true
 	}
@@ -643,10 +702,11 @@ func classifySessionOrAccount(lower, body string) (ErrKind, bool) {
 	return ErrNone, false
 }
 
-// 官方客户端业务码：队列、额度、认证/激活。
+// 官方客户端业务码：队列、限流、额度、认证/激活。
 //   - 6020 排队等待（WAITING）：可重试，带 retry_after；
 //   - 6021 队列满（FULL）、6022 用户并发上限（USER_LIMIT）：不可自愈；
-//   - 14001/14012/14013/14014/14019 额度耗尽；
+//   - 6000-6008 限流/窗口用量（6004 由 handler 再做模型级判定）；
+//   - 10105/11145/14001/14002/14012-14014/14018/14019/15001 额度耗尽；
 //   - 14015 授权过期（会话失效）；14016/14017 未激活。
 const (
 	queueWaitingCode = "6020"
@@ -654,7 +714,44 @@ const (
 	queueUserCode    = "6022"
 )
 
-var hardCreditCodes = []string{"14001", "14012", "14013", "14014", "14018", "14019"}
+var hardCreditCodes = []string{
+	"10105", "11145", "14001", "14002", "14012", "14013", "14014", "14018", "14019", "15001",
+}
+
+// requestLevelCodes 客户端语义为 editInput/newTask/reupload/upgradeClient 的
+// 请求级业务码：同一 body 换号结果不变，必须不罚号、不轮转、透传原文。
+// 11136/11141 另由 modelAccessCodes 处理（还需模型级避让）。
+var requestLevelCodes = []string{
+	"11125", "11129", "11130", "11132", "11137", "11138", "11139",
+	"11148", "11149", "11150", "11151", "11152", "11153", "11154", "11155",
+	"12654", "14405",
+}
+
+// modelAccessCodes 模型级请求错误：客户端要求 switchModel。与 11102 一样写
+// (账号,模型) 负缓存，但归 ErrModelAccess：不罚账号、不轮转，透传原文。
+var modelAccessCodes = []string{"11136", "11141"}
+
+// ModelAccessReason 11136/11141 负缓存条目的 reason 前缀。pool.BlockModelClear
+// 按前缀识别可恢复的模型避让条目（11102 与 11136 两族），不碰 6004 限流台账。
+const ModelAccessReason = "11136/11141 model access denied"
+
+// rateLimitCodes 客户端限流/窗口用量族。6004 的模型级语义由
+// IsModelRateLimit 单独判定，这里统一先归 ErrSoftRate。
+var rateLimitCodes = []string{"6000", "6001", "6002", "6003", "6004", "6005", "6006", "6007", "6008"}
+
+// classifyRequestLevel 判定客户端明确的请求级业务码。11136/11141 需要模型级
+// 避让，单独归 ErrModelAccess；其余归 ErrBadParams（不罚号、不轮转、透传原文）。
+func classifyRequestLevel(body string) (ErrKind, bool) {
+	if hasAnyBusinessCode(body, modelAccessCodes...) {
+		return ErrModelAccess, true
+	}
+
+	if hasAnyBusinessCode(body, requestLevelCodes...) {
+		return ErrBadParams, true
+	}
+
+	return ErrNone, false
+}
 
 // QueueCode 返回 body 命中的队列业务码（"6020"/"6021"/"6022"），未命中返回空串。
 func QueueCode(body string) string {
@@ -674,6 +771,12 @@ func classifyQueueOrQuota(body string) (ErrKind, bool) {
 		return ErrQueueWaiting, true
 	case queueFullCode, queueUserCode:
 		return ErrQueueFull, true
+	}
+
+	// 限流/窗口用量族（6000-6008）：6004 的模型级语义由 handler 用
+	// IsModelRateLimit 单独判定，这里统一先归 ErrSoftRate。
+	if hasAnyBusinessCode(body, rateLimitCodes...) {
+		return ErrSoftRate, true
 	}
 
 	if hasBusinessCode(body, "14015") {
@@ -1262,12 +1365,14 @@ func (c *Client) doJSONLimit(req *http.Request, maxBytes int64) (json.RawMessage
 	}
 
 	if env.Code != 0 {
-		kind := Classify(resp.StatusCode, env.Msg)
+		// 保留原始结构化信封交给 Classify：额度/限流/请求级码都依赖 code 字段，
+		// 拼成 `code=N msg=...` 纯文本会让后续分类只能看文案。
+		kind := Classify(resp.StatusCode, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient
 		}
 
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 	}
 
 	return env.Data, nil
@@ -3955,8 +4060,8 @@ func ClassifyCheckin(err error) CheckinResult {
 	}
 }
 
-// checkinBusinessCode 从 *Error.Msg 提取签到业务码（doJSON 形态 `code=1001 msg=...`
-// 或原始 JSON 信封）。非 *Error 返回空串。
+// checkinBusinessCode 从 *Error.Msg 提取签到业务码（原始 JSON 信封）。
+// 非 *Error 返回空串。
 func checkinBusinessCode(err error) string {
 	var upstreamErr *Error
 	if !errors.As(err, &upstreamErr) {
@@ -3972,23 +4077,10 @@ func checkinBusinessCode(err error) string {
 	return ""
 }
 
-// matchBusinessCode 匹配完整业务码，避免 code=10012 被前缀匹配成 code=1001。
+// matchBusinessCode 匹配结构化业务码（顶层/嵌套 code、字符串或数字），
+// 完整比对避免 10012 被前缀匹配成 1001。
 func matchBusinessCode(msg, code string) bool {
-	for _, marker := range []string{"code=" + code, `"code":` + code, `"code": ` + code} {
-		idx := strings.Index(msg, marker)
-		if idx < 0 {
-			continue
-		}
-
-		end := idx + len(marker)
-		if end < len(msg) && msg[end] >= '0' && msg[end] <= '9' {
-			continue
-		}
-
-		return true
-	}
-
-	return false
+	return hasBusinessCode(msg, code)
 }
 
 func truncate(s string, n int) string {

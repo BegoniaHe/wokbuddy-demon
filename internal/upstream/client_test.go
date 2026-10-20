@@ -102,16 +102,73 @@ func TestClassify(t *testing.T) {
 		{429, `insufficient credits`, ErrSoftRate},
 		{429, `{"code":1,"msg":"额度不足"}`, ErrSoftRate},
 		{429, `积分不足，请充值`, ErrSoftRate},
-		// 429 + 账号级故障码防回归（accountFault 仍先于 429 判定）：429+14017 若
+		// 429 + 账号级故障码防回归（accountFault/sessionDead 仍先于 429 判定）：
 		// 落到 status==429 兜底会误归 soft_rate，账号级故障等不来自愈。
 		{429, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
 		{429, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
+		{429, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
+		{429, `{"code":14015,"msg":"enterprise auth expired"}`, ErrSessionDead},
 		// Issue #175：14018 明确表示账号积分耗尽，即使 HTTP 状态是 429 也必须
 		// 走硬积分冷却；仅有相同文案而无该业务码的普通 429 仍保持软限流。
 		{429, `{"code":14018,"msg":"Credits exhausted"}`, ErrHardCredit},
 		{429, `{"error":{"data":{"code":"14018","msg":"Credits exhausted"}}}`, ErrHardCredit},
 		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
 		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
+		// 请求级码：客户端语义是 editInput/newTask/reupload/upgradeClient，同一 body
+		// 换号结果不变 → ErrBadParams（不罚号、不轮转、透传原文）。
+		{400, `{"code":11125,"msg":"input format unsupported"}`, ErrBadParams},
+		{400, `{"code":11129,"msg":"tool schema invalid"}`, ErrBadParams},
+		{400, `{"code":11130,"msg":"too many attachments"}`, ErrBadParams},
+		{400, `{"code":11132,"msg":"missing request info"}`, ErrBadParams},
+		{400, `{"code":11137,"msg":"image too large"}`, ErrBadParams},
+		{400, `{"code":11138,"msg":"client too old"}`, ErrBadParams},
+		{400, `{"code":11139,"msg":"image format unsupported"}`, ErrBadParams},
+		{400, `{"code":11148,"msg":"tool record incomplete"}`, ErrBadParams},
+		{400, `{"code":11149,"msg":"tool record duplicated"}`, ErrBadParams},
+		{400, `{"code":11150,"msg":"thinking effort unsupported"}`, ErrBadParams},
+		{400, `{"code":11151,"msg":"blank message"}`, ErrBadParams},
+		{400, `{"code":11152,"msg":"tool name invalid"}`, ErrBadParams},
+		{400, `{"code":11153,"msg":"bad conversation ending"}`, ErrBadParams},
+		{400, `{"code":11154,"msg":"attachment too large"}`, ErrBadParams},
+		{400, `{"code":11155,"msg":"thinking record missing"}`, ErrBadParams},
+		{400, `{"code":12654,"msg":"platform internal info"}`, ErrBadParams},
+		{400, `{"code":14405,"msg":"request risk"}`, ErrBadParams},
+		// 嵌套 data.code 与 bizCode 同义字段。
+		{400, `{"error":{"data":{"code":11129}}}`, ErrBadParams},
+		{400, `{"bizCode":11129,"msg":"tool schema invalid"}`, ErrBadParams},
+		{400, `{"bizCode":"11148"}`, ErrBadParams},
+		// 11136/11141：请求级 fail-fast + (账号,模型) 避让，不能混入 11102。
+		{400, `{"code":11136,"msg":"no model permission"}`, ErrModelAccess},
+		{400, `{"code":11141,"msg":"model offline"}`, ErrModelAccess},
+		{400, `{"error":{"data":{"code":11141}}}`, ErrModelAccess},
+		{400, `{"bizCode":11136}`, ErrModelAccess},
+		// 11-128 入站内容拦截（与出站 sanitize 同语义），不依赖文案 marker。
+		{400, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
+		{200, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
+		// 额度族新增码与中文 hard marker。
+		{400, `{"code":11145,"msg":"TokenPlan exhausted"}`, ErrHardCredit},
+		{200, `{"code":14002,"msg":"agent quota exhausted"}`, ErrHardCredit},
+		{200, `{"code":10105,"msg":"quota exhausted"}`, ErrHardCredit},
+		{200, `{"code":15001,"msg":"quota exhausted"}`, ErrHardCredit},
+		{400, `{"code":1,"msg":"余额已耗尽"}`, ErrHardCredit},
+		{400, `{"code":1,"msg":"额度已达上限"}`, ErrHardCredit},
+		// 429 仍先于 hardMarkers：中文额度文案不得把限流硬冷却到次日。
+		{429, `{"code":1,"msg":"额度已达上限"}`, ErrSoftRate},
+		// 11142 账号级 auth 故障，先于 429。
+		{400, `{"code":11142,"msg":"auth required"}`, ErrAccountFault},
+		{429, `{"code":11142,"msg":"auth required"}`, ErrAccountFault},
+		// 限流/窗口用量族 6000-6008：6004 保持模型级判定，其余账号级软限流。
+		{200, `{"code":6000,"msg":"too frequent"}`, ErrSoftRate},
+		{400, `{"code":6001,"msg":"send too fast"}`, ErrSoftRate},
+		{400, `{"code":6002,"msg":"minute usage limit"}`, ErrSoftRate},
+		{200, `{"code":6003,"msg":"hour usage limit"}`, ErrSoftRate},
+		{200, `{"code":6004,"msg":"model daily limit"}`, ErrSoftRate},
+		{400, `{"code":6005,"msg":"send too fast"}`, ErrSoftRate},
+		{200, `{"code":6006,"msg":"minute count limit"}`, ErrSoftRate},
+		{200, `{"code":6007,"msg":"hour count limit"}`, ErrSoftRate},
+		{200, `{"code":6008,"msg":"daily count exhausted"}`, ErrSoftRate},
+		{400, `{"code":1,"msg":"本分钟用量已达上限"}`, ErrSoftRate},
+		{400, `{"code":1,"msg":"请求过于频繁"}`, ErrSoftRate},
 		// WAF 403（P0-1）：403 + 无业务信封（无 "code":/"msg": 字段）→ ErrWafBlock。
 		// 空体 / HTML 拦截页 / 纯文本 / 非信封 JSON 均命中。
 		{403, ``, ErrWafBlock},
