@@ -1536,7 +1536,7 @@ func (f *chatFlow) reportNoAccount() {
 	f.st.status = http.StatusServiceUnavailable
 	// 记下"是不是模型级阻塞"。选号返回 nil 有两种完全不同的成因：
 	//   (a) 池子真的没有可用号（账号级冷却/在途占满/积分保底）；
-	//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11102/6004）。
+	//   (b) 号都在，但每个号都对这个模型处于模型级冷却（11136/6004）。
 	// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 	f.modelBlock = f.h.cfg.Pool.ModelBlocked(f.bareModel)
 
@@ -2042,7 +2042,7 @@ func (f *chatFlow) rotateAllowedForStatus(status int) bool {
 func failFastKind(kind upstream.ErrKind) bool {
 	return kind == upstream.ErrContentBlocked || kind == upstream.ErrPromptTooLong ||
 		kind == upstream.ErrImageInvalid || kind == upstream.ErrBadParams ||
-		kind == upstream.ErrModelAccess
+		kind == upstream.ErrModelAccess || kind == upstream.ErrModelNotFound
 }
 
 // handleQueueError 处置官方客户端的队列/并发业务码：
@@ -2087,6 +2087,7 @@ func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr
 //   - ErrPromptTooLong（11115）：上游原文含真实 token 数与上限值，最有价值。
 //   - ErrImageInvalid：图片格式/数据无效，同一 body 换号仍是同样解析错误。
 //   - ErrBadParams（11101）：请求体解析失败，继续轮转会把确定失败伪装成"号不可用"。
+//   - ErrModelNotFound（11102）：上游目录无此模型，所有账号同一答复，404 立即返回。
 func (f *chatFlow) handleRequestLevelError(acct *auth.Auth, kind upstream.ErrKind, respBody []byte, uerr *upstream.Error) {
 	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
 	f.fail(acct.UID)
@@ -2101,10 +2102,16 @@ func (f *chatFlow) handleRequestLevelError(acct *auth.Auth, kind upstream.ErrKin
 		// 空 body 兜底：无上游原文可透传，保留可读分类文案（不编造原文）。
 		msg = fallback
 	}
+	// 模型不存在用 404（与 /v1/models/{model} 的 model_not_found 同口径），
+	// 其余请求级错误保持 400。
+	status := http.StatusBadRequest
+	if kind == upstream.ErrModelNotFound {
+		status = http.StatusNotFound
+	}
 
-	f.out.Error(http.StatusBadRequest, code, msg,
+	f.out.Error(status, code, msg,
 		f.h.hintOf(kind, raw, f.bareModel, f.reqHasImage, uerr))
-	f.st.status = http.StatusBadRequest
+	f.st.status = status
 	f.st.outcome = reqlog.OutcomeHTTPError
 }
 
@@ -2121,6 +2128,8 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 		return "bad_params", "chat request body was rejected by upstream"
 	case upstream.ErrModelAccess:
 		return "model_unavailable", "model is unavailable for this account"
+	case upstream.ErrModelNotFound:
+		return "model_not_found", "model not found in upstream catalog"
 	default:
 		return "invalid_request", ""
 	}
@@ -2221,12 +2230,12 @@ func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
 		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, reason)
 }
 
-// noteSuccessAndBind 记录账号成功、清 11102 负缓存，并让会话粘性跟随最终成功号。
+// noteSuccessAndBind 记录账号成功、清 11136 负缓存，并让会话粘性跟随最终成功号。
 func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	f.h.cfg.Pool.NoteSuccess(acct.UID)
 	f.h.cfg.Pool.NoteRouteSuccess(f.realm, f.bareModel)
-	// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-	// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+	// 11136 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+	// BlockModelClear 按 "11136" reason 前缀识别，只清 11136 条目、不碰 6004 独立冷却。
 	f.h.cfg.Pool.BlockModelClear(acct.UID, f.bareModel)
 
 	if f.sessKey != "" && f.h.cfg.Session != nil {
@@ -2726,7 +2735,7 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 			msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 		}
 	case upstream.ErrModelBlocked, upstream.ErrModelAccess:
-		// 11102/11136 模型在该账号不可用、11141 平台下线：上游原文已经写清原因，
+		// 11136 该账号无模型权限、11141 平台下线：上游原文已经写清原因，
 		// 但 code 此前停在默认的 no_healthy_account（"服务端过载"语义，客户端会不断
 		// 重试）。用 400 + 明确 code 把不可重试的性质讲清楚——真正该做的是换个模型。
 		code = "model_unavailable"
@@ -2920,7 +2929,9 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11102/11136 负缓存避让。
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11136 负缓存避让。
+//   - ErrModelNotFound → 11102 上游目录无此模型：请求级 fail-fast（404），
+//     不罚账号、不轮转、不写 (账号,模型) 负缓存与路由熔断。
 //   - ErrModelAccess → BlockModelBackoff + NoteRouteFailure：11141 模型级
 //     避让；请求级 fail-fast 已在 handleRequestLevelError 提前返回，不罚账号。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
@@ -2942,14 +2953,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 	case upstream.ErrHardCredit, upstream.ErrSessionDead, upstream.ErrNotFound, upstream.ErrServer:
 		h.applyLifecyclePolicy(uid, kind)
 	case upstream.ErrModelBlocked:
-		// 11102「该后端无此模型」：(账号, 模型) 负缓存避让。复用 modelCooldowns 机制
-		// （与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
+		// 11136「该账号无该模型权限」：(账号, 模型) 负缓存避让。复用 modelCooldowns
+		// 机制（与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
 		h.cfg.Pool.NoteRouteFailure(realm, model)
 	case upstream.ErrModelAccess:
 		// 11141 模型已下线：请求级 fail-fast（不罚账号、不轮转），
-		// 同时写 (账号,模型) 负缓存，后续请求不再命中同一组合。与 11102 同机制但
+		// 同时写 (账号,模型) 负缓存，后续请求不再命中同一组合。与 11136 同机制但
 		// 独立 reason，避免把两种语义混进同一条台账。
 		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelAccessReason)
 		h.cfg.Pool.NoteRouteFailure(realm, model)
@@ -2959,7 +2970,7 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 		h.cfg.Pool.NoteFailures(uid)
 	default:
 		// ErrNone 与请求/内容类错误（ErrContentBlocked/ErrPromptTooLong/
-		// ErrImageInvalid/ErrBadParams/ErrModelAccess）：请求或内容问题非账号问题，
+		// ErrImageInvalid/ErrBadParams/ErrModelNotFound）：请求或内容问题非账号问题，
 		// 零动作不罚账号（无冷却/熔断/NoteError）。ErrNone 属防御路径，语义不明不喂。
 	}
 }

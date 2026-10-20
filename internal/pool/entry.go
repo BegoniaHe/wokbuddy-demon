@@ -138,7 +138,7 @@ type ModelCostStatus struct {
 // RateLimitedModel 单个被限流模型的台账行（issue #36）。
 type RateLimitedModel struct {
 	Model string `json:"model"`
-	// Kind 区分限流与模型不可用：6004 是 rate_limit，11102 是 model_unavailable。
+	// Kind 区分限流与模型不可用：6004 是 rate_limit，11136 是 model_unavailable。
 	Kind string `json:"kind"`
 	// Until 冷却到期时刻 = 该模型的独立冷却截止（modelCooldowns[m].Until，截断后），
 	// 多模型限流时不再等于 Status.Until（账号级）。
@@ -153,18 +153,18 @@ type RateLimitedModel struct {
 // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。
 // 承载两种「该模型在此账号上不可用」语义：
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
-//   - 11102 该后端无此模型：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
+//   - 11136 账号无该模型权限：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
 //     累计命中次数驱动退避（6004 无 hits 概念，Hits 恒 0）。
 type modelCooldown struct {
-	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11102：now+退避 TTL）。
+	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11136：now+退避 TTL）。
 	Until time.Time
 	// ResetAt 上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断）。
 	// 与 Until 的区别同：Until 可能截断，ResetAt 是上游权威恢复时刻。
-	// 11102 无重置文案，ResetAt 恒零值。
+	// 11136 无重置文案，ResetAt 恒零值。
 	ResetAt time.Time
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string
-	// Hits 11102 负缓存的累计命中次数（驱动指数退避）。6004 条目 Hits 恒 0。
+	// Hits 11136 负缓存的累计命中次数（驱动指数退避）。6004 条目 Hits 恒 0。
 	Hits int
 	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
 	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
@@ -505,7 +505,7 @@ type stateAccount struct {
 	// 与 CreditsExpiring 一并持久化，重启后首次请求仍可沿用最近一次余额快照。
 	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitzero"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
-	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 / 11102
+	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 / 11136
 	// 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达数小时，
 	// 跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。
 	// 恢复时惰性过滤已过期条目。
@@ -521,7 +521,7 @@ type stateAccount struct {
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态
 // modelCooldown 同构（Until/ResetAt/Reason 字段名与语义对齐），落盘/恢复往返无损。
-// Hits 不落盘（重启后 11102 退避从 6h 基数重新学习，同 modelCost 口径）。
+// Hits 不落盘（重启后 11136 退避从 6h 基数重新学习，同 modelCost 口径）。
 type stateModelCooldown struct {
 	Until     time.Time `json:"until"`
 	ResetAt   time.Time `json:"reset_at,omitzero"`

@@ -410,9 +410,40 @@ func TestWindowBoundsTwoHourFallBack(t *testing.T) {
 	}
 }
 
-// 30 分钟拨快的时区（Australia/Lord_Howe：01:30+10:30 → 02:30+11）里
-// time.Date(02:00) 会归一化成 02:30；若把它当成上一桶起点，hours=2 只含当前
-// 小时桶，01 点桶被整段排除。
+// 午夜拨回（America/Santiago 2026-04-05 00:00 -03 → 前一日 23:00 -04）让前一
+// 日 23 点出现两次。滚动窗口的上一桶必须取首个 occurrence，才能与 bucketTime
+// 解析出的桶起点一致；目标日期若误取当日（未来），绝对回退会停在第二次 23 点，
+// hours=2 会把整个前一日 23 点桶排除在窗口外。
+//
+// 本用例临时替换 time.Local，不能 t.Parallel（并行用例不得与全局状态共存）。
+//
+//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
+func TestWindowBoundsMidnightFallBack(t *testing.T) {
+	loc, err := time.LoadLocation("America/Santiago")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	orig := time.Local
+	time.Local = loc
+
+	t.Cleanup(func() { time.Local = orig })
+
+	now := time.Date(2026, 4, 5, 0, 9, 0, 0, loc)
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 4, 4, 23, 0, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（前一日 23 点首个 occurrence）", from, want)
+	}
+
+	if !inWindow("h:2026-04-04T23", from, time.Time{}, true) {
+		t.Fatalf("hours=2 漏掉前一日 23 点桶（from=%v）", from)
+	}
+}
+
+// 30 分钟拨快的时区（Australia/Lord_Howe：02:00+10:30 → 02:30+11）里
+// time.Date(02:00) 与桶键 "T02" 都归一化成 02:30——那就是 02 点桶的起点。
+// hours=2 必须恰好含 02、03 两个桶，不能退到 01:00 把 01 点桶也带进来。
 func TestWindowBoundsPartialSpringForward(t *testing.T) {
 	t.Parallel()
 
@@ -424,8 +455,93 @@ func TestWindowBoundsPartialSpringForward(t *testing.T) {
 	now := time.Date(2026, 10, 4, 3, 10, 0, 0, loc)
 
 	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
-	if want := time.Date(2026, 10, 4, 1, 0, 0, 0, loc); !from.Equal(want) {
-		t.Fatalf("hours=2 from=%v want %v（02:00 不存在，上一桶是 01:00）", from, want)
+	if want := time.Date(2026, 10, 4, 2, 0, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（02:00 不存在，归一化为 02:30）", from, want)
+	}
+
+	// 01 点桶必须排除：hours=2 是当前桶 03 加上一桶 02，多算一小时会让面板
+	// 「最近 2 小时」在拨快日偏大。
+	if !from.After(time.Date(2026, 10, 4, 1, 0, 0, 0, loc)) {
+		t.Fatalf("hours=2 from=%v 仍落在 01 点桶", from)
+	}
+}
+
+// 部分小时被拨快跳过、且跳过区间起点不在整点时（Pacific/Chatham 2026-09-27
+// 02:45 → 03:45），time.Date/ParseInLocation 会把 03:00 归一化成 04:00。窗口
+// 起点必须是该小时真正的首个实际时刻 03:45，否则 hours=1 会把 02 点桶也算进来。
+func TestWindowBoundsPartialSpringForwardMidHour(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	// 拨快完成后：当前桶 04，上一桶应从 03:45 起算。
+	now := time.Date(2026, 9, 27, 4, 30, 0, 0, loc)
+
+	from, _ := (Window{Hours: 2, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=2 from=%v want %v（03:00 不存在，首个实际时刻是 03:45）", from, want)
+	}
+
+	// 当前就在被跳过后的半小时里：hours=1 的起点同样是 03:45，不能退到 02:00。
+	now = time.Date(2026, 9, 27, 3, 50, 0, 0, loc)
+
+	from, _ = (Window{Hours: 1, From: time.Time{}, To: time.Time{}}).boundsAt(now)
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, loc); !from.Equal(want) {
+		t.Fatalf("hours=1 from=%v want %v", from, want)
+	}
+}
+
+// hourFirst 必须返回墙钟小时的首个实际时刻；整小时被抹掉时明确失败。
+func TestHourFirstPartialGap(t *testing.T) {
+	t.Parallel()
+
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	if got, ok := hourFirst(2026, 9, 27, 3, chatham); !ok || !got.Equal(time.Date(2026, 9, 27, 3, 45, 0, 0, chatham)) {
+		t.Fatalf("Chatham 03:00 首个实际时刻 = %v/%v, want 03:45/true", got, ok)
+	}
+
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	if got, ok := hourFirst(2026, 3, 29, 2, berlin); ok {
+		t.Fatalf("Berlin 02:00 整小时被抹掉，hourFirst 不应成功: %v", got)
+	}
+}
+
+// 桶键按写入时的墙钟小时生成；部分分钟被拨快跳过时，本地解析会把该键平移
+// 到下一小时（Chatham 的 03:00 → 04:00）。bucketTime 必须按键里的字面小时
+// 找回桶起点 03:45，否则显式区间会把 03 点桶算到 04 点。
+//
+// 本用例临时替换 time.Local，不能 t.Parallel（并行用例不得与全局状态共存）。
+//
+//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
+func TestBucketTimePartialGap(t *testing.T) {
+	chatham, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	orig := time.Local
+	time.Local = chatham
+
+	t.Cleanup(func() { time.Local = orig })
+
+	got, ok := bucketTime("h:2026-09-27T03")
+	if !ok {
+		t.Fatal("bucketTime 解析失败")
+	}
+
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, chatham); !got.Equal(want) {
+		t.Fatalf("bucketTime = %v, want %v", got, want)
 	}
 }
 

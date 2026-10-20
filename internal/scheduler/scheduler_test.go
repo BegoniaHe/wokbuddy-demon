@@ -1067,3 +1067,22 @@ func TestNextFireSkippedMidnight(t *testing.T) {
 		}
 	}
 }
+
+// TestNextFirePartialSkippedHour 跳过区间起点不在整点时（Pacific/Chatham
+// 2026-09-27 02:45 → 03:45），time.Date(03:00) 会越过目标小时落到 04:00。
+// 03 点槽位应在 03:45 触发，而不是等到 04:00。
+func TestNextFirePartialSkippedHour(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("tzdata 不可用，跳过 DST 用例: %v", err)
+	}
+
+	now := time.Date(2026, 9, 27, 2, 0, 0, 0, loc)
+
+	next := nextFire(now, []int{3})
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, loc); !next.Equal(want) {
+		t.Fatalf("now=%v next=%v want %v（03:45 是该小时首个实际时刻）", now, next, want)
+	}
+}

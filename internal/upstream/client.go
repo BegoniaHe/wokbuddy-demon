@@ -55,7 +55,8 @@ const (
 	ErrContentBlocked                // 内容策略拦截（400 + 审核文案）→ 不罚账号，走降级重试
 	ErrBadParams                     // 请求体解析失败（400 + Unmarshal chat params failed / 11101）→ 请求级错误：不罚号、不轮转，末端 400 透传原文
 	ErrAccountFault                  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
-	ErrModelBlocked                  // 11102/11136「该后端无此模型/无该模型权限」→ (账号,模型) 负缓存避让，切模型/切账号
+	ErrModelBlocked                  // 11136 账号缺该模型权限 → (账号,模型) 负缓存避让，换号重试
+	ErrModelNotFound                 // 11102 上游模型目录无此模型 → 请求级 fail-fast：不罚号、不轮转、不写路由熔断
 	ErrModelAccess                   // 11141 模型已下线 → 请求级 fail-fast + (账号,模型) 负缓存避让
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
@@ -76,6 +77,7 @@ var errKindNames = map[ErrKind]string{
 	ErrContentBlocked: "content_blocked",
 	ErrBadParams:      "bad_params",
 	ErrModelBlocked:   "model_blocked",
+	ErrModelNotFound:  "model_not_found",
 	ErrModelAccess:    "model_access",
 	ErrWafBlock:       "waf_block",
 	ErrPromptTooLong:  "prompt_too_long",
@@ -278,15 +280,15 @@ const modelBlockCode = "11102"
 // not found 措辞。
 const modelBlockMsgMarker = "service info not found"
 
-// ModelBlockReason 11102 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
-// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11102" 前缀识别条目
+// ModelBlockReason 11136 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
+// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11136" 前缀识别条目
 // （与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
-const ModelBlockReason = "11102 model not available"
+const ModelBlockReason = "11136 model not permitted"
 
-// IsModelBlocked 报告 body 是否是「该后端无此模型」(11102) 的确定性答复。
+// IsModelBlocked 报告 body 是否是「上游模型目录无此模型」(11102) 的确定性答复。
 //
 // 只比对 code/msg 等独立字段，绝不做整段文本子串匹配：错误体还带 requestId 等字段，
-// 拿整段文本匹配会把 "11102" 撞在 ID 上、误避让一个本来能用的模型。判定 =
+// 拿整段文本匹配会把 "11102" 撞在 ID 上、误判一个本来能用的模型。判定 =
 // code 字段精确等于 "11102"，或 msg/message 字段命中窄短语 "service info not
 // found"（两者任一命中即真）。只看 400/404：429 带 11102 属限流语义。
 // 字段遍历覆盖顶层与 error 子对象两层。
@@ -626,12 +628,17 @@ func ParseRateReset(body string) (time.Time, bool) {
 // classifyEarly 判定优先级最高的几类：模型不存在、402、11-128 内容拦截、
 // 客户端明确的请求级业务码。顺序即优先级。
 func classifyEarly(status int, body string) (ErrKind, bool) {
-	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
-	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
-	// 4xx 兜底归为 ErrClient（只换号不避让），该坏号会留在池内反复被选中。
+	// 11136 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
+	// 平台级「目录无此模型」分开）。
+	if hasAnyBusinessCode(body, modelAccessCodes...) {
+		return ErrModelBlocked, true
+	}
+	// 11102「上游模型目录无此模型」：所有账号共享同一目录，换号必然得到同一答复。
+	// 归 ErrModelNotFound 请求级 fail-fast——若等到通用 4xx 兜底归 ErrClient 会逐号
+	// 轮转，模型不存在时把一次失败放大 MaxRotate 倍。
 	// 只认 400/404（见 IsModelBlocked），429+11102 落 status==429 层走限流语义。
 	if IsModelBlocked(status, body) {
-		return ErrModelBlocked, true
+		return ErrModelNotFound, true
 	}
 	// 402：真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 	if status == http.StatusPaymentRequired {
@@ -650,8 +657,9 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序自「严」到「宽」，每层的先后都有语义依据：
-//  0. 11102（IsModelBlocked）——「该后端无此模型」确定性答复，语义最具体，最先判
-//     （只认 400/404，429+11102 属限流语义走 status==429 层）。
+//  0. 11136/11102 —— 账号级模型权限缺失与平台级「目录无此模型」分开：11136 换号
+//     并做 (账号,模型) 避让；11102 是请求级事实（所有账号共享同一模型目录），
+//     fail-fast 不轮转（只认 400/404，429+11102 属限流语义走 status==429 层）。
 //  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
 //  2. 11-128 —— 上游内容审核/反探测拦截码（常见形态是非法 JSON），按内容拦截
 //     处理，不罚账号、可降级重试。
@@ -776,7 +784,7 @@ var requestLevelCodes = []string{
 }
 
 // modelAccessCodes 账号级模型权限缺失（11136「无该模型权限」）：同一账号换请求
-// 仍会失败，但换账号可能成功。与 11102 同路径——写 (账号,模型) 负缓存后继续换号。
+// 仍会失败，但换账号可能成功 → 写 (账号,模型) 负缓存后继续换号。
 var modelAccessCodes = []string{"11136"}
 
 // modelRetiredCodes 平台级模型下线（11141「该模型已下线」）：所有账号都会得到
@@ -784,7 +792,7 @@ var modelAccessCodes = []string{"11136"}
 var modelRetiredCodes = []string{"11141"}
 
 // ModelAccessReason 11141 负缓存条目的 reason 前缀。pool.BlockModelClear
-// 按前缀识别可恢复的模型避让条目（11102 与 11141 两族），不碰 6004 限流台账。
+// 按前缀识别可恢复的模型避让条目（11136 与 11141 两族），不碰 6004 限流台账。
 const ModelAccessReason = "11141 model retired"
 
 // accountLimitCodes 账号级使用上限（10105 活跃会话数、15001 联网搜索次数）。
@@ -1003,7 +1011,7 @@ func classifyGeneric4xx(status int, lower, body string) (ErrKind, bool) {
 	// 剩余来源是客户端 JSON 本身畸形——换了账号照样 400，不该罚号（白白冷却好号）。
 	// 归 ErrBadParams：不冷却/不熔断/不计错，且**不轮转**——11101 发生在上游解析
 	// 请求体阶段，还没走到模型路由，所以"不同账号可能有不同模型权限"其实是
-	// 11102（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
+	// 11136（ErrModelBlocked）的理由，那里已有 (账号,模型) 负缓存避让。
 	if strings.Contains(body, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode) {
 		return ErrBadParams, true
 	}

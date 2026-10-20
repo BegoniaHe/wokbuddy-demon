@@ -195,7 +195,7 @@ func (p *Pool) NoteError(uid string) {
 // 成功证明账号当前可用，连败计数与临时出池截止一并归零。
 // **不碰 modelCooldowns**：6004 模型级 limit 每模型独立计时，其他模型成功不得抹掉
 // 本模型的冷却截止（这正是"每模型独立"的语义）。模型级冷却只由到期/复活/账号级
-// 冷却（Cooldown/reviveCoolingLocked）清除。11102 条目的成功清理由 handler 在
+// 冷却（Cooldown/reviveCoolingLocked）清除。11136 条目的成功清理由 handler 在
 // 成功且模型命中时显式调 BlockModelClear（6004 不清，语义不同）。
 func (p *Pool) NoteSuccess(uid string) {
 	p.mu.Lock()
@@ -810,7 +810,7 @@ func (p *Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimit
 		modelCooldown2 := entry4.modelCooldowns[m]
 		if !modelCooldown2.Until.IsZero() && now.Before(modelCooldown2.Until) {
 			kind := "rate_limit"
-			if strings.HasPrefix(modelCooldown2.Reason, "11102") {
+			if strings.HasPrefix(modelCooldown2.Reason, "11136") {
 				kind = "model_unavailable"
 			}
 

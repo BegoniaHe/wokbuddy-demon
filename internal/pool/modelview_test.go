@@ -272,7 +272,7 @@ func TestModelLockViewSortsLockedFirst(t *testing.T) {
 func TestModelLockViewAfterClear(t *testing.T) {
 	t.Parallel()
 	pool := lockViewPool(t)
-	pool.BlockModelBackoff("u1", "glm-5.3", "11102 model [glm-5.3] service info not found")
+	pool.BlockModelBackoff("u1", "glm-5.3", "11136 model not permitted")
 
 	rows := pool.ModelLockView()
 	if len(rows) != 1 || rows[0].State != "partial" {

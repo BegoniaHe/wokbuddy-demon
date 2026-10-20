@@ -78,16 +78,16 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
-		// 11102「该后端无此模型」：确定性答复，归 ErrModelBlocked（(账号,模型) 负缓存避让）。
-		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelBlocked},
-		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelBlocked},
-		{400, `{"msg":"service info not found"}`, ErrModelBlocked},
+		// 11102「上游模型目录无此模型」：确定性答复，归 ErrModelNotFound 请求级 fail-fast。
+		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelNotFound},
+		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelNotFound},
+		{400, `{"msg":"service info not found"}`, ErrModelNotFound},
 		// 同节点内 code 为空串/纯空白时须继续回落后备键 errCode/error_code：
 		// 停在空 code 会丢掉 11102 判定（回归：firstCodeField 曾「首个存在即返回」）。
-		{400, `{"code":"","errCode":"11102"}`, ErrModelBlocked},
-		{404, `{"code":"   ","error_code":"11102"}`, ErrModelBlocked},
+		{400, `{"code":"","errCode":"11102"}`, ErrModelNotFound},
+		{404, `{"code":"   ","error_code":"11102"}`, ErrModelNotFound},
 		// msg 为纯空白时须继续回落后备键 message（同类回归）。
-		{400, `{"msg":"   ","message":"service info not found"}`, ErrModelBlocked},
+		{400, `{"msg":"   ","message":"service info not found"}`, ErrModelNotFound},
 		// 11102 撞在 requestId 上不算（不得误避让可用模型）。
 		{404, `{"requestId":"11102","msg":"ok"}`, ErrNotFound},
 		// 429 + 11102 → 限流语义（ErrSoftRate），不是模型不存在。

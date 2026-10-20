@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 func TestGeminiToOpenAIRequest(t *testing.T) {
@@ -320,6 +321,16 @@ func TestGeminiXGoogAPIKeyAuth(t *testing.T) {
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("x-goog-api-key code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestGeminiStreamModelNotFoundStatus 流式模型不存在应与非流式 404 同口径，
+// 不能退化成 400 INVALID_ARGUMENT。
+func TestGeminiStreamModelNotFoundStatus(t *testing.T) {
+	t.Parallel()
+
+	if got := geminiStreamErrorStatus(upstream.ErrModelNotFound); got != http.StatusNotFound {
+		t.Fatalf("status=%d want 404", got)
 	}
 }
 

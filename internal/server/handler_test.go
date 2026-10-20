@@ -2570,6 +2570,39 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	}
 }
 
+// TestChatModelNotFoundDoesNotRotate 上游 11102（目录无此模型）是请求级事实：
+// 一次尝试即返回 404，不按 MaxRotate 逐号重试，也不冷却账号。
+func TestChatModelNotFoundDoesNotRotate(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+		return http.StatusBadRequest, `{"code":11102,"msg":"model [gpt-100] service info not found"}`, false
+	})
+	state := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u3", AccessToken: "at3", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, h, `{"model":"gpt-100","messages":[]}`)
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "model_not_found") {
+		t.Fatalf("code=%d body=%s want 404 model_not_found", rec.Code, rec.Body)
+	}
+
+	if calls != 1 {
+		t.Errorf("upstream calls=%d want 1 (must not rotate on 11102)", calls)
+	}
+
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		if st := statusOf(t, state, uid); st.Cooling {
+			t.Errorf("%s should not be penalized on 11102: %+v", uid, st)
+		}
+	}
+}
+
 // TestChatModelBlockPlatformHint 模型全池阻塞且账号共享同一上游重置时刻 → hint 标注
 // platform-level（issue #29）。
 func TestChatModelBlockPlatformHint(t *testing.T) {
