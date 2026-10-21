@@ -575,7 +575,7 @@ function UsageDimRow({ x, dim, withPerf }: { x: UsageRow; dim: DimKey; withPerf:
 }
 
 // ── 时序图 ────────────────────────────────────────────────────────────
-function UsageChart({ series }: { series: SeriesPoint[] }) {
+export function UsageChart({ series }: { series: SeriesPoint[] }) {
   const model = useMemo(() => {
     const pts: { t: number; scope?: string; raw: string; pt: number; ct: number; tt: number; req: number }[] = [];
     for (const p of series) {
@@ -587,12 +587,15 @@ function UsageChart({ series }: { series: SeriesPoint[] }) {
     }
     return pts;
   }, [series]);
+  // hook 必须在任何早返回之前调用：数据从「有」变「无」时 hook 数量前后不一致，
+  // React 会抛 "Rendered fewer hooks than expected"（整页白屏）。
+  const narrow = useMediaQuery(MOBILE_QUERY);
 
   if (!model.length) {
     return <div className="py-8 text-center text-xs text-muted-foreground">暂无用量数据。发起一次对话后再刷新。</div>;
   }
 
-  const { W, H, PL, PR, PT, iw, ih, ticks: maxTicks } = chartLayout(useMediaQuery(MOBILE_QUERY));
+  const { W, H, PL, PR, PT, iw, ih, ticks: maxTicks } = chartLayout(narrow);
   const t0 = model[0]!.t;
   const t1 = model[model.length - 1]!.t;
   const span = Math.max(1, t1 - t0);
@@ -800,11 +803,14 @@ function Heatmap({ days, metric }: { days: HeatDay[]; metric: HeatMetric }) {
 }
 
 // ── 单指标趋势图（issue #111）─────────────────────────────────────────
-function TrendChart({ points, metric }: { points: ReturnType<typeof usTrendPoints>; metric: TrendMetric }) {
+export function TrendChart({ points, metric }: { points: ReturnType<typeof usTrendPoints>; metric: TrendMetric }) {
+  // 同上：先取 hook 再判空，避免早返回改变 hook 数量。
+  const narrow = useMediaQuery(MOBILE_QUERY);
+
   if (!points.length) {
     return <div className="py-8 text-center text-xs text-muted-foreground">所选指标在当前范围内没有数据。</div>;
   }
-  const { W, H, PL, PR, PT, iw, ih, ticks: maxTicks } = chartLayout(useMediaQuery(MOBILE_QUERY));
+  const { W, H, PL, PR, PT, iw, ih, ticks: maxTicks } = chartLayout(narrow);
   const t0 = points[0]!.t;
   const t1 = points[points.length - 1]!.t;
   const span = Math.max(1, t1 - t0);
