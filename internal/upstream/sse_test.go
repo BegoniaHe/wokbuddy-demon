@@ -236,6 +236,63 @@ func TestStripToolCallNames(t *testing.T) {
 	assertStripContentOnlyUntouched(t, tools, seen)
 }
 
+// TestStripToolCallNamesEmptyFirstName 首片只带 arguments（name 缺失）时不得占用
+// 「已下发 name」配额：name 随后续分片到达时必须保留，否则客户端拿到没有 name 的
+// 工具调用（Anthropic 面会整块丢弃 tool_use）。
+func TestStripToolCallNamesEmptyFirstName(t *testing.T) {
+	t.Parallel()
+
+	tools := newToolIndex()
+	seen := map[int]bool{}
+
+	first := stripTestFrame(0, "", `{"term":`)
+	stripToolCallNames(first, tools, seen)
+
+	if seen[0] {
+		t.Fatal("空 name 首片不应标记 seen")
+	}
+
+	// stripTestFrame 在 name=="" 时不写该键，这里补一个显式空串键的帧：
+	// 「键存在但为空」同样不得占用配额，且该噪声键要被删掉。
+	explicitEmpty := map[string]any{"choices": []any{
+		map[string]any{"delta": map[string]any{
+			"tool_calls": []any{
+				map[string]any{"index": float64(1), "function": map[string]any{
+					"name": "", "arguments": `{"a":`,
+				}},
+			},
+		}},
+	}}
+	stripToolCallNames(explicitEmpty, tools, seen)
+
+	if _, ok := stripTestFn(explicitEmpty)["name"]; ok {
+		t.Errorf("显式空 name 键是噪声，应删除: %#v", stripTestFn(explicitEmpty))
+	}
+
+	if seen[1] {
+		t.Error("显式空 name 不应标记 seen")
+	}
+
+	second := stripTestFrame(0, "lookup", `"x"}`)
+	stripToolCallNames(second, tools, seen)
+
+	if stripTestFn(second)["name"] != "lookup" {
+		t.Errorf("后到的 name 被删: %#v", stripTestFn(second))
+	}
+
+	if !seen[0] {
+		t.Error("非空 name 下发后应标记 seen")
+	}
+
+	// 已下发后同一 index 的重复 name 仍按原语义删除。
+	third := stripTestFrame(0, "lookup", "y")
+	stripToolCallNames(third, tools, seen)
+
+	if _, ok := stripTestFn(third)["name"]; ok {
+		t.Errorf("重复 name 应删除: %#v", stripTestFn(third))
+	}
+}
+
 // TestStripToolCallNamesMissingIndex 上游省略 index 时按 id 归位：同帧第二个
 // 调用及跨帧的新调用不得被当成同一 index 的首片重复而删除 name。
 func TestStripToolCallNamesMissingIndex(t *testing.T) {

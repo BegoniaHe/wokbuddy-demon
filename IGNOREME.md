@@ -299,11 +299,16 @@ claude
 ```
 
 - 鉴权同时接受 `Authorization: Bearer` 与 Anthropic SDK 的 `X-Api-Key`，两者走同一常量时间比较。
-- 请求侧支持 `system`、文本/图片内容块、`tool_use` / `tool_result`、`tools`、`tool_choice`（含 `disable_parallel_tool_use`）、`stop_sequences`、`thinking`；响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
-- system 与 message text 块上的 `cache_control` 会保留到出站 content parts，供上游 prompt cache 使用。
-- 流结束时校验各工具块聚合后的 `input_json_delta` 是否为合法 JSON；截断/非法时记 WARN（不含参数原文），本期不改写分片。
-- 上游错误转换为 Anthropic `{"type":"error","error":{...}}`，`gateway_hint` 保留在 error 对象内。
-- `count_tokens` 无本地 tokenizer，按请求文本字节数近似估算，仅用于客户端上下文预算，不作计费依据。
+- 请求侧支持顶层 `system` 与 `system` role 消息、文本/图片/文档内容块、`tool_use` / `tool_result`（`is_error` 会在 tool 内容前加 `[tool_error]` 标记）、`tools`（客户端工具，`type` 可省略或为 `custom`，`strict` 透传）、`tool_choice`（含 `disable_parallel_tool_use`）、`stop_sequences`、`thinking`（含 `adaptive` / `between_tools` / `display`）；服务端工具与其余无法映射的内容块返回明确 400；`redacted_thinking` 无可见内容，跳过而不失败。文档 `source.type=url` 以 `file.file_url` 透传，取决于上游是否接受该字段。
+- 并行 `tool_calls` 按工具 index 缓冲；文本/思考恢复或新工具批次出现时按顺序刷新已完整的批次，收尾时写出剩余块，避免交错分片拆坏 `tool_use`，也避免 trailing text 排到工具调用之前。参数在批次落地时整块下发，不再逐片产生 `input_json_delta`；无参工具（`arguments:""`）的批次要等 `finish_reason` / `[DONE]` 才落地，其后的正文也随之后发。上游报错或截断时先落地已生成内容再发 error 事件（截断的参数只记 WARN）。响应侧映射为 Anthropic `Message` 与 SSE 事件（`message_start` / `content_block_*` / `message_delta` / `message_stop`）。
+- 明确拒绝：服务端工具结果块、`tool_reference` / `browser_state`、`container` / `diagnostics` / `inference_geo`；块内的 `citations` 等无对应字段静默忽略；`messages` 上限 100,000 条，`max_tokens` 下限 0。
+- system、text、image、document 与 tool_result 块上的 `cache_control` 会保留到出站内容，供上游 prompt cache 使用；`max_tokens=0`（缓存预热）按 0 写出，但 GPT 系模型仍会被上游下限钳到 16（见 `clampGPTMinMaxTokens`）。
+- `top_k` / `speed` / `service_tier` / `metadata`（`user_id` 上限 512）与顶层 `cache_control` 原样写进上游 body，是否生效取决于上游；`temperature` / `top_p` 限定在 `[0,1]`，`top_k` 不得为负，越界 400。
+- `stop_sequences` 命中已知后缀时返回 `stop_reason=stop_sequence` 与匹配序列；上游未回传命中序列时保持 `end_turn`。
+- 流结束时校验各工具块聚合后的 `input_json_delta` 是否为合法 JSON；截断/非法时记 WARN（不含参数原文），不改写分片。合法但不是对象的参数（`null` / `[]` / 数字等）与非流式路径同口径归一成 `{}`，空/纯空白参数不下发 `input_json_delta`。
+- 上游错误优先采信帧内已有的 Anthropic `error.type`，否则按 `FrameKind` 转换为 Anthropic error.type（限流/过载/余额等）；判不出类别的帧与网关本地兜底帧一律 `api_error`，不臆造成客户端参数错误。`gateway_hint` 保留在 error 对象内；响应带 `Request-Id`，错误体顶层 `request_id` 与响应头一致，供 SDK 读取。
+- Messages 端点方法不匹配（如 `GET /v1/messages`、`GET /v1/messages/count_tokens`）返回 `405` + `Allow: POST` 的 Anthropic 错误体（改前是 404 `not_found_error`）；CORS 允许头补上 `Anthropic-Beta` / `Anthropic-Dangerous-Direct-Browser-Access`，并暴露 `Request-Id`。
+- `count_tokens` 无本地 tokenizer，按 prompt 文本字节数近似估算（跳过模型名与 base64 载荷），要求 `messages` 非空，仅用于客户端上下文预算，不作计费依据。
 - 未配置模型别名时，Anthropic 客户端可直接请求上游裸模型名。
 
 Gemini CLI（GATEWAY 模式）接入：
@@ -421,7 +426,7 @@ gemini
 | `notify.webhook_url` | 空 | 告警 webhook（http/https）；空 = 关闭 |
 | `notify.events` | `[]` | 订阅事件；空 = 默认关键事件（session_dead / pool_unavailable / credit_low / waf_ip_blocked / task_failed） |
 | `server.read_timeout` | `300s` | 入站请求读取（含 body 上传）总时长上限；`0` = 不限制。改后需重启 |
-| `server.max_body_bytes` | `33554432` | 聊天类入站请求体上限（字节，32 MiB，对齐官方桌面端 VLM 代理），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413 `payload_too_large`；`0` = 不限制。改后需重启 |
+| `server.max_body_bytes` | `33554432` | 聊天类入站请求体上限（字节，32 MiB，对齐官方桌面端 VLM 代理），覆盖 `/v1/chat/completions`、`/v1/messages` 与 count_tokens；超限返回 413（OpenAI 面 `payload_too_large`，Anthropic 面 `request_too_large`）；`0` = 不限制。改后需重启 |
 | `server.request_accept_grace_seconds` | `0` | 停机摘流宽限（秒）：收到 SIGTERM 后 `/healthz` 立即 503，listener 继续受理该时长再关闭；`0` = 立即停机。改后需重启 |
 | `server.shutdown_grace_seconds` | `30` | listener 关闭后等待在途 SSE 流排空的上限（秒）；`0` 回落 30，负值报错。改后需重启 |
 | `server.cors_origins` | `[]` | 允许跨域访问 `/v1/*` 的 Origin 列表（如 `["http://localhost:3000"]`）；空 = 关闭。仅精确匹配，不支持 `*`；管理面不开放 |
@@ -595,7 +600,7 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 - 命名密钥**只作用于网关 API 面**（`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`）；
 - 面板、`GET /status`、`GET /metrics` 仍**只认**默认 `api_key`（命名密钥是给客户端的，不获得管理/运维可见性）；
 - 每把密钥记录 `last_used_at`、请求数 / token 用量与被限制拒绝数，面板可查看；
-- 面板「限制」可设置每把密钥的 `rpm` / `tpm` / `max_concurrent` / 模型白名单（glob，可带 `cn:` / `global:` 前缀）；超限返回 `429 + Retry-After`，白名单未命中返回 `403 model_not_allowed`；未配置限制的密钥行为不变。限流为进程内单实例计数；
+- 面板「限制」可设置每把密钥的 `rpm` / `tpm` / `max_concurrent` / 模型白名单（glob，可带 `cn:` / `global:` 前缀）；超限返回 `429 + Retry-After`，错误体按入站协议编码（OpenAI / Anthropic / Gemini 各自的信封），白名单未命中返回 `403 model_not_allowed`；未配置限制的密钥行为不变。限流为进程内单实例计数；
 - 白名单按别名 / 后台模型改写 / 模态路由解析后的**最终模型**匹配（例如 `models.aliases`、`models.background_names` 的目标，或 `features.multimodal_routing` 改选的模型）；只写客户端请求的原模型名不会生效，已有配置需改写成目标名；
 - 每把密钥可绑定出口（`cn` / `global` / 跟随模型）：绑定后不带前缀的请求只走对应域；与显式 `cn:` / `global:` 前缀冲突返回 `400 realm_binding_conflict`，不消耗账号或上游额度；
 - `api_key` 为空且未创建任何命名密钥时，网关仍为「不鉴权」放行（既有默认）。

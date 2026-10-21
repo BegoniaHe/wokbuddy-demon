@@ -63,6 +63,54 @@ func TestNamedKeyRPMAndDefaultKeyUnaffected(t *testing.T) {
 	}
 }
 
+// TestNamedKeyRPMAnthropicErrorShape 命名密钥超限时 /v1/messages 必须返回
+// Anthropic 错误信封，而不是 OpenAI 形态。
+func TestNamedKeyRPMAnthropicErrorShape(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+
+	rec, raw, err := store.Create("limited")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, err := store.UpdateLimits(rec.ID, apikey.Limits{RPM: 1, TPM: 0, MaxConcurrent: 0, Models: nil}); err != nil || !ok {
+		t.Fatalf("limits: %v %v", ok, err)
+	}
+
+	handler := NewHandler(&Config{APIKey: "secret", Keys: store})
+
+	do := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens",
+			strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Authorization", "Bearer "+raw)
+
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+
+		return recorder
+	}
+
+	if code := do().Code; code != http.StatusOK {
+		t.Fatalf("第一个请求 code=%d", code)
+	}
+
+	limited := do()
+	if limited.Code != http.StatusTooManyRequests {
+		t.Fatalf("超限 code=%d body=%s", limited.Code, limited.Body)
+	}
+
+	if limited.Header().Get("Retry-After") == "" {
+		t.Fatal("缺少 Retry-After")
+	}
+
+	if body := limited.Body.String(); !strings.Contains(body, `"type":"error"`) ||
+		!strings.Contains(body, `"rate_limit_error"`) {
+		t.Fatalf("超限应返回 Anthropic 错误体: %s", body)
+	}
+}
+
 // TestNamedKeyModelWhitelist 模型白名单拒绝未命中模型，命中时正常转发。
 func TestNamedKeyModelWhitelist(t *testing.T) {
 	t.Parallel()
@@ -144,11 +192,11 @@ func TestNamedKeyModelWhitelistAnthropic(t *testing.T) {
 		t.Fatalf("/v1/messages 拒绝应为 Anthropic 错误体: %s", denied.Body)
 	}
 
-	if code := do("/v1/messages/count_tokens", `{"model":"glm-5.2"}`).Code; code != http.StatusOK {
+	if code := do("/v1/messages/count_tokens", `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`).Code; code != http.StatusOK {
 		t.Fatalf("白名单模型 count_tokens code=%d", code)
 	}
 
-	denied = do("/v1/messages/count_tokens", `{"model":"claude-x"}`)
+	denied = do("/v1/messages/count_tokens", `{"model":"claude-x","messages":[{"role":"user","content":"hi"}]}`)
 	if denied.Code != http.StatusForbidden {
 		t.Fatalf("白名单外模型 count_tokens code=%d", denied.Code)
 	}
@@ -193,7 +241,7 @@ func TestNamedKeyModelWhitelistBackgroundAnthropic(t *testing.T) {
 
 	setModels("deepseek-v4.1-flash")
 
-	if code := do("/v1/messages/count_tokens", `{"model":"gpt-5-background"}`).Code; code != http.StatusOK {
+	if code := do("/v1/messages/count_tokens", `{"model":"gpt-5-background","messages":[{"role":"user","content":"hi"}]}`).Code; code != http.StatusOK {
 		t.Fatalf("白名单目标模型 count_tokens code=%d", code)
 	}
 
@@ -204,7 +252,7 @@ func TestNamedKeyModelWhitelistBackgroundAnthropic(t *testing.T) {
 		t.Fatalf("原模型名不应绕过 /v1/messages 白名单 code=%d", code)
 	}
 
-	if code := do("/v1/messages/count_tokens", `{"model":"gpt-5-background"}`).Code; code != http.StatusForbidden {
+	if code := do("/v1/messages/count_tokens", `{"model":"gpt-5-background","messages":[{"role":"user","content":"hi"}]}`).Code; code != http.StatusForbidden {
 		t.Fatalf("原模型名不应绕过 count_tokens 白名单 code=%d", code)
 	}
 }

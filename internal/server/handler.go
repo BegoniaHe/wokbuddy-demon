@@ -306,6 +306,13 @@ func (h *Handler) BeginShutdown() { h.shuttingDown.Store(true) }
 func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 	message := "unknown endpoint: " + r.Method + " " + r.URL.Path
 
+	if anthropicMessagesMethodNotAllowed(r) {
+		w.Header().Set("Allow", http.MethodPost)
+		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed", "")
+
+		return
+	}
+
 	if requestsGemini(r) {
 		writeGeminiError(w, http.StatusNotFound, message, "")
 		return
@@ -337,7 +344,7 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 	allowed := origin != "" && h.cors[origin]
 	if allowed {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, X-Request-ID")
+		w.Header().Set("Access-Control-Expose-Headers", "Retry-After, Request-Id, X-Request-ID")
 	}
 
 	if r.Method != http.MethodOptions {
@@ -349,7 +356,8 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 
 		headers := r.Header.Get("Access-Control-Request-Headers")
 		if headers == "" {
-			headers = "Authorization, Content-Type, X-Requested-With, X-Api-Key, X-Goog-Api-Key, Anthropic-Version"
+			headers = "Authorization, Content-Type, X-Requested-With, X-Api-Key, X-Goog-Api-Key, " +
+				"Anthropic-Version, Anthropic-Beta, Anthropic-Dangerous-Direct-Browser-Access"
 		}
 
 		w.Header().Set("Access-Control-Allow-Headers", headers)
@@ -442,8 +450,10 @@ func writeClientAuthError(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.HasPrefix(r.URL.Path, "/v1/messages") || requestsAnthropicModels(r) {
+	if wantsAnthropicErrorBody(r) {
+		setAnthropicRequestID(w, r)
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "missing or invalid API key", "")
+
 		return
 	}
 
@@ -467,7 +477,8 @@ func writeClientAuthFailLimit(w http.ResponseWriter, r *http.Request, retry time
 		return
 	}
 
-	if strings.HasPrefix(r.URL.Path, "/v1/messages") || requestsAnthropicModels(r) {
+	if wantsAnthropicErrorBody(r) {
+		setAnthropicRequestID(w, r)
 		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error",
 			"too many authentication failures", "")
 
@@ -513,7 +524,7 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
 		if !ok {
 			h.cfg.Keys.RecordRejected(res.KeyID)
-			writeKeyLimitError(w, retryAfter)
+			writeKeyLimitError(w, r, retryAfter)
 
 			return
 		}
@@ -640,15 +651,16 @@ const (
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 // Anthropic SDK 固定带 anthropic-version 头，按 Anthropic 分页形态返回。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
-	list := h.modelList()
 	if requestsAnthropicModels(r) {
-		writeJSON(w, http.StatusOK, anthropicModelList(list))
+		setAnthropicRequestID(w, r)
+		writeJSON(w, http.StatusOK, anthropicModelList(h.modelList()))
+
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   list,
+		"data":   h.modelList(),
 	})
 }
 
@@ -656,10 +668,15 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // `GET /v1/models/{model_id}` 共用；按请求头选择响应形态）。
 func (h *Handler) modelRetrieve(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("model")
+	isAnthropic := requestsAnthropicModels(r)
+
+	if isAnthropic {
+		setAnthropicRequestID(w, r)
+	}
 
 	for _, entry := range h.modelList() {
 		if stringValue(entry["id"]) == id {
-			if requestsAnthropicModels(r) {
+			if isAnthropic {
 				writeJSON(w, http.StatusOK, anthropicModelEntry(entry))
 				return
 			}
@@ -670,7 +687,7 @@ func (h *Handler) modelRetrieve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if requestsAnthropicModels(r) {
+	if isAnthropic {
 		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "model not found", "")
 		return
 	}
@@ -678,9 +695,27 @@ func (h *Handler) modelRetrieve(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIError(w, http.StatusNotFound, "model_not_found", "model not found")
 }
 
+// anthropicMessagesMethodNotAllowed 报告方法不匹配的 Messages 端点。
+// 尾斜杠写法（/v1/messages/）不落在已注册的精确路由上，这里归一化后再判定，
+// 否则同一端点按方法不同分别得到 405 与 404。
+func anthropicMessagesMethodNotAllowed(r *http.Request) bool {
+	if r.Method == http.MethodPost {
+		return false
+	}
+
+	path := strings.TrimSuffix(r.URL.Path, "/")
+
+	return path == "/v1/messages" || path == "/v1/messages/count_tokens"
+}
+
 // requestsAnthropicModels 判断调用方是否按 Anthropic Models API 解析响应。
 func requestsAnthropicModels(r *http.Request) bool {
 	return strings.TrimSpace(r.Header.Get("Anthropic-Version")) != ""
+}
+
+// wantsAnthropicErrorBody 报告入站请求是否按 Anthropic 协议编码错误体。
+func wantsAnthropicErrorBody(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, "/v1/messages") || requestsAnthropicModels(r)
 }
 
 // requestsGemini 判断请求是否走 Gemini GenerateContent 协议面（含 /v1 版本）。
