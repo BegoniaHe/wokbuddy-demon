@@ -45,8 +45,8 @@ func (s *Scheduler) streakAll(trigger string) (total, success, failure int) {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 
-		if account.IsEnterprise() {
-			continue // 企业版门控：无成长体系（/activity/growth/streak 上游一律 403）
+		if account.IsEnterpriseSession() {
+			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/streak 上游一律 403）
 		}
 
 		runCounters2.record(s.streakBonusAccount(account))
@@ -89,9 +89,9 @@ func (s *Scheduler) claimStreakGifts(account4 *auth.Auth) {
 		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(account4.UID, account4.NicknameValue()), credit)
 	}
 
-	if credit, err := s.cfg.Upstream.ClaimCompensation(account4); err == nil {
-		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(account4.UID, account4.NicknameValue()), credit)
-	}
+	// 补偿：先查状态再决定是否领（不再盲领——「没有/已领/领取失败」三种情形
+	// 此前在日志里完全同构）。无活动静默、失败必显形，见 claimCompensationIfPending。
+	s.claimCompensationIfPending(account4)
 }
 
 // redeemUnlockedTiers 兑换所有已解锁档位（locked/claimed 跳过；未解锁 403 静默）。

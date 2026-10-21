@@ -124,6 +124,9 @@ type Config struct {
 	LocalWebTools bool
 	// LocalWebToolRounds 本地工具代跑轮数（0 回落默认 3，封顶 8）。
 	LocalWebToolRounds int
+	// HiddenModels 模型黑名单（"cn:x"/"global:x" 归一形式）；空 = 关闭。
+	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
+	HiddenModels map[string]struct{}
 	// BackgroundNames 后台模型改写名单（小写；issue #103）；空 = 关闭。
 	BackgroundNames map[string]bool
 	// BackgroundTarget 后台模型改写目标（issue #103）。
@@ -182,6 +185,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		LocalWebToolRounds: h.cfg.LocalWebToolRounds,
 		BackgroundNames:    h.cfg.BackgroundNames,
 		BackgroundTarget:   h.cfg.BackgroundTarget,
+		HiddenModels:       h.cfg.HiddenModels,
 	}
 }
 
@@ -254,6 +258,7 @@ func NewHandler(cfg *Config) *Handler {
 	handler.mux.HandleFunc("POST /v1/chat/completions", handler.withRecovery(handler.withClientAuth(handler.chatCompletions)))
 	handler.mux.HandleFunc("POST /v1/responses", handler.withRecovery(handler.withClientAuth(handler.responsesHandler)))
 	handler.mux.HandleFunc("POST /v1/messages", handler.withRecovery(handler.withClientAuth(handler.anthropicMessagesHandler)))
+	handler.registerSearchRoute()
 	handler.mux.HandleFunc(
 		"POST /v1/messages/count_tokens",
 		handler.withRecovery(handler.withClientAuth(handler.anthropicCountTokensHandler)),
@@ -381,9 +386,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
-		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" ||
-			r.URL.Path == "/v1/responses" || requestsGemini(r)) {
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && h.tracedPath(r) {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r, h.cfg.TrustedProxies)
@@ -898,12 +901,23 @@ func (h *Handler) modelList() []map[string]any {
 
 	models := h.fetchDynamicModels()
 	for i := range models {
+		// 按上游裸模型名判定：条目 id 是 "cn:<model>" 形态，直接用会永远匹配不到。
+		if h.modelHidden("cn", models[i].ID) {
+			continue
+		}
+
 		out = append(out, h.cnModelEntry(&models[i]))
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
 	// 名单 = 纯动态探测结果（fetchGlobalModels，失败/无号 → 空）。
 	if h.cfg.GlobalEnabled {
-		out = append(out, h.globalModelEntries()...)
+		for _, entry := range h.globalModelEntries() {
+			if id, ok := entry["id"].(string); ok && h.modelHidden("global", strings.TrimPrefix(id, "global:")) {
+				continue
+			}
+
+			out = append(out, entry)
+		}
 	}
 
 	return h.appendAliasEntries(out)
@@ -932,6 +946,13 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 	}
 
 	for _, name := range names {
+		upstreamID := normalizeAliasTarget(h.cfg.ModelAliases[name])
+		// 别名条目同样受黑名单约束：别名名字本身或其目标模型被隐藏时都不列出
+		// （否则「藏起来的模型」会经由别名泄露）。
+		if realm, bare, _ := splitRealm(upstreamID); h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
+			continue
+		}
+
 		entry := map[string]any{
 			"id":       name,
 			"object":   "model",
@@ -939,7 +960,7 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 			"owned_by": "workbuddy",
 			// upstream_id 保留配置里的 "[realm:]model" 原文；省略 realm 时
 			// 请求侧裸名按 cn 解析，这里也补上 cn: 便于客户端识别目标域。
-			"upstream_id": normalizeAliasTarget(h.cfg.ModelAliases[name]),
+			"upstream_id": upstreamID,
 		}
 		if i, ok := index[name]; ok {
 			out[i] = entry
@@ -1100,9 +1121,18 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 		// 拉取失败只进负缓存（5min lastFail），不 NoteError：NoteError 喂的是 chat
 		// 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；
 		// models 拉取失败 ≠ 账号 chat 不可用。
+		//
+		// 但必须留一条 WARN：静默返回会让上游接口变更、账号不可用、网络问题全都
+		// 无法从日志发现。负缓存期内不再重试，所以这条路每 5min 最多 1 行，不刷屏。
 		h.modelsCache.Lock()
 		h.modelsCache.lastFail = time.Now()
 		h.modelsCache.Unlock()
+
+		if err != nil {
+			log.Printf("WARN: [server] /v1/models: CN 模型目录拉取失败: %v", err)
+		} else {
+			log.Printf("WARN: [server] /v1/models: CN 模型目录返回空列表（按失败处理，回落内置种子）")
+		}
 
 		return nil
 	}
@@ -1147,6 +1177,11 @@ type chatFlow struct {
 	stream   bool
 	rawModel string
 	realm    string
+	// crossRealm 本次请求允许跨域回退（开关开启且请求未显式指定域；判定见
+	// crossRealmAllowed/realmExplicitFor，结果在构造期捕获一次）。
+	crossRealm bool
+	// realmSwitched 本次请求是否已因 11102 切过域（只允许一次）。
+	realmSwitched bool
 	// realmErr 命名密钥出口绑定与请求显式前缀冲突（issue #94）；非 nil 时
 	// serveChat 在选号前返回 400。
 	realmErr      error
@@ -1213,8 +1248,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
-func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
-	chatFlow2 := h.newChatFlow(in, out)
+func (h *Handler) serveChat(r *http.Request, input *chatInput, out chatResponder) {
+	chatFlow2 := h.newChatFlow(input, out)
 	if chatFlow2.realmErr != nil {
 		chatFlow2.out.Error(http.StatusBadRequest, "realm_binding_conflict", chatFlow2.realmErr.Error(), "")
 		chatFlow2.st.status = http.StatusBadRequest
@@ -1226,6 +1261,11 @@ func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
 	defer chatFlow2.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
 	defer chatFlow2.recordKeyUsage()
+	// 模型黑名单（models.hidden）先于命名密钥白名单：隐藏模型不给任何 key 放行，
+	// 避免「key 白名单」变相解禁。判定点与白名单同处（后台改写/别名解析之后）。
+	if !chatFlow2.checkModelHidden() {
+		return
+	}
 	// 模型白名单必须在后台改写/别名解析之后校验：此时 f.realm/f.bareModel 才是
 	// 实际选号与出站使用的最终模型（裸名不再固定按 cn 误判 global key）。
 	if !chatFlow2.checkModelAllowed() {
@@ -1235,16 +1275,54 @@ func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
 	if !chatFlow2.applyModalityRoute() {
 		return
 	}
-	// 模态路由可能改写模型：按改写后的最终模型复核白名单，避免绕过。
+	// 模态路由可能改写模型：按改写后的最终模型复核隐藏与白名单，避免绕过。
+	if !chatFlow2.checkModelHidden() {
+		return
+	}
+
 	if !chatFlow2.checkModelAllowed() {
 		return
 	}
+	// 跨域回退授权（命名密钥按模型/域的白名单）同样按最终模型重算：改选后的模型
+	// 若不在另一域的白名单内，不能沿用原模型的授权跨域。
+	chatFlow2.crossRealm = h.crossRealmAllowed(input, chatFlow2.realm, chatFlow2.bareModel)
 	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
 	if chatFlow2.runRotation(r.Context()) {
 		return
 	}
 
 	chatFlow2.writeFinalError()
+}
+
+// checkModelHidden 校验模型黑名单：命中即 400 model_unavailable，不打上游、不占选号。
+func (f *chatFlow) checkModelHidden() bool {
+	if !f.h.modelHidden(f.realm, f.bareModel) {
+		return true
+	}
+
+	f.out.Error(http.StatusBadRequest, "model_unavailable",
+		"model is hidden by gateway config (models.hidden); pick another model", "")
+	f.st.status = http.StatusBadRequest
+	f.st.outcome = reqlog.OutcomeHTTPError
+
+	return false
+}
+
+// modelHidden 报告 (realm, model) 是否被 models.hidden 隐藏。
+// 键为归一后的 "realm:model"（裸名配置在归一阶段已展开成两域）。
+func (h *Handler) modelHidden(realm, model string) bool {
+	if model == "" {
+		return false
+	}
+
+	hidden := h.loadLive().HiddenModels
+	if len(hidden) == 0 {
+		return false
+	}
+
+	_, ok := hidden[realm+":"+model]
+
+	return ok
 }
 
 // checkModelAllowed 校验命名密钥模型白名单。调用时机必须在别名/后台改写/模态
@@ -1279,6 +1357,45 @@ func (h *Handler) backgroundTarget(model string) string {
 	}
 
 	return live.BackgroundTarget
+}
+
+// realmExplicitFor 报告请求是否显式指定了出口域：
+//   - 模型自带 cn:/global: 前缀，或别名目标自带显式前缀；
+//   - 命名密钥绑定了出口域（绑定即运维侧的显式约束）。
+//
+// 三者任一命中都**不允许**跨域回退——否则出口约束（安全面）会被绕过。
+func (h *Handler) realmExplicitFor(in *chatInput) bool {
+	if in.keyRealm != "" {
+		return true
+	}
+
+	_, explicit := explicitModelRealm(in.model, h.requestModelAliases(in.model, in.keyRealm))
+
+	return explicit
+}
+
+// crossRealmAllowed 报告本次请求是否允许跨域回退：开关开启**且**请求未显式指定域
+// （显式前缀 / 别名目标前缀 / 命名密钥绑定都算显式——否则出口约束会被绕过）。
+//
+// 命名密钥的模型白名单也可能按域限定（如 limit.models=["cn:glm-*"]）：这类白名单
+// 是运维侧的显式授权，跨域回退前必须确认另一域同样在白名单内，否则裸模型名会
+// 以一个域的白名单换来另一域的服务（realm 前缀授权被绕过）。
+func (h *Handler) crossRealmAllowed(input *chatInput, realm, bareModel string) bool {
+	if h.realmExplicitFor(input) {
+		return false
+	}
+
+	if h.cfg.Pool == nil || !h.cfg.Pool.CrossDomainFallback() {
+		return false
+	}
+
+	if input.keyUsage != nil && h.cfg.Keys != nil {
+		if !h.cfg.Keys.ModelAllowed(input.keyUsage.id, otherRealm(realm)+":"+bareModel) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // requestModelAliases 合并上游目录别名与配置别名；配置别名优先（覆盖同名上游别名）。
@@ -1370,6 +1487,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
 		reqModalities:  reqMods,
 		bareModel:      bareModel,
+		crossRealm:     h.crossRealmAllowed(chatInput2, realm, bareModel),
 		modelRate:      modelRate,
 		st:             chatStat2,
 		keyUsage:       chatInput2.keyUsage,
@@ -1390,9 +1508,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
 		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
 		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
-		if uid, ok := h.cfg.Session.ResolveForModel(chatFlow2.sessKey, chatFlow2.realm+":"+chatFlow2.bareModel); ok {
-			chatFlow2.stickyUID = uid
-		}
+		chatFlow2.stickyUID = h.resolveStickyForStrategy(chatFlow2)
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生。必须在 prompt.Rewrite 之前取
@@ -1715,6 +1831,28 @@ func (f *chatFlow) degradeSticky() string {
 	return uid
 }
 
+// resolveStickyForStrategy 按当前选号策略解析会话粘性绑定：
+//   - 有序策略（round_robin / sequential_exhaust）：只复用**既有**绑定——哈希分配会绕过
+//     账号顺序（issue #205），未命中就交回选号策略决定；
+//   - 加权随机（默认）：沿用既有 ResolveForModel（含慢路径哈希分配，零回归）。
+func (h *Handler) resolveStickyForStrategy(flow *chatFlow) string {
+	model := flow.realm + ":" + flow.bareModel
+
+	if h.cfg.Pool != nil && h.cfg.Pool.StrategyForRealm(flow.realm) != "weighted_random" {
+		if uid, ok := h.cfg.Session.ResolveExisting(flow.sessKey, model); ok {
+			return uid
+		}
+
+		return ""
+	}
+
+	if uid, ok := h.cfg.Session.ResolveForModel(flow.sessKey, model); ok {
+		return uid
+	}
+
+	return ""
+}
+
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
@@ -1747,26 +1885,120 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 }
 
 // pickWith 普通轮换选号，tried 为本轮已尝试的 uid 集合。
+// 跨域回退开启时按 pickRealms 给出的域顺序依次尝试（主域优先）。
 func (f *chatFlow) pickWith(tried map[string]bool) *auth.Auth {
-	if f.st.decision != nil {
-		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(tried, f.bareModel, f.realm)
-		mergePickTrace(f.st.decision, trace)
+	for _, realm := range f.pickRealms() {
+		if acct := f.pickInRealm(tried, realm); acct != nil {
+			f.noteServedRealm(acct)
 
-		return acct
+			return acct
+		}
 	}
 
-	return f.h.cfg.Pool.PickExcludingForRealm(tried, f.bareModel, f.realm)
+	return nil
+}
+
+// pickInRealm 在指定域选号（决策链开启时顺带合并选号快照）。
+func (f *chatFlow) pickInRealm(tried map[string]bool, realm string) *auth.Auth {
+	if f.st.decision == nil {
+		return f.h.cfg.Pool.PickExcludingForRealm(tried, f.bareModel, realm)
+	}
+
+	acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(tried, f.bareModel, realm)
+	mergePickTrace(f.st.decision, trace)
+
+	return acct
+}
+
+// pickRealms 返回本次选号要尝试的域顺序（主域优先）。
+// 跨域回退关闭时只有请求域；开启时：请求域不可服务而另一域可服务就先试另一域，
+// 否则先试请求域、选不到再试另一域。
+func (f *chatFlow) pickRealms() []string {
+	if !f.crossRealm {
+		return []string{f.realm}
+	}
+
+	// 11102 已切过域：只在新域重取号，禁止再跳回原域。否则另一域无号时
+	// pickRealms 会回落原域、对同一 11102 再打一次，违背「跨域仅一次」。
+	if f.realmSwitched {
+		return []string{f.realm}
+	}
+
+	other := otherRealm(f.realm)
+	if !f.h.cfg.Pool.ServableForModelRealm(f.bareModel, f.realm) &&
+		f.h.cfg.Pool.ServableForModelRealm(f.bareModel, other) {
+		return []string{other, f.realm}
+	}
+
+	return []string{f.realm, other}
+}
+
+// noteServedRealm 跨域命中后把生效域切到账号实际所属域：之后的日限、计费、
+// 模型负缓存与路由熔断全部按**实际服务域**记账（否则另一域的消耗会记到请求域账上）。
+func (f *chatFlow) noteServedRealm(acct *auth.Auth) {
+	if !f.crossRealm {
+		return
+	}
+
+	realm := acct.Realm()
+	if realm == "" || realm == f.realm {
+		return
+	}
+
+	log.Printf("INFO: [server] cross-domain fallback model=%s: %s -> %s acct=%s",
+		f.bareModel, f.realm, realm, logfmt.UID8(acct.UID))
+
+	f.realm = realm
+
+	if f.h.cfg.Upstream != nil {
+		f.modelRate = f.h.cfg.Upstream.ModelRate(realm, f.bareModel)
+	}
+}
+
+// switchRealmForModelNotFound 11102（上游目录无此模型）跨域重取号一次：仅当跨域回退
+// 开启、请求未显式指定域、且本次请求还没切过域。已切过即返回 false，交给既有
+// 请求级 fail-fast（404），避免把一次失败放大成多轮无效请求。
+func (f *chatFlow) switchRealmForModelNotFound() bool {
+	if !f.crossRealm || f.realmSwitched {
+		return false
+	}
+
+	other := otherRealm(f.realm)
+	// 另一域没有可服务账号时保持原判（11102 → 404）；否则切过去只会落到
+	// 「无可用账号」503，把「模型不存在」误报成池故障。
+	if !f.h.cfg.Pool.ServableForModelRealm(f.bareModel, other) {
+		return false
+	}
+
+	f.realmSwitched = true
+	f.realm = other
+
+	if f.h.cfg.Upstream != nil {
+		f.modelRate = f.h.cfg.Upstream.ModelRate(f.realm, f.bareModel)
+	}
+
+	log.Printf("INFO: [server] cross-domain fallback model=%s: model not found, retry on %s",
+		f.bareModel, f.realm)
+
+	return true
 }
 
 // trySticky 尝试复用会话绑定号；ok=false 表示已解绑/降级，调用方回落普通轮换。
 // 第三个返回值是软逃逸被降级的 uid，供调用方在本轮排除。
 func (f *chatFlow) trySticky() (*auth.Auth, bool, string) {
 	acct, picked := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
-	if picked == pool.StickyPicked && acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
+	// 跨域回退开启时放宽域校验：粘性号属于「另一域」也可以继续用（该域正是
+	// 这次请求实际要用的域），由 noteServedRealm 切换生效域与记账口径。
+	// 但 11102 已跨域切过一次（realmSwitched）后必须锁定新域：否则旧域粘性号会
+	// 把请求拉回原域、对同一 11102 再打一次，违背「跨域仅一次」。
+	if picked == pool.StickyPicked && acct != nil &&
+		(f.realm == "" || acct.Realm() == f.realm || (f.crossRealm && !f.realmSwitched)) {
 		if f.st.decision != nil {
 			f.st.decision.StickyHit = true
 			f.st.decision.FinalUID = logfmt.UID8(acct.UID)
 		}
+
+		f.noteServedRealm(acct)
 
 		return acct, true, ""
 	}
@@ -1800,10 +2032,13 @@ func (h *Handler) sampleDecisionTrace() *reqlog.DecisionTrace {
 		Rotations:  nil,
 		Top:        nil,
 		FinalUID:   "",
+		Strategy:   "",
 	}
 }
 
 // mergePickTrace 把 pool 决策快照并入请求级决策链（Top 覆盖为最近一次尝试）。
+//
+//nolint:gocritic // PickTrace 值传递保持既有调用点简单（新增 Strategy 字段后触发的 hugeParam 提示）。
 func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	dst.Candidates += src.Candidates
 	if dst.Excluded == nil {
@@ -1815,6 +2050,9 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 
 	dst.CostTier = src.CostTier
+	if src.Strategy != "" {
+		dst.Strategy = src.Strategy
+	}
 
 	dst.Explored = dst.Explored || src.Explored
 	if len(src.Top) > 0 {
@@ -2028,6 +2266,10 @@ func (f *chatFlow) handleHTTPError(
 		f.handleQueueError(kind, respBody, uerr)
 		return rotDone
 	}
+	// 11102 + 跨域回退：本域目录无此模型时允许换域重取号一次。
+	if action, ok := f.retryModelNotFoundCrossRealm(ctx, acct, kind, status, respBody, uerr, i); ok {
+		return action
+	}
 	// 请求级错误（内容防火墙 / 上下文超限 / 图片无效 / 请求体畸形）：换任何账号都会
 	// 撞同一结果，轮转纯属浪费，透传上游原文立即返回。
 	if failFastKind(kind) {
@@ -2042,10 +2284,7 @@ func (f *chatFlow) handleHTTPError(
 	// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：该次
 	// WAF 403 喂入 IP 级状态机，若激活（短窗多号命中）则立即终止轮转，避免把请求放大
 	// MaxRotate 倍打同一出口 IP。账号级软冷却已在上方 applyErrorPolicy 照常记账。
-	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
-		f.h.notifyAccount(acct.UID, notify.EventWAFIPBlocked, "出口 IP 触发上游 WAF 级拦截，轮转已停止",
-			map[string]any{"model": f.bareModel})
-
+	if f.noteWafAndStop(kind, acct) {
 		return rotBreak
 	}
 	// 状态码换号闸（issue #17，默认关闭）：allowlist 非空时仅列出的状态码才换号；
@@ -2061,6 +2300,62 @@ func (f *chatFlow) handleHTTPError(
 	f.rotateReason = kind.String()
 
 	return rotContinue
+}
+
+// noteWafAndStop 记录 IP 级 WAF 命中：激活（短窗多号命中）时报告调用方终止轮转。
+func (f *chatFlow) noteWafAndStop(kind upstream.ErrKind, acct *auth.Auth) bool {
+	if kind != upstream.ErrWafBlock || !f.h.wafIP.noteWaf(acct.UID) {
+		return false
+	}
+
+	f.h.notifyAccount(acct.UID, notify.EventWAFIPBlocked, "出口 IP 触发上游 WAF 级拦截，轮转已停止",
+		map[string]any{"model": f.bareModel})
+
+	return true
+}
+
+// retryModelNotFoundCrossRealm 11102「上游模型目录无此模型」+ 跨域回退：该域没有此
+// 模型时允许跨到另一域重取号一次（本 fork 的 11102 是请求级 fail-fast，与上游
+// 「负缓存后换域」链路不同，所以显式补一条一次性跨域分支）。不罚账号、不写模型负缓存。
+// ok=false 表示「本次不走跨域分支」，调用方继续既有 fail-fast 处置。
+func (f *chatFlow) retryModelNotFoundCrossRealm(
+	ctx context.Context, acct *auth.Auth, kind upstream.ErrKind, status int, respBody []byte,
+	uerr *upstream.Error, i int,
+) (rotationAction, bool) {
+	if kind != upstream.ErrModelNotFound || !f.switchRealmForModelNotFound() {
+		return rotDone, false
+	}
+
+	f.lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+	f.fail(acct.UID)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak, true
+	}
+
+	f.rotateReason = "model_not_found_cross_realm"
+
+	return rotContinue, true
+}
+
+// tracedPath 报告该请求是否纳入请求日志记账（archived 路径集合集中在此，
+// 新增网关 POST 接口时只改这一处）。
+func (h *Handler) tracedPath(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/search/messages":
+		return true
+	}
+
+	return requestsGemini(r)
+}
+
+// registerSearchRoute 注册官方联网搜索端点（与 /v1/messages 并列，不遮蔽既有路由）。
+// 受 features.search_endpoint 开关约束（默认关，热生效）。
+func (h *Handler) registerSearchRoute() {
+	h.mux.HandleFunc(
+		"POST /v1/search/messages",
+		h.withRecovery(h.withClientAuth(h.anthropicSearchHandler)),
+	)
 }
 
 // rotateAllowedForStatus 报告该 HTTP 状态码是否允许换号：RotateStatuses 为空时恒 true
@@ -2265,7 +2560,7 @@ func (f *chatFlow) failStreamUpstream(acct *auth.Auth, reason string) {
 		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, reason)
 }
 
-// noteSuccessAndBind 记录账号成功、清 11136/11141 负缓存，并让会话粘性跟随最终成功号。
+// noteSuccessAndBind 记录账号成功、清 11136/11158/11141 负缓存，并让会话粘性跟随最终成功号。
 func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	f.h.cfg.Pool.NoteSuccess(acct.UID)
 	f.h.cfg.Pool.NoteRouteSuccess(f.realm, f.bareModel)
@@ -2349,11 +2644,10 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	credit, total, hasCredit := usageCreditTotal(resp)
+	// 缓存三维观测与流式同源同口径（cacheTokensFromUsage）：非流式此前只看 hit 侧，
+	// miss 显式存在而 hit 缺失时直接丢弃，导致「prompt 数万 + hit=0」误报告警。
 	if usageMap, ok := resp["usage"].(map[string]any); ok {
-		if hit, okH := upstream.UsageCacheHitTokens(usageMap); okH {
-			miss, _ := upstream.UsageCacheMissTokens(usageMap)
-			f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = int64(hit), int64(miss), true
-		}
+		f.setCacheTokensFromUsage(usageMap)
 	}
 
 	f.recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
@@ -2376,6 +2670,28 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	return rotDone
+}
+
+// setCacheTokensFromUsage 用聚合响应 usage 填 st 的缓存三维观测（非流式收尾）。
+// 命中/未命中的推导与流式共用 cacheTokensFromUsage，保证两条路径口径一致。
+func (f *chatFlow) setCacheTokensFromUsage(usageMap map[string]any) {
+	promptTokens, hasPrompt := upstream.UsagePromptTokens(usageMap)
+	hit, hasHit := upstream.UsageCacheHitTokens(usageMap)
+	miss, hasMiss := upstream.UsageCacheMissTokens(usageMap)
+
+	hitInt, missInt, ok := cacheTokensFromUsage(cacheTokenTriple{
+		prompt:    int64(promptTokens),
+		hit:       int64(hit),
+		miss:      int64(miss),
+		hasPrompt: hasPrompt,
+		hasHit:    hasHit,
+		hasMiss:   hasMiss,
+	})
+	if !ok {
+		return
+	}
+
+	f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = hitInt, missInt, true
 }
 
 // retryNonStreamAggregateError 处置空流 / EOF 截断：截断的 content 不是完整回答，
@@ -2769,6 +3085,11 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 			code = "waf_ip_blocked"
 			msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 		}
+	case upstream.ErrChannelRefused:
+		// 11-128 通道校验失败：问题在客户端/通道一侧，重试同一请求只会再撞同一堵墙。
+		// 用 400 + 明确 code 表达「不可重试、需排查通道」；上游原文优先透传。
+		code = "channel_refused"
+		status = http.StatusBadRequest
 	case upstream.ErrModelBlocked, upstream.ErrModelAccess:
 		// 11136 该账号无模型权限、11141 平台下线：上游原文已经写清原因，
 		// 但 code 此前停在默认的 no_healthy_account（"服务端过载"语义，客户端会不断
@@ -2969,6 +3290,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     14017 等未激活/授权故障 → Cooldown(CoolSoft) 有界退避。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrChannelRefused → 11-128 通道校验失败：零动作（不罚号/不熔断/不喂连败），
+//     换号继续轮转；轮转耗尽按 400 channel_refused 透传原文。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号，且与 ErrPromptTooLong/ErrImageInvalid 同待遇：
 //     调用方在轮转循环内即刻 400 透传原文终止（换号必然同样失败）。
@@ -2977,7 +3300,7 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //   - ErrImageInvalid → 图片格式/数据无效：请求的问题不是账号的问题（同一 body
 //     换任何号都会得到相同的解析错误）。零动作（不冷却/不熔断/不 NoteError、
 //     不喂连败），chatCompletions 已直接透传原文返回不轮转。
-//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11136 负缓存避让；
+//   - ErrModelBlocked → BlockModelBackoff：(账号, 模型) 11136/11158 负缓存避让；
 //     权限是账号维度，不写路由熔断（其他账号可能仍有权限）。
 //   - ErrModelNotFound → 11102 上游目录无此模型：请求级 fail-fast（404），
 //     不罚账号、不轮转、不写 (账号,模型) 负缓存与路由熔断。
@@ -3001,13 +3324,19 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 		h.applyAccountFaultPolicy(uid, body)
 	case upstream.ErrHardCredit, upstream.ErrSessionDead, upstream.ErrNotFound, upstream.ErrServer:
 		h.applyLifecyclePolicy(uid, kind)
+	case upstream.ErrChannelRefused:
+		// 11-128 + request illegal 是**通道校验失败**（UA/头/中间代理/入站形态），
+		// 账号本身健康：零动作（不冷却/不熔断/不 NoteError/不喂连败），只换号继续轮转。
+		// 与 ErrContentBlocked 的区别：后者是同账号降级重试，前者换号即可。
 	case upstream.ErrModelBlocked:
-		// 11136「该账号无该模型权限」：(账号, 模型) 负缓存避让。复用 modelCooldowns
+		// 11136「该账号无该模型权限」/ 11158「该账号类型不允许该模型」：
+		// (账号, 模型) 负缓存避让。复用 modelCooldowns
 		// 机制（与 6004 同域），选号侧 healthyForModel 对该账号自动避开该模型。
 		// 立即换号（本轮 continue），该账号该模型冷却，下次选号避开。
 		// 权限是账号维度：其他账号可能仍有权限，不能写 (realm, model) 路由熔断——
 		// 否则少数无权限账号连续失败会冷却整条路由，把本可服务的账号一并挡在门外。
-		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReason)
+		// reason 按 body 里的真实码值落账（ModelBlockReasonFor），面板/排障可区分两族。
+		h.cfg.Pool.BlockModelBackoff(uid, model, upstream.ModelBlockReasonFor(body))
 	case upstream.ErrModelAccess:
 		// 11141 模型已下线：请求级 fail-fast（不罚账号、不轮转），
 		// 同时写 (账号,模型) 负缓存，后续请求不再命中同一组合。与 11136 同机制但
@@ -3081,16 +3410,18 @@ func (h *Handler) applyWafPolicy(uid string, uerr *upstream.Error) {
 	h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 }
 
-// applyAccountFaultPolicy 账号级授权/配额故障按 msg 分野（口径与 Classify 的
-// accountFaultMarkers 一致）：
-//   - "request illegal"（code 11140）→ 账号级**授权封禁**：硬禁用（Disable）。
+// applyAccountFaultPolicy 账号级授权/配额故障按形态分野（口径与 Classify 一致）：
+//   - 11140 + request illegal（upstream.IsAccountRestricted）→ 账号级**授权封禁**：
+//     硬禁用（Disable）。上游要求账号持有人在 WorkBuddy 提交反馈申诉后重新登录，
+//     网关侧冷却救不回来。
 //   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 //     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 //
-// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+// 判定必须「code 且文案」：裸 "request illegal" 此前会把普通请求错误升级成硬禁用，
+// 上游已删除该过宽 marker，本 fork 同步收窄。
 func (h *Handler) applyAccountFaultPolicy(uid, body string) {
-	if strings.Contains(strings.ToLower(body), "request illegal") {
-		h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+	if upstream.IsAccountRestricted(body) {
+		h.cfg.Pool.Disable(uid, "upstream account restricted (11140 request illegal), submit feedback in WorkBuddy and re-login")
 		return
 	}
 

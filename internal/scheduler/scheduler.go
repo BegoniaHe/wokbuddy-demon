@@ -67,6 +67,11 @@ type Config struct {
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
+
+	// TaskSweepHook 周期补领回调（panel.RunTaskSweep：扫全部非禁用账号幂等补领
+	// 「已达标未领」的成长任务奖励）。同样由 panel 在调度器之后用 SetTaskSweepHook
+	// 挂载；nil 时到点跳过。ctx 用于「取消后不再派发新的逐号请求」。
+	TaskSweepHook func(ctx context.Context)
 }
 
 // Scheduler 调度器。
@@ -93,6 +98,10 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+	// taskSweepInterval 任务补领清扫间隔（纳秒，0=暂停），语义同 balanceInterval。
+	taskSweepInterval atomic.Int64
+	// rearmTaskSweep 任务补领清扫的「排程已变」通知（与余额刷新分开，避免丢信号）。
+	rearmTaskSweep chan struct{}
 	// balanceSem/balanceSemOnce 余额刷新逐号上游调用的全局并发上限：后台周期与
 	// 面板手动刷新会并发触发，各持一个信号量会把总在途请求放大到 2 倍以上。
 	balanceSemOnce sync.Once
@@ -128,12 +137,13 @@ func New(cfg *Config) *Scheduler {
 	}
 
 	return &Scheduler{
-		cfg:           config,
-		nowFn:         time.Now,
-		logger:        log.Default(),
-		adoptTried:    make(map[string]string),
-		rearmSchedule: make(chan struct{}, 1),
-		rearmBalance:  make(chan struct{}, 1),
+		cfg:            config,
+		nowFn:          time.Now,
+		logger:         log.Default(),
+		adoptTried:     make(map[string]string),
+		rearmSchedule:  make(chan struct{}, 1),
+		rearmBalance:   make(chan struct{}, 1),
+		rearmTaskSweep: make(chan struct{}, 1),
 	}
 }
 
@@ -169,6 +179,13 @@ func (s *Scheduler) SetExpiringSoonWindow(duration time.Duration) {
 func (s *Scheduler) SetGrowthHook(fn func()) {
 	s.schedMu.Lock()
 	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
+// SetTaskSweepHook 挂载/替换任务补领清扫回调（panel 构造晚于 scheduler，事后接线）。
+func (s *Scheduler) SetTaskSweepHook(fn func(ctx context.Context)) {
+	s.schedMu.Lock()
+	s.cfg.TaskSweepHook = fn
 	s.schedMu.Unlock()
 }
 
@@ -673,15 +690,17 @@ func (s *Scheduler) runCheckinAccount(status *pool.Status, account *auth.Auth, e
 		ok = s.checkinOne(status.UID, status.Nickname, account)
 	}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account, expiringSoon)
+	// 用含逐日到期批次的快照写入：签到链路也保留完整批次，避免把后台刷新刚写入的
+	// 批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
+	snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
 	if err != nil {
 		log.Printf("user-resource %s: %v", logfmt.Label(status.UID, status.Nickname), err)
 		return false
 	}
 
-	s.cfg.Pool.ReenableIfCredits(status.UID, remain, total)
-	s.cfg.Pool.SetCreditsDetailed(status.UID, remain, total, expiring, earliestAt, earliestRemaining)
-	s.notifyCreditLow(account, remain)
+	s.cfg.Pool.ReenableIfCredits(status.UID, snap.Remain, snap.Total)
+	s.cfg.Pool.SetCreditsSnapshot(status.UID, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+	s.notifyCreditLow(account, snap.Remain)
 
 	return ok
 }
@@ -759,7 +778,7 @@ func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure in
 		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
 		// （「growth system is only available for personal users」），即**零收益**。
 		// 该类"静默无效"最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
-		if account.IsEnterprise() {
+		if account.IsEnterpriseSession() {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -983,19 +1002,54 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account4, expiringSoon)
+			// 用含逐日到期批次的快照写入：面板快照路径与「检查」同口径（issue #200）。
+			snap, err := s.cfg.Upstream.UserResourceSnapshot(account4, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, account4.NicknameValue()), err)
 				return
 			}
 
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-			s.notifyCreditLow(account4, remain)
+			s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
+			s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+			s.notifyCreditLow(account4, snap.Remain)
 		}(account, status.UID)
 	}
 
 	wg.Wait()
+
+	// 记录本轮完成时刻与周期，供面板展示「数据新鲜度」（issue #200）。
+	s.cfg.Pool.SetBalanceRefreshMeta(s.balanceRefreshSeconds(), time.Now())
+}
+
+// runBalanceRefreshFirstRound 启动即跑一轮余额刷新（issue #200）：否则首个 ticker
+// 到期前（最长一个周期）面板只有旧快照/空批次。仅在启用状态下执行，失败不影响循环。
+func (s *Scheduler) runBalanceRefreshFirstRound(ctx context.Context) {
+	if time.Duration(s.balanceInterval.Load()) <= 0 {
+		return
+	}
+
+	s.RunBalanceRefreshNowCtx(ctx)
+}
+
+// balanceRefreshSeconds 当前余额刷新周期（秒，0 = 未启用）。
+func (s *Scheduler) balanceRefreshSeconds() int64 {
+	cur := time.Duration(s.balanceInterval.Load())
+
+	return int64(cur / time.Second)
+}
+
+// mapExpiryBuckets upstream.ExpiryBucket → pool.ExpiryBucket（pool 不依赖 upstream 包）。
+func mapExpiryBuckets(buckets []upstream.ExpiryBucket) []pool.ExpiryBucket {
+	if len(buckets) == 0 {
+		return nil
+	}
+
+	out := make([]pool.ExpiryBucket, 0, len(buckets))
+	for _, bucket := range buckets {
+		out = append(out, pool.ExpiryBucket{Date: bucket.Date, ExpireAt: bucket.ExpireAt, Remain: bucket.Remain})
+	}
+
+	return out
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -1012,6 +1066,8 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 
 	go func() {
 		var logged time.Duration
+
+		s.runBalanceRefreshFirstRound(ctx)
 
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
@@ -1045,11 +1101,88 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 }
 
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
-func (s *Scheduler) SetBalanceInterval(d time.Duration) {
+func (s *Scheduler) SetBalanceInterval(interval time.Duration) {
+	if interval < 0 {
+		interval = 0
+	}
+
+	s.balanceInterval.Store(int64(interval))
+
+	// 面板的「数据新鲜度」直接读这份元数据：热关/热开时同步周期，否则关闭后仍
+	// 显示「每 N 分钟后台刷新」、刚开启却显示「未启用」。保留上次完成时刻不动。
+	if s.cfg.Pool != nil {
+		_, at := s.cfg.Pool.BalanceRefreshMeta()
+		s.cfg.Pool.SetBalanceRefreshMeta(int64(interval/time.Second), at)
+	}
+
+	poke(s.rearmBalance)
+}
+
+// taskSweepContext 读取当前补领回调（nil 安全）。
+func (s *Scheduler) taskSweepContext() func(ctx context.Context) {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+
+	return s.cfg.TaskSweepHook
+}
+
+// StartTaskSweep 后台周期性补领「已达标未领」的成长任务奖励（独立 ticker
+// goroutine，ctx 取消即停）。interval<=0 以暂停状态启动并等待 SetTaskSweepInterval
+// 唤醒：启动时关闭 schedule.task_sweep_enabled、运行期再热开也能生效（无需重启）。
+// 运行期可用 SetTaskSweepInterval 热改间隔（下一轮生效）。
+func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) {
+	if interval < 0 {
+		interval = 0
+	}
+
+	s.taskSweepInterval.Store(int64(interval))
+
+	go func() {
+		var logged time.Duration
+
+		for {
+			cur := time.Duration(s.taskSweepInterval.Load())
+			if cur != logged {
+				log.Printf("scheduler: 任务补领清扫每 %s（暂停中显示 0s）", cur)
+				logged = cur
+			}
+
+			if cur <= 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.rearmTaskSweep:
+					continue
+				}
+			}
+
+			timer := time.NewTimer(cur)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-s.rearmTaskSweep:
+				timer.Stop() // 间隔已变：立刻按新值重算
+			case <-timer.C:
+				s.runTaskSweepOnce(ctx)
+			}
+		}
+	}()
+}
+
+// runTaskSweepOnce 执行一轮补领清扫（hook 未挂载时跳过）。
+func (s *Scheduler) runTaskSweepOnce(ctx context.Context) {
+	if hook := s.taskSweepContext(); hook != nil {
+		hook(ctx)
+	}
+}
+
+// SetTaskSweepInterval 热改任务补领清扫间隔；<=0 表示暂停循环（面板关闭该开关时）。
+func (s *Scheduler) SetTaskSweepInterval(d time.Duration) {
 	if d < 0 {
 		d = 0
 	}
 
-	s.balanceInterval.Store(int64(d))
-	poke(s.rearmBalance)
+	s.taskSweepInterval.Store(int64(d))
+	poke(s.rearmTaskSweep)
 }

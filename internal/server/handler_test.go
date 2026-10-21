@@ -2111,6 +2111,73 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	}
 }
 
+// TestChannelRefusedAndAccountRestrictedSplit 11-128 分流与「账号受限」收窄：
+//   - `11-128 + request illegal`：通道校验失败 → 不罚号、不降级重试，换号轮转，
+//     轮转耗尽回 400 channel_refused 并透传原文；
+//   - 裸 `request illegal`（无 code）：普通请求错误 → 不再硬禁用账号；
+//   - `11140 + request illegal`：账号受限 → 仍禁用，原因文案可读。
+func TestChannelRefusedAndAccountRestrictedSplit(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		body         string
+		wantStatus   int
+		wantCode     string
+		wantDisabled bool
+	}{
+		{"11-128 通道校验失败", `{"code":11-128,"msg":"request illegal"}`, http.StatusBadRequest, "channel_refused", false},
+		{"裸 request illegal 不禁用", `{"msg":"request illegal"}`, http.StatusServiceUnavailable, "no_healthy_account", false},
+		{"11140 账号受限", `{"code":11140,"msg":"request illegal"}`, http.StatusServiceUnavailable, "no_healthy_account", true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var calls int
+
+			client := newFakeUpstream(t, func(string) (int, string, bool) {
+				calls++
+
+				return http.StatusBadRequest, testCase.body, false
+			})
+			state := testPoolWith(
+				&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+				&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+			)
+			// 熔断阈值 1：若误罚 NoteError 一次即熔断，便于暴露「通道错误被当 5xx」。
+			state.SetBreaker(1, time.Hour, time.Hour)
+			h := NewHandler(&Config{Pool: state, Upstream: client, PromptMode: "custom", PromptText: "SYS"})
+
+			rec := postChat(t, h, `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)
+
+			if rec.Code != testCase.wantStatus {
+				t.Fatalf("code=%d want %d, body=%s", rec.Code, testCase.wantStatus, rec.Body)
+			}
+
+			if !strings.Contains(rec.Body.String(), testCase.wantCode) {
+				t.Errorf("error.code want %q, body=%s", testCase.wantCode, rec.Body)
+			}
+
+			if calls != 2 {
+				t.Errorf("upstream calls=%d want 2（两个号各试一次）", calls)
+			}
+
+			for _, uid := range []string{"u1", "u2"} {
+				status := statusOf(t, state, uid)
+				if status.Disabled != testCase.wantDisabled {
+					t.Errorf("%s disabled=%v want %v (%+v)", uid, status.Disabled, testCase.wantDisabled, status)
+				}
+
+				if !testCase.wantDisabled && (status.Cooling || status.ErrTotal != 0) {
+					t.Errorf("%s 不应被罚：%+v", uid, status)
+				}
+			}
+		})
+	}
+}
+
 // TestContentBlockedDoesNotPenalizeAccount ErrContentBlocked 不罚账号（无冷却/熔断/NoteError）。
 func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 	t.Parallel()

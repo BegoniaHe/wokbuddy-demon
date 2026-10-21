@@ -175,3 +175,87 @@ func TestPickExcludingForRealmTried(t *testing.T) {
 		t.Fatalf("picked non-cn %s", account.UID)
 	}
 }
+
+// TestServableForModelRealm 跨域回退挑域口径：只看「该域是否存在能服务该模型的号」，
+// 口径取 excludeReason 全集并额外排除路由级熔断。
+func TestServableForModelRealm(t *testing.T) {
+	t.Parallel()
+
+	t.Run("两域都有健康号", func(t *testing.T) {
+		t.Parallel()
+
+		pool := realmPool(t)
+		if !pool.ServableForModelRealm("glm-5.2", "cn") || !pool.ServableForModelRealm("glm-5.2", "global") {
+			t.Error("两域都应可服务")
+		}
+	})
+
+	t.Run("cn 全冷却则 cn 不可服务", func(t *testing.T) {
+		t.Parallel()
+
+		pool := realmPool(t)
+		for _, uid := range []string{"cn1", "cn2"} {
+			pool.CooldownSoftRate(uid, time.Hour, time.Time{}, "429 rate limit")
+		}
+
+		if pool.ServableForModelRealm("glm-5.2", "cn") {
+			t.Error("cn 域全冷却时不应可服务")
+		}
+
+		if !pool.ServableForModelRealm("glm-5.2", "global") {
+			t.Error("global 域仍应可服务")
+		}
+	})
+
+	t.Run("模型级负缓存只影响该模型", func(t *testing.T) {
+		t.Parallel()
+
+		pool := realmPool(t)
+		pool.BlockModelBackoff("cn1", "glm-5.2", "11136 model not permitted")
+		pool.BlockModelBackoff("cn2", "glm-5.2", "11136 model not permitted")
+
+		if pool.ServableForModelRealm("glm-5.2", "cn") {
+			t.Error("cn 域该模型全被负缓存时不应可服务")
+		}
+
+		if !pool.ServableForModelRealm("other-model", "cn") {
+			t.Error("其他模型不受影响")
+		}
+	})
+
+	t.Run("路由熔断排除该域", func(t *testing.T) {
+		t.Parallel()
+
+		pool := realmPool(t)
+		for range 3 {
+			pool.NoteRouteFailure("cn", "glm-5.2")
+		}
+
+		if pool.ServableForModelRealm("glm-5.2", "cn") {
+			t.Error("路由熔断中该域不应可服务")
+		}
+	})
+}
+
+// TestCrossDomainFallbackFlag 开关读写（默认关闭）。
+func TestCrossDomainFallbackFlag(t *testing.T) {
+	t.Parallel()
+
+	state := New("")
+
+	if state.CrossDomainFallback() {
+		t.Fatal("默认应关闭跨域回退")
+	}
+
+	state.SetCrossDomainFallback(true)
+
+	if !state.CrossDomainFallback() {
+		t.Fatal("SetCrossDomainFallback(true) 后应开启")
+	}
+
+	state.SetCrossDomainFallback(false)
+
+	if state.CrossDomainFallback() {
+		t.Fatal("SetCrossDomainFallback(false) 后应关闭")
+	}
+}

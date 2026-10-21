@@ -35,6 +35,13 @@ import {
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 
+// 按域选号策略（issue #205）。
+const STRATEGY_OPTIONS = [
+  { value: 'weighted_random', label: 'weighted_random — 加权随机（默认）' },
+  { value: 'round_robin', label: 'round_robin — 按顺序轮转' },
+  { value: 'sequential_exhaust', label: 'sequential_exhaust — 用完一个号再下一个' },
+] as const satisfies readonly SelectOption[];
+
 // 系统提示词注入模式。
 const PROMPT_MODE_OPTIONS = [
   { value: 'custom', label: 'custom — 网关自有提示词（避免指纹误报）' },
@@ -254,6 +261,12 @@ export function ConfigView() {
               <FieldLabel>刷新间隔（分钟）</FieldLabel>
               {num('balance_refresh_minutes', { min: 1, placeholder: '5' })}
             </Field>
+            <div>{check('task_sweep_enabled', '周期补领任务奖励')}</div>
+            <Field>
+              <FieldLabel>补领区间隔（分钟）</FieldLabel>
+              {num('task_sweep_minutes', { min: 1, placeholder: '15' })}
+              <FieldDescription>只补领「已达标未领」的成长任务奖励（幂等、不代做任务）；热生效</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
@@ -380,7 +393,41 @@ export function ConfigView() {
               <FieldDescription>改动需重启进程</FieldDescription>
             </Field>
           </div>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-2">
+            {(['cn', 'global'] as const).map((realm) => (
+              <Field key={realm}>
+                <FieldLabel>{realm === 'cn' ? '国内版' : '国际版'}选号策略</FieldLabel>
+                <Select
+                  items={selectOptionItems(STRATEGY_OPTIONS)}
+                  value={String(values['strategy_' + realm] ?? 'weighted_random')}
+                  onValueChange={(v) => set('strategy_' + realm, v ?? 'weighted_random')}>
+                  <SelectTrigger aria-label={realm + ' 选号策略'}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectOptions options={STRATEGY_OPTIONS} />
+                  </SelectContent>
+                </Select>
+                <FieldDescription>有序策略会关闭全冷却兜底与防撞号窗口；热生效</FieldDescription>
+              </Field>
+            ))}
+            <Field>
+              <FieldLabel>国内版账号顺序（uid，逗号分隔）</FieldLabel>
+              {text('account_order_cn', { placeholder: '留空 = 按 uid 升序' })}
+              <FieldDescription>仅对有序策略生效；热生效</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国际版账号顺序（uid，逗号分隔）</FieldLabel>
+              {text('account_order_global', { placeholder: '留空 = 按 uid 升序' })}
+              <FieldDescription>仅对有序策略生效；热生效</FieldDescription>
+            </Field>
+          </div>
           {check('prefer_expiring', '快过期积分优先')}
+          {check('cross_domain_fallback', '裸模型名跨域回退')}
+          <FieldDescription>
+            本域选不到号时换到另一域（含上游 11102 跨域重取号一次）；显式域前缀 / 别名显式前缀 / 密钥绑定出口永不回退。热生效
+          </FieldDescription>
         </CardContent>
       </Card>
 
@@ -490,6 +537,11 @@ export function ConfigView() {
               {text('global_billing_base', { placeholder: '留空 = 内置默认' })}
               <FieldDescription>需重启</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>国内版 Chat Base</FieldLabel>
+              {text('cn_chat_base', { placeholder: '留空 = 内置默认 + 回落链' })}
+              <FieldDescription>非空时只用该 base、不回落官方域；需重启</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
@@ -515,6 +567,11 @@ export function ConfigView() {
               <FieldLabel>后台任务改写目标</FieldLabel>
               {text('background_target', { placeholder: 'deepseek-v4.1-flash' })}
               <FieldDescription>只改 model 字段，其余请求原样透传；热生效</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>模型黑名单</FieldLabel>
+              {text('hidden_models', { placeholder: '如 glm-5.2, global:kimi-k3' })}
+              <FieldDescription>逗号分隔；裸名两域都隐藏，cn:/global: 只藏该域。命中后不出现在 /v1/models，点名调用返回 400；热生效</FieldDescription>
             </Field>
           </div>
           <Separator className="my-4" />
@@ -553,6 +610,7 @@ export function ConfigView() {
               <FieldDescription>默认 3，封顶 8；仅对 /v1/responses 生效</FieldDescription>
             </Field>
           </div>
+          {check('search_endpoint', '开放 POST /v1/search/messages（官方联网搜索；每次调用消耗一次账号额度）')}
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
             本卡片字段均在启动期装配，保存后需重启进程；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。

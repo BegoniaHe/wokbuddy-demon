@@ -142,9 +142,26 @@ func TestClassify(t *testing.T) {
 		{400, `{"code":11141,"msg":"model offline"}`, ErrModelAccess},
 		{400, `{"error":{"data":{"code":11141}}}`, ErrModelAccess},
 		{400, `{"bizCode":11136}`, ErrModelBlocked},
+		// 11158 账号类型级模型权限拒绝（`model [x] is not allowed for user type [y]`）：
+		// 与 11136 同族 → 换号 + 模型避让。**与上游刻意不同**：上游把 429+11158 归
+		// 软限流（逐号冷却），本 fork 判定与状态码无关（同一码值不因状态码分叉），
+		// 429 同样归模型权限，避免权限拒绝让整池健康号陪跑软冷却。
+		{400, `{"code":11158,"msg":"model [x] is not allowed for user type [y]"}`, ErrModelBlocked},
+		{400, `{"code":"11158"}`, ErrModelBlocked},
+		{400, `{"msg":"model [x] is not allowed for user type [y]"}`, ErrModelBlocked},
+		{429, `{"code":11158,"msg":"model [x] is not allowed for user type [y]"}`, ErrModelBlocked},
 		// 11-128 入站内容拦截（与出站 sanitize 同语义），不依赖文案 marker。
 		{400, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
 		{200, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
+		// 11-128 分流：`+ request illegal` 是**通道校验失败**（账号健康、不降级重试），
+		// 其余 11-128 仍是内容拦截——两种语义不能合并。
+		{400, `{"code":11-128,"msg":"request illegal"}`, ErrChannelRefused},
+		{400, `{"error":{"code":"11-128","message":"request illegal"}}`, ErrChannelRefused},
+		// 裸 "request illegal"（无 11140 code）不再升级成账号故障（上游本轮删掉的过宽 marker）。
+		{400, `{"msg":"request illegal"}`, ErrClient},
+		{400, `{"code":1,"msg":"request illegal"}`, ErrClient},
+		// 11140 + request illegal 才是账号受限（code 与文案同时命中）。
+		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		// 额度族新增码与中文 hard marker。
 		{400, `{"code":11145,"msg":"TokenPlan exhausted"}`, ErrHardCredit},
 		{200, `{"code":14002,"msg":"agent quota exhausted"}`, ErrHardCredit},

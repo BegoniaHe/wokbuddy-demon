@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"sort"
@@ -64,6 +65,10 @@ const (
 	ErrQueueWaiting                  // 6020 排队等待 → 可重试，携带 Retry-After，不换号
 	ErrQueueFull                     // 6021/6022 队列满/用户并发上限 → 不可自愈，不轮转
 	ErrClient                        // 其他 4xx / 业务错误
+	// ErrChannelRefused 11-128 通道校验失败（`11-128 + request illegal`）：问题在
+	// 客户端/通道一侧（UA、头、中间代理或入站形态），账号本身健康 → 不罚号、
+	// 不降级重试，按通道级处理并继续轮转。追加在末尾以保持既有枚举值稳定。
+	ErrChannelRefused
 )
 
 // errKindNames 错误类别的字符串名（未知类别回落 "none"）。
@@ -86,6 +91,7 @@ var errKindNames = map[ErrKind]string{
 	ErrQueueWaiting:   "queue_waiting",
 	ErrQueueFull:      "queue_full",
 	ErrClient:         "client",
+	ErrChannelRefused: "channel_refused",
 }
 
 func (k ErrKind) String() string {
@@ -150,19 +156,45 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
 // 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
-//   - "request illegal"（code 11140）→ 上游 auth/auth_forbidden，账号级授权风控，
-//     需重新 OAuth 登录才能恢复，短冷却只能阻止继续送死。
 //   - code 14017（"trial not activated" / "The trial version is not yet activated"）→
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
-// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方 softRateMarkers
-// 后判定）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案）。
+// 裸 "request illegal"（无 11140 code）**不在**本表：它此前会把普通请求错误升级成
+// 硬禁用——上游本轮专门删掉了这条过宽 marker。账号受限改由 IsAccountRestricted
+// （11140 **且** 该文案）单独判定，见其文档。
 // 14017 文案唯一（无软限流歧义），可安全收录。
 var accountFaultMarkers = []string{
-	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
+}
+
+// accountRestrictedCode 账号级授权封禁码（auth/auth_forbidden）。
+const accountRestrictedCode = "11140"
+
+// accountRestrictedMsg 「账号受限」的确定性文案。
+const accountRestrictedMsg = "request illegal"
+
+// channelRefusedCode 11-128 通道校验失败码。上游常见形态是**非法 JSON**
+// （`{"code":11-128,...}`），因此按字节子串而不是 JSON 字段判定。
+const channelRefusedCode = "11-128"
+
+// IsChannelRefused 报告 body 是否是「11-128 通道校验失败」形态：码命中 11-128
+// **且**文案含 request illegal。通道校验问题在客户端/通道一侧（UA、头、中间代理、
+// 入站形态），账号健康，不该罚号也不该走内容拦截的降级重试。
+func IsChannelRefused(body string) bool {
+	return strings.Contains(body, channelRefusedCode) &&
+		containsAnyDual(strings.ToLower(body), body, []string{accountRestrictedMsg})
+}
+
+// IsAccountRestricted 报告 body 是否是「账号受限」（11140 + request illegal）：
+// 上游 auth/auth_forbidden，需人工在 WorkBuddy 提交反馈申诉后重新登录。
+//
+// 11140 **不能**只按 code 判定：该 code 也承载模型级限流文案（"The model provider
+// is rate-limiting requests."），那种场景必须保持 ErrSoftRate。反过来也不能只按
+// 文案判定：裸 "request illegal" 会命中普通请求错误。两者与（AND）才成立。
+func IsAccountRestricted(body string) bool {
+	return hasBusinessCode(body, accountRestrictedCode) &&
+		containsAnyDual(strings.ToLower(body), body, []string{accountRestrictedMsg})
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -281,9 +313,35 @@ const modelBlockCode = "11102"
 const modelBlockMsgMarker = "service info not found"
 
 // ModelBlockReason 11136 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
-// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11136"/"11141" 前缀识别
-// 可恢复的模型避让条目（与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
+// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11136"/"11158"/"11141"
+// 前缀识别可恢复的模型避让条目（与 6004 条目的 "6004 model rate limit" reason
+// 互不干扰）。
 const ModelBlockReason = "11136 model not permitted"
+
+// ModelForbiddenReason 11158 负缓存条目的 reason 前缀（账号类型级模型权限拒绝：
+// `model [x] is not allowed for user type [y]`）。与 ModelBlockReason 分开记录，
+// 让面板/排障能区分「该账号无该模型权限」与「该账号类型不允许该模型」。
+const ModelForbiddenReason = "11158 model not allowed for user type"
+
+// modelForbiddenMsgMarker 11158 答复的确定性文案。上游丢 code 时的外卡判据；
+// 只收这个窄短语，不收 "not allowed" 宽匹配（会命中任意权限类措辞）。
+const modelForbiddenMsgMarker = "is not allowed for user type"
+
+// hasModelForbiddenMarker 报告 body 是否带 11158 的窄文案。
+func hasModelForbiddenMarker(body string) bool {
+	return body != "" && strings.Contains(strings.ToLower(body), modelForbiddenMsgMarker)
+}
+
+// ModelBlockReasonFor 返回模型权限拒绝 body 对应的负缓存 reason 前缀：11158（账号
+// 类型级）优先于 11136（账号级）。两者都是 (账号,模型) 维度的可恢复避让，仅台账
+// 文案不同，因此共用 BlockModelBackoff 的同一条通道。
+func ModelBlockReasonFor(body string) string {
+	if hasBusinessCode(body, "11158") || hasModelForbiddenMarker(body) {
+		return ModelForbiddenReason
+	}
+
+	return ModelBlockReason
+}
 
 // IsModelBlocked 报告 body 是否是「上游模型目录无此模型」(11102) 的确定性答复。
 //
@@ -628,9 +686,10 @@ func ParseRateReset(body string) (time.Time, bool) {
 // classifyEarly 判定优先级最高的几类：模型不存在、402、11-128 内容拦截、
 // 客户端明确的请求级业务码。顺序即优先级。
 func classifyEarly(status int, body string) (ErrKind, bool) {
-	// 11136 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
-	// 平台级「目录无此模型」分开）。
-	if hasAnyBusinessCode(body, modelAccessCodes...) {
+	// 11136/11158 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
+	// 平台级「目录无此模型」分开）。11158 另留文案外卡：上游丢 code 时仍按账号类型
+	// 级权限拒绝处理，不落 ErrClient 逐号连败。
+	if hasAnyBusinessCode(body, modelAccessCodes...) || hasModelForbiddenMarker(body) {
 		return ErrModelBlocked, true
 	}
 	// 11102「上游模型目录无此模型」：所有账号共享同一目录，换号必然得到同一答复。
@@ -644,9 +703,15 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit, true
 	}
-	// 11-128 是上游内容审核/反探测拦截码（常见形态是非法 JSON `"code":11-128`）。
-	// 入站与出站 sanitize 同语义：内容问题非账号问题，归 ErrContentBlocked 走降级重试。
-	if strings.Contains(body, "11-128") {
+	// 11-128 有两种语义，必须先分流：`11-128 + request illegal` 是**通道校验失败**
+	// （问题在客户端/通道一侧，账号健康、不该降级重试也不该罚号）；其余 11-128 才是
+	// 上游内容审核/反探测拦截（常见形态是非法 JSON `"code":11-128`），归
+	// ErrContentBlocked 走降级重试（与出站 sanitize 同语义）。
+	if IsChannelRefused(body) {
+		return ErrChannelRefused, true
+	}
+
+	if strings.Contains(body, channelRefusedCode) {
 		return ErrContentBlocked, true
 	}
 
@@ -667,8 +732,8 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 //     错误（11125/11129/.../11155、12654、14405）：不罚号、不轮转。11136 归
 //     ErrModelBlocked（账号级，换号 + (账号,模型) 避让）；11141 归 ErrModelAccess
 //     （平台级下线，fail-fast）。
-//  4. sessionDeadMarkers / accountFaultMarkers / 11142 —— 需要人工重登的终态或
-//     账号级授权/配额故障。若 401 body 同时含 "12153" 与 "rate limit"（如网关
+//  4. sessionDeadMarkers / accountFaultMarkers / 11142 / 11140+request illegal ——
+//     需要人工重登的终态或账号级授权/配额故障。若 401 body 同时含 "12153" 与 "rate limit"（如网关
 //     错误页混排），归 session_dead：短冷却救不活失效 session，误判为限流会让该死号
 //     留在池中反复被选中。14017 常带 429，若落到 status==429 会误归 soft_rate
 //     （账号级故障等不来自愈）。11140 的 model 级限流变体因 marker 不含该文案而
@@ -750,6 +815,12 @@ func classifySessionOrAccount(lower, body string) (ErrKind, bool) {
 		return ErrAccountFault, true
 	}
 
+	// 11140 + request illegal：账号级授权封禁（auth/auth_forbidden）。**不能**只看
+	// 裸文案——那样会把普通请求错误升级成硬禁用（上游已删该过宽 marker）。
+	if IsAccountRestricted(body) {
+		return ErrAccountFault, true
+	}
+
 	if containsAnyDual(lower, body, accountFaultMarkers) {
 		return ErrAccountFault, true
 	}
@@ -783,16 +854,21 @@ var requestLevelCodes = []string{
 	"12654", "14405",
 }
 
-// modelAccessCodes 账号级模型权限缺失（11136「无该模型权限」）：同一账号换请求
-// 仍会失败，但换账号可能成功 → 写 (账号,模型) 负缓存后继续换号。
-var modelAccessCodes = []string{"11136"}
+// modelAccessCodes 账号级模型权限缺失（11136「无该模型权限」、11158「账号类型
+// 不允许该模型」）：同一账号换请求仍会失败，但换账号可能成功 → 写 (账号,模型)
+// 负缓存后继续换号。
+//
+// 11158 与 11136 判定口径一致（与状态码无关）：同一码值不因状态码分叉。上游把
+// 429+11158 归软限流，本 fork 刻意不同——429 只是同一权限拒绝的传输层状态码，
+// 逐号软冷却会让整池健康号陪跑，而权限拒绝本身不会因冷却而改变。
+var modelAccessCodes = []string{"11136", "11158"}
 
 // modelRetiredCodes 平台级模型下线（11141「该模型已下线」）：所有账号都会得到
 // 同一答复，换号无意义，归 ErrModelAccess 请求级 fail-fast。
 var modelRetiredCodes = []string{"11141"}
 
 // ModelAccessReason 11141 负缓存条目的 reason 前缀。pool.BlockModelClear
-// 按前缀识别可恢复的模型避让条目（11136 与 11141 两族），不碰 6004 限流台账。
+// 按前缀识别可恢复的模型避让条目（11136/11158 与 11141 两族），不碰 6004 限流台账。
 const ModelAccessReason = "11141 model retired"
 
 // accountLimitCodes 账号级使用上限（10105 活跃会话数、15001 联网搜索次数）。
@@ -834,12 +910,24 @@ func QueueCode(body string) string {
 	return ""
 }
 
+// queueFullTextMarkers 队列满载的**文案**形态（上游实测 `msg:"queue.full.title"`）。
+// 结构化 code 是主判据；本表只兜「上游换状态码或丢 code」的外卡：渠道级容量事件
+// 一旦落到 ErrSoftRate，applyErrorPolicy 会逐号 CooldownSoftRate + 轮转，把一次
+// 集群排队放大成整池软冷却（2026-10-15 上游事故形态）。只收 queue.full 的连写
+// 形态，普通 429（"too many requests"）不受影响。
+var queueFullTextMarkers = []string{"queue.full", "queue full"}
+
 // classifyQueueOrQuota 识别官方客户端的队列/额度/认证业务码。
 func classifyQueueOrQuota(body string) (ErrKind, bool) {
 	switch QueueCode(body) {
 	case queueWaitingCode:
 		return ErrQueueWaiting, true
 	case queueFullCode, queueUserCode:
+		return ErrQueueFull, true
+	}
+
+	// 无结构化码时的文案外卡（状态码无关）：渠道级满载不得落 ErrSoftRate 逐号冷却。
+	if containsAnyDual(strings.ToLower(body), body, queueFullTextMarkers) {
 		return ErrQueueFull, true
 	}
 
@@ -863,10 +951,8 @@ func classifyQueueOrQuota(body string) (ErrKind, bool) {
 		return ErrAccountFault, true
 	}
 
-	for _, code := range hardCreditCodes {
-		if hasBusinessCode(body, code) {
-			return ErrHardCredit, true
-		}
+	if hasAnyBusinessCode(body, hardCreditCodes...) {
+		return ErrHardCredit, true
 	}
 
 	return ErrNone, false
@@ -1113,8 +1199,12 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
-	ChatBaseCN    string
-	BillingBaseCN string
+	// BalanceObserver 余额观测回调（可选）：每次成功查询余额后回调 (uid, remain, total)，
+	// 供本地积分账本记录变动。装配期注入、运行期只读；回调 panic 被隔离，
+	// 且回调失败不影响余额查询主路径（账本只是观测附属物）。
+	BalanceObserver func(uid string, remain, total int64)
+	ChatBaseCN      string
+	BillingBaseCN   string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
@@ -1128,6 +1218,14 @@ type Client struct {
 	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
+
+	// refreshMu/refreshInFlight 同账号 refresh 单飞（按 UID 分桶）：同一时刻只允许
+	// 一个 refresh 在途，其余调用等待并复用首个结果。上游对 refreshToken 反重放，
+	// 并发第二发会带着已被消费的 RT 撞 12153 并整条 RT 链作废（账号从此恒 401，
+	// 只能人工重登）。本 fork 的并发来源比上游更多：scheduler keepalive 全量刷新、
+	// handler 临近过期刷新与 401 重放、cmd/signin 独立进程。单飞在这里是保号手段。
+	refreshMu       sync.Mutex
+	refreshInFlight map[string]*refreshFlight
 }
 
 // New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：真正禁 h2 /
@@ -1474,13 +1572,109 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
 //
-// 并发安全模型（两段式，缩小持锁窗口）：
-//   - 锁内仅做「读 refreshToken 快照」与「校验未变后写回新 token」两小段内存操作；
-//   - 网络 I/O（doJSON）在**锁外**执行，带 30s ctx 超时——避免上游 hang 时长时间
-//     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
-//   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
-//     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+// 并发安全模型（单飞 + 两段式）：
+//   - **单飞**：同一账号（UID）同一时刻只允许一个 refresh 在途，其余调用等待并
+//     原样复用首个结果。上游对 refreshToken 反重放：RT 被消费后再用会撞 12153，
+//     并把整条 RT 链作废（账号从此恒 401，只能人工重登）。本 fork 的并发来源
+//     更多（scheduler keepalive、handler 临近过期刷新与 401 重放、cmd/signin），
+//     单飞是保号手段而非省流量。
+//   - 首个调用内部仍是两段式：锁内读快照 → 锁外 I/O（30s）→ 锁内校验快照一致后
+//     写回；写回前若发现另一刷新已完成（两 token 同时变化）则直接采用。
+//   - 12153 兜底：磁盘 auth 文件已被其他进程（server + signin 双进程部署）刷新过
+//     时采纳磁盘 token 重试一次——进程内单飞挡不住跨进程竞态。无 FilePath 或磁盘
+//     RT 与内存一致时不重试（不做无限重试）。
 func (c *Client) RefreshToken(account10 *auth.Auth) error {
+	key := account10.UID
+	if key == "" {
+		// 无 UID 的临时 auth：退化为按对象指针去重，仍保证同一对象串行。
+		key = fmt.Sprintf("%p", account10)
+	}
+
+	// 取票或等待既有票据。等待者不解锁任何账号锁，避免与首个调用的 I/O 串行化。
+	c.refreshMu.Lock()
+
+	if c.refreshInFlight == nil {
+		c.refreshInFlight = make(map[string]*refreshFlight)
+	}
+
+	if flight, ok := c.refreshInFlight[key]; ok {
+		c.refreshMu.Unlock()
+		<-flight.done
+
+		return flight.err
+	}
+
+	flight := &refreshFlight{done: make(chan struct{})}
+	c.refreshInFlight[key] = flight
+	c.refreshMu.Unlock()
+
+	err := c.refreshTokenOnce(account10)
+	if err != nil && isSessionDeadErr(err) && adoptNewerTokensFromDisk(account10) {
+		// 跨进程竞态：磁盘 RT 已被别的进程 rotate 过，用新 RT 再试一次。
+		err = c.refreshTokenOnce(account10)
+	}
+
+	// 先写结果再关 channel：等待者 <-flight.done 之后读到的一定是最终 err。
+	flight.err = err
+	close(flight.done)
+
+	c.refreshMu.Lock()
+	delete(c.refreshInFlight, key)
+	c.refreshMu.Unlock()
+
+	return err
+}
+
+// refreshFlight 是同一账号一次 refresh 的单飞票据：done 关闭即结果就绪。
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// isSessionDeadErr 判定错误是否为会话/RT 失效（12153 或 refresh 侧 401/403 映射）。
+func isSessionDeadErr(err error) bool {
+	var ue *Error
+
+	return errors.As(err, &ue) && ue.Kind == ErrSessionDead
+}
+
+// adoptNewerTokensFromDisk 在 refresh 失败后回读 auth 文件：磁盘 RT 与内存不同
+// （另一进程已刷新并写回）时采纳磁盘 token 并返回 true，供调用方重试一次。
+// 读文件/解析失败、无 FilePath、RT 一致均返回 false（不改内存状态，保持失败语义）。
+func adoptNewerTokensFromDisk(account *auth.Auth) bool {
+	if account.FilePath == "" {
+		return false
+	}
+
+	raw, err := os.ReadFile(account.FilePath)
+	if err != nil {
+		return false
+	}
+
+	disk, err := auth.Parse(raw)
+	if err != nil || strings.TrimSpace(disk.RefreshToken) == "" {
+		return false
+	}
+
+	account.Lock()
+	defer account.Unlock()
+
+	if disk.RefreshToken == account.RefreshToken {
+		return false
+	}
+
+	account.AccessToken = disk.AccessToken
+	account.RefreshToken = disk.RefreshToken
+
+	if disk.ExpiresAt > 0 {
+		account.ExpiresAt = disk.ExpiresAt
+	}
+
+	return true
+}
+
+// refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
+func (c *Client) refreshTokenOnce(account10 *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
 	rtSnapshot, atBefore, err := refreshTokenSnapshot(account10)
 	if err != nil {
@@ -3381,7 +3575,24 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
 	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+
 	return remain, total, expiring, err
+}
+
+// notifyBalance 触发余额观测回调（装配期注入，缺省 nil = 关闭）。panic 隔离：
+// 账本是观测附属物，任何异常都不得打断余额查询主路径。
+func (c *Client) notifyBalance(account *auth.Auth, remain, total int64) {
+	if c.BalanceObserver == nil || account == nil {
+		return
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("WARN: [upstream] balance observer panic: %v", recovered)
+		}
+	}()
+
+	c.BalanceObserver(account.UID, remain, total)
 }
 
 // enterpriseUnlimitedRemain / enterpriseUnlimitedTotal 企业版「不限量」在池内的等价表示
@@ -3441,6 +3652,8 @@ func (c *Client) enterpriseResource(
 	}
 	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
 	if limit < 0 {
+		c.notifyBalance(account6, enterpriseUnlimitedRemain, enterpriseUnlimitedTotal)
+
 		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
 	}
 
@@ -3448,6 +3661,9 @@ func (c *Client) enterpriseResource(
 	total = limit
 	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
 	earliestAt, earliestRemaining, expiring = enterpriseExpiryBucket(cycleEnd, cycleReset, remain, time.Now(), soon)
+	// 观测回调挂在具体成功路径（而不是 UserResourceDetailedWithExpiry 包装层），
+	// 这样任何直接调用企业口径的余额查询（如 UserResourceSnapshot）都能记账。
+	c.notifyBalance(account6, remain, total)
 
 	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }
@@ -3606,6 +3822,13 @@ func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, 
 		return resourceSummaryResp{}, fmt.Errorf("resource summary parse: %w", err)
 	}
 
+	// summary 是主余额路径：在数据解析成功后触发观测，下游（personalResource /
+	// UserResourceSnapshot 重构）无需再处理。空 packages 属「回落旧端点」，不记脏数据。
+	if len(out.Packages) > 0 {
+		remain, total := out.summaryTotals()
+		c.notifyBalance(account, remain, total)
+	}
+
 	return out, nil
 }
 
@@ -3676,10 +3899,10 @@ var (
 
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
-func (c *Client) resourcePackageExpiry(account *auth.Auth, now time.Time, soon time.Duration) (
-	earliestAt time.Time, earliestRemaining, expiring int64,
+func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.Duration) (
+	expiring int64, totals *resourceTotals,
 ) {
-	var totals resourceTotals
+	totals = &resourceTotals{}
 
 	// 切片日期窗口按上游 UTC+8 墙钟计算；用部署机本地时区会在非 UTC+8 环境把
 	// 「今天」算错一天，拿到错误周期的免费包。
@@ -3710,12 +3933,12 @@ func (c *Client) resourcePackageExpiry(account *auth.Auth, now time.Time, soon t
 	}
 
 	for _, spec := range specs {
-		if perr := c.collectPackageExpiry(account, spec.path, spec.body, now, soon, &totals); perr != nil {
+		if perr := c.collectPackageExpiry(account, spec.path, spec.body, now, soon, totals); perr != nil {
 			log.Printf("WARN: [upstream] resource packages %s: %v (summary total kept)", spec.path, perr)
 		}
 	}
 
-	return totals.earliestAt, totals.earliestRemaining, totals.expiring
+	return totals.expiring, totals
 }
 
 // collectPackageExpiry 分页拉取单类积分包并累加到期批次。TotalCount>0 时以其为
@@ -3803,19 +4026,65 @@ func addPackageExpiry(packages []billingPackageAccount, now time.Time, soon time
 func (c *Client) UserResourceDetailedWithExpiry(
 	account *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	snap, err := c.UserResourceSnapshot(account, soon)
+	if err != nil {
+		return 0, 0, 0, time.Time{}, 0, err
+	}
+
+	for i := range snap.Buckets {
+		bucket := &snap.Buckets[i]
+		if earliestAt.IsZero() || bucket.ExpireAt.Before(earliestAt) {
+			earliestAt, earliestRemaining = bucket.ExpireAt, bucket.Remain
+		} else if bucket.ExpireAt.Equal(earliestAt) {
+			earliestRemaining += bucket.Remain
+		}
+	}
+
+	return snap.Remain, snap.Total, snap.Expiring, earliestAt, earliestRemaining, nil
+}
+
+// UserResourceSnapshot 查询余额并返回含逐日到期批次的完整快照。企业版走企业口径
+// （额度体系无「资源包到期批次」，Buckets 恒空）。
+func (c *Client) UserResourceSnapshot(account *auth.Auth, soon time.Duration) (ResourceSnapshot, error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if account.IsEnterprise() {
-		return c.enterpriseResource(account, soon)
+		remain, total, expiring, earliestAt, earliestRemaining, err := c.enterpriseResource(account, soon)
+		if err != nil {
+			return ResourceSnapshot{}, err
+		}
+
+		// 企业口径只给「周期末」一个到期点：折算成单条日桶，保持与个人口径同形状
+		// （快照 / 最早到期路由 / 面板「检查」看到的是同一份到期信息）。
+		snap := ResourceSnapshot{Remain: remain, Total: total, Expiring: expiring}
+		if !earliestAt.IsZero() && earliestRemaining > 0 {
+			snap.Buckets = []ExpiryBucket{{
+				Date:     expiryBucketDate(earliestAt),
+				ExpireAt: earliestAt,
+				Remain:   earliestRemaining,
+			}}
+		}
+
+		return snap, nil
 	}
 
+	remain, total, expiring, totals, err := c.personalResource(account, soon)
+	if err != nil {
+		return ResourceSnapshot{}, err
+	}
+
+	return ResourceSnapshot{Remain: remain, Total: total, Expiring: expiring, Buckets: totals.bucketList()}, nil
+}
+
+// personalResource 个人号余额查询主体：返回汇总与含日桶的累加器。
+func (c *Client) personalResource(account *auth.Auth, soon time.Duration) (int64, int64, int64, *resourceTotals, error) {
 	now := time.Now()
 	// 官方桌面端主路径：summary 汇总 remain/total；失败时回落旧 get-user-resource。
 	if summary, serr := c.fetchResourceSummary(account); serr == nil && len(summary.Packages) > 0 {
 		remain, total := summary.summaryTotals()
-		earliestAt, earliestRemaining, expiring := c.resourcePackageExpiry(account, now, soon)
+		expiring, totals := c.resourcePackages(account, now, soon)
 
-		return remain, total, expiring, earliestAt, earliestRemaining, nil
+		return remain, total, expiring, totals, nil
 	} else if serr != nil {
 		log.Printf("WARN: [upstream] resource summary failed: %v (fallback get-user-resource)", serr)
 	}
@@ -3832,7 +4101,7 @@ func (c *Client) UserResourceDetailedWithExpiry(
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
 	var data json.RawMessage
 
-	err = c.retryBillingTransient(func() error {
+	err := c.retryBillingTransient(func() error {
 		var e error
 
 		data, e = c.billingMeterJSON(account, c.billingMeterPaths(account), body)
@@ -3840,12 +4109,12 @@ func (c *Client) UserResourceDetailedWithExpiry(
 		return e
 	})
 	if err != nil {
-		return 0, 0, 0, time.Time{}, 0, err
+		return 0, 0, 0, nil, err
 	}
 
 	var resp resourceDetailedResp
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, nil, fmt.Errorf("resource parse: %w", err)
 	}
 
 	var totals resourceTotals
@@ -3853,7 +4122,12 @@ func (c *Client) UserResourceDetailedWithExpiry(
 		totals.add(&resp.Response.Data.Accounts[i], now, soon)
 	}
 
-	return totals.remain, totals.total, totals.expiring, totals.earliestAt, totals.earliestRemaining, nil
+	// 观测回调挂在具体成功路径（不是 UserResourceDetailedWithExpiry / UserResourceSnapshot
+	// 包装层）：summary 已在 fetchResourceSummary 记账，企业口径在 enterpriseResource 记账，
+	// 这里补旧端点回退路径。成功才回调，失败不写脏数据。
+	c.notifyBalance(account, totals.remain, totals.total)
+
+	return totals.remain, totals.total, totals.expiring, &totals, nil
 }
 
 // resourceDetailedResp get-user-resource 响应信封。
@@ -3872,6 +4146,7 @@ type resourceAccount struct {
 	SlicePeriodUsageDetails    []slicePeriodUsage `json:"SlicePeriodUsageDetails"`
 	CycleEndTime               string             `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
 	ExpiredTime                string             `json:"ExpiredTime"`
+	PackageEndTime             string             `json:"PackageEndTime"`
 	DeductionEndTime           int64              `json:"DeductionEndTime"`
 	CapacitySize               int64              `json:"CapacitySize"`
 	CapacityRemain             int64              `json:"CapacityRemain"`
@@ -3887,11 +4162,33 @@ type resourceAccount struct {
 	CycleCapacityUsedPrecise   string             `json:"CycleCapacityUsedPrecise"`
 }
 
+// ExpiryBucket 一个自然日（上游 CST 墙钟）的到期批次：同日多包合并。
+// Date 是「YYYY-MM-DD」形态（与前端 expBatches 同口径，按日聚合）；
+// ExpireAt 是该日最早到期时刻（展示/排序用，跨日聚合时不为零值）；
+// Remain 是该日全部正余额包的剩余积分之和。
+type ExpiryBucket struct {
+	Date     string    `json:"date"`
+	ExpireAt time.Time `json:"expire_at,omitzero"`
+	Remain   int64     `json:"remain"`
+}
+
+// ResourceSnapshot 一次余额查询的完整快照：汇总 + 逐日到期批次。
+// 快照与「检查」（面板 packages 明细）同口径——两路都按自然日聚合，
+// 避免「快照只显示最早一批、检查能显示全部批次」的口径分裂。
+type ResourceSnapshot struct {
+	Remain   int64          `json:"remain"`
+	Total    int64          `json:"total"`
+	Expiring int64          `json:"expiring"`
+	Buckets  []ExpiryBucket `json:"buckets,omitempty"`
+}
+
 // resourceTotals 个人资源聚合累加器。
 type resourceTotals struct {
 	remain, total, expiring int64
 	earliestAt              time.Time
 	earliestRemaining       int64
+	// buckets 按自然日聚合的到期批次（date → 批次）；nil 表示尚无批次。
+	buckets map[string]*ExpiryBucket
 }
 
 // add 累加单个套餐的余额与到期批次（余额钳非负、size 不高于 remain）。
@@ -3939,7 +4236,9 @@ func (t *resourceTotals) add(acct *resourceAccount, now time.Time, soon time.Dur
 // CapacityType=4（切片/每日包）以 CycleEndTime 为刷新边界；其余优先
 // DeductionEndTime（epoch 毫秒），再 ExpiredTime，最后 CycleEndTime。
 func resourceAccountExpiry(acct *resourceAccount) (time.Time, bool) {
-	if acct.CapacityType == 4 {
+	// 切片/每日包以周期边界为准，但仅在字段存在时（与 creditPackageExpiry 同口径）：
+	// CycleEndTime 缺失时继续按下面的通用优先级回落，不直接判「无到期」。
+	if acct.CapacityType == 4 && acct.CycleEndTime != "" {
 		return parsePackageEndTime(acct.CycleEndTime)
 	}
 
@@ -3949,6 +4248,15 @@ func resourceAccountExpiry(acct *resourceAccount) (time.Time, bool) {
 
 	if acct.ExpiredTime != "" {
 		if t, ok := parsePackageEndTime(acct.ExpiredTime); ok {
+			return t, true
+		}
+	}
+
+	// 与「检查」（creditPackageExpiry）同优先级：ExpiredTime → PackageEndTime →
+	// CycleEndTime。漏掉 PackageEndTime 会让仅带该字段的包回落到周期重置日，
+	// 快照与逐包明细再次分叉。
+	if acct.PackageEndTime != "" {
+		if t, ok := parsePackageEndTime(acct.PackageEndTime); ok {
 			return t, true
 		}
 	}
@@ -3968,6 +4276,55 @@ func (t *resourceTotals) addExpiry(end time.Time, r int64, now time.Time, soon t
 	if soon > 0 && !end.After(now.Add(soon)) {
 		t.expiring += r
 	}
+
+	t.addBucket(end, r)
+}
+
+// expiryBucketDate 到期时刻所属的自然日（上游 CST 墙钟），口径与面板「检查」
+// （expBatches 按 expire_at 的日期聚合）一致。
+func expiryBucketDate(end time.Time) string {
+	return end.In(softRateResetLoc).Format("2006-01-02")
+}
+
+// addBucket 把一笔到期额度累加进所属自然日的批次（同日取最早到期时刻）。
+func (t *resourceTotals) addBucket(end time.Time, r int64) {
+	if r <= 0 || end.IsZero() {
+		return
+	}
+
+	date := expiryBucketDate(end)
+
+	if t.buckets == nil {
+		t.buckets = make(map[string]*ExpiryBucket, 2)
+	}
+
+	if bucket := t.buckets[date]; bucket != nil {
+		bucket.Remain += r
+
+		if end.Before(bucket.ExpireAt) {
+			bucket.ExpireAt = end
+		}
+
+		return
+	}
+
+	t.buckets[date] = &ExpiryBucket{Date: date, ExpireAt: end, Remain: r}
+}
+
+// bucketList 返回按日期升序的批次快照（nil = 无批次）。
+func (t *resourceTotals) bucketList() []ExpiryBucket {
+	if len(t.buckets) == 0 {
+		return nil
+	}
+
+	out := make([]ExpiryBucket, 0, len(t.buckets))
+	for _, bucket := range t.buckets {
+		out = append(out, *bucket)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Date < out[j].Date })
+
+	return out
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。

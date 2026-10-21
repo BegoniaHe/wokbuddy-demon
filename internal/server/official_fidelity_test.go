@@ -99,6 +99,78 @@ func TestChat401RefreshesAndReplaysOnce(t *testing.T) {
 	}
 }
 
+// TestChatQueueFullIsChannelLevel 队列满载（6021 / 只有 queue.full 文案）是渠道级
+// 容量事件：只打一次上游、不轮转、账号零惩罚，返回 503 + queue_full 透传上游原文。
+func TestChatQueueFullIsChannelLevel(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"429+6021", http.StatusTooManyRequests, `{"code":6021,"msg":"queue.full.title"}`},
+		{"500+6021", http.StatusInternalServerError, `{"code":6021,"msg":"queue.full.title"}`},
+		{"仅文案外卡", http.StatusTooManyRequests, `{"msg":"queue.full.title"}`},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			assertQueueFullChannelLevel(t, testCase.status, testCase.body)
+		})
+	}
+}
+
+// assertQueueFullChannelLevel 单次断言：只打一次上游、503 queue_full、账号零惩罚。
+func assertQueueFullChannelLevel(t *testing.T, status int, body string) {
+	t.Helper()
+
+	var calls atomic.Int32
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls.Add(1)
+
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+	// 两个健康号：若被误判成软限流就会轮转到第二个号（calls 变 2）。
+	state := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503, body=%s", rec.Code, rec.Body)
+	}
+
+	got := rec.Body.String()
+	if !strings.Contains(got, "queue_full") || !strings.Contains(got, "queue.full.title") {
+		t.Errorf("body must carry queue_full + upstream text, got %s", got)
+	}
+
+	if n := calls.Load(); n != 1 {
+		t.Errorf("upstream calls=%d want 1 (channel-level busy must not rotate)", n)
+	}
+
+	for _, uid := range []string{"u1", "u2"} {
+		st := statusOf(t, state, uid)
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+			t.Errorf("account %s must stay unpunished: %+v", uid, st)
+		}
+	}
+}
+
 // TestInboundSessionMetadataForwarded 入站官方会话头进入 ChatMeta。
 //
 //nolint:cyclop // 覆盖多个透传字段。

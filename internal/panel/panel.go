@@ -31,6 +31,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/agentcfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -82,6 +83,8 @@ type Config struct {
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
+	// CreditHistory 本地积分变动账本（nil = 积分历史接口返回 501）。
+	CreditHistory *credithist.Ledger
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
@@ -277,6 +280,11 @@ func (p *Panel) routesImport() {
 
 func (p *Panel) routesUsage() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistoryHandler))
+	// 官方补偿（上游同步窗口 issue #204）：只读状态 + 逐号/全量「先查后领」。
+	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensationStatus))
+	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensation))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/usage/remaining", p.withAuth(p.usageRemaining))
@@ -420,24 +428,30 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		sticky = p.cfg.StickyCount()
 	}
 
+	// 余额快照新鲜度（issue #200）：周期 + 最近一次完成时刻，供到期提醒卡片标注
+	// 「每 N 分钟后台刷新、x 分钟前更新」。未刷新过时时间为零值（前端按 — 渲染）。
+	balanceRefreshSec, balanceRefreshedAt := p.cfg.Pool.BalanceRefreshMeta()
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":             p.cfg.Version,
-		"uptime_sec":          int(time.Since(p.started).Seconds()),
-		"auth_required":       p.apiKey() != "",
-		"redis_mode":          p.cfg.RedisMode,
-		"sticky_sessions":     sticky,
-		"total":               total,
-		"healthy":             healthy,
-		"cooling":             cooling,
-		"disabled":            disabled,
-		"paused":              paused,
-		"in_flight_full":      inFlightFull,
-		"in_flight_total":     p.cfg.Pool.InFlightTotal(),
-		"max_in_flight_total": p.cfg.Pool.MaxInFlightTotal(),
-		"daily_limited":       p.cfg.Pool.DailyLimitedUIDs(),
-		"daily_reset_at":      nextLocalMidnight(),
-		"proxy_slots":         p.cfg.ProxySlots,
-		"accounts":            p.cfg.Pool.List(),
+		"version":              p.cfg.Version,
+		"balance_refresh_sec":  balanceRefreshSec,
+		"balance_refreshed_at": balanceRefreshedAt,
+		"uptime_sec":           int(time.Since(p.started).Seconds()),
+		"auth_required":        p.apiKey() != "",
+		"redis_mode":           p.cfg.RedisMode,
+		"sticky_sessions":      sticky,
+		"total":                total,
+		"healthy":              healthy,
+		"cooling":              cooling,
+		"disabled":             disabled,
+		"paused":               paused,
+		"in_flight_full":       inFlightFull,
+		"in_flight_total":      p.cfg.Pool.InFlightTotal(),
+		"max_in_flight_total":  p.cfg.Pool.MaxInFlightTotal(),
+		"daily_limited":        p.cfg.Pool.DailyLimitedUIDs(),
+		"daily_reset_at":       nextLocalMidnight(),
+		"proxy_slots":          p.cfg.ProxySlots,
+		"accounts":             p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
@@ -851,7 +865,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	// 账号体系门控（issue #108）：企业版无个人签到体系（上游 400 code 10001），
 	// 不发起签到调用，端点退化为「刷新额度」；global 账号与调度器一致走签到。
-	// 额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
+	// 额度查询按 realm/企业口径分流（upstream.UserResourceSnapshot）。
 	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
 	denyReason, checkinDone, checkinMsg := p.runCheckin(account, uid)
@@ -871,10 +885,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		resp["checkin_message"] = checkinMsg
 	}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(
-		account,
-		p.expiringSoonWindow(),
-	)
+	// 用含逐日到期批次的快照写入：单号签到同样保留完整批次，而不是把后台刷新
+	// 刚写入的批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
+	snap, err := p.cfg.Upstream.UserResourceSnapshot(account, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
@@ -882,11 +895,11 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	p.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
+	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	resp["credits"] = snap.Remain
+	resp["credits_total"] = snap.Total
+	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, snap.Remain, snap.Total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -900,17 +913,29 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(
-		account,
-		p.expiringSoonWindow(),
-	)
+	// 与签到/后台刷新同口径：写完整批次，单号刷新不清空到期明细。
+	snap, err := p.cfg.Upstream.UserResourceSnapshot(account, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
 
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": snap.Remain, "credits_total": snap.Total})
+}
+
+// poolExpiryBuckets upstream → pool 类型转换（pool 不依赖 upstream 包）。
+func poolExpiryBuckets(buckets []upstream.ExpiryBucket) []pool.ExpiryBucket {
+	if len(buckets) == 0 {
+		return nil
+	}
+
+	out := make([]pool.ExpiryBucket, 0, len(buckets))
+	for _, bucket := range buckets {
+		out = append(out, pool.ExpiryBucket{Date: bucket.Date, ExpireAt: bucket.ExpireAt, Remain: bucket.Remain})
+	}
+
+	return out
 }
 
 // accountRemove 移除账号：先出池（池内退役凭证并立即落盘 state），再删 auth 文件。

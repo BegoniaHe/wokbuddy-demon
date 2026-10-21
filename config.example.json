@@ -3,6 +3,7 @@
   "api_key": "test_key",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "dns_servers": [],
   "server": {
     "read_timeout": "300s",
     "max_body_bytes": 33554432,
@@ -59,18 +60,24 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
+    "task_sweep_enabled": true,
+    "task_sweep_minutes": 15,
     "checkin_account_delay": "800ms",
     "include_disabled_in_tasks": false
   },
   "models": {
     "aliases": {},
     "background_names": [],
-    "background_target": "deepseek-v4.1-flash"
+    "background_target": "deepseek-v4.1-flash",
+    "hidden": []
   },
   "global": {
     "enabled": true,
     "chat_base": "",
     "billing_base": ""
+  },
+  "cn": {
+    "chat_base": ""
   },
   "upstream": {
     "timeout_seconds": 120,
@@ -95,7 +102,8 @@
     "sanitize_blacklist_fingerprints": true,
     "multimodal_routing": false,
     "local_web_tools": false,
-    "local_web_tool_rounds": 3
+    "local_web_tool_rounds": 3,
+    "search_endpoint": false
   },
   "prompt": {
     "mode": "passthrough",
@@ -137,9 +145,18 @@
     "degrade_cooldown_max": "2h",
     "idle_weight_per_hour": 0.5,
     "idle_weight_max": 5.0,
+    "strategy": {
+      "cn": "weighted_random",
+      "global": "weighted_random"
+    },
+    "account_order": {
+      "cn": [],
+      "global": []
+    },
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
+    "cross_domain_fallback": false,
     "credit_floor": 100
   },
   "session_sticky": {

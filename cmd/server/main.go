@@ -25,6 +25,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
@@ -159,6 +160,9 @@ func main() {
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(panel2.RunGrowthQueueOnce)
+	// 任务补领清扫（上游同步窗口 issue #196）：周期幂等补领「已达标未领」的奖励，
+	// 与「一键完成」共用 claim 口径；默认 15 分钟、开关与间隔均热生效。
+	sch.SetTaskSweepHook(func(ctx context.Context) { panel2.RunTaskSweep(ctx) })
 	log.SetOutput(io.MultiWriter(os.Stderr, panel2.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, panel2.Logs()))
 
@@ -224,6 +228,17 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 	state.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)
+	state.SetScheduling(pool.Scheduling{
+		Strategy: map[string]pool.Strategy{
+			"cn":     pool.Strategy(cfg.Pool.Strategy.CN),
+			"global": pool.Strategy(cfg.Pool.Strategy.Global),
+		},
+		Order: map[string][]string{
+			"cn":     cfg.Pool.AccountOrder.CN,
+			"global": cfg.Pool.AccountOrder.Global,
+		},
+	})
 
 	// 会话粘性路由（可配关闭）。
 	sessRouter, redisMode, sessCount := setupSessionRouter(cfg, store, state)
@@ -233,6 +248,12 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 
 // setupUpstream 装配上游客户端、通知器与调度器，并注入账号路由与倍率读取。
 func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.Notifier, *scheduler.Scheduler) {
+	// 出站 DNS 必须在 upstream.New() **之前**注入：Transport/Dialer（含 Resolver）
+	// 在 New() 内一次性构造，运行期改无效——所以 dns_servers 被列为「需重启」。
+	// 空 = 系统解析器（零回归）；internal/server/localwebtools.go 的 SSRF 专用
+	// Transport 不经这里，保持不受影响。
+	upstream.SetDNSServers(cfg.DNSServers)
+
 	client := upstream.New()
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
@@ -289,6 +310,15 @@ func newPanel(
 	cfg *Config, cfgPath string, state *pool.Pool, client4 *upstream.Client, sch *scheduler.Scheduler,
 	redisMode string, sessCount func() int, obs *observability, trustedProxies []*net.IPNet,
 ) *panel.Panel {
+	// 积分变动账本（issue #201 / 上游 #138）：与 state 文件同目录，余额观测回调在
+	// 装配期挂上（New() 之后、开始服务之前，运行期只读）。账本是观测附属物：
+	// 写盘失败只记日志，不影响余额查询主路径。
+	creditLedger := credithist.Open(stateSibling(cfg.StateFile, "credit-history.json"), credithist.DefaultMaxEntries)
+	client4.BalanceObserver = func(uid string, remain, _ int64) {
+		creditLedger.Observe(uid, remain, "")
+		creditLedger.Flush() // 只在该账号余额变化时才写（低频），无需额外后台协程
+	}
+
 	return panel.New(&panel.Config{
 		Pool:           state,
 		Usage:          obs.usage,
@@ -314,6 +344,7 @@ func newPanel(
 		PricingRate:    cfg.Pricing.ExchangeRate,
 		Quota:          obs.quota,
 		Agents:         obs.agents,
+		CreditHistory:  creditLedger,
 		LoadConfig: func() (any, error) {
 			return Load(cfgPath)
 		},
@@ -337,10 +368,12 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		MultimodalRouting:    cfg.Features.MultimodalRouting,
+		SearchEndpoint:       cfg.Features.SearchEndpoint,
 		LocalWebTools:        cfg.Features.LocalWebTools,
 		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
 		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
 		BackgroundTarget:     cfg.Models.BackgroundTarget,
+		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -400,6 +433,8 @@ func serve(
 	go sch.Run(ctx)
 
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// 任务补领清扫循环：0 = 暂停（task_sweep_enabled=false），运行期可热改间隔。
+	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -589,6 +624,11 @@ func configureUpstream(cfg *Config, client *upstream.Client) {
 	client.GlobalEnabled = cfg.Global.Enabled
 	client.ChatBaseGlobal = cfg.Global.ChatBase
 	client.BillingBaseGlobal = cfg.Global.BillingBase
+	// cn.chat_base：仅非空时覆盖 CN 主域（空 = 保持内置默认 + 回落链）。
+	if base := strings.TrimSpace(cfg.CN.ChatBase); base != "" {
+		client.ChatBaseCN = base
+	}
+
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
@@ -661,6 +701,13 @@ func logScheduleBalance(cfg *Config) {
 		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
 	case cfg.BalanceRefreshInterval > 0:
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
+	}
+
+	switch {
+	case !cfg.Schedule.TaskSweepEnabled:
+		log.Printf("任务补领清扫已禁用（schedule.task_sweep_enabled=false）")
+	case cfg.TaskSweepInterval > 0:
+		log.Printf("任务补领清扫：每 %s（只补领「已达标未领」的奖励）", cfg.TaskSweepInterval)
 	}
 
 	if cfg.Schedule.IncludeDisabledInTasks {
@@ -814,10 +861,12 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		MultimodalRouting:    newCfg.Features.MultimodalRouting,
+		SearchEndpoint:       newCfg.Features.SearchEndpoint,
 		LocalWebTools:        newCfg.Features.LocalWebTools,
 		LocalWebToolRounds:   newCfg.Features.LocalWebToolRounds,
 		BackgroundNames:      backgroundNameSet(newCfg.Models.BackgroundNames),
 		BackgroundTarget:     newCfg.Models.BackgroundTarget,
+		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	client3.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	state9.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -831,6 +880,17 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 	state9.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	state9.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	state9.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	state9.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback)
+	state9.SetScheduling(pool.Scheduling{
+		Strategy: map[string]pool.Strategy{
+			"cn":     pool.Strategy(newCfg.Pool.Strategy.CN),
+			"global": pool.Strategy(newCfg.Pool.Strategy.Global),
+		},
+		Order: map[string][]string{
+			"cn":     newCfg.Pool.AccountOrder.CN,
+			"global": newCfg.Pool.AccountOrder.Global,
+		},
+	})
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -841,6 +901,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 		!newCfg.Schedule.GrowthEnabled,
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 }
@@ -934,8 +995,12 @@ var restartFieldPaths = []string{
 	"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip",
 	"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
 	"upstream.proxies",
+	// 出站解析器在 Dialer 构造期一次性装入，运行期改无效。
+	"dns_servers",
 	// global 路由在 configureUpstream / auth / handler 构造期捕获。
 	"global.enabled", "global.chat_base", "global.billing_base",
+	// cn.chat_base 同样在 configureUpstream 一次性写入 client。
+	"cn.chat_base",
 	// 提示词模式与文件在 handler 构造期解析。
 	"prompt.mode", "prompt.file",
 	// Redis 客户端在启动期装配。

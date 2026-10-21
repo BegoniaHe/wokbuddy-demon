@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,6 +19,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
 
@@ -31,10 +34,12 @@ var (
 	errLoadFailed                       = errors.New("Load failed")
 	errModelsAliases                    = errors.New("models.aliases: 别名不能为空")
 	errNormalizeModelAliasesFailed      = errors.New("normalizeModelAliases failed")
+	errNormalizeHiddenModels            = errors.New("normalizeHiddenModels failed")
 	errNormalizeAliasTargetFailed       = errors.New("normalizeAliasTarget failed")
 	errNormalizeNotifyFailed            = errors.New("normalizeNotify failed")
 	errNormalizeLoggingFailed           = errors.New("normalizeLogging failed")
 	errNormalizeProxiesFailed           = errors.New("normalizeProxies failed")
+	errNormalizeDNSServersFailed        = errors.New("normalizeDNSServers failed")
 	errValidateBackoffOrderFailed       = errors.New("validateBackoffOrder failed")
 	errValidateServerRangesFailed       = errors.New("validateServerRanges failed")
 	errValidateRangesFailed             = errors.New("validateRanges failed")
@@ -62,6 +67,12 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// DNSServers 出站 DNS 服务器（host 或 host:port，按顺序尝试，缺省端口 53）。
+	// 空 = 系统解析器（零回归）。用途：绕过污染解析、把上游域名固定到可控出口。
+	// 属连接层参数（Transport 在装配期构造），改后**需重启**。
+	// 环境变量 WB2A_DNS（逗号分隔）覆盖此处配置。
+	DNSServers []string `json:"dns_servers"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -179,6 +190,10 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+		// 任务补领清扫（上游同步窗口 issue #196）：周期扫全部非禁用账号，幂等补领
+		// 「已达标未领」的成长任务奖励（只补领、不代做任务）。默认开启。
+		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
+		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
 		// CheckinAccountDelay 签到任务账号间等待（issue #59）：如 "800ms"；"0" = 不限。
 		CheckinAccountDelay string `json:"checkin_account_delay"`
 	} `json:"schedule"`
@@ -195,6 +210,10 @@ type Config struct {
 		// 语法，省略 realm 时继承请求侧的 realm（裸请求即 cn）。
 		// 命中别名后选号/粘性/成本台账/日志一律使用解析后的裸模型名。
 		Aliases map[string]string `json:"aliases"`
+		// Hidden 模型黑名单：裸名 = 两域都隐藏，"cn:"/"global:" 前缀 = 只藏该域。
+		// 命中后 /v1/models 不再列出、点名调用返回 400 model_unavailable（不打上游、
+		// 不占选号）。大小写敏感，保存后热生效。
+		Hidden []string `json:"hidden"`
 	} `json:"models"`
 
 	Global struct {
@@ -209,6 +228,17 @@ type Config struct {
 		ChatBase    string `json:"chat_base"`
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
+
+	CN struct {
+		// ChatBase 国内版（cn realm）上游 chat base 覆盖；空 = 回落内置默认
+		// https://www.workbuddy.cn，并在首 token 前按 408/502/503/504 或传输错误
+		// 回落 copilot.tencent.com / wb.tencentbuddy.com（见 upstream.chatOrigins）。
+		//
+		// 显式设置时**只用**该 base、不做回落（与 global.chat_base 同语义）：
+		// 让 CN 域指向自建/自选入口时，回落到官方域会绕过该入口。
+		// 注意本 fork 的默认域已经是 workbuddy.cn 且自带回落链，常规部署无需设置。
+		ChatBase string `json:"chat_base"`
+	} `json:"cn"`
 
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
@@ -267,6 +297,11 @@ type Config struct {
 		// 该模态的模型并重写 model（默认 false = 明确 400 model_capability）。
 		// issue #109。
 		MultimodalRouting bool `json:"multimodal_routing"`
+		// SearchEndpoint 是否开放 POST /v1/search/messages（官方联网搜索）。
+		// 默认 false：搜索是新增出站面且消耗账号额度，与 local_web_tools /
+		// multimodal_routing 同口径默认关闭；热生效。当前只放行 CN 域账号选号
+		// （上游仅在 CN 域实测过，两域放开留 TODO）。
+		SearchEndpoint bool `json:"search_endpoint"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`
@@ -324,6 +359,21 @@ type Config struct {
 		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// Strategy 按域选号策略（issue #205）：{"cn":"weighted_random","global":"..."}。
+		// 可选 weighted_random（默认）/ round_robin / sequential_exhaust；
+		// 有序策略会**关闭全冷却兜底与防撞号窗口**（语义：明确地用下一个号）。
+		// 热生效；非法值在 normalize 阶段拒绝启动。
+		Strategy struct {
+			CN     string `json:"cn"`
+			Global string `json:"global"`
+		} `json:"strategy"`
+		// AccountOrder 按域固定账号顺序（issue #205）：{"cn":["uid1","uid2"],...}。
+		// 只对有序策略有意义；配置里不存在/异域/重复的 uid 自动跳过，
+		// 其余账号按 uid 升序追加在后。
+		AccountOrder struct {
+			CN     []string `json:"cn"`
+			Global []string `json:"global"`
+		} `json:"account_order"`
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
@@ -339,6 +389,14 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// CrossDomainFallback 裸模型名跨域回退开关（默认 false）：请求没有显式指定域
+		// （无 cn:/global: 前缀、别名目标无显式前缀、命名密钥未绑定出口）时，本域对该
+		// 模型选不到号可以换到另一域；上游 11102（目录无此模型）也允许跨域重取号一次。
+		// 显式指定域的请求永不回退（出口约束）。热生效。
+		//
+		// 注意语义代价：开启后请求可能落到客户端**没点名**的另一域，并消耗该域的
+		// 额度与日限（记账按实际服务域）。
+		CrossDomainFallback bool `json:"cross_domain_fallback"`
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
@@ -362,7 +420,9 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
-	ExpiringSoonDur        time.Duration `json:"-"`
+	// TaskSweepInterval 任务补领清扫周期（0 = 不启动，task_sweep_enabled=false）。
+	TaskSweepInterval time.Duration `json:"-"`
+	ExpiringSoonDur   time.Duration `json:"-"`
 	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
 	CheckinAccountDelayDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
@@ -456,6 +516,9 @@ func applyScheduleDefaults(config2 *Config) {
 	config2.Schedule.BlackcatEnabled = true
 	config2.Schedule.BalanceRefreshEnabled = true
 	config2.Schedule.BalanceRefreshMinutes = 5
+	// 任务补领清扫默认开启、15 分钟一轮：只补领「已达标未领」的奖励，幂等且零副作用。
+	config2.Schedule.TaskSweepEnabled = true
+	config2.Schedule.TaskSweepMinutes = 15
 	config2.Schedule.CheckinAccountDelay = "800ms"
 }
 
@@ -795,6 +858,14 @@ func applyEnvFeatures(config6 *Config) {
 	if b, ok := envBool("WB2A_PREFER_EXPIRING"); ok {
 		config6.Pool.PreferExpiring = b
 	}
+
+	if b, ok := envBool("WB2A_CROSS_DOMAIN_FALLBACK"); ok {
+		config6.Pool.CrossDomainFallback = b
+	}
+
+	if v := os.Getenv("WB2A_DNS"); strings.TrimSpace(v) != "" {
+		config6.DNSServers = strings.Split(v, ",")
+	}
 }
 
 // envInt 读取整型环境变量：键缺席或解析失败一律视为未设置（ok=false），
@@ -841,8 +912,10 @@ func (c *Config) normalize() error {
 
 	steps := []func() error{
 		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
+		c.normalizeHiddenModels, c.normalizeScheduling,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
+		c.normalizeDNSServers,
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -916,6 +989,173 @@ func (c *Config) normalizeBackgroundModels() error {
 	}
 
 	c.Models.BackgroundNames = out
+
+	return nil
+}
+
+// normalizeHiddenModels 规范化模型黑名单（models.hidden）：去空白、丢空项、
+// 去重，并拒绝 "cn:"/"global:" 前缀后裸名为空的写法（否则会隐藏整域）。
+func (c *Config) normalizeHiddenModels() error {
+	if len(c.Models.Hidden) == 0 {
+		c.Models.Hidden = nil
+		return nil
+	}
+
+	seen := make(map[string]bool, len(c.Models.Hidden))
+
+	out := make([]string, 0, len(c.Models.Hidden))
+
+	for _, raw := range c.Models.Hidden {
+		name := strings.TrimSpace(raw)
+		if name == "" || seen[name] {
+			continue
+		}
+
+		if realm, bare, prefixed := splitHiddenRealmPrefix(name); prefixed && bare == "" {
+			return fmt.Errorf("models.hidden[%q]: realm 前缀 %q 之后必须写模型名: %w",
+				name, realm, errNormalizeHiddenModels)
+		}
+
+		seen[name] = true
+
+		out = append(out, name)
+	}
+
+	c.Models.Hidden = out
+
+	return nil
+}
+
+// normalizeDNSServers 规范化出站 DNS 服务器列表：去空白、去重、丢弃空项，
+// 并拒绝带 scheme/路径与非法端口的写法。非法值**拒启动**——自定义解析器出错会
+// 影响全部出站请求，宁可开机失败也不要运行期静默失败。
+func (c *Config) normalizeDNSServers() error {
+	if len(c.DNSServers) == 0 {
+		c.DNSServers = nil
+		return nil
+	}
+
+	seen := make(map[string]bool, len(c.DNSServers))
+
+	out := make([]string, 0, len(c.DNSServers))
+
+	for _, raw := range c.DNSServers {
+		server := strings.TrimSpace(raw)
+		if server == "" || seen[server] {
+			continue
+		}
+
+		if err := validateDNSServer(server); err != nil {
+			return err
+		}
+
+		seen[server] = true
+
+		out = append(out, server)
+	}
+
+	if len(out) == 0 {
+		out = nil
+	}
+
+	c.DNSServers = out
+
+	return nil
+}
+
+// splitHiddenRealmPrefix 拆分 models.hidden 里的可选 realm 前缀（只认 cn/global，
+// 大小写敏感；其余原样当作裸模型名，避免与含冒号的模型名混淆）。
+func splitHiddenRealmPrefix(name string) (realm, bare string, prefixed bool) {
+	for _, candidate := range []string{"cn", "global"} {
+		if trimmed, ok := strings.CutPrefix(name, candidate+":"); ok {
+			return candidate, strings.TrimSpace(trimmed), true
+		}
+	}
+
+	return "", name, false
+}
+
+// validateDNSServer 校验单个 DNS 服务器：接受 host / host:port / [IPv6]:port，
+// 拒绝带 scheme、路径或非法端口的写法。
+func validateDNSServer(server string) error {
+	if strings.Contains(server, "://") || strings.ContainsAny(server, "/ ") {
+		return fmt.Errorf("dns_servers[%q]: 只接受 host 或 host:port（不要带 scheme/路径）: %w",
+			server, errNormalizeDNSServersFailed)
+	}
+
+	host := server
+
+	if parsedHost, port, err := net.SplitHostPort(server); err == nil {
+		host = parsedHost
+
+		if num, convErr := strconv.Atoi(port); convErr != nil || num <= 0 || num > 65535 {
+			return fmt.Errorf("dns_servers[%q]: 端口必须是 1-65535 的数字: %w",
+				server, errNormalizeDNSServersFailed)
+		}
+	} else if strings.Contains(server, ":") {
+		// 没有可解析的端口，但含冒号：只可能是裸 IPv6（可带方括号）。
+		// 形如 "1.1.1.1:53:54" / "foo::bar:baz" 的畸形写法必须拒绝，否则启动后
+		// 全部出站解析都会指向一个不可用的地址。
+		host = strings.TrimSuffix(strings.TrimPrefix(server, "["), "]")
+		if _, addrErr := netip.ParseAddr(host); addrErr != nil {
+			return fmt.Errorf("dns_servers[%q]: 只接受 host / host:port / [IPv6]:port: %w",
+				server, errNormalizeDNSServersFailed)
+		}
+	}
+
+	if host == "" {
+		return fmt.Errorf("dns_servers[%q]: host 不能为空: %w", server, errNormalizeDNSServersFailed)
+	}
+
+	return nil
+}
+
+// normalizeScheduling 校验并归一按域选号策略与账号顺序（issue #205）。
+// 非法策略值拒绝启动（拼错会静默退回默认，运维以为生效了却没用）。
+func (c *Config) normalizeScheduling() error {
+	for _, item := range []struct {
+		realm string
+		value *string
+	}{
+		{"cn", &c.Pool.Strategy.CN},
+		{"global", &c.Pool.Strategy.Global},
+	} {
+		strategy, err := pool.ParseStrategy(*item.value)
+		if err != nil {
+			return fmt.Errorf("pool.strategy.%s: %w", item.realm, err)
+		}
+
+		*item.value = string(strategy)
+	}
+
+	for _, item := range []struct {
+		realm string
+		list  *[]string
+	}{
+		{"cn", &c.Pool.AccountOrder.CN},
+		{"global", &c.Pool.AccountOrder.Global},
+	} {
+		seen := make(map[string]bool, len(*item.list))
+
+		out := make([]string, 0, len(*item.list))
+
+		for _, raw := range *item.list {
+			uid := strings.TrimSpace(raw)
+			if uid == "" || seen[uid] {
+				continue
+			}
+
+			seen[uid] = true
+
+			out = append(out, uid)
+		}
+
+		if len(out) == 0 {
+			out = nil
+		}
+
+		*item.list = out
+	}
 
 	return nil
 }
@@ -1600,6 +1840,7 @@ func (c *Config) normalizeCheckinDelay() error {
 func (c *Config) normalizeSchedule() error {
 	c.normalizeListenAndHours()
 	c.normalizeBalanceRefresh()
+	c.normalizeTaskSweep()
 
 	return c.validateScheduleHours()
 }
@@ -1645,6 +1886,18 @@ func (c *Config) normalizeBalanceRefresh() {
 		}
 
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+}
+
+// normalizeTaskSweep 计算任务补领清扫周期：启用时 minutes<=0 回落默认 15；
+// 关闭时 interval 保持 0（不启动）。
+func (c *Config) normalizeTaskSweep() {
+	if c.Schedule.TaskSweepEnabled {
+		if c.Schedule.TaskSweepMinutes <= 0 {
+			c.Schedule.TaskSweepMinutes = 15
+		}
+
+		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
 }
 

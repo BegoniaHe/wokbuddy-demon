@@ -150,12 +150,38 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 		model = target
 	}
 
+	if !h.countTokensModelVisible(w, r, model) {
+		return
+	}
+
 	if !h.countTokensModelAllowed(w, r, model) {
 		return
 	}
 
 	tokens := max((countAnthropicPromptBytes(obj)+3)/4, 1)
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": tokens})
+}
+
+// countTokensModelVisible 校验 count_tokens 的模型黑名单（models.hidden）：
+// 与 /v1/messages 同口径地把模型解析到最终 (realm, bare) 后判定，隐藏即 400。
+// 判定**先于**命名密钥白名单（隐藏模型不给任何 key 放行）。
+func (h *Handler) countTokensModelVisible(w http.ResponseWriter, r *http.Request, model string) bool {
+	keyRealm := keyRealmFrom(r.Context())
+
+	realm, bare, err := resolveKeyModel(model, h.requestModelAliases(model, keyRealm), keyRealm)
+	if err != nil {
+		// 解析失败不在此拦：白名单/主路径照旧给出各自的错误语义。
+		return true
+	}
+
+	if !h.modelHidden(realm, bare) {
+		return true
+	}
+
+	writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+		"model is hidden by gateway config (models.hidden); pick another model", "")
+
+	return false
 }
 
 // countTokensModelAllowed 校验 count_tokens 的命名密钥模型白名单；与
@@ -2456,7 +2482,7 @@ func anthropicStreamErrorType(payload string, errObj map[string]any) string {
 		return "not_found_error"
 	case upstream.ErrBadParams, upstream.ErrPromptTooLong, upstream.ErrContentBlocked,
 		upstream.ErrImageInvalid, upstream.ErrModelBlocked, upstream.ErrModelAccess,
-		upstream.ErrWafBlock:
+		upstream.ErrWafBlock, upstream.ErrChannelRefused:
 		return "invalid_request_error"
 	default:
 		return "api_error"

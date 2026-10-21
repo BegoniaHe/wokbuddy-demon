@@ -20,6 +20,22 @@ func splitRealm(model string) (realm, bare string, prefixed bool) {
 	return prefix, rest, true
 }
 
+// otherRealm 返回另一个域（cn ↔ global）。未知值按「另一域 = global」处理，与
+// 裸名默认按 cn 解析的口径一致。
+func otherRealm(realm string) string {
+	if realm == realmGlobal {
+		return realmCN
+	}
+
+	return realmGlobal
+}
+
+// realmGlobal / realmCN 是本包内的域常量（与 auth/pool 的取值一致）。
+const (
+	realmCN     = "cn"
+	realmGlobal = "global"
+)
+
 // resolveModel 解析模型名协议（PLAN D6）：
 //
 //	分布式前缀： "[realm:]model"

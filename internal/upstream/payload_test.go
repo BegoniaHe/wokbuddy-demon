@@ -649,3 +649,129 @@ func TestClampGPTMinMaxTokens(t *testing.T) {
 		})
 	}
 }
+
+// TestDropReasoningContentParts 思考片段剥离规则（直调，隔离其它归一化步骤）。
+// 背景：第三方把 Responses 的 reasoning_text / reasoning 当 content part 回放进
+// chat/completions 时，上游 content 类型白名单不含它们 → 400 code=11101。
+func TestDropReasoningContentParts(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			"reasoning_text 剥离、text 保留",
+			`{"messages":[{"role":"assistant","content":[{"type":"reasoning_text","text":"think"},{"type":"text","text":"ans"}]}]}`,
+			`[{"role":"assistant","content":[{"type":"text","text":"ans"}]}]`,
+		},
+		{
+			"reasoning 别名同样剥离",
+			`{"messages":[{"role":"assistant","content":[{"type":"reasoning","text":"think"},{"type":"output_text","text":"ans"}]}]}`,
+			`[{"role":"assistant","content":[{"type":"output_text","text":"ans"}]}]`,
+		},
+		{
+			"type 前后空白同样命中",
+			`{"messages":[{"role":"assistant","content":[{"type":" reasoning_text ","text":"think"},{"type":"text","text":"ans"}]}]}`,
+			`[{"role":"assistant","content":[{"type":"text","text":"ans"}]}]`,
+		},
+		{
+			"剥离后为空且无 tool_calls：整条消息删除",
+			`{"messages":[{"role":"assistant","content":[{"type":"reasoning_text","text":"think"}]},{"role":"user","content":"hi"}]}`,
+			`[{"role":"user","content":"hi"}]`,
+		},
+		{
+			"剥离后为空但有 tool_calls：保留空数组 content",
+			`{"messages":[{"role":"assistant","content":[{"type":"reasoning_text","text":"think"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{}"}}]}]}`,
+			`[{"role":"assistant","content":[],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"exec_command","arguments":"{}"}}]}]`,
+		},
+		{
+			"字符串 content 原样通过",
+			`{"messages":[{"role":"assistant","content":"plain text"}]}`,
+			`[{"role":"assistant","content":"plain text"}]`,
+		},
+		{
+			"正常 content part 不受影响",
+			`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}}]}]}`,
+			`[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}}]}]`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			obj, err := decodeBody([]byte(testCase.body))
+			if err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+
+			dropReasoningContentParts(obj)
+
+			// 用解码后的结构比较：map 序列化键序不稳定，字符串比较会假失败。
+			var got, want any
+			if err := json.Unmarshal([]byte(mustMarshal(t, obj["messages"])), &got); err != nil {
+				t.Fatalf("unmarshal got: %v", err)
+			}
+
+			if err := json.Unmarshal([]byte(testCase.want), &want); err != nil {
+				t.Fatalf("unmarshal want: %v", err)
+			}
+
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("messages=%v want %s", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestPrepareBodyDropsReasoningParts 全链路（sanitize 开/关两态）：reasoning 片段
+// 不出现在出站 body。
+func TestPrepareBodyDropsReasoningParts(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"glm-5.2","messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":[{"type":"reasoning_text","text":"think"},{"type":"text","text":"ans"}]},
+		{"role":"user","content":"again"}
+	]}`
+
+	for _, sanitize := range []bool{false, true} {
+		out := PrepareBodyOptWithEfforts([]byte(body), sanitize, nil)
+		if strings.Contains(string(out), "reasoning_text") {
+			t.Fatalf("sanitize=%v: reasoning_text 未剥离: %s", sanitize, out)
+		}
+
+		obj, err := decodeBody(out)
+		if err != nil {
+			t.Fatalf("sanitize=%v unmarshal: %v", sanitize, err)
+		}
+
+		msgs, ok := obj["messages"].([]any)
+		if !ok || len(msgs) != 3 {
+			t.Fatalf("sanitize=%v: messages=%v want 3 条", sanitize, obj["messages"])
+		}
+
+		content, ok := msgs[1].(map[string]any)["content"].([]any)
+		if !ok || len(content) != 1 {
+			t.Fatalf("sanitize=%v: 助手 content 片段数=%v want 1", sanitize, msgs[1])
+		}
+
+		if got := content[0].(map[string]any)["text"]; got != "ans" {
+			t.Fatalf("sanitize=%v: 保留片段 text=%v want ans", sanitize, got)
+		}
+	}
+}
+
+// mustMarshal 测试辅助：序列化失败直接 fail。
+func mustMarshal(t *testing.T, v any) string {
+	t.Helper()
+
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	return string(raw)
+}

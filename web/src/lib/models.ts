@@ -1,5 +1,7 @@
 // 模型目录筛选/排序（纯函数，便于测试）。
 
+import { fmtLocalDateTime, parseAPITime } from './format';
+
 export interface ModelEntry {
   id: string;
   name?: string;
@@ -92,4 +94,109 @@ export function mdSortList(list: ModelEntry[], f: ModelFilter): ModelEntry[] {
     out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
   else if (f.sort === 'name') out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
   return out;
+}
+
+// ── Global 模型可用性（本地证据合成，不产生上游推理探测） ──────────────
+
+export interface ModelLockLike {
+  model?: string;
+  realm?: string;
+  state?: string;
+  servable?: number;
+  total?: number;
+  locked?: number;
+  unlock_at?: string;
+  reason?: string;
+}
+
+export interface RecentRequestLike {
+  model?: string;
+  status?: number | string;
+  outcome?: string;
+}
+
+export type AvailabilityTone = 'ok' | 'warn' | 'bad' | 'mute';
+
+export interface ModelAvailability {
+  key: string;
+  label: string;
+  tone: AvailabilityTone;
+  tip: string;
+}
+
+// mdAvailability 合成 global 模型的可用性标签：**只用两路本地证据**，不新增上游
+// 推理探测。优先级（与上游同口径）：
+//  1. model_locks（锁在选号层，最权威）：
+//     - locked  → 无权限(11158) / 上游无此模型(11102) / 限流不可用 细分；
+//     - starved → 账号暂不可用（不是模型自身问题）；
+//     - partial → 部分可用（N/M 号可服务）。
+//  2. request_metrics.recent 里该模型最近一次真实请求结果（成功 / 429 / ≥500 / 其他失败）；
+//  3. 两路都无 → 「待验证」。
+// 非 global 模型返回 null（本标签只对 global 域有意义）。
+export function mdAvailability(
+  modelId: string,
+  locks: ModelLockLike[] | null | undefined,
+  recent: RecentRequestLike[] | null | undefined,
+): ModelAvailability | null {
+  const id = String(modelId || '');
+  if (!id.startsWith('global:')) return null;
+  const model = id.slice('global:'.length);
+
+  const lock = (locks || []).find((l) => l && l.model === model && (!l.realm || l.realm === 'global'));
+  if (lock) {
+    const state = String(lock.state || '');
+    const reason = String(lock.reason || '');
+    const servable = Number(lock.servable || 0);
+    const total = Number(lock.total || 0);
+    // 时间统一按本地时区渲染（与面板其它时间列同口径）：后端给的是 RFC3339 UTC，
+    // 直接切片会把 UTC 当本地时间显示，且零值时间会渲染成 0001-01-01。
+    const unlockMs = parseAPITime(lock.unlock_at);
+    const unlock = unlockMs ? '；最早 ' + fmtLocalDateTime(unlockMs) + ' 解封' : '';
+    if (state === 'partial') {
+      return {
+        key: 'partial',
+        label: '部分可用',
+        tone: 'warn',
+        tip: '锁池：' + servable + '/' + total + ' 个 global 号可服务该模型' + unlock,
+      };
+    }
+    if (state === 'starved') {
+      return {
+        key: 'starved',
+        label: '账号暂不可用',
+        tone: 'warn',
+        tip: '锁池：此刻没有号能服务（账号级冷却/熔断/在途占满，与模型无关，等一下会好）' + unlock,
+      };
+    }
+    // locked：按上游原因细分。
+    if (reason.includes('11158')) {
+      return { key: 'forbidden', label: '无权限', tone: 'bad', tip: '锁池：账号类型不允许该模型（11158）' + unlock };
+    }
+    if (reason.includes('11102')) {
+      return { key: 'no_model', label: '上游无此模型', tone: 'bad', tip: '锁池：上游目录没有该模型（11102）' + unlock };
+    }
+    return { key: 'rate', label: '限流不可用', tone: 'bad', tip: '锁池：该模型被限流/冷却，全部账号不可用' + unlock };
+  }
+
+  // 请求日志记录的是客户端原始 model：模型页展示/复制的 global 模型通常带
+  // "global:" 前缀，只比裸名会让最标准的调用方式永远命中不到最近请求。
+  const latest = (recent || []).find(
+    (r) => r && (r.model === model || r.model === 'global:' + model),
+  );
+  if (latest) {
+    const status = Number(latest.status || 0);
+    const outcome = String(latest.outcome || '');
+    if (outcome === 'success') {
+      return { key: 'recent_ok', label: '近期可用', tone: 'ok', tip: '依据：最近一次真实请求成功' };
+    }
+    if (status === 429) {
+      return { key: 'recent_429', label: '近期限流', tone: 'warn', tip: '依据：最近一次真实请求 429' };
+    }
+    if (status >= 500) {
+      return { key: 'recent_5xx', label: '近期异常', tone: 'bad', tip: '依据：最近一次真实请求 ' + status };
+    }
+    return { key: 'recent_fail', label: '近期失败', tone: 'warn', tip: '依据：最近一次真实请求失败' };
+  }
+
+  return { key: 'unknown', label: '待验证', tone: 'mute', tip: '暂无本地证据（既无锁也无可用的最近请求），可点「探测」确认' };
 }

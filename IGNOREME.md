@@ -174,6 +174,13 @@ docker compose up -d --build
 curl -s http://localhost:7863/healthz
 ```
 
+构建阶段的 Go 模块代理默认留空（沿用构建环境的默认，即官方源 `proxy.golang.org`）。国内网络访问官方源不稳定时可显式传入代理，只影响本次构建：
+
+```bash
+docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
+# 或直接：docker build --build-arg GOPROXY=https://goproxy.cn,direct -t wokbuddy-demon .
+```
+
 Compose 默认把端口绑定到 `127.0.0.1`，仅本机可达（面板与网关无内置 TLS）。需要局域网访问时，把 `docker-compose.yml` 的 ports 改为 `"7863:7863"` 或指定内网 IP：
 
 ```yaml
@@ -277,6 +284,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | OpenAI Chat Completions | `POST /v1/chat/completions`、`GET /v1/models`、`GET /v1/models/{model}` |
 | OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function/custom tools、结构化输出；reasoning/compaction 等状态 item 忽略） |
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
+| 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭） |
 | Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
 
 Codex CLI 等使用 Responses API 的客户端：
@@ -288,6 +296,26 @@ codex
 ```
 
 - `/v1/responses` 会合并 `input` 里的 `additional_tools`（Codex 0.162+ 的工具下发形态之一），展开 `namespace` 工具并在回程补回 `namespace`；客户端未传 `max_output_tokens` 时按模型目录补全 `max_tokens`，避免上游回落到默认 32k 输出预算截断长推理。
+
+#### 联网搜索端点 `POST /v1/search/messages`
+
+网关直连上游官方联网搜索（`/agenttool/v1/search`），出入站均为 Anthropic Messages 形态，
+**与本地代跑的 `features.local_web_tools` 是两条独立能力**（后者只服务 Responses 的工具调用，
+`/v1/messages` 对服务端 `web_search` 工具仍是显式拒绝）。
+
+- 开关：`features.search_endpoint`（默认 `false`，热生效）。搜索是新增出站面且每次调用消耗一次账号额度。
+- realm：当前只放行 **CN 域**账号选号（上游仅在 CN 域实测过；两域放开留 TODO）。
+- 入站要求：`tools` 里声明 `web_search`（如 `{"type":"web_search_20250305","name":"web_search"}`），否则 400；搜索词取**最后一条 user 消息**的文本块（不在文本里的历史/tool_result 不参与），并剥掉官方固定指令前缀 `Perform a web search for the query:`；入站 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Trace-ID` 原样透传上游。
+- 条数：`max_results`（请求体顶层或 `tools[].max_results`）生效，缺省 5、上限 10；搜索词上限 1024 字符。
+- 出站响应：assistant message，`content` 依次为 text 块（摘要 + `citations[].cited_text`）与 `web_search_tool_result` 块（逐条 title/url/snippet）；`usage` 为估算值（网关无 tokenizer，仅用于客户端预算）。
+- 错误：上游错误按既有分类处置（限流走软冷却、会话失效禁用、额度硬冷却等），请求级/内容/队列类不再轮转；`15001`（搜索次数用尽）会在 `gateway_hint` 里提示可按号重试，上游原文原样透传。
+
+```bash
+curl -s http://127.0.0.1:7863/v1/search/messages \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-api-key: test_key" -H "content-type: application/json" \
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"golang context 用法"}]}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}'
+```
 
 Claude Code 接入示例（`api_key` 非空时填同一密钥）：
 
@@ -341,9 +369,10 @@ gemini
 - **身份头**：企业账号同时发送 `X-Enterprise-Id` 与 `X-Tenant-Id`；个人 global 账号发送 `X-No-Enterprise-Id: 1`。账号带 `domain` 时透传为 `X-Domain`，global 缺省回落 `www.workbuddy.ai`。
 - **入站会话元数据**：`X-Conversation-ID`、`X-Root-Request-ID`、`X-Parent-Conversation-ID`、`X-Agent-Intent/Purpose/Type`、`X-Compaction`、`X-Context-Compacted` 原样透传；缺失时保持网关默认。
 - **401 重放**：上游 chat 返回 401 时，同账号刷新一次 token 并重放同一请求；再次 401 回到既有轮换策略。refresh 端点 401/403 视为会话失效，按 keepalive 阈值禁用。
+- **refresh 单飞**：同一账号（UID）同一时刻只允许一个 refresh 在途，其余调用等待并复用首个结果——上游对 refreshToken 反重放，并发重复送同一 RT 会撞 `12153` 并作废整条 RT 链。跨进程（主服务 + `signin`/`signin.sh` 同时刷新）靠「refresh 遇 `12153` 时回读磁盘 auth 文件、采纳更新的 token 重试一次」兜底，不做跨进程文件锁。
 - **SSE**：兼容 `delta.reasoning`（归一为 `reasoning_content`）、重复 `tool_calls[].id` 去重；已收到 `finish_reason` 后 EOF 视为正常完成。只有 reasoning、没有正文/工具调用/拒答的流不记成功。
 - **队列与额度业务码**：`6020` 返回 429 + `Retry-After`（不换号）；`6021/6022` 返回容量/并发错误（不轮转）；`11145/14001/14002/14012-14014/14018/14019` 归为额度耗尽，`10105/15001` 按账号级使用上限走软限流，`14015` 会话失效，`14016/14017` 账号未激活，`11142` 账号级认证故障。
-- **错误码分类**：`11125/11129/11130/11132/11137-11139/11148-11155/12654/14405` 为请求级错误，不罚号、不轮转；`11102` 模型目录不存在直接 `404` fail-fast，`11136` 换号并写入 (账号,模型) 负缓存（不写路由熔断），`11141` 模型下线直接 fail-fast；`11-128` 入站按内容拦截处理；`6000-6008` 按限流处理（`6004` 保持模型级冷却）。HTTP 200 + 非零业务码与 SSE error 帧均按帧内/结构化 `code` 分类。
+- **错误码分类**：`11125/11129/11130/11132/11137-11139/11148-11155/12654/14405` 为请求级错误，不罚号、不轮转；`11102` 模型目录不存在直接 `404` fail-fast，`11136` 换号并写入 (账号,模型) 负缓存（不写路由熔断），`11141` 模型下线直接 fail-fast；`11-128 + request illegal` 按**通道校验失败**处理（不罚号、不降级重试、继续轮转，轮转耗尽回 400 `channel_refused`），其余 `11-128` 入站按内容拦截；`11140 + request illegal` 才是账号受限（禁用，需在 WorkBuddy 提交反馈申诉后重登），裸 `request illegal` 不再升级成账号故障；`6000-6008` 按限流处理（`6004` 保持模型级冷却）。HTTP 200 + 非零业务码与 SSE error 帧均按帧内/结构化 `code` 分类。
 - **签到 / 余额**：两 realm 均优先 `/v2/billing/meter/daily-checkin`，404 回落旧路径；`1001` 视为已签到，`1002/1003` 视为活动未开启。余额以 `get-user-resource-summary` 为主，失败回落 `get-user-resource`，并解析精确容量、切片额度与到期字段。
 - **模型目录**：应用 `availableModels` / `disabled` / `aliases` 过滤；CN 在 `/console` 无 CLI 过滤集时回落 `/v2/enterprises/personal/models`，`/v3/config` 同时使用桌面端与 IDE UA。上游 alias 参与请求解析，`models.aliases` 配置优先。
 - **growth / travel**：Bearer 通道优先 `/v2/activity/growth/*`，404 回落旧路径；travel claim 支持带 `record_id` 与空 body 两种形态，并发送 `X-Product-Code: workbuddy`。
@@ -419,6 +448,7 @@ gemini
 | `api_key` | 空 | 默认（管理）鉴权密钥，覆盖全部网关端点与面板；**空 = 不鉴权直接放行**（公网必须设置）。另可在面板「密钥」页签发多把命名密钥 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号管家状态持久化文件 |
+| `dns_servers` | `[]` | 出站 DNS 服务器（`host` 或 `host:port`，按顺序尝试，缺省端口 53）。空 = 系统解析器。只作用于 `internal/upstream` 出站连接；本地网页抓取的 SSRF 专用 Transport 不受影响。非法值（带 scheme/路径、端口非法）拒启动。改后需重启（环境变量 `WB2A_DNS` 逗号分隔可覆盖） |
 | `logging.request_archive_enabled` | `true` | 请求元数据归档开关 |
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
 | `logging.decision_trace` | `false` | 请求归档记录选号决策链（候选/排除原因/成本层/Top-N/轮换） |
@@ -442,7 +472,9 @@ gemini
 | `upstream.idle_timeout_seconds` | `1200` | 聊天 SSE 流中空闲上限（秒，对齐官方客户端）；活跃吐数据会续命；`0` = 默认 1200。`upstream.model_timeouts` 优先 |
 | `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
+| `cn.chat_base` | 空 | 国内版 upstream chat base 覆盖（如指向自建/自选入口）。空 = 默认 `https://www.workbuddy.cn`，并在首 token 前按 `408/502/503/504` 或传输错误回落 `copilot.tencent.com`、`wb.tencentbuddy.com`；**非空时只用该值、不回落**（与 `global.chat_base` 同语义）。改后需重启 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
+| `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
 | `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |
 | `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |
@@ -451,6 +483,8 @@ gemini
 | `schedule.keepalive_hours` | `[22]` | 每日整点刷新凭证保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
 | `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
+| `schedule.task_sweep_enabled` | `true` | 任务补领清扫总开关：周期扫全部非禁用账号，**先接受未接受任务、再幂等补领「已达标未领」的成长任务奖励**（补领不代做任务；默认/mp 双口径；global/企业版账号零上游请求；忙账号整轮跳过）。热生效 |
+| `schedule.task_sweep_minutes` | `15` | 补领清扫间隔（分钟）；`<=0` 回落 15。热生效 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
 | `limits.daily_tokens` | `0` | 账号当日总 token 达限后不接单；`0` = 关闭。本地 0 点重置 |
 | `limits.daily_credits` | `0` | 账号当日消耗积分达限后只接免费模型；`0` = 关闭 |
@@ -461,12 +495,16 @@ gemini
 | `pricing.exchange_rate` | `1` | 展示币种换算系数（1 = USD） |
 | `pool.max_in_flight_total` | `0` | 网关级全局在途上限；满额新请求返回 503 且不选号；`0` = 不限。热生效 |
 | `pool.credit_floor` | `0`（示例 `100`） | 积分保底：余额低于该值不再参与收费模型轮换；`0` = 关闭 |
+| `pool.cross_domain_fallback` | `false` | 裸模型名跨域回退：请求未显式指定域时，本域对该模型选不到号可换到另一域；上游 `11102`（目录无此模型）允许跨域重取号一次。显式 `cn:`/`global:` 前缀、别名目标显式前缀、命名密钥绑定出口**永不回退**。开启后请求可能落到客户端没点名的域并消耗该域额度/日限（记账按实际服务域）。热生效 |
+| `pool.strategy.cn` / `pool.strategy.global` | `weighted_random` | 按域选号策略：`weighted_random`（默认，加权随机）/ `round_robin`（严格轮转）/ `sequential_exhaust`（用完一个号再下一个）。**有序策略会关闭全冷却兜底与防撞号窗口**；游标按 (域, 模型) 持久化，切换策略清空该域游标。热生效 |
+| `pool.account_order.cn` / `pool.account_order.global` | `[]` | 有序策略的固定账号顺序（uid 数组）；未列出/异域 uid 自动跳过，其余按 uid 升序追加在后。热生效 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
 | `models.background_names` | `[]` | 客户端后台任务硬编码模型名（大小写不敏感）；命中后把 `model` 改写为 `background_target`。留空 = 关闭。热生效 |
 | `models.background_target` | `deepseek-v4.1-flash` | 后台模型改写目标；只改 `model`，其余请求原样透传 |
+| `models.hidden` | `[]` | 模型黑名单：裸名 = 两域都隐藏，`cn:` / `global:` 前缀 = 只藏该域（大小写敏感，前缀后必须写模型名）。命中的模型不在 `/v1/models` 列出（含别名条目），点名调用返回 400 `model_unavailable`（不打上游、不占选号）。热生效 |
 
 调度补充说明：
 
@@ -501,7 +539,17 @@ gemini
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE` · `WB2A_TIMEOUT_SECONDS` · `WB2A_PROMPT_MODE` …
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS` · `WB2A_SOFT_RATE` · `WB2A_TIMEOUT_SECONDS` · `WB2A_PROMPT_MODE` …
+
+## 官方补偿
+
+官方在「套餐与积分」页挂的限时补偿（带领取截止日）由网关**先查后领**，不再盲领：
+
+- 面板账号池的「官方补偿」卡片：待领账号 + 领取截止倒计时（≤48 小时标红）+ 逐号/全量领取；**查询失败的账号以红色行显形**（避免把故障说成「没有补偿」）。
+- 接口：`GET /panel/api/compensation`（只读状态）、`POST /panel/api/accounts/{uid}/compensation`（单号先查后领）、`POST /panel/api/compensation_all`（全量，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**）。
+- 取数只在进页面与手动点击时发生，不挂 5 秒轮询（补偿状态没有 overview 快照可吃）。
+- 参与范围：CN 个人号；global / 企业版 / 禁用账号跳过（paused 不跳过——纯领奖 RPC，与选号让位无关）。
+- 签到链路（连登管家）同样改为先查后领：无活动静默、领取失败必打 WARN。
 
 ## 部署运维
 
@@ -543,6 +591,7 @@ gemini
 ### 1. 凭据管理（auths）
 
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
+- **积分历史账本**：`data/credit-history.json`（与 `state_file` 同目录）记录每次余额变动（时间/账号/变动/变动后余额），最多保留 5000 条，滚动裁剪、先写 tmp 再 rename；首次观测只建基线，异常跳变不记账。属本地观测数据，`data/` 已被 gitignore。
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息
 - **权限**：容器内以 `app` 用户运行；刷新由 `SaveAtomic` 以 `0600` 原子写回；建议手动 `chmod 600 auths/*.json`
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`
@@ -618,3 +667,14 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 - 允许任意使用、复制、修改、合并、发布、分发、再授权及销售
 - 再分发时请保留原仓库的 MIT 版权声明与许可声明
 - 本项目不授予任何 CodeBuddy / 腾讯接口或服务的权利；使用者仍需自行遵守其服务条款
+
+### 选号策略（按域）
+
+默认 `weighted_random`（加权随机，含成本分层 / 快过期虚拟权重 / Top5 抽签），也可按域切换：
+
+- `round_robin`：按 `pool.account_order.<realm>` 顺序**严格轮转**（每次选中后游标前进一位）；
+- `sequential_exhaust`：按顺序**用完一个号再下一个**（游标钉在当前号，只有该号不可服务时才顺延）；
+- 有序策略会**关闭全冷却兜底与防撞号窗口**：语义就是「明确地用下一个号」，兜底抽号会破坏它；
+- **成本分层仍然生效**（与加权随机同口径）：先在本次最优成本层内选号，账号顺序只在同层内滚动——免费号不会被排在前面的收费号抢走；
+- 游标按 `(域, 模型)` 持久化在 `state.json`（跨重启保留顺序耗尽进度），**切换策略会清空该域游标**；
+- 有序策略下会话粘性只复用既有绑定（不做哈希分配），避免绕过账号顺序。

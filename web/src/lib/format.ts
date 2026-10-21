@@ -115,12 +115,18 @@ export interface RateLimitMeta {
 }
 
 // rateLimitMeta 把上游限流/模型不可用行翻译成人读的「还要多久、什么时候解封」。
+//
+// 双时钟（until < resetAt）：网关自己的 until 决定「实际何时放行」，上游声明的
+// resetAt 只是对方口径。此时主文字同时给出两个时刻，**倒计时跟随 until**——
+// 否则会出现「显示还要 2 小时、实际 10 分钟就掉框」，用户会认为面板在骗人。
 export function rateLimitMeta(row: RateLimitRow | null | undefined, now: number): RateLimitMeta {
   const model = String((row && row.model) || '未知模型');
   const kind = String((row && row.kind) || 'rate_limit');
   const resetAt = parseAPITime(row && row.reset_at);
   const until = parseAPITime(row && row.until);
-  const deadline = resetAt || until;
+  const dualClock = Boolean(until && resetAt && until < resetAt);
+  // 倒计时跟随「实际放行」时刻：双时钟场景跟 until，其余沿用 resetAt || until。
+  const deadline = dualClock ? until : resetAt || until;
   const remaining = deadline > now ? Math.round((deadline - now) / 1000) : 0;
   if (kind === 'model_unavailable') {
     return {
@@ -130,16 +136,23 @@ export function rateLimitMeta(row: RateLimitRow | null | undefined, now: number)
       title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
     };
   }
-  let detail = resetAt
+  if (dualClock) {
+    const title = [
+      model,
+      '网关最早重试：' + fmtLocalDateTime(until),
+      '上游重置：' + fmtLocalDateTime(resetAt),
+    ];
+    const detail =
+      '网关 ' + fmtLocalDateTime(until) + ' 起重试（剩余 ' + dur(remaining) + '）' +
+      ' · 上游称 ' + fmtLocalDateTime(resetAt) + ' 恢复';
+    return { model, kind, detail, title: title.join('\n') };
+  }
+  const detail = resetAt
     ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
     : until
       ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）'
       : '预计解封时间未知';
   const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
-  if (until && resetAt && until < resetAt) {
-    detail += ' · 网关最快 ' + dur(Math.max(0, Math.round((until - now) / 1000))) + ' 后重试';
-    title.push('网关最早重试：' + fmtLocalDateTime(until));
-  }
   return { model, kind, detail, title: title.join('\n') };
 }
 

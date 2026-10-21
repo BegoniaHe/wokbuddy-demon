@@ -87,6 +87,41 @@ describe('rateLimitMeta', () => {
     expect(m.detail).toContain('解封');
     expect(m.detail).toContain('剩余 1时00分');
   });
+  it('双时钟（until < resetAt）：主文字给出两个时刻、倒计时跟 until', () => {
+    const until = new Date(now + 600_000).toISOString(); // 网关 10 分钟后放行
+    const reset = new Date(now + 7200_000).toISOString(); // 上游称 2 小时后恢复
+    const m = rateLimitMeta({ model: 'glm-5.2', kind: 'rate_limit', until, reset_at: reset }, now);
+    // 主文字同时出现「网关…起重试」与「上游称…恢复」
+    expect(m.detail).toContain('网关');
+    expect(m.detail).toContain('起重试');
+    expect(m.detail).toContain('上游称');
+    // 倒计时按 until（600s → 10分00秒），不是 resetAt（2 小时）
+    expect(m.detail).toContain('剩余 10分');
+    expect(m.detail).not.toContain('2时00分');
+    // title 保留两个完整时刻
+    expect(m.title).toContain('网关最早重试：');
+    expect(m.title).toContain('上游重置：');
+  });
+  it('无 reset_at 时倒计时跟 until', () => {
+    const until = new Date(now + 300_000).toISOString();
+    const m = rateLimitMeta({ model: 'glm-5.2', kind: 'rate_limit', until }, now);
+    expect(m.detail).toContain('恢复');
+    expect(m.detail).toContain('剩余 5分');
+  });
+  it('until >= reset_at 不是双时钟，回到既有文案', () => {
+    const until = new Date(now + 7200_000).toISOString();
+    const reset = new Date(now + 3600_000).toISOString();
+    const m = rateLimitMeta({ model: 'glm-5.2', kind: 'rate_limit', until, reset_at: reset }, now);
+    expect(m.detail).toContain('解封');
+    expect(m.detail).toContain('剩余 1时00分');
+    expect(m.detail).not.toContain('上游称');
+  });
+  it('model_unavailable 带 until 时倒计时跟 until', () => {
+    const until = new Date(now + 600_000).toISOString();
+    const m = rateLimitMeta({ model: 'glm-5.2', kind: 'model_unavailable', until }, now);
+    expect(m.detail).toContain('预计');
+    expect(m.detail).toContain('10分');
+  });
 });
 
 describe('用量页格式化', () => {

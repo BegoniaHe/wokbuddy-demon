@@ -26,12 +26,15 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"math"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
@@ -112,11 +115,96 @@ func deriveID(a *auth.Auth, salt string) string {
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
 type DesktopEvent map[string]any
 
+// desktopOSVersions Windows 11 各版本 build 的轮换池（权重近似 2026-10 的真实
+// 保有量：25H2/24H2 为主力，23H2 渐退，26H2 随新机铺开，26H1 仅新机型）。
+var desktopOSVersions = []struct {
+	build  string
+	weight int
+}{
+	{"10.0.26200", 34}, // 25H2
+	{"10.0.26100", 30}, // 24H2
+	{"10.0.22631", 16}, // 23H2
+	{"10.0.26300", 12}, // 26H2
+	{"10.0.28000", 8},  // 26H1（新机专用）
+}
+
+// desktopMemBands 核心数区间 → 内存档（GB）加权表，重复即权重。
+// 整体单调：核多则内存大；4 核不配 32G，16 核以上不再出现 8G，
+// 18 核以上一律 32G（该核心数只出现在高端整机上）。
+var desktopMemBands = []struct {
+	maxCores int
+	mem      []int
+}{
+	{4, []int{8, 8, 16}},
+	{6, []int{8, 16, 16, 16}},
+	{8, []int{16, 16, 16, 32}},
+	{12, []int{16, 16, 16, 32}},
+	{16, []int{16, 32, 32}},
+	{32, []int{32}},
+}
+
+// desktopRNG 由 uid + salt 稳定派生一个确定性 PRNG：同一账号每次得到同一序列，
+// 不同账号互不相关（避免所有机器同一套硬件参数）。
+func desktopRNG(a *auth.Auth, salt string) *rand.Rand {
+	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
+
+	return rand.New(rand.NewPCG(
+		binary.LittleEndian.Uint64(sum[0:8]),
+		binary.LittleEndian.Uint64(sum[8:16]),
+	))
+}
+
+// desktopHardware 由 uid 稳定派生一台「固定设备」的 osVersion/cpuCores/memorySize：
+//   - osVersion：按版本权重轮换（上表）；
+//   - cpuCores：N(10, 5.5) 取偶后截断到 [4,32]——8~12 核的装机量占多数，
+//     16 核以上是少数，4 核为老机型；
+//   - memorySize：按核心数分档加权抽样，核多内存大，16GB 最主流。
+func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) {
+	rng := desktopRNG(a, "hardware")
+
+	total := 0
+	for _, v := range desktopOSVersions {
+		total += v.weight
+	}
+
+	pick := rng.IntN(total)
+
+	osVersion = desktopOSVersions[len(desktopOSVersions)-1].build
+	for _, ver := range desktopOSVersions {
+		if pick < ver.weight {
+			osVersion = ver.build
+
+			break
+		}
+
+		pick -= ver.weight
+	}
+
+	cpuCores = int(math.Round((rng.NormFloat64()*5.5+10)/2)) * 2 // 偶数核
+	cpuCores = min(max(cpuCores, 4), 32)
+
+	mem := []int{32}
+
+	for _, band := range desktopMemBands {
+		if cpuCores <= band.maxCores {
+			mem = band.mem
+
+			break
+		}
+	}
+
+	memorySize = mem[rng.IntN(len(mem))]
+
+	return osVersion, cpuCores, memorySize
+}
+
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 // 版本/commit/releaseDate 按 realm 取官方分发包真值；os/arch 固定为常见桌面
-// （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台。
+// （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台；
+// osVersion/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
 func desktopFingerprint(account7 *auth.Auth) map[string]any {
 	desktopBuild2 := desktopBuildFor(account7)
+	osVersion, cpuCores, memorySize := desktopHardware(account7)
 	now := time.Now().UnixMilli()
 
 	fingerprint := map[string]any{
@@ -137,9 +225,9 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"extVersion":   desktopBuild2.version,
 		"os":           "win32",
 		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
+		"osVersion":    osVersion,
+		"cpuCores":     cpuCores,
+		"memorySize":   memorySize,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
