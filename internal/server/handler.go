@@ -254,6 +254,7 @@ func NewHandler(cfg *Config) *Handler {
 	handler.mux.HandleFunc("POST /v1/chat/completions", handler.withRecovery(handler.withClientAuth(handler.chatCompletions)))
 	handler.mux.HandleFunc("POST /v1/responses", handler.withRecovery(handler.withClientAuth(handler.responsesHandler)))
 	handler.mux.HandleFunc("POST /v1/messages", handler.withRecovery(handler.withClientAuth(handler.anthropicMessagesHandler)))
+	handler.registerSearchRoute()
 	handler.mux.HandleFunc(
 		"POST /v1/messages/count_tokens",
 		handler.withRecovery(handler.withClientAuth(handler.anthropicCountTokensHandler)),
@@ -2061,6 +2062,15 @@ func (f *chatFlow) handleHTTPError(
 	f.rotateReason = kind.String()
 
 	return rotContinue
+}
+
+// registerSearchRoute 注册官方联网搜索端点（与 /v1/messages 并列，不遮蔽既有路由）。
+// 受 features.search_endpoint 开关约束（默认关，热生效）。
+func (h *Handler) registerSearchRoute() {
+	h.mux.HandleFunc(
+		"POST /v1/search/messages",
+		h.withRecovery(h.withClientAuth(h.anthropicSearchHandler)),
+	)
 }
 
 // rotateAllowedForStatus 报告该 HTTP 状态码是否允许换号：RotateStatuses 为空时恒 true

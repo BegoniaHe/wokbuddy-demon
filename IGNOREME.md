@@ -443,6 +443,7 @@ gemini
 | `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
+| `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
 | `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |
 | `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |

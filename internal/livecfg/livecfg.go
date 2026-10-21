@@ -24,6 +24,9 @@ type Snapshot struct {
 	MultimodalRouting bool
 	// LocalWebTools 是否允许 Responses 本地代跑 web_search/web_fetch（issue #104）。
 	LocalWebTools bool
+	// SearchEndpoint 是否开放 POST /v1/search/messages（features.search_endpoint，
+	// 默认 false）：握手官方联网搜索，会消耗账号额度，故与其它新增出站能力同口径默认关。
+	SearchEndpoint bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
 	// BackgroundNames 后台模型改写名单（小写；issue #103）。空 = 关闭。

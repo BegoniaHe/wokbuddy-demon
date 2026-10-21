@@ -553,6 +553,7 @@ export function ConfigView() {
               <FieldDescription>默认 3，封顶 8；仅对 /v1/responses 生效</FieldDescription>
             </Field>
           </div>
+          {check('search_endpoint', '开放 POST /v1/search/messages（官方联网搜索；每次调用消耗一次账号额度）')}
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
             本卡片字段均在启动期装配，保存后需重启进程；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。
