@@ -2456,7 +2456,7 @@ func anthropicStreamErrorType(payload string, errObj map[string]any) string {
 		return "not_found_error"
 	case upstream.ErrBadParams, upstream.ErrPromptTooLong, upstream.ErrContentBlocked,
 		upstream.ErrImageInvalid, upstream.ErrModelBlocked, upstream.ErrModelAccess,
-		upstream.ErrWafBlock:
+		upstream.ErrWafBlock, upstream.ErrChannelRefused:
 		return "invalid_request_error"
 	default:
 		return "api_error"

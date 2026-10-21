@@ -73,6 +73,10 @@ var gatewayHintByKind = map[ErrKind]string{
 	// 措辞不含 "upstream"：content_blocked 响应有不含上游字样的既有口径
 	// （handler_test 的泄漏守卫），hint 遵守同一口径。
 	ErrContentBlocked: "request content was rejected by content policy; adjust the prompt and retry",
+	// 11-128 通道校验失败：不是账号问题、也不是内容问题——排查客户端/通道形态
+	// （UA、必需头、中间代理改写）。换号与改提示词都无效。
+	ErrChannelRefused: "request rejected by channel validation (11-128); " +
+		"check client user-agent, required headers and any intermediate proxy",
 }
 
 // HintContext gateway_hint 判定所需的请求侧上下文（handler 侧组装，见

@@ -65,6 +65,10 @@ const (
 	ErrQueueWaiting                  // 6020 排队等待 → 可重试，携带 Retry-After，不换号
 	ErrQueueFull                     // 6021/6022 队列满/用户并发上限 → 不可自愈，不轮转
 	ErrClient                        // 其他 4xx / 业务错误
+	// ErrChannelRefused 11-128 通道校验失败（`11-128 + request illegal`）：问题在
+	// 客户端/通道一侧（UA、头、中间代理或入站形态），账号本身健康 → 不罚号、
+	// 不降级重试，按通道级处理并继续轮转。追加在末尾以保持既有枚举值稳定。
+	ErrChannelRefused
 )
 
 // errKindNames 错误类别的字符串名（未知类别回落 "none"）。
@@ -87,6 +91,7 @@ var errKindNames = map[ErrKind]string{
 	ErrQueueWaiting:   "queue_waiting",
 	ErrQueueFull:      "queue_full",
 	ErrClient:         "client",
+	ErrChannelRefused: "channel_refused",
 }
 
 func (k ErrKind) String() string {
@@ -151,19 +156,45 @@ var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
 // 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
-//   - "request illegal"（code 11140）→ 上游 auth/auth_forbidden，账号级授权风控，
-//     需重新 OAuth 登录才能恢复，短冷却只能阻止继续送死。
 //   - code 14017（"trial not activated" / "The trial version is not yet activated"）→
 //     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
 //
-// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方 softRateMarkers
-// 后判定）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案）。
+// 裸 "request illegal"（无 11140 code）**不在**本表：它此前会把普通请求错误升级成
+// 硬禁用——上游本轮专门删掉了这条过宽 marker。账号受限改由 IsAccountRestricted
+// （11140 **且** 该文案）单独判定，见其文档。
 // 14017 文案唯一（无软限流歧义），可安全收录。
 var accountFaultMarkers = []string{
-	"request illegal",
 	"trial not activated",
 	"trial version is not yet activated",
+}
+
+// accountRestrictedCode 账号级授权封禁码（auth/auth_forbidden）。
+const accountRestrictedCode = "11140"
+
+// accountRestrictedMsg 「账号受限」的确定性文案。
+const accountRestrictedMsg = "request illegal"
+
+// channelRefusedCode 11-128 通道校验失败码。上游常见形态是**非法 JSON**
+// （`{"code":11-128,...}`），因此按字节子串而不是 JSON 字段判定。
+const channelRefusedCode = "11-128"
+
+// IsChannelRefused 报告 body 是否是「11-128 通道校验失败」形态：码命中 11-128
+// **且**文案含 request illegal。通道校验问题在客户端/通道一侧（UA、头、中间代理、
+// 入站形态），账号健康，不该罚号也不该走内容拦截的降级重试。
+func IsChannelRefused(body string) bool {
+	return strings.Contains(body, channelRefusedCode) &&
+		containsAnyDual(strings.ToLower(body), body, []string{accountRestrictedMsg})
+}
+
+// IsAccountRestricted 报告 body 是否是「账号受限」（11140 + request illegal）：
+// 上游 auth/auth_forbidden，需人工在 WorkBuddy 提交反馈申诉后重新登录。
+//
+// 11140 **不能**只按 code 判定：该 code 也承载模型级限流文案（"The model provider
+// is rate-limiting requests."），那种场景必须保持 ErrSoftRate。反过来也不能只按
+// 文案判定：裸 "request illegal" 会命中普通请求错误。两者与（AND）才成立。
+func IsAccountRestricted(body string) bool {
+	return hasBusinessCode(body, accountRestrictedCode) &&
+		containsAnyDual(strings.ToLower(body), body, []string{accountRestrictedMsg})
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -672,9 +703,15 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit, true
 	}
-	// 11-128 是上游内容审核/反探测拦截码（常见形态是非法 JSON `"code":11-128`）。
-	// 入站与出站 sanitize 同语义：内容问题非账号问题，归 ErrContentBlocked 走降级重试。
-	if strings.Contains(body, "11-128") {
+	// 11-128 有两种语义，必须先分流：`11-128 + request illegal` 是**通道校验失败**
+	// （问题在客户端/通道一侧，账号健康、不该降级重试也不该罚号）；其余 11-128 才是
+	// 上游内容审核/反探测拦截（常见形态是非法 JSON `"code":11-128`），归
+	// ErrContentBlocked 走降级重试（与出站 sanitize 同语义）。
+	if IsChannelRefused(body) {
+		return ErrChannelRefused, true
+	}
+
+	if strings.Contains(body, channelRefusedCode) {
 		return ErrContentBlocked, true
 	}
 
@@ -695,8 +732,8 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 //     错误（11125/11129/.../11155、12654、14405）：不罚号、不轮转。11136 归
 //     ErrModelBlocked（账号级，换号 + (账号,模型) 避让）；11141 归 ErrModelAccess
 //     （平台级下线，fail-fast）。
-//  4. sessionDeadMarkers / accountFaultMarkers / 11142 —— 需要人工重登的终态或
-//     账号级授权/配额故障。若 401 body 同时含 "12153" 与 "rate limit"（如网关
+//  4. sessionDeadMarkers / accountFaultMarkers / 11142 / 11140+request illegal ——
+//     需要人工重登的终态或账号级授权/配额故障。若 401 body 同时含 "12153" 与 "rate limit"（如网关
 //     错误页混排），归 session_dead：短冷却救不活失效 session，误判为限流会让该死号
 //     留在池中反复被选中。14017 常带 429，若落到 status==429 会误归 soft_rate
 //     （账号级故障等不来自愈）。11140 的 model 级限流变体因 marker 不含该文案而
@@ -775,6 +812,12 @@ func classifySessionOrAccount(lower, body string) (ErrKind, bool) {
 	// 11142 auth_required：结构化账号级认证故障。与 11140 不同，该码不承载
 	// 限流文案，可安全按 code 判定（429+11142 仍先于限流层归账号故障）。
 	if hasBusinessCode(body, "11142") {
+		return ErrAccountFault, true
+	}
+
+	// 11140 + request illegal：账号级授权封禁（auth/auth_forbidden）。**不能**只看
+	// 裸文案——那样会把普通请求错误升级成硬禁用（上游已删该过宽 marker）。
+	if IsAccountRestricted(body) {
 		return ErrAccountFault, true
 	}
 

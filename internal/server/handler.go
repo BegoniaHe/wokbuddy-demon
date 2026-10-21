@@ -2769,6 +2769,11 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 			code = "waf_ip_blocked"
 			msg = "waf ip-level block: upstream firewall is blocking the gateway IP, rotation stopped; retry after the block window expires"
 		}
+	case upstream.ErrChannelRefused:
+		// 11-128 通道校验失败：问题在客户端/通道一侧，重试同一请求只会再撞同一堵墙。
+		// 用 400 + 明确 code 表达「不可重试、需排查通道」；上游原文优先透传。
+		code = "channel_refused"
+		status = http.StatusBadRequest
 	case upstream.ErrModelBlocked, upstream.ErrModelAccess:
 		// 11136 该账号无模型权限、11141 平台下线：上游原文已经写清原因，
 		// 但 code 此前停在默认的 no_healthy_account（"服务端过载"语义，客户端会不断
@@ -2969,6 +2974,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     14017 等未激活/授权故障 → Cooldown(CoolSoft) 有界退避。
 //   - ErrNotFound → Cooldown(CoolSoft, notFoundCooldown 固定 60s)：短冷却防雪崩。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
+//   - ErrChannelRefused → 11-128 通道校验失败：零动作（不罚号/不熔断/不喂连败），
+//     换号继续轮转；轮转耗尽按 400 channel_refused 透传原文。
 //   - ErrContentBlocked → 不罚账号；passthrough 首遇触发降级重试，最终仍拦则回 400。
 //   - ErrBadParams → 不罚账号，且与 ErrPromptTooLong/ErrImageInvalid 同待遇：
 //     调用方在轮转循环内即刻 400 透传原文终止（换号必然同样失败）。
@@ -3001,6 +3008,10 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 		h.applyAccountFaultPolicy(uid, body)
 	case upstream.ErrHardCredit, upstream.ErrSessionDead, upstream.ErrNotFound, upstream.ErrServer:
 		h.applyLifecyclePolicy(uid, kind)
+	case upstream.ErrChannelRefused:
+		// 11-128 + request illegal 是**通道校验失败**（UA/头/中间代理/入站形态），
+		// 账号本身健康：零动作（不冷却/不熔断/不 NoteError/不喂连败），只换号继续轮转。
+		// 与 ErrContentBlocked 的区别：后者是同账号降级重试，前者换号即可。
 	case upstream.ErrModelBlocked:
 		// 11136「该账号无该模型权限」/ 11158「该账号类型不允许该模型」：
 		// (账号, 模型) 负缓存避让。复用 modelCooldowns
@@ -3083,16 +3094,18 @@ func (h *Handler) applyWafPolicy(uid string, uerr *upstream.Error) {
 	h.cfg.Pool.CooldownSoftRate(uid, jitterDur(wafCooldownBase), time.Time{}, "waf 403 block")
 }
 
-// applyAccountFaultPolicy 账号级授权/配额故障按 msg 分野（口径与 Classify 的
-// accountFaultMarkers 一致）：
-//   - "request illegal"（code 11140）→ 账号级**授权封禁**：硬禁用（Disable）。
+// applyAccountFaultPolicy 账号级授权/配额故障按形态分野（口径与 Classify 一致）：
+//   - 11140 + request illegal（upstream.IsAccountRestricted）→ 账号级**授权封禁**：
+//     硬禁用（Disable）。上游要求账号持有人在 WorkBuddy 提交反馈申诉后重新登录，
+//     网关侧冷却救不回来。
 //   - 14017（trial not activated）→ register 未完成，补完 register 后可能自愈，
 //     **保持软冷却**（禁用会让用户补完 register 后仍无法用）。
 //
-// 大小写不敏感（与 Classify 的 marker 匹配同口径）。
+// 判定必须「code 且文案」：裸 "request illegal" 此前会把普通请求错误升级成硬禁用，
+// 上游已删除该过宽 marker，本 fork 同步收窄。
 func (h *Handler) applyAccountFaultPolicy(uid, body string) {
-	if strings.Contains(strings.ToLower(body), "request illegal") {
-		h.cfg.Pool.Disable(uid, "account banned by upstream (11140 request illegal), re-login required")
+	if upstream.IsAccountRestricted(body) {
+		h.cfg.Pool.Disable(uid, "upstream account restricted (11140 request illegal), submit feedback in WorkBuddy and re-login")
 		return
 	}
 
