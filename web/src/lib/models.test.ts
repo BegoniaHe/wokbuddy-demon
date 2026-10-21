@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_MODEL_FILTER, mdMatch, mdSortList, type ModelEntry } from './models';
+import { DEFAULT_MODEL_FILTER, mdAvailability, mdMatch, mdSortList, type ModelEntry } from './models';
 
 const base: ModelEntry = { id: 'cn:glm-5.2', name: 'GLM 5.2', vendor: 'zhipu' };
 
@@ -58,5 +58,78 @@ describe('mdSortList', () => {
   });
   it('name A→Z', () => {
     expect(mdSortList(list, { ...DEFAULT_MODEL_FILTER, sort: 'name' }).map((m) => m.id)).toEqual(['a', 'b', 'c']);
+  });
+});
+
+describe('mdAvailability（global 模型可用性）', () => {
+  it('cn 模型返回 null（该标签只对 global 域有意义）', () => {
+    expect(mdAvailability('cn:glm-5.2', [], [])).toBeNull();
+    expect(mdAvailability('glm-5.2', [], [])).toBeNull();
+  });
+
+  it('两路证据都没有 → 待验证', () => {
+    const a = mdAvailability('global:kimi-k3', [], []);
+    expect(a?.key).toBe('unknown');
+    expect(a?.label).toBe('待验证');
+    expect(a?.tone).toBe('mute');
+    expect(a?.tip).toContain('探测');
+  });
+
+  it('锁优先：partial → 部分可用', () => {
+    const a = mdAvailability('global:kimi-k3', [{ model: 'kimi-k3', realm: 'global', state: 'partial', servable: 2, total: 3 }], []);
+    expect(a?.key).toBe('partial');
+    expect(a?.label).toBe('部分可用');
+    expect(a?.tone).toBe('warn');
+    expect(a?.tip).toContain('2/3');
+  });
+
+  it('锁优先：starved → 账号暂不可用', () => {
+    const a = mdAvailability('global:kimi-k3', [{ model: 'kimi-k3', realm: 'global', state: 'starved', total: 2 }], []);
+    expect(a?.key).toBe('starved');
+    expect(a?.tone).toBe('warn');
+  });
+
+  it('锁优先：locked + 11158 → 无权限', () => {
+    const a = mdAvailability('global:kimi-k3', [{ model: 'kimi-k3', realm: 'global', state: 'locked', reason: '11158 model not allowed' }], []);
+    expect(a?.label).toBe('无权限');
+    expect(a?.tone).toBe('bad');
+  });
+
+  it('锁优先：locked + 11102 → 上游无此模型', () => {
+    const a = mdAvailability('global:kimi-k3', [{ model: 'kimi-k3', realm: 'global', state: 'locked', reason: '11102 service info not found' }], []);
+    expect(a?.label).toBe('上游无此模型');
+  });
+
+  it('锁优先：locked 无具体码 → 限流不可用', () => {
+    const a = mdAvailability('global:kimi-k3', [{ model: 'kimi-k3', realm: 'global', state: 'locked', reason: '6004 model rate limit', unlock_at: '2026-10-21T10:00:00Z' }], []);
+    expect(a?.label).toBe('限流不可用');
+    expect(a?.tip).toContain('解封');
+  });
+
+  it('无锁时看最近真实请求：成功/429/≥500/其他失败', () => {
+    expect(
+      mdAvailability('global:kimi-k3', [], [{ model: 'kimi-k3', status: 200, outcome: 'success' }])?.key,
+    ).toBe('recent_ok');
+    expect(mdAvailability('global:kimi-k3', [], [{ model: 'kimi-k3', status: 429 }])?.key).toBe('recent_429');
+    expect(mdAvailability('global:kimi-k3', [], [{ model: 'kimi-k3', status: 503 }])?.key).toBe('recent_5xx');
+    expect(mdAvailability('global:kimi-k3', [], [{ model: 'kimi-k3', status: 400 }])?.key).toBe('recent_fail');
+  });
+
+  it('锁优先于最近请求：有锁时忽略 recent', () => {
+    const a = mdAvailability(
+      'global:kimi-k3',
+      [{ model: 'kimi-k3', realm: 'global', state: 'locked', reason: '6004 model rate limit' }],
+      [{ model: 'kimi-k3', status: 200, outcome: 'success' }],
+    );
+    expect(a?.key).toBe('rate');
+  });
+
+  it('忽略其他域或其他模型的锁', () => {
+    expect(
+      mdAvailability('global:kimi-k3', [{ model: 'kimi-k3', realm: 'cn', state: 'locked' }], [])?.key,
+    ).toBe('unknown');
+    expect(
+      mdAvailability('global:kimi-k3', [{ model: 'other', realm: 'global', state: 'locked' }], [])?.key,
+    ).toBe('unknown');
   });
 });

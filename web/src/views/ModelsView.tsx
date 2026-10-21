@@ -1,7 +1,17 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import { mdMatch, mdSortList, DEFAULT_MODEL_FILTER, type ModelEntry, type ModelFilter } from '@/lib/models';
+import {
+  mdAvailability,
+  mdMatch,
+  mdSortList,
+  DEFAULT_MODEL_FILTER,
+  type ModelEntry,
+  type ModelFilter,
+  type ModelAvailability,
+  type ModelLockLike,
+  type RecentRequestLike,
+} from '@/lib/models';
 import { Button } from '@/components/ui/button';
 import {
   Select,
@@ -119,6 +129,20 @@ export function ModelsView() {
       api<{ models?: Record<string, ModelHealth> }>('model_health').catch(
         (): { models?: Record<string, ModelHealth> } => ({ models: {} }),
       ),
+  });
+  // 两路本地证据（不产生上游推理探测）：
+  //   - model_locks 来自 overview 快照（复用同一 queryKey，与账号池共享缓存）；
+  //   - 最近真实请求来自 request_metrics.recent（失败静默，不加标签）。
+  const overviewQ = useQuery({
+    queryKey: ['overview'],
+    queryFn: () => api<{ model_locks?: ModelLockLike[] }>('overview').catch((): { model_locks?: ModelLockLike[] } => ({})),
+    refetchInterval: 30000,
+  });
+  const recentQ = useQuery({
+    queryKey: ['model_availability_recent'],
+    queryFn: () =>
+      api<{ recent?: RecentRequestLike[] }>('request_metrics').catch((): { recent?: RecentRequestLike[] } => ({})),
+    refetchInterval: 60000,
   });
   const [probing, setProbing] = useState<string | null>(null);
   const reload = () => {
@@ -289,6 +313,7 @@ export function ModelsView() {
                   m={m}
                   pr={probeOf(m.id)}
                   h={health[m.id]}
+                  availability={mdAvailability(m.id, overviewQ.data?.model_locks, recentQ.data?.recent)}
                   probing={probing === m.id}
                   onProbe={() => void probe(m)}
                 />
@@ -388,12 +413,14 @@ function ModelRow({
   m,
   pr,
   h,
+  availability,
   probing,
   onProbe,
 }: {
   m: ModelEntry;
   pr?: Probe;
   h?: ModelHealth;
+  availability?: ModelAvailability | null;
   probing: boolean;
   onProbe: () => void;
 }) {
@@ -425,7 +452,16 @@ function ModelRow({
       <TableCell title={m.description}>
         <div className="font-medium">{m.id}</div>
         <div className="font-mono text-2xs text-muted-foreground">{m.name || ''}</div>
-        {caps.length ? <div className="mt-0.5 flex gap-1">{caps}</div> : null}
+        {caps.length || availability ? (
+          <div className="mt-0.5 flex flex-wrap gap-1">
+            {availability ? (
+              <Tag tone={availability.tone} title={availability.tip}>
+                {availability.label}
+              </Tag>
+            ) : null}
+            {caps}
+          </div>
+        ) : null}
       </TableCell>
       <TableCell>
         <RateCell m={m} />
