@@ -278,6 +278,9 @@ func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
 const modelRateLimitCode = "6004"
 
+// modelBusyCode 上游「当前模型繁忙」业务码：只停 (账号, 模型) 短窗口。
+const modelBusyCode = "14003"
+
 // softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
 // "reset at <固定格式时间>"），捕获中间的时间串。
 const (
@@ -289,7 +292,6 @@ const (
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -297,11 +299,17 @@ var (
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
-// 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）
+// 或模型繁忙（14003）。用于区分"账号级软限流"（按账号冷却）与"模型级限流"
+// （切模型即可用；14003 另走短窗口，见 IsModelBusy）。
 func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	return reModelRateLimit.MatchString(body)
+	// 结构化 code 字段精确匹配 6004/14003，避免 60040/140030 这类前缀误伤。
+	return hasAnyBusinessCode(body, modelRateLimitCode, modelBusyCode)
+}
+
+// IsModelBusy 报告 body 是否是 14003「当前模型繁忙」：只停该模型短窗口。
+func IsModelBusy(body string) bool {
+	return hasBusinessCode(body, modelBusyCode)
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
@@ -689,8 +697,13 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 	// 11136/11158 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
 	// 平台级「目录无此模型」分开）。11158 另留文案外卡：上游丢 code 时仍按账号类型
 	// 级权限拒绝处理，不落 ErrClient 逐号连败。
-	if hasAnyBusinessCode(body, modelAccessCodes...) || hasModelForbiddenMarker(body) {
+	if status != http.StatusTooManyRequests &&
+		(hasAnyBusinessCode(body, modelAccessCodes...) || hasModelForbiddenMarker(body)) {
 		return ErrModelBlocked, true
+	}
+	// 11141 平台下线同理：429 下保留限流语义。
+	if status != http.StatusTooManyRequests && hasAnyBusinessCode(body, modelRetiredCodes...) {
+		return ErrModelAccess, true
 	}
 	// 11102「上游模型目录无此模型」：所有账号共享同一目录，换号必然得到同一答复。
 	// 归 ErrModelNotFound 请求级 fail-fast——若等到通用 4xx 兜底归 ErrClient 会逐号
@@ -729,9 +742,8 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 //  2. 11-128 —— 上游内容审核/反探测拦截码（常见形态是非法 JSON），按内容拦截
 //     处理，不罚账号、可降级重试。
 //  3. requestLevelCodes —— 客户端判为 editInput/newTask/reupload 的确定性请求
-//     错误（11125/11129/.../11155、12654、14405）：不罚号、不轮转。11136 归
-//     ErrModelBlocked（账号级，换号 + (账号,模型) 避让）；11141 归 ErrModelAccess
-//     （平台级下线，fail-fast）。
+//     错误（11125/11129/.../11155、12654、14405）：不罚号、不轮转。11136/11158
+//     与 11141 已在第 0 层 classifyEarly 按状态码分流（429 保留限流语义）。
 //  4. sessionDeadMarkers / accountFaultMarkers / 11142 / 11140+request illegal ——
 //     需要人工重登的终态或账号级授权/配额故障。若 401 body 同时含 "12153" 与 "rate limit"（如网关
 //     错误页混排），归 session_dead：短冷却救不活失效 session，误判为限流会让该死号
@@ -858,9 +870,9 @@ var requestLevelCodes = []string{
 // 不允许该模型」）：同一账号换请求仍会失败，但换账号可能成功 → 写 (账号,模型)
 // 负缓存后继续换号。
 //
-// 11158 与 11136 判定口径一致（与状态码无关）：同一码值不因状态码分叉。上游把
-// 429+11158 归软限流，本 fork 刻意不同——429 只是同一权限拒绝的传输层状态码，
-// 逐号软冷却会让整池健康号陪跑，而权限拒绝本身不会因冷却而改变。
+// 11158 与 11136 共用码表，但 429+11158 保留限流语义（见 classifyEarly 的
+// 状态门控）：400/404 才是账号级模型权限拒绝；429 是上游限流，按软限流换号，
+// 避免把限流误判成整池权限缺失。
 var modelAccessCodes = []string{"11136", "11158"}
 
 // modelRetiredCodes 平台级模型下线（11141「该模型已下线」）：所有账号都会得到
@@ -880,18 +892,9 @@ var accountLimitCodes = []string{"10105", "15001"}
 // IsModelRateLimit 单独判定，这里统一先归 ErrSoftRate。
 var rateLimitCodes = []string{"6000", "6001", "6002", "6003", "6004", "6005", "6006", "6007", "6008"}
 
-// classifyRequestLevel 判定客户端明确的请求级业务码。11136 是账号级模型权限
-// 缺失，归 ErrModelBlocked 走换号 + (账号,模型) 避让；11141 是平台级模型下线，
-// 归 ErrModelAccess fail-fast；其余归 ErrBadParams（不罚号、不轮转、透传原文）。
+// classifyRequestLevel 判定客户端明确的请求级业务码，归 ErrBadParams
+// （不罚号、不轮转、透传原文）。11136/11158/11141 已在 classifyEarly 分流。
 func classifyRequestLevel(body string) (ErrKind, bool) {
-	if hasAnyBusinessCode(body, modelAccessCodes...) {
-		return ErrModelBlocked, true
-	}
-
-	if hasAnyBusinessCode(body, modelRetiredCodes...) {
-		return ErrModelAccess, true
-	}
-
 	if hasAnyBusinessCode(body, requestLevelCodes...) {
 		return ErrBadParams, true
 	}
@@ -1126,7 +1129,7 @@ type Client struct {
 	RetryDelay time.Duration
 
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（生产由 config
-	// normalize 到 1200s；裸用回落 transport 构造默认）。
+	// normalize 到 120s/300s；裸用回落 transport 构造默认）。
 	HeaderTimeout time.Duration
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
@@ -1391,15 +1394,16 @@ const (
 )
 
 // billingMeterPaths 按 realm 返回 billing/meter 域路径候选序列：
-// global → [无 /v2, 有 /v2]（404 时 fallback）；cn → [有 /v2]（现状逐字，零回归）。
-// 仅作用于 get-user-resource / daily-checkin（/billing/meter/* 族）；report /v2/report 不参与，
-// 其他 billing 端点（growth 等）路径不含 /billing/meter 前缀，走原常量不受影响。
+// global → [无 /v2, 有 /v2]；cn → [有 /v2, 无 /v2]（官方桌面 CN 的 resourcePrefix
+// 为空串，无 /v2 是官方形态；保留 /v2 优先以维持现状，404 再回落）。
+// 仅作用于 get-user-resource / daily-checkin（/billing/meter/* 族）；report /v2/report
+// 不参与，其他 billing 端点（growth 等）路径不含 /billing/meter 前缀，走原常量不受影响。
 func (c *Client) billingMeterPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
 		return []string{billingMeterPath, billingMeterPathV2}
 	}
 
-	return []string{billingMeterPathV2}
+	return []string{billingMeterPathV2, billingMeterPath}
 }
 
 // checkinMeterPaths 签到路径候选：两 realm 均 `/v2` 优先，404 时回落无 `/v2`
@@ -1559,8 +1563,6 @@ func (c *Client) doJSONLimit(req *http.Request, maxBytes int64) (json.RawMessage
 	return env.Data, nil
 }
 
-// RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
-// 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
 // refreshIOTimeout 刷新端点网络 I/O 上限（两段式锁外执行，防上游 hang 长占锁）。
 const refreshIOTimeout = 30 * time.Second
 
@@ -1590,6 +1592,12 @@ func (c *Client) RefreshToken(account10 *auth.Auth) error {
 		key = fmt.Sprintf("%p", account10)
 	}
 
+	// 等待者用自己的快照合并 leader 的结果；与自己同一对象时 commit 守卫会跳过。
+	rtSnapshot, atBefore, err := refreshTokenSnapshot(account10)
+	if err != nil {
+		return err
+	}
+
 	// 取票或等待既有票据。等待者不解锁任何账号锁，避免与首个调用的 I/O 串行化。
 	c.refreshMu.Lock()
 
@@ -1601,6 +1609,10 @@ func (c *Client) RefreshToken(account10 *auth.Auth) error {
 		c.refreshMu.Unlock()
 		<-flight.done
 
+		if flight.err == nil {
+			commitRefreshedToken(account10, flight.tok, atBefore, rtSnapshot)
+		}
+
 		return flight.err
 	}
 
@@ -1608,13 +1620,14 @@ func (c *Client) RefreshToken(account10 *auth.Auth) error {
 	c.refreshInFlight[key] = flight
 	c.refreshMu.Unlock()
 
-	err := c.refreshTokenOnce(account10)
+	tok, err := c.refreshTokenOnce(account10)
 	if err != nil && isSessionDeadErr(err) && adoptNewerTokensFromDisk(account10) {
 		// 跨进程竞态：磁盘 RT 已被别的进程 rotate 过，用新 RT 再试一次。
-		err = c.refreshTokenOnce(account10)
+		tok, err = c.refreshTokenOnce(account10)
 	}
 
 	// 先写结果再关 channel：等待者 <-flight.done 之后读到的一定是最终 err。
+	flight.tok = tok
 	flight.err = err
 	close(flight.done)
 
@@ -1625,9 +1638,20 @@ func (c *Client) RefreshToken(account10 *auth.Auth) error {
 	return err
 }
 
+// RefreshTokenIfNeeded 按需刷新（请求路径 / signin 用）：先快速判断是否临近
+// 过期；真正需要刷新时复用 RefreshToken 的单飞结果。
+func (c *Client) RefreshTokenIfNeeded(a *auth.Auth, within time.Duration) error {
+	if !a.NeedsRefresh(within) {
+		return nil
+	}
+
+	return c.RefreshToken(a)
+}
+
 // refreshFlight 是同一账号一次 refresh 的单飞票据：done 关闭即结果就绪。
 type refreshFlight struct {
 	done chan struct{}
+	tok  refreshTokenResponse
 	err  error
 }
 
@@ -1674,11 +1698,11 @@ func adoptNewerTokensFromDisk(account *auth.Auth) bool {
 }
 
 // refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
-func (c *Client) refreshTokenOnce(account10 *auth.Auth) error {
+func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, error) {
 	// 第 1 段（锁内）：读快照。
 	rtSnapshot, atBefore, err := refreshTokenSnapshot(account10)
 	if err != nil {
-		return err
+		return refreshTokenResponse{}, err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
@@ -1710,7 +1734,7 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) error {
 
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
 		if reqErr != nil {
-			return fmt.Errorf("RefreshToken: %w", reqErr)
+			return refreshTokenResponse{}, fmt.Errorf("RefreshToken: %w", reqErr)
 		}
 
 		c.RefreshHeaders(req, &hdrSnapshot)
@@ -1723,19 +1747,87 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) error {
 
 		lastErr = classifyRefreshError(lastErr)
 		if i >= len(origins)-1 || !refreshReplayable(lastErr) {
-			return lastErr
+			return refreshTokenResponse{}, lastErr
 		}
 	}
 
 	tok, err := parseRefreshResponse(data)
 	if err != nil {
-		return err
+		return refreshTokenResponse{}, err
 	}
 
 	// 第 2 段（锁内）：校验快照一致后写回。
 	commitRefreshedToken(account10, tok, atBefore, rtSnapshot)
 
-	return nil
+	return tok, nil
+}
+
+// commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
+func commitRefreshedToken(account4 *auth.Auth, tok refreshTokenResponse, atBefore, rtSnapshot string) {
+	account4.Lock()
+	defer account4.Unlock()
+	// 写回守卫是 AND 语义：锁外期间另一刷新已完成 → 两 token 必同时变化（实测 R-D：
+	// refresh 响应 accessToken/refreshToken 总是一起 rotate，写回也同时写两个），AND
+	// 即「并发刷新已完成」判据；AND 与 OR 在真实形态下等价。唯 OR 会额外放弃的
+	// 「只有单 token 变化」（如手工只改 auth 文件一个字段）不构成放弃条件——本次
+	// 结果覆盖手工编辑。
+	if account4.AccessToken != atBefore && account4.RefreshToken != rtSnapshot {
+		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
+		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
+		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
+		return
+	}
+
+	account4.AccessToken = tok.AccessToken
+	if tok.RefreshToken != "" {
+		account4.RefreshToken = tok.RefreshToken
+	}
+
+	if tok.Domain != "" {
+		account4.Domain = tok.Domain
+	}
+	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
+	// 实测 R-D 响应恒带 expiresIn=5184000（60d）——缺省分支仅为防御，保留旧值
+	// 避免过期判定漂移。同理，超过 10 年的 expiresIn 按脏值处理保留旧值：
+	// 实测 JWT exp-iat 与 expiresIn 严格自洽（R-F），超量级值只会是上游脏数据，
+	// 照写会把 ExpiresAt 推到荒谬未来 → NeedsRefresh 永假 → token 永不刷新
+	// 反而真过期失效。
+	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
+		account4.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	}
+}
+
+// refreshTokenResponse refresh 端点响应体（字段名与上游 JSON 对齐）。
+type refreshTokenResponse struct {
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresIn    int64  `json:"expiresIn"`
+	Domain       string `json:"domain"`
+}
+
+// refreshTokenSnapshot 锁内读取 refresh/access token 快照；refreshToken 为空视为
+// 无刷新凭证，返回错误（调用方直接失败）。
+func refreshTokenSnapshot(account *auth.Auth) (rtSnapshot, atBefore string, err error) {
+	account.Lock()
+	rtSnapshot = account.RefreshToken
+	atBefore = account.AccessToken
+	account.Unlock()
+
+	if strings.TrimSpace(rtSnapshot) == "" {
+		return "", "", errNoRefreshToken
+	}
+
+	return rtSnapshot, atBefore, nil
+}
+
+// parseRefreshResponse 解析 refresh 响应；缺 accessToken 视为刷新失败（需重登）。
+func parseRefreshResponse(data []byte) (refreshTokenResponse, error) {
+	var tok refreshTokenResponse
+	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+		return refreshTokenResponse{}, errRefreshFailedNoAccessTokenIn
+	}
+
+	return tok, nil
 }
 
 // classifyRefreshError 把 refresh 端点的「纯凭证拒绝」映射为会话失效。
@@ -1777,74 +1869,6 @@ func refreshReplayable(err error) bool {
 	return replayableOriginStatus(ue.Status)
 }
 
-// refreshTokenResponse refresh 端点响应体（字段名与上游 JSON 对齐）。
-type refreshTokenResponse struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-	ExpiresIn    int64  `json:"expiresIn"`
-	Domain       string `json:"domain"`
-}
-
-// refreshTokenSnapshot 锁内读取 refresh/access token 快照；refreshToken 为空视为
-// 无刷新凭证，返回错误（调用方直接失败）。
-func refreshTokenSnapshot(a *auth.Auth) (rtSnapshot, atBefore string, err error) {
-	a.Lock()
-	rtSnapshot = a.RefreshToken
-	atBefore = a.AccessToken
-	a.Unlock()
-
-	if strings.TrimSpace(rtSnapshot) == "" {
-		return "", "", errNoRefreshToken
-	}
-
-	return rtSnapshot, atBefore, nil
-}
-
-// parseRefreshResponse 解析 refresh 响应；缺 accessToken 视为刷新失败（需重登）。
-func parseRefreshResponse(data []byte) (refreshTokenResponse, error) {
-	var tok refreshTokenResponse
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
-		return refreshTokenResponse{}, errRefreshFailedNoAccessTokenIn
-	}
-
-	return tok, nil
-}
-
-// commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
-func commitRefreshedToken(account4 *auth.Auth, tok refreshTokenResponse, atBefore, rtSnapshot string) {
-	account4.Lock()
-	defer account4.Unlock()
-	// 写回守卫是 AND 语义：锁外期间另一刷新已完成 → 两 token 必同时变化（实测 R-D：
-	// refresh 响应 accessToken/refreshToken 总是一起 rotate，写回也同时写两个），AND
-	// 即「并发刷新已完成」判据；AND 与 OR 在真实形态下等价。唯 OR 会额外放弃的
-	// 「只有单 token 变化」（如手工只改 auth 文件一个字段）不构成放弃条件——本次
-	// 结果覆盖手工编辑。
-	if account4.AccessToken != atBefore && account4.RefreshToken != rtSnapshot {
-		// 锁外期间另一 goroutine 已完成刷新：新 token 已生效，本次结果不必再写
-		// （实测 R-E：服务端无 rotation 撤销，并发双刷新拿到的两个新 token 都有效，
-		// 后写覆盖先写二者等价可用；提前返回避免无意义覆盖与 ExpiresAt 抖动）。
-		return
-	}
-
-	account4.AccessToken = tok.AccessToken
-	if tok.RefreshToken != "" {
-		account4.RefreshToken = tok.RefreshToken
-	}
-
-	if tok.Domain != "" {
-		account4.Domain = tok.Domain
-	}
-	// preserveExpiry：响应缺 expiresIn 时保留旧过期时间，避免刷新风暴。
-	// 实测 R-D 响应恒带 expiresIn=5184000（60d）——缺省分支仅为防御，保留旧值
-	// 避免过期判定漂移。同理，超过 10 年的 expiresIn 按脏值处理保留旧值：
-	// 实测 JWT exp-iat 与 expiresIn 严格自洽（R-F），超量级值只会是上游脏数据，
-	// 照写会把 ExpiresAt 推到荒谬未来 → NeedsRefresh 永假 → token 永不刷新
-	// 反而真过期失效。
-	if tok.ExpiresIn > 0 && time.Duration(tok.ExpiresIn)*time.Second < refreshTokenExpiresInMax {
-		account4.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	}
-}
-
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
 // 需要客户端断开联动的调用方用 ChatStreamContext 传入请求 ctx。
@@ -1875,10 +1899,9 @@ func (c *Client) ChatStream(
 // respBody 自行兜底。
 //
 // global chat 自 #119 实测后固定走 /v2（chat 层无 fallback 链；billing 层的 404
-// fallback 独立存在，语义不受影响）。ensureConsoleSystem 在 prepareBody 后统一套用
-// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
-// #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
-// 反证，删了无回滚路径）。
+// fallback 独立存在，语义不受影响）。ensureLeadingSystem 在 prepareBody 后统一套用：
+// 首条消息非 system 时前置官方兜底 system（防 11-128 "first message is not system
+// prompt"；CN/global 都需要）。
 // modelFromBody 取聊天请求体里的 model（畸形/缺失 → 空串，走全局超时）。
 func modelFromBody(body []byte) string {
 	var peek struct {
@@ -1899,9 +1922,7 @@ func (c *Client) ChatStreamContext(
 	}
 
 	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID)
-	if c.globalOn(account3) {
-		prepared = ensureConsoleSystem(prepared)
-	}
+	prepared = ensureLeadingSystem(prepared)
 
 	headerTimeout, idleTimeout := c.modelTimeout(account3.Realm(), modelFromBody(prepared))
 	chatHTTP := c.chatHTTPForAccount(account3, headerTimeout)

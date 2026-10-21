@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -140,15 +141,15 @@ func processAccount(str string, client *upstream.Client) row {
 // refreshIfNeeded 在 token 临近过期（2h 内）时刷新并原子落盘；
 // 落盘失败仅记日志（与旧行为一致），刷新错误原样上抛供调用方分类。
 func refreshIfNeeded(account *auth.Auth, up *upstream.Client) error {
-	if !account.NeedsRefresh(2 * 3600) {
+	if !account.NeedsRefresh(2 * time.Hour) {
 		return nil
 	}
 
-	if err := up.RefreshToken(account); err != nil {
+	if err := up.RefreshTokenIfNeeded(account, 2*time.Hour); err != nil {
 		return fmt.Errorf("refreshIfNeeded: %w", err)
 	}
 
-	if err := account.SaveAtomic(); err != nil {
+	if err := account.SaveAtomicRetry(); err != nil {
 		log.Printf("signin %q save: %q", account.UID, err.Error()) //nolint:gosec // 参数经 %q 转义，无注入面
 	}
 

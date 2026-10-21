@@ -954,6 +954,11 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		if err := os.Remove(account.FilePath); err != nil && !os.IsNotExist(err) {
 			fileMsg = err.Error()
 		}
+		// safefile.WriteKeep 会留一份上一版凭证（含仍可能有效的 access token）；
+		// 删除账号时一并清掉，否则凭证残留在 auth 目录。
+		if err := os.Remove(account.FilePath + ".bak"); err != nil && !os.IsNotExist(err) && fileMsg == "" {
+			fileMsg = err.Error()
+		}
 	}
 
 	if fileMsg != "" {

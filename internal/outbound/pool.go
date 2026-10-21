@@ -48,14 +48,6 @@ func New(rawURLs []string) (*Pool, error) {
 	return &Pool{states: states, now: time.Now}, nil
 }
 
-// SetClock 仅供测试注入确定性时钟。
-func (pool *Pool) SetClock(fn func() time.Time) {
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
-	pool.now = fn
-}
-
 // Len 返回池内代理数（0 = 直连）。
 func (pool *Pool) Len() int { return len(pool.states) }
 

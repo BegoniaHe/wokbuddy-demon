@@ -993,6 +993,13 @@ type streamWriter struct {
 	// （普通 / keepalive）共用；收尾时据此区分「正常结束」与「EOF 截断」。
 	sawDone bool
 
+	// dataLines 当前 SSE 事件累积的 data: 行；按规范用 \n 拼接，遇空行/事件边界
+	// 才写出一帧。单行 data 也走这里，保证多行 data 不再被拆成多个坏帧。
+	dataLines []string
+	// dataBytes 是 dataLines 的载荷总字节数：多行事件必须有总量上限，否则恶意/异常
+	// 上游持续发 data 行且不发空行时会无限累积（单行上限只约束一行）。
+	dataBytes int
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen map[int]bool
@@ -1062,10 +1069,18 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 // 写失败统一包 errClientWrite（issue #105）：调用方据此把「客户端已走」与
 // 「上游读失败」分开处置。
 func (s *streamWriter) writeAll(payload string) error {
+	return s.writeSegments("", payload, "")
+}
+
+// writeSegments 分段写出 prefix/payload/suffix 后 flush：SSE 帧头尾是常量，
+// 分段写避免每帧为 "data: "+payload+"\n\n" 复制一次完整载荷。
+func (s *streamWriter) writeSegments(prefix, payload, suffix string) error {
 	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
 
-	if _, werr := io.WriteString(s.w, payload); werr != nil {
-		return fmt.Errorf("%w: %w", errClientWrite, werr)
+	for _, part := range [3]string{prefix, payload, suffix} {
+		if _, werr := io.WriteString(s.w, part); werr != nil {
+			return fmt.Errorf("%w: %w", errClientWrite, werr)
+		}
 	}
 
 	if s.fl != nil {
@@ -1086,7 +1101,7 @@ func (s *streamWriter) setWriteDeadline(deadline time.Time) {
 
 // writeSSE 原样写出一帧并 flush。
 func (s *streamWriter) writeSSE(payload string) error {
-	return s.writeAll("data: " + payload + "\n\n")
+	return s.writeSegments("data: ", payload, "\n\n")
 }
 
 // writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
@@ -1172,15 +1187,15 @@ func (s *streamWriter) trackMaxToolIdx(obj map[string]any) {
 
 // repairFrame 在透传前跑标记修复，并把一帧展开成「可能多帧」：正文帧（标记被摘掉
 // 后的可见文本）+ N 个 delta.tool_calls 帧 + 收尾 finish_reason 帧。没有命中标记
-// 时原样返回入参帧（单元素），与修复前逐字节一致。
+// 时返回 nil（调用方直接写原帧），与修复前逐字节一致。
 func (s *streamWriter) repairFrame(obj map[string]any) []map[string]any {
 	if !s.repair.Enabled() {
-		return []map[string]any{obj}
+		return nil
 	}
 
 	chs, ok := obj["choices"].([]any)
 	if !ok {
-		return []map[string]any{obj}
+		return nil
 	}
 
 	calls := s.feedRepair(chs)
@@ -1191,7 +1206,7 @@ func (s *streamWriter) repairFrame(obj map[string]any) []map[string]any {
 			s.toolFinishSent = true
 		}
 
-		return []map[string]any{obj}
+		return nil
 	}
 
 	return s.expandMarkupCalls(obj, calls)
@@ -1289,7 +1304,16 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 		return 1, nil
 	}
 
-	for _, ch := range s.repairFrame(obj) {
+	frames := s.repairFrame(obj)
+	if frames == nil {
+		if werr := s.writeChunk(obj, payload); werr != nil {
+			return 0, werr
+		}
+
+		return 1, nil
+	}
+
+	for _, ch := range frames {
 		if werr := s.writeChunk(ch, payload); werr != nil {
 			return 0, werr
 		}
@@ -1334,6 +1358,11 @@ func (s *streamWriter) stream(r io.Reader) error {
 		validFrames += n
 
 		if werr != nil {
+			// 多行 data 事件总量超限：与单行超限同口径，先写 error 帧 + [DONE]。
+			if errors.Is(werr, ErrSSELineTooLong) {
+				s.finishSizeLimit()
+			}
+
 			return werr // 客户端写失败（或帧解析失败）：原样上抛
 		}
 
@@ -1473,15 +1502,39 @@ func (s *streamWriter) keepaliveIfIdle(lastWrite *time.Time) error {
 func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err error) {
 	trimmed := strings.TrimRight(line, "\r\n")
 	switch {
-	case strings.HasPrefix(trimmed, "data: [DONE]"):
-		// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
-		// [DONE] 统一在循环结束后写出，保证恰好一个。
-		s.sawDone = true
-		return 0, true, nil
-	case strings.HasPrefix(trimmed, "data: "):
-		n, werr := s.writeFrame(strings.TrimPrefix(trimmed, "data: "))
+	case strings.HasPrefix(trimmed, "data:"):
+		payload := strings.TrimPrefix(trimmed, "data:")
+
+		payload = strings.TrimPrefix(payload, " ") // SSE 允许 "data:" 后不带空格
+		if strings.TrimSpace(payload) == "[DONE]" {
+			// 先吐出已累积的多行 data，再结束；[DONE] 统一在收尾写一次。
+			n, werr := s.flushData()
+			if werr != nil {
+				return n, false, werr
+			}
+
+			s.sawDone = true
+
+			return n, true, nil
+		}
+
+		// 非规范上游可能用单个 \n 分隔事件：上一行本身已是完整 JSON 时先落帧，
+		// 避免把两个对象拼成一行。只校验单行（O(line)），不对累积缓冲反复 join。
+		if len(s.dataLines) == 1 && json.Valid([]byte(s.dataLines[0])) {
+			n, werr := s.flushData()
+			if werr != nil {
+				return n, false, werr
+			}
+
+			// flushData 已清零 dataLines/dataBytes，继续走下面的追加。
+			return s.appendDataLine(n, payload)
+		}
+
+		return s.appendDataLine(0, payload)
+	case trimmed == "":
+		n, werr := s.flushData()
 		return n, false, werr
-	case trimmed != "":
+	default:
 		// 注释/其他行：原样透传
 		if werr := s.writeAll(line); werr != nil {
 			return 0, false, werr
@@ -1489,6 +1542,43 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 	}
 
 	return 0, false, nil
+}
+
+// appendDataLine 把一行 data 追加到当前事件缓冲，并施加事件总量上限：
+// 单行上限只约束一行，异常上游持续发 data 行且不发空行时累积缓冲会无限增长。
+// 与单行超限同口径返回 ErrSSELineTooLong（调用方写 error 帧 + [DONE]）。
+func (s *streamWriter) appendDataLine(n int, payload string) (int, bool, error) {
+	add := len(payload)
+	if len(s.dataLines) > 0 {
+		add++ // 行间 "\n"
+	}
+
+	if s.dataBytes+add > MaxSSELineBytes {
+		return n, false, fmt.Errorf("%w: > %d bytes", ErrSSELineTooLong, MaxSSELineBytes)
+	}
+
+	s.dataLines = append(s.dataLines, payload)
+	s.dataBytes += add
+
+	return n, false, nil
+}
+
+// flushData 把一个完整 SSE 事件的多行 data 按规范用 \n 拼接后写出一帧。
+func (s *streamWriter) flushData() (int, error) {
+	if len(s.dataLines) == 0 {
+		return 0, nil
+	}
+
+	payload := strings.Join(s.dataLines, "\n")
+	s.dataLines = s.dataLines[:0]
+	s.dataBytes = 0
+
+	n, err := s.writeFrame(payload)
+	if err != nil {
+		return 0, err
+	}
+
+	return n, nil
 }
 
 // finishSizeLimit 单行/总量超限的收尾（issue #113）：先写一帧明确 error
@@ -1511,27 +1601,49 @@ func (s *streamWriter) finishSizeLimit() {
 // errTruncatedStream，让调用方把这次请求记为上游失败（issue #105）。
 // [DONE] 兜底帧照写：客户端已开始读流，必须有一个收尾标记，不能中途悬挂。
 func (s *streamWriter) finish(validFrames *int) error {
+	if err := s.flushPending(validFrames); err != nil {
+		return err
+	}
+
 	if werr := s.finishRepair(validFrames); werr != nil {
 		return werr
 	}
-	// 空流 / 截断都不是完整回答：先写一帧 error（绕过 normalizeFrame 原样保留
-	// error 字段），再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方
-	// 记录。与 finishSizeLimit 同形态，客户端不能把半截内容读成正常完成。
-	// 网关本地兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
-	// 且 writeRaw 的 hintFn 闭包在兜底路径下可能携带上一帧的上下文造成误配。
-	switch {
-	case *validFrames == 0:
-		_ = s.writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
-	case !s.sawDone && !s.sawFinish:
-		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]","type":"upstream_error","code":"upstream_parse"}}`)
-	}
+
+	s.writeFinishFallback(*validFrames)
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
 	if err := s.writeAll("data: [DONE]\n\n"); err != nil {
 		return err
 	}
 
+	return s.finishResult(*validFrames)
+}
+
+// flushPending 把尚未写出的事件数据落帧并计入有效帧数。
+func (s *streamWriter) flushPending(validFrames *int) error {
+	n, err := s.flushData()
+	if err != nil {
+		return err
+	}
+
+	*validFrames += n
+
+	return nil
+}
+
+// writeFinishFallback 空流/截断时给客户端补一帧明确 error（HTTP 头已发出只能 200）。
+func (s *streamWriter) writeFinishFallback(validFrames int) {
 	switch {
-	case *validFrames == 0:
+	case validFrames == 0:
+		_ = s.writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
+	case !s.sawDone && !s.sawFinish:
+		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]","type":"upstream_error","code":"upstream_parse"}}`)
+	}
+}
+
+// finishResult 把收尾形态映射为哨兵错误（空流/截断都不是成功）。
+func (s *streamWriter) finishResult(validFrames int) error {
+	switch {
+	case validFrames == 0:
 		return errEmptyStream
 	case !s.sawDone && !s.sawFinish:
 		return errTruncatedStream

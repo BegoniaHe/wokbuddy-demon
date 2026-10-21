@@ -370,6 +370,77 @@ func TestModelRateLimitAuditDoesNotAffectRouting(t *testing.T) {
 	}
 }
 
+// TestCooldownModelBusyOverridesAuditOnly 14003 短窗不得被 AuditOnly 台账挡住或延长：
+// 审计项不参与路由，真实繁忙冷却必须写入并只停短窗。
+func TestCooldownModelBusyOverridesAuditOnly(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.RecordModelRateLimitAudit("u1", "glm-5.3", "6004 model rate limit (reset unknown)")
+
+	pool.mu.Lock()
+	audit, ok := pool.byUID["u1"].modelCooldowns["glm-5.3"]
+	pool.mu.Unlock()
+
+	if !ok || !audit.AuditOnly {
+		t.Fatalf("audit entry missing: %+v ok=%v", audit, ok)
+	}
+
+	start := time.Now()
+
+	pool.CooldownModelBusy("u1", "glm-5.3", "14003 model busy")
+
+	pool.mu.Lock()
+	busy := pool.byUID["u1"].modelCooldowns["glm-5.3"]
+	pool.mu.Unlock()
+
+	if busy.AuditOnly || !strings.HasPrefix(busy.Reason, "14003") {
+		t.Fatalf("14003 未覆盖审计项: %+v", busy)
+	}
+
+	if d := busy.Until.Sub(start); d > modelBusyMax+time.Second {
+		t.Fatalf("14003 短窗被审计项延长: %v", d)
+	}
+}
+
+// TestCooldownModelBusyBackoffDoubles 连续 14003 必须按命中次数翻倍
+// （10s→20s→…，封顶 1m），不能第 2 次仍停在 10s。
+func TestCooldownModelBusyBackoffDoubles(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+
+	base := time.Date(2026, 10, 22, 10, 0, 0, 0, time.UTC)
+	clock := base
+
+	pool.SetClock(func() time.Time { return clock })
+
+	pool.CooldownModelBusy("u1", "glm-5.3", "14003 model busy")
+
+	if got := modelCooldownUntil(t, pool, "u1", "glm-5.3"); !got.Equal(base.Add(10 * time.Second)) {
+		t.Fatalf("first 14003 until=%v want %v", got, base.Add(10*time.Second))
+	}
+
+	clock = base.Add(5 * time.Second)
+
+	pool.CooldownModelBusy("u1", "glm-5.3", "14003 model busy")
+
+	if got := modelCooldownUntil(t, pool, "u1", "glm-5.3"); !got.Equal(clock.Add(20 * time.Second)) {
+		t.Fatalf("second 14003 until=%v want %v", got, clock.Add(20*time.Second))
+	}
+}
+
+func modelCooldownUntil(t *testing.T, pool *Pool, uid, model string) time.Time {
+	t.Helper()
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	return pool.byUID[uid].modelCooldowns[model].Until
+}
+
 // 11136 与 6004 共用台账但必须输出不同 kind。
 func TestRateLimitedModelKindModelUnavailable(t *testing.T) {
 	t.Parallel()

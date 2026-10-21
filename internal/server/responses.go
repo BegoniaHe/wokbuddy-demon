@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -84,6 +85,8 @@ func (h *Handler) responsesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	chatIn.clientIP = httpauth.ClientIP(r, h.cfg.TrustedProxies)
+
 	h.serveChat(r, &chatIn, responder)
 }
 
@@ -115,7 +118,6 @@ func newResponsesChatInput(
 		body:           openAI,
 		stream:         stream,
 		model:          model,
-		clientIP:       upstream.ExtractClientIP(r),
 		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
 		traceID:        r.Header.Get("X-Trace-Id"),
 		inboundSession: inboundSessionMetaFrom(r),

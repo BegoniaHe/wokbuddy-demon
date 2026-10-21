@@ -468,8 +468,8 @@ gemini
 | `upstream.rotate_budget` | `0` | 轮换总时长预算（如 `90s`）；`0` = 不限。与 `rotate_max` 先到先停 |
 | `upstream.rotate_status_codes` | `[]` | 非空时仅这些 HTTP 状态码触发换号（如 `[429,500,502,503,504]`）；空 = 按错误分类换号 |
 | `upstream.keepalive_interval` | `0` | 入站 SSE 主动心跳间隔（如 `15s`）；上游静默时写 `: keepalive` 注释帧。`0` = 关闭 |
-| `upstream.header_timeout_seconds` | `1200` | 聊天 SSE 首字节前上限（秒，对齐官方客户端）；`0` = 默认 1200。`upstream.model_timeouts` 优先 |
-| `upstream.idle_timeout_seconds` | `1200` | 聊天 SSE 流中空闲上限（秒，对齐官方客户端）；活跃吐数据会续命；`0` = 默认 1200。`upstream.model_timeouts` 优先 |
+| `upstream.header_timeout_seconds` | `120` | 聊天 SSE 首字节前上限（秒）；`0` = 默认 120。`upstream.model_timeouts` 优先 |
+| `upstream.idle_timeout_seconds` | `300` | 聊天 SSE 流中空闲上限（秒）；活跃吐数据会续命；`0` = 默认 300。`upstream.model_timeouts` 优先 |
 | `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `cn.chat_base` | 空 | 国内版 upstream chat base 覆盖（如指向自建/自选入口）。空 = 默认 `https://www.workbuddy.cn`，并在首 token 前按 `408/502/503/504` 或传输错误回落 `copilot.tencent.com`、`wb.tencentbuddy.com`；**非空时只用该值、不回落**（与 `global.chat_base` 同语义）。改后需重启 |

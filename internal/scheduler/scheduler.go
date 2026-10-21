@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -31,7 +32,7 @@ type Config struct {
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
-	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 计数窗口）
+	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 CST 计数窗口，按 CST 排程）
 	GrowthHours    []int // 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，
 	// 01:00 自动扫描+执行；避开零点整防解锁竞态）
 
@@ -72,6 +73,9 @@ type Config struct {
 	// 「已达标未领」的成长任务奖励）。同样由 panel 在调度器之后用 SetTaskSweepHook
 	// 挂载；nil 时到点跳过。ctx 用于「取消后不再派发新的逐号请求」。
 	TaskSweepHook func(ctx context.Context)
+
+	// RunStampFile 启动补跑去重记录的落盘路径（空 = 不持久化，旧行为）。
+	RunStampFile string
 }
 
 // Scheduler 调度器。
@@ -273,12 +277,25 @@ func poke(ch chan struct{}) {
 	}
 }
 
-// nextFire 返回 now 之后最近的一个整点触发时间；hours 为本地小时（0-23）。
+// nextFire 返回 now 之后最近的一个整点触发时间；hours 按宿主本地时区解释。
 func nextFire(now time.Time, hours []int) time.Time {
+	return nextFireIn(now, hours, nil)
+}
+
+// nextFireIn 返回 now 之后最近的一个整点触发时间；loc 为空时按 now 的时区解释，
+// 非空时 hours 按 loc（例如 CST）解释。仅黑猫任务需要固定 CST：上游窗口按 CST，
+// 其他任务保留操作者本地时钟（含 DST 语义）。
+func nextFireIn(now time.Time, hours []int, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = now.Location()
+	}
+
+	localNow := now.In(loc)
+
 	var earliest time.Time
 
 	for _, hour := range hours {
-		t := slotOn(now, hour)
+		t := slotOn(localNow, hour)
 		if !t.After(now) {
 			// 按墙钟日重算次日同一小时，而不是 Add(24h)：夏令时切换日 24h
 			// 不等于一个日历日，Add 会把 09:00 推到 08:00（回拨日）或
@@ -286,8 +303,8 @@ func nextFire(now time.Time, hours []int) time.Time {
 			// 次日日期用中午锚点推进：now 自身可能落在被拨快抹掉的墙钟时刻里，
 			// AddDate 会被 time.Date 归一化回前一日（America/Santiago 的
 			// 00:xx）。time.Date 对日溢出自动进位（月末→下月 1 号）。
-			y, m, d := now.Date()
-			t = slotOn(time.Date(y, m, d+1, 12, 0, 0, 0, now.Location()), hour)
+			y, m, d := localNow.Date()
+			t = slotOn(time.Date(y, m, d+1, 12, 0, 0, 0, loc), hour)
 		}
 
 		if earliest.IsZero() || t.Before(earliest) {
@@ -385,13 +402,15 @@ func (s *Scheduler) candidateSlots(now time.Time) []wakeSlot {
 		hours    []int
 		kind     taskKind
 		disabled bool
+		loc      *time.Location
 	}{
-		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled},
-		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled},
-		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled},
-		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled},
-		{s.cfg.BlackcatHours, taskBlackcat, s.cfg.BlackcatDisabled},
-		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled},
+		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled, nil},
+		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled, nil},
+		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled, nil},
+		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled, nil},
+		// 夜猫子窗口固定 CST：按宿主本地小时排程会让非 UTC+8 主机落在窗口外。
+		{s.cfg.BlackcatHours, taskBlackcat, s.cfg.BlackcatDisabled, cst.Loc},
+		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled, nil},
 	}
 	s.schedMu.Unlock()
 
@@ -402,7 +421,7 @@ func (s *Scheduler) candidateSlots(now time.Time) []wakeSlot {
 			continue
 		}
 
-		slots = append(slots, wakeSlot{nextFire(now, sp.hours), sp.kind})
+		slots = append(slots, wakeSlot{nextFireIn(now, sp.hours, sp.loc), sp.kind})
 	}
 
 	return slots
@@ -522,9 +541,60 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 	}
 }
 
+// startupCatchup 启动补跑：进程停机跨过当天时点后，迟到唤醒补跑救不了
+// （它只管进程活着时 timer 被睡眠冻结）。这里补一轮，按天记录，重启不重复打上游。
+func (s *Scheduler) startupCatchup(ctx context.Context) bool {
+	// 补跑期间可能跨过后续时点：只算一次会让刚跨过的时点被首轮 nextWake 推到
+	// 明天而漏跑。每轮重新取墙钟判定，只补「本轮新出现」的任务族（attempted 去重，
+	// 避免 RunStampFile 未配置时重复打上游）。
+	attempted := make(map[taskKind]bool)
+
+	for {
+		// 捕获本轮时刻并全程复用：runBatch 可能长时间运行甚至跨过午夜，标记必须
+		// 落在「被补跑的那一天」，不能取收尾时的墙钟（否则会把次日误标为已补跑）。
+		now := time.Now()
+
+		pending := s.missedToday(now)
+
+		fresh := make([]taskKind, 0, len(pending))
+		for _, kind := range pending {
+			if !attempted[kind] {
+				fresh = append(fresh, kind)
+			}
+		}
+
+		if len(fresh) == 0 {
+			return true
+		}
+
+		log.Printf("启动补跑：%v（今天的时点已过）", fresh)
+
+		if !sleepCtx(ctx, wakeupGraceDelay) {
+			return false
+		}
+
+		s.runBatch(ctx, fresh)
+		// 停机取消时各任务提前收尾，不能记为「今天已补跑」——否则本次进程重启后
+		// 同一天的补跑会被永久跳过。留空标记让下次启动重试。
+		if ctx.Err() != nil {
+			return false
+		}
+
+		s.markRan(fresh, now)
+
+		for _, kind := range fresh {
+			attempted[kind] = true
+		}
+	}
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
+	if !s.startupCatchup(ctx) {
+		return
+	}
+
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -873,7 +943,7 @@ func (s *Scheduler) keepaliveAll() (total, success, failure int) {
 
 		s.cfg.Pool.ClearSessionDead(status.UID) // 刷新成功清误判计数，失败不该累计
 
-		if err := account.SaveAtomic(); err != nil {
+		if err := account.SaveAtomicRetry(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(status.UID, status.Nickname), err)
 		}
 

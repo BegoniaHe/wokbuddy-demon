@@ -444,12 +444,12 @@ export function ConfigView() {
             </Field>
             <Field>
               <FieldLabel>聊天首字节超时</FieldLabel>
-              {num('header_timeout_seconds', { min: 1, placeholder: '1200' })}
+              {num('header_timeout_seconds', { min: 1, placeholder: '120' })}
               <FieldDescription>需重启</FieldDescription>
             </Field>
             <Field>
               <FieldLabel>流空闲超时</FieldLabel>
-              {num('idle_timeout_seconds', { min: 1, placeholder: '1200' })}
+              {num('idle_timeout_seconds', { min: 1, placeholder: '300' })}
               <FieldDescription>需重启</FieldDescription>
             </Field>
           </div>

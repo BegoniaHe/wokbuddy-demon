@@ -168,3 +168,56 @@ func marshalOr(obj map[string]any, fallback []byte) []byte {
 
 	return out
 }
+
+// EnsureSystemFirst 保证出站 messages 的第一条是 system。
+//
+// 上游对部分账号灰度启用请求形态校验：messages[0] 不是 system 即 400 11-128
+// "first message is not system prompt"。官方客户端每次请求都带开头 system；
+// passthrough 模式会把「只带 user」的请求原样转发，属于官方不会发出的 wire 形态。
+//
+// 只补角色形态，不动任何既有消息：首条已是 system 原样返回；首条 developer
+// 就地改成 system（内容逐字保留，下游 normalizeRoles 同口径）；首条是
+// user/assistant/tool/非对象时在最前插入 fallback（空则用 Degraded）。
+// body 不可解析 / 无 messages / messages 为 [] 时原样返回，不替上游编造对话。
+func EnsureSystemFirst(body []byte, fallback string) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return body
+	}
+
+	if first, ok := msgs[0].(map[string]any); ok {
+		role, _ := first["role"].(string)
+		if role == "system" {
+			return body
+		}
+
+		if role == "developer" {
+			first["role"] = "system"
+			return marshalOr(obj, body)
+		}
+	}
+
+	if fallback == "" {
+		fallback = Degraded
+	}
+
+	if fallback == "" {
+		return body
+	}
+
+	rewritten := make([]any, 0, len(msgs)+1)
+	rewritten = append(rewritten, systemMsg(fallback))
+	rewritten = append(rewritten, msgs...)
+	obj["messages"] = rewritten
+
+	return marshalOr(obj, body)
+}

@@ -418,11 +418,18 @@ func isReasoningPartType(partType string) bool {
 	return false
 }
 
-// ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
-// 首条消息非 system 时在 messages 最前补一条 fallback system（"You are a helpful assistant."）。
-// 仅对 global 请求调用（CN 现状不动；即使首条就是 system 也不重复注入）。
-// body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不在这里二次错误化）。
-func ensureConsoleSystem(body []byte) []byte {
+// LeadingSystemFallback 官方分发包里首条 system 的兜底文案。补的必须是官方
+// 存在的字节，不能用自造句——自造句本身是渠道指纹。handler 侧补齐开头角色时
+// 也复用同一常量，避免两处兜底文案漂移。
+const LeadingSystemFallback = "You are CodeBuddy Code.\n"
+
+// ensureLeadingSystem 首条消息非 system 时在 messages 最前补一条官方 fallback system。
+//
+// 上游对部分账号灰度启用形态校验：messages[0] 不是 system 即 400 11-128
+// "first message is not system prompt"。补的必须是官方分发包存在的字节
+// （LeadingSystemFallback），不能用自造句——自造句本身是渠道指纹。
+// 两个 realm 都套用；首条已是 system 时不重复注入。body 不可解析时原样返回。
+func ensureLeadingSystem(body []byte) []byte {
 	if len(body) == 0 {
 		return body
 	}
@@ -444,7 +451,7 @@ func ensureConsoleSystem(body []byte) []byte {
 		}
 	}
 
-	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
+	obj["messages"] = append([]any{map[string]any{"role": "system", "content": LeadingSystemFallback}}, msgs...)
 
 	out, err := json.Marshal(obj)
 	if err != nil {

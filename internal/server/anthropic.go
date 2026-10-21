@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -72,12 +73,14 @@ const (
 
 // anthropicMessagesHandler 是 /v1/messages 的入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
-	in, out, ok := newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
+	input, out, ok := newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
 
-	h.serveChat(r, &in, out)
+	input.clientIP = httpauth.ClientIP(r, h.cfg.TrustedProxies)
+
+	h.serveChat(r, &input, out)
 }
 
 // setAnthropicRequestID 设置 Anthropic SDK 读取的 request-id 响应头并返回该值。
@@ -316,7 +319,6 @@ func newAnthropicChatInput(
 		body:           converted.openAI,
 		stream:         converted.stream,
 		model:          converted.model,
-		clientIP:       upstream.ExtractClientIP(r),
 		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
 		traceID:        r.Header.Get("X-Trace-Id"),
 		inboundSession: inboundSessionMetaFrom(r),

@@ -38,9 +38,6 @@ var defaultEvents = []string{
 
 var errWebhookURLHTTPS = errors.New("webhook_url 必须是 http(s) 绝对地址")
 
-// DefaultEvents 返回默认订阅的事件集合。
-func DefaultEvents() []string { return append([]string(nil), defaultEvents...) }
-
 // ValidEvent 报告事件名是否受支持（配置校验用）。
 func ValidEvent(name string) bool {
 	switch name {

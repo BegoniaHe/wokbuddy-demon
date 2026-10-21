@@ -8,6 +8,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 )
 
 func (p *Pool) SetCredits(uid string, credits, total int64) {
@@ -66,7 +68,7 @@ func (p *Pool) NoteCheckinDone(uid string) {
 	defer p.mu.Unlock()
 
 	if e, ok := p.byUID[uid]; ok {
-		day := p.now().Format("2006-01-02")
+		day := cst.Day(p.now())
 		if e.lastCheckinDay != day {
 			e.lastCheckinDay = day
 
@@ -227,18 +229,16 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	}
 }
 
-// CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
-// 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
+// CooldownSoftForModel 429 的软冷却入口（issue #31）：有模型维度且带上游重置
+// 时间时只冷该模型，不冷整号。
 //
-//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
-//     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
-//   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
-//     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
-//     冷却越堆越厚）。不记录模型（不豁免）。
-//
-// 与旧实现的差异：有上游重置时间时绝对不做指数堆加；无重置时间时，「冷却中兜底
-// 探测再 429」不再 softStreak++ 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
+//   - resetAt 非零且 model 非空 → modelCooldowns[model].Until = min(resetAt,
+//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不做指数堆加，
+//     切模型即可用。
+//   - resetAt 零值（无时间文案）→ 无法确认是模型级还是套餐额度耗尽，保守按账号级
+//     有界退避（同 CooldownSoftRate）。
+//   - model 为空（无模型维度的防御路径）→ 同样退回账号级，绝不在 modelCooldowns
+//     写空键。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -250,35 +250,107 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 
 	now := p.now()
 
-	if !resetAt.IsZero() {
-		// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
-		if entry2.modelCooldowns == nil {
-			entry2.modelCooldowns = map[string]modelCooldown{}
-		}
+	if model == "" || resetAt.IsZero() {
+		p.cooldownSoftRateLocked(entry2, now, base, resetAt, reason)
+		p.dirty.Store(true)
 
-		entry2.modelCooldowns[model] = modelCooldown{
-			Until:   p.cappedSoftUntilLocked(now, resetAt),
-			ResetAt: resetAt,
-			Reason:  reason,
-		}
-		if p.onModelRateLimit != nil {
-			p.onModelRateLimit(uid, model, entry2.a.Realm(), resetAt)
-		}
-	} else {
-		// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-		// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
-		if entry2.coolKind != CoolSoft || !now.Before(entry2.until) {
-			d := p.jitterSoftDurationLocked(base, entry2.softStreak+1)
-			entry2.softStreak++
-			entry2.until = now.Add(d)
-		}
+		return
+	}
 
-		entry2.coolKind = CoolSoft
-		entry2.reason = reason
-		clearRoutingModelCooldownsLocked(entry2)
+	// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+	if entry2.modelCooldowns == nil {
+		entry2.modelCooldowns = map[string]modelCooldown{}
+	}
+
+	entry2.modelCooldowns[model] = modelCooldown{
+		Until:   p.cappedSoftUntilLocked(now, resetAt),
+		ResetAt: resetAt,
+		Reason:  reason,
+	}
+	if p.onModelRateLimit != nil {
+		p.onModelRateLimit(uid, model, entry2.a.Realm(), resetAt)
 	}
 
 	p.dirty.Store(true)
+}
+
+// modelBusyBase/modelBusyMax 14003「模型繁忙」独立短窗口：10s 起、1m 封顶。
+const (
+	modelBusyBase = 10 * time.Second
+	modelBusyMax  = time.Minute
+)
+
+// CooldownModelBusy 把 (账号, 模型) 停一个短窗口（14003 模型繁忙专用）。
+// 只写模型级冷却，不动账号级 until；已有更晚的冷却时保留更晚者。
+func (p *Pool) CooldownModelBusy(uid, model, reason string) {
+	if uid == "" || model == "" {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entry2, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+
+	now := p.now()
+
+	old, exists := entry2.modelCooldowns[model]
+	if !busyWindowAllowed(&old, exists, now) {
+		return
+	}
+
+	hits, until := busyWindow(&old, exists, now)
+
+	if entry2.modelCooldowns == nil {
+		entry2.modelCooldowns = map[string]modelCooldown{}
+	}
+
+	entry2.modelCooldowns[model] = modelCooldown{Until: until, Reason: reason, Hits: hits + 1}
+
+	p.dirty.Store(true)
+}
+
+// busyWindowAllowed 已有更权威的模型冷却（6004/11136/11141）时不降级成短窗。
+// AuditOnly 台账不参与路由，不构成「更权威」；否则审计项会挡住真正的 14003 短窗。
+func busyWindowAllowed(old *modelCooldown, exists bool, now time.Time) bool {
+	if !exists || old.AuditOnly {
+		return true
+	}
+
+	return strings.HasPrefix(old.Reason, "14003") || !old.Until.After(now)
+}
+
+// busyWindow 返回 14003 的累计命中次数与本次冷却截止（10s 起、1m 封顶）。
+// AuditOnly 台账的 Hits/Until 不属于真实冷却，不得延长本次短窗。
+func busyWindow(old *modelCooldown, exists bool, now time.Time) (int, time.Time) {
+	if exists && old.AuditOnly {
+		exists = false
+	}
+
+	hits := 0
+	if exists && strings.HasPrefix(old.Reason, "14003") {
+		hits = old.Hits
+	}
+
+	// hits 是本次之前的命中次数：第 1 次 10s、第 2 次 20s、第 3 次 40s，封顶 1m。
+	duration := modelBusyBase
+	for i := 0; i < hits && duration < modelBusyMax; i++ {
+		duration *= 2
+	}
+
+	if duration > modelBusyMax {
+		duration = modelBusyMax
+	}
+
+	until := now.Add(duration)
+	if exists && old.Until.After(until) {
+		until = old.Until
+	}
+
+	return hits, until
 }
 
 // RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
@@ -404,10 +476,10 @@ func modelUnavailableReason(reason string) bool {
 		strings.HasPrefix(reason, "11141")
 }
 
-// modelRateLimitReason 判定模型级冷却原因是否来自 6004 模型级限流。与
-// modelUnavailableReason 互斥：前者是"等等再试"，后者是"换模型才有用"。
+// modelRateLimitReason 判定模型级冷却原因是否来自模型级限流/繁忙（6004/14003）。
+// 与 modelUnavailableReason 互斥：前者是"等等再试"，后者是"换模型才有用"。
 func modelRateLimitReason(reason string) bool {
-	return strings.HasPrefix(reason, "6004")
+	return strings.HasPrefix(reason, "6004") || strings.HasPrefix(reason, "14003")
 }
 
 // BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。handler 在
@@ -595,21 +667,26 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	defer p.mu.Unlock()
 
 	if entry2, ok := p.byUID[uid]; ok {
-		now := p.now()
-		if !resetAt.IsZero() {
-			entry2.until = p.cappedSoftUntilLocked(now, resetAt)
-		} else if entry2.coolKind != CoolSoft || !now.Before(entry2.until) {
-			// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
-			d := p.jitterSoftDurationLocked(base, entry2.softStreak+1)
-			entry2.softStreak++
-			entry2.until = now.Add(d)
-		}
-
-		entry2.coolKind = CoolSoft
-		entry2.reason = reason
-		clearRoutingModelCooldownsLocked(entry2) // 账号级软冷却：清路由豁免，保留审计台账
+		p.cooldownSoftRateLocked(entry2, p.now(), base, resetAt, reason)
 		p.dirty.Store(true)
 	}
+}
+
+// cooldownSoftRateLocked 账号级软冷却本体（语义见 CooldownSoftRate）。
+// 调用方必须已持有 p.mu。
+func (p *Pool) cooldownSoftRateLocked(entry2 *entry, now time.Time, base time.Duration, resetAt time.Time, reason string) {
+	if !resetAt.IsZero() {
+		entry2.until = p.cappedSoftUntilLocked(now, resetAt)
+	} else if entry2.coolKind != CoolSoft || !now.Before(entry2.until) {
+		// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
+		d := p.jitterSoftDurationLocked(base, entry2.softStreak+1)
+		entry2.softStreak++
+		entry2.until = now.Add(d)
+	}
+
+	entry2.coolKind = CoolSoft
+	entry2.reason = reason
+	clearRoutingModelCooldownsLocked(entry2) // 账号级软冷却：清路由豁免，保留审计台账
 }
 
 // cappedSoftUntilLocked 把上游重置墙钟截断到 softRateMax（now+softRateMax 与 resetAt
@@ -696,24 +773,25 @@ func (p *Pool) recordBreakerFailureLocked(entry2 *entry) {
 	entry2.breakerUntil = p.now().Add(duration)
 }
 
-// CooldownUntilTomorrow4AM 冷却到下一个 04:00（本地时区）。
+// CooldownUntilTomorrow4AM 冷却到下一个 04:00（CST，上游自然日）。
 // 用于 ErrHardCredit 场景：积分耗尽账号等签到任务（09:00/21:00）恢复。
 func (p *Pool) CooldownUntilTomorrow4AM(uid, reason string) {
 	now := p.now()
 	p.Cooldown(uid, CoolHard, nextDay4AM(now).Sub(now), reason)
 }
 
-// nextDay4AM 返回 now 之后最近的一个 04:00（与 now 同一时区）。
+// nextDay4AM 返回 now 之后最近的一个 04:00（固定 CST，上游自然日）。
 // now 在当天 04:00 之前（凌晨 00:00~04:00）时返回当天 04:00——此时签到尚未执行，
 // 该窗内触发的硬冷却等当天签到即可恢复；返回次日会白冷约一天。
 // 04:00 整及之后返回次日 04:00。
 // time.Date 对日溢出自动进位（月末→下月 1 号、年末→下年 1 号），天然覆盖跨日/跨月/跨年。
 func nextDay4AM(now time.Time) time.Time {
-	if now.Hour() < 4 {
-		return time.Date(now.Year(), now.Month(), now.Day(), 4, 0, 0, 0, now.Location())
+	local := now.In(cst.Loc)
+	if local.Hour() < 4 {
+		return time.Date(local.Year(), local.Month(), local.Day(), 4, 0, 0, 0, cst.Loc)
 	}
 
-	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
+	return time.Date(local.Year(), local.Month(), local.Day()+1, 4, 0, 0, 0, cst.Loc)
 }
 
 // ReenableIfCredits 签到/余额刷新后解冻：仅当 remain > 0 且账号非禁用时，解冻

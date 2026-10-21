@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
@@ -699,7 +700,7 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		Paused:                   entry2.paused,
 		SuccessCount:             entry2.successCount,
 		ErrTotal:                 entry2.errTotal,
-		CheckinDone:              entry2.lastCheckinDay == now.Format("2006-01-02"),
+		CheckinDone:              entry2.lastCheckinDay == cst.Day(now),
 		TokenUsage:               entry2.tokenUsage,
 		LastSuccessTime:          entry2.lastSuccess,
 		LastErrTime:              entry2.lastErr,

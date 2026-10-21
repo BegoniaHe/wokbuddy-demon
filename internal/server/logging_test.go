@@ -18,34 +18,6 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
-// captureStdout 重定向 os.Stdout（连同 chatLogOut，见 SetChatLogOutput 的注入点）
-// 并捕获 fn 期间的全部输出。
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-
-	old := os.Stdout
-	oldOut := currentChatLogOutput()
-
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	os.Stdout = w
-	SetChatLogOutput(w)
-
-	fn()
-
-	os.Stdout = old
-
-	SetChatLogOutput(oldOut)
-
-	_ = w.Close()
-	raw, _ := io.ReadAll(r)
-
-	return string(raw)
-}
-
 // TestSetChatLogOutputAcceptsDifferentWriterTypes：输出目标会从 *os.File
 // （默认 stdout）切换为 io.MultiWriter（生产 main 注入面板镜像）。atomic.Value
 // 在具体类型不一致时 Store 会 panic，故用 atomic.Pointer[io.Writer]。
@@ -64,17 +36,6 @@ func TestSetChatLogOutputAcceptsDifferentWriterTypes(t *testing.T) {
 	if got := currentChatLogOutput(); got != multi {
 		t.Fatalf("currentChatLogOutput() = %T, want injected MultiWriter", got)
 	}
-}
-
-// withChatLog 临时开启聊天表格日志（TestMain 默认关闭），测试结束后恢复。
-// 仅供断言表格行输出的用例使用。
-func withChatLog(t *testing.T) {
-	t.Helper()
-
-	old := chatLogEnabled.Load()
-	chatLogEnabled.Store(true)
-
-	t.Cleanup(func() { chatLogEnabled.Store(old) })
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {

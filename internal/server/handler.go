@@ -255,28 +255,7 @@ func NewHandler(cfg *Config) *Handler {
 	// 只认默认密钥（命名密钥分发给客户端，不应获得账号池可见性）。
 	// withRecovery 必须包在最外层：内层 withClientAuth 的命名密钥 release 依赖
 	// defer 正常执行，recover 放在鉴权之内会让 panic 跳过租约释放（issue #146）。
-	handler.mux.HandleFunc("POST /v1/chat/completions", handler.withRecovery(handler.withClientAuth(handler.chatCompletions)))
-	handler.mux.HandleFunc("POST /v1/responses", handler.withRecovery(handler.withClientAuth(handler.responsesHandler)))
-	handler.mux.HandleFunc("POST /v1/messages", handler.withRecovery(handler.withClientAuth(handler.anthropicMessagesHandler)))
-	handler.registerSearchRoute()
-	handler.mux.HandleFunc(
-		"POST /v1/messages/count_tokens",
-		handler.withRecovery(handler.withClientAuth(handler.anthropicCountTokensHandler)),
-	)
-	handler.mux.HandleFunc("GET /v1/models", handler.withRecovery(handler.withClientAuth(handler.models)))
-	handler.mux.HandleFunc("GET /v1/models/{model}", handler.withRecovery(handler.withClientAuth(handler.modelRetrieve)))
-	handler.registerGeminiRoutes()
-	handler.mux.HandleFunc("GET /status", handler.withRecovery(handler.withAuth(handler.status)))
-	handler.mux.HandleFunc("GET /healthz", handler.withRecovery(handler.healthz))
-	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
-	handler.mux.HandleFunc("GET /metrics", handler.withRecovery(handler.withAuth(handler.metricsHandler)))
-	// 运行时 profiling（issue #146）：与 /metrics 同口径走 withAuth，避免 goroutine
-	// 栈与调用细节在公网裸奔。pprof.Index 自行按路径分发 allocs/goroutine 等子 profile。
-	handler.mux.HandleFunc("/debug/pprof/", handler.withRecovery(handler.withAuth(pprof.Index)))
-	handler.mux.HandleFunc("/debug/pprof/cmdline", handler.withRecovery(handler.withAuth(pprof.Cmdline)))
-	handler.mux.HandleFunc("/debug/pprof/profile", handler.withRecovery(handler.withAuth(pprof.Profile)))
-	handler.mux.HandleFunc("/debug/pprof/symbol", handler.withRecovery(handler.withAuth(pprof.Symbol)))
-	handler.mux.HandleFunc("/debug/pprof/trace", handler.withRecovery(handler.withAuth(pprof.Trace)))
+	handler.registerRoutes()
 
 	if cfg.Panel != nil {
 		handler.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -336,6 +315,50 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// registerRoutes 注册协议面、运维面与调试路由。放在独立方法里，避免
+// NewHandler 因路由增长超过 funlen。
+func (h *Handler) registerRoutes() {
+	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
+	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
+	h.mux.HandleFunc("POST /v1/messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
+	// 部分 Anthropic 客户端把 base URL 配成 .../v1，再拼 /messages；保留同义别名。
+	h.mux.HandleFunc("POST /messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
+	h.mux.HandleFunc(
+		"POST /v1/messages/count_tokens",
+		h.withRecovery(h.withClientAuth(h.anthropicCountTokensHandler)),
+	)
+	h.mux.HandleFunc(
+		"POST /messages/count_tokens",
+		h.withRecovery(h.withClientAuth(h.anthropicCountTokensHandler)),
+	)
+	h.registerSearchRoute()
+	// Codex 在 supports_websockets 时先探 GET /v1/responses 升级 WS；本网关不做
+	// 连接内 previous_response_id 复用，回 426 让它立刻回落 HTTPS POST。
+	// 与 POST /v1/responses 同口径鉴权：命名密钥客户端也必须拿到 426 才能回落。
+	h.mux.HandleFunc("GET /v1/responses", h.withRecovery(h.withClientAuth(h.responsesWebsocketUnsupported)))
+	h.mux.HandleFunc("GET /v1/models", h.withRecovery(h.withClientAuth(h.models)))
+	h.mux.HandleFunc("GET /v1/models/{model}", h.withRecovery(h.withClientAuth(h.modelRetrieve)))
+	h.registerGeminiRoutes()
+	h.mux.HandleFunc("GET /status", h.withRecovery(h.withAuth(h.status)))
+	h.mux.HandleFunc("GET /healthz", h.withRecovery(h.healthz))
+	// Prometheus 指标端点（issue #13）：鉴权与主服务同口径（withAuth），空 api_key 即放行。
+	h.mux.HandleFunc("GET /metrics", h.withRecovery(h.withAuth(h.metricsHandler)))
+	// 运行时 profiling（issue #146）：与 /metrics 同口径走 withAuth，避免 goroutine
+	// 栈与调用细节在公网裸奔。pprof.Index 自行按路径分发 allocs/goroutine 等子 profile。
+	h.mux.HandleFunc("/debug/pprof/", h.withRecovery(h.withAuth(pprof.Index)))
+	h.mux.HandleFunc("/debug/pprof/cmdline", h.withRecovery(h.withAuth(pprof.Cmdline)))
+	h.mux.HandleFunc("/debug/pprof/profile", h.withRecovery(h.withAuth(pprof.Profile)))
+	h.mux.HandleFunc("/debug/pprof/symbol", h.withRecovery(h.withAuth(pprof.Symbol)))
+	h.mux.HandleFunc("/debug/pprof/trace", h.withRecovery(h.withAuth(pprof.Trace)))
+}
+
+// responsesWebsocketUnsupported 明确告知客户端 WS transport 不可用，回 426。
+func (h *Handler) responsesWebsocketUnsupported(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Upgrade", "websocket")
+	writeOpenAIError(w, http.StatusUpgradeRequired, "websocket_unsupported",
+		"websocket transport unsupported; use POST /v1/responses")
+}
+
 // handleCORS 处理 `/v1/*` 的跨域头与 OPTIONS 预检。返回 true 表示已写出
 // 预检响应；普通请求只附加允许头后继续。管理面与未配置 CORS 时完全跳过。
 func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
@@ -374,11 +397,15 @@ func (h *Handler) handleCORS(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// isV1Path 仅匹配网关 API 面（/v1 及其子路径，含 Gemini 的 /v1beta、/v1alpha），
-// 管理面不参与 CORS。
+// isV1Path 仅匹配网关 API 面（/v1 及其子路径，含 Gemini 的 /v1beta、/v1alpha
+// 与无前缀的 Anthropic Messages 兼容别名），管理面不参与 CORS。
 func isV1Path(path string) bool {
-	return path == "/v1" || strings.HasPrefix(path, "/v1/") ||
-		strings.HasPrefix(path, "/v1beta/") || strings.HasPrefix(path, "/v1alpha/")
+	if path == "/v1" || strings.HasPrefix(path, "/v1/") ||
+		strings.HasPrefix(path, "/v1beta/") || strings.HasPrefix(path, "/v1alpha/") {
+		return true
+	}
+
+	return isAnthropicMessagesPath(path)
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -716,9 +743,21 @@ func requestsAnthropicModels(r *http.Request) bool {
 	return strings.TrimSpace(r.Header.Get("Anthropic-Version")) != ""
 }
 
+// isAnthropicMessagesPath 报告路径是否属于 Anthropic Messages 协议面
+// （含 /v1 前缀与无前缀的兼容别名）。
+func isAnthropicMessagesPath(path string) bool {
+	if strings.HasPrefix(path, "/v1/messages") {
+		return true
+	}
+
+	path = strings.TrimSuffix(path, "/")
+
+	return path == "/messages" || path == "/messages/count_tokens"
+}
+
 // wantsAnthropicErrorBody 报告入站请求是否按 Anthropic 协议编码错误体。
 func wantsAnthropicErrorBody(r *http.Request) bool {
-	return strings.HasPrefix(r.URL.Path, "/v1/messages") || requestsAnthropicModels(r)
+	return isAnthropicMessagesPath(r.URL.Path) || requestsAnthropicModels(r)
 }
 
 // requestsGemini 判断请求是否走 Gemini GenerateContent 协议面（含 /v1 版本）。
@@ -1239,12 +1278,14 @@ const (
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 入站适配：解析 HTTP 请求为结构化输入，并构造输出端口（唯一的 net/http 边界）。
-	in, out, ok := newChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
+	input, out, ok := newChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
+	// passthrough_ip 只信 trusted_proxies 内的转发头；不可信对端的 XFF 不得透传上游。
+	input.clientIP = httpauth.ClientIP(r, h.cfg.TrustedProxies)
 
-	h.serveChat(r, &in, out)
+	h.serveChat(r, &input, out)
 }
 
 // serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
@@ -1542,6 +1583,11 @@ func (f *chatFlow) applyPromptRewrite() {
 	case f.canDegrade() && f.h.degrade.Active():
 		f.body = prompt.Rewrite(f.body, prompt.Degraded)
 		f.degradedApplied = true
+	case f.h.cfg.PromptMode == "passthrough":
+		// 上游形态校验要求首条是 system；passthrough 不替换客户端提示词，
+		// 但必须补齐开头角色。用官方分发包的兜底文案，不能自造句（自造句本身是
+		// 渠道指纹）；与 upstream.ensureLeadingSystem 共用同一常量。
+		f.body = prompt.EnsureSystemFirst(f.body, upstream.LeadingSystemFallback)
 	}
 }
 
@@ -1588,6 +1634,12 @@ func (f *chatFlow) buildChatMeta() {
 	} else {
 		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
 		f.chatMeta.ConversationRequestID = session.TurnRequestID("")
+	}
+
+	if f.chatMeta.ConversationID == "" {
+		// 上游渠道校验要求 X-Conversation-ID 恒在；客户端没给会话 ID 时用轮级
+		// 聚合键兜底。只进出站头，不覆盖 ConversationID（prompt cache key 的源）。
+		f.chatMeta.ConversationHeaderID = f.chatMeta.ConversationRequestID
 	}
 
 	f.chatMeta.TraceID = f.traceID
@@ -2091,7 +2143,8 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 		return true, false
 	}
 
-	if err := f.h.cfg.Upstream.RefreshToken(acct); err != nil {
+	// RefreshTokenIfNeeded 内部会再双检一次：等锁期间别的请求已刷好则直接复用。
+	if err := f.h.cfg.Upstream.RefreshTokenIfNeeded(acct, f.h.cfg.RefreshSkew); err != nil {
 		f.lastErr = err
 		f.penalizeRefreshFailure(acct, err)
 		f.fail(acct.UID)
@@ -2103,7 +2156,7 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 		return false, false
 	}
 
-	if err := acct.SaveAtomic(); err != nil {
+	if err := acct.SaveAtomicRetry(); err != nil {
 		// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露。
 		log.Printf("ERR: [server] chat refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.NicknameValue()), err)
 	}
@@ -2154,7 +2207,7 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 
 		err := f.h.cfg.Upstream.RefreshToken(acct)
 		if err == nil {
-			if saveErr := acct.SaveAtomic(); saveErr != nil {
+			if saveErr := acct.SaveAtomicRetry(); saveErr != nil {
 				log.Printf("ERR: [server] chat 401 refresh acct=%s: save auth failed: %v", logfmt.Label(acct.UID, acct.NicknameValue()), saveErr)
 			}
 
@@ -2342,7 +2395,8 @@ func (f *chatFlow) retryModelNotFoundCrossRealm(
 // 新增网关 POST 接口时只改这一处）。
 func (h *Handler) tracedPath(r *http.Request) bool {
 	switch r.URL.Path {
-	case "/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/search/messages":
+	case "/v1/chat/completions", "/v1/messages", "/messages",
+		"/v1/responses", "/v1/search/messages":
 		return true
 	}
 
@@ -3279,9 +3333,10 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //
 // 以下分类各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
-//   - ErrSoftRate → 优先对齐上游重置墙钟（带「将在 … 重置」时 6004 走模型级豁免、
-//     非 6004 走账号级，均不指数堆加）；无重置时间才走有界退避。冷却时长优先采信
-//     Retry-After 头（uerr.RetryAfter，body 文案墙钟之外的头形态来源）。
+//   - ErrSoftRate → 优先对齐上游重置墙钟（6004 带「将在 … 重置」走模型级豁免，
+//     6004 无重置走账号级保守退避，14003 走模型级短窗；均不指数堆加）。无重置
+//     时间才走有界退避。冷却时长优先采信 Retry-After 头（uerr.RetryAfter，body
+//     文案墙钟之外的头形态来源）。
 //   - ErrWafBlock → 账号级软冷却：**不 Disable**——WAF 403 是 IP/指纹维频控信号，
 //     罚过即走、到期自愈。时长优先 Retry-After 头；缺失按 wafCooldownBase(60s)
 //     起 · softStreak 指数、封顶 soft_rate_max 的既有 CooldownSoftRate 有界退避。
@@ -3355,46 +3410,59 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, real
 }
 
 // applySoftRatePolicy 处置 429/限流文案：优先对齐上游重置墙钟，其次 Retry-After
-// 头，最后账号级有界退避。6004 走模型级豁免，非 6004 走账号级。
+// 头，最后账号级有界退避。6004 带重置/14003 走模型级；6004 无重置走账号级。
 func (h *Handler) applySoftRatePolicy(uid, body, realm, model string, uerr *upstream.Error) {
 	// 统一对齐上游重置时间：只要 body 带「将在 … 重置」，无论业务 code 是
-	// 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
-	//   - 模型级（6004）→ CooldownSoftForModel：写 modelCooldowns[model]，切模型豁免。
-	//   - 账号级（非 6004）→ CooldownSoftRate：写账号级 until，不产生模型豁免。
+	// 6004/14003 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不指数堆加。
+	//   - 模型级（6004 带重置 / 14003）→ 只写 modelCooldowns[model]，切模型豁免。
+	//   - 6004 无重置 → 账号级保守退避，并记录模型审计。
+	//   - 账号级（其余 429）→ CooldownSoftRate：写账号级 until。
 	modelRateLimited := upstream.IsModelRateLimit(body)
+
+	// 14003 是模型后端瞬时繁忙：只停 (账号, 模型) 短窗口，不套账号级阶梯，
+	// 也不喂路由熔断（路由熔断是 11141/6004 的平台级信号）。
+	if upstream.IsModelBusy(body) {
+		h.cfg.Pool.CooldownModelBusy(uid, model, "14003 model busy")
+		return
+	}
+
 	if modelRateLimited {
 		h.cfg.Pool.NoteRouteFailure(realm, model)
 	}
 
-	if resetAt, ok := upstream.ParseRateReset(body); ok {
-		if modelRateLimited {
+	if modelRateLimited {
+		if resetAt, ok := upstream.ParseRateReset(body); ok {
 			h.cfg.Pool.CooldownSoftForModel(uid, h.softCooldown(), resetAt, model, "6004 model rate limit")
 			return
 		}
 
-		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
+		if uerr != nil && uerr.RetryAfter > 0 {
+			h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
+			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
 
+			return
+		}
+		// 无重置文案：6004 可能是套餐额度耗尽，保守按账号级退避；只记录模型审计。
+		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
+		h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
+
+		return
+	}
+
+	if resetAt, ok := upstream.ParseRateReset(body); ok {
+		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), resetAt, "429 rate limit")
 		return
 	}
 	// body 无重置文案但带 Retry-After 头 → 冷却到该时刻（不做指数堆加）。
 	// 头优先于「有界退避」，但低于 body 重置文案（文案是上游更权威的口径）。
 	if uerr != nil && uerr.RetryAfter > 0 {
 		h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Now().Add(uerr.RetryAfter), "429 rate limit (retry-after)")
-
-		if modelRateLimited {
-			h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
-		}
-
 		return
 	}
 	// 无重置时间 → 账号级有界退避（soft_rate 基数起、softStreak 翻倍、封顶
 	// soft_rate_max；已在冷却中的兜底探测不翻倍）。基数取 h.softCooldown()
 	// （热改优先），管理面板改 soft_rate 后立即生效。
 	h.cfg.Pool.CooldownSoftRate(uid, h.softCooldown(), time.Time{}, "429 rate limit")
-
-	if modelRateLimited {
-		h.cfg.Pool.RecordModelRateLimitAudit(uid, model, "6004 model rate limit (reset unknown)")
-	}
 }
 
 // applyWafPolicy WAF 403（无业务信封拦截形态）。软冷却复用 CooldownSoftRate 家族：

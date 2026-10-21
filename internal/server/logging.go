@@ -662,7 +662,7 @@ func (t *requestTrace) captureClientInfo(r *http.Request, trusted []*net.IPNet) 
 
 // clientIPForLog 提取用于日志展示的客户端 IP。
 //
-// 与 upstream.ExtractClientIP 的差别：后者只认代理头（X-Forwarded-For 首段 →
+// 与透传上游的口径不同：后者只认代理头（X-Forwarded-For 首段 →
 // X-Real-IP），因为它的用途是把客户端 IP **透传给上游**，回落到网关自身地址会
 // 污染上游风控判据。日志场景相反：只有 TCP 对端属于配置的可信反代网段时才采信
 // 转发头，否则一律用 RemoteAddr——否则任何客户端都能用伪造的 X-Forwarded-For

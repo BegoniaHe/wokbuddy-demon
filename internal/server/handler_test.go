@@ -19,6 +19,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/redisstore"
@@ -218,8 +219,8 @@ func assertHardCreditCooldown(t *testing.T, status4 pool.Status) {
 		t.Errorf("reason=%q", status4.Reason)
 	}
 
-	if status4.Until.Hour() != 4 {
-		t.Errorf("until hour=%d want 4 (next-day 04:00)", status4.Until.Hour())
+	if status4.Until.In(cst.Loc).Hour() != 4 {
+		t.Errorf("until hour(CST)=%d want 4 (next-day 04:00)", status4.Until.In(cst.Loc).Hour())
 	}
 	// 距次日 04:00 最长 28h（凌晨 00:00~04:00 间运行时 now→次日 04:00 跨度 > 24h，属正常）。
 	if d := time.Until(status4.Until); d <= 0 || d > 28*time.Hour {
@@ -1032,7 +1033,7 @@ func TestChat429Code14018UsesHardCreditCooldown(t *testing.T) {
 		t.Fatalf("14018 account should be cooling: %+v ok=%v", status, ok)
 	}
 
-	if status.Reason != "余额不足" || status.Until.Hour() != 4 {
+	if status.Reason != "余额不足" || status.Until.In(cst.Loc).Hour() != 4 {
 		t.Fatalf("14018 should use hard-credit cooldown, got reason=%q until=%v", status.Reason, status.Until)
 	}
 
@@ -1091,7 +1092,7 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 }
 
 // TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
-// （现状不变）。
+// （无法确认是模型级还是套餐额度耗尽，保守按账号级）。
 func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 	t.Parallel()
 
