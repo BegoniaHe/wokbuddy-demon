@@ -4,8 +4,12 @@ WORKDIR /src
 # 构建标识：编译期注入 server 二进制（滚动更新、无版本号）。
 # 构建时可用 --build-arg VERSION=nightly-YYYYMMDD-<sha> 覆盖。
 ARG VERSION=dev
+# 模块代理：默认留空 = 不设置，交给基础镜像/构建环境的默认（官方源 proxy.golang.org）。
+# 国内构建可传 --build-arg GOPROXY=https://goproxy.cn,direct；官方镜像（GHCR）构建不传，
+# 不把发布的构建绑到第三方镜像的可用性上。
+ARG GOPROXY=""
 COPY go.mod ./
-RUN go mod download
+RUN if [ -n "$GOPROXY" ]; then go env -w GOPROXY="$GOPROXY"; fi && go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" -o /out/wokbuddy-demon ./cmd/server \

@@ -174,6 +174,13 @@ docker compose up -d --build
 curl -s http://localhost:7863/healthz
 ```
 
+构建阶段的 Go 模块代理默认留空（沿用构建环境的默认，即官方源 `proxy.golang.org`）。国内网络访问官方源不稳定时可显式传入代理，只影响本次构建：
+
+```bash
+docker compose build --build-arg GOPROXY=https://goproxy.cn,direct
+# 或直接：docker build --build-arg GOPROXY=https://goproxy.cn,direct -t wokbuddy-demon .
+```
+
 Compose 默认把端口绑定到 `127.0.0.1`，仅本机可达（面板与网关无内置 TLS）。需要局域网访问时，把 `docker-compose.yml` 的 ports 改为 `"7863:7863"` 或指定内网 IP：
 
 ```yaml
