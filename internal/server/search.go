@@ -162,9 +162,17 @@ func (h *Handler) searchOnAccount(
 //     原文照样填好**——轮转耗尽时直接把这一份透给客户端，留零值会走到
 //     WriteHeader(0) 直接 panic（客户端只看到空 200）。
 func (h *Handler) searchFailureFor(uid string, upErr *upstream.Error) *searchFailure {
+	fail := searchFailureEnvelope(upErr)
+	// 终态错误（请求体/内容/模型/队列）是请求或通道本身的问题：换号与账号冷却都
+	// 无意义，不能因为一次坏请求给账号记失败（尤其 ErrClient 被 chat 口径当作
+	// 未知 4xx 喂连败计数）。
+	if fail.code != "" {
+		return fail
+	}
+
 	h.applyErrorPolicy(uid, upErr.Kind, upErr.Msg, searchRealm, "", upErr)
 
-	return searchFailureEnvelope(upErr)
+	return fail
 }
 
 // searchFailureEnvelope 只把上游错误翻译成终端形态，不做任何账号惩罚。
@@ -228,6 +236,10 @@ func searchTerminalStatus(upErr *upstream.Error) (int, string) {
 		return http.StatusBadRequest, "content_blocked"
 	case upstream.ErrModelBlocked, upstream.ErrModelAccess, upstream.ErrModelNotFound:
 		return http.StatusBadRequest, "model_unavailable"
+	case upstream.ErrClient:
+		// 未知 4xx / 业务码（如 15003 unsupported search type）：同一请求换号必然
+		// 同样失败，不能当可重试的 503 逐号轮转。
+		return http.StatusBadRequest, "bad_params"
 	case upstream.ErrQueueWaiting:
 		return http.StatusTooManyRequests, "queue_waiting"
 	case upstream.ErrQueueFull:

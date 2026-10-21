@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -126,7 +127,7 @@ type searchRequestBody struct {
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一口径（公开 API 简单）。
 func (c *Client) Search(ctx context.Context, account *auth.Auth, query string, maxResults int, meta ChatMeta) (*SearchOutcome, error) {
 	query = strings.TrimSpace(query)
-	if len(query) < SearchMinQueryLen {
+	if utf8.RuneCountInString(query) < SearchMinQueryLen {
 		return nil, &Error{Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen)}
 	}
 

@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -50,6 +51,13 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if isBodyTooLarge(err) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+
+			return
+		}
+
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
 
 		return
@@ -119,7 +127,13 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 		return nil, errSearchQueryEmpty
 	}
 
-	if len(query) > searchQueryMaxLen {
+	// 按字符（rune）而不是字节计：文档写的是「字符」上限，单个 CJK 字符 3 字节，
+	// 用 len() 会把 342 个汉字的合法搜索词误判成超长。
+	if utf8.RuneCountInString(query) < upstream.SearchMinQueryLen {
+		return nil, errSearchQueryTooShort
+	}
+
+	if utf8.RuneCountInString(query) > searchQueryMaxLen {
 		return nil, errSearchQueryTooLong
 	}
 
@@ -243,7 +257,7 @@ func buildSearchMessage(model, query string, outcome *upstream.SearchOutcome) ma
 		"role":  "assistant",
 		"model": model,
 		"content": []map[string]any{
-			{"type": "text", "text": summary.String(), "citations": citations},
+			{"type": "text", "text": summary, "citations": citations},
 			{
 				"type":    "web_search_tool_result",
 				"content": results,
@@ -255,7 +269,7 @@ func buildSearchMessage(model, query string, outcome *upstream.SearchOutcome) ma
 		// 字节/4 粗估。客户端只用它做上下文预算，不作为计费依据（与 count_tokens 同口径）。
 		"usage": map[string]any{
 			"input_tokens":  max(1, queryBytes/4),
-			"output_tokens": max(1, summary.Len()/4),
+			"output_tokens": max(1, len(summary)/4),
 		},
 	}
 }
@@ -275,9 +289,11 @@ func accountNickname(h *Handler, uid string) string {
 
 // buildSearchBlocks 把搜索结果折成 Anthropic content 需要的三样东西：
 // citations（text 块）、web_search_result（tool_result 块）与摘要文本。
-func buildSearchBlocks(outcome *upstream.SearchOutcome) (citations, results []map[string]any, summary strings.Builder) {
+func buildSearchBlocks(outcome *upstream.SearchOutcome) (citations, results []map[string]any, summary string) {
 	citations = make([]map[string]any, 0, len(outcome.Results))
 	results = make([]map[string]any, 0, len(outcome.Results))
+
+	var text strings.Builder
 
 	for i := range outcome.Results {
 		result := &outcome.Results[i]
@@ -301,24 +317,24 @@ func buildSearchBlocks(outcome *upstream.SearchOutcome) (citations, results []ma
 			"snippet": result.Snippet,
 		})
 
-		if summary.Len() > 0 {
-			summary.WriteString("\n")
+		if text.Len() > 0 {
+			text.WriteString("\n")
 		}
 
-		summary.WriteString("- ")
-		summary.WriteString(result.Title)
+		text.WriteString("- ")
+		text.WriteString(result.Title)
 
 		if result.Snippet != "" {
-			summary.WriteString("：")
-			summary.WriteString(result.Snippet)
+			text.WriteString("：")
+			text.WriteString(result.Snippet)
 		}
 	}
 
-	if summary.Len() == 0 {
-		summary.WriteString("未找到与该查询相关的网页结果。")
+	if text.Len() == 0 {
+		text.WriteString("未找到与该查询相关的网页结果。")
 	}
 
-	return citations, results, summary
+	return citations, results, text.String()
 }
 
 // searchHint 给搜索失败补一条客户端可操作的提示（上游原文仍在 message 里透传）。
@@ -350,6 +366,7 @@ var (
 	errSearchInvalidJSON  = errors.New("invalid JSON body")
 	errSearchToolRequired = errors.New(
 		"该端点只用于联网搜索：请求必须在 tools 中声明 web_search 工具")
-	errSearchQueryEmpty   = errors.New("请在 messages 中提供一段用户文本作为搜索词")
-	errSearchQueryTooLong = errors.New("搜索词过长（上限 1024 字符），请精简后重试")
+	errSearchQueryEmpty    = errors.New("请在 messages 中提供一段用户文本作为搜索词")
+	errSearchQueryTooShort = errors.New("搜索词过短（至少 2 个字符）")
+	errSearchQueryTooLong  = errors.New("搜索词过长（上限 1024 字符），请精简后重试")
 )

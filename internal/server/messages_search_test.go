@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -340,7 +341,7 @@ func TestSearchRejectsTooLongQuery(t *testing.T) {
 		return 200, searchOKBody
 	})
 
-	long := strings.Repeat("搜", searchQueryMaxLen)
+	long := strings.Repeat("搜", searchQueryMaxLen+1)
 	rec := doSearchRequest(t, handler, `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"`+long+`"}]}],"tools":[{"name":"web_search"}]}`)
 
 	if rec.Code != http.StatusBadRequest {
@@ -467,5 +468,74 @@ func TestSearchRejectsGlobalBoundKey(t *testing.T) {
 
 	if calls != 0 {
 		t.Errorf("global 绑定 key 不得打 CN 上游，calls=%d", calls)
+	}
+}
+
+// TestSearchRejectsSingleRuneQuery 搜索词长度按字符计：单个 CJK 字符是 3 字节，
+// 不能因为字节数 >= 2 就放过（上游 zod 按字符数要求至少 2）。
+func TestSearchRejectsSingleRuneQuery(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		calls++
+
+		return 200, searchOKBody
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"搜"}]}],"tools":[{"name":"web_search"}]}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400，body=%s", rec.Code, rec.Body)
+	}
+
+	if calls != 0 {
+		t.Errorf("过短搜索词不应打上游，calls=%d", calls)
+	}
+}
+
+// TestSearchClientErrorIsTerminal 未知 4xx（ErrClient）是请求级错误：应回 400
+// 且不再逐号轮转、不把一次坏请求记成账号失败。
+func TestSearchClientErrorIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":1,"msg":"bad request"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+	}
+	state := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at-u2", ExpiresAt: 9999999999},
+	)
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"golang"}]}],"tools":[{"name":"web_search"}]}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400，body=%s", rec.Code, rec.Body)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("请求级 4xx 不应逐号轮转，calls=%d", got)
+	}
+
+	for _, uid := range []string{"u1", "u2"} {
+		if st := statusOf(t, state, uid); st.ErrTotal != 0 || st.Cooling {
+			t.Errorf("请求级 4xx 不应罚账号 %s: %+v", uid, st)
+		}
 	}
 }
