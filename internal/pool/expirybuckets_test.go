@@ -114,3 +114,34 @@ func TestBalanceRefreshMeta(t *testing.T) {
 		t.Fatalf("got %d/%v want 300/%v", sec, at, now)
 	}
 }
+
+// TestSetCreditsDetailedClearsStaleBuckets 无逐日批次的上游路径（签到 / 面板单号
+// 刷新）更新余额时必须清掉旧批次：否则快照会同时展示新 credits/最早批次与上一次
+// 周期刷新留下的过期批次（issue #200 快照/检查口径一致性）。
+func TestSetCreditsDetailedClearsStaleBuckets(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+
+	at := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	pool.SetCreditsSnapshot("u1", 100, 100, 0, []ExpiryBucket{
+		{Date: at.Format("2006-01-02"), ExpireAt: at, Remain: 100},
+	})
+
+	// 模拟签到 / 单号刷新：只带最早批次，不带逐日明细。
+	pool.SetCreditsDetailed("u1", 60, 100, 0, at, 60)
+
+	status, ok := pool.Status("u1")
+	if !ok {
+		t.Fatal("status missing")
+	}
+
+	if len(status.CreditsExpiryBuckets) != 0 {
+		t.Errorf("无批次路径更新后不应保留旧批次，got %v", status.CreditsExpiryBuckets)
+	}
+
+	if !status.CreditsEarliestExpiry.Equal(at) || status.CreditsEarliestRemaining != 60 {
+		t.Errorf("最早批次应更新为 %v/60，got %v/%d", at, status.CreditsEarliestExpiry, status.CreditsEarliestRemaining)
+	}
+}

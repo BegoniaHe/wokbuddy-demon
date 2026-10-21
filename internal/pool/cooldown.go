@@ -93,6 +93,9 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 	entry2.creditsExpiring = expiring
 	entry2.creditsEarliestExpiry = earliestAt
 	entry2.creditsEarliestRemaining = earliestRemaining
+	// 本入口没有逐日批次信息（签到 / 面板单号刷新）：清掉上一次周期刷新留下的批次，
+	// 否则面板会把新余额/新最早批次与旧批次并排展示（快照与「检查」口径分裂）。
+	entry2.creditsExpiryBuckets = nil
 
 	p.dirty.Store(true)
 }
