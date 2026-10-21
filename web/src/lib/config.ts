@@ -54,6 +54,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'expiring_soon', path: ['pool', 'expiring_soon'], kind: 'text' },
   { name: 'ttl', path: ['session_sticky', 'ttl'], kind: 'text' },
   { name: 'prefer_expiring', path: ['pool', 'prefer_expiring'], kind: 'checkbox' },
+  { name: 'cross_domain_fallback', path: ['pool', 'cross_domain_fallback'], kind: 'checkbox' },
   { name: 'timeout_seconds', path: ['upstream', 'timeout_seconds'], kind: 'number' },
   { name: 'header_timeout_seconds', path: ['upstream', 'header_timeout_seconds'], kind: 'number' },
   { name: 'idle_timeout_seconds', path: ['upstream', 'idle_timeout_seconds'], kind: 'number' },

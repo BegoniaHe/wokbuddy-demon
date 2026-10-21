@@ -68,6 +68,11 @@ type Pool struct {
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// crossDomainFallback 裸模型名跨域回退开关（pool.cross_domain_fallback，默认
+	// false）。开启后：请求未显式指定域时，本域对该模型选不到号可以换到另一域；
+	// 上游 11102（目录无此模型）也允许跨域重取号一次。显式带 cn:/global: 前缀、
+	// 别名目标显式带前缀、或命名密钥绑定出口的请求永不回退。
+	crossDomainFallback bool
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -231,6 +236,22 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
 	}
+}
+
+// SetCrossDomainFallback 注入裸模型名跨域回退开关（main 从 config 解析后调用，默认关闭）。
+func (p *Pool) SetCrossDomainFallback(enabled bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.crossDomainFallback = enabled
+}
+
+// CrossDomainFallback 报告跨域回退是否开启（handler 选号路径读取）。
+func (p *Pool) CrossDomainFallback() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.crossDomainFallback
 }
 
 // SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。

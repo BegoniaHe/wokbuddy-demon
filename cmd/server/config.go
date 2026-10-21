@@ -355,6 +355,14 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// CrossDomainFallback 裸模型名跨域回退开关（默认 false）：请求没有显式指定域
+		// （无 cn:/global: 前缀、别名目标无显式前缀、命名密钥未绑定出口）时，本域对该
+		// 模型选不到号可以换到另一域；上游 11102（目录无此模型）也允许跨域重取号一次。
+		// 显式指定域的请求永不回退（出口约束）。热生效。
+		//
+		// 注意语义代价：开启后请求可能落到客户端**没点名**的另一域，并消耗该域的
+		// 额度与日限（记账按实际服务域）。
+		CrossDomainFallback bool `json:"cross_domain_fallback"`
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
@@ -810,6 +818,10 @@ func applyEnvFeatures(config6 *Config) {
 
 	if b, ok := envBool("WB2A_PREFER_EXPIRING"); ok {
 		config6.Pool.PreferExpiring = b
+	}
+
+	if b, ok := envBool("WB2A_CROSS_DOMAIN_FALLBACK"); ok {
+		config6.Pool.CrossDomainFallback = b
 	}
 }
 

@@ -151,3 +151,27 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 
 	return uids
 }
+
+// ServableForModelRealm 报告该域当前是否存在能服务该模型的账号：口径取
+// excludeReason 全集（域过滤、模型健康与负缓存、账号健康、积分保底、日限、
+// 在途上限），并额外排除路由级熔断（该 (域,模型) 整条路由冷却时同样不可服务）。
+//
+// 供跨域回退（pool.cross_domain_fallback）挑域：只看「能不能服务」，不做权重/成本
+// 判定——挑域之后仍走既有加权选号。
+func (p *Pool) ServableForModelRealm(model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := p.now()
+	if p.routeCoolingLocked(realm, model, now) {
+		return false
+	}
+
+	for _, item := range p.byUID {
+		if p.excludeReason(item, model, realm, now) == "" {
+			return true
+		}
+	}
+
+	return false
+}

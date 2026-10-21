@@ -144,6 +144,7 @@
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
+    "cross_domain_fallback": false,
     "credit_floor": 100
   },
   "session_sticky": {
