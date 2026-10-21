@@ -167,32 +167,22 @@ func (p *Pool) orderedUIDsLocked(realm string) []string {
 	return append(out, rest...)
 }
 
-// firstServableLocked 从 start 处顺延找第一个可服务账号（返回账号与其在顺序里的下标）。
-// 调用方已持锁；trace 可为空载体。
-func (p *Pool) firstServableLocked(
-	order []string, start int, tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace,
+// orderedCandidateLocked 从 start 处顺延找顺序里第一个「可服务且落在 bestTier」
+// 的账号（返回账号与其在 order 里的下标）。servable 由 pickCandidates 提供，
+// 已排除 tried/健康/在途/保底；本函数只再过滤成本层。
+func (p *Pool) orderedCandidateLocked(
+	order []string, servable map[string]*entry, start int, reqModel string, now time.Time, bestTier int, trace *PickTrace,
 ) (*entry, int) {
 	for offset := range order {
 		idx := (start + offset) % len(order)
-		uid := order[idx]
 
-		if tried != nil && tried[uid] {
-			trace.addExcluded("tried")
-
-			continue
-		}
-
-		entry2, ok := p.byUID[uid]
+		entry2, ok := servable[order[idx]]
 		if !ok {
 			continue
 		}
 
-		entry2.pruneExpiredModelCooldowns(now)
-		entry2.pruneExpiredModelCosts(now)
-		entry2.pruneExpiredHealth(now)
-
-		if reason := p.excludeReason(entry2, reqModel, realm, now); reason != "" {
-			trace.addExcluded(reason)
+		if tier, _ := entry2.costTier(reqModel, now); tier != bestTier {
+			trace.addExcluded("cost_tier")
 
 			continue
 		}
@@ -205,19 +195,28 @@ func (p *Pool) firstServableLocked(
 
 // pickOrderedLocked 有序策略选号（调用方已持锁）。
 //
+// 入参 cands 是已完成健康/保底/在途/tried 过滤的候选；本函数再按成本层过滤到
+// bestTier（与加权随机同一分层口径，见 resolveCostTier），只在同层内按账号顺序
+// 选号——顺序策略不应把已实测收费的号排在免费号之前。
+//
 // 语义：
-//   - 从 (realm, model) 游标处开始顺延，取第一个「可服务且未被 tried」的账号；
+//   - 从 (realm, model) 游标处开始顺延，取最优成本层里第一个账号；
 //   - round_robin：选中后游标 = 下一位置（严格轮转）；
-//   - sequential_exhaust：游标钉在选中账号（该号不可服务时才顺延）；
+//   - sequential_exhaust：游标钉在选中账号（该号不可服务或成本层变化时才顺延）；
 //   - 有序策略**不**走全冷却兜底（候选为空就返回 nil，由上层按 no_healthy 处理）。
 func (p *Pool) pickOrderedLocked(
-	tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace, strategy Strategy,
+	cands []*entry, reqModel, realm string, now time.Time, trace *PickTrace, strategy Strategy, bestTier int,
 ) *entry {
 	order := p.orderedUIDsLocked(realm)
 	if len(order) == 0 {
 		trace.addExcluded("no_account")
 
 		return nil
+	}
+
+	servable := make(map[string]*entry, len(cands))
+	for _, entry2 := range cands {
+		servable[entry2.a.UID] = entry2
 	}
 
 	key := realm + ":" + reqModel
@@ -227,7 +226,7 @@ func (p *Pool) pickOrderedLocked(
 		start = 0
 	}
 
-	chosen, chosenIdx := p.firstServableLocked(order, start, tried, reqModel, realm, now, trace)
+	chosen, chosenIdx := p.orderedCandidateLocked(order, servable, start, reqModel, now, bestTier, trace)
 	if chosen == nil {
 		return nil
 	}

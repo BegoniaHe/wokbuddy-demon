@@ -188,6 +188,33 @@ func TestStrategySwitchClearsCursors(t *testing.T) {
 	}
 }
 
+// TestOrderedStrategyRespectsCostTier 有序策略仍需遵守成本分层：已实测免费的号
+// 优先于已实测收费的号（与加权随机同口径），账号顺序只在同层内生效。
+func TestOrderedStrategyRespectsCostTier(t *testing.T) {
+	t.Parallel()
+
+	pool := strategyPool(t)
+	pool.SetScheduling(Scheduling{
+		Strategy: map[string]Strategy{"cn": StrategyRoundRobin},
+		Order:    map[string][]string{"cn": {"u1", "u2", "u3"}},
+	})
+
+	// 关闭条件探索：本节只验证成本层过滤，探索会把生效层临时切到 tier 1。
+	pool.SetCostExploreInterval(0)
+
+	// u1 已实测收费（tier 2），u2 已实测免费（tier 0）：即使 u1 排在顺序最前，
+	// 也只能在免费层里选 u2。
+	pool.NoteModelCost("u1", "m1", 10, 1000)
+	pool.NoteModelCost("u2", "m1", 0, 1000)
+
+	for i := range 3 {
+		acct := pool.PickExcludingForRealm(nil, "m1", "cn")
+		if acct == nil || acct.UID != "u2" {
+			t.Fatalf("第 %d 次选号=%+v want u2（免费层优先）", i, acct)
+		}
+	}
+}
+
 // TestSchedulingCursorsPersist 游标随 state.json 落盘并恢复。
 func TestSchedulingCursorsPersist(t *testing.T) {
 	t.Parallel()
