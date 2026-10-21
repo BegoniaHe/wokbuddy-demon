@@ -1100,9 +1100,18 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 		// 拉取失败只进负缓存（5min lastFail），不 NoteError：NoteError 喂的是 chat
 		// 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；
 		// models 拉取失败 ≠ 账号 chat 不可用。
+		//
+		// 但必须留一条 WARN：静默返回会让上游接口变更、账号不可用、网络问题全都
+		// 无法从日志发现。负缓存期内不再重试，所以这条路每 5min 最多 1 行，不刷屏。
 		h.modelsCache.Lock()
 		h.modelsCache.lastFail = time.Now()
 		h.modelsCache.Unlock()
+
+		if err != nil {
+			log.Printf("WARN: [server] /v1/models: CN 模型目录拉取失败: %v", err)
+		} else {
+			log.Printf("WARN: [server] /v1/models: CN 模型目录返回空列表（按失败处理，回落内置种子）")
+		}
 
 		return nil
 	}
