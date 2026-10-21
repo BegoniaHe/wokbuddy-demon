@@ -200,3 +200,52 @@ func TestLedgerConcurrentFlushStaysValid(t *testing.T) {
 		t.Fatal("并发 Flush 后账本不应为空")
 	}
 }
+
+// TestMarkFlushedKeepsDirtyWhenSeqAdvanced 落盘期间（快照之后）有新增流水：
+// 即使滚动裁剪让条数不变，也不能在写盘成功后清脏——否则新流水不会落盘。
+func TestMarkFlushedKeepsDirtyWhenSeqAdvanced(t *testing.T) {
+	t.Parallel()
+
+	ledger := Open("", 1) // 上限 1：每次新增都会裁剪，len 恒为 1
+	ledger.Observe("u1", 100, "")
+	ledger.Observe("u1", 90, "") // 第一条流水
+
+	ledger.mu.Lock()
+	flushedSeq := ledger.seq
+	ledger.mu.Unlock()
+
+	ledger.Observe("u1", 80, "") // 快照之后新增（len 仍为 1）
+
+	ledger.markFlushed(flushedSeq)
+
+	ledger.mu.Lock()
+	dirty := ledger.dirty
+	ledger.mu.Unlock()
+
+	if !dirty {
+		t.Fatal("快照后新增的流水未落盘，必须保持脏标记")
+	}
+}
+
+// TestMarkFlushedClearsWhenSeqUnchanged 快照后无新增：写盘成功后清脏。
+func TestMarkFlushedClearsWhenSeqUnchanged(t *testing.T) {
+	t.Parallel()
+
+	ledger := Open("", 10)
+	ledger.Observe("u1", 100, "")
+	ledger.Observe("u1", 90, "")
+
+	ledger.mu.Lock()
+	flushedSeq := ledger.seq
+	ledger.mu.Unlock()
+
+	ledger.markFlushed(flushedSeq)
+
+	ledger.mu.Lock()
+	dirty := ledger.dirty
+	ledger.mu.Unlock()
+
+	if dirty {
+		t.Fatal("快照后无新流水，写盘成功后应清脏")
+	}
+}

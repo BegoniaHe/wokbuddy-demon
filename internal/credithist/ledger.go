@@ -50,6 +50,9 @@ type Ledger struct {
 	last map[string]int64
 	// dirty 是否有未落盘的变更。
 	dirty bool
+	// seq 内存账本的单调变更序号：每次追加流水 +1。落盘期间若 seq 变化，说明
+	// 快照之后又来了新流水（可能同时触发滚动裁剪，len 不变），不能清脏。
+	seq uint64
 }
 
 // fileDoc 账本文件形态（带 schema 版本，便于将来迁移）。
@@ -128,6 +131,7 @@ func (l *Ledger) Observe(uid string, remain int64, note string) {
 	}
 
 	l.entries = append(l.entries, Entry{Time: time.Now(), UID: uid, Delta: delta, Remain: remain, Note: note})
+	l.seq++
 	l.trimLocked()
 	l.dirty = true
 	l.mu.Unlock()
@@ -192,15 +196,14 @@ func (l *Ledger) Flush() {
 	}
 
 	raw, err := json.Marshal(fileDoc{Version: 1, Entries: l.entries})
-	// 记下本次写出的条数：清脏标记后，写盘期间新进来的流水必须重新置脏，
-	// 否则它们只留在内存里，下一次 Flush 会因「不脏」直接跳过。
-	written := len(l.entries)
-	l.dirty = false
+	// 记录本次快照对应的变更序号：**不在写盘前清脏**。写盘成功后才按序号决定
+	// 是否清脏——写盘期间新追加的流水（可能同时触发滚动裁剪，len 不变）必须
+	// 保持脏标记，否则这批流水会永久留在内存里。
+	flushedSeq := l.seq
 	l.mu.Unlock()
 
 	if err != nil {
 		log.Printf("WARN: [credithist] 序列化失败: %v", err)
-		l.markDirty()
 
 		return
 	}
@@ -208,43 +211,32 @@ func (l *Ledger) Flush() {
 	tmp := l.path + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
 		log.Printf("WARN: [credithist] 建目录失败: %v", err)
-		l.markDirty()
 
 		return
 	}
 
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		log.Printf("WARN: [credithist] 写临时文件失败: %v", err)
-		l.markDirty()
 
 		return
 	}
 
 	if err := atomicwrite.Rename(tmp, l.path); err != nil {
 		log.Printf("WARN: [credithist] 原子替换失败: %v", err)
-		l.markDirty()
 
 		return
 	}
 
-	l.dirtyIfGrown(written)
+	l.markFlushed(flushedSeq)
 }
 
-// markDirty 重新置脏（写盘失败时调用）：脏标记已提前清掉，不置回就会永久丢写。
-func (l *Ledger) markDirty() {
+// markFlushed 写盘成功后清脏：只有快照之后没有新流水（seq 未变）才清。
+// 写盘失败路径不会调用它，因此脏标记天然保留，下一轮 Flush 会重试。
+func (l *Ledger) markFlushed(flushedSeq uint64) {
 	l.mu.Lock()
-	l.dirty = true
-	l.mu.Unlock()
-}
+	defer l.mu.Unlock()
 
-// dirtyIfGrown 写盘成功后补一次脏标记：写盘期间若又追加了流水（条数变化），
-// 这批新条目还没落盘，必须让下一次 Flush 再写一遍。
-func (l *Ledger) dirtyIfGrown(written int) {
-	l.mu.Lock()
-
-	if len(l.entries) != written {
-		l.dirty = true
+	if l.seq == flushedSeq {
+		l.dirty = false
 	}
-
-	l.mu.Unlock()
 }
