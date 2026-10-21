@@ -1147,9 +1147,8 @@ type chatFlow struct {
 	stream   bool
 	rawModel string
 	realm    string
-	// realmExplicit 请求是否显式指定了出口域（模型前缀 / 别名目标前缀 / 命名密钥绑定）。
-	realmExplicit bool
-	// crossRealm 本次请求允许跨域回退（开关开启且 realmExplicit=false）。
+	// crossRealm 本次请求允许跨域回退（开关开启且请求未显式指定域；判定见
+	// crossRealmAllowed/realmExplicitFor，结果在构造期捕获一次）。
 	crossRealm bool
 	// realmSwitched 本次请求是否已因 11102 切过域（只允许一次）。
 	realmSwitched bool
@@ -1401,7 +1400,6 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
 		reqModalities:  reqMods,
 		bareModel:      bareModel,
-		realmExplicit:  h.realmExplicitFor(chatInput2),
 		crossRealm:     h.crossRealmAllowed(chatInput2),
 		modelRate:      modelRate,
 		st:             chatStat2,
