@@ -42,6 +42,28 @@ func TestApplyErrorPolicyRecordsRouteFailures(t *testing.T) {
 	}
 }
 
+// TestApplyErrorPolicy14003NoRouteCooldown 14003 是模型后端瞬时繁忙，只停
+// (账号,模型) 短窗，不写路由熔断；否则三次后整条模型路由会被误冷却。
+func TestApplyErrorPolicy14003NoRouteCooldown(t *testing.T) {
+	t.Parallel()
+
+	state := pool.New("")
+	state.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+
+	h := NewHandler(&Config{Pool: state})
+	for range 3 {
+		h.applyErrorPolicy("u1", upstream.ErrSoftRate, `{"code":14003,"msg":"too many requests"}`, "cn", "m1", nil)
+	}
+
+	if until := state.RouteRecovery("cn", "m1"); !until.IsZero() {
+		t.Fatalf("14003 不应写路由熔断，got until=%v", until)
+	}
+
+	if st := statusOf(t, state, "u1"); st.Cooling {
+		t.Fatalf("14003 只停模型，不应冷却账号: %+v", st)
+	}
+}
+
 // TestApplyErrorPolicyModelNotFoundNoRouteCooldown 11102 是请求级事实（上游目录
 // 无此模型），不写路由熔断：同模型后续请求应继续得到 404，而不是被冷却成 503。
 func TestApplyErrorPolicyModelNotFoundNoRouteCooldown(t *testing.T) {
@@ -159,8 +181,8 @@ func TestChatAllAccountsLackModelPermission(t *testing.T) {
 // 与 11136 同机制——每号只打一次上游，写入 (账号,模型) 负缓存，返回 400
 // model_unavailable + 上游原文，且不写路由熔断、不罚账号。
 //
-// 与上游差异：上游把 429+11158 归软限流（逐号冷却），本 fork 判定与状态码无关，
-// 429+11158 同样归模型权限（见 upstream 侧分类表用例），避免整池健康号陪跑。
+// 400+11158 归模型权限；429+11158 保留限流语义（见 upstream 侧分类表用例），
+// 与上游一致，避免把限流误判成整池权限缺失。
 func TestChatAllAccountsForbiddenByUserType(t *testing.T) {
 	t.Parallel()
 

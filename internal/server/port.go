@@ -27,6 +27,8 @@ type chatInput struct {
 	// model 原始 model 名（可能带 "cn:"/"global:" realm 前缀，含前缀）。
 	model string
 	// clientIP 已提取的客户端 IP（供透传给上游；空 = 未透传）。
+	// 适配器不填；handler 入口用 httpauth.ClientIP(r, trusted) 统一赋值，
+	// 保证不可信对端的 X-Forwarded-For 不会被透传上游。
 	clientIP string
 	// convReqID 入站 X-Conversation-Request-Id（缺省空串，不伪造）。
 	convReqID string

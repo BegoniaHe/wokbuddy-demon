@@ -57,6 +57,27 @@ func TestCORSPreflightAllowed(t *testing.T) {
 	}
 }
 
+// TestCORSPreflightMessagesAlias 无 /v1 前缀的 Anthropic Messages 别名也属于
+// 网关 API 面，预检必须与 /v1/messages 同口径。
+func TestCORSPreflightMessagesAlias(t *testing.T) {
+	t.Parallel()
+
+	handler := NewHandler(&Config{CORSOrigins: []string{"http://localhost:3000"}})
+	req := httptest.NewRequest(http.MethodOptions, "/messages", nil)
+	req.Header.Set("Origin", "http://localhost:3000")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("code=%d want 204", rec.Code)
+	}
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "http://localhost:3000" {
+		t.Fatalf("allow-origin=%q", got)
+	}
+}
+
 func TestCORSPreflightDenied(t *testing.T) {
 	t.Parallel()
 

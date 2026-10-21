@@ -25,6 +25,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -155,7 +156,7 @@ func (h *Handler) runLocalWebToolLoop(r *http.Request, req map[string]any, msgs 
 			body:           raw,
 			stream:         false,
 			model:          model,
-			clientIP:       upstream.ExtractClientIP(r),
+			clientIP:       httpauth.ClientIP(r, h.cfg.TrustedProxies),
 			convReqID:      r.Header.Get("X-Conversation-Request-Id"),
 			traceID:        r.Header.Get("X-Trace-Id"),
 			inboundSession: inboundSessionMetaFrom(r),

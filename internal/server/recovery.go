@@ -15,7 +15,6 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
-	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
@@ -53,7 +52,7 @@ func (h *Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
 				return
 			}
 
-			if strings.HasPrefix(r.URL.Path, "/v1/messages") {
+			if isAnthropicMessagesPath(r.URL.Path) {
 				writeAnthropicError(recoveryWriter2, http.StatusInternalServerError, "api_error", "internal gateway error", "")
 				return
 			}

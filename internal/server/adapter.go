@@ -50,7 +50,6 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 		body:           body,
 		stream:         peek.Stream,
 		model:          peek.Model,
-		clientIP:       upstream.ExtractClientIP(r),
 		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
 		traceID:        r.Header.Get("X-Trace-Id"),
 		inboundSession: inboundSessionMetaFrom(r),

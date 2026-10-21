@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -78,12 +79,14 @@ func (h *Handler) geminiModelsHandler(w http.ResponseWriter, r *http.Request) {
 
 // geminiGenerate 读取并转换请求，复用 chatFlow 转发。
 func (h *Handler) geminiGenerate(w http.ResponseWriter, r *http.Request, model string, stream bool) {
-	in, out, ok := newGeminiChatInput(w, r, model, stream, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
+	input, out, ok := newGeminiChatInput(w, r, model, stream, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
 
-	h.serveChat(r, &in, out)
+	input.clientIP = httpauth.ClientIP(r, h.cfg.TrustedProxies)
+
+	h.serveChat(r, &input, out)
 }
 
 // newGeminiChatInput 读取 Gemini 请求体并构造 chatInput；失败时已写出 Gemini 错误。
@@ -110,7 +113,6 @@ func newGeminiChatInput(
 		body:           converted,
 		stream:         stream,
 		model:          model,
-		clientIP:       upstream.ExtractClientIP(r),
 		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
 		traceID:        r.Header.Get("X-Trace-Id"),
 		inboundSession: inboundSessionMetaFrom(r),
