@@ -29,6 +29,8 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'activity_hours', path: ['schedule', 'activity_hours'], kind: 'hours' },
   { name: 'balance_refresh_enabled', path: ['schedule', 'balance_refresh_enabled'], kind: 'checkbox' },
   { name: 'balance_refresh_minutes', path: ['schedule', 'balance_refresh_minutes'], kind: 'number' },
+  { name: 'task_sweep_enabled', path: ['schedule', 'task_sweep_enabled'], kind: 'checkbox' },
+  { name: 'task_sweep_minutes', path: ['schedule', 'task_sweep_minutes'], kind: 'number' },
   { name: 'checkin_account_delay', path: ['schedule', 'checkin_account_delay'], kind: 'text' },
   { name: 'growth_enabled', path: ['schedule', 'growth_enabled'], kind: 'checkbox' },
   { name: 'growth_hours', path: ['schedule', 'growth_hours'], kind: 'hours' },

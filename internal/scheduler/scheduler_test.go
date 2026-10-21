@@ -1086,3 +1086,41 @@ func TestNextFirePartialSkippedHour(t *testing.T) {
 		t.Fatalf("now=%v next=%v want %v（03:45 是该小时首个实际时刻）", now, next, want)
 	}
 }
+
+// TestStartTaskSweepHotEnableFromPaused 启动时暂停（interval=0）也必须起 worker：
+// 运行期 SetTaskSweepInterval 热开后才会有周期清扫，无需重启。
+func TestStartTaskSweepHotEnableFromPaused(t *testing.T) {
+	t.Parallel()
+
+	scheduler := New(&Config{Pool: pool.New("")})
+
+	var calls atomic.Int32
+
+	scheduler.SetTaskSweepHook(func(context.Context) { calls.Add(1) })
+
+	ctx := t.Context()
+
+	scheduler.StartTaskSweep(ctx, 0)
+	scheduler.SetTaskSweepInterval(5 * time.Millisecond)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for calls.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("启动时暂停的补领清扫在热开 interval 后仍未运行")
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 热暂停后不再有新的调用。
+	scheduler.SetTaskSweepInterval(0)
+	time.Sleep(30 * time.Millisecond)
+
+	before := calls.Load()
+
+	time.Sleep(50 * time.Millisecond)
+
+	if after := calls.Load(); after != before {
+		t.Errorf("暂停后仍在执行：before=%d after=%d", before, after)
+	}
+}

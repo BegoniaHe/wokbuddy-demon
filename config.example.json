@@ -60,6 +60,8 @@
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
     "balance_refresh_minutes": 5,
+    "task_sweep_enabled": true,
+    "task_sweep_minutes": 15,
     "checkin_account_delay": "800ms",
     "include_disabled_in_tasks": false
   },
