@@ -3462,6 +3462,8 @@ func (c *Client) enterpriseResource(
 	}
 	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
 	if limit < 0 {
+		c.notifyBalance(account6, enterpriseUnlimitedRemain, enterpriseUnlimitedTotal)
+
 		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
 	}
 
@@ -3469,6 +3471,9 @@ func (c *Client) enterpriseResource(
 	total = limit
 	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
 	earliestAt, earliestRemaining, expiring = enterpriseExpiryBucket(cycleEnd, cycleReset, remain, time.Now(), soon)
+	// 观测回调挂在具体成功路径（而不是 UserResourceDetailedWithExpiry 包装层），
+	// 这样任何直接调用企业口径的余额查询（如 UserResourceSnapshot）都能记账。
+	c.notifyBalance(account6, remain, total)
 
 	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }
@@ -3837,12 +3842,7 @@ func (c *Client) UserResourceDetailedWithExpiry(
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if account.IsEnterprise() {
-		remain, total, expiring, earliestAt, earliestRemaining, err = c.enterpriseResource(account, soon)
-		if err == nil {
-			c.notifyBalance(account, remain, total)
-		}
-
-		return remain, total, expiring, earliestAt, earliestRemaining, err
+		return c.enterpriseResource(account, soon)
 	}
 
 	now := time.Now()
