@@ -3385,9 +3385,6 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
 	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
-	if err == nil {
-		c.notifyBalance(a, remain, total)
-	}
 
 	return remain, total, expiring, err
 }
@@ -3827,6 +3824,15 @@ func addPackageExpiry(packages []billingPackageAccount, now time.Time, soon time
 func (c *Client) UserResourceDetailedWithExpiry(
 	account *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	// 余额观测回调挂在**所有成功查询路径**的公共出口：scheduler 周期刷新与面板
+	// 「检查」都走本函数（而非 UserResourceDetailed），挂在后者会让积分账本永远
+	// 只记录登录/导入时的基线，看不到真实变动。成功才回调，失败不写脏数据。
+	defer func() {
+		if err == nil {
+			c.notifyBalance(account, remain, total)
+		}
+	}()
+
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if account.IsEnterprise() {

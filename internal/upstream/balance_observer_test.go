@@ -7,7 +7,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// TestBalanceObserverNotifies UserResourceDetailed 成功后触发余额观测回调。
+// TestBalanceObserverNotifies UserResource 成功后触发余额观测回调。
 func TestBalanceObserverNotifies(t *testing.T) {
 	t.Parallel()
 
@@ -31,6 +31,36 @@ func TestBalanceObserverNotifies(t *testing.T) {
 
 	if gotUID != "u1" || gotRemain != 900 || gotTotal != 1000 {
 		t.Fatalf("observer got %s/%d/%d want u1/900/1000", gotUID, gotRemain, gotTotal)
+	}
+}
+
+// TestBalanceObserverNotifiesSchedulerPath scheduler / 面板「检查」走的是
+// UserResourceDetailedWithExpiry；回调必须挂在公共出口，否则账本永远只有登录基线。
+func TestBalanceObserverNotifiesSchedulerPath(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"CycleCapacitySize":1000,"CycleCapacityRemain":800,"CycleCapacityUsed":200}
+		]}}}}`), nil
+	})
+
+	var calls int
+
+	client.BalanceObserver = func(uid string, remain, total int64) {
+		calls++
+
+		if uid != "u1" || remain != 800 || total != 1000 {
+			t.Errorf("observer got %s/%d/%d want u1/800/1000", uid, remain, total)
+		}
+	}
+
+	if _, _, _, _, _, err := client.UserResourceDetailedWithExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, 0); err != nil {
+		t.Fatalf("resource: %v", err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("observer calls=%d want 1", calls)
 	}
 }
 
