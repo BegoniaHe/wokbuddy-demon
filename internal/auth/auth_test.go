@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/base64"
 	"io"
 	"log"
 	"os"
@@ -333,5 +334,21 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		!strings.Contains(string(raw), "workbuddy-a-cn.json") ||
 		!strings.Contains(string(raw), "workbuddy-z-global.json") {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
+	}
+}
+
+// TestTokenSourceFromJWT 企业切换 token 的 token_source 进入出站身份头。
+func TestTokenSourceFromJWT(t *testing.T) {
+	t.Parallel()
+
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"token_source":"enterprise_switch"}`))
+
+	a := &Auth{AccessToken: "x." + payload + ".sig"}
+	if got := a.TokenSource(); got != "enterprise_switch" {
+		t.Fatalf("TokenSource=%q", got)
+	}
+
+	if got := (&Auth{AccessToken: "not-a-jwt"}).TokenSource(); got != "" {
+		t.Fatalf("non-JWT TokenSource=%q want empty", got)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	pathpkg "path"
@@ -28,8 +29,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
 const (
@@ -126,9 +127,9 @@ func New(path string) *Store {
 
 // load 读取落盘文件并重建校验快照。
 func (s *Store) load() error {
-	raw, err := os.ReadFile(s.path)
+	raw, err := safefile.Read(s.path, nil)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 
@@ -399,12 +400,7 @@ func writeRecords(path string, records []Record) error {
 		}
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("writeRecords: %w", err)
-	}
-
-	if err := atomicwrite.Rename(tmp, path); err != nil {
+	if err := safefile.WriteKeep(path, raw, 0o600, nil); err != nil {
 		return fmt.Errorf("writeRecords: %w", err)
 	}
 

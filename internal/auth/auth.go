@@ -10,15 +10,14 @@ import (
 	"io/fs"
 	"log"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
 // 归一化后的账号域取值：realm 字段与 Realm()/ResolveRealm 的返回值恒为二者之一。
@@ -544,11 +543,10 @@ func (a *Auth) SaveAtomic() error {
 		return fmt.Errorf("SaveAtomic: %w", err)
 	}
 
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := safefile.WriteKeep(a.FilePath, raw, 0o600, validAuthFile); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		msg := fmt.Sprintf("写入 %s 失败: %v", a.FilePath, err)
 		if errors.Is(err, fs.ErrPermission) {
 			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
 				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
@@ -559,14 +557,38 @@ func (a *Auth) SaveAtomic() error {
 		return fmt.Errorf("%s: %w", msg, errSaveAtomicFailed)
 	}
 
-	if err := atomicwrite.Rename(tmp, a.FilePath); err != nil {
-		return fmt.Errorf("saveAtomic: %w", err)
-	}
-
 	return nil
 }
 
-// LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
+// SaveAtomicRetry 在 SaveAtomic 基础上做有界重试（0/100ms/300ms）。
+// refresh 成功后上游已轮换 RT；落盘瞬时失败（磁盘满、bind-mount 抖动）不能静默
+// 留下旧 RT，否则重启后可能再也刷新不了。
+func (a *Auth) SaveAtomicRetry() error {
+	var err error
+
+	for i, delay := range []time.Duration{0, 100 * time.Millisecond, 300 * time.Millisecond} {
+		if i > 0 {
+			time.Sleep(delay)
+		}
+
+		if err = a.SaveAtomic(); err == nil {
+			return nil
+		}
+	}
+
+	return err
+}
+
+// validAuthFile 报告 b 能否解析为 auth；safefile 的回退与备份判定共用此口径，
+// 避免「合法 JSON 但不是 auth」的文件覆盖掉唯一可用的 .bak。
+func validAuthFile(b []byte) bool {
+	_, err := Parse(b)
+
+	return err == nil
+}
+
+// LoadDir 扫描并解析 dir 下 workbuddy*.json；不可读/解析失败的文件跳过并打 WARN
+// （损坏时 safefile.Read 先回落 .bak）。
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
@@ -582,13 +604,15 @@ func LoadDir(dir string) ([]*Auth, error) {
 	var out []*Auth
 
 	for _, item := range files {
-		raw, err := os.ReadFile(item)
+		raw, err := safefile.Read(item, validAuthFile)
 		if err != nil {
+			log.Printf("WARN: auth 文件不可用（%v），跳过: %s", err, item)
 			continue
 		}
 
 		auth, err := Parse(raw)
 		if err != nil {
+			log.Printf("WARN: auth 解析失败（%v），跳过: %s", err, item)
 			continue
 		}
 
@@ -614,3 +638,8 @@ func LoadDir(dir string) ([]*Auth, error) {
 
 	return out, nil
 }
+
+// TokenSource 从 AccessToken 的 JWT payload 读取 token_source 声明。
+// 非 JWT / 无该声明 / 解码失败返回空串；调用方据此决定是否发出站身份头。
+// 复用 jwtTokenSource 的解析口径，避免同一 JWT 出现两套解码逻辑。
+func (a *Auth) TokenSource() string { return a.jwtTokenSource() }

@@ -240,3 +240,28 @@ func TestSetRealmPersistsAndValidates(t *testing.T) {
 		t.Errorf("reloaded realm=%q want global", got)
 	}
 }
+
+// TestLoadFallsBackToBackup 主文件损坏时从 .bak 恢复上一份有效记录。
+func TestLoadFallsBackToBackup(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "keys.json")
+
+	store := New(path)
+	if _, _, err := store.Create("a"); err != nil {
+		t.Fatalf("create a: %v", err)
+	}
+	// 第二次写盘把「只有 a」的版本留成 .bak。
+	if _, _, err := store.Create("b"); err != nil {
+		t.Fatalf("create b: %v", err)
+	}
+
+	if err := os.WriteFile(path, []byte("bad"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := New(path)
+	if got := len(reloaded.List()); got != 1 {
+		t.Fatalf("records=%d want 1 (restored from .bak)", got)
+	}
+}
