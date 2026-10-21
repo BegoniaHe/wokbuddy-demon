@@ -1,5 +1,7 @@
 // 模型目录筛选/排序（纯函数，便于测试）。
 
+import { fmtLocalDateTime, parseAPITime } from './format';
+
 export interface ModelEntry {
   id: string;
   name?: string;
@@ -146,7 +148,10 @@ export function mdAvailability(
     const reason = String(lock.reason || '');
     const servable = Number(lock.servable || 0);
     const total = Number(lock.total || 0);
-    const unlock = lock.unlock_at ? '；最早 ' + String(lock.unlock_at).replace('T', ' ').slice(0, 16) + ' 解封' : '';
+    // 时间统一按本地时区渲染（与面板其它时间列同口径）：后端给的是 RFC3339 UTC，
+    // 直接切片会把 UTC 当本地时间显示，且零值时间会渲染成 0001-01-01。
+    const unlockMs = parseAPITime(lock.unlock_at);
+    const unlock = unlockMs ? '；最早 ' + fmtLocalDateTime(unlockMs) + ' 解封' : '';
     if (state === 'partial') {
       return {
         key: 'partial',

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_MODEL_FILTER, mdAvailability, mdMatch, mdSortList, type ModelEntry } from './models';
+import { fmtLocalDateTime } from './format';
 
 const base: ModelEntry = { id: 'cn:glm-5.2', name: 'GLM 5.2', vendor: 'zhipu' };
 
@@ -122,6 +123,26 @@ describe('mdAvailability（global 模型可用性）', () => {
       [{ model: 'kimi-k3', status: 200, outcome: 'success' }],
     );
     expect(a?.key).toBe('rate');
+  });
+
+  it('unlock_at 按本地时间渲染，而不是 UTC 原始串切片', () => {
+    const iso = '2026-10-21T10:00:00Z';
+    const a = mdAvailability(
+      'global:kimi-k3',
+      [{ model: 'kimi-k3', realm: 'global', state: 'locked', reason: '6004', unlock_at: iso }],
+      [],
+    );
+    expect(a?.tip).toContain(fmtLocalDateTime(Date.parse(iso)));
+  });
+
+  it('unlock_at 零值时间不渲染 0001 日期', () => {
+    const a = mdAvailability(
+      'global:kimi-k3',
+      [{ model: 'kimi-k3', realm: 'global', state: 'locked', reason: '6004', unlock_at: '0001-01-01T00:00:00Z' }],
+      [],
+    );
+    expect(a?.tip).not.toContain('0001');
+    expect(a?.tip).not.toContain('解封');
   });
 
   it('忽略其他域或其他模型的锁', () => {
