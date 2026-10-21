@@ -73,6 +73,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'global_enabled', path: ['global', 'enabled'], kind: 'checkbox' },
   { name: 'global_chat_base', path: ['global', 'chat_base'], kind: 'text' },
   { name: 'global_billing_base', path: ['global', 'billing_base'], kind: 'text' },
+  { name: 'cn_chat_base', path: ['cn', 'chat_base'], kind: 'text' },
   { name: 'upstash_url', path: ['upstash', 'url'], kind: 'text' },
   { name: 'upstash_token', path: ['upstash', 'token'], kind: 'password', secret: true },
   { name: 'prompt_mode', path: ['prompt', 'mode'], kind: 'select' },

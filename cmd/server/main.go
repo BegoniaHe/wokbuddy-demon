@@ -589,6 +589,11 @@ func configureUpstream(cfg *Config, client *upstream.Client) {
 	client.GlobalEnabled = cfg.Global.Enabled
 	client.ChatBaseGlobal = cfg.Global.ChatBase
 	client.BillingBaseGlobal = cfg.Global.BillingBase
+	// cn.chat_base：仅非空时覆盖 CN 主域（空 = 保持内置默认 + 回落链）。
+	if base := strings.TrimSpace(cfg.CN.ChatBase); base != "" {
+		client.ChatBaseCN = base
+	}
+
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
@@ -936,6 +941,8 @@ var restartFieldPaths = []string{
 	"upstream.proxies",
 	// global 路由在 configureUpstream / auth / handler 构造期捕获。
 	"global.enabled", "global.chat_base", "global.billing_base",
+	// cn.chat_base 同样在 configureUpstream 一次性写入 client。
+	"cn.chat_base",
 	// 提示词模式与文件在 handler 构造期解析。
 	"prompt.mode", "prompt.file",
 	// Redis 客户端在启动期装配。
