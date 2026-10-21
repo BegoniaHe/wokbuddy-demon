@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
 // strategyPool 造一个含三号、无冷却的池。
@@ -72,6 +73,31 @@ func TestRoundRobinAdvancesCursor(t *testing.T) {
 		if acct.UID != wantUID {
 			t.Fatalf("第 %d 次选号=%s want %s（严格轮转）", i, acct.UID, wantUID)
 		}
+	}
+}
+
+// TestOrderedPickTraceUsesShortUID 有序策略的决策链与加权随机同口径：FinalUID 记
+// uid8，且带上生效策略（完整 uid 只留在账号池/凭证侧）。
+func TestOrderedPickTraceUsesShortUID(t *testing.T) {
+	t.Parallel()
+
+	pool := strategyPool(t)
+	pool.SetScheduling(Scheduling{
+		Strategy: map[string]Strategy{"cn": StrategyRoundRobin},
+		Order:    map[string][]string{"cn": {"u1", "u2"}},
+	})
+
+	acct, trace := pool.PickExcludingForRealmTrace(nil, "m1", "cn")
+	if acct == nil {
+		t.Fatal("pick returned nil")
+	}
+
+	if trace.FinalUID != logfmt.UID8(acct.UID) {
+		t.Errorf("FinalUID=%q want %q（uid8）", trace.FinalUID, logfmt.UID8(acct.UID))
+	}
+
+	if trace.Strategy != string(StrategyRoundRobin) {
+		t.Errorf("Strategy=%q want %q", trace.Strategy, StrategyRoundRobin)
 	}
 }
 
@@ -144,6 +170,8 @@ func TestStrategySwitchClearsCursors(t *testing.T) {
 		t.Fatal("轮转后应有游标")
 	}
 
+	// 模拟「游标已落盘」：清掉脏标记，验证切策略清游标本身会重新置脏。
+	pool.dirty.Store(false)
 	pool.SetScheduling(Scheduling{Strategy: map[string]Strategy{"cn": StrategySequentialExhaust}})
 
 	pool.mu.RLock()
@@ -152,6 +180,11 @@ func TestStrategySwitchClearsCursors(t *testing.T) {
 
 	if after != 0 {
 		t.Fatalf("切策略后游标应清空，got %d", after)
+	}
+
+	// 清游标必须置脏，否则旧游标会留在 state.json 里被重启恢复。
+	if !pool.dirty.Load() {
+		t.Error("切策略清空游标后必须置脏（否则旧游标会被持久化恢复）")
 	}
 }
 

@@ -18,6 +18,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
 // errUnknownStrategy 未知策略值（config 校验据此拒绝启动）。
@@ -97,11 +99,20 @@ func (p *Pool) SetScheduling(sched Scheduling) {
 // clearCursorsForRealmLocked 清掉某域全部 (realm, model) 游标（调用方已持锁）。
 func (p *Pool) clearCursorsForRealmLocked(realm string) {
 	prefix := realm + ":"
+	cleared := false
 
 	for key := range p.schedulingCursors {
 		if strings.HasPrefix(key, prefix) {
 			delete(p.schedulingCursors, key)
+
+			cleared = true
 		}
+	}
+
+	if cleared {
+		// 游标属于持久化状态：清空也要置脏，否则旧游标会留在 state.json 里，
+		// 进程重启后又被恢复（切策略=清游标的语义丢失）。
+		p.dirty.Store(true)
 	}
 }
 
@@ -238,7 +249,8 @@ func (p *Pool) pickOrderedLocked(
 	p.pickSeq++
 	chosen.usedSeq = p.pickSeq
 
-	trace.FinalUID = chosen.a.UID
+	// 与加权随机路径同口径：决策链只记 uid8（完整 uid 只留在账号池/凭证侧）。
+	trace.FinalUID = logfmt.UID8(chosen.a.UID)
 
 	return chosen
 }
