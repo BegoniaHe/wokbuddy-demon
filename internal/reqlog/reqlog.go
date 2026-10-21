@@ -102,6 +102,8 @@ type DecisionTrace struct {
 	Rotations  []string            `json:"rotations,omitempty"`
 	Top        []DecisionCandidate `json:"top,omitempty"`
 	FinalUID   string              `json:"final_uid,omitempty"`
+	// Strategy 实际生效的选号策略（weighted_random 时省略；有序策略便于排障）。
+	Strategy string `json:"strategy,omitempty"`
 }
 
 // DecisionCandidate Top-N 候选（uid8 + 权重 + 成本层）。

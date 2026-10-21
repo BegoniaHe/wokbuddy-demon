@@ -1502,7 +1502,14 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	// 走普通轮换）。ExtractKey 与粘性开关解耦：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级。
 	chatFlow2.sessKey = session.ExtractKey(chatInput2.body)
-	h.bindSticky(chatFlow2)
+	if h.cfg.Session != nil && chatFlow2.sessKey != "" {
+		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
+		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
+		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
+		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
+		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
+		chatFlow2.stickyUID = h.resolveStickyForStrategy(chatFlow2)
+	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生。必须在 prompt.Rewrite 之前取
 	// ——改写会动 messages 内容，之后取会让键漂移。
@@ -1824,20 +1831,26 @@ func (f *chatFlow) degradeSticky() string {
 	return uid
 }
 
-// bindSticky 解析会话键对应的绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
-//
-// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，而不是钉在
-// 限额号上反复失败（"限额后换不动号"的正解）。必须带 realm 前缀：粘性可用性闭包按
-// realm 过滤账号，只传裸名会回落 cn，让 global 请求把会话绑到 cn 号（或每轮重新分配，
-// 粘性形同失效）。别名目标省略 realm 时，flow.realm 已是继承请求侧后的结果。
-func (h *Handler) bindSticky(flow *chatFlow) {
-	if h.cfg.Session == nil || flow.sessKey == "" {
-		return
+// resolveStickyForStrategy 按当前选号策略解析会话粘性绑定：
+//   - 有序策略（round_robin / sequential_exhaust）：只复用**既有**绑定——哈希分配会绕过
+//     账号顺序（issue #205），未命中就交回选号策略决定；
+//   - 加权随机（默认）：沿用既有 ResolveForModel（含慢路径哈希分配，零回归）。
+func (h *Handler) resolveStickyForStrategy(flow *chatFlow) string {
+	model := flow.realm + ":" + flow.bareModel
+
+	if h.cfg.Pool != nil && h.cfg.Pool.StrategyForRealm(flow.realm) != "weighted_random" {
+		if uid, ok := h.cfg.Session.ResolveExisting(flow.sessKey, model); ok {
+			return uid
+		}
+
+		return ""
 	}
 
-	if uid, ok := h.cfg.Session.ResolveForModel(flow.sessKey, flow.realm+":"+flow.bareModel); ok {
-		flow.stickyUID = uid
+	if uid, ok := h.cfg.Session.ResolveForModel(flow.sessKey, model); ok {
+		return uid
 	}
+
+	return ""
 }
 
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
@@ -2019,10 +2032,13 @@ func (h *Handler) sampleDecisionTrace() *reqlog.DecisionTrace {
 		Rotations:  nil,
 		Top:        nil,
 		FinalUID:   "",
+		Strategy:   "",
 	}
 }
 
 // mergePickTrace 把 pool 决策快照并入请求级决策链（Top 覆盖为最近一次尝试）。
+//
+//nolint:gocritic // PickTrace 值传递保持既有调用点简单（新增 Strategy 字段后触发的 hugeParam 提示）。
 func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	dst.Candidates += src.Candidates
 	if dst.Excluded == nil {
@@ -2034,6 +2050,9 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 
 	dst.CostTier = src.CostTier
+	if src.Strategy != "" {
+		dst.Strategy = src.Strategy
+	}
 
 	dst.Explored = dst.Explored || src.Explored
 	if len(src.Top) > 0 {

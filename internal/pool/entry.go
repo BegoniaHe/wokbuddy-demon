@@ -564,6 +564,10 @@ type stateModelCost struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
+	// SchedulingCursors 有序选号策略的 (realm, model) 游标（issue #205）。
+	// 池级而非逐号：游标描述「这个域的模型当前轮询到第几个账号」。
+	// 持久化以保留顺序耗尽进度（跨重启不该从第一个号重新打）。
+	SchedulingCursors map[string]int `json:"scheduling_cursors,omitempty"`
 }
 
 // flushInterval 后台落盘周期。

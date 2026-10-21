@@ -56,6 +56,8 @@ type PickTrace struct {
 	Explored   bool            `json:"explored,omitempty"`
 	Top        []PickCandidate `json:"top,omitempty"`
 	FinalUID   string          `json:"final_uid,omitempty"`
+	// Strategy 生效的选号策略（weighted_random 时为空省略；有序策略便于排障）。
+	Strategy string `json:"strategy,omitempty"`
 }
 
 // PickCandidate Top-N 候选的权重快照（uid8 + 权重 + 成本层）。
@@ -89,6 +91,15 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	if p.routeCoolingLocked(realm, reqModel, now) {
 		trace.addExcluded("route_cooldown")
 		return nil
+	}
+
+	// 有序策略（round_robin / sequential_exhaust）：按账号顺序选号，**旁路**加权随机、
+	// 防撞号窗口与全冷却兜底（语义：用完一个再下一个，兜底抽号会破坏该语义）。
+	// 成本分层仍生效（与加权随机同口径）：先按既有口径选出本次最优成本层，再在
+	// **该层内**按账号顺序滚动——否则有序策略会把已实测收费的号排在免费号前面
+	// （PR #205 的「不改成本分层」承诺）。
+	if strategy := p.strategyForLocked(realm); strategy != StrategyWeightedRandom {
+		return p.pickOrderedPathLocked(tried, reqModel, realm, now, trace, strategy)
 	}
 
 	cands := p.pickCandidates(tried, reqModel, realm, now, trace)
@@ -128,6 +139,31 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	entry2.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	entry2.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+
+	return entry2.a
+}
+
+// pickOrderedPathLocked 有序策略的选号路径：收集候选 → 定成本层 → 层内按顺序选号。
+// 调用方已持有 p.mu；与加权随机共享 pickCandidates/resolveCostTier 的分层口径。
+func (p *Pool) pickOrderedPathLocked(
+	tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace, strategy Strategy,
+) *auth.Auth {
+	trace.Strategy = string(strategy)
+
+	cands := p.pickCandidates(tried, reqModel, realm, now, trace)
+	trace.Candidates = len(cands)
+
+	if len(cands) == 0 {
+		return nil
+	}
+
+	bestTier, explored := p.resolveCostTier(cands, reqModel, realm, now)
+	trace.CostTier, trace.Explored = bestTier, explored
+
+	entry2 := p.pickOrderedLocked(cands, reqModel, realm, now, trace, strategy, bestTier)
+	if entry2 == nil {
+		return nil
+	}
 
 	return entry2.a
 }

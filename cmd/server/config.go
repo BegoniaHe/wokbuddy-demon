@@ -19,6 +19,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 )
 
@@ -358,6 +359,21 @@ type Config struct {
 		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// Strategy 按域选号策略（issue #205）：{"cn":"weighted_random","global":"..."}。
+		// 可选 weighted_random（默认）/ round_robin / sequential_exhaust；
+		// 有序策略会**关闭全冷却兜底与防撞号窗口**（语义：明确地用下一个号）。
+		// 热生效；非法值在 normalize 阶段拒绝启动。
+		Strategy struct {
+			CN     string `json:"cn"`
+			Global string `json:"global"`
+		} `json:"strategy"`
+		// AccountOrder 按域固定账号顺序（issue #205）：{"cn":["uid1","uid2"],...}。
+		// 只对有序策略有意义；配置里不存在/异域/重复的 uid 自动跳过，
+		// 其余账号按 uid 升序追加在后。
+		AccountOrder struct {
+			CN     []string `json:"cn"`
+			Global []string `json:"global"`
+		} `json:"account_order"`
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
@@ -896,7 +912,7 @@ func (c *Config) normalize() error {
 
 	steps := []func() error{
 		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
-		c.normalizeHiddenModels,
+		c.normalizeHiddenModels, c.normalizeScheduling,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
 		c.normalizeDNSServers,
@@ -1089,6 +1105,56 @@ func validateDNSServer(server string) error {
 
 	if host == "" {
 		return fmt.Errorf("dns_servers[%q]: host 不能为空: %w", server, errNormalizeDNSServersFailed)
+	}
+
+	return nil
+}
+
+// normalizeScheduling 校验并归一按域选号策略与账号顺序（issue #205）。
+// 非法策略值拒绝启动（拼错会静默退回默认，运维以为生效了却没用）。
+func (c *Config) normalizeScheduling() error {
+	for _, item := range []struct {
+		realm string
+		value *string
+	}{
+		{"cn", &c.Pool.Strategy.CN},
+		{"global", &c.Pool.Strategy.Global},
+	} {
+		strategy, err := pool.ParseStrategy(*item.value)
+		if err != nil {
+			return fmt.Errorf("pool.strategy.%s: %w", item.realm, err)
+		}
+
+		*item.value = string(strategy)
+	}
+
+	for _, item := range []struct {
+		realm string
+		list  *[]string
+	}{
+		{"cn", &c.Pool.AccountOrder.CN},
+		{"global", &c.Pool.AccountOrder.Global},
+	} {
+		seen := make(map[string]bool, len(*item.list))
+
+		out := make([]string, 0, len(*item.list))
+
+		for _, raw := range *item.list {
+			uid := strings.TrimSpace(raw)
+			if uid == "" || seen[uid] {
+				continue
+			}
+
+			seen[uid] = true
+
+			out = append(out, uid)
+		}
+
+		if len(out) == 0 {
+			out = nil
+		}
+
+		*item.list = out
 	}
 
 	return nil

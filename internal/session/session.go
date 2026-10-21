@@ -168,6 +168,29 @@ func (r *Router) Resolve(key string) (string, bool) {
 	return r.ResolveForModel(key, "")
 }
 
+// ResolveExisting 只复用**既有**绑定：命中有效且该模型可用的绑定返回 uid，否则 false。
+//
+// 与 ResolveForModel 的差别是没有慢路径哈希分配——有序选号策略（round_robin /
+// sequential_exhaust，issue #205）下，哈希分配会绕过账号顺序，让粘性变成「随处落号」。
+// 调用方在未命中时交回选号策略决定。
+func (r *Router) ResolveExisting(key, model string) (string, bool) {
+	now := time.Now()
+
+	r.mu.RLock()
+	entry2, found := r.entries[key]
+	a, hasAvoid := r.avoid[key]
+	avoid := r.avoidActive(a, hasAvoid, entry2, model, now)
+	r.mu.RUnlock()
+
+	if !found || expired(entry2, now, r.cfg.TTL) || !r.availableOne(model, entry2.uid) || avoid {
+		return "", false
+	}
+
+	r.touch(key, entry2.uid, model, now)
+
+	return entry2.uid, true
+}
+
 // ResolveForModel 返回会话 key 在该模型上应绑定的账号 uid。
 // 命中且账号在该模型可用 → 滚动 lastActive 并直接返回；否则（绑定号已冷却/占满/
 // 被该模型限流）走重新分配。

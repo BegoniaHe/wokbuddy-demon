@@ -229,6 +229,16 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
 	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)
+	state.SetScheduling(pool.Scheduling{
+		Strategy: map[string]pool.Strategy{
+			"cn":     pool.Strategy(cfg.Pool.Strategy.CN),
+			"global": pool.Strategy(cfg.Pool.Strategy.Global),
+		},
+		Order: map[string][]string{
+			"cn":     cfg.Pool.AccountOrder.CN,
+			"global": cfg.Pool.AccountOrder.Global,
+		},
+	})
 
 	// 会话粘性路由（可配关闭）。
 	sessRouter, redisMode, sessCount := setupSessionRouter(cfg, store, state)
@@ -871,6 +881,16 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 	state9.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	state9.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	state9.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback)
+	state9.SetScheduling(pool.Scheduling{
+		Strategy: map[string]pool.Strategy{
+			"cn":     pool.Strategy(newCfg.Pool.Strategy.CN),
+			"global": pool.Strategy(newCfg.Pool.Strategy.Global),
+		},
+		Order: map[string][]string{
+			"cn":     newCfg.Pool.AccountOrder.CN,
+			"global": newCfg.Pool.AccountOrder.Global,
+		},
+	})
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
