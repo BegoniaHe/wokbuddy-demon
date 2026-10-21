@@ -230,6 +230,9 @@ func (p *Pool) pickOrderedLocked(
 	} else {
 		p.schedulingCursors[key] = chosenIdx
 	}
+	// 游标属于持久化状态：选号本身不写 lastUsed（运行态），必须显式置脏，
+	// 否则连续请求之间没有其它状态变更时游标会一直停留在内存里。
+	p.dirty.Store(true)
 
 	chosen.lastUsed = now
 	p.pickSeq++
