@@ -2349,11 +2349,10 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	credit, total, hasCredit := usageCreditTotal(resp)
+	// 缓存三维观测与流式同源同口径（cacheTokensFromUsage）：非流式此前只看 hit 侧，
+	// miss 显式存在而 hit 缺失时直接丢弃，导致「prompt 数万 + hit=0」误报告警。
 	if usageMap, ok := resp["usage"].(map[string]any); ok {
-		if hit, okH := upstream.UsageCacheHitTokens(usageMap); okH {
-			miss, _ := upstream.UsageCacheMissTokens(usageMap)
-			f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = int64(hit), int64(miss), true
-		}
+		f.setCacheTokensFromUsage(usageMap)
 	}
 
 	f.recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted, 0)
@@ -2376,6 +2375,28 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	return rotDone
+}
+
+// setCacheTokensFromUsage 用聚合响应 usage 填 st 的缓存三维观测（非流式收尾）。
+// 命中/未命中的推导与流式共用 cacheTokensFromUsage，保证两条路径口径一致。
+func (f *chatFlow) setCacheTokensFromUsage(usageMap map[string]any) {
+	promptTokens, hasPrompt := upstream.UsagePromptTokens(usageMap)
+	hit, hasHit := upstream.UsageCacheHitTokens(usageMap)
+	miss, hasMiss := upstream.UsageCacheMissTokens(usageMap)
+
+	hitInt, missInt, ok := cacheTokensFromUsage(cacheTokenTriple{
+		prompt:    int64(promptTokens),
+		hit:       int64(hit),
+		miss:      int64(miss),
+		hasPrompt: hasPrompt,
+		hasHit:    hasHit,
+		hasMiss:   hasMiss,
+	})
+	if !ok {
+		return
+	}
+
+	f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = hitInt, missInt, true
 }
 
 // retryNonStreamAggregateError 处置空流 / EOF 截断：截断的 content 不是完整回答，
