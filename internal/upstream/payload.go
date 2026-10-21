@@ -55,6 +55,10 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
+	// 防御层：第三方把 reasoning_text / reasoning 当成 content part 回放时，上游 content
+	// 类型白名单不含它们 → 400 code=11101。本仓库自带 responses→chat 转换器（responses.go
+	// 里 reasoning item 走 default 丢弃），主链路不会产生该形态；这里只兜第三方客户端。
+	dropReasoningContentParts(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
@@ -340,6 +344,78 @@ func normalizeImageURL(obj map[string]any) {
 			part["image_url"] = map[string]any{"url": imageURL}
 		}
 	}
+}
+
+// dropReasoningContentParts 剔除 chat content 数组里的 reasoning_text / reasoning 片段。
+//
+// 定位：**出站防御层**。某些聚合器/客户端会把 `reasoning_text`（Responses 形态）或
+// `reasoning` 当成 content part 回放进 messages[]，上游对该类型直接 400
+// （code=11101 "unsupported content type"）。本仓库自带上游转换器，主链路不会产生
+// 该形态；把本网关当 chat/completions 上游的第三方仍可能送进来，命中即整请求失败。
+//
+// 规则（与上游语义一致）：
+//   - 删除 type 为 reasoning_text / reasoning 的片段（TrimSpace 后比较）；
+//   - 删除后 content 为空数组且该消息无 tool_calls → 整条消息删除；
+//   - 字符串 content、非对象片段、非数组 content 原样通过（不臆造改写）。
+func dropReasoningContentParts(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+
+	out := make([]any, 0, len(msgs))
+
+	for _, rawMsg := range msgs {
+		msg, ok := rawMsg.(map[string]any)
+		if !ok {
+			out = append(out, rawMsg)
+
+			continue
+		}
+
+		parts, ok := msg["content"].([]any)
+		if !ok {
+			out = append(out, rawMsg)
+
+			continue
+		}
+
+		kept := make([]any, 0, len(parts))
+
+		for _, rawPart := range parts {
+			if part, isObj := rawPart.(map[string]any); isObj {
+				partType, _ := part["type"].(string)
+				if isReasoningPartType(partType) {
+					continue
+				}
+			}
+
+			kept = append(kept, rawPart)
+		}
+
+		if len(kept) == 0 {
+			if _, hasToolCalls := msg["tool_calls"]; !hasToolCalls {
+				continue
+			}
+		}
+
+		msg["content"] = kept
+
+		out = append(out, rawMsg)
+	}
+
+	obj["messages"] = out
+}
+
+// isReasoningPartType 报告 content part 的 type 是否属于思考片段
+// （reasoning_text / reasoning，容忍前后空白）。
+func isReasoningPartType(partType string) bool {
+	switch strings.TrimSpace(partType) {
+	case "reasoning_text", "reasoning":
+		return true
+	}
+
+	return false
 }
 
 // ensureConsoleSystem global realm 兜底 system 注入（吸收 PR #45，防 console 域上游 code 11-128）：
