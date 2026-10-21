@@ -557,6 +557,7 @@ gemini
 ### 1. 凭据管理（auths）
 
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
+- **积分历史账本**：`data/credit-history.json`（与 `state_file` 同目录）记录每次余额变动（时间/账号/变动/变动后余额），最多保留 5000 条，滚动裁剪、先写 tmp 再 rename；首次观测只建基线，异常跳变不记账。属本地观测数据，`data/` 已被 gitignore。
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息
 - **权限**：容器内以 `app` 用户运行；刷新由 `SaveAtomic` 以 `0600` 原子写回；建议手动 `chmod 600 auths/*.json`
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`

@@ -1199,8 +1199,12 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
-	ChatBaseCN    string
-	BillingBaseCN string
+	// BalanceObserver 余额观测回调（可选）：每次成功查询余额后回调 (uid, remain, total)，
+	// 供本地积分账本记录变动。装配期注入、运行期只读；回调 panic 被隔离，
+	// 且回调失败不影响余额查询主路径（账本只是观测附属物）。
+	BalanceObserver func(uid string, remain, total int64)
+	ChatBaseCN      string
+	BillingBaseCN   string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
@@ -3571,7 +3575,24 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
 	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+
 	return remain, total, expiring, err
+}
+
+// notifyBalance 触发余额观测回调（装配期注入，缺省 nil = 关闭）。panic 隔离：
+// 账本是观测附属物，任何异常都不得打断余额查询主路径。
+func (c *Client) notifyBalance(account *auth.Auth, remain, total int64) {
+	if c.BalanceObserver == nil || account == nil {
+		return
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("WARN: [upstream] balance observer panic: %v", recovered)
+		}
+	}()
+
+	c.BalanceObserver(account.UID, remain, total)
 }
 
 // enterpriseUnlimitedRemain / enterpriseUnlimitedTotal 企业版「不限量」在池内的等价表示
@@ -3631,6 +3652,8 @@ func (c *Client) enterpriseResource(
 	}
 	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
 	if limit < 0 {
+		c.notifyBalance(account6, enterpriseUnlimitedRemain, enterpriseUnlimitedTotal)
+
 		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
 	}
 
@@ -3638,6 +3661,9 @@ func (c *Client) enterpriseResource(
 	total = limit
 	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
 	earliestAt, earliestRemaining, expiring = enterpriseExpiryBucket(cycleEnd, cycleReset, remain, time.Now(), soon)
+	// 观测回调挂在具体成功路径（而不是 UserResourceDetailedWithExpiry 包装层），
+	// 这样任何直接调用企业口径的余额查询（如 UserResourceSnapshot）都能记账。
+	c.notifyBalance(account6, remain, total)
 
 	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }
@@ -3794,6 +3820,13 @@ func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, 
 	var out resourceSummaryResp
 	if err := json.Unmarshal(data, &out); err != nil {
 		return resourceSummaryResp{}, fmt.Errorf("resource summary parse: %w", err)
+	}
+
+	// summary 是主余额路径：在数据解析成功后触发观测，下游（personalResource /
+	// UserResourceSnapshot 重构）无需再处理。空 packages 属「回落旧端点」，不记脏数据。
+	if len(out.Packages) > 0 {
+		remain, total := out.summaryTotals()
+		c.notifyBalance(account, remain, total)
 	}
 
 	return out, nil
@@ -4088,6 +4121,11 @@ func (c *Client) personalResource(account *auth.Auth, soon time.Duration) (int64
 	for i := range resp.Response.Data.Accounts {
 		totals.add(&resp.Response.Data.Accounts[i], now, soon)
 	}
+
+	// 观测回调挂在具体成功路径（不是 UserResourceDetailedWithExpiry / UserResourceSnapshot
+	// 包装层）：summary 已在 fetchResourceSummary 记账，企业口径在 enterpriseResource 记账，
+	// 这里补旧端点回退路径。成功才回调，失败不写脏数据。
+	c.notifyBalance(account, totals.remain, totals.total)
 
 	return totals.remain, totals.total, totals.expiring, &totals, nil
 }
