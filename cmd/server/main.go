@@ -234,6 +234,12 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 
 // setupUpstream 装配上游客户端、通知器与调度器，并注入账号路由与倍率读取。
 func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.Notifier, *scheduler.Scheduler) {
+	// 出站 DNS 必须在 upstream.New() **之前**注入：Transport/Dialer（含 Resolver）
+	// 在 New() 内一次性构造，运行期改无效——所以 dns_servers 被列为「需重启」。
+	// 空 = 系统解析器（零回归）；internal/server/localwebtools.go 的 SSRF 专用
+	// Transport 不经这里，保持不受影响。
+	upstream.SetDNSServers(cfg.DNSServers)
+
 	client := upstream.New()
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
@@ -943,6 +949,8 @@ var restartFieldPaths = []string{
 	"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip",
 	"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
 	"upstream.proxies",
+	// 出站解析器在 Dialer 构造期一次性装入，运行期改无效。
+	"dns_servers",
 	// global 路由在 configureUpstream / auth / handler 构造期捕获。
 	"global.enabled", "global.chat_base", "global.billing_base",
 	// cn.chat_base 同样在 configureUpstream 一次性写入 client。

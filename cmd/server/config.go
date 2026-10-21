@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -36,6 +38,7 @@ var (
 	errNormalizeNotifyFailed            = errors.New("normalizeNotify failed")
 	errNormalizeLoggingFailed           = errors.New("normalizeLogging failed")
 	errNormalizeProxiesFailed           = errors.New("normalizeProxies failed")
+	errNormalizeDNSServersFailed        = errors.New("normalizeDNSServers failed")
 	errValidateBackoffOrderFailed       = errors.New("validateBackoffOrder failed")
 	errValidateServerRangesFailed       = errors.New("validateServerRanges failed")
 	errValidateRangesFailed             = errors.New("validateRanges failed")
@@ -63,6 +66,12 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// DNSServers 出站 DNS 服务器（host 或 host:port，按顺序尝试，缺省端口 53）。
+	// 空 = 系统解析器（零回归）。用途：绕过污染解析、把上游域名固定到可控出口。
+	// 属连接层参数（Transport 在装配期构造），改后**需重启**。
+	// 环境变量 WB2A_DNS（逗号分隔）覆盖此处配置。
+	DNSServers []string `json:"dns_servers"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -823,6 +832,10 @@ func applyEnvFeatures(config6 *Config) {
 	if b, ok := envBool("WB2A_CROSS_DOMAIN_FALLBACK"); ok {
 		config6.Pool.CrossDomainFallback = b
 	}
+
+	if v := os.Getenv("WB2A_DNS"); strings.TrimSpace(v) != "" {
+		config6.DNSServers = strings.Split(v, ",")
+	}
 }
 
 // envInt 读取整型环境变量：键缺席或解析失败一律视为未设置（ok=false），
@@ -872,6 +885,7 @@ func (c *Config) normalize() error {
 		c.normalizeHiddenModels,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
+		c.normalizeDNSServers,
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -982,6 +996,43 @@ func (c *Config) normalizeHiddenModels() error {
 	return nil
 }
 
+// normalizeDNSServers 规范化出站 DNS 服务器列表：去空白、去重、丢弃空项，
+// 并拒绝带 scheme/路径与非法端口的写法。非法值**拒启动**——自定义解析器出错会
+// 影响全部出站请求，宁可开机失败也不要运行期静默失败。
+func (c *Config) normalizeDNSServers() error {
+	if len(c.DNSServers) == 0 {
+		c.DNSServers = nil
+		return nil
+	}
+
+	seen := make(map[string]bool, len(c.DNSServers))
+
+	out := make([]string, 0, len(c.DNSServers))
+
+	for _, raw := range c.DNSServers {
+		server := strings.TrimSpace(raw)
+		if server == "" || seen[server] {
+			continue
+		}
+
+		if err := validateDNSServer(server); err != nil {
+			return err
+		}
+
+		seen[server] = true
+
+		out = append(out, server)
+	}
+
+	if len(out) == 0 {
+		out = nil
+	}
+
+	c.DNSServers = out
+
+	return nil
+}
+
 // splitHiddenRealmPrefix 拆分 models.hidden 里的可选 realm 前缀（只认 cn/global，
 // 大小写敏感；其余原样当作裸模型名，避免与含冒号的模型名混淆）。
 func splitHiddenRealmPrefix(name string) (realm, bare string, prefixed bool) {
@@ -992,6 +1043,41 @@ func splitHiddenRealmPrefix(name string) (realm, bare string, prefixed bool) {
 	}
 
 	return "", name, false
+}
+
+// validateDNSServer 校验单个 DNS 服务器：接受 host / host:port / [IPv6]:port，
+// 拒绝带 scheme、路径或非法端口的写法。
+func validateDNSServer(server string) error {
+	if strings.Contains(server, "://") || strings.ContainsAny(server, "/ ") {
+		return fmt.Errorf("dns_servers[%q]: 只接受 host 或 host:port（不要带 scheme/路径）: %w",
+			server, errNormalizeDNSServersFailed)
+	}
+
+	host := server
+
+	if parsedHost, port, err := net.SplitHostPort(server); err == nil {
+		host = parsedHost
+
+		if num, convErr := strconv.Atoi(port); convErr != nil || num <= 0 || num > 65535 {
+			return fmt.Errorf("dns_servers[%q]: 端口必须是 1-65535 的数字: %w",
+				server, errNormalizeDNSServersFailed)
+		}
+	} else if strings.Contains(server, ":") {
+		// 没有可解析的端口，但含冒号：只可能是裸 IPv6（可带方括号）。
+		// 形如 "1.1.1.1:53:54" / "foo::bar:baz" 的畸形写法必须拒绝，否则启动后
+		// 全部出站解析都会指向一个不可用的地址。
+		host = strings.TrimSuffix(strings.TrimPrefix(server, "["), "]")
+		if _, addrErr := netip.ParseAddr(host); addrErr != nil {
+			return fmt.Errorf("dns_servers[%q]: 只接受 host / host:port / [IPv6]:port: %w",
+				server, errNormalizeDNSServersFailed)
+		}
+	}
+
+	if host == "" {
+		return fmt.Errorf("dns_servers[%q]: host 不能为空: %w", server, errNormalizeDNSServersFailed)
+	}
+
+	return nil
 }
 
 // normalizeAliasTarget 去掉目标首尾空白并校验 "[realm:]model"：冒号前只允许
