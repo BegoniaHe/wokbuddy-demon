@@ -382,9 +382,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.cfg.RequestLog != nil && r.Method == http.MethodPost &&
-		(r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/messages" ||
-			r.URL.Path == "/v1/responses" || requestsGemini(r)) {
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && h.tracedPath(r) {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now(), path: r.URL.Path}
 		if h.loadLive().RecordClientInfo {
 			trace.captureClientInfo(r, h.cfg.TrustedProxies)
@@ -2062,6 +2060,17 @@ func (f *chatFlow) handleHTTPError(
 	f.rotateReason = kind.String()
 
 	return rotContinue
+}
+
+// tracedPath 报告该请求是否纳入请求日志记账（archived 路径集合集中在此，
+// 新增网关 POST 接口时只改这一处）。
+func (h *Handler) tracedPath(r *http.Request) bool {
+	switch r.URL.Path {
+	case "/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/search/messages":
+		return true
+	}
+
+	return requestsGemini(r)
 }
 
 // registerSearchRoute 注册官方联网搜索端点（与 /v1/messages 并列，不遮蔽既有路由）。

@@ -20,6 +20,8 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -51,7 +53,15 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	outcome, fail := h.runSearch(r.Context(), req.query, req.maxResults, &upstream.ChatMeta{})
+	outcome, uid, fail := h.runSearch(r.Context(), req.query, req.maxResults, &upstream.ChatMeta{})
+	// 请求日志记账：搜索路径没有 chatStat，账号/模型/结果显式写进 trace
+	// （trace 由 ServeHTTP 在 /v1/search/messages 上创建，开关与其它 POST 接口一致）。
+	if fail == nil {
+		requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeSuccess)
+	} else {
+		requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeHTTPError)
+	}
+
 	if fail != nil {
 		writeAnthropicError(w, fail.status, searchErrorType(fail.status), fail.msg, fail.hint)
 
@@ -218,6 +228,19 @@ func buildSearchMessage(model string, outcome *upstream.SearchOutcome) map[strin
 		"stop_sequence": nil,
 		"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
 	}
+}
+
+// accountNickname 取账号昵称（记账展示用；账号已移除时返回空串）。
+func accountNickname(h *Handler, uid string) string {
+	if uid == "" {
+		return ""
+	}
+
+	if acct := h.cfg.Pool.AuthByUID(uid); acct != nil {
+		return acct.NicknameValue()
+	}
+
+	return ""
 }
 
 // searchErrorType 把终端状态码映射成 Anthropic 错误类型。

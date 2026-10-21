@@ -31,13 +31,14 @@ type searchFailure struct {
 	hint   string
 }
 
-// runSearch 执行一次联网搜索（内部有界轮转）。返回 (结果, 失败形态) 二选一。
+// runSearch 执行一次联网搜索（内部有界轮转），并返回最终服务该请求的账号 UID
+// （供请求日志记账：搜索路径没有 chatStat，账号/模型要显式写进 trace）。
 //
 // 错误处置与 chat 同口径：`applyErrorPolicy` 决定是否罚号（限流软冷却 / 会话失效禁用 /
 // 额度硬冷却等），fail-fast 类错误（内容拦截、参数错误、模型类）不再轮转。
 func (h *Handler) runSearch(
 	ctx context.Context, query string, maxResults int, meta *upstream.ChatMeta,
-) (*upstream.SearchOutcome, *searchFailure) {
+) (*upstream.SearchOutcome, string, *searchFailure) {
 	tried := map[string]bool{}
 	attempts := max(h.cfg.MaxRotate+1, 1)
 
@@ -47,10 +48,10 @@ func (h *Handler) runSearch(
 		acct := h.cfg.Pool.PickExcludingForRealm(tried, "", searchRealm)
 		if acct == nil {
 			if lastFail != nil {
-				return nil, lastFail
+				return nil, "", lastFail
 			}
 
-			return nil, &searchFailure{
+			return nil, "", &searchFailure{
 				status: http.StatusServiceUnavailable,
 				code:   "no_healthy_account",
 				msg:    "all accounts are temporarily unavailable, please retry later",
@@ -69,13 +70,13 @@ func (h *Handler) runSearch(
 		h.cfg.Pool.Release(acct.UID)
 
 		if fail == nil {
-			return outcome, nil
+			return outcome, acct.UID, nil
 		}
 
 		lastFail = fail
 		// 请求级错误/内容拦截/队列满/鉴权终态：换号无意义，直接返回。
 		if fail.code != "" {
-			return nil, fail
+			return nil, acct.UID, fail
 		}
 
 		if !rotateBackoff(ctx, i) {
@@ -84,10 +85,10 @@ func (h *Handler) runSearch(
 	}
 
 	if lastFail != nil {
-		return nil, lastFail
+		return nil, "", lastFail
 	}
 
-	return nil, &searchFailure{
+	return nil, "", &searchFailure{
 		status: http.StatusServiceUnavailable,
 		code:   "no_healthy_account",
 		msg:    "all accounts are temporarily unavailable, please retry later",

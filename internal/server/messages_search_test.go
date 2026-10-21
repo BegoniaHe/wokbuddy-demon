@@ -11,6 +11,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -222,5 +223,32 @@ func TestSearchDoesNotShadowMessages(t *testing.T) {
 	// 既有路径：会走向上游 chat（假上游对任何路径都回搜索体，必然不是 404 的「未注册」）。
 	if rec.Code == http.StatusNotFound && strings.Contains(rec.Body.String(), "search endpoint") {
 		t.Fatalf("/v1/messages 被搜索端点遮蔽：%s", rec.Body)
+	}
+}
+
+// TestSearchRecordsRequestTrace 搜索请求在请求日志里留下真实 path / 账号 / 模型。
+func TestSearchRecordsRequestTrace(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) { return 200, searchOKBody })
+
+	// 打开请求归档（trace 只在 RequestLog 存在时创建）。
+	recorder := reqlog.New(reqlog.Config{Dir: t.TempDir(), Enabled: true})
+	t.Cleanup(recorder.Close)
+	handler.cfg.RequestLog = recorder
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/search/messages",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"golang"}]}],"tools":[{"name":"web_search"}]}`))
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if rec.Header().Get("X-Request-ID") == "" {
+		t.Error("搜索请求应带 X-Request-ID（与其他 POST 接口同口径）")
 	}
 }
