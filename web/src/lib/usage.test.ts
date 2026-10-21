@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fmtTokTimeLabel, parsePointTime, usDayHeatmap, usTrendPoints, type SeriesPoint } from './usage';
+import { chartLayout, fmtTokTimeLabel, parsePointTime, usDayHeatmap, usTrendPoints, type SeriesPoint } from './usage';
 
 describe('parsePointTime / fmtTokTimeLabel', () => {
   it('小时桶（13 字符）正确解析，不产生 NaN:00', () => {
@@ -90,5 +90,33 @@ describe('usTrendPoints（issue #111）', () => {
 
   it('空数据返回空数组', () => {
     expect(usTrendPoints([], 'tokens')).toEqual([]);
+  });
+});
+
+describe('chartLayout（窄屏时序图）', () => {
+  it('宽屏保持既有 1200×200 / 6 刻度（零回归）', () => {
+    const l = chartLayout(false);
+    expect(l.W).toBe(1200);
+    expect(l.H).toBe(200);
+    expect(l.ticks).toBe(6);
+    expect(l.PL).toBe(58);
+    expect(l.PR).toBe(14);
+    expect(l.iw).toBe(1200 - 58 - 14);
+    expect(l.ih).toBe(200 - 18 - 30);
+  });
+
+  it('窄屏 440×230 / 4 刻度，绘制区仍为正', () => {
+    const l = chartLayout(true);
+    expect(l.W).toBe(440);
+    expect(l.H).toBe(230);
+    expect(l.ticks).toBe(4);
+    expect(l.iw).toBeGreaterThan(0);
+    expect(l.ih).toBeGreaterThan(0);
+  });
+
+  it('窄屏绘制区不被边距吃掉（iw/ih 与参数一致）', () => {
+    const l = chartLayout(true);
+    expect(l.iw).toBe(l.W - l.PL - l.PR);
+    expect(l.ih).toBe(l.H - l.PT - l.PB);
   });
 });

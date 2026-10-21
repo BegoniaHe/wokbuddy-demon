@@ -205,3 +205,41 @@ export function usTrendPoints(series: SeriesPoint[], metric: TrendMetric): Trend
   out.sort((a, b) => a.t - b.t);
   return out;
 }
+
+// ── 时序图布局（窄屏适配，issue #202）───────────────────────────────
+
+export interface ChartLayout {
+  W: number;
+  H: number;
+  PL: number;
+  PR: number;
+  PT: number;
+  PB: number;
+  iw: number;
+  ih: number;
+  ticks: number;
+}
+
+// chartLayout 时序图的布局参数：宽屏保持既有 1200×200 / 6 刻度（零回归），
+// 窄屏改用 440×230 / 4 刻度——固定宽 viewBox 在 360px 屏上会被缩到约 0.28 倍，
+// 刻度与线条不可读。
+export function chartLayout(narrow: boolean): ChartLayout {
+  const W = narrow ? 440 : 1200;
+  const H = narrow ? 230 : 200;
+  const PL = narrow ? 44 : 58;
+  const PR = narrow ? 10 : 14;
+  const PT = 18;
+  const PB = narrow ? 26 : 30;
+
+  return {
+    W,
+    H,
+    PL,
+    PR,
+    PT,
+    PB,
+    iw: W - PL - PR,
+    ih: H - PT - PB,
+    ticks: narrow ? 4 : 6,
+  };
+}
