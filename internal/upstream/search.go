@@ -143,7 +143,10 @@ func (c *Client) Search(ctx context.Context, account *auth.Auth, query string, m
 	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatBase(account)+searchPath, bytes.NewReader(body))
+	// chat base 允许 host / host/v2 / host/v2/chat/completions 三种配置形态（见
+	// normalizeChatBase）：搜索与 chat 同源，必须先归一再拼搜索路径，否则
+	// cn.chat_base 配成 /v2 形态时会拼出 /v2/agenttool/v1/search。
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+searchPath, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("search request: %w", err)
 	}

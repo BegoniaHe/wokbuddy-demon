@@ -44,6 +44,36 @@ func TestSearchRequestShape(t *testing.T) {
 	}
 }
 
+// TestSearchUsesNormalizedChatBase chat base 允许 host / host/v2 /
+// host/v2/chat/completions 三种配置形态（与 chat 同口径）：搜索端点必须先归一，
+// 否则会拼出 /v2/agenttool/v1/search 之类的错误路径。
+func TestSearchUsesNormalizedChatBase(t *testing.T) {
+	t.Parallel()
+
+	for _, base := range []string{
+		"https://srv.example",
+		"https://srv.example/v2",
+		"https://srv.example/v2/chat/completions",
+	} {
+		var gotHost, gotPath string
+
+		client := testClient(func(r *http.Request) (*http.Response, error) {
+			gotHost, gotPath = r.URL.Host, r.URL.Path
+
+			return jsonResp(200, `{"query":"q","results":[]}`), nil
+		})
+		client.ChatBaseCN = base
+
+		if _, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{}); err != nil {
+			t.Fatalf("base=%q search: %v", base, err)
+		}
+
+		if gotHost != "srv.example" || gotPath != searchPath {
+			t.Errorf("base=%q -> host=%q path=%q want srv.example %s", base, gotHost, gotPath, searchPath)
+		}
+	}
+}
+
 // assertSearchRequestShape 断言路径 / body 形状 / 三个覆盖头。
 func assertSearchRequestShape(t *testing.T, path, body, accept, contentType, intent, runtime string) {
 	t.Helper()
