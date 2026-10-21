@@ -99,6 +99,56 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	if len(table["machineId"].(string)) != 36 {
 		t.Errorf("machineId 长度=%d want 36", len(table["machineId"].(string)))
 	}
+
+	assertDesktopMachineFingerprint(t, table)
+}
+
+// assertDesktopMachineFingerprint 断言真机 OS 处理器字段，并确认不伪造 qimei36。
+func assertDesktopMachineFingerprint(t *testing.T, table map[string]any) {
+	t.Helper()
+
+	if table["cpuModel"] == nil || table["cpuModel"] == "" {
+		t.Errorf("cpuModel 缺失（真机 os 处理器必带）")
+	}
+
+	if _, ok := table["qimei36"]; ok {
+		t.Error("不应上报 qimei36（无真实设备标识，派生值属于伪造）")
+	}
+}
+
+// TestDesktopFingerprintPerRealm 桌面指纹的版本三元组/UA 按 realm 分档，
+// 且两域都不注入 qimei36。
+func TestDesktopFingerprintPerRealm(t *testing.T) {
+	t.Parallel()
+
+	cnAccount := &auth.Auth{UID: "u-cn", Nickname: "cn", AccessToken: "at"}
+	globalAccount := &auth.Auth{UID: "u-gl", Nickname: "gl", AccessToken: "at", Domain: "www.workbuddy.ai"}
+
+	cnFP := desktopFingerprint(cnAccount)
+	if cnFP["ideVersion"] != cnClientVersion || cnFP["commit"] != cnDesktopCommit {
+		t.Errorf("CN 版本三元组=%v/%v", cnFP["ideVersion"], cnFP["commit"])
+	}
+
+	if _, ok := cnFP["qimei36"]; ok {
+		t.Error("CN 指纹不应带 qimei36")
+	}
+
+	globalFP := desktopFingerprint(globalAccount)
+	if globalFP["ideVersion"] != globalClientVersion || globalFP["commit"] != globalDesktopCommit {
+		t.Errorf("global 版本三元组=%v/%v", globalFP["ideVersion"], globalFP["commit"])
+	}
+
+	if _, ok := globalFP["qimei36"]; ok {
+		t.Error("global 指纹不应带 qimei36")
+	}
+
+	if got, want := desktopUAFor(cnAccount), "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+		t.Errorf("CN desktop UA=%q want %q", got, want)
+	}
+
+	if got, want := desktopUAFor(globalAccount), "workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"; got != want {
+		t.Errorf("global desktop UA=%q want %q", got, want)
+	}
 }
 
 // TestDesktopChatSequenceShape 断言完整对话事件链的事件码顺序与关键字段。

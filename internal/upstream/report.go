@@ -71,8 +71,9 @@ func (c *Client) domainJSONLimitHeaders(
 }
 
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
-// 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
-// （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
+// 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时换有 /v2 前缀
+// （上游新旧路径分叉）；cn 先有 /v2，404 时回落无 /v2（官方桌面 resourcePrefix 为空）。
+// 两 realm 都可能在 404 时换路径。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.RawMessage, error) {
 	return c.billingMeterJSONLimit(a, paths, body, defaultJSONBodyLimit)
 }

@@ -775,3 +775,27 @@ func mustMarshal(t *testing.T, v any) string {
 
 	return string(raw)
 }
+
+// TestEnsureLeadingSystem 首条非 system 时补官方 fallback；已是 system 时逐字不动。
+func TestEnsureLeadingSystem(t *testing.T) {
+	t.Parallel()
+
+	out := ensureLeadingSystem([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := obj["messages"].([]any)
+
+	first := msgs[0].(map[string]any)
+	if first["role"] != "system" || first["content"] != LeadingSystemFallback {
+		t.Fatalf("first=%v", first)
+	}
+
+	in := []byte(`{"messages":[{"role":"system","content":"S"}]}`)
+	if got := ensureLeadingSystem(in); string(got) != string(in) {
+		t.Fatalf("system-first body changed: %s", got)
+	}
+}

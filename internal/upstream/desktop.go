@@ -5,7 +5,7 @@
 // 不是独立端点，而是同一 POST /v2/report 通道上**不同的客户端指纹**：
 //
 //	POST https://www.workbuddy.cn/v2/report           ← chatBase（CLI 上报走 billingBase）
-//	User-Agent: WorkBuddy/<realm 版本>
+//	User-Agent: 两段品牌 WorkBuddy/<ver> + CLI/<cli>（global 品牌段为 workbuddy-ai）
 //	X-Domain: www.workbuddy.cn（host 形态）, X-Product: SaaS, X-User-Id: <uid>
 //	Body: [ {...event...} ]                           ← 数组
 //
@@ -45,6 +45,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/cpupool"
 )
 
 const (
@@ -86,10 +87,18 @@ func desktopBuildFor(a *auth.Auth) desktopBuild {
 	return desktopBuild{version: cnClientVersion, commit: cnDesktopCommit, releaseDate: cnDesktopReleaseDate}
 }
 
-// desktopUAFor 桌面上报/白名单类出站 UA：单段 `WorkBuddy/<realm 版本>`
-// （官方 daemon 上报头组 `${applicationName}/${appVersion}` 形态，不带 CLI 段）。
+// desktopUAFor 桌面上报/白名单类出站 UA：两段品牌 + CLI 段
+// （`WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cli>`；global 品牌段为 `workbuddy-ai`）。
+// 与 chat 链路的 SDK 形态不同：这是 /v2/report 等非 SDK 请求的官方形态。
 func desktopUAFor(a *auth.Auth) string {
-	return "WorkBuddy/" + desktopBuildFor(a).version
+	build := desktopBuildFor(a)
+
+	brand, cli := "WorkBuddy", cnCliVersion
+	if a != nil && a.IsGlobal() {
+		brand, cli = "workbuddy-ai", globalCliVersion
+	}
+
+	return brand + "/" + build.version + " " + brand + "/" + build.version + " CLI/" + cli
 }
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（CN 默认 www.workbuddy.cn）。
@@ -105,7 +114,7 @@ func (c *Client) desktopDomain(a *auth.Auth) string {
 	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
 }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/qimei36 复用），
+// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/sessionId 等复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
 func deriveID(a *auth.Auth, salt string) string {
 	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
@@ -143,6 +152,15 @@ var desktopMemBands = []struct {
 	{32, []int{32}},
 }
 
+// desktopCPUModel 按逻辑线程数与 uid 稳定选一个 CPU 型号：同一账号恒定，
+// 不同账号可不同。官方 os 处理器上报的是逻辑处理器数，故按线程档取型号。
+func desktopCPUModel(account *auth.Auth, cpuCores int) string {
+	pool := cpupool.ModelsForThreads(cpuCores)
+	rng := desktopRNG(account, "cpu")
+
+	return pool[rng.IntN(len(pool))].Name
+}
+
 // desktopRNG 由 uid + salt 稳定派生一个确定性 PRNG：同一账号每次得到同一序列，
 // 不同账号互不相关（避免所有机器同一套硬件参数）。
 func desktopRNG(a *auth.Auth, salt string) *rand.Rand {
@@ -156,8 +174,8 @@ func desktopRNG(a *auth.Auth, salt string) *rand.Rand {
 
 // desktopHardware 由 uid 稳定派生一台「固定设备」的 osVersion/cpuCores/memorySize：
 //   - osVersion：按版本权重轮换（上表）；
-//   - cpuCores：N(10, 5.5) 取偶后截断到 [4,32]——8~12 核的装机量占多数，
-//     16 核以上是少数，4 核为老机型；
+//   - cpuCores：N(10, 5.5) 取偶后截断到 [4,32]，再归到 CPU 型号池线程档——
+//     8~12 线程的装机量占多数，16 线程以上是少数，4 线程为老机型；
 //   - memorySize：按核心数分档加权抽样，核多内存大，16GB 最主流。
 func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) {
 	rng := desktopRNG(a, "hardware")
@@ -182,6 +200,8 @@ func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) 
 
 	cpuCores = int(math.Round((rng.NormFloat64()*5.5+10)/2)) * 2 // 偶数核
 	cpuCores = min(max(cpuCores, 4), 32)
+	// 归到 CPU 型号池的线程档，避免 cpuCores 与 cpuModel 的线程数互相矛盾。
+	cpuCores = cpupool.SnapThreads(cpuCores)
 
 	mem := []int{32}
 
@@ -201,10 +221,11 @@ func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 // 版本/commit/releaseDate 按 realm 取官方分发包真值；os/arch 固定为常见桌面
 // （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台；
-// osVersion/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
+// osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
 func desktopFingerprint(account7 *auth.Auth) map[string]any {
 	desktopBuild2 := desktopBuildFor(account7)
 	osVersion, cpuCores, memorySize := desktopHardware(account7)
+	cpuModel := desktopCPUModel(account7, cpuCores)
 	now := time.Now().UnixMilli()
 
 	fingerprint := map[string]any{
@@ -226,11 +247,15 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    osVersion,
+		"cpuModel":     cpuModel,
 		"cpuCores":     cpuCores,
 		"memorySize":   memorySize,
 		"timestamp":    now,
 		"presentAt":    now,
 	}
+
+	// qimei36 故意不注入：网关没有真实腾讯设备标识，派生值属于伪造，
+	// 宁可缺这个键也不误报。
 
 	if account7.EnterpriseID != "" {
 		fingerprint["enterpriseId"] = account7.EnterpriseID
@@ -242,7 +267,7 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 
 // ReportDesktopEvent 以桌面客户端指纹向 chatBase 的 /v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
-// 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
+// 业务字段优先（可用于覆盖 machineId 等设备标识做真实设备对齐）。
 func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent) error {
 	if len(events) == 0 {
 		return errDesktopReportNoEvents

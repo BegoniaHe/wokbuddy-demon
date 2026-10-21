@@ -46,7 +46,7 @@ const (
 	//
 	// 注意：本常量只是 newTransport 的构造默认，main.go 会按 config
 	// upstream.header_timeout_seconds 无条件覆盖。因此生产生效值 = config
-	// 解析值（未配置时 normalize 回落 1200s），本 60s 仅作
+	// 解析值（未配置时 normalize 回落 120s/300s），本 60s 仅作
 	// 「Config 未接线/测试裸用」时的安全网。
 	responseHeaderTimeout = 60 * time.Second
 	// writeTimeout 单次出站 Write 的上限（每次 Write 前重设，非整请求总时长）。

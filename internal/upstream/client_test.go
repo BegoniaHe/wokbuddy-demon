@@ -137,19 +137,21 @@ func TestClassify(t *testing.T) {
 		{400, `{"error":{"data":{"code":11129}}}`, ErrBadParams},
 		{400, `{"bizCode":11129,"msg":"tool schema invalid"}`, ErrBadParams},
 		{400, `{"bizCode":"11148"}`, ErrBadParams},
-		// 11136 账号级权限缺失 → 换号 + 模型避让；11141 平台下线 → fail-fast。
+		// 11136/11158 账号级权限缺失 → 换号 + 模型避让；11141 平台下线 → fail-fast。
 		{400, `{"code":11136,"msg":"no model permission"}`, ErrModelBlocked},
+		{400, `{"code":11158,"msg":"model is not allowed for user type"}`, ErrModelBlocked},
 		{400, `{"code":11141,"msg":"model offline"}`, ErrModelAccess},
 		{400, `{"error":{"data":{"code":11141}}}`, ErrModelAccess},
 		{400, `{"bizCode":11136}`, ErrModelBlocked},
 		// 11158 账号类型级模型权限拒绝（`model [x] is not allowed for user type [y]`）：
-		// 与 11136 同族 → 换号 + 模型避让。**与上游刻意不同**：上游把 429+11158 归
-		// 软限流（逐号冷却），本 fork 判定与状态码无关（同一码值不因状态码分叉），
-		// 429 同样归模型权限，避免权限拒绝让整池健康号陪跑软冷却。
+		// 400/404 与 11136 同族 → 换号 + 模型避让；429 带权限码按限流语义（与
+		// linguo/misakano/csszyft 同口径），由 handler 走软限流换号。
 		{400, `{"code":11158,"msg":"model [x] is not allowed for user type [y]"}`, ErrModelBlocked},
 		{400, `{"code":"11158"}`, ErrModelBlocked},
 		{400, `{"msg":"model [x] is not allowed for user type [y]"}`, ErrModelBlocked},
-		{429, `{"code":11158,"msg":"model [x] is not allowed for user type [y]"}`, ErrModelBlocked},
+		{429, `{"code":11158,"msg":"model [x] is not allowed for user type [y]"}`, ErrSoftRate},
+		// 14003 模型繁忙：429 限流语义（模型级短窗口）。
+		{429, `{"code":14003,"msg":"too many requests"}`, ErrSoftRate},
 		// 11-128 入站内容拦截（与出站 sanitize 同语义），不依赖文案 marker。
 		{400, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
 		{200, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
@@ -227,6 +229,28 @@ func TestIsModelRateLimit(t *testing.T) {
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
 			t.Errorf("IsModelRateLimit(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// TestIsModelBusy 14003 与 6004 的 code 判定互不误伤。
+func TestIsModelBusy(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		body string
+		want bool
+	}{
+		{`{"code":14003,"msg":"too many requests"}`, true},
+		{`{"code": 14003}`, true},
+		{`{"code":"14003"}`, true},
+		{`{"code":6004,"msg":"model usage limit"}`, false},
+		{`{"code":140030,"msg":"other"}`, false},
+		{`{"requestId":"14003","msg":"ok"}`, false},
+	}
+	for _, tc := range cases {
+		if got := IsModelBusy(tc.body); got != tc.want {
+			t.Errorf("IsModelBusy(%s)=%v want %v", tc.body, got, tc.want)
 		}
 	}
 }
@@ -934,5 +958,40 @@ func assertV3Overlay(t *testing.T, modelInfo ModelInfo) {
 
 	if got := strings.Join(modelInfo.Efforts, ","); got != "low,high,max" {
 		t.Errorf("Efforts=%v want low,high,max", modelInfo.Efforts)
+	}
+}
+
+// TestUserResourceCNFallsBackToNoPrefix 官方 CN 桌面 resourcePrefix 为空；
+// /v2 404 时必须回落 /billing/meter/get-user-resource。
+func TestUserResourceCNFallsBackToNoPrefix(t *testing.T) {
+	t.Parallel()
+
+	var v2Calls, plainCalls int
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "get-user-resource-summary"):
+			return jsonResp(http.StatusNotFound, `{"code":404}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource"):
+			v2Calls++
+			return jsonResp(http.StatusNotFound, `{"code":404}`), nil
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource"):
+			plainCalls++
+
+			return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
+				{"CycleCapacitySize":1000,"CycleCapacityRemain":700,"CycleCapacityUsed":300}
+			]}}}}`), nil
+		default:
+			return jsonResp(http.StatusNotFound, `{"code":404}`), nil
+		}
+	})
+
+	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil || remain != 700 || total != 1000 {
+		t.Fatalf("remain=%d total=%d err=%v want 700/1000", remain, total, err)
+	}
+
+	if v2Calls != 1 || plainCalls != 1 {
+		t.Fatalf("v2Calls=%d plainCalls=%d want 1/1", v2Calls, plainCalls)
 	}
 }

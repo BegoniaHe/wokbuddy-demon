@@ -483,3 +483,13 @@ func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
 }
+
+// TestSanitizeDSHHarness DSH 身份句品牌词被改写（上游按非官方渠道整单拦）。
+func TestSanitizeDSHHarness(t *testing.T) {
+	t.Parallel()
+
+	got := sanitizeText("You are a coding agent running in DeepSeek Harness.")
+	if strings.Contains(got, "DeepSeek Harness") || !strings.Contains(got, "DeepSeekRuntime") {
+		t.Fatalf("sanitized=%q want DeepSeekRuntime", got)
+	}
+}

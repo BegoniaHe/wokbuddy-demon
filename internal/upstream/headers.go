@@ -4,7 +4,9 @@ package upstream
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -198,7 +200,8 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：入站头/body 提取值，空则不发（透传优先，不伪造）
+	ConversationID        string // X-Conversation-ID：入站头/body 提取值，非空时优先
+	ConversationHeaderID  string // X-Conversation-ID 出站兜底：客户端没给会话 ID 时由 handler 合成；仅进出站头，不进 prompt cache key
 	ConversationRequestID string // X-Conversation-Request-ID：聚合主键，必发
 	RootRequestID         string // X-Root-Request-ID：入站透传值，空则回落 conversationRequestID
 	ParentConversationID  string // X-Parent-Conversation-ID：入站透传值，空则不发
@@ -246,6 +249,8 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	}
 	// 用量归属头：默认伪造官方桌面端指纹（client_name 非空 = 自定义归属逃生门）。
 	c.injectAttribution(req, account3)
+	// 企业/静态 Key 的 CLI 身份头（个人号不注入）。
+	c.injectIdentityHeaders(req, account3)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
@@ -320,7 +325,7 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) 
 //     16/32 hex TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId
 //     回落 messageID（恒 32 hex），SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
 //   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
-//     conversationId 稳定派生 v4 形态 UUID；无 conversationId 时不注入。
+//     conversationId（或出站兜底 ConversationHeaderID）稳定派生 v4 形态 UUID。
 //
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单。
 func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
@@ -333,9 +338,14 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 
 	messageID := session.NewMessageID()
 
-	if meta.ConversationID != "" {
-		req.Header.Set("X-Conversation-Id", meta.ConversationID)
-		req.Header.Set("Acp-Connection-Id", acpConnectionID(meta.ConversationID))
+	convID := meta.ConversationID
+	if convID == "" {
+		convID = meta.ConversationHeaderID
+	}
+
+	if convID != "" {
+		req.Header.Set("X-Conversation-Id", convID)
+		req.Header.Set("Acp-Connection-Id", acpConnectionID(convID))
 	}
 
 	req.Header.Set("X-Conversation-Request-Id", convReqID)
@@ -452,6 +462,41 @@ func (c *Client) injectAttribution(req *http.Request, account4 *auth.Auth) {
 	req.Header.Set("X-Product", product)
 }
 
+// injectIdentityHeaders 注入官方 CLI 的身份头族（企业/静态 Key 形态）。
+// 个人号三值全空 → 不注入（官方个人号同样不发，补空值反而是伪造指纹）。
+func (c *Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
+	if account == nil || account.UID == "" {
+		return
+	}
+
+	method := account.TokenSource()
+
+	enterprise := strings.TrimSpace(account.EnterpriseID)
+	if enterprise == "" && method == "" {
+		return
+	}
+
+	if method != "" {
+		req.Header.Set("X-Auth-Method", method)
+	}
+
+	payload := map[string]any{"uin": account.UID}
+	if enterprise != "" {
+		payload["owner_uin"] = enterprise
+	}
+
+	if method != "" {
+		payload["token_source"] = method
+	}
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	req.Header.Set("X-Userinfo", base64.StdEncoding.EncodeToString(raw))
+}
+
 // injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游（三等价头）。
 func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 	if c == nil || !c.PassthroughIP || clientIP == "" {
@@ -461,29 +506,6 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 	req.Header.Set("X-Forwarded-For", clientIP)
 	req.Header.Set("X-Real-IP", clientIP)
 	req.Header.Set("X-Client-Ip", clientIP)
-}
-
-// ExtractClientIP 从入站请求提取客户端 IP 首段（X-Forwarded-For 首段，回落 X-Real-IP）。
-func ExtractClientIP(r *http.Request) string {
-	if r == nil {
-		return ""
-	}
-
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		for i := range len(xff) {
-			if xff[i] == ',' {
-				return strings.TrimSpace(xff[:i])
-			}
-		}
-
-		return strings.TrimSpace(xff)
-	}
-
-	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
-		return realIP
-	}
-
-	return ""
 }
 
 // BillingHeaders billing 接口请求头。

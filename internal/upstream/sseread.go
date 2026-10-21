@@ -50,6 +50,10 @@ func readSSELine(br *bufio.Reader) (string, error) {
 			return "", fmt.Errorf("%w: > %d bytes", ErrSSELineTooLong, MaxSSELineBytes)
 		}
 
+		if err == nil && builder.Len() == 0 {
+			return string(chunk), nil // 快路径：单次 ReadSlice 即完整一行，省去 Builder 拷贝
+		}
+
 		builder.Write(chunk)
 
 		if err == nil {

@@ -442,6 +442,32 @@ func assertStripContentOnlyUntouched(t *testing.T, tools *toolIndex, seen map[in
 	}
 }
 
+// TestStreamSingleNewlineFrames 非规范上游用单个 \n 分隔事件时，不能把
+// 前后两个 JSON 拼成一帧（否则客户端收到非法 JSON）。
+func TestStreamSingleNewlineFrames(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n" +
+		"data: {\"id\":\"x1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"b\"}}]}\n" +
+		"data: [DONE]\n"
+
+	frames, done := streamFrames(t, raw)
+	if done != 1 {
+		t.Fatalf("done=%d want 1", done)
+	}
+
+	if len(frames) != 2 {
+		t.Fatalf("frames=%d want 2", len(frames))
+	}
+
+	for i, want := range []string{"a", "b"} {
+		delta := frames[i]["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)
+		if delta["content"] != want {
+			t.Fatalf("frame %d content=%v want %q", i, delta["content"], want)
+		}
+	}
+}
+
 // TestStreamFinishReasonWithoutDoneCompletes 已见 finish_reason 后 EOF 视为正常完成：
 // 官方客户端在 finish_reason 后允许无 [DONE] 收尾，网关补齐 [DONE] 但不报截断。
 func TestStreamFinishReasonWithoutDoneCompletes(t *testing.T) {
@@ -2061,5 +2087,51 @@ func TestAggregateReadErrorPropagates(t *testing.T) {
 	))
 	if !errors.Is(err, boom) {
 		t.Fatalf("err=%v want read error", err)
+	}
+}
+
+// TestStreamMultiLineData 合法 SSE 多行 data 必须按事件拼接后解析，不能逐行拆成坏帧。
+func TestStreamMultiLineData(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"id\":\"c1\",\n" +
+		"data: \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data:[DONE]\n\n"
+
+	rec := &stringRecorder{header: http.Header{}}
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+
+	body := rec.body.String()
+	if !strings.Contains(body, `"content":"hi"`) {
+		t.Fatalf("multi-line frame not parsed: %s", body)
+	}
+
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Fatalf("missing DONE: %s", body)
+	}
+}
+
+// TestStreamMultiLineDataEventSizeLimit 多行 data 也必须受总量上限约束：
+// 单行均未超限但合计超限时，不能无限累积（恶意上游不发空行即可撑爆内存）。
+func TestStreamMultiLineDataEventSizeLimit(t *testing.T) {
+	t.Parallel()
+
+	line := "data: " + strings.Repeat("a", 3<<20) + "\n"
+	raw := line + line
+
+	rec := &stringRecorder{header: http.Header{}}
+	if err := Stream(rec, strings.NewReader(raw)); !errors.Is(err, ErrSSELineTooLong) {
+		t.Fatalf("err=%v want ErrSSELineTooLong", err)
+	}
+
+	body := rec.body.String()
+	if !strings.Contains(body, "exceeded size limit") {
+		t.Fatalf("missing size-limit error frame: %s", body)
+	}
+
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Fatalf("missing DONE: %s", body)
 	}
 }

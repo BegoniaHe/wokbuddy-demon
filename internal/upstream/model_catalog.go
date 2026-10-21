@@ -14,7 +14,7 @@
 // 多请求同时 miss 同一模型只写一次）；文件损坏/不可写均静默降级（种子表→1M）。
 //
 // 状态归属：包级 catalogState 单例（与 modelsDev fetcher 同模式，进程一份）。
-// 测试用 resetModelCatalog / loadModelCatalogAt 隔离。
+// 测试用 loadModelCatalogAt 隔离。
 package upstream
 
 import (
@@ -27,7 +27,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
 // modelSeedFS 仓库种子版 model.json（context_catalog 静态表 27 值迁移，source=seed）。
@@ -178,14 +178,8 @@ func (c *modelCatalog) saveLocked() {
 		_ = os.MkdirAll(dir, 0o755)
 	}
 
-	tmp := c.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := safefile.Write(c.path, raw, 0o600); err != nil {
 		log.Printf("WARN: [upstream] model.json 落盘失败（内存缓存仍生效）: path=%s err=%v", c.path, err)
-		return
-	}
-
-	if err := atomicwrite.Rename(tmp, c.path); err != nil {
-		log.Printf("WARN: [upstream] model.json 落盘改名失败: path=%s err=%v", c.path, err)
 	}
 }
 
@@ -220,26 +214,6 @@ func modelCatalogPutSourced(model string, context, maxOutput int64, source strin
 		FetchedAt:       time.Now().UTC().Format(time.RFC3339),
 		Source:          source,
 	})
-}
-
-// resetModelCatalog 测试隔离：清空单例状态（entries/path/loaded）。
-func resetModelCatalog() {
-	modelCatalog2 := catalogState
-	modelCatalog2.mu.Lock()
-	defer modelCatalog2.mu.Unlock()
-
-	modelCatalog2.entries = nil
-	modelCatalog2.path = ""
-	modelCatalog2.loaded = false
-}
-
-// ResetLookupChainForTest 跨包测试钩子：清空 model.json 缓存与 models.dev fetcher
-// 的全部包级单例状态（含在途拉取冷却——防 server 包测试末尾的异步 goroutine 打
-// 真网、防跨测试缓存污染）。仅测试引用（upstream 包内用 resetModelsDev /
-// resetModelCatalog 等价内联）。
-func ResetLookupChainForTest() {
-	resetModelCatalog()
-	resetModelsDev()
 }
 
 // ---- 四级查找链（对 handler 暴露的入口，签名与 32a3c13 三级版兼容）----
