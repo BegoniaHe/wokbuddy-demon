@@ -292,7 +292,7 @@ func TestBadBreakerCooldown(t *testing.T) {
 
 func TestUpstreamTimeoutDefaults(t *testing.T) {
 	t.Parallel()
-	// 默认：header / idle 均对齐官方客户端 1200s，不再跟随短 RPC timeout。
+	// 默认：header 120s / idle 300s，避免半死上游长期占在途。
 	config := Default()
 	if err := config.normalize(); err != nil {
 		t.Fatalf("normalize: %v", err)
@@ -302,18 +302,18 @@ func TestUpstreamTimeoutDefaults(t *testing.T) {
 		t.Errorf("timeout_seconds=%d want 120", config.Upstream.TimeoutSeconds)
 	}
 
-	if config.Upstream.HeaderTimeoutSeconds != 1200 {
-		t.Errorf("header_timeout_seconds=%d want fallback 1200", config.Upstream.HeaderTimeoutSeconds)
+	if config.Upstream.HeaderTimeoutSeconds != 120 {
+		t.Errorf("header_timeout_seconds=%d want fallback 120", config.Upstream.HeaderTimeoutSeconds)
 	}
 
-	if config.Upstream.IdleTimeoutSeconds != 1200 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 1200", config.Upstream.IdleTimeoutSeconds)
+	if config.Upstream.IdleTimeoutSeconds != 300 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 300", config.Upstream.IdleTimeoutSeconds)
 	}
 }
 
 func TestUpstreamHeaderTimeoutIndependentOfRPCTimeout(t *testing.T) {
 	t.Parallel()
-	// 只设 timeout_seconds：header / idle 仍取 1200s 默认（短 RPC 超时不外溢）。
+	// 只设 timeout_seconds：header / idle 仍取 120/300 默认（短 RPC 超时不外溢）。
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
 	os.WriteFile(fp, []byte(`{"upstream":{"timeout_seconds":60}}`), 0o600)
@@ -323,12 +323,12 @@ func TestUpstreamHeaderTimeoutIndependentOfRPCTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if config.Upstream.HeaderTimeoutSeconds != 1200 {
-		t.Errorf("header_timeout_seconds=%d want fallback 1200", config.Upstream.HeaderTimeoutSeconds)
+	if config.Upstream.HeaderTimeoutSeconds != 120 {
+		t.Errorf("header_timeout_seconds=%d want fallback 120", config.Upstream.HeaderTimeoutSeconds)
 	}
 
-	if config.Upstream.IdleTimeoutSeconds != 1200 {
-		t.Errorf("idle_timeout_seconds=%d want fallback 1200", config.Upstream.IdleTimeoutSeconds)
+	if config.Upstream.IdleTimeoutSeconds != 300 {
+		t.Errorf("idle_timeout_seconds=%d want fallback 300", config.Upstream.IdleTimeoutSeconds)
 	}
 }
 

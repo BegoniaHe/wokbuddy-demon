@@ -152,7 +152,7 @@ type Config struct {
 		TravelHours    []int `json:"travel_hours"`    // [9,21]
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
-		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 CST，按 CST 排程）
 		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
@@ -243,9 +243,9 @@ type Config struct {
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
-		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落默认 1200。
+		// HeaderTimeoutSeconds 聊天 SSE 首字节前（响应头）上限；<=0 回落默认 120。
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
-		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 1200。
+		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
 		// KeepaliveInterval 入站 SSE 主动心跳间隔（issue #54）：上游静默超过该时长
 		// 时向客户端写 ": keepalive" 注释帧，防反代空闲超时断流。"0"/空 = 关闭。
@@ -1527,19 +1527,19 @@ func (c *Config) normalizePoolDefaults() {
 	}
 }
 
-// normalizeUpstreamDefaults 补齐出站超时缺省值（对齐官方客户端 1200s）。
+// normalizeUpstreamDefaults 补齐出站超时缺省值（header 120s / idle 300s）。
 func (c *Config) normalizeUpstreamDefaults() {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
-	// chat 首字节 / 流空闲缺省 1200s（官方客户端普通对话口径）；model_timeouts
-	// 仍按模型覆盖。0 一律视为"未设置"走默认。
+	// chat 首字节 120s / 流空闲 300s：半死上游不能长期占住在途名额；
+	// 长推理模型用 upstream.model_timeouts 单独放宽。0 一律视为"未设置"走默认。
 	if c.Upstream.HeaderTimeoutSeconds <= 0 {
-		c.Upstream.HeaderTimeoutSeconds = 1200
+		c.Upstream.HeaderTimeoutSeconds = 120
 	}
 
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
-		c.Upstream.IdleTimeoutSeconds = 1200
+		c.Upstream.IdleTimeoutSeconds = 300
 	}
 
 	if c.Upstream.RotateMax <= 0 {
