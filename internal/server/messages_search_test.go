@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -537,5 +538,115 @@ func TestSearchClientErrorIsTerminal(t *testing.T) {
 		if st := statusOf(t, state, uid); st.ErrTotal != 0 || st.Cooling {
 			t.Errorf("请求级 4xx 不应罚账号 %s: %+v", uid, st)
 		}
+	}
+}
+
+// TestSearch401RefreshesAndReplaysOnce 上游 401 → 同号 refresh 后重放一次（与 chat
+// 同口径）：不把可恢复的 token 过期降级成请求级 400，也不惩罚账号。
+//
+//nolint:cyclop // 覆盖 401 → refresh → 重放 全链路，拆开反而难读。
+func TestSearch401RefreshesAndReplaysOnce(t *testing.T) {
+	t.Parallel()
+
+	var searchCalls, refreshCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+			refreshCalls.Add(1)
+
+			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"accessToken":"at-new","refreshToken":"rt-new","expiresIn":3600}}`))
+
+			return
+		}
+
+		if searchCalls.Add(1) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":401,"msg":"unauthorized"}`))
+
+			return
+		}
+
+		_, _ = w.Write([]byte(searchOKBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+	}
+	account := &auth.Auth{
+		UID: "u1", AccessToken: "at-old", RefreshToken: "rt-old", ExpiresAt: 9999999999,
+		FilePath: filepath.Join(t.TempDir(), "u1.json"),
+	}
+	state := testPoolWith(account)
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"glm-5.2","messages":[{"role":"user","content":"golang"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200（401 应 refresh 后重放），body=%s", rec.Code, rec.Body)
+	}
+
+	if got := searchCalls.Load(); got != 2 {
+		t.Errorf("search calls=%d want 2（原请求 + 重放）", got)
+	}
+
+	if got := refreshCalls.Load(); got != 1 {
+		t.Errorf("refresh calls=%d want 1", got)
+	}
+
+	if account.AccessToken != "at-new" || account.RefreshToken != "rt-new" {
+		t.Errorf("token 未更新: access=%q refresh=%q", account.AccessToken, account.RefreshToken)
+	}
+
+	if st := statusOf(t, state, "u1"); st.Cooling || st.Disabled || st.ErrTotal != 0 {
+		t.Errorf("401 refresh 成功不应惩罚账号: %+v", st)
+	}
+}
+
+// TestSearch401AfterRefreshIsRetryable 重放后仍 401：按账号级可换号处理（不是
+// 请求级 400）；单号池轮转耗尽后返回 5xx，而不是把 token 故障说成客户端问题。
+func TestSearch401AfterRefreshIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.HasSuffix(r.URL.Path, "/v2/plugin/auth/token/refresh") {
+			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"accessToken":"at-new","refreshToken":"rt-new","expiresIn":3600}}`))
+
+			return
+		}
+
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":401,"msg":"unauthorized"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+	}
+	account := &auth.Auth{
+		UID: "u1", AccessToken: "at-old", RefreshToken: "rt-old", ExpiresAt: 9999999999,
+		FilePath: filepath.Join(t.TempDir(), "u1.json"),
+	}
+	state := testPoolWith(account)
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"glm-5.2","messages":[{"role":"user","content":"golang"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`)
+	if rec.Code < 500 {
+		t.Fatalf("code=%d want 5xx（401 不是请求级 400），body=%s", rec.Code, rec.Body)
+	}
+
+	if strings.Contains(rec.Body.String(), "bad_params") {
+		t.Errorf("401 不应映射成 bad_params: %s", rec.Body)
 	}
 }

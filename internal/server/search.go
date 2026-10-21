@@ -140,10 +140,69 @@ func (h *Handler) searchOnAccount(
 		return outcome, nil
 	}
 
+	// 与 chat 同口径：上游 401 先同号 refresh 再重放一次。搜索是同步请求，没有
+	// chat 的 authReplay 状态机，这里在单次 attempt 内完成；重放后仍 401 才回到
+	// 既有分类（可换号），绝不二次刷新循环。
+	if ue, ok := errors.AsType[*upstream.Error](err); ok && ue.Status == http.StatusUnauthorized {
+		return h.replaySearchAfterRefresh(ctx, acct, query, maxResults, chatMeta)
+	}
+
 	var upErr *upstream.Error
 	if !errors.As(err, &upErr) {
 		// 传输层故障：不罚号（与 chat 同口径），但也不再把请求放大到所有账号。
 		log.Printf("WARN: [server] search acct=%s: %v", logfmt.UID8(acct.UID), err)
+
+		return nil, &searchFailure{
+			status: http.StatusBadGateway,
+			code:   "upstream_unavailable",
+			msg:    "upstream search failed (transport error)",
+		}
+	}
+
+	return nil, h.searchFailureFor(acct.UID, upErr)
+}
+
+// replaySearchAfterRefresh 同号 refresh 后重放一次搜索（401 专用）。
+//
+// 刷新失败时惩罚已由 noteSearchRefreshFailure 完成，这里只返回信封、不再走
+// searchFailureFor（避免同一失败被罚两次）；刷新成功但重放仍失败则按重放错误
+// 重新分类（与 chat 的 401 重放后轮转同口径）。
+//
+//nolint:gocritic // ChatMeta 值传递与 Search 保持同一口径（公开 API 简单）。
+func (h *Handler) replaySearchAfterRefresh(
+	ctx context.Context, acct *auth.Auth, query string, maxResults int, chatMeta upstream.ChatMeta,
+) (*upstream.SearchOutcome, *searchFailure) {
+	if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+		h.noteSearchRefreshFailure(acct, err)
+
+		if ue, ok := errors.AsType[*upstream.Error](err); ok {
+			return nil, searchFailureEnvelope(ue)
+		}
+
+		return nil, &searchFailure{
+			status: http.StatusBadGateway,
+			msg:    "upstream token refresh failed",
+		}
+	}
+
+	if err := acct.SaveAtomic(); err != nil {
+		log.Printf("ERR: [server] search 401 refresh acct=%s: save auth failed: %v",
+			logfmt.Label(acct.UID, acct.NicknameValue()), err)
+	}
+
+	log.Printf("INFO: [server] search 401 acct=%s: refreshed token, replaying once",
+		logfmt.Label(acct.UID, acct.NicknameValue()))
+
+	outcome, err := h.cfg.Upstream.Search(ctx, acct, query, maxResults, chatMeta)
+	if err == nil {
+		h.cfg.Pool.NoteSuccess(acct.UID)
+
+		return outcome, nil
+	}
+
+	var upErr *upstream.Error
+	if !errors.As(err, &upErr) {
+		log.Printf("WARN: [server] search replay acct=%s: %v", logfmt.UID8(acct.UID), err)
 
 		return nil, &searchFailure{
 			status: http.StatusBadGateway,
@@ -229,6 +288,13 @@ func (h *Handler) noteSearchRefreshFailure(acct *auth.Auth, err error) {
 // searchTerminalStatus 把错误类别映射成「不再轮转」的状态码与 code；
 // 空 code 表示可继续换号。
 func searchTerminalStatus(upErr *upstream.Error) (int, string) {
+	// 401 已在 searchOnAccount 内 refresh + 重放一次；仍 401 说明该账号 token
+	// 不可恢复，按账号级故障换号（与 chat 的 401 重放后轮转同口径），不要降级成
+	// 请求级 400 把可换号的故障说成客户端问题。
+	if upErr.Status == http.StatusUnauthorized {
+		return 0, ""
+	}
+
 	switch upErr.Kind {
 	case upstream.ErrBadParams:
 		return http.StatusBadRequest, "bad_params"
