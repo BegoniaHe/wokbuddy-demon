@@ -60,6 +60,7 @@ import {
 } from '@/components/ui/table';
 import { MixBar, Legend } from '@/components/ui-kit';
 import { TimeRange } from '@/components/TimeRange';
+import { remarkName } from '@/lib/remarks';
 
 // 用量明细排序选项。
 const SORT_OPTIONS = [
@@ -495,7 +496,7 @@ export function UsageView() {
                     <TableRow key={i}>
                       <TableCell className="w-[3px] p-0" />
                       <TableCell>
-                        {row.nickname || uid.slice(0, 8) || '—'}
+                        {remarkName(uid, row.nickname || '').display || '—'}
                         <div className="text-2xs text-muted-foreground">
                           {(row.realm || '') + ' · ' + uid.slice(0, 8)}
                         </div>
@@ -985,7 +986,7 @@ function RemainingCard({ payload }: { payload: RemainingPayload }) {
             <TableBody>
               {rows.slice(0, 30).map((row) => (
                 <TableRow key={row.uid + '|' + row.model}>
-                  <TableCell>{row.nickname || row.uid.slice(0, 8)}</TableCell>
+                  <TableCell>{remarkName(row.uid, row.nickname || '').display}</TableCell>
                   <TableCell className="font-mono text-xs">{row.model}</TableCell>
                   <TableCell className="text-right tabular-nums">{fmtTok(row.used || 0)}</TableCell>
                   <TableCell className="text-right tabular-nums">
