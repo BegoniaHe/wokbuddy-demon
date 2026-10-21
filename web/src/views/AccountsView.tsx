@@ -42,6 +42,9 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Tag, Chip, Bar, Dot, type Tone } from '@/components/ui-kit';
 import { TasksDialog } from '@/components/TasksDialog';
+import { RemarksDialog } from '@/components/RemarksDialog';
+import { remarkName } from '@/lib/remarks';
+import { useLocalFlag } from '@/hooks/useLocalFlag';
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import { MoreHorizontal } from 'lucide-react';
@@ -50,6 +53,7 @@ import { MoreHorizontal } from 'lucide-react';
 export function AccountsView() {
   const qc = useQueryClient();
   const [taskUID, setTaskUID] = useState<string | null>(null);
+  const [remarksOpen, setRemarksOpen] = useState(false);
   const { confirm, confirmDialog } = useConfirm();
 
   const { data, error, refetch } = useQuery({
@@ -118,6 +122,12 @@ export function AccountsView() {
         ]}
       />
 
+      <RemarksDialog
+        open={remarksOpen}
+        accounts={(data.accounts || []).map((a) => ({ uid: a.uid, name: a.nickname }))}
+        onClose={() => setRemarksOpen(false)}
+      />
+
       <ExpiryBox
         overview={data}
         detail={pkgQuery.data}
@@ -134,6 +144,9 @@ export function AccountsView() {
               {data.in_flight_full ? (
                 <span className="text-xs text-muted-foreground">{data.in_flight_full} 个账号在途占满</span>
               ) : null}
+              <Button size="xs" variant="ghost" onClick={() => setRemarksOpen(true)}>
+                备注
+              </Button>
               <BatchButton run={runOf('checkin')} label="全部签到" onClick={() => void startBatch('checkin_all', '全部签到')} />
               <BatchButton run={runOf('travel')} label="旅行巡检" onClick={() => void startBatch('travel_all', '旅行巡检')} />
               <BatchButton run={runOf('activity')} label="活跃上报" onClick={() => void startBatch('activity_all', '活跃上报')} />
@@ -242,6 +255,9 @@ function ExpiryBox({
   checking: boolean;
   onCheck: () => void;
 }) {
+  // 折叠态记在本机（默认展开）：到期提醒是常驻卡片，占屏明显。
+  const [expanded, setExpanded] = useLocalFlag('wb2api.expfold.v1', true);
+
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
@@ -265,7 +281,7 @@ function ExpiryBox({
       return x.key < y.key ? -1 : 1;
     });
     rows = keyed.map(({ a }) => {
-      const nm = a.nickname || String(a.uid || '').slice(0, 8);
+      const nm = remarkName(a.uid, a.nickname || '').display;
       if (a.error) {
         return (
           <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
@@ -330,7 +346,7 @@ function ExpiryBox({
       return x.key! - y.key!;
     });
     rows = keyed.map(({ a, ms }) => {
-      const nm = a.nickname || String(a.uid || '').slice(0, 8);
+      const nm = remarkName(a.uid, a.nickname || '').display;
       if (!ms || !a.credits_earliest_remaining) {
         return (
           <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
@@ -375,10 +391,23 @@ function ExpiryBox({
             <Button size="xs" disabled={checking} onClick={onCheck}>
               {checking ? '查询中…' : '检查'}
             </Button>
+            <Button
+              size="xs"
+              variant="ghost"
+              aria-expanded={expanded}
+              aria-controls="expiry-box-body"
+              onClick={() => setExpanded()}
+            >
+              {expanded ? '收起' : '展开'}
+            </Button>
           </div>
         </CardAction>
       </CardHeader>
-      <CardContent>{rows && (rows as unknown[])?.length ? rows : <p className="py-4 text-center text-muted-foreground">没有账号</p>}</CardContent>
+      {expanded ? (
+        <CardContent id="expiry-box-body">
+          {rows && (rows as unknown[])?.length ? rows : <p className="py-4 text-center text-muted-foreground">没有账号</p>}
+        </CardContent>
+      ) : null}
     </Card>
   );
 }
@@ -551,7 +580,20 @@ function AccountRow({
       <TableCell>
         <div className="flex items-center gap-1.5">
           <span className="truncate font-medium" title={s.nickname || undefined}>
-            {s.nickname ? s.nickname : <span className="text-muted-foreground">未命名</span>}
+            {(() => {
+              const remark = remarkName(s.uid, s.nickname || '');
+              if (remark.ghost) {
+                return (
+                  <>
+                    {remark.display}
+                    <span className="ml-1 font-normal text-2xs text-muted-foreground">（{remark.ghost}）</span>
+                  </>
+                );
+              }
+              // 无备注时 remark.display 会回落短 uid；账号池原有语义是「未命名」。
+              if (!s.nickname) return <span className="text-muted-foreground">未命名</span>;
+              return remark.display;
+            })()}
           </span>
           {s.realm === 'global' ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">国际版</span> : null}
           {s.enterprise ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">企业版</span> : null}

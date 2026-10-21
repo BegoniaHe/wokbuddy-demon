@@ -46,6 +46,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Legend } from '@/components/ui-kit';
+import { remarkName } from '@/lib/remarks';
 
 const LS_PK_SORT = 'pkSortMode';
 
@@ -194,7 +195,7 @@ function ExpiryDistribution({ list, now }: { list: PkgAccount[]; now: number }) 
     .filter((a) => a && !a.error && a.uid && pkAccountSegments(a, now).some((s) => s.days != null))
     .map((a) => (
       <Legend key={a.uid} color={colors.get(String(a.uid)) || 'var(--primary)'}>
-        {a.nickname || String(a.uid).slice(0, 8)}
+        {remarkName(a.uid, a.nickname || '').display}
       </Legend>
     ));
 
@@ -273,7 +274,7 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
           return (
             <div key={a.uid} className="min-w-[200px] flex-1 rounded-lg border border-border/60 p-3">
               <div className="flex items-baseline gap-1.5">
-                <span className="truncate text-sm font-semibold">{a.nickname || String(a.uid).slice(0, 8)}</span>
+                <span className="truncate text-sm font-semibold">{remarkName(a.uid, a.nickname || '').display}</span>
                 <span className="font-mono text-2xs text-muted-foreground">{a.realm || ''}</span>
               </div>
               <div className="mt-1 text-xs text-warning">查询失败：{a.error}</div>
@@ -289,7 +290,7 @@ function ComparisonCards({ list, now }: { list: PkgAccount[]; now: number }) {
           <div key={a.uid} className="min-w-[200px] flex-1 rounded-lg border border-border/60 p-3">
             <div className="mb-1.5 flex items-center gap-1.5">
               <span className="truncate text-sm font-semibold" title={a.nickname || String(a.uid).slice(0, 8)}>
-                {a.nickname || String(a.uid).slice(0, 8)}
+                {remarkName(a.uid, a.nickname || '').display}
               </span>
               {a.realm ? (
                 <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">
@@ -404,7 +405,7 @@ function DetailBox({
     <Card className="mb-5">
       <CardHeader className="items-center gap-3">
         <CardTitle>
-          {a.nickname || String(a.uid).slice(0, 8)} · {a.realm || ''}
+          {remarkName(a.uid, a.nickname || '').display} · {a.realm || ''}
         </CardTitle>
         <CardDescription>
           余额 {fmtTok(a.remain)} / 总额 {fmtTok(a.size)} · 可用 {groups.visible.length + groups.rest.length} 个包
@@ -504,7 +505,7 @@ function GrantHistory({ grants }: { grants: Grant[] }) {
               <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
                 {g.created_at ? g.created_at.replace('T', ' ').slice(0, 16) : '—'}
               </TableCell>
-              <TableCell>{g.nickname || g.uid.slice(0, 8)}</TableCell>
+              <TableCell>{remarkName(g.uid, g.nickname || '').display}</TableCell>
               <TableCell className="text-muted-foreground">{g.realm || '—'}</TableCell>
               <TableCell>{g.name || '—'}</TableCell>
               <TableCell>
