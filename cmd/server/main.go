@@ -25,6 +25,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
@@ -289,6 +290,15 @@ func newPanel(
 	cfg *Config, cfgPath string, state *pool.Pool, client4 *upstream.Client, sch *scheduler.Scheduler,
 	redisMode string, sessCount func() int, obs *observability, trustedProxies []*net.IPNet,
 ) *panel.Panel {
+	// 积分变动账本（issue #201 / 上游 #138）：与 state 文件同目录，余额观测回调在
+	// 装配期挂上（New() 之后、开始服务之前，运行期只读）。账本是观测附属物：
+	// 写盘失败只记日志，不影响余额查询主路径。
+	creditLedger := credithist.Open(stateSibling(cfg.StateFile, "credit-history.json"), credithist.DefaultMaxEntries)
+	client4.BalanceObserver = func(uid string, remain, _ int64) {
+		creditLedger.Observe(uid, remain, "")
+		creditLedger.Flush() // 只在该账号余额变化时才写（低频），无需额外后台协程
+	}
+
 	return panel.New(&panel.Config{
 		Pool:           state,
 		Usage:          obs.usage,
@@ -314,6 +324,7 @@ func newPanel(
 		PricingRate:    cfg.Pricing.ExchangeRate,
 		Quota:          obs.quota,
 		Agents:         obs.agents,
+		CreditHistory:  creditLedger,
 		LoadConfig: func() (any, error) {
 			return Load(cfgPath)
 		},

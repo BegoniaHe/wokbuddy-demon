@@ -31,6 +31,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/agentcfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -82,6 +83,8 @@ type Config struct {
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
+	// CreditHistory 本地积分变动账本（nil = 积分历史接口返回 501）。
+	CreditHistory *credithist.Ledger
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
@@ -277,6 +280,7 @@ func (p *Panel) routesImport() {
 
 func (p *Panel) routesUsage() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistoryHandler))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/usage/remaining", p.withAuth(p.usageRemaining))

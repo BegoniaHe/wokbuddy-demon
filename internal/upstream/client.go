@@ -1113,8 +1113,12 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
-	ChatBaseCN    string
-	BillingBaseCN string
+	// BalanceObserver 余额观测回调（可选）：每次成功查询余额后回调 (uid, remain, total)，
+	// 供本地积分账本记录变动。装配期注入、运行期只读；回调 panic 被隔离，
+	// 且回调失败不影响余额查询主路径（账本只是观测附属物）。
+	BalanceObserver func(uid string, remain, total int64)
+	ChatBaseCN      string
+	BillingBaseCN   string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
@@ -3381,7 +3385,27 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
 	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+	if err == nil {
+		c.notifyBalance(a, remain, total)
+	}
+
 	return remain, total, expiring, err
+}
+
+// notifyBalance 触发余额观测回调（装配期注入，缺省 nil = 关闭）。panic 隔离：
+// 账本是观测附属物，任何异常都不得打断余额查询主路径。
+func (c *Client) notifyBalance(account *auth.Auth, remain, total int64) {
+	if c.BalanceObserver == nil || account == nil {
+		return
+	}
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("WARN: [upstream] balance observer panic: %v", recovered)
+		}
+	}()
+
+	c.BalanceObserver(account.UID, remain, total)
 }
 
 // enterpriseUnlimitedRemain / enterpriseUnlimitedTotal 企业版「不限量」在池内的等价表示

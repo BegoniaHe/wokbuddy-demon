@@ -42,6 +42,7 @@ import { Tag } from '@/components/ui-kit';
 import { TimeRange } from '@/components/TimeRange';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
+import { chDelta, chName, chTime, chTone, type CreditHistoryEntry } from '@/lib/creditHistory';
 
 interface LogEntry {
   ts?: string;
@@ -99,6 +100,16 @@ export function LogsView() {
     queryKey: ['logs'],
     queryFn: () => api<{ entries?: LogEntry[] }>('logs'),
     refetchInterval: 5000,
+  });
+
+  // 积分历史（本地账本）：进页面取一次，**不挂 5s 轮询**——账本变动低频，
+  // 轮询只会白白增加面板负载。
+  const creditHistQ = useQuery({
+    queryKey: ['credit_history'],
+    queryFn: () =>
+      api<{ entries?: CreditHistoryEntry[] }>('credit_history?limit=100').catch((): { entries?: CreditHistoryEntry[] } => ({})),
+    refetchInterval: false,
+    staleTime: 30000,
   });
 
   const reqQ = useQuery({
@@ -243,6 +254,47 @@ export function LogsView() {
                 </TableRow>
               ) : (
                 filtered.map((e, i) => <RequestRow key={e.request_id || i} e={e} />)
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
+
+      <Card className="mt-5">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
+          <CardTitle>积分历史</CardTitle>
+          <CardAction>
+            <span className="text-xs text-muted-foreground">本地账本 · 每次余额变动记一条（最近 100 条）</span>
+          </CardAction>
+        </CardHeader>
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>时间</TableHead>
+                <TableHead>账号</TableHead>
+                <TableHead className="text-right">变动</TableHead>
+                <TableHead className="text-right">变动后余额</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(creditHistQ.data?.entries || []).length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={4} className="py-8 text-center text-muted-foreground">
+                    暂无余额变动记录（账本随余额查询累积，首次观测只建基线）
+                  </TableCell>
+                </TableRow>
+              ) : (
+                [...(creditHistQ.data?.entries || [])].reverse().map((entry, i) => (
+                  <TableRow key={entry.time || '' + i}>
+                    <TableCell className="font-mono text-xs">{chTime(entry.time) || '—'}</TableCell>
+                    <TableCell>{chName(entry)}</TableCell>
+                    <TableCell className="text-right font-mono tabular-nums">
+                      <Tag tone={chTone(entry.delta)}>{chDelta(entry.delta)}</Tag>
+                    </TableCell>
+                    <TableCell className="text-right font-mono tabular-nums">{entry.remain ?? '—'}</TableCell>
+                  </TableRow>
+                ))
               )}
             </TableBody>
           </Table>
