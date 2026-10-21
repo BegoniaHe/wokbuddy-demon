@@ -277,6 +277,28 @@ func TestModelAccessBlockedThenClear(t *testing.T) {
 	}
 }
 
+// TestModelForbiddenBlockedThenClear 11158（账号类型级权限拒绝）与 11136/11141
+// 同通道：写入 (账号,模型) 负缓存、成功后清除；6004 限流台账同样不受影响。
+func TestModelForbiddenBlockedThenClear(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+
+	pool.BlockModelBackoff("u1", "glm-5.3", "11158 model not allowed for user type")
+
+	st := pool.ModelBlocked("glm-5.3")
+	if !st.Blocked || st.RateLimited {
+		t.Fatalf("写入 11158 避让后应按模型不可用阻塞：%+v", st)
+	}
+
+	pool.BlockModelClear("u1", "glm-5.3")
+
+	if after := pool.ModelBlocked("glm-5.3"); after.Blocked {
+		t.Fatalf("清除后不应再阻塞：%+v", after)
+	}
+}
+
 // TestModelRateLimitNotCleared 6004 限流台账不受 BlockModelClear 影响。
 func TestModelRateLimitNotCleared(t *testing.T) {
 	t.Parallel()

@@ -154,3 +154,88 @@ func TestChatAllAccountsLackModelPermission(t *testing.T) {
 		t.Errorf("全池应写入 (账号,模型) 负缓存，status=%+v", st)
 	}
 }
+
+// TestChatAllAccountsForbiddenByUserType 全池 11158（账号类型级模型权限拒绝）：
+// 与 11136 同机制——每号只打一次上游，写入 (账号,模型) 负缓存，返回 400
+// model_unavailable + 上游原文，且不写路由熔断、不罚账号。
+//
+// 与上游差异：上游把 429+11158 归软限流（逐号冷却），本 fork 判定与状态码无关，
+// 429+11158 同样归模型权限（见 upstream 侧分类表用例），避免整池健康号陪跑。
+func TestChatAllAccountsForbiddenByUserType(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+
+		return http.StatusBadRequest,
+			`{"code":11158,"msg":"model [glm-5.3] is not allowed for user type [personal]"}`, false
+	})
+	state := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	handler := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, handler, `{"model":"glm-5.3","messages":[]}`)
+
+	body := rec.Body.String()
+	if rec.Code != http.StatusBadRequest || !strings.Contains(body, "model_unavailable") {
+		t.Fatalf("code=%d body=%s want 400 model_unavailable", rec.Code, body)
+	}
+
+	if !strings.Contains(body, "is not allowed for user type") {
+		t.Errorf("上游原文必须透传，body=%s", body)
+	}
+
+	if calls != 2 {
+		t.Errorf("upstream calls=%d want 2（每号一次，不逐号轮转）", calls)
+	}
+
+	// 第二次请求走既有负缓存，不再打上游。
+	postChat(t, handler, `{"model":"glm-5.3","messages":[]}`)
+
+	if calls != 2 {
+		t.Errorf("负缓存命中后不应再打上游，calls=%d", calls)
+	}
+
+	if until := state.RouteRecovery("cn", "glm-5.3"); !until.IsZero() {
+		t.Errorf("11158 不应写路由熔断，got until=%v", until)
+	}
+
+	if st := state.ModelBlocked("glm-5.3"); !st.Blocked || st.Count != 2 {
+		t.Fatalf("全池应写入 (账号,模型) 负缓存，status=%+v", st)
+	}
+}
+
+// TestForbiddenByUserTypeNegativeCacheReason 11158 的负缓存 reason 落到
+// upstream.ModelForbiddenReason 前缀（面板可区分「账号类型不允许」与「无权限」），
+// 且不罚账号。
+func TestForbiddenByUserTypeNegativeCacheReason(t *testing.T) {
+	t.Parallel()
+
+	state := pool.New("")
+	state.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+
+	h := NewHandler(&Config{Pool: state})
+	h.applyErrorPolicy("u1", upstream.ErrModelBlocked,
+		`{"code":11158,"msg":"model [m1] is not allowed for user type [personal]"}`, "cn", "m1", nil)
+
+	rows := statusOf(t, state, "u1").RateLimitedModels
+	if len(rows) != 1 || rows[0].Model != "m1" {
+		t.Fatalf("应写 1 条 m1 避让台账，got %+v", rows)
+	}
+
+	if !strings.HasPrefix(rows[0].Reason, upstream.ModelForbiddenReason) {
+		t.Errorf("reason=%q want 前缀 %q", rows[0].Reason, upstream.ModelForbiddenReason)
+	}
+
+	if rows[0].Kind != "model_unavailable" {
+		t.Errorf("kind=%q want model_unavailable", rows[0].Kind)
+	}
+
+	if st := statusOf(t, state, "u1"); st.Cooling || st.ErrTotal != 0 {
+		t.Errorf("11158 不应惩罚账号，status=%+v", st)
+	}
+}
