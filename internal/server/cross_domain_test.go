@@ -218,3 +218,26 @@ func TestCrossDomainFallbackModelNotFoundOnce(t *testing.T) {
 		t.Errorf("每域只应请求一次，cn=%d global=%d", cn, global)
 	}
 }
+
+// TestCrossDomainFallbackModelNotFoundNoSameRealmRetry 11102 切到无号的目标域后，
+// 不得再跳回原域对同一个 11102 重试一次（「跨域仅一次」）。
+func TestCrossDomainFallbackModelNotFoundNoSameRealmRetry(t *testing.T) {
+	t.Parallel()
+
+	fixture, client := newCrossDomainFixture(t, false, func(string) (int, string, bool) {
+		return http.StatusNotFound, `{"code":11102,"msg":"model [glm-5.2] service info not found"}`, false
+	})
+	// 只留 CN 号：切到 global 后无号可服务。
+	fixture.pool.Remove("g1")
+	fixture.pool.SetCrossDomainFallback(true)
+	handler := NewHandler(&Config{Pool: fixture.pool, Upstream: client})
+
+	rec := postChat(t, handler, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("两域都无此模型应回 404，code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if cn, global := fixture.calls("Bearer at-cn"), fixture.calls("Bearer at-global"); cn != 1 || global != 0 {
+		t.Errorf("原域不得因跨域失败被重试，cn=%d global=%d", cn, global)
+	}
+}

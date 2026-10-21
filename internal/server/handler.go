@@ -1818,6 +1818,12 @@ func (f *chatFlow) pickRealms() []string {
 		return []string{f.realm}
 	}
 
+	// 11102 已切过域：只在新域重取号，禁止再跳回原域。否则另一域无号时
+	// pickRealms 会回落原域、对同一 11102 再打一次，违背「跨域仅一次」。
+	if f.realmSwitched {
+		return []string{f.realm}
+	}
+
 	other := otherRealm(f.realm)
 	if !f.h.cfg.Pool.ServableForModelRealm(f.bareModel, f.realm) &&
 		f.h.cfg.Pool.ServableForModelRealm(f.bareModel, other) {
@@ -1857,8 +1863,15 @@ func (f *chatFlow) switchRealmForModelNotFound() bool {
 		return false
 	}
 
+	other := otherRealm(f.realm)
+	// 另一域没有可服务账号时保持原判（11102 → 404）；否则切过去只会落到
+	// 「无可用账号」503，把「模型不存在」误报成池故障。
+	if !f.h.cfg.Pool.ServableForModelRealm(f.bareModel, other) {
+		return false
+	}
+
 	f.realmSwitched = true
-	f.realm = otherRealm(f.realm)
+	f.realm = other
 
 	if f.h.cfg.Upstream != nil {
 		f.modelRate = f.h.cfg.Upstream.ModelRate(f.realm, f.bareModel)
