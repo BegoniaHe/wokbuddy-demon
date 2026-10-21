@@ -1820,6 +1820,7 @@ func (h *Handler) sampleDecisionTrace() *reqlog.DecisionTrace {
 		Rotations:  nil,
 		Top:        nil,
 		FinalUID:   "",
+		Strategy:   "",
 	}
 }
 
@@ -1837,6 +1838,9 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 
 	dst.CostTier = src.CostTier
+	if src.Strategy != "" {
+		dst.Strategy = src.Strategy
+	}
 
 	dst.Explored = dst.Explored || src.Explored
 	if len(src.Top) > 0 {
