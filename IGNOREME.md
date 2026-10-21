@@ -419,6 +419,7 @@ gemini
 | `api_key` | 空 | 默认（管理）鉴权密钥，覆盖全部网关端点与面板；**空 = 不鉴权直接放行**（公网必须设置）。另可在面板「密钥」页签发多把命名密钥 |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号管家状态持久化文件 |
+| `dns_servers` | `[]` | 出站 DNS 服务器（`host` 或 `host:port`，按顺序尝试，缺省端口 53）。空 = 系统解析器。只作用于 `internal/upstream` 出站连接；本地网页抓取的 SSRF 专用 Transport 不受影响。非法值（带 scheme/路径、端口非法）拒启动。改后需重启（环境变量 `WB2A_DNS` 逗号分隔可覆盖） |
 | `logging.request_archive_enabled` | `true` | 请求元数据归档开关 |
 | `logging.request_retention_days` | `7` | 请求归档保留天数 |
 | `logging.decision_trace` | `false` | 请求归档记录选号决策链（候选/排除原因/成本层/Top-N/轮换） |
@@ -501,7 +502,7 @@ gemini
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE` · `WB2A_TIMEOUT_SECONDS` · `WB2A_PROMPT_MODE` …
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_DNS` · `WB2A_SOFT_RATE` · `WB2A_TIMEOUT_SECONDS` · `WB2A_PROMPT_MODE` …
 
 ## 部署运维
 

@@ -8,8 +8,11 @@ package upstream
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -71,10 +74,16 @@ const (
 // newDialer 构造出站拨号器（DialContext 的 Timeout/KeepAlive 参数集中于此，
 // 供测试回读断言）。
 func newDialer() *net.Dialer {
-	return &net.Dialer{
+	dialer := &net.Dialer{
 		Timeout:   dialTimeout,
 		KeepAlive: dialKeepAlive,
 	}
+	// 出站 DNS 可指定（config dns_servers）：空 = 系统解析器（零回归）。
+	if servers := currentDNSServers(); len(servers) > 0 {
+		dialer.Resolver = newDNSResolver(servers)
+	}
+
+	return dialer
 }
 
 // writeDeadlineConn 包装拨号返回的 net.Conn，在每次 Write 前重设写 deadline，
@@ -167,4 +176,85 @@ func roundTripCloseIdle(rt http.RoundTripper) {
 	if ci, ok := rt.(closeIdler); ok {
 		ci.CloseIdleConnections()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 出站 DNS 解析器（config dns_servers / 环境变量 WB2A_DNS）
+// ---------------------------------------------------------------------------
+
+// dnsDialTimeout 单个 DNS 服务器的建连+查询超时。取 5s：比系统解析器的常见
+// 重试窗口短，多个服务器可快速轮换，同时不至于因一次慢查询误杀健康解析。
+const dnsDialTimeout = 5 * time.Second
+
+var (
+	// dnsServers 出站解析器地址（host 或 host:port）。由 SetDNSServers 注入，
+	// 在 upstream.New() 构造 Transport 时读取——**改动需重启进程生效**。
+	dnsMu      sync.RWMutex
+	dnsServers []string
+)
+
+// SetDNSServers 注入出站 DNS 服务器（config `dns_servers` 或环境变量 WB2A_DNS）。
+// 空 = 用系统解析器（零回归）。必须在 upstream.New() **之前**调用：Transport 在
+// New() 内一次性构造（Dialer 的 Resolver 属于连接层参数，运行期改无效，故该配置
+// 列为「需重启」）。非法值由 config.normalize 拦截，这里不再校验。
+func SetDNSServers(servers []string) {
+	dnsMu.Lock()
+	defer dnsMu.Unlock()
+
+	if len(servers) == 0 {
+		dnsServers = nil
+		return
+	}
+
+	dnsServers = append([]string(nil), servers...)
+}
+
+// currentDNSServers 返回当前注入的 DNS 服务器副本。
+func currentDNSServers() []string {
+	dnsMu.RLock()
+	defer dnsMu.RUnlock()
+
+	if len(dnsServers) == 0 {
+		return nil
+	}
+
+	return append([]string(nil), dnsServers...)
+}
+
+// newDNSResolver 构造使用指定服务器的解析器：
+//   - PreferGo=true：走纯 Go 解析器，不用 cgo（行为可控、跨平台一致）；
+//   - Dial 按顺序尝试服务器，首个成功即用；全部失败返回最后一个错误。
+//
+// 只替换 Resolver，不动 Dialer 的 Timeout/KeepAlive，也不改 DialContext 包装
+// （写截止 writeDeadlineConn 必须保留——那不是 DNS 层能替换的东西）。
+func newDNSResolver(servers []string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var lastErr error
+
+			for _, server := range servers {
+				conn, err := (&net.Dialer{Timeout: dnsDialTimeout}).DialContext(ctx, network, dnsServerAddr(server))
+				if err == nil {
+					return conn, nil
+				}
+
+				lastErr = err
+			}
+
+			return nil, fmt.Errorf("dns: 所有解析服务器均不可用: %w", lastErr)
+		},
+	}
+}
+
+// dnsServerAddr 补齐 DNS 服务器的缺省端口（53）。已带端口则原样返回；
+// 带方括号的 IPv6（"[::1]"）先脱括号再由 JoinHostPort 统一加回，避免双重括号。
+func dnsServerAddr(server string) string {
+	if _, _, err := net.SplitHostPort(server); err == nil {
+		return server
+	}
+
+	host := strings.TrimSuffix(strings.TrimPrefix(server, "["), "]")
+
+	return net.JoinHostPort(host, "53")
 }

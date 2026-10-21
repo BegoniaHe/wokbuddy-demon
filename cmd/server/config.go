@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -35,6 +36,7 @@ var (
 	errNormalizeNotifyFailed            = errors.New("normalizeNotify failed")
 	errNormalizeLoggingFailed           = errors.New("normalizeLogging failed")
 	errNormalizeProxiesFailed           = errors.New("normalizeProxies failed")
+	errNormalizeDNSServersFailed        = errors.New("normalizeDNSServers failed")
 	errValidateBackoffOrderFailed       = errors.New("validateBackoffOrder failed")
 	errValidateServerRangesFailed       = errors.New("validateServerRanges failed")
 	errValidateRangesFailed             = errors.New("validateRanges failed")
@@ -62,6 +64,12 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// DNSServers 出站 DNS 服务器（host 或 host:port，按顺序尝试，缺省端口 53）。
+	// 空 = 系统解析器（零回归）。用途：绕过污染解析、把上游域名固定到可控出口。
+	// 属连接层参数（Transport 在装配期构造），改后**需重启**。
+	// 环境变量 WB2A_DNS（逗号分隔）覆盖此处配置。
+	DNSServers []string `json:"dns_servers"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -795,6 +803,10 @@ func applyEnvFeatures(config6 *Config) {
 	if b, ok := envBool("WB2A_PREFER_EXPIRING"); ok {
 		config6.Pool.PreferExpiring = b
 	}
+
+	if v := os.Getenv("WB2A_DNS"); strings.TrimSpace(v) != "" {
+		config6.DNSServers = strings.Split(v, ",")
+	}
 }
 
 // envInt 读取整型环境变量：键缺席或解析失败一律视为未设置（ok=false），
@@ -843,6 +855,7 @@ func (c *Config) normalize() error {
 		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
+		c.normalizeDNSServers,
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -916,6 +929,69 @@ func (c *Config) normalizeBackgroundModels() error {
 	}
 
 	c.Models.BackgroundNames = out
+
+	return nil
+}
+
+// normalizeDNSServers 规范化出站 DNS 服务器列表：去空白、去重、丢弃空项，
+// 并拒绝带 scheme/路径与非法端口的写法。非法值**拒启动**——自定义解析器出错会
+// 影响全部出站请求，宁可开机失败也不要运行期静默失败。
+func (c *Config) normalizeDNSServers() error {
+	if len(c.DNSServers) == 0 {
+		c.DNSServers = nil
+		return nil
+	}
+
+	seen := make(map[string]bool, len(c.DNSServers))
+
+	out := make([]string, 0, len(c.DNSServers))
+
+	for _, raw := range c.DNSServers {
+		server := strings.TrimSpace(raw)
+		if server == "" || seen[server] {
+			continue
+		}
+
+		if err := validateDNSServer(server); err != nil {
+			return err
+		}
+
+		seen[server] = true
+
+		out = append(out, server)
+	}
+
+	if len(out) == 0 {
+		out = nil
+	}
+
+	c.DNSServers = out
+
+	return nil
+}
+
+// validateDNSServer 校验单个 DNS 服务器：接受 host / host:port / [IPv6]:port，
+// 拒绝带 scheme、路径或非法端口的写法。
+func validateDNSServer(server string) error {
+	if strings.Contains(server, "://") || strings.ContainsAny(server, "/ ") {
+		return fmt.Errorf("dns_servers[%q]: 只接受 host 或 host:port（不要带 scheme/路径）: %w",
+			server, errNormalizeDNSServersFailed)
+	}
+
+	host := server
+
+	if parsedHost, port, err := net.SplitHostPort(server); err == nil {
+		host = parsedHost
+
+		if num, convErr := strconv.Atoi(port); convErr != nil || num <= 0 || num > 65535 {
+			return fmt.Errorf("dns_servers[%q]: 端口必须是 1-65535 的数字: %w",
+				server, errNormalizeDNSServersFailed)
+		}
+	}
+
+	if host == "" {
+		return fmt.Errorf("dns_servers[%q]: host 不能为空: %w", server, errNormalizeDNSServersFailed)
+	}
 
 	return nil
 }
