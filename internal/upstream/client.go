@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"sort"
@@ -1170,6 +1171,14 @@ type Client struct {
 	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
+
+	// refreshMu/refreshInFlight 同账号 refresh 单飞（按 UID 分桶）：同一时刻只允许
+	// 一个 refresh 在途，其余调用等待并复用首个结果。上游对 refreshToken 反重放，
+	// 并发第二发会带着已被消费的 RT 撞 12153 并整条 RT 链作废（账号从此恒 401，
+	// 只能人工重登）。本 fork 的并发来源比上游更多：scheduler keepalive 全量刷新、
+	// handler 临近过期刷新与 401 重放、cmd/signin 独立进程。单飞在这里是保号手段。
+	refreshMu       sync.Mutex
+	refreshInFlight map[string]*refreshFlight
 }
 
 // New 生产默认值。Transport 由 newTransport() 集中构造（连接层加固：真正禁 h2 /
@@ -1516,13 +1525,109 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
 // 调用方负责 SaveAtomic。
 //
-// 并发安全模型（两段式，缩小持锁窗口）：
-//   - 锁内仅做「读 refreshToken 快照」与「校验未变后写回新 token」两小段内存操作；
-//   - 网络 I/O（doJSON）在**锁外**执行，带 30s ctx 超时——避免上游 hang 时长时间
-//     独占 a.mu，阻塞同账号的 SaveAtomic / 其他刷新（issue:持锁 120s I/O）。
-//   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
-//     已变），本次结果直接采用（新 token 已生效），不再重复写回。
+// 并发安全模型（单飞 + 两段式）：
+//   - **单飞**：同一账号（UID）同一时刻只允许一个 refresh 在途，其余调用等待并
+//     原样复用首个结果。上游对 refreshToken 反重放：RT 被消费后再用会撞 12153，
+//     并把整条 RT 链作废（账号从此恒 401，只能人工重登）。本 fork 的并发来源
+//     更多（scheduler keepalive、handler 临近过期刷新与 401 重放、cmd/signin），
+//     单飞是保号手段而非省流量。
+//   - 首个调用内部仍是两段式：锁内读快照 → 锁外 I/O（30s）→ 锁内校验快照一致后
+//     写回；写回前若发现另一刷新已完成（两 token 同时变化）则直接采用。
+//   - 12153 兜底：磁盘 auth 文件已被其他进程（server + signin 双进程部署）刷新过
+//     时采纳磁盘 token 重试一次——进程内单飞挡不住跨进程竞态。无 FilePath 或磁盘
+//     RT 与内存一致时不重试（不做无限重试）。
 func (c *Client) RefreshToken(account10 *auth.Auth) error {
+	key := account10.UID
+	if key == "" {
+		// 无 UID 的临时 auth：退化为按对象指针去重，仍保证同一对象串行。
+		key = fmt.Sprintf("%p", account10)
+	}
+
+	// 取票或等待既有票据。等待者不解锁任何账号锁，避免与首个调用的 I/O 串行化。
+	c.refreshMu.Lock()
+
+	if c.refreshInFlight == nil {
+		c.refreshInFlight = make(map[string]*refreshFlight)
+	}
+
+	if flight, ok := c.refreshInFlight[key]; ok {
+		c.refreshMu.Unlock()
+		<-flight.done
+
+		return flight.err
+	}
+
+	flight := &refreshFlight{done: make(chan struct{})}
+	c.refreshInFlight[key] = flight
+	c.refreshMu.Unlock()
+
+	err := c.refreshTokenOnce(account10)
+	if err != nil && isSessionDeadErr(err) && adoptNewerTokensFromDisk(account10) {
+		// 跨进程竞态：磁盘 RT 已被别的进程 rotate 过，用新 RT 再试一次。
+		err = c.refreshTokenOnce(account10)
+	}
+
+	// 先写结果再关 channel：等待者 <-flight.done 之后读到的一定是最终 err。
+	flight.err = err
+	close(flight.done)
+
+	c.refreshMu.Lock()
+	delete(c.refreshInFlight, key)
+	c.refreshMu.Unlock()
+
+	return err
+}
+
+// refreshFlight 是同一账号一次 refresh 的单飞票据：done 关闭即结果就绪。
+type refreshFlight struct {
+	done chan struct{}
+	err  error
+}
+
+// isSessionDeadErr 判定错误是否为会话/RT 失效（12153 或 refresh 侧 401/403 映射）。
+func isSessionDeadErr(err error) bool {
+	var ue *Error
+
+	return errors.As(err, &ue) && ue.Kind == ErrSessionDead
+}
+
+// adoptNewerTokensFromDisk 在 refresh 失败后回读 auth 文件：磁盘 RT 与内存不同
+// （另一进程已刷新并写回）时采纳磁盘 token 并返回 true，供调用方重试一次。
+// 读文件/解析失败、无 FilePath、RT 一致均返回 false（不改内存状态，保持失败语义）。
+func adoptNewerTokensFromDisk(account *auth.Auth) bool {
+	if account.FilePath == "" {
+		return false
+	}
+
+	raw, err := os.ReadFile(account.FilePath)
+	if err != nil {
+		return false
+	}
+
+	disk, err := auth.Parse(raw)
+	if err != nil || strings.TrimSpace(disk.RefreshToken) == "" {
+		return false
+	}
+
+	account.Lock()
+	defer account.Unlock()
+
+	if disk.RefreshToken == account.RefreshToken {
+		return false
+	}
+
+	account.AccessToken = disk.AccessToken
+	account.RefreshToken = disk.RefreshToken
+
+	if disk.ExpiresAt > 0 {
+		account.ExpiresAt = disk.ExpiresAt
+	}
+
+	return true
+}
+
+// refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
+func (c *Client) refreshTokenOnce(account10 *auth.Auth) error {
 	// 第 1 段（锁内）：读快照。
 	rtSnapshot, atBefore, err := refreshTokenSnapshot(account10)
 	if err != nil {

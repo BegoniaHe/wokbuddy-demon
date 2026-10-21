@@ -341,6 +341,7 @@ gemini
 - **身份头**：企业账号同时发送 `X-Enterprise-Id` 与 `X-Tenant-Id`；个人 global 账号发送 `X-No-Enterprise-Id: 1`。账号带 `domain` 时透传为 `X-Domain`，global 缺省回落 `www.workbuddy.ai`。
 - **入站会话元数据**：`X-Conversation-ID`、`X-Root-Request-ID`、`X-Parent-Conversation-ID`、`X-Agent-Intent/Purpose/Type`、`X-Compaction`、`X-Context-Compacted` 原样透传；缺失时保持网关默认。
 - **401 重放**：上游 chat 返回 401 时，同账号刷新一次 token 并重放同一请求；再次 401 回到既有轮换策略。refresh 端点 401/403 视为会话失效，按 keepalive 阈值禁用。
+- **refresh 单飞**：同一账号（UID）同一时刻只允许一个 refresh 在途，其余调用等待并复用首个结果——上游对 refreshToken 反重放，并发重复送同一 RT 会撞 `12153` 并作废整条 RT 链。跨进程（主服务 + `signin`/`signin.sh` 同时刷新）靠「refresh 遇 `12153` 时回读磁盘 auth 文件、采纳更新的 token 重试一次」兜底，不做跨进程文件锁。
 - **SSE**：兼容 `delta.reasoning`（归一为 `reasoning_content`）、重复 `tool_calls[].id` 去重；已收到 `finish_reason` 后 EOF 视为正常完成。只有 reasoning、没有正文/工具调用/拒答的流不记成功。
 - **队列与额度业务码**：`6020` 返回 429 + `Retry-After`（不换号）；`6021/6022` 返回容量/并发错误（不轮转）；`11145/14001/14002/14012-14014/14018/14019` 归为额度耗尽，`10105/15001` 按账号级使用上限走软限流，`14015` 会话失效，`14016/14017` 账号未激活，`11142` 账号级认证故障。
 - **错误码分类**：`11125/11129/11130/11132/11137-11139/11148-11155/12654/14405` 为请求级错误，不罚号、不轮转；`11102` 模型目录不存在直接 `404` fail-fast，`11136` 换号并写入 (账号,模型) 负缓存（不写路由熔断），`11141` 模型下线直接 fail-fast；`11-128` 入站按内容拦截处理；`6000-6008` 按限流处理（`6004` 保持模型级冷却）。HTTP 200 + 非零业务码与 SSE error 帧均按帧内/结构化 `code` 分类。
