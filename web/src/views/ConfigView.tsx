@@ -381,6 +381,10 @@ export function ConfigView() {
             </Field>
           </div>
           {check('prefer_expiring', '快过期积分优先')}
+          {check('cross_domain_fallback', '裸模型名跨域回退')}
+          <FieldDescription>
+            本域选不到号时换到另一域（含上游 11102 跨域重取号一次）；显式域前缀 / 别名显式前缀 / 密钥绑定出口永不回退。热生效
+          </FieldDescription>
         </CardContent>
       </Card>
 

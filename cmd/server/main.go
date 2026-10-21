@@ -224,6 +224,7 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 	state.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)
 
 	// 会话粘性路由（可配关闭）。
 	sessRouter, redisMode, sessCount := setupSessionRouter(cfg, store, state)
@@ -831,6 +832,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 	state9.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	state9.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	state9.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	state9.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,

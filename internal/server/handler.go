@@ -1147,6 +1147,12 @@ type chatFlow struct {
 	stream   bool
 	rawModel string
 	realm    string
+	// realmExplicit 请求是否显式指定了出口域（模型前缀 / 别名目标前缀 / 命名密钥绑定）。
+	realmExplicit bool
+	// crossRealm 本次请求允许跨域回退（开关开启且 realmExplicit=false）。
+	crossRealm bool
+	// realmSwitched 本次请求是否已因 11102 切过域（只允许一次）。
+	realmSwitched bool
 	// realmErr 命名密钥出口绑定与请求显式前缀冲突（issue #94）；非 nil 时
 	// serveChat 在选号前返回 400。
 	realmErr      error
@@ -1281,6 +1287,31 @@ func (h *Handler) backgroundTarget(model string) string {
 	return live.BackgroundTarget
 }
 
+// realmExplicitFor 报告请求是否显式指定了出口域：
+//   - 模型自带 cn:/global: 前缀，或别名目标自带显式前缀；
+//   - 命名密钥绑定了出口域（绑定即运维侧的显式约束）。
+//
+// 三者任一命中都**不允许**跨域回退——否则出口约束（安全面）会被绕过。
+func (h *Handler) realmExplicitFor(in *chatInput) bool {
+	if in.keyRealm != "" {
+		return true
+	}
+
+	_, explicit := explicitModelRealm(in.model, h.requestModelAliases(in.model, in.keyRealm))
+
+	return explicit
+}
+
+// crossRealmAllowed 报告本次请求是否允许跨域回退：开关开启**且**请求未显式指定域
+// （显式前缀 / 别名目标前缀 / 命名密钥绑定都算显式——否则出口约束会被绕过）。
+func (h *Handler) crossRealmAllowed(in *chatInput) bool {
+	if h.realmExplicitFor(in) {
+		return false
+	}
+
+	return h.cfg.Pool != nil && h.cfg.Pool.CrossDomainFallback()
+}
+
 // requestModelAliases 合并上游目录别名与配置别名；配置别名优先（覆盖同名上游别名）。
 // 裸名按命名密钥出口绑定选 realm（未绑定才回落到请求侧默认 cn），否则 global
 // key 会拿到 cn 目录的别名，global 上游 alias 永远解析不到。
@@ -1370,6 +1401,8 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
 		reqModalities:  reqMods,
 		bareModel:      bareModel,
+		realmExplicit:  h.realmExplicitFor(chatInput2),
+		crossRealm:     h.crossRealmAllowed(chatInput2),
 		modelRate:      modelRate,
 		st:             chatStat2,
 		keyUsage:       chatInput2.keyUsage,
@@ -1384,16 +1417,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	// 走普通轮换）。ExtractKey 与粘性开关解耦：关闭粘性时会话头族的聚合主键仍按
 	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级。
 	chatFlow2.sessKey = session.ExtractKey(chatInput2.body)
-	if h.cfg.Session != nil && chatFlow2.sessKey != "" {
-		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
-		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
-		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
-		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
-		if uid, ok := h.cfg.Session.ResolveForModel(chatFlow2.sessKey, chatFlow2.realm+":"+chatFlow2.bareModel); ok {
-			chatFlow2.stickyUID = uid
-		}
-	}
+	h.bindSticky(chatFlow2)
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生。必须在 prompt.Rewrite 之前取
 	// ——改写会动 messages 内容，之后取会让键漂移。
@@ -1715,6 +1739,22 @@ func (f *chatFlow) degradeSticky() string {
 	return uid
 }
 
+// bindSticky 解析会话键对应的绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
+//
+// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，而不是钉在
+// 限额号上反复失败（"限额后换不动号"的正解）。必须带 realm 前缀：粘性可用性闭包按
+// realm 过滤账号，只传裸名会回落 cn，让 global 请求把会话绑到 cn 号（或每轮重新分配，
+// 粘性形同失效）。别名目标省略 realm 时，flow.realm 已是继承请求侧后的结果。
+func (h *Handler) bindSticky(flow *chatFlow) {
+	if h.cfg.Session == nil || flow.sessKey == "" {
+		return
+	}
+
+	if uid, ok := h.cfg.Session.ResolveForModel(flow.sessKey, flow.realm+":"+flow.bareModel); ok {
+		flow.stickyUID = uid
+	}
+}
+
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
@@ -1747,26 +1787,104 @@ func (f *chatFlow) pickAccount() *auth.Auth {
 }
 
 // pickWith 普通轮换选号，tried 为本轮已尝试的 uid 集合。
+// 跨域回退开启时按 pickRealms 给出的域顺序依次尝试（主域优先）。
 func (f *chatFlow) pickWith(tried map[string]bool) *auth.Auth {
-	if f.st.decision != nil {
-		acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(tried, f.bareModel, f.realm)
-		mergePickTrace(f.st.decision, trace)
+	for _, realm := range f.pickRealms() {
+		if acct := f.pickInRealm(tried, realm); acct != nil {
+			f.noteServedRealm(acct)
 
-		return acct
+			return acct
+		}
 	}
 
-	return f.h.cfg.Pool.PickExcludingForRealm(tried, f.bareModel, f.realm)
+	return nil
+}
+
+// pickInRealm 在指定域选号（决策链开启时顺带合并选号快照）。
+func (f *chatFlow) pickInRealm(tried map[string]bool, realm string) *auth.Auth {
+	if f.st.decision == nil {
+		return f.h.cfg.Pool.PickExcludingForRealm(tried, f.bareModel, realm)
+	}
+
+	acct, trace := f.h.cfg.Pool.PickExcludingForRealmTrace(tried, f.bareModel, realm)
+	mergePickTrace(f.st.decision, trace)
+
+	return acct
+}
+
+// pickRealms 返回本次选号要尝试的域顺序（主域优先）。
+// 跨域回退关闭时只有请求域；开启时：请求域不可服务而另一域可服务就先试另一域，
+// 否则先试请求域、选不到再试另一域。
+func (f *chatFlow) pickRealms() []string {
+	if !f.crossRealm {
+		return []string{f.realm}
+	}
+
+	other := otherRealm(f.realm)
+	if !f.h.cfg.Pool.ServableForModelRealm(f.bareModel, f.realm) &&
+		f.h.cfg.Pool.ServableForModelRealm(f.bareModel, other) {
+		return []string{other, f.realm}
+	}
+
+	return []string{f.realm, other}
+}
+
+// noteServedRealm 跨域命中后把生效域切到账号实际所属域：之后的日限、计费、
+// 模型负缓存与路由熔断全部按**实际服务域**记账（否则另一域的消耗会记到请求域账上）。
+func (f *chatFlow) noteServedRealm(acct *auth.Auth) {
+	if !f.crossRealm {
+		return
+	}
+
+	realm := acct.Realm()
+	if realm == "" || realm == f.realm {
+		return
+	}
+
+	log.Printf("INFO: [server] cross-domain fallback model=%s: %s -> %s acct=%s",
+		f.bareModel, f.realm, realm, logfmt.UID8(acct.UID))
+
+	f.realm = realm
+
+	if f.h.cfg.Upstream != nil {
+		f.modelRate = f.h.cfg.Upstream.ModelRate(realm, f.bareModel)
+	}
+}
+
+// switchRealmForModelNotFound 11102（上游目录无此模型）跨域重取号一次：仅当跨域回退
+// 开启、请求未显式指定域、且本次请求还没切过域。已切过即返回 false，交给既有
+// 请求级 fail-fast（404），避免把一次失败放大成多轮无效请求。
+func (f *chatFlow) switchRealmForModelNotFound() bool {
+	if !f.crossRealm || f.realmSwitched {
+		return false
+	}
+
+	f.realmSwitched = true
+	f.realm = otherRealm(f.realm)
+
+	if f.h.cfg.Upstream != nil {
+		f.modelRate = f.h.cfg.Upstream.ModelRate(f.realm, f.bareModel)
+	}
+
+	log.Printf("INFO: [server] cross-domain fallback model=%s: model not found, retry on %s",
+		f.bareModel, f.realm)
+
+	return true
 }
 
 // trySticky 尝试复用会话绑定号；ok=false 表示已解绑/降级，调用方回落普通轮换。
 // 第三个返回值是软逃逸被降级的 uid，供调用方在本轮排除。
 func (f *chatFlow) trySticky() (*auth.Auth, bool, string) {
 	acct, picked := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
-	if picked == pool.StickyPicked && acct != nil && (f.realm == "" || acct.Realm() == f.realm) {
+	// 跨域回退开启时放宽域校验：粘性号属于「另一域」也可以继续用（该域正是
+	// 这次请求实际要用的域），由 noteServedRealm 切换生效域与记账口径。
+	if picked == pool.StickyPicked && acct != nil && (f.crossRealm || f.realm == "" || acct.Realm() == f.realm) {
 		if f.st.decision != nil {
 			f.st.decision.StickyHit = true
 			f.st.decision.FinalUID = logfmt.UID8(acct.UID)
 		}
+
+		f.noteServedRealm(acct)
 
 		return acct, true, ""
 	}
@@ -2028,6 +2146,10 @@ func (f *chatFlow) handleHTTPError(
 		f.handleQueueError(kind, respBody, uerr)
 		return rotDone
 	}
+	// 11102 + 跨域回退：本域目录无此模型时允许换域重取号一次。
+	if action, ok := f.retryModelNotFoundCrossRealm(ctx, acct, kind, status, respBody, uerr, i); ok {
+		return action
+	}
 	// 请求级错误（内容防火墙 / 上下文超限 / 图片无效 / 请求体畸形）：换任何账号都会
 	// 撞同一结果，轮转纯属浪费，透传上游原文立即返回。
 	if failFastKind(kind) {
@@ -2042,10 +2164,7 @@ func (f *chatFlow) handleHTTPError(
 	// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：该次
 	// WAF 403 喂入 IP 级状态机，若激活（短窗多号命中）则立即终止轮转，避免把请求放大
 	// MaxRotate 倍打同一出口 IP。账号级软冷却已在上方 applyErrorPolicy 照常记账。
-	if kind == upstream.ErrWafBlock && f.h.wafIP.noteWaf(acct.UID) {
-		f.h.notifyAccount(acct.UID, notify.EventWAFIPBlocked, "出口 IP 触发上游 WAF 级拦截，轮转已停止",
-			map[string]any{"model": f.bareModel})
-
+	if f.noteWafAndStop(kind, acct) {
 		return rotBreak
 	}
 	// 状态码换号闸（issue #17，默认关闭）：allowlist 非空时仅列出的状态码才换号；
@@ -2061,6 +2180,42 @@ func (f *chatFlow) handleHTTPError(
 	f.rotateReason = kind.String()
 
 	return rotContinue
+}
+
+// noteWafAndStop 记录 IP 级 WAF 命中：激活（短窗多号命中）时报告调用方终止轮转。
+func (f *chatFlow) noteWafAndStop(kind upstream.ErrKind, acct *auth.Auth) bool {
+	if kind != upstream.ErrWafBlock || !f.h.wafIP.noteWaf(acct.UID) {
+		return false
+	}
+
+	f.h.notifyAccount(acct.UID, notify.EventWAFIPBlocked, "出口 IP 触发上游 WAF 级拦截，轮转已停止",
+		map[string]any{"model": f.bareModel})
+
+	return true
+}
+
+// retryModelNotFoundCrossRealm 11102「上游模型目录无此模型」+ 跨域回退：该域没有此
+// 模型时允许跨到另一域重取号一次（本 fork 的 11102 是请求级 fail-fast，与上游
+// 「负缓存后换域」链路不同，所以显式补一条一次性跨域分支）。不罚账号、不写模型负缓存。
+// ok=false 表示「本次不走跨域分支」，调用方继续既有 fail-fast 处置。
+func (f *chatFlow) retryModelNotFoundCrossRealm(
+	ctx context.Context, acct *auth.Auth, kind upstream.ErrKind, status int, respBody []byte,
+	uerr *upstream.Error, i int,
+) (rotationAction, bool) {
+	if kind != upstream.ErrModelNotFound || !f.switchRealmForModelNotFound() {
+		return rotDone, false
+	}
+
+	f.lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+	f.fail(acct.UID)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak, true
+	}
+
+	f.rotateReason = "model_not_found_cross_realm"
+
+	return rotContinue, true
 }
 
 // rotateAllowedForStatus 报告该 HTTP 状态码是否允许换号：RotateStatuses 为空时恒 true

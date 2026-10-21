@@ -461,6 +461,7 @@ gemini
 | `pricing.exchange_rate` | `1` | 展示币种换算系数（1 = USD） |
 | `pool.max_in_flight_total` | `0` | 网关级全局在途上限；满额新请求返回 503 且不选号；`0` = 不限。热生效 |
 | `pool.credit_floor` | `0`（示例 `100`） | 积分保底：余额低于该值不再参与收费模型轮换；`0` = 关闭 |
+| `pool.cross_domain_fallback` | `false` | 裸模型名跨域回退：请求未显式指定域时，本域对该模型选不到号可换到另一域；上游 `11102`（目录无此模型）允许跨域重取号一次。显式 `cn:`/`global:` 前缀、别名目标显式前缀、命名密钥绑定出口**永不回退**。开启后请求可能落到客户端没点名的域并消耗该域额度/日限（记账按实际服务域）。热生效 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
