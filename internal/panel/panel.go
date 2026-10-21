@@ -857,7 +857,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	// 账号体系门控（issue #108）：企业版无个人签到体系（上游 400 code 10001），
 	// 不发起签到调用，端点退化为「刷新额度」；global 账号与调度器一致走签到。
-	// 额度查询按 realm/企业口径分流（upstream.UserResourceDetailedWithExpiry）。
+	// 额度查询按 realm/企业口径分流（upstream.UserResourceSnapshot）。
 	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
 	denyReason, checkinDone, checkinMsg := p.runCheckin(account, uid)
@@ -877,10 +877,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		resp["checkin_message"] = checkinMsg
 	}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(
-		account,
-		p.expiringSoonWindow(),
-	)
+	// 用含逐日到期批次的快照写入：单号签到同样保留完整批次，而不是把后台刷新
+	// 刚写入的批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
+	snap, err := p.cfg.Upstream.UserResourceSnapshot(account, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
@@ -888,11 +887,11 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-	resp["credits"] = remain
-	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	p.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
+	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	resp["credits"] = snap.Remain
+	resp["credits_total"] = snap.Total
+	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, snap.Remain, snap.Total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -906,17 +905,29 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(
-		account,
-		p.expiringSoonWindow(),
-	)
+	// 与签到/后台刷新同口径：写完整批次，单号刷新不清空到期明细。
+	snap, err := p.cfg.Upstream.UserResourceSnapshot(account, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
 
-	p.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
+	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": snap.Remain, "credits_total": snap.Total})
+}
+
+// poolExpiryBuckets upstream → pool 类型转换（pool 不依赖 upstream 包）。
+func poolExpiryBuckets(buckets []upstream.ExpiryBucket) []pool.ExpiryBucket {
+	if len(buckets) == 0 {
+		return nil
+	}
+
+	out := make([]pool.ExpiryBucket, 0, len(buckets))
+	for _, bucket := range buckets {
+		out = append(out, pool.ExpiryBucket{Date: bucket.Date, ExpireAt: bucket.ExpireAt, Remain: bucket.Remain})
+	}
+
+	return out
 }
 
 // accountRemove 移除账号：先出池（池内退役凭证并立即落盘 state），再删 auth 文件。

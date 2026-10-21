@@ -752,6 +752,34 @@ func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 	}
 }
 
+// TestRunCheckinKeepsExpiryBuckets 签到链路写完整余额快照：不得把后台刷新刚写入的
+// 逐日到期批次清空（SetCreditsDetailed 只带最早一批，会清旧批次）。
+func TestRunCheckinKeepsExpiryBuckets(t *testing.T) {
+	t.Parallel()
+
+	end := time.Now().In(time.FixedZone("CST", 8*3600)).Add(24 * time.Hour).Format("2006-01-02 15:04:05")
+	fakeUpstream2 := &fakeUpstream{resourceRemain: 100, resourceEnd: end}
+
+	srv := fakeUpstream2.server()
+	defer srv.Close()
+
+	state := pool.New("")
+	state.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	at := time.Now().Add(time.Hour)
+	state.SetCreditsSnapshot("u1", 100, 1000, 100, []pool.ExpiryBucket{{
+		Date: at.Format("2006-01-02"), ExpireAt: at, Remain: 100,
+	}})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	scheduler := New(&Config{Pool: state, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	scheduler.RunCheckinNow()
+
+	status, _ := state.Status("u1")
+	if len(status.CreditsExpiryBuckets) == 0 {
+		t.Fatalf("签到后到期批次被清空: %+v", status)
+	}
+}
+
 func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
 	t.Parallel()
 

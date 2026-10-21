@@ -115,9 +115,9 @@ func TestBalanceRefreshMeta(t *testing.T) {
 	}
 }
 
-// TestSetCreditsDetailedClearsStaleBuckets 无逐日批次的上游路径（签到 / 面板单号
-// 刷新）更新余额时必须清掉旧批次：否则快照会同时展示新 credits/最早批次与上一次
-// 周期刷新留下的过期批次（issue #200 快照/检查口径一致性）。
+// TestSetCreditsDetailedClearsStaleBuckets 无逐日批次的入口（外部/测试调用方）
+// 更新余额时必须清掉旧批次：否则快照会同时展示新 credits/最早批次与上一次周期
+// 刷新留下的过期批次（issue #200 快照/检查口径一致性）。
 func TestSetCreditsDetailedClearsStaleBuckets(t *testing.T) {
 	t.Parallel()
 
@@ -129,7 +129,7 @@ func TestSetCreditsDetailedClearsStaleBuckets(t *testing.T) {
 		{Date: at.Format("2006-01-02"), ExpireAt: at, Remain: 100},
 	})
 
-	// 模拟签到 / 单号刷新：只带最早批次，不带逐日明细。
+	// 模拟只带最早批次、不带逐日明细的调用方。
 	pool.SetCreditsDetailed("u1", 60, 100, 0, at, 60)
 
 	status, ok := pool.Status("u1")

@@ -673,15 +673,17 @@ func (s *Scheduler) runCheckinAccount(status *pool.Status, account *auth.Auth, e
 		ok = s.checkinOne(status.UID, status.Nickname, account)
 	}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account, expiringSoon)
+	// 用含逐日到期批次的快照写入：签到链路也保留完整批次，避免把后台刷新刚写入的
+	// 批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
+	snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
 	if err != nil {
 		log.Printf("user-resource %s: %v", logfmt.Label(status.UID, status.Nickname), err)
 		return false
 	}
 
-	s.cfg.Pool.ReenableIfCredits(status.UID, remain, total)
-	s.cfg.Pool.SetCreditsDetailed(status.UID, remain, total, expiring, earliestAt, earliestRemaining)
-	s.notifyCreditLow(account, remain)
+	s.cfg.Pool.ReenableIfCredits(status.UID, snap.Remain, snap.Total)
+	s.cfg.Pool.SetCreditsSnapshot(status.UID, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+	s.notifyCreditLow(account, snap.Remain)
 
 	return ok
 }
