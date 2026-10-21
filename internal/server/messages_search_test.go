@@ -252,3 +252,127 @@ func TestSearchRecordsRequestTrace(t *testing.T) {
 		t.Error("搜索请求应带 X-Request-ID（与其他 POST 接口同口径）")
 	}
 }
+
+// TestSearchMaxResultsPassthrough 请求体 / tools 里的 max_results 透传并收敛。
+func TestSearchMaxResultsPassthrough(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "请求体顶层 max_results",
+			body: `{"model":"m","max_results":3,"messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],"tools":[{"name":"web_search"}]}`,
+			want: `"max_results":3`,
+		},
+		{
+			name: "tools 里的 max_results",
+			body: `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],"tools":[{"name":"web_search","max_results":7}]}`,
+			want: `"max_results":7`,
+		},
+		{
+			name: "超上限收敛到 10",
+			body: `{"model":"m","max_results":99,"messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],"tools":[{"name":"web_search"}]}`,
+			want: `"max_results":10`,
+		},
+		{
+			name: "缺省用默认 5",
+			body: `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],"tools":[{"name":"web_search"}]}`,
+			want: `"max_results":5`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotBody string
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw := make([]byte, 0, 256)
+				buf := make([]byte, 256)
+
+				for {
+					n, err := r.Body.Read(buf)
+					raw = append(raw, buf[:n]...)
+
+					if err != nil {
+						break
+					}
+				}
+
+				gotBody = string(raw)
+
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(searchOKBody))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL}
+			state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999})
+			handler := NewHandler(&Config{
+				Pool: state, Upstream: client,
+				Live: livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+			})
+
+			if rec := doSearchRequest(t, handler, testCase.body); rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+
+			if !strings.Contains(gotBody, testCase.want) {
+				t.Errorf("出站 body=%s want 含 %s", gotBody, testCase.want)
+			}
+		})
+	}
+}
+
+// TestSearchRejectsTooLongQuery 超长搜索词在本地拒绝（不打上游）。
+func TestSearchRejectsTooLongQuery(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		calls++
+
+		return 200, searchOKBody
+	})
+
+	long := strings.Repeat("搜", searchQueryMaxLen)
+	rec := doSearchRequest(t, handler, `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"`+long+`"}]}],"tools":[{"name":"web_search"}]}`)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400", rec.Code)
+	}
+
+	if calls != 0 {
+		t.Errorf("超长搜索词不应打上游，calls=%d", calls)
+	}
+}
+
+// TestSearchUsageIsEstimated 响应 usage 是估算值（非恒 0），供客户端预算。
+func TestSearchUsageIsEstimated(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) { return 200, searchOKBody })
+
+	rec := doSearchRequest(t, handler, `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"golang search"}]}],"tools":[{"name":"web_search"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var resp struct {
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if resp.Usage.InputTokens < 1 || resp.Usage.OutputTokens < 1 {
+		t.Errorf("usage=%+v want 估算值均 >= 1", resp.Usage)
+	}
+}

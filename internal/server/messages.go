@@ -63,12 +63,12 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	if fail != nil {
-		writeAnthropicError(w, fail.status, searchErrorType(fail.status), fail.msg, fail.hint)
+		writeAnthropicError(w, fail.status, searchErrorType(fail.status), fail.msg, searchHint(fail))
 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, buildSearchMessage(req.model, outcome))
+	writeJSON(w, http.StatusOK, buildSearchMessage(req.model, req.query, outcome))
 }
 
 // searchRequest 解析出的搜索请求要素。
@@ -88,6 +88,8 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 			Content []map[string]any `json:"content"`
 		} `json:"messages"`
 		Tools []map[string]any `json:"tools"`
+		// MaxResults 可选：非 0 时覆盖默认条数（上游按 ClampSearchMaxResults 收敛）。
+		MaxResults int `json:"max_results"`
 	}
 
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -111,7 +113,43 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 		return nil, errSearchQueryEmpty
 	}
 
-	return &searchRequest{model: payload.Model, query: query, maxResults: 0}, nil
+	if len(query) > searchQueryMaxLen {
+		return nil, errSearchQueryTooLong
+	}
+
+	// 条数：请求体顶层 max_results 优先，其次 tools[].max_results；两处都缺省时用
+	// upstream 的默认值（ClampSearchMaxResults 负责收敛到 [1, cap]）。
+	maxResults := payload.MaxResults
+	if maxResults <= 0 {
+		maxResults = toolMaxResults(payload.Tools)
+	}
+
+	return &searchRequest{model: payload.Model, query: query, maxResults: maxResults}, nil
+}
+
+// searchQueryMaxLen 搜索词长度上限（防御性：上游 zod 无上限，超长 query 只会让
+// 上游超时并白占一次在途名额；1024 字符已远超任何真实搜索词）。
+const searchQueryMaxLen = 1024
+
+// toolMaxResults 取 web_search 工具声明里的 max_results（缺省/非法返回 0 = 用默认）。
+func toolMaxResults(tools []map[string]any) int {
+	for _, tool := range tools {
+		name, _ := tool["name"].(string)
+		kind, _ := tool["type"].(string)
+
+		if name != "web_search" && !strings.HasPrefix(kind, "web_search") {
+			continue
+		}
+
+		switch value := tool["max_results"].(type) {
+		case float64:
+			return int(value)
+		case int:
+			return value
+		}
+	}
+
+	return 0
 }
 
 // declaresWebSearch 报告请求是否声明了 web_search 工具（官方形态：
@@ -167,11 +205,51 @@ func lastUserText(messages []struct {
 
 // buildSearchMessage 组装 Anthropic Messages 形态的响应：摘要 text 块（带 citations）
 // + web_search_tool_result 块（逐条结果）。
-func buildSearchMessage(model string, outcome *upstream.SearchOutcome) map[string]any {
-	citations := make([]map[string]any, 0, len(outcome.Results))
-	results := make([]map[string]any, 0, len(outcome.Results))
+func buildSearchMessage(model, query string, outcome *upstream.SearchOutcome) map[string]any {
+	queryBytes := len(query)
+	citations, results, summary := buildSearchBlocks(outcome)
 
-	var summary strings.Builder
+	return map[string]any{
+		"id":    "msg_" + session.NewMessageID(),
+		"type":  "message",
+		"role":  "assistant",
+		"model": model,
+		"content": []map[string]any{
+			{"type": "text", "text": summary.String(), "citations": citations},
+			{
+				"type":    "web_search_tool_result",
+				"content": results,
+			},
+		},
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		// usage 是估算值（网关没有 tokenizer）：input 按搜索词字节/4、output 按摘要
+		// 字节/4 粗估。客户端只用它做上下文预算，不作为计费依据（与 count_tokens 同口径）。
+		"usage": map[string]any{
+			"input_tokens":  max(1, queryBytes/4),
+			"output_tokens": max(1, summary.Len()/4),
+		},
+	}
+}
+
+// accountNickname 取账号昵称（记账展示用；账号已移除时返回空串）。
+func accountNickname(h *Handler, uid string) string {
+	if uid == "" {
+		return ""
+	}
+
+	if acct := h.cfg.Pool.AuthByUID(uid); acct != nil {
+		return acct.NicknameValue()
+	}
+
+	return ""
+}
+
+// buildSearchBlocks 把搜索结果折成 Anthropic content 需要的三样东西：
+// citations（text 块）、web_search_result（tool_result 块）与摘要文本。
+func buildSearchBlocks(outcome *upstream.SearchOutcome) (citations, results []map[string]any, summary strings.Builder) {
+	citations = make([]map[string]any, 0, len(outcome.Results))
+	results = make([]map[string]any, 0, len(outcome.Results))
 
 	for i := range outcome.Results {
 		result := &outcome.Results[i]
@@ -212,35 +290,17 @@ func buildSearchMessage(model string, outcome *upstream.SearchOutcome) map[strin
 		summary.WriteString("未找到与该查询相关的网页结果。")
 	}
 
-	return map[string]any{
-		"id":    "msg_" + session.NewMessageID(),
-		"type":  "message",
-		"role":  "assistant",
-		"model": model,
-		"content": []map[string]any{
-			{"type": "text", "text": summary.String(), "citations": citations},
-			{
-				"type":    "web_search_tool_result",
-				"content": results,
-			},
-		},
-		"stop_reason":   "end_turn",
-		"stop_sequence": nil,
-		"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
-	}
+	return citations, results, summary
 }
 
-// accountNickname 取账号昵称（记账展示用；账号已移除时返回空串）。
-func accountNickname(h *Handler, uid string) string {
-	if uid == "" {
-		return ""
+// searchHint 给搜索失败补一条客户端可操作的提示（上游原文仍在 message 里透传）。
+// 15001「联网搜索次数用尽」是账号级额度，换号可能仍有额度——提示写明这一点。
+func searchHint(fail *searchFailure) string {
+	if strings.Contains(fail.msg, "15001") {
+		return "search quota exhausted for the current account; the gateway may retry on another account"
 	}
 
-	if acct := h.cfg.Pool.AuthByUID(uid); acct != nil {
-		return acct.NicknameValue()
-	}
-
-	return ""
+	return fail.hint
 }
 
 // searchErrorType 把终端状态码映射成 Anthropic 错误类型。
@@ -262,5 +322,6 @@ var (
 	errSearchInvalidJSON  = errors.New("invalid JSON body")
 	errSearchToolRequired = errors.New(
 		"该端点只用于联网搜索：请求必须在 tools 中声明 web_search 工具")
-	errSearchQueryEmpty = errors.New("请在 messages 中提供一段用户文本作为搜索词")
+	errSearchQueryEmpty   = errors.New("请在 messages 中提供一段用户文本作为搜索词")
+	errSearchQueryTooLong = errors.New("搜索词过长（上限 1024 字符），请精简后重试")
 )
