@@ -178,7 +178,11 @@ export function mdAvailability(
     return { key: 'rate', label: '限流不可用', tone: 'bad', tip: '锁池：该模型被限流/冷却，全部账号不可用' + unlock };
   }
 
-  const latest = (recent || []).find((r) => r && r.model === model);
+  // 请求日志记录的是客户端原始 model：模型页展示/复制的 global 模型通常带
+  // "global:" 前缀，只比裸名会让最标准的调用方式永远命中不到最近请求。
+  const latest = (recent || []).find(
+    (r) => r && (r.model === model || r.model === 'global:' + model),
+  );
   if (latest) {
     const status = Number(latest.status || 0);
     const outcome = String(latest.outcome || '');

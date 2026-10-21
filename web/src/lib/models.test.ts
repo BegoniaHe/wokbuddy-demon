@@ -116,6 +116,13 @@ describe('mdAvailability（global 模型可用性）', () => {
     expect(mdAvailability('global:kimi-k3', [], [{ model: 'kimi-k3', status: 400 }])?.key).toBe('recent_fail');
   });
 
+  it('最近请求记录带 global: 前缀时也能命中（请求记的是原始 model）', () => {
+    const a = mdAvailability('global:kimi-k3', [], [
+      { model: 'global:kimi-k3', status: 200, outcome: 'success' },
+    ]);
+    expect(a?.key).toBe('recent_ok');
+  });
+
   it('锁优先于最近请求：有锁时忽略 recent', () => {
     const a = mdAvailability(
       'global:kimi-k3',
