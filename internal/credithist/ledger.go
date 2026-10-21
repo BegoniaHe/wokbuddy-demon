@@ -39,6 +39,9 @@ type Entry struct {
 
 // Ledger 账本（并发安全）。
 type Ledger struct {
+	// flushMu 串行化落盘：多个账号的余额查询会并发触发 Observe+Flush，共用同一个
+	// 「path.tmp」；不串行化时两个写者会在同一 inode 上交错写/rename，产生非法 JSON。
+	flushMu sync.Mutex
 	mu      sync.Mutex
 	path    string
 	max     int
@@ -175,6 +178,12 @@ func (l *Ledger) Recent(limit int, uid string) []Entry {
 // Flush 把当前账本原子写盘（先写 tmp 再 rename）。写失败只记日志——
 // 账本是观测附属物，不能影响余额查询主路径。
 func (l *Ledger) Flush() {
+	// 先串行化整个「快照 + 写 tmp + rename」：Flush 会在 p.mu 之外做磁盘 I/O，
+	// 并发 Flush 若共用同一个 tmp 路径会互相截断/交错写。flushMu 只在落盘路径使用，
+	// 不与 l.mu 形成反向加锁（其它方法只取 l.mu）。
+	l.flushMu.Lock()
+	defer l.flushMu.Unlock()
+
 	l.mu.Lock()
 
 	if !l.dirty || l.path == "" {

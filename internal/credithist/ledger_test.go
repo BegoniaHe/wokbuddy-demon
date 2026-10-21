@@ -1,9 +1,11 @@
 package credithist
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -157,5 +159,44 @@ func TestLedgerFlushFailureKeepsDirty(t *testing.T) {
 
 	if !dirty {
 		t.Fatal("写盘失败后必须保持脏标记，否则这批流水永远不会再被写出")
+	}
+}
+
+// TestLedgerConcurrentFlushStaysValid 多账号并发 Observe+Flush（与真实余额刷新
+// 并发模型一致）不得把共用的 tmp 文件写坏：落盘必须串行化，最终文件始终是合法 JSON。
+func TestLedgerConcurrentFlushStaysValid(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "credit-history.json")
+	ledger := Open(path, 10000)
+
+	var wg sync.WaitGroup
+
+	for i := range 8 {
+		wg.Go(func() {
+			uid := fmt.Sprintf("u%d", i)
+			ledger.Observe(uid, 100, "")
+
+			for j := range 50 {
+				ledger.Observe(uid, int64(100+j+1), "")
+				ledger.Flush()
+			}
+		})
+	}
+
+	wg.Wait()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read ledger: %v", err)
+	}
+
+	var doc fileDoc
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("并发 Flush 写坏了账本文件: %v", err)
+	}
+
+	if len(doc.Entries) == 0 {
+		t.Fatal("并发 Flush 后账本不应为空")
 	}
 }
