@@ -74,15 +74,19 @@ func (s *Scheduler) CompensationStatusAll(ctx context.Context) []CompensationRow
 	for i := range list {
 		status := &list[i]
 
-		account := s.cfg.Pool.AuthByUID(status.UID)
-		if account == nil {
-			continue
-		}
-
 		rows[i] = CompensationRow{
 			UID:      status.UID,
 			Nickname: status.Nickname,
 			Realm:    status.Realm,
+		}
+
+		// 凭证缺失也要显形：留一条空行会被前端当成「没有待领补偿」，与本模块
+		// 「不静默失败」的命题相反。
+		account := s.cfg.Pool.AuthByUID(status.UID)
+		if account == nil {
+			rows[i].Error = "账号凭证缺失"
+
+			continue
 		}
 
 		if reason, skip := compensationGate(account, status.Disabled); skip {
