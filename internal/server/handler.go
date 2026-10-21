@@ -124,6 +124,9 @@ type Config struct {
 	LocalWebTools bool
 	// LocalWebToolRounds 本地工具代跑轮数（0 回落默认 3，封顶 8）。
 	LocalWebToolRounds int
+	// HiddenModels 模型黑名单（"cn:x"/"global:x" 归一形式）；空 = 关闭。
+	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
+	HiddenModels map[string]struct{}
 	// BackgroundNames 后台模型改写名单（小写；issue #103）；空 = 关闭。
 	BackgroundNames map[string]bool
 	// BackgroundTarget 后台模型改写目标（issue #103）。
@@ -182,6 +185,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		LocalWebToolRounds: h.cfg.LocalWebToolRounds,
 		BackgroundNames:    h.cfg.BackgroundNames,
 		BackgroundTarget:   h.cfg.BackgroundTarget,
+		HiddenModels:       h.cfg.HiddenModels,
 	}
 }
 
@@ -898,12 +902,23 @@ func (h *Handler) modelList() []map[string]any {
 
 	models := h.fetchDynamicModels()
 	for i := range models {
+		// 按上游裸模型名判定：条目 id 是 "cn:<model>" 形态，直接用会永远匹配不到。
+		if h.modelHidden("cn", models[i].ID) {
+			continue
+		}
+
 		out = append(out, h.cnModelEntry(&models[i]))
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
 	// 名单 = 纯动态探测结果（fetchGlobalModels，失败/无号 → 空）。
 	if h.cfg.GlobalEnabled {
-		out = append(out, h.globalModelEntries()...)
+		for _, entry := range h.globalModelEntries() {
+			if id, ok := entry["id"].(string); ok && h.modelHidden("global", strings.TrimPrefix(id, "global:")) {
+				continue
+			}
+
+			out = append(out, entry)
+		}
 	}
 
 	return h.appendAliasEntries(out)
@@ -932,6 +947,13 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 	}
 
 	for _, name := range names {
+		upstreamID := normalizeAliasTarget(h.cfg.ModelAliases[name])
+		// 别名条目同样受黑名单约束：别名名字本身或其目标模型被隐藏时都不列出
+		// （否则「藏起来的模型」会经由别名泄露）。
+		if realm, bare, _ := splitRealm(upstreamID); h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
+			continue
+		}
+
 		entry := map[string]any{
 			"id":       name,
 			"object":   "model",
@@ -939,7 +961,7 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 			"owned_by": "workbuddy",
 			// upstream_id 保留配置里的 "[realm:]model" 原文；省略 realm 时
 			// 请求侧裸名按 cn 解析，这里也补上 cn: 便于客户端识别目标域。
-			"upstream_id": normalizeAliasTarget(h.cfg.ModelAliases[name]),
+			"upstream_id": upstreamID,
 		}
 		if i, ok := index[name]; ok {
 			out[i] = entry
@@ -1226,6 +1248,11 @@ func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
 	defer chatFlow2.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
 	defer chatFlow2.recordKeyUsage()
+	// 模型黑名单（models.hidden）先于命名密钥白名单：隐藏模型不给任何 key 放行，
+	// 避免「key 白名单」变相解禁。判定点与白名单同处（后台改写/别名解析之后）。
+	if !chatFlow2.checkModelHidden() {
+		return
+	}
 	// 模型白名单必须在后台改写/别名解析之后校验：此时 f.realm/f.bareModel 才是
 	// 实际选号与出站使用的最终模型（裸名不再固定按 cn 误判 global key）。
 	if !chatFlow2.checkModelAllowed() {
@@ -1235,7 +1262,11 @@ func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
 	if !chatFlow2.applyModalityRoute() {
 		return
 	}
-	// 模态路由可能改写模型：按改写后的最终模型复核白名单，避免绕过。
+	// 模态路由可能改写模型：按改写后的最终模型复核隐藏与白名单，避免绕过。
+	if !chatFlow2.checkModelHidden() {
+		return
+	}
+
 	if !chatFlow2.checkModelAllowed() {
 		return
 	}
@@ -1245,6 +1276,37 @@ func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
 	}
 
 	chatFlow2.writeFinalError()
+}
+
+// checkModelHidden 校验模型黑名单：命中即 400 model_unavailable，不打上游、不占选号。
+func (f *chatFlow) checkModelHidden() bool {
+	if !f.h.modelHidden(f.realm, f.bareModel) {
+		return true
+	}
+
+	f.out.Error(http.StatusBadRequest, "model_unavailable",
+		"model is hidden by gateway config (models.hidden); pick another model", "")
+	f.st.status = http.StatusBadRequest
+	f.st.outcome = reqlog.OutcomeHTTPError
+
+	return false
+}
+
+// modelHidden 报告 (realm, model) 是否被 models.hidden 隐藏。
+// 键为归一后的 "realm:model"（裸名配置在归一阶段已展开成两域）。
+func (h *Handler) modelHidden(realm, model string) bool {
+	if model == "" {
+		return false
+	}
+
+	hidden := h.loadLive().HiddenModels
+	if len(hidden) == 0 {
+		return false
+	}
+
+	_, ok := hidden[realm+":"+model]
+
+	return ok
 }
 
 // checkModelAllowed 校验命名密钥模型白名单。调用时机必须在别名/后台改写/模态

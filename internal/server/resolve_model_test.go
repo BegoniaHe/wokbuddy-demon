@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -304,5 +305,159 @@ func TestChatFlowAliasStickyKeepsRealm(t *testing.T) {
 		if chatFlow2.stickyUID != testCase.wantUID {
 			t.Errorf("%s: stickyUID=%q，want %q", testCase.model, chatFlow2.stickyUID, testCase.wantUID)
 		}
+	}
+}
+
+// hiddenModelsTestHandler 造一个已填充 CN 目录缓存 + 含别名的 handler，
+// 用于 models.hidden 判定（独立缓存，避免落到进程级 dynamicModelsCache）。
+func hiddenModelsTestHandler(hidden []string) *Handler {
+	cache := &modelsCache{}
+	cache.ids = []upstream.ModelInfo{{ID: "glm-5.2"}, {ID: "kimi-k3"}}
+	cache.fetched = time.Now()
+
+	return NewHandler(&Config{
+		Pool:         testPoolWith(),
+		Upstream:     upstream.New(),
+		modelsCache:  cache,
+		HiddenModels: livecfg.NormalizeHiddenModels(hidden),
+		ModelAliases: map[string]string{
+			"alias-cn":     "cn:kimi-k3",
+			"alias-global": "global:kimi-k3",
+			"alias-ok":     "cn:glm-5.2",
+		},
+	})
+}
+
+// modelsListIDs 取 /v1/models 的 id 集合。
+func modelsListIDs(t *testing.T, handler *Handler) map[string]bool {
+	t.Helper()
+
+	rec := doModelsRequest(handler, "/v1/models", false)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("bad json: %v", err)
+	}
+
+	ids := make(map[string]bool, len(resp.Data))
+
+	for _, m := range resp.Data {
+		if id, ok := m["id"].(string); ok {
+			ids[id] = true
+		}
+	}
+
+	return ids
+}
+
+// TestModelsHiddenFiltersList 裸名黑名单：/v1/models 不列出该模型，且别名条目
+// （别名名或其目标模型命中）一并过滤——否则隐藏模型会经由别名泄露。
+func TestModelsHiddenFiltersList(t *testing.T) {
+	t.Parallel()
+
+	ids := modelsListIDs(t, hiddenModelsTestHandler([]string{"kimi-k3"}))
+
+	// CN 条目 id 带 "cn:" 前缀（/v1/models 的既有形态）。
+	if ids["cn:kimi-k3"] || ids["kimi-k3"] {
+		t.Errorf("隐藏模型不应出现在 /v1/models: %v", ids)
+	}
+
+	if ids["alias-cn"] || ids["alias-global"] {
+		t.Errorf("指向隐藏模型的别名不应列出: %v", ids)
+	}
+
+	if !ids["cn:glm-5.2"] || !ids["alias-ok"] {
+		t.Errorf("未隐藏的模型与别名必须保留: %v", ids)
+	}
+}
+
+// TestModelsHiddenRealmScoped cn: 前缀只藏 cn，不误伤 global。
+func TestModelsHiddenRealmScoped(t *testing.T) {
+	t.Parallel()
+
+	handler := hiddenModelsTestHandler([]string{"cn:kimi-k3"})
+
+	ids := modelsListIDs(t, handler)
+	if ids["cn:kimi-k3"] {
+		t.Errorf("cn:kimi-k3 应从 CN 目录移除: %v", ids)
+	}
+
+	if handler.modelHidden("global", "kimi-k3") {
+		t.Error("cn: 前缀不得影响 global 域")
+	}
+
+	if !handler.modelHidden("cn", "kimi-k3") {
+		t.Error("cn: 前缀应命中 cn 域")
+	}
+}
+
+// TestChatHiddenModelRejected 点名调用隐藏模型：400 model_unavailable、
+// 不打上游、不占选号、不冷却账号。
+func TestChatHiddenModelRejected(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls++
+
+		return http.StatusOK, sseOK, true
+	})
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{
+		Pool:         state,
+		Upstream:     client,
+		HiddenModels: livecfg.NormalizeHiddenModels([]string{"glm-5.2"}),
+	})
+
+	rec := postChat(t, handler, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("code=%d body=%s want 400 model_unavailable", rec.Code, rec.Body)
+	}
+
+	if calls != 0 {
+		t.Errorf("隐藏模型不得打上游，calls=%d", calls)
+	}
+
+	if st := statusOf(t, state, "u1"); st.Cooling || st.Disabled || st.ErrTotal != 0 {
+		t.Errorf("隐藏模型不应罚账号: %+v", st)
+	}
+}
+
+// TestCountTokensHiddenModelRejected /v1/messages/count_tokens 同口径：
+// 隐藏模型返回 400，不返回 token 估算。
+func TestCountTokensHiddenModelRejected(t *testing.T) {
+	t.Parallel()
+
+	handler := NewHandler(&Config{
+		Pool:         testPoolWith(),
+		Upstream:     upstream.New(),
+		modelsCache:  &modelsCache{},
+		HiddenModels: livecfg.NormalizeHiddenModels([]string{"cn:glm-5.2"}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s want 400", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), "hidden") {
+		t.Errorf("错误应说明模型被隐藏: %s", rec.Body)
+	}
+
+	if strings.Contains(rec.Body.String(), "input_tokens") {
+		t.Errorf("不得返回 token 估算: %s", rec.Body)
 	}
 }

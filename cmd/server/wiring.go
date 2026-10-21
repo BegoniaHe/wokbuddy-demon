@@ -285,6 +285,8 @@ func buildHandler(handlerDeps2 *handlerDeps) *server.Handler {
 		// 后台模型重定向（issue #103）：Live 快照优先，这里填静态回落值。
 		BackgroundNames:  backgroundNameSet(handlerDeps2.cfg.Models.BackgroundNames),
 		BackgroundTarget: handlerDeps2.cfg.Models.BackgroundTarget,
+		// 模型黑名单（models.hidden）：Live 快照优先，这里填静态回落值（热生效）。
+		HiddenModels: livecfg.NormalizeHiddenModels(handlerDeps2.cfg.Models.Hidden),
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: handlerDeps2.cfg.Global.Enabled,
 		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。

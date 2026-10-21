@@ -9,6 +9,7 @@
 package livecfg
 
 import (
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -30,6 +31,59 @@ type Snapshot struct {
 	BackgroundNames map[string]bool
 	// BackgroundTarget 后台模型改写目标（issue #103）。
 	BackgroundTarget string
+	// HiddenModels 模型黑名单（models.hidden），归一为 "cn:x"/"global:x" 全量形式：
+	// 命中即不在 /v1/models 列出、点名调用返回 400 model_unavailable。空 = 关闭。
+	HiddenModels map[string]struct{}
+}
+
+// NormalizeHiddenModels 把 models.hidden 归一为 "realm:model" 键集合：
+//   - 裸名 = 两域都隐藏（展开成 cn:x + global:x）；
+//   - "cn:x" / "global:x" 只藏该域；
+//   - 大小写敏感（与 models.aliases / splitRealm 同口径），空白项丢弃。
+func NormalizeHiddenModels(list []string) map[string]struct{} {
+	if len(list) == 0 {
+		return nil
+	}
+
+	out := make(map[string]struct{}, len(list)*2)
+
+	for _, raw := range list {
+		name := strings.TrimSpace(raw)
+		if name == "" {
+			continue
+		}
+
+		realm, bare, prefixed := splitHiddenRealm(name)
+		if bare == "" {
+			continue
+		}
+
+		if prefixed {
+			out[realm+":"+bare] = struct{}{}
+			continue
+		}
+
+		out["cn:"+bare] = struct{}{}
+		out["global:"+bare] = struct{}{}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+// splitHiddenRealm 拆分可选的 realm 前缀（只认 cn/global，其余原样视为裸模型名）。
+func splitHiddenRealm(name string) (realm, bare string, prefixed bool) {
+	for _, candidate := range []string{"cn", "global"} {
+		prefix := candidate + ":"
+		if trimmed, ok := strings.CutPrefix(name, prefix); ok {
+			return candidate, strings.TrimSpace(trimmed), true
+		}
+	}
+
+	return "", name, false
 }
 
 // Holder 原子持有当前快照。

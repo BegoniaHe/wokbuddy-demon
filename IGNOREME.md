@@ -467,6 +467,7 @@ gemini
 | `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
 | `models.background_names` | `[]` | 客户端后台任务硬编码模型名（大小写不敏感）；命中后把 `model` 改写为 `background_target`。留空 = 关闭。热生效 |
 | `models.background_target` | `deepseek-v4.1-flash` | 后台模型改写目标；只改 `model`，其余请求原样透传 |
+| `models.hidden` | `[]` | 模型黑名单：裸名 = 两域都隐藏，`cn:` / `global:` 前缀 = 只藏该域（大小写敏感，前缀后必须写模型名）。命中的模型不在 `/v1/models` 列出（含别名条目），点名调用返回 400 `model_unavailable`（不打上游、不占选号）。热生效 |
 
 调度补充说明：
 
