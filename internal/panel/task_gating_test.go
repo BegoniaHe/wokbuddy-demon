@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -29,6 +30,10 @@ func gatingAccount(t *testing.T, uid, kind string) *auth.Auth {
 	case "enterprise":
 		account.EnterpriseID = "ent-" + uid
 		account.Domain = "workbuddy.cn"
+	case "enterprise_switch":
+		// 企业切换会话：可用（无 enterpriseId），但 JWT 带 token_source=enterprise_switch。
+		account.AccessToken = switchSessionToken(uid)
+		account.Domain = "workbuddy.cn"
 	default:
 		account.Domain = "workbuddy.cn"
 	}
@@ -36,7 +41,15 @@ func gatingAccount(t *testing.T, uid, kind string) *auth.Auth {
 	return account
 }
 
-// newGatingPanel 构造带调用计数的面板（三类账号各一个）。
+// switchSessionToken 造含 token_source=enterprise_switch 的假 JWT（只解 payload、不验签）。
+func switchSessionToken(uid string) string {
+	payload := base64.RawURLEncoding.EncodeToString(
+		[]byte(`{"sub":"` + uid + `","token_source":"enterprise_switch"}`))
+
+	return "eyJhbGciOiJIUzI1NiJ9." + payload + ".sig"
+}
+
+// newGatingPanel 构造带调用计数的面板（cn / global / 企业版 / 企业切换会话各一个）。
 func newGatingPanel(t *testing.T) (*Panel, *int64) {
 	t.Helper()
 
@@ -62,7 +75,7 @@ func newGatingPanel(t *testing.T) (*Panel, *int64) {
 	}
 
 	p := pool.New("")
-	for _, kind := range []string{"cn", "global", "enterprise"} {
+	for _, kind := range []string{"cn", "global", "enterprise", "enterprise_switch"} {
 		p.Add(gatingAccount(t, kind+"-u", kind))
 	}
 
@@ -107,7 +120,7 @@ func assertSkipped(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int,
 func TestPanelTaskEndpointsDenyGlobalAndEnterprise(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []string{"global", "enterprise"} {
+	for _, kind := range []string{"global", "enterprise", "enterprise_switch"} {
 		t.Run(kind, func(t *testing.T) {
 			t.Parallel()
 			panel, calls := newGatingPanel(t)

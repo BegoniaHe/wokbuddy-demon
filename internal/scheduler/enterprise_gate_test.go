@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -196,4 +197,86 @@ func TestEnterpriseGateKeepsKeepaliveAndBalance(t *testing.T) {
 	if scheduler.cfg.Pool == nil {
 		t.Fatal("pool missing")
 	}
+}
+
+// switchSessionJWT 造一个含 token_source=enterprise_switch 的假 JWT（只解 payload、不验签）。
+func switchSessionJWT(t *testing.T) string {
+	t.Helper()
+
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","token_source":"enterprise_switch"}`))
+
+	return "eyJhbGciOiJIUzI1NiJ9." + payload + ".sig"
+}
+
+// switchSessionTestScheduler 构造「企业切换会话」账号（有 access token、无 enterpriseId）
+// 的调度器：这类会话能用（选号/额度正常），但没有个人成长体系。
+func switchSessionTestScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
+	t.Helper()
+	fastTravel(t)
+	fastActivity(t)
+	fastAdoptGap(t)
+
+	r := &recorderUpstream{}
+	srv := r.server()
+	t.Cleanup(srv.Close)
+
+	account := &auth.Auth{UID: "u1", AccessToken: switchSessionJWT(t), RefreshToken: "rt", ExpiresAt: 9999999999}
+
+	state := pool.New("")
+	state.Add(account)
+
+	client := &upstream.Client{
+		HTTP:          srv.Client(),
+		ChatBaseCN:    srv.URL,
+		BillingBaseCN: srv.URL,
+		WebBaseCN:     srv.URL,
+	}
+
+	return New(&Config{Pool: state, Upstream: client}), r
+}
+
+// TestEnterpriseSwitchSessionGateSkipsBehaviorTasks 企业切换会话（token_source=
+// enterprise_switch）跑行为类任务会白耗真实对话配额且拿不到奖励：四类行为任务
+// 一个上游调用都不发（与真企业号同口径），签到**不门控**（仍尝试并显式报错）。
+func TestEnterpriseSwitchSessionGateSkipsBehaviorTasks(t *testing.T) {
+	t.Parallel()
+
+	night := func() time.Time { return time.Date(2026, 10, 7, 23, 30, 0, 0, time.Local) }
+
+	cases := []struct {
+		name     string
+		run      func(*Scheduler)
+		endpoint string
+	}{
+		{"活跃上报", func(s *Scheduler) { s.RunActivityNow() }, "/v2/report"},
+		{"猫猫旅行", func(s *Scheduler) { s.RunTravelNow() }, "/activity/growth/buddy/info"},
+		{"夜猫子", func(s *Scheduler) { s.RunBlackcatNow() }, "/v2/activity/growth/tasks"},
+		{"连登管家", func(s *Scheduler) { s.RunStreakBonusNow() }, "/activity/growth/streak"},
+	}
+
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			scheduler, recorder := switchSessionTestScheduler(t)
+			scheduler.nowFn = night
+			item.run(scheduler)
+
+			if recorder.has(item.endpoint) {
+				t.Errorf("企业切换会话不应发起 %s，实际请求=%v", item.endpoint, recorder.snapshot())
+			}
+		})
+	}
+
+	// 反向断言：签到照常尝试（这类会话签到会显式报错，不需要门控）。
+	t.Run("签到仍尝试", func(t *testing.T) {
+		t.Parallel()
+
+		scheduler, recorder := switchSessionTestScheduler(t)
+		scheduler.RunCheckinNow()
+
+		if !recorder.has("/daily-checkin") {
+			t.Errorf("企业切换会话的签到不应被门控，实际请求=%v", recorder.snapshot())
+		}
+	})
 }

@@ -55,8 +55,8 @@ func (s *Scheduler) blackcatAll() (total, success, failure int) {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 
-		if account.IsEnterprise() {
-			continue // 企业版门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」）
+		if account.IsEnterpriseSession() {
+			continue // 企业版 / 企业切换会话门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」）
 		}
 
 		runCounters2.record(s.blackcatOne(account))
