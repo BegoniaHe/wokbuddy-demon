@@ -4,14 +4,16 @@ package pool
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"log"
 	"maps"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
 var flushInterval = 5 * time.Second
@@ -154,18 +156,23 @@ func (p *Pool) Flush() {
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) load() {
-	raw, err := os.ReadFile(p.stateFp)
+	raw, err := safefile.Read(p.stateFp, nil)
 	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("WARN: pool: state.json 不可用（%v），跳过本地状态恢复: %s", err, p.stateFp)
+		}
+
 		return
 	}
 
-	var state stateFile
-	if json.Unmarshal(raw, &state) != nil {
+	var stateSnapshot stateFile
+	if err := json.Unmarshal(raw, &stateSnapshot); err != nil {
+		log.Printf("WARN: pool: state.json 解析失败（%v），跳过本地状态恢复: %s", err, p.stateFp)
 		return
 	}
 
-	p.applyAccountsLocked(state.Accounts)
-	p.applySchedulingCursorsLocked(state.SchedulingCursors)
+	p.applyAccountsLocked(stateSnapshot.Accounts)
+	p.applySchedulingCursorsLocked(stateSnapshot.SchedulingCursors)
 }
 
 // applySchedulingCursorsLocked 恢复有序策略游标（缺失/损坏视为无游标）。
@@ -366,13 +373,7 @@ func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 		_ = os.MkdirAll(dir, 0o755)
 	}
 
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		p.notePersistFail(err)
-		return
-	}
-
-	if err := atomicwrite.Rename(tmp, p.stateFp); err != nil {
+	if err := safefile.Write(p.stateFp, raw, 0o600); err != nil {
 		p.notePersistFail(err)
 		return
 	}

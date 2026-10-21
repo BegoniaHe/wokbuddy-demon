@@ -115,7 +115,7 @@ type Status struct {
 	ErrTotal        int64     `json:"err_total,omitempty"`
 	LastSuccessTime time.Time `json:"last_success,omitzero"`
 	LastErrTime     time.Time `json:"last_err,omitzero"`
-	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
+	// CheckinDone 上游自然日（CST）今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
 	CheckinDone bool       `json:"checkin_done,omitempty"`
 	TokenUsage  TokenUsage `json:"token_usage,omitzero"`
@@ -169,6 +169,7 @@ type RateLimitedModel struct {
 //   - 11136 账号无该模型权限：Until 为指数退避 TTL（6h 起、封顶 24h）；Hits 记录
 //     累计命中次数驱动退避（6004 无 hits 概念，Hits 恒 0）。
 //   - 11141 模型下线：与 11136 共用负缓存形态（Until 为退避 TTL），成功或到期清除。
+//   - 14003 模型繁忙：Until 为 10s 起的短窗，Hits 驱动短窗翻倍（封顶 1m）。
 type modelCooldown struct {
 	// Until 该模型的冷却截止（6004：now+min(resetAt-now, soft_rate_max)；11136/11141：now+退避 TTL）。
 	Until time.Time
@@ -178,7 +179,7 @@ type modelCooldown struct {
 	ResetAt time.Time
 	// Reason 触发原因（透出运维可读文案，同 Status.Reason）。
 	Reason string
-	// Hits 11136/11141 负缓存的累计命中次数（驱动指数退避）。6004 条目 Hits 恒 0。
+	// Hits 11136/11141 负缓存与 14003 短窗的累计命中次数（驱动退避）。6004 恒 0。
 	Hits int
 	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
 	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
@@ -220,7 +221,7 @@ type entry struct {
 	// health 按模型的实时健康台账（TTFT EWMA + 错误压力），供选号降权（issue #16）。
 	// 运行态、不持久化：信号短时有效（TTL 过期即删），重启后中性起步。
 	health map[string]*modelHealth
-	// lastCheckinDay 最近一次签到成功的本地日期（"2006-01-02"）。签到成功与上游
+	// lastCheckinDay 最近一次签到成功的 CST 自然日（"2006-01-02"）。签到成功与上游
 	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 CheckinDone 供面板按钮显示
 	// 签到/已签。持久化：跨重启不丢当日状态。
 	lastCheckinDay string

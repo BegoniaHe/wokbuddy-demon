@@ -257,12 +257,23 @@ func (t *PickTrace) addExcluded(reason string) {
 	t.Excluded[reason]++
 }
 
-// maxCreditsOf 返回候选集中的最大 credits（权重归一基准）。
+// sentinelCredits 企业「不限量」在池内的剩余量哨兵（与
+// upstream.enterpriseUnlimitedRemain 同值，1<<40）。
+const sentinelCredits int64 = 1 << 40
+
+// maxCreditsOf 返回候选集的 credits 权重分母：忽略企业「不限量」哨兵后取最大
+// 余额，避免 1<<40 把普通号的 credits 项压成 0（不限量号独吞流量）。
+// 全部候选都是哨兵（或余额全为 0）时返回 0，调用方跳过 credits 项（人人等权）。
 func maxCreditsOf(cands []*entry) int64 {
 	var maxCredits int64
-	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
+
+	for _, candidate := range cands {
+		if candidate.credits >= sentinelCredits {
+			continue
+		}
+
+		if candidate.credits > maxCredits {
+			maxCredits = candidate.credits
 		}
 	}
 
@@ -794,13 +805,9 @@ var minPickGap = 100 * time.Millisecond
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
 func (p *Pool) pickWeighted(cands []*entry, model string) *entry {
 	now := p.now()
-
-	var maxCredits int64
-	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
-		}
-	}
+	// 与排序路径共用同一分母：必须排除企业「不限量」哨兵，否则 1<<40 会把普通号
+	// 的 credits 项压成 0（此处曾内联取最大余额，绕过了 maxCreditsOf 的哨兵过滤）。
+	maxCredits := maxCreditsOf(cands)
 
 	const scale = 1_000_000 // 定点放大：int64 累加权重大整数抽签
 
@@ -845,8 +852,11 @@ func (p *Pool) pickWeighted(cands []*entry, model string) *entry {
 func (p *Pool) weightOf(entry6 *entry, maxCredits int64, model string, now time.Time) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
+	// 哨兵/超过分母的余额钳到满权重，避免 1<<40 被二次放大。
 	if maxCredits > 0 {
-		w += float64(entry6.credits) / float64(maxCredits) * 10
+		credits := min(entry6.credits, maxCredits)
+
+		w += float64(credits) / float64(maxCredits) * 10
 	}
 	// 2. 闲置补偿。
 	if entry6.lastUsed.IsZero() {

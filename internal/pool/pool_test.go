@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 )
 
 // withNoPickGap 保留调用点语义：测试统一经 TestMain 关闭窗口（gap=0），
@@ -745,8 +746,8 @@ func TestCooldownUntilTomorrow4AM(t *testing.T) {
 		t.Errorf("until %v is in the past (call span %v..%v)", status.Until, before, after)
 	}
 
-	if status.Until.Hour() != 4 {
-		t.Errorf("until hour=%d want 4", status.Until.Hour())
+	if status.Until.In(cst.Loc).Hour() != 4 {
+		t.Errorf("until hour(CST)=%d want 4", status.Until.In(cst.Loc).Hour())
 	}
 
 	if d := status.Until.Sub(after); d > 24*time.Hour {
@@ -771,7 +772,7 @@ func TestCooldownUntilTomorrow4AMPersists(t *testing.T) {
 	p2.Add(&auth.Auth{UID: "u1"})
 
 	st, ok := p2.Status("u1")
-	if !ok || st.Until.Hour() != 4 || st.Reason != "余额不足" {
+	if !ok || st.Until.In(cst.Loc).Hour() != 4 || st.Reason != "余额不足" {
 		t.Errorf("status after reload=%+v ok=%v", st, ok)
 	}
 }
@@ -1067,9 +1068,8 @@ func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
 
 func TestCooldownSoftForModelNoResetFallbackBackoff(t *testing.T) {
 	t.Parallel()
-	// 无解析时间（resetAt 零值）→ 有界退避（600s 起）。冷却中的兜底探测再撞 429
-	// **不推进 streak、不延长**（吸收上游：旧「每次探测都翻倍」正是全池被推到
-	// 2h 封顶的元凶）。
+	// 无解析时间（resetAt 零值）→ 账号级有界退避（600s 起）。无法确认是模型级
+	// 还是套餐额度耗尽，保守按账号级；冷却中的兜底探测再撞 429 不推进 streak。
 	pool := New("")
 	pool.Add(&auth.Auth{UID: "u1"})
 	pool.SetSoftRateMax(time.Hour)
