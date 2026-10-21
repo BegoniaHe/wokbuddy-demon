@@ -105,17 +105,26 @@ func (h *Handler) searchOnAccount(
 	// token 临近过期 → 先刷新（失败按既有刷新语义罚号，然后换号）。
 	if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 		if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
+			// 刷新失败已在 noteSearchRefreshFailure 里按 chat 同口径罚过账号；
+			// 不能再走 searchFailureFor（它会再 applyErrorPolicy 一次，且对
+			// session dead 直接 Disable，绕过 NoteSessionDead 的连续阈值）。
 			h.noteSearchRefreshFailure(acct, err)
 
 			if ue, ok := errors.AsType[*upstream.Error](err); ok {
-				return nil, h.searchFailureFor(acct.UID, ue)
+				return nil, searchFailureEnvelope(ue)
 			}
 
+			// 传输层刷新失败：与 chat 一致继续换号，不当作不可重试的终态。
 			return nil, &searchFailure{
 				status: http.StatusBadGateway,
-				code:   "upstream_auth",
 				msg:    "upstream token refresh failed",
 			}
+		}
+
+		if err := acct.SaveAtomic(); err != nil {
+			// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露（与 chat 同口径）。
+			log.Printf("ERR: [server] search refresh acct=%s: save auth failed: %v",
+				logfmt.Label(acct.UID, acct.NicknameValue()), err)
 		}
 	}
 
@@ -155,6 +164,12 @@ func (h *Handler) searchOnAccount(
 func (h *Handler) searchFailureFor(uid string, upErr *upstream.Error) *searchFailure {
 	h.applyErrorPolicy(uid, upErr.Kind, upErr.Msg, searchRealm, "", upErr)
 
+	return searchFailureEnvelope(upErr)
+}
+
+// searchFailureEnvelope 只把上游错误翻译成终端形态，不做任何账号惩罚。
+// 供「惩罚已由别处完成」的路径复用（如 refresh 失败已走 noteSearchRefreshFailure）。
+func searchFailureEnvelope(upErr *upstream.Error) *searchFailure {
 	status, code := searchTerminalStatus(upErr)
 	if code == "" {
 		status = searchRetryableStatus(upErr.Kind)

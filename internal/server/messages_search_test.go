@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -410,5 +411,60 @@ func TestSearchAcceptsStringContent(t *testing.T) {
 	rec := doSearchRequest(t, handler, `{"model":"glm-5.2","messages":[{"role":"user","content":"golang 用法"}],"tools":[{"name":"web_search"}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d want 200，body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestSearchRejectsGlobalBoundKey 搜索只放行 CN 域：绑定 global 出口的命名密钥
+// 不得消耗 CN 账号额度（出口绑定是运维侧的显式约束）。
+func TestSearchRejectsGlobalBoundKey(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(searchOKBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+	}
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999})
+
+	store := apikey.New("")
+
+	_, raw, err := store.Create("global-key")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+
+	if _, err := store.SetRealm(store.List()[0].ID, "global"); err != nil {
+		t.Fatalf("set realm: %v", err)
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		APIKey:   "secret",
+		Keys:     store,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/search/messages",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"golang"}]}],"tools":[{"name":"web_search"}]}`))
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("Authorization", "Bearer "+raw)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "cn realm") {
+		t.Fatalf("code=%d body=%s want 400 且说明 cn realm 限制", rec.Code, rec.Body)
+	}
+
+	if calls != 0 {
+		t.Errorf("global 绑定 key 不得打 CN 上游，calls=%d", calls)
 	}
 }

@@ -37,6 +37,15 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// 命名密钥绑定出口是运维侧的显式约束：搜索只放行 CN 域，绑定 global 的
+	// key 不能在未经授权的情况下消耗 CN 账号额度（与 chat 的 key realm 校验同口径）。
+	if keyRealm := keyRealmFrom(r.Context()); keyRealm != "" && keyRealm != searchRealm {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			"search endpoint only supports the cn realm; this API key is bound to "+keyRealm, "")
+
+		return
+	}
+
 	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
 
 	body, err := io.ReadAll(r.Body)
