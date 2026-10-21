@@ -1086,3 +1086,29 @@ func TestNextFirePartialSkippedHour(t *testing.T) {
 		t.Fatalf("now=%v next=%v want %v（03:45 是该小时首个实际时刻）", now, next, want)
 	}
 }
+
+// TestSetBalanceIntervalUpdatesMeta 热改余额刷新周期时同步「数据新鲜度」元数据：
+// 关闭后不得继续显示旧周期（面板据此标注「每 N 分钟后台刷新」）。
+func TestSetBalanceIntervalUpdatesMeta(t *testing.T) {
+	t.Parallel()
+
+	state := pool.New("")
+	scheduler := New(&Config{Pool: state})
+
+	refreshedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	state.SetBalanceRefreshMeta(300, refreshedAt)
+
+	scheduler.SetBalanceInterval(0)
+
+	sec, at := state.BalanceRefreshMeta()
+	if sec != 0 || !at.Equal(refreshedAt) {
+		t.Fatalf("关闭后 meta=%d/%v want 0/%v", sec, at, refreshedAt)
+	}
+
+	scheduler.SetBalanceInterval(5 * time.Minute)
+
+	sec, at = state.BalanceRefreshMeta()
+	if sec != 300 || !at.Equal(refreshedAt) {
+		t.Fatalf("重开后 meta=%d/%v want 300/%v", sec, at, refreshedAt)
+	}
+}

@@ -1082,11 +1082,19 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 }
 
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
-func (s *Scheduler) SetBalanceInterval(d time.Duration) {
-	if d < 0 {
-		d = 0
+func (s *Scheduler) SetBalanceInterval(interval time.Duration) {
+	if interval < 0 {
+		interval = 0
 	}
 
-	s.balanceInterval.Store(int64(d))
+	s.balanceInterval.Store(int64(interval))
+
+	// 面板的「数据新鲜度」直接读这份元数据：热关/热开时同步周期，否则关闭后仍
+	// 显示「每 N 分钟后台刷新」、刚开启却显示「未启用」。保留上次完成时刻不动。
+	if s.cfg.Pool != nil {
+		_, at := s.cfg.Pool.BalanceRefreshMeta()
+		s.cfg.Pool.SetBalanceRefreshMeta(int64(interval/time.Second), at)
+	}
+
 	poke(s.rearmBalance)
 }
