@@ -633,6 +633,20 @@ type requestTrace struct {
 	userAgent string
 	// keyID 命中的命名密钥 ID；默认密钥 / 未鉴权为空。由 withClientAuth 回填。
 	keyID string
+	// account/model/outcome 非 chat 路径（搜索等）显式写入的记账元数据：
+	// 那些路径没有 chatStat，但归档仍要能回答「谁、哪个模型、成没成」。
+	account string
+	model   string
+	outcome string
+}
+
+// noteResult 记录非 chat 路径的账号/模型/结果（搜索端点调用；nil 安全）。
+func (t *requestTrace) noteResult(account, model, outcome string) {
+	if t == nil {
+		return
+	}
+
+	t.account, t.model, t.outcome = account, model, outcome
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -687,20 +701,15 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	duration := time.Since(t.start)
 	event.DurationMs = max(duration.Milliseconds(), 1)
 
-	if t.stat != nil {
-		chatStat2 := t.stat
-		event.Account = logfmt.Label(chatStat2.uid, chatStat2.nick)
-		event.Model = chatStat2.model
-		event.Outcome = chatStat2.outcome
-		event.TTFBMs = chatStat2.ttfb.Milliseconds()
-		event.Attempts = chatStat2.attempts
-		event.PromptTokens = chatStat2.promptTokens
-		event.CompletionTokens = chatStat2.completionTokens
-		event.TotalTokens = chatStat2.totalTokens
-		event.Credit = chatStat2.credit
-		event.HasCredit = chatStat2.hasCredit
-		event.CacheHitTokens = chatStat2.cacheHit
-		event.CacheMissTokens = chatStat2.cacheMiss
+	if t.stat == nil {
+		// 非 chat 路径（搜索）：用 handler 写入的元数据，保持与 chat 行同字段口径。
+		event.Account, event.Model = t.account, t.model
+
+		if t.outcome != "" {
+			event.Outcome = t.outcome
+		}
+	} else {
+		applyChatStat(&event, t.stat)
 	}
 
 	event.KeyID = t.keyID
@@ -722,6 +731,22 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	event.OK = status >= 200 && status < 300 && event.Outcome == reqlog.OutcomeSuccess
 
 	return event
+}
+
+// applyChatStat 把 chat 统计拷进归档事件（chat 行与搜索行同字段口径）。
+func applyChatStat(event *reqlog.Event, chatStat2 *chatStat) {
+	event.Account = logfmt.Label(chatStat2.uid, chatStat2.nick)
+	event.Model = chatStat2.model
+	event.Outcome = chatStat2.outcome
+	event.TTFBMs = chatStat2.ttfb.Milliseconds()
+	event.Attempts = chatStat2.attempts
+	event.PromptTokens = chatStat2.promptTokens
+	event.CompletionTokens = chatStat2.completionTokens
+	event.TotalTokens = chatStat2.totalTokens
+	event.Credit = chatStat2.credit
+	event.HasCredit = chatStat2.hasCredit
+	event.CacheHitTokens = chatStat2.cacheHit
+	event.CacheMissTokens = chatStat2.cacheMiss
 }
 
 // responseObserver 捕获 handler 实际写出的 HTTP 状态，同时保留 Flusher/Unwrap，

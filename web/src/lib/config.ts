@@ -86,6 +86,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'multimodal_routing', path: ['features', 'multimodal_routing'], kind: 'checkbox' },
   { name: 'local_web_tools', path: ['features', 'local_web_tools'], kind: 'checkbox' },
   { name: 'local_web_tool_rounds', path: ['features', 'local_web_tool_rounds'], kind: 'number' },
+  { name: 'search_endpoint', path: ['features', 'search_endpoint'], kind: 'checkbox' },
   { name: 'session_sticky_enabled', path: ['session_sticky', 'enabled'], kind: 'checkbox' },
   { name: 'request_client_info', path: ['logging', 'request_client_info'], kind: 'checkbox' },
 ];

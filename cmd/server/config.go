@@ -296,6 +296,11 @@ type Config struct {
 		// 该模态的模型并重写 model（默认 false = 明确 400 model_capability）。
 		// issue #109。
 		MultimodalRouting bool `json:"multimodal_routing"`
+		// SearchEndpoint 是否开放 POST /v1/search/messages（官方联网搜索）。
+		// 默认 false：搜索是新增出站面且消耗账号额度，与 local_web_tools /
+		// multimodal_routing 同口径默认关闭；热生效。当前只放行 CN 域账号选号
+		// （上游仅在 CN 域实测过，两域放开留 TODO）。
+		SearchEndpoint bool `json:"search_endpoint"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`
