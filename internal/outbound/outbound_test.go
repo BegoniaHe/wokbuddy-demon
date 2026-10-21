@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -361,7 +360,6 @@ func TestHTTPConnectHandshakeTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before := runtime.NumGoroutine()
 	start := time.Now()
 	_, err = proxy.dial(context.Background(), "tcp", "127.0.0.1:9")
 	elapsed := time.Since(start)
@@ -373,12 +371,8 @@ func TestHTTPConnectHandshakeTimeout(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Errorf("handshake took %v: deadline not enforced", elapsed)
 	}
-	// watcher goroutine 退出：等一小会儿再比对（Close 由 ctx watcher 或读失败触发）。
-	time.Sleep(100 * time.Millisecond)
-
-	if after := runtime.NumGoroutine(); after > before+2 {
-		t.Errorf("goroutines leaked: before=%d after=%d", before, after)
-	}
+	// watcher goroutine 退出由包级 goleak（TestMain）兜底：本用例 t.Parallel，
+	// 全局 NumGoroutine 会被同包并发用例干扰，不能在这里做差分断言。
 }
 
 // TestSOCKS5HandshakeTimeout SOCKS5 代理接受连接但不响应：协商必须在设定
