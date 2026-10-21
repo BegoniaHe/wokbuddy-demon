@@ -67,6 +67,11 @@ type Config struct {
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
+
+	// TaskSweepHook 周期补领回调（panel.RunTaskSweep：扫全部非禁用账号幂等补领
+	// 「已达标未领」的成长任务奖励）。同样由 panel 在调度器之后用 SetTaskSweepHook
+	// 挂载；nil 时到点跳过。ctx 用于「取消后不再派发新的逐号请求」。
+	TaskSweepHook func(ctx context.Context)
 }
 
 // Scheduler 调度器。
@@ -93,6 +98,10 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+	// taskSweepInterval 任务补领清扫间隔（纳秒，0=暂停），语义同 balanceInterval。
+	taskSweepInterval atomic.Int64
+	// rearmTaskSweep 任务补领清扫的「排程已变」通知（与余额刷新分开，避免丢信号）。
+	rearmTaskSweep chan struct{}
 	// balanceSem/balanceSemOnce 余额刷新逐号上游调用的全局并发上限：后台周期与
 	// 面板手动刷新会并发触发，各持一个信号量会把总在途请求放大到 2 倍以上。
 	balanceSemOnce sync.Once
@@ -128,12 +137,13 @@ func New(cfg *Config) *Scheduler {
 	}
 
 	return &Scheduler{
-		cfg:           config,
-		nowFn:         time.Now,
-		logger:        log.Default(),
-		adoptTried:    make(map[string]string),
-		rearmSchedule: make(chan struct{}, 1),
-		rearmBalance:  make(chan struct{}, 1),
+		cfg:            config,
+		nowFn:          time.Now,
+		logger:         log.Default(),
+		adoptTried:     make(map[string]string),
+		rearmSchedule:  make(chan struct{}, 1),
+		rearmBalance:   make(chan struct{}, 1),
+		rearmTaskSweep: make(chan struct{}, 1),
 	}
 }
 
@@ -169,6 +179,13 @@ func (s *Scheduler) SetExpiringSoonWindow(duration time.Duration) {
 func (s *Scheduler) SetGrowthHook(fn func()) {
 	s.schedMu.Lock()
 	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
+// SetTaskSweepHook 挂载/替换任务补领清扫回调（panel 构造晚于 scheduler，事后接线）。
+func (s *Scheduler) SetTaskSweepHook(fn func(ctx context.Context)) {
+	s.schedMu.Lock()
+	s.cfg.TaskSweepHook = fn
 	s.schedMu.Unlock()
 }
 
@@ -1052,4 +1069,73 @@ func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 
 	s.balanceInterval.Store(int64(d))
 	poke(s.rearmBalance)
+}
+
+// taskSweepContext 读取当前补领回调（nil 安全）。
+func (s *Scheduler) taskSweepContext() func(ctx context.Context) {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+
+	return s.cfg.TaskSweepHook
+}
+
+// StartTaskSweep 后台周期性补领「已达标未领」的成长任务奖励（独立 ticker
+// goroutine，ctx 取消即停）。interval<=0 以暂停状态启动并等待 SetTaskSweepInterval
+// 唤醒：启动时关闭 schedule.task_sweep_enabled、运行期再热开也能生效（无需重启）。
+// 运行期可用 SetTaskSweepInterval 热改间隔（下一轮生效）。
+func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) {
+	if interval < 0 {
+		interval = 0
+	}
+
+	s.taskSweepInterval.Store(int64(interval))
+
+	go func() {
+		var logged time.Duration
+
+		for {
+			cur := time.Duration(s.taskSweepInterval.Load())
+			if cur != logged {
+				log.Printf("scheduler: 任务补领清扫每 %s（暂停中显示 0s）", cur)
+				logged = cur
+			}
+
+			if cur <= 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.rearmTaskSweep:
+					continue
+				}
+			}
+
+			timer := time.NewTimer(cur)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-s.rearmTaskSweep:
+				timer.Stop() // 间隔已变：立刻按新值重算
+			case <-timer.C:
+				s.runTaskSweepOnce(ctx)
+			}
+		}
+	}()
+}
+
+// runTaskSweepOnce 执行一轮补领清扫（hook 未挂载时跳过）。
+func (s *Scheduler) runTaskSweepOnce(ctx context.Context) {
+	if hook := s.taskSweepContext(); hook != nil {
+		hook(ctx)
+	}
+}
+
+// SetTaskSweepInterval 热改任务补领清扫间隔；<=0 表示暂停循环（面板关闭该开关时）。
+func (s *Scheduler) SetTaskSweepInterval(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+
+	s.taskSweepInterval.Store(int64(d))
+	poke(s.rearmTaskSweep)
 }

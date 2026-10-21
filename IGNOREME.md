@@ -451,6 +451,8 @@ gemini
 | `schedule.keepalive_hours` | `[22]` | 每日整点刷新凭证保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
 | `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
+| `schedule.task_sweep_enabled` | `true` | 任务补领清扫总开关：周期扫全部非禁用账号，**幂等补领「已达标未领」的成长任务奖励**（只补领、不代做任务；global/企业版账号零上游请求；忙账号整轮跳过）。热生效 |
+| `schedule.task_sweep_minutes` | `15` | 补领清扫间隔（分钟）；`<=0` 回落 15。热生效 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |
 | `limits.daily_tokens` | `0` | 账号当日总 token 达限后不接单；`0` = 关闭。本地 0 点重置 |
 | `limits.daily_credits` | `0` | 账号当日消耗积分达限后只接免费模型；`0` = 关闭 |

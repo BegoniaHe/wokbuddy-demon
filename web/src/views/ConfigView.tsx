@@ -254,6 +254,12 @@ export function ConfigView() {
               <FieldLabel>刷新间隔（分钟）</FieldLabel>
               {num('balance_refresh_minutes', { min: 1, placeholder: '5' })}
             </Field>
+            <div>{check('task_sweep_enabled', '周期补领任务奖励')}</div>
+            <Field>
+              <FieldLabel>补领区间隔（分钟）</FieldLabel>
+              {num('task_sweep_minutes', { min: 1, placeholder: '15' })}
+              <FieldDescription>只补领「已达标未领」的成长任务奖励（幂等、不代做任务）；热生效</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">

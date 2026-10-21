@@ -159,6 +159,9 @@ func main() {
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(panel2.RunGrowthQueueOnce)
+	// 任务补领清扫（上游同步窗口 issue #196）：周期幂等补领「已达标未领」的奖励，
+	// 与「一键完成」共用 claim 口径；默认 15 分钟、开关与间隔均热生效。
+	sch.SetTaskSweepHook(func(ctx context.Context) { panel2.RunTaskSweep(ctx) })
 	log.SetOutput(io.MultiWriter(os.Stderr, panel2.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, panel2.Logs()))
 
@@ -400,6 +403,8 @@ func serve(
 	go sch.Run(ctx)
 
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	// 任务补领清扫循环：0 = 暂停（task_sweep_enabled=false），运行期可热改间隔。
+	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -663,6 +668,13 @@ func logScheduleBalance(cfg *Config) {
 		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
 	}
 
+	switch {
+	case !cfg.Schedule.TaskSweepEnabled:
+		log.Printf("任务补领清扫已禁用（schedule.task_sweep_enabled=false）")
+	case cfg.TaskSweepInterval > 0:
+		log.Printf("任务补领清扫：每 %s（只补领「已达标未领」的奖励）", cfg.TaskSweepInterval)
+	}
+
 	if cfg.Schedule.IncludeDisabledInTasks {
 		log.Printf("保号任务覆盖禁用账号（schedule.include_disabled_in_tasks=true）：禁用号仍签到 / 活跃 / 保活 / 刷新余额，但不参与选号")
 	}
@@ -841,6 +853,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 		!newCfg.Schedule.GrowthEnabled,
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
+	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 }

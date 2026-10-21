@@ -179,6 +179,10 @@ type Config struct {
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
 		BalanceRefreshMinutes int  `json:"balance_refresh_minutes"` // 缺省 5；<=0 回落 5
+		// 任务补领清扫（上游同步窗口 issue #196）：周期扫全部非禁用账号，幂等补领
+		// 「已达标未领」的成长任务奖励（只补领、不代做任务）。默认开启。
+		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
+		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
 		// CheckinAccountDelay 签到任务账号间等待（issue #59）：如 "800ms"；"0" = 不限。
 		CheckinAccountDelay string `json:"checkin_account_delay"`
 	} `json:"schedule"`
@@ -362,7 +366,9 @@ type Config struct {
 	SessionTTL             time.Duration `json:"-"`
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
-	ExpiringSoonDur        time.Duration `json:"-"`
+	// TaskSweepInterval 任务补领清扫周期（0 = 不启动，task_sweep_enabled=false）。
+	TaskSweepInterval time.Duration `json:"-"`
+	ExpiringSoonDur   time.Duration `json:"-"`
 	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
 	CheckinAccountDelayDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
@@ -456,6 +462,9 @@ func applyScheduleDefaults(config2 *Config) {
 	config2.Schedule.BlackcatEnabled = true
 	config2.Schedule.BalanceRefreshEnabled = true
 	config2.Schedule.BalanceRefreshMinutes = 5
+	// 任务补领清扫默认开启、15 分钟一轮：只补领「已达标未领」的奖励，幂等且零副作用。
+	config2.Schedule.TaskSweepEnabled = true
+	config2.Schedule.TaskSweepMinutes = 15
 	config2.Schedule.CheckinAccountDelay = "800ms"
 }
 
@@ -1600,6 +1609,7 @@ func (c *Config) normalizeCheckinDelay() error {
 func (c *Config) normalizeSchedule() error {
 	c.normalizeListenAndHours()
 	c.normalizeBalanceRefresh()
+	c.normalizeTaskSweep()
 
 	return c.validateScheduleHours()
 }
@@ -1645,6 +1655,18 @@ func (c *Config) normalizeBalanceRefresh() {
 		}
 
 		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
+	}
+}
+
+// normalizeTaskSweep 计算任务补领清扫周期：启用时 minutes<=0 回落默认 15；
+// 关闭时 interval 保持 0（不启动）。
+func (c *Config) normalizeTaskSweep() {
+	if c.Schedule.TaskSweepEnabled {
+		if c.Schedule.TaskSweepMinutes <= 0 {
+			c.Schedule.TaskSweepMinutes = 15
+		}
+
+		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
 	}
 }
 
