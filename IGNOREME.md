@@ -277,6 +277,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | OpenAI Chat Completions | `POST /v1/chat/completions`、`GET /v1/models`、`GET /v1/models/{model}` |
 | OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function/custom tools、结构化输出；reasoning/compaction 等状态 item 忽略） |
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
+| 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭） |
 | Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
 
 Codex CLI 等使用 Responses API 的客户端：
@@ -288,6 +289,26 @@ codex
 ```
 
 - `/v1/responses` 会合并 `input` 里的 `additional_tools`（Codex 0.162+ 的工具下发形态之一），展开 `namespace` 工具并在回程补回 `namespace`；客户端未传 `max_output_tokens` 时按模型目录补全 `max_tokens`，避免上游回落到默认 32k 输出预算截断长推理。
+
+#### 联网搜索端点 `POST /v1/search/messages`
+
+网关直连上游官方联网搜索（`/agenttool/v1/search`），出入站均为 Anthropic Messages 形态，
+**与本地代跑的 `features.local_web_tools` 是两条独立能力**（后者只服务 Responses 的工具调用，
+`/v1/messages` 对服务端 `web_search` 工具仍是显式拒绝）。
+
+- 开关：`features.search_endpoint`（默认 `false`，热生效）。搜索是新增出站面且每次调用消耗一次账号额度。
+- realm：当前只放行 **CN 域**账号选号（上游仅在 CN 域实测过；两域放开留 TODO）。
+- 入站要求：`tools` 里声明 `web_search`（如 `{"type":"web_search_20250305","name":"web_search"}`），否则 400；搜索词取**最后一条 user 消息**的文本块（不在文本里的历史/tool_result 不参与）。
+- 条数：`max_results`（请求体顶层或 `tools[].max_results`）生效，缺省 5、上限 10；搜索词上限 1024 字符。
+- 出站响应：assistant message，`content` 依次为 text 块（摘要 + `citations[].cited_text`）与 `web_search_tool_result` 块（逐条 title/url/snippet）；`usage` 为估算值（网关无 tokenizer，仅用于客户端预算）。
+- 错误：上游错误按既有分类处置（限流走软冷却、会话失效禁用、额度硬冷却等），请求级/内容/队列类不再轮转；`15001`（搜索次数用尽）会在 `gateway_hint` 里提示可按号重试，上游原文原样透传。
+
+```bash
+curl -s http://127.0.0.1:7863/v1/search/messages \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-api-key: test_key" -H "content-type: application/json" \
+  -d '{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"golang context 用法"}]}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}'
+```
 
 Claude Code 接入示例（`api_key` 非空时填同一密钥）：
 
