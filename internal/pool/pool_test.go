@@ -2683,3 +2683,41 @@ func TestAllDailyBlockedAccountCoolingPastMidnight(t *testing.T) {
 		t.Fatal("账号级冷却跨 0 点应保持既有日限口径")
 	}
 }
+
+// TestStatusReasonHiddenAfterCooldownExpires issue #171 问题一（上游 64bac41）：
+// 软冷却到期后 until/coolKind/reason 字段按设计不清理，statusOf 不应再把过期
+// reason 透出给面板（避免「可用」旁挂着历史 429）。
+func TestStatusReasonHiddenAfterCooldownExpires(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+
+	// 冷却中：reason 正常透出。
+	pool.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+
+	status, ok := pool.Status("u1")
+	if !ok || !status.Cooling || status.Reason != "429 rate limit" {
+		t.Fatalf("cooling status=%+v ok=%v", status, ok)
+	}
+
+	// 冷却到期、字段残留：不再透出。
+	pool.Cooldown("u1", CoolSoft, -time.Minute, "429 rate limit")
+
+	status, ok = pool.Status("u1")
+	if !ok || status.Cooling {
+		t.Fatalf("expired cooldown should not be cooling: %+v", status)
+	}
+
+	if status.Reason != "" {
+		t.Fatalf("expired cooldown reason leaked to status: %q", status.Reason)
+	}
+
+	// 禁用账号仍透出原因（DisabledReason 与 Reason 都保留）。
+	pool.Disable("u1", "banned")
+
+	status, _ = pool.Status("u1")
+	if status.DisabledReason != "banned" || status.Reason != "banned" {
+		t.Fatalf("disabled reason must stay visible: %+v", status)
+	}
+}

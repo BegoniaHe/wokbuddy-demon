@@ -694,7 +694,6 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		CreditsEarliestExpiry:    entry2.creditsEarliestExpiry,
 		CreditsEarliestRemaining: entry2.creditsEarliestRemaining,
 		Cooling:                  now.Before(entry2.until) || now.Before(entry2.breakerUntil),
-		Reason:                   entry2.reason,
 		Disabled:                 entry2.disabled,
 		Paused:                   entry2.paused,
 		SuccessCount:             entry2.successCount,
@@ -712,6 +711,14 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		BreakerFails:             entry2.fails,
 		BreakerUntil:             entry2.breakerUntil,
 	}
+	// Reason 只在「冷却中 / 已禁用」时透出：until/coolKind/reason 按设计不主动清理
+	// （NoteSuccess 注释：「不碰 until/coolKind，那些是即时冷却，各自到期」），无条件
+	// 透出会让面板把过期数天的「429 rate limit」与「可用」并排展示，运维无法判断
+	// 是历史残留还是当前限流。禁用原因另由 DisabledReason 透出（零回归）。
+	if status.Cooling || status.Disabled {
+		status.Reason = entry2.reason
+	}
+
 	if status.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		status.DisabledReason = entry2.reason
