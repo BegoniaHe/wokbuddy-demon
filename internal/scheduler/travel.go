@@ -73,8 +73,8 @@ func (s *Scheduler) travelAll() (total, success, failure int) {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 
-		if account.IsEnterprise() {
-			continue // 企业版门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
+		if account.IsEnterpriseSession() {
+			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
 		}
 
 		if !first {
