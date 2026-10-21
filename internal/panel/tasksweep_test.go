@@ -278,3 +278,38 @@ func TestTaskSweepStopsOnCancel(t *testing.T) {
 		t.Fatalf("已取消的 ctx 不应派发请求，stats=%+v", stats)
 	}
 }
+
+// TestClaimableTasksPrefersClaimableDuplicate 两口径同名任务的状态瞬时不一致时，
+// 默认口径的「不可领」条目不能把 mp 口径的「可领」条目吃掉（去重须先判可领）。
+func TestClaimableTasksPrefersClaimableDuplicate(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		body := `{"code":0,"msg":"ok","data":{"tasks":[{"task_code":"Model_chat_GLM5.2","target":1,"current":0,"accept_status":"accepted"}]}}`
+		if r.Header.Get("X-Client-Platform") == "miniprogram" {
+			body = `{"code":0,"msg":"ok","data":{"tasks":[{"task_code":"Model_chat_GLM5.2","target":1,"current":1,"accept_status":"accepted"}]}}`
+		}
+
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999}
+	state := pool.New("")
+	state.Add(account)
+
+	panel := &Panel{cfg: Config{Pool: state, Upstream: &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+	}}}
+
+	tasks, err := panel.claimableTasks(account)
+	if err != nil {
+		t.Fatalf("claimableTasks: %v", err)
+	}
+
+	if len(tasks) != 1 || tasks[0].TaskCode != "Model_chat_GLM5.2" || !tasks[0].Claimable {
+		t.Fatalf("应保留 mp 口径的可领条目，got %+v", tasks)
+	}
+}

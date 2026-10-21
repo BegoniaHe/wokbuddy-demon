@@ -209,15 +209,15 @@ func (p *Panel) claimableTasks(account *auth.Auth) ([]upstream.Task, error) {
 	for _, list := range [][]upstream.Task{primary, secondary} {
 		for i := range list {
 			task := &list[i]
-			if task.TaskCode == "" || seen[task.TaskCode] {
+			// 先判 Claimable 再去重：两口径对同一 task_code 的进度/领取状态可能
+			// 瞬时不一致，先出现的「不可领」条目不能把后出现的「可领」条目吃掉。
+			if task.TaskCode == "" || !task.Claimable || seen[task.TaskCode] {
 				continue
 			}
 
 			seen[task.TaskCode] = true
 
-			if task.Claimable {
-				merged = append(merged, *task)
-			}
+			merged = append(merged, *task)
 		}
 	}
 
