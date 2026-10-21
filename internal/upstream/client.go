@@ -281,9 +281,35 @@ const modelBlockCode = "11102"
 const modelBlockMsgMarker = "service info not found"
 
 // ModelBlockReason 11136 负缓存条目在 pool.modelCooldowns 里的 reason 前缀。
-// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11136"/"11141" 前缀识别
-// 可恢复的模型避让条目（与 6004 条目的 "6004 model rate limit" reason 互不干扰）。
+// handler 写 BlockModelBackoff；pool.BlockModelClear 按 "11136"/"11158"/"11141"
+// 前缀识别可恢复的模型避让条目（与 6004 条目的 "6004 model rate limit" reason
+// 互不干扰）。
 const ModelBlockReason = "11136 model not permitted"
+
+// ModelForbiddenReason 11158 负缓存条目的 reason 前缀（账号类型级模型权限拒绝：
+// `model [x] is not allowed for user type [y]`）。与 ModelBlockReason 分开记录，
+// 让面板/排障能区分「该账号无该模型权限」与「该账号类型不允许该模型」。
+const ModelForbiddenReason = "11158 model not allowed for user type"
+
+// modelForbiddenMsgMarker 11158 答复的确定性文案。上游丢 code 时的外卡判据；
+// 只收这个窄短语，不收 "not allowed" 宽匹配（会命中任意权限类措辞）。
+const modelForbiddenMsgMarker = "is not allowed for user type"
+
+// hasModelForbiddenMarker 报告 body 是否带 11158 的窄文案。
+func hasModelForbiddenMarker(body string) bool {
+	return body != "" && strings.Contains(strings.ToLower(body), modelForbiddenMsgMarker)
+}
+
+// ModelBlockReasonFor 返回模型权限拒绝 body 对应的负缓存 reason 前缀：11158（账号
+// 类型级）优先于 11136（账号级）。两者都是 (账号,模型) 维度的可恢复避让，仅台账
+// 文案不同，因此共用 BlockModelBackoff 的同一条通道。
+func ModelBlockReasonFor(body string) string {
+	if hasBusinessCode(body, "11158") || hasModelForbiddenMarker(body) {
+		return ModelForbiddenReason
+	}
+
+	return ModelBlockReason
+}
 
 // IsModelBlocked 报告 body 是否是「上游模型目录无此模型」(11102) 的确定性答复。
 //
@@ -628,9 +654,10 @@ func ParseRateReset(body string) (time.Time, bool) {
 // classifyEarly 判定优先级最高的几类：模型不存在、402、11-128 内容拦截、
 // 客户端明确的请求级业务码。顺序即优先级。
 func classifyEarly(status int, body string) (ErrKind, bool) {
-	// 11136 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
-	// 平台级「目录无此模型」分开）。
-	if hasAnyBusinessCode(body, modelAccessCodes...) {
+	// 11136/11158 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
+	// 平台级「目录无此模型」分开）。11158 另留文案外卡：上游丢 code 时仍按账号类型
+	// 级权限拒绝处理，不落 ErrClient 逐号连败。
+	if hasAnyBusinessCode(body, modelAccessCodes...) || hasModelForbiddenMarker(body) {
 		return ErrModelBlocked, true
 	}
 	// 11102「上游模型目录无此模型」：所有账号共享同一目录，换号必然得到同一答复。
@@ -783,16 +810,21 @@ var requestLevelCodes = []string{
 	"12654", "14405",
 }
 
-// modelAccessCodes 账号级模型权限缺失（11136「无该模型权限」）：同一账号换请求
-// 仍会失败，但换账号可能成功 → 写 (账号,模型) 负缓存后继续换号。
-var modelAccessCodes = []string{"11136"}
+// modelAccessCodes 账号级模型权限缺失（11136「无该模型权限」、11158「账号类型
+// 不允许该模型」）：同一账号换请求仍会失败，但换账号可能成功 → 写 (账号,模型)
+// 负缓存后继续换号。
+//
+// 11158 与 11136 判定口径一致（与状态码无关）：同一码值不因状态码分叉。上游把
+// 429+11158 归软限流，本 fork 刻意不同——429 只是同一权限拒绝的传输层状态码，
+// 逐号软冷却会让整池健康号陪跑，而权限拒绝本身不会因冷却而改变。
+var modelAccessCodes = []string{"11136", "11158"}
 
 // modelRetiredCodes 平台级模型下线（11141「该模型已下线」）：所有账号都会得到
 // 同一答复，换号无意义，归 ErrModelAccess 请求级 fail-fast。
 var modelRetiredCodes = []string{"11141"}
 
 // ModelAccessReason 11141 负缓存条目的 reason 前缀。pool.BlockModelClear
-// 按前缀识别可恢复的模型避让条目（11136 与 11141 两族），不碰 6004 限流台账。
+// 按前缀识别可恢复的模型避让条目（11136/11158 与 11141 两族），不碰 6004 限流台账。
 const ModelAccessReason = "11141 model retired"
 
 // accountLimitCodes 账号级使用上限（10105 活跃会话数、15001 联网搜索次数）。

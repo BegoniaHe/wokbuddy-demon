@@ -340,10 +340,12 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 }
 
 // modelUnavailableReason 判定模型级冷却原因是否属于「模型不可用」负缓存：
-// 11136 账号权限缺失（upstream.ModelBlockReason）与 11141 模型下线
-// （upstream.ModelAccessReason）共用该口径；6004 限流不算。
+// 11136 账号权限缺失（upstream.ModelBlockReason）、11158 账号类型级权限拒绝
+// （upstream.ModelForbiddenReason）与 11141 模型下线（upstream.ModelAccessReason）
+// 共用该口径；6004 限流不算。
 func modelUnavailableReason(reason string) bool {
-	return strings.HasPrefix(reason, "11136") || strings.HasPrefix(reason, "11141")
+	return strings.HasPrefix(reason, "11136") || strings.HasPrefix(reason, "11158") ||
+		strings.HasPrefix(reason, "11141")
 }
 
 // modelRateLimitReason 判定模型级冷却原因是否来自 6004 模型级限流。与
@@ -355,8 +357,8 @@ func modelRateLimitReason(reason string) bool {
 // BlockModelClear 清除 (账号, 模型) 的模型避让条目（该模型实测又通了）。handler 在
 // 成功路径调用。负缓存到期前选号不会命中被避让账号（全冷却兜底也已排除），所以常规
 // 恢复靠 TTL 到期；本入口主要覆盖并发下「成功与负缓存新写入交错」的窗口。只清
-// 11136/11141 两类可恢复避让条目、不碰 6004 独立冷却表——6004 有自身上游重置墙钟
-// 语义，成功不该抹掉。
+// 11136/11158/11141 三类可恢复避让条目、不碰 6004 独立冷却表——6004 有自身上游
+// 重置墙钟语义，成功不该抹掉。
 func (p *Pool) BlockModelClear(uid, model string) {
 	if uid == "" || model == "" {
 		return
