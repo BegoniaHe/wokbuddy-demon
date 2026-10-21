@@ -81,13 +81,10 @@ type searchRequest struct {
 // parseSearchRequest 解析并校验入站请求：模型、messages、web_search 工具声明。
 func parseSearchRequest(body []byte) (*searchRequest, error) {
 	var payload struct {
-		Model     string `json:"model"`
-		MaxTokens int    `json:"max_tokens"`
-		Messages  []struct {
-			Role    string           `json:"role"`
-			Content []map[string]any `json:"content"`
-		} `json:"messages"`
-		Tools []map[string]any `json:"tools"`
+		Model     string                 `json:"model"`
+		MaxTokens int                    `json:"max_tokens"`
+		Messages  []searchInboundMessage `json:"messages"`
+		Tools     []map[string]any       `json:"tools"`
 		// MaxResults 可选：非 0 时覆盖默认条数（上游按 ClampSearchMaxResults 收敛）。
 		MaxResults int `json:"max_results"`
 	}
@@ -170,21 +167,22 @@ func declaresWebSearch(tools []map[string]any) bool {
 	return false
 }
 
-// lastUserText 取最后一条 user 消息里的文本块作为搜索词（Anthropic 入站形态里
-// content 是块数组；只认 text 块，忽略 tool_result 之类的历史块）。
-func lastUserText(messages []struct {
-	Role    string           `json:"role"`
-	Content []map[string]any `json:"content"`
-},
-) string {
-	for _, message := range slices.Backward(messages) {
-		if message.Role != "user" {
-			continue
-		}
+// searchInboundMessage 入站消息。content 保留原始 JSON：Anthropic Messages 允许
+// content 是块数组，也允许是纯字符串（两种都是合法入站形态），用固定结构体会让
+// 字符串形态在解析阶段直接失败并被误报成「invalid JSON body」。
+type searchInboundMessage struct {
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
 
+// messageTextParts 取一条消息的文本部分：块数组只认 text 块（忽略 tool_result
+// 之类的历史块）；纯字符串整段即文本；无法识别的形态返回 nil（不参与搜索词）。
+func messageTextParts(content json.RawMessage) []string {
+	var blocks []map[string]any
+	if err := json.Unmarshal(content, &blocks); err == nil {
 		var parts []string
 
-		for _, block := range message.Content {
+		for _, block := range blocks {
 			kind, _ := block["type"].(string)
 			if kind != "" && kind != "text" {
 				continue
@@ -195,7 +193,28 @@ func lastUserText(messages []struct {
 			}
 		}
 
-		if len(parts) > 0 {
+		return parts
+	}
+
+	var text string
+	if err := json.Unmarshal(content, &text); err == nil {
+		if trimmed := strings.TrimSpace(text); trimmed != "" {
+			return []string{trimmed}
+		}
+	}
+
+	return nil
+}
+
+// lastUserText 取最后一条 user 消息里的文本作为搜索词（块数组取全部 text 块，
+// 纯字符串取其本身）。
+func lastUserText(messages []searchInboundMessage) string {
+	for _, message := range slices.Backward(messages) {
+		if message.Role != "user" {
+			continue
+		}
+
+		if parts := messageTextParts(message.Content); len(parts) > 0 {
 			return strings.Join(parts, "\n")
 		}
 	}

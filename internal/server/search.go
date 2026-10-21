@@ -149,13 +149,15 @@ func (h *Handler) searchOnAccount(
 // searchFailureFor 按上游错误分类决定处置与终端形态：
 //   - 走既有 applyErrorPolicy（与 chat 同一套惩罚口径，不新增第二套）；
 //   - 请求级/内容/队列类不可自愈 → 返回带 code 的终态（不再轮转）；
-//   - 其余（限流/会话/额度/账号故障/5xx）→ 返回不带 code，让调用方换号。
+//   - 其余（限流/会话/额度/账号故障/5xx）→ code 为空，让调用方换号；但**状态码与
+//     原文照样填好**——轮转耗尽时直接把这一份透给客户端，留零值会走到
+//     WriteHeader(0) 直接 panic（客户端只看到空 200）。
 func (h *Handler) searchFailureFor(uid string, upErr *upstream.Error) *searchFailure {
 	h.applyErrorPolicy(uid, upErr.Kind, upErr.Msg, searchRealm, "", upErr)
 
 	status, code := searchTerminalStatus(upErr)
 	if code == "" {
-		return &searchFailure{}
+		status = searchRetryableStatus(upErr.Kind)
 	}
 
 	msg := upErr.Msg
@@ -168,6 +170,19 @@ func (h *Handler) searchFailureFor(uid string, upErr *upstream.Error) *searchFai
 		code:   code,
 		msg:    msg,
 		hint:   upstream.GatewayHint(upErr.Kind, upErr.Msg, upstream.HintContext{}),
+	}
+}
+
+// searchRetryableStatus 可换号类别的终端状态码（轮转耗尽时透传给客户端）：
+// 限流/额度按 429（客户端应退避后重试），账号级/上游级故障按 503。
+func searchRetryableStatus(kind upstream.ErrKind) int {
+	switch kind {
+	case upstream.ErrSoftRate, upstream.ErrHardCredit:
+		return http.StatusTooManyRequests
+	case upstream.ErrWafBlock:
+		return http.StatusForbidden
+	default:
+		return http.StatusServiceUnavailable
 	}
 }
 

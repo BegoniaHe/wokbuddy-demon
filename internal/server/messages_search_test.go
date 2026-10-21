@@ -376,3 +376,39 @@ func TestSearchUsageIsEstimated(t *testing.T) {
 		t.Errorf("usage=%+v want 估算值均 >= 1", resp.Usage)
 	}
 }
+
+// TestSearchRetryableExhaustReturns429 可重试错误（429）耗尽轮转后必须回 429 +
+// upstream 原文：曾经这一路返回零值 failure，写到 WriteHeader(0) 直接 panic
+// （客户端只看到空 200）。
+func TestSearchRetryableExhaustReturns429(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		return http.StatusTooManyRequests, `{"code":429,"msg":"rate limited"}`
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"golang"}]}],"tools":[{"name":"web_search"}]}`)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429，body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), "rate_limit_error") || !strings.Contains(rec.Body.String(), "rate limited") {
+		t.Errorf("错误信封应带 rate_limit_error 与上游原文：%s", rec.Body)
+	}
+}
+
+// TestSearchAcceptsStringContent Anthropic Messages 允许 content 是纯字符串：
+// 这种形态此前被解析成「invalid JSON body」，属误报。
+func TestSearchAcceptsStringContent(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		return http.StatusOK, searchOKBody
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"glm-5.2","messages":[{"role":"user","content":"golang 用法"}],"tools":[{"name":"web_search"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d want 200，body=%s", rec.Code, rec.Body)
+	}
+}
