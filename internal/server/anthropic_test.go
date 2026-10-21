@@ -296,7 +296,7 @@ func TestAnthropicStreamThinkingBlock(t *testing.T) {
 	out := rec.Body.String()
 	for _, want := range []string{
 		`"type":"thinking"`, `"signature":""`, `"type":"thinking_delta"`, `"thinking":"先想一下"`,
-		`"type":"text_delta"`, `"text":"答案"`,
+		`"type":"signature_delta"`, `"type":"text_delta"`, `"text":"答案"`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stream missing %q:\n%s", want, out)
@@ -323,7 +323,7 @@ func TestAnthropicStreamToolUse(t *testing.T) {
 	out := rec.Body.String()
 	for _, want := range []string{
 		`"type":"tool_use"`, `"id":"call_1"`, `"name":"get_weather"`,
-		`"type":"input_json_delta"`, `"partial_json":"{\"city\":"`,
+		`"type":"input_json_delta"`, `"partial_json":"{\"city\":\"SF\"}"`,
 		`"stop_reason":"tool_use"`,
 	} {
 		if !strings.Contains(out, want) {
@@ -509,6 +509,10 @@ func TestAnthropicAuthErrorShape(t *testing.T) {
 		t.Fatalf("code=%d", rec.Code)
 	}
 
+	if rec.Header().Get("Request-Id") == "" {
+		t.Fatal("鉴权失败缺少 Request-Id")
+	}
+
 	var resp map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("bad json: %v", err)
@@ -516,6 +520,10 @@ func TestAnthropicAuthErrorShape(t *testing.T) {
 
 	if resp["type"] != "error" {
 		t.Fatalf("body=%v", resp)
+	}
+
+	if resp["request_id"] != rec.Header().Get("Request-Id") {
+		t.Fatalf("body request_id=%v header=%q", resp["request_id"], rec.Header().Get("Request-Id"))
 	}
 
 	e := resp["error"].(map[string]any)

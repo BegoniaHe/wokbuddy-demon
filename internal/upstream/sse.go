@@ -671,8 +671,13 @@ func appendStringIfNonEmpty(dst, src map[string]any, key string) {
 //     键缺失是比空串更安全的形态：`??` 与 truthy 守卫对缺失键必然保留旧值，
 //     而对空串，`??` 会误判为重设并清空工具名。
 //
-// seen 记录每个 index 是否已发过首片（与 name 是否非空无关）；删除是幂等的。
+// seen 记录每个 index 是否已下发过非空 name；删除是幂等的。
 // 只动 function.name 键，id/type/arguments 原样透传。
+//
+// 「已下发」只看非空 name：部分上游首片只带 id/arguments，name 随后续分片到达。
+// 若空 name 的首片就占用该配额，真正的 name 会被当成重复而删掉，客户端最终拿到
+// 没有 name 的调用（Anthropic 面会整块丢弃 tool_use）。空 name 键本身是噪声，
+// 直接删掉但不占配额。
 func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
@@ -706,8 +711,17 @@ func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool)
 
 				continue
 			}
-			// 首现：保留 name 键原样（上游首片通常带非空 name；空 name 也照发，
-			// 与 OpenAI 对「首帧无 name」的容忍一致），随后分片统一删除。
+
+			fn, _ := table["function"].(map[string]any)
+			if name, _ := fn["name"].(string); name == "" {
+				// 空 name（键缺失/空串）：本片不占用「已下发」配额，name 可能随后片到达。
+				if fn != nil {
+					delete(fn, "name")
+				}
+
+				continue
+			}
+
 			seen[idx] = true
 		}
 	}
