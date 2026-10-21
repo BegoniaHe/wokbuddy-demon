@@ -341,6 +341,7 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
 		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
 		BackgroundTarget:     cfg.Models.BackgroundTarget,
+		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -823,6 +824,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 		LocalWebToolRounds:   newCfg.Features.LocalWebToolRounds,
 		BackgroundNames:      backgroundNameSet(newCfg.Models.BackgroundNames),
 		BackgroundTarget:     newCfg.Models.BackgroundTarget,
+		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	client3.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	state9.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

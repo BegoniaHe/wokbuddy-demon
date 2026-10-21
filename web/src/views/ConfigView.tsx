@@ -521,6 +521,11 @@ export function ConfigView() {
               {text('background_target', { placeholder: 'deepseek-v4.1-flash' })}
               <FieldDescription>只改 model 字段，其余请求原样透传；热生效</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>模型黑名单</FieldLabel>
+              {text('hidden_models', { placeholder: '如 glm-5.2, global:kimi-k3' })}
+              <FieldDescription>逗号分隔；裸名两域都隐藏，cn:/global: 只藏该域。命中后不出现在 /v1/models，点名调用返回 400；热生效</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">

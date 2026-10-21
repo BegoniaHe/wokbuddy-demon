@@ -65,7 +65,8 @@
   "models": {
     "aliases": {},
     "background_names": [],
-    "background_target": "deepseek-v4.1-flash"
+    "background_target": "deepseek-v4.1-flash",
+    "hidden": []
   },
   "global": {
     "enabled": true,

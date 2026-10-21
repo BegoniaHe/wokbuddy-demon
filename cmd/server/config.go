@@ -31,6 +31,7 @@ var (
 	errLoadFailed                       = errors.New("Load failed")
 	errModelsAliases                    = errors.New("models.aliases: 别名不能为空")
 	errNormalizeModelAliasesFailed      = errors.New("normalizeModelAliases failed")
+	errNormalizeHiddenModels            = errors.New("normalizeHiddenModels failed")
 	errNormalizeAliasTargetFailed       = errors.New("normalizeAliasTarget failed")
 	errNormalizeNotifyFailed            = errors.New("normalizeNotify failed")
 	errNormalizeLoggingFailed           = errors.New("normalizeLogging failed")
@@ -195,6 +196,10 @@ type Config struct {
 		// 语法，省略 realm 时继承请求侧的 realm（裸请求即 cn）。
 		// 命中别名后选号/粘性/成本台账/日志一律使用解析后的裸模型名。
 		Aliases map[string]string `json:"aliases"`
+		// Hidden 模型黑名单：裸名 = 两域都隐藏，"cn:"/"global:" 前缀 = 只藏该域。
+		// 命中后 /v1/models 不再列出、点名调用返回 400 model_unavailable（不打上游、
+		// 不占选号）。大小写敏感，保存后热生效。
+		Hidden []string `json:"hidden"`
 	} `json:"models"`
 
 	Global struct {
@@ -852,6 +857,7 @@ func (c *Config) normalize() error {
 
 	steps := []func() error{
 		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
+		c.normalizeHiddenModels,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
 	}
@@ -929,6 +935,51 @@ func (c *Config) normalizeBackgroundModels() error {
 	c.Models.BackgroundNames = out
 
 	return nil
+}
+
+// normalizeHiddenModels 规范化模型黑名单（models.hidden）：去空白、丢空项、
+// 去重，并拒绝 "cn:"/"global:" 前缀后裸名为空的写法（否则会隐藏整域）。
+func (c *Config) normalizeHiddenModels() error {
+	if len(c.Models.Hidden) == 0 {
+		c.Models.Hidden = nil
+		return nil
+	}
+
+	seen := make(map[string]bool, len(c.Models.Hidden))
+
+	out := make([]string, 0, len(c.Models.Hidden))
+
+	for _, raw := range c.Models.Hidden {
+		name := strings.TrimSpace(raw)
+		if name == "" || seen[name] {
+			continue
+		}
+
+		if realm, bare, prefixed := splitHiddenRealmPrefix(name); prefixed && bare == "" {
+			return fmt.Errorf("models.hidden[%q]: realm 前缀 %q 之后必须写模型名: %w",
+				name, realm, errNormalizeHiddenModels)
+		}
+
+		seen[name] = true
+
+		out = append(out, name)
+	}
+
+	c.Models.Hidden = out
+
+	return nil
+}
+
+// splitHiddenRealmPrefix 拆分 models.hidden 里的可选 realm 前缀（只认 cn/global，
+// 大小写敏感；其余原样当作裸模型名，避免与含冒号的模型名混淆）。
+func splitHiddenRealmPrefix(name string) (realm, bare string, prefixed bool) {
+	for _, candidate := range []string{"cn", "global"} {
+		if trimmed, ok := strings.CutPrefix(name, candidate+":"); ok {
+			return candidate, strings.TrimSpace(trimmed), true
+		}
+	}
+
+	return "", name, false
 }
 
 // normalizeAliasTarget 去掉目标首尾空白并校验 "[realm:]model"：冒号前只允许

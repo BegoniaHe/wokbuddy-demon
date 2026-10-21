@@ -1,6 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32" role="img" aria-label="WokBuddy Demon">
-  <rect width="32" height="32" rx="7" fill="#111113"/>
-  <path d="M16 5.5c2 2.4 2 4.4 0 6.6-2-2.2-2-4.2 0-6.6z" fill="#fbbf24"/>
-  <path d="M7 17h18a9 9 0 0 1-18 0z" fill="#3b82f6"/>
-  <path d="M4 17h24" stroke="#3b82f6" stroke-width="2.4" stroke-linecap="round"/>
-</svg>
