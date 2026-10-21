@@ -1384,9 +1384,20 @@ func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]an
 		return item
 	}
 
-	if before.Claimed || before.Current >= before.Target && before.Target > 0 {
+	if before.Claimed {
 		item["status"] = "skipped"
-		item["message"] = "已完成（" + taskProgressText(before) + "）"
+		item["message"] = "已领取（" + taskProgressText(before) + "）"
+
+		return item
+	}
+	// 已达标未领：先补领再跳过。此前这里直接标 skipped，奖励就一直躺在那里
+	// （issue #174）。判据只用 progress（不依赖 accept_status=="completed"，
+	// 上游该字段在部分任务上不更新）。
+	if before.Target > 0 && before.Current >= before.Target {
+		item["status"] = "skipped"
+		// autoClaimItem 会把 claimed/credit/energy/claim_error 写回条目，并把 message
+		// 覆写为「已完成（…）；已自动领奖 +N 分 +M 能」（失败则带可读 claim_error）。
+		p.autoClaimItem(account5, act.TaskCode, "已完成（"+taskProgressText(before)+"）", item)
 
 		return item
 	}
