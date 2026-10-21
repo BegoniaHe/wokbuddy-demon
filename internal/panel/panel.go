@@ -277,6 +277,10 @@ func (p *Panel) routesImport() {
 
 func (p *Panel) routesUsage() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	// 官方补偿（上游同步窗口 issue #204）：只读状态 + 逐号/全量「先查后领」。
+	p.mux.HandleFunc("GET /panel/api/compensation", p.withAuth(p.compensationStatus))
+	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAuth(p.compensationAll))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAuth(p.accountCompensation))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 	p.mux.HandleFunc("GET /panel/api/usage/remaining", p.withAuth(p.usageRemaining))

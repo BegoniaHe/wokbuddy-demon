@@ -503,6 +503,16 @@ gemini
 
 `WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE` · `WB2A_TIMEOUT_SECONDS` · `WB2A_PROMPT_MODE` …
 
+## 官方补偿
+
+官方在「套餐与积分」页挂的限时补偿（带领取截止日）由网关**先查后领**，不再盲领：
+
+- 面板账号池的「官方补偿」卡片：待领账号 + 领取截止倒计时（≤48 小时标红）+ 逐号/全量领取；**查询失败的账号以红色行显形**（避免把故障说成「没有补偿」）。
+- 接口：`GET /panel/api/compensation`（只读状态）、`POST /panel/api/accounts/{uid}/compensation`（单号先查后领）、`POST /panel/api/compensation_all`（全量，返回 `summary{claimed,skipped,errored,credit}`——**先看 `errored` 再看 `claimed`**）。
+- 取数只在进页面与手动点击时发生，不挂 5 秒轮询（补偿状态没有 overview 快照可吃）。
+- 参与范围：CN 个人号；global / 企业版 / 禁用账号跳过（paused 不跳过——纯领奖 RPC，与选号让位无关）。
+- 签到链路（连登管家）同样改为先查后领：无活动静默、领取失败必打 WARN。
+
 ## 部署运维
 
 ### 部署模型：单实例

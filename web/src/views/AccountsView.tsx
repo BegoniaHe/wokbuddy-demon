@@ -42,6 +42,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Tag, Chip, Bar, Dot, type Tone } from '@/components/ui-kit';
 import { TasksDialog } from '@/components/TasksDialog';
+import { compDeadlineHours, compDeadlineTone, compName, compNote, compPending, type CompensationRow } from '@/lib/compensation';
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import { MoreHorizontal } from 'lucide-react';
@@ -72,6 +73,39 @@ export function AccountsView() {
       toast((e as Error).message, 'err');
     } finally {
       void runsQ.refetch();
+    }
+  };
+
+  // 官方补偿（issue #204）：进页面取一次 + 手动刷新/领取；**不挂 5s 轮询**
+  //（补偿状态没有 overview 快照可吃，挂轮询就是每 5 秒对每账号轰炸上游）。
+  const compQuery = useQuery({
+    queryKey: ['compensation'],
+    queryFn: () => api<{ accounts?: CompensationRow[] }>('compensation').catch((): { accounts?: CompensationRow[] } => ({})),
+    refetchInterval: false,
+    staleTime: 120000,
+  });
+  const compClaim = async (uid?: string) => {
+    try {
+      const r = await postJSON<{
+        account?: CompensationRow;
+        summary?: { claimed?: number; errored?: number; credit?: number };
+      }>(uid ? 'accounts/' + encodeURIComponent(uid) + '/compensation' : 'compensation_all');
+      if (uid) {
+        const row = r.account;
+        toast(row?.error ? '领取失败：' + row.error : row?.claimed ? '已领取 +' + (row?.credit_num ?? 0) + ' 分' : '无需领取', row?.error ? 'err' : 'ok');
+      } else {
+        const sum = r.summary;
+        // 先看 errored：上游全挂时不能把故障说成「没有待领补偿」。
+        toast(
+          sum?.errored
+            ? '完成：领取 ' + (sum.claimed ?? 0) + ' 个，失败 ' + sum.errored + ' 个'
+            : '完成：领取 ' + (sum?.claimed ?? 0) + ' 个（+' + (sum?.credit ?? 0) + ' 分）',
+          sum?.errored ? 'err' : 'ok',
+        );
+      }
+      void compQuery.refetch();
+    } catch (e) {
+      toast((e as Error).message, 'err');
     }
   };
 
@@ -125,6 +159,8 @@ export function AccountsView() {
         checking={pkgQuery.isFetching}
         onCheck={() => void pkgQuery.refetch()}
       />
+
+      <CompensationBox rows={compQuery.data?.accounts} loading={compQuery.isFetching} onClaim={compClaim} onRefresh={() => void compQuery.refetch()} />
 
       <Card>
         <CardHeader className="flex flex-wrap items-center justify-between gap-3">
@@ -379,6 +415,82 @@ function ExpiryBox({
         </CardAction>
       </CardHeader>
       <CardContent>{rows && (rows as unknown[])?.length ? rows : <p className="py-4 text-center text-muted-foreground">没有账号</p>}</CardContent>
+    </Card>
+  );
+}
+
+// CompensationBox 官方补偿卡片：待领账号 + 截止倒计时（≤48h 标红）+ 逐号/全量领取。
+// 查询失败的账号渲染为红色行并强制显形（compNote 里也先报失败数）。
+function CompensationBox({
+  rows,
+  loading,
+  onClaim,
+  onRefresh,
+}: {
+  rows?: CompensationRow[];
+  loading: boolean;
+  onClaim: (uid?: string) => void;
+  onRefresh: () => void;
+}) {
+  const now = Date.now();
+  const pending = (rows || []).filter((r) => compPending(r));
+  const failed = (rows || []).filter((r) => r.error);
+
+  return (
+    <Card className="mb-5">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-3">
+        <CardTitle className="flex items-baseline">
+          官方补偿
+          <CardDescription className="ml-1.5">
+            官方限时补偿活动（带领取截止日）：先查状态再领取，查询失败会显形而不是被当成「没有补偿」
+          </CardDescription>
+        </CardTitle>
+        <CardAction>
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs text-muted-foreground">{compNote(rows)}</span>
+            <Button size="xs" variant="ghost" disabled={loading} onClick={onRefresh}>
+              {loading ? '查询中…' : '刷新'}
+            </Button>
+            <Button size="xs" disabled={loading || pending.length === 0} onClick={() => onClaim()}>
+              全部领取
+            </Button>
+          </div>
+        </CardAction>
+      </CardHeader>
+      <CardContent>
+        {!rows || rows.length === 0 ? (
+          <p className="py-4 text-center text-muted-foreground">还没有查询过补偿状态，点「刷新」</p>
+        ) : pending.length === 0 && failed.length === 0 ? (
+          <p className="py-4 text-center text-muted-foreground">当前没有待领补偿</p>
+        ) : (
+          <div className="flex flex-col gap-1">
+            {pending.map((row) => {
+              const hours = compDeadlineHours(row.end_time, now);
+              return (
+                <div key={row.uid} className="flex flex-wrap items-center gap-2 border-t border-border/60 py-2 text-xs first:border-t-0">
+                  <Dot tone={compDeadlineTone(hours)} className="size-2.5" />
+                  <span className="min-w-[9em] flex-none font-semibold">{compName(row)}</span>
+                  <span className="text-muted-foreground">
+                    待领 <b className="font-mono">{row.credit_num ?? 0}</b> 分
+                    {hours != null ? ' · 剩 ' + hours + ' 小时截止（' + String(row.end_time || '') + '）' : ' · 截止时间未知'}
+                  </span>
+                  <span className="flex-1" />
+                  <Button size="xs" onClick={() => onClaim(row.uid)}>
+                    领取
+                  </Button>
+                </div>
+              );
+            })}
+            {failed.map((row) => (
+              <div key={'err-' + row.uid} className="flex items-center gap-2 border-t border-border/60 py-2 text-xs first:border-t-0">
+                <Dot tone="bad" className="size-2.5" />
+                <span className="min-w-[9em] flex-none font-semibold">{compName(row)}</span>
+                <span className="text-destructive">查询失败：{row.error}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </CardContent>
     </Card>
   );
 }
