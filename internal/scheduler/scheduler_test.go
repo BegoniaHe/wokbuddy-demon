@@ -752,6 +752,34 @@ func TestRunBalanceRefreshReplacesExpirySnapshot(t *testing.T) {
 	}
 }
 
+// TestRunCheckinKeepsExpiryBuckets 签到链路写完整余额快照：不得把后台刷新刚写入的
+// 逐日到期批次清空（SetCreditsDetailed 只带最早一批，会清旧批次）。
+func TestRunCheckinKeepsExpiryBuckets(t *testing.T) {
+	t.Parallel()
+
+	end := time.Now().In(time.FixedZone("CST", 8*3600)).Add(24 * time.Hour).Format("2006-01-02 15:04:05")
+	fakeUpstream2 := &fakeUpstream{resourceRemain: 100, resourceEnd: end}
+
+	srv := fakeUpstream2.server()
+	defer srv.Close()
+
+	state := pool.New("")
+	state.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	at := time.Now().Add(time.Hour)
+	state.SetCreditsSnapshot("u1", 100, 1000, 100, []pool.ExpiryBucket{{
+		Date: at.Format("2006-01-02"), ExpireAt: at, Remain: 100,
+	}})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	scheduler := New(&Config{Pool: state, Upstream: up, ExpiringSoonWindow: 7 * 24 * time.Hour})
+	scheduler.RunCheckinNow()
+
+	status, _ := state.Status("u1")
+	if len(status.CreditsExpiryBuckets) == 0 {
+		t.Fatalf("签到后到期批次被清空: %+v", status)
+	}
+}
+
 func TestSetExpiringSoonWindowClearsSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -1122,5 +1150,31 @@ func TestStartTaskSweepHotEnableFromPaused(t *testing.T) {
 
 	if after := calls.Load(); after != before {
 		t.Errorf("暂停后仍在执行：before=%d after=%d", before, after)
+	}
+}
+
+// TestSetBalanceIntervalUpdatesMeta 热改余额刷新周期时同步「数据新鲜度」元数据：
+// 关闭后不得继续显示旧周期（面板据此标注「每 N 分钟后台刷新」）。
+func TestSetBalanceIntervalUpdatesMeta(t *testing.T) {
+	t.Parallel()
+
+	state := pool.New("")
+	scheduler := New(&Config{Pool: state})
+
+	refreshedAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	state.SetBalanceRefreshMeta(300, refreshedAt)
+
+	scheduler.SetBalanceInterval(0)
+
+	sec, at := state.BalanceRefreshMeta()
+	if sec != 0 || !at.Equal(refreshedAt) {
+		t.Fatalf("关闭后 meta=%d/%v want 0/%v", sec, at, refreshedAt)
+	}
+
+	scheduler.SetBalanceInterval(5 * time.Minute)
+
+	sec, at = state.BalanceRefreshMeta()
+	if sec != 300 || !at.Equal(refreshedAt) {
+		t.Fatalf("重开后 meta=%d/%v want 300/%v", sec, at, refreshedAt)
 	}
 }

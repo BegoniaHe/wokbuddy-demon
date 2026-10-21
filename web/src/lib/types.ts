@@ -44,6 +44,8 @@ export interface Account {
   token_usage?: AccountTokenUsage;
   credits_earliest_expiry?: string;
   credits_earliest_remaining?: number;
+  // credits_expiry_buckets 逐日到期批次（与「检查」同口径，issue #200）。
+  credits_expiry_buckets?: { date?: string; expire_at?: string; remain?: number }[];
 }
 
 // 批量任务运行状态（GET /panel/api/tasks/runs，issue #112）。
@@ -105,6 +107,10 @@ export interface Overview {
   in_flight_full?: number;
   in_flight_total?: number;
   max_in_flight_total?: number;
+  // balance_refresh_sec / balance_refreshed_at 余额快照的刷新周期与最近完成时刻
+  // （issue #200）：到期提醒卡片据此标注数据新鲜度。
+  balance_refresh_sec?: number;
+  balance_refreshed_at?: string;
   daily_limited?: string[];
   daily_reset_at?: string;
   proxy_slots?: { id: string; name: string }[];

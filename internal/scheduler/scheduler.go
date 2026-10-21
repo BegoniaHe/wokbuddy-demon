@@ -690,15 +690,17 @@ func (s *Scheduler) runCheckinAccount(status *pool.Status, account *auth.Auth, e
 		ok = s.checkinOne(status.UID, status.Nickname, account)
 	}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account, expiringSoon)
+	// 用含逐日到期批次的快照写入：签到链路也保留完整批次，避免把后台刷新刚写入的
+	// 批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
+	snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
 	if err != nil {
 		log.Printf("user-resource %s: %v", logfmt.Label(status.UID, status.Nickname), err)
 		return false
 	}
 
-	s.cfg.Pool.ReenableIfCredits(status.UID, remain, total)
-	s.cfg.Pool.SetCreditsDetailed(status.UID, remain, total, expiring, earliestAt, earliestRemaining)
-	s.notifyCreditLow(account, remain)
+	s.cfg.Pool.ReenableIfCredits(status.UID, snap.Remain, snap.Total)
+	s.cfg.Pool.SetCreditsSnapshot(status.UID, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+	s.notifyCreditLow(account, snap.Remain)
 
 	return ok
 }
@@ -1000,19 +1002,54 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account4, expiringSoon)
+			// 用含逐日到期批次的快照写入：面板快照路径与「检查」同口径（issue #200）。
+			snap, err := s.cfg.Upstream.UserResourceSnapshot(account4, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, account4.NicknameValue()), err)
 				return
 			}
 
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-			s.notifyCreditLow(account4, remain)
+			s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
+			s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+			s.notifyCreditLow(account4, snap.Remain)
 		}(account, status.UID)
 	}
 
 	wg.Wait()
+
+	// 记录本轮完成时刻与周期，供面板展示「数据新鲜度」（issue #200）。
+	s.cfg.Pool.SetBalanceRefreshMeta(s.balanceRefreshSeconds(), time.Now())
+}
+
+// runBalanceRefreshFirstRound 启动即跑一轮余额刷新（issue #200）：否则首个 ticker
+// 到期前（最长一个周期）面板只有旧快照/空批次。仅在启用状态下执行，失败不影响循环。
+func (s *Scheduler) runBalanceRefreshFirstRound(ctx context.Context) {
+	if time.Duration(s.balanceInterval.Load()) <= 0 {
+		return
+	}
+
+	s.RunBalanceRefreshNowCtx(ctx)
+}
+
+// balanceRefreshSeconds 当前余额刷新周期（秒，0 = 未启用）。
+func (s *Scheduler) balanceRefreshSeconds() int64 {
+	cur := time.Duration(s.balanceInterval.Load())
+
+	return int64(cur / time.Second)
+}
+
+// mapExpiryBuckets upstream.ExpiryBucket → pool.ExpiryBucket（pool 不依赖 upstream 包）。
+func mapExpiryBuckets(buckets []upstream.ExpiryBucket) []pool.ExpiryBucket {
+	if len(buckets) == 0 {
+		return nil
+	}
+
+	out := make([]pool.ExpiryBucket, 0, len(buckets))
+	for _, bucket := range buckets {
+		out = append(out, pool.ExpiryBucket{Date: bucket.Date, ExpireAt: bucket.ExpireAt, Remain: bucket.Remain})
+	}
+
+	return out
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -1029,6 +1066,8 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 
 	go func() {
 		var logged time.Duration
+
+		s.runBalanceRefreshFirstRound(ctx)
 
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
@@ -1062,12 +1101,20 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 }
 
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
-func (s *Scheduler) SetBalanceInterval(d time.Duration) {
-	if d < 0 {
-		d = 0
+func (s *Scheduler) SetBalanceInterval(interval time.Duration) {
+	if interval < 0 {
+		interval = 0
 	}
 
-	s.balanceInterval.Store(int64(d))
+	s.balanceInterval.Store(int64(interval))
+
+	// 面板的「数据新鲜度」直接读这份元数据：热关/热开时同步周期，否则关闭后仍
+	// 显示「每 N 分钟后台刷新」、刚开启却显示「未启用」。保留上次完成时刻不动。
+	if s.cfg.Pool != nil {
+		_, at := s.cfg.Pool.BalanceRefreshMeta()
+		s.cfg.Pool.SetBalanceRefreshMeta(int64(interval/time.Second), at)
+	}
+
 	poke(s.rearmBalance)
 }
 

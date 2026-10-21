@@ -93,6 +93,62 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 	entry2.creditsExpiring = expiring
 	entry2.creditsEarliestExpiry = earliestAt
 	entry2.creditsEarliestRemaining = earliestRemaining
+	// 本入口没有逐日批次信息（只给聚合值的外部/测试调用方）：清掉上一次周期刷新
+	// 留下的批次，否则面板会把新余额/新最早批次与旧批次并排展示（快照与「检查」口径分裂）。
+	// 生产路径（签到 / 单号刷新 / 后台刷新）统一走 SetCreditsSnapshot 保留完整批次。
+	entry2.creditsExpiryBuckets = nil
+
+	p.dirty.Store(true)
+}
+
+// SetCreditsSnapshot 写入一次余额快照（含逐日到期批次）：先按 SetCreditsDetailed
+// 同口径钳制汇总值，再落批次并按批次重算「最早到期批次 / 剩余量」——
+// 这样快照与面板「检查」对同一账号给出完全一致的批次（issue #200）。
+// buckets 为空表示上游本次没有可用批次（清空旧批次，避免展示过期数据）。
+func (p *Pool) SetCreditsSnapshot(uid string, credits, total, expiring int64, buckets []ExpiryBucket) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entry2, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+
+	now := p.now()
+
+	var earliestAt time.Time
+
+	var earliestRemaining int64
+
+	kept := make([]ExpiryBucket, 0, len(buckets))
+
+	for _, bucket := range buckets {
+		if bucket.Remain <= 0 || bucket.Date == "" {
+			continue
+		}
+
+		kept = append(kept, bucket)
+
+		if earliestAt.IsZero() || bucket.ExpireAt.Before(earliestAt) {
+			earliestAt, earliestRemaining = bucket.ExpireAt, bucket.Remain
+		} else if bucket.ExpireAt.Equal(earliestAt) {
+			earliestRemaining += bucket.Remain
+		}
+	}
+
+	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(now, credits, expiring, earliestAt, earliestRemaining)
+
+	entry2.credits = credits
+	entry2.creditsTotal = total
+	entry2.creditsExpiring = expiring
+	entry2.creditsEarliestExpiry = earliestAt
+	entry2.creditsEarliestRemaining = earliestRemaining
+
+	if len(kept) == 0 {
+		entry2.creditsExpiryBuckets = nil
+	} else {
+		entry2.creditsExpiryBuckets = kept
+	}
 
 	p.dirty.Store(true)
 }

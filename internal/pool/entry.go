@@ -60,6 +60,15 @@ type TokenUsageDelta struct {
 	TokensPerSecond     float64
 }
 
+// ExpiryBucket 一个自然日的到期批次（同日多包合并为一条）。
+// 与 internal/upstream.ExpiryBucket 同形但类型独立——pool 不依赖 upstream 包
+// （分层：由 scheduler 做映射）。
+type ExpiryBucket struct {
+	Date     string    `json:"date"`
+	ExpireAt time.Time `json:"expire_at,omitzero"`
+	Remain   int64     `json:"remain"`
+}
+
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
 	UID          string `json:"uid"`
@@ -72,12 +81,15 @@ type Status struct {
 	CreditsExpiring          int64     `json:"credits_expiring,omitempty"`
 	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitzero"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
-	Cooling                  bool      `json:"cooling"`
-	CoolKind                 string    `json:"cool_kind,omitempty"`
-	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
-	Until                    time.Time `json:"until,omitzero"`
-	Reason                   string    `json:"reason,omitempty"`
-	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	// CreditsExpiryBuckets 逐日到期批次（与面板「检查」同口径的按日聚合），
+	// 供快照路径渲染全部批次；空 = 无批次或尚未查询过。
+	CreditsExpiryBuckets []ExpiryBucket `json:"credits_expiry_buckets,omitempty"`
+	Cooling              bool           `json:"cooling"`
+	CoolKind             string         `json:"cool_kind,omitempty"`
+	CoolRemaining        int64          `json:"cool_remaining_sec,omitempty"`
+	Until                time.Time      `json:"until,omitzero"`
+	Reason               string         `json:"reason,omitempty"`
+	SoftStreak           int            `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额/避让的模型列表（issue #36 台账）。
 	// 任一未过期的模型级条目（modelCooldowns，含无重置时间的 6004 审计项）都会成行：
 	// 6004 限流为 rate_limit，11136 权限缺失 / 11141 模型下线为 model_unavailable。
@@ -197,11 +209,14 @@ type entry struct {
 	creditsExpiring          int64
 	creditsEarliestExpiry    time.Time
 	creditsEarliestRemaining int64
-	successCount             int64      // 累计成功
-	errTotal                 int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr                  time.Time  // 最近一次错误时间
-	lastSuccess              time.Time  // 最近一次成功时间
-	tokenUsage               TokenUsage // 聊天请求 token 用量摘要（持久化）
+	// creditsExpiryBuckets 逐日到期批次（上游快照，按自然日聚合）。持久化：重启后
+	// 面板到期提醒与「检查」仍能看到全部批次，而不是退回「只有最早一批」。
+	creditsExpiryBuckets []ExpiryBucket
+	successCount         int64      // 累计成功
+	errTotal             int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr              time.Time  // 最近一次错误时间
+	lastSuccess          time.Time  // 最近一次成功时间
+	tokenUsage           TokenUsage // 聊天请求 token 用量摘要（持久化）
 	// health 按模型的实时健康台账（TTFT EWMA + 错误压力），供选号降权（issue #16）。
 	// 运行态、不持久化：信号短时有效（TTL 过期即删），重启后中性起步。
 	health map[string]*modelHealth
@@ -511,6 +526,9 @@ type stateAccount struct {
 	// 与 CreditsExpiring 一并持久化，重启后首次请求仍可沿用最近一次余额快照。
 	CreditsEarliestExpiry    time.Time `json:"credits_earliest_expiry,omitzero"`
 	CreditsEarliestRemaining int64     `json:"credits_earliest_remaining,omitempty"`
+	// CreditsExpiryBuckets 逐日到期批次。与其他到期字段同口径持久化：旧 state.json
+	// 缺失该键视为空（沿用「只有最早一批」的既有表现，不报错）。
+	CreditsExpiryBuckets []ExpiryBucket `json:"credits_expiry_buckets,omitempty"`
 	// ModelCooldowns 模型级独立冷却表（model → 冷却记录：6004 重置墙钟 /
 	// 11136/11141 负缓存退避）。持久化：6004 对齐上游重置墙钟后单模型冷却可长达
 	// 数小时，跨重启是常态；不持久化会导致 healthyForModel 重启失忆、重新踩雷区。

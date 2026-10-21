@@ -693,6 +693,7 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		CreditsExpiring:          entry2.creditsExpiring,
 		CreditsEarliestExpiry:    entry2.creditsEarliestExpiry,
 		CreditsEarliestRemaining: entry2.creditsEarliestRemaining,
+		CreditsExpiryBuckets:     entry2.creditsExpiryBuckets,
 		Cooling:                  now.Before(entry2.until) || now.Before(entry2.breakerUntil),
 		Disabled:                 entry2.disabled,
 		Paused:                   entry2.paused,

@@ -11,7 +11,7 @@ import {
   rateLimitMeta,
   type RateLimitRow,
 } from '@/lib/format';
-import { expBatches, expDaysLeft, type Package } from '@/lib/expiry';
+import { expBatches, expBucketsFromSnapshot, expDaysLeft, type Package } from '@/lib/expiry';
 import { fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
 import { useConfirm, type ConfirmOptions } from '@/components/ConfirmDialog';
@@ -242,6 +242,16 @@ function Stats({ stats }: { stats: StatItem[] }) {
   );
 }
 
+// snapshotPackages 把快照里的逐日到期批次折成 expBatches 认识的 packages 形状，
+// 让「快照」与「检查」走同一条渲染路径（同口径，issue #200）。旧 state 没有批次时
+// 回落为「最早一批」单包，保持既有表现。
+function snapshotPackages(a: Account): Package[] {
+  const buckets = expBucketsFromSnapshot(a.credits_expiry_buckets);
+  if (buckets.length) return buckets.map((b) => ({ remain: b.remain, end_time: b.date }));
+  if (!a.credits_earliest_expiry || !a.credits_earliest_remaining) return [];
+  return [{ remain: a.credits_earliest_remaining, end_time: String(a.credits_earliest_expiry).slice(0, 10) }];
+}
+
 function ExpiryBox({
   overview,
   detail,
@@ -261,121 +271,82 @@ function ExpiryBox({
   const today = new Date();
   today.setHours(0, 0, 0, 0);
 
-  let rows: React.ReactNode;
-  let note: string;
+  // 两条路径（实时明细 / 本地快照）统一成同一份「账号 + 到期包」，渲染只写一次。
+  const list: PackageAccount[] = detail
+    ? (detail.accounts ?? [])
+    : (overview.accounts ?? []).map((a) => ({ uid: a.uid, nickname: a.nickname, packages: snapshotPackages(a) }));
 
-  if (detail) {
-    const list = detail.accounts ?? [];
-    const keyed = list.map((a) => {
-      let key: string | null = null;
-      if (!a.error) {
-        const bs = expBatches(a.packages).filter((b) => expDaysLeft(b.date, today) >= 0);
-        if (bs.length) key = bs[0]!.date;
-      }
-      return { a, key };
-    });
-    keyed.sort((x, y) => {
-      if (x.key === y.key) return 0;
-      if (x.key === null) return 1;
-      if (y.key === null) return -1;
-      return x.key < y.key ? -1 : 1;
-    });
-    rows = keyed.map(({ a }) => {
-      const nm = remarkName(a.uid, a.nickname || '').display;
-      if (a.error) {
-        return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
-            <Dot tone="mute" className="mt-1 size-2.5" />
-            <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-            <span className="text-destructive">查询失败：{a.error}</span>
-          </div>
-        );
-      }
+  const keyed = list.map((a) => {
+    let key: string | null = null;
+    if (!a.error) {
       const bs = expBatches(a.packages).filter((b) => expDaysLeft(b.date, today) >= 0);
-      if (!bs.length) {
-        return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
-            <Dot tone="ok" className="mt-1 size-2.5" />
-            <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-            <span className="text-muted-foreground">7 天内无到期积分</span>
-          </div>
-        );
-      }
-      const first = bs[0]!;
-      const days = expDaysLeft(first.date, today);
-      const daily = Math.ceil(first.remain / Math.max(1, days));
-      const week = bs.filter((b) => expDaysLeft(b.date, today) <= 7).reduce((s, b) => s + b.remain, 0);
-      const dotTone: Tone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
-      const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-      const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
-      const rest = bs.slice(1, 4).map((b) => '随后 ' + b.date.slice(5) + ' · ' + fmtTok(b.remain)).join('　') + more;
+      if (bs.length) key = bs[0]!.date;
+    }
+    return { a, key };
+  });
+  keyed.sort((x, y) => {
+    if (x.key === y.key) return 0;
+    if (x.key === null) return 1;
+    if (y.key === null) return -1;
+    return x.key < y.key ? -1 : 1;
+  });
+
+  const rows = keyed.map(({ a }) => {
+    const nm = remarkName(a.uid, a.nickname || '').display;
+    if (a.error) {
       return (
         <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
-          <Dot tone={dotTone} className="mt-1 size-2.5" />
+          <Dot tone="mute" className="mt-1 size-2.5" />
           <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-          <span className="text-muted-foreground">
-            最近到期 <b className="font-mono">{first.date}</b>（{dayWord}）· 该批{' '}
-            <b className="font-mono">{fmtTok(first.remain)}</b> 积分 · 到期前日均需耗 ≥
-            <b className="font-mono">{fmtTok(daily)}</b>
-            {week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : ''}
-            {rest ? <div className="mt-0.5 text-2xs text-muted-foreground/80">{rest}</div> : null}
-          </span>
+          <span className="text-destructive">查询失败：{a.error}</span>
         </div>
       );
-    });
+    }
+    const bs = expBatches(a.packages).filter((b) => expDaysLeft(b.date, today) >= 0);
+    if (!bs.length) {
+      return (
+        <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
+          <Dot tone="ok" className="mt-1 size-2.5" />
+          <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
+          <span className="text-muted-foreground">7 天内无到期积分</span>
+        </div>
+      );
+    }
+    const first = bs[0]!;
+    const days = expDaysLeft(first.date, today);
+    const daily = Math.ceil(first.remain / Math.max(1, days));
+    const week = bs.filter((b) => expDaysLeft(b.date, today) <= 7).reduce((s, b) => s + b.remain, 0);
+    const dotTone: Tone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
+    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
+    const rest = bs.slice(1, 4).map((b) => '随后 ' + b.date.slice(5) + ' · ' + fmtTok(b.remain)).join('　') + more;
+    return (
+      <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
+        <Dot tone={dotTone} className="mt-1 size-2.5" />
+        <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
+        <span className="text-muted-foreground">
+          最近到期 <b className="font-mono">{first.date}</b>（{dayWord}）· 该批{' '}
+          <b className="font-mono">{fmtTok(first.remain)}</b> 积分 · 到期前日均需耗 ≥
+          <b className="font-mono">{fmtTok(daily)}</b>
+          {week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : ''}
+          {rest ? <div className="mt-0.5 text-2xs text-muted-foreground/80">{rest}</div> : null}
+        </span>
+      </div>
+    );
+  });
+
+  // 数据新鲜度：明细路径看本地查询时刻；快照路径看后台刷新周期与最近完成时刻。
+  const refreshSec = Number(overview.balance_refresh_sec || 0);
+  const refreshedAt = Date.parse(String(overview.balance_refreshed_at || ''));
+  let note: string;
+  if (detail) {
     const ageMin = fetchedAt ? Math.floor((Date.now() - fetchedAt) / 60000) : 0;
     note = ageMin > 0 ? list.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，可点「检查」刷新' : list.length + ' 个账号 · 实时查询上游';
   } else {
-    const list = overview.accounts ?? [];
-    const keyed = list.map((a) => {
-      let key: number | null = null;
-      let ms = 0;
-      if (a.credits_earliest_expiry) {
-        const t = new Date(a.credits_earliest_expiry);
-        if (!isNaN(t.getTime())) {
-          ms = t.getTime();
-          key = ms;
-        }
-      }
-      return { a, key, ms };
-    });
-    keyed.sort((x, y) => {
-      if (x.key === null && y.key === null) return 0;
-      if (x.key === null) return 1;
-      if (y.key === null) return -1;
-      return x.key! - y.key!;
-    });
-    rows = keyed.map(({ a, ms }) => {
-      const nm = remarkName(a.uid, a.nickname || '').display;
-      if (!ms || !a.credits_earliest_remaining) {
-        return (
-          <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
-            <Dot tone="ok" className="mt-1 size-2.5" />
-            <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-            <span className="text-muted-foreground">无近期到期批次</span>
-          </div>
-        );
-      }
-      const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
-      const remain = Number(a.credits_earliest_remaining || 0);
-      const daily = Math.ceil(remain / Math.max(1, days));
-      const dotTone: Tone = days <= 3 ? 'bad' : days <= 7 ? 'warn' : 'ok';
-      const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
-      const when = new Date(ms).toISOString().slice(0, 10);
-      return (
-        <div key={nm} className="flex items-start gap-2.5 border-t border-border/60 py-2 text-xs first:border-t-0">
-          <Dot tone={dotTone} className="mt-1 size-2.5" />
-          <span className="min-w-[9em] flex-none font-semibold">{nm}</span>
-          <span className="text-muted-foreground">
-            最近到期 <b className="font-mono">{when}</b>（{dayWord}）· 该批{' '}
-            <b className="font-mono">{fmtTok(remain)}</b> 积分 · 到期前日均需耗 ≥
-            <b className="font-mono">{fmtTok(daily)}</b>
-            <div className="mt-0.5 text-2xs text-muted-foreground/80">仅最早一批，点「检查」看全部到期批次</div>
-          </span>
-        </div>
-      );
-    });
-    note = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
+    const cadence = refreshSec > 0 ? '每 ' + Math.round(refreshSec / 60) + ' 分钟后台刷新' : '后台刷新未启用';
+    const ageMin = Number.isFinite(refreshedAt) && refreshedAt > 0 ? Math.floor((Date.now() - refreshedAt) / 60000) : -1;
+    const age = ageMin >= 0 ? ageMin + ' 分钟前更新' : '尚未刷新';
+    note = list.length + ' 个账号 · 快照（' + cadence + '，' + age + '；点「检查」拉实时明细）';
   }
 
   return (
@@ -383,7 +354,9 @@ function ExpiryBox({
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <CardTitle className="flex items-baseline">
           积分到期提醒
-          <CardDescription className="ml-1.5">按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）</CardDescription>
+          <CardDescription className="ml-1.5">
+            按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）
+          </CardDescription>
         </CardTitle>
         <CardAction>
           <div className="flex flex-wrap items-center gap-3">
@@ -405,7 +378,7 @@ function ExpiryBox({
       </CardHeader>
       {expanded ? (
         <CardContent id="expiry-box-body">
-          {rows && (rows as unknown[])?.length ? rows : <p className="py-4 text-center text-muted-foreground">没有账号</p>}
+          {rows.length ? rows : <p className="py-4 text-center text-muted-foreground">没有账号</p>}
         </CardContent>
       ) : null}
     </Card>
