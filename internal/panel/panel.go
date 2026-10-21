@@ -420,24 +420,30 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		sticky = p.cfg.StickyCount()
 	}
 
+	// 余额快照新鲜度（issue #200）：周期 + 最近一次完成时刻，供到期提醒卡片标注
+	// 「每 N 分钟后台刷新、x 分钟前更新」。未刷新过时时间为零值（前端按 — 渲染）。
+	balanceRefreshSec, balanceRefreshedAt := p.cfg.Pool.BalanceRefreshMeta()
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version":             p.cfg.Version,
-		"uptime_sec":          int(time.Since(p.started).Seconds()),
-		"auth_required":       p.apiKey() != "",
-		"redis_mode":          p.cfg.RedisMode,
-		"sticky_sessions":     sticky,
-		"total":               total,
-		"healthy":             healthy,
-		"cooling":             cooling,
-		"disabled":            disabled,
-		"paused":              paused,
-		"in_flight_full":      inFlightFull,
-		"in_flight_total":     p.cfg.Pool.InFlightTotal(),
-		"max_in_flight_total": p.cfg.Pool.MaxInFlightTotal(),
-		"daily_limited":       p.cfg.Pool.DailyLimitedUIDs(),
-		"daily_reset_at":      nextLocalMidnight(),
-		"proxy_slots":         p.cfg.ProxySlots,
-		"accounts":            p.cfg.Pool.List(),
+		"version":              p.cfg.Version,
+		"balance_refresh_sec":  balanceRefreshSec,
+		"balance_refreshed_at": balanceRefreshedAt,
+		"uptime_sec":           int(time.Since(p.started).Seconds()),
+		"auth_required":        p.apiKey() != "",
+		"redis_mode":           p.cfg.RedisMode,
+		"sticky_sessions":      sticky,
+		"total":                total,
+		"healthy":              healthy,
+		"cooling":              cooling,
+		"disabled":             disabled,
+		"paused":               paused,
+		"in_flight_full":       inFlightFull,
+		"in_flight_total":      p.cfg.Pool.InFlightTotal(),
+		"max_in_flight_total":  p.cfg.Pool.MaxInFlightTotal(),
+		"daily_limited":        p.cfg.Pool.DailyLimitedUIDs(),
+		"daily_reset_at":       nextLocalMidnight(),
+		"proxy_slots":          p.cfg.ProxySlots,
+		"accounts":             p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),

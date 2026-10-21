@@ -433,7 +433,7 @@ func TestResourcePackageDayWindowUsesCST(t *testing.T) {
 	// UTC 2026-10-19 17:30 = CST 2026-10-20 01:30。
 	now := time.Date(2026, 10, 19, 17, 30, 0, 0, time.UTC)
 
-	if _, _, _ = client.resourcePackageExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, now, 0); len(freeBody) == 0 {
+	if _, _ = client.resourcePackages(&auth.Auth{AccessToken: "at", UID: "u1"}, now, 0); len(freeBody) == 0 {
 		t.Fatal("free package request not captured")
 	}
 
@@ -461,7 +461,7 @@ func TestResourcePackageExpirySendsPackageCodes(t *testing.T) {
 		return jsonResp(200, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`), nil
 	})
 
-	if _, _, _ = client.resourcePackageExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, time.Now(), 0); len(bodies) != 2 {
+	if _, _ = client.resourcePackages(&auth.Auth{AccessToken: "at", UID: "u1"}, time.Now(), 0); len(bodies) != 2 {
 		t.Fatalf("captured bodies=%v want paid and free", bodies)
 	}
 

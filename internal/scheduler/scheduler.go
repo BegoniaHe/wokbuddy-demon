@@ -983,19 +983,54 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(account4, expiringSoon)
+			// 用含逐日到期批次的快照写入：面板快照路径与「检查」同口径（issue #200）。
+			snap, err := s.cfg.Upstream.UserResourceSnapshot(account4, expiringSoon)
 			if err != nil {
 				log.Printf("balance %s: %v", logfmt.Label(uid, account4.NicknameValue()), err)
 				return
 			}
 
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-			s.notifyCreditLow(account4, remain)
+			s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
+			s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+			s.notifyCreditLow(account4, snap.Remain)
 		}(account, status.UID)
 	}
 
 	wg.Wait()
+
+	// 记录本轮完成时刻与周期，供面板展示「数据新鲜度」（issue #200）。
+	s.cfg.Pool.SetBalanceRefreshMeta(s.balanceRefreshSeconds(), time.Now())
+}
+
+// runBalanceRefreshFirstRound 启动即跑一轮余额刷新（issue #200）：否则首个 ticker
+// 到期前（最长一个周期）面板只有旧快照/空批次。仅在启用状态下执行，失败不影响循环。
+func (s *Scheduler) runBalanceRefreshFirstRound(ctx context.Context) {
+	if time.Duration(s.balanceInterval.Load()) <= 0 {
+		return
+	}
+
+	s.RunBalanceRefreshNowCtx(ctx)
+}
+
+// balanceRefreshSeconds 当前余额刷新周期（秒，0 = 未启用）。
+func (s *Scheduler) balanceRefreshSeconds() int64 {
+	cur := time.Duration(s.balanceInterval.Load())
+
+	return int64(cur / time.Second)
+}
+
+// mapExpiryBuckets upstream.ExpiryBucket → pool.ExpiryBucket（pool 不依赖 upstream 包）。
+func mapExpiryBuckets(buckets []upstream.ExpiryBucket) []pool.ExpiryBucket {
+	if len(buckets) == 0 {
+		return nil
+	}
+
+	out := make([]pool.ExpiryBucket, 0, len(buckets))
+	for _, bucket := range buckets {
+		out = append(out, pool.ExpiryBucket{Date: bucket.Date, ExpireAt: bucket.ExpireAt, Remain: bucket.Remain})
+	}
+
+	return out
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -1012,6 +1047,8 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 
 	go func() {
 		var logged time.Duration
+
+		s.runBalanceRefreshFirstRound(ctx)
 
 		for {
 			cur := time.Duration(s.balanceInterval.Load())

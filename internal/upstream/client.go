@@ -3676,10 +3676,10 @@ var (
 
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
-func (c *Client) resourcePackageExpiry(account *auth.Auth, now time.Time, soon time.Duration) (
-	earliestAt time.Time, earliestRemaining, expiring int64,
+func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.Duration) (
+	expiring int64, totals *resourceTotals,
 ) {
-	var totals resourceTotals
+	totals = &resourceTotals{}
 
 	// 切片日期窗口按上游 UTC+8 墙钟计算；用部署机本地时区会在非 UTC+8 环境把
 	// 「今天」算错一天，拿到错误周期的免费包。
@@ -3710,12 +3710,12 @@ func (c *Client) resourcePackageExpiry(account *auth.Auth, now time.Time, soon t
 	}
 
 	for _, spec := range specs {
-		if perr := c.collectPackageExpiry(account, spec.path, spec.body, now, soon, &totals); perr != nil {
+		if perr := c.collectPackageExpiry(account, spec.path, spec.body, now, soon, totals); perr != nil {
 			log.Printf("WARN: [upstream] resource packages %s: %v (summary total kept)", spec.path, perr)
 		}
 	}
 
-	return totals.earliestAt, totals.earliestRemaining, totals.expiring
+	return totals.expiring, totals
 }
 
 // collectPackageExpiry 分页拉取单类积分包并累加到期批次。TotalCount>0 时以其为
@@ -3803,19 +3803,65 @@ func addPackageExpiry(packages []billingPackageAccount, now time.Time, soon time
 func (c *Client) UserResourceDetailedWithExpiry(
 	account *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	snap, err := c.UserResourceSnapshot(account, soon)
+	if err != nil {
+		return 0, 0, 0, time.Time{}, 0, err
+	}
+
+	for i := range snap.Buckets {
+		bucket := &snap.Buckets[i]
+		if earliestAt.IsZero() || bucket.ExpireAt.Before(earliestAt) {
+			earliestAt, earliestRemaining = bucket.ExpireAt, bucket.Remain
+		} else if bucket.ExpireAt.Equal(earliestAt) {
+			earliestRemaining += bucket.Remain
+		}
+	}
+
+	return snap.Remain, snap.Total, snap.Expiring, earliestAt, earliestRemaining, nil
+}
+
+// UserResourceSnapshot 查询余额并返回含逐日到期批次的完整快照。企业版走企业口径
+// （额度体系无「资源包到期批次」，Buckets 恒空）。
+func (c *Client) UserResourceSnapshot(account *auth.Auth, soon time.Duration) (ResourceSnapshot, error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if account.IsEnterprise() {
-		return c.enterpriseResource(account, soon)
+		remain, total, expiring, earliestAt, earliestRemaining, err := c.enterpriseResource(account, soon)
+		if err != nil {
+			return ResourceSnapshot{}, err
+		}
+
+		// 企业口径只给「周期末」一个到期点：折算成单条日桶，保持与个人口径同形状
+		// （快照 / 最早到期路由 / 面板「检查」看到的是同一份到期信息）。
+		snap := ResourceSnapshot{Remain: remain, Total: total, Expiring: expiring}
+		if !earliestAt.IsZero() && earliestRemaining > 0 {
+			snap.Buckets = []ExpiryBucket{{
+				Date:     expiryBucketDate(earliestAt),
+				ExpireAt: earliestAt,
+				Remain:   earliestRemaining,
+			}}
+		}
+
+		return snap, nil
 	}
 
+	remain, total, expiring, totals, err := c.personalResource(account, soon)
+	if err != nil {
+		return ResourceSnapshot{}, err
+	}
+
+	return ResourceSnapshot{Remain: remain, Total: total, Expiring: expiring, Buckets: totals.bucketList()}, nil
+}
+
+// personalResource 个人号余额查询主体：返回汇总与含日桶的累加器。
+func (c *Client) personalResource(account *auth.Auth, soon time.Duration) (int64, int64, int64, *resourceTotals, error) {
 	now := time.Now()
 	// 官方桌面端主路径：summary 汇总 remain/total；失败时回落旧 get-user-resource。
 	if summary, serr := c.fetchResourceSummary(account); serr == nil && len(summary.Packages) > 0 {
 		remain, total := summary.summaryTotals()
-		earliestAt, earliestRemaining, expiring := c.resourcePackageExpiry(account, now, soon)
+		expiring, totals := c.resourcePackages(account, now, soon)
 
-		return remain, total, expiring, earliestAt, earliestRemaining, nil
+		return remain, total, expiring, totals, nil
 	} else if serr != nil {
 		log.Printf("WARN: [upstream] resource summary failed: %v (fallback get-user-resource)", serr)
 	}
@@ -3832,7 +3878,7 @@ func (c *Client) UserResourceDetailedWithExpiry(
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
 	var data json.RawMessage
 
-	err = c.retryBillingTransient(func() error {
+	err := c.retryBillingTransient(func() error {
 		var e error
 
 		data, e = c.billingMeterJSON(account, c.billingMeterPaths(account), body)
@@ -3840,12 +3886,12 @@ func (c *Client) UserResourceDetailedWithExpiry(
 		return e
 	})
 	if err != nil {
-		return 0, 0, 0, time.Time{}, 0, err
+		return 0, 0, 0, nil, err
 	}
 
 	var resp resourceDetailedResp
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, nil, fmt.Errorf("resource parse: %w", err)
 	}
 
 	var totals resourceTotals
@@ -3853,7 +3899,7 @@ func (c *Client) UserResourceDetailedWithExpiry(
 		totals.add(&resp.Response.Data.Accounts[i], now, soon)
 	}
 
-	return totals.remain, totals.total, totals.expiring, totals.earliestAt, totals.earliestRemaining, nil
+	return totals.remain, totals.total, totals.expiring, &totals, nil
 }
 
 // resourceDetailedResp get-user-resource 响应信封。
@@ -3887,11 +3933,33 @@ type resourceAccount struct {
 	CycleCapacityUsedPrecise   string             `json:"CycleCapacityUsedPrecise"`
 }
 
+// ExpiryBucket 一个自然日（上游 CST 墙钟）的到期批次：同日多包合并。
+// Date 是「YYYY-MM-DD」形态（与前端 expBatches 同口径，按日聚合）；
+// ExpireAt 是该日最早到期时刻（展示/排序用，跨日聚合时不为零值）；
+// Remain 是该日全部正余额包的剩余积分之和。
+type ExpiryBucket struct {
+	Date     string    `json:"date"`
+	ExpireAt time.Time `json:"expire_at,omitzero"`
+	Remain   int64     `json:"remain"`
+}
+
+// ResourceSnapshot 一次余额查询的完整快照：汇总 + 逐日到期批次。
+// 快照与「检查」（面板 packages 明细）同口径——两路都按自然日聚合，
+// 避免「快照只显示最早一批、检查能显示全部批次」的口径分裂。
+type ResourceSnapshot struct {
+	Remain   int64          `json:"remain"`
+	Total    int64          `json:"total"`
+	Expiring int64          `json:"expiring"`
+	Buckets  []ExpiryBucket `json:"buckets,omitempty"`
+}
+
 // resourceTotals 个人资源聚合累加器。
 type resourceTotals struct {
 	remain, total, expiring int64
 	earliestAt              time.Time
 	earliestRemaining       int64
+	// buckets 按自然日聚合的到期批次（date → 批次）；nil 表示尚无批次。
+	buckets map[string]*ExpiryBucket
 }
 
 // add 累加单个套餐的余额与到期批次（余额钳非负、size 不高于 remain）。
@@ -3968,6 +4036,55 @@ func (t *resourceTotals) addExpiry(end time.Time, r int64, now time.Time, soon t
 	if soon > 0 && !end.After(now.Add(soon)) {
 		t.expiring += r
 	}
+
+	t.addBucket(end, r)
+}
+
+// expiryBucketDate 到期时刻所属的自然日（上游 CST 墙钟），口径与面板「检查」
+// （expBatches 按 expire_at 的日期聚合）一致。
+func expiryBucketDate(end time.Time) string {
+	return end.In(softRateResetLoc).Format("2006-01-02")
+}
+
+// addBucket 把一笔到期额度累加进所属自然日的批次（同日取最早到期时刻）。
+func (t *resourceTotals) addBucket(end time.Time, r int64) {
+	if r <= 0 || end.IsZero() {
+		return
+	}
+
+	date := expiryBucketDate(end)
+
+	if t.buckets == nil {
+		t.buckets = make(map[string]*ExpiryBucket, 2)
+	}
+
+	if bucket := t.buckets[date]; bucket != nil {
+		bucket.Remain += r
+
+		if end.Before(bucket.ExpireAt) {
+			bucket.ExpireAt = end
+		}
+
+		return
+	}
+
+	t.buckets[date] = &ExpiryBucket{Date: date, ExpireAt: end, Remain: r}
+}
+
+// bucketList 返回按日期升序的批次快照（nil = 无批次）。
+func (t *resourceTotals) bucketList() []ExpiryBucket {
+	if len(t.buckets) == 0 {
+		return nil
+	}
+
+	out := make([]ExpiryBucket, 0, len(t.buckets))
+	for _, bucket := range t.buckets {
+		out = append(out, *bucket)
+	}
+
+	sort.Slice(out, func(i, j int) bool { return out[i].Date < out[j].Date })
+
+	return out
 }
 
 // respAccount 供 packageRemainUsed 解析的套餐字段（CreditPackages 的逐包结构同构）。

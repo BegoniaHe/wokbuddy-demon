@@ -191,6 +191,7 @@ func buildEntryFromState(uid string, stateAccount2 *stateAccount, now time.Time)
 		creditsExpiring:          stateAccount2.CreditsExpiring,
 		creditsEarliestExpiry:    stateAccount2.CreditsEarliestExpiry,
 		creditsEarliestRemaining: stateAccount2.CreditsEarliestRemaining,
+		creditsExpiryBuckets:     stateAccount2.CreditsExpiryBuckets,
 		disabled:                 stateAccount2.Disabled,
 		paused:                   stateAccount2.Paused,
 		reason:                   stateAccount2.Reason,
@@ -425,6 +426,7 @@ func buildStateAccount(entry5 *entry, now time.Time) stateAccount {
 		CreditsExpiring:          entry5.creditsExpiring,
 		CreditsEarliestExpiry:    entry5.creditsEarliestExpiry,
 		CreditsEarliestRemaining: entry5.creditsEarliestRemaining,
+		CreditsExpiryBuckets:     entry5.creditsExpiryBuckets,
 	}
 	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 	if !entry5.breakerUntil.IsZero() && now.Before(entry5.breakerUntil) {

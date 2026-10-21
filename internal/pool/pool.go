@@ -65,6 +65,10 @@ type Pool struct {
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// balanceRefreshSec / balanceRefreshedAt 余额后台刷新的周期与最近一次完成时刻，
+	// 由 scheduler 每轮写入，供面板展示「数据新鲜度」（issue #200）。0 = 未刷新过。
+	balanceRefreshSec  int64
+	balanceRefreshedAt time.Time
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
@@ -231,6 +235,24 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
 	}
+}
+
+// SetBalanceRefreshMeta 记录余额后台刷新的周期与最近一次完成时刻（scheduler 每轮
+// 调用），供面板展示数据年龄；sec<=0 表示当前未启用周期刷新。
+func (p *Pool) SetBalanceRefreshMeta(sec int64, at time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.balanceRefreshSec = sec
+	p.balanceRefreshedAt = at
+}
+
+// BalanceRefreshMeta 返回余额刷新周期（秒）与最近一次完成时刻（零值 = 尚未刷新）。
+func (p *Pool) BalanceRefreshMeta() (int64, time.Time) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.balanceRefreshSec, p.balanceRefreshedAt
 }
 
 // SetPreferExpiring 注入最早到期优先路由开关（main 从 config 解析后调用）。
