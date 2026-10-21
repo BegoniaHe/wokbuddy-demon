@@ -11,12 +11,26 @@ upstream:
   branch: main
 
 last_synced:
-  commit: 6b31db6d045e985042620c819c3a938002e7b0b1
-  synced_at_utc: 2026-10-16T00:00:00Z
+  commit: 73a7560efc7a88ebd9865db4c71ae7f6d85859f8
+  synced_at_utc: 2026-10-21T14:59:01Z
   sync_method: adapt
-  source_pr: "152"
+  source_pr: "213"
+  range:
+    from: 6b31db6d045e985042620c819c3a938002e7b0b1
+    to: 73a7560efc7a88ebd9865db4c71ae7f6d85859f8
+    commits_total: 60
+    commits_with_content: 35
+    merge_bubbles: 25
+  dispositions:
+    adapt: 29
+    skip: 5
+    revisit: 1
+    merge_bubble: 25
   note: >-
-    前序 fork main 末次提交（Merge PR #152，fix(panel): 积分到期提醒卡片默认可见），
-    即本仓库重建快照所对应的上游状态。此后前序 fork 停更；本仓库自该基线起独立演进
-    （Go module path 改为 github.com/BegoniaHe/wokbuddy-demon、golangci-lint v2 严格
-    规则集、gofumpt + gci、面板/任务体系维护）。默认吸收方式为 adapt。
+    区间 6b31db6..73a7560 全部 60 条提交已逐条落账（见 upstream-decisions.jsonl）：
+    adapt 29 条分 24 个工作 Issue（#182–#205）实现并各自开 PR；skip 5 条
+    （dea68c4 空提交 / d809396 本 fork 不持有的字面量 bug / 241913d 空提交 /
+    505d5d7 环境代理与显式代理池双叠加且削弱 SSRF 边界 / 73a7560 上游停止维护声明）；
+    revisit 1 条（a48d4e4 手机端适配：抽屉与宽表卡片化已由本 fork 既有设计覆盖，
+    仅取窄屏时序图一项 → #202）。上游 head 已附「停止维护声明」，本区间之后
+    预期为空操作。游标推进本身是独立的 chore(sync) 元数据提交，不含实现改动。
