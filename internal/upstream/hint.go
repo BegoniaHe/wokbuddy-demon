@@ -57,6 +57,9 @@ var gatewayHintByKind = map[ErrKind]string{
 	// （等待窗口过去再试，换号/立刻重试无意义）。
 	ErrWafBlock: "upstream WAF blocked the gateway; retry after the block window",
 	ErrSoftRate: "rate limited by upstream; retry after reset",
+	// 队列满载是渠道级容量事件：不是账号问题，换号撞同一堵墙，只应退避重试。
+	ErrQueueFull: "upstream inference queue is full (channel-level capacity, not an account problem); " +
+		"switching accounts will not help, retry with backoff",
 	ErrAccountFault: "account-level fault at upstream (auth/quota state); " +
 		"the gateway will rotate or disable this account",
 	ErrSessionDead: "account session expired at upstream; the account is disabled until re-login",

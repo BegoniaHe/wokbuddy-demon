@@ -834,12 +834,24 @@ func QueueCode(body string) string {
 	return ""
 }
 
+// queueFullTextMarkers 队列满载的**文案**形态（上游实测 `msg:"queue.full.title"`）。
+// 结构化 code 是主判据；本表只兜「上游换状态码或丢 code」的外卡：渠道级容量事件
+// 一旦落到 ErrSoftRate，applyErrorPolicy 会逐号 CooldownSoftRate + 轮转，把一次
+// 集群排队放大成整池软冷却（2026-10-15 上游事故形态）。只收 queue.full 的连写
+// 形态，普通 429（"too many requests"）不受影响。
+var queueFullTextMarkers = []string{"queue.full", "queue full"}
+
 // classifyQueueOrQuota 识别官方客户端的队列/额度/认证业务码。
 func classifyQueueOrQuota(body string) (ErrKind, bool) {
 	switch QueueCode(body) {
 	case queueWaitingCode:
 		return ErrQueueWaiting, true
 	case queueFullCode, queueUserCode:
+		return ErrQueueFull, true
+	}
+
+	// 无结构化码时的文案外卡（状态码无关）：渠道级满载不得落 ErrSoftRate 逐号冷却。
+	if containsAnyDual(strings.ToLower(body), body, queueFullTextMarkers) {
 		return ErrQueueFull, true
 	}
 
@@ -863,10 +875,8 @@ func classifyQueueOrQuota(body string) (ErrKind, bool) {
 		return ErrAccountFault, true
 	}
 
-	for _, code := range hardCreditCodes {
-		if hasBusinessCode(body, code) {
-			return ErrHardCredit, true
-		}
+	if hasAnyBusinessCode(body, hardCreditCodes...) {
+		return ErrHardCredit, true
 	}
 
 	return ErrNone, false

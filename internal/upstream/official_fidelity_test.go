@@ -212,6 +212,34 @@ func TestClassifyQueueAndQuotaCodes(t *testing.T) {
 	}
 }
 
+// TestClassifyQueueFullTextFallback 队列满载的文案外卡：上游换状态码或丢 code 时
+// 仍须归 ErrQueueFull（渠道级容量），不得落 ErrSoftRate 逐号软冷却。
+func TestClassifyQueueFullTextFallback(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		status int
+		body   string
+		want   ErrKind
+	}{
+		// 结构化码优先，状态码无关。
+		{http.StatusTooManyRequests, `{"code":6021,"msg":"queue.full.title"}`, ErrQueueFull},
+		{http.StatusInternalServerError, `{"code":6021,"msg":"queue.full.title"}`, ErrQueueFull},
+		// 只有文案：queue.full 连写两种形态。
+		{http.StatusTooManyRequests, `{"msg":"queue.full.title"}`, ErrQueueFull},
+		{http.StatusServiceUnavailable, `{"msg":"Queue Full"}`, ErrQueueFull},
+		// 防过宽：普通 429 与普通 5xx 不得被外卡吞掉。
+		{http.StatusTooManyRequests, `{"code":1,"msg":"too many requests"}`, ErrSoftRate},
+		{http.StatusInternalServerError, `{"msg":"internal error"}`, ErrServer},
+	}
+
+	for _, testCase := range cases {
+		if got := Classify(testCase.status, testCase.body); got != testCase.want {
+			t.Errorf("Classify(%d,%s)=%v want %v", testCase.status, testCase.body, got, testCase.want)
+		}
+	}
+}
+
 // TestCheckinBusinessCodes 1001/1002/1003 分类。
 func TestCheckinBusinessCodes(t *testing.T) {
 	t.Parallel()
