@@ -461,6 +461,8 @@ gemini
 | `pricing.exchange_rate` | `1` | 展示币种换算系数（1 = USD） |
 | `pool.max_in_flight_total` | `0` | 网关级全局在途上限；满额新请求返回 503 且不选号；`0` = 不限。热生效 |
 | `pool.credit_floor` | `0`（示例 `100`） | 积分保底：余额低于该值不再参与收费模型轮换；`0` = 关闭 |
+| `pool.strategy.cn` / `pool.strategy.global` | `weighted_random` | 按域选号策略：`weighted_random`（默认，加权随机）/ `round_robin`（严格轮转）/ `sequential_exhaust`（用完一个号再下一个）。**有序策略会关闭全冷却兜底与防撞号窗口**；游标按 (域, 模型) 持久化，切换策略清空该域游标。热生效 |
+| `pool.account_order.cn` / `pool.account_order.global` | `[]` | 有序策略的固定账号顺序（uid 数组）；未列出/异域 uid 自动跳过，其余按 uid 升序追加在后。热生效 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
@@ -618,3 +620,13 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 - 允许任意使用、复制、修改、合并、发布、分发、再授权及销售
 - 再分发时请保留原仓库的 MIT 版权声明与许可声明
 - 本项目不授予任何 CodeBuddy / 腾讯接口或服务的权利；使用者仍需自行遵守其服务条款
+
+### 选号策略（按域）
+
+默认 `weighted_random`（加权随机，含成本分层 / 快过期虚拟权重 / Top5 抽签），也可按域切换：
+
+- `round_robin`：按 `pool.account_order.<realm>` 顺序**严格轮转**（每次选中后游标前进一位）；
+- `sequential_exhaust`：按顺序**用完一个号再下一个**（游标钉在当前号，只有该号不可服务时才顺延）；
+- 有序策略会**关闭全冷却兜底与防撞号窗口**：语义就是「明确地用下一个号」，兜底抽号会破坏它；
+- 游标按 `(域, 模型)` 持久化在 `state.json`（跨重启保留顺序耗尽进度），**切换策略会清空该域游标**；
+- 有序策略下会话粘性只复用既有绑定（不做哈希分配），避免绕过账号顺序。

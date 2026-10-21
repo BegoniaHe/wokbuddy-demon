@@ -35,6 +35,13 @@ import {
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 
+// 按域选号策略（issue #205）。
+const STRATEGY_OPTIONS = [
+  { value: 'weighted_random', label: 'weighted_random — 加权随机（默认）' },
+  { value: 'round_robin', label: 'round_robin — 按顺序轮转' },
+  { value: 'sequential_exhaust', label: 'sequential_exhaust — 用完一个号再下一个' },
+] as const satisfies readonly SelectOption[];
+
 // 系统提示词注入模式。
 const PROMPT_MODE_OPTIONS = [
   { value: 'custom', label: 'custom — 网关自有提示词（避免指纹误报）' },
@@ -378,6 +385,36 @@ export function ConfigView() {
               <FieldLabel>会话粘性 TTL</FieldLabel>
               {text('ttl', { placeholder: '30m' })}
               <FieldDescription>改动需重启进程</FieldDescription>
+            </Field>
+          </div>
+          <Separator className="my-4" />
+          <div className="grid gap-x-5 md:grid-cols-2">
+            {(['cn', 'global'] as const).map((realm) => (
+              <Field key={realm}>
+                <FieldLabel>{realm === 'cn' ? '国内版' : '国际版'}选号策略</FieldLabel>
+                <Select
+                  items={selectOptionItems(STRATEGY_OPTIONS)}
+                  value={String(values['strategy_' + realm] ?? 'weighted_random')}
+                  onValueChange={(v) => set('strategy_' + realm, v ?? 'weighted_random')}>
+                  <SelectTrigger aria-label={realm + ' 选号策略'}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectOptions options={STRATEGY_OPTIONS} />
+                  </SelectContent>
+                </Select>
+                <FieldDescription>有序策略会关闭全冷却兜底与防撞号窗口；热生效</FieldDescription>
+              </Field>
+            ))}
+            <Field>
+              <FieldLabel>国内版账号顺序（uid，逗号分隔）</FieldLabel>
+              {text('account_order_cn', { placeholder: '留空 = 按 uid 升序' })}
+              <FieldDescription>仅对有序策略生效；热生效</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国际版账号顺序（uid，逗号分隔）</FieldLabel>
+              {text('account_order_global', { placeholder: '留空 = 按 uid 升序' })}
+              <FieldDescription>仅对有序策略生效；热生效</FieldDescription>
             </Field>
           </div>
           {check('prefer_expiring', '快过期积分优先')}

@@ -1390,9 +1390,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
 		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
 		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
-		if uid, ok := h.cfg.Session.ResolveForModel(chatFlow2.sessKey, chatFlow2.realm+":"+chatFlow2.bareModel); ok {
-			chatFlow2.stickyUID = uid
-		}
+		chatFlow2.stickyUID = h.resolveStickyForStrategy(chatFlow2)
 	}
 
 	// 轮级聚合键：按 body 里最后一条 user 消息派生。必须在 prompt.Rewrite 之前取
@@ -1715,6 +1713,28 @@ func (f *chatFlow) degradeSticky() string {
 	return uid
 }
 
+// resolveStickyForStrategy 按当前选号策略解析会话粘性绑定：
+//   - 有序策略（round_robin / sequential_exhaust）：只复用**既有**绑定——哈希分配会绕过
+//     账号顺序（issue #205），未命中就交回选号策略决定；
+//   - 加权随机（默认）：沿用既有 ResolveForModel（含慢路径哈希分配，零回归）。
+func (h *Handler) resolveStickyForStrategy(flow *chatFlow) string {
+	model := flow.realm + ":" + flow.bareModel
+
+	if h.cfg.Pool != nil && h.cfg.Pool.StrategyForRealm(flow.realm) != "weighted_random" {
+		if uid, ok := h.cfg.Session.ResolveExisting(flow.sessKey, model); ok {
+			return uid
+		}
+
+		return ""
+	}
+
+	if uid, ok := h.cfg.Session.ResolveForModel(flow.sessKey, model); ok {
+		return uid
+	}
+
+	return ""
+}
+
 // pickAccount 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），
 // 否则普通轮换（模型感知 + realm 感知：模型非空时启用 6004 模型级冷却豁免）。
 func (f *chatFlow) pickAccount() *auth.Auth {
@@ -1804,6 +1824,8 @@ func (h *Handler) sampleDecisionTrace() *reqlog.DecisionTrace {
 }
 
 // mergePickTrace 把 pool 决策快照并入请求级决策链（Top 覆盖为最近一次尝试）。
+//
+//nolint:gocritic // PickTrace 值传递保持既有调用点简单（新增 Strategy 字段后触发的 hugeParam 提示）。
 func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	dst.Candidates += src.Candidates
 	if dst.Excluded == nil {

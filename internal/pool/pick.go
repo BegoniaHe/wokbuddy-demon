@@ -56,6 +56,8 @@ type PickTrace struct {
 	Explored   bool            `json:"explored,omitempty"`
 	Top        []PickCandidate `json:"top,omitempty"`
 	FinalUID   string          `json:"final_uid,omitempty"`
+	// Strategy 生效的选号策略（weighted_random 时为空省略；有序策略便于排障）。
+	Strategy string `json:"strategy,omitempty"`
 }
 
 // PickCandidate Top-N 候选的权重快照（uid8 + 权重 + 成本层）。
@@ -89,6 +91,19 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	if p.routeCoolingLocked(realm, reqModel, now) {
 		trace.addExcluded("route_cooldown")
 		return nil
+	}
+
+	// 有序策略（round_robin / sequential_exhaust）：按账号顺序选号，**旁路**加权随机、
+	// 防撞号窗口与全冷却兜底（语义：用完一个再下一个，兜底抽号会破坏该语义）。
+	if strategy := p.strategyForLocked(realm); strategy != StrategyWeightedRandom {
+		trace.Strategy = string(strategy)
+
+		entry2 := p.pickOrderedLocked(tried, reqModel, realm, now, trace, strategy)
+		if entry2 == nil {
+			return nil
+		}
+
+		return entry2.a
 	}
 
 	cands := p.pickCandidates(tried, reqModel, realm, now, trace)

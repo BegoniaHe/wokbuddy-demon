@@ -65,6 +65,12 @@ type Pool struct {
 	// 加权路由的闲置补偿调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
+	// schedulingStrategy / schedulingOrder / schedulingCursors 按域的选号策略、
+	// 账号顺序与 (realm, model) 游标（issue #205）。策略缺省 weighted_random
+	// （现状零回归）；游标持久化在 state.json，切换策略时按域清空。
+	schedulingStrategy map[string]Strategy
+	schedulingOrder    map[string][]string
+	schedulingCursors  map[string]int
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
@@ -127,6 +133,9 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		preferExpiring:     true,
+		schedulingStrategy: map[string]Strategy{},
+		schedulingOrder:    map[string][]string{},
+		schedulingCursors:  map[string]int{},
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,

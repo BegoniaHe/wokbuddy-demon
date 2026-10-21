@@ -5,6 +5,7 @@ package pool
 import (
 	"encoding/json"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
 	"time"
@@ -158,12 +159,33 @@ func (p *Pool) load() {
 		return
 	}
 
-	var sf stateFile
-	if json.Unmarshal(raw, &sf) != nil {
+	var state stateFile
+	if json.Unmarshal(raw, &state) != nil {
 		return
 	}
 
-	p.applyAccountsLocked(sf.Accounts)
+	p.applyAccountsLocked(state.Accounts)
+	p.applySchedulingCursorsLocked(state.SchedulingCursors)
+}
+
+// applySchedulingCursorsLocked 恢复有序策略游标（缺失/损坏视为无游标）。
+// 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
+func (p *Pool) applySchedulingCursorsLocked(cursors map[string]int) {
+	if len(cursors) == 0 {
+		return
+	}
+
+	if p.schedulingCursors == nil {
+		p.schedulingCursors = map[string]int{}
+	}
+
+	for key, pos := range cursors {
+		if key == "" || pos < 0 {
+			continue
+		}
+
+		p.schedulingCursors[key] = pos
+	}
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -308,6 +330,8 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
 	p.applyAccountsLocked(s.Accounts)
+	// 有序策略游标同样随快照恢复（本地与 Redis 两路一致）。
+	p.applySchedulingCursorsLocked(s.SchedulingCursors)
 }
 
 // snapshotStateLocked 生成一份带单调序号的一致快照；调用方必须已持有 p.mu。
@@ -393,12 +417,17 @@ func (p *Pool) notePersistFail(err error) {
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := p.now()
 
-	sf := stateFile{Accounts: map[string]stateAccount{}}
+	state := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
-		sf.Accounts[uid] = buildStateAccount(e, now)
+		state.Accounts[uid] = buildStateAccount(e, now)
 	}
 
-	return sf
+	if len(p.schedulingCursors) > 0 {
+		state.SchedulingCursors = make(map[string]int, len(p.schedulingCursors))
+		maps.Copy(state.SchedulingCursors, p.schedulingCursors)
+	}
+
+	return state
 }
 
 // buildStateAccount 把运行态 entry 序列化为持久化 stateAccount，并按当前时刻惰性过滤
