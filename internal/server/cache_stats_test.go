@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 func feedStatsLines(s *chatStatsReader, lines ...string) {
@@ -91,4 +93,113 @@ func TestCacheMissSignal(t *testing.T) {
 	cacheMissWarn.noteCacheTokens("glm-5.3", 500, 0, 500)
 	// miss 缺失（上游只回 hit=0、无 miss、无 prompt）不触发。
 	cacheMissWarn.noteCacheTokens("glm-5.3", 0, 0, 0)
+}
+
+// TestCacheTokensSymmetricHitDerivation 缓存命中的**对称反推**（上游同步窗口 issue #186）：
+// 上游「接近全命中」时可能只回显式 miss、把 hit 置 0 或留空。单向推导会把这种形态
+// 判成缓存完全失效，刷出假阳性 WARN 并污染面板缓存指标。
+func TestCacheTokensSymmetricHitDerivation(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		line string
+		hit  int64
+		miss int64
+		ok   bool
+	}{
+		{
+			name: "hit=0+miss=3+prompt=50000 反推 hit",
+			line: `data: {"usage":{"prompt_tokens":50000,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":3}}`,
+			hit:  49997, miss: 3, ok: true,
+		},
+		{
+			name: "hit 缺失 + miss 显式",
+			line: `data: {"usage":{"prompt_tokens":50000,"prompt_cache_miss_tokens":3}}`,
+			hit:  49997, miss: 3, ok: true,
+		},
+		{
+			name: "prompt<=miss 不自造命中",
+			line: `data: {"usage":{"prompt_tokens":3,"prompt_cache_miss_tokens":3}}`,
+			hit:  0, miss: 3, ok: true,
+		},
+		{
+			name: "真整段未命中保持 hit=0",
+			line: `data: {"usage":{"prompt_tokens":50000,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":50000}}`,
+			hit:  0, miss: 50000, ok: true,
+		},
+		{
+			name: "两侧都缺 → 不可得",
+			line: `data: {"usage":{"prompt_tokens":50000}}`,
+			hit:  0, miss: 0, ok: false,
+		},
+		{
+			// 反推只接受「正的显式 miss」：两侧都显式 0 时没有任何命中证据，
+			// 反推会凭空造出 100% 命中（命中率统计被污染成反向假阳性）。
+			name: "两侧显式 0 不反推命中",
+			line: `data: {"usage":{"prompt_tokens":50000,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":0}}`,
+			hit:  0, miss: 0, ok: true,
+		},
+		{
+			name: "hit 缺失且无 miss（只有 prompt）不反推命中",
+			line: `data: {"usage":{"prompt_tokens":50000,"prompt_cache_hit_tokens":0}}`,
+			hit:  0, miss: 50000, ok: true,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := newChatStatsReaderSince(strings.NewReader(""), time.Now())
+			feedStatsLines(s, testCase.line)
+
+			hit, miss, ok := s.CacheTokens()
+			if ok != testCase.ok || hit != testCase.hit || miss != testCase.miss {
+				t.Fatalf("hit=%d miss=%d ok=%v, want %d/%d/%v", hit, miss, ok, testCase.hit, testCase.miss, testCase.ok)
+			}
+		})
+	}
+}
+
+// TestCacheTokensFromUsageMap 非流式路径与流式同口径：聚合响应 usage 走同一套
+// 对称推导（修复前只取 hit 侧，miss 显式存在时被丢弃）。
+func TestCacheTokensFromUsageMap(t *testing.T) {
+	t.Parallel()
+
+	usage := map[string]any{"prompt_tokens": float64(50000), "prompt_cache_miss_tokens": float64(3)}
+	hit, hasHit := upstream.UsageCacheHitTokens(usage)
+	miss, hasMiss := upstream.UsageCacheMissTokens(usage)
+	prompt, hasPrompt := upstream.UsagePromptTokens(usage)
+
+	hitInt, missInt, ok := cacheTokensFromUsage(cacheTokenTriple{
+		prompt:    int64(prompt),
+		hit:       int64(hit),
+		miss:      int64(miss),
+		hasPrompt: hasPrompt,
+		hasHit:    hasHit,
+		hasMiss:   hasMiss,
+	})
+	if !ok || hitInt != 49997 || missInt != 3 {
+		t.Fatalf("map 反推 hit=%d miss=%d ok=%v, want 49997/3/true", hitInt, missInt, ok)
+	}
+}
+
+// TestCacheMissWarnSkipsExplicitZero 两侧显式 0（hit=0/miss=0）没有未命中证据：
+// 即使该模型此前命中过也不能触发「整段重算」WARN（对称反推的配套防假阳性）。
+func TestCacheMissWarnSkipsExplicitZero(t *testing.T) {
+	t.Parallel()
+
+	const model = "explicit-zero-cache-model"
+
+	cacheMissWarn.noteCacheTokens(model, 5000, 100, 0) // 先建立「可命中」基线
+	cacheMissWarn.noteCacheTokens(model, 5000, 0, 0)   // 两侧显式 0：不应告警
+
+	cacheMissWarn.mu.Lock()
+	_, warned := cacheMissWarn.last[model]
+	cacheMissWarn.mu.Unlock()
+
+	if warned {
+		t.Fatal("两侧显式 0 不应触发缓存未命中 WARN")
+	}
 }

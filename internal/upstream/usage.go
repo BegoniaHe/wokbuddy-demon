@@ -136,6 +136,23 @@ func UsageCacheMissTokens(usage map[string]any) (float64, bool) {
 	return 0, false
 }
 
+// UsagePromptTokens 返回 usage 里的 prompt token 总数（多别名取首个可用值）。
+// 供网关统计层做缓存命中的**对称推导**：上游有时只回显式 miss、把 hit 留空/置 0，
+// 此时需要 prompt 总数才能反推 hit。
+func UsagePromptTokens(usage map[string]any) (float64, bool) {
+	if usage == nil {
+		return 0, false
+	}
+
+	for _, key := range []string{"prompt_tokens", "input_tokens"} {
+		if value, ok := usageNumber(usage, key); ok {
+			return value, true
+		}
+	}
+
+	return 0, false
+}
+
 // usageNumber 从 usage 顶层取数值字段（JSON 数字可能是 float64 / json.Number 形态）。
 func usageNumber(usage map[string]any, key string) (float64, bool) {
 	v, ok := usage[key]

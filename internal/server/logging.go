@@ -391,25 +391,67 @@ func (s *chatStatsReader) applyUsage(sseUsageFrame2 *sseUsageFrame) {
 	}
 }
 
-// CacheTokens 返回末帧 usage 的缓存命中 / 未命中 token 数。miss 缺失时按
-// prompt - hit 推导；hit 与 miss 均不可得时 ok=false（不参与命中率统计）。
-func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
-	if !s.hasCacheHit {
+// cacheTokenTriple 缓存三维观测（prompt / hit / miss）与各自的「是否有值」标记。
+// 流式从末帧 SSE usage 填，非流式从聚合响应 usage 填，之后共用同一套推导。
+type cacheTokenTriple struct {
+	prompt, hit, miss          int64
+	hasPrompt, hasHit, hasMiss bool
+}
+
+// cacheTokensFromUsage 由三维观测推导 (hit, miss)：两侧都缺失 → ok=false
+// （不参与命中率统计，不臆造）；其余按 resolveCacheMiss / resolveCacheHit 的口径。
+func cacheTokensFromUsage(t cacheTokenTriple) (hit, miss int64, ok bool) {
+	if !t.hasHit && !t.hasMiss {
 		return 0, 0, false
 	}
 
-	hit = int64(s.cacheHit)
+	return resolveCacheHit(t), resolveCacheMiss(t), true
+}
 
-	miss = int64(s.cacheMiss)
-	if !s.hasCacheMiss {
-		if !s.hasPromptTokens || s.promptTokens < s.cacheHit {
-			return hit, 0, true
-		}
-
-		miss = int64(s.promptTokens - s.cacheHit)
+// resolveCacheMiss 未命中 token：上游显式值优先，缺失时按 prompt - hit 推导。
+func resolveCacheMiss(t cacheTokenTriple) int64 {
+	if t.hasMiss {
+		return t.miss
 	}
 
-	return hit, miss, true
+	if t.hasPrompt && t.prompt >= t.hit {
+		return t.prompt - t.hit
+	}
+
+	return 0
+}
+
+// resolveCacheHit 命中 token：显式值优先；显式值为 0 或缺失、且上游给了**正的**
+// 显式 miss 时按 prompt - miss **对称反推**——上游「接近全命中」时可能只回显式
+// miss、把 hit 置 0 或留空，单向推导会把它误判成缓存完全失效（假阳性 WARN）。
+//
+// 反推的两个前提缺一不可：
+//   - miss 必须是显式且 > 0：两侧都显式给 0（或无 miss 只有 prompt）时没有任何
+//     「命中」证据，反推会凭空造出 100% 命中（与「不臆造」的设计目标相反）；
+//   - prompt > miss：自造命中的代价比「不可得」更大，保持 0。
+func resolveCacheHit(t cacheTokenTriple) int64 {
+	if t.hasHit && t.hit > 0 {
+		return t.hit
+	}
+
+	if t.hasMiss && t.miss > 0 && t.hasPrompt && t.prompt > t.miss {
+		return t.prompt - t.miss
+	}
+
+	return 0
+}
+
+// CacheTokens 返回末帧 usage 的缓存命中 / 未命中 token 数，推导口径见
+// cacheTokensFromUsage。
+func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
+	return cacheTokensFromUsage(cacheTokenTriple{
+		prompt:    int64(s.promptTokens),
+		hit:       int64(s.cacheHit),
+		miss:      int64(s.cacheMiss),
+		hasPrompt: s.hasPromptTokens,
+		hasHit:    s.hasCacheHit,
+		hasMiss:   s.hasCacheMiss,
+	})
 }
 
 // SawErrorFrame 报告流中是否透传过 SSE error 帧。
@@ -848,6 +890,10 @@ var cacheMissWarnEvery = 10 * time.Minute
 
 // noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；整段未命中且此前
 // 命中过 → 触发 WARN（冷却内不重复）。
+//
+// 入参是已推导后的三维值（见 cacheTokensFromUsage）：上游未回 miss 时调用方已按
+// prompt 反推为未命中，所以这里 miss<=0 只可能是「上游显式回 0」。两侧都显式 0 时
+// 没有任何命中/未命中证据，不能按整段重算告警（否则对称反推修完仍会刷假阳性）。
 func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64) {
 	if model == "" {
 		return
@@ -860,14 +906,10 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 		c.everHit[model] = true
 		return
 	}
-	// hit==0 才可能是整段重算。小前缀（<1000 tok）的 miss 无告警价值；上游未回
-	// miss 字段时按 prompt 全量视为未命中。
-	if prompt < 1000 {
+	// hit==0 才可能是整段重算。小前缀（<1000 tok）无告警价值；miss<=0 是显式 0
+	// （无证据），同样跳过。
+	if prompt < 1000 || miss <= 0 {
 		return
-	}
-
-	if miss <= 0 {
-		miss = prompt
 	}
 
 	if !c.everHit[model] {
