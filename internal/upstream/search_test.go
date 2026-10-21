@@ -122,6 +122,24 @@ func TestSearchBusinessCodeError(t *testing.T) {
 	}
 }
 
+// TestSearchBusinessCodeClassifiedFromBody 2xx + 业务码必须按完整 body 分类：
+// 15001（搜索额度耗尽）只在 code 字段里，只传 msg 会误降级成 ErrClient，
+// 让账号逃过软限流、把额度耗尽的号反复选中。
+func TestSearchBusinessCodeClassifiedFromBody(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":15001,"msg":"search quota exhausted"}`), nil
+	})
+
+	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{})
+
+	var upErr *Error
+	if !asError(err, &upErr) || upErr.Kind != ErrSoftRate {
+		t.Fatalf("err=%v want ErrSoftRate（15001 账号级额度）", err)
+	}
+}
+
 // TestSearchHTTPErrorClassified 非 2xx 按既有 Classify 分类（不引入第二套判定）。
 func TestSearchHTTPErrorClassified(t *testing.T) {
 	t.Parallel()

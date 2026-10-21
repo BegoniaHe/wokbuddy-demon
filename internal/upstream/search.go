@@ -188,7 +188,9 @@ func (c *Client) doSearch(req *http.Request) (*SearchOutcome, error) {
 	}
 
 	if parsed.Code != 0 {
-		kind := Classify(resp.StatusCode, parsed.Msg)
+		// 用完整 body 分类：业务码（如 15001 搜索额度耗尽）只在 code 字段里，
+		// 只传 msg 会丢失分类信息，把它降级成通用 ErrClient。
+		kind := Classify(resp.StatusCode, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient
 		}
