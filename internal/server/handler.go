@@ -1218,8 +1218,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 // serveChat 运行一次请求的核心流水线（OpenAI 与 Anthropic 入站适配共用）。
-func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
-	chatFlow2 := h.newChatFlow(in, out)
+func (h *Handler) serveChat(r *http.Request, input *chatInput, out chatResponder) {
+	chatFlow2 := h.newChatFlow(input, out)
 	if chatFlow2.realmErr != nil {
 		chatFlow2.out.Error(http.StatusBadRequest, "realm_binding_conflict", chatFlow2.realmErr.Error(), "")
 		chatFlow2.st.status = http.StatusBadRequest
@@ -1244,6 +1244,9 @@ func (h *Handler) serveChat(r *http.Request, in *chatInput, out chatResponder) {
 	if !chatFlow2.checkModelAllowed() {
 		return
 	}
+	// 跨域回退授权（命名密钥按模型/域的白名单）同样按最终模型重算：改选后的模型
+	// 若不在另一域的白名单内，不能沿用原模型的授权跨域。
+	chatFlow2.crossRealm = h.crossRealmAllowed(input, chatFlow2.realm, chatFlow2.bareModel)
 	// ctx 显式传参（不入结构体）：取消/超时信号来自入站请求，传播到上游转发与轮转退避。
 	if chatFlow2.runRotation(r.Context()) {
 		return

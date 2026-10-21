@@ -345,3 +345,55 @@ func TestCrossDomainFallbackHonorsRealmScopedKeyWhitelist(t *testing.T) {
 		})
 	}
 }
+
+// TestCrossDomainFallbackRecomputesAuthorizationAfterModalityRoute 模态路由改写模型后，
+// 跨域回退授权必须按**最终模型**重算：原模型在另一域的白名单内，不代表改选后的
+// 模型也在，否则一次裸请求会借原模型的授权跨域。
+func TestCrossDomainFallbackRecomputesAuthorizationAfterModalityRoute(t *testing.T) {
+	t.Parallel()
+
+	fixture, client := newCrossDomainFixture(t, true, func(string) (int, string, bool) {
+		return http.StatusOK, sseOK, true
+	})
+	fixture.pool.SetCrossDomainFallback(true)
+
+	store := apikey.New("")
+
+	record, raw, err := store.Create("modality-key")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+
+	// 原模型 text-only 在 global 域白名单内（允许跨域），模态改选后的 vision 不在。
+	limits := apikey.Limits{RPM: 0, TPM: 0, MaxConcurrent: 0, Models: []string{"cn:*", "global:text-only"}}
+	if _, err := store.UpdateLimits(record.ID, limits); err != nil {
+		t.Fatalf("set limits: %v", err)
+	}
+
+	handler := NewHandler(&Config{
+		Pool:              fixture.pool,
+		Upstream:          client,
+		APIKey:            "secret",
+		Keys:              store,
+		MultimodalRouting: true,
+		modelsCache: modelCatalog([]upstream.ModelInfo{
+			{ID: "text-only", InputModalities: []string{"text"}},
+			{ID: "vision", InputModalities: []string{"text", "image"}},
+		}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(imageBody("text-only")))
+	req.Header.Set("Authorization", "Bearer "+raw)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("改选模型不在另一域白名单时不得跨域成功，code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if got := fixture.calls("Bearer at-global"); got != 0 {
+		t.Errorf("授权只覆盖原模型时不得用改选后的模型跨域，calls=%d", got)
+	}
+}
