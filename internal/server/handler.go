@@ -1889,7 +1889,10 @@ func (f *chatFlow) trySticky() (*auth.Auth, bool, string) {
 	acct, picked := f.h.cfg.Pool.PickByUIDForModel(f.stickyUID, f.bareModel, f.realm)
 	// 跨域回退开启时放宽域校验：粘性号属于「另一域」也可以继续用（该域正是
 	// 这次请求实际要用的域），由 noteServedRealm 切换生效域与记账口径。
-	if picked == pool.StickyPicked && acct != nil && (f.crossRealm || f.realm == "" || acct.Realm() == f.realm) {
+	// 但 11102 已跨域切过一次（realmSwitched）后必须锁定新域：否则旧域粘性号会
+	// 把请求拉回原域、对同一 11102 再打一次，违背「跨域仅一次」。
+	if picked == pool.StickyPicked && acct != nil &&
+		(f.realm == "" || acct.Realm() == f.realm || (f.crossRealm && !f.realmSwitched)) {
 		if f.st.decision != nil {
 			f.st.decision.StickyHit = true
 			f.st.decision.FinalUID = logfmt.UID8(acct.UID)

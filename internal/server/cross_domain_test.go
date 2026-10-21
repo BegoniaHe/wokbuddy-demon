@@ -9,10 +9,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -239,5 +241,50 @@ func TestCrossDomainFallbackModelNotFoundNoSameRealmRetry(t *testing.T) {
 
 	if cn, global := fixture.calls("Bearer at-cn"), fixture.calls("Bearer at-global"); cn != 1 || global != 0 {
 		t.Errorf("原域不得因跨域失败被重试，cn=%d global=%d", cn, global)
+	}
+}
+
+// TestTryStickyDoesNotRevertRealmAfterSwitch 11102 已跨域切到 global 后，旧域（cn）
+// 的会话粘性号不得把请求拉回 cn——否则会对同一 11102 再打一次，跨域重试失效。
+func TestTryStickyDoesNotRevertRealmAfterSwitch(t *testing.T) {
+	t.Parallel()
+
+	state := pool.New("")
+	state.Add(&auth.Auth{UID: "cn1", AccessToken: "at-cn", ExpiresAt: 9999999999})
+
+	global := &auth.Auth{UID: "g1", AccessToken: "at-global", ExpiresAt: 9999999999}
+	if _, err := auth.BackfillRealmFor(global, "global"); err != nil {
+		t.Fatalf("backfill realm: %v", err)
+	}
+
+	state.Add(global)
+
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     newBindStore(),
+		Available: func() []string { return []string{"cn1", "g1"} },
+	})
+	sess.Bind("conv-1", "cn1")
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) { return http.StatusOK, sseOK, true })
+	handler := NewHandler(&Config{Pool: state, Upstream: client, Session: sess})
+
+	flow := &chatFlow{
+		h:             handler,
+		sessKey:       "conv-1",
+		stickyUID:     "cn1",
+		bareModel:     "glm-5.2",
+		realm:         "global",
+		crossRealm:    true,
+		realmSwitched: true,
+		st:            &chatStat{},
+	}
+
+	if acct, ok, _ := flow.trySticky(); ok || acct != nil {
+		t.Fatalf("跨域切域后不得复用旧域粘性号，got %+v", acct)
+	}
+
+	if flow.realm != "global" {
+		t.Errorf("realm=%q want global（不得被旧域粘性拉回）", flow.realm)
 	}
 }
