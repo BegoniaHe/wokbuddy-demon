@@ -288,3 +288,60 @@ func TestTryStickyDoesNotRevertRealmAfterSwitch(t *testing.T) {
 		t.Errorf("realm=%q want global（不得被旧域粘性拉回）", flow.realm)
 	}
 }
+
+// TestCrossDomainFallbackHonorsRealmScopedKeyWhitelist 命名密钥的模型白名单若按域
+// 限定（如 cn:glm-*），跨域回退不得用另一域的服务绕过该授权；不带 realm 前缀的
+// 白名单匹配任意域，回退仍应生效。
+func TestCrossDomainFallbackHonorsRealmScopedKeyWhitelist(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		pattern   string
+		wantOK    bool
+		wantCalls int
+	}{
+		{"cn 限定的白名单不回退", "cn:glm-*", false, 0},
+		{"任意域白名单允许回退", "glm-*", true, 1},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture, client := newCrossDomainFixture(t, true, func(string) (int, string, bool) {
+				return http.StatusOK, sseOK, true
+			})
+			fixture.pool.SetCrossDomainFallback(true)
+
+			store := apikey.New("")
+
+			record, raw, err := store.Create("model-key")
+			if err != nil {
+				t.Fatalf("create key: %v", err)
+			}
+
+			limits := apikey.Limits{RPM: 0, TPM: 0, MaxConcurrent: 0, Models: []string{testCase.pattern}}
+			if _, err := store.UpdateLimits(record.ID, limits); err != nil {
+				t.Fatalf("set limits: %v", err)
+			}
+
+			handler := NewHandler(&Config{Pool: fixture.pool, Upstream: client, APIKey: "secret", Keys: store})
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+			req.Header.Set("Authorization", "Bearer "+raw)
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if got := fixture.calls("Bearer at-global"); got != testCase.wantCalls {
+				t.Errorf("global 调用次数=%d want %d", got, testCase.wantCalls)
+			}
+
+			if ok := rec.Code == http.StatusOK; ok != testCase.wantOK {
+				t.Fatalf("跨域回退结果=%v want %v，code=%d body=%s", ok, testCase.wantOK, rec.Code, rec.Body)
+			}
+		})
+	}
+}

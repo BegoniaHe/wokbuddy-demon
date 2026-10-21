@@ -1303,12 +1303,26 @@ func (h *Handler) realmExplicitFor(in *chatInput) bool {
 
 // crossRealmAllowed 报告本次请求是否允许跨域回退：开关开启**且**请求未显式指定域
 // （显式前缀 / 别名目标前缀 / 命名密钥绑定都算显式——否则出口约束会被绕过）。
-func (h *Handler) crossRealmAllowed(in *chatInput) bool {
-	if h.realmExplicitFor(in) {
+//
+// 命名密钥的模型白名单也可能按域限定（如 limit.models=["cn:glm-*"]）：这类白名单
+// 是运维侧的显式授权，跨域回退前必须确认另一域同样在白名单内，否则裸模型名会
+// 以一个域的白名单换来另一域的服务（realm 前缀授权被绕过）。
+func (h *Handler) crossRealmAllowed(input *chatInput, realm, bareModel string) bool {
+	if h.realmExplicitFor(input) {
 		return false
 	}
 
-	return h.cfg.Pool != nil && h.cfg.Pool.CrossDomainFallback()
+	if h.cfg.Pool == nil || !h.cfg.Pool.CrossDomainFallback() {
+		return false
+	}
+
+	if input.keyUsage != nil && h.cfg.Keys != nil {
+		if !h.cfg.Keys.ModelAllowed(input.keyUsage.id, otherRealm(realm)+":"+bareModel) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // requestModelAliases 合并上游目录别名与配置别名；配置别名优先（覆盖同名上游别名）。
@@ -1400,7 +1414,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
 		reqModalities:  reqMods,
 		bareModel:      bareModel,
-		crossRealm:     h.crossRealmAllowed(chatInput2),
+		crossRealm:     h.crossRealmAllowed(chatInput2, realm, bareModel),
 		modelRate:      modelRate,
 		st:             chatStat2,
 		keyUsage:       chatInput2.keyUsage,
