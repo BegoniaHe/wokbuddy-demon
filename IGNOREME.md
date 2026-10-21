@@ -450,6 +450,7 @@ gemini
 | `upstream.idle_timeout_seconds` | `1200` | 聊天 SSE 流中空闲上限（秒，对齐官方客户端）；活跃吐数据会续命；`0` = 默认 1200。`upstream.model_timeouts` 优先 |
 | `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
+| `cn.chat_base` | 空 | 国内版 upstream chat base 覆盖（如指向自建/自选入口）。空 = 默认 `https://www.workbuddy.cn`，并在首 token 前按 `408/502/503/504` 或传输错误回落 `copilot.tencent.com`、`wb.tencentbuddy.com`；**非空时只用该值、不回落**（与 `global.chat_base` 同语义）。改后需重启 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
 | `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |
 | `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |

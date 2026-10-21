@@ -490,6 +490,11 @@ export function ConfigView() {
               {text('global_billing_base', { placeholder: '留空 = 内置默认' })}
               <FieldDescription>需重启</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>国内版 Chat Base</FieldLabel>
+              {text('cn_chat_base', { placeholder: '留空 = 内置默认 + 回落链' })}
+              <FieldDescription>非空时只用该 base、不回落官方域；需重启</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">

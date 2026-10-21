@@ -210,6 +210,17 @@ type Config struct {
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
 
+	CN struct {
+		// ChatBase 国内版（cn realm）上游 chat base 覆盖；空 = 回落内置默认
+		// https://www.workbuddy.cn，并在首 token 前按 408/502/503/504 或传输错误
+		// 回落 copilot.tencent.com / wb.tencentbuddy.com（见 upstream.chatOrigins）。
+		//
+		// 显式设置时**只用**该 base、不做回落（与 global.chat_base 同语义）：
+		// 让 CN 域指向自建/自选入口时，回落到官方域会绕过该入口。
+		// 注意本 fork 的默认域已经是 workbuddy.cn 且自带回落链，常规部署无需设置。
+		ChatBase string `json:"chat_base"`
+	} `json:"cn"`
+
 	Upstream struct {
 		// TimeoutSeconds 短 RPC（refresh/checkin/balance/FetchModels）总时长上限，默认 120。
 		TimeoutSeconds int `json:"timeout_seconds"`
