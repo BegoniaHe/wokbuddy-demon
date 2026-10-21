@@ -286,7 +286,9 @@ export function LogsView() {
                 </TableRow>
               ) : (
                 [...(creditHistQ.data?.entries || [])].reverse().map((entry, i) => (
-                  <TableRow key={entry.time || '' + i}>
+                  // 账本时间只到秒：同一秒内多账号变动会撞车，必须再拼下标保唯一
+                  // （`entry.time || '' + i` 的运算符优先级会把下标并进右操作数，等于没拼）。
+                  <TableRow key={(entry.time || '') + '#' + i}>
                     <TableCell className="font-mono text-xs">{chTime(entry.time) || '—'}</TableCell>
                     <TableCell>{chName(entry)}</TableCell>
                     <TableCell className="text-right font-mono tabular-nums">

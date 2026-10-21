@@ -183,26 +183,59 @@ func (l *Ledger) Flush() {
 	}
 
 	raw, err := json.Marshal(fileDoc{Version: 1, Entries: l.entries})
+	// 记下本次写出的条数：清脏标记后，写盘期间新进来的流水必须重新置脏，
+	// 否则它们只留在内存里，下一次 Flush 会因「不脏」直接跳过。
+	written := len(l.entries)
 	l.dirty = false
 	l.mu.Unlock()
 
 	if err != nil {
 		log.Printf("WARN: [credithist] 序列化失败: %v", err)
+		l.markDirty()
+
 		return
 	}
 
 	tmp := l.path + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
 		log.Printf("WARN: [credithist] 建目录失败: %v", err)
+		l.markDirty()
+
 		return
 	}
 
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		log.Printf("WARN: [credithist] 写临时文件失败: %v", err)
+		l.markDirty()
+
 		return
 	}
 
 	if err := atomicwrite.Rename(tmp, l.path); err != nil {
 		log.Printf("WARN: [credithist] 原子替换失败: %v", err)
+		l.markDirty()
+
+		return
 	}
+
+	l.dirtyIfGrown(written)
+}
+
+// markDirty 重新置脏（写盘失败时调用）：脏标记已提前清掉，不置回就会永久丢写。
+func (l *Ledger) markDirty() {
+	l.mu.Lock()
+	l.dirty = true
+	l.mu.Unlock()
+}
+
+// dirtyIfGrown 写盘成功后补一次脏标记：写盘期间若又追加了流水（条数变化），
+// 这批新条目还没落盘，必须让下一次 Flush 再写一遍。
+func (l *Ledger) dirtyIfGrown(written int) {
+	l.mu.Lock()
+
+	if len(l.entries) != written {
+		l.dirty = true
+	}
+
+	l.mu.Unlock()
 }

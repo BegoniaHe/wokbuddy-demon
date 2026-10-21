@@ -133,3 +133,29 @@ func TestLedgerCorruptedFileStartsEmpty(t *testing.T) {
 		t.Errorf("损坏文件应按空账本，got %v", got)
 	}
 }
+
+// TestLedgerFlushFailureKeepsDirty 写盘失败后必须保留脏标记：脏标记在写盘前就被清掉，
+// 不置回的话这批流水会永久留在内存里（下一次 Flush 因「不脏」直接跳过）。
+func TestLedgerFlushFailureKeepsDirty(t *testing.T) {
+	t.Parallel()
+
+	// 父路径是普通文件 → MkdirAll 必然失败，模拟写盘失败。
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := writeFile(blocker, "x"); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+
+	ledger := Open(filepath.Join(blocker, "credit-history.json"), 100)
+	ledger.Observe("u1", 500, "")
+	ledger.Observe("u1", 400, "task")
+
+	ledger.Flush()
+
+	ledger.mu.Lock()
+	dirty := ledger.dirty
+	ledger.mu.Unlock()
+
+	if !dirty {
+		t.Fatal("写盘失败后必须保持脏标记，否则这批流水永远不会再被写出")
+	}
+}
