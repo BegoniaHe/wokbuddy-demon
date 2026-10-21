@@ -26,10 +26,21 @@ describe('compName', () => {
 });
 
 describe('compDeadlineHours / tone', () => {
-  const now = Date.parse('2026-10-21T00:00:00');
+  // 用显式 +08:00 的「现在」，避免断言依赖测试机本地时区。
+  const now = Date.parse('2026-10-21T00:00:00+08:00');
 
-  it('解析上游无时区时间', () => {
+  it('解析上游无时区时间（按 UTC+8 墙钟）', () => {
     expect(compDeadlineHours('2026-10-22 00:00:00', now)).toBeCloseTo(24, 1);
+  });
+
+  it('无时区字符串按 +08:00 解释，不随浏览器时区漂移', () => {
+    const utcMidnight = Date.parse('2026-10-21T00:00:00Z');
+    // 2026-10-22 00:00 +08:00 = 2026-10-21 16:00Z。
+    expect(compDeadlineHours('2026-10-22 00:00:00', utcMidnight)).toBeCloseTo(16, 1);
+  });
+
+  it('已带时区的 ISO 原样解析', () => {
+    expect(compDeadlineHours('2026-10-22T00:00:00+08:00', now)).toBeCloseTo(24, 1);
   });
   it('无截止/非法 → null 且 tone=mute', () => {
     expect(compDeadlineHours('', now)).toBeNull();

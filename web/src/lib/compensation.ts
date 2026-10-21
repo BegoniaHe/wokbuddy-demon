@@ -35,8 +35,12 @@ export function compName(row: CompensationRow | undefined): string {
 export function compDeadlineHours(endTime: unknown, now: number): number | null {
   const raw = String(endTime || '').trim();
   if (!raw) return null;
-  // 上游是 "2006-01-02 15:04:05" 无时区字符串：按本地时间解析（与面板其它时间列同口径）。
-  const ms = Date.parse(raw.replace(' ', 'T'));
+  // 上游是 "2006-01-02 15:04:05" 无时区字符串，语义是 UTC+8 墙钟（与积分包
+  // end_time 同口径，见 pkExpiryMs）。按浏览器本地时区解析会让非 UTC+8 部署的
+  // 倒计时整体偏移；缺时区时补 +08:00。
+  let iso = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  if (!/(?:Z|[+-]\d\d:\d\d)$/.test(iso)) iso += '+08:00';
+  const ms = Date.parse(iso);
   if (!Number.isFinite(ms)) return null;
   return Math.round(((ms - now) / 3600000) * 10) / 10;
 }
