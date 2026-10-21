@@ -421,16 +421,20 @@ func resolveCacheMiss(t cacheTokenTriple) int64 {
 	return 0
 }
 
-// resolveCacheHit 命中 token：显式值优先；显式值为 0 或缺失时按 prompt - miss
-// **对称反推**——上游「接近全命中」时可能只回显式 miss、把 hit 置 0 或留空，
-// 单向推导会把它误判成缓存完全失效（假阳性 WARN）。
-// prompt <= miss 时不反推：自造命中的代价比「不可得」更大，保持 0。
+// resolveCacheHit 命中 token：显式值优先；显式值为 0 或缺失、且上游给了**正的**
+// 显式 miss 时按 prompt - miss **对称反推**——上游「接近全命中」时可能只回显式
+// miss、把 hit 置 0 或留空，单向推导会把它误判成缓存完全失效（假阳性 WARN）。
+//
+// 反推的两个前提缺一不可：
+//   - miss 必须是显式且 > 0：两侧都显式给 0（或无 miss 只有 prompt）时没有任何
+//     「命中」证据，反推会凭空造出 100% 命中（与「不臆造」的设计目标相反）；
+//   - prompt > miss：自造命中的代价比「不可得」更大，保持 0。
 func resolveCacheHit(t cacheTokenTriple) int64 {
 	if t.hasHit && t.hit > 0 {
 		return t.hit
 	}
 
-	if t.hasPrompt && t.prompt > t.miss {
+	if t.hasMiss && t.miss > 0 && t.hasPrompt && t.prompt > t.miss {
 		return t.prompt - t.miss
 	}
 

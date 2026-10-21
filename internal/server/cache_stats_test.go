@@ -133,6 +133,18 @@ func TestCacheTokensSymmetricHitDerivation(t *testing.T) {
 			line: `data: {"usage":{"prompt_tokens":50000}}`,
 			hit:  0, miss: 0, ok: false,
 		},
+		{
+			// 反推只接受「正的显式 miss」：两侧都显式 0 时没有任何命中证据，
+			// 反推会凭空造出 100% 命中（命中率统计被污染成反向假阳性）。
+			name: "两侧显式 0 不反推命中",
+			line: `data: {"usage":{"prompt_tokens":50000,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":0}}`,
+			hit:  0, miss: 0, ok: true,
+		},
+		{
+			name: "hit 缺失且无 miss（只有 prompt）不反推命中",
+			line: `data: {"usage":{"prompt_tokens":50000,"prompt_cache_hit_tokens":0}}`,
+			hit:  0, miss: 50000, ok: true,
+		},
 	}
 
 	for _, testCase := range cases {
