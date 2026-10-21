@@ -650,3 +650,38 @@ func TestSearch401AfterRefreshIsRetryable(t *testing.T) {
 		t.Errorf("401 不应映射成 bad_params: %s", rec.Body)
 	}
 }
+
+// TestSearchRealmPrefix 搜索端点只走 CN：显式 global: 前缀必须拒绝（否则客户端
+// 以为在查国际版，实际消耗 CN 额度）；cn: 前缀剥掉后按裸名回显。
+func TestSearchRealmPrefix(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		calls++
+
+		return http.StatusOK, searchOKBody
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"global:glm-5.2","messages":[{"role":"user","content":"golang"}],"tools":[{"name":"web_search"}]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("global 前缀 code=%d want 400，body=%s", rec.Code, rec.Body)
+	}
+
+	if calls != 0 {
+		t.Errorf("global 前缀不得打上游，calls=%d", calls)
+	}
+
+	rec = doSearchRequest(t, handler, `{"model":"cn:glm-5.2","messages":[{"role":"user","content":"golang"}],"tools":[{"name":"web_search"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("cn 前缀 code=%d want 200，body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), `"model":"glm-5.2"`) {
+		t.Errorf("响应 model 应剥掉 cn: 前缀：%s", rec.Body)
+	}
+
+	if calls != 1 {
+		t.Errorf("cn 前缀应打上游一次，calls=%d", calls)
+	}
+}

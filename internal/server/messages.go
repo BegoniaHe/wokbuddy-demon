@@ -110,8 +110,9 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 		return nil, errSearchInvalidJSON
 	}
 
-	if strings.TrimSpace(payload.Model) == "" {
-		return nil, errModelIsRequired
+	model, merr := normalizeSearchModel(payload.Model)
+	if merr != nil {
+		return nil, merr
 	}
 
 	if len(payload.Messages) == 0 {
@@ -144,7 +145,33 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 		maxResults = toolMaxResults(payload.Tools)
 	}
 
-	return &searchRequest{model: payload.Model, query: query, maxResults: maxResults}, nil
+	return &searchRequest{model: model, query: query, maxResults: maxResults}, nil
+}
+
+// normalizeSearchModel 归一搜索请求的 model：去空白、拒绝空值、只接受 cn 域。
+// 搜索只走 CN 账号，显式 global: 前缀必须拒绝（否则客户端以为在查国际版，实际
+// 消耗 CN 额度）；cn: 前缀剥掉后按裸名回显（与其它入站协议同口径）。
+func normalizeSearchModel(raw string) (string, error) {
+	model := strings.TrimSpace(raw)
+	if model == "" {
+		return "", errModelIsRequired
+	}
+
+	realm, bare, prefixed := splitRealm(model)
+	if !prefixed {
+		return model, nil
+	}
+
+	if realm != searchRealm {
+		return "", errSearchRealmUnsupported
+	}
+
+	model = strings.TrimSpace(bare)
+	if model == "" {
+		return "", errModelIsRequired
+	}
+
+	return model, nil
 }
 
 // searchQueryMaxLen 搜索词长度上限（防御性：上游 zod 无上限，超长 query 只会让
@@ -366,7 +393,9 @@ var (
 	errSearchInvalidJSON  = errors.New("invalid JSON body")
 	errSearchToolRequired = errors.New(
 		"该端点只用于联网搜索：请求必须在 tools 中声明 web_search 工具")
-	errSearchQueryEmpty    = errors.New("请在 messages 中提供一段用户文本作为搜索词")
-	errSearchQueryTooShort = errors.New("搜索词过短（至少 2 个字符）")
-	errSearchQueryTooLong  = errors.New("搜索词过长（上限 1024 字符），请精简后重试")
+	errSearchQueryEmpty       = errors.New("请在 messages 中提供一段用户文本作为搜索词")
+	errSearchQueryTooShort    = errors.New("搜索词过短（至少 2 个字符）")
+	errSearchQueryTooLong     = errors.New("搜索词过长（上限 1024 字符），请精简后重试")
+	errSearchRealmUnsupported = errors.New(
+		"该搜索端点只支持 cn 域；请去掉 global: 前缀（当前不支持国际版搜索）")
 )
