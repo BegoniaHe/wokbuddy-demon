@@ -104,3 +104,21 @@ func itoa(n int64) string {
 
 	return string(buf[i:])
 }
+
+// TestResourceAccountExpiryPackageEndTime 回退路径（get-user-resource）与「检查」
+// 同优先级：仅带 PackageEndTime 的包必须按该字段取到期，不能回落到周期重置日。
+func TestResourceAccountExpiryPackageEndTime(t *testing.T) {
+	t.Parallel()
+
+	end := time.Now().Add(48 * time.Hour).Truncate(time.Second).In(softRateResetLoc)
+	acct := &resourceAccount{
+		CapacityType:   1,
+		PackageEndTime: end.Format(packageEndLayout),
+		CycleEndTime:   end.AddDate(0, 1, 0).Format(packageEndLayout),
+	}
+
+	got, ok := resourceAccountExpiry(acct)
+	if !ok || !got.Equal(end) {
+		t.Fatalf("expiry=%v ok=%v want %v（PackageEndTime 优先于 CycleEndTime）", got, ok, end)
+	}
+}

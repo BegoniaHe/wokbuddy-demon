@@ -3918,6 +3918,7 @@ type resourceAccount struct {
 	SlicePeriodUsageDetails    []slicePeriodUsage `json:"SlicePeriodUsageDetails"`
 	CycleEndTime               string             `json:"CycleEndTime"` // "2006-01-02 15:04:05"，缺省/空 = 无到期
 	ExpiredTime                string             `json:"ExpiredTime"`
+	PackageEndTime             string             `json:"PackageEndTime"`
 	DeductionEndTime           int64              `json:"DeductionEndTime"`
 	CapacitySize               int64              `json:"CapacitySize"`
 	CapacityRemain             int64              `json:"CapacityRemain"`
@@ -4017,6 +4018,15 @@ func resourceAccountExpiry(acct *resourceAccount) (time.Time, bool) {
 
 	if acct.ExpiredTime != "" {
 		if t, ok := parsePackageEndTime(acct.ExpiredTime); ok {
+			return t, true
+		}
+	}
+
+	// 与「检查」（creditPackageExpiry）同优先级：ExpiredTime → PackageEndTime →
+	// CycleEndTime。漏掉 PackageEndTime 会让仅带该字段的包回落到周期重置日，
+	// 快照与逐包明细再次分叉。
+	if acct.PackageEndTime != "" {
+		if t, ok := parsePackageEndTime(acct.PackageEndTime); ok {
 			return t, true
 		}
 	}
