@@ -32,8 +32,10 @@ const (
 	StrategySequentialExhaust Strategy = "sequential_exhaust"
 )
 
-// ParseStrategy 归一策略字符串：空 = 默认 weighted_random；同时接受上游旧口径别名
-// domestic/international（只为兼容旧文档写法，本仓库自身只用 cn/global）。
+// ParseStrategy 归一策略字符串（大小写不敏感、去首尾空白）：空 = 默认
+// weighted_random；只接受三个枚举值，拼错/未知值返回错误由 config 拒启动
+// （静默退回默认会让运维以为配置生效了）。域口径统一用 cn / global，
+// 不接受 domestic / international 之类的别名。
 func ParseStrategy(raw string) (Strategy, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", string(StrategyWeightedRandom):

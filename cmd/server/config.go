@@ -328,7 +328,7 @@ type Config struct {
 		// Strategy 按域选号策略（issue #205）：{"cn":"weighted_random","global":"..."}。
 		// 可选 weighted_random（默认）/ round_robin / sequential_exhaust；
 		// 有序策略会**关闭全冷却兜底与防撞号窗口**（语义：明确地用下一个号）。
-		// 热生效。别名 domestic/international 在 normalize 阶段归一为 cn/global。
+		// 热生效；非法值在 normalize 阶段拒绝启动。
 		Strategy struct {
 			CN     string `json:"cn"`
 			Global string `json:"global"`
