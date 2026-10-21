@@ -298,7 +298,7 @@ codex
 
 - 开关：`features.search_endpoint`（默认 `false`，热生效）。搜索是新增出站面且每次调用消耗一次账号额度。
 - realm：当前只放行 **CN 域**账号选号（上游仅在 CN 域实测过；两域放开留 TODO）。
-- 入站要求：`tools` 里声明 `web_search`（如 `{"type":"web_search_20250305","name":"web_search"}`），否则 400；搜索词取**最后一条 user 消息**的文本块（不在文本里的历史/tool_result 不参与）。
+- 入站要求：`tools` 里声明 `web_search`（如 `{"type":"web_search_20250305","name":"web_search"}`），否则 400；搜索词取**最后一条 user 消息**的文本块（不在文本里的历史/tool_result 不参与），并剥掉官方固定指令前缀 `Perform a web search for the query:`；入站 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Trace-ID` 原样透传上游。
 - 条数：`max_results`（请求体顶层或 `tools[].max_results`）生效，缺省 5、上限 10；搜索词上限 1024 字符。
 - 出站响应：assistant message，`content` 依次为 text 块（摘要 + `citations[].cited_text`）与 `web_search_tool_result` 块（逐条 title/url/snippet）；`usage` 为估算值（网关无 tokenizer，仅用于客户端预算）。
 - 错误：上游错误按既有分类处置（限流走软冷却、会话失效禁用、额度硬冷却等），请求级/内容/队列类不再轮转；`15001`（搜索次数用尽）会在 `gateway_hint` 里提示可按号重试，上游原文原样透传。

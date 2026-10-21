@@ -26,6 +26,7 @@ type searchMessageResponse struct {
 	Content []struct {
 		Type      string           `json:"type"`
 		Text      string           `json:"text"`
+		ToolUseID string           `json:"tool_use_id"`
 		Citations []map[string]any `json:"citations"`
 		Content   []map[string]any `json:"content"`
 	} `json:"content"`
@@ -139,6 +140,8 @@ func TestSearchReturnsAnthropicMessage(t *testing.T) {
 }
 
 // assertSearchMessageShape 断言 Anthropic 消息外壳与两个 content 块。
+//
+//nolint:cyclop // 逐字段校验响应契约，拆开反而难读。
 func assertSearchMessageShape(t *testing.T, resp searchMessageResponse) {
 	t.Helper()
 
@@ -157,6 +160,11 @@ func assertSearchMessageShape(t *testing.T, resp searchMessageResponse) {
 
 	if resp.Content[1].Type != "web_search_tool_result" || len(resp.Content[1].Content) != 1 {
 		t.Errorf("tool_result 块=%+v", resp.Content[1])
+	}
+
+	// Anthropic 的 web_search_tool_result 必须带 tool_use_id（每次调用唯一标识）。
+	if !strings.HasPrefix(resp.Content[1].ToolUseID, "srvtoolu_") || len(resp.Content[1].ToolUseID) <= len("srvtoolu_") {
+		t.Errorf("tool_use_id=%q want srvtoolu_ 前缀且非空", resp.Content[1].ToolUseID)
 	}
 }
 
@@ -207,6 +215,168 @@ func TestSearchUsesLastUserText(t *testing.T) {
 
 	if !strings.Contains(gotBody, `"query":"当前搜索词"`) {
 		t.Errorf("出站 query 应取最后一条 user 文本，body=%s", gotBody)
+	}
+}
+
+// TestSearchStripsOfficialQueryPrefix 官方搜索客户端（DSH / 官方 CLI）会把固定指令
+// 前缀一起送来（`Perform a web search for the query: <query>`）：前缀必须剥掉，
+// 否则会把指令本身当搜索词打给上游。大小写差异也按同口径处理。
+func TestSearchStripsOfficialQueryPrefix(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "块数组 + 标准前缀",
+			content: `[{"type":"text","text":"Perform a web search for the query: golang"}]`,
+			want:    `"query":"golang"`,
+		},
+		{
+			name:    "纯字符串 + 大小写差异",
+			content: `"perform a WEB SEARCH for the query: 中文查询"`,
+			want:    `"query":"中文查询"`,
+		},
+		{
+			name:    "无前缀原样保留",
+			content: `[{"type":"text","text":"golang"}]`,
+			want:    `"query":"golang"`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotBody string
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw := make([]byte, 0, 256)
+				buf := make([]byte, 256)
+
+				for {
+					n, err := r.Body.Read(buf)
+					raw = append(raw, buf[:n]...)
+
+					if err != nil {
+						break
+					}
+				}
+
+				gotBody = string(raw)
+
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(searchOKBody))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := &upstream.Client{
+				HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+			}
+			state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999})
+			handler := NewHandler(&Config{
+				Pool:     state,
+				Upstream: client,
+				Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+			})
+
+			body := `{"model":"glm-5.2","messages":[{"role":"user","content":` + testCase.content + `}],"tools":[{"name":"web_search"}]}`
+			if rec := doSearchRequest(t, handler, body); rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+
+			if !strings.Contains(gotBody, testCase.want) {
+				t.Errorf("出站 query 应剥离官方前缀，body=%s", gotBody)
+			}
+
+			if strings.Contains(gotBody, "Perform a web search") || strings.Contains(gotBody, "perform a WEB SEARCH") {
+				t.Errorf("固定指令前缀不得进入上游 query，body=%s", gotBody)
+			}
+		})
+	}
+}
+
+// TestSearchResultTitleFallsBackToURL 结果无 title 时用 URL 兜底：Anthropic 客户端
+// 按 title 渲染结果行，空标题会显示成空白条目；tool_use_id 每次响应都必须唯一。
+func TestSearchResultTitleFallsBackToURL(t *testing.T) {
+	t.Parallel()
+
+	msg := buildSearchMessage("m", "q", &upstream.SearchOutcome{
+		Results: []upstream.SearchResult{{URL: "https://example.com/a"}},
+	})
+
+	content, ok := msg["content"].([]map[string]any)
+	if !ok || len(content) != 2 {
+		t.Fatalf("content=%v", msg["content"])
+	}
+
+	citations, _ := content[0]["citations"].([]map[string]any)
+	if len(citations) != 1 || citations[0]["title"] != "https://example.com/a" {
+		t.Errorf("citation title=%v want URL 兜底", citations)
+	}
+
+	results, _ := content[1]["content"].([]map[string]any)
+	if len(results) != 1 || results[0]["title"] != "https://example.com/a" {
+		t.Errorf("result title=%v want URL 兜底", results)
+	}
+
+	id, _ := content[1]["tool_use_id"].(string)
+	if !strings.HasPrefix(id, "srvtoolu_") {
+		t.Errorf("tool_use_id=%q want srvtoolu_ 前缀", id)
+	}
+}
+
+// TestSearchForwardsSessionHeaders 入站会话头族必须透传给上游（上游按会话聚合
+// 搜索流量）：同一次搜索的换号重试复用同一聚合主键，客户端缺 request ID 时本地生成。
+func TestSearchForwardsSessionHeaders(t *testing.T) {
+	t.Parallel()
+
+	var got http.Header
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(searchOKBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
+	}
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/search/messages",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"golang"}],"tools":[{"name":"web_search"}]}`))
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("X-Conversation-Id", "conv-1")
+	req.Header.Set("X-Conversation-Request-Id", "req-1")
+	req.Header.Set("X-Trace-Id", "trace-1")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if got.Get("X-Conversation-Id") != "conv-1" {
+		t.Errorf("X-Conversation-Id=%q want conv-1", got.Get("X-Conversation-Id"))
+	}
+
+	if got.Get("X-Conversation-Request-Id") != "req-1" {
+		t.Errorf("X-Conversation-Request-Id=%q want req-1", got.Get("X-Conversation-Request-Id"))
+	}
+
+	if got.Get("X-Trace-Id") != "trace-1" {
+		t.Errorf("X-Trace-Id=%q want trace-1", got.Get("X-Trace-Id"))
 	}
 }
 

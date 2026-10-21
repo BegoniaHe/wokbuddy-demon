@@ -70,7 +70,8 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	outcome, uid, fail := h.runSearch(r.Context(), req.query, req.maxResults, &upstream.ChatMeta{})
+	meta := searchMetaFromRequest(r)
+	outcome, uid, fail := h.runSearch(r.Context(), req.query, req.maxResults, &meta)
 	// 请求日志记账：搜索路径没有 chatStat，账号/模型/结果显式写进 trace
 	// （trace 由 ServeHTTP 在 /v1/search/messages 上创建，开关与其它 POST 接口一致）。
 	if fail == nil {
@@ -256,8 +257,26 @@ func messageTextParts(content json.RawMessage) []string {
 	return nil
 }
 
+// searchQueryPrefix 官方搜索客户端（DSH / 官方 CLI）的固定指令前缀。它是写给模型
+// 看的指令、不是搜索词：客户端把搜索 base 指到本端点时会把整句一起送来，不剥掉就
+// 会把指令本身当作 query 打给上游（上游契约见 issue #203）。
+const searchQueryPrefix = "Perform a web search for the query:"
+
+// stripSearchQueryPrefix 大小写不敏感地剥掉官方固定前缀（不同客户端模板大小写可能
+// 有差异）；没有前缀时原样返回（已 trim）。
+func stripSearchQueryPrefix(text string) string {
+	trimmed := strings.TrimSpace(text)
+
+	if len(trimmed) >= len(searchQueryPrefix) &&
+		strings.EqualFold(trimmed[:len(searchQueryPrefix)], searchQueryPrefix) {
+		return strings.TrimSpace(trimmed[len(searchQueryPrefix):])
+	}
+
+	return trimmed
+}
+
 // lastUserText 取最后一条 user 消息里的文本作为搜索词（块数组取全部 text 块，
-// 纯字符串取其本身）。
+// 纯字符串取其本身），并剥掉官方固定指令前缀。
 func lastUserText(messages []searchInboundMessage) string {
 	for _, message := range slices.Backward(messages) {
 		if message.Role != "user" {
@@ -265,7 +284,7 @@ func lastUserText(messages []searchInboundMessage) string {
 		}
 
 		if parts := messageTextParts(message.Content); len(parts) > 0 {
-			return strings.Join(parts, "\n")
+			return stripSearchQueryPrefix(strings.Join(parts, "\n"))
 		}
 	}
 
@@ -286,8 +305,11 @@ func buildSearchMessage(model, query string, outcome *upstream.SearchOutcome) ma
 		"content": []map[string]any{
 			{"type": "text", "text": summary, "citations": citations},
 			{
-				"type":    "web_search_tool_result",
-				"content": results,
+				"type": "web_search_tool_result",
+				// Anthropic 的 web_search_tool_result 必须带 tool_use_id（标识「一次
+				// 工具调用」，每次响应唯一）；缺字段的块不符合协议，严格客户端会拒收。
+				"tool_use_id": "srvtoolu_" + session.NewMessageID(),
+				"content":     results,
 			},
 		},
 		"stop_reason":   "end_turn",
@@ -325,21 +347,28 @@ func buildSearchBlocks(outcome *upstream.SearchOutcome) (citations, results []ma
 	for i := range outcome.Results {
 		result := &outcome.Results[i]
 
+		// 无标题时用 URL 兜底：Anthropic 客户端按 title 渲染结果行，空标题会显示成
+		// 空白条目（上游也不保证每条都带 title）。
+		title := result.Title
+		if title == "" {
+			title = result.URL
+		}
+
 		cited := result.Snippet
 		if cited == "" {
-			cited = result.Title
+			cited = title
 		}
 
 		citations = append(citations, map[string]any{
 			"type":            "web_search_result_location",
 			"url":             result.URL,
-			"title":           result.Title,
+			"title":           title,
 			"cited_text":      cited,
 			"encrypted_index": "",
 		})
 		results = append(results, map[string]any{
 			"type":    "web_search_result",
-			"title":   result.Title,
+			"title":   title,
 			"url":     result.URL,
 			"snippet": result.Snippet,
 		})
@@ -349,7 +378,7 @@ func buildSearchBlocks(outcome *upstream.SearchOutcome) (citations, results []ma
 		}
 
 		text.WriteString("- ")
-		text.WriteString(result.Title)
+		text.WriteString(title)
 
 		if result.Snippet != "" {
 			text.WriteString("：")

@@ -1,9 +1,9 @@
 // search.go /v1/search/messages 的搜索执行流程（选号 → 在途租约 → 预刷新 →
 // 上游搜索 → 错误策略 → 轮转）。
 //
-// 与 chat 的区别：搜索是一次同步 JSON 请求，没有 SSE、没有模型/会话上下文，
-// 因此不套 chatFlow（那套状态机的复杂度都在流与会话上）。这里只保留必要的三段：
-// 选号 + 账号级错误策略 + 有界轮转。
+// 与 chat 的区别：搜索是一次同步 JSON 请求，没有 SSE；入站会话头族仍透传给上游
+// （见 searchMetaFromRequest），但不套 chatFlow（那套状态机的复杂度都在流与模型
+// 上下文上）。这里只保留必要的三段：选号 + 账号级错误策略 + 有界轮转。
 package server
 
 import (
@@ -11,17 +11,38 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // searchRealm 联网搜索只放行 CN 域选号：上游搜索端点仅在 CN 域实测可用。
 // 两域放开留 TODO（需先补 global 域实测，不能靠推断）。
 const searchRealm = "cn"
+
+// searchMetaFromRequest 提取入站搜索请求的会话头族。
+//
+// 搜索通常由某个会话内的 agent 发起：X-Conversation-ID / X-Conversation-Request-ID /
+// X-Trace-ID 必须原样透传给上游（上游按会话聚合搜索流量，缺失会被视为请求不完整）。
+// 客户端没带 request ID 时本地生成一个——同一次搜索的换号重试必须复用同一个聚合主键
+// （meta 在 runSearch 外构造一次），不能每轮随机。
+func searchMetaFromRequest(r *http.Request) upstream.ChatMeta {
+	meta := upstream.ChatMeta{
+		ConversationID:        strings.TrimSpace(r.Header.Get("X-Conversation-Id")),
+		ConversationRequestID: strings.TrimSpace(r.Header.Get("X-Conversation-Request-Id")),
+		TraceID:               strings.TrimSpace(r.Header.Get("X-Trace-Id")),
+	}
+	if meta.ConversationRequestID == "" {
+		meta.ConversationRequestID = session.NewMessageID()
+	}
+
+	return meta
+}
 
 // searchFailure 搜索失败的终端形态（status / code / message / hint）。
 type searchFailure struct {
