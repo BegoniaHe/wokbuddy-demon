@@ -288,6 +288,7 @@ func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.No
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 		CheckinAccountDelay:    cfg.CheckinAccountDelayDur,
+		RunStampFile:           stateSibling(cfg.StateFile, "scheduler-runs.json"),
 	})
 	logScheduleConfig(cfg)
 
@@ -449,7 +450,7 @@ func serve(
 		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body 上传）：防慢速 body 拖死连接。
-		// 请求体已无网关侧上限（max_body_mb 移除）。缺省 300s（issue #100：旧固定
+		// 请求体上限由 server.max_body_bytes 约束（缺省 32MiB）。缺省 300s（issue #100：旧固定
 		// 60s 会掐掉大上下文/文件块经反代链的慢速上传，客户端收到
 		// 400 "read body: ... i/o timeout"）；server.read_timeout="0" 显式关闭。
 		// 改动需重启进程。
@@ -593,7 +594,7 @@ func setupSessionRouter(cfg *Config, store redisstore.Store, state5 *pool.Pool) 
 func configureUpstream(cfg *Config, client *upstream.Client) {
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	client.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
-	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省 1200s）。
+	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省 120s）。
 	client.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
 	if tr, ok := client.ChatHTTP.Transport.(*http.Transport); ok {
 		tr.ResponseHeaderTimeout = client.HeaderTimeout
@@ -690,7 +691,7 @@ func logScheduleLifecycle(cfg *Config) {
 	case !cfg.Schedule.BlackcatEnabled:
 		log.Printf("夜猫子已禁用（schedule.blackcat_enabled=false）")
 	default:
-		log.Printf("夜猫子已启用：%v 点（23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
+		log.Printf("夜猫子已启用：%v 点（CST；23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
 	}
 }
 

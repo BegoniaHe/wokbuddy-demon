@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -55,6 +56,38 @@ func TestNextFireMergesSchedules(t *testing.T) {
 	next := nextFire(now, []int{9, 21, 22})
 	if next.Hour() != 21 {
 		t.Errorf("next=%v want 21 (earliest of 21/22)", next)
+	}
+}
+
+// TestNextWakeBlackcatUsesCST 夜猫子按 CST 23:00 排程，不受宿主本地时区影响。
+func TestNextWakeBlackcatUsesCST(t *testing.T) {
+	t.Parallel()
+
+	scheduler := New(&Config{
+		BlackcatHours:     []int{23},
+		CheckinDisabled:   true,
+		TravelDisabled:    true,
+		ActivityDisabled:  true,
+		KeepaliveDisabled: true,
+		GrowthDisabled:    true,
+	})
+
+	host := time.FixedZone("UTC-5", -5*60*60)
+	now := time.Date(2026, 9, 11, 9, 0, 0, 0, host) // 14:00 UTC = 22:00 CST
+
+	at, kinds := scheduler.nextWake(now)
+	if want := time.Date(2026, 9, 11, 23, 0, 0, 0, cst.Loc); !at.Equal(want) {
+		t.Fatalf("next=%v want %v", at, want)
+	}
+
+	if !hasKind(kinds, taskBlackcat) {
+		t.Fatalf("kinds=%v want blackcat", kinds)
+	}
+
+	// CST 23:30 已过窗口起点，下一次落到次日 CST 23:00。
+	at, _ = scheduler.nextWake(time.Date(2026, 9, 11, 10, 30, 0, 0, host)) // 15:30 UTC = 23:30 CST
+	if want := time.Date(2026, 9, 12, 23, 0, 0, 0, cst.Loc); !at.Equal(want) {
+		t.Fatalf("next=%v want %v", at, want)
 	}
 }
 

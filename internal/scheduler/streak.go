@@ -10,9 +10,9 @@ import (
 	"context"
 	"encoding/json"
 	"log"
-	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -158,7 +158,7 @@ func (s *Scheduler) makeupYesterday(account2 *auth.Auth) {
 		return
 	}
 
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	yesterday := cst.Day(cst.Now().AddDate(0, 0, -1))
 	if err := s.cfg.Upstream.UseMakeupCard(account2, yesterday); err != nil {
 		log.Printf("streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(account2.UID, account2.NicknameValue()), yesterday, err)
 		return
