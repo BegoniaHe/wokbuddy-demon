@@ -890,6 +890,10 @@ var cacheMissWarnEvery = 10 * time.Minute
 
 // noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；整段未命中且此前
 // 命中过 → 触发 WARN（冷却内不重复）。
+//
+// 入参是已推导后的三维值（见 cacheTokensFromUsage）：上游未回 miss 时调用方已按
+// prompt 反推为未命中，所以这里 miss<=0 只可能是「上游显式回 0」。两侧都显式 0 时
+// 没有任何命中/未命中证据，不能按整段重算告警（否则对称反推修完仍会刷假阳性）。
 func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64) {
 	if model == "" {
 		return
@@ -902,14 +906,10 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 		c.everHit[model] = true
 		return
 	}
-	// hit==0 才可能是整段重算。小前缀（<1000 tok）的 miss 无告警价值；上游未回
-	// miss 字段时按 prompt 全量视为未命中。
-	if prompt < 1000 {
+	// hit==0 才可能是整段重算。小前缀（<1000 tok）无告警价值；miss<=0 是显式 0
+	// （无证据），同样跳过。
+	if prompt < 1000 || miss <= 0 {
 		return
-	}
-
-	if miss <= 0 {
-		miss = prompt
 	}
 
 	if !c.everHit[model] {

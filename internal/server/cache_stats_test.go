@@ -184,3 +184,22 @@ func TestCacheTokensFromUsageMap(t *testing.T) {
 		t.Fatalf("map 反推 hit=%d miss=%d ok=%v, want 49997/3/true", hitInt, missInt, ok)
 	}
 }
+
+// TestCacheMissWarnSkipsExplicitZero 两侧显式 0（hit=0/miss=0）没有未命中证据：
+// 即使该模型此前命中过也不能触发「整段重算」WARN（对称反推的配套防假阳性）。
+func TestCacheMissWarnSkipsExplicitZero(t *testing.T) {
+	t.Parallel()
+
+	const model = "explicit-zero-cache-model"
+
+	cacheMissWarn.noteCacheTokens(model, 5000, 100, 0) // 先建立「可命中」基线
+	cacheMissWarn.noteCacheTokens(model, 5000, 0, 0)   // 两侧显式 0：不应告警
+
+	cacheMissWarn.mu.Lock()
+	_, warned := cacheMissWarn.last[model]
+	cacheMissWarn.mu.Unlock()
+
+	if warned {
+		t.Fatal("两侧显式 0 不应触发缓存未命中 WARN")
+	}
+}
