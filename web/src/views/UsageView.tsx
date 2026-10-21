@@ -30,6 +30,8 @@ import {
   type UsageRow,
   type UsSort,
 } from '@/lib/usage';
+import { chartLayout } from '@/lib/usage';
+import { MOBILE_QUERY, useMediaQuery } from '@/hooks/useMediaQuery';
 import { defaultTimeRangeState, trangeLabel, trangeQuery, type TimeRangeState } from '@/lib/timeRange';
 import { Button } from '@/components/ui/button';
 import {
@@ -574,7 +576,7 @@ function UsageDimRow({ x, dim, withPerf }: { x: UsageRow; dim: DimKey; withPerf:
 }
 
 // ── 时序图 ────────────────────────────────────────────────────────────
-function UsageChart({ series }: { series: SeriesPoint[] }) {
+export function UsageChart({ series }: { series: SeriesPoint[] }) {
   const model = useMemo(() => {
     const pts: { t: number; scope?: string; raw: string; pt: number; ct: number; tt: number; req: number }[] = [];
     for (const p of series) {
@@ -586,19 +588,15 @@ function UsageChart({ series }: { series: SeriesPoint[] }) {
     }
     return pts;
   }, [series]);
+  // hook 必须在任何早返回之前调用：数据从「有」变「无」时 hook 数量前后不一致，
+  // React 会抛 "Rendered fewer hooks than expected"（整页白屏）。
+  const narrow = useMediaQuery(MOBILE_QUERY);
 
   if (!model.length) {
     return <div className="py-8 text-center text-xs text-muted-foreground">暂无用量数据。发起一次对话后再刷新。</div>;
   }
 
-  const W = 1200;
-  const H = 200;
-  const PL = 58;
-  const PR = 14;
-  const PT = 18;
-  const PB = 30;
-  const iw = W - PL - PR;
-  const ih = H - PT - PB;
+  const { W, H, PL, PR, PT, iw, ih, ticks: maxTicks } = chartLayout(narrow);
   const t0 = model[0]!.t;
   const t1 = model[model.length - 1]!.t;
   const span = Math.max(1, t1 - t0);
@@ -615,7 +613,7 @@ function UsageChart({ series }: { series: SeriesPoint[] }) {
   const yOf = (v: number) => PT + ih - ih * (v / max);
   const yBase = PT + ih;
 
-  const ticks = Math.min(6, model.length);
+  const ticks = Math.min(maxTicks, model.length);
   const usedLabel = new Set<number>();
   const xLabels: { x: number; anchor: 'start' | 'middle' | 'end'; label: string }[] = [];
   for (let k = 0; k < ticks; k++) {
@@ -806,18 +804,14 @@ function Heatmap({ days, metric }: { days: HeatDay[]; metric: HeatMetric }) {
 }
 
 // ── 单指标趋势图（issue #111）─────────────────────────────────────────
-function TrendChart({ points, metric }: { points: ReturnType<typeof usTrendPoints>; metric: TrendMetric }) {
+export function TrendChart({ points, metric }: { points: ReturnType<typeof usTrendPoints>; metric: TrendMetric }) {
+  // 同上：先取 hook 再判空，避免早返回改变 hook 数量。
+  const narrow = useMediaQuery(MOBILE_QUERY);
+
   if (!points.length) {
     return <div className="py-8 text-center text-xs text-muted-foreground">所选指标在当前范围内没有数据。</div>;
   }
-  const W = 1200;
-  const H = 200;
-  const PL = 58;
-  const PR = 14;
-  const PT = 18;
-  const PB = 30;
-  const iw = W - PL - PR;
-  const ih = H - PT - PB;
+  const { W, H, PL, PR, PT, iw, ih, ticks: maxTicks } = chartLayout(narrow);
   const t0 = points[0]!.t;
   const t1 = points[points.length - 1]!.t;
   const span = Math.max(1, t1 - t0);
@@ -829,7 +823,7 @@ function TrendChart({ points, metric }: { points: ReturnType<typeof usTrendPoint
     'M' + xOf(points[0]!.t).toFixed(1) + ' ' + (PT + ih) + ' ' +
     points.map((p) => 'L' + xOf(p.t).toFixed(1) + ' ' + yOf(p.value).toFixed(1)).join(' ') +
     ' L' + xOf(points[points.length - 1]!.t).toFixed(1) + ' ' + (PT + ih) + ' Z';
-  const ticks = Math.min(6, points.length);
+  const ticks = Math.min(maxTicks, points.length);
   const fmtVal = (v: number) => (metric === 'credits' ? fmtCredit(v) : metric === 'ttft' ? fmtMs(v) : fmtTok(v));
   return (
     <>
