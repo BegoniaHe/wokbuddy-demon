@@ -3627,6 +3627,13 @@ func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, 
 		return resourceSummaryResp{}, fmt.Errorf("resource summary parse: %w", err)
 	}
 
+	// summary 是主余额路径：在数据解析成功后触发观测，下游（personalResource /
+	// UserResourceSnapshot 重构）无需再处理。空 packages 属「回落旧端点」，不记脏数据。
+	if len(out.Packages) > 0 {
+		remain, total := out.summaryTotals()
+		c.notifyBalance(account, remain, total)
+	}
+
 	return out, nil
 }
 
@@ -3824,19 +3831,18 @@ func addPackageExpiry(packages []billingPackageAccount, now time.Time, soon time
 func (c *Client) UserResourceDetailedWithExpiry(
 	account *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
-	// 余额观测回调挂在**所有成功查询路径**的公共出口：scheduler 周期刷新与面板
-	// 「检查」都走本函数（而非 UserResourceDetailed），挂在后者会让积分账本永远
-	// 只记录登录/导入时的基线，看不到真实变动。成功才回调，失败不写脏数据。
-	defer func() {
-		if err == nil {
-			c.notifyBalance(account, remain, total)
-		}
-	}()
-
+	// 余额观测回调挂在**具体成功路径**（summary / enterprise / fallback），而不是
+	// 本函数的统一出口：issue #200 之后 scheduler 直接调用 UserResourceSnapshot，
+	// 把回调留在本包装函数会在重构后漏记周期刷新。成功才回调，失败不写脏数据。
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if account.IsEnterprise() {
-		return c.enterpriseResource(account, soon)
+		remain, total, expiring, earliestAt, earliestRemaining, err = c.enterpriseResource(account, soon)
+		if err == nil {
+			c.notifyBalance(account, remain, total)
+		}
+
+		return remain, total, expiring, earliestAt, earliestRemaining, err
 	}
 
 	now := time.Now()
@@ -3882,6 +3888,8 @@ func (c *Client) UserResourceDetailedWithExpiry(
 	for i := range resp.Response.Data.Accounts {
 		totals.add(&resp.Response.Data.Accounts[i], now, soon)
 	}
+
+	c.notifyBalance(account, totals.remain, totals.total)
 
 	return totals.remain, totals.total, totals.expiring, totals.earliestAt, totals.earliestRemaining, nil
 }

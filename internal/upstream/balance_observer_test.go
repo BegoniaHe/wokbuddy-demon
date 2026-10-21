@@ -84,3 +84,53 @@ func TestBalanceObserverPanicIsolated(t *testing.T) {
 		t.Fatalf("remain/total=%d/%d want 10/10", remain, total)
 	}
 }
+
+// TestBalanceObserverNotifiesSummaryPath summary 是主余额路径：观测必须挂在它上面，
+// 这样 issue #200 把 scheduler 改走 UserResourceSnapshot 后仍能记录周期刷新。
+func TestBalanceObserverNotifiesSummaryPath(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"Packages":[{"CycleRemainCapacity":700,"CycleTotalCapacity":1000}]}}`), nil
+	})
+
+	var calls int
+
+	client.BalanceObserver = func(uid string, remain, total int64) {
+		calls++
+
+		if uid != "u1" || remain != 700 || total != 1000 {
+			t.Errorf("observer got %s/%d/%d want u1/700/1000", uid, remain, total)
+		}
+	}
+
+	if _, err := client.fetchResourceSummary(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("observer calls=%d want 1", calls)
+	}
+}
+
+// TestBalanceObserverSkipsEmptySummary summary 返回空 packages 时会回落旧端点：
+// 此时不能按 0/0 记一笔假变动。
+func TestBalanceObserverSkipsEmptySummary(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":0,"data":{"packages":[]}}`), nil
+	})
+
+	var calls int
+
+	client.BalanceObserver = func(string, int64, int64) { calls++ }
+
+	if _, err := client.fetchResourceSummary(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+
+	if calls != 0 {
+		t.Fatalf("空 packages 不应触发观测，calls=%d", calls)
+	}
+}
