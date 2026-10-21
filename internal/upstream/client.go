@@ -4008,7 +4008,9 @@ func (t *resourceTotals) add(acct *resourceAccount, now time.Time, soon time.Dur
 // CapacityType=4（切片/每日包）以 CycleEndTime 为刷新边界；其余优先
 // DeductionEndTime（epoch 毫秒），再 ExpiredTime，最后 CycleEndTime。
 func resourceAccountExpiry(acct *resourceAccount) (time.Time, bool) {
-	if acct.CapacityType == 4 {
+	// 切片/每日包以周期边界为准，但仅在字段存在时（与 creditPackageExpiry 同口径）：
+	// CycleEndTime 缺失时继续按下面的通用优先级回落，不直接判「无到期」。
+	if acct.CapacityType == 4 && acct.CycleEndTime != "" {
 		return parsePackageEndTime(acct.CycleEndTime)
 	}
 

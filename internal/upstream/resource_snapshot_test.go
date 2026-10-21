@@ -122,3 +122,21 @@ func TestResourceAccountExpiryPackageEndTime(t *testing.T) {
 		t.Fatalf("expiry=%v ok=%v want %v（PackageEndTime 优先于 CycleEndTime）", got, ok, end)
 	}
 }
+
+// TestResourceAccountExpirySliceWithoutCycleEnd 切片包（CapacityType=4）缺
+// CycleEndTime 时不得直接判无到期：按通用优先级回落 ExpiredTime/PackageEndTime。
+func TestResourceAccountExpirySliceWithoutCycleEnd(t *testing.T) {
+	t.Parallel()
+
+	end := time.Now().Add(48 * time.Hour).Truncate(time.Second).In(softRateResetLoc)
+	acct := &resourceAccount{
+		CapacityType:   4,
+		ExpiredTime:    end.Format(packageEndLayout),
+		PackageEndTime: end.Add(time.Hour).Format(packageEndLayout),
+	}
+
+	got, ok := resourceAccountExpiry(acct)
+	if !ok || !got.Equal(end) {
+		t.Fatalf("expiry=%v ok=%v want %v（缺 CycleEndTime 应回落 ExpiredTime）", got, ok, end)
+	}
+}
