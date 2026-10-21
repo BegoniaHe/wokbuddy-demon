@@ -590,7 +590,9 @@ function AccountRow({
                   </>
                 );
               }
-              return remark.display ? remark.display : <span className="text-muted-foreground">未命名</span>;
+              // 无备注时 remark.display 会回落短 uid；账号池原有语义是「未命名」。
+              if (!s.nickname) return <span className="text-muted-foreground">未命名</span>;
+              return remark.display;
             })()}
           </span>
           {s.realm === 'global' ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">国际版</span> : null}
