@@ -145,6 +145,15 @@ func TestClassify(t *testing.T) {
 		// 11-128 入站内容拦截（与出站 sanitize 同语义），不依赖文案 marker。
 		{400, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
 		{200, `{"code":11-128,"msg":"request intercepted"}`, ErrContentBlocked},
+		// 11-128 分流：`+ request illegal` 是**通道校验失败**（账号健康、不降级重试），
+		// 其余 11-128 仍是内容拦截——两种语义不能合并。
+		{400, `{"code":11-128,"msg":"request illegal"}`, ErrChannelRefused},
+		{400, `{"error":{"code":"11-128","message":"request illegal"}}`, ErrChannelRefused},
+		// 裸 "request illegal"（无 11140 code）不再升级成账号故障（上游本轮删掉的过宽 marker）。
+		{400, `{"msg":"request illegal"}`, ErrClient},
+		{400, `{"code":1,"msg":"request illegal"}`, ErrClient},
+		// 11140 + request illegal 才是账号受限（code 与文案同时命中）。
+		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		// 额度族新增码与中文 hard marker。
 		{400, `{"code":11145,"msg":"TokenPlan exhausted"}`, ErrHardCredit},
 		{200, `{"code":14002,"msg":"agent quota exhausted"}`, ErrHardCredit},
