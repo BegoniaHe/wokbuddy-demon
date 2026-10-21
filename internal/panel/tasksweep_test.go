@@ -5,6 +5,7 @@ package panel
 
 import (
 	"context"
+	"encoding/json"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -304,12 +305,138 @@ func TestClaimableTasksPrefersClaimableDuplicate(t *testing.T) {
 		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL,
 	}}}
 
-	tasks, err := panel.claimableTasks(account)
+	tasks, err := panel.sweepTasks(account)
 	if err != nil {
-		t.Fatalf("claimableTasks: %v", err)
+		t.Fatalf("sweepTasks: %v", err)
 	}
 
-	if len(tasks) != 1 || tasks[0].TaskCode != "Model_chat_GLM5.2" || !tasks[0].Claimable {
+	if len(tasks) != 1 || tasks[0].Task.TaskCode != "Model_chat_GLM5.2" || !tasks[0].Task.Claimable {
 		t.Fatalf("应保留 mp 口径的可领条目，got %+v", tasks)
+	}
+
+	// 共享任务（默认口径也下发）保留 Web 来源标记：即便可领状态来自 mp 列表，
+	// 领奖仍走 Web 端点。
+	if tasks[0].MP {
+		t.Error("默认口径也下发的共享任务不应标记 MP")
+	}
+}
+
+// TestTaskSweepAcceptsBeforeClaim 进度达标但尚未接受的任务：先 accept 再 claim
+// （直接 claim 会被上游 task not accepted 拒绝）。mp 列表独有的任务（且不在
+// mpTaskCodes 硬编码表里）accept/claim 都必须带 mp 头走 mp 端点。
+//
+//nolint:cyclop,gocognit,wsl_v5 // 假上游在同一个 handler 里覆盖 list/accept/claim 三端点。
+func TestTaskSweepAcceptsBeforeClaim(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu        sync.Mutex
+		accepted  = map[string]bool{}
+		claims    = map[string]int{}
+		acceptMP  int
+		claimMP   int
+		wrongEnd  int
+		listCalls int
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		isMP := r.Header.Get("X-Client-Platform") == "miniprogram"
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/accept"):
+			if isMP {
+				acceptMP++
+			}
+
+			var body struct {
+				TaskCodes []string `json:"task_codes"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+
+			for _, code := range body.TaskCodes {
+				if code == "mp_only_custom" && !isMP {
+					wrongEnd++
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"code":400,"msg":"task not found"}`))
+
+					return
+				}
+
+				accepted[code] = true
+			}
+
+			_, _ = w.Write([]byte(`{"code":0,"msg":"ok"}`))
+		case strings.HasSuffix(r.URL.Path, "/claim"):
+			code := taskCodeFromClaimPath(r.URL.Path)
+			if isMP {
+				claimMP++
+			}
+
+			if !accepted[code] {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"code":400,"msg":"task not accepted"}`))
+
+				return
+			}
+
+			if code == "mp_only_custom" && !isMP {
+				wrongEnd++
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"code":400,"msg":"task not found"}`))
+
+				return
+			}
+
+			claims[code]++
+			_, _ = w.Write([]byte(`{"code":0,"data":{"credit":10,"energy":1}}`))
+		default:
+			listCalls++
+			if isMP {
+				_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"tasks":[{"task_code":"mp_only_custom","target":1,"current":1,"accept_status":"pending"}]}}`))
+
+				return
+			}
+
+			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"tasks":[{"task_code":"pending_web","target":1,"current":1,"accept_status":"pending"}]}}`))
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{
+		HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL,
+		WebBaseCN: srv.URL, ChatBaseGlobal: srv.URL, BillingBaseGlobal: srv.URL,
+	}
+	state := pool.New("")
+	state.Add(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999})
+	panel := &Panel{cfg: Config{Pool: state, Upstream: client}}
+
+	stats := panel.RunTaskSweep(context.Background())
+	if stats.Accepted != 2 || stats.Claimed != 2 || stats.Failed != 0 {
+		t.Fatalf("stats=%+v want accepted=2 claimed=2 failed=0", stats)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	for _, code := range []string{"pending_web", "mp_only_custom"} {
+		if claims[code] != 1 {
+			t.Errorf("%s claim=%d want 1", code, claims[code])
+		}
+	}
+
+	if acceptMP == 0 || claimMP == 0 {
+		t.Errorf("mp 独有任务必须走 mp 端点：acceptMP=%d claimMP=%d", acceptMP, claimMP)
+	}
+
+	if wrongEnd != 0 {
+		t.Errorf("mp 独有任务被错误地走了 Web 端点 %d 次", wrongEnd)
+	}
+
+	if listCalls < 2 {
+		t.Errorf("应分别拉默认与 mp 两个口径列表，listCalls=%d", listCalls)
 	}
 }

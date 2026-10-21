@@ -26,6 +26,7 @@ type TaskSweepStats struct {
 	Accounts int   `json:"accounts"` // 参与扫描的账号数（已排除 global/企业版/禁用）
 	Busy     int   `json:"busy"`     // 忙账号整轮跳过数
 	Scanned  int   `json:"scanned"`  // 实际拉过任务列表的账号数
+	Accepted int   `json:"accepted"` // 本轮接受成功的任务数
 	Claimed  int   `json:"claimed"`  // 补领成功次数
 	Failed   int   `json:"failed"`   // 补领/拉列表失败次数
 	Credit   int64 `json:"credit"`   // 本轮补领积分合计
@@ -45,6 +46,7 @@ func (a *sweepAccumulator) add(delta TaskSweepStats) {
 
 	a.stats.Busy += delta.Busy
 	a.stats.Scanned += delta.Scanned
+	a.stats.Accepted += delta.Accepted
 	a.stats.Claimed += delta.Claimed
 	a.stats.Failed += delta.Failed
 	a.stats.Credit += delta.Credit
@@ -137,7 +139,7 @@ func (p *Panel) sweepAccount(ctx context.Context, account *auth.Auth) TaskSweepS
 	}
 	defer p.unlockAccount(account.UID)
 
-	tasks, err := p.claimableTasks(account)
+	tasks, err := p.sweepTasks(account)
 	if err != nil {
 		stats.Failed = 1
 
@@ -148,7 +150,14 @@ func (p *Panel) sweepAccount(ctx context.Context, account *auth.Auth) TaskSweepS
 	}
 
 	stats.Scanned = 1
-	stats.Claimed, stats.Credit, stats.Energy, stats.Failed = p.claimAll(account, tasks, ctx.Err)
+	// 先接受未接受任务：进度已达标但未接受的任务，直接 claim 会被上游拒绝
+	// （task not accepted），奖励仍然领不到。接受不是「代做任务」。
+	stats.Accepted, stats.Failed = p.acceptSweepTasks(account, tasks)
+
+	var failed int
+
+	stats.Claimed, stats.Credit, stats.Energy, failed = p.claimAll(account, tasks, ctx.Err)
+	stats.Failed += failed
 
 	if stats.Claimed > 0 {
 		log.Printf("INFO: [panel] 任务补领清扫 acct=%s: 补领 %d 项 +%d 分 +%d 能",
@@ -159,18 +168,23 @@ func (p *Panel) sweepAccount(ctx context.Context, account *auth.Auth) TaskSweepS
 }
 
 // claimAll 逐项补领（账号内串行，ctx 取消后不再继续）。
-func (p *Panel) claimAll(account *auth.Auth, tasks []upstream.Task, canceled func() error) (claimed int, credit, energy int64, failed int) {
+func (p *Panel) claimAll(account *auth.Auth, tasks []sweepTask, canceled func() error) (claimed int, credit, energy int64, failed int) {
 	for i := range tasks {
 		if canceled() != nil {
 			return claimed, credit, energy, failed
 		}
 
-		taskCredit, taskEnergy, err := p.claimTaskReward(account, tasks[i].TaskCode)
+		task := &tasks[i]
+		if !task.Task.Claimable || task.Task.Claimed || task.Task.Locked {
+			continue
+		}
+
+		taskCredit, taskEnergy, err := p.claimSweepTask(account, task)
 		if err != nil {
 			failed++
 
 			log.Printf("WARN: [panel] 任务补领清扫 acct=%s task=%s: 补领失败: %v",
-				logfmt.Label(account.UID, account.NicknameValue()), tasks[i].TaskCode, err)
+				logfmt.Label(account.UID, account.NicknameValue()), task.Task.TaskCode, err)
 
 			continue
 		}
@@ -184,10 +198,92 @@ func (p *Panel) claimAll(account *auth.Auth, tasks []upstream.Task, canceled fun
 	return claimed, credit, energy, failed
 }
 
-// claimableTasks 返回该账号「已达标未领」的任务：默认口径与小程序口径各拉一次，
-// 按 task_code 去重合并（mp 列表是默认口径的超集，且 mp 专属任务只在 mp 口径下发）。
-// 单口径失败不致命：另一口径仍可照常补领。
-func (p *Panel) claimableTasks(account *auth.Auth) ([]upstream.Task, error) {
+// claimSweepTask 按任务来源（默认/mp 列表）选择领奖端点。mp 列表下发的任务必须
+// 带 mp 头，否则上游返回 task not found；共享任务仍走 Web 端点。
+func (p *Panel) claimSweepTask(account *auth.Auth, task *sweepTask) (int64, int64, error) {
+	if task.MP || isMPTaskCode(task.Task.TaskCode) {
+		credit, energy, err := p.cfg.Upstream.ClaimRewardMP(account, task.Task.TaskCode)
+		if err != nil {
+			return 0, 0, fmt.Errorf("claimSweepTask: %w", err)
+		}
+
+		return credit, energy, nil
+	}
+
+	credit, energy, err := p.cfg.Upstream.ClaimReward(account, task.Task.TaskCode)
+	if err != nil {
+		return 0, 0, fmt.Errorf("claimSweepTask: %w", err)
+	}
+
+	return credit, energy, nil
+}
+
+// shouldAcceptTask 报告任务是否需要先接受：未领、未锁定、且尚未 accepted/completed。
+func shouldAcceptTask(task *upstream.Task) bool {
+	if task.TaskCode == "" || task.Claimed || task.Locked {
+		return false
+	}
+
+	return task.AcceptStatus != "accepted" && task.AcceptStatus != "completed"
+}
+
+// acceptSweepTasks 接受尚未接受的任务（默认/mp 口径分开提交，端标记不可混用）。
+// 失败只记日志并计入 Failed；接受失败时仍继续尝试领取（既已接受的任务不受影响）。
+func (p *Panel) acceptSweepTasks(account *auth.Auth, tasks []sweepTask) (accepted, failed int) {
+	var webCodes, mpCodes []string
+
+	for i := range tasks {
+		if !shouldAcceptTask(&tasks[i].Task) {
+			continue
+		}
+
+		if tasks[i].MP || isMPTaskCode(tasks[i].Task.TaskCode) {
+			mpCodes = append(mpCodes, tasks[i].Task.TaskCode)
+		} else {
+			webCodes = append(webCodes, tasks[i].Task.TaskCode)
+		}
+	}
+
+	acceptedWeb, failedWeb := p.acceptCodes(account, webCodes, false)
+	acceptedMP, failedMP := p.acceptCodes(account, mpCodes, true)
+
+	return acceptedWeb + acceptedMP, failedWeb + failedMP
+}
+
+// acceptCodes 提交一批同端任务的接受请求；返回成功条数与失败次数（0/1）。
+func (p *Panel) acceptCodes(account *auth.Auth, codes []string, isMP bool) (accepted, failed int) {
+	if len(codes) == 0 {
+		return 0, 0
+	}
+
+	var err error
+	if isMP {
+		err = p.cfg.Upstream.AcceptTasksMP(account, codes)
+	} else {
+		err = p.cfg.Upstream.AcceptTasks(account, codes)
+	}
+
+	if err != nil {
+		log.Printf("WARN: [panel] 任务补领清扫 acct=%s: 接受任务失败（mp=%v）: %v",
+			logfmt.Label(account.UID, account.NicknameValue()), isMP, err)
+
+		return 0, 1
+	}
+
+	return len(codes), 0
+}
+
+// sweepTask 清扫任务及其来源口径：mp 列表下发的任务 accept/claim 都要带 mp 头。
+type sweepTask struct {
+	Task upstream.Task
+	MP   bool
+}
+
+// sweepTasks 返回该账号的默认 + 小程序两口径任务（按 task_code 去重合并）。
+// 合并时优先保留「可领」的同名条目（两口径的进度/领取状态可能瞬时不一致）；共享
+// 任务保留默认口径的来源标记，只有 mp 列表下发的任务标记 MP。
+// 单口径失败不致命：另一口径仍可照常接受/补领。
+func (p *Panel) sweepTasks(account *auth.Auth) ([]sweepTask, error) {
 	primary, primaryErr := p.cfg.Upstream.ListTasks(account)
 	if primaryErr != nil {
 		primary = nil
@@ -199,27 +295,43 @@ func (p *Panel) claimableTasks(account *auth.Auth) ([]upstream.Task, error) {
 	}
 
 	if primaryErr != nil && mpErr != nil {
-		return nil, fmt.Errorf("claimableTasks: %w", primaryErr)
+		return nil, fmt.Errorf("sweepTasks: %w", primaryErr)
 	}
 
-	merged := make([]upstream.Task, 0, len(primary)+len(secondary))
+	return mergeSweepTasks(primary, secondary), nil
+}
 
-	seen := make(map[string]bool, len(primary)+len(secondary))
+// mergeSweepTasks 合并默认/mp 两口径任务：按 task_code 去重，优先保留「可领」的
+// 同名条目；共享任务保留默认口径的来源标记（领奖走 Web 端点），只有 mp 列表
+// 下发的任务标记 MP（accept/claim 必须带 mp 头）。
+func mergeSweepTasks(primary, secondary []upstream.Task) []sweepTask {
+	merged := make([]sweepTask, 0, len(primary)+len(secondary))
 
-	for _, list := range [][]upstream.Task{primary, secondary} {
-		for i := range list {
-			task := &list[i]
-			// 先判 Claimable 再去重：两口径对同一 task_code 的进度/领取状态可能
-			// 瞬时不一致，先出现的「不可领」条目不能把后出现的「可领」条目吃掉。
-			if task.TaskCode == "" || !task.Claimable || seen[task.TaskCode] {
+	index := make(map[string]int, len(primary)+len(secondary))
+
+	for _, list := range []struct {
+		tasks []upstream.Task
+		mp    bool
+	}{{primary, false}, {secondary, true}} {
+		for i := range list.tasks {
+			task := &list.tasks[i]
+			if task.TaskCode == "" {
 				continue
 			}
 
-			seen[task.TaskCode] = true
+			if idx, ok := index[task.TaskCode]; ok {
+				if !merged[idx].Task.Claimable && task.Claimable {
+					merged[idx].Task = *task
+				}
 
-			merged = append(merged, *task)
+				continue
+			}
+
+			index[task.TaskCode] = len(merged)
+
+			merged = append(merged, sweepTask{Task: *task, MP: list.mp})
 		}
 	}
 
-	return merged, nil
+	return merged
 }
