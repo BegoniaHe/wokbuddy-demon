@@ -20,8 +20,9 @@ import (
 // sweepUpstream 假上游：按「是否为 mp 请求」返回不同任务列表，并统计 claim 次数。
 type sweepUpstream struct {
 	mu sync.Mutex
-	// claimed 已领取的 task_code 集合（第二轮返回 claimed 形态，实现幂等）。
-	claimed map[string]bool
+	// claimed 已领取的 task_code 集合，按账号 token 分桶（上游状态本就是账号级，
+	// 多账号并发清扫时共享一份会互相污染列表口径）。第二轮据此返回 claimed 形态。
+	claimed map[string]map[string]bool
 	// defaultTasks / mpTasks 任务模板（target/current）。
 	defaultTasks []string
 	mpTasks      []string
@@ -52,7 +53,7 @@ func (u *sweepUpstream) panel(t *testing.T, accounts ...*auth.Auth) *Panel {
 		if strings.HasSuffix(r.URL.Path, "/claim") {
 			code := taskCodeFromClaimPath(r.URL.Path)
 			u.claims[code]++
-			u.claimed[code] = true
+			u.claimedFor(r)[code] = true
 			_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"credit":10,"energy":1}}`))
 
 			return
@@ -65,7 +66,7 @@ func (u *sweepUpstream) panel(t *testing.T, accounts ...*auth.Auth) *Panel {
 			codes = u.mpTasks
 		}
 
-		_, _ = w.Write([]byte(taskListJSON(codes, u.claimed)))
+		_, _ = w.Write([]byte(taskListJSON(codes, u.claimedFor(r))))
 	}))
 	t.Cleanup(srv.Close)
 
@@ -81,6 +82,19 @@ func (u *sweepUpstream) panel(t *testing.T, accounts ...*auth.Auth) *Panel {
 	}
 
 	return &Panel{cfg: Config{Pool: state, Upstream: client}}
+}
+
+// claimedFor 返回该请求所属账号的已领取集合（按 Authorization 分桶）。
+func (u *sweepUpstream) claimedFor(r *http.Request) map[string]bool {
+	key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+
+	set := u.claimed[key]
+	if set == nil {
+		set = map[string]bool{}
+		u.claimed[key] = set
+	}
+
+	return set
 }
 
 // taskCodeFromClaimPath 从 .../tasks/<code>/claim 取 code。
@@ -111,7 +125,7 @@ func taskListJSON(codes []string, claimed map[string]bool) string {
 
 func newSweepUpstream() *sweepUpstream {
 	return &sweepUpstream{
-		claimed: map[string]bool{},
+		claimed: map[string]map[string]bool{},
 		claims:  map[string]int{},
 	}
 }
