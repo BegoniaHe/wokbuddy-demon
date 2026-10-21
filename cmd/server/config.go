@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -985,6 +986,15 @@ func validateDNSServer(server string) error {
 
 		if num, convErr := strconv.Atoi(port); convErr != nil || num <= 0 || num > 65535 {
 			return fmt.Errorf("dns_servers[%q]: 端口必须是 1-65535 的数字: %w",
+				server, errNormalizeDNSServersFailed)
+		}
+	} else if strings.Contains(server, ":") {
+		// 没有可解析的端口，但含冒号：只可能是裸 IPv6（可带方括号）。
+		// 形如 "1.1.1.1:53:54" / "foo::bar:baz" 的畸形写法必须拒绝，否则启动后
+		// 全部出站解析都会指向一个不可用的地址。
+		host = strings.TrimSuffix(strings.TrimPrefix(server, "["), "]")
+		if _, addrErr := netip.ParseAddr(host); addrErr != nil {
+			return fmt.Errorf("dns_servers[%q]: 只接受 host / host:port / [IPv6]:port: %w",
 				server, errNormalizeDNSServersFailed)
 		}
 	}

@@ -23,6 +23,24 @@ func TestDNSServersParse(t *testing.T) {
 	}
 }
 
+// TestDNSServersAcceptsIPv6 裸 IPv6 / 带方括号 / 带端口都合法（缺省端口补齐在 upstream 侧）。
+func TestDNSServersAcceptsIPv6(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := ParseConfig([]byte(`{
+		"listen": ":7863",
+		"dns_servers": ["2606:4700::1", "[2606:4700::1]", "[2606:4700::1]:5353"]
+	}`))
+	if err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+
+	want := []string{"2606:4700::1", "[2606:4700::1]", "[2606:4700::1]:5353"}
+	if !slices.Equal(cfg.DNSServers, want) {
+		t.Fatalf("dns_servers=%v want %v", cfg.DNSServers, want)
+	}
+}
+
 // TestDNSServersRejectsInvalid 非法写法（scheme / 路径 / 坏端口）拒绝启动。
 func TestDNSServersRejectsInvalid(t *testing.T) {
 	t.Parallel()
@@ -33,6 +51,8 @@ func TestDNSServersRejectsInvalid(t *testing.T) {
 		"1.1.1.1:0",
 		"1.1.1.1:70000",
 		"1.1.1.1:abc",
+		"1.1.1.1:53:54",
+		"foo::bar:baz",
 	} {
 		if _, err := ParseConfig([]byte(`{"listen": ":7863", "dns_servers": ["` + bad + `"]}`)); err == nil {
 			t.Errorf("dns_servers[%q] 应被拒绝", bad)
