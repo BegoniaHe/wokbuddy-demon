@@ -320,6 +320,8 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
 	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
+	// 图像生成（issue #253）：默认关闭，开启后独立透传 /v2/images/generations。
+	h.mux.HandleFunc("POST /v1/images/generations", h.withRecovery(h.withClientAuth(h.imagesGenerationsHandler)))
 	h.mux.HandleFunc("POST /v1/messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
 	// 部分 Anthropic 客户端把 base URL 配成 .../v1，再拼 /messages；保留同义别名。
 	h.mux.HandleFunc("POST /messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
@@ -2472,7 +2474,7 @@ func (f *chatFlow) retryModelNotFoundCrossRealm(
 func (h *Handler) tracedPath(r *http.Request) bool {
 	switch r.URL.Path {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
-		"/v1/responses", "/v1/search/messages":
+		"/v1/responses", "/v1/search/messages", "/v1/images/generations":
 		return true
 	}
 

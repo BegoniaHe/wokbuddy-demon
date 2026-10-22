@@ -302,6 +302,9 @@ type Config struct {
 		// multimodal_routing 同口径默认关闭；热生效。当前只放行 CN 域账号选号
 		// （上游仅在 CN 域实测过，两域放开留 TODO）。
 		SearchEndpoint bool `json:"search_endpoint"`
+		// ImagesEndpoint 是否开放 POST /v1/images/generations（issue #253）。
+		// 默认 false：图像端点尚未在真实账号验证鉴权/计费，与 search_endpoint 同口径。
+		ImagesEndpoint bool `json:"images_endpoint"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`
