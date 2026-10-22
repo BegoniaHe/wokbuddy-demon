@@ -2,10 +2,12 @@ package session
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // imagePartSig 计算 part 原文摘要（sha256 前 8 hex），供期望值精确构造——
@@ -76,6 +78,30 @@ func TestNewUUIDv7HexFormat(t *testing.T) {
 		}
 
 		prev = id
+	}
+}
+
+// TestNewUUIDv7HexTimestamp 前 48 位必须是当前 Unix 毫秒（允许调用前后 1s 抖动）。
+func TestNewUUIDv7HexTimestamp(t *testing.T) {
+	t.Parallel()
+
+	before := time.Now().UnixMilli()
+
+	id := NewUUIDv7Hex()
+
+	after := time.Now().UnixMilli()
+
+	raw, err := hex.DecodeString(id)
+	if err != nil {
+		t.Fatalf("DecodeString(%q): %v", id, err)
+	}
+
+	var high [8]byte
+	copy(high[2:], raw[:6])
+
+	got := int64(binary.BigEndian.Uint64(high[:]))
+	if got < before || got > after {
+		t.Fatalf("UUIDv7 时间戳=%d 不在 [%d,%d]（前 48 位未写入当前毫秒）", got, before, after)
 	}
 }
 

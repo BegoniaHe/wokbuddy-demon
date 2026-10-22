@@ -47,7 +47,8 @@ func NewUUIDv7Hex() string {
 
 	var timestamp [8]byte
 	binary.BigEndian.PutUint64(timestamp[:], uint64(time.Now().UnixMilli()))
-	copy(buf[:6], timestamp[:6])
+	// Unix 毫秒只占 8 字节的后 6 字节（高 2 字节恒 0），UUIDv7 取低 48 位时间戳。
+	copy(buf[:6], timestamp[2:])
 
 	return uuidV7Hex(buf[:])
 }
