@@ -278,8 +278,8 @@ func poke(ch chan struct{}) {
 }
 
 // nextFireIn 返回 now 之后最近的一个整点触发时间；loc 为空时按 now 的时区解释，
-// 非空时 hours 按 loc（例如 CST）解释。仅黑猫任务需要固定 CST：上游窗口按 CST，
-// 其他任务保留操作者本地时钟（含 DST 语义）。
+// 非空时 hours 按 loc 解释。生产排程统一传 cst.Loc（issue #252）；loc 为空仅用于
+// 保留墙钟/DST 归一化算法的独立测试。
 func nextFireIn(now time.Time, hours []int, loc *time.Location) time.Time {
 	if loc == nil {
 		loc = now.Location()
@@ -399,13 +399,14 @@ func (s *Scheduler) candidateSlots(now time.Time) []wakeSlot {
 		disabled bool
 		loc      *time.Location
 	}{
-		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled, nil},
-		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled, nil},
-		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled, nil},
-		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled, nil},
-		// 夜猫子窗口固定 CST：按宿主本地小时排程会让非 UTC+8 主机落在窗口外。
+		// 所有排程统一按 CST 解释：上游日界/签到重置/窗口都按 Asia/Shanghai，
+		// 宿主时区（UTC 容器/NAS/海外 VPS）不得让任务漂移（issue #252）。
+		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled, cst.Loc},
+		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled, cst.Loc},
+		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled, cst.Loc},
+		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled, cst.Loc},
 		{s.cfg.BlackcatHours, taskBlackcat, s.cfg.BlackcatDisabled, cst.Loc},
-		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled, nil},
+		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled, cst.Loc},
 	}
 	s.schedMu.Unlock()
 

@@ -1211,3 +1211,50 @@ func TestSetBalanceIntervalUpdatesMeta(t *testing.T) {
 		t.Fatalf("重开后 meta=%d/%v want 300/%v", sec, at, refreshedAt)
 	}
 }
+
+// TestCandidateSlotsAlwaysCST 宿主时区不影响排程：UTC 容器下 09/21 点按 CST 触发。
+func TestCandidateSlotsAlwaysCST(t *testing.T) {
+	t.Parallel()
+
+	for _, zone := range []*time.Location{
+		time.UTC,
+		mustLoadLocation(t, "America/Santiago"),
+		mustLoadLocation(t, "Pacific/Chatham"),
+	} {
+		scheduler := New(&Config{
+			CheckinHours:      []int{9},
+			TravelDisabled:    true,
+			ActivityDisabled:  true,
+			KeepaliveDisabled: true,
+			BlackcatDisabled:  true,
+			GrowthDisabled:    true,
+		})
+
+		hostNow := time.Date(2026, 10, 21, 12, 0, 0, 0, zone)
+		slots := scheduler.candidateSlots(hostNow)
+		if len(slots) != 1 {
+			t.Fatalf("zone=%v slots=%v", zone, slots)
+		}
+
+		cstNow := hostNow.In(cst.Loc)
+		want := time.Date(cstNow.Year(), cstNow.Month(), cstNow.Day(), 9, 0, 0, 0, cst.Loc)
+		if !want.After(hostNow) {
+			want = want.AddDate(0, 0, 1)
+		}
+
+		if got := slots[0].at; !got.Equal(want) {
+			t.Fatalf("zone=%v next=%v want %v", zone, got, want)
+		}
+	}
+}
+
+func mustLoadLocation(t *testing.T, name string) *time.Location {
+	t.Helper()
+
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return loc
+}
