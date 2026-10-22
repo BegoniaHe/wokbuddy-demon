@@ -1856,6 +1856,9 @@ func (c *Config) normalizeCheckinDelay() error {
 type timingDurations struct {
 	jitterRaw, floorRaw, ceilingRaw, phaseRaw string
 	jitter, floor, ceiling, phase             time.Duration
+	// floorExplicit / ceilingExplicit 记录用户是否显式配置夹逼：缺省值只做默认
+	// 形状，不应让已有配置（checkin_account_delay 超出默认区间）升级后拒绝启动。
+	floorExplicit, ceilingExplicit bool
 }
 
 // normalizeTimingShape 解析并校验时序整形参数（issue #220）。
@@ -1866,6 +1869,8 @@ func (c *Config) normalizeTimingShape() error {
 	if err != nil {
 		return err
 	}
+
+	c.adaptImplicitTimingClamp(&parsed)
 
 	if err := c.validateTimingShape(&parsed); err != nil {
 		return err
@@ -1899,10 +1904,14 @@ func (c *Config) parseTimingDurations() (timingDurations, error) {
 		return parsed, err
 	}
 
+	parsed.floorExplicit = strings.TrimSpace(c.Schedule.AccountPacingFloor) != ""
+
 	if parsed.floorRaw, parsed.floor, err = normalizeTimingDuration(
 		"account_pacing_floor", c.Schedule.AccountPacingFloor, "250ms"); err != nil {
 		return parsed, err
 	}
+
+	parsed.ceilingExplicit = strings.TrimSpace(c.Schedule.AccountPacingCeiling) != ""
 
 	if parsed.ceilingRaw, parsed.ceiling, err = normalizeTimingDuration(
 		"account_pacing_ceiling", c.Schedule.AccountPacingCeiling, "6s"); err != nil {
@@ -1934,22 +1943,66 @@ func (c *Config) validateTimingShape(parsed *timingDurations) error {
 	return c.validateTimingClamp(parsed)
 }
 
-// validateTimingClamp 校验 floor/ceiling 与 median 的关系；median<=0 时不设夹逼。
+// validateTimingClamp 校验显式配置的 floor/ceiling 与 median 的关系；
+// median<=0 或字段缺省（用默认值）时不判定矛盾。
 func (c *Config) validateTimingClamp(parsed *timingDurations) error {
 	median := c.CheckinAccountDelayDur
 	if median <= 0 {
 		return nil
 	}
 
-	if parsed.floor > 0 && parsed.floor > median {
+	if parsed.floorExplicit && parsed.floor > 0 && parsed.floor > median {
 		return fmt.Errorf("%w: %q > %v", errTimingPacingFloorAboveMedian, parsed.floorRaw, median)
 	}
 
-	if parsed.ceiling > 0 && median > parsed.ceiling {
+	if parsed.ceilingExplicit && parsed.ceiling > 0 && median > parsed.ceiling {
 		return fmt.Errorf("%w: %q < %v", errTimingPacingCeilingBelowMedian, parsed.ceilingRaw, median)
 	}
 
 	return nil
+}
+
+// adaptImplicitTimingClamp 让缺省夹逼向显式值 / median 让位：默认 250ms~6s
+// 只描述"常见配置的形状"，不应硬性约束既有 checkin_account_delay（如 100ms /
+// 10s），也不应把隐式一侧当成用户配置来报错。显式配置的矛盾仍由
+// validateTimingClamp 报错。
+func (c *Config) adaptImplicitTimingClamp(parsed *timingDurations) {
+	parsed.adaptImplicitBounds()
+	c.adaptBoundsToMedian(parsed)
+}
+
+// adaptImplicitBounds 处理隐式一侧与显式另一侧的先后关系。
+func (parsed *timingDurations) adaptImplicitBounds() {
+	// 显式一侧优先：隐式 floor 超过显式 ceiling（ceiling=0 表示不设上限）时收窄。
+	if !parsed.floorExplicit && parsed.ceilingExplicit && parsed.ceiling > 0 &&
+		parsed.floor > parsed.ceiling {
+		parsed.floor = parsed.ceiling
+		parsed.floorRaw = parsed.ceilingRaw
+	}
+
+	// 隐式 ceiling 至少覆盖显式 floor。
+	if !parsed.ceilingExplicit && parsed.floor > parsed.ceiling {
+		parsed.ceiling = parsed.floor
+		parsed.ceilingRaw = parsed.floorRaw
+	}
+}
+
+// adaptBoundsToMedian 让隐式夹逼覆盖 median，兼容旧配置的极端间隔。
+func (c *Config) adaptBoundsToMedian(parsed *timingDurations) {
+	median := c.CheckinAccountDelayDur
+	if median <= 0 {
+		return
+	}
+
+	if !parsed.floorExplicit && parsed.floor > median {
+		parsed.floor = median
+		parsed.floorRaw = median.String()
+	}
+
+	if !parsed.ceilingExplicit && parsed.ceiling < median {
+		parsed.ceiling = median
+		parsed.ceilingRaw = median.String()
+	}
 }
 
 // normalizeTimingDuration 解析时序整形时长：空值回落默认，负值报错。

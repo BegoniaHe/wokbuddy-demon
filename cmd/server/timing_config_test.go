@@ -49,6 +49,68 @@ func TestTimingShapeConfigZero(t *testing.T) {
 	}
 }
 
+// TestTimingShapeConfigImplicitClampAdapts 旧配置的 checkin_account_delay
+// 超出默认夹逼区间时，缺省一侧自动让位而不是拒绝启动。
+func TestTimingShapeConfigImplicitClampAdapts(t *testing.T) {
+	t.Parallel()
+
+	config := Default()
+	config.Schedule.CheckinAccountDelay = "100ms"
+	config.Schedule.AccountPacingFloor = ""
+
+	if err := config.normalize(); err != nil {
+		t.Fatalf("median 100ms 不应报错: %v", err)
+	}
+
+	if config.Timing.PacingFloor != 100*time.Millisecond {
+		t.Fatalf("floor=%v want 100ms（默认值向 median 让位）", config.Timing.PacingFloor)
+	}
+
+	config = Default()
+	config.Schedule.CheckinAccountDelay = "10s"
+	config.Schedule.AccountPacingCeiling = ""
+
+	if err := config.normalize(); err != nil {
+		t.Fatalf("median 10s 不应报错: %v", err)
+	}
+
+	if config.Timing.PacingCeiling != 10*time.Second {
+		t.Fatalf("ceiling=%v want 10s（默认值向 median 让位）", config.Timing.PacingCeiling)
+	}
+}
+
+// TestTimingShapeConfigImplicitSideYieldsToExplicit 显式一侧优先：
+// 显式 floor 抬高时隐式 ceiling 跟随，显式 ceiling 压低时隐式 floor 跟随。
+func TestTimingShapeConfigImplicitSideYieldsToExplicit(t *testing.T) {
+	t.Parallel()
+
+	config := Default()
+	config.Schedule.CheckinAccountDelay = "8s"
+	config.Schedule.AccountPacingFloor = "7s"
+	config.Schedule.AccountPacingCeiling = ""
+
+	if err := config.normalize(); err != nil {
+		t.Fatalf("显式 floor 7s 不应被隐式 ceiling 6s 拒绝: %v", err)
+	}
+
+	if config.Timing.PacingCeiling != 8*time.Second {
+		t.Fatalf("ceiling=%v want 8s", config.Timing.PacingCeiling)
+	}
+
+	config = Default()
+	config.Schedule.CheckinAccountDelay = "100ms"
+	config.Schedule.AccountPacingFloor = ""
+	config.Schedule.AccountPacingCeiling = "100ms"
+
+	if err := config.normalize(); err != nil {
+		t.Fatalf("显式 ceiling 100ms 不应被隐式 floor 250ms 拒绝: %v", err)
+	}
+
+	if config.Timing.PacingFloor != 100*time.Millisecond {
+		t.Fatalf("floor=%v want 100ms", config.Timing.PacingFloor)
+	}
+}
+
 // TestTimingShapeConfigRejectsInvalid 非法值报错而不静默回落。
 func TestTimingShapeConfigRejectsInvalid(t *testing.T) {
 	t.Parallel()
