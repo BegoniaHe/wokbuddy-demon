@@ -112,6 +112,8 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 // （IsModelRateLimit 对帧 JSON 直接命中）优先；其余先取帧内业务码
 // （error.code / error.data.code / data.code，字符串或数字），取不到再回落
 // error.message 走 Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
+//
+//nolint:cyclop // 帧形态按优先级线性判定。
 func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
@@ -277,7 +279,9 @@ func BusinessFrameError(payload string) (code, msg string, ok bool) {
 
 // mustRaw 把已解码值重新编码为 json.RawMessage（仅用于复用 firstJSONCode）。
 func mustRaw(value any) json.RawMessage {
+	//nolint:errchkjson // value 来自已解码 JSON，Marshal 不会失败。
 	raw, _ := json.Marshal(value)
+
 	return raw
 }
 

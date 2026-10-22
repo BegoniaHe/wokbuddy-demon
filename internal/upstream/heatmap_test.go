@@ -40,5 +40,4 @@ func TestHeatmapMissedDays(t *testing.T) {
 			t.Fatalf("days=%v want %v", days, want)
 		}
 	}
-
 }

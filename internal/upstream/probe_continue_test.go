@@ -30,6 +30,7 @@ func TestProbeStreamZeroOutputLength(t *testing.T) {
 
 	frame := `data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n"
 	probe := ProbeStream(strings.NewReader(frame))
+
 	if !probe.ZeroOutputLength {
 		t.Fatalf("ZeroOutputLength=false probe=%+v", probe)
 	}

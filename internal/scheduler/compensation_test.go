@@ -32,6 +32,7 @@ func (f *compensationFixture) scheduler(t *testing.T, accounts ...*auth.Auth) *S
 
 		if r.URL.Path == "/v2/billing/meter/compensation-status" || r.URL.Path == "/billing/meter/compensation-status" {
 			call := f.statusCalls.Add(1)
+
 			body := f.statusBody
 			if call > 1 && f.statusBodyAfter != "" {
 				body = f.statusBodyAfter

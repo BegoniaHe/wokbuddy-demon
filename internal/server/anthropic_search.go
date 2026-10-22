@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
@@ -32,9 +33,9 @@ func (h *Handler) anthropicConvertWithSearch(
 	}
 
 	if !declaresWebSearch(req.Tools) || !h.loadLive().SearchEndpoint {
-		converted, err := anthropicConvertRequest(req)
+		converted, convErr := anthropicConvertRequest(req)
 
-		return converted, nil, err
+		return converted, nil, convErr
 	}
 
 	query := anthropicLastUserText(req.Messages)
@@ -66,12 +67,12 @@ func (h *Handler) anthropicConvertWithSearch(
 
 // anthropicLastUserText 取最后一条 user 消息的文本（块数组只取 text 块）。
 func anthropicLastUserText(messages []json.RawMessage) string {
-	for i := len(messages) - 1; i >= 0; i-- {
+	for _, raw := range slices.Backward(messages) {
 		var msg struct {
 			Role    string          `json:"role"`
 			Content json.RawMessage `json:"content"`
 		}
-		if json.Unmarshal(messages[i], &msg) != nil || msg.Role != "user" {
+		if json.Unmarshal(raw, &msg) != nil || msg.Role != "user" {
 			continue
 		}
 

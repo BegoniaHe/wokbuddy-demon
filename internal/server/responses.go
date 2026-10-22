@@ -473,7 +473,7 @@ func responsesInputMessage(item map[string]any) (any, error) {
 
 // responsesInputFunctionCall 把 Responses function_call 映射为 assistant tool_calls。
 func responsesInputFunctionCall(item map[string]any, refs map[string]responsesToolRef) (any, error) {
-	name := stringValue(item["name"])
+	name := responsesUpstreamToolName(stringValue(item["name"]), refs)
 	if name == "" {
 		return nil, errFunctionCallNameIsRequired
 	}
@@ -1329,6 +1329,7 @@ func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map
 		}
 
 		args := stringValue(fn["arguments"])
+
 		status := "completed"
 		if finishReason == "length" {
 			status = "incomplete"

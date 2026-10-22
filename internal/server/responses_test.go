@@ -996,6 +996,7 @@ func TestResponsesCustomToolTruncatedIncomplete(t *testing.T) {
 	}
 
 	resp := responsesFromOpenAI(body, "m", "", map[string]bool{"apply_patch": true})
+
 	output := resp["output"].([]any)
 	if len(output) != 2 {
 		t.Fatalf("output=%v", output)

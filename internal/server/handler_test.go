@@ -1189,13 +1189,13 @@ func TestChatSessionDeadDisablesAtThreshold(t *testing.T) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
 	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(&Config{Pool: state, Upstream: up})
+	handler := NewHandler(&Config{Pool: state, Upstream: up})
 
 	// Issue #245：一次 401 只进入会话失效计数（面板显示待重登），连续达到阈值才禁用。
 	for i := range 3 {
 		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
+		handler.ServeHTTP(rec, req)
 
 		if rec.Code != 503 {
 			t.Errorf("attempt %d code=%d", i, rec.Code)

@@ -60,40 +60,9 @@ type TravelRunResult struct {
 func (s *Scheduler) RunTravelNowFor(uid string) TravelRunResult {
 	result := TravelRunResult{UID: uid}
 
-	status, ok := s.cfg.Pool.Status(uid)
-	if !ok {
-		result.SkipReason = "账号不存在"
-
-		return result
-	}
-
-	if status.Disabled {
-		result.SkipReason = "账号已禁用"
-
-		return result
-	}
-
-	if status.Paused {
-		result.SkipReason = "账号已暂停选号"
-
-		return result
-	}
-
-	account := s.cfg.Pool.AuthByUID(uid)
-	if account == nil || account.RefreshTokenValue() == "" {
-		result.SkipReason = "账号凭证缺失"
-
-		return result
-	}
-
-	if account.IsGlobal() {
-		result.SkipReason = "国际版（global）账号无 CN 旅行体系"
-
-		return result
-	}
-
-	if account.IsEnterpriseSession() {
-		result.SkipReason = "企业版/企业切换会话无个人旅行体系"
+	account, reason := s.travelAccountGate(uid)
+	if reason != "" {
+		result.SkipReason = reason
 
 		return result
 	}
@@ -105,6 +74,7 @@ func (s *Scheduler) RunTravelNowFor(uid string) TravelRunResult {
 	}
 
 	okRun := s.travelOne(account)
+
 	success, failure := 0, 0
 	if okRun {
 		success = 1
@@ -119,6 +89,37 @@ func (s *Scheduler) RunTravelNowFor(uid string) TravelRunResult {
 	log.Printf("panel: 按号旅行 uid=%s ok=%v", logfmt.Label(uid, account.NicknameValue()), okRun)
 
 	return result
+}
+
+// travelAccountGate 按号旅行的账号门控（disabled/global/enterprise/paused/凭证）。
+func (s *Scheduler) travelAccountGate(uid string) (*auth.Auth, string) {
+	status, ok := s.cfg.Pool.Status(uid)
+	if !ok {
+		return nil, "账号不存在"
+	}
+
+	if status.Disabled {
+		return nil, "账号已禁用"
+	}
+
+	if status.Paused {
+		return nil, "账号已暂停选号"
+	}
+
+	account := s.cfg.Pool.AuthByUID(uid)
+	if account == nil || account.RefreshTokenValue() == "" {
+		return nil, "账号凭证缺失"
+	}
+
+	if account.IsGlobal() {
+		return nil, "国际版（global）账号无 CN 旅行体系"
+	}
+
+	if account.IsEnterpriseSession() {
+		return nil, "企业版/企业切换会话无个人旅行体系"
+	}
+
+	return account, ""
 }
 
 // travelAll 旅行巡检实体；返回尝试/成功/失败账号数（跳过不计数）。

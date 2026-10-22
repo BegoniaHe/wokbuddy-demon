@@ -7,6 +7,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"slices"
 	"strings"
 )
 
@@ -612,6 +613,8 @@ func unescapePatternProperties(n map[string]any) {
 // injectConversationRequestID 给当前轮最后一条 user 消息补
 // conversationRequestId / startsNewUserRequest（issue #249）。只改最后一条 user，
 // 历史轮次不动；客户端自带值优先。没有 user 消息或 body 不可解析时原样返回。
+//
+//nolint:cyclop // 解析 + 找到最后一条 user + 保留客户端值。
 func injectConversationRequestID(body []byte, requestID string) []byte {
 	if requestID == "" || len(body) == 0 {
 		return body
@@ -627,8 +630,8 @@ func injectConversationRequestID(body []byte, requestID string) []byte {
 		return body
 	}
 
-	for i := len(msgs) - 1; i >= 0; i-- {
-		msg, ok := msgs[i].(map[string]any)
+	for _, raw := range slices.Backward(msgs) {
+		msg, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}

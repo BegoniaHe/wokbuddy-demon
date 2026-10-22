@@ -10,8 +10,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 
@@ -23,6 +25,8 @@ const (
 	modelBusyBatch   = 50
 	modelBusyMaxBody = 1 << 20
 )
+
+var errModelBusyTooLarge = errors.New("model busy response too large")
 
 // ModelBusy 查询一批模型的繁忙度（内部按 50 分批）。返回 model → level。
 func (c *Client) ModelBusy(ctx context.Context, account *auth.Auth, models []string) (map[string]string, error) {
@@ -41,9 +45,7 @@ func (c *Client) ModelBusy(ctx context.Context, account *auth.Auth, models []str
 			return out, err
 		}
 
-		for model, level := range levels {
-			out[model] = level
-		}
+		maps.Copy(out, levels)
 	}
 
 	return out, nil
@@ -78,7 +80,7 @@ func (c *Client) modelBusyBatch(ctx context.Context, account *auth.Auth, models 
 	}
 
 	if int64(len(body)) > modelBusyMaxBody {
-		return nil, fmt.Errorf("ModelBusy: response exceeds %d bytes", modelBusyMaxBody)
+		return nil, fmt.Errorf("%w: > %d bytes", errModelBusyTooLarge, modelBusyMaxBody)
 	}
 
 	if resp.StatusCode >= 400 {
@@ -111,6 +113,8 @@ func parseModelBusy(body []byte) map[string]string {
 }
 
 // collectModelBusy 递归收集 model→level（深度有界）。
+//
+//nolint:cyclop,gocognit // 兼容三种响应形态，深度有界且分支集中。
 func collectModelBusy(node any, out map[string]string, depth int) {
 	if depth > 3 {
 		return

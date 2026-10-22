@@ -50,7 +50,9 @@ func NewTextContinueReader(src io.ReadCloser, initialText string, hasTool bool, 
 }
 
 // Read 实现 io.Reader：优先返回内部缓冲，行级解析并改写终态。
-func (c *TextContinueReader) Read(p []byte) (int, error) {
+//
+//nolint:wrapcheck // io.Reader 实现直接返回底层错误。
+func (c *TextContinueReader) Read(dst []byte) (int, error) {
 	for c.out.Len() == 0 {
 		if c.done {
 			if c.err != nil {
@@ -65,13 +67,14 @@ func (c *TextContinueReader) Read(p []byte) (int, error) {
 
 		if err != nil {
 			c.handleEOF()
+
 			if err != io.EOF {
 				c.err = err
 			}
 		}
 	}
 
-	return c.out.Read(p)
+	return c.out.Read(dst)
 }
 
 // Close 关闭当前上游流。
@@ -84,6 +87,8 @@ func (c *TextContinueReader) Close() error {
 }
 
 // handleLine 处理一行：解析 finish_reason/正文，必要时暂存 length 终态。
+//
+//nolint:cyclop // 行类型分派 + 终态暂存，保持单入口避免状态散落。
 func (c *TextContinueReader) handleLine(line string) {
 	trimmed := strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(trimmed, "data: ") {
@@ -219,15 +224,15 @@ func finishOnlyFrameLine(frame map[string]any) []byte {
 }
 
 // deepCopyMap 经 JSON 往返复制（帧结构小，续写只在截断时触发）。
-func deepCopyMap(in map[string]any) (map[string]any, error) {
-	raw, err := json.Marshal(in)
+func deepCopyMap(src map[string]any) (map[string]any, error) {
+	raw, err := json.Marshal(src)
 	if err != nil {
-		return in, err
+		return src, fmt.Errorf("deepCopyMap marshal: %w", err)
 	}
 
 	var out map[string]any
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return in, err
+		return src, fmt.Errorf("deepCopyMap unmarshal: %w", err)
 	}
 
 	return out, nil
@@ -362,10 +367,10 @@ func (c *TextContinueReader) flushHeld() {
 
 // BuildContinuationBody 在原始请求体后追加 assistant 部分正文与续写指令。
 // 返回的新 body 仍交给 ChatStreamContext（经 prepareBody 脱敏/思考/缓存键管线）。
-func BuildContinuationBody(base []byte, partial string) []byte {
+func BuildContinuationBody(src []byte, partial string) []byte {
 	var obj map[string]any
-	if json.Unmarshal(base, &obj) != nil || obj == nil {
-		return base
+	if json.Unmarshal(src, &obj) != nil || obj == nil {
+		return src
 	}
 
 	msgs, _ := obj["messages"].([]any)
@@ -381,7 +386,7 @@ func BuildContinuationBody(base []byte, partial string) []byte {
 
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return base
+		return src
 	}
 
 	return out
@@ -409,9 +414,4 @@ func DisableThinking(body []byte) []byte {
 	}
 
 	return out
-}
-
-// continuationDebug 供日志使用的简短描述（不含内容）。
-func continuationDebug(partial string) string {
-	return fmt.Sprintf("continue after %d chars", len(partial))
 }

@@ -111,14 +111,19 @@ func classifyErrorText(text string) string {
 		return "session_dead"
 	case strings.Contains(text, "14003"), strings.Contains(lower, "model busy"), strings.Contains(text, "模型繁忙"):
 		return "model_busy"
-	case strings.Contains(lower, "hard_credit"), strings.Contains(text, "余额不足"), strings.Contains(text, "额度不足"), strings.Contains(lower, "402"):
+	case strings.Contains(lower, "hard_credit"),
+		strings.Contains(text, "余额不足"),
+		strings.Contains(text, "额度不足"),
+		strings.Contains(lower, "402"):
 		return "hard_credit"
 	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "429"), strings.Contains(text, "限流"), strings.Contains(text, "冷却"):
 		return "rate_limit"
 	case strings.Contains(lower, "timeout"), strings.Contains(lower, "timed out"), strings.Contains(text, "超时"):
 		return "timeout"
-	case strings.Contains(lower, "truncated"), strings.Contains(lower, "empty upstream"),
-		strings.Contains(lower, "upstream_parse"), strings.Contains(lower, "continuation failed"),
+	case strings.Contains(lower, "truncated"),
+		strings.Contains(lower, "empty upstream"),
+		strings.Contains(lower, "upstream_parse"),
+		strings.Contains(lower, "continuation failed"),
 		strings.Contains(text, "续写"):
 		return "stream_error"
 	case strings.Contains(lower, "error frame"), strings.Contains(lower, "upstream error"):

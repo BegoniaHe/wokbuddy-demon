@@ -25,14 +25,14 @@ func jsonResponse(status int, body string) *http.Response {
 func TestImagesDisabledReturns404(t *testing.T) {
 	t.Parallel()
 
-	h := NewHandler(&Config{
+	handler := NewHandler(&Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 200, `{}`, false }),
 		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: false}),
 	})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
 		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
 
 	if rec.Code != http.StatusNotFound {
@@ -44,6 +44,7 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 	t.Parallel()
 
 	var gotPath, gotAccept string
+
 	var gotBody []byte
 
 	client := &upstream.Client{
@@ -59,7 +60,7 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 		BillingBaseCN: "https://fake.example",
 	}
 
-	h := NewHandler(&Config{
+	handler := NewHandler(&Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: client,
 		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
@@ -67,7 +68,7 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 
 	body := `{"model":"text-to-image","prompt":"cat","n":1}`
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(body)))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(body)))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
@@ -108,16 +109,18 @@ func TestImagesRealmDirectNoFallback(t *testing.T) {
 
 	// 只有 global 号：裸模型默认 cn，必须 fail-fast 而不是回落到 global。
 	state := pool.New("")
+
 	global := &auth.Auth{UID: "g1", AccessToken: "at-global", ExpiresAt: 9999999999}
 	if _, err := auth.BackfillRealmFor(global, "global"); err != nil {
 		t.Fatal(err)
 	}
+
 	state.Add(global)
 
-	h := NewHandler(&Config{Pool: state, Upstream: client, Live: livecfg.New(livecfg.Snapshot{ImagesEndpoint: true})})
+	handler := NewHandler(&Config{Pool: state, Upstream: client, Live: livecfg.New(livecfg.Snapshot{ImagesEndpoint: true})})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
 		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
 
 	if rec.Code != http.StatusServiceUnavailable {

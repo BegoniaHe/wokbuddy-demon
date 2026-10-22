@@ -27,43 +27,8 @@ import (
 
 // imagesGenerationsHandler 出图入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Request) {
-	if !h.loadLive().ImagesEndpoint {
-		writeOpenAIError(w, http.StatusNotFound, "not_found",
-			"images endpoint is disabled; enable features.images_endpoint to use POST /v1/images/generations")
-
-		return
-	}
-
-	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if isBodyTooLarge(err) {
-			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "")
-
-			return
-		}
-
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-
-		return
-	}
-
-	var peek struct {
-		Model string `json:"model"`
-	}
-	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
-
-		return
-	}
-
-	realm, bareModel, _ := splitRealm(strings.TrimSpace(peek.Model))
-	if keyRealm := keyRealmFrom(r.Context()); keyRealm != "" && keyRealm != realm {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			"model realm "+realm+" does not match API key realm "+keyRealm)
-
+	body, realm, bareModel, ok := h.readImagesRequest(w, r)
+	if !ok {
 		return
 	}
 
@@ -83,16 +48,79 @@ func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Reques
 	}
 	defer h.cfg.Pool.Release(acct.UID)
 
-	if acct.NeedsRefresh(h.cfg.RefreshSkew) {
-		if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream token refresh failed")
-
-			return
-		}
-
-		_ = acct.SaveAtomicRetry()
+	if !h.ensureImagesToken(w, acct) {
+		return
 	}
 
+	h.generateImages(w, r, acct, body, realm, bareModel)
+}
+
+// readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
+func (h *Handler) readImagesRequest(w http.ResponseWriter, r *http.Request) ([]byte, string, string, bool) {
+	if !h.loadLive().ImagesEndpoint {
+		writeOpenAIError(w, http.StatusNotFound, "not_found",
+			"images endpoint is disabled; enable features.images_endpoint to use POST /v1/images/generations")
+
+		return nil, "", "", false
+	}
+
+	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "")
+
+			return nil, "", "", false
+		}
+
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+
+		return nil, "", "", false
+	}
+
+	var peek struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
+
+		return nil, "", "", false
+	}
+
+	realm, bareModel, _ := splitRealm(strings.TrimSpace(peek.Model))
+	if keyRealm := keyRealmFrom(r.Context()); keyRealm != "" && keyRealm != realm {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"model realm "+realm+" does not match API key realm "+keyRealm)
+
+		return nil, "", "", false
+	}
+
+	return body, realm, bareModel, true
+}
+
+// ensureImagesToken 临近过期先刷新；失败写出 502。
+func (h *Handler) ensureImagesToken(w http.ResponseWriter, acct *auth.Auth) bool {
+	if !acct.NeedsRefresh(h.cfg.RefreshSkew) {
+		return true
+	}
+
+	if refreshErr := h.cfg.Upstream.RefreshToken(acct); refreshErr != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream token refresh failed")
+
+		return false
+	}
+
+	_ = acct.SaveAtomicRetry()
+
+	return true
+}
+
+// generateImages 发起上游请求，401 同号 refresh 重放一次后记账/收尾。
+func (h *Handler) generateImages(
+	w http.ResponseWriter, r *http.Request, acct *auth.Auth, body []byte, realm, bareModel string,
+) {
 	meta := upstream.ChatMeta{
 		ConversationRequestID: session.NewMessageID(),
 		ConversationID:        metaConversationID(r),
@@ -135,6 +163,7 @@ func (h *Handler) handleImagesError(
 	w http.ResponseWriter, acct *auth.Auth, model string, status int, raw []byte, uerr *upstream.Error,
 ) {
 	kind := uerr.Kind
+
 	h.cfg.Pool.RecordTokenUsage(acct.UID, &pool.TokenUsageDelta{})
 
 	if kind == upstream.ErrSessionDead {

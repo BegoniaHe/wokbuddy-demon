@@ -1268,6 +1268,8 @@ type chatFlow struct {
 	busyWaited bool
 	// zeroRetried 是否已因「length + 零输出」关闭思考重发过（只重发一次，issue #244）。
 	zeroRetried bool
+	// nonstreamContinued 非流式截断续写是否已执行（只续写一次，issue #247）。
+	nonstreamContinued bool
 
 	chatMeta upstream.ChatMeta
 }
@@ -1772,7 +1774,7 @@ func (f *chatFlow) reportNoAccount() {
 
 // attempt 执行一次「选号 → 占名额 → 刷新 token → 转发」尝试，返回控制流去向。
 func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
-	acct := f.pickAccount()
+	acct := f.pickAccountWithBusyWait(ctx)
 	if acct == nil {
 		if f.h.cfg.Pool.AllDailyBlocked(f.bareModel, f.realm) {
 			f.st.dailyLimited = true
@@ -1781,18 +1783,9 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 			return rotBreak
 		}
 
-		// 纯 14003 模型繁忙是可自愈的短暂状态：等待最近解锁时刻一次（上限 10s，
-		// 受 ctx 取消约束），再重新选号。账号级冷却/在途占满不等待（issue #254）。
-		if !f.busyWaited && f.waitForModelBusy(ctx) {
-			f.busyWaited = true
-			acct = f.pickAccount()
-		}
+		f.reportNoAccount()
 
-		if acct == nil {
-			f.reportNoAccount()
-
-			return rotBreak
-		}
+		return rotBreak
 	}
 
 	f.tried[acct.UID] = true
@@ -2138,6 +2131,22 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 }
 
+// pickAccountWithBusyWait 选号；纯 14003 全池阻塞时等待一次后重选（issue #254）。
+func (f *chatFlow) pickAccountWithBusyWait(ctx context.Context) *auth.Auth {
+	acct := f.pickAccount()
+	if acct != nil {
+		return acct
+	}
+
+	if f.busyWaited || !f.waitForModelBusy(ctx) {
+		return nil
+	}
+
+	f.busyWaited = true
+
+	return f.pickAccount()
+}
+
 // waitForModelBusy 纯 14003 全池阻塞时等待一次（≤10s，受 ctx 取消）。等待期间
 // 清空本轮 tried：冷却窗口可能刚好到期，旧排除集会挡住已恢复的账号。
 // 返回 true 表示值得重新选号；账号级冷却/非 busy/ctx 取消返回 false。
@@ -2342,6 +2351,8 @@ func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth) b
 }
 
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
+//
+//nolint:cyclop // 错误类别按优先级线性展开，拆散会掩盖处置顺序。
 func (f *chatFlow) handleHTTPError(
 	ctx context.Context, acct *auth.Auth, status int, respBody []byte,
 	uerr *upstream.Error, attemptStarted time.Time, i int,
@@ -2629,7 +2640,7 @@ func (f *chatFlow) handleStreamSuccess(
 	// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 	f.st.status = http.StatusOK
 
-	stream := io.ReadCloser(probe.ReadCloser(rc))
+	stream := probe.ReadCloser(rc)
 	if !probe.HasTool && probe.Text != "" {
 		stream = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
 			return f.continueUpstream(ctx, acct, partial)
@@ -2670,7 +2681,7 @@ func (f *chatFlow) retryZeroOutputLength(ctx context.Context, acct *auth.Auth, i
 
 	f.st.status = http.StatusBadGateway
 	f.st.outcome = reqlog.OutcomeStreamError
-	f.lastErr = fmt.Errorf("zero_output_length")
+	f.lastErr = errZeroOutputLength
 	f.out.Error(http.StatusBadGateway, "zero_output_length",
 		"upstream hit the output budget before producing any content; retry with a smaller prompt or another model",
 		"upstream returned finish_reason=length with no content; the gateway retried once with thinking disabled")
@@ -2741,10 +2752,10 @@ func (f *chatFlow) continueUpstream(ctx context.Context, acct *auth.Auth, partia
 			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, status, err, logfmt.Truncate(string(respBody), 160))
 
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("continuation request: %w", err)
 		}
 
-		return nil, fmt.Errorf("continuation status %d", status)
+		return nil, fmt.Errorf("%w: status %d", errContinuationFailed, status)
 	}
 
 	log.Printf("INFO: [server] stream acct=%s model=%s: continued truncated response (partial=%d chars)",
@@ -2891,6 +2902,9 @@ func (f *chatFlow) handleNonStreamSuccess(
 
 		return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
 	}
+
+	resp = f.continueNonStream(ctx, acct, resp)
+
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
 	// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
 	// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
@@ -2930,6 +2944,97 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	return rotDone
+}
+
+// continueNonStream 非流式 finish_reason=length 且有正文时续写一次，把第二段
+// 正文拼进同一响应（issue #247）。工具调用不续写；失败保留首段 length 终态。
+func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp map[string]any) map[string]any {
+	if f.nonstreamContinued || len(resp) == 0 {
+		return resp
+	}
+
+	choice := firstChoice(resp)
+	if choice == nil {
+		return resp
+	}
+
+	msg, _ := choice["message"].(map[string]any)
+	if msg == nil {
+		return resp
+	}
+
+	if fr, _ := choice["finish_reason"].(string); fr != "length" {
+		return resp
+	}
+
+	if tools, _ := msg["tool_calls"].([]any); len(tools) > 0 {
+		return resp
+	}
+
+	partial, _ := msg["content"].(string)
+	if partial == "" {
+		return resp
+	}
+
+	f.nonstreamContinued = true
+
+	next, err := f.continueUpstream(ctx, acct, partial)
+	if err != nil {
+		return resp
+	}
+
+	defer next.Close()
+
+	second, err := upstream.Aggregate(next)
+	if err != nil {
+		return resp
+	}
+
+	return mergeNonStreamContinuation(resp, second)
+}
+
+// firstChoice 取 choices[0]。
+func firstChoice(resp map[string]any) map[string]any {
+	choices, _ := resp["choices"].([]any)
+	if len(choices) == 0 {
+		return nil
+	}
+
+	choice, _ := choices[0].(map[string]any)
+
+	return choice
+}
+
+// mergeNonStreamContinuation 拼接两段正文，终态/usage 取第二段（最终回答）。
+func mergeNonStreamContinuation(first, second map[string]any) map[string]any {
+	firstChoiceItem, secondChoiceItem := firstChoice(first), firstChoice(second)
+	if firstChoiceItem == nil || secondChoiceItem == nil {
+		return first
+	}
+
+	firstMessage, _ := firstChoiceItem["message"].(map[string]any)
+	secondMessage, _ := secondChoiceItem["message"].(map[string]any)
+
+	if firstMessage == nil || secondMessage == nil {
+		return first
+	}
+
+	content1, _ := firstMessage["content"].(string)
+	content2, _ := secondMessage["content"].(string)
+	firstMessage["content"] = content1 + content2
+
+	if r2, ok := secondMessage["reasoning_content"].(string); ok && r2 != "" {
+		r1, _ := firstMessage["reasoning_content"].(string)
+		firstMessage["reasoning_content"] = r1 + r2
+	}
+
+	firstChoiceItem["finish_reason"] = secondChoiceItem["finish_reason"]
+
+	if usageObj, ok := second["usage"]; ok {
+		first["usage"] = usageObj
+	}
+
+	return first
 }
 
 // setCacheTokensFromUsage 用聚合响应 usage 填 st 的缓存三维观测（非流式收尾）。
@@ -3375,6 +3480,8 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 // 告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。
 // 状态码按阻塞原因分档：11136/11141 是模型不可用（换模型才有用），用 400；
 // 全池 6004 模型级限流是"等上游重置"，用 429 并带 Retry-After（不能报成不可用）。
+//
+//nolint:cyclop,nestif // 模型阻塞分类优先于通用文案，线性分支更易核对。
 func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, upstreamMsgPassed bool) (int, string, string, string) {
 	if !f.modelBlock.Blocked {
 		return status, code, msg, hint
@@ -3522,6 +3629,12 @@ func rotateBackoff(ctx context.Context, i int) bool {
 
 // errUpstreamTimeout 上游超时的哨兵：末端出口据此给出与「没号可用」可区分的文案。
 var errUpstreamTimeout = errors.New("upstream timeout")
+
+// errZeroOutputLength / errContinuationFailed 流恢复路径的哨兵（issue #244/#247）。
+var (
+	errZeroOutputLength   = errors.New("zero_output_length")
+	errContinuationFailed = errors.New("continuation failed")
+)
 
 // isUpstreamTimeout 判断这一跳的失败是否属于「上游超时 / 停滞」。超时不是账号的
 // 问题，换号注定白换（同一份请求撞同一个慢上游），必须止损：不轮转、不罚号。
@@ -3725,9 +3838,11 @@ func (h *Handler) applyLifecyclePolicy(uid string, kind upstream.ErrKind) {
 	case upstream.ErrHardCredit:
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
-		h.notifyAccount(uid, notify.EventSessionDead, "账号 session 失效（12153），已禁用，需重新登录",
-			map[string]any{"stage": "chat"})
+		// 12153/14015 与 401 同口径：连续达到阈值才禁用，避免一次上游抖动杀号。
+		if h.cfg.Pool.NoteSessionDead(uid) {
+			h.notifyAccount(uid, notify.EventSessionDead, "账号连续 session 失效，已禁用，需重新登录",
+				map[string]any{"stage": "chat"})
+		}
 	case upstream.ErrNotFound:
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrServer:

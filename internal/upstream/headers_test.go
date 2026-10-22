@@ -85,6 +85,8 @@ func TestConversationHeaderPrefersInbound(t *testing.T) {
 
 // TestIdentityHeadersEnterprise 身份头只按企业身份注入：个人号即使残留
 // token_source 也不发 X-Auth-Method / X-Userinfo（issue #248）。
+//
+//nolint:cyclop // 表驱动四象限。
 func TestIdentityHeadersEnterprise(t *testing.T) {
 	t.Parallel()
 
@@ -156,12 +158,14 @@ func TestChatHeadersNoAcceptLanguage(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
 	client.ChatHeaders(req, acct, "", ChatMeta{})
+
 	if got := req.Header.Get("Accept-Language"); got != "" {
 		t.Fatalf("chat Accept-Language=%q want empty", got)
 	}
 
 	billing, _ := http.NewRequest(http.MethodPost, "https://example.invalid/billing", http.NoBody)
 	client.BillingHeaders(billing, acct)
+
 	if got := billing.Header.Get("Accept-Language"); got != "zh-CN" {
 		t.Fatalf("billing Accept-Language=%q want zh-CN", got)
 	}

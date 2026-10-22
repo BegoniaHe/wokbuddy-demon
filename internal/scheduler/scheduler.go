@@ -1076,22 +1076,7 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// 用含逐日到期批次的快照写入：面板快照路径与「检查」同口径（issue #200）。
-			snap, err := s.cfg.Upstream.UserResourceSnapshot(account4, expiringSoon)
-			if err != nil && upstream.IsCredentialDead(err) {
-				// 401 先同号 refresh 求证；refresh 成功则重试快照，仍失败才计
-				// session dead（issue #245）。一次网络抖动不直接判死。
-				snap, err = s.refreshThenSnapshot(account4, expiringSoon)
-			}
-
-			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, account4.NicknameValue()), err)
-				return
-			}
-
-			s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
-			s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
-			s.notifyCreditLow(account4, snap.Remain)
+			s.refreshBalanceAccount(account4, uid, expiringSoon)
 		}(account, status.UID)
 	}
 
@@ -1099,6 +1084,25 @@ loop:
 
 	// 记录本轮完成时刻与周期，供面板展示「数据新鲜度」（issue #200）。
 	s.cfg.Pool.SetBalanceRefreshMeta(s.balanceRefreshSeconds(), time.Now())
+}
+
+// refreshBalanceAccount 单账号余额刷新：401 先 refresh 求证（issue #245），
+// 成功后写快照并做低额度告警。
+func (s *Scheduler) refreshBalanceAccount(account *auth.Auth, uid string, expiringSoon time.Duration) {
+	snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+	if err != nil && upstream.IsCredentialDead(err) {
+		snap, err = s.refreshThenSnapshot(account, expiringSoon)
+	}
+
+	if err != nil {
+		log.Printf("balance %s: %v", logfmt.Label(uid, account.NicknameValue()), fmt.Errorf("snapshot: %w", err))
+
+		return
+	}
+
+	s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
+	s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+	s.notifyCreditLow(account, snap.Remain)
 }
 
 // refreshThenSnapshot 余额 401 的 refresh 求证：refresh 成功 → 重试一次快照；
@@ -1111,7 +1115,12 @@ func (s *Scheduler) refreshThenSnapshot(account *auth.Auth, expiringSoon time.Du
 				logfmt.Label(account.UID, account.NicknameValue()), saveErr)
 		}
 
-		return s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+		snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+		if err != nil {
+			return snap, fmt.Errorf("snapshot after refresh: %w", err)
+		}
+
+		return snap, nil
 	}
 
 	if upstream.IsCredentialDead(refreshErr) {
@@ -1124,7 +1133,7 @@ func (s *Scheduler) refreshThenSnapshot(account *auth.Auth, expiringSoon time.Du
 		}
 	}
 
-	return upstream.ResourceSnapshot{}, refreshErr
+	return upstream.ResourceSnapshot{}, fmt.Errorf("refresh: %w", refreshErr)
 }
 
 // runBalanceRefreshFirstRound 启动即跑一轮余额刷新（issue #200）：否则首个 ticker

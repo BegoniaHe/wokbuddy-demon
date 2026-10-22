@@ -175,41 +175,51 @@ func (s *Scheduler) ClaimCompensationFor(uid string) CompensationRow {
 
 	row.Active, row.Claimed, row.CreditNum, row.EndTime = comp.Active, comp.Claimed, comp.CreditNum, comp.EndTime
 
+	return s.claimCompensation(&row, account, comp, uid)
+}
+
+// claimCompensation 执行「已领/无待领/幂等/领取」分支，返回填好的结果行。
+func (s *Scheduler) claimCompensation(
+	row *CompensationRow, account *auth.Auth, comp upstream.CompensationStatus, uid string,
+) CompensationRow {
 	key := compensationClaimKey(uid, comp)
 
 	if comp.Claimed {
 		s.recordClaimed(key)
+
 		row.Skipped = true
 		row.Reason = "上游状态已领取"
 
-		return row
+		return *row
 	}
 
 	if !comp.Pending() {
 		row.Skipped = true
 		row.Reason = "当前无待领补偿"
 
-		return row
+		return *row
 	}
 
 	if !s.beginClaim(key) {
 		row.Skipped = true
 		row.Reason = "本周期已领取（进程内幂等）"
 
-		return row
+		return *row
 	}
 
 	credit, err := s.cfg.Upstream.ClaimCompensation(account)
 	if err != nil {
 		s.finishClaim(key, false)
 		// 领取失败必须显形：这正是「盲领」时被吞掉的那一类。
-		log.Printf("WARN: [scheduler] 补偿领取失败 acct=%s: %v", logfmt.Label(uid, status.Nickname), err)
+		log.Printf("WARN: [scheduler] 补偿领取失败 acct=%s: %v",
+			logfmt.Label(uid, account.NicknameValue()), fmt.Errorf("claim: %w", err))
 		row.Error = err.Error()
 
-		return row
+		return *row
 	}
 
 	s.finishClaim(key, true)
+
 	credit, known := s.normalizeClaimCredit(account, credit)
 
 	row.Claimed = true
@@ -217,12 +227,13 @@ func (s *Scheduler) ClaimCompensationFor(uid string) CompensationRow {
 	row.CreditKnown = known
 
 	if known {
-		log.Printf("INFO: [scheduler] 补偿领取成功 acct=%s: +%dc", logfmt.Label(uid, status.Nickname), credit)
+		log.Printf("INFO: [scheduler] 补偿领取成功 acct=%s: +%dc", logfmt.Label(uid, account.NicknameValue()), credit)
 	} else {
-		log.Printf("INFO: [scheduler] 补偿领取成功 acct=%s: 额度未知（回执与状态均为 0）", logfmt.Label(uid, status.Nickname))
+		log.Printf("INFO: [scheduler] 补偿领取成功 acct=%s: 额度未知（回执与状态均为 0）",
+			logfmt.Label(uid, account.NicknameValue()))
 	}
 
-	return row
+	return *row
 }
 
 // compensationClaimKey 进程内幂等键：账号 + 活动截止时间 + 待领额度。
@@ -313,7 +324,9 @@ type CompensationSummary struct {
 func SummarizeCompensation(rows []CompensationRow) CompensationSummary {
 	summary := CompensationSummary{}
 
-	for _, row := range rows {
+	for i := range rows {
+		row := &rows[i]
+
 		switch {
 		case row.Error != "":
 			summary.Errored++
@@ -384,6 +397,7 @@ func (s *Scheduler) claimCompensationIfPending(account *auth.Auth) {
 	}
 
 	s.finishClaim(key, true)
+
 	credit, known := s.normalizeClaimCredit(account, credit)
 	if known {
 		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(account.UID, account.NicknameValue()), credit)

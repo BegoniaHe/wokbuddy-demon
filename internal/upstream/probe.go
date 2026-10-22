@@ -49,6 +49,7 @@ func (p *StreamProbe) ReadCloser(closer io.Closer) io.ReadCloser {
 // probedReadCloser 组合预览流与上游 body 的 Close。
 type probedReadCloser struct {
 	io.Reader
+
 	closer io.Closer
 }
 
@@ -138,6 +139,8 @@ func (p *StreamProbe) inspectLine(line string) {
 }
 
 // inspectChoices 累计正文/工具调用并读取 finish_reason。
+//
+//nolint:cyclop // 逐 choice 解析 delta/message 与终态，线性分支更直观。
 func (p *StreamProbe) inspectChoices(frame map[string]any) {
 	choices, _ := frame["choices"].([]any)
 

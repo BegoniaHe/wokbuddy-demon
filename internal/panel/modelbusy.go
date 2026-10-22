@@ -29,6 +29,7 @@ func (p *Panel) attachModelBusy(out []map[string]any, fetchErrs *[]string) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		levels, err := p.cfg.Upstream.ModelBusy(ctx, account, names)
+
 		cancel()
 
 		if err != nil {
@@ -39,6 +40,7 @@ func (p *Panel) attachModelBusy(out []map[string]any, fetchErrs *[]string) {
 
 		for _, entry := range out {
 			id, _ := entry["id"].(string)
+
 			prefix := realm + ":"
 			if !strings.HasPrefix(id, prefix) {
 				continue

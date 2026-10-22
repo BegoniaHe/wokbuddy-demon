@@ -851,6 +851,7 @@ func TestChatStreamInjectsConversationRequestBody(t *testing.T) {
 	client.ConversationRequestBody.Store(true)
 
 	account := &auth.Auth{UID: "u1", AccessToken: "at"}
+
 	_, _, _, err := client.ChatStreamContext(context.Background(), account,
 		[]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`), "",
 		ChatMeta{ConversationID: "conv", ConversationRequestID: "req-1"})

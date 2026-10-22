@@ -1297,6 +1297,8 @@ func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall)
 
 // writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 // 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
+//
+//nolint:cyclop // 帧类型按 error/业务错误/修复/普通分派，线性更直观。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil {

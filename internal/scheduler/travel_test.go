@@ -594,15 +594,16 @@ func TestRunTravelNowForSingleAccount(t *testing.T) {
 	fastTravel(t)
 
 	stub := &travelStub{buddy: "null"}
+
 	srv := stub.server()
 	defer srv.Close()
 
-	s, state := newTravelScheduler(t, srv, "u1", "u2")
+	scheduler, state := newTravelScheduler(t, srv, "u1", "u2")
 	if !state.Pause("u2") {
 		t.Fatal("pause u2")
 	}
 
-	result := s.RunTravelNowFor("u1")
+	result := scheduler.RunTravelNowFor("u1")
 	if !result.Ran || !result.OK {
 		t.Fatalf("result=%+v", result)
 	}
@@ -611,7 +612,7 @@ func TestRunTravelNowForSingleAccount(t *testing.T) {
 		t.Fatalf("infoCalls=%d want 1 (only target account)", got)
 	}
 
-	paused := s.RunTravelNowFor("u2")
+	paused := scheduler.RunTravelNowFor("u2")
 	if paused.Ran || paused.SkipReason == "" {
 		t.Fatalf("paused result=%+v", paused)
 	}
@@ -620,7 +621,7 @@ func TestRunTravelNowForSingleAccount(t *testing.T) {
 		t.Fatalf("paused account must not call upstream: infoCalls=%d", got)
 	}
 
-	missing := s.RunTravelNowFor("nope")
+	missing := scheduler.RunTravelNowFor("nope")
 	if missing.Ran || missing.SkipReason == "" {
 		t.Fatalf("missing result=%+v", missing)
 	}

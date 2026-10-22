@@ -1231,12 +1231,14 @@ func TestCandidateSlotsAlwaysCST(t *testing.T) {
 		})
 
 		hostNow := time.Date(2026, 10, 21, 12, 0, 0, 0, zone)
+
 		slots := scheduler.candidateSlots(hostNow)
 		if len(slots) != 1 {
 			t.Fatalf("zone=%v slots=%v", zone, slots)
 		}
 
 		cstNow := hostNow.In(cst.Loc)
+
 		want := time.Date(cstNow.Year(), cstNow.Month(), cstNow.Day(), 9, 0, 0, 0, cst.Loc)
 		if !want.After(hostNow) {
 			want = want.AddDate(0, 0, 1)

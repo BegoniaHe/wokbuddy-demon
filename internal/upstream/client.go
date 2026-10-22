@@ -690,6 +690,8 @@ func ParseRateReset(body string) (time.Time, bool) {
 
 // classifyEarly 判定优先级最高的几类：模型不存在、402、11-128 内容拦截、
 // 客户端明确的请求级业务码。顺序即优先级。
+//
+//nolint:cyclop // 分类优先级线性展开。
 func classifyEarly(status int, body string) (ErrKind, bool) {
 	// 11136/11158 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
 	// 平台级「目录无此模型」分开）。11158 另留文案外卡：上游丢 code 时仍按账号类型
@@ -755,6 +757,8 @@ func classifyModelParamInvalid(body string) ErrKind {
 
 // businessErrorParam 从上游错误信封提取 extError.param / error.data.param /
 // 顶层 param（只取字符串，深度有界）。
+//
+//nolint:cyclop // 深度有界的递归提取。
 func businessErrorParam(body string) string {
 	var root any
 	if json.Unmarshal([]byte(body), &root) != nil {
@@ -2014,6 +2018,7 @@ func (c *Client) ChatStreamContext(
 
 	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID)
 	prepared = ensureLeadingSystem(prepared)
+
 	if c.ConversationRequestBody.Load() && meta.ConversationRequestID != "" {
 		prepared = injectConversationRequestID(prepared, meta.ConversationRequestID)
 	}

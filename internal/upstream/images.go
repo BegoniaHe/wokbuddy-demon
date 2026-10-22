@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,7 +24,11 @@ const imageGenerationsPath = "/v2/images/generations"
 // imageResponseMaxBytes 图像响应上限：b64 图片可能较大，但 64 MiB 已远超单图。
 const imageResponseMaxBytes = 64 << 20
 
+var errImageResponseTooLarge = errors.New("image response too large")
+
 // ImagesHeaders 出图请求头：复用 chat 头族，但 Accept 改回 JSON（非 SSE）。
+//
+//nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
 func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {
 	c.ChatHeaders(req, account, clientIP, meta)
 	req.Header.Set("Accept", "application/json")
@@ -32,6 +37,8 @@ func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP s
 
 // GenerateImage 向账号所属域的发图端点透传一次请求。返回上游原始 JSON 与状态码；
 // 业务错误（HTTP >=400 或 200 + 非零 code）返回 *Error，body 保留原文供透传。
+//
+//nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
 func (c *Client) GenerateImage(
 	ctx context.Context, account *auth.Auth, body []byte, clientIP string, meta ChatMeta,
 ) (int, []byte, error) {
@@ -58,7 +65,7 @@ func (c *Client) GenerateImage(
 	}
 
 	if int64(len(raw)) > imageResponseMaxBytes {
-		return resp.StatusCode, nil, fmt.Errorf("GenerateImage: response exceeds %d bytes", imageResponseMaxBytes)
+		return resp.StatusCode, nil, fmt.Errorf("%w: > %d bytes", errImageResponseTooLarge, imageResponseMaxBytes)
 	}
 
 	if resp.StatusCode >= 400 {

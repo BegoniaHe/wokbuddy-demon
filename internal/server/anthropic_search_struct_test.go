@@ -16,10 +16,13 @@ import (
 
 // TestAnthropicWebSearchExecutesServerTool 声明 web_search_20250305 时执行官方搜索，
 // 回发 server_tool_use + web_search_tool_result，且不把服务端工具透传给 chat（issue #256）。
+//
+//nolint:cyclop // 端到端假上游分支。
 func TestAnthropicWebSearchExecutesServerTool(t *testing.T) {
 	t.Parallel()
 
 	var searchCalls, chatCalls atomic.Int32
+
 	var chatBody []byte
 
 	client := &upstream.Client{
@@ -31,6 +34,7 @@ func TestAnthropicWebSearchExecutesServerTool(t *testing.T) {
 				return jsonResponse(http.StatusOK, `{"query":"weather","results":[{"title":"Weather","url":"https://weather.example","snippet":"sunny"}],"total_results":1}`), nil
 			case strings.Contains(r.URL.Path, "/v2/chat/completions"):
 				chatCalls.Add(1)
+
 				chatBody, _ = io.ReadAll(r.Body)
 
 				return jsonResponse(http.StatusOK,
@@ -43,7 +47,7 @@ func TestAnthropicWebSearchExecutesServerTool(t *testing.T) {
 		BillingBaseCN: "https://fake.example",
 	}
 
-	h := NewHandler(&Config{
+	handler := NewHandler(&Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: client,
 		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
@@ -53,7 +57,7 @@ func TestAnthropicWebSearchExecutesServerTool(t *testing.T) {
 		"messages":[{"role":"user","content":"what is the weather"}],
 		"tools":[{"type":"web_search_20250305","name":"web_search"}]}`
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
@@ -101,14 +105,14 @@ func TestAnthropicNoWebSearchZeroOverhead(t *testing.T) {
 		BillingBaseCN: "https://fake.example",
 	}
 
-	h := NewHandler(&Config{
+	handler := NewHandler(&Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: client,
 		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
 	})
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages",
 		strings.NewReader(`{"model":"glm-5.2","max_tokens":64,"stream":false,"messages":[{"role":"user","content":"hi"}]}`)))
 
 	if rec.Code != http.StatusOK {
@@ -137,7 +141,7 @@ func TestAnthropicWebSearchFailureDegrades(t *testing.T) {
 		BillingBaseCN: "https://fake.example",
 	}
 
-	h := NewHandler(&Config{
+	handler := NewHandler(&Config{
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: client,
 		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
@@ -147,7 +151,7 @@ func TestAnthropicWebSearchFailureDegrades(t *testing.T) {
 		"messages":[{"role":"user","content":"what is the weather"}],
 		"tools":[{"type":"web_search_20250305","name":"web_search"}]}`
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
