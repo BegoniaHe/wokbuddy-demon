@@ -692,21 +692,24 @@ func TestResponsesToolImagesStayWithToolRun(t *testing.T) {
 	}
 }
 
-func TestResponsesCustomToolInputFallback(t *testing.T) {
+func TestResponsesCustomToolInputStrict(t *testing.T) {
 	t.Parallel()
 
 	for _, testCase := range []struct {
 		name string
 		args string
 		want string
+		ok   bool
 	}{
-		{"约定形态", `{"input":"*** Begin Patch"}`, "*** Begin Patch"},
-		{"缺 input 键保留原文", `{"patch":"*** Begin Patch"}`, `{"patch":"*** Begin Patch"}`},
-		{"input 非字符串保留原文", `{"input":123}`, `{"input":123}`},
-		{"非法 JSON 保留原文", `not-json`, `not-json`},
+		{"约定形态", `{"input":"*** Begin Patch"}`, "*** Begin Patch", true},
+		{"缺 input 键", `{"patch":"*** Begin Patch"}`, "", false},
+		{"input 非字符串", `{"input":123}`, "", false},
+		{"非法 JSON", `not-json`, "", false},
+		{"截断 JSON", `{"input":"*** Beg`, "", false},
 	} {
-		if got := responsesCustomToolInput(testCase.args); got != testCase.want {
-			t.Errorf("%s: got %q want %q", testCase.name, got, testCase.want)
+		got, ok := responsesCustomToolInput(testCase.args)
+		if got != testCase.want || ok != testCase.ok {
+			t.Errorf("%s: got (%q,%v) want (%q,%v)", testCase.name, got, ok, testCase.want, testCase.ok)
 		}
 	}
 }
@@ -823,7 +826,7 @@ func TestResponsesFunctionItemsAggregatedShape(t *testing.T) {
 	items := responsesFunctionItems([]map[string]any{{
 		"id": "call_1", "type": "function",
 		"function": map[string]any{"name": "lookup", "arguments": `{"q":1}`},
-	}}, nil, nil)
+	}}, nil, nil, "stop")
 
 	if len(items) != 1 {
 		t.Fatalf("items=%v", items)
@@ -965,5 +968,88 @@ func TestResponsesEndpointStream(t *testing.T) {
 
 	if !strings.Contains(out, `"delta":"你好"`) {
 		t.Errorf("missing text delta:\n%s", out)
+	}
+}
+
+// TestResponsesCustomToolTruncatedIncomplete finish_reason=length 时工具状态必须
+// incomplete，且畸形 custom 输入不得回退原文（issue #259）。
+func TestResponsesCustomToolTruncatedIncomplete(t *testing.T) {
+	t.Parallel()
+
+	body := map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"content": "",
+				"tool_calls": []any{
+					map[string]any{
+						"id": "call_1", "type": "function",
+						"function": map[string]any{"name": "apply_patch", "arguments": `{"input":"*** Begin"`},
+					},
+					map[string]any{
+						"id": "call_2", "type": "function",
+						"function": map[string]any{"name": "lookup", "arguments": `{"q":`},
+					},
+				},
+			},
+			"finish_reason": "length",
+		}},
+	}
+
+	resp := responsesFromOpenAI(body, "m", "", map[string]bool{"apply_patch": true})
+	output := resp["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("output=%v", output)
+	}
+
+	custom := output[0].(map[string]any)
+	if custom["status"] != "incomplete" || custom["input"] != "" {
+		t.Fatalf("custom=%v", custom)
+	}
+
+	fn := output[1].(map[string]any)
+	if fn["status"] != "incomplete" {
+		t.Fatalf("function=%v", fn)
+	}
+}
+
+// TestResponsesInputCustomToolCallStrict 历史 custom 调用缺 input/类型不符直接报错。
+func TestResponsesInputCustomToolCallStrict(t *testing.T) {
+	t.Parallel()
+
+	if _, err := responsesInputCustomToolCall(map[string]any{"name": "apply_patch"}, nil); !errors.Is(err, errCustomToolCallInputIs) {
+		t.Fatalf("err=%v want %v", err, errCustomToolCallInputIs)
+	}
+
+	if _, err := responsesInputCustomToolCall(map[string]any{"name": "apply_patch", "input": 1}, nil); !errors.Is(err, errCustomToolCallInputIs) {
+		t.Fatalf("err=%v want %v", err, errCustomToolCallInputIs)
+	}
+}
+
+// TestResponsesStreamWriterLengthMarksToolIncomplete length 终态下流式工具必须
+// 以 incomplete 下发，客户端不会执行半截参数（issue #259）。
+func TestResponsesStreamWriterLengthMarksToolIncomplete(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	w := newResponsesStreamWriter(rec, "m", "", map[string]bool{"apply_patch": true}, nil)
+
+	chunks := `data: {"id":"c1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"apply_patch","arguments":"{\"input\":\"*** Begin\"}"}}]}}]}` + "\n\n" +
+		`data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	if _, err := w.Write([]byte(chunks)); err != nil {
+		t.Fatal(err)
+	}
+
+	out := rec.Body.String()
+	if !strings.Contains(out, `"type":"custom_tool_call"`) || !strings.Contains(out, `"status":"incomplete"`) {
+		t.Fatalf("tool must be incomplete:\n%s", out)
+	}
+
+	if strings.Count(out, `"status":"completed"`) > 0 && strings.Contains(out, `"type":"custom_tool_call"`) {
+		// output_item.added 允许 in_progress，但不应出现 completed 的 custom item。
+		if strings.Contains(out, `"input":"*** Begin","status":"completed"`) {
+			t.Fatalf("half input must not be completed:\n%s", out)
+		}
 	}
 }

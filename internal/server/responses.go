@@ -29,6 +29,7 @@ var (
 	errFunctionCallNameIsRequired  = errors.New("function_call name is required")
 	errCustomToolCallNameIs        = errors.New("custom_tool_call name is required")
 	errCustomToolCallOutputCallID  = errors.New("custom_tool_call_output call_id is required")
+	errCustomToolCallInputIs       = errors.New("custom_tool_call input must be a string")
 )
 
 // responsesRequest 只声明转换所需的字段；未知字段忽略，便于协议演进。
@@ -232,14 +233,15 @@ func responsesToOpenAIWithClient(
 	}
 	// Codex 0.162+ 把工具放在 input 的 additional_tools 条目里（顶层 tools 为空）。
 	req.Tools = append(req.Tools, responsesAdditionalTools(req.Input)...)
+	refs := responsesToolNamespaces(req.Tools)
 
-	msgs, err := responsesMessages(req)
+	msgs, err := responsesMessages(req, refs)
 	if err != nil {
 		return nil, "", "", false, err
 	}
 
 	out := map[string]any{"model": req.Model, "stream": req.Stream, "messages": msgs}
-	applyResponsesParams(out, req)
+	applyResponsesParams(out, req, refs)
 	applyResponsesDefaultMaxTokens(out, req.Model, httpClient, aliases)
 
 	converted, err := json.Marshal(out)
@@ -302,7 +304,7 @@ func decodeResponsesRequest(body []byte) (*responsesRequest, error) {
 }
 
 // responsesMessages 把 instructions 与 input 转成 OpenAI messages。
-func responsesMessages(req *responsesRequest) ([]any, error) {
+func responsesMessages(req *responsesRequest, refs map[string]responsesToolRef) ([]any, error) {
 	msgs := make([]any, 0, 4)
 	if text := strings.TrimSpace(req.Instructions); text != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": text})
@@ -329,7 +331,7 @@ func responsesMessages(req *responsesRequest) ([]any, error) {
 	builder := &responsesInputMessages{msgs: msgs}
 
 	for _, item := range items {
-		converted, images, ok, err := responsesInputItem(item)
+		converted, images, ok, err := responsesInputItem(item, refs)
 		if err != nil {
 			return nil, err
 		}
@@ -418,14 +420,14 @@ func responsesToolImageMessage(images []any) map[string]any {
 
 // responsesInputItem 转换单条 input item，返回消息与需要单独回传的图片。
 // 其余类型（reasoning、compaction 等）没有 chat/completions 对应语义，ok=false 忽略。
-func responsesInputItem(item map[string]any) ([]any, []any, bool, error) {
+func responsesInputItem(item map[string]any, refs map[string]responsesToolRef) ([]any, []any, bool, error) {
 	switch stringValue(item["type"]) {
 	case "", "message":
 		msg, err := responsesInputMessage(item)
 
 		return []any{msg}, nil, true, err
 	case "function_call":
-		msg, err := responsesInputFunctionCall(item)
+		msg, err := responsesInputFunctionCall(item, refs)
 
 		return []any{msg}, nil, true, err
 	case "function_call_output":
@@ -440,7 +442,7 @@ func responsesInputItem(item map[string]any) ([]any, []any, bool, error) {
 
 		return []any{msg}, nil, ok, nil
 	case "custom_tool_call":
-		msg, err := responsesInputCustomToolCall(item)
+		msg, err := responsesInputCustomToolCall(item, refs)
 
 		return []any{msg}, nil, true, err
 	case "custom_tool_call_output":
@@ -470,7 +472,7 @@ func responsesInputMessage(item map[string]any) (any, error) {
 }
 
 // responsesInputFunctionCall 把 Responses function_call 映射为 assistant tool_calls。
-func responsesInputFunctionCall(item map[string]any) (any, error) {
+func responsesInputFunctionCall(item map[string]any, refs map[string]responsesToolRef) (any, error) {
 	name := stringValue(item["name"])
 	if name == "" {
 		return nil, errFunctionCallNameIsRequired
@@ -536,10 +538,15 @@ func responsesInputFunctionOutput(item map[string]any) (any, []any) {
 // responsesInputCustomToolCall 把 custom_tool_call 降级为 assistant tool_calls。
 // custom 工具在上游以单 input 参数的 function 形态声明，因此把自由文本 input
 // 包装成 {"input": "..."}，与 responsesTools 的降级规则对称。
-func responsesInputCustomToolCall(item map[string]any) (any, error) {
-	name := stringValue(item["name"])
+func responsesInputCustomToolCall(item map[string]any, refs map[string]responsesToolRef) (any, error) {
+	name := responsesUpstreamToolName(stringValue(item["name"]), refs)
 	if name == "" {
 		return nil, errCustomToolCallNameIs
+	}
+
+	input, ok := item["input"].(string)
+	if !ok {
+		return nil, errCustomToolCallInputIs
 	}
 
 	callID := stringValue(item["call_id"])
@@ -547,7 +554,7 @@ func responsesInputCustomToolCall(item map[string]any) (any, error) {
 		callID = stringValue(item["id"])
 	}
 
-	args, err := json.Marshal(map[string]any{"input": stringValue(item["input"])})
+	args, err := json.Marshal(map[string]any{"input": input})
 	if err != nil {
 		return nil, fmt.Errorf("custom_tool_call input: %w", err)
 	}
@@ -713,14 +720,14 @@ func responsesImageURL(raw any) string {
 }
 
 // applyResponsesParams 映射采样参数、工具与推理强度。
-func applyResponsesParams(out map[string]any, req *responsesRequest) {
+func applyResponsesParams(out map[string]any, req *responsesRequest, refs map[string]responsesToolRef) {
 	applyResponsesSampling(out, req)
 
 	if tools, _ := responsesTools(req.Tools); len(tools) > 0 {
 		out["tools"] = tools
 	}
 
-	if choice := responsesToolChoice(req.ToolChoice); choice != nil {
+	if choice := responsesToolChoice(req.ToolChoice, refs); choice != nil {
 		out["tool_choice"] = choice
 	}
 
@@ -1070,7 +1077,7 @@ func responsesCustomTool(tool map[string]any) map[string]any {
 }
 
 // responsesToolChoice 映射 Responses tool_choice 到 OpenAI tool_choice。
-func responsesToolChoice(raw json.RawMessage) any {
+func responsesToolChoice(raw json.RawMessage, refs map[string]responsesToolRef) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -1107,7 +1114,29 @@ func responsesToolChoice(raw json.RawMessage) any {
 		return nil
 	}
 
-	return map[string]any{"type": "function", "function": map[string]any{"name": obj.Name}}
+	return map[string]any{"type": "function", "function": map[string]any{
+		"name": responsesUpstreamToolName(obj.Name, refs),
+	}}
+}
+
+// responsesUpstreamToolName 把入站工具名映射为上游声明的工具名：已声明的限定名
+// 原样返回；bare 名若对应唯一的 namespace 工具，改用限定名（issue #259）。
+func responsesUpstreamToolName(name string, refs map[string]responsesToolRef) string {
+	if name == "" {
+		return ""
+	}
+
+	if _, ok := refs[name]; ok {
+		return name
+	}
+
+	for declared, ref := range refs {
+		if ref.bare == name {
+			return declared
+		}
+	}
+
+	return name
 }
 
 // responsesResponder 把核心的 OpenAI 结果编码为 Responses 形态。
@@ -1212,7 +1241,7 @@ func responsesOutput(choice map[string]any, customTools map[string]bool, namespa
 		output = append(output, responsesMessageItem("msg_gateway", text, "completed"))
 	}
 
-	output = append(output, responsesFunctionItems(msg["tool_calls"], customTools, namespaces)...)
+	output = append(output, responsesFunctionItems(msg["tool_calls"], customTools, namespaces, stringValue(choice["finish_reason"]))...)
 	if len(output) == 0 {
 		output = append(output, responsesMessageItem("msg_gateway", "", "completed"))
 	}
@@ -1282,7 +1311,7 @@ func mapItems(raw any) []map[string]any {
 	}
 }
 
-func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map[string]responsesToolRef) []any {
+func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map[string]responsesToolRef, finishReason string) []any {
 	calls := mapItems(raw)
 
 	out := make([]any, 0, len(calls))
@@ -1300,10 +1329,20 @@ func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map
 		}
 
 		args := stringValue(fn["arguments"])
+		status := "completed"
+		if finishReason == "length" {
+			status = "incomplete"
+		}
+
 		if customTools[name] {
+			input, ok := responsesCustomToolInput(args)
+			if !ok {
+				status = "incomplete"
+			}
+
 			item := map[string]any{
 				"type": "custom_tool_call", "id": "ctc_" + callID, "call_id": callID,
-				"name": name, "input": responsesCustomToolInput(args), "status": "completed",
+				"name": name, "input": input, "status": status,
 			}
 			responsesSetNamespace(item, namespace)
 			out = append(out, item)
@@ -1313,7 +1352,7 @@ func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map
 
 		item := map[string]any{
 			"type": "function_call", "id": "fc_" + callID, "call_id": callID,
-			"name": name, "arguments": args, "status": "completed",
+			"name": name, "arguments": args, "status": status,
 		}
 		responsesSetNamespace(item, namespace)
 		out = append(out, item)
@@ -1329,26 +1368,26 @@ func responsesSetNamespace(item map[string]any, namespace string) {
 	}
 }
 
-// responsesCustomToolInput 从降级后的 {"input":"..."} 参数里还原 freeform 文本。
-// 模型未按约定输出时退回原始 arguments，避免丢调用。只有 input 键存在且为字符串
-// 才解包；否则 {"patch":"..."} 这类偏差会被当成空 input 丢掉。
-func responsesCustomToolInput(args string) string {
+// responsesCustomToolInput 从降级后的 {"input":"..."} 参数里严格还原 freeform 文本。
+// 只接受约定包裹形态（对象 + input 字符串）；缺字段/类型不符/参数不完整返回 ok=false，
+// 由调用方标 incomplete，绝不把半截 JSON 或原文交给客户端执行（issue #259）。
+func responsesCustomToolInput(args string) (string, bool) {
 	var payload map[string]json.RawMessage
 	if json.Unmarshal([]byte(args), &payload) != nil {
-		return args
+		return "", false
 	}
 
 	raw, ok := payload["input"]
 	if !ok {
-		return args
+		return "", false
 	}
 
 	var input string
 	if json.Unmarshal(raw, &input) != nil {
-		return args
+		return "", false
 	}
 
-	return input
+	return input, true
 }
 
 func responsesUsage(raw any) map[string]any {
@@ -1868,10 +1907,13 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 	}
 
 	args := state.args.String()
+	input, customOK := responsesCustomToolInput(args)
+	status := s.toolCompletionStatus(state, customOK)
+
 	if state.custom {
 		if err := s.event("response.custom_tool_call_input.done", map[string]any{
 			"type": "response.custom_tool_call_input.done", "item_id": state.id,
-			"output_index": state.index, "input": responsesCustomToolInput(args),
+			"output_index": state.index, "input": input,
 		}); err != nil {
 			return err
 		}
@@ -1882,7 +1924,7 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 		return err
 	}
 
-	item := s.functionItem(state, "completed")
+	item := s.functionItemWithStatus(state, status)
 	if err := s.event("response.output_item.done", map[string]any{
 		"type": "response.output_item.done", "output_index": state.index, "item": item,
 	}); err != nil {
@@ -1894,17 +1936,37 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 	return nil
 }
 
+// toolCompletionStatus 工具终态：finish_reason=length 或 custom 输入不合法时
+// 一律 incomplete，避免客户端执行半截参数（issue #259）。
+func (s *responsesStreamWriter) toolCompletionStatus(state *responsesToolState, customOK bool) string {
+	if s.finishReason == "length" || (state.custom && !customOK) {
+		return "incomplete"
+	}
+
+	return "completed"
+}
+
 func (s *responsesStreamWriter) messageItem(status string) map[string]any {
 	return responsesMessageItem(s.msg.id, s.msg.text.String(), status)
 }
 
 func (s *responsesStreamWriter) functionItem(state *responsesToolState, status string) map[string]any {
+	return s.functionItemWithStatus(state, status)
+}
+
+// functionItemWithStatus 构造工具 item；custom 输入非法时强制 incomplete。
+func (s *responsesStreamWriter) functionItemWithStatus(state *responsesToolState, status string) map[string]any {
 	namespace := state.namespace
 
 	if state.custom {
+		input, ok := responsesCustomToolInput(state.args.String())
+		if !ok && status == "completed" {
+			status = "incomplete"
+		}
+
 		item := map[string]any{
 			"type": "custom_tool_call", "id": state.id, "call_id": state.callID,
-			"name": state.name, "input": responsesCustomToolInput(state.args.String()), "status": status,
+			"name": state.name, "input": input, "status": status,
 		}
 		responsesSetNamespace(item, namespace)
 
