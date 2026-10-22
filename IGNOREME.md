@@ -153,6 +153,7 @@ http://127.0.0.1:7863/panel/
 - **Docker + Docker Compose**（推荐）——或
 - **Windows / macOS / Linux 直接跑单文件二进制**
 - 一个或多个已注册的 CodeBuddy 账号，用于登录
+- `data/client-profiles/cn.json`（启用 global 时还需 `global.json`）——客户端指纹快照，启动必需；用 `reverse-workbuddy` 从官方 Win32 分发包生成
 - 宿主机 Go ≥ 1.27（仅从源码构建时需要）
 
 ### 方式一：Docker Compose（推荐）
@@ -167,10 +168,14 @@ cp config.example.json config.json
 #    示例里的 api_key 是公开占位值 test_key；程序启动时会自动替换为随机密钥
 #    并写回该文件（显式设置的其他值不会被覆盖）。也可先自行改成自己的密钥。
 
-# 3. 启动（首次会构建镜像，约 1-2 分钟）
+# 3. 准备客户端指纹快照（缺失会拒绝启动）
+#    data/client-profiles/cn.json，启用 global 时还需 global.json；
+#    用 reverse-workbuddy 从官方 Win32 分发包生成后放入该目录。
+
+# 4. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
 
-# 4. 健康检查（无可用账号时返回 503）
+# 5. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
 ```
 
@@ -204,10 +209,13 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 # 1) 下载 nightly 构建产物（wokbuddy-demon.exe），或从源码构建
 go build -trimpath -ldflags="-s -w" -o wokbuddy-demon.exe ./cmd/server
 
-# 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
+# 2) 准备客户端指纹快照 data\client-profiles\{cn,global}.json（缺失会拒绝启动）
+#    用 reverse-workbuddy 从官方 Win32 分发包生成
+
+# 3) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
 .\wokbuddy-demon.exe -config config.json
 
-# 3) 浏览器打开面板添加账号
+# 4) 浏览器打开面板添加账号
 #    http://127.0.0.1:7863/panel/
 ```
 
@@ -363,7 +371,8 @@ gemini
 
 ### 官方客户端协议对齐
 
-网关按 WorkBuddy Desktop CN `5.8.3` / global `5.8.4` 的静态包内行为对齐协议：
+网关按官方 WorkBuddy Desktop CN / global Win32 静态包内行为对齐协议（版本/commit
+取自部署 profile）：
 
 - **CN origin**：默认主域 `www.workbuddy.cn`；chat / refresh / 登录在首 token 前遇到传输错误或 `408/502/503/504` 时依次回落 `copilot.tencent.com`、`wb.tencentbuddy.com`。显式覆盖 chat base 时只用该值。
 - **身份头**：企业账号同时发送 `X-Enterprise-Id` 与 `X-Tenant-Id`；个人 global 账号发送 `X-No-Enterprise-Id: 1`。账号带 `domain` 时透传为 `X-Domain`，global 缺省回落 `www.workbuddy.ai`。

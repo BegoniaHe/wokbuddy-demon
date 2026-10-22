@@ -1,7 +1,7 @@
 interface:
   display_name: 'Reverse WorkBuddy Client'
-  short_description: 'Unpack WorkBuddy builds and diff protocol vs internal/upstream'
-  default_prompt: 'Use $reverse-workbuddy to download the latest cn/global WorkBuddy installers with scripts/download_latest.mjs, unpack them under .tmp/workbuddy/, sweep the protocol surface with scripts/protocol_sweep.mjs, escalate to REA when grep cannot answer, and write the diff report under .tmp/workbuddy-diff/.'
+  short_description: 'Unpack WorkBuddy builds, diff protocol, build fingerprint profiles'
+  default_prompt: 'Use $reverse-workbuddy to download the latest cn/global WorkBuddy Win32 installers (the only source of truth) with scripts/download_latest.mjs, unpack them under .tmp/workbuddy/ (win32-x64-user; macOS only for auxiliary comparison), sweep the protocol surface with scripts/protocol_sweep.mjs, escalate to REA when grep cannot answer, and write the diff report under .tmp/workbuddy-diff/. When asked for a client fingerprint profile, follow references/client-profile.md: copy per-surface literals with evidence, never synthesize from templates, and validate with the Go validator before handing off.'
 
 policy:
   allow_implicit_invocation: true

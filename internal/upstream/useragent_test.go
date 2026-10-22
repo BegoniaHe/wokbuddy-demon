@@ -52,7 +52,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "WorkBuddy/5.8.3",
+			wantUA: billingUAWorkBuddy,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -65,6 +65,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 				ChatHTTP:      &http.Client{Transport: uaCaptureTransport{ua: &str}},
 				ChatBaseCN:    "https://chat.example",
 				BillingBaseCN: "https://billing.example",
+				Profile:       testProfileSet(t),
 			}
 			if err := testCase.call(client); err != nil {
 				t.Fatalf("call: %v", err)
@@ -182,10 +183,10 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	defaultUAString      = "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"
 	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.161.0"
-	billingUAWorkBuddy   = "WorkBuddy/5.8.3"
+	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/8.8.8"
+	billingUAWorkBuddy   = "WorkBuddy/9.9.9"
 	billingUACustomVer   = "WorkBuddy/6.0.0"
 	billingUAAgentString = "BillingAgent/1"
 )
@@ -201,6 +202,7 @@ func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
 		ChatHTTP:      &http.Client{Transport: uaCaptureTransport{ua: new(string)}},
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
+		Profile:       testProfileSet(t),
 	}
 
 	rc, status, _, err := client.ChatStream(account, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
@@ -272,6 +274,7 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
 		ClientVersion: "6.0.0",
+		Profile:       testProfileSet(t),
 	}
 
 	rc, status, _, err := client.ChatStream(account, []byte(`{"model":"deepseek-v4-flash","messages":[]}`), "", ChatMeta{})
@@ -294,7 +297,7 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
-	// 默认 client_version → WorkBuddy/5.5.4
+	// 默认 client_version → profile.billingUA
 	client := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			if got := r.Header.Get("User-Agent"); got != billingUAWorkBuddy {
@@ -306,6 +309,7 @@ func TestBillingUA_WhenClientNameSet(t *testing.T) {
 		ChatBaseCN:    "https://chat.example",
 		BillingBaseCN: "https://billing.example",
 		ClientName:    "WorkBuddy",
+		Profile:       testProfileSet(t),
 	}
 	if _, _, err := client.UserResource(account); err != nil {
 		t.Errorf("userResource: %v", err)

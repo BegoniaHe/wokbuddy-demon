@@ -259,10 +259,9 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 按 realm 取内置默认（cn 5.8.3 / global 5.8.4，对齐官方分发包）。
+		// X-IDE-Version）。空 = profile.xIdeVersion；profile 缺失仍拒绝启动。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 按 realm 取内置默认
-		// （cn 2.161.0 / global 2.161.0，对齐官方内置 CLI）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = profile.source.cliVersion。
 		CliVersion string `json:"cli_version"`
 		// ClientName 自定义用量归属名：非空时 X-Product 与 X-IDE-Name/Type 跟随该值。
 		// 空 = 官方桌面端默认（X-Product="SaaS"、X-IDE-Name/Type="WorkBuddy"）。

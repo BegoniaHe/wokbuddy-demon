@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -23,7 +24,7 @@ func TestLoginEndpoints(t *testing.T) {
 		t.Run(item.realm, func(t *testing.T) {
 			t.Parallel()
 
-			ep := loginCandidates(item.realm)[0]
+			ep := loginCandidatesWithIdentity(item.realm, defaultLoginIdentity(item.realm))[0]
 
 			st, tok, acct, origin := ep.state, ep.token, ep.account, ep.origin
 			if st != item.wantState {
@@ -53,7 +54,7 @@ func TestLoginEndpoints(t *testing.T) {
 func TestLoginCandidatesCNFallback(t *testing.T) {
 	t.Parallel()
 
-	candidates := loginCandidates("cn")
+	candidates := loginCandidatesWithIdentity("cn", defaultLoginIdentity("cn"))
 
 	want := []string{
 		"https://www.workbuddy.cn",
@@ -70,8 +71,33 @@ func TestLoginCandidatesCNFallback(t *testing.T) {
 		}
 	}
 
-	preferred := loginCandidatesPrefer("cn", "https://copilot.tencent.com")
+	preferred := loginCandidatesPreferWithIdentity("cn", "https://copilot.tencent.com", defaultLoginIdentity("cn"))
 	if preferred[0].base != "https://copilot.tencent.com" {
 		t.Errorf("preferred base=%q", preferred[0].base)
+	}
+}
+
+// TestLoginCandidatesUseIdentity profile 的 loginUA / loginPlatform 必须进入
+// auth/state 的 platform 参数与请求 UA，而不是固定旧 CLI 身份。
+func TestLoginCandidatesUseIdentity(t *testing.T) {
+	t.Parallel()
+
+	identity := loginIdentity{
+		userAgent: "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/9.9.9",
+		platform:  "workbuddy-custom",
+	}
+
+	endpoint := loginCandidatesWithIdentity("cn", identity)[0]
+	if endpoint.state != "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy-custom" {
+		t.Errorf("state=%q", endpoint.state)
+	}
+
+	if endpoint.userAgent != identity.userAgent {
+		t.Errorf("ua=%q want %q", endpoint.userAgent, identity.userAgent)
+	}
+
+	escaped := loginCandidatesWithIdentity("cn", loginIdentity{userAgent: "ua", platform: "a&b"})[0]
+	if !strings.Contains(escaped.state, "platform=a%26b") {
+		t.Errorf("platform 未转义: %q", escaped.state)
 	}
 }

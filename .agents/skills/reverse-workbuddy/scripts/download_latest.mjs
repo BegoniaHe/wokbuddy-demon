@@ -3,7 +3,8 @@
 // 用法（仓库根执行）：
 //   node download_latest.mjs [--realm all|cn|global] [--platform <p>|all]
 //     [--out-root .tmp/workbuddy] [--force] [--dry-run]
-// 默认 realm=all、platform=当前机器；macOS 的接口返回 .zip，这里取同版本 .dmg。
+// 默认 realm=all、platform=win32-x64-user（项目唯一事实源）；macOS 仅辅助对照，
+// 需显式 --platform darwin-*，接口返回 .zip，这里取同版本 .dmg。
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { once } from 'node:events';
@@ -46,14 +47,8 @@ for (const realm of realmList) {
   if (!REALMS[realm]) throw new Error(`未知 realm: ${realm}（可选 all/cn/global）`);
 }
 
-function hostPlatform() {
-  if (process.platform === 'darwin') return process.arch === 'arm64' ? 'darwin-arm64' : 'darwin-x64';
-  if (process.platform === 'win32') return 'win32-x64-user';
-  if (process.platform === 'linux') return process.arch === 'arm64' ? 'linux-arm64-deb' : 'linux-x64-deb';
-  throw new Error(`无法识别当前平台: ${process.platform}/${process.arch}，请用 --platform 指定`);
-}
-
-const platformArg = opt('platform', null) ?? hostPlatform();
+// Win32 构建是仓库唯一事实源；macOS / Linux 包只能通过显式 --platform 辅助下载。
+const platformArg = opt('platform', 'win32-x64-user');
 const platformList = platformArg === 'all' ? Object.keys(PLATFORM_API) : platformArg.split(',').map(s => s.trim());
 for (const platform of platformList) {
   if (!PLATFORM_API[platform]) throw new Error(`未知 platform: ${platform}（可选 ${Object.keys(PLATFORM_API).join('/')} 或 all）`);

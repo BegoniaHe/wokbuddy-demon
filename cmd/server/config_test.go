@@ -967,7 +967,7 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 }
 
 // TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
-// 缺省空串保持现状（headers 层回落到 clientUA）。
+// 缺省空串保持现状（headers 层回落到 profile.chatUA）。
 //
 //nolint:paralleltest // 该用例改写进程级状态，必须串行执行
 func TestUpstreamUserAgentConfig(t *testing.T) {

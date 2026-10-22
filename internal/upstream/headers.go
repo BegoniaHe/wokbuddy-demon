@@ -11,21 +11,11 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 const (
-	// 官方分发包版本（按 realm 分档）。UA 的 `WorkBuddy/<ver>`、白名单头组
-	// X-IDE-Version、桌面上报指纹的 ideVersion/extVersion 均取此值。
-	//   cn     → WorkBuddy Desktop 5.8.3（内嵌 CLI 2.161.0）
-	//   global → WorkBuddy AI Desktop 5.8.4（内嵌 CLI 2.161.0）
-	// 两份官方包的 daemon UA 第二段均为 `WorkBuddy`（无 realm 品牌差异，仅版本不同）。
-	// config upstream.client_version / cli_version 可整体覆盖（空 = 按 realm 取内置默认）。
-	cnClientVersion     = "5.8.3"
-	cnCliVersion        = "2.161.0"
-	globalClientVersion = "5.8.4"
-	globalCliVersion    = "2.161.0"
-
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
@@ -40,42 +30,67 @@ func originRefererFor(a *auth.Auth) string {
 	return originRefererCN
 }
 
-// clientVersionFor 生效的 WorkBuddy 客户端版本：Client.ClientVersion 非空则取之
-// （全局覆盖），否则按账号 realm 取内置默认（cn 5.8.3 / global 5.8.4）。nil 账号按 cn。
-func (c *Client) clientVersionFor(a *auth.Auth) string {
+// profileFor 返回账号 realm 的部署 profile；未配置返回 nil（启动期已拒绝该状态）。
+func (c *Client) profileFor(a *auth.Auth) *clientprofile.Profile {
+	if c == nil || c.Profile == nil {
+		return nil
+	}
+
+	if a != nil && a.IsGlobal() {
+		return c.Profile.ForRealm("global")
+	}
+
+	return c.Profile.ForRealm("cn")
+}
+
+// clientVersionFor 生效的 WorkBuddy 客户端版本：显式 ClientVersion 优先，其次是
+// profile 的 xIdeVersion。两者皆空返回空串（启动期已要求 profile 覆盖每个启用 realm）。
+func (c *Client) clientVersionFor(account *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
 	}
 
-	if a != nil && a.IsGlobal() {
-		return globalClientVersion
+	if p := c.profileFor(account); p != nil {
+		return p.Emit.XIdeVersion
 	}
 
-	return cnClientVersion
+	return ""
 }
 
-// cliVersionFor 生效的 CLI 版本：Client.CliVersion 非空则取之（全局覆盖），
-// 否则按账号 realm 取内置默认（cn 2.161.0 / global 2.161.0）。nil 账号按 cn。
-func (c *Client) cliVersionFor(a *auth.Auth) string {
+// cliVersionFor 生效的 CLI 版本：显式 CliVersion 优先，其次是 profile 的
+// source.cliVersion。两者皆空返回空串。
+func (c *Client) cliVersionFor(account *auth.Auth) string {
 	if c != nil && c.CliVersion != "" {
 		return c.CliVersion
 	}
 
-	if a != nil && a.IsGlobal() {
-		return globalCliVersion
+	if p := c.profileFor(account); p != nil {
+		return p.Source.CLIVersion
 	}
 
-	return cnCliVersion
+	return ""
 }
 
-// defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 daemon 代理层形状）：
-// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`。
-// 两份官方分发包（CN 5.8.3 / global 5.8.4）的 daemon UA 第二段均为 `WorkBuddy`
-// （`buildVlmGatewayHeaders` / `Jr` 字面量），无 realm 品牌差异；仅版本号按 realm 分档。
-// 官方无任何 UA 随机化，故默认确定性。
-func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
-	v := c.clientVersionFor(a)
-	return "WorkBuddy/" + v + " WorkBuddy/" + v + " CLI/" + c.cliVersionFor(a)
+// defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方桌面端 daemon 代理层形状：
+// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`）。默认不拼接版本，直接使用 profile 字面量；
+// 用户显式配 client_version / cli_version 时才按该版本重新拼装，避免 UA 与
+// X-Ide-Version 自相矛盾。profile 缺失返回空串（启动期已拒绝该状态）。
+func (c *Client) defaultWorkBuddyUAFor(account *auth.Auth) string {
+	if c == nil {
+		return ""
+	}
+
+	if c.ClientVersion == "" && c.CliVersion == "" {
+		if p := c.profileFor(account); p != nil {
+			return p.Emit.ChatUA
+		}
+
+		return ""
+	}
+
+	v := c.clientVersionFor(account)
+
+	return "WorkBuddy/" + v + " WorkBuddy/" + v + " CLI/" + c.cliVersionFor(account)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
@@ -91,14 +106,22 @@ func (c *Client) userAgent(a *auth.Auth) string {
 }
 
 // billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
-// （官方 banner/上报显式覆写形态，不带 CLI 段）。默认生效（伪造官方桌面端指纹）；
-// 显式 client_name="SaaS" 才不设 UA（还原旧行为，Go 默认 UA）。
-func (c *Client) billingUA(a *auth.Auth) string {
+// （官方 banner/上报显式覆写形态，不带 CLI 段）。默认取 profile 字面量；
+// 显式 client_version 覆盖时按该版本拼装；client_name="SaaS" 才不设 UA（Go 默认 UA）。
+func (c *Client) billingUA(account *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
 	}
 
-	return "WorkBuddy/" + c.clientVersionFor(a)
+	if c.ClientVersion == "" {
+		if p := c.profileFor(account); p != nil {
+			return p.Emit.BillingUA
+		}
+
+		return ""
+	}
+
+	return "WorkBuddy/" + c.clientVersionFor(account)
 }
 
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。

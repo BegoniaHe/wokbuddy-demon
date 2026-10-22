@@ -1,7 +1,8 @@
 // desktop.go 桌面客户端（WorkBuddy Desktop）行为指纹上报。
 //
-// 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）+ 官方分发包
-// app.asar 逆向（CN 5.8.3 / global 5.8.4）。桌面端点亮「需电脑端」类任务的关键
+// 来源：抓包实测 + 官方 Win32 分发包（win32-x64-user）app.asar 逆向
+// （具体版本/commit/releaseDate 全部来自部署 profile；macOS 包仅辅助对照）。
+// 桌面端点亮「需电脑端」类任务的关键
 // 不是独立端点，而是同一 POST /v2/report 通道上**不同的客户端指纹**：
 //
 //	POST https://www.workbuddy.cn/v2/report           ← chatBase（CLI 上报走 billingBase）
@@ -51,15 +52,6 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-
-	// 官方桌面分发包构建指纹（realm 分档，取自各包 cli/product.json）。
-	//   cn     5.8.3  commit 64d249be…  date 2026-10-14T10:11:49.257Z
-	//   global 5.8.4  commit 73952edb…  date 2026-10-15T11:17:03.116Z
-	// 上报事件 product/releaseDate/commit/ideVersion/extVersion 取此组，与 UA 版本自洽。
-	cnDesktopCommit          = "64d249bed3dec40edd720537d96f27e70a3f6a4f"
-	cnDesktopReleaseDate     = int64(1791972709257) // 2026-10-14T10:11:49.257Z
-	globalDesktopCommit      = "73952edb48da46bd0b244661efe22f4f247c4977"
-	globalDesktopReleaseDate = int64(1792063023116) // 2026-10-15T11:17:03.116Z
 )
 
 // desktopLocal 桌面端事件中 source/mode 字段的本地标记值（官方分发端恒发此值）。
@@ -78,27 +70,39 @@ type desktopBuild struct {
 	releaseDate int64
 }
 
-// desktopBuildFor 按账号 realm 返回桌面构建指纹（nil 账号按 cn）。
-func desktopBuildFor(a *auth.Auth) desktopBuild {
-	if a != nil && a.IsGlobal() {
-		return desktopBuild{version: globalClientVersion, commit: globalDesktopCommit, releaseDate: globalDesktopReleaseDate}
+// desktopBuildFor 按账号 realm 返回 profile 冻结的桌面构建指纹
+// （版本 + commit + releaseDate）。profile 缺失返回零值（启动期已拒绝该状态）。
+func (c *Client) desktopBuildFor(account *auth.Auth) desktopBuild {
+	profile := c.profileFor(account)
+	if profile == nil {
+		return desktopBuild{}
 	}
 
-	return desktopBuild{version: cnClientVersion, commit: cnDesktopCommit, releaseDate: cnDesktopReleaseDate}
+	return desktopBuild{
+		version:     profile.Emit.DesktopIdeVersion,
+		commit:      profile.Source.Commit,
+		releaseDate: profile.Source.ReleaseDate,
+	}
 }
 
-// desktopUAFor 桌面上报/白名单类出站 UA：两段品牌 + CLI 段
-// （`WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cli>`；global 品牌段为 `workbuddy-ai`）。
-// 与 chat 链路的 SDK 形态不同：这是 /v2/report 等非 SDK 请求的官方形态。
-func desktopUAFor(a *auth.Auth) string {
-	build := desktopBuildFor(a)
-
-	brand, cli := "WorkBuddy", cnCliVersion
-	if a != nil && a.IsGlobal() {
-		brand, cli = "workbuddy-ai", globalCliVersion
+// desktopExtVersionFor 上报事件的 extVersion：profile 可独立取值，不跟 ideVersion 绑定。
+func (c *Client) desktopExtVersionFor(account *auth.Auth) string {
+	if p := c.profileFor(account); p != nil && p.Emit.DesktopExtVersion != "" {
+		return p.Emit.DesktopExtVersion
 	}
 
-	return brand + "/" + build.version + " " + brand + "/" + build.version + " CLI/" + cli
+	return c.desktopBuildFor(account).version
+}
+
+// desktopUAFor 桌面上报/白名单类出站 UA：直接取 profile 冻结字面量。
+// 与 chat 链路的 SDK 形态不同：这是 /v2/report 等非 SDK 请求的官方形态。
+// profile 缺失返回空串（启动期已拒绝该状态）。
+func (c *Client) desktopUAFor(account *auth.Auth) string {
+	if p := c.profileFor(account); p != nil {
+		return p.Emit.DesktopUA
+	}
+
+	return ""
 }
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（CN 默认 www.workbuddy.cn）。
@@ -219,11 +223,11 @@ func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) 
 }
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-// 版本/commit/releaseDate 按 realm 取官方分发包真值；os/arch 固定为常见桌面
+// 版本/commit/releaseDate 按 realm 取部署 profile 的官方分发包真值；os/arch 固定为常见桌面
 // （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台；
 // osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
-func desktopFingerprint(account7 *auth.Auth) map[string]any {
-	desktopBuild2 := desktopBuildFor(account7)
+func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
+	desktopBuild2 := c.desktopBuildFor(account7)
 	osVersion, cpuCores, memorySize := desktopHardware(account7)
 	cpuModel := desktopCPUModel(account7, cpuCores)
 	now := time.Now().UnixMilli()
@@ -243,7 +247,7 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"machineId":    deriveID(account7, "machine"),
 		"sessionId":    deriveID(account7, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   desktopBuild2.version,
+		"extVersion":   c.desktopExtVersionFor(account7),
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    osVersion,
@@ -273,7 +277,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 		return errDesktopReportNoEvents
 	}
 
-	fp := desktopFingerprint(account2)
+	fp := c.desktopFingerprint(account2)
 
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
@@ -301,7 +305,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	req.Header.Set("Authorization", "Bearer "+account2.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUAFor(account2))
+	req.Header.Set("User-Agent", c.desktopUAFor(account2))
 	req.Header.Set("X-Domain", c.desktopDomain(account2))
 	req.Header.Set("X-Product", "SaaS")
 	injectEnterpriseHeaders(req, account2)
@@ -437,7 +441,7 @@ func (c *Client) SetAppearanceTheme(account *auth.Auth, resourceKey string) erro
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUAFor(account))
+	req.Header.Set("User-Agent", c.desktopUAFor(account))
 	req.Header.Set("X-Product", "SaaS")
 
 	if account.UID != "" {
@@ -628,7 +632,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 
 	req.Header.Set("Authorization", "Bearer "+account4.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUAFor(account4))
+	req.Header.Set("User-Agent", c.desktopUAFor(account4))
 	req.Header.Set("X-Domain", c.desktopDomain(account4))
 	req.Header.Set("X-Product", "SaaS")
 
