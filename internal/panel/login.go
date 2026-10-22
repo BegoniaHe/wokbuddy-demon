@@ -360,8 +360,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 
 	tok, pending, endpoint, err := p.pollLoginToken(sess.realm, sess.base, state)
 	if err != nil {
-		// pending / 未完成：面板前端继续轮询。
-		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
+		writeLoginPollError(w, err)
 		return
 	}
 
@@ -402,6 +401,18 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
 	})
+}
+
+// writeLoginPollError 区分部署错误与「等用户完成登录」：profile 缺失不能返回
+// 200 done=false，否则前端会无限轮询；其余错误仍按 pending 语义返回。
+func writeLoginPollError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errLoginProfileMissing) {
+		writeErr(w, http.StatusServiceUnavailable, err.Error())
+
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": err.Error()})
 }
 
 // pollLoginToken 查 auth/token：请求失败返回 err（面板按 pending 处理）；token 尚未
