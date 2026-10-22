@@ -295,9 +295,13 @@ func (s *Scheduler) runPacedBatch(
 }
 
 // waitBatchTarget 分段等待到墙钟 target；ctx 取消返回 false。
+//
+// target 来自 time.Now()（携带单调读数），若直接 time.Until 会按单调时钟计算：
+// 机器睡眠时单调时钟冻结，醒来后仍会按剩余时长继续等，把整批账号顺延到墙钟
+// 目标之后。Round(0) 去掉单调读数，让每段都按墙钟重判，与 waitSlot 同口径。
 func waitBatchTarget(ctx context.Context, target time.Time) bool {
 	for {
-		remain := time.Until(target)
+		remain := time.Until(target.Round(0))
 		if remain <= 0 {
 			return ctx.Err() == nil
 		}
