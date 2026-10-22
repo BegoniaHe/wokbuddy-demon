@@ -27,7 +27,7 @@ import (
 
 // imagesGenerationsHandler 出图入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Request) {
-	body, realm, bareModel, ok := h.readImagesRequest(w, r)
+	body, realm, bareModel, prefixed, ok := h.readImagesRequest(w, r)
 	if !ok {
 		return
 	}
@@ -52,16 +52,20 @@ func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	if prefixed {
+		body = rewriteImageModel(body, bareModel)
+	}
+
 	h.generateImages(w, r, acct, body, realm, bareModel)
 }
 
 // readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
-func (h *Handler) readImagesRequest(w http.ResponseWriter, r *http.Request) ([]byte, string, string, bool) {
+func (h *Handler) readImagesRequest(w http.ResponseWriter, r *http.Request) ([]byte, string, string, bool, bool) {
 	if !h.loadLive().ImagesEndpoint {
 		writeOpenAIError(w, http.StatusNotFound, "not_found",
 			"images endpoint is disabled; enable features.images_endpoint to use POST /v1/images/generations")
 
-		return nil, "", "", false
+		return nil, "", "", false, false
 	}
 
 	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
@@ -72,12 +76,12 @@ func (h *Handler) readImagesRequest(w http.ResponseWriter, r *http.Request) ([]b
 			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
 				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "")
 
-			return nil, "", "", false
+			return nil, "", "", false, false
 		}
 
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 
-		return nil, "", "", false
+		return nil, "", "", false, false
 	}
 
 	var peek struct {
@@ -86,18 +90,35 @@ func (h *Handler) readImagesRequest(w http.ResponseWriter, r *http.Request) ([]b
 	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
 
-		return nil, "", "", false
+		return nil, "", "", false, false
 	}
 
-	realm, bareModel, _ := splitRealm(strings.TrimSpace(peek.Model))
+	realm, bareModel, prefixed := splitRealm(strings.TrimSpace(peek.Model))
 	if keyRealm := keyRealmFrom(r.Context()); keyRealm != "" && keyRealm != realm {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
 			"model realm "+realm+" does not match API key realm "+keyRealm)
 
-		return nil, "", "", false
+		return nil, "", "", false, false
 	}
 
-	return body, realm, bareModel, true
+	return body, realm, bareModel, prefixed, true
+}
+
+// rewriteImageModel 去掉 body.model 的 realm 前缀（上游只认裸名）。
+func rewriteImageModel(body []byte, bareModel string) []byte {
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil || obj == nil {
+		return body
+	}
+
+	obj["model"] = bareModel
+
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+
+	return out
 }
 
 // ensureImagesToken 临近过期先刷新；失败写出 502。

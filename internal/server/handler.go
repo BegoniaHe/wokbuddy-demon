@@ -3818,6 +3818,11 @@ func (h *Handler) applyWafPolicy(uid string, uerr *upstream.Error) {
 // 判定必须「code 且文案」：裸 "request illegal" 此前会把普通请求错误升级成硬禁用，
 // 上游已删除该过宽 marker，本 fork 同步收窄。
 func (h *Handler) applyAccountFaultPolicy(uid, body string) {
+	if upstream.IsUnconfirmedSafetyReview(body) {
+		log.Printf("WARN: [server] acct=%s: 11140 content failed safety review（未确认文案，仅记录；未扩内容审核 marker）",
+			logfmt.UID8(uid))
+	}
+
 	if upstream.IsAccountRestricted(body) {
 		h.cfg.Pool.Disable(uid, "upstream account restricted (11140 request illegal), submit feedback in WorkBuddy and re-login")
 		return

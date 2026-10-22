@@ -127,3 +127,38 @@ func TestImagesRealmDirectNoFallback(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 }
+
+// TestImagesRealmPrefixStripped 带 realm 前缀的模型只改 body.model，按前缀直路由。
+func TestImagesRealmPrefixStripped(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"cn:text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(string(gotBody), `"model":"text-to-image"`) || strings.Contains(string(gotBody), "cn:") {
+		t.Fatalf("body=%s", gotBody)
+	}
+}

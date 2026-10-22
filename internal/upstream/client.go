@@ -197,6 +197,14 @@ func IsAccountRestricted(body string) bool {
 		containsAnyDual(strings.ToLower(body), body, []string{accountRestrictedMsg})
 }
 
+// IsUnconfirmedSafetyReview 报告 11140 + "content failed safety review" 形态。
+// 该文案来自同类实现实证，官方包内未确认，因此**只记录日志**、不扩 contentBlocked
+// marker（issue #246）。
+func IsUnconfirmedSafetyReview(body string) bool {
+	return hasBusinessCode(body, accountRestrictedCode) &&
+		strings.Contains(strings.ToLower(body), "content failed safety review")
+}
+
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
 // 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex

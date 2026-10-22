@@ -1,14 +1,17 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 )
 
 // TestStreamFirstFrameErrorVeto 首帧可换号失败不写 200：直接换号后成功（issue #244）。
@@ -140,5 +143,46 @@ func TestNonStreamContinuation(t *testing.T) {
 
 	if calls.Load() != 2 {
 		t.Fatalf("calls=%d want 2", calls.Load())
+	}
+}
+
+// TestApplyModelBlockOverrideBusy 纯 14003 全池阻塞返回 503 model_busy（issue #254）。
+func TestApplyModelBlockOverrideBusy(t *testing.T) {
+	t.Parallel()
+
+	flow := &chatFlow{modelBlock: pool.ModelBlockStatus{Blocked: true, Busy: true, Count: 2}}
+	status, code, _, _ := flow.applyModelBlockOverride(http.StatusServiceUnavailable, "no_healthy_account", "", "", false)
+
+	if status != http.StatusServiceUnavailable || code != "model_busy" {
+		t.Fatalf("status=%d code=%s", status, code)
+	}
+
+	accountLevel := &chatFlow{modelBlock: pool.ModelBlockStatus{Blocked: false}}
+
+	status, code, _, _ = accountLevel.applyModelBlockOverride(http.StatusServiceUnavailable, "no_healthy_account", "", "", false)
+	if status != http.StatusServiceUnavailable || code != "no_healthy_account" {
+		t.Fatalf("account-level status=%d code=%s", status, code)
+	}
+}
+
+// TestWaitForModelBusyRespectsCancel ctx 取消时立即返回（issue #254 的 10s 上限）。
+func TestWaitForModelBusyRespectsCancel(t *testing.T) {
+	t.Parallel()
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	state.CooldownModelBusy("u1", "glm-5.2", "14003 model busy")
+
+	flow := &chatFlow{h: NewHandler(&Config{Pool: state}), bareModel: "glm-5.2", realm: "cn"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+
+	if flow.waitForModelBusy(ctx) {
+		t.Fatal("canceled ctx must not wait")
+	}
+
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("canceled wait took %v", elapsed)
 	}
 }
