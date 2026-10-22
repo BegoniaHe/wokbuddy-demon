@@ -115,11 +115,13 @@ func anthropicSearchPrelude(query string, outcome *upstream.SearchOutcome, fail 
 
 	var result map[string]any
 	if fail != nil {
+		// 官方契约：出错时 content 是单个 error 对象，不是数组；成功但无结果才是
+		// 空数组。客户端按该形状解析，数组会落进结果分支而丢掉错误码。
 		result = map[string]any{
 			"type": "web_search_tool_result", "tool_use_id": toolUseID,
-			"content": []any{map[string]any{
+			"content": map[string]any{
 				"type": "web_search_tool_result_error", "error_code": "unavailable",
-			}},
+			},
 		}
 	} else {
 		results := make([]any, 0, len(outcome.Results))

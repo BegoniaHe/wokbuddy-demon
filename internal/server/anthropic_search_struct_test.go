@@ -157,8 +157,28 @@ func TestAnthropicWebSearchFailureDegrades(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 
-	var parsed map[string]any
+	var parsed struct {
+		Content []struct {
+			Type    string `json:"type"`
+			Content any    `json:"content"`
+		} `json:"content"`
+	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
 		t.Fatal(err)
 	}
+
+	for _, block := range parsed.Content {
+		if block.Type != "web_search_tool_result" {
+			continue
+		}
+
+		// Anthropic 契约：搜索失败时 content 是单个错误对象，不是数组。
+		if _, ok := block.Content.(map[string]any); !ok {
+			t.Fatalf("web_search_tool_result error content must be an object, got %T: %s", block.Content, rec.Body)
+		}
+
+		return
+	}
+
+	t.Fatalf("response missing web_search_tool_result: %s", rec.Body)
 }

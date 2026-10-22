@@ -2620,7 +2620,7 @@ func (f *chatFlow) handleStreamSuccess(
 	if probe.ZeroOutputLength {
 		rc.Close()
 
-		return f.retryZeroOutputLength(ctx, acct, i)
+		return f.retryZeroOutputLength(ctx, acct, attemptStarted, i)
 	}
 
 	if probe.Kind != upstream.ErrNone {
@@ -2670,7 +2670,11 @@ func (f *chatFlow) handleStreamSuccess(
 
 // retryZeroOutputLength 处理 finish_reason=length 且零输出：同额度关闭 thinking
 // 重发一次；仍零输出返回 502 zero_output_length，不罚号、不冷却（issue #244）。
-func (f *chatFlow) retryZeroOutputLength(ctx context.Context, acct *auth.Auth, i int) rotationAction {
+func (f *chatFlow) retryZeroOutputLength(
+	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
 	if !f.zeroRetried {
 		f.zeroRetried = true
 		f.body = upstream.DisableThinking(f.body)
@@ -2680,7 +2684,7 @@ func (f *chatFlow) retryZeroOutputLength(ctx context.Context, acct *auth.Auth, i
 		return f.dispatch(ctx, acct, i)
 	}
 
-	f.zeroOutputLengthError()
+	f.zeroOutputLengthError(true)
 
 	return rotDone
 }
@@ -2688,11 +2692,13 @@ func (f *chatFlow) retryZeroOutputLength(ctx context.Context, acct *auth.Auth, i
 // retryNonStreamZeroOutput 非流式零输出 length 的同额度重发（与流式同口径）。
 // handled=false 表示该响应不是「零输出 length」，继续常规收尾。
 func (f *chatFlow) retryNonStreamZeroOutput(
-	ctx context.Context, acct *auth.Auth, resp map[string]any, i int,
+	ctx context.Context, acct *auth.Auth, resp map[string]any, attemptStarted time.Time, i int,
 ) (rotationAction, bool) {
 	if !zeroOutputLengthResponse(resp) {
 		return rotDone, false
 	}
+
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
 	if !f.zeroRetried {
 		f.zeroRetried = true
@@ -2703,7 +2709,7 @@ func (f *chatFlow) retryNonStreamZeroOutput(
 		return f.dispatch(ctx, acct, i), true
 	}
 
-	f.zeroOutputLengthError()
+	f.zeroOutputLengthError(false)
 
 	return rotDone, true
 }
@@ -2741,9 +2747,14 @@ func zeroOutputLengthResponse(resp map[string]any) bool {
 }
 
 // zeroOutputLengthError 写出 502 zero_output_length 终态（流式/非流式共用）。
-func (f *chatFlow) zeroOutputLengthError() {
+func (f *chatFlow) zeroOutputLengthError(stream bool) {
 	f.st.status = http.StatusBadGateway
-	f.st.outcome = reqlog.OutcomeStreamError
+	if stream {
+		f.st.outcome = reqlog.OutcomeStreamError
+	} else {
+		f.st.outcome = reqlog.OutcomeHTTPError
+	}
+
 	f.lastErr = errZeroOutputLength
 	f.out.Error(http.StatusBadGateway, "zero_output_length",
 		"upstream hit the output budget before producing any content; retry with a smaller prompt or another model",
@@ -2964,7 +2975,7 @@ func (f *chatFlow) handleNonStreamSuccess(
 		return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
 	}
 
-	if action, handled := f.retryNonStreamZeroOutput(ctx, acct, resp, i); handled {
+	if action, handled := f.retryNonStreamZeroOutput(ctx, acct, resp, attemptStarted, i); handled {
 		return action
 	}
 
