@@ -632,7 +632,7 @@ func runSequentialModelChat(panel2 *Panel, account3 *auth.Auth) (string, error) 
 		func() error {
 			return panel2.cfg.Upstream.ReportChatActivityModel(
 				account3,
-				session.NewUUIDv7Hex(),
+				session.NewUUIDv4(),
 				"",
 				"glm-5.2",
 				"GLM-5.2",

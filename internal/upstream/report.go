@@ -194,7 +194,7 @@ type chatRequestEvent struct {
 
 // ReportChatActivity 向上游发送一条对话活跃上报（chat_request_send）。
 // conversationID 由调用方生成（UUIDv4），无需真实会话——服务端不校验一致性。
-// requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时回落 conversationID。
+// requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时生成新的 UUIDv7。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
 	return c.ReportChatActivityModel(a, conversationID, requestID, "deepseek-v4-flash", "DeepSeek V4 Flash")
