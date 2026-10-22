@@ -404,3 +404,32 @@ func TestImagesRefreshDeadCredentialCountsSession(t *testing.T) {
 		t.Fatalf("session dead=%+v want 1 次且未达阈值不禁用", status)
 	}
 }
+
+// TestNoteRefreshFailureNoRefreshTokenCountsSession 无 RT 的 credential-dead
+// 错误在非 chat 入口也必须计入 session dead 阈值，而不是只喂熔断。
+func TestNoteRefreshFailureNoRefreshTokenCountsSession(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 1}
+	state := testPoolWith(account)
+	client := upstream.New()
+	client.BillingBaseCN = "https://fake.example"
+
+	handler := NewHandler(&Config{Pool: state, Upstream: client})
+
+	err := client.RefreshToken(account)
+	if err == nil {
+		t.Fatal("无 refreshToken 应返回错误")
+	}
+
+	handler.noteRefreshFailure(account, err, "search_refresh")
+
+	status, ok := state.Status("u1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+
+	if status.SessionDeadFails != 1 || status.Disabled {
+		t.Fatalf("session dead=%+v want 1 次且未达阈值不禁用", status)
+	}
+}
