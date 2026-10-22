@@ -65,7 +65,8 @@ type Config struct {
 	// 开启时序整形后作为对数正态分布的 median。
 	CheckinAccountDelay time.Duration
 
-	// Timing 时序整形参数（整点抖动 / 账号间限速 / 每日相位）；零值 = 今天的行为。
+	// Timing 时序整形参数（整点抖动 / 账号间限速 / 每日相位）；零值 = 不抖动、不限速，
+	// 账号顺序仍按每日相位稳定重排（PhaseWindow=0 的既定语义）。
 	Timing Timing
 
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
