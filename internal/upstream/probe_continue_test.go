@@ -36,6 +36,29 @@ func TestProbeStreamZeroOutputLength(t *testing.T) {
 	}
 }
 
+// TestProbeStreamContentFilterPassesThrough content_filter 是合法终态，不能当
+// 账号故障轮转；预览应立即放行，把终态帧交给客户端。
+func TestProbeStreamContentFilterPassesThrough(t *testing.T) {
+	t.Parallel()
+
+	frame := `data: {"choices":[{"index":0,"delta":{},"finish_reason":"content_filter"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	probe := ProbeStream(strings.NewReader(frame))
+	if probe.Kind != ErrNone || probe.ZeroOutputLength || probe.Empty || !probe.passThrough {
+		t.Fatalf("probe=%+v want pass-through content_filter", probe)
+	}
+
+	out, err := io.ReadAll(probe.Reader())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(out), `"finish_reason":"content_filter"`) {
+		t.Fatalf("content_filter frame lost: %s", out)
+	}
+}
+
 // TestTextContinueReaderSplicesLength 首段 length 后自动接续写段，客户端看到连续正文。
 func TestTextContinueReaderSplicesLength(t *testing.T) {
 	t.Parallel()

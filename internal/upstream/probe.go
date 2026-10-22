@@ -31,6 +31,9 @@ type StreamProbe struct {
 	Text string
 	// HasTool 预览阶段是否出现工具调用（有工具时不做正文续写）。
 	HasTool bool
+	// passThrough 已出现合法终态（如 content_filter）但无正文：直接透传，
+	// 不按账号故障轮转。
+	passThrough bool
 
 	buffered []byte
 	reader   *bufio.Reader
@@ -76,7 +79,8 @@ func ProbeStream(r io.Reader) *StreamProbe {
 		probe.buffered = append(probe.buffered, line...)
 		probe.inspectLine(line)
 
-		if probe.Kind != ErrNone || probe.ZeroOutputLength || probe.Empty || probe.hasSubstantive() {
+		if probe.Kind != ErrNone || probe.ZeroOutputLength || probe.Empty ||
+			probe.passThrough || probe.hasSubstantive() {
 			return probe
 		}
 
@@ -167,9 +171,14 @@ func (p *StreamProbe) inspectChoices(frame map[string]any) {
 		return
 	}
 
-	if p.FinishReason == "length" {
+	switch p.FinishReason {
+	case "length":
 		p.ZeroOutputLength = true
-	} else if p.FinishReason != "" && p.FinishReason != "stop" {
+	case "content_filter":
+		// 内容过滤是上游合法终态，不是账号故障；原样把终态帧交给客户端。
+		p.passThrough = true
+	case "", "stop":
+	default:
 		p.Kind = ErrServer
 	}
 }

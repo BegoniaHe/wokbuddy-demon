@@ -101,6 +101,40 @@ func TestStreamZeroOutputLengthRetriesThinkingDisabled(t *testing.T) {
 	}
 }
 
+// TestStreamContentFilterPassedThrough content_filter 终态直通客户端，不轮转、不罚号。
+func TestStreamContentFilterPassedThrough(t *testing.T) {
+	t.Parallel()
+
+	frame := "data: {\"id\":\"1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"content_filter\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	var calls atomic.Int32
+
+	upstreamClient := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls.Add(1)
+
+		return 200, frame, true
+	})
+	state := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	handler := NewHandler(&Config{Pool: state, Upstream: upstreamClient, MaxRotate: 3})
+
+	rec := postChat(t, handler, `{"model":"glm-5.2","stream":true,"messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), `"finish_reason":"content_filter"`) {
+		t.Fatalf("content_filter must reach client: %s", rec.Body)
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("content_filter must not rotate: calls=%d", calls.Load())
+	}
+}
+
 // TestNonStreamContinuation 非流式 length 截断自动续写并拼接正文（issue #247）。
 func TestNonStreamContinuation(t *testing.T) {
 	t.Parallel()

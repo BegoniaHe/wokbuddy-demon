@@ -215,7 +215,9 @@ func (h *Handler) handleImagesError(
 
 	outStatus := status
 	code := "upstream_error"
-	msg := strings.TrimSpace(string(raw))
+	// 与 chat 同口径：只透出 upstream.Error 已截断的 Msg（200 字符），避免把
+	// 上游可能很大的错误正文（含 HTML/调试信息）整段回给客户端。
+	msg := strings.TrimSpace(uerr.Msg)
 
 	switch {
 	case failFastKind(kind):

@@ -234,3 +234,41 @@ func TestImagesAliasRewrittenToUpstreamModel(t *testing.T) {
 		t.Fatalf("body=%s", gotBody)
 	}
 }
+
+// TestImagesUpstreamErrorTruncated 上游错误正文只透出截断后的 Msg，避免把大段
+// HTML/调试信息原样回给客户端。
+func TestImagesUpstreamErrorTruncated(t *testing.T) {
+	t.Parallel()
+
+	bigBody := strings.Repeat("x", 4096)
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusInternalServerError, bigBody, false
+	})
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var parsed struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(parsed.Error.Message) > 200 {
+		t.Fatalf("error message len=%d want <=200", len(parsed.Error.Message))
+	}
+}
