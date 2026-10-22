@@ -22,15 +22,16 @@ type ContinueOpener func(partial string) (io.ReadCloser, error)
 
 // TextContinueReader 在检测到 finish_reason=length + 正文后切换到续写流。
 type TextContinueReader struct {
-	src      io.ReadCloser
-	reader   *bufio.Reader
-	open     ContinueOpener
-	text     strings.Builder
-	hasTool  bool
-	out      bytes.Buffer
-	held     []byte
-	firstID  string
-	firstMdl string
+	src        io.ReadCloser
+	reader     *bufio.Reader
+	open       ContinueOpener
+	text       strings.Builder
+	hasTool    bool
+	out        bytes.Buffer
+	held       []byte
+	firstID    string
+	firstMdl   string
+	firstUsage map[string]any
 
 	finishLength  bool
 	continueTried bool
@@ -142,21 +143,37 @@ func (c *TextContinueReader) handleLine(line string) {
 	c.inspectFrame(frame)
 
 	if c.finishLength && !c.continued {
-		// 暂存 length 终态帧：续写成功则丢弃，失败则原样补发。终态帧若同时带
-		// 正文（少见），先把它作为普通内容写出，再暂存一个 finish-only 帧。
-		if frameHasSubstantive(frame) {
-			c.writeFrameJSON(stripFinishReason(frame))
-			c.held = finishOnlyFrameLine(frame)
-
-			return
-		}
-
-		c.held = []byte(line)
+		c.holdLengthFrame(line, frame)
 
 		return
 	}
 
 	c.writeFrameJSON(frame)
+}
+
+// holdLengthFrame 在续写前暂存 length 终态：续写成功则丢弃，失败则补发。
+// usage 帧立即写出并剥掉 finish_reason——hold 会被后续帧覆盖或在续写成功时
+// 丢弃（用量/积分漏记），直接写出 length 则会让客户端提前结束响应。
+func (c *TextContinueReader) holdLengthFrame(line string, frame map[string]any) {
+	if frameHasUsage(frame) {
+		c.writeFrameJSON(stripFinishReason(frame))
+
+		if frameFinishReasonIsLength(frame) {
+			c.held = append(c.held, finishOnlyFrameLine(frame)...)
+		}
+
+		return
+	}
+
+	if frameHasSubstantive(frame) {
+		// 终态帧同时带正文（少见）：正文先按普通内容写出，再暂存 finish-only 帧。
+		c.writeFrameJSON(stripFinishReason(frame))
+		c.held = append(c.held, finishOnlyFrameLine(frame)...)
+
+		return
+	}
+
+	c.held = append(c.held, line...)
 }
 
 // frameHasSubstantive 报告帧是否携带正文/拒答/工具调用。
@@ -186,6 +203,31 @@ func frameHasSubstantive(frame map[string]any) bool {
 			if tools, _ := node["tool_calls"].([]any); len(tools) > 0 {
 				return true
 			}
+		}
+	}
+
+	return false
+}
+
+// frameHasUsage 报告帧是否携带非空 usage 对象。
+func frameHasUsage(frame map[string]any) bool {
+	usage, ok := frame["usage"].(map[string]any)
+
+	return ok && len(usage) > 0
+}
+
+// frameFinishReasonIsLength 报告帧是否带 finish_reason=length。
+func frameFinishReasonIsLength(frame map[string]any) bool {
+	choices, _ := frame["choices"].([]any)
+
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		if choice == nil {
+			continue
+		}
+
+		if fr, _ := choice["finish_reason"].(string); fr == "length" {
+			return true
 		}
 	}
 
@@ -263,6 +305,14 @@ func (c *TextContinueReader) captureMeta(frame map[string]any) {
 
 // inspectFrame 累计正文/工具调用并读取 finish_reason。
 func (c *TextContinueReader) inspectFrame(frame map[string]any) {
+	if !c.continuation {
+		// 首段 usage 在续写成功后仍是独立一次上游调用，不能随 length 帧一起丢弃；
+		// 续写段带 usage 时把它合并进去（末帧口径，与 statsReader 一致）。
+		if usage, ok := frame["usage"].(map[string]any); ok && len(usage) > 0 {
+			c.firstUsage = usage
+		}
+	}
+
 	choices, _ := frame["choices"].([]any)
 
 	for _, raw := range choices {
@@ -302,15 +352,7 @@ func (c *TextContinueReader) inspectDelta(delta map[string]any) {
 
 // writeFrameJSON 写回数据帧；续写段复用首段 id/model。
 func (c *TextContinueReader) writeFrameJSON(frame map[string]any) {
-	if c.continuation {
-		if c.firstID != "" {
-			frame["id"] = c.firstID
-		}
-
-		if c.firstMdl != "" {
-			frame["model"] = c.firstMdl
-		}
-	}
+	c.rewriteContinuationFrame(frame)
 
 	raw, err := json.Marshal(frame)
 	if err != nil {
@@ -318,6 +360,27 @@ func (c *TextContinueReader) writeFrameJSON(frame map[string]any) {
 	}
 
 	c.out.WriteString("data: " + string(raw) + "\n\n")
+}
+
+// rewriteContinuationFrame 把续写帧的 id/model 对齐首段，并把首段 usage 合并进
+// 续写段 usage：续写是第二次上游调用，只报本段会让流式记账漏记首段
+// （issue #247，与非流式 mergeUsageTotals 同口径）。
+func (c *TextContinueReader) rewriteContinuationFrame(frame map[string]any) {
+	if !c.continuation {
+		return
+	}
+
+	if c.firstID != "" {
+		frame["id"] = c.firstID
+	}
+
+	if c.firstMdl != "" {
+		frame["model"] = c.firstMdl
+	}
+
+	if usage, ok := frame["usage"].(map[string]any); ok && c.firstUsage != nil {
+		mergeUsageNumbers(usage, c.firstUsage)
+	}
 }
 
 // handleEOF 流结束：有暂存 length 时尝试续写；否则收尾。
@@ -379,6 +442,31 @@ func (c *TextContinueReader) flushHeld() {
 
 	c.out.Write(c.held)
 	c.held = nil
+}
+
+// mergeUsageNumbers 递归把 src 的数值字段累加进 dst，缺失的非数值键直接补齐。
+// 只处理 usage 的数值树（prompt_tokens_details 等嵌套对象）。
+func mergeUsageNumbers(dst, src map[string]any) {
+	for key, value := range src {
+		switch typed := value.(type) {
+		case map[string]any:
+			if target, ok := dst[key].(map[string]any); ok {
+				mergeUsageNumbers(target, typed)
+
+				continue
+			}
+		case float64:
+			if target, ok := dst[key].(float64); ok {
+				dst[key] = target + typed
+
+				continue
+			}
+		}
+
+		if _, exists := dst[key]; !exists {
+			dst[key] = value
+		}
+	}
 }
 
 // BuildContinuationBody 在原始请求体后追加 assistant 部分正文与续写指令。

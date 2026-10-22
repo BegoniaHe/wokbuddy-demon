@@ -838,6 +838,8 @@ type responsesToolSpec struct {
 // 不同 namespace 的同名工具必须区分：直接按 bare 名去重会让后一个工具整体消失。
 // 只在检测到重名时使用带回 namespace 的限定名，唯一工具保持裸名，避免无谓地
 // 改变模型看到的工具名。
+//
+//nolint:cyclop // 收集/去重/命名/回程映射线性展开，拆散会掩盖同名冲突判定。
 func responsesTools(tools []map[string]any) ([]any, map[string]responsesToolRef) {
 	specs := responsesCollectTools(tools)
 
@@ -873,7 +875,9 @@ func responsesTools(tools []map[string]any) ([]any, map[string]responsesToolRef)
 
 		seen[declared] = true
 		// 顶层唯一工具名无需映射：responsesResolveToolName 未命中时原样返回。
-		if spec.namespace != "" || declared != spec.name {
+		// 但顶层裸名与 namespace 工具同名时，必须记录裸名身份，否则
+		// responsesUpstreamToolName 会把它误映射到唯一的限定名（issue #259）。
+		if spec.namespace != "" || declared != spec.name || counts[spec.name] > 1 {
 			refs[declared] = responsesToolRef{bare: spec.name, namespace: spec.namespace}
 		}
 

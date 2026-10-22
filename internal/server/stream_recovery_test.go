@@ -222,6 +222,71 @@ func TestNonStreamContinuationSumsUsage(t *testing.T) {
 	}
 }
 
+// TestStreamContinuationSumsUsage 流式截断续写两段 usage 必须累加，且首段 length
+// 终态不得提前发给客户端（issue #247）。
+//
+//nolint:cyclop // 端到端断言，线性展开更直观。
+func TestStreamContinuationSumsUsage(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		if calls.Add(1) == 1 {
+			return 200, `data: {"id":"c1","model":"glm-5.2","choices":[{"index":0,"delta":{"content":"hello "}}]}` + "\n\n" +
+				`data: {"id":"c1","model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"credit":1}}` + "\n\n" +
+				"data: [DONE]\n\n", true
+		}
+
+		return 200, `data: {"id":"c1","model":"glm-5.2","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24,"credit":2}}` + "\n\n" +
+			"data: [DONE]\n\n", true
+	})
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, handler, `{"model":"glm-5.2","stream":true,"messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "hello ") || !strings.Contains(body, "world") {
+		t.Fatalf("continuation body missing content: %s", body)
+	}
+
+	if strings.Contains(body, `"finish_reason":"length"`) {
+		t.Fatalf("client must not see first-segment length before continuation: %s", body)
+	}
+
+	usage := map[string]any{}
+
+	for line := range strings.SplitSeq(body, "\n") {
+		if !strings.HasPrefix(line, "data: ") || strings.Contains(line, "[DONE]") {
+			continue
+		}
+
+		var chunk map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
+			continue
+		}
+
+		if u, ok := chunk["usage"].(map[string]any); ok {
+			usage = u
+		}
+	}
+
+	for key, want := range map[string]float64{"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36, "credit": 3} {
+		if got, _ := usage[key].(float64); got != want {
+			t.Errorf("usage.%s=%v want %v (body=%s)", key, usage[key], want, body)
+		}
+	}
+
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d want 2", calls.Load())
+	}
+}
+
 // TestNonStreamZeroOutputLengthRetriesThinkingDisabled 非流式零输出 length 也关闭
 // thinking 重发一次，而不是把空 content 当成功（issue #244）。
 func TestNonStreamZeroOutputLengthRetriesThinkingDisabled(t *testing.T) {

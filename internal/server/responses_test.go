@@ -492,6 +492,29 @@ func TestResponsesUpstreamToolNameBareAmbiguous(t *testing.T) {
 	}
 }
 
+// TestResponsesUpstreamToolNameTopLevelCollision 顶层裸名与 namespace 工具同名时，
+// 历史 function_call 的裸名必须仍指向顶层工具，不能被改写成限定名（issue #259）。
+func TestResponsesUpstreamToolNameTopLevelCollision(t *testing.T) {
+	t.Parallel()
+
+	tools := []map[string]any{
+		{"type": "function", "name": "search", "parameters": map[string]any{"type": "object"}},
+		{"type": "namespace", "name": "web", "tools": []any{
+			map[string]any{"type": "function", "name": "search", "parameters": map[string]any{"type": "object"}},
+		}},
+	}
+
+	_, refs := responsesTools(tools)
+
+	if got := responsesUpstreamToolName("search", refs); got != "search" {
+		t.Fatalf("top-level search = %q want search (refs=%v)", got, refs)
+	}
+
+	if got := responsesUpstreamToolName("web__search", refs); got != "web__search" {
+		t.Fatalf("namespaced search = %q want web__search", got)
+	}
+}
+
 // assertResponsesFlatToolNames 校验转换后的 chat tools 名字集合。
 func assertResponsesFlatToolNames(t *testing.T, tools []any, want ...string) {
 	t.Helper()

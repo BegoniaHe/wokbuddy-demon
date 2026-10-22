@@ -199,3 +199,64 @@ func TestTextContinueReaderContinuesWhenDoneHasNoNewline(t *testing.T) {
 		t.Fatalf("length finish must be suppressed: %s", out)
 	}
 }
+
+// TestTextContinueReaderPreservesLengthWithSeparateUsage 末帧 length 之后还有独立
+// usage 帧时，续写失败必须同时保留 length 与 usage（issue #247）。
+func TestTextContinueReaderPreservesLengthWithSeparateUsage(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"hello "}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+		return nil, io.ErrUnexpectedEOF
+	})
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(out), `"finish_reason":"length"`) {
+		t.Fatalf("length frame lost after usage frame: %s", out)
+	}
+
+	if !strings.Contains(string(out), `"total_tokens":15`) {
+		t.Fatalf("usage frame lost after length: %s", out)
+	}
+}
+
+// TestTextContinueReaderMergesFirstUsage 续写成功时末帧 usage 必须包含首段用量，
+// 不能只保留续写段（issue #247，与非流式 mergeUsageTotals 同口径）。
+func TestTextContinueReaderMergesFirstUsage(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"hello "}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"credit":1,"prompt_tokens_details":{"cached_tokens":3}}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	second := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24,"credit":2,"prompt_tokens_details":{"cached_tokens":5}}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+		return closeString{strings.NewReader(second)}, nil
+	})
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		`"prompt_tokens":30`, `"completion_tokens":6`, `"total_tokens":36`, `"credit":3`, `"cached_tokens":8`,
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("merged usage missing %s: %s", want, out)
+		}
+	}
+
+	if strings.Contains(string(out), `"finish_reason":"length"`) {
+		t.Fatalf("length finish must be suppressed after successful continuation: %s", out)
+	}
+}
