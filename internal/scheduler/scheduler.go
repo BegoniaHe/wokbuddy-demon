@@ -62,7 +62,11 @@ type Config struct {
 	IncludeDisabledInTasks bool
 
 	// CheckinAccountDelay 签到任务账号间等待（issue #59）；0 = 不限。
+	// 开启时序整形后作为对数正态分布的 median。
 	CheckinAccountDelay time.Duration
+
+	// Timing 时序整形参数（整点抖动 / 账号间限速 / 每日相位）；零值 = 今天的行为。
+	Timing Timing
 
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
@@ -115,6 +119,8 @@ type Scheduler struct {
 	nowFn func() time.Time
 	// logger 调度日志出口（测试可注入本地 buffer；nil 回退 log.Default()）。
 	logger *log.Logger
+	// rndFn 账号间隔采样随机源（测试注入；nil 回退 math/rand/v2）。
+	rndFn func() float64
 }
 
 // New 构建。
@@ -277,37 +283,9 @@ func poke(ch chan struct{}) {
 	}
 }
 
-// nextFireIn 返回 now 之后最近的一个整点触发时间；loc 为空时按 now 的时区解释，
-// 非空时 hours 按 loc（例如 CST）解释。仅黑猫任务需要固定 CST：上游窗口按 CST，
-// 其他任务保留操作者本地时钟（含 DST 语义）。
-func nextFireIn(now time.Time, hours []int, loc *time.Location) time.Time {
-	if loc == nil {
-		loc = now.Location()
-	}
-
-	localNow := now.In(loc)
-
-	var earliest time.Time
-
-	for _, hour := range hours {
-		t := slotOn(localNow, hour)
-		if !t.After(now) {
-			// 按墙钟日重算次日同一小时，而不是 Add(24h)：夏令时切换日 24h
-			// 不等于一个日历日，Add 会把 09:00 推到 08:00（回拨日）或
-			// 10:00（拨快日），导致任务在错误的小时触发。
-			// 次日日期用中午锚点推进：now 自身可能落在被拨快抹掉的墙钟时刻里，
-			// AddDate 会被 time.Date 归一化回前一日（America/Santiago 的
-			// 00:xx）。time.Date 对日溢出自动进位（月末→下月 1 号）。
-			y, m, d := localNow.Date()
-			t = slotOn(time.Date(y, m, d+1, 12, 0, 0, 0, loc), hour)
-		}
-
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
-		}
-	}
-
-	return earliest
+// nextFireIn 返回 now 之后最近的一个整点触发时间（无抖动），小时按 now 的时区解释。
+func nextFireIn(now time.Time, hours []int) time.Time {
+	return nextFireFor(now, taskCheckin, hours, nil, 0, "").at
 }
 
 // slotOn 返回 day 当天墙钟 hour:00 的实际时刻；该墙钟时刻被夏令时拨快抹掉时，
@@ -385,6 +363,7 @@ const (
 // wakeSlot 一类任务的候选时点：at 为零值表示该类当前无有效时点。
 type wakeSlot struct {
 	at   time.Time
+	base time.Time // 未抖动整点；零值表示该槽无有效基准
 	kind taskKind
 }
 
@@ -407,16 +386,18 @@ func (s *Scheduler) candidateSlots(now time.Time) []wakeSlot {
 		{s.cfg.BlackcatHours, taskBlackcat, s.cfg.BlackcatDisabled, cst.Loc},
 		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled, nil},
 	}
+	timing := s.cfg.Timing
 	s.schedMu.Unlock()
 
 	var slots []wakeSlot
 
-	for _, sp := range specs {
-		if sp.disabled {
+	for _, spec := range specs {
+		if spec.disabled {
 			continue
 		}
 
-		slots = append(slots, wakeSlot{nextFireIn(now, sp.hours, sp.loc), sp.kind})
+		fire := nextFireFor(now, spec.kind, spec.hours, spec.loc, timing.SlotJitter, timing.Salt)
+		slots = append(slots, wakeSlot{at: fire.at, base: fire.base, kind: spec.kind})
 	}
 
 	return slots
@@ -443,22 +424,40 @@ func earliestSlot(slots []wakeSlot) time.Time {
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
 func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
+	earliest, kinds, _ := s.nextWakeDetail(now)
+
+	return earliest, kinds
+}
+
+// nextWakeDetail 同 nextWake，额外返回该唤醒时刻的抖动偏移（无抖动为 0），供 Run 日志对账。
+func (s *Scheduler) nextWakeDetail(now time.Time) (time.Time, []taskKind, time.Duration) {
 	slots := s.candidateSlots(now)
 
 	earliest := earliestSlot(slots)
 	if earliest.IsZero() {
-		return time.Time{}, nil
+		return time.Time{}, nil, 0
 	}
 
-	var kinds []taskKind
+	var (
+		kinds  []taskKind
+		jitter time.Duration
+	)
 
-	for _, sl := range slots {
-		if !sl.at.IsZero() && sl.at.Equal(earliest) {
-			kinds = append(kinds, sl.kind)
+	for _, slot := range slots {
+		if slot.at.IsZero() || !slot.at.Equal(earliest) {
+			continue
+		}
+
+		kinds = append(kinds, slot.kind)
+
+		if !slot.base.IsZero() {
+			if d := slot.at.Sub(slot.base); d > jitter {
+				jitter = d
+			}
 		}
 	}
 
-	return earliest, kinds
+	return earliest, kinds, jitter
 }
 
 // wakeupGraceDelay 迟到唤醒补跑的派发前网络宽限：Windows Modern Standby exit 后
@@ -591,7 +590,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 
 	for {
-		next, kinds := s.nextWake(time.Now())
+		next, kinds, jitter := s.nextWakeDetail(time.Now())
 		if next.IsZero() {
 			// 四类任务全部禁用：不空转，等重排通知（在线改配置重新启用）或退出信号。
 			select {
@@ -601,6 +600,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 		}
+
+		s.logNextWake(next, jitter)
 
 		switch s.waitSlot(ctx, next, wallclockCheckStep) {
 		case slotCancel:
@@ -622,6 +623,16 @@ func (s *Scheduler) Run(ctx context.Context) {
 			s.runBatch(ctx, kinds)
 		}
 	}
+}
+
+// logNextWake 记录下一次唤醒与抖动偏移，便于对账。
+func (s *Scheduler) logNextWake(next time.Time, jitter time.Duration) {
+	if jitter > 0 {
+		log.Printf("下次唤醒 %s (+%s jitter)", next.Format("15:04:05"), jitter.Round(time.Millisecond))
+		return
+	}
+
+	log.Printf("下次唤醒 %s", next.Format("15:04:05"))
 }
 
 // runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
@@ -697,11 +708,10 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	delay := s.checkinDelay()
-	attempted := false
-
-	var runCounters2 runCounters
 
 	all := s.cfg.Pool.List()
+	targets := make([]batchTarget, 0, len(all))
+
 	for i := range all {
 		status := &all[i]
 
@@ -710,14 +720,15 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 			continue
 		}
 
-		if attempted && !sleepCtx(ctx, delay) {
-			// 优雅停机：不等限速睡满，剩余账号下轮再跑。
-			return runCounters2.total, runCounters2.success, runCounters2.failure
-		}
+		targets = append(targets, batchTarget{
+			uid: account.UID,
+			run: func() bool { return s.runCheckinAccount(status, account, expiringSoon) },
+		})
+	}
 
-		attempted = true
-
-		runCounters2.record(s.runCheckinAccount(status, account, expiringSoon))
+	total, success, failure = s.runPacedBatch(ctx, taskCheckin, delay, targets)
+	if ctx.Err() != nil {
+		return total, success, failure
 	}
 	// 连登管家作为独立任务族运行（自己的守卫/状态），触发来源标记为签到后置，
 	// 与独立手动/排程区分；已在跑时跳过并留一行日志，避免用户误以为已执行。
@@ -725,7 +736,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 		log.Printf("INFO: [scheduler] 连登管家已在运行，本轮签到后置触发跳过")
 	}
 
-	return runCounters2.total, runCounters2.success, runCounters2.failure
+	return total, success, failure
 }
 
 // checkinAuth 返回该账号本轮应使用的凭证；禁用/无 refresh token 跳过。
@@ -823,12 +834,11 @@ func (s *Scheduler) RunActivityNow() {
 
 // activityAll 活跃上报遍历，随 ctx 取消立即退出；返回尝试/成功/失败账号数。
 func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure int) {
-	var runCounters2 runCounters
-
-	first := true
 	includeDisabled := s.includeDisabledInTasks()
 
 	list := s.cfg.Pool.List()
+	targets := make([]batchTarget, 0, len(list))
+
 	for i := range list {
 		st := &list[i]
 		if st.Disabled && !includeDisabled {
@@ -851,29 +861,25 @@ func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure in
 		// 无需改动 upstream。此处曾按「D4 门控：global 无活跃体系」跳过 global，实测该
 		// 判断不成立——国际版 /v2/report 可用，跳过即国际版账号永远点不亮连登（上游
 		// a190252 同口径修复）。checkin/travel 的 global 门控不受影响，仍跳过。
-		if !first {
-			if !sleepCtx(ctx, activityAccountDelay) {
-				// 优雅停机：不等限速睡满，剩余账号下轮再报。
-				return runCounters2.total, runCounters2.success, runCounters2.failure
-			}
-		}
+		targets = append(targets, batchTarget{
+			uid: account.UID,
+			run: func() bool {
+				cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
+				if err := s.cfg.Upstream.ReportChatActivity(account, cid, ""); err != nil {
+					log.Printf("activity %s: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
+					s.notifyTaskFailed("activity", account.UID, account.NicknameValue(), account.Realm())
 
-		first = false
+					return false
+				}
 
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
-		if err := s.cfg.Upstream.ReportChatActivity(account, cid, ""); err != nil {
-			log.Printf("activity %s: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
-			s.notifyTaskFailed("activity", account.UID, account.NicknameValue(), account.Realm())
-			runCounters2.record(false)
+				s.checkActivityStreak(account) // 上报成功 → 回读 streak 自检（自检异常不计失败）
 
-			continue
-		}
-
-		s.checkActivityStreak(account) // 上报成功 → 回读 streak 自检（自检异常不计失败）
-		runCounters2.record(true)
+				return true
+			},
+		})
 	}
 
-	return runCounters2.total, runCounters2.success, runCounters2.failure
+	return s.runPacedBatch(ctx, taskActivity, activityAccountDelay, targets)
 }
 
 // checkActivityStreak 上报成功后回读连登天数（只读 oracle，发现静默失败）。

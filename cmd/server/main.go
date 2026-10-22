@@ -288,6 +288,7 @@ func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.No
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
 		CheckinAccountDelay:    cfg.CheckinAccountDelayDur,
+		Timing:                 cfg.Timing,
 		RunStampFile:           stateSibling(cfg.StateFile, "scheduler-runs.json"),
 	})
 	logScheduleConfig(cfg)
@@ -660,6 +661,21 @@ func logScheduleConfig(cfg *Config) {
 	logScheduleTasks(cfg)
 	logScheduleLifecycle(cfg)
 	logScheduleBalance(cfg)
+	logScheduleTiming(cfg)
+}
+
+// logScheduleTiming 打印时序整形汇总（issue #220）。
+func logScheduleTiming(cfg *Config) {
+	t := cfg.Timing
+	if t.SlotJitter <= 0 && t.PacingSigma <= 0 && t.PhaseWindow <= 0 {
+		log.Printf("时序整形已关闭（slot_jitter / account_pacing_sigma / account_phase_window 均为 0）")
+		return
+	}
+
+	log.Printf(
+		"时序整形：整点抖动 ≤%s，账号间隔 σ=%.2f（%s~%s），每日相位窗口 %s",
+		t.SlotJitter, t.PacingSigma, t.PacingFloor, t.PacingCeiling, t.PhaseWindow,
+	)
 }
 
 // logScheduleTasks 打印签到 / 旅行 / 活跃上报的启用态。
@@ -912,6 +928,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
+	sch.SetTimingShape(newCfg.Timing)
 }
 
 // configBackupPath 单代配置备份路径（只留上一版，KISS）。

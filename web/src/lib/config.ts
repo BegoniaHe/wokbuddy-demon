@@ -32,6 +32,12 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'task_sweep_enabled', path: ['schedule', 'task_sweep_enabled'], kind: 'checkbox' },
   { name: 'task_sweep_minutes', path: ['schedule', 'task_sweep_minutes'], kind: 'number' },
   { name: 'checkin_account_delay', path: ['schedule', 'checkin_account_delay'], kind: 'text' },
+  { name: 'slot_jitter', path: ['schedule', 'slot_jitter'], kind: 'text' },
+  { name: 'account_pacing_sigma', path: ['schedule', 'account_pacing_sigma'], kind: 'number' },
+  { name: 'account_pacing_floor', path: ['schedule', 'account_pacing_floor'], kind: 'text' },
+  { name: 'account_pacing_ceiling', path: ['schedule', 'account_pacing_ceiling'], kind: 'text' },
+  { name: 'account_phase_window', path: ['schedule', 'account_phase_window'], kind: 'text' },
+  { name: 'timing_salt', path: ['schedule', 'timing_salt'], kind: 'text' },
   { name: 'growth_enabled', path: ['schedule', 'growth_enabled'], kind: 'checkbox' },
   { name: 'growth_hours', path: ['schedule', 'growth_hours'], kind: 'hours' },
   { name: 'include_disabled_in_tasks', path: ['schedule', 'include_disabled_in_tasks'], kind: 'checkbox' },
@@ -114,6 +120,10 @@ export const DURATION_FIELDS = new Set([
   'expiring_soon',
   'ttl',
   'checkin_account_delay',
+  'slot_jitter',
+  'account_pacing_floor',
+  'account_pacing_ceiling',
+  'account_phase_window',
   'rotate_budget',
 ]);
 export const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';

@@ -278,6 +278,44 @@ export function ConfigView() {
             </Field>
           </div>
           <Separator className="my-4" />
+          <div>
+            <Field>
+              <FieldLabel>整点抖动窗口</FieldLabel>
+              {text('slot_jitter', { placeholder: '20m' })}
+              <FieldDescription>整点后随机延后 0~W；0 = 整点触发，最大 59m</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>账号间隔中位数</FieldLabel>
+              {text('checkin_account_delay', { placeholder: '800ms' })}
+              <FieldDescription>签到账号间等待；开启时序整形后作为对数正态 median，0 = 不限</FieldDescription>
+            </Field>
+          </div>
+          <div className="grid gap-x-5 md:grid-cols-2">
+            <Field>
+              <FieldLabel>间隔分布 σ</FieldLabel>
+              {num('account_pacing_sigma', { min: 0, max: 1.5, step: 0.1, placeholder: '0.4' })}
+              <FieldDescription>对数正态 σ；0 = 固定间隔，范围 0~1.5</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>每日相位窗口</FieldLabel>
+              {text('account_phase_window', { placeholder: '10m' })}
+              <FieldDescription>每号每日错峰窗口；0 = 只打乱顺序不错峰</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>间隔下限</FieldLabel>
+              {text('account_pacing_floor', { placeholder: '250ms' })}
+            </Field>
+            <Field>
+              <FieldLabel>间隔上限</FieldLabel>
+              {text('account_pacing_ceiling', { placeholder: '6s' })}
+            </Field>
+            <Field>
+              <FieldLabel>派生盐</FieldLabel>
+              {text('timing_salt', { placeholder: '留空 = 内置常量' })}
+              <FieldDescription>改动会重排当天的抖动与相位</FieldDescription>
+            </Field>
+          </div>
+          <Separator className="my-4" />
           {check('include_disabled_in_tasks', '保号任务覆盖已禁用账号')}
           <p className="text-2xs text-muted-foreground">
             禁用只关选号：打开后已禁用的账号仍会签到 / 活跃上报 / 保活 / 刷新余额（依旧不参与选号）。适合「一次只放开一个账号、用禁用做流量开关」的轮换养号用法，默认关闭。

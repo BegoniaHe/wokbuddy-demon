@@ -56,6 +56,27 @@ describe('collectConfig', () => {
       upstream: { rotate_status_codes: [429, 500] },
     });
   });
+  it('时序整形字段拆分正确', () => {
+    expect(
+      collectConfig({
+        slot_jitter: '20m',
+        account_pacing_sigma: '0.4',
+        account_pacing_floor: '250ms',
+        account_pacing_ceiling: '6s',
+        account_phase_window: '10m',
+        timing_salt: 'abc',
+      }),
+    ).toEqual({
+      schedule: {
+        slot_jitter: '20m',
+        account_pacing_sigma: 0.4,
+        account_pacing_floor: '250ms',
+        account_pacing_ceiling: '6s',
+        account_phase_window: '10m',
+        timing_salt: 'abc',
+      },
+    });
+  });
   it('secret 字段空值不下发（保留磁盘原值）', () => {
     expect('device_token' in collectConfig({ device_token: '' })).toBe(false);
     expect('upstash_token' in collectConfig({ upstash_token: '' })).toBe(false);

@@ -167,13 +167,13 @@ func (s *Scheduler) runTaskBody(ctx context.Context, task, trigger string) (tota
 	case TaskCheckin:
 		return s.checkinAll(ctx)
 	case TaskTravel:
-		return s.travelAll()
+		return s.travelAll(ctx)
 	case TaskActivity:
 		return s.activityAll(ctx)
 	case TaskKeepalive:
 		return s.keepaliveAll()
 	case TaskBlackcat:
-		return s.blackcatAll()
+		return s.blackcatAll(ctx)
 	case TaskStreak:
 		return s.streakAll(trigger)
 	default:

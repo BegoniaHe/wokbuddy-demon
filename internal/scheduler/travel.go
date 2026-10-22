@@ -47,12 +47,10 @@ func (s *Scheduler) RunTravelNow() {
 }
 
 // travelAll 旅行巡检实体；返回尝试/成功/失败账号数（跳过不计数）。
-func (s *Scheduler) travelAll() (total, success, failure int) {
-	first := true
-
-	var runCounters2 runCounters
-
+func (s *Scheduler) travelAll(ctx context.Context) (total, success, failure int) {
 	list := s.cfg.Pool.List()
+	targets := make([]batchTarget, 0, len(list))
+
 	for i := range list {
 		st := &list[i]
 		if st.Disabled {
@@ -72,16 +70,10 @@ func (s *Scheduler) travelAll() (total, success, failure int) {
 			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
 		}
 
-		if !first {
-			time.Sleep(travelAccountDelay)
-		}
-
-		first = false
-
-		runCounters2.record(s.travelOne(account))
+		targets = append(targets, batchTarget{uid: account.UID, run: func() bool { return s.travelOne(account) }})
 	}
 
-	return runCounters2.total, runCounters2.success, runCounters2.failure
+	return s.runPacedBatch(ctx, taskTravel, travelAccountDelay, targets)
 }
 
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。

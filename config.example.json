@@ -63,6 +63,12 @@
     "task_sweep_enabled": true,
     "task_sweep_minutes": 15,
     "checkin_account_delay": "800ms",
+    "slot_jitter": "20m",
+    "account_pacing_sigma": 0.4,
+    "account_pacing_floor": "250ms",
+    "account_pacing_ceiling": "6s",
+    "account_phase_window": "10m",
+    "timing_salt": "",
     "include_disabled_in_tasks": false
   },
   "models": {

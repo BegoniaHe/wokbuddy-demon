@@ -21,6 +21,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
 )
 
 // placeholderAPIKey 是 config.example.json 里的公开占位密钥。
@@ -57,6 +58,11 @@ var (
 	errNormalizeUpstreamKeepaliveFailed = errors.New("normalizeUpstreamKeepalive failed")
 	errNormalizeServerDurationFailed    = errors.New("normalizeServerDuration failed")
 	errNormalizeCheckinDelayFailed      = errors.New("normalizeCheckinDelay failed")
+	errTimingJitterTooLarge             = errors.New("schedule.slot_jitter 不能超过 59m")
+	errTimingSigmaRange                 = errors.New("schedule.account_pacing_sigma 超出 [0,1.5]")
+	errTimingPacingFloorAboveCeiling    = errors.New("schedule.account_pacing_floor 不能大于 account_pacing_ceiling")
+	errTimingPacingFloorAboveMedian     = errors.New("schedule.account_pacing_floor 不能大于 checkin_account_delay")
+	errTimingPacingCeilingBelowMedian   = errors.New("schedule.account_pacing_ceiling 不能小于 checkin_account_delay")
 	errNormalizePromptFailed            = errors.New("normalizePrompt failed")
 	errCheckHourRangeFailed             = errors.New("checkHourRange failed")
 )
@@ -195,7 +201,15 @@ type Config struct {
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
 		// CheckinAccountDelay 签到任务账号间等待（issue #59）：如 "800ms"；"0" = 不限。
+		// 开启时序整形后作为对数正态分布的 median。
 		CheckinAccountDelay string `json:"checkin_account_delay"`
+		// 时序整形（issue #220）：默认开启；对应字段为 "0" 时完整回到整点/固定间隔。
+		SlotJitter           string  `json:"slot_jitter"`
+		AccountPacingSigma   float64 `json:"account_pacing_sigma"`
+		AccountPacingFloor   string  `json:"account_pacing_floor"`
+		AccountPacingCeiling string  `json:"account_pacing_ceiling"`
+		AccountPhaseWindow   string  `json:"account_phase_window"`
+		TimingSalt           string  `json:"timing_salt"`
 	} `json:"schedule"`
 
 	Models struct {
@@ -425,6 +439,8 @@ type Config struct {
 	ExpiringSoonDur   time.Duration `json:"-"`
 	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
 	CheckinAccountDelayDur time.Duration `json:"-"`
+	// Timing 解析后的时序整形参数（issue #220）。
+	Timing scheduler.Timing `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
@@ -520,6 +536,12 @@ func applyScheduleDefaults(config2 *Config) {
 	config2.Schedule.TaskSweepEnabled = true
 	config2.Schedule.TaskSweepMinutes = 15
 	config2.Schedule.CheckinAccountDelay = "800ms"
+	config2.Schedule.SlotJitter = "20m"
+	config2.Schedule.AccountPacingSigma = 0.4
+	config2.Schedule.AccountPacingFloor = "250ms"
+	config2.Schedule.AccountPacingCeiling = "6s"
+	config2.Schedule.AccountPhaseWindow = "10m"
+	config2.Schedule.TimingSalt = ""
 }
 
 func applyUpstreamDefaults(config7 *Config) {
@@ -908,7 +930,7 @@ func (c *Config) normalize() error {
 	steps := []func() error{
 		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
 		c.normalizeHiddenModels, c.normalizeScheduling,
-		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeLogging,
+		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeTimingShape, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
 		c.normalizeDNSServers,
 	}
@@ -1828,6 +1850,125 @@ func (c *Config) normalizeCheckinDelay() error {
 	c.CheckinAccountDelayDur = duration
 
 	return nil
+}
+
+// timingDurations 时序整形四段时长的归一化结果。
+type timingDurations struct {
+	jitterRaw, floorRaw, ceilingRaw, phaseRaw string
+	jitter, floor, ceiling, phase             time.Duration
+}
+
+// normalizeTimingShape 解析并校验时序整形参数（issue #220）。
+// 空值回落默认；"0" 合法（关闭对应整形）；负值/非法时长/σ 越界/夹逼矛盾报错，
+// 不静默回落。
+func (c *Config) normalizeTimingShape() error {
+	parsed, err := c.parseTimingDurations()
+	if err != nil {
+		return err
+	}
+
+	if err := c.validateTimingShape(&parsed); err != nil {
+		return err
+	}
+
+	c.Schedule.SlotJitter = parsed.jitterRaw
+	c.Schedule.AccountPacingFloor = parsed.floorRaw
+	c.Schedule.AccountPacingCeiling = parsed.ceilingRaw
+	c.Schedule.AccountPhaseWindow = parsed.phaseRaw
+	c.Schedule.TimingSalt = strings.TrimSpace(c.Schedule.TimingSalt)
+	c.Timing = scheduler.Timing{
+		SlotJitter:    parsed.jitter,
+		PacingSigma:   c.Schedule.AccountPacingSigma,
+		PacingFloor:   parsed.floor,
+		PacingCeiling: parsed.ceiling,
+		PhaseWindow:   parsed.phase,
+		Salt:          c.Schedule.TimingSalt,
+	}
+
+	return nil
+}
+
+// parseTimingDurations 解析四段时长，空值回落默认。
+func (c *Config) parseTimingDurations() (timingDurations, error) {
+	var parsed timingDurations
+
+	var err error
+
+	if parsed.jitterRaw, parsed.jitter, err = normalizeTimingDuration(
+		"slot_jitter", c.Schedule.SlotJitter, "20m"); err != nil {
+		return parsed, err
+	}
+
+	if parsed.floorRaw, parsed.floor, err = normalizeTimingDuration(
+		"account_pacing_floor", c.Schedule.AccountPacingFloor, "250ms"); err != nil {
+		return parsed, err
+	}
+
+	if parsed.ceilingRaw, parsed.ceiling, err = normalizeTimingDuration(
+		"account_pacing_ceiling", c.Schedule.AccountPacingCeiling, "6s"); err != nil {
+		return parsed, err
+	}
+
+	if parsed.phaseRaw, parsed.phase, err = normalizeTimingDuration(
+		"account_phase_window", c.Schedule.AccountPhaseWindow, "10m"); err != nil {
+		return parsed, err
+	}
+
+	return parsed, nil
+}
+
+// validateTimingShape 校验抖动窗口、σ 与夹逼关系。
+func (c *Config) validateTimingShape(parsed *timingDurations) error {
+	if parsed.jitter > 59*time.Minute {
+		return fmt.Errorf("%w: %q", errTimingJitterTooLarge, parsed.jitterRaw)
+	}
+
+	if c.Schedule.AccountPacingSigma < 0 || c.Schedule.AccountPacingSigma > 1.5 {
+		return fmt.Errorf("%w: %v", errTimingSigmaRange, c.Schedule.AccountPacingSigma)
+	}
+
+	if parsed.floor > 0 && parsed.ceiling > 0 && parsed.floor > parsed.ceiling {
+		return fmt.Errorf("%w: %q > %q", errTimingPacingFloorAboveCeiling, parsed.floorRaw, parsed.ceilingRaw)
+	}
+
+	return c.validateTimingClamp(parsed)
+}
+
+// validateTimingClamp 校验 floor/ceiling 与 median 的关系；median<=0 时不设夹逼。
+func (c *Config) validateTimingClamp(parsed *timingDurations) error {
+	median := c.CheckinAccountDelayDur
+	if median <= 0 {
+		return nil
+	}
+
+	if parsed.floor > 0 && parsed.floor > median {
+		return fmt.Errorf("%w: %q > %v", errTimingPacingFloorAboveMedian, parsed.floorRaw, median)
+	}
+
+	if parsed.ceiling > 0 && median > parsed.ceiling {
+		return fmt.Errorf("%w: %q < %v", errTimingPacingCeilingBelowMedian, parsed.ceilingRaw, median)
+	}
+
+	return nil
+}
+
+// normalizeTimingDuration 解析时序整形时长：空值回落默认，负值报错。
+func normalizeTimingDuration(field, raw, fallback string) (string, time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		raw = fallback
+	}
+
+	duration, err := time.ParseDuration(raw)
+	if err != nil {
+		return "", 0, fmt.Errorf("schedule.%s: %w", field, err)
+	}
+
+	if duration < 0 {
+		return "", 0, fmt.Errorf("schedule.%s: 负时长 %q 无意义: %w", field, raw, errNormalizeCheckinDelayFailed)
+	}
+
+	return raw, duration, nil
 }
 
 // normalizeSchedule 归一化监听地址与排程：小时数组空值回落默认、余额刷新周期，
