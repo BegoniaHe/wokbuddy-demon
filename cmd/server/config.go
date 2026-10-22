@@ -604,6 +604,8 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
 
+		markImplicitTimingClamp(raw, config)
+
 		if _, err := ParseConfigInto(raw, config); err != nil {
 			return nil, err
 		}
@@ -616,6 +618,28 @@ func Load(path string) (*Config, error) {
 	}
 
 	return config, nil
+}
+
+// markImplicitTimingClamp 把 JSON 缺键的 floor/ceiling 还原为「未显式配置」。
+// Load / parseConfigWithEnv 都从 Default() 起步，预填的 250ms/6s 会被
+// normalizeTimingShape 当成用户显式值，导致旧配置的 checkin_account_delay
+// 超出默认区间时升级即拒绝启动（与「缺键使用默认值」承诺冲突）。只清空缺键，
+// JSON 里显式写出的值（含与 median 矛盾的值）仍走校验报错。
+func markImplicitTimingClamp(raw []byte, config3 *Config) {
+	var doc struct {
+		Schedule map[string]json.RawMessage `json:"schedule"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return
+	}
+
+	if _, ok := doc.Schedule["account_pacing_floor"]; !ok {
+		config3.Schedule.AccountPacingFloor = ""
+	}
+
+	if _, ok := doc.Schedule["account_pacing_ceiling"]; !ok {
+		config3.Schedule.AccountPacingCeiling = ""
+	}
 }
 
 // ParseConfigInto 把 JSON 覆盖到 c 上并 normalize（不做 env、不读文件）。
@@ -636,6 +660,8 @@ func ParseConfigInto(raw []byte, config3 *Config) (*Config, error) {
 // 与 Load 同序：JSON → env → normalize，避免 env 覆盖的字段被误报为已变化。
 func parseConfigWithEnv(raw []byte) (*Config, error) {
 	config := Default()
+	markImplicitTimingClamp(raw, config)
+
 	if _, err := ParseConfigInto(raw, config); err != nil {
 		return nil, err
 	}

@@ -112,6 +112,37 @@ func TestTimingShapeConfigImplicitSideYieldsToExplicit(t *testing.T) {
 	}
 }
 
+// TestTimingShapeLegacyConfigMissingClampKeys 真实旧配置（JSON 里没有新键）不能
+// 被 Default() 预填的 250ms/6s 当成显式夹逼拒绝启动：缺键时夹逼要向 median 让位。
+func TestTimingShapeLegacyConfigMissingClampKeys(t *testing.T) {
+	t.Parallel()
+
+	high, err := parseConfigWithEnv([]byte(`{"schedule":{"checkin_account_delay":"10s"}}`))
+	if err != nil {
+		t.Fatalf("high median: %v", err)
+	}
+
+	if high.Timing.PacingCeiling != 10*time.Second {
+		t.Fatalf("ceiling=%v want 10s", high.Timing.PacingCeiling)
+	}
+
+	low, err := parseConfigWithEnv([]byte(`{"schedule":{"checkin_account_delay":"100ms"}}`))
+	if err != nil {
+		t.Fatalf("low median: %v", err)
+	}
+
+	if low.Timing.PacingFloor != 100*time.Millisecond {
+		t.Fatalf("floor=%v want 100ms", low.Timing.PacingFloor)
+	}
+
+	// JSON 显式写出矛盾值仍然报错，不被"缺键让位"兜住。
+	if _, err := parseConfigWithEnv([]byte(
+		`{"schedule":{"checkin_account_delay":"10s","account_pacing_ceiling":"6s"}}`,
+	)); err == nil {
+		t.Fatal("explicit conflicting ceiling must fail")
+	}
+}
+
 // TestTimingShapeConfigMissingSigmaDefaults 旧配置缺 account_pacing_sigma 键时
 // 应补默认 0.4（显式 0 仍在 TestTimingShapeConfigZero 中验证为关闭）。
 func TestTimingShapeConfigMissingSigmaDefaults(t *testing.T) {
