@@ -272,3 +272,57 @@ func TestImagesUpstreamErrorTruncated(t *testing.T) {
 		t.Fatalf("error message len=%d want <=200", len(parsed.Error.Message))
 	}
 }
+
+// TestImagesRefreshFailureDoesNotMarkSessionDead 出图 401 后 refresh 遇到瞬时失败
+// （网络/5xx）时不能把原始 401 记成会话失效，否则健康号会被连续三次刷新失败误禁用。
+func TestImagesRefreshFailureDoesNotMarkSessionDead(t *testing.T) {
+	t.Parallel()
+
+	var imageCalls, refreshCalls int
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "/images/") {
+				imageCalls++
+
+				return jsonResponse(http.StatusUnauthorized, `{"code":12153,"msg":"offline user session"}`), nil
+			}
+
+			refreshCalls++
+
+			return jsonResponse(http.StatusInternalServerError, `{"code":10000,"msg":"temporary"}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	state := testPoolWith(&auth.Auth{
+		UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999,
+	})
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if imageCalls != 1 || refreshCalls == 0 {
+		t.Fatalf("imageCalls=%d refreshCalls=%d", imageCalls, refreshCalls)
+	}
+
+	status, ok := state.Status("u1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+
+	if status.SessionDeadFails != 0 || status.Disabled {
+		t.Fatalf("transient refresh failure must not mark session dead: %+v", status)
+	}
+}

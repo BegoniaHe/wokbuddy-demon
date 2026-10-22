@@ -169,10 +169,15 @@ func (h *Handler) generateImages(
 
 	status, raw, err := h.cfg.Upstream.GenerateImage(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 
-	var uerr *upstream.Error
+	var (
+		uerr        *upstream.Error
+		refreshFail error
+	)
 	if errors.As(err, &uerr) && status == http.StatusUnauthorized {
-		// 401 同号 refresh 重放一次；仍失败按会话失效记录。
-		if refreshErr := h.cfg.Upstream.RefreshToken(acct); refreshErr == nil {
+		// 401 同号 refresh 重放一次；refresh 失败时按 refresh 错误分类，不能拿原始
+		// 401 记会话失效——网络/上游 5xx 会让健康号被连续三次失败误禁用。
+		refreshFail = h.cfg.Upstream.RefreshToken(acct)
+		if refreshFail == nil {
 			_ = acct.SaveAtomicRetry()
 			status, raw, err = h.cfg.Upstream.GenerateImage(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 		}
@@ -181,6 +186,15 @@ func (h *Handler) generateImages(
 	h.recordImagesAttempt(acct, realm, bareModel, raw, err, started, r)
 
 	if err != nil {
+		if refreshFail != nil && !upstream.IsCredentialDead(refreshFail) {
+			// 与 chat 的 penalizeRefreshFailure 非会话失效分支同口径：只喂熔断计数，
+			// 不累计 session dead。
+			h.cfg.Pool.NoteError(acct.UID)
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream token refresh failed")
+
+			return
+		}
+
 		if !errors.As(err, &uerr) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "image request failed at transport layer")
 
