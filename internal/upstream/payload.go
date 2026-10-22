@@ -38,6 +38,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 
 	normalizeToolChoice(obj)
+	normalizeStop(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
@@ -252,6 +253,18 @@ func pickLowestEffort(supported []string) string {
 	}
 
 	return lowest
+}
+
+// normalizeStop 把 OpenAI 兼容客户端常见的 `stop: "x"` 字符串形态归一为数组。
+// 上游按数组校验，字符串会 400 code=11101（issue #246）。空串不转换，保持原语义：
+// 是否把空串当「无停止序列」由上游决定，网关不替客户端丢弃字段。
+func normalizeStop(obj map[string]any) {
+	stop, ok := obj["stop"].(string)
+	if !ok || stop == "" {
+		return
+	}
+
+	obj["stop"] = []string{stop}
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。

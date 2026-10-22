@@ -1262,6 +1262,10 @@ type chatFlow struct {
 	// 标签）。各换号 return rotContinue 分支写入；degrade 复用同号重试、不算换号，
 	// 保持空值即跳过计数。
 	rotateReason string
+	// busyWaited 本次请求是否已为 14003 模型繁忙等待过（只等一次，issue #254）。
+	busyWaited bool
+	// zeroRetried 是否已因「length + 零输出」关闭思考重发过（只重发一次，issue #244）。
+	zeroRetried bool
 
 	chatMeta upstream.ChatMeta
 }
@@ -1775,9 +1779,18 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 			return rotBreak
 		}
 
-		f.reportNoAccount()
+		// 纯 14003 模型繁忙是可自愈的短暂状态：等待最近解锁时刻一次（上限 10s，
+		// 受 ctx 取消约束），再重新选号。账号级冷却/在途占满不等待（issue #254）。
+		if !f.busyWaited && f.waitForModelBusy(ctx) {
+			f.busyWaited = true
+			acct = f.pickAccount()
+		}
 
-		return rotBreak
+		if acct == nil {
+			f.reportNoAccount()
+
+			return rotBreak
+		}
 	}
 
 	f.tried[acct.UID] = true
@@ -2123,6 +2136,36 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 }
 
+// waitForModelBusy 纯 14003 全池阻塞时等待一次（≤10s，受 ctx 取消）。等待期间
+// 清空本轮 tried：冷却窗口可能刚好到期，旧排除集会挡住已恢复的账号。
+// 返回 true 表示值得重新选号；账号级冷却/非 busy/ctx 取消返回 false。
+func (f *chatFlow) waitForModelBusy(ctx context.Context) bool {
+	block := f.h.cfg.Pool.ModelBlockedForRealm(f.bareModel, f.realm)
+	if !block.Blocked || !block.Busy || block.Until.IsZero() {
+		return false
+	}
+
+	wait := min(time.Until(block.Until), modelBusyWaitMax)
+	if wait <= 0 {
+		return false
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		clear(f.tried)
+
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// modelBusyWaitMax 14003 单次请求最多等待时长（issue #254）。
+const modelBusyWaitMax = 10 * time.Second
+
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，
 // 避免下一轮仍撞同一个满载粘性号再浪费一次 PickByUID 往返。
 func (f *chatFlow) retryAcquireFailed(ctx context.Context, acct *auth.Auth, i int) rotationAction {
@@ -2170,10 +2213,9 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 
 // penalizeRefreshFailure refresh 失败按分类处置：session 死亡禁用，否则喂熔断计数。
 func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
-	var ue *upstream.Error
-	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-		// 与 keepalive 同口径：refresh 401/403 是猜测性终态，连续达到阈值才禁用，
-		// 避免一次上游抖动/并发 refresh 竞态直接杀号。
+	if upstream.IsCredentialDead(err) {
+		// 与 keepalive 同口径：refresh 401/403/无 RT 是猜测性终态，连续达到阈值才
+		// 禁用，避免一次上游抖动/并发 refresh 竞态直接杀号（issue #245）。
 		if f.h.cfg.Pool.NoteSessionDead(acct.UID) {
 			log.Printf("WARN: [server] refresh acct=%s: 连续 %d 次 session dead — 禁用",
 				logfmt.Label(acct.UID, acct.NicknameValue()), pool.SessionDeadThreshold())
@@ -2223,6 +2265,8 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 
 		f.lastErr = err
 		f.penalizeRefreshFailure(acct, err)
+
+		return f.handleSessionDeadError(ctx, acct, status, respBody, attemptStarted, i)
 	}
 
 	if status >= 400 {
@@ -2310,6 +2354,13 @@ func (f *chatFlow) handleHTTPError(
 		kind = upstream.Classify(status, string(respBody))
 		uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 	}
+	// 401 在 dispatch 已完成同号 refresh 求证；到这里说明重放后仍 401。按会话失效
+	// 连续计数（阈值才禁用），不再走 applyLifecyclePolicy 的立即 Disable（issue #245）。
+	if status == http.StatusUnauthorized && kind == upstream.ErrSessionDead {
+		f.penalizeRefreshFailure(acct, uerr)
+
+		return f.handleSessionDeadError(ctx, acct, status, respBody, attemptStarted, i)
+	}
 	// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，触发降级
 	// 到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append 降级重试同样退化
 	// 为 replace——原文在场只会确定性再撞 400）。第二次仍被拦 → 回内容防火墙错误。
@@ -2355,6 +2406,27 @@ func (f *chatFlow) handleHTTPError(
 	}
 
 	f.rotateReason = kind.String()
+
+	return rotContinue
+}
+
+// handleSessionDeadError 401/会话失效的换号收尾：记录一次空尝试、释放租约、
+// 按既有退避换号。禁用与否已由 penalizeRefreshFailure 的连续阈值决定。
+func (f *chatFlow) handleSessionDeadError(
+	ctx context.Context, acct *auth.Auth, status int, respBody []byte, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.st.status = status
+	f.lastErr = &upstream.Error{Kind: upstream.ErrSessionDead, Status: status, Msg: string(respBody)}
+	log.Printf("WARN: [server] chat acct=%s model=%s: session dead after refresh (401)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+	f.fail(acct.UID)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = "session_dead"
 
 	return rotContinue
 }
@@ -3178,7 +3250,16 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 		return status, code, msg, hint
 	}
 
-	if f.modelBlock.RateLimited {
+	if f.modelBlock.Busy {
+		// 14003 模型繁忙：短暂可恢复，503 + Retry-After 让客户端等待重试，
+		// 不伪装成 429 账号限流（issue #254）。
+		status = http.StatusServiceUnavailable
+		code = "model_busy"
+
+		if !upstreamMsgPassed {
+			msg = "model is busy upstream on every account; retry shortly"
+		}
+	} else if f.modelBlock.RateLimited {
 		status = http.StatusTooManyRequests
 		code = "rate_limit_exceeded"
 
@@ -3196,7 +3277,9 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 	}
 	// 阻塞范围（issue #29）：平台级（上游统一限流，等上游恢复）与账号级（换号/等本号
 	// 恢复）对运维的处置完全不同，在 hint 里点明。
-	if f.modelBlock.Scope == pool.ModelBlockScopePlatform {
+	if f.modelBlock.Busy {
+		hint = fmt.Sprintf("model_busy: 14003 upstream busy on %d account(s); retry after the short window", f.modelBlock.Count)
+	} else if f.modelBlock.Scope == pool.ModelBlockScopePlatform {
 		hint = fmt.Sprintf(
 			"model_blocked: upstream platform-level rate limit on this model (%d account(s) share the same reset)",
 			f.modelBlock.Count,

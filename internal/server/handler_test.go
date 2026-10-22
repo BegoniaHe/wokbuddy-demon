@@ -1183,24 +1183,28 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 }
 
-func TestChatSessionDeadDisables(t *testing.T) {
+func TestChatSessionDeadDisablesAtThreshold(t *testing.T) {
 	t.Parallel()
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 401, `{"code":12153,"msg":"Offline user session not found"}`, false
 	})
 	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(&Config{Pool: state, Upstream: up})
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
 
-	if rec.Code != 503 {
-		t.Errorf("code=%d", rec.Code)
+	// Issue #245：一次 401 只进入会话失效计数（面板显示待重登），连续达到阈值才禁用。
+	for i := range 3 {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+
+		if rec.Code != 503 {
+			t.Errorf("attempt %d code=%d", i, rec.Code)
+		}
 	}
 
 	st, _ := state.Status("u1")
 	if !st.Disabled {
-		t.Errorf("account should be disabled: %+v", st)
+		t.Errorf("account should be disabled after threshold: %+v", st)
 	}
 }
 

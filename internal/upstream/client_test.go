@@ -67,14 +67,21 @@ func TestClassify(t *testing.T) {
 		// 11135 业务码须容忍 JSON 空白（5d5223d：字面量 marker 只覆盖紧凑形态）。
 		{400, `{"code": 11135, "msg":"image data invalid"}`, ErrImageInvalid},
 		{400, `{"error":{"code": "11135", "message":"image invalid"}}`, ErrImageInvalid},
-		// 防过宽：11133（模型不支持图片）不进 image_invalid。
-		{400, `{"code": 11133, "msg":"model does not support image"}`, ErrClient},
+		// 11133 细分（issue #246）：缺/空 messages 是确定性请求体错误；图像/GIF 是模型
+		// 能力问题；其余按官方「模型无法处理此请求」归请求级，不喂账号连败。
+		{400, `{"code":11133,"extError":{"param":"messages"},"msg":"messages is required"}`, ErrBadParams},
+		{400, `{"code":11133,"msg":"model does not support image"}`, ErrImageInvalid},
+		{400, `{"code": 11133, "msg":"model failed to process request"}`, ErrBadParams},
+		{429, `{"code":11133,"msg":"model busy"}`, ErrSoftRate},
 		{200, `quota exceeded`, ErrHardCredit},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
-		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 401 一律会话失效（issue #245）：plain 401 / APISIX invalid_token 不能落
+		// ErrClient 只换号，否则死号会留在池中每个请求刷一遍 401。
+		{401, `{"code":9999,"msg":"bad token"}`, ErrSessionDead},
+		{401, `<html><body>invalid_token</body></html>`, ErrSessionDead},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
