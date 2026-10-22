@@ -43,9 +43,6 @@ type FrameError struct {
 func (e *FrameError) Error() string { return errErrorFrame.Error() + ": " + e.Payload }
 func (e *FrameError) Unwrap() error { return errErrorFrame }
 
-// IsErrorFrameError 报告错误是否为上游 error 帧。
-func IsErrorFrameError(err error) bool { return errors.Is(err, errErrorFrame) }
-
 // ErrorFramePayload 返回 error 帧原始 JSON；非该类型返回空串。
 func ErrorFramePayload(err error) string {
 	if frame, ok := errors.AsType[*FrameError](err); ok {
@@ -908,17 +905,6 @@ func normalizeFrameUsage(rawUsage any) any {
 	return rawUsage
 }
 
-// Stream 透传上游 SSE 到 w（逐帧规范化后 flush），保证至少写一个 [DONE]。
-// 调用方必须先设置过 status 200；本函数自设 SSE headers。
-// 流式策略：逐帧透传（规范化已剥空 content 噪声），恢复与上游一致的平滑流式。
-//
-// StreamHint 变体（gateway_hint 任务）：上游 error 帧透传时附加
-// error.gateway_hint 字段——message 原文不动，hint 并列补充；hintFn 返回空串
-// 或 nil 时与 Stream 行为逐字节一致。
-func Stream(w http.ResponseWriter, r io.Reader) error {
-	return StreamHint(w, r, nil)
-}
-
 // StreamOption StreamHint 的可选行为开关。
 // WithErrorFrameObserver 只做旁路观测、不改透传字节；WithMarkupRepair 会改写出站
 // 帧（把正文里的原生工具调用标记还原成 delta.tool_calls，见 dsml.go）。
@@ -1104,6 +1090,30 @@ func (s *streamWriter) writeSSE(payload string) error {
 	return s.writeSegments("data: ", payload, "\n\n")
 }
 
+// writeSSEBytes 写出一帧已是 JSON 字节的载荷：直接写 []byte，省去
+// []byte→string 的整帧拷贝（流式高频路径每帧都会产生一份 json.Marshal 结果）。
+func (s *streamWriter) writeSSEBytes(payload []byte) error {
+	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
+
+	if _, err := io.WriteString(s.w, "data: "); err != nil {
+		return fmt.Errorf("%w: %w", errClientWrite, err)
+	}
+
+	if _, err := s.w.Write(payload); err != nil {
+		return fmt.Errorf("%w: %w", errClientWrite, err)
+	}
+
+	if _, err := io.WriteString(s.w, "\n\n"); err != nil {
+		return fmt.Errorf("%w: %w", errClientWrite, err)
+	}
+
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+
+	return nil
+}
+
 // writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
 // 与空流错误帧需保留 error 字段，不能被白名单剥掉，故经此写出。
 // gateway_hint：上游 error 帧透出前按 hintFn 附加 error.gateway_hint 字段
@@ -1134,7 +1144,7 @@ func (s *streamWriter) writeChunk(obj map[string]any, fallback string) error {
 		return s.writeSSE(fallback)
 	}
 
-	return s.writeSSE(string(raw))
+	return s.writeSSEBytes(raw)
 }
 
 // continueMessageID 维护消息 id 续传：首帧非空真实 id 缓存；后续帧缺 id / 空 id

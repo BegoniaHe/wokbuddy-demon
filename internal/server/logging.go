@@ -613,13 +613,6 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
-// uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
-//
-// 实现委托 logfmt.UID8，避免 "截 8 位" 的规则在 server 与 logfmt 两处各写一份而走样。
-func uidPrefix(uid string) string {
-	return logfmt.UID8(uid)
-}
-
 type requestTraceKey struct{}
 
 // requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
@@ -794,17 +787,6 @@ const (
 	chatTokWidth  = 6
 	chatRateWidth = 11 // 形如 "183.6tok/s"
 )
-
-// logChatRow 打印一行请求级表格日志（输出 chatLogOut，无 log 时间戳前缀）。
-//
-// 参数：
-//   - model：模型名（含 realm 前缀），超 chatModelWidth 截断（模型名是 ASCII，字节截即列宽）；
-//   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
-//     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
-//   - toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(out io.Writer, ttfb, total time.Duration, model, mode, uid, nick string, status, toks int) {
-	logChatRowEx(out, true, ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
-}
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。

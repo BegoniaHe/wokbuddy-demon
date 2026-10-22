@@ -412,20 +412,9 @@ func TestCompletionTokensExtraction(t *testing.T) {
 	}
 }
 
-func TestUIDPrefix(t *testing.T) {
-	t.Parallel()
-
-	if got := uidPrefix("00e26541abcdef012345"); got != "00e26541" {
-		t.Errorf("long uid -> %q", got)
-	}
-
-	if got := uidPrefix("abc"); got != "abc" {
-		t.Errorf("short uid -> %q", got)
-	}
-
-	if got := uidPrefix(""); got != "-" {
-		t.Errorf("empty uid -> %q", got)
-	}
+// logChatRow 测试用精简入口：只验证无扩展字段的基础表格行格式。
+func logChatRow(out io.Writer, ttfb, total time.Duration, model, mode, uid, nick string, status, toks int) {
+	logChatRowEx(out, true, ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
 }
 
 func TestLogChatRowFormat(t *testing.T) {

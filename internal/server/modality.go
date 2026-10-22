@@ -11,6 +11,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -22,15 +23,44 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
+// contentTypeMarker 快速预检：请求体里没有 "type" 键就必然没有 part 模态，
+// 纯文本闲聊可跳过整个 messages 反序列化。
+var contentTypeMarker = []byte(`"type"`)
+
+// modalityContent 只保留 part 数组里的 type：字符串 content（纯文本，最常见）在
+// UnmarshalJSON 里直接跳过，不复制原文。此前用 json.RawMessage 会把每条消息的
+// content 全文复制一份，长上下文下每请求几十 KB 的无谓分配。
+type modalityContent struct {
+	parts []struct {
+		Type string `json:"type"`
+	}
+}
+
+// UnmarshalJSON 只解析数组形态的 content；字符串/null/畸形值按纯文本处理。
+// 数组元素类型不符（如同质字符串数组）时忽略该消息，与旧逐条解析失败的 continue 同义。
+func (c *modalityContent) UnmarshalJSON(raw []byte) error {
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil
+	}
+
+	_ = json.Unmarshal(raw, &c.parts)
+
+	return nil
+}
+
 // requestModalities 解析聊天请求体里带有的非文本输入模态（去重、按出现顺序）。
 // content 在 OpenAI 规范里既可以是字符串也可以是 part 数组，且同一请求里常混用
 // （system/assistant 历史用字符串、user 带图用数组）；逐条消息分别解析，字符串
 // content 视为纯文本。畸形 JSON 一律返回 nil（请求体后续仍会原样送上游，不在这里
 // 改变解析语义）。文本是隐含能力，不返回。
 func requestModalities(body []byte) []string {
+	if !bytes.Contains(body, contentTypeMarker) {
+		return nil
+	}
+
 	var peek struct {
 		Messages []struct {
-			Content json.RawMessage `json:"content"`
+			Content modalityContent `json:"content"`
 		} `json:"messages"`
 	}
 	if json.Unmarshal(body, &peek) != nil {
@@ -39,23 +69,13 @@ func requestModalities(body []byte) []string {
 
 	var out []string
 
-	seen := map[string]bool{}
-
 	for _, m := range peek.Messages {
-		var parts []struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(m.Content, &parts) != nil {
-			continue // 字符串 content / 缺失：纯文本，无 part
-		}
-
-		for _, part := range parts {
+		for _, part := range m.Content.parts {
 			mod := upstream.RequestPartModality(part.Type)
-			if mod == "" || seen[mod] {
+			if mod == "" || slices.Contains(out, mod) {
 				continue
 			}
 
-			seen[mod] = true
 			out = append(out, mod)
 		}
 	}

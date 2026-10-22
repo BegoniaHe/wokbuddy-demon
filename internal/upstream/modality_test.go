@@ -3,6 +3,7 @@ package upstream
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 // TestNormalizeModalities 归一化：小写、去重、过滤未知值、保持顺序。
@@ -150,4 +151,15 @@ func TestLookupModelsDevModalitiesNotLoaded(t *testing.T) {
 	if _, ok := lookupModelsDevModalities("m"); ok {
 		t.Error("未加载文档时应返回 ok=false")
 	}
+}
+
+// resetModelsDev 测试隔离：清空单例状态（doc/fetched/lastFetch/negatives）。
+func resetModelsDev() {
+	modelsDev.mu.Lock()
+	modelsDev.doc = nil
+	modelsDev.modalities = nil
+	modelsDev.fetched = false
+	modelsDev.lastFetch = time.Time{}
+	modelsDev.negatives = nil
+	modelsDev.mu.Unlock()
 }

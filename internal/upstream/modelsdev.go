@@ -109,17 +109,6 @@ type modelsDevFetcher struct {
 // modelsDev 包级拉取器实例（单例：全进程共享一份文档索引与节流状态）。
 var modelsDev = &modelsDevFetcher{}
 
-// resetModelsDev 测试隔离：清空单例状态（doc/fetched/lastFetch/negatives）。
-func resetModelsDev() {
-	modelsDev.mu.Lock()
-	modelsDev.doc = nil
-	modelsDev.modalities = nil
-	modelsDev.fetched = false
-	modelsDev.lastFetch = time.Time{}
-	modelsDev.negatives = nil
-	modelsDev.mu.Unlock()
-}
-
 // lookup 查询一个模型的 (context, output, found)：
 //   - 索引命中且值合法 → found=true；
 //   - 索引未命中（含索引尚未就绪）→ 记入 negatives（既是 24h 负缓存，也是

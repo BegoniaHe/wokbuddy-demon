@@ -152,7 +152,7 @@ func TestAggregateErrorFrame(t *testing.T) {
 		"data: [DONE]\n\n"
 
 	_, err := Aggregate(strings.NewReader(raw))
-	if !IsErrorFrameError(err) {
+	if !errors.Is(err, errErrorFrame) {
 		t.Fatalf("err=%v want error frame", err)
 	}
 

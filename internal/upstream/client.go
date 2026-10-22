@@ -270,9 +270,6 @@ var (
 // 与容器时区无关）。
 var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 
-// SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
-func SoftRateResetLoc() *time.Location { return softRateResetLoc }
-
 // modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
 // 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
 // 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。

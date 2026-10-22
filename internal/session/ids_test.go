@@ -17,11 +17,11 @@ func imagePartSig(t *testing.T, part string) string {
 	return hex.EncodeToString(sum[:4])
 }
 
-// TestResolveConversationID 覆盖 conversationId 提取的 snake/camel/缺失三态：
+// TestExtractSessionConversationID 覆盖 conversationId 提取的 snake/camel/缺失三态：
 //   - metadata.conversation_id / metadata.conversationId → 取值
-//   - 顶层 conversation_id / conversationId → 取值（snake 优先同 ExtractKey）
+//   - 顶层 conversation_id / conversationId → 取值（snake 优先于 camel，与 ExtractSession 会话键同口径）
 //   - 缺失 / 只有 user_id → ""（会话头族语义只认对话 ID，绝不回落 user_id）
-func TestResolveConversationID(t *testing.T) {
+func TestExtractSessionConversationID(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -46,8 +46,8 @@ func TestResolveConversationID(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := ResolveConversationID([]byte(c.body)); got != c.want {
-				t.Errorf("ResolveConversationID(%q) = %q want %q", c.body, got, c.want)
+			if _, got := ExtractSession([]byte(c.body)); got != c.want {
+				t.Errorf("ExtractSession(%q) conversationID = %q want %q", c.body, got, c.want)
 			}
 		})
 	}

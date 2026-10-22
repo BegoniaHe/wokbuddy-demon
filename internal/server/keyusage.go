@@ -12,6 +12,7 @@ import (
 // 默认密钥命中或未鉴权请求不创建累加器（nil），不产生任何记账。
 type keyUsage struct {
 	id                        string
+	realm                     string
 	prompt, completion, total int64
 }
 
@@ -46,10 +47,12 @@ func writeKeyLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.
 	writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "api key rate limit exceeded")
 }
 
-// keyRealmCtxKey 承载命名密钥的出口绑定（issue #94）；默认密钥/未绑定不写入。
-type keyRealmCtxKey struct{}
-
+// keyRealmFrom 返回命名密钥的出口绑定（issue #94）；默认密钥/未绑定返回 ""。
+// 出口绑定挂在 keyUsage 上（同一次 context 注入），不再单独占用一个 context 键。
 func keyRealmFrom(ctx context.Context) string {
-	realm, _ := ctx.Value(keyRealmCtxKey{}).(string)
-	return realm
+	if ku := keyUsageFrom(ctx); ku != nil {
+		return ku.realm
+	}
+
+	return ""
 }

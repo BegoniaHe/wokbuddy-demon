@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+// ParseConfig 测试便利入口：基于默认值解析配置，不读环境变量。
+// 生产走 Load（文件）或 ParseConfigInto（面板保存）。
+func ParseConfig(raw []byte) (*Config, error) {
+	return ParseConfigInto(raw, Default())
+}
+
 func TestDefault(t *testing.T) {
 	t.Parallel()
 

@@ -70,19 +70,6 @@ func loginEndpointForBase(realm, base string) loginEndpoint {
 	}
 }
 
-// loginEndpoints 按 realm 返回主 origin 的设备授权三端点 + Origin。
-// realm=="global" → 国际版（workbuddy.ai 同域）；cn/非法/缺省 → CN（workbuddy.cn）。
-func loginEndpoints(realm string) (state, token, account, origin string) {
-	base := upstreamBaseCN
-	if realm == "global" {
-		base = upstreamBaseGlobal
-	}
-
-	ep := loginEndpointForBase(realm, base)
-
-	return ep.state, ep.token, ep.account, ep.origin
-}
-
 // loginCandidates 返回该 realm 可尝试的 origin 顺序；CN 主域失败时可回落旧域。
 func loginCandidates(realm string) []loginEndpoint {
 	if realm == "global" {

@@ -3,6 +3,7 @@ package server
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -39,5 +40,44 @@ func TestChatEmitsConversationHeaderWithoutSessionKey(t *testing.T) {
 
 	if got == "" {
 		t.Fatal("outbound X-Conversation-Id is empty")
+	}
+}
+
+// TestChatPassthroughConversationRequestID 入站自带 X-Conversation-Request-Id 时
+// 原样透传；该路径不再解析轮级键（body 解析被跳过），透传值必须保持不变。
+func TestChatPassthroughConversationRequestID(t *testing.T) {
+	t.Parallel()
+
+	var got string
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			got = r.Header.Get("X-Conversation-Request-Id")
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: p, Upstream: client, PromptMode: "passthrough"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("X-Conversation-Request-Id", "inbound-turn-1")
+
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	if got != "inbound-turn-1" {
+		t.Fatalf("outbound X-Conversation-Request-Id=%q want inbound-turn-1", got)
 	}
 }

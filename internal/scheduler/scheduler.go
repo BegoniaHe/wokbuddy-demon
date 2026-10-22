@@ -277,11 +277,6 @@ func poke(ch chan struct{}) {
 	}
 }
 
-// nextFire 返回 now 之后最近的一个整点触发时间；hours 按宿主本地时区解释。
-func nextFire(now time.Time, hours []int) time.Time {
-	return nextFireIn(now, hours, nil)
-}
-
 // nextFireIn 返回 now 之后最近的一个整点触发时间；loc 为空时按 now 的时区解释，
 // 非空时 hours 按 loc（例如 CST）解释。仅黑猫任务需要固定 CST：上游窗口按 CST，
 // 其他任务保留操作者本地时钟（含 DST 语义）。

@@ -391,11 +391,6 @@ func pickBand(bands []band, value int) []CPUModel {
 	return bands[len(bands)-1].models
 }
 
-// ModelsForCores 返回物理核心数 cores 对应的型号池；无精确档时取最近的上档。
-func ModelsForCores(cores int) []CPUModel {
-	return pickBand(coresBands, cores)
-}
-
 // SnapThreads 把任意逻辑线程数向上归到最近的档位（4/6/8/12/16/20/24/28/32），
 // 保证上报的 cpuCores 与所选 CPU 型号的线程数一致；超出最大档时取最大档。
 func SnapThreads(threads int) int {

@@ -1049,7 +1049,7 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 	t.Parallel()
 	// 用未来 5 分钟的重置时间（wall-clock）构造上游响应。
 	reset := time.Now().Add(5 * time.Minute)
-	str := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	str := reset.In(cst.Loc).Format("2006-01-02 15:04:05")
 
 	var calls int
 

@@ -560,12 +560,9 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		defer release()
 
-		keyUsage2 := &keyUsage{id: res.KeyID}
+		keyUsage2 := &keyUsage{id: res.KeyID, realm: h.cfg.Keys.Realm(res.KeyID)}
 
 		ctx := context.WithValue(r.Context(), keyUsageKey{}, keyUsage2)
-		if realm := h.cfg.Keys.Realm(res.KeyID); realm != "" {
-			ctx = context.WithValue(ctx, keyRealmCtxKey{}, realm)
-		}
 
 		next(w, r.WithContext(ctx))
 		h.cfg.Keys.RecordUsage(keyUsage2.id, keyUsage2.prompt, keyUsage2.completion, keyUsage2.total)
@@ -1244,9 +1241,11 @@ type chatFlow struct {
 	inboundSession inboundSessionMeta
 
 	// 会话标识
-	sessKey   string
-	turnKey   string
-	stickyUID string
+	sessKey        string
+	explicitConvID string
+	turnKey        string
+	turnKeyBody    []byte // prompt.Rewrite 之前的 body（轮级键按它派生）
+	stickyUID      string
 
 	// 轮转状态
 	tried map[string]bool
@@ -1537,12 +1536,14 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		convReqID:      chatInput2.convReqID,
 		traceID:        chatInput2.traceID,
 		inboundSession: chatInput2.inboundSession,
+		turnKeyBody:    chatInput2.body, // 轮级键按改写前的 body 派生
 	}
 
-	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，
-	// 走普通轮换）。ExtractKey 与粘性开关解耦：关闭粘性时会话头族的聚合主键仍按
-	// 会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级。
-	chatFlow2.sessKey = session.ExtractKey(chatInput2.body)
+	// 会话粘性：从请求体一次解析会话键与显式 conversationId（后者供出站会话头族），
+	// 再解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。ExtractSession 与
+	// 粘性开关解耦：关闭粘性时会话头族的聚合主键仍按会话级
+	// （RequestIDForKey(sessKey)），不悄悄退化成轮级。
+	chatFlow2.sessKey, chatFlow2.explicitConvID = session.ExtractSession(chatInput2.body)
 	if h.cfg.Session != nil && chatFlow2.sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
@@ -1551,10 +1552,6 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
 		chatFlow2.stickyUID = h.resolveStickyForStrategy(chatFlow2)
 	}
-
-	// 轮级聚合键：按 body 里最后一条 user 消息派生。必须在 prompt.Rewrite 之前取
-	// ——改写会动 messages 内容，之后取会让键漂移。
-	chatFlow2.turnKey = session.TurnKey(chatInput2.body)
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
 	chatFlow2.applyPromptRewrite()
@@ -1601,9 +1598,16 @@ func (f *chatFlow) canDegrade() bool {
 //   - conversationRequestID：入站 X-Conversation-Request-Id 透传优先，否则按粘性 key
 //     进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID）。
 func (f *chatFlow) buildChatMeta() {
+	// 入站已带 X-Conversation-Request-Id 时直接透传，轮级键不参与输出：跳过整包
+	// messages 解析（长请求省一次全量反序列化）。
+	if f.convReqID == "" {
+		f.turnKey = session.TurnKey(f.turnKeyBody)
+		f.turnKeyBody = nil
+	}
+
 	convID := f.inboundSession.conversationID
 	if convID == "" {
-		convID = session.ResolveConversationID(f.body)
+		convID = f.explicitConvID
 	}
 
 	if convID == "" {
