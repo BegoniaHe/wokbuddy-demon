@@ -2768,6 +2768,7 @@ func TestChatStreamReadErrorNoSuccess(t *testing.T) {
 	h := NewHandler(&Config{Pool: state, Upstream: client, Session: sess, SoftCooldown: time.Minute})
 
 	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
+	// 已写出正文后发生读错误：头已发只能 200，但账号不记成功。
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
@@ -2799,7 +2800,8 @@ func TestChatStreamEmptyStreamNoSuccess(t *testing.T) {
 	h := NewHandler(&Config{Pool: state, Upstream: up, Session: sess, SoftCooldown: time.Minute})
 
 	rec := postChat(t, h, `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`)
-	if rec.Code != http.StatusOK {
+	// 首帧否决后尚未写字节：空流按 502 upstream_parse 收口，而不是 200 假成功。
+	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 

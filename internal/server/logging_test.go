@@ -356,7 +356,9 @@ func TestCaptureClientInfoTruncatesUserAgent(t *testing.T) {
 func TestRequestMetricsDetectsStreamErrorFrame(t *testing.T) {
 	t.Parallel()
 
-	const sseErr = "data: {\"error\":{\"message\":\"upstream failed\"}}\n\ndata: [DONE]\n\n"
+	// 首段先给正文（通过首帧否决窗口），再给 error 帧：验证已写出后的流错误观测。
+	const sseErr = "data: {\"id\":\"1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"error\":{\"message\":\"upstream failed\"}}\n\ndata: [DONE]\n\n"
 
 	client := newFakeUpstream(t, func(string) (int, string, bool) {
 		return 200, sseErr, true

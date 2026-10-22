@@ -2275,7 +2275,7 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 	// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 	// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核）。
 	if f.stream {
-		return f.handleStreamSuccess(ctx, acct, rc, attemptStarted)
+		return f.handleStreamSuccess(ctx, acct, rc, attemptStarted, i)
 	}
 
 	return f.handleNonStreamSuccess(ctx, acct, rc, attemptStarted, i)
@@ -2596,14 +2596,45 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 }
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
-func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+func (f *chatFlow) handleStreamSuccess(
+	ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int,
+) rotationAction {
+	// 首帧否决窗口（issue #244）：在写出任何字节前预览首段，error/顶层业务码/零输出
+	// 都还能换号或关闭思考重发，不再出现「200 + error 帧」。
+	probe := upstream.ProbeStream(rc)
+
+	if probe.ZeroOutputLength {
+		rc.Close()
+
+		return f.retryZeroOutputLength(ctx, acct, i)
+	}
+
+	if probe.Kind != upstream.ErrNone {
+		rc.Close()
+
+		return f.handlePreStreamErrorFrame(ctx, acct, probe, attemptStarted, i)
+	}
+
+	if probe.Empty {
+		rc.Close()
+
+		return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i)
+	}
+
 	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
 	f.h.streams.enter()
 	defer f.h.streams.leave()
 	// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 	f.st.status = http.StatusOK
 
-	stats := newChatStatsReaderSince(rc, f.st.start)
+	stream := io.ReadCloser(probe.ReadCloser(rc))
+	if !probe.HasTool && probe.Text != "" {
+		stream = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
+			return f.continueUpstream(ctx, acct, partial)
+		})
+	}
+
+	stats := newChatStatsReaderSince(stream, f.st.start)
 	defer stats.release()
 	// errFrame：上游 error 帧原文（观察者旁路采集），用于流尾的账号处置。
 	var errFrame string
@@ -2618,9 +2649,106 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
 
 	f.finishStreamStats(acct, stats, repair, attemptStarted)
-	rc.Close()
+	stream.Close()
 
 	return rotDone
+}
+
+// retryZeroOutputLength 处理 finish_reason=length 且零输出：同额度关闭 thinking
+// 重发一次；仍零输出返回 502 zero_output_length，不罚号、不冷却（issue #244）。
+func (f *chatFlow) retryZeroOutputLength(ctx context.Context, acct *auth.Auth, i int) rotationAction {
+	if !f.zeroRetried {
+		f.zeroRetried = true
+		f.body = upstream.DisableThinking(f.body)
+		log.Printf("INFO: [server] stream acct=%s model=%s: length with zero output, retrying once with thinking disabled",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return f.dispatch(ctx, acct, i)
+	}
+
+	f.st.status = http.StatusBadGateway
+	f.st.outcome = reqlog.OutcomeStreamError
+	f.lastErr = fmt.Errorf("zero_output_length")
+	f.out.Error(http.StatusBadGateway, "zero_output_length",
+		"upstream hit the output budget before producing any content; retry with a smaller prompt or another model",
+		"upstream returned finish_reason=length with no content; the gateway retried once with thinking disabled")
+
+	return rotDone
+}
+
+// handlePreStreamErrorFrame 首帧 error/顶层业务错误：尚未向客户端写字节，按非流式
+// 同口径分类，可换号或请求级 fail-fast（issue #244）。
+func (f *chatFlow) handlePreStreamErrorFrame(
+	ctx context.Context, acct *auth.Auth, probe *upstream.StreamProbe, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	kind := probe.Kind
+	uerr := &upstream.Error{Kind: kind, Status: http.StatusOK, Msg: probe.Frame}
+	f.lastErr = uerr
+
+	if failFastKind(kind) {
+		f.handleRequestLevelError(acct, kind, []byte(probe.Frame), uerr)
+		return rotDone
+	}
+
+	f.h.applyErrorPolicy(acct.UID, kind, probe.Frame, f.realm, f.bareModel, nil)
+	f.fail(acct.UID)
+	log.Printf("WARN: [server] stream acct=%s model=%s: first-frame upstream error kind=%s payload=%s (rotating before write)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(probe.Frame, 200))
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = kind.String()
+
+	return rotContinue
+}
+
+// handlePreStreamEmpty 首段没有任何实质输出就结束：按上游失败处置并换号。
+func (f *chatFlow) handlePreStreamEmpty(ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.fail(acct.UID)
+	f.st.status = http.StatusBadGateway
+	f.lastErr = upstream.EmptyStreamError()
+	log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream before first content (rotating)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = "empty_stream"
+
+	return rotContinue
+}
+
+// continueUpstream 发起截断续写请求：复用 ChatStreamContext → prepareBody 管线，
+// 同账号同模型，不手拼 raw body（脱敏/thinking/缓存键仍生效）。
+func (f *chatFlow) continueUpstream(ctx context.Context, acct *auth.Auth, partial string) (io.ReadCloser, error) {
+	body := upstream.BuildContinuationBody(f.body, partial)
+
+	next, status, respBody, err := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, body, f.clientIP, f.chatMeta)
+	if err != nil || status >= http.StatusBadRequest {
+		if next != nil {
+			next.Close()
+		}
+
+		log.Printf("WARN: [server] stream acct=%s model=%s: continuation failed status=%d err=%v body=%s",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, status, err, logfmt.Truncate(string(respBody), 160))
+
+		if err != nil {
+			return nil, err
+		}
+
+		return nil, fmt.Errorf("continuation status %d", status)
+	}
+
+	log.Printf("INFO: [server] stream acct=%s model=%s: continued truncated response (partial=%d chars)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, len(partial))
+
+	return next, nil
 }
 
 // applyStreamOutcome 根据流结束形态给账号与请求日志定性。
