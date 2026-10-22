@@ -147,6 +147,9 @@ func (h *Handler) ensureImagesToken(w http.ResponseWriter, acct *auth.Auth) bool
 	}
 
 	if refreshErr := h.cfg.Upstream.RefreshToken(acct); refreshErr != nil {
+		// 与 chat 同口径：凭证失效连续达阈才禁用，其余只喂熔断，避免健康号被一次
+		// 瞬时刷新失败踢出池。
+		h.noteRefreshFailure(acct, refreshErr, "images")
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream token refresh failed")
 
 		return false
@@ -245,7 +248,9 @@ func (h *Handler) handleImagesError(
 		outStatus = http.StatusBadGateway
 	}
 
-	if outStatus <= 0 {
+	// 上游 200 + 非零业务码也会走到这里：错误响应不能继续用 2xx 状态，否则
+	// OpenAI 兼容客户端会当成成功去解析 data 字段。
+	if outStatus < http.StatusBadRequest {
 		outStatus = http.StatusBadGateway
 	}
 

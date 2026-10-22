@@ -180,6 +180,48 @@ func TestNonStreamContinuation(t *testing.T) {
 	}
 }
 
+// TestNonStreamContinuationSumsUsage 续写两段请求的 usage 必须累加，不能只留第二段。
+func TestNonStreamContinuationSumsUsage(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		if calls.Add(1) == 1 {
+			return 200, "data: {\"id\":\"c1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hello \"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"credit\":1,\"prompt_tokens_details\":{\"cached_tokens\":3}}}\n\ndata: [DONE]\n\n", true
+		}
+
+		return 200, "data: {\"id\":\"c1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4,\"total_tokens\":24,\"credit\":2,\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\ndata: [DONE]\n\n", true
+	})
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, handler, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var parsed struct {
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]float64{"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36, "credit": 3}
+	for key, value := range want {
+		if got, _ := parsed.Usage[key].(float64); got != value {
+			t.Errorf("usage.%s=%v want %v", key, parsed.Usage[key], value)
+		}
+	}
+
+	details, _ := parsed.Usage["prompt_tokens_details"].(map[string]any)
+	if got, _ := details["cached_tokens"].(float64); got != 8 {
+		t.Errorf("cached_tokens=%v want 8", details["cached_tokens"])
+	}
+}
+
 // TestNonStreamZeroOutputLengthRetriesThinkingDisabled 非流式零输出 length 也关闭
 // thinking 重发一次，而不是把空 content 当成功（issue #244）。
 func TestNonStreamZeroOutputLengthRetriesThinkingDisabled(t *testing.T) {

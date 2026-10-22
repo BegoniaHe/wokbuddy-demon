@@ -326,3 +326,81 @@ func TestImagesRefreshFailureDoesNotMarkSessionDead(t *testing.T) {
 		t.Fatalf("transient refresh failure must not mark session dead: %+v", status)
 	}
 }
+
+// TestImagesBusinessErrorNot200 上游 HTTP 200 + 非零业务码必须映射成错误状态，
+// 不能把 error 信封挂在 200 上让 OpenAI 客户端当成功解析。
+func TestImagesBusinessErrorNot200(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusOK, `{"code":9999,"msg":"image backend failed"}`, false
+	})
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), `"code":"upstream_error"`) {
+		t.Fatalf("body=%s", rec.Body)
+	}
+}
+
+// TestImagesRefreshDeadCredentialCountsSession 出图前的刷新若确认凭证失效，
+// 必须计入 session dead 连续计数（与 chat/search 同口径），不能静默 502。
+func TestImagesRefreshDeadCredentialCountsSession(t *testing.T) {
+	t.Parallel()
+
+	imageCalls := 0
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "/images/") {
+				imageCalls++
+			}
+
+			return jsonResponse(http.StatusUnauthorized, `{"code":12153,"msg":"offline user session"}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	state := testPoolWith(&auth.Auth{
+		UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 1,
+	})
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if imageCalls != 0 {
+		t.Fatalf("凭证失效时不应继续出图: imageCalls=%d", imageCalls)
+	}
+
+	status, ok := state.Status("u1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+
+	if status.SessionDeadFails != 1 || status.Disabled {
+		t.Fatalf("session dead=%+v want 1 次且未达阈值不禁用", status)
+	}
+}

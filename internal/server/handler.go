@@ -3106,11 +3106,47 @@ func mergeNonStreamContinuation(first, second map[string]any) map[string]any {
 
 	firstChoiceItem["finish_reason"] = secondChoiceItem["finish_reason"]
 
-	if usageObj, ok := second["usage"]; ok {
-		first["usage"] = usageObj
-	}
+	mergeUsageTotals(first, second)
 
 	return first
+}
+
+// mergeUsageTotals 把续写段的 usage 累加到首段：两段请求都真实消耗了 token/积分，
+// 只保留第二段会漏记首段用量。数值叶子递归相加，缺失键直接补齐。
+func mergeUsageTotals(first, second map[string]any) {
+	secondUsage, ok := second["usage"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	firstUsage, ok := first["usage"].(map[string]any)
+	if !ok {
+		first["usage"] = secondUsage
+
+		return
+	}
+
+	addUsageNumbers(firstUsage, secondUsage)
+}
+
+// addUsageNumbers 递归把 src 的数值字段累加进 dst；非数值/缺失沿用 src。
+func addUsageNumbers(dst, src map[string]any) {
+	for key, value := range src {
+		switch typed := value.(type) {
+		case map[string]any:
+			if target, ok := dst[key].(map[string]any); ok {
+				addUsageNumbers(target, typed)
+				continue
+			}
+		case float64:
+			if target, ok := dst[key].(float64); ok {
+				dst[key] = target + typed
+				continue
+			}
+		}
+
+		dst[key] = value
+	}
 }
 
 // setCacheTokensFromUsage 用聚合响应 usage 填 st 的缓存三维观测（非流式收尾）。
