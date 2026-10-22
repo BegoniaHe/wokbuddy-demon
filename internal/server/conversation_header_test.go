@@ -12,7 +12,7 @@ import (
 )
 
 // TestChatEmitsConversationHeaderWithoutSessionKey metadata.user_id 会让
-// session.ExtractKey 主动不派生会话键；出站仍必须带 X-Conversation-Id。
+// session.ExtractSession 主动不派生会话键；出站仍必须带 X-Conversation-Id。
 func TestChatEmitsConversationHeaderWithoutSessionKey(t *testing.T) {
 	t.Parallel()
 

@@ -142,7 +142,7 @@ func (h *Handler) searchOnAccount(
 			}
 		}
 
-		if err := acct.SaveAtomic(); err != nil {
+		if err := acct.SaveAtomicRetry(); err != nil {
 			// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露（与 chat 同口径）。
 			log.Printf("ERR: [server] search refresh acct=%s: save auth failed: %v",
 				logfmt.Label(acct.UID, acct.NicknameValue()), err)
@@ -206,7 +206,7 @@ func (h *Handler) replaySearchAfterRefresh(
 		}
 	}
 
-	if err := acct.SaveAtomic(); err != nil {
+	if err := acct.SaveAtomicRetry(); err != nil {
 		log.Printf("ERR: [server] search 401 refresh acct=%s: save auth failed: %v",
 			logfmt.Label(acct.UID, acct.NicknameValue()), err)
 	}

@@ -390,7 +390,7 @@ type wakeSlot struct {
 
 // candidateSlots 在 schedMu 下快照排程参数，返回各类未禁用任务的候选时点。
 // 顺序固定为 checkin→travel→activity→keepalive→blackcat→growth，与同刻任务的
-// kinds 收集顺序一致；已显式禁用的任务不进候选（nextFire 对其零值返回零时间）。
+// kinds 收集顺序一致；已显式禁用的任务不进候选。
 func (s *Scheduler) candidateSlots(now time.Time) []wakeSlot {
 	s.schedMu.Lock()
 	specs := []struct {
@@ -500,7 +500,7 @@ const (
 	slotCancel                 // ctx 取消：上层优雅退出
 )
 
-// waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFire 用 time.Date 构造、
+// waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFireIn 用 time.Date 构造、
 // 不携带单调读数，time.Until 对它是纯墙钟差）。
 //
 // 为什么不一把 time.NewTimer(time.Until(next)) 睡到底：timer 的等待基于单调时钟，
@@ -1120,7 +1120,7 @@ func mapExpiryBuckets(buckets []upstream.ExpiryBucket) []pool.ExpiryBucket {
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
 // interval<=0 以暂停状态启动并等待 SetBalanceInterval 唤醒：启动时关闭
 // schedule.balance_refresh_enabled、运行期再热开也能生效（无需重启）。
-// 独立于 Run 的小时制排程：余额是分钟级观测量，不值得为它扩展 nextFire 的粒度。
+// 独立于 Run 的小时制排程：余额是分钟级观测量，不值得为它扩展 nextFireIn 的粒度。
 // 运行期可用 SetBalanceInterval 热改间隔（下一轮生效）。
 func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Duration) {
 	if interval < 0 {

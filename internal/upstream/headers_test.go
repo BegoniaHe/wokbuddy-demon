@@ -35,6 +35,33 @@ func TestConversationHeaderFallback(t *testing.T) {
 	}
 }
 
+// TestConversationHeaderAlwaysEmitted 零值 meta（搜索/夜猫子/模型探测等直接
+// ChatHeaders 的路径）也必须带 X-Conversation-Id：上游渠道校验要求该头恒在。
+func TestConversationHeaderAlwaysEmitted(t *testing.T) {
+	t.Parallel()
+
+	client := New()
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ChatHeaders(req, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{})
+
+	if got := req.Header.Get("X-Conversation-Id"); got == "" {
+		t.Fatal("X-Conversation-Id missing")
+	}
+
+	if got := req.Header.Get("X-Conversation-Id"); got != req.Header.Get("X-Conversation-Request-Id") {
+		t.Fatalf("X-Conversation-Id=%q want request-id %q", got, req.Header.Get("X-Conversation-Request-Id"))
+	}
+
+	if got := req.Header.Get("Acp-Connection-Id"); got == "" {
+		t.Fatal("Acp-Connection-Id missing")
+	}
+}
+
 // TestConversationHeaderPrefersInbound 客户端显式 conversationId 优先于兜底值。
 func TestConversationHeaderPrefersInbound(t *testing.T) {
 	t.Parallel()

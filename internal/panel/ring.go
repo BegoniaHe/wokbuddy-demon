@@ -40,7 +40,7 @@ var tsPrefixRe = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} `)
 
 // classifyLine 按行首特征归类频道。
 func classifyLine(line string) string {
-	if strings.HasPrefix(line, "| #") { // chat 表格日志（server/logging.go logChatRow）
+	if strings.HasPrefix(line, "| #") { // chat 表格日志（server/logging.go logChatRowEx）
 		return ChChat
 	}
 

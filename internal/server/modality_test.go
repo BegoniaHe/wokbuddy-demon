@@ -110,6 +110,20 @@ func TestRequestModalitiesMixedContent(t *testing.T) {
 	}
 }
 
+// TestRequestModalitiesIgnoresMalformedContentArray 数组里混入非对象元素时整条
+// content 按纯文本处理：不能因为 json.Unmarshal 半解析出前面的 part 就误报模态。
+func TestRequestModalitiesIgnoresMalformedContentArray(t *testing.T) {
+	t.Parallel()
+
+	body := `{"messages":[{"role":"user","content":[` +
+		`{"type":"image_url","image_url":{"url":"https://example.com/a.png"}},` +
+		`"junk"}]}]}`
+
+	if got := requestModalities([]byte(body)); len(got) != 0 {
+		t.Fatalf("modalities=%v want none（畸形 content 数组不得半解析）", got)
+	}
+}
+
 // TestChatMixedContentModalityRejected 混用 content 的带图请求仍按模型能力拒绝，
 // 不因解析失败而静默送上游（issue #109）。
 func TestChatMixedContentModalityRejected(t *testing.T) {

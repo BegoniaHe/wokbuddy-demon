@@ -257,7 +257,7 @@ func pickLowestEffort(supported []string) string {
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。
 //
 // 背景：上游对 messages 的 role 字段做白名单校验，developer 不在白名单内，
-// 命中即 HTTP 400 code=11128。developer 是 OpenAI 新规范里 system 的别名
+// 命中即 HTTP 400 code=11-128。developer 是 OpenAI 新规范里 system 的别名
 // （Codex / Cursor 等新客户端用它承载 system 级指令），改写为 system 不丢语义。
 //
 // 此归一化是「协议兼容」（补上游 role 白名单），不是「内容脱敏」，

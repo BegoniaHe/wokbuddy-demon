@@ -201,7 +201,7 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
 	ConversationID        string // X-Conversation-ID：入站头/body 提取值，非空时优先
-	ConversationHeaderID  string // X-Conversation-ID 出站兜底：客户端没给会话 ID 时由 handler 合成；仅进出站头，不进 prompt cache key
+	ConversationHeaderID  string // X-Conversation-ID 出站兜底：handler 合成；仅进出站头，不进 prompt cache key。为空时最终回落到 ConversationRequestID
 	ConversationRequestID string // X-Conversation-Request-ID：聚合主键，必发
 	RootRequestID         string // X-Root-Request-ID：入站透传值，空则回落 conversationRequestID
 	ParentConversationID  string // X-Parent-Conversation-ID：入站透传值，空则不发
@@ -313,8 +313,9 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) 
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
 // 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。空则不发——
-//     透传客户端原值优先，客户端没给就不伪造，避免误导后台建错会话。
+//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。透传客户端
+//     原值优先；handler 未给会话 ID 时用 ConversationHeaderID 兜底，再空则回落到
+//     本次请求的 ConversationRequestID——上游渠道校验要求该头恒在。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
 //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
@@ -325,7 +326,8 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) 
 //     16/32 hex TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId
 //     回落 messageID（恒 32 hex），SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
 //   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
-//     conversationId（或出站兜底 ConversationHeaderID）稳定派生 v4 形态 UUID。
+//     conversationId（或出站兜底 ConversationHeaderID / ConversationRequestID）
+//     稳定派生 v4 形态 UUID。
 //
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单。
 func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
@@ -342,11 +344,16 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	if convID == "" {
 		convID = meta.ConversationHeaderID
 	}
-
-	if convID != "" {
-		req.Header.Set("X-Conversation-Id", convID)
-		req.Header.Set("Acp-Connection-Id", acpConnectionID(convID))
+	// 上游渠道校验要求 X-Conversation-ID 恒在（官方客户端每次请求都发）。
+	// chat 路径已按会话键/轮级键兜底；搜索只透传客户端会话 ID（可能为空），
+	// 夜猫子/模型探测不走 chatFlow（meta 为空）。这些情况下用本次请求的聚合
+	// 主键兜底即可——只影响出站头，不覆盖 ConversationID（prompt cache key 的源）。
+	if convID == "" {
+		convID = convReqID
 	}
+
+	req.Header.Set("X-Conversation-Id", convID)
+	req.Header.Set("Acp-Connection-Id", acpConnectionID(convID))
 
 	req.Header.Set("X-Conversation-Request-Id", convReqID)
 	req.Header.Set("X-Conversation-Message-Id", messageID)

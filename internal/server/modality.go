@@ -43,7 +43,16 @@ func (c *modalityContent) UnmarshalJSON(raw []byte) error {
 		return nil
 	}
 
-	_ = json.Unmarshal(raw, &c.parts)
+	var parts []struct {
+		Type string `json:"type"`
+	}
+	// 解析失败时整条消息按纯文本处理（与旧逐条 Unmarshal + continue 同义）；
+	// 不能保留半解析出的 parts，否则畸形 content 会误报出模态。
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return nil //nolint:nilerr // 畸形 content 按纯文本处理，不阻断整包请求解析
+	}
+
+	c.parts = parts
 
 	return nil
 }

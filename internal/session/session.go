@@ -644,7 +644,7 @@ func (r *bodyRaw) UnmarshalJSON(data []byte) error {
 // sessionProbe 只保留会话相关顶层字段的原始 JSON 视图（subslice，不复制）。
 // 会话键判定不需要构造整棵 body 树：旧实现解到 map[string]any 会把 messages /
 // tools 等全部展开，几十 KB 的请求每轮白付数千次分配；这里 tools 等无关字段
-// 直接跳过，messages 只在需要派生键时才解析成 []any。
+// 直接跳过，messages 只在需要派生键时才逐条解析成 []bodyRaw。
 type sessionProbe struct {
 	Messages            bodyRaw `json:"messages"`
 	Metadata            bodyRaw `json:"metadata"`

@@ -655,12 +655,10 @@ func (t *requestTrace) captureClientInfo(r *http.Request, trusted []*net.IPNet) 
 
 // clientIPForLog 提取用于日志展示的客户端 IP。
 //
-// 与透传上游的口径不同：后者只认代理头（X-Forwarded-For 首段 →
-// X-Real-IP），因为它的用途是把客户端 IP **透传给上游**，回落到网关自身地址会
-// 污染上游风控判据。日志场景相反：只有 TCP 对端属于配置的可信反代网段时才采信
-// 转发头，否则一律用 RemoteAddr——否则任何客户端都能用伪造的 X-Forwarded-For
-// 污染请求日志与审计记录。对端地址解析失败时保持空串（面板显示 "-"），
-// 不再回落到可伪造的代理头。
+// 与透传上游同一口径（httpauth.ClientIP）：只有 TCP 对端属于配置的可信反代
+// 网段时才采信转发头，否则一律用 RemoteAddr——否则任何客户端都能用伪造的
+// X-Forwarded-For 污染请求日志与审计记录。对端地址解析失败时保持空串
+// （面板显示 "-"）。
 func clientIPForLog(r *http.Request, trusted []*net.IPNet) string {
 	return httpauth.ClientIP(r, trusted)
 }

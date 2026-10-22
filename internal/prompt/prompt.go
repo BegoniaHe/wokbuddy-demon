@@ -1,7 +1,7 @@
 // Package prompt 提供网关自有系统提示词：内置默认 + 文件覆盖 + 降级中性提示词。
 //
 // 背景：客户端（Claude Code/Codex 等 CLI）在 system prompt 注入固定模板句，
-// 上游内容审核按逐字精确匹配误杀合法流量（issue #36/PR39 的 11128）。
+// 上游内容审核按逐字精确匹配误杀合法流量（issue #36/PR39 的 11-128）。
 // 方案：网关在出站前用自有系统提示词替换客户端 system/developer 消息，
 // 从源头消灭 system 来源的指纹误报（用户/assistant 消息里的指纹串仍由
 // internal/upstream/sanitize.go 清洗，两层叠加、互不替代）。
@@ -92,7 +92,7 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 // 边界判定须显式同时匹配 system 与 developer：归一（developer→system）在
 // 下游 prepareBody 的 normalizeRoles，Append 执行时开头块里的 developer
 // 还是 developer。网关消息角色用 system 而非 developer——上游 role 白名单
-// 不含 developer，插 developer 等于制造一次必然归一与多余的 11128 风险窗口。
+// 不含 developer，插 developer 等于制造一次必然归一与多余的 11-128 风险窗口。
 func Append(body []byte, systemPrompt string) []byte {
 	obj, ok := decodeBody(body, systemPrompt)
 	if !ok {

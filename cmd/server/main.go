@@ -1085,7 +1085,7 @@ func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
 	return cur
 }
 
-// mergedJSON 把合并后的 map 序列化回 JSON（供 ParseConfig 校验）。
+// mergedJSON 把合并后的 map 序列化回 JSON（供 parseConfigWithEnv 校验）。
 func mergedJSON(m map[string]any) []byte {
 	b, err := json.Marshal(m)
 	if err != nil {
