@@ -153,7 +153,7 @@ http://127.0.0.1:7863/panel/
 - **Docker + Docker Compose**（推荐）——或
 - **Windows / macOS / Linux 直接跑单文件二进制**
 - 一个或多个已注册的 CodeBuddy 账号，用于登录
-- `data/client-profiles/cn.json`（启用 global 时还需 `global.json`）——客户端指纹快照，启动必需；用 `reverse-workbuddy` 从官方 Win32 分发包生成
+- `data/client-profiles/cn.json`——客户端指纹快照，启动必需；`config.example.json` 的 `global.enabled` 默认为 `true`，因此 `global.json` 也必需（纯 CN 部署可设 `global.enabled=false` 后只提供 `cn.json`）。用 `reverse-workbuddy` 从官方 Win32 分发包生成
 - 宿主机 Go ≥ 1.27（仅从源码构建时需要）
 
 ### 方式一：Docker Compose（推荐）
@@ -169,7 +169,8 @@ cp config.example.json config.json
 #    并写回该文件（显式设置的其他值不会被覆盖）。也可先自行改成自己的密钥。
 
 # 3. 准备客户端指纹快照（缺失会拒绝启动）
-#    data/client-profiles/cn.json，启用 global 时还需 global.json；
+#    data/client-profiles/cn.json 必需；global.enabled 默认 true，故 global.json
+#    也必需（纯 CN 部署可设 global.enabled=false 后只提供 cn.json）。
 #    用 reverse-workbuddy 从官方 Win32 分发包生成后放入该目录。
 
 # 4. 启动（首次会构建镜像，约 1-2 分钟）
