@@ -86,6 +86,43 @@ func slotJitter(salt string, kind taskKind, day string, hour int, window time.Du
 	return time.Duration(n % uint64(window)) //nolint:gosec // W <= 59m
 }
 
+// jitterWithinHour 在 slotJitter 基础上把抖动截断到配置小时的剩余时长。
+// 普通整点剩余 1h（W <= 59m 时无影响）；DST 拨快抹掉小时开头时 slotOn 可能返回
+// 03:45 一类「小时内首个实际时刻」，此时窗口只剩 15m，必须收窄以免跨到 04:xx。
+func jitterWithinHour(salt string, kind taskKind, hour int, base time.Time, window time.Duration) time.Duration {
+	jitter := slotJitter(salt, kind, base.Format("2006-01-02"), hour, window)
+	if jitter <= 0 {
+		return 0
+	}
+
+	limit := hourRemaining(base, hour)
+	if limit <= 0 {
+		return 0
+	}
+
+	if jitter >= limit {
+		return limit - time.Nanosecond
+	}
+
+	return jitter
+}
+
+// hourRemaining 返回 base 所在配置小时到下一个墙钟小时的间隔。下一小时同样可能
+// 被 DST 抹掉，slotOn 会归一化到首个实际时刻；因此 DST 日返回 0/15m 等短窗口也
+// 是正常结果。hour=23 时跨到下一天。
+func hourRemaining(base time.Time, hour int) time.Duration {
+	year, month, day := base.Date()
+	next := time.Date(year, month, day, 12, 0, 0, 0, base.Location())
+	nextHour := hour + 1
+
+	if nextHour == 24 {
+		nextHour = 0
+		next = time.Date(year, month, day+1, 12, 0, 0, 0, base.Location())
+	}
+
+	return slotOn(next, nextHour).Sub(base)
+}
+
 // fireSlot 一次触发的实际时刻与未抖动基准时刻（用于日志展示抖动偏移）。
 type fireSlot struct {
 	at   time.Time
@@ -105,13 +142,13 @@ func nextFireFor(now time.Time, kind taskKind, hours []int, loc *time.Location, 
 
 	for _, hour := range hours {
 		base := slotOn(localNow, hour)
-		at := base.Add(slotJitter(salt, kind, base.Format("2006-01-02"), hour, window))
+		at := base.Add(jitterWithinHour(salt, kind, hour, base, window))
 
 		if !at.After(now) {
 			// 与 nextFireIn 同口径：按墙钟日推进，不做 Add(24h)。
 			y, m, d := localNow.Date()
 			base = slotOn(time.Date(y, m, d+1, 12, 0, 0, 0, loc), hour)
-			at = base.Add(slotJitter(salt, kind, base.Format("2006-01-02"), hour, window))
+			at = base.Add(jitterWithinHour(salt, kind, hour, base, window))
 		}
 
 		if earliest.at.IsZero() || at.Before(earliest.at) {

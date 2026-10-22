@@ -191,6 +191,30 @@ func TestNextFireForKeepsWallClockHour(t *testing.T) {
 	}
 }
 
+// TestNextFireForCapsJitterAtSkippedHourEnd DST 拨快只抹掉小时开头时（Chatham
+// 2026-09-27 02:45 → 03:45），03 点槽位只剩 15 分钟窗口；抖动不得把触发时刻
+// 推到 04:xx，否则「不跨出配置小时」的窗口语义（如 blackcat）会失效。
+func TestNextFireForCapsJitterAtSkippedHourEnd(t *testing.T) {
+	t.Parallel()
+
+	loc, err := time.LoadLocation("Pacific/Chatham")
+	if err != nil {
+		t.Skipf("时区数据不可用: %v", err)
+	}
+
+	now := time.Date(2026, 9, 27, 2, 0, 0, 0, loc)
+	hourEnd := time.Date(2026, 9, 27, 4, 0, 0, 0, loc)
+
+	fire := nextFireFor(now, taskCheckin, []int{3}, loc, 59*time.Minute, "")
+	if fire.at.Hour() != 3 || !fire.at.Before(hourEnd) {
+		t.Fatalf("fire=%v want 03:45~03:59（抖动收窄到被抹掉小时之后的剩余窗口）", fire.at)
+	}
+
+	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, loc); !fire.base.Equal(want) {
+		t.Fatalf("base=%v want %v", fire.base, want)
+	}
+}
+
 // TestNextWakeJitterOffMerges 抖动关闭时同小时任务仍在同一时刻合并。
 func TestNextWakeJitterOffMerges(t *testing.T) {
 	t.Parallel()
