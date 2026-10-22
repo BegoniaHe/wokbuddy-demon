@@ -1121,6 +1121,8 @@ func responsesToolChoice(raw json.RawMessage, refs map[string]responsesToolRef) 
 
 // responsesUpstreamToolName 把入站工具名映射为上游声明的工具名：已声明的限定名
 // 原样返回；bare 名若对应唯一的 namespace 工具，改用限定名（issue #259）。
+// 多个 namespace 共用同一 bare 名时无法判定身份，保留原名（map 遍历顺序随机，
+// 不能任选一个，否则同一请求在不同进程会指向不同工具）。
 func responsesUpstreamToolName(name string, refs map[string]responsesToolRef) string {
 	if name == "" {
 		return ""
@@ -1130,10 +1132,22 @@ func responsesUpstreamToolName(name string, refs map[string]responsesToolRef) st
 		return name
 	}
 
+	matched := ""
+
 	for declared, ref := range refs {
-		if ref.bare == name {
-			return declared
+		if ref.bare != name {
+			continue
 		}
+
+		if matched != "" {
+			return name
+		}
+
+		matched = declared
+	}
+
+	if matched != "" {
+		return matched
 	}
 
 	return name

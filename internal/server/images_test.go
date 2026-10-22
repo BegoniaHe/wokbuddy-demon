@@ -162,3 +162,75 @@ func TestImagesRealmPrefixStripped(t *testing.T) {
 		t.Fatalf("body=%s", gotBody)
 	}
 }
+
+// TestImagesHiddenModelRejected models.hidden 在出图端点同样生效（不能绕过模型限制）。
+func TestImagesHiddenModelRejected(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			called = true
+			return jsonResponse(http.StatusOK, `{}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live: livecfg.New(livecfg.Snapshot{
+			ImagesEndpoint: true,
+			HiddenModels:   map[string]struct{}{"cn:text-to-image": {}},
+		}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if called {
+		t.Fatal("hidden model must not reach upstream")
+	}
+}
+
+// TestImagesAliasRewrittenToUpstreamModel 别名解析后按最终裸模型出站。
+func TestImagesAliasRewrittenToUpstreamModel(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:     client,
+		Live:         livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+		ModelAliases: map[string]string{"img-alias": "cn:text-to-image"},
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"img-alias","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(string(gotBody), `"model":"text-to-image"`) {
+		t.Fatalf("body=%s", gotBody)
+	}
+}

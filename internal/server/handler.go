@@ -2276,8 +2276,9 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 
 		f.lastErr = err
 		f.penalizeRefreshFailure(acct, err)
+		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
-		return f.handleSessionDeadError(ctx, acct, status, respBody, attemptStarted, i)
+		return f.handleSessionDeadError(ctx, acct, status, respBody, i)
 	}
 
 	if status >= 400 {
@@ -2372,7 +2373,7 @@ func (f *chatFlow) handleHTTPError(
 	if status == http.StatusUnauthorized && kind == upstream.ErrSessionDead {
 		f.penalizeRefreshFailure(acct, uerr)
 
-		return f.handleSessionDeadError(ctx, acct, status, respBody, attemptStarted, i)
+		return f.handleSessionDeadError(ctx, acct, status, respBody, i)
 	}
 	// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，触发降级
 	// 到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append 降级重试同样退化
@@ -2423,12 +2424,12 @@ func (f *chatFlow) handleHTTPError(
 	return rotContinue
 }
 
-// handleSessionDeadError 401/会话失效的换号收尾：记录一次空尝试、释放租约、
-// 按既有退避换号。禁用与否已由 penalizeRefreshFailure 的连续阈值决定。
+// handleSessionDeadError 401/会话失效的换号收尾：释放租约、按既有退避换号。
+// 禁用与否已由 penalizeRefreshFailure 的连续阈值决定；尝试记录由调用方完成
+// （handleHTTPError 入口与本文件的 refresh 失败分支各记一次，避免同一次 401 双计）。
 func (f *chatFlow) handleSessionDeadError(
-	ctx context.Context, acct *auth.Auth, status int, respBody []byte, attemptStarted time.Time, i int,
+	ctx context.Context, acct *auth.Auth, status int, respBody []byte, i int,
 ) rotationAction {
-	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	f.st.status = status
 	f.lastErr = &upstream.Error{Kind: upstream.ErrSessionDead, Status: status, Msg: string(respBody)}
 	log.Printf("WARN: [server] chat acct=%s model=%s: session dead after refresh (401)",
@@ -2679,14 +2680,74 @@ func (f *chatFlow) retryZeroOutputLength(ctx context.Context, acct *auth.Auth, i
 		return f.dispatch(ctx, acct, i)
 	}
 
+	f.zeroOutputLengthError()
+
+	return rotDone
+}
+
+// retryNonStreamZeroOutput 非流式零输出 length 的同额度重发（与流式同口径）。
+// handled=false 表示该响应不是「零输出 length」，继续常规收尾。
+func (f *chatFlow) retryNonStreamZeroOutput(
+	ctx context.Context, acct *auth.Auth, resp map[string]any, i int,
+) (rotationAction, bool) {
+	if !zeroOutputLengthResponse(resp) {
+		return rotDone, false
+	}
+
+	if !f.zeroRetried {
+		f.zeroRetried = true
+		f.body = upstream.DisableThinking(f.body)
+		log.Printf("INFO: [server] non-stream acct=%s model=%s: length with zero output, retrying once with thinking disabled",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return f.dispatch(ctx, acct, i), true
+	}
+
+	f.zeroOutputLengthError()
+
+	return rotDone, true
+}
+
+// zeroOutputLengthResponse 报告聚合响应是否为 finish_reason=length 且无正文/
+// 拒答/工具调用：这类响应不能当成功写回。
+func zeroOutputLengthResponse(resp map[string]any) bool {
+	choice := firstChoice(resp)
+	if choice == nil {
+		return false
+	}
+
+	if fr, _ := choice["finish_reason"].(string); fr != "length" {
+		return false
+	}
+
+	msg, _ := choice["message"].(map[string]any)
+	if msg == nil {
+		return false
+	}
+
+	if content, _ := msg["content"].(string); content != "" {
+		return false
+	}
+
+	if refusal, _ := msg["refusal"].(string); refusal != "" {
+		return false
+	}
+
+	if tools, _ := msg["tool_calls"].([]any); len(tools) > 0 {
+		return false
+	}
+
+	return true
+}
+
+// zeroOutputLengthError 写出 502 zero_output_length 终态（流式/非流式共用）。
+func (f *chatFlow) zeroOutputLengthError() {
 	f.st.status = http.StatusBadGateway
 	f.st.outcome = reqlog.OutcomeStreamError
 	f.lastErr = errZeroOutputLength
 	f.out.Error(http.StatusBadGateway, "zero_output_length",
 		"upstream hit the output budget before producing any content; retry with a smaller prompt or another model",
 		"upstream returned finish_reason=length with no content; the gateway retried once with thinking disabled")
-
-	return rotDone
 }
 
 // handlePreStreamErrorFrame 首帧 error/顶层业务错误：尚未向客户端写字节，按非流式
@@ -2901,6 +2962,10 @@ func (f *chatFlow) handleNonStreamSuccess(
 		}
 
 		return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
+	}
+
+	if action, handled := f.retryNonStreamZeroOutput(ctx, acct, resp, i); handled {
+		return action
 	}
 
 	resp = f.continueNonStream(ctx, acct, resp)

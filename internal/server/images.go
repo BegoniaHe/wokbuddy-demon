@@ -93,15 +93,34 @@ func (h *Handler) readImagesRequest(w http.ResponseWriter, r *http.Request) ([]b
 		return nil, "", "", false, false
 	}
 
-	realm, bareModel, prefixed := splitRealm(strings.TrimSpace(peek.Model))
-	if keyRealm := keyRealmFrom(r.Context()); keyRealm != "" && keyRealm != realm {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			"model realm "+realm+" does not match API key realm "+keyRealm)
+	rawModel := strings.TrimSpace(peek.Model)
+	keyRealm := keyRealmFrom(r.Context())
+
+	realm, bareModel, err := resolveKeyModel(rawModel, h.requestModelAliases(rawModel, keyRealm), keyRealm)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 
 		return nil, "", "", false, false
 	}
 
-	return body, realm, bareModel, prefixed, true
+	// 与 chat/Anthropic 同口径：models.hidden 与命名密钥白名单必须在出站前判定，
+	// 否则开启图像端点后可以绕过模型限制。
+	if h.modelHidden(realm, bareModel) {
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			"model is hidden by gateway config (models.hidden); pick another model")
+
+		return nil, "", "", false, false
+	}
+
+	if keyUsage2 := keyUsageFrom(r.Context()); keyUsage2 != nil &&
+		!h.cfg.Keys.ModelAllowed(keyUsage2.id, realm+":"+bareModel) {
+		h.cfg.Keys.RecordRejected(keyUsage2.id)
+		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed", "model is not allowed for this API key")
+
+		return nil, "", "", false, false
+	}
+
+	return body, realm, bareModel, rawModel != bareModel, true
 }
 
 // rewriteImageModel 去掉 body.model 的 realm 前缀（上游只认裸名）。
@@ -185,8 +204,8 @@ func (h *Handler) handleImagesError(
 ) {
 	kind := uerr.Kind
 
-	h.cfg.Pool.RecordTokenUsage(acct.UID, &pool.TokenUsageDelta{})
-
+	// 尝试与延迟已由 recordImagesAttempt 记账；这里不再补空 delta，避免同一次失败
+	// 被记成两次请求。
 	if kind == upstream.ErrSessionDead {
 		// 与 chat 同口径：连续阈值才禁用，401 本身只进入待重登计数。
 		h.cfg.Pool.NoteSessionDead(acct.UID)

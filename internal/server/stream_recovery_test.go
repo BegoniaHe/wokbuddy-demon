@@ -146,6 +146,58 @@ func TestNonStreamContinuation(t *testing.T) {
 	}
 }
 
+// TestNonStreamZeroOutputLengthRetriesThinkingDisabled 非流式零输出 length 也关闭
+// thinking 重发一次，而不是把空 content 当成功（issue #244）。
+func TestNonStreamZeroOutputLengthRetriesThinkingDisabled(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+
+	var secondBody atomic.Value
+
+	lengthFrame := "data: {\"id\":\"c1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"
+	okFrame := "data: {\"id\":\"c1\",\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		if calls.Add(1) == 1 {
+			return 200, lengthFrame, true
+		}
+
+		return 200, okFrame, true
+	})
+	base := client.HTTP.Transport
+	client.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if calls.Load() >= 1 {
+			raw, _ := io.ReadAll(r.Body)
+			r.Body = io.NopCloser(strings.NewReader(string(raw)))
+			secondBody.Store(string(raw))
+		}
+
+		return base.RoundTrip(r)
+	})
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, handler, `{"model":"glm-5.2","messages":[],"thinking":{"type":"enabled"}}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if calls.Load() != 2 {
+		t.Fatalf("calls=%d want 2", calls.Load())
+	}
+
+	body, _ := secondBody.Load().(string)
+	if !strings.Contains(body, `"thinking":{"type":"disabled"}`) {
+		t.Fatalf("second request must disable thinking: %s", body)
+	}
+
+	if !strings.Contains(rec.Body.String(), `"content":"ok"`) {
+		t.Fatalf("body=%s", rec.Body)
+	}
+}
+
 // TestApplyModelBlockOverrideBusy 纯 14003 全池阻塞返回 503 model_busy（issue #254）。
 func TestApplyModelBlockOverrideBusy(t *testing.T) {
 	t.Parallel()

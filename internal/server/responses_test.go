@@ -466,6 +466,32 @@ func assertNamespaceCollisionStream(t *testing.T, refs map[string]responsesToolR
 	}
 }
 
+// TestResponsesUpstreamToolNameBareAmbiguous 同名工具跨 namespace 时，bare 名无法
+// 判定身份，必须保留原名；唯一匹配时才映射到限定名（issue #259）。
+func TestResponsesUpstreamToolNameBareAmbiguous(t *testing.T) {
+	t.Parallel()
+
+	refs := map[string]responsesToolRef{
+		"mcp__a__search": {bare: "search", namespace: "mcp__a__"},
+		"mcp__b__search": {bare: "search", namespace: "mcp__b__"},
+	}
+
+	if got := responsesUpstreamToolName("search", refs); got != "search" {
+		t.Fatalf("ambiguous bare name = %q want unchanged", got)
+	}
+
+	if got := responsesUpstreamToolName("mcp__a__search", refs); got != "mcp__a__search" {
+		t.Fatalf("declared name = %q", got)
+	}
+
+	unique := map[string]responsesToolRef{
+		"functions__lookup": {bare: "lookup", namespace: "functions"},
+	}
+	if got := responsesUpstreamToolName("lookup", unique); got != "functions__lookup" {
+		t.Fatalf("unique bare name = %q want functions__lookup", got)
+	}
+}
+
 // assertResponsesFlatToolNames 校验转换后的 chat tools 名字集合。
 func assertResponsesFlatToolNames(t *testing.T, tools []any, want ...string) {
 	t.Helper()
