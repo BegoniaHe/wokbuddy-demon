@@ -37,7 +37,8 @@ func TestTimingShapeConfigZero(t *testing.T) {
 
 	config := Default()
 	config.Schedule.SlotJitter = "0"
-	config.Schedule.AccountPacingSigma = 0
+	zero := 0.0
+	config.Schedule.AccountPacingSigma = &zero
 	config.Schedule.AccountPhaseWindow = "0"
 
 	if err := config.normalize(); err != nil {
@@ -111,6 +112,27 @@ func TestTimingShapeConfigImplicitSideYieldsToExplicit(t *testing.T) {
 	}
 }
 
+// TestTimingShapeConfigMissingSigmaDefaults 旧配置缺 account_pacing_sigma 键时
+// 应补默认 0.4（显式 0 仍在 TestTimingShapeConfigZero 中验证为关闭）。
+func TestTimingShapeConfigMissingSigmaDefaults(t *testing.T) {
+	t.Parallel()
+
+	config := Default()
+	config.Schedule.AccountPacingSigma = nil
+
+	if err := config.normalize(); err != nil {
+		t.Fatalf("sigma 缺键: %v", err)
+	}
+
+	if config.Schedule.AccountPacingSigma == nil || *config.Schedule.AccountPacingSigma != 0.4 {
+		t.Fatalf("sigma=%v want 0.4", config.Schedule.AccountPacingSigma)
+	}
+
+	if config.Timing.PacingSigma != 0.4 {
+		t.Fatalf("effective sigma=%v want 0.4", config.Timing.PacingSigma)
+	}
+}
+
 // TestTimingShapeConfigRejectsInvalid 非法值报错而不静默回落。
 func TestTimingShapeConfigRejectsInvalid(t *testing.T) {
 	t.Parallel()
@@ -122,8 +144,14 @@ func TestTimingShapeConfigRejectsInvalid(t *testing.T) {
 		{"jitter 超 59m", func(c *Config) { c.Schedule.SlotJitter = "60m" }},
 		{"jitter 负数", func(c *Config) { c.Schedule.SlotJitter = "-1s" }},
 		{"jitter 非法", func(c *Config) { c.Schedule.SlotJitter = "abc" }},
-		{"sigma 过大", func(c *Config) { c.Schedule.AccountPacingSigma = 1.6 }},
-		{"sigma 负数", func(c *Config) { c.Schedule.AccountPacingSigma = -0.1 }},
+		{"sigma 过大", func(c *Config) {
+			sigma := 1.6
+			c.Schedule.AccountPacingSigma = &sigma
+		}},
+		{"sigma 负数", func(c *Config) {
+			sigma := -0.1
+			c.Schedule.AccountPacingSigma = &sigma
+		}},
 		{"floor 大于 median", func(c *Config) { c.Schedule.AccountPacingFloor = "2s" }},
 		{"ceiling 小于 median", func(c *Config) { c.Schedule.AccountPacingCeiling = "100ms" }},
 		{"floor 大于 ceiling", func(c *Config) {

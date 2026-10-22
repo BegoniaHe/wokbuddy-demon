@@ -204,12 +204,13 @@ type Config struct {
 		// 开启时序整形后作为对数正态分布的 median。
 		CheckinAccountDelay string `json:"checkin_account_delay"`
 		// 时序整形（issue #220）：默认开启；对应字段为 "0" 时完整回到整点/固定间隔。
-		SlotJitter           string  `json:"slot_jitter"`
-		AccountPacingSigma   float64 `json:"account_pacing_sigma"`
-		AccountPacingFloor   string  `json:"account_pacing_floor"`
-		AccountPacingCeiling string  `json:"account_pacing_ceiling"`
-		AccountPhaseWindow   string  `json:"account_phase_window"`
-		TimingSalt           string  `json:"timing_salt"`
+		SlotJitter string `json:"slot_jitter"`
+		// 指针用于区分「缺键」（nil → 默认 0.4）与显式 0（关闭对数正态限速）。
+		AccountPacingSigma   *float64 `json:"account_pacing_sigma"`
+		AccountPacingFloor   string   `json:"account_pacing_floor"`
+		AccountPacingCeiling string   `json:"account_pacing_ceiling"`
+		AccountPhaseWindow   string   `json:"account_phase_window"`
+		TimingSalt           string   `json:"timing_salt"`
 	} `json:"schedule"`
 
 	Models struct {
@@ -537,7 +538,10 @@ func applyScheduleDefaults(config2 *Config) {
 	config2.Schedule.TaskSweepMinutes = 15
 	config2.Schedule.CheckinAccountDelay = "800ms"
 	config2.Schedule.SlotJitter = "20m"
-	config2.Schedule.AccountPacingSigma = 0.4
+
+	sigma := 0.4
+	config2.Schedule.AccountPacingSigma = &sigma
+
 	config2.Schedule.AccountPacingFloor = "250ms"
 	config2.Schedule.AccountPacingCeiling = "6s"
 	config2.Schedule.AccountPhaseWindow = "10m"
@@ -1865,6 +1869,13 @@ type timingDurations struct {
 // 空值回落默认；"0" 合法（关闭对应整形）；负值/非法时长/σ 越界/夹逼矛盾报错，
 // 不静默回落。
 func (c *Config) normalizeTimingShape() error {
+	// 数值型无法区分缺键与显式 0：nil 视为旧配置缺键，补默认 0.4；
+	// 用户显式写 0 仍表示关闭对数正态限速。
+	if c.Schedule.AccountPacingSigma == nil {
+		sigma := 0.4
+		c.Schedule.AccountPacingSigma = &sigma
+	}
+
 	parsed, err := c.parseTimingDurations()
 	if err != nil {
 		return err
@@ -1883,7 +1894,7 @@ func (c *Config) normalizeTimingShape() error {
 	c.Schedule.TimingSalt = strings.TrimSpace(c.Schedule.TimingSalt)
 	c.Timing = scheduler.Timing{
 		SlotJitter:    parsed.jitter,
-		PacingSigma:   c.Schedule.AccountPacingSigma,
+		PacingSigma:   *c.Schedule.AccountPacingSigma,
 		PacingFloor:   parsed.floor,
 		PacingCeiling: parsed.ceiling,
 		PhaseWindow:   parsed.phase,
@@ -1932,8 +1943,8 @@ func (c *Config) validateTimingShape(parsed *timingDurations) error {
 		return fmt.Errorf("%w: %q", errTimingJitterTooLarge, parsed.jitterRaw)
 	}
 
-	if c.Schedule.AccountPacingSigma < 0 || c.Schedule.AccountPacingSigma > 1.5 {
-		return fmt.Errorf("%w: %v", errTimingSigmaRange, c.Schedule.AccountPacingSigma)
+	if *c.Schedule.AccountPacingSigma < 0 || *c.Schedule.AccountPacingSigma > 1.5 {
+		return fmt.Errorf("%w: %v", errTimingSigmaRange, *c.Schedule.AccountPacingSigma)
 	}
 
 	if parsed.floor > 0 && parsed.ceiling > 0 && parsed.floor > parsed.ceiling {
