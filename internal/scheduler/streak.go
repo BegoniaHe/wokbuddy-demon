@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
@@ -58,8 +59,8 @@ func (s *Scheduler) streakAll(trigger string) (total, success, failure int) {
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
 // 返回 false 仅表示主链路（连登状态/抽奖次数）查询失败；可选的礼包/补签失败不改变结果。
 func (s *Scheduler) streakBonusAccount(account3 *auth.Auth) bool {
-	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
-	s.makeupYesterday(account3)
+	// 0. 补签保连登：本月漏签由近及远补，受补签卡余额限制（issue #250）。
+	s.makeupRecent(account3)
 	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
 	s.claimStreakGifts(account3)
 
@@ -86,7 +87,12 @@ func (s *Scheduler) streakBonusAccount(account3 *auth.Auth) bool {
 // claimStreakGifts 领取新手礼包与补偿（各一次，业务错误静默跳过）。
 func (s *Scheduler) claimStreakGifts(account4 *auth.Auth) {
 	if credit, err := s.cfg.Upstream.ClaimGift(account4); err == nil {
-		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(account4.UID, account4.NicknameValue()), credit)
+		if credit > 0 {
+			log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(account4.UID, account4.NicknameValue()), credit)
+		} else {
+			// 回执缺额度不等于 0：不写假 +0c（issue #251 同口径）。
+			log.Printf("streak-bonus %s: 🎊 新手礼包已领（额度未知）", logfmt.Label(account4.UID, account4.NicknameValue()))
+		}
 	}
 
 	// 补偿：先查状态再决定是否领（不再盲领——「没有/已领/领取失败」三种情形
@@ -145,24 +151,46 @@ func compactJSON(raw json.RawMessage) string {
 	return s
 }
 
-// makeupYesterday 昨日漏签且有补签卡时自动补签（保住连登连续天数）。
-// 无卡 / 无漏签 / 查询失败均静默（不影响主流程）。
-func (s *Scheduler) makeupYesterday(account2 *auth.Auth) {
-	missed, err := s.cfg.Upstream.HeatmapYesterdayMissed(account2)
-	if err != nil || !missed {
+// makeupRecent 本月漏签由近及远补签，受补签卡余额限制；无卡/无漏签/查询失败静默。
+// 只在有漏签时才查连登详情与补签卡余额，避免无漏签账号多打一次上游。
+func (s *Scheduler) makeupRecent(account2 *auth.Auth) {
+	now := cst.Now()
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, cst.Loc)
+	yesterday := now.AddDate(0, 0, -1)
+
+	missed, err := s.cfg.Upstream.HeatmapMissedDays(account2, cst.Day(monthStart), cst.Day(yesterday))
+	if err != nil || len(missed) == 0 {
 		return
 	}
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(account2)
-	if err != nil || full.MakeupCards.Balance <= 0 {
+	if err != nil {
 		return
 	}
 
-	yesterday := cst.Day(cst.Now().AddDate(0, 0, -1))
-	if err := s.cfg.Upstream.UseMakeupCard(account2, yesterday); err != nil {
-		log.Printf("streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(account2.UID, account2.NicknameValue()), yesterday, err)
+	remaining := full.MakeupCards.Balance
+	if remaining <= 0 {
 		return
 	}
 
-	log.Printf("streak-bonus %s: ★ 已用补签卡补签 %s（保连登）", logfmt.Label(account2.UID, account2.NicknameValue()), yesterday)
+	used := 0
+
+	for i := len(missed) - 1; i >= 0 && remaining > 0; i-- {
+		day := missed[i]
+		if err := s.cfg.Upstream.UseMakeupCard(account2, day); err != nil {
+			log.Printf("streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(account2.UID, account2.NicknameValue()), day, err)
+			continue
+		}
+
+		remaining--
+		used++
+
+		log.Printf("streak-bonus %s: ★ 已用补签卡补签 %s（剩余 %d 张）",
+			logfmt.Label(account2.UID, account2.NicknameValue()), day, remaining)
+	}
+
+	if used > 0 {
+		log.Printf("streak-bonus %s: 本次补签 %d 天，剩余补签卡 %d 张",
+			logfmt.Label(account2.UID, account2.NicknameValue()), used, remaining)
+	}
 }

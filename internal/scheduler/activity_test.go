@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )

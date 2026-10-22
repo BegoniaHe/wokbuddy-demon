@@ -13,10 +13,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"sync"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // compensationWorkers 并发查询/领取的账号上限（与余额刷新同量级）。
@@ -33,10 +35,13 @@ type CompensationRow struct {
 	// Error 查询或领取失败（非空即必须显形——这正是本文件的命题）。
 	Error string `json:"error,omitempty"`
 	// Active / Claimed / CreditNum / EndTime 来自上游状态。
-	Active    bool   `json:"active"`
-	Claimed   bool   `json:"claimed"`
-	CreditNum int64  `json:"credit_num"`
-	EndTime   string `json:"end_time,omitempty"`
+	Active  bool `json:"active"`
+	Claimed bool `json:"claimed"`
+	// CreditNum 到账额度；CreditKnown=false 表示上游回执与状态都没给额度（显示「未知」，
+	// 不能写成 0，issue #251）。
+	CreditNum   int64  `json:"credit_num"`
+	CreditKnown bool   `json:"credit_known"`
+	EndTime     string `json:"end_time,omitempty"`
 }
 
 // Pending 该行是否存在「可领且未领」的补偿（与 upstream.Pending 同口径）。
@@ -170,6 +175,16 @@ func (s *Scheduler) ClaimCompensationFor(uid string) CompensationRow {
 
 	row.Active, row.Claimed, row.CreditNum, row.EndTime = comp.Active, comp.Claimed, comp.CreditNum, comp.EndTime
 
+	key := compensationClaimKey(uid, comp)
+
+	if comp.Claimed {
+		s.recordClaimed(key)
+		row.Skipped = true
+		row.Reason = "上游状态已领取"
+
+		return row
+	}
+
 	if !comp.Pending() {
 		row.Skipped = true
 		row.Reason = "当前无待领补偿"
@@ -177,8 +192,16 @@ func (s *Scheduler) ClaimCompensationFor(uid string) CompensationRow {
 		return row
 	}
 
+	if !s.beginClaim(key) {
+		row.Skipped = true
+		row.Reason = "本周期已领取（进程内幂等）"
+
+		return row
+	}
+
 	credit, err := s.cfg.Upstream.ClaimCompensation(account)
 	if err != nil {
+		s.finishClaim(key, false)
 		// 领取失败必须显形：这正是「盲领」时被吞掉的那一类。
 		log.Printf("WARN: [scheduler] 补偿领取失败 acct=%s: %v", logfmt.Label(uid, status.Nickname), err)
 		row.Error = err.Error()
@@ -186,12 +209,94 @@ func (s *Scheduler) ClaimCompensationFor(uid string) CompensationRow {
 		return row
 	}
 
+	s.finishClaim(key, true)
+	credit, known := s.normalizeClaimCredit(account, credit)
+
 	row.Claimed = true
 	row.CreditNum = credit
+	row.CreditKnown = known
 
-	log.Printf("INFO: [scheduler] 补偿领取成功 acct=%s: +%dc", logfmt.Label(uid, status.Nickname), credit)
+	if known {
+		log.Printf("INFO: [scheduler] 补偿领取成功 acct=%s: +%dc", logfmt.Label(uid, status.Nickname), credit)
+	} else {
+		log.Printf("INFO: [scheduler] 补偿领取成功 acct=%s: 额度未知（回执与状态均为 0）", logfmt.Label(uid, status.Nickname))
+	}
 
 	return row
+}
+
+// compensationClaimKey 进程内幂等键：账号 + 活动截止时间 + 待领额度。
+// 上游没有稳定活动 ID；同账号同截止同额度的重复回调视为同一周期。
+func compensationClaimKey(uid string, status upstream.CompensationStatus) string {
+	return uid + "|" + status.EndTime + "|" + strconv.FormatInt(status.CreditNum, 10)
+}
+
+// beginClaim 占用领取权：已领取或正在领取返回 false。首次调用惰性初始化 map
+// （零值 Scheduler 也可用）。
+func (s *Scheduler) beginClaim(key string) bool {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+
+	if s.claimedKeys == nil {
+		s.claimedKeys = make(map[string]string)
+	}
+
+	if s.claimingKeys == nil {
+		s.claimingKeys = make(map[string]bool)
+	}
+
+	if _, done := s.claimedKeys[key]; done {
+		return false
+	}
+
+	if s.claimingKeys[key] {
+		return false
+	}
+
+	s.claimingKeys[key] = true
+
+	return true
+}
+
+// finishClaim 释放领取权；成功则写入幂等标记。
+func (s *Scheduler) finishClaim(key string, ok bool) {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+
+	delete(s.claimingKeys, key)
+
+	if ok {
+		s.claimedKeys[key] = "claimed"
+	}
+}
+
+// recordClaimed 记录上游已领取状态（重启后首次查询命中 claimed 也走这里）。
+func (s *Scheduler) recordClaimed(key string) {
+	s.claimMu.Lock()
+	defer s.claimMu.Unlock()
+
+	if s.claimedKeys == nil {
+		s.claimedKeys = make(map[string]string)
+	}
+
+	s.claimedKeys[key] = "claimed"
+}
+
+// normalizeClaimCredit 统一「真实到账」归一：回执 credit<=0 时回落状态额度；
+// 两者都为 0 时 known=false（面板/日志显示未知，不写假 0，issue #251）。
+func (s *Scheduler) normalizeClaimCredit(account *auth.Auth, receipt int64) (int64, bool) {
+	if receipt > 0 {
+		return receipt, true
+	}
+
+	// 回执不填额度时重新查一次状态（领取后的额度可能已变化），不能拿领取前的
+	// 待领额度当作到账值。
+	status, err := s.cfg.Upstream.GetCompensationStatus(account)
+	if err == nil && status.CreditNum > 0 {
+		return status.CreditNum, true
+	}
+
+	return 0, false
 }
 
 // CompensationSummary 批量领取的汇总。
@@ -264,13 +369,25 @@ func (s *Scheduler) claimCompensationIfPending(account *auth.Auth) {
 		return
 	}
 
+	key := compensationClaimKey(account.UID, status)
+	if !s.beginClaim(key) {
+		return
+	}
+
 	credit, err := s.cfg.Upstream.ClaimCompensation(account)
 	if err != nil {
+		s.finishClaim(key, false)
 		log.Printf("WARN: [scheduler] 补偿领取失败 acct=%s: %v",
 			logfmt.Label(account.UID, account.NicknameValue()), err)
 
 		return
 	}
 
-	log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(account.UID, account.NicknameValue()), credit)
+	s.finishClaim(key, true)
+	credit, known := s.normalizeClaimCredit(account, credit)
+	if known {
+		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", logfmt.Label(account.UID, account.NicknameValue()), credit)
+	} else {
+		log.Printf("streak-bonus %s: 🎊 补偿领取成功（额度未知）", logfmt.Label(account.UID, account.NicknameValue()))
+	}
 }

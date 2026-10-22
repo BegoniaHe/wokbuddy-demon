@@ -19,7 +19,9 @@ type compensationFixture struct {
 	// statusBody 返回的状态信封（可含 error 形态由 httpStatus 决定）。
 	httpStatus int
 	statusBody string
-	claimBody  string
+	// statusBodyAfter 非空时，第 2 次及以后的 status 查询使用它（模拟领取后状态变化）。
+	statusBodyAfter string
+	claimBody       string
 }
 
 func (f *compensationFixture) scheduler(t *testing.T, accounts ...*auth.Auth) *Scheduler {
@@ -29,9 +31,14 @@ func (f *compensationFixture) scheduler(t *testing.T, accounts ...*auth.Auth) *S
 		w.Header().Set("Content-Type", "application/json")
 
 		if r.URL.Path == "/v2/billing/meter/compensation-status" || r.URL.Path == "/billing/meter/compensation-status" {
-			f.statusCalls.Add(1)
+			call := f.statusCalls.Add(1)
+			body := f.statusBody
+			if call > 1 && f.statusBodyAfter != "" {
+				body = f.statusBodyAfter
+			}
+
 			w.WriteHeader(f.httpStatus)
-			_, _ = w.Write([]byte(f.statusBody))
+			_, _ = w.Write([]byte(body))
 
 			return
 		}
@@ -185,5 +192,67 @@ func TestSummarizeCompensationErroredFirst(t *testing.T) {
 
 	if summary.Errored != 2 || summary.Skipped != 1 || summary.Claimed != 1 || summary.Credit != 100 {
 		t.Fatalf("summary=%+v", summary)
+	}
+}
+
+// TestClaimCompensationZeroReceiptFallsBack 回执 credit=0 时回落状态额度（issue #251）。
+func TestClaimCompensationZeroReceiptFallsBack(t *testing.T) {
+	t.Parallel()
+
+	fixture := &compensationFixture{
+		httpStatus: http.StatusOK,
+		statusBody: `{"code":0,"data":{"active":true,"credit_num":300,"end_time":"2026-10-31 23:59:59"}}`,
+		claimBody:  `{"code":0,"data":{"credit":0}}`,
+	}
+	sched := fixture.scheduler(t, &auth.Auth{UID: "u1", AccessToken: "at"})
+
+	row := sched.ClaimCompensationFor("u1")
+	if !row.Claimed || !row.CreditKnown || row.CreditNum != 300 {
+		t.Fatalf("row=%+v want claimed known 300", row)
+	}
+
+	if row.CreditNum == 0 {
+		t.Fatal("must not report fake +0c")
+	}
+}
+
+// TestClaimCompensationZeroReceiptUnknown 回执与状态都为 0 时标记额度未知。
+func TestClaimCompensationZeroReceiptUnknown(t *testing.T) {
+	t.Parallel()
+
+	fixture := &compensationFixture{
+		httpStatus:      http.StatusOK,
+		statusBody:      `{"code":0,"data":{"active":true,"credit_num":1,"end_time":"2026-10-31 23:59:59"}}`,
+		statusBodyAfter: `{"code":0,"data":{"active":false}}`,
+		claimBody:       `{"code":0,"data":{}}`,
+	}
+	sched := fixture.scheduler(t, &auth.Auth{UID: "u1", AccessToken: "at"})
+
+	row := sched.ClaimCompensationFor("u1")
+	if !row.Claimed || row.CreditKnown {
+		t.Fatalf("row=%+v want claimed unknown", row)
+	}
+}
+
+// TestClaimCompensationIdempotent 同进程重复调用只 claim 一次（issue #251）。
+func TestClaimCompensationIdempotent(t *testing.T) {
+	t.Parallel()
+
+	fixture := &compensationFixture{
+		httpStatus: http.StatusOK,
+		statusBody: `{"code":0,"data":{"active":true,"credit_num":500,"end_time":"2026-10-31 23:59:59"}}`,
+		claimBody:  `{"code":0,"data":{"credit":500}}`,
+	}
+	sched := fixture.scheduler(t, &auth.Auth{UID: "u1", AccessToken: "at"})
+
+	first := sched.ClaimCompensationFor("u1")
+	second := sched.ClaimCompensationFor("u1")
+
+	if !first.Claimed || !second.Skipped {
+		t.Fatalf("first=%+v second=%+v", first, second)
+	}
+
+	if got := fixture.claimCalls.Load(); got != 1 {
+		t.Fatalf("claim calls=%d want 1", got)
 	}
 }

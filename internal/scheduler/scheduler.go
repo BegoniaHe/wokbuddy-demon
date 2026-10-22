@@ -99,6 +99,12 @@ type Scheduler struct {
 	runMu sync.Mutex
 	runs  map[string]*runSlot
 
+	// claimMu 保护补偿/礼包进程内幂等闸（issue #251）：uid|周期 → 已领取标记，
+	// 以及正在领取的 key 集合（防并发重复 claim）。重启即清零，语义见 compensation.go。
+	claimMu      sync.Mutex
+	claimedKeys  map[string]string
+	claimingKeys map[string]bool
+
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
@@ -145,6 +151,8 @@ func New(cfg *Config) *Scheduler {
 		nowFn:          time.Now,
 		logger:         log.Default(),
 		adoptTried:     make(map[string]string),
+		claimedKeys:    make(map[string]string),
+		claimingKeys:   make(map[string]bool),
 		rearmSchedule:  make(chan struct{}, 1),
 		rearmBalance:   make(chan struct{}, 1),
 		rearmTaskSweep: make(chan struct{}, 1),
