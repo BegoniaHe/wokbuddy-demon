@@ -27,7 +27,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,7 +38,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -114,11 +112,10 @@ func (c *Client) desktopDomain(a *auth.Auth) string {
 	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
 }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/sessionId 等复用），
+// deriveID 由 uid 稳定派生一个 UUIDv4 形态设备标识（machineId/sessionId 等复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
 func deriveID(a *auth.Auth, salt string) string {
-	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
+	return deriveUUIDv4(salt + ":" + a.UID)
 }
 
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
@@ -305,7 +302,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	req.Header.Set("X-Domain", c.desktopDomain(account2))
 	req.Header.Set("X-Product", "SaaS")
 	injectEnterpriseHeaders(req, account2)
-	req.Header.Set("X-Request-ID", deriveID(account2, "req")+strconv.FormatInt(time.Now().UnixNano()%1e6, 10))
+	req.Header.Set("X-Request-ID", session.NewUUIDv7Hex())
 
 	if account2.UID != "" {
 		req.Header.Set("X-User-Id", account2.UID)
@@ -355,7 +352,7 @@ func desktopTaskCreated(conversationID, messageID, modelID, modelName string) De
 
 func desktopMessageSend(conversationID, requestID, messageID string) DesktopEvent {
 	return desktopEvent("chat_message_send", map[string]any{
-		"messageId": messageID + "-assistant", "historyCount": 0,
+		"messageId": messageID, "historyCount": 0,
 		"isContextTruncated": false, "currentStepCount": 1,
 		"traceId": requestID, "rootRequestId": requestID,
 		"parentConversationId": conversationID,
@@ -381,7 +378,7 @@ func desktopRequestSend(conversationID, requestID string) DesktopEvent {
 
 func desktopMessageResponse(conversationID, requestID, messageID, modelID string) DesktopEvent {
 	return desktopEvent("chat_message_response", map[string]any{
-		"messageId": messageID + "-assistant", "responseModelId": modelID,
+		"messageId": messageID, "responseModelId": modelID,
 		"inputToken": 120, "outputToken": 80, "totalToken": 200,
 		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
 		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
@@ -396,7 +393,7 @@ func desktopMessageResponse(conversationID, requestID, messageID, modelID string
 
 func desktopMessageStatus(conversationID, requestID, messageID string) DesktopEvent {
 	return desktopEvent("chat_message_status", map[string]any{
-		"messageId": messageID + "-assistant", "messageErrorCode": "0",
+		"messageId": messageID, "messageErrorCode": "0",
 		"traceId": requestID, "rootRequestId": requestID,
 		"parentConversationId": conversationID,
 		"agentName":            "cli", "agentType": "main",
@@ -535,7 +532,7 @@ func (c *Client) ReportWebEvent(account6 *auth.Auth, eventCode, pageURL, element
 // template_used {template_id,task_mode}，JOIN 一条完整 chat 链。
 // 三账号实测：5 组（不同模板）一次上报 → 5/5 点亮。
 func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-"+templateID, "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	events = append(events,
 		DesktopEvent{
 			"eventCode": "agent_task_created_with_template", "mode": "working",
@@ -551,7 +548,7 @@ func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateN
 // web_element_click(playbook_ctaClick) + playbook_cta_click + playbook_prompt_send
 // （Dialog 发送 Prompt，带 conversationId/requestId JOIN chat 链）。三账号实测 1/1 点亮。
 func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-pb", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	payload := map[string]any{
 		"id": caseID, "name": caseName, "type": "document",
 		"categoryId": "", "categoryName": "",
@@ -582,7 +579,7 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 // wbx_design_canvas_task_create + wbx_design_canvas_open（Ardot create_design 工具
 // 完成时客户端经 metrics 通道上报，同一 /v2/report 端点）。三账号实测 1/1 点亮。
 func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-canvas", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 
 	return append(events,
 		DesktopEvent{
@@ -657,7 +654,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(account3 *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	conversationID = session.NewUUIDv4()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
@@ -720,7 +717,7 @@ func (c *Client) DesktopChatWithExpert(account3 *auth.Auth, expertID string) (co
 // + 会话头族 + traceparent/b3/X-B3-* 链路族 + acp-connection-id。
 func (c *Client) setDesktopExpertHeaders(req *http.Request, account5 *auth.Auth, conversationID, expertID string) {
 	header := req.Header
-	requestID := session.NewMessageID()
+	requestID := session.NewUUIDv7Hex()
 
 	header.Set("Authorization", "Bearer "+account5.AccessTokenValue())
 	header.Set("Content-Type", "application/json")
@@ -946,7 +943,7 @@ func desktopExpertActualUse(marketExpert2 *MarketExpert, conversationID, request
 		"id":        marketExpert2.ExpertID, "name": marketExpert2.DisplayNameZH, "expertTitle": marketExpert2.ProfessionZH,
 		"type": cat, "expertType": marketExpert2.ExpertType, "source": "builtin", "version": ver,
 		"cost": 9000, "characterCount": 14,
-		"conversationId": conversationID, "requestId": requestID, "messageId": "msg-" + requestID[len(requestID)-8:],
+		"conversationId": conversationID, "requestId": requestID, "messageId": session.NewUUIDv7Hex(),
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 	}
 }

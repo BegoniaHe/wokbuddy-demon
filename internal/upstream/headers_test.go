@@ -4,9 +4,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+)
+
+var (
+	uuidV4HeaderPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	uuidV7HeaderPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 )
 
 // TestConversationHeaderFallback 无客户端 conversationId 时，出站头使用
@@ -37,6 +43,7 @@ func TestConversationHeaderFallback(t *testing.T) {
 
 // TestConversationHeaderAlwaysEmitted 零值 meta（搜索/夜猫子/模型探测等直接
 // ChatHeaders 的路径）也必须带 X-Conversation-Id：上游渠道校验要求该头恒在。
+// 会话 ID 兜底为 UUIDv4，请求/消息 ID 为 UUIDv7 32 hex。
 func TestConversationHeaderAlwaysEmitted(t *testing.T) {
 	t.Parallel()
 
@@ -49,16 +56,44 @@ func TestConversationHeaderAlwaysEmitted(t *testing.T) {
 
 	client.ChatHeaders(req, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{})
 
-	if got := req.Header.Get("X-Conversation-Id"); got == "" {
-		t.Fatal("X-Conversation-Id missing")
+	if got := req.Header.Get("X-Conversation-Id"); !uuidV4HeaderPattern.MatchString(got) {
+		t.Fatalf("X-Conversation-Id=%q want UUIDv4", got)
 	}
 
-	if got := req.Header.Get("X-Conversation-Id"); got != req.Header.Get("X-Conversation-Request-Id") {
-		t.Fatalf("X-Conversation-Id=%q want request-id %q", got, req.Header.Get("X-Conversation-Request-Id"))
+	for _, name := range []string{"X-Conversation-Request-Id", "X-Conversation-Message-Id", "X-Request-ID"} {
+		if got := req.Header.Get(name); !uuidV7HeaderPattern.MatchString(got) {
+			t.Fatalf("%s=%q want UUIDv7 32 hex", name, got)
+		}
 	}
 
-	if got := req.Header.Get("Acp-Connection-Id"); got == "" {
-		t.Fatal("Acp-Connection-Id missing")
+	if got := req.Header.Get("Acp-Connection-Id"); !uuidV4HeaderPattern.MatchString(got) {
+		t.Fatalf("Acp-Connection-Id=%q want UUIDv4", got)
+	}
+}
+
+// TestAccountStableHeadersUUIDShape 设备/会话头按 uid 稳定派生且为连字符 UUIDv4。
+func TestAccountStableHeadersUUIDShape(t *testing.T) {
+	t.Parallel()
+
+	client := New()
+	a := &auth.Auth{UID: "u-stable", AccessToken: "at"}
+
+	read := func() (string, string) {
+		req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+		client.CommonHeaders(req, a)
+
+		return req.Header.Get("X-Machine-Id"), req.Header.Get("X-Session-Id")
+	}
+
+	machineA, sessionA := read()
+
+	machineB, sessionB := read()
+	if machineA != machineB || sessionA != sessionB {
+		t.Fatalf("同 uid 派生应稳定: machine %q/%q session %q/%q", machineA, machineB, sessionA, sessionB)
+	}
+
+	if !uuidV4HeaderPattern.MatchString(machineA) || !uuidV4HeaderPattern.MatchString(sessionA) {
+		t.Fatalf("设备/会话头应为 UUIDv4: machine=%q session=%q", machineA, sessionA)
 	}
 }
 

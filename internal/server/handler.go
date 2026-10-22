@@ -1641,9 +1641,10 @@ func (f *chatFlow) buildChatMeta() {
 	}
 
 	if f.chatMeta.ConversationID == "" {
-		// 上游渠道校验要求 X-Conversation-ID 恒在；客户端没给会话 ID 时用轮级
-		// 聚合键兜底。只进出站头，不覆盖 ConversationID（prompt cache key 的源）。
-		f.chatMeta.ConversationHeaderID = f.chatMeta.ConversationRequestID
+		// 上游渠道校验要求 X-Conversation-ID 恒在；客户端没给会话 ID 时用
+		// UUIDv4 兜底（官方 session.id = crypto.randomUUID()）。只进出站头，
+		// 不覆盖 ConversationID（prompt cache key 的源）。
+		f.chatMeta.ConversationHeaderID = session.NewUUIDv4()
 	}
 
 	f.chatMeta.TraceID = f.traceID

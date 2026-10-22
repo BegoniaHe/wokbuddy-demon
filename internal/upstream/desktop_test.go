@@ -65,6 +65,10 @@ func assertReportDesktopRequest(t *testing.T, r *http.Request) {
 	if r.Header.Get("X-Product") != "SaaS" {
 		t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
 	}
+
+	if got := r.Header.Get("X-Request-ID"); !uuidV7HeaderPattern.MatchString(got) {
+		t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
+	}
 }
 
 // assertDesktopEventFingerprint 断言上报事件被注入 workbuddy-desktop 公共指纹。
@@ -95,9 +99,11 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	if table["mode"] != "craft" {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", table["mode"])
 	}
-	// machineId 应为 uid 稳定派生（36 hex）。
-	if len(table["machineId"].(string)) != 36 {
-		t.Errorf("machineId 长度=%d want 36", len(table["machineId"].(string)))
+	// machineId/sessionId 应为 uid 稳定派生的连字符 UUIDv4。
+	for _, key := range []string{"machineId", "sessionId"} {
+		if got, _ := table[key].(string); !uuidV4HeaderPattern.MatchString(got) {
+			t.Errorf("%s=%q want UUIDv4", key, got)
+		}
 	}
 
 	assertDesktopMachineFingerprint(t, table)

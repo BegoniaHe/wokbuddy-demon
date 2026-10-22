@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 // reportPath 活跃上报通道（实测）。
@@ -192,7 +193,7 @@ type chatRequestEvent struct {
 }
 
 // ReportChatActivity 向上游发送一条对话活跃上报（chat_request_send）。
-// conversationID 由调用方生成（如 wb2api-<ms>），无需真实会话——服务端不校验一致性。
+// conversationID 由调用方生成（UUIDv4），无需真实会话——服务端不校验一致性。
 // requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时回落 conversationID。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
@@ -203,7 +204,7 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 // 对齐实际模型（如 Model_chat_GLM5.2 需 requestModelId=glm-5.2 与独立 requestID）。
 func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, requestID, modelID, modelName string) error {
 	if requestID == "" {
-		requestID = conversationID
+		requestID = session.NewUUIDv7Hex()
 	}
 
 	if modelID == "" {
@@ -246,7 +247,7 @@ func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, re
 		TotalCount:            0,
 		FileURI:               "",
 		PresentAt:             now,
-		TraceID:               "",
+		TraceID:               requestID,
 		RootRequestID:         requestID,
 		ParentConversationID:  conversationID,
 		AgentName:             "default",
