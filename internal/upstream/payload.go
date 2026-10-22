@@ -608,3 +608,50 @@ func unescapePatternProperties(n map[string]any) {
 		n["patternProperties"] = fixed
 	}
 }
+
+// injectConversationRequestID 给当前轮最后一条 user 消息补
+// conversationRequestId / startsNewUserRequest（issue #249）。只改最后一条 user，
+// 历史轮次不动；客户端自带值优先。没有 user 消息或 body 不可解析时原样返回。
+func injectConversationRequestID(body []byte, requestID string) []byte {
+	if requestID == "" || len(body) == 0 {
+		return body
+	}
+
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil || obj == nil {
+		return body
+	}
+
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return body
+	}
+
+	for i := len(msgs) - 1; i >= 0; i-- {
+		msg, ok := msgs[i].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if role, _ := msg["role"].(string); role != "user" {
+			continue
+		}
+
+		if _, exists := msg["conversationRequestId"]; !exists {
+			msg["conversationRequestId"] = requestID
+		}
+
+		if _, exists := msg["startsNewUserRequest"]; !exists {
+			msg["startsNewUserRequest"] = true
+		}
+
+		break
+	}
+
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+
+	return out
+}

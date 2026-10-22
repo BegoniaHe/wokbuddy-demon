@@ -1200,6 +1200,11 @@ type Client struct {
 	// <=0 回落包级默认 billingRetryDelay（2s）。仅供测试注入更短间隔，生产不设置。
 	RetryDelay time.Duration
 
+	// ConversationRequestBody 是否在 body 的当前轮最后一条 user 消息写入
+	// conversationRequestId / startsNewUserRequest（features.conversation_request_body；
+	// 默认 false，供真实账号小流量 A/B 后开启，issue #249）。
+	ConversationRequestBody atomic.Bool
+
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（生产由 config
 	// normalize 到 120s/300s；裸用回落 transport 构造默认）。
 	HeaderTimeout time.Duration
@@ -2009,6 +2014,9 @@ func (c *Client) ChatStreamContext(
 
 	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID)
 	prepared = ensureLeadingSystem(prepared)
+	if c.ConversationRequestBody.Load() && meta.ConversationRequestID != "" {
+		prepared = injectConversationRequestID(prepared, meta.ConversationRequestID)
+	}
 
 	headerTimeout, idleTimeout := c.modelTimeout(account3.Realm(), modelFromBody(prepared))
 	chatHTTP := c.chatHTTPForAccount(account3, headerTimeout)

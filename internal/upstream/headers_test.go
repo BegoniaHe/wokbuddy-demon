@@ -83,7 +83,8 @@ func TestConversationHeaderPrefersInbound(t *testing.T) {
 	}
 }
 
-// TestIdentityHeadersEnterprise 企业号发 X-Auth-Method / X-Userinfo；个人号不发。
+// TestIdentityHeadersEnterprise 身份头只按企业身份注入：个人号即使残留
+// token_source 也不发 X-Auth-Method / X-Userinfo（issue #248）。
 func TestIdentityHeadersEnterprise(t *testing.T) {
 	t.Parallel()
 
@@ -92,32 +93,76 @@ func TestIdentityHeadersEnterprise(t *testing.T) {
 		return &auth.Auth{UID: "u1", AccessToken: "x." + payload + ".sig", EnterpriseID: enterprise}
 	}
 
+	cases := []struct {
+		name       string
+		account    *auth.Auth
+		wantMethod string
+		wantInfo   bool
+	}{
+		{"企业号带来源", makeAuth("ent-1", "enterprise_switch"), "enterprise_switch", true},
+		{"企业号缺来源", makeAuth("ent-1", ""), "", true},
+		{"个人号无来源", makeAuth("", ""), "", false},
+		{"个人号残留来源", makeAuth("", "enterprise_switch"), "", false},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := New()
+			req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+			client.ChatHeaders(req, testCase.account, "", ChatMeta{})
+
+			if got := req.Header.Get("X-Auth-Method"); got != testCase.wantMethod {
+				t.Fatalf("X-Auth-Method=%q want %q", got, testCase.wantMethod)
+			}
+
+			info := req.Header.Get("X-Userinfo")
+			if !testCase.wantInfo {
+				if info != "" {
+					t.Fatalf("personal account must not send X-Userinfo: %s", info)
+				}
+
+				return
+			}
+
+			raw, err := base64.StdEncoding.DecodeString(info)
+			if err != nil {
+				t.Fatalf("X-Userinfo base64: %v", err)
+			}
+
+			var payload map[string]any
+			if err := json.Unmarshal(raw, &payload); err != nil {
+				t.Fatalf("X-Userinfo json: %v", err)
+			}
+
+			if payload["uin"] != "u1" || payload["owner_uin"] != "ent-1" {
+				t.Fatalf("X-Userinfo=%v", payload)
+			}
+
+			if testCase.wantMethod != "" && payload["token_source"] != testCase.wantMethod {
+				t.Fatalf("token_source=%v want %s", payload["token_source"], testCase.wantMethod)
+			}
+		})
+	}
+}
+
+// TestChatHeadersNoAcceptLanguage chat 路径不发 Accept-Language；billing 仍按 realm 带。
+func TestChatHeadersNoAcceptLanguage(t *testing.T) {
+	t.Parallel()
+
 	client := New()
+	acct := &auth.Auth{UID: "u1", AccessToken: "at"}
+
 	req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
-	client.ChatHeaders(req, makeAuth("ent-1", "enterprise_switch"), "", ChatMeta{})
-
-	if got := req.Header.Get("X-Auth-Method"); got != "enterprise_switch" {
-		t.Fatalf("X-Auth-Method=%q", got)
+	client.ChatHeaders(req, acct, "", ChatMeta{})
+	if got := req.Header.Get("Accept-Language"); got != "" {
+		t.Fatalf("chat Accept-Language=%q want empty", got)
 	}
 
-	raw, err := base64.StdEncoding.DecodeString(req.Header.Get("X-Userinfo"))
-	if err != nil {
-		t.Fatalf("X-Userinfo base64: %v", err)
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		t.Fatalf("X-Userinfo json: %v", err)
-	}
-
-	if payload["uin"] != "u1" || payload["owner_uin"] != "ent-1" || payload["token_source"] != "enterprise_switch" {
-		t.Fatalf("X-Userinfo=%v", payload)
-	}
-
-	personal, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
-	client.ChatHeaders(personal, makeAuth("", ""), "", ChatMeta{})
-
-	if personal.Header.Get("X-Userinfo") != "" || personal.Header.Get("X-Auth-Method") != "" {
-		t.Fatalf("personal account must not send identity headers: %v", personal.Header)
+	billing, _ := http.NewRequest(http.MethodPost, "https://example.invalid/billing", http.NoBody)
+	client.BillingHeaders(billing, acct)
+	if got := billing.Header.Get("Accept-Language"); got != "zh-CN" {
+		t.Fatalf("billing Accept-Language=%q want zh-CN", got)
 	}
 }

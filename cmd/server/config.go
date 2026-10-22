@@ -307,6 +307,10 @@ type Config struct {
 		LocalWebTools bool `json:"local_web_tools"`
 		// LocalWebToolRounds 本地工具最多代跑轮数；<=0 回落 3，>8 钳到 8。
 		LocalWebToolRounds int `json:"local_web_tool_rounds"`
+		// ConversationRequestBody 在当前轮最后一条 user 消息写
+		// conversationRequestId / startsNewUserRequest（issue #249）。默认 false：
+		// 官方桌面端形态，先用真实账号小流量 A/B 确认上游接受后再开启。
+		ConversationRequestBody bool `json:"conversation_request_body"`
 	} `json:"features"`
 
 	Prompt struct {

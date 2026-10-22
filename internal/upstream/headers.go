@@ -170,9 +170,9 @@ func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	req.Header.Set("User-Agent", c.userAgent(account2))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-Codebuddy-Request", "1")
-	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
-	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
-	req.Header.Set("Accept-Language", acceptLanguageFor(account2))
+	// chat/通用 API 不发 Accept-Language：官方 chat 路径没有该头（只有 billing/
+	// account 分页按 locale 带，见 BillingHeaders）。为「看起来像浏览器」补该头反而
+	// 增加非官方指纹（issue #249）。
 	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
 	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
 	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
@@ -479,7 +479,9 @@ func (c *Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 	method := account.TokenSource()
 
 	enterprise := strings.TrimSpace(account.EnterpriseID)
-	if enterprise == "" && method == "" {
+	// 判据只看企业身份：token_source 描述 token 来路，不是账号身份。个人号即使
+	// auth 文件残留 token_source 也不得注入身份头（issue #248，抓包级证据）。
+	if enterprise == "" {
 		return
 	}
 
@@ -487,11 +489,7 @@ func (c *Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 		req.Header.Set("X-Auth-Method", method)
 	}
 
-	payload := map[string]any{"uin": account.UID}
-	if enterprise != "" {
-		payload["owner_uin"] = enterprise
-	}
-
+	payload := map[string]any{"uin": account.UID, "owner_uin": enterprise}
 	if method != "" {
 		payload["token_source"] = method
 	}
