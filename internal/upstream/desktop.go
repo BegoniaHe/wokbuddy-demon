@@ -316,14 +316,18 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 // DesktopChatSequence 构造一次「桌面端成功对话」的完整事件链
 // （agent_task_created → chat_message_send → chat_request_send →
 // chat_message_response(isSuccessful) → chat_message_status → chat_request_response）。
-// 实测该链点亮 RichMeow_Chat。conversationID/requestID/messageID 由调用方生成。
+// 实测该链点亮 RichMeow_Chat。conversationID/requestID/messageID 由调用方生成；
+// messageID 是用户消息 id，助手消息必须另有独立 id（原实现用 `<messageID>-assistant`，
+// 改成 UUID 后不能复用同一值，否则两条消息在后台落到同一个 messageId）。
 func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelName string) []DesktopEvent {
+	assistantMessageID := session.NewUUIDv7Hex()
+
 	return []DesktopEvent{
 		desktopTaskCreated(conversationID, messageID, modelID, modelName),
-		desktopMessageSend(conversationID, requestID, messageID),
+		desktopMessageSend(conversationID, requestID, assistantMessageID),
 		desktopRequestSend(conversationID, requestID),
-		desktopMessageResponse(conversationID, requestID, messageID, modelID),
-		desktopMessageStatus(conversationID, requestID, messageID),
+		desktopMessageResponse(conversationID, requestID, assistantMessageID, modelID),
+		desktopMessageStatus(conversationID, requestID, assistantMessageID),
 		desktopRequestResponse(conversationID, requestID),
 	}
 }

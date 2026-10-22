@@ -191,6 +191,29 @@ func TestDesktopChatSequenceShape(t *testing.T) {
 	}
 }
 
+// TestDesktopChatSequenceAssistantMessageID 助手消息必须使用独立于用户消息的
+// UUIDv7 messageId，并在 send/response/status 三个事件间保持一致。
+func TestDesktopChatSequenceAssistantMessageID(t *testing.T) {
+	t.Parallel()
+
+	events := DesktopChatSequence("conv-1", "req-1", "user-msg", "fast-model", "fast-model")
+
+	assistantID, _ := events[1]["messageId"].(string)
+	if !uuidV7HeaderPattern.MatchString(assistantID) {
+		t.Fatalf("assistant messageId=%q want UUIDv7", assistantID)
+	}
+
+	if assistantID == events[0]["messageId"] {
+		t.Fatalf("assistant messageId 复用了用户消息 id: %q", assistantID)
+	}
+
+	for _, i := range []int{3, 4} {
+		if got := events[i]["messageId"]; got != assistantID {
+			t.Errorf("events[%d].messageId=%v want %q", i, got, assistantID)
+		}
+	}
+}
+
 // TestSetAppearanceTheme 断言主题设置端点形状（点亮 Hp_Appearance 的 API）。
 func TestSetAppearanceTheme(t *testing.T) {
 	t.Parallel()
