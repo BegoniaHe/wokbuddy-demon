@@ -47,14 +47,14 @@ func (c *Client) BlackcatNeed(a *auth.Auth) (int64, error) {
 }
 
 // RunNightChats 夜猫子：发 need 次 glm-5.2 真实对话（读干流）并上报事件链。
-// 返回成功次数。对话内容极短（1+1），消耗可忽略。
+// 返回成功次数。每次从内置短问句池抽一条，避免固定 user 内容形成指纹。
 func (c *Client) RunNightChats(account *auth.Auth, need int) (int64, error) {
 	var ok int64
 
 	for i := range need {
 		body, merr := json.Marshal(map[string]any{
 			"model":    "glm-5.2",
-			"messages": []map[string]any{{"role": "user", "content": "1+1等于几？直接回答。"}},
+			"messages": []map[string]any{{"role": "user", "content": pickChatQuestion()}},
 			"stream":   true,
 		})
 		if merr != nil {
