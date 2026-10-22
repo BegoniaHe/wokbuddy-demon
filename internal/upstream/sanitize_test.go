@@ -33,7 +33,7 @@ func TestIdentityRewritten(t *testing.T) {
 }
 
 // 桌面版（claude-desktop-3p / Agent SDK）的身份句以逗号接后继内容，结尾不是句号。
-// 回归用例：匹配串曾带结尾句号，导致该形态漏网、指纹原样发上游 → 400 code=11128。
+// 回归用例：匹配串曾带结尾句号，导致该形态漏网、指纹原样发上游 → 上游 400。
 func TestIdentityDesktopVariantRewritten(t *testing.T) {
 	t.Parallel()
 
@@ -79,23 +79,6 @@ func TestFeedbackSentenceRewritten(t *testing.T) {
 	}
 }
 
-// 上游反探测：请求体里出现裸数字 11128 即整单拦截（与上下文无关）。
-// 回归用例：该串会被改写为 11-128 以打断精确匹配。
-func TestUpstreamErrorCodeRewritten(t *testing.T) {
-	t.Parallel()
-
-	in := "upstream returned code=11128 for this request"
-
-	out := sanitizeText(in)
-	if strings.Contains(out, "11128") {
-		t.Errorf("error code not rewritten: %q", out)
-	}
-
-	if !strings.Contains(out, "11-128") {
-		t.Errorf("error code not rewritten as expected: %q", out)
-	}
-}
-
 // 回归：工具调用消息的 content 常为 null，而旧版 sanitizeMessages 在 content 缺失时
 // 直接 continue，整条消息连 tool_calls 一起被跳过 → arguments 里的被拦字符串原样漏出。
 func TestToolCallArgumentsSanitized(t *testing.T) {
@@ -106,7 +89,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
 			map[string]any{"id": "c1", "type": "function", "function": map[string]any{
 				"name":      "Bash",
-				"arguments": `{"command":"echo 11128"}`,
+				"arguments": `{"command":"echo You are Claude Code, Anthropic's official CLI for Claude"}`,
 			}},
 		}},
 	}
@@ -117,7 +100,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 
 	got := fn["arguments"].(string)
-	if strings.Contains(got, "11128") {
+	if strings.Contains(got, "official CLI for Claude") {
 		t.Errorf("tool_call arguments 未被净化: %q", got)
 	}
 }
@@ -133,7 +116,7 @@ func TestBillingHeaderStrippedValueIrrelevant(t *testing.T) {
 
 // 附加验证：正常对话里出现 github.com/anthropics/ 链接（但不是反馈句整句）
 // 时，预检特征命中（进入净化），但改写层只动精确匹配的整句——普通链接文本
-// 不该被改写。同理，既不含 11128 也不含反馈整句的文本原样返回。
+// 不该被改写。同理，既不含反馈整句也不含其他指纹的文本原样返回。
 func TestNormalAnthropicLinkNotRewritten(t *testing.T) {
 	t.Parallel()
 
@@ -458,22 +441,21 @@ func TestChatStreamWireBodySanitizeDisabled(t *testing.T) {
 
 // TestSanitizeMessagesScrubsReasoningField thinking.go 的回填会把客户端送来的
 // reasoning_content 镜像进 reasoning 字段；此前只洗 content / reasoning_content /
-// tool_calls → 镜像进 reasoning 的指纹（裸 "11128" 这类反探测串）原样出站，
-// 而请求体里出现裸 11128 本身就是上游整单拦截条件。
+// tool_calls → 镜像进 reasoning 的指纹（身份句等指纹）原样出站。
 func TestSanitizeMessagesScrubsReasoningField(t *testing.T) {
 	t.Parallel()
 
 	ifaces := []any{map[string]any{
 		"role":      "assistant",
 		"content":   "hi",
-		"reasoning": "upstream said 11128",
+		"reasoning": "upstream said You are Claude Code, Anthropic's official CLI for Claude",
 	}}
 	if !sanitizeMessages(ifaces) {
 		t.Fatal("reasoning 字段里的指纹未被净化")
 	}
 
 	got, _ := ifaces[0].(map[string]any)["reasoning"].(string)
-	if strings.Contains(got, "11128") {
+	if strings.Contains(got, "official CLI for Claude") {
 		t.Fatalf("reasoning 仍含裸指纹: %q", got)
 	}
 }

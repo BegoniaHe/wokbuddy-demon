@@ -20,14 +20,13 @@ var sanitizeFeatures = []string{
 	"DeepSeek Harness",           // DSH 身份句品牌词：上游按非官方渠道整单拦
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
-	"11128",                                           // 上游反探测：裸数字错误码
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
 var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
 
 // sanitizeBareHdrRe 兜底层：裸键名（无冒号无值）同样是指纹——2026-09-13 实验 F4
-// 证实 assistant 消息里反引号引用裸键名即触发 11128，而剥离层要求冒号、对裸串无效。
+// 证实 assistant 消息里反引号引用裸键名即触发上游 400，而剥离层要求冒号、对裸串无效。
 // 键值形态被整段删除后，残留的裸键名做最小缩写（header→hdr）：破坏逐字匹配、
 // 语义不变、保留可读性。大小写不敏感，覆盖 X-Anthropic-... 变体。
 //
@@ -44,7 +43,7 @@ var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
 // 身份句的匹配串**不带结尾标点**（只到 "…for Claude" 为止）：
 // CLI 版这句以句号收尾（"…for Claude."），桌面版（claude-desktop-3p / Agent SDK）
 // 以逗号接后继内容（"…for Claude, running within the Claude Agent SDK."）。
-// 带句号的整句只匹配前者，桌面版会漏网、指纹原样发上游 → 400 code=11128。
+// 带句号的整句只匹配前者，桌面版会漏网、指纹原样发上游 → 上游 400。
 // 去掉结尾标点后两种形态一并覆盖（替换串同样不带标点，让原有标点原样保留）。
 // 注意仍要求 "You are Claude Code, " 前缀，不做更宽的子串替换，
 // 以免误伤 TestExactMatchOnlyVariantNotTouched 所保护的零散文本。
@@ -72,16 +71,6 @@ var sanitizeRewrites = [][2]string{
 		// 实测需整句同时出现）。give→provide 一词之差即可绕过，语义不变。
 		"To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
 		"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
-	},
-	{
-		// 上游反探测：只要请求体里出现裸数字 11128 就整单拦截（与该数字的上下文无关——
-		// "code=11128" / 裸 "11128" / "错误码 11128" / "Code=11128" 全部命中；
-		// 相邻的 11148 / 11101 / 11115 / 99999 均放行）。11128 正是本类拦截自身的错误码，
-		// 上游据此识别"在讨论/回显其内部错误码"的请求。
-		// 代价：用户对话中任何 11128 都会被改写——但这串数字出现在请求里本身就是拦截条件，
-		// 不改写必然失败。插入连字符保留可读性与指代（零宽空格无效，实测上游会归一化）。
-		"11128",
-		"11-128",
 	},
 }
 
@@ -224,7 +213,7 @@ func sanitizeMessages(messages []any) bool {
 		// reasoning：另一形态的思维链字段。thinking.go 的回填会把客户端送来的
 		// reasoning_content 镜像进 reasoning（反之亦然），而此前只洗 content /
 		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
-		// 裸 "11128" 这种反探测串同样致命。
+		// 身份句等指纹同样致命。
 		if sanitizeStringField(m, "reasoning") {
 			changed = true
 		}
