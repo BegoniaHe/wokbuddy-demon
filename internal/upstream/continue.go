@@ -32,11 +32,12 @@ type TextContinueReader struct {
 	firstID  string
 	firstMdl string
 
-	finishLength bool
-	continued    bool
-	continuation bool
-	done         bool
-	err          error
+	finishLength  bool
+	continueTried bool
+	continued     bool
+	continuation  bool
+	done          bool
+	err           error
 }
 
 // NewTextContinueReader 包装上游流。initialText 是 ProbeStream 已消费的正文。
@@ -62,10 +63,17 @@ func (c *TextContinueReader) Read(dst []byte) (int, error) {
 			return 0, io.EOF
 		}
 
+		readerBefore := c.reader
 		line, err := c.reader.ReadString('\n')
 		c.handleLine(line)
 
 		if err != nil {
+			// handleLine 内已成功切到续写流时，旧 reader 的 EOF/读错误不得终止新的
+			// 读取循环：否则续写段会被直接丢弃（无尾随换行的 [DONE] 尤其常见）。
+			if c.reader != readerBefore {
+				continue
+			}
+
 			c.handleEOF()
 
 			if err != io.EOF {
@@ -330,7 +338,15 @@ func (c *TextContinueReader) handleEOF() {
 
 // tryContinue 发起一次续写。成功则切换 reader；失败则补发暂存的 length 帧。
 func (c *TextContinueReader) tryContinue() bool {
-	// 工具调用不盲重试：参数分片可能未闭合，续写会拼出半截参数。
+	// 只尝试一次：失败后 held 里的 length 终态已经补发，若在 EOF 处再试会把
+	// 续写帧写到已经发出的 [DONE] 之后，并重复打上游。工具调用不盲重试：参数
+	// 分片可能未闭合，续写会拼出半截参数。
+	if c.continueTried {
+		return false
+	}
+
+	c.continueTried = true
+
 	if c.hasTool || c.open == nil || c.text.Len() == 0 {
 		c.flushHeld()
 
