@@ -50,6 +50,14 @@ interface LogEntry {
   ch?: string;
 }
 
+interface ErrorSummaryRow {
+  account?: string;
+  type?: string;
+  count?: number;
+  last_at?: string;
+  sample?: string;
+}
+
 interface RequestMetrics {
   completed?: number;
   success_rate?: number;
@@ -99,6 +107,12 @@ export function LogsView() {
   const logsQ = useQuery({
     queryKey: ['logs'],
     queryFn: () => api<{ entries?: LogEntry[] }>('logs'),
+    refetchInterval: 5000,
+  });
+
+  const errSummaryQ = useQuery({
+    queryKey: ['error_summary'],
+    queryFn: () => api<{ entries?: ErrorSummaryRow[] }>('error_summary'),
     refetchInterval: 5000,
   });
 
@@ -295,6 +309,48 @@ export function LogsView() {
                       <Tag tone={chTone(entry.delta)}>{chDelta(entry.delta)}</Tag>
                     </TableCell>
                     <TableCell className="text-right font-mono tabular-nums">{entry.remain ?? '—'}</TableCell>
+                  </TableRow>
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </Card>
+
+      <Card className="mt-5">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
+          <CardTitle>
+            错误汇总
+            <span className="ml-1.5 text-2xs font-normal text-muted-foreground">按账号 × 类型聚合当前日志环</span>
+          </CardTitle>
+          <CardAction>
+            <span className="text-xs text-muted-foreground">{(errSummaryQ.data?.entries || []).length} 组</span>
+          </CardAction>
+        </CardHeader>
+        <div className="overflow-x-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>账号</TableHead>
+                <TableHead>类型</TableHead>
+                <TableHead className="text-right">次数</TableHead>
+                <TableHead>最近</TableHead>
+                <TableHead>样例</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {(errSummaryQ.data?.entries || []).length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={5} className="py-8 text-center text-muted-foreground">暂无错误聚合</TableCell>
+                </TableRow>
+              ) : (
+                (errSummaryQ.data?.entries || []).slice(0, 12).map((row, i) => (
+                  <TableRow key={(row.account || '-') + '|' + (row.type || '') + '|' + i}>
+                    <TableCell className="font-mono text-xs">{row.account || '-'}</TableCell>
+                    <TableCell><Tag tone="warn">{row.type || 'failure'}</Tag></TableCell>
+                    <TableCell className="text-right font-mono tabular-nums">{row.count || 0}</TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">{fmtClockTime(row.last_at) || '—'}</TableCell>
+                    <TableCell className="max-w-[520px] truncate text-xs text-muted-foreground" title={row.sample}>{row.sample || '—'}</TableCell>
                   </TableRow>
                 ))
               )}

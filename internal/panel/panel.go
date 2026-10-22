@@ -227,6 +227,7 @@ func (p *Panel) routesPages() {
 	p.mux.HandleFunc("GET /panel/{path...}", p.asset)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/error_summary", p.withAuth(p.errorSummaryHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("GET /panel/api/audit", p.withAuth(p.auditList))
@@ -546,6 +547,10 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if len(out) > 0 {
+		p.attachModelBusy(out, &fetchErrs)
+	}
+
 	if len(out) == 0 {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
@@ -557,7 +562,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out, "fetch_errors": fetchErrs})
 }
 
 // collectCNModels 查 CN 域模型：无可用 CN 账号或账号缺失时返回空；查询失败返回
