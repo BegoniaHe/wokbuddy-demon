@@ -81,6 +81,9 @@ git clone https://github.com/BegoniaHe/wokbuddy-demon.git
 cd wokbuddy-demon
 
 cp config.example.json config.json
+
+# 客户端指纹快照：data/client-profiles/cn.json 必需，启用 global 时再加
+# global.json；用 reverse-workbuddy 技能从官方 Win32 分发包生成，缺失会拒绝启动
 docker compose up -d --build
 ```
 
