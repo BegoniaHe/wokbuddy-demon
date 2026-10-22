@@ -37,6 +37,8 @@ export interface Account {
   credits_total?: number;
   success_count?: number;
   err_total?: number;
+  session_dead_fails?: number;
+  session_dead_suspect?: boolean;
   in_flight?: number;
   last_success?: string;
   rate_limited_models?: RateLimitRow[];

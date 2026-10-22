@@ -136,6 +136,12 @@ var autoActions = []autoAction{
 		run:      runExpertLighthouse,
 	},
 	{
+		TaskCode: "WorkBuddy_Valorant",
+		Desc:     "接受 Valorant 活动任务并按上游进度领奖（真实动作链待活动抓包确认）",
+		Attempt:  true,
+		run:      runValorant,
+	},
+	{
 		TaskCode: "black_cat",
 		Desc:     "夜猫子：23:00–08:00（CST）窗口内 glm-5.2 对话补足（窗口外提示稍后再试）",
 		Attempt:  true,
@@ -1095,6 +1101,17 @@ func runSkillFresh(panel7 *Panel, account16 *auth.Auth) (string, error) {
 	}
 
 	return "已上报真实对话 + skill_info 技能加载事件", nil
+}
+
+// runValorant 完成 WorkBuddy_Valorant（issue #257）。活动动作码/事件链尚无可核实的
+// 官方证据：这里只走规范 accept，随后由 autoRunAction 回读进度并在可领时自动领奖。
+// Attempt=true：上游未证实纯 API 可点亮，不伪造未验证的事件序列。
+func runValorant(panel *Panel, account *auth.Auth) (string, error) {
+	if err := panel.cfg.Upstream.AcceptTasks(account, []string{"WorkBuddy_Valorant"}); err != nil {
+		return "", fmt.Errorf("accept: %w", err)
+	}
+
+	return "已接受 WorkBuddy_Valorant 任务；未配置未经验证的动作事件，按上游进度领奖", nil
 }
 
 // runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。

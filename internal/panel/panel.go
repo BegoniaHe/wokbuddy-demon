@@ -243,6 +243,7 @@ func (p *Panel) routesAccounts() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy_slot", p.withAuth(p.accountProxySlot))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/travel", p.withAuth(p.accountTravel))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 }
 

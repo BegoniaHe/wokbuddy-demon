@@ -62,3 +62,22 @@ func TestTaskAccountLockCrossEntryShared(t *testing.T) {
 
 	panel.unlockAccount("u1")
 }
+
+// TestAutoActionValorantRegistered WorkBuddy_Valorant 进入动作表且标记为尝试型
+// （真实动作链未验证，issue #257）。
+func TestAutoActionValorantRegistered(t *testing.T) {
+	t.Parallel()
+
+	act := autoActionFor("WorkBuddy_Valorant")
+	if act == nil {
+		t.Fatal("WorkBuddy_Valorant must be registered")
+	}
+
+	if !act.Attempt {
+		t.Fatal("Valorant action must be marked as attempt-only until verified")
+	}
+
+	if act.run == nil {
+		t.Fatal("Valorant action run must be set")
+	}
+}

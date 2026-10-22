@@ -587,3 +587,41 @@ func TestTravelDayAlignsCST(t *testing.T) {
 		}
 	}
 }
+
+// TestRunTravelNowForSingleAccount 按号旅行只跑目标账号，并复用 disabled/paused 门控。
+func TestRunTravelNowForSingleAccount(t *testing.T) {
+	t.Parallel()
+	fastTravel(t)
+
+	stub := &travelStub{buddy: "null"}
+	srv := stub.server()
+	defer srv.Close()
+
+	s, state := newTravelScheduler(t, srv, "u1", "u2")
+	if !state.Pause("u2") {
+		t.Fatal("pause u2")
+	}
+
+	result := s.RunTravelNowFor("u1")
+	if !result.Ran || !result.OK {
+		t.Fatalf("result=%+v", result)
+	}
+
+	if got := stub.infoCalls.Load(); got != 1 {
+		t.Fatalf("infoCalls=%d want 1 (only target account)", got)
+	}
+
+	paused := s.RunTravelNowFor("u2")
+	if paused.Ran || paused.SkipReason == "" {
+		t.Fatalf("paused result=%+v", paused)
+	}
+
+	if got := stub.infoCalls.Load(); got != 1 {
+		t.Fatalf("paused account must not call upstream: infoCalls=%d", got)
+	}
+
+	missing := s.RunTravelNowFor("nope")
+	if missing.Ran || missing.SkipReason == "" {
+		t.Fatalf("missing result=%+v", missing)
+	}
+}
