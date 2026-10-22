@@ -18,6 +18,8 @@ describe('durationBad', () => {
     expect(durationBad('30m')).toBe(false);
     expect(durationBad('1h30m')).toBe(false);
     expect(durationBad('600s')).toBe(false);
+    // time.ParseDuration("0") 合法；时序整形把 "0" 作为关闭回滚值。
+    expect(durationBad('0')).toBe(false);
   });
   it('脏值标红', () => {
     expect(durationBad('abc')).toBe(true);
@@ -32,6 +34,7 @@ describe('collectConfig', () => {
   });
   it('覆盖型字段空串照发', () => {
     expect(collectConfig({ user_agent: '' })).toEqual({ upstream: { user_agent: '' } });
+    expect(collectConfig({ timing_salt: '' })).toEqual({ schedule: { timing_salt: '' } });
   });
   it('hours 字段拆分成数字数组', () => {
     expect(collectConfig({ checkin_hours: '9, 21' })).toEqual({ schedule: { checkin_hours: [9, 21] } });

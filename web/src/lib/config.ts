@@ -106,9 +106,12 @@ export const CFG_FIELD_BY_NAME: Record<string, FieldDef> = Object.fromEntries(
 );
 
 // 覆盖型文本字段：空串本身有意义（= 回落内置默认），必须照发。不含 api_key。
-export const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
+export const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'timing_salt']);
 
-export const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
+// Go 的 time.ParseDuration 接受裸 "0"（无单位）；配置里 "0" 是关闭时序整形的
+// 官方回滚值，前端不能把它当作脏值拦截。
+export const DURATION_RE = /^(0|(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+)$/;
+
 export const DURATION_FIELDS = new Set([
   'soft_rate',
   'soft_rate_max',
@@ -126,7 +129,7 @@ export const DURATION_FIELDS = new Set([
   'account_phase_window',
   'rotate_budget',
 ]);
-export const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
+export const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m；0 = 关闭';
 
 export type FieldValue = string | boolean;
 
