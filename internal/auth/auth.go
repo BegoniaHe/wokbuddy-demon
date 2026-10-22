@@ -317,17 +317,9 @@ func (a *Auth) IsEnterpriseSession() bool {
 // 「读不到即非企业切换会话」（宁可多发一次请求，也不误跳过真实任务）。
 // 解码容错与 realmFromIssuer 同口径（RawURLEncoding 失败再试带 padding 形态）。
 func (a *Auth) jwtTokenSource() string {
-	parts := strings.Split(a.AccessTokenValue(), ".")
-	if len(parts) < 2 {
+	payload, ok := jwtPayload(a.AccessTokenValue())
+	if !ok {
 		return ""
-	}
-
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		payload, err = base64.URLEncoding.DecodeString(parts[1])
-		if err != nil {
-			return ""
-		}
 	}
 
 	var claims struct {
@@ -339,6 +331,33 @@ func (a *Auth) jwtTokenSource() string {
 	}
 
 	return strings.TrimSpace(claims.TokenSource)
+}
+
+// jwtPayload 解出 JWT 的 payload（base64url 第二段），不校验签名。
+//
+// 用 Cut 定位第二段而不是 Split：Split 会为一次性取中段分配整个 []string；
+// 第二段之后即使还有 "." 也属于签名，直接忽略。
+func jwtPayload(token string) ([]byte, bool) {
+	_, rest, ok := strings.Cut(token, ".")
+	if !ok {
+		return nil, false
+	}
+
+	if i := strings.IndexByte(rest, '.'); i >= 0 {
+		rest = rest[:i]
+	}
+
+	payload, err := base64.RawURLEncoding.DecodeString(rest)
+	if err == nil {
+		return payload, true
+	}
+	// 容错：部分实现带 padding。
+	payload, err = base64.URLEncoding.DecodeString(rest)
+	if err != nil {
+		return nil, false
+	}
+
+	return payload, true
 }
 
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
@@ -354,18 +373,9 @@ func isGlobalDomain(d string) bool {
 // 仅解 payload（base64url 第二段），不做签名校验——本项只用于缺 realm/domain 时的
 // 路由兜底，安全默认是「未知即不判 global」。解码 / 解析失败静默返回空串，不吞调用方错误。
 func realmFromIssuer(accessToken string) string {
-	parts := strings.Split(accessToken, ".")
-	if len(parts) < 2 {
+	payload, ok := jwtPayload(accessToken)
+	if !ok {
 		return ""
-	}
-
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		// 容错：部分实现带 padding。
-		payload, err = base64.URLEncoding.DecodeString(parts[1])
-		if err != nil {
-			return ""
-		}
 	}
 
 	var claims struct {

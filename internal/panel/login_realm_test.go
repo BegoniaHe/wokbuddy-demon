@@ -23,7 +23,9 @@ func TestLoginEndpoints(t *testing.T) {
 		t.Run(item.realm, func(t *testing.T) {
 			t.Parallel()
 
-			st, tok, acct, origin := loginEndpoints(item.realm)
+			ep := loginCandidates(item.realm)[0]
+
+			st, tok, acct, origin := ep.state, ep.token, ep.account, ep.origin
 			if st != item.wantState {
 				t.Errorf("realm=%q state=%q want %q", item.realm, st, item.wantState)
 			}

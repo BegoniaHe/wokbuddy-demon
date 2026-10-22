@@ -370,17 +370,6 @@ type anthropicConversion struct {
 	options anthropicResponseOptions
 }
 
-// anthropicToOpenAI 把 Anthropic Messages 请求转换为 OpenAI chat/completions 请求体。
-// 返回转换后的 body、原始模型名与 stream 标志。
-func anthropicToOpenAI(body []byte) ([]byte, string, bool, error) {
-	converted, err := anthropicConvert(body)
-	if err != nil {
-		return nil, "", false, err
-	}
-
-	return converted.openAI, converted.model, converted.stream, nil
-}
-
 // anthropicConvert 转换请求体并保留响应编码选项。
 func anthropicConvert(body []byte) (anthropicConversion, error) {
 	req, err := decodeAnthropicRequest(body)
@@ -1803,11 +1792,6 @@ func (r *anthropicResponder) Stream(rc io.Reader, hint func(string) string, repa
 	return nil
 }
 
-// anthropicMessageFromOpenAI 把聚合后的 OpenAI chat.completion 转为 Anthropic Message。
-func anthropicMessageFromOpenAI(body any, model string) map[string]any {
-	return anthropicMessageFromOpenAIWithOptions(body, model, anthropicResponseOptions{})
-}
-
 // anthropicMessageFromOpenAIWithOptions 按请求选项编码非流式响应。
 func anthropicMessageFromOpenAIWithOptions(
 	body any, model string, options anthropicResponseOptions,
@@ -2080,10 +2064,6 @@ type anthropicStreamWriter struct {
 	cachedTokens    int
 	cacheWrite      int
 	reasoningTokens int
-}
-
-func newAnthropicStreamWriter(w http.ResponseWriter, model string) *anthropicStreamWriter {
-	return newAnthropicStreamWriterWithOptions(w, model, anthropicResponseOptions{})
 }
 
 func newAnthropicStreamWriterWithOptions(

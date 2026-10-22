@@ -631,6 +631,13 @@ func configureUpstream(cfg *Config, client *upstream.Client) {
 	}
 
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
+
+	globalState := "启用"
+	if !auth.GlobalEnabled() {
+		globalState = "禁用（纯 CN 逃生门）"
+	}
+
+	log.Printf("global realm 路由：%s", globalState)
 	// model.json 本地缓存接线（context_length/max_output_tokens 四级查找链第 3 级）：
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
@@ -1078,7 +1085,7 @@ func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
 	return cur
 }
 
-// mergedJSON 把合并后的 map 序列化回 JSON（供 ParseConfig 校验）。
+// mergedJSON 把合并后的 map 序列化回 JSON（供 parseConfigWithEnv 校验）。
 func mergedJSON(m map[string]any) []byte {
 	b, err := json.Marshal(m)
 	if err != nil {

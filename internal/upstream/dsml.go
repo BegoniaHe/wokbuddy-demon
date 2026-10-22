@@ -40,6 +40,7 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -419,6 +420,12 @@ func parseMarkupParams(body string) (string, bool) {
 // 两个来源都为空 → 返回 nil，由调用方决定是否启用弱判定（见 NewMarkupRepair）。
 // 解析失败按空处理（不编造名单）。
 func ToolNameAllowlist(body []byte) map[string]bool {
+	// 快速预检：工具名只可能来自这几个键；一个都不出现时无需反序列化整个请求体
+	// （纯文本闲聊/无工具请求在长上下文下省一次全量 JSON 解析）。
+	if !containsAny(body, toolNameMarkers) {
+		return nil
+	}
+
 	var req toolNameRequest
 	if json.Unmarshal(body, &req) != nil {
 		return nil
@@ -433,6 +440,25 @@ func ToolNameAllowlist(body []byte) map[string]bool {
 	}
 
 	return names
+}
+
+// toolNameMarkers 工具名相关键的字面量预检集合。取公共前缀（"tool / "function）
+// 覆盖 tools/functions/tool_calls/function_call 四种键，少扫两遍长 body。
+var toolNameMarkers = [][]byte{
+	[]byte(`"tool`),
+	[]byte(`"function`),
+}
+
+// containsAny 报告 body 是否包含任一 marker（非精确 JSON 键匹配：命中即进入完整
+// 解析，宁可多解一次也不漏工具名）。
+func containsAny(body []byte, markers [][]byte) bool {
+	for _, marker := range markers {
+		if bytes.Contains(body, marker) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // toolNameRequest 工具名收集用的请求体形态。

@@ -10,7 +10,7 @@ import (
 
 // TestNormalizeRoles 验证出站请求体把 developer 角色归一为 system。
 // 上游 role 白名单不含 developer（OpenAI 新规范的 system 别名），
-// 命中即 HTTP 400 code=11128；此处走 PrepareBodyOptWithEfforts 全链路断言。
+// 命中即 HTTP 400 code=11-128；此处走 PrepareBodyOptWithEfforts 全链路断言。
 func TestNormalizeRoles(t *testing.T) {
 	t.Parallel()
 

@@ -8,6 +8,7 @@
 package session
 
 import (
+	"bytes"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,38 +18,6 @@ import (
 	"slices"
 	"strings"
 )
-
-// ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
-// 复用 ExtractKey 的识别顺序：metadata 优先、snake 优先于 camel）。
-// 与 ExtractKey 的差异：**只认 conversationId，绝不回落 user_id**——X-Conversation-ID
-// 语义是"对话 ID"，user_id 回落会污染后台按对话聚合的判据。
-// 缺失返回 ""（不伪造：透传客户端原值优先，客户端没给就不发）。
-func ResolveConversationID(body []byte) string {
-	if len(body) == 0 {
-		return ""
-	}
-
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return ""
-	}
-
-	if meta, ok := obj["metadata"].(map[string]any); ok {
-		if v := strOrEmpty(meta["conversation_id"]); v != "" {
-			return v
-		}
-
-		if v := strOrEmpty(meta["conversationId"]); v != "" {
-			return v
-		}
-	}
-
-	if v := strOrEmpty(obj["conversation_id"]); v != "" {
-		return v
-	}
-
-	return strOrEmpty(obj["conversationId"])
-}
 
 // NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
 // X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败（理论上不可能）时回落
@@ -86,11 +55,18 @@ func RequestIDForKey(key string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// turnMessage TurnKey 只读 role 与 content：content 用 bodyRaw 直接引用请求体
+// 子切片，避免为每条消息复制一份 content（长上下文下可达几十 KB）。
+type turnMessage struct {
+	Role    string  `json:"role"`
+	Content bodyRaw `json:"content"`
+}
+
 // TurnKey 派生「对话轮级」聚合键：body 里**最后一条** role=="user" 消息的
 // 「序号 + 文本」。
 //
 // 为什么需要它：无会话键的客户端（OpenAI 兼容协议——dsh / Codex / Cherry Studio
-// 等的请求体里既无 conversationId 也无 metadata 键）会让 ExtractKey 恒返回空串，
+// 等的请求体里既无 conversationId 也无 metadata 键）会让 ExtractSession 的会话键恒为空，
 // 会话头族的聚合主键便只能逐请求新生成，agent 多轮在上游用量明细里仍是一条请求
 // 一条记录。本函数给这类客户端一个**不依赖客户端配合**的轮级键：一次用户发送内的
 // 所有上游调用（tool call 多轮 / 换号重试 / 降级重发）body 里最后一条 user 消息
@@ -109,10 +85,7 @@ func TurnKey(body []byte) string {
 	}
 
 	var obj struct {
-		Messages []struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
+		Messages []turnMessage `json:"messages"`
 	}
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return ""
@@ -148,26 +121,26 @@ func TurnKey(body []byte) string {
 // 无可签名内容（空 / null / 空数组 / 纯文本 part 全为空串）返回 ""（不伪造——
 // 调用方回落原有的空键语义）。TurnKey 与 firstUserText（粘性兜底）共用本函数，
 // 两条链路的图片盲区一并修复。
-func contentSignature(raw json.RawMessage) string {
-	str2 := strings.TrimSpace(string(raw))
-	if str2 == "" || str2 == "null" {
+func contentSignature(raw []byte) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || (len(trimmed) == 4 && trimmed[0] == 'n') { // 空 / null
 		return ""
 	}
 	// 字符串形态：纯文本路径签名 == contentText 结果（键值零漂移）。
-	if str2[0] == '"' {
+	if trimmed[0] == '"' {
 		var str string
-		if err := json.Unmarshal(raw, &str); err != nil {
+		if err := json.Unmarshal(trimmed, &str); err != nil {
 			return ""
 		}
 
 		return str
 	}
 
-	if str2[0] != '[' {
+	if trimmed[0] != '[' {
 		return ""
 	}
 	// 非文本 part：type + 原文 sha256 前 8 hex（超长 data: URL 只入短摘要）。
-	return partsSignature(raw, func(typeName string, rawPart json.RawMessage) string {
+	return partsSignature(json.RawMessage(trimmed), func(typeName string, rawPart json.RawMessage) string {
 		sum := sha256.Sum256(rawPart)
 		return "\n[" + typeName + ":" + hex.EncodeToString(sum[:4]) + "]\n"
 	})
@@ -176,7 +149,7 @@ func contentSignature(raw json.RawMessage) string {
 // partsSignature 对多模态 parts 数组做确定性签名：文本 part（type 为 "" 或 "text"）
 // 按原文无缝拼接（与 contentText 完全同口径——全文本 part 的数组签名 == contentText
 // 结果，存量键零漂移）；非文本 part 的渲染交由 renderNonText（各调用方口径不同，
-// 见 contentSignature / userContentSignature）。存在非文本 part 时对整体结果
+// 见 contentSignature / userContentSignatureRaw）。存在非文本 part 时对整体结果
 // TrimSpace。json 解析失败返回 ""（不伪造）。
 func partsSignature(raw json.RawMessage, renderNonText func(typeName string, rawPart json.RawMessage) string) string {
 	var parts []json.RawMessage

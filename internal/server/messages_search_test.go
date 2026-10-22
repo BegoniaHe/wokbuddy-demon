@@ -380,6 +380,34 @@ func TestSearchForwardsSessionHeaders(t *testing.T) {
 	}
 }
 
+// TestSearchEmitsConversationHeaderFallback 入站没带会话头时，搜索出站仍须带
+// X-Conversation-Id（上游渠道校验要求恒在），由聚合请求 ID 兜底。
+func TestSearchEmitsConversationHeaderFallback(t *testing.T) {
+	t.Parallel()
+
+	var got http.Header
+
+	handler, _ := searchTestHandler(t, true, func(r *http.Request) (int, string) {
+		got = r.Header.Clone()
+
+		return http.StatusOK, searchOKBody
+	})
+
+	rec := doSearchRequest(t, handler, `{"model":"glm-5.2","messages":[{"role":"user","content":"golang"}],"tools":[{"name":"web_search"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if got.Get("X-Conversation-Id") == "" {
+		t.Fatal("outbound X-Conversation-Id is empty")
+	}
+
+	if got.Get("X-Conversation-Id") != got.Get("X-Conversation-Request-Id") {
+		t.Fatalf("X-Conversation-Id=%q want request-id %q",
+			got.Get("X-Conversation-Id"), got.Get("X-Conversation-Request-Id"))
+	}
+}
+
 // TestSearchDoesNotShadowMessages /v1/messages 不受影响（仍是既有 Anthropic 入站）。
 func TestSearchDoesNotShadowMessages(t *testing.T) {
 	t.Parallel()

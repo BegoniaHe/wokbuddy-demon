@@ -613,13 +613,6 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
-// uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
-//
-// 实现委托 logfmt.UID8，避免 "截 8 位" 的规则在 server 与 logfmt 两处各写一份而走样。
-func uidPrefix(uid string) string {
-	return logfmt.UID8(uid)
-}
-
 type requestTraceKey struct{}
 
 // requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
@@ -662,12 +655,10 @@ func (t *requestTrace) captureClientInfo(r *http.Request, trusted []*net.IPNet) 
 
 // clientIPForLog 提取用于日志展示的客户端 IP。
 //
-// 与透传上游的口径不同：后者只认代理头（X-Forwarded-For 首段 →
-// X-Real-IP），因为它的用途是把客户端 IP **透传给上游**，回落到网关自身地址会
-// 污染上游风控判据。日志场景相反：只有 TCP 对端属于配置的可信反代网段时才采信
-// 转发头，否则一律用 RemoteAddr——否则任何客户端都能用伪造的 X-Forwarded-For
-// 污染请求日志与审计记录。对端地址解析失败时保持空串（面板显示 "-"），
-// 不再回落到可伪造的代理头。
+// 与透传上游同一口径（httpauth.ClientIP）：只有 TCP 对端属于配置的可信反代
+// 网段时才采信转发头，否则一律用 RemoteAddr——否则任何客户端都能用伪造的
+// X-Forwarded-For 污染请求日志与审计记录。对端地址解析失败时保持空串
+// （面板显示 "-"）。
 func clientIPForLog(r *http.Request, trusted []*net.IPNet) string {
 	return httpauth.ClientIP(r, trusted)
 }
@@ -794,17 +785,6 @@ const (
 	chatTokWidth  = 6
 	chatRateWidth = 11 // 形如 "183.6tok/s"
 )
-
-// logChatRow 打印一行请求级表格日志（输出 chatLogOut，无 log 时间戳前缀）。
-//
-// 参数：
-//   - model：模型名（含 realm 前缀），超 chatModelWidth 截断（模型名是 ASCII，字节截即列宽）；
-//   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
-//     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
-//   - toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(out io.Writer, ttfb, total time.Duration, model, mode, uid, nick string, status, toks int) {
-	logChatRowEx(out, true, ttfb, total, model, mode, uid, nick, status, toks, "", "", 0, 0, false, "", "")
-}
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。

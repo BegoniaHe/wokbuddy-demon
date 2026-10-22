@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
-	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 )
 
 // TestChat14003StaysModelScopedShortWindow 14003 模型繁忙只停 (账号,模型)，
@@ -74,7 +74,7 @@ func TestChat6004ModelCooldownReports429(t *testing.T) {
 	t.Parallel()
 
 	reset := time.Now().Add(5 * time.Minute)
-	str := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	str := reset.In(cst.Loc).Format("2006-01-02 15:04:05")
 
 	client := newFakeUpstream(t, func(string) (int, string, bool) {
 		return http.StatusTooManyRequests, `{"code":6004,"msg":"将在 ` + str + ` UTC+8 重置"}`, false

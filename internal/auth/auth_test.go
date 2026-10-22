@@ -348,6 +348,11 @@ func TestTokenSourceFromJWT(t *testing.T) {
 		t.Fatalf("TokenSource=%q", got)
 	}
 
+	// 两段式 token（无签名）与旧 Split 口径一致：仍可解出 payload。
+	if got := (&Auth{AccessToken: "x." + payload}).TokenSource(); got != "enterprise_switch" {
+		t.Fatalf("two-part TokenSource=%q", got)
+	}
+
 	if got := (&Auth{AccessToken: "not-a-jwt"}).TokenSource(); got != "" {
 		t.Fatalf("non-JWT TokenSource=%q want empty", got)
 	}

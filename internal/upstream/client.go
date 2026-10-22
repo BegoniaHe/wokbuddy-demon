@@ -174,8 +174,8 @@ const accountRestrictedCode = "11140"
 // accountRestrictedMsg 「账号受限」的确定性文案。
 const accountRestrictedMsg = "request illegal"
 
-// channelRefusedCode 11-128 通道校验失败码。上游常见形态是**非法 JSON**
-// （`{"code":11-128,...}`），因此按字节子串而不是 JSON 字段判定。
+// channelRefusedCode 11-128 通道校验失败码。上游 code 字段带连字符，常见形态为
+// `{"code":"11-128",...}`（部分版本是非法 JSON），因此按字节子串而不是 JSON 字段判定。
 const channelRefusedCode = "11-128"
 
 // IsChannelRefused 报告 body 是否是「11-128 通道校验失败」形态：码命中 11-128
@@ -269,9 +269,6 @@ var (
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
 var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
-
-// SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
-func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 
 // modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
 // 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
@@ -557,7 +554,7 @@ func hasBusinessEnvelope(body string) bool {
 
 // IsWafBlocked 报告 403 响应是否为 WAF 拦截形态：HTTP 403 且 body 无业务信封
 // （无 `"code":`/`"msg":` JSON 字段——HTML 拦截页、空体、纯文本均命中）。
-// 带业务信封的 403（11140 request illegal / 11128 等）仍走既有分类链。
+// 带业务信封的 403（11140 request illegal / 11-128 等）仍走既有分类链。
 // 403 含 accountFault 文案的维持现状（ErrAccountFault），由 Classify 的规则序保证。
 func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
@@ -718,7 +715,7 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 	}
 	// 11-128 有两种语义，必须先分流：`11-128 + request illegal` 是**通道校验失败**
 	// （问题在客户端/通道一侧，账号健康、不该降级重试也不该罚号）；其余 11-128 才是
-	// 上游内容审核/反探测拦截（常见形态是非法 JSON `"code":11-128`），归
+	// 上游内容审核/反探测拦截（常见形态是 code 字段带连字符 `"code":"11-128"`），归
 	// ErrContentBlocked 走降级重试（与出站 sanitize 同语义）。
 	if IsChannelRefused(body) {
 		return ErrChannelRefused, true
@@ -739,7 +736,7 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 //     并做 (账号,模型) 避让；11102 是请求级事实（所有账号共享同一模型目录），
 //     fail-fast 不轮转（只认 400/404，429+11102 属限流语义走 status==429 层）。
 //  1. 402 —— 真正的计费余额耗尽状态码，最严、最不可自愈，最先判。
-//  2. 11-128 —— 上游内容审核/反探测拦截码（常见形态是非法 JSON），按内容拦截
+//  2. 11-128 —— 上游内容审核/反探测拦截码（code 字段带连字符），按内容拦截
 //     处理，不罚账号、可降级重试。
 //  3. requestLevelCodes —— 客户端判为 editInput/newTask/reupload 的确定性请求
 //     错误（11125/11129/.../11155、12654、14405）：不罚号、不轮转。11136/11158
@@ -1670,6 +1667,9 @@ func adoptNewerTokensFromDisk(account *auth.Auth) bool {
 		return false
 	}
 
+	// 只读主文件，不回退 .bak：.bak 是上一次写入前的副本，其中的 RT 已在上一次
+	// 刷新时被消费；拿它重试会触发上游反重放，作废整条 RT 链。主文件损坏时按
+	// 失败处理，由 auth.LoadDir 在下次启动时用 .bak 恢复可加载的凭证。
 	raw, err := os.ReadFile(account.FilePath)
 	if err != nil {
 		return false

@@ -72,8 +72,8 @@ func declaredLocalWebTools(body []byte) (map[string]bool, bool) {
 
 	wanted := map[string]bool{}
 
-	// Codex 0.162+ 把工具放进 input.additional_tools；与 responsesToOpenAI 的
-	// 合并口径保持一致，否则本地 web 工具不会触发、反而被透传给上游。
+	// Codex 0.162+ 把工具放进 input.additional_tools；与 responsesToOpenAIWithClient
+	// 的合并口径保持一致，否则本地 web 工具不会触发、反而被透传给上游。
 	for _, tool := range append(req.Tools, responsesAdditionalTools(req.Input)...) {
 		switch stringValue(tool["type"]) {
 		case "web_search", "web_search_preview":

@@ -11,6 +11,13 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/redisstore"
 )
 
+// extractKey 只取 ExtractSession 的粘性会话键，保持既有用例表达式简洁。
+func extractKey(body []byte) string {
+	key, _ := ExtractSession(body)
+
+	return key
+}
+
 // countingStore 记录镜像调用次数的假 Store（不联网）。
 type countingStore struct {
 	redisstore.Noop
@@ -156,7 +163,7 @@ func TestBoundAccountCooldownReassigns(t *testing.T) {
 func TestNoSessionKeyPassthrough(t *testing.T) {
 	t.Parallel()
 	// ExtractKey 找不到任何会话键 → 空串（调用方据空串走普通 Pick；router 不会被调用）。
-	got := ExtractKey([]byte(`{"model":"x","messages":[]}`))
+	got := extractKey([]byte(`{"model":"x","messages":[]}`))
 	if got != "" {
 		t.Errorf("ExtractKey should return empty, got %q", got)
 	}
@@ -182,10 +189,16 @@ func TestExtractKeyPriority(t *testing.T) {
 		{`{"conversationId":123}`, ""},                                                 // 数字 conversationId → 空
 		{`{"metadata":{"conversationId":456}}`, ""},                                    // metadata 数字 conversationId → 空
 		{`{"metadata":{"conversationId":"abc","user_id":"mu"}}`, "abc"},                // camel conversationId 优先于 user_id
+		// 顶层字段解析不再依赖 metadata 必须是对象：非对象 / null / 类型不符时
+		// 仍继续看顶层 conversation_id（旧 map 断言失败后的行为）。
+		{`{"metadata":"x","conversation_id":"top"}`, "top"},
+		{`{"metadata":null,"conversation_id":"top"}`, "top"},
+		{`{"metadata":{"conversation_id":123},"conversation_id":"top"}`, "top"},
+		{`{"metadata":{"user_id":123},"conversation_id":"top"}`, "top"},
 	}
 	for _, c := range cases {
-		if got := ExtractKey([]byte(c.body)); got != c.want {
-			t.Errorf("ExtractKey(%s)=%q want %q", c.body, got, c.want)
+		if got := extractKey([]byte(c.body)); got != c.want {
+			t.Errorf("extractKey(%s)=%q want %q", c.body, got, c.want)
 		}
 	}
 }
@@ -393,7 +406,7 @@ func TestExtractKeyDerivedFromContent(t *testing.T) {
 	// 第二轮：历史追加了 assistant 与新的 user（system 与首条 user 不变）
 	turn2 := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"},{"role":"assistant","content":"好的"},{"role":"user","content":"换成快排"}]}`
 
-	str, key2 := ExtractKey([]byte(turn1)), ExtractKey([]byte(turn2))
+	str, key2 := extractKey([]byte(turn1)), extractKey([]byte(turn2))
 	if str == "" {
 		t.Fatal("derived key should not be empty when messages present")
 	}
@@ -407,20 +420,25 @@ func TestExtractKeyDerivedFromContent(t *testing.T) {
 	}
 	// 不同对话（首条 user 不同）→ 不同键
 	other := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"翻译这段话"}]}`
-	if ExtractKey([]byte(other)) == str {
+	if extractKey([]byte(other)) == str {
 		t.Error("different first user message must yield a different derived key")
+	}
+	// 非对象消息条目（旧整树解析里本就被 scanDeriveTexts 跳过）不影响派生结果。
+	withJunk := `{"model":"glm-5.3","messages":["junk",{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"}]}`
+	if got := extractKey([]byte(withJunk)); got != str {
+		t.Errorf("junk message entries must not change derived key: got %q want %q", got, str)
 	}
 	// 显式 id 优先于派生键
 	withID := `{"conversation_id":"my-session","messages":[{"role":"user","content":"帮我写个排序算法"}]}`
-	if got := ExtractKey([]byte(withID)); got != "my-session" {
+	if got := extractKey([]byte(withID)); got != "my-session" {
 		t.Errorf("explicit id must win over derived key, got %q", got)
 	}
 	// 无 messages / 纯无文本内容 → 空（退回普通轮换，不误粘）
-	if got := ExtractKey([]byte(`{"model":"x"}`)); got != "" {
+	if got := extractKey([]byte(`{"model":"x"}`)); got != "" {
 		t.Errorf("no messages should yield empty key, got %q", got)
 	}
 
-	if got := ExtractKey([]byte(`{"messages":[{"role":"user","content":[]}]}`)); got != "" {
+	if got := extractKey([]byte(`{"messages":[{"role":"user","content":[]}]}`)); got != "" {
 		t.Errorf("text-less content should yield empty key, got %q", got)
 	}
 }
@@ -431,26 +449,26 @@ func TestExtractKeyMultimodalContent(t *testing.T) {
 
 	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`
 
-	k := ExtractKey([]byte(body))
+	k := extractKey([]byte(body))
 	if k == "" || !strings.HasPrefix(k, "d-") {
 		t.Fatalf("multimodal text should derive a key, got %q", k)
 	}
 	// 同一文本（图片不同）→ 同键（图片不参与派生，避免签名 URL 变化破坏粘性）
 	body2 := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
-	if ExtractKey([]byte(body2)) != k {
+	if extractKey([]byte(body2)) != k {
 		t.Error("image url changes must not break derived key stability")
 	}
 	// 纯图片首条 user（无 text part）也应派生非空键（首图会话粘性盲区修复；
 	// 图片只入类型占位，同图重发/换 URL 均同键）。
 	imgOnly := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`
 
-	str := ExtractKey([]byte(imgOnly))
+	str := extractKey([]byte(imgOnly))
 	if str == "" || !strings.HasPrefix(str, "d-") {
 		t.Fatalf("pure-image first user should derive a key, got %q", str)
 	}
 
 	imgOnly2 := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
-	if ExtractKey([]byte(imgOnly2)) != str {
+	if extractKey([]byte(imgOnly2)) != str {
 		t.Error("pure-image url changes must keep same derived key")
 	}
 }

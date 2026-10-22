@@ -62,3 +62,8 @@ func TestSnapThreadsRoundsUp(t *testing.T) {
 		t.Fatalf("SnapThreads(64)=%d，超出最大档应取 32", got)
 	}
 }
+
+// ModelsForCores 测试便利入口：按物理核心数取型号池（生产内部直接走 pickBand）。
+func ModelsForCores(cores int) []CPUModel {
+	return pickBand(coresBands, cores)
+}

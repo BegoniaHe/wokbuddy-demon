@@ -219,11 +219,6 @@ func responsesCustomToolSet(tools []map[string]any) map[string]bool {
 	return out
 }
 
-// responsesToOpenAI 转换请求体（无上游 client，供测试与不查动态目录的调用方）。
-func responsesToOpenAI(body []byte) ([]byte, string, string, bool, error) {
-	return responsesToOpenAIWithClient(body, nil, nil)
-}
-
 // responsesToOpenAIWithClient 转换请求体，返回内部 chat body、原始模型名、instructions 与 stream。
 // httpClient/aliases 仅用于模型目录的 max_output_tokens 查找；nil 时只查静态表。
 func responsesToOpenAIWithClient(
@@ -1154,16 +1149,6 @@ func (r *responsesResponder) Stream(rc io.Reader, hint func(string) string, repa
 	}
 
 	return nil
-}
-
-// responsesFromOpenAI 把聚合后的 chat.completion 转成 Responses 对象。
-func responsesFromOpenAI(body any, model, instructions string, customTools ...map[string]bool) map[string]any {
-	custom := map[string]bool{}
-	if len(customTools) > 0 {
-		custom = customTools[0]
-	}
-
-	return responsesFromOpenAIWithNamespaces(body, model, instructions, custom, nil)
 }
 
 // responsesFromOpenAIWithNamespaces 在 Responses 对象里还原 namespace 工具。

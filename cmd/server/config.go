@@ -606,11 +606,6 @@ func ParseConfigInto(raw []byte, config3 *Config) (*Config, error) {
 	return config3, nil
 }
 
-// ParseConfig 基于默认值解析一段配置 JSON（等价于 Load 的文件分支，但不读环境变量）。
-func ParseConfig(raw []byte) (*Config, error) {
-	return ParseConfigInto(raw, Default())
-}
-
 // parseConfigWithEnv 解析配置后再叠加环境变量覆盖，供面板比较「当前生效值」。
 // 与 Load 同序：JSON → env → normalize，避免 env 覆盖的字段被误报为已变化。
 func parseConfigWithEnv(raw []byte) (*Config, error) {
