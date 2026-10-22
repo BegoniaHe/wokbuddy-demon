@@ -24,8 +24,11 @@ const compare = opt('compare');
 
 // 只扫含协议面字面量的目录；preload/renderer 全量，i18n 语言包噪音大单独计数
 const SCAN_DIRS = ['main', 'cli', 'renderer', 'preload'];
-// 出站端点：/v1|v2|v3/...、/console/...、/activity/...、/plugin/...、/billing/...、/auth/...
-const EP_RE = /(?:^|[^\w./-])(["'`])(\/(?:v[0-9]|console|activity|plugin|billing|auth)\/[A-Za-z0-9/_.$-]*)\1/g;
+// 出站端点：/v1|v2|v3/...、/console/...、/activity/...、/plugin/...、/billing/...、
+// /auth/...、/agenttool/...；模板串（`${base}/v2/...`）由下一条正则补扫。
+const EP_RE = /(?:^|[^\w./-])(["'`])(\/(?:v[0-9]|console|activity|plugin|billing|auth|agenttool)\/[A-Za-z0-9/_.$-]*)\1/g;
+// 模板串端点：`${chatBase}/v2/images/generations` 这类字面量前缀
+const EP_TPL_RE = /`\$\{[^}]+\}(\/(?:v[0-9]|agenttool)\/[A-Za-z0-9/_.$-]*)/g;
 const HDR_RE = /["'`](X-[A-Z][A-Za-z0-9-]*)["'`]/g;
 // UA 形态只记「模板痕迹」（变量插值一律归一成 ${…}），真实版本号不在 JS 里
 const UA_RE = /\b((?:WorkBuddy|CLI)\/(\$?\{[^}]*\}|[A-Za-z0-9._-]{1,24}))/g;
@@ -66,6 +69,7 @@ function sweep(target) {
       let text;
       try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
       for (const m of text.matchAll(EP_RE)) bump(res.endpoints, m[2]);
+      for (const m of text.matchAll(EP_TPL_RE)) bump(res.endpoints, m[1]);
       if (sub !== 'renderer') for (const m of text.matchAll(HDR_RE)) bump(res.headers, m[1]);
       for (const m of text.matchAll(UA_RE)) bump(res.ua, NORM_UA(m[1]));
     }
