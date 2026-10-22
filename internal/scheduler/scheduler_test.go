@@ -25,7 +25,7 @@ var errUnused = errors.New("unused")
 func TestNextFire(t *testing.T) {
 	t.Parallel()
 
-	loc := time.Local
+	loc := cst.Loc
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, loc)
 
 	next := nextFireIn(now, []int{9, 21}, nil)
@@ -51,7 +51,7 @@ func TestNextFire(t *testing.T) {
 func TestNextFireMergesSchedules(t *testing.T) {
 	t.Parallel()
 
-	now := time.Date(2026, 7, 27, 20, 0, 0, 0, time.Local)
+	now := time.Date(2026, 7, 27, 20, 0, 0, 0, cst.Loc)
 
 	next := nextFireIn(now, []int{9, 21, 22}, nil)
 	if next.Hour() != 21 {
@@ -100,8 +100,8 @@ func TestNextWakeKeepaliveOnly(t *testing.T) {
 		TravelDisabled: true, ActivityDisabled: true,
 	})
 
-	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
-	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
+	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, cst.Loc))
+	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, cst.Loc); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
 	}
 
@@ -124,8 +124,8 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		BlackcatDisabled: true,
 	})
 
-	at, kinds := scheduler.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
-	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
+	at, kinds := scheduler.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, cst.Loc))
+	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, cst.Loc); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
 	}
 
@@ -134,8 +134,8 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 	}
 
 	// 22 点过后下一次是次日 09:00，且只含签到（旅行/活跃已禁用）。
-	at, kinds = scheduler.nextWake(time.Date(2026, 9, 11, 22, 30, 0, 0, time.Local))
-	if want := time.Date(2026, 9, 12, 9, 0, 0, 0, time.Local); !at.Equal(want) {
+	at, kinds = scheduler.nextWake(time.Date(2026, 9, 11, 22, 30, 0, 0, cst.Loc))
+	if want := time.Date(2026, 9, 12, 9, 0, 0, 0, cst.Loc); !at.Equal(want) {
 		t.Errorf("next=%v want %v", at, want)
 	}
 
@@ -165,8 +165,8 @@ func TestNextWakeCheckinDisabled(t *testing.T) {
 		TravelDisabled: true, ActivityDisabled: true,
 	})
 
-	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
-	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
+	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, cst.Loc))
+	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, cst.Loc); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 21 点签到）", at, want)
 	}
 
@@ -184,8 +184,8 @@ func TestNextWakeKeepaliveDisabled(t *testing.T) {
 		TravelDisabled: true, ActivityDisabled: true,
 	})
 
-	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, time.Local))
-	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, time.Local); !at.Equal(want) {
+	at, kinds := s.nextWake(time.Date(2026, 9, 11, 20, 0, 0, 0, cst.Loc))
+	if want := time.Date(2026, 9, 11, 21, 0, 0, 0, cst.Loc); !at.Equal(want) {
 		t.Errorf("next=%v want %v（不应再有 22 点保活）", at, want)
 	}
 
@@ -730,7 +730,7 @@ func TestNextWakeGrowthSlot(t *testing.T) {
 	t.Parallel()
 
 	s := New(&Config{GrowthHours: []int{1}})
-	at, kinds := s.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
+	at, kinds := s.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, cst.Loc))
 	hasGrowth := false
 
 	for _, k := range kinds {
@@ -745,7 +745,7 @@ func TestNextWakeGrowthSlot(t *testing.T) {
 	// 禁用后不进候选（其余 kind 为空 → nextWake 零值返回）
 	s2 := New(&Config{GrowthHours: []int{1}, GrowthDisabled: true})
 
-	_, kinds2 := s2.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, time.Local))
+	_, kinds2 := s2.nextWake(time.Date(2026, 9, 27, 0, 10, 0, 0, cst.Loc))
 	for _, k := range kinds2 {
 		if k == taskGrowth {
 			t.Fatal("禁用后 growth 仍在候选")

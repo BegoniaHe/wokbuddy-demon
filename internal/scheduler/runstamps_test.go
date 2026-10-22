@@ -23,7 +23,7 @@ func TestMissedTodayAndRunStamp(t *testing.T) {
 		RunStampFile:      filepath.Join(t.TempDir(), "scheduler-runs.json"),
 	})
 
-	now := time.Date(2026, 10, 21, 22, 0, 0, 0, time.Local)
+	now := time.Date(2026, 10, 21, 22, 0, 0, 0, cst.Loc)
 
 	missed := scheduler.missedToday(now)
 	if len(missed) != 1 || missed[0] != taskCheckin {
