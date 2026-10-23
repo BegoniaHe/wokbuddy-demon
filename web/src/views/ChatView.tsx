@@ -73,7 +73,8 @@ export function ChatView() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [stick, setStick] = useState(true);
 
-  const abortRef = useRef<AbortController | null>(null);
+  // 全局只跑一条流，但必须记住它属于哪个会话：清空/删除/停止只能作用于该会话。
+  const streamRef = useRef<{ sessionId: string; ctrl: AbortController } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const { confirm, confirmDialog } = useConfirm();
@@ -107,7 +108,7 @@ export function ChatView() {
     return () => clearTimeout(t);
   }, [sessions]);
 
-  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => () => streamRef.current?.ctrl.abort(), []);
 
   // 模型目录到达后补默认值：记住上次选择 → 官方默认 → 首个。
   useEffect(() => {
@@ -157,7 +158,7 @@ export function ChatView() {
       }))
     )
       return;
-    if (id === activeId && busy) abortRef.current?.abort();
+    if (streamRef.current?.sessionId === id) streamRef.current.ctrl.abort();
     setSessions((prev) => {
       const next = prev.filter((s) => s.id !== id);
       return next.length ? next : [newChatSession()];
@@ -175,7 +176,7 @@ export function ChatView() {
       }))
     )
       return;
-    if (busy) abortRef.current?.abort();
+    if (streamRef.current?.sessionId === active.id) streamRef.current.ctrl.abort();
     patch(active.id, (s) => {
       s.messages = [];
       s.title = '新对话';
@@ -202,11 +203,11 @@ export function ChatView() {
       s.messages = [...base, asst];
       s.at = Date.now();
     });
-    setBusy(true);
     setStick(true);
 
     const ctrl = new AbortController();
-    abortRef.current = ctrl;
+    streamRef.current = { sessionId, ctrl };
+    setBusy(true);
     const started = performance.now();
     let firstAt = 0;
     let raf = 0;
@@ -297,8 +298,11 @@ export function ChatView() {
       asst.elapsedMs = Math.round(performance.now() - started);
       if (firstAt) asst.ttftMs = Math.round(firstAt - started);
       flush(snapshot());
-      abortRef.current = null;
-      setBusy(false);
+      // 只清理自己：被 abort 后用户可能已切到别的会话并开了新流。
+      if (streamRef.current?.ctrl === ctrl) {
+        streamRef.current = null;
+        setBusy(false);
+      }
     }
   };
 
@@ -335,8 +339,10 @@ export function ChatView() {
     }
   };
 
-  const stop = () => abortRef.current?.abort();
-  const liveId = busy ? active?.messages[active.messages.length - 1]?.id : undefined;
+  const stop = () => streamRef.current?.ctrl.abort();
+  // 流属于别的会话时，当前会话不应显示「生成中」或停止按钮。
+  const streaming = busy && streamRef.current?.sessionId === active?.id;
+  const liveId = streaming ? active?.messages[active.messages.length - 1]?.id : undefined;
   const sessionOptions = useMemo(
     () => sessions.map((s) => ({ value: s.id, label: s.title })),
     [sessions],
@@ -505,7 +511,13 @@ export function ChatView() {
                   rows={1}
                   value={input}
                   aria-label="输入消息"
-                  placeholder={active?.model ? '输入消息，Enter 发送' : '先选择模型'}
+                  placeholder={
+                    busy && !streaming
+                      ? '另一个对话正在生成，请稍候'
+                      : active?.model
+                        ? '输入消息，Enter 发送'
+                        : '先选择模型'
+                  }
                   className="max-h-[180px] w-full resize-none bg-transparent px-1.5 py-1 text-base outline-none placeholder:text-muted-foreground"
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={(e) => {
@@ -520,13 +532,13 @@ export function ChatView() {
                     Enter 发送 · Shift+Enter 换行 · 仅存本机浏览器
                   </span>
                   <span className="flex-1" />
-                  {busy ? (
+                  {streaming ? (
                     <Button size="sm" variant="outline" onClick={stop}>
                       <Square />
                       停止
                     </Button>
                   ) : (
-                    <Button size="sm" disabled={!input.trim() || !active?.model} onClick={send}>
+                    <Button size="sm" disabled={busy || !input.trim() || !active?.model} onClick={send}>
                       <Send />
                       发送
                     </Button>
