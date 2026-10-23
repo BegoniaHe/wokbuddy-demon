@@ -84,6 +84,10 @@ func (w *recoveryWriter) Write(p []byte) (int, error) {
 }
 
 func (w *recoveryWriter) Flush() {
+	// Flush 会让 net/http 立即发送响应头；未标记时随后 panic 会被误判成
+	// 「尚未写头」，向已开始的响应追加错误体。
+	w.wroteHeader = true
+
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}

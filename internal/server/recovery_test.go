@@ -129,6 +129,27 @@ func TestWithRecoveryAfterReadFrom(t *testing.T) {
 	}
 }
 
+// TestWithRecoveryAfterFlush 只 Flush（尚未 Write）也已发送响应头，随后 panic 不得
+// 再追加错误体。
+func TestWithRecoveryAfterFlush(t *testing.T) {
+	t.Parallel()
+	quietPanicLog(t)
+
+	h := NewHandler(&Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+
+	h.withRecovery(func(w http.ResponseWriter, _ *http.Request) {
+		w.(http.Flusher).Flush()
+
+		panic("flush then boom")
+	})(rec, req)
+
+	if rec.Body.Len() != 0 {
+		t.Fatalf("body=%q want empty (no error envelope appended)", rec.Body.String())
+	}
+}
+
 // TestPprofAuth pprof 与 /metrics 同口径：api_key 非空时缺 token → 401，正确 → 200。
 func TestPprofAuth(t *testing.T) {
 	t.Parallel()
