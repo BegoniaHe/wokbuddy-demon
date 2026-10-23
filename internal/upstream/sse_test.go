@@ -976,6 +976,26 @@ func TestStreamPassthrough(t *testing.T) {
 	}
 }
 
+// TestStreamNullFrameDoesNotPanic 顶层 null 解码为 nil map；同流已有真实 id 时
+// continueMessageID 会写 obj["id"]，必须按非 JSON 帧降级透传而不是 panic。
+func TestStreamNullFrameDoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: null\n\n" +
+		"data: [DONE]\n\n"
+
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatal(err)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "data: null") || !strings.Contains(body, "hi") {
+		t.Fatalf("body=%q", body)
+	}
+}
+
 // TestAggregateEmptyStreamCases 覆盖空流检测：0 有效事件必须报错、[DONE] 即 break、
 // [DONE] 后垃圾不进聚合、正常聚合回归。
 func TestAggregateEmptyStreamCases(t *testing.T) {
@@ -1073,6 +1093,7 @@ func TestStreamEmptyFramesCase(t *testing.T) {
 	}{
 		{"空流", ""},
 		{"只有注释行", ": comment\n\n"},
+		{"只有 null", "data: null\n\n"},
 		{"只有 DONE", "data: [DONE]\n\n"},
 	}
 	for _, item := range cases {
