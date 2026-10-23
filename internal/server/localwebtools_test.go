@@ -49,6 +49,8 @@ func TestBlockedIPClasses(t *testing.T) {
 		"100::1", "2001:2::1", "2001:db8::1", "3fff::1",
 		// IPv4 过渡/转换前缀：NAT64（含内网 IPv4）、Teredo、6to4。
 		"64:ff9b::a00:1", "64:ff9b::7f00:1", "64:ff9b:1::a00:1", "2001::a00:1", "2002:a00:1::",
+		// IPv4 兼容/转换形态与已废弃的 site-local。
+		"::7f00:1", "::ffff:0:7f00:1", "fec0::1",
 	} {
 		ip := parseIP(t, raw)
 		if !isBlockedIP(ip) {

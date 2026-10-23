@@ -644,6 +644,10 @@ var blockedNonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("2001::/32"),
 	netip.MustParsePrefix("2002::/16"),
+	// IPv4 兼容/转换形态（::a.b.c.d、::ffff:0:a.b.c.d）与已废弃的 site-local。
+	netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("::ffff:0:0:0/96"),
+	netip.MustParsePrefix("fec0::/10"),
 }
 
 func isBlockedIP(ip net.IP) bool {
