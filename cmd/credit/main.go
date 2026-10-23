@@ -46,16 +46,19 @@ var (
 // workbuddy.ai 家族，都按国际版处理。cmd/credit 早先对所有账号硬编码 CN 域，
 // 导致 global 账号余额查询恒返回 401（面板显示的是池内缓存值，不是实时的）。
 func billingBaseFor(af *authFile) string {
-	if strings.EqualFold(strings.TrimSpace(af.realm()), "global") {
-		return billingBaseGlobal
-	}
-
-	d := strings.ToLower(strings.TrimSpace(af.domain()))
-	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
+	if strings.EqualFold(strings.TrimSpace(af.realm()), "global") || isGlobalDomain(af.domain()) {
 		return billingBaseGlobal
 	}
 
 	return billingBaseCN
+}
+
+// isGlobalDomain 与 internal/auth 的判定同口径：workbuddy.ai 家族为国际版。
+// 不能因为显式 realm=cn 就短路 domain 判定——服务端 Realm() 同样是 domain 优先。
+func isGlobalDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+
+	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
 }
 
 // authFile 兼容 internal/auth 支持的两种磁盘形态：嵌套形（插件 OAuth）与

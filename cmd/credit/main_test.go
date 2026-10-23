@@ -95,3 +95,20 @@ func TestAuthFileNestedWinsOverFlat(t *testing.T) {
 		t.Errorf("uid=%q want nested-uid", got)
 	}
 }
+
+// 显式 realm=cn 与 global domain 冲突时按 domain 判 global：服务端 Realm() 也是
+// domain 优先，CLI 若短路到 CN 会拿 401。
+func TestBillingBaseDomainWinsOverExplicitCN(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{"auth":{"accessToken":"token","domain":"www.workbuddy.ai","realm":"cn"}}`)
+
+	var file authFile
+	if err := json.Unmarshal(raw, &file); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := billingBaseFor(&file); got != billingBaseGlobal {
+		t.Errorf("billingBaseFor=%q want %q", got, billingBaseGlobal)
+	}
+}
