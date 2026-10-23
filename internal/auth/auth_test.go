@@ -357,3 +357,24 @@ func TestTokenSourceFromJWT(t *testing.T) {
 		t.Fatalf("non-JWT TokenSource=%q want empty", got)
 	}
 }
+
+// TestBackfillRealmForTrimsRealm realm 输入允许带首尾空白，但落盘值必须是
+// 归一后的 cn/global；否则 RealmStored/SaveAtomic 会写入 " global " 这类脏值。
+func TestBackfillRealmForTrimsRealm(t *testing.T) {
+	t.Parallel()
+
+	account := &Auth{}
+
+	changed, err := BackfillRealmFor(account, " global ")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !changed {
+		t.Fatal("首次写入 realm 应报告 changed")
+	}
+
+	if got := account.RealmStored(); got != "global" {
+		t.Fatalf("RealmStored=%q want global", got)
+	}
+}

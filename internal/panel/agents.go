@@ -8,11 +8,12 @@ import (
 	"net/http"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/agentcfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 )
 
 // agentsStatus 返回本机客户端检测与写入状态。
 func (p *Panel) agentsStatus(w http.ResponseWriter, r *http.Request) {
-	if !loopbackRequest(r) {
+	if !p.loopbackRequest(r) {
 		writeErr(w, http.StatusForbidden, "仅允许本机回环访问")
 		return
 	}
@@ -27,7 +28,7 @@ func (p *Panel) agentsStatus(w http.ResponseWriter, r *http.Request) {
 
 // agentsApply 写入网关专属配置。
 func (p *Panel) agentsApply(w http.ResponseWriter, r *http.Request) {
-	if !loopbackRequest(r) {
+	if !p.loopbackRequest(r) {
 		writeErr(w, http.StatusForbidden, "仅允许本机回环访问")
 		return
 	}
@@ -59,7 +60,7 @@ func (p *Panel) agentsApply(w http.ResponseWriter, r *http.Request) {
 
 // agentsRestore 还原首次写入前的配置。
 func (p *Panel) agentsRestore(w http.ResponseWriter, r *http.Request) {
-	if !loopbackRequest(r) {
+	if !p.loopbackRequest(r) {
 		writeErr(w, http.StatusForbidden, "仅允许本机回环访问")
 		return
 	}
@@ -97,14 +98,14 @@ func (p *Panel) agentsRestore(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// loopbackRequest 只信任 TCP 来源地址，不信任 X-Forwarded-For。
-func loopbackRequest(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-
-	ip := net.ParseIP(host)
+// loopbackRequest 判断请求是否来自本机回环。
+//
+// 必须经 httpauth.ClientIP 解析来源：面板常在同机反代之后，直接读 RemoteAddr
+// 会把所有外部客户端都看成 127.0.0.1，使「仅回环」限制（以及写本机智能体配置的
+// 权限边界）失效。ClientIP 只在 TCP 对端属于 trusted_proxies 时采信转发头，
+// 直连时仍只看 RemoteAddr。
+func (p *Panel) loopbackRequest(r *http.Request) bool {
+	ip := net.ParseIP(httpauth.ClientIP(r, p.cfg.TrustedProxies))
 
 	return ip != nil && ip.IsLoopback()
 }
