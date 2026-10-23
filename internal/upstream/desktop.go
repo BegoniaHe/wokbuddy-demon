@@ -788,7 +788,7 @@ func debugChatRequest(req *http.Request) {
 func debugHeaderValue(name, value string) string {
 	switch strings.ToLower(name) {
 	case "authorization", "proxy-authorization", "cookie", "set-cookie",
-		"x-api-key", "x-goog-api-key", "x-device-token":
+		"x-api-key", "x-goog-api-key", "x-device-token", "x-refresh-token":
 		return redacted
 	default:
 		return logfmt.Truncate(sanitizeLogLine(value), 200)

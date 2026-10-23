@@ -11,7 +11,7 @@ func TestDebugHeaderValueRedactsCredentials(t *testing.T) {
 
 	for _, name := range []string{
 		"Authorization", "proxy-authorization", "Cookie", "Set-Cookie",
-		"X-Api-Key", "x-goog-api-key", "X-Device-Token",
+		"X-Api-Key", "x-goog-api-key", "X-Device-Token", "X-Refresh-Token",
 	} {
 		if got := debugHeaderValue(name, "Bearer secret-token"); got != redacted {
 			t.Errorf("debugHeaderValue(%q) = %q, want %q", name, got, redacted)
