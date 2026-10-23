@@ -113,7 +113,12 @@ export function ChatView() {
   // 模型目录到达后补默认值：记住上次选择 → 官方默认 → 首个。
   useEffect(() => {
     if (!active || active.model || !models.length) return;
-    const remembered = localStorage.getItem(LS_CHAT_MODEL);
+    let remembered: string | null = null;
+    try {
+      remembered = localStorage.getItem(LS_CHAT_MODEL);
+    } catch {
+      // 隐私模式/禁用存储：读偏好失败不应中断试聊。
+    }
     const pick = models.find((m) => m.id === remembered) ?? models.find((m) => m.is_default) ?? models[0];
     if (!pick) return;
     setSessions((prev) => prev.map((s) => (s.id === active.id && !s.model ? { ...s, model: pick.id } : s)));

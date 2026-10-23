@@ -1,10 +1,13 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   applyChatChunk,
+  CHAT_MAX_TOOL_CALLS,
   chatError,
+  LS_CHAT_SESSIONS,
   chatModelParts,
   chatTitle,
   chatWireMessages,
+  loadChatSessions,
   readSSEStream,
   splitSSEFrames,
   sseData,
@@ -90,6 +93,27 @@ describe('applyChatChunk', () => {
     expect(m.toolCalls).toEqual([{ id: 't1', name: 'lookup', arguments: '{"q":1}' }]);
   });
 
+  it('忽略越界工具调用 index，避免撑爆数组', () => {
+    const m = assistant();
+    const changed = applyChatChunk(m, {
+      choices: [{ delta: { tool_calls: [{ index: 1_000_000_000, function: { name: 'boom' } }] } }],
+    });
+    expect(changed).toBe(false);
+    expect(m.toolCalls ?? []).toEqual([]);
+  });
+
+  it('允许边界内的最大工具调用 index', () => {
+    const m = assistant();
+    const changed = applyChatChunk(m, {
+      choices: [
+        { delta: { tool_calls: [{ index: CHAT_MAX_TOOL_CALLS - 1, function: { name: 'last' } }] } },
+      ],
+    });
+    expect(changed).toBe(true);
+    expect(m.toolCalls).toHaveLength(CHAT_MAX_TOOL_CALLS);
+    expect(m.toolCalls?.[CHAT_MAX_TOOL_CALLS - 1]?.name).toBe('last');
+  });
+
   it('记录 usage', () => {
     const m = assistant();
     const changed = applyChatChunk(m, { usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 } });
@@ -102,6 +126,44 @@ describe('applyChatChunk', () => {
     expect(applyChatChunk(m, null)).toBe(false);
     expect(applyChatChunk(m, { choices: [null, { delta: { content: 1 } }] })).toBe(false);
     expect(m.content).toBe('');
+  });
+});
+
+describe('loadChatSessions', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('丢弃损坏的工具调用字段，避免对象参数触发渲染错误', () => {
+    const saved = JSON.stringify([
+      {
+        id: 's',
+        title: 't',
+        model: 'm',
+        at: 1,
+        messages: [
+          {
+            id: 'a',
+            role: 'assistant',
+            content: '',
+            at: 1,
+            toolCalls: [
+              { id: 'x', name: 'bad', arguments: { a: 1 } },
+              { id: 'y', name: 'good', arguments: '{}' },
+            ],
+          },
+        ],
+      },
+    ]);
+    const store = new Map<string, string>([[LS_CHAT_SESSIONS, saved]]);
+    vi.stubGlobal('localStorage', {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => void store.set(k, v),
+      removeItem: (k: string) => void store.delete(k),
+    });
+
+    const sessions = loadChatSessions();
+    expect(sessions[0]?.messages[0]?.toolCalls).toEqual([
+      { id: 'y', name: 'good', arguments: '{}' },
+    ]);
   });
 });
 

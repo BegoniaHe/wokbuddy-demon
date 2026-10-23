@@ -47,6 +47,8 @@ export const LS_CHAT_MODEL = 'wb2api.chat.model';
 export const CHAT_MAX_SESSIONS = 30;
 export const CHAT_MAX_MESSAGES = 200;
 export const CHAT_RAW_MAX_FRAMES = 200;
+// 工具调用 index 上限：上游帧可携带任意数字，未设界会让 while 循环把数组撑到 OOM。
+export const CHAT_MAX_TOOL_CALLS = 128;
 
 // newChatID 生成会话/消息 ID：优先 randomUUID，旧浏览器回落时间戳 + 随机串。
 export function newChatID(): string {
@@ -160,6 +162,7 @@ function mergeToolCalls(msg: ChatMessage, calls: unknown[]): boolean {
     if (!raw || typeof raw !== 'object') continue;
     const c = raw as { index?: unknown; id?: unknown; function?: unknown };
     const idx = typeof c.index === 'number' && c.index >= 0 ? c.index : 0;
+    if (idx >= CHAT_MAX_TOOL_CALLS) continue;
     const fn = (c.function && typeof c.function === 'object' ? c.function : {}) as {
       name?: unknown;
       arguments?: unknown;
@@ -260,10 +263,13 @@ function loadMessage(v: unknown): ChatMessage | undefined {
   if (typeof v.error === 'string') m.error = v.error;
   if (v.aborted === true) m.aborted = true;
   if (Array.isArray(v.toolCalls)) {
-    m.toolCalls = v.toolCalls.filter(
-      (t): t is ChatToolCall =>
-        !!t && typeof t === 'object' && typeof (t as ChatToolCall).name === 'string',
-    );
+    m.toolCalls = v.toolCalls
+      .slice(0, CHAT_MAX_TOOL_CALLS)
+      .filter((t): t is ChatToolCall => {
+        if (!t || typeof t !== 'object') return false;
+        const c = t as Partial<ChatToolCall>;
+        return typeof c.id === 'string' && typeof c.name === 'string' && typeof c.arguments === 'string';
+      });
   }
   if (v.usage && typeof v.usage === 'object') m.usage = v.usage as ChatUsage;
   return m;
