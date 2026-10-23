@@ -347,6 +347,10 @@ func applyClaude(existing []byte, opts Options) ([]byte, error) {
 		if err := json.Unmarshal(existing, &doc); err != nil {
 			return nil, fmt.Errorf("现有 Claude 配置不是合法 JSON: %w", err)
 		}
+		// 顶层 null 会把 doc 置为 nil map；按空配置处理，避免写 env 时 panic。
+		if doc == nil {
+			doc = map[string]any{}
+		}
 	}
 
 	env, _ := doc["env"].(map[string]any)
@@ -463,6 +467,10 @@ func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 	if len(bytes.TrimSpace(existing)) > 0 {
 		if err := json.Unmarshal(existing, &doc); err != nil {
 			return nil, fmt.Errorf("现有 OpenCode 配置不是合法 JSON: %w", err)
+		}
+		// 顶层 null 会把 doc 置为 nil map；按空配置处理，避免写 provider 时 panic。
+		if doc == nil {
+			doc = map[string]any{}
 		}
 	}
 
