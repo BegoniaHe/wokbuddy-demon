@@ -120,7 +120,9 @@ func (c *TextContinueReader) handleLine(line string) {
 	}
 
 	var frame map[string]any
-	if json.Unmarshal([]byte(payload), &frame) != nil {
+	if json.Unmarshal([]byte(payload), &frame) != nil || frame == nil {
+		// 非 JSON 帧与顶层 null（nil map 没有可写字段，续写重写 id/model 会 panic）
+		// 一律原样透传。
 		c.out.WriteString(line)
 
 		return

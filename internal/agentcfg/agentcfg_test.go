@@ -1,6 +1,7 @@
 package agentcfg
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -235,5 +236,43 @@ func TestConcurrentApplyRestore(t *testing.T) {
 		if item.ID == "claude" && item.Modified {
 			t.Fatalf("meta and config diverged after concurrent writes: %+v", item)
 		}
+	}
+}
+
+// TestApplyNullExistingConfig 顶层 null 会被 json.Unmarshal 置成 nil map；apply 必须
+// 按空配置处理，不能写 env/provider 时 panic。
+func TestApplyNullExistingConfig(t *testing.T) {
+	t.Parallel()
+
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk-test", Model: "glm-5.2"}
+
+	claudeRaw, err := applyClaude([]byte("null"), opts)
+	if err != nil {
+		t.Fatalf("applyClaude: %v", err)
+	}
+
+	var claude map[string]any
+	if uerr := json.Unmarshal(claudeRaw, &claude); uerr != nil {
+		t.Fatalf("claude output: %v", uerr)
+	}
+
+	env, _ := claude["env"].(map[string]any)
+	if env["ANTHROPIC_AUTH_TOKEN"] != "sk-test" {
+		t.Fatalf("claude env=%v", env)
+	}
+
+	opencodeRaw, err := applyOpenCode([]byte("null"), opts)
+	if err != nil {
+		t.Fatalf("applyOpenCode: %v", err)
+	}
+
+	var opencode map[string]any
+	if uerr := json.Unmarshal(opencodeRaw, &opencode); uerr != nil {
+		t.Fatalf("opencode output: %v", uerr)
+	}
+
+	provider, _ := opencode["provider"].(map[string]any)
+	if _, ok := provider["wokbuddy"].(map[string]any); !ok {
+		t.Fatalf("opencode provider=%v", provider)
 	}
 }

@@ -181,8 +181,9 @@ func (a *streamAggregator) handleLine(line string) (bool, error) {
 	}
 
 	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) == nil {
-		// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
+	if json.Unmarshal([]byte(payload), &chunk) == nil && chunk != nil {
+		// 有效事件计数：仅 JSON 对象数据帧计入（解析失败、顶层 null 沿用静默 continue）。
+		// null 是合法 JSON 但解码成 nil map，没有可聚合字段，计入会掩盖空流。
 		a.validEvents++
 		if err := a.handleChunk(chunk); err != nil {
 			return false, err
@@ -1296,13 +1297,15 @@ func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall)
 }
 
 // writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
-// 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
+// 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
+// 降级原样写出，但不计数）。
 //
 //nolint:cyclop // 帧类型按 error/业务错误/修复/普通分派，线性更直观。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
 	var obj map[string]any
-	if json.Unmarshal([]byte(payload), &obj) != nil {
-		// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。
+	if json.Unmarshal([]byte(payload), &obj) != nil || obj == nil {
+		// 非 JSON 帧或顶层 null（nil map 没有可透传字段，后续写 id 会 panic）：
+		// 原样降级写出，不计数（与修复前一致）。
 		if werr := s.writeSSE(payload); werr != nil {
 			return 0, werr
 		}
