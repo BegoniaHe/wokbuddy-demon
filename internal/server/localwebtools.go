@@ -20,6 +20,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -616,10 +617,71 @@ func checkHostIP(ctx context.Context, host string) error {
 	return nil
 }
 
+// blockedNonPublicPrefixes 非私网但同样不可公网访问的地址段（netip 的
+// IsPrivate 只覆盖 RFC1918/RFC4193）：0.0.0.0/8、CGNAT（100.64/10，含 Tailscale
+// 等内网）、IETF 协议分配、文档/基准测试段与 240/4 保留段。漏掉它们会让
+// web_fetch 穿过内网边界（如 http://100.100.100.100）。
+//
+// IPv6 过渡/转换前缀必须单列：NAT64（64:ff9b::/96 与 RFC 8215 本地前缀）和
+// 6to4/Teredo 都能把 IPv4 地址嵌进 IPv6 字面量，IsGlobalUnicast/IsPrivate 却判为
+// 公网。漏掉时 http://[64:ff9b::a00:1]/ 会在 NAT64 环境里访问 10.0.0.1。
+//
+// NAT64 知名前缀例外：IPv6-only + DNS64 环境会把**所有**公网 IPv4 目标合成为
+// 64:ff9b::/96，直接封整段会让 web_fetch 失去全部 IPv4 站点。该前缀在
+// isBlockedIP 里按嵌入的 IPv4 逐地址判定（内嵌私网仍拒绝）。
+var blockedNonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	// IPv6 特殊用途：文档/基准/丢弃段。
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001:2::/48"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("3fff::/20"),
+	// IPv4 过渡/转换前缀：可嵌入内网 IPv4。
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	// IPv4 兼容/转换形态（::a.b.c.d、::ffff:0:a.b.c.d）与已废弃的 site-local。
+	netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("::ffff:0:0:0/96"),
+	netip.MustParsePrefix("fec0::/10"),
+}
+
+// nat64WellKnownPrefix DNS64 合成的知名前缀（RFC 6052）。单独判定而非整段封禁。
+var nat64WellKnownPrefix = netip.MustParsePrefix("64:ff9b::/96")
+
 func isBlockedIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast()
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	// 非全局单播（回环/未指定/链路本地/组播/广播）与 RFC1918/RFC4193 私网。
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return true
+	}
+
+	// NAT64 知名前缀按内嵌 IPv4 判定：公网目标放行（IPv6-only/DNS64 环境可用），
+	// 内嵌私网/保留段仍拒绝。
+	if nat64WellKnownPrefix.Contains(addr) {
+		raw := addr.As16()
+
+		return isBlockedIP(net.IPv4(raw[12], raw[13], raw[14], raw[15]))
+	}
+
+	for _, prefix := range blockedNonPublicPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // dialWebFetch 解析目标域名，校验所有解析结果后直接连接已验证的 IP。

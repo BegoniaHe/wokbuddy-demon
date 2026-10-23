@@ -84,6 +84,10 @@ func (w *recoveryWriter) Write(p []byte) (int, error) {
 }
 
 func (w *recoveryWriter) Flush() {
+	// Flush 会让 net/http 立即发送响应头；未标记时随后 panic 会被误判成
+	// 「尚未写头」，向已开始的响应追加错误体。
+	w.wroteHeader = true
+
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -91,7 +95,14 @@ func (w *recoveryWriter) Flush() {
 
 func (w *recoveryWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
-		return hj.Hijack()
+		conn, bufrw, err := hj.Hijack()
+		if err == nil {
+			// 连接已交给调用方，HTTP 响应阶段结束；之后再 panic 不得向被劫持的
+			// 连接追加错误体（net/http 会拒绝写，但 recover 仍会误走写错误分支）。
+			w.wroteHeader = true
+		}
+
+		return conn, bufrw, err
 	}
 
 	return nil, nil, http.ErrNotSupported
@@ -106,6 +117,11 @@ func (w *recoveryWriter) Push(target string, opts *http.PushOptions) error {
 }
 
 func (w *recoveryWriter) ReadFrom(r io.Reader) (int64, error) {
+	// ReadFrom 直接写底层 ResponseWriter，不经过本类型的 Write。必须在这里同步
+	// 标记响应头已写出，否则 sendfile/io.Copy 路径之后再 panic 会被 recover 误判
+	// 成「尚未写头」，向已开始发送的响应追加第二个错误体。
+	w.wroteHeader = true
+
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
 	}

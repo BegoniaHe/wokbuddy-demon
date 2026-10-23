@@ -727,6 +727,40 @@ func TestBasesAlwaysCN(t *testing.T) {
 	}
 }
 
+// TestChatBaseNormalizesConfiguredSuffix chatBase 是全部「chat 同源」端点的
+// base 出口（images / modelbusy / v3/config / 任务 / 旅行）：配置允许 host /
+// host/v2 / host/v2/chat/completions，出口必须先归一，否则这些路径会拼出
+// /v2/v2/...。chat/search 此前的各自归一只是局部修复。
+func TestChatBaseNormalizesConfiguredSuffix(t *testing.T) {
+	t.Parallel()
+
+	for _, base := range []string{
+		"https://srv.example",
+		"https://srv.example/v2",
+		"https://srv.example/v2/chat/completions",
+	} {
+		client := testClient(nil)
+		client.ChatBaseCN = base
+
+		if got := client.chatBase(&auth.Auth{}); got != "https://srv.example" {
+			t.Errorf("cn base=%q -> %q want https://srv.example", base, got)
+		}
+	}
+
+	global := &auth.Auth{UID: "g1"}
+	if _, err := auth.BackfillRealmFor(global, "global"); err != nil {
+		t.Fatal(err)
+	}
+
+	client := testClient(nil)
+	client.GlobalEnabled = true
+	client.ChatBaseGlobal = "https://global.example/v2/chat/completions"
+
+	if got := client.chatBase(global); got != "https://global.example" {
+		t.Errorf("global base -> %q want https://global.example", got)
+	}
+}
+
 func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	t.Parallel()
 

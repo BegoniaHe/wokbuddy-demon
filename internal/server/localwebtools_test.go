@@ -40,7 +40,18 @@ func TestValidateWebURLAllowsPublicIP(t *testing.T) {
 func TestBlockedIPClasses(t *testing.T) {
 	t.Parallel()
 
-	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.1.1", "::1", "fc00::1", "fe80::1"} {
+	for _, raw := range []string{
+		"127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.1.1",
+		"::1", "fc00::1", "fe80::1",
+		// 非私网但不可公网访问：CGNAT/Tailscale、0/8、IETF、基准测试与保留段。
+		"100.64.1.1", "100.100.100.100", "0.1.2.3", "192.0.0.1", "198.18.0.1", "240.0.0.1",
+		// IPv6 文档/基准/丢弃段。
+		"100::1", "2001:2::1", "2001:db8::1", "3fff::1",
+		// IPv4 过渡/转换前缀：NAT64（含内网 IPv4）、Teredo、6to4。
+		"64:ff9b::a00:1", "64:ff9b::7f00:1", "64:ff9b:1::a00:1", "2001::a00:1", "2002:a00:1::",
+		// IPv4 兼容/转换形态与已废弃的 site-local。
+		"::7f00:1", "::ffff:0:7f00:1", "fec0::1",
+	} {
 		ip := parseIP(t, raw)
 		if !isBlockedIP(ip) {
 			t.Errorf("%s should be blocked", raw)
@@ -49,6 +60,13 @@ func TestBlockedIPClasses(t *testing.T) {
 
 	if isBlockedIP(parseIP(t, "93.184.216.34")) {
 		t.Error("public IP blocked")
+	}
+
+	// NAT64 知名前缀按内嵌 IPv4 判定：公网目标必须放行（IPv6-only/DNS64 环境）。
+	for _, raw := range []string{"64:ff9b::808:808", "64:ff9b::5db8:d822"} {
+		if isBlockedIP(parseIP(t, raw)) {
+			t.Errorf("%s (public NAT64) should be allowed", raw)
+		}
 	}
 }
 
