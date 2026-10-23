@@ -274,10 +274,6 @@ func (h *Handler) recordImagesAttempt(
 		trace.noteResult(logfmt.Label(acct.UID, acct.NicknameValue()), model, outcome)
 	}
 
-	if h.cfg.Usage == nil {
-		return
-	}
-
 	delta := &usage.Delta{
 		LatencyMs: attemptLatencyMs(started), HasLatency: true,
 	}
@@ -298,6 +294,18 @@ func (h *Handler) recordImagesAttempt(
 			delta.TotalTokens, delta.HasTotal = payload.Usage.TotalTokens, payload.Usage.TotalTokens > 0
 			delta.Credit, delta.HasCredit = payload.Usage.Credit, payload.Usage.Credit > 0
 		}
+	}
+
+	// 命名密钥用量回填：与 chat / anthropic / gemini / responses 同口径，
+	// 必须在 withClientAuth 落账前把本次 token 计入该密钥（否则只记请求数）。
+	if ku := keyUsageFrom(r.Context()); ku != nil {
+		ku.prompt += delta.PromptTokens
+		ku.completion += delta.CompletionTokens
+		ku.total += delta.TotalTokens
+	}
+
+	if h.cfg.Usage == nil {
+		return
 	}
 
 	h.cfg.Usage.Add(time.Now(), realm, acct.UID, model, delta, ok)
