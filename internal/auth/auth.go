@@ -252,7 +252,9 @@ func BackfillRealmFor(auth *Auth, realm string) (bool, error) {
 		return false, errNilAuth
 	}
 
-	switch strings.TrimSpace(realm) {
+	realm = strings.TrimSpace(realm)
+
+	switch realm {
 	case realmCN, realmGlobal:
 	default:
 		return false, fmt.Errorf("realm must be cn/global, got %q: %w", realm, errBackfillRealmForFailed)
