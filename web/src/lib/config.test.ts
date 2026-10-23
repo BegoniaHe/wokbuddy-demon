@@ -18,6 +18,8 @@ describe('durationBad', () => {
     expect(durationBad('30m')).toBe(false);
     expect(durationBad('1h30m')).toBe(false);
     expect(durationBad('600s')).toBe(false);
+    // time.ParseDuration("0") 合法；时序整形把 "0" 作为关闭回滚值。
+    expect(durationBad('0')).toBe(false);
   });
   it('脏值标红', () => {
     expect(durationBad('abc')).toBe(true);
@@ -32,6 +34,7 @@ describe('collectConfig', () => {
   });
   it('覆盖型字段空串照发', () => {
     expect(collectConfig({ user_agent: '' })).toEqual({ upstream: { user_agent: '' } });
+    expect(collectConfig({ timing_salt: '' })).toEqual({ schedule: { timing_salt: '' } });
   });
   it('hours 字段拆分成数字数组', () => {
     expect(collectConfig({ checkin_hours: '9, 21' })).toEqual({ schedule: { checkin_hours: [9, 21] } });
@@ -54,6 +57,27 @@ describe('collectConfig', () => {
   it('数字列表字段复用 hours 拆分', () => {
     expect(collectConfig({ rotate_status_codes: '429, 500' })).toEqual({
       upstream: { rotate_status_codes: [429, 500] },
+    });
+  });
+  it('时序整形字段拆分正确', () => {
+    expect(
+      collectConfig({
+        slot_jitter: '20m',
+        account_pacing_sigma: '0.4',
+        account_pacing_floor: '250ms',
+        account_pacing_ceiling: '6s',
+        account_phase_window: '10m',
+        timing_salt: 'abc',
+      }),
+    ).toEqual({
+      schedule: {
+        slot_jitter: '20m',
+        account_pacing_sigma: 0.4,
+        account_pacing_floor: '250ms',
+        account_pacing_ceiling: '6s',
+        account_phase_window: '10m',
+        timing_salt: 'abc',
+      },
     });
   });
   it('secret 字段空值不下发（保留磁盘原值）', () => {

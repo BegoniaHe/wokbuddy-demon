@@ -492,7 +492,13 @@ gemini
 | `schedule.activity_hours` | `[10]` | 每日整点对话活跃上报 |
 | `schedule.keepalive_hours` | `[22]` | 每日整点刷新凭证保活 |
 | `schedule.blackcat_hours` | `[23]` | 每日整点夜猫子补足 |
-| `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；`0` = 不限 |
+| `schedule.checkin_account_delay` | `800ms` | 签到任务账号间等待；开启时序整形后作为对数正态 median；`0` = 不限 |
+| `schedule.slot_jitter` | `20m` | 整点后确定性抖动窗口（`0 ≤ J < W`）；`0` = 整点触发；最大 `59m` |
+| `schedule.account_pacing_sigma` | `0.4` | 账号间间隔对数正态 σ（均值仍为配置的 median）；`0` = 固定间隔；范围 `0~1.5` |
+| `schedule.account_pacing_floor` | `250ms` | 账号间间隔下夹逼；`0` = 不设下限 |
+| `schedule.account_pacing_ceiling` | `6s` | 账号间间隔上夹逼；`0` = 不设上限 |
+| `schedule.account_phase_window` | `10m` | 每号每日相位错峰窗口；`0` = 只打乱顺序不错峰 |
+| `schedule.timing_salt` | 空 | 抖动/相位派生盐；空 = 内置常量 |
 | `schedule.task_sweep_enabled` | `true` | 任务补领清扫总开关：周期扫全部非禁用账号，**先接受未接受任务、再幂等补领「已达标未领」的成长任务奖励**（补领不代做任务；默认/mp 双口径；global/企业版账号零上游请求；忙账号整轮跳过）。热生效 |
 | `schedule.task_sweep_minutes` | `15` | 补领清扫间隔（分钟）；`<=0` 回落 15。热生效 |
 | `schedule.*_enabled` | `true` | 五类任务各自的总开关 |

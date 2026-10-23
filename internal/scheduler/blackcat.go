@@ -28,15 +28,15 @@ func (s *Scheduler) RunBlackcatNow() {
 }
 
 // blackcatAll 夜猫子实体：返回尝试/成功/失败账号数（窗口外/门控跳过不计数）。
-func (s *Scheduler) blackcatAll() (total, success, failure int) {
+func (s *Scheduler) blackcatAll(ctx context.Context) (total, success, failure int) {
 	if !upstream.InNightWindow(s.now()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return 0, 0, 0
 	}
 
-	var runCounters2 runCounters
-
 	all := s.cfg.Pool.List()
+	targets := make([]batchTarget, 0, len(all))
+
 	for i := range all {
 		status := &all[i]
 		// 暂停选号（paused）账号跳过：夜猫子是全任务体系中唯一「整任务都是
@@ -59,10 +59,10 @@ func (s *Scheduler) blackcatAll() (total, success, failure int) {
 			continue // 企业版 / 企业切换会话门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」）
 		}
 
-		runCounters2.record(s.blackcatOne(account))
+		targets = append(targets, batchTarget{uid: account.UID, run: func() bool { return s.blackcatOne(account) }})
 	}
 
-	return runCounters2.total, runCounters2.success, runCounters2.failure
+	return s.runPacedBatch(ctx, taskBlackcat, activityAccountDelay, targets)
 }
 
 // blackcatOne 单账号夜猫子补足：查需补的对话数 → 跑夜间对话；已补足（need<=0）则跳过。
@@ -85,7 +85,6 @@ func (s *Scheduler) blackcatOne(account *auth.Auth) bool {
 	}
 
 	log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(account.UID, account.NicknameValue()), ok)
-	time.Sleep(activityAccountDelay)
 
 	return true
 }

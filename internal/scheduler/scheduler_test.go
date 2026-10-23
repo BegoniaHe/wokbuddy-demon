@@ -28,21 +28,21 @@ func TestNextFire(t *testing.T) {
 	loc := cst.Loc
 	now := time.Date(2026, 7, 27, 10, 0, 0, 0, loc)
 
-	next := nextFireIn(now, []int{9, 21}, nil)
+	next := nextFireIn(now, []int{9, 21})
 	if next.Hour() != 21 || next.Day() != 27 {
 		t.Errorf("next=%v want 21:00 same day", next)
 	}
 
 	now = time.Date(2026, 7, 27, 22, 0, 0, 0, loc)
 
-	next = nextFireIn(now, []int{9, 21}, nil)
+	next = nextFireIn(now, []int{9, 21})
 	if next.Hour() != 9 || next.Day() != 28 {
 		t.Errorf("next=%v want 09:00 next day", next)
 	}
 
 	now = time.Date(2026, 7, 27, 9, 0, 0, 0, loc)
 
-	next = nextFireIn(now, []int{9}, nil)
+	next = nextFireIn(now, []int{9})
 	if next.Day() != 28 {
 		t.Errorf("exact match should roll to next day: %v", next)
 	}
@@ -53,7 +53,7 @@ func TestNextFireMergesSchedules(t *testing.T) {
 
 	now := time.Date(2026, 7, 27, 20, 0, 0, 0, cst.Loc)
 
-	next := nextFireIn(now, []int{9, 21, 22}, nil)
+	next := nextFireIn(now, []int{9, 21, 22})
 	if next.Hour() != 21 {
 		t.Errorf("next=%v want 21 (earliest of 21/22)", next)
 	}
@@ -1090,13 +1090,13 @@ func TestNextFireAcrossDST(t *testing.T) {
 
 	// 2026-10-25 03:00 CEST 回拨到 02:00 CET：Add(24h) 会把 09:00 变成 08:00。
 	now := time.Date(2026, 10, 24, 10, 0, 0, 0, loc)
-	if next := nextFireIn(now, []int{9}, nil); next.Hour() != 9 || next.Day() != 25 {
+	if next := nextFireIn(now, []int{9}); next.Hour() != 9 || next.Day() != 25 {
 		t.Errorf("回拨日 next=%v want 2026-10-25 09:00", next)
 	}
 
 	// 2026-03-29 02:00 CET 拨快到 03:00 CEST：Add(24h) 会把 09:00 变成 10:00。
 	now = time.Date(2026, 3, 28, 10, 0, 0, 0, loc)
-	if next := nextFireIn(now, []int{9}, nil); next.Hour() != 9 || next.Day() != 29 {
+	if next := nextFireIn(now, []int{9}); next.Hour() != 9 || next.Day() != 29 {
 		t.Errorf("拨快日 next=%v want 2026-03-29 09:00", next)
 	}
 }
@@ -1117,7 +1117,7 @@ func TestNextFireSkippedMidnight(t *testing.T) {
 		time.Date(2026, 9, 5, 22, 0, 0, 0, loc),  // 归一化结果 23:00 在未来但小时错误
 		time.Date(2026, 9, 5, 23, 30, 0, 0, loc), // 归一化结果 23:00 已是过去时刻
 	} {
-		next := nextFireIn(now, []int{0}, nil)
+		next := nextFireIn(now, []int{0})
 		if !next.After(now) {
 			t.Fatalf("now=%v next=%v 未晚于 now（过去时刻会让调度器空转）", now, next)
 		}
@@ -1142,7 +1142,7 @@ func TestNextFirePartialSkippedHour(t *testing.T) {
 
 	now := time.Date(2026, 9, 27, 2, 0, 0, 0, loc)
 
-	next := nextFireIn(now, []int{3}, nil)
+	next := nextFireIn(now, []int{3})
 	if want := time.Date(2026, 9, 27, 3, 45, 0, 0, loc); !next.Equal(want) {
 		t.Fatalf("now=%v next=%v want %v（03:45 是该小时首个实际时刻）", now, next, want)
 	}
