@@ -104,6 +104,34 @@ func TestModifiedRequiresForce(t *testing.T) {
 	}
 }
 
+func TestValidateOptionsRejectsMalformedBaseURL(t *testing.T) {
+	t.Parallel()
+
+	for _, baseURL := range []string{"", "ftp://example.com", "http://", "http:///path", "not a url"} {
+		t.Run(baseURL, func(t *testing.T) {
+			t.Parallel()
+
+			opts := Options{BaseURL: baseURL, APIKey: "sk-test", Model: "glm-5.2"}
+			if err := validateOptions(&opts); !errors.Is(err, errBaseURLHTTPS) {
+				t.Errorf("validateOptions(base_url=%q) err=%v want %v", baseURL, err, errBaseURLHTTPS)
+			}
+		})
+	}
+}
+
+func TestValidateOptionsTrimsBaseURL(t *testing.T) {
+	t.Parallel()
+
+	opts := Options{BaseURL: "  https://example.com/v1  ", APIKey: "sk-test", Model: "glm-5.2"}
+	if err := validateOptions(&opts); err != nil {
+		t.Fatal(err)
+	}
+
+	if opts.BaseURL != "https://example.com/v1" {
+		t.Errorf("BaseURL=%q want trimmed value", opts.BaseURL)
+	}
+}
+
 func TestApplyCodexKeepsRootKeysOutOfTables(t *testing.T) {
 	t.Parallel()
 	home := t.TempDir()

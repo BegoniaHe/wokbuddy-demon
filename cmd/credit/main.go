@@ -46,18 +46,23 @@ var (
 // workbuddy.ai 家族，都按国际版处理。cmd/credit 早先对所有账号硬编码 CN 域，
 // 导致 global 账号余额查询恒返回 401（面板显示的是池内缓存值，不是实时的）。
 func billingBaseFor(af *authFile) string {
-	if strings.EqualFold(strings.TrimSpace(af.Auth.Realm), "global") {
-		return billingBaseGlobal
-	}
-
-	d := strings.ToLower(strings.TrimSpace(af.Auth.Domain))
-	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
+	if strings.EqualFold(strings.TrimSpace(af.realm()), "global") || isGlobalDomain(af.domain()) {
 		return billingBaseGlobal
 	}
 
 	return billingBaseCN
 }
 
+// isGlobalDomain 与 internal/auth 的判定同口径：workbuddy.ai 家族为国际版。
+// 不能因为显式 realm=cn 就短路 domain 判定——服务端 Realm() 同样是 domain 优先。
+func isGlobalDomain(domain string) bool {
+	d := strings.ToLower(strings.TrimSpace(domain))
+
+	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+}
+
+// authFile 兼容 internal/auth 支持的两种磁盘形态：嵌套形（插件 OAuth）与
+// 扁平形（手写/旧版）。扁平字段用 Flat 后缀，避免与嵌套结构同名字段冲突。
 type authFile struct {
 	Auth struct {
 		AccessToken string `json:"accessToken"`
@@ -69,6 +74,63 @@ type authFile struct {
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	} `json:"account"`
+
+	FlatAccessToken  string `json:"accessToken"`
+	FlatDomain       string `json:"domain"`
+	FlatRealm        string `json:"realm"`
+	FlatUID          string `json:"uid"`
+	FlatEnterpriseID string `json:"enterpriseId"`
+	FlatNickname     string `json:"nickname"`
+}
+
+// accessToken/domain/realm/uid/enterpriseID/nickname 优先取嵌套形，缺失时回落
+// 扁平形；与 internal/auth.Parse 的取值口径一致。
+func (a *authFile) accessToken() string {
+	if a.Auth.AccessToken != "" {
+		return a.Auth.AccessToken
+	}
+
+	return a.FlatAccessToken
+}
+
+func (a *authFile) domain() string {
+	if a.Auth.Domain != "" {
+		return a.Auth.Domain
+	}
+
+	return a.FlatDomain
+}
+
+func (a *authFile) realm() string {
+	if a.Auth.Realm != "" {
+		return a.Auth.Realm
+	}
+
+	return a.FlatRealm
+}
+
+func (a *authFile) uid() string {
+	if a.Account.UID != "" {
+		return a.Account.UID
+	}
+
+	return a.FlatUID
+}
+
+func (a *authFile) enterpriseID() string {
+	if a.Account.EnterpriseID != "" {
+		return a.Account.EnterpriseID
+	}
+
+	return a.FlatEnterpriseID
+}
+
+func (a *authFile) nickname() string {
+	if a.Account.Nickname != "" {
+		return a.Account.Nickname
+	}
+
+	return a.FlatNickname
 }
 
 type accountResult struct {
@@ -180,21 +242,21 @@ func newUserResourceRequest(authFile2 *authFile) (*http.Request, error) {
 		return nil, fmt.Errorf("newUserResourceRequest: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+authFile2.Auth.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+authFile2.accessToken())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 
-	if authFile2.Account.UID != "" {
-		req.Header.Set("X-User-Id", authFile2.Account.UID)
+	if uid := authFile2.uid(); uid != "" {
+		req.Header.Set("X-User-Id", uid)
 	}
 
-	if authFile2.Account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", authFile2.Account.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", authFile2.Account.EnterpriseID)
+	if enterpriseID := authFile2.enterpriseID(); enterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", enterpriseID)
+		req.Header.Set("X-Tenant-Id", enterpriseID)
 	}
 
-	if authFile2.Auth.Domain != "" {
-		req.Header.Set("X-Domain", authFile2.Auth.Domain)
+	if domain := authFile2.domain(); domain != "" {
+		req.Header.Set("X-Domain", domain)
 	}
 
 	return req, nil
@@ -303,8 +365,8 @@ func collectAccounts(files []string) []accountResult {
 		}
 
 		res := accountResult{
-			UID:      authFile2.Account.UID,
-			Nickname: authFile2.Account.Nickname,
+			UID:      authFile2.uid(),
+			Nickname: authFile2.nickname(),
 			Remain:   nil,
 			Used:     nil,
 			Size:     nil,
@@ -312,7 +374,7 @@ func collectAccounts(files []string) []accountResult {
 			OK:       false,
 			Error:    "",
 		}
-		if authFile2.Auth.AccessToken == "" {
+		if authFile2.accessToken() == "" {
 			res.Error = "no accessToken"
 			accounts = append(accounts, res)
 
