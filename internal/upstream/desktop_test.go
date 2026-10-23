@@ -65,6 +65,10 @@ func assertReportDesktopRequest(t *testing.T, r *http.Request) {
 	if r.Header.Get("X-Product") != "SaaS" {
 		t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
 	}
+
+	if got := r.Header.Get("X-Request-ID"); !uuidV7HeaderPattern.MatchString(got) {
+		t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
+	}
 }
 
 // assertDesktopEventFingerprint 断言上报事件被注入 workbuddy-desktop 公共指纹。
@@ -95,9 +99,11 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	if table["mode"] != "craft" {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", table["mode"])
 	}
-	// machineId 应为 uid 稳定派生（36 hex）。
-	if len(table["machineId"].(string)) != 36 {
-		t.Errorf("machineId 长度=%d want 36", len(table["machineId"].(string)))
+	// machineId/sessionId 应为 uid 稳定派生的连字符 UUIDv4。
+	for _, key := range []string{"machineId", "sessionId"} {
+		if got, _ := table[key].(string); !uuidV4HeaderPattern.MatchString(got) {
+			t.Errorf("%s=%q want UUIDv4", key, got)
+		}
 	}
 
 	assertDesktopMachineFingerprint(t, table)
@@ -182,6 +188,29 @@ func TestDesktopChatSequenceShape(t *testing.T) {
 
 	if resp["conversationId"] != "conv-1" {
 		t.Errorf("conversationId=%v want conv-1", resp["conversationId"])
+	}
+}
+
+// TestDesktopChatSequenceAssistantMessageID 助手消息必须使用独立于用户消息的
+// UUIDv7 messageId，并在 send/response/status 三个事件间保持一致。
+func TestDesktopChatSequenceAssistantMessageID(t *testing.T) {
+	t.Parallel()
+
+	events := DesktopChatSequence("conv-1", "req-1", "user-msg", "fast-model", "fast-model")
+
+	assistantID, _ := events[1]["messageId"].(string)
+	if !uuidV7HeaderPattern.MatchString(assistantID) {
+		t.Fatalf("assistant messageId=%q want UUIDv7", assistantID)
+	}
+
+	if assistantID == events[0]["messageId"] {
+		t.Fatalf("assistant messageId 复用了用户消息 id: %q", assistantID)
+	}
+
+	for _, i := range []int{3, 4} {
+		if got := events[i]["messageId"]; got != assistantID {
+			t.Errorf("events[%d].messageId=%v want %q", i, got, assistantID)
+		}
 	}
 }
 

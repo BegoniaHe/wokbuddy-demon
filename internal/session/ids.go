@@ -11,17 +11,19 @@ import (
 	"bytes"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"time"
 )
 
-// NewMessageID 生成消息级 ID：32 位 hex（UUID v4 去横线的长度形态），对齐官方
-// X-Request-ID / X-Conversation-Message-ID。crypto/rand 失败（理论上不可能）时回落
-// math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法，可安全用作 B3 TraceId。
+// NewMessageID 生成随机 32 位 hex（无 UUID 版本位），仅用于 B3 span 等不要求
+// UUID 语义的短标识；消息/请求级 ID 用 NewUUIDv7Hex。crypto/rand 失败（理论上
+// 不可能）时回落 math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法。
 func NewMessageID() string {
 	b := make([]byte, 16)
 	if _, err := cryptorand.Read(b); err == nil {
@@ -29,6 +31,52 @@ func NewMessageID() string {
 	}
 	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
 	return fmt.Sprintf("%016x%016x", rand.Uint64()|1, rand.Uint64())
+}
+
+// NewUUIDv7Hex 生成 32 位小写 hex 的 UUIDv7（去连字符），对齐官方
+// generateConversationRequestId / X-Conversation-Request-ID 校验正则：
+// ^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$。
+// 前 48 位为 Unix 毫秒时间戳，剩余位来自 crypto/rand；熵源失败时回落
+// math/rand/v2，版本/变体位仍在返回前强制写入。
+func NewUUIDv7Hex() string {
+	var buf [16]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1)
+		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())
+	}
+
+	var timestamp [8]byte
+	binary.BigEndian.PutUint64(timestamp[:], uint64(time.Now().UnixMilli()))
+	// Unix 毫秒只占 8 字节的后 6 字节（高 2 字节恒 0），UUIDv7 取低 48 位时间戳。
+	copy(buf[:6], timestamp[2:])
+
+	return uuidV7Hex(buf[:])
+}
+
+// NewUUIDv4 生成标准带连字符 UUIDv4（8-4-4-4-12，version=4、variant=10xx），
+// 用于会话级兜底 ID（官方 crypto.randomUUID() 同款形态）。
+func NewUUIDv4() string {
+	var buf [16]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
+		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1)
+		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())
+	}
+
+	buf[6] = buf[6]&0x0f | 0x40
+	buf[8] = buf[8]&0x3f | 0x80
+
+	h := hex.EncodeToString(buf[:])
+
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// uuidV7Hex 将 16 字节的版本/变体位改成 UUIDv7 后编码为 32 hex。
+// 调用方保证 b 至少 16 字节（可直接传 sha256 派生结果）。
+func uuidV7Hex(b []byte) string {
+	b[6] = b[6]&0x0f | 0x70
+	b[8] = b[8]&0x3f | 0x80
+
+	return hex.EncodeToString(b[:16])
 }
 
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法
@@ -44,15 +92,15 @@ var deriveSalt = NewMessageID()
 //   - 空 key：每次生成新值（无会话则无"会话内稳定"语义——调用方应在请求级
 //     捕获复用，handler 在轮转循环外取一次即天然共享）。
 //
-// 返回值恒为 32 hex（NewMessageID 形态），可直接用作 B3 TraceId（16/32 hex 合法）。
+// 返回值恒为 UUIDv7 形态的 32 hex，可直接用作 B3 TraceId（16/32 hex 合法）。
 func RequestIDForKey(key string) string {
 	if key == "" {
-		return NewMessageID()
+		return NewUUIDv7Hex()
 	}
 
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + key))
 
-	return hex.EncodeToString(sum[:16])
+	return uuidV7Hex(sum[:])
 }
 
 // turnMessage TurnKey 只读 role 与 content：content 用 bodyRaw 直接引用请求体
@@ -188,8 +236,8 @@ func partsSignature(raw json.RawMessage, renderNonText func(typeName string, raw
 	return strings.TrimSpace(out)
 }
 
-// TurnRequestID 返回轮级键对应的聚合 ID：sha256(盐|键) 前 16 字节的 hex（32 位，
-// 与 NewMessageID 同形态，可直接作 B3 TraceId）。
+// TurnRequestID 返回轮级键对应的聚合 ID：sha256(盐|键) 前 16 字节强制为
+// UUIDv7 版本/变体位后的 32 hex（可直接作 B3 TraceId）。
 //
 // 纯派生，无缓存、无 TTL、不随进程内请求数增长内存 —— 这点与会话级的
 // RequestIDForKey 相反：会话键数量有限（与粘性会话同源）可以常驻缓存，而轮级键
@@ -197,10 +245,10 @@ func partsSignature(raw json.RawMessage, renderNonText func(typeName string, raw
 // 空键返回新随机值（无轮可聚合时保持原有的「每请求独立」行为）。
 func TurnRequestID(turnKey string) string {
 	if turnKey == "" {
-		return NewMessageID()
+		return NewUUIDv7Hex()
 	}
 
 	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
 
-	return hex.EncodeToString(sum[:16])
+	return uuidV7Hex(sum[:])
 }

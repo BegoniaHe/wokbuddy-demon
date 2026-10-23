@@ -38,7 +38,7 @@ func searchMetaFromRequest(r *http.Request) upstream.ChatMeta {
 		TraceID:               strings.TrimSpace(r.Header.Get("X-Trace-Id")),
 	}
 	if meta.ConversationRequestID == "" {
-		meta.ConversationRequestID = session.NewMessageID()
+		meta.ConversationRequestID = session.NewUUIDv7Hex()
 	}
 
 	return meta

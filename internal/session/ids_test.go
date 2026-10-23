@@ -2,9 +2,12 @@ package session
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // imagePartSig 计算 part 原文摘要（sha256 前 8 hex），供期望值精确构造——
@@ -53,6 +56,67 @@ func TestExtractSessionConversationID(t *testing.T) {
 	}
 }
 
+// uuidV7HexPattern 官方 X-Conversation-Request-ID 校验正则（32 位小写 hex、version=7、variant=10xx）。
+var uuidV7HexPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
+
+// uuidV4Pattern 标准 UUIDv4（8-4-4-4-12）。
+var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// TestNewUUIDv7HexFormat 64 次采样均匹配官方正则，且两次调用不相等。
+func TestNewUUIDv7HexFormat(t *testing.T) {
+	t.Parallel()
+
+	prev := NewUUIDv7Hex()
+	for range 64 {
+		id := NewUUIDv7Hex()
+		if !uuidV7HexPattern.MatchString(id) {
+			t.Fatalf("NewUUIDv7Hex() = %q 不匹配官方正则", id)
+		}
+
+		if id == prev {
+			t.Fatalf("连续两次 UUIDv7 相同: %q", id)
+		}
+
+		prev = id
+	}
+}
+
+// TestNewUUIDv7HexTimestamp 前 48 位必须是当前 Unix 毫秒（允许调用前后 1s 抖动）。
+func TestNewUUIDv7HexTimestamp(t *testing.T) {
+	t.Parallel()
+
+	before := time.Now().UnixMilli()
+
+	id := NewUUIDv7Hex()
+
+	after := time.Now().UnixMilli()
+
+	raw, err := hex.DecodeString(id)
+	if err != nil {
+		t.Fatalf("DecodeString(%q): %v", id, err)
+	}
+
+	var high [8]byte
+	copy(high[2:], raw[:6])
+
+	got := int64(binary.BigEndian.Uint64(high[:]))
+	if got < before || got > after {
+		t.Fatalf("UUIDv7 时间戳=%d 不在 [%d,%d]（前 48 位未写入当前毫秒）", got, before, after)
+	}
+}
+
+// TestNewUUIDv4Format 64 次采样均匹配标准 UUIDv4。
+func TestNewUUIDv4Format(t *testing.T) {
+	t.Parallel()
+
+	for range 64 {
+		id := NewUUIDv4()
+		if !uuidV4Pattern.MatchString(id) {
+			t.Fatalf("NewUUIDv4() = %q 不匹配 UUIDv4", id)
+		}
+	}
+}
+
 // TestNewMessageIDFormat 32 位 hex 且不为空、两次调用大概率不同（随机性冒烟）。
 func TestNewMessageIDFormat(t *testing.T) {
 	t.Parallel()
@@ -93,10 +157,10 @@ func TestRequestIDForKeyStability(t *testing.T) {
 	if str == e2 {
 		t.Errorf("empty key should yield fresh values each call: %q", str)
 	}
-	// 稳定值自身也须是 32 hex（可作 B3 TraceId 直接使用）。
+	// 稳定值自身也须是 UUIDv7 形态的 32 hex（可作 B3 TraceId 直接使用）。
 	for _, id := range []string{k1a, str2, str} {
-		if len(id) != 32 {
-			t.Errorf("RequestIDForKey value %q len=%d want 32", id, len(id))
+		if !uuidV7HexPattern.MatchString(id) {
+			t.Errorf("RequestIDForKey value %q 不匹配 UUIDv7", id)
 		}
 	}
 }

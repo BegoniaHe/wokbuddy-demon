@@ -5,7 +5,6 @@ package scheduler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -16,6 +15,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -860,8 +860,8 @@ func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure in
 
 		first = false
 
-		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
-		if err := s.cfg.Upstream.ReportChatActivity(account, cid, ""); err != nil {
+		cid := session.NewUUIDv4()
+		if err := s.cfg.Upstream.ReportChatActivity(account, cid, session.NewUUIDv7Hex()); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
 			s.notifyTaskFailed("activity", account.UID, account.NicknameValue(), account.Realm())
 			runCounters2.record(false)

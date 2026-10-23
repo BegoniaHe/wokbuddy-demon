@@ -7,13 +7,12 @@
 package upstream
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 // streakRedeemPath / lottery 路径（growth 域，growthJSON 走 www.workbuddy.cn）。
@@ -23,14 +22,9 @@ const (
 	lotteryDrawPath    = "/activity/growth/lottery/draw"
 )
 
-// clientToken 幂等令牌（前端 randomUUID 同款语义）。
+// clientToken 幂等令牌（前端 randomUUID 同款语义：标准 UUIDv4）。
 func clientToken() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-
-	return fmt.Sprintf("%s-%s-%s-%s-%s",
-		hex.EncodeToString(b[0:4]), hex.EncodeToString(b[4:6]), hex.EncodeToString(b[6:8]),
-		hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16]))
+	return session.NewUUIDv4()
 }
 
 // StreakFull 连登完整状态（GET /activity/growth/streak）。

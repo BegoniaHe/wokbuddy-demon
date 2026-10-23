@@ -4,13 +4,13 @@ package scheduler
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -172,7 +172,7 @@ func (s *Scheduler) travelAdopt(account *auth.Auth) bool {
 		return true
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
-	if err := s.cfg.Upstream.ReportChatActivity(account, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+	if err := s.cfg.Upstream.ReportChatActivity(account, session.NewUUIDv4(), session.NewUUIDv7Hex()); err != nil {
 		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
 	} else {
 		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）
