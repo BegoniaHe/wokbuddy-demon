@@ -73,7 +73,7 @@ const (
 
 // anthropicMessagesHandler 是 /v1/messages 的入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
-	input, out, ok := newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
+	input, out, ok := h.newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
@@ -286,7 +286,7 @@ func countAnthropicMapBytes(x map[string]any, root bool) int {
 }
 
 // newAnthropicChatInput 读取并转换 Anthropic 请求体；失败时已写出 Anthropic 错误。
-func newAnthropicChatInput(
+func (h *Handler) newAnthropicChatInput(
 	w http.ResponseWriter,
 	r *http.Request,
 	keepalive time.Duration,
@@ -309,7 +309,7 @@ func newAnthropicChatInput(
 		return chatInput{}, nil, false
 	}
 
-	converted, err := anthropicConvert(body)
+	converted, prelude, err := h.anthropicConvertWithSearch(r.Context(), r, body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
 		return chatInput{}, nil, false
@@ -329,6 +329,7 @@ func newAnthropicChatInput(
 
 	return chatInput2, &anthropicResponder{
 		w: w, model: converted.model, keepalive: keepalive, options: converted.options,
+		prelude: prelude,
 	}, true
 }
 
@@ -377,6 +378,11 @@ func anthropicConvert(body []byte) (anthropicConversion, error) {
 		return anthropicConversion{}, err
 	}
 
+	return anthropicConvertRequest(req)
+}
+
+// anthropicConvertRequest 把已解码请求转换为内部 chat 请求（不做搜索）。
+func anthropicConvertRequest(req *anthropicRequest) (anthropicConversion, error) {
 	out, err := buildOpenAIRequest(req)
 	if err != nil {
 		return anthropicConversion{}, err
@@ -1754,11 +1760,19 @@ type anthropicResponder struct {
 	model     string
 	keepalive time.Duration
 	options   anthropicResponseOptions
+	// prelude 响应前部的服务端工具块（server_tool_use / web_search_tool_result）。
+	prelude []any
 }
 
 // JSON 写出非流式 Anthropic Message。
 func (r *anthropicResponder) JSON(status int, body any) {
-	writeJSON(r.w, status, anthropicMessageFromOpenAIWithOptions(body, r.model, r.options))
+	msg := anthropicMessageFromOpenAIWithOptions(body, r.model, r.options)
+	if len(r.prelude) > 0 {
+		content, _ := msg["content"].([]any)
+		msg["content"] = append(append([]any{}, r.prelude...), content...)
+	}
+
+	writeJSON(r.w, status, msg)
 }
 
 // Error 写出 Anthropic 错误信封（保留 gateway_hint 等价字段）。
@@ -1774,6 +1788,7 @@ func (r *anthropicResponder) Header(name, value string) {
 // Stream 读取上游 OpenAI SSE，逐帧转换为 Anthropic SSE 事件。
 func (r *anthropicResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
 	anthropicStreamWriter2 := newAnthropicStreamWriterWithOptions(r.w, r.model, r.options)
+	anthropicStreamWriter2.prelude = r.prelude
 
 	opts := make([]upstream.StreamOption, 0, 2)
 	if onErrFrame != nil {
@@ -2064,6 +2079,8 @@ type anthropicStreamWriter struct {
 	cachedTokens    int
 	cacheWrite      int
 	reasoningTokens int
+	// prelude 服务端工具块，在 message_start 之后、正文之前完整下发。
+	prelude []any
 }
 
 func newAnthropicStreamWriterWithOptions(
@@ -2366,7 +2383,7 @@ func (a *anthropicStreamWriter) ensureStart(chunk map[string]any) error {
 		}
 	}
 
-	return a.event("message_start", map[string]any{
+	if err := a.event("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
 			"id":            id,
@@ -2383,7 +2400,32 @@ func (a *anthropicStreamWriter) ensureStart(chunk map[string]any) error {
 				"cache_read_input_tokens":     a.cachedTokens,
 			},
 		},
-	})
+	}); err != nil {
+		return err
+	}
+
+	return a.emitPrelude()
+}
+
+// emitPrelude 完整下发服务端工具块（start 携带完整 content，随后 stop）。
+func (a *anthropicStreamWriter) emitPrelude() error {
+	for _, block := range a.prelude {
+		a.blockIndex++
+
+		if err := a.event("content_block_start", map[string]any{
+			"type": "content_block_start", "index": a.blockIndex, "content_block": block,
+		}); err != nil {
+			return err
+		}
+
+		if err := a.event("content_block_stop", map[string]any{
+			"type": "content_block_stop", "index": a.blockIndex,
+		}); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // captureUsage 记录 chunk.usage 的 token 数（末帧通常带 usage）。

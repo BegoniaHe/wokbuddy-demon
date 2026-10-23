@@ -532,6 +532,9 @@ type ModelBlockStatus struct {
 	// RateLimited true = 被挡原因全部是 6004 模型级限流（等上游重置），
 	// 而非 11136/11141 的模型不可用（换模型才有用）。上层据此选 429 还是 400。
 	RateLimited bool
+	// Busy true = 被挡原因全部是 14003「模型繁忙」短窗口：可短暂等待后重试，
+	// 上层返回 503 model_busy 而不是 429 rate_limit_exceeded（issue #254）。
+	Busy bool
 	// Scope 阻塞范围：platform / account（见常量）。只读诊断，不参与选号。
 	Scope string
 	// SharedResetAt 平台级时的共享上游重置时刻（账号级为零值）。
@@ -584,8 +587,8 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 
 	now := p.now()
 
-	// RateLimited 默认按限流起步，merge 遇到非 6004 原因时清零。
-	modelBlockStatus := ModelBlockStatus{RateLimited: true}
+	// RateLimited/Busy 默认按限流起步，merge 遇到不匹配原因时清零。
+	modelBlockStatus := ModelBlockStatus{RateLimited: true, Busy: true}
 	// 重置时刻一致性统计（issue #29）：distinct 用集合去重，withReset 计带非零
 	// ResetAt 的账号数，shared 记唯一值。
 	var (
@@ -633,6 +636,8 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 func (st *ModelBlockStatus) mergeModelCooldown(modelCooldown2 *modelCooldown, ok bool) {
 	if !ok {
 		st.RateLimited = false
+		st.Busy = false
+
 		return
 	}
 
@@ -642,6 +647,10 @@ func (st *ModelBlockStatus) mergeModelCooldown(modelCooldown2 *modelCooldown, ok
 
 	if !modelRateLimitReason(modelCooldown2.Reason) {
 		st.RateLimited = false
+	}
+
+	if !strings.HasPrefix(modelCooldown2.Reason, "14003") {
+		st.Busy = false
 	}
 
 	if !modelCooldown2.Until.IsZero() && (st.Until.IsZero() || modelCooldown2.Until.Before(st.Until)) {

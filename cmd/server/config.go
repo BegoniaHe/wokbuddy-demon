@@ -274,10 +274,9 @@ type Config struct {
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
 		UserAgent string `json:"user_agent"`
 		// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` 与归属头
-		// X-IDE-Version）。空 = 按 realm 取内置默认（cn 5.8.3 / global 5.8.4，对齐官方分发包）。
+		// X-IDE-Version）。空 = profile.xIdeVersion；profile 缺失仍拒绝启动。
 		ClientVersion string `json:"client_version"`
-		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = 按 realm 取内置默认
-		// （cn 2.161.0 / global 2.161.0，对齐官方内置 CLI）。
+		// CliVersion 出站 UA 中 `CLI/<ver>` 段的版本。空 = profile.source.cliVersion。
 		CliVersion string `json:"cli_version"`
 		// ClientName 自定义用量归属名：非空时 X-Product 与 X-IDE-Name/Type 跟随该值。
 		// 空 = 官方桌面端默认（X-Product="SaaS"、X-IDE-Name/Type="WorkBuddy"）。
@@ -317,11 +316,18 @@ type Config struct {
 		// multimodal_routing 同口径默认关闭；热生效。当前只放行 CN 域账号选号
 		// （上游仅在 CN 域实测过，两域放开留 TODO）。
 		SearchEndpoint bool `json:"search_endpoint"`
+		// ImagesEndpoint 是否开放 POST /v1/images/generations（issue #253）。
+		// 默认 false：图像端点尚未在真实账号验证鉴权/计费，与 search_endpoint 同口径。
+		ImagesEndpoint bool `json:"images_endpoint"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`
 		// LocalWebToolRounds 本地工具最多代跑轮数；<=0 回落 3，>8 钳到 8。
 		LocalWebToolRounds int `json:"local_web_tool_rounds"`
+		// ConversationRequestBody 在当前轮最后一条 user 消息写
+		// conversationRequestId / startsNewUserRequest（issue #249）。默认 false：
+		// 官方桌面端形态，先用真实账号小流量 A/B 确认上游接受后再开启。
+		ConversationRequestBody bool `json:"conversation_request_body"`
 	} `json:"features"`
 
 	Prompt struct {

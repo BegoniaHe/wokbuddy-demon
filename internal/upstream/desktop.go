@@ -1,7 +1,8 @@
 // desktop.go 桌面客户端（WorkBuddy Desktop）行为指纹上报。
 //
-// 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）+ 官方分发包
-// app.asar 逆向（CN 5.8.3 / global 5.8.4）。桌面端点亮「需电脑端」类任务的关键
+// 来源：抓包实测 + 官方 Win32 分发包（win32-x64-user）app.asar 逆向
+// （具体版本/commit/releaseDate 全部来自部署 profile；macOS 包仅辅助对照）。
+// 桌面端点亮「需电脑端」类任务的关键
 // 不是独立端点，而是同一 POST /v2/report 通道上**不同的客户端指纹**：
 //
 //	POST https://www.workbuddy.cn/v2/report           ← chatBase（CLI 上报走 billingBase）
@@ -27,7 +28,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,7 +39,6 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -51,15 +50,6 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-
-	// 官方桌面分发包构建指纹（realm 分档，取自各包 cli/product.json）。
-	//   cn     5.8.3  commit 64d249be…  date 2026-10-14T10:11:49.257Z
-	//   global 5.8.4  commit 73952edb…  date 2026-10-15T11:17:03.116Z
-	// 上报事件 product/releaseDate/commit/ideVersion/extVersion 取此组，与 UA 版本自洽。
-	cnDesktopCommit          = "64d249bed3dec40edd720537d96f27e70a3f6a4f"
-	cnDesktopReleaseDate     = int64(1791972709257) // 2026-10-14T10:11:49.257Z
-	globalDesktopCommit      = "73952edb48da46bd0b244661efe22f4f247c4977"
-	globalDesktopReleaseDate = int64(1792063023116) // 2026-10-15T11:17:03.116Z
 )
 
 // desktopLocal 桌面端事件中 source/mode 字段的本地标记值（官方分发端恒发此值）。
@@ -78,27 +68,39 @@ type desktopBuild struct {
 	releaseDate int64
 }
 
-// desktopBuildFor 按账号 realm 返回桌面构建指纹（nil 账号按 cn）。
-func desktopBuildFor(a *auth.Auth) desktopBuild {
-	if a != nil && a.IsGlobal() {
-		return desktopBuild{version: globalClientVersion, commit: globalDesktopCommit, releaseDate: globalDesktopReleaseDate}
+// desktopBuildFor 按账号 realm 返回 profile 冻结的桌面构建指纹
+// （版本 + commit + releaseDate）。profile 缺失返回零值（启动期已拒绝该状态）。
+func (c *Client) desktopBuildFor(account *auth.Auth) desktopBuild {
+	profile := c.profileFor(account)
+	if profile == nil {
+		return desktopBuild{}
 	}
 
-	return desktopBuild{version: cnClientVersion, commit: cnDesktopCommit, releaseDate: cnDesktopReleaseDate}
+	return desktopBuild{
+		version:     profile.Emit.DesktopIdeVersion,
+		commit:      profile.Source.Commit,
+		releaseDate: profile.Source.ReleaseDate,
+	}
 }
 
-// desktopUAFor 桌面上报/白名单类出站 UA：两段品牌 + CLI 段
-// （`WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cli>`；global 品牌段为 `workbuddy-ai`）。
-// 与 chat 链路的 SDK 形态不同：这是 /v2/report 等非 SDK 请求的官方形态。
-func desktopUAFor(a *auth.Auth) string {
-	build := desktopBuildFor(a)
-
-	brand, cli := "WorkBuddy", cnCliVersion
-	if a != nil && a.IsGlobal() {
-		brand, cli = "workbuddy-ai", globalCliVersion
+// desktopExtVersionFor 上报事件的 extVersion：profile 可独立取值，不跟 ideVersion 绑定。
+func (c *Client) desktopExtVersionFor(account *auth.Auth) string {
+	if p := c.profileFor(account); p != nil && p.Emit.DesktopExtVersion != "" {
+		return p.Emit.DesktopExtVersion
 	}
 
-	return brand + "/" + build.version + " " + brand + "/" + build.version + " CLI/" + cli
+	return c.desktopBuildFor(account).version
+}
+
+// desktopUAFor 桌面上报/白名单类出站 UA：直接取 profile 冻结字面量。
+// 与 chat 链路的 SDK 形态不同：这是 /v2/report 等非 SDK 请求的官方形态。
+// profile 缺失返回空串（启动期已拒绝该状态）。
+func (c *Client) desktopUAFor(account *auth.Auth) string {
+	if p := c.profileFor(account); p != nil {
+		return p.Emit.DesktopUA
+	}
+
+	return ""
 }
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（CN 默认 www.workbuddy.cn）。
@@ -114,11 +116,10 @@ func (c *Client) desktopDomain(a *auth.Auth) string {
 	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://"), "/")
 }
 
-// deriveID 由 uid 稳定派生一个 36 位 hex 设备标识（machineId/sessionId 等复用），
+// deriveID 由 uid 稳定派生一个 UUIDv4 形态设备标识（machineId/sessionId 等复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
 func deriveID(a *auth.Auth, salt string) string {
-	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
+	return deriveUUIDv4(salt + ":" + a.UID)
 }
 
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
@@ -219,11 +220,11 @@ func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) 
 }
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-// 版本/commit/releaseDate 按 realm 取官方分发包真值；os/arch 固定为常见桌面
+// 版本/commit/releaseDate 按 realm 取部署 profile 的官方分发包真值；os/arch 固定为常见桌面
 // （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台；
 // osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
-func desktopFingerprint(account7 *auth.Auth) map[string]any {
-	desktopBuild2 := desktopBuildFor(account7)
+func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
+	desktopBuild2 := c.desktopBuildFor(account7)
 	osVersion, cpuCores, memorySize := desktopHardware(account7)
 	cpuModel := desktopCPUModel(account7, cpuCores)
 	now := time.Now().UnixMilli()
@@ -243,7 +244,7 @@ func desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"machineId":    deriveID(account7, "machine"),
 		"sessionId":    deriveID(account7, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   desktopBuild2.version,
+		"extVersion":   c.desktopExtVersionFor(account7),
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    osVersion,
@@ -273,7 +274,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 		return errDesktopReportNoEvents
 	}
 
-	fp := desktopFingerprint(account2)
+	fp := c.desktopFingerprint(account2)
 
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
@@ -301,11 +302,11 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	req.Header.Set("Authorization", "Bearer "+account2.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUAFor(account2))
+	req.Header.Set("User-Agent", c.desktopUAFor(account2))
 	req.Header.Set("X-Domain", c.desktopDomain(account2))
 	req.Header.Set("X-Product", "SaaS")
 	injectEnterpriseHeaders(req, account2)
-	req.Header.Set("X-Request-ID", deriveID(account2, "req")+strconv.FormatInt(time.Now().UnixNano()%1e6, 10))
+	req.Header.Set("X-Request-ID", session.NewUUIDv7Hex())
 
 	if account2.UID != "" {
 		req.Header.Set("X-User-Id", account2.UID)
@@ -319,14 +320,18 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 // DesktopChatSequence 构造一次「桌面端成功对话」的完整事件链
 // （agent_task_created → chat_message_send → chat_request_send →
 // chat_message_response(isSuccessful) → chat_message_status → chat_request_response）。
-// 实测该链点亮 RichMeow_Chat。conversationID/requestID/messageID 由调用方生成。
+// 实测该链点亮 RichMeow_Chat。conversationID/requestID/messageID 由调用方生成；
+// messageID 是用户消息 id，助手消息必须另有独立 id（原实现用 `<messageID>-assistant`，
+// 改成 UUID 后不能复用同一值，否则两条消息在后台落到同一个 messageId）。
 func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelName string) []DesktopEvent {
+	assistantMessageID := session.NewUUIDv7Hex()
+
 	return []DesktopEvent{
 		desktopTaskCreated(conversationID, messageID, modelID, modelName),
-		desktopMessageSend(conversationID, requestID, messageID),
+		desktopMessageSend(conversationID, requestID, assistantMessageID),
 		desktopRequestSend(conversationID, requestID),
-		desktopMessageResponse(conversationID, requestID, messageID, modelID),
-		desktopMessageStatus(conversationID, requestID, messageID),
+		desktopMessageResponse(conversationID, requestID, assistantMessageID, modelID),
+		desktopMessageStatus(conversationID, requestID, assistantMessageID),
 		desktopRequestResponse(conversationID, requestID),
 	}
 }
@@ -355,7 +360,7 @@ func desktopTaskCreated(conversationID, messageID, modelID, modelName string) De
 
 func desktopMessageSend(conversationID, requestID, messageID string) DesktopEvent {
 	return desktopEvent("chat_message_send", map[string]any{
-		"messageId": messageID + "-assistant", "historyCount": 0,
+		"messageId": messageID, "historyCount": 0,
 		"isContextTruncated": false, "currentStepCount": 1,
 		"traceId": requestID, "rootRequestId": requestID,
 		"parentConversationId": conversationID,
@@ -381,7 +386,7 @@ func desktopRequestSend(conversationID, requestID string) DesktopEvent {
 
 func desktopMessageResponse(conversationID, requestID, messageID, modelID string) DesktopEvent {
 	return desktopEvent("chat_message_response", map[string]any{
-		"messageId": messageID + "-assistant", "responseModelId": modelID,
+		"messageId": messageID, "responseModelId": modelID,
 		"inputToken": 120, "outputToken": 80, "totalToken": 200,
 		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
 		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
@@ -396,7 +401,7 @@ func desktopMessageResponse(conversationID, requestID, messageID, modelID string
 
 func desktopMessageStatus(conversationID, requestID, messageID string) DesktopEvent {
 	return desktopEvent("chat_message_status", map[string]any{
-		"messageId": messageID + "-assistant", "messageErrorCode": "0",
+		"messageId": messageID, "messageErrorCode": "0",
 		"traceId": requestID, "rootRequestId": requestID,
 		"parentConversationId": conversationID,
 		"agentName":            "cli", "agentType": "main",
@@ -437,7 +442,7 @@ func (c *Client) SetAppearanceTheme(account *auth.Auth, resourceKey string) erro
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUAFor(account))
+	req.Header.Set("User-Agent", c.desktopUAFor(account))
 	req.Header.Set("X-Product", "SaaS")
 
 	if account.UID != "" {
@@ -535,7 +540,7 @@ func (c *Client) ReportWebEvent(account6 *auth.Auth, eventCode, pageURL, element
 // template_used {template_id,task_mode}，JOIN 一条完整 chat 链。
 // 三账号实测：5 组（不同模板）一次上报 → 5/5 点亮。
 func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-"+templateID, "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	events = append(events,
 		DesktopEvent{
 			"eventCode": "agent_task_created_with_template", "mode": "working",
@@ -551,7 +556,7 @@ func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateN
 // web_element_click(playbook_ctaClick) + playbook_cta_click + playbook_prompt_send
 // （Dialog 发送 Prompt，带 conversationId/requestId JOIN chat 链）。三账号实测 1/1 点亮。
 func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-pb", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	payload := map[string]any{
 		"id": caseID, "name": caseName, "type": "document",
 		"categoryId": "", "categoryName": "",
@@ -582,7 +587,7 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 // wbx_design_canvas_task_create + wbx_design_canvas_open（Ardot create_design 工具
 // 完成时客户端经 metrics 通道上报，同一 /v2/report 端点）。三账号实测 1/1 点亮。
 func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, "msg-canvas", "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 
 	return append(events,
 		DesktopEvent{
@@ -628,7 +633,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 
 	req.Header.Set("Authorization", "Bearer "+account4.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUAFor(account4))
+	req.Header.Set("User-Agent", c.desktopUAFor(account4))
 	req.Header.Set("X-Domain", c.desktopDomain(account4))
 	req.Header.Set("X-Product", "SaaS")
 
@@ -657,12 +662,12 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(account3 *auth.Auth, expertID string) (conversationID, requestID string, err error) {
-	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
+	conversationID = session.NewUUIDv4()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
 			map[string]any{"role": "system", "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
-			map[string]any{"role": "user", "content": "1+1等于几？直接回答。"},
+			map[string]any{"role": "user", "content": pickChatQuestion()},
 		},
 		"agent":          "cli",
 		"temperature":    1,
@@ -720,7 +725,7 @@ func (c *Client) DesktopChatWithExpert(account3 *auth.Auth, expertID string) (co
 // + 会话头族 + traceparent/b3/X-B3-* 链路族 + acp-connection-id。
 func (c *Client) setDesktopExpertHeaders(req *http.Request, account5 *auth.Auth, conversationID, expertID string) {
 	header := req.Header
-	requestID := session.NewMessageID()
+	requestID := session.NewUUIDv7Hex()
 
 	header.Set("Authorization", "Bearer "+account5.AccessTokenValue())
 	header.Set("Content-Type", "application/json")
@@ -946,7 +951,7 @@ func desktopExpertActualUse(marketExpert2 *MarketExpert, conversationID, request
 		"id":        marketExpert2.ExpertID, "name": marketExpert2.DisplayNameZH, "expertTitle": marketExpert2.ProfessionZH,
 		"type": cat, "expertType": marketExpert2.ExpertType, "source": "builtin", "version": ver,
 		"cost": 9000, "characterCount": 14,
-		"conversationId": conversationID, "requestId": requestID, "messageId": "msg-" + requestID[len(requestID)-8:],
+		"conversationId": conversationID, "requestId": requestID, "messageId": session.NewUUIDv7Hex(),
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 	}
 }

@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "source": {
+    "realm": "cn",
+    "packageUrl": "https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-9.9.9-cccc.exe",
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "packageVersion": "9.9.9",
+    "version": "9.9.9",
+    "cliVersion": "8.8.8",
+    "commit": "cccccccccccccccccccccccccccccccccccccccc",
+    "releaseDate": 1792000000000,
+    "observedAt": "2026-10-22T00:00:00Z",
+    "generatedBy": "reverse-workbuddy@test"
+  },
+  "emit": {
+    "chatUA": "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+    "desktopUA": "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+    "billingUA": "WorkBuddy/9.9.9",
+    "xIdeVersion": "9.9.9",
+    "desktopIdeVersion": "9.9.9",
+    "desktopExtVersion": "9.9.9.7",
+    "loginPlatform": "workbuddy",
+    "loginUA": "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"
+  },
+  "missing": [],
+  "evidence": {
+    "chatUA": {"source": "package", "file": "main/server.js", "snippet": "x"},
+    "desktopUA": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
+    "billingUA": {"source": "package", "file": "main/tar.js", "snippet": "x"},
+    "xIdeVersion": {"source": "package", "file": "main/server.js", "snippet": "x"},
+    "desktopIdeVersion": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
+    "desktopExtVersion": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
+    "loginPlatform": {"source": "package", "file": "cli/product.json", "snippet": "x"},
+    "loginUA": {"source": "package", "file": "main/module-base.js", "snippet": "x"}
+  }
+}

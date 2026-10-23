@@ -1,11 +1,16 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
 // TestNormalizeRoles 验证出站请求体把 developer 角色归一为 system。
@@ -797,5 +802,78 @@ func TestEnsureLeadingSystem(t *testing.T) {
 	in := []byte(`{"messages":[{"role":"system","content":"S"}]}`)
 	if got := ensureLeadingSystem(in); string(got) != string(in) {
 		t.Fatalf("system-first body changed: %s", got)
+	}
+}
+
+// TestInjectConversationRequestID 只给当前轮最后一条 user 消息补字段；客户端自带值优先。
+func TestInjectConversationRequestID(t *testing.T) {
+	t.Parallel()
+
+	in := `{"model":"m","messages":[` +
+		`{"role":"user","content":"old"},` +
+		`{"role":"assistant","content":"a"},` +
+		`{"role":"user","content":"new","conversationRequestId":"client-id"}]}`
+
+	out := injectConversationRequestID([]byte(in), "server-id")
+
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := obj["messages"].([]any)
+
+	if id := msgs[0].(map[string]any)["conversationRequestId"]; id != nil {
+		t.Fatalf("historical turn must not be touched: %v", id)
+	}
+
+	last := msgs[2].(map[string]any)
+	if last["conversationRequestId"] != "client-id" {
+		t.Fatalf("client value must win: %v", last["conversationRequestId"])
+	}
+
+	if last["startsNewUserRequest"] != true {
+		t.Fatalf("startsNewUserRequest=%v", last["startsNewUserRequest"])
+	}
+}
+
+// TestChatStreamInjectsConversationRequestBody 开关开启后出站 body 带轮级字段；
+// prepareBody 管线仍生效（stream:true 等）。
+func TestChatStreamInjectsConversationRequestBody(t *testing.T) {
+	t.Parallel()
+
+	var got []byte
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		got, _ = io.ReadAll(r.Body)
+		return jsonResp(200, "data: [DONE]\n\n"), nil
+	})
+	client.ConversationRequestBody.Store(true)
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at"}
+
+	_, _, _, err := client.ChatStreamContext(context.Background(), account,
+		[]byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`), "",
+		ChatMeta{ConversationID: "conv", ConversationRequestID: "req-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(got, &obj); err != nil {
+		t.Fatal(err)
+	}
+
+	var msg map[string]any
+
+	for _, raw := range obj["messages"].([]any) {
+		candidate := raw.(map[string]any)
+		if candidate["role"] == "user" {
+			msg = candidate
+		}
+	}
+
+	if msg == nil || msg["conversationRequestId"] != "req-1" || msg["startsNewUserRequest"] != true {
+		t.Fatalf("body=%s", got)
 	}
 }

@@ -2,6 +2,9 @@
 
 `SKILL.md` 之外的细节放这里，按需加载；不复制 `AGENTS.md` / `UPSTREAM.md` 的内容。
 
+- `references/client-profile.md`：指纹 profile 的 schema、surface 表、来源分级、
+  校验规则、反伪造硬规则与落点。生成/校验 profile 前必读；补齐/修改 surface 时
+  同步该文件与校验器。
 - `references/protocol-anchors.md`：协议面事实源与锚点速查（端点 / 头族 /
   realm 常量在本仓库的 `path:line`）。调研时先读它，再打开对应文件核实。
 - `scripts/extract_asar.mjs`：从 `.app/Contents/Resources/app.asar` 提取文件树。
@@ -17,7 +20,8 @@
 
   ```bash
   node download_latest.mjs --dry-run                 # 只看版本与 URL
-  node download_latest.mjs                           # cn + global，当前机器平台
+  node download_latest.mjs                           # cn + global 的 Win32 包（事实源）
+  node download_latest.mjs --realm cn --platform darwin-arm64 # macOS 辅助对照
   node download_latest.mjs --realm cn --platform all # 指定 realm / 全部平台
   ```
 
@@ -26,17 +30,21 @@
   `{version,url,productVersion,sha256hash,...}`。平台名：
   `workbuddy-darwin-arm64` / `workbuddy-darwin-x64` /
   `workbuddy-win32-x64-user` / `workbuddy-linux-{x64,arm64}-{deb,rpm}`。
-  macOS 接口给 `.zip`（自动更新包），网站实际下载同版本 `.dmg`；脚本对
-  darwin 把后缀换成 `.dmg`。`sha256hash` 只对应接口原 URL（zip），dmg 不校验。
+  默认平台是 `win32-x64-user`：项目以 Win32 构建为唯一事实源，macOS 只作辅助
+  对照。macOS 接口给 `.zip`（自动更新包），网站实际下载同版本 `.dmg`；显式指定
+  darwin 时脚本把后缀换成 `.dmg`，`sha256hash` 只对应接口原 URL（zip），dmg 不校验。
   落盘路径：`.tmp/workbuddy/<realm>/<version>/`，`<version>` 取文件名中的
   完整版本串（含构建 hash，如 `5.8.4.41366630-73952edb`）。
 
-## 已知数据形态（2026-10-19 核对）
+## 已知数据形态（2026-10-22 核对，Win32）
 
-| Realm | 包版本 | `cli/product.json` `productName` | `endpoint` | `authentication.id` |
-| --- | --- | --- | --- | --- |
-| `cn` | 5.8.3.41334564-db0e9b51 | WorkBuddy | https://www.workbuddy.cn | workbuddy-desktop |
-| `global` | 5.8.4.41366630-73952edb | WorkBuddy AI | https://www.workbuddy.ai | workbuddy-desktop-ai |
+| Realm | 包版本 | `cli/product.json` `productName` | `endpoint` | `authentication.id` | commit | date |
+| --- | --- | --- | --- | --- | --- | --- |
+| `cn` | 5.8.3.41334564-db0e9b51 | WorkBuddy | https://www.workbuddy.cn | workbuddy-desktop | `db0e9b51b7fa0b383f41f5b0b83dd442c8557918` | 2026-10-15T01:58:12.880Z |
+| `global` | 5.8.4.41366630-73952edb | WorkBuddy AI | https://www.workbuddy.ai | workbuddy-desktop-ai | `73952edb48da46bd0b244661efe22f4f247c4977` | 2026-10-15T11:18:04.107Z |
+
+macOS 同版本包的 commit/date 可能与 Win32 不同（CN 的 commit 与 date 都不同、
+global 仅 releaseDate 不同），只能用于辅助对照，不得写入 profile 或代码常量。
 
 CN 与 global 的 `internalDomain` / `externalDomain` 划分不同（CN 无
 `externalDomain` 拆分，global 有 `iOADomain` / `cloudHostedDomain`）。realm 隔离

@@ -58,19 +58,24 @@
 
 ## 六、官方客户端协议基线
 
-本仓库的协议对齐以官方 WorkBuddy Desktop 静态包为基线（不运行官方客户端、不请求上游）：
+本仓库的协议对齐以官方 WorkBuddy Desktop **Win32** 静态包（`win32-x64-user`）为唯一
+事实来源（不运行官方客户端、不请求上游）。macOS 构建只作辅助对照，不参与出站指纹：
 
-| realm | 客户端版本 | CLI | commit | releaseDate |
-| --- | --- | --- | --- | --- |
-| cn | `5.8.3` | `2.161.0` | `64d249bed3dec40edd720537d96f27e70a3f6a4f` | `1791972709257` |
-| global | `5.8.4` | `2.161.0` | `73952edb48da46bd0b244661efe22f4f247c4977` | `1792063023116` |
+| realm | 平台 | 客户端版本 | CLI | commit | releaseDate |
+| --- | --- | --- | --- | --- | --- |
+| cn | win32-x64-user | 取自部署 profile | 取自部署 profile | 取自部署 profile | 取自部署 profile |
+| global | win32-x64-user | 取自部署 profile | 取自部署 profile | 取自部署 profile | 取自部署 profile |
+
+运行时从 `data/client-profiles/<realm>.json` 读取部署快照并整份覆盖对应 realm；
+cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失败都拒绝启动。
+仓库源码不保留具体版本 / commit / releaseDate，避免把某一版官方指纹固定成内置回退。
 
 采用的桌面端 / CLI 行为：
 
 - CN origin 主域 `www.workbuddy.cn`，首 token 前可回落 `copilot.tencent.com` / `wb.tencentbuddy.com`。
 - 企业账号 chat 同时发 `X-Enterprise-Id` / `X-Tenant-Id`；个人 global 发 `X-No-Enterprise-Id: 1`。
 - 401 同号 refresh + replay；refresh 401/403 映射会话失效；同账号/同 RT refresh 单飞（60s 按需复用）。
-- 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端没给会话 ID 时用轮级聚合键兜底（不影响 prompt cache key）。
+- 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端没给会话 ID 时生成 UUIDv4（不影响 prompt cache key）。
 - 首条消息非 system 时补官方 `"You are CodeBuddy Code.\n"` fallback（CN/global 都补，防 11-128 形态校验）。
 - `6004` 带重置、`14003` 模型级限流只冷该模型；`14003` 用 10s→1m 短窗且不喂路由熔断；`6004` 无重置按账号级保守退避并记模型审计；`11158` 仅在 400/404 时与 `11136` 同归账号级模型权限避让，429+11158 归限流。
 - CN billing/meter `/v2` 优先、无 `/v2` 回落（官方桌面 resourcePrefix 为空）。

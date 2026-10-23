@@ -584,6 +584,7 @@ function AccountRow({
   // taskDenyReason 及任务中心的扫描/队列门控同口径。
   const canCheckin = !s.enterprise;
   const canUseTasks = canCheckin && s.realm !== 'global';
+  const canTravel = canCheckin && s.realm !== 'global';
   const tu = s.token_usage || {};
   const req = tu.request_count || 0;
   const totalTok = formatTokenCount(tu.total_tokens);
@@ -627,6 +628,12 @@ function AccountRow({
             (r.checkin_message ? '（' + r.checkin_message + '）' : ''),
           'ok',
         );
+      } else if (a === 'travel') {
+        const r = await postJSON<{ ran?: boolean; ok?: boolean; skip_reason?: string }>(
+          'accounts/' + encodeURIComponent(u) + '/travel',
+        );
+        if (!r.ran) toast('未执行：' + (r.skip_reason || '未知原因'));
+        else toast(r.ok ? '旅行巡检完成' : '旅行巡检失败', r.ok ? 'ok' : 'err');
       } else if (a === 'balance') {
         const r = await postJSON<{ credits?: number; credits_total?: number }>(
           'accounts/' + encodeURIComponent(u) + '/balance',
@@ -703,6 +710,11 @@ function AccountRow({
       </TableCell>
       <TableCell>
         {tag}
+        {s.session_dead_suspect ? (
+          <div className="mt-0.5 text-2xs text-warning" title={'连续会话失效 ' + (s.session_dead_fails || 0) + ' 次'}>
+            疑似登录失效 · 待重登
+          </div>
+        ) : null}
         {s.reason ? <div className="mt-0.5 text-2xs text-muted-foreground">{s.reason}</div> : null}
         {limits.length ? (
           <div className="mt-1.5 flex min-w-[210px] flex-col gap-1">
@@ -761,6 +773,11 @@ function AccountRow({
           <Button size="xs" variant="ghost" title={s.enterprise ? '刷新企业版已分配额度（上游 get-enterprise-user-usage）' : undefined} onClick={() => void act('balance')}>
             {s.enterprise ? '额度' : '余额'}
           </Button>
+          {canTravel ? (
+            <Button size="xs" variant="ghost" title="只对本账号执行一趟旅行巡检" onClick={() => void act('travel')}>
+              旅行
+            </Button>
+          ) : null}
           {canUseTasks ? (
             <Button size="xs" variant="ghost" onClick={onOpenTasks}>
               任务

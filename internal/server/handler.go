@@ -320,6 +320,8 @@ func (h *Handler) notFound(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
 	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
+	// 图像生成（issue #253）：默认关闭，开启后独立透传 /v2/images/generations。
+	h.mux.HandleFunc("POST /v1/images/generations", h.withRecovery(h.withClientAuth(h.imagesGenerationsHandler)))
 	h.mux.HandleFunc("POST /v1/messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
 	// 部分 Anthropic 客户端把 base URL 配成 .../v1，再拼 /messages；保留同义别名。
 	h.mux.HandleFunc("POST /messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
@@ -1262,6 +1264,12 @@ type chatFlow struct {
 	// 标签）。各换号 return rotContinue 分支写入；degrade 复用同号重试、不算换号，
 	// 保持空值即跳过计数。
 	rotateReason string
+	// busyWaited 本次请求是否已为 14003 模型繁忙等待过（只等一次，issue #254）。
+	busyWaited bool
+	// zeroRetried 是否已因「length + 零输出」关闭思考重发过（只重发一次，issue #244）。
+	zeroRetried bool
+	// nonstreamContinued 非流式截断续写是否已执行（只续写一次，issue #247）。
+	nonstreamContinued bool
 
 	chatMeta upstream.ChatMeta
 }
@@ -1641,9 +1649,10 @@ func (f *chatFlow) buildChatMeta() {
 	}
 
 	if f.chatMeta.ConversationID == "" {
-		// 上游渠道校验要求 X-Conversation-ID 恒在；客户端没给会话 ID 时用轮级
-		// 聚合键兜底。只进出站头，不覆盖 ConversationID（prompt cache key 的源）。
-		f.chatMeta.ConversationHeaderID = f.chatMeta.ConversationRequestID
+		// 上游渠道校验要求 X-Conversation-ID 恒在；客户端没给会话 ID 时用
+		// UUIDv4 兜底（官方 session.id = crypto.randomUUID()）。只进出站头，
+		// 不覆盖 ConversationID（prompt cache key 的源）。
+		f.chatMeta.ConversationHeaderID = session.NewUUIDv4()
 	}
 
 	f.chatMeta.TraceID = f.traceID
@@ -1766,7 +1775,7 @@ func (f *chatFlow) reportNoAccount() {
 
 // attempt 执行一次「选号 → 占名额 → 刷新 token → 转发」尝试，返回控制流去向。
 func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
-	acct := f.pickAccount()
+	acct := f.pickAccountWithBusyWait(ctx)
 	if acct == nil {
 		if f.h.cfg.Pool.AllDailyBlocked(f.bareModel, f.realm) {
 			f.st.dailyLimited = true
@@ -2123,6 +2132,52 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 }
 
+// pickAccountWithBusyWait 选号；纯 14003 全池阻塞时等待一次后重选（issue #254）。
+func (f *chatFlow) pickAccountWithBusyWait(ctx context.Context) *auth.Auth {
+	acct := f.pickAccount()
+	if acct != nil {
+		return acct
+	}
+
+	if f.busyWaited || !f.waitForModelBusy(ctx) {
+		return nil
+	}
+
+	f.busyWaited = true
+
+	return f.pickAccount()
+}
+
+// waitForModelBusy 纯 14003 全池阻塞时等待一次（≤10s，受 ctx 取消）。等待期间
+// 清空本轮 tried：冷却窗口可能刚好到期，旧排除集会挡住已恢复的账号。
+// 返回 true 表示值得重新选号；账号级冷却/非 busy/ctx 取消返回 false。
+func (f *chatFlow) waitForModelBusy(ctx context.Context) bool {
+	block := f.h.cfg.Pool.ModelBlockedForRealm(f.bareModel, f.realm)
+	if !block.Blocked || !block.Busy || block.Until.IsZero() {
+		return false
+	}
+
+	wait := min(time.Until(block.Until), modelBusyWaitMax)
+	if wait <= 0 {
+		return false
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		clear(f.tried)
+
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// modelBusyWaitMax 14003 单次请求最多等待时长（issue #254）。
+const modelBusyWaitMax = 10 * time.Second
+
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，
 // 避免下一轮仍撞同一个满载粘性号再浪费一次 PickByUID 往返。
 func (f *chatFlow) retryAcquireFailed(ctx context.Context, acct *auth.Auth, i int) rotationAction {
@@ -2170,10 +2225,9 @@ func (f *chatFlow) ensureFreshToken(ctx context.Context, acct *auth.Auth, i int)
 
 // penalizeRefreshFailure refresh 失败按分类处置：session 死亡禁用，否则喂熔断计数。
 func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
-	var ue *upstream.Error
-	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-		// 与 keepalive 同口径：refresh 401/403 是猜测性终态，连续达到阈值才禁用，
-		// 避免一次上游抖动/并发 refresh 竞态直接杀号。
+	if upstream.IsCredentialDead(err) {
+		// 与 keepalive 同口径：refresh 401/403/无 RT 是猜测性终态，连续达到阈值才
+		// 禁用，避免一次上游抖动/并发 refresh 竞态直接杀号（issue #245）。
 		if f.h.cfg.Pool.NoteSessionDead(acct.UID) {
 			log.Printf("WARN: [server] refresh acct=%s: 连续 %d 次 session dead — 禁用",
 				logfmt.Label(acct.UID, acct.NicknameValue()), pool.SessionDeadThreshold())
@@ -2223,6 +2277,9 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 
 		f.lastErr = err
 		f.penalizeRefreshFailure(acct, err)
+		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+		return f.handleSessionDeadError(ctx, acct, status, respBody, i)
 	}
 
 	if status >= 400 {
@@ -2231,7 +2288,7 @@ func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotatio
 	// 成功判定与粘性绑定一律**延后到这一跳真正成功之后**（见下方流式/非流式分支）：
 	// 上游「200 已开流 + 一帧 error」是真实形态（6004 限流、内容拦截、审核）。
 	if f.stream {
-		return f.handleStreamSuccess(ctx, acct, rc, attemptStarted)
+		return f.handleStreamSuccess(ctx, acct, rc, attemptStarted, i)
 	}
 
 	return f.handleNonStreamSuccess(ctx, acct, rc, attemptStarted, i)
@@ -2296,6 +2353,8 @@ func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth) b
 }
 
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
+//
+//nolint:cyclop // 错误类别按优先级线性展开，拆散会掩盖处置顺序。
 func (f *chatFlow) handleHTTPError(
 	ctx context.Context, acct *auth.Auth, status int, respBody []byte,
 	uerr *upstream.Error, attemptStarted time.Time, i int,
@@ -2309,6 +2368,13 @@ func (f *chatFlow) handleHTTPError(
 	} else {
 		kind = upstream.Classify(status, string(respBody))
 		uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+	}
+	// 401 在 dispatch 已完成同号 refresh 求证；到这里说明重放后仍 401。按会话失效
+	// 连续计数（阈值才禁用），不再走 applyLifecyclePolicy 的立即 Disable（issue #245）。
+	if status == http.StatusUnauthorized && kind == upstream.ErrSessionDead {
+		f.penalizeRefreshFailure(acct, uerr)
+
+		return f.handleSessionDeadError(ctx, acct, status, respBody, i)
 	}
 	// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，触发降级
 	// 到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append 降级重试同样退化
@@ -2359,6 +2425,27 @@ func (f *chatFlow) handleHTTPError(
 	return rotContinue
 }
 
+// handleSessionDeadError 401/会话失效的换号收尾：释放租约、按既有退避换号。
+// 禁用与否已由 penalizeRefreshFailure 的连续阈值决定；尝试记录由调用方完成
+// （handleHTTPError 入口与本文件的 refresh 失败分支各记一次，避免同一次 401 双计）。
+func (f *chatFlow) handleSessionDeadError(
+	ctx context.Context, acct *auth.Auth, status int, respBody []byte, i int,
+) rotationAction {
+	f.st.status = status
+	f.lastErr = &upstream.Error{Kind: upstream.ErrSessionDead, Status: status, Msg: string(respBody)}
+	log.Printf("WARN: [server] chat acct=%s model=%s: session dead after refresh (401)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+	f.fail(acct.UID)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = "session_dead"
+
+	return rotContinue
+}
+
 // noteWafAndStop 记录 IP 级 WAF 命中：激活（短窗多号命中）时报告调用方终止轮转。
 func (f *chatFlow) noteWafAndStop(kind upstream.ErrKind, acct *auth.Auth) bool {
 	if kind != upstream.ErrWafBlock || !f.h.wafIP.noteWaf(acct.UID) {
@@ -2400,7 +2487,7 @@ func (f *chatFlow) retryModelNotFoundCrossRealm(
 func (h *Handler) tracedPath(r *http.Request) bool {
 	switch r.URL.Path {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
-		"/v1/responses", "/v1/search/messages":
+		"/v1/responses", "/v1/search/messages", "/v1/images/generations":
 		return true
 	}
 
@@ -2524,14 +2611,45 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 }
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
-func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time) rotationAction {
+func (f *chatFlow) handleStreamSuccess(
+	ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int,
+) rotationAction {
+	// 首帧否决窗口（issue #244）：在写出任何字节前预览首段，error/顶层业务码/零输出
+	// 都还能换号或关闭思考重发，不再出现「200 + error 帧」。
+	probe := upstream.ProbeStream(rc)
+
+	if probe.ZeroOutputLength {
+		rc.Close()
+
+		return f.retryZeroOutputLength(ctx, acct, attemptStarted, i)
+	}
+
+	if probe.Kind != upstream.ErrNone {
+		rc.Close()
+
+		return f.handlePreStreamErrorFrame(ctx, acct, probe, attemptStarted, i)
+	}
+
+	if probe.Empty {
+		rc.Close()
+
+		return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i)
+	}
+
 	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
 	f.h.streams.enter()
 	defer f.h.streams.leave()
 	// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 	f.st.status = http.StatusOK
 
-	stats := newChatStatsReaderSince(rc, f.st.start)
+	stream := probe.ReadCloser(rc)
+	if !probe.HasTool && probe.Text != "" {
+		stream = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
+			return f.continueUpstream(ctx, acct, partial)
+		})
+	}
+
+	stats := newChatStatsReaderSince(stream, f.st.start)
 	defer stats.release()
 	// errFrame：上游 error 帧原文（观察者旁路采集），用于流尾的账号处置。
 	var errFrame string
@@ -2546,9 +2664,177 @@ func (f *chatFlow) handleStreamSuccess(ctx context.Context, acct *auth.Auth, rc 
 	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
 
 	f.finishStreamStats(acct, stats, repair, attemptStarted)
-	rc.Close()
+	stream.Close()
 
 	return rotDone
+}
+
+// retryZeroOutputLength 处理 finish_reason=length 且零输出：同额度关闭 thinking
+// 重发一次；仍零输出返回 502 zero_output_length，不罚号、不冷却（issue #244）。
+func (f *chatFlow) retryZeroOutputLength(
+	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	if !f.zeroRetried {
+		f.zeroRetried = true
+		f.body = upstream.DisableThinking(f.body)
+		log.Printf("INFO: [server] stream acct=%s model=%s: length with zero output, retrying once with thinking disabled",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return f.dispatch(ctx, acct, i)
+	}
+
+	f.zeroOutputLengthError(true)
+
+	return rotDone
+}
+
+// retryNonStreamZeroOutput 非流式零输出 length 的同额度重发（与流式同口径）。
+// handled=false 表示该响应不是「零输出 length」，继续常规收尾。
+func (f *chatFlow) retryNonStreamZeroOutput(
+	ctx context.Context, acct *auth.Auth, resp map[string]any, attemptStarted time.Time, i int,
+) (rotationAction, bool) {
+	if !zeroOutputLengthResponse(resp) {
+		return rotDone, false
+	}
+
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	if !f.zeroRetried {
+		f.zeroRetried = true
+		f.body = upstream.DisableThinking(f.body)
+		log.Printf("INFO: [server] non-stream acct=%s model=%s: length with zero output, retrying once with thinking disabled",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return f.dispatch(ctx, acct, i), true
+	}
+
+	f.zeroOutputLengthError(false)
+
+	return rotDone, true
+}
+
+// zeroOutputLengthResponse 报告聚合响应是否为 finish_reason=length 且无正文/
+// 拒答/工具调用：这类响应不能当成功写回。
+func zeroOutputLengthResponse(resp map[string]any) bool {
+	choice := firstChoice(resp)
+	if choice == nil {
+		return false
+	}
+
+	if fr, _ := choice["finish_reason"].(string); fr != "length" {
+		return false
+	}
+
+	msg, _ := choice["message"].(map[string]any)
+	if msg == nil {
+		return false
+	}
+
+	if content, _ := msg["content"].(string); content != "" {
+		return false
+	}
+
+	if refusal, _ := msg["refusal"].(string); refusal != "" {
+		return false
+	}
+
+	if tools, _ := msg["tool_calls"].([]any); len(tools) > 0 {
+		return false
+	}
+
+	return true
+}
+
+// zeroOutputLengthError 写出 502 zero_output_length 终态（流式/非流式共用）。
+func (f *chatFlow) zeroOutputLengthError(stream bool) {
+	f.st.status = http.StatusBadGateway
+	if stream {
+		f.st.outcome = reqlog.OutcomeStreamError
+	} else {
+		f.st.outcome = reqlog.OutcomeHTTPError
+	}
+
+	f.lastErr = errZeroOutputLength
+	f.out.Error(http.StatusBadGateway, "zero_output_length",
+		"upstream hit the output budget before producing any content; retry with a smaller prompt or another model",
+		"upstream returned finish_reason=length with no content; the gateway retried once with thinking disabled")
+}
+
+// handlePreStreamErrorFrame 首帧 error/顶层业务错误：尚未向客户端写字节，按非流式
+// 同口径分类，可换号或请求级 fail-fast（issue #244）。
+func (f *chatFlow) handlePreStreamErrorFrame(
+	ctx context.Context, acct *auth.Auth, probe *upstream.StreamProbe, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	kind := probe.Kind
+	uerr := &upstream.Error{Kind: kind, Status: http.StatusOK, Msg: probe.Frame}
+	f.lastErr = uerr
+
+	if failFastKind(kind) {
+		f.handleRequestLevelError(acct, kind, []byte(probe.Frame), uerr)
+		return rotDone
+	}
+
+	f.h.applyErrorPolicy(acct.UID, kind, probe.Frame, f.realm, f.bareModel, nil)
+	f.fail(acct.UID)
+	log.Printf("WARN: [server] stream acct=%s model=%s: first-frame upstream error kind=%s payload=%s (rotating before write)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(probe.Frame, 200))
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = kind.String()
+
+	return rotContinue
+}
+
+// handlePreStreamEmpty 首段没有任何实质输出就结束：按上游失败处置并换号。
+func (f *chatFlow) handlePreStreamEmpty(ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.fail(acct.UID)
+	f.st.status = http.StatusBadGateway
+	f.lastErr = upstream.EmptyStreamError()
+	log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream before first content (rotating)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = "empty_stream"
+
+	return rotContinue
+}
+
+// continueUpstream 发起截断续写请求：复用 ChatStreamContext → prepareBody 管线，
+// 同账号同模型，不手拼 raw body（脱敏/thinking/缓存键仍生效）。
+func (f *chatFlow) continueUpstream(ctx context.Context, acct *auth.Auth, partial string) (io.ReadCloser, error) {
+	body := upstream.BuildContinuationBody(f.body, partial)
+
+	next, status, respBody, err := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, body, f.clientIP, f.chatMeta)
+	if err != nil || status >= http.StatusBadRequest {
+		if next != nil {
+			next.Close()
+		}
+
+		log.Printf("WARN: [server] stream acct=%s model=%s: continuation failed status=%d err=%v body=%s",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, status, err, logfmt.Truncate(string(respBody), 160))
+
+		if err != nil {
+			return nil, fmt.Errorf("continuation request: %w", err)
+		}
+
+		return nil, fmt.Errorf("%w: status %d", errContinuationFailed, status)
+	}
+
+	log.Printf("INFO: [server] stream acct=%s model=%s: continued truncated response (partial=%d chars)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, len(partial))
+
+	return next, nil
 }
 
 // applyStreamOutcome 根据流结束形态给账号与请求日志定性。
@@ -2689,6 +2975,13 @@ func (f *chatFlow) handleNonStreamSuccess(
 
 		return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
 	}
+
+	if action, handled := f.retryNonStreamZeroOutput(ctx, acct, resp, attemptStarted, i); handled {
+		return action
+	}
+
+	resp = f.continueNonStream(ctx, acct, resp)
+
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
 	// 只在「没有结构化 tool_calls」且「finish_reason 为 stop」时生效（见 dsml.go）；
 	// 名单为空时走弱判定（tools 声明在中转环节丢失是常态）。
@@ -2728,6 +3021,133 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	return rotDone
+}
+
+// continueNonStream 非流式 finish_reason=length 且有正文时续写一次，把第二段
+// 正文拼进同一响应（issue #247）。工具调用不续写；失败保留首段 length 终态。
+func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp map[string]any) map[string]any {
+	if f.nonstreamContinued || len(resp) == 0 {
+		return resp
+	}
+
+	choice := firstChoice(resp)
+	if choice == nil {
+		return resp
+	}
+
+	msg, _ := choice["message"].(map[string]any)
+	if msg == nil {
+		return resp
+	}
+
+	if fr, _ := choice["finish_reason"].(string); fr != "length" {
+		return resp
+	}
+
+	if tools, _ := msg["tool_calls"].([]any); len(tools) > 0 {
+		return resp
+	}
+
+	partial, _ := msg["content"].(string)
+	if partial == "" {
+		return resp
+	}
+
+	f.nonstreamContinued = true
+
+	next, err := f.continueUpstream(ctx, acct, partial)
+	if err != nil {
+		return resp
+	}
+
+	defer next.Close()
+
+	second, err := upstream.Aggregate(next)
+	if err != nil {
+		return resp
+	}
+
+	return mergeNonStreamContinuation(resp, second)
+}
+
+// firstChoice 取 choices[0]。
+func firstChoice(resp map[string]any) map[string]any {
+	choices, _ := resp["choices"].([]any)
+	if len(choices) == 0 {
+		return nil
+	}
+
+	choice, _ := choices[0].(map[string]any)
+
+	return choice
+}
+
+// mergeNonStreamContinuation 拼接两段正文，终态/usage 取第二段（最终回答）。
+func mergeNonStreamContinuation(first, second map[string]any) map[string]any {
+	firstChoiceItem, secondChoiceItem := firstChoice(first), firstChoice(second)
+	if firstChoiceItem == nil || secondChoiceItem == nil {
+		return first
+	}
+
+	firstMessage, _ := firstChoiceItem["message"].(map[string]any)
+	secondMessage, _ := secondChoiceItem["message"].(map[string]any)
+
+	if firstMessage == nil || secondMessage == nil {
+		return first
+	}
+
+	content1, _ := firstMessage["content"].(string)
+	content2, _ := secondMessage["content"].(string)
+	firstMessage["content"] = content1 + content2
+
+	if r2, ok := secondMessage["reasoning_content"].(string); ok && r2 != "" {
+		r1, _ := firstMessage["reasoning_content"].(string)
+		firstMessage["reasoning_content"] = r1 + r2
+	}
+
+	firstChoiceItem["finish_reason"] = secondChoiceItem["finish_reason"]
+
+	mergeUsageTotals(first, second)
+
+	return first
+}
+
+// mergeUsageTotals 把续写段的 usage 累加到首段：两段请求都真实消耗了 token/积分，
+// 只保留第二段会漏记首段用量。数值叶子递归相加，缺失键直接补齐。
+func mergeUsageTotals(first, second map[string]any) {
+	secondUsage, ok := second["usage"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	firstUsage, ok := first["usage"].(map[string]any)
+	if !ok {
+		first["usage"] = secondUsage
+
+		return
+	}
+
+	addUsageNumbers(firstUsage, secondUsage)
+}
+
+// addUsageNumbers 递归把 src 的数值字段累加进 dst；非数值/缺失沿用 src。
+func addUsageNumbers(dst, src map[string]any) {
+	for key, value := range src {
+		switch typed := value.(type) {
+		case map[string]any:
+			if target, ok := dst[key].(map[string]any); ok {
+				addUsageNumbers(target, typed)
+				continue
+			}
+		case float64:
+			if target, ok := dst[key].(float64); ok {
+				dst[key] = target + typed
+				continue
+			}
+		}
+
+		dst[key] = value
+	}
 }
 
 // setCacheTokensFromUsage 用聚合响应 usage 填 st 的缓存三维观测（非流式收尾）。
@@ -3173,12 +3593,23 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 // 告诉客户端的两件事——「有几个号被挡」和「最早什么时候解封」。
 // 状态码按阻塞原因分档：11136/11141 是模型不可用（换模型才有用），用 400；
 // 全池 6004 模型级限流是"等上游重置"，用 429 并带 Retry-After（不能报成不可用）。
+//
+//nolint:cyclop,nestif // 模型阻塞分类优先于通用文案，线性分支更易核对。
 func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, upstreamMsgPassed bool) (int, string, string, string) {
 	if !f.modelBlock.Blocked {
 		return status, code, msg, hint
 	}
 
-	if f.modelBlock.RateLimited {
+	if f.modelBlock.Busy {
+		// 14003 模型繁忙：短暂可恢复，503 + Retry-After 让客户端等待重试，
+		// 不伪装成 429 账号限流（issue #254）。
+		status = http.StatusServiceUnavailable
+		code = "model_busy"
+
+		if !upstreamMsgPassed {
+			msg = "model is busy upstream on every account; retry shortly"
+		}
+	} else if f.modelBlock.RateLimited {
 		status = http.StatusTooManyRequests
 		code = "rate_limit_exceeded"
 
@@ -3196,7 +3627,9 @@ func (f *chatFlow) applyModelBlockOverride(status int, code, msg, hint string, u
 	}
 	// 阻塞范围（issue #29）：平台级（上游统一限流，等上游恢复）与账号级（换号/等本号
 	// 恢复）对运维的处置完全不同，在 hint 里点明。
-	if f.modelBlock.Scope == pool.ModelBlockScopePlatform {
+	if f.modelBlock.Busy {
+		hint = fmt.Sprintf("model_busy: 14003 upstream busy on %d account(s); retry after the short window", f.modelBlock.Count)
+	} else if f.modelBlock.Scope == pool.ModelBlockScopePlatform {
 		hint = fmt.Sprintf(
 			"model_blocked: upstream platform-level rate limit on this model (%d account(s) share the same reset)",
 			f.modelBlock.Count,
@@ -3309,6 +3742,12 @@ func rotateBackoff(ctx context.Context, i int) bool {
 
 // errUpstreamTimeout 上游超时的哨兵：末端出口据此给出与「没号可用」可区分的文案。
 var errUpstreamTimeout = errors.New("upstream timeout")
+
+// errZeroOutputLength / errContinuationFailed 流恢复路径的哨兵（issue #244/#247）。
+var (
+	errZeroOutputLength   = errors.New("zero_output_length")
+	errContinuationFailed = errors.New("continuation failed")
+)
 
 // isUpstreamTimeout 判断这一跳的失败是否属于「上游超时 / 停滞」。超时不是账号的
 // 问题，换号注定白换（同一份请求撞同一个慢上游），必须止损：不轮转、不罚号。
@@ -3492,6 +3931,11 @@ func (h *Handler) applyWafPolicy(uid string, uerr *upstream.Error) {
 // 判定必须「code 且文案」：裸 "request illegal" 此前会把普通请求错误升级成硬禁用，
 // 上游已删除该过宽 marker，本 fork 同步收窄。
 func (h *Handler) applyAccountFaultPolicy(uid, body string) {
+	if upstream.IsUnconfirmedSafetyReview(body) {
+		log.Printf("WARN: [server] acct=%s: 11140 content failed safety review（未确认文案，仅记录；未扩内容审核 marker）",
+			logfmt.UID8(uid))
+	}
+
 	if upstream.IsAccountRestricted(body) {
 		h.cfg.Pool.Disable(uid, "upstream account restricted (11140 request illegal), submit feedback in WorkBuddy and re-login")
 		return
@@ -3512,9 +3956,11 @@ func (h *Handler) applyLifecyclePolicy(uid string, kind upstream.ErrKind) {
 	case upstream.ErrHardCredit:
 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
 	case upstream.ErrSessionDead:
-		h.cfg.Pool.Disable(uid, "12153 session dead")
-		h.notifyAccount(uid, notify.EventSessionDead, "账号 session 失效（12153），已禁用，需重新登录",
-			map[string]any{"stage": "chat"})
+		// 12153/14015 与 401 同口径：连续达到阈值才禁用，避免一次上游抖动杀号。
+		if h.cfg.Pool.NoteSessionDead(uid) {
+			h.notifyAccount(uid, notify.EventSessionDead, "账号连续 session 失效，已禁用，需重新登录",
+				map[string]any{"stage": "chat"})
+		}
 	case upstream.ErrNotFound:
 		h.cfg.Pool.Cooldown(uid, pool.CoolSoft, notFoundCooldown, "upstream 404")
 	case upstream.ErrServer:

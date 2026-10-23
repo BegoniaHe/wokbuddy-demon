@@ -34,16 +34,16 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	client := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, Profile: testProfileSet(t)}
 	account := &auth.Auth{AccessToken: "at", UID: "u-dt", Nickname: "RenJie"}
 
-	err := c.ReportDesktopEvent(account,
+	err := client.ReportDesktopEvent(account,
 		DesktopEvent{"eventCode": "agent_task_created", "mode": "craft"})
 	if err != nil {
 		t.Fatalf("report desktop: %v", err)
 	}
 
-	if want := desktopUAFor(account); gotUA != want {
+	if want := client.desktopUAFor(account); gotUA != want {
 		t.Errorf("UA=%q want %q", gotUA, want)
 	}
 
@@ -64,6 +64,10 @@ func assertReportDesktopRequest(t *testing.T, r *http.Request) {
 
 	if r.Header.Get("X-Product") != "SaaS" {
 		t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
+	}
+
+	if got := r.Header.Get("X-Request-ID"); !uuidV7HeaderPattern.MatchString(got) {
+		t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
 	}
 }
 
@@ -95,9 +99,11 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	if table["mode"] != "craft" {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", table["mode"])
 	}
-	// machineId 应为 uid 稳定派生（36 hex）。
-	if len(table["machineId"].(string)) != 36 {
-		t.Errorf("machineId 长度=%d want 36", len(table["machineId"].(string)))
+	// machineId/sessionId 应为 uid 稳定派生的连字符 UUIDv4。
+	for _, key := range []string{"machineId", "sessionId"} {
+		if got, _ := table[key].(string); !uuidV4HeaderPattern.MatchString(got) {
+			t.Errorf("%s=%q want UUIDv4", key, got)
+		}
 	}
 
 	assertDesktopMachineFingerprint(t, table)
@@ -121,11 +127,12 @@ func assertDesktopMachineFingerprint(t *testing.T, table map[string]any) {
 func TestDesktopFingerprintPerRealm(t *testing.T) {
 	t.Parallel()
 
+	client := newProfileClient(t)
 	cnAccount := &auth.Auth{UID: "u-cn", Nickname: "cn", AccessToken: "at"}
 	globalAccount := &auth.Auth{UID: "u-gl", Nickname: "gl", AccessToken: "at", Domain: "www.workbuddy.ai"}
 
-	cnFP := desktopFingerprint(cnAccount)
-	if cnFP["ideVersion"] != cnClientVersion || cnFP["commit"] != cnDesktopCommit {
+	cnFP := client.desktopFingerprint(cnAccount)
+	if cnFP["ideVersion"] != "9.9.9" || cnFP["commit"] != "cccccccccccccccccccccccccccccccccccccccc" {
 		t.Errorf("CN 版本三元组=%v/%v", cnFP["ideVersion"], cnFP["commit"])
 	}
 
@@ -133,8 +140,8 @@ func TestDesktopFingerprintPerRealm(t *testing.T) {
 		t.Error("CN 指纹不应带 qimei36")
 	}
 
-	globalFP := desktopFingerprint(globalAccount)
-	if globalFP["ideVersion"] != globalClientVersion || globalFP["commit"] != globalDesktopCommit {
+	globalFP := client.desktopFingerprint(globalAccount)
+	if globalFP["ideVersion"] != "9.9.10" || globalFP["commit"] != "dddddddddddddddddddddddddddddddddddddddd" {
 		t.Errorf("global 版本三元组=%v/%v", globalFP["ideVersion"], globalFP["commit"])
 	}
 
@@ -142,12 +149,30 @@ func TestDesktopFingerprintPerRealm(t *testing.T) {
 		t.Error("global 指纹不应带 qimei36")
 	}
 
-	if got, want := desktopUAFor(cnAccount), "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"; got != want {
+	if got, want := client.desktopUAFor(cnAccount), "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"; got != want {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
 
-	if got, want := desktopUAFor(globalAccount), "workbuddy-ai/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0"; got != want {
+	if got, want := client.desktopUAFor(globalAccount), "workbuddy-ai/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
+	}
+}
+
+// TestDesktopBuildFingerprintProfile 桌面构建三元组只来自 profile，
+// 不再有内置 Win32 基线可回写。
+func TestDesktopBuildFingerprintProfile(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+
+	cn := client.desktopBuildFor(&auth.Auth{UID: "u-cn"})
+	if cn.version != "9.9.9" || cn.commit != "cccccccccccccccccccccccccccccccccccccccc" || cn.releaseDate != 1792000000000 {
+		t.Errorf("cn build=%+v want 9.9.9/cccc/1792000000000", cn)
+	}
+
+	global := client.desktopBuildFor(&auth.Auth{UID: "u-gl", Domain: "www.workbuddy.ai"})
+	if global.version != "9.9.10" || global.commit != "dddddddddddddddddddddddddddddddddddddddd" || global.releaseDate != 1792100000000 {
+		t.Errorf("global build=%+v want 9.9.10/dddd/1792100000000", global)
 	}
 }
 
@@ -185,6 +210,29 @@ func TestDesktopChatSequenceShape(t *testing.T) {
 	}
 }
 
+// TestDesktopChatSequenceAssistantMessageID 助手消息必须使用独立于用户消息的
+// UUIDv7 messageId，并在 send/response/status 三个事件间保持一致。
+func TestDesktopChatSequenceAssistantMessageID(t *testing.T) {
+	t.Parallel()
+
+	events := DesktopChatSequence("conv-1", "req-1", "user-msg", "fast-model", "fast-model")
+
+	assistantID, _ := events[1]["messageId"].(string)
+	if !uuidV7HeaderPattern.MatchString(assistantID) {
+		t.Fatalf("assistant messageId=%q want UUIDv7", assistantID)
+	}
+
+	if assistantID == events[0]["messageId"] {
+		t.Fatalf("assistant messageId 复用了用户消息 id: %q", assistantID)
+	}
+
+	for _, i := range []int{3, 4} {
+		if got := events[i]["messageId"]; got != assistantID {
+			t.Errorf("events[%d].messageId=%v want %q", i, got, assistantID)
+		}
+	}
+}
+
 // TestSetAppearanceTheme 断言主题设置端点形状（点亮 Hp_Appearance 的 API）。
 func TestSetAppearanceTheme(t *testing.T) {
 	t.Parallel()
@@ -192,13 +240,14 @@ func TestSetAppearanceTheme(t *testing.T) {
 	var got map[string]any
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
+	wantUA := "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/user-asset/appearance/set" {
 			t.Errorf("path=%s want /v2/user-asset/appearance/set", r.URL.Path)
 		}
 
-		if r.Header.Get("User-Agent") != desktopUAFor(account) {
+		if r.Header.Get("User-Agent") != wantUA {
 			t.Errorf("UA=%q want desktop UA", r.Header.Get("User-Agent"))
 		}
 
@@ -208,7 +257,7 @@ func TestSetAppearanceTheme(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL}
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, Profile: testProfileSet(t)}
 	if err := c.SetAppearanceTheme(account, "theme-tkmw7j"); err != nil {
 		t.Fatalf("set theme: %v", err)
 	}

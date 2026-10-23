@@ -11,21 +11,11 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 const (
-	// 官方分发包版本（按 realm 分档）。UA 的 `WorkBuddy/<ver>`、白名单头组
-	// X-IDE-Version、桌面上报指纹的 ideVersion/extVersion 均取此值。
-	//   cn     → WorkBuddy Desktop 5.8.3（内嵌 CLI 2.161.0）
-	//   global → WorkBuddy AI Desktop 5.8.4（内嵌 CLI 2.161.0）
-	// 两份官方包的 daemon UA 第二段均为 `WorkBuddy`（无 realm 品牌差异，仅版本不同）。
-	// config upstream.client_version / cli_version 可整体覆盖（空 = 按 realm 取内置默认）。
-	cnClientVersion     = "5.8.3"
-	cnCliVersion        = "2.161.0"
-	globalClientVersion = "5.8.4"
-	globalCliVersion    = "2.161.0"
-
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
@@ -40,42 +30,67 @@ func originRefererFor(a *auth.Auth) string {
 	return originRefererCN
 }
 
-// clientVersionFor 生效的 WorkBuddy 客户端版本：Client.ClientVersion 非空则取之
-// （全局覆盖），否则按账号 realm 取内置默认（cn 5.8.3 / global 5.8.4）。nil 账号按 cn。
-func (c *Client) clientVersionFor(a *auth.Auth) string {
+// profileFor 返回账号 realm 的部署 profile；未配置返回 nil（启动期已拒绝该状态）。
+func (c *Client) profileFor(a *auth.Auth) *clientprofile.Profile {
+	if c == nil || c.Profile == nil {
+		return nil
+	}
+
+	if a != nil && a.IsGlobal() {
+		return c.Profile.ForRealm("global")
+	}
+
+	return c.Profile.ForRealm("cn")
+}
+
+// clientVersionFor 生效的 WorkBuddy 客户端版本：显式 ClientVersion 优先，其次是
+// profile 的 xIdeVersion。两者皆空返回空串（启动期已要求 profile 覆盖每个启用 realm）。
+func (c *Client) clientVersionFor(account *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
 	}
 
-	if a != nil && a.IsGlobal() {
-		return globalClientVersion
+	if p := c.profileFor(account); p != nil {
+		return p.Emit.XIdeVersion
 	}
 
-	return cnClientVersion
+	return ""
 }
 
-// cliVersionFor 生效的 CLI 版本：Client.CliVersion 非空则取之（全局覆盖），
-// 否则按账号 realm 取内置默认（cn 2.161.0 / global 2.161.0）。nil 账号按 cn。
-func (c *Client) cliVersionFor(a *auth.Auth) string {
+// cliVersionFor 生效的 CLI 版本：显式 CliVersion 优先，其次是 profile 的
+// source.cliVersion。两者皆空返回空串。
+func (c *Client) cliVersionFor(account *auth.Auth) string {
 	if c != nil && c.CliVersion != "" {
 		return c.CliVersion
 	}
 
-	if a != nil && a.IsGlobal() {
-		return globalCliVersion
+	if p := c.profileFor(account); p != nil {
+		return p.Source.CLIVersion
 	}
 
-	return cnCliVersion
+	return ""
 }
 
-// defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 daemon 代理层形状）：
-// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`。
-// 两份官方分发包（CN 5.8.3 / global 5.8.4）的 daemon UA 第二段均为 `WorkBuddy`
-// （`buildVlmGatewayHeaders` / `Jr` 字面量），无 realm 品牌差异；仅版本号按 realm 分档。
-// 官方无任何 UA 随机化，故默认确定性。
-func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
-	v := c.clientVersionFor(a)
-	return "WorkBuddy/" + v + " WorkBuddy/" + v + " CLI/" + c.cliVersionFor(a)
+// defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方桌面端 daemon 代理层形状：
+// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`）。默认不拼接版本，直接使用 profile 字面量；
+// 用户显式配 client_version / cli_version 时才按该版本重新拼装，避免 UA 与
+// X-Ide-Version 自相矛盾。profile 缺失返回空串（启动期已拒绝该状态）。
+func (c *Client) defaultWorkBuddyUAFor(account *auth.Auth) string {
+	if c == nil {
+		return ""
+	}
+
+	if c.ClientVersion == "" && c.CliVersion == "" {
+		if p := c.profileFor(account); p != nil {
+			return p.Emit.ChatUA
+		}
+
+		return ""
+	}
+
+	v := c.clientVersionFor(account)
+
+	return "WorkBuddy/" + v + " WorkBuddy/" + v + " CLI/" + c.cliVersionFor(account)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
@@ -91,14 +106,22 @@ func (c *Client) userAgent(a *auth.Auth) string {
 }
 
 // billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
-// （官方 banner/上报显式覆写形态，不带 CLI 段）。默认生效（伪造官方桌面端指纹）；
-// 显式 client_name="SaaS" 才不设 UA（还原旧行为，Go 默认 UA）。
-func (c *Client) billingUA(a *auth.Auth) string {
+// （官方 banner/上报显式覆写形态，不带 CLI 段）。默认取 profile 字面量；
+// 显式 client_version 覆盖时按该版本拼装；client_name="SaaS" 才不设 UA（Go 默认 UA）。
+func (c *Client) billingUA(account *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
 	}
 
-	return "WorkBuddy/" + c.clientVersionFor(a)
+	if c.ClientVersion == "" {
+		if p := c.profileFor(account); p != nil {
+			return p.Emit.BillingUA
+		}
+
+		return ""
+	}
+
+	return "WorkBuddy/" + c.clientVersionFor(account)
 }
 
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
@@ -127,11 +150,24 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 	}
 }
 
-// deriveAccountStableID 按 uid + 用途盐稳定派生 36 hex 设备/会话标识。
+// deriveUUIDv4 从任意种子稳定派生 UUIDv4 形态字符串（8-4-4-4-12，version=4、
+// variant=10xx）。用于设备/会话等需要跨重启稳定、但输出必须符合官方 UUID
+// 字符集与版本位的标识；种子相同则输出恒同。
+func deriveUUIDv4(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	b := sum[:16]
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+
+	h := hex.EncodeToString(b)
+
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// deriveAccountStableID 按 uid + 用途盐稳定派生 UUIDv4 形态设备/会话标识。
 // 跨重启稳定（固定盐 "wb2a:"，不随进程换——这是与 session 包派生盐的本质差异：
 // 那是会话键维度的进程级随机盐，重启换新；本函数是账号维度，必须跨重启恒定）、
-// 账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。用 sha256 与项目
-// 既有派生（session/ids.go、cache_key.go）保持一致；截 36 hex 提供更长熵。
+// 账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。
 //
 // 两个用途：
 //   - purpose="machine" → X-Machine-ID（设备级，跨会话稳定）
@@ -141,8 +177,7 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 // 真实设备令牌（有则发，权威）；本对头是「每账号一台固定虚拟设备」的稳定指纹，
 // 防多号被上游按设备指纹缺失/漂移关联风控。两者是不同头族，官方桌面端都发。
 func deriveAccountStableID(uid, purpose string) string {
-	sum := sha256.Sum256([]byte("wb2a:" + purpose + ":" + uid))
-	return hex.EncodeToString(sum[:18]) // 36 hex chars
+	return deriveUUIDv4("wb2a:" + purpose + ":" + uid)
 }
 
 // injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
@@ -170,9 +205,9 @@ func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	req.Header.Set("User-Agent", c.userAgent(account2))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-Codebuddy-Request", "1")
-	// Accept-Language 按 realm 切（D5）：CN zh-CN，global en-US。官方客户端按账号域
-	// 发对应语言标识，对齐避免上游风控按语言缺失误判。
-	req.Header.Set("Accept-Language", acceptLanguageFor(account2))
+	// chat/通用 API 不发 Accept-Language：官方 chat 路径没有该头（只有 billing/
+	// account 分页按 locale 带，见 BillingHeaders）。为「看起来像浏览器」补该头反而
+	// 增加非官方指纹（issue #249）。
 	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
 	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
 	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
@@ -201,7 +236,7 @@ func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
 	ConversationID        string // X-Conversation-ID：入站头/body 提取值，非空时优先
-	ConversationHeaderID  string // X-Conversation-ID 出站兜底：handler 合成；仅进出站头，不进 prompt cache key。为空时最终回落到 ConversationRequestID
+	ConversationHeaderID  string // X-Conversation-ID 出站兜底：handler 合成；仅进出站头，不进 prompt cache key。为空时最终生成 UUIDv4
 	ConversationRequestID string // X-Conversation-Request-ID：聚合主键，必发
 	RootRequestID         string // X-Root-Request-ID：入站透传值，空则回落 conversationRequestID
 	ParentConversationID  string // X-Parent-Conversation-ID：入站透传值，空则不发
@@ -314,11 +349,11 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
 // 头族分四层，各司其职：
 //   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。透传客户端
-//     原值优先；handler 未给会话 ID 时用 ConversationHeaderID 兜底，再空则回落到
-//     本次请求的 ConversationRequestID——上游渠道校验要求该头恒在。
+//     原值优先；handler 未给会话 ID 时用 ConversationHeaderID 兜底，再空则生成
+//     UUIDv4（官方 session.id = crypto.randomUUID()）——上游渠道校验要求该头恒在。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
 //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
-//   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（32 位 hex）。
+//   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（UUIDv7 32 hex）。
 //   - X-Root-Request-ID：= conversationRequestID（根请求追踪）。
 //   - X-Trace-ID / traceparent / b3 / X-B3-*：链路族。官方桌面端 daemon 用
 //     randomBytes(16/8/8) 生成 traceId/spanId/parentSpanId 三件套，同时写 traceparent、
@@ -326,30 +361,28 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) 
 //     16/32 hex TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId
 //     回落 messageID（恒 32 hex），SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
 //   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
-//     conversationId（或出站兜底 ConversationHeaderID / ConversationRequestID）
-//     稳定派生 v4 形态 UUID。
+//     实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v4 形态 UUID。
 //
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单。
 func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
 		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
-		// 本级补一个 32 hex，调用方（handler）已生成稳定的不走到这里。
-		convReqID = session.NewMessageID()
+		// 本级补一个 UUIDv7 32 hex，调用方（handler）已生成稳定的不走到这里。
+		convReqID = session.NewUUIDv7Hex()
 	}
 
-	messageID := session.NewMessageID()
+	messageID := session.NewUUIDv7Hex()
 
 	convID := meta.ConversationID
 	if convID == "" {
 		convID = meta.ConversationHeaderID
 	}
 	// 上游渠道校验要求 X-Conversation-ID 恒在（官方客户端每次请求都发）。
-	// chat 路径已按会话键/轮级键兜底；搜索只透传客户端会话 ID（可能为空），
-	// 夜猫子/模型探测不走 chatFlow（meta 为空）。这些情况下用本次请求的聚合
-	// 主键兜底即可——只影响出站头，不覆盖 ConversationID（prompt cache key 的源）。
+	// 客户端未给会话 ID 时用 UUIDv4 兜底（官方 session.id = crypto.randomUUID()）；
+	// 只影响出站头，不覆盖 ConversationID（prompt cache key 的源）。
 	if convID == "" {
-		convID = convReqID
+		convID = session.NewUUIDv4()
 	}
 
 	req.Header.Set("X-Conversation-Id", convID)
@@ -405,10 +438,7 @@ func setHeaderIfNonEmpty(req *http.Request, name, value string) {
 // acpConnectionID 由会话 id 稳定派生 acp-connection-id（官方桌面端为会话级 UUID）。
 // 幂等：同一 conversationId 恒同值；输出为 v4 形态 UUID（8-4-4-4-12）。
 func acpConnectionID(conversationID string) string {
-	sum := sha256.Sum256([]byte("wb2a:acp:" + conversationID))
-	h := hex.EncodeToString(sum[:16]) // 32 hex
-
-	return h[0:8] + "-" + h[8:12] + "-4" + h[13:16] + "-a" + h[17:20] + "-" + h[20:32]
+	return deriveUUIDv4("wb2a:acp:" + conversationID)
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
@@ -479,7 +509,9 @@ func (c *Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 	method := account.TokenSource()
 
 	enterprise := strings.TrimSpace(account.EnterpriseID)
-	if enterprise == "" && method == "" {
+	// 判据只看企业身份：token_source 描述 token 来路，不是账号身份。个人号即使
+	// auth 文件残留 token_source 也不得注入身份头（issue #248，抓包级证据）。
+	if enterprise == "" {
 		return
 	}
 
@@ -487,11 +519,7 @@ func (c *Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 		req.Header.Set("X-Auth-Method", method)
 	}
 
-	payload := map[string]any{"uin": account.UID}
-	if enterprise != "" {
-		payload["owner_uin"] = enterprise
-	}
-
+	payload := map[string]any{"uin": account.UID, "owner_uin": enterprise}
 	if method != "" {
 		payload["token_source"] = method
 	}

@@ -29,6 +29,7 @@ func (s *Scheduler) markRan(kinds []taskKind, now time.Time) {
 	}
 
 	stamps := s.loadStamps()
+	stamps[stampBoundaryKey] = stampBoundaryValue
 
 	for _, kind := range kinds {
 		stamps[kind.String()] = runDay(kind, now)
@@ -44,22 +45,27 @@ func (s *Scheduler) markRan(kinds []taskKind, now time.Time) {
 	}
 }
 
-// runDay 返回任务补跑标记使用的日界：夜猫子按 CST 窗口起点所在日
-// （00:00–07:59 属于前一晚），其余任务按宿主本地日界（与排程一致）。
+// runDay 返回任务补跑标记使用的日界：所有任务统一按 CST（与排程一致，issue #252）。
+// 夜猫子窗口跨午夜：00:00–07:59 的补跑属于前一晚 23:00 开启的窗口，记到前一日。
 func runDay(kind taskKind, now time.Time) string {
-	if kind == taskBlackcat {
-		now = now.In(cst.Loc)
-		// 窗口跨午夜：凌晨补跑属于前一日 23:00 开启的窗口，不能记到新的一天，
-		// 否则会抑制当晚 23:00 的补跑。
-		if now.Hour() < 8 {
-			now = now.AddDate(0, 0, -1)
-		}
+	now = now.In(cst.Loc)
+
+	if kind == taskBlackcat && now.Hour() < 8 {
+		now = now.AddDate(0, 0, -1)
 	}
 
 	return now.Format("2006-01-02")
 }
 
+// stampBoundaryKey/Value 标记 runstamp 使用的日界版本。旧版文件没有该键
+// （宿主本地日界），升级后直接忽略，允许按 CST 重新补跑一轮（issue #252）。
+const (
+	stampBoundaryKey   = "_boundary"
+	stampBoundaryValue = "cst"
+)
+
 // loadStamps 读标记；文件不在/坏了都当空表（宁可多补一轮，不因此不跑）。
+// 旧版本地日界标记整体作废：升级首次运行按 CST 重算，避免漏跑/重跑。
 func (s *Scheduler) loadStamps() map[string]string {
 	raw, err := safefile.Read(s.cfg.RunStampFile, nil)
 	if err != nil {
@@ -68,6 +74,10 @@ func (s *Scheduler) loadStamps() map[string]string {
 
 	stamps := map[string]string{}
 	if json.Unmarshal(raw, &stamps) != nil {
+		return map[string]string{}
+	}
+
+	if stamps[stampBoundaryKey] != stampBoundaryValue {
 		return map[string]string{}
 	}
 

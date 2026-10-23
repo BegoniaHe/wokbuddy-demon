@@ -38,7 +38,7 @@ func searchMetaFromRequest(r *http.Request) upstream.ChatMeta {
 		TraceID:               strings.TrimSpace(r.Header.Get("X-Trace-Id")),
 	}
 	if meta.ConversationRequestID == "" {
-		meta.ConversationRequestID = session.NewMessageID()
+		meta.ConversationRequestID = session.NewUUIDv7Hex()
 	}
 
 	return meta
@@ -129,7 +129,7 @@ func (h *Handler) searchOnAccount(
 			// 刷新失败已在 noteSearchRefreshFailure 里按 chat 同口径罚过账号；
 			// 不能再走 searchFailureFor（它会再 applyErrorPolicy 一次，且对
 			// session dead 直接 Disable，绕过 NoteSessionDead 的连续阈值）。
-			h.noteSearchRefreshFailure(acct, err)
+			h.noteRefreshFailure(acct, err, "search_refresh")
 
 			if ue, ok := errors.AsType[*upstream.Error](err); ok {
 				return nil, searchFailureEnvelope(ue)
@@ -194,7 +194,7 @@ func (h *Handler) replaySearchAfterRefresh(
 	ctx context.Context, acct *auth.Auth, query string, maxResults int, chatMeta upstream.ChatMeta,
 ) (*upstream.SearchOutcome, *searchFailure) {
 	if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
-		h.noteSearchRefreshFailure(acct, err)
+		h.noteRefreshFailure(acct, err, "search_refresh")
 
 		if ue, ok := errors.AsType[*upstream.Error](err); ok {
 			return nil, searchFailureEnvelope(ue)
@@ -289,15 +289,16 @@ func searchRetryableStatus(kind upstream.ErrKind) int {
 	}
 }
 
-// noteSearchRefreshFailure 搜索路径的刷新失败处置：与 chat 的
+// noteRefreshFailure 非 chat 入口（搜索/出图）的刷新失败处置：与 chat 的
 // penalizeRefreshFailure 同口径（session dead 连续达阈才禁用；其余喂熔断计数）。
-func (h *Handler) noteSearchRefreshFailure(acct *auth.Auth, err error) {
-	if ue, ok := errors.AsType[*upstream.Error](err); ok && ue.Kind == upstream.ErrSessionDead {
+// 判定用 IsCredentialDead 覆盖 refresh 侧 401/403、12153 与无 RT 的错误。
+func (h *Handler) noteRefreshFailure(acct *auth.Auth, err error, stage string) {
+	if upstream.IsCredentialDead(err) {
 		if h.cfg.Pool.NoteSessionDead(acct.UID) {
-			log.Printf("WARN: [server] search refresh acct=%s: 连续 %d 次 session dead — 禁用",
-				logfmt.Label(acct.UID, acct.NicknameValue()), pool.SessionDeadThreshold())
+			log.Printf("WARN: [server] %s refresh acct=%s: 连续 %d 次 session dead — 禁用",
+				stage, logfmt.Label(acct.UID, acct.NicknameValue()), pool.SessionDeadThreshold())
 			h.notifyAccount(acct.UID, notify.EventSessionDead, "账号连续 session 失效，已禁用，需重新登录",
-				map[string]any{"stage": "search_refresh"})
+				map[string]any{"stage": stage})
 		}
 
 		return

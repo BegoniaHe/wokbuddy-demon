@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 // InNightWindow 当前是否处于夜猫子计数窗口（23:00–08:00 CST，上游按自然日计时）。
@@ -46,14 +48,14 @@ func (c *Client) BlackcatNeed(a *auth.Auth) (int64, error) {
 }
 
 // RunNightChats 夜猫子：发 need 次 glm-5.2 真实对话（读干流）并上报事件链。
-// 返回成功次数。对话内容极短（1+1），消耗可忽略。
+// 返回成功次数。每次从内置短问句池抽一条，避免固定 user 内容形成指纹。
 func (c *Client) RunNightChats(account *auth.Auth, need int) (int64, error) {
 	var ok int64
 
 	for i := range need {
 		body, merr := json.Marshal(map[string]any{
 			"model":    "glm-5.2",
-			"messages": []map[string]any{{"role": "user", "content": "1+1等于几？直接回答。"}},
+			"messages": []map[string]any{{"role": "user", "content": pickChatQuestion()}},
 			"stream":   true,
 		})
 		if merr != nil {
@@ -72,8 +74,8 @@ func (c *Client) RunNightChats(account *auth.Auth, need int) (int64, error) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<20))
 		rc.Close()
 
-		cid := fmt.Sprintf("wb2api-night-%d-%d", time.Now().UnixMilli(), i)
-		if err := c.ReportChatActivityModel(account, cid, "", "glm-5.2", "GLM-5.2"); err != nil {
+		cid := session.NewUUIDv4()
+		if err := c.ReportChatActivityModel(account, cid, session.NewUUIDv7Hex(), "glm-5.2", "GLM-5.2"); err != nil {
 			return ok, fmt.Errorf("第 %d 次上报失败: %w", i+1, err)
 		}
 
@@ -143,6 +145,44 @@ func (c *Client) HeatmapYesterdayMissed(a *auth.Auth) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// HeatmapMissedDays 返回 [startDay, endDay]（CST 自然日，含端点）内未签到的日期，
+// 升序排列。heatmap 接口一次返回当月/近期格子；区间外的格子忽略。
+func (c *Client) HeatmapMissedDays(a *auth.Auth, startDay, endDay string) ([]string, error) {
+	data, err := c.growthJSON(a, http.MethodGet, "/activity/growth/heatmap", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Cells []struct {
+			Date  string `json:"date"`
+			Score int    `json:"score"`
+		} `json:"cells"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("HeatmapMissedDays: %w", err)
+	}
+
+	out := make([]string, 0, len(resp.Cells))
+
+	for _, cell := range resp.Cells {
+		day := cell.Date
+		if len(day) > 10 {
+			day = day[:10]
+		}
+
+		if len(day) != 10 || day < startDay || day > endDay || cell.Score != 0 {
+			continue
+		}
+
+		out = append(out, day)
+	}
+
+	slices.Sort(out)
+
+	return out, nil
 }
 
 // UseMakeupCard 对指定日期使用补签卡（保住连登连续天数；无卡返回业务错误）。

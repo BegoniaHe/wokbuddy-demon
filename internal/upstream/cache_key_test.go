@@ -40,8 +40,8 @@ func TestInjectPromptCacheKey_PreservesExisting(t *testing.T) {
 
 // TestInjectPromptCacheKey_UsesConversationID 覆盖任务用例 2：
 // body 无 prompt_cache_key 但有 conversation_id → 用它做会话哈希源。
-// 格式 wb2a-<uid8>-<conversationHash>：conversation_id 不逐字出现，而是驱动哈希段
-// （同 id 同 key、不同 id 不同 key）。同时仍带 uid8 隔离前缀。
+// 格式 <uid8>-<conversationHash>：conversation_id 不逐字出现，而是驱动哈希段
+// （同 id 同 key、不同 id 不同 key）。仍带 uid8 隔离前缀，但不再有项目品牌前缀。
 func TestInjectPromptCacheKey_UsesConversationID(t *testing.T) {
 	t.Parallel()
 
@@ -51,11 +51,11 @@ func TestInjectPromptCacheKey_UsesConversationID(t *testing.T) {
 	out := InjectPromptCacheKey([]byte(str), uid, "")
 
 	got := extractCacheKey(t, out)
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if strings.Contains(got, "wb2a") {
+		t.Fatalf("cache key must not carry brand prefix: got=%q", got)
 	}
 
-	if !strings.Contains(got, "user-abc") {
+	if !strings.HasPrefix(got, "user-abc-") {
 		t.Fatalf("expected uid8 isolation prefix, got=%q", got)
 	}
 	// 同 conversation_id 两次出站 → 同 key（稳定）。
@@ -105,8 +105,8 @@ func TestInjectPromptCacheKey_AccountIsolation(t *testing.T) {
 		t.Fatalf("cross-account key collision: both=%q", str)
 	}
 
-	if !strings.HasPrefix(str, "wb2a-") || !strings.HasPrefix(str2, "wb2a-") {
-		t.Fatalf("keys must carry wb2a- prefix: a=%q b=%q", str, str2)
+	if !strings.HasPrefix(str, "user-aaa-") || !strings.HasPrefix(str2, "user-bbb-") {
+		t.Fatalf("keys must carry uid8 isolation prefix: a=%q b=%q", str, str2)
 	}
 }
 
@@ -120,11 +120,11 @@ func TestInjectPromptCacheKey_Format(t *testing.T) {
 	out := InjectPromptCacheKey([]byte(in), uid, "conv-fmt")
 
 	got := extractCacheKey(t, out)
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if strings.Contains(got, "wb2a") {
+		t.Fatalf("cache key must not carry brand prefix: got=%q", got)
 	}
 
-	if !strings.Contains(got, "12345678") {
+	if !strings.HasPrefix(got, "12345678-") {
 		t.Fatalf("expected uid8 (12345678) in key, got=%q", got)
 	}
 }
@@ -144,11 +144,11 @@ func TestInjectPromptCacheKey_EmptyConversation(t *testing.T) {
 		t.Fatalf("expected non-empty key when no conversation, got empty")
 	}
 
-	if !strings.HasPrefix(got, "wb2a-") {
-		t.Fatalf("expected wb2a- prefix, got=%q", got)
+	if strings.Contains(got, "wb2a") {
+		t.Fatalf("cache key must not carry brand prefix: got=%q", got)
 	}
 
-	if !strings.Contains(got, "user-abc") {
+	if !strings.HasPrefix(got, "user-abc-") {
 		t.Fatalf("expected uid8 in key, got=%q", got)
 	}
 }

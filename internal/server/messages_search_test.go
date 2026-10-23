@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +17,11 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+)
+
+var (
+	uuidV4SearchPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	uuidV7SearchPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 )
 
 // searchMessageResponse 搜索响应的断言形态。
@@ -398,13 +404,12 @@ func TestSearchEmitsConversationHeaderFallback(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 
-	if got.Get("X-Conversation-Id") == "" {
-		t.Fatal("outbound X-Conversation-Id is empty")
+	if convID := got.Get("X-Conversation-Id"); !uuidV4SearchPattern.MatchString(convID) {
+		t.Fatalf("outbound X-Conversation-Id=%q want UUIDv4", convID)
 	}
 
-	if got.Get("X-Conversation-Id") != got.Get("X-Conversation-Request-Id") {
-		t.Fatalf("X-Conversation-Id=%q want request-id %q",
-			got.Get("X-Conversation-Id"), got.Get("X-Conversation-Request-Id"))
+	if reqID := got.Get("X-Conversation-Request-Id"); !uuidV7SearchPattern.MatchString(reqID) {
+		t.Fatalf("outbound X-Conversation-Request-Id=%q want UUIDv7 32 hex", reqID)
 	}
 }
 

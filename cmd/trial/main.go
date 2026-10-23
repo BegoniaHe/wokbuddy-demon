@@ -20,14 +20,19 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
+
+// errGlobalProfileMissing trial 缺少 global 客户端指纹。
+var errGlobalProfileMissing = errors.New("缺少 data/client-profiles/global.json：trial 需要 global 客户端指纹")
 
 // classifyTrial 归一化 ClaimTrial 结果（纯函数，供 main 循环与测试直接断言）：
 // err → FAIL；claimed → OK；否则（幂等码已领）→ ALREADY。
@@ -73,12 +78,19 @@ func main() {
 
 	sort.Strings(files)
 
-	up := upstream.New()
+	profiles, perr := loadProfiles()
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", perr)
+		os.Exit(1)
+	}
+
+	client := upstream.New()
+	client.Profile = profiles
 	// trial 是 global 专属端点：必须开启 global realm 路由，否则 upstream.New() 的
 	// GlobalEnabled 零值 false 会把请求路由到 CN base（codebuddy.cn）而必然失败。
-	up.GlobalEnabled = true
+	client.GlobalEnabled = true
 
-	rows := collectTrialRows(files, up)
+	rows := collectTrialRows(files, client)
 
 	var okN, alreadyN, notAppN, failN int
 
@@ -103,6 +115,17 @@ func main() {
 
 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
 		len(rows), okN, alreadyN, notAppN, failN)
+}
+
+// loadProfiles 加载部署 profile。global 缺失不在启动期硬失败：CN 账号仍应
+// 输出 N/A，只有真正要发请求的 global 账号才在 trialForFile 里报 FAIL。
+func loadProfiles() (*clientprofile.Set, error) {
+	profiles, err := clientprofile.LoadDir("data/client-profiles")
+	if err != nil {
+		return nil, fmt.Errorf("load client profiles: %w", err)
+	}
+
+	return profiles, nil
 }
 
 // collectTrialRows 逐个 auth 文件领取 trial，返回每账号结果行（顺序与 files 一致）。
@@ -138,6 +161,11 @@ func trialForFile(str string, client *upstream.Client) trialRow {
 	// 仅 global 账号适用：CN 明确提示不适用，不发任何请求。
 	if !account.IsGlobal() {
 		r.status, r.detail = trialNotApp, "CN account not applicable"
+		return r
+	}
+
+	if client.Profile == nil || client.Profile.ForRealm("global") == nil {
+		r.status, r.detail = trialFailed, errGlobalProfileMissing.Error()
 		return r
 	}
 

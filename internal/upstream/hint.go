@@ -112,9 +112,26 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 // （IsModelRateLimit 对帧 JSON 直接命中）优先；其余先取帧内业务码
 // （error.code / error.data.code / data.code，字符串或数字），取不到再回落
 // error.message 走 Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
+//
+//nolint:cyclop // 帧形态按优先级线性判定。
 func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
+	}
+
+	// 顶层 {code,msg} 业务错误帧（issue #244）：与 error 帧同口径分类。
+	if code, msg, ok := BusinessFrameError(payload); ok {
+		probe, err := json.Marshal(struct {
+			Code string `json:"code"`
+			Msg  string `json:"msg"`
+		}{Code: code, Msg: msg})
+		if err == nil {
+			if kind := Classify(http.StatusBadRequest, string(probe)); kind != ErrNone && kind != ErrClient {
+				return kind
+			}
+		}
+
+		return Classify(http.StatusBadRequest, msg)
 	}
 
 	var frame struct {
@@ -218,4 +235,79 @@ func codeMarker(lower, code string) bool {
 	}
 
 	return false
+}
+
+// BusinessFrameError 报告 SSE 数据帧是否是**顶层**业务错误信封
+// `{"code":N,"msg":"..."}`（N 非 0）。上游部分故障不走 `{"error":...}`，
+// 而是 200 + 顶层 code/msg；不识别会被白名单洗成空 chunk 或空成功（issue #244）。
+// 只认同时具备非零 code 与 msg、且没有 choices/delta 的形态，避免误伤正常分片。
+func BusinessFrameError(payload string) (code, msg string, ok bool) {
+	var frame map[string]any
+	if json.Unmarshal([]byte(payload), &frame) != nil {
+		return "", "", false
+	}
+
+	if _, hasErr := frame["error"]; hasErr {
+		return "", "", false
+	}
+
+	if _, hasChoices := frame["choices"]; hasChoices {
+		return "", "", false
+	}
+
+	rawCode, hasCode := frame["code"]
+	if !hasCode {
+		return "", "", false
+	}
+
+	code = firstJSONCode(mustRaw(rawCode))
+	if code == "" || code == "0" {
+		return "", "", false
+	}
+
+	msg = strings.TrimSpace(stringValueAny(frame["msg"]))
+	if msg == "" {
+		msg = strings.TrimSpace(stringValueAny(frame["message"]))
+	}
+
+	if msg == "" {
+		return "", "", false
+	}
+
+	return code, msg, true
+}
+
+// mustRaw 把已解码值重新编码为 json.RawMessage（仅用于复用 firstJSONCode）。
+func mustRaw(value any) json.RawMessage {
+	//nolint:errchkjson // value 来自已解码 JSON，Marshal 不会失败。
+	raw, _ := json.Marshal(value)
+
+	return raw
+}
+
+// stringValueAny 读取任意 JSON 标量的字符串形态（数字/字符串）。
+func stringValueAny(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64)
+	default:
+		return ""
+	}
+}
+
+// BusinessErrorFrame 把顶层业务错误包成 OpenAI error 帧（保留原始 code/msg）。
+func BusinessErrorFrame(payload, code, msg string) string {
+	out, err := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": msg, "type": "upstream_error", "code": code,
+			"upstream_payload": json.RawMessage(payload),
+		},
+	})
+	if err != nil {
+		return payload
+	}
+
+	return string(out)
 }

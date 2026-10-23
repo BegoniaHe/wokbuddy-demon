@@ -45,7 +45,7 @@
 | 23:00 | 夜猫子任务 | 按 CST 排程，越晚越精神 |
 | 01:00 | 成长任务巡检 | 趁你睡着偷偷努力 |
 
-夜猫子按 CST 排程，其余任务按宿主本地时区。五类任务可以分别开关。今天不想让它出门？关掉就行，它不会闹。
+所有定时任务（签到 / 旅行 / 活跃 / 保活 / 夜猫子 / 成长 / 余额）统一按 **CST（Asia/Shanghai）** 解释日界与整点，宿主时区（UTC 容器 / NAS / 海外 VPS）不会让任务漂移。升级后旧版按宿主本地日界写入的补跑标记会被忽略一次，按 CST 重新计算。任务可分别开关。今天不想让它出门？关掉就行，它不会闹。
 
 实际触发时刻会在整点后按 `schedule.slot_jitter`（默认 20 分钟）做确定性延后；账号之间按对数正态间隔错开（签到以 `checkin_account_delay` 为中位数，旅行/活跃/夜猫子用各自固定中位数），每号每天还有独立相位。把抖动、σ 与相位窗口设为 `0` 可回到整点齐发、固定间隔；相位窗口为 `0` 时仍会按每日相位打乱账号顺序。
 
@@ -83,6 +83,11 @@ git clone https://github.com/BegoniaHe/wokbuddy-demon.git
 cd wokbuddy-demon
 
 cp config.example.json config.json
+
+# 客户端指纹快照：data/client-profiles/cn.json 必需；config.example.json 的
+# global.enabled 默认为 true，因此 global.json 也必需（纯 CN 部署可把
+# global.enabled 设为 false 后只提供 cn.json）。用 reverse-workbuddy 技能从
+# 官方 Win32 分发包生成，缺失会拒绝启动
 docker compose up -d --build
 ```
 

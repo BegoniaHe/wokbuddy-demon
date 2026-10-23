@@ -15,9 +15,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 // reportPath 活跃上报通道（实测）。
@@ -113,17 +115,26 @@ func (c *Client) retryDelay() time.Duration {
 	return billingRetryDelay
 }
 
+// billingProcessingMarkers 上游 429「请求处理中」文案（签到/余额瞬时状态）。
+// 该状态是上游正在处理上一笔请求，重试通常可成功；不能按普通业务错误丢掉，
+// 否则会造成漏签（issue #250）。
+var billingProcessingMarkers = []string{"请求处理中", "processing"}
+
 // isTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
 // 上游 5xx（ErrServer，实测偶发 "code 10000 / API request failed with status
-// code: 500"）或网络层错误（非 *Error 的传输失败）。业务错误（code!=0 的
-// 已签到/参数错、4xx、限流）不重试——重试只会原样再失败一次。
+// code: 500"）、网络层错误（非 *Error 的传输失败），以及 429「请求处理中」
+// 这类瞬时状态。其余业务错误（已签到/参数错/余额耗尽）不重试。
 func isTransientBillingErr(err error) bool {
 	if err == nil {
 		return false
 	}
 
 	if ue, ok := errors.AsType[*Error](err); ok {
-		return ue.Kind == ErrServer
+		if ue.Kind == ErrServer {
+			return true
+		}
+
+		return ue.Kind == ErrSoftRate && containsAnyDual(strings.ToLower(ue.Msg), ue.Msg, billingProcessingMarkers)
 	}
 
 	return true
@@ -192,8 +203,8 @@ type chatRequestEvent struct {
 }
 
 // ReportChatActivity 向上游发送一条对话活跃上报（chat_request_send）。
-// conversationID 由调用方生成（如 wb2api-<ms>），无需真实会话——服务端不校验一致性。
-// requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时回落 conversationID。
+// conversationID 由调用方生成（UUIDv4），无需真实会话——服务端不校验一致性。
+// requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时生成新的 UUIDv7。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
 	return c.ReportChatActivityModel(a, conversationID, requestID, "deepseek-v4-flash", "DeepSeek V4 Flash")
@@ -203,7 +214,7 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 // 对齐实际模型（如 Model_chat_GLM5.2 需 requestModelId=glm-5.2 与独立 requestID）。
 func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, requestID, modelID, modelName string) error {
 	if requestID == "" {
-		requestID = conversationID
+		requestID = session.NewUUIDv7Hex()
 	}
 
 	if modelID == "" {
@@ -246,7 +257,7 @@ func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, re
 		TotalCount:            0,
 		FileURI:               "",
 		PresentAt:             now,
-		TraceID:               "",
+		TraceID:               requestID,
 		RootRequestID:         requestID,
 		ParentConversationID:  conversationID,
 		AgentName:             "default",

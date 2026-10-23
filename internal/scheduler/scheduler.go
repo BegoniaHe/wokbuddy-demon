@@ -16,6 +16,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -104,6 +105,12 @@ type Scheduler struct {
 	runMu sync.Mutex
 	runs  map[string]*runSlot
 
+	// claimMu 保护补偿/礼包进程内幂等闸（issue #251）：uid|周期 → 已领取标记，
+	// 以及正在领取的 key 集合（防并发重复 claim）。重启即清零，语义见 compensation.go。
+	claimMu      sync.Mutex
+	claimedKeys  map[string]string
+	claimingKeys map[string]bool
+
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
@@ -152,6 +159,8 @@ func New(cfg *Config) *Scheduler {
 		nowFn:          time.Now,
 		logger:         log.Default(),
 		adoptTried:     make(map[string]string),
+		claimedKeys:    make(map[string]string),
+		claimingKeys:   make(map[string]bool),
 		rearmSchedule:  make(chan struct{}, 1),
 		rearmBalance:   make(chan struct{}, 1),
 		rearmTaskSweep: make(chan struct{}, 1),
@@ -379,13 +388,14 @@ func (s *Scheduler) candidateSlots(now time.Time) []wakeSlot {
 		disabled bool
 		loc      *time.Location
 	}{
-		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled, nil},
-		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled, nil},
-		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled, nil},
-		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled, nil},
-		// 夜猫子窗口固定 CST：按宿主本地小时排程会让非 UTC+8 主机落在窗口外。
+		// 所有排程统一按 CST 解释：上游日界/签到重置/窗口都按 Asia/Shanghai，
+		// 宿主时区（UTC 容器/NAS/海外 VPS）不得让任务漂移（issue #252）。
+		{s.cfg.CheckinHours, taskCheckin, s.cfg.CheckinDisabled, cst.Loc},
+		{s.cfg.TravelHours, taskTravel, s.cfg.TravelDisabled, cst.Loc},
+		{s.cfg.ActivityHours, taskActivity, s.cfg.ActivityDisabled, cst.Loc},
+		{s.cfg.KeepaliveHours, taskKeepalive, s.cfg.KeepaliveDisabled, cst.Loc},
 		{s.cfg.BlackcatHours, taskBlackcat, s.cfg.BlackcatDisabled, cst.Loc},
-		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled, nil},
+		{s.cfg.GrowthHours, taskGrowth, s.cfg.GrowthDisabled, cst.Loc},
 	}
 	timing := s.cfg.Timing
 	s.schedMu.Unlock()
@@ -865,8 +875,8 @@ func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure in
 		targets = append(targets, batchTarget{
 			uid: account.UID,
 			run: func() bool {
-				cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
-				if err := s.cfg.Upstream.ReportChatActivity(account, cid, ""); err != nil {
+				cid := session.NewUUIDv4()
+				if err := s.cfg.Upstream.ReportChatActivity(account, cid, session.NewUUIDv7Hex()); err != nil {
 					log.Printf("activity %s: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
 					s.notifyTaskFailed("activity", account.UID, account.NicknameValue(), account.Realm())
 
@@ -1074,16 +1084,7 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			// 用含逐日到期批次的快照写入：面板快照路径与「检查」同口径（issue #200）。
-			snap, err := s.cfg.Upstream.UserResourceSnapshot(account4, expiringSoon)
-			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, account4.NicknameValue()), err)
-				return
-			}
-
-			s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
-			s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
-			s.notifyCreditLow(account4, snap.Remain)
+			s.refreshBalanceAccount(account4, uid, expiringSoon)
 		}(account, status.UID)
 	}
 
@@ -1091,6 +1092,56 @@ loop:
 
 	// 记录本轮完成时刻与周期，供面板展示「数据新鲜度」（issue #200）。
 	s.cfg.Pool.SetBalanceRefreshMeta(s.balanceRefreshSeconds(), time.Now())
+}
+
+// refreshBalanceAccount 单账号余额刷新：401 先 refresh 求证（issue #245），
+// 成功后写快照并做低额度告警。
+func (s *Scheduler) refreshBalanceAccount(account *auth.Auth, uid string, expiringSoon time.Duration) {
+	snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+	if err != nil && upstream.IsCredentialDead(err) {
+		snap, err = s.refreshThenSnapshot(account, expiringSoon)
+	}
+
+	if err != nil {
+		log.Printf("balance %s: %v", logfmt.Label(uid, account.NicknameValue()), fmt.Errorf("snapshot: %w", err))
+
+		return
+	}
+
+	s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
+	s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+	s.notifyCreditLow(account, snap.Remain)
+}
+
+// refreshThenSnapshot 余额 401 的 refresh 求证：refresh 成功 → 重试一次快照；
+// refresh 仍失败且为凭证失效 → 计入 session dead（连续阈值才禁用），否则原样返回。
+func (s *Scheduler) refreshThenSnapshot(account *auth.Auth, expiringSoon time.Duration) (upstream.ResourceSnapshot, error) {
+	refreshErr := s.cfg.Upstream.RefreshToken(account)
+	if refreshErr == nil {
+		if saveErr := account.SaveAtomicRetry(); saveErr != nil {
+			log.Printf("ERR: [scheduler] balance refresh acct=%s: save auth failed: %v",
+				logfmt.Label(account.UID, account.NicknameValue()), saveErr)
+		}
+
+		snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+		if err != nil {
+			return snap, fmt.Errorf("snapshot after refresh: %w", err)
+		}
+
+		return snap, nil
+	}
+
+	if upstream.IsCredentialDead(refreshErr) {
+		if s.cfg.Pool.NoteSessionDead(account.UID) {
+			log.Printf("WARN: [scheduler] balance acct=%s: 连续 %d 次会话失效 — 禁用，需重新登录",
+				logfmt.Label(account.UID, account.NicknameValue()), pool.SessionDeadThreshold())
+			s.notifyAccount(account.UID, account.NicknameValue(), account.Realm(),
+				notify.EventSessionDead, "账号连续 session 失效，已禁用，需重新登录",
+				map[string]any{"stage": "balance"})
+		}
+	}
+
+	return upstream.ResourceSnapshot{}, fmt.Errorf("refresh: %w", refreshErr)
 }
 
 // runBalanceRefreshFirstRound 启动即跑一轮余额刷新（issue #200）：否则首个 ticker

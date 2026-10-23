@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 const schoolBase = "/portal/activity/school"
@@ -146,7 +147,7 @@ func (c *Client) ReportMPEvent(account *auth.Auth, events ...map[string]any) err
 
 // SchoolChatTimesEvents 构造一条 chat_request_send 事件（chat_3_times 计数）。
 func SchoolChatTimesEvents(conversationID string) map[string]any {
-	rid := "wb2api-" + clientToken()
+	rid := session.NewUUIDv7Hex()
 
 	return map[string]any{
 		"eventCode":   "chat_request_send",
@@ -156,9 +157,9 @@ func SchoolChatTimesEvents(conversationID string) map[string]any {
 		"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
 		"codebaseId": "", "mentionContextCount": 0, "command": "",
 		"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
-		"traceId": rid, "rootRequestId": rid,
+		"requestId": rid, "traceId": rid, "rootRequestId": rid,
 		"parentConversationId": conversationID, "conversationId": conversationID,
-		"messageId": "msg-" + rid[len(rid)-8:],
+		"messageId": session.NewUUIDv7Hex(),
 		"agentName": "mp", "agentType": "main",
 		"codebuddy.session_id":              conversationID,
 		"codebuddy.conversation_request_id": rid,
@@ -235,7 +236,7 @@ func MiniPlaybookEvents(caseID, caseName string) []map[string]any {
 	send := map[string]any{
 		"eventCode": "playbook_prompt_send", "source": "discover",
 		"promptLength": 96, "isOfficial": 1,
-		"conversationId": "wb2api-mp-pb-" + clientToken(),
+		"conversationId": session.NewUUIDv4(),
 		"extVersion":     mpExtVersion,
 	}
 	maps.Copy(send, base)

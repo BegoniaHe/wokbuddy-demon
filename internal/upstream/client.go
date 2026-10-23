@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
@@ -195,6 +196,14 @@ func IsChannelRefused(body string) bool {
 func IsAccountRestricted(body string) bool {
 	return hasBusinessCode(body, accountRestrictedCode) &&
 		containsAnyDual(strings.ToLower(body), body, []string{accountRestrictedMsg})
+}
+
+// IsUnconfirmedSafetyReview 报告 11140 + "content failed safety review" 形态。
+// 该文案来自同类实现实证，官方包内未确认，因此**只记录日志**、不扩 contentBlocked
+// marker（issue #246）。
+func IsUnconfirmedSafetyReview(body string) bool {
+	return hasBusinessCode(body, accountRestrictedCode) &&
+		strings.Contains(strings.ToLower(body), "content failed safety review")
 }
 
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
@@ -690,6 +699,8 @@ func ParseRateReset(body string) (time.Time, bool) {
 
 // classifyEarly 判定优先级最高的几类：模型不存在、402、11-128 内容拦截、
 // 客户端明确的请求级业务码。顺序即优先级。
+//
+//nolint:cyclop // 分类优先级线性展开。
 func classifyEarly(status int, body string) (ErrKind, bool) {
 	// 11136/11158 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
 	// 平台级「目录无此模型」分开）。11158 另留文案外卡：上游丢 code 时仍按账号类型
@@ -725,8 +736,78 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 		return ErrContentBlocked, true
 	}
 
+	// 11133 model_param_invalid：官方文案是「模型无法处理此请求」，同时被 GIF
+	// 不支持复用。不能一律当账号故障：缺/空 messages 是确定性请求体错误（不轮转），
+	// 图像/GIF 形态是模型能力问题（不罚号），其余按请求级处理（issue #246）。
+	if status != http.StatusTooManyRequests && hasBusinessCode(body, "11133") {
+		return classifyModelParamInvalid(body), true
+	}
+
 	// 客户端明确的请求级业务码先于账号/限流层：同一 body 换号结果不变。
 	return classifyRequestLevel(body)
+}
+
+// classifyModelParamInvalid 细分 11133：缺/空 messages → ErrBadParams 请求级
+// fail-fast；图像/GIF → ErrImageInvalid（提示换模型或移除图片）；其余按官方
+// 「模型无法处理此请求」归请求级错误，不喂账号连败。
+func classifyModelParamInvalid(body string) ErrKind {
+	param := businessErrorParam(body)
+	if param == "messages" || param == "input" {
+		return ErrBadParams
+	}
+
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "image") || strings.Contains(lower, "gif") {
+		return ErrImageInvalid
+	}
+
+	return ErrBadParams
+}
+
+// businessErrorParam 从上游错误信封提取 extError.param / error.data.param /
+// 顶层 param（只取字符串，深度有界）。
+//
+//nolint:cyclop // 深度有界的递归提取。
+func businessErrorParam(body string) string {
+	var root any
+	if json.Unmarshal([]byte(body), &root) != nil {
+		return ""
+	}
+
+	var walk func(any, int) string
+
+	walk = func(value any, depth int) string {
+		if depth < 0 {
+			return ""
+		}
+
+		node, ok := value.(map[string]any)
+		if !ok {
+			return ""
+		}
+
+		for _, key := range []string{"extError", "error"} {
+			if child, ok := node[key].(map[string]any); ok {
+				if p, ok := child["param"].(string); ok && strings.TrimSpace(p) != "" {
+					return strings.TrimSpace(p)
+				}
+			}
+		}
+
+		if p, ok := node["param"].(string); ok && strings.TrimSpace(p) != "" {
+			return strings.TrimSpace(p)
+		}
+
+		for _, key := range []string{"data", "error", "response"} {
+			if p := walk(node[key], depth-1); p != "" {
+				return p
+			}
+		}
+
+		return ""
+	}
+
+	return walk(root, 3)
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
@@ -997,6 +1078,13 @@ func classifyPromptTooLong(status int, lower, body string) (ErrKind, bool) {
 // 是「只换号不罚」（连环 403 根因），必须在兜底前分流。带信封的 403 在上方各层已有
 // 权威分类，不受影响。
 func classifyStatusFallback(status int, body string) (ErrKind, bool) {
+	// 上游 401（含 APISIX invalid_token HTML 页）统一归会话失效：先由调用方在同号
+	// refresh 后重放一次，仍失败才累计 session dead。若落 ErrClient，死号会留在池中
+	// 每个请求刷一遍 401（issue #245）。
+	if status == http.StatusUnauthorized {
+		return ErrSessionDead, true
+	}
+
 	if status == http.StatusNotFound {
 		return ErrNotFound, true
 	}
@@ -1125,6 +1213,11 @@ type Client struct {
 	// <=0 回落包级默认 billingRetryDelay（2s）。仅供测试注入更短间隔，生产不设置。
 	RetryDelay time.Duration
 
+	// ConversationRequestBody 是否在 body 的当前轮最后一条 user 消息写入
+	// conversationRequestId / startsNewUserRequest（features.conversation_request_body；
+	// 默认 false，供真实账号小流量 A/B 后开启，issue #249）。
+	ConversationRequestBody atomic.Bool
+
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（生产由 config
 	// normalize 到 120s/300s；裸用回落 transport 构造默认）。
 	HeaderTimeout time.Duration
@@ -1170,19 +1263,23 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
-	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
-	// 空 = 默认官方形态：chat/refresh/FetchModels 走
-	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
-	// （仅当 client_name 非空）。
+	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认形态）。
+	// 空 = 按 realm 取部署 profile 的冻结字面量：chat/refresh/FetchModels 用
+	// emit.chatUA，billing/checkin/banner 用 emit.billingUA。
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
-	// 空 = 按 realm 取内置默认（cn 5.8.3 / global 5.8.4，对齐官方分发包）。
+	// 空 = profile.xIdeVersion。显式配置优先于 profile。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 按 realm 取内置默认
-	// （cn 2.161.0 / global 2.161.0，对齐官方内置 CLI）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = profile.source.cliVersion。
+	// 显式配置优先于 profile。
 	CliVersion string
+
+	// Profile 部署侧客户端指纹快照（data/client-profiles/<realm>.json）。
+	// 整份提供 UA / IDE 版本 / 构建 commit/releaseDate；启动期按启用 realm 强制校验，
+	// 缺失即拒绝启动。装配期注入，运行期只读。
+	Profile *clientprofile.Set
 
 	// ClientName 自定义用量归属名：非空时 X-Product 与 X-IDE-Name/Type 跟随该值。
 	// 空 = 官方桌面端默认（X-Product="SaaS"、X-IDE-Name/Type="WorkBuddy"）。
@@ -1652,6 +1749,17 @@ type refreshFlight struct {
 	err  error
 }
 
+// IsCredentialDead 判定错误是否意味着会话/refresh token 已不可用：账号需要重新
+// 登录，而不是继续换号。refresh 侧 401/403、12153 与「无 refresh token」都算。
+// 供 handler / scheduler 共用，避免各处只看 *Error.Kind 漏掉无 RT 的失败（issue #245）。
+func IsCredentialDead(err error) bool {
+	if errors.Is(err, errNoRefreshToken) || errors.Is(err, errRefreshFailedNoAccessTokenIn) {
+		return true
+	}
+
+	return isSessionDeadErr(err)
+}
+
 // isSessionDeadErr 判定错误是否为会话/RT 失效（12153 或 refresh 侧 401/403 映射）。
 func isSessionDeadErr(err error) bool {
 	var ue *Error
@@ -1923,6 +2031,10 @@ func (c *Client) ChatStreamContext(
 
 	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID)
 	prepared = ensureLeadingSystem(prepared)
+
+	if c.ConversationRequestBody.Load() && meta.ConversationRequestID != "" {
+		prepared = injectConversationRequestID(prepared, meta.ConversationRequestID)
+	}
 
 	headerTimeout, idleTimeout := c.modelTimeout(account3.Realm(), modelFromBody(prepared))
 	chatHTTP := c.chatHTTPForAccount(account3, headerTimeout)
