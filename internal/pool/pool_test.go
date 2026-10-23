@@ -21,6 +21,15 @@ func withNoPickGap(t *testing.T) {
 	t.Helper()
 }
 
+// persistFailureCount 在锁内读取 persistFails：后台 flusher（TestMain 把间隔
+// 调到 20ms）会并发写该字段，测试直读构成数据竞争。生产读写均由 persistMu 保护。
+func persistFailureCount(p *Pool) int {
+	p.persistMu.Lock()
+	defer p.persistMu.Unlock()
+
+	return p.persistFails
+}
+
 func TestPickHighestCredits(t *testing.T) {
 	t.Parallel()
 	withNoPickGap(t)
@@ -1362,7 +1371,7 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 	p.SetCredits("u1", 42, 0)
 	p.Flush()
 
-	if p.persistFails == 0 {
+	if got := persistFailureCount(p); got == 0 {
 		t.Fatal("persist failure should be recorded (visible), got 0")
 	}
 
@@ -1373,8 +1382,8 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 	testCase.SetCredits("u1", 42, 0)
 	testCase.Flush()
 
-	if testCase.persistFails != 0 {
-		t.Fatalf("successful save should reset persistFails, got %d", testCase.persistFails)
+	if got := persistFailureCount(testCase); got != 0 {
+		t.Fatalf("successful save should reset persistFails, got %d", got)
 	}
 
 	if raw, err := os.ReadFile(good); err != nil || !strings.Contains(string(raw), `"credits": 42`) {
