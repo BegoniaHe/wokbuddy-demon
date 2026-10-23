@@ -181,8 +181,9 @@ func (a *streamAggregator) handleLine(line string) (bool, error) {
 	}
 
 	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) == nil {
-		// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
+	if json.Unmarshal([]byte(payload), &chunk) == nil && chunk != nil {
+		// 有效事件计数：仅 JSON 对象数据帧计入（解析失败、顶层 null 沿用静默 continue）。
+		// null 是合法 JSON 但解码成 nil map，没有可聚合字段，计入会掩盖空流。
 		a.validEvents++
 		if err := a.handleChunk(chunk); err != nil {
 			return false, err

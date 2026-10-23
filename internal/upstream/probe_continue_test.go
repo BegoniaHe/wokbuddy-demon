@@ -260,3 +260,29 @@ func TestTextContinueReaderMergesFirstUsage(t *testing.T) {
 		t.Fatalf("length finish must be suppressed after successful continuation: %s", out)
 	}
 }
+
+// TestTextContinueReaderNullFrame 续写段的顶层 null 帧必须原样透传：nil map 没有
+// 可写字段，续写重写 id/model 时写 nil map 会 panic。
+func TestTextContinueReaderNullFrame(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"hello "}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	second := "data: null\n\n" +
+		`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+		return closeString{strings.NewReader(second)}, nil
+	})
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(out), "data: null") {
+		t.Fatalf("null frame must be passed through: %s", out)
+	}
+}

@@ -1024,6 +1024,11 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "只有 null",
+			raw:     "data: null\n\ndata: [DONE]\n\n",
+			wantErr: true,
+		},
+		{
 			name:    "DONE 后跟垃圾帧不进聚合",
 			raw:     valid[:len(valid)-len("data: [DONE]\n\n")] + "data: [DONE]\n\ndata: {\"junk\":\"should not aggregate\"}\n\n",
 			wantErr: false,
