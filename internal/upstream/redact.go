@@ -32,8 +32,8 @@ var (
 	reLongToken = regexp.MustCompile(`\b[A-Za-z0-9][A-Za-z0-9._~+/\-=]{31,}\b`)
 )
 
-// redactForLog 清理控制字符、脱敏敏感值，再截断到 limit 字节（limit<=0 不截断）。
-func redactForLog(s string, limit int) string {
+// RedactForLog 清理控制字符、脱敏敏感值，再截断到 limit 字节（limit<=0 不截断）。
+func RedactForLog(s string, limit int) string {
 	clean := sanitizeLogLine(s)
 	clean = reAuthorization.ReplaceAllString(clean, `$1`+redacted)
 	clean = reBearer.ReplaceAllString(clean, `Bearer `+redacted)
