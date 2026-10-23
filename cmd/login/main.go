@@ -29,12 +29,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	auth2 "github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 )
 
 // 上游常量：CN → www.workbuddy.cn（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
@@ -42,7 +44,6 @@ import (
 const (
 	upstreamBaseCN      = "https://www.workbuddy.cn"
 	upstreamBaseGlobal  = "https://www.workbuddy.ai"
-	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
@@ -62,6 +63,7 @@ var (
 	errParseRealmArgsFailed     = errors.New("parseRealmArgs failed")
 	errValidateRealmMatchFailed = errors.New("validateRealmMatch failed")
 	errLoginPending             = errors.New("登录未完成（waiting for login）。请确认已在浏览器完成登录再按 y")
+	errDoJSONHeadersRequired    = errors.New("doJSON: headers 不能为空")
 )
 
 // realmConfig 按 realm 返回上游 base 与 Origin/Referer origin：global →
@@ -95,16 +97,62 @@ func authPlatform(realm string) string {
 	return "workbuddy"
 }
 
+// loginIdentity 设备授权链路的客户端身份：UA 与 auth/state 的 platform 参数。
+type loginIdentity struct {
+	userAgent string
+	platform  string
+}
+
+// loginIdentityFor 取部署 profile 的 loginUA / loginPlatform。profile 或 loginUA
+// 缺失时 userAgent 为空，由调用方拒绝登录（仓库不内置任何登录 UA）。
+func loginIdentityFor(profiles *clientprofile.Set, realm string) loginIdentity {
+	identity := loginIdentity{platform: authPlatform(realm)}
+	if profiles == nil {
+		return identity
+	}
+
+	profile := profiles.ForRealm(realm)
+	if profile == nil {
+		return identity
+	}
+
+	if profile.Emit.LoginUA != nil {
+		identity.userAgent = *profile.Emit.LoginUA
+	}
+
+	if profile.Emit.LoginPlatform != "" {
+		identity.platform = profile.Emit.LoginPlatform
+	}
+
+	return identity
+}
+
+// mustLoginIdentity 加载部署 profile 并取登录身份；profile 或 loginUA 缺失时直接
+// 退出（仓库不内置登录 UA）。仅在 url/poll 网络流程调用，realm 选域不依赖 profile。
+func mustLoginIdentity(realm string) loginIdentity {
+	profiles, err := clientprofile.LoadDir("data/client-profiles")
+	if err != nil {
+		fatalf("load client profiles: %v", err)
+	}
+
+	identity := loginIdentityFor(profiles, realm)
+	if identity.userAgent == "" {
+		fatalf("缺少 data/client-profiles/%s.json 的 loginUA：请用 reverse-workbuddy 技能重新生成，仓库不内置登录 UA", realm)
+	}
+
+	return identity
+}
+
 // commonHeaders 按 origin 设置通用请求头（Origin/Referer 随 realm 变化）。
 // 返回 func(*http.Request)，由调用方按 realm 选定的 origin 构造一次后复用。
-func commonHeaders(origin string) func(*http.Request) {
+func commonHeaders(origin, userAgent string) func(*http.Request) {
 	return func(req *http.Request) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Referer", origin+"/")
-		req.Header.Set("User-Agent", clientUA)
+		req.Header.Set("User-Agent", userAgent)
 	}
 }
 
@@ -134,12 +182,11 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
 
-	if headers != nil {
-		headers(req)
-	} else {
-		// 缺省头：CN origin（与原 commonHeaders() 行为一致，零回归）
-		commonHeaders(originRefererCN)(req)
+	if headers == nil {
+		return nil, 0, errDoJSONHeadersRequired
 	}
+
+	headers(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -294,8 +341,8 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // runURL 执行 url 子命令：向 upstreamBase 的 state 端点 POST 取授权 URL，
 // state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；stateFile 为落盘路径
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
-func runURL(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
-	headers := noAuthHeaders(commonHeaders(origin))
+func runURL(base, origin, realm, statePath string, identity loginIdentity, client *http.Client, out io.Writer) {
+	headers := noAuthHeaders(commonHeaders(origin, identity.userAgent))
 
 	var (
 		data     []byte
@@ -304,14 +351,14 @@ func runURL(base, origin, realm, statePath string, client *http.Client, out io.W
 	)
 
 	for _, candidate := range realmBases(realm, base) {
-		url := candidate + "/v2/plugin/auth/state?platform=" + authPlatform(realm)
+		stateURL := candidate + "/v2/plugin/auth/state?platform=" + url.QueryEscape(identity.platform)
 
 		var (
 			status int
 			err    error
 		)
 
-		data, status, err = doJSON(client, http.MethodPost, url, headers, bytes.NewReader([]byte("{}")))
+		data, status, err = doJSON(client, http.MethodPost, stateURL, headers, bytes.NewReader([]byte("{}")))
 		if err == nil {
 			lastErr = nil
 			usedBase = candidate
@@ -353,9 +400,9 @@ func runURL(base, origin, realm, statePath string, client *http.Client, out io.W
 // runPoll 执行 poll 子命令：读 state 文件（realm 校验），向 upstreamBase 的 token 端点
 // GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
 // statePath 可注入临时文件便于测试。
-func runPoll(base, origin, realm, statePath string, client *http.Client, out io.Writer) {
+func runPoll(base, origin, realm, statePath string, identity loginIdentity, client *http.Client, out io.Writer) {
 	loginState2 := loadLoginState(statePath, realm)
-	headers := commonHeaders(origin)
+	headers := commonHeaders(origin, identity.userAgent)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
 	// pending 时业务 code 非 0（"login ing"），完成时 code=0 + token bundle
 	tok, usedBase, err := pollTokenWithFallback(base, realm, loginState2.Base, loginState2.State, headers, client)
@@ -521,10 +568,10 @@ func main() {
 
 	switch rest[0] {
 	case "url":
-		runURL(base, origin, realm, stateFile, client, os.Stdout)
+		runURL(base, origin, realm, stateFile, mustLoginIdentity(realm), client, os.Stdout)
 
 	case "poll":
-		runPoll(base, origin, realm, stateFile, client, os.Stdout)
+		runPoll(base, origin, realm, stateFile, mustLoginIdentity(realm), client, os.Stdout)
 
 	case "realm":
 		// 交互式选域（login.sh 无 --realm 传参且 stdin 为 tty 时调用）。

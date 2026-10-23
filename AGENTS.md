@@ -126,6 +126,7 @@ WokBuddy Demon 是一个本地网关：接收 OpenAI 兼容的 `/v1/*` 请求，
 
 - `internal/upstream/`：出站客户端。CodeBuddy / workbuddy 协议、SSE 流、DSML、tool-call 配对、设备 token、`global` 域路由、模型目录与倍率表、`model.json` 本地缓存。
 - `internal/upstream/sanitize.go`：出站请求体脱敏（剥离上游内容审核黑名单指纹）。策略：键值/header 型指纹整段剥离，承载语义的模板句最小改写。
+- `internal/clientprofile/`：部署侧客户端指纹快照（`data/client-profiles/<realm>.json`）。只认 Win32 来源，校验结构 / 版本一致 / header 安全边界；整份覆盖对应 realm，缺失即拒绝启动（仓库不内置任何版本 / commit / releaseDate 字面量）。
 - 上游行为（接口）变更时，在本目录内自行适配，不依赖上游修复。
 
 ### 服务与面板

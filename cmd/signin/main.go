@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -41,7 +42,14 @@ func main() {
 
 	sort.Strings(files)
 
+	profiles, perr := clientprofile.LoadDir("data/client-profiles")
+	if perr != nil {
+		fmt.Fprintf(os.Stderr, "load client profiles: %v\n", perr)
+		os.Exit(1)
+	}
+
 	up := upstream.New()
+	up.Profile = profiles
 
 	rows, okN, alreadyN, inactiveN, failN := processAccounts(files, up)
 
@@ -103,16 +111,16 @@ func processAccount(str string, client *upstream.Client) row {
 	account.FilePath = str
 	r.uid, r.nick = account.UID, account.Nickname
 
-	// refresh 过期 token
-	if rerr := refreshIfNeeded(account, client); rerr != nil {
-		ue := &upstream.Error{}
-		if errors.As(rerr, &ue) {
-			r.status = "AUTH_INVALID"
-		} else {
-			r.status = "FAIL"
-		}
+	// profile 是出站指纹的唯一来源：缺对应 realm 时不得发请求。
+	if detail := missingProfile(client, account); detail != "" {
+		r.status, r.detail = "FAIL", detail
 
-		r.detail = "refresh: " + short(rerr.Error())
+		return r
+	}
+
+	// refresh 过期 token
+	if status, detail, failed := refreshFailure(account, client); failed {
+		r.status, r.detail = status, detail
 
 		return r
 	}
@@ -136,6 +144,32 @@ func processAccount(str string, client *upstream.Client) row {
 	}
 
 	return r
+}
+
+// missingProfile 返回出站 profile 缺失说明；齐全时返回空串。
+func missingProfile(client *upstream.Client, account *auth.Auth) string {
+	if client.Profile == nil || client.Profile.ForRealm(account.Realm()) == nil {
+		return "missing client profile for realm " + account.Realm()
+	}
+
+	return ""
+}
+
+// refreshFailure 按需刷新 token，返回失败状态与说明；未失败时 failed=false。
+func refreshFailure(account *auth.Auth, client *upstream.Client) (status, detail string, failed bool) {
+	rerr := refreshIfNeeded(account, client)
+	if rerr == nil {
+		return "", "", false
+	}
+
+	ue := &upstream.Error{}
+	if errors.As(rerr, &ue) {
+		status = "AUTH_INVALID"
+	} else {
+		status = "FAIL"
+	}
+
+	return status, "refresh: " + short(rerr.Error()), true
 }
 
 // refreshIfNeeded 在 token 临近过期（2h 内）时刷新并原子落盘；

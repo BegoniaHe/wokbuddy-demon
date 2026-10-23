@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
@@ -1170,19 +1171,23 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
-	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
-	// 空 = 默认官方形态：chat/refresh/FetchModels 走
-	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
-	// （仅当 client_name 非空）。
+	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认形态）。
+	// 空 = 按 realm 取部署 profile 的冻结字面量：chat/refresh/FetchModels 用
+	// emit.chatUA，billing/checkin/banner 用 emit.billingUA。
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
-	// 空 = 按 realm 取内置默认（cn 5.8.3 / global 5.8.4，对齐官方分发包）。
+	// 空 = profile.xIdeVersion。显式配置优先于 profile。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 按 realm 取内置默认
-	// （cn 2.161.0 / global 2.161.0，对齐官方内置 CLI）。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = profile.source.cliVersion。
+	// 显式配置优先于 profile。
 	CliVersion string
+
+	// Profile 部署侧客户端指纹快照（data/client-profiles/<realm>.json）。
+	// 整份提供 UA / IDE 版本 / 构建 commit/releaseDate；启动期按启用 realm 强制校验，
+	// 缺失即拒绝启动。装配期注入，运行期只读。
+	Profile *clientprofile.Set
 
 	// ClientName 自定义用量归属名：非空时 X-Product 与 X-IDE-Name/Type 跟随该值。
 	// 空 = 官方桌面端默认（X-Product="SaaS"、X-IDE-Name/Type="WorkBuddy"）。

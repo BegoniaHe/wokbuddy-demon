@@ -81,6 +81,11 @@ git clone https://github.com/BegoniaHe/wokbuddy-demon.git
 cd wokbuddy-demon
 
 cp config.example.json config.json
+
+# 客户端指纹快照：data/client-profiles/cn.json 必需；config.example.json 的
+# global.enabled 默认为 true，因此 global.json 也必需（纯 CN 部署可把
+# global.enabled 设为 false 后只提供 cn.json）。用 reverse-workbuddy 技能从
+# 官方 Win32 分发包生成，缺失会拒绝启动
 docker compose up -d --build
 ```
 

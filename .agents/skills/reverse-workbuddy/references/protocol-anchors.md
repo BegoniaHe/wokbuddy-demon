@@ -23,14 +23,15 @@
   - `WebBaseCN`（`https://www.workbuddy.cn`）：任务领奖 / profile 域。
   - `/v3/config` 拉取 + `X-Domain`：见 `internal/upstream/client.go` 1874 附近。
 - 桌面指纹上报：`internal/upstream/desktop.go`：`/v2/report`、
-  `/v2/user-asset/appearance/set`、固定构建指纹 `*DesktopCommit` /
-  `*DesktopReleaseDate`。
+  `/v2/user-asset/appearance/set`、`desktopFingerprint`（commit / releaseDate
+  来自部署 profile，源码无固定构建常量）。
 
 ## 请求头族
 
 - `internal/upstream/headers.go`
-  - `userAgent()` 三段形态 `WorkBuddy/<v> WorkBuddy/<v> CLI/<cli>`，版本按
-    `clientVersionFor` / `cliVersionFor` 分 realm 取默认，config 可覆盖。
+  - `userAgent()` / `billingUA()` / `desktopUAFor()` 默认取部署 profile 的冻结
+    字面量（`internal/clientprofile`）；显式 config `user_agent` /
+    `client_version` / `cli_version` 才覆盖版本段。
   - `injectDeviceToken()`：`X-Device-Token`，文件兜底见
     `internal/upstream/device_token.go`。
   - 会话头族 `X-Conversation-Id` / `-Request-Id` / `-Message-Id` /

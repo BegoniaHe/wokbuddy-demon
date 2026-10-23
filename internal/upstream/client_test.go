@@ -446,6 +446,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
 		}, nil
 	})
+	client.Profile = testProfileSet(t)
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
 
 	rc, status, respBody, err := client.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
@@ -467,7 +468,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		"X-Agent-Intent": "craft",
 		"X-Private-Data": "true",
 		"X-Ide-Type":     "WorkBuddy",
-		"X-Ide-Version":  cnClientVersion,
+		"X-Ide-Version":  "9.9.9",
 	}
 	for k, w := range want {
 		if got[k] != w {

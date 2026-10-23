@@ -25,6 +25,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
@@ -46,6 +47,9 @@ import (
 // appVersion 构建标识：编译时经 -ldflags -X 注入（缺省 "dev"），透出到 /panel/api/overview。
 // 本项目滚动更新、无版本号——这里只是运行时自述用的构建串，不是可比的发布版本。
 var appVersion = "dev"
+
+// errClientProfileMissing 部署缺少必需的 client profile（启动期拒绝）。
+var errClientProfileMissing = errors.New("请用 reverse-workbuddy 技能从官方 Win32 分发包生成后放入 client-profiles 目录")
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -137,19 +141,16 @@ func main() {
 	}
 
 	state, store, sessRouter, redisMode, sessCount := setupPool(cfg, auths)
-	// 停机序：先 pool.Close()（最后一次 Flush → SaveState 已提交到 store），
-	// 再 store.Close() 排空在途异步写（最后一笔 Redis 镜像必须写完才关连接）。
-	defer func() {
-		state.Close()
-		_ = store.Close()
-	}()
 
-	if sessRouter != nil {
-		defer sessRouter.StopGC()
+	client, notifier, sch, err := setupUpstream(cfg, state)
+	if err != nil {
+		cleanupRuntime(state, store, sessRouter, nil)
+		log.Fatalf("%v", err)
 	}
 
-	client, notifier, sch := setupUpstream(cfg, state)
-	defer notifier.Close()
+	// 停机序：先 pool.Close()（最后一次 Flush → SaveState 已提交到 store），
+	// 再 store.Close() 排空在途异步写（最后一笔 Redis 镜像必须写完才关连接）。
+	defer cleanupRuntime(state, store, sessRouter, notifier)
 
 	obs := setupObservability(cfg, state)
 	defer obs.usage.Stop()
@@ -206,6 +207,22 @@ func loadConfigAndAuths(path string) (*Config, []*auth.Auth, error) {
 	return cfg, auths, nil
 }
 
+// cleanupRuntime 停机清理：先 pool.Close()（最后一次 Flush → SaveState
+// 已提交到 store），再 store.Close() 排空在途异步写（最后一笔 Redis 镜像
+// 必须写完才关连接），最后停会话 GC 与通知器。
+func cleanupRuntime(state *pool.Pool, store redisstore.Store, sessRouter *session.Router, notifier *notify.Notifier) {
+	state.Close()
+	_ = store.Close()
+
+	if sessRouter != nil {
+		sessRouter.StopGC()
+	}
+
+	if notifier != nil {
+		notifier.Close()
+	}
+}
+
 // setupPool 装配账号池、Redis 镜像与会话粘性路由。
 func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *session.Router, string, func() int) {
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
@@ -247,7 +264,7 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 }
 
 // setupUpstream 装配上游客户端、通知器与调度器，并注入账号路由与倍率读取。
-func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.Notifier, *scheduler.Scheduler) {
+func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.Notifier, *scheduler.Scheduler, error) {
 	// 出站 DNS 必须在 upstream.New() **之前**注入：Transport/Dialer（含 Resolver）
 	// 在 New() 内一次性构造，运行期改无效——所以 dns_servers 被列为「需重启」。
 	// 空 = 系统解析器（零回归）；internal/server/localwebtools.go 的 SSRF 专用
@@ -262,7 +279,10 @@ func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.No
 	// 位于 up 装配之后：倍率表由探测下发，闭包每次调用读实时快照。
 	state2.SetModelRateOf(func(realm, model string) string { return client.ModelRate(realm, model) })
 
-	configureUpstream(cfg, client)
+	if err := configureUpstream(cfg, client); err != nil {
+		return nil, nil, nil, err
+	}
+
 	configureAccountRouting(state2, client, cfg)
 
 	notifier := notify.New(notify.Config{URL: cfg.Notify.WebhookURL, Events: cfg.Notify.Events})
@@ -292,7 +312,7 @@ func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.No
 	})
 	logScheduleConfig(cfg)
 
-	return client, notifier, sch
+	return client, notifier, sch, nil
 }
 
 // observability 运行期可观测组件（日志镜像、用量、密钥、请求归档、定价与智能体配置）。
@@ -591,7 +611,7 @@ func setupSessionRouter(cfg *Config, store redisstore.Store, state5 *pool.Pool) 
 
 // configureUpstream 把 config 的 HTTP 超时、脱敏开关、UA / 归属头、global 路由与
 // model.json 缓存路径注入出站客户端。装配期一次性捕获，改动需重启。
-func configureUpstream(cfg *Config, client *upstream.Client) {
+func configureUpstream(cfg *Config, client *upstream.Client) error {
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	client.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省 120s）。
@@ -620,6 +640,10 @@ func configureUpstream(cfg *Config, client *upstream.Client) {
 	client.DeviceToken = cfg.Upstream.DeviceToken
 	client.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	client.PassthroughIP = cfg.Upstream.PassthroughIP
+
+	if err := loadClientProfile(cfg, client); err != nil {
+		return err
+	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	client.GlobalEnabled = cfg.Global.Enabled
@@ -653,6 +677,41 @@ func configureUpstream(cfg *Config, client *upstream.Client) {
 			log.Printf("出站代理池已启用：%d 个代理（失败自动冷却轮换）", proxyPool.Len())
 		}
 	}
+
+	return nil
+}
+
+// loadClientProfile 加载与 state.json 同目录的 client-profiles/：文件存在即整份
+// 覆盖对应 realm 的 UA / IDE 版本 / 构建 commit/releaseDate。profile 是启动必需项：
+// cn 恒需，global 仅在 global.enabled 时需要；缺失即拒绝启动，不回落到任何内置指纹。
+func loadClientProfile(cfg *Config, client *upstream.Client) error {
+	profileDir := stateSibling(cfg.StateFile, "client-profiles")
+
+	profiles, err := clientprofile.LoadDir(profileDir)
+	if err != nil {
+		return fmt.Errorf("load client profiles: %w", err)
+	}
+
+	required := []string{"cn"}
+	if cfg.Global.Enabled {
+		required = append(required, "global")
+	}
+
+	for _, realm := range required {
+		if profiles.ForRealm(realm) == nil {
+			return fmt.Errorf("缺少 client profile %s/%s.json: %w", profileDir, realm, errClientProfileMissing)
+		}
+	}
+
+	client.Profile = profiles
+
+	for _, realm := range required {
+		profile := profiles.ForRealm(realm)
+		log.Printf("client profile: %s/%s.json 已加载（version=%s cli=%s releaseDate=%d）",
+			profileDir, realm, profile.Source.Version, profile.Source.CLIVersion, profile.Source.ReleaseDate)
+	}
+
+	return nil
 }
 
 // logScheduleConfig 启动日志：逐项打印排程启用态与小时。纯日志，无副作用。

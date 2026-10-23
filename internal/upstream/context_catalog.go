@@ -50,7 +50,7 @@ var contextCapFallback = map[string]contextCap{
 	"kimi-k2.6":         {context: 256000, maxOutput: 262144},  // 实测（CN 256K）；输出 models.dev 官方 262144
 	"kimi-k2.5":         {context: 164000, maxOutput: 262144},  // 实测（global 侧同 id 外推 164K）；输出 models.dev 共识 262144
 	"kimi-k3":           {context: 1048576, maxOutput: 131072}, // models.dev 官方（moonshotai 1M/128K）
-	"kimi-k2.8-preview": {context: 1000000, maxOutput: 64000},  // 官方 5.8.4 product.json：1M/64K
+	"kimi-k2.8-preview": {context: 1000000, maxOutput: 64000},  // 官方 product.json：1M/64K
 
 	// ---- MiniMax / 混元（tencent）----
 	"minimax-m3":    {context: 512000, maxOutput: 512000}, // 实测（CN 512K）；输出 models.dev 共识 512000
@@ -63,7 +63,7 @@ var contextCapFallback = map[string]contextCap{
 	"deepseek-v4-pro":        {context: 1000000, maxOutput: 384000}, // 实测（CN 1M；models.dev 共识 1M/384000）
 	"deepseek-v4-flash":      {context: 1000000, maxOutput: 384000}, // 实测（CN 1M；models.dev 共识 1M/384000）
 	"deepseek-v4.1-flash":    {context: 1000000, maxOutput: 384000}, // 实测外推 + models.dev 共识 1M/384000
-	"deepseek-v4.1-flash-sg": {context: 1000000, maxOutput: 128000}, // 官方 5.8.4 product.json：1M/128K
+	"deepseek-v4.1-flash-sg": {context: 1000000, maxOutput: 128000}, // 官方 product.json：1M/128K
 
 	// ---- OpenAI / Google（global 域家族）----
 	"gpt-6-astra":      {context: 1050000, maxOutput: 128000}, // models.dev（全 provider 一致 1050000/128000）

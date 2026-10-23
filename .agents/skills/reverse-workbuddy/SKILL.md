@@ -1,10 +1,13 @@
 ---
 name: reverse-workbuddy
 description: >
-  自动下载并解包 WorkBuddy 官方分发包（.tmp/workbuddy/ 下 cn / global 各版本
-  dmg 与 app-asar），调研客户端协议面并与本仓库 internal/upstream/ 实现做差异
-  比对。Use when investigating new client releases, upstream protocol drift,
-  realm/version differences, or re-verifying the current protocol baseline.
+  自动下载并解包 WorkBuddy 官方 Win32 分发包（.tmp/workbuddy/ 下 cn / global
+  各版本 exe 与 app-asar；macOS 包仅辅助对照），调研客户端协议面并与本仓库
+  internal/upstream/ 实现做差异比对，按需产出逐 surface 字面量的客户端指纹
+  profile 并校验。Use when
+  investigating new client releases, upstream protocol drift, realm/version
+  differences, re-verifying the current protocol baseline, or generating /
+  validating a client fingerprint profile.
   不用于 git 历史形态的上游同步（那走 sync-upstream）。
 ---
 
@@ -16,14 +19,23 @@ description: >
 
 ## Locked
 
+- **Win32 构建是唯一事实来源**（`win32-x64-user`）：协议事实、指纹常量、profile
+  一律取 Win32 包；macOS 包只作辅助对照，不参与 `emit` 或代码常量。两者同版本号
+  也可能有不同 commit/releaseDate，以 Win32 的 `cli/product.json` 为准。
 - 官方分发包只读：解包到**新目录**，不原地改动 `.tmp/workbuddy/<realm>/<ver>/`
-  下的 dmg / app-asar / extracted。asar 提取用 `scripts/extract_asar.mjs`
+  下的 exe / dmg / app-asar / extracted。asar 提取用 `scripts/extract_asar.mjs`
   （`node scripts/extract_asar.mjs <app.asar> <unpackedRoot> <outDir>`）。
+  解包树命名：`app-asar/` 始终放 Win32；macOS 对照放 `app-asar-macos/`。
 - `.tmp/` 已被 gitignore；调研产物只落 `.tmp/`，**绝不**把 dmg / asar 二进制或
   解包树提交进版本库。凭证（`auths/`）、状态（`data/`）同样不进库、不进报告。
 - 报告中的端点、常量、header 名可原文照录；**token、Cookie、账号标识**不照录，
   涉及处用 `<uid>` / `<token>` 占位。
 - 事实分层：客户端包内证据 = 事实；抓包实测 = 事实（注明来源）；推断 = 假设。
+- 指纹 profile 只写字面量（literal），不写模板、不按版本号拼接：每个值必须追到
+  包内片段或抓包记录。找不到就标 `null` 并列入 `missing`，**不得**按「官方大概是
+  这个形状」补一个。
+- profile 必须过校验器才算产出（schema、交叉一致、`evidence` 逐字命中、控制字符
+  检查）；校验不过的值是未生成状态，不得当作事实写进报告或提交。
 - 调研产出差异结论若要落到代码，改的是 `internal/upstream/`（适配在上游侧做，
   不依赖上游修复，见 `AGENTS.md` 上游同步策略）。
 
@@ -42,7 +54,7 @@ description: >
 
 ## 工作流
 
-1. **取最新安装包**。默认同时查 cn / global、按当前机器平台下载到
+1. **取最新安装包**。默认同时查 cn / global 的 Win32 包，下载到
    `.tmp/workbuddy/<realm>/<version>/`：
 
    ```bash
@@ -50,21 +62,21 @@ description: >
    node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs --dry-run
    # 下载（已存在则跳过；--force 覆盖）
    node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs
-   # 指定 realm / 平台
+   # macOS 仅辅助对照，必须显式指定
    node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs --realm all --platform darwin-arm64
    ```
 
    脚本查 `https://www.workbuddy.ai|www.workbuddy.cn/v2/update?platform=...`，
-   macOS 取接口同版本 `.dmg`（接口默认给 `.zip`）。需要历史版本时手工放置到
-   同目录结构。
+   默认 `workbuddy-win32-x64-user`。macOS 取接口同版本 `.dmg`（接口默认给
+   `.zip`），只用于对照。需要历史版本时手工放置到同目录结构。
 2. **定位与解包**。确认 `.tmp/workbuddy/<realm>/<version>/` 下已有产物：
-   - `app-asar/`：已解包的 ASAR 树（直接可用）；
-   - `asar-extract.mjs`：同目录提取脚本，缺 `app-asar/` 时对 `WorkBuddy.app`
-     内的 `app.asar` 重跑：
-     `node asar-extract.mjs <path/to/app.asar> <app.unpacked> <outDir>`
-     （unpackedRoot 用 `.app/Contents/Resources/app.unpacked`，缺则空目录）。
-   - `extracted/`：dmg 挂载拷贝出的 `.app`（取 `Contents/Resources/` 下的
-     `app.asar` 与 `app.unpacked`）。
+   - `app-asar/`：**Win32** 已解包 ASAR 树（直接可用，事实源）；
+   - `app-asar-macos/`：macOS 对照树（可选）；
+   - Win32 exe 是 NSIS 包：`7zz x -y -o<tmp> <exe>`，再解
+     `<tmp>/$PLUGINSDIR/app-64.7z`，最后对
+     `resources/app.asar` + `resources/app.asar.unpacked` 跑
+     `node scripts/extract_asar.mjs <app.asar> <unpackedRoot> <outDir>`；
+   - `extracted/`：dmg 挂载拷贝出的 macOS `.app`（辅助）。
 3. **粗扫协议面**（每次调研必做，秒级）：
 
     ```bash
@@ -80,7 +92,7 @@ description: >
      `authentication.id` / `authentication.type` / `authentication.attributes`
      （含 `internalDomain` / `externalDomain` / `iOADomain` / `prefixPath`）。
      这是 realm 分域的权威声明。
-   - `<app-asar>/main/*.js`：出站端点路径字面量（`/v2/...`、`/v3/config`、
+   - `<app-asar>/main/*.js`（Win32）：出站端点路径字面量（`/v2/...`、`/v3/config`、
      `plugin/auth/...`、`/activity/...`）。先用 `protocol_sweep.mjs` 拿集合，
      再对具体端点 `rg -o '.<前缀>.<端点>.{200}'` 看调用上下文（压缩单行）。
    - `<app-asar>/renderer/assets/esm-*.js` 与 `*-*.js` chunks：渲染层请求头族
@@ -90,17 +102,17 @@ description: >
    - `<app-asar>/main/server.js` 等：`/v2/report` 上报指纹字段
      （ideName/extName/product/commit/releaseDate）。
 5. **与本仓库实现比对**。事实源锚点：
-   - realm 分域常量与 UA：`internal/upstream/headers.go`（`cnClientVersion`
-     / `globalClientVersion` / `cnCliVersion` / `globalCliVersion`、
-     `originRefererCN/Global`、`userAgent` 三段形态）。
+   - realm 分域常量与 UA：`internal/upstream/headers.go`（`originRefererCN/Global`、
+     `userAgent`）与 `internal/clientprofile`（出站 UA / IDE 版本来自部署 profile，
+     源码不内置版本常量）。
    - chat 路径与 base：`internal/upstream/client.go`（`ChatBaseCN` /
      `ChatBaseGlobal`、`chatCompletionsPath`、`chatPaths`、`/v3/config`）。
    - billing 域：同文件 `billingMeterPaths` / `checkinMeterPaths`，
      `internal/upstream/trial.go`、`requestusage.go`、`report.go`。
    - 任务域：`internal/upstream/tasks.go`、`streak.go`、`blackcat.go`、
      `travel` 相关；`internal/scheduler/` 调用侧。
-   - 桌面指纹上报：`internal/upstream/desktop.go`（`cnDesktopCommit` /
-     `globalDesktopCommit` 等固定指纹）。
+   - 桌面指纹上报：`internal/upstream/desktop.go`（`desktopFingerprint`；
+     commit / releaseDate 来自部署 profile）。
    - 注册激活：`internal/upstream/global_register.go`（链路注释即此前逆向结论）。
 6. **写差异报告**到 `.tmp/workbuddy-diff/<date>-<a>_vs_<b>.md`，章节：
    - 对比对象（版本目录、realm、`product.json` endpoint/auth id）。
@@ -113,20 +125,42 @@ description: >
    粗扫答不上的问题（某 header 挂哪个模块的哪条请求、两版本同一端点的调用方
    是否同源、DMG 成员清单）再上 REA 深挖，编排见
    `references/rea-toolchain.md`（先 summary 后翻页，全程只读）。
-7. **验证**。只做静态调研时无需构建；若落地代码改动：
-   `go build ./... && go test ./internal/upstream/...`，头部常量改动补
+7. **产出客户端指纹 profile（按需）**。用户要更新部署指纹或核对协议 facts 时才做，
+   纯调研可跳过。流程：
+   - 只从 Win32 `app-asar/` 取 `references/client-profile.md` 的 surface 表逐项
+     **包内字面量**：
+     `chatUA` / `desktopUA` / `billingUA` / `xIdeVersion` / `desktopIdeVersion` /
+     `desktopExtVersion` / `loginPlatform`。不从 `version` 拼任何串。
+   - 双源核对：Win32 `product.json` 的版本与 commit、包内 bundle 版本字面量、
+     update 接口返回版本，三处必须一致；不一致就停下报告，不挑「看起来对的」那个。
+     macOS 同版本包只用于旁证，不得覆盖 Win32 的 commit/releaseDate。
+   - 为每个值写 `evidence`：`package` 来源给相对文件路径 + 可逐字 grep 到的
+     snippet；抓包来源写 `source: "traffic"` 并在 `note` 记日期与端点。
+   - 跑校验器；缺必需 surface 即视为生成失败，不落盘。
+   - 落点：真实 profile 只落用户部署的 `data/client-profiles/<realm>.json`
+     （gitignore，server 启动时从 `state_file` 同目录读取），**不入库**（入库即
+     变成内置版本表）。仓库侧只提交测试 fixture：
+     `internal/upstream/testdata/profile/<realm>.json` 与 `clientprofile_test.go`
+     的假值 fixture（版本填 `9.9.x` / `0.0.0`，仅供 schema/校验测试）。
+     解包树和原始包仍只留 `.tmp/`。协议 facts（端点/头族/product.json/模型清单）
+     仍留在代码与 `UPSTREAM.md`；新增 baseline 文件需另起 PR，由人类维护者批准。
+8. **验证**。只做静态调研时无需构建；若落地代码改动：
+   `go build ./... && go test ./internal/upstream/... ./internal/clientprofile/...`，
+   profile / 头部行为改动补 `internal/clientprofile` 与
    `internal/upstream/desktop_test.go` / `headers` 相关用例，再
    `make fmt-check`。
 
 ## Handoff
 
-- 协议溯源文案要更新时改 `internal/upstream/UPSTREAM.md`；配置项变化同步
-  `config.example.json`；用户可见行为改 `README.md`。
+- 协议溯源文案要更新时改 `internal/upstream/UPSTREAM.md`；配置项变化（含 profile
+  路径/字段）同步 `config.example.json`；用户可见行为改 `README.md`。
 - git 历史形态的上游同步（前序 fork 提交）走 `sync-upstream` 技能；本技能的
   「上游」指官方客户端二进制，两者不是同一物。
 
 ## Read as needed
 
+- `references/client-profile.md`：指纹 profile 的 schema、surface 表、来源分级、
+  校验规则与落点。生成/校验 profile 前必读。
 - `references/protocol-anchors.md`：协议面事实源与本仓库 `path:line` 锚点速查。
 - `references/rea-toolchain.md`：REA 静态分析编排（ASAR 应用图、版本比对、
   抓包归档归纳）与约束。默认先用 `scripts/protocol_sweep.mjs`，不够再上 REA。
@@ -135,9 +169,13 @@ description: >
 
 ## Verify
 
-- 报告每条差异都能追到一个客户端文件位置或一个本仓库 `path:line`。
+- 报告每条差异都能追到一个 Win32 客户端文件位置或一个本仓库 `path:line`；
+  macOS 证据必须标注「辅助对照」，且不得支撑 `emit` 值。
 - `node scripts/download_latest.mjs --dry-run` 给出的版本与 `.tmp/workbuddy/`
   下解包目录所用版本一致（或明确说明只调研历史版本）。
 - `node scripts/extract_asar.mjs` 重跑结果与既有 `app-asar/` 目录一致
   （抽样比对若干文件字节）。
 - `node scripts/protocol_sweep.mjs` 的端点集合与报告引用的端点集合一致。
+- profile 每个 `source: package` 的 `evidence.snippet` 能在对应文件里逐字命中
+  （校验器或 `rg -F` 均可）；任一必需 surface 为 `null` 时不得声称已生成。
+- 抽查 `chatUA` / `desktopUA` 与包内字面量逐字相同，确认没有经过版本号拼接。
