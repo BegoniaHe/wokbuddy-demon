@@ -412,8 +412,8 @@ function DetailBox({
           {groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : ''} · 默认展示最早到期 {pkDetailLimitValue(limit)} 条（{PK_SORT_LABELS[mode] || ''}）
         </CardDescription>
       </CardHeader>
-      <div className="overflow-x-auto">
-        <Table>
+      <div className="overflow-x-auto" tabIndex={0} aria-label="逐包明细，可横向滚动">
+        <Table containerClassName="overflow-visible">
           <TableHeader>
             <TableRow>
               <TableHead className="w-[3px] p-0" aria-hidden />
@@ -484,8 +484,8 @@ type Grant = {
 function GrantHistory({ grants }: { grants: Grant[] }) {
   if (!grants.length) return <p className="text-sm text-muted-foreground">暂无积分包数据。</p>;
   return (
-    <div className="overflow-x-auto">
-      <Table>
+    <div className="overflow-x-auto" tabIndex={0} aria-label="获取历史，可横向滚动">
+      <Table containerClassName="overflow-visible">
         <TableHeader>
           <TableRow>
             <TableHead>发放时间</TableHead>

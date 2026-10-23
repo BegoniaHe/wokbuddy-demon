@@ -48,7 +48,7 @@ import { useLocalFlag } from '@/hooks/useLocalFlag';
 import { compDeadlineHours, compDeadlineTone, compName, compNote, compPending, type CompensationRow } from '@/lib/compensation';
 import { useState } from 'react';
 import { cn } from '@/lib/utils';
-import { MoreHorizontal } from 'lucide-react';
+import { Activity, CircleCheck, Clock3, Coins, Gauge, MoreHorizontal, PauseCircle, Users } from 'lucide-react';
 
 // 账号池视图：统计条 + 积分到期提醒 + 账号表 + 模型锁池。
 export function AccountsView() {
@@ -141,17 +141,19 @@ export function AccountsView() {
       {error ? <LoadError className="mb-4" message={'刷新失败：' + (error as Error).message} onRetry={() => void refetch()} /> : null}
       <Stats
         stats={[
-          { value: data.total, label: '账号总数' },
-          { value: data.healthy, label: '可用', tone: 'good' },
-          { value: data.cooling, label: '冷却中', tone: 'warn' },
-          { value: data.disabled, label: '已禁用', tone: 'bad' },
-          { value: data.paused ?? '-', label: '已暂停选号', tone: 'warn' },
-          { value: creditsText, label: '积分剩余 / 总额' },
-          { value: data.sticky_sessions, label: '粘性会话' },
+          { value: data.total, label: '账号总数', icon: Users },
+          { value: data.healthy, label: '可用', tone: 'good', icon: CircleCheck },
+          { value: data.cooling, label: '冷却中', tone: 'warn', icon: Clock3 },
+          { value: data.disabled, label: '已禁用', tone: 'bad', icon: PauseCircle },
+          { value: data.paused ?? '-', label: '已暂停选号', tone: 'warn', icon: PauseCircle },
+          { value: creditsText, label: '积分剩余 / 总额', icon: Coins, wide: true },
+          { value: data.sticky_sessions, label: '粘性会话', icon: Activity },
           {
             value: (data.in_flight_total ?? 0) + ' / ' + (data.max_in_flight_total ? data.max_in_flight_total : '不限'),
             label: '全局在途',
             tone: data.max_in_flight_total && (data.in_flight_total ?? 0) >= data.max_in_flight_total ? 'warn' : undefined,
+            icon: Gauge,
+            wide: true,
           },
         ]}
       />
@@ -204,7 +206,9 @@ export function AccountsView() {
                 <TableHead>在途</TableHead>
                 <TableHead>用量</TableHead>
                 <TableHead>最近成功</TableHead>
-                <TableHead />
+                <TableHead className="text-right">
+                  <span className="sr-only">操作</span>
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -253,27 +257,44 @@ interface StatItem {
   value: React.ReactNode;
   label: string;
   tone?: 'default' | 'good' | 'warn' | 'bad';
+  icon?: React.ComponentType<{ className?: string }>;
+  wide?: boolean;
 }
 
-// Stats：顶部统计条。窄屏 2 列，宽屏 4 列。
+// Stats：顶部指标条。窄屏 2 列，宽屏 4 列；用细分隔线代替卡片栅格。
 function Stats({ stats }: { stats: StatItem[] }) {
   return (
-    <div className="mb-5 grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4">
-      {stats.map((s) => (
-        <div key={s.label} className="bg-card px-4 py-3.5">
-          <div
-            className={cn(
-              'truncate font-mono text-[24px] font-semibold leading-tight tracking-tight tabular-nums lg:text-[26px]',
-              s.tone === 'good' && 'text-success',
-              s.tone === 'warn' && 'text-warning',
-              s.tone === 'bad' && 'text-destructive',
-            )}
-          >
-            {s.value}
-          </div>
-          <div className="mt-1.5 text-2xs text-muted-foreground">{s.label}</div>
-        </div>
-      ))}
+    <div className="mb-5 overflow-hidden rounded-xl border border-border bg-card shadow-panel">
+      <div className="grid grid-flow-dense grid-cols-2 gap-px bg-border lg:grid-cols-4">
+        {stats.map((s) => {
+          const Icon = s.icon;
+          return (
+            <div
+              key={s.label}
+              className={cn(
+                'group/stat bg-card px-4 py-3.5 transition-colors hover:bg-muted/30',
+                s.wide && 'col-span-2 lg:col-span-1',
+              )}
+            >
+              <div className="flex items-center gap-1.5 text-2xs text-muted-foreground">
+                {Icon ? <Icon className="size-3.5 text-ink-3" /> : null}
+                <span className="truncate">{s.label}</span>
+              </div>
+              <div
+                className={cn(
+                  'mt-1.5 truncate font-mono text-[22px] font-semibold leading-tight tracking-tight tabular-nums lg:text-[24px]',
+                  s.wide && 'text-[20px] lg:text-[24px]',
+                  s.tone === 'good' && 'text-success',
+                  s.tone === 'warn' && 'text-warning',
+                  s.tone === 'bad' && 'text-destructive',
+                )}
+              >
+                {s.value}
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -365,7 +386,7 @@ function ExpiryBox({
           <b className="font-mono">{fmtTok(first.remain)}</b> 积分 · 到期前日均需耗 ≥
           <b className="font-mono">{fmtTok(daily)}</b>
           {week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : ''}
-          {rest ? <div className="mt-0.5 text-2xs text-muted-foreground/80">{rest}</div> : null}
+          {rest ? <div className="mt-0.5 text-2xs text-muted-foreground">{rest}</div> : null}
         </span>
       </div>
     );
@@ -388,12 +409,12 @@ function ExpiryBox({
   return (
     <Card className="mb-5">
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-        <CardTitle className="flex items-baseline">
-          积分到期提醒
-          <CardDescription className="ml-1.5">
+        <div className="min-w-0">
+          <CardTitle>积分到期提醒</CardTitle>
+          <CardDescription>
             按最近到期批次估算 · 日均需耗 = 批次剩余 ÷ 距到期天数 · 上游按失效时刻先后自动优先扣减（FEFO）
           </CardDescription>
-        </CardTitle>
+        </div>
         <CardAction>
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-xs text-muted-foreground">{note}</span>
@@ -441,12 +462,12 @@ function CompensationBox({
   return (
     <Card className="mb-5">
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-        <CardTitle className="flex items-baseline">
-          官方补偿
-          <CardDescription className="ml-1.5">
+        <div className="min-w-0">
+          <CardTitle>官方补偿</CardTitle>
+          <CardDescription>
             官方限时补偿活动（带领取截止日）：先查状态再领取，查询失败会显形而不是被当成「没有补偿」
           </CardDescription>
-        </CardTitle>
+        </div>
         <CardAction>
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs text-muted-foreground">{compNote(rows)}</span>
@@ -791,7 +812,7 @@ function AccountRow({
                 </Button>
               }
             />
-            <DropdownMenuContent align="end">
+            <DropdownMenuContent align="end" collisionPadding={8}>
               {frozen ? (
                 <DropdownMenuItem onClick={() => void act('revive')}>解冻</DropdownMenuItem>
               ) : s.paused ? (
@@ -837,16 +858,16 @@ function ModelLocks({ rows }: { rows?: ModelLock[] }) {
   return (
     <Card className="mt-5">
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-        <CardTitle className="flex items-baseline">
-          模型锁池
-          <CardDescription className="ml-1.5">哪些模型不能用、还要锁多久</CardDescription>
-        </CardTitle>
+        <div className="min-w-0">
+          <CardTitle>模型锁池</CardTitle>
+          <CardDescription>哪些模型不能用、还要锁多久</CardDescription>
+        </div>
         <CardAction>
           <span className="text-xs text-muted-foreground">{list.length ? (bad ? bad + ' 个模型整池不可用' : list.length + ' 个模型部分限流') : ''}</span>
         </CardAction>
       </CardHeader>
-      <div className="overflow-x-auto">
-        <Table>
+      <div className="overflow-x-auto" tabIndex={0} aria-label="模型锁池，可横向滚动">
+        <Table containerClassName="overflow-visible">
           <TableHeader>
             <TableRow>
               <TableHead>模型</TableHead>

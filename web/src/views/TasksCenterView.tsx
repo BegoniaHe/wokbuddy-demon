@@ -15,11 +15,14 @@ import {
 import {
   Card,
   CardAction,
+  CardContent,
+  CardDescription,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
-import { Bar, Dot, Tag, type Tone } from '@/components/ui-kit';
-import { VouchersDialog } from '@/components/VouchersDialog';
+import { Bar, Dot, type Tone } from '@/components/ui-kit';
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
+import { ListChecks } from 'lucide-react';
 
 interface QRow {
   kind: string;
@@ -62,7 +65,6 @@ export function TasksCenterView() {
   const [conc, setConc] = useState('1');
   const [scanning, setScanning] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [vouchersOpen, setVouchersOpen] = useState(false);
   const { confirm, confirmDialog } = useConfirm();
   const titlesRef = useRef<Record<string, string>>({});
   const seqRef = useRef(0);
@@ -157,7 +159,7 @@ export function TasksCenterView() {
       by.get(it.uid)!.rows.push({
         kind: it.kind,
         code: it.code,
-        prog: it.kind === 'school' ? '—' : '',
+        prog: '',
         status: it.status,
         message: it.message,
       });
@@ -175,15 +177,12 @@ export function TasksCenterView() {
     <>
       <Card>
         <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-          <CardTitle className="flex items-baseline">
-            成长任务队列
-            <span className="ml-1.5 text-2xs font-normal text-muted-foreground">{total ? total + ' 项' : ''}</span>
-          </CardTitle>
+          <div className="min-w-0">
+            <CardTitle>成长任务队列</CardTitle>
+            <CardDescription>{total ? total + ' 项待办' : '扫描全部账号的成长任务后统一执行'}</CardDescription>
+          </div>
           <CardAction>
             <div className="flex flex-wrap items-center gap-2">
-              <Button size="xs" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）" onClick={() => setVouchersOpen(true)}>
-                查询券码
-              </Button>
               <Select items={selectOptionItems(CONC_OPTIONS)} value={conc} onValueChange={(v) => setConc(v ?? '1')}>
                 <SelectTrigger size="sm" className="w-16" aria-label="并发档位">
                   <SelectValue />
@@ -212,22 +211,21 @@ export function TasksCenterView() {
         ) : null}
 
         {!groups || groups.length === 0 ? (
-          <div className="flex flex-col items-center gap-1.5 px-4 py-10 text-muted-foreground">
-            <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" strokeWidth={2} className="mb-1.5 size-10 opacity-55" aria-hidden>
-              <rect x="8" y="6" width="24" height="36" rx="3" />
-              <path d="M14 16h12M14 24h12M14 32h7" opacity=".45" />
-              <circle cx="35" cy="33" r="8" />
-              <path d="m40 38 5 5" />
-            </svg>
-            <div className="font-medium text-foreground">
-              {groups ? '没有待办任务 🎉' : '还没有扫描过'}
-            </div>
-            <div className="max-w-[34em] text-center text-xs">
-              {groups
-                ? '全部账号的成长任务与开学季活动都已完成，明日再来。'
-                : '扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。'}
-            </div>
-          </div>
+          <CardContent>
+            <Empty className="border border-dashed border-border bg-muted/20 py-9">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <ListChecks />
+                </EmptyMedia>
+                <EmptyTitle>{groups ? '没有待办任务' : '还没有扫描过'}</EmptyTitle>
+                <EmptyDescription>
+                  {groups
+                    ? '全部账号的成长任务都已完成，明日再来。'
+                    : '扫描所有账号的成长任务，把没做的排成一列，一键执行。'}
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          </CardContent>
         ) : (
           <div className="overflow-x-auto pb-2.5">
             {groups.map((g) => (
@@ -237,7 +235,7 @@ export function TasksCenterView() {
                   <span className="text-xs tabular-nums text-muted-foreground">{g.rows.length} 项待办</span>
                 </header>
                 {g.rows.map((it, i) => (
-                  <QueueRow key={i} it={it} title={it.kind === 'school' ? '开学季闭环' : titlesRef.current[it.code] || it.code} />
+                  <QueueRow key={i} it={it} title={titlesRef.current[it.code] || it.code} />
                 ))}
               </div>
             ))}
@@ -245,14 +243,12 @@ export function TasksCenterView() {
         )}
       </Card>
 
-      <VouchersDialog open={vouchersOpen} onOpenChange={setVouchersOpen} />
       {confirmDialog}
     </>
   );
 }
 
 function QueueRow({ it, title }: { it: QRow; title: string }) {
-  const isSchool = it.kind === 'school';
   const known =
     it.status === 'running' || it.status === 'error' || it.status === 'skipped' || it.status === 'done';
   const dotTone: Tone =
@@ -267,7 +263,6 @@ function QueueRow({ it, title }: { it: QRow; title: string }) {
       <span className="truncate font-mono text-2xs text-muted-foreground">{it.code}</span>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate">{title}</span>
-        {isSchool ? <Tag tone="mute">开学季</Tag> : null}
       </span>
       <span className="text-right font-mono tabular-nums text-muted-foreground">{it.prog || ''}</span>
       <span className="inline-flex items-center gap-1.5 whitespace-nowrap">

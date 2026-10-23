@@ -73,7 +73,7 @@ export function RemarksDialog({
         if (!next) onClose();
       }}
     >
-      <DialogContent className="max-w-2xl">
+      <DialogContent className="sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>账号备注</DialogTitle>
           <DialogDescription>
@@ -86,8 +86,8 @@ export function RemarksDialog({
           ) : (
             <div className="flex flex-col gap-2">
               {rows.map((row) => (
-                <div key={row.key + row.uid} className="flex items-center gap-3">
-                  <div className="w-[42%] min-w-0">
+                <div key={row.key + row.uid} className="flex flex-col gap-1.5 border-b border-border/60 pb-2 last:border-0 last:pb-0 sm:flex-row sm:items-center sm:gap-3">
+                  <div className="min-w-0 sm:w-[42%]">
                     <div className="truncate font-mono text-xs text-muted-foreground" title={row.uid}>
                       {row.uid}
                     </div>
@@ -95,19 +95,22 @@ export function RemarksDialog({
                       {row.name}
                     </div>
                   </div>
-                  <Input
-                    className="flex-1"
-                    placeholder="备注（留空 = 恢复原标题）"
-                    value={draft[row.key] ?? ''}
-                    onChange={(e) => setDraft((prev) => ({ ...prev, [row.key]: e.target.value }))}
-                  />
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    onClick={() => setDraft((prev) => ({ ...prev, [row.key]: '' }))}
-                  >
-                    清空
-                  </Button>
+                  <div className="flex min-w-0 items-center gap-2 sm:flex-1">
+                    <Input
+                      className="min-w-0 flex-1"
+                      placeholder="备注（留空 = 恢复原标题）"
+                      value={draft[row.key] ?? ''}
+                      onChange={(e) => setDraft((prev) => ({ ...prev, [row.key]: e.target.value }))}
+                    />
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      className="shrink-0"
+                      onClick={() => setDraft((prev) => ({ ...prev, [row.key]: '' }))}
+                    >
+                      清空
+                    </Button>
+                  </div>
                 </div>
               ))}
             </div>

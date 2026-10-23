@@ -4,95 +4,107 @@
    与 Tailwind 默认的 prefers-color-scheme 解耦，故自定义 dark 变体。 */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-/* 设计令牌：极简中性基调。底色分层 + 单一蓝色强调（仅交互），
-   语义色只给状态。等宽数字承载所有观测值。
-   命名沿用 shadcn 标准 token（primary/background/card/muted/...），
-   值沿用本面板的极简配色。 */
+/* 设计令牌：中性工作台基调。底色、卡片、浮层三级分层，
+   蓝色只用于主操作与选中态，琥珀色只用于品牌点缀。
+   命名沿用 shadcn 标准 token（primary/background/card/muted/...）。 */
 :root {
-  --radius: 6px;
-  --background: #fafafa;
-  --foreground: #18181b;
+  --radius: 8px;
+  --background: #f6f6f7;
+  --foreground: #17171a;
   --card: #ffffff;
-  --card-foreground: #18181b;
+  --card-foreground: #17171a;
   --popover: #ffffff;
-  --popover-foreground: #18181b;
-  --primary: #2563eb;
-  --primary-hover: #1d4ed8;
+  --popover-foreground: #17171a;
+  --primary: #1f5fd6;
+  --primary-hover: #1a52ba;
   --primary-foreground: #ffffff;
-  --secondary: #f4f4f5;
-  --secondary-foreground: #18181b;
-  --muted: #f4f4f5;
-  --muted-foreground: #52525b;
-  --accent: rgba(37, 99, 235, 0.08);
-  --accent-foreground: #2563eb;
-  --destructive: #dc2626;
+  --secondary: #f1f1f3;
+  --secondary-foreground: #17171a;
+  --muted: #f1f1f3;
+  --muted-foreground: #62626c;
+  --accent: rgba(31, 95, 214, 0.08);
+  --accent-foreground: #1f5fd6;
+  --destructive: #bd2424;
   --destructive-foreground: #ffffff;
-  --border: #e4e4e7;
-  --input: #e4e4e7;
-  --ring: #2563eb;
-  --success: #16a34a;
+  --border: #e3e3e7;
+  --input: #dcdce1;
+  --ring: #1f5fd6;
+  --success: #137238;
   --success-foreground: #ffffff;
-  --warning: #d97706;
+  --warning: #a94b06;
   --warning-foreground: #ffffff;
 
   /* 状态软底（tag / chip / 行级提示用） */
-  --success-soft: rgba(22, 163, 74, 0.09);
-  --warning-soft: rgba(217, 119, 6, 0.1);
-  --destructive-soft: rgba(220, 38, 38, 0.08);
-  --accent-soft: rgba(37, 99, 235, 0.08);
+  --success-soft: rgba(21, 128, 61, 0.09);
+  --warning-soft: rgba(180, 83, 9, 0.1);
+  --destructive-soft: rgba(189, 36, 36, 0.1);
+  --accent-soft: rgba(31, 95, 214, 0.08);
 
   /* 分层与弱化 */
-  --surface-2: #f4f4f5;
+  --surface-2: #f1f1f3;
   --raise: #ffffff;
-  --line: #e4e4e7;
-  --line-soft: #efeff1;
-  --ink-2: #52525b;
-  --ink-3: #a1a1aa;
+  --line: #e3e3e7;
+  --line-soft: #ededf0;
+  --ink-2: #62626c;
+  --ink-3: #6f6f7b;
 
-  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.04);
+  /* 侧栏与品牌 */
+  --sidebar: #fbfbfc;
+  --sidebar-active: #eeeef2;
+  --brand: #d97706;
+  --brand-soft: rgba(217, 119, 6, 0.12);
+
+  --mono: "SFMono-Regular", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --sans: "Inter", system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --shadow-panel: 0 1px 2px rgba(20, 20, 24, 0.04), 0 8px 24px -18px rgba(20, 20, 24, 0.22);
+  --shadow-float: 0 16px 48px -20px rgba(20, 20, 24, 0.28);
 }
 
 [data-theme="dark"] {
-  --background: #09090b;
-  --foreground: #fafafa;
-  --card: #111113;
-  --card-foreground: #fafafa;
-  --popover: #111113;
-  --popover-foreground: #fafafa;
-  --primary: #3b82f6;
-  --primary-hover: #2563eb;
-  --primary-foreground: #ffffff;
-  --secondary: #18181b;
-  --secondary-foreground: #fafafa;
-  --muted: #18181b;
-  --muted-foreground: #a1a1aa;
-  --accent: rgba(59, 130, 246, 0.14);
-  --accent-foreground: #3b82f6;
-  --destructive: #f87171;
-  --destructive-foreground: #09090b;
-  --border: #27272a;
-  --input: #27272a;
-  --ring: #3b82f6;
-  --success: #4ade80;
-  --success-foreground: #09090b;
-  --warning: #fbbf24;
-  --warning-foreground: #09090b;
+  --background: #0a0a0c;
+  --foreground: #f3f3f5;
+  --card: #121215;
+  --card-foreground: #f3f3f5;
+  --popover: #17171b;
+  --popover-foreground: #f3f3f5;
+  --primary: #5b8ef0;
+  --primary-hover: #74a0f5;
+  --primary-foreground: #0a0a0c;
+  --secondary: #1b1b20;
+  --secondary-foreground: #f3f3f5;
+  --muted: #1b1b20;
+  --muted-foreground: #9e9ea9;
+  --accent: rgba(91, 142, 240, 0.13);
+  --accent-foreground: #8db1f5;
+  --destructive: #f07373;
+  --destructive-foreground: #0a0a0c;
+  --border: #26262c;
+  --input: #303038;
+  --ring: #5b8ef0;
+  --success: #5cc98a;
+  --success-foreground: #0a0a0c;
+  --warning: #e7b15c;
+  --warning-foreground: #0a0a0c;
 
-  --success-soft: rgba(74, 222, 128, 0.12);
-  --warning-soft: rgba(251, 191, 36, 0.12);
-  --destructive-soft: rgba(248, 113, 113, 0.12);
-  --accent-soft: rgba(59, 130, 246, 0.14);
+  --success-soft: rgba(92, 201, 138, 0.12);
+  --warning-soft: rgba(231, 177, 92, 0.12);
+  --destructive-soft: rgba(240, 115, 115, 0.12);
+  --accent-soft: rgba(91, 142, 240, 0.13);
 
-  --surface-2: #18181b;
-  --raise: #1c1c1f;
-  --line: #27272a;
-  --line-soft: #1f1f22;
-  --ink-2: #a1a1aa;
-  --ink-3: #71717a;
+  --surface-2: #1b1b20;
+  --raise: #1d1d22;
+  --line: #26262c;
+  --line-soft: #202026;
+  --ink-2: #9e9ea9;
+  --ink-3: #7e7e8a;
 
-  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --sidebar: #0e0e11;
+  --sidebar-active: #1c1c22;
+  --brand: #f0a94a;
+  --brand-soft: rgba(240, 169, 74, 0.12);
+
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.32), 0 12px 32px -20px rgba(0, 0, 0, 0.7);
+  --shadow-float: 0 24px 64px -24px rgba(0, 0, 0, 0.8);
 }
 
 @theme inline {
@@ -132,10 +144,15 @@
   --color-line-soft: var(--line-soft);
   --color-ink-2: var(--ink-2);
   --color-ink-3: var(--ink-3);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-active: var(--sidebar-active);
+  --color-brand: var(--brand);
+  --color-brand-soft: var(--brand-soft);
 
   --font-mono: var(--mono);
   --font-sans: var(--sans);
   --shadow-panel: var(--shadow-panel);
+  --shadow-float: var(--shadow-float);
   --radius-panel: var(--radius);
 
   /* 成套字号（密集仪表盘 6 档，替代散落的 text-[Npx]）：
@@ -164,6 +181,30 @@ body {
   color: var(--foreground);
   font: 14px/1.55 var(--sans);
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* 细滚动条：面板里滚动容器很多，原生滚动条会打断密度。 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: var(--line);
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-3);
+  background-clip: content-box;
 }
 
 ::selection {

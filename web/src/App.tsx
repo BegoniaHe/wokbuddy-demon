@@ -10,6 +10,7 @@ import { KeyGate } from '@/components/KeyGate';
 import { AddAccountDialog } from '@/components/AddAccountDialog';
 import { VIEWS, type ViewId } from '@/views/registry';
 import { AccountsView } from '@/views/AccountsView';
+import { ChatView } from '@/views/ChatView';
 import { UsageView } from '@/views/UsageView';
 import { PackagesView } from '@/views/PackagesView';
 import { TasksCenterView } from '@/views/TasksCenterView';
@@ -50,6 +51,8 @@ export default function App() {
     switch (view) {
       case 'accounts':
         return <AccountsView />;
+      case 'chat':
+        return <ChatView />;
       case 'usage':
         return <UsageView />;
       case 'packages':

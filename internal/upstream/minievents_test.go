@@ -11,9 +11,9 @@ import (
 func TestMPEventBase(t *testing.T) {
 	t.Parallel()
 
-	a := &auth.Auth{UID: "u-1", Nickname: "测试"}
+	account := &auth.Auth{UID: "u-1", Nickname: "测试"}
 
-	base := mpEventBase(a)
+	base := mpEventBase(account)
 	for _, k := range []string{"ideType", "extName", "ideName", "platform", "userId"} {
 		if _, ok := base[k]; !ok {
 			t.Errorf("missing common field %s", k)
@@ -22,6 +22,20 @@ func TestMPEventBase(t *testing.T) {
 
 	if base["ideType"] != "WorkBuddy_MP" || base["extName"] != "workbuddy-mp" {
 		t.Errorf("fingerprint ideType=%v extName=%v", base["ideType"], base["extName"])
+	}
+
+	// machineId 按 uid 稳定派生：同号恒定、异号互异（不再是全局硬编码常量）。
+	got, _ := base["machineId"].(string)
+	if !uuidV4HeaderPattern.MatchString(got) {
+		t.Errorf("machineId = %q 不是 UUIDv4 形态", got)
+	}
+
+	if mpEventBase(account)["machineId"] != got {
+		t.Error("同账号 machineId 不稳定")
+	}
+
+	if mpEventBase(&auth.Auth{UID: "u-2"})["machineId"] == got {
+		t.Error("不同账号 machineId 相同")
 	}
 }
 

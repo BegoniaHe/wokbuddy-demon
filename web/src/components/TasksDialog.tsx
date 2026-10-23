@@ -151,7 +151,7 @@ export function TasksDialog({ uid, onClose }: { uid: string | null; onClose: () 
   return (
     <>
     <Dialog open={open} onOpenChange={(v) => !v && onClose()}>
-      <DialogContent className="max-w-3xl" showCloseButton={false}>
+      <DialogContent className="sm:max-w-3xl" showCloseButton={false}>
         <DialogHeader>
           <DialogTitle>积分任务 {uid ? <span className="font-mono text-xs text-muted-foreground">{uid.slice(0, 16)}</span> : null}</DialogTitle>
           <DialogDescription>

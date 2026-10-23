@@ -63,6 +63,7 @@ import {
 import { MixBar, Legend } from '@/components/ui-kit';
 import { TimeRange } from '@/components/TimeRange';
 import { remarkName } from '@/lib/remarks';
+import { cn } from '@/lib/utils';
 
 // 用量明细排序选项。
 const SORT_OPTIONS = [
@@ -130,11 +131,11 @@ function Kpi({
   children?: ReactNode;
 }) {
   const toneCls =
-    tone === 'accent' ? 'text-accent-foreground' : tone === 'ok' ? 'text-success' : tone === 'warn' ? 'text-warning' : '';
+    tone === 'accent' ? 'text-foreground' : tone === 'ok' ? 'text-success' : tone === 'warn' ? 'text-warning' : '';
   return (
-    <div className="min-w-0 overflow-hidden rounded-lg border border-border/60 bg-secondary py-2.5 pl-4 pr-3.5">
+    <div className="min-w-0 overflow-hidden rounded-lg border border-border/70 bg-card px-3.5 py-2.5">
       <div className="truncate text-2xs text-muted-foreground">{label}</div>
-      <div className={toneCls + ' mt-1 truncate font-mono text-[21px] font-semibold xl:text-[23px] leading-tight tracking-tight tabular-nums'}>
+      <div className={cn(toneCls, 'mt-1 truncate font-mono text-[21px] font-semibold leading-tight tracking-tight tabular-nums xl:text-[23px]')}>
         {value}
       </div>
       {sub ? <div className="mt-1 text-pretty text-2xs text-muted-foreground">{sub}</div> : null}
@@ -305,8 +306,8 @@ export function UsageView() {
             </Kpis>
 
             <CardContent className="pt-3.5">
-              <div className="overflow-hidden rounded-lg border border-border/60 bg-secondary">
-                <div className="flex flex-wrap items-center gap-2.5 border-b border-border/60 px-3.5 py-2.5 text-xs">
+              <div className="overflow-hidden rounded-lg border border-border/70 bg-card">
+                <div className="flex flex-wrap items-center gap-2.5 border-b border-border/70 px-3.5 py-2.5 text-xs">
                   <span className="font-semibold text-muted-foreground">用量趋势</span>
                   <Select
                     items={selectOptionItems(TREND_OPTIONS)}
@@ -396,8 +397,8 @@ export function UsageView() {
             </div>
           </CardAction>
         </CardHeader>
-        <div className="overflow-x-auto">
-          <Table className="[&_tbody_tr:nth-child(even)]:bg-secondary/55">
+        <div className="overflow-x-auto" tabIndex={0} aria-label="用量明细，可横向滚动">
+          <Table className="[&_tbody_tr:nth-child(even)]:bg-secondary/55" containerClassName="overflow-visible">
             <TableHeader>
               <TableRow>
                 <TableHead className="w-[3px] p-0" aria-hidden />
@@ -453,8 +454,8 @@ export function UsageView() {
             sub="上游前缀缓存命中 / (命中+未命中)；低命中意味着费用数倍放大"
           />
         </Kpis>
-        <div className="overflow-x-auto">
-          <Table className="[&_tbody_tr:nth-child(even)]:bg-secondary/55">
+        <div className="overflow-x-auto" tabIndex={0} aria-label="积分扣除历史，可横向滚动">
+          <Table className="[&_tbody_tr:nth-child(even)]:bg-secondary/55" containerClassName="overflow-visible">
             <TableHeader>
               <TableRow>
                 <TableHead className="w-[3px] p-0" aria-hidden />
@@ -648,7 +649,7 @@ export function UsageChart({ series }: { series: SeriesPoint[] }) {
 
   return (
     <>
-      <svg viewBox={`0 0 ${W} ${H}`} role="img" preserveAspectRatio="xMidYMid meet" className="block h-auto w-full">
+      <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label="用量趋势图：prompt / completion Token 与均值" preserveAspectRatio="xMidYMid meet" className="block h-auto w-full">
         <defs>
           <linearGradient id="usGradP" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0" style={{ stopColor: 'var(--primary)', stopOpacity: 1 }} />
@@ -750,7 +751,7 @@ function Heatmap({ days, metric }: { days: HeatDay[]; metric: HeatMetric }) {
   for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
 
   return (
-    <div className="overflow-x-auto">
+    <div className="overflow-x-auto" tabIndex={0} aria-label="日历热力图，可横向滚动">
       <div className="inline-flex items-start gap-[3px]">
         {weeks.map((week, wi) => (
           <div key={wi} className="flex flex-col gap-[3px]">
@@ -827,7 +828,7 @@ export function TrendChart({ points, metric }: { points: ReturnType<typeof usTre
   const fmtVal = (v: number) => (metric === 'credits' ? fmtCredit(v) : metric === 'ttft' ? fmtMs(v) : fmtTok(v));
   return (
     <>
-      <svg viewBox={`0 0 ${W} ${H}`} role="img" preserveAspectRatio="xMidYMid meet" className="block h-auto w-full">
+      <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`趋势图：${TREND_METRIC_LABEL[metric]}，${points.length} 个数据点`} preserveAspectRatio="xMidYMid meet" className="block h-auto w-full">
         {[0, 0.5, 1].map((f) => (
           <g key={f}>
             <line
@@ -964,8 +965,8 @@ function RemainingCard({ payload }: { payload: RemainingPayload }) {
         </CardAction>
       </CardHeader>
       <CardContent>
-        <div className="overflow-x-auto">
-          <Table>
+        <div className="overflow-x-auto" tabIndex={0} aria-label="剩余用量估算，可横向滚动">
+          <Table containerClassName="overflow-visible">
             <TableHeader>
               <TableRow>
                 <TableHead>账号</TableHead>
@@ -1004,4 +1005,3 @@ function RemainingCard({ payload }: { payload: RemainingPayload }) {
     </Card>
   );
 }
-
