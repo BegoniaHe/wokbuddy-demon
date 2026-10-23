@@ -106,6 +106,29 @@ func TestWithRecoveryAfterHeaderWritten(t *testing.T) {
 	}
 }
 
+// TestWithRecoveryAfterReadFrom 通过 ReadFrom（sendfile/io.Copy 路径）写出响应后
+// panic，同样不得追加错误体：ReadFrom 绕过 recoveryWriter.Write，必须自行标记
+// 已写头。
+func TestWithRecoveryAfterReadFrom(t *testing.T) {
+	t.Parallel()
+	quietPanicLog(t)
+
+	h := NewHandler(&Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+
+	h.withRecovery(func(w http.ResponseWriter, _ *http.Request) {
+		// LimitedReader 不实现 WriterTo，确保走到 recoveryWriter.ReadFrom。
+		_, _ = io.Copy(w, &io.LimitedReader{R: strings.NewReader("partial"), N: 7})
+
+		panic("late boom")
+	})(rec, req)
+
+	if got := rec.Body.String(); got != "partial" {
+		t.Fatalf("body=%q want %q (no error envelope appended)", got, "partial")
+	}
+}
+
 // TestPprofAuth pprof 与 /metrics 同口径：api_key 非空时缺 token → 401，正确 → 200。
 func TestPprofAuth(t *testing.T) {
 	t.Parallel()

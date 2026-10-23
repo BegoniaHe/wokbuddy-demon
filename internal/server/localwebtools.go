@@ -20,6 +20,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strings"
@@ -616,10 +617,40 @@ func checkHostIP(ctx context.Context, host string) error {
 	return nil
 }
 
+// blockedNonPublicPrefixes 非私网但同样不可公网访问的地址段（netip 的
+// IsPrivate 只覆盖 RFC1918/RFC4193）：0.0.0.0/8、CGNAT（100.64/10，含 Tailscale
+// 等内网）、IETF 协议分配、文档/基准测试段与 240/4 保留段。漏掉它们会让
+// web_fetch 穿过内网边界（如 http://100.100.100.100）。
+var blockedNonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
 func isBlockedIP(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() ||
-		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsInterfaceLocalMulticast() || ip.IsMulticast()
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	// 非全局单播（回环/未指定/链路本地/组播/广播）与 RFC1918/RFC4193 私网。
+	addr = addr.Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() {
+		return true
+	}
+
+	for _, prefix := range blockedNonPublicPrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // dialWebFetch 解析目标域名，校验所有解析结果后直接连接已验证的 IP。

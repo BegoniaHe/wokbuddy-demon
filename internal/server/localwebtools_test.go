@@ -40,7 +40,12 @@ func TestValidateWebURLAllowsPublicIP(t *testing.T) {
 func TestBlockedIPClasses(t *testing.T) {
 	t.Parallel()
 
-	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.1.1", "::1", "fc00::1", "fe80::1"} {
+	for _, raw := range []string{
+		"127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.0.1", "169.254.1.1",
+		"::1", "fc00::1", "fe80::1",
+		// 非私网但不可公网访问：CGNAT/Tailscale、0/8、IETF、基准测试与保留段。
+		"100.64.1.1", "100.100.100.100", "0.1.2.3", "192.0.0.1", "198.18.0.1", "240.0.0.1",
+	} {
 		ip := parseIP(t, raw)
 		if !isBlockedIP(ip) {
 			t.Errorf("%s should be blocked", raw)

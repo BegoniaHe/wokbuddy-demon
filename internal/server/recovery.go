@@ -106,6 +106,11 @@ func (w *recoveryWriter) Push(target string, opts *http.PushOptions) error {
 }
 
 func (w *recoveryWriter) ReadFrom(r io.Reader) (int64, error) {
+	// ReadFrom 直接写底层 ResponseWriter，不经过本类型的 Write。必须在这里同步
+	// 标记响应头已写出，否则 sendfile/io.Copy 路径之后再 panic 会被 recover 误判
+	// 成「尚未写头」，向已开始发送的响应追加第二个错误体。
+	w.wroteHeader = true
+
 	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
 		return rf.ReadFrom(r)
 	}

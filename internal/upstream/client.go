@@ -1506,12 +1506,18 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 	return []string{dailyCheckinPathV2, dailyCheckinPath}
 }
 
+// chatBase 返回按账号域生效的 chat base（已归一为 host）。
+//
+// 归一必须在这里做而不是只在 chat/search 各自做：配置允许 host / host/v2 /
+// host/v2/chat/completions 三种形态，而 chatBase 同时被 images、modelbusy、
+// v3/config、任务/旅行等「chat 同源但非 /v2/chat/completions」路径复用。
+// 若返回原始配置值，配成 host/v2 时这些端点会拼出 /v2/v2/...。
 func (c *Client) chatBase(a *auth.Auth) string {
 	if c.globalOn(a) {
-		return c.globalChatBase()
+		return normalizeChatBase(c.globalChatBase())
 	}
 
-	return c.ChatBaseCN
+	return normalizeChatBase(c.ChatBaseCN)
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
