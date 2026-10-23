@@ -121,7 +121,7 @@ export function AgentsView() {
           <CardTitle>本机客户端</CardTitle>
           <CardDescription>写入前备份首次原件；还原按备份恢复。</CardDescription>
         </CardHeader>
-        <CardContent className="space-y-3">
+        <CardContent className="flex flex-col gap-3">
           {q.error ? (
             <LoadError
               variant={q.data === undefined ? 'page' : 'inline'}

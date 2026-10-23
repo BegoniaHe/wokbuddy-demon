@@ -1,5 +1,6 @@
 export const VIEWS = [
   'accounts',
+  'chat',
   'usage',
   'packages',
   'taskscenter',
@@ -14,6 +15,7 @@ export type ViewId = (typeof VIEWS)[number];
 
 export const VIEW_TITLES: Record<ViewId, string> = {
   accounts: '账号池',
+  chat: '试聊',
   usage: '用量',
   packages: '积分构成',
   taskscenter: '任务中心',

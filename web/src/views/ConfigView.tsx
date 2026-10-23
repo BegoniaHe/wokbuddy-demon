@@ -184,7 +184,7 @@ export function ConfigView() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          <div className="grid gap-x-5 md:grid-cols-2">
+          <div className="grid gap-x-5 gap-y-4 md:grid-cols-2">
             <Field>
               <FieldLabel>监听地址</FieldLabel>
               {text('listen', { placeholder: ':7863' })}
@@ -201,16 +201,18 @@ export function ConfigView() {
               <FieldDescription>立即生效（含面板自身）</FieldDescription>
             </Field>
           </div>
-          <Field>
-            <FieldLabel>单账号明细默认展示条数</FieldLabel>
-            {num('package_detail_limit', { min: 1, placeholder: '5' })}
-            <FieldDescription>积分构成页按最早到期展示，其余未用完包聚合</FieldDescription>
-          </Field>
-          <Field>
-            <FieldLabel>聊天请求体上限（字节）</FieldLabel>
-            {num('max_body_bytes', { min: 0, placeholder: '33554432' })}
-            <FieldDescription>覆盖 chat / messages / count_tokens；超限返回 413。0 = 不限制。改动需重启进程</FieldDescription>
-          </Field>
+          <div className="mt-4 grid gap-x-5 gap-y-4 md:grid-cols-2">
+            <Field>
+              <FieldLabel>单账号明细默认展示条数</FieldLabel>
+              {num('package_detail_limit', { min: 1, placeholder: '5' })}
+              <FieldDescription>积分构成页按最早到期展示，其余未用完包聚合</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>聊天请求体上限（字节）</FieldLabel>
+              {num('max_body_bytes', { min: 0, placeholder: '33554432' })}
+              <FieldDescription>覆盖 chat / messages / count_tokens；超限返回 413。0 = 不限制。改动需重启进程</FieldDescription>
+            </Field>
+          </div>
         </CardContent>
       </Card>
 
@@ -671,19 +673,21 @@ export function ConfigView() {
         </CardContent>
       </Card>
 
-      <div className="sticky bottom-0 flex items-center gap-3 border-t border-border bg-secondary px-4 py-3">
-        <span className="flex-1" />
+      <div className="sticky bottom-0 -mx-4 flex flex-wrap items-center gap-2 border-t border-border bg-background/95 px-4 py-3 backdrop-blur-md md:-mx-7 md:px-7">
+        <span className="hidden flex-1 sm:block" />
         {badFields.length ? <span className="text-xs text-warning">{DURATION_TIP}</span> : null}
         <span className="text-xs text-warning">{note}</span>
-        <Button variant="outline" disabled={saving || restoring} onClick={() => void restore()}>
-          {restoring ? '恢复中…' : '恢复上一版'}
-        </Button>
-        <Button disabled={saving || restoring} onClick={() => void load()}>
-          放弃修改
-        </Button>
-        <Button type="submit" variant="default" disabled={saving || restoring}>
-          {saving ? '保存中…' : '保存配置'}
-        </Button>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <Button variant="outline" disabled={saving || restoring} onClick={() => void restore()}>
+            {restoring ? '恢复中…' : '恢复上一版'}
+          </Button>
+          <Button disabled={saving || restoring} onClick={() => void load()}>
+            放弃修改
+          </Button>
+          <Button type="submit" variant="default" disabled={saving || restoring}>
+            {saving ? '保存中…' : '保存配置'}
+          </Button>
+        </div>
       </div>
       {confirmDialog}
     </form>

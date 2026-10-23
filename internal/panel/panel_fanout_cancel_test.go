@@ -40,9 +40,8 @@ func TestReadonlyFanoutStopsOnCanceledContext(t *testing.T) {
 	panel := &Panel{cfg: Config{Pool: state, Upstream: client}}
 
 	handlers := map[string]http.HandlerFunc{
-		"packages":       panel.packages,
-		"schoolVouchers": panel.schoolVouchers,
-		"tasksScanAll":   panel.tasksScanAll,
+		"packages":     panel.packages,
+		"tasksScanAll": panel.tasksScanAll,
 	}
 
 	for name, handler := range handlers {

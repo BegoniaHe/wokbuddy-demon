@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { MoreHorizontal } from 'lucide-react';
+import { KeyRound, MoreHorizontal } from 'lucide-react';
 import { api, postJSON } from '@/lib/api';
 import { ago, fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
@@ -48,6 +48,7 @@ import {
   DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog';
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 
 const REALM_OPTIONS = [
   { value: 'auto', label: '跟随模型前缀 / 全局开关' },
@@ -208,7 +209,17 @@ export function KeysView() {
             />
           </CardContent>
         ) : list.length === 0 ? (
-          <CardContent className="py-10 text-center text-muted-foreground">暂无命名密钥。创建后即可分发给不同客户端，并在此查看各自的请求与 token 用量。</CardContent>
+          <CardContent>
+            <Empty className="border border-dashed border-border bg-muted/20 py-10">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <KeyRound />
+                </EmptyMedia>
+                <EmptyTitle>暂无命名密钥</EmptyTitle>
+                <EmptyDescription>创建后即可分发给不同客户端，并在此查看各自的请求与 token 用量。</EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+          </CardContent>
         ) : (
           <div className="overflow-x-auto">
             <Table>

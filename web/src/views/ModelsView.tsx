@@ -196,10 +196,10 @@ export function ModelsView() {
   return (
     <Card>
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-        <CardTitle className="flex items-baseline">
-          模型能力
-          <CardDescription className="ml-1.5">max_tokens bug 已修复目前可以正常透传最大输出，但是官方返回的最大输出仅为参考，不保证完全正确</CardDescription>
-        </CardTitle>
+        <div className="min-w-0">
+          <CardTitle>模型能力</CardTitle>
+          <CardDescription>max_tokens 可透传最大输出；官方上限仅供参考，不保证完全准确。</CardDescription>
+        </div>
         <CardAction>
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-xs text-muted-foreground">{note}</span>
@@ -210,10 +210,10 @@ export function ModelsView() {
         </CardAction>
       </CardHeader>
 
-      <div className="flex flex-wrap items-center gap-2 border-y border-border/60 bg-secondary px-4 py-2.5">
+      <div className="grid grid-cols-2 items-center gap-2 border-y border-border/60 bg-secondary px-4 py-2.5 sm:flex sm:flex-wrap">
         <Input
           type="search"
-          className="h-7 min-w-[200px] flex-[0_1_280px] text-xs"
+          className="col-span-2 h-7 min-w-[200px] text-xs sm:flex-[0_1_280px]"
           placeholder="搜索模型 ID / 名称 / 描述 / 厂商"
           aria-label="搜索模型"
           value={q}
@@ -273,13 +273,15 @@ export function ModelsView() {
           ariaLabel="排序方式"
           value={filter.sort}
           onChange={(v) => setFilter((f) => ({ ...f, sort: v }))} />
-        <span className="flex-1" />
-        <span className={cn('text-xs text-muted-foreground', filtered && 'text-warning')}>
-          {!all.length ? '' : filtered ? '命中 ' + list.length + ' / ' + all.length + ' 个模型' : all.length + ' 个模型'}
-        </span>
-        <Button size="xs" variant="ghost" title="清空全部筛选条件" onClick={() => { setQ(''); setFilter(DEFAULT_MODEL_FILTER); }}>
-          重置
-        </Button>
+        <span className="hidden flex-1 sm:block" />
+        <div className="col-span-2 flex items-center justify-between gap-2 sm:col-span-3">
+          <span className={cn('text-xs text-muted-foreground', filtered && 'text-warning')}>
+            {!all.length ? '' : filtered ? '命中 ' + list.length + ' / ' + all.length + ' 个模型' : all.length + ' 个模型'}
+          </span>
+          <Button size="xs" variant="ghost" title="清空全部筛选条件" onClick={() => { setQ(''); setFilter(DEFAULT_MODEL_FILTER); }}>
+            重置
+          </Button>
+        </div>
       </div>
 
       <div className="overflow-x-auto">

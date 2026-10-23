@@ -263,7 +263,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
           <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center">
             <DialogTitle>添加账号</DialogTitle>
             <Tabs value={tab} onValueChange={(v) => setTab(v as Tab)}>
-              <TabsList>
+              <TabsList className="grid h-auto w-full grid-cols-2 gap-0.5 sm:flex sm:h-8 sm:w-fit">
                 <TabsTrigger value="login">浏览器登录</TabsTrigger>
                 <TabsTrigger value="import">导入 JSON</TabsTrigger>
                 <TabsTrigger value="secure">加密备份</TabsTrigger>
@@ -277,7 +277,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
             <>
               {phase === 'pick' ? (
                 <>
-                  <div className="flex items-center gap-3.5">
+                  <div className="flex flex-wrap items-center gap-x-3.5 gap-y-2">
                     <span className="text-xs text-muted-foreground">版本：</span>
                     <label className="inline-flex items-center gap-1.5 text-xs text-foreground">
                       <input type="radio" name="addRealm" checked={realm === 'cn'} onChange={() => setRealm('cn')} /> 国内版（CN）

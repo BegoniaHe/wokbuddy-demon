@@ -26,6 +26,7 @@ import {
 import {
   Card,
   CardAction,
+  CardDescription,
   CardHeader,
   CardTitle,
 } from '@/components/ui/card';
@@ -189,10 +190,10 @@ export function LogsView() {
     <>
       <Card className="mb-5">
         <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-          <CardTitle className="flex items-baseline">
-            请求记录
-            <span className="ml-1.5 text-2xs font-normal text-muted-foreground">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span>
-          </CardTitle>
+          <div className="min-w-0">
+            <CardTitle>请求记录</CardTitle>
+            <CardDescription>调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</CardDescription>
+          </div>
           <CardAction>
             <div className="flex flex-wrap items-center gap-3">
               <span className="text-xs text-muted-foreground">{reqSummary}</span>
@@ -244,8 +245,8 @@ export function LogsView() {
             重新读取
           </Button>
         </div>
-        <div className="max-h-[460px] overflow-auto">
-          <Table className="min-w-[1080px]">
+        <div className="max-h-[460px] overflow-auto" tabIndex={0} aria-label="请求记录，可横向滚动">
+          <Table className="min-w-[1080px]" containerClassName="overflow-visible">
             <TableHeader className="sticky top-0 z-[1] bg-card">
               <TableRow>
                 <TableHead>时间</TableHead>
@@ -319,10 +320,10 @@ export function LogsView() {
 
       <Card className="mt-5">
         <CardHeader className="flex flex-wrap items-center justify-between gap-3">
-          <CardTitle>
-            错误汇总
-            <span className="ml-1.5 text-2xs font-normal text-muted-foreground">按账号 × 类型聚合当前日志环</span>
-          </CardTitle>
+          <div className="min-w-0">
+            <CardTitle>错误汇总</CardTitle>
+            <CardDescription>按账号 × 类型聚合当前日志环</CardDescription>
+          </div>
           <CardAction>
             <span className="text-xs text-muted-foreground">{(errSummaryQ.data?.entries || []).length} 组</span>
           </CardAction>
