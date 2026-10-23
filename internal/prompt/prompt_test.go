@@ -271,3 +271,19 @@ func TestLoadFileMissingFailsFast(t *testing.T) {
 		t.Fatal("missing file should return error (fail fast)")
 	}
 }
+
+// TestRewriteAndAppendNullBody 顶层 null 是合法 JSON 但解成 nil map；
+// 改写函数必须原样返回，不能向 nil map 写 messages。
+func TestRewriteAndAppendNullBody(t *testing.T) {
+	t.Parallel()
+
+	nullBody := []byte("null")
+
+	if out := Rewrite(nullBody, "SYS"); string(out) != "null" {
+		t.Fatalf("Rewrite(null)=%s want null", out)
+	}
+
+	if out := Append(nullBody, "SYS"); string(out) != "null" {
+		t.Fatalf("Append(null)=%s want null", out)
+	}
+}

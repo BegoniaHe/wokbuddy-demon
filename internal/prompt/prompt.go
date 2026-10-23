@@ -137,6 +137,11 @@ func decodeBody(body []byte, systemPrompt string) (map[string]any, bool) {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, false
 	}
+	// 顶层 null 是合法 JSON 但解成 nil map：没有可改写的字段，
+	// 按解析失败处理，避免调用方写 map 时 panic。
+	if obj == nil {
+		return nil, false
+	}
 
 	return obj, true
 }

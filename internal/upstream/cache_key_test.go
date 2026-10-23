@@ -171,3 +171,14 @@ func TestPrepareBodyOptNoCacheKeyInjection(t *testing.T) {
 		t.Fatalf("PrepareBodyOpt must NOT inject prompt_cache_key, but got: %v", obj["prompt_cache_key"])
 	}
 }
+
+// TestInjectPromptCacheKey_NullBody 顶层 null 解成 nil map，不能向 nil map
+// 写 prompt_cache_key；解析不出对象的 body 一律原样返回。
+func TestInjectPromptCacheKey_NullBody(t *testing.T) {
+	t.Parallel()
+
+	nullBody := []byte("null")
+	if out := InjectPromptCacheKey(nullBody, "uid", "conv"); string(out) != "null" {
+		t.Fatalf("InjectPromptCacheKey(null)=%s want null", out)
+	}
+}
