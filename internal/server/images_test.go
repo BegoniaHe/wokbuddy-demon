@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -431,5 +432,63 @@ func TestNoteRefreshFailureNoRefreshTokenCountsSession(t *testing.T) {
 
 	if status.SessionDeadFails != 1 || status.Disabled {
 		t.Fatalf("session dead=%+v want 1 次且未达阈值不禁用", status)
+	}
+}
+
+// TestImagesNamedKeyUsageRecorded 出图路径也要把 token 用量回填到命名密钥：
+// 只记请求数而漏 token 会让密钥用量面板少记（与 chat / anthropic 同口径）。
+func TestImagesNamedKeyUsageRecorded(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+
+	created, raw, err := store.Create("img")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK,
+				`{"created":1,"data":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Keys:     store,
+		Live:     livecfg.New(livecfg.Snapshot{APIKey: "secret", ImagesEndpoint: true}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`))
+	req.Header.Set("Authorization", "Bearer "+raw)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var got *apikey.Record
+
+	for _, item := range store.List() {
+		if item.ID == created.ID {
+			got = &item
+
+			break
+		}
+	}
+
+	if got == nil {
+		t.Fatal("named key missing")
+	}
+
+	if got.Requests != 1 || got.PromptTokens != 3 || got.CompletionTokens != 4 || got.TotalTokens != 7 {
+		t.Fatalf("key usage=%+v want requests=1 prompt=3 completion=4 total=7", got)
 	}
 }
