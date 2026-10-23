@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/agentcfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 )
 
 func agentsPanel(t *testing.T, apiKey string) (*Panel, string) {
@@ -66,6 +67,33 @@ func TestAgentsRejectNonLoopback(t *testing.T) {
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("code=%d want 403", rec.Code)
+	}
+}
+
+// TestAgentsRejectBehindTrustedProxy 同机反代场景：TCP 对端是 127.0.0.1，
+// 但可信转发头给出的真实来源不是回环，必须拒绝——否则所有外部客户端都能
+// 借本机反代写本机智能体配置。
+func TestAgentsRejectBehindTrustedProxy(t *testing.T) {
+	t.Parallel()
+
+	trusted, err := httpauth.ParseTrustedProxies([]string{"127.0.0.1/32"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	panel, _ := agentsPanel(t, "k")
+	panel.cfg.TrustedProxies = trusted
+
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/agents", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("X-Forwarded-For", "203.0.113.9")
+	req.Header.Set("Authorization", "Bearer k")
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code=%d body=%s, want 403", rec.Code, rec.Body)
 	}
 }
 
