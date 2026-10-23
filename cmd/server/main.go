@@ -51,6 +51,9 @@ var appVersion = "dev"
 // errClientProfileMissing 部署缺少必需的 client profile（启动期拒绝）。
 var errClientProfileMissing = errors.New("请用 reverse-workbuddy 技能从官方 Win32 分发包生成后放入 client-profiles 目录")
 
+// errSubmittedConfigNull 面板提交的配置是顶层 null：合法 JSON 但不是配置对象。
+var errSubmittedConfigNull = errors.New("parse submitted config: expected JSON object, got null")
+
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
 func usagePathFor(stateFile string) string { return stateSibling(stateFile, "usage.json") }
@@ -913,6 +916,10 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 	if err := json.Unmarshal(raw, &incoming); err != nil {
 		return nil, nil, nil, fmt.Errorf("parse submitted config: %w", err)
 	}
+	// 顶层 null 解成 nil map：既不能当配置对象合并，也不能原样落盘（会把配置洗成 null）。
+	if incoming == nil {
+		return nil, nil, nil, errSubmittedConfigNull
+	}
 
 	oldCfg, oldErr := parseConfigWithEnv(oldRaw)
 	if oldErr != nil {
@@ -923,7 +930,8 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 
 	if merge {
 		var cur map[string]any
-		if err := json.Unmarshal(oldRaw, &cur); err != nil {
+		if err := json.Unmarshal(oldRaw, &cur); err != nil || cur == nil {
+			// 损坏或顶层 null 的现有配置按空对象处理，避免向 nil map 合并。
 			cur = map[string]any{}
 		}
 

@@ -192,3 +192,28 @@ func TestSaveConfigConcurrentStaysValid(t *testing.T) {
 		t.Fatalf("api_key 丢失: %s", raw)
 	}
 }
+
+// TestPrepareConfigMergeRejectsNull 顶层 null 是合法 JSON 但不是配置对象：
+// 合并/落盘必须拒绝，不能把 null 当空配置整体写入。
+func TestPrepareConfigMergeRejectsNull(t *testing.T) {
+	t.Parallel()
+
+	if _, _, _, err := prepareConfigMerge([]byte(`{"api_key":"old"}`), []byte(`null`), true); err == nil {
+		t.Fatal("null submitted config must be rejected")
+	}
+}
+
+// TestPrepareConfigMergeNullCurrentConfig 当前配置为 null 时按空对象合并，
+// 不能对 nil map 写入（panel 保存会 panic）。
+func TestPrepareConfigMergeNullCurrentConfig(t *testing.T) {
+	t.Parallel()
+
+	merged, _, _, err := prepareConfigMerge([]byte(`null`), []byte(`{"api_key":"new"}`), true)
+	if err != nil {
+		t.Fatalf("prepareConfigMerge: %v", err)
+	}
+
+	if merged["api_key"] != "new" {
+		t.Fatalf("merged=%v", merged)
+	}
+}
