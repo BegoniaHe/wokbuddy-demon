@@ -95,7 +95,14 @@ func (w *recoveryWriter) Flush() {
 
 func (w *recoveryWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	if hj, ok := w.ResponseWriter.(http.Hijacker); ok {
-		return hj.Hijack()
+		conn, bufrw, err := hj.Hijack()
+		if err == nil {
+			// 连接已交给调用方，HTTP 响应阶段结束；之后再 panic 不得向被劫持的
+			// 连接追加错误体（net/http 会拒绝写，但 recover 仍会误走写错误分支）。
+			w.wroteHeader = true
+		}
+
+		return conn, bufrw, err
 	}
 
 	return nil, nil, http.ErrNotSupported

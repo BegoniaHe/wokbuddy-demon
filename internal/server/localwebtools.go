@@ -625,6 +625,10 @@ func checkHostIP(ctx context.Context, host string) error {
 // IPv6 过渡/转换前缀必须单列：NAT64（64:ff9b::/96 与 RFC 8215 本地前缀）和
 // 6to4/Teredo 都能把 IPv4 地址嵌进 IPv6 字面量，IsGlobalUnicast/IsPrivate 却判为
 // 公网。漏掉时 http://[64:ff9b::a00:1]/ 会在 NAT64 环境里访问 10.0.0.1。
+//
+// NAT64 知名前缀例外：IPv6-only + DNS64 环境会把**所有**公网 IPv4 目标合成为
+// 64:ff9b::/96，直接封整段会让 web_fetch 失去全部 IPv4 站点。该前缀在
+// isBlockedIP 里按嵌入的 IPv4 逐地址判定（内嵌私网仍拒绝）。
 var blockedNonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
@@ -640,7 +644,6 @@ var blockedNonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("2001:db8::/32"),
 	netip.MustParsePrefix("3fff::/20"),
 	// IPv4 过渡/转换前缀：可嵌入内网 IPv4。
-	netip.MustParsePrefix("64:ff9b::/96"),
 	netip.MustParsePrefix("64:ff9b:1::/48"),
 	netip.MustParsePrefix("2001::/32"),
 	netip.MustParsePrefix("2002::/16"),
@@ -649,6 +652,9 @@ var blockedNonPublicPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("::ffff:0:0:0/96"),
 	netip.MustParsePrefix("fec0::/10"),
 }
+
+// nat64WellKnownPrefix DNS64 合成的知名前缀（RFC 6052）。单独判定而非整段封禁。
+var nat64WellKnownPrefix = netip.MustParsePrefix("64:ff9b::/96")
 
 func isBlockedIP(ip net.IP) bool {
 	addr, ok := netip.AddrFromSlice(ip)
@@ -659,6 +665,14 @@ func isBlockedIP(ip net.IP) bool {
 	addr = addr.Unmap()
 	if !addr.IsGlobalUnicast() || addr.IsPrivate() {
 		return true
+	}
+
+	// NAT64 知名前缀按内嵌 IPv4 判定：公网目标放行（IPv6-only/DNS64 环境可用），
+	// 内嵌私网/保留段仍拒绝。
+	if nat64WellKnownPrefix.Contains(addr) {
+		raw := addr.As16()
+
+		return isBlockedIP(net.IPv4(raw[12], raw[13], raw[14], raw[15]))
 	}
 
 	for _, prefix := range blockedNonPublicPrefixes {

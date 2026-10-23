@@ -61,6 +61,13 @@ func TestBlockedIPClasses(t *testing.T) {
 	if isBlockedIP(parseIP(t, "93.184.216.34")) {
 		t.Error("public IP blocked")
 	}
+
+	// NAT64 知名前缀按内嵌 IPv4 判定：公网目标必须放行（IPv6-only/DNS64 环境）。
+	for _, raw := range []string{"64:ff9b::808:808", "64:ff9b::5db8:d822"} {
+		if isBlockedIP(parseIP(t, raw)) {
+			t.Errorf("%s (public NAT64) should be allowed", raw)
+		}
+	}
 }
 
 func parseIP(t *testing.T, raw string) net.IP {

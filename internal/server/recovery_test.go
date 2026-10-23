@@ -2,9 +2,11 @@
 package server
 
 import (
+	"bufio"
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -147,6 +149,45 @@ func TestWithRecoveryAfterFlush(t *testing.T) {
 
 	if rec.Body.Len() != 0 {
 		t.Fatalf("body=%q want empty (no error envelope appended)", rec.Body.String())
+	}
+}
+
+// hijackRecorder 记录 Hijack 调用；底层仍保留可写 recorder，便于断言 recover
+// 没有在被劫持的连接上追加错误体。
+type hijackRecorder struct {
+	*httptest.ResponseRecorder
+
+	hijacked bool
+}
+
+func (h *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+
+	return nil, nil, nil
+}
+
+// TestWithRecoveryAfterHijack 连接已 Hijack 后 HTTP 响应阶段结束，随后 panic 不得
+// 再尝试写错误体。
+func TestWithRecoveryAfterHijack(t *testing.T) {
+	t.Parallel()
+	quietPanicLog(t)
+
+	h := NewHandler(&Config{})
+	rec := &hijackRecorder{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+
+	h.withRecovery(func(w http.ResponseWriter, _ *http.Request) {
+		_, _, _ = w.(http.Hijacker).Hijack()
+
+		panic("after hijack")
+	})(rec, req)
+
+	if !rec.hijacked {
+		t.Fatal("handler did not hijack the connection")
+	}
+
+	if rec.Body.Len() != 0 {
+		t.Fatalf("body=%q want empty (no error envelope after hijack)", rec.Body.String())
 	}
 }
 
