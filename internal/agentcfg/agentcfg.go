@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -147,9 +148,14 @@ func validateOptions(opts *Options) error {
 		return errAPIKey
 	}
 
-	if !strings.HasPrefix(opts.BaseURL, "http://") && !strings.HasPrefix(opts.BaseURL, "https://") {
+	baseURL := strings.TrimSpace(opts.BaseURL)
+
+	u, err := url.Parse(baseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return errBaseURLHTTPS
 	}
+
+	opts.BaseURL = baseURL
 
 	if strings.TrimSpace(opts.Model) == "" {
 		opts.Model = "glm-5.2"
