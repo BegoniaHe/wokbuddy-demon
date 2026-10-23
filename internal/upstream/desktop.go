@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/cpupool"
 )
@@ -768,12 +769,29 @@ func (c *Client) setDesktopExpertHeaders(req *http.Request, account5 *auth.Auth,
 
 // debugChatRequest 调试输出请求 URL 与全部请求头（仅 WB2A_DEBUG_CHAT 非空时）。
 //
+// 凭证头（Authorization / Cookie / API key / 设备 token）整体替换为 [REDACTED]，
+// 其余值清理控制字符并截断——调试开关不能成为泄露凭证或伪造日志行的通道。
+//
 //nolint:forbidigo // 调试专用输出：仅 WB2A_DEBUG_CHAT 显式开启时打印到终端，非库内调试残留。
 func debugChatRequest(req *http.Request) {
-	fmt.Printf("[dbg] URL=%s\n", req.URL)
+	fmt.Printf("[dbg] URL=%s\n", RedactForLog(req.URL.Redacted(), 0))
 
-	for k := range req.Header {
-		fmt.Printf("[dbg] %s: %s\n", k, req.Header.Get(k))
+	for k, values := range req.Header {
+		for _, v := range values {
+			fmt.Printf("[dbg] %s: %s\n", k, debugHeaderValue(k, v))
+		}
+	}
+}
+
+// debugHeaderValue 返回可安全打印的请求头值：敏感头整段隐藏，其余清理控制字符
+// 并截断到 200 字节（保留 UUID/会话 ID 等排障信息，不做通用 token 脱敏）。
+func debugHeaderValue(name, value string) string {
+	switch strings.ToLower(name) {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie",
+		"x-api-key", "x-goog-api-key", "x-device-token", "x-refresh-token":
+		return redacted
+	default:
+		return logfmt.Truncate(sanitizeLogLine(value), 200)
 	}
 }
 

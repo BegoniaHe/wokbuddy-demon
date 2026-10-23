@@ -2129,7 +2129,7 @@ func (c *Client) chatStreamAt(
 
 	kind := Classify(resp.StatusCode, string(raw))
 	log.Printf("WARN: [upstream] chat_stream acct=%s origin=%s: upstream %d %s body=%s",
-		logfmt.Label(account3.UID, account3.NicknameValue()), base, resp.StatusCode, kind, redactForLog(string(raw), 200))
+		logfmt.Label(account3.UID, account3.NicknameValue()), base, resp.StatusCode, kind, RedactForLog(string(raw), 200))
 
 	if kind == ErrNone {
 		return chatAttempt{status: resp.StatusCode, body: raw}

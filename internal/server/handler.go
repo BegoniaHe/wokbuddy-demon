@@ -2781,7 +2781,7 @@ func (f *chatFlow) handlePreStreamErrorFrame(
 	f.h.applyErrorPolicy(acct.UID, kind, probe.Frame, f.realm, f.bareModel, nil)
 	f.fail(acct.UID)
 	log.Printf("WARN: [server] stream acct=%s model=%s: first-frame upstream error kind=%s payload=%s (rotating before write)",
-		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(probe.Frame, 200))
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, upstream.RedactForLog(probe.Frame, 200))
 
 	if !rotateBackoff(ctx, i) {
 		return rotBreak
@@ -2822,7 +2822,7 @@ func (f *chatFlow) continueUpstream(ctx context.Context, acct *auth.Auth, partia
 		}
 
 		log.Printf("WARN: [server] stream acct=%s model=%s: continuation failed status=%d err=%v body=%s",
-			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, status, err, logfmt.Truncate(string(respBody), 160))
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, status, err, upstream.RedactForLog(string(respBody), 160))
 
 		if err != nil {
 			return nil, fmt.Errorf("continuation request: %w", err)
@@ -2889,7 +2889,7 @@ func (f *chatFlow) applyStreamErrorFrame(acct *auth.Auth, errFrame string) {
 	f.st.status = http.StatusServiceUnavailable
 	f.st.outcome = reqlog.OutcomeStreamError
 	log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
-		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(errFrame, 200))
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, upstream.RedactForLog(errFrame, 200))
 }
 
 // failStreamUpstream 处置流式路径的上游失败（空流 / 截断，issue #105）：
@@ -3215,7 +3215,7 @@ func (f *chatFlow) handleNonStreamErrorFrame(
 	f.h.applyErrorPolicy(acct.UID, kind, payload, f.realm, f.bareModel, nil)
 	f.fail(acct.UID)
 	log.Printf("WARN: [server] non-stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
-		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, logfmt.Truncate(payload, 200))
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind, upstream.RedactForLog(payload, 200))
 
 	if !rotateBackoff(ctx, i) {
 		return rotBreak

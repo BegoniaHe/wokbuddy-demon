@@ -1587,9 +1587,27 @@ func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.B
 		}
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool { return rows[i].Remaining < rows[j].Remaining })
+	sort.SliceStable(rows, func(i, j int) bool { return remainingRowLess(&rows[i], &rows[j]) })
 
 	return rows, budgets, len(events)
+}
+
+// remainingRowLess 剩余量升序；同量按 realm/uid/model 固定次序。
+// 行集合来自 map 遍历，缺少次级键时同量行序会随机变化，令 ETag 抖动、304 失效。
+func remainingRowLess(left, right *remainingRow) bool {
+	if left.Remaining != right.Remaining {
+		return left.Remaining < right.Remaining
+	}
+
+	if left.Realm != right.Realm {
+		return left.Realm < right.Realm
+	}
+
+	if left.UID != right.UID {
+		return left.UID < right.UID
+	}
+
+	return left.Model < right.Model
 }
 
 // remainingRow 组装单行；有撞线重置时间时改用同窗口用量。
