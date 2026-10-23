@@ -44,7 +44,7 @@ func TestImagesDisabledReturns404(t *testing.T) {
 func TestImagesPassthroughAndUsage(t *testing.T) {
 	t.Parallel()
 
-	var gotPath, gotAccept string
+	var gotPath, gotAccept, gotConvReqID string
 
 	var gotBody []byte
 
@@ -52,6 +52,7 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 			gotPath = r.URL.Path
 			gotAccept = r.Header.Get("Accept")
+			gotConvReqID = r.Header.Get("X-Conversation-Request-Id")
 			gotBody, _ = io.ReadAll(r.Body)
 
 			return jsonResponse(http.StatusOK,
@@ -81,6 +82,11 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 
 	if gotAccept != "application/json" {
 		t.Fatalf("accept=%q", gotAccept)
+	}
+
+	// 与 chat/search 同口径：轮级聚合主键必须是 UUIDv7 32 hex，不能是裸随机 hex。
+	if !uuidV7SearchPattern.MatchString(gotConvReqID) {
+		t.Fatalf("X-Conversation-Request-Id=%q want UUIDv7 32 hex", gotConvReqID)
 	}
 
 	if string(gotBody) != body {

@@ -165,7 +165,9 @@ func (h *Handler) generateImages(
 	w http.ResponseWriter, r *http.Request, acct *auth.Auth, body []byte, realm, bareModel string,
 ) {
 	meta := upstream.ChatMeta{
-		ConversationRequestID: session.NewMessageID(),
+		// X-Conversation-Request-ID 是轮级聚合主键，与 chat/search 同口径用 UUIDv7
+		// 32 hex；NewMessageID 不带版本/变体位，会被按官方正则校验的上游拒绝。
+		ConversationRequestID: session.NewUUIDv7Hex(),
 		ConversationID:        metaConversationID(r),
 	}
 	started := time.Now()

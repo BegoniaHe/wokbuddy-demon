@@ -153,6 +153,17 @@ func TestInjectPromptCacheKey_EmptyConversation(t *testing.T) {
 	}
 }
 
+// TestInjectPromptCacheKey_NullBody 顶层 null 解析为 nil map：必须原样返回，不能 panic。
+func TestInjectPromptCacheKey_NullBody(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`null`)
+
+	if out := InjectPromptCacheKey(body, "user-abc-123", "conv-xyz"); string(out) != string(body) {
+		t.Fatalf("InjectPromptCacheKey(null) = %q, want 原样返回", out)
+	}
+}
+
 // TestPrepareBodyOptNoCacheKeyInjection 覆盖任务用例 6：
 // PrepareBodyOpt（sanitize=false 的旧入口）行为不变——不注入 cache key。
 // 向后兼容：仅传 body 不给 cacheKey 上下文时，不得引入新字段。
