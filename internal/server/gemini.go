@@ -983,7 +983,8 @@ func geminiArgsObject(raw string) map[string]any {
 	}
 
 	var args map[string]any
-	if json.Unmarshal([]byte(raw), &args) == nil {
+	// 顶层 null 解成 nil map：Gemini 的 args 必须是对象，统一回落空对象。
+	if json.Unmarshal([]byte(raw), &args) == nil && args != nil {
 		return args
 	}
 

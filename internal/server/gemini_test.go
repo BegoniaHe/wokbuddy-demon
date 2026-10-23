@@ -358,3 +358,18 @@ func TestGeminiStreamRequestLevelError(t *testing.T) {
 		t.Errorf("请求级错误不应返回 UNAVAILABLE:\n%s", out)
 	}
 }
+
+// TestGeminiArgsObjectNull 工具参数为顶层 null 时回落空对象：
+// Gemini functionCall.args 必须是对象，不能是 null。
+func TestGeminiArgsObjectNull(t *testing.T) {
+	t.Parallel()
+
+	args := geminiArgsObject("null")
+	if args == nil {
+		t.Fatal("null arguments must become an empty object, got nil")
+	}
+
+	if len(args) != 0 {
+		t.Fatalf("args=%v want empty object", args)
+	}
+}
