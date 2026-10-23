@@ -3,7 +3,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -162,14 +161,19 @@ func refreshFailure(account *auth.Auth, client *upstream.Client) (status, detail
 		return "", "", false
 	}
 
-	ue := &upstream.Error{}
-	if errors.As(rerr, &ue) {
-		status = "AUTH_INVALID"
-	} else {
-		status = "FAIL"
-	}
+	status = classifyRefreshFailure(rerr)
 
 	return status, "refresh: " + short(rerr.Error()), true
+}
+
+// classifyRefreshFailure 只在凭证确实不可用时报 AUTH_INVALID；上游 5xx/限流/
+// 传输层错误只算本次 FAIL，避免把健康账号误导成「需要重新登录」。
+func classifyRefreshFailure(err error) string {
+	if upstream.IsCredentialDead(err) {
+		return "AUTH_INVALID"
+	}
+
+	return "FAIL"
 }
 
 // refreshIfNeeded 在 token 临近过期（2h 内）时刷新并原子落盘；
