@@ -113,3 +113,31 @@ func TestReportChatActivityServerError(t *testing.T) {
 		t.Fatal("want error on 500")
 	}
 }
+
+// TestIsTransientBillingErrProcessing 429「请求处理中」按瞬时错误重试（issue #250）。
+func TestIsTransientBillingErrProcessing(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"429 请求处理中", &Error{Kind: ErrSoftRate, Status: 429, Msg: "请求处理中，请稍后重试"}, true},
+		{"429 processing", &Error{Kind: ErrSoftRate, Status: 429, Msg: "request processing"}, true},
+		{"429 普通限流", &Error{Kind: ErrSoftRate, Status: 429, Msg: "rate limit"}, false},
+		{"业务错误", &Error{Kind: ErrClient, Status: 400, Msg: "请求处理中"}, false},
+		{"5xx", &Error{Kind: ErrServer, Status: 500}, true},
+		{"网络错误", io.ErrUnexpectedEOF, true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := isTransientBillingErr(testCase.err); got != testCase.want {
+				t.Fatalf("isTransientBillingErr(%v)=%v want %v", testCase.err, got, testCase.want)
+			}
+		})
+	}
+}

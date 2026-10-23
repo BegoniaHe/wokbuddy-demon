@@ -1,7 +1,9 @@
 package scheduler
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,7 +23,7 @@ func TestMissedTodayAndRunStamp(t *testing.T) {
 		RunStampFile:      filepath.Join(t.TempDir(), "scheduler-runs.json"),
 	})
 
-	now := time.Date(2026, 10, 21, 22, 0, 0, 0, time.Local)
+	now := time.Date(2026, 10, 21, 22, 0, 0, 0, cst.Loc)
 
 	missed := scheduler.missedToday(now)
 	if len(missed) != 1 || missed[0] != taskCheckin {
@@ -91,25 +93,24 @@ func TestBlackcatRunStampEarlyMorningDoesNotBlockNextNight(t *testing.T) {
 	}
 }
 
-// TestRunStampUsesSchedulingDay 补跑标记必须与排程同一天界（now 的 location），
-// 不能跨到 CST 日界：否则非 CST 宿主上重启会把同一天的任务重复补跑或漏补。
+// TestRunStampUsesSchedulingDay 补跑标记与排程同用 CST 日界（issue #252）：
+// 宿主 UTC 日凌晨/晚上属于不同 CST 日，不能沿用旧的宿主本地日界。
 func TestRunStampUsesSchedulingDay(t *testing.T) {
 	t.Parallel()
 
 	scheduler := New(&Config{RunStampFile: filepath.Join(t.TempDir(), "scheduler-runs.json")})
 
-	early := time.Date(2026, 10, 21, 5, 0, 0, 0, time.UTC)
-	later := time.Date(2026, 10, 21, 20, 0, 0, 0, time.UTC) // CST 已是 10-22
+	early := time.Date(2026, 10, 21, 5, 0, 0, 0, time.UTC)  // CST 10-21 13:00
+	later := time.Date(2026, 10, 21, 20, 0, 0, 0, time.UTC) // CST 10-22 04:00
 
 	scheduler.markRan([]taskKind{taskCheckin}, early)
 
-	if !scheduler.ranToday(taskCheckin, later) {
-		t.Fatal("same scheduling day must stay marked even across CST midnight")
+	if scheduler.ranToday(taskCheckin, later) {
+		t.Fatal("different CST day must not stay marked")
 	}
 
-	nextDay := time.Date(2026, 10, 22, 1, 0, 0, 0, time.UTC)
-	if scheduler.ranToday(taskCheckin, nextDay) {
-		t.Fatal("next scheduling day must not be marked")
+	if !scheduler.ranToday(taskCheckin, early.Add(2*time.Hour)) {
+		t.Fatal("same CST day must stay marked")
 	}
 }
 
@@ -144,5 +145,37 @@ func TestMissedTodayBlackcatWithinWindow(t *testing.T) {
 	outOfWindow := time.Date(2026, 10, 22, 12, 0, 0, 0, cst.Loc)
 	if got := scheduler.missedToday(outOfWindow); len(got) != 0 {
 		t.Fatalf("out of window must not catch up blackcat: %v", got)
+	}
+}
+
+// TestLoadStampsMigratesLegacyBoundary 旧版宿主本地日界标记整体作废。
+func TestLoadStampsMigratesLegacyBoundary(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "scheduler-runs.json")
+	if err := os.WriteFile(path, []byte(`{"checkin":"2026-10-21"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	scheduler := New(&Config{RunStampFile: path})
+	now := time.Date(2026, 10, 21, 22, 0, 0, 0, time.UTC) // CST 10-22 06:00
+
+	if scheduler.ranToday(taskCheckin, now) {
+		t.Fatal("legacy local-day stamp must be ignored after CST migration")
+	}
+
+	scheduler.markRan([]taskKind{taskCheckin}, now)
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(raw), `"_boundary":"cst"`) {
+		t.Fatalf("boundary marker missing: %s", raw)
+	}
+
+	if !scheduler.ranToday(taskCheckin, now) {
+		t.Fatal("new CST stamp must be effective")
 	}
 }

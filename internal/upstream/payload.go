@@ -7,6 +7,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"slices"
 	"strings"
 )
 
@@ -38,6 +39,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	}
 
 	normalizeToolChoice(obj)
+	normalizeStop(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
@@ -252,6 +254,18 @@ func pickLowestEffort(supported []string) string {
 	}
 
 	return lowest
+}
+
+// normalizeStop 把 OpenAI 兼容客户端常见的 `stop: "x"` 字符串形态归一为数组。
+// 上游按数组校验，字符串会 400 code=11101（issue #246）。空串不转换，保持原语义：
+// 是否把空串当「无停止序列」由上游决定，网关不替客户端丢弃字段。
+func normalizeStop(obj map[string]any) {
+	stop, ok := obj["stop"].(string)
+	if !ok || stop == "" {
+		return
+	}
+
+	obj["stop"] = []string{stop}
 }
 
 // normalizeRoles 把 messages 里的 developer 角色归一为 system。
@@ -594,4 +608,53 @@ func unescapePatternProperties(n map[string]any) {
 	if rebuilt {
 		n["patternProperties"] = fixed
 	}
+}
+
+// injectConversationRequestID 给当前轮最后一条 user 消息补
+// conversationRequestId / startsNewUserRequest（issue #249）。只改最后一条 user，
+// 历史轮次不动；客户端自带值优先。没有 user 消息或 body 不可解析时原样返回。
+//
+//nolint:cyclop // 解析 + 找到最后一条 user + 保留客户端值。
+func injectConversationRequestID(body []byte, requestID string) []byte {
+	if requestID == "" || len(body) == 0 {
+		return body
+	}
+
+	var obj map[string]any
+	if json.Unmarshal(body, &obj) != nil || obj == nil {
+		return body
+	}
+
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return body
+	}
+
+	for _, raw := range slices.Backward(msgs) {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if role, _ := msg["role"].(string); role != "user" {
+			continue
+		}
+
+		if _, exists := msg["conversationRequestId"]; !exists {
+			msg["conversationRequestId"] = requestID
+		}
+
+		if _, exists := msg["startsNewUserRequest"]; !exists {
+			msg["startsNewUserRequest"] = true
+		}
+
+		break
+	}
+
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+
+	return out
 }

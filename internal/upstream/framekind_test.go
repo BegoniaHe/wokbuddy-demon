@@ -123,3 +123,24 @@ func TestDoJSONKeepsCodeBeyondTruncation(t *testing.T) {
 		t.Errorf("msg len=%d want truncated 200", len(uerr.Msg))
 	}
 }
+
+// TestFrameKindTopLevelBusiness 顶层 {code,msg} 与 error 帧同口径分类（issue #244）。
+func TestFrameKindTopLevelBusiness(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		payload string
+		want    ErrKind
+	}{
+		{`{"code":14003,"msg":"model busy"}`, ErrSoftRate},
+		{`{"code":11133,"msg":"messages is required","extError":{"param":"messages"}}`, ErrBadParams},
+		{`{"code":0,"msg":"ok"}`, ErrNone},
+		{`{"code":11129,"msg":"bad tool","choices":[]}`, ErrNone},
+	}
+
+	for _, testCase := range cases {
+		if got := FrameKind(testCase.payload); got != testCase.want {
+			t.Errorf("FrameKind(%s)=%v want %v", testCase.payload, got, testCase.want)
+		}
+	}
+}

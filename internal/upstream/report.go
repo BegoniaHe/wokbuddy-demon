@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -114,17 +115,26 @@ func (c *Client) retryDelay() time.Duration {
 	return billingRetryDelay
 }
 
+// billingProcessingMarkers 上游 429「请求处理中」文案（签到/余额瞬时状态）。
+// 该状态是上游正在处理上一笔请求，重试通常可成功；不能按普通业务错误丢掉，
+// 否则会造成漏签（issue #250）。
+var billingProcessingMarkers = []string{"请求处理中", "processing"}
+
 // isTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
 // 上游 5xx（ErrServer，实测偶发 "code 10000 / API request failed with status
-// code: 500"）或网络层错误（非 *Error 的传输失败）。业务错误（code!=0 的
-// 已签到/参数错、4xx、限流）不重试——重试只会原样再失败一次。
+// code: 500"）、网络层错误（非 *Error 的传输失败），以及 429「请求处理中」
+// 这类瞬时状态。其余业务错误（已签到/参数错/余额耗尽）不重试。
 func isTransientBillingErr(err error) bool {
 	if err == nil {
 		return false
 	}
 
 	if ue, ok := errors.AsType[*Error](err); ok {
-		return ue.Kind == ErrServer
+		if ue.Kind == ErrServer {
+			return true
+		}
+
+		return ue.Kind == ErrSoftRate && containsAnyDual(strings.ToLower(ue.Msg), ue.Msg, billingProcessingMarkers)
 	}
 
 	return true

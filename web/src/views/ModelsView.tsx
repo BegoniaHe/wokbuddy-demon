@@ -444,6 +444,11 @@ function ModelRow({
   if (m.supports_tool_call) caps.push(<Tag key="t" tone="warn">工具</Tag>);
   if (m.supports_images) caps.push(<Tag key="v" tone="warn">视觉</Tag>);
   if (m.supports_reasoning && !m.can_disable_thinking) caps.push(<Tag key="r" tone="warn">思考常开</Tag>);
+  if (m.busy === 'busy' || m.busy === 'congested') {
+    caps.push(<Tag key="b" tone="warn" title="官方渲染层繁忙度（仅观测）">{m.busy === 'busy' ? '繁忙' : '拥堵'}</Tag>);
+  } else if (m.busy === 'unavailable') {
+    caps.push(<Tag key="b" tone="bad" title="官方渲染层繁忙度（仅观测）">不可用</Tag>);
+  }
   return (
     <TableRow>
       <TableCell className="w-[3px] p-0">

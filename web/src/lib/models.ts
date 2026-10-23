@@ -22,6 +22,7 @@ export interface ModelEntry {
   credits?: number | string;
   max_output_tokens?: number;
   context_length?: number;
+  busy?: string;
 }
 
 export interface ModelFilter {

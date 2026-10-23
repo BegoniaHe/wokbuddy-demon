@@ -390,6 +390,7 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		MultimodalRouting:    cfg.Features.MultimodalRouting,
 		SearchEndpoint:       cfg.Features.SearchEndpoint,
+		ImagesEndpoint:       cfg.Features.ImagesEndpoint,
 		LocalWebTools:        cfg.Features.LocalWebTools,
 		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
 		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
@@ -630,6 +631,7 @@ func configureUpstream(cfg *Config, client *upstream.Client) error {
 	}
 
 	client.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
+	client.ConversationRequestBody.Store(cfg.Features.ConversationRequestBody)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -929,6 +931,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		MultimodalRouting:    newCfg.Features.MultimodalRouting,
 		SearchEndpoint:       newCfg.Features.SearchEndpoint,
+		ImagesEndpoint:       newCfg.Features.ImagesEndpoint,
 		LocalWebTools:        newCfg.Features.LocalWebTools,
 		LocalWebToolRounds:   newCfg.Features.LocalWebToolRounds,
 		BackgroundNames:      backgroundNameSet(newCfg.Models.BackgroundNames),
@@ -936,6 +939,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
 	client3.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	client3.ConversationRequestBody.Store(newCfg.Features.ConversationRequestBody)
 	state9.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	state9.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	state9.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

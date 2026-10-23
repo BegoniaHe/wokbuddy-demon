@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -144,6 +145,44 @@ func (c *Client) HeatmapYesterdayMissed(a *auth.Auth) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// HeatmapMissedDays 返回 [startDay, endDay]（CST 自然日，含端点）内未签到的日期，
+// 升序排列。heatmap 接口一次返回当月/近期格子；区间外的格子忽略。
+func (c *Client) HeatmapMissedDays(a *auth.Auth, startDay, endDay string) ([]string, error) {
+	data, err := c.growthJSON(a, http.MethodGet, "/activity/growth/heatmap", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		Cells []struct {
+			Date  string `json:"date"`
+			Score int    `json:"score"`
+		} `json:"cells"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("HeatmapMissedDays: %w", err)
+	}
+
+	out := make([]string, 0, len(resp.Cells))
+
+	for _, cell := range resp.Cells {
+		day := cell.Date
+		if len(day) > 10 {
+			day = day[:10]
+		}
+
+		if len(day) != 10 || day < startDay || day > endDay || cell.Score != 0 {
+			continue
+		}
+
+		out = append(out, day)
+	}
+
+	slices.Sort(out)
+
+	return out, nil
 }
 
 // UseMakeupCard 对指定日期使用补签卡（保住连登连续天数；无卡返回业务错误）。

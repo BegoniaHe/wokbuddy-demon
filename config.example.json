@@ -103,7 +103,9 @@
     "multimodal_routing": false,
     "local_web_tools": false,
     "local_web_tool_rounds": 3,
-    "search_endpoint": false
+    "search_endpoint": false,
+    "images_endpoint": false,
+    "conversation_request_body": false
   },
   "prompt": {
     "mode": "passthrough",

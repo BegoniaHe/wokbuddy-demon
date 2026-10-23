@@ -57,6 +57,9 @@ func ErrorFramePayload(err error) string {
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// EmptyStreamError 返回空流哨兵（供 handler 在首帧预览阶段复用同一末端映射）。
+func EmptyStreamError() error { return errEmptyStream }
+
 // IsTruncatedStreamError 报告错误是否为「上游流被截断」（EOF 收尾但从未收到
 // data: [DONE]）。截断按上游失败处置：账号不记成功、不绑粘性（issue #105）。
 func IsTruncatedStreamError(err error) bool { return errors.Is(err, errTruncatedStream) }
@@ -198,6 +201,13 @@ func (a *streamAggregator) handleChunk(chunk map[string]any) error {
 		}
 
 		return &FrameError{Payload: string(payload)}
+	}
+	// 顶层 {code,msg} 业务错误帧：与 error 帧同口径上抛，不能聚合成功（issue #244）。
+	payload, err := json.Marshal(chunk)
+	if err == nil {
+		if _, _, isErr := BusinessFrameError(string(payload)); isErr {
+			return &FrameError{Payload: string(payload)}
+		}
 	}
 
 	a.mergeChunkMeta(chunk)
@@ -1287,6 +1297,8 @@ func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall)
 
 // writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 // 仅 JSON 解析成功时计数记为一次有效转发（JSON 解析失败照常降级原样写出，但不计数）。
+//
+//nolint:cyclop // 帧类型按 error/业务错误/修复/普通分派，线性更直观。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil {
@@ -1308,6 +1320,19 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 		}
 
 		if werr := s.writeRaw(payload); werr != nil {
+			return 0, werr
+		}
+
+		return 1, nil
+	}
+	// 顶层 {code,msg} 业务错误帧（issue #244）：原帧若直接走白名单会被洗成空
+	// chunk。观察者拿原始 payload 分类，客户端拿带原始 code/msg 的 error 帧。
+	if code, msg, isErr := BusinessFrameError(payload); isErr {
+		if s.opts.onErrorFrame != nil {
+			s.opts.onErrorFrame(payload)
+		}
+
+		if werr := s.writeRaw(BusinessErrorFrame(payload, code, msg)); werr != nil {
 			return 0, werr
 		}
 
