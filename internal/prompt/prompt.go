@@ -127,14 +127,14 @@ func Append(body []byte, systemPrompt string) []byte {
 
 // decodeBody 解析 OpenAI 请求体，供 Rewrite/Append 共用：
 // 空 body 或空 systemPrompt 直接判否（调用方原样返回，绝不失败）；
-// JSON 解析失败同样判否。
+// JSON 解析失败或顶层为 null 同样判否（nil map 不可写入，否则后续赋值 panic）。
 func decodeBody(body []byte, systemPrompt string) (map[string]any, bool) {
 	if len(body) == 0 || systemPrompt == "" {
 		return nil, false
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
 		return nil, false
 	}
 

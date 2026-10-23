@@ -38,8 +38,8 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
+	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+		return body // 坏 body / 顶层 null：无字段可写，保持原文
 	}
 	// 优先级 1：客户端已显式带 key → 绝不覆盖。
 	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {

@@ -210,6 +210,22 @@ func TestRewriteInvalidJSONReturnedAsIs(t *testing.T) {
 	}
 }
 
+// TestRewriteAppendNullBodyReturnedAsIs 顶层 null 解析为 nil map：改写必须原样返回，
+// 不能对 nil map 赋值（custom/append 模式下客户端可远程触发 panic）。
+func TestRewriteAppendNullBodyReturnedAsIs(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`null`)
+
+	if out := Rewrite(body, "SYS"); string(out) != string(body) {
+		t.Errorf("Rewrite(null) = %s, want 原样返回", out)
+	}
+
+	if out := Append(body, "SYS"); string(out) != string(body) {
+		t.Errorf("Append(null) = %s, want 原样返回", out)
+	}
+}
+
 func TestRewriteEmptyBodyReturnedAsIs(t *testing.T) {
 	t.Parallel()
 
