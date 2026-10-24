@@ -151,7 +151,7 @@ const maxStreakPayloadLen = 220
 func compactJSON(raw json.RawMessage) string {
 	s := string(raw)
 	if len(s) > maxStreakPayloadLen {
-		return s[:220] + "…"
+		return s[:maxStreakPayloadLen] + "…"
 	}
 
 	return s
