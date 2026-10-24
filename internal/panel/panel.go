@@ -1250,8 +1250,8 @@ func parseUsageWindow(r *http.Request) usage.Window {
 		}
 	}
 
-	if win.Hours > minutesPerDay {
-		win.Hours = minutesPerDay
+	if win.Hours > maxUsageWindowHours {
+		win.Hours = maxUsageWindowHours
 	}
 
 	return win
@@ -1454,7 +1454,7 @@ type creditGrant struct {
 }
 
 const (
-	minutesPerDay        = 24 * 60
+	maxUsageWindowHours  = 24 * 60
 	epochMillisThreshold = 1e12
 	largePackageMinSize  = 1500
 )
