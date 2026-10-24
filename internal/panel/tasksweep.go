@@ -168,7 +168,9 @@ func (p *Panel) sweepAccount(ctx context.Context, account *auth.Auth) TaskSweepS
 }
 
 // claimAll 逐项补领（账号内串行，ctx 取消后不再继续）。
-func (p *Panel) claimAll(account *auth.Auth, tasks []sweepTask, canceled func() error) (claimed int, credit, energy int64, failed int) {
+func (p *Panel) claimAll(
+	account *auth.Auth, tasks []sweepTask, canceled func() error,
+) (claimed int, credit, energy int64, failed int) {
 	for i := range tasks {
 		if canceled() != nil {
 			return claimed, credit, energy, failed

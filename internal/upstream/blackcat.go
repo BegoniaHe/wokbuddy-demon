@@ -89,23 +89,17 @@ func (c *Client) RunNightChats(account *auth.Auth, need int) (int64, error) {
 
 // ClaimGift 领取新手礼包（每号一次，已领返回业务错误）。
 func (c *Client) ClaimGift(a *auth.Auth) (int64, error) {
-	data, err := c.billingJSON(a, "/billing/meter/claim-gift", map[string]any{})
-	if err != nil {
-		return 0, err
-	}
-
-	var resp struct {
-		Credit int64 `json:"credit"`
-	}
-
-	_ = json.Unmarshal(data, &resp)
-
-	return resp.Credit, nil
+	return c.claimCredit(a, "/billing/meter/claim-gift")
 }
 
 // ClaimCompensation 领取活动补偿（有则领，无则业务错误）。
 func (c *Client) ClaimCompensation(a *auth.Auth) (int64, error) {
-	data, err := c.billingJSON(a, "/billing/meter/claim-compensation", map[string]any{})
+	return c.claimCredit(a, "/billing/meter/claim-compensation")
+}
+
+// claimCredit 调用领取类接口并解析 credit 字段。
+func (c *Client) claimCredit(a *auth.Auth, path string) (int64, error) {
+	data, err := c.billingJSON(a, path, map[string]any{})
 	if err != nil {
 		return 0, err
 	}

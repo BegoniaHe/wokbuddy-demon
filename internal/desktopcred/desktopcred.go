@@ -19,7 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +31,9 @@ import (
 var (
 	errAuthObjectMissing                    = errors.New("auth object missing")
 	errAccessTokenRefreshTokenIsEmpty       = errors.New("accessToken/refreshToken is empty")
-	errInvalidAtRestSecretExpectedCanonical = errors.New("invalid at-rest secret: expected canonical base64 of 32 bytes")
+	errInvalidAtRestSecretExpectedCanonical = errors.New(
+		"invalid at-rest secret: expected canonical base64 of 32 bytes",
+	)
 	errDecryptFieldFailed                   = errors.New("decryptField failed")
 	errUnsupportedWBEncryptedVersion        = errors.New("unsupported $wbEncrypted version")
 	errOpenWrapperFailed                    = errors.New("openWrapper failed")
@@ -119,7 +121,7 @@ func Discover() []string {
 		}
 	}
 
-	sort.Strings(out)
+	slices.Sort(out)
 
 	return out
 }

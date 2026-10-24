@@ -20,7 +20,9 @@ import (
 
 // newChatInput 读取并解码入站请求，返回传输无关输入与输出端口。返回 false
 // 表示请求体读取失败、已写出错误响应（核心不启动）。
-func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duration, maxBodyBytes int64) (chatInput, chatResponder, bool) {
+func newChatInput(
+	w http.ResponseWriter, r *http.Request, keepalive time.Duration, maxBodyBytes int64,
+) (chatInput, chatResponder, bool) {
 	// 解析前先套上网关侧上限（server.max_body_bytes，0 = 不限制）：Content-Length
 	// 与 chunked 都由 MaxBytesReader 约束，超限不进入选号与上游请求。
 	limitRequestBody(w, r, maxBodyBytes)
@@ -46,10 +48,17 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 
 	_ = json.Unmarshal(body, &peek)
 
-	chatInput2 := chatInput{
+	chatInput2 := newChatInputFromRequest(r, body, peek.Stream, peek.Model)
+
+	return chatInput2, &httpResponder{w: w, keepalive: keepalive}, true
+}
+
+// newChatInputFromRequest 从 HTTP 请求提取传输无关的聊天输入。
+func newChatInputFromRequest(r *http.Request, body []byte, stream bool, model string) chatInput {
+	return chatInput{
 		body:           body,
-		stream:         peek.Stream,
-		model:          peek.Model,
+		stream:         stream,
+		model:          model,
 		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
 		traceID:        r.Header.Get("X-Trace-Id"),
 		inboundSession: inboundSessionMetaFrom(r),
@@ -57,8 +66,6 @@ func newChatInput(w http.ResponseWriter, r *http.Request, keepalive time.Duratio
 		keyUsage:       keyUsageFrom(r.Context()),
 		keyRealm:       keyRealmFrom(r.Context()),
 	}
-
-	return chatInput2, &httpResponder{w: w, keepalive: keepalive}, true
 }
 
 // limitRequestBody 用 http.MaxBytesReader 包住请求体；limit<=0 表示不限制。
@@ -103,7 +110,9 @@ func (r *httpResponder) Header(name, value string) {
 
 // Stream 把上游 SSE 透传给客户端。SSE 头与帧格式由 upstream.StreamHint 负责
 // （本仓出站协议层，未改动），适配器只负责挂接选项与写入目标。
-func (r *httpResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
+func (r *httpResponder) Stream(
+	rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string),
+) error {
 	opts := make([]upstream.StreamOption, 0, 2)
 	if onErrFrame != nil {
 		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))

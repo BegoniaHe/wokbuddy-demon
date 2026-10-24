@@ -127,6 +127,7 @@ func loadConfig(path string) (*Config, error) {
 	return Load("")
 }
 
+//nolint:funlen,maintidx // CLI 入口装配线性展开。
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 
@@ -213,7 +214,9 @@ func loadConfigAndAuths(path string) (*Config, []*auth.Auth, error) {
 // cleanupRuntime 停机清理：先 pool.Close()（最后一次 Flush → SaveState
 // 已提交到 store），再 store.Close() 排空在途异步写（最后一笔 Redis 镜像
 // 必须写完才关连接），最后停会话 GC 与通知器。
-func cleanupRuntime(state *pool.Pool, store redisstore.Store, sessRouter *session.Router, notifier *notify.Notifier) {
+func cleanupRuntime(
+	state *pool.Pool, store redisstore.Store, sessRouter *session.Router, notifier *notify.Notifier,
+) {
 	state.Close()
 	_ = store.Close()
 
@@ -227,7 +230,9 @@ func cleanupRuntime(state *pool.Pool, store redisstore.Store, sessRouter *sessio
 }
 
 // setupPool 装配账号池、Redis 镜像与会话粘性路由。
-func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *session.Router, string, func() int) {
+func setupPool(
+	cfg *Config, auths []*auth.Auth,
+) (*pool.Pool, redisstore.Store, *session.Router, string, func() int) {
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 	state := pool.New(cfg.StateFile)
@@ -243,22 +248,7 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 	state.SetMaxInFlightTotal(cfg.Pool.MaxInFlightTotal)   // 网关级全局在途上限（issue #92）
 	applyDailyLimits(state, cfg)
 	state.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
-	state.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
-	state.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
-	state.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
-	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
-	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
-	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)
-	state.SetScheduling(pool.Scheduling{
-		Strategy: map[string]pool.Strategy{
-			"cn":     pool.Strategy(cfg.Pool.Strategy.CN),
-			"global": pool.Strategy(cfg.Pool.Strategy.Global),
-		},
-		Order: map[string][]string{
-			"cn":     cfg.Pool.AccountOrder.CN,
-			"global": cfg.Pool.AccountOrder.Global,
-		},
-	})
+	applyPoolConfig(state, cfg)
 
 	// 会话粘性路由（可配关闭）。
 	sessRouter, redisMode, sessCount := setupSessionRouter(cfg, store, state)
@@ -267,7 +257,9 @@ func setupPool(cfg *Config, auths []*auth.Auth) (*pool.Pool, redisstore.Store, *
 }
 
 // setupUpstream 装配上游客户端、通知器与调度器，并注入账号路由与倍率读取。
-func setupUpstream(cfg *Config, state2 *pool.Pool) (*upstream.Client, *notify.Notifier, *scheduler.Scheduler, error) {
+func setupUpstream(
+	cfg *Config, state2 *pool.Pool,
+) (*upstream.Client, *notify.Notifier, *scheduler.Scheduler, error) {
 	// 出站 DNS 必须在 upstream.New() **之前**注入：Transport/Dialer（含 Resolver）
 	// 在 New() 内一次性构造，运行期改无效——所以 dns_servers 被列为「需重启」。
 	// 空 = 系统解析器（零回归）；internal/server/localwebtools.go 的 SSRF 专用
@@ -330,7 +322,9 @@ type observability struct {
 	agents  *agentcfg.Manager
 }
 
-// newPanel 构造管理面板：所有可热改字段经 live 快照读取，重启项由 cfg 静态持有。
+// newPanel 构造管理面板：所有可改字段经 live 快照读取，重启项由 cfg 静态持有。
+//
+//nolint:revive // 装配参数多，拆 struct 只会把构造噪音转移到调用点。
 func newPanel(
 	cfg *Config, cfgPath string, state *pool.Pool, client4 *upstream.Client, sch *scheduler.Scheduler,
 	redisMode string, sessCount func() int, obs *observability, trustedProxies []*net.IPNet,
@@ -338,7 +332,9 @@ func newPanel(
 	// 积分变动账本（issue #201 / 上游 #138）：与 state 文件同目录，余额观测回调在
 	// 装配期挂上（New() 之后、开始服务之前，运行期只读）。账本是观测附属物：
 	// 写盘失败只记日志，不影响余额查询主路径。
-	creditLedger := credithist.Open(stateSibling(cfg.StateFile, "credit-history.json"), credithist.DefaultMaxEntries)
+	creditLedger := credithist.Open(
+		stateSibling(cfg.StateFile, "credit-history.json"), credithist.DefaultMaxEntries,
+	)
 	client4.BalanceObserver = func(uid string, remain, _ int64) {
 		creditLedger.Observe(uid, remain, "")
 		creditLedger.Flush() // 只在该账号余额变化时才写（低频），无需额外后台协程
@@ -387,20 +383,7 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
 	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
-	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
-		MultimodalRouting:    cfg.Features.MultimodalRouting,
-		SearchEndpoint:       cfg.Features.SearchEndpoint,
-		ImagesEndpoint:       cfg.Features.ImagesEndpoint,
-		LocalWebTools:        cfg.Features.LocalWebTools,
-		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
-		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
-		BackgroundTarget:     cfg.Models.BackgroundTarget,
-		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
-	})
+	live := livecfg.New(liveSnapshot(cfg))
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
 	usagePath := usagePathFor(cfg.StateFile)
@@ -448,6 +431,8 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 }
 
 // serve 启动定时任务与 HTTP 监听，并在收到退出信号后等待在途流排空。
+//
+//nolint:funlen,maintidx // 启动/监听/优雅退出线性装配。
 func serve(
 	ctx context.Context,
 	cfg *Config,
@@ -511,7 +496,8 @@ func serve(
 		_ = srv.Shutdown(shutdownCtx)
 
 		if n := handler.ActiveStreams(); n > 0 {
-			log.Printf("WARN: [server] graceful shutdown timed out with %d in-flight SSE stream(s) still active; forcing exit", n)
+			log.Printf("WARN: [server] graceful shutdown timed out with %d in-flight SSE stream(s) "+
+				"still active; forcing exit", n)
 		}
 	}()
 
@@ -536,6 +522,8 @@ func serve(
 //
 // 失败处理：单域失败只记 WARN（不阻塞、不致命——后续懒触发仍会补上）；global 域
 // 仅在其路由开关开启时预热（逃生门关锁时按 CN 处理，无需探测）。
+//
+//nolint:nestif // 预热按域线性分层，拆开反而割裂失败处理。
 func warmModelRates(ctx context.Context, client *upstream.Client, state7 *pool.Pool) {
 	// 预热不得拖住进程退出：ctx 取消（SIGINT/SIGTERM）时立刻放弃剩余域。
 	if ctx.Err() != nil {
@@ -580,7 +568,9 @@ func warmGlobalModelRates(client2 *upstream.Client, state4 *pool.Pool) {
 
 // setupSessionRouter 按配置装配会话粘性路由，并返回 redis 模式串与粘性计数闭包。
 // 关闭时不创建路由（返回 nil），redisMode 仍按 store 类型判定。
-func setupSessionRouter(cfg *Config, store redisstore.Store, state5 *pool.Pool) (*session.Router, string, func() int) {
+func setupSessionRouter(
+	cfg *Config, store redisstore.Store, state5 *pool.Pool,
+) (*session.Router, string, func() int) {
 	redisMode := "noop"
 	if _, ok := store.(redisstore.Noop); !ok {
 		redisMode = "upstash"
@@ -616,6 +606,8 @@ func setupSessionRouter(cfg *Config, store redisstore.Store, state5 *pool.Pool) 
 
 // configureUpstream 把 config 的 HTTP 超时、脱敏开关、UA / 归属头、global 路由与
 // model.json 缓存路径注入出站客户端。装配期一次性捕获，改动需重启。
+//
+//nolint:funlen,maintidx // 装配字段多，线性赋值更易核对。
 func configureUpstream(cfg *Config, client *upstream.Client) error {
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	client.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -819,7 +811,8 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
+//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/
+//     SetPreferExpiring/SetCreditFloor
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
@@ -896,7 +889,7 @@ func saveConfigInternal(
 	}
 
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+	if err := os.WriteFile(tmp, out, 0o600); err != nil { //nolint:gosec // 配置路径来自本机启动参数 / 环境变量
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 
@@ -946,22 +939,49 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 	return merged, oldCfg, newCfg, nil
 }
 
-// applyRuntimeConfig 应用可热生效字段（池参数 / 排程 / 密钥 / 脱敏）。
-func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool, client3 *upstream.Client, sch *scheduler.Scheduler) {
-	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
-		MultimodalRouting:    newCfg.Features.MultimodalRouting,
-		SearchEndpoint:       newCfg.Features.SearchEndpoint,
-		ImagesEndpoint:       newCfg.Features.ImagesEndpoint,
-		LocalWebTools:        newCfg.Features.LocalWebTools,
-		LocalWebToolRounds:   newCfg.Features.LocalWebToolRounds,
-		BackgroundNames:      backgroundNameSet(newCfg.Models.BackgroundNames),
-		BackgroundTarget:     newCfg.Models.BackgroundTarget,
-		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
+// applyPoolConfig 应用池的软冷却/成本探索/保底/权重/排程参数。
+func applyPoolConfig(state *pool.Pool, cfg *Config) {
+	state.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
+	state.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（默认 30m；0 关停）
+	state.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
+	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)
+	state.SetScheduling(pool.Scheduling{
+		Strategy: map[string]pool.Strategy{
+			"cn":     pool.Strategy(cfg.Pool.Strategy.CN),
+			"global": pool.Strategy(cfg.Pool.Strategy.Global),
+		},
+		Order: map[string][]string{
+			"cn":     cfg.Pool.AccountOrder.CN,
+			"global": cfg.Pool.AccountOrder.Global,
+		},
 	})
+}
+
+// liveSnapshot 把配置中可热改字段投影为 livecfg 快照。
+func liveSnapshot(cfg *Config) livecfg.Snapshot {
+	return livecfg.Snapshot{
+		APIKey:               cfg.APIKey,
+		SoftCooldown:         cfg.SoftRateDur,
+		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		MultimodalRouting:    cfg.Features.MultimodalRouting,
+		SearchEndpoint:       cfg.Features.SearchEndpoint,
+		ImagesEndpoint:       cfg.Features.ImagesEndpoint,
+		LocalWebTools:        cfg.Features.LocalWebTools,
+		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
+		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
+		BackgroundTarget:     cfg.Models.BackgroundTarget,
+		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+	}
+}
+
+// applyRuntimeConfig 应用可热生效字段（池参数 / 排程 / 密钥 / 脱敏）。
+func applyRuntimeConfig(
+	newCfg *Config, live *livecfg.Holder, state9 *pool.Pool, client3 *upstream.Client, sch *scheduler.Scheduler,
+) {
+	live.Store(liveSnapshot(newCfg))
 	client3.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	client3.ConversationRequestBody.Store(newCfg.Features.ConversationRequestBody)
 	state9.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
@@ -970,22 +990,7 @@ func applyRuntimeConfig(newCfg *Config, live *livecfg.Holder, state9 *pool.Pool,
 	state9.SetMaxInFlightTotal(newCfg.Pool.MaxInFlightTotal)
 	applyDailyLimits(state9, newCfg)
 	state9.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
-	state9.SetSoftRateMax(newCfg.SoftRateMaxDur)
-	state9.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
-	state9.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
-	state9.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
-	state9.SetPreferExpiring(newCfg.Pool.PreferExpiring)
-	state9.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback)
-	state9.SetScheduling(pool.Scheduling{
-		Strategy: map[string]pool.Strategy{
-			"cn":     pool.Strategy(newCfg.Pool.Strategy.CN),
-			"global": pool.Strategy(newCfg.Pool.Strategy.Global),
-		},
-		Order: map[string][]string{
-			"cn":     newCfg.Pool.AccountOrder.CN,
-			"global": newCfg.Pool.AccountOrder.Global,
-		},
-	})
+	applyPoolConfig(state9, newCfg)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -1010,7 +1015,7 @@ func backupConfigFile(path string, raw []byte) error {
 	backup := configBackupPath(path)
 
 	tmp := backup + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil { //nolint:gosec // 备份路径派生自本机配置路径
 		return fmt.Errorf("write config backup: %w", err)
 	}
 
@@ -1127,7 +1132,7 @@ func restartRequiredFields(oldCfg, newCfg *Config) []string {
 // configDoc 把配置序列化为按 JSON 路径取值的 map（解析后的 time.Duration
 // 字段带 json:"-"，不会参与比较）。
 func configDoc(c *Config) map[string]any {
-	raw, err := json.Marshal(c)
+	raw, err := json.Marshal(c) //nolint:gosec // config 本就是凭据载体，落盘为设计行为
 	if err != nil {
 		return nil
 	}

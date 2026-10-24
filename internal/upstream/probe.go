@@ -143,29 +143,12 @@ func (p *StreamProbe) inspectLine(line string) {
 }
 
 // inspectChoices 累计正文/工具调用并读取 finish_reason。
-//
-//nolint:cyclop // 逐 choice 解析 delta/message 与终态，线性分支更直观。
 func (p *StreamProbe) inspectChoices(frame map[string]any) {
-	choices, _ := frame["choices"].([]any)
-
-	for _, raw := range choices {
-		choice, _ := raw.(map[string]any)
-		if choice == nil {
-			continue
-		}
-
-		if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+	walkChoiceDeltas(frame, func(fr string) {
+		if fr != "" {
 			p.FinishReason = fr
 		}
-
-		if delta, ok := choice["delta"].(map[string]any); ok {
-			p.inspectDelta(delta)
-		}
-
-		if msg, ok := choice["message"].(map[string]any); ok {
-			p.inspectDelta(msg)
-		}
-	}
+	}, p.inspectDelta)
 
 	if p.hasSubstantive() {
 		return

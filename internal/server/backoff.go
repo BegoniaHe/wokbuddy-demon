@@ -30,7 +30,7 @@ func jitterDur(duration time.Duration) time.Duration {
 		return duration
 	}
 
-	f := 1 + (rand.Float64()*2-1)*jitterFraction
+	f := 1 + (rand.Float64()*2-1)*jitterFraction //nolint:gosec // 退避抖动，非安全用途
 
 	out := time.Duration(float64(duration) * f)
 	if out < 0 {

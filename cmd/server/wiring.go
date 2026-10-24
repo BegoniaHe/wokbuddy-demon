@@ -62,6 +62,8 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 }
 
 // realmAwareAvailableOne 构造会话粘性快路径的单账号可用性闭包。
+//
+//nolint:dupl // 与 realmAwareStickyLowLoad 形似但参数顺序不同；共享 helper 曾导致实参错位。
 func realmAwareAvailableOne(p *pool.Pool) func(model, uid string) bool {
 	return func(model, uid string) bool {
 		realm, bare := server.ResolveModel(model)
@@ -70,6 +72,8 @@ func realmAwareAvailableOne(p *pool.Pool) func(model, uid string) bool {
 }
 
 // realmAwareStickyLowLoad 构造粘性降级窗口结束后的低水位判定闭包。
+//
+//nolint:dupl // 同 realmAwareAvailableOne：参数顺序不同，不能共用同一 adapter。
 func realmAwareStickyLowLoad(p *pool.Pool) func(model, uid string) bool {
 	return func(model, uid string) bool {
 		realm, bare := server.ResolveModel(model)
@@ -103,8 +107,13 @@ func setDailyUsageProvider(p *pool.Pool, rec *usage.Recorder) {
 }
 
 // buildProxySlotDials 构造账号代理槽的拨号器（issue #96）。
-func buildProxySlotDials(cfg *Config) map[string]func(ctx context.Context, network, addr string) (net.Conn, error) {
-	out := make(map[string]func(ctx context.Context, network, addr string) (net.Conn, error), len(cfg.Upstream.ProxySlots))
+func buildProxySlotDials(
+	cfg *Config,
+) map[string]func(ctx context.Context, network, addr string) (net.Conn, error) {
+	out := make(
+		map[string]func(ctx context.Context, network, addr string) (net.Conn, error),
+		len(cfg.Upstream.ProxySlots),
+	)
 	for _, slot := range cfg.Upstream.ProxySlots {
 		if !slot.Enabled {
 			continue
@@ -140,12 +149,14 @@ func configureAccountRouting(state2 *pool.Pool, up *upstream.Client, cfg *Config
 
 	var missingSlots sync.Map
 
-	up.AccountRoute = func(a *auth.Auth) (string, func(ctx context.Context, network, addr string) (net.Conn, error)) {
-		if a == nil {
+	up.AccountRoute = func(
+		acct *auth.Auth,
+	) (string, func(ctx context.Context, network, addr string) (net.Conn, error)) {
+		if acct == nil {
 			return "", nil
 		}
 
-		slot := state2.ProxySlotOf(a.UID)
+		slot := state2.ProxySlotOf(acct.UID)
 		if slot == "" {
 			return "", nil
 		}

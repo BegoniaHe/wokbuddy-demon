@@ -24,7 +24,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
@@ -76,7 +76,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	sort.Strings(files)
+	slices.Sort(files)
 
 	profiles, perr := loadProfiles()
 	if perr != nil {
@@ -143,7 +143,7 @@ func collectTrialRows(files []string, up *upstream.Client) []trialRow {
 func trialForFile(str string, client *upstream.Client) trialRow {
 	r := trialRow{uid: filepath.Base(str)}
 
-	raw, err := os.ReadFile(str)
+	raw, err := os.ReadFile(str) //nolint:gosec // 路径来自本机 CLI 参数，非远程输入
 	if err != nil {
 		r.status, r.detail = trialFailed, "load: "+err.Error()
 		return r

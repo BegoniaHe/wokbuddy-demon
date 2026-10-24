@@ -42,7 +42,9 @@ type TextContinueReader struct {
 }
 
 // NewTextContinueReader 包装上游流。initialText 是 ProbeStream 已消费的正文。
-func NewTextContinueReader(src io.ReadCloser, initialText string, hasTool bool, open ContinueOpener) *TextContinueReader {
+func NewTextContinueReader(
+	src io.ReadCloser, initialText string, hasTool bool, open ContinueOpener,
+) *TextContinueReader {
 	r := &TextContinueReader{
 		src: src, reader: bufio.NewReaderSize(src, 64*1024), open: open, hasTool: hasTool,
 	}
@@ -97,7 +99,7 @@ func (c *TextContinueReader) Close() error {
 
 // handleLine 处理一行：解析 finish_reason/正文，必要时暂存 length 终态。
 //
-//nolint:cyclop // 行类型分派 + 终态暂存，保持单入口避免状态散落。
+//nolint:cyclop,funlen,gocyclo // 行类型分派 + 终态暂存，保持单入口避免状态散落。
 func (c *TextContinueReader) handleLine(line string) {
 	trimmed := strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(trimmed, "data: ") {
@@ -179,6 +181,8 @@ func (c *TextContinueReader) holdLengthFrame(line string, frame map[string]any) 
 }
 
 // frameHasSubstantive 报告帧是否携带正文/拒答/工具调用。
+//
+//nolint:gocognit // 正文/拒答/工具调用判定按优先级线性展开。
 func frameHasSubstantive(frame map[string]any) bool {
 	choices, _ := frame["choices"].([]any)
 
@@ -315,6 +319,15 @@ func (c *TextContinueReader) inspectFrame(frame map[string]any) {
 		}
 	}
 
+	walkChoiceDeltas(frame, func(fr string) {
+		if fr == "length" {
+			c.finishLength = true
+		}
+	}, c.inspectDelta)
+}
+
+// forEachChoice 遍历帧内非空 choices。
+func forEachChoice(frame map[string]any, visit func(choice map[string]any)) {
 	choices, _ := frame["choices"].([]any)
 
 	for _, raw := range choices {
@@ -323,18 +336,25 @@ func (c *TextContinueReader) inspectFrame(frame map[string]any) {
 			continue
 		}
 
-		if fr, ok := choice["finish_reason"].(string); ok && fr == "length" {
-			c.finishLength = true
+		visit(choice)
+	}
+}
+
+// walkChoiceDeltas 遍历 choices，回调 finish_reason 与 delta/message。
+func walkChoiceDeltas(frame map[string]any, handleFinish func(string), inspect func(map[string]any)) {
+	forEachChoice(frame, func(choice map[string]any) {
+		if fr, ok := choice["finish_reason"].(string); ok {
+			handleFinish(fr)
 		}
 
 		if delta, ok := choice["delta"].(map[string]any); ok {
-			c.inspectDelta(delta)
+			inspect(delta)
 		}
 
 		if msg, ok := choice["message"].(map[string]any); ok {
-			c.inspectDelta(msg)
+			inspect(msg)
 		}
-	}
+	})
 }
 
 // inspectDelta 累计正文与工具调用。

@@ -29,6 +29,18 @@ var ErrProxyDial = errors.New("outbound proxy dial failed")
 const (
 	dialTimeout   = 10 * time.Second
 	dialKeepAlive = 15 * time.Second
+
+	// SOCKS5 协议常量（RFC 1928 / RFC 1929）。
+	socks5Version         = 0x05
+	socks5AuthNone        = 0x00
+	socks5AuthUserPass    = 0x02
+	socks5AuthNoAvailable = 0xff
+	socks5CmdConnect      = 0x01
+	socks5AtypIPv4        = 0x01
+	socks5AtypDomain      = 0x03
+	socks5AtypIPv6        = 0x04
+	socks5ReplySuccess    = 0x00
+	maxSocks5HostLen      = 255
 )
 
 // handshakeTimeout 代理握手（HTTP CONNECT / SOCKS5 协商+认证+CONNECT）的一次性
@@ -92,7 +104,8 @@ func ParseProxy(raw string) (*Proxy, error) {
 	switch scheme {
 	case "http", "https", "socks5", "socks5h":
 	default:
-		return nil, fmt.Errorf("proxy: 不支持的 scheme %q（http/https/socks5/socks5h）: %w", url2.Scheme, errParseProxyFailed)
+		return nil, fmt.Errorf("proxy: 不支持的 scheme %q（http/https/socks5/socks5h）: %w",
+			url2.Scheme, errParseProxyFailed)
 	}
 
 	host := url2.Hostname()
@@ -140,7 +153,7 @@ func (p *Proxy) dial(ctx context.Context, network, addr string) (net.Conn, error
 	return p.dialHTTPConnect(ctx, addr)
 }
 
-func (p *Proxy) dialer() *net.Dialer {
+func (*Proxy) dialer() *net.Dialer {
 	return &net.Dialer{Timeout: dialTimeout, KeepAlive: dialKeepAlive}
 }
 
@@ -225,7 +238,8 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 
 	reader := bufio.NewReader(conn)
 	// CONNECT 的 200 响应无 body；不读 resp.Body（它即隧道本体），仅取状态码。
-	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect}) //nolint:bodyclose // CONNECT 200 的 resp.Body 即隧道本体，不可关闭
+	//nolint:bodyclose // CONNECT 200 的 resp.Body 即隧道本体，不可关闭
+	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("dialHTTPConnect: %w", err)
@@ -284,12 +298,12 @@ func (p *Proxy) socks5Handshake(conn net.Conn, addr string) error {
 
 // socks5Negotiate 完成版本/方法协商与（可选）用户名密码认证。
 func (p *Proxy) socks5Negotiate(conn net.Conn) error {
-	methods := []byte{0x00} // no-auth
+	methods := []byte{socks5AuthNone} // no-auth
 	if p.user != "" {
-		methods = []byte{0x00, 0x02} // no-auth + username/password
+		methods = []byte{socks5AuthNone, socks5AuthUserPass} // no-auth + username/password
 	}
 
-	greet := append([]byte{0x05, byte(len(methods))}, methods...) //nolint:gosec // methods 长度固定 ≤2
+	greet := append([]byte{socks5Version, byte(len(methods))}, methods...) //nolint:gosec // methods 长度固定 ≤2
 	if _, err := conn.Write(greet); err != nil {
 		return fmt.Errorf("socks5Negotiate: %w", err)
 	}
@@ -299,16 +313,16 @@ func (p *Proxy) socks5Negotiate(conn net.Conn) error {
 		return fmt.Errorf("socks5Negotiate: %w", err)
 	}
 
-	if sel[0] != 0x05 {
+	if sel[0] != socks5Version {
 		return errSocks5
 	}
 
 	switch sel[1] {
-	case 0x00:
+	case socks5AuthNone:
 		return nil
-	case 0x02:
+	case socks5AuthUserPass:
 		return p.socks5UserPass(conn)
-	case 0xff:
+	case socks5AuthNoAvailable:
 		return errSocks52
 	default:
 		return fmt.Errorf("socks5: 不支持的认证方式 %#x: %w", sel[1], errSocks5NegotiateFailed)
@@ -316,7 +330,7 @@ func (p *Proxy) socks5Negotiate(conn net.Conn) error {
 }
 
 // socks5Connect 发送 CONNECT 请求并读取应答。
-func (p *Proxy) socks5Connect(conn net.Conn, addr string) error {
+func (*Proxy) socks5Connect(conn net.Conn, addr string) error {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("socks5Connect: %w", err)
@@ -327,21 +341,21 @@ func (p *Proxy) socks5Connect(conn net.Conn, addr string) error {
 		return fmt.Errorf("socks5: 非法端口 %q: %w", portStr, errSocks5ConnectFailed)
 	}
 
-	req := []byte{0x05, 0x01, 0x00} // CONNECT
+	req := []byte{socks5Version, socks5CmdConnect, socks5AuthNone} // CONNECT
 
 	switch ip := net.ParseIP(host); {
 	case ip == nil:
-		if len(host) > 255 {
+		if len(host) > maxSocks5HostLen {
 			return errSocks5Host
 		}
 
-		req = append(req, 0x03, byte(len(host))) //nolint:gosec // len ≤255 已校验
+		req = append(req, socks5AtypDomain, byte(len(host))) //nolint:gosec // len ≤255 已校验
 		req = append(req, host...)
 	case ip.To4() != nil:
-		req = append(req, 0x01)
+		req = append(req, socks5AtypIPv4)
 		req = append(req, ip.To4()...)
 	default:
-		req = append(req, 0x04)
+		req = append(req, socks5AtypIPv6)
 		req = append(req, ip.To16()...)
 	}
 
@@ -360,22 +374,22 @@ func socks5ReadReply(conn net.Conn) error {
 		return fmt.Errorf("socks5ReadReply: %w", err)
 	}
 
-	if head[0] != 0x05 {
+	if head[0] != socks5Version {
 		return errSocks53
 	}
 
-	if head[1] != 0x00 {
+	if head[1] != socks5ReplySuccess {
 		return fmt.Errorf("socks5: CONNECT 失败（rep=%#x）: %w", head[1], errSocks5ReadReplyFailed)
 	}
 
 	var n int
 
 	switch head[3] {
-	case 0x01:
+	case socks5AtypIPv4:
 		n = 4
-	case 0x04:
+	case socks5AtypIPv6:
 		n = 16
-	case 0x03:
+	case socks5AtypDomain:
 		var l [1]byte
 		if _, err := io.ReadFull(conn, l[:]); err != nil {
 			return fmt.Errorf("socks5ReadReply: %w", err)
@@ -415,7 +429,7 @@ func (p *Proxy) socks5UserPass(conn net.Conn) error {
 		return fmt.Errorf("socks5UserPass: %w", err)
 	}
 
-	if rep[1] != 0x00 {
+	if rep[1] != socks5ReplySuccess {
 		return errSocks55
 	}
 

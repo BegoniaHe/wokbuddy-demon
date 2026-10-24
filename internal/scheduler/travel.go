@@ -152,13 +152,18 @@ func (s *Scheduler) travelAll(ctx context.Context) (total, success, failure int)
 	return s.runPacedBatch(ctx, taskTravel, travelAccountDelay, targets)
 }
 
+// travelLookupFailed 记录旅行查询失败并通知。
+func (s *Scheduler) travelLookupFailed(account *auth.Auth, stage string, err error) {
+	log.Printf("travel %s: %s: %v", logfmt.Label(account.UID, account.NicknameValue()), stage, err)
+	s.notifyTaskFailed("travel", account.UID, account.NicknameValue(), account.Realm())
+}
+
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
 // 返回 false 仅表示上游查询/动作真实失败；「已领养/门槛未达/旅行中」属正常跳过。
 func (s *Scheduler) travelOne(account3 *auth.Auth) bool {
 	buddy, err := s.cfg.Upstream.BuddyInfo(account3)
 	if err != nil {
-		log.Printf("travel %s: buddy-info: %v", logfmt.Label(account3.UID, account3.NicknameValue()), err)
-		s.notifyTaskFailed("travel", account3.UID, account3.NicknameValue(), account3.Realm())
+		s.travelLookupFailed(account3, "buddy-info", err)
 
 		return false
 	}
@@ -169,8 +174,7 @@ func (s *Scheduler) travelOne(account3 *auth.Auth) bool {
 
 	travelState, err := s.cfg.Upstream.TravelStatus(account3)
 	if err != nil {
-		log.Printf("travel %s: status: %v", logfmt.Label(account3.UID, account3.NicknameValue()), err)
-		s.notifyTaskFailed("travel", account3.UID, account3.NicknameValue(), account3.Realm())
+		s.travelLookupFailed(account3, "status", err)
 
 		return false
 	}
@@ -181,10 +185,14 @@ func (s *Scheduler) travelOne(account3 *auth.Auth) bool {
 	case travelStateIdle:
 		return s.travelDepart(account3, travelState)
 	case travelStateTraveling:
-		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(account3.UID, account3.NicknameValue()), travelState.RecordID)
+		log.Printf("travel %s: skip (traveling record=%d)",
+			logfmt.Label(account3.UID, account3.NicknameValue()), travelState.RecordID)
+
 		return true
 	default:
-		log.Printf("travel %s: skip (unknown state %q)", logfmt.Label(account3.UID, account3.NicknameValue()), travelState.State)
+		log.Printf("travel %s: skip (unknown state %q)",
+			logfmt.Label(account3.UID, account3.NicknameValue()), travelState.State)
+
 		return true
 	}
 }
@@ -203,7 +211,8 @@ func (s *Scheduler) travelDepart(account2 *auth.Auth, ts *upstream.TravelState) 
 		return false
 	}
 
-	log.Printf("travel %s: depart ok location=%d", logfmt.Label(account2.UID, account2.NicknameValue()), travelLocationID)
+	log.Printf("travel %s: depart ok location=%d",
+		logfmt.Label(account2.UID, account2.NicknameValue()), travelLocationID)
 
 	return true
 }
@@ -211,19 +220,23 @@ func (s *Scheduler) travelDepart(account2 *auth.Auth, ts *upstream.TravelState) 
 // travelClaim 到站领奖（必须带 record_id）。
 func (s *Scheduler) travelClaim(account *auth.Auth, travelState *upstream.TravelState) bool {
 	if travelState.RecordID == 0 {
-		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(account.UID, account.NicknameValue()))
+		log.Printf("travel %s: claim skipped (arrived but no record_id)",
+			logfmt.Label(account.UID, account.NicknameValue()))
+
 		return true
 	}
 
 	reward, err := s.cfg.Upstream.TravelClaim(account, travelState.RecordID)
 	if err != nil {
-		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(account.UID, account.NicknameValue()), travelState.RecordID, err)
+		log.Printf("travel %s: claim record=%d: %v",
+			logfmt.Label(account.UID, account.NicknameValue()), travelState.RecordID, err)
 		s.notifyTaskFailed("travel", account.UID, account.NicknameValue(), account.Realm())
 
 		return false
 	}
 
-	log.Printf("travel %s: claim ok record=%d reward=%d", logfmt.Label(account.UID, account.NicknameValue()), travelState.RecordID, reward)
+	log.Printf("travel %s: claim ok record=%d reward=%d",
+		logfmt.Label(account.UID, account.NicknameValue()), travelState.RecordID, reward)
 
 	return true
 }

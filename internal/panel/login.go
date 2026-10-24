@@ -142,7 +142,8 @@ func loginCandidatesPreferWithIdentity(realm, preferredBase string, identity log
 // loginReplayable 报告登录请求失败是否值得换 origin：仅传输错误与网关类状态码。
 func loginReplayable(status int) bool {
 	switch status {
-	case 0, http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case 0, http.StatusRequestTimeout, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	default:
 		return false
@@ -188,7 +189,10 @@ type apiEnvelope struct {
 }
 
 // doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
-func doJSON(method, fullURL, bearer string, body io.Reader, origin, userAgent string) (json.RawMessage, int, error) {
+func doJSON(
+	method, fullURL, bearer string, body io.Reader, origin, userAgent string,
+) (json.RawMessage, int, error) {
+	//nolint:gosec // URL 由固定 realm 端点拼接，非用户可控主机
 	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
@@ -207,14 +211,14 @@ func doJSON(method, fullURL, bearer string, body io.Reader, origin, userAgent st
 	req.Header.Set("X-No-Enterprise-Id", "true")
 	req.Header.Set("X-No-Department-Info", "true")
 
-	resp, err := loginHTTP.Do(req)
+	resp, err := loginHTTP.Do(req) //nolint:gosec // 同上，请求 URL 来自固定 realm 端点
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 300 {
+	if resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %w", resp.StatusCode, errDoJSONFailed)
 	}
 
@@ -243,7 +247,9 @@ func (p *Panel) loginStartState(realm string) (json.RawMessage, loginEndpoint, i
 	)
 
 	for _, endpoint := range loginCandidatesWithIdentity(realm, identity) {
-		data, status, err := doJSON(http.MethodPost, endpoint.state, "", bytes.NewReader([]byte("{}")), endpoint.origin, endpoint.userAgent)
+		data, status, err := doJSON(
+			http.MethodPost, endpoint.state, "", bytes.NewReader([]byte("{}")), endpoint.origin, endpoint.userAgent,
+		)
 		if err == nil {
 			return data, endpoint, status, nil
 		}
@@ -316,7 +322,9 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	p.logins[item.State] = loginSession{created: time.Now(), realm: realm, base: used.base}
 	p.loginMu.Unlock()
 	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, item.State[:min(8, len(item.State))])
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "url": item.AuthURL, "state": item.State, "realm": realm})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "url": item.AuthURL, "state": item.State, "realm": realm,
+	})
 }
 
 // loginToken auth/token 端点返回的凭证字段。
@@ -327,6 +335,22 @@ type loginToken struct {
 	Domain       string `json:"domain"`
 }
 
+// lookupLoginSession 取登录会话并回收超时项；loginTTL 是授权 URL 的最长有效期，
+// 过期后不得继续 poll（否则一次发起即可无限期占用 state，且持续打上游）。
+func (p *Panel) lookupLoginSession(state string) (loginSession, bool) {
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+
+	sess, known := p.logins[state]
+	if !known || time.Since(sess.created) <= loginTTL {
+		return sess, known
+	}
+
+	delete(p.logins, state)
+
+	return loginSession{}, false
+}
+
 // loginAccount login/account 端点返回的账号字段。
 type loginAccount struct {
 	UID          string `json:"uid"`
@@ -335,6 +359,8 @@ type loginAccount struct {
 }
 
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
+//
+//nolint:funlen // 轮询/落盘/热加载/签到线性展开。
 func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	if state == "" {
@@ -342,17 +368,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.loginMu.Lock()
-	sess, known := p.logins[state]
-	// 超时会话直接回收：loginTTL 是授权 URL 的最长有效期，过期后不得再
-	// 继续 poll（否则一次发起即可无限期占用 state，且持续打上游）。
-	if known && time.Since(sess.created) > loginTTL {
-		delete(p.logins, state)
-
-		known = false
-	}
-	p.loginMu.Unlock()
-
+	sess, known := p.lookupLoginSession(state)
 	if !known {
 		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
 		return
@@ -426,7 +442,9 @@ func (p *Panel) pollLoginToken(realm, preferredBase, state string) (loginToken, 
 	var lastErr error
 
 	for _, endpoint := range loginCandidatesPreferWithIdentity(realm, preferredBase, identity) {
-		tokRaw, status, err := doJSON(http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent)
+		tokRaw, status, err := doJSON(
+			http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
+		)
 		if err != nil {
 			lastErr = err
 
@@ -451,9 +469,11 @@ func (p *Panel) pollLoginToken(realm, preferredBase, state string) (loginToken, 
 }
 
 // fetchLoginAccount 取 uid/nickname（失败不阻塞，仅缺展示名）。
-func (p *Panel) fetchLoginAccount(endpoint *loginEndpoint, state, bearer string) loginAccount {
+func (*Panel) fetchLoginAccount(endpoint *loginEndpoint, state, bearer string) loginAccount {
 	var acct loginAccount
-	if acctRaw, _, err := doJSON(http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent); err == nil {
+	if acctRaw, _, err := doJSON(
+		http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent,
+	); err == nil {
 		_ = json.Unmarshal(acctRaw, &acct)
 	}
 
@@ -576,7 +596,7 @@ func joinMsg(parts ...string) string {
 
 // loginRegions 返回 global 注册可选地区（panel 前端选地区弹窗用；CN 不调用）。
 // 未持账号时返回白名单静态兜底（前端只读展示，不依赖上游）。
-func (p *Panel) loginRegions(w http.ResponseWriter, r *http.Request) {
+func (*Panel) loginRegions(w http.ResponseWriter, r *http.Request) {
 	// 静态白名单（对齐国际版 web 展示集）：面板前端只读展示，无需账号态。
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true,

@@ -58,7 +58,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 // 不缓存：页面引用带哈希的资源，但 index.html 本身必须每次回源以拿到最新引用。
-func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
+func (*Panel) index(w http.ResponseWriter, r *http.Request) {
 	raw, err := fs.ReadFile(panelFS, "index.html")
 	if err != nil {
 		http.Error(w, "panel: 缺少内嵌 index.html", http.StatusInternalServerError)
@@ -74,7 +74,7 @@ func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 
 // asset 输出构建产物（/panel/static/** 等）。
 // 产物文件名带内容哈希，可长期强缓存（immutable）。
-func (p *Panel) asset(w http.ResponseWriter, r *http.Request) {
+func (*Panel) asset(w http.ResponseWriter, r *http.Request) {
 	rel := strings.TrimPrefix(r.URL.Path, "/panel/")
 	if rel == "" || strings.HasPrefix(rel, "api/") {
 		http.NotFound(w, r)
@@ -96,5 +96,5 @@ func (p *Panel) asset(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
 
-	http.ServeFileFS(w, r, panelFS, rel)
+	http.ServeFileFS(w, r, panelFS, rel) //nolint:gosec // 只读嵌入产物 FS，非法路径由 fs.Stat 与 embed.FS 拒绝
 }

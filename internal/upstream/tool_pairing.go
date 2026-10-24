@@ -101,7 +101,11 @@ func toolCallIDs(tcs []any) map[string]bool {
 
 // collectToolResults 从 start 起收集同批（want 内 id）tool 结果与夹在结果之间的插入
 // 消息，返回更新后的下标、结果、插入物，以及是否出现「结果被插入物分隔」。
-func collectToolResults(messages []any, start int, want map[string]bool) (next int, results, between []any, separated bool) {
+//
+//nolint:gocognit // 同批工具结果收集与插入物分隔判定，顺序即语义。
+func collectToolResults(
+	messages []any, start int, want map[string]bool,
+) (next int, results, between []any, separated bool) {
 	i := start
 	sawNonTool := false
 

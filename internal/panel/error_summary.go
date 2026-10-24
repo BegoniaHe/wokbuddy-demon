@@ -5,9 +5,10 @@
 package panel
 
 import (
+	"cmp"
 	"net/http"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,7 +28,8 @@ type ErrorSummaryRow struct {
 var errorAccountRe = regexp.MustCompile(`(?i)(?:acct|uid)=([^\s:]+)`)
 
 // taskAccountRe 任务行前缀：`checkin 昵称(uid8): ...`。
-var taskAccountRe = regexp.MustCompile(`^(checkin|travel|activity|keepalive|blackcat|school|streak-bonus|balance|lottery)\s+([^\s:]+):`)
+var taskAccountRe = regexp.MustCompile(`^(checkin|travel|activity|keepalive|blackcat|school|streak-bonus|` +
+	`balance|lottery)\s+([^\s:]+):`)
 
 // errorSummaryHandler GET /panel/api/error_summary。
 func (p *Panel) errorSummaryHandler(w http.ResponseWriter, r *http.Request) {
@@ -40,6 +42,8 @@ func (p *Panel) errorSummaryHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // SummarizeErrors 聚合错误行：账号 × 类型。空账号归 "-"。
+//
+//nolint:funlen // 错误聚合与排序线性展开。
 func SummarizeErrors(entries []LogEntry) []ErrorSummaryRow {
 	type key struct{ account, kind string }
 
@@ -78,16 +82,16 @@ func SummarizeErrors(entries []LogEntry) []ErrorSummaryRow {
 		out = append(out, *row)
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Count != out[j].Count {
-			return out[i].Count > out[j].Count
+	slices.SortFunc(out, func(left, right ErrorSummaryRow) int {
+		if left.Count != right.Count {
+			return cmp.Compare(right.Count, left.Count)
 		}
 
-		if out[i].Account != out[j].Account {
-			return out[i].Account < out[j].Account
+		if left.Account != right.Account {
+			return cmp.Compare(left.Account, right.Account)
 		}
 
-		return out[i].Type < out[j].Type
+		return cmp.Compare(left.Type, right.Type)
 	})
 
 	return out
@@ -116,7 +120,10 @@ func classifyErrorText(text string) string {
 		strings.Contains(text, "额度不足"),
 		strings.Contains(lower, "402"):
 		return "hard_credit"
-	case strings.Contains(lower, "rate limit"), strings.Contains(lower, "429"), strings.Contains(text, "限流"), strings.Contains(text, "冷却"):
+	case strings.Contains(lower, "rate limit"),
+		strings.Contains(lower, "429"),
+		strings.Contains(text, "限流"),
+		strings.Contains(text, "冷却"):
 		return "rate_limit"
 	case strings.Contains(lower, "timeout"), strings.Contains(lower, "timed out"), strings.Contains(text, "超时"):
 		return "timeout"

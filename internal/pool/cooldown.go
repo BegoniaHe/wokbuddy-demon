@@ -80,7 +80,9 @@ func (p *Pool) NoteCheckinDone(uid string) {
 // SetCreditsDetailed 更新账号余额/总额、配置窗口内的快过架子集，以及最早未来
 // 到期批次。earliestAt 为零或不在未来时清空最早批次；expiring/earliestRemaining
 // 均钳到 [0, credits]，避免上游脏数据污染选号。
-func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64) {
+func (p *Pool) SetCreditsDetailed(
+	uid string, credits, total, expiring int64, earliestAt time.Time, earliestRemaining int64,
+) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -89,7 +91,9 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64, ea
 		return
 	}
 
-	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(p.now(), credits, expiring, earliestAt, earliestRemaining)
+	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(
+		p.now(), credits, expiring, earliestAt, earliestRemaining,
+	)
 	entry2.credits = credits
 	entry2.creditsTotal = total
 	entry2.creditsExpiring = expiring
@@ -138,7 +142,9 @@ func (p *Pool) SetCreditsSnapshot(uid string, credits, total, expiring int64, bu
 		}
 	}
 
-	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(now, credits, expiring, earliestAt, earliestRemaining)
+	credits, expiring, earliestAt, earliestRemaining = clampCreditsDetailed(
+		now, credits, expiring, earliestAt, earliestRemaining,
+	)
 
 	entry2.credits = credits
 	entry2.creditsTotal = total
@@ -626,7 +632,9 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 	}
 
 	modelBlockStatus.Blocked = true
-	modelBlockStatus.Scope, modelBlockStatus.SharedResetAt = modelBlockScope(modelBlockStatus.Count, withReset, len(distinct), shared)
+	modelBlockStatus.Scope, modelBlockStatus.SharedResetAt = modelBlockScope(
+		modelBlockStatus.Count, withReset, len(distinct), shared,
+	)
 
 	return modelBlockStatus
 }
@@ -683,7 +691,9 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 
 // cooldownSoftRateLocked 账号级软冷却本体（语义见 CooldownSoftRate）。
 // 调用方必须已持有 p.mu。
-func (p *Pool) cooldownSoftRateLocked(entry2 *entry, now time.Time, base time.Duration, resetAt time.Time, reason string) {
+func (p *Pool) cooldownSoftRateLocked(
+	entry2 *entry, now time.Time, base time.Duration, resetAt time.Time, reason string,
+) {
 	if !resetAt.IsZero() {
 		entry2.until = p.cappedSoftUntilLocked(now, resetAt)
 	} else if entry2.coolKind != CoolSoft || !now.Before(entry2.until) {

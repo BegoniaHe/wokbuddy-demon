@@ -161,9 +161,12 @@ var wideRanges = [][2]rune{
 	{0x20000, 0x3fffd}, // CJK 扩展 B 及以后
 }
 
+// ideographicHalfFillSpace U+303F，位于宽字符区间但实际为窄字符。
+const ideographicHalfFillSpace = 0x303f
+
 // isWide 判定 rune 是否占 2 显示列。
 func isWide(r rune) bool {
-	if r == 0x303f { // 窄字符，落在 0x2e80…0xa4cf 段内需单独排除
+	if r == ideographicHalfFillSpace { // 窄字符，落在 0x2e80…0xa4cf 段内需单独排除
 		return false
 	}
 

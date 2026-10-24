@@ -23,7 +23,7 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -232,7 +232,7 @@ func (s *Store) List() []Record {
 		out[i].Hash = ""
 	}
 
-	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	slices.SortStableFunc(out, func(a, b Record) int { return b.CreatedAt.Compare(a.CreatedAt) })
 
 	return out
 }
@@ -354,6 +354,8 @@ func (s *Store) Flush() {
 // flush 防抖落盘：持锁写盘，与 Create/Revoke/Delete 的落盘同序。若先快照再释放
 // 锁写盘，旧快照会覆盖期间并发变更（内存有、磁盘无），且两个写共用 path+".tmp"
 // 会相互截断导致文件损坏。落盘失败时保持 dirty，下次 tick 重试。
+//
+//nolint:revive // flush/Flush 为公开与内部变体，命名有意成对。
 func (s *Store) flush() {
 	if s == nil {
 		return
@@ -532,30 +534,26 @@ func (s *Store) SetRealm(id, realm string) (bool, error) {
 		return false, fmt.Errorf("realm 必须是空、cn 或 global，当前 %q: %w", realm, errSetRealmFailed)
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	return s.updateRecord(id, func(rec *Record) func() {
+		old := rec.Realm
+		rec.Realm = realm
 
-	for i := range s.records {
-		if s.records[i].ID != id {
-			continue
-		}
-
-		old := s.records[i].Realm
-
-		s.records[i].Realm = realm
-		if err := s.persistLocked(); err != nil {
-			s.records[i].Realm = old
-			return false, err
-		}
-
-		return true, nil
-	}
-
-	return false, nil
+		return func() { rec.Realm = old }
+	})
 }
 
 // UpdateLimits 替换一把密钥的限制（面板编辑用）。非法值在调用方校验。
 func (s *Store) UpdateLimits(id string, limits Limits) (bool, error) {
+	return s.updateRecord(id, func(rec *Record) func() {
+		old := rec.Limits
+		rec.Limits = limits
+
+		return func() { rec.Limits = old }
+	})
+}
+
+// updateRecord 在锁内修改指定记录并落盘；落盘失败调用 undo 回滚。
+func (s *Store) updateRecord(id string, apply func(*Record) func()) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -564,11 +562,10 @@ func (s *Store) UpdateLimits(id string, limits Limits) (bool, error) {
 			continue
 		}
 
-		old := s.records[i].Limits
-
-		s.records[i].Limits = limits
+		undo := apply(&s.records[i])
 		if err := s.persistLocked(); err != nil {
-			s.records[i].Limits = old
+			undo()
+
 			return false, err
 		}
 

@@ -113,7 +113,9 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 // 调用方取消/超时导致的失败不算代理不健康：客户端断开或请求超时会让握手读
 // 被 watcher 打断，错误形态是“连接已关闭”而非 context.Canceled，故以
 // ctx.Err() 判定，不记失败冷却。
-func (pool *Pool) dialProxy(ctx context.Context, proxyState2 *proxyState, now time.Time, network, addr string) (net.Conn, error) {
+func (pool *Pool) dialProxy(
+	ctx context.Context, proxyState2 *proxyState, now time.Time, network, addr string,
+) (net.Conn, error) {
 	conn, err := proxyState2.proxy.dial(ctx, network, addr)
 	if err != nil {
 		if ctx.Err() == nil {

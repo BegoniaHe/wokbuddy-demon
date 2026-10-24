@@ -24,7 +24,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
@@ -206,7 +206,7 @@ func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err e
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		return 0, 0, 0, 0, fmt.Errorf("http %d: %w", resp.StatusCode, errFetchUserResourceFailed)
 	}
 
@@ -319,7 +319,7 @@ func main() {
 	}
 
 	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
-	sort.Strings(files)
+	slices.Sort(files)
 
 	accounts := collectAccounts(files)
 	totalRemain, totalUsed, totalSize, okCount := summarize(accounts)
@@ -359,7 +359,7 @@ func collectAccounts(files []string) []accountResult {
 	for _, f := range files {
 		var authFile2 authFile
 
-		raw, err := os.ReadFile(f)
+		raw, err := os.ReadFile(f) //nolint:gosec // 路径来自本机 CLI 参数，非远程输入
 		if err != nil || json.Unmarshal(raw, &authFile2) != nil {
 			continue
 		}

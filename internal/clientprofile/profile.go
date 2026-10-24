@@ -130,7 +130,8 @@ func LoadDir(dir string) (*Set, error) {
 func loadRealmFile(dir, name string) (string, *Profile, error) {
 	realm := strings.TrimSuffix(name, ".json")
 	if realm != "cn" && realm != "global" {
-		return "", nil, fmt.Errorf("client profile %s: 未知 realm 文件名（只认 cn.json / global.json）: %w", name, errInvalidProfile)
+		return "", nil, fmt.Errorf("client profile %s: 未知 realm 文件名（只认 cn.json / global.json）: %w",
+			name, errInvalidProfile)
 	}
 
 	profile, err := LoadFile(filepath.Join(dir, name))
@@ -139,7 +140,8 @@ func loadRealmFile(dir, name string) (string, *Profile, error) {
 	}
 
 	if profile.Source.Realm != realm {
-		return "", nil, fmt.Errorf("client profile %s: source.realm=%q 与文件名不一致: %w", name, profile.Source.Realm, errInvalidProfile)
+		return "", nil, fmt.Errorf("client profile %s: source.realm=%q 与文件名不一致: %w",
+			name, profile.Source.Realm, errInvalidProfile)
 	}
 
 	return realm, profile, nil
@@ -272,7 +274,8 @@ func validatePackageURL(realm, raw string) error {
 
 	wantHost := map[string]string{"cn": "download.codebuddy.cn", "global": "download.codebuddy.ai"}[realm]
 	if parsed.Host != wantHost {
-		return fmt.Errorf("source.packageUrl host=%q want %q（只接受 Win32 安装包）: %w", parsed.Host, wantHost, errInvalidProfile)
+		return fmt.Errorf("source.packageUrl host=%q want %q（只接受 Win32 安装包）: %w",
+			parsed.Host, wantHost, errInvalidProfile)
 	}
 
 	if !strings.HasPrefix(parsed.Path, "/workbuddy/saas/win32-x64-user/") {

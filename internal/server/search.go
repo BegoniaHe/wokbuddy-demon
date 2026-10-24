@@ -57,6 +57,8 @@ type searchFailure struct {
 //
 // 错误处置与 chat 同口径：`applyErrorPolicy` 决定是否罚号（限流软冷却 / 会话失效禁用 /
 // 额度硬冷却等），fail-fast 类错误（内容拦截、参数错误、模型类）不再轮转。
+//
+//nolint:funlen,gocognit // 轮转/错误处置/记账线性展开。
 func (h *Handler) runSearch(
 	ctx context.Context, query string, maxResults int, meta *upstream.ChatMeta,
 ) (*upstream.SearchOutcome, string, *searchFailure) {
@@ -120,6 +122,8 @@ func (h *Handler) runSearch(
 // searchOnAccount 在指定账号上执行一次搜索：预刷新 token → 调用 → 错误策略。
 // 返回的 fail 中 code 非空表示「不再轮转」的终态；code 为空表示可继续换号
 // （调用方已在 applyErrorPolicy 里记过惩罚）。
+//
+//nolint:funlen,maintidx,nestif // 刷新失败分类紧邻错误来源，拆开需重复传递判定上下文。
 func (h *Handler) searchOnAccount(
 	ctx context.Context, acct *auth.Auth, query string, maxResults int, meta *upstream.ChatMeta,
 ) (*upstream.SearchOutcome, *searchFailure) {

@@ -14,7 +14,11 @@ import (
 // PrepareBodyOptWithEffortsAndDefault 完整管线：efforts 降级 + thinking.go 按
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
-func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+//
+//nolint:maintidx // 多段 payload 变换线性展开，拆开需重复传递解析结果。
+func PrepareBodyOptWithEffortsAndDefault(
+	src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string,
+) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -242,9 +246,12 @@ func applyBestEffort(obj map[string]any, key, model, reqStr string, supported []
 	return true
 }
 
+// lowestEffortInit 档位排序的初始上界。
+const lowestEffortInit = 1 << 30
+
 // pickLowestEffort 取 supported 里 rank 最低的有效档位；无有效档返回 ""。
 func pickLowestEffort(supported []string) string {
-	lowest, lowestIdx := "", 1<<30
+	lowest, lowestIdx := "", lowestEffortInit
 
 	for _, s := range supported {
 		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
@@ -313,6 +320,8 @@ func normalizeRoles(obj map[string]any) {
 //
 // 这里只做形状转换：字符串转 {"url": 原值}；已有对象及其中 url/detail/mime_type
 // 原样保留；空字符串、缺失值、对象内非法 url 一律不补默认值，让上游返回真实错误。
+//
+//nolint:gocognit // 字符串/对象/嵌套 part 形状转换线性展开。
 func normalizeImageURL(obj map[string]any) {
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
@@ -357,6 +366,8 @@ func normalizeImageURL(obj map[string]any) {
 //   - 删除 type 为 reasoning_text / reasoning 的片段（TrimSpace 后比较）；
 //   - 删除后 content 为空数组且该消息无 tool_calls → 整条消息删除；
 //   - 字符串 content、非对象片段、非数组 content 原样通过（不臆造改写）。
+//
+//nolint:gocognit // 片段过滤按类型/空数组/tool_calls 分层，顺序即语义。
 func dropReasoningContentParts(obj map[string]any) {
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
@@ -614,7 +625,7 @@ func unescapePatternProperties(n map[string]any) {
 // conversationRequestId / startsNewUserRequest（issue #249）。只改最后一条 user，
 // 历史轮次不动；客户端自带值优先。没有 user 消息或 body 不可解析时原样返回。
 //
-//nolint:cyclop // 解析 + 找到最后一条 user + 保留客户端值。
+//nolint:cyclop,gocognit,gocyclo // 解析 + 找到最后一条 user + 保留客户端值。
 func injectConversationRequestID(body []byte, requestID string) []byte {
 	if requestID == "" || len(body) == 0 {
 		return body

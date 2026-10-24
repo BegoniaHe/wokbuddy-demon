@@ -1,7 +1,8 @@
 package pool
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -86,16 +87,16 @@ func (p *Pool) ModelLockView() []ModelLockRow {
 		out = append(out, p.buildModelLockRow(key, a, routable, now))
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		if ri, rj := modelLockRank(out[i].State), modelLockRank(out[j].State); ri != rj {
-			return ri < rj
+	slices.SortFunc(out, func(left, right ModelLockRow) int {
+		if c := cmp.Compare(modelLockRank(left.State), modelLockRank(right.State)); c != 0 {
+			return c
 		}
 
-		if out[i].Model != out[j].Model {
-			return out[i].Model < out[j].Model
+		if c := cmp.Compare(left.Model, right.Model); c != 0 {
+			return c
 		}
 
-		return out[i].Realm < out[j].Realm
+		return cmp.Compare(left.Realm, right.Realm)
 	})
 
 	return out
@@ -131,7 +132,9 @@ func activeModelCooldown(mc *modelCooldown, now time.Time) bool {
 
 // aggregateModelLock 把单个账号的单个模型冷却并入 (域, 模型) 聚合态：累计被锁账号数，
 // 记录最早/最晚解锁时刻与最早解锁账号的上游原因。
-func aggregateModelLock(rows map[string]*modelLockAgg, realm, model string, modelCooldown2 *modelCooldown, now time.Time) {
+func aggregateModelLock(
+	rows map[string]*modelLockAgg, realm, model string, modelCooldown2 *modelCooldown, now time.Time,
+) {
 	if !activeModelCooldown(modelCooldown2, now) {
 		return
 	}
@@ -166,7 +169,9 @@ func aggregateModelLock(rows map[string]*modelLockAgg, realm, model string, mode
 
 // buildModelLockRow 由聚合态构造单行画像：补上 Servable 计数（该域内
 // healthyForModel 且未在途占满的账号数）并推导 State。调用方必须已持有 p.mu。
-func (p *Pool) buildModelLockRow(key string, modelLockAgg2 *modelLockAgg, routable map[string]int, now time.Time) ModelLockRow {
+func (p *Pool) buildModelLockRow(
+	key string, modelLockAgg2 *modelLockAgg, routable map[string]int, now time.Time,
+) ModelLockRow {
 	sep := strings.IndexByte(key, '\x1f')
 	realm, model := key[:sep], key[sep+1:]
 
@@ -197,7 +202,9 @@ func (p *Pool) buildModelLockRow(key string, modelLockAgg2 *modelLockAgg, routab
 		}
 	}
 
-	row.Scope, _ = modelBlockScope(modelLockAgg2.locked, modelLockAgg2.withReset, len(modelLockAgg2.resetCounts), shared)
+	row.Scope, _ = modelBlockScope(
+		modelLockAgg2.locked, modelLockAgg2.withReset, len(modelLockAgg2.resetCounts), shared,
+	)
 	switch {
 	case row.Servable > 0:
 		row.State = "partial"

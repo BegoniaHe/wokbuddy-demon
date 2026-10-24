@@ -71,6 +71,9 @@ type Router struct {
 	stop    chan struct{}
 }
 
+// defaultSessionTTL 默认会话粘性 TTL。
+const defaultSessionTTL = 30 * time.Minute
+
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
 // TTL/GCInterval 非正取默认（30m / 5m）——main 从 config 解析后传入，这里兜底。
 func New(cfg Config) *Router {
@@ -79,7 +82,7 @@ func New(cfg Config) *Router {
 	}
 
 	if cfg.TTL <= 0 {
-		cfg.TTL = 30 * time.Minute
+		cfg.TTL = defaultSessionTTL
 	}
 
 	if cfg.GCInterval <= 0 {
@@ -545,6 +548,8 @@ func (r *Router) Count() int {
 }
 
 // gcOnce 清理 TTL 过期的绑定，并镜像删除。
+//
+//nolint:gocognit // 过期扫描/删除/镜像同步线性展开。
 func (r *Router) gcOnce(now time.Time) int {
 	r.mu.Lock()
 
@@ -805,6 +810,8 @@ func deriveKey(raw []byte) string {
 //
 // 用 bodyRaw 直接在原始字节上逐条解析：不构造 map 树、不复制 content；逐条解到
 // 小 struct，非对象/损坏条目跳过（与旧 []any 路径的 map 断言失败同义）。
+//
+//nolint:gocognit // 原始字节逐条解析与字段提取线性展开。
 func scanDeriveTexts(raw []byte) (systemText, firstUserText string) {
 	var items []bodyRaw
 	if json.Unmarshal(raw, &items) != nil {

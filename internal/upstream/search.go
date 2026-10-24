@@ -125,10 +125,14 @@ type searchRequestBody struct {
 // 决定是否罚号），其余（序列化/读体失败）是普通 error（传输层故障不罚号）。
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一口径（公开 API 简单）。
-func (c *Client) Search(ctx context.Context, account *auth.Auth, query string, maxResults int, meta ChatMeta) (*SearchOutcome, error) {
+func (c *Client) Search(
+	ctx context.Context, account *auth.Auth, query string, maxResults int, meta ChatMeta,
+) (*SearchOutcome, error) {
 	query = strings.TrimSpace(query)
 	if utf8.RuneCountInString(query) < SearchMinQueryLen {
-		return nil, &Error{Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen)}
+		return nil, &Error{
+			Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen),
+		}
 	}
 
 	body, err := json.Marshal(searchRequestBody{
@@ -146,7 +150,9 @@ func (c *Client) Search(ctx context.Context, account *auth.Auth, query string, m
 	// chat base 允许 host / host/v2 / host/v2/chat/completions 三种配置形态（见
 	// normalizeChatBase）：搜索与 chat 同源，必须先归一再拼搜索路径，否则
 	// cn.chat_base 配成 /v2 形态时会拼出 /v2/agenttool/v1/search。
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+searchPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+searchPath, bytes.NewReader(body),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("search request: %w", err)
 	}
@@ -174,7 +180,7 @@ func (c *Client) doSearch(req *http.Request) (*SearchOutcome, error) {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		kind := Classify(resp.StatusCode, string(raw))
 
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}

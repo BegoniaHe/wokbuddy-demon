@@ -4,7 +4,7 @@ package pool
 
 import (
 	"log"
-	"sort"
+	"slices"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -119,30 +119,29 @@ func (p *Pool) Revive(uid string) bool {
 // 而非「判死」，故无需重登或人工解冻，Resume 即可立刻恢复。
 // uid 不存在返回 false（供调用方区分"账号不存在"与"已暂停"）。
 func (p *Pool) Pause(uid string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	e, ok := p.byUID[uid]
-	if !ok {
-		return false
-	}
-
-	p.pauseLocked(e)
-
-	return true
+	return p.setPaused(uid, true)
 }
 
 // Resume 解除暂停选号（幂等，对未暂停账号为空操作）。uid 不存在返回 false。
 func (p *Pool) Resume(uid string) bool {
+	return p.setPaused(uid, false)
+}
+
+// setPaused 在锁内切换账号暂停状态；uid 不存在返回 false。
+func (p *Pool) setPaused(uid string, pause bool) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	e, ok := p.byUID[uid]
+	acct, ok := p.byUID[uid]
 	if !ok {
 		return false
 	}
 
-	p.resumeLocked(e)
+	if pause {
+		p.pauseLocked(acct)
+	} else {
+		p.resumeLocked(acct)
+	}
 
 	return true
 }
@@ -426,7 +425,7 @@ func (p *Pool) AvailableUIDs() []string {
 		uids = append(uids, uid)
 	}
 
-	sort.Strings(uids)
+	slices.Sort(uids)
 
 	return uids
 }
@@ -453,7 +452,7 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 		uids = append(uids, uid)
 	}
 
-	sort.Strings(uids)
+	slices.Sort(uids)
 
 	return uids
 }
@@ -501,7 +500,8 @@ func (p *Pool) PickByUIDForModel(uid, model, realm string) (*auth.Auth, StickyPi
 	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
 	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 	if p.floorBlockedForRealmModel(entry2, model, entry2.a.Realm(), now) {
-		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
+		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, "+
+			"unbind (paid model held out)",
 			logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()), model, entry2.credits, p.creditFloor)
 
 		return nil, StickyUnavailable
@@ -569,6 +569,8 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 //
 // 面板概况要回答「禁用几个、暂停几个」——暂停只关选号、照常签到保活，与禁用混成
 // 一个数字会让人误判池子的真实状况（issue #125）。
+//
+//nolint:revive // 状态计数快照，拆 struct 会增加调用点解构成本。
 func (p *Pool) CountsDetailedWithPaused() (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	return p.countsDetailedForRealm("")
 }
@@ -587,7 +589,11 @@ func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, di
 // /status 要的是「还能不能用」（暂停与禁用同样不可选，合并）；面板概况要的是
 // 「禁用几个、暂停几个」（分开，issue #125）。两种口径都合理，所以把选择权
 // 留在调用方，而不是让一个共享函数替所有人做决定。
-func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, disabled, paused, inFlightFull int) {
+//
+//nolint:revive // 同 CountsDetailedWithPaused：多状态计数快照。
+func (p *Pool) countsDetailedForRealm(
+	realm string,
+) (total, healthy, cooling, disabled, paused, inFlightFull int) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -665,7 +671,7 @@ func (p *Pool) List() []Status {
 		uids = append(uids, uid)
 	}
 
-	sort.Strings(uids)
+	slices.Sort(uids)
 
 	out := make([]Status, 0, len(uids))
 	for _, uid := range uids {
@@ -762,7 +768,7 @@ func fillCoolingStatus(status *Status, entry2 *entry, now time.Time) {
 // modelCostsStatusLocked 收集账号的有效成本台账行（P1-anti-monopoly 可观测性）。
 // 仅 modelCostTTL 内的观测进台账（过期/零值跳过，与选号读取侧同口径）；
 // 模型名稳定排序。调用方必须已持有锁。
-func (p *Pool) modelCostsStatusLocked(entry3 *entry, now time.Time) []ModelCostStatus {
+func (*Pool) modelCostsStatusLocked(entry3 *entry, now time.Time) []ModelCostStatus {
 	if len(entry3.modelCost) == 0 {
 		return nil
 	}
@@ -780,7 +786,7 @@ func (p *Pool) modelCostsStatusLocked(entry3 *entry, now time.Time) []ModelCostS
 		return nil
 	}
 
-	sort.Strings(models)
+	slices.Sort(models)
 
 	rows := make([]ModelCostStatus, 0, len(models))
 	for _, m := range models {
@@ -803,7 +809,7 @@ func (p *Pool) modelCostsStatusLocked(entry3 *entry, now time.Time) []ModelCostS
 // rateLimitedModelsLocked 收集账号当前仍在限额的模型台账行（issue #36）。
 // modelCooldowns 未到期条目按模型名稳定排序输出；全部到期/空表返回 nil。
 // 调用方必须已持有锁（statusOf 只读路径持 RLock，本函数只读不写）。
-func (p *Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimitedModel {
+func (*Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimitedModel {
 	if len(entry4.modelCooldowns) == 0 {
 		return nil
 	}
@@ -813,7 +819,7 @@ func (p *Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimit
 		models = append(models, m)
 	}
 
-	sort.Strings(models)
+	slices.Sort(models)
 
 	rows := make([]RateLimitedModel, 0, len(models))
 	for _, m := range models {

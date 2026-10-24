@@ -29,7 +29,9 @@ const (
 var errModelBusyTooLarge = errors.New("model busy response too large")
 
 // ModelBusy 查询一批模型的繁忙度（内部按 50 分批）。返回 model → level。
-func (c *Client) ModelBusy(ctx context.Context, account *auth.Auth, models []string) (map[string]string, error) {
+func (c *Client) ModelBusy(
+	ctx context.Context, account *auth.Auth, models []string,
+) (map[string]string, error) {
 	if len(models) == 0 {
 		return map[string]string{}, nil
 	}
@@ -52,13 +54,17 @@ func (c *Client) ModelBusy(ctx context.Context, account *auth.Auth, models []str
 }
 
 // modelBusyBatch 单批查询。
-func (c *Client) modelBusyBatch(ctx context.Context, account *auth.Auth, models []string) (map[string]string, error) {
+func (c *Client) modelBusyBatch(
+	ctx context.Context, account *auth.Auth, models []string,
+) (map[string]string, error) {
 	raw, err := json.Marshal(map[string]any{"models": models})
 	if err != nil {
 		return nil, fmt.Errorf("ModelBusy encode: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatBase(account)+modelBusyPath, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, c.chatBase(account)+modelBusyPath, bytes.NewReader(raw),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("ModelBusy: %w", err)
 	}
@@ -83,7 +89,7 @@ func (c *Client) modelBusyBatch(ctx context.Context, account *auth.Auth, models 
 		return nil, fmt.Errorf("%w: > %d bytes", errModelBusyTooLarge, modelBusyMaxBody)
 	}
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		return nil, &Error{
 			Kind: Classify(resp.StatusCode, string(body)), Status: resp.StatusCode,
 			Msg: truncate(string(body), 200), Code: businessCode(string(body)),
@@ -114,7 +120,7 @@ func parseModelBusy(body []byte) map[string]string {
 
 // collectModelBusy 递归收集 model→level（深度有界）。
 //
-//nolint:cyclop,gocognit // 兼容三种响应形态，深度有界且分支集中。
+//nolint:cyclop,gocognit,gocyclo // 兼容三种响应形态，深度有界且分支集中。
 func collectModelBusy(node any, out map[string]string, depth int) {
 	if depth > 3 {
 		return

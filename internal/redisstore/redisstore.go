@@ -27,6 +27,8 @@ const keyTTL = 7 * 24 * time.Hour
 const writeConcurrencyLimit = 8
 
 // Store 只放本期需要的方法。上下文由实现内部构造（读操作配短超时，写操作 fire-and-forget）。
+//
+//nolint:interfacebloat // Redis 镜像的读写/生命周期方法同属一个实现，拆开反而增加装配噪音。
 type Store interface {
 	// SetBind 异步镜像粘性会话绑定（key→uid），带 TTL。
 	SetBind(key, uid string, ttl time.Duration)

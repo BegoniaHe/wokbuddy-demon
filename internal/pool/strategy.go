@@ -15,7 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -47,7 +47,8 @@ func ParseStrategy(raw string) (Strategy, error) {
 	case string(StrategySequentialExhaust):
 		return StrategySequentialExhaust, nil
 	default:
-		return "", fmt.Errorf("%w: %q（可选 weighted_random / round_robin / sequential_exhaust）", errUnknownStrategy, raw)
+		return "", fmt.Errorf("%w: %q（可选 weighted_random / round_robin / sequential_exhaust）",
+			errUnknownStrategy, raw)
 	}
 }
 
@@ -162,7 +163,7 @@ func (p *Pool) orderedUIDsLocked(realm string) []string {
 		rest = append(rest, uid)
 	}
 
-	sort.Strings(rest)
+	slices.Sort(rest)
 
 	return append(out, rest...)
 }
@@ -170,8 +171,9 @@ func (p *Pool) orderedUIDsLocked(realm string) []string {
 // orderedCandidateLocked 从 start 处顺延找顺序里第一个「可服务且落在 bestTier」
 // 的账号（返回账号与其在 order 里的下标）。servable 由 pickCandidates 提供，
 // 已排除 tried/健康/在途/保底；本函数只再过滤成本层。
-func (p *Pool) orderedCandidateLocked(
-	order []string, servable map[string]*entry, start int, reqModel string, now time.Time, bestTier int, trace *PickTrace,
+func (*Pool) orderedCandidateLocked(
+	order []string, servable map[string]*entry, start int, reqModel string,
+	now time.Time, bestTier int, trace *PickTrace,
 ) (*entry, int) {
 	for offset := range order {
 		idx := (start + offset) % len(order)
