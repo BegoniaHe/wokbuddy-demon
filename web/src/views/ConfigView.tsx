@@ -656,7 +656,7 @@ export function ConfigView() {
           {check('images_endpoint', '开放 POST /v1/images/generations（官方出图；尚未在真实账号验证计费）')}
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
-            会话粘性开关需重启进程生效，其余开关保存后即时生效；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。
+            提示词模式/文件与会话粘性开关需重启进程生效，其余开关保存后即时生效；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。
           </p>
         </CardContent>
       </Card>
