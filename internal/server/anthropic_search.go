@@ -49,7 +49,7 @@ func (h *Handler) anthropicConvertWithSearch(
 
 	options := toolSearchOptions(req.Tools)
 
-	if validationErr := validateSearchOptions(options); validationErr != nil {
+	if validationErr := validateSearchOptions(options, false); validationErr != nil {
 		return anthropicConversion{}, nil, validationErr
 	}
 

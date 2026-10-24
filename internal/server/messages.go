@@ -168,7 +168,7 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 		options.MaxResults = payload.MaxResults
 	}
 
-	if err := validateSearchOptions(options); err != nil {
+	if err := validateSearchOptions(options, payload.Deep); err != nil {
 		return nil, err
 	}
 
@@ -222,7 +222,7 @@ func stringList(v any) []string {
 }
 
 // validateSearchOptions 在入口校验域名与时间范围：非法值 400，不烧账号。
-func validateSearchOptions(opts upstream.SearchOptions) error {
+func validateSearchOptions(opts upstream.SearchOptions, deep bool) error {
 	for _, domain := range append(append([]string{}, opts.AllowedDomains...), opts.BlockedDomains...) {
 		if !upstream.ValidSearchDomain(domain) {
 			return fmt.Errorf("%w: %q", errSearchInvalidDomain, domain)
@@ -235,6 +235,32 @@ func validateSearchOptions(opts upstream.SearchOptions) error {
 
 	if !upstream.ValidSearchFreshness(opts.Freshness) {
 		return fmt.Errorf("%w: %q", errSearchInvalidFreshness, opts.Freshness)
+	}
+
+	if deep {
+		return validateDeepSearchOptions(opts)
+	}
+
+	return nil
+}
+
+// validateDeepSearchOptions deep=true 走官方综述式检索，上游接口不接受 snippet
+// 搜索的过滤参数；直接拒绝而不是静默丢弃，避免客户端误以为过滤已生效。
+func validateDeepSearchOptions(opts upstream.SearchOptions) error {
+	if opts.MaxResults > 0 {
+		return errDeepSearchOptionsUnsupported
+	}
+
+	if len(opts.AllowedDomains) > 0 {
+		return errDeepSearchOptionsUnsupported
+	}
+
+	if len(opts.BlockedDomains) > 0 {
+		return errDeepSearchOptionsUnsupported
+	}
+
+	if opts.Freshness != "" {
+		return errDeepSearchOptionsUnsupported
 	}
 
 	return nil
@@ -569,7 +595,9 @@ var (
 	errSearchQueryTooLong     = errors.New("搜索词过长（上限 1024 字符），请精简后重试")
 	errSearchRealmUnsupported = errors.New(
 		"该搜索端点只支持 cn 域；请去掉 global: 前缀（当前不支持国际版搜索）")
-	errSearchInvalidDomain    = errors.New("非法搜索域名：只允许 host（不含协议/路径/端口/空白）")
-	errSearchTooManyDomains   = errors.New("搜索域名数量超过上限")
-	errSearchInvalidFreshness = errors.New("非法 freshness：只允许 d1-d30 / m1-m12 / y1-y5")
+	errSearchInvalidDomain          = errors.New("非法搜索域名：只允许 host（不含协议/路径/端口/空白）")
+	errSearchTooManyDomains         = errors.New("搜索域名数量超过上限")
+	errSearchInvalidFreshness       = errors.New("非法 freshness：只允许 d1-d30 / m1-m12 / y1-y5")
+	errDeepSearchOptionsUnsupported = errors.New(
+		"deep=true 不支持 allowed_domains / blocked_domains / freshness / max_results；请去掉这些参数后重试")
 )

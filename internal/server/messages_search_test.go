@@ -976,6 +976,37 @@ func TestDeepSearchDisabled(t *testing.T) {
 	}
 }
 
+// TestDeepSearchRejectsSnippetOptions deep=true 不接受 snippet 搜索的过滤参数：
+// 上游综述接口没有这些字段，静默丢弃会让客户端误以为过滤已生效。
+func TestDeepSearchRejectsSnippetOptions(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		calls++
+		return 200, searchOKBody
+	})
+
+	for _, extra := range []string{
+		`"max_results":5,"tools":[{"name":"web_search"}],`,
+		`"tools":[{"name":"web_search","allowed_domains":["go.dev"]}],`,
+		`"tools":[{"name":"web_search","blocked_domains":["spam.example"]}],`,
+		`"tools":[{"name":"web_search","freshness":"d7"}],`,
+	} {
+		body := `{"model":"m","deep":true,` + extra +
+			`"messages":[{"role":"user","content":[{"type":"text","text":"研究 go"}]}]}`
+
+		rec := doSearchRequest(t, handler, body)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "deep=true") {
+			t.Fatalf("extra=%s code=%d body=%s", extra, rec.Code, rec.Body)
+		}
+	}
+
+	if calls != 0 {
+		t.Fatalf("非法组合不得打上游，calls=%d", calls)
+	}
+}
+
 // TestDeepSearchReturnsSynthesis 开启后只打一次 agentic_search，返回 synthesis 文本。
 func TestDeepSearchReturnsSynthesis(t *testing.T) {
 	t.Parallel()
