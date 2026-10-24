@@ -271,7 +271,9 @@ func clampRestoredCredits(entry4 *entry, now time.Time) {
 		entry4.creditsEarliestRemaining = 0
 	}
 
-	if entry4.creditsEarliestRemaining == 0 || entry4.creditsEarliestExpiry.IsZero() || !now.Before(entry4.creditsEarliestExpiry) {
+	if entry4.creditsEarliestRemaining == 0 ||
+		entry4.creditsEarliestExpiry.IsZero() ||
+		!now.Before(entry4.creditsEarliestExpiry) {
 		entry4.creditsEarliestExpiry = time.Time{}
 		entry4.creditsEarliestRemaining = 0
 	}

@@ -26,7 +26,7 @@ var (
 )
 
 // desktopScan 扫描本机桌面客户端凭据目录，只返回元数据（不含 token）。
-func (p *Panel) desktopScan(w http.ResponseWriter, _ *http.Request) {
+func (*Panel) desktopScan(w http.ResponseWriter, _ *http.Request) {
 	accounts := desktopcred.Scan()
 	if accounts == nil {
 		accounts = []desktopcred.Account{}
@@ -104,7 +104,9 @@ func parseDesktopImport(r *http.Request) (struct {
 }
 
 // importDesktopFiles 逐文件导入；只允许发现列表内的路径，避免任意文件读取。
-func (p *Panel) importDesktopFiles(targets []string, allowed map[string]bool, key string) (int, []string, []*auth.Auth) {
+func (p *Panel) importDesktopFiles(
+	targets []string, allowed map[string]bool, key string,
+) (int, []string, []*auth.Auth) {
 	var imported int
 
 	errs := make([]string, 0, len(targets))
@@ -124,7 +126,7 @@ func (p *Panel) importDesktopFiles(targets []string, allowed map[string]bool, ke
 		}
 
 		uid := strings.TrimSpace(account.UID)
-		if !validImportUID(uid) {
+		if !validUID(uid) {
 			errs = append(errs, base+": invalid uid")
 			continue
 		}

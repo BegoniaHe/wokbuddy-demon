@@ -12,15 +12,16 @@
 //
 // 落盘：data/usage.json，原子替换 + 防抖刷新（默认 30s），重启不丢。
 // 桶数上界 ≈ 账号数 × 模型数 × (hourlyKeep + 已过天数)，实测单桶约 90 字节。
-package usage
+package usage //nolint:revive // 公共聚合结构体较多，保持稳定 API。
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -543,7 +544,10 @@ func (r *Recorder) Rollup(now time.Time) {
 		}
 
 		day := "d:" + ts.Format(dayLayout)
-		moves = append(moves, move{from: strVal, to: day + "|" + bucket2.Realm + "|" + bucket2.UID + "|" + bucket2.Model + "|" + bucket2.Rate})
+		moves = append(moves, move{
+			from: strVal,
+			to:   day + "|" + bucket2.Realm + "|" + bucket2.UID + "|" + bucket2.Model + "|" + bucket2.Rate,
+		})
 	}
 
 	for _, m := range moves {
@@ -557,6 +561,7 @@ func (r *Recorder) Rollup(now time.Time) {
 	}
 }
 
+//nolint:dupl // 桶字段与聚合字段逐项映射，字段名不同但赋值形状一致。
 func (r *Recorder) mergeHourly(from, to string) {
 	src := r.buckets[from]
 	if src == nil {
@@ -632,7 +637,9 @@ func (r *Recorder) flush(force bool) {
 		return
 	}
 
-	snap := file{Version: fileVersion, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
+	snap := file{
+		Version: fileVersion, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets)),
+	}
 	for _, b := range r.buckets {
 		snap.Buckets = append(snap.Buckets, *b)
 	}
@@ -706,6 +713,7 @@ type aggAcc struct {
 	tpsSamples  int64
 }
 
+//nolint:dupl // 同 mergeHourly：逐字段累加，抽公共 helper 反而需反射式映射。
 func (g *aggAcc) add(bucket5 *bucket) {
 	g.Requests += bucket5.Req
 	g.Errors += bucket5.Err
@@ -740,7 +748,7 @@ func (g *aggAcc) finish() Agg {
 	}
 
 	if g.CreditTokens > 0 {
-		agg.CreditsPer1MTokens = g.Credits / float64(g.CreditTokens) * 1_000_000
+		agg.CreditsPer1MTokens = g.Credits / float64(g.CreditTokens) * creditsPerMillionTokens
 	}
 
 	if total := g.CacheHitTokens + g.CacheMissTokens; total > 0 {
@@ -751,6 +759,9 @@ func (g *aggAcc) finish() Agg {
 }
 
 // KeyedAgg 按某个维度聚合的一行。
+// creditsPerMillionTokens 每百万 token 的积分换算分母。
+const creditsPerMillionTokens = 1_000_000
+
 type KeyedAgg struct {
 	Agg
 
@@ -800,7 +811,7 @@ func (a *creditAcc) add(bucket4 *bucket) {
 func (a *creditAcc) finish() CreditAgg {
 	out := a.CreditAgg
 	if a.CreditTokens > 0 {
-		out.CreditsPer1MTokens = a.Credits / float64(a.CreditTokens) * 1_000_000
+		out.CreditsPer1MTokens = a.Credits / float64(a.CreditTokens) * creditsPerMillionTokens
 	}
 
 	if total := a.CacheHitTokens + a.CacheMissTokens; total > 0 {
@@ -974,7 +985,9 @@ func sameWallDate(t time.Time, year int, month time.Month, day int) bool {
 func localHourStart(now time.Time) time.Time {
 	// 取当前墙钟小时的首个实际时刻；部分小时被拨快跳过时它是跳过区间末端
 	// （Chatham 03:45），保证 hours=1 不会把上一小时的桶带进来。
-	if start, ok := hourFirst(now.Year(), now.Month(), now.Day(), now.Hour(), now.Location()); ok && !start.After(now) {
+	if start, ok := hourFirst(
+		now.Year(), now.Month(), now.Day(), now.Hour(), now.Location(),
+	); ok && !start.After(now) {
 		return start
 	}
 	// 夏令时回拨的重复小时里 time.Date 可能选到更晚的那次 occurrence，得到晚于
@@ -985,6 +998,8 @@ func localHourStart(now time.Time) time.Time {
 }
 
 // bucketTime 把桶 scope 解析成本地时间；脏 scope 返回 false（不进任何口径）。
+//
+//nolint:nestif // DST 墙钟解析的多级回落，顺序即语义。
 func bucketTime(scope string) (time.Time, bool) {
 	if hour, ok := strings.CutPrefix(scope, "h:"); ok {
 		parsed, err := time.ParseInLocation(hourLayout, hour, time.Local)
@@ -1026,7 +1041,9 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 
 // SnapshotWithRates 与 Snapshot 相同，但允许为缺少历史倍率的旧桶提供当前
 // 模型倍率回填。currentRate 返回空串时该行按“未知倍率”聚合，不伪造价格。
-func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, currentRate func(realm, model string) string) Snapshot {
+func (r *Recorder) SnapshotWithRates(
+	hours int, nicks map[string]string, currentRate func(realm, model string) string,
+) Snapshot {
 	return r.SnapshotWindow(Window{Hours: hours, From: time.Time{}, To: time.Time{}}, nicks, currentRate)
 }
 
@@ -1037,7 +1054,9 @@ func (r *Recorder) SnapshotWithRates(hours int, nicks map[string]string, current
 // （曾长期是"卡片为全部历史累计、hours 只改时序分片"的口径，界面上被读成"筛选没
 // 生效"，已废弃）。小时桶按整点入窗；日桶（Rollup 折叠出的长期数据）按日起点入窗，
 // 故小时窗口天然不含更早的日桶。
-func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate func(realm, model string) string) Snapshot {
+func (r *Recorder) SnapshotWindow(
+	w Window, nicks map[string]string, currentRate func(realm, model string) string,
+) Snapshot {
 	if r == nil {
 		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
 	}
@@ -1112,7 +1131,7 @@ func (r *Recorder) AggregateByModel() []KeyedAgg {
 		out = append(out, KeyedAgg{Key: k, Agg: v.finish(), Realm: "", Extra: ""})
 	}
 	// 按 key 升序，保证 /metrics 输出稳定（Prometheus 虽无序，但稳定输出便于 diff）。
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	slices.SortFunc(out, func(a, b KeyedAgg) int { return cmp.Compare(a.Key, b.Key) })
 
 	return out
 }
@@ -1228,7 +1247,7 @@ func (a *snapshotAcc) add(bucket2 *bucket) {
 }
 
 // addKeyed 按 key 取（或新建）该维度的累加器后并入桶。
-func (a *snapshotAcc) addKeyed(m map[string]*aggAcc, key string, b *bucket) {
+func (*snapshotAcc) addKeyed(m map[string]*aggAcc, key string, b *bucket) {
 	if m[key] == nil {
 		m[key] = &aggAcc{}
 	}
@@ -1314,7 +1333,7 @@ func seriesPoints(m map[string]*aggAcc, scope string) []Point {
 		keys = append(keys, k)
 	}
 
-	sort.Strings(keys)
+	slices.Sort(keys)
 
 	pts := make([]Point, 0, len(keys))
 	for _, k := range keys {
@@ -1346,20 +1365,20 @@ func creditKeyed(m map[string]*creditAcc) []CreditAgg {
 		out = append(out, v.finish())
 	}
 
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Credits != out[j].Credits {
-			return out[i].Credits > out[j].Credits
+	slices.SortFunc(out, func(left, right CreditAgg) int {
+		if left.Credits != right.Credits {
+			return cmp.Compare(right.Credits, left.Credits)
 		}
 
-		if out[i].CreditTokens != out[j].CreditTokens {
-			return out[i].CreditTokens > out[j].CreditTokens
+		if left.CreditTokens != right.CreditTokens {
+			return cmp.Compare(right.CreditTokens, left.CreditTokens)
 		}
 
-		if out[i].Key != out[j].Key {
-			return out[i].Key < out[j].Key
+		if left.Key != right.Key {
+			return cmp.Compare(left.Key, right.Key)
 		}
 
-		return out[i].Rate < out[j].Rate
+		return cmp.Compare(left.Rate, right.Rate)
 	})
 
 	return out
@@ -1372,16 +1391,16 @@ func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg
 		out = append(out, KeyedAgg{Key: key, Extra: extra, Agg: v.finish(), Realm: ""})
 	}
 	// 按总量降序；同量按 key 升序，保证输出稳定（前端 diff 不抖）。
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].TotalTokens != out[j].TotalTokens {
-			return out[i].TotalTokens > out[j].TotalTokens
+	slices.SortFunc(out, func(left, right KeyedAgg) int {
+		if left.TotalTokens != right.TotalTokens {
+			return cmp.Compare(right.TotalTokens, left.TotalTokens)
 		}
 
-		if out[i].Requests != out[j].Requests {
-			return out[i].Requests > out[j].Requests
+		if left.Requests != right.Requests {
+			return cmp.Compare(right.Requests, left.Requests)
 		}
 
-		return out[i].Key < out[j].Key
+		return cmp.Compare(left.Key, right.Key)
 	})
 
 	return out

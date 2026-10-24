@@ -5,7 +5,6 @@ import (
 	"log"
 	"math/rand/v2"
 	"slices"
-	"sort"
 	"strconv"
 	"time"
 
@@ -44,6 +43,8 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
 // 拆成「收集候选 → 定成本层 → 排序 → 选号」四段，各段独立可读。
+//
+//nolint:revive // pick/Pick 为内部与公开变体，命名有意成对。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	return p.pickTraceWith(tried, reqModel, realm, nil)
 }
@@ -68,7 +69,9 @@ type PickCandidate struct {
 }
 
 // PickExcludingForRealmTrace 同 PickExcludingForRealm，并返回决策链快照（issue #63）。
-func (p *Pool) PickExcludingForRealmTrace(tried map[string]bool, reqModel, realm string) (*auth.Auth, PickTrace) {
+func (p *Pool) PickExcludingForRealmTrace(
+	tried map[string]bool, reqModel, realm string,
+) (*auth.Auth, PickTrace) {
 	trace := PickTrace{Excluded: map[string]int{}}
 	acct := p.pickTraceWith(tried, reqModel, realm, &trace)
 
@@ -76,6 +79,8 @@ func (p *Pool) PickExcludingForRealmTrace(tried map[string]bool, reqModel, realm
 }
 
 // pickTraceWith 选号并收集决策链；trace=nil 时不分配排除原因 map（常规热路径）。
+//
+//nolint:funlen,maintidx // 选号/排除原因/成本层/排序线性展开。
 func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trace *PickTrace) *auth.Auth {
 	var local PickTrace
 
@@ -192,7 +197,9 @@ func topTrace(top []*entry, model string, now time.Time, pool *Pool, maxCredits 
 // pickCandidates 收集本次 pick 的 healthy 候选：跳过 tried、惰性清理过期模型级
 // 冷却/成本台账、按模型与域判定健康、应用积分保底拦截与在途占满过滤。
 // 调用方必须已持有 p.mu 写锁。
-func (p *Pool) pickCandidates(tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace) []*entry {
+func (p *Pool) pickCandidates(
+	tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace,
+) []*entry {
 	cands := p.pickCands[:0]
 
 	for strVal, entry2 := range p.byUID {
@@ -363,13 +370,17 @@ type weightedEntry struct {
 	cost1k float64
 }
 
-func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, maxCredits int64, now time.Time) (ordered, top []*entry) {
+func (p *Pool) rankCandidates(
+	cands []*entry, reqModel string, bestTier int, maxCredits int64, now time.Time,
+) (ordered, top []*entry) {
 	weightedEntries := p.pickWeightBuf[:0]
 
 	for _, e := range cands {
 		ti, ci := e.costTier(reqModel, now)
 		if ti == bestTier {
-			weightedEntries = append(weightedEntries, weightedEntry{e: e, w: p.routingWeightOf(e, maxCredits, reqModel, now), cost1k: ci})
+			weightedEntries = append(weightedEntries, weightedEntry{
+				e: e, w: p.routingWeightOf(e, maxCredits, reqModel, now), cost1k: ci,
+			})
 		}
 	}
 
@@ -378,7 +389,7 @@ func (p *Pool) rankCandidates(cands []*entry, reqModel string, bestTier int, max
 		// 手写 Fisher-Yates：使用并发安全的全局源，不消耗 p.randInt64N 注入源，
 		// 也避免每次 Pick 分配 PCG 与 Shuffle 闭包。
 		for i := len(weightedEntries) - 1; i > 0; i-- {
-			j := rand.IntN(i + 1)
+			j := rand.IntN(i + 1) //nolint:gosec // Fisher-Yates 选号打散，非安全用途
 			weightedEntries[i], weightedEntries[j] = weightedEntries[j], weightedEntries[i]
 		}
 	}
@@ -540,7 +551,9 @@ func (p *Pool) dailyBlocked(e *entry, model, realm string, now time.Time) bool {
 
 // dailyBlockedUsage 用给定当日快照判定：token 达限 → 全模型；积分达限 →
 // 仅收费模型；按模型 token 达限 → 仅该模型。
-func (p *Pool) dailyBlockedUsage(usage map[string]DailyUsage, entry3 *entry, model, realm string, now time.Time) bool {
+func (p *Pool) dailyBlockedUsage(
+	usage map[string]DailyUsage, entry3 *entry, model, realm string, now time.Time,
+) bool {
 	lim := p.dailyLimitsFor(entry3.a.Realm())
 	if !lim.enabled() {
 		return false
@@ -604,7 +617,9 @@ func (p *Pool) AllDailyBlocked(model, realm string) bool {
 //     仍可能可用，不算日限，全部候选如此时由 ModelBlocked 回 400/429；
 //   - 两者都为 false：当日不可用且不会在 0 点前恢复，计入日限。同时带账号级
 //     冷却的模型冷却走原有口径（max 截止仍跨 0 点则按日限）。
-func (p *Pool) dailyBlockClass(item *entry, usage map[string]DailyUsage, model, realm string, now time.Time) (serveable, onlyModel bool) {
+func (p *Pool) dailyBlockClass(
+	item *entry, usage map[string]DailyUsage, model, realm string, now time.Time,
+) (serveable, onlyModel bool) {
 	if item.modelCooled(now, model) && item.healthy(now) && !p.dailyBlockedUsage(usage, item, model, realm, now) {
 		// 会在 0 点前恢复 → 不算「今天没号」：即使其他账号已触日限，也不能把
 		// 少数账号的日限放大成整池等次日；恢复时刻仍由选号/模型阻塞路径处理。
@@ -641,7 +656,7 @@ func (p *Pool) DailyLimitedUIDs() []string {
 		}
 	}
 
-	sort.Strings(out)
+	slices.Sort(out)
 
 	return out
 }
@@ -716,7 +731,8 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	}
 
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s",
-		logfmt.Label(best.a.UID, best.a.NicknameValue()), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+		logfmt.Label(best.a.UID, best.a.NicknameValue()), best.expiry(now).Format(time.RFC3339),
+		best.fallbackKind(now))
 	best.lastUsed = p.now()
 	// 单飞探针（issue #116 P0-3）：刚解封账号只允许一个兜底请求先试探，其余并发
 	// 在 probeWindow 内直接失败，避免二次踩爆。
@@ -734,7 +750,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 // fallbackEligible 判定账号是否可参与全冷却兜底：排除 tried/跨域/禁用暂停/
 // 有效 hard 冷却（调了必 402）/请求模型的模型级冷却/积分保底拦截/在途占满。
 // 调用方需已持 p.mu。
-func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool, realm, model string, now time.Time) bool {
+func (p *Pool) fallbackEligible(
+	entry2 *entry, uid string, tried map[string]bool, realm, model string, now time.Time,
+) bool {
 	if tried != nil && tried[uid] {
 		return false
 	}
@@ -765,7 +783,7 @@ func (p *Pool) fallbackEligible(entry2 *entry, uid string, tried map[string]bool
 // fallbackCoolingBlocks 兜底前的冷却判定：余额耗尽号调了必 402；请求模型仍在本
 // 账号模型级冷却中（11136 权限缺失 / 11141 已下线 / 6004 限流）则探测也必然失败，
 // 两者都不参与兜底。
-func (p *Pool) fallbackCoolingBlocks(entry2 *entry, model string, now time.Time) bool {
+func (*Pool) fallbackCoolingBlocks(entry2 *entry, model string, now time.Time) bool {
 	if entry2.hardCoolingActive(now) {
 		return true
 	}

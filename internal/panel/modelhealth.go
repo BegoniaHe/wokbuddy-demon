@@ -260,7 +260,9 @@ func (p *Panel) runModelProbe(parent context.Context, realm, model string) model
 	defer rc.Close()
 
 	if status >= http.StatusBadRequest {
-		return probeFailure(start, upstream.Classify(status, string(respBody)).String(), truncateProbeError(string(respBody)))
+		return probeFailure(
+			start, upstream.Classify(status, string(respBody)).String(), truncateProbeError(string(respBody)),
+		)
 	}
 
 	ttft, tokens, errClass, errMsg := readProbeStream(start, rc)
@@ -372,7 +374,9 @@ func readProbeStream(start time.Time, rc io.Reader) (ttft, tokens int64, errClas
 }
 
 // handleProbeFrame 处理一帧 data payload（error 帧 / [DONE] / 内容与 usage）。
-func handleProbeFrame(payload string, start time.Time, ttft, tokens int64) (done bool, nTTFT, nTokens int64, errClass, errMsg string) {
+func handleProbeFrame(
+	payload string, start time.Time, ttft, tokens int64,
+) (done bool, nTTFT, nTokens int64, errClass, errMsg string) {
 	if payload == "[DONE]" {
 		return true, ttft, tokens, "", ""
 	}
@@ -583,12 +587,15 @@ func summarizeProbeSamples(samples []modelProbeSample) modelProbeHealth {
 }
 
 // percentile 取有序切片的 p 分位（最近秩法，p ∈ [0,100]）。
+// percentileDenominator 百分位分母。
+const percentileDenominator = 100
+
 func percentile(sorted []int64, p int) int64 {
 	if len(sorted) == 0 {
 		return 0
 	}
 	// 最近秩法：idx = ceil(p·n/100)-1（p95/10 个样本取第 10 个）。
-	idx := (p*len(sorted)+99)/100 - 1
+	idx := (p*len(sorted)+percentileDenominator-1)/percentileDenominator - 1
 	idx = max(idx, 0)
 	idx = min(idx, len(sorted)-1)
 

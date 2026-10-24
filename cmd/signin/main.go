@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -39,7 +39,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	sort.Strings(files)
+	slices.Sort(files)
 
 	profiles, perr := clientprofile.LoadDir("data/client-profiles")
 	if perr != nil {
@@ -54,7 +54,8 @@ func main() {
 
 	// 报告
 	fmt.Printf("uid                                  | nick        | status       | remain | detail\n")
-	fmt.Printf("-------------------------------------+-------------+--------------+--------+------------------------------\n")
+	fmt.Printf("-------------------------------------+-------------+--------------+--------+" +
+		"------------------------------\n")
 
 	for _, r := range rows {
 		remain := "-"
@@ -95,7 +96,7 @@ func processAccounts(files []string, up *upstream.Client) (rows []row, okN, alre
 func processAccount(str string, client *upstream.Client) row {
 	r := row{file: filepath.Base(str)}
 
-	raw, err := os.ReadFile(str)
+	raw, err := os.ReadFile(str) //nolint:gosec // 路径来自本机 CLI 参数，非远程输入
 	if err != nil {
 		r.status, r.detail = "LOAD_ERR", err.Error()
 		return r

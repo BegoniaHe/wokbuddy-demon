@@ -176,7 +176,9 @@ type apiEnvelope struct {
 }
 
 // doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error。
-func doJSON(client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader) (json.RawMessage, int, error) {
+func doJSON(
+	client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader,
+) (json.RawMessage, int, error) {
 	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
@@ -188,19 +190,21 @@ func doJSON(client *http.Client, method, fullURL string, headers func(*http.Requ
 
 	headers(req)
 
-	resp, err := client.Do(req)
+	resp, err := client.Do(req) //nolint:gosec,nolintlint // URL 由固定 realm 端点拼接；绕过 gosec 增量分析抖动
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %w", resp.StatusCode, errDoJSONFailed)
 	}
 
-	if resp.StatusCode >= 300 {
-		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream redirect %d: %w", resp.StatusCode, errDoJSONFailed)
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, resp.StatusCode, fmt.Errorf(
+			"http_error: upstream redirect %d: %w", resp.StatusCode, errDoJSONFailed,
+		)
 	}
 
 	var env apiEnvelope
@@ -341,6 +345,8 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // runURL 执行 url 子命令：向 upstreamBase 的 state 端点 POST 取授权 URL，
 // state 落盘（带 realm），stdout 打印 authURL。out 接 stdout；stateFile 为落盘路径
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
+//
+//nolint:funlen // URL/poll 候选轮转线性展开。
 func runURL(base, origin, realm, statePath string, identity loginIdentity, client *http.Client, out io.Writer) {
 	headers := noAuthHeaders(commonHeaders(origin, identity.userAgent))
 
@@ -400,7 +406,9 @@ func runURL(base, origin, realm, statePath string, identity loginIdentity, clien
 // runPoll 执行 poll 子命令：读 state 文件（realm 校验），向 upstreamBase 的 token 端点
 // GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
 // statePath 可注入临时文件便于测试。
-func runPoll(base, origin, realm, statePath string, identity loginIdentity, client *http.Client, out io.Writer) {
+func runPoll(
+	base, origin, realm, statePath string, identity loginIdentity, client *http.Client, out io.Writer,
+) {
 	loginState2 := loadLoginState(statePath, realm)
 	headers := commonHeaders(origin, identity.userAgent)
 	// handlePollLogin (oauth.go:108-162)：auth/token 是权威登录状态端点，
@@ -447,7 +455,8 @@ func pollTokenWithFallback(
 // loginReplayableStatus 报告登录请求失败是否值得换 origin：仅传输错误与网关类状态码。
 func loginReplayableStatus(status int) bool {
 	switch status {
-	case 0, http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case 0, http.StatusRequestTimeout, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 		return true
 	default:
 		return false
@@ -492,8 +501,12 @@ func loadLoginState(statePath, realm string) loginState {
 }
 
 // pollTokenOnce 单 origin 拉取 token；transient 错误返回给调用方决定是否换 origin。
-func pollTokenOnce(base, state string, headers func(*http.Request), client *http.Client) (tokenBundle, int, error) {
-	tokRaw, status, errTok := doJSON(client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil)
+func pollTokenOnce(
+	base, state string, headers func(*http.Request), client *http.Client,
+) (tokenBundle, int, error) {
+	tokRaw, status, errTok := doJSON(
+		client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil,
+	)
 	if errTok != nil {
 		if status == 0 || status >= 500 {
 			return tokenBundle{}, status, fmt.Errorf("token endpoint error: %w", errTok)
@@ -511,7 +524,9 @@ func pollTokenOnce(base, state string, headers func(*http.Request), client *http
 }
 
 // pollAccount 带 Bearer 拉取 login/account；失败时返回零值（与旧行为一致，不中断输出）。
-func pollAccount(base, state, accessToken string, headers func(*http.Request), client *http.Client) accountInfo {
+func pollAccount(
+	base, state, accessToken string, headers func(*http.Request), client *http.Client,
+) accountInfo {
 	var acct accountInfo
 
 	acctHeaders := func(r *http.Request) {

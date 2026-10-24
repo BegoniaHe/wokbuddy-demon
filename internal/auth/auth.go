@@ -282,7 +282,8 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == realmGlobal }
 //   - POST /v2/billing/meter/daily-checkin                → 400 code 10001「企业账号不支持该操作」
 //   - POST /billing/meter/claim-gift / claim-compensation → 400 code 10001 同上
 //   - GET  /activity/growth/{streak,buddy/info,heatmap,lottery/summary}
-//     与 GET /v2/activity/growth/tasks                    → 403「growth system is only available for personal users」
+//     与 GET /v2/activity/growth/tasks → 403
+//     「growth system is only available for personal users」
 //
 // 因此引用处（scheduler 五类任务 + panel 成长任务/签到入口）必须与 IsGlobal 门控
 // 并列跳过，避免每日对注定失败的端点空发请求、面板按钮必然报错。
@@ -514,6 +515,8 @@ func parseFlatAuth(raw []byte) (Auth, error) {
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
 // 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
+//
+//nolint:funlen // 校验/序列化/原子写/回写缓存线性展开。
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -604,6 +607,8 @@ func validAuthFile(b []byte) bool {
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
+//
+//nolint:gocognit,nestif // realm 存量迁移按空值逐层收口，保持覆盖顺序可见。
 func LoadDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {

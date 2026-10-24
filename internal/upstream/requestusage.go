@@ -30,7 +30,7 @@ const requestUsageMaxRespBytes int64 = 8 << 20
 var errRequestUsageFailed = errors.New("RequestUsage failed")
 
 // requestUsagePaths 返回路径候选：先主路径，404 时再试 /v2（见上方注释）。
-func (c *Client) requestUsagePaths() []string {
+func (*Client) requestUsagePaths() []string {
 	return []string{requestUsagePath, requestUsagePathV2}
 }
 
@@ -61,7 +61,9 @@ type RequestUsagePage struct {
 // 时间是 UTC+8 墙钟字符串（不是 Unix 秒），分页字段是 pageNum（不是 page）；响应
 // data 含 data 列表 + total。解析对字段名宽容（parseRequestUsage），以适配上游命名
 // 的可能差异。
-func (c *Client) RequestUsage(account *auth.Auth, start, end time.Time, page, pageSize int) (*RequestUsagePage, error) {
+func (c *Client) RequestUsage(
+	account *auth.Auth, start, end time.Time, page, pageSize int,
+) (*RequestUsagePage, error) {
 	if pageSize <= 0 {
 		pageSize = 100
 	}
@@ -225,12 +227,15 @@ func parseUsageTime(v any) time.Time {
 }
 
 // timeFromUnix 把秒/毫秒时间戳归一为 time.Time（>=1e12 视为毫秒）。
+// epochMillisThreshold 秒/毫秒时间戳分界。
+const epochMillisThreshold = 1_000_000_000_000
+
 func timeFromUnix(n int64) time.Time {
 	if n <= 0 {
 		return time.Time{}
 	}
 
-	if n >= 1_000_000_000_000 {
+	if n >= epochMillisThreshold {
 		return time.UnixMilli(n)
 	}
 

@@ -8,12 +8,13 @@ package reqlog
 
 import (
 	"bufio"
+	"cmp"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,11 +23,13 @@ import (
 )
 
 const (
-	recentLimit     = 100
-	defaultFileMax  = int64(16 << 20)
-	defaultQueue    = 1024
-	defaultReadMax  = 1000
-	archiveFileGlob = "requests-*.jsonl"
+	recentLimit         = 100
+	defaultFileMax      = int64(16 << 20)
+	defaultQueue        = 1024
+	defaultReadMax      = 1000
+	defaultReadFallback = 200
+	defaultMaxBytes     = 100 << 20
+	archiveFileGlob     = "requests-*.jsonl"
 )
 
 // NewRequestID 生成不含用户信息的本地请求 ID。
@@ -328,7 +331,7 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 	}
 
 	if cfg.MaxBytes <= 0 {
-		cfg.MaxBytes = 100 << 20
+		cfg.MaxBytes = defaultMaxBytes
 	}
 
 	if cfg.FileMaxBytes <= 0 {
@@ -487,6 +490,7 @@ func (w *archiveWriter) openFile(now time.Time, rotate bool) error {
 	return nil
 }
 
+//nolint:gocognit // 目录扫描/日期匹配/兜底选择线性展开。
 func latestArchiveForDay(dir, day string) string {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -614,7 +618,9 @@ func scanArchiveItems(dir string) ([]archiveItem, int64, error) {
 			continue
 		}
 
-		items = append(items, archiveItem{path: filepath.Join(dir, entry.Name()), size: info.Size(), mtime: info.ModTime()})
+		items = append(items, archiveItem{
+			path: filepath.Join(dir, entry.Name()), size: info.Size(), mtime: info.ModTime(),
+		})
 		total += info.Size()
 	}
 
@@ -632,12 +638,12 @@ func (w *archiveWriter) prune() {
 		return
 	}
 
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].mtime.Equal(items[j].mtime) {
-			return items[i].path < items[j].path
+	slices.SortFunc(items, func(a, b archiveItem) int {
+		if a.mtime.Equal(b.mtime) {
+			return cmp.Compare(a.path, b.path)
 		}
 
-		return items[i].mtime.Before(items[j].mtime)
+		return a.mtime.Compare(b.mtime)
 	})
 	w.removeExpired(items, total)
 }
@@ -686,7 +692,7 @@ func (w *archiveWriter) read(limit int, filter *Filter) ([]Event, error) {
 		out = append(out, rows...)
 	}
 	// 契约：按事件时间倒序返回最近 limit 条（同一时刻用 Stable 保留落盘先后）。
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
+	slices.SortStableFunc(out, func(a, b Event) int { return b.Time.Compare(a.Time) })
 
 	if len(out) > limit {
 		out = out[:limit]
@@ -698,7 +704,7 @@ func (w *archiveWriter) read(limit int, filter *Filter) ([]Event, error) {
 // clampReadLimit 归一化读取条数：<=0 回落 200，上限 1000。
 func clampReadLimit(limit int) int {
 	if limit <= 0 {
-		return 200
+		return defaultReadFallback
 	}
 
 	if limit > defaultReadMax {

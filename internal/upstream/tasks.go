@@ -177,6 +177,7 @@ func growthProgress(raw json.RawMessage, cur, tgt int64) (int64, int64) {
 	return cur, tgt
 }
 
+//nolint:funlen // 任务列表解析与归一化线性展开。
 func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 	var resp struct {
 		Tasks []struct {

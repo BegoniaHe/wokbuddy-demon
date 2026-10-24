@@ -47,6 +47,8 @@ func resolveModel(model string) (realm, bare string) {
 }
 
 // ResolveModel 是 resolveModel 的导出面（跨包调用）。
+//
+//nolint:revive // ResolveModel/resolveModel 为公开与内部变体，命名有意成对。
 func ResolveModel(model string) (realm, bare string) { return resolveModel(model) }
 
 // resolveRequestModel 在 realm 前缀之上应用模型别名（issue #52）：
@@ -98,7 +100,8 @@ func checkKeyRealmBinding(model string, aliases map[string]string, keyRealm stri
 		return nil
 	}
 
-	return fmt.Errorf("该 API key 绑定 %s 出口，但请求模型 %q 指定了 %s；请去掉 realm 前缀或改用匹配的 key: %w", keyRealm, model, realm, errCheckKeyRealmBindingFailed)
+	return fmt.Errorf("该 API key 绑定 %s 出口，但请求模型 %q 指定了 %s；"+
+		"请去掉 realm 前缀或改用匹配的 key: %w", keyRealm, model, realm, errCheckKeyRealmBindingFailed)
 }
 
 // explicitModelRealm 报告请求模型是否显式指定 realm（前缀或别名目标的显式前缀）。

@@ -177,20 +177,21 @@ func (p *Pool) Close() {
 }
 
 // SetBreaker 注入熔断器参数（main 从 config 解析后调用）。非正值保留原值（用默认）。
+//
+//nolint:dupl // 字段不同但参数注入形状一致，逐字段保留默认值。
 func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if threshold > 0 {
-		p.breakerThreshold = threshold
-	}
+	applyPositive(&p.breakerThreshold, threshold)
+	applyPositive(&p.breakerCooldown, cooldown)
+	applyPositive(&p.breakerCooldownMax, cooldownMax)
+}
 
-	if cooldown > 0 {
-		p.breakerCooldown = cooldown
-	}
-
-	if cooldownMax > 0 {
-		p.breakerCooldownMax = cooldownMax
+// applyPositive 仅在候选值为正时覆盖目标，保留默认值。
+func applyPositive[T int | int64 | time.Duration](target *T, value T) {
+	if value > 0 {
+		*target = value
 	}
 }
 
@@ -295,21 +296,15 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
 // 非正值保留原值（用默认，见 defaultDegrade*），风格同 SetBreaker/SetSoftRateMax。
+//
+//nolint:dupl // 同 SetBreaker：逐字段保留默认值。
 func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if threshold > 0 {
-		p.degradeThreshold = threshold
-	}
-
-	if cooldown > 0 {
-		p.degradeCooldown = cooldown
-	}
-
-	if cooldownMax > 0 {
-		p.degradeCooldownMax = cooldownMax
-	}
+	applyPositive(&p.degradeThreshold, threshold)
+	applyPositive(&p.degradeCooldown, cooldown)
+	applyPositive(&p.degradeCooldownMax, cooldownMax)
 }
 
 // CreditFloor 透出生效的积分保底值（/status 用）。0 = 关闭。
@@ -569,7 +564,7 @@ func (p *Pool) releaseTotal() {
 }
 
 // acquireAccount 占账号名额；limit<=0 时只计数不拒绝。
-func (p *Pool) acquireAccount(entry2 *entry, limit int) bool {
+func (*Pool) acquireAccount(entry2 *entry, limit int) bool {
 	if limit <= 0 {
 		entry2.inFlight.Add(1)
 		return true

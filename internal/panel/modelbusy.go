@@ -10,6 +10,8 @@ import (
 )
 
 // attachModelBusy 给已构造的模型条目补 busy 字段（按 realm 各取一个可用账号）。
+//
+//nolint:gocognit // 逐模型附加繁忙度并汇总错误，线性展开。
 func (p *Panel) attachModelBusy(out []map[string]any, fetchErrs *[]string) {
 	for _, realm := range []string{"cn", "global"} {
 		names := modelNamesForRealm(out, realm)

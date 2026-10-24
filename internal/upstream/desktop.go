@@ -163,12 +163,22 @@ func desktopCPUModel(account *auth.Auth, cpuCores int) string {
 	return pool[rng.IntN(len(pool))].Name
 }
 
+// 上游事件/缓存共用的字段名。
+const (
+	keyConversationID       = "conversationId"
+	keyElementName          = "elementName"
+	keyRootRequestID        = "rootRequestId"
+	keyParentConversationID = "parentConversationId"
+	modelFastID             = "fast-model"
+	keyExtVersion           = "extVersion"
+)
+
 // desktopRNG 由 uid + salt 稳定派生一个确定性 PRNG：同一账号每次得到同一序列，
 // 不同账号互不相关（避免所有机器同一套硬件参数）。
 func desktopRNG(a *auth.Auth, salt string) *rand.Rand {
 	sum := sha256.Sum256([]byte(salt + ":" + a.UID))
 
-	return rand.New(rand.NewPCG(
+	return rand.New(rand.NewPCG( //nolint:gosec // 设备指纹派生 PRNG，非安全用途
 		binary.LittleEndian.Uint64(sum[0:8]),
 		binary.LittleEndian.Uint64(sum[8:16]),
 	))
@@ -245,7 +255,7 @@ func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"machineId":    deriveID(account7, "machine"),
 		"sessionId":    deriveID(account7, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   c.desktopExtVersionFor(account7),
+		keyExtVersion:  c.desktopExtVersionFor(account7),
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    osVersion,
@@ -354,7 +364,7 @@ func desktopTaskCreated(conversationID, messageID, modelID, modelName string) De
 		"has_template": false, "action": "", "template_name": "",
 		"has_expert": false, "expert_id": "", "expert_name": "", "expert_industry_id": "",
 		"has_skill": false, "skill_names": []any{},
-		"conversationId": conversationID, "messageId": messageID,
+		keyConversationID: conversationID, "messageId": messageID,
 		"buddyId": "", "buddyName": "",
 	})
 }
@@ -363,9 +373,9 @@ func desktopMessageSend(conversationID, requestID, messageID string) DesktopEven
 	return desktopEvent("chat_message_send", map[string]any{
 		"messageId": messageID, "historyCount": 0,
 		"isContextTruncated": false, "currentStepCount": 1,
-		"traceId": requestID, "rootRequestId": requestID,
-		"parentConversationId": conversationID,
-		"agentName":            "cli", "agentType": "main",
+		"traceId": requestID, keyRootRequestID: requestID,
+		keyParentConversationID: conversationID,
+		"agentName":             "cli", "agentType": "main",
 	})
 }
 
@@ -377,9 +387,9 @@ func desktopRequestSend(conversationID, requestID string) DesktopEvent {
 		"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
 		"codebaseId": "", "mentionContextCount": 0, "command": "",
 		"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
-		"traceId": requestID, "rootRequestId": requestID,
-		"parentConversationId": conversationID,
-		"agentName":            "cli", "agentType": "main",
+		"traceId": requestID, keyRootRequestID: requestID,
+		keyParentConversationID: conversationID,
+		"agentName":             "cli", "agentType": "main",
 		"codebuddy.session_id":              conversationID,
 		"codebuddy.conversation_request_id": requestID,
 	})
@@ -392,8 +402,8 @@ func desktopMessageResponse(conversationID, requestID, messageID, modelID string
 		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
 		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
 		"firstTokenAt": time.Now().UnixMilli(), "traceId": requestID,
-		"conversationId": conversationID,
-		"rootRequestId":  requestID, "parentConversationId": conversationID,
+		keyConversationID: conversationID,
+		keyRootRequestID:  requestID, keyParentConversationID: conversationID,
 		"agentName": "cli", "agentType": "main",
 		"codebuddy.session_id":              conversationID,
 		"codebuddy.conversation_request_id": requestID,
@@ -403,9 +413,9 @@ func desktopMessageResponse(conversationID, requestID, messageID, modelID string
 func desktopMessageStatus(conversationID, requestID, messageID string) DesktopEvent {
 	return desktopEvent("chat_message_status", map[string]any{
 		"messageId": messageID, "messageErrorCode": "0",
-		"traceId": requestID, "rootRequestId": requestID,
-		"parentConversationId": conversationID,
-		"agentName":            "cli", "agentType": "main",
+		"traceId": requestID, keyRootRequestID: requestID,
+		keyParentConversationID: conversationID,
+		"agentName":             "cli", "agentType": "main",
 	})
 }
 
@@ -415,7 +425,7 @@ func desktopRequestResponse(conversationID, requestID string) DesktopEvent {
 		"inputToken": 120, "outputToken": 80, "totalToken": 200,
 		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
 		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
-		"rootRequestId": requestID, "parentConversationId": conversationID,
+		keyRootRequestID: requestID, keyParentConversationID: conversationID,
 	})
 }
 
@@ -472,10 +482,12 @@ func DesktopBuddyAppSequence(buddyID, buddyName string) []DesktopEvent {
 
 	return []DesktopEvent{
 		callback("buddyapp_discover_click", nil),
-		callback("buddyapp_show", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2}),
-		callback("buddyapp_enter_click", map[string]any{"elementId": buddyID, "elementName": buddyName, "position": 2, "isFirstPage": "1"}),
-		callback("buddyapp_auth_confirm_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
-		callback("buddyapp_bindaccount_skip_click", map[string]any{"elementId": buddyID, "elementName": buddyName}),
+		callback("buddyapp_show", map[string]any{"elementId": buddyID, keyElementName: buddyName, "position": 2}),
+		callback("buddyapp_enter_click", map[string]any{
+			"elementId": buddyID, keyElementName: buddyName, "position": 2, "isFirstPage": "1",
+		}),
+		callback("buddyapp_auth_confirm_click", map[string]any{"elementId": buddyID, keyElementName: buddyName}),
+		callback("buddyapp_bindaccount_skip_click", map[string]any{"elementId": buddyID, keyElementName: buddyName}),
 	}
 }
 
@@ -484,7 +496,7 @@ func DesktopBuddyAppSequence(buddyID, buddyName string) []DesktopEvent {
 func DesktopAutomationCreateEvent(name string) DesktopEvent {
 	return DesktopEvent{
 		"eventCode": "automated_task_create_suc", "name": name,
-		"source": "manually", "modelId": "fast-model", "modelIsThinking": true,
+		"source": "manually", "modelId": modelFastID, "modelIsThinking": true,
 		"connectorCount": 0, "skills": "", "skillCount": 0,
 		"scheduleType": "once", "mode": desktopLocal,
 	}
@@ -494,10 +506,11 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
 func (c *Client) ReportWebEvent(account6 *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
-	str := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+	str := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 	table := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
-		"pageURL": pageURL, "elementId": elementID, "elementName": elementName,
+		"pageURL": pageURL, "elementId": elementID, keyElementName: elementName,
 		"os": "Win32", "arch": "", "osVersion": "10.0", "userAgent": str,
 		"machineId": deriveID(account6, "webmachine"), "userId": account6.UID,
 		"userNickname": account6.NicknameValue(), "enterpriseId": account6.EnterpriseID,
@@ -508,7 +521,9 @@ func (c *Client) ReportWebEvent(account6 *auth.Auth, eventCode, pageURL, element
 		return fmt.Errorf("ReportWebEvent: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.webBase(account6)+"/v2/report", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(
+		context.Background(), http.MethodPost, c.webBase(account6)+"/v2/report", bytes.NewReader(raw),
+	)
 	if err != nil {
 		return fmt.Errorf("ReportWebEvent: %w", err)
 	}
@@ -541,7 +556,7 @@ func (c *Client) ReportWebEvent(account6 *auth.Auth, eventCode, pageURL, element
 // template_used {template_id,task_mode}，JOIN 一条完整 chat 链。
 // 三账号实测：5 组（不同模板）一次上报 → 5/5 点亮。
 func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), modelFastID, modelFastID)
 	events = append(events,
 		DesktopEvent{
 			"eventCode": "agent_task_created_with_template", "mode": "working",
@@ -557,7 +572,7 @@ func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateN
 // web_element_click(playbook_ctaClick) + playbook_cta_click + playbook_prompt_send
 // （Dialog 发送 Prompt，带 conversationId/requestId JOIN chat 链）。三账号实测 1/1 点亮。
 func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), modelFastID, modelFastID)
 	payload := map[string]any{
 		"id": caseID, "name": caseName, "type": "document",
 		"categoryId": "", "categoryName": "",
@@ -565,7 +580,7 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 	events = append(events,
 		DesktopEvent{
 			"eventCode": "web_element_click", "pageName": "playbook_detail",
-			"elementId": "playbook_ctaClick", "elementName": caseName, "source": "discover",
+			"elementId": "playbook_ctaClick", keyElementName: caseName, "source": "discover",
 		},
 		DesktopEvent(func() map[string]any {
 			m := map[string]any{"eventCode": "playbook_cta_click", "source": "discover", "position": 0}
@@ -574,7 +589,9 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 			return m
 		}()),
 		DesktopEvent(func() map[string]any {
-			m := map[string]any{"eventCode": "playbook_prompt_send", "conversationId": conversationID, "requestId": requestID}
+			m := map[string]any{
+				"eventCode": "playbook_prompt_send", keyConversationID: conversationID, "requestId": requestID,
+			}
 			maps.Copy(m, payload)
 
 			return m
@@ -588,15 +605,15 @@ func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName s
 // wbx_design_canvas_task_create + wbx_design_canvas_open（Ardot create_design 工具
 // 完成时客户端经 metrics 通道上报，同一 /v2/report 端点）。三账号实测 1/1 点亮。
 func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEvent {
-	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), "fast-model", "fast-model")
+	events := DesktopChatSequence(conversationID, requestID, session.NewUUIDv7Hex(), modelFastID, modelFastID)
 
 	return append(events,
 		DesktopEvent{
-			"eventCode": "wbx_design_canvas_task_create", "conversationId": conversationID,
+			"eventCode": "wbx_design_canvas_task_create", keyConversationID: conversationID,
 			"requestId": requestID, "source": "summon_keyword", "cost": 12000, "isSuccessful": true,
 		},
 		DesktopEvent{
-			"eventCode": "wbx_design_canvas_open", "conversationId": conversationID,
+			"eventCode": "wbx_design_canvas_open", keyConversationID: conversationID,
 			"requestId": requestID, "id": "ardot-file-" + requestID[len(requestID)-8:],
 			"source": "summon_keyword", "type": "page", "cost": 13000, "isSuccessful": true,
 		},
@@ -662,10 +679,14 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 // 解析**服务端返回的 requestId**（data.id，如 cmb-xxxx / 32hex）并返回。
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
-func (c *Client) DesktopChatWithExpert(account3 *auth.Auth, expertID string) (conversationID, requestID string, err error) {
+//
+//nolint:funlen,maintidx // 桌面 chat 请求装配与 SSE 解析线性展开。
+func (c *Client) DesktopChatWithExpert(
+	account3 *auth.Auth, expertID string,
+) (conversationID, requestID string, err error) {
 	conversationID = session.NewUUIDv4()
 	body := map[string]any{
-		"model": "fast-model",
+		"model": modelFastID,
 		"messages": []any{
 			map[string]any{"role": "system", "content": "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"},
 			map[string]any{"role": "user", "content": pickChatQuestion()},
@@ -724,7 +745,9 @@ func (c *Client) DesktopChatWithExpert(account3 *auth.Auth, expertID string) (co
 // setDesktopExpertHeaders 注入桌面指纹 chat 请求头（可带 X-Expert-Id）。
 // 对齐官方桌面端 chat 头组：完整三段 UA + X-Agent-Intent/Purpose/Type + X-Private-Data
 // + 会话头族 + traceparent/b3/X-B3-* 链路族 + acp-connection-id。
-func (c *Client) setDesktopExpertHeaders(req *http.Request, account5 *auth.Auth, conversationID, expertID string) {
+func (c *Client) setDesktopExpertHeaders(
+	req *http.Request, account5 *auth.Auth, conversationID, expertID string,
+) {
 	header := req.Header
 	requestID := session.NewUUIDv7Hex()
 
@@ -866,6 +889,9 @@ func scanBufferedRequestID(buf []byte, searchFrom int) (id string, matched bool,
 	}
 }
 
+// maxDebugPayloadLen 调试输出截断长度。
+const maxDebugPayloadLen = 120
+
 // debugChatRead 调试输出单次读取的字节（仅 WB2A_DEBUG_CHAT 非空时）。
 //
 //nolint:forbidigo // 调试专用输出：仅 WB2A_DEBUG_CHAT 显式开启时打印到终端，非库内调试残留。
@@ -875,8 +901,8 @@ func debugChatRead(chunk []byte) {
 	}
 
 	dbg := string(chunk)
-	if len(dbg) > 120 {
-		dbg = dbg[:120]
+	if len(dbg) > maxDebugPayloadLen {
+		dbg = dbg[:maxDebugPayloadLen]
 	}
 
 	fmt.Printf("[dbg-rd %d] %q\n", len(chunk), dbg)
@@ -916,7 +942,7 @@ func DesktopExpertSummonSequence(marketExpert *MarketExpert) []DesktopEvent {
 	return []DesktopEvent{
 		{
 			"eventCode": "web_element_click", "source": marketExpert.ExpertID, "type": cat, "version": ver,
-			"elementId": "expert_summon_click", "elementName": "立即召唤",
+			"elementId": "expert_summon_click", keyElementName: "立即召唤",
 			"pageURL": "/C:/Program%20Files/WorkBuddy/resources/app.asar/renderer/index.html",
 		},
 		{
@@ -966,10 +992,11 @@ func desktopExpertActualUse(marketExpert2 *MarketExpert, conversationID, request
 
 	return DesktopEvent{
 		"eventCode": "expert_actual_use",
-		"id":        marketExpert2.ExpertID, "name": marketExpert2.DisplayNameZH, "expertTitle": marketExpert2.ProfessionZH,
-		"type": cat, "expertType": marketExpert2.ExpertType, "source": "builtin", "version": ver,
+		"id":        marketExpert2.ExpertID, "name": marketExpert2.DisplayNameZH,
+		"expertTitle": marketExpert2.ProfessionZH,
+		"type":        cat, "expertType": marketExpert2.ExpertType, "source": "builtin", "version": ver,
 		"cost": 9000, "characterCount": 14,
-		"conversationId": conversationID, "requestId": requestID, "messageId": session.NewUUIDv7Hex(),
-		"requestModelId": "fast-model", "requestModelName": "fast-model",
+		keyConversationID: conversationID, "requestId": requestID, "messageId": session.NewUUIDv7Hex(),
+		"requestModelId": modelFastID, "requestModelName": modelFastID,
 	}
 }

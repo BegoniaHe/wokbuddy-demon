@@ -25,7 +25,9 @@ const maxPanicStack = 64 << 10
 
 // withRecovery 包裹单个 handler。必须放在鉴权/限流中间件最外层：否则内层
 // 中间件的 defer（如命名密钥 release）不会执行。
-func (h *Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
+//
+//nolint:gocognit // panic 恢复/二次 panic/日志分流线性展开。
+func (*Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		recoveryWriter2 := &recoveryWriter{ResponseWriter: w}
 
@@ -53,7 +55,10 @@ func (h *Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
 			}
 
 			if isAnthropicMessagesPath(r.URL.Path) {
-				writeAnthropicError(recoveryWriter2, http.StatusInternalServerError, "api_error", "internal gateway error", "")
+				writeAnthropicError(
+					recoveryWriter2, http.StatusInternalServerError, "api_error", "internal gateway error", "",
+				)
+
 				return
 			}
 

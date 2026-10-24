@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -174,7 +174,7 @@ func (s *Store) pruneLocked(now time.Time) {
 		all = append(all, entry{key, e.At})
 	}
 
-	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	slices.SortFunc(all, func(a, b entry) int { return a.at.Compare(b.at) })
 
 	for _, item := range all[:len(all)-maxEvents] {
 		delete(s.events, item.key)

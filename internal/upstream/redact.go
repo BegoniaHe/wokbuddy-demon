@@ -16,7 +16,9 @@ const redacted = "[REDACTED]"
 
 var (
 	// authorization / proxy-authorization: Bearer|Basic xxx（含 JSON 引号键）。
-	reAuthorization = regexp.MustCompile(`(?i)("?(?:proxy-)?authorization"?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^\s"',;}]+`)
+	reAuthorization = regexp.MustCompile(
+		`(?i)("?(?:proxy-)?authorization"?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?[^\s"',;}]+`,
+	)
 	// 独立的 Bearer / Basic token。
 	reBearer = regexp.MustCompile(`(?i)\b(?:bearer|basic)\s+[A-Za-z0-9._~+/\-=]+`)
 	// 常见敏感键值（JSON 或 query/header 形态）；只替换值，保留键名便于排障。

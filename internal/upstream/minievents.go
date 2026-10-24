@@ -43,7 +43,7 @@ func mpEventBase(account2 *auth.Auth) map[string]any {
 		"ideType":      "WorkBuddy_MP",
 		"ideVersion":   "2.4.0",
 		"extName":      "workbuddy-mp",
-		"extVersion":   "2.4.0",
+		keyExtVersion:  "2.4.0",
 		"product":      "SaaS",
 		"ideName":      "wx_app_cloud",
 		"platform":     "mini_program",
@@ -78,7 +78,9 @@ func (c *Client) ReportMPEvent(account *auth.Auth, events ...map[string]any) err
 		return fmt.Errorf("ReportMPEvent: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, c.BillingBaseCN+mpReportPath, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(
+		context.Background(), http.MethodPost, c.BillingBaseCN+mpReportPath, bytes.NewReader(raw),
+	)
 	if err != nil {
 		return fmt.Errorf("ReportMPEvent: %w", err)
 	}
@@ -112,8 +114,8 @@ func SchoolChatTimesEvents(conversationID string) map[string]any {
 		"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
 		"codebaseId": "", "mentionContextCount": 0, "command": "",
 		"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
-		"requestId": rid, "traceId": rid, "rootRequestId": rid,
-		"parentConversationId": conversationID, "conversationId": conversationID,
+		"requestId": rid, "traceId": rid, keyRootRequestID: rid,
+		keyParentConversationID: conversationID, keyConversationID: conversationID,
 		"messageId": session.NewUUIDv7Hex(),
 		"agentName": "mp", "agentType": "main",
 		"codebuddy.session_id":              conversationID,
@@ -151,7 +153,7 @@ func MiniExpertUseEvent(expertID, expertName, expertType string) map[string]any 
 
 	return map[string]any{
 		"eventCode": "expert_actual_use", "reportDelay": 0,
-		"extVersion": mpExtVersion, "source": "mini_program",
+		keyExtVersion: mpExtVersion, "source": "mini_program",
 		"id": expertID, "name": expertID,
 		"expertTitle": expertName, "type": "send_message",
 		"characterCount": 12, "expertType": expertType,
@@ -182,15 +184,15 @@ func MiniPlaybookEvents(caseID, caseName string) []map[string]any {
 	}
 	cta := map[string]any{
 		"eventCode": "playbook_cta_click", "source": "discover", "position": 1,
-		"extVersion": mpExtVersion,
+		keyExtVersion: mpExtVersion,
 	}
 	maps.Copy(cta, base)
 
 	send := map[string]any{
 		"eventCode": "playbook_prompt_send", "source": "discover",
 		"promptLength": 96, "isOfficial": 1,
-		"conversationId": session.NewUUIDv4(),
-		"extVersion":     mpExtVersion,
+		keyConversationID: session.NewUUIDv4(),
+		keyExtVersion:     mpExtVersion,
 	}
 	maps.Copy(send, base)
 

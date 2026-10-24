@@ -28,23 +28,28 @@ func keyUsageFrom(ctx context.Context) *keyUsage {
 // writeKeyLimitError 命名密钥超限响应：429 + Retry-After（秒，至少 1）。
 // 错误体按入站协议编码，Anthropic SDK 只解析顶层 type=error 的信封。
 func writeKeyLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.Duration) {
+	writeLimitError(w, r, retryAfter, "rate_limit_exceeded", "api key rate limit exceeded")
+}
+
+// writeLimitError 429 限流响应：Retry-After + 按入站协议编码错误体。
+func writeLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.Duration, code, msg string) {
 	seconds := max(int((retryAfter+time.Second-1)/time.Second), 1)
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
 
 	if requestsGemini(r) {
-		writeGeminiError(w, http.StatusTooManyRequests, "api key rate limit exceeded", "")
+		writeGeminiError(w, http.StatusTooManyRequests, msg, "")
 
 		return
 	}
 
 	if wantsAnthropicErrorBody(r) {
 		setAnthropicRequestID(w, r)
-		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", "api key rate limit exceeded", "")
+		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", msg, "")
 
 		return
 	}
 
-	writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "api key rate limit exceeded")
+	writeOpenAIError(w, http.StatusTooManyRequests, code, msg)
 }
 
 // keyRealmFrom 返回命名密钥的出口绑定（issue #94）；默认密钥/未绑定返回 ""。

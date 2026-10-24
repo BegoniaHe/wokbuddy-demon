@@ -483,6 +483,9 @@ type ModelTimeout struct {
 }
 
 // Default 默认配置。
+// defaultMaxBodyBytes 默认请求体上限（32 MiB）。
+const defaultMaxBodyBytes = 32 << 20
+
 func Default() *Config {
 	c := baseDefaults()
 	applyScheduleDefaults(c)
@@ -502,7 +505,7 @@ func baseDefaults() *Config {
 	config.Cooldown.SoftRate = "600s"
 	config.Cooldown.SoftRateMax = "2h"
 	config.Server.ReadTimeout = "300s"
-	config.Server.MaxBodyBytes = 32 << 20
+	config.Server.MaxBodyBytes = defaultMaxBodyBytes
 	// 缺省只信任本机回环：同机 nginx / Caddy 反代可直接拿到真实客户端 IP。
 	// 反代在另一台机器时必须显式配置，否则来源一律是反代地址。
 	config.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128"}
@@ -599,7 +602,8 @@ func Load(path string) (*Config, error) {
 		// 直接 ReadFile 会报 "Incorrect function" 之类晦涩错误，这里给出可操作提示。
 		if st, statErr := os.Stat(path); statErr == nil && st.IsDir() {
 			return nil, fmt.Errorf(
-				"config %s 是目录而非文件——Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）: %w",
+				"config %s 是目录而非文件——Docker 部署时若宿主机缺少 config.json，bind mount 会创建同名目录。"+
+					"请先 `cp config.example.json config.json` 或删除该目录（程序会自动生成配置）: %w",
 				path,
 				errLoadFailed,
 			)
@@ -695,7 +699,7 @@ func WriteDefault(path string) (string, error) {
 	c.APIKey = key
 	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
 
-	out, err := json.MarshalIndent(c, "", "  ")
+	out, err := json.MarshalIndent(c, "", "  ") //nolint:gosec // config 本就是凭据载体，落盘为设计行为
 	if err != nil {
 		return "", fmt.Errorf("marshal config: %w", err)
 	}
@@ -1225,7 +1229,8 @@ func normalizeAliasTarget(name, value string) (string, error) {
 	if i := strings.IndexByte(model, ':'); i >= 0 {
 		prefix := model[:i]
 		if prefix != "cn" && prefix != "global" {
-			return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 的 realm 前缀必须是 cn 或 global: %w", name, target, errNormalizeAliasTargetFailed)
+			return "", fmt.Errorf("models.aliases[%q]: 目标模型 %q 的 realm 前缀必须是 cn 或 global: %w",
+				name, target, errNormalizeAliasTargetFailed)
 		}
 
 		model = model[i+1:]
@@ -1275,7 +1280,8 @@ func (c *Config) normalizeNotify() error {
 // normalizeLogging 校验决策链采样率（issue #63）：0/1 = 全部，0<v<1 采样，>1 报错。
 func (c *Config) normalizeLogging() error {
 	if c.Logging.DecisionTraceSample < 0 || c.Logging.DecisionTraceSample > 1 {
-		return fmt.Errorf("logging.decision_trace_sample: 必须在 [0,1]，当前 %v: %w", c.Logging.DecisionTraceSample, errNormalizeLoggingFailed)
+		return fmt.Errorf("logging.decision_trace_sample: 必须在 [0,1]，当前 %v: %w",
+			c.Logging.DecisionTraceSample, errNormalizeLoggingFailed)
 	}
 
 	return nil
@@ -1353,7 +1359,8 @@ func (c *Config) validateBackoffOrder() error {
 // validateServerRanges server.* 的非负校验（0 分别表示不限制 / 立即停机）。
 func (c *Config) validateServerRanges() error {
 	if c.Server.MaxBodyBytes < 0 {
-		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）: %w", c.Server.MaxBodyBytes, errValidateServerRangesFailed)
+		return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0 = 不限制）: %w",
+			c.Server.MaxBodyBytes, errValidateServerRangesFailed)
 	}
 
 	if c.Server.RequestAcceptGraceSeconds < 0 {
@@ -1365,7 +1372,8 @@ func (c *Config) validateServerRanges() error {
 	}
 
 	if c.Server.ShutdownGraceSeconds < 0 {
-		return fmt.Errorf("server.shutdown_grace_seconds: 负值 %d 无意义: %w", c.Server.ShutdownGraceSeconds, errValidateServerRangesFailed)
+		return fmt.Errorf("server.shutdown_grace_seconds: 负值 %d 无意义: %w",
+			c.Server.ShutdownGraceSeconds, errValidateServerRangesFailed)
 	}
 
 	if _, err := httpauth.ParseTrustedProxies(c.Server.TrustedProxies); err != nil {
@@ -1378,7 +1386,8 @@ func (c *Config) validateServerRanges() error {
 // validateRanges 字段范围：0 有明确语义（不限 / 关闭）的键不接受负值。
 func (c *Config) validateRanges() error {
 	if err := validateLimitRule("limits", LimitRule{
-		DailyTokens: c.Limits.DailyTokens, DailyCredits: c.Limits.DailyCredits, ModelDailyTokens: c.Limits.ModelDailyTokens,
+		DailyTokens: c.Limits.DailyTokens, DailyCredits: c.Limits.DailyCredits,
+		ModelDailyTokens: c.Limits.ModelDailyTokens,
 	}); err != nil {
 		return err
 	}
@@ -1400,7 +1409,8 @@ func (c *Config) validateRanges() error {
 	}
 
 	if c.Pool.MaxInFlightTotal < 0 {
-		return fmt.Errorf("pool.max_in_flight_total: 负值 %d 无意义（0 = 不限）: %w", c.Pool.MaxInFlightTotal, errValidateRangesFailed)
+		return fmt.Errorf("pool.max_in_flight_total: 负值 %d 无意义（0 = 不限）: %w",
+			c.Pool.MaxInFlightTotal, errValidateRangesFailed)
 	}
 
 	if c.SessionTTL < 0 {
@@ -1408,7 +1418,8 @@ func (c *Config) validateRanges() error {
 	}
 
 	if c.SessionGCInterval <= 0 {
-		return fmt.Errorf("session_sticky.gc_interval: 必须为正时长，当前 %q: %w", c.SessionSticky.GCInterval, errValidateRangesFailed)
+		return fmt.Errorf("session_sticky.gc_interval: 必须为正时长，当前 %q: %w",
+			c.SessionSticky.GCInterval, errValidateRangesFailed)
 	}
 
 	return nil
@@ -1425,7 +1436,8 @@ func validateLimitRule(name string, r LimitRule) error {
 
 // validateGlobalMutex 互斥：global 路由关闭时再配 global base 自相矛盾（base 永不会被使用）。
 func (c *Config) validateGlobalMutex() error {
-	if !c.Global.Enabled && (strings.TrimSpace(c.Global.ChatBase) != "" || strings.TrimSpace(c.Global.BillingBase) != "") {
+	if !c.Global.Enabled &&
+		(strings.TrimSpace(c.Global.ChatBase) != "" || strings.TrimSpace(c.Global.BillingBase) != "") {
 		return errGlobalEnabledFalseGlobalChatBase
 	}
 
@@ -1686,7 +1698,8 @@ func parseModelTimeout(name string, spec ModelTimeout) (ModelTimeout, error) {
 	}
 
 	if header == 0 && idle == 0 {
-		return ModelTimeout{}, fmt.Errorf("upstream.model_timeouts[%q]: header/idle 至少配置一项: %w", name, errParseModelTimeoutFailed)
+		return ModelTimeout{}, fmt.Errorf("upstream.model_timeouts[%q]: header/idle 至少配置一项: %w",
+			name, errParseModelTimeoutFailed)
 	}
 
 	spec.Header = strings.TrimSpace(spec.Header)
@@ -1718,18 +1731,11 @@ func parseOptionalDuration(field, raw string) (time.Duration, error) {
 // normalizeUpstreamRotate 解析轮换总时长预算（issue #17）：空 = "0"（不限）；
 // 负时长无意义 fail fast。
 func (c *Config) normalizeUpstreamRotate() error {
-	budget := c.Upstream.RotateBudget
-	if budget == "" {
-		budget = "0"
-	}
-
-	duration, err := time.ParseDuration(budget)
+	duration, err := normalizeConfigDuration(
+		c.Upstream.RotateBudget, "upstream.rotate_budget", errNormalizeUpstreamRotateFailed,
+	)
 	if err != nil {
-		return fmt.Errorf("upstream.rotate_budget: %w", err)
-	}
-
-	if duration < 0 {
-		return fmt.Errorf("upstream.rotate_budget: 负时长 %q 无意义: %w", c.Upstream.RotateBudget, errNormalizeUpstreamRotateFailed)
+		return err
 	}
 
 	c.RotateBudgetDur = duration
@@ -1740,23 +1746,35 @@ func (c *Config) normalizeUpstreamRotate() error {
 // normalizeUpstreamKeepalive 解析入站 SSE 心跳间隔（issue #54）：空 = "0"（关闭）；
 // 负时长无意义 fail fast。
 func (c *Config) normalizeUpstreamKeepalive() error {
-	raw := c.Upstream.KeepaliveInterval
-	if raw == "" {
-		raw = "0"
-	}
-
-	duration, err := time.ParseDuration(raw)
+	duration, err := normalizeConfigDuration(
+		c.Upstream.KeepaliveInterval, "upstream.keepalive_interval", errNormalizeUpstreamKeepaliveFailed,
+	)
 	if err != nil {
-		return fmt.Errorf("upstream.keepalive_interval: %w", err)
-	}
-
-	if duration < 0 {
-		return fmt.Errorf("upstream.keepalive_interval: 负时长 %q 无意义: %w", c.Upstream.KeepaliveInterval, errNormalizeUpstreamKeepaliveFailed)
+		return err
 	}
 
 	c.KeepaliveIntervalDur = duration
 
 	return nil
+}
+
+// normalizeConfigDuration 解析可为空的时长配置；空串按 "0" 处理，负值报错。
+func normalizeConfigDuration(raw, field string, errSentinel error) (time.Duration, error) {
+	parse := raw
+	if parse == "" {
+		parse = "0"
+	}
+
+	duration, err := time.ParseDuration(parse)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", field, err)
+	}
+
+	if duration < 0 {
+		return 0, fmt.Errorf("%s: 负时长 %q 无意义: %w", field, raw, errSentinel)
+	}
+
+	return duration, nil
 }
 
 // normalizeServerDuration 解析入站读取上限。
@@ -1773,7 +1791,8 @@ func (c *Config) normalizeServerDuration() error {
 	}
 
 	if c.ServerReadTimeoutDur < 0 {
-		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义: %w", c.Server.ReadTimeout, errNormalizeServerDurationFailed)
+		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义: %w",
+			c.Server.ReadTimeout, errNormalizeServerDurationFailed)
 	}
 
 	return nil
@@ -1879,7 +1898,8 @@ func (c *Config) normalizeCheckinDelay() error {
 	}
 
 	if duration < 0 {
-		return fmt.Errorf("schedule.checkin_account_delay: 负时长 %q 无意义: %w", c.Schedule.CheckinAccountDelay, errNormalizeCheckinDelayFailed)
+		return fmt.Errorf("schedule.checkin_account_delay: 负时长 %q 无意义: %w",
+			c.Schedule.CheckinAccountDelay, errNormalizeCheckinDelayFailed)
 	}
 
 	c.Schedule.CheckinAccountDelay = raw
@@ -2112,25 +2132,30 @@ func (c *Config) normalizeListenAndHours() {
 // normalizeBalanceRefresh 计算余额后台刷新周期：启用时 minutes<=0 回落默认 5；
 // 关闭时 interval 保持 0（不启动）。
 func (c *Config) normalizeBalanceRefresh() {
-	if c.Schedule.BalanceRefreshEnabled {
-		if c.Schedule.BalanceRefreshMinutes <= 0 {
-			c.Schedule.BalanceRefreshMinutes = 5
-		}
-
-		c.BalanceRefreshInterval = time.Duration(c.Schedule.BalanceRefreshMinutes) * time.Minute
-	}
+	c.BalanceRefreshInterval = normalizeScheduleInterval(
+		c.Schedule.BalanceRefreshEnabled, &c.Schedule.BalanceRefreshMinutes, 5,
+	)
 }
 
 // normalizeTaskSweep 计算任务补领清扫周期：启用时 minutes<=0 回落默认 15；
 // 关闭时 interval 保持 0（不启动）。
 func (c *Config) normalizeTaskSweep() {
-	if c.Schedule.TaskSweepEnabled {
-		if c.Schedule.TaskSweepMinutes <= 0 {
-			c.Schedule.TaskSweepMinutes = 15
-		}
+	c.TaskSweepInterval = normalizeScheduleInterval(
+		c.Schedule.TaskSweepEnabled, &c.Schedule.TaskSweepMinutes, 15,
+	)
+}
 
-		c.TaskSweepInterval = time.Duration(c.Schedule.TaskSweepMinutes) * time.Minute
+// normalizeScheduleInterval 计算后台周期：关闭返回 0；启用时分钟<=0 回落默认值。
+func normalizeScheduleInterval(enabled bool, minutes *int, fallback int) time.Duration {
+	if !enabled {
+		return 0
 	}
+
+	if *minutes <= 0 {
+		*minutes = fallback
+	}
+
+	return time.Duration(*minutes) * time.Minute
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
@@ -2148,7 +2173,8 @@ func (c *Config) normalizePrompt() error {
 	case "append":
 		c.Prompt.Mode = "append"
 	default:
-		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）: %w", c.Prompt.Mode, errNormalizePromptFailed)
+		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）: %w",
+			c.Prompt.Mode, errNormalizePromptFailed)
 	}
 
 	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" {
@@ -2181,7 +2207,9 @@ func (c *Config) validateScheduleHours() error {
 		return err
 	}
 
-	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
+	if err := checkHourRange(
+		"schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours,
+	); err != nil {
 		return err
 	}
 
@@ -2195,7 +2223,8 @@ func (c *Config) validateScheduleHours() error {
 func checkHourRange(field, switchKey string, hours []int) error {
 	for _, h := range hours {
 		if h < 0 || h > 23 {
-			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false: %w", field, h, switchKey, errCheckHourRangeFailed)
+			return fmt.Errorf("%s: %d 不是合法小时（0-23）；如要关闭该任务请设 schedule.%s=false: %w",
+				field, h, switchKey, errCheckHourRangeFailed)
 		}
 	}
 

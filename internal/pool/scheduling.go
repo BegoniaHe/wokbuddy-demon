@@ -105,8 +105,11 @@ func jitterCooldown(duration time.Duration) time.Duration {
 		return duration
 	}
 
-	return duration - time.Duration(delta) + time.Duration(rand.Int64N(2*delta+1))
+	return duration - time.Duration(delta) + time.Duration(rand.Int64N(2*delta+1)) //nolint:gosec // 调度抖动，非安全用途
 }
+
+// cjkRangeStart CJK 统一表意文字的起始 rune。
+const cjkRangeStart = 0x2E80
 
 // EstimatePromptTokens 粗略估算请求的 prompt token：ASCII ≈ 4 字节/token，
 // CJK ≈ 1.5 字节/token。只用于请求前预扣，不参与计费或 usage 统计。
@@ -114,7 +117,7 @@ func EstimatePromptTokens(body []byte) int {
 	ascii, cjk := 0, 0
 
 	for _, r := range string(body) {
-		if r >= 0x2E80 {
+		if r >= cjkRangeStart {
 			cjk++
 		} else {
 			ascii++

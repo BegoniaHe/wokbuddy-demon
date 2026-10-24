@@ -10,7 +10,7 @@
 // （AMD）一致。型号名采用 Windows 任务管理器/系统信息中的常见展示形式。
 package cpupool
 
-import "sort"
+import "slices"
 
 // Segment 表示处理器所属的厂商产品线分档。
 type Segment uint8
@@ -52,7 +52,8 @@ func amdProduct(segment, series, slug string) string {
 // 支持页仍保留完整 General Specifications，作为官方规格来源）：
 // https://www.amd.com/en/support/downloads/drivers.html/processors/ryzen/ryzen-<series>-series/<slug>.html
 func amdSupport(series, slug string) string {
-	return amdBase + "/en/support/downloads/drivers.html/processors/ryzen/ryzen-" + series + "-series/" + slug + ".html"
+	return amdBase + "/en/support/downloads/drivers.html/processors/ryzen/ryzen-" +
+		series + "-series/" + slug + ".html"
 }
 
 // Models 是全部已核对的型号；桌面与移动合并，按需按核心/线程分档。
@@ -365,7 +366,7 @@ func groupBy(models []CPUModel, key func(CPUModel) int) []band {
 		values = append(values, value)
 	}
 
-	sort.Ints(values)
+	slices.Sort(values)
 
 	bands := make([]band, 0, len(values))
 	for _, value := range values {

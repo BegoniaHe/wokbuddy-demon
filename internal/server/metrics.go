@@ -5,7 +5,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,13 +142,17 @@ func (h *Handler) writePoolMetrics(builder3 *strings.Builder) {
 		return
 	}
 
-	writeHelpType(builder3, "wokbuddy_pool_in_flight", "Current in-flight upstream requests across all accounts.", "gauge")
+	writeHelpType(
+		builder3, "wokbuddy_pool_in_flight", "Current in-flight upstream requests across all accounts.", "gauge",
+	)
 	writeSample(builder3, "wokbuddy_pool_in_flight", "", float64(h.cfg.Pool.InFlightTotal()))
 	_, _, cooling, _, _ := h.cfg.Pool.CountsDetailed() //nolint:dogsled // 只需要 cooling
 
 	writeHelpType(builder3, "wokbuddy_pool_cooling", "Cooling or breaker-open accounts.", "gauge")
 	writeSample(builder3, "wokbuddy_pool_cooling", "", float64(cooling))
-	writeHelpType(builder3, "wokbuddy_model_ttft_ms", "Average account TTFT EWMA in milliseconds by model.", "gauge")
+	writeHelpType(
+		builder3, "wokbuddy_model_ttft_ms", "Average account TTFT EWMA in milliseconds by model.", "gauge",
+	)
 
 	ttft := h.cfg.Pool.TTFTByModel()
 
@@ -157,7 +161,7 @@ func (h *Handler) writePoolMetrics(builder3 *strings.Builder) {
 		models = append(models, model)
 	}
 
-	sort.Strings(models)
+	slices.Sort(models)
 
 	for _, model := range models {
 		writeSample(builder3, "wokbuddy_model_ttft_ms", label("model", model), ttft[model])
@@ -173,28 +177,41 @@ func (h *Handler) writeModelMetrics(builder5 *strings.Builder) {
 
 	rows := h.cfg.Usage.AggregateByModel()
 	// 每族样本连续输出（HELP/TYPE 紧邻其样本），符合 exposition 惯例。
-	writeHelpType(builder5, "wokbuddy_requests_total", "Total upstream request attempts by model and result.", "counter")
+	writeHelpType(
+		builder5, "wokbuddy_requests_total", "Total upstream request attempts by model and result.", "counter",
+	)
 
 	for i := range rows {
 		row := &rows[i]
 		ok := max(row.Requests-row.Errors, 0)
 		writeSample(builder5, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "ok"), float64(ok))
-		writeSample(builder5, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "error"), float64(row.Errors))
+		writeSample(
+			builder5, "wokbuddy_requests_total", labelPair("model", row.Key, "result", "error"), float64(row.Errors),
+		)
 	}
 
 	writeHelpType(builder5, "wokbuddy_tokens_total", "Total tokens by model and kind.", "counter")
 
 	for i := range rows {
 		row := &rows[i]
-		writeSample(builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "prompt"), float64(row.PromptTokens))
-		writeSample(builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "completion"), float64(row.CompletionTok))
-		writeSample(builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "total"), float64(row.TotalTokens))
+		writeSample(
+			builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "prompt"), float64(row.PromptTokens),
+		)
+		writeSample(
+			builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "completion"),
+			float64(row.CompletionTok),
+		)
+		writeSample(
+			builder5, "wokbuddy_tokens_total", labelPair("model", row.Key, "kind", "total"), float64(row.TotalTokens),
+		)
 	}
 }
 
 // writeDurationMetrics 渲染按 result 分流的耗时 histogram（进程内累计）。
 func (h *Handler) writeDurationMetrics(builder2 *strings.Builder) {
-	writeHelpType(builder2, "wokbuddy_request_duration_seconds", "Upstream attempt duration in seconds by result.", "histogram")
+	writeHelpType(
+		builder2, "wokbuddy_request_duration_seconds", "Upstream attempt duration in seconds by result.", "histogram",
+	)
 	// 先快照再渲染：ok/error 恒输出（无观测即全零），保证序列集稳定。
 	snapshot := make(map[string]durationHist, len(durationResults))
 	for _, result := range durationResults {
@@ -224,7 +241,10 @@ func (h *Handler) writeDurationMetrics(builder2 *strings.Builder) {
 			)
 		}
 
-		writeSample(builder2, "wokbuddy_request_duration_seconds_bucket", labelPair("result", result, "le", "+Inf"), float64(hist.count))
+		writeSample(
+			builder2, "wokbuddy_request_duration_seconds_bucket", labelPair("result", result, "le", "+Inf"),
+			float64(hist.count),
+		)
 		writeSample(builder2, "wokbuddy_request_duration_seconds_sum", label("result", result), hist.sum)
 		writeSample(builder2, "wokbuddy_request_duration_seconds_count", label("result", result), float64(hist.count))
 	}
@@ -237,7 +257,9 @@ func (h *Handler) writeRotationMetrics(builder4 *strings.Builder) {
 		return
 	}
 
-	writeHelpType(builder4, "wokbuddy_upstream_rotations_total", "Total upstream account rotations by reason.", "counter")
+	writeHelpType(
+		builder4, "wokbuddy_upstream_rotations_total", "Total upstream account rotations by reason.", "counter",
+	)
 	m.mu.Lock()
 
 	reasons := make([]string, 0, len(m.rotations))
@@ -245,7 +267,7 @@ func (h *Handler) writeRotationMetrics(builder4 *strings.Builder) {
 		reasons = append(reasons, reason)
 	}
 
-	sort.Strings(reasons)
+	slices.Sort(reasons)
 
 	counts := make(map[string]uint64, len(m.rotations))
 	maps.Copy(counts, m.rotations)

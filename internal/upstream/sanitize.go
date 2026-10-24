@@ -189,6 +189,8 @@ func sanitizeToolCalls(v any) bool {
 }
 
 // sanitizeMessages 净化 messages 中的 content 与 tool_calls；任一命中返回 true。
+//
+//nolint:gocognit // content 与 tool_calls 的多形态净化线性展开。
 func sanitizeMessages(messages []any) bool {
 	changed := false
 

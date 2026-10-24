@@ -2,7 +2,7 @@
 package pool
 
 import (
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -35,7 +35,7 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 		uids = append(uids, strVal)
 	}
 
-	sort.Strings(uids)
+	slices.Sort(uids)
 
 	return uids
 }
@@ -62,24 +62,7 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 
 // weightedAvailableLocked 过滤可用账号并按快过期实例数展开；调用方需已持 p.mu。
 func (p *Pool) weightedAvailableLocked(model, realm string, now time.Time) []string {
-	uids := make([]string, 0, len(p.byUID))
-	for strVal, entry2 := range p.byUID {
-		if realm != "" && entry2.a.Realm() != realm {
-			continue
-		}
-
-		if !entry2.healthyForModel(now, model) {
-			continue
-		}
-
-		if p.inFlightFull(entry2) {
-			continue
-		}
-
-		uids = append(uids, strVal)
-	}
-
-	sort.Strings(uids)
+	uids := p.availableUIDsLocked(model, realm, now)
 
 	out := make([]string, 0, len(uids))
 	for _, uid := range uids {
@@ -130,6 +113,11 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 
 	now := p.now()
 
+	return p.availableUIDsLocked(model, realm, now)
+}
+
+// availableUIDsLocked 过滤可用账号并排序；调用方需已持 p.mu。
+func (p *Pool) availableUIDsLocked(model, realm string, now time.Time) []string {
 	uids := make([]string, 0, len(p.byUID))
 	for strVal, entry2 := range p.byUID {
 		if realm != "" && entry2.a.Realm() != realm {
@@ -147,7 +135,7 @@ func (p *Pool) AvailableUIDsForModelRealm(model, realm string) []string {
 		uids = append(uids, strVal)
 	}
 
-	sort.Strings(uids)
+	slices.Sort(uids)
 
 	return uids
 }

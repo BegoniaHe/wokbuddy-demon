@@ -228,7 +228,7 @@ func (p *Panel) exportEncrypted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plain, err := json.Marshal(accounts)
+	plain, err := json.Marshal(accounts) //nolint:gosec // 加密导出前序列化账号，输出随即加密
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "序列化失败")
 		return
@@ -326,27 +326,7 @@ func readSecureAccounts(w http.ResponseWriter, r *http.Request) ([]secureAccount
 // persistSecureAccounts 串行落盘并热加载；失败项逐条返回原因。
 func (p *Panel) persistSecureAccounts(accounts []secureAccount) ([]*auth.Auth, int, int, []string) {
 	// 阶段 1（串行）：字段校验 + 落盘 + 热加载。
-	importedAuths := make([]*auth.Auth, 0, len(accounts))
-	errs := make([]string, 0, len(accounts))
-
-	var imported, skipped int
-
-	for i := range accounts {
-		account, msg := p.persistSecureAccount(&accounts[i])
-		if account == nil {
-			skipped++
-
-			errs = append(errs, msg)
-
-			continue
-		}
-
-		imported++
-
-		importedAuths = append(importedAuths, account)
-	}
-
-	return importedAuths, imported, skipped, errs
+	return persistAccounts(accounts, p.persistSecureAccount)
 }
 
 // validateSecureAccounts 校验解密后的账号数量：空数组与超上限整体拒绝。
@@ -356,7 +336,8 @@ func validateSecureAccounts(accounts []secureAccount) error {
 	}
 
 	if len(accounts) > maxImportAccounts {
-		return fmt.Errorf("too many accounts: %d (max %d per import): %w", len(accounts), maxImportAccounts, errValidateSecureAccountsFailed)
+		return fmt.Errorf("too many accounts: %d (max %d per import): %w",
+			len(accounts), maxImportAccounts, errValidateSecureAccountsFailed)
 	}
 
 	return nil
@@ -375,7 +356,7 @@ func (p *Panel) persistSecureAccount(acc *secureAccount) (*auth.Auth, string) {
 		return nil, fmt.Sprintf("missing required fields (uid=%q)", acc.UID)
 	}
 
-	if !validImportUID(uid) {
+	if !validUID(uid) {
 		return nil, fmt.Sprintf("invalid uid (uid=%q)", acc.UID)
 	}
 

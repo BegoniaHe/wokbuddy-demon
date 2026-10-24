@@ -58,6 +58,8 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 // keysRevoke 软撤销一把密钥（保留记录与计数，立即从网关鉴权移除）。
+//
+//nolint:dupl // 撤销/删除仅文案与 store 方法不同，并排便于对照。
 func (p *Panel) keysRevoke(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Keys == nil {
 		writeErr(w, http.StatusNotImplemented, "api key store not available")
@@ -82,6 +84,8 @@ func (p *Panel) keysRevoke(w http.ResponseWriter, r *http.Request) {
 }
 
 // keysDelete 物理删除一把密钥（连同其用量记录）。
+//
+//nolint:dupl // 同 keysRevoke：结构对照优先于抽 helper。
 func (p *Panel) keysDelete(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Keys == nil {
 		writeErr(w, http.StatusNotImplemented, "api key store not available")
@@ -139,7 +143,8 @@ func (p *Panel) keysUpdateLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("panel: 更新命名密钥限制 id=%s rpm=%d tpm=%d concurrent=%d models=%v", id, limits.RPM, limits.TPM, limits.MaxConcurrent, limits.Models)
+	log.Printf("panel: 更新命名密钥限制 id=%s rpm=%d tpm=%d concurrent=%d models=%v",
+		id, limits.RPM, limits.TPM, limits.MaxConcurrent, limits.Models)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -186,7 +191,9 @@ func normalizeLimits(limits apikey.Limits) (apikey.Limits, error) {
 		return apikey.Limits{}, err
 	}
 
-	return apikey.Limits{RPM: limits.RPM, TPM: limits.TPM, MaxConcurrent: limits.MaxConcurrent, Models: models}, nil
+	return apikey.Limits{
+		RPM: limits.RPM, TPM: limits.TPM, MaxConcurrent: limits.MaxConcurrent, Models: models,
+	}, nil
 }
 
 // normalizeModels 去空白/去重并校验 glob 语法。

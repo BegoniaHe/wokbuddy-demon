@@ -7,7 +7,8 @@
 //	POST /billing/area/get-country-code {filterForbidden:1} → 可取国家列表
 //	POST /billing/area/get-user-area-info {action:getUserAreaInfo} → 检测当前地区
 //	POST /console/login/account {attributes:{countryCode,countryFullName,countryName}} → 提交地区（幂等）
-//	GET  /auth/realms/copilot/overseas/user/register?userId=<uid> → 注册激活（code:200 成功；code:500 "region required" 需补地区）
+//	GET  /auth/realms/copilot/overseas/user/register?userId=<uid> → 注册激活
+//	（code:200 成功；code:500 "region required" 需补地区）
 //	POST /billing/ide/trial → 一次性加油包（幂等码 14051，见 trial.go）
 //
 // 响应体注意：get-country-code / get-user-area-info 的 data 是 JSON 字符串
@@ -123,7 +124,8 @@ func (c *Client) GlobalFetchCountries(account2 *auth.Auth, intlOnly bool) ([]Glo
 	}
 
 	req, err := c.globalRegisterReq(http.MethodPost,
-		c.globalRegisterBase()+"/billing/area/get-country-code", account2.AccessTokenValue(), map[string]any{"filterForbidden": 1})
+		c.globalRegisterBase()+"/billing/area/get-country-code", account2.AccessTokenValue(),
+		map[string]any{"filterForbidden": 1})
 	if err != nil {
 		return nil, err
 	}
@@ -193,6 +195,12 @@ func filterIntlCountries(list []GlobalCountry) []GlobalCountry {
 	return out
 }
 
+// 注册状态接口的业务码（非 HTTP 状态码）。
+const (
+	registerCodeOK             = 200
+	registerCodeRegionRequired = 500
+)
+
 // GlobalRegisterStatus 报告 global 账号注册激活状态：是否需要补地区、是否已激活。
 func (c *Client) GlobalRegisterStatus(account *auth.Auth) (activated, needsRegion bool, msg string, err error) {
 	if account == nil || account.Realm() != "global" {
@@ -214,9 +222,9 @@ func (c *Client) GlobalRegisterStatus(account *auth.Auth) (activated, needsRegio
 	}
 
 	switch {
-	case code == 200:
+	case code == registerCodeOK:
 		return true, false, "register success", nil
-	case code == 500 || strings.Contains(strings.ToLower(m), "region required"):
+	case code == registerCodeRegionRequired || strings.Contains(strings.ToLower(m), "region required"):
 		return false, true, m, nil
 	default:
 		return false, false, m, nil
@@ -289,7 +297,8 @@ func (c *Client) GlobalCompleteRegistration(account4 *auth.Auth) (activated bool
 	}
 
 	if !activated {
-		return false, fmt.Errorf("register still not activated after region submit: %s: %w", msg, errGlobalCompleteRegistrationFailed)
+		return false, fmt.Errorf("register still not activated after region submit: %s: %w",
+			msg, errGlobalCompleteRegistrationFailed)
 	}
 
 	return true, nil

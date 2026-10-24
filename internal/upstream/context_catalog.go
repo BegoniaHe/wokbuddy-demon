@@ -46,7 +46,8 @@ var contextCapFallback = map[string]contextCap{
 	"glm-5v-turbo":  {context: 200000, maxOutput: 131072},  // 实测（CN 200K；models.dev 共识 200K/131072）
 
 	// ---- Kimi 家族（moonshot）----
-	"kimi-k2.7":         {context: 256000, maxOutput: 65536},   // 实测（CN 256K）；输出 65536 为 models.dev kimi-k2.7-code 同族估算
+	// 实测（CN 256K）；输出 65536 为 models.dev kimi-k2.7-code 同族估算
+	"kimi-k2.7":         {context: 256000, maxOutput: 65536},
 	"kimi-k2.6":         {context: 256000, maxOutput: 262144},  // 实测（CN 256K）；输出 models.dev 官方 262144
 	"kimi-k2.5":         {context: 164000, maxOutput: 262144},  // 实测（global 侧同 id 外推 164K）；输出 models.dev 共识 262144
 	"kimi-k3":           {context: 1048576, maxOutput: 131072}, // models.dev 官方（moonshotai 1M/128K）

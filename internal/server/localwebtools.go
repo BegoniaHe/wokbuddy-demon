@@ -77,8 +77,8 @@ func declaredLocalWebTools(body []byte) (map[string]bool, bool) {
 	// 的合并口径保持一致，否则本地 web 工具不会触发、反而被透传给上游。
 	for _, tool := range append(req.Tools, responsesAdditionalTools(req.Input)...) {
 		switch stringValue(tool["type"]) {
-		case "web_search", "web_search_preview":
-			wanted["web_search"] = true
+		case webSearchTool, "web_search_preview":
+			wanted[webSearchTool] = true
 		case "web_fetch":
 			wanted["web_fetch"] = true
 		}
@@ -102,7 +102,9 @@ func (h *Handler) localWebToolRounds() int {
 }
 
 // serveResponsesWithLocalTools 执行本地工具循环并写回最终响应。
-func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Request, body []byte, wanted map[string]bool) {
+func (h *Handler) serveResponsesWithLocalTools(
+	w http.ResponseWriter, r *http.Request, body []byte, wanted map[string]bool,
+) {
 	openAI, model, instructions, stream, err := responsesToOpenAIWithClient(
 		body, h.responsesHTTPClient(), h.cfg.ModelAliases,
 	)
@@ -139,7 +141,9 @@ func (h *Handler) serveResponsesWithLocalTools(w http.ResponseWriter, r *http.Re
 }
 
 // runLocalWebToolLoop 反复执行模型请求与本地工具，返回最终 chat 响应。
-func (h *Handler) runLocalWebToolLoop(r *http.Request, req map[string]any, msgs []any, model string) (map[string]any, error) {
+func (h *Handler) runLocalWebToolLoop(
+	r *http.Request, req map[string]any, msgs []any, model string,
+) (map[string]any, error) {
 	maxRounds := h.localWebToolRounds()
 	for round := 0; round <= maxRounds; round++ {
 		if round == maxRounds {
@@ -153,18 +157,8 @@ func (h *Handler) runLocalWebToolLoop(r *http.Request, req map[string]any, msgs 
 		}
 
 		buf := &bufferResponder{}
-		chatInput2 := chatInput{
-			body:           raw,
-			stream:         false,
-			model:          model,
-			clientIP:       httpauth.ClientIP(r, h.cfg.TrustedProxies),
-			convReqID:      r.Header.Get("X-Conversation-Request-Id"),
-			traceID:        r.Header.Get("X-Trace-Id"),
-			inboundSession: inboundSessionMetaFrom(r),
-			trace:          requestTraceFrom(r),
-			keyUsage:       keyUsageFrom(r.Context()),
-			keyRealm:       keyRealmFrom(r.Context()),
-		}
+		chatInput2 := newChatInputFromRequest(r, raw, false, model)
+		chatInput2.clientIP = httpauth.ClientIP(r, h.cfg.TrustedProxies)
 		h.serveChat(r, &chatInput2, buf)
 
 		if buf.status != 0 {
@@ -219,7 +213,7 @@ func localToolCalls(obj map[string]any) ([]localToolCall, bool) {
 		fn, _ := call["function"].(map[string]any)
 
 		name := stringValue(fn["name"])
-		if name != "web_search" && name != "web_fetch" {
+		if name != webSearchTool && name != "web_fetch" {
 			return nil, false
 		}
 
@@ -254,7 +248,7 @@ func assistantToolMessage(obj map[string]any) map[string]any {
 // 能看到具体原因继续回答。
 func (h *Handler) toolResultMessage(call localToolCall) map[string]any {
 	content := h.executeLocalTool(call)
-	return map[string]any{"role": "tool", "tool_call_id": call.ID, "content": content}
+	return map[string]any{"role": "tool", keyToolCallID: call.ID, "content": content}
 }
 
 func (h *Handler) executeLocalTool(call localToolCall) string {
@@ -265,7 +259,7 @@ func (h *Handler) executeLocalTool(call localToolCall) string {
 
 	_ = json.Unmarshal([]byte(call.Arguments), &args)
 	switch call.Name {
-	case "web_search":
+	case webSearchTool:
 		out, err := h.webSearch(args.Query)
 		if err != nil {
 			return "web_search error: " + err.Error()
@@ -323,7 +317,7 @@ func localToolSpec(name string) map[string]any {
 	}
 
 	return map[string]any{
-		"name": "web_search", "description": "使用 DuckDuckGo 搜索公开网页并返回标题、链接与摘要",
+		"name": webSearchTool, "description": "使用 DuckDuckGo 搜索公开网页并返回标题、链接与摘要",
 		"parameters": map[string]any{
 			"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}},
 			"required": []any{"query"},
@@ -343,8 +337,8 @@ func (b *bufferResponder) JSON(_ int, body any) { b.body = body }
 func (b *bufferResponder) Error(status int, code, msg, _ string) {
 	b.status, b.code, b.msg = status, code, msg
 }
-func (b *bufferResponder) Header(string, string) {}
-func (b *bufferResponder) Stream(io.Reader, func(string) string, *upstream.MarkupRepair, func(string)) error {
+func (*bufferResponder) Header(string, string) {}
+func (*bufferResponder) Stream(io.Reader, func(string) string, *upstream.MarkupRepair, func(string)) error {
 	return errLocalWebToolLoopRequiresNon
 }
 
@@ -378,13 +372,17 @@ func writeResponsesObjectSSE(w http.ResponseWriter, resp map[string]any) {
 	output, _ := resp["output"].([]any)
 	for index, item := range output {
 		obj, _ := item.(map[string]any)
-		event("response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": index, "item": obj})
+		event("response.output_item.added", map[string]any{
+			"type": "response.output_item.added", keyOutputIndex: index, "item": obj,
+		})
 
 		if obj["type"] == "message" {
 			emitBufferedMessage(event, obj, index)
 		}
 
-		event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": index, "item": obj})
+		event("response.output_item.done", map[string]any{
+			"type": "response.output_item.done", keyOutputIndex: index, "item": obj,
+		})
 	}
 
 	event("response.completed", map[string]any{"type": "response.completed", "response": resp})
@@ -394,23 +392,23 @@ func emitBufferedMessage(event func(string, map[string]any), item map[string]any
 	content, _ := item["content"].([]any)
 	for partIndex, part := range content {
 		m, _ := part.(map[string]any)
-		if m["type"] != "output_text" {
+		if m["type"] != typeOutputText {
 			continue
 		}
 
 		text := stringValue(m["text"])
 
 		event("response.content_part.added", map[string]any{
-			"type": "response.content_part.added", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "part": responsesOutputText(""),
+			"type": "response.content_part.added", "item_id": item["id"], keyOutputIndex: index,
+			keyContentIndex: partIndex, "part": responsesOutputText(""),
 		})
 		event("response.output_text.delta", map[string]any{
-			"type": "response.output_text.delta", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "delta": text, "logprobs": []any{},
+			"type": "response.output_text.delta", "item_id": item["id"], keyOutputIndex: index,
+			keyContentIndex: partIndex, "delta": text, "logprobs": []any{},
 		})
 		event("response.output_text.done", map[string]any{
-			"type": "response.output_text.done", "item_id": item["id"], "output_index": index,
-			"content_index": partIndex, "text": text, "logprobs": []any{},
+			"type": "response.output_text.done", "item_id": item["id"], keyOutputIndex: index,
+			keyContentIndex: partIndex, "text": text, "logprobs": []any{},
 		})
 	}
 }

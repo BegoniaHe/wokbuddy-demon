@@ -246,7 +246,9 @@ func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
 	s.schedMu.Unlock()
 }
 
-func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours []int,
+//nolint:revive // 六个任务族的时点/开关成组传入，拆 struct 会割裂调用点。
+func (s *Scheduler) Reconfigure(
+	checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours, growthHours []int,
 	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled, growthDisabled bool,
 ) {
 	s.schedMu.Lock()
@@ -637,7 +639,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // logNextWake 记录下一次唤醒与抖动偏移，便于对账。
-func (s *Scheduler) logNextWake(next time.Time, jitter time.Duration) {
+func (*Scheduler) logNextWake(next time.Time, jitter time.Duration) {
 	if jitter > 0 {
 		log.Printf("下次唤醒 %s (+%s jitter)", next.Format("15:04:05"), jitter.Round(time.Millisecond))
 		return
@@ -769,7 +771,9 @@ func (s *Scheduler) checkinAuth(st *pool.Status, includeDisabled bool) (*auth.Au
 
 // runCheckinAccount 执行单账号签到（企业版跳过）+ 余额刷新。
 // 返回该账号本轮是否成功（签到失败或余额查询失败均记失败）。
-func (s *Scheduler) runCheckinAccount(status *pool.Status, account *auth.Auth, expiringSoon time.Duration) bool {
+func (s *Scheduler) runCheckinAccount(
+	status *pool.Status, account *auth.Auth, expiringSoon time.Duration,
+) bool {
 	ok := true
 	// 企业版无签到体系：上游直接 400；跳过签到，但余额查询照常跑
 	// （企业额度是 credit_floor 判定与面板额度展示的唯一数据源）。
@@ -786,7 +790,9 @@ func (s *Scheduler) runCheckinAccount(status *pool.Status, account *auth.Auth, e
 	}
 
 	s.cfg.Pool.ReenableIfCredits(status.UID, snap.Remain, snap.Total)
-	s.cfg.Pool.SetCreditsSnapshot(status.UID, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+	s.cfg.Pool.SetCreditsSnapshot(
+		status.UID, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets),
+	)
 	s.notifyCreditLow(account, snap.Remain)
 
 	return ok
@@ -903,12 +909,16 @@ func (s *Scheduler) activityAll(ctx context.Context) (total, success, failure in
 func (s *Scheduler) checkActivityStreak(account2 *auth.Auth) bool {
 	days, err := s.cfg.Upstream.GrowthStreak(account2)
 	if err != nil {
-		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(account2.UID, account2.NicknameValue()), err)
+		log.Printf("activity %s: streak check failed (report OK): %v",
+			logfmt.Label(account2.UID, account2.NicknameValue()), err)
+
 		return true
 	}
 
 	if days == 0 {
-		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)", logfmt.Label(account2.UID, account2.NicknameValue()))
+		log.Printf("activity %s: report OK but streak.days=0 (silent drop?)",
+			logfmt.Label(account2.UID, account2.NicknameValue()))
+
 		return true
 	}
 
@@ -974,7 +984,8 @@ func (s *Scheduler) noteKeepaliveFailure(status2 *pool.Status, err error) {
 	var ue *upstream.Error
 	if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !status2.Disabled {
 		if s.cfg.Pool.NoteSessionDead(status2.UID) {
-			log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(status2.UID, status2.Nickname), pool.SessionDeadThreshold())
+			log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用",
+				logfmt.Label(status2.UID, status2.Nickname), pool.SessionDeadThreshold())
 			s.notifyAccount(status2.UID, status2.Nickname, status2.Realm, notify.EventSessionDead,
 				"账号连续 session 失效（12153），已禁用，需重新登录", map[string]any{"stage": "keepalive"})
 		}
@@ -1039,6 +1050,8 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 // RunBalanceRefreshNowCtx 同 RunBalanceRefreshNow，ctx 取消后不再派发新的逐号
 // 请求（已派发的等其完成）。限并发到 balanceRefreshWorkers 后，1000 个账号
 // 遇上上游超时可能让整轮拖上数小时；面板请求断开或进程停机时应尽早停止派发。
+//
+//nolint:gocognit // 派发/等待/取消处理线性展开。
 func (s *Scheduler) RunBalanceRefreshNowCtx(ctx context.Context) {
 	var wg sync.WaitGroup
 
@@ -1115,7 +1128,9 @@ func (s *Scheduler) refreshBalanceAccount(account *auth.Auth, uid string, expiri
 
 // refreshThenSnapshot 余额 401 的 refresh 求证：refresh 成功 → 重试一次快照；
 // refresh 仍失败且为凭证失效 → 计入 session dead（连续阈值才禁用），否则原样返回。
-func (s *Scheduler) refreshThenSnapshot(account *auth.Auth, expiringSoon time.Duration) (upstream.ResourceSnapshot, error) {
+func (s *Scheduler) refreshThenSnapshot(
+	account *auth.Auth, expiringSoon time.Duration,
+) (upstream.ResourceSnapshot, error) {
 	refreshErr := s.cfg.Upstream.RefreshToken(account)
 	if refreshErr == nil {
 		if saveErr := account.SaveAtomicRetry(); saveErr != nil {
@@ -1187,24 +1202,36 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 
 	s.balanceInterval.Store(int64(interval))
 
+	runIntervalLoop(ctx, &s.balanceInterval, s.rearmBalance, "余额后台刷新", s.runBalanceRefreshFirstRound,
+		func(ctx context.Context) { s.RunBalanceRefreshNowCtx(ctx) })
+}
+
+// runIntervalLoop 后台周期循环：间隔可热改，<=0 暂停并等待 rearm 唤醒。
+//
+//nolint:gocognit // 暂停/重排/退出三路 select 交织，顺序即语义。
+func runIntervalLoop(
+	ctx context.Context, interval *atomic.Int64, rearm <-chan struct{}, label string,
+	first, tick func(context.Context),
+) {
 	go func() {
 		var logged time.Duration
 
-		s.runBalanceRefreshFirstRound(ctx)
+		if first != nil {
+			first(ctx)
+		}
 
 		for {
-			cur := time.Duration(s.balanceInterval.Load())
+			cur := time.Duration(interval.Load())
 			if cur != logged {
-				log.Printf("scheduler: 余额后台刷新每 %s（暂停中显示 0s）", cur)
+				log.Printf("scheduler: %s每 %s（暂停中显示 0s）", label, cur)
 				logged = cur
 			}
 
 			if cur <= 0 {
-				// 被热改暂停：等重排通知（重新启用时唤醒）或退出。
 				select {
 				case <-ctx.Done():
 					return
-				case <-s.rearmBalance:
+				case <-rearm:
 					continue
 				}
 			}
@@ -1214,10 +1241,10 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 			case <-ctx.Done():
 				timer.Stop()
 				return
-			case <-s.rearmBalance:
+			case <-rearm:
 				timer.Stop() // 间隔已变：立刻按新值重算
 			case <-timer.C:
-				s.RunBalanceRefreshNowCtx(ctx)
+				tick(ctx)
 			}
 		}
 	}()
@@ -1260,37 +1287,7 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 
 	s.taskSweepInterval.Store(int64(interval))
 
-	go func() {
-		var logged time.Duration
-
-		for {
-			cur := time.Duration(s.taskSweepInterval.Load())
-			if cur != logged {
-				log.Printf("scheduler: 任务补领清扫每 %s（暂停中显示 0s）", cur)
-				logged = cur
-			}
-
-			if cur <= 0 {
-				select {
-				case <-ctx.Done():
-					return
-				case <-s.rearmTaskSweep:
-					continue
-				}
-			}
-
-			timer := time.NewTimer(cur)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-s.rearmTaskSweep:
-				timer.Stop() // 间隔已变：立刻按新值重算
-			case <-timer.C:
-				s.runTaskSweepOnce(ctx)
-			}
-		}
-	}()
+	runIntervalLoop(ctx, &s.taskSweepInterval, s.rearmTaskSweep, "任务补领清扫", nil, s.runTaskSweepOnce)
 }
 
 // runTaskSweepOnce 执行一轮补领清扫（hook 未挂载时跳过）。

@@ -65,7 +65,7 @@ func (s *Scheduler) rndFloat() float64 {
 		return s.rndFn()
 	}
 
-	return rand.Float64()
+	return rand.Float64() //nolint:gosec // 排程抖动，非安全用途
 }
 
 // slotJitter 返回 [0, W) 的确定性抖动：sha256(salt|kind|day|hour) % W。
@@ -89,7 +89,9 @@ func slotJitter(salt string, kind taskKind, day string, hour int, window time.Du
 // jitterWithinHour 在 slotJitter 基础上把抖动截断到配置小时的剩余时长。
 // 普通整点剩余 1h（W <= 59m 时无影响）；DST 拨快抹掉小时开头时 slotOn 可能返回
 // 03:45 一类「小时内首个实际时刻」，此时窗口只剩 15m，必须收窄以免跨到 04:xx。
-func jitterWithinHour(salt string, kind taskKind, hour int, base time.Time, window time.Duration) time.Duration {
+func jitterWithinHour(
+	salt string, kind taskKind, hour int, base time.Time, window time.Duration,
+) time.Duration {
 	jitter := slotJitter(salt, kind, base.Format("2006-01-02"), hour, window)
 	if jitter <= 0 {
 		return 0
@@ -131,7 +133,9 @@ type fireSlot struct {
 
 // nextFireFor 返回 now 之后最近的抖动后触发时刻及其基准整点。
 // 抖动只向前且 W 由调用方保证 <= 59m；W=0 时与 nextFireIn 完全一致。
-func nextFireFor(now time.Time, kind taskKind, hours []int, loc *time.Location, window time.Duration, salt string) fireSlot {
+func nextFireFor(
+	now time.Time, kind taskKind, hours []int, loc *time.Location, window time.Duration, salt string,
+) fireSlot {
 	if loc == nil {
 		loc = now.Location()
 	}
@@ -161,7 +165,9 @@ func nextFireFor(now time.Time, kind taskKind, hours []int, loc *time.Location, 
 
 // samplePacing 对数正态采样：median * exp(σZ - σ²/2)，均值仍等于 median，
 // 再按 floor/ceiling 夹逼。median <= 0 直接返回 0；σ=0 且无夹逼时返回 median。
-func samplePacing(rnd func() float64, median time.Duration, sigma float64, floor, ceiling time.Duration) time.Duration {
+func samplePacing(
+	rnd func() float64, median time.Duration, sigma float64, floor, ceiling time.Duration,
+) time.Duration {
 	if median <= 0 {
 		return 0
 	}
@@ -219,13 +225,16 @@ func (s *Scheduler) samplePacingCurrent(median time.Duration) time.Duration {
 }
 
 // dailyPhase 返回 [0,1) 的确定性相位：同 (salt,uid,day,kind,hour) 恒等。
+// jitterShiftBits 抖动哈希取高位后的右移位数。
+const jitterShiftBits = 11
+
 func dailyPhase(salt, uid, day string, kind taskKind, hour int) float64 {
 	if salt == "" {
 		salt = defaultTimingSalt
 	}
 
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|phase|%s|%s|%s|%d", salt, uid, day, kind, hour)))
-	n := binary.BigEndian.Uint64(sum[:8]) >> 11
+	n := binary.BigEndian.Uint64(sum[:8]) >> jitterShiftBits
 
 	return float64(n) / float64(uint64(1)<<53)
 }
@@ -236,6 +245,19 @@ func dailyPhase(salt, uid, day string, kind taskKind, hour int) float64 {
 //  3. 等待走墙钟分段（sleepCtx 的单调 timer 在机器睡眠时会冻结）。
 //
 // P=0 时只排序不错峰；ctx 取消立即停止剩余账号。
+//
+// sortBatchTargets 按相位与 uid 稳定排序。
+func sortBatchTargets(targets []batchTarget) {
+	slices.SortStableFunc(targets, func(a, b batchTarget) int {
+		if c := cmp.Compare(a.phase, b.phase); c != 0 {
+			return c
+		}
+
+		return cmp.Compare(a.uid, b.uid)
+	})
+}
+
+//nolint:funlen,gocognit // 排序/错峰/等待/记账线性展开。
 func (s *Scheduler) runPacedBatch(
 	ctx context.Context, kind taskKind, median time.Duration, targets []batchTarget,
 ) (total, success, failure int) {
@@ -252,13 +274,7 @@ func (s *Scheduler) runPacedBatch(
 		targets[i].phase = dailyPhase(timing.Salt, targets[i].uid, day, kind, hour)
 	}
 
-	slices.SortStableFunc(targets, func(a, b batchTarget) int {
-		if c := cmp.Compare(a.phase, b.phase); c != 0 {
-			return c
-		}
-
-		return cmp.Compare(a.uid, b.uid)
-	})
+	sortBatchTargets(targets)
 
 	batchStart := time.Now()
 

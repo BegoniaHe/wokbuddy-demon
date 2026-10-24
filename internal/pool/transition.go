@@ -88,7 +88,7 @@ func (p *Pool) resumeLocked(e *entry) {
 // 收敛。硬冷却（CoolHard）的权威恢复证据正是余额恢复（remain>0），照旧解冻。
 // 不动熔断器（fails/retryCount/breakerUntil）——签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康。调用方必须已持有 p.mu。
-func (p *Pool) reviveCoolingLocked(entry2 *entry, credits, total int64) {
+func (*Pool) reviveCoolingLocked(entry2 *entry, credits, total int64) {
 	entry2.credits = credits
 
 	entry2.creditsTotal = total

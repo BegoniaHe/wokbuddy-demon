@@ -23,7 +23,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -76,7 +76,7 @@ func main() {
 		failf("no auth files in %s", *dir)
 	}
 
-	sort.Strings(files)
+	slices.Sort(files)
 
 	rows, counts2 := migrateAll(files, *apply)
 	printTable(rows)
@@ -211,7 +211,7 @@ func writeBackup(path string, raw []byte) error {
 		return fmt.Errorf("writeBackup: %w", err)
 	}
 
-	if err := os.WriteFile(backup, raw, 0o600); err != nil {
+	if err := os.WriteFile(backup, raw, 0o600); err != nil { //nolint:gosec // 备份路径派生自本机 auth 文件路径
 		return fmt.Errorf("write backup: %w", err)
 	}
 
@@ -269,10 +269,13 @@ func convertLegacy(raw []byte) (*auth.Auth, error) {
 	return account, nil
 }
 
+// epochMillisThreshold 秒/毫秒时间戳分界（1e11 秒 ≈ 公元 5138 年）。
+const epochMillisThreshold = 100_000_000_000
+
 // normalizeExpiry 归一化过期时间戳为 Unix 秒：大于 1e11 视为毫秒（旧版工具导出
 // 毫秒时间戳；1e11 秒 ≈ 公元 5138 年，不会与合法秒级时间戳冲突）。
 func normalizeExpiry(v int64) int64 {
-	if v > 100_000_000_000 {
+	if v > epochMillisThreshold {
 		return v / 1000
 	}
 
