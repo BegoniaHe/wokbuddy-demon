@@ -12,6 +12,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
 func newWebFetchTestHandler(t *testing.T, enabled bool, respond func(*http.Request) (*http.Response, error)) *Handler {
@@ -342,5 +343,26 @@ func TestWebFetchMalformedResponseNotRotated(t *testing.T) {
 
 	if got := fetchCalls.Load(); got != 1 {
 		t.Fatalf("fetch calls=%d want 1（确定性失败不换号）", got)
+	}
+}
+
+// TestWebFetchRecordsUsage 抓取与搜索/深检索同口径写入用量账本：请求数与
+// 延迟恒记，避免面板/metrics 漏掉 webfetch 调用。
+func TestWebFetchRecordsUsage(t *testing.T) {
+	t.Parallel()
+
+	handler := newWebFetchTestHandler(t, true, func(*http.Request) (*http.Response, error) {
+		return jsonResponse(200, `{"code":0,"content_type":"text/plain","content":"ok"}`), nil
+	})
+	handler.cfg.Usage = usage.New("")
+
+	rec := postFetch(t, handler, `{"url":"https://93.184.216.34/a"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	rows := handler.cfg.Usage.AggregateByModel()
+	if len(rows) != 1 || rows[0].Key != "webfetch" || rows[0].Requests != 1 {
+		t.Fatalf("usage rows=%+v want webfetch requests=1", rows)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
@@ -48,11 +49,15 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 	// 会话头族在轮转外构造一次：同一次抓取的换号重试必须复用同一聚合主键。
 	meta := searchMetaFromRequest(r)
 
+	started := time.Now()
+	usageModel := webFetchUsageModel(&req)
+
 	outcome, uid, fail := runAgentTool(r.Context(), h, "webfetch", max(h.cfg.MaxRotate+1, 1), true,
 		func(ctx context.Context, acct *auth.Auth) (*upstream.WebFetchOutcome, error) {
 			return h.cfg.Upstream.WebFetch(ctx, acct, req, meta)
 		})
 	if fail != nil {
+		h.recordSearchUsage(r, uid, usageModel, started, nil, false)
 		noteWebFetchTrace(r, h, uid, reqlog.OutcomeHTTPError)
 
 		status, code := webFetchFailure(fail)
@@ -63,6 +68,7 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 
 	// provider 侧重定向后的最终 URL 再校验：不允许落入内网。
 	if err := validateWebURL(r.Context(), outcome.URL); err != nil {
+		h.recordSearchUsage(r, uid, usageModel, started, nil, false)
 		log.Printf("WARN: [server] webfetch rejected final url acct=%s", logfmt.UID8(uid))
 		noteWebFetchTrace(r, h, uid, reqlog.OutcomeHTTPError)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_fetch_failed", "upstream fetch failed")
@@ -70,6 +76,7 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	h.recordSearchUsage(r, uid, usageModel, started, nil, true)
 	noteWebFetchTrace(r, h, uid, reqlog.OutcomeSuccess)
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -136,6 +143,15 @@ func webFetchFailure(fail *searchFailure) (int, string) {
 	default:
 		return http.StatusBadGateway, "upstream_fetch_failed"
 	}
+}
+
+// webFetchUsageModel 用量账本里的模型维度：优先客户端声明的 model_name，否则固定 webfetch。
+func webFetchUsageModel(req *upstream.WebFetchRequest) string {
+	if model := strings.TrimSpace(req.ModelName); model != "" {
+		return model
+	}
+
+	return "webfetch"
 }
 
 // webFetchTitle 从 markdown 首个标题取 title；没有则回落 URL（DSH 要求 title 字符串）。
