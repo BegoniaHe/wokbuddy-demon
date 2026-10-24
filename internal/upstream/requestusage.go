@@ -226,10 +226,10 @@ func parseUsageTime(v any) time.Time {
 	return time.Time{}
 }
 
-// timeFromUnix 把秒/毫秒时间戳归一为 time.Time（>=1e12 视为毫秒）。
 // epochMillisThreshold 秒/毫秒时间戳分界。
 const epochMillisThreshold = 1_000_000_000_000
 
+// timeFromUnix 把秒/毫秒时间戳归一为 time.Time（>=1e12 视为毫秒）。
 func timeFromUnix(n int64) time.Time {
 	if n <= 0 {
 		return time.Time{}

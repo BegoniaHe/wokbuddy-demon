@@ -224,10 +224,10 @@ func (s *Scheduler) samplePacingCurrent(median time.Duration) time.Duration {
 	return samplePacing(s.rndFloat, median, t.PacingSigma, t.PacingFloor, t.PacingCeiling)
 }
 
-// dailyPhase 返回 [0,1) 的确定性相位：同 (salt,uid,day,kind,hour) 恒等。
 // jitterShiftBits 抖动哈希取高位后的右移位数。
 const jitterShiftBits = 11
 
+// dailyPhase 返回 [0,1) 的确定性相位：同 (salt,uid,day,kind,hour) 恒等。
 func dailyPhase(salt, uid, day string, kind taskKind, hour int) float64 {
 	if salt == "" {
 		salt = defaultTimingSalt
@@ -239,13 +239,6 @@ func dailyPhase(salt, uid, day string, kind taskKind, hour int) float64 {
 	return float64(n) / float64(uint64(1)<<53)
 }
 
-// runPacedBatch 执行一轮账号批次：
-//  1. 按 dailyPhase 升序稳定排序（同相位回落 uid）；
-//  2. send_i = max(batchStart + φ_i·P, last + pacing)；
-//  3. 等待走墙钟分段（sleepCtx 的单调 timer 在机器睡眠时会冻结）。
-//
-// P=0 时只排序不错峰；ctx 取消立即停止剩余账号。
-//
 // sortBatchTargets 按相位与 uid 稳定排序。
 func sortBatchTargets(targets []batchTarget) {
 	slices.SortStableFunc(targets, func(a, b batchTarget) int {
@@ -257,6 +250,13 @@ func sortBatchTargets(targets []batchTarget) {
 	})
 }
 
+// runPacedBatch 执行一轮账号批次：
+//  1. 按 dailyPhase 升序稳定排序（同相位回落 uid）；
+//  2. send_i = max(batchStart + φ_i·P, last + pacing)；
+//  3. 等待走墙钟分段（sleepCtx 的单调 timer 在机器睡眠时会冻结）。
+//
+// P=0 时只排序不错峰；ctx 取消立即停止剩余账号。
+//
 //nolint:funlen,gocognit // 排序/错峰/等待/记账线性展开。
 func (s *Scheduler) runPacedBatch(
 	ctx context.Context, kind taskKind, median time.Duration, targets []batchTarget,

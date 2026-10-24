@@ -71,11 +71,11 @@ type Router struct {
 	stop    chan struct{}
 }
 
-// New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
-// TTL/GCInterval 非正取默认（30m / 5m）——main 从 config 解析后传入，这里兜底。
 // defaultSessionTTL 默认会话粘性 TTL。
 const defaultSessionTTL = 30 * time.Minute
 
+// New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
+// TTL/GCInterval 非正取默认（30m / 5m）——main 从 config 解析后传入，这里兜底。
 func New(cfg Config) *Router {
 	if cfg.Store == nil {
 		cfg.Store = redisstore.Noop{}

@@ -630,13 +630,13 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+// epochMillisMinDigits 毫秒 epoch 的最小十进制长度（13 位；11 位边界按秒）。
+const epochMillisMinDigits = 12
+
 // parseRetryNumber 按头名口径把纯数字串折算成时长。x-ratelimit-reset 是
 // epoch 时刻而非时长：秒口径（10 位）与毫秒口径（13 位）都按「now+ 该时刻
 // 的剩余量」折算，已在过去则不可用。位数不足（8 位以下）无法判定 epoch
 // 语义的丢弃（宁缺毋滥：短串多半是序号之类的误用头）。
-// epochMillisMinDigits 毫秒 epoch 的最小十进制长度（13 位；11 位边界按秒）。
-const epochMillisMinDigits = 12
-
 func parseRetryNumber(str, headerName string) (time.Duration, bool) {
 	// 上限 16 位防 int64 溢出（超过 epoch 毫秒的现实量级必非法）。
 	if len(str) > 16 {

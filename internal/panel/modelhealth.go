@@ -586,10 +586,10 @@ func summarizeProbeSamples(samples []modelProbeSample) modelProbeHealth {
 	return modelProbeHealth2
 }
 
-// percentile 取有序切片的 p 分位（最近秩法，p ∈ [0,100]）。
 // percentileDenominator 百分位分母。
 const percentileDenominator = 100
 
+// percentile 取有序切片的 p 分位（最近秩法，p ∈ [0,100]）。
 func percentile(sorted []int64, p int) int64 {
 	if len(sorted) == 0 {
 		return 0

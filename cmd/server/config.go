@@ -482,10 +482,10 @@ type ModelTimeout struct {
 	IdleDur   time.Duration `json:"-"`
 }
 
-// Default 默认配置。
 // defaultMaxBodyBytes 默认请求体上限（32 MiB）。
 const defaultMaxBodyBytes = 32 << 20
 
+// Default 默认配置。
 func Default() *Config {
 	c := baseDefaults()
 	applyScheduleDefaults(c)

@@ -758,10 +758,10 @@ func (g *aggAcc) finish() Agg {
 	return agg
 }
 
-// KeyedAgg 按某个维度聚合的一行。
 // creditsPerMillionTokens 每百万 token 的积分换算分母。
 const creditsPerMillionTokens = 1_000_000
 
+// KeyedAgg 按某个维度聚合的一行。
 type KeyedAgg struct {
 	Agg
 
