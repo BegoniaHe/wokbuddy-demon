@@ -22,7 +22,8 @@ var defaultPrompt string
 // 触发场景：passthrough 模式下请求被上游内容策略拦截（HTTP 400 + 审核文案），
 // 判定为指纹误报后换最小中性提示词重试一次。非对抗框架——只用于绕开
 // system 来源的误报，不改变用户指令的合法性语义。
-const Degraded = "You are a helpful assistant. Respond in the user's language, follow the user's instructions, and be direct and concise."
+const Degraded = "You are a helpful assistant. Respond in the user's language, " +
+	"follow the user's instructions, and be direct and concise."
 
 // Load 按 mode 与 file 加载系统提示词文本。
 //   - file 非空 → 读文件（不存在/读失败返回 error，调用方 fail fast）；

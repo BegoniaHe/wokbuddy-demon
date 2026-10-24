@@ -141,13 +141,20 @@ func readCockpitAccounts(w http.ResponseWriter, r *http.Request) ([]cockpitAccou
 func (p *Panel) persistCockpitAccounts(accounts []cockpitAccount) ([]*auth.Auth, int, int, []string) {
 	// 阶段 1（串行）：字段校验 + 落盘 + 热加载。落盘是本地操作且池写入不并发，
 	// 保持逐号顺序，失败项继续逐条返回（与旧实现逐字一致）。
+	return persistAccounts(accounts, p.persistCockpitAccount)
+}
+
+// persistAccounts 串行落盘并热加载账号；失败项逐条返回原因。
+func persistAccounts[T any](
+	accounts []T, persist func(*T) (*auth.Auth, string),
+) ([]*auth.Auth, int, int, []string) {
 	importedAuths := make([]*auth.Auth, 0, len(accounts))
 	errs := make([]string, 0, len(accounts))
 
 	var imported, skipped int
 
 	for i := range accounts {
-		account, msg := p.persistCockpitAccount(&accounts[i])
+		account, msg := persist(&accounts[i])
 		if account == nil {
 			skipped++
 
@@ -176,7 +183,7 @@ func (p *Panel) persistCockpitAccount(acc *cockpitAccount) (*auth.Auth, string) 
 		return nil, fmt.Sprintf("missing required fields (id=%s)", acc.ID)
 	}
 
-	if !validImportUID(uid) {
+	if !validUID(uid) {
 		return nil, fmt.Sprintf("invalid uid (id=%s)", acc.ID)
 	}
 
@@ -294,21 +301,4 @@ func (p *Panel) importGlobalActivation(account2 *auth.Auth, uid string) {
 	} else if claimed {
 		log.Printf("panel: import global trial uid=%s 已领", uid)
 	}
-}
-
-// validImportUID 校验导入 uid 是否可用于拼文件名（同 login.go validUID 口径）。
-func validImportUID(uid string) bool {
-	if uid == "" || len(uid) > 64 {
-		return false
-	}
-
-	for _, c := range uid {
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-', c == '_':
-		default:
-			return false
-		}
-	}
-
-	return true
 }

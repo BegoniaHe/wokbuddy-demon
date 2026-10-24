@@ -63,8 +63,12 @@ func (c *Client) growthJSON(account *auth.Auth, method, path string, body any) (
 }
 
 // growthJSONPath 单路径 growth 请求，可附加额外请求头。
-func (c *Client) growthJSONPath(account *auth.Auth, method, path string, body any, headers map[string]string) (json.RawMessage, error) {
-	return c.domainJSONLimitHeaders(account, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers)
+func (c *Client) growthJSONPath(
+	account *auth.Auth, method, path string, body any, headers map[string]string,
+) (json.RawMessage, error) {
+	return c.domainJSONLimitHeaders(
+		account, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers,
+	)
 }
 
 // TravelStatus 查询猫猫旅行状态。
@@ -96,10 +100,14 @@ func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) 
 	headers := map[string]string{"X-Product-Code": "workbuddy"}
 	lastPath := "/v2" + travelClaimPath
 
-	data, err := c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers)
+	data, err := c.growthJSONPath(
+		account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers,
+	)
 	if err != nil && isKind(err, ErrNotFound) {
 		lastPath = travelClaimPath
-		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers)
+		data, err = c.growthJSONPath(
+			account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers,
+		)
 	}
 
 	if err != nil && claimNeedsEmptyBody(err) {

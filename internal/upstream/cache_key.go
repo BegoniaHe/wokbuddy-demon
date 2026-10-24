@@ -49,7 +49,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	conv := conversationID
 	if v := strField(obj, "conversation_id"); v != "" {
 		conv = v
-	} else if v := strField(obj, "conversationId"); v != "" {
+	} else if v := strField(obj, keyConversationID); v != "" {
 		conv = v
 	}
 

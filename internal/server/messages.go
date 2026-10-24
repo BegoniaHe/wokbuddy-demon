@@ -30,6 +30,8 @@ import (
 )
 
 // anthropicSearchHandler /v1/search/messages 入口（鉴权由 withClientAuth 负责）。
+//
+//nolint:funlen // 解析/搜索/编码响应线性展开。
 func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request) {
 	setAnthropicRequestID(w, r)
 
@@ -43,7 +45,7 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 	// 命名密钥绑定出口是运维侧的显式约束：搜索只放行 CN 域，绑定 global 的
 	// key 不能在未经授权的情况下消耗 CN 账号额度（与 chat 的 key realm 校验同口径）。
 	if keyRealm := keyRealmFrom(r.Context()); keyRealm != "" && keyRealm != searchRealm {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq,
 			"search endpoint only supports the cn realm; this API key is bound to "+keyRealm, "")
 
 		return
@@ -56,7 +58,7 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 
 	req, perr := parseSearchRequest(body)
 	if perr != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", perr.Error(), "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, perr.Error(), "")
 
 		return
 	}
@@ -117,6 +119,8 @@ type searchRequest struct {
 }
 
 // parseSearchRequest 解析并校验入站请求：模型、messages、web_search 工具声明。
+//
+//nolint:funlen // 解析/校验线性展开，拆开需重复传递错误上下文。
 func parseSearchRequest(body []byte) (*searchRequest, error) {
 	var payload struct {
 		Model     string                 `json:"model"`
@@ -229,7 +233,8 @@ func validateSearchOptions(opts upstream.SearchOptions, deep bool) error {
 		}
 	}
 
-	if len(opts.AllowedDomains) > upstream.SearchMaxDomains || len(opts.BlockedDomains) > upstream.SearchMaxDomains {
+	if len(opts.AllowedDomains) > upstream.SearchMaxDomains ||
+		len(opts.BlockedDomains) > upstream.SearchMaxDomains {
 		return fmt.Errorf("%w（每类最多 %d 个）", errSearchTooManyDomains, upstream.SearchMaxDomains)
 	}
 
@@ -297,16 +302,16 @@ func normalizeSearchModel(raw string) (string, error) {
 const searchQueryMaxLen = 1024
 
 // declaresWebSearch 报告请求是否声明了 web_search 工具（官方形态：
-// {"type":"web_search_20250305","name":"web_search"}；也接受 name=web_search 的简写）。
+// {"type":"web_search_20250305","name":webSearchTool}；也接受 name=web_search 的简写）。
 func declaresWebSearch(tools []map[string]any) bool {
 	for _, tool := range tools {
 		name, _ := tool["name"].(string)
-		if name == "web_search" {
+		if name == webSearchTool {
 			return true
 		}
 
 		kind, _ := tool["type"].(string)
-		if strings.HasPrefix(kind, "web_search") {
+		if strings.HasPrefix(kind, webSearchTool) {
 			return true
 		}
 	}
@@ -408,13 +413,13 @@ func buildSearchMessage(model, query string, outcome *upstream.SearchOutcome) ma
 				"content":     results,
 			},
 		},
-		"stop_reason":   "end_turn",
-		"stop_sequence": nil,
+		stopReasonKey:      "end_turn",
+		stopReasonSequence: nil,
 		// usage 是估算值（网关没有 tokenizer）：input 按搜索词字节/4、output 按摘要
 		// 字节/4 粗估。客户端只用它做上下文预算，不作为计费依据（与 count_tokens 同口径）。
 		"usage": map[string]any{
-			"input_tokens":  max(1, queryBytes/4),
-			"output_tokens": max(1, len(summary)/4),
+			keyInputTokens:  max(1, queryBytes/4),
+			keyOutputTokens: max(1, len(summary)/4),
 		},
 	}
 }
@@ -485,7 +490,7 @@ func buildAgenticSearchMessage(model string, outcome *upstream.AgenticOutcome) m
 		"role":          "assistant",
 		"model":         model,
 		"content":       []map[string]any{{"type": "text", "text": synthesis}},
-		"stop_reason":   "end_turn",
+		stopReasonKey:   "end_turn",
 		"stop_sequence": nil,
 		"usage":         usage,
 	}
@@ -506,6 +511,8 @@ func accountNickname(h *Handler, uid string) string {
 
 // buildSearchBlocks 把搜索结果折成 Anthropic content 需要的三样东西：
 // citations（text 块）、web_search_result（tool_result 块）与摘要文本。
+//
+//nolint:funlen // 搜索结果的 citations/results/summary 线性展开。
 func buildSearchBlocks(outcome *upstream.SearchOutcome) (citations, results []map[string]any, summary string) {
 	citations = make([]map[string]any, 0, len(outcome.Results))
 	results = make([]map[string]any, 0, len(outcome.Results))
@@ -576,10 +583,10 @@ func searchErrorType(status int) string {
 	switch {
 	case status == http.StatusTooManyRequests:
 		return "rate_limit_error"
-	case status >= 500:
-		return "overloaded_error"
-	case status >= 400:
-		return "invalid_request_error"
+	case status >= http.StatusInternalServerError:
+		return errorTypeOverloaded
+	case status >= http.StatusBadRequest:
+		return errorTypeInvalidReq
 	default:
 		return "api_error"
 	}

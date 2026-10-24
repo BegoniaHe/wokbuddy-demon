@@ -119,7 +119,7 @@ func anthropicSearchPrelude(query string, outcome *upstream.SearchOutcome, fail 
 	toolUseID := "srvtoolu_" + session.NewMessageID()
 
 	use := map[string]any{
-		"type": "server_tool_use", "id": toolUseID, "name": "web_search",
+		"type": "server_tool_use", "id": toolUseID, "name": webSearchTool,
 		"input": map[string]any{"query": query},
 	}
 
@@ -152,7 +152,9 @@ func anthropicSearchPrelude(query string, outcome *upstream.SearchOutcome, fail 
 
 // injectAnthropicSearchContext 把检索结果写进 system 消息；失败时写明失败原因，
 // 让模型如实告知用户，而不是把「搜索失败」当成「网上没有」。
-func injectAnthropicSearchContext(req *anthropicRequest, query string, outcome *upstream.SearchOutcome, fail *searchFailure) {
+func injectAnthropicSearchContext(
+	req *anthropicRequest, query string, outcome *upstream.SearchOutcome, fail *searchFailure,
+) {
 	var text strings.Builder
 
 	if fail != nil {

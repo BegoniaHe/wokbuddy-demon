@@ -17,6 +17,8 @@ var (
 
 // Rename 原子替换 oldpath → newpath。非 Windows 等价于单次 os.Rename；
 // Windows 对目标被占用导致的瞬时错误做有界退避重试。
+//
+//nolint:revive,nolintlint // Rename/rename 为跨平台公开与内部实现，命名有意成对。
 func Rename(oldpath, newpath string) error {
 	return rename(oldpath, newpath)
 }
@@ -26,7 +28,9 @@ func Rename(oldpath, newpath string) error {
 //
 // 拆出 doRename/retryable 注入点：平台 rename 在 windows/非 windows 两个构建文件里
 // 提供，跨平台单测可注入假 rename 覆盖「重试后成功 / 重试耗尽 / 不可重试」。
-func renameWithRetry(oldpath, newpath string, doRename func(string, string) error, retryable func(error) bool) error {
+func renameWithRetry(
+	oldpath, newpath string, doRename func(string, string) error, retryable func(error) bool,
+) error {
 	var err error
 
 	delay := renameBaseDelay

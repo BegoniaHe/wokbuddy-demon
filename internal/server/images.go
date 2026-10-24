@@ -42,7 +42,9 @@ func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Reques
 
 	// 单账号租约：出图是低频重请求，占在途名额防止并发把池打满。
 	if !h.cfg.Pool.Acquire(acct.UID) {
-		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", "account is busy, please retry later")
+		writeOpenAIError(
+			w, http.StatusServiceUnavailable, "no_healthy_account", "account is busy, please retry later",
+		)
 
 		return
 	}
@@ -60,7 +62,11 @@ func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Reques
 }
 
 // readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
-func (h *Handler) readImagesRequest(w http.ResponseWriter, r *http.Request) ([]byte, string, string, bool, bool) {
+//
+//nolint:funlen,maintidx // 校验顺序即语义，平铺便于核对拒绝路径。
+func (h *Handler) readImagesRequest(
+	w http.ResponseWriter, r *http.Request,
+) ([]byte, string, string, bool, bool) {
 	if !h.loadLive().ImagesEndpoint {
 		writeOpenAIError(w, http.StatusNotFound, "not_found",
 			"images endpoint is disabled; enable features.images_endpoint to use POST /v1/images/generations")
@@ -264,6 +270,8 @@ func (h *Handler) handleImagesError(
 }
 
 // recordImagesAttempt 记账：reqlog 结果 + usage（响应 usage 缺失时仍记一次请求）。
+//
+//nolint:funlen // 记账分支按结果形态线性展开。
 func (h *Handler) recordImagesAttempt(
 	acct *auth.Auth, realm, model string, raw []byte, err error, started time.Time, r *http.Request,
 ) {
@@ -292,7 +300,8 @@ func (h *Handler) recordImagesAttempt(
 		}
 		if json.Unmarshal(raw, &payload) == nil {
 			delta.PromptTokens, delta.HasPromptTokens = payload.Usage.PromptTokens, payload.Usage.PromptTokens > 0
-			delta.CompletionTokens, delta.HasCompletion = payload.Usage.CompletionTokens, payload.Usage.CompletionTokens > 0
+			delta.CompletionTokens, delta.HasCompletion =
+				payload.Usage.CompletionTokens, payload.Usage.CompletionTokens > 0
 			delta.TotalTokens, delta.HasTotal = payload.Usage.TotalTokens, payload.Usage.TotalTokens > 0
 			delta.Credit, delta.HasCredit = payload.Usage.Credit, payload.Usage.Credit > 0
 		}

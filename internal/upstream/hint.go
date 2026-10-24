@@ -113,7 +113,7 @@ func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 // （error.code / error.data.code / data.code，字符串或数字），取不到再回落
 // error.message 走 Classify（请求级 400 口径）。判不出 → ErrNone（无 hint）。
 //
-//nolint:cyclop // 帧形态按优先级线性判定。
+//nolint:cyclop,funlen,gocognit,gocyclo // 帧形态按优先级线性判定。
 func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate

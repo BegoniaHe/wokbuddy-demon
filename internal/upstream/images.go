@@ -38,7 +38,7 @@ func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP s
 // GenerateImage 向账号所属域的发图端点透传一次请求。返回上游原始 JSON 与状态码；
 // 业务错误（HTTP >=400 或 200 + 非零 code）返回 *Error，body 保留原文供透传。
 //
-//nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
+//nolint:funlen,gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API；请求装配/解析线性展开。
 func (c *Client) GenerateImage(
 	ctx context.Context, account *auth.Auth, body []byte, clientIP string, meta ChatMeta,
 ) (int, []byte, error) {
@@ -46,7 +46,9 @@ func (c *Client) GenerateImage(
 		ctx = context.Background()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatBase(account)+imageGenerationsPath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, c.chatBase(account)+imageGenerationsPath, bytes.NewReader(body),
+	)
 	if err != nil {
 		return 0, nil, fmt.Errorf("GenerateImage: %w", err)
 	}
@@ -68,7 +70,7 @@ func (c *Client) GenerateImage(
 		return resp.StatusCode, nil, fmt.Errorf("%w: > %d bytes", errImageResponseTooLarge, imageResponseMaxBytes)
 	}
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		return resp.StatusCode, raw, &Error{
 			Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode,
 			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),

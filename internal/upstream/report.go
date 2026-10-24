@@ -34,12 +34,16 @@ func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessa
 
 // billingJSONLimit 同 billingJSON，允许调用方指定响应体上限（逐笔用量页含 prompt，
 // 单页 1000 条可超过 1 MiB）。
-func (c *Client) billingJSONLimit(a *auth.Auth, path string, body any, maxBytes int64) (json.RawMessage, error) {
+func (c *Client) billingJSONLimit(
+	a *auth.Auth, path string, body any, maxBytes int64,
+) (json.RawMessage, error) {
 	return c.domainJSONLimit(a, c.billingBase(a), http.MethodPost, path, body, maxBytes)
 }
 
 // domainJSONLimit 对指定 base 域发请求并解信封，额外指定响应体上限。
-func (c *Client) domainJSONLimit(account *auth.Auth, base, method, path string, body any, maxBytes int64) (json.RawMessage, error) {
+func (c *Client) domainJSONLimit(
+	account *auth.Auth, base, method, path string, body any, maxBytes int64,
+) (json.RawMessage, error) {
 	return c.domainJSONLimitHeaders(account, base, method, path, body, maxBytes, nil)
 }
 
@@ -81,7 +85,9 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.
 }
 
 // billingMeterJSONLimit 同 billingMeterJSON，允许调用方指定响应体上限。
-func (c *Client) billingMeterJSONLimit(a *auth.Auth, paths []string, body any, maxBytes int64) (json.RawMessage, error) {
+func (c *Client) billingMeterJSONLimit(
+	a *auth.Auth, paths []string, body any, maxBytes int64,
+) (json.RawMessage, error) {
 	var lastErr error
 
 	for i, path := range paths {
@@ -212,7 +218,9 @@ func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID stri
 
 // ReportChatActivityModel 同上，但可指定上报携带的模型：供「体验某模型」类任务
 // 对齐实际模型（如 Model_chat_GLM5.2 需 requestModelId=glm-5.2 与独立 requestID）。
-func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, requestID, modelID, modelName string) error {
+func (c *Client) ReportChatActivityModel(
+	account2 *auth.Auth, conversationID, requestID, modelID, modelName string,
+) error {
 	if requestID == "" {
 		requestID = session.NewUUIDv7Hex()
 	}
@@ -225,8 +233,25 @@ func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, re
 		modelName = modelID
 	}
 
+	raw, err := json.Marshal([]chatRequestEvent{
+		newChatRequestEvent(account2, conversationID, requestID, modelID, modelName),
+	})
+	if err != nil {
+		return fmt.Errorf("ReportChatActivityModel: %w", err)
+	}
+
+	_, err = c.billingJSON(account2, reportPath, json.RawMessage(raw))
+
+	return err
+}
+
+// newChatRequestEvent 构造 chat_request_send 事件；字段为零值即为官方默认。
+func newChatRequestEvent(
+	account *auth.Auth, conversationID, requestID, modelID, modelName string,
+) chatRequestEvent {
 	now := time.Now().UnixMilli()
-	chatRequestEvent2 := chatRequestEvent{
+
+	return chatRequestEvent{
 		EventCode:             "chat_request_send",
 		Timestamp:             now,
 		ReportDelay:           0,
@@ -262,15 +287,6 @@ func (c *Client) ReportChatActivityModel(account2 *auth.Auth, conversationID, re
 		ParentConversationID:  conversationID,
 		AgentName:             "default",
 		AgentType:             "conversation",
-		UserID:                account2.UID,
+		UserID:                account.UID,
 	}
-
-	raw, err := json.Marshal([]chatRequestEvent{chatRequestEvent2})
-	if err != nil {
-		return fmt.Errorf("ReportChatActivityModel: %w", err)
-	}
-
-	_, err = c.billingJSON(account2, reportPath, json.RawMessage(raw))
-
-	return err
 }

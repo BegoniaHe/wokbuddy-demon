@@ -134,6 +134,8 @@ func (h *Handler) recordSearchUsage(
 //
 // 不接收 model：snippet/深检索请求体不含 model，webfetch 的 model_name 也不是
 // 网关池里的聊天模型；把客户端模型名交给 applyErrorPolicy 会误写模型级冷却/路由熔断。
+//
+//nolint:funlen,gocognit // 轮转/租约/错误处置线性展开。
 func runAgentTool[T any](
 	ctx context.Context, handler *Handler, stage string, attempts int, rotateTransport bool,
 	call func(context.Context, *auth.Auth) (T, error),
@@ -223,6 +225,7 @@ func (h *Handler) agentToolOnAccount[T any](
 	refreshStage := stage + "_refresh"
 
 	// token 临近过期 → 先刷新（失败按既有刷新语义罚号，然后换号）。
+	//nolint:nestif // 刷新失败分类紧邻错误来源，拆开需重复传递判定上下文。
 	if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 		if err := h.cfg.Upstream.RefreshToken(acct); err != nil {
 			h.noteRefreshFailure(acct, err, refreshStage)
@@ -289,6 +292,8 @@ func (h *Handler) agentToolErrorFailure(
 // 刷新失败时惩罚已由 noteRefreshFailure 完成，这里只返回信封、不再走
 // searchFailureFor（避免同一失败被罚两次）；刷新成功但重放仍失败则按重放错误
 // 重新分类（与 chat 的 401 重放后轮转同口径）。
+//
+//nolint:funlen // 刷新/重放/分类线性展开。
 func (h *Handler) agentToolReplayAfterRefresh[T any](
 	ctx context.Context, stage string, acct *auth.Auth, rotateTransport bool,
 	call func(context.Context, *auth.Auth) (T, error),
@@ -332,7 +337,9 @@ func (h *Handler) agentToolReplayAfterRefresh[T any](
 			stage, logfmt.UID8(acct.UID), upstream.RedactForLog(err.Error(), 200))
 
 		if rotateTransport {
-			return zero, &searchFailure{status: http.StatusBadGateway, msg: "upstream " + stage + " failed (transport error)"}
+			return zero, &searchFailure{
+				status: http.StatusBadGateway, msg: "upstream " + stage + " failed (transport error)",
+			}
 		}
 
 		return zero, &searchFailure{

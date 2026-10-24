@@ -17,7 +17,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +30,7 @@ import (
 // 保留仅作历史对照（global e2e 观测日志差集参照）。
 var GlobalModelNames = []string{
 	"default-model",
-	"fast-model",
+	modelFastID,
 	"balanced-model",
 	"primary-model",
 	"hy4-preview",
@@ -255,7 +255,8 @@ func (c *Client) probeGlobalModels(
 
 	if probeResult2.err != nil {
 		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
-		log.Printf("WARN: [upstream] global models: v3/config probe failed (degraded to enterprise endpoint): %v", probeResult2.err)
+		log.Printf("WARN: [upstream] global models: v3/config probe failed "+
+			"(degraded to enterprise endpoint): %v", probeResult2.err)
 
 		names, infos, efforts, defaults = extractEfforts(enterprise.infos)
 
@@ -295,7 +296,7 @@ func (c *Client) probeV3Route(a *auth.Auth, ua string) probeResult {
 		outInfos = append(outInfos, modelInfo)
 	}
 
-	sort.Strings(ids) // map 迭代序随机，排序保输出稳定
+	slices.Sort(ids) // map 迭代序随机，排序保输出稳定
 
 	return probeResult{names: ids, infos: outInfos}
 }
@@ -398,7 +399,9 @@ func mergeV3Routes(routes []struct {
 
 // extractEfforts 从条目列表抽取 effort 能力桶（supportedEfforts 数组优先；
 // 缺数组但 defaultEffort 单档非空也入 defaults 桶）并顺带返回有序 names。
-func extractEfforts(infos []ModelInfo) (names []string, out []ModelInfo, efforts map[string][]string, defaults map[string]string) {
+func extractEfforts(
+	infos []ModelInfo,
+) (names []string, out []ModelInfo, efforts map[string][]string, defaults map[string]string) {
 	names = make([]string, 0, len(infos))
 	for i := range infos {
 		modelInfo := &infos[i]
@@ -560,7 +563,8 @@ func (c *Client) globalModelsOnce(account3 *auth.Auth, path string) ([]string, [
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("global models status %d: %s: %w", resp.StatusCode, truncate(string(raw), 120), errGlobalModelsOnceFailed)
+		return nil, nil, fmt.Errorf("global models status %d: %s: %w",
+			resp.StatusCode, truncate(string(raw), 120), errGlobalModelsOnceFailed)
 	}
 
 	names, infos, _, _, err := parseGlobalModelNames(raw)
@@ -626,7 +630,7 @@ func parseGlobalModelNames(
 // resolveAvailableModels 从 payload 任意层级提取 availableModels。
 // 支持字符串数组与对象数组（_meta["codebuddy.ai"].availableModels 为对象形态）。
 //
-//nolint:cyclop,modernize // 递归遍历多信封，抽取 availableModels。
+//nolint:cyclop,gocognit,gocyclo,modernize // 递归遍历多信封，抽取 availableModels。
 func resolveAvailableModels(payload json.RawMessage) []string {
 	var root any
 	if json.Unmarshal(payload, &root) != nil {

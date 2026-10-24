@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -59,13 +60,15 @@ type agenticRequestBody struct {
 // AgenticSearch 对指定账号执行一次综述式检索。只做单次上游调用，不选号/轮转。
 // meta 与 snippet 搜索同口径：入站会话头族原样透传（上游按会话聚合搜索流量）。
 //
-//nolint:gocritic // ChatMeta 值传递与 SearchHeaders 保持同一口径。
+//nolint:gocritic,funlen // ChatMeta 值传递与 SearchHeaders 同口径；单次调用 + 解析线性展开。
 func (c *Client) AgenticSearch(
 	ctx context.Context, account *auth.Auth, query, bizVia string, meta ChatMeta,
 ) (*AgenticOutcome, error) {
 	query = strings.TrimSpace(query)
 	if len([]rune(query)) < SearchMinQueryLen {
-		return nil, &Error{Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen)}
+		return nil, &Error{
+			Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen),
+		}
 	}
 
 	if strings.TrimSpace(bizVia) == "" {
@@ -114,7 +117,7 @@ func (c *Client) AgenticSearch(
 
 // agenticOutcomeFromResponse 处理状态码/业务错误/SSE，拆开降低主流程复杂度。
 func agenticOutcomeFromResponse(status int, raw []byte) (*AgenticOutcome, error) {
-	if status >= 400 {
+	if status >= http.StatusBadRequest {
 		return nil, &Error{
 			Kind: Classify(status, string(raw)), Status: status,
 			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),

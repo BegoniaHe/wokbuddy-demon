@@ -24,7 +24,7 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -177,7 +177,7 @@ func (f *modelsDevFetcher) pruneNegatives(now time.Time) {
 			oldest = append(oldest, m)
 		}
 
-		sort.Slice(oldest, func(i, j int) bool { return f.negatives[oldest[i]].Before(f.negatives[oldest[j]]) })
+		slices.SortFunc(oldest, func(a, b string) int { return f.negatives[a].Compare(f.negatives[b]) })
 
 		for _, m := range oldest[:cut] {
 			delete(f.negatives, m)
@@ -225,9 +225,13 @@ func (f *modelsDevFetcher) ensureDocAsync(client *http.Client, baseOverride stri
 // 拒绝 nil client（不回落 http.DefaultClient）：生产调用方恒传非 nil，nil 只意味着
 // 测试疏漏——DefaultClient 无超时（挂起隐患）且会打真网（测试污染 + 不确定延迟），
 // 静默 WARN + 返回（与 fetch 失败同语义，降级 1M 兜底）让疏漏显式化。
+//
+//nolint:funlen // 请求/状态/解析/降级顺序线性展开。
 func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 	if client == nil {
-		log.Printf("WARN: [upstream] models.dev fetch: nil client rejected (no DefaultClient fallback, silent fallback to 1M)")
+		log.Printf("WARN: [upstream] models.dev fetch: nil client rejected " +
+			"(no DefaultClient fallback, silent fallback to 1M)")
+
 		return
 	}
 
@@ -364,7 +368,9 @@ func bareModelID(fullID string) string {
 
 // accumulateCandidate 把 (provider, ctx, out) 并入候选列表：同值聚合投票并维护
 // vendor/minProvider，新值追加候选。
-func accumulateCandidate(modelsDevCandidates []modelsDevCandidate, provider string, ctx, out int64) []modelsDevCandidate {
+func accumulateCandidate(
+	modelsDevCandidates []modelsDevCandidate, provider string, ctx, out int64,
+) []modelsDevCandidate {
 	key := fmt.Sprintf("%d/%d", ctx, out)
 	for i := range modelsDevCandidates {
 		if modelsDevCandidates[i].aggKey != key {
@@ -427,6 +433,8 @@ func candidateBetter(modelsDevCandidate2, cur modelsDevCandidate) bool {
 // 与 limit 的采值优先级一致：vendor 官方源（modelsDevVendorSources）优先；否则取
 // provider 字典序最小者（确定性 tie-break，避免 map 迭代序导致同 binary 两次拉取
 // 宣称不同模态）。只保留非空输入模态；值原样交给上游 normalizeModalities 过滤。
+//
+//nolint:gocognit // provider/模态/字典序 tie-break 线性展开。
 func parseModelsDevModalities(raw []byte) (map[string][]string, error) {
 	var doc map[string]struct {
 		Models map[string]struct {
@@ -457,7 +465,9 @@ func parseModelsDevModalities(raw []byte) (map[string][]string, error) {
 				continue
 			}
 
-			best[id] = modelsDevModalityPick{mods: item.Modalities.Input, vendor: modelsDevVendorSources[provider], provider: provider}
+			best[id] = modelsDevModalityPick{
+				mods: item.Modalities.Input, vendor: modelsDevVendorSources[provider], provider: provider,
+			}
 		}
 	}
 

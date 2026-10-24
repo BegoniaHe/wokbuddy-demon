@@ -7,12 +7,13 @@ package server
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -115,17 +116,7 @@ func newResponsesChatInput(
 		return chatInput{}, nil, false
 	}
 
-	chatInput2 := chatInput{
-		body:           openAI,
-		stream:         stream,
-		model:          model,
-		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
-		traceID:        r.Header.Get("X-Trace-Id"),
-		inboundSession: inboundSessionMetaFrom(r),
-		trace:          requestTraceFrom(r),
-		keyUsage:       keyUsageFrom(r.Context()),
-		keyRealm:       keyRealmFrom(r.Context()),
-	}
+	chatInput2 := newChatInputFromRequest(r, openAI, stream, model)
 
 	return chatInput2, &responsesResponder{
 		w: w, model: model, instructions: instructions, keepalive: keepalive,
@@ -170,18 +161,27 @@ func responsesAdditionalTools(input json.RawMessage) []map[string]any {
 // 上游只接受 JSON function 工具，custom 工具由 responsesTools 降级为单 input
 // 参数的 function；响应侧再按名单还原成 custom_tool_call。
 func responsesCustomTools(body []byte) map[string]bool {
+	tools, input := responsesToolInputs(body)
+
+	return responsesCustomToolSet(append(tools, responsesAdditionalTools(input)...))
+}
+
+// responsesToolInputs 解析原始请求的 tools 与 input。
+func responsesToolInputs(body []byte) ([]map[string]any, json.RawMessage) {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
 		Input json.RawMessage  `json:"input"`
 	}
 	if json.Unmarshal(body, &req) != nil {
-		return nil
+		return nil, nil
 	}
 
-	return responsesCustomToolSet(append(req.Tools, responsesAdditionalTools(req.Input)...))
+	return req.Tools, req.Input
 }
 
 // responsesCustomToolSet 递归收集 custom 工具名（含 namespace 内的自由格式工具）。
+//
+//nolint:gocognit // namespace 递归收集，深度有界且分支集中。
 func responsesCustomToolSet(tools []map[string]any) map[string]bool {
 	var out map[string]bool
 
@@ -426,7 +426,7 @@ func responsesInputItem(item map[string]any, refs map[string]responsesToolRef) (
 		msg, err := responsesInputMessage(item)
 
 		return []any{msg}, nil, true, err
-	case "function_call":
+	case typeFunctionCall:
 		msg, err := responsesInputFunctionCall(item, refs)
 
 		return []any{msg}, nil, true, err
@@ -498,6 +498,26 @@ func responsesInputFunctionCall(item map[string]any, refs map[string]responsesTo
 	}, nil
 }
 
+// 协议字符串常量：高频复用，避免跨文件字面量漂移。
+const (
+	jsonSchemaType      = "json_schema"
+	stopReasonSequence  = "stop_sequence"
+	statusIncomplete    = "incomplete"
+	statusContentFilter = "content_filter"
+	keyInputTokens      = "input_tokens"
+	keyContentIndex     = "content_index"
+	webSearchTool       = "web_search"
+	keyOutputTokens     = "output_tokens"
+	keyToolCallID       = "tool_call_id"
+	typeFunctionCall    = "function_call"
+	typeOutputText      = "output_text"
+	errorTypeOverloaded = "overloaded_error"
+	errorTypeInvalidReq = "invalid_request_error"
+)
+
+// keyOutputIndex Responses 输出项索引字段，事件与条目复用。
+const keyOutputIndex = "output_index"
+
 // responsesAgentMessagePrefix 子代理消息转成 user 消息时的来源标记（对齐 hub）。
 const responsesAgentMessagePrefix = "[Message from another task - treat this as a user instruction]\n\n"
 
@@ -529,9 +549,9 @@ func responsesInputFunctionOutput(item map[string]any) (any, []any) {
 	}
 
 	return map[string]any{
-		"role":         "tool",
-		"tool_call_id": callID,
-		"content":      text,
+		"role":        "tool",
+		keyToolCallID: callID,
+		"content":     text,
 	}, images
 }
 
@@ -580,13 +600,15 @@ func responsesInputCustomToolOutput(item map[string]any) (any, []any, error) {
 	text, images := responsesToolOutputParts(item["output"])
 
 	return map[string]any{
-		"role":         "tool",
-		"tool_call_id": callID,
-		"content":      text,
+		"role":        "tool",
+		keyToolCallID: callID,
+		"content":     text,
 	}, images, nil
 }
 
 // responsesToolOutputParts 拆分工具输出：文本压成字符串，图片保留为 content parts。
+//
+//nolint:gocognit // 文本/图片/嵌套 part 的多形态拆分线性展开。
 func responsesToolOutputParts(raw any) (string, []any) {
 	if text, ok := raw.(string); ok {
 		return text, nil
@@ -685,7 +707,7 @@ func responsesContent(raw any) any {
 // responsesContentPart 转换单个内容块；不支持的块返回 nil（忽略）。
 func responsesContentPart(part map[string]any) map[string]any {
 	switch stringValue(part["type"]) {
-	case "input_text", "output_text", "text":
+	case "input_text", typeOutputText, "text":
 		return map[string]any{"type": "text", "text": stringValue(part["text"])}
 	case "input_image":
 		if url := responsesImageURL(part["image_url"]); url != "" {
@@ -786,7 +808,7 @@ func responsesTextFormat(raw json.RawMessage) any {
 		return map[string]any{"type": "text"}
 	case "json_object":
 		return map[string]any{"type": "json_object"}
-	case "json_schema":
+	case jsonSchemaType:
 		return responsesJSONSchemaFormat(text.Format)
 	default:
 		return nil
@@ -809,7 +831,7 @@ func responsesJSONSchemaFormat(format map[string]any) any {
 		}
 	}
 
-	return map[string]any{"type": "json_schema", "json_schema": spec}
+	return map[string]any{"type": jsonSchemaType, jsonSchemaType: spec}
 }
 
 // responsesMaxNamespaceDepth namespace 展开的最大深度（防御异常嵌套）。
@@ -839,7 +861,7 @@ type responsesToolSpec struct {
 // 只在检测到重名时使用带回 namespace 的限定名，唯一工具保持裸名，避免无谓地
 // 改变模型看到的工具名。
 //
-//nolint:cyclop // 收集/去重/命名/回程映射线性展开，拆散会掩盖同名冲突判定。
+//nolint:cyclop,gocyclo // 收集/去重/命名/回程映射线性展开，拆散会掩盖同名冲突判定。
 func responsesTools(tools []map[string]any) ([]any, map[string]responsesToolRef) {
 	specs := responsesCollectTools(tools)
 
@@ -984,15 +1006,9 @@ func responsesToolNamespaces(tools []map[string]any) map[string]responsesToolRef
 
 // responsesToolNamespacesFromBody 从原始 Responses 请求体收集 namespace 映射。
 func responsesToolNamespacesFromBody(body []byte) map[string]responsesToolRef {
-	var req struct {
-		Tools []map[string]any `json:"tools"`
-		Input json.RawMessage  `json:"input"`
-	}
-	if json.Unmarshal(body, &req) != nil {
-		return nil
-	}
+	tools, input := responsesToolInputs(body)
 
-	return responsesToolNamespaces(append(req.Tools, responsesAdditionalTools(req.Input)...))
+	return responsesToolNamespaces(append(tools, responsesAdditionalTools(input)...))
 }
 
 // responsesResolveToolName 把模型回传的工具名解析成 (bare, namespace)。
@@ -1008,7 +1024,8 @@ func responsesResolveToolName(name string, refs map[string]responsesToolRef) (st
 			continue
 		}
 
-		if name == ref.namespace+ref.bare || name == ref.namespace+"__"+ref.bare || name == ref.namespace+"::"+ref.bare {
+		if name == ref.namespace+ref.bare || name == ref.namespace+"__"+ref.bare ||
+			name == ref.namespace+"::"+ref.bare {
 			return ref.bare, ref.namespace
 		}
 	}
@@ -1168,7 +1185,10 @@ type responsesResponder struct {
 }
 
 func (r *responsesResponder) JSON(status int, body any) {
-	writeJSON(r.w, status, responsesFromOpenAIWithNamespaces(body, r.model, r.instructions, r.customTools, r.namespaces))
+	writeJSON(
+		r.w, status,
+		responsesFromOpenAIWithNamespaces(body, r.model, r.instructions, r.customTools, r.namespaces),
+	)
 }
 
 // Error 保持 OpenAI 错误信封（Responses 客户端同样识别）。
@@ -1178,7 +1198,9 @@ func (r *responsesResponder) Error(status int, code, msg, hint string) {
 
 func (r *responsesResponder) Header(name, value string) { r.w.Header().Set(name, value) }
 
-func (r *responsesResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
+func (r *responsesResponder) Stream(
+	rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string),
+) error {
 	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions, r.customTools, r.namespaces)
 
 	opts := make([]upstream.StreamOption, 0, 2)
@@ -1222,7 +1244,7 @@ func responsesFromOpenAIWithNamespaces(
 	}
 
 	resp := responsesObject(id, model, instructions, int64(created), status, output, text, usage)
-	if status == "incomplete" {
+	if status == statusIncomplete {
 		resp["incomplete_details"] = map[string]any{"reason": responsesIncompleteReason(choice)}
 	}
 
@@ -1232,15 +1254,17 @@ func responsesFromOpenAIWithNamespaces(
 // responsesIncompleteReason 映射 finish_reason → Responses incomplete_details.reason。
 func responsesIncompleteReason(choice map[string]any) string {
 	switch stringValue(choice["finish_reason"]) {
-	case "content_filter":
-		return "content_filter"
+	case statusContentFilter:
+		return statusContentFilter
 	default:
 		return "max_output_tokens"
 	}
 }
 
 // responsesOutput 从 choices[0] 构建 output 数组、output_text 与状态。
-func responsesOutput(choice map[string]any, customTools map[string]bool, namespaces map[string]responsesToolRef) ([]any, string, string) {
+func responsesOutput(
+	choice map[string]any, customTools map[string]bool, namespaces map[string]responsesToolRef,
+) ([]any, string, string) {
 	if choice == nil {
 		return []any{}, "", "completed"
 	}
@@ -1259,7 +1283,9 @@ func responsesOutput(choice map[string]any, customTools map[string]bool, namespa
 		output = append(output, responsesMessageItem("msg_gateway", text, "completed"))
 	}
 
-	output = append(output, responsesFunctionItems(msg["tool_calls"], customTools, namespaces, stringValue(choice["finish_reason"]))...)
+	output = append(output, responsesFunctionItems(
+		msg["tool_calls"], customTools, namespaces, stringValue(choice["finish_reason"]),
+	)...)
 	if len(output) == 0 {
 		output = append(output, responsesMessageItem("msg_gateway", "", "completed"))
 	}
@@ -1267,8 +1293,8 @@ func responsesOutput(choice map[string]any, customTools map[string]bool, namespa
 	status := "completed"
 
 	switch stringValue(choice["finish_reason"]) {
-	case "length", "content_filter":
-		status = "incomplete"
+	case "length", statusContentFilter:
+		status = statusIncomplete
 	}
 
 	return output, text, status
@@ -1306,7 +1332,7 @@ func responsesMessageItem(id, text, status string) map[string]any {
 
 // responsesOutputText 构造 OpenAI Responses 的 output_text 内容块。
 func responsesOutputText(text string) map[string]any {
-	return map[string]any{"type": "output_text", "text": text, "annotations": []any{}, "logprobs": []any{}}
+	return map[string]any{"type": typeOutputText, "text": text, "annotations": []any{}, "logprobs": []any{}}
 }
 
 // mapItems 接受 JSON 解码后的 []any 与内部聚合产生的 []map[string]any，
@@ -1329,7 +1355,10 @@ func mapItems(raw any) []map[string]any {
 	}
 }
 
-func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map[string]responsesToolRef, finishReason string) []any {
+//nolint:funlen // 工具调用 item 的多形态展开。
+func responsesFunctionItems(
+	raw any, customTools map[string]bool, namespaces map[string]responsesToolRef, finishReason string,
+) []any {
 	calls := mapItems(raw)
 
 	out := make([]any, 0, len(calls))
@@ -1350,13 +1379,13 @@ func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map
 
 		status := "completed"
 		if finishReason == "length" {
-			status = "incomplete"
+			status = statusIncomplete
 		}
 
 		if customTools[name] {
 			input, ok := responsesCustomToolInput(args)
 			if !ok {
-				status = "incomplete"
+				status = statusIncomplete
 			}
 
 			item := map[string]any{
@@ -1370,7 +1399,7 @@ func responsesFunctionItems(raw any, customTools map[string]bool, namespaces map
 		}
 
 		item := map[string]any{
-			"type": "function_call", "id": "fc_" + callID, "call_id": callID,
+			"type": typeFunctionCall, "id": "fc_" + callID, "call_id": callID,
 			"name": name, "arguments": args, "status": status,
 		}
 		responsesSetNamespace(item, namespace)
@@ -1416,7 +1445,7 @@ func responsesUsage(raw any) map[string]any {
 	cached, cacheWrite := responsesCachedTokens(usage)
 
 	return map[string]any{
-		"input_tokens": input, "output_tokens": output, "total_tokens": input + output,
+		keyInputTokens: input, keyOutputTokens: output, "total_tokens": input + output,
 		"input_tokens_details": map[string]any{
 			"cached_tokens": cached, "cache_write_tokens": cacheWrite,
 		},
@@ -1471,7 +1500,7 @@ func responsesObject(
 ) map[string]any {
 	return map[string]any{
 		"id": id, "object": "response", "created_at": created, "status": status,
-		"model": model, "instructions": instructions, "output": output, "output_text": text,
+		"model": model, "instructions": instructions, "output": output, typeOutputText: text,
 		"usage": usage, "error": nil, "incomplete_details": nil,
 		"tools": []any{}, "tool_choice": "auto", "parallel_tool_calls": true,
 		"background": false, "metadata": map[string]any{},
@@ -1559,17 +1588,23 @@ func (s *responsesStreamWriter) Flush() {
 }
 
 func (s *responsesStreamWriter) Write(nums []byte) (int, error) {
-	s.pending = append(s.pending, nums...)
+	return writeSSELines(&s.pending, nums, s.handleLine)
+}
+
+// writeSSELines 按行拆分 SSE 数据并交给 handleLine，返回本次写入字节数。
+func writeSSELines(pending *[]byte, nums []byte, handle func(string) error) (int, error) {
+	*pending = append(*pending, nums...)
 	for {
-		i := bytes.IndexByte(s.pending, '\n')
+		i := bytes.IndexByte(*pending, '\n')
 		if i < 0 {
 			break
 		}
 
-		line := strings.TrimRight(string(s.pending[:i]), "\r")
+		line := strings.TrimRight(string((*pending)[:i]), "\r")
 
-		s.pending = s.pending[i+1:]
-		if err := s.handleLine(line); err != nil {
+		*pending = (*pending)[i+1:]
+
+		if err := handle(line); err != nil {
 			return 0, err
 		}
 	}
@@ -1693,7 +1728,9 @@ func (s *responsesStreamWriter) ensureStart(chunk map[string]any) error {
 	}
 
 	resp := s.responseObject("in_progress")
-	if err := s.event("response.created", map[string]any{"type": "response.created", "response": resp}); err != nil {
+	if err := s.event(
+		"response.created", map[string]any{"type": "response.created", "response": resp},
+	); err != nil {
 		return err
 	}
 
@@ -1721,14 +1758,14 @@ func (s *responsesStreamWriter) emitText(text string) error {
 
 		s.nextIdx++
 		if err := s.event("response.output_item.added", map[string]any{
-			"type": "response.output_item.added", "output_index": s.msg.index, "item": s.messageItem("in_progress"),
+			"type": "response.output_item.added", keyOutputIndex: s.msg.index, "item": s.messageItem("in_progress"),
 		}); err != nil {
 			return err
 		}
 
 		if err := s.event("response.content_part.added", map[string]any{
-			"type": "response.content_part.added", "item_id": s.msg.id, "output_index": s.msg.index,
-			"content_index": 0, "part": responsesOutputText(""),
+			"type": "response.content_part.added", "item_id": s.msg.id, keyOutputIndex: s.msg.index,
+			keyContentIndex: 0, "part": responsesOutputText(""),
 		}); err != nil {
 			return err
 		}
@@ -1737,8 +1774,8 @@ func (s *responsesStreamWriter) emitText(text string) error {
 	s.msg.text.WriteString(text)
 
 	return s.event("response.output_text.delta", map[string]any{
-		"type": "response.output_text.delta", "item_id": s.msg.id, "output_index": s.msg.index,
-		"content_index": 0, "delta": text, "logprobs": []any{},
+		"type": "response.output_text.delta", "item_id": s.msg.id, keyOutputIndex: s.msg.index,
+		keyContentIndex: 0, "delta": text, "logprobs": []any{},
 	})
 }
 
@@ -1766,7 +1803,7 @@ func (s *responsesStreamWriter) emitTools(raw any) error {
 
 			if err := s.event("response.function_call_arguments.delta", map[string]any{
 				"type": "response.function_call_arguments.delta", "item_id": state.id,
-				"output_index": state.index, "delta": args,
+				keyOutputIndex: state.index, "delta": args,
 			}); err != nil {
 				return err
 			}
@@ -1808,7 +1845,8 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 	s.tools[idx] = state
 	s.toolSeq = append(s.toolSeq, idx)
 	_ = s.event("response.output_item.added", map[string]any{
-		"type": "response.output_item.added", "output_index": state.index, "item": s.functionItem(state, "in_progress"),
+		"type": "response.output_item.added", keyOutputIndex: state.index,
+		"item": s.functionItem(state, "in_progress"),
 	})
 
 	return state
@@ -1865,9 +1903,9 @@ func (s *responsesStreamWriter) emitCompletion() error {
 func (s *responsesStreamWriter) completionStatus() (status, eventName, reason string) {
 	switch s.finishReason {
 	case "length":
-		return "incomplete", "response.incomplete", "max_output_tokens"
-	case "content_filter":
-		return "incomplete", "response.incomplete", "content_filter"
+		return statusIncomplete, "response.incomplete", "max_output_tokens"
+	case statusContentFilter:
+		return statusIncomplete, "response.incomplete", statusContentFilter
 	default:
 		return "completed", "response.completed", ""
 	}
@@ -1882,22 +1920,22 @@ func (s *responsesStreamWriter) closeMessage() error {
 
 	text := s.msg.text.String()
 	if err := s.event("response.output_text.done", map[string]any{
-		"type": "response.output_text.done", "item_id": s.msg.id, "output_index": s.msg.index,
-		"content_index": 0, "text": text, "logprobs": []any{},
+		"type": "response.output_text.done", "item_id": s.msg.id, keyOutputIndex: s.msg.index,
+		keyContentIndex: 0, "text": text, "logprobs": []any{},
 	}); err != nil {
 		return err
 	}
 
 	if err := s.event("response.content_part.done", map[string]any{
-		"type": "response.content_part.done", "item_id": s.msg.id, "output_index": s.msg.index,
-		"content_index": 0, "part": responsesOutputText(text),
+		"type": "response.content_part.done", "item_id": s.msg.id, keyOutputIndex: s.msg.index,
+		keyContentIndex: 0, "part": responsesOutputText(text),
 	}); err != nil {
 		return err
 	}
 
 	item := s.messageItem("completed")
 	if err := s.event("response.output_item.done", map[string]any{
-		"type": "response.output_item.done", "output_index": s.msg.index, "item": item,
+		"type": "response.output_item.done", keyOutputIndex: s.msg.index, "item": item,
 	}); err != nil {
 		return err
 	}
@@ -1912,7 +1950,7 @@ func (s *responsesStreamWriter) closeEmptyMessage() error {
 
 	s.nextIdx++
 	if err := s.event("response.output_item.added", map[string]any{
-		"type": "response.output_item.added", "output_index": s.msg.index, "item": s.messageItem("in_progress"),
+		"type": "response.output_item.added", keyOutputIndex: s.msg.index, "item": s.messageItem("in_progress"),
 	}); err != nil {
 		return err
 	}
@@ -1932,20 +1970,20 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 	if state.custom {
 		if err := s.event("response.custom_tool_call_input.done", map[string]any{
 			"type": "response.custom_tool_call_input.done", "item_id": state.id,
-			"output_index": state.index, "input": input,
+			keyOutputIndex: state.index, "input": input,
 		}); err != nil {
 			return err
 		}
 	} else if err := s.event("response.function_call_arguments.done", map[string]any{
 		"type": "response.function_call_arguments.done", "item_id": state.id,
-		"output_index": state.index, "arguments": args,
+		keyOutputIndex: state.index, "arguments": args,
 	}); err != nil {
 		return err
 	}
 
 	item := s.functionItemWithStatus(state, status)
 	if err := s.event("response.output_item.done", map[string]any{
-		"type": "response.output_item.done", "output_index": state.index, "item": item,
+		"type": "response.output_item.done", keyOutputIndex: state.index, "item": item,
 	}); err != nil {
 		return err
 	}
@@ -1959,7 +1997,7 @@ func (s *responsesStreamWriter) closeTool(state *responsesToolState) error {
 // 一律 incomplete，避免客户端执行半截参数（issue #259）。
 func (s *responsesStreamWriter) toolCompletionStatus(state *responsesToolState, customOK bool) string {
 	if s.finishReason == "length" || (state.custom && !customOK) {
-		return "incomplete"
+		return statusIncomplete
 	}
 
 	return "completed"
@@ -1974,13 +2012,13 @@ func (s *responsesStreamWriter) functionItem(state *responsesToolState, status s
 }
 
 // functionItemWithStatus 构造工具 item；custom 输入非法时强制 incomplete。
-func (s *responsesStreamWriter) functionItemWithStatus(state *responsesToolState, status string) map[string]any {
+func (*responsesStreamWriter) functionItemWithStatus(state *responsesToolState, status string) map[string]any {
 	namespace := state.namespace
 
 	if state.custom {
 		input, ok := responsesCustomToolInput(state.args.String())
 		if !ok && status == "completed" {
-			status = "incomplete"
+			status = statusIncomplete
 		}
 
 		item := map[string]any{
@@ -1993,7 +2031,7 @@ func (s *responsesStreamWriter) functionItemWithStatus(state *responsesToolState
 	}
 
 	item := map[string]any{
-		"type": "function_call", "id": state.id, "call_id": state.callID,
+		"type": typeFunctionCall, "id": state.id, "call_id": state.callID,
 		"name": state.name, "arguments": state.args.String(), "status": status,
 	}
 	responsesSetNamespace(item, namespace)
@@ -2003,7 +2041,7 @@ func (s *responsesStreamWriter) functionItemWithStatus(state *responsesToolState
 
 func (s *responsesStreamWriter) responseObject(status string) map[string]any {
 	sorted := append([]responsesIndexedItem(nil), s.outputs...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].index < sorted[j].index })
+	slices.SortFunc(sorted, func(a, b responsesIndexedItem) int { return cmp.Compare(a.index, b.index) })
 	output := make([]any, 0, len(sorted))
 
 	var text strings.Builder
@@ -2016,14 +2054,14 @@ func (s *responsesStreamWriter) responseObject(status string) map[string]any {
 
 		parts, _ := item.item["content"].([]any)
 		for _, part := range parts {
-			if m, ok := part.(map[string]any); ok && m["type"] == "output_text" {
+			if m, ok := part.(map[string]any); ok && m["type"] == typeOutputText {
 				text.WriteString(stringValue(m["text"]))
 			}
 		}
 	}
 
 	usage := map[string]any{
-		"input_tokens": s.inputTokens, "output_tokens": s.outputTokens,
+		keyInputTokens: s.inputTokens, keyOutputTokens: s.outputTokens,
 		"total_tokens": s.inputTokens + s.outputTokens,
 		"input_tokens_details": map[string]any{
 			"cached_tokens": s.cachedTokens, "cache_write_tokens": s.cacheWrite,

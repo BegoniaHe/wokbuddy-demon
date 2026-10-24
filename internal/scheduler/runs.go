@@ -12,8 +12,9 @@
 package scheduler
 
 import (
+	"cmp"
 	"context"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -117,7 +118,7 @@ func (s *Scheduler) RunTaskStates() []TaskRun {
 		out = append(out, slot.TaskRun)
 	}
 
-	sort.Slice(out, func(i, j int) bool { return out[i].Task < out[j].Task })
+	slices.SortFunc(out, func(a, b TaskRun) int { return cmp.Compare(a.Task, b.Task) })
 
 	return out
 }

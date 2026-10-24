@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -149,7 +150,7 @@ func normalizeWebFetchRequest(req *WebFetchRequest) ([]byte, int, error) {
 
 // parseWebFetchResponse 校验状态/业务码/文本类型/正文，任一不满足都明确失败。
 func parseWebFetchResponse(status int, raw []byte, fallbackURL string) (*WebFetchOutcome, error) {
-	if status >= 400 {
+	if status >= http.StatusBadRequest {
 		return nil, &Error{
 			Kind: Classify(status, string(raw)), Status: status,
 			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),

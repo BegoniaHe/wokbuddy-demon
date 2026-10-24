@@ -788,7 +788,10 @@ const (
 
 // logChatRowEx 是带请求 ID、结果、重试、积分与调用来源字段的扩展流水行。旧调用保持
 // 原格式；requestID 非空时才追加扩展字段；来源两参均为空时不追加来源段。
-func logChatRowEx(out io.Writer, enabled bool, ttfb, total time.Duration, model, mode, uid, nick string, status, toks int,
+//
+//nolint:revive // 日志字段按协议顺序平铺，改 struct 会增加调用点构造负担。
+func logChatRowEx(
+	out io.Writer, enabled bool, ttfb, total time.Duration, model, mode, uid, nick string, status, toks int,
 	requestID, outcome string, attempts int, credit float64, hasCredit bool,
 	clientIP, userAgent string,
 ) {
@@ -884,14 +887,21 @@ func sourceFields(clientIP, userAgent string) string {
 // 全 miss，不在此列。
 type cacheMissSignal struct {
 	mu      sync.Mutex
+	every   time.Duration
 	everHit map[string]bool
 	last    map[string]time.Time
 }
 
-var cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{}, last: map[string]time.Time{}}
+// newCacheMissSignal 构造告警信号；every 为同模型的 WARN 冷却间隔。
+func newCacheMissSignal(every time.Duration) *cacheMissSignal {
+	return &cacheMissSignal{
+		every:   every,
+		everHit: map[string]bool{},
+		last:    map[string]time.Time{},
+	}
+}
 
-// cacheMissWarnEvery 冷却间隔；变量供测试缩短。
-var cacheMissWarnEvery = 10 * time.Minute
+var cacheMissWarn = newCacheMissSignal(10 * time.Minute)
 
 // noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；整段未命中且此前
 // 命中过 → 触发 WARN（冷却内不重复）。
@@ -922,10 +932,11 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	}
 
 	now := time.Now()
-	if t, ok := c.last[model]; ok && now.Sub(t) < cacheMissWarnEvery {
+	if t, ok := c.last[model]; ok && now.Sub(t) < c.every {
 		return
 	}
 
 	c.last[model] = now
-	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；上游前缀缓存重算，费用会显著升高", model, prompt, miss)
+	log.Printf("WARN: [server] cache miss: model=%s 本次大前缀未命中（prompt=%d miss=%d，此前观测到过命中）；"+
+		"上游前缀缓存重算，费用会显著升高", model, prompt, miss)
 }

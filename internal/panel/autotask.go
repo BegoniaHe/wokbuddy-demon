@@ -200,6 +200,9 @@ func autoActionFor(code string) *autoAction {
 	return nil
 }
 
+// unknownAutoActionIndex 未知任务排到最后。
+const unknownAutoActionIndex = 1 << 20
+
 // autoActionIndex 任务在 autoActions 中的顺序（队列执行按依赖序排；未知返回大值）。
 func autoActionIndex(code string) int {
 	for i := range autoActions {
@@ -208,7 +211,7 @@ func autoActionIndex(code string) int {
 		}
 	}
 
-	return 1 << 20
+	return unknownAutoActionIndex
 }
 
 // mpTaskCodes 小程序口径专属下发的成长任务：默认（无 mp 头）列表不出现，
@@ -315,7 +318,9 @@ func (p *Panel) taskByCodeMP(a *auth.Auth, code string) (*upstream.Task, error) 
 func (p *Panel) acceptWithVerifyMP(account12 *auth.Auth, code string) bool {
 	for attempt := 1; attempt <= 2; attempt++ {
 		if err := p.cfg.Upstream.AcceptTasksMP(account12, []string{code}); err != nil {
-			log.Printf("autotask %s %s: accept 尝试%d: %v", logfmt.Label(account12.UID, account12.NicknameValue()), code, attempt, err)
+			log.Printf("autotask %s %s: accept 尝试%d: %v",
+				logfmt.Label(account12.UID, account12.NicknameValue()), code, attempt, err)
+
 			continue
 		}
 
@@ -437,7 +442,9 @@ func (p *Panel) acceptMPTaskIfNeeded(a *auth.Auth, code, status string) bool {
 
 // mpEarlyClaim 计算 target 并在任务已达标（含 completed 未领）时直接领奖。
 // 返回 target、完成消息、是否已完成、错误。
-func (p *Panel) mpEarlyClaim(account19 *auth.Auth, code string, t *upstream.Task) (target int64, msg string, done bool, err error) {
+func (p *Panel) mpEarlyClaim(
+	account19 *auth.Auth, code string, t *upstream.Task,
+) (target int64, msg string, done bool, err error) {
 	target = t.Target
 	if target <= 0 {
 		target = 1
@@ -459,7 +466,7 @@ func (p *Panel) mpEarlyClaim(account19 *auth.Auth, code string, t *upstream.Task
 // 返回中断时的下标与错误；全部成功返回 (need, nil)。
 func (p *Panel) reportMiniChatEvents(account20 *auth.Auth, need int64, withActivityID bool) (int64, error) {
 	for i := range need {
-		time.Sleep(mpChatEventGap + time.Duration(rand.Int64N(int64(10*time.Second))))
+		time.Sleep(mpChatEventGap + time.Duration(rand.Int64N(int64(10*time.Second)))) //nolint:gosec // 上报节奏抖动，非安全用途
 
 		conv := session.NewUUIDv4()
 
@@ -480,7 +487,9 @@ func (p *Panel) reportMiniChatEvents(account20 *auth.Auth, need int64, withActiv
 
 // pollTaskMPFrom 从当前任务出发做达标回读（两轮各隔 claimPollGap）；首轮未达标
 // 且 fallback 非空时补报一轮。返回最后一次结果；补报失败返回错误。
-func (p *Panel) pollTaskMPFrom(a *auth.Auth, code string, target int64, t *upstream.Task, fallback func() error) (*upstream.Task, error) {
+func (p *Panel) pollTaskMPFrom(
+	a *auth.Auth, code string, target int64, t *upstream.Task, fallback func() error,
+) (*upstream.Task, error) {
 	for round := range 2 {
 		time.Sleep(claimPollGap)
 
@@ -505,7 +514,9 @@ func (p *Panel) pollTaskMPFrom(a *auth.Auth, code string, target int64, t *upstr
 }
 
 // finishMPTask 回读后的收尾：已 claimed / 未达标 / 达标领奖。
-func (p *Panel) finishMPTask(account14 *auth.Auth, code string, target int64, t *upstream.Task, notMetMsg string) (string, error) {
+func (p *Panel) finishMPTask(
+	account14 *auth.Auth, code string, target int64, t *upstream.Task, notMetMsg string,
+) (string, error) {
 	if t.Claimed {
 		return "本轮已入账（claimed）", nil
 	}
@@ -576,7 +587,9 @@ func runSequentialChat10(p *Panel, a *auth.Auth) (string, error) {
 // runSequentialEventTask Sequential 链预留任务通用骨架：mp 查询 → accept（带验证）
 // → 判据事件上报（primary；未点亮且 fallback 非空时补一轮）→ 回读 → 达标领奖。
 // 每日零点解锁一环：locked 期间 accept 不落账，返回等下次调度（无需人工干预）。
-func (p *Panel) runSequentialEventTask(account23 *auth.Auth, code string, primary, fallback func() error) (string, error) {
+func (p *Panel) runSequentialEventTask(
+	account23 *auth.Auth, code string, primary, fallback func() error,
+) (string, error) {
 	t, err := p.taskByCodeMP(account23, code)
 	if err != nil {
 		return "", err
@@ -658,7 +671,9 @@ func runSequentialPlaybook(panel4 *Panel, account *auth.Auth) (string, error) {
 				upstream.DesktopPlaybookPromptSequence(conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
 		},
 		func() error {
-			return panel4.cfg.Upstream.ReportMPEvent(account, upstream.MiniPlaybookEvents("pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
+			return panel4.cfg.Upstream.ReportMPEvent(
+				account, upstream.MiniPlaybookEvents("pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...,
+			)
 		})
 }
 
@@ -823,6 +838,8 @@ func (p *Panel) finishTaskAuto(
 }
 
 // autoClaimResponse 达标后自动领奖，把结果写进响应 map（claimed/credit/claim_error）。
+//
+//nolint:dupl // 与 autoClaimItem 仅输入形态不同，结构对照优先。
 func (p *Panel) autoClaimResponse(a *auth.Auth, code, msg string, resp map[string]any) {
 	credit, energy, cerr := p.claimTaskReward(a, code)
 	if cerr != nil {
@@ -913,7 +930,9 @@ func runChat5(panel *Panel, account25 *auth.Auth) (string, error) {
 
 // runFirstBuddy 领养：report（解锁前置）→ agreement → first。
 func runFirstBuddy(panel2 *Panel, account24 *auth.Auth) (string, error) {
-	if err := panel2.cfg.Upstream.ReportChatActivity(account24, session.NewUUIDv4(), session.NewUUIDv7Hex()); err != nil {
+	if err := panel2.cfg.Upstream.ReportChatActivity(
+		account24, session.NewUUIDv4(), session.NewUUIDv7Hex(),
+	); err != nil {
 		return "", fmt.Errorf("前置上报: %w", err)
 	}
 
@@ -960,9 +979,11 @@ func runModelChat(panel9 *Panel, account18 *auth.Auth) (string, error) {
 		return "", fmt.Errorf("对话请求: %w", err)
 	}
 
-	if status >= 400 {
+	if status >= http.StatusBadRequest {
 		rc.Close()
-		return "", fmt.Errorf("对话失败 http=%d: %s: %w", status, truncateStr(string(respBody), 160), errRunModelChatFailed)
+
+		return "", fmt.Errorf("对话失败 http=%d: %s: %w",
+			status, truncateStr(string(respBody), 160), errRunModelChatFailed)
 	}
 	// 读干 SSE（网关对上游强制 flow：不读完会残留连接）
 	_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<20))
@@ -970,7 +991,9 @@ func runModelChat(panel9 *Panel, account18 *auth.Auth) (string, error) {
 	time.Sleep(reportGap)
 	// 3. 对齐模型的上报（触发进度）
 	cid := session.NewUUIDv4()
-	if err := panel9.cfg.Upstream.ReportChatActivityModel(account18, cid, session.NewUUIDv7Hex(), modelID, modelName); err != nil {
+	if err := panel9.cfg.Upstream.ReportChatActivityModel(
+		account18, cid, session.NewUUIDv7Hex(), modelID, modelName,
+	); err != nil {
 		return "对话已完成，但进度上报失败：" + err.Error(), nil //nolint:nilerr // 对话已完成，上报失败仅提示不算请求错误
 	}
 
@@ -1107,28 +1130,8 @@ func runSkillFresh(panel7 *Panel, account16 *auth.Auth) (string, error) {
 // （ex_xQHHD1u5Jkua / valorant-perler-expert / 1.2.1）；市场列表命中时以服务端
 // 下发的 version/名称等为准。活动截止 2026-11-15，过期后上游不再计数。
 func runValorant(panel *Panel, account *auth.Auth) (string, error) {
-	const valorantID = "ex_xQHHD1u5Jkua"
-
-	expert := upstream.MarketExpert{
-		ExpertID: valorantID, ExpertType: "agent",
-		DisplayNameZH: "无畏契约拼豆专家", ProfessionZH: "无畏契约拼豆专家", Version: "1.2.1",
-		Categories: nil,
-	}
-
-	if experts, err := panel.cfg.Upstream.MarketExpertList(account, "agent"); err == nil {
-		for _, e := range experts {
-			if e.ExpertID == valorantID {
-				expert = e
-				break
-			}
-		}
-	}
-
-	if err := runExpertChain(panel, account, &expert); err != nil {
-		return "", err
-	}
-
-	return "已上报无畏契约拼豆专家召唤+使用链（真实对话 requestId）", nil
+	return runExpertTask(panel, account, "ex_xQHHD1u5Jkua", "无畏契约拼豆专家", "1.2.1",
+		"已上报无畏契约拼豆专家召唤+使用链（真实对话 requestId）")
 }
 
 // runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。
@@ -1137,17 +1140,24 @@ func runValorant(panel *Panel, account *auth.Auth) (string, error) {
 // expert_actual_use 的 mode 为 "LOCAL"（非 craft）。id 固定为轻量云专家
 // ex_2cvvUZQhDyeJ；requestId 必须是真实 chat 的服务端 id。紫川/人杰2 实测点亮。
 func runExpertLighthouse(panel *Panel, account *auth.Auth) (string, error) {
-	const lighthouseID = "ex_2cvvUZQhDyeJ"
+	return runExpertTask(panel, account, "ex_2cvvUZQhDyeJ", "腾讯轻量云专家", "1.0.2",
+		"已上报轻量云专家召唤+使用链（真实对话 requestId）")
+}
 
+// runExpertTask 按固定 id 召唤专家并跑公共事件链；市场列表命中时以服务端下发的
+// version/名称等为准。
+func runExpertTask(
+	panel *Panel, account *auth.Auth, id, nameZh, version, report string,
+) (string, error) {
 	expert := upstream.MarketExpert{
-		ExpertID: lighthouseID, ExpertType: "agent",
-		DisplayNameZH: "腾讯轻量云专家", ProfessionZH: "腾讯轻量云专家", Version: "1.0.2",
+		ExpertID: id, ExpertType: "agent",
+		DisplayNameZH: nameZh, ProfessionZH: nameZh, Version: version,
 		Categories: nil,
 	}
-	// 市场列表若命中真实条目则用其信息（version 等以服务端为准）。
+
 	if experts, err := panel.cfg.Upstream.MarketExpertList(account, "agent"); err == nil {
 		for _, e := range experts {
-			if e.ExpertID == lighthouseID {
+			if e.ExpertID == id {
 				expert = e
 				break
 			}
@@ -1158,13 +1168,15 @@ func runExpertLighthouse(panel *Panel, account *auth.Auth) (string, error) {
 		return "", err
 	}
 
-	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
+	return report, nil
 }
 
 // runExpertChain 平台专家的「召唤 + 真实对话 + LOCAL 使用」公共事件链。
 // 两处判据差异（has_expert / expert_actual_use type+mode）统一在这里对齐。
 func runExpertChain(panel *Panel, account *auth.Auth, expert *upstream.MarketExpert) error {
-	if err := panel.cfg.Upstream.ReportDesktopEvent(account, upstream.DesktopExpertSummonSequence(expert)...); err != nil {
+	if err := panel.cfg.Upstream.ReportDesktopEvent(
+		account, upstream.DesktopExpertSummonSequence(expert)...,
+	); err != nil {
 		return fmt.Errorf("召唤链: %w", err)
 	}
 
@@ -1353,6 +1365,8 @@ func (p *Panel) runAutoAll(account6 *auth.Auth) []map[string]any {
 }
 
 // autoAcceptBatch 批量接受默认口径未接受任务，返回结果条目（列表失败静默）。
+//
+//nolint:dupl // CN/MP 两套上游接口并排，保持结构对照。
 func (p *Panel) autoAcceptBatch(account21 *auth.Auth) []map[string]any {
 	tasks, err := p.cfg.Upstream.ListTasks(account21)
 	if err != nil {
@@ -1380,6 +1394,8 @@ func (p *Panel) autoAcceptBatch(account21 *auth.Auth) []map[string]any {
 }
 
 // autoAcceptBatchMP 批量接受小程序口径未接受任务，返回结果条目（列表失败静默）。
+//
+//nolint:dupl // 同 autoAcceptBatch：两套接口结构对照。
 func (p *Panel) autoAcceptBatchMP(account11 *auth.Auth) []map[string]any {
 	mpTasks, err := p.cfg.Upstream.ListTasksMP(account11)
 	if err != nil {
@@ -1407,6 +1423,8 @@ func (p *Panel) autoAcceptBatchMP(account11 *auth.Auth) []map[string]any {
 }
 
 // autoRunAction 执行单个任务动作并组装结果条目（单项失败不影响后续项）。
+//
+//nolint:funlen // 动作分派/结果组装线性展开。
 func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]any {
 	item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
 
@@ -1468,6 +1486,8 @@ func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]an
 }
 
 // autoClaimItem 达标自动领奖，把结果写进结果条目（claim_error 供前端提示）。
+//
+//nolint:dupl // 同 autoClaimResponse：输入形态不同但流程一致。
 func (p *Panel) autoClaimItem(a *auth.Auth, code, msg string, item map[string]any) {
 	credit, energy, cerr := p.claimTaskReward(a, code)
 	if cerr != nil {

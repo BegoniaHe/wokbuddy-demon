@@ -26,6 +26,8 @@ import (
 const webFetchEndpointMaxBody = 64 << 10
 
 // webFetchEndpointHandler /v1/tools/fetch 入口（鉴权由 withClientAuth 负责）。
+//
+//nolint:funlen,maintidx // SSRF 校验/上游调用/记账线性展开。
 func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request) {
 	if !h.loadLive().WebFetchEndpoint {
 		writeOpenAIError(w, http.StatusNotFound, "not_found",
@@ -41,7 +43,7 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	req, ok := h.readWebFetchRequest(w, r)
+	req, ok := readWebFetchRequest(w, r)
 	if !ok {
 		return
 	}
@@ -88,7 +90,7 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 }
 
 // readWebFetchRequest 读取 body 并做 SSRF 校验；失败已写出响应。
-func (h *Handler) readWebFetchRequest(w http.ResponseWriter, r *http.Request) (upstream.WebFetchRequest, bool) {
+func readWebFetchRequest(w http.ResponseWriter, r *http.Request) (upstream.WebFetchRequest, bool) {
 	var req upstream.WebFetchRequest
 
 	limitRequestBody(w, r, webFetchEndpointMaxBody)

@@ -226,10 +226,14 @@ func cleanSearchDomains(domains []string) []string {
 // 决定是否罚号），其余（序列化/读体失败）是普通 error（传输层故障不罚号）。
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一口径（公开 API 简单）。
-func (c *Client) Search(ctx context.Context, account *auth.Auth, query string, opts SearchOptions, meta ChatMeta) (*SearchOutcome, error) {
+func (c *Client) Search(
+	ctx context.Context, account *auth.Auth, query string, opts SearchOptions, meta ChatMeta,
+) (*SearchOutcome, error) {
 	query = strings.TrimSpace(query)
 	if utf8.RuneCountInString(query) < SearchMinQueryLen {
-		return nil, &Error{Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen)}
+		return nil, &Error{
+			Kind: ErrClient, Msg: fmt.Sprintf("search query must be at least %d characters", SearchMinQueryLen),
+		}
 	}
 
 	if !ValidSearchFreshness(opts.Freshness) {
@@ -258,7 +262,9 @@ func (c *Client) newAgentToolRequest(
 	//nolint:gocritic // ChatMeta 值传递与 SearchHeaders 保持同一口径。
 	ctx context.Context, account *auth.Auth, path string, body []byte, accept string, meta ChatMeta,
 ) (*http.Request, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+path, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+path, bytes.NewReader(body),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("new agenttool request: %w", err)
 	}
@@ -287,7 +293,7 @@ func (c *Client) doSearch(req *http.Request) (*SearchOutcome, error) {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode >= http.StatusBadRequest {
 		kind := Classify(resp.StatusCode, string(raw))
 
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}

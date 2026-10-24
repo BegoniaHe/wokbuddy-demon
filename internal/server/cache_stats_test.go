@@ -54,45 +54,37 @@ func TestStatsReaderCacheTokens(t *testing.T) {
 func TestCacheMissSignal(t *testing.T) {
 	t.Parallel()
 
-	old := cacheMissWarnEvery
-	cacheMissWarnEvery = time.Hour // 拉长冷却，验证「冷却内不重复」
+	signal := newCacheMissSignal(time.Hour) // 拉长冷却，验证「冷却内不重复」
 
-	t.Cleanup(func() {
-		cacheMissWarnEvery = old
-		cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{}, last: map[string]time.Time{}}
-	})
+	signal.noteCacheTokens("glm-5.3", 8500, 8000, 500) // 命中 → 标记可命中
 
-	cacheMissWarn = &cacheMissSignal{everHit: map[string]bool{}, last: map[string]time.Time{}}
-
-	cacheMissWarn.noteCacheTokens("glm-5.3", 8500, 8000, 500) // 命中 → 标记可命中
-
-	if cacheMissWarn.last["glm-5.3"] != (time.Time{}) {
+	if signal.last["glm-5.3"] != (time.Time{}) {
 		t.Fatal("命中不应触发 WARN")
 	}
 
-	cacheMissWarn.noteCacheTokens("glm-5.3", 8500, 0, 8500) // 整段未命中 → 触发
+	signal.noteCacheTokens("glm-5.3", 8500, 0, 8500) // 整段未命中 → 触发
 
-	if cacheMissWarn.last["glm-5.3"].IsZero() {
+	if signal.last["glm-5.3"].IsZero() {
 		t.Fatal("曾命中的模型整段未命中应触发 WARN 记录")
 	}
 
-	first := cacheMissWarn.last["glm-5.3"]
-	cacheMissWarn.noteCacheTokens("glm-5.3", 8500, 0, 8500) // 冷却内 → 不重复
+	first := signal.last["glm-5.3"]
+	signal.noteCacheTokens("glm-5.3", 8500, 0, 8500) // 冷却内 → 不重复
 
-	if !cacheMissWarn.last["glm-5.3"].Equal(first) {
+	if !signal.last["glm-5.3"].Equal(first) {
 		t.Fatal("冷却期内不应重复触发")
 	}
 
 	// 从未命中的模型（新模型首请求天然全 miss）不触发。
-	cacheMissWarn.noteCacheTokens("new-model", 5000, 0, 5000)
+	signal.noteCacheTokens("new-model", 5000, 0, 5000)
 
-	if !cacheMissWarn.last["new-model"].IsZero() {
+	if !signal.last["new-model"].IsZero() {
 		t.Fatal("从未命中的模型不应触发")
 	}
 	// 小前缀不触发。
-	cacheMissWarn.noteCacheTokens("glm-5.3", 500, 0, 500)
+	signal.noteCacheTokens("glm-5.3", 500, 0, 500)
 	// miss 缺失（上游只回 hit=0、无 miss、无 prompt）不触发。
-	cacheMissWarn.noteCacheTokens("glm-5.3", 0, 0, 0)
+	signal.noteCacheTokens("glm-5.3", 0, 0, 0)
 }
 
 // TestCacheTokensSymmetricHitDerivation 缓存命中的**对称反推**（上游同步窗口 issue #186）：
@@ -192,12 +184,13 @@ func TestCacheMissWarnSkipsExplicitZero(t *testing.T) {
 
 	const model = "explicit-zero-cache-model"
 
-	cacheMissWarn.noteCacheTokens(model, 5000, 100, 0) // 先建立「可命中」基线
-	cacheMissWarn.noteCacheTokens(model, 5000, 0, 0)   // 两侧显式 0：不应告警
+	signal := newCacheMissSignal(time.Hour)
+	signal.noteCacheTokens(model, 5000, 100, 0) // 先建立「可命中」基线
+	signal.noteCacheTokens(model, 5000, 0, 0)   // 两侧显式 0：不应告警
 
-	cacheMissWarn.mu.Lock()
-	_, warned := cacheMissWarn.last[model]
-	cacheMissWarn.mu.Unlock()
+	signal.mu.Lock()
+	_, warned := signal.last[model]
+	signal.mu.Unlock()
 
 	if warned {
 		t.Fatal("两侧显式 0 不应触发缓存未命中 WARN")

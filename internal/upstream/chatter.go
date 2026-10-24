@@ -22,7 +22,7 @@ var chatterQuestionData string
 var chatterQuestions = strings.Split(strings.TrimSpace(chatterQuestionData), "\n")
 
 var (
-	chatterQuestionOffset = rand.IntN(len(chatterQuestions))
+	chatterQuestionOffset = rand.IntN(len(chatterQuestions)) //nolint:gosec // 问句池随机起点，非安全用途
 	chatterQuestionMu     sync.Mutex
 	chatterQuestionCursor int
 )

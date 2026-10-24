@@ -18,6 +18,7 @@ import (
 var (
 	errSplitBackfillWindowFailed = errors.New("splitBackfillWindow failed")
 	errFetchBackfillPagesFailed  = errors.New("fetchBackfillPages failed")
+	errBackfillAccountNotFound   = errors.New("account not found")
 )
 
 // usageBackfill 显式触发的上游逐笔用量回填/对账（issue #31）：按账号（缺省全部）
@@ -25,6 +26,8 @@ var (
 //
 //	POST /panel/api/usage/backfill
 //	Body: {"uid":"<可选>","days":7}
+//
+//nolint:funlen // 请求解析/窗口拆分/逐号回填/汇总线性展开。
 func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		UID  string `json:"uid"`
@@ -58,22 +61,14 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 	failures := map[string]string{}
 
 	for _, uid := range uids {
-		account := p.cfg.Pool.AuthByUID(uid)
-		if account == nil {
-			failures[uid] = "account not found"
-			continue
-		}
-
-		rows, records, err := p.backfillAccount(account, uid, start, end)
+		records, buckets, err := p.backfillOneUID(uid, start, end)
 		if err != nil {
 			failures[uid] = err.Error()
-			log.Printf("WARN: [panel] usage backfill %s: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
-
 			continue
 		}
 
 		totalRecords += records
-		totalBuckets += p.cfg.Usage.Backfill(rows)
+		totalBuckets += buckets
 	}
 
 	p.cfg.Usage.Save()
@@ -86,6 +81,23 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 		"buckets":  totalBuckets,
 		"failures": failures,
 	})
+}
+
+// backfillOneUID 回填单个账号，返回抓取记录数与覆盖桶数。
+func (p *Panel) backfillOneUID(uid string, start, end time.Time) (int, int, error) {
+	account := p.cfg.Pool.AuthByUID(uid)
+	if account == nil {
+		return 0, 0, errBackfillAccountNotFound
+	}
+
+	rows, records, err := p.backfillAccount(account, uid, start, end)
+	if err != nil {
+		log.Printf("WARN: [panel] usage backfill %s: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
+
+		return 0, 0, err
+	}
+
+	return records, p.cfg.Usage.Backfill(rows), nil
 }
 
 // resolveBackfillUIDs 解析回填目标账号：显式 uid 优先，否则全部池内账号。
@@ -118,7 +130,9 @@ const (
 
 // backfillAccount 拉取单账号逐笔用量并按 (天, 模型) 聚合。requestId 跨页/跨窗口
 // 去重，避免上游分页重叠或时间窗边界重叠时重复计数。
-func (p *Panel) backfillAccount(account4 *auth.Auth, uid string, start, end time.Time) ([]usage.BackfillRow, int, error) {
+func (p *Panel) backfillAccount(
+	account4 *auth.Auth, uid string, start, end time.Time,
+) ([]usage.BackfillRow, int, error) {
 	realm := account4.Realm()
 	rows := map[string]*usage.BackfillRow{}
 	seen := map[string]struct{}{}
@@ -149,7 +163,9 @@ func (p *Panel) backfillAccount(account4 *auth.Auth, uid string, start, end time
 //
 // 上游单次时间范围最多返回 3000 条（total 截到 3000，超出部分静默丢弃）；直接查
 // 7 天会把最新的今天记录挤掉。命中上限时二分时间窗，直到每个窗口都低于上限。
-func (p *Panel) fetchBackfillRecords(account *auth.Auth, start, end time.Time) ([]upstream.RequestUsageRecord, error) {
+func (p *Panel) fetchBackfillRecords(
+	account *auth.Auth, start, end time.Time,
+) ([]upstream.RequestUsageRecord, error) {
 	first, err := p.cfg.Upstream.RequestUsage(account, start, end, 1, requestUsagePageSize)
 	if err != nil {
 		return nil, fmt.Errorf("window %v..%v: %w", start, end, err)
@@ -163,9 +179,12 @@ func (p *Panel) fetchBackfillRecords(account *auth.Auth, start, end time.Time) (
 }
 
 // splitBackfillWindow 把命中 3000 条上限的时间窗二分，左右窗口用秒级边界避免重叠。
-func (p *Panel) splitBackfillWindow(account2 *auth.Auth, start, end time.Time) ([]upstream.RequestUsageRecord, error) {
+func (p *Panel) splitBackfillWindow(
+	account2 *auth.Auth, start, end time.Time,
+) ([]upstream.RequestUsageRecord, error) {
 	if end.Sub(start) <= requestUsageMinWindow {
-		return nil, fmt.Errorf("window %v..%v exceeds %d-record cap: %w", start, end, requestUsageResultCap, errSplitBackfillWindowFailed)
+		return nil, fmt.Errorf("window %v..%v exceeds %d-record cap: %w",
+			start, end, requestUsageResultCap, errSplitBackfillWindowFailed)
 	}
 
 	mid := start.Add(end.Sub(start) / 2).Truncate(time.Second)
@@ -199,7 +218,8 @@ func (p *Panel) fetchBackfillPages(
 		// 翻到硬上限仍有下一页：宁可失败也不返回截断数据（回填是覆盖写入，
 		// 截断会把本地当天桶替换成不完整计数）。
 		if page > requestUsageMaxPages {
-			return nil, fmt.Errorf("window %v..%v exceeds %d pages: %w", start, end, requestUsageMaxPages, errFetchBackfillPagesFailed)
+			return nil, fmt.Errorf("window %v..%v exceeds %d pages: %w",
+				start, end, requestUsageMaxPages, errFetchBackfillPagesFailed)
 		}
 
 		requestUsagePage, err := p.cfg.Upstream.RequestUsage(account3, start, end, page, requestUsagePageSize)

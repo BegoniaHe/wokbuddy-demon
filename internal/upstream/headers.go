@@ -45,27 +45,36 @@ func (c *Client) profileFor(a *auth.Auth) *clientprofile.Profile {
 
 // clientVersionFor 生效的 WorkBuddy 客户端版本：显式 ClientVersion 优先，其次是
 // profile 的 xIdeVersion。两者皆空返回空串（启动期已要求 profile 覆盖每个启用 realm）。
+//
+//nolint:dupl // client/cli 版本解析结构一致，仅字段与 selector 不同。
 func (c *Client) clientVersionFor(account *auth.Auth) string {
 	if c != nil && c.ClientVersion != "" {
 		return c.ClientVersion
 	}
 
-	if p := c.profileFor(account); p != nil {
-		return p.Emit.XIdeVersion
-	}
-
-	return ""
+	return c.profileVersion(account, func(p *clientprofile.Profile) string { return p.Emit.XIdeVersion })
 }
 
 // cliVersionFor 生效的 CLI 版本：显式 CliVersion 优先，其次是 profile 的
 // source.cliVersion。两者皆空返回空串。
+//
+//nolint:dupl // 同 clientVersionFor：结构一致。
 func (c *Client) cliVersionFor(account *auth.Auth) string {
 	if c != nil && c.CliVersion != "" {
 		return c.CliVersion
 	}
 
+	return c.profileVersion(account, func(p *clientprofile.Profile) string { return p.Source.CLIVersion })
+}
+
+// profileVersion 从账号所属 profile 读取版本字段。
+func (c *Client) profileVersion(account *auth.Auth, pick func(*clientprofile.Profile) string) string {
+	if c == nil {
+		return ""
+	}
+
 	if p := c.profileFor(account); p != nil {
-		return p.Source.CLIVersion
+		return pick(p)
 	}
 
 	return ""
@@ -150,14 +159,22 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 	}
 }
 
+// UUID version/variant 位掩码（RFC 4122）。
+const (
+	uuidVersionMask  = 0x0f
+	uuidVariantMask  = 0x3f
+	uuidVariantBits  = 0x80
+	uuidVersion4Bits = 0x40
+)
+
 // deriveUUIDv4 从任意种子稳定派生 UUIDv4 形态字符串（8-4-4-4-12，version=4、
 // variant=10xx）。用于设备/会话等需要跨重启稳定、但输出必须符合官方 UUID
 // 字符集与版本位的标识；种子相同则输出恒同。
 func deriveUUIDv4(seed string) string {
 	sum := sha256.Sum256([]byte(seed))
 	b := sum[:16]
-	b[6] = b[6]&0x0f | 0x40
-	b[8] = b[8]&0x3f | 0x80
+	b[6] = b[6]&uuidVersionMask | uuidVersion4Bits
+	b[8] = b[8]&uuidVariantMask | uuidVariantBits
 
 	h := hex.EncodeToString(b)
 
@@ -182,7 +199,7 @@ func deriveAccountStableID(uid, purpose string) string {
 
 // injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
 // 派生，跨重启固定、账号间互异。uid 为空时不注入（匿名请求无设备标识，上游不要求）。
-func (c *Client) injectAccountStableHeaders(req *http.Request, account5 *auth.Auth) {
+func (*Client) injectAccountStableHeaders(req *http.Request, account5 *auth.Auth) {
 	if account5 == nil || account5.UID == "" {
 		return
 	}
@@ -225,7 +242,7 @@ func acceptLanguageFor(a *auth.Auth) string {
 
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
 // billing 域未走 CommonHeaders，单独注入保证全出站覆盖（D1）。
-func (c *Client) injectCodeBuddyRequest(req *http.Request) {
+func (*Client) injectCodeBuddyRequest(req *http.Request) {
 	req.Header.Set("X-Codebuddy-Request", "1")
 }
 
@@ -337,7 +354,7 @@ func injectChatDomain(req *http.Request, account *auth.Auth) {
 //   - 企业账号：X-Enterprise-Id + X-Tenant-Id
 //   - 个人账号：X-No-Enterprise-Id: 1
 //   - X-Domain：账号 domain 优先，缺省 www.workbuddy.ai
-func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
+func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 	if account == nil || !account.IsGlobal() {
 		return
 	}
@@ -363,8 +380,8 @@ func (c *Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) 
 //   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
 //     实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v4 形态 UUID。
 //
-//nolint:gocritic // ChatMeta 值传递保持公开 API 简单。
-func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+//nolint:funlen,gocritic,maintidx // ChatMeta 值传递保持公开 API 简单；头族注入线性展开。
+func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
 		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
@@ -501,7 +518,7 @@ func (c *Client) injectAttribution(req *http.Request, account4 *auth.Auth) {
 
 // injectIdentityHeaders 注入官方 CLI 的身份头族（企业/静态 Key 形态）。
 // 个人号三值全空 → 不注入（官方个人号同样不发，补空值反而是伪造指纹）。
-func (c *Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
+func (*Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 	if account == nil || account.UID == "" {
 		return
 	}

@@ -21,6 +21,15 @@ import (
 	"time"
 )
 
+// UUID version/variant 位掩码（RFC 4122）。
+const (
+	uuidVersionMask  = 0x0f
+	uuidVariantMask  = 0x3f
+	uuidVariantBits  = 0x80
+	uuidVersion4Bits = 0x40
+	uuidVersion7Bits = 0x70
+)
+
 // NewMessageID 生成随机 32 位 hex（无 UUID 版本位），仅用于 B3 span 等不要求
 // UUID 语义的短标识；消息/请求级 ID 用 NewUUIDv7Hex。crypto/rand 失败（理论上
 // 不可能）时回落 math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法。
@@ -30,7 +39,7 @@ func NewMessageID() string {
 		return hex.EncodeToString(b)
 	}
 	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
-	return fmt.Sprintf("%016x%016x", rand.Uint64()|1, rand.Uint64())
+	return fmt.Sprintf("%016x%016x", rand.Uint64()|1, rand.Uint64()) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 }
 
 // NewUUIDv7Hex 生成 32 位小写 hex 的 UUIDv7（去连字符），对齐官方
@@ -41,8 +50,8 @@ func NewMessageID() string {
 func NewUUIDv7Hex() string {
 	var buf [16]byte
 	if _, err := cryptorand.Read(buf[:]); err != nil {
-		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1)
-		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())
+		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
+		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())  //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 	}
 
 	var timestamp [8]byte
@@ -58,12 +67,12 @@ func NewUUIDv7Hex() string {
 func NewUUIDv4() string {
 	var buf [16]byte
 	if _, err := cryptorand.Read(buf[:]); err != nil {
-		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1)
-		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())
+		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
+		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())  //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 	}
 
-	buf[6] = buf[6]&0x0f | 0x40
-	buf[8] = buf[8]&0x3f | 0x80
+	buf[6] = buf[6]&uuidVersionMask | uuidVersion4Bits
+	buf[8] = buf[8]&uuidVariantMask | uuidVariantBits
 
 	h := hex.EncodeToString(buf[:])
 
@@ -73,8 +82,8 @@ func NewUUIDv4() string {
 // uuidV7Hex 将 16 字节的版本/变体位改成 UUIDv7 后编码为 32 hex。
 // 调用方保证 b 至少 16 字节（可直接传 sha256 派生结果）。
 func uuidV7Hex(b []byte) string {
-	b[6] = b[6]&0x0f | 0x70
-	b[8] = b[8]&0x3f | 0x80
+	b[6] = b[6]&uuidVersionMask | uuidVersion7Bits
+	b[8] = b[8]&uuidVariantMask | uuidVariantBits
 
 	return hex.EncodeToString(b[:16])
 }
@@ -199,7 +208,9 @@ func contentSignature(raw []byte) string {
 // 结果，存量键零漂移）；非文本 part 的渲染交由 renderNonText（各调用方口径不同，
 // 见 contentSignature / userContentSignatureRaw）。存在非文本 part 时对整体结果
 // TrimSpace。json 解析失败返回 ""（不伪造）。
-func partsSignature(raw json.RawMessage, renderNonText func(typeName string, rawPart json.RawMessage) string) string {
+func partsSignature(
+	raw json.RawMessage, renderNonText func(typeName string, rawPart json.RawMessage) string,
+) string {
 	var parts []json.RawMessage
 	if err := json.Unmarshal(raw, &parts); err != nil {
 		return ""

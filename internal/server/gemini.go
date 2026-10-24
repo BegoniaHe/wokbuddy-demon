@@ -109,17 +109,7 @@ func newGeminiChatInput(
 		return chatInput{}, nil, false
 	}
 
-	return chatInput{
-		body:           converted,
-		stream:         stream,
-		model:          model,
-		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
-		traceID:        r.Header.Get("X-Trace-Id"),
-		inboundSession: inboundSessionMetaFrom(r),
-		trace:          requestTraceFrom(r),
-		keyUsage:       keyUsageFrom(r.Context()),
-		keyRealm:       keyRealmFrom(r.Context()),
-	}, &geminiResponder{
+	return newChatInputFromRequest(r, converted, stream, model), &geminiResponder{
 		w: w, model: model, keepalive: keepalive,
 	}, true
 }
@@ -301,7 +291,7 @@ func geminiModelToolCalls(parts []map[string]any) []any {
 func geminiFunctionCall(part map[string]any) map[string]any {
 	call, _ := part["functionCall"].(map[string]any)
 	if call == nil {
-		call, _ = part["function_call"].(map[string]any)
+		call, _ = part[typeFunctionCall].(map[string]any)
 	}
 
 	name := stringValue(call["name"])
@@ -384,7 +374,7 @@ func geminiFunctionResponse(part map[string]any) map[string]any {
 		}
 	}
 
-	return map[string]any{"role": "tool", "tool_call_id": id, "content": body}
+	return map[string]any{"role": "tool", keyToolCallID: id, "content": body}
 }
 
 // geminiContentPart 把 text / inlineData / fileData 转成 OpenAI content part。
@@ -529,8 +519,8 @@ func geminiApplySampling(out map[string]any, cfg *geminiGenerationConfig) {
 func geminiApplyResponseFormat(out map[string]any, cfg *geminiGenerationConfig) {
 	if schema := geminiResponseSchema(cfg); schema != nil {
 		out["response_format"] = map[string]any{
-			"type": "json_schema",
-			"json_schema": map[string]any{
+			"type": jsonSchemaType,
+			jsonSchemaType: map[string]any{
 				"name": "response", "schema": schema, "strict": true,
 			},
 		}
@@ -641,6 +631,9 @@ func geminiSchemaList(raw any) []any {
 	return out
 }
 
+// thinkingBudgetMediumMax 中等思考预算上限（token）。
+const thinkingBudgetMediumMax = 16384
+
 // geminiThinkingEffort 把 thinkingLevel / thinkingBudget 映射为 reasoning_effort。
 func geminiThinkingEffort(cfg *geminiThinkingConfig) string {
 	if cfg == nil {
@@ -664,7 +657,7 @@ func geminiThinkingEffort(cfg *geminiThinkingConfig) string {
 		return ""
 	case budget <= 4096:
 		return "low"
-	case budget <= 16384:
+	case budget <= thinkingBudgetMediumMax:
 		return "medium"
 	default:
 		return "high"
@@ -876,7 +869,9 @@ func (g *geminiResponder) Error(status int, code, msg, hint string) {
 
 func (g *geminiResponder) Header(name, value string) { g.w.Header().Set(name, value) }
 
-func (g *geminiResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
+func (g *geminiResponder) Stream(
+	rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string),
+) error {
 	writer := newGeminiStreamWriter(g.w, g.model)
 
 	opts := make([]upstream.StreamOption, 0, 2)
@@ -999,9 +994,9 @@ func geminiFinishReason(choice map[string]any) string {
 	switch stringValue(choice["finish_reason"]) {
 	case "length":
 		return "MAX_TOKENS"
-	case "content_filter":
+	case statusContentFilter:
 		return "SAFETY"
-	case "tool_calls", "function_call":
+	case "tool_calls", typeFunctionCall:
 		return "STOP"
 	default:
 		return "STOP"
@@ -1120,23 +1115,7 @@ func (g *geminiStreamWriter) Flush() {
 }
 
 func (g *geminiStreamWriter) Write(nums []byte) (int, error) {
-	g.pending = append(g.pending, nums...)
-
-	for {
-		i := bytes.IndexByte(g.pending, '\n')
-		if i < 0 {
-			break
-		}
-
-		line := strings.TrimRight(string(g.pending[:i]), "\r")
-
-		g.pending = g.pending[i+1:]
-		if err := g.handleLine(line); err != nil {
-			return 0, err
-		}
-	}
-
-	return len(nums), nil
+	return writeSSELines(&g.pending, nums, g.handleLine)
 }
 
 func (g *geminiStreamWriter) handleLine(line string) error {
@@ -1308,6 +1287,7 @@ func geminiStreamErrorStatus(kind upstream.ErrKind) int {
 	}
 }
 
+//nolint:funlen // 流收尾的终态帧按顺序写出。
 func (g *geminiStreamWriter) finish() error {
 	if g.finished {
 		return nil

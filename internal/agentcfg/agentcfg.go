@@ -95,7 +95,7 @@ type meta struct {
 	AppliedAt   time.Time `json:"applied_at"`
 }
 
-func (m *Manager) client(id string) (client, bool) {
+func (*Manager) client(id string) (client, bool) {
 	for _, c := range clients {
 		if c.id == id {
 			return c, true
@@ -121,11 +121,14 @@ func (m *Manager) Status() []Status {
 // statusLocked 无锁实现；调用方已持 m.mu。
 func (m *Manager) statusLocked() []Status {
 	out := make([]Status, 0, len(clients))
-	for _, c := range clients {
-		path := c.path(m.Home)
+	for _, spec := range clients {
+		path := spec.path(m.Home)
 
-		status := Status{ID: c.id, Name: c.name, Path: path, Detected: detected(path), Applied: false, Modified: false, AppliedAt: ""}
-		if mt, err := m.readMeta(c.id); err == nil {
+		status := Status{
+			ID: spec.id, Name: spec.name, Path: path, Detected: detected(path),
+			Applied: false, Modified: false, AppliedAt: "",
+		}
+		if mt, err := m.readMeta(spec.id); err == nil {
 			status.Applied = true
 
 			status.AppliedAt = mt.AppliedAt.Format(time.RFC3339)
@@ -165,6 +168,8 @@ func validateOptions(opts *Options) error {
 }
 
 // Apply 写入网关专属配置。
+//
+//nolint:funlen // 配置读改写与回滚线性展开。
 func (m *Manager) Apply(id string, opts Options) (Status, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -212,7 +217,10 @@ func (m *Manager) Apply(id string, opts Options) (Status, error) {
 		}
 	}
 
-	return Status{ID: id, Name: client2.name, Path: path, Detected: false, Applied: false, Modified: false, AppliedAt: ""}, nil
+	return Status{
+		ID: id, Name: client2.name, Path: path, Detected: false,
+		Applied: false, Modified: false, AppliedAt: "",
+	}, nil
 }
 
 // prepareMeta 首次写入时备份原件；已有写入记录时校验文件未被外部修改。
@@ -347,16 +355,26 @@ func (m *Manager) writeMeta(id string, mt meta) error {
 	return nil
 }
 
-func applyClaude(existing []byte, opts Options) ([]byte, error) {
+// loadConfigDoc 解析已有客户端配置；空内容按空对象处理。
+func loadConfigDoc(existing []byte, label string) (map[string]any, error) {
 	doc := map[string]any{}
 	if len(bytes.TrimSpace(existing)) > 0 {
 		if err := json.Unmarshal(existing, &doc); err != nil {
-			return nil, fmt.Errorf("现有 Claude 配置不是合法 JSON: %w", err)
+			return nil, fmt.Errorf("现有 %s 配置不是合法 JSON: %w", label, err)
 		}
-		// 顶层 null 会把 doc 置为 nil map；按空配置处理，避免写 env 时 panic。
+
 		if doc == nil {
 			doc = map[string]any{}
 		}
+	}
+
+	return doc, nil
+}
+
+func applyClaude(existing []byte, opts Options) ([]byte, error) {
+	doc, err := loadConfigDoc(existing, "Claude")
+	if err != nil {
+		return nil, err
 	}
 
 	env, _ := doc["env"].(map[string]any)
@@ -469,15 +487,9 @@ func splitCodexRoot(text string) (root, tables string) {
 }
 
 func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
-	doc := map[string]any{}
-	if len(bytes.TrimSpace(existing)) > 0 {
-		if err := json.Unmarshal(existing, &doc); err != nil {
-			return nil, fmt.Errorf("现有 OpenCode 配置不是合法 JSON: %w", err)
-		}
-		// 顶层 null 会把 doc 置为 nil map；按空配置处理，避免写 provider 时 panic。
-		if doc == nil {
-			doc = map[string]any{}
-		}
+	doc, err := loadConfigDoc(existing, "OpenCode")
+	if err != nil {
+		return nil, err
 	}
 
 	provider, _ := doc["provider"].(map[string]any)
@@ -536,7 +548,7 @@ func writeFile(path string, raw []byte) error {
 	}
 
 	tmp := path + ".wokbuddy.tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil { //nolint:gosec // 路径来自固定客户端定义 + 用户主目录
 		return fmt.Errorf("writeFile: %w", err)
 	}
 

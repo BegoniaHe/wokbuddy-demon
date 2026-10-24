@@ -70,7 +70,8 @@ var markupTagPrefix = regexp.QuoteMeta("<" + markupPipe + "DSML" + markupPipe)
 // 其中 string 属性可选（缺省按 JSON 解析取值）。
 var (
 	markupInvokeRe = regexp.MustCompile(markupTagPrefix + `\s+invoke\s+name="([^"]*)"\s*>`)
-	markupParamRe  = regexp.MustCompile(markupTagPrefix + `\s+parameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>`)
+	markupParamRe  = regexp.MustCompile(markupTagPrefix +
+		`\s+parameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>`)
 )
 
 // markupToolNameRe 是工具名的合理形态：各家 SDK 的工具名一律是这种标识符。
@@ -357,6 +358,8 @@ func markupNameAllowed(name string, allowed map[string]bool, strict bool) bool {
 // string="true" 的取值按原文字符串处理（走 JSON 转义，命令里的换行/引号/反斜杠
 // 原样保留）；其余先按 JSON 解析，失败则退化为字符串——参数值永远不丢，最坏情况
 // 是类型不如模型本意。无参数的工具产出 "{}"。
+//
+//nolint:gocognit // 参数按 JSON/字符串多形态解析。
 func parseMarkupParams(body string) (string, bool) {
 	args := map[string]any{}
 

@@ -24,7 +24,9 @@ var errFetchAccountProfileFailed = errors.New("FetchAccountProfile failed")
 // FetchAccountProfile 拉取账号资料并返回最新昵称。uid 与凭证不一致时报错
 // （防串号）；业务/网络错误原样返回，调用方静默跳过即可。
 func (c *Client) FetchAccountProfile(account *auth.Auth) (string, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, c.webBase(account)+"/console/account", http.NoBody)
+	req, err := http.NewRequestWithContext(
+		context.Background(), http.MethodGet, c.webBase(account)+"/console/account", http.NoBody,
+	)
 	if err != nil {
 		return "", fmt.Errorf("FetchAccountProfile: %w", err)
 	}
@@ -53,7 +55,8 @@ func (c *Client) FetchAccountProfile(account *auth.Auth) (string, error) {
 	}
 
 	if resp.UID != "" && account.UID != "" && resp.UID != account.UID {
-		return "", fmt.Errorf("profile uid mismatch: resp=%s auth=%s: %w", resp.UID, account.UID, errFetchAccountProfileFailed)
+		return "", fmt.Errorf("profile uid mismatch: resp=%s auth=%s: %w",
+			resp.UID, account.UID, errFetchAccountProfileFailed)
 	}
 
 	return resp.Nickname, nil

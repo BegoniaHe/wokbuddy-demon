@@ -66,6 +66,8 @@ func compensationGate(acct *auth.Auth, disabled bool) (string, bool) {
 // CompensationStatusAll 并发查询全部账号的补偿状态，按池顺序返回。
 //
 // ctx 取消后不再派发新的请求（已派发的等其完成）。
+//
+//nolint:funlen // 并发拉取/汇总/排序线性展开。
 func (s *Scheduler) CompensationStatusAll(ctx context.Context) []CompensationRow {
 	list := s.cfg.Pool.List()
 	rows := make([]CompensationRow, len(list))
@@ -131,7 +133,8 @@ func (s *Scheduler) fetchCompensationRow(account *auth.Auth, row *CompensationRo
 		return
 	}
 
-	row.Active, row.Claimed, row.CreditNum, row.EndTime = status.Active, status.Claimed, status.CreditNum, status.EndTime
+	row.Active, row.Claimed, row.CreditNum, row.EndTime =
+		status.Active, status.Claimed, status.CreditNum, status.EndTime
 }
 
 // ClaimCompensationFor 对单账号执行「先查后领」，返回该账号的结果行。
@@ -177,6 +180,8 @@ func (s *Scheduler) ClaimCompensationFor(uid string) CompensationRow {
 }
 
 // claimCompensation 执行「已领/无待领/幂等/领取」分支，返回填好的结果行。
+//
+//nolint:funlen // 领取/状态更新/结果汇总线性展开。
 func (s *Scheduler) claimCompensation(
 	row *CompensationRow, account *auth.Auth, comp upstream.CompensationStatus, uid string,
 ) CompensationRow {

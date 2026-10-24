@@ -50,7 +50,7 @@ var cnEffortFallback = map[string]effortCap{
 // 注意 deepseek-v4.1-flash 在国际版**只有 ['high']**（product.ts:190 实测 IDE 缓存），
 // 与 CN 面的三档刻意不同——往 WorkBuddy 上游发 low/max 是非法参数 400。
 var globalEffortFallback = map[string]effortCap{
-	"fast-model":             {efforts: []string{"medium"}},
+	modelFastID:              {efforts: []string{"medium"}},
 	"balanced-model":         {efforts: []string{"medium"}},
 	"primary-model":          {efforts: []string{"high"}},
 	"hy4-preview":            {efforts: []string{"high"}, defaultEffort: "high"},
@@ -95,7 +95,9 @@ func staticEffortCap(realm, model string) effortCap {
 // （对齐参考仓库 resolveModel 的 `defaultEffort ∈ efforts` 防御：不宣称不支持的默认档）。
 // remoteDefault 空串不回落到静态默认档——默认档随档位表同源：remote 有档位就用 remote 默认档，
 // 静态兜底档位就用静态默认档，避免跨源拼接出「档位是静态、默认档是 remote」的矛盾组合。
-func EffortListing(realm, model string, remoteEfforts []string, remoteDefault string) (efforts []string, defaultEffort string) {
+func EffortListing(
+	realm, model string, remoteEfforts []string, remoteDefault string,
+) (efforts []string, defaultEffort string) {
 	var src effortCap
 
 	switch {
@@ -129,7 +131,9 @@ func containsEffort(efforts []string, want string) bool {
 // 只认 high，客户端传 low/max 必降级到 high，否则上游 400 毁掉请求）。
 // 语义对齐参考仓库 effortsFor（remoteMeta → productFallback → 静态表），只取前两级：
 // 远端桶（探测已解析）→ 本产品静态表（本文件），缺档位即无（不再到通用静态表）。
-func globalEffortMap(remoteEfforts map[string][]string, remoteDefaults map[string]string) (map[string][]string, map[string]string) {
+func globalEffortMap(
+	remoteEfforts map[string][]string, remoteDefaults map[string]string,
+) (map[string][]string, map[string]string) {
 	efforts := make(map[string][]string, len(globalEffortFallback)+len(remoteEfforts))
 	defs := make(map[string]string, len(globalEffortFallback)+len(remoteDefaults))
 	// 静态兜底为基。

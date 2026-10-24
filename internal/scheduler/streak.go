@@ -115,7 +115,9 @@ func (s *Scheduler) redeemUnlockedTiers(account *auth.Auth, full *upstream.Strea
 
 		if err := s.cfg.Upstream.GrowthRedeemTier(account, tier.Tier); err != nil {
 			// 未解锁（403）属预期，静默；其余记日志。
-			log.Printf("streak-bonus %s: redeem %s: %v", logfmt.Label(account.UID, account.NicknameValue()), tier.Tier, err)
+			log.Printf("streak-bonus %s: redeem %s: %v",
+				logfmt.Label(account.UID, account.NicknameValue()), tier.Tier, err)
+
 			continue
 		}
 
@@ -133,7 +135,8 @@ func (s *Scheduler) drawAllLottery(account5 *auth.Auth, chances int) {
 			return
 		}
 
-		log.Printf("streak-bonus %s: 🎲 第%d抽 %s", logfmt.Label(account5.UID, account5.NicknameValue()), i+1, compactJSON(raw))
+		log.Printf("streak-bonus %s: 🎲 第%d抽 %s",
+			logfmt.Label(account5.UID, account5.NicknameValue()), i+1, compactJSON(raw))
 	}
 
 	if chances > 0 {
@@ -141,11 +144,14 @@ func (s *Scheduler) drawAllLottery(account5 *auth.Auth, chances int) {
 	}
 }
 
+// maxStreakPayloadLen 奖品载荷日志上限。
+const maxStreakPayloadLen = 220
+
 // compactJSON 裁剪奖品载荷（日志单行可读）。
 func compactJSON(raw json.RawMessage) string {
 	s := string(raw)
-	if len(s) > 220 {
-		return s[:220] + "…"
+	if len(s) > maxStreakPayloadLen {
+		return s[:maxStreakPayloadLen] + "…"
 	}
 
 	return s

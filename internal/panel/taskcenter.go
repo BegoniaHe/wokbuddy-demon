@@ -10,12 +10,13 @@
 package panel
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -238,6 +239,8 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 // growth 时点共用核心）。返回 (started, total, seq, msg)：seq==-1 表示队列
 // 已在执行（冲突）；started=false 时 msg 为无可执行待办的说明。并发夹取
 // [1,4]；growth 开关同 HTTP 入参语义。
+//
+//nolint:funlen // 扫描/冲突判定/入队/启动线性展开。
 func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, total, seq int, msg string) {
 	if concurrency < 1 {
 		concurrency = 1
@@ -380,8 +383,8 @@ func (p *Panel) queueAccountGrowth(account2 *auth.Auth) []upstream.Task {
 		grow = mergeMPPending(grow, mpTasks)
 	}
 
-	sort.Slice(grow, func(i, j int) bool { // 按 autoActions 顺序（依赖前置）
-		return autoActionIndex(grow[i].TaskCode) < autoActionIndex(grow[j].TaskCode)
+	slices.SortFunc(grow, func(a, b upstream.Task) int { // 按 autoActions 顺序（依赖前置）
+		return cmp.Compare(autoActionIndex(a.TaskCode), autoActionIndex(b.TaskCode))
 	})
 
 	return grow
@@ -400,6 +403,8 @@ func (p *Panel) RunGrowthQueueOnce() {
 
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），
 // 账号间并发（信号量）。每项结果写回队列状态。
+//
+//nolint:gocognit,funlen,maintidx // 分组并发/串行/收尾线性展开，拆开需传递队列状态。
 func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurrency int) {
 	queueState2 := p.queue()
 	defer func() {
@@ -491,7 +496,7 @@ func (p *Panel) queueMarkAt(i int, status, msg string) {
 }
 
 // queueSet 按 uid 批量改状态。
-func (p *Panel) queueSet(queueState2 *queueState, uid string, fn func(*queueItem)) {
+func (*Panel) queueSet(queueState2 *queueState, uid string, fn func(*queueItem)) {
 	queueState2.mu.Lock()
 	defer queueState2.mu.Unlock()
 
@@ -509,14 +514,7 @@ func (p *Panel) acceptPendingTasks(account *auth.Auth) int {
 		return 0
 	}
 
-	var codes []string
-
-	for i := range tasks {
-		if t := &tasks[i]; !t.Claimed && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
-			codes = append(codes, t.TaskCode)
-		}
-	}
-
+	codes := pendingTaskCodes(tasks)
 	if len(codes) == 0 {
 		return 0
 	}

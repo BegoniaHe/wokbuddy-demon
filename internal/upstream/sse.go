@@ -9,7 +9,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,7 +41,7 @@ type FrameError struct {
 }
 
 func (e *FrameError) Error() string { return errErrorFrame.Error() + ": " + e.Payload }
-func (e *FrameError) Unwrap() error { return errErrorFrame }
+func (*FrameError) Unwrap() error   { return errErrorFrame }
 
 // ErrorFramePayload 返回 error 帧原始 JSON；非该类型返回空串。
 func ErrorFramePayload(err error) string {
@@ -564,7 +564,7 @@ func (a *streamAggregator) attachToolCalls(message map[string]any) {
 		return
 	}
 
-	sort.Ints(a.tools.order)
+	slices.Sort(a.tools.order)
 
 	calls := make([]map[string]any, 0, len(a.tools.order))
 	for _, idx := range a.tools.order {
@@ -686,6 +686,8 @@ func appendStringIfNonEmpty(dst, src map[string]any, key string) {
 // 若空 name 的首片就占用该配额，真正的 name 会被当成重复而删掉，客户端最终拿到
 // 没有 name 的调用（Anthropic 面会整块丢弃 tool_use）。空 name 键本身是噪声，
 // 直接删掉但不占配额。
+//
+//nolint:gocognit // 工具名去重按 index/片段/空名分层，顺序即语义。
 func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
@@ -738,6 +740,8 @@ func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool)
 // stripToolCallIDs 去除同一 tool_call index 后续分片里重复的 id 键。
 // 官方流首片带 id，后续分片可能重复携带同一 id；累加型客户端会把 id 当字符串
 // 拼接。保留首个 id，后续同 index 的 id 键删除。
+//
+//nolint:gocognit // 工具调用 id 去重按 index/片段/空名分层，顺序即语义。
 func stripToolCallIDs(obj map[string]any, tools *toolIndex, seen map[int]string) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
@@ -1175,6 +1179,8 @@ func (s *streamWriter) continueMessageID(obj map[string]any) {
 }
 
 // trackMaxToolIdx 记录上游已用过的最大 tool_call index（供标记修复接续编号）。
+//
+//nolint:gocognit // 逐 choice/delta/tool_calls 提取最大 index。
 func (s *streamWriter) trackMaxToolIdx(obj map[string]any) {
 	chs, ok := obj["choices"].([]any)
 	if !ok {
@@ -1300,7 +1306,7 @@ func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall)
 // 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
 // 降级原样写出，但不计数）。
 //
-//nolint:cyclop // 帧类型按 error/业务错误/修复/普通分派，线性更直观。
+//nolint:cyclop,gocognit,gocyclo // 帧类型按 error/业务错误/修复/普通分派，线性更直观。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil || obj == nil {
@@ -1366,6 +1372,8 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 // 单行超上限（issue #113）：向客户端写一帧明确 error 后收尾（[DONE] 照写），
 // 并返回 ErrSSELineTooLong——客户端不会把半截超长行当正常内容，调用方按上游
 // 失败处置账号。
+//
+//nolint:gocognit // 读帧/写帧/空流兜底/错误分类线性展开。
 func (s *streamWriter) stream(r io.Reader) error {
 	// 流结束（含写失败）清掉写截止：连接可能被 keep-alive 复用，
 	// 残留的过期 deadline 会让后续请求的响应写立即失败。
@@ -1425,6 +1433,8 @@ type lineResult struct {
 // streamWithKeepalive 在阻塞读取上游的同时按 keepalive 间隔写注释帧。
 // 读放在独立 goroutine，主循环 select 读结果与心跳定时器；退出时关闭 r
 // （若可关闭）以解除读阻塞，避免 goroutine 泄漏。
+//
+//nolint:gocognit // 读 goroutine 与心跳定时器双路 select，顺序即语义。
 func (s *streamWriter) streamWithKeepalive(r io.Reader) error {
 	lines, done, finished := asyncLines(r)
 	// 返回前先关 done 再 Close 底层 reader（解除阻塞中的 Read），最后等读 goroutine
@@ -1624,7 +1634,8 @@ func (s *streamWriter) flushData() (int, error) {
 // 与空流兜底同形态：HTTP 头已发出只能 200，error 帧是客户端唯一能看到的失败信号。
 // 错误原因由 stream 原样返回给调用方（日志/观测），不在这里二次编造。
 func (s *streamWriter) finishSizeLimit() {
-	_ = s.writeRaw(`{"error":{"message":"upstream sse line exceeded size limit","type":"upstream_error","code":"upstream_parse"}}`)
+	_ = s.writeRaw(`{"error":{"message":"upstream sse line exceeded size limit",` +
+		`"type":"upstream_error","code":"upstream_parse"}}`)
 	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
 		return
 	}
@@ -1672,9 +1683,11 @@ func (s *streamWriter) flushPending(validFrames *int) error {
 func (s *streamWriter) writeFinishFallback(validFrames int) {
 	switch {
 	case validFrames == 0:
-		_ = s.writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
+		_ = s.writeRaw(`{"error":{"message":"empty upstream stream",` +
+			`"type":"upstream_error","code":"upstream_parse"}}`)
 	case !s.sawDone && !s.sawFinish:
-		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]","type":"upstream_error","code":"upstream_parse"}}`)
+		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]",` +
+			`"type":"upstream_error","code":"upstream_parse"}}`)
 	}
 }
 

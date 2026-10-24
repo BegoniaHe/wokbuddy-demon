@@ -59,6 +59,8 @@ func New(url string, client *http.Client) *Catalog {
 }
 
 // Refresh 拉取并替换价格快照；失败时保留旧快照并记录原因。
+//
+//nolint:funlen // 拉取/解析/合并/缓存替换线性展开。
 func (c *Catalog) Refresh(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, http.NoBody)
 	if err != nil {
@@ -136,7 +138,9 @@ func (c *Catalog) Snapshot() Snapshot {
 
 // Estimate 估算一次用量的 USD 花费。缓存命中/未命中分别计价；未定价返回 false。
 // exchangeRate 用于把 USD 折算成展示币种（1 = 保持 USD）。
-func (c *Catalog) Estimate(model string, prompt, completion, cacheHit, cacheMiss int64, exchangeRate float64) (float64, bool) {
+func (c *Catalog) Estimate(
+	model string, prompt, completion, cacheHit, cacheMiss int64, exchangeRate float64,
+) (float64, bool) {
 	if c == nil {
 		return 0, false
 	}

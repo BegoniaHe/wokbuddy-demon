@@ -13,7 +13,6 @@ import (
 	"log"
 	"net/http"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -71,6 +70,9 @@ const (
 	anthropicMaxToolUseNameLen = 200
 )
 
+// stopReasonKey Anthropic 响应里表示停止原因的字段名。
+const stopReasonKey = "stop_reason"
+
 // anthropicMessagesHandler 是 /v1/messages 的入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	input, out, ok := h.newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
@@ -125,26 +127,26 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 			return
 		}
 
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, "read body: "+err.Error(), "")
 
 		return
 	}
 
 	var iface any
 	if err := json.Unmarshal(body, &iface); err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body", "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, "invalid JSON body", "")
 		return
 	}
 
 	obj, _ := iface.(map[string]any)
 	if messages, ok := obj["messages"].([]any); !ok || len(messages) == 0 {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", errMessagesIsRequired.Error(), "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, errMessagesIsRequired.Error(), "")
 		return
 	}
 
 	model, _ := obj["model"].(string)
 	if strings.TrimSpace(model) == "" {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", errModelIsRequired.Error(), "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, errModelIsRequired.Error(), "")
 		return
 	}
 	// 与 /v1/messages 同口径：白名单校验前先应用后台模型改写，避免同一模型在
@@ -162,7 +164,7 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	tokens := max((countAnthropicPromptBytes(obj)+3)/4, 1)
-	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": tokens})
+	writeJSON(w, http.StatusOK, map[string]any{keyInputTokens: tokens})
 }
 
 // countTokensModelVisible 校验 count_tokens 的模型黑名单（models.hidden）：
@@ -181,7 +183,7 @@ func (h *Handler) countTokensModelVisible(w http.ResponseWriter, r *http.Request
 		return true
 	}
 
-	writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+	writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq,
 		"model is hidden by gateway config (models.hidden); pick another model", "")
 
 	return false
@@ -200,7 +202,7 @@ func (h *Handler) countTokensModelAllowed(w http.ResponseWriter, r *http.Request
 
 	realm, bare, err := resolveKeyModel(model, h.requestModelAliases(model, keyRealm), keyRealm)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, err.Error(), "")
 		return false
 	}
 
@@ -304,28 +306,18 @@ func (h *Handler) newAnthropicChatInput(
 			return chatInput{}, nil, false
 		}
 
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, "read body: "+err.Error(), "")
 
 		return chatInput{}, nil, false
 	}
 
 	converted, prelude, err := h.anthropicConvertWithSearch(r.Context(), r, body)
 	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error(), "")
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, err.Error(), "")
 		return chatInput{}, nil, false
 	}
 
-	chatInput2 := chatInput{
-		body:           converted.openAI,
-		stream:         converted.stream,
-		model:          converted.model,
-		convReqID:      r.Header.Get("X-Conversation-Request-Id"),
-		traceID:        r.Header.Get("X-Trace-Id"),
-		inboundSession: inboundSessionMetaFrom(r),
-		trace:          requestTraceFrom(r),
-		keyUsage:       keyUsageFrom(r.Context()),
-		keyRealm:       keyRealmFrom(r.Context()),
-	}
+	chatInput2 := newChatInputFromRequest(r, converted.openAI, converted.stream, converted.model)
 
 	return chatInput2, &anthropicResponder{
 		w: w, model: converted.model, keepalive: keepalive, options: converted.options,
@@ -747,7 +739,7 @@ func anthropicOutputConfig(raw json.RawMessage) (string, any) {
 
 // anthropicJSONOutputFormat 把 Anthropic JSONOutputFormat 转成 chat response_format。
 func anthropicJSONOutputFormat(format map[string]any) any {
-	if format == nil || stringValue(format["type"]) != "json_schema" {
+	if format == nil || stringValue(format["type"]) != jsonSchemaType {
 		return nil
 	}
 
@@ -757,8 +749,8 @@ func anthropicJSONOutputFormat(format map[string]any) any {
 	}
 
 	return map[string]any{
-		"type": "json_schema",
-		"json_schema": map[string]any{
+		"type": jsonSchemaType,
+		jsonSchemaType: map[string]any{
 			"name": "output", "schema": schema, "strict": true,
 		},
 	}
@@ -1154,9 +1146,9 @@ func anthropicToolResultMessage(block map[string]any) (map[string]any, []any, er
 	}
 
 	toolMsg := map[string]any{
-		"role":         "tool",
-		"tool_call_id": id,
-		"content":      text,
+		"role":        "tool",
+		keyToolCallID: id,
+		"content":     text,
 	}
 	// chat 形态的 tool 消息没有 content part 数组，缓存断点只能挂在消息对象上
 	// （其余块类型都落在 part 上）。
@@ -1447,7 +1439,8 @@ func anthropicDocumentContentParts(raw any) ([]any, error) {
 
 			parts = append(parts, part)
 		default:
-			return nil, fmt.Errorf("%w: unsupported content block %q", errAnthropicDocumentSource, stringValue(block["type"]))
+			return nil, fmt.Errorf("%w: unsupported content block %q",
+				errAnthropicDocumentSource, stringValue(block["type"]))
 		}
 	}
 
@@ -1602,6 +1595,8 @@ func openAIContent(parts []any) any {
 // anthropicTools 把 Anthropic tools 转为 OpenAI function tools。客户端自定义
 // 工具的 type 可以省略，也可以是 "custom"；服务端工具（web_search/bash/
 // code_execution 等）没有客户端执行语义，明确拒绝。
+//
+//nolint:gocognit // 工具类型/服务端工具/参数转换线性展开。
 func anthropicTools(tools []map[string]any) ([]any, error) {
 	out := make([]any, 0, len(tools))
 	for _, tool := range tools {
@@ -1786,7 +1781,9 @@ func (r *anthropicResponder) Header(name, value string) {
 }
 
 // Stream 读取上游 OpenAI SSE，逐帧转换为 Anthropic SSE 事件。
-func (r *anthropicResponder) Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error {
+func (r *anthropicResponder) Stream(
+	rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string),
+) error {
 	anthropicStreamWriter2 := newAnthropicStreamWriterWithOptions(r.w, r.model, r.options)
 	anthropicStreamWriter2.prelude = r.prelude
 
@@ -1808,6 +1805,8 @@ func (r *anthropicResponder) Stream(rc io.Reader, hint func(string) string, repa
 }
 
 // anthropicMessageFromOpenAIWithOptions 按请求选项编码非流式响应。
+//
+//nolint:funlen // 非流式响应字段密集，平铺便于与协议对照。
 func anthropicMessageFromOpenAIWithOptions(
 	body any, model string, options anthropicResponseOptions,
 ) map[string]any {
@@ -1857,14 +1856,14 @@ func anthropicMessageFromOpenAIWithOptions(
 	usage := anthropicUsage(obj["usage"])
 
 	return map[string]any{
-		"id":            id,
-		"type":          "message",
-		"role":          "assistant",
-		"model":         model,
-		"content":       content,
-		"stop_reason":   stopReason,
-		"stop_sequence": stopSequence,
-		"usage":         usage,
+		"id":               id,
+		"type":             "message",
+		"role":             "assistant",
+		"model":            model,
+		"content":          content,
+		stopReasonKey:      stopReason,
+		stopReasonSequence: stopSequence,
+		"usage":            usage,
 	}
 }
 
@@ -1928,8 +1927,8 @@ func anthropicUsage(raw any) map[string]any {
 	input = max(input-cached-cacheWrite, 0)
 
 	usageOut := map[string]any{
-		"input_tokens":                input,
-		"output_tokens":               output,
+		keyInputTokens:                input,
+		keyOutputTokens:               output,
 		"cache_creation_input_tokens": cacheWrite,
 		"cache_read_input_tokens":     cached,
 	}
@@ -1946,11 +1945,11 @@ func anthropicStopReason(reason string, hasTool bool) string {
 	switch reason {
 	case "length", "max_tokens":
 		return "max_tokens"
-	case "tool_calls", "function_call", "tool_use":
+	case "tool_calls", typeFunctionCall, "tool_use":
 		return "tool_use"
-	case "content_filter", "refusal":
+	case statusContentFilter, "refusal":
 		return "refusal"
-	case "stop_sequence", "pause_turn", "model_context_window_exceeded", "end_turn":
+	case stopReasonSequence, "pause_turn", "model_context_window_exceeded", "end_turn":
 		return reason
 	case "stop":
 		if hasTool {
@@ -1973,13 +1972,13 @@ func anthropicStop(reason, text string, sequences []string, hasTool bool) (strin
 	// 上游可能不发 finish_reason；此时若正文以客户端声明的停止序列收尾，
 	// 仍按 stop_sequence 返回，不能退化成 end_turn。
 	reasonMissing := reason == ""
-	if (reasonMissing || reason == "stop" || reason == "stop_sequence") && !hasTool {
+	if (reasonMissing || reason == "stop" || reason == stopReasonSequence) && !hasTool {
 		if sequence, ok := matchedStopSequence(text, sequences); ok {
-			return "stop_sequence", sequence
+			return stopReasonSequence, sequence
 		}
 	}
 
-	if reason == "stop_sequence" {
+	if reason == stopReasonSequence {
 		// 上游说命中了停止序列，但正文里没有可回传的序列（已被上游剥掉）：
 		// 没有配对值就不能保持 stop_sequence，退回 end_turn。
 		return anthropicStopReason("stop", hasTool), nil
@@ -2006,11 +2005,14 @@ func matchedStopSequence(text string, sequences []string) (string, bool) {
 	return best, best != ""
 }
 
+// statusAnthropicOverloaded Anthropic 的非标准重载状态码。
+const statusAnthropicOverloaded = 529
+
 // anthropicErrorType 按 HTTP 状态码映射 Anthropic error.type。529 是 Anthropic
 // 的非标准重载码，单独保留。
 func anthropicErrorType(status int) string {
-	if status == 529 {
-		return "overloaded_error"
+	if status == statusAnthropicOverloaded {
+		return errorTypeOverloaded
 	}
 
 	if errorType, ok := anthropicErrorTypes[status]; ok {
@@ -2021,8 +2023,8 @@ func anthropicErrorType(status int) string {
 }
 
 var anthropicErrorTypes = map[int]string{
-	http.StatusBadRequest:            "invalid_request_error",
-	http.StatusUnprocessableEntity:   "invalid_request_error",
+	http.StatusBadRequest:            errorTypeInvalidReq,
+	http.StatusUnprocessableEntity:   errorTypeInvalidReq,
 	http.StatusUnauthorized:          "authentication_error",
 	http.StatusForbidden:             "permission_error",
 	http.StatusNotFound:              "not_found_error",
@@ -2033,8 +2035,8 @@ var anthropicErrorTypes = map[int]string{
 	http.StatusPaymentRequired:       "billing_error",
 	http.StatusRequestTimeout:        "timeout_error",
 	http.StatusGatewayTimeout:        "timeout_error",
-	http.StatusServiceUnavailable:    "overloaded_error",
-	http.StatusBadGateway:            "overloaded_error",
+	http.StatusServiceUnavailable:    errorTypeOverloaded,
+	http.StatusBadGateway:            errorTypeOverloaded,
 }
 
 // writeAnthropicError 写出 Anthropic 错误信封。错误路径也要保证 Request-Id 可读，
@@ -2156,22 +2158,7 @@ func (a *anthropicStreamWriter) Flush() {
 
 // Write 按行拆分开源 SSE，转换 data 帧；返回错误会中止上游透传。
 func (a *anthropicStreamWriter) Write(nums []byte) (int, error) {
-	a.pending = append(a.pending, nums...)
-	for {
-		i := bytes.IndexByte(a.pending, '\n')
-		if i < 0 {
-			break
-		}
-
-		line := strings.TrimRight(string(a.pending[:i]), "\r")
-
-		a.pending = a.pending[i+1:]
-		if err := a.handleLine(line); err != nil {
-			return 0, err
-		}
-	}
-
-	return len(nums), nil
+	return writeSSELines(&a.pending, nums, a.handleLine)
 }
 
 // handleLine 处理单行：data 帧转换，[DONE] 收尾，注释/空行忽略。
@@ -2386,16 +2373,16 @@ func (a *anthropicStreamWriter) ensureStart(chunk map[string]any) error {
 	if err := a.event("message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
-			"id":            id,
-			"type":          "message",
-			"role":          "assistant",
-			"model":         a.model,
-			"content":       []any{},
-			"stop_reason":   nil,
-			"stop_sequence": nil,
+			"id":               id,
+			"type":             "message",
+			"role":             "assistant",
+			"model":            a.model,
+			"content":          []any{},
+			stopReasonKey:      nil,
+			stopReasonSequence: nil,
 			"usage": map[string]any{
-				"input_tokens":                a.netInputTokens(),
-				"output_tokens":               0,
+				keyInputTokens:                a.netInputTokens(),
+				keyOutputTokens:               0,
 				"cache_creation_input_tokens": a.cacheWrite,
 				"cache_read_input_tokens":     a.cachedTokens,
 			},
@@ -2470,17 +2457,17 @@ func (a *anthropicStreamWriter) netInputTokens() int {
 // 取值（链式网关与 Anthropic 兼容实现会回传这些字面量）。网关本地兜底帧用
 // upstream_error，不在此表内。
 var anthropicFrameErrorTypes = map[string]bool{
-	"invalid_request_error": true,
-	"authentication_error":  true,
-	"permission_error":      true,
-	"not_found_error":       true,
-	"conflict_error":        true,
-	"request_too_large":     true,
-	"rate_limit_error":      true,
-	"billing_error":         true,
-	"timeout_error":         true,
-	"overloaded_error":      true,
-	"api_error":             true,
+	errorTypeInvalidReq:    true,
+	"authentication_error": true,
+	"permission_error":     true,
+	"not_found_error":      true,
+	"conflict_error":       true,
+	"request_too_large":    true,
+	"rate_limit_error":     true,
+	"billing_error":        true,
+	"timeout_error":        true,
+	errorTypeOverloaded:    true,
+	"api_error":            true,
 }
 
 // anthropicStreamErrorType 把上游错误帧映射为 Anthropic error.type。
@@ -2497,7 +2484,7 @@ func anthropicStreamErrorType(payload string, errObj map[string]any) string {
 	case upstream.ErrSoftRate, upstream.ErrQueueWaiting:
 		return "rate_limit_error"
 	case upstream.ErrQueueFull, upstream.ErrServer:
-		return "overloaded_error"
+		return errorTypeOverloaded
 	case upstream.ErrHardCredit:
 		return "billing_error"
 	case upstream.ErrSessionDead, upstream.ErrAccountFault:
@@ -2507,7 +2494,7 @@ func anthropicStreamErrorType(payload string, errObj map[string]any) string {
 	case upstream.ErrBadParams, upstream.ErrPromptTooLong, upstream.ErrContentBlocked,
 		upstream.ErrImageInvalid, upstream.ErrModelBlocked, upstream.ErrModelAccess,
 		upstream.ErrWafBlock, upstream.ErrChannelRefused:
-		return "invalid_request_error"
+		return errorTypeInvalidReq
 	default:
 		return "api_error"
 	}
@@ -2634,7 +2621,7 @@ func (a *anthropicStreamWriter) indexedToolBlocks() []*anthropicToolBlock {
 		indexes = append(indexes, idx)
 	}
 
-	sort.Ints(indexes)
+	slices.Sort(indexes)
 
 	blocks := make([]*anthropicToolBlock, 0, len(indexes))
 	for _, idx := range indexes {
@@ -2646,6 +2633,8 @@ func (a *anthropicStreamWriter) indexedToolBlocks() []*anthropicToolBlock {
 
 // flushToolBlocks 按 index 顺序写出当前缓冲的 tool_use 块并清空缓冲；
 // 可被文本边界或收尾多次调用。
+//
+//nolint:funlen,gocognit // 工具块收尾按状态顺序写出。
 func (a *anthropicStreamWriter) flushToolBlocks() error {
 	// 调用方遍布正文边界、finish_reason、错误与收尾：先关掉可能还在开的
 	// text/thinking 块，否则工具块会在旧块未关闭时开新 index，旧块永远拿不到
@@ -2808,8 +2797,8 @@ func (a *anthropicStreamWriter) validateToolBlock(block *anthropicToolBlock) {
 // usagePayload 组装 message_delta 的累计 usage。
 func (a *anthropicStreamWriter) usagePayload() map[string]any {
 	usage := map[string]any{
-		"input_tokens":                a.netInputTokens(),
-		"output_tokens":               a.outputTokens,
+		keyInputTokens:                a.netInputTokens(),
+		keyOutputTokens:               a.outputTokens,
 		"cache_creation_input_tokens": a.cacheWrite,
 		"cache_read_input_tokens":     a.cachedTokens,
 	}
@@ -2887,7 +2876,7 @@ func (a *anthropicStreamWriter) finish() error {
 
 	if err := a.event("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": reason, "stop_sequence": stopSequence},
+		"delta": map[string]any{stopReasonKey: reason, stopReasonSequence: stopSequence},
 		"usage": a.usagePayload(),
 	}); err != nil {
 		return err

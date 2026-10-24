@@ -12,6 +12,7 @@
 package panel
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -22,7 +23,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -236,6 +237,7 @@ func (p *Panel) routesPages() {
 	p.mux.HandleFunc("POST /panel/api/agents/{client}/restore", p.withAuth(p.agentsRestore))
 }
 
+//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesAccounts() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
@@ -279,6 +281,7 @@ func (p *Panel) routesImport() {
 	p.mux.HandleFunc("POST /panel/api/import/encrypted", p.withAuth(p.importEncrypted))
 }
 
+//nolint:dupl // 同 routesAccounts：逐条平铺比抽象注册表更易检索。
 func (p *Panel) routesUsage() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/credit_history", p.withAuth(p.creditHistoryHandler))
@@ -585,7 +588,9 @@ func (p *Panel) collectCNModels() ([]map[string]any, string) {
 
 	out := make([]map[string]any, 0, len(infos))
 	for i := range infos {
-		out = append(out, panelModelEntry("cn", &infos[i], infos[i].Efforts, infos[i].DefaultEffort, p.cfg.Upstream.HTTP))
+		out = append(out, panelModelEntry(
+			"cn", &infos[i], infos[i].Efforts, infos[i].DefaultEffort, p.cfg.Upstream.HTTP,
+		))
 	}
 
 	return out, ""
@@ -618,7 +623,9 @@ func (p *Panel) collectGlobalModels() ([]map[string]any, string) {
 
 	out := make([]map[string]any, 0, len(infos))
 	for i := range infos {
-		out = append(out, panelModelEntry("global", &infos[i], efforts[infos[i].ID], defaults[infos[i].ID], p.cfg.Upstream.HTTP))
+		out = append(out, panelModelEntry(
+			"global", &infos[i], efforts[infos[i].ID], defaults[infos[i].ID], p.cfg.Upstream.HTTP,
+		))
 	}
 
 	return out, ""
@@ -627,6 +634,8 @@ func (p *Panel) collectGlobalModels() ([]map[string]any, string) {
 // panelModelEntry 构造单个模型条目（两域共用）：id 带 realm 前缀（调用值即显示值），
 // context_length / max_output_tokens 走四级查找链，effort 档位按 realm 域取
 // EffortListing（远端权威 ∪ 静态兜底表）——与 /v1/models 同一口径，两侧不再漂移。
+//
+//nolint:funlen,maintidx // 单模型条目字段密集，平铺便于与 /v1/models 对照。
 func panelModelEntry(
 	realm string,
 	modelInfo *upstream.ModelInfo,
@@ -819,25 +828,26 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 // 余额刷新。与 disable 的区别：不写 reason、不清冷却域、不重置计数——账号是「临时
 // 让位」而非「判死」，点「恢复选号」即可立刻回到池子（无需重登或解冻）。
 func (p *Panel) accountPause(w http.ResponseWriter, r *http.Request) {
-	uid := r.PathValue("uid")
-	if !p.cfg.Pool.Pause(uid) {
-		writeErr(w, http.StatusNotFound, "account not found")
-		return
-	}
-
-	log.Printf("panel: pause uid=%s（暂停选号，保号任务照常）", uid)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	p.accountToggle(w, r, p.cfg.Pool.Pause, "pause uid=%s（暂停选号，保号任务照常）")
 }
 
 // accountResume 解除暂停选号（幂等，对未暂停账号为空操作）。
 func (p *Panel) accountResume(w http.ResponseWriter, r *http.Request) {
+	p.accountToggle(w, r, p.cfg.Pool.Resume, "resume uid=%s（恢复参与选号）")
+}
+
+// accountToggle 切换账号选号状态并输出统一回执。
+func (*Panel) accountToggle(
+	w http.ResponseWriter, r *http.Request, toggle func(string) bool, logFormat string,
+) {
 	uid := r.PathValue("uid")
-	if !p.cfg.Pool.Resume(uid) {
+	if !toggle(uid) {
 		writeErr(w, http.StatusNotFound, "account not found")
+
 		return
 	}
 
-	log.Printf("panel: resume uid=%s（恢复参与选号）", uid)
+	log.Printf("panel: "+logFormat, uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1250,8 +1260,8 @@ func parseUsageWindow(r *http.Request) usage.Window {
 		}
 	}
 
-	if win.Hours > 1440 {
-		win.Hours = 1440
+	if win.Hours > maxUsageWindowHours {
+		win.Hours = maxUsageWindowHours
 	}
 
 	return win
@@ -1271,7 +1281,7 @@ func parseTimeParam(str string) time.Time {
 			return time.Time{}
 		}
 		// 兼容秒与毫秒（前端可能直接把 Date.now() 传上来）。
-		if n > 1e12 {
+		if n > epochMillisThreshold {
 			return time.UnixMilli(n)
 		}
 
@@ -1305,6 +1315,8 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 // 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
 // 标 error，不影响其它账号——一个号 token 失效不该让整页空白。客户端断开后
 // 不再派发剩余账号。
+//
+//nolint:funlen // 并发拉包/合并/错误隔离线性展开。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	accts := p.cfg.Pool.List()
@@ -1359,7 +1371,7 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 余额降序：多的在前，便于和少的对比。
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
+	slices.SortStableFunc(out, func(a, b packageAccountRow) int { return cmp.Compare(b.Remain, a.Remain) })
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "grants": creditGrants(out)})
 }
 
@@ -1451,6 +1463,12 @@ type creditGrant struct {
 	Status    string `json:"status"`
 }
 
+const (
+	maxUsageWindowHours  = 24 * 60
+	epochMillisThreshold = 1e12
+	largePackageMinSize  = 1500
+)
+
 // creditGrants 把全部账号的积分包摊平成获取历史，按发放时间倒序。
 func creditGrants(accounts []packageAccountRow) []creditGrant {
 	now := time.Now()
@@ -1468,7 +1486,7 @@ func creditGrants(accounts []packageAccountRow) []creditGrant {
 		}
 	}
 
-	sort.SliceStable(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
+	slices.SortStableFunc(out, func(a, b creditGrant) int { return cmp.Compare(b.CreatedAt, a.CreatedAt) })
 
 	return out
 }
@@ -1485,7 +1503,7 @@ func inferGrantSource(pkg *upstream.CreditPackage) string {
 		}
 	}
 
-	if pkg.Size >= 1500 {
+	if pkg.Size >= largePackageMinSize {
 		return "首次授权（按面额推断）"
 	}
 
@@ -1593,31 +1611,33 @@ func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.B
 		}
 
 		for model := range models {
-			rows = append(rows, p.remainingRow(acct, model, daily[acct.UID][model], resetByKey[acct.UID+"|"+model], budgets, now))
+			rows = append(rows, p.remainingRow(
+				acct, model, daily[acct.UID][model], resetByKey[acct.UID+"|"+model], budgets, now,
+			))
 		}
 	}
 
-	sort.SliceStable(rows, func(i, j int) bool { return remainingRowLess(&rows[i], &rows[j]) })
+	slices.SortStableFunc(rows, func(a, b remainingRow) int { return remainingRowCompare(&a, &b) })
 
 	return rows, budgets, len(events)
 }
 
-// remainingRowLess 剩余量升序；同量按 realm/uid/model 固定次序。
+// remainingRowCompare 剩余量升序；同量按 realm/uid/model 固定次序。
 // 行集合来自 map 遍历，缺少次级键时同量行序会随机变化，令 ETag 抖动、304 失效。
-func remainingRowLess(left, right *remainingRow) bool {
-	if left.Remaining != right.Remaining {
-		return left.Remaining < right.Remaining
+func remainingRowCompare(left, right *remainingRow) int {
+	if c := cmp.Compare(left.Remaining, right.Remaining); c != 0 {
+		return c
 	}
 
-	if left.Realm != right.Realm {
-		return left.Realm < right.Realm
+	if c := cmp.Compare(left.Realm, right.Realm); c != 0 {
+		return c
 	}
 
-	if left.UID != right.UID {
-		return left.UID < right.UID
+	if c := cmp.Compare(left.UID, right.UID); c != 0 {
+		return c
 	}
 
-	return left.Model < right.Model
+	return cmp.Compare(left.Model, right.Model)
 }
 
 // remainingRow 组装单行；有撞线重置时间时改用同窗口用量。

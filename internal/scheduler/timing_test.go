@@ -1,12 +1,10 @@
 package scheduler
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"math"
 	"math/rand/v2"
-	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -313,13 +311,7 @@ func TestRunPacedBatchSortsWithoutWindow(t *testing.T) {
 		want[i].phase = dailyPhase("", want[i].uid, day, taskCheckin, hour)
 	}
 
-	slices.SortStableFunc(want, func(first, second batchTarget) int {
-		if c := cmp.Compare(first.phase, second.phase); c != 0 {
-			return c
-		}
-
-		return cmp.Compare(first.uid, second.uid)
-	})
+	sortBatchTargets(want)
 
 	for i := range want {
 		if order[i] != want[i].uid {
