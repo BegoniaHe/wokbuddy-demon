@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
-	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -121,10 +120,7 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 // global/enterprise 门控；默认列表失败返回错误文本（此时仍合并 mp 待办）。
 func (p *Panel) scanAccountGrowth(account4 *auth.Auth) ([]upstream.Task, string) {
 	// D4/企业版门控：global 与企业版无 CN 个人成长任务体系，不发起任何上游调用。
-	// 企业切换会话（token_source=enterprise_switch）同口径跳过并 WARN——这类会话跑
-	// 行为类任务会白耗真实对话配额且拿不到奖励，需以个人身份重新登录。
-	if account4.IsGlobal() || account4.IsEnterpriseSession() {
-		warnEnterpriseSwitchSession(account4, "扫描")
+	if account4.IsGlobal() || account4.IsEnterprise() {
 		return nil, ""
 	}
 
@@ -362,8 +358,7 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 // queueAccountGrowth 拉取账号待办成长任务并按 autoActions 顺序排序。global/企业版
 // 门控；默认列表失败则整账号跳过（与扫描口径不同：扫描失败仍合并 mp 待办）。
 func (p *Panel) queueAccountGrowth(account2 *auth.Auth) []upstream.Task {
-	if account2.IsGlobal() || account2.IsEnterpriseSession() {
-		warnEnterpriseSwitchSession(account2, "队列")
+	if account2.IsGlobal() || account2.IsEnterprise() {
 		return nil
 	}
 
@@ -603,16 +598,4 @@ func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 		"seq":        queueState2.seq,
 		"items":      items,
 	})
-}
-
-// warnEnterpriseSwitchSession 企业切换会话被任务链路跳过时留一条 WARN（纯企业版账号
-// 属预期形态，不刷日志；只有 token_source=enterprise_switch 这种「半企业」会话才是
-// 需要人工处置的异常，须显形）。
-func warnEnterpriseSwitchSession(account *auth.Auth, stage string) {
-	if account == nil || account.IsEnterprise() || !account.IsEnterpriseSession() {
-		return
-	}
-
-	log.Printf("WARN: [panel] %s 跳过企业切换会话 acct=%s：需移除账号后以个人身份重新登录",
-		stage, logfmt.Label(account.UID, account.NicknameValue()))
 }

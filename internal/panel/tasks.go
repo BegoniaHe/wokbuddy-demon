@@ -69,17 +69,14 @@ func decodeTaskCode(w http.ResponseWriter, r *http.Request) (string, bool) {
 //   - 企业版没有个人成长/签到体系（上游 400 code 10001「企业账号不支持该操作」，
 //     见 auth.IsEnterprise 注释）。
 //
-// 与 taskcenter 的扫描/队列门控同口径（IsGlobal() || IsEnterpriseSession()）。
+// 与 taskcenter 的扫描/队列门控同口径（IsGlobal() || IsEnterprise()）。
+// token_source 只是认证方法，不参与账号身份判定。
 func taskDenyReason(account *auth.Auth) string {
 	switch {
 	case account.IsGlobal():
 		return "国际版（global）账号没有 CN 成长/任务体系，已跳过"
 	case account.IsEnterprise():
 		return "企业版账号没有个人签到/成长任务体系，已跳过"
-	// 企业切换会话（token_source=enterprise_switch）：跑行为类任务会白耗真实对话
-	// 配额且拿不到奖励，需以个人身份重新登录。
-	case account.IsEnterpriseSession():
-		return "企业切换会话，请移除账号后以个人身份重新登录"
 	default:
 		return ""
 	}
