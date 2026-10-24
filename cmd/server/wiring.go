@@ -62,20 +62,22 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 }
 
 // realmAwareAvailableOne 构造会话粘性快路径的单账号可用性闭包。
+//
+//nolint:dupl // 与 realmAwareStickyLowLoad 形似但参数顺序不同；共享 helper 曾导致实参错位。
 func realmAwareAvailableOne(p *pool.Pool) func(model, uid string) bool {
-	return realmAware(p, p.IsAvailableForModel)
+	return func(model, uid string) bool {
+		realm, bare := server.ResolveModel(model)
+		return p.IsAvailableForModel(bare, realm, uid)
+	}
 }
 
 // realmAwareStickyLowLoad 构造粘性降级窗口结束后的低水位判定闭包。
+//
+//nolint:dupl // 同 realmAwareAvailableOne：参数顺序不同，不能共用同一 adapter。
 func realmAwareStickyLowLoad(p *pool.Pool) func(model, uid string) bool {
-	return realmAware(p, p.StickyLowLoad)
-}
-
-// realmAware 把 model 拆成 realm/bare 后调用账号级判定。
-func realmAware(_ *pool.Pool, check func(bare, realm, uid string) bool) func(model, uid string) bool {
 	return func(model, uid string) bool {
 		realm, bare := server.ResolveModel(model)
-		return check(bare, realm, uid)
+		return p.StickyLowLoad(uid, bare, realm)
 	}
 }
 
