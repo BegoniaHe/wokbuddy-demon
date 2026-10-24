@@ -316,6 +316,13 @@ type Config struct {
 		// multimodal_routing 同口径默认关闭；热生效。当前只放行 CN 域账号选号
 		// （上游仅在 CN 域实测过，两域放开留 TODO）。
 		SearchEndpoint bool `json:"search_endpoint"`
+		// SearchDeep 是否允许 /v1/search/messages 的 deep=true 综述式检索
+		// （官方 /agenttool/v1/agentic_search，issue #277）。默认 false：
+		// 单次请求最长 120s 且消耗搜索额度，与 search_endpoint 同口径默认关。
+		SearchDeep bool `json:"search_deep"`
+		// WebFetchEndpoint 是否开放 POST /v1/tools/fetch（官方 /agenttool/v1/webfetch
+		// 的 DSH 形态出口，issue #276）。默认 false。
+		WebFetchEndpoint bool `json:"web_fetch_endpoint"`
 		// ImagesEndpoint 是否开放 POST /v1/images/generations（issue #253）。
 		// 默认 false：图像端点尚未在真实账号验证鉴权/计费，与 search_endpoint 同口径。
 		ImagesEndpoint bool `json:"images_endpoint"`

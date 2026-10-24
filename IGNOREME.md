@@ -292,7 +292,8 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | OpenAI Chat Completions | `POST /v1/chat/completions`、`GET /v1/models`、`GET /v1/models/{model}` |
 | OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function/custom tools、结构化输出；reasoning/compaction 等状态 item 忽略） |
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
-| 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭） |
+| 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭；`deep=true` 需 `features.search_deep`） |
+| 官方工具出口 | `POST /v2/chat/busy`（模型忙预检，只读本地池状态）、`POST /v1/tools/fetch` / `POST /v1/fetch`（官方服务端抓取，需 `features.web_fetch_endpoint=true`） |
 | Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
 
 Codex CLI 等使用 Responses API 的客户端：
@@ -315,6 +316,8 @@ codex
 - realm：当前只放行 **CN 域**账号选号（上游仅在 CN 域实测过；两域放开留 TODO）。
 - 入站要求：`tools` 里声明 `web_search`（如 `{"type":"web_search_20250305","name":"web_search"}`），否则 400；搜索词取**最后一条 user 消息**的文本块（不在文本里的历史/tool_result 不参与），并剥掉官方固定指令前缀 `Perform a web search for the query:`；入站 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Trace-ID` 原样透传上游。
 - 条数：`max_results`（请求体顶层或 `tools[].max_results`）生效，缺省 5、上限 10；搜索词上限 1024 字符。
+- 官方过滤参数：`tools[]` 的 `allowed_domains` / `blocked_domains` / `freshness`（`d1-d30` / `m1-m12` / `y1-y5`）透传到上游；`blocked_domains` 按官方形态拼成 `(... -site:domain)` 追加到 query。非法域名/freshness 在入口 400，不消耗账号。
+- 深检索：请求体 `deep:true` 改走 `/agenttool/v1/agentic_search` 返回综述文本（需 `features.search_deep=true`），只做单次尝试；关闭时明确 400，不静默降级。
 - 出站响应：assistant message，`content` 依次为 text 块（摘要 + `citations[].cited_text`）与 `web_search_tool_result` 块（逐条 title/url/snippet）；`usage` 为估算值（网关无 tokenizer，仅用于客户端预算）。
 - 错误：上游错误按既有分类处置（限流走软冷却、会话失效禁用、额度硬冷却等），请求级/内容/队列类不再轮转；`15001`（搜索次数用尽）会在 `gateway_hint` 里提示可按号重试，上游原文原样透传。
 
@@ -484,6 +487,9 @@ gemini
 | `cn.chat_base` | 空 | 国内版 upstream chat base 覆盖（如指向自建/自选入口）。空 = 默认 `https://www.workbuddy.cn`，并在首 token 前按 `408/502/503/504` 或传输错误回落 `copilot.tencent.com`、`wb.tencentbuddy.com`；**非空时只用该值、不回落**（与 `global.chat_base` 同语义）。改后需重启 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
 | `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
+| `features.search_deep` | `false` | 允许 `POST /v1/search/messages` 的 `deep:true`：上游 `/agenttool/v1/agentic_search` 综述式检索，单次最长 120s、只做单次尝试（不随 `upstream.rotate_max` 放大）。热生效 |
+| `features.web_fetch_endpoint` | `false` | 开放 `POST /v1/tools/fetch`（`/v1/fetch` 同义别名）：官方服务端抓取（上游 `/agenttool/v1/webfetch`），入口做 scheme / userinfo / 私网 SSRF 校验，仅 CN 域。热生效 |
+| `features.images_endpoint` | `false` | 开放 `POST /v1/images/generations`：官方出图；尚未在真实账号验证鉴权与计费，默认关闭。热生效 |
 | `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |
 | `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -45,7 +46,16 @@ func (h *Handler) anthropicConvertWithSearch(
 	}
 
 	meta := searchMetaFromRequest(r)
-	outcome, uid, fail := h.runSearch(ctx, query, toolMaxResults(req.Tools), &meta)
+
+	options := toolSearchOptions(req.Tools)
+
+	if validationErr := validateSearchOptions(options); validationErr != nil {
+		return anthropicConversion{}, nil, validationErr
+	}
+
+	started := time.Now()
+	outcome, uid, fail := h.runSearch(ctx, query, options, &meta)
+	h.recordSearchUsage(r, uid, req.Model, started, nil, fail == nil)
 
 	prelude := anthropicSearchPrelude(query, outcome, fail)
 	req.Tools = stripWebSearchTools(req.Tools)

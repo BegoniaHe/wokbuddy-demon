@@ -888,3 +888,220 @@ func TestSearchRealmPrefix(t *testing.T) {
 		t.Errorf("cn 前缀应打上游一次，calls=%d", calls)
 	}
 }
+
+// TestSearchOfficialFiltersPassThrough web_search 声明的 allowed/blocked/freshness
+// 完整到达上游请求体；blocked 拼成 -site: 后缀（issue #278）。
+func TestSearchOfficialFiltersPassThrough(t *testing.T) {
+	t.Parallel()
+
+	var gotBody string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 1024)
+		n, _ := r.Body.Read(buf)
+		gotBody = string(buf[:n])
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(searchOKBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL}
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+	})
+
+	body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],` +
+		`"tools":[{"name":"web_search","allowed_domains":["go.dev"],"blocked_domains":["spam.example"],"freshness":"d7"}]}`
+	if rec := doSearchRequest(t, handler, body); rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	for _, want := range []string{
+		`"query":"go (-site:spam.example)"`, `"allowed_domains":["go.dev"]`, `"freshness":"d7"`,
+	} {
+		if !strings.Contains(gotBody, want) {
+			t.Errorf("出站 body=%s want 含 %s", gotBody, want)
+		}
+	}
+}
+
+// TestSearchRejectsInvalidFilters 非法域名/freshness 在入口 400，不打上游。
+func TestSearchRejectsInvalidFilters(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		calls++
+		return 200, searchOKBody
+	})
+
+	for _, tool := range []string{
+		`{"name":"web_search","allowed_domains":["https://go.dev"]}`,
+		`{"name":"web_search","blocked_domains":["a b.com"]}`,
+		`{"name":"web_search","freshness":"d31"}`,
+	} {
+		body := `{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],"tools":[` + tool + `]}`
+		if rec := doSearchRequest(t, handler, body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("tool=%s code=%d body=%s", tool, rec.Code, rec.Body)
+		}
+	}
+
+	if calls != 0 {
+		t.Fatalf("非法参数不得打上游，calls=%d", calls)
+	}
+}
+
+// TestDeepSearchDisabled 开关关闭时 deep=true 明确 400，不静默降级（issue #277）。
+func TestDeepSearchDisabled(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		calls++
+		return 200, searchOKBody
+	})
+
+	body := `{"model":"m","deep":true,"messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],"tools":[{"name":"web_search"}]}`
+
+	rec := doSearchRequest(t, handler, body)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "search_deep") {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if calls != 0 {
+		t.Fatalf("calls=%d want 0", calls)
+	}
+}
+
+// TestDeepSearchReturnsSynthesis 开启后只打一次 agentic_search，返回 synthesis 文本。
+func TestDeepSearchReturnsSynthesis(t *testing.T) {
+	t.Parallel()
+
+	var searches, agentic int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/agenttool/v1/agentic_search":
+			agentic++
+
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("event: tool_call\ndata: {}\n\nevent: done\ndata: {\"synthesis\":{\"content\":\"综述内容\"}}\n\n"))
+		case "/agenttool/v1/search":
+			searches++
+
+			http.Error(w, "should not use snippet search", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL}
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true, SearchDeep: true}),
+	})
+
+	body := `{"model":"m","deep":true,"messages":[{"role":"user","content":[{"type":"text","text":"研究 go"}]}],"tools":[{"name":"web_search"}]}`
+
+	rec := doSearchRequest(t, handler, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	out := rec.Body.String()
+
+	if !strings.Contains(out, "综述内容") || !strings.Contains(out, `"type":"text"`) {
+		t.Fatalf("response missing synthesis: %s", out)
+	}
+
+	if agentic != 1 || searches != 0 {
+		t.Fatalf("agentic=%d searches=%d want 1/0", agentic, searches)
+	}
+}
+
+// TestDeepSearchForwardsSessionHeaders 深检索与 snippet 搜索同口径：入站会话头族
+// 必须原样透传给上游（上游按会话聚合搜索流量）。
+func TestDeepSearchForwardsSessionHeaders(t *testing.T) {
+	t.Parallel()
+
+	var got http.Header
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: done\ndata: {\"synthesis\":{\"content\":\"ok\"}}\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL}
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at-u1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{SearchEndpoint: true, SearchDeep: true}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/search/messages",
+		strings.NewReader(`{"model":"m","deep":true,"messages":[{"role":"user","content":"研究 go"}],"tools":[{"name":"web_search"}]}`))
+	req.Header.Set("Anthropic-Version", "2023-06-01")
+	req.Header.Set("X-Conversation-Id", "conv-1")
+	req.Header.Set("X-Conversation-Request-Id", "req-1")
+	req.Header.Set("X-Trace-Id", "trace-1")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if got.Get("X-Conversation-Id") != "conv-1" || got.Get("X-Conversation-Request-Id") != "req-1" ||
+		got.Get("X-Trace-Id") != "trace-1" {
+		t.Fatalf("conversation headers=%q/%q/%q",
+			got.Get("X-Conversation-Id"), got.Get("X-Conversation-Request-Id"), got.Get("X-Trace-Id"))
+	}
+}
+
+// TestDeepSearchNoDoneIs502 上游无 done 帧不能伪装成成功。
+func TestDeepSearchNoDoneIs502(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		return 200, "event: tool_result\ndata: {}\n\n"
+	})
+	handler.cfg.Live = livecfg.New(livecfg.Snapshot{SearchEndpoint: true, SearchDeep: true})
+
+	body := `{"model":"m","deep":true,"messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],"tools":[{"name":"web_search"}]}`
+
+	rec := doSearchRequest(t, handler, body)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+}
+
+// TestSearchErrorDoesNotPenalizeClientModel 搜索请求体不含 model：上游 14003
+// 不能被写成客户端模型的模型级冷却（否则后续 chat 会误避开该模型）。
+func TestSearchErrorDoesNotPenalizeClientModel(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := searchTestHandler(t, true, func(*http.Request) (int, string) {
+		return http.StatusTooManyRequests, `{"code":14003,"msg":"model busy"}`
+	})
+
+	body := `{"model":"glm-5.2","messages":[{"role":"user","content":[{"type":"text","text":"go"}]}],` +
+		`"tools":[{"name":"web_search"}]}`
+
+	rec := doSearchRequest(t, handler, body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if st := handler.cfg.Pool.ModelBlockedForRealm("glm-5.2", "cn"); st.Blocked {
+		t.Fatalf("search error must not cool client model: %+v", st)
+	}
+}

@@ -114,6 +114,10 @@ func parseModelBusy(body []byte) map[string]string {
 
 // collectModelBusy 递归收集 model→level（深度有界）。
 //
+// 官方 /v2/chat/busy 的数组项是 {"model","busy_level"}；map 形态是
+// {model: level} 或 {model: {busy_level: level}}。level 键只作为旧形态兼容，
+// busy_level 优先。字段名本身不能当模型名写入结果（否则模型页出现伪模型）。
+//
 //nolint:cyclop,gocognit // 兼容三种响应形态，深度有界且分支集中。
 func collectModelBusy(node any, out map[string]string, depth int) {
 	if depth > 3 {
@@ -123,13 +127,17 @@ func collectModelBusy(node any, out map[string]string, depth int) {
 	switch value := node.(type) {
 	case map[string]any:
 		for key, item := range value {
+			if isModelBusyMetaKey(key) {
+				continue
+			}
+
 			switch typed := item.(type) {
 			case string:
-				if isModelBusyLevel(typed) {
-					out[key] = typed
+				if level, ok := normalizeModelBusyLevel(typed); ok {
+					out[key] = level
 				}
 			case map[string]any:
-				if level, _ := typed["level"].(string); isModelBusyLevel(level) {
+				if level, ok := modelBusyLevel(typed); ok {
 					out[key] = level
 				} else {
 					collectModelBusy(typed, out, depth+1)
@@ -140,8 +148,9 @@ func collectModelBusy(node any, out map[string]string, depth int) {
 		}
 	case []any:
 		for _, item := range value {
-			m, _ := item.(map[string]any)
-			if m == nil {
+			m, ok := item.(map[string]any)
+			if !ok {
+				collectModelBusy(item, out, depth+1)
 				continue
 			}
 
@@ -150,14 +159,48 @@ func collectModelBusy(node any, out map[string]string, depth int) {
 				name, _ = m["id"].(string)
 			}
 
-			level, _ := m["level"].(string)
-			if name != "" && isModelBusyLevel(level) {
+			if level, ok := modelBusyLevel(m); ok && name != "" {
 				out[name] = level
 			} else {
 				collectModelBusy(m, out, depth+1)
 			}
 		}
 	}
+}
+
+// modelBusyLevel 读 busy_level，缺失/非法时回落旧 level 键。
+func modelBusyLevel(m map[string]any) (string, bool) {
+	if level, ok := normalizeModelBusyLevel(stringValue(m["busy_level"])); ok {
+		return level, true
+	}
+
+	return normalizeModelBusyLevel(stringValue(m["level"]))
+}
+
+// normalizeModelBusyLevel 归一官方六个 level；大小写/空白不一致时统一为小写。
+func normalizeModelBusyLevel(level string) (string, bool) {
+	level = strings.ToLower(strings.TrimSpace(level))
+	if isModelBusyLevel(level) {
+		return level, true
+	}
+
+	return "", false
+}
+
+// isModelBusyMetaKey 跳过响应字段名，避免把 busy_level / level 当成模型名。
+func isModelBusyMetaKey(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "busy_level", "level", "model", "id":
+		return true
+	}
+
+	return false
+}
+
+// stringValue 读取 JSON 字符串字段（非字符串返回空串）。
+func stringValue(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 // isModelBusyLevel 官方六个 level。

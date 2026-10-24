@@ -667,6 +667,9 @@ func panelModelEntry(
 		entry["promo_note"] = modelInfo.PromoNote
 	}
 
+	// 官方档位徽章（issue #274）：与 /v1/models 同口径，仅展示。
+	applyPanelModelTier(entry, modelInfo)
+
 	if mods := modelInfo.EffectiveInputModalities(); len(mods) > 0 {
 		// 输入模态（issue #109）：与 /v1/models 同口径，未知时省略（不宣称）。
 		entry["input_modalities"] = mods
@@ -689,6 +692,13 @@ func panelModelEntry(
 	}
 
 	return entry
+}
+
+// applyPanelModelTier 挂载官方档位展示字段（nil 时省略）。
+func applyPanelModelTier(entry map[string]any, modelInfo *upstream.ModelInfo) {
+	if modelInfo.Tier != nil {
+		entry["tier"] = modelInfo.Tier
+	}
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out

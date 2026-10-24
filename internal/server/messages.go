@@ -15,10 +15,12 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
@@ -47,19 +49,8 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if isBodyTooLarge(err) {
-			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large",
-				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
-
-			return
-		}
-
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
-
+	body, ok := h.readSearchBody(w, r)
+	if !ok {
 		return
 	}
 
@@ -70,8 +61,15 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if req.deep {
+		h.anthropicDeepSearch(w, r, req)
+		return
+	}
+
 	meta := searchMetaFromRequest(r)
-	outcome, uid, fail := h.runSearch(r.Context(), req.query, req.maxResults, &meta)
+	started := time.Now()
+	outcome, uid, fail := h.runSearch(r.Context(), req.query, req.options, &meta)
+	h.recordSearchUsage(r, uid, req.model, started, nil, fail == nil)
 	// 请求日志记账：搜索路径没有 chatStat，账号/模型/结果显式写进 trace
 	// （trace 由 ServeHTTP 在 /v1/search/messages 上创建，开关与其它 POST 接口一致）。
 	if fail == nil {
@@ -89,11 +87,33 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, buildSearchMessage(req.model, req.query, outcome))
 }
 
+// readSearchBody 读取并限制搜索请求体；失败已写出 Anthropic 错误。
+func (h *Handler) readSearchBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "缩小请求体或调大 server.max_body_bytes")
+
+			return nil, false
+		}
+
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error(), "")
+
+		return nil, false
+	}
+
+	return body, true
+}
+
 // searchRequest 解析出的搜索请求要素。
 type searchRequest struct {
-	model      string
-	query      string
-	maxResults int
+	model   string
+	query   string
+	options upstream.SearchOptions
+	deep    bool
 }
 
 // parseSearchRequest 解析并校验入站请求：模型、messages、web_search 工具声明。
@@ -105,6 +125,8 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 		Tools     []map[string]any       `json:"tools"`
 		// MaxResults 可选：非 0 时覆盖默认条数（上游按 ClampSearchMaxResults 收敛）。
 		MaxResults int `json:"max_results"`
+		// Deep 可选：true = 官方综述式检索（features.search_deep）。
+		Deep bool `json:"deep"`
 	}
 
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -141,12 +163,81 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 
 	// 条数：请求体顶层 max_results 优先，其次 tools[].max_results；两处都缺省时用
 	// upstream 的默认值（ClampSearchMaxResults 负责收敛到 [1, cap]）。
-	maxResults := payload.MaxResults
-	if maxResults <= 0 {
-		maxResults = toolMaxResults(payload.Tools)
+	options := toolSearchOptions(payload.Tools)
+	if payload.MaxResults > 0 {
+		options.MaxResults = payload.MaxResults
 	}
 
-	return &searchRequest{model: model, query: query, maxResults: maxResults}, nil
+	if err := validateSearchOptions(options); err != nil {
+		return nil, err
+	}
+
+	return &searchRequest{model: model, query: query, options: options, deep: payload.Deep}, nil
+}
+
+// toolSearchOptions 解析 web_search 工具声明里的官方可选参数。
+func toolSearchOptions(tools []map[string]any) upstream.SearchOptions {
+	for _, tool := range tools {
+		name, _ := tool["name"].(string)
+		kind, _ := tool["type"].(string)
+
+		if name != "web_search" && !strings.HasPrefix(kind, "web_search") {
+			continue
+		}
+
+		opts := upstream.SearchOptions{
+			AllowedDomains: stringList(tool["allowed_domains"]),
+			BlockedDomains: stringList(tool["blocked_domains"]),
+			Freshness:      strings.TrimSpace(stringValue(tool["freshness"])),
+		}
+
+		switch value := tool["max_results"].(type) {
+		case float64:
+			opts.MaxResults = int(value)
+		case int:
+			opts.MaxResults = value
+		}
+
+		return opts
+	}
+
+	return upstream.SearchOptions{}
+}
+
+// stringList 把 JSON 字符串数组解析为 []string（非数组/非字符串项忽略）。
+func stringList(v any) []string {
+	items, _ := v.([]any)
+	if len(items) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+
+	return out
+}
+
+// validateSearchOptions 在入口校验域名与时间范围：非法值 400，不烧账号。
+func validateSearchOptions(opts upstream.SearchOptions) error {
+	for _, domain := range append(append([]string{}, opts.AllowedDomains...), opts.BlockedDomains...) {
+		if !upstream.ValidSearchDomain(domain) {
+			return fmt.Errorf("%w: %q", errSearchInvalidDomain, domain)
+		}
+	}
+
+	if len(opts.AllowedDomains) > upstream.SearchMaxDomains || len(opts.BlockedDomains) > upstream.SearchMaxDomains {
+		return fmt.Errorf("%w（每类最多 %d 个）", errSearchTooManyDomains, upstream.SearchMaxDomains)
+	}
+
+	if !upstream.ValidSearchFreshness(opts.Freshness) {
+		return fmt.Errorf("%w: %q", errSearchInvalidFreshness, opts.Freshness)
+	}
+
+	return nil
 }
 
 // normalizeSearchModel 归一搜索请求的 model：去空白、拒绝空值、只接受 cn 域。
@@ -178,27 +269,6 @@ func normalizeSearchModel(raw string) (string, error) {
 // searchQueryMaxLen 搜索词长度上限（防御性：上游 zod 无上限，超长 query 只会让
 // 上游超时并白占一次在途名额；1024 字符已远超任何真实搜索词）。
 const searchQueryMaxLen = 1024
-
-// toolMaxResults 取 web_search 工具声明里的 max_results（缺省/非法返回 0 = 用默认）。
-func toolMaxResults(tools []map[string]any) int {
-	for _, tool := range tools {
-		name, _ := tool["name"].(string)
-		kind, _ := tool["type"].(string)
-
-		if name != "web_search" && !strings.HasPrefix(kind, "web_search") {
-			continue
-		}
-
-		switch value := tool["max_results"].(type) {
-		case float64:
-			return int(value)
-		case int:
-			return value
-		}
-	}
-
-	return 0
-}
 
 // declaresWebSearch 报告请求是否声明了 web_search 工具（官方形态：
 // {"type":"web_search_20250305","name":"web_search"}；也接受 name=web_search 的简写）。
@@ -323,6 +393,78 @@ func buildSearchMessage(model, query string, outcome *upstream.SearchOutcome) ma
 	}
 }
 
+// anthropicDeepSearch 执行综述式检索并写回 Anthropic message（issue #277）。
+func (h *Handler) anthropicDeepSearch(w http.ResponseWriter, r *http.Request, req *searchRequest) {
+	if !h.loadLive().SearchDeep {
+		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+			"deep search is disabled; enable features.search_deep to use deep=true", "")
+
+		return
+	}
+
+	meta := searchMetaFromRequest(r)
+	started := time.Now()
+	outcome, uid, fail := h.runAgenticSearch(r.Context(), req.query, &meta)
+
+	var agenticUsage *upstream.AgenticUsage
+	if outcome != nil {
+		agenticUsage = outcome.Usage
+	}
+
+	h.recordSearchUsage(r, uid, req.model, started, agenticUsage, fail == nil)
+
+	if fail != nil {
+		requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeHTTPError)
+		writeAnthropicError(w, fail.status, searchErrorType(fail.status), fail.msg, searchHint(fail))
+
+		return
+	}
+
+	requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeSuccess)
+
+	writeJSON(w, http.StatusOK, buildAgenticSearchMessage(req.model, outcome))
+}
+
+// buildAgenticSearchMessage 组装综述式检索的 Anthropic message：单个 text 块。
+func buildAgenticSearchMessage(model string, outcome *upstream.AgenticOutcome) map[string]any {
+	synthesis := ""
+	inputTokens, outputTokens := 1, 1
+
+	if outcome != nil {
+		synthesis = outcome.Synthesis
+		// 上游不返回用量时按查询/综述粗估（与 snippet 搜索同一口径），有真实
+		// usage 再覆盖；输入与输出必须分别取 query / synthesis。
+		inputTokens = max(1, len(outcome.Query)/4)
+		outputTokens = max(1, len(synthesis)/4)
+	}
+
+	usage := map[string]any{
+		"input_tokens":  inputTokens,
+		"output_tokens": outputTokens,
+	}
+
+	if outcome != nil && outcome.Usage != nil {
+		if outcome.Usage.PromptTokens > 0 {
+			usage["input_tokens"] = outcome.Usage.PromptTokens
+		}
+
+		if outcome.Usage.CompletionTokens > 0 {
+			usage["output_tokens"] = outcome.Usage.CompletionTokens
+		}
+	}
+
+	return map[string]any{
+		"id":            "msg_" + session.NewMessageID(),
+		"type":          "message",
+		"role":          "assistant",
+		"model":         model,
+		"content":       []map[string]any{{"type": "text", "text": synthesis}},
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage":         usage,
+	}
+}
+
 // accountNickname 取账号昵称（记账展示用；账号已移除时返回空串）。
 func accountNickname(h *Handler, uid string) string {
 	if uid == "" {
@@ -427,4 +569,7 @@ var (
 	errSearchQueryTooLong     = errors.New("搜索词过长（上限 1024 字符），请精简后重试")
 	errSearchRealmUnsupported = errors.New(
 		"该搜索端点只支持 cn 域；请去掉 global: 前缀（当前不支持国际版搜索）")
+	errSearchInvalidDomain    = errors.New("非法搜索域名：只允许 host（不含协议/路径/端口/空白）")
+	errSearchTooManyDomains   = errors.New("搜索域名数量超过上限")
+	errSearchInvalidFreshness = errors.New("非法 freshness：只允许 d1-d30 / m1-m12 / y1-y5")
 )
