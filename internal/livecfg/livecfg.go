@@ -28,6 +28,10 @@ type Snapshot struct {
 	// SearchEndpoint 是否开放 POST /v1/search/messages（features.search_endpoint，
 	// 默认 false）：握手官方联网搜索，会消耗账号额度，故与其它新增出站能力同口径默认关。
 	SearchEndpoint bool
+	// SearchDeep 是否允许 /v1/search/messages 的 deep=true（issue #277）。
+	SearchDeep bool
+	// WebFetchEndpoint 是否开放 POST /v1/tools/fetch（issue #276）。
+	WebFetchEndpoint bool
 	// ImagesEndpoint 是否开放 POST /v1/images/generations（features.images_endpoint，
 	// 默认 false）。未在真实账号验证前不默认开启（issue #253）。
 	ImagesEndpoint bool

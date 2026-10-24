@@ -2320,6 +2320,10 @@ type ModelInfo struct {
 	PromoCredits string   // 折扣后倍率原文（如 "0x" / "0.50x"），仅展示
 	PromoLabel   string   // 徽章文案（限时免费 / 夜间折扣 / 错峰使用）
 	PromoNote    string   // hover 说明原文（含时段/日期描述）
+
+	// 官方档位徽章（/v3/config data.modelTiers，issue #274）：只挂目录内模型，
+	// 仅用于展示；不参与选号、不按 tier/requiredUserType 过滤模型。
+	Tier *ModelTier
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -2778,6 +2782,69 @@ func (c *Client) v3ModelsForUA(a *auth.Auth, ua string) (models []ModelInfo, err
 	return out, nil
 }
 
+// v3ModelTier /v3/config data.modelTiers 单条档位定义（issue #274）。
+//
+// Enabled 用指针区分「字段缺失」与显式 false：官方 UI 的 isTierEnabled 只把
+// enabled === false 视为禁用，缺失等同启用。ModelIDs 只在挂载阶段使用，
+// 不进入对外结构。
+type v3ModelTier struct {
+	Enabled          *bool           `json:"enabled"`
+	ID               string          `json:"id"`
+	ModelIDs         []string        `json:"modelIds"`
+	Tier             string          `json:"tier"`
+	Priority         int             `json:"priority"`
+	RequiredUserType string          `json:"requiredUserType"`
+	Badge            *ModelTierBadge `json:"badge"`
+	Hover            *ModelTierHover `json:"hover"`
+}
+
+// tierEnabled 报告档位是否启用：只有显式 false 才禁用。
+func (t *v3ModelTier) tierEnabled() bool { return t != nil && (t.Enabled == nil || *t.Enabled) }
+
+// applyModelTiers 把档位挂到目录内已有模型：同模型多条命中取 priority 最高；
+// 目录外模型不凭空造条目；不按 requiredUserType 过滤。
+//
+//nolint:gocognit // 多来源档位合并，分支集中。
+func applyModelTiers(out map[string]ModelInfo, tiers []v3ModelTier) {
+	if len(tiers) == 0 || len(out) == 0 {
+		return
+	}
+
+	best := make(map[string]*v3ModelTier)
+	bestPrio := make(map[string]int)
+
+	for i := range tiers {
+		tier := &tiers[i]
+		if !tier.tierEnabled() {
+			continue
+		}
+
+		for _, id := range tier.ModelIDs {
+			if _, ok := out[id]; !ok {
+				continue
+			}
+
+			if prio, seen := bestPrio[id]; !seen || tier.Priority > prio {
+				best[id] = tier
+				bestPrio[id] = tier.Priority
+			}
+		}
+	}
+
+	for id, tier := range best {
+		info := out[id]
+		info.Tier = &ModelTier{
+			Enabled:          true,
+			Tier:             tier.Tier,
+			Priority:         tier.Priority,
+			RequiredUserType: tier.RequiredUserType,
+			Badge:            tier.Badge,
+			Hover:            tier.Hover,
+		}
+		out[id] = info
+	}
+}
+
 // v3ModelPromotion /v3/config data.modelPromotions 单条优惠定义（2026-09-23 实测
 // 7 条：deepseek 系错峰五折、glm-5.2 夜间五折、hy3 与 hy4-preview-f 限时免费）。
 // discount 只在部分条目上存在：有 factor 的可算生效价；「错峰使用」类只有时段
@@ -3212,6 +3279,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	// 倍率，如 hy4-preview-f 的 x0.29），而 WorkBuddy 客户端显示的是生效价（试用/
 	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
 	applyModelPromotions(out, env.Data.ModelPromotions)
+	applyModelTiers(out, env.Data.ModelTiers)
 
 	if len(out) == 0 {
 		return nil, errV3ConfigReturnedEmptyModels
@@ -3264,6 +3332,7 @@ type v3ConfigEnv struct {
 		// targetModelId=hy4-preview、trialDays=14），纯 data.models 解析会漏掉它。
 		ProductFeaturesConfig v3ProductFeaturesConfig `json:"productFeaturesConfig"`
 		ModelPromotions       []v3ModelPromotion      `json:"modelPromotions"`
+		ModelTiers            []v3ModelTier           `json:"modelTiers"`
 	} `json:"data"`
 }
 

@@ -359,8 +359,6 @@ type loginAccount struct {
 }
 
 // loginPoll 轮询登录态。未完成 → {done:false}；完成 → 建凭证、落盘、热加载、签到。
-//
-//nolint:funlen // 轮询/落盘/热加载/签到线性展开。
 func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	state := r.URL.Query().Get("state")
 	if state == "" {
@@ -391,14 +389,6 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	if status != 0 {
 		writeErr(w, status, msg)
 		return
-	}
-
-	// 企业切换会话（token_source=enterprise_switch）：账号能用（选号/额度正常），
-	// 但行为类成长任务会白耗真实对话配额且拿不到奖励——热加载时留一条 WARN，
-	// 让运维在「新账号已热加载」这行旁边就看到处置建议。
-	if account.IsEnterpriseSession() && !account.IsEnterprise() {
-		log.Printf("WARN: [panel] 新账号是企业切换会话 uid=%s：连登/旅行/夜猫子/活跃上报已门控跳过，"+
-			"如需个人成长任务请移除账号后以个人身份重新登录", acct.UID)
 	}
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。

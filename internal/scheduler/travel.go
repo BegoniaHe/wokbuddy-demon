@@ -115,8 +115,8 @@ func (s *Scheduler) travelAccountGate(uid string) (*auth.Auth, string) {
 		return nil, "国际版（global）账号无 CN 旅行体系"
 	}
 
-	if account.IsEnterpriseSession() {
-		return nil, "企业版/企业切换会话无个人旅行体系"
+	if account.IsEnterprise() {
+		return nil, "企业版无个人旅行体系"
 	}
 
 	return account, ""
@@ -142,8 +142,8 @@ func (s *Scheduler) travelAll(ctx context.Context) (total, success, failure int)
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 
-		if account.IsEnterpriseSession() {
-			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
+		if account.IsEnterprise() {
+			continue // 企业版门控：无个人成长体系（/activity/growth/* 上游一律 403），不发起任何上游调用
 		}
 
 		targets = append(targets, batchTarget{uid: account.UID, run: func() bool { return s.travelOne(account) }})

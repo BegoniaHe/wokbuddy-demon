@@ -968,6 +968,8 @@ func liveSnapshot(cfg *Config) livecfg.Snapshot {
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		MultimodalRouting:    cfg.Features.MultimodalRouting,
 		SearchEndpoint:       cfg.Features.SearchEndpoint,
+		SearchDeep:           cfg.Features.SearchDeep,
+		WebFetchEndpoint:     cfg.Features.WebFetchEndpoint,
 		ImagesEndpoint:       cfg.Features.ImagesEndpoint,
 		LocalWebTools:        cfg.Features.LocalWebTools,
 		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,

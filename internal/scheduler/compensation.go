@@ -57,8 +57,6 @@ func compensationGate(acct *auth.Auth, disabled bool) (string, bool) {
 	case acct.IsGlobal():
 		return "国际版（global）账号无 CN 补偿活动", true
 	case acct.IsEnterprise():
-		// 注：企业切换会话（token_source=enterprise_switch）的门控随成长任务一并收敛，
-		// 见任务门控改造；本处只按企业身份判定，避免引入未合入的门控口径。
 		return "企业版账号无个人补偿体系", true
 	default:
 		return "", false

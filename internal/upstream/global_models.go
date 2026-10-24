@@ -1020,3 +1020,14 @@ func (c *Client) CachedGlobalModelInfos() []ModelInfo {
 
 	return infos
 }
+
+// CachedGlobalModelInfosAnyAge 返回最近一次 global 模型目录快照，忽略 TTL
+// （**只读缓存，不触发上游探测**；探测失败会清空快照）。供 /v2/chat/busy 这类
+// 只读预检判断「模型是否存在」：缓存过期不代表模型消失，按 TTL 判 nil 会让
+// 长时间运行的客户端把已知模型报成 unknown。
+func (c *Client) CachedGlobalModelInfosAnyAge() []ModelInfo {
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+
+	return c.globalModels.infos
+}

@@ -70,6 +70,9 @@ const (
 	anthropicMaxToolUseNameLen = 200
 )
 
+// stopReasonKey Anthropic 响应里表示停止原因的字段名。
+const stopReasonKey = "stop_reason"
+
 // anthropicMessagesHandler 是 /v1/messages 的入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 	input, out, ok := h.newAnthropicChatInput(w, r, h.cfg.KeepaliveInterval, h.cfg.MaxBodyBytes)
@@ -1858,7 +1861,7 @@ func anthropicMessageFromOpenAIWithOptions(
 		"role":             "assistant",
 		"model":            model,
 		"content":          content,
-		"stop_reason":      stopReason,
+		stopReasonKey:      stopReason,
 		stopReasonSequence: stopSequence,
 		"usage":            usage,
 	}
@@ -2375,7 +2378,7 @@ func (a *anthropicStreamWriter) ensureStart(chunk map[string]any) error {
 			"role":             "assistant",
 			"model":            a.model,
 			"content":          []any{},
-			"stop_reason":      nil,
+			stopReasonKey:      nil,
 			stopReasonSequence: nil,
 			"usage": map[string]any{
 				keyInputTokens:                a.netInputTokens(),
@@ -2873,7 +2876,7 @@ func (a *anthropicStreamWriter) finish() error {
 
 	if err := a.event("message_delta", map[string]any{
 		"type":  "message_delta",
-		"delta": map[string]any{"stop_reason": reason, stopReasonSequence: stopSequence},
+		"delta": map[string]any{stopReasonKey: reason, stopReasonSequence: stopSequence},
 		"usage": a.usagePayload(),
 	}); err != nil {
 		return err

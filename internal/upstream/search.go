@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -49,6 +50,12 @@ const (
 
 	// SearchMinQueryLen 官方 zod schema 的 query.min(2)。
 	SearchMinQueryLen = 2
+
+	// SearchMaxDomains 单个请求允许的域名条目上限（防御性：只影响 query 体积）。
+	SearchMaxDomains = 20
+
+	// SearchMaxDomainLen 单个域名 host 长度上限（DNS 规范 253）。
+	SearchMaxDomainLen = 253
 )
 
 // SearchResult 单条搜索结果。
@@ -105,15 +112,109 @@ func ClampSearchMaxResults(n int) int {
 	return n
 }
 
+// SearchOptions 一次搜索的可选参数（字段名对齐官方 WebSearchTool 工具声明）。
+type SearchOptions struct {
+	MaxResults     int
+	AllowedDomains []string
+	BlockedDomains []string
+	Freshness      string
+}
+
 // searchRequestBody 出站搜索请求体。
 //
 // 用 struct 而不是 map：Go 的 map 序列化会按键名排序，而官方 buildRequestBody 的
-// 字段顺序是 query → type → max_results。JSON 语义上顺序无关，但保持与真实客户端
-// 同形便于抓包比对与可能的 body 指纹风控。
+// 字段顺序是 query → type → max_results → allowed_domains → freshness。JSON 语义上
+// 顺序无关，但保持与真实客户端同形便于抓包比对与可能的 body 指纹风控。
 type searchRequestBody struct {
-	Query      string `json:"query"`
-	Type       string `json:"type"`
-	MaxResults int    `json:"max_results"`
+	Query          string   `json:"query"`
+	Type           string   `json:"type"`
+	MaxResults     int      `json:"max_results"`
+	AllowedDomains []string `json:"allowed_domains,omitempty"`
+	Freshness      string   `json:"freshness,omitempty"`
+}
+
+// searchFreshnessRE 官方工具 schema 的 freshness 正则（d1-d30 / m1-m12 / y1-y5）。
+var searchFreshnessRE = regexp.MustCompile(`^(?:d(?:[1-9]|[12]\d|30)?|m(?:[1-9]|1[012])?|y[1-5]?)$`)
+
+// searchDomainRE 域名 host 白名单：字母/数字/点/连字符/下划线，首尾非分隔符。
+var searchDomainRE = regexp.MustCompile(`^[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?$`)
+
+// ValidSearchFreshness 报告 freshness 是否合法（空串 = 未指定，合法）。
+func ValidSearchFreshness(freshness string) bool {
+	freshness = strings.TrimSpace(freshness)
+	return freshness == "" || searchFreshnessRE.MatchString(freshness)
+}
+
+// ValidSearchDomain 报告域名是否只包含 host（拒绝协议/路径/端口/userinfo/空白/超长）。
+func ValidSearchDomain(domain string) bool {
+	domain = strings.TrimSpace(domain)
+	if domain == "" || len(domain) > SearchMaxDomainLen {
+		return false
+	}
+
+	if strings.ContainsAny(domain, "/\\?#@%") || strings.Contains(domain, "://") {
+		return false
+	}
+
+	return searchDomainRE.MatchString(domain)
+}
+
+// normalizeSearchOptions 去空白并生成官方请求体字段；blocked_domains 拼进 query
+// （官方形态：" (" + "-site:a -site:b" + ")"）。
+func normalizeSearchOptions(query string, opts SearchOptions) searchRequestBody {
+	allowed := cleanSearchDomains(opts.AllowedDomains)
+	blocked := cleanSearchDomains(opts.BlockedDomains)
+
+	if len(blocked) > 0 {
+		var suffix strings.Builder
+		suffix.WriteString(" (")
+
+		for i, domain := range blocked {
+			if i > 0 {
+				suffix.WriteString(" ")
+			}
+
+			suffix.WriteString("-site:")
+			suffix.WriteString(domain)
+		}
+
+		suffix.WriteString(")")
+		query += suffix.String()
+	}
+
+	return searchRequestBody{
+		Query:          query,
+		Type:           "text2text",
+		MaxResults:     ClampSearchMaxResults(opts.MaxResults),
+		AllowedDomains: allowed,
+		Freshness:      strings.TrimSpace(opts.Freshness),
+	}
+}
+
+// cleanSearchDomains 去空白、去重并保持输入顺序；空项丢弃。
+func cleanSearchDomains(domains []string) []string {
+	if len(domains) == 0 {
+		return nil
+	}
+
+	out := make([]string, 0, len(domains))
+	seen := make(map[string]bool, len(domains))
+
+	for _, domain := range domains {
+		domain = strings.TrimSpace(domain)
+		if domain == "" || seen[domain] {
+			continue
+		}
+
+		seen[domain] = true
+		out = append(out, domain)
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
 }
 
 // Search 对指定账号执行一次联网搜索。
@@ -126,7 +227,7 @@ type searchRequestBody struct {
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一口径（公开 API 简单）。
 func (c *Client) Search(
-	ctx context.Context, account *auth.Auth, query string, maxResults int, meta ChatMeta,
+	ctx context.Context, account *auth.Auth, query string, opts SearchOptions, meta ChatMeta,
 ) (*SearchOutcome, error) {
 	query = strings.TrimSpace(query)
 	if utf8.RuneCountInString(query) < SearchMinQueryLen {
@@ -135,11 +236,11 @@ func (c *Client) Search(
 		}
 	}
 
-	body, err := json.Marshal(searchRequestBody{
-		Query:      query,
-		Type:       "text2text", // 官方硬编码；服务端只接受该小写值
-		MaxResults: ClampSearchMaxResults(maxResults),
-	})
+	if !ValidSearchFreshness(opts.Freshness) {
+		return nil, &Error{Kind: ErrClient, Msg: "invalid search freshness"}
+	}
+
+	body, err := json.Marshal(normalizeSearchOptions(query, opts))
 	if err != nil {
 		return nil, fmt.Errorf("search marshal: %w", err)
 	}
@@ -147,19 +248,31 @@ func (c *Client) Search(
 	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
-	// chat base 允许 host / host/v2 / host/v2/chat/completions 三种配置形态（见
-	// normalizeChatBase）：搜索与 chat 同源，必须先归一再拼搜索路径，否则
-	// cn.chat_base 配成 /v2 形态时会拼出 /v2/agenttool/v1/search。
-	req, err := http.NewRequestWithContext(
-		ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+searchPath, bytes.NewReader(body),
-	)
+	req, err := c.newAgentToolRequest(ctx, account, searchPath, body, "application/json", meta)
 	if err != nil {
 		return nil, fmt.Errorf("search request: %w", err)
 	}
 
-	c.SearchHeaders(req, account, "", meta)
-
 	return c.doSearch(req)
+}
+
+// newAgentToolRequest 构造 agenttool 系请求（search / webfetch / agentic_search）：
+// base 先归一，再复用 SearchHeaders 的同源头族，按端点覆盖 Accept。
+func (c *Client) newAgentToolRequest(
+	//nolint:gocritic // ChatMeta 值传递与 SearchHeaders 保持同一口径。
+	ctx context.Context, account *auth.Auth, path string, body []byte, accept string, meta ChatMeta,
+) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+path, bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("new agenttool request: %w", err)
+	}
+
+	c.SearchHeaders(req, account, "", meta)
+	req.Header.Set("Accept", accept)
+
+	return req, nil
 }
 
 // doSearch 发搜索请求并解析扁平响应。

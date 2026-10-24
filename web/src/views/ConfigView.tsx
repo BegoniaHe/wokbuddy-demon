@@ -651,9 +651,12 @@ export function ConfigView() {
             </Field>
           </div>
           {check('search_endpoint', '开放 POST /v1/search/messages（官方联网搜索；每次调用消耗一次账号额度）')}
+          {check('search_deep', '允许 /v1/search/messages 的 deep:true 综述式检索（单次最长 120s，消耗搜索额度）')}
+          {check('web_fetch_endpoint', '开放 POST /v1/tools/fetch（官方服务端抓取；每次调用消耗一次账号额度）')}
+          {check('images_endpoint', '开放 POST /v1/images/generations（官方出图；尚未在真实账号验证计费）')}
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
-            本卡片字段均在启动期装配，保存后需重启进程；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。
+            提示词模式/文件与会话粘性开关需重启进程生效，其余开关保存后即时生效；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。
           </p>
         </CardContent>
       </Card>

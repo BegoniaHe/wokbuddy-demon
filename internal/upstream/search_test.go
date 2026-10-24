@@ -32,7 +32,7 @@ func TestSearchRequestShape(t *testing.T) {
 			`{"title":"Go","url":"https://go.dev","snippet":"lang"}],"total_results":1}`), nil
 	})
 
-	out, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{})
+	out, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{}, ChatMeta{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestSearchUsesNormalizedChatBase(t *testing.T) {
 		})
 		client.ChatBaseCN = base
 
-		if _, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{}); err != nil {
+		if _, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{}, ChatMeta{}); err != nil {
 			t.Fatalf("base=%q search: %v", base, err)
 		}
 
@@ -118,7 +118,7 @@ func TestSearchShortQueryRejected(t *testing.T) {
 		return jsonResp(200, `{}`), nil
 	})
 
-	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, " a ", 0, ChatMeta{})
+	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, " a ", SearchOptions{}, ChatMeta{})
 	if err == nil {
 		t.Fatal("want error for short query")
 	}
@@ -141,7 +141,7 @@ func TestSearchBusinessCodeError(t *testing.T) {
 		return jsonResp(200, `{"code":15003,"msg":"unsupported search type"}`), nil
 	})
 
-	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{})
+	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{}, ChatMeta{})
 	if err == nil {
 		t.Fatal("want error")
 	}
@@ -162,7 +162,7 @@ func TestSearchBusinessCodeClassifiedFromBody(t *testing.T) {
 		return jsonResp(200, `{"code":15001,"msg":"search quota exhausted"}`), nil
 	})
 
-	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{})
+	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{}, ChatMeta{})
 
 	var upErr *Error
 	if !asError(err, &upErr) || upErr.Kind != ErrSoftRate {
@@ -178,7 +178,7 @@ func TestSearchHTTPErrorClassified(t *testing.T) {
 		return jsonResp(http.StatusTooManyRequests, `{"code":429,"msg":"rate limited"}`), nil
 	})
 
-	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{})
+	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{}, ChatMeta{})
 
 	var upErr *Error
 	if !asError(err, &upErr) || upErr.Kind != ErrSoftRate {
@@ -194,7 +194,7 @@ func TestSearchParsesFlatResponse(t *testing.T) {
 		return jsonResp(200, `{"query":"q","results":[{"title":"t","url":"u"},{"title":"t2","url":"u2"}]}`), nil
 	})
 
-	out, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", 0, ChatMeta{})
+	out, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{}, ChatMeta{})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -206,5 +206,74 @@ func TestSearchParsesFlatResponse(t *testing.T) {
 	raw, _ := json.Marshal(out)
 	if !strings.Contains(string(raw), `"results":[`) {
 		t.Errorf("results 必须序列化为数组: %s", raw)
+	}
+}
+
+// TestSearchRequestOptions 官方可选参数透传：blocked 拼 -site:、allowed/freshness
+// 独立字段；空数组不出现字段（issue #278）。
+func TestSearchRequestOptions(t *testing.T) {
+	t.Parallel()
+
+	var gotBody string
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+
+		return jsonResp(200, `{"query":"q","results":[]}`), nil
+	})
+
+	_, err := client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{
+		MaxResults:     99,
+		AllowedDomains: []string{"go.dev"},
+		BlockedDomains: []string{"spam.example"},
+		Freshness:      "d7",
+	}, ChatMeta{})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+
+	want := `{"query":"golang (-site:spam.example)","type":"text2text","max_results":10,"allowed_domains":["go.dev"],"freshness":"d7"}`
+	if gotBody != want {
+		t.Fatalf("body=%s want %s", gotBody, want)
+	}
+
+	// 空参数与现状一致：不出现 allowed_domains/freshness。
+	_, err = client.Search(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, "golang", SearchOptions{}, ChatMeta{})
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+
+	if gotBody != `{"query":"golang","type":"text2text","max_results":5}` {
+		t.Fatalf("empty options body=%s", gotBody)
+	}
+}
+
+// TestSearchOptionsValidation 域名/freshness 合法性与上限。
+func TestSearchOptionsValidation(t *testing.T) {
+	t.Parallel()
+
+	for _, domain := range []string{"example.com", "a-b.example.com", "sub_domain.example"} {
+		if !ValidSearchDomain(domain) {
+			t.Errorf("ValidSearchDomain(%q)=false", domain)
+		}
+	}
+
+	for _, domain := range []string{"", "https://example.com", "example.com/x", "a b.com", "u@example.com", ".example.com", "example.com."} {
+		if ValidSearchDomain(domain) {
+			t.Errorf("ValidSearchDomain(%q)=true", domain)
+		}
+	}
+
+	for _, freshness := range []string{"", "d", "d1", "d30", "m", "m12", "y", "y5"} {
+		if !ValidSearchFreshness(freshness) {
+			t.Errorf("ValidSearchFreshness(%q)=false", freshness)
+		}
+	}
+
+	for _, freshness := range []string{"d31", "m13", "y6", "0d", "d1x"} {
+		if ValidSearchFreshness(freshness) {
+			t.Errorf("ValidSearchFreshness(%q)=true", freshness)
+		}
 	}
 }

@@ -4,6 +4,7 @@ import { api } from '@/lib/api';
 import {
   mdAvailability,
   mdMatch,
+  mdTierBadge,
   mdSortList,
   DEFAULT_MODEL_FILTER,
   type ModelEntry,
@@ -441,7 +442,15 @@ function ModelRow({
       {m.supports_reasoning ? '固定档 · 默认 ' + (m.default_effort || '?') : '不支持思考'}
     </span>
   );
+  const tier = mdTierBadge(m);
   const caps: React.ReactNode[] = [];
+  if (tier) {
+    caps.push(
+      <Tag key="tier" tone={m.tier?.requiredUserType ? 'warn' : 'accent'} title={tier.tip}>
+        {tier.label}
+      </Tag>,
+    );
+  }
   if (m.is_default) caps.push(<Tag key="d" tone="ok">默认</Tag>);
   if (m.supports_tool_call) caps.push(<Tag key="t" tone="warn">工具</Tag>);
   if (m.supports_images) caps.push(<Tag key="v" tone="warn">视觉</Tag>);

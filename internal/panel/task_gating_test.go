@@ -120,7 +120,7 @@ func assertSkipped(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int,
 func TestPanelTaskEndpointsDenyGlobalAndEnterprise(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range []string{"global", "enterprise", "enterprise_switch"} {
+	for _, kind := range []string{"global", "enterprise"} {
 		t.Run(kind, func(t *testing.T) {
 			t.Parallel()
 			panel, calls := newGatingPanel(t)
@@ -169,6 +169,18 @@ func TestPanelTaskEndpointsDenyGlobalAndEnterprise(t *testing.T) {
 // （缺 task_code 照常 400），且任务查询照常调用上游（issue #108）。
 func TestPanelTaskEndpointsAllowCN(t *testing.T) {
 	t.Parallel()
+	assertTaskEndpointsAllowed(t, "cn-u")
+}
+
+// TestPanelTaskEndpointsAllowEnterpriseSwitch token_source=enterprise_switch 且
+// enterpriseId 为空的个人号按普通个人号放行（issue #275）。
+func TestPanelTaskEndpointsAllowEnterpriseSwitch(t *testing.T) {
+	t.Parallel()
+	assertTaskEndpointsAllowed(t, "enterprise_switch-u")
+}
+
+func assertTaskEndpointsAllowed(t *testing.T, uid string) {
+	t.Helper()
 
 	panel, calls := newGatingPanel(t)
 	for _, act := range []struct {
@@ -182,7 +194,7 @@ func TestPanelTaskEndpointsAllowCN(t *testing.T) {
 		t.Run(act.name, func(t *testing.T) {
 			t.Parallel()
 
-			rec := invoke(act.h, "cn-u", "")
+			rec := invoke(act.h, uid, "")
 			if rec.Code != http.StatusBadRequest {
 				t.Fatalf("code=%d want 400（请求体校验，说明已通过门控）body=%s", rec.Code, rec.Body)
 			}
@@ -191,12 +203,12 @@ func TestPanelTaskEndpointsAllowCN(t *testing.T) {
 
 	before := atomic.LoadInt64(calls)
 
-	if rec := invoke(panel.accountTasks, "cn-u", ""); rec.Code != http.StatusOK {
+	if rec := invoke(panel.accountTasks, uid, ""); rec.Code != http.StatusOK {
 		t.Fatalf("tasks code=%d body=%s", rec.Code, rec.Body)
 	}
 
 	if atomic.LoadInt64(calls) == before {
-		t.Errorf("CN 任务查询应调用上游列表")
+		t.Errorf("个人号任务查询应调用上游列表")
 	}
 }
 

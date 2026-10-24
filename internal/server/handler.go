@@ -325,6 +325,11 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
 	// 图像生成（issue #253）：默认关闭，开启后独立透传 /v2/images/generations。
 	h.mux.HandleFunc("POST /v1/images/generations", h.withRecovery(h.withClientAuth(h.imagesGenerationsHandler)))
+	// 官方客户端模型忙预检（issue #273）：只读本地池状态，不产生上游请求。
+	h.mux.HandleFunc("POST /v2/chat/busy", h.withRecovery(h.withClientAuth(h.busyHandler)))
+	// 官方 webfetch 的 DSH 形态出口（issue #276）：默认关闭，/v1/fetch 为同义别名。
+	h.mux.HandleFunc("POST /v1/tools/fetch", h.withRecovery(h.withClientAuth(h.webFetchEndpointHandler)))
+	h.mux.HandleFunc("POST /v1/fetch", h.withRecovery(h.withClientAuth(h.webFetchEndpointHandler)))
 	h.mux.HandleFunc("POST /v1/messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
 	// 部分 Anthropic 客户端把 base URL 配成 .../v1，再拼 /messages；保留同义别名。
 	h.mux.HandleFunc("POST /messages", h.withRecovery(h.withClientAuth(h.anthropicMessagesHandler)))
@@ -862,6 +867,11 @@ func applyModelInfoFields(entry map[string]any, modelInfo *upstream.ModelInfo) m
 		entry["is_default"] = true
 	}
 
+	// 官方档位徽章（issue #274）：只透出展示字段，不参与选号/过滤。
+	if modelInfo.Tier != nil {
+		entry["tier"] = modelInfo.Tier
+	}
+
 	applyModelInfoCapabilities(entry, modelInfo)
 
 	return entry
@@ -1187,6 +1197,16 @@ func (h *Handler) cachedModelsSnapshot() []upstream.ModelInfo {
 	if len(h.modelsCache.ids) == 0 || time.Since(h.modelsCache.fetched) >= dynamicModelsTTL {
 		return nil
 	}
+
+	return h.modelsCache.ids
+}
+
+// cachedModelInfosAnyAge 返回最近一次 CN 模型目录快照，忽略 TTL（只读，不触发
+// 上游拉取）。供只读预检（/v2/chat/busy）判断「模型是否存在」：目录过期不代表
+// 模型消失，按 TTL 判 nil 会让长时间运行的客户端把已知模型全部报成 unknown。
+func (h *Handler) cachedModelInfosAnyAge() []upstream.ModelInfo {
+	h.modelsCache.RLock()
+	defer h.modelsCache.RUnlock()
 
 	return h.modelsCache.ids
 }
@@ -2489,7 +2509,8 @@ func (f *chatFlow) retryModelNotFoundCrossRealm(
 func (*Handler) tracedPath(r *http.Request) bool {
 	switch r.URL.Path {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
-		"/v1/responses", "/v1/search/messages", "/v1/images/generations":
+		"/v1/responses", "/v1/search/messages", "/v1/images/generations",
+		"/v1/tools/fetch", "/v1/fetch":
 		return true
 	}
 

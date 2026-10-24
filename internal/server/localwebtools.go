@@ -580,6 +580,10 @@ func validateWebURL(ctx context.Context, raw string) error {
 		return fmt.Errorf("只允许 http/https，当前 %q: %w", url2.Scheme, errValidateWebURLFailed)
 	}
 
+	if url2.User != nil {
+		return fmt.Errorf("URL 不允许包含用户信息: %w", errValidateWebURLFailed)
+	}
+
 	if url2.Hostname() == "" {
 		return errURL
 	}

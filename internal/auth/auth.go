@@ -295,29 +295,13 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == realmGlobal }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
-// enterpriseSwitchTokenSource 企业切换会话的 JWT token_source 取值：企业账号切到
-// 个人身份后拿到的会话，跑行为类成长任务会白耗真实对话配额且拿不到奖励。
-const enterpriseSwitchTokenSource = "enterprise_switch"
-
-// IsEnterpriseSession 报告账号是否运行在「企业切换会话」下：既有企业身份
-// （IsEnterprise），或 JWT 里 token_source=enterprise_switch。
-//
-// 与 IsEnterprise 的用途区分：IsEnterprise 是**计费/额度**口径（企业额度走
-// get-enterprise-user-usage、无个人签到体系）；本方法只服务**行为类任务门控**
-// （连登 / 旅行 / 夜猫子 / 活跃上报）。两者刻意隔离：JWT 解码结果不缓存，
-// 计费口径不因 token_source 变化而漂移。
-func (a *Auth) IsEnterpriseSession() bool {
-	if a.IsEnterprise() {
-		return true
-	}
-
-	return a.jwtTokenSource() == enterpriseSwitchTokenSource
-}
-
 // jwtTokenSource 从 access token 的 JWT payload 读 token_source。
 //
-// 只解 payload（base64url 第二段），不校验签名——本项只用于任务门控，安全默认是
-// 「读不到即非企业切换会话」（宁可多发一次请求，也不误跳过真实任务）。
+// token_source 只是**认证方法**（如 enterprise_switch 表示这次会话通过企业切换
+// 获得），不代表账号身份；企业身份只由 EnterpriseID 决定。出站身份头仍需要该值
+// （见 TokenSource），但任务门控不得用它跳过个人号任务。
+//
+// 只解 payload（base64url 第二段），不校验签名——读不到返回空串。
 // 解码容错与 realmFromIssuer 同口径（RawURLEncoding 失败再试带 padding 形态）。
 func (a *Auth) jwtTokenSource() string {
 	payload, ok := jwtPayload(a.AccessTokenValue())

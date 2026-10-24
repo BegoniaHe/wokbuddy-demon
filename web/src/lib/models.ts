@@ -2,6 +2,34 @@
 
 import { fmtLocalDateTime, parseAPITime } from './format';
 
+export interface ModelTierBadge {
+  label?: string;
+  shortLabel?: string;
+  labelEn?: string;
+  shortLabelEn?: string;
+  color?: string;
+}
+
+export interface ModelTierHoverAction {
+  labelZh?: string;
+  labelEn?: string;
+}
+
+export interface ModelTierHover {
+  textZh?: string;
+  textEn?: string;
+  action?: ModelTierHoverAction;
+}
+
+export interface ModelTier {
+  enabled?: boolean;
+  tier?: string;
+  priority?: number;
+  requiredUserType?: string;
+  badge?: ModelTierBadge;
+  hover?: ModelTierHover;
+}
+
 export interface ModelEntry {
   id: string;
   name?: string;
@@ -23,6 +51,7 @@ export interface ModelEntry {
   max_output_tokens?: number;
   context_length?: number;
   busy?: string;
+  tier?: ModelTier;
 }
 
 export interface ModelFilter {
@@ -42,6 +71,18 @@ export const DEFAULT_MODEL_FILTER: ModelFilter = {
   promo: '',
   sort: 'default',
 };
+
+// mdTierBadge 官方档位徽章文案与悬停说明：enabled=false 或无 badge 时不显示。
+export function mdTierBadge(m: ModelEntry): { label: string; tip?: string } | null {
+  const t = m.tier;
+  if (!t || t.enabled === false) return null;
+  const label = t.badge?.shortLabel || t.badge?.label || t.tier;
+  if (!label) return null;
+  const tip = [t.hover?.textZh || t.hover?.textEn, t.requiredUserType ? '需要 ' + t.requiredUserType + ' 账号' : '']
+    .filter(Boolean)
+    .join(' · ');
+  return { label, tip: tip || undefined };
+}
 
 // mdRateValue 当前生效倍率：优先促销价（限时免费 = 0），无倍率记 Infinity（排最后）。
 export function mdRateValue(m: ModelEntry): number {

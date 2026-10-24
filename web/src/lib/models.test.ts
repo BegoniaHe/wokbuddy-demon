@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_MODEL_FILTER, mdAvailability, mdMatch, mdSortList, type ModelEntry } from './models';
+import { DEFAULT_MODEL_FILTER, mdAvailability, mdMatch, mdSortList, mdTierBadge, type ModelEntry } from './models';
 import { fmtLocalDateTime } from './format';
 
 const base: ModelEntry = { id: 'cn:glm-5.2', name: 'GLM 5.2', vendor: 'zhipu' };
@@ -159,5 +159,27 @@ describe('mdAvailability（global 模型可用性）', () => {
     expect(
       mdAvailability('global:kimi-k3', [{ model: 'other', realm: 'global', state: 'locked' }], [])?.key,
     ).toBe('unknown');
+  });
+});
+
+describe('mdTierBadge', () => {
+  it('显示官方档位徽章与悬停说明', () => {
+    const badge = mdTierBadge({
+      id: 'cn:glm',
+      tier: {
+        enabled: true,
+        tier: 'advanced',
+        requiredUserType: 'advanced',
+        badge: { label: '进阶', shortLabel: '进' },
+        hover: { textZh: '升级后可用' },
+      },
+    });
+    expect(badge).toEqual({ label: '进', tip: '升级后可用 · 需要 advanced 账号' });
+  });
+
+  it('disabled 或缺 badge/tier 时不显示', () => {
+    expect(mdTierBadge({ id: 'cn:x', tier: { enabled: false, badge: { label: '停用' } } })).toBeNull();
+    expect(mdTierBadge({ id: 'cn:x', tier: { enabled: true } })).toBeNull();
+    expect(mdTierBadge({ id: 'cn:x' })).toBeNull();
   });
 });

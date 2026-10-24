@@ -37,7 +37,7 @@ import {
 import { Tag } from '@/components/ui-kit';
 import { cn } from '@/lib/utils';
 import { ago, fmtMs, fmtTok } from '@/lib/format';
-import { mdSearchText, type ModelEntry } from '@/lib/models';
+import { mdSearchText, mdTierBadge, type ModelEntry } from '@/lib/models';
 import {
   CHAT_MAX_SESSIONS,
   CHAT_RAW_MAX_FRAMES,
@@ -738,6 +738,7 @@ function ModelPicker({
         <div className="-mx-1 max-h-[52vh] overflow-y-auto">
           {list.map((m) => {
             const parts = chatModelParts(m.id);
+            const tier = mdTierBadge(m);
             return (
               <button
                 key={m.id}
@@ -750,6 +751,11 @@ function ModelPicker({
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="truncate font-mono text-xs">{parts.name}</span>
+                    {tier ? (
+                      <Tag tone={m.tier?.requiredUserType ? 'warn' : 'accent'} title={tier.tip}>
+                        {tier.label}
+                      </Tag>
+                    ) : null}
                     {m.is_default ? <Tag tone="accent">默认</Tag> : null}
                     {m.busy ? <Tag tone="warn">{m.busy}</Tag> : null}
                     {m.supports_reasoning ? <Tag tone="mute">思考</Tag> : null}

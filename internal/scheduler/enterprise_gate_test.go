@@ -199,17 +199,8 @@ func TestEnterpriseGateKeepsKeepaliveAndBalance(t *testing.T) {
 	}
 }
 
-// switchSessionJWT 造一个含 token_source=enterprise_switch 的假 JWT（只解 payload、不验签）。
-func switchSessionJWT(t *testing.T) string {
-	t.Helper()
-
-	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","token_source":"enterprise_switch"}`))
-
-	return "eyJhbGciOiJIUzI1NiJ9." + payload + ".sig"
-}
-
-// switchSessionTestScheduler 构造「企业切换会话」账号（有 access token、无 enterpriseId）
-// 的调度器：这类会话能用（选号/额度正常），但没有个人成长体系。
+// switchSessionTestScheduler 构造「token_source=enterprise_switch、enterpriseId 为空」
+// 的个人号调度器：该字段只是认证方法，任务门控应按个人号放行。
 func switchSessionTestScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
 	t.Helper()
 	fastTravel(t)
@@ -220,7 +211,9 @@ func switchSessionTestScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
 	srv := r.server()
 	t.Cleanup(srv.Close)
 
-	account := &auth.Auth{UID: "u1", AccessToken: switchSessionJWT(t), RefreshToken: "rt", ExpiresAt: 9999999999}
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"u1","token_source":"enterprise_switch"}`))
+	accessToken := "eyJhbGciOiJIUzI1NiJ9." + payload + ".sig"
+	account := &auth.Auth{UID: "u1", AccessToken: accessToken, RefreshToken: "rt", ExpiresAt: 9999999999}
 
 	state := pool.New("")
 	state.Add(account)
@@ -235,10 +228,9 @@ func switchSessionTestScheduler(t *testing.T) (*Scheduler, *recorderUpstream) {
 	return New(&Config{Pool: state, Upstream: client}), r
 }
 
-// TestEnterpriseSwitchSessionGateSkipsBehaviorTasks 企业切换会话（token_source=
-// enterprise_switch）跑行为类任务会白耗真实对话配额且拿不到奖励：四类行为任务
-// 一个上游调用都不发（与真企业号同口径），签到**不门控**（仍尝试并显式报错）。
-func TestEnterpriseSwitchSessionGateSkipsBehaviorTasks(t *testing.T) {
+// TestEnterpriseSwitchSessionIsPersonal 带 token_source=enterprise_switch 但无
+// enterpriseId 的账号按个人号执行成长任务，不再被误判为企业身份跳过（issue #275）。
+func TestEnterpriseSwitchSessionIsPersonal(t *testing.T) {
 	t.Parallel()
 
 	night := func() time.Time { return time.Date(2026, 10, 7, 23, 30, 0, 0, time.Local) }
@@ -262,21 +254,9 @@ func TestEnterpriseSwitchSessionGateSkipsBehaviorTasks(t *testing.T) {
 			scheduler.nowFn = night
 			item.run(scheduler)
 
-			if recorder.has(item.endpoint) {
-				t.Errorf("企业切换会话不应发起 %s，实际请求=%v", item.endpoint, recorder.snapshot())
+			if !recorder.has(item.endpoint) {
+				t.Errorf("个人号（enterprise_switch）应发起 %s，实际请求=%v", item.endpoint, recorder.snapshot())
 			}
 		})
 	}
-
-	// 反向断言：签到照常尝试（这类会话签到会显式报错，不需要门控）。
-	t.Run("签到仍尝试", func(t *testing.T) {
-		t.Parallel()
-
-		scheduler, recorder := switchSessionTestScheduler(t)
-		scheduler.RunCheckinNow()
-
-		if !recorder.has("/daily-checkin") {
-			t.Errorf("企业切换会话的签到不应被门控，实际请求=%v", recorder.snapshot())
-		}
-	})
 }

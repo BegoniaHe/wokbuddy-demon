@@ -82,10 +82,12 @@
   本仓库 chat 单轮请求未涉及。
 - `/v2/chat/busy`：渲染层模型繁忙度探测（`renderer/assets/contexts-*.js`），
   单次最多 50 个模型，levels 为 `idle|normal|busy|congested|unavailable|unknown`；
-  不是 CLI 排队。本仓可作为面板只读观测接入，不要参与选号。
+  不是 CLI 排队。本仓已覆盖出站解析（`internal/upstream/modelbusy.go`）与入站只读
+  预检（`internal/server/busy.go`）；不要让它参与选号。
 - `/v2/images/generations`、`/v2/images/edits`：官方 CLI 出图 / 图生图，
   CN 5.8.3 与 global 5.8.4 同源；本仓库尚未覆盖。
-- `/agenttool/v1/search`、`/agenttool/v1/webfetch`：官方联网搜索 / 抓取；
-  本仓库已覆盖 search（`internal/upstream/search.go`），webfetch 未覆盖。
+- `/agenttool/v1/search`、`/agenttool/v1/webfetch`、`/agenttool/v1/agentic_search`：
+  官方联网搜索 / 抓取 / 综述式检索；本仓库均已覆盖
+  （`internal/upstream/{search,webfetch,agentic_search}.go`）。
 - `/v2/user-asset/*`：appearance/set 已覆盖，skill/assets 族未覆盖。
 - `/v2/service-proxy`、`/v3/group/*`、`/v2/spans`：客户端内部域，非网关目标。

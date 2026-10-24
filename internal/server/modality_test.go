@@ -455,3 +455,31 @@ func TestModelsListingIncludesInputModalities(t *testing.T) {
 		t.Errorf("unknown model must not claim modalities: %v", unknown["input_modalities"])
 	}
 }
+
+// TestModelsListingIncludesTier /v1/models 透出官方档位；无 tier 的模型省略字段
+// （issue #274）。
+func TestModelsListingIncludesTier(t *testing.T) {
+	t.Parallel()
+
+	tier := &upstream.ModelTier{
+		Enabled: true, Tier: "advanced", Priority: 20, RequiredUserType: "advanced",
+		Badge: &upstream.ModelTierBadge{Label: "进阶", ShortLabel: "进"},
+		Hover: &upstream.ModelTierHover{TextZh: "升级后可用", Action: &upstream.ModelTierHoverAction{LabelZh: "升级"}},
+	}
+	cat := modelCatalog([]upstream.ModelInfo{{ID: "tiered", Tier: tier}, {ID: "plain"}})
+	h := NewHandler(&Config{modelsCache: cat, Pool: pool.New(""), Upstream: &upstream.Client{}})
+
+	byID := map[string]map[string]any{}
+	for _, entry := range h.modelList() {
+		byID[entry["id"].(string)] = entry
+	}
+
+	got, ok := byID["cn:tiered"]["tier"].(*upstream.ModelTier)
+	if !ok || got.Tier != "advanced" || got.Badge == nil || got.Badge.Label != "进阶" {
+		t.Fatalf("tier=%v", byID["cn:tiered"]["tier"])
+	}
+
+	if _, exists := byID["cn:plain"]["tier"]; exists {
+		t.Fatalf("plain model must omit tier: %v", byID["cn:plain"])
+	}
+}
