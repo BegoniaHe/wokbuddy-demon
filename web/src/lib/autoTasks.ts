@@ -17,6 +17,7 @@ export const AUTO_TASKS: Record<string, string> = {
   Hp_Appearance: '设置主题 API + 皮肤生效事件（两账号实测点亮）',
   black_cat: '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   Expert_lighthouse: '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
+  WorkBuddy_Valorant: '无畏契约拼豆专家召唤+使用链（真实对话 requestId，活动截止 2026-11-15）',
   skill_1: '真实对话 + skill_info 技能加载事件（实测点亮）',
   school_season: '校园日（小程序口径）：accept → mini 对话+activityId 上报 → 领奖（+100c+5e）',
   Sequential_Tasks_1: '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）',

@@ -138,8 +138,7 @@ var autoActions = []autoAction{
 	},
 	{
 		TaskCode: "WorkBuddy_Valorant",
-		Desc:     "接受 Valorant 活动任务并按上游进度领奖（真实动作链待活动抓包确认）",
-		Attempt:  true,
+		Desc:     "无畏契约拼豆专家召唤+使用链（判据同 Expert_lighthouse，活动截止 2026-11-15）",
 		run:      runValorant,
 	},
 	{
@@ -1101,15 +1100,35 @@ func runSkillFresh(panel7 *Panel, account16 *auth.Auth) (string, error) {
 	return "已上报真实对话 + skill_info 技能加载事件", nil
 }
 
-// runValorant 完成 WorkBuddy_Valorant（issue #257）。活动动作码/事件链尚无可核实的
-// 官方证据：这里只走规范 accept，随后由 autoRunAction 回读进度并在可领时自动领奖。
-// Attempt=true：上游未证实纯 API 可点亮，不伪造未验证的事件序列。
+// runValorant 完成 WorkBuddy_Valorant「体验『无畏契约拼豆专家』」（issue #257）。
+//
+// 动作链复用 Expert_lighthouse：召唤事件组 + 真实桌面 chat（服务端 requestId）+
+// expert_actual_use(mode=LOCAL)。专家 id 来自参考实现 530f1df
+// （ex_xQHHD1u5Jkua / valorant-perler-expert / 1.2.1）；市场列表命中时以服务端
+// 下发的 version/名称等为准。活动截止 2026-11-15，过期后上游不再计数。
 func runValorant(panel *Panel, account *auth.Auth) (string, error) {
-	if err := panel.cfg.Upstream.AcceptTasks(account, []string{"WorkBuddy_Valorant"}); err != nil {
-		return "", fmt.Errorf("accept: %w", err)
+	const valorantID = "ex_xQHHD1u5Jkua"
+
+	expert := upstream.MarketExpert{
+		ExpertID: valorantID, ExpertType: "agent",
+		DisplayNameZH: "无畏契约拼豆专家", ProfessionZH: "无畏契约拼豆专家", Version: "1.2.1",
+		Categories: nil,
 	}
 
-	return "已接受 WorkBuddy_Valorant 任务；未配置未经验证的动作事件，按上游进度领奖", nil
+	if experts, err := panel.cfg.Upstream.MarketExpertList(account, "agent"); err == nil {
+		for _, e := range experts {
+			if e.ExpertID == valorantID {
+				expert = e
+				break
+			}
+		}
+	}
+
+	if err := runExpertChain(panel, account, &expert); err != nil {
+		return "", err
+	}
+
+	return "已上报无畏契约拼豆专家召唤+使用链（真实对话 requestId）", nil
 }
 
 // runExpertLighthouse 完成 Expert_lighthouse（体验「腾讯轻量云」专家）。
@@ -1117,53 +1136,63 @@ func runValorant(panel *Panel, account *auth.Auth) (string, error) {
 // chat 链的 agent_task_created 需带 has_expert:true + expert_id（我们默认 false），
 // expert_actual_use 的 mode 为 "LOCAL"（非 craft）。id 固定为轻量云专家
 // ex_2cvvUZQhDyeJ；requestId 必须是真实 chat 的服务端 id。紫川/人杰2 实测点亮。
-func runExpertLighthouse(panel *Panel, account2 *auth.Auth) (string, error) {
-	const lhID = "ex_2cvvUZQhDyeJ"
+func runExpertLighthouse(panel *Panel, account *auth.Auth) (string, error) {
+	const lighthouseID = "ex_2cvvUZQhDyeJ"
 
-	marketExpert := upstream.MarketExpert{
-		ExpertID: lhID, ExpertType: "agent",
+	expert := upstream.MarketExpert{
+		ExpertID: lighthouseID, ExpertType: "agent",
 		DisplayNameZH: "腾讯轻量云专家", ProfessionZH: "腾讯轻量云专家", Version: "1.0.2",
 		Categories: nil,
 	}
 	// 市场列表若命中真实条目则用其信息（version 等以服务端为准）。
-	if experts, err := panel.cfg.Upstream.MarketExpertList(account2, "agent"); err == nil {
+	if experts, err := panel.cfg.Upstream.MarketExpertList(account, "agent"); err == nil {
 		for _, e := range experts {
-			if e.ExpertID == lhID {
-				marketExpert = e
+			if e.ExpertID == lighthouseID {
+				expert = e
 				break
 			}
 		}
 	}
 
-	if err := panel.cfg.Upstream.ReportDesktopEvent(account2, upstream.DesktopExpertSummonSequence(&marketExpert)...); err != nil {
-		return "", fmt.Errorf("召唤链: %w", err)
+	if err := runExpertChain(panel, account, &expert); err != nil {
+		return "", err
 	}
 
-	conv, req, err := panel.cfg.Upstream.DesktopChatWithExpert(account2, lhID)
+	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
+}
+
+// runExpertChain 平台专家的「召唤 + 真实对话 + LOCAL 使用」公共事件链。
+// 两处判据差异（has_expert / expert_actual_use type+mode）统一在这里对齐。
+func runExpertChain(panel *Panel, account *auth.Auth, expert *upstream.MarketExpert) error {
+	if err := panel.cfg.Upstream.ReportDesktopEvent(account, upstream.DesktopExpertSummonSequence(expert)...); err != nil {
+		return fmt.Errorf("召唤链: %w", err)
+	}
+
+	conv, req, err := panel.cfg.Upstream.DesktopChatWithExpert(account, expert.ExpertID)
 	if err != nil {
-		return "", fmt.Errorf("真实对话: %w", err)
+		return fmt.Errorf("真实对话: %w", err)
 	}
 
 	events := upstream.DesktopChatSequence(conv, req, session.NewUUIDv7Hex(), "fast-model", "fast-model")
 	for _, ev := range events {
 		if ev["eventCode"] == "agent_task_created" {
 			ev["has_expert"] = true
-			ev["expert_id"] = marketExpert.ExpertID
-			ev["expert_name"] = marketExpert.DisplayNameZH
+			ev["expert_id"] = expert.ExpertID
+			ev["expert_name"] = expert.DisplayNameZH
 			ev["expert_industry_id"] = ""
 		}
 	}
 
-	events = append(events, upstream.DesktopExpertActualUseLocal(&marketExpert, conv, req))
-	// 对齐真实样本细节：轻量云专家 actual_use 的 type 为空、cost=0。
+	events = append(events, upstream.DesktopExpertActualUseLocal(expert, conv, req))
+	// 对齐真实样本细节：LOCAL 专家 actual_use 的 type 为空、cost=0。
 	events[len(events)-1]["type"] = ""
-
 	events[len(events)-1]["cost"] = 0
-	if err := panel.cfg.Upstream.ReportDesktopEvent(account2, events...); err != nil {
-		return "", fmt.Errorf("使用事件: %w", err)
+
+	if err := panel.cfg.Upstream.ReportDesktopEvent(account, events...); err != nil {
+		return fmt.Errorf("使用事件: %w", err)
 	}
 
-	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
+	return nil
 }
 
 // runAppearance 完成 Hp_Appearance（换主题）。
