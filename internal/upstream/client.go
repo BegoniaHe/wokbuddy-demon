@@ -1636,7 +1636,12 @@ func (c *Client) billingBase(a *auth.Auth) string {
 // CN 用 workbuddy.cn。
 func (c *Client) webBase(a *auth.Auth) string {
 	if c.globalOn(a) {
-		return c.globalChatBase(a)
+		// web/任务端点不走 global.chat_base 覆盖（既有语义），只按签发域选主机。
+		if base := globalBaseForDomain(a.DomainValue()); base != "" {
+			return base
+		}
+
+		return defaultGlobalBase
 	}
 
 	if c.WebBaseCN != "" {
