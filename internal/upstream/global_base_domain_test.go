@@ -1,7 +1,9 @@
 package upstream
 
 import (
+	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -195,5 +197,95 @@ func TestCommonHeadersOriginFollowsIssuingDomain(t *testing.T) {
 
 	if got := req.Header.Get("Origin"); got != originRefererCN {
 		t.Errorf("cn Origin=%q want %q", got, originRefererCN)
+	}
+}
+
+var errUnexpectedWebPath = errors.New("unexpected web path")
+
+var webOriginCases = []struct {
+	name   string
+	domain string
+	want   string
+}{
+	{"官方国际站", "www.codebuddy.ai", officialGlobalBase},
+	{"旧桌面端", "www.workbuddy.ai", defaultGlobalBase},
+	{"CN 默认", "www.codebuddy.cn", "https://www.workbuddy.cn"},
+}
+
+// TestClaimRewardOriginFollowsIssuingDomain ClaimReward 走 webBase；Origin/Referer
+// 必须与请求主机同域，不能对 codebuddy.ai 账号继续声称 workbuddy.cn 来源。
+func TestClaimRewardOriginFollowsIssuingDomain(t *testing.T) {
+	t.Parallel()
+
+	for _, item := range webOriginCases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotOrigin, gotReferer string
+
+			client := testClient(func(r *http.Request) (*http.Response, error) {
+				if !strings.HasSuffix(r.URL.Path, "/claim") {
+					return nil, errUnexpectedWebPath
+				}
+
+				gotOrigin = r.Header.Get("Origin")
+				gotReferer = r.Header.Get("Referer")
+
+				return jsonResp(http.StatusOK, `{"code":0,"data":{"already_claimed":true}}`), nil
+			})
+			client.GlobalEnabled = true
+
+			account := &auth.Auth{UID: "u1", AccessToken: "at", Domain: item.domain}
+			if _, _, err := client.ClaimReward(account, "chat_1"); err != nil {
+				t.Fatalf("ClaimReward: %v", err)
+			}
+
+			if gotOrigin != item.want {
+				t.Errorf("Origin=%q want %q", gotOrigin, item.want)
+			}
+
+			if gotReferer != item.want+"/profile/growth-center" {
+				t.Errorf("Referer=%q want %q", gotReferer, item.want+"/profile/growth-center")
+			}
+		})
+	}
+}
+
+// TestFetchAccountProfileOriginFollowsIssuingDomain FetchAccountProfile 走 webBase；
+// Origin/Referer 必须与请求主机同域。
+func TestFetchAccountProfileOriginFollowsIssuingDomain(t *testing.T) {
+	t.Parallel()
+
+	for _, item := range webOriginCases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotOrigin, gotReferer string
+
+			client := testClient(func(r *http.Request) (*http.Response, error) {
+				if !strings.HasSuffix(r.URL.Path, "/console/account") {
+					return nil, errUnexpectedWebPath
+				}
+
+				gotOrigin = r.Header.Get("Origin")
+				gotReferer = r.Header.Get("Referer")
+
+				return jsonResp(http.StatusOK, `{"code":0,"data":{"uid":"u1","nickname":"n"}}`), nil
+			})
+			client.GlobalEnabled = true
+
+			account := &auth.Auth{UID: "u1", AccessToken: "at", Domain: item.domain}
+			if _, err := client.FetchAccountProfile(account); err != nil {
+				t.Fatalf("FetchAccountProfile: %v", err)
+			}
+
+			if gotOrigin != item.want {
+				t.Errorf("Origin=%q want %q", gotOrigin, item.want)
+			}
+
+			if gotReferer != item.want+"/profile/account-settings" {
+				t.Errorf("Referer=%q want %q", gotReferer, item.want+"/profile/account-settings")
+			}
+		})
 	}
 }
