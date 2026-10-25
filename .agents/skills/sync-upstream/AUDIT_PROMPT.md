@@ -33,12 +33,14 @@ remote if needed.
 ```bash
 git fetch --prune upstream
 node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs --dry-run
+node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs
 node .agents/skills/reverse-workbuddy/scripts/protocol_sweep.mjs --root .tmp/workbuddy
 python3 .agents/skills/sync-upstream/scripts/inspect_upstream.py
 ```
 
-If the latest official package is missing, download it before judging commits.
-Do not audit against memory or the reference fork's assertions.
+If the latest official package is still missing after the download, stop and
+report it before judging commits. Do not audit against memory or the reference
+fork's assertions.
 
 ## Audit and file Issues
 

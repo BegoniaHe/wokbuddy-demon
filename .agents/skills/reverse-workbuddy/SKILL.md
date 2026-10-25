@@ -154,8 +154,8 @@ description: >
 
 - 协议溯源文案要更新时改 `internal/upstream/UPSTREAM.md`；配置项变化（含 profile
   路径/字段）同步 `config.example.json`；用户可见行为改 `README.md`。
-- git 历史形态的上游同步（前序 fork 提交）走 `sync-upstream` 技能；本技能的
-  「上游」指官方客户端二进制，两者不是同一物。
+- git 历史形态的参考 fork 审计（`misakano7545/workbuddy2api-panel` 提交）走
+  `sync-upstream` 技能；本技能的「上游」指官方客户端二进制，两者不是同一物。
 
 ## Read as needed
 
