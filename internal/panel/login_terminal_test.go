@@ -205,3 +205,35 @@ func TestLoginPollTokenTerminalDropsSession(t *testing.T) {
 		t.Error("终态失败后会话应被移除")
 	}
 }
+
+// TestLoginPollPersistFailureDropsSession 凭证落盘失败同样返回非 200，前端会停止
+// 轮询；会话必须在返回前移除，否则 p.logins 要等 TTL/下次 login start 才回收。
+//
+//nolint:paralleltest // 串行替换全局 loginHTTP，避免测试间互相干扰
+func TestLoginPollPersistFailureDropsSession(t *testing.T) {
+	replaceLoginHTTP(t, func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "/auth/token") {
+			return loginResponse(http.StatusOK,
+				`{"code":0,"data":{"accessToken":"at","refreshToken":"rt","expiresIn":3600}}`), nil
+		}
+
+		// 含路径字符的 uid 会在 persistLoginAuth 落盘前被拒，模拟 account 成功但
+		// 凭证无法保存的失败路径。
+		return loginResponse(http.StatusOK,
+			`{"code":0,"data":{"uid":"../evil","nickname":"evil"}}`), nil
+	})
+
+	panel := loginTestPanel(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/login/poll?state=state-1", nil)
+
+	panel.loginPoll(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d want 502 body=%s", rec.Code, rec.Body.String())
+	}
+
+	if _, known := panel.lookupLoginSession("state-1"); known {
+		t.Error("落盘失败后会话应被移除")
+	}
+}

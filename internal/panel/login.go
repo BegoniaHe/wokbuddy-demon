@@ -401,7 +401,10 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 
 	account, status, msg := p.persistLoginAuth(sess.realm, tok, acct)
 	if status != 0 {
+		// 非 200 会让前端停止轮询；会话不清掉就得等 TTL 或下次 login/start 才回收。
+		p.dropLoginSession(state)
 		writeErr(w, status, msg)
+
 		return
 	}
 
