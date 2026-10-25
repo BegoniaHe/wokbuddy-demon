@@ -60,7 +60,7 @@
 - **面板内试聊**：直接输入提示词走真实 `/v1` 链路，验证模型、账号与流式输出；对话只存在本机浏览器。
 - **本地状态持久化**：重启后还记得昨天干到哪，不会一键失忆。
 - **登录与搬家**：面板里完成授权登录；需要换机器时，可以加密导出再导入账号。
-- **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations`（`features.images_endpoint`，默认关）。
+- **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态，单批最多 50 个模型）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations`（`features.images_endpoint`，默认关）。
 - **官方档位徽章**：解析 `/v3/config` 的 `modelTiers`，在模型页与试聊选择器显示档位与升级提示，不改变选号或模型过滤。
 
 ### 🎯 差一个就满分的成长任务

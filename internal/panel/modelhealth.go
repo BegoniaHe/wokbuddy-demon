@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -457,13 +458,11 @@ func probeErrorClass(err error) string {
 }
 
 // truncateProbeError 截断错误原文（面板展示用；不写日志、不含凭证）。
+// 按字节上限截断但回退到 UTF-8 rune 边界，避免中文错误文案被切成半个字符。
 func truncateProbeError(str string) string {
 	const maxLen = 200
-	if len(str) > maxLen {
-		return str[:maxLen] + "…"
-	}
 
-	return str
+	return logfmt.TruncateEllipsis(str, maxLen)
 }
 
 // recordProbeSample 追加样本并落盘（滚动裁剪到 modelProbeSamplesPerModel）。

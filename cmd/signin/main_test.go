@@ -3,7 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -60,5 +62,29 @@ func TestClassifyRefreshFailure(t *testing.T) {
 				t.Errorf("classifyRefreshFailure(%v)=%q want %q", testCase.err, got, testCase.want)
 			}
 		})
+	}
+}
+
+// TestTruncKeepsValidUTF8 表格里的昵称常为中文：按字节截断必须回退到 rune 边界，
+// 不能把多字节字符切成半个（终端会显示替换符）。
+func TestTruncKeepsValidUTF8(t *testing.T) {
+	t.Parallel()
+
+	got := trunc("测试昵称", 11)
+	if got != "测试昵" || !utf8.ValidString(got) {
+		t.Fatalf("trunc=%q valid=%v want 测试昵", got, utf8.ValidString(got))
+	}
+
+	if got := trunc("uid-123", 36); got != "uid-123" {
+		t.Fatalf("未超长时应原样返回: %q", got)
+	}
+
+	if got := short("错误：\n连接超时"); got != "错误： 连接超时" {
+		t.Fatalf("换行应替换为空格: %q", got)
+	}
+
+	// 60 字节切点落在第 20 个汉字中间时必须回退，不能输出半个字符。
+	if got := short("a" + strings.Repeat("错", 20)); !utf8.ValidString(got) {
+		t.Fatalf("short 结果不是合法 UTF-8: %q", got)
 	}
 }

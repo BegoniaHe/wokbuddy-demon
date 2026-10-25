@@ -14,6 +14,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -196,18 +197,11 @@ func refreshIfNeeded(account *auth.Auth, up *upstream.Client) error {
 }
 
 func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-
-	return s
+	return logfmt.Truncate(s, n)
 }
 
 func short(str2 string) string {
 	str2 = strings.ReplaceAll(str2, "\n", " ")
-	if len(str2) > 60 {
-		return str2[:60]
-	}
 
-	return str2
+	return logfmt.Truncate(str2, 60)
 }
