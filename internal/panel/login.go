@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
 )
 
 const (
@@ -218,17 +219,21 @@ func doJSON(
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+
+	// 先解信封：业务错误可能随任意 HTTP 状态返回（含 4xx），code 比状态码更权威。
+	var env apiEnvelope
+
+	parseErr := json.Unmarshal(raw, &env)
+	if parseErr == nil && env.Code != 0 {
+		return nil, resp.StatusCode, &logincode.Error{Code: env.Code, Msg: env.Msg, Status: resp.StatusCode}
+	}
+
 	if resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %w", resp.StatusCode, errDoJSONFailed)
 	}
 
-	var env apiEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
-	}
-
-	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s: %w", env.Code, env.Msg, errDoJSONFailed)
+	if parseErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", parseErr)
 	}
 
 	return env.Data, resp.StatusCode, nil
@@ -383,7 +388,10 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	acct := p.fetchLoginAccount(&endpoint, state, tok.AccessToken)
+	acct, ok := p.pollLoginAccount(w, &endpoint, state, tok.AccessToken)
+	if !ok {
+		return
+	}
 
 	account, status, msg := p.persistLoginAuth(sess.realm, tok, acct)
 	if status != 0 {
@@ -391,22 +399,61 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
-	checkinMsg, remain, total := p.postLoginTasks(account, sess.realm, acct.UID)
+	p.finishLoginPoll(w, state, sess.realm, account, acct)
+}
+
+// finishLoginPoll 登录成功后的收尾：顺带签到 + 余额刷新（幂等；失败只体现在
+// 返回字段里），清理会话并回写结果。
+func (p *Panel) finishLoginPoll(
+	w http.ResponseWriter, state, realm string, account *auth.Auth, acct loginAccount,
+) {
+	checkinMsg, remain, total := p.postLoginTasks(account, realm, acct.UID)
 
 	p.loginMu.Lock()
 	delete(p.logins, state)
 	p.loginMu.Unlock()
-	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
+	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, realm)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":            true,
 		"uid":             acct.UID,
 		"nickname":        acct.Nickname,
-		"realm":           sess.realm,
+		"realm":           realm,
 		"credits":         remain,
 		"credits_total":   total,
 		"checkin_message": checkinMsg,
 	})
+}
+
+// pollLoginAccount 取账号信息并回写 pending / 终态响应；返回值 ok=false 表示
+// 本轮轮询已处理完毕，调用方应直接返回。其他错误保持忽略（由 uid 校验兜底）。
+func (p *Panel) pollLoginAccount(
+	w http.ResponseWriter, endpoint *loginEndpoint, state, bearer string,
+) (loginAccount, bool) {
+	acct, err := p.fetchLoginAccount(endpoint, state, bearer)
+	if err == nil {
+		return acct, true
+	}
+
+	codeErr, ok := errors.AsType[*logincode.Error](err)
+	if !ok {
+		return acct, true
+	}
+
+	// 账号信息尚未就绪：继续按 pending 轮询。
+	if logincode.IsPending(codeErr.Code) {
+		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "waiting for account"})
+
+		return loginAccount{}, false
+	}
+
+	// 许可终态：立即失败并透出上游 msg，不再空转到 TTL。
+	if logincode.IsTerminal(codeErr.Code) {
+		writeLoginPollError(w, err)
+
+		return loginAccount{}, false
+	}
+
+	return acct, true
 }
 
 // writeLoginPollError 区分部署错误与「等用户完成登录」：profile 缺失不能返回
@@ -414,6 +461,18 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 func writeLoginPollError(w http.ResponseWriter, err error) {
 	if errors.Is(err, errLoginProfileMissing) {
 		writeErr(w, http.StatusServiceUnavailable, err.Error())
+
+		return
+	}
+
+	// 许可终态返回非 200 + 上游 msg，前端停止轮询并展示真实原因。
+	if codeErr, ok := errors.AsType[*logincode.Error](err); ok && logincode.IsTerminal(codeErr.Code) {
+		msg := codeErr.Msg
+		if msg == "" {
+			msg = err.Error()
+		}
+
+		writeErr(w, http.StatusBadRequest, msg)
 
 		return
 	}
@@ -432,42 +491,85 @@ func (p *Panel) pollLoginToken(realm, preferredBase, state string) (loginToken, 
 	var lastErr error
 
 	for _, endpoint := range loginCandidatesPreferWithIdentity(realm, preferredBase, identity) {
-		tokRaw, status, err := doJSON(
-			http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
-		)
-		if err != nil {
-			lastErr = err
-
-			if loginReplayable(status) {
-				continue
-			}
-
-			return loginToken{}, false, loginEndpoint{}, err
+		tok, pending, status, err := requestLoginToken(&endpoint, state)
+		if err == nil {
+			return tok, pending, endpoint, nil
 		}
 
-		var tok loginToken
-
-		_ = json.Unmarshal(tokRaw, &tok)
-		if tok.AccessToken == "" {
-			return loginToken{}, true, endpoint, nil
+		lastErr = err
+		if loginTokenRetryable(status, err) {
+			continue
 		}
 
-		return tok, false, endpoint, nil
+		return loginToken{}, false, loginEndpoint{}, err
 	}
 
 	return loginToken{}, false, loginEndpoint{}, lastErr
 }
 
-// fetchLoginAccount 取 uid/nickname（失败不阻塞，仅缺展示名）。
-func (*Panel) fetchLoginAccount(endpoint *loginEndpoint, state, bearer string) loginAccount {
-	var acct loginAccount
-	if acctRaw, _, err := doJSON(
-		http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent,
-	); err == nil {
-		_ = json.Unmarshal(acctRaw, &acct)
+// requestLoginToken 请求单个 origin 的 token 端点：pending 业务码与空 token 都归一为
+// pending=true 且 err=nil；许可终态与其他错误原样返回给调用方决定是否换 origin。
+func requestLoginToken(endpoint *loginEndpoint, state string) (loginToken, bool, int, error) {
+	tokRaw, status, err := doJSON(
+		http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
+	)
+	if err != nil {
+		if loginTokenPending(err) {
+			return loginToken{}, true, status, nil
+		}
+
+		return loginToken{}, false, status, err
 	}
 
-	return acct
+	var tok loginToken
+
+	_ = json.Unmarshal(tokRaw, &tok)
+	if tok.AccessToken == "" {
+		return loginToken{}, true, status, nil
+	}
+
+	return tok, false, status, nil
+}
+
+// loginTokenRetryable 报告失败是否值得换 origin：许可终态不换，其余按网关类状态码。
+func loginTokenRetryable(status int, err error) bool {
+	if loginTokenTerminal(err) {
+		return false
+	}
+
+	return loginReplayable(status)
+}
+
+// loginTokenPending 报告 token 轮询错误是否为 pending 业务码。
+func loginTokenPending(err error) bool {
+	codeErr, ok := errors.AsType[*logincode.Error](err)
+
+	return ok && logincode.IsPending(codeErr.Code)
+}
+
+// loginTokenTerminal 报告 token 轮询错误是否为许可终态。
+func loginTokenTerminal(err error) bool {
+	codeErr, ok := errors.AsType[*logincode.Error](err)
+
+	return ok && logincode.IsTerminal(codeErr.Code)
+}
+
+// fetchLoginAccount 取 uid/nickname；失败返回错误，由 loginPoll 区分 pending / 终态 / 忽略。
+func (*Panel) fetchLoginAccount(endpoint *loginEndpoint, state, bearer string) (loginAccount, error) {
+	var acct loginAccount
+
+	acctRaw, _, err := doJSON(
+		http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent,
+	)
+	if err != nil {
+		return loginAccount{}, err
+	}
+
+	if err := json.Unmarshal(acctRaw, &acct); err != nil {
+		return loginAccount{}, fmt.Errorf("parse account: %w", err)
+	}
+
+	return acct, nil
 }
 
 // persistLoginAuth 校验 uid、落盘凭证并热加载进池。返回非零 status 表示失败，
