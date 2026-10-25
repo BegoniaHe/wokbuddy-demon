@@ -1,6 +1,6 @@
 ---
 name: plan-issue
-description: Turn a wokbuddy-demon GitHub Issue or change request into a code-backed implementation plan with file paths, acceptance criteria, and verification commands. Use when planning, triage, or a specification is requested; not for direct implementation, upstream sync, or product audits.
+description: Turn a wokbuddy-demon GitHub Issue or change request into a code-backed implementation plan with file paths, acceptance criteria, and verification commands. Use when planning, triage, or a specification is requested; not for direct implementation, reference-fork audits, or product audits.
 license: MIT
 compatibility: >
   Codex CLI or OpenCode in the BegoniaHe/wokbuddy-demon checkout. Requires
@@ -41,8 +41,9 @@ concise chat question otherwise. Continue independent research while waiting.
 Record reasonable defaults for non-blocking unknowns. Never infer approval from
 silence or elapsed time.
 
-Route upstream integration to `sync-upstream`. Do not start this planning
-workflow merely because an implementation task has several steps.
+Route reference-fork audits to `sync-upstream`; it only files Issues and does
+not absorb code. Do not start this planning workflow merely because an
+implementation task has several steps.
 
 ## Read as needed
 

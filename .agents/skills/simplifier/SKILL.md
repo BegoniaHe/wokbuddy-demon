@@ -5,7 +5,7 @@ description: >
   (YAGNI, reuse, stdlib, no new deps). Use ONLY when the user says
   simplifier, simplify, yagni, do less, shortest path, or asks to cut
   over-engineering, bloat, boilerplate, or extra dependencies. Not for
-  planning, upstream sync, or non-coding requests.
+  planning, reference-fork audits, or non-coding requests.
 license: MIT
 compatibility: >
   Codex CLI or OpenCode in the BegoniaHe/wokbuddy-demon checkout. Go 1.27;
@@ -94,7 +94,7 @@ User insists on the larger version → build it, no re-arguing.
 
 - Checkout rungs and provenance: `REFERENCE.md`
 - Repo policy: `AGENTS.md`
-- Upstream: `sync-upstream`
+- Reference-fork audit: `sync-upstream`
 - Plans: `plan-issue`
 
 ## Verify

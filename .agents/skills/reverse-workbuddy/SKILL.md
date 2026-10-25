@@ -8,7 +8,7 @@ description: >
   investigating new client releases, upstream protocol drift, realm/version
   differences, re-verifying the current protocol baseline, or generating /
   validating a client fingerprint profile.
-  不用于 git 历史形态的上游同步（那走 sync-upstream）。
+  不用于 git 历史形态的参考 fork 审计（那走 sync-upstream）。
 ---
 
 # 逆向调研 WorkBuddy 客户端协议
@@ -37,7 +37,7 @@ description: >
 - profile 必须过校验器才算产出（schema、交叉一致、`evidence` 逐字命中、控制字符
   检查）；校验不过的值是未生成状态，不得当作事实写进报告或提交。
 - 调研产出差异结论若要落到代码，改的是 `internal/upstream/`（适配在上游侧做，
-  不依赖上游修复，见 `AGENTS.md` 上游同步策略）。
+  不依赖上游修复，见 `AGENTS.md` 上游审计策略）。
 
 ## Open
 
