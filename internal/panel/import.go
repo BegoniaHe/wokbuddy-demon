@@ -187,7 +187,7 @@ func (p *Panel) persistCockpitAccount(acc *cockpitAccount) (*auth.Auth, string) 
 		return nil, fmt.Sprintf("invalid uid (id=%s)", acc.ID)
 	}
 
-	// 按 domain 推断 realm：workbuddy.ai 家族 → global，否则 cn。
+	// 按 domain 推断 realm：workbuddy.ai / codebuddy.ai 家族 → global，否则 cn。
 	realm := auth.ResolveRealm("", acc.Domain)
 
 	a := buildImportedAuth(acc, uid, at, str, p.cfg.AuthDir)

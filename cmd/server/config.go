@@ -233,7 +233,8 @@ type Config struct {
 
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
-		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
+		// domain 属 workbuddy.ai / codebuddy.ai 的账号判为 global 并路由 global
+		// base/路径。
 		// 显式 "enabled": false 关闭（逃生门，纯 CN 锁定：即便 auth 写了 realm=global
 		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
 		// 恒判 cn，global base 只在 realm=global 的账号上被使用。

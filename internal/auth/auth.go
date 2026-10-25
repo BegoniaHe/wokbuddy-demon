@@ -153,8 +153,9 @@ func (a *Auth) NicknameValue() string {
 // globalDisabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认关闭（零值）：与 config global.enabled 缺省 true 一致，Realm() 正常按显式
 // realm/domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）
-// → 逃生门：纯 CN 部署，即便 auth 文件写了 realm=global 或 domain 为 .workbuddy.ai
-// 也恒判 cn——「关了才锁死」的单一闸口集中收敛在 Realm()/IsGlobal() 里。
+// → 逃生门：纯 CN 部署，即便 auth 文件写了 realm=global 或 domain 属
+// workbuddy.ai / codebuddy.ai 家族，也恒判 cn——「关了才锁死」的单一闸口
+// 集中收敛在 Realm()/IsGlobal() 里。
 var globalDisabled atomic.Bool
 
 // SetGlobalEnabled 注入 global realm 路由开关（false = 锁死纯 CN，逃生门）。
@@ -163,8 +164,9 @@ func SetGlobalEnabled(enabled bool) { globalDisabled.Store(!enabled) }
 // GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
 func GlobalEnabled() bool { return !globalDisabled.Load() }
 
-// Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，
-// 否则 "cn"。显式 global 优先于 domain 回落（D1）。
+// Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 属 global 域家族
+// （workbuddy.ai / codebuddy.ai）→ "global"，否则 "cn"。显式 global 优先于
+// domain 回落（D1）。
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
 func (a *Auth) Realm() string {
