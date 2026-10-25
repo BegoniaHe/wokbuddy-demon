@@ -2128,7 +2128,7 @@ func (c *Config) normalizeKeepaliveWindow() error {
 	if err != nil {
 		return fmt.Errorf(
 			"schedule.keepalive_refresh_window: %q 不是合法时长: %w",
-			c.Schedule.KeepaliveRefreshWindow, errNormalizeKeepaliveWindowFailed,
+			c.Schedule.KeepaliveRefreshWindow, err,
 		)
 	}
 
