@@ -172,6 +172,36 @@ func TestLoginPollAccountPendingAndTerminal(t *testing.T) {
 			if !item.wantPending && item.wantStatus != http.StatusOK && !strings.Contains(rec.Body.String(), item.msg) {
 				t.Errorf("body=%s 未透出上游 msg %q", rec.Body.String(), item.msg)
 			}
+
+			// pending 继续保留会话；终态前端已停止轮询，必须收敛会话。
+			if _, known := panel.lookupLoginSession("state-1"); known != item.wantPending {
+				t.Errorf("session known=%v want %v", known, item.wantPending)
+			}
 		})
+	}
+}
+
+// TestLoginPollTokenTerminalDropsSession token 端终态同样要收敛会话：前端收到
+// 非 200 后停止轮询，残留条目不会再被 TTL 查询清掉。
+//
+//nolint:paralleltest // 串行替换全局 loginHTTP，避免测试间互相干扰
+func TestLoginPollTokenTerminalDropsSession(t *testing.T) {
+	replaceLoginHTTP(t, func(*http.Request) (*http.Response, error) {
+		return loginResponse(http.StatusOK,
+			`{"code":`+strconv.Itoa(logincode.LicenseExpired)+`,"msg":"许可已过期"}`), nil
+	})
+
+	panel := loginTestPanel(t)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/login/poll?state=state-1", nil)
+
+	panel.loginPoll(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d want 400 body=%s", rec.Code, rec.Body.String())
+	}
+
+	if _, known := panel.lookupLoginSession("state-1"); known {
+		t.Error("终态失败后会话应被移除")
 	}
 }

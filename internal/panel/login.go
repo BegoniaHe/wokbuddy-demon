@@ -379,7 +379,13 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 
 	tok, pending, endpoint, err := p.pollLoginToken(sess.realm, sess.base, state)
 	if err != nil {
+		// 许可终态会让前端停止轮询；收敛会话，避免状态永久留在 p.logins。
+		if loginTokenTerminal(err) {
+			p.dropLoginSession(state)
+		}
+
 		writeLoginPollError(w, err)
+
 		return
 	}
 
@@ -402,6 +408,13 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.finishLoginPoll(w, state, sess.realm, account, acct)
 }
 
+// dropLoginSession 移除登录会话（成功、终态失败共用）；幂等。
+func (p *Panel) dropLoginSession(state string) {
+	p.loginMu.Lock()
+	delete(p.logins, state)
+	p.loginMu.Unlock()
+}
+
 // finishLoginPoll 登录成功后的收尾：顺带签到 + 余额刷新（幂等；失败只体现在
 // 返回字段里），清理会话并回写结果。
 func (p *Panel) finishLoginPoll(
@@ -409,9 +422,7 @@ func (p *Panel) finishLoginPoll(
 ) {
 	checkinMsg, remain, total := p.postLoginTasks(account, realm, acct.UID)
 
-	p.loginMu.Lock()
-	delete(p.logins, state)
-	p.loginMu.Unlock()
+	p.dropLoginSession(state)
 	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, realm)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":            true,
@@ -446,8 +457,10 @@ func (p *Panel) pollLoginAccount(
 		return loginAccount{}, false
 	}
 
-	// 许可终态：立即失败并透出上游 msg，不再空转到 TTL。
+	// 许可终态：立即失败并透出上游 msg，不再空转到 TTL；同时收敛会话，
+	// 前端收到非 200 后会停止轮询，否则条目会永久留在 p.logins。
 	if logincode.IsTerminal(codeErr.Code) {
+		p.dropLoginSession(state)
 		writeLoginPollError(w, err)
 
 		return loginAccount{}, false
