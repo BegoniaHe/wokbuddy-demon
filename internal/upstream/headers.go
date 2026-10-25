@@ -20,10 +20,16 @@ const (
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 
-// originRefererFor 按账号 realm 返回 Origin/Referer 基础域：
-// global → https://www.workbuddy.ai；cn（含全局开关未开）→ https://www.codebuddy.cn。
+// originRefererFor 按账号 realm 与签发域返回 Origin/Referer 基础域：
+// global → auth.domain 推出的签发域（codebuddy.ai / workbuddy.ai）；cn（含全局
+// 开关未开）→ https://www.codebuddy.cn。origin 必须与请求主机同域：token 只在
+// 签发域可用，跨域 Origin 会被上游判为非官方来源。
 func originRefererFor(a *auth.Auth) string {
 	if a != nil && a.IsGlobal() {
+		if base := globalBaseForDomain(a.DomainValue()); base != "" {
+			return base
+		}
+
 		return originRefererGlobal
 	}
 

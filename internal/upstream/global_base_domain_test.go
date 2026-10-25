@@ -147,3 +147,53 @@ func TestGlobalRegisterRequestUsesIssuingDomain(t *testing.T) {
 		t.Errorf("Referer=%q want %q", gotReferer, officialGlobalBase+"/")
 	}
 }
+
+// TestCommonHeadersOriginFollowsIssuingDomain chat/refresh/growth 等共用
+// CommonHeaders：Origin/Referer 必须与请求主机同域，codebuddy.ai 账号不能继续
+// 声称自己是 workbuddy.ai 来源。
+func TestCommonHeadersOriginFollowsIssuingDomain(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(nil)
+	client.GlobalEnabled = true
+
+	cases := []struct {
+		name   string
+		domain string
+		want   string
+	}{
+		{"官方国际站", "www.codebuddy.ai", officialGlobalBase},
+		{"旧桌面端", "www.workbuddy.ai", defaultGlobalBase},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+
+			client.CommonHeaders(req, &auth.Auth{Domain: item.domain, AccessToken: "at"})
+
+			if got := req.Header.Get("Origin"); got != item.want {
+				t.Errorf("Domain=%s Origin=%q want %q", item.domain, got, item.want)
+			}
+
+			if got := req.Header.Get("Referer"); got != item.want+"/" {
+				t.Errorf("Domain=%s Referer=%q want %q", item.domain, got, item.want+"/")
+			}
+		})
+	}
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+
+	client.CommonHeaders(req, &auth.Auth{Domain: "www.codebuddy.cn", AccessToken: "at"})
+
+	if got := req.Header.Get("Origin"); got != originRefererCN {
+		t.Errorf("cn Origin=%q want %q", got, originRefererCN)
+	}
+}

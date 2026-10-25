@@ -361,7 +361,8 @@ func isDomainOrSubdomain(d, root string) bool {
 }
 
 // realmFromIssuer 从 access token 的 JWT iss claim 兜底推断账号域：iss host 命中
-// workbuddy.ai 家族 → "global"，否则返回空串（未知 / 非法 token，调用方回落现有行为）。
+// global 域家族（workbuddy.ai / codebuddy.ai）→ "global"，否则返回空串（未知 /
+// 非法 token，调用方回落现有行为）。
 //
 // 仅解 payload（base64url 第二段），不做签名校验——本项只用于缺 realm/domain 时的
 // 路由兜底，安全默认是「未知即不判 global」。解码 / 解析失败静默返回空串，不吞调用方错误。
