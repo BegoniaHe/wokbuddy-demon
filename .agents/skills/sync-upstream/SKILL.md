@@ -1,4 +1,12 @@
-# Skill: sync-upstream
+---
+name: sync-upstream
+description: >-
+  Audit pending commits from the misakano7545/workbuddy2api-panel reference
+  fork against the latest official WorkBuddy Win32 client, record dispositions
+  in the decision ledger, and open Issues on BegoniaHe/wokbuddy-demon. Use for
+  upstream synchronization audits, reference-fork commit classification, and
+  upstream protocol drift review; do not use to absorb or cherry-pick code.
+---
 
 # Audit the reference fork and open issues
 
