@@ -5,9 +5,9 @@ import {
   CFG_FIELD_BY_NAME,
   collectConfig,
   configToValues,
-  durationBad,
   DURATION_FIELDS,
-  DURATION_TIP,
+  durationFieldInvalid,
+  durationTip,
   type FieldValue,
 } from '@/lib/config';
 import { toast } from '@/components/Toaster';
@@ -80,12 +80,12 @@ export function ConfigView() {
 
   const badFields = [...DURATION_FIELDS].filter((n) => {
     const v = values[n];
-    return typeof v === 'string' && durationBad(v);
+    return typeof v === 'string' && durationFieldInvalid(n, v);
   });
 
   const save = async () => {
     if (badFields.length) {
-      toast('「' + badFields[0] + '」' + DURATION_TIP, 'err');
+      toast('「' + badFields[0] + '」' + durationTip(badFields[0]!), 'err');
       return;
     }
     setSaving(true);
@@ -143,16 +143,20 @@ export function ConfigView() {
     }
   };
 
-  const text = (name: string, props: React.ComponentProps<typeof Input> = {}) => (
-    <Input
-      value={String(values[name] ?? '')}
-      onChange={(e) => set(name, e.target.value)}
-      aria-invalid={DURATION_FIELDS.has(name) && durationBad(String(values[name] ?? ''))}
-      className={cn(DURATION_FIELDS.has(name) && durationBad(String(values[name] ?? '')) && 'border-destructive bg-destructive-soft')}
-      title={DURATION_FIELDS.has(name) && durationBad(String(values[name] ?? '')) ? DURATION_TIP : undefined}
-      {...props}
-    />
-  );
+  const text = (name: string, props: React.ComponentProps<typeof Input> = {}) => {
+    const invalid = durationFieldInvalid(name, String(values[name] ?? ''));
+
+    return (
+      <Input
+        value={String(values[name] ?? '')}
+        onChange={(e) => set(name, e.target.value)}
+        aria-invalid={invalid}
+        className={cn(invalid && 'border-destructive bg-destructive-soft')}
+        title={invalid ? durationTip(name) : undefined}
+        {...props}
+      />
+    );
+  };
   const num = (name: string, props: React.ComponentProps<typeof Input> = {}) =>
     text(name, { type: 'number', ...props });
   const check = (name: string, label: React.ReactNode, hint?: string) => (
@@ -683,7 +687,7 @@ export function ConfigView() {
 
       <div className="sticky bottom-0 -mx-4 flex flex-wrap items-center gap-2 border-t border-border bg-background/95 px-4 py-3 backdrop-blur-md md:-mx-7 md:px-7">
         <span className="hidden flex-1 sm:block" />
-        {badFields.length ? <span className="text-xs text-warning">{DURATION_TIP}</span> : null}
+        {badFields.length ? <span className="text-xs text-warning">{durationTip(badFields[0]!)}</span> : null}
         <span className="text-xs text-warning">{note}</span>
         <div className="ml-auto flex flex-wrap items-center gap-2">
           <Button variant="outline" disabled={saving || restoring} onClick={() => void restore()}>
