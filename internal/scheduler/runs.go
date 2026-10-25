@@ -172,7 +172,7 @@ func (s *Scheduler) runTaskBody(ctx context.Context, task, trigger string) (tota
 	case TaskActivity:
 		return s.activityAll(ctx)
 	case TaskKeepalive:
-		return s.keepaliveAll()
+		return s.keepaliveAll(trigger)
 	case TaskBlackcat:
 		return s.blackcatAll(ctx)
 	case TaskStreak:

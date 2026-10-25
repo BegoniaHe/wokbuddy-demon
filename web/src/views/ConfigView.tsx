@@ -235,6 +235,11 @@ export function ConfigView() {
                 <FieldLabel>保活时点（小时，逗号分隔）</FieldLabel>
                 {text('keepalive_hours', { placeholder: '22' })}
               </Field>
+              <Field>
+                <FieldLabel>临期刷新窗口</FieldLabel>
+                {text('keepalive_refresh_window', { placeholder: '24h' })}
+                <FieldDescription>仅定时刷新 expiresAt 进入该窗口的账号；手动“全部保活”仍全量</FieldDescription>
+              </Field>
             </div>
           </div>
           <Separator className="my-4" />
