@@ -16,10 +16,10 @@ import (
 	"unicode/utf8"
 )
 
-// Truncate 截断字符串到 n 字节上限（先 TrimSpace，与旧 upstream/内部实现口径
-// 一致），切点落在多字节字符中间时回退到 UTF-8 rune 边界——错误 body 多为中文
-// （"将在 … 重置"），按字节切会出半截序列乱码。返回前统一去除首尾空白；未超限
-// 时即该结果，超限时在 n 字节内回退到 rune 边界（截断点前的空白会保留）；
+// Truncate 先 TrimSpace 再截断到 n 字节（与旧 upstream/内部实现口径一致），
+// 切点落在多字节字符中间时回退到 UTF-8 rune 边界——错误 body 多为中文
+// （"将在 … 重置"），按字节切会出半截序列乱码。未超限时返回 trim 后的原串；
+// 超限时在 n 字节内回退（截断点前的空白保留，尾部空白不保证去除）；
 // n<=0 返回空串。需要保留首尾空白（如 SSE 分帧）不要用它。
 func Truncate(str2 string, n int) string {
 	if n <= 0 {
