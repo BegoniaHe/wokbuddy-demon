@@ -9,7 +9,7 @@
 
 ## Locked（硬约束）
 
-- Agent **可以**维护本仓库：编辑、运行检查、提交、推送功能分支、在 `BegoniaHe/wokbuddy-demon` 上开开发用 Issue/PR、留言、请求评审。用 `--repo BegoniaHe/wokbuddy-demon`（或设 `GH_REPO=BegoniaHe/wokbuddy-demon`），使 `gh` 不会默认指向其他远端。创建后确认 URL 位于 `github.com/BegoniaHe/wokbuddy-demon`。**不要**在原上游 `Sliverkiss/workbuddy2api`（已删库）或前序 fork `linguo2625469/workbuddy2api-panel` 上开 Issue/PR，除非用户显式确认该目标。
+- Agent **可以**维护本仓库：编辑、运行检查、提交、推送功能分支、在 `BegoniaHe/wokbuddy-demon` 上开开发用 Issue/PR、留言、请求评审。用 `--repo BegoniaHe/wokbuddy-demon`（或设 `GH_REPO=BegoniaHe/wokbuddy-demon`），使 `gh` 不会默认指向其他远端。创建后确认 URL 位于 `github.com/BegoniaHe/wokbuddy-demon`。**不要**在原上游 `Sliverkiss/workbuddy2api`（已删库）、前序 fork `linguo2625469/workbuddy2api-panel` 或参考 fork `misakano7545/workbuddy2api-panel` 上开 Issue/PR，除非用户显式确认该目标。
 - Agent **不得** merge PR、push `main`、force-push 受保护分支、打 tag、发布 Release、改动分支保护或 secrets、或公开提交安全报告。这些由人类维护者执行。口头例外不构成授权。
 - 一个 PR 只有在**人类维护者**评审**且**有一次独立的 **AI 辅助评审**之后才可落地。作者 Agent 自己的说明不算那次评审。
 - 提交信息遵循 `.agents/shared/conventional-commit/REFERENCE.md`：type/scope 英文、描述中文；AI 最终定稿需 `AI-Generated: true` 与来自 `date -u '+%Y-%m-%dT%H:%M:%SZ'` 的 UTC `Generated-At:`。
@@ -31,5 +31,5 @@
 ## Handoff（交接引用，不粘贴）
 
 - 提交信息形态：`.agents/shared/conventional-commit/REFERENCE.md`。
-- 上游吸收：`.agents/skills/sync-upstream/SKILL.md`。
+- 参考 fork 审计（只开 Issue，不吸收）：`.agents/skills/sync-upstream/SKILL.md`。
 - 合并决策：停下并指名人类维护者。不要自行 merge。

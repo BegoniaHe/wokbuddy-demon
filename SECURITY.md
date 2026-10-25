@@ -2,13 +2,13 @@
 
 ## 支持的版本（Supported Versions）
 
-本仓库是滚动更新的 fork，**不发布版本化资产**：只有 nightly 构建（二进制 + 容器镜像），不存在版本支持矩阵。仅当前 `main` 分支受支持。原上游 `Sliverkiss/workbuddy2api`（已删库）与前序 fork `linguo2625469/workbuddy2api-panel` 的构建不是本分支产物，其安全问题不在本仓库范围内。
+本仓库是滚动更新的 fork，**不发布版本化资产**：只有 nightly 构建（二进制 + 容器镜像），不存在版本支持矩阵。仅当前 `main` 分支受支持。原上游 `Sliverkiss/workbuddy2api`（已删库）、前序 fork `linguo2625469/workbuddy2api-panel` 与参考 fork `misakano7545/workbuddy2api-panel` 的构建不是本分支产物，其安全问题不在本仓库范围内。
 
 | 版本 / 分支                      | 是否支持             |
 | -------------------------------- | -------------------- |
 | `main`（本 fork）                | ✅ 支持              |
 | 历史提交 / 旧 nightly            | ⚠️ 尽力而为          |
-| 前序 fork `workbuddy2api-panel`  | ❌ 报前序 fork       |
+| 前序 / 参考 fork `workbuddy2api-panel` | ❌ 报对应 fork |
 | 原上游 `workbuddy2api`           | ❌ 已删库，无从报告  |
 
 ## 报告漏洞（Reporting a Vulnerability）

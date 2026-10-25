@@ -15,7 +15,7 @@ from typing import Any
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-DISPOSITIONS = {"cherry-pick", "adapt", "skip", "replay", "revisit"}
+DISPOSITIONS = {"issue", "cherry-pick", "adapt", "skip", "replay", "revisit"}
 STATUSES = {"active", "superseded", "deferred"}
 EVENT_TYPES = {"upsert", "delete"}
 
@@ -79,6 +79,7 @@ def validate_event(event: Any, *, line_number: int | None = None) -> None:
         "reason_codes",
         "affected_paths",
         "integration_commits",
+        "issues",
         "tests",
         "supersedes",
     ):
@@ -87,7 +88,7 @@ def validate_event(event: Any, *, line_number: int | None = None) -> None:
             or not all(isinstance(x, str) for x in event[key])
         ):
             raise LedgerError(f"{key} must be a string array{where}")
-    for key in ("source_pr", "reason_codes", "affected_paths", "tests", "supersedes"):
+    for key in ("source_pr", "reason_codes", "affected_paths", "issues", "tests", "supersedes"):
         for value in event.get(key, []):
             if not value.strip():
                 raise LedgerError(f"{key} cannot contain empty values{where}")
@@ -198,7 +199,18 @@ def common_record_args(
         "--integration-commit", action="append", default=optional_default
     )
     parser.add_argument("--test", action="append", default=optional_default)
+    parser.add_argument(
+        "--issue",
+        action="append",
+        default=optional_default,
+        help="Issue URL or #number on BegoniaHe/wokbuddy-demon",
+    )
     parser.add_argument("--supersedes", action="append", default=optional_default)
+    parser.add_argument(
+        "--official-baseline",
+        default=text_default,
+        help='official client versions/commits, e.g. "cn 5.8.3... / global 5.8.4..."',
+    )
     parser.add_argument("--fork-adaptation", default=text_default)
     parser.add_argument("--revisit-when", default=text_default)
     parser.add_argument("--notes", default=text_default)
@@ -234,11 +246,12 @@ def make_upsert(
         "integration_commits": [
             normalize_sha(x) for x in normalize_list(args.integration_commit)
         ],
+        "issues": normalize_list(args.issue),
         "tests": normalize_list(args.test),
         "supersedes": [normalize_sha(x) for x in normalize_list(args.supersedes)],
     }
     event.update({key: value for key, value in optional.items() if value})
-    for key in ("fork_adaptation", "revisit_when", "notes"):
+    for key in ("fork_adaptation", "revisit_when", "notes", "official_baseline"):
         if getattr(args, key):
             event[key] = getattr(args, key).strip()
     return event
@@ -376,7 +389,9 @@ def command_add_or_update(args: argparse.Namespace, operation: str) -> None:
             ("affected_paths", "affected_paths"),
             ("integration_commit", "integration_commits"),
             ("test", "tests"),
+            ("issue", "issues"),
             ("supersedes", "supersedes"),
+            ("official_baseline", "official_baseline"),
             ("fork_adaptation", "fork_adaptation"),
             ("revisit_when", "revisit_when"),
             ("notes", "notes"),
@@ -389,7 +404,7 @@ def command_add_or_update(args: argparse.Namespace, operation: str) -> None:
                         key,
                         []
                         if attribute.endswith(
-                            ("pr", "code", "paths", "commit", "test", "supersedes")
+                            ("pr", "code", "paths", "commit", "test", "issue", "supersedes")
                         )
                         else "",
                     ),
@@ -494,6 +509,7 @@ def command_import_git(args: argparse.Namespace) -> None:
             reason_code=item["reason_codes"],
             affected_paths=[],
             integration_commit=[item["git_commit"]],
+            issue=None,
             test=item["tests"],
             supersedes=[],
             fork_adaptation=item["fork_deviations"],
@@ -502,6 +518,7 @@ def command_import_git(args: argparse.Namespace) -> None:
                 "Imported from Git commit "
                 f"{item['git_commit']}; review inferred fields before relying on them."
             ),
+            official_baseline="",
             source="git-inferred",
             recorded_at_utc=args.recorded_at_utc,
         )
