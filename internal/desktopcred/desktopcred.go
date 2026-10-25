@@ -174,6 +174,8 @@ func InspectFile(path string) (Account, error) {
 			account.ExpiresAt = n
 		}
 
+		account.ExpiresAt = auth.NormalizeExpiresAt(account.ExpiresAt)
+
 		if s, ok := m["realm"].(string); ok {
 			account.Realm = s
 		}
@@ -279,7 +281,7 @@ func buildAuth(doc, authObj, accountObj map[string]any, key keyMaterial) (*auth.
 func authExpiry(authObj map[string]any) int64 {
 	for _, k := range []string{"expiresAt", "expires_at"} {
 		if n, ok := int64Value(authObj[k]); ok {
-			return n
+			return auth.NormalizeExpiresAt(n)
 		}
 	}
 

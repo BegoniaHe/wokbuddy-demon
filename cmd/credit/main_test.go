@@ -101,14 +101,85 @@ func TestAuthFileNestedWinsOverFlat(t *testing.T) {
 func TestBillingBaseDomainWinsOverExplicitCN(t *testing.T) {
 	t.Parallel()
 
-	raw := []byte(`{"auth":{"accessToken":"token","domain":"www.workbuddy.ai","realm":"cn"}}`)
+	for _, domain := range []string{"www.workbuddy.ai", "www.codebuddy.ai"} {
+		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + domain + `","realm":"cn"}}`)
 
-	var file authFile
-	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatal(err)
+		var file authFile
+		if err := json.Unmarshal(raw, &file); err != nil {
+			t.Fatal(err)
+		}
+
+		want := billingBaseGlobal
+		if isCodebuddyAIDomain(domain) {
+			want = billingBaseOfficial
+		}
+
+		if got := billingBaseFor(&file); got != want {
+			t.Errorf("domain=%s billingBaseFor=%q want %q", domain, got, want)
+		}
 	}
+}
 
-	if got := billingBaseFor(&file); got != billingBaseGlobal {
-		t.Errorf("billingBaseFor=%q want %q", got, billingBaseGlobal)
+// 官方 CLI 国际站 codebuddy.ai 家族按签发域查 www.codebuddy.ai；
+// workbuddy.ai 仍走旧桌面端，codebuddy.cn 走 CN。
+func TestBillingBaseCodebuddyAIDomain(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		domain string
+		want   string
+	}{
+		{"www.codebuddy.ai", billingBaseOfficial},
+		{"codebuddy.ai", billingBaseOfficial},
+		{"sub.codebuddy.ai", billingBaseOfficial},
+		{"  WWW.CodeBuddy.AI  ", billingBaseOfficial},
+		{"www.workbuddy.ai", billingBaseGlobal},
+		{"www.codebuddy.cn", billingBaseCN},
+		{"codebuddy.cn", billingBaseCN},
+		{"", billingBaseCN},
+	}
+	for _, item := range cases {
+		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + item.domain + `"}}`)
+
+		var file authFile
+		if err := json.Unmarshal(raw, &file); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := billingBaseFor(&file); got != item.want {
+			t.Errorf("domain=%q billingBaseFor=%q want %q", item.domain, got, item.want)
+		}
+	}
+}
+
+// TestUserResourceRequestUsesIssuingDomain 计费域按签发域选，且国际域使用无
+// /v2 前缀的路径（与 internal/upstream 的 billingMeterPaths 同口径）。
+func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		domain string
+		want   string
+	}{
+		{"www.codebuddy.ai", "https://www.codebuddy.ai/billing/meter/get-user-resource"},
+		{"www.workbuddy.ai", "https://www.workbuddy.ai/billing/meter/get-user-resource"},
+		{"www.codebuddy.cn", "https://www.codebuddy.cn/v2/billing/meter/get-user-resource"},
+	}
+	for _, item := range cases {
+		var file authFile
+
+		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + item.domain + `"}}`)
+		if err := json.Unmarshal(raw, &file); err != nil {
+			t.Fatal(err)
+		}
+
+		req, err := newUserResourceRequest(&file)
+		if err != nil {
+			t.Fatalf("domain=%s: %v", item.domain, err)
+		}
+
+		if got := req.URL.String(); got != item.want {
+			t.Errorf("domain=%s url=%q want %q", item.domain, got, item.want)
+		}
 	}
 }

@@ -1318,7 +1318,7 @@ type Client struct {
 	WebBaseCN string
 
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
-	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
+	// 空 = 按账号 domain 选签发域；未知/缺省回落 https://www.workbuddy.ai（D5）。
 	ChatBaseGlobal    string
 	BillingBaseGlobal string
 
@@ -1394,8 +1394,13 @@ func (c *Client) chatHTTP() *http.Client {
 	return c.HTTP
 }
 
-// defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
+// defaultGlobalBase 缺省 global base（config 未覆盖、且 auth 文件未写 domain 时的兜底）。
+// 对齐官方 CLI：国际站新登录写 www.codebuddy.ai；workbuddy.ai 是旧桌面端主机名。
 const defaultGlobalBase = "https://www.workbuddy.ai"
+
+// officialGlobalBase 官方国际站（CodeBuddy CLI externalDomain）base。
+// 国际域两套主机名并存，token 只在签发域可用，必须按账号 domain 选主机。
+const officialGlobalBase = "https://www.codebuddy.ai"
 
 // CN 官方 origin 顺序：workbuddy.cn 为主，copilot.tencent.com / wb.tencentbuddy.com
 // 为兜底（仅在首 token 前可重放）。显式覆盖 chat base 时只用该值。
@@ -1409,7 +1414,7 @@ var cnChatFallbackBases = []string{
 // chatOrigins 返回本次 chat 可尝试的 origin 列表（按优先级）。
 func (c *Client) chatOrigins(a *auth.Auth) []string {
 	if c.globalOn(a) {
-		return []string{normalizeChatBase(c.globalChatBase())}
+		return []string{normalizeChatBase(c.globalChatBase(a))}
 	}
 
 	base := normalizeChatBase(c.ChatBaseCN)
@@ -1452,19 +1457,47 @@ func replayableOriginStatus(status int) bool {
 	}
 }
 
-// globalChatBase 生效的 global chat base：Client.ChatBaseGlobal 非空取之，否则默认。
-func (c *Client) globalChatBase() string {
-	if c.ChatBaseGlobal != "" {
-		return c.ChatBaseGlobal
+// globalBaseForDomain 按 auth 文件 domain 推出 global 上游主机：
+//
+//	*.codebuddy.ai → officialGlobalBase（官方国际站）
+//	*.workbuddy.ai → defaultGlobalBase（旧桌面端）
+//	其它/空        → ""（调用方回落配置或默认值，不猜域）
+//
+// 国际域两套主机名并存，且 token 只在签发域可用；只按 realm 选主机会把
+// 一半账号打到非签发域（401）。
+func globalBaseForDomain(domain string) string {
+	d := strings.ToLower(strings.TrimSpace(domain))
+	switch {
+	case d == "codebuddy.ai" || strings.HasSuffix(d, ".codebuddy.ai"):
+		return officialGlobalBase
+	case d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai"):
+		return defaultGlobalBase
+	default:
+		return ""
 	}
-
-	return defaultGlobalBase
 }
 
-// globalBillingBase 生效的 global billing base：Client.BillingBaseGlobal 非空取之，否则默认。
-func (c *Client) globalBillingBase() string {
-	if c.BillingBaseGlobal != "" {
-		return c.BillingBaseGlobal
+// globalChatBase 生效的 global chat base，优先级：
+// config ChatBaseGlobal > auth domain 推出的官方主机 > defaultGlobalBase。
+func (c *Client) globalChatBase(a *auth.Auth) string {
+	return c.globalBaseOverride(c.ChatBaseGlobal, a)
+}
+
+// globalBillingBase 生效的 global billing base（优先级同 globalChatBase）。
+func (c *Client) globalBillingBase(a *auth.Auth) string {
+	return c.globalBaseOverride(c.BillingBaseGlobal, a)
+}
+
+// globalBaseOverride 按「显式配置 > auth domain > 默认」解析 global 上游主机。
+func (*Client) globalBaseOverride(configured string, account *auth.Auth) string {
+	if configured != "" {
+		return configured
+	}
+
+	if account != nil {
+		if base := globalBaseForDomain(account.DomainValue()); base != "" {
+			return base
+		}
 	}
 
 	return defaultGlobalBase
@@ -1526,7 +1559,7 @@ func (*Client) checkinMeterPaths(a *auth.Auth) []string {
 // 若返回原始配置值，配成 host/v2 时这些端点会拼出 /v2/v2/...。
 func (c *Client) chatBase(a *auth.Auth) string {
 	if c.globalOn(a) {
-		return normalizeChatBase(c.globalChatBase())
+		return normalizeChatBase(c.globalChatBase(a))
 	}
 
 	return normalizeChatBase(c.ChatBaseCN)
@@ -1592,16 +1625,22 @@ func realmKey(realm string) string {
 
 func (c *Client) billingBase(a *auth.Auth) string {
 	if c.globalOn(a) {
-		return c.globalBillingBase()
+		return c.globalBillingBase(a)
 	}
 
 	return c.BillingBaseCN
 }
 
 // webBase 返回官网域（任务领奖类接口；未注入时回落默认）。
-// realm 感知：global 账号切国际站 workbuddy.ai，CN 用 workbuddy.cn。
+// realm 感知：global 账号按 auth.domain 选签发域（codebuddy.ai / workbuddy.ai），
+// CN 用 workbuddy.cn。
 func (c *Client) webBase(a *auth.Auth) string {
 	if c.globalOn(a) {
+		// web/任务端点不走 global.chat_base 覆盖（既有语义），只按签发域选主机。
+		if base := globalBaseForDomain(a.DomainValue()); base != "" {
+			return base
+		}
+
 		return defaultGlobalBase
 	}
 

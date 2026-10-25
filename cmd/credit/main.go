@@ -31,34 +31,57 @@ import (
 
 const billingBaseCN = "https://www.codebuddy.cn"
 
-// billingBaseGlobal 国际版计费域。global 账号打 CN 域会得到 401：
+// billingBaseGlobal 旧桌面端国际版计费域。global 账号打 CN 域会得到 401：
 // www.codebuddy.cn 不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
 const billingBaseGlobal = "https://www.workbuddy.ai"
+
+// billingBaseOfficial 官方国际站（CodeBuddy CLI externalDomain）计费域。
+// 国际域两套主机名并存，token 只在签发域可用，不能统一打 workbuddy.ai。
+const billingBaseOfficial = "https://www.codebuddy.ai"
 
 var (
 	errFetchUserResourceFailed = errors.New("fetchUserResource failed")
 	errParseUserResourceFailed = errors.New("parseUserResource failed")
 )
 
-// billingBaseFor 按账号 realm 选择计费域。
+// billingBaseFor 按账号 realm 与 domain 选择计费域。
 //
 // 判定口径与 internal/auth.Realm() 一致：显式 realm=global 或 domain 落在
-// workbuddy.ai 家族，都按国际版处理。cmd/credit 早先对所有账号硬编码 CN 域，
-// 导致 global 账号余额查询恒返回 401（面板显示的是池内缓存值，不是实时的）。
-func billingBaseFor(af *authFile) string {
-	if strings.EqualFold(strings.TrimSpace(af.realm()), "global") || isGlobalDomain(af.domain()) {
-		return billingBaseGlobal
-	}
+// global 域家族（workbuddy.ai / codebuddy.ai），都按国际版处理。两个国际域
+// 的 token 只在签发域可用，因此按 domain 细分主机；只有显式 realm=global
+// 且无域名抬头时才回落旧桌面端 workbuddy.ai。cmd/credit 早先对所有账号硬编码
+// CN 域，导致 global 账号余额查询恒返回 401（面板显示的是池内缓存值，不是实时的）。
+func billingBaseFor(file *authFile) string {
+	d := strings.ToLower(strings.TrimSpace(file.domain()))
 
-	return billingBaseCN
+	switch {
+	case isCodebuddyAIDomain(d):
+		return billingBaseOfficial
+	case isGlobalDomain(d) || strings.EqualFold(strings.TrimSpace(file.realm()), "global"):
+		return billingBaseGlobal
+	default:
+		return billingBaseCN
+	}
 }
 
-// isGlobalDomain 与 internal/auth 的判定同口径：workbuddy.ai 家族为国际版。
-// 不能因为显式 realm=cn 就短路 domain 判定——服务端 Realm() 同样是 domain 优先。
+// isCodebuddyAIDomain 报告 domain 是否落在官方国际站 codebuddy.ai 家族。
+func isCodebuddyAIDomain(domain string) bool {
+	return domain == "codebuddy.ai" || strings.HasSuffix(domain, ".codebuddy.ai")
+}
+
+// isGlobalDomain 与 internal/auth 的判定同口径：workbuddy.ai 与 codebuddy.ai
+// 家族为国际版。不能因为显式 realm=cn 就短路 domain 判定——服务端 Realm()
+// 同样是 domain 优先。
 func isGlobalDomain(domain string) bool {
 	d := strings.ToLower(strings.TrimSpace(domain))
 
-	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+	for _, root := range []string{"workbuddy.ai", "codebuddy.ai"} {
+		if d == root || strings.HasSuffix(d, "."+root) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // authFile 兼容 internal/auth 支持的两种磁盘形态：嵌套形（插件 OAuth）与
@@ -233,7 +256,7 @@ func newUserResourceRequest(authFile2 *authFile) (*http.Request, error) {
 	base := billingBaseFor(authFile2)
 	// global 域无 /v2 前缀（与 internal/upstream 的 billingMeterPaths 同口径）。
 	path := "/v2/billing/meter/get-user-resource"
-	if base == billingBaseGlobal {
+	if base != billingBaseCN {
 		path = "/billing/meter/get-user-resource"
 	}
 

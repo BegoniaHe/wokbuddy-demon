@@ -24,8 +24,10 @@ var errFetchAccountProfileFailed = errors.New("FetchAccountProfile failed")
 // FetchAccountProfile 拉取账号资料并返回最新昵称。uid 与凭证不一致时报错
 // （防串号）；业务/网络错误原样返回，调用方静默跳过即可。
 func (c *Client) FetchAccountProfile(account *auth.Auth) (string, error) {
+	base := c.webBase(account)
+
 	req, err := http.NewRequestWithContext(
-		context.Background(), http.MethodGet, c.webBase(account)+"/console/account", http.NoBody,
+		context.Background(), http.MethodGet, base+"/console/account", http.NoBody,
 	)
 	if err != nil {
 		return "", fmt.Errorf("FetchAccountProfile: %w", err)
@@ -34,8 +36,9 @@ func (c *Client) FetchAccountProfile(account *auth.Auth) (string, error) {
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Client-Platform", "web")
-	req.Header.Set("Origin", "https://www.workbuddy.cn")
-	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/account-settings")
+	// Origin/Referer 与请求主机同域（CN workbuddy.cn / global 签发域）。
+	req.Header.Set("Origin", base)
+	req.Header.Set("Referer", base+"/profile/account-settings")
 
 	if ua := c.userAgent(account); ua != "" {
 		req.Header.Set("User-Agent", ua)

@@ -540,7 +540,7 @@ func warmModelRates(ctx context.Context, client *upstream.Client, state7 *pool.P
 			}
 		}
 	}
-	// global：独立目录端点（workbuddy.ai），倍率按 "global" 域键存储。
+	// global：独立目录端点（按账号签发域选主机），倍率按 "global" 域键存储。
 	// 仅在其路由开关开启时预热（逃生门关锁时按 CN 处理，无需探测）。
 	if client.GlobalEnabled && ctx.Err() == nil {
 		warmGlobalModelRates(client, state7)
