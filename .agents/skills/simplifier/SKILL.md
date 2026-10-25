@@ -77,7 +77,7 @@ put one guard in the shared function, not a patch on the ticket's path only.
   look smaller. Those are contracts, not bloat.
 - Copy ponytail's plugin, hooks, intensity levels, or companion skills into
   `.opencode/`, `.codex/`, or this tree.
-- Route upstream cherry-picks or issue plans through this skill.
+- Route reference-fork audits or issue plans through this skill.
 
 ## Output
 

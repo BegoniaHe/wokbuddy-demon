@@ -94,6 +94,8 @@ def validate_event(event: Any, *, line_number: int | None = None) -> None:
                 raise LedgerError(f"{key} cannot contain empty values{where}")
     for value in event.get("integration_commits", []):
         normalize_sha(value)
+    if event.get("disposition") == "issue" and not event.get("issues"):
+        raise LedgerError(f"issue disposition requires at least one issue URL{where}")
 
 
 def load_events(path: Path) -> list[dict[str, Any]]:
