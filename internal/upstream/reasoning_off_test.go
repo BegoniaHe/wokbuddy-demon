@@ -90,9 +90,10 @@ func TestOffEffortNormalizeEarlyExit(t *testing.T) {
 	}
 }
 
-// TestExplicitThinkingTypeWinsOverOff 显式 thinking.type 优先：不改写 type；
-// effort 仍按关闭意图删除，不补默认档。
-func TestExplicitThinkingTypeWinsOverOff(t *testing.T) {
+// TestOffEffortOverridesExplicitThinkingType 关闭意图优先于显式 thinking.type：
+// 官方 deepseek 分支在非 enabled 时直接写 disabled，客户端同时带 enabled 也以
+// 关闭为准；effort 字段删除，不补默认档。
+func TestOffEffortOverridesExplicitThinkingType(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -101,12 +102,12 @@ func TestExplicitThinkingTypeWinsOverOff(t *testing.T) {
 		wantTyp string
 	}{
 		{
-			"显式 enabled 保留 type",
+			"显式 enabled 被关闭意图覆盖",
 			`{"model":"deepseek-v4-flash","thinking":{"type":"enabled"},"reasoning_effort":"off"}`,
-			"enabled",
+			"disabled",
 		},
 		{
-			"显式 disabled 保留 type",
+			"显式 disabled 保持 disabled",
 			`{"model":"deepseek-v4-flash","thinking":{"type":"disabled"},"reasoning_effort":"none"}`,
 			"disabled",
 		},
@@ -124,6 +125,30 @@ func TestExplicitThinkingTypeWinsOverOff(t *testing.T) {
 
 			assertEffortFieldsAbsent(t, out)
 		})
+	}
+}
+
+// TestExplicitThinkingTypeKeptWithoutOffEffort 没有关闭档位时，显式 type 语义不变。
+func TestExplicitThinkingTypeKeptWithoutOffEffort(t *testing.T) {
+	t.Parallel()
+
+	out := PrepareBodyOptWithEfforts(
+		[]byte(`{"model":"deepseek-v4-flash","thinking":{"type":"enabled"},"reasoning_effort":"high"}`),
+		false, nil,
+	)
+
+	typ, present := getThinkingType(t, out)
+	if !present || typ != "enabled" {
+		t.Fatalf("thinking.type=%q present=%v want enabled (out=%s)", typ, present, out)
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal: %v (out=%s)", err, out)
+	}
+
+	if got, _ := obj["reasoning_effort"].(string); got != "high" {
+		t.Fatalf("reasoning_effort=%q want high (out=%s)", got, out)
 	}
 }
 

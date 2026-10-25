@@ -186,6 +186,8 @@ func effortValueOff(obj map[string]any) bool {
 //
 // 核心逻辑（对齐官方客户端）：
 //   - 「开思考」必须 thinking.type=enabled + 有 effort 档位（Hermes #43 打回证据）。
+//   - 档位字段 off/none/disabled 表示关闭思考，优先于显式 thinking.type：即使
+//     请求同时带了 enabled，也按官方 deepseek 分支写 disabled 并删 effort。
 //   - 显式 thinking.type 非空 → 客户端显式控制：enabled 缺 effort 时补默认档；
 //     disabled 尊重并删 reasoning_effort（snake/camel 双字段）。
 //   - 无 thinking / type 空 / 已有 effort → 注入 enabled 并补默认档（已有 effort 不覆盖）。
@@ -195,6 +197,22 @@ func effortValueOff(obj map[string]any) bool {
 func injectThinking(obj map[string]any, defaultEffort string) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {
+		return
+	}
+
+	// 关闭意图必须先于显式 type 判定：官方 deepseek 分支在非 enabled 时直接写
+	// thinking={type:"disabled"} 并删除 reasoning_effort，客户端同时带 enabled
+	// 也以关闭为准；放到显式分支之后会让「关思考」被 enabled 覆盖。
+	if effortValueOff(obj) {
+		delete(obj, "reasoning_effort")
+		delete(obj, "reasoningEffort")
+
+		if table, ok := obj["thinking"].(map[string]any); ok {
+			table["type"] = "disabled"
+		} else {
+			obj["thinking"] = map[string]any{"type": "disabled"}
+		}
+
 		return
 	}
 
@@ -215,21 +233,6 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 		}
 
 		ensureDeepSeekEffort(obj, defaultEffort) // 显式 enabled 缺 effort → 补默认档
-
-		return
-	}
-	// 无 thinking（或 thinking 非法非对象值）或 thinking 对象 type 缺失/为空：
-	// 客户端用 reasoning_effort / reasoningEffort 的 off/none/disabled 表达关闭
-	// 思考 → 写 thinking.type=disabled 并删除两个 effort 字段，不能再注入 enabled。
-	if effortValueOff(obj) {
-		delete(obj, "reasoning_effort")
-		delete(obj, "reasoningEffort")
-
-		if !ok {
-			obj["thinking"] = map[string]any{"type": "disabled"}
-		} else {
-			table["type"] = "disabled"
-		}
 
 		return
 	}
