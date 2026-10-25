@@ -172,23 +172,8 @@ var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "
 //   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
 //   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
 func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
-	// 关闭思考的档位（off/none/disabled）不属于降级管线：模型声明支持关闭档时
-	// 保留（按支持列表的大小写）；否则删除两个 effort 字段，避免在模型缓存缺失/
-	// 非 DeepSeek 时被就近抬成最弱正档。支持档原样透传，不应被误删。
-	if effortValueOff(obj) {
-		if supported := supportedOffEffort(obj, efforts); supported != "" {
-			if _, ok := obj["reasoning_effort"]; ok {
-				obj["reasoning_effort"] = supported
-			} else {
-				obj["reasoningEffort"] = supported
-			}
-
-			return
-		}
-
-		delete(obj, "reasoning_effort")
-		delete(obj, "reasoningEffort")
-
+	// 关闭思考的档位（off/none/disabled）不属于降级管线，单独处理。
+	if normalizeOffEffort(obj, efforts) {
 		return
 	}
 
@@ -219,6 +204,30 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 		obj[key] = lowest
 		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
 	}
+}
+
+// normalizeOffEffort 处理关闭思考档位：模型 supportedEfforts 声明支持时按支持
+// 列表写法保留（支持档原样透传，不应被误删）；未声明支持则删除两个 effort 字段，
+// 避免在模型缓存缺失/非 DeepSeek 时被就近抬成最弱正档。返回是否命中关闭意图。
+func normalizeOffEffort(obj map[string]any, efforts map[string][]string) bool {
+	if !effortValueOff(obj) {
+		return false
+	}
+
+	if supported := supportedOffEffort(obj, efforts); supported != "" {
+		if _, ok := obj["reasoning_effort"]; ok {
+			obj["reasoning_effort"] = supported
+		} else {
+			obj["reasoningEffort"] = supported
+		}
+
+		return true
+	}
+
+	delete(obj, "reasoning_effort")
+	delete(obj, "reasoningEffort")
+
+	return true
 }
 
 // supportedOffEffort 返回模型支持列表里的关闭档位写法（off/none/disabled，
