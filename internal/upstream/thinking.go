@@ -162,6 +162,26 @@ func backfillAssistantReasoning(msg map[string]any) {
 	}
 }
 
+// effortValueOff 报告请求是否通过 reasoning_effort / reasoningEffort 的
+// off / none / disabled 表达「关闭思考」（大小写、空白不敏感）。
+// 官方客户端把 off 翻译成 undefined 后删除档位；这里用于在降级管线之前
+// 截住关闭意图，避免被抬成最弱正档。
+func effortValueOff(obj map[string]any) bool {
+	for _, key := range []string{"reasoning_effort", "reasoningEffort"} {
+		raw, ok := obj[key].(string)
+		if !ok {
+			continue
+		}
+
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "off", "none", "disabled":
+			return true
+		}
+	}
+
+	return false
+}
+
 // injectThinking 按 DeepSeek 思维链开关规则改写请求体。非 deepseek 零改动。
 //
 // 核心逻辑（对齐官方客户端）：
@@ -199,6 +219,20 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 		return
 	}
 	// 无 thinking（或 thinking 非法非对象值）或 thinking 对象 type 缺失/为空：
+	// 客户端用 reasoning_effort / reasoningEffort 的 off/none/disabled 表达关闭
+	// 思考 → 写 thinking.type=disabled 并删除两个 effort 字段，不能再注入 enabled。
+	if effortValueOff(obj) {
+		delete(obj, "reasoning_effort")
+		delete(obj, "reasoningEffort")
+
+		if !ok {
+			obj["thinking"] = map[string]any{"type": "disabled"}
+		} else {
+			table["type"] = "disabled"
+		}
+
+		return
+	}
 	// 注入 enabled（客户端 case "deepseek" 行为）。有 reasoning_effort 也走此分支
 	// （effort 保留给既有降级逻辑，开关照开）。
 	if !ok {

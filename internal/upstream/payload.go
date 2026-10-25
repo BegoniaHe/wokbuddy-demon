@@ -172,6 +172,15 @@ var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "
 //   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
 //   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
 func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
+	// 关闭思考的档位（off/none/disabled）不属于降级管线：删除两个 effort 字段
+	// 直接返回，避免在模型缓存缺失/非 DeepSeek 时被就近抬成最弱正档。
+	if effortValueOff(obj) {
+		delete(obj, "reasoning_effort")
+		delete(obj, "reasoningEffort")
+
+		return
+	}
+
 	if len(efforts) == 0 {
 		return
 	}
