@@ -1318,7 +1318,7 @@ type Client struct {
 	WebBaseCN string
 
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
-	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
+	// 空 = 按账号 domain 选签发域；未知/缺省回落 https://www.workbuddy.ai（D5）。
 	ChatBaseGlobal    string
 	BillingBaseGlobal string
 
