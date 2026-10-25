@@ -101,14 +101,47 @@ func TestAuthFileNestedWinsOverFlat(t *testing.T) {
 func TestBillingBaseDomainWinsOverExplicitCN(t *testing.T) {
 	t.Parallel()
 
-	raw := []byte(`{"auth":{"accessToken":"token","domain":"www.workbuddy.ai","realm":"cn"}}`)
+	for _, domain := range []string{"www.workbuddy.ai", "www.codebuddy.ai"} {
+		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + domain + `","realm":"cn"}}`)
 
-	var file authFile
-	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatal(err)
+		var file authFile
+		if err := json.Unmarshal(raw, &file); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := billingBaseFor(&file); got != billingBaseGlobal {
+			t.Errorf("domain=%s billingBaseFor=%q want %q", domain, got, billingBaseGlobal)
+		}
 	}
+}
 
-	if got := billingBaseFor(&file); got != billingBaseGlobal {
-		t.Errorf("billingBaseFor=%q want %q", got, billingBaseGlobal)
+// 官方 CLI 国际站的 codebuddy.ai 家族与 workbuddy.ai 同判 global；
+// codebuddy.cn 仍走 CN，避免余额查询打错计费域。
+func TestBillingBaseCodebuddyAIDomain(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		domain string
+		want   string
+	}{
+		{"www.codebuddy.ai", billingBaseGlobal},
+		{"codebuddy.ai", billingBaseGlobal},
+		{"sub.codebuddy.ai", billingBaseGlobal},
+		{"  WWW.CodeBuddy.AI  ", billingBaseGlobal},
+		{"www.codebuddy.cn", billingBaseCN},
+		{"codebuddy.cn", billingBaseCN},
+		{"", billingBaseCN},
+	}
+	for _, item := range cases {
+		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + item.domain + `"}}`)
+
+		var file authFile
+		if err := json.Unmarshal(raw, &file); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := billingBaseFor(&file); got != item.want {
+			t.Errorf("domain=%q billingBaseFor=%q want %q", item.domain, got, item.want)
+		}
 	}
 }

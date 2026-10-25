@@ -43,8 +43,9 @@ var (
 // billingBaseFor 按账号 realm 选择计费域。
 //
 // 判定口径与 internal/auth.Realm() 一致：显式 realm=global 或 domain 落在
-// workbuddy.ai 家族，都按国际版处理。cmd/credit 早先对所有账号硬编码 CN 域，
-// 导致 global 账号余额查询恒返回 401（面板显示的是池内缓存值，不是实时的）。
+// global 域家族（workbuddy.ai / codebuddy.ai），都按国际版处理。cmd/credit
+// 早先对所有账号硬编码 CN 域，导致 global 账号余额查询恒返回 401（面板显示的
+// 是池内缓存值，不是实时的）。
 func billingBaseFor(af *authFile) string {
 	if strings.EqualFold(strings.TrimSpace(af.realm()), "global") || isGlobalDomain(af.domain()) {
 		return billingBaseGlobal
@@ -53,12 +54,19 @@ func billingBaseFor(af *authFile) string {
 	return billingBaseCN
 }
 
-// isGlobalDomain 与 internal/auth 的判定同口径：workbuddy.ai 家族为国际版。
-// 不能因为显式 realm=cn 就短路 domain 判定——服务端 Realm() 同样是 domain 优先。
+// isGlobalDomain 与 internal/auth 的判定同口径：workbuddy.ai 与 codebuddy.ai
+// 家族为国际版。不能因为显式 realm=cn 就短路 domain 判定——服务端 Realm()
+// 同样是 domain 优先。
 func isGlobalDomain(domain string) bool {
 	d := strings.ToLower(strings.TrimSpace(domain))
 
-	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+	for _, root := range []string{"workbuddy.ai", "codebuddy.ai"} {
+		if d == root || strings.HasSuffix(d, "."+root) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // authFile 兼容 internal/auth 支持的两种磁盘形态：嵌套形（插件 OAuth）与
