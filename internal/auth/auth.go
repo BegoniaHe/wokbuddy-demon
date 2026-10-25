@@ -347,11 +347,17 @@ func jwtPayload(token string) ([]byte, bool) {
 	return payload, true
 }
 
-// isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
-// 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
+// isGlobalDomain 判定 domain 是否指向 global 上游域家族：workbuddy.ai 与
+// codebuddy.ai 的裸域及任意子域（大小写/空白不敏感）。codebuddy.cn 仍判 cn。
 func isGlobalDomain(d string) bool {
 	d = strings.ToLower(strings.TrimSpace(d))
-	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+
+	return isDomainOrSubdomain(d, "workbuddy.ai") || isDomainOrSubdomain(d, "codebuddy.ai")
+}
+
+// isDomainOrSubdomain 报告 d 是否等于 root 或为其子域。
+func isDomainOrSubdomain(d, root string) bool {
+	return d == root || strings.HasSuffix(d, "."+root)
 }
 
 // realmFromIssuer 从 access token 的 JWT iss claim 兜底推断账号域：iss host 命中
@@ -414,12 +420,26 @@ func Parse(raw []byte) (*Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 官方 CLI 写入 Unix 毫秒，本仓库内部统一按秒。阈值 1e11 落在当前秒/毫秒值之间：
+	// 两侧都不会误判。写回 SaveAtomic 仍按秒。
+	auth.ExpiresAt = normalizeExpiresAt(auth.ExpiresAt)
 
 	if strings.TrimSpace(auth.AccessToken) == "" {
 		return nil, errParseErrorMissingAccessToken
 	}
 
 	return &auth, nil
+}
+
+// normalizeExpiresAt 把毫秒级 Unix 时间戳归一为秒；秒值原样保留。
+func normalizeExpiresAt(expiresAt int64) int64 {
+	const millisThreshold = 1e11
+
+	if expiresAt > millisThreshold {
+		return expiresAt / 1000
+	}
+
+	return expiresAt
 }
 
 // parseAuthDoc 按磁盘形态选择解析器：存在 "auth" 键即嵌套形，否则扁平形。
