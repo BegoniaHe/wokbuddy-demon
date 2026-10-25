@@ -37,9 +37,9 @@ func TestDeepSeekOffEffortDisablesThinking(t *testing.T) {
 	}
 }
 
-// TestNonDeepSeekOffEffortOnlyDeletesEffort 非 DeepSeek 不注入 thinking，只清理档位；
-// 即使模型支持列表把 off 降成 low 也不能发生。
-func TestNonDeepSeekOffEffortOnlyDeletesEffort(t *testing.T) {
+// TestNonDeepSeekSupportedOffEffortPreserved 模型支持列表声明 off 时，关闭档位
+// 必须原样透传（按支持列表写法），不能被降级成最弱正档或被误删。
+func TestNonDeepSeekSupportedOffEffortPreserved(t *testing.T) {
 	t.Parallel()
 
 	efforts := map[string][]string{"glm-5.2": {"off", "low", "high"}}
@@ -47,9 +47,10 @@ func TestNonDeepSeekOffEffortOnlyDeletesEffort(t *testing.T) {
 	cases := []struct {
 		name string
 		body string
+		key  string
 	}{
-		{"snake", `{"model":"glm-5.2","reasoning_effort":"off","messages":[]}`},
-		{"camel 大小写空白", `{"model":"glm-5.2","reasoningEffort":" DISABLED ","messages":[]}`},
+		{"snake", `{"model":"glm-5.2","reasoning_effort":"off","messages":[]}`, "reasoning_effort"},
+		{"camel 大小写空白", `{"model":"glm-5.2","reasoningEffort":" DISABLED ","messages":[]}`, "reasoningEffort"},
 	}
 	for _, item := range cases {
 		t.Run(item.name, func(t *testing.T) {
@@ -61,8 +62,36 @@ func TestNonDeepSeekOffEffortOnlyDeletesEffort(t *testing.T) {
 				t.Errorf("非 DeepSeek 不得注入 thinking (out=%s)", out)
 			}
 
-			assertEffortFieldsAbsent(t, out)
+			var obj map[string]any
+			if err := json.Unmarshal(out, &obj); err != nil {
+				t.Fatalf("unmarshal: %v (out=%s)", err, out)
+			}
+
+			if got, _ := obj[item.key].(string); got != "off" {
+				t.Errorf("%s=%q want off (out=%s)", item.key, got, out)
+			}
 		})
+	}
+}
+
+// TestNonDeepSeekUnsupportedOffEffortDeleted 模型未声明支持关闭档时，删除 effort
+// 字段，避免被降级管线抬成最弱正档。
+func TestNonDeepSeekUnsupportedOffEffortDeleted(t *testing.T) {
+	t.Parallel()
+
+	efforts := map[string][]string{"glm-5.2": {"low", "high"}}
+
+	for _, body := range []string{
+		`{"model":"glm-5.2","reasoning_effort":"off","messages":[]}`,
+		`{"model":"glm-5.2","reasoningEffort":"none","messages":[]}`,
+	} {
+		out := PrepareBodyOptWithEfforts([]byte(body), false, efforts)
+
+		if _, present := getThinkingType(t, out); present {
+			t.Errorf("非 DeepSeek 不得注入 thinking (out=%s)", out)
+		}
+
+		assertEffortFieldsAbsent(t, out)
 	}
 }
 
