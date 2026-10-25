@@ -238,8 +238,9 @@ type Config struct {
 		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
 		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
 		Enabled bool `json:"enabled"`
-		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
-		// https://www.workbuddy.ai（internal/upstream.defaultGlobalBase）。
+		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 按账号 domain 回落
+		// 签发域（codebuddy.ai → www.codebuddy.ai；workbuddy.ai/缺省 →
+		// https://www.workbuddy.ai，见 internal/upstream.globalBaseForDomain）。
 		ChatBase    string `json:"chat_base"`
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
