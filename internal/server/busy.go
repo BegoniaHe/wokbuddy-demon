@@ -6,6 +6,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -13,7 +14,12 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-const busyMaxBodyBytes = 1 << 20
+const (
+	busyMaxBodyBytes = 1 << 20
+	// busyMaxModels 单次预检模型数上限：官方 renderer 每批最多 50 个。逐个模型
+	// 都要解析别名并扫描本地目录，无上限时一个 1MiB 请求可放大成十万次以上扫描。
+	busyMaxModels = 50
+)
 
 // busyHandler /v2/chat/busy 入口（鉴权由 withClientAuth 负责）。
 func (h *Handler) busyHandler(w http.ResponseWriter, r *http.Request) {
@@ -36,6 +42,11 @@ func (h *Handler) busyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if json.Unmarshal(body, &payload) != nil {
 		writeBusyResponse(w, http.StatusBadRequest, "invalid JSON body", nil)
+		return
+	}
+
+	if len(payload.Models) > busyMaxModels {
+		writeBusyResponse(w, http.StatusBadRequest, fmt.Sprintf("too many models (max %d)", busyMaxModels), nil)
 		return
 	}
 

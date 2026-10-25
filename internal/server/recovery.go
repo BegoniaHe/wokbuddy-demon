@@ -25,8 +25,6 @@ const maxPanicStack = 64 << 10
 
 // withRecovery 包裹单个 handler。必须放在鉴权/限流中间件最外层：否则内层
 // 中间件的 defer（如命名密钥 release）不会执行。
-//
-//nolint:gocognit // panic 恢复/二次 panic/日志分流线性展开。
 func (*Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		recoveryWriter2 := &recoveryWriter{ResponseWriter: w}
@@ -42,10 +40,7 @@ func (*Handler) withRecovery(next http.HandlerFunc) http.HandlerFunc {
 				panic(rec)
 			}
 
-			stack := debug.Stack()
-			if len(stack) > maxPanicStack {
-				stack = stack[:maxPanicStack]
-			}
+			stack := logfmt.Truncate(string(debug.Stack()), maxPanicStack)
 
 			log.Printf("ERR: [server] panic recovered method=%q path=%q type=%T\n%s",
 				logfmt.Truncate(r.Method, 16), logfmt.Truncate(r.URL.Path, 256), rec, stack)

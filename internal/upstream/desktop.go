@@ -900,6 +900,8 @@ func debugChatRead(chunk []byte) {
 		return
 	}
 
+	// 不能用 logfmt.Truncate：它会 TrimSpace，而 SSE 分帧的关键信息恰恰是首尾
+	// 空白（"\n\n" 分帧）；%q 已把非法 UTF-8 转成 \xNN 转义，调试输出无需 rune 边界。
 	dbg := string(chunk)
 	if len(dbg) > maxDebugPayloadLen {
 		dbg = dbg[:maxDebugPayloadLen]

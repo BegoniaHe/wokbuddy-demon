@@ -147,14 +147,10 @@ func (s *Scheduler) drawAllLottery(account5 *auth.Auth, chances int) {
 // maxStreakPayloadLen 奖品载荷日志上限。
 const maxStreakPayloadLen = 220
 
-// compactJSON 裁剪奖品载荷（日志单行可读）。
+// compactJSON 裁剪奖品载荷（日志单行可读）。截断点回退到 UTF-8 rune 边界：
+// 奖品名是中文，按字节切会打出半个字符。
 func compactJSON(raw json.RawMessage) string {
-	s := string(raw)
-	if len(s) > maxStreakPayloadLen {
-		return s[:maxStreakPayloadLen] + "…"
-	}
-
-	return s
+	return logfmt.TruncateEllipsis(string(raw), maxStreakPayloadLen)
 }
 
 // makeupRecent 本月漏签由近及远补签，受补签卡余额限制；无卡/无漏签/查询失败静默。

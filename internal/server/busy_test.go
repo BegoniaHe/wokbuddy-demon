@@ -81,6 +81,47 @@ func TestBusyEmptyAndMalformed(t *testing.T) {
 	}
 }
 
+// TestBusyModelLimit 单次预检模型数超过官方批量上限时整体 400：
+// 逐个模型都要解析别名并扫描目录，无上限会被大列表放大成 CPU/内存消耗。
+func TestBusyModelLimit(t *testing.T) {
+	t.Parallel()
+
+	handler, _ := newBusyTestHandler(t)
+
+	models := make([]string, busyMaxModels)
+	for i := range models {
+		models[i] = "glm-5.2"
+	}
+
+	body, err := json.Marshal(map[string]any{"models": models})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rec := postBusy(t, handler, string(body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("at limit: code=%d body=%s want 200", rec.Code, rec.Body)
+	}
+
+	if out := decodeBusy(t, rec); len(out.Data) != busyMaxModels {
+		t.Fatalf("data len=%d want %d", len(out.Data), busyMaxModels)
+	}
+
+	over := make([]string, 0, busyMaxModels+1)
+	over = append(over, models...)
+	over = append(over, "glm-5.2")
+
+	body, err = json.Marshal(map[string]any{"models": over})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	rec = postBusy(t, handler, string(body))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("over limit: code=%d body=%s want 400", rec.Code, rec.Body)
+	}
+}
+
 // TestBusyUsesPoolState idle / busy / congested / unavailable / unknown 映射。
 func TestBusyUsesPoolState(t *testing.T) {
 	t.Parallel()
