@@ -68,6 +68,12 @@ func sealField(t *testing.T, secret, plaintext string) map[string]any {
 func writeAuthFile(t *testing.T, secret, domain string, encrypted bool) string {
 	t.Helper()
 
+	return writeAuthFileWithExpiry(t, secret, domain, encrypted, 1893456000)
+}
+
+func writeAuthFileWithExpiry(t *testing.T, secret, domain string, encrypted bool, expiresAt int64) string {
+	t.Helper()
+
 	dir := filepath.Join(t.TempDir(), "Data", "Public", "auth")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -81,7 +87,7 @@ func writeAuthFile(t *testing.T, secret, domain string, encrypted bool) string {
 	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken": iface, "refreshToken": iface2,
-			"expiresAt": 1893456000, "domain": domain,
+			"expiresAt": expiresAt, "domain": domain,
 		},
 		"account": map[string]any{"uid": "u1", "enterpriseId": "e1", "nickname": "nick"},
 	}
@@ -159,6 +165,32 @@ func TestImportPlaintextCredential(t *testing.T) {
 
 	if account.AccessToken != "access-token" || account.IsGlobal() {
 		t.Fatalf("auth=%+v", account)
+	}
+}
+
+// TestExpiresAtMillisNormalized 官方客户端把 expiresAt 写成 Unix 毫秒；
+// 导入构造的 Auth 与扫描元数据都必须归一为秒，否则 NeedsRefresh 永假。
+func TestExpiresAtMillisNormalized(t *testing.T) {
+	t.Parallel()
+
+	path := writeAuthFileWithExpiry(t, "", "", false, 1893456000000)
+
+	account, err := ImportFile(path, "")
+	if err != nil {
+		t.Fatalf("import plaintext: %v", err)
+	}
+
+	if account.ExpiresAt != 1893456000 {
+		t.Errorf("import expiresAt=%d want 1893456000（毫秒归一为秒）", account.ExpiresAt)
+	}
+
+	meta, err := InspectFile(path)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+
+	if meta.ExpiresAt != 1893456000 {
+		t.Errorf("inspect expiresAt=%d want 1893456000（毫秒归一为秒）", meta.ExpiresAt)
 	}
 }
 

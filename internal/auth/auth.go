@@ -422,7 +422,7 @@ func Parse(raw []byte) (*Auth, error) {
 	}
 	// 官方 CLI 写入 Unix 毫秒，本仓库内部统一按秒。阈值 1e11 落在当前秒/毫秒值之间：
 	// 两侧都不会误判。写回 SaveAtomic 仍按秒。
-	auth.ExpiresAt = normalizeExpiresAt(auth.ExpiresAt)
+	auth.ExpiresAt = NormalizeExpiresAt(auth.ExpiresAt)
 
 	if strings.TrimSpace(auth.AccessToken) == "" {
 		return nil, errParseErrorMissingAccessToken
@@ -431,8 +431,10 @@ func Parse(raw []byte) (*Auth, error) {
 	return &auth, nil
 }
 
-// normalizeExpiresAt 把毫秒级 Unix 时间戳归一为秒；秒值原样保留。
-func normalizeExpiresAt(expiresAt int64) int64 {
+// NormalizeExpiresAt 把毫秒级 Unix 时间戳归一为秒；秒值原样保留。
+// 官方 CodeBuddy CLI 与工作台客户端都把 expiresAt 写成毫秒；所有从官方
+// 凭据构造 Auth 的路径都必须经过这里，避免把毫秒当成极远未来而永不刷新。
+func NormalizeExpiresAt(expiresAt int64) int64 {
 	const millisThreshold = 1e11
 
 	if expiresAt > millisThreshold {
