@@ -16,9 +16,11 @@ import (
 	"unicode/utf8"
 )
 
-// Truncate 截断字符串到 n 字节上限（先 TrimSpace，与旧 upstream/内部实现口径
-// 一致），切点落在多字节字符中间时回退到 UTF-8 rune 边界——错误 body 多为中文
-// （"将在 … 重置"），按字节切会出半截序列乱码。短于 n 原样返回；n<=0 返回空串。
+// Truncate 先 TrimSpace 再截断到 n 字节（与旧 upstream/内部实现口径一致），
+// 切点落在多字节字符中间时回退到 UTF-8 rune 边界——错误 body 多为中文
+// （"将在 … 重置"），按字节切会出半截序列乱码。未超限时返回 trim 后的原串；
+// 超限时在 n 字节内回退（截断点前的空白保留，尾部空白不保证去除）；
+// n<=0 返回空串。需要保留首尾空白（如 SSE 分帧）不要用它。
 func Truncate(str2 string, n int) string {
 	if n <= 0 {
 		return ""
@@ -26,7 +28,7 @@ func Truncate(str2 string, n int) string {
 
 	str2 = strings.TrimSpace(str2)
 	if len(str2) > n {
-		// s[n] 是切点后的首字节：是 rune 的后续字节（continuation）说明切点落在
+		// str2[n] 是切点后的首字节：是 rune 的后续字节（continuation）说明切点落在
 		// 多字节字符中间，逐字节回退到 rune 边界（该字符整个让出）。
 		for n > 0 && !utf8.RuneStart(str2[n]) {
 			n--
@@ -36,6 +38,21 @@ func Truncate(str2 string, n int) string {
 	}
 
 	return str2
+}
+
+// TruncateEllipsis 与 Truncate 同口径，超限时追加 "…" 标明截断。
+// 是否超限按去除首尾空白后的长度判断——只裁掉空白不算截断，不应多打省略号。
+func TruncateEllipsis(str2 string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+
+	str2 = strings.TrimSpace(str2)
+	if len(str2) <= n {
+		return str2
+	}
+
+	return Truncate(str2, n) + "…"
 }
 
 // UID8 返回 uid 的前 8 位；空 uid 返回 "-"（与 chat 流水行同口径）。

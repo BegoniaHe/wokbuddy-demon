@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect the pending upstream interval without changing the repository."""
+"""Inspect the pending reference-fork audit interval without changing the repository."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def read_sync_config(path: Path) -> tuple[str, str]:
     marker = re.search(r"(?m)^\s+commit:\s*([0-9a-f]{40})\s*$", text)
     branch = re.search(r"(?m)^\s+branch:\s*([^\s#]+)\s*$", text)
     if not marker or not SHA_RE.fullmatch(marker.group(1)):
-        raise LedgerError(f"could not find a full sync marker in {path}")
+        raise LedgerError(f"could not find a full audit marker in {path}")
     if not branch:
         raise LedgerError(f"could not find upstream branch in {path}")
     return marker.group(1), branch.group(1)
@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             capture_output=True,
         )
         if ancestor.returncode:
-            raise LedgerError(f"sync marker {marker} is not an ancestor of {ref}")
+            raise LedgerError(f"audit marker {marker} is not an ancestor of {ref}")
         events = load_events(args.repo / args.decisions_file)
         decisions = latest_by_commit(events)
         commits = pending_commits(args.repo, marker, ref)

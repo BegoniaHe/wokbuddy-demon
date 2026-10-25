@@ -58,6 +58,7 @@ var (
 	errNormalizeUpstreamKeepaliveFailed = errors.New("normalizeUpstreamKeepalive failed")
 	errNormalizeServerDurationFailed    = errors.New("normalizeServerDuration failed")
 	errNormalizeCheckinDelayFailed      = errors.New("normalizeCheckinDelay failed")
+	errNormalizeKeepaliveWindowFailed   = errors.New("normalizeKeepaliveWindow failed")
 	errTimingJitterTooLarge             = errors.New("schedule.slot_jitter 不能超过 59m")
 	errTimingSigmaRange                 = errors.New("schedule.account_pacing_sigma 超出 [0,1.5]")
 	errTimingPacingFloorAboveCeiling    = errors.New("schedule.account_pacing_floor 不能大于 account_pacing_ceiling")
@@ -158,8 +159,12 @@ type Config struct {
 		TravelHours    []int `json:"travel_hours"`    // [9,21]
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
-		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 CST，按 CST 排程）
-		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
+		// KeepaliveRefreshWindow 定时保活的临期窗口（Go duration，默认 "24h"）：
+		// 排程到点只刷新 expiresAt 进入 now+window 的账号；空值回落 24h，
+		// 非法值或 <=0 启动报错。手动「全部保活」不受此窗口限制。
+		KeepaliveRefreshWindow string `json:"keepalive_refresh_window"`
+		BlackcatHours          []int  `json:"blackcat_hours"` // [23] 夜猫子窗口（23:00–08:00 CST，按 CST 排程）
+		GrowthHours            []int  `json:"growth_hours"`   // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -233,13 +238,15 @@ type Config struct {
 
 	Global struct {
 		// Enabled global realm 路由开关。缺省 true：Realm() 正常把 realm=global/
-		// domain=workbuddy.ai 的账号判为 global 并路由 global base/路径。
+		// domain 属 workbuddy.ai / codebuddy.ai 的账号判为 global 并路由 global
+		// base/路径。
 		// 显式 "enabled": false 关闭（逃生门，纯 CN 锁定：即便 auth 写了 realm=global
 		// 也不路由，auth.Realm() 双保险的第一道闸）。纯 CN 部署行为不变：CN 账号
 		// 恒判 cn，global base 只在 realm=global 的账号上被使用。
 		Enabled bool `json:"enabled"`
-		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 回落内置默认
-		// https://www.workbuddy.ai（internal/upstream.defaultGlobalBase）。
+		// ChatBase / BillingBase 国际版上游 base 覆盖；空 = 按账号 domain 回落
+		// 签发域（codebuddy.ai → www.codebuddy.ai；workbuddy.ai/缺省 →
+		// https://www.workbuddy.ai，见 internal/upstream.globalBaseForDomain）。
 		ChatBase    string `json:"chat_base"`
 		BillingBase string `json:"billing_base"`
 	} `json:"global"`
@@ -453,6 +460,8 @@ type Config struct {
 	ExpiringSoonDur   time.Duration `json:"-"`
 	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
 	CheckinAccountDelayDur time.Duration `json:"-"`
+	// KeepaliveRefreshWindowDur 解析后的定时保活临期窗口（默认 24h）。
+	KeepaliveRefreshWindowDur time.Duration `json:"-"`
 	// Timing 解析后的时序整形参数（issue #220）。
 	Timing scheduler.Timing `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
@@ -537,6 +546,7 @@ func applyScheduleDefaults(config2 *Config) {
 	config2.Schedule.TravelHours = []int{9, 21}
 	config2.Schedule.ActivityHours = []int{10}
 	config2.Schedule.KeepaliveHours = []int{22}
+	config2.Schedule.KeepaliveRefreshWindow = "24h"
 	config2.Schedule.BlackcatHours = []int{23}
 	config2.Schedule.GrowthHours = []int{1}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
@@ -2101,7 +2111,40 @@ func (c *Config) normalizeSchedule() error {
 	c.normalizeBalanceRefresh()
 	c.normalizeTaskSweep()
 
+	if err := c.normalizeKeepaliveWindow(); err != nil {
+		return err
+	}
+
 	return c.validateScheduleHours()
+}
+
+// normalizeKeepaliveWindow 解析定时保活临期窗口：空值回落 24h；非法或 <=0
+// fail fast（拼错时退化成全量刷新会放大 refresh token 轮换与风控面）。
+func (c *Config) normalizeKeepaliveWindow() error {
+	raw := strings.TrimSpace(c.Schedule.KeepaliveRefreshWindow)
+	if raw == "" {
+		raw = "24h"
+	}
+
+	window, err := time.ParseDuration(raw)
+	if err != nil {
+		return fmt.Errorf(
+			"schedule.keepalive_refresh_window: %q 不是合法时长: %w",
+			c.Schedule.KeepaliveRefreshWindow, err,
+		)
+	}
+
+	if window <= 0 {
+		return fmt.Errorf(
+			"schedule.keepalive_refresh_window: 必须大于 0，当前 %q: %w",
+			c.Schedule.KeepaliveRefreshWindow, errNormalizeKeepaliveWindowFailed,
+		)
+	}
+
+	c.Schedule.KeepaliveRefreshWindow = raw
+	c.KeepaliveRefreshWindowDur = window
+
+	return nil
 }
 
 // normalizeListenAndHours 补齐 listen 前缀与六个排程小时数组的缺省值。

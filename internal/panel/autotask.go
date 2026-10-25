@@ -43,6 +43,7 @@ var (
 	errStatic             = errors.New("任务不存在")
 	errRunModelChatFailed = errors.New("runModelChat failed")
 	errStatic2            = errors.New("专家市场列表为空")
+	errExpertAllFailed    = errors.New("专家召唤+使用全部失败")
 )
 
 // autoAction 一个可自动化的任务动作。
@@ -878,12 +879,9 @@ func taskProgressText(t *upstream.Task) string {
 }
 
 // truncateStr 截断错误文本（避免把上游长响应原样透给前端）。
+// 按字节上限截断但回退到 UTF-8 rune 边界，避免中文错误文案被切成半个字符。
 func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-
-	return s[:n] + "…"
+	return logfmt.TruncateEllipsis(s, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,6 +1292,27 @@ func runExpertTeamUse(p *Panel, a *auth.Auth) (string, error) {
 	return runExpertBatch(p, a, "team", 3)
 }
 
+// runExpertOnce 完成一位专家的召唤链、真实 chat 与使用上报。
+func runExpertOnce(panelRef *Panel, account *auth.Auth, marketExpert *upstream.MarketExpert) error {
+	summonEvents := upstream.DesktopExpertSummonSequence(marketExpert)
+	if err := panelRef.cfg.Upstream.ReportDesktopEvent(account, summonEvents...); err != nil {
+		return fmt.Errorf("上报召唤链: %w", err)
+	}
+
+	conv, req, err := panelRef.cfg.Upstream.DesktopChatWithExpert(account, marketExpert.ExpertID)
+	if err != nil {
+		return fmt.Errorf("专家真实对话: %w", err)
+	}
+
+	events := append(upstream.DesktopChatSequence(conv, req, session.NewUUIDv7Hex(), "fast-model", "fast-model"),
+		upstream.DesktopExpertActualUseEvent(marketExpert, conv, req))
+	if err := panelRef.cfg.Upstream.ReportDesktopEvent(account, events...); err != nil {
+		return fmt.Errorf("上报使用链: %w", err)
+	}
+
+	return nil
+}
+
 // runExpertBatch 专家召唤+使用的公共实现。失败逐个继续，返回汇总信息。
 func runExpertBatch(panel8 *Panel, account15 *auth.Auth, expertType string, count int) (string, error) {
 	experts, err := panel8.cfg.Upstream.MarketExpertList(account15, expertType)
@@ -1306,40 +1325,42 @@ func runExpertBatch(panel8 *Panel, account15 *auth.Auth, expertType string, coun
 	}
 
 	ok, fail := 0, 0
+
+	var lastErr error
+
 	for numVal, marketExpert := range experts {
 		if ok >= count {
 			break
 		}
-		// 召唤链（web_element_click + summon_click + summoned）。
-		summonEvents := upstream.DesktopExpertSummonSequence(&marketExpert)
-		if err := panel8.cfg.Upstream.ReportDesktopEvent(account15, summonEvents...); err != nil {
+
+		if err := runExpertOnce(panel8, account15, &marketExpert); err != nil {
 			fail++
-			continue
-		}
-		// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
-		conv, req, cerr := panel8.cfg.Upstream.DesktopChatWithExpert(account15, marketExpert.ExpertID)
-		if cerr != nil {
-			fail++
-			continue
-		}
-		// 使用事件（JOIN 服务端 requestId）+ chat 链。
-		events := append(upstream.DesktopChatSequence(conv, req, session.NewUUIDv7Hex(), "fast-model", "fast-model"),
-			upstream.DesktopExpertActualUseEvent(&marketExpert, conv, req))
-		if err := panel8.cfg.Upstream.ReportDesktopEvent(account15, events...); err != nil {
-			fail++
+
+			lastErr = err
+
 			continue
 		}
 
 		ok++
 
-		if numVal < len(experts)-1 {
+		// 已达目标时下一轮会 break，不应再为已完成的批量多等一个间隔。
+		if ok < count && numVal < len(experts)-1 {
 			time.Sleep(expertSummonGap)
 		}
 	}
 
-	_ = fail
+	// 一次都没成功时不能返回 nil：调用方（autoRunAction）会把 nil 当 done，
+	// 任务中心就会把「0 位完成」展示成成功。
+	if ok == 0 {
+		return "", fmt.Errorf("%w（%d 次尝试）: %w", errExpertAllFailed, fail, lastErr)
+	}
 
-	return fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType), nil
+	msg := fmt.Sprintf("已对 %d 位真实专家完成召唤+使用链（类型 %s）", ok, expertType)
+	if fail > 0 {
+		msg += fmt.Sprintf("，%d 次尝试失败", fail)
+	}
+
+	return msg, nil
 }
 
 // ---------------------------------------------------------------------------

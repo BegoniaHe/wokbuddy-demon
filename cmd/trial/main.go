@@ -28,6 +28,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -174,10 +175,6 @@ func trialForFile(str string, client *upstream.Client) trialRow {
 	return r
 }
 
-func trunc(s string, n int) string {
-	if len(s) > n {
-		return s[:n]
-	}
-
-	return s
+func trunc(value string, maxLen int) string {
+	return logfmt.Truncate(value, maxLen)
 }

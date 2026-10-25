@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -18,12 +17,14 @@ func TestClaimRewardWebEndpoint(t *testing.T) {
 
 	var (
 		gotPath, gotMethod, gotBody string
-		gotPlatform, gotReferer     string
+		gotPlatform, gotOrigin      string
+		gotReferer                  string
 	)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath, gotMethod = r.URL.Path, r.Method
 		gotPlatform = r.Header.Get("X-Client-Platform")
+		gotOrigin = r.Header.Get("Origin")
 		gotReferer = r.Header.Get("Referer")
 		buf := make([]byte, 64)
 		n, _ := r.Body.Read(buf)
@@ -61,8 +62,12 @@ func TestClaimRewardWebEndpoint(t *testing.T) {
 		t.Errorf("x-client-platform=%q want web", gotPlatform)
 	}
 
-	if !strings.Contains(gotReferer, "workbuddy.cn") {
-		t.Errorf("Referer=%q 应指向 workbuddy.cn", gotReferer)
+	if gotOrigin != srv.URL {
+		t.Errorf("Origin=%q want %q（必须与请求主机同域）", gotOrigin, srv.URL)
+	}
+
+	if gotReferer != srv.URL+"/profile/growth-center" {
+		t.Errorf("Referer=%q want %q", gotReferer, srv.URL+"/profile/growth-center")
 	}
 }
 

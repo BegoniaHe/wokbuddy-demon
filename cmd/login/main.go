@@ -37,6 +37,7 @@ import (
 
 	auth2 "github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
 )
 
 // 上游常量：CN → www.workbuddy.cn（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
@@ -197,6 +198,15 @@ func doJSON(
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
+
+	// 先解信封：业务错误可能随任意 HTTP 状态返回（含 4xx），code 比状态码更权威。
+	var env apiEnvelope
+
+	parseErr := json.Unmarshal(raw, &env)
+	if parseErr == nil && env.Code != 0 {
+		return nil, resp.StatusCode, &logincode.Error{Code: env.Code, Msg: env.Msg, Status: resp.StatusCode}
+	}
+
 	if resp.StatusCode >= http.StatusBadRequest {
 		return nil, resp.StatusCode, fmt.Errorf("http_error: upstream %d: %w", resp.StatusCode, errDoJSONFailed)
 	}
@@ -207,13 +217,8 @@ func doJSON(
 		)
 	}
 
-	var env apiEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", err)
-	}
-
-	if env.Code != 0 {
-		return nil, resp.StatusCode, fmt.Errorf("code=%d msg=%s: %w", env.Code, env.Msg, errDoJSONFailed)
+	if parseErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("parse failed: %w", parseErr)
 	}
 
 	return env.Data, resp.StatusCode, nil
@@ -417,8 +422,12 @@ func runPoll(
 	if err != nil {
 		fatalf("%v", err)
 	}
-	// login/account 拿 uid/nickname（带 Bearer）
-	acct := pollAccount(usedBase, loginState2.State, tok.AccessToken, headers, client)
+	// login/account 拿 uid/nickname（带 Bearer）：终态立即失败并显示上游原因，
+	// 12151 提示仍在等待账号信息，其他错误保持忽略（与旧行为一致）。
+	acct, err := pollAccount(usedBase, loginState2.State, tok.AccessToken, headers, client)
+	if err != nil {
+		failOnPollAccountError(err)
+	}
 
 	oraw, oerr := json.Marshal(buildLoginOutput(tok, realm, acct))
 	if oerr != nil {
@@ -427,6 +436,23 @@ func runPoll(
 
 	fmt.Fprintln(out, string(oraw))
 	os.Remove(statePath)
+}
+
+// failOnPollAccountError 处理 login/account 失败：12151 提示 pending 后退出，
+// 许可终态立即 fatal；其他错误保持忽略（与旧行为一致）。
+func failOnPollAccountError(err error) {
+	codeErr, ok := errors.AsType[*logincode.Error](err)
+	if !ok {
+		return
+	}
+
+	if logincode.IsPending(codeErr.Code) {
+		fatalf("登录账号信息尚未就绪（code=%d），请稍后重新运行 login poll", codeErr.Code)
+	}
+
+	if logincode.IsTerminal(codeErr.Code) {
+		fatalf("%v", codeErr)
+	}
 }
 
 // pollTokenWithFallback 按 origin 候选拉取 token，仅在传输/网关错误时切换；
@@ -443,6 +469,11 @@ func pollTokenWithFallback(
 		}
 
 		lastErr = err
+
+		// 许可终态与 origin 无关：换域只会重复同一条失败，不再回落。
+		if codeErr, ok := errors.AsType[*logincode.Error](err); ok && logincode.IsTerminal(codeErr.Code) {
+			break
+		}
 
 		if !loginReplayableStatus(status) {
 			break
@@ -508,11 +539,7 @@ func pollTokenOnce(
 		client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil,
 	)
 	if errTok != nil {
-		if status == 0 || status >= 500 {
-			return tokenBundle{}, status, fmt.Errorf("token endpoint error: %w", errTok)
-		}
-
-		return tokenBundle{}, status, fmt.Errorf("%w: %w", errLoginPending, errTok)
+		return tokenBundle{}, status, wrapTokenPollError(status, errTok)
 	}
 
 	var tok tokenBundle
@@ -523,10 +550,31 @@ func pollTokenOnce(
 	return tok, status, nil
 }
 
-// pollAccount 带 Bearer 拉取 login/account；失败时返回零值（与旧行为一致，不中断输出）。
+// wrapTokenPollError 按业务码与 HTTP 状态归类 token 轮询错误：pending 包装为
+// errLoginPending，许可终态原样返回，其余沿用传输/HTTP 语义。
+func wrapTokenPollError(status int, err error) error {
+	if codeErr, ok := errors.AsType[*logincode.Error](err); ok {
+		if logincode.IsPending(codeErr.Code) {
+			return fmt.Errorf("%w: %w", errLoginPending, err)
+		}
+
+		if logincode.IsTerminal(codeErr.Code) {
+			return err
+		}
+	}
+
+	if status == 0 || status >= 500 {
+		return fmt.Errorf("token endpoint error: %w", err)
+	}
+
+	return fmt.Errorf("%w: %w", errLoginPending, err)
+}
+
+// pollAccount 带 Bearer 拉取 login/account；失败时返回零值与错误（调用方决定
+// pending / 终态 / 忽略）。
 func pollAccount(
 	base, state, accessToken string, headers func(*http.Request), client *http.Client,
-) accountInfo {
+) (accountInfo, error) {
 	var acct accountInfo
 
 	acctHeaders := func(r *http.Request) {
@@ -537,17 +585,23 @@ func pollAccount(
 		r.Header.Set("X-No-Enterprise-Id", "true")
 		r.Header.Set("X-No-Department-Info", "true")
 	}
-	if acctRaw, _, errAcct := doJSON(
+
+	acctRaw, _, errAcct := doJSON(
 		client,
 		http.MethodGet,
 		base+"/v2/plugin/login/account?state="+state,
 		acctHeaders,
 		nil,
-	); errAcct == nil {
-		_ = json.Unmarshal(acctRaw, &acct)
+	)
+	if errAcct != nil {
+		return accountInfo{}, errAcct
 	}
 
-	return acct
+	if err := json.Unmarshal(acctRaw, &acct); err != nil {
+		return accountInfo{}, fmt.Errorf("parse account: %w", err)
+	}
+
+	return acct, nil
 }
 
 // buildLoginOutput 组装 poll 输出的完整 JSON（login.sh 据此落盘 auth 文件）。

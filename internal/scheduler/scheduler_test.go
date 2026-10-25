@@ -427,6 +427,113 @@ func TestRunKeepaliveRefreshesTokens(t *testing.T) {
 	}
 }
 
+// TestKeepaliveSchedulerOnlyRefreshesExpiring 定时保活只刷新即将到期/已过期/无到期
+// 时间的账号；窗口外的健康 token 不轮换。
+func TestKeepaliveSchedulerOnlyRefreshesExpiring(t *testing.T) {
+	t.Parallel()
+
+	fakeUpstream2 := &fakeUpstream{}
+
+	srv := fakeUpstream2.server()
+	defer srv.Close()
+
+	state := pool.New("")
+	now := time.Now()
+	state.Add(&auth.Auth{UID: "outside", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(48 * time.Hour).Unix()})
+	state.Add(&auth.Auth{UID: "inside", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(time.Hour).Unix()})
+	state.Add(&auth.Auth{UID: "no-expiry", AccessToken: "at", RefreshToken: "rt"})
+	state.Add(&auth.Auth{UID: "expired", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(-time.Hour).Unix()})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(&Config{Pool: state, Upstream: up, KeepaliveRefreshWindow: 24 * time.Hour})
+
+	if !s.runTaskSync(t.Context(), TaskKeepalive, TriggerScheduler) {
+		t.Fatal("scheduled keepalive should run")
+	}
+
+	if got := fakeUpstream2.refreshCalls.Load(); got != 3 {
+		t.Errorf("refresh calls=%d want 3（窗口内 + 无 expiry + 已过期）", got)
+	}
+
+	for _, uid := range []string{"outside"} {
+		if account := state.AuthByUID(uid); account != nil && account.AccessToken != "at" {
+			t.Errorf("%s 窗口外不应刷新，token=%q", uid, account.AccessToken)
+		}
+	}
+
+	for _, uid := range []string{"inside", "no-expiry", "expired"} {
+		if account := state.AuthByUID(uid); account != nil && account.AccessToken != "new" {
+			t.Errorf("%s 应被刷新，token=%q", uid, account.AccessToken)
+		}
+	}
+}
+
+// TestKeepaliveManualRefreshesAll 手动「全部保活」不受临期窗口限制。
+func TestKeepaliveManualRefreshesAll(t *testing.T) {
+	t.Parallel()
+
+	fakeUpstream2 := &fakeUpstream{}
+
+	srv := fakeUpstream2.server()
+	defer srv.Close()
+
+	state := pool.New("")
+	now := time.Now()
+	state.Add(&auth.Auth{UID: "outside", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(48 * time.Hour).Unix()})
+	state.Add(&auth.Auth{UID: "inside", AccessToken: "at", RefreshToken: "rt", ExpiresAt: now.Add(time.Hour).Unix()})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(&Config{Pool: state, Upstream: up, KeepaliveRefreshWindow: 24 * time.Hour})
+	s.RunKeepaliveNow()
+
+	if got := fakeUpstream2.refreshCalls.Load(); got != 2 {
+		t.Errorf("manual refresh calls=%d want 2（全量）", got)
+	}
+}
+
+// TestKeepaliveRefreshWindowHotUpdate 窗口热更新后下一轮定时保活立即生效。
+func TestKeepaliveRefreshWindowHotUpdate(t *testing.T) {
+	t.Parallel()
+
+	fakeUpstream2 := &fakeUpstream{}
+
+	srv := fakeUpstream2.server()
+	defer srv.Close()
+
+	state := pool.New("")
+	state.Add(&auth.Auth{
+		UID: "u1", AccessToken: "at", RefreshToken: "rt",
+		ExpiresAt: time.Now().Add(48 * time.Hour).Unix(),
+	})
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	scheduler := New(&Config{Pool: state, Upstream: up, KeepaliveRefreshWindow: 24 * time.Hour})
+
+	scheduler.runTaskSync(t.Context(), TaskKeepalive, TriggerScheduler)
+
+	if got := fakeUpstream2.refreshCalls.Load(); got != 0 {
+		t.Fatalf("窗口 24h 时窗口外账号不应刷新，calls=%d", got)
+	}
+
+	scheduler.SetKeepaliveRefreshWindow(72 * time.Hour)
+
+	if got := scheduler.KeepaliveRefreshWindow(); got != 72*time.Hour {
+		t.Fatalf("window=%v want 72h", got)
+	}
+
+	scheduler.runTaskSync(t.Context(), TaskKeepalive, TriggerScheduler)
+
+	if got := fakeUpstream2.refreshCalls.Load(); got != 1 {
+		t.Errorf("窗口热更新为 72h 后应刷新，calls=%d", got)
+	}
+
+	scheduler.SetKeepaliveRefreshWindow(0)
+
+	if got := scheduler.KeepaliveRefreshWindow(); got != 24*time.Hour {
+		t.Errorf("<=0 应回落 24h，got %v", got)
+	}
+}
+
 func TestRunKeepaliveSessionDeadDisables(t *testing.T) {
 	t.Parallel()
 

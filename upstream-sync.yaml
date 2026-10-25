@@ -1,36 +1,44 @@
 schema_version: 1
 
-# 上游追踪（upstream tracking）
+# 上游审计追踪（reference-fork audit）
 #
-# 原始上游 Sliverkiss/workbuddy2api 已删库，不可获取。本仓库实际追踪的上游是
-# 前序 fork linguo2625469/workbuddy2api-panel（branch main）。本仓库 2026-10-16
-# 以工作区快照重建 git 历史，与上游无共同祖先；下面 last_synced.commit 是
-# “逻辑基线”——该提交位于上游仓库历史中，是本仓库快照所对应的上游状态。
+# 原始上游 Sliverkiss/workbuddy2api 已删库，不可获取。前序 fork
+# linguo2625469/workbuddy2api-panel 已停止维护，仅作溯源。当前审计对象是
+# misakano7545/workbuddy2api-panel（branch main）；审计只对照最新官方 Win32
+# 客户端确认缺口并开 Issue，不直接吸收代码。实现走 issue-driven PR。
+#
+# 本仓库 2026-10-16 以工作区快照重建 git 历史，与参考 fork 无共同祖先；
+# last_audited.commit 是“逻辑审计基线”，位于参考 fork 历史中，不是本仓库祖先。
 upstream:
-  repo: https://github.com/linguo2625469/workbuddy2api-panel.git
+  repo: https://github.com/misakano7545/workbuddy2api-panel.git
   branch: main
 
-last_synced:
-  commit: 73a7560efc7a88ebd9865db4c71ae7f6d85859f8
-  synced_at_utc: 2026-10-21T14:59:01Z
-  sync_method: adapt
-  source_pr: "213"
-  range:
-    from: 6b31db6d045e985042620c819c3a938002e7b0b1
-    to: 73a7560efc7a88ebd9865db4c71ae7f6d85859f8
-    commits_total: 60
-    commits_with_content: 35
-    merge_bubbles: 25
+last_audited:
+  commit: 46629494bfe1f5a8579c9e562f59115e0aa81fe5
+  audited_at_utc: 2026-10-25T18:58:09Z
+  sync_method: audit
+  official_baseline:
+    cn: 5.8.3.41334564-db0e9b51 (commit db0e9b51b7fa0b383f41f5b0b83dd442c8557918)
+    global: 5.8.4.41366630-73952edb (commit 73952edb48da46bd0b244661efe22f4f247c4977)
+  reviewed_window:
+    from: 2026-10-23
+    to: 2026-10-25
+    non_merge_commits: 30
   dispositions:
-    adapt: 29
-    skip: 5
-    revisit: 1
-    merge_bubble: 25
+    issue: 3
+    skip: 21
+    revisit: 6
+  issues:
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/282
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/283
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/284
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/285
   note: >-
-    区间 6b31db6..73a7560 全部 60 条提交已逐条落账（见 upstream-decisions.jsonl）：
-    adapt 29 条分 24 个工作 Issue（#182–#205）实现并各自开 PR；skip 5 条
-    （dea68c4 空提交 / d809396 本 fork 不持有的字面量 bug / 241913d 空提交 /
-    505d5d7 环境代理与显式代理池双叠加且削弱 SSRF 边界 / 73a7560 上游停止维护声明）；
-    revisit 1 条（a48d4e4 手机端适配：抽屉与宽表卡片化已由本 fork 既有设计覆盖，
-    仅取窄屏时序图一项 → #202）。上游 head 已附「停止维护声明」，本区间之后
-    预期为空操作。游标推进本身是独立的 chore(sync) 元数据提交，不含实现改动。
+    2026-10-25 以参考 fork head 建立审计基线，审计最近窗口（2026-10-23..25，
+    30 条非 merge 提交），逐条对照官方 Win32 cn 5.8.3 / global 5.8.4 包。
+    确认 4 个缺口并开 Issue #282–#285（auth 毫秒 expiresAt/codebuddy.ai、
+    登录终态码、reasoning_effort=off/none、周期保活临期窗口）；其余按 skip
+    或 revisit 记录。参考 fork 与 linguo 分叉后另有约 370 条非 merge 提交，
+    其中多数已由本 fork 独立演进覆盖或属运行时/面板扩展，本次不纳入
+    pending；后续审计从该 head 之后开始。审计不产生实现提交，游标推进是独立的
+    chore(sync) 元数据提交。

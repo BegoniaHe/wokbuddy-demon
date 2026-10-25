@@ -86,7 +86,7 @@ func (a *Auth) Retire() {
 // （client.go「第 2 段（锁内）：校验快照一致后写回」），而所有出站请求头构造
 // （ChatHeaders / BillingHeaders / fetchEnterpriseModels / fetchV3Models /
 // global_models）与调度器的 token 检查都在锁外直读这些字段。生产上两侧真会并发：
-// Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新（与是否有在途请求无关），
+// Scheduler.RunKeepaliveNow（手动全量）与定时临期保活都会刷新 token（与是否有在途请求无关），
 // 而 handler 正基于**同一个** *auth.Auth 指针构造请求头（Pool.AuthByUID/List 返回的
 // 就是池内同一个对象）。无同步直读构成数据竞争（go test -race 实证）。
 func (a *Auth) AccessTokenValue() string {
@@ -153,8 +153,9 @@ func (a *Auth) NicknameValue() string {
 // globalDisabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认关闭（零值）：与 config global.enabled 缺省 true 一致，Realm() 正常按显式
 // realm/domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）
-// → 逃生门：纯 CN 部署，即便 auth 文件写了 realm=global 或 domain 为 .workbuddy.ai
-// 也恒判 cn——「关了才锁死」的单一闸口集中收敛在 Realm()/IsGlobal() 里。
+// → 逃生门：纯 CN 部署，即便 auth 文件写了 realm=global 或 domain 属
+// workbuddy.ai / codebuddy.ai 家族，也恒判 cn——「关了才锁死」的单一闸口
+// 集中收敛在 Realm()/IsGlobal() 里。
 var globalDisabled atomic.Bool
 
 // SetGlobalEnabled 注入 global realm 路由开关（false = 锁死纯 CN，逃生门）。
@@ -163,8 +164,9 @@ func SetGlobalEnabled(enabled bool) { globalDisabled.Store(!enabled) }
 // GlobalEnabled 报告 global realm 路由开关当前状态（测试/运维观测）。
 func GlobalEnabled() bool { return !globalDisabled.Load() }
 
-// Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 后缀 .workbuddy.ai → "global"，
-// 否则 "cn"。显式 global 优先于 domain 回落（D1）。
+// Realm 返回账号的归一化域：显式 Realm=="global" 或 domain 属 global 域家族
+// （workbuddy.ai / codebuddy.ai）→ "global"，否则 "cn"。显式 global 优先于
+// domain 回落（D1）。
 // 全局开关 SetGlobalEnabled(false) 时恒 "cn"（逃生门：纯 CN 锁定，不影响默认行为）。
 // 空 realm + 空 domain → "cn"（老 CN 凭证零回归）。
 func (a *Auth) Realm() string {
@@ -347,15 +349,22 @@ func jwtPayload(token string) ([]byte, bool) {
 	return payload, true
 }
 
-// isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
-// 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
+// isGlobalDomain 判定 domain 是否指向 global 上游域家族：workbuddy.ai 与
+// codebuddy.ai 的裸域及任意子域（大小写/空白不敏感）。codebuddy.cn 仍判 cn。
 func isGlobalDomain(d string) bool {
 	d = strings.ToLower(strings.TrimSpace(d))
-	return d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai")
+
+	return isDomainOrSubdomain(d, "workbuddy.ai") || isDomainOrSubdomain(d, "codebuddy.ai")
+}
+
+// isDomainOrSubdomain 报告 d 是否等于 root 或为其子域。
+func isDomainOrSubdomain(d, root string) bool {
+	return d == root || strings.HasSuffix(d, "."+root)
 }
 
 // realmFromIssuer 从 access token 的 JWT iss claim 兜底推断账号域：iss host 命中
-// workbuddy.ai 家族 → "global"，否则返回空串（未知 / 非法 token，调用方回落现有行为）。
+// global 域家族（workbuddy.ai / codebuddy.ai）→ "global"，否则返回空串（未知 /
+// 非法 token，调用方回落现有行为）。
 //
 // 仅解 payload（base64url 第二段），不做签名校验——本项只用于缺 realm/domain 时的
 // 路由兜底，安全默认是「未知即不判 global」。解码 / 解析失败静默返回空串，不吞调用方错误。
@@ -414,12 +423,28 @@ func Parse(raw []byte) (*Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 官方 CLI 写入 Unix 毫秒，本仓库内部统一按秒。阈值 1e11 落在当前秒/毫秒值之间：
+	// 两侧都不会误判。写回 SaveAtomic 仍按秒。
+	auth.ExpiresAt = NormalizeExpiresAt(auth.ExpiresAt)
 
 	if strings.TrimSpace(auth.AccessToken) == "" {
 		return nil, errParseErrorMissingAccessToken
 	}
 
 	return &auth, nil
+}
+
+// NormalizeExpiresAt 把毫秒级 Unix 时间戳归一为秒；秒值原样保留。
+// 官方 CodeBuddy CLI 与工作台客户端都把 expiresAt 写成毫秒；所有从官方
+// 凭据构造 Auth 的路径都必须经过这里，避免把毫秒当成极远未来而永不刷新。
+func NormalizeExpiresAt(expiresAt int64) int64 {
+	const millisThreshold = 1e11
+
+	if expiresAt > millisThreshold {
+		return expiresAt / 1000
+	}
+
+	return expiresAt
 }
 
 // parseAuthDoc 按磁盘形态选择解析器：存在 "auth" 键即嵌套形，否则扁平形。

@@ -253,18 +253,20 @@ func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
 // 一直返回 400 "task not completed"，是此前领奖失败的真实原因。
 // 本实现返回 (credit, energy, err)：credit/energy 为本次到账奖励（已领取过时为 0）。
 func (c *Client) ClaimReward(account3 *auth.Auth, taskCode string) (credit, energy int64, err error) {
+	base := c.webBase(account3)
+
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost,
-		c.webBase(account3)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
+		base+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", http.NoBody)
 	if err != nil {
 		return 0, 0, fmt.Errorf("ClaimReward: %w", err)
 	}
-	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 指向 workbuddy.cn 成长中心，
-	// 带 x-client-platform: web 标记来源端。
+	// Web 端请求头形状（对照浏览器实际请求）：Origin/Referer 与请求主机同域
+	// （CN workbuddy.cn / global 签发域），带 x-client-platform: web 标记来源端。
 	req.Header.Set("Authorization", "Bearer "+account3.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Origin", "https://www.workbuddy.cn")
-	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
+	req.Header.Set("Origin", base)
+	req.Header.Set("Referer", base+"/profile/growth-center")
 	req.Header.Set("X-Client-Platform", "web")
 
 	if ua := c.userAgent(account3); ua != "" {

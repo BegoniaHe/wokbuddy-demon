@@ -47,6 +47,8 @@
 
 所有定时任务（签到 / 旅行 / 活跃 / 保活 / 夜猫子 / 成长 / 余额）统一按 **CST（Asia/Shanghai）** 解释日界与整点，宿主时区（UTC 容器 / NAS / 海外 VPS）不会让任务漂移。升级后旧版按宿主本地日界写入的补跑标记会被忽略一次，按 CST 重新计算。任务可分别开关。今天不想让它出门？关掉就行，它不会闹。
 
+定时保活只刷新将在 `schedule.keepalive_refresh_window`（默认 `24h`）内到期的账号；无到期时间或已过期的账号照常刷新，手动「全部保活」仍全量执行。
+
 实际触发时刻会在整点后按 `schedule.slot_jitter`（默认 20 分钟）做确定性延后；账号之间按对数正态间隔错开（签到以 `checkin_account_delay` 为中位数，旅行/活跃/夜猫子用各自固定中位数），每号每天还有独立相位。把抖动、σ 与相位窗口设为 `0` 可回到整点齐发、固定间隔；相位窗口为 `0` 时仍会按每日相位打乱账号顺序。
 
 ## 🎒 它能帮你做什么
@@ -60,7 +62,7 @@
 - **面板内试聊**：直接输入提示词走真实 `/v1` 链路，验证模型、账号与流式输出；对话只存在本机浏览器。
 - **本地状态持久化**：重启后还记得昨天干到哪，不会一键失忆。
 - **登录与搬家**：面板里完成授权登录；需要换机器时，可以加密导出再导入账号。
-- **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations`（`features.images_endpoint`，默认关）。
+- **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态，单批最多 50 个模型）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations`（`features.images_endpoint`，默认关）。
 - **官方档位徽章**：解析 `/v3/config` 的 `modelTiers`，在模型页与试聊选择器显示档位与升级提示，不改变选号或模型过滤。
 
 ### 🎯 差一个就满分的成长任务

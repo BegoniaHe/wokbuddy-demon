@@ -49,6 +49,7 @@
     "keepalive_hours": [
       22
     ],
+    "keepalive_refresh_window": "24h",
     "blackcat_hours": [
       23
     ],
