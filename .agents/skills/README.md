@@ -6,7 +6,7 @@
 
 两个客户端都从 `.agents/skills/<name>/SKILL.md` 发现技能。保持单一技能树，不要复制到 `.codex/` 或 `.opencode/`。仓库规则在 `AGENTS.md`，两个客户端都支持。
 
-- Codex：用 `$skill-name` 触发，例如 `Use $sync-upstream to review pending upstream commits.`
+- Codex：用 `$skill-name` 触发，例如 `Use $sync-upstream to audit pending reference-fork commits.`
 - OpenCode：按名字请求，`skill` 工具加载共享指令。本仓库已在 `.opencode/opencode.json` 配置 `skills.paths: [".agents/skills"]`，因此 OpenCode 能发现本目录。
 
 `agents/openai.yaml` 只提供 Codex 的短标签与起始 prompt，**不得**包含 `SKILL.md` 里没有的流程要求；OpenCode 不需要该元数据即可执行。使用当前客户端可用的 shell / 提问 / 浏览器 / 委派工具；缺某工具时用等价能力，或报告具体未验证部分。
@@ -22,7 +22,7 @@
 
 | Skill                   | 何时加载                                                       |
 | ----------------------- | -------------------------------------------------------------- |
-| `sync-upstream`         | 吸收前序 fork `linguo2625469/workbuddy2api-panel` `main` 提交  |
+| `sync-upstream`         | 审计参考 fork `misakano7545/workbuddy2api-panel` `main` 提交，对照官方客户端确认后开 Issue |
 | `plan-issue`            | 把 Issue 或请求变成研究充分、可验证的实施计划                  |
 | `simplifier`            | 要最小改动、YAGNI、砍过度设计/依赖时                           |
 | `reverse-workbuddy`     | 解包 `.tmp/workbuddy/` 官方客户端并比对 `internal/upstream/` 协议差异 |
@@ -45,5 +45,5 @@ Frontmatter 用与目录一致的 `name`，以及一句以能力与触发词开�
 
 ## 说明
 
-- 上游吸收技能的游标在 `upstream-sync.yaml`，决策账本在 `upstream-decisions.jsonl`。
-- `sync-upstream` 的默认吸收方式是 **adapt**（非 cherry-pick），详见该技能 `SKILL.md`。
+- 上游审计技能的游标在 `upstream-sync.yaml`，决策账本在 `upstream-decisions.jsonl`。
+- `sync-upstream` **只审计、不吸收**：默认对照最新官方 Win32 客户端确认缺口，然后开 Issue；实现走 issue-driven PR。详见该技能 `SKILL.md`。

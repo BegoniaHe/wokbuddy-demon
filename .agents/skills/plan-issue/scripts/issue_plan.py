@@ -17,7 +17,10 @@ FORK_REPO = "BegoniaHe/wokbuddy-demon"
 PROBE_REQUIRED = "required"
 PROBE_SKIPPED = "skipped"
 PROBE_VALUES = (PROBE_REQUIRED, PROBE_SKIPPED)
-UPSTREAM_HOST = "github.com/linguo2625469/workbuddy2api-panel"
+UPSTREAM_HOSTS = (
+    "github.com/linguo2625469/workbuddy2api-panel",
+    "github.com/misakano7545/workbuddy2api-panel",
+)
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 ISSUE_ID_RE = re.compile(r"^issue-\d+$")
 LOCAL_ID_RE = re.compile(r"^local-[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -475,9 +478,9 @@ def cmd_init(args: argparse.Namespace) -> int:
 
 def cmd_fetch(args: argparse.Namespace) -> int:
     root = repo_root()
-    if args.url and UPSTREAM_HOST in args.url and not args.allow_upstream:
+    if args.url and any(host in args.url for host in UPSTREAM_HOSTS) and not args.allow_upstream:
         raise PlanError(
-            "refusing linguo2625469/workbuddy2api-panel; "
+            "refusing upstream fork URL; "
             "pass --allow-upstream after explicit confirmation"
         )
     run_dir = resolve_run_dir(root, args.run_dir)
@@ -510,9 +513,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         raise PlanError(detail) from exc
     data = json.loads(payload)
     url = str(data.get("url", ""))
-    if UPSTREAM_HOST in url and not args.allow_upstream:
+    if any(host in url for host in UPSTREAM_HOSTS) and not args.allow_upstream:
         raise PlanError(
-            "fetched URL is on linguo2625469/workbuddy2api-panel; "
+            "fetched URL is on an upstream fork; "
             "pass --allow-upstream after confirmation"
         )
     title = str(data.get("title", "")).strip() or f"Issue {issue}"

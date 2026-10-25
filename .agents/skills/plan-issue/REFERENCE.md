@@ -10,7 +10,8 @@ paste them.
 | ------------------- | ----------------------------------------------------------------- |
 | Product             | WokBuddy Demon (BegoniaHe fork)                                   |
 | Repository          | `BegoniaHe/wokbuddy-demon`                                        |
-| Upstream provenance | `linguo2625469/workbuddy2api-panel` (sync source only)            |
+| Upstream provenance | `linguo2625469/workbuddy2api-panel` (historical)                  |
+| Reference fork      | `misakano7545/workbuddy2api-panel` (audit only)                   |
 | Issue templates     | `.github/ISSUE_TEMPLATE/{bug_report,feature_request,task}.yml`    |
 | PR templates        | `.github/PULL_REQUEST_TEMPLATE/{feat,fix,docs,refactor,chore}.md` |
 | Published artifacts | nightly binaries + GHCR image (`ghcr.io/begoniahe/wokbuddy-demon`) |
@@ -70,8 +71,9 @@ gh issue list --repo BegoniaHe/wokbuddy-demon --state all --search "<query>" --l
 gh search issues --repo BegoniaHe/wokbuddy-demon "<query>"
 ```
 
-Refuse a URL under `github.com/linguo2625469/workbuddy2api-panel` unless the
-user confirmed that upstream target. Do not post triage comments unless asked.
+Refuse a URL under `github.com/linguo2625469/workbuddy2api-panel` or
+`github.com/misakano7545/workbuddy2api-panel` unless the user confirmed that
+upstream target. Do not post triage comments unless asked.
 
 ## Verify command map
 
@@ -115,5 +117,5 @@ failure-path task.
 
 | Request                                       | Skill            |
 | --------------------------------------------- | ---------------- |
-| Absorb `linguo2625469/workbuddy2api-panel`    | `sync-upstream`  |
+| Audit `misakano7545/workbuddy2api-panel`      | `sync-upstream`  |
 | Change this checkout from an Issue or request | `plan-issue` (this skill) |

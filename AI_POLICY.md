@@ -20,7 +20,7 @@ AI **不可以**：
 - 打 tag、创建 GitHub Release、发布二进制 / 容器镜像 / 其他发行资产。
 - 修改分支保护、仓库密钥、组织设置。
 - 把安全漏洞写成公开 Issue 或公开 PR 描述。安全报告只走 [SECURITY.md](SECURITY.md)。
-- 未经用户明确确认，把 Issue 或 PR 开到其他仓库（原上游 `Sliverkiss/workbuddy2api` 已删库；前序 fork `linguo2625469/workbuddy2api-panel` 非本 fork 的 PR 目标）。
+- 未经用户明确确认，把 Issue 或 PR 开到其他仓库（原上游 `Sliverkiss/workbuddy2api` 已删库；前序 fork `linguo2625469/workbuddy2api-panel` 与参考 fork `misakano7545/workbuddy2api-panel` 均非本 fork 的 PR 目标）。
 - 代维护者在 PR 上点 Approve，或伪造他人的评审。
 
 ## 合并门槛

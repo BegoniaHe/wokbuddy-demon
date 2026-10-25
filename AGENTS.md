@@ -37,7 +37,7 @@
 - **滚动更新，无版本号**：不使用语义化版本，不做带版本的 Release；只有 nightly 构建，版本串在**编译时注入**。不要引入版本线或发布矩阵。
 - 优先「解决当前问题的最小设计」。只有靠复活废弃路径才能成立的改动，是错误设计。
 - Agent 可以维护本仓库：提交、推送功能分支、开开发用 Issue/PR。**不得** merge、push `main`、force-push 受保护分支、打 tag、发版。由人类维护者执行；口头例外不构成授权。PR 需人类维护者评审**且**一次独立 AI 辅助评审。遵循 [AI_POLICY.md](AI_POLICY.md) 与 `.agents/shared/ai-contribution/REFERENCE.md`。
-- Issue 与 PR 只对 `BegoniaHe/wokbuddy-demon` 开。不要对原上游 `Sliverkiss/workbuddy2api`（已删库）或前序 fork `linguo2625469/workbuddy2api-panel` 开，除非用户显式确认该目标。`gh` 可能默认指向其他远端，务必 `--repo BegoniaHe/wokbuddy-demon`（或 `GH_REPO=BegoniaHe/wokbuddy-demon`）并确认 URL。
+- Issue 与 PR 只对 `BegoniaHe/wokbuddy-demon` 开。不要对原上游 `Sliverkiss/workbuddy2api`（已删库）、前序 fork `linguo2625469/workbuddy2api-panel` 或参考 fork `misakano7545/workbuddy2api-panel` 开，除非用户显式确认该目标。`gh` 可能默认指向其他远端，务必 `--repo BegoniaHe/wokbuddy-demon`（或 `GH_REPO=BegoniaHe/wokbuddy-demon`）并确认 URL。
 
 ## Toolchain and setup
 
@@ -168,21 +168,22 @@ WokBuddy Demon 是一个本地网关：接收 OpenAI 兼容的 `/v1/*` 请求，
 - **导入边界**：`internal/*` 各包职责单一；`cmd/*` 负责装配，不反向依赖。改动跨包依赖时明确说明。
 - **错误处理**：错误信息面向开发者，用中文说明「发生了什么、为什么」；不要吞错。
 - **Skills**：从 `.agents/skills/` 加载。政策与事实分离（`SKILL.md` vs `REFERENCE.md` / 共享文件）。目录见 `.agents/skills/README.md`。引用这些文件，不要粘贴。
-- **Commits/PRs**：遵循 `.agents/shared/conventional-commit/REFERENCE.md`。`<type>(<可选 scope>): <描述>`，type/scope 英文、描述中文，小写命令式、结尾无句号。破坏性变更用 `!` 加 `BREAKING CHANGE:` 脚注。issue 编号放脚注（`Fixes #123`），不当 scope。Agent 生成/定稿时运行 `date -u '+%Y-%m-%dT%H:%M:%SZ'` 并追加 `AI-Generated: true` 与 `Generated-At:`。Agent 可提交、推送功能分支、开 PR；**不得** merge、push `main`、打 tag。PR 用 `--repo BegoniaHe/wokbuddy-demon`。Agent 作者 PR 以 `## Agent note` 结尾；人类作者以 `## Human note` 结尾。用 `.github/PULL_REQUEST_TEMPLATE/` 下匹配 type 的模板（`perf`/`style` 归 `refactor.md`；`build`/`ops`/`test` 归 `chore.md`）。上游 cherry-pick/adapt 的标题保持原样；见 sync-upstream 技能。
+- **Commits/PRs**：遵循 `.agents/shared/conventional-commit/REFERENCE.md`。`<type>(<可选 scope>): <描述>`，type/scope 英文、描述中文，小写命令式、结尾无句号。破坏性变更用 `!` 加 `BREAKING CHANGE:` 脚注。issue 编号放脚注（`Fixes #123`），不当 scope。Agent 生成/定稿时运行 `date -u '+%Y-%m-%dT%H:%M:%SZ'` 并追加 `AI-Generated: true` 与 `Generated-At:`。Agent 可提交、推送功能分支、开 PR；**不得** merge、push `main`、打 tag。PR 用 `--repo BegoniaHe/wokbuddy-demon`。Agent 作者 PR 以 `## Agent note` 结尾；人类作者以 `## Human note` 结尾。用 `.github/PULL_REQUEST_TEMPLATE/` 下匹配 type 的模板（`perf`/`style` 归 `refactor.md`；`build`/`ops`/`test` 归 `chore.md`）。参考 fork 的提交只作审计线索，不进入提交标题；见 sync-upstream 技能。
 
-## Upstream synchronization
+## Upstream audit
 
-本仓库的默认上游吸收方式是 **adapt**，不是 merge，也不是默认 cherry-pick。上游是前序 fork `linguo2625469/workbuddy2api-panel`（branch `main`）；原始上游 `Sliverkiss/workbuddy2api` 已删库。因历史已重建（无共同祖先）且已分叉，绝大多数上游提交需按当前边界重新实现。
+本仓库**不直接吸收**参考 fork 代码。审计对象是 `misakano7545/workbuddy2api-panel`（branch `main`）；前序 fork `linguo2625469/workbuddy2api-panel` 已停止维护，仅作溯源；原始上游 `Sliverkiss/workbuddy2api` 已删库。因历史已重建（无共同祖先）且已分叉，参考提交只作线索，**默认对照最新官方 WorkBuddy Win32 客户端**（`reverse-workbuddy` 技能）确认缺口，然后只开 Issue，不改代码、不 cherry-pick、不 adapt、不 merge。
 
 ```bash
 # 远端不存在则 add，已存在则 set-url
-git remote add upstream https://github.com/linguo2625469/workbuddy2api-panel.git
-git remote set-url upstream https://github.com/linguo2625469/workbuddy2api-panel.git
+git remote add upstream https://github.com/misakano7545/workbuddy2api-panel.git
+git remote set-url upstream https://github.com/misakano7545/workbuddy2api-panel.git
 git fetch --prune upstream
+node .agents/skills/reverse-workbuddy/scripts/download_latest.mjs --dry-run
 python3 .agents/skills/sync-upstream/scripts/inspect_upstream.py
 ```
 
-逐提交评估（oldest-first），默认 `adapt`；`cherry-pick` 仅用于与 fork 分叉路径不重叠且无冲突的提交；`skip` / `replay` 更少。冲突不得盲目 ours/theirs。详见 `.agents/skills/sync-upstream/SKILL.md`。每次决策写入 `upstream-decisions.jsonl`，游标 `upstream-sync.yaml` 仅在区间全部有处置后推进。
+逐提交审计（oldest-first）：官方静态包能确认的缺口 → `issue`（在 `BegoniaHe/wokbuddy-demon` 开单）；不适用/已覆盖/与官方冲突 → `skip`；证据不足或需实测 → `revisit`。历史 `adapt`/`cherry-pick` 记录保留可读，但不再新增。每次处置写入 `upstream-decisions.jsonl`，游标 `upstream-sync.yaml` 仅在区间全部有处置且每个 `issue` 有 URL 后推进。详见 `.agents/skills/sync-upstream/SKILL.md`；实现走 issue-driven PR。
 
 ## Releases
 

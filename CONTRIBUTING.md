@@ -85,6 +85,6 @@ make test
 
 或直接 `make ci`。
 
-## 上游同步
+## 上游审计
 
-上游是前序 fork `linguo2625469/workbuddy2api-panel`（原始上游 `Sliverkiss/workbuddy2api` 已删库）。默认吸收方式是 **adapt**，详见 `.agents/skills/sync-upstream/SKILL.md`。
+参考 fork 是 `misakano7545/workbuddy2api-panel`（前序 fork `linguo2625469/workbuddy2api-panel` 已停止维护，原始上游 `Sliverkiss/workbuddy2api` 已删库）。本仓库**不直接吸收**参考代码：先对照最新官方 WorkBuddy Win32 客户端做深度审计，确认缺口后开 Issue，实现走 issue-driven PR。详见 `.agents/skills/sync-upstream/SKILL.md`。

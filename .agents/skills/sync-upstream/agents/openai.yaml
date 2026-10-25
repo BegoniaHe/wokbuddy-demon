@@ -1,7 +1,7 @@
 interface:
-  display_name: 'Sync wokbuddy-demon Upstream'
-  short_description: 'Review or adapt upstream commits with provenance'
-  default_prompt: 'Use $sync-upstream to review pending upstream commits from linguo2625469/workbuddy2api-panel and produce an integration plan, or execute the plan already authorized in this conversation.'
+  display_name: 'Audit wokbuddy-demon Reference Fork'
+  short_description: 'Audit reference commits against official client; open issues'
+  default_prompt: 'Use $sync-upstream to audit pending commits from misakano7545/workbuddy2api-panel against the latest official WorkBuddy Win32 client, record dispositions, and open Issues on BegoniaHe/wokbuddy-demon. Do not absorb code.'
 
 policy:
   allow_implicit_invocation: true

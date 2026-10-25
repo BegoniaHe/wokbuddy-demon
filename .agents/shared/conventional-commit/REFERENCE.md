@@ -1,6 +1,6 @@
 # 提交信息规范：Conventional Commits（AI 参考）
 
-本文件是本仓库 AI 辅助提交的**提交信息唯一事实源**（source of truth）。人工提交可省略 AI 生成脚注，见 `CONTRIBUTING.md`。上游 cherry-pick / adapt 的提交标题保持原样，见 `.agents/skills/sync-upstream/SKILL.md`。Agent 可以创建提交、Issue、PR，但**不得** merge，见 `AI_POLICY.md` 与 `.agents/shared/ai-contribution/REFERENCE.md`。
+本文件是本仓库 AI 辅助提交的**提交信息唯一事实源**（source of truth）。人工提交可省略 AI 生成脚注，见 `CONTRIBUTING.md`。参考 fork 的提交只作审计线索，不进入提交标题；见 `.agents/skills/sync-upstream/SKILL.md`。Agent 可以创建提交、Issue、PR，但**不得** merge，见 `AI_POLICY.md` 与 `.agents/shared/ai-contribution/REFERENCE.md`。
 
 > 语言约定：`type` / `scope` / `!` / 脚注键名一律用英文；`description` 与正文用**简体中文**（贴合本仓库既有提交历史，如 `docs: 精简 README，聚焦部署与使用说明`）。
 
@@ -282,4 +282,4 @@ chore: 更新 gitignore
 - 发布产物只有 **nightly 构建**（见 `.github/workflows/`）；版本串在**编译时注入**（构建期写入二进制），不作为可比的发布版本。
 - 因此不存在「版本号提交」这类提交；`build`/`ops` 类提交仅描述构建/CI 改动本身。
 
-> 例外：从上游吸收的历史版本号提交，其标题按 sync-upstream 技能保持原样（`cherry-pick`/`adapt`），但本仓库**不据此**建立自己的版本线。
+> 例外：历史 `adapt` / `cherry-pick` 记录的标题保持原样；新的参考 fork 审计不再产生吸收提交。本仓库**不据此**建立自己的版本线。
