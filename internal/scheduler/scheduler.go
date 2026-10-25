@@ -20,6 +20,9 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
+// defaultKeepaliveRefreshWindow 定时保活默认临期窗口，对齐官方客户端到期前 24h 刷新。
+const defaultKeepaliveRefreshWindow = 24 * time.Hour
+
 // Config 调度器依赖。
 //
 // 任务开关用「禁用」命名而非「启用」：零值 Config 即四类任务都启用（hours 回落默认），
@@ -33,8 +36,11 @@ type Config struct {
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
 	KeepaliveHours []int // 默认 [22]
-	BlackcatHours  []int // 默认 [23]：夜猫子（23:00–08:00 CST 计数窗口，按 CST 排程）
-	GrowthHours    []int // 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，
+	// KeepaliveRefreshWindow 定时保活的临期窗口：仅刷新 expiresAt 进入
+	// now+window 的账号；<=0 回落 24h。手动「全部保活」不受此窗口限制。
+	KeepaliveRefreshWindow time.Duration
+	BlackcatHours          []int // 默认 [23]：夜猫子（23:00–08:00 CST 计数窗口，按 CST 排程）
+	GrowthHours            []int // 默认 [1]：成长任务队列（Sequential 族每日零点解锁一环，
 	// 01:00 自动扫描+执行；避开零点整防解锁竞态）
 
 	// ExpiringSoonWindow 快过期积分窗口：签到/余额刷新查余额时，把到期时间
@@ -150,6 +156,10 @@ func New(cfg *Config) *Scheduler {
 		config.KeepaliveHours = []int{22}
 	}
 
+	if config.KeepaliveRefreshWindow <= 0 {
+		config.KeepaliveRefreshWindow = defaultKeepaliveRefreshWindow
+	}
+
 	if len(config.BlackcatHours) == 0 {
 		config.BlackcatHours = []int{23}
 	}
@@ -173,6 +183,25 @@ func (s *Scheduler) ExpiringSoonWindow() time.Duration {
 	defer s.schedMu.Unlock()
 
 	return s.cfg.ExpiringSoonWindow
+}
+
+// KeepaliveRefreshWindow 返回定时保活临期窗口（读取时与热配置写在 schedMu 下同步）。
+func (s *Scheduler) KeepaliveRefreshWindow() time.Duration {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+
+	return s.cfg.KeepaliveRefreshWindow
+}
+
+// SetKeepaliveRefreshWindow 热更新定时保活临期窗口；<=0 回落默认 24h。
+func (s *Scheduler) SetKeepaliveRefreshWindow(window time.Duration) {
+	if window <= 0 {
+		window = defaultKeepaliveRefreshWindow
+	}
+
+	s.schedMu.Lock()
+	s.cfg.KeepaliveRefreshWindow = window
+	s.schedMu.Unlock()
 }
 
 // SetExpiringSoonWindow 热更新快过期路由窗口。窗口变化时清空池内旧快照，避免在下一轮
@@ -939,10 +968,13 @@ func (s *Scheduler) RunKeepaliveNow() {
 }
 
 // keepaliveAll token 刷新实体；返回尝试/成功/失败账号数。
-func (s *Scheduler) keepaliveAll() (total, success, failure int) {
+// trigger=TriggerScheduler 时只刷新临期（NeedsRefresh(window)）账号；手动入口全量。
+// 无 expiry 与已过期账号由 NeedsRefresh 天然返回 true。
+func (s *Scheduler) keepaliveAll(trigger string) (total, success, failure int) {
 	var runCounters2 runCounters
 
 	includeDisabled := s.includeDisabledInTasks()
+	window := s.KeepaliveRefreshWindow()
 
 	list := s.cfg.Pool.List()
 	for i := range list {
@@ -953,6 +985,10 @@ func (s *Scheduler) keepaliveAll() (total, success, failure int) {
 
 		account := s.cfg.Pool.AuthByUID(status.UID)
 		if account == nil || account.RefreshTokenValue() == "" {
+			continue
+		}
+		// 定时保活只刷新临期账号；手动「全部保活」保持全量语义。
+		if trigger == TriggerScheduler && !account.NeedsRefresh(window) {
 			continue
 		}
 

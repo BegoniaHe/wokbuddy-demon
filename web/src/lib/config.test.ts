@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { collectConfig, configToValues, durationBad, dig, put } from './config';
+import {
+  collectConfig,
+  configToValues,
+  durationBad,
+  durationFieldInvalid,
+  durationIsZero,
+  durationTip,
+  dig,
+  put,
+} from './config';
 
 describe('dig / put', () => {
   it('嵌套读写', () => {
@@ -24,6 +33,42 @@ describe('durationBad', () => {
   it('脏值标红', () => {
     expect(durationBad('abc')).toBe(true);
     expect(durationBad('30 minutes')).toBe(true);
+  });
+});
+
+describe('durationIsZero', () => {
+  it('识别零值 Go 时长', () => {
+    expect(durationIsZero('0')).toBe(true);
+    expect(durationIsZero('0s')).toBe(true);
+    expect(durationIsZero('0h0m')).toBe(true);
+    expect(durationIsZero('0.0h')).toBe(true);
+  });
+  it('非零与空值', () => {
+    expect(durationIsZero('')).toBe(false);
+    expect(durationIsZero('0h30m')).toBe(false);
+    expect(durationIsZero('1h')).toBe(false);
+  });
+});
+
+describe('durationFieldInvalid', () => {
+  it('普通时长字段允许 0', () => {
+    expect(durationFieldInvalid('slot_jitter', '0')).toBe(false);
+  });
+  it('临期窗口必须大于 0', () => {
+    expect(durationFieldInvalid('keepalive_refresh_window', '0')).toBe(true);
+    expect(durationFieldInvalid('keepalive_refresh_window', '0h0m')).toBe(true);
+    expect(durationFieldInvalid('keepalive_refresh_window', '24h')).toBe(false);
+    expect(durationFieldInvalid('keepalive_refresh_window', '')).toBe(false);
+  });
+  it('正时长字段仍校验格式', () => {
+    expect(durationFieldInvalid('keepalive_refresh_window', 'abc')).toBe(true);
+  });
+});
+
+describe('durationTip', () => {
+  it('正时长字段不复用「0 = 关闭」提示', () => {
+    expect(durationTip('keepalive_refresh_window')).not.toContain('0 = 关闭');
+    expect(durationTip('slot_jitter')).toContain('0 = 关闭');
   });
 });
 

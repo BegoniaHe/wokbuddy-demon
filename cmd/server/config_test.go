@@ -1388,3 +1388,43 @@ func TestCORSOriginDefaultPort(t *testing.T) {
 		}
 	}
 }
+
+// TestKeepaliveRefreshWindowConfig 临期保活窗口：默认 24h；空值回落；非法值/<=0 fail fast；
+// 显式合法值按 Go duration 解析。
+func TestKeepaliveRefreshWindowConfig(t *testing.T) {
+	t.Parallel()
+
+	config := Default()
+	if err := config.normalize(); err != nil {
+		t.Fatalf("normalize default: %v", err)
+	}
+
+	if config.KeepaliveRefreshWindowDur != 24*time.Hour {
+		t.Errorf("default window=%v want 24h", config.KeepaliveRefreshWindowDur)
+	}
+
+	empty, err := ParseConfig([]byte(`{"schedule":{"keepalive_refresh_window":""}}`))
+	if err != nil {
+		t.Fatalf("empty window should fall back: %v", err)
+	}
+
+	if empty.KeepaliveRefreshWindowDur != 24*time.Hour {
+		t.Errorf("empty window=%v want 24h", empty.KeepaliveRefreshWindowDur)
+	}
+
+	explicit, err := ParseConfig([]byte(`{"schedule":{"keepalive_refresh_window":"6h"}}`))
+	if err != nil {
+		t.Fatalf("explicit window: %v", err)
+	}
+
+	if explicit.KeepaliveRefreshWindowDur != 6*time.Hour {
+		t.Errorf("explicit window=%v want 6h", explicit.KeepaliveRefreshWindowDur)
+	}
+
+	for _, raw := range []string{`"24"`, `"abc"`, `"0"`, `"-1h"`} {
+		body := []byte(`{"schedule":{"keepalive_refresh_window":` + raw + `}}`)
+		if _, err := ParseConfig(body); err == nil {
+			t.Errorf("window=%s should fail fast", raw)
+		}
+	}
+}

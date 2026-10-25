@@ -86,7 +86,7 @@ func (a *Auth) Retire() {
 // （client.go「第 2 段（锁内）：校验快照一致后写回」），而所有出站请求头构造
 // （ChatHeaders / BillingHeaders / fetchEnterpriseModels / fetchV3Models /
 // global_models）与调度器的 token 检查都在锁外直读这些字段。生产上两侧真会并发：
-// Scheduler.RunKeepaliveNow 定时对**每个**非禁用账号刷新（与是否有在途请求无关），
+// Scheduler.RunKeepaliveNow（手动全量）与定时临期保活都会刷新 token（与是否有在途请求无关），
 // 而 handler 正基于**同一个** *auth.Auth 指针构造请求头（Pool.AuthByUID/List 返回的
 // 就是池内同一个对象）。无同步直读构成数据竞争（go test -race 实证）。
 func (a *Auth) AccessTokenValue() string {

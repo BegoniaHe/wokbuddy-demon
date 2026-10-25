@@ -23,6 +23,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'checkin_hours', path: ['schedule', 'checkin_hours'], kind: 'hours' },
   { name: 'keepalive_enabled', path: ['schedule', 'keepalive_enabled'], kind: 'checkbox' },
   { name: 'keepalive_hours', path: ['schedule', 'keepalive_hours'], kind: 'hours' },
+  { name: 'keepalive_refresh_window', path: ['schedule', 'keepalive_refresh_window'], kind: 'text' },
   { name: 'travel_enabled', path: ['schedule', 'travel_enabled'], kind: 'checkbox' },
   { name: 'travel_hours', path: ['schedule', 'travel_hours'], kind: 'hours' },
   { name: 'activity_enabled', path: ['schedule', 'activity_enabled'], kind: 'checkbox' },
@@ -126,6 +127,7 @@ export const DURATION_FIELDS = new Set([
   'expiring_soon',
   'ttl',
   'checkin_account_delay',
+  'keepalive_refresh_window',
   'slot_jitter',
   'account_pacing_floor',
   'account_pacing_ceiling',
@@ -133,6 +135,15 @@ export const DURATION_FIELDS = new Set([
   'rotate_budget',
 ]);
 export const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m；0 = 关闭';
+
+// 后端要求正时长的字段：通用 duration 口径把 0 当作「关闭」，但
+// keepalive_refresh_window 的 normalize 会拒绝 <=0，前端需提前拦截。
+export const POSITIVE_DURATION_FIELDS = new Set(['keepalive_refresh_window']);
+
+export const POSITIVE_DURATION_TIP = '格式应为 Go 时长且必须大于 0：30m / 2h / 600s / 1h30m';
+
+// 全部分量都为 0 的 Go duration（"0"、"0s"、"0h0m"、"0.0h"）。
+const ZERO_DURATION_RE = /^(?:0+(?:\.0+)?(?:ns|us|µs|ms|s|m|h))+$/;
 
 export type FieldValue = string | boolean;
 
@@ -156,6 +167,23 @@ export function put(obj: Record<string, unknown>, path: string[], val: unknown):
 export function durationBad(value: string): boolean {
   const v = value.trim();
   return v !== '' && !DURATION_RE.test(v);
+}
+
+// durationIsZero 报告 Go duration 字符串是否为零值（"0" / "0s" / "0h0m"）。
+export function durationIsZero(value: string): boolean {
+  const v = value.trim();
+  return v === '0' || ZERO_DURATION_RE.test(v);
+}
+
+export function durationTip(name: string): string {
+  return POSITIVE_DURATION_FIELDS.has(name) ? POSITIVE_DURATION_TIP : DURATION_TIP;
+}
+
+// durationFieldInvalid 汇总配置页的时长校验：格式非法，或字段要求正时长但填了 0。
+export function durationFieldInvalid(name: string, value: string): boolean {
+  if (!DURATION_FIELDS.has(name)) return false;
+
+  return durationBad(value) || (POSITIVE_DURATION_FIELDS.has(name) && durationIsZero(value));
 }
 
 // configToValues 把服务端配置映射为表单初值。secret 字段已有值时留空，
