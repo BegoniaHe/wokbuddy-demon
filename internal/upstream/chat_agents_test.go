@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -344,5 +345,20 @@ func assertChatVisibility(t *testing.T, infos []ModelInfo, want map[string]bool)
 		if *infos[i].ChatVisible != wantVisible {
 			t.Errorf("%s ChatVisible=%v want %v", infos[i].ID, *infos[i].ChatVisible, wantVisible)
 		}
+	}
+}
+
+// TestModelInfoChatVisibleNotSerialized ChatVisible 是目录内部判定，不得随
+// ModelInfo 序列化泄露到任何 JSON 输出。
+func TestModelInfoChatVisibleNotSerialized(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(ModelInfo{ID: "m", ChatVisible: new(false)}) //nolint:musttag // 内部结构无 JSON 契约，此处只验证字段被排除
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	if strings.Contains(string(raw), "ChatVisible") {
+		t.Fatalf("ChatVisible 不应进入 JSON: %s", raw)
 	}
 }

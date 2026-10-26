@@ -2366,7 +2366,7 @@ type ModelInfo struct {
 
 	// ChatVisible 官方默认会话 agent 白名单判定（issue #319）：nil = 该来源没有
 	// 判定；false = 不出现在 /v1/models 发现列表。内部字段，不参与 JSON 序列化。
-	ChatVisible *bool
+	ChatVisible *bool `json:"-"`
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
