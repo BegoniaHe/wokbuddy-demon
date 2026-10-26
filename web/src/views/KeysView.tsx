@@ -57,6 +57,7 @@ const REALM_OPTIONS = [
 ] as const satisfies readonly SelectOption[];
 
 // toLocalDatetime 把 RFC3339 转成 <input type="datetime-local"> 需要的本地时间串。
+// 保留秒精度：编辑其他限制后原样保存时，不能把到期时间截断到整分。
 function toLocalDatetime(iso?: string | null): string {
   if (!iso) return '';
   const d = new Date(iso);
@@ -71,7 +72,9 @@ function toLocalDatetime(iso?: string | null): string {
     'T' +
     pad(d.getHours()) +
     ':' +
-    pad(d.getMinutes())
+    pad(d.getMinutes()) +
+    ':' +
+    pad(d.getSeconds())
   );
 }
 
@@ -428,7 +431,7 @@ export function KeysView() {
               </Field>
               <Field>
                 <FieldLabel>到期时间（本地时区，留空 = 永不过期）</FieldLabel>
-                <Input type="datetime-local" value={cExpiry} onChange={(e) => setCExpiry(e.target.value)} />
+                <Input type="datetime-local" step={1} value={cExpiry} onChange={(e) => setCExpiry(e.target.value)} />
                 <FieldDescription>保存为 RFC3339 UTC；到达时刻后请求返回 401。</FieldDescription>
               </Field>
               <div className="grid grid-cols-2 gap-3">
@@ -505,7 +508,7 @@ export function KeysView() {
           </div>
           <Field>
             <FieldLabel>到期时间（本地时区，留空 = 永不过期）</FieldLabel>
-            <Input type="datetime-local" value={expiry} onChange={(e) => setExpiry(e.target.value)} />
+            <Input type="datetime-local" step={1} value={expiry} onChange={(e) => setExpiry(e.target.value)} />
             <FieldDescription>保存为 RFC3339 UTC；到达时刻后请求返回 401。</FieldDescription>
           </Field>
           <Field>
