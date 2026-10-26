@@ -81,7 +81,11 @@ func newSecurePanel(t *testing.T) (*Panel, *pool.Pool, *httptest.Server) {
 func TestExportImportEncryptedEndToEnd(t *testing.T) {
 	t.Parallel()
 	panel2, p, _ := newSecurePanel(t)
-	p.Add(&auth.Auth{UID: "u1", AccessToken: "at-secret", RefreshToken: "rt-secret", ExpiresAt: 9999999999, Nickname: "甲"})
+	p.Add(&auth.Auth{
+		UID: "u1", AccessToken: "at-secret", RefreshToken: "rt-secret",
+		ExpiresAt: 9999999999, Nickname: "甲",
+		IDSource: "static_key", DepartmentFullName: "研发部",
+	})
 
 	// 导出。
 	body, _ := json.Marshal(map[string]string{"password": "correct horse battery"})
@@ -130,6 +134,8 @@ func TestExportImportEncryptedEndToEnd(t *testing.T) {
 
 	if a := testCase.AuthByUID("u1"); a == nil || a.AccessTokenValue() != "at-secret" {
 		t.Fatalf("imported account missing or token mismatch: %+v", a)
+	} else if a.IDSource != "static_key" || a.DepartmentFullName != "研发部" {
+		t.Fatalf("身份头字段未随备份恢复: %+v", a)
 	}
 }
 
