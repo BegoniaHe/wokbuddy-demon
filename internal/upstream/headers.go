@@ -302,12 +302,9 @@ func injectChatDomain(req *http.Request, account *auth.Auth) {
 		return
 	}
 
-	// 有部门信息时由 injectIdentityHeaders 发 X-Department-Info，不能再声明
-	// X-No-Department-Info（两者互斥）。
-	if account != nil && strings.TrimSpace(account.DepartmentFullName) != "" {
-		return
-	}
-
+	// 有部门信息时由 injectIdentityHeaders 发 X-Department-Info 并删掉本声明
+	// （两者互斥）。这里仍先写 X-No-Department-Info：只调 injectChatDomain 的
+	// 端点（FetchModels 等）保持原有的「无部门」声明。
 	req.Header.Set("X-No-Department-Info", "1")
 }
 
@@ -506,6 +503,7 @@ func (*Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 	}
 
 	if department := strings.TrimSpace(account.DepartmentFullName); department != "" {
+		req.Header.Del("X-No-Department-Info")
 		req.Header.Set("X-Department-Info", department)
 	}
 

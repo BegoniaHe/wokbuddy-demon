@@ -124,6 +124,45 @@ func TestDesktopFingerprintHeadersAbsent(t *testing.T) {
 	}
 }
 
+// TestChatHeadersDepartmentInfoExcludesNoDepartment 有 departmentFullName 时
+// ChatHeaders 发 X-Department-Info 并移除 X-No-Department-Info；只调
+// injectChatDomain 的 FetchModels 类端点仍保留「无部门」声明。
+func TestChatHeadersDepartmentInfoExcludesNoDepartment(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1", DepartmentFullName: "研发部"}
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	New().ChatHeaders(req, account, "", ChatMeta{})
+
+	if got := req.Header.Get("X-Department-Info"); got != "研发部" {
+		t.Errorf("X-Department-Info=%q", got)
+	}
+
+	if got := req.Header.Get("X-No-Department-Info"); got != "" {
+		t.Errorf("X-No-Department-Info=%q should be removed", got)
+	}
+
+	modelsReq, err := http.NewRequest(http.MethodPost, "https://example.invalid/v3/config", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injectChatDomain(modelsReq, account)
+
+	if got := modelsReq.Header.Get("X-No-Department-Info"); got != "1" {
+		t.Errorf("non-chat X-No-Department-Info=%q want 1", got)
+	}
+
+	if got := modelsReq.Header.Get("X-Department-Info"); got != "" {
+		t.Errorf("non-chat X-Department-Info=%q want empty", got)
+	}
+}
+
 // TestConversationHeaderPrefersInbound 客户端显式 conversationId 优先于兜底值。
 func TestConversationHeaderPrefersInbound(t *testing.T) {
 	t.Parallel()
