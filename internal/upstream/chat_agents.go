@@ -129,11 +129,11 @@ func selectChatAgent(agents []modelAgent) (modelAgent, bool) {
 	return modelAgent{}, false
 }
 
-// newModelChatWhitelist 构造默认 agent 判定。没有可用 agent 或 agent models
-// 为空时保持 undecided：此时不隐藏任何模型。
+// newModelChatWhitelist 构造默认 agent 判定。没有可用 agent 时保持 undecided；
+// 选中 agent 的 models 为空也算已判定：官方此时 H 为空，只剩 custom / chat 可见。
 func newModelChatWhitelist(agents []modelAgent) modelChatWhitelist {
 	agent, ok := selectChatAgent(agents)
-	if !ok || len(agent.Models) == 0 {
+	if !ok {
 		return modelChatWhitelist{}
 	}
 

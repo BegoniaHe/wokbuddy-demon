@@ -104,6 +104,38 @@ func TestChatVisibilityRules(t *testing.T) {
 	}
 }
 
+// TestChatVisibilityEmptyAgentModels default/cli agent 的 models 为空时官方仍按
+// 该 agent 判定：H 为空，仅 custom 与 tags 含 chat 的模型可见，不能退回全量。
+func TestChatVisibilityEmptyAgentModels(t *testing.T) {
+	t.Parallel()
+
+	infos := []ModelInfo{
+		{ID: "chat", Tags: []string{"chat"}},
+		{ID: "custom", Tags: []string{"custom"}},
+		{ID: "other"},
+	}
+
+	for _, agent := range []modelAgent{
+		{Name: "default", Tags: []string{"default"}},
+		{Name: "cli"},
+	} {
+		whitelist := newModelChatWhitelist([]modelAgent{agent, {Name: "later", Models: []string{"other"}}})
+		whitelist.apply(infos)
+
+		if infos[0].ChatVisible == nil || !*infos[0].ChatVisible {
+			t.Errorf("%s: chat 模型应可见", agent.Name)
+		}
+
+		if infos[1].ChatVisible == nil || !*infos[1].ChatVisible {
+			t.Errorf("%s: custom 模型应可见", agent.Name)
+		}
+
+		if infos[2].ChatVisible == nil || *infos[2].ChatVisible {
+			t.Errorf("%s: 空白名单下普通模型应隐藏", agent.Name)
+		}
+	}
+}
+
 // TestChatVisibilityNameMatch 白名单条目可匹配 model.name，而不只是 id。
 func TestChatVisibilityNameMatch(t *testing.T) {
 	t.Parallel()
