@@ -346,11 +346,17 @@ func validateCrossVersion(src *Source, emit *Emit) error {
 	for key, value := range map[string]string{
 		"chatUA": emit.ChatUA, "desktopUA": emit.DesktopUA,
 		"xIdeVersion": emit.XIdeVersion, "desktopIdeVersion": emit.DesktopIdeVersion,
-		"desktopExtVersion": emit.DesktopExtVersion,
 	} {
 		if !strings.Contains(value, src.Version) {
 			return fmt.Errorf("emit.%s 未包含 source.version=%q: %w", key, src.Version, errInvalidProfile)
 		}
+	}
+
+	// 官方 pluginVersion 恒取 resolveProductVersion()，cn/global 当前都与
+	// source.version 同源；desktopIdeVersion 允许未来 platformVersion 独立，故只要求包含。
+	if emit.DesktopExtVersion != src.Version {
+		return fmt.Errorf("emit.desktopExtVersion=%q 必须等于 source.version=%q: %w",
+			emit.DesktopExtVersion, src.Version, errInvalidProfile)
 	}
 
 	for key, value := range map[string]string{"chatUA": emit.ChatUA, "desktopUA": emit.DesktopUA} {

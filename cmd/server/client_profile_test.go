@@ -40,7 +40,7 @@ func writeClientProfile(t *testing.T, dir, realm string) {
 			"billingUA":         "WorkBuddy/9.9.9",
 			"xIdeVersion":       "9.9.9",
 			"desktopIdeVersion": "9.9.9",
-			"desktopExtVersion": "9.9.9.7",
+			"desktopExtVersion": "9.9.9",
 			"loginPlatform":     "workbuddy",
 			"loginUA":           "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
 		},

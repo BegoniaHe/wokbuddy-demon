@@ -30,7 +30,7 @@ const fakeCNProfile = `{
     "billingUA": "WorkBuddy/9.9.9",
     "xIdeVersion": "9.9.9",
     "desktopIdeVersion": "9.9.9",
-    "desktopExtVersion": "9.9.9.7",
+    "desktopExtVersion": "9.9.9",
     "loginPlatform": "workbuddy",
     "loginUA": null
   },
@@ -47,7 +47,7 @@ const fakeCNProfile = `{
 }`
 
 // TestClientProfileOverridesFingerprint profile 存在时整份覆盖 UA / IDE 版本 /
-// 构建指纹；desktopExtVersion 独立于 desktopIdeVersion。
+// 构建指纹；desktopExtVersion 与 source.version 同源。
 func TestClientProfileOverridesFingerprint(t *testing.T) {
 	t.Parallel()
 
@@ -79,7 +79,7 @@ func TestClientProfileOverridesFingerprint(t *testing.T) {
 	}
 
 	fingerprint := client.desktopFingerprint(account)
-	if fingerprint["ideVersion"] != "9.9.9" || fingerprint["extVersion"] != "9.9.9.7" {
+	if fingerprint["ideVersion"] != "9.9.9" || fingerprint["extVersion"] != "9.9.9" {
 		t.Errorf("指纹版本 ide=%v ext=%v", fingerprint["ideVersion"], fingerprint["extVersion"])
 	}
 

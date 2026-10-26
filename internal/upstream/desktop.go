@@ -85,7 +85,8 @@ func (c *Client) desktopBuildFor(account *auth.Auth) desktopBuild {
 	}
 }
 
-// desktopExtVersionFor 上报事件的 extVersion：profile 可独立取值，不跟 ideVersion 绑定。
+// desktopExtVersionFor 上报事件的 extVersion：取 profile 值；clientprofile 校验
+// 当前要求它与 source.version 同源（官方 pluginVersion 恒取产品版本）。
 func (c *Client) desktopExtVersionFor(account *auth.Auth) string {
 	if p := c.profileFor(account); p != nil && p.Emit.DesktopExtVersion != "" {
 		return p.Emit.DesktopExtVersion
@@ -127,28 +128,23 @@ func deriveID(a *auth.Auth, salt string) string {
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
 type DesktopEvent map[string]any
 
-// desktopMemBands 核心数区间 → 内存档（GB）加权表，重复即权重。
-// 整体单调：核多则内存大；4 核不配 32G，16 核以上不再出现 8G，
-// 18 核以上一律 32G（该核心数只出现在高端整机上）。
+// desktopMemBands 逻辑线程数区间 → 内存档（GB）加权表，重复即权重。
+// 整体单调：线程多则内存大；8 线程及以下不配 32G，高线程不配 8G；
+// 24/28/32 线程才出现 64G（高端整机，低权重）。移动段另由
+// desktopMemoryFor 压到 32G 以内。
 var desktopMemBands = []struct {
-	maxCores int
-	mem      []int
+	maxThreads int
+	mem        []int
 }{
 	{4, []int{8, 8, 16}},
-	{6, []int{8, 16, 16, 16}},
-	{8, []int{16, 16, 16, 32}},
-	{12, []int{16, 16, 16, 32}},
+	{6, []int{8, 16, 16}},
+	{8, []int{16, 16, 16}},
+	{12, []int{16, 16, 32}},
 	{16, []int{16, 32, 32}},
-	{32, []int{32}},
-}
-
-// desktopCPUModel 按逻辑线程数与 uid 稳定选一个 CPU 型号：同一账号恒定，
-// 不同账号可不同。官方 os 处理器上报的是逻辑处理器数，故按线程档取型号。
-func desktopCPUModel(account *auth.Auth, cpuCores int) string {
-	pool := cpupool.ModelsForThreads(cpuCores)
-	rng := desktopRNG(account, "cpu")
-
-	return pool[rng.IntN(len(pool))].Name
+	{20, []int{16, 32, 32}},
+	{24, []int{32, 32, 64}},
+	{28, []int{32, 32, 32, 64}},
+	{32, []int{32, 32, 32, 64}},
 }
 
 // 上游事件/缓存共用的字段名。
@@ -172,34 +168,143 @@ func desktopRNG(a *auth.Auth, salt string) *rand.Rand {
 	))
 }
 
-// desktopHardware 由 uid 稳定派生一台「固定设备」的 osVersion/cpuCores/memorySize：
-//   - osVersion：从 ospool 按版本权重轮换（Windows 10/11 各版本，来源见 ospool）；
-//   - cpuCores：N(10, 5.5) 取偶后截断到 [4,32]，再归到 CPU 型号池线程档——
-//     8~12 线程的装机量占多数，16 线程以上是少数，4 线程为老机型；
-//   - memorySize：按核心数分档加权抽样，核多内存大，16GB 最主流。
-func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) {
+// desktopHardware 由 uid 稳定派生一台「固定设备」的 osVersion/CPU/内存：
+//   - cpu：N(10, 5.5) 取偶后截断到 [4,32]，归到 CPU 型号池线程档后按 uid 选具体型号
+//     ——8~12 线程的装机量占多数，16 线程以上是少数，4 线程为老机型；
+//   - osVersion：先定 CPU 型号，再只在 MinCPUYear <= 型号发布年的版本里按权重抽，
+//     避免新系统配老平台；
+//   - memorySize：按该型号的逻辑线程数与 Segment 分档加权抽样，核多内存大，16GB 最主流。
+func desktopHardware(a *auth.Auth) (osVersion string, cpu cpupool.CPUModel, memorySize int) {
 	rng := desktopRNG(a, "hardware")
 
-	osVersion = ospool.Pick(rng).Build
-
-	cpuCores = int(math.Round((rng.NormFloat64()*5.5+10)/2)) * 2 // 偶数核
-	cpuCores = min(max(cpuCores, 4), 32)
+	threads := int(math.Round((rng.NormFloat64()*5.5+10)/2)) * 2 // 偶数线程
+	threads = min(max(threads, 4), 32)
 	// 归到 CPU 型号池的线程档，避免 cpuCores 与 cpuModel 的线程数互相矛盾。
-	cpuCores = cpupool.SnapThreads(cpuCores)
+	threads = cpupool.SnapThreads(threads)
 
+	pool := cpupool.ModelsForThreads(threads)
+	cpu = pool[rng.IntN(len(pool))]
+
+	osVersion = desktopOSVersionFor(rng, cpu.Year)
+	memorySize = desktopMemoryFor(rng, cpu)
+
+	return osVersion, cpu, memorySize
+}
+
+// desktopOSVersionFor 在 CPU 发布年允许的 Windows 版本里按权重抽一个；
+// 候选为空（理论上不会发生）时退到门槛最低的版本。
+func desktopOSVersionFor(rng *rand.Rand, cpuYear int) string {
+	candidates := make([]int, 0, len(ospool.Releases))
+	total := 0
+
+	for i, release := range ospool.Releases {
+		if release.MinCPUYear > cpuYear {
+			continue
+		}
+
+		candidates = append(candidates, i)
+		total += release.Weight
+	}
+
+	if len(candidates) == 0 {
+		minYear := math.MaxInt
+		for _, release := range ospool.Releases {
+			minYear = min(minYear, release.MinCPUYear)
+		}
+
+		for i, release := range ospool.Releases {
+			if release.MinCPUYear == minYear {
+				candidates = append(candidates, i)
+				total += release.Weight
+			}
+		}
+	}
+
+	pick := rng.IntN(total)
+
+	for _, i := range candidates {
+		release := ospool.Releases[i]
+		if pick < release.Weight {
+			return release.Build
+		}
+
+		pick -= release.Weight
+	}
+
+	return ospool.Releases[candidates[len(candidates)-1]].Build
+}
+
+// desktopMemoryFor 按 CPU 型号的逻辑线程数选内存档；移动段上限 32G。
+func desktopMemoryFor(rng *rand.Rand, cpu cpupool.CPUModel) int {
 	mem := []int{32}
 
 	for _, band := range desktopMemBands {
-		if cpuCores <= band.maxCores {
+		if cpu.Threads <= band.maxThreads {
 			mem = band.mem
 
 			break
 		}
 	}
 
-	memorySize = mem[rng.IntN(len(mem))]
+	if cpu.Segment == cpupool.Mobile {
+		desktop := make([]int, 0, len(mem))
 
-	return osVersion, cpuCores, memorySize
+		for _, size := range mem {
+			if size <= 32 {
+				desktop = append(desktop, size)
+			}
+		}
+
+		if len(desktop) > 0 {
+			mem = desktop
+		} else {
+			mem = []int{32}
+		}
+	}
+
+	return mem[rng.IntN(len(mem))]
+}
+
+// desktopTimezone 桌面事件 timezone：cn 部署固定上海；global 优先取宿主 TZ
+// （行为与官方 Intl 解析宿主时区一致），取不到则不注入该键。
+func desktopTimezone(realm string) string {
+	if realm != "global" {
+		return "Asia/Shanghai"
+	}
+
+	if tz := strings.TrimSpace(os.Getenv("TZ")); tz != "" {
+		if _, err := time.LoadLocation(tz); err == nil {
+			return tz
+		}
+	}
+
+	if local := time.Local.String(); local != "" && local != "Local" {
+		return local
+	}
+
+	return ""
+}
+
+// desktopSessionID 进程内按账号缓存一次随机 UUIDv4：官方 fallbackSessionId 跟随
+// 客户端进程，重启后刷新；这里不落盘，且不同账号各自独立。
+func (c *Client) desktopSessionID(a *auth.Auth) string {
+	key := a.Realm() + "\x00" + a.UID
+
+	c.desktopSessionMu.Lock()
+	defer c.desktopSessionMu.Unlock()
+
+	if c.desktopSessionIDs == nil {
+		c.desktopSessionIDs = make(map[string]string)
+	}
+
+	if id, ok := c.desktopSessionIDs[key]; ok {
+		return id
+	}
+
+	id := session.NewUUIDv4()
+	c.desktopSessionIDs[key] = id
+
+	return id
 }
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
@@ -208,13 +313,12 @@ func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) 
 // osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
 func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 	desktopBuild2 := c.desktopBuildFor(account7)
-	osVersion, cpuCores, memorySize := desktopHardware(account7)
-	cpuModel := desktopCPUModel(account7, cpuCores)
+	osVersion, cpu, memorySize := desktopHardware(account7)
 	now := time.Now().UnixMilli()
 
 	fingerprint := map[string]any{
-		"timezone":     "Asia/Shanghai",
-		"reportDelay":  2000,
+		// 单请求立即发送：官方构造时为 0、发送前按当前时间重算，此处等价于 0。
+		"reportDelay":  0,
 		"userId":       account7.UID,
 		"username":     account7.NicknameValue(),
 		"userNickname": account7.NicknameValue(),
@@ -224,22 +328,31 @@ func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
 		"ideVersion":   desktopBuild2.version,
-		"machineId":    deriveID(account7, "machine"),
-		"sessionId":    deriveID(account7, "session"),
-		"extName":      "workbuddy-desktop",
-		keyExtVersion:  c.desktopExtVersionFor(account7),
-		"os":           "win32",
-		"arch":         "x64",
-		"osVersion":    osVersion,
-		"cpuModel":     cpuModel,
-		"cpuCores":     cpuCores,
-		"memorySize":   memorySize,
-		"timestamp":    now,
-		"presentAt":    now,
+		// machineId 官方取 Windows MachineGuid；网关按账号派生是刻意差异：
+		// 保证同一账号稳定、不同账号隔离，且不暴露宿主真实设备标识。
+		"machineId":   deriveID(account7, "machine"),
+		"sessionId":   c.desktopSessionID(account7),
+		"extName":     "workbuddy-desktop",
+		keyExtVersion: c.desktopExtVersionFor(account7),
+		"os":          "win32",
+		"arch":        "x64",
+		"osVersion":   osVersion,
+		"cpuModel":    cpu.Name,
+		"cpuCores":    cpu.Threads,
+		"memorySize":  memorySize,
+		"timestamp":   now,
 	}
 
+	if tz := desktopTimezone(account7.Realm()); tz != "" {
+		fingerprint["timezone"] = tz
+	}
+
+	// presentAt 只出现在官方部分下游遥测业务事件，基础 /v2/report 指纹不注入。
 	// qimei36 故意不注入：网关没有真实腾讯设备标识，派生值属于伪造，
-	// 宁可缺这个键也不误报。
+	// 宁可缺这个键也不误报（官方注入链归 #301 跟踪）。
+	// downloadChannel 官方读 Windows 注册表 HKCU/HKLM\Software\WorkBuddy，有值才写；
+	// 网关没有真实安装来源，省略该键，不猜固定值。
+	// clientIp 官方仅在 detector 有值时注入，服务端也能从连接取 IP，影响低，不做。
 
 	if account7.EnterpriseID != "" {
 		fingerprint["enterpriseId"] = account7.EnterpriseID

@@ -72,6 +72,8 @@ func assertReportDesktopRequest(t *testing.T, r *http.Request) {
 }
 
 // assertDesktopEventFingerprint 断言上报事件被注入 workbuddy-desktop 公共指纹。
+//
+//nolint:cyclop // 逐字段校验公共指纹，拆开反而难读。
 func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	t.Helper()
 
@@ -99,7 +101,15 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	if table["mode"] != "craft" {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", table["mode"])
 	}
-	// machineId/sessionId 应为 uid 稳定派生的连字符 UUIDv4。
+
+	if got, ok := table["reportDelay"].(float64); !ok || got != 0 {
+		t.Errorf("reportDelay=%v want 0（单请求立即发送）", table["reportDelay"])
+	}
+
+	if _, ok := table["presentAt"]; ok {
+		t.Error("基础 /v2/report 指纹不应注入 presentAt")
+	}
+	// machineId 按账号派生、sessionId 进程内随机，都应是带连字符的 UUIDv4。
 	for _, key := range []string{"machineId", "sessionId"} {
 		if got, _ := table[key].(string); !uuidV4HeaderPattern.MatchString(got) {
 			t.Errorf("%s=%q want UUIDv4", key, got)
@@ -107,6 +117,56 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	}
 
 	assertDesktopMachineFingerprint(t, table)
+}
+
+// TestDesktopSessionIDProcessScoped sessionId 在同一进程内按账号稳定、不同账号不同，
+// 且不随指纹调用重新生成。
+func TestDesktopSessionIDProcessScoped(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	firstAccount := &auth.Auth{UID: "u-session-a", Nickname: "a"}
+	secondAccount := &auth.Auth{UID: "u-session-b", Nickname: "b"}
+
+	first := client.desktopSessionID(firstAccount)
+
+	second := client.desktopSessionID(firstAccount)
+	if first != second {
+		t.Fatalf("同账号 sessionId 不稳定：%q vs %q", first, second)
+	}
+
+	if !uuidV4HeaderPattern.MatchString(first) {
+		t.Fatalf("sessionId=%q want UUIDv4", first)
+	}
+
+	if other := client.desktopSessionID(secondAccount); other == first {
+		t.Fatalf("不同账号共用 sessionId=%q", first)
+	}
+
+	fp := client.desktopFingerprint(firstAccount)
+	if fp["sessionId"] != first {
+		t.Errorf("fingerprint sessionId=%v want %q", fp["sessionId"], first)
+	}
+}
+
+// TestDesktopTimezonePerRealm cn 固定上海；global 取宿主 TZ，取不到则省略。
+func TestDesktopTimezonePerRealm(t *testing.T) {
+	t.Setenv("TZ", "America/New_York")
+
+	if got := desktopTimezone("cn"); got != "Asia/Shanghai" {
+		t.Errorf("cn timezone=%q want Asia/Shanghai", got)
+	}
+
+	if got := desktopTimezone("global"); got != "America/New_York" {
+		t.Errorf("global timezone=%q want America/New_York", got)
+	}
+
+	client := newProfileClient(t)
+	global := &auth.Auth{UID: "u-gl-tz", Domain: "www.workbuddy.ai"}
+
+	if got := client.desktopFingerprint(global)["timezone"]; got != "America/New_York" {
+		t.Errorf("global 指纹 timezone=%v want America/New_York", got)
+	}
 }
 
 // assertDesktopMachineFingerprint 断言真机 OS 处理器字段，并确认不伪造 qimei36。
