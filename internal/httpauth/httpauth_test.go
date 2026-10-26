@@ -154,3 +154,53 @@ func TestDigestIsFixedLength(t *testing.T) {
 		t.Errorf("sha256 digest length = %d, want 32", len(digest("x")))
 	}
 }
+
+// TestAuthenticateManagement 管理面作用域矩阵：默认回落、admin、readonly、
+// 未配置限权、未命中。
+func TestAuthenticateManagement(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		defaultKey string
+		adminKey   string
+		readonly   string
+		authz      string
+		wantOK     bool
+		wantScope  Scope
+		wantDef    bool
+	}{
+		{"全空放行", "", "", "", "", true, ScopeAdmin, true},
+		{"单密钥默认回落 admin", "sk-api", "", "", "Bearer sk-api", true, ScopeAdmin, true},
+		{"单密钥错误拒绝", "sk-api", "", "", "Bearer nope", false, ScopeNone, false},
+		{"admin 命中", "sk-api", "sk-admin", "", "Bearer sk-admin", true, ScopeAdmin, false},
+		{"readonly 命中", "sk-api", "sk-admin", "sk-ro", "Bearer sk-ro", true, ScopeReadonly, false},
+		{"默认密钥不再进管理面", "sk-api", "sk-admin", "", "Bearer sk-api", false, ScopeNone, false},
+		{"仅 readonly 时 admin 不可用", "sk-api", "", "sk-ro", "Bearer sk-api", false, ScopeNone, false},
+		{"仅 readonly 命中", "sk-api", "", "sk-ro", "Bearer sk-ro", true, ScopeReadonly, false},
+		{"未命中", "sk-api", "sk-admin", "sk-ro", "Bearer nope", false, ScopeNone, false},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := AuthenticateManagement(req(item.authz), item.defaultKey, item.adminKey, item.readonly)
+			if got.OK != item.wantOK || got.Scope != item.wantScope || got.IsDefault != item.wantDef {
+				t.Errorf("got %+v, want {OK:%v Scope:%v IsDefault:%v}",
+					got, item.wantOK, item.wantScope, item.wantDef)
+			}
+		})
+	}
+}
+
+func TestScopeAllowsRead(t *testing.T) {
+	t.Parallel()
+
+	if ScopeNone.AllowsRead() || ScopeData.AllowsRead() {
+		t.Error("none/data 不应允许管理面读取")
+	}
+
+	if !ScopeReadonly.AllowsRead() || !ScopeAdmin.AllowsRead() {
+		t.Error("readonly/admin 应允许管理面读取")
+	}
+}

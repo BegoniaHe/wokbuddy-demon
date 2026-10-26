@@ -6,12 +6,18 @@
 package panel
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 )
 
+// redactedConfigKeys 配置回显时必须抹掉的顶层凭据字段。前端 secret 字段留空
+// 表示「保持原值」，保存时 merge 不会清空未提交的键。
+var redactedConfigKeys = []string{"api_key", "admin_api_key", "readonly_api_key"}
+
 // getConfig 返回当前配置文件内容与路径（前端按 schema 渲染表单）。
+// 三把顶层凭据统一置空：GET /panel/api/config 仅 admin 可达，但仍不回显原文。
 func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.LoadConfig == nil {
 		writeErr(w, http.StatusNotImplemented, "config api not available")
@@ -24,10 +30,26 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	raw, err := json.Marshal(cfg)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "encode config: "+err.Error())
+		return
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		writeErr(w, http.StatusInternalServerError, "encode config: "+err.Error())
+		return
+	}
+
+	for _, key := range redactedConfigKeys {
+		doc[key] = ""
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":     true,
 		"path":   p.cfg.ConfigPath,
-		"config": cfg,
+		"config": doc,
 	})
 }
 

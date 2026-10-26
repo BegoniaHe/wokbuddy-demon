@@ -262,14 +262,16 @@ func buildAuth(doc, authObj, accountObj map[string]any, key keyMaterial) (*auth.
 	}
 
 	account := &auth.Auth{
-		AccessToken:  at,
-		RefreshToken: str,
-		Domain:       stringField(authObj, "domain"),
-		UID:          stringField(accountObj, "uid"),
-		EnterpriseID: stringField(accountObj, "enterpriseId"),
-		Nickname:     stringField(accountObj, "nickname"),
-		ExpiresAt:    authExpiry(authObj),
-		DeviceToken:  deviceToken(doc, key),
+		AccessToken:        at,
+		RefreshToken:       str,
+		Domain:             stringField(authObj, "domain"),
+		UID:                stringField(accountObj, "uid"),
+		EnterpriseID:       stringField(accountObj, "enterpriseId"),
+		IDSource:           stringField(accountObj, "idSource"),
+		DepartmentFullName: stringField(accountObj, "departmentFullName"),
+		Nickname:           stringField(accountObj, "nickname"),
+		ExpiresAt:          authExpiry(authObj),
+		DeviceToken:        deviceToken(doc, key),
 	}
 	if account.Nickname == "" {
 		account.Nickname = stringField(accountObj, "email")

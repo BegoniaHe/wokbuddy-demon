@@ -10,6 +10,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
@@ -267,25 +268,29 @@ type handlerDeps struct {
 	requestLog     *reqlog.Recorder
 	notifier       notify.Sender
 	trustedProxies []*net.IPNet
+	authLimiter    *httpauth.Limiter
 }
 
 // buildHandler 把装配期依赖映射为 server.Config；这些字段改动需重启。
 func buildHandler(handlerDeps2 *handlerDeps) *server.Handler {
 	return server.NewHandler(&server.Config{
-		Pool:         handlerDeps2.pool,
-		Upstream:     handlerDeps2.up,
-		APIKey:       handlerDeps2.cfg.APIKey,
-		Keys:         handlerDeps2.keys,
-		Session:      handlerDeps2.session,
-		StickyCount:  handlerDeps2.stickyCount,
-		RedisMode:    handlerDeps2.redisMode,
-		SoftCooldown: handlerDeps2.cfg.SoftRateDur,
-		Panel:        handlerDeps2.panel,
-		Live:         handlerDeps2.live,
-		Usage:        handlerDeps2.usage,
-		RequestLog:   handlerDeps2.requestLog,
-		PromptMode:   handlerDeps2.cfg.Prompt.Mode,
-		PromptText:   handlerDeps2.cfg.PromptText,
+		Pool:           handlerDeps2.pool,
+		Upstream:       handlerDeps2.up,
+		APIKey:         handlerDeps2.cfg.APIKey,
+		AdminAPIKey:    handlerDeps2.cfg.AdminAPIKey,
+		ReadonlyAPIKey: handlerDeps2.cfg.ReadonlyAPIKey,
+		AuthLimiter:    handlerDeps2.authLimiter,
+		Keys:           handlerDeps2.keys,
+		Session:        handlerDeps2.session,
+		StickyCount:    handlerDeps2.stickyCount,
+		RedisMode:      handlerDeps2.redisMode,
+		SoftCooldown:   handlerDeps2.cfg.SoftRateDur,
+		Panel:          handlerDeps2.panel,
+		Live:           handlerDeps2.live,
+		Usage:          handlerDeps2.usage,
+		RequestLog:     handlerDeps2.requestLog,
+		PromptMode:     handlerDeps2.cfg.Prompt.Mode,
+		PromptText:     handlerDeps2.cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo:    handlerDeps2.cfg.Logging.RequestClientInfo,

@@ -54,7 +54,6 @@ export function ConfigView() {
   const [values, setValues] = useState<Record<string, FieldValue>>({});
   const [path, setPath] = useState('');
   const [note, setNote] = useState('');
-  const [showKey, setShowKey] = useState(false);
   const [saving, setSaving] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [clears, setClears] = useState<Record<string, boolean>>({});
@@ -108,8 +107,35 @@ export function ConfigView() {
       const r = await postJSON<{ restart_required?: string[] }>('config', payload);
       const n = (r.restart_required || []).length;
       toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-      const k = String(values.api_key ?? '').trim();
-      if (k) localStorage.setItem(LS_KEY, k);
+      // 保存后先确认现有管理凭据是否仍然有效，再决定是否替换：
+      // - 新增 readonly 不应把已认证的 admin 降级；
+      // - 单密钥模式下改 api_key 后，旧值失效，新值继续用于管理面。
+      const admin = String(values.admin_api_key ?? '').trim();
+      const readonly = String(values.readonly_api_key ?? '').trim();
+      const apiKeyValue = String(values.api_key ?? '').trim();
+      const existing = localStorage.getItem(LS_KEY) ?? '';
+
+      if (admin) {
+        localStorage.setItem(LS_KEY, admin);
+      } else {
+        let existingValid = false;
+
+        if (existing) {
+          try {
+            existingValid = (await fetch('/panel/api/overview', {
+              headers: { Authorization: 'Bearer ' + existing },
+            })).ok;
+          } catch {
+            existingValid = false;
+          }
+        }
+
+        if (!existingValid) {
+          if (readonly) localStorage.setItem(LS_KEY, readonly);
+          else if (apiKeyValue) localStorage.setItem(LS_KEY, apiKeyValue);
+          else localStorage.removeItem(LS_KEY);
+        }
+      }
       await load();
       await qc.invalidateQueries({ queryKey: ['overview'] });
     } catch (e) {
@@ -195,14 +221,39 @@ export function ConfigView() {
               <FieldDescription>改动需重启进程</FieldDescription>
             </Field>
             <Field>
-              <FieldLabel>API 密钥</FieldLabel>
+              <FieldLabel>数据面 API 密钥</FieldLabel>
+              {text('api_key', { type: 'password', autoComplete: 'new-password', placeholder: '留空 = 保持原值（未设置则不鉴权）' })}
+              <FieldDescription>仅用于 /v1/*；配置管理密钥后不再拥有面板/运维权限。立即生效，不支持在此清除</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>管理密钥（admin）</FieldLabel>
               <div className="flex items-center gap-2">
-                {text('api_key', { type: showKey ? 'text' : 'password', autoComplete: 'new-password', placeholder: '留空 = 不鉴权' })}
-                <Button size="xs" onClick={() => setShowKey((s) => !s)}>
-                  {showKey ? '隐藏' : '显示'}
+                {text('admin_api_key', { type: 'password', autoComplete: 'new-password', placeholder: clears.admin_api_key ? '保存后清除' : '留空 = 保持原值' })}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant={clears.admin_api_key ? 'destructive' : 'ghost'}
+                  onClick={() => setClears((prev) => ({ ...prev, admin_api_key: !prev.admin_api_key }))}
+                >
+                  {clears.admin_api_key ? '取消清除' : '清除'}
                 </Button>
               </div>
-              <FieldDescription>立即生效（含面板自身）</FieldDescription>
+              <FieldDescription>完整管理/运维权限；任一把管理密钥非空后 api_key 不再能访问面板</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>只读密钥（readonly）</FieldLabel>
+              <div className="flex items-center gap-2">
+                {text('readonly_api_key', { type: 'password', autoComplete: 'new-password', placeholder: clears.readonly_api_key ? '保存后清除' : '留空 = 保持原值' })}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant={clears.readonly_api_key ? 'destructive' : 'ghost'}
+                  onClick={() => setClears((prev) => ({ ...prev, readonly_api_key: !prev.readonly_api_key }))}
+                >
+                  {clears.readonly_api_key ? '取消清除' : '清除'}
+                </Button>
+              </div>
+              <FieldDescription>仅只读 GET；写操作与配置读取要求 admin</FieldDescription>
             </Field>
           </div>
           <div className="mt-4 grid gap-x-5 gap-y-4 md:grid-cols-2">

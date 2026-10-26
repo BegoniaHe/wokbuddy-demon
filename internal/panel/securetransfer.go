@@ -58,6 +58,10 @@ type secureAccount struct {
 	Realm        string `json:"realm,omitempty"`
 	EnterpriseID string `json:"enterprise_id,omitempty"`
 	DeviceToken  string `json:"device_token,omitempty"`
+	// 静态 Key / 企业身份头字段：导出再导入后出站仍需 X-Id-Source 与
+	// X-Department-Info，不能只保留 enterpriseId。
+	IDSource           string `json:"id_source,omitempty"`
+	DepartmentFullName string `json:"department_full_name,omitempty"`
 }
 
 // secureEnvelope 加密备份外层（明文头 + base64 密文）。
@@ -188,15 +192,17 @@ func (p *Panel) collectSecureAccounts() []secureAccount {
 		}
 
 		out = append(out, secureAccount{
-			UID:          account.UID,
-			Nickname:     account.NicknameValue(),
-			AccessToken:  account.AccessTokenValue(),
-			RefreshToken: account.RefreshTokenValue(),
-			ExpiresAt:    account.ExpiresAtValue(),
-			Domain:       account.DomainValue(),
-			Realm:        account.Realm(),
-			EnterpriseID: account.EnterpriseID,
-			DeviceToken:  account.DeviceToken,
+			UID:                account.UID,
+			Nickname:           account.NicknameValue(),
+			AccessToken:        account.AccessTokenValue(),
+			RefreshToken:       account.RefreshTokenValue(),
+			ExpiresAt:          account.ExpiresAtValue(),
+			Domain:             account.DomainValue(),
+			Realm:              account.Realm(),
+			EnterpriseID:       account.EnterpriseID,
+			DeviceToken:        account.DeviceToken,
+			IDSource:           account.IDSource,
+			DepartmentFullName: account.DepartmentFullName,
 		})
 	}
 
@@ -381,14 +387,16 @@ func buildSecureAuth(acc *secureAccount, strVal, at, str, authDir string) *auth.
 	}
 
 	return &auth.Auth{
-		AccessToken:  at,
-		RefreshToken: str,
-		ExpiresAt:    expiresAt,
-		Domain:       acc.Domain,
-		UID:          strVal,
-		Nickname:     acc.Nickname,
-		EnterpriseID: acc.EnterpriseID,
-		DeviceToken:  acc.DeviceToken,
-		FilePath:     filepath.Join(authDir, fmt.Sprintf("workbuddy-%s.json", strVal)),
+		AccessToken:        at,
+		RefreshToken:       str,
+		ExpiresAt:          expiresAt,
+		Domain:             acc.Domain,
+		UID:                strVal,
+		Nickname:           acc.Nickname,
+		EnterpriseID:       acc.EnterpriseID,
+		DeviceToken:        acc.DeviceToken,
+		IDSource:           acc.IDSource,
+		DepartmentFullName: acc.DepartmentFullName,
+		FilePath:           filepath.Join(authDir, fmt.Sprintf("workbuddy-%s.json", strVal)),
 	}
 }
