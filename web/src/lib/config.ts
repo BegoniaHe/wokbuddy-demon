@@ -12,7 +12,9 @@ export interface FieldDef {
 
 export const CFG_FIELDS: FieldDef[] = [
   { name: 'listen', path: ['listen'], kind: 'text' },
-  { name: 'api_key', path: ['api_key'], kind: 'password' },
+  { name: 'api_key', path: ['api_key'], kind: 'password', secret: true },
+  { name: 'admin_api_key', path: ['admin_api_key'], kind: 'password', secret: true },
+  { name: 'readonly_api_key', path: ['readonly_api_key'], kind: 'password', secret: true },
   { name: 'auth_dir', path: ['auth_dir'], kind: 'text' },
   { name: 'state_file', path: ['state_file'], kind: 'text' },
   { name: 'package_detail_limit', path: ['panel', 'package_detail_limit'], kind: 'number' },

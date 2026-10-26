@@ -89,6 +89,93 @@ func Authenticate(r *http.Request, defaultKey string, keys []Key) AuthResult {
 	return AuthResult{OK: false, KeyID: "", IsDefault: false}
 }
 
+// Scope 一次鉴权命中的凭据作用域。ScopeNone 表示未命中任何候选。
+type Scope int
+
+const (
+	ScopeNone Scope = iota
+	// ScopeData 网关数据面凭据（默认 api_key / 命名密钥）。
+	ScopeData
+	// ScopeReadonly 管理面只读凭据。
+	ScopeReadonly
+	// ScopeAdmin 管理面完整凭据。
+	ScopeAdmin
+)
+
+// AllowsRead 报告该作用域能否读取管理面（admin 或 readonly）。
+func (s Scope) AllowsRead() bool { return s == ScopeAdmin || s == ScopeReadonly }
+
+// ScopeResult 管理/运维面一次作用域鉴权的结果。
+type ScopeResult struct {
+	OK        bool
+	Scope     Scope
+	IsDefault bool // 命中默认密钥（或未配置管理凭据时未鉴权放行）
+}
+
+// managementCredential 管理面候选凭据（摘要 + 作用域）。
+type managementCredential struct {
+	hash      []byte
+	scope     Scope
+	isDefault bool
+}
+
+// AuthenticateManagement 是管理面与运维面统一的作用域鉴权入口。
+//
+// 候选集合：
+//   - adminKey（admin）与 readonlyKey（readonly）任一非空时，只接受这两者；
+//     默认 api_key 不再获得管理权限（readonly 单独配置时没有 admin 候选）。
+//   - 两者都为空时回落到默认 api_key（ScopeAdmin）；默认也空则未鉴权放行。
+//
+// 常量时间口径与 Authenticate 一致：presented token 先摘要为定长，再对**全部**
+// 候选逐条 subtle.ConstantTimeCompare，不因命中提前返回。admin/readonly 只在
+// 这里参与比较，不会进入数据面 Authenticate 的候选集合。
+func AuthenticateManagement(r *http.Request, defaultKey, adminKey, readonlyKey string) ScopeResult {
+	candidates := managementCredentials(defaultKey, adminKey, readonlyKey)
+	if len(candidates) == 0 {
+		return ScopeResult{OK: true, Scope: ScopeAdmin, IsDefault: true}
+	}
+
+	got := digest(bearerToken(r))
+	matched := -1
+
+	for i := range candidates {
+		eq := subtle.ConstantTimeCompare(got, candidates[i].hash)
+		if eq == 1 && matched < 0 {
+			matched = i
+		}
+	}
+
+	if matched < 0 {
+		return ScopeResult{OK: false, Scope: ScopeNone}
+	}
+
+	hit := candidates[matched]
+
+	return ScopeResult{OK: true, Scope: hit.scope, IsDefault: hit.isDefault}
+}
+
+// managementCredentials 构造管理面候选凭据；返回空表示未启用鉴权。
+func managementCredentials(defaultKey, adminKey, readonlyKey string) []managementCredential {
+	if adminKey == "" && readonlyKey == "" {
+		if defaultKey == "" {
+			return nil
+		}
+
+		return []managementCredential{{hash: digest(defaultKey), scope: ScopeAdmin, isDefault: true}}
+	}
+
+	out := make([]managementCredential, 0, 2)
+	if adminKey != "" {
+		out = append(out, managementCredential{hash: digest(adminKey), scope: ScopeAdmin})
+	}
+
+	if readonlyKey != "" {
+		out = append(out, managementCredential{hash: digest(readonlyKey), scope: ScopeReadonly})
+	}
+
+	return out
+}
+
 // bearerToken 从 Authorization 头提取 Bearer token；缺头或方案不符时回退到
 // Anthropic 客户端使用的 X-Api-Key 头。两者都缺失返回空串（调用方仍会摘要后
 // 参与比较，保持耗时形状一致）。

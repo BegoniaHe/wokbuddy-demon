@@ -161,7 +161,11 @@ func main() {
 	defer obs.keys.Stop()
 	defer obs.reqlog.Close()
 
-	panel2 := newPanel(cfg, *cfgPath, state, client, sch, redisMode, sessCount, obs, trustedProxies)
+	// 管理与运维面共用同一份失败预算；/v1/* 的 clientAuthLimiter 仍独立。
+	authLimiter := httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow)
+	panel2 := newPanel(
+		cfg, *cfgPath, state, client, sch, redisMode, sessCount, obs, trustedProxies, authLimiter,
+	)
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
 	sch.SetGrowthHook(panel2.RunGrowthQueueOnce)
@@ -185,6 +189,7 @@ func main() {
 		requestLog:     obs.reqlog,
 		notifier:       notifier,
 		trustedProxies: trustedProxies,
+		authLimiter:    authLimiter,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -329,6 +334,7 @@ type observability struct {
 func newPanel(
 	cfg *Config, cfgPath string, state *pool.Pool, client4 *upstream.Client, sch *scheduler.Scheduler,
 	redisMode string, sessCount func() int, obs *observability, trustedProxies []*net.IPNet,
+	authLimiter *httpauth.Limiter,
 ) *panel.Panel {
 	// 积分变动账本（issue #201 / 上游 #138）：与 state 文件同目录，余额观测回调在
 	// 装配期挂上（New() 之后、开始服务之前，运行期只读）。账本是观测附属物：
@@ -351,6 +357,9 @@ func newPanel(
 		AuthDir:        cfg.AuthDir,
 		AuditDir:       stateSibling(cfg.StateFile, "audit"),
 		APIKey:         cfg.APIKey,
+		AdminAPIKey:    cfg.AdminAPIKey,
+		ReadonlyAPIKey: cfg.ReadonlyAPIKey,
+		AuthLimiter:    authLimiter,
 		TrustedProxies: trustedProxies,
 		RedisMode:      redisMode,
 		StickyCount:    sessCount,
@@ -964,6 +973,8 @@ func applyPoolConfig(state *pool.Pool, cfg *Config) {
 func liveSnapshot(cfg *Config) livecfg.Snapshot {
 	return livecfg.Snapshot{
 		APIKey:               cfg.APIKey,
+		AdminAPIKey:          cfg.AdminAPIKey,
+		ReadonlyAPIKey:       cfg.ReadonlyAPIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,

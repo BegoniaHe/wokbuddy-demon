@@ -5,6 +5,7 @@ import {
   ChevronDown,
   Copy,
   Eraser,
+  KeyRound,
   MessagesSquare,
   Plus,
   RefreshCw,
@@ -13,7 +14,7 @@ import {
   Square,
   Trash2,
 } from 'lucide-react';
-import { api, getKey, notifyUnauthorized } from '@/lib/api';
+import { api, getGatewayKey, notifyUnauthorized, setGatewayKey } from '@/lib/api';
 import { toast } from '@/components/Toaster';
 import { useConfirm } from '@/components/ConfirmDialog';
 import { Markdown } from '@/components/Markdown';
@@ -72,6 +73,8 @@ export function ChatView() {
   const [busy, setBusy] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [stick, setStick] = useState(true);
+  const [gatewayOpen, setGatewayOpen] = useState(false);
+  const [gatewayVal, setGatewayVal] = useState('');
 
   // 全局只跑一条流，但必须记住它属于哪个会话：清空/删除/停止只能作用于该会话。
   const streamRef = useRef<{ sessionId: string; ctrl: AbortController } | null>(null);
@@ -245,7 +248,7 @@ export function ChatView() {
     };
 
     try {
-      const key = getKey();
+      const key = getGatewayKey();
       const resp = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -439,6 +442,17 @@ export function ChatView() {
             <Button
               variant="ghost"
               size="icon-sm"
+              title="网关密钥（/v1）"
+              aria-label="网关密钥"
+              onClick={() => {
+                setGatewayVal(getGatewayKey() ?? '');
+                setGatewayOpen(true);
+              }}>
+              <KeyRound />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-sm"
               title="清空当前对话"
               aria-label="清空当前对话"
               disabled={!active?.messages.length}
@@ -554,6 +568,53 @@ export function ChatView() {
           </div>
         </section>
       </div>
+
+      <Dialog open={gatewayOpen} onOpenChange={setGatewayOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>网关密钥（/v1）</DialogTitle>
+            <DialogDescription>
+              试聊直连 /v1/*，这里只发送数据面密钥（config.json 的 api_key 或命名密钥），
+              不会把管理密钥发到网关。留空则不带鉴权头。
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            type="password"
+            autoComplete="off"
+            placeholder="api_key 或命名密钥"
+            value={gatewayVal}
+            onChange={(e) => setGatewayVal(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                setGatewayKey(gatewayVal.trim());
+                setGatewayOpen(false);
+                toast('网关密钥已保存', 'ok');
+              }
+            }}
+          />
+          <div className="flex justify-end gap-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setGatewayKey('');
+                setGatewayVal('');
+                setGatewayOpen(false);
+                toast('已清除网关密钥', 'ok');
+              }}>
+              清除
+            </Button>
+            <Button
+              onClick={() => {
+                setGatewayKey(gatewayVal.trim());
+                setGatewayOpen(false);
+                toast('网关密钥已保存', 'ok');
+              }}>
+              保存
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <ModelPicker
         open={pickerOpen}
