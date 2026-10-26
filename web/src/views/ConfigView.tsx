@@ -107,13 +107,35 @@ export function ConfigView() {
       const r = await postJSON<{ restart_required?: string[] }>('config', payload);
       const n = (r.restart_required || []).length;
       toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-      // 管理密钥与数据面密钥分开存储：只保存表单里新输入的管理凭据。
-      // api_key 是 /v1 密钥，不能写进管理凭据槽；已配置 admin/readonly 时它会被
-      // 管理面 401 拒绝，反而覆盖掉仍然有效的管理凭据。
+      // 保存后先确认现有管理凭据是否仍然有效，再决定是否替换：
+      // - 新增 readonly 不应把已认证的 admin 降级；
+      // - 单密钥模式下改 api_key 后，旧值失效，新值继续用于管理面。
       const admin = String(values.admin_api_key ?? '').trim();
       const readonly = String(values.readonly_api_key ?? '').trim();
-      if (admin) localStorage.setItem(LS_KEY, admin);
-      else if (readonly) localStorage.setItem(LS_KEY, readonly);
+      const apiKeyValue = String(values.api_key ?? '').trim();
+      const existing = localStorage.getItem(LS_KEY) ?? '';
+
+      if (admin) {
+        localStorage.setItem(LS_KEY, admin);
+      } else {
+        let existingValid = false;
+
+        if (existing) {
+          try {
+            existingValid = (await fetch('/panel/api/overview', {
+              headers: { Authorization: 'Bearer ' + existing },
+            })).ok;
+          } catch {
+            existingValid = false;
+          }
+        }
+
+        if (!existingValid) {
+          if (readonly) localStorage.setItem(LS_KEY, readonly);
+          else if (apiKeyValue) localStorage.setItem(LS_KEY, apiKeyValue);
+          else localStorage.removeItem(LS_KEY);
+        }
+      }
       await load();
       await qc.invalidateQueries({ queryKey: ['overview'] });
     } catch (e) {
