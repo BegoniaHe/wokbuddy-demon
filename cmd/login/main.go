@@ -567,6 +567,15 @@ func wrapTokenPollError(status int, err error) error {
 		return fmt.Errorf("token endpoint error: %w", err)
 	}
 
+	// 非信封 4xx（含 408/429）不是「还没登录完」：state 很可能已失效，继续
+	// 轮询永远不会成功。明确透出 HTTP 状态与上游错误，并引导重新发起登录。
+	if status >= http.StatusBadRequest {
+		return fmt.Errorf(
+			"登录状态查询被拒（HTTP %d）：%w；state 可能已过期，请重新运行 login url",
+			status, err,
+		)
+	}
+
 	return fmt.Errorf("%w: %w", errLoginPending, err)
 }
 

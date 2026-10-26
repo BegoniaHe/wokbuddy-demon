@@ -34,6 +34,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
   const [url, setUrl] = useState('');
   const [errMsg, setErrMsg] = useState('');
   const [doneMsg, setDoneMsg] = useState('');
+  const [slowHint, setSlowHint] = useState(false);
   const [importMsg, setImportMsg] = useState('');
   const [importErr, setImportErr] = useState('');
   const [secPass, setSecPass] = useState('');
@@ -55,6 +56,20 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
       timerRef.current = null;
     }
   };
+
+  // 等待超过 90s 只提示一次：浏览器侧可能已经失败，但面板仍在轮询。
+  // phase 变化（done/err/重新 start）或关闭弹窗时由 cleanup 清除提示。
+  useEffect(() => {
+    if (!open || phase !== 'ready') {
+      setSlowHint(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setSlowHint(true), 90_000);
+    return () => {
+      window.clearTimeout(timer);
+      setSlowHint(false);
+    };
+  }, [open, phase]);
 
   useEffect(() => {
     if (open) {
@@ -295,6 +310,7 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
                   <p className="text-sm text-muted-foreground">在浏览器打开以下链接并登录：</p>
                   <div className="select-all break-all rounded-lg border border-border bg-secondary px-3 py-2.5 font-mono text-xs text-accent-foreground">{url}</div>
                   <p className="text-sm text-muted-foreground">等待授权完成，自动检测中…</p>
+                  {slowHint ? <p className="text-sm text-destructive">已等待超过 90 秒，浏览器侧可能已失败，请重新发起登录。</p> : null}
                 </>
               ) : null}
               {phase === 'done' ? <p className="text-sm text-success">{doneMsg}</p> : null}
