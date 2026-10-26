@@ -11,11 +11,6 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
   onUnauthorized = fn;
 }
 
-// notifyUnauthorized 由非 api() 的请求（如试聊直连 /v1）在 401 时触发密钥门。
-export function notifyUnauthorized(): void {
-  onUnauthorized?.();
-}
-
 export function getKey(): string | null {
   return localStorage.getItem(LS_KEY);
 }

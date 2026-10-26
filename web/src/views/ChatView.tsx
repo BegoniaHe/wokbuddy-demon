@@ -14,7 +14,7 @@ import {
   Square,
   Trash2,
 } from 'lucide-react';
-import { api, getGatewayKey, notifyUnauthorized, setGatewayKey } from '@/lib/api';
+import { api, getGatewayKey, setGatewayKey } from '@/lib/api';
 import { toast } from '@/components/Toaster';
 import { useConfirm } from '@/components/ConfirmDialog';
 import { Markdown } from '@/components/Markdown';
@@ -258,7 +258,9 @@ export function ChatView() {
         body: JSON.stringify({ model, messages: chatWireMessages(base), stream: true }),
         signal: ctrl.signal,
       });
-      if (resp.status === 401) notifyUnauthorized();
+      // 试聊走数据面 /v1：401 是网关密钥问题，不能弹管理面 KeyGate（那会把
+      // admin/readonly 凭据存进管理槽，试聊仍然 401）。
+      if (resp.status === 401) setGatewayOpen(true);
       if (!resp.ok) {
         const text = await resp.text();
         let message = 'HTTP ' + resp.status;

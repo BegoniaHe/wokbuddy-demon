@@ -107,14 +107,13 @@ export function ConfigView() {
       const r = await postJSON<{ restart_required?: string[] }>('config', payload);
       const n = (r.restart_required || []).length;
       toast(n ? '配置已保存，其中 ' + n + ' 项需重启进程生效' : '配置已保存并立即生效', 'ok');
-      // 管理密钥与数据面密钥分开存储：优先保存刚输入的管理凭据；仅当表单没有
-      // 管理凭据时才把 api_key 当作单密钥模式的默认管理密钥。
+      // 管理密钥与数据面密钥分开存储：只保存表单里新输入的管理凭据。
+      // api_key 是 /v1 密钥，不能写进管理凭据槽；已配置 admin/readonly 时它会被
+      // 管理面 401 拒绝，反而覆盖掉仍然有效的管理凭据。
       const admin = String(values.admin_api_key ?? '').trim();
       const readonly = String(values.readonly_api_key ?? '').trim();
-      const apiKeyValue = String(values.api_key ?? '').trim();
       if (admin) localStorage.setItem(LS_KEY, admin);
       else if (readonly) localStorage.setItem(LS_KEY, readonly);
-      else if (apiKeyValue) localStorage.setItem(LS_KEY, apiKeyValue);
       await load();
       await qc.invalidateQueries({ queryKey: ['overview'] });
     } catch (e) {
