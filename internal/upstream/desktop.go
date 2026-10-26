@@ -46,6 +46,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/cpupool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/ospool"
 )
 
 const (
@@ -126,19 +127,6 @@ func deriveID(a *auth.Auth, salt string) string {
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
 type DesktopEvent map[string]any
 
-// desktopOSVersions Windows 11 各版本 build 的轮换池（权重近似 2026-10 的真实
-// 保有量：25H2/24H2 为主力，23H2 渐退，26H2 随新机铺开，26H1 仅新机型）。
-var desktopOSVersions = []struct {
-	build  string
-	weight int
-}{
-	{"10.0.26200", 34}, // 25H2
-	{"10.0.26100", 30}, // 24H2
-	{"10.0.22631", 16}, // 23H2
-	{"10.0.26300", 12}, // 26H2
-	{"10.0.28000", 8},  // 26H1（新机专用）
-}
-
 // desktopMemBands 核心数区间 → 内存档（GB）加权表，重复即权重。
 // 整体单调：核多则内存大；4 核不配 32G，16 核以上不再出现 8G，
 // 18 核以上一律 32G（该核心数只出现在高端整机上）。
@@ -185,30 +173,14 @@ func desktopRNG(a *auth.Auth, salt string) *rand.Rand {
 }
 
 // desktopHardware 由 uid 稳定派生一台「固定设备」的 osVersion/cpuCores/memorySize：
-//   - osVersion：按版本权重轮换（上表）；
+//   - osVersion：从 ospool 按版本权重轮换（Windows 10/11 各版本，来源见 ospool）；
 //   - cpuCores：N(10, 5.5) 取偶后截断到 [4,32]，再归到 CPU 型号池线程档——
 //     8~12 线程的装机量占多数，16 线程以上是少数，4 线程为老机型；
 //   - memorySize：按核心数分档加权抽样，核多内存大，16GB 最主流。
 func desktopHardware(a *auth.Auth) (osVersion string, cpuCores, memorySize int) {
 	rng := desktopRNG(a, "hardware")
 
-	total := 0
-	for _, v := range desktopOSVersions {
-		total += v.weight
-	}
-
-	pick := rng.IntN(total)
-
-	osVersion = desktopOSVersions[len(desktopOSVersions)-1].build
-	for _, ver := range desktopOSVersions {
-		if pick < ver.weight {
-			osVersion = ver.build
-
-			break
-		}
-
-		pick -= ver.weight
-	}
+	osVersion = ospool.Pick(rng).Build
 
 	cpuCores = int(math.Round((rng.NormFloat64()*5.5+10)/2)) * 2 // 偶数核
 	cpuCores = min(max(cpuCores, 4), 32)

@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/ospool"
 )
 
 // TestDesktopHardwareStableAndBounded 同一账号的机型参数必须稳定，且落在平台
@@ -12,9 +13,9 @@ import (
 func TestDesktopHardwareStableAndBounded(t *testing.T) {
 	t.Parallel()
 
-	versions := make(map[string]bool, len(desktopOSVersions))
-	for _, ver := range desktopOSVersions {
-		versions[ver.build] = true
+	versions := make(map[string]bool, len(ospool.Releases))
+	for _, release := range ospool.Releases {
+		versions[release.Build] = true
 	}
 
 	for i := range 24 {
