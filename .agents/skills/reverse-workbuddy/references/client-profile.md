@@ -59,9 +59,10 @@
 
 说明：
 
-- `emit` 的每个值都是**最终出站字面量**。`xIdeVersion` / `desktopIdeVersion` /
-  `desktopExtVersion` 各自独立取值，不从 `version` 派生（防止官方解耦后我们仍
-  强行一致）。
+- `emit` 的每个值都是**最终出站字面量**。`xIdeVersion` / `desktopIdeVersion` 各自
+  独立取值，不从 `version` 派生（防止官方解耦后我们仍强行一致）；`desktopExtVersion`
+  当前必须与 `source.version` 相等（官方 `pluginVersion` 恒取 `resolveProductVersion()`），
+  仍从包内字面量提取，不自行拼装。
 - `version` / `cliVersion` 只做交叉校验与可读性，不是运行时拼接素材。
 - `loginUA` 非必需，但 Win32 登录走 `restOperations`，与 `desktopUA` 共用同一 UA
   拦截器，因此当前应填 `desktopUA` 最终值；确实取不到时写 `null` 并列入 `missing`。
@@ -77,7 +78,7 @@
 | `billingUA` | 是 | billing / checkin / banner 单段 UA | Win32 包内显式覆写 |
 | `xIdeVersion` | 是 | `X-Ide-Version` | 与 `chatUA` 同源的版本 |
 | `desktopIdeVersion` | 是 | 上报事件 `ideVersion` | Win32 桌面端构建串 |
-| `desktopExtVersion` | 是 | 上报事件 `extVersion` | Win32 桌面端构建串 |
+| `desktopExtVersion` | 是 | 上报事件 `extVersion`（须等于 `source.version`） | 官方 `pluginVersion`（产品版本） |
 | `loginPlatform` | 否 | OAuth `platform=` 参数 | `plugin/auth/state` 调用处 |
 | `loginUA` | 否 | 登录流 UA | 与 `desktopUA` 同源（`restOperations` 拦截器） |
 
@@ -104,8 +105,9 @@
 3. `sha256` 为 64 位小写 hex，与 `packageUrl` 指向的实际安装包一致（exe）；
    `commit` 为 40 位小写 hex；`releaseDate` 落在 `[2024-01-01, now+7d]`。
 4. 交叉一致：`version` 必须以子串形式出现在 `chatUA` / `desktopUA` /
-   `xIdeVersion` / `desktopIdeVersion` / `desktopExtVersion` 中；`cliVersion` 出现
-   在 `chatUA` / `desktopUA` 中。`loginUA` 不参与（CLI 段可能不同）。
+   `xIdeVersion` / `desktopIdeVersion` 中，且 `desktopExtVersion` 必须与 `version`
+   完全相等（官方 `pluginVersion` 恒取产品版本）；`cliVersion` 出现在 `chatUA` /
+   `desktopUA` 中。`loginUA` 不参与（CLI 段可能不同）。
 5. 必需 surface 非空；`null` 的 key 集合必须与 `missing` 完全一致。
 6. 所有 `emit` 值：无 `\r` / `\n` / 其它控制字符，长度 ≤ 1024 字节，无首尾空白。
    值会进 HTTP header，这条是硬性安全约束。

@@ -134,7 +134,7 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 			ua := ""
 			p.Emit.LoginUA = &ua
 		}},
-		{"版本不一致", func(p *Profile) { p.Emit.DesktopExtVersion = "9.9.9" }},
+		{"extVersion 同前缀但不同值", func(p *Profile) { p.Emit.DesktopExtVersion = "0.0.0.1" }},
 		{"macOS 包", func(p *Profile) {
 			p.Source.PackageURL = "https://download.codebuddy.cn/workbuddy/saas/darwin-arm64/x.dmg"
 		}},
@@ -170,6 +170,27 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 				t.Fatal("应校验失败")
 			}
 		})
+	}
+}
+
+// TestValidateDesktopExtVersionExact 官方 pluginVersion 恒取 resolveProductVersion，
+// 故 desktopExtVersion 必须与 source.version 完全相等；desktopIdeVersion 仍允许
+// 带独立 platformVersion 后缀（只要求包含 source.version）。
+func TestValidateDesktopExtVersionExact(t *testing.T) {
+	t.Parallel()
+
+	profile := validProfile("cn")
+	profile.Emit.DesktopExtVersion = "0.0.0.1"
+
+	if err := profile.Validate(); err == nil {
+		t.Fatal("desktopExtVersion 同前缀但不同值应报错")
+	}
+
+	profile = validProfile("cn")
+	profile.Emit.DesktopIdeVersion = "0.0.0.1"
+
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("desktopIdeVersion 允许独立 platformVersion: %v", err)
 	}
 }
 

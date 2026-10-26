@@ -1250,6 +1250,12 @@ type Client struct {
 	slotMu      sync.Mutex
 	slotClients map[string]*http.Client
 
+	// desktopSessionMu/desktopSessionIDs 桌面 /v2/report 的进程内 sessionId 缓存。
+	// 官方 sessionId 跟随客户端进程生命周期：同一账号在进程内保持稳定，重启后刷新，
+	// 不同账号互不相同；不落盘。
+	desktopSessionMu  sync.Mutex
+	desktopSessionIDs map[string]string
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。

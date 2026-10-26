@@ -10,6 +10,8 @@ import (
 
 var buildRe = regexp.MustCompile(`^10\.0\.[0-9]{5}$`)
 
+//
+//nolint:cyclop // 逐字段校验版本池元数据，线性展开更直观。
 func TestReleasesHaveVersionBuildAndSource(t *testing.T) {
 	t.Parallel()
 
@@ -30,6 +32,15 @@ func TestReleasesHaveVersionBuildAndSource(t *testing.T) {
 
 		if release.Weight <= 0 {
 			t.Fatalf("%s/%s: weight=%d 必须为正", release.Family, release.Version, release.Weight)
+		}
+
+		if release.MinCPUYear < 2017 || release.MinCPUYear > 2026 {
+			t.Fatalf("%s/%s: minCPUYear=%d 超出合理区间",
+				release.Family, release.Version, release.MinCPUYear)
+		}
+
+		if release.Version == "26H2" && release.MinCPUYear < 2022 {
+			t.Fatalf("26H2 要求 2022 年及以后平台，实际门槛 %d", release.MinCPUYear)
 		}
 
 		if want := sourceFor(release.Family); release.Source != want {

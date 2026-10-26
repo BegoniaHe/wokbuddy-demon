@@ -12,7 +12,8 @@
 // 同步本列表。
 //
 // 26H1（28000）仅预装于 ARM 新机，而桌面指纹固定 os=win32/arch=x64，故不收，
-// 避免上报「Arm-only 系统 + x64」的矛盾组合。
+// 避免上报「Arm-only 系统 + x64」的矛盾组合。MinCPUYear 约束版本与 CPU 年代的
+// 搭配：新系统不配老平台，具体门槛由桌面指纹抽样逻辑使用。
 package ospool
 
 import (
@@ -33,20 +34,36 @@ const (
 
 // Release 是一个 Windows 版本及其主 build 号。
 type Release struct {
-	Family  string // Windows 10 / Windows 11
-	Version string // 版本名，如 25H2
-	Build   string // 主 build 号，如 10.0.26200
-	Weight  int    // 近似真实保有量权重
-	Source  string // 官方版本信息页
+	Family     string // Windows 10 / Windows 11
+	Version    string // 版本名，如 25H2
+	Build      string // 主 build 号，如 10.0.26200
+	Weight     int    // 近似真实保有量权重
+	MinCPUYear int    // 可搭配的最低 CPU 发布年
+	Source     string // 官方版本信息页
 }
 
 // Releases 是当前仍在真实设备中占主流的 Windows 版本；按权重挑选。
 var Releases = []Release{
-	{Family: FamilyWindows11, Version: "26H2", Build: "10.0.26300", Weight: 12, Source: Windows11SourceURL},
-	{Family: FamilyWindows11, Version: "25H2", Build: "10.0.26200", Weight: 34, Source: Windows11SourceURL},
-	{Family: FamilyWindows11, Version: "24H2", Build: "10.0.26100", Weight: 30, Source: Windows11SourceURL},
-	{Family: FamilyWindows11, Version: "23H2", Build: "10.0.22631", Weight: 16, Source: Windows11SourceURL},
-	{Family: FamilyWindows10, Version: "22H2", Build: "10.0.19045", Weight: 40, Source: Windows10SourceURL},
+	{
+		Family: FamilyWindows11, Version: "26H2", Build: "10.0.26300",
+		Weight: 12, MinCPUYear: 2022, Source: Windows11SourceURL,
+	},
+	{
+		Family: FamilyWindows11, Version: "25H2", Build: "10.0.26200",
+		Weight: 34, MinCPUYear: 2018, Source: Windows11SourceURL,
+	},
+	{
+		Family: FamilyWindows11, Version: "24H2", Build: "10.0.26100",
+		Weight: 30, MinCPUYear: 2018, Source: Windows11SourceURL,
+	},
+	{
+		Family: FamilyWindows11, Version: "23H2", Build: "10.0.22631",
+		Weight: 16, MinCPUYear: 2017, Source: Windows11SourceURL,
+	},
+	{
+		Family: FamilyWindows10, Version: "22H2", Build: "10.0.19045",
+		Weight: 40, MinCPUYear: 2017, Source: Windows10SourceURL,
+	},
 }
 
 // Pick 按 Weight 加权随机选一个版本；rng 由调用方按账号稳定派生。
