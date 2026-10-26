@@ -1,12 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -221,6 +223,37 @@ func TestRefreshAccountRefreshesAndWritesBack(t *testing.T) {
 
 	if saved.AccessTokenValue() != "new-at" || saved.RefreshTokenValue() != "new-rt" {
 		t.Errorf("written auth token=%q refresh=%q", saved.AccessTokenValue(), saved.RefreshTokenValue())
+	}
+}
+
+// TestRefreshAccountFallsBackWhenTokenStillValid refresh 端点暂时失败但 access token
+// 未过期时，继续用旧 token 查询余额；不返回错误、不改写文件。
+func TestRefreshAccountFallsBackWhenTokenStillValid(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":400,"msg":"bad refresh"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	raw := fmt.Sprintf(
+		`{"auth":{"accessToken":"still-at","refreshToken":"old-rt","expiresAt":%d,"domain":"www.codebuddy.cn"},"account":{"uid":"u-still"}}`,
+		time.Now().Add(time.Hour).Unix(),
+	)
+	account := parseTestAuth(t, raw)
+
+	client := upstream.New()
+	client.HTTP = srv.Client()
+	client.ChatBaseCN = srv.URL
+
+	if err := refreshAccount(client, account); err != nil {
+		t.Fatalf("未过期 token 的 refresh 失败不应阻断查询: %v", err)
+	}
+
+	if got := account.AccessTokenValue(); got != "still-at" {
+		t.Errorf("accessToken=%q want still-at", got)
 	}
 }
 

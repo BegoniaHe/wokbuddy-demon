@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -260,7 +261,16 @@ func main() {
 	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
 	slices.Sort(files)
 
+	// refresh 与主程序/CLI 出站同源：加载部署 profile，避免刷新请求使用
+	// Go 默认 UA 或与 chat 面不一致的指纹。目录缺失返回空集（不阻断余额查询）。
+	profiles, perr := clientprofile.LoadDir("data/client-profiles")
+	if perr != nil {
+		fmt.Fprintln(os.Stderr, "load client profiles:", perr)
+		os.Exit(1)
+	}
+
 	client := upstream.New()
+	client.Profile = profiles
 	accounts := collectAccounts(files, client)
 	totalRemain, totalUsed, totalSize, okCount := summarize(accounts)
 
@@ -359,6 +369,10 @@ func collectAccounts(files []string, client *upstream.Client) []accountResult {
 // expiresAt。NeedsRefresh 会把「无过期时间」视为需要刷新，若直接调用
 // RefreshTokenIfNeeded 会以 no refresh token 失败，反而丢掉一次本可成功的余额查询
 // （issue #294 要求扁平形手写文件可直接使用）。
+//
+// 刷新失败但 access token 尚未确认过期时继续用旧 token 查询：refresh 端点可能
+// 只是暂时不可用，旧 token 仍有效；直接判失败会把一次本可成功的余额查询变成
+// 「refresh: ...」错误行。真正的失效由随后的余额请求返回 401。
 func refreshAccount(client *upstream.Client, account *auth.Auth) error {
 	if account.RefreshTokenValue() == "" {
 		return nil
@@ -367,6 +381,16 @@ func refreshAccount(client *upstream.Client, account *auth.Auth) error {
 	needed := account.NeedsRefresh(2 * time.Hour)
 
 	if err := client.RefreshTokenIfNeeded(account, 2*time.Hour); err != nil {
+		if !accessTokenExpired(account) {
+			//nolint:gosec // uid 经 UID8 截断，err 只含上游/网络错误。
+			log.Printf(
+				"WARN: [credit] refresh failed, retry balance with existing token uid=%s: %v",
+				logfmt.UID8(account.UID), err,
+			)
+
+			return nil
+		}
+
 		return fmt.Errorf("refreshAccount: %w", err)
 	}
 
@@ -381,6 +405,14 @@ func refreshAccount(client *upstream.Client, account *auth.Auth) error {
 	}
 
 	return nil
+}
+
+// accessTokenExpired 报告 access token 是否已确认过期；expiresAt<=0（未知）按
+// 未过期处理，交给随后的余额请求判定。
+func accessTokenExpired(account *auth.Auth) bool {
+	expiresAt := account.ExpiresAtValue()
+
+	return expiresAt > 0 && time.Now().Unix() >= expiresAt
 }
 
 // summarize 汇总成功账号的余额与成功计数（failed = len(accounts) - ok）。
