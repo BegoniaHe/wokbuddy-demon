@@ -131,6 +131,9 @@ description: >
      **包内字面量**：
      `chatUA` / `desktopUA` / `billingUA` / `xIdeVersion` / `desktopIdeVersion` /
      `desktopExtVersion` / `loginPlatform`。不从 `version` 拼任何串。
+   - `chatUA` 取 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
+     `UserAgentHttpInterceptor.buildUserAgent` 输出；`main/server.js` 是 daemon/VLM
+     面（`/v2/report` 走 desktop surface），不能作为 `chatUA` 证据。
    - 双源核对：Win32 `product.json` 的版本与 commit、包内 bundle 版本字面量、
      update 接口返回版本，三处必须一致；不一致就停下报告，不挑「看起来对的」那个。
      macOS 同版本包只用于旁证，不得覆盖 Win32 的 commit/releaseDate。

@@ -45,7 +45,7 @@
   },
   "missing": [],
   "evidence": {
-    "chatUA": {"source": "package", "file": "main/server.js", "snippet": "…"},
+    "chatUA": {"source": "package", "file": "cli/dist/codebuddy-lite-wb.mjs", "snippet": "…"},
     "desktopUA": {"source": "package", "file": "main/module-base.js", "snippet": "…"},
     "billingUA": {"source": "package", "file": "main/tar.js", "snippet": "…"},
     "xIdeVersion": {"source": "package", "file": "main/server.js", "snippet": "…"},
@@ -72,7 +72,7 @@
 
 | key | 必需 | 用途 | 典型来源 |
 | --- | --- | --- | --- |
-| `chatUA` | 是 | chat / refresh / FetchModels | Win32 `main/*.js` 的 UA 模板 |
+| `chatUA` | 是 | chat / refresh / FetchModels | CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 最终输出 |
 | `desktopUA` | 是 | `/v2/report`、白名单类上报 | Win32 `main/*.js`、桌面端构建串 |
 | `billingUA` | 是 | billing / checkin / banner 单段 UA | Win32 包内显式覆写 |
 | `xIdeVersion` | 是 | `X-Ide-Version` | 与 `chatUA` 同源的版本 |
@@ -80,6 +80,11 @@
 | `desktopExtVersion` | 是 | 上报事件 `extVersion` | Win32 桌面端构建串 |
 | `loginPlatform` | 否 | OAuth `platform=` 参数 | `plugin/auth/state` 调用处 |
 | `loginUA` | 否 | 登录流 UA | 与 `desktopUA` 同源（`restOperations` 拦截器） |
+
+`chatUA` 的 chat 实际由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
+`UserAgentHttpInterceptor.buildUserAgent` 构造；`main/server.js` 是 daemon/VLM 面，
+其中的 UA 构造不能作为 `chatUA` 证据。`desktopUA`（`/v2/report`）与 `chatUA` 是两条
+不同 surface，不得互相顶替。
 
 ## 来源分级（`evidence.<key>.source`）
 

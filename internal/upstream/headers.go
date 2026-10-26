@@ -65,8 +65,9 @@ func (c *Client) profileVersion(account *auth.Auth, pick func(*clientprofile.Pro
 	return ""
 }
 
-// defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方桌面端 daemon 代理层形状：
-// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`）。默认不拼接版本，直接使用 profile 字面量；
+// defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方 CLI chat 拦截器形状：
+// `WorkBuddy/<ver> <brand>/<ver> CLI/<cliVer>`，品牌段来自 realm 的 applicationName）。
+// 默认不拼接版本，直接使用 profile 字面量；
 // 用户显式配 client_version / cli_version 时才按该版本重新拼装，避免 UA 与
 // X-Ide-Version 自相矛盾。profile 缺失返回空串（启动期已拒绝该状态）。
 func (c *Client) defaultWorkBuddyUAFor(account *auth.Auth) string {
