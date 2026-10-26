@@ -933,6 +933,8 @@ func applyModelInfoCapabilities(entry map[string]any, modelInfo3 *upstream.Model
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
+	// 被官方默认会话 agent 白名单隐藏的模型（realm:裸 id），供别名过滤复用。
+	chatHidden := make(map[string]bool)
 
 	models := h.fetchDynamicModels()
 	for i := range models {
@@ -941,27 +943,49 @@ func (h *Handler) modelList() []map[string]any {
 			continue
 		}
 
+		if visible := models[i].ChatVisible; visible != nil && !*visible {
+			chatHidden["cn:"+models[i].ID] = true
+			continue
+		}
+
 		out = append(out, h.cnModelEntry(&models[i]))
 	}
 	// global 模型名单：仅 GlobalEnabled=true 时列出（逃生门）。
 	// 名单 = 纯动态探测结果（fetchGlobalModels，失败/无号 → 空）。
 	if h.cfg.GlobalEnabled {
-		for _, entry := range h.globalModelEntries() {
-			if id, ok := entry["id"].(string); ok && h.modelHidden("global", strings.TrimPrefix(id, "global:")) {
-				continue
-			}
-
-			out = append(out, entry)
-		}
+		out = h.appendGlobalModelEntries(out, chatHidden)
 	}
 
-	return h.appendAliasEntries(out)
+	return h.appendAliasEntries(out, chatHidden)
+}
+
+// appendGlobalModelEntries 追加 global 可见模型，并把白名单隐藏项并入 chatHidden。
+func (h *Handler) appendGlobalModelEntries(
+	out []map[string]any, chatHidden map[string]bool,
+) []map[string]any {
+	entries, hidden := h.globalModelEntries()
+	maps.Copy(chatHidden, hidden)
+
+	for _, entry := range entries {
+		id, ok := entry["id"].(string)
+		if ok && h.modelHidden("global", strings.TrimPrefix(id, "global:")) {
+			continue
+		}
+
+		if ok && hidden[id] {
+			continue
+		}
+
+		out = append(out, entry)
+	}
+
+	return out
 }
 
 // appendAliasEntries 把配置的模型别名追加到 /v1/models 列表（issue #52）。
 // 别名按名字排序保证输出稳定；与真实模型同 id 时以别名为准（请求解析同样
 // 别名优先），避免"列表显示一个、实际路由到另一个"。
-func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
+func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string]bool) []map[string]any {
 	if len(h.cfg.ModelAliases) == 0 {
 		return out
 	}
@@ -984,7 +1008,12 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 		upstreamID := normalizeAliasTarget(h.cfg.ModelAliases[name])
 		// 别名条目同样受黑名单约束：别名名字本身或其目标模型被隐藏时都不列出
 		// （否则「藏起来的模型」会经由别名泄露）。
-		if realm, bare, _ := splitRealm(upstreamID); h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
+		realm, bare, _ := splitRealm(upstreamID)
+		if h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
+			continue
+		}
+		// 官方默认会话 agent 隐藏的模型也不经别名泄露；目标不在目录时保持现状。
+		if aliasChatHidden(upstreamID, name, realm, chatHidden) {
 			continue
 		}
 
@@ -1006,6 +1035,20 @@ func (h *Handler) appendAliasEntries(out []map[string]any) []map[string]any {
 	}
 
 	return out
+}
+
+// aliasChatHidden 别名目标或别名名字命中官方 agent 隐藏集合时返回 true。
+func aliasChatHidden(upstreamID, name, targetRealm string, chatHidden map[string]bool) bool {
+	if chatHidden[upstreamID] {
+		return true
+	}
+
+	aliasRealm, aliasBare := targetRealm, name
+	if nameRealm, nameBare, prefixed := splitRealm(name); prefixed {
+		aliasRealm, aliasBare = nameRealm, nameBare
+	}
+
+	return chatHidden[aliasRealm+":"+aliasBare]
 }
 
 // normalizeAliasTarget 把别名目标规范成 "[realm:]model"（缺省 realm 补 cn）。
@@ -1056,16 +1099,21 @@ func (h *Handler) cnModelEntry(modelInfo4 *upstream.ModelInfo) map[string]any {
 
 // globalModelEntries 组装 global 域模型条目：先 fetchGlobalModels（内部探测并落
 // effort 桶）拿名单，再按 id 取探测对象形态的全字段富信息（共享同一次探测缓存）。
-func (h *Handler) globalModelEntries() []map[string]any {
+func (h *Handler) globalModelEntries() ([]map[string]any, map[string]bool) {
 	globalIDs, globalAccount := h.fetchGlobalModels()
 	// 探测对象形态的全字段条目（与 fetchGlobalModels 共享同一次探测缓存）：
 	// 命中 id 才透出富字段；窄表/失败 → 零值 ModelInfo（applyModelInfoFields 全空省略）。
 	// globalAccount 为 nil（无 global 号）时 FetchGlobalModelInfos 返回 nil。
 	globalInfos := map[string]upstream.ModelInfo{}
+	chatHidden := make(map[string]bool)
 
 	infos := h.cfg.Upstream.FetchGlobalModelInfos(globalAccount)
 	for i := range infos {
 		globalInfos[infos[i].ID] = infos[i]
+
+		if visible := infos[i].ChatVisible; visible != nil && !*visible {
+			chatHidden["global:"+infos[i].ID] = true
+		}
 	}
 
 	globalEfforts, globalDefaults := h.cfg.Upstream.GlobalEffortSnapshot()
@@ -1076,7 +1124,7 @@ func (h *Handler) globalModelEntries() []map[string]any {
 		out = append(out, h.globalModelEntry(id, &mi, globalEfforts[id], globalDefaults[id]))
 	}
 
-	return out
+	return out, chatHidden
 }
 
 // globalModelEntry 组装单个 global 模型条目（与 CN 动态分支同口径）。

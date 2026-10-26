@@ -2363,6 +2363,10 @@ type ModelInfo struct {
 	// 官方档位徽章（/v3/config data.modelTiers，issue #274）：只挂目录内模型，
 	// 仅用于展示；不参与选号、不按 tier/requiredUserType 过滤模型。
 	Tier *ModelTier
+
+	// ChatVisible 官方默认会话 agent 白名单判定（issue #319）：nil = 该来源没有
+	// 判定；false = 不出现在 /v1/models 发现列表。内部字段，不参与 JSON 序列化。
+	ChatVisible *bool
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -2500,6 +2504,7 @@ const codeBuddyCLIUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 	type probeResult struct {
 		infos []ModelInfo
+		chat  modelChatWhitelist
 		err   error
 	}
 
@@ -2507,17 +2512,15 @@ func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 	v3Ch := make(chan probeResult, 1)
 
 	go func() {
-		infos, err := c.fetchEnterpriseModels(account9)
-		enterpriseCh <- probeResult{infos, err}
+		infos, chat, err := c.fetchEnterpriseModels(account9)
+		enterpriseCh <- probeResult{infos: infos, chat: chat, err: err}
 	}()
 	go func() {
 		infos, err := c.fetchV3Models(account9)
-		v3Ch <- probeResult{infos, err}
+		v3Ch <- probeResult{infos: infos, err: err}
 	}()
 
-	enterprise := <-enterpriseCh
-
-	probeResult2 := <-v3Ch
+	enterprise, probeResult2 := <-enterpriseCh, <-v3Ch
 	if enterprise.err != nil && probeResult2.err != nil {
 		return nil, enterprise.err // 两路全失败：返回企业端点错误（既有调用方语义零漂移）
 	}
@@ -2531,6 +2534,10 @@ func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 	if enterprise.err != nil {
 		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
 	}
+
+	// v3 没有默认 agent 判定时，用企业端点的白名单给 v3 独有模型补判定；
+	// v3 已有显式判定则保持主来源优先。
+	enterprise.chat.apply(probeResult2.infos)
 
 	out := mergeModelInfos(probeResult2.infos, enterprise.infos)
 	if len(out) == 0 {
@@ -2581,6 +2588,7 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 	}
 
 	seen := make(map[string]bool, len(primary)+len(secondary))
+	index := make(map[string]int, len(primary)+len(secondary))
 
 	out := make([]ModelInfo, 0, len(primary)+len(secondary))
 	for i := range primary {
@@ -2590,16 +2598,27 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 		}
 
 		seen[modelInfo.ID] = true
+		index[modelInfo.ID] = len(out)
 		out = append(out, *modelInfo)
 	}
 
 	for i := range secondary {
 		modelInfo2 := &secondary[i]
-		if modelInfo2.ID == "" || seen[modelInfo2.ID] {
+		if modelInfo2.ID == "" {
+			continue
+		}
+
+		if seen[modelInfo2.ID] {
+			// 同 id：主来源字段权威，但主来源没有 ChatVisible 判定时采用次来源的。
+			if j, ok := index[modelInfo2.ID]; ok {
+				fillChatVisible(&out[j], modelInfo2)
+			}
+
 			continue
 		}
 
 		seen[modelInfo2.ID] = true
+		index[modelInfo2.ID] = len(out)
 		out = append(out, *modelInfo2)
 	}
 
@@ -2607,33 +2626,37 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 }
 
 // fetchEnterpriseModels 单路探测企业模型端点（/console/enterprises/personal/models）。
-// 解析口径：agents[cli].models 过滤 + nonChatModel 剔除 + disabled 剔除。
-func (c *Client) fetchEnterpriseModels(account7 *auth.Auth) ([]ModelInfo, error) {
-	// CN 端点顺序：/console 兼容旧路径；空/缺 agents[cli] 时回落 /v2 企业端点，
-	// /v2 仍无 cli 过滤集时接受完整 models（官方目录兜底）。
+// 解析口径：官方默认会话 agent.models 过滤 + nonChatModel 剔除 + disabled 剔除；
+// 同时返回该来源的默认 agent 判定，供 v3 独有模型兜底。
+func (c *Client) fetchEnterpriseModels(
+	account7 *auth.Auth,
+) ([]ModelInfo, modelChatWhitelist, error) {
+	// CN 端点顺序：/console 兼容旧路径；空/缺 agent models 时回落 /v2 企业端点，
+	// /v2 仍无 agent models 时接受完整 models（官方目录兜底）。
 	var lastErr error
 
 	for i, path := range []string{"/console/enterprises/personal/models", "/v2/enterprises/personal/models"} {
-		out, err := c.fetchEnterpriseModelsPath(account7, path, i > 0)
+		out, chat, err := c.fetchEnterpriseModelsPath(account7, path, i > 0)
 		if err == nil {
-			return out, nil
+			return out, chat, nil
 		}
 
 		lastErr = err
 	}
 
-	return nil, lastErr
+	return nil, modelChatWhitelist{}, lastErr
 }
 
-// fetchEnterpriseModelsPath 单端点探测；allowFull 允许在缺少 agents[cli] 时使用完整 models。
+// fetchEnterpriseModelsPath 单端点探测；allowFull 允许在完全没有可用 agent models
+// 时使用完整 models。
 func (c *Client) fetchEnterpriseModelsPath(
 	account7 *auth.Auth, path string, allowFull bool,
-) ([]ModelInfo, error) {
+) ([]ModelInfo, modelChatWhitelist, error) {
 	endpoint := c.chatBase(account7) + path
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, http.NoBody)
 	if err != nil {
-		return nil, fmt.Errorf("fetchEnterpriseModels: %w", err)
+		return nil, modelChatWhitelist{}, fmt.Errorf("fetchEnterpriseModels: %w", err)
 	}
 
 	c.CommonHeaders(req, account7) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
@@ -2644,32 +2667,35 @@ func (c *Client) fetchEnterpriseModelsPath(
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetchEnterpriseModels: %w", err)
+		return nil, modelChatWhitelist{}, fmt.Errorf("fetchEnterpriseModels: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		// 读失败 → 传输层错误（handler 侧该路径不 NoteError）。
-		return nil, fmt.Errorf("read body: %w", err)
+		return nil, modelChatWhitelist{}, fmt.Errorf("read body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s: %w",
+		return nil, modelChatWhitelist{}, fmt.Errorf("models api status %d: %s: %w",
 			resp.StatusCode, truncate(string(raw), 120), errFetchEnterpriseModelsFailed)
 	}
 
-	cliIDs, dynMap, err := parseEnterpriseModels(raw, allowFull)
+	cliIDs, dynMap, agents, err := parseEnterpriseModels(raw, allowFull)
 	if err != nil {
-		return nil, err
+		return nil, modelChatWhitelist{}, err
 	}
 
 	out := collectEnterpriseModels(cliIDs, dynMap)
 	if len(out) == 0 {
-		return nil, errModelsAPIReturnedEmptyList
+		return nil, modelChatWhitelist{}, errModelsAPIReturnedEmptyList
 	}
 
-	return out, nil
+	chat := newModelChatWhitelist(agents, out)
+	chat.apply(out)
+
+	return out, chat, nil
 }
 
 // enterpriseModelsEnv /console/enterprises/personal/models 响应信封。
@@ -2678,46 +2704,42 @@ type enterpriseModelsEnv struct {
 	Data struct {
 		Models          []dynModelEntry `json:"models"`
 		AvailableModels modelIDList     `json:"availableModels"`
-		Agents          []struct {
-			Name   string   `json:"name"`
-			Models []string `json:"models"`
-		} `json:"agents"`
+		Agents          []modelAgent    `json:"agents"`
 	} `json:"data"`
 }
 
-// parseEnterpriseModels 解析企业端点响应：取 agents[cli].models 过滤集，并以
+// parseEnterpriseModels 解析企业端点响应：取官方默认 agent 的 models 过滤集，并以
 // nonChatModel 规则剔除的模型字段建 dynMap。
-func parseEnterpriseModels(raw []byte, allowFull bool) ([]string, map[string]dynModelEntry, error) {
+func parseEnterpriseModels(
+	raw []byte, allowFull bool,
+) ([]string, map[string]dynModelEntry, []modelAgent, error) {
 	var env enterpriseModelsEnv
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, nil, fmt.Errorf("models parse: %w", err)
+		return nil, nil, nil, fmt.Errorf("models parse: %w", err)
 	}
 
 	if env.Code != 0 {
-		return nil, nil, fmt.Errorf("models api code=%d: %w", env.Code, errParseEnterpriseModelsFailed)
+		return nil, nil, nil, fmt.Errorf("models api code=%d: %w", env.Code, errParseEnterpriseModelsFailed)
 	}
 
-	var cliIDs []string
+	var agentModels []string
 
-	for _, ag := range env.Data.Agents {
-		if ag.Name == "cli" {
-			cliIDs = ag.Models
-			break
-		}
+	if agent, ok := selectChatAgent(env.Data.Agents); ok {
+		agentModels = agent.Models
 	}
 
-	if len(cliIDs) == 0 {
+	if len(agentModels) == 0 {
 		if !allowFull {
-			return nil, nil, errNoCLIAgentModelsFound
+			return nil, nil, nil, errNoCLIAgentModelsFound
 		}
 
-		cliIDs = make([]string, 0, len(env.Data.Models))
+		agentModels = make([]string, 0, len(env.Data.Models))
 		for i := range env.Data.Models {
-			cliIDs = append(cliIDs, env.Data.Models[i].ID)
+			agentModels = append(agentModels, env.Data.Models[i].ID)
 		}
 	}
 
-	cliIDs = filterModelIDsByAvailable(cliIDs, env.Data.AvailableModels)
+	agentModels = filterModelIDsByAvailable(agentModels, env.Data.AvailableModels)
 	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
 	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
 	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
@@ -2731,16 +2753,34 @@ func parseEnterpriseModels(raw []byte, allowFull bool) ([]string, map[string]dyn
 		dynMap[m.ID] = *m
 	}
 
-	return cliIDs, dynMap, nil
+	return agentModels, dynMap, env.Data.Agents, nil
 }
 
-// collectEnterpriseModels 按 cli 过滤集从 dynMap 取可用模型（disabled 剔除）。
-func collectEnterpriseModels(cliIDs []string, dynMap map[string]dynModelEntry) []ModelInfo {
-	out := make([]ModelInfo, 0, len(cliIDs))
-	for _, id := range cliIDs {
-		if m, ok := dynMap[id]; ok && !m.Disabled {
-			out = append(out, m.modelInfo())
+// collectEnterpriseModels 按默认 agent 白名单从 dynMap 取可用模型（disabled 剔除）。
+// 白名单条目既可匹配 model.id 也可匹配 model.name；同 id 去重。
+func collectEnterpriseModels(agentModels []string, dynMap map[string]dynModelEntry) []ModelInfo {
+	byName := make(map[string]dynModelEntry, len(dynMap))
+	for id := range dynMap {
+		if entry := dynMap[id]; entry.Name != "" {
+			byName[entry.Name] = entry
 		}
+	}
+
+	seen := make(map[string]bool, len(agentModels))
+
+	out := make([]ModelInfo, 0, len(agentModels))
+	for _, want := range agentModels {
+		m, ok := dynMap[want]
+		if !ok {
+			m, ok = byName[want]
+		}
+
+		if !ok || m.Disabled || seen[m.ID] {
+			continue
+		}
+
+		seen[m.ID] = true
+		out = append(out, m.modelInfo())
 	}
 
 	return out
@@ -3319,6 +3359,9 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	// 折扣窗口内 factor 打折）——面板据此展示「生效价 + 标签 + 牌价」。
 	applyModelPromotions(out, env.Data.ModelPromotions)
 	applyModelTiers(out, env.Data.ModelTiers)
+	// 官方客户端在 availableModels 之后还会按默认会话 agent 的 models 白名单裁剪；
+	// 这里只给条目打内部标记，保留全量目录供面板 / effort 缓存使用。
+	applyChatWhitelistToMap(out, env.Data.Agents)
 
 	if len(out) == 0 {
 		return nil, errV3ConfigReturnedEmptyModels
@@ -3372,6 +3415,7 @@ type v3ConfigEnv struct {
 		ProductFeaturesConfig v3ProductFeaturesConfig `json:"productFeaturesConfig"`
 		ModelPromotions       []v3ModelPromotion      `json:"modelPromotions"`
 		ModelTiers            []v3ModelTier           `json:"modelTiers"`
+		Agents                []modelAgent            `json:"agents"`
 	} `json:"data"`
 }
 

@@ -271,7 +271,7 @@ func (c *Client) probeGlobalModels(
 		return names, infos, efforts, defaults, nil //nolint:nilerr // 企业端点失败但 v3 结果有效
 	}
 
-	return mergeGlobalProbeResults(probeResult2, enterprise)
+	return mergeGlobalProbeResults(&probeResult2, &enterprise)
 }
 
 // probeV3Route 单次 /v3/config 探测（UA 参数化）并过滤非对话模型，返回该路结果。
@@ -306,13 +306,13 @@ func (c *Client) probeEnterpriseRoute(a *auth.Auth) probeResult {
 	var lastErr error
 
 	for _, path := range globalModelsProbePaths {
-		names, infos, perr := c.globalModelsOnce(a, path)
+		names, infos, chat, perr := c.globalModelsOnce(a, path)
 		if perr != nil {
 			lastErr = perr
 			continue
 		}
 
-		return probeResult{names: names, infos: infos}
+		return probeResult{names: names, infos: infos, chat: chat}
 	}
 
 	return probeResult{err: lastErr}
@@ -321,12 +321,15 @@ func (c *Client) probeEnterpriseRoute(a *auth.Auth) probeResult {
 // mergeGlobalProbeResults 两路皆成功时合并：v3 为主、企业端点补缺（含 effort 桶合并，
 // v3 权威）。
 func mergeGlobalProbeResults(
-	v3, enterprise probeResult,
+	v3, enterprise *probeResult,
 ) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	v3Names, v3Infos, v3Efforts, v3Defaults := extractEfforts(v3.infos)
 	if len(v3Names) == 0 {
 		v3Names = v3.names
 	}
+
+	// v3 没有默认 agent 判定时，用企业端点的白名单给 v3 独有模型补判定。
+	enterprise.chat.apply(v3Infos)
 
 	entNames, entInfos, entEfforts, entDefaults := extractEfforts(enterprise.infos)
 	if len(entNames) == 0 {
@@ -341,10 +344,12 @@ func mergeGlobalProbeResults(
 }
 
 // probeResult 单路模型目录探测结果（/v3/config 某 UA 路，或企业端点家族）。
-// infos 为对象形态条目（窄表探测为 nil），names 与之平行；err 非 nil 表示该路失败。
+// infos 为对象形态条目（窄表探测为 nil），names 与之平行；chat 为该企业来源的
+// 默认 agent 判定（v3 路已在目录阶段写入 ChatVisible）；err 非 nil 表示该路失败。
 type probeResult struct {
 	names []string
 	infos []ModelInfo
+	chat  modelChatWhitelist
 	err   error
 }
 
@@ -448,13 +453,27 @@ func mergeGlobalCatalog(
 	out = appendUniqueNames(out, seen, primaryNames)
 
 	var outInfos []ModelInfo
+
+	infosIndex := make(map[string]int, len(primaryInfos)+len(secondaryInfos))
+
 	if primaryInfos != nil {
 		outInfos = make([]ModelInfo, 0, len(primaryInfos)+len(secondaryInfos))
 		outInfos = append(outInfos, primaryInfos...)
+
+		for i := range outInfos {
+			infosIndex[outInfos[i].ID] = i
+		}
 	}
 
 	for _, id := range secondaryNames {
-		if id == "" || seen[id] {
+		if id == "" {
+			continue
+		}
+
+		if seen[id] {
+			// 同 id：主来源字段权威，但主来源没有 ChatVisible 判定时采用次来源的。
+			mergeSecondaryChatVisibility(outInfos, infosIndex, secondaryInfos, id)
+
 			continue
 		}
 
@@ -463,11 +482,27 @@ func mergeGlobalCatalog(
 		// 窄表企业响应（secondaryInfos nil / 超出条目数）时该 id 无对象字段，
 		// infos 保持原样（调用方按 id 名单输出裸条目，不编造字段）。
 		if mi, ok := secondaryInfosByID(secondaryInfos, id); ok {
+			infosIndex[id] = len(outInfos)
 			outInfos = append(outInfos, mi)
 		}
 	}
 
 	return out, outInfos
+}
+
+// mergeSecondaryChatVisibility 同 id 时保持主来源字段，仅在主来源 ChatVisible
+// 为 nil 时采用次来源的判定。
+func mergeSecondaryChatVisibility(
+	outInfos []ModelInfo, index map[string]int, secondaryInfos []ModelInfo, id string,
+) {
+	modelInfo, ok := secondaryInfosByID(secondaryInfos, id)
+	if !ok {
+		return
+	}
+
+	if j, ok := index[id]; ok {
+		fillChatVisible(&outInfos[j], &modelInfo)
+	}
 }
 
 // appendUniqueNames 把 names 中非空且未出现过的 id 追加到 out，并更新 seen。
@@ -535,13 +570,16 @@ func mergeEffortDefaults(primary, secondary map[string]string) map[string]string
 	return out
 }
 
-// globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, infos, nil)；否则 (nil, nil, err)。
-func (c *Client) globalModelsOnce(account3 *auth.Auth, path string) ([]string, []ModelInfo, error) {
+// globalModelsOnce 单端点探测。2xx + 解析出非空名单 → (names, infos, chat, nil)；
+// 否则 (nil, nil, zero, err)。
+func (c *Client) globalModelsOnce(
+	account3 *auth.Auth, path string,
+) ([]string, []ModelInfo, modelChatWhitelist, error) {
 	url := c.chatBase(account3) + path // 按 realm 切 base：global 账号 → global base
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, http.NoBody)
 	if err != nil {
-		return nil, nil, fmt.Errorf("globalModelsOnce: %w", err)
+		return nil, nil, modelChatWhitelist{}, fmt.Errorf("globalModelsOnce: %w", err)
 	}
 
 	c.CommonHeaders(req, account3) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
@@ -552,24 +590,24 @@ func (c *Client) globalModelsOnce(account3 *auth.Auth, path string) ([]string, [
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("globalModelsOnce: %w", err)
+		return nil, nil, modelChatWhitelist{}, fmt.Errorf("globalModelsOnce: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		// 读失败 → 传输层错误：半截 body 不进解析（探测负缓存走 lastFail，不罚号）。
-		return nil, nil, fmt.Errorf("read body: %w", err)
+		return nil, nil, modelChatWhitelist{}, fmt.Errorf("read body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("global models status %d: %s: %w",
+		return nil, nil, modelChatWhitelist{}, fmt.Errorf("global models status %d: %s: %w",
 			resp.StatusCode, truncate(string(raw), 120), errGlobalModelsOnceFailed)
 	}
 
-	names, infos, _, _, err := parseGlobalModelNames(raw)
+	catalog, err := parseGlobalModelNames(raw)
 
-	return names, infos, err
+	return catalog.names, catalog.infos, catalog.chat, err
 }
 
 // parseGlobalModelNames 多信封兼容解析模型目录（国际站曾在多种 envelope 间切换，
@@ -587,44 +625,64 @@ func (c *Client) globalModelsOnce(account3 *auth.Auth, path string) ([]string, [
 //     id 依次回退 id/modelId/model/name，窗口键回退 contextWindow/maxTokens，
 //     reasoning 档位（defaultEffort 新键优先、effort 老键兜底）保留。
 //
-// 同时产出 effort 能力桶（supportedEfforts/defaultEffort）。
+// 同时产出 effort 能力桶（supportedEfforts/defaultEffort）与默认 agent 判定。
 // 解析成功但名单为空 → 返回错误（等价"该端点没给全"）。
-func parseGlobalModelNames(
-	raw []byte,
-) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
+// globalCatalogParse global 模型目录解析结果（避免多返回值超出 lint 上限）。
+type globalCatalogParse struct {
+	names    []string
+	infos    []ModelInfo
+	efforts  map[string][]string
+	defaults map[string]string
+	chat     modelChatWhitelist
+}
+
+func parseGlobalModelNames(raw []byte) (globalCatalogParse, error) {
 	payload, err := resolveGlobalPayload(raw)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return globalCatalogParse{}, err
 	}
 
 	arr, ok := resolveGlobalModelsArray(payload)
 	if !ok {
-		return nil, nil, nil, nil, errGlobalModelsEmptyList
+		return globalCatalogParse{}, errGlobalModelsEmptyList
 	}
 
 	available := resolveAvailableModels(payload)
+	agents := resolveGlobalAgents(payload)
 	// 主形态：对象数组 → dynModelEntry 全字段（与 CN FetchModels 共用解析，零口径漂移）。
 	if entryNames, entryInfos, entryEfforts, entryDefaults, ok := parseGlobalModelEntries(arr); ok {
 		entryNames, entryInfos = filterGlobalCatalog(entryNames, entryInfos, available)
-		return entryNames, entryInfos, entryEfforts, entryDefaults, nil
+		chat := newModelChatWhitelist(agents, entryInfos)
+		chat.apply(entryInfos)
+
+		return globalCatalogParse{
+			names: entryNames, infos: entryInfos, efforts: entryEfforts,
+			defaults: entryDefaults, chat: chat,
+		}, nil
 	}
 	// 可用条目为 0（键名全对不上）：落入下方动态兜底，不在这里报空。
-	// 窄表：字符串数组 → 仅 ID（无 effort 元数据、无对象字段 → infos nil）。
+	// 窄表：字符串数组 → 仅 ID（无 effort 元数据、无对象字段 → infos nil，不产生判定）。
 	if narrowNames, isStr := parseGlobalNarrowTable(arr); isStr {
 		if len(narrowNames) > 0 {
 			narrowNames, _ = filterGlobalCatalog(narrowNames, nil, available)
-			return narrowNames, nil, nil, nil, nil
+			return globalCatalogParse{names: narrowNames}, nil
 		}
 
-		return nil, nil, nil, nil, errGlobalModelsEmptyList
+		return globalCatalogParse{}, errGlobalModelsEmptyList
 	}
 	// 动态兜底：逐对象宽松解析（上游换键名时不至于整域空列表）。
-	names, infos, efforts, defaults, err = parseGlobalModelLooseArray(arr)
-	if err == nil {
-		names, infos = filterGlobalCatalog(names, infos, available)
+	names, infos, efforts, defaults, err := parseGlobalModelLooseArray(arr)
+	if err != nil {
+		return globalCatalogParse{}, err
 	}
 
-	return names, infos, efforts, defaults, err
+	names, infos = filterGlobalCatalog(names, infos, available)
+	chat := newModelChatWhitelist(agents, infos)
+	chat.apply(infos)
+
+	return globalCatalogParse{
+		names: names, infos: infos, efforts: efforts, defaults: defaults, chat: chat,
+	}, nil
 }
 
 // resolveAvailableModels 从 payload 任意层级提取 availableModels。
@@ -650,6 +708,55 @@ func resolveAvailableModels(payload json.RawMessage) []string {
 					var ids modelIDList
 					if json.Unmarshal(encoded, &ids) == nil && len(ids) > 0 {
 						found = ids
+						return true
+					}
+				}
+			}
+
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+
+		return false
+	}
+
+	walk(root)
+
+	return found
+}
+
+// resolveGlobalAgents 从 payload 任意层级提取 agents（global 多信封兜底）。
+// 找不到或结构不符返回 nil，调用方据此保持「无判定」。
+//
+//nolint:cyclop,gocognit,gocyclo,modernize // 递归遍历多信封，抽取 agents。
+func resolveGlobalAgents(payload json.RawMessage) []modelAgent {
+	var root any
+	if json.Unmarshal(payload, &root) != nil {
+		return nil
+	}
+
+	var found []modelAgent
+
+	var walk func(any) bool
+
+	walk = func(value any) bool {
+		switch node := value.(type) {
+		case map[string]any:
+			if raw, ok := node["agents"]; ok {
+				encoded, err := json.Marshal(raw)
+				if err == nil {
+					var agents []modelAgent
+					if json.Unmarshal(encoded, &agents) == nil && len(agents) > 0 {
+						found = agents
 						return true
 					}
 				}
