@@ -224,6 +224,41 @@ func TestRefreshAccountRefreshesAndWritesBack(t *testing.T) {
 	}
 }
 
+// TestRefreshAccountWithoutRefreshTokenKeepsHandwrittenAuth 手写扁平 auth 常无
+// expiresAt / refreshToken；不能因为 NeedsRefresh(无过期时间)=true 就判 refresh
+// 失败，必须保留 accessToken 继续查询，且不重写原文件。
+func TestRefreshAccountWithoutRefreshTokenKeepsHandwrittenAuth(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "workbuddy-u-flat.json")
+
+	raw := `{"accessToken":"flat-at","uid":"u-flat","domain":"www.codebuddy.cn"}`
+	if err := os.WriteFile(filePath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	account := parseTestAuth(t, raw)
+	account.FilePath = filePath
+
+	if err := refreshAccount(upstream.New(), account); err != nil {
+		t.Fatalf("无 refresh token 应跳过刷新: %v", err)
+	}
+
+	if got := account.AccessTokenValue(); got != "flat-at" {
+		t.Errorf("accessToken=%q want flat-at", got)
+	}
+
+	written, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read auth: %v", err)
+	}
+
+	if string(written) != raw {
+		t.Errorf("未触发刷新不应重写 auth 文件: %s", written)
+	}
+}
+
 // TestCollectAccountsRefreshFailureRow refresh 失败记 refresh: 前缀并跳过余额请求。
 func TestCollectAccountsRefreshFailureRow(t *testing.T) {
 	t.Parallel()

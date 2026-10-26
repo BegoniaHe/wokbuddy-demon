@@ -354,7 +354,16 @@ func collectAccounts(files []string, client *upstream.Client) []accountResult {
 
 // refreshAccount 在 token 临期/过期时刷新，成功后原子写回；写回失败只 WARN，
 // 不阻断本次余额查询（内存中的新 token 仍可用）。
+//
+// 没有 refresh token 时跳过刷新：手写扁平 auth 常只带 accessToken、没有
+// expiresAt。NeedsRefresh 会把「无过期时间」视为需要刷新，若直接调用
+// RefreshTokenIfNeeded 会以 no refresh token 失败，反而丢掉一次本可成功的余额查询
+// （issue #294 要求扁平形手写文件可直接使用）。
 func refreshAccount(client *upstream.Client, account *auth.Auth) error {
+	if account.RefreshTokenValue() == "" {
+		return nil
+	}
+
 	needed := account.NeedsRefresh(2 * time.Hour)
 
 	if err := client.RefreshTokenIfNeeded(account, 2*time.Hour); err != nil {
