@@ -688,7 +688,7 @@ func parseGlobalModelNames(raw []byte) (globalCatalogParse, error) {
 // resolveAvailableModels 从 payload 任意层级提取 availableModels。
 // 支持字符串数组与对象数组（_meta["codebuddy.ai"].availableModels 为对象形态）。
 //
-//nolint:cyclop,gocognit,gocyclo,modernize // 递归遍历多信封，抽取 availableModels。
+//nolint:cyclop,gocognit,gocyclo,modernize,dupl // 递归遍历多信封，抽取 availableModels。
 func resolveAvailableModels(payload json.RawMessage) []string {
 	var root any
 	if json.Unmarshal(payload, &root) != nil {
@@ -737,7 +737,7 @@ func resolveAvailableModels(payload json.RawMessage) []string {
 // resolveGlobalAgents 从 payload 任意层级提取 agents（global 多信封兜底）。
 // 找不到或结构不符返回 nil，调用方据此保持「无判定」。
 //
-//nolint:cyclop,gocognit,gocyclo,modernize // 递归遍历多信封，抽取 agents。
+//nolint:cyclop,gocognit,gocyclo,modernize,dupl // 递归遍历多信封，抽取 agents。
 func resolveGlobalAgents(payload json.RawMessage) []modelAgent {
 	var root any
 	if json.Unmarshal(payload, &root) != nil {
@@ -754,7 +754,7 @@ func resolveGlobalAgents(payload json.RawMessage) []modelAgent {
 			if raw, ok := node["agents"]; ok {
 				encoded, err := json.Marshal(raw)
 				if err == nil {
-					var agents []modelAgent
+					var agents modelAgents
 					if json.Unmarshal(encoded, &agents) == nil && len(agents) > 0 {
 						found = agents
 						return true

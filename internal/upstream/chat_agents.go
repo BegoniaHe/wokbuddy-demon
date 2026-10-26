@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"encoding/json"
 	"slices"
 	"strings"
 )
@@ -11,6 +12,81 @@ type modelAgent struct {
 	Name   string   `json:"name"`
 	Models []string `json:"models"`
 	Tags   []string `json:"tags"`
+}
+
+// modelAgents 上游 agents 数组。官方 resolveConversationAgent 对形状做防御式
+// 解析：非数组视为没有 agent，非对象条目跳过，非字符串 models/tags 丢弃。
+// 这里同样容忍，避免 agents 这一可选字段漂移时拖垮整个模型目录解析。
+type modelAgents []modelAgent
+
+func (a *modelAgents) UnmarshalJSON(data []byte) error {
+	var items []json.RawMessage
+	if err := json.Unmarshal(data, &items); err != nil {
+		*a = nil
+
+		return nil //nolint:nilerr // 非数组 agents 等价于没有 agent（与官方客户端一致）
+	}
+
+	out := make(modelAgents, 0, len(items))
+	for _, item := range items {
+		var agent modelAgent
+		if json.Unmarshal(item, &agent) == nil {
+			out = append(out, agent)
+		}
+	}
+
+	*a = out
+
+	return nil
+}
+
+// UnmarshalJSON 容忍 agent 条目的字段漂移：非对象条目、非字符串 name/models/tags
+// 都按缺省处理，不让一个可选字段中断模型目录解析。
+func (a *modelAgent) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name   json.RawMessage `json:"name"`
+		Models json.RawMessage `json:"models"`
+		Tags   json.RawMessage `json:"tags"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		*a = modelAgent{}
+
+		return nil //nolint:nilerr // 非对象条目跳过，与官方客户端一致
+	}
+
+	*a = modelAgent{
+		Name:   agentString(raw.Name),
+		Models: agentStrings(raw.Models),
+		Tags:   agentStrings(raw.Tags),
+	}
+
+	return nil
+}
+
+func agentString(raw json.RawMessage) string {
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+
+	return value
+}
+
+func agentStrings(raw json.RawMessage) []string {
+	var items []json.RawMessage
+	if len(raw) == 0 || json.Unmarshal(raw, &items) != nil {
+		return nil
+	}
+
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		var value string
+		if json.Unmarshal(item, &value) == nil {
+			out = append(out, value)
+		}
+	}
+
+	return out
 }
 
 // modelChatWhitelist 一个来源的默认会话 agent 判定结果。

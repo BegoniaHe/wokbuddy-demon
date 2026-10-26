@@ -2704,7 +2704,7 @@ type enterpriseModelsEnv struct {
 	Data struct {
 		Models          []dynModelEntry `json:"models"`
 		AvailableModels modelIDList     `json:"availableModels"`
-		Agents          []modelAgent    `json:"agents"`
+		Agents          modelAgents     `json:"agents"`
 	} `json:"data"`
 }
 
@@ -3415,7 +3415,7 @@ type v3ConfigEnv struct {
 		ProductFeaturesConfig v3ProductFeaturesConfig `json:"productFeaturesConfig"`
 		ModelPromotions       []v3ModelPromotion      `json:"modelPromotions"`
 		ModelTiers            []v3ModelTier           `json:"modelTiers"`
-		Agents                []modelAgent            `json:"agents"`
+		Agents                modelAgents             `json:"agents"`
 	} `json:"data"`
 }
 

@@ -387,6 +387,67 @@ func TestFetchGlobalV3AgentWhitelist(t *testing.T) {
 	})
 }
 
+// TestFetchModelsMalformedAgentsKeepCatalog agents 是可选字段：非数组形状应等价于
+// 没有 agent，不能拖垮同一响应里的模型目录。
+func TestFetchModelsMalformedAgentsKeepCatalog(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"first","maxOutputTokens":8192},
+				{"id":"second","maxOutputTokens":8192}
+			],"agents":{"unexpected":"shape"}}}`), nil
+		default:
+			return jsonResp(500, `{}`), nil
+		}
+	})
+
+	infos, err := client.FetchModels(&auth.Auth{AccessToken: "at", UID: "u-malformed-agents"})
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+
+	if len(infos) != 2 {
+		t.Fatalf("infos=%+v want 2", infos)
+	}
+
+	for i := range infos {
+		if infos[i].ChatVisible != nil {
+			t.Errorf("%s 不应产生判定：%v", infos[i].ID, *infos[i].ChatVisible)
+		}
+	}
+}
+
+// TestFetchModelsAgentEntriesTolerateSchemaDrift 官方客户端会跳过非对象 agent、
+// 丢弃非字符串 models/tags；这里必须保持同样宽容，否则整个目录解析失败。
+func TestFetchModelsAgentEntriesTolerateSchemaDrift(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"hit","maxOutputTokens":8192},
+				{"id":"other","maxOutputTokens":8192}
+			],"agents":[
+				{"name":"cli","models":["hit",7,null],"tags":[42]},
+				"not-an-agent"
+			]}}`), nil
+		default:
+			return jsonResp(500, `{}`), nil
+		}
+	})
+
+	infos, err := client.FetchModels(&auth.Auth{AccessToken: "at", UID: "u-drift-agents"})
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+
+	assertChatVisibility(t, infos, map[string]bool{"hit": true, "other": false})
+}
+
 // assertChatVisibility 断言目录内每个 id 的 ChatVisible 判定。
 func assertChatVisibility(t *testing.T, infos []ModelInfo, want map[string]bool) {
 	t.Helper()
