@@ -21,8 +21,11 @@ func weakAPIKeyListenWarning(apiKey, listen string) string {
 		return ""
 	}
 
+	// 不把「面板不鉴权」写死：管理面可能另有凭据（后续 admin/readonly 分层），
+	// 告警只强调当前可确认的数据面暴露与面板风险。
 	return "WARN: api_key 为空或仍为公开占位值，且 listen 不是回环地址；" +
-		"网关与面板将不鉴权或使用公开占位 key，请尽快修改 api_key"
+		"网关数据面将不鉴权或使用公开占位 key；面板同样可能被未授权访问，" +
+		"请尽快修改 api_key"
 }
 
 // isLoopbackListen 判断 listen 地址是否只绑定回环接口。
