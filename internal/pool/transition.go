@@ -26,7 +26,12 @@
 //     （详见 reviveCoolingLocked 注释）。
 package pool
 
-import "time"
+import (
+	"log"
+	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+)
 
 // clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
 // reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
@@ -48,13 +53,15 @@ func (e *entry) clearCoolingLocked() {
 //
 // 熔断器保留：熔断是「连续 5xx 失败」信号（与授权/会话无关），禁用后再复活时
 // 熔断观测仍有效，不应被禁用覆盖。
-func (p *Pool) disableLocked(e *entry, reason string) {
-	e.clearCoolingLocked()
-	e.disabled = true
-	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
-	e.reason = reason
+func (p *Pool) disableLocked(entry2 *entry, reason string) {
+	entry2.clearCoolingLocked()
+	entry2.disabled = true
+	entry2.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
+	entry2.reason = reason
 
 	p.dirty.Store(true)
+	log.Printf("WARN: [pool] account disabled acct=%s reason=%q",
+		logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()), reason)
 }
 
 // pauseLocked 暂停选号迁移：置 paused 使账号退出选号候选（healthy 判否），

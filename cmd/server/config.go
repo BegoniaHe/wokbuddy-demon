@@ -38,6 +38,7 @@ var (
 	errNormalizeHiddenModels            = errors.New("normalizeHiddenModels failed")
 	errNormalizeAliasTargetFailed       = errors.New("normalizeAliasTarget failed")
 	errNormalizeNotifyFailed            = errors.New("normalizeNotify failed")
+	errNormalizeAPIKeysFailed           = errors.New("normalizeAPIKeys failed")
 	errNormalizeLoggingFailed           = errors.New("normalizeLogging failed")
 	errNormalizeProxiesFailed           = errors.New("normalizeProxies failed")
 	errNormalizeDNSServersFailed        = errors.New("normalizeDNSServers failed")
@@ -74,6 +75,13 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+
+	// AdminAPIKey / ReadonlyAPIKey 可选的管理/运维面凭据。任一非空时，
+	// /panel/api/*、/status、/metrics、/debug/pprof/* 只接受二者；默认 api_key
+	// 仅保留数据面 /v1/* 权限。两者都为空时 api_key 兼管理面（单密钥默认）。
+	// 非空值必须彼此不同且不同于 api_key；不限制字符集与长度。热生效。
+	AdminAPIKey    string `json:"admin_api_key"`
+	ReadonlyAPIKey string `json:"readonly_api_key"`
 
 	// DNSServers 出站 DNS 服务器（host 或 host:port，按顺序尝试，缺省端口 53）。
 	// 空 = 系统解析器（零回归）。用途：绕过污染解析、把上游域名固定到可控出口。
@@ -985,7 +993,7 @@ func (c *Config) normalize() error {
 	c.normalizeStaticDefaults()
 
 	steps := []func() error{
-		c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
+		c.normalizeAPIKeys, c.normalizeCORS, c.normalizeModelAliases, c.normalizeBackgroundModels,
 		c.normalizeHiddenModels, c.normalizeScheduling,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeTimingShape, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
@@ -998,6 +1006,29 @@ func (c *Config) normalize() error {
 	}
 	// 归一化完成后做显式校验：非法 / 自相矛盾的配置在写入前即被拒绝（不落盘）。
 	return c.Validate()
+}
+
+// normalizeAPIKeys 归一化三把顶层凭据：去首尾空白，并要求非空值互不相同。
+// 不做字符集/长度限制（凭据熵由用户负责）；重复会让作用域分层失效——同一把
+// 密钥既是数据面又是管理面，或者 admin/readonly 无法区分，必须在保存前拒绝。
+func (c *Config) normalizeAPIKeys() error {
+	c.APIKey = strings.TrimSpace(c.APIKey)
+	c.AdminAPIKey = strings.TrimSpace(c.AdminAPIKey)
+	c.ReadonlyAPIKey = strings.TrimSpace(c.ReadonlyAPIKey)
+
+	if c.AdminAPIKey != "" && c.AdminAPIKey == c.APIKey {
+		return fmt.Errorf("admin_api_key 不能与 api_key 相同: %w", errNormalizeAPIKeysFailed)
+	}
+
+	if c.ReadonlyAPIKey != "" && c.ReadonlyAPIKey == c.APIKey {
+		return fmt.Errorf("readonly_api_key 不能与 api_key 相同: %w", errNormalizeAPIKeysFailed)
+	}
+
+	if c.AdminAPIKey != "" && c.AdminAPIKey == c.ReadonlyAPIKey {
+		return fmt.Errorf("admin_api_key 不能与 readonly_api_key 相同: %w", errNormalizeAPIKeysFailed)
+	}
+
+	return nil
 }
 
 // normalizeModelAliases 校验并归一化模型别名（issue #52）：键必须是裸名，

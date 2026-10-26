@@ -1706,7 +1706,14 @@ func (s *responsesStreamWriter) handleUpstreamError(errObj map[string]any) error
 	resp := s.responseObject("failed")
 	resp["error"] = body
 
-	return s.event("response.failed", map[string]any{"type": "response.failed", "response": resp})
+	if err := s.event("response.failed", map[string]any{"type": "response.failed", "response": resp}); err != nil {
+		return err
+	}
+	// response.failed 是终止态：后续上游帧（增量、added、重复 error/DONE）一律忽略，
+	// 避免客户端在失败后继续收到内容或第二个终止事件。
+	s.finished = true
+
+	return nil
 }
 
 // ensureStart 写出 response.created / response.in_progress。

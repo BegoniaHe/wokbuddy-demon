@@ -1,185 +1,330 @@
 package main
 
 import (
-	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
-// authFile 必须同时兼容嵌套形（插件 OAuth）与扁平形（手写/旧版），与
-// internal/auth.Parse 的服务端口径一致；此前只认嵌套形，扁平账号会报
-// "no accessToken"。
-func TestAuthFileSupportsNested(t *testing.T) {
-	t.Parallel()
-
-	raw := []byte(`{
-		"auth": {"accessToken": "nested-token", "domain": "www.workbuddy.ai", "realm": "global"},
-		"account": {"uid": "nested-uid", "enterpriseId": "nested-eid", "nickname": "嵌套"}
-	}`)
-
-	var file authFile
-	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatal(err)
-	}
-
-	assertAuthFile(t, &file, "nested-token", "nested-uid", "nested-eid", "嵌套", "www.workbuddy.ai")
-
-	if got := billingBaseFor(&file); got != billingBaseGlobal {
-		t.Errorf("nested global billing base=%q want %q", got, billingBaseGlobal)
-	}
-}
-
-func TestAuthFileSupportsFlat(t *testing.T) {
-	t.Parallel()
-
-	raw := []byte(`{
-		"accessToken": "flat-token", "domain": "www.workbuddy.ai", "realm": "global",
-		"uid": "flat-uid", "enterpriseId": "flat-eid", "nickname": "扁平"
-	}`)
-
-	var file authFile
-	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatal(err)
-	}
-
-	assertAuthFile(t, &file, "flat-token", "flat-uid", "flat-eid", "扁平", "www.workbuddy.ai")
-
-	if got := billingBaseFor(&file); got != billingBaseGlobal {
-		t.Errorf("flat global billing base=%q want %q", got, billingBaseGlobal)
-	}
-}
-
-func assertAuthFile(t *testing.T, file *authFile, token, uid, enterpriseID, nickname, domain string) {
+func parseTestAuth(t *testing.T, raw string) *auth.Auth {
 	t.Helper()
 
-	if got := file.accessToken(); got != token {
-		t.Errorf("accessToken=%q want %q", got, token)
+	account, err := auth.Parse([]byte(raw))
+	if err != nil {
+		t.Fatalf("parse auth: %v", err)
 	}
 
-	if got := file.uid(); got != uid {
-		t.Errorf("uid=%q want %q", got, uid)
-	}
-
-	if got := file.enterpriseID(); got != enterpriseID {
-		t.Errorf("enterpriseId=%q want %q", got, enterpriseID)
-	}
-
-	if got := file.nickname(); got != nickname {
-		t.Errorf("nickname=%q want %q", got, nickname)
-	}
-
-	if got := file.domain(); got != domain {
-		t.Errorf("domain=%q want %q", got, domain)
-	}
+	return account
 }
 
-// 嵌套字段非空时优先于扁平字段，避免混合形态下被扁平值覆盖。
-func TestAuthFileNestedWinsOverFlat(t *testing.T) {
-	t.Parallel()
-
-	raw := []byte(`{
-		"auth": {"accessToken": "nested-token"},
-		"account": {"uid": "nested-uid"},
-		"accessToken": "flat-token", "uid": "flat-uid"
-	}`)
-
-	var file authFile
-	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := file.accessToken(); got != "nested-token" {
-		t.Errorf("accessToken=%q want nested-token", got)
-	}
-
-	if got := file.uid(); got != "nested-uid" {
-		t.Errorf("uid=%q want nested-uid", got)
-	}
-}
-
-// 显式 realm=cn 与 global domain 冲突时按 domain 判 global：服务端 Realm() 也是
-// domain 优先，CLI 若短路到 CN 会拿 401。
-func TestBillingBaseDomainWinsOverExplicitCN(t *testing.T) {
-	t.Parallel()
-
-	for _, domain := range []string{"www.workbuddy.ai", "www.codebuddy.ai"} {
-		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + domain + `","realm":"cn"}}`)
-
-		var file authFile
-		if err := json.Unmarshal(raw, &file); err != nil {
-			t.Fatal(err)
-		}
-
-		want := billingBaseGlobal
-		if isCodebuddyAIDomain(domain) {
-			want = billingBaseOfficial
-		}
-
-		if got := billingBaseFor(&file); got != want {
-			t.Errorf("domain=%s billingBaseFor=%q want %q", domain, got, want)
-		}
-	}
-}
-
-// 官方 CLI 国际站 codebuddy.ai 家族按签发域查 www.codebuddy.ai；
-// workbuddy.ai 仍走旧桌面端，codebuddy.cn 走 CN。
-func TestBillingBaseCodebuddyAIDomain(t *testing.T) {
+// TestNewUserResourceRequestNestedAndFlat 嵌套形与扁平形 auth 都能直接用于
+// 计费请求，身份头来自 auth.Auth 统一字段。
+func TestNewUserResourceRequestNestedAndFlat(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		domain string
-		want   string
+		name string
+		raw  string
 	}{
-		{"www.codebuddy.ai", billingBaseOfficial},
-		{"codebuddy.ai", billingBaseOfficial},
-		{"sub.codebuddy.ai", billingBaseOfficial},
-		{"  WWW.CodeBuddy.AI  ", billingBaseOfficial},
-		{"www.workbuddy.ai", billingBaseGlobal},
-		{"www.codebuddy.cn", billingBaseCN},
-		{"codebuddy.cn", billingBaseCN},
-		{"", billingBaseCN},
+		{
+			name: "嵌套形",
+			raw:  `{"auth":{"accessToken":"nested-token","domain":"www.codebuddy.cn"},"account":{"uid":"nested-uid","enterpriseId":"nested-eid","nickname":"嵌套"}}`,
+		},
+		{
+			name: "扁平形",
+			raw:  `{"accessToken":"flat-token","domain":"www.codebuddy.cn","uid":"flat-uid","enterpriseId":"flat-eid","nickname":"扁平"}`,
+		},
 	}
-	for _, item := range cases {
-		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + item.domain + `"}}`)
 
-		var file authFile
-		if err := json.Unmarshal(raw, &file); err != nil {
-			t.Fatal(err)
-		}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
 
-		if got := billingBaseFor(&file); got != item.want {
-			t.Errorf("domain=%q billingBaseFor=%q want %q", item.domain, got, item.want)
-		}
+			account := parseTestAuth(t, testCase.raw)
+
+			req, err := newUserResourceRequest(account)
+			if err != nil {
+				t.Fatalf("newUserResourceRequest: %v", err)
+			}
+
+			if got := req.Header.Get("Authorization"); got != "Bearer "+account.AccessTokenValue() {
+				t.Errorf("Authorization=%q", got)
+			}
+
+			if got := req.Header.Get("X-User-Id"); got != account.UID {
+				t.Errorf("X-User-Id=%q want %q", got, account.UID)
+			}
+
+			if got := req.Header.Get("X-Enterprise-Id"); got != account.EnterpriseID {
+				t.Errorf("X-Enterprise-Id=%q want %q", got, account.EnterpriseID)
+			}
+
+			if got := req.Header.Get("X-Tenant-Id"); got != account.EnterpriseID {
+				t.Errorf("X-Tenant-Id=%q want %q", got, account.EnterpriseID)
+			}
+
+			if got := req.Header.Get("X-Domain"); got != account.DomainValue() {
+				t.Errorf("X-Domain=%q want %q", got, account.DomainValue())
+			}
+		})
 	}
 }
 
-// TestUserResourceRequestUsesIssuingDomain 计费域按签发域选，且国际域使用无
-// /v2 前缀的路径（与 internal/upstream 的 billingMeterPaths 同口径）。
+// TestUserResourceRequestUsesIssuingDomain 三域映射与路径前缀保持不变：
+// codebuddy.ai / workbuddy.ai 无 /v2，codebuddy.cn 带 /v2。
 func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		domain string
-		want   string
+		name string
+		raw  string
+		want string
 	}{
-		{"www.codebuddy.ai", "https://www.codebuddy.ai/billing/meter/get-user-resource"},
-		{"www.workbuddy.ai", "https://www.workbuddy.ai/billing/meter/get-user-resource"},
-		{"www.codebuddy.cn", "https://www.codebuddy.cn/v2/billing/meter/get-user-resource"},
+		{
+			name: "国内站",
+			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"}}`,
+			want: "https://www.codebuddy.cn/v2/billing/meter/get-user-resource",
+		},
+		{
+			name: "官方国际站",
+			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.ai"}}`,
+			want: "https://www.codebuddy.ai/billing/meter/get-user-resource",
+		},
+		{
+			name: "旧桌面国际站",
+			raw:  `{"auth":{"accessToken":"at","domain":"www.workbuddy.ai"}}`,
+			want: "https://www.workbuddy.ai/billing/meter/get-user-resource",
+		},
+		{
+			name: "显式 global 无 domain",
+			raw:  `{"auth":{"accessToken":"at","realm":"global"}}`,
+			want: "https://www.workbuddy.ai/billing/meter/get-user-resource",
+		},
+		{
+			name: "realm=cn 但 domain 属 global",
+			raw:  `{"auth":{"accessToken":"at","realm":"cn","domain":"www.workbuddy.ai"}}`,
+			want: "https://www.workbuddy.ai/billing/meter/get-user-resource",
+		},
 	}
-	for _, item := range cases {
-		var file authFile
 
-		raw := []byte(`{"auth":{"accessToken":"token","domain":"` + item.domain + `"}}`)
-		if err := json.Unmarshal(raw, &file); err != nil {
-			t.Fatal(err)
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := newUserResourceRequest(parseTestAuth(t, testCase.raw))
+			if err != nil {
+				t.Fatalf("newUserResourceRequest: %v", err)
+			}
+
+			if got := req.URL.String(); got != testCase.want {
+				t.Errorf("url=%q want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestCollectAccountsCountsBadFiles 每个输入文件都产生一条结果，坏文件写
+// load: 前缀，total.accounts 与文件数一致。
+func TestCollectAccountsCountsBadFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	badJSON := filepath.Join(dir, "workbuddy-bad.json")
+	missingToken := filepath.Join(dir, "workbuddy-no-token.json")
+	missingFile := filepath.Join(dir, "workbuddy-missing.json")
+
+	if err := os.WriteFile(badJSON, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(missingToken, []byte(`{"auth":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accounts := collectAccounts([]string{badJSON, missingToken, missingFile}, upstream.New())
+	if len(accounts) != 3 {
+		t.Fatalf("accounts=%d want 3", len(accounts))
+	}
+
+	for i, item := range accounts {
+		if item.OK {
+			t.Errorf("accounts[%d] should fail", i)
 		}
 
-		req, err := newUserResourceRequest(&file)
-		if err != nil {
-			t.Fatalf("domain=%s: %v", item.domain, err)
+		if !strings.HasPrefix(item.Error, "load: ") {
+			t.Errorf("accounts[%d] error=%q want load: prefix", i, item.Error)
 		}
+	}
+}
 
-		if got := req.URL.String(); got != item.want {
-			t.Errorf("domain=%s url=%q want %q", item.domain, got, item.want)
-		}
+// TestRefreshAccountRefreshesAndWritesBack 过期 token 在单次运行内经 refresh
+// 端点更新并原子写回 auth 文件。
+func TestRefreshAccountRefreshesAndWritesBack(t *testing.T) {
+	t.Parallel()
+
+	var gotPath, gotRefreshToken string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotRefreshToken = r.Header.Get("X-Refresh-Token")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"accessToken":"new-at","refreshToken":"new-rt","expiresIn":3600}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "workbuddy-u-refresh.json")
+
+	raw := `{"auth":{"accessToken":"old-at","refreshToken":"old-rt","expiresAt":1,"domain":"www.codebuddy.cn"},"account":{"uid":"u-refresh","nickname":"待刷新"}}`
+	if err := os.WriteFile(filePath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	account := parseTestAuth(t, raw)
+	account.FilePath = filePath
+
+	client := upstream.New()
+	client.HTTP = srv.Client()
+	client.ChatBaseCN = srv.URL
+
+	if err := refreshAccount(client, account); err != nil {
+		t.Fatalf("refreshAccount: %v", err)
+	}
+
+	if gotPath != "/v2/plugin/auth/token/refresh" {
+		t.Errorf("refresh path=%q", gotPath)
+	}
+
+	if gotRefreshToken != "old-rt" {
+		t.Errorf("X-Refresh-Token=%q", gotRefreshToken)
+	}
+
+	if got := account.AccessTokenValue(); got != "new-at" {
+		t.Errorf("accessToken=%q want new-at", got)
+	}
+
+	written, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read written auth: %v", err)
+	}
+
+	saved, err := auth.Parse(written)
+	if err != nil {
+		t.Fatalf("parse written auth: %v", err)
+	}
+
+	if saved.AccessTokenValue() != "new-at" || saved.RefreshTokenValue() != "new-rt" {
+		t.Errorf("written auth token=%q refresh=%q", saved.AccessTokenValue(), saved.RefreshTokenValue())
+	}
+}
+
+// TestRefreshAccountFallsBackWhenTokenStillValid refresh 端点暂时失败但 access token
+// 未过期时，继续用旧 token 查询余额；不返回错误、不改写文件。
+func TestRefreshAccountFallsBackWhenTokenStillValid(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":400,"msg":"bad refresh"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	raw := fmt.Sprintf(
+		`{"auth":{"accessToken":"still-at","refreshToken":"old-rt","expiresAt":%d,"domain":"www.codebuddy.cn"},"account":{"uid":"u-still"}}`,
+		time.Now().Add(time.Hour).Unix(),
+	)
+	account := parseTestAuth(t, raw)
+
+	client := upstream.New()
+	client.HTTP = srv.Client()
+	client.ChatBaseCN = srv.URL
+
+	if err := refreshAccount(client, account); err != nil {
+		t.Fatalf("未过期 token 的 refresh 失败不应阻断查询: %v", err)
+	}
+
+	if got := account.AccessTokenValue(); got != "still-at" {
+		t.Errorf("accessToken=%q want still-at", got)
+	}
+}
+
+// TestRefreshAccountWithoutRefreshTokenKeepsHandwrittenAuth 手写扁平 auth 常无
+// expiresAt / refreshToken；不能因为 NeedsRefresh(无过期时间)=true 就判 refresh
+// 失败，必须保留 accessToken 继续查询，且不重写原文件。
+func TestRefreshAccountWithoutRefreshTokenKeepsHandwrittenAuth(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "workbuddy-u-flat.json")
+
+	raw := `{"accessToken":"flat-at","uid":"u-flat","domain":"www.codebuddy.cn"}`
+	if err := os.WriteFile(filePath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	account := parseTestAuth(t, raw)
+	account.FilePath = filePath
+
+	if err := refreshAccount(upstream.New(), account); err != nil {
+		t.Fatalf("无 refresh token 应跳过刷新: %v", err)
+	}
+
+	if got := account.AccessTokenValue(); got != "flat-at" {
+		t.Errorf("accessToken=%q want flat-at", got)
+	}
+
+	written, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read auth: %v", err)
+	}
+
+	if string(written) != raw {
+		t.Errorf("未触发刷新不应重写 auth 文件: %s", written)
+	}
+}
+
+// TestCollectAccountsRefreshFailureRow refresh 失败记 refresh: 前缀并跳过余额请求。
+func TestCollectAccountsRefreshFailureRow(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":400,"msg":"bad refresh"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "workbuddy-u-fail.json")
+
+	raw := `{"auth":{"accessToken":"old-at","refreshToken":"old-rt","expiresAt":1,"domain":"www.codebuddy.cn"},"account":{"uid":"u-fail"}}`
+	if err := os.WriteFile(filePath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := upstream.New()
+	client.HTTP = srv.Client()
+	client.ChatBaseCN = srv.URL
+
+	accounts := collectAccounts([]string{filePath}, client)
+	if len(accounts) != 1 {
+		t.Fatalf("accounts=%d want 1", len(accounts))
+	}
+
+	if accounts[0].OK {
+		t.Fatal("refresh failure should not be ok")
+	}
+
+	if !strings.HasPrefix(accounts[0].Error, "refresh: ") {
+		t.Errorf("error=%q want refresh: prefix", accounts[0].Error)
 	}
 }

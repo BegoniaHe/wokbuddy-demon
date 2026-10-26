@@ -7,6 +7,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/cpupool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/ospool"
 )
 
 // TestDesktopHardwareStableAndBounded 同一账号的机型参数必须稳定，且落在平台
@@ -14,9 +15,9 @@ import (
 func TestDesktopHardwareStableAndBounded(t *testing.T) {
 	t.Parallel()
 
-	versions := make(map[string]int, len(desktopOSVersions))
-	for _, ver := range desktopOSVersions {
-		versions[ver.build] = ver.minCPUYear
+	versions := make(map[string]int, len(ospool.Releases))
+	for _, release := range ospool.Releases {
+		versions[release.Build] = release.MinCPUYear
 	}
 
 	for i := range 64 {
@@ -101,14 +102,15 @@ func TestDesktopHardwareVariesAcrossAccounts(t *testing.T) {
 	}
 }
 
-// TestDesktopOSVersionCPUYearGate 新版本（26H1/26H2）只能配 2022 年及以后平台；
+// TestDesktopOSVersionCPUYearGate 新版本（26H2；#318 已移除 ARM 独占的 26H1）
+// 只能配 2022 年及以后平台；
 // 老平台只落在门槛允许的版本里。
 func TestDesktopOSVersionCPUYearGate(t *testing.T) {
 	t.Parallel()
 
-	minYears := make(map[string]int, len(desktopOSVersions))
-	for _, ver := range desktopOSVersions {
-		minYears[ver.build] = ver.minCPUYear
+	minYears := make(map[string]int, len(ospool.Releases))
+	for _, release := range ospool.Releases {
+		minYears[release.Build] = release.MinCPUYear
 	}
 
 	for _, year := range []int{2017, 2018, 2021, 2022, 2024} {

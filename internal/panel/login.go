@@ -332,6 +332,12 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// loginPendingInfo pending 轮询携带的上游业务码与消息（用于按 state 去重记日志）。
+type loginPendingInfo struct {
+	code int
+	msg  string
+}
+
 // loginToken auth/token 端点返回的凭证字段。
 type loginToken struct {
 	AccessToken  string `json:"accessToken"`
@@ -377,7 +383,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, pending, endpoint, err := p.pollLoginToken(sess.realm, sess.base, state)
+	tok, pendingInfo, pending, endpoint, err := p.pollLoginToken(sess.realm, sess.base, state)
 	if err != nil {
 		// 许可终态会让前端停止轮询；收敛会话，避免状态永久留在 p.logins。
 		if loginTokenTerminal(err) {
@@ -390,7 +396,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if pending {
+		p.noteLoginPending(state, pendingInfo)
 		writeJSON(w, http.StatusOK, map[string]any{"done": false, "message": "waiting for login"})
+
 		return
 	}
 
@@ -497,19 +505,22 @@ func writeLoginPollError(w http.ResponseWriter, err error) {
 }
 
 // pollLoginToken 查 auth/token：请求失败返回 err（面板按 pending 处理）；token 尚未
-// 就绪返回 pending=true；成功返回解析后的凭证与命中的 origin（account 端点同源）。
-func (p *Panel) pollLoginToken(realm, preferredBase, state string) (loginToken, bool, loginEndpoint, error) {
+// 就绪返回 pending=true 并带回上游 code/msg；成功返回解析后的凭证与命中的 origin
+// （account 端点同源）。
+func (p *Panel) pollLoginToken(
+	realm, preferredBase, state string,
+) (loginToken, loginPendingInfo, bool, loginEndpoint, error) {
 	identity := p.loginIdentityFor(realm)
 	if identity.userAgent == "" {
-		return loginToken{}, false, loginEndpoint{}, errLoginProfileMissing
+		return loginToken{}, loginPendingInfo{}, false, loginEndpoint{}, errLoginProfileMissing
 	}
 
 	var lastErr error
 
 	for _, endpoint := range loginCandidatesPreferWithIdentity(realm, preferredBase, identity) {
-		tok, pending, status, err := requestLoginToken(&endpoint, state)
+		tok, pendingInfo, pending, status, err := requestLoginToken(&endpoint, state)
 		if err == nil {
-			return tok, pending, endpoint, nil
+			return tok, pendingInfo, pending, endpoint, nil
 		}
 
 		lastErr = err
@@ -517,34 +528,68 @@ func (p *Panel) pollLoginToken(realm, preferredBase, state string) (loginToken, 
 			continue
 		}
 
-		return loginToken{}, false, loginEndpoint{}, err
+		return loginToken{}, loginPendingInfo{}, false, loginEndpoint{}, err
 	}
 
-	return loginToken{}, false, loginEndpoint{}, lastErr
+	return loginToken{}, loginPendingInfo{}, false, loginEndpoint{}, lastErr
 }
 
 // requestLoginToken 请求单个 origin 的 token 端点：pending 业务码与空 token 都归一为
-// pending=true 且 err=nil；许可终态与其他错误原样返回给调用方决定是否换 origin。
-func requestLoginToken(endpoint *loginEndpoint, state string) (loginToken, bool, int, error) {
+// pending=true 且 err=nil；pending 业务码同时带回 code/msg 供日志使用。许可终态与其他
+// 错误原样返回给调用方决定是否换 origin。
+func requestLoginToken(endpoint *loginEndpoint, state string) (loginToken, loginPendingInfo, bool, int, error) {
 	tokRaw, status, err := doJSON(
 		http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
 	)
 	if err != nil {
-		if loginTokenPending(err) {
-			return loginToken{}, true, status, nil
+		if codeErr, ok := errors.AsType[*logincode.Error](err); ok && logincode.IsPending(codeErr.Code) {
+			return loginToken{}, loginPendingInfo{code: codeErr.Code, msg: codeErr.Msg}, true, status, nil
 		}
 
-		return loginToken{}, false, status, err
+		return loginToken{}, loginPendingInfo{}, false, status, err
 	}
 
 	var tok loginToken
 
 	_ = json.Unmarshal(tokRaw, &tok)
 	if tok.AccessToken == "" {
-		return loginToken{}, true, status, nil
+		return loginToken{}, loginPendingInfo{}, true, status, nil
 	}
 
-	return tok, false, status, nil
+	return tok, loginPendingInfo{}, false, status, nil
+}
+
+// noteLoginPending 按 state 去重记录 pending 的上游 code/msg：相同结果只记一次，
+// 变化时再记。去重状态存 loginSession，读写都在 loginMu 下。日志只含 state 前 8 位。
+func (p *Panel) noteLoginPending(state string, info loginPendingInfo) {
+	if info.code == 0 && info.msg == "" {
+		return
+	}
+
+	p.loginMu.Lock()
+
+	sess, ok := p.logins[state]
+	if !ok {
+		p.loginMu.Unlock()
+
+		return
+	}
+
+	if sess.pendingLogged && sess.pendingCode == info.code && sess.pendingMsg == info.msg {
+		p.loginMu.Unlock()
+
+		return
+	}
+
+	sess.pendingLogged = true
+	sess.pendingCode = info.code
+	sess.pendingMsg = info.msg
+	p.logins[state] = sess
+	p.loginMu.Unlock()
+
+	//nolint:gosec // state 仅取前 8 位，msg 已用 %q 转义。
+	log.Printf("panel: 登录等待中 state=%s... code=%d msg=%q",
+		state[:min(8, len(state))], info.code, info.msg)
 }
 
 // loginTokenRetryable 报告失败是否值得换 origin：许可终态不换，其余按网关类状态码。
@@ -554,13 +599,6 @@ func loginTokenRetryable(status int, err error) bool {
 	}
 
 	return loginReplayable(status)
-}
-
-// loginTokenPending 报告 token 轮询错误是否为 pending 业务码。
-func loginTokenPending(err error) bool {
-	codeErr, ok := errors.AsType[*logincode.Error](err)
-
-	return ok && logincode.IsPending(codeErr.Code)
 }
 
 // loginTokenTerminal 报告 token 轮询错误是否为许可终态。

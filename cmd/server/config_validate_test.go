@@ -25,6 +25,11 @@ func TestValidateRejectsInvalidConfig(t *testing.T) {
 		{"global-disabled-with-base", `{"global":{"enabled":false,"chat_base":"https://x.example"}}`, "global.enabled"},
 		{"global-disabled-no-base", `{"global":{"enabled":false}}`, ""},
 		{"max-in-flight-zero-ok", `{"pool":{"max_in_flight":0}}`, ""},
+		{"admin-equals-api", `{"api_key":"k","admin_api_key":"k"}`, "admin_api_key"},
+		{"readonly-equals-api", `{"api_key":"k","readonly_api_key":"k"}`, "readonly_api_key"},
+		{"admin-equals-readonly", `{"admin_api_key":"k","readonly_api_key":"k"}`, "readonly_api_key"},
+		{"admin-and-readonly-ok", `{"api_key":"a","admin_api_key":"b","readonly_api_key":"c"}`, ""},
+		{"admin-trimmed", `{"api_key":"a","admin_api_key":"  a  "}`, "admin_api_key"},
 	}
 	for _, item := range cases {
 		t.Run(item.name, func(t *testing.T) {

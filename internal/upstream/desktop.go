@@ -46,6 +46,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/cpupool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/ospool"
 )
 
 const (
@@ -127,21 +128,6 @@ func deriveID(a *auth.Auth, salt string) string {
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
 type DesktopEvent map[string]any
 
-// desktopOSVersions Windows 11 各版本 build 的轮换池（权重近似 2026-10 的真实
-// 保有量：25H2/24H2 为主力，23H2 渐退，26H2 随新机铺开，26H1 仅新机型）。
-// minCPUYear 是该版本可搭配的最低 CPU 发布年：新系统不配老平台。
-var desktopOSVersions = []struct {
-	build      string
-	weight     int
-	minCPUYear int
-}{
-	{"10.0.26200", 34, 2018}, // 25H2
-	{"10.0.26100", 30, 2018}, // 24H2
-	{"10.0.22631", 16, 2017}, // 23H2
-	{"10.0.26300", 12, 2022}, // 26H2
-	{"10.0.28000", 8, 2022},  // 26H1（新机专用）
-}
-
 // desktopMemBands 逻辑线程数区间 → 内存档（GB）加权表，重复即权重。
 // 整体单调：线程多则内存大；8 线程及以下不配 32G，高线程不配 8G；
 // 24/28/32 线程才出现 64G（高端整机，低权重）。移动段另由
@@ -185,7 +171,7 @@ func desktopRNG(a *auth.Auth, salt string) *rand.Rand {
 // desktopHardware 由 uid 稳定派生一台「固定设备」的 osVersion/CPU/内存：
 //   - cpu：N(10, 5.5) 取偶后截断到 [4,32]，归到 CPU 型号池线程档后按 uid 选具体型号
 //     ——8~12 线程的装机量占多数，16 线程以上是少数，4 线程为老机型；
-//   - osVersion：先定 CPU 型号，再只在 minCPUYear <= 型号发布年的版本里按权重抽，
+//   - osVersion：先定 CPU 型号，再只在 MinCPUYear <= 型号发布年的版本里按权重抽，
 //     避免新系统配老平台；
 //   - memorySize：按该型号的逻辑线程数与 Segment 分档加权抽样，核多内存大，16GB 最主流。
 func desktopHardware(a *auth.Auth) (osVersion string, cpu cpupool.CPUModel, memorySize int) {
@@ -208,28 +194,28 @@ func desktopHardware(a *auth.Auth) (osVersion string, cpu cpupool.CPUModel, memo
 // desktopOSVersionFor 在 CPU 发布年允许的 Windows 版本里按权重抽一个；
 // 候选为空（理论上不会发生）时退到门槛最低的版本。
 func desktopOSVersionFor(rng *rand.Rand, cpuYear int) string {
-	candidates := make([]int, 0, len(desktopOSVersions))
+	candidates := make([]int, 0, len(ospool.Releases))
 	total := 0
 
-	for i, ver := range desktopOSVersions {
-		if ver.minCPUYear > cpuYear {
+	for i, release := range ospool.Releases {
+		if release.MinCPUYear > cpuYear {
 			continue
 		}
 
 		candidates = append(candidates, i)
-		total += ver.weight
+		total += release.Weight
 	}
 
 	if len(candidates) == 0 {
 		minYear := math.MaxInt
-		for _, ver := range desktopOSVersions {
-			minYear = min(minYear, ver.minCPUYear)
+		for _, release := range ospool.Releases {
+			minYear = min(minYear, release.MinCPUYear)
 		}
 
-		for i, ver := range desktopOSVersions {
-			if ver.minCPUYear == minYear {
+		for i, release := range ospool.Releases {
+			if release.MinCPUYear == minYear {
 				candidates = append(candidates, i)
-				total += ver.weight
+				total += release.Weight
 			}
 		}
 	}
@@ -237,15 +223,15 @@ func desktopOSVersionFor(rng *rand.Rand, cpuYear int) string {
 	pick := rng.IntN(total)
 
 	for _, i := range candidates {
-		ver := desktopOSVersions[i]
-		if pick < ver.weight {
-			return ver.build
+		release := ospool.Releases[i]
+		if pick < release.Weight {
+			return release.Build
 		}
 
-		pick -= ver.weight
+		pick -= release.Weight
 	}
 
-	return desktopOSVersions[candidates[len(candidates)-1]].build
+	return ospool.Releases[candidates[len(candidates)-1]].Build
 }
 
 // desktopMemoryFor 按 CPU 型号的逻辑线程数选内存档；移动段上限 32G。

@@ -285,13 +285,13 @@ linters:
       ignore-sig-regexps:
         - ^func \((net/http\.(ResponseWriter|Hijacker|Pusher)|io\.(ReaderFrom|Closer)|context\.Context|net\.Conn)\)\.
     # exhaustruct_v5：显式模式只对「全字段都应显式给出」的 DTO 生效；
-    # 配置/状态结构含大量可选零值字段，逐个补零只会制造噪音，故不纳入。
+    # 配置/状态结构含大量可选零值字段，逐个补零只会制造噪音，故不纳入
+    # （apikey.Limits 的零值即「不限」，同样不强制逐字段列出）。
     exhaustruct_v5:
       explicit-mode: true
       # 成功路径用零值表示「无此对象」（如上游无可用专家），与 err 无关。
       allow-empty-returns: true
       enforce-patterns:
-        - '.*/internal/apikey\.Limits$'
         - '.*/internal/httpauth\.AuthResult$'
         - '.*/internal/usage\.Window$'
         - '.*/internal/notify\.Event$'

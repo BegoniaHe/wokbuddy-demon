@@ -71,29 +71,95 @@ func TestConversationHeaderAlwaysEmitted(t *testing.T) {
 	}
 }
 
-// TestAccountStableHeadersUUIDShape 设备/会话头按 uid 稳定派生且为连字符 UUIDv4。
-func TestAccountStableHeadersUUIDShape(t *testing.T) {
+// TestDesktopFingerprintHeadersAbsent 官方 CLI chat 与 daemon 网关都不发
+// Origin / Referer / X-Machine-Id / X-Session-Id（issue #299）。CN/global 经
+// CommonHeaders、ChatHeaders、RefreshHeaders 都不得注入。
+func TestDesktopFingerprintHeadersAbsent(t *testing.T) {
 	t.Parallel()
 
 	client := New()
-	a := &auth.Auth{UID: "u-stable", AccessToken: "at"}
 
-	read := func() (string, string) {
-		req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
-		client.CommonHeaders(req, a)
-
-		return req.Header.Get("X-Machine-Id"), req.Header.Get("X-Session-Id")
+	cases := []struct {
+		name    string
+		account *auth.Auth
+	}{
+		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}},
+		{"global 个人号", &auth.Auth{UID: "u-global", AccessToken: "at", Domain: "www.workbuddy.ai"}},
 	}
 
-	machineA, sessionA := read()
-
-	machineB, sessionB := read()
-	if machineA != machineB || sessionA != sessionB {
-		t.Fatalf("同 uid 派生应稳定: machine %q/%q session %q/%q", machineA, machineB, sessionA, sessionB)
+	headerSets := []struct {
+		name string
+		call func(req *http.Request, account *auth.Auth)
+	}{
+		{"CommonHeaders", func(req *http.Request, account *auth.Auth) {
+			client.CommonHeaders(req, account)
+		}},
+		{"ChatHeaders", func(req *http.Request, account *auth.Auth) {
+			client.ChatHeaders(req, account, "", ChatMeta{})
+		}},
+		{"RefreshHeaders", func(req *http.Request, account *auth.Auth) {
+			client.RefreshHeaders(req, account)
+		}},
 	}
 
-	if !uuidV4HeaderPattern.MatchString(machineA) || !uuidV4HeaderPattern.MatchString(sessionA) {
-		t.Fatalf("设备/会话头应为 UUIDv4: machine=%q session=%q", machineA, sessionA)
+	for _, accountCase := range cases {
+		for _, headerCase := range headerSets {
+			t.Run(accountCase.name+"/"+headerCase.name, func(t *testing.T) {
+				t.Parallel()
+
+				req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+				if err != nil {
+					t.Fatalf("new request: %v", err)
+				}
+
+				headerCase.call(req, accountCase.account)
+
+				for _, name := range []string{"Origin", "Referer", "X-Machine-Id", "X-Session-Id"} {
+					if got := req.Header.Get(name); got != "" {
+						t.Errorf("%s=%q want empty", name, got)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestChatHeadersDepartmentInfoExcludesNoDepartment 有 departmentFullName 时
+// ChatHeaders 发 X-Department-Info 并移除 X-No-Department-Info；只调
+// injectChatDomain 的 FetchModels 类端点仍保留「无部门」声明。
+func TestChatHeadersDepartmentInfoExcludesNoDepartment(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1", DepartmentFullName: "研发部"}
+
+	req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	New().ChatHeaders(req, account, "", ChatMeta{})
+
+	if got := req.Header.Get("X-Department-Info"); got != "研发部" {
+		t.Errorf("X-Department-Info=%q", got)
+	}
+
+	if got := req.Header.Get("X-No-Department-Info"); got != "" {
+		t.Errorf("X-No-Department-Info=%q should be removed", got)
+	}
+
+	modelsReq, err := http.NewRequest(http.MethodPost, "https://example.invalid/v3/config", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	injectChatDomain(modelsReq, account)
+
+	if got := modelsReq.Header.Get("X-No-Department-Info"); got != "1" {
+		t.Errorf("non-chat X-No-Department-Info=%q want 1", got)
+	}
+
+	if got := modelsReq.Header.Get("X-Department-Info"); got != "" {
+		t.Errorf("non-chat X-Department-Info=%q want empty", got)
 	}
 }
 
@@ -118,28 +184,40 @@ func TestConversationHeaderPrefersInbound(t *testing.T) {
 	}
 }
 
-// TestIdentityHeadersEnterprise 身份头只按企业身份注入：个人号即使残留
-// token_source 也不发 X-Auth-Method / X-Userinfo（issue #248）。
+// TestIdentityHeaders 身份头按 enterpriseId / idSource 注入：企业号补齐
+// X-Id-Source / X-Department-Info，静态 Key（enterpriseId 空、idSource 非空）
+// 不再被跳过；个人号即使残留 token_source 也不发任何身份头（issue #248/#298）。
 //
-//nolint:cyclop // 表驱动四象限。
-func TestIdentityHeadersEnterprise(t *testing.T) {
+//nolint:cyclop // 表驱动多字段断言。
+func TestIdentityHeaders(t *testing.T) {
 	t.Parallel()
 
-	makeAuth := func(enterprise, source string) *auth.Auth {
+	makeAuth := func(enterprise, idSource, department, source string) *auth.Auth {
 		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"token_source":"` + source + `"}`))
-		return &auth.Auth{UID: "u1", AccessToken: "x." + payload + ".sig", EnterpriseID: enterprise}
+
+		return &auth.Auth{
+			UID:                "u1",
+			AccessToken:        "x." + payload + ".sig",
+			EnterpriseID:       enterprise,
+			IDSource:           idSource,
+			DepartmentFullName: department,
+		}
 	}
 
 	cases := []struct {
-		name       string
-		account    *auth.Auth
-		wantMethod string
-		wantInfo   bool
+		name           string
+		account        *auth.Auth
+		wantMethod     string
+		wantIDSource   string
+		wantDepartment string
+		wantInfo       bool
+		wantOwner      string
 	}{
-		{"企业号带来源", makeAuth("ent-1", "enterprise_switch"), "enterprise_switch", true},
-		{"企业号缺来源", makeAuth("ent-1", ""), "", true},
-		{"个人号无来源", makeAuth("", ""), "", false},
-		{"个人号残留来源", makeAuth("", "enterprise_switch"), "", false},
+		{"企业号带来源与部门", makeAuth("ent-1", "static_key", "研发部", "enterprise_switch"), "enterprise_switch", "static_key", "研发部", true, "ent-1"},
+		{"企业号缺来源", makeAuth("ent-1", "", "", ""), "", "", "", true, "ent-1"},
+		{"静态 Key 仅 idSource", makeAuth("", "static_key", "", "static_key"), "static_key", "static_key", "", true, ""},
+		{"个人号无来源", makeAuth("", "", "", ""), "", "", "", false, ""},
+		{"个人号残留来源", makeAuth("", "", "", "enterprise_switch"), "", "", "", false, ""},
 	}
 
 	for _, testCase := range cases {
@@ -152,6 +230,18 @@ func TestIdentityHeadersEnterprise(t *testing.T) {
 
 			if got := req.Header.Get("X-Auth-Method"); got != testCase.wantMethod {
 				t.Fatalf("X-Auth-Method=%q want %q", got, testCase.wantMethod)
+			}
+
+			if got := req.Header.Get("X-Id-Source"); got != testCase.wantIDSource {
+				t.Fatalf("X-Id-Source=%q want %q", got, testCase.wantIDSource)
+			}
+
+			if got := req.Header.Get("X-Department-Info"); got != testCase.wantDepartment {
+				t.Fatalf("X-Department-Info=%q want %q", got, testCase.wantDepartment)
+			}
+
+			if testCase.wantDepartment != "" && req.Header.Get("X-No-Department-Info") != "" {
+				t.Fatal("X-No-Department-Info must not accompany X-Department-Info")
 			}
 
 			info := req.Header.Get("X-Userinfo")
@@ -173,12 +263,26 @@ func TestIdentityHeadersEnterprise(t *testing.T) {
 				t.Fatalf("X-Userinfo json: %v", err)
 			}
 
-			if payload["uin"] != "u1" || payload["owner_uin"] != "ent-1" {
-				t.Fatalf("X-Userinfo=%v", payload)
+			if payload["uin"] != "u1" {
+				t.Fatalf("X-Userinfo uin=%v", payload["uin"])
 			}
 
-			if testCase.wantMethod != "" && payload["token_source"] != testCase.wantMethod {
-				t.Fatalf("token_source=%v want %s", payload["token_source"], testCase.wantMethod)
+			if got, ok := payload["owner_uin"]; testCase.wantOwner == "" && ok {
+				t.Fatalf("owner_uin should be absent: %v", got)
+			} else if testCase.wantOwner != "" && got != testCase.wantOwner {
+				t.Fatalf("owner_uin=%v want %s", got, testCase.wantOwner)
+			}
+
+			if got, ok := payload["id_source"]; testCase.wantIDSource == "" && ok {
+				t.Fatalf("id_source should be absent: %v", got)
+			} else if testCase.wantIDSource != "" && got != testCase.wantIDSource {
+				t.Fatalf("id_source=%v want %s", got, testCase.wantIDSource)
+			}
+
+			if got, ok := payload["token_source"]; testCase.wantMethod == "" && ok {
+				t.Fatalf("token_source should be absent: %v", got)
+			} else if testCase.wantMethod != "" && got != testCase.wantMethod {
+				t.Fatalf("token_source=%v want %s", got, testCase.wantMethod)
 			}
 		})
 	}

@@ -3,7 +3,12 @@
 // （三个截止是或门，任一未到期即不可选，生效的一定是最远者——见 entry.degradeUntil 注释）。
 package pool
 
-import "time"
+import (
+	"log"
+	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+)
 
 // NoteFailures 记录一次「不罚号的失败」（issue #114 连败兜底的喂入口）：
 // consecutiveFails++，达到 degradeThreshold 触发降权（degradeUntil = now +
@@ -32,6 +37,8 @@ func (p *Pool) NoteFailures(uid string) {
 		return
 	}
 
+	fails := entry2.consecutiveFails
+
 	entry2.consecutiveFails = 0
 	if !entry2.degradeUntil.IsZero() && p.now().Before(entry2.degradeUntil) {
 		// 降权期内的连败达阈：不延长（取更长者语义由 healthy 或门保证）。计数
@@ -42,6 +49,9 @@ func (p *Pool) NoteFailures(uid string) {
 
 	entry2.degradeUntil = p.now().Add(p.degradeDurationLocked())
 	p.dirty.Store(true)
+	log.Printf("WARN: [pool] account degraded acct=%s until=%s consecutiveFails=%d",
+		logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()),
+		entry2.degradeUntil.Format(time.RFC3339), fails)
 }
 
 // degradeDurationLocked 返回降权时长（当前实现为固定 degradeCooldown，钳到

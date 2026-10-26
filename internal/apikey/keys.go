@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net/netip"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -46,7 +47,11 @@ const (
 	flushInterval = 30 * time.Second
 )
 
-var errSetRealmFailed = errors.New("SetRealm failed")
+var (
+	errSetRealmFailed = errors.New("SetRealm failed")
+	// ErrInvalidLimits 表示 Limits 校验失败（调用方应映射为 400，而不是落盘/500）。
+	ErrInvalidLimits = errors.New("invalid limits")
+)
 
 // Record 一把命名密钥的持久化记录。Hash 为 SHA-256 十六进制串，绝不回显。
 type Record struct {
@@ -74,6 +79,12 @@ type Limits struct {
 	TPM           int      `json:"tpm,omitempty"`            // 每分钟 token 数（按已完成请求累计）
 	MaxConcurrent int      `json:"max_concurrent,omitempty"` // 最大并发请求数
 	Models        []string `json:"models,omitempty"`         // 模型白名单（glob，可带 cn:/global: 前缀）
+	// ExpiresAt 到期时刻（UTC）；nil = 永不过期。now >= ExpiresAt 即拒绝。
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	// QuotaTokens 生命周期总 token 配额；0 = 不限。按 Record.TotalTokens 判定。
+	QuotaTokens int64 `json:"quota_tokens,omitempty"`
+	// IPAllowlist 来源 IP 白名单（裸 IP 或 CIDR）；空 = 不限。保存时归一化。
+	IPAllowlist []string `json:"ip_allowlist,omitempty"`
 }
 
 // limitRuntime 单把密钥的进程内限流状态（固定 1 分钟窗口）。
@@ -193,12 +204,24 @@ func (s *Store) Stop() {
 }
 
 // Create 生成并持久化一把新命名密钥，返回记录（不含哈希）与仅此一次的明文。
+// 可选 Limits 在写入前统一校验/归一化；非法值返回 ErrInvalidLimits，绝不落盘。
 // 落盘失败时回滚内存变更并返回错误。
-func (s *Store) Create(name string) (Record, string, error) {
+func (s *Store) Create(name string, limits ...Limits) (Record, string, error) {
+	var normalized Limits
+
+	if len(limits) > 0 {
+		var err error
+		if normalized, err = NormalizeLimits(limits[0]); err != nil {
+			return Record{}, "", err
+		}
+	}
+
 	raw, rec, err := newRecord(name)
 	if err != nil {
 		return Record{}, "", err
 	}
+
+	rec.Limits = normalized
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -428,23 +451,52 @@ func (s *Store) rebuildKeysLocked() {
 	s.keys = keys
 }
 
-// Acquire 按命名密钥限制尝试进入一次请求。返回 release（必须 defer 调用）、
-// 建议 Retry-After 与是否放行。未配置限制时直接放行（no-op release）。
-// model 白名单不在此检查（请求体尚未解析），见 ModelAllowed。
-func (s *Store) Acquire(id string) (release func(), retryAfter time.Duration, ok bool) {
-	limits, found := s.limitsOf(id)
-	if !found || !limits.enabled() {
-		return func() {}, 0, true
+// RejectReason 命名密钥准入拒绝原因。调用方按枚举决定状态码，不解析字符串。
+type RejectReason int
+
+const (
+	RejectNone RejectReason = iota
+	// RejectExpired 密钥已过期（401 invalid_api_key）。
+	RejectExpired
+	// RejectIPNotAllowed 来源 IP 不在白名单（403 ip_not_allowed）。
+	RejectIPNotAllowed
+	// RejectQuotaExhausted 生命周期 token 配额耗尽（429 insufficient_quota）。
+	RejectQuotaExhausted
+	// RejectRateLimited RPM/TPM 超限（429 + Retry-After）。
+	RejectRateLimited
+	// RejectConcurrency 并发超限（429 + Retry-After）。
+	RejectConcurrency
+)
+
+// Acquire 按命名密钥限制尝试进入一次请求。返回 release（放行时必须 defer 调用）、
+// 建议 Retry-After 与拒绝原因。检查顺序固定：过期 → IP 白名单 → 总量配额 →
+// RPM/TPM/并发。
+//
+// 总量配额是准入时 best-effort：max_concurrent 条在途请求仍可能各消耗 token，
+// 因此允许有限超额，不做 token 预留。model 白名单不在此检查（请求体尚未解析），
+// 见 ModelAllowed。
+func (s *Store) Acquire(id, ip string) (release func(), retryAfter time.Duration, reason RejectReason) {
+	limits, totalTokens, found := s.stateOf(id)
+	if !found {
+		return func() {}, 0, RejectNone
 	}
 
 	now := time.Now()
+
+	if reason := checkKeyAdmission(limits, totalTokens, ip, now); reason != RejectNone {
+		return nil, 0, reason
+	}
+
+	if limits.RPM <= 0 && limits.TPM <= 0 && limits.MaxConcurrent <= 0 {
+		return func() {}, 0, RejectNone
+	}
 
 	s.limMu.Lock()
 	defer s.limMu.Unlock()
 
 	limitRuntime2 := s.runtimeLocked(id, now)
-	if retry, ok := allowLocked(limitRuntime2, limits); !ok {
-		return nil, retry, false
+	if retry, rejection := allowLocked(limitRuntime2, limits); rejection != RejectNone {
+		return nil, retry, rejection
 	}
 
 	limitRuntime2.rpm++
@@ -456,28 +508,46 @@ func (s *Store) Acquire(id string) (release func(), retryAfter time.Duration, ok
 			limitRuntime2.inflight--
 		}
 		s.limMu.Unlock()
-	}, 0, true
+	}, 0, RejectNone
 }
 
-// enabled 报告是否配置了任一限流维度。
-func (l Limits) enabled() bool { return l.RPM > 0 || l.TPM > 0 || l.MaxConcurrent > 0 }
+// checkKeyAdmission 检查不依赖进程内窗口的准入维度：过期 → IP 白名单 → 总量配额。
+//
+//nolint:gocritic // 值语义的 Limits，与 Acquire/NormalizeLimits 保持一致。
+func checkKeyAdmission(limits Limits, totalTokens int64, ip string, now time.Time) RejectReason {
+	if limits.ExpiresAt != nil && !now.Before(*limits.ExpiresAt) {
+		return RejectExpired
+	}
 
-// allowLocked 检查并发/RPM/TPM，返回建议等待时长。
-func allowLocked(limitRuntime2 *limitRuntime, limits Limits) (time.Duration, bool) {
+	if len(limits.IPAllowlist) > 0 && !ipAllowed(limits.IPAllowlist, ip) {
+		return RejectIPNotAllowed
+	}
+
+	if limits.QuotaTokens > 0 && totalTokens >= limits.QuotaTokens {
+		return RejectQuotaExhausted
+	}
+
+	return RejectNone
+}
+
+// allowLocked 检查并发/RPM/TPM，返回建议等待时长与拒绝原因。
+//
+//nolint:gocritic // Limits 是值语义的配置快照，指针化会让调用点与不可变性都变复杂。
+func allowLocked(limitRuntime2 *limitRuntime, limits Limits) (time.Duration, RejectReason) {
 	if limits.MaxConcurrent > 0 && limitRuntime2.inflight >= limits.MaxConcurrent {
-		return time.Second, false
+		return time.Second, RejectConcurrency
 	}
 
 	retry := time.Until(limitRuntime2.windowStart.Add(time.Minute))
 	if limits.RPM > 0 && limitRuntime2.rpm >= limits.RPM {
-		return retry, false
+		return retry, RejectRateLimited
 	}
 
 	if limits.TPM > 0 && limitRuntime2.tpm >= int64(limits.TPM) {
-		return retry, false
+		return retry, RejectRateLimited
 	}
 
-	return 0, true
+	return 0, RejectNone
 }
 
 // ModelAllowed 报告模型是否命中密钥白名单（未配置 = 全部允许）。
@@ -542,11 +612,19 @@ func (s *Store) SetRealm(id, realm string) (bool, error) {
 	})
 }
 
-// UpdateLimits 替换一把密钥的限制（面板编辑用）。非法值在调用方校验。
+// UpdateLimits 替换一把密钥的限制（面板编辑用）。统一在包内校验/归一化；
+// 非法值返回 ErrInvalidLimits，绝不落盘。
+//
+//nolint:gocritic // 值语义的 Limits 便于调用方以字面量表达「零 = 不限」。
 func (s *Store) UpdateLimits(id string, limits Limits) (bool, error) {
+	normalized, err := NormalizeLimits(limits)
+	if err != nil {
+		return false, err
+	}
+
 	return s.updateRecord(id, func(rec *Record) func() {
 		old := rec.Limits
-		rec.Limits = limits
+		rec.Limits = normalized
 
 		return func() { rec.Limits = old }
 	})
@@ -610,6 +688,209 @@ func (s *Store) limitsOf(id string) (Limits, bool) {
 	}
 
 	return Limits{RPM: 0, TPM: 0, MaxConcurrent: 0, Models: nil}, false
+}
+
+// stateOf 读取记录限制与已累计 token（返回 false 表示不存在/已撤销）。
+func (s *Store) stateOf(id string) (Limits, int64, bool) {
+	if s == nil {
+		return Limits{}, 0, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range s.records {
+		if s.records[i].ID == id && !s.records[i].Revoked {
+			return s.records[i].Limits, s.records[i].TotalTokens, true
+		}
+	}
+
+	return Limits{}, 0, false
+}
+
+// NormalizeLimits 校验并归一化一把密钥的限制；零值保持「不限」：
+//   - expires_at 转 UTC；
+//   - quota_tokens 负数拒绝；
+//   - ip_allowlist 解析裸 IP / CIDR，IPv4-mapped 归一，CIDR 取 Masked，去重；
+//   - models 去空白、去重并校验 glob。
+//
+//nolint:gocritic // 同上：值语义避免调用方关心生命周期。
+func NormalizeLimits(limits Limits) (Limits, error) {
+	if limits.RPM < 0 || limits.TPM < 0 || limits.MaxConcurrent < 0 {
+		return Limits{}, fmt.Errorf("rpm/tpm/max_concurrent 不能为负: %w", ErrInvalidLimits)
+	}
+
+	if limits.QuotaTokens < 0 {
+		return Limits{}, fmt.Errorf("quota_tokens 不能为负（0 = 不限）: %w", ErrInvalidLimits)
+	}
+
+	if limits.ExpiresAt != nil {
+		utc := limits.ExpiresAt.UTC()
+		limits.ExpiresAt = &utc
+	}
+
+	ips, err := normalizeIPAllowlist(limits.IPAllowlist)
+	if err != nil {
+		return Limits{}, err
+	}
+
+	limits.IPAllowlist = ips
+
+	models, err := normalizeModelPatterns(limits.Models)
+	if err != nil {
+		return Limits{}, err
+	}
+
+	limits.Models = models
+
+	return limits, nil
+}
+
+// normalizeIPAllowlist 归一化 IP 白名单：接受裸 IP 或 CIDR（IPv4/IPv6）。
+func normalizeIPAllowlist(raw []string) ([]string, error) {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]bool, len(raw))
+
+	for _, item := range raw {
+		value := strings.TrimSpace(item)
+		if value == "" {
+			continue
+		}
+
+		canonical, err := normalizeIPPattern(value)
+		if err != nil {
+			return nil, err
+		}
+
+		if seen[canonical] {
+			continue
+		}
+
+		seen[canonical] = true
+		out = append(out, canonical)
+	}
+
+	if len(out) == 0 {
+		return nil, nil
+	}
+
+	return out, nil
+}
+
+// normalizeIPPattern 归一化单个 IP / CIDR 模式。
+func normalizeIPPattern(value string) (string, error) {
+	if strings.Contains(value, "/") {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return "", fmt.Errorf("ip_allowlist[%q]: 非法 CIDR: %w: %w", value, err, ErrInvalidLimits)
+		}
+
+		prefix, err = normalizePrefix(prefix, value)
+		if err != nil {
+			return "", err
+		}
+
+		return prefix.String(), nil
+	}
+
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return "", fmt.Errorf("ip_allowlist[%q]: 非法 IP: %w: %w", value, err, ErrInvalidLimits)
+	}
+
+	return addr.Unmap().String(), nil
+}
+
+// normalizePrefix 把 CIDR 归一为 Masked 形式；IPv4-mapped 前缀转成 IPv4。
+func normalizePrefix(prefix netip.Prefix, raw string) (netip.Prefix, error) {
+	prefix = prefix.Masked()
+	if !prefix.Addr().Is4In6() {
+		return prefix, nil
+	}
+
+	const mappedPrefixBits = 96
+	if prefix.Bits() < mappedPrefixBits {
+		return netip.Prefix{}, fmt.Errorf(
+			"ip_allowlist[%q]: IPv4-mapped CIDR 前缀过宽: %w", raw, ErrInvalidLimits,
+		)
+	}
+
+	return netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-mappedPrefixBits), nil
+}
+
+// ipAllowed 报告来源 IP 是否命中白名单（白名单已归一化）。
+func ipAllowed(patterns []string, rawIP string) bool {
+	addr, err := netip.ParseAddr(strings.TrimSpace(rawIP))
+	if err != nil {
+		return false
+	}
+
+	addr = addr.Unmap()
+
+	for _, pattern := range patterns {
+		if strings.Contains(pattern, "/") {
+			prefix, err := netip.ParsePrefix(pattern)
+			if err != nil {
+				continue
+			}
+
+			if prefix.Contains(addr) {
+				return true
+			}
+
+			continue
+		}
+
+		want, err := netip.ParseAddr(pattern)
+		if err != nil {
+			continue
+		}
+
+		if want.Unmap() == addr {
+			return true
+		}
+	}
+
+	return false
+}
+
+// normalizeModelPatterns 去空白/去重并校验 glob 语法；空列表返回 nil。
+func normalizeModelPatterns(raw []string) ([]string, error) {
+	seen := make(map[string]bool, len(raw))
+
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		pat := strings.TrimSpace(item)
+		if pat == "" {
+			continue
+		}
+
+		bare := pat
+		if i := strings.IndexByte(pat, ':'); i >= 0 && (pat[:i] == "cn" || pat[:i] == "global") {
+			bare = pat[i+1:]
+		}
+
+		if bare == "" {
+			return nil, fmt.Errorf("模型 glob %q 缺少模型名: %w", item, ErrInvalidLimits)
+		}
+
+		if _, err := pathpkg.Match(bare, "x"); err != nil {
+			return nil, fmt.Errorf("非法模型 glob %q: %w: %w", item, err, ErrInvalidLimits)
+		}
+
+		if seen[pat] {
+			continue
+		}
+
+		seen[pat] = true
+		out = append(out, pat)
+	}
+
+	if len(out) == 0 {
+		return nil, nil
+	}
+
+	return out, nil
 }
 
 // runtimeLocked 取/初始化密钥运行时；窗口过期时重置计数。
