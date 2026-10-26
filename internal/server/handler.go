@@ -711,16 +711,17 @@ const (
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 // Anthropic SDK 固定带 anthropic-version 头，按 Anthropic 分页形态返回。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	entries := h.modelListFor(r.Context())
 	if requestsAnthropicModels(r) {
 		setAnthropicRequestID(w, r)
-		writeJSON(w, http.StatusOK, anthropicModelList(h.modelList()))
+		writeJSON(w, http.StatusOK, anthropicModelList(entries))
 
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   entries,
 	})
 }
 
@@ -734,7 +735,7 @@ func (h *Handler) modelRetrieve(w http.ResponseWriter, r *http.Request) {
 		setAnthropicRequestID(w, r)
 	}
 
-	for _, entry := range h.modelList() {
+	for _, entry := range h.modelListFor(r.Context()) {
 		if stringValue(entry["id"]) == id {
 			if isAnthropic {
 				writeJSON(w, http.StatusOK, anthropicModelEntry(entry))
@@ -995,6 +996,48 @@ func (h *Handler) modelList() []map[string]any {
 	}
 
 	return h.appendAliasEntries(out)
+}
+
+// modelListFor 返回当前请求可见的模型列表：默认 api_key / 未鉴权保持全量；
+// 命名密钥按 realm 绑定与模型白名单过滤已缓存的目录（不触发额外上游请求）。
+func (h *Handler) modelListFor(ctx context.Context) []map[string]any {
+	entries := h.modelList()
+
+	keyUse := keyUsageFrom(ctx)
+	if keyUse == nil || h.cfg.Keys == nil {
+		return entries
+	}
+
+	return h.filterModelsForKey(entries, keyUse)
+}
+
+// filterModelsForKey 按命名密钥作用域过滤模型条目：
+//   - 用与对话一致的 resolveKeyModel 解析别名与 realm 绑定；显式 realm 冲突直接排除；
+//   - 绑定 realm 时只保留最终 realm 匹配的条目；
+//   - 白名单按别名解析后的最终 (realm, bare) 校验；
+//   - hidden 已在 modelList 阶段排除，这里只做减法，不重新加入。
+func (h *Handler) filterModelsForKey(entries []map[string]any, keyUse *keyUsage) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+
+	for _, entry := range entries {
+		id := stringValue(entry["id"])
+		if id == "" {
+			continue
+		}
+
+		realm, bare, err := resolveKeyModel(id, h.cfg.ModelAliases, keyUse.realm)
+		if err != nil {
+			continue
+		}
+
+		if !h.cfg.Keys.ModelAllowed(keyUse.id, realm+":"+bare) {
+			continue
+		}
+
+		out = append(out, entry)
+	}
+
+	return out
 }
 
 // appendAliasEntries 把配置的模型别名追加到 /v1/models 列表（issue #52）。
