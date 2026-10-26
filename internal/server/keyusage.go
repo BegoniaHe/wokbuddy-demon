@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 )
 
 // keyUsage 一次命名密钥请求的用量累加器：withClientAuth 创建并挂到 context，
@@ -23,6 +25,48 @@ type keyUsageKey struct{}
 func keyUsageFrom(ctx context.Context) *keyUsage {
 	ku, _ := ctx.Value(keyUsageKey{}).(*keyUsage)
 	return ku
+}
+
+// writeKeyRejection 按准入拒绝原因写出响应：
+//   - 过期：401 泛化错误（与不存在/已撤销同口径）；
+//   - IP 未命中：403 ip_not_allowed，不回显来源 IP；
+//   - 配额耗尽：429 insufficient_quota，不带 Retry-After（生命周期配额不自动恢复）；
+//   - RPM/TPM/并发：沿用 429 + Retry-After。
+func writeKeyRejection(
+	w http.ResponseWriter, r *http.Request, reason apikey.RejectReason, retryAfter time.Duration,
+) {
+	switch reason {
+	case apikey.RejectExpired:
+		writeClientAuthError(w, r)
+	case apikey.RejectIPNotAllowed:
+		writeKeyScopedError(w, r, http.StatusForbidden,
+			"ip_not_allowed", "permission_error", "ip not allowed")
+	case apikey.RejectQuotaExhausted:
+		writeKeyScopedError(w, r, http.StatusTooManyRequests,
+			"insufficient_quota", "rate_limit_error", "insufficient quota")
+	default:
+		writeKeyLimitError(w, r, retryAfter)
+	}
+}
+
+// writeKeyScopedError 按入站协议写出带状态码的密钥拒绝错误（不含 Retry-After）。
+func writeKeyScopedError(
+	w http.ResponseWriter, r *http.Request, status int, openAICode, anthropicType, msg string,
+) {
+	if requestsGemini(r) {
+		writeGeminiError(w, status, msg, "")
+
+		return
+	}
+
+	if wantsAnthropicErrorBody(r) {
+		setAnthropicRequestID(w, r)
+		writeAnthropicError(w, status, anthropicType, msg, "")
+
+		return
+	}
+
+	writeOpenAIError(w, status, openAICode, msg)
 }
 
 // writeKeyLimitError 命名密钥超限响应：429 + Retry-After（秒，至少 1）。

@@ -79,6 +79,10 @@ export interface ApiKeyLimits {
   tpm?: number;
   max_concurrent?: number;
   models?: string[];
+  // RFC3339 UTC；与 null 同义表示永不过期。
+  expires_at?: string | null;
+  quota_tokens?: number;
+  ip_allowlist?: string[];
 }
 
 export interface ApiKey {

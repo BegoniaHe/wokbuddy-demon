@@ -56,6 +56,49 @@ const REALM_OPTIONS = [
   { value: 'global', label: '固定 global' },
 ] as const satisfies readonly SelectOption[];
 
+// toLocalDatetime 把 RFC3339 转成 <input type="datetime-local"> 需要的本地时间串。
+// 保留秒精度：编辑其他限制后原样保存时，不能把到期时间截断到整分。
+function toLocalDatetime(iso?: string | null): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return (
+    d.getFullYear() +
+    '-' +
+    pad(d.getMonth() + 1) +
+    '-' +
+    pad(d.getDate()) +
+    'T' +
+    pad(d.getHours()) +
+    ':' +
+    pad(d.getMinutes()) +
+    ':' +
+    pad(d.getSeconds())
+  );
+}
+
+// toRFC3339 把本地时间输入转成 UTC RFC3339；空串返回 undefined。
+function toRFC3339(local: string): string | undefined {
+  const v = local.trim();
+  if (!v) return undefined;
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return undefined;
+  return d.toISOString();
+}
+
+function parseNonNegative(v: string): number | null {
+  const trimmed = v.trim();
+  if (trimmed === '') return 0;
+  if (!/^\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function parseIPList(v: string): string[] {
+  return v.split(/[,，\s]+/).filter(Boolean);
+}
+
 // KeysView：命名 API 密钥管理。命名密钥只用于网关 /v1/*（chat/models）；
 // 面板与 /status、/metrics 认 admin_api_key / readonly_api_key（未配置时回落 api_key）。
 export function KeysView() {
@@ -68,7 +111,13 @@ export function KeysView() {
   const [tpm, setTpm] = useState('');
   const [concurrent, setConcurrent] = useState('');
   const [models, setModels] = useState('');
+  const [expiry, setExpiry] = useState('');
+  const [quota, setQuota] = useState('');
+  const [ipAllow, setIpAllow] = useState('');
   const [realm, setRealm] = useState<'' | 'cn' | 'global'>('');
+  const [cExpiry, setCExpiry] = useState('');
+  const [cQuota, setCQuota] = useState('');
+  const [cIP, setCIP] = useState('');
   const { confirm, confirmDialog } = useConfirm();
 
   const keysQ = useQuery({
@@ -80,7 +129,8 @@ export function KeysView() {
   const invalidate = () => qc.invalidateQueries({ queryKey: ['keys'] });
 
   const createM = useMutation({
-    mutationFn: (n: string) => postJSON<{ key: string; record: ApiKey }>('keys', { name: n }),
+    mutationFn: (v: { name: string; limits: ApiKeyLimits }) =>
+      postJSON<{ key: string; record: ApiKey }>('keys', v),
     onSuccess: (r) => {
       setRawKey(r.key);
       void invalidate();
@@ -108,8 +158,9 @@ export function KeysView() {
 
   const limitsM = useMutation({
     mutationFn: async (v: { id: string; realm: '' | 'cn' | 'global'; limits: ApiKeyLimits }) => {
-      await postJSON('keys/' + v.id + '/realm', { realm: v.realm });
-      return postJSON('keys/' + v.id + '/limits', { limits: v.limits });
+      // 先写 limits：服务端会校验 IP/CIDR，失败时不能留下改过 realm 的半更新。
+      await postJSON('keys/' + v.id + '/limits', { limits: v.limits });
+      return postJSON('keys/' + v.id + '/realm', { realm: v.realm });
     },
     onSuccess: () => {
       toast('设置已保存，下一个请求生效', 'ok');
@@ -125,23 +176,25 @@ export function KeysView() {
     setTpm(String(k.limits?.tpm ?? ''));
     setConcurrent(String(k.limits?.max_concurrent ?? ''));
     setModels((k.limits?.models ?? []).join(', '));
+    setExpiry(toLocalDatetime(k.limits?.expires_at));
+    setQuota(k.limits?.quota_tokens ? String(k.limits.quota_tokens) : '');
+    setIpAllow((k.limits?.ip_allowlist ?? []).join(', '));
     setRealm(k.realm ?? '');
   };
 
   const saveLimits = () => {
     if (!limitsFor) return;
-    const parseLimit = (v: string): number | null => {
-      const trimmed = v.trim();
-      if (trimmed === '') return 0;
-      if (!/^\d+$/.test(trimmed)) return null;
-      const n = Number(trimmed);
-      return Number.isSafeInteger(n) ? n : null;
-    };
-    const nextRpm = parseLimit(rpm);
-    const nextTpm = parseLimit(tpm);
-    const nextConcurrent = parseLimit(concurrent);
-    if (nextRpm === null || nextTpm === null || nextConcurrent === null) {
-      toast('限制必须是非负整数', 'err');
+    const nextRpm = parseNonNegative(rpm);
+    const nextTpm = parseNonNegative(tpm);
+    const nextConcurrent = parseNonNegative(concurrent);
+    const nextQuota = parseNonNegative(quota);
+    if (nextRpm === null || nextTpm === null || nextConcurrent === null || nextQuota === null) {
+      toast('RPM / TPM / 并发 / 配额必须是非负整数', 'err');
+      return;
+    }
+    const expires = toRFC3339(expiry);
+    if (expiry.trim() && !expires) {
+      toast('到期时间格式不正确', 'err');
       return;
     }
     limitsM.mutate({
@@ -152,6 +205,9 @@ export function KeysView() {
         tpm: nextTpm,
         max_concurrent: nextConcurrent,
         models: models.split(/[,，\s]+/).filter(Boolean),
+        expires_at: expires,
+        quota_tokens: nextQuota,
+        ip_allowlist: parseIPList(ipAllow),
       },
     });
   };
@@ -163,13 +219,46 @@ export function KeysView() {
     if (l.rpm) parts.push('RPM ' + l.rpm);
     if (l.tpm) parts.push('TPM ' + l.tpm);
     if (l.max_concurrent) parts.push('并发 ' + l.max_concurrent);
+    if (l.quota_tokens) {
+      const left = Math.max(0, l.quota_tokens - (k.total_tokens ?? 0));
+      parts.push('配额剩 ' + fmtTok(left));
+    }
+    if (l.expires_at) {
+      const at = new Date(l.expires_at);
+      parts.push(at.getTime() <= Date.now() ? '已过期' : '到期 ' + at.toLocaleString());
+    }
+    if (l.ip_allowlist?.length) parts.push('IP ' + l.ip_allowlist.join(', '));
     if (l.models?.length) parts.push(l.models.join(', '));
     return parts.length ? parts.join(' · ') : '—';
+  };
+
+  const submitCreate = () => {
+    const nextQuota = parseNonNegative(cQuota);
+    if (nextQuota === null) {
+      toast('配额必须是非负整数', 'err');
+      return;
+    }
+    const expires = toRFC3339(cExpiry);
+    if (cExpiry.trim() && !expires) {
+      toast('到期时间格式不正确', 'err');
+      return;
+    }
+    createM.mutate({
+      name,
+      limits: {
+        expires_at: expires,
+        quota_tokens: nextQuota,
+        ip_allowlist: parseIPList(cIP),
+      },
+    });
   };
 
   const openCreate = () => {
     setName('');
     setRawKey('');
+    setCExpiry('');
+    setCQuota('');
+    setCIP('');
     setCreateOpen(true);
   };
 
@@ -327,18 +416,36 @@ export function KeysView() {
               <p className="text-2xs text-warning">关闭后无法再次查看。如丢失，请撤销后重新创建。</p>
             </>
           ) : (
-            <Field>
-              <FieldLabel>名称</FieldLabel>
-              <Input
-                placeholder="客户端名称"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') createM.mutate(name);
-                }}
-              />
-              <FieldDescription>用于区分客户端，例如「笔记本」「手机」。</FieldDescription>
-            </Field>
+            <>
+              <Field>
+                <FieldLabel>名称</FieldLabel>
+                <Input
+                  placeholder="客户端名称"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') submitCreate();
+                  }}
+                />
+                <FieldDescription>用于区分客户端，例如「笔记本」「手机」。</FieldDescription>
+              </Field>
+              <Field>
+                <FieldLabel>到期时间（本地时区，留空 = 永不过期）</FieldLabel>
+                <Input type="datetime-local" step={1} value={cExpiry} onChange={(e) => setCExpiry(e.target.value)} />
+                <FieldDescription>保存为 RFC3339 UTC；到达时刻后请求返回 401。</FieldDescription>
+              </Field>
+              <div className="grid grid-cols-2 gap-3">
+                <Field>
+                  <FieldLabel>总量配额（token）</FieldLabel>
+                  <Input inputMode="numeric" placeholder="0 = 不限" value={cQuota} onChange={(e) => setCQuota(e.target.value)} />
+                </Field>
+                <Field>
+                  <FieldLabel>IP 白名单</FieldLabel>
+                  <Input placeholder="192.0.2.1, 10.0.0.0/8" value={cIP} onChange={(e) => setCIP(e.target.value)} />
+                </Field>
+              </div>
+              <FieldDescription>留空 = 不限制；支持 IPv4 / IPv6 / CIDR，逗号或空格分隔。</FieldDescription>
+            </>
           )}
           <DialogFooter>
             {rawKey ? (
@@ -351,7 +458,7 @@ export function KeysView() {
             ) : (
               <>
                 <Button onClick={() => setCreateOpen(false)}>取消</Button>
-                <Button variant="default" disabled={createM.isPending} onClick={() => createM.mutate(name)}>
+                <Button variant="default" disabled={createM.isPending} onClick={submitCreate}>
                   {createM.isPending ? '创建中…' : '创建'}
                 </Button>
               </>
@@ -394,7 +501,21 @@ export function KeysView() {
               <FieldLabel>最大并发</FieldLabel>
               <Input inputMode="numeric" placeholder="并发请求数" value={concurrent} onChange={(e) => setConcurrent(e.target.value)} />
             </Field>
+            <Field>
+              <FieldLabel>总量配额（token）</FieldLabel>
+              <Input inputMode="numeric" placeholder="0 = 不限" value={quota} onChange={(e) => setQuota(e.target.value)} />
+            </Field>
           </div>
+          <Field>
+            <FieldLabel>到期时间（本地时区，留空 = 永不过期）</FieldLabel>
+            <Input type="datetime-local" step={1} value={expiry} onChange={(e) => setExpiry(e.target.value)} />
+            <FieldDescription>保存为 RFC3339 UTC；到达时刻后请求返回 401。</FieldDescription>
+          </Field>
+          <Field>
+            <FieldLabel>IP 白名单</FieldLabel>
+            <Input placeholder="192.0.2.1, 10.0.0.0/8" value={ipAllow} onChange={(e) => setIpAllow(e.target.value)} />
+            <FieldDescription>留空 = 不限制；支持 IPv4 / IPv6 / CIDR，逗号或空格分隔。</FieldDescription>
+          </Field>
           <Field>
             <FieldLabel>模型白名单</FieldLabel>
             <Input placeholder="cn:glm-*, gpt-5*" value={models} onChange={(e) => setModels(e.target.value)} />

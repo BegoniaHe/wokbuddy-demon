@@ -584,10 +584,10 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 			tr.keyID = res.KeyID
 		}
 
-		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
-		if !ok {
+		release, retryAfter, reason := h.cfg.Keys.Acquire(res.KeyID, ip)
+		if reason != apikey.RejectNone {
 			h.cfg.Keys.RecordRejected(res.KeyID)
-			writeKeyLimitError(w, r, retryAfter)
+			writeKeyRejection(w, r, reason, retryAfter)
 
 			return
 		}
