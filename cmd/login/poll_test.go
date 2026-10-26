@@ -82,8 +82,9 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 
 var errTestTransport = errors.New("network down")
 
-// TestPollTokenOnceHTTPFailures 非信封 4xx（含 408/429）不再当作 pending：必须
-// 透出 HTTP 状态与上游错误，并提示 state 可能过期；5xx/传输错误保持原语义。
+// TestPollTokenOnceHTTPFailures 非信封 4xx 不再当作 pending：4xx 透出 HTTP 状态
+// 与 state 过期提示；408/429 是暂时性拒绝，保留可重试语义、不引导重跑 login url；
+// 5xx/传输错误保持原语义。
 //
 //nolint:cyclop // 表驱动多状态断言。
 func TestPollTokenOnceHTTPFailures(t *testing.T) {
@@ -94,8 +95,6 @@ func TestPollTokenOnceHTTPFailures(t *testing.T) {
 		http.StatusUnauthorized,
 		http.StatusForbidden,
 		http.StatusNotFound,
-		http.StatusRequestTimeout,
-		http.StatusTooManyRequests,
 	}
 	for _, status := range rejected {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
@@ -120,6 +119,37 @@ func TestPollTokenOnceHTTPFailures(t *testing.T) {
 				if !strings.Contains(err.Error(), want) {
 					t.Errorf("err=%q missing %q", err.Error(), want)
 				}
+			}
+		})
+	}
+
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			t.Parallel()
+
+			srv := loginReply(t, status, `not json`)
+
+			_, _, err := pollTokenOnce(srv.URL, "s", func(*http.Request) {}, srv.Client())
+			if err == nil {
+				t.Fatal("暂时性拒绝应返回错误")
+			}
+
+			if errors.Is(err, errLoginPending) {
+				t.Errorf("暂时性拒绝不应包装成 pending: %v", err)
+			}
+
+			for _, want := range []string{
+				"HTTP " + strconv.Itoa(status),
+				"http_error: upstream " + strconv.Itoa(status),
+				"temporarily unavailable",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("err=%q missing %q", err.Error(), want)
+				}
+			}
+
+			if strings.Contains(err.Error(), "state 可能已过期") {
+				t.Errorf("暂时性拒绝不得引导重跑 login url: %v", err)
 			}
 		})
 	}
