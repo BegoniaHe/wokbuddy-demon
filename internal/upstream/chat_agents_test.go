@@ -109,16 +109,16 @@ func TestChatVisibilityRules(t *testing.T) {
 func TestChatVisibilityEmptyAgentModels(t *testing.T) {
 	t.Parallel()
 
-	infos := []ModelInfo{
-		{ID: "chat", Tags: []string{"chat"}},
-		{ID: "custom", Tags: []string{"custom"}},
-		{ID: "other"},
-	}
-
 	for _, agent := range []modelAgent{
 		{Name: "default", Tags: []string{"default"}},
 		{Name: "cli"},
 	} {
+		infos := []ModelInfo{
+			{ID: "chat", Tags: []string{"chat"}},
+			{ID: "custom", Tags: []string{"custom"}},
+			{ID: "other"},
+		}
+
 		whitelist := newModelChatWhitelist([]modelAgent{agent, {Name: "later", Models: []string{"other"}}})
 		whitelist.apply(infos)
 
