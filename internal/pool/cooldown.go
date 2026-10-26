@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
 func (p *Pool) SetCredits(uid string, credits, total int64) {
@@ -790,6 +791,9 @@ func (p *Pool) recordBreakerFailureLocked(entry2 *entry) {
 	entry2.fails = 0
 	entry2.retryCount++
 	entry2.breakerUntil = p.now().Add(duration)
+	log.Printf("WARN: [pool] breaker open acct=%s until=%s retryCount=%d",
+		logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()),
+		entry2.breakerUntil.Format(time.RFC3339), entry2.retryCount)
 }
 
 // CooldownUntilTomorrow4AM 冷却到下一个 04:00（CST，上游自然日）。
