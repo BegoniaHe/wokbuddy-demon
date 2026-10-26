@@ -7,18 +7,11 @@ package panel
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
-	pathpkg "path"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
-)
-
-var (
-	errLimits                = errors.New("limits 不能为负")
-	errNormalizeModelsFailed = errors.New("normalizeModels failed")
 )
 
 // keysList 列出全部命名密钥（不含哈希与明文）。
@@ -39,7 +32,8 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body *struct {
-		Name string `json:"name"`
+		Name   string        `json:"name"`
+		Limits apikey.Limits `json:"limits"`
 	}
 	// 指针接收：空 body / 畸形 JSON / 字面量 null 都拒绝，避免静默签发默认名密钥。
 	if err := decodeJSONBody(r.Body, &body); err != nil || body == nil {
@@ -47,13 +41,20 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, raw, err := p.cfg.Keys.Create(strings.TrimSpace(body.Name))
+	rec, raw, err := p.cfg.Keys.Create(strings.TrimSpace(body.Name), body.Limits)
 	if err != nil {
+		if errors.Is(err, apikey.ErrInvalidLimits) {
+			writeErr(w, http.StatusBadRequest, err.Error())
+
+			return
+		}
+
 		writeErr(w, http.StatusInternalServerError, "create key: "+err.Error())
+
 		return
 	}
 
-	log.Printf("panel: 签发命名密钥 id=%s name=%q prefix=%s", rec.ID, rec.Name, rec.Prefix)
+	log.Printf("panel: 签发命名密钥 id=%s name=%q", rec.ID, rec.Name)
 	writeJSON(w, http.StatusOK, map[string]any{"key": raw, "record": rec})
 }
 
@@ -124,17 +125,18 @@ func (p *Panel) keysUpdateLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	limits, err := normalizeLimits(body.Limits)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
 	id := r.PathValue("id")
 
-	ok, err := p.cfg.Keys.UpdateLimits(id, limits)
+	ok, err := p.cfg.Keys.UpdateLimits(id, body.Limits)
 	if err != nil {
+		if errors.Is(err, apikey.ErrInvalidLimits) {
+			writeErr(w, http.StatusBadRequest, err.Error())
+
+			return
+		}
+
 		writeErr(w, http.StatusInternalServerError, "update limits: "+err.Error())
+
 		return
 	}
 
@@ -143,8 +145,9 @@ func (p *Panel) keysUpdateLimits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("panel: 更新命名密钥限制 id=%s rpm=%d tpm=%d concurrent=%d models=%v",
-		id, limits.RPM, limits.TPM, limits.MaxConcurrent, limits.Models)
+	log.Printf("panel: 更新命名密钥限制 id=%s rpm=%d tpm=%d concurrent=%d quota=%d ips=%d models=%d",
+		id, body.Limits.RPM, body.Limits.TPM, body.Limits.MaxConcurrent,
+		body.Limits.QuotaTokens, len(body.Limits.IPAllowlist), len(body.Limits.Models))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -178,55 +181,4 @@ func (p *Panel) keysUpdateRealm(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("panel: 更新命名密钥出口 id=%s realm=%q", id, body.Realm)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// normalizeLimits 校验限制值并把模型 glob 去空白/去重。
-func normalizeLimits(limits apikey.Limits) (apikey.Limits, error) {
-	if limits.RPM < 0 || limits.TPM < 0 || limits.MaxConcurrent < 0 {
-		return apikey.Limits{}, errLimits
-	}
-
-	models, err := normalizeModels(limits.Models)
-	if err != nil {
-		return apikey.Limits{}, err
-	}
-
-	return apikey.Limits{
-		RPM: limits.RPM, TPM: limits.TPM, MaxConcurrent: limits.MaxConcurrent, Models: models,
-	}, nil
-}
-
-// normalizeModels 去空白/去重并校验 glob 语法。
-func normalizeModels(raw []string) ([]string, error) {
-	seen := map[string]bool{}
-
-	models := make([]string, 0, len(raw))
-	for _, item := range raw {
-		pat := strings.TrimSpace(item)
-		if pat == "" {
-			continue
-		}
-
-		bare := pat
-		if i := strings.IndexByte(pat, ':'); i >= 0 && (pat[:i] == "cn" || pat[:i] == "global") {
-			bare = pat[i+1:]
-		}
-
-		if bare == "" {
-			return nil, fmt.Errorf("模型 glob %q 缺少模型名: %w", item, errNormalizeModelsFailed)
-		}
-
-		if _, err := pathpkg.Match(bare, "x"); err != nil {
-			return nil, fmt.Errorf("非法模型 glob %q: %w", item, err)
-		}
-
-		if seen[pat] {
-			continue
-		}
-
-		seen[pat] = true
-		models = append(models, pat)
-	}
-
-	return models, nil
 }
