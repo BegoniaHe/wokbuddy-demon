@@ -2724,6 +2724,8 @@ func parseEnterpriseModels(
 
 	var agentModels []string
 
+	agents := env.Data.Agents
+
 	if agent, ok := selectChatAgent(env.Data.Agents); ok {
 		agentModels = agent.Models
 	}
@@ -2732,6 +2734,10 @@ func parseEnterpriseModels(
 		if !allowFull {
 			return nil, nil, nil, errNoCLIAgentModelsFound
 		}
+
+		// 全量兜底没有真实白名单：刚接受完整 models，不能再用空 agent 把它标成
+		// 不可见（否则 /v1/models 会把兜底目录全部隐藏，还会连带隐藏 v3 独有模型）。
+		agents = nil
 
 		agentModels = make([]string, 0, len(env.Data.Models))
 		for i := range env.Data.Models {
@@ -2753,7 +2759,7 @@ func parseEnterpriseModels(
 		dynMap[m.ID] = *m
 	}
 
-	return agentModels, dynMap, env.Data.Agents, nil
+	return agentModels, dynMap, agents, nil
 }
 
 // collectEnterpriseModels 按默认 agent 白名单从 dynMap 取可用模型（disabled 剔除）。

@@ -294,6 +294,46 @@ func TestFetchModelsEnterpriseWhitelistFallback(t *testing.T) {
 	})
 }
 
+// TestFetchModelsEnterpriseFullFallbackKeepsUndecided /console 无可用 agent models、
+// /v2 走 allowFull 全量兜底时，不能再用空白名单把兜底目录标成不可见。
+func TestFetchModelsEnterpriseFullFallbackKeepsUndecided(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"v3-chat","maxOutputTokens":8192,"tags":["chat"]},
+				{"id":"v3-only","maxOutputTokens":8192}
+			]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			return jsonResp(200, `{"code":1,"msg":"no cli agent"}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v2/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"ent-only","maxOutputTokens":8192},
+				{"id":"shared","maxOutputTokens":8192}
+			],"agents":[{"name":"cli","models":[]}]}}`), nil
+		default:
+			return jsonResp(500, `{}`), nil
+		}
+	})
+
+	infos, err := client.FetchModels(&auth.Auth{AccessToken: "at", UID: "u-full-fallback"})
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+
+	if len(infos) != 4 {
+		t.Fatalf("infos=%+v want 4（v3 2 + 企业兜底 2）", infos)
+	}
+
+	for i := range infos {
+		if infos[i].ChatVisible != nil {
+			t.Errorf("%s 全量兜底不应产生判定：%v", infos[i].ID, *infos[i].ChatVisible)
+		}
+	}
+}
+
 // TestFetchModelsEnterpriseWhitelistDisjointFallback 企业端点白名单与 v3 目录
 // 无交集时，v3 的 chat 模型应按「H 为空」保留，而不是被来源目录的命中结果隐藏。
 func TestFetchModelsEnterpriseWhitelistDisjointFallback(t *testing.T) {
