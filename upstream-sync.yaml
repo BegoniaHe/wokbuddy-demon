@@ -14,31 +14,30 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 46629494bfe1f5a8579c9e562f59115e0aa81fe5
-  audited_at_utc: 2026-10-25T18:58:09Z
+  commit: 33ce2f15025c59e38b71da5b92cde403a2ca35d1
+  audited_at_utc: 2026-10-26T07:21:49Z
   sync_method: audit
   official_baseline:
     cn: 5.8.3.41334564-db0e9b51 (commit db0e9b51b7fa0b383f41f5b0b83dd442c8557918)
     global: 5.8.4.41366630-73952edb (commit 73952edb48da46bd0b244661efe22f4f247c4977)
   reviewed_window:
-    from: 2026-10-23
-    to: 2026-10-25
-    non_merge_commits: 30
+    from: 2026-10-25
+    to: 2026-10-26
+    non_merge_commits: 19
   dispositions:
-    issue: 3
-    skip: 21
-    revisit: 6
+    issue: 5
+    skip: 19
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/282
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/283
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/284
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/285
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/293
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/294
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/295
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/296
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/297
   note: >-
-    2026-10-25 以参考 fork head 建立审计基线，审计最近窗口（2026-10-23..25，
-    30 条非 merge 提交），逐条对照官方 Win32 cn 5.8.3 / global 5.8.4 包。
-    确认 4 个缺口并开 Issue #282–#285（auth 毫秒 expiresAt/codebuddy.ai、
-    登录终态码、reasoning_effort=off/none、周期保活临期窗口）；其余按 skip
-    或 revisit 记录。参考 fork 与 linguo 分叉后另有约 370 条非 merge 提交，
-    其中多数已由本 fork 独立演进覆盖或属运行时/面板扩展，本次不纳入
-    pending；后续审计从该 head 之后开始。审计不产生实现提交，游标推进是独立的
-    chore(sync) 元数据提交。
+    2026-10-26 审计 4662949..33ce2f1（19 条非 merge + 5 条 merge），官方
+    Win32 cn 5.8.3 / global 5.8.4 包与上一基线一致（无协议 drift）。19 条
+    非 merge 中 11 条已由本仓独立演进覆盖或属参考 fork 面板/测试形态，按 skip
+    记录；确认 5 个缺口并开 Issue #293–#297（redisstore LoadBinds N+1、
+    credit CLI refresh/坏文件、登录轮询可观测性、池状态迁移日志、弱 api_key
+    启动告警）。signin 结构化幂等码 10001 需在签到端点实测并与充值码区分，
+    本次未单开 Issue。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。

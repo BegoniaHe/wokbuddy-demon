@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `46629494bfe1f5a8579c9e562f59115e0aa81fe5`（2026-10-25）。该基线与本仓库无共同祖先，
+  `33ce2f15025c59e38b71da5b92cde403a2ca35d1`（2026-10-26）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -37,10 +37,13 @@
 **结论**：本仓库不再跟踪前序 fork 的停维护声明，也不直接吸收参考 fork 的代码。
 `sync-upstream` 的默认流程是：**对照最新官方 Win32 客户端深度审计 → 确认缺口 →
 在 `BegoniaHe/wokbuddy-demon` 开 Issue**。2026-10-25 已审计参考 fork 最近窗口
-（2026-10-23..25，30 条非 merge 提交），确认 4 个缺口并开 Issue #282–#285；
-其余按 `skip` / `revisit` 落账。参考 fork 与 linguo 分叉后另有约 370 条非 merge
-提交，多数已由本仓库独立演进覆盖或属运行时/面板扩展，不纳入 pending；后续审计从
-`4662949` 之后开始。
+（2026-10-23..25，30 条非 merge 提交），确认 4 个缺口并开 Issue #282–#285。
+2026-10-26 续审 `4662949..33ce2f1`（19 条非 merge + 5 条 merge；官方 Win32
+包版本未变），确认 5 个缺口并开 Issue #293–#297（redisstore `LoadBinds` N+1、
+credit CLI refresh/坏文件、登录轮询可观测性、池状态迁移日志、弱 `api_key`
+启动告警）；其余按 `skip` / `revisit` 落账。参考 fork 与 linguo 分叉后另有约 370
+条非 merge 提交，多数已由本仓库独立演进覆盖或属运行时/面板扩展，不纳入 pending；
+后续审计从 `33ce2f1` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -99,7 +102,7 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - 上游远端：`upstream` → `https://github.com/misakano7545/workbuddy2api-panel.git`
   （branch `main`）。首次使用执行 `git fetch --prune upstream`。
 - 审计游标（逻辑基线，位于参考 fork 历史中，非本仓库祖先）：
-  `46629494bfe1f5a8579c9e562f59115e0aa81fe5`（2026-10-25 建立）。
+  `33ce2f15025c59e38b71da5b92cde403a2ca35d1`（2026-10-26 建立）。
 - 正式审计前先刷新官方 Win32 包并跑 `reverse-workbuddy` 的
   `download_latest.mjs` / `protocol_sweep.mjs`；官方静态包缺失时停止审计。
 - 常用命令：
@@ -114,4 +117,4 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-10-25（参考 fork 审计基线 `4662949`；最近窗口开 Issue #282–#285；不直接吸收）。_
+_最近更新：2026-10-26（参考 fork 审计基线 `33ce2f1`；窗口 `4662949..33ce2f1` 开 Issue #293–#297；不直接吸收）。_
