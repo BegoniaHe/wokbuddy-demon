@@ -130,7 +130,8 @@ description: >
    - 只从 Win32 `app-asar/` 取 `references/client-profile.md` 的 surface 表逐项
      **包内字面量**：
      `chatUA` / `desktopUA` / `billingUA` / `xIdeVersion` / `desktopIdeVersion` /
-     `desktopExtVersion` / `loginPlatform`。不从 `version` 拼任何串。
+     `desktopExtVersion` / `loginPlatform`。不从 `version` 拼任何串；
+     `desktopExtVersion` 仍须核对为与 `source.version` 相等（产品版本）。
    - `chatUA` 取 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
      `UserAgentHttpInterceptor.buildUserAgent` 输出；`main/server.js` 是 daemon/VLM
      面（`/v2/report` 走 desktop surface），不能作为 `chatUA` 证据。
