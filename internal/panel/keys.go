@@ -1,6 +1,6 @@
 // keys.go 命名 API 密钥的面板管理接口（签发 / 撤销 / 删除 / 列表）。
 //
-// 边界：面板自身鉴权仍只认默认 api_key（见 panel.withAuth）；命名密钥是发给
+// 边界：面板自身鉴权走 admin/readonly（未配置时回落默认 api_key，见 panel.withReadAuth）；命名密钥是发给
 // 网关客户端的，只作用于 /v1/*（见 server.withClientAuth），不获得管理权限。
 // 明文仅在签发响应里返回一次，列表与持久化都只有哈希与展示前缀。
 package panel

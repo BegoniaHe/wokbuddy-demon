@@ -129,6 +129,7 @@ WokBuddy Demon 是供个人打理自己 CodeBuddy 账号的本地小工具：自
 - 仅用于**本人授权的账号**与**本机 / 私有环境**；
 - 请遵守 CodeBuddy 平台的服务条款与所在地法律；
 - `auths/` 里保存的是明文凭证，面板也没有内置 TLS。请妥善保管凭证目录，不要把面板端口直接暴露到公网。
+- 默认 `api_key` 同时用于 `/v1/*` 与面板/运维面。需要隔离时设置可选的 `admin_api_key` 与 `readonly_api_key`：任一非空后，`/panel/api/*`、`/status`、`/metrics`、`/debug/pprof/*` 只接受这两把凭据，默认 `api_key` 仅保留 `/v1/*` 权限；`readonly_api_key` 只能读，写操作与配置读取需要 `admin_api_key`。三把凭据必须互不相同，均为热生效。
 
 ## 免责声明
 

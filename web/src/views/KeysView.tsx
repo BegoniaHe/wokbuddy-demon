@@ -57,7 +57,7 @@ const REALM_OPTIONS = [
 ] as const satisfies readonly SelectOption[];
 
 // KeysView：命名 API 密钥管理。命名密钥只用于网关 /v1/*（chat/models）；
-// 面板与 /status、/metrics 仍只认 config.json 的默认 api_key。
+// 面板与 /status、/metrics 认 admin_api_key / readonly_api_key（未配置时回落 api_key）。
 export function KeysView() {
   const qc = useQueryClient();
   const [createOpen, setCreateOpen] = useState(false);
@@ -186,7 +186,7 @@ export function KeysView() {
           <CardTitle>命名密钥</CardTitle>
           <CardAction>
             <div className="flex flex-wrap items-center gap-3">
-              <span className="text-xs text-muted-foreground">仅用于 /v1/*（chat / models）；面板与 /status、/metrics 仍只认默认 api_key</span>
+              <span className="text-xs text-muted-foreground">仅用于 /v1/*（chat / models）；管理面使用 admin/readonly 凭据</span>
               <Button onClick={openCreate}>创建密钥</Button>
             </div>
           </CardAction>
