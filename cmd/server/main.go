@@ -505,6 +505,10 @@ func serve(
 	log.Printf("wokbuddy-demon listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/",
 		cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 
+	if warning := weakAPIKeyListenWarning(cfg.APIKey, cfg.Listen); warning != "" {
+		log.Print(warning)
+	}
+
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Printf("http: %v", err)
 		return
