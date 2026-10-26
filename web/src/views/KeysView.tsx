@@ -155,8 +155,9 @@ export function KeysView() {
 
   const limitsM = useMutation({
     mutationFn: async (v: { id: string; realm: '' | 'cn' | 'global'; limits: ApiKeyLimits }) => {
-      await postJSON('keys/' + v.id + '/realm', { realm: v.realm });
-      return postJSON('keys/' + v.id + '/limits', { limits: v.limits });
+      // 先写 limits：服务端会校验 IP/CIDR，失败时不能留下改过 realm 的半更新。
+      await postJSON('keys/' + v.id + '/limits', { limits: v.limits });
+      return postJSON('keys/' + v.id + '/realm', { realm: v.realm });
     },
     onSuccess: () => {
       toast('设置已保存，下一个请求生效', 'ok');
