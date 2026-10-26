@@ -18,7 +18,6 @@ type modelAgent struct {
 type modelChatWhitelist struct {
 	decided     bool
 	agentModels map[string]bool // 默认 agent 的 models 原文（可匹配 model.id 或 model.name）
-	hNonEmpty   bool            // 该来源里是否有模型命中白名单
 }
 
 // selectChatAgent 复刻官方 resolveConversationAgent 的选择顺序：
@@ -54,9 +53,9 @@ func selectChatAgent(agents []modelAgent) (modelAgent, bool) {
 	return modelAgent{}, false
 }
 
-// newModelChatWhitelist 按来源模型集合构造默认 agent 判定。没有可用 agent 或
-// agent models 为空时保持 undecided：此时不隐藏任何模型。
-func newModelChatWhitelist(agents []modelAgent, infos []ModelInfo) modelChatWhitelist {
+// newModelChatWhitelist 构造默认 agent 判定。没有可用 agent 或 agent models
+// 为空时保持 undecided：此时不隐藏任何模型。
+func newModelChatWhitelist(agents []modelAgent) modelChatWhitelist {
 	agent, ok := selectChatAgent(agents)
 	if !ok || len(agent.Models) == 0 {
 		return modelChatWhitelist{}
@@ -69,14 +68,6 @@ func newModelChatWhitelist(agents []modelAgent, infos []ModelInfo) modelChatWhit
 	for _, id := range agent.Models {
 		if id = strings.TrimSpace(id); id != "" {
 			whitelist.agentModels[id] = true
-		}
-	}
-
-	for i := range infos {
-		if modelMatchesAgent(&infos[i], whitelist.agentModels) {
-			whitelist.hNonEmpty = true
-
-			break
 		}
 	}
 
@@ -101,9 +92,10 @@ func isCustomModel(modelInfo *ModelInfo) bool {
 }
 
 // chatVisible 最终可见集合 = H ∪ custom ∪（仅 H 为空时）tags 含 chat 的模型。
-func (whitelist modelChatWhitelist) chatVisible(modelInfo *ModelInfo) bool {
+// hNonEmpty 必须按目标模型集合计算（同一份白名单应用到不同来源时命中集不同）。
+func (whitelist modelChatWhitelist) chatVisible(modelInfo *ModelInfo, hNonEmpty bool) bool {
 	custom := isCustomModel(modelInfo)
-	if whitelist.hNonEmpty {
+	if hNonEmpty {
 		return custom || modelMatchesAgent(modelInfo, whitelist.agentModels)
 	}
 
@@ -111,9 +103,21 @@ func (whitelist modelChatWhitelist) chatVisible(modelInfo *ModelInfo) bool {
 }
 
 // apply 给尚无判定的条目写入 ChatVisible；已有显式判定不覆盖。
+// H 是否为空按本次目标 infos 重新计算：企业端点白名单兜底 v3 时，两边目录可能
+// 没有交集，不能沿用来源目录的命中结果。
 func (whitelist modelChatWhitelist) apply(infos []ModelInfo) {
 	if !whitelist.decided {
 		return
+	}
+
+	hNonEmpty := false
+
+	for i := range infos {
+		if modelMatchesAgent(&infos[i], whitelist.agentModels) {
+			hNonEmpty = true
+
+			break
+		}
 	}
 
 	for i := range infos {
@@ -121,7 +125,7 @@ func (whitelist modelChatWhitelist) apply(infos []ModelInfo) {
 			continue
 		}
 
-		visible := whitelist.chatVisible(&infos[i])
+		visible := whitelist.chatVisible(&infos[i], hNonEmpty)
 		infos[i].ChatVisible = &visible
 	}
 }
@@ -133,7 +137,7 @@ func applyChatWhitelistToMap(out map[string]ModelInfo, agents []modelAgent) {
 		infos = append(infos, out[id])
 	}
 
-	whitelist := newModelChatWhitelist(agents, infos)
+	whitelist := newModelChatWhitelist(agents)
 	if !whitelist.decided {
 		return
 	}

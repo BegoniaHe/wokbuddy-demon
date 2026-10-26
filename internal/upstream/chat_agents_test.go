@@ -60,7 +60,7 @@ func TestChatVisibilityRules(t *testing.T) {
 	}
 
 	hitAgent := modelAgent{Name: "default", Models: []string{"hit"}, Tags: []string{"default"}}
-	whitelist := newModelChatWhitelist([]modelAgent{hitAgent}, infos)
+	whitelist := newModelChatWhitelist([]modelAgent{hitAgent})
 	whitelist.apply(infos)
 
 	want := map[string]bool{
@@ -79,7 +79,7 @@ func TestChatVisibilityRules(t *testing.T) {
 		{ID: "custom", Tags: []string{"custom"}},
 		{ID: "other"},
 	}
-	whitelist = newModelChatWhitelist([]modelAgent{missingAgent}, emptyHit)
+	whitelist = newModelChatWhitelist([]modelAgent{missingAgent})
 	whitelist.apply(emptyHit)
 
 	if emptyHit[0].ChatVisible == nil || !*emptyHit[0].ChatVisible {
@@ -96,7 +96,7 @@ func TestChatVisibilityRules(t *testing.T) {
 
 	// 没有 agent：不产生任何判定。
 	noAgent := []ModelInfo{{ID: "anything"}}
-	whitelist = newModelChatWhitelist(nil, noAgent)
+	whitelist = newModelChatWhitelist(nil)
 	whitelist.apply(noAgent)
 
 	if noAgent[0].ChatVisible != nil {
@@ -111,11 +111,45 @@ func TestChatVisibilityNameMatch(t *testing.T) {
 	infos := []ModelInfo{{ID: "internal-id", Name: "Display Name"}}
 	agent := modelAgent{Name: "cli", Models: []string{"Display Name"}}
 
-	whitelist := newModelChatWhitelist([]modelAgent{agent}, infos)
+	whitelist := newModelChatWhitelist([]modelAgent{agent})
 	whitelist.apply(infos)
 
 	if infos[0].ChatVisible == nil || !*infos[0].ChatVisible {
 		t.Fatalf("name 命中应可见：%+v", infos[0])
+	}
+}
+
+// TestChatWhitelistRecomputesHitAgainstTarget 白名单应用到另一份目录时，H 必须按
+// 目标目录重新计算：企业端点白名单与 v3 目录无交集时，v3 的 chat 模型仍应可见。
+func TestChatWhitelistRecomputesHitAgainstTarget(t *testing.T) {
+	t.Parallel()
+
+	agent := modelAgent{Name: "cli", Models: []string{"ent-only"}}
+	whitelist := newModelChatWhitelist([]modelAgent{agent})
+
+	target := []ModelInfo{
+		{ID: "v3-chat", Tags: []string{"chat"}},
+		{ID: "v3-only"},
+	}
+	whitelist.apply(target)
+
+	if target[0].ChatVisible == nil || !*target[0].ChatVisible {
+		t.Errorf("目标目录 H 为空时应保留 chat 模型: %+v", target[0])
+	}
+
+	if target[1].ChatVisible == nil || *target[1].ChatVisible {
+		t.Errorf("目标目录 H 为空时应隐藏普通模型: %+v", target[1])
+	}
+
+	// 同一白名单应用到包含命中项的目录时，chat 模型按 H 非空规则隐藏。
+	hitTarget := []ModelInfo{
+		{ID: "ent-only"},
+		{ID: "v3-chat", Tags: []string{"chat"}},
+	}
+	whitelist.apply(hitTarget)
+
+	if hitTarget[1].ChatVisible == nil || *hitTarget[1].ChatVisible {
+		t.Errorf("目标目录 H 非空时应隐藏未命中的 chat 模型: %+v", hitTarget[1])
 	}
 }
 
@@ -225,6 +259,37 @@ func TestFetchModelsEnterpriseWhitelistFallback(t *testing.T) {
 
 	assertChatVisibility(t, infos, map[string]bool{
 		"v3-only": false, "shared": true, "v3-chat": false, "ent-only": true,
+	})
+}
+
+// TestFetchModelsEnterpriseWhitelistDisjointFallback 企业端点白名单与 v3 目录
+// 无交集时，v3 的 chat 模型应按「H 为空」保留，而不是被来源目录的命中结果隐藏。
+func TestFetchModelsEnterpriseWhitelistDisjointFallback(t *testing.T) {
+	t.Parallel()
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"v3-chat","maxOutputTokens":8192,"tags":["chat"]},
+				{"id":"v3-only","maxOutputTokens":8192}
+			]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"ent-only","maxOutputTokens":8192}
+			],"agents":[{"name":"cli","models":["ent-only"]}]}}`), nil
+		default:
+			return jsonResp(500, `{}`), nil
+		}
+	})
+
+	infos, err := client.FetchModels(&auth.Auth{AccessToken: "at", UID: "u-disjoint"})
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+
+	assertChatVisibility(t, infos, map[string]bool{
+		"v3-chat": true, "v3-only": false, "ent-only": true,
 	})
 }
 

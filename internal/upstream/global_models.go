@@ -652,7 +652,7 @@ func parseGlobalModelNames(raw []byte) (globalCatalogParse, error) {
 	// 主形态：对象数组 → dynModelEntry 全字段（与 CN FetchModels 共用解析，零口径漂移）。
 	if entryNames, entryInfos, entryEfforts, entryDefaults, ok := parseGlobalModelEntries(arr); ok {
 		entryNames, entryInfos = filterGlobalCatalog(entryNames, entryInfos, available)
-		chat := newModelChatWhitelist(agents, entryInfos)
+		chat := newModelChatWhitelist(agents)
 		chat.apply(entryInfos)
 
 		return globalCatalogParse{
@@ -677,7 +677,7 @@ func parseGlobalModelNames(raw []byte) (globalCatalogParse, error) {
 	}
 
 	names, infos = filterGlobalCatalog(names, infos, available)
-	chat := newModelChatWhitelist(agents, infos)
+	chat := newModelChatWhitelist(agents)
 	chat.apply(infos)
 
 	return globalCatalogParse{

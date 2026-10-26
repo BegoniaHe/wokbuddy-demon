@@ -2692,7 +2692,7 @@ func (c *Client) fetchEnterpriseModelsPath(
 		return nil, modelChatWhitelist{}, errModelsAPIReturnedEmptyList
 	}
 
-	chat := newModelChatWhitelist(agents, out)
+	chat := newModelChatWhitelist(agents)
 	chat.apply(out)
 
 	return out, chat, nil
