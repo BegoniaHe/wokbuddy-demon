@@ -2,6 +2,7 @@ package auth
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log"
 	"os"
@@ -94,6 +95,129 @@ func TestSaveAtomicRoundtrip(t *testing.T) {
 
 	if auth.AccessToken != "at" || auth.UID != "u1" || auth.EnterpriseID != "e1" {
 		t.Errorf("roundtrip: %+v", auth)
+	}
+}
+
+// TestParseIdentityFields 嵌套形从 account.idSource / departmentFullName 读取，
+// 扁平形读顶层同名字段（静态 Key 与企业部门信息）。
+func TestParseIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		raw        string
+		wantSource string
+		wantDept   string
+	}{
+		{
+			name:       "嵌套形",
+			raw:        `{"auth":{"accessToken":"at"},"account":{"uid":"u1","enterpriseId":"e1","idSource":"static_key","departmentFullName":"研发部"}}`,
+			wantSource: "static_key",
+			wantDept:   "研发部",
+		},
+		{
+			name:       "扁平形",
+			raw:        `{"accessToken":"at","uid":"u1","enterpriseId":"","idSource":"static_key","departmentFullName":"研发部"}`,
+			wantSource: "static_key",
+			wantDept:   "研发部",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			account, err := Parse([]byte(testCase.raw))
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+
+			if account.IDSource != testCase.wantSource {
+				t.Errorf("IDSource=%q want %q", account.IDSource, testCase.wantSource)
+			}
+
+			if account.DepartmentFullName != testCase.wantDept {
+				t.Errorf("DepartmentFullName=%q want %q", account.DepartmentFullName, testCase.wantDept)
+			}
+		})
+	}
+}
+
+// TestSaveAtomicWritesIdentityFields 非空 idSource / departmentFullName 写回
+// 嵌套 account，并可重新解析。
+func TestSaveAtomicWritesIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	filePath := filepath.Join(t.TempDir(), "workbuddy-u1.json")
+
+	account := &Auth{
+		AccessToken:        "at",
+		UID:                "u1",
+		IDSource:           "static_key",
+		DepartmentFullName: "研发部",
+		FilePath:           filePath,
+	}
+	if err := account.SaveAtomic(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	var doc struct {
+		Account map[string]any `json:"account"`
+	}
+	if err = json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if doc.Account["idSource"] != "static_key" {
+		t.Errorf("account.idSource=%v", doc.Account["idSource"])
+	}
+
+	if doc.Account["departmentFullName"] != "研发部" {
+		t.Errorf("account.departmentFullName=%v", doc.Account["departmentFullName"])
+	}
+
+	roundtrip, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("reparse: %v", err)
+	}
+
+	if roundtrip.IDSource != "static_key" || roundtrip.DepartmentFullName != "研发部" {
+		t.Errorf("roundtrip identity: %+v", roundtrip)
+	}
+}
+
+// TestSaveAtomicOmitsEmptyIdentityFields 空身份字段不写回，避免污染旧 auth 文件。
+func TestSaveAtomicOmitsEmptyIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	filePath := filepath.Join(t.TempDir(), "workbuddy-u2.json")
+
+	account := &Auth{AccessToken: "at", UID: "u2", FilePath: filePath}
+	if err := account.SaveAtomic(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	raw, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	var doc struct {
+		Account map[string]any `json:"account"`
+	}
+	if err = json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	for _, key := range []string{"idSource", "departmentFullName"} {
+		if _, ok := doc.Account[key]; ok {
+			t.Errorf("account.%s should be absent", key)
+		}
 	}
 }
 
