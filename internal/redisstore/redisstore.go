@@ -277,26 +277,110 @@ func (u *Upstash) LoadState() ([]byte, bool) {
 	return v, true
 }
 
-// LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀）。
-func (u *Upstash) LoadBinds() map[string]string {
-	out := map[string]string{}
+// bindMGetBatchSize 每批 MGET 的 key 数：把 N+1 次 GET 收敛为 SCAN + 常数次往返。
+const bindMGetBatchSize = 100
 
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
-	defer cancel()
+// bindScanPage 单页 SCAN 的可注入形态（测试用 fake 替代真实 Redis）。
+type bindScanPage func(ctx context.Context, cursor uint64) (keys []string, next uint64, err error)
 
-	iter := u.client.Scan(ctx, 0, bindPrefix+"*", 200).Iterator()
-	for iter.Next(ctx) {
-		key := iter.Val()
+// bindMGet 批量取值的可注入形态（测试用 fake 替代真实 Redis）。
+type bindMGet func(ctx context.Context, keys ...string) ([]any, error)
 
-		v, err := u.client.Get(ctx, key).Result()
+// scanBindKeys 用 SCAN 只收集 key（不读值），直到游标归零；失败时返回已发现的部分。
+func scanBindKeys(ctx context.Context, scan bindScanPage) ([]string, error) {
+	var keys []string
+
+	var cursor uint64
+
+	for {
+		batch, next, err := scan(ctx, cursor)
 		if err != nil {
+			return keys, err
+		}
+
+		keys = append(keys, batch...)
+		cursor = next
+
+		if cursor == 0 {
+			return keys, nil
+		}
+	}
+}
+
+// readBindValues 按批 MGET 已发现的 key：空值跳过，key 剥前缀后写入结果。
+// 单批失败记 WARN 并继续后续批次；complete=false 表示至少一批未成功读取。
+func readBindValues(ctx context.Context, keys []string, mget bindMGet) (map[string]string, bool) {
+	out := make(map[string]string, len(keys))
+	complete := true
+
+	for start := 0; start < len(keys); start += bindMGetBatchSize {
+		end := min(start+bindMGetBatchSize, len(keys))
+
+		values, err := mget(ctx, keys[start:end]...)
+		if err != nil {
+			complete = false
+
+			log.Printf("WARN: [redisstore] LoadBinds MGET batch failed discovered=%d restored=%d: %v",
+				len(keys), len(out), err)
+
 			continue
 		}
 
-		out[strings.TrimPrefix(key, bindPrefix)] = v
+		if len(values) != end-start {
+			complete = false
+
+			log.Printf("WARN: [redisstore] LoadBinds MGET truncated discovered=%d restored=%d batch=%d got=%d",
+				len(keys), len(out), end-start, len(values))
+		}
+
+		for i, raw := range values {
+			if i >= end-start {
+				break
+			}
+
+			value, ok := raw.(string)
+			if !ok || value == "" {
+				continue
+			}
+
+			out[strings.TrimPrefix(keys[start+i], bindPrefix)] = value
+		}
+	}
+
+	return out, complete
+}
+
+// loadBinds 是 LoadBinds 的可注入主体：scan/mget 由生产实现或测试 fake 提供。
+// 失败/不完整只记 WARN（带 discovered/restored 计数，不打印 key 或值），
+// 成功恢复的汇总日志仍由 session.LoadFromStore 统一输出，避免重复刷屏。
+func loadBinds(ctx context.Context, scan bindScanPage, mget bindMGet) map[string]string {
+	keys, scanErr := scanBindKeys(ctx, scan)
+
+	out, complete := readBindValues(ctx, keys, mget)
+
+	if scanErr != nil {
+		log.Printf("WARN: [redisstore] LoadBinds SCAN failed discovered=%d restored=%d: %v",
+			len(keys), len(out), scanErr)
+	} else if !complete {
+		log.Printf("WARN: [redisstore] LoadBinds incomplete discovered=%d restored=%d", len(keys), len(out))
 	}
 
 	return out
+}
+
+// LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀 + 分批 MGET）。
+func (u *Upstash) LoadBinds() map[string]string {
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	defer cancel()
+
+	return loadBinds(ctx,
+		func(ctx context.Context, cursor uint64) ([]string, uint64, error) {
+			return u.client.Scan(ctx, cursor, bindPrefix+"*", 200).Result()
+		},
+		func(ctx context.Context, keys ...string) ([]any, error) {
+			return u.client.MGet(ctx, keys...).Result()
+		},
+	)
 }
 
 // Noop 纯内存降级：所有方法空实现。

@@ -128,6 +128,9 @@ describe('collectConfig', () => {
   it('secret 字段空值不下发（保留磁盘原值）', () => {
     expect('device_token' in collectConfig({ device_token: '' })).toBe(false);
     expect('upstash_token' in collectConfig({ upstash_token: '' })).toBe(false);
+    expect('api_key' in collectConfig({ api_key: '' })).toBe(false);
+    expect('admin_api_key' in collectConfig({ admin_api_key: '' })).toBe(false);
+    expect('readonly_api_key' in collectConfig({ readonly_api_key: '' })).toBe(false);
   });
 });
 
@@ -135,11 +138,17 @@ describe('configToValues', () => {
   it('secret 字段已有值时留空，普通字段照常回填', () => {
     const v = configToValues({
       listen: ':7863',
+      api_key: 'data-key',
+      admin_api_key: 'admin-key',
+      readonly_api_key: 'readonly-key',
       upstream: { device_token: 'tok' },
       upstash: { token: 'redis-token' },
     });
     expect(v.listen).toBe(':7863');
     expect(v.device_token).toBe('');
     expect(v.upstash_token).toBe('');
+    expect(v.api_key).toBe('');
+    expect(v.admin_api_key).toBe('');
+    expect(v.readonly_api_key).toBe('');
   });
 });

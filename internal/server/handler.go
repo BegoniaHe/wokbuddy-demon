@@ -43,8 +43,14 @@ type Config struct {
 	modelsCache *modelsCache
 	Pool        *pool.Pool
 	Upstream    *upstream.Client
-	APIKey      string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
-	MaxRotate   int    // 单请求最多换号次数，默认 3
+	APIKey      string // 数据面默认密钥；空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
+	// AdminAPIKey / ReadonlyAPIKey 管理/运维面凭据。任一非空时默认 api_key 不再
+	// 有管理权限；两者都为空时 api_key 兼管理面（单密钥默认）。热生效。
+	AdminAPIKey    string
+	ReadonlyAPIKey string
+	// AuthLimiter 管理/运维面鉴权失败限速器；与面板共享同一实例（nil 时自建）。
+	AuthLimiter *httpauth.Limiter
+	MaxRotate   int // 单请求最多换号次数，默认 3
 	// RotateBudget 轮换总时长预算：从首个尝试起累计耗时达此值即停止换号（0 = 不限）。
 	// 与 MaxRotate 构成「先到先停」——避免慢上游下 MaxRotate × header_timeout 把
 	// 客户端拖很久（issue #17）。
@@ -178,6 +184,8 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 
 	return livecfg.Snapshot{
 		APIKey:             h.cfg.APIKey,
+		AdminAPIKey:        h.cfg.AdminAPIKey,
+		ReadonlyAPIKey:     h.cfg.ReadonlyAPIKey,
 		SoftCooldown:       h.cfg.SoftCooldown,
 		RecordClientInfo:   h.cfg.RecordClientInfo,
 		MultimodalRouting:  h.cfg.MultimodalRouting,
@@ -240,9 +248,14 @@ func NewHandler(cfg *Config) *Handler {
 		cache = &dynamicModelsCache
 	}
 
+	authLimiter := config.AuthLimiter
+	if authLimiter == nil {
+		authLimiter = httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow)
+	}
+
 	handler := &Handler{
 		cfg: config, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
-		authLimiter:       httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow),
+		authLimiter:       authLimiter,
 		clientAuthLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit*3, httpauth.DefaultFailWindow),
 		cors:              make(map[string]bool, len(config.CORSOrigins)),
 		webSearch:         webSearchFn,
@@ -355,11 +368,11 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("GET /metrics", h.withRecovery(h.withAuth(h.metricsHandler)))
 	// 运行时 profiling（issue #146）：与 /metrics 同口径走 withAuth，避免 goroutine
 	// 栈与调用细节在公网裸奔。pprof.Index 自行按路径分发 allocs/goroutine 等子 profile。
-	h.mux.HandleFunc("/debug/pprof/", h.withRecovery(h.withAuth(pprof.Index)))
-	h.mux.HandleFunc("/debug/pprof/cmdline", h.withRecovery(h.withAuth(pprof.Cmdline)))
-	h.mux.HandleFunc("/debug/pprof/profile", h.withRecovery(h.withAuth(pprof.Profile)))
-	h.mux.HandleFunc("/debug/pprof/symbol", h.withRecovery(h.withAuth(pprof.Symbol)))
-	h.mux.HandleFunc("/debug/pprof/trace", h.withRecovery(h.withAuth(pprof.Trace)))
+	h.mux.HandleFunc("/debug/pprof/", h.withRecovery(h.withOpsAuth(pprof.Index)))
+	h.mux.HandleFunc("/debug/pprof/cmdline", h.withRecovery(h.withOpsAuth(pprof.Cmdline)))
+	h.mux.HandleFunc("/debug/pprof/profile", h.withRecovery(h.withOpsAuth(pprof.Profile)))
+	h.mux.HandleFunc("/debug/pprof/symbol", h.withRecovery(h.withOpsAuth(pprof.Symbol)))
+	h.mux.HandleFunc("/debug/pprof/trace", h.withRecovery(h.withOpsAuth(pprof.Trace)))
 }
 
 // responsesWebsocketUnsupported 明确告知客户端 WS transport 不可用，回 426。
@@ -452,25 +465,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
-// withAuth 默认密钥鉴权（/status 等运维面）：只认 config.api_key。
-// api_key 非空时按来源 IP 限制连续失败（issue #61）：超限返回 429 + Retry-After；
-// 来源 IP 由 httpauth.ClientIP 解析：只有 TCP 对端命中 server.trusted_proxies
-// 时才采信转发头；成功鉴权清零窗口。
+// withAuth 管理/运维面只读鉴权（/status、/metrics 等）：admin 或 readonly 均可。
+// 默认 api_key 在未配置 admin/readonly 时回落为 admin（单密钥默认）。
+//
+// 统一走 httpauth.AuthenticateManagement（常量时间、全候选遍历）；失败预算只在
+// 凭据校验失败时消耗，作用域不足不消耗。来源 IP 由 httpauth.ClientIP 解析：
+// 只有 TCP 对端命中 server.trusted_proxies 时才采信转发头。
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return h.withManagementAuth(next, false)
+}
+
+// withOpsAuth 运维面方法感知鉴权：GET/HEAD 允许 readonly，其余要求 admin。
+// 用于 /debug/pprof/*（GET 只读、POST/profile 等会消耗 CPU/落盘）。
+func (h *Handler) withOpsAuth(next http.HandlerFunc) http.HandlerFunc {
+	readonly := h.withManagementAuth(next, false)
+	admin := h.withManagementAuth(next, true)
+
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := h.loadLive().APIKey
-		if key == "" {
-			next(w, r)
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			readonly(w, r)
 			return
 		}
 
+		admin(w, r)
+	}
+}
+
+// withManagementAuth 管理/运维面统一鉴权；requireAdmin=true 时 readonly 返回 403。
+func (h *Handler) withManagementAuth(next http.HandlerFunc, requireAdmin bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		ip := httpauth.ClientIP(r, h.cfg.TrustedProxies)
 		if ok, retry := h.authLimiter.Allow(ip); !ok {
 			writeAuthFailLimit(w, retry)
 			return
 		}
 
-		if !httpauth.VerifyBearer(r, key) {
+		live := h.loadLive()
+
+		res := httpauth.AuthenticateManagement(r, live.APIKey, live.AdminAPIKey, live.ReadonlyAPIKey)
+		if !res.OK {
 			h.authLimiter.Fail(ip)
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 
@@ -478,6 +511,12 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 
 		h.authLimiter.Reset(ip)
+
+		if requireAdmin && res.Scope != httpauth.ScopeAdmin {
+			writeOpenAIError(w, http.StatusForbidden, "forbidden", "forbidden")
+			return
+		}
+
 		next(w, r)
 	}
 }
@@ -545,10 +584,10 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 			tr.keyID = res.KeyID
 		}
 
-		release, retryAfter, ok := h.cfg.Keys.Acquire(res.KeyID)
-		if !ok {
+		release, retryAfter, reason := h.cfg.Keys.Acquire(res.KeyID, ip)
+		if reason != apikey.RejectNone {
 			h.cfg.Keys.RecordRejected(res.KeyID)
-			writeKeyLimitError(w, r, retryAfter)
+			writeKeyRejection(w, r, reason, retryAfter)
 
 			return
 		}
@@ -672,16 +711,17 @@ const (
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 // Anthropic SDK 固定带 anthropic-version 头，按 Anthropic 分页形态返回。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	entries := h.modelListFor(r.Context())
 	if requestsAnthropicModels(r) {
 		setAnthropicRequestID(w, r)
-		writeJSON(w, http.StatusOK, anthropicModelList(h.modelList()))
+		writeJSON(w, http.StatusOK, anthropicModelList(entries))
 
 		return
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(),
+		"data":   entries,
 	})
 }
 
@@ -695,7 +735,7 @@ func (h *Handler) modelRetrieve(w http.ResponseWriter, r *http.Request) {
 		setAnthropicRequestID(w, r)
 	}
 
-	for _, entry := range h.modelList() {
+	for _, entry := range h.modelListFor(r.Context()) {
 		if stringValue(entry["id"]) == id {
 			if isAnthropic {
 				writeJSON(w, http.StatusOK, anthropicModelEntry(entry))
@@ -973,6 +1013,48 @@ func (h *Handler) appendGlobalModelEntries(
 		}
 
 		if ok && hidden[id] {
+			continue
+		}
+
+		out = append(out, entry)
+	}
+
+	return out
+}
+
+// modelListFor 返回当前请求可见的模型列表：默认 api_key / 未鉴权保持全量；
+// 命名密钥按 realm 绑定与模型白名单过滤已缓存的目录（不触发额外上游请求）。
+func (h *Handler) modelListFor(ctx context.Context) []map[string]any {
+	entries := h.modelList()
+
+	keyUse := keyUsageFrom(ctx)
+	if keyUse == nil || h.cfg.Keys == nil {
+		return entries
+	}
+
+	return h.filterModelsForKey(entries, keyUse)
+}
+
+// filterModelsForKey 按命名密钥作用域过滤模型条目：
+//   - 用与对话一致的 resolveKeyModel 解析别名与 realm 绑定；显式 realm 冲突直接排除；
+//   - 绑定 realm 时只保留最终 realm 匹配的条目；
+//   - 白名单按别名解析后的最终 (realm, bare) 校验；
+//   - hidden 已在 modelList 阶段排除，这里只做减法，不重新加入。
+func (h *Handler) filterModelsForKey(entries []map[string]any, keyUse *keyUsage) []map[string]any {
+	out := make([]map[string]any, 0, len(entries))
+
+	for _, entry := range entries {
+		id := stringValue(entry["id"])
+		if id == "" {
+			continue
+		}
+
+		realm, bare, err := resolveKeyModel(id, h.cfg.ModelAliases, keyUse.realm)
+		if err != nil {
+			continue
+		}
+
+		if !h.cfg.Keys.ModelAllowed(keyUse.id, realm+":"+bare) {
 			continue
 		}
 

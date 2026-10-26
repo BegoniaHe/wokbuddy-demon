@@ -582,7 +582,7 @@ func (c *Client) globalModelsOnce(
 		return nil, nil, modelChatWhitelist{}, fmt.Errorf("globalModelsOnce: %w", err)
 	}
 
-	c.CommonHeaders(req, account3) // 共享请求头（Origin/Referer/UA），与 FetchModels 同款
+	c.CommonHeaders(req, account3) // 共享请求头（UA/Accept/Content-Type），与 FetchModels 同款
 	injectEnterpriseHeaders(req, account3)
 	injectChatDomain(req, account3)
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。

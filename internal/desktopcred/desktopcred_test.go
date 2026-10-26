@@ -89,7 +89,10 @@ func writeAuthFileWithExpiry(t *testing.T, secret, domain string, encrypted bool
 			"accessToken": iface, "refreshToken": iface2,
 			"expiresAt": expiresAt, "domain": domain,
 		},
-		"account": map[string]any{"uid": "u1", "enterpriseId": "e1", "nickname": "nick"},
+		"account": map[string]any{
+			"uid": "u1", "enterpriseId": "e1", "nickname": "nick",
+			"idSource": "static_key", "departmentFullName": "研发部",
+		},
 	}
 	raw, _ := json.Marshal(doc)
 
@@ -130,6 +133,10 @@ func assertImportedAuth(t *testing.T, account *auth.Auth) {
 
 	if account.UID != "u1" || account.EnterpriseID != "e1" || account.Nickname != "nick" {
 		t.Fatalf("account=%+v", account)
+	}
+
+	if account.IDSource != "static_key" || account.DepartmentFullName != "研发部" {
+		t.Fatalf("身份头字段未随桌面凭证恢复: %+v", account)
 	}
 
 	if !account.IsGlobal() {

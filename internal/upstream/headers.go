@@ -15,27 +15,6 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
-const (
-	originRefererCN     = "https://www.codebuddy.cn"
-	originRefererGlobal = "https://www.workbuddy.ai"
-)
-
-// originRefererFor 按账号 realm 与签发域返回 Origin/Referer 基础域：
-// global → auth.domain 推出的签发域（codebuddy.ai / workbuddy.ai）；cn（含全局
-// 开关未开）→ https://www.codebuddy.cn。origin 必须与请求主机同域：token 只在
-// 签发域可用，跨域 Origin 会被上游判为非官方来源。
-func originRefererFor(a *auth.Auth) string {
-	if a != nil && a.IsGlobal() {
-		if base := globalBaseForDomain(a.DomainValue()); base != "" {
-			return base
-		}
-
-		return originRefererGlobal
-	}
-
-	return originRefererCN
-}
-
 // profileFor 返回账号 realm 的部署 profile；未配置返回 nil（启动期已拒绝该状态）。
 func (c *Client) profileFor(a *auth.Auth) *clientprofile.Profile {
 	if c == nil || c.Profile == nil {
@@ -86,8 +65,9 @@ func (c *Client) profileVersion(account *auth.Auth, pick func(*clientprofile.Pro
 	return ""
 }
 
-// defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方桌面端 daemon 代理层形状：
-// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`）。默认不拼接版本，直接使用 profile 字面量；
+// defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方 CLI chat 拦截器形状：
+// `WorkBuddy/<ver> <brand>/<ver> CLI/<cliVer>`，品牌段来自 realm 的 applicationName）。
+// 默认不拼接版本，直接使用 profile 字面量；
 // 用户显式配 client_version / cli_version 时才按该版本重新拼装，避免 UA 与
 // X-Ide-Version 自相矛盾。profile 缺失返回空串（启动期已拒绝该状态）。
 func (c *Client) defaultWorkBuddyUAFor(account *auth.Auth) string {
@@ -187,54 +167,24 @@ func deriveUUIDv4(seed string) string {
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
-// deriveAccountStableID 按 uid + 用途盐稳定派生 UUIDv4 形态设备/会话标识。
-// 跨重启稳定（固定盐 "wb2a:"，不随进程换——这是与 session 包派生盐的本质差异：
-// 那是会话键维度的进程级随机盐，重启换新；本函数是账号维度，必须跨重启恒定）、
-// 账号间互异（uid 不同则不同）、同 uid 同用途恒同值（幂等）。
-//
-// 两个用途：
-//   - purpose="machine" → X-Machine-ID（设备级，跨会话稳定）
-//   - purpose="session" → X-Session-ID（账号固定会话，跨重启稳定）
-//
-// 与 injectDeviceToken 的 X-Device-Token 并存不冲突：那是登录时上游签发的
-// 真实设备令牌（有则发，权威）；本对头是「每账号一台固定虚拟设备」的稳定指纹，
-// 防多号被上游按设备指纹缺失/漂移关联风控。两者是不同头族，官方桌面端都发。
-func deriveAccountStableID(uid, purpose string) string {
-	return deriveUUIDv4("wb2a:" + purpose + ":" + uid)
-}
-
-// injectAccountStableHeaders 在 req 注入 X-Machine-ID / X-Session-ID：按 uid 稳定
-// 派生，跨重启固定、账号间互异。uid 为空时不注入（匿名请求无设备标识，上游不要求）。
-func (*Client) injectAccountStableHeaders(req *http.Request, account5 *auth.Auth) {
-	if account5 == nil || account5.UID == "" {
-		return
-	}
-
-	req.Header.Set("X-Machine-Id", deriveAccountStableID(account5.UID, "machine"))
-	req.Header.Set("X-Session-Id", deriveAccountStableID(account5.UID, "session"))
-}
-
 // CommonHeaders 设置所有 API 共享的请求头。
+//
+// 官方 CLI chat 拦截器与 daemon 网关头构造都不发 Origin / Referer /
+// X-Machine-Id / X-Session-Id（见 UPSTREAM.md），这里也不注入，避免出站指纹
+// 比官方客户端更多。web 端点（ClaimReward / FetchAccountProfile 等）在自己的
+// 请求构造里按需设置 Origin / Referer。
 func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
 	// chat 流式路径在 ChatHeaders 覆盖为 event-stream。
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-
-	origin := originRefererFor(account2)
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", c.userAgent(account2))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-Codebuddy-Request", "1")
 	// chat/通用 API 不发 Accept-Language：官方 chat 路径没有该头（只有 billing/
 	// account 分页按 locale 带，见 BillingHeaders）。为「看起来像浏览器」补该头反而
 	// 增加非官方指纹（issue #249）。
-	// X-Machine-ID / X-Session-ID：按 uid 稳定派生的账号级设备头（见
-	// injectAccountStableHeaders）。注入在 CommonHeaders——chat 经 ChatHeaders
-	// 叠加 CommonHeaders 天然继承；billing 域另行注入，全出站覆盖。
-	c.injectAccountStableHeaders(req, account2)
 }
 
 // acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
@@ -353,6 +303,9 @@ func injectChatDomain(req *http.Request, account *auth.Auth) {
 		return
 	}
 
+	// 有部门信息时由 injectIdentityHeaders 发 X-Department-Info 并删掉本声明
+	// （两者互斥）。这里仍先写 X-No-Department-Info：只调 injectChatDomain 的
+	// 端点（FetchModels 等）保持原有的「无部门」声明。
 	req.Header.Set("X-No-Department-Info", "1")
 }
 
@@ -523,7 +476,11 @@ func (c *Client) injectAttribution(req *http.Request, account4 *auth.Auth) {
 }
 
 // injectIdentityHeaders 注入官方 CLI 的身份头族（企业/静态 Key 形态）。
-// 个人号三值全空 → 不注入（官方个人号同样不发，补空值反而是伪造指纹）。
+// 判据只看 enterpriseId / idSource：个人号即使 auth 文件残留 token_source
+// 也不得注入身份头（issue #248，抓包级证据）。静态 Key 形态 enterpriseId 为空
+// 但 idSource 非空，同样要发（issue #298）。
+//
+//nolint:cyclop,gocyclo // 身份头族按字段线性展开，拆分反而更碎。
 func (*Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 	if account == nil || account.UID == "" {
 		return
@@ -532,9 +489,9 @@ func (*Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 	method := account.TokenSource()
 
 	enterprise := strings.TrimSpace(account.EnterpriseID)
-	// 判据只看企业身份：token_source 描述 token 来路，不是账号身份。个人号即使
-	// auth 文件残留 token_source 也不得注入身份头（issue #248，抓包级证据）。
-	if enterprise == "" {
+	idSource := strings.TrimSpace(account.IDSource)
+
+	if enterprise == "" && idSource == "" {
 		return
 	}
 
@@ -542,7 +499,24 @@ func (*Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 		req.Header.Set("X-Auth-Method", method)
 	}
 
-	payload := map[string]any{"uin": account.UID, "owner_uin": enterprise}
+	if idSource != "" {
+		req.Header.Set("X-Id-Source", idSource)
+	}
+
+	if department := strings.TrimSpace(account.DepartmentFullName); department != "" {
+		req.Header.Del("X-No-Department-Info")
+		req.Header.Set("X-Department-Info", department)
+	}
+
+	payload := map[string]any{"uin": account.UID}
+	if enterprise != "" {
+		payload["owner_uin"] = enterprise
+	}
+
+	if idSource != "" {
+		payload["id_source"] = idSource
+	}
+
 	if method != "" {
 		payload["token_source"] = method
 	}
