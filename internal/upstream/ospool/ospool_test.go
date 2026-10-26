@@ -102,3 +102,35 @@ func TestPickReturnsReleasedValue(t *testing.T) {
 		t.Fatalf("200 次挑选只命中 %d 个版本，权重分布异常", len(seen))
 	}
 }
+
+// TestReleasesCoverDesktopTarget 回归 #318：桌面指纹固定 os=win32/arch=x64，
+// 因此版本池不能收入 ARM 独占的 26H1（28000），同时必须覆盖 Windows 10 22H2
+// 存量设备。build 不得重复，否则 Pick 的权重分布会偏向重复项。
+func TestReleasesCoverDesktopTarget(t *testing.T) {
+	t.Parallel()
+
+	byBuild := make(map[string]Release, len(Releases))
+	for _, release := range Releases {
+		if other, ok := byBuild[release.Build]; ok {
+			t.Fatalf("重复 build %q: %s/%s 与 %s/%s",
+				release.Build,
+				other.Family, other.Version,
+				release.Family, release.Version)
+		}
+
+		byBuild[release.Build] = release
+	}
+
+	if release, ok := byBuild["10.0.28000"]; ok {
+		t.Fatalf("不应包含 ARM 独占的 %s %s（%s）", release.Family, release.Version, release.Build)
+	}
+
+	win10, ok := byBuild["10.0.19045"]
+	if !ok {
+		t.Fatal("缺少 Windows 10 22H2（10.0.19045）")
+	}
+
+	if win10.Family != FamilyWindows10 || win10.Version != "22H2" {
+		t.Fatalf("10.0.19045 应为 Windows 10 22H2，实际 %s %s", win10.Family, win10.Version)
+	}
+}
