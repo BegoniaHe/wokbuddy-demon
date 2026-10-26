@@ -2636,7 +2636,7 @@ func (c *Client) fetchEnterpriseModelsPath(
 		return nil, fmt.Errorf("fetchEnterpriseModels: %w", err)
 	}
 
-	c.CommonHeaders(req, account7) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
+	c.CommonHeaders(req, account7) // 复用共享请求头（UA/Accept/Content-Type）
 	injectEnterpriseHeaders(req, account7)
 	injectChatDomain(req, account7)
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。

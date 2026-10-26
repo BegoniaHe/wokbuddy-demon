@@ -52,8 +52,14 @@ type Auth struct {
 	realm        string
 	UID          string
 	EnterpriseID string
-	Nickname     string
-	FilePath     string // 来源文件；refresh 后原子写回此处
+	// IdSource 身份来源（account.idSource / 扁平形 idSource）。静态 Key 形态
+	// enterpriseId 为空但 idSource 非空，出站仍需发企业身份头族。
+	IDSource string
+	// DepartmentFullName 部门全名（account.departmentFullName / 扁平形同名键），
+	// 非空时出站注入 X-Department-Info。
+	DepartmentFullName string
+	Nickname           string
+	FilePath           string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
@@ -467,9 +473,11 @@ func parseNestedAuth(raw []byte) (Auth, error) {
 			Realm        string `json:"realm"`
 		} `json:"auth"`
 		Account struct {
-			UID          string `json:"uid"`
-			EnterpriseID string `json:"enterpriseId"`
-			Nickname     string `json:"nickname"`
+			UID                string `json:"uid"`
+			EnterpriseID       string `json:"enterpriseId"`
+			IDSource           string `json:"idSource"`
+			DepartmentFullName string `json:"departmentFullName"`
+			Nickname           string `json:"nickname"`
 		} `json:"account"`
 		// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 		DeviceToken string `json:"device_token"`
@@ -479,45 +487,51 @@ func parseNestedAuth(raw []byte) (Auth, error) {
 	}
 
 	return Auth{
-		AccessToken:  n.Auth.AccessToken,
-		RefreshToken: n.Auth.RefreshToken,
-		ExpiresAt:    n.Auth.ExpiresAt,
-		Domain:       n.Auth.Domain,
-		realm:        n.Auth.Realm,
-		UID:          n.Account.UID,
-		EnterpriseID: n.Account.EnterpriseID,
-		Nickname:     n.Account.Nickname,
-		DeviceToken:  n.DeviceToken,
+		AccessToken:        n.Auth.AccessToken,
+		RefreshToken:       n.Auth.RefreshToken,
+		ExpiresAt:          n.Auth.ExpiresAt,
+		Domain:             n.Auth.Domain,
+		realm:              n.Auth.Realm,
+		UID:                n.Account.UID,
+		EnterpriseID:       n.Account.EnterpriseID,
+		IDSource:           n.Account.IDSource,
+		DepartmentFullName: n.Account.DepartmentFullName,
+		Nickname:           n.Account.Nickname,
+		DeviceToken:        n.DeviceToken,
 	}, nil
 }
 
 // parseFlatAuth 解析手写/旧版扁平形 {"accessToken":...,"uid":...}。
 func parseFlatAuth(raw []byte) (Auth, error) {
 	var item struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresAt    int64  `json:"expiresAt"`
-		Domain       string `json:"domain"`
-		Realm        string `json:"realm"`
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-		DeviceToken  string `json:"device_token"`
+		AccessToken        string `json:"accessToken"`
+		RefreshToken       string `json:"refreshToken"`
+		ExpiresAt          int64  `json:"expiresAt"`
+		Domain             string `json:"domain"`
+		Realm              string `json:"realm"`
+		UID                string `json:"uid"`
+		EnterpriseID       string `json:"enterpriseId"`
+		IDSource           string `json:"idSource"`
+		DepartmentFullName string `json:"departmentFullName"`
+		Nickname           string `json:"nickname"`
+		DeviceToken        string `json:"device_token"`
 	}
 	if err := json.Unmarshal(raw, &item); err != nil {
 		return Auth{}, fmt.Errorf("storage_parse_error: %w", err)
 	}
 
 	return Auth{
-		AccessToken:  item.AccessToken,
-		RefreshToken: item.RefreshToken,
-		ExpiresAt:    item.ExpiresAt,
-		Domain:       item.Domain,
-		realm:        item.Realm,
-		UID:          item.UID,
-		EnterpriseID: item.EnterpriseID,
-		Nickname:     item.Nickname,
-		DeviceToken:  item.DeviceToken,
+		AccessToken:        item.AccessToken,
+		RefreshToken:       item.RefreshToken,
+		ExpiresAt:          item.ExpiresAt,
+		Domain:             item.Domain,
+		realm:              item.Realm,
+		UID:                item.UID,
+		EnterpriseID:       item.EnterpriseID,
+		IDSource:           item.IDSource,
+		DepartmentFullName: item.DepartmentFullName,
+		Nickname:           item.Nickname,
+		DeviceToken:        item.DeviceToken,
 	}, nil
 }
 
@@ -525,7 +539,7 @@ func parseFlatAuth(raw []byte) (Auth, error) {
 // 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
 //
-//nolint:funlen // 校验/序列化/原子写/回写缓存线性展开。
+//nolint:funlen,maintidx // 校验/序列化/原子写/回写缓存线性展开。
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -542,6 +556,19 @@ func (a *Auth) SaveAtomic() error {
 		return errNoFilePathSet
 	}
 
+	accountDoc := map[string]any{
+		"uid":          a.UID,
+		"enterpriseId": a.EnterpriseID,
+		"nickname":     a.Nickname,
+	}
+	if a.IDSource != "" {
+		accountDoc["idSource"] = a.IDSource
+	}
+
+	if a.DepartmentFullName != "" {
+		accountDoc["departmentFullName"] = a.DepartmentFullName
+	}
+
 	doc := map[string]any{
 		"auth": map[string]any{
 			"accessToken":  a.AccessToken,
@@ -550,11 +577,7 @@ func (a *Auth) SaveAtomic() error {
 			"domain":       a.Domain,
 			"realm":        a.realm,
 		},
-		"account": map[string]any{
-			"uid":          a.UID,
-			"enterpriseId": a.EnterpriseID,
-			"nickname":     a.Nickname,
-		},
+		"account": accountDoc,
 	}
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
