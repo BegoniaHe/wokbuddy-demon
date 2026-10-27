@@ -2,6 +2,7 @@ package main
 
 import (
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -91,5 +92,81 @@ func TestModelsAllowedBackgroundTarget(t *testing.T) {
 	// 后台改写关闭（background_names 为空）时不要求覆盖默认目标。
 	if _, err := ParseConfig([]byte(`{"listen":":7863","models":{"allowed":["cn:glm-5.2"]}}`)); err != nil {
 		t.Fatalf("未开启后台改写时不应校验目标: %v", err)
+	}
+}
+
+// TestModelsAllowedBackgroundTargetAlias 后台目标写成别名时，按别名解析后的真实模型
+// 校验白名单（与运行期 resolveFlowModel 同口径）；只放行别名本身不算数。
+func TestModelsAllowedBackgroundTargetAlias(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		target  string
+		aliases string
+		allowed string
+		wantErr bool
+	}{
+		{
+			name:    "白名单放行真实模型",
+			target:  "fast",
+			aliases: `{"fast":"glm-5.2"}`,
+			allowed: `["glm-5.2"]`,
+		},
+		{
+			name:    "只放行别名本身仍拒绝",
+			target:  "fast",
+			aliases: `{"fast":"glm-5.2"}`,
+			allowed: `["fast"]`,
+			wantErr: true,
+		},
+		{
+			name:    "别名目标带 global 前缀时按 global 校验",
+			target:  "fast",
+			aliases: `{"fast":"global:glm-5.2"}`,
+			allowed: `["global:glm-5.2"]`,
+		},
+		{
+			name:    "别名目标带 global 前缀时 cn 白名单不覆盖",
+			target:  "fast",
+			aliases: `{"fast":"global:glm-5.2"}`,
+			allowed: `["cn:glm-5.2"]`,
+			wantErr: true,
+		},
+		{
+			name:    "后台目标带 realm 前缀也能查别名",
+			target:  "cn:fast",
+			aliases: `{"fast":"glm-5.2"}`,
+			allowed: `["glm-5.2"]`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			body := `{"listen":":7863","models":{"background_names":["memory-gen"],` +
+				`"background_target":` + strconv.Quote(testCase.target) + `,` +
+				`"aliases":` + testCase.aliases + `,"allowed":` + testCase.allowed + `}}`
+			_, err := ParseConfig([]byte(body))
+
+			if !testCase.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				return
+			}
+
+			if err == nil {
+				t.Fatal("后台目标解析后的真实模型未被白名单覆盖时应拒绝启动")
+			}
+
+			for _, want := range []string{"models.allowed", "background_target"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("错误信息应含 %q，got %v", want, err)
+				}
+			}
+		})
 	}
 }

@@ -1141,6 +1141,18 @@ func (c *Config) normalizeAllowedModels() error {
 		// 裸目标按 cn 解析（与 models.aliases / resolveModel 一致），不是两域。
 		realm = "cn"
 	}
+	// 后台改写后仍会经过别名解析（resolveFlowModel）：目标写成别名时，白名单要
+	// 校验别名解析后的真实模型，否则「白名单放行别名、运行期却拒绝真实模型」或
+	// 反过来误拒。别名只解析一层，与 resolveRequestModel 同口径。
+	if aliasTarget, ok := c.Models.Aliases[bare]; ok {
+		if aliasRealm, aliasBare, aliasPrefixed := splitModelRealmPrefix(aliasTarget); aliasBare != "" {
+			if aliasPrefixed {
+				realm = aliasRealm
+			}
+
+			bare = aliasBare
+		}
+	}
 
 	for _, entry := range out {
 		entryRealm, entryBare, entryPrefixed := splitModelRealmPrefix(entry)
