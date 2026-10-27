@@ -38,6 +38,11 @@ description: >
   检查）；校验不过的值是未生成状态，不得当作事实写进报告或提交。
 - 调研产出差异结论若要落到代码，改的是 `internal/upstream/`（适配在上游侧做，
   不依赖上游修复，见 `AGENTS.md` 上游审计策略）。
+- **动态验证默认关闭，仅在用户显式授权时启用**：运行官方客户端只用于验证静态包
+  结论，不能替代静态证据；必须使用测试账号，不登录真实账号。运行时采集只落
+  `.tmp/workbuddy-runtime/<realm>-<ts>/`，默认脱敏、不复制 auth/原始日志。
+- **提权只走 pkexec**：需要 root 的抓包（tcpdump）由 `pkexec` 向桌面用户发起
+  polkit 授权；不读取、不保存密码，不调用 sudo，不在非交互脚本里注入凭据。
 
 ## Open
 
@@ -46,7 +51,8 @@ description: >
 
 ## Do not
 
-- 不运行官方客户端二进制或登录任何账号；只用静态包内证据。
+- 默认不运行官方客户端二进制、不登录真实账号；只在用户显式授权并使用测试账号时，
+  通过 `scripts/runtime_probe.mjs` 做 opt-in 运行时验证。静态证据仍是首选。
 - 不 curl 上游端点验证「是否存在」（除用户明确要求的实测，且需走已有凭证路径）。
 - 不为旧版本/旧 realm 形态加兼容层；只回答当前路径的差异。
 - 不把本报告的结论搬进 `README.md` / `UPSTREAM.md`（那两处只收用户可见行为与
@@ -154,6 +160,48 @@ description: >
    `internal/upstream/desktop_test.go` / `headers` 相关用例，再
    `make fmt-check`。
 
+## Opt-in runtime verification (Wine)
+
+静态包无法回答「真实 chat 请求头/UA」时，用户显式授权且使用测试账号后，可运行
+`scripts/runtime_probe.mjs`。它是唯一允许启动官方客户端的入口，仍遵守上面的脱敏
+与提权边界。
+
+```bash
+# 只采集启动/CDP/客户端日志，不发消息
+node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn
+
+# 需要 chat 证据：显式确认会消耗测试账号额度
+node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn \
+  --send "ping" --confirm-spend --duration 20
+
+# 需要 root 抓包：由 pkexec 弹出 polkit 授权，不读取 sudo 密码
+node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn --capture
+```
+
+规则：
+
+- 默认复用现有 `WINEPREFIX` 的登录态；`--isolated-user-data` 只验证启动/公开端点，
+  不能验证 chat（未登录）。
+- 产物隔离在 `.tmp/workbuddy-runtime/<realm>-<ts>/`：`requests.jsonl`（URL 去
+  query、白名单头、会话/请求 ID 打码）、`summary.json`（端点/模型/事件）、可选
+  `traffic.pcap`（600，归当前用户）。原始 `netlog.json` / `runtime.log` 默认删除；
+  `--keep-raw` 才保留，且不得提交。
+- 不记录 `Authorization`、Cookie、`X-Refresh-Token`、`X-Userinfo`、`X-User-Id`
+  值；账号 UID、昵称、prompt、响应正文不写入摘要。
+- 证据等级：代码路径/包内字面量 > 运行时日志 > TLS 密文。CDP 看不到主进程/CLI
+  请求时，不要把它当成「没有发这个头」。
+- 提权只走 `pkexec`；脚本不包含 sudo 密码，也不在非交互环境注入凭据。
+- 结束后确认进程已停止；复用现有 prefix 时不执行全局 `wineserver -k`。
+
+已知无效路径（不要再重复试）：
+
+- `NODE_OPTIONS=--require=...` 会被 Electron 打包应用拒绝。
+- `NODE_DEBUG=http,https` 只输出 socket 内部信息，不打印请求头。
+- renderer CDP 看不到主进程/CLI 发出的 chat、`/v2/report`、`/v3/config`。
+- chat 实际由 `cli/dist/codebuddy-lite-wb.mjs` 的 `axiosToFetchAdapter` 发出，
+  头构造看 `buildConversationHeaders` / `UserAgentHttpInterceptor.buildUserAgent`；
+  profile 不要把 daemon surface（`main/server.js`）和 CLI surface 混用。
+
 ## Handoff
 
 - 协议溯源文案要更新时改 `internal/upstream/UPSTREAM.md`；配置项变化（含 profile
@@ -170,6 +218,8 @@ description: >
   抓包归档归纳）与约束。默认先用 `scripts/protocol_sweep.mjs`，不够再上 REA。
 - `scripts/download_latest.mjs`：查官方更新接口并下载 cn / global 最新包。
 - `scripts/extract_asar.mjs`：ASAR 提取；`scripts/protocol_sweep.mjs`：粗扫。
+- `scripts/runtime_probe.mjs`：opt-in Wine 运行时探针；隔离输出、白名单头、
+  默认删除原始日志；抓包提权只走 `pkexec`。
 
 ## Verify
 
@@ -183,3 +233,6 @@ description: >
 - profile 每个 `source: package` 的 `evidence.snippet` 能在对应文件里逐字命中
   （校验器或 `rg -F` 均可）；任一必需 surface 为 `null` 时不得声称已生成。
 - 抽查 `chatUA` / `desktopUA` 与包内字面量逐字相同，确认没有经过版本号拼接。
+- 运行 `runtime_probe.mjs` 后，`summary.json` 不含 token/UID/Cookie；原始
+  NetLog/stdout 默认已删除（或 `--keep-raw` 且明确不提交）。
+- `--capture` 只通过 `pkexec` 提权；脚本中不存在 sudo 密码或明文凭据。
