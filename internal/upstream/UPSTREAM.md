@@ -95,6 +95,19 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - 队列业务码 `6020/6021/6022`、限流族 `6000-6008`、额度/认证码按客户端枚举实现；请求级码（`11125/11129/.../11155`、`12654/14405`）不罚号不轮转，`11136` 换号并做模型级避让，`11141` 模型下线 fail-fast，`11102` 模型目录不存在按请求级 404 fail-fast（不换号），`11-128` 入站按内容拦截。
 - SSE error 帧与 HTTP 200 业务信封优先按结构化 `code`（含 `bizCode`）分类，取不到再回落 message；客户端 `data.statusCode`/`actions`、`cgicode/ret/retcode` 与 `172xx` 技能码尚未进入聊天主路径验证，暂不实现。
 
+非 chat 端点的头族取舍（刻意统一指纹，不是遗漏）：
+
+| surface | 官方形态 | 本仓 | 取舍 |
+| --- | --- | --- | --- |
+| search / webfetch | raw `fetch`，`CLI/<desktop version>` UA，头更少 | 复用 chat 头族 | 统一指纹，避免同账号多客户端 |
+| agentic_search | `Content-Type` / `Authorization` / 可选 `X-Conversation-Request-ID` | 复用 chat 头族 + `Accept: text/event-stream` | 同上；SSE 契约优先 |
+| images | Content-Type / Authorization / conversation / identity | 复用 chat 头族 | 同上 |
+| chat/busy | renderer `wb.http.post` | 复用 chat 头族 | 同上 |
+
+证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.8.3 / global 5.8.4
+基线包内 `X-Agent-Runtime` 0 命中（对应 CLI 2.161.0）；保留该头的依据是更晚 CLI 的
+搜索端点观测，待新基线复核。版本值仍只来自部署 profile，不进入仓库内置常量。
+
 桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。
 
 ## 七、参考 fork 审计工具（sync-upstream 技能）
