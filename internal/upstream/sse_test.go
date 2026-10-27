@@ -1404,7 +1404,7 @@ func TestUserResourceDetailedWithExpirySnapshot(t *testing.T) {
 		`{"PackageName":"unknown","CycleCapacitySize":5,"CycleCapacityRemain":5,"CycleCapacityUsed":0}` +
 		`]}}}}`
 	client := testClient(func(r *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+		if !strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource") {
 			return nil, fmt.Errorf("%s: %w", "wrong path: "+r.URL.Path, errTestUserResourceDetailedWithExpiry)
 		}
 
@@ -1432,7 +1432,7 @@ func TestCreditPackagesExpiryTimestamp(t *testing.T) {
 
 	end := time.Now().In(softRateResetLoc).Add(7 * 24 * time.Hour).Truncate(time.Second)
 	client := testClient(func(r *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+		if !strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource") {
 			return nil, fmt.Errorf("%s: %w", "wrong path: "+r.URL.Path, errTestCreditPackagesExpiryTimestampFailed)
 		}
 

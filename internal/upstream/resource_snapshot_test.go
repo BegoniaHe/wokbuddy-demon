@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,9 +19,9 @@ func TestUserResourceSnapshotBucketsByDay(t *testing.T) {
 
 	client := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
-		case r.URL.Path == "/v2/billing/meter/get-user-resource-summary":
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource-summary"):
 			return jsonResp(200, `{"code":0,"data":{"packages":[{"remain":900,"total":1000}]}}`), nil
-		case r.URL.Path == "/v2/billing/meter/get-user-resource-paid-packages":
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource-paid-packages"):
 			return jsonResp(200, `{"code":0,"data":{"Accounts":[
 				{"CapacitySize":300,"CapacityRemain":300,"DeductionEndTime":`+itoa(day1.UnixMilli())+`},
 				{"CapacitySize":200,"CapacityRemain":200,"DeductionEndTime":`+itoa(day1.UnixMilli())+`},
@@ -56,11 +57,11 @@ func TestUserResourceDetailedMatchesSnapshot(t *testing.T) {
 	day1 := time.Now().Add(24 * time.Hour).Truncate(time.Second).In(softRateResetLoc)
 
 	client := testClient(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/v2/billing/meter/get-user-resource-summary" {
+		if strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource-summary") {
 			return jsonResp(200, `{"code":0,"data":{"packages":[{"remain":300,"total":300}]}}`), nil
 		}
 
-		if r.URL.Path == "/v2/billing/meter/get-user-resource-paid-packages" {
+		if strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource-paid-packages") {
 			return jsonResp(200, `{"code":0,"data":{"Accounts":[
 				{"CapacitySize":300,"CapacityRemain":300,"DeductionEndTime":`+itoa(day1.UnixMilli())+`}
 			],"TotalCount":1}}`), nil

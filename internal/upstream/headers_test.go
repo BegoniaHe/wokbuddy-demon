@@ -288,8 +288,9 @@ func TestIdentityHeaders(t *testing.T) {
 	}
 }
 
-// TestChatHeadersNoAcceptLanguage chat 路径不发 Accept-Language；billing 仍按 realm 带。
-func TestChatHeadersNoAcceptLanguage(t *testing.T) {
+// TestBillingAcceptLanguageOnlyOnSummaryAndPackages chat 与 billing 默认头族都不发
+// Accept-Language；只有 summary / packages 由调用方带语言短码（zh / en）。
+func TestBillingAcceptLanguageOnlyOnSummaryAndPackages(t *testing.T) {
 	t.Parallel()
 
 	client := New()
@@ -305,8 +306,21 @@ func TestChatHeadersNoAcceptLanguage(t *testing.T) {
 	billing, _ := http.NewRequest(http.MethodPost, "https://example.invalid/billing", http.NoBody)
 	client.BillingHeaders(billing, acct)
 
-	if got := billing.Header.Get("Accept-Language"); got != "zh-CN" {
-		t.Fatalf("billing Accept-Language=%q want zh-CN", got)
+	if got := billing.Header.Get("Accept-Language"); got != "" {
+		t.Fatalf("billing Accept-Language=%q want empty", got)
+	}
+
+	if got := billingAcceptLanguage(acct); got != "zh" {
+		t.Fatalf("CN Accept-Language=%q want zh（短码）", got)
+	}
+
+	global := &auth.Auth{UID: "u2", AccessToken: "at"}
+	if _, err := auth.BackfillRealmFor(global, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor: %v", err)
+	}
+
+	if got := billingAcceptLanguage(global); got != "en" {
+		t.Fatalf("global Accept-Language=%q want en（短码）", got)
 	}
 }
 

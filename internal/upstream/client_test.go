@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -641,7 +642,7 @@ func TestUserResourceAggregation(t *testing.T) {
 	t.Parallel()
 
 	client := testClient(func(r *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+		if !strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource") {
 			return nil, fmt.Errorf("%s: %w", "wrong path: "+r.URL.Path, errTestUserResourceAggregationFailed)
 		}
 
@@ -1005,22 +1006,22 @@ func assertV3Overlay(t *testing.T, modelInfo ModelInfo) {
 	}
 }
 
-// TestUserResourceCNFallsBackToNoPrefix 官方 CN 桌面 resourcePrefix 为空；
-// /v2 404 时必须回落 /billing/meter/get-user-resource。
-func TestUserResourceCNFallsBackToNoPrefix(t *testing.T) {
+// TestUserResourceNoPrefixFirstFallsBackToV2 官方 5.9.3 桌面 resourcePrefix 为空：
+// get-user-resource 先发无前缀路径，404 才回落 `/v2`。
+func TestUserResourceNoPrefixFirstFallsBackToV2(t *testing.T) {
 	t.Parallel()
 
-	var v2Calls, plainCalls int
+	var paths []string
 
 	client := testClient(func(r *http.Request) (*http.Response, error) {
 		switch {
 		case strings.Contains(r.URL.Path, "get-user-resource-summary"):
 			return jsonResp(http.StatusNotFound, `{"code":404}`), nil
-		case strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource"):
-			v2Calls++
-			return jsonResp(http.StatusNotFound, `{"code":404}`), nil
 		case strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource"):
-			plainCalls++
+			paths = append(paths, r.URL.Path)
+			if len(paths) == 1 {
+				return jsonResp(http.StatusNotFound, `{"code":404}`), nil
+			}
 
 			return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[
 				{"CycleCapacitySize":1000,"CycleCapacityRemain":700,"CycleCapacityUsed":300}
@@ -1035,8 +1036,9 @@ func TestUserResourceCNFallsBackToNoPrefix(t *testing.T) {
 		t.Fatalf("remain=%d total=%d err=%v want 700/1000", remain, total, err)
 	}
 
-	if v2Calls != 1 || plainCalls != 1 {
-		t.Fatalf("v2Calls=%d plainCalls=%d want 1/1", v2Calls, plainCalls)
+	want := []string{"/billing/meter/get-user-resource", "/v2/billing/meter/get-user-resource"}
+	if !slices.Equal(paths, want) {
+		t.Fatalf("paths=%v want %v（无前缀优先，404 回落 /v2）", paths, want)
 	}
 }
 
