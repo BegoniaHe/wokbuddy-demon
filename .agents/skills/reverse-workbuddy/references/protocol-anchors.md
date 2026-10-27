@@ -24,7 +24,8 @@
   - `/v3/config` 拉取 + `X-Domain`：见 `internal/upstream/client.go` 1874 附近。
 - 桌面指纹上报：`internal/upstream/desktop.go`：`/v2/report`、
   `/v2/user-asset/appearance/set`、`desktopFingerprint`（commit / releaseDate
-  来自部署 profile，源码无固定构建常量）。
+  来自部署 profile，源码无固定构建常量；body 的 `userAgent` 取桌面 UA 字面量，
+  `os` 为 `Win32`，对应官方 `navigator.userAgent` / `navigator.platform`）。
 
 ## 请求头族
 

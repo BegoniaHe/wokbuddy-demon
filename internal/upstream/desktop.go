@@ -308,9 +308,9 @@ func (c *Client) desktopSessionID(a *auth.Auth) string {
 }
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-// 版本/commit/releaseDate 按 realm 取部署 profile 的官方分发包真值；os/arch 固定为常见桌面
-// （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台；
-// osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
+// 版本/commit/releaseDate 按 realm 取部署 profile 的官方分发包真值；os/arch 对齐官方
+// `navigator.platform`（Win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露
+// 宿主平台；osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
 func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 	desktopBuild2 := c.desktopBuildFor(account7)
 	osVersion, cpu, memorySize := desktopHardware(account7)
@@ -334,13 +334,16 @@ func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"sessionId":   c.desktopSessionID(account7),
 		"extName":     "workbuddy-desktop",
 		keyExtVersion: c.desktopExtVersionFor(account7),
-		"os":          "win32",
-		"arch":        "x64",
-		"osVersion":   osVersion,
-		"cpuModel":    cpu.Name,
-		"cpuCores":    cpu.Threads,
-		"memorySize":  memorySize,
-		"timestamp":   now,
+		// 官方 report body 取 navigator.userAgent / navigator.platform（Windows
+		// 返回 Win32）：UA 与桌面上报头同源，不按版本号拼接。
+		"userAgent":  c.desktopUAFor(account7),
+		"os":         "Win32",
+		"arch":       "x64",
+		"osVersion":  osVersion,
+		"cpuModel":   cpu.Name,
+		"cpuCores":   cpu.Threads,
+		"memorySize": memorySize,
+		"timestamp":  now,
 	}
 
 	if tz := desktopTimezone(account7.Realm()); tz != "" {
