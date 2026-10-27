@@ -98,6 +98,7 @@ func TestChatStatsReaderSubstantiveOutput(t *testing.T) {
 		{"refusal", `data: {"choices":[{"delta":{"refusal":"no"}}]}`, true},
 		{"function_call", `data: {"choices":[{"delta":{"function_call":{"name":"Bash"}}}]}`, true},
 		{"empty_function_call", `data: {"choices":[{"delta":{"function_call":{}}}]}`, false},
+		{"placeholder_function_call", `data: {"choices":[{"delta":{"function_call":{"name":"","arguments":""}}}]}`, false},
 		{"reasoning_only", `data: {"choices":[{"delta":{"reasoning":"think"}}]}`, false},
 	}
 
@@ -753,6 +754,17 @@ func TestRequestMetricsRecordsNamedKeyID(t *testing.T) {
 
 // --- 工具面统计（issue #329）-------------------------------------------------
 
+// legacyFunctionCallSSE 旧式 functions API 的 function_call（独立于 tool_calls）。
+const legacyFunctionCallSSE = `data: {"id":"chatcmpl-l","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"content":"ok","function_call":{"name":"exec_command","arguments":""}}}]}
+
+data: {"id":"chatcmpl-l","choices":[{"index":0,"delta":{"function_call":{"arguments":"{\"cmd\":\"ls\"}"}}}]}
+
+data: {"id":"chatcmpl-l","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+
 // toolCallsSSE 两个工具调用：index=0 分三帧增量（首帧带 id），index=1 一帧完成。
 const toolCallsSSE = `data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":""}}]}}]}
 
@@ -831,6 +843,25 @@ data: [DONE]
 	}
 }
 
+// TestChatStatsReaderToolCallCountEmptyPlaceholder 空占位 function_call
+// {"name":"","arguments":""} 不是一次调用，不能计入 ToolCallCount。
+func TestChatStatsReaderToolCallCountEmptyPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	const sse = `data: {"choices":[{"index":0,"delta":{"function_call":{"name":"","arguments":""}}}]}
+
+data: [DONE]
+
+`
+
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.ReadAll(r)
+
+	if got := r.ToolCallCount(); got != 0 {
+		t.Fatalf("ToolCallCount=%d want 0（空占位不算调用）", got)
+	}
+}
+
 // TestRequestMetricsToolCounters 归档里的「声明 / 调用」口径：流式与非流式、
 // 声明有调用与声明零调用都写入，未声明 tools 的请求两个字段都不出现。
 func TestRequestMetricsToolCounters(t *testing.T) {
@@ -881,6 +912,22 @@ func TestRequestMetricsToolCounters(t *testing.T) {
 			stream:        true,
 			body:          `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`,
 			upstreamBody:  markupUpstreamSSE(markupFixture("先读一遍控制器。\n\n", "ls -la")),
+			wantDeclared:  1,
+			wantToolCalls: 1,
+		},
+		{
+			name:          "流式旧式 function_call 计入",
+			stream:        true,
+			body:          `{"model":"glm-5.2","stream":true,"tools":[{"type":"function","function":{"name":"exec_command"}}],"messages":[]}`,
+			upstreamBody:  legacyFunctionCallSSE,
+			wantDeclared:  1,
+			wantToolCalls: 1,
+		},
+		{
+			name:          "非流式旧式 function_call 计入",
+			stream:        false,
+			body:          `{"model":"glm-5.2","tools":[{"type":"function","function":{"name":"exec_command"}}],"messages":[]}`,
+			upstreamBody:  legacyFunctionCallSSE,
 			wantDeclared:  1,
 			wantToolCalls: 1,
 		},

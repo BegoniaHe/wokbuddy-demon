@@ -3275,10 +3275,10 @@ func firstChoice(resp map[string]any) map[string]any {
 	return choice
 }
 
-// responseToolCallCount 统计聚合响应 choices[0].message.tool_calls 的条数（缺失为 0）。
-// 供请求归档的「声明 / 调用」统计（issue #329），不改变响应内容。
-// 聚合器写回的是 []map[string]any（in-process），经过 JSON 反序列化的是 []any；
-// 两种形态都要认，否则非流式会恒记 0。
+// responseToolCallCount 统计聚合响应 choices[0].message 的工具调用条数：tool_calls
+// 数组 + 非空旧式 function_call（二者与流式统计同口径）。供请求归档的「声明 / 调用」
+// 统计（issue #329），不改变响应内容。聚合器写回的是 []map[string]any（in-process），
+// 经过 JSON 反序列化的是 []any；两种形态都要认，否则非流式会恒记 0。
 func responseToolCallCount(resp map[string]any) int {
 	choice := firstChoice(resp)
 	if choice == nil {
@@ -3290,14 +3290,20 @@ func responseToolCallCount(resp map[string]any) int {
 		return 0
 	}
 
+	count := 0
+
 	switch calls := message["tool_calls"].(type) {
 	case []any:
-		return len(calls)
+		count = len(calls)
 	case []map[string]any:
-		return len(calls)
-	default:
-		return 0
+		count = len(calls)
 	}
+
+	if fc, ok := message["function_call"].(map[string]any); ok && functionCallMapHasPayload(fc) {
+		count++
+	}
+
+	return count
 }
 
 // mergeNonStreamContinuation 拼接两段正文，终态/usage 取第二段（最终回答）。

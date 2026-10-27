@@ -347,8 +347,9 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 		s.hasToolCall = true
 		s.noteToolCalls(delta.ToolCalls)
 	}
-	// 旧式 function_call（非 tool_calls）同样是可消费的实质输出；空占位 {} 除外。
-	if rawPayloadPresent(delta.FunctionCall) {
+	// 旧式 function_call（非 tool_calls）同样是可消费的实质输出；空占位
+	// {"name":"","arguments":""} 与 {} 一样不算（与 upstream.keepFunctionCall 同口径）。
+	if functionCallHasPayload(delta.FunctionCall) {
 		s.hasToolCall = true
 		s.legacyFunctionCall = true
 	}
@@ -450,6 +451,29 @@ func rawPayloadPresent(raw json.RawMessage) bool {
 	value := strings.TrimSpace(string(raw))
 
 	return value != "" && value != "null" && value != "[]" && value != "{}"
+}
+
+// functionCallHasPayload 报告旧式 function_call 是否含实际负载：空占位
+// {"name":"","arguments":""} 不算一次调用；非对象形态保守按有负载处理。
+func functionCallHasPayload(raw json.RawMessage) bool {
+	if !rawPayloadPresent(raw) {
+		return false
+	}
+
+	var fc map[string]any
+	if json.Unmarshal(raw, &fc) != nil {
+		return true
+	}
+
+	return functionCallMapHasPayload(fc)
+}
+
+// functionCallMapHasPayload 报告 function_call 对象的 name/arguments 是否至少一项非空。
+func functionCallMapHasPayload(fc map[string]any) bool {
+	name, _ := fc["name"].(string)
+	args, _ := fc["arguments"].(string)
+
+	return name != "" || args != ""
 }
 
 // HasSubstantiveOutput 报告流中是否产生正文、工具调用或拒答。
