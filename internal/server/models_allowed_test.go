@@ -208,6 +208,59 @@ func TestCountTokensAllowedModelRejected(t *testing.T) {
 	}
 }
 
+// TestGeminiCountTokensAllowedModel Gemini 的 countTokens 与 chat 同口径受
+// models.allowed/models.hidden 约束：默认密钥（无命名密钥）也必须拦截，
+// 白名单外或隐藏模型不返回 token 估算。
+func TestGeminiCountTokensAllowedModel(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		model    string
+		allowed  map[string]struct{}
+		hidden   map[string]struct{}
+		wantCode int
+		wantMsg  string
+	}{
+		{"白名单外拒绝", "glm-other", allowedSet("cn:glm-5.2"), nil, http.StatusBadRequest, "models.allowed"},
+		{"global 前缀不放行 cn", "glm-5.2", allowedSet("global:glm-5.2"), nil, http.StatusBadRequest, "models.allowed"},
+		{"黑名单拒绝", "glm-5.2", allowedSet("cn:glm-5.2"), livecfg.NormalizeHiddenModels([]string{"glm-5.2"}), http.StatusBadRequest, "models.hidden"},
+		{"白名单内放行", "glm-5.2", allowedSet("cn:glm-5.2"), nil, http.StatusOK, "totalTokens"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			handler := NewHandler(&Config{
+				Pool:          testPoolWith(),
+				Upstream:      upstream.New(),
+				modelsCache:   &modelsCache{},
+				AllowedModels: testCase.allowed,
+				HiddenModels:  testCase.hidden,
+			})
+
+			req := httptest.NewRequest(http.MethodPost,
+				"/v1beta/models/"+testCase.model+":countTokens",
+				strings.NewReader(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != testCase.wantCode {
+				t.Fatalf("code=%d body=%s want %d", rec.Code, rec.Body, testCase.wantCode)
+			}
+
+			if !strings.Contains(rec.Body.String(), testCase.wantMsg) {
+				t.Errorf("响应应含 %q: %s", testCase.wantMsg, rec.Body)
+			}
+
+			if testCase.wantCode != http.StatusOK && strings.Contains(rec.Body.String(), "totalTokens") {
+				t.Errorf("被拒模型不得返回 token 估算: %s", rec.Body)
+			}
+		})
+	}
+}
+
 // TestBusyAllowedModelUnavailable 预检里白名单外模型报 unavailable（与 hidden 同档）。
 func TestBusyAllowedModelUnavailable(t *testing.T) {
 	t.Parallel()
