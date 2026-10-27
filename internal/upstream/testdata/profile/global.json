@@ -13,7 +13,7 @@
     "generatedBy": "reverse-workbuddy@test"
   },
   "emit": {
-    "chatUA": "WorkBuddy/9.9.10 WorkBuddy/9.9.10 CLI/8.8.9",
+    "chatUA": "WorkBuddy/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9",
     "desktopUA": "workbuddy-ai/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9",
     "billingUA": "WorkBuddy/9.9.10",
     "xIdeVersion": "9.9.10",
@@ -24,7 +24,7 @@
   },
   "missing": [],
   "evidence": {
-    "chatUA": {"source": "package", "file": "main/server.js", "snippet": "x"},
+    "chatUA": {"source": "package", "file": "cli/dist/codebuddy-lite-wb.mjs", "snippet": "x"},
     "desktopUA": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
     "billingUA": {"source": "package", "file": "main/tar.js", "snippet": "x"},
     "xIdeVersion": {"source": "package", "file": "main/server.js", "snippet": "x"},

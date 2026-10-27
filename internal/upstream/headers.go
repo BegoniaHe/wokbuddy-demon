@@ -65,8 +65,20 @@ func (c *Client) profileVersion(account *auth.Auth, pick func(*clientprofile.Pro
 	return ""
 }
 
+// chatBrandFor 返回官方 CLI chat UA 的品牌段（`cli/product.json` 的
+// `applicationName`）：global → `workbuddy-ai`，其余 → `WorkBuddy`。
+// 只放品牌字面量，不放版本号；版本仍取 profile / 显式覆盖。
+func chatBrandFor(account *auth.Auth) string {
+	if account != nil && account.IsGlobal() {
+		return "workbuddy-ai"
+	}
+
+	return "WorkBuddy"
+}
+
 // defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方 CLI chat 拦截器形状：
-// `WorkBuddy/<ver> <brand>/<ver> CLI/<cliVer>`，品牌段来自 realm 的 applicationName）。
+// `WorkBuddy/<ver> <brand>/<ver> CLI/<cliVer>`，品牌段来自 `cli/product.json` 的
+// `applicationName`，不是 desktop surface 的同名字段）。
 // 默认不拼接版本，直接使用 profile 字面量；
 // 用户显式配 client_version / cli_version 时才按该版本重新拼装，避免 UA 与
 // X-Ide-Version 自相矛盾。profile 缺失返回空串（启动期已拒绝该状态）。
@@ -85,7 +97,7 @@ func (c *Client) defaultWorkBuddyUAFor(account *auth.Auth) string {
 
 	v := c.clientVersionFor(account)
 
-	return "WorkBuddy/" + v + " WorkBuddy/" + v + " CLI/" + c.cliVersionFor(account)
+	return "WorkBuddy/" + v + " " + chatBrandFor(account) + "/" + v + " CLI/" + c.cliVersionFor(account)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。

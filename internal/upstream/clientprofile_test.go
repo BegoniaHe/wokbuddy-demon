@@ -36,7 +36,7 @@ const fakeCNProfile = `{
   },
   "missing": ["loginUA"],
   "evidence": {
-    "chatUA": {"source": "package", "file": "main/server.js", "snippet": "x"},
+    "chatUA": {"source": "package", "file": "cli/dist/codebuddy-lite-wb.mjs", "snippet": "x"},
     "desktopUA": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
     "billingUA": {"source": "package", "file": "main/tar.js", "snippet": "x"},
     "xIdeVersion": {"source": "package", "file": "main/server.js", "snippet": "x"},
