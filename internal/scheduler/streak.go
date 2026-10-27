@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"slices"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -153,8 +154,9 @@ func compactJSON(raw json.RawMessage) string {
 	return logfmt.TruncateEllipsis(string(raw), maxStreakPayloadLen)
 }
 
-// makeupRecent 本月漏签由近及远补签，受补签卡余额限制；无卡/无漏签/查询失败静默。
-// 只在有漏签时才查连登详情与补签卡余额，避免无漏签账号多打一次上游。
+// makeupRecent 本月漏签由近及远补签，受补签卡余额与每轮上限限制；
+// 无卡/无漏签/查询失败静默。只在有漏签时才查连登详情与补签卡余额，
+// 避免无漏签账号多打一次上游。
 func (s *Scheduler) makeupRecent(account2 *auth.Auth) {
 	now := cst.Now()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, cst.Loc)
@@ -175,10 +177,33 @@ func (s *Scheduler) makeupRecent(account2 *auth.Auth) {
 		return
 	}
 
-	used := 0
+	maxPerRound := int(s.makeupPerRound.Load())
 
-	for i := len(missed) - 1; i >= 0 && remaining > 0; i-- {
-		day := missed[i]
+	used, remaining, leftForNextRound := s.useMakeupCards(account2, missed, remaining, maxPerRound)
+	if used > 0 {
+		log.Printf("streak-bonus %s: 本次补签 %d 天，剩余补签卡 %d 张",
+			logfmt.Label(account2.UID, account2.NicknameValue()), used, remaining)
+	}
+
+	if maxPerRound > 0 && used >= maxPerRound && leftForNextRound > 0 {
+		log.Printf("streak-bonus %s: 本轮达上限 %d 天，剩余 %d 天待下一轮",
+			logfmt.Label(account2.UID, account2.NicknameValue()), maxPerRound, leftForNextRound)
+	}
+}
+
+// useMakeupCards 由近及远补签，返回成功数、剩余卡数与留待下一轮的漏签天数。
+func (s *Scheduler) useMakeupCards(
+	account2 *auth.Auth, missed []string, remaining, maxPerRound int,
+) (used, remainingCards, leftForNextRound int) {
+	for i, day := range slices.Backward(missed) {
+		if remaining <= 0 {
+			return used, remaining, 0
+		}
+
+		if maxPerRound > 0 && used >= maxPerRound {
+			return used, remaining, i + 1
+		}
+
 		if err := s.cfg.Upstream.UseMakeupCard(account2, day); err != nil {
 			log.Printf("streak-bonus %s: 补签 %s 失败: %v", logfmt.Label(account2.UID, account2.NicknameValue()), day, err)
 			continue
@@ -191,8 +216,5 @@ func (s *Scheduler) makeupRecent(account2 *auth.Auth) {
 			logfmt.Label(account2.UID, account2.NicknameValue()), day, remaining)
 	}
 
-	if used > 0 {
-		log.Printf("streak-bonus %s: 本次补签 %d 天，剩余补签卡 %d 张",
-			logfmt.Label(account2.UID, account2.NicknameValue()), used, remaining)
-	}
+	return used, remaining, 0
 }

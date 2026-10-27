@@ -34,6 +34,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'balance_refresh_minutes', path: ['schedule', 'balance_refresh_minutes'], kind: 'number' },
   { name: 'task_sweep_enabled', path: ['schedule', 'task_sweep_enabled'], kind: 'checkbox' },
   { name: 'task_sweep_minutes', path: ['schedule', 'task_sweep_minutes'], kind: 'number' },
+  { name: 'makeup_cards_per_round', path: ['schedule', 'makeup_cards_per_round'], kind: 'number' },
   { name: 'checkin_account_delay', path: ['schedule', 'checkin_account_delay'], kind: 'text' },
   { name: 'slot_jitter', path: ['schedule', 'slot_jitter'], kind: 'text' },
   { name: 'account_pacing_sigma', path: ['schedule', 'account_pacing_sigma'], kind: 'number' },

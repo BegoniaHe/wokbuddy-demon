@@ -60,6 +60,7 @@ var (
 	errNormalizeServerDurationFailed    = errors.New("normalizeServerDuration failed")
 	errNormalizeCheckinDelayFailed      = errors.New("normalizeCheckinDelay failed")
 	errNormalizeKeepaliveWindowFailed   = errors.New("normalizeKeepaliveWindow failed")
+	errNormalizeMakeupCardsPerRound     = errors.New("normalizeMakeupCardsPerRound failed")
 	errTimingJitterTooLarge             = errors.New("schedule.slot_jitter 不能超过 59m")
 	errTimingSigmaRange                 = errors.New("schedule.account_pacing_sigma 超出 [0,1.5]")
 	errTimingPacingFloorAboveCeiling    = errors.New("schedule.account_pacing_floor 不能大于 account_pacing_ceiling")
@@ -213,6 +214,9 @@ type Config struct {
 		// 「已达标未领」的成长任务奖励（只补领、不代做任务）。默认开启。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+		// MakeupCardsPerRound 连登补签每轮成功上限：0 = 不限（保持既有行为），
+		// >0 = 每轮最多成功补签 N 天，剩余漏签留待下一轮。负数启动报错。
+		MakeupCardsPerRound int `json:"makeup_cards_per_round"`
 		// CheckinAccountDelay 签到任务账号间等待（issue #59）：如 "800ms"；"0" = 不限。
 		// 开启时序整形后作为对数正态分布的 median。
 		CheckinAccountDelay string `json:"checkin_account_delay"`
@@ -579,6 +583,7 @@ func applyScheduleDefaults(config2 *Config) {
 	// 任务补领清扫默认开启、15 分钟一轮：只补领「已达标未领」的奖励，幂等且零副作用。
 	config2.Schedule.TaskSweepEnabled = true
 	config2.Schedule.TaskSweepMinutes = 15
+	config2.Schedule.MakeupCardsPerRound = 0
 	config2.Schedule.CheckinAccountDelay = "800ms"
 	config2.Schedule.SlotJitter = "20m"
 
@@ -2151,11 +2156,24 @@ func (c *Config) normalizeSchedule() error {
 	c.normalizeBalanceRefresh()
 	c.normalizeTaskSweep()
 
+	if err := c.normalizeMakeupCardsPerRound(); err != nil {
+		return err
+	}
+
 	if err := c.normalizeKeepaliveWindow(); err != nil {
 		return err
 	}
 
 	return c.validateScheduleHours()
+}
+
+// normalizeMakeupCardsPerRound 校验连登补签每轮上限：0 = 不限，负数 fail fast。
+func (c *Config) normalizeMakeupCardsPerRound() error {
+	if c.Schedule.MakeupCardsPerRound < 0 {
+		return fmt.Errorf("schedule.makeup_cards_per_round: 不能为负数（0 = 不限）: %w", errNormalizeMakeupCardsPerRound)
+	}
+
+	return nil
 }
 
 // normalizeKeepaliveWindow 解析定时保活临期窗口：空值回落 24h；非法或 <=0
