@@ -32,6 +32,13 @@
   - `userAgent()` / `billingUA()` / `desktopUAFor()` 默认取部署 profile 的冻结
     字面量（`internal/clientprofile`）；显式 config `user_agent` /
     `client_version` / `cli_version` 才覆盖版本段。
+  - chat UA 模板（`cli/dist/codebuddy-lite-wb.mjs` 的
+    `UserAgentHttpInterceptor.buildUserAgent`）：
+    `WorkBuddy/<platformVersion> <applicationName>/<platformVersion> CLI/<cliVersion>`。
+    `platform` 由 sidecar 注入固定为 `WorkBuddy`；`applicationName` 取
+    `cli/product.json`（CN `WorkBuddy` / global `workbuddy-ai`）；extension 为
+    `CLI/<cli>`。服务端不注入 `CLIENT_INFO_APPLICATION_NAME`。`/v2/report` 的
+    desktop UA 是另一条 surface，不共用该模板。
   - `injectDeviceToken()`：`X-Device-Token`，文件兜底见
     `internal/upstream/device_token.go`。
   - 会话头族 `X-Conversation-Id` / `-Request-Id` / `-Message-Id` /

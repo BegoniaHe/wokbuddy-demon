@@ -170,9 +170,9 @@ func TestNonChatModelGenerationTags(t *testing.T) {
 	}
 }
 
-// TestDesktopUAForGlobalAccount 桌面端 UA 直接取 profile 字面量，按 realm 分档；
-// 探测主路用这个 UA，与 chat 路径同源。
-func TestDesktopUAForGlobalAccount(t *testing.T) {
+// TestChatUAForGlobalAccount chat UA 直接取 profile 字面量，按 realm 分档；
+// 品牌段来自 CLI product.json 的 applicationName（global = workbuddy-ai）。
+func TestChatUAForGlobalAccount(t *testing.T) {
 	t.Parallel()
 
 	client := newProfileClient(t)
@@ -181,22 +181,26 @@ func TestDesktopUAForGlobalAccount(t *testing.T) {
 
 	str := client.defaultWorkBuddyUAFor(global)
 	if want := "WorkBuddy/9.9.10"; !contains(str, want) {
-		t.Errorf("global desktop UA = %q, want it to contain %q", str, want)
+		t.Errorf("global chat UA = %q, want it to contain %q", str, want)
+	}
+
+	if !contains(str, "workbuddy-ai/9.9.10") {
+		t.Errorf("global chat UA = %q, want workbuddy-ai/9.9.10 brand segment", str)
 	}
 
 	if !contains(str, "CLI/8.8.9") {
-		t.Errorf("global desktop UA = %q, want CLI/8.8.9 segment", str)
+		t.Errorf("global chat UA = %q, want CLI/8.8.9 segment", str)
 	}
 
 	if contains(str, "WorkBuddy AI") {
-		t.Errorf("global desktop UA = %q, must not contain 'WorkBuddy AI'", str)
+		t.Errorf("global chat UA = %q, must not contain 'WorkBuddy AI'", str)
 	}
-	// CN 账号版本分档为 9.9.9。
+	// CN 账号版本分档为 9.9.9，品牌段仍为 WorkBuddy。
 	cn := &auth.Auth{UID: "u2", Domain: "copilot.tencent.com"}
 	cn.BackfillRealm()
 
-	if ua := client.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/9.9.9") {
-		t.Errorf("cn desktop UA = %q, want WorkBuddy/9.9.9", ua)
+	if ua := client.defaultWorkBuddyUAFor(cn); !contains(ua, "WorkBuddy/9.9.9 WorkBuddy/9.9.9") {
+		t.Errorf("cn chat UA = %q, want WorkBuddy/9.9.9 WorkBuddy/9.9.9", ua)
 	}
 }
 
