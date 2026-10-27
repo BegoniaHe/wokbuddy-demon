@@ -2636,17 +2636,29 @@ func mergeModelInfos(primary, secondary []ModelInfo) []ModelInfo {
 	return out
 }
 
-// fetchEnterpriseModels 单路探测企业模型端点（/console/enterprises/personal/models）。
+// fetchEnterpriseModels 单路探测企业模型端点
+// （/console/enterprises/<enterpriseId|personal>/models）。
 // 解析口径：官方默认会话 agent.models 过滤 + nonChatModel 剔除 + disabled 剔除；
 // 同时返回该来源的默认 agent 判定，供 v3 独有模型兜底。
 func (c *Client) fetchEnterpriseModels(
 	account7 *auth.Auth,
 ) ([]ModelInfo, modelChatWhitelist, error) {
-	// CN 端点顺序：/console 兼容旧路径；空/缺 agent models 时回落 /v2 企业端点，
-	// /v2 仍无 agent models 时接受完整 models（官方目录兜底）。
+	// 官方 CloudAgentProvider.getModels() 按账号 enterpriseId 拼 /console 路径，
+	// 个人号回落 personal。CN 端点顺序：/console 兼容旧路径；空/缺 agent models
+	// 时回落 /v2 企业端点（官方 daemon 侧固定 personal），/v2 仍无 agent models
+	// 时接受完整 models（官方目录兜底）。
+	enterprise := "personal"
+	if id := account7.EnterpriseID; id != "" {
+		enterprise = url.PathEscape(id)
+	}
+
 	var lastErr error
 
-	for i, path := range []string{"/console/enterprises/personal/models", "/v2/enterprises/personal/models"} {
+	paths := []string{
+		"/console/enterprises/" + enterprise + "/models",
+		"/v2/enterprises/personal/models",
+	}
+	for i, path := range paths {
 		out, chat, err := c.fetchEnterpriseModelsPath(account7, path, i > 0)
 		if err == nil {
 			return out, chat, nil
