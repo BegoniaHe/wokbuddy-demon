@@ -108,6 +108,17 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 基线包内 `X-Agent-Runtime` 0 命中（对应 CLI 2.161.0）；保留该头的依据是更晚 CLI 的
 搜索端点观测，待新基线复核。版本值仍只来自部署 profile，不进入仓库内置常量。
 
+chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
+
+| 项 | 状态 | 依据 |
+| --- | --- | --- |
+| refresh trace（`X-Trace-Id` / `Traceparent` / `B3` / `X-B3-*`） | 已对齐 | 官方 `cli/dist/codebuddy-lite-wb.mjs` 的 `AccountScopedAuth.refreshSession()` 追加 `traceSpan.requestHeaders`；网关无活动 span，故生成自洽的新链路 id |
+| CN refresh `X-Domain` | 已对齐 | 官方 `enterpriseHeaders()` 无 domain 时回落 endpoint authority；本仓回落 chat endpoint host，`cn.chat_base` 覆盖时跟随 |
+| `X-Stainless-*` | 不补 | 由 OpenAI Node SDK 自动生成；本仓出站不是 Node SDK，补等于伪造 SDK 运行时版本 |
+| `X-Codebuddy-Request: 1` | 刻意保留 | D1 风控闸门头；官方 chat adapter 未注入、daemon/ACP 注入，但无实测证明移除安全 |
+| 个人号 `X-No-Enterprise-Id` / `X-No-Department-Info` | 刻意保留 | 非 chat 端点也声明无部门信息（#298），按 chat-only 收窄会回退该修复 |
+| custom model 的 `X-Private-Data` | 不适用 | 本仓没有 custom 模型上游路由（`isCustomModel` 仅用于模型目录可见性），无触达路径 |
+
 桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。
 
 ## 七、参考 fork 审计工具（sync-upstream 技能）
