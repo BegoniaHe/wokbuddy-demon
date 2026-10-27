@@ -83,11 +83,14 @@ type SearchOutcome struct {
 //   - Accept：搜索是非流式 JSON（ChatHeaders 为 chat 流式设成 event-stream，必须覆盖）
 //   - Content-Type：官方带 charset（CommonHeaders 的 chat 形态不带）
 //   - X-Agent-Intent：官方固定 "craft"（搜索请求不携带会话 mode）
-//   - X-Agent-Runtime：官方 2.166.0 起必发，无 runtime 时回落 "other"
+//   - X-Agent-Runtime：5.8.3 / 5.8.4 基线包内无该头（对应 CLI 2.161.0）；
+//     保留依据是更晚 CLI 的搜索端点观测，待新基线复核
 //
 // 为什么整体复用而不是照抄官方精简头清单：官方 CLI 的搜索头就是它同一个客户端的
 // 通用头（chat 与搜索共用同一 UA 与会话头族）。本仓库出站身份是桌面端，若搜索另发
 // 一套精简头，上游会看到「同账号同时段两种客户端指纹」，反而更像异常。
+// 决策记录见 `internal/upstream/UPSTREAM.md` §六：非 chat 端点沿用统一桌面指纹，
+// 不按 surface 拆分；改动前先看该记录。
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一口径（公开 API 简单）。
 func (c *Client) SearchHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {

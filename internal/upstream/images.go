@@ -27,6 +27,7 @@ const imageResponseMaxBytes = 64 << 20
 var errImageResponseTooLarge = errors.New("image response too large")
 
 // ImagesHeaders 出图请求头：复用 chat 头族，但 Accept 改回 JSON（非 SSE）。
+// 统一指纹是刻意取舍，理由与边界见 `internal/upstream/UPSTREAM.md` §六。
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
 func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {
