@@ -167,9 +167,10 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, map[string]any{keyInputTokens: tokens})
 }
 
-// countTokensModelVisible 校验 count_tokens 的模型黑名单（models.hidden）：
-// 与 /v1/messages 同口径地把模型解析到最终 (realm, bare) 后判定，隐藏即 400。
-// 判定**先于**命名密钥白名单（隐藏模型不给任何 key 放行）。
+// countTokensModelVisible 校验 count_tokens 的模型可见性（models.hidden 黑名单与
+// models.allowed 部署级白名单）：与 /v1/messages 同口径地把模型解析到最终
+// (realm, bare) 后判定，隐藏或不在白名单内即 400。
+// 判定**先于**命名密钥白名单（部署策略不给任何 key 放行）。
 func (h *Handler) countTokensModelVisible(w http.ResponseWriter, r *http.Request, model string) bool {
 	keyRealm := keyRealmFrom(r.Context())
 
@@ -179,14 +180,21 @@ func (h *Handler) countTokensModelVisible(w http.ResponseWriter, r *http.Request
 		return true
 	}
 
-	if !h.modelHidden(realm, bare) {
-		return true
+	if h.modelHidden(realm, bare) {
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq,
+			"model is hidden by gateway config (models.hidden); pick another model", "")
+
+		return false
 	}
 
-	writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq,
-		"model is hidden by gateway config (models.hidden); pick another model", "")
+	if !h.modelAllowedByConfig(realm, bare) {
+		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq,
+			"model is not in the gateway allowlist (models.allowed); pick another model", "")
 
-	return false
+		return false
+	}
+
+	return true
 }
 
 // countTokensModelAllowed 校验 count_tokens 的命名密钥模型白名单；与

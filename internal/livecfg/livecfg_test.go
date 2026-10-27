@@ -79,3 +79,47 @@ func TestSnapshotHiddenModels(t *testing.T) {
 		t.Error("Store 后应包含 global:mm")
 	}
 }
+
+// TestNormalizeAllowedModels models.allowed 与 hidden 同语法：裸名展开两域、
+// 带前缀只放行该域、空白/重复丢弃、空 → nil（不启用）。
+func TestNormalizeAllowedModels(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   []string
+		want map[string]struct{}
+	}{
+		{
+			name: "裸名两域都放行",
+			in:   []string{"glm-5.2"},
+			want: map[string]struct{}{"cn:glm-5.2": {}, "global:glm-5.2": {}},
+		},
+		{
+			name: "cn 前缀只放行 cn",
+			in:   []string{"cn:kimi-k3", "  glm-5.2  ", ""},
+			want: map[string]struct{}{"cn:kimi-k3": {}, "cn:glm-5.2": {}, "global:glm-5.2": {}},
+		},
+		{
+			name: "空名单不启用",
+			in:   nil,
+			want: nil,
+		},
+		{
+			name: "全空项不启用",
+			in:   []string{"", "  ", "cn:"},
+			want: nil,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := NormalizeAllowedModels(testCase.in)
+			if !reflect.DeepEqual(got, testCase.want) {
+				t.Errorf("NormalizeAllowedModels(%v)=%v want %v", testCase.in, got, testCase.want)
+			}
+		})
+	}
+}

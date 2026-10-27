@@ -998,6 +998,7 @@ func liveSnapshot(cfg *Config) livecfg.Snapshot {
 		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
 		BackgroundTarget:     cfg.Models.BackgroundTarget,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		AllowedModels:        livecfg.NormalizeAllowedModels(cfg.Models.Allowed),
 	}
 }
 

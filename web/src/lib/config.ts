@@ -78,6 +78,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'background_names', path: ['models', 'background_names'], kind: 'list' },
   { name: 'background_target', path: ['models', 'background_target'], kind: 'text' },
   { name: 'hidden_models', path: ['models', 'hidden'], kind: 'list' },
+  { name: 'allowed_models', path: ['models', 'allowed'], kind: 'list' },
   { name: 'client_version', path: ['upstream', 'client_version'], kind: 'text' },
   { name: 'cli_version', path: ['upstream', 'cli_version'], kind: 'text' },
   { name: 'client_name', path: ['upstream', 'client_name'], kind: 'text' },

@@ -133,6 +133,9 @@ type Config struct {
 	// HiddenModels 模型黑名单（"cn:x"/"global:x" 归一形式）；空 = 关闭。
 	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
 	HiddenModels map[string]struct{}
+	// AllowedModels 部署级模型白名单（"cn:x"/"global:x" 归一形式）；空 = 不启用。
+	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
+	AllowedModels map[string]struct{}
 	// BackgroundNames 后台模型改写名单（小写；issue #103）；空 = 关闭。
 	BackgroundNames map[string]bool
 	// BackgroundTarget 后台模型改写目标（issue #103）。
@@ -194,6 +197,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		BackgroundNames:    h.cfg.BackgroundNames,
 		BackgroundTarget:   h.cfg.BackgroundTarget,
 		HiddenModels:       h.cfg.HiddenModels,
+		AllowedModels:      h.cfg.AllowedModels,
 	}
 }
 
@@ -979,7 +983,8 @@ func (h *Handler) modelList() []map[string]any {
 	models := h.fetchDynamicModels()
 	for i := range models {
 		// 按上游裸模型名判定：条目 id 是 "cn:<model>" 形态，直接用会永远匹配不到。
-		if h.modelHidden("cn", models[i].ID) {
+		// 黑名单与白名单都在这一层收口：白名单外不列出。
+		if h.modelHidden("cn", models[i].ID) || !h.modelAllowedByConfig("cn", models[i].ID) {
 			continue
 		}
 
@@ -1009,6 +1014,10 @@ func (h *Handler) appendGlobalModelEntries(
 	for _, entry := range entries {
 		id, ok := entry["id"].(string)
 		if ok && h.modelHidden("global", strings.TrimPrefix(id, "global:")) {
+			continue
+		}
+
+		if ok && !h.modelAllowedByConfig("global", strings.TrimPrefix(id, "global:")) {
 			continue
 		}
 
@@ -1088,14 +1097,9 @@ func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string
 
 	for _, name := range names {
 		upstreamID := normalizeAliasTarget(h.cfg.ModelAliases[name])
-		// 别名条目同样受黑名单约束：别名名字本身或其目标模型被隐藏时都不列出
-		// （否则「藏起来的模型」会经由别名泄露）。
-		realm, bare, _ := splitRealm(upstreamID)
-		if h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
-			continue
-		}
-		// 官方默认会话 agent 隐藏的模型也不经别名泄露；目标不在目录时保持现状。
-		if aliasChatHidden(upstreamID, name, realm, chatHidden) {
+		// 别名条目同样受黑名单/部署级白名单/官方 agent 可见性约束：任一层拒绝都
+		// 不列出（否则被藏起来/未放行的模型会经由别名泄露）。
+		if h.aliasExcluded(upstreamID, name, chatHidden) {
 			continue
 		}
 
@@ -1117,6 +1121,21 @@ func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string
 	}
 
 	return out
+}
+
+// aliasExcluded 别名条目是否应被排除：别名名字或目标命中 models.hidden、
+// models.allowed 白名单外，或被官方默认会话 agent 隐藏。
+func (h *Handler) aliasExcluded(upstreamID, name string, chatHidden map[string]bool) bool {
+	realm, bare, _ := splitRealm(upstreamID)
+	if h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
+		return true
+	}
+
+	if !h.modelAllowedByConfig(realm, bare) || !h.modelAllowedByConfig(realm, name) {
+		return true
+	}
+
+	return aliasChatHidden(upstreamID, name, realm, chatHidden)
 }
 
 // aliasChatHidden 别名目标或别名名字命中官方 agent 隐藏集合时返回 true。
@@ -1455,6 +1474,11 @@ func (h *Handler) serveChat(r *http.Request, input *chatInput, out chatResponder
 	defer chatFlow2.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
 	defer chatFlow2.recordKeyUsage()
+	// 部署级白名单（models.allowed）先于黑名单：两者都是部署策略，先收窄可见集合
+	// 再剔除。判定点与黑名单/命名密钥白名单同处（后台改写/别名解析之后）。
+	if !chatFlow2.checkConfigAllowlist() {
+		return
+	}
 	// 模型黑名单（models.hidden）先于命名密钥白名单：隐藏模型不给任何 key 放行，
 	// 避免「key 白名单」变相解禁。判定点与白名单同处（后台改写/别名解析之后）。
 	if !chatFlow2.checkModelHidden() {
@@ -1469,7 +1493,11 @@ func (h *Handler) serveChat(r *http.Request, input *chatInput, out chatResponder
 	if !chatFlow2.applyModalityRoute() {
 		return
 	}
-	// 模态路由可能改写模型：按改写后的最终模型复核隐藏与白名单，避免绕过。
+	// 模态路由可能改写模型：按改写后的最终模型复核白名单与隐藏，避免绕过。
+	if !chatFlow2.checkConfigAllowlist() {
+		return
+	}
+
 	if !chatFlow2.checkModelHidden() {
 		return
 	}
@@ -1515,6 +1543,40 @@ func (h *Handler) modelHidden(realm, model string) bool {
 	}
 
 	_, ok := hidden[realm+":"+model]
+
+	return ok
+}
+
+// checkConfigAllowlist 校验部署级模型白名单（models.allowed）：白名单外即 400
+// model_unavailable，不打上游、不占选号。与 checkModelAllowed（命名密钥 glob
+// 白名单）是两套语义：两者都通过才放行（取交集）。
+func (f *chatFlow) checkConfigAllowlist() bool {
+	if f.h.modelAllowedByConfig(f.realm, f.bareModel) {
+		return true
+	}
+
+	f.out.Error(http.StatusBadRequest, "model_unavailable",
+		"model is not in the gateway allowlist (models.allowed); pick another model", "")
+	f.st.status = http.StatusBadRequest
+	f.st.outcome = reqlog.OutcomeHTTPError
+
+	return false
+}
+
+// modelAllowedByConfig 报告 (realm, model) 是否在部署级白名单 models.allowed 内。
+// 白名单为空 = 不启用（放行全部）；键为归一后的 "realm:model"（裸名已展开两域，
+// 因此 cn:x 不会自动放行 global:x）。
+func (h *Handler) modelAllowedByConfig(realm, model string) bool {
+	allowed := h.loadLive().AllowedModels
+	if len(allowed) == 0 {
+		return true
+	}
+
+	if model == "" {
+		return false
+	}
+
+	_, ok := allowed[realm+":"+model]
 
 	return ok
 }
@@ -1580,6 +1642,12 @@ func (h *Handler) crossRealmAllowed(input *chatInput, realm, bareModel string) b
 	}
 
 	if h.cfg.Pool == nil || !h.cfg.Pool.CrossDomainFallback() {
+		return false
+	}
+
+	// 部署级白名单按域限定时（如 models.allowed=["cn:x"]），另一域的服务不能借同一
+	// 裸名绕过域作用域：与命名密钥的域限定白名单同口径，两域都放行才允许回退。
+	if !h.modelAllowedByConfig(otherRealm(realm), bareModel) {
 		return false
 	}
 

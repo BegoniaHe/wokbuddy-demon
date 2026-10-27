@@ -13,6 +13,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -395,5 +396,53 @@ func TestCrossDomainFallbackRecomputesAuthorizationAfterModalityRoute(t *testing
 
 	if got := fixture.calls("Bearer at-global"); got != 0 {
 		t.Errorf("授权只覆盖原模型时不得用改选后的模型跨域，calls=%d", got)
+	}
+}
+
+// TestCrossDomainFallbackHonorsConfigAllowlistModels 部署级白名单 models.allowed 若
+// 按域限定（如 cn:glm-5.2），跨域回退不得让裸名模型借另一域的服务绕过域作用域；
+// 裸名白名单展开两域，回退仍应生效。
+func TestCrossDomainFallbackHonorsConfigAllowlistModels(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		allowed   []string
+		wantOK    bool
+		wantCalls int
+	}{
+		{"cn 限定的白名单不回退", []string{"cn:glm-5.2"}, false, 0},
+		{"任意域白名单允许回退", []string{"glm-5.2"}, true, 1},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			fixture, client := newCrossDomainFixture(t, true, func(string) (int, string, bool) {
+				return http.StatusOK, sseOK, true
+			})
+			fixture.pool.SetCrossDomainFallback(true)
+
+			handler := NewHandler(&Config{
+				Pool:          fixture.pool,
+				Upstream:      client,
+				AllowedModels: livecfg.NormalizeAllowedModels(testCase.allowed),
+			})
+
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+				strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if ok := rec.Code == http.StatusOK; ok != testCase.wantOK {
+				t.Fatalf("跨域回退结果=%v want %v，code=%d body=%s", ok, testCase.wantOK, rec.Code, rec.Body)
+			}
+
+			if got := fixture.calls("Bearer at-global"); got != testCase.wantCalls {
+				t.Errorf("global 上游调用次数=%d want %d", got, testCase.wantCalls)
+			}
+		})
 	}
 }
