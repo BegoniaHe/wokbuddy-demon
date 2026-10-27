@@ -1306,11 +1306,14 @@ type Client struct {
 	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 传入 ChatStream。
 	PassthroughIP bool
 
-	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：config upstream.device_token。
+	// DeviceToken 签到专用设备风控 Token（X-Device-Token 头）全局兜底来源：
+	// config upstream.device_token。官方只在该头的 auth/state 与签到消费点使用，
+	// 本仓只在签到路径注入（见 checkinHeaders）。
 	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
 	DeviceToken string
 
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
+	// 与 DeviceToken 同口径：只用于签到。
 	DeviceTokenFile string
 
 	// BalanceObserver 余额观测回调（可选）：每次成功查询余额后回调 (uid, remain, total)，
@@ -1530,29 +1533,31 @@ func (*Client) chatPaths(a *auth.Auth) []string {
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
 // 统一走 billingJSON 发请求。
 const (
-	billingMeterPath   = "/billing/meter/get-user-resource"    // global 首选（国际版无 /v2 前缀）
-	dailyCheckinPath   = "/billing/meter/daily-checkin"        // global 首选
-	billingMeterPathV2 = "/v2/billing/meter/get-user-resource" // CN 现状 / global fallback
+	// 官方 5.9.3 桌面端 `resourcePrefix` 是空串：get-user-resource / summary /
+	// packages 都只发无前缀路径，`/v2` 仅作 404 回落（resume 旧网关形态）。
+	billingMeterPath   = "/billing/meter/get-user-resource"
+	dailyCheckinPath   = "/billing/meter/daily-checkin"
+	billingMeterPathV2 = "/v2/billing/meter/get-user-resource"
 	dailyCheckinPathV2 = "/v2/billing/meter/daily-checkin"
 
+	// 签到是例外：官方 DesktopAccountRepo.billingPrefix 覆写成 `/v2`，
+	// checkin-activity-status / daily-checkin 才带 `/v2`。
 	checkinActivityStatusPath = "/v2/billing/meter/checkin-activity-status"
+
+	resourceSummaryPath   = "/billing/meter/get-user-resource-summary"
+	resourceSummaryPathV2 = "/v2/billing/meter/get-user-resource-summary"
 )
 
-// billingMeterPaths 按 realm 返回 billing/meter 域路径候选序列：
-// global → [无 /v2, 有 /v2]；cn → [有 /v2, 无 /v2]（官方桌面 CN 的 resourcePrefix
-// 为空串，无 /v2 是官方形态；保留 /v2 优先以维持现状，404 再回落）。
-// 仅作用于 get-user-resource / daily-checkin（/billing/meter/* 族）；report /v2/report
+// billingMeterPaths 返回 billing/meter 域路径候选序列：两 realm 一致的无前缀优先、
+// 404 回落 `/v2`。官方桌面端 `resourcePrefix` 为空串，故不再按 realm 分叉；
+// 签到例外见 checkinMeterPaths。仅作用于 /billing/meter/* 族；report `/v2/report`
 // 不参与，其他 billing 端点（growth 等）路径不含 /billing/meter 前缀，走原常量不受影响。
-func (c *Client) billingMeterPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{billingMeterPath, billingMeterPathV2}
-	}
-
-	return []string{billingMeterPathV2, billingMeterPath}
+func (*Client) billingMeterPaths(*auth.Auth) []string {
+	return []string{billingMeterPath, billingMeterPathV2}
 }
 
 // checkinMeterPaths 签到路径候选：两 realm 均 `/v2` 优先，404 时回落无 `/v2`
-// （官方桌面端 billingPrefix=/v2；旧路径保留 fallback）。
+// （官方 DesktopAccountRepo.billingPrefix=/v2；旧路径保留 fallback）。
 func (*Client) checkinMeterPaths(a *auth.Auth) []string {
 	return []string{dailyCheckinPathV2, dailyCheckinPath}
 }
@@ -4149,16 +4154,19 @@ type resourceSummaryResp struct {
 }
 
 // fetchResourceSummary 查询额度汇总（官方桌面端主路径）。
+// 官方 5.9.3 `resourcePrefix` 为空串：无前缀路径优先，404 回落 `/v2`。
+// Accept-Language 只在这类 summary / packages 请求上带（官方由调用方注入 zh/en）。
 func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, error) {
 	var data json.RawMessage
 
 	err := c.retryBillingTransient(func() error {
 		var fetchErr error
 
-		data, fetchErr = c.billingMeterJSON(account, []string{
-			"/v2/billing/meter/get-user-resource-summary",
-			"/billing/meter/get-user-resource-summary",
-		}, map[string]any{})
+		data, fetchErr = c.billingMeterJSONHeaders(account,
+			[]string{resourceSummaryPath, resourceSummaryPathV2},
+			map[string]any{},
+			map[string]string{"Accept-Language": billingAcceptLanguage(account)},
+		)
 
 		return fetchErr
 	})
@@ -4334,6 +4342,8 @@ func (c *Client) collectPackageExpiry(
 }
 
 // fetchPackagePage 拉取一页积分包。
+// 官方 packages 分页同样是无前缀优先（resourcePrefix 空串），`/v2` 仅作 404 回落；
+// 该端点由调用方带 Accept-Language（zh / en），其余 billing 端点不发。
 func (c *Client) fetchPackagePage(
 	account *auth.Auth, path string, base map[string]any, page int,
 ) (packagePageResp, error) {
@@ -4341,7 +4351,9 @@ func (c *Client) fetchPackagePage(
 	body["PageNumber"] = page
 	body["PageSize"] = 100
 
-	data, err := c.billingMeterJSON(account, []string{"/v2" + path, path}, body)
+	data, err := c.billingMeterJSONHeaders(account, []string{path, "/v2" + path}, body,
+		map[string]string{"Accept-Language": billingAcceptLanguage(account)},
+	)
 	if err != nil {
 		return packagePageResp{}, err
 	}
@@ -4811,9 +4823,10 @@ func cyclePackageAmounts(account respAccount) (remain, used, size int64) {
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
+// 签到是 X-Device-Token 的两个消费点之一（另一个是 auth/state），见 checkinHeaders。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
 	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), map[string]any{})
+		_, err := c.billingMeterJSONHeaders(a, c.checkinMeterPaths(a), map[string]any{}, c.checkinHeaders(a))
 		return err
 	})
 }
@@ -4821,7 +4834,9 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 // CheckinActivityStatus 查询签到活动状态（官方桌面端 checkin-activity-status）。
 // 返回 today_checked_in；请求失败时调用方回落直接签到路径。
 func (c *Client) CheckinActivityStatus(a *auth.Auth) (todayChecked bool, err error) {
-	data, err := c.billingMeterJSON(a, []string{checkinActivityStatusPath}, map[string]any{})
+	data, err := c.billingMeterJSONHeaders(
+		a, []string{checkinActivityStatusPath}, map[string]any{}, c.checkinHeaders(a),
+	)
 	if err != nil {
 		return false, err
 	}

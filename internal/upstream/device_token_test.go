@@ -15,57 +15,80 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// TestDeviceTokenInjected_WhenSet auth.Auth.DeviceToken 非空时 chat/billing 请求均注入。
-func TestDeviceTokenInjected_WhenSet(t *testing.T) {
+// TestDeviceTokenInjectedOnCheckinOnly 官方 5.9.3 只在该头的 auth/state 与签到消费点
+// 发 X-Device-Token：daily-checkin / checkin-activity-status 注入，chat / report /
+// balance 都不带（#342）。
+func TestDeviceTokenInjectedOnCheckinOnly(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth"}
-	// 用 server 端验证而非 RoundTripper 捕获：更贴近真实注入路径。
-	for _, testCase := range []struct {
-		name     string
-		apply    func(c *Client, req *http.Request)
-		wantPath string
+
+	var mu sync.Mutex
+
+	seen := map[string]string{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.URL.Path] = r.Header.Get("X-Device-Token")
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"today_checked_in":true}}`))
+	}))
+	defer srv.Close()
+
+	client := &Client{
+		HTTP:          srv.Client(),
+		ChatHTTP:      srv.Client(),
+		ChatBaseCN:    srv.URL,
+		BillingBaseCN: srv.URL,
+	}
+
+	if err := client.DailyCheckin(account); err != nil {
+		t.Fatalf("daily-checkin: %v", err)
+	}
+
+	if _, err := client.CheckinActivityStatus(account); err != nil {
+		t.Fatalf("checkin-activity-status: %v", err)
+	}
+
+	for _, surface := range []struct {
+		path  string
+		apply func(*http.Request)
 	}{
-		{"chat", func(c *Client, req *http.Request) { c.ChatHeaders(req, account, "", ChatMeta{}) }, "/v2/chat/completions"},
-		{"billing", func(c *Client, req *http.Request) { c.BillingHeaders(req, account) }, "/v2/report"},
+		{"/v2/chat/completions", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
+		{"/v2/report", func(req *http.Request) { client.BillingHeaders(req, account) }},
+		{"/billing/meter/get-user-resource", func(req *http.Request) { client.BillingHeaders(req, account) }},
 	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+surface.path, nil)
+		surface.apply(req)
 
-			var got string
+		resp, err := client.HTTP.Do(req)
+		if err != nil {
+			t.Fatalf("%s do: %v", surface.path, err)
+		}
 
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				got = r.Header.Get("X-Device-Token")
+		resp.Body.Close()
+	}
 
-				w.WriteHeader(http.StatusOK)
-				_, _ = w.Write([]byte(`{"code":0}`))
-			}))
-			defer srv.Close()
+	want := map[string]string{
+		"/v2/billing/meter/daily-checkin":           "tok-from-auth",
+		"/v2/billing/meter/checkin-activity-status": "tok-from-auth",
+		"/v2/chat/completions":                      "",
+		"/v2/report":                                "",
+		"/billing/meter/get-user-resource":          "",
+	}
 
-			client := &Client{
-				HTTP:          srv.Client(),
-				ChatHTTP:      srv.Client(),
-				ChatBaseCN:    srv.URL,
-				BillingBaseCN: srv.URL,
-			}
-			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+testCase.wantPath, nil)
-			testCase.apply(client, req)
-
-			resp, err := client.HTTP.Do(req)
-			if err != nil {
-				t.Fatalf("do: %v", err)
-			}
-
-			resp.Body.Close()
-
-			if got != "tok-from-auth" {
-				t.Errorf("X-Device-Token = %q want %q", got, "tok-from-auth")
-			}
-		})
+	for path, wantTok := range want {
+		if got, ok := seen[path]; !ok {
+			t.Errorf("%s: 未观察到请求", path)
+		} else if got != wantTok {
+			t.Errorf("%s: X-Device-Token = %q want %q", path, got, wantTok)
+		}
 	}
 }
 
-// TestDeviceTokenNotInjected_WhenEmpty 所有来源皆空时不注入该头。
+// TestDeviceTokenNotInjected_WhenEmpty 所有来源皆空时签到也不注入该头。
 func TestDeviceTokenNotInjected_WhenEmpty(t *testing.T) {
 	t.Parallel()
 
@@ -88,22 +111,17 @@ func TestDeviceTokenNotInjected_WhenEmpty(t *testing.T) {
 		BillingBaseCN: srv.URL,
 		// DeviceToken / DeviceTokenFile 皆空
 	}
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/v2/chat/completions", nil)
-	client.ChatHeaders(req, account, "", ChatMeta{})
 
-	resp, err := client.HTTP.Do(req)
-	if err != nil {
-		t.Fatalf("do: %v", err)
+	if err := client.DailyCheckin(account); err != nil {
+		t.Fatalf("daily-checkin: %v", err)
 	}
-
-	resp.Body.Close()
 
 	if got != "" {
 		t.Errorf("X-Device-Token = %q want empty (not injected)", got)
 	}
 }
 
-// TestDeviceTokenFromConfigOrFile_Overrides 优先级：auth > config > 文件。
+// TestDeviceTokenFromConfigOrFile_Overrides 优先级：auth > config > 文件（签到注入面）。
 // auth 有值时覆盖 config；auth 空时 config 兜底；auth 与 config 皆空时读文件。
 func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
 	t.Parallel()
@@ -151,15 +169,10 @@ func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
 				DeviceToken:     testCase.cfg,
 				DeviceTokenFile: filePath,
 			}
-			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+"/v2/chat/completions", nil)
-			client.ChatHeaders(req, account, "", ChatMeta{})
 
-			resp, err := client.HTTP.Do(req)
-			if err != nil {
-				t.Fatalf("do: %v", err)
+			if err := client.DailyCheckin(account); err != nil {
+				t.Fatalf("daily-checkin: %v", err)
 			}
-
-			resp.Body.Close()
 
 			if got != testCase.want {
 				t.Errorf("X-Device-Token = %q want %q", got, testCase.want)

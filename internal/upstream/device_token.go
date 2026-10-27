@@ -2,8 +2,9 @@
 //
 // 容器内无桌面端 Turing Shield SDK，无法像 Python fork（xiaofan6ya/converter.py）那样
 // 现取 token。这里提供另一条路径：宿主把桌面端生成的 device token 落 /app/data/device_token
-// （或任意挂载路径），网关定期读取注入。读取频率限 5 分钟一次缓存，>1KB 或读失败则忽略
-// （优雅降级不注入，不影响主流程）。
+// （或任意挂载路径），网关定期读取注入**签到**请求（daily-checkin /
+// checkin-activity-status；官方也只在这两处消费该头）。读取频率限 5 分钟一次缓存，
+// >1KB 或读失败则忽略（优雅降级不注入，不影响主流程）。
 package upstream
 
 import (
