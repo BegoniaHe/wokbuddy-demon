@@ -87,10 +87,16 @@ type Event struct {
 	HasCredit        bool    `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
-	ClientIP        string `json:"client_ip,omitempty"`
-	UserAgent       string `json:"user_agent,omitempty"`
+	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
+	// ToolsDeclared / ToolCalls 工具面统计（issue #329）：声明数只数本请求
+	// tools/functions（不含会话历史），调用数只数实际产生的 tool_call 条数。
+	// 两者都 omitempty：ToolsDeclared 缺失 = 本请求没声明 tools（不进分母），
+	// ToolsDeclared 存在而 ToolCalls 缺失 = 声明了但零调用（这是要观察的形态）。
+	ToolsDeclared int    `json:"tools_declared,omitempty"`
+	ToolCalls     int    `json:"tool_calls,omitempty"`
+	ClientIP      string `json:"client_ip,omitempty"`
+	UserAgent     string `json:"user_agent,omitempty"`
 	// Decision 可选选号决策链（logging.decision_trace，issue #63）；默认不记录。
 	Decision *DecisionTrace `json:"decision,omitempty"`
 }

@@ -441,27 +441,39 @@ func TestMarkupRepairConvertedCounter(t *testing.T) {
 
 // --- 工具名单提取 -----------------------------------------------------------
 
-func TestToolNameAllowlist(t *testing.T) {
+// TestToolFacts 名单是「声明 ∪ 历史」，声明数只数本请求 tools/functions：
+// 历史里出现过的工具名不能进 declared（否则多轮会话会把声明数放大）。
+func TestToolFacts(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name string
-		body string
-		want []string
+		name         string
+		body         string
+		want         []string
+		wantDeclared int
 	}{
 		{"openai 形态", `{"tools":[{"type":"function","function":{"name":"exec_command"}},
-			{"type":"function","function":{"name":"write_stdin"}}]}`, []string{"exec_command", "write_stdin"}},
-		{"responses 裸 name", `{"tools":[{"type":"function","name":"exec_command"}]}`, []string{"exec_command"}},
-		{"旧版 functions", `{"functions":[{"name":"exec_command"}]}`, []string{"exec_command"}},
-		{"历史 tool_calls", `{"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"exec_command"}}]}]}`, []string{"exec_command"}},
-		{"历史 function_call", `{"messages":[{"role":"assistant","function_call":{"name":"exec_command"}}]}`, []string{"exec_command"}},
-		{"无工具", `{"model":"x","messages":[]}`, nil},
-		{"空 tools", `{"tools":[]}`, nil},
-		{"非法 JSON", `{`, nil},
-		{"名字为空", `{"tools":[{"type":"function","function":{"name":""}}]}`, nil},
+			{"type":"function","function":{"name":"write_stdin"}}]}`, []string{"exec_command", "write_stdin"}, 2},
+		{"responses 裸 name", `{"tools":[{"type":"function","name":"exec_command"}]}`, []string{"exec_command"}, 1},
+		{"旧版 functions", `{"functions":[{"name":"exec_command"}]}`, []string{"exec_command"}, 1},
+		{"声明去重", `{"tools":[{"type":"function","function":{"name":"exec_command"}},
+			{"type":"function","name":"exec_command"}]}`, []string{"exec_command"}, 1},
+		{"历史 tool_calls", `{"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"exec_command"}}]}]}`, []string{"exec_command"}, 0},
+		{"历史 function_call", `{"messages":[{"role":"assistant","function_call":{"name":"exec_command"}}]}`, []string{"exec_command"}, 0},
+		{
+			"声明+历史不同名",
+			`{"tools":[{"type":"function","function":{"name":"exec_command"}}],
+			"messages":[{"role":"assistant","tool_calls":[{"function":{"name":"write_stdin"}}]}]}`,
+			[]string{"exec_command", "write_stdin"},
+			1,
+		},
+		{"无工具", `{"model":"x","messages":[]}`, nil, 0},
+		{"空 tools", `{"tools":[]}`, nil, 0},
+		{"非法 JSON", `{`, nil, 0},
+		{"名字为空", `{"tools":[{"type":"function","function":{"name":""}}]}`, nil, 0},
 	}
 	for _, testCase := range cases {
-		got := ToolNameAllowlist([]byte(testCase.body))
+		got, declared := ToolFacts([]byte(testCase.body))
 		if len(got) != len(testCase.want) {
 			t.Fatalf("%s: 工具数错误 want %v got %v", testCase.name, testCase.want, got)
 		}
@@ -470,6 +482,10 @@ func TestToolNameAllowlist(t *testing.T) {
 			if !got[n] {
 				t.Fatalf("%s: 缺少工具 %q（got %v）", testCase.name, n, got)
 			}
+		}
+
+		if declared != testCase.wantDeclared {
+			t.Fatalf("%s: declared want %d got %d", testCase.name, testCase.wantDeclared, declared)
 		}
 	}
 }

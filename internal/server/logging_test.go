@@ -750,3 +750,159 @@ func TestRequestMetricsRecordsNamedKeyID(t *testing.T) {
 		t.Fatalf("key id = %q want %q", snapshot.Recent[0].KeyID, keyRecord.ID)
 	}
 }
+
+// --- 工具面统计（issue #329）-------------------------------------------------
+
+// toolCallsSSE 两个工具调用：index=0 分三帧增量（首帧带 id），index=1 一帧完成。
+const toolCallsSSE = `data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"exec_command","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"cmd\":\"ls\"}"}}]}}]}
+
+data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"write_stdin","arguments":"{}"}}]}}]}
+
+data: {"id":"chatcmpl-t","object":"chat.completion.chunk","created":1753600000,"model":"glm-5.2","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+
+`
+
+// TestChatStatsReaderToolCallCount 流式 tool_calls 按 index 去重：同 index 多帧只算
+// 1 条；不同 index 各 1 条；旧式 function_call 计 1 条。
+func TestChatStatsReaderToolCallCount(t *testing.T) {
+	t.Parallel()
+
+	r := newChatStatsReaderSince(strings.NewReader(toolCallsSSE), time.Now())
+	_, _ = io.ReadAll(r)
+
+	if got := r.ToolCallCount(); got != 2 {
+		t.Fatalf("ToolCallCount=%d want 2（index 0 多帧去重 + index 1）", got)
+	}
+}
+
+// TestChatStatsReaderToolCallCountUntrackedForms 无 index 时按 id 去重、id 也没有时
+// 按帧计数；旧式 function_call 记 1 条。
+func TestChatStatsReaderToolCallCountUntrackedForms(t *testing.T) {
+	t.Parallel()
+
+	const sse = `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"name":"a"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"{}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"b","arguments":"{}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"function_call":{"name":"legacy","arguments":"{}"}}}]}
+
+data: [DONE]
+
+`
+
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.ReadAll(r)
+
+	// call_a 两帧去重 = 1，匿名 fragment = 1，旧式 function_call = 1。
+	if got := r.ToolCallCount(); got != 3 {
+		t.Fatalf("ToolCallCount=%d want 3", got)
+	}
+}
+
+// TestRequestMetricsToolCounters 归档里的「声明 / 调用」口径：流式与非流式、
+// 声明有调用与声明零调用都写入，未声明 tools 的请求两个字段都不出现。
+func TestRequestMetricsToolCounters(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		stream        bool
+		body          string
+		upstreamBody  string
+		wantDeclared  int
+		wantToolCalls int
+	}{
+		{
+			name:          "流式声明有调用",
+			stream:        true,
+			body:          `{"model":"glm-5.2","stream":true,"tools":[{"type":"function","function":{"name":"exec_command"}},{"type":"function","function":{"name":"write_stdin"}}],"messages":[]}`,
+			upstreamBody:  toolCallsSSE,
+			wantDeclared:  2,
+			wantToolCalls: 2,
+		},
+		{
+			name:          "流式声明零调用",
+			stream:        true,
+			body:          `{"model":"glm-5.2","stream":true,"tools":[{"type":"function","function":{"name":"exec_command"}}],"messages":[]}`,
+			upstreamBody:  sseOK,
+			wantDeclared:  1,
+			wantToolCalls: 0,
+		},
+		{
+			name:          "非流式声明有调用",
+			stream:        false,
+			body:          `{"model":"glm-5.2","tools":[{"type":"function","function":{"name":"exec_command"}},{"type":"function","function":{"name":"write_stdin"}}],"messages":[]}`,
+			upstreamBody:  toolCallsSSE,
+			wantDeclared:  2,
+			wantToolCalls: 2,
+		},
+		{
+			name:          "非流式声明零调用",
+			stream:        false,
+			body:          `{"model":"glm-5.2","tools":[{"type":"function","function":{"name":"exec_command"}}],"messages":[]}`,
+			upstreamBody:  sseOK,
+			wantDeclared:  1,
+			wantToolCalls: 0,
+		},
+		{
+			name:          "流式标记还原计入",
+			stream:        true,
+			body:          `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`,
+			upstreamBody:  markupUpstreamSSE(markupFixture("先读一遍控制器。\n\n", "ls -la")),
+			wantDeclared:  1,
+			wantToolCalls: 1,
+		},
+		{
+			name:          "非流式标记还原计入",
+			stream:        false,
+			body:          `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],` + declaredToolsBody + `}`,
+			upstreamBody:  markupUpstreamSSE(markupFixture("先读一遍控制器。\n\n", "ls -la")),
+			wantDeclared:  1,
+			wantToolCalls: 1,
+		},
+		{
+			name:         "只有历史没有声明",
+			stream:       true,
+			body:         `{"model":"glm-5.2","stream":true,"messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"exec_command","arguments":"{}"}}]}]}`,
+			upstreamBody: toolCallsSSE,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newFakeUpstream(t, func(string) (int, string, bool) {
+				return http.StatusOK, testCase.upstreamBody, true
+			})
+			reqLog := reqlog.New(reqlog.Config{})
+			handler := NewHandler(&Config{
+				Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+				Upstream:   client,
+				RequestLog: reqLog,
+			})
+
+			rec := postChat(t, handler, testCase.body)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+
+			s := reqLog.Snapshot()
+			if len(s.Recent) != 1 {
+				t.Fatalf("recent=%+v", s.Recent)
+			}
+
+			event := s.Recent[0]
+			if event.ToolsDeclared != testCase.wantDeclared || event.ToolCalls != testCase.wantToolCalls {
+				t.Fatalf("tools_declared=%d tool_calls=%d want %d/%d",
+					event.ToolsDeclared, event.ToolCalls, testCase.wantDeclared, testCase.wantToolCalls)
+			}
+		})
+	}
+}

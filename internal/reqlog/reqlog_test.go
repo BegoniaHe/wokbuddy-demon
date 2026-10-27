@@ -3,6 +3,7 @@ package reqlog
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -338,5 +339,93 @@ func TestArchivePruneHonorsSize(t *testing.T) {
 
 	if len(entries) != 1 || entries[0].Name() != "requests-2026-09-22.jsonl" {
 		t.Fatalf("remaining = %+v, want newest file only", entries)
+	}
+}
+
+// TestArchiveToolCounters JSONL 落盘与读回都保留 tools_declared / tool_calls，
+// 且 omitempty 生效：未声明 tools 的请求两条都不写（缺失 = 不进分母）。
+func TestArchiveToolCounters(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	recorder := writeToolCounterEvents(t, dir)
+
+	rows := readToolCounterRows(t, recorder)
+
+	byID := map[string]Event{}
+	for _, row := range rows {
+		byID[row.RequestID] = row
+	}
+
+	assertToolCounters(t, byID["declared-zero"], 3, 0)
+	assertToolCounters(t, byID["declared-called"], 2, 1)
+	assertToolCounters(t, byID["no-tools"], 0, 0)
+	assertToolCounterJSONL(t, dir)
+}
+
+// writeToolCounterEvents 落三条事件：声明零调用、声明有调用、未声明。
+func writeToolCounterEvents(t *testing.T, dir string) *Recorder {
+	t.Helper()
+
+	recorder := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 7})
+	base := time.Now().Add(-time.Minute)
+
+	recorder.Record(&Event{
+		Time: base, RequestID: "declared-zero", Status: 200, OK: true, Outcome: OutcomeSuccess,
+		ToolsDeclared: 3,
+	})
+	recorder.Record(&Event{
+		Time: base.Add(time.Second), RequestID: "declared-called", Status: 200, OK: true, Outcome: OutcomeSuccess,
+		ToolsDeclared: 2, ToolCalls: 1,
+	})
+	recorder.Record(&Event{
+		Time: base.Add(2 * time.Second), RequestID: "no-tools", Status: 200, OK: true, Outcome: OutcomeSuccess,
+	})
+	recorder.Close()
+
+	return recorder
+}
+
+func readToolCounterRows(t *testing.T, recorder *Recorder) []Event {
+	t.Helper()
+
+	rows, err := recorder.ReadArchive(10, &Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return rows
+}
+
+func assertToolCounters(t *testing.T, event2 Event, declared, calls int) {
+	t.Helper()
+
+	if event2.ToolsDeclared != declared || event2.ToolCalls != calls {
+		t.Fatalf("%s tools=%d/%d want %d/%d",
+			event2.RequestID, event2.ToolsDeclared, event2.ToolCalls, declared, calls)
+	}
+}
+
+// assertToolCounterJSONL 原始 JSONL：未声明 tools 的行不能出现这两个键（omitempty 是契约）。
+func assertToolCounterJSONL(t *testing.T, dir string) {
+	t.Helper()
+
+	files, err := filepath.Glob(filepath.Join(dir, "*"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("archive files = %v err=%v", files, err)
+	}
+
+	raw, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for line := range strings.SplitSeq(strings.TrimSpace(string(raw)), "\n") {
+		if strings.Contains(line, "no-tools") && strings.Contains(line, `"tools_declared"`) {
+			t.Fatalf("未声明 tools 的行不应写 tools_declared: %s", line)
+		}
+
+		if strings.Contains(line, "declared-zero") && !strings.Contains(line, `"tools_declared":3`) {
+			t.Fatalf("声明 tools 的行应写 tools_declared=3: %s", line)
+		}
 	}
 }

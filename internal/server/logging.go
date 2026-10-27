@@ -111,6 +111,11 @@ type chatStat struct {
 	// decision 可选选号决策链（logging.decision_trace）；nil = 未启用/未采样。
 	decision *reqlog.DecisionTrace
 
+	// toolsDeclared / toolCalls 工具面统计（issue #329）：仅在本请求声明了 tools 时
+	// 归档（未声明不进分母）；toolCalls > 0 才写 JSON（omitempty）。
+	toolsDeclared int
+	toolCalls     int
+
 	out     io.Writer
 	enabled bool
 	logged  bool
@@ -166,7 +171,14 @@ type chatStatsReader struct {
 	cacheHit     int
 	cacheMiss    int
 	hasCacheMiss bool
-	pend         []byte // 已读未返回的行缓存
+	// 工具调用去重计数（issue #329）：流式 tool_calls 是分片增量，按 index（OpenAI
+	// 形态）或 id（无 index 形态）去重；两者都没有时按「本帧一个匿名 fragment」计。
+	// 旧式 function_call 整块出现，记一条。仅用于归档统计，不影响透传字节。
+	toolCallIndexes    map[int]struct{}
+	toolCallIDs        map[string]struct{}
+	toolCallAnonymous  int
+	legacyFunctionCall bool
+	pend               []byte // 已读未返回的行缓存
 }
 
 // chatStatsReader 必须实现 io.Closer：keepalive 流返回前由 upstream 关闭并等待
@@ -330,11 +342,56 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 
 	if rawPayloadPresent(delta.ToolCalls) {
 		s.hasToolCall = true
+		s.noteToolCalls(delta.ToolCalls)
 	}
 	// 旧式 function_call（非 tool_calls）同样是可消费的实质输出；空占位 {} 除外。
 	if rawPayloadPresent(delta.FunctionCall) {
 		s.hasToolCall = true
+		s.legacyFunctionCall = true
 	}
+}
+
+// noteToolCalls 对流式 tool_calls 增量做去重计数（issue #329）：同一调用的首帧带
+// index 与 id，后续分片只带 index；按 index 去重即可，无 index 时按 id 兜底，
+// 两者都没有（个别上游一次性吐完整调用）按本帧一个 fragment 计。
+func (s *chatStatsReader) noteToolCalls(raw json.RawMessage) {
+	var calls []struct {
+		Index *int   `json:"index"`
+		ID    string `json:"id"`
+	}
+
+	if json.Unmarshal(raw, &calls) != nil {
+		return
+	}
+
+	for _, call := range calls {
+		switch {
+		case call.Index != nil:
+			if s.toolCallIndexes == nil {
+				s.toolCallIndexes = map[int]struct{}{}
+			}
+
+			s.toolCallIndexes[*call.Index] = struct{}{}
+		case call.ID != "":
+			if s.toolCallIDs == nil {
+				s.toolCallIDs = map[string]struct{}{}
+			}
+
+			s.toolCallIDs[call.ID] = struct{}{}
+		default:
+			s.toolCallAnonymous++
+		}
+	}
+}
+
+// ToolCallCount 本流实际产生的 tool_call 条数（去重后；不含正文标记还原出的调用）。
+func (s *chatStatsReader) ToolCallCount() int {
+	count := len(s.toolCallIndexes) + len(s.toolCallIDs) + s.toolCallAnonymous
+	if s.legacyFunctionCall {
+		count++
+	}
+
+	return count
 }
 
 // rawPayloadPresent 报告 JSON 片段是否是有效负载（排除空值/空数组/空对象占位）。
@@ -738,6 +795,11 @@ func applyChatStat(event *reqlog.Event, chatStat2 *chatStat) {
 	event.HasCredit = chatStat2.hasCredit
 	event.CacheHitTokens = chatStat2.cacheHit
 	event.CacheMissTokens = chatStat2.cacheMiss
+	// 工具面：只有声明了 tools 的请求才写，未声明保持零值 + omitempty（不进分母）。
+	if chatStat2.toolsDeclared > 0 {
+		event.ToolsDeclared = chatStat2.toolsDeclared
+		event.ToolCalls = chatStat2.toolCalls
+	}
 }
 
 // responseObserver 捕获 handler 实际写出的 HTTP 状态，同时保留 Flusher/Unwrap，
