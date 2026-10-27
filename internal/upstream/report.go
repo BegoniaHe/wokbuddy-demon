@@ -1,4 +1,4 @@
-// report.go growth 域「对话活跃上报」接口：POST {billingBase}/v2/report。
+// report.go billing 域「对话活跃上报」接口：POST {billingBase}/v2/report。
 // 照抄客户端 chat_request_send 事件形状（含 conversationId/mode/inputLength 等全字段，
 // 勿用最小 3 字段，防上游后续加严）。事件必须带 userId（=账号 uid），缺失则服务端
 // 200 但静默丢弃（实测见 REPORT-active-map.md §2）。
@@ -23,7 +23,7 @@ import (
 )
 
 // reportPath 活跃上报通道（实测）。默认走 CN billing 域（codebuddy.cn，可用
-// cn.billing_base 覆盖）；桌面 /v2/report 是另一条 surface，走 chatBase。
+// cn.billing_base 覆盖）；桌面 /v2/report 是另一条 surface，走 webBase。
 const reportPath = "/v2/report"
 
 // billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。

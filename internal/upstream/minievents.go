@@ -6,8 +6,10 @@
 //   - 专家任务：expert_actual_use。
 //   - 模型 / 灵感任务：带模型字段的对话事件与 playbook 事件组。
 //
-// 端点基址固定 www.codebuddy.cn；桌面/增长 billing 域可被 cn.billing_base 覆盖，
-// 但 MP 埋点属于另一 surface，不跟随该覆盖。信封 {code,msg,data}，code=0 成功。
+// 端点基址固定 www.codebuddy.cn；billing / 签到 / 活跃上报（billing 域）可被
+// cn.billing_base 覆盖，但 MP 埋点属于另一 surface，不跟随该覆盖。桌面 /v2/report
+// 走 webBase，growth 任务 / 旅行走 chatBase，同样不受该配置影响。
+// 信封 {code,msg,data}，code=0 成功。
 package upstream
 
 import (
