@@ -88,7 +88,7 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端没给会话 ID 时生成 UUIDv4（不影响 prompt cache key）。
 - 首条消息非 system 时补官方 `"You are CodeBuddy Code.\n"` fallback（CN/global 都补）。
 - `6004` 带重置、`14003` 模型级限流只冷该模型；`14003` 用 10s→1m 短窗且不喂路由熔断；`6004` 无重置按账号级保守退避并记模型审计；`11158` 仅在 400/404 时与 `11136` 同归账号级模型权限避让，429+11158 归限流。
-- CN billing/meter `/v2` 优先、无 `/v2` 回落（官方桌面 resourcePrefix 为空）。
+- CN billing/meter `/v2` 优先、无 `/v2` 回落（官方桌面 resourcePrefix 为空）。分 surface 取 base：桌面 report 走 `desktopBase`（即 `chatBase`），Web report 走 `webBase`，growth 任务 / 旅行走 `chatBase`，billing / 签到 / 活跃上报走 `billingBase`。本仓 CN billing 默认仍走 `codebuddy.cn`，可用 `cn.billing_base` 灰度切到 `workbuddy.cn`；小程序埋点固定 `codebuddy.cn`，不跟随覆盖。这是 surface 取舍，不是遗漏。
 - SSE 接受 `delta.reasoning`、重复 tool id 去重、`finish_reason` 后 EOF 正常收尾；reasoning-only 不记成功。
 - 签到两 realm `/v2` 优先；余额 summary 为主、旧端点兜底；模型目录应用 `availableModels` / `disabled` / `aliases`。`/v1/models` 发现输出再按官方默认会话 agent（`/v3/config data.agents`，企业端点 `agents` 兜底；`tags` 含 default → `name=cli` → 首个有 models）裁剪，仅隐藏展示条目，`FetchModels`、面板与请求路由保持全量。
 - growth `/v2` 优先；travel claim 支持 `record_id` 与空 body；桌面 report `X-Domain` 为 host 形态。

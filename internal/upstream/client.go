@@ -1318,7 +1318,7 @@ type Client struct {
 	// 且回调失败不影响余额查询主路径（账本只是观测附属物）。
 	BalanceObserver func(uid string, remain, total int64)
 	ChatBaseCN      string
-	BillingBaseCN   string
+	BillingBaseCN   string // billing 域默认 codebuddy.cn；可用 cn.billing_base 覆盖（MP 埋点不跟随）。
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
