@@ -329,6 +329,11 @@ export function ConfigView() {
               {num('task_sweep_minutes', { min: 1, placeholder: '15' })}
               <FieldDescription>只补领「已达标未领」的成长任务奖励（幂等、不代做任务）；热生效</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>每轮补签上限（天）</FieldLabel>
+              {num('makeup_cards_per_round', { min: 0, placeholder: '0' })}
+              <FieldDescription>0 = 不限；&gt;0 = 每轮最多补签天数，剩余留待下一轮；热生效</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">

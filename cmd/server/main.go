@@ -312,6 +312,7 @@ func setupUpstream(
 		Timing:                 cfg.Timing,
 		RunStampFile:           stateSibling(cfg.StateFile, "scheduler-runs.json"),
 	})
+	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	logScheduleConfig(cfg)
 
 	return client, notifier, sch, nil
@@ -1021,6 +1022,7 @@ func applyRuntimeConfig(
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
+	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 	sch.SetTimingShape(newCfg.Timing)
