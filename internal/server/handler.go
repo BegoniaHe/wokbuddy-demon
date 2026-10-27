@@ -133,6 +133,9 @@ type Config struct {
 	// HiddenModels 模型黑名单（"cn:x"/"global:x" 归一形式）；空 = 关闭。
 	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
 	HiddenModels map[string]struct{}
+	// AllowedModels 部署级模型白名单（"cn:x"/"global:x" 归一形式）；空 = 不启用。
+	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
+	AllowedModels map[string]struct{}
 	// BackgroundNames 后台模型改写名单（小写；issue #103）；空 = 关闭。
 	BackgroundNames map[string]bool
 	// BackgroundTarget 后台模型改写目标（issue #103）。
@@ -194,6 +197,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		BackgroundNames:    h.cfg.BackgroundNames,
 		BackgroundTarget:   h.cfg.BackgroundTarget,
 		HiddenModels:       h.cfg.HiddenModels,
+		AllowedModels:      h.cfg.AllowedModels,
 	}
 }
 
@@ -979,7 +983,8 @@ func (h *Handler) modelList() []map[string]any {
 	models := h.fetchDynamicModels()
 	for i := range models {
 		// 按上游裸模型名判定：条目 id 是 "cn:<model>" 形态，直接用会永远匹配不到。
-		if h.modelHidden("cn", models[i].ID) {
+		// 黑名单与白名单都在这一层收口：白名单外不列出。
+		if h.modelHidden("cn", models[i].ID) || !h.modelAllowedByConfig("cn", models[i].ID) {
 			continue
 		}
 
@@ -1009,6 +1014,10 @@ func (h *Handler) appendGlobalModelEntries(
 	for _, entry := range entries {
 		id, ok := entry["id"].(string)
 		if ok && h.modelHidden("global", strings.TrimPrefix(id, "global:")) {
+			continue
+		}
+
+		if ok && !h.modelAllowedByConfig("global", strings.TrimPrefix(id, "global:")) {
 			continue
 		}
 
@@ -1088,14 +1097,9 @@ func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string
 
 	for _, name := range names {
 		upstreamID := normalizeAliasTarget(h.cfg.ModelAliases[name])
-		// 别名条目同样受黑名单约束：别名名字本身或其目标模型被隐藏时都不列出
-		// （否则「藏起来的模型」会经由别名泄露）。
-		realm, bare, _ := splitRealm(upstreamID)
-		if h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
-			continue
-		}
-		// 官方默认会话 agent 隐藏的模型也不经别名泄露；目标不在目录时保持现状。
-		if aliasChatHidden(upstreamID, name, realm, chatHidden) {
+		// 别名条目同样受黑名单/部署级白名单/官方 agent 可见性约束：任一层拒绝都
+		// 不列出（否则被藏起来/未放行的模型会经由别名泄露）。
+		if h.aliasExcluded(upstreamID, name, chatHidden) {
 			continue
 		}
 
@@ -1117,6 +1121,21 @@ func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string
 	}
 
 	return out
+}
+
+// aliasExcluded 别名条目是否应被排除：别名名字或目标命中 models.hidden、
+// models.allowed 白名单外，或被官方默认会话 agent 隐藏。
+func (h *Handler) aliasExcluded(upstreamID, name string, chatHidden map[string]bool) bool {
+	realm, bare, _ := splitRealm(upstreamID)
+	if h.modelHidden(realm, bare) || h.modelHidden(realm, name) {
+		return true
+	}
+
+	if !h.modelAllowedByConfig(realm, bare) || !h.modelAllowedByConfig(realm, name) {
+		return true
+	}
+
+	return aliasChatHidden(upstreamID, name, realm, chatHidden)
 }
 
 // aliasChatHidden 别名目标或别名名字命中官方 agent 隐藏集合时返回 true。
@@ -1369,7 +1388,10 @@ type chatFlow struct {
 	bareModel     string
 	modelRate     string
 	declaredTools map[string]bool
-	reqHasImage   bool
+	// declaredToolCount 本请求声明的去重工具数（不含会话历史），>0 才进请求归档
+	// 的「声明 / 调用」统计；declaredTools 仍含历史名，供标记修复判定。
+	declaredToolCount int
+	reqHasImage       bool
 	// reqModalities 请求携带的非文本输入模态（issue #109，改写前取一次，
 	// 供 gateway_hint 与能力判定/路由共用，避免重复解析请求体）。
 	reqModalities []string
@@ -1452,6 +1474,11 @@ func (h *Handler) serveChat(r *http.Request, input *chatInput, out chatResponder
 	defer chatFlow2.releaseHeld()
 	// 命名密钥用量回填（无累加器时空操作）；在 withClientAuth 落账前完成。
 	defer chatFlow2.recordKeyUsage()
+	// 部署级白名单（models.allowed）先于黑名单：两者都是部署策略，先收窄可见集合
+	// 再剔除。判定点与黑名单/命名密钥白名单同处（后台改写/别名解析之后）。
+	if !chatFlow2.checkConfigAllowlist() {
+		return
+	}
 	// 模型黑名单（models.hidden）先于命名密钥白名单：隐藏模型不给任何 key 放行，
 	// 避免「key 白名单」变相解禁。判定点与白名单同处（后台改写/别名解析之后）。
 	if !chatFlow2.checkModelHidden() {
@@ -1466,7 +1493,11 @@ func (h *Handler) serveChat(r *http.Request, input *chatInput, out chatResponder
 	if !chatFlow2.applyModalityRoute() {
 		return
 	}
-	// 模态路由可能改写模型：按改写后的最终模型复核隐藏与白名单，避免绕过。
+	// 模态路由可能改写模型：按改写后的最终模型复核白名单与隐藏，避免绕过。
+	if !chatFlow2.checkConfigAllowlist() {
+		return
+	}
+
 	if !chatFlow2.checkModelHidden() {
 		return
 	}
@@ -1512,6 +1543,40 @@ func (h *Handler) modelHidden(realm, model string) bool {
 	}
 
 	_, ok := hidden[realm+":"+model]
+
+	return ok
+}
+
+// checkConfigAllowlist 校验部署级模型白名单（models.allowed）：白名单外即 400
+// model_unavailable，不打上游、不占选号。与 checkModelAllowed（命名密钥 glob
+// 白名单）是两套语义：两者都通过才放行（取交集）。
+func (f *chatFlow) checkConfigAllowlist() bool {
+	if f.h.modelAllowedByConfig(f.realm, f.bareModel) {
+		return true
+	}
+
+	f.out.Error(http.StatusBadRequest, "model_unavailable",
+		"model is not in the gateway allowlist (models.allowed); pick another model", "")
+	f.st.status = http.StatusBadRequest
+	f.st.outcome = reqlog.OutcomeHTTPError
+
+	return false
+}
+
+// modelAllowedByConfig 报告 (realm, model) 是否在部署级白名单 models.allowed 内。
+// 白名单为空 = 不启用（放行全部）；键为归一后的 "realm:model"（裸名已展开两域，
+// 因此 cn:x 不会自动放行 global:x）。
+func (h *Handler) modelAllowedByConfig(realm, model string) bool {
+	allowed := h.loadLive().AllowedModels
+	if len(allowed) == 0 {
+		return true
+	}
+
+	if model == "" {
+		return false
+	}
+
+	_, ok := allowed[realm+":"+model]
 
 	return ok
 }
@@ -1577,6 +1642,12 @@ func (h *Handler) crossRealmAllowed(input *chatInput, realm, bareModel string) b
 	}
 
 	if h.cfg.Pool == nil || !h.cfg.Pool.CrossDomainFallback() {
+		return false
+	}
+
+	// 部署级白名单按域限定时（如 models.allowed=["cn:x"]），另一域的服务不能借同一
+	// 裸名绕过域作用域：与命名密钥的域限定白名单同口径，两域都放行才允许回退。
+	if !h.modelAllowedByConfig(otherRealm(realm), bareModel) {
 		return false
 	}
 
@@ -1664,6 +1735,9 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	}
 	// 请求模态在改写前解析一次（gateway_hint + 能力判定/路由共用）。
 	reqMods := requestModalities(chatInput2.body)
+	// 工具名名单与声明数一次解析：名单（声明 ∪ 历史）供标记修复判定，声明数
+	// 只数本请求 tools/functions，供请求归档的「声明 / 调用」统计。
+	declaredTools, declaredToolCount := upstream.ToolFacts(chatInput2.body)
 	chatFlow2 := &chatFlow{
 		h: h, out: out, clientIP: chatInput2.clientIP,
 		body:     chatInput2.body,
@@ -1675,7 +1749,8 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
-		declaredTools: upstream.ToolNameAllowlist(chatInput2.body),
+		declaredTools:     declaredTools,
+		declaredToolCount: declaredToolCount,
 		// gateway_hint 判定与模态能力判定所需的请求形态（多模态 part）：在改写前取。
 		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
 		reqModalities:  reqMods,
@@ -3092,6 +3167,12 @@ func (f *chatFlow) finishStreamStats(
 	}
 
 	f.recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
+	// 工具面（issue #329）：stats 读的是修复器之前的原始字节，markup 还原出的调用
+	// 不在其中，用 repair.Converted() 补上（二者不重叠）。
+	if f.declaredToolCount > 0 {
+		f.st.toolsDeclared = f.declaredToolCount
+		f.st.toolCalls = stats.ToolCallCount() + repair.Converted()
+	}
 	// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 	if f.st.hasCache {
 		cacheMissWarn.noteCacheTokens(f.bareModel, f.st.promptTokens, f.st.cacheHit, f.st.cacheMiss)
@@ -3168,6 +3249,13 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	credit, total, hasCredit := usageCreditTotal(resp)
+
+	// 工具面（issue #329）：RepairAggregatedResponse 已把还原结果写回同一个 resp，
+	// 直接数 message.tool_calls 即可；此处不再加 mrepair.Converted()（会双计）。
+	if f.declaredToolCount > 0 {
+		f.st.toolsDeclared = f.declaredToolCount
+		f.st.toolCalls = responseToolCallCount(resp)
+	}
 	// 缓存三维观测与流式同源同口径（cacheTokensFromUsage）：非流式此前只看 hit 侧，
 	// miss 显式存在而 hit 缺失时直接丢弃，导致「prompt 数万 + hit=0」误报告警。
 	if usageMap, ok := resp["usage"].(map[string]any); ok {
@@ -3253,6 +3341,37 @@ func firstChoice(resp map[string]any) map[string]any {
 	choice, _ := choices[0].(map[string]any)
 
 	return choice
+}
+
+// responseToolCallCount 统计聚合响应 choices[0].message 的工具调用条数：tool_calls
+// 数组 + 非空旧式 function_call（二者与流式统计同口径）。供请求归档的「声明 / 调用」
+// 统计（issue #329），不改变响应内容。聚合器写回的是 []map[string]any（in-process），
+// 经过 JSON 反序列化的是 []any；两种形态都要认，否则非流式会恒记 0。
+func responseToolCallCount(resp map[string]any) int {
+	choice := firstChoice(resp)
+	if choice == nil {
+		return 0
+	}
+
+	message, _ := choice["message"].(map[string]any)
+	if message == nil {
+		return 0
+	}
+
+	count := 0
+
+	switch calls := message["tool_calls"].(type) {
+	case []any:
+		count = len(calls)
+	case []map[string]any:
+		count = len(calls)
+	}
+
+	if fc, ok := message["function_call"].(map[string]any); ok && functionCallMapHasPayload(fc) {
+		count++
+	}
+
+	return count
 }
 
 // mergeNonStreamContinuation 拼接两段正文，终态/usage 取第二段（最终回答）。

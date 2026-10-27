@@ -122,6 +122,8 @@ type Scheduler struct {
 	balanceInterval atomic.Int64
 	// taskSweepInterval 任务补领清扫间隔（纳秒，0=暂停），语义同 balanceInterval。
 	taskSweepInterval atomic.Int64
+	// makeupPerRound 连登补签每轮成功上限（0=不限），热生效。
+	makeupPerRound atomic.Int64
 	// rearmTaskSweep 任务补领清扫的「排程已变」通知（与余额刷新分开，避免丢信号）。
 	rearmTaskSweep chan struct{}
 	// balanceSem/balanceSemOnce 余额刷新逐号上游调用的全局并发上限：后台周期与
@@ -263,6 +265,15 @@ func (s *Scheduler) SetCheckinAccountDelay(duration2 time.Duration) {
 	s.schedMu.Lock()
 	s.cfg.CheckinAccountDelay = duration2
 	s.schedMu.Unlock()
+}
+
+// SetMakeupCardsPerRound 热改连登补签每轮成功上限（0=不限，负数钳 0）。
+func (s *Scheduler) SetMakeupCardsPerRound(n int) {
+	if n < 0 {
+		n = 0
+	}
+
+	s.makeupPerRound.Store(int64(n))
 }
 
 // SetIncludeDisabledInTasks 热更新「保号类任务是否覆盖禁用账号」

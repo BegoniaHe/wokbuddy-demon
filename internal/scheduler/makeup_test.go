@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -76,4 +77,152 @@ func TestMakeupRecentNearToFar(t *testing.T) {
 	if len(used) != 1 || used[0] != cst.Day(yesterday) {
 		t.Fatalf("used=%v want [%s]", used, cst.Day(yesterday))
 	}
+}
+
+// makeupFixture 可变漏签状态：use 成功后从 heatmap 移除，模拟下一轮真实上游。
+type makeupFixture struct {
+	mu      sync.Mutex
+	missed  map[string]bool
+	used    []string
+	balance int
+}
+
+func newMakeupFixture(t *testing.T, balance int, missed ...string) (*makeupFixture, *httptest.Server) {
+	t.Helper()
+
+	fixture := &makeupFixture{missed: map[string]bool{}, used: nil, balance: balance}
+	for _, day := range missed {
+		fixture.missed[day] = true
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/heatmap"):
+			fixture.mu.Lock()
+
+			cells := make([]string, 0, len(fixture.missed))
+			for day := range fixture.missed {
+				cells = append(cells, `{"date":"`+day+`","score":0}`)
+			}
+
+			fixture.mu.Unlock()
+
+			_, _ = w.Write([]byte(`{"code":0,"data":{"cells":[` + strings.Join(cells, ",") + `]}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/makeup-cards/use"):
+			var body struct {
+				TargetDate string `json:"target_date"`
+			}
+
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			fixture.mu.Lock()
+
+			delete(fixture.missed, body.TargetDate)
+			fixture.used = append(fixture.used, body.TargetDate)
+			fixture.balance--
+
+			fixture.mu.Unlock()
+
+			_, _ = w.Write([]byte(`{"code":0,"data":{}}`))
+		case strings.HasSuffix(r.URL.Path, "/activity/growth/streak"):
+			fixture.mu.Lock()
+
+			balance := fixture.balance
+
+			fixture.mu.Unlock()
+
+			_, _ = fmt.Fprintf(w, `{"code":0,"data":{"makeup_cards":{"balance":%d}}}`, balance)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+
+	return fixture, srv
+}
+
+func (f *makeupFixture) snapshotUsed() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return append([]string(nil), f.used...)
+}
+
+// TestMakeupRecentPerRoundCap 每轮上限：cap=1 分两轮继续、cap=0 全补、
+// cap 大于漏签数全部补完；补签顺序仍由近及远。
+func TestMakeupRecentPerRoundCap(t *testing.T) {
+	t.Parallel()
+
+	now := cst.Now()
+	yesterday := now.AddDate(0, 0, -1)
+	dayBefore := now.AddDate(0, 0, -2)
+
+	if dayBefore.Month() != now.Month() {
+		t.Skip("month boundary: dynamic fixture would cross month")
+	}
+
+	days := []string{cst.Day(dayBefore), cst.Day(yesterday)}
+
+	newScheduler := func(srv *httptest.Server) *Scheduler {
+		client := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+
+		return New(&Config{Pool: pool.New(""), Upstream: client})
+	}
+
+	t.Run("cap=1 分两轮", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, srv := newMakeupFixture(t, 5, days...)
+		defer srv.Close()
+
+		scheduler := newScheduler(srv)
+		scheduler.SetMakeupCardsPerRound(1)
+		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+
+		if got := fixture.snapshotUsed(); len(got) != 1 || got[0] != days[1] {
+			t.Fatalf("第一轮 used=%v want [%s]", got, days[1])
+		}
+
+		next := newScheduler(srv)
+		next.SetMakeupCardsPerRound(1)
+		next.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+
+		if got := fixture.snapshotUsed(); len(got) != 2 || got[1] != days[0] {
+			t.Fatalf("第二轮 used=%v want [%s %s]", got, days[1], days[0])
+		}
+	})
+
+	t.Run("cap=0 全补", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, srv := newMakeupFixture(t, 5, days...)
+		defer srv.Close()
+
+		scheduler := newScheduler(srv)
+		scheduler.SetMakeupCardsPerRound(0)
+		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+
+		if got := fixture.snapshotUsed(); len(got) != 2 || got[0] != days[1] || got[1] != days[0] {
+			t.Fatalf("used=%v want [%s %s]", got, days[1], days[0])
+		}
+	})
+
+	t.Run("cap 大于漏签数全补", func(t *testing.T) {
+		t.Parallel()
+
+		fixture, srv := newMakeupFixture(t, 5, days...)
+		defer srv.Close()
+
+		scheduler := newScheduler(srv)
+		scheduler.SetMakeupCardsPerRound(10)
+		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+
+		if got := fixture.snapshotUsed(); len(got) != 2 {
+			t.Fatalf("used=%v want 2 天全补", got)
+		}
+	})
 }

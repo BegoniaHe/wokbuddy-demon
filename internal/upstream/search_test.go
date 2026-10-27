@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -92,6 +93,30 @@ func assertSearchRequestShape(t *testing.T, path, body, accept, contentType, int
 
 	if intent != "craft" || runtime != "other" {
 		t.Errorf("agent intent/runtime=%q/%q want craft/other", intent, runtime)
+	}
+}
+
+// TestSearchHeadersReuseChatFingerprint 防回归：search 仍复用 chat 头族。
+// 这是刻意取舍（同一账号避免多客户端指纹），不是遗漏；改动前先看 UPSTREAM.md §六。
+func TestSearchHeadersReuseChatFingerprint(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	req := httptest.NewRequest(http.MethodPost, "https://upstream.test/agenttool/v1/search", nil)
+	client.SearchHeaders(req, &auth.Auth{AccessToken: "at", UID: "u1"}, "", ChatMeta{})
+
+	for _, name := range []string{"X-Agent-Intent", "X-Private-Data", "X-Agent-Runtime"} {
+		if got := req.Header.Get(name); got == "" {
+			t.Errorf("search 缺少 chat 头族代表字段 %s（刻意统一指纹，勿当遗漏删除）", name)
+		}
+	}
+
+	if got := req.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("Accept=%q want application/json", got)
+	}
+
+	if got := req.Header.Get("Content-Type"); !strings.Contains(got, "charset=UTF-8") {
+		t.Errorf("Content-Type=%q want charset=UTF-8", got)
 	}
 }
 

@@ -65,6 +65,7 @@
     "balance_refresh_minutes": 5,
     "task_sweep_enabled": true,
     "task_sweep_minutes": 15,
+    "makeup_cards_per_round": 0,
     "checkin_account_delay": "800ms",
     "slot_jitter": "20m",
     "account_pacing_sigma": 0.4,
@@ -78,7 +79,8 @@
     "aliases": {},
     "background_names": [],
     "background_target": "deepseek-v4.1-flash",
-    "hidden": []
+    "hidden": [],
+    "allowed": []
   },
   "global": {
     "enabled": true,
@@ -86,7 +88,8 @@
     "billing_base": ""
   },
   "cn": {
-    "chat_base": ""
+    "chat_base": "",
+    "billing_base": ""
   },
   "upstream": {
     "timeout_seconds": 120,

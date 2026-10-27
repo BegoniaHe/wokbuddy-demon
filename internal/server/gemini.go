@@ -827,19 +827,35 @@ func (h *Handler) geminiCountTokens(w http.ResponseWriter, r *http.Request, mode
 	writeJSON(w, http.StatusOK, map[string]any{"totalTokens": tokens})
 }
 
-// geminiCountTokensAllowed 校验命名密钥模型白名单；与 chat 同口径解析别名/realm。
+// geminiCountTokensAllowed 校验 countTokens 的模型可见性：先按 chat 同口径解析
+// 别名/realm，再检查部署级 models.hidden / models.allowed（不给任何 key 放行），
+// 最后检查命名密钥模型白名单。
 func (h *Handler) geminiCountTokensAllowed(w http.ResponseWriter, r *http.Request, model string) bool {
-	keyUsage2 := keyUsageFrom(r.Context())
-	if keyUsage2 == nil {
-		return true
-	}
-
 	keyRealm := keyRealmFrom(r.Context())
 
 	realm, bare, err := resolveKeyModel(model, h.requestModelAliases(model, keyRealm), keyRealm)
 	if err != nil {
 		writeGeminiError(w, http.StatusBadRequest, err.Error(), "")
 		return false
+	}
+
+	if h.modelHidden(realm, bare) {
+		writeGeminiError(w, http.StatusBadRequest,
+			"model is hidden by gateway config (models.hidden); pick another model", "")
+
+		return false
+	}
+
+	if !h.modelAllowedByConfig(realm, bare) {
+		writeGeminiError(w, http.StatusBadRequest,
+			"model is not in the gateway allowlist (models.allowed); pick another model", "")
+
+		return false
+	}
+
+	keyUsage2 := keyUsageFrom(r.Context())
+	if keyUsage2 == nil {
+		return true
 	}
 
 	if h.cfg.Keys.ModelAllowed(keyUsage2.id, realm+":"+bare) {

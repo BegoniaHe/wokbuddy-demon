@@ -219,6 +219,49 @@ func TestUserAgentDefaultWorkBuddyShape(t *testing.T) {
 	}
 }
 
+// TestUserAgentGlobalChatBrand global 的 chat 品牌段取 CLI product.json 的
+// applicationName（workbuddy-ai）：默认走 profile 字面量，显式版本覆盖时按 realm 重拼。
+func TestUserAgentGlobalChatBrand(t *testing.T) {
+	t.Parallel()
+
+	global := &auth.Auth{UID: "u1", Domain: "www.workbuddy.ai"}
+	global.BackfillRealm()
+
+	for _, testCase := range []struct {
+		name          string
+		clientVersion string
+		cliVersion    string
+		want          string
+	}{
+		{
+			name: "默认 profile 字面量",
+			want: "WorkBuddy/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9",
+		},
+		{
+			name:          "client_version 覆盖",
+			clientVersion: "6.0.0",
+			want:          "WorkBuddy/6.0.0 workbuddy-ai/6.0.0 CLI/8.8.9",
+		},
+		{
+			name:       "仅 cli_version 覆盖",
+			cliVersion: "7.7.7",
+			want:       "WorkBuddy/9.9.10 workbuddy-ai/9.9.10 CLI/7.7.7",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newProfileClient(t)
+			client.ClientVersion = testCase.clientVersion
+			client.CliVersion = testCase.cliVersion
+
+			if got := client.defaultWorkBuddyUAFor(global); got != testCase.want {
+				t.Errorf("global chat UA = %q want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
 // chatLastUA 从最近一次聊天请求捕获 UA（当前测试 Client 的 ChatHTTP transport 记录）。
 func (c *Client) chatLastUA() string {
 	if t, ok := c.ChatHTTP.Transport.(uaCaptureTransport); ok && t.ua != nil {

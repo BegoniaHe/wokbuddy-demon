@@ -35,6 +35,10 @@ export interface RequestEntry {
   request_id?: string;
   cache_hit_tokens?: number;
   cache_miss_tokens?: number;
+  // 工具面（issue #329）：missing tools_declared = 本请求未声明 tools；
+  // 有声明、tool_calls 缺失或 0 = 声明了但零调用。
+  tools_declared?: number;
+  tool_calls?: number;
   decision?: DecisionTrace;
 }
 
@@ -88,6 +92,14 @@ export function reqCreditCell(e: RequestEntry | undefined): string {
   if (!e || !e.credit_known) return '—';
   const v = Number(e.credit);
   return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '—';
+}
+
+// reqToolCell 工具面「声明 / 调用」：未声明 tools 显示 —（不进分母），
+// 声明了但零调用显示 "N / 0"。
+export function reqToolCell(e: RequestEntry | undefined): string {
+  const declared = Number((e && e.tools_declared) || 0);
+  if (declared <= 0) return '—';
+  return declared + ' / ' + Number((e && e.tool_calls) || 0);
 }
 
 // reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词 AND 包含；outcome 精确匹配。

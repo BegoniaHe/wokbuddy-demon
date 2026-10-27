@@ -111,6 +111,11 @@ type chatStat struct {
 	// decision 可选选号决策链（logging.decision_trace）；nil = 未启用/未采样。
 	decision *reqlog.DecisionTrace
 
+	// toolsDeclared / toolCalls 工具面统计（issue #329）：仅在本请求声明了 tools 时
+	// 归档（未声明不进分母）；toolCalls > 0 才写 JSON（omitempty）。
+	toolsDeclared int
+	toolCalls     int
+
 	out     io.Writer
 	enabled bool
 	logged  bool
@@ -166,7 +171,17 @@ type chatStatsReader struct {
 	cacheHit     int
 	cacheMiss    int
 	hasCacheMiss bool
-	pend         []byte // 已读未返回的行缓存
+	// 工具调用去重计数（issue #329）：流式 tool_calls 是分片增量。与 upstream 的
+	// toolIndex 同口径：带 index 按 index 去重；缺 index 时 id 绑定到已有调用，新 id
+	// 分配新序号；index/id 都缺的后续分片归最近一次调用（单个调用的延续分片无
+	// index/id 是标准形态）。旧式 function_call 整块出现，记一条。仅用于归档统计，
+	// 不影响透传字节。
+	toolCallIndexes    map[int]struct{}
+	toolCallIDs        map[string]int
+	toolCallHasIndex   bool
+	toolCallNextIndex  int
+	legacyFunctionCall bool
+	pend               []byte // 已读未返回的行缓存
 }
 
 // chatStatsReader 必须实现 io.Closer：keepalive 流返回前由 upstream 关闭并等待
@@ -330,11 +345,105 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 
 	if rawPayloadPresent(delta.ToolCalls) {
 		s.hasToolCall = true
+		s.noteToolCalls(delta.ToolCalls)
 	}
-	// 旧式 function_call（非 tool_calls）同样是可消费的实质输出；空占位 {} 除外。
-	if rawPayloadPresent(delta.FunctionCall) {
+	// 旧式 function_call（非 tool_calls）同样是可消费的实质输出；空占位
+	// {"name":"","arguments":""} 与 {} 一样不算（与 upstream.keepFunctionCall 同口径）。
+	if functionCallHasPayload(delta.FunctionCall) {
 		s.hasToolCall = true
+		s.legacyFunctionCall = true
 	}
+}
+
+// noteToolCalls 对流式 tool_calls 增量做去重计数（issue #329）。
+func (s *chatStatsReader) noteToolCalls(raw json.RawMessage) {
+	var calls []struct {
+		Index *int   `json:"index"`
+		ID    string `json:"id"`
+	}
+
+	if json.Unmarshal(raw, &calls) != nil {
+		return
+	}
+
+	for _, call := range calls {
+		s.noteToolCall(call.Index, call.ID)
+	}
+}
+
+// noteToolCall 把单个增量归并到调用序号，规则与 internal/upstream 的 toolIndex 一致：
+// 省略 index 的上游按 id 绑定调用，后续无 index/id 的 arguments 分片延续最近一次调用。
+func (s *chatStatsReader) noteToolCall(index *int, id string) {
+	if index != nil {
+		s.markToolCallIndex(*index)
+
+		if id != "" {
+			s.bindToolCallID(id, *index)
+		}
+
+		return
+	}
+
+	if id != "" {
+		if idx, ok := s.toolCallIDs[id]; ok {
+			s.markToolCallIndex(idx)
+
+			return
+		}
+
+		s.bindToolCallID(id, s.nextToolCallIndex())
+
+		return
+	}
+
+	// 单个调用的延续分片无 index/id 是标准形态，归入最近一次调用；首个匿名分片
+	// 没有可归属的调用时才新开序号。
+	if !s.toolCallHasIndex {
+		s.nextToolCallIndex()
+	}
+}
+
+// markToolCallIndex 记录一个调用序号，并把它设为后续匿名分片的归属。
+func (s *chatStatsReader) markToolCallIndex(index int) {
+	if s.toolCallIndexes == nil {
+		s.toolCallIndexes = map[int]struct{}{}
+	}
+
+	s.toolCallIndexes[index] = struct{}{}
+	s.toolCallHasIndex = true
+}
+
+// bindToolCallID 把上游 tool_call id 绑定到调用序号。
+func (s *chatStatsReader) bindToolCallID(id string, index int) {
+	if s.toolCallIDs == nil {
+		s.toolCallIDs = map[string]int{}
+	}
+
+	s.toolCallIDs[id] = index
+}
+
+// nextToolCallIndex 分配一个未被显式 index 占用的新序号（与 toolIndex.next 同义）。
+func (s *chatStatsReader) nextToolCallIndex() int {
+	for {
+		index := s.toolCallNextIndex
+		s.toolCallNextIndex++
+
+		if _, used := s.toolCallIndexes[index]; !used {
+			s.markToolCallIndex(index)
+
+			return index
+		}
+	}
+}
+
+// ToolCallCount 本流实际产生的 tool_call 条数（去重后；不含正文标记还原出的调用）。
+func (s *chatStatsReader) ToolCallCount() int {
+	count := len(s.toolCallIndexes)
+	if s.legacyFunctionCall {
+		count++
+	}
+
+	return count
 }
 
 // rawPayloadPresent 报告 JSON 片段是否是有效负载（排除空值/空数组/空对象占位）。
@@ -342,6 +451,29 @@ func rawPayloadPresent(raw json.RawMessage) bool {
 	value := strings.TrimSpace(string(raw))
 
 	return value != "" && value != "null" && value != "[]" && value != "{}"
+}
+
+// functionCallHasPayload 报告旧式 function_call 是否含实际负载：空占位
+// {"name":"","arguments":""} 不算一次调用；非对象形态保守按有负载处理。
+func functionCallHasPayload(raw json.RawMessage) bool {
+	if !rawPayloadPresent(raw) {
+		return false
+	}
+
+	var fc map[string]any
+	if json.Unmarshal(raw, &fc) != nil {
+		return true
+	}
+
+	return functionCallMapHasPayload(fc)
+}
+
+// functionCallMapHasPayload 报告 function_call 对象的 name/arguments 是否至少一项非空。
+func functionCallMapHasPayload(fc map[string]any) bool {
+	name, _ := fc["name"].(string)
+	args, _ := fc["arguments"].(string)
+
+	return name != "" || args != ""
 }
 
 // HasSubstantiveOutput 报告流中是否产生正文、工具调用或拒答。
@@ -738,6 +870,11 @@ func applyChatStat(event *reqlog.Event, chatStat2 *chatStat) {
 	event.HasCredit = chatStat2.hasCredit
 	event.CacheHitTokens = chatStat2.cacheHit
 	event.CacheMissTokens = chatStat2.cacheMiss
+	// 工具面：只有声明了 tools 的请求才写，未声明保持零值 + omitempty（不进分母）。
+	if chatStat2.toolsDeclared > 0 {
+		event.ToolsDeclared = chatStat2.toolsDeclared
+		event.ToolCalls = chatStat2.toolCalls
+	}
 }
 
 // responseObserver 捕获 handler 实际写出的 HTTP 状态，同时保留 Flusher/Unwrap，

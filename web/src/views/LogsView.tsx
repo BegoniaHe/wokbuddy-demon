@@ -9,6 +9,7 @@ import {
   reqOutcomeLabel,
   reqOutcomeTone,
   reqTokenCell,
+  reqToolCell,
   requestLogText,
   type RequestEntry,
 } from '@/lib/reqlog';
@@ -246,7 +247,7 @@ export function LogsView() {
           </Button>
         </div>
         <div className="max-h-[460px] overflow-auto" tabIndex={0} aria-label="请求记录，可横向滚动">
-          <Table className="min-w-[1080px]" containerClassName="overflow-visible">
+          <Table className="min-w-[1180px]" containerClassName="overflow-visible">
             <TableHeader className="sticky top-0 z-[1] bg-card">
               <TableRow>
                 <TableHead>时间</TableHead>
@@ -257,6 +258,7 @@ export function LogsView() {
                 <TableHead>User-Agent</TableHead>
                 <TableHead className="text-right">耗时</TableHead>
                 <TableHead className="text-right">Token</TableHead>
+                <TableHead className="text-right">工具 声明/调用</TableHead>
                 <TableHead className="text-right">积分</TableHead>
                 <TableHead>请求 ID</TableHead>
                 <TableHead>决策</TableHead>
@@ -265,7 +267,7 @@ export function LogsView() {
             <TableBody>
               {filtered.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={11} className="py-10 text-center text-muted-foreground">{entries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录'}</TableCell>
+                  <TableCell colSpan={12} className="py-10 text-center text-muted-foreground">{entries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录'}</TableCell>
                 </TableRow>
               ) : (
                 filtered.map((e, i) => <RequestRow key={e.request_id || i} e={e} />)
@@ -440,6 +442,9 @@ function RequestRow({ e }: { e: RequestEntry }) {
         <span className="font-mono tabular-nums">{reqTokenCell(e)}</span>
       </TableCell>
       <TableCell className="text-right">
+        <span className="font-mono tabular-nums">{reqToolCell(e)}</span>
+      </TableCell>
+      <TableCell className="text-right">
         <span className="font-mono tabular-nums">{reqCreditCell(e)}</span>
       </TableCell>
       <TableCell>{e.request_id ? <Clip className="max-w-[150px] font-mono text-2xs text-muted-foreground" text={e.request_id} /> : muted}</TableCell>
@@ -453,7 +458,7 @@ function RequestRow({ e }: { e: RequestEntry }) {
     </TableRow>
     {open && e.decision ? (
       <TableRow>
-        <TableCell colSpan={11} className="bg-muted/30">
+        <TableCell colSpan={12} className="bg-muted/30">
           <pre className="m-0 max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs text-muted-foreground">
             {JSON.stringify(e.decision, null, 2)}
           </pre>

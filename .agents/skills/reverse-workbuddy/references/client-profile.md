@@ -73,7 +73,7 @@
 
 | key | 必需 | 用途 | 典型来源 |
 | --- | --- | --- | --- |
-| `chatUA` | 是 | chat / refresh / FetchModels | CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 最终输出 |
+| `chatUA` | 是 | chat / refresh / FetchModels | CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 最终输出；第二段品牌取 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`） |
 | `desktopUA` | 是 | `/v2/report`、白名单类上报 | Win32 `main/*.js`、桌面端构建串 |
 | `billingUA` | 是 | billing / checkin / banner 单段 UA | Win32 包内显式覆写 |
 | `xIdeVersion` | 是 | `X-Ide-Version` | 与 `chatUA` 同源的版本 |
@@ -83,9 +83,13 @@
 | `loginUA` | 否 | 登录流 UA | 与 `desktopUA` 同源（`restOperations` 拦截器） |
 
 `chatUA` 的 chat 实际由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
-`UserAgentHttpInterceptor.buildUserAgent` 构造；`main/server.js` 是 daemon/VLM 面，
-其中的 UA 构造不能作为 `chatUA` 证据。`desktopUA`（`/v2/report`）与 `chatUA` 是两条
-不同 surface，不得互相顶替。
+`UserAgentHttpInterceptor.buildUserAgent` 构造；三段依次是
+`platform / applicationName / userAgentExtension`，其中 `platform` 由 sidecar 注入
+固定为 `WorkBuddy`，`applicationName` 取 `cli/product.json`（CN `WorkBuddy` /
+global `workbuddy-ai`），`userAgentExtension` 为 `CLI/<cli>`。
+因此 `evidence.chatUA.file` 必须是 `cli/dist/codebuddy-lite-wb.mjs`；
+`main/server.js` 是 daemon/VLM 面，其中的 UA 构造不能作为 `chatUA` 证据。
+`desktopUA`（`/v2/report`）与 `chatUA` 是两条不同 surface，不得互相顶替。
 
 ## 来源分级（`evidence.<key>.source`）
 

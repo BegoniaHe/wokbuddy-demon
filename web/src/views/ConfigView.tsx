@@ -329,6 +329,11 @@ export function ConfigView() {
               {num('task_sweep_minutes', { min: 1, placeholder: '15' })}
               <FieldDescription>只补领「已达标未领」的成长任务奖励（幂等、不代做任务）；热生效</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>每轮补签上限（天）</FieldLabel>
+              {num('makeup_cards_per_round', { min: 0, placeholder: '0' })}
+              <FieldDescription>0 = 不限；&gt;0 = 每轮最多补签天数，剩余留待下一轮；热生效</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
@@ -672,6 +677,11 @@ export function ConfigView() {
               <FieldLabel>模型黑名单</FieldLabel>
               {text('hidden_models', { placeholder: '如 glm-5.2, global:kimi-k3' })}
               <FieldDescription>逗号分隔；裸名两域都隐藏，cn:/global: 只藏该域。命中后不出现在 /v1/models，点名调用返回 400；热生效</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>模型白名单</FieldLabel>
+              {text('allowed_models', { placeholder: '如 glm-5.2, global:kimi-k3' })}
+              <FieldDescription>逗号分隔；裸名两域，cn:/global: 单域；留空 = 不启用；与黑名单取交集；热生效</FieldDescription>
             </Field>
           </div>
           <Separator className="my-4" />

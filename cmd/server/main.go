@@ -312,6 +312,7 @@ func setupUpstream(
 		Timing:                 cfg.Timing,
 		RunStampFile:           stateSibling(cfg.StateFile, "scheduler-runs.json"),
 	})
+	sch.SetMakeupCardsPerRound(cfg.Schedule.MakeupCardsPerRound)
 	logScheduleConfig(cfg)
 
 	return client, notifier, sch, nil
@@ -665,6 +666,11 @@ func configureUpstream(cfg *Config, client *upstream.Client) error {
 	if base := strings.TrimSpace(cfg.CN.ChatBase); base != "" {
 		client.ChatBaseCN = base
 	}
+	// cn.billing_base：仅非空时覆盖 CN billing 域（空 = 保持内置 codebuddy.cn）；
+	// 小程序埋点使用独立常量，不跟随该覆盖。
+	if base := strings.TrimSpace(cfg.CN.BillingBase); base != "" {
+		client.BillingBaseCN = base
+	}
 
 	auth.SetGlobalEnabled(cfg.Global.Enabled)
 
@@ -992,6 +998,7 @@ func liveSnapshot(cfg *Config) livecfg.Snapshot {
 		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
 		BackgroundTarget:     cfg.Models.BackgroundTarget,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		AllowedModels:        livecfg.NormalizeAllowedModels(cfg.Models.Allowed),
 	}
 }
 
@@ -1021,6 +1028,7 @@ func applyRuntimeConfig(
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
+	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 	sch.SetTimingShape(newCfg.Timing)
@@ -1119,8 +1127,8 @@ var restartFieldPaths = []string{
 	"dns_servers",
 	// global 路由在 configureUpstream / auth / handler 构造期捕获。
 	"global.enabled", "global.chat_base", "global.billing_base",
-	// cn.chat_base 同样在 configureUpstream 一次性写入 client。
-	"cn.chat_base",
+	// cn.chat_base / cn.billing_base 同样在 configureUpstream 一次性写入 client。
+	"cn.chat_base", "cn.billing_base",
 	// 提示词模式与文件在 handler 构造期解析。
 	"prompt.mode", "prompt.file",
 	// Redis 客户端在启动期装配。

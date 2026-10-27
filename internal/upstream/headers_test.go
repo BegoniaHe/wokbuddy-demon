@@ -309,3 +309,118 @@ func TestChatHeadersNoAcceptLanguage(t *testing.T) {
 		t.Fatalf("billing Accept-Language=%q want zh-CN", got)
 	}
 }
+
+// TestRefreshHeadersTrace refresh 也补 trace 五件套，且不复用会话四件套。
+func TestRefreshHeadersTrace(t *testing.T) {
+	t.Parallel()
+
+	client := New()
+	acct := &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt"}
+
+	req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/auth/refresh", http.NoBody)
+	client.RefreshHeaders(req, acct)
+
+	hex16 := regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+	traceID := req.Header.Get("X-Trace-Id")
+	if !uuidV7HeaderPattern.MatchString(traceID) {
+		t.Errorf("X-Trace-Id=%q want UUIDv7 32 hex", traceID)
+	}
+
+	b3Trace := req.Header.Get("X-B3-Traceid")
+	if !uuidV7HeaderPattern.MatchString(b3Trace) {
+		t.Errorf("X-B3-Traceid=%q want UUIDv7 32 hex", b3Trace)
+	}
+
+	spanID := req.Header.Get("X-B3-Spanid")
+	parentSpanID := req.Header.Get("X-B3-Parentspanid")
+
+	if !hex16.MatchString(spanID) || !hex16.MatchString(parentSpanID) {
+		t.Errorf("span/parent=%q/%q want 16 hex", spanID, parentSpanID)
+	}
+
+	if got, want := req.Header.Get("Traceparent"), "00-"+b3Trace+"-"+spanID+"-01"; got != want {
+		t.Errorf("Traceparent=%q want %q", got, want)
+	}
+
+	if got, want := req.Header.Get("B3"), b3Trace+"-"+spanID+"-1-"+parentSpanID; got != want {
+		t.Errorf("B3=%q want %q", got, want)
+	}
+
+	if got := req.Header.Get("X-B3-Sampled"); got != "1" {
+		t.Errorf("X-B3-Sampled=%q want 1", got)
+	}
+
+	for _, name := range []string{"X-Conversation-Id", "X-Conversation-Request-Id", "X-Conversation-Message-Id", "X-Request-ID"} {
+		if got := req.Header.Get(name); got != "" {
+			t.Errorf("refresh 不应发 %s=%q", name, got)
+		}
+	}
+}
+
+// TestRefreshDomain refresh 的 X-Domain：账号 domain 优先；global 缺省
+// www.workbuddy.ai；CN 无 domain 回落到本次 refresh 请求的 endpoint host
+// （含 cn.chat_base 覆盖与 chat 回落链里的备选域）。
+func TestRefreshDomain(t *testing.T) {
+	t.Parallel()
+
+	globalNoDomain := &auth.Auth{UID: "u-global", AccessToken: "at", RefreshToken: "rt"}
+	if _, err := auth.BackfillRealmFor(globalNoDomain, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		reqURL  string
+		account *auth.Auth
+		want    string
+	}{
+		{
+			name:    "CN 无 domain 回落默认 chat host",
+			reqURL:  "https://www.workbuddy.cn/v2/plugin/auth/token/refresh",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt"},
+			want:    "www.workbuddy.cn",
+		},
+		{
+			name:    "CN chat_base 覆盖时跟随该 host",
+			reqURL:  "https://cn.example.test/v2/plugin/auth/token/refresh",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt"},
+			want:    "cn.example.test",
+		},
+		{
+			name:    "CN chat 回落链备选域用实际 endpoint host",
+			reqURL:  "https://copilot.tencent.com/v2/plugin/auth/token/refresh",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt"},
+			want:    "copilot.tencent.com",
+		},
+		{
+			name:    "CN 有 domain 时账号 domain 优先",
+			reqURL:  "https://cn.example.test/v2/plugin/auth/token/refresh",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt", Domain: "copilot.tencent.com"},
+			want:    "copilot.tencent.com",
+		},
+		{
+			name:    "global 无 domain 仍固定 www.workbuddy.ai",
+			reqURL:  "https://global.example.test/v2/plugin/auth/token/refresh",
+			account: globalNoDomain,
+			want:    "www.workbuddy.ai",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, testCase.reqURL, http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			New().RefreshHeaders(req, testCase.account)
+
+			if got := req.Header.Get("X-Domain"); got != testCase.want {
+				t.Errorf("X-Domain=%q want %q", got, testCase.want)
+			}
+		})
+	}
+}
