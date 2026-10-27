@@ -832,7 +832,7 @@ func (c *Client) DesktopChatWithExpert(
 
 // setDesktopExpertHeaders 注入桌面指纹 chat 请求头（可带 X-Expert-Id）。
 // 对齐官方桌面端 chat 头组：完整三段 UA + X-Agent-Intent/Purpose/Type + X-Private-Data
-// （取值按 realm，见 privateDataHeaderValue）+ 会话头族 + traceparent/b3/X-B3-* 链路族
+// （取值按账号身份，见 privateDataHeaderValue）+ 会话头族 + traceparent/b3/X-B3-* 链路族
 // + acp-connection-id。
 func (c *Client) setDesktopExpertHeaders(
 	req *http.Request, account5 *auth.Auth, conversationID, expertID string,

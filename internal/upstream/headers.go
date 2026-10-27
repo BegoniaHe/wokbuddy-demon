@@ -492,12 +492,13 @@ func (c *Client) attributionClientName() string {
 }
 
 // privateDataHeaderValue 返回 X-Private-Data 的取值（chat 与桌面专家路径同口径）：
-// CN 5.9.3 官方 `applyPrivateDataHeaderPolicy` 在个人号的默认分支发 false；
-// global 基线仍是 5.8.4，旧逻辑发 true，等 global 升到 5.9.x 后按同一逻辑复核。
+// CN 5.9.3 官方 `applyPrivateDataHeaderPolicy` 在个人号的默认分支发 false，
+// 企业号因 `isEnterpriseEdition` 命中同一判定而发 true；global 基线仍是 5.8.4，
+// 旧逻辑发 true，等 global 升到 5.9.x 后按同一逻辑复核。
 // 远端 abTest（DefaultModelOptimizationOff）与会话 meta `privateDataSticky`
 // 都不在网关范围：本仓没有这两类状态来源，只对齐静态默认分支。
 func privateDataHeaderValue(account *auth.Auth) string {
-	if account != nil && account.IsGlobal() {
+	if account != nil && (account.IsGlobal() || account.IsEnterprise()) {
 		return "true"
 	}
 
@@ -510,7 +511,7 @@ func privateDataHeaderValue(account *auth.Auth) string {
 // 默认（ClientName 空）对齐官方桌面端 chat 指纹：
 //
 //	X-Agent-Purpose=conversation、X-Agent-Intent=craft、X-Agent-Type=main、
-//	X-Private-Data=<CN false / global true，见 privateDataHeaderValue>、
+//	X-Private-Data=<CN 个人 false / 企业或 global true，见 privateDataHeaderValue>、
 //	X-IDE-Name/Type=WorkBuddy、X-IDE-Version=<realm 版本>、X-Product=SaaS（=deploymentType）。
 //
 // 显式 ClientName 非空时 X-Product 与 X-IDE-Name/Type 跟随该值（自定义归因逃生门）。
