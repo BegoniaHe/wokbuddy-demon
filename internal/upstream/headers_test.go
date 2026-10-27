@@ -425,9 +425,10 @@ func TestRefreshDomain(t *testing.T) {
 	}
 }
 
-// TestPrivateDataHeaderPerRealm X-Private-Data 按 realm 分层：CN 5.9.3 官方
-// applyPrivateDataHeaderPolicy 在个人号默认分支发 false；global 基线仍是 5.8.4，
-// 旧逻辑发 true，等 global 升到 5.9.x 后按同一逻辑复核（issue #343）。
+// TestPrivateDataHeaderPerRealm X-Private-Data 按账号身份分层：CN 5.9.3 官方
+// applyPrivateDataHeaderPolicy 在个人号默认分支发 false、企业号发 true；
+// global 基线仍是 5.8.4，旧逻辑发 true，等 global 升到 5.9.x 后按同一逻辑复核
+// （issue #343）。
 func TestPrivateDataHeaderPerRealm(t *testing.T) {
 	t.Parallel()
 
@@ -437,6 +438,7 @@ func TestPrivateDataHeaderPerRealm(t *testing.T) {
 		want    string
 	}{
 		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "false"},
+		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
 		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
 	}
 

@@ -57,8 +57,8 @@
     （`main/account.js`）。本仓 `CommonHeaders` 在 chat 也发，属待清理差异。
   - chat 桌面头组：`setDesktopExpertHeaders()`（`X-Domain` / `X-Product=SaaS` /
     `X-User-Id` / `X-Agent-Intent|Purpose|Type` /
-    `X-Private-Data`（`privateDataHeaderValue()`：CN 5.9.3 默认 `false`，
-    global 5.8.4 旧基线仍 `true`）/ `X-Ide-Name|Type|Version` /
+    `X-Private-Data`（`privateDataHeaderValue()`：CN 5.9.3 个人号 `false`、
+    企业号 `true`；global 5.8.4 旧基线仍 `true`）/ `X-Ide-Name|Type|Version` /
     `X-Codebuddy-Request` / traceparent + b3 单头 + `X-B3-*` 四件套）。
   - `X-Agent-Runtime`：5.9.3 起官方在 chat / images / search / webfetch 全发；
     `ChatHeaders` 统一发兜底值 `other`（网关无 session meta /

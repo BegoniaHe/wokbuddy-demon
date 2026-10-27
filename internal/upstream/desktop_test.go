@@ -401,7 +401,7 @@ func TestReadServerRequestIDSkipsInvalidID(t *testing.T) {
 }
 
 // TestDesktopExpertHeadersPrivateDataPerRealm 桌面专家路径与 chat 同口径：
-// X-Private-Data 按 realm 取 privateDataHeaderValue（CN false / global true），
+// X-Private-Data 取 privateDataHeaderValue（CN 个人 false / 企业或 global true），
 // 避免两条 chat 出口出现第三种取值（issue #343）。
 func TestDesktopExpertHeadersPrivateDataPerRealm(t *testing.T) {
 	t.Parallel()
@@ -414,6 +414,7 @@ func TestDesktopExpertHeadersPrivateDataPerRealm(t *testing.T) {
 		want    string
 	}{
 		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "false"},
+		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
 		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
 	}
 
