@@ -1642,6 +1642,12 @@ func (h *Handler) crossRealmAllowed(input *chatInput, realm, bareModel string) b
 		return false
 	}
 
+	// 部署级白名单按域限定时（如 models.allowed=["cn:x"]），另一域的服务不能借同一
+	// 裸名绕过域作用域：与命名密钥的域限定白名单同口径，两域都放行才允许回退。
+	if !h.modelAllowedByConfig(otherRealm(realm), bareModel) {
+		return false
+	}
+
 	if input.keyUsage != nil && h.cfg.Keys != nil {
 		if !h.cfg.Keys.ModelAllowed(input.keyUsage.id, otherRealm(realm)+":"+bareModel) {
 			return false
