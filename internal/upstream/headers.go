@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -590,12 +589,13 @@ func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 	injectEnterpriseHeaders(req, account)
 
 	// X-Domain：账号 domain 优先；global 缺省固定 www.workbuddy.ai；CN 个人号
-	// 无 domain 时官方回落 endpoint authority，本仓同形回落 chat endpoint host。
+	// 无 domain 时官方回落 endpoint authority，这里取本次 refresh 请求的实际
+	// host（可能是 chat 回落链里的备选域，不能只看首选 origin）。
 	if d := account.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
 	} else if account.IsGlobal() {
 		req.Header.Set("X-Domain", "www.workbuddy.ai")
-	} else if host := hostOfChatOrigin(c, account); host != "" {
+	} else if host := req.URL.Host; host != "" {
 		req.Header.Set("X-Domain", host)
 	}
 	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
@@ -603,20 +603,4 @@ func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 
 	// 官方 refresh 复用当前 trace span；网关侧无活动 span，故生成一组自洽的新链路 id。
 	injectTraceHeaders(req, session.NewUUIDv7Hex(), session.NewUUIDv7Hex(), session.NewUUIDv7Hex())
-}
-
-// hostOfChatOrigin 返回账号 chat 首选 origin 的 host（CN 空配置已回落默认域）。
-// 解析失败返回空串，调用方不注入 X-Domain。
-func hostOfChatOrigin(c *Client, account *auth.Auth) string {
-	origins := c.chatOrigins(account)
-	if len(origins) == 0 {
-		return ""
-	}
-
-	u, err := url.Parse(origins[0])
-	if err != nil {
-		return ""
-	}
-
-	return u.Host
 }

@@ -359,35 +359,50 @@ func TestRefreshHeadersTrace(t *testing.T) {
 }
 
 // TestRefreshDomain refresh 的 X-Domain：账号 domain 优先；global 缺省
-// www.workbuddy.ai；CN 无 domain 回落 chat endpoint host（含 cn.chat_base 覆盖）。
+// www.workbuddy.ai；CN 无 domain 回落到本次 refresh 请求的 endpoint host
+// （含 cn.chat_base 覆盖与 chat 回落链里的备选域）。
 func TestRefreshDomain(t *testing.T) {
 	t.Parallel()
 
+	globalNoDomain := &auth.Auth{UID: "u-global", AccessToken: "at", RefreshToken: "rt"}
+	if _, err := auth.BackfillRealmFor(globalNoDomain, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor: %v", err)
+	}
+
 	cases := []struct {
-		name     string
-		chatBase string
-		account  *auth.Auth
-		want     string
+		name    string
+		reqURL  string
+		account *auth.Auth
+		want    string
 	}{
 		{
 			name:    "CN 无 domain 回落默认 chat host",
+			reqURL:  "https://www.workbuddy.cn/v2/plugin/auth/token/refresh",
 			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt"},
 			want:    "www.workbuddy.cn",
 		},
 		{
-			name:     "CN chat_base 覆盖时跟随该 host",
-			chatBase: "https://cn.example.test/v2",
-			account:  &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt"},
-			want:     "cn.example.test",
+			name:    "CN chat_base 覆盖时跟随该 host",
+			reqURL:  "https://cn.example.test/v2/plugin/auth/token/refresh",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt"},
+			want:    "cn.example.test",
+		},
+		{
+			name:    "CN chat 回落链备选域用实际 endpoint host",
+			reqURL:  "https://copilot.tencent.com/v2/plugin/auth/token/refresh",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt"},
+			want:    "copilot.tencent.com",
 		},
 		{
 			name:    "CN 有 domain 时账号 domain 优先",
+			reqURL:  "https://cn.example.test/v2/plugin/auth/token/refresh",
 			account: &auth.Auth{UID: "u-cn", AccessToken: "at", RefreshToken: "rt", Domain: "copilot.tencent.com"},
 			want:    "copilot.tencent.com",
 		},
 		{
 			name:    "global 无 domain 仍固定 www.workbuddy.ai",
-			account: &auth.Auth{UID: "u-global", AccessToken: "at", RefreshToken: "rt", Domain: "www.workbuddy.ai"},
+			reqURL:  "https://global.example.test/v2/plugin/auth/token/refresh",
+			account: globalNoDomain,
 			want:    "www.workbuddy.ai",
 		},
 	}
@@ -396,13 +411,12 @@ func TestRefreshDomain(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			client := New()
-			if testCase.chatBase != "" {
-				client.ChatBaseCN = testCase.chatBase
+			req, err := http.NewRequest(http.MethodPost, testCase.reqURL, http.NoBody)
+			if err != nil {
+				t.Fatal(err)
 			}
 
-			req, _ := http.NewRequest(http.MethodPost, "https://example.invalid/v2/auth/refresh", http.NoBody)
-			client.RefreshHeaders(req, testCase.account)
+			New().RefreshHeaders(req, testCase.account)
 
 			if got := req.Header.Get("X-Domain"); got != testCase.want {
 				t.Errorf("X-Domain=%q want %q", got, testCase.want)
