@@ -273,8 +273,9 @@ type Config struct {
 		//
 		// 官方桌面把签到 / 资源 / 增长事件发到产品 endpoint https://www.workbuddy.cn；
 		// 本仓默认仍保留 codebuddy.cn，直至用真实 CN token 实测确认后再决定是否切换。
-		// 影响 billing / 签到 / 活跃上报（report.go）；不影响 growth 任务 / 旅行
-		// （走 chatBase）、桌面 /v2/report（走 webBase）与小程序埋点（固定 codebuddy.cn）。
+		// 影响 billing / 签到 / 活跃上报（report.go，走 billingBase）；不影响 growth 任务 /
+		// 旅行（走 chatBase）、桌面 /v2/report（走 desktopBase → chatBase）、Web 上报
+		// （走 webBase）与小程序埋点（固定 codebuddy.cn）。
 		BillingBase string `json:"billing_base"`
 	} `json:"cn"`
 
