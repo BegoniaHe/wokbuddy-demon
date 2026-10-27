@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -180,7 +181,8 @@ func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("User-Agent", c.userAgent(account2))
-	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
+	// X-CodeBuddy-Request: 1（D1 风控闸门头）。官方 chat adapter 未注入，
+	// daemon/ACP 注入；本仓无实测证明移除安全，按 D1 保留（见 UPSTREAM.md §六）。
 	req.Header.Set("X-Codebuddy-Request", "1")
 	// chat/通用 API 不发 Accept-Language：官方 chat 路径没有该头（只有 billing/
 	// account 分页按 locale 带，见 BillingHeaders）。为「看起来像浏览器」补该头反而
@@ -339,7 +341,7 @@ func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 //   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
 //     实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v4 形态 UUID。
 //
-//nolint:funlen,gocritic,maintidx // ChatMeta 值传递保持公开 API 简单；头族注入线性展开。
+//nolint:gocritic // ChatMeta 值传递保持公开 API 简单；头族注入线性展开。
 func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
@@ -381,14 +383,20 @@ func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	setHeaderIfNonEmpty(req, "X-Compaction", meta.Compaction)
 	setHeaderIfNonEmpty(req, "X-Context-Compacted", meta.ContextCompacted)
 
-	traceID := meta.TraceID
+	injectTraceHeaders(req, meta.TraceID, convReqID, messageID)
+}
+
+// injectTraceHeaders 注入链路头族（X-Trace-Id / traceparent / b3 / X-B3-*）。
+// chat 与 refresh 共用：官方 refresh 复用当前 trace span；网关侧 refresh 没有
+// 活动 span，由调用方生成一组自洽的新链路 id。
+func injectTraceHeaders(req *http.Request, traceID, b3Seed, messageID string) {
 	if traceID == "" {
-		traceID = convReqID
+		traceID = b3Seed
 	}
 
 	req.Header.Set("X-Trace-Id", traceID)
 
-	b3Trace := convReqID
+	b3Trace := b3Seed
 	if !validTraceID(b3Trace) {
 		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
 	}
@@ -581,11 +589,34 @@ func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 
 	injectEnterpriseHeaders(req, account)
 
+	// X-Domain：账号 domain 优先；global 缺省固定 www.workbuddy.ai；CN 个人号
+	// 无 domain 时官方回落 endpoint authority，本仓同形回落 chat endpoint host。
 	if d := account.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
 	} else if account.IsGlobal() {
 		req.Header.Set("X-Domain", "www.workbuddy.ai")
+	} else if host := hostOfChatOrigin(c, account); host != "" {
+		req.Header.Set("X-Domain", host)
 	}
 	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
+
+	// 官方 refresh 复用当前 trace span；网关侧无活动 span，故生成一组自洽的新链路 id。
+	injectTraceHeaders(req, session.NewUUIDv7Hex(), session.NewUUIDv7Hex(), session.NewUUIDv7Hex())
+}
+
+// hostOfChatOrigin 返回账号 chat 首选 origin 的 host（CN 空配置已回落默认域）。
+// 解析失败返回空串，调用方不注入 X-Domain。
+func hostOfChatOrigin(c *Client, account *auth.Auth) string {
+	origins := c.chatOrigins(account)
+	if len(origins) == 0 {
+		return ""
+	}
+
+	u, err := url.Parse(origins[0])
+	if err != nil {
+		return ""
+	}
+
+	return u.Host
 }

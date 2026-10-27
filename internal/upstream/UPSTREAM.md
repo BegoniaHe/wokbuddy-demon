@@ -95,6 +95,17 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - 队列业务码 `6020/6021/6022`、限流族 `6000-6008`、额度/认证码按客户端枚举实现；请求级码（`11125/11129/.../11155`、`12654/14405`）不罚号不轮转，`11136` 换号并做模型级避让，`11141` 模型下线 fail-fast，`11102` 模型目录不存在按请求级 404 fail-fast（不换号），`11-128` 入站按内容拦截。
 - SSE error 帧与 HTTP 200 业务信封优先按结构化 `code`（含 `bizCode`）分类，取不到再回落 message；客户端 `data.statusCode`/`actions`、`cgicode/ret/retcode` 与 `172xx` 技能码尚未进入聊天主路径验证，暂不实现。
 
+chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
+
+| 项 | 状态 | 依据 |
+| --- | --- | --- |
+| refresh trace（`X-Trace-Id` / `Traceparent` / `B3` / `X-B3-*`） | 已对齐 | 官方 `cli/dist/codebuddy-lite-wb.mjs` 的 `AccountScopedAuth.refreshSession()` 追加 `traceSpan.requestHeaders`；网关无活动 span，故生成自洽的新链路 id |
+| CN refresh `X-Domain` | 已对齐 | 官方 `enterpriseHeaders()` 无 domain 时回落 endpoint authority；本仓回落 chat endpoint host，`cn.chat_base` 覆盖时跟随 |
+| `X-Stainless-*` | 不补 | 由 OpenAI Node SDK 自动生成；本仓出站不是 Node SDK，补等于伪造 SDK 运行时版本 |
+| `X-Codebuddy-Request: 1` | 刻意保留 | D1 风控闸门头；官方 chat adapter 未注入、daemon/ACP 注入，但无实测证明移除安全 |
+| 个人号 `X-No-Enterprise-Id` / `X-No-Department-Info` | 刻意保留 | 非 chat 端点也声明无部门信息（#298），按 chat-only 收窄会回退该修复 |
+| custom model 的 `X-Private-Data` | 不适用 | 本仓没有 custom 模型上游路由（`isCustomModel` 仅用于模型目录可见性），无触达路径 |
+
 桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。
 
 ## 七、参考 fork 审计工具（sync-upstream 技能）
