@@ -22,6 +22,9 @@
     `/v2/...`。`checkinMeterPaths()`：两 realm 均 `/v2` 优先，404 回落旧路径。
   - `WebBaseCN`（`https://www.workbuddy.cn`）：任务领奖 / profile 域。
   - `/v3/config` 拉取 + `X-Domain`：见 `internal/upstream/client.go` 1874 附近。
+  - 企业模型目录：`/console/enterprises/<enterpriseId|personal>/models`（官方
+    `CloudAgentProvider.getModels()` 按账号拼 `enterpriseId`），失败回落
+    `/v2/enterprises/personal/models`（官方 daemon 侧固定 personal）。
 - 桌面指纹上报：`internal/upstream/desktop.go`：`/v2/report`、
   `/v2/user-asset/appearance/set`、`desktopFingerprint`（commit / releaseDate
   来自部署 profile，源码无固定构建常量）。
