@@ -52,6 +52,9 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
+	// desktopReportUA 官方 report body 的 navigator.userAgent：Electron 主进程
+	// 跑在 Node 22 上，Node 只暴露主版本号。HTTP 头仍用 desktopUAFor。
+	desktopReportUA = "Node.js/22"
 )
 
 // desktopLocal 桌面端事件中 source/mode 字段的本地标记值（官方分发端恒发此值）。
@@ -334,9 +337,10 @@ func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"sessionId":   c.desktopSessionID(account7),
 		"extName":     "workbuddy-desktop",
 		keyExtVersion: c.desktopExtVersionFor(account7),
-		// 官方 report body 取 navigator.userAgent / navigator.platform（Windows
-		// 返回 Win32）：UA 与桌面上报头同源，不按版本号拼接。
-		"userAgent":  c.desktopUAFor(account7),
+		// 官方 report body 取 Electron 主进程的 navigator.userAgent
+		// （Windows 下 Node 22 为 Node.js/22）与 navigator.platform（Win32），
+		// 与 /v2/report 的 HTTP 头 UA 不同源。
+		"userAgent":  desktopReportUA,
 		"os":         "Win32",
 		"arch":       "x64",
 		"osVersion":  osVersion,

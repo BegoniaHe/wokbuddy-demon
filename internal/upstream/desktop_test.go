@@ -47,9 +47,9 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 		t.Errorf("UA=%q want %q", gotUA, want)
 	}
 
-	// body 的 userAgent 与上报头同源，os 对齐 navigator.platform（Win32）。
-	if want := client.desktopUAFor(account); got[0]["userAgent"] != want {
-		t.Errorf("userAgent=%v want %q（与桌面上报 UA 同源）", got[0]["userAgent"], want)
+	// body 的 userAgent 取 Electron 主进程 navigator.userAgent，与 HTTP 头不同源。
+	if got[0]["userAgent"] != desktopReportUA {
+		t.Errorf("userAgent=%v want %q（navigator.userAgent）", got[0]["userAgent"], desktopReportUA)
 	}
 
 	if got := got[0]["os"]; got != "Win32" {
@@ -260,21 +260,21 @@ func TestDesktopFingerprintPerRealm(t *testing.T) {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
 
-	assertDesktopUAAndOS(t, cnFP, client, cnAccount, "CN")
+	assertDesktopReportUAAndOS(t, cnFP, "CN")
 
 	if got, want := client.desktopUAFor(globalAccount), "workbuddy-ai/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
 	}
 
-	assertDesktopUAAndOS(t, globalFP, client, globalAccount, "global")
+	assertDesktopReportUAAndOS(t, globalFP, "global")
 }
 
-// assertDesktopUAAndOS 断言指纹的 userAgent 与桌面上报 UA 同源、os 对齐 Win32。
-func assertDesktopUAAndOS(t *testing.T, fingerprint map[string]any, client *Client, account *auth.Auth, realm string) {
+// assertDesktopReportUAAndOS 断言 body 的 userAgent 取 navigator 形态、os 对齐 Win32。
+func assertDesktopReportUAAndOS(t *testing.T, fingerprint map[string]any, realm string) {
 	t.Helper()
 
-	if want := client.desktopUAFor(account); fingerprint["userAgent"] != want {
-		t.Errorf("%s userAgent=%v want %q", realm, fingerprint["userAgent"], want)
+	if fingerprint["userAgent"] != desktopReportUA {
+		t.Errorf("%s userAgent=%v want %q", realm, fingerprint["userAgent"], desktopReportUA)
 	}
 
 	if fingerprint["os"] != "Win32" {

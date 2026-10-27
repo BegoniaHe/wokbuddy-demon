@@ -28,16 +28,18 @@
     `/v2/enterprises/personal/models`（官方 daemon 侧固定 personal）。
 - 桌面指纹上报：`internal/upstream/desktop.go`：`/v2/report`、
   `/v2/user-asset/appearance/set`、`desktopFingerprint`（commit / releaseDate
-  来自部署 profile，源码无固定构建常量；body 的 `userAgent` 取桌面 UA 字面量，
-  `os` 为 `Win32`，对应官方 `navigator.userAgent` / `navigator.platform`）。
+  来自部署 profile，源码无固定构建常量；body 的 `userAgent` 固定为
+  `Node.js/22`（Electron 主进程 `navigator.userAgent`），与 HTTP 头桌面 UA
+  不同源；`os` 为 `Win32`（官方 `navigator.platform`））。
 
 ## 请求头族
 
 - `internal/upstream/headers.go`
   - `userAgent()` / `desktopUAFor()` 默认取部署 profile 的冻结字面量
     （`internal/clientprofile`）；显式 config `user_agent` / `client_version` /
-    `cli_version` 才覆盖版本段。`billingUA()` 只服务 billing 域 report / banner
-    这类显式 UA 面（默认 billing meter **不发** UA）。
+    `cli_version` 才覆盖版本段。billing meter 走 `restOperations` 的
+    `WorkbuddyUserAgentHttpInterceptor`，默认与 `desktopUA` 同形；`billingUA()`
+    只服务 billing 域 report / banner 这类显式单段 UA 面。
   - chat UA 模板（`cli/dist/codebuddy-lite-wb.mjs` 的
     `UserAgentHttpInterceptor.buildUserAgent`）：
     `WorkBuddy/<platformVersion> <applicationName>/<platformVersion> CLI/<cliVersion>`。
