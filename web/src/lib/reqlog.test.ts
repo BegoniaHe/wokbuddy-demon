@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cacheRateText, fmtBytes, reqMatch, reqTokenCell, type RequestEntry } from './reqlog';
+import { cacheRateText, fmtBytes, reqMatch, reqTokenCell, reqToolCell, type RequestEntry } from './reqlog';
 
 describe('reqMatch', () => {
   const e: RequestEntry = {
@@ -25,6 +25,18 @@ describe('reqTokenCell', () => {
     expect(reqTokenCell({ total_tokens: 1500 })).toBe('1.5k');
     expect(reqTokenCell({ prompt_tokens: 1000, completion_tokens: 500 })).toBe('1.5k');
     expect(reqTokenCell({})).toBe('—');
+  });
+});
+
+describe('reqToolCell', () => {
+  it('未声明 tools 显示 —', () => {
+    expect(reqToolCell({})).toBe('—');
+    expect(reqToolCell(undefined)).toBe('—');
+    expect(reqToolCell({ tools_declared: 0, tool_calls: 0 })).toBe('—');
+  });
+  it('声明数与调用数并列，零调用显示 0', () => {
+    expect(reqToolCell({ tools_declared: 3, tool_calls: 2 })).toBe('3 / 2');
+    expect(reqToolCell({ tools_declared: 3 })).toBe('3 / 0');
   });
 });
 

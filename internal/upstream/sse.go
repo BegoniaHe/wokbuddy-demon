@@ -148,6 +148,9 @@ type streamAggregator struct {
 	sawDone       bool // 上游显式发过 data: [DONE]（正常收尾）
 	sawFinish     bool // 收到过非空 finish_reason（EOF 无 [DONE] 时视为完整收尾）
 	toolCalls     map[int]map[string]any
+	// functionCall 旧式（OpenAI functions API）function_call 的累计形态：name
+	// 覆盖、arguments 拼接；与 tool_calls 互斥。
+	functionCall map[string]any
 	// tools 解析 tool_call 归属 index（兼容上游省略 index 的形态）；聚合与逐帧
 	// 透传路径共用同一套规则。
 	tools *toolIndex
@@ -289,35 +292,7 @@ func deltaReasoning(node map[string]any) (string, bool) {
 // handleDelta 并入一个流式 delta（role/content/reasoning_content/tool_calls）。
 // 聚合超限返回错误（issue #113）。
 func (a *streamAggregator) handleDelta(delta map[string]any) error {
-	if r2, ok := delta["role"].(string); ok && r2 != "" {
-		a.role = r2
-	}
-
-	if txt, ok := delta["content"].(string); ok {
-		if err := a.appendContent(txt); err != nil {
-			return err
-		}
-	}
-
-	if rc, ok := deltaReasoning(delta); ok {
-		if err := a.guard.add(len(rc)); err != nil {
-			return err
-		}
-
-		a.reasoning.WriteString(rc)
-	}
-
-	if refusal, ok := delta["refusal"].(string); ok {
-		a.refusal.WriteString(refusal)
-	}
-
-	if tcs, ok := delta["tool_calls"].([]any); ok {
-		if err := a.mergeToolCallsChunk(tcs); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return a.mergeFields(delta)
 }
 
 // mergeMessageFields 把非 delta 的完整 message 内容并入聚合（message 是整条下发，
@@ -325,31 +300,62 @@ func (a *streamAggregator) handleDelta(delta map[string]any) error {
 // 同构透出；content 同样置 gotAnyContent，与 delta 路径的 latch 语义一致
 // （一帧整条 message 之后，后续 delta 帧不重复追加）。
 func (a *streamAggregator) mergeMessageFields(msg map[string]any) error {
-	if r2, ok := msg["role"].(string); ok && r2 != "" {
+	return a.mergeFields(msg)
+}
+
+// mergeFields 是 delta 与 message 两路共用的字段归并逻辑：role/content/
+// reasoning_content/refusal/tool_calls/function_call。聚合超限返回错误。
+func (a *streamAggregator) mergeFields(fields map[string]any) error {
+	if r2, ok := fields["role"].(string); ok && r2 != "" {
 		a.role = r2
 	}
 
-	if txt, ok := msg["content"].(string); ok {
+	if txt, ok := fields["content"].(string); ok {
 		if err := a.appendContent(txt); err != nil {
 			return err
 		}
 	}
 
-	if rc, ok := deltaReasoning(msg); ok {
-		if err := a.guard.add(len(rc)); err != nil {
-			return err
-		}
-
-		a.reasoning.WriteString(rc)
+	if err := a.mergeReasoning(fields); err != nil {
+		return err
 	}
 
-	if refusal, ok := msg["refusal"].(string); ok {
+	if refusal, ok := fields["refusal"].(string); ok {
 		a.refusal.WriteString(refusal)
 	}
 
-	if tcs, ok := msg["tool_calls"].([]any); ok {
-		return a.mergeToolCallsChunk(tcs)
+	return a.mergeCalls(fields)
+}
+
+// mergeCalls 并入 tool_calls 与旧式 function_call（聚合超限返回错误）。
+func (a *streamAggregator) mergeCalls(fields map[string]any) error {
+	if tcs, ok := fields["tool_calls"].([]any); ok {
+		if err := a.mergeToolCallsChunk(tcs); err != nil {
+			return err
+		}
 	}
+
+	if functionCall, ok := fields["function_call"].(map[string]any); ok {
+		if err := a.mergeFunctionCallChunk(functionCall); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// mergeReasoning 并入 reasoning_content / reasoning 别名（计入聚合总量上限）。
+func (a *streamAggregator) mergeReasoning(fields map[string]any) error {
+	rc, ok := deltaReasoning(fields)
+	if !ok {
+		return nil
+	}
+
+	if err := a.guard.add(len(rc)); err != nil {
+		return err
+	}
+
+	a.reasoning.WriteString(rc)
 
 	return nil
 }
@@ -496,6 +502,31 @@ func (a *streamAggregator) mergeToolCallsChunk(tcs []any) error {
 	return nil
 }
 
+// mergeFunctionCallChunk 合并旧式 function_call 分片：name 覆盖、arguments 拼接。
+// 空占位（name/arguments 全空）是噪声，与 normalizeDelta 的 keepFunctionCall 同口径；
+// arguments 累计量计入聚合总量上限。
+func (a *streamAggregator) mergeFunctionCallChunk(chunk map[string]any) error {
+	if !keepFunctionCall(chunk) {
+		return nil
+	}
+
+	if a.functionCall == nil {
+		a.functionCall = map[string]any{}
+	}
+
+	setStringIfNonEmpty(a.functionCall, chunk, "name")
+
+	if args, _ := chunk["arguments"].(string); args != "" {
+		if err := a.guard.add(len(args)); err != nil {
+			return err
+		}
+	}
+
+	appendStringIfNonEmpty(a.functionCall, chunk, "arguments")
+
+	return nil
+}
+
 // result 由聚合状态构造最终的非流式响应；无有效事件返回 errEmptyStream，
 // EOF 截断（未见过 [DONE]）返回 errTruncatedStream——两者都不是成功响应。
 func (a *streamAggregator) result() (map[string]any, error) {
@@ -532,7 +563,7 @@ func (a *streamAggregator) result() (map[string]any, error) {
 		message["refusal"] = a.refusal.String()
 	}
 
-	a.attachToolCalls(message)
+	a.attachCalls(message)
 
 	resp := map[string]any{
 		"id":      a.id,
@@ -556,6 +587,12 @@ func (a *streamAggregator) result() (map[string]any, error) {
 	}
 
 	return resp, nil
+}
+
+// attachCalls 把累计的 tool_calls 与旧式 function_call 写入 message。
+func (a *streamAggregator) attachCalls(message map[string]any) {
+	a.attachToolCalls(message)
+	a.attachFunctionCall(message)
 }
 
 // attachToolCalls 把累计的 tool_calls 按序写入 message（截断流剔除残缺参数）。
@@ -583,6 +620,21 @@ func (a *streamAggregator) attachToolCalls(message map[string]any) {
 	if len(calls) > 0 {
 		message["tool_calls"] = calls
 	}
+}
+
+// attachFunctionCall 把累计的旧式 function_call 写入 message。截断流下参数残缺
+// （与 tool_calls 同口径）时不写回，避免客户端解析非法 JSON；空占位不写回。
+func (a *streamAggregator) attachFunctionCall(message map[string]any) {
+	if len(a.functionCall) == 0 {
+		return
+	}
+
+	truncatedStream := a.finishReason == "length" || !a.sawDone
+	if args, _ := a.functionCall["arguments"].(string); truncatedStream && isTruncatedArguments(args) {
+		return
+	}
+
+	message["function_call"] = a.functionCall
 }
 
 // ensureUsageTotal 在 usage 缺 total_tokens 但 prompt_tokens/completion_tokens 都在时

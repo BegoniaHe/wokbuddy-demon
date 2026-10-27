@@ -1369,7 +1369,10 @@ type chatFlow struct {
 	bareModel     string
 	modelRate     string
 	declaredTools map[string]bool
-	reqHasImage   bool
+	// declaredToolCount 本请求声明的去重工具数（不含会话历史），>0 才进请求归档
+	// 的「声明 / 调用」统计；declaredTools 仍含历史名，供标记修复判定。
+	declaredToolCount int
+	reqHasImage       bool
 	// reqModalities 请求携带的非文本输入模态（issue #109，改写前取一次，
 	// 供 gateway_hint 与能力判定/路由共用，避免重复解析请求体）。
 	reqModalities []string
@@ -1664,6 +1667,9 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	}
 	// 请求模态在改写前解析一次（gateway_hint + 能力判定/路由共用）。
 	reqMods := requestModalities(chatInput2.body)
+	// 工具名名单与声明数一次解析：名单（声明 ∪ 历史）供标记修复判定，声明数
+	// 只数本请求 tools/functions，供请求归档的「声明 / 调用」统计。
+	declaredTools, declaredToolCount := upstream.ToolFacts(chatInput2.body)
 	chatFlow2 := &chatFlow{
 		h: h, out: out, clientIP: chatInput2.clientIP,
 		body:     chatInput2.body,
@@ -1675,7 +1681,8 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
-		declaredTools: upstream.ToolNameAllowlist(chatInput2.body),
+		declaredTools:     declaredTools,
+		declaredToolCount: declaredToolCount,
 		// gateway_hint 判定与模态能力判定所需的请求形态（多模态 part）：在改写前取。
 		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
 		reqModalities:  reqMods,
@@ -3092,6 +3099,12 @@ func (f *chatFlow) finishStreamStats(
 	}
 
 	f.recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted, stats.TTFB())
+	// 工具面（issue #329）：stats 读的是修复器之前的原始字节，markup 还原出的调用
+	// 不在其中，用 repair.Converted() 补上（二者不重叠）。
+	if f.declaredToolCount > 0 {
+		f.st.toolsDeclared = f.declaredToolCount
+		f.st.toolCalls = stats.ToolCallCount() + repair.Converted()
+	}
 	// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
 	if f.st.hasCache {
 		cacheMissWarn.noteCacheTokens(f.bareModel, f.st.promptTokens, f.st.cacheHit, f.st.cacheMiss)
@@ -3168,6 +3181,13 @@ func (f *chatFlow) handleNonStreamSuccess(
 	}
 
 	credit, total, hasCredit := usageCreditTotal(resp)
+
+	// 工具面（issue #329）：RepairAggregatedResponse 已把还原结果写回同一个 resp，
+	// 直接数 message.tool_calls 即可；此处不再加 mrepair.Converted()（会双计）。
+	if f.declaredToolCount > 0 {
+		f.st.toolsDeclared = f.declaredToolCount
+		f.st.toolCalls = responseToolCallCount(resp)
+	}
 	// 缓存三维观测与流式同源同口径（cacheTokensFromUsage）：非流式此前只看 hit 侧，
 	// miss 显式存在而 hit 缺失时直接丢弃，导致「prompt 数万 + hit=0」误报告警。
 	if usageMap, ok := resp["usage"].(map[string]any); ok {
@@ -3253,6 +3273,37 @@ func firstChoice(resp map[string]any) map[string]any {
 	choice, _ := choices[0].(map[string]any)
 
 	return choice
+}
+
+// responseToolCallCount 统计聚合响应 choices[0].message 的工具调用条数：tool_calls
+// 数组 + 非空旧式 function_call（二者与流式统计同口径）。供请求归档的「声明 / 调用」
+// 统计（issue #329），不改变响应内容。聚合器写回的是 []map[string]any（in-process），
+// 经过 JSON 反序列化的是 []any；两种形态都要认，否则非流式会恒记 0。
+func responseToolCallCount(resp map[string]any) int {
+	choice := firstChoice(resp)
+	if choice == nil {
+		return 0
+	}
+
+	message, _ := choice["message"].(map[string]any)
+	if message == nil {
+		return 0
+	}
+
+	count := 0
+
+	switch calls := message["tool_calls"].(type) {
+	case []any:
+		count = len(calls)
+	case []map[string]any:
+		count = len(calls)
+	}
+
+	if fc, ok := message["function_call"].(map[string]any); ok && functionCallMapHasPayload(fc) {
+		count++
+	}
+
+	return count
 }
 
 // mergeNonStreamContinuation 拼接两段正文，终态/usage 取第二段（最终回答）。

@@ -411,7 +411,8 @@ func parseMarkupParams(body string) (string, bool) {
 	return string(out), true
 }
 
-// ToolNameAllowlist 从客户端请求体里收集「可用于判定工具调用」的工具名集合。
+// ToolFacts 从客户端请求体里收集「可用于判定工具调用」的工具名集合，并单独给出
+// 本请求声明的去重工具数（供请求归档统计「声明 / 实际调用」）。
 //
 // 两个来源都要，因为二者会分别缺失：
 //  1. 本请求声明的工具：OpenAI tools[].function.name、Responses 风格裸 tools[].name、
@@ -420,29 +421,38 @@ func parseMarkupParams(body string) (string, bool) {
 //     messages[].function_call.name。多轮会话里这份名单几乎总在，且天然可信——
 //     它是客户端自己写进历史的工具名。
 //
-// 两个来源都为空 → 返回 nil，由调用方决定是否启用弱判定（见 NewMarkupRepair）。
+// 返回值的两个口径不同：names 是「声明 ∪ 历史」（供标记修复判定），declared 只数
+// 本请求声明（历史里出现过的工具不算，否则归档里的声明数会被多轮会话放大）。
+//
+// 两个来源都为空 → names 返回 nil，由调用方决定是否启用弱判定（见 NewMarkupRepair）。
 // 解析失败按空处理（不编造名单）。
-func ToolNameAllowlist(body []byte) map[string]bool {
+func ToolFacts(body []byte) (map[string]bool, int) {
 	// 快速预检：工具名只可能来自这几个键；一个都不出现时无需反序列化整个请求体
 	// （纯文本闲聊/无工具请求在长上下文下省一次全量 JSON 解析）。
 	if !containsAny(body, toolNameMarkers) {
-		return nil
+		return nil, 0
 	}
 
 	var req toolNameRequest
 	if json.Unmarshal(body, &req) != nil {
-		return nil
+		return nil, 0
 	}
 
-	names := map[string]bool{}
-	addToolDeclarations(names, req.Tools, req.Functions)
+	declared := map[string]bool{}
+	addToolDeclarations(declared, req.Tools, req.Functions)
+
+	names := make(map[string]bool, len(declared))
+	for name := range declared {
+		names[name] = true
+	}
+
 	addHistoryToolNames(names, req.Messages)
 
 	if len(names) == 0 {
-		return nil
+		return nil, 0
 	}
 
-	return names
+	return names, len(declared)
 }
 
 // toolNameMarkers 工具名相关键的字面量预检集合。取公共前缀（"tool / "function）

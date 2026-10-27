@@ -223,6 +223,74 @@ data: [DONE]
 	}
 }
 
+// TestAggregateLegacyFunctionCall 旧式 function_call（functions API）也按分片聚合：
+// name 覆盖、arguments 拼接；空占位不写回；截断（finish_reason=length）的残缺参数丢弃。
+func TestAggregateLegacyFunctionCall(t *testing.T) {
+	t.Parallel()
+
+	raw := `data: {"id":"x1","model":"glm-5.2","created":1,"choices":[{"index":0,"delta":{"function_call":{"name":"legacy","arguments":""}}}]}
+
+data: {"id":"x1","choices":[{"index":0,"delta":{"function_call":{"arguments":"{\"cmd\":"}}}]}
+
+data: {"id":"x1","choices":[{"index":0,"delta":{"function_call":{"arguments":"\"ls\"}"}}}]}
+
+data: {"id":"x1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+`
+
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+
+	functionCall, ok := msg["function_call"].(map[string]any)
+	if !ok {
+		t.Fatalf("function_call=%#v want map", msg["function_call"])
+	}
+
+	if functionCall["name"] != "legacy" || functionCall["arguments"] != `{"cmd":"ls"}` {
+		t.Fatalf("function_call=%v", functionCall)
+	}
+
+	t.Run("空占位不写回", func(t *testing.T) {
+		t.Parallel()
+
+		empty := "data: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"\",\"arguments\":\"\"}}}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+
+		resp, err := Aggregate(strings.NewReader(empty))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+		if _, ok := msg["function_call"]; ok {
+			t.Fatalf("空占位不应写回: %v", msg["function_call"])
+		}
+	})
+
+	t.Run("截断参数丢弃", func(t *testing.T) {
+		t.Parallel()
+
+		truncated := "data: {\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"name\":\"legacy\",\"arguments\":\"{\\\"cmd\\\":\"}}}]}\n\n" +
+			"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n"
+
+		resp, err := Aggregate(strings.NewReader(truncated))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+		if _, ok := msg["function_call"]; ok {
+			t.Fatalf("截断参数不应写回: %v", msg["function_call"])
+		}
+	})
+}
+
 // TestStripToolCallNames 直测跨帧 name 收敛：首片保留 name、同 index 后续分片删除
 // name 键（空串或重复非空串都删），不同 index 互不串扰，非 tool_calls 帧零影响。
 func TestStripToolCallNames(t *testing.T) {
