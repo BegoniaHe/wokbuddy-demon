@@ -47,6 +47,15 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 		t.Errorf("UA=%q want %q", gotUA, want)
 	}
 
+	// body 的 userAgent 与上报头同源，os 对齐 navigator.platform（Win32）。
+	if want := client.desktopUAFor(account); got[0]["userAgent"] != want {
+		t.Errorf("userAgent=%v want %q（与桌面上报 UA 同源）", got[0]["userAgent"], want)
+	}
+
+	if got := got[0]["os"]; got != "Win32" {
+		t.Errorf("os=%v want Win32（navigator.platform）", got)
+	}
+
 	assertDesktopEventFingerprint(t, got)
 }
 
@@ -117,6 +126,44 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	}
 
 	assertDesktopMachineFingerprint(t, table)
+}
+
+// TestReportDesktopEventBusinessFieldsOverride 业务载荷同名键优先于公共指纹：
+// 真实设备对齐时可用 os / userAgent 覆盖默认伪装值。
+func TestReportDesktopEventBusinessFieldsOverride(t *testing.T) {
+	t.Parallel()
+
+	var got []map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("body must be array: %v", err)
+		}
+
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer srv.Close()
+
+	client := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, Profile: testProfileSet(t)}
+	account := &auth.Auth{AccessToken: "at", UID: "u-override"}
+
+	err := client.ReportDesktopEvent(account, DesktopEvent{
+		"eventCode": "agent_task_created",
+		"os":        "Linux",
+		"userAgent": "RealDevice/1",
+	})
+	if err != nil {
+		t.Fatalf("report desktop: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("events=%d want 1", len(got))
+	}
+
+	if got[0]["os"] != "Linux" || got[0]["userAgent"] != "RealDevice/1" {
+		t.Errorf("os/userAgent=%v/%v want Linux/RealDevice/1（业务字段优先）", got[0]["os"], got[0]["userAgent"])
+	}
 }
 
 // TestDesktopSessionIDProcessScoped sessionId 在同一进程内按账号稳定、不同账号不同，
@@ -213,8 +260,25 @@ func TestDesktopFingerprintPerRealm(t *testing.T) {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
 
+	assertDesktopUAAndOS(t, cnFP, client, cnAccount, "CN")
+
 	if got, want := client.desktopUAFor(globalAccount), "workbuddy-ai/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
+	}
+
+	assertDesktopUAAndOS(t, globalFP, client, globalAccount, "global")
+}
+
+// assertDesktopUAAndOS 断言指纹的 userAgent 与桌面上报 UA 同源、os 对齐 Win32。
+func assertDesktopUAAndOS(t *testing.T, fingerprint map[string]any, client *Client, account *auth.Auth, realm string) {
+	t.Helper()
+
+	if want := client.desktopUAFor(account); fingerprint["userAgent"] != want {
+		t.Errorf("%s userAgent=%v want %q", realm, fingerprint["userAgent"], want)
+	}
+
+	if fingerprint["os"] != "Win32" {
+		t.Errorf("%s os=%v want Win32", realm, fingerprint["os"])
 	}
 }
 
