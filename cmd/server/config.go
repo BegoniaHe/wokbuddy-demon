@@ -1131,27 +1131,9 @@ func (c *Config) normalizeAllowedModels() error {
 		return nil
 	}
 
-	target := strings.TrimSpace(c.Models.BackgroundTarget)
-	if target == "" {
+	realm, bare := c.resolveBackgroundTarget()
+	if bare == "" {
 		return nil
-	}
-
-	realm, bare, prefixed := splitModelRealmPrefix(target)
-	if !prefixed {
-		// 裸目标按 cn 解析（与 models.aliases / resolveModel 一致），不是两域。
-		realm = "cn"
-	}
-	// 后台改写后仍会经过别名解析（resolveFlowModel）：目标写成别名时，白名单要
-	// 校验别名解析后的真实模型，否则「白名单放行别名、运行期却拒绝真实模型」或
-	// 反过来误拒。别名只解析一层，与 resolveRequestModel 同口径。
-	if aliasTarget, ok := c.Models.Aliases[bare]; ok {
-		if aliasRealm, aliasBare, aliasPrefixed := splitModelRealmPrefix(aliasTarget); aliasBare != "" {
-			if aliasPrefixed {
-				realm = aliasRealm
-			}
-
-			bare = aliasBare
-		}
 	}
 
 	for _, entry := range out {
@@ -1167,7 +1149,38 @@ func (c *Config) normalizeAllowedModels() error {
 	}
 
 	return fmt.Errorf("models.allowed: 白名单未覆盖 models.background_target %q，"+
-		"后台任务改写后会被白名单拒绝: %w", target, errNormalizeModelFilter)
+		"后台任务改写后会被白名单拒绝: %w", strings.TrimSpace(c.Models.BackgroundTarget), errNormalizeModelFilter)
+}
+
+// resolveBackgroundTarget 返回后台改写目标最终出站时的 (realm, bare)。后台改写后
+// 仍会经过别名解析（resolveFlowModel）：目标写成别名时，白名单要校验解析后的真实
+// 模型；别名只解析一层，与 resolveRequestModel 同口径。
+func (c *Config) resolveBackgroundTarget() (realm, bare string) {
+	if strings.TrimSpace(c.Models.BackgroundTarget) == "" {
+		return "", ""
+	}
+
+	realm, bare, prefixed := splitModelRealmPrefix(strings.TrimSpace(c.Models.BackgroundTarget))
+	if !prefixed {
+		// 裸目标按 cn 解析（与 models.aliases / resolveModel 一致），不是两域。
+		realm = "cn"
+	}
+
+	aliasTarget, ok := c.Models.Aliases[bare]
+	if !ok {
+		return realm, bare
+	}
+
+	aliasRealm, aliasBare, aliasPrefixed := splitModelRealmPrefix(aliasTarget)
+	if aliasBare == "" {
+		return realm, bare
+	}
+
+	if aliasPrefixed {
+		realm = aliasRealm
+	}
+
+	return realm, aliasBare
 }
 
 // normalizeModelFilter 规范化 models.hidden / models.allowed 共用的条目列表：
