@@ -171,12 +171,15 @@ type chatStatsReader struct {
 	cacheHit     int
 	cacheMiss    int
 	hasCacheMiss bool
-	// 工具调用去重计数（issue #329）：流式 tool_calls 是分片增量，按 index（OpenAI
-	// 形态）或 id（无 index 形态）去重；两者都没有时按「本帧一个匿名 fragment」计。
-	// 旧式 function_call 整块出现，记一条。仅用于归档统计，不影响透传字节。
+	// 工具调用去重计数（issue #329）：流式 tool_calls 是分片增量。与 upstream 的
+	// toolIndex 同口径：带 index 按 index 去重；缺 index 时 id 绑定到已有调用，新 id
+	// 分配新序号；index/id 都缺的后续分片归最近一次调用（单个调用的延续分片无
+	// index/id 是标准形态）。旧式 function_call 整块出现，记一条。仅用于归档统计，
+	// 不影响透传字节。
 	toolCallIndexes    map[int]struct{}
-	toolCallIDs        map[string]struct{}
-	toolCallAnonymous  int
+	toolCallIDs        map[string]int
+	toolCallHasIndex   bool
+	toolCallNextIndex  int
 	legacyFunctionCall bool
 	pend               []byte // 已读未返回的行缓存
 }
@@ -351,9 +354,7 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 	}
 }
 
-// noteToolCalls 对流式 tool_calls 增量做去重计数（issue #329）：同一调用的首帧带
-// index 与 id，后续分片只带 index；按 index 去重即可，无 index 时按 id 兜底，
-// 两者都没有（个别上游一次性吐完整调用）按本帧一个 fragment 计。
+// noteToolCalls 对流式 tool_calls 增量做去重计数（issue #329）。
 func (s *chatStatsReader) noteToolCalls(raw json.RawMessage) {
 	var calls []struct {
 		Index *int   `json:"index"`
@@ -365,28 +366,78 @@ func (s *chatStatsReader) noteToolCalls(raw json.RawMessage) {
 	}
 
 	for _, call := range calls {
-		switch {
-		case call.Index != nil:
-			if s.toolCallIndexes == nil {
-				s.toolCallIndexes = map[int]struct{}{}
-			}
+		s.noteToolCall(call.Index, call.ID)
+	}
+}
 
-			s.toolCallIndexes[*call.Index] = struct{}{}
-		case call.ID != "":
-			if s.toolCallIDs == nil {
-				s.toolCallIDs = map[string]struct{}{}
-			}
+// noteToolCall 把单个增量归并到调用序号，规则与 internal/upstream 的 toolIndex 一致：
+// 省略 index 的上游按 id 绑定调用，后续无 index/id 的 arguments 分片延续最近一次调用。
+func (s *chatStatsReader) noteToolCall(index *int, id string) {
+	if index != nil {
+		s.markToolCallIndex(*index)
 
-			s.toolCallIDs[call.ID] = struct{}{}
-		default:
-			s.toolCallAnonymous++
+		if id != "" {
+			s.bindToolCallID(id, *index)
+		}
+
+		return
+	}
+
+	if id != "" {
+		if idx, ok := s.toolCallIDs[id]; ok {
+			s.markToolCallIndex(idx)
+
+			return
+		}
+
+		s.bindToolCallID(id, s.nextToolCallIndex())
+
+		return
+	}
+
+	// 单个调用的延续分片无 index/id 是标准形态，归入最近一次调用；首个匿名分片
+	// 没有可归属的调用时才新开序号。
+	if !s.toolCallHasIndex {
+		s.nextToolCallIndex()
+	}
+}
+
+// markToolCallIndex 记录一个调用序号，并把它设为后续匿名分片的归属。
+func (s *chatStatsReader) markToolCallIndex(index int) {
+	if s.toolCallIndexes == nil {
+		s.toolCallIndexes = map[int]struct{}{}
+	}
+
+	s.toolCallIndexes[index] = struct{}{}
+	s.toolCallHasIndex = true
+}
+
+// bindToolCallID 把上游 tool_call id 绑定到调用序号。
+func (s *chatStatsReader) bindToolCallID(id string, index int) {
+	if s.toolCallIDs == nil {
+		s.toolCallIDs = map[string]int{}
+	}
+
+	s.toolCallIDs[id] = index
+}
+
+// nextToolCallIndex 分配一个未被显式 index 占用的新序号（与 toolIndex.next 同义）。
+func (s *chatStatsReader) nextToolCallIndex() int {
+	for {
+		index := s.toolCallNextIndex
+		s.toolCallNextIndex++
+
+		if _, used := s.toolCallIndexes[index]; !used {
+			s.markToolCallIndex(index)
+
+			return index
 		}
 	}
 }
 
 // ToolCallCount 本流实际产生的 tool_call 条数（去重后；不含正文标记还原出的调用）。
 func (s *chatStatsReader) ToolCallCount() int {
-	count := len(s.toolCallIndexes) + len(s.toolCallIDs) + s.toolCallAnonymous
+	count := len(s.toolCallIndexes)
 	if s.legacyFunctionCall {
 		count++
 	}

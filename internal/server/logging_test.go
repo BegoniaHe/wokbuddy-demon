@@ -779,16 +779,21 @@ func TestChatStatsReaderToolCallCount(t *testing.T) {
 	}
 }
 
-// TestChatStatsReaderToolCallCountUntrackedForms 无 index 时按 id 去重、id 也没有时
-// 按帧计数；旧式 function_call 记 1 条。
+// TestChatStatsReaderToolCallCountUntrackedForms 无 index 的上游：首帧 id 绑定调用，
+// 后续无 index/id 的 arguments 分片归最近一次调用；两个调用各算 1，旧式
+// function_call 再记 1。
 func TestChatStatsReaderToolCallCountUntrackedForms(t *testing.T) {
 	t.Parallel()
 
 	const sse = `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"name":"a"}}]}}]}
 
-data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"{}"}}]}}]}
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\"x\":1}"}}]}}]}
 
-data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"name":"b","arguments":"{}"}}]}}]}
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_b","function":{"name":"b"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{}"}}]}}]}
 
 data: {"choices":[{"index":0,"delta":{"function_call":{"name":"legacy","arguments":"{}"}}}]}
 
@@ -799,9 +804,30 @@ data: [DONE]
 	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
 	_, _ = io.ReadAll(r)
 
-	// call_a 两帧去重 = 1，匿名 fragment = 1，旧式 function_call = 1。
+	// call_a（id 首帧 + 两段延续）与 call_b（id 首帧 + 一段延续）各 1，旧式 1。
 	if got := r.ToolCallCount(); got != 3 {
-		t.Fatalf("ToolCallCount=%d want 3", got)
+		t.Fatalf("ToolCallCount=%d want 3（两个调用 + 旧式 function_call）", got)
+	}
+}
+
+// TestChatStatsReaderToolCallCountMixedIndexID 同一调用先带 index，后续分片只带 id
+// （省略 index）时不能把 id 再算成一个新调用。
+func TestChatStatsReaderToolCallCountMixedIndexID(t *testing.T) {
+	t.Parallel()
+
+	const sse = `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"a"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_a","function":{"arguments":"{}"}}]}}]}
+
+data: [DONE]
+
+`
+
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.ReadAll(r)
+
+	if got := r.ToolCallCount(); got != 1 {
+		t.Fatalf("ToolCallCount=%d want 1（index 与 id 指向同一调用）", got)
 	}
 }
 
