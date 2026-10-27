@@ -72,15 +72,16 @@ func TestMPReportOutboundIDsBrandFree(t *testing.T) {
 
 	var gotRaw []byte
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := New()
+	client.HTTP = &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "www.codebuddy.cn" {
+			t.Errorf("MP 埋点 host=%q want www.codebuddy.cn", r.URL.Host)
+		}
+
 		gotRaw, _ = io.ReadAll(r.Body)
 
-		w.Write([]byte(`{"code":0,"msg":"OK"}`))
-	}))
-	defer srv.Close()
-
-	client := New()
-	client.BillingBaseCN = srv.URL
+		return jsonResp(200, `{"code":0,"msg":"OK"}`), nil
+	})}
 
 	conv := "0f0e0d0c-0b0a-4908-8706-050403020100"
 	if err := client.ReportMPEvent(&auth.Auth{AccessToken: "at", UID: "u-mp"}, SchoolChatTimesEvents(conv)); err != nil {

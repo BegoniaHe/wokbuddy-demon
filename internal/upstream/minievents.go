@@ -6,7 +6,8 @@
 //   - 专家任务：expert_actual_use。
 //   - 模型 / 灵感任务：带模型字段的对话事件与 playbook 事件组。
 //
-// 端点基址 www.codebuddy.cn（billing 同域）；信封 {code,msg,data}，code=0 成功。
+// 端点基址固定 www.codebuddy.cn；桌面/增长 billing 域可被 cn.billing_base 覆盖，
+// 但 MP 埋点属于另一 surface，不跟随该覆盖。信封 {code,msg,data}，code=0 成功。
 package upstream
 
 import (
@@ -30,6 +31,10 @@ var errMpReportNoEvents = errors.New("mp report: no events")
 
 // mpReportPath 小程序埋点上报路径。
 const mpReportPath = "/v2/report"
+
+// mpReportBaseCN 小程序埋点固定基址。官方 MP 事件只走 codebuddy.cn；
+// 桌面 / 增长事件与 Web/MP 事件是两个 base，不跟随 cn.billing_base 灰度覆盖。
+const mpReportBaseCN = "https://www.codebuddy.cn"
 
 // schoolOpenDayActivityID 校园日活动 id（school_season 事件 activityId 字段值）。
 const schoolOpenDayActivityID = "school_open_day_2026"
@@ -79,7 +84,7 @@ func (c *Client) ReportMPEvent(account *auth.Auth, events ...map[string]any) err
 	}
 
 	req, err := http.NewRequestWithContext(
-		context.Background(), http.MethodPost, c.BillingBaseCN+mpReportPath, bytes.NewReader(raw),
+		context.Background(), http.MethodPost, mpReportBaseCN+mpReportPath, bytes.NewReader(raw),
 	)
 	if err != nil {
 		return fmt.Errorf("ReportMPEvent: %w", err)

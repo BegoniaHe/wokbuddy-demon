@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -36,6 +37,31 @@ func TestMPEventBase(t *testing.T) {
 
 	if mpEventBase(&auth.Auth{UID: "u-2"})["machineId"] == got {
 		t.Error("不同账号 machineId 相同")
+	}
+}
+
+// TestReportMPEventStaysOnCodebuddyCN 小程序埋点固定 codebuddy.cn，
+// 即使 cn.billing_base 已切到 workbuddy.cn 也不跟随。
+func TestReportMPEventStaysOnCodebuddyCN(t *testing.T) {
+	t.Parallel()
+
+	var host string
+
+	client := &Client{
+		BillingBaseCN: "https://www.workbuddy.cn",
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			host = r.URL.Host
+			return jsonResp(200, `{"code":0}`), nil
+		})},
+	}
+
+	account := &auth.Auth{UID: "u-1", AccessToken: "at"}
+	if err := client.ReportMPEvent(account, map[string]any{"eventCode": "chat_request_send"}); err != nil {
+		t.Fatalf("ReportMPEvent: %v", err)
+	}
+
+	if host != "www.codebuddy.cn" {
+		t.Errorf("MP 埋点 host = %q want www.codebuddy.cn（不跟随 billing 覆盖）", host)
 	}
 }
 
