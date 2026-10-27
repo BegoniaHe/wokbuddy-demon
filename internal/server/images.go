@@ -111,10 +111,7 @@ func (h *Handler) readImagesRequest(
 
 	// 与 chat/Anthropic 同口径：models.hidden 与命名密钥白名单必须在出站前判定，
 	// 否则开启图像端点后可以绕过模型限制。
-	if h.modelHidden(realm, bareModel) {
-		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
-			"model is hidden by gateway config (models.hidden); pick another model")
-
+	if !h.imageModelVisible(w, realm, bareModel) {
 		return nil, "", "", false, false
 	}
 
@@ -127,6 +124,26 @@ func (h *Handler) readImagesRequest(
 	}
 
 	return body, realm, bareModel, rawModel != bareModel, true
+}
+
+// imageModelVisible 出图前的模型可见性：models.hidden 与 models.allowed 同口径，
+// 任一拒绝即 400 model_unavailable（不打上游、不占号），且先于命名密钥白名单。
+func (h *Handler) imageModelVisible(w http.ResponseWriter, realm, bareModel string) bool {
+	if h.modelHidden(realm, bareModel) {
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			"model is hidden by gateway config (models.hidden); pick another model")
+
+		return false
+	}
+
+	if !h.modelAllowedByConfig(realm, bareModel) {
+		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
+			"model is not in the gateway allowlist (models.allowed); pick another model")
+
+		return false
+	}
+
+	return true
 }
 
 // rewriteImageModel 去掉 body.model 的 realm 前缀（上游只认裸名）。

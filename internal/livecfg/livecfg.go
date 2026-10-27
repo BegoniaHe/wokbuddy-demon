@@ -46,6 +46,9 @@ type Snapshot struct {
 	// HiddenModels 模型黑名单（models.hidden），归一为 "cn:x"/"global:x" 全量形式：
 	// 命中即不在 /v1/models 列出、点名调用返回 400 model_unavailable。空 = 关闭。
 	HiddenModels map[string]struct{}
+	// AllowedModels 模型白名单（models.allowed），同样的 "cn:x"/"global:x" 形式：
+	// 非空时只有键集合内的模型可用（列表不列、点名 400）。与 HiddenModels 取交集。
+	AllowedModels map[string]struct{}
 }
 
 // NormalizeHiddenModels 把 models.hidden 归一为 "realm:model" 键集合：
@@ -53,6 +56,17 @@ type Snapshot struct {
 //   - "cn:x" / "global:x" 只藏该域；
 //   - 大小写敏感（与 models.aliases / splitRealm 同口径），空白项丢弃。
 func NormalizeHiddenModels(list []string) map[string]struct{} {
+	return normalizeModelSet(list)
+}
+
+// NormalizeAllowedModels 把 models.allowed 归一为 "realm:model" 键集合（语法与
+// hidden 完全一致：裸名展开两域、带前缀只放行该域）。空/全空 → nil = 不启用。
+func NormalizeAllowedModels(list []string) map[string]struct{} {
+	return normalizeModelSet(list)
+}
+
+// normalizeModelSet 把模型筛选名单归一成 "realm:model" 键集合（hidden/allowed 共用）。
+func normalizeModelSet(list []string) map[string]struct{} {
 	if len(list) == 0 {
 		return nil
 	}
@@ -65,7 +79,7 @@ func NormalizeHiddenModels(list []string) map[string]struct{} {
 			continue
 		}
 
-		realm, bare, prefixed := splitHiddenRealm(name)
+		realm, bare, prefixed := splitModelRealm(name)
 		if bare == "" {
 			continue
 		}
@@ -86,8 +100,8 @@ func NormalizeHiddenModels(list []string) map[string]struct{} {
 	return out
 }
 
-// splitHiddenRealm 拆分可选的 realm 前缀（只认 cn/global，其余原样视为裸模型名）。
-func splitHiddenRealm(name string) (realm, bare string, prefixed bool) {
+// splitModelRealm 拆分可选的 realm 前缀（只认 cn/global，其余原样视为裸模型名）。
+func splitModelRealm(name string) (realm, bare string, prefixed bool) {
 	for _, candidate := range []string{"cn", "global"} {
 		prefix := candidate + ":"
 		if trimmed, ok := strings.CutPrefix(name, prefix); ok {

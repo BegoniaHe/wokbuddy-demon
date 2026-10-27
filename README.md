@@ -106,6 +106,16 @@ docker compose up -d --build
 
 > 本项目滚动更新，没有版本号，只有 nightly。不用等 `v1.0`，它不会来。
 
+## 🎛️ 模型筛选（`models`）
+
+`config.json` 的 `models` 段决定哪些模型对调用方可见。三组配置互相独立、可叠加：
+
+- `models.hidden`：黑名单。裸名 = `cn` 与 `global` 两域都隐藏，`cn:x` / `global:x` 只藏该域。命中后不出现在 `/v1/models`，点名调用返回 `400 model_unavailable`（不打上游、不占号）。热生效。
+- `models.allowed`：部署级白名单。语法与 `hidden` 相同，空数组 = 不启用（放行全部）。启用后只有名单内模型出现在 `/v1/models`，点名调用同样 `400 model_unavailable`；与 `hidden` 取交集，同时命中的模型拒绝。热生效。若开启后台模型改写（`models.background_names`），`models.background_target` 也必须在白名单内，否则启动即报错。
+- `models.aliases`：别名 → 上游模型。别名按解析后的真实模型受上面两套名单约束；别名本身或目标不在白名单内时，别名不出现在列表、点名调用 400。改别名需重启。
+
+命名密钥自带的模型白名单（`/panel/` 密钥管理里的 glob）语义不变，与 `models.allowed` 取交集：两边都放行才可用。
+
 ## 🐾 适合谁
 
 - 手上有多个 CodeBuddy 账号，但不想每天挨个打卡；

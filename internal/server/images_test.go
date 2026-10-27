@@ -498,3 +498,39 @@ func TestImagesNamedKeyUsageRecorded(t *testing.T) {
 		t.Fatalf("key usage=%+v want requests=1 prompt=3 completion=4 total=7", got)
 	}
 }
+
+// TestImagesAllowedModelRejected models.allowed 在出图端点同样生效（不能绕过白名单）。
+func TestImagesAllowedModelRejected(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			called = true
+			return jsonResponse(http.StatusOK, `{}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live: livecfg.New(livecfg.Snapshot{
+			ImagesEndpoint: true,
+			AllowedModels:  livecfg.NormalizeAllowedModels([]string{"cn:glm-5.2"}),
+		}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if called {
+		t.Fatal("白名单外模型不得打上游")
+	}
+}

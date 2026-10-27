@@ -78,7 +78,8 @@
     "aliases": {},
     "background_names": [],
     "background_target": "deepseek-v4.1-flash",
-    "hidden": []
+    "hidden": [],
+    "allowed": []
   },
   "global": {
     "enabled": true,

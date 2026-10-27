@@ -94,9 +94,9 @@ func (h *Handler) modelBusyLevel(raw string, keyUse *keyUsage, keyRealm string) 
 	return h.busyLevelFromPool(bare, realm)
 }
 
-// busyModelUnavailable 模型被配置隐藏或命名密钥白名单拒绝。
+// busyModelUnavailable 模型被部署级白名单/黑名单拒绝，或被命名密钥白名单拒绝。
 func (h *Handler) busyModelUnavailable(realm, model string, keyUse *keyUsage) bool {
-	if h.modelHidden(realm, model) {
+	if h.modelHidden(realm, model) || !h.modelAllowedByConfig(realm, model) {
 		return true
 	}
 

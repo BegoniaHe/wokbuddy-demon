@@ -673,6 +673,11 @@ export function ConfigView() {
               {text('hidden_models', { placeholder: '如 glm-5.2, global:kimi-k3' })}
               <FieldDescription>逗号分隔；裸名两域都隐藏，cn:/global: 只藏该域。命中后不出现在 /v1/models，点名调用返回 400；热生效</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>模型白名单</FieldLabel>
+              {text('allowed_models', { placeholder: '如 glm-5.2, global:kimi-k3' })}
+              <FieldDescription>逗号分隔；裸名两域，cn:/global: 单域；留空 = 不启用；与黑名单取交集；热生效</FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-2">
