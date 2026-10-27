@@ -245,6 +245,9 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	c.CommonHeaders(req, account3)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime；
+	// 网关没有 session meta / CODEBUDDY_AGENT_RUNTIME 来源，统一发官方兜底值 other。
+	req.Header.Set("X-Agent-Runtime", "other")
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
 	if at := account3.AccessTokenValue(); at != "" {
@@ -464,21 +467,34 @@ func (c *Client) attributionClientName() string {
 	return "WorkBuddy"
 }
 
+// privateDataHeaderValue 返回 X-Private-Data 的取值（chat 与桌面专家路径同口径）：
+// CN 5.9.3 官方 `applyPrivateDataHeaderPolicy` 在个人号的默认分支发 false；
+// global 基线仍是 5.8.4，旧逻辑发 true，等 global 升到 5.9.x 后按同一逻辑复核。
+// 远端 abTest（DefaultModelOptimizationOff）与会话 meta `privateDataSticky`
+// 都不在网关范围：本仓没有这两类状态来源，只对齐静态默认分支。
+func privateDataHeaderValue(account *auth.Auth) string {
+	if account != nil && account.IsGlobal() {
+		return "true"
+	}
+
+	return "false"
+}
+
 // injectAttribution 注入桌面客户端 chat 归属头（X-Agent-Purpose / X-Agent-Intent /
 // X-Agent-Type / X-IDE-* / X-Product / X-Private-Data）。仅在 chat/completions 路径生效。
 //
 // 默认（ClientName 空）对齐官方桌面端 chat 指纹：
 //
 //	X-Agent-Purpose=conversation、X-Agent-Intent=craft、X-Agent-Type=main、
-//	X-Private-Data=true、X-IDE-Name/Type=WorkBuddy、X-IDE-Version=<realm 版本>、
-//	X-Product=SaaS（=deploymentType）。
+//	X-Private-Data=<CN false / global true，见 privateDataHeaderValue>、
+//	X-IDE-Name/Type=WorkBuddy、X-IDE-Version=<realm 版本>、X-Product=SaaS（=deploymentType）。
 //
 // 显式 ClientName 非空时 X-Product 与 X-IDE-Name/Type 跟随该值（自定义归因逃生门）。
 func (c *Client) injectAttribution(req *http.Request, account4 *auth.Auth) {
 	req.Header.Set("X-Agent-Purpose", "conversation")
 	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Agent-Type", "main")
-	req.Header.Set("X-Private-Data", "true")
+	req.Header.Set("X-Private-Data", privateDataHeaderValue(account4))
 
 	name := "WorkBuddy"
 	product := "SaaS" // 官方 chat X-Product=deploymentType（SaaS）
