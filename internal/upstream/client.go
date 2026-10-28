@@ -4242,6 +4242,9 @@ func packageExpiryTime(pkg *billingPackageAccount) (time.Time, bool) {
 
 // 官方桌面端按包类型拆分查询，且上游要求显式下发 PackageCodes（缺失直接返回
 // 10001 PackageCodes required）。付费包与免费/赠送包分属两个端点，码表不可混用。
+//
+// 码表对齐 CN 5.9.3 `main/account.js` 的 `Fs`（paid）/ `Is`（free）两个数组；
+// `buddyOneVip`（TCACA_code_043）是 5.9.3 才加进 paid 的码，5.8.x 包内没有它。
 var (
 	paidResourcePackageCodes = []string{
 		"TCACA_code_002_AkiJS3ZHF5",
@@ -4250,6 +4253,7 @@ var (
 		"TCACA_code_023_4xbGhMrE6q",
 		"TCACA_code_026_BaESVICNoi",
 		"TCACA_code_027_0FCGVA6vSa",
+		"TCACA_code_043_6oIkxT7Z0S",
 		"TCACA_code_009_0XmEQc2xOf",
 		"TCACA_code_038_OhvqZtiPKr",
 		"TCACA_code_036_lupO5WgNdG",

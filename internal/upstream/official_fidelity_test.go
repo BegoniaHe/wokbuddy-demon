@@ -512,6 +512,12 @@ func TestResourcePackageExpirySendsPackageCodes(t *testing.T) {
 		t.Errorf("paid body=%s want paid codes only", bodies["paid"])
 	}
 
+	// buddyOneVip（TCACA_code_043）在 CN 5.9.3 的 paid 列表 `Fs` 里，5.8.x 还没有；
+	// 少了它，BuddyOne 会员包不计入付费包到期与余额。
+	if !strings.Contains(bodies["paid"], "TCACA_code_043_6oIkxT7Z0S") {
+		t.Errorf("paid body=%s 缺 buddyOneVip 码（CN 5.9.3 Fs）", bodies["paid"])
+	}
+
 	if !strings.Contains(bodies["free"], freeResourcePackageCodes[0]) ||
 		strings.Contains(bodies["free"], paidResourcePackageCodes[0]) {
 		t.Errorf("free body=%s want free codes only", bodies["free"])
