@@ -267,6 +267,7 @@ func buildAuth(doc, authObj, accountObj map[string]any, key keyMaterial) (*auth.
 		Domain:             stringField(authObj, "domain"),
 		UID:                stringField(accountObj, "uid"),
 		EnterpriseID:       stringField(accountObj, "enterpriseId"),
+		EditionType:        stringField(accountObj, "type"),
 		IDSource:           stringField(accountObj, "idSource"),
 		DepartmentFullName: stringField(accountObj, "departmentFullName"),
 		Nickname:           stringField(accountObj, "nickname"),
