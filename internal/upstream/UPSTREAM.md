@@ -133,9 +133,9 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | `/billing/meter/get-user-request-usage` | `internal/upstream/requestusage.go:19-20`（#31） | 第三方 WorkDaddy 脚本 `credit-request-usage.js` + 实测 |
 | `/billing/ide/trial` | `internal/upstream/trial.go:13`（`global_register.go` 亦有记录） | 实测 / 参考实现 |
 | `/billing/area/get-country-code` | `internal/upstream/global_register.go:124` | 实测 / 参考实现 |
-| `/billing/meter/claim-gift`、`claim-compensation`、`compensation-status` | `internal/upstream/blackcat.go:92,97`、`compensation.go:28` | 已被本文件「任务体系（连登/抽奖/补签/礼包/补偿/校园活动）以 Web 契约为准」总口径覆盖，不单独论证 |
+| `/billing/meter/claim-gift`、`claim-compensation`、`compensation-status` | `internal/upstream/blackcat.go:92,97`、`compensation.go:28` | 本文件末尾「桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准」总口径已覆盖，不单独论证 |
 
-读这张表时不要反推「官方客户端里有这个端点」：这三条路径的形态来自第三方脚本、参考实现或实测，桌面 static 包内没有任何字面量证据；要重新论证时按上表列为起点，而不是把它们当作已对齐桌面。
+读这张表时不要反推「官方客户端里有这个端点」：前三条的形态来自第三方脚本、参考实现或实测，`claim-*` / `compensation-status` 出自 Web 契约；四行在桌面 static 包内都没有任何字面量证据。要重新论证时按上表列为起点，而不是把它们当作已对齐桌面。
 
 桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。
 
