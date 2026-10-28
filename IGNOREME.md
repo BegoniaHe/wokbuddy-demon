@@ -486,6 +486,7 @@ gemini
 | `upstream.proxy_slots` | `[]` | 命名出站代理槽（`id` / `name` / `url` / `enabled`）；账号可在面板绑定，绑定后使用独立 Transport，未绑定走全局池/直连。改后需重启 |
 | `upstream.proxies` | `[]` | 出站代理列表（`http://` / `https://` / `socks5://`，可带 `user:pass`）；非空按健康轮换，失败代理自动冷却。空 = 直连 |
 | `cn.chat_base` | 空 | 国内版 upstream chat base 覆盖（如指向自建/自选入口）。空 = 默认 `https://www.workbuddy.cn`，并在首 token 前按 `408/502/503/504` 或传输错误回落 `copilot.tencent.com`、`wb.tencentbuddy.com`；**非空时只用该值、不回落**（与 `global.chat_base` 同语义）。改后需重启 |
+| `cn.billing_base` | 空 | 国内版 billing / 签到 / 活跃上报 base 覆盖。空 = 默认 `https://www.workbuddy.cn`（官方 5.9.3 桌面全走产品域）；显式填 `https://www.codebuddy.cn` 可退回旧口径。**不**影响 growth 任务 / 旅行、桌面与 Web 的 `/v2/report`（各走 `chat_base` / `web_base`）与小程序埋点（固定 `codebuddy.cn`）。改后需重启 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
 | `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
 | `features.search_deep` | `false` | 允许 `POST /v1/search/messages` 的 `deep:true`：上游 `/agenttool/v1/agentic_search` 综述式检索，单次最长 120s、只做单次尝试（不随 `upstream.rotate_max` 放大）。热生效 |

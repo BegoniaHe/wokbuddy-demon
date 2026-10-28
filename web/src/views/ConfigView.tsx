@@ -594,14 +594,14 @@ export function ConfigView() {
                 </Button>
               </div>
               <FieldDescription>
-                只在签到（daily-checkin / checkin-activity-status）注入，官方仅这两处消费；已设置时留空保持不变；点「清除」保存后置空；账号级
+                注入 chat 与签到（daily-checkin / checkin-activity-status）两处；已设置时留空保持不变；点「清除」保存后置空；账号级
                 token 优先；需重启
               </FieldDescription>
             </Field>
             <Field>
               <FieldLabel>设备 Token 文件</FieldLabel>
               {text('device_token_file', { placeholder: '留空 = 不读取文件' })}
-              <FieldDescription>桌面端落盘 token 路径，5 分钟读取缓存；同样只用于签到；需重启</FieldDescription>
+              <FieldDescription>桌面端落盘 token 路径，5 分钟读取缓存；消费面同上方（chat 与签到）；需重启</FieldDescription>
             </Field>
           </div>
           {check('passthrough_ip', '向上游透传客户端 IP', '默认关闭；开启前确认反代信任边界，需重启')}
@@ -649,6 +649,14 @@ export function ConfigView() {
               <FieldLabel>国内版 Chat Base</FieldLabel>
               {text('cn_chat_base', { placeholder: '留空 = 内置默认 + 回落链' })}
               <FieldDescription>非空时只用该 base、不回落官方域；需重启</FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel>国内版 Billing Base</FieldLabel>
+              {text('cn_billing_base', { placeholder: '留空 = 内置默认 workbuddy.cn' })}
+              <FieldDescription>
+                billing / 签到 / 活跃上报；填 https://www.codebuddy.cn 可退回旧口径。不影响 growth 任务 / 旅行、桌面与 Web 的
+                /v2/report 与小程序埋点；需重启
+              </FieldDescription>
             </Field>
           </div>
           <Separator className="my-4" />

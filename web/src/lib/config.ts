@@ -93,6 +93,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'global_chat_base', path: ['global', 'chat_base'], kind: 'text' },
   { name: 'global_billing_base', path: ['global', 'billing_base'], kind: 'text' },
   { name: 'cn_chat_base', path: ['cn', 'chat_base'], kind: 'text' },
+  { name: 'cn_billing_base', path: ['cn', 'billing_base'], kind: 'text' },
   { name: 'upstash_url', path: ['upstash', 'url'], kind: 'text' },
   { name: 'upstash_token', path: ['upstash', 'token'], kind: 'password', secret: true },
   { name: 'prompt_mode', path: ['prompt', 'mode'], kind: 'select' },
@@ -114,7 +115,17 @@ export const CFG_FIELD_BY_NAME: Record<string, FieldDef> = Object.fromEntries(
 );
 
 // 覆盖型文本字段：空串本身有意义（= 回落内置默认），必须照发。不含 api_key。
-export const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file', 'timing_salt']);
+// 四个 base 覆盖项同属此类：其中 cn_billing_base 是「退回旧 codebuddy.cn 口径」的
+// 灰度逃生门，清空才能回内置 workbuddy.cn——不能清空等于逃生门只进不出。
+export const CLEARABLE_CFG = new Set([
+  'user_agent',
+  'prompt_file',
+  'timing_salt',
+  'global_chat_base',
+  'global_billing_base',
+  'cn_chat_base',
+  'cn_billing_base',
+]);
 
 // Go 的 time.ParseDuration 接受裸 "0"（无单位）；配置里 "0" 是关闭时序整形的
 // 官方回滚值，前端不能把它当作脏值拦截。

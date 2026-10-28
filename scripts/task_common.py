@@ -6,15 +6,16 @@
 
 端点权威来源（Go 代码实测 + 本次实测确认）：
   - chat 域（copilot.tencent.com）：growth / tasks / buddy / streak / chat/completions
-  - billing 域（www.codebuddy.cn）：/v2/report
+  - billing 域（www.workbuddy.cn，与 internal/upstream.defaultCNBillingBase 同口径）：/v2/report
   - accept : POST /v2/activity/growth/tasks/accept  {"task_codes":[code]}
   - claim  : POST /v2/activity/growth/tasks/reward/claim {"task_code":code}
 """
 import json, os, time, glob, urllib.request, urllib.error
+from urllib.parse import urlsplit
 
 AUTHS = "/root/wokbuddy-demon/auths"
 CHAT_BASE = "https://copilot.tencent.com"   # growth / tasks / buddy / streak / chat
-BILL_BASE = "https://www.codebuddy.cn"      # report / billing
+BILL_BASE = "https://www.workbuddy.cn"      # report / billing
 
 # growth 域常量（travel.go / report.go 与本次实测对齐）
 PATH_LIST_TASKS     = "/v2/activity/growth/tasks"
@@ -61,13 +62,28 @@ def billing_base(auth: dict) -> str:
     return auth.get("billing_base") or BILL_BASE
 
 
-def _headers(auth: dict) -> dict:
+def _origin(url: str) -> str:
+    """取 scheme://host[:port]：Origin 只允许同源三元组，不能带路径。
+
+    传进来的 base 可能是 `https://host`、`https://host/` 或带路径的自建入口，
+    直接 rstrip 会把路径留在 Origin 里，是握手层就能看出的异样指纹。
+    """
+    parts = urlsplit(url)
+    if parts.scheme and parts.netloc:
+        return f"{parts.scheme}://{parts.netloc}"
+    return url.rstrip("/")
+
+
+def _headers(auth: dict, base: str = CHAT_BASE) -> dict:
+    # Origin/Referer 与请求主机同域（与 internal/upstream 的 web 端点同口径），
+    # 不能固定 codebuddy.cn：billing 域已改 workbuddy.cn，跨域 Origin 是异样指纹。
+    origin = _origin(base)
     hdr = {"Authorization": "Bearer " + auth["token"],
            "Accept": "application/json",
            "Content-Type": "application/json",
            "User-Agent": CLIENT_UA,
-           "Origin": "https://www.codebuddy.cn",
-           "Referer": "https://www.codebuddy.cn/"}
+           "Origin": origin,
+           "Referer": origin + "/"}
     if auth.get("uid"):
         hdr["X-User-Id"] = auth["uid"]
     if auth.get("domain"):
@@ -77,7 +93,7 @@ def _headers(auth: dict) -> dict:
 
 def _request(auth, method, base, path, body=None, headers=None, timeout=30):
     url = path if path.startswith("http") else base + path
-    hdr = _headers(auth)
+    hdr = _headers(auth, url if path.startswith("http") else base)
     if headers:
         hdr.update(headers)
     data = json.dumps(body).encode() if body is not None else None
@@ -144,10 +160,15 @@ def get_streak(auth) -> int:
 
 def chat_event(auth, conversation_id=None, model_id="deepseek-v4-flash",
                model_name="DeepSeek V4 Flash", mode="craft"):
-    """客户端 chat_request_send 事件完整形状（照抄 report.go / probe_active.py）。
+    """客户端 chat_request_send 事件形状（对齐 CN 5.9.3 与 report.go 的
+    newChatRequestEvent，issue #366）。
 
     必须带 userId（=账号 uid），缺失则服务端 200 但静默丢弃。
     model_id/name 可换（如 GLM-5.2），供 model_chat 对齐实际模型。
+
+    5.9.3 已不再发 maxToken / maxSteps / temperature / maxRetries / skillCount /
+    totalCount，改发 isMaxMode；source / inputAttemptId / connectorId 是条件键，
+    这里取不到就整键不发（与 report.go 同口径，不伪造）。fileUri 空串时不产生 vcs* 四键。
     """
     now = int(time.time() * 1000)
     cid = conversation_id or f"task-{now}"
@@ -156,13 +177,13 @@ def chat_event(auth, conversation_id=None, model_id="deepseek-v4-flash",
             "inputLength": 12, "requestModelId": model_id,
             "requestModelName": model_name, "isPlan": False,
             "isAutoExecuteTerminal": False, "isAutoModify": False,
-            "codebaseEnable": False, "maxToken": 0, "maxSteps": 0, "temperature": 0,
-            "maxRetries": 0, "mentionContexts": [], "knowledgeId": [],
+            "codebaseEnable": False, "isMaxMode": False,
+            "mentionContexts": [], "knowledgeId": [],
             "knowledgeName": [], "codebaseId": "", "mentionContextCount": 0,
             "command": "", "expertId": "", "recommendId": "", "skillId": "",
-            "skillCount": 0, "totalCount": 0, "fileUri": "", "presentAt": now,
-            "traceId": "", "rootRequestId": cid, "parentConversationId": cid,
-            "agentName": "default", "agentType": "conversation", "userId": auth["uid"]}
+            "fileUri": "", "presentAt": now,
+            "traceId": cid, "rootRequestId": cid, "parentConversationId": cid,
+            "agentName": "", "agentType": "main", "userId": auth["uid"]}
 
 
 def report_activity(auth, count=1, gap=1.05, model_id="deepseek-v4-flash",

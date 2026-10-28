@@ -51,7 +51,7 @@ func TestNewUserResourceRequestNestedAndFlat(t *testing.T) {
 
 			account := parseTestAuth(t, testCase.raw)
 
-			req, err := newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account)
+			req, err := newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account, "")
 			if err != nil {
 				t.Fatalf("newUserResourceRequest: %v", err)
 			}
@@ -79,8 +79,10 @@ func TestNewUserResourceRequestNestedAndFlat(t *testing.T) {
 	}
 }
 
-// TestUserResourceRequestUsesIssuingDomain 三域映射保持不变，首候选路径统一为
-// 无 `/v2` 前缀（官方 5.9.3 resourcePrefix 为空串，两 realm 同形）。
+// TestUserResourceRequestUsesIssuingDomain 三域映射与 internal/upstream 同口径：
+// CN 账号（含 domain=codebuddy.cn）缺省打 workbuddy.cn，global 按签发域分
+// workbuddy.ai / codebuddy.ai；首候选路径统一为无 `/v2` 前缀（官方 5.9.3
+// resourcePrefix 为空串，两 realm 同形）。
 func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 	t.Parallel()
 
@@ -90,9 +92,14 @@ func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 		want string
 	}{
 		{
-			name: "国内站",
+			name: "国内站（domain=codebuddy.cn 仍判 cn，缺省打 workbuddy.cn）",
 			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"}}`,
-			want: "https://www.codebuddy.cn/billing/meter/get-user-resource",
+			want: "https://www.workbuddy.cn/billing/meter/get-user-resource",
+		},
+		{
+			name: "国内站无 domain",
+			raw:  `{"auth":{"accessToken":"at"}}`,
+			want: "https://www.workbuddy.cn/billing/meter/get-user-resource",
 		},
 		{
 			name: "官方国际站",
@@ -122,7 +129,7 @@ func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 
 			account := parseTestAuth(t, testCase.raw)
 
-			req, err := newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account)
+			req, err := newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account, "")
 			if err != nil {
 				t.Fatalf("newUserResourceRequest: %v", err)
 			}
@@ -356,7 +363,7 @@ func TestFetchUserResourceFallsBackOn404(t *testing.T) {
 
 	account := parseTestAuth(t, `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"},"account":{"uid":"u-fb"}}`)
 
-	remain, used, size, packs, err := fetchUserResourceAt(srv.Client(), srv.URL, account)
+	remain, used, size, packs, err := fetchUserResourceAt(srv.Client(), srv.URL, account, "")
 	if err != nil {
 		t.Fatalf("fetchUserResourceAt: %v", err)
 	}
@@ -385,11 +392,59 @@ func TestFetchUserResourceNoFallbackOnOther4xx(t *testing.T) {
 
 	account := parseTestAuth(t, `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"},"account":{"uid":"u-401"}}`)
 
-	if _, _, _, _, err := fetchUserResourceAt(srv.Client(), srv.URL, account); err == nil {
+	if _, _, _, _, err := fetchUserResourceAt(srv.Client(), srv.URL, account, ""); err == nil {
 		t.Fatal("401 应返回错误")
 	}
 
 	if want := []string{"/billing/meter/get-user-resource"}; !slices.Equal(paths, want) {
 		t.Errorf("paths=%v want %v", paths, want)
+	}
+}
+
+// TestUserResourceRequestSendsMeterUA 余额查询必须带与 internal/upstream billing meter
+// 面同源的 UA：CLI 用 Go 默认 UA 打同一端点是明显的非官方指纹。
+func TestUserResourceRequestSendsMeterUA(t *testing.T) {
+	t.Parallel()
+
+	account := parseTestAuth(t, `{"auth":{"accessToken":"at"},"account":{"uid":"u-ua"}}`)
+
+	const agent = "axios/9.9.9"
+
+	req, err := newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account, agent)
+	if err != nil {
+		t.Fatalf("newUserResourceRequest: %v", err)
+	}
+
+	if got := req.Header.Get("User-Agent"); got != agent {
+		t.Errorf("User-Agent=%q want %q", got, agent)
+	}
+
+	// 空 UA（client_name="SaaS" 逃生门）时不写该键，保留 Go 默认值。
+	req, err = newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account, "")
+	if err != nil {
+		t.Fatalf("newUserResourceRequest: %v", err)
+	}
+
+	if got := req.Header.Get("User-Agent"); got != "" {
+		t.Errorf("User-Agent=%q want 空（不写键）", got)
+	}
+}
+
+// TestBillingMeterUserAgentFollowsUpstream 导出入口与出站路径同源：显式 user_agent
+// 优先于 profile 抓包值，未配置 profile 时为空串（CLI 不写该头）。
+func TestBillingMeterUserAgentFollowsUpstream(t *testing.T) {
+	t.Parallel()
+
+	client := upstream.New()
+	account := parseTestAuth(t, `{"auth":{"accessToken":"at"},"account":{"uid":"u-ua"}}`)
+
+	if got := client.BillingMeterUserAgent(account); got != "" {
+		t.Errorf("无 profile / 无 user_agent 时 = %q want 空", got)
+	}
+
+	client.UserAgent = "CustomUA/1"
+
+	if got := client.BillingMeterUserAgent(account); got != "CustomUA/1" {
+		t.Errorf("= %q want CustomUA/1", got)
 	}
 }

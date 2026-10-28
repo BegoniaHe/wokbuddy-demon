@@ -18,16 +18,19 @@
   - body 必须含 userId 字段，否则服务端 200 但静默丢弃
 """
 import json, os, sys, time, glob, argparse, urllib.request, urllib.error
+from urllib.parse import urlsplit
 
 AUTHS = "/root/wokbuddy-demon/auths"
 CHAT_BASE = "https://copilot.tencent.com"   # growth / report
-BILL_BASE = "https://www.codebuddy.cn"      # billing / report
+BILL_BASE = "https://www.workbuddy.cn"      # billing / report
 
 def cred(prefix):
     hits = glob.glob(os.path.join(AUTHS, f"workbuddy-{prefix}*.json"))
     if not hits:
         raise SystemExit(f"no auth for {prefix}")
-    d = json.load(open(hits[0]))
+    # encoding 必须显式指定：Windows 上 open() 默认用 locale 代码页（中文系统为 GBK），
+    # auth 文件是 UTF-8，非 ASCII 昵称会 UnicodeDecodeError（与 task_common.py 同因）。
+    d = json.load(open(hits[0], encoding="utf-8"))
     a, acc = d["auth"], d["account"]
     return {"token": a["accessToken"], "domain": a.get("domain") or "",
             "uid": acc["uid"], "nick": acc.get("nickname", ""),
@@ -35,11 +38,15 @@ def cred(prefix):
 
 def call(c, method, path, body=None, host=CHAT_BASE, timeout=30):
     url = path if path.startswith("http") else host + path
+    # Origin/Referer 与请求主机同域（billing 域已改 workbuddy.cn，跨域 Origin 是异样指纹）。
+    # Origin 只能是 scheme://host[:port]，带路径会被上游当异样指纹（urlsplit 取同源）。
+    parts = urlsplit(host)
+    origin = f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else host.rstrip("/")
     hdr = {"Authorization": "Bearer " + c["token"], "X-User-Id": c["uid"],
            "X-Domain": c["domain"], "Accept": "application/json",
            "Content-Type": "application/json",
            "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
-           "Origin": "https://www.codebuddy.cn", "Referer": "https://www.codebuddy.cn/"}
+           "Origin": origin, "Referer": origin + "/"}
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=hdr, method=method)
     try:
@@ -53,7 +60,11 @@ def call(c, method, path, body=None, host=CHAT_BASE, timeout=30):
         return -1, {"err": repr(e)}
 
 def chat_event(c, conversation_id=None):
-    """客户端 chat_request_send 事件形状（照抄 CLI，勿删 userId）。"""
+    """客户端 chat_request_send 事件形状（对齐 CN 5.9.3 与 report.go，勿删 userId）。
+
+    5.9.3 删掉 maxToken / maxSteps / temperature / maxRetries / skillCount /
+    totalCount、改发 isMaxMode；traceId 与 requestId 同值，agentType 为 main。
+    """
     now = int(time.time() * 1000)
     cid = conversation_id or f"wb-active-{now}"
     return {"eventCode": "chat_request_send", "timestamp": now, "reportDelay": 0,
@@ -61,13 +72,13 @@ def chat_event(c, conversation_id=None):
             "inputLength": 12, "requestModelId": "deepseek-v4-flash",
             "requestModelName": "DeepSeek V4 Flash", "isPlan": False,
             "isAutoExecuteTerminal": False, "isAutoModify": False,
-            "codebaseEnable": False, "maxToken": 0, "maxSteps": 0, "temperature": 0,
-            "maxRetries": 0, "mentionContexts": [], "knowledgeId": [],
+            "codebaseEnable": False, "isMaxMode": False,
+            "mentionContexts": [], "knowledgeId": [],
             "knowledgeName": [], "codebaseId": "", "mentionContextCount": 0,
             "command": "", "expertId": "", "recommendId": "", "skillId": "",
-            "skillCount": 0, "totalCount": 0, "fileUri": "", "presentAt": now,
-            "traceId": "", "rootRequestId": cid, "parentConversationId": cid,
-            "agentName": "default", "agentType": "conversation", "userId": c["uid"]}
+            "fileUri": "", "presentAt": now,
+            "traceId": cid, "rootRequestId": cid, "parentConversationId": cid,
+            "agentName": "", "agentType": "main", "userId": c["uid"]}
 
 def report_activity(c):
     """点亮活跃/连登。返回 (status, code)."""

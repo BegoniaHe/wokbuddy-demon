@@ -75,7 +75,7 @@ fi
 
 EXPIRES_AT=$(( $(date +%s) + EXPIRES_IN ))
 
-# ─── 签到（CN：POST codebuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
+# ─── 签到（CN：POST workbuddy.cn/v2/billing/meter/daily-checkin，幂等不阻塞）───
 # OAuth 返回字段一律通过环境变量传入 Python，并用带引号 heredoc：
 # 昵称/domain/token 等值可含引号或换行，拼进 Python 源码会造成注入。
 WB2A_LOGIN_TOKEN="$TOKEN" \
@@ -91,7 +91,7 @@ ent_id = os.environ["WB2A_LOGIN_ENT_ID"]
 domain = os.environ["WB2A_LOGIN_DOMAIN"]
 
 req = urllib.request.Request(
-    "https://www.codebuddy.cn/v2/billing/meter/daily-checkin",
+    "https://www.workbuddy.cn/v2/billing/meter/daily-checkin",
     method="POST", data=b"{}",
     headers={
         "Authorization": "Bearer " + token,
