@@ -294,6 +294,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
 | 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭；`deep=true` 需 `features.search_deep`） |
 | 官方工具出口 | `POST /v2/chat/busy`（模型忙预检，只读本地池状态）、`POST /v1/tools/fetch` / `POST /v1/fetch`（官方服务端抓取，需 `features.web_fetch_endpoint=true`） |
+| 官方图像 | `POST /v1/images/generations`（出图）、`POST /v1/images/edits`（图生图，JSON 形态、非 multipart），需 `features.images_endpoint=true` |
 | Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
 
 Codex CLI 等使用 Responses API 的客户端：

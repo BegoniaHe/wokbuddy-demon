@@ -43,7 +43,7 @@ func (h *Handler) imagesEndpointHandler(upstreamPath string) http.HandlerFunc {
 
 // serveImages 图像端点主体：读请求 → 选号 → 租约 → 刷新 → 打上游。
 func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPath string) {
-	body, realm, bareModel, prefixed, ok := h.readImagesRequest(w, r)
+	body, realm, bareModel, prefixed, ok := h.readImagesRequest(w, r, upstreamPath)
 	if !ok {
 		return
 	}
@@ -80,7 +80,7 @@ func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPa
 // readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
 // 校验顺序即语义，平铺便于核对拒绝路径。
 func (h *Handler) readImagesRequest(
-	w http.ResponseWriter, r *http.Request,
+	w http.ResponseWriter, r *http.Request, upstreamPath string,
 ) ([]byte, string, string, bool, bool) {
 	if !h.loadLive().ImagesEndpoint {
 		// 文案按入站端点区分，避免只提 generations 时让人以为 edits 没做开关。
@@ -90,7 +90,7 @@ func (h *Handler) readImagesRequest(
 		return nil, "", "", false, false
 	}
 
-	body, ok := h.readImagesBody(w, r)
+	body, ok := h.readImagesBody(w, r, upstreamPath)
 	if !ok {
 		return nil, "", "", false, false
 	}
@@ -131,9 +131,11 @@ func (h *Handler) readImagesRequest(
 // multipart 判定必须在读 body 之前：OpenAI 官方 edits 形态就是 multipart，先
 // ReadAll 会让大文件上传先吃满 server.max_body_bytes 再回 413，把「形态不支持」
 // 误报成「请求体过大」，客户端会去调大上限而不是换形态。
-func (h *Handler) readImagesBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+func (h *Handler) readImagesBody(
+	w http.ResponseWriter, r *http.Request, upstreamPath string,
+) ([]byte, bool) {
 	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
-		writeMultipartUnsupported(w)
+		writeMultipartUnsupported(w, upstreamPath)
 
 		return nil, false
 	}
@@ -160,11 +162,18 @@ func (h *Handler) readImagesBody(w http.ResponseWriter, r *http.Request) ([]byte
 // writeMultipartUnsupported 对 OpenAI 官方 multipart 形态给出明确 400。
 // 不这么写时，multipart body 解析失败会落成 "model is required"，把「形态不支持」
 // 误报成「缺字段」，客户端会反复补 model 而不是换形态。
-func writeMultipartUnsupported(w http.ResponseWriter) {
+//
+// 补充说明按端点分化：只有 edits 有 `image` 字段可承载文件内容，generations 没有，
+// 对它说「把图放进 image 字段」是错的引导。
+func writeMultipartUnsupported(w http.ResponseWriter, upstreamPath string) {
+	hint := "send a JSON body (`model` + `prompt`) instead of multipart form data"
+	if upstreamPath == upstream.ImageEditsPath {
+		hint = "put the image in the JSON `image` field as a data URL, http(s) URL or raw base64 " +
+			"string (array also allowed) instead of uploading a file part"
+	}
+
 	writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request",
-		"multipart/form-data is not supported; send a JSON body instead",
-		"put the image in the JSON `image` field as a data URL, http(s) URL or raw base64 "+
-			"string (array also allowed) instead of uploading a file part")
+		"multipart/form-data is not supported; send a JSON body instead", hint)
 }
 
 // imageRequestModel 从入站 JSON body 取 model；字段缺失或不是 JSON 时写出 400。
