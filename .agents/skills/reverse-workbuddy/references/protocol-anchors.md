@@ -50,6 +50,9 @@
   - `checkinHeaders()`：`X-Device-Token`，**只在签到**（daily-checkin /
     checkin-activity-status）注入；文件兜底见 `internal/upstream/device_token.go`。
     官方也只在这两处 + `/v2/plugin/auth/state`（面板登录面，不在本仓出站面）消费。
+    同一注入点**不发** `X-Device-Token-Error`：该头只在 Turing SDK 取不到 token 时
+    出现，取值是 SDK 原生错误串（截断到 64 字符 ASCII），本仓没有同源错误域，
+    伪造取值等于自造指纹；结论见 `internal/upstream/UPSTREAM.md` §六。
   - 会话头族 `X-Conversation-Id` / `-Request-Id` / `-Message-Id` /
     `X-Request-ID` / `X-Root-Request-Id`（`ChatMeta`）。
   - body 侧 `conversationRequestId`：官方桌面端在当前轮最后一条 user 消息的
@@ -97,7 +100,13 @@
   已覆盖 `checkin-activity-status`（`CheckinActivityStatus`）、
   `get-user-resource-summary`（`fetchResourceSummary`）、
   `get-user-resource-{paid,free}-packages`（`fetchPackagePage`）；
-  仅 `checkin-status`（无 `-activity`，官方 `BackendProvider.getCheckinStatus`）仍未覆盖（首查项）。
+  `checkin-status`（无 `-activity`）已定性为 IDE/CLI 面：它只出现在
+  `BackendProvider.getCheckinStatus`（CN 5.9.3 `main/account.js@399217` /
+  `renderer/assets/common-Cklb-JUT.js@443241`）与渲染层 IPC，桌面 daemon 自己走
+  `${endpoint}/v2/billing/meter/checkin-activity-status`
+  （`main/authority-snapshot.js@463251`，本仓 `CheckinActivityStatus` 已覆盖）。
+  本仓无调用方，**刻意不实现**，不再当首查项；理由见
+  `internal/upstream/UPSTREAM.md` §六「checkin 面有两个端点」那条。
 
 ## 已知未覆盖 / 形态存疑入口
 
