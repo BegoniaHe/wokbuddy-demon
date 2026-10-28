@@ -457,7 +457,13 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 		// 更明显的非官方指纹。见 UPSTREAM.md §六，issue #371）。
 		req.Header.Set("X-Product", "SaaS")
 	case surfaceRefresh:
+		// 真机 refresh 的 Accept 是宽松值（不是轻头族默认的 application/json），
+		// 且带 X-Product: SaaS、X-Requested-With（#370）。
+		// Authorization / X-User-Id / X-Request-ID 由轻头族 base 统一注入——refresh 与
+		// chat 相反：Authorization 与 X-Refresh-Token **双发**（chat 绝不带 RT）。
+		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("X-Product", "SaaS")
 		// X-Domain：账号 domain 优先；global 缺省固定 www.workbuddy.ai；CN 个人号
 		// 无 domain 时官方回落 endpoint authority，这里取本次 refresh 请求的实际
 		// host（可能是 chat 回落链里的备选域，不能只看首选 origin）。

@@ -122,6 +122,7 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | 项 | 状态 | 依据 |
 | --- | --- | --- |
 | refresh trace（`X-Trace-Id` / `Traceparent` / `B3` / `X-B3-*`） | 已对齐 | 官方 `cli/dist/codebuddy-lite-wb.mjs` 的 `AccountScopedAuth.refreshSession()` 追加 `traceSpan.requestHeaders`；网关无活动 span，故生成自洽的新链路 id |
+| refresh 头集与 body | 已对齐 | 真机 11 头 + body `{}`（`Content-Length: 2`）：`Accept: application/json, text/plain, */*`（宽松值，不沿用轻头族默认）、`Authorization`（与 `X-Refresh-Token` **双发**，与 chat 相反）、`X-User-Id`、`X-Request-ID`（32 hex）、`X-Product: SaaS`、`X-Requested-With`、三段式 UA、`X-Domain`（endpoint authority）、`X-Auth-Refresh-Source: plugin`（#370） |
 | 轻头族 `X-Domain` | 已对齐 | 官方 `enterpriseHeaders()` 无 domain 时回落 **endpoint authority**；轻头族各面（refresh / v3-config / billing / report / busy / growth）统一按本次请求 URL 的 host 取值，不回落 chat base——billing 面走 `billing_base`，取 chat host 会把别的域发给 billing。`cn.chat_base` / `cn.billing_base` 覆盖时各自跟随 |
 | 非 chat 业务面的 `X-Request-ID` | 已对齐（refresh / v3-config / billing / busy / report） | 官方 HTTP 层 `applyRequestId` 对每条业务请求补 32 hex（UUIDv7 形态）；`/v2/activity/growth/*` 是 Node 裸 fetch 面，真机**不带**该头，故 growth 不在覆盖范围（#369 / #375） |
 | `X-Stainless-*` | 不补 | 由 OpenAI Node SDK 自动生成；本仓出站不是 Node SDK，补等于伪造 SDK 运行时版本 |

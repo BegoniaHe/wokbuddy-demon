@@ -1875,8 +1875,6 @@ func adoptNewerTokensFromDisk(account *auth.Auth) bool {
 }
 
 // refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
-//
-//nolint:funlen // 刷新三段式（快照/请求/回写）线性展开。
 func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, error) {
 	// 第 1 段（锁内）：读快照。
 	rtSnapshot, atBefore, err := refreshTokenSnapshot(account10)
@@ -1909,17 +1907,8 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 	var lastErr error
 
 	for i, base := range origins {
-		endpoint := base + "/v2/plugin/auth/token/refresh"
-
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
-		if reqErr != nil {
-			return refreshTokenResponse{}, fmt.Errorf("RefreshToken: %w", reqErr)
-		}
-
-		c.RefreshHeaders(req, &hdrSnapshot)
-
 		// 网络 I/O（锁外，30s 上限）。
-		data, lastErr = c.doJSON(req)
+		data, lastErr = c.refreshAt(ctx, base, &hdrSnapshot)
 		if lastErr == nil {
 			break
 		}
@@ -1939,6 +1928,25 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 	commitRefreshedToken(account10, tok, atBefore, rtSnapshot)
 
 	return tok, nil
+}
+
+// refreshBody 官方 refresh 请求体：空 JSON 对象（真机 Content-Length: 2）。
+// `refreshSession()` 显式传空对象，不是无 body——空 body 会让 Content-Length 变 0，
+// 与真机形态不同（#370）。
+const refreshBody = "{}"
+
+// refreshAt 向单个 origin 发一次 refresh 请求并解信封。
+func (c *Client) refreshAt(ctx context.Context, base string, hdr *auth.Auth) (json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, base+"/v2/plugin/auth/token/refresh", strings.NewReader(refreshBody),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("RefreshToken: %w", err)
+	}
+
+	c.RefreshHeaders(req, hdr)
+
+	return c.doJSON(req)
 }
 
 // commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
