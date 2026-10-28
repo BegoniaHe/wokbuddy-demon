@@ -104,7 +104,7 @@ func (c *Client) TravelDepart(a *auth.Auth, locationID int) error {
 // 请求顺序（三跳，最多 3 次）：
 //  1. POST /v2 + travelClaimPath，body `{}`；
 //  2. 仅当上一跳是 404（路径不存在）时换成无前缀 travelClaimPath，body 仍为 `{}`；
-//  3. 仅当最后一跳仍是 400 / 参数错误时，在最后一次用的路径上带 record_id 再试一次。
+//  3. 仅当最后一跳是 400（参数错误）时，在最后一次用的路径上带 record_id 再试一次。
 //
 // 多次尝试都失败时返回最后一次错误（避免用更早的 404 / 参数错误覆盖会话失效或
 // 服务端错误，让调用方仍能按真实分类处置账号）。
@@ -215,15 +215,17 @@ func isKind(err error, kind ErrKind) bool {
 	return errors.As(err, &upstreamErr) && upstreamErr.Kind == kind
 }
 
-// claimNeedsRecordIDBody 判定 claim 是否需要带 record_id 兜底重试：404 或参数错误。
-// 实际只用到 400 分支——404 已在上一跳改成无前缀空 body 路径。
+// claimNeedsRecordIDBody 判定 claim 是否需要带 record_id 兜底重试：仅参数错误（400）。
+//
+// 不认 404：上一跳已把 404 换成无前缀路径再试，两条路径都 404 说明端点不存在，
+// 带 record_id 打第三次不可能成功，只会用这次结果覆盖真实的 ErrNotFound 分类。
 func claimNeedsRecordIDBody(err error) bool {
 	var upstreamErr *Error
 	if !errors.As(err, &upstreamErr) {
 		return false
 	}
 
-	return upstreamErr.Kind == ErrNotFound || upstreamErr.Status == http.StatusBadRequest
+	return upstreamErr.Status == http.StatusBadRequest
 }
 
 // IsBuddyTaskIncomplete 判定「领养门槛未达标」：HTTP 400 + first_buddy 关键词。

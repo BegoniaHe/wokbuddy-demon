@@ -418,6 +418,31 @@ func TestTravelClaimEmptyBody404FallsBackToLegacyPath(t *testing.T) {
 	}
 }
 
+// TestTravelClaimDoubleNotFoundStops 两跳都是 404 时不再打 record_id 兜底：
+// 端点不存在换成带 record_id 的 body 也不可能成功，只会用第三次结果覆盖 ErrNotFound。
+func TestTravelClaimDoubleNotFoundStops(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		calls++
+
+		return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
+	})
+
+	_, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 42)
+
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Kind != ErrNotFound {
+		t.Errorf("err=%v want ErrNotFound", err)
+	}
+
+	if calls != 2 {
+		t.Errorf("calls=%d want 2（404 不触发 record_id 兜底）", calls)
+	}
+}
+
 // TestGrowthUsesV2First Bearer growth 通道 /v2 路径优先。
 func TestGrowthUsesV2First(t *testing.T) {
 	t.Parallel()
