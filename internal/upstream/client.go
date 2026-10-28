@@ -4269,18 +4269,24 @@ var (
 	}
 )
 
+// resourcePackagePageSize 积分包分页大小。官方桌面 `fetchAllPages`
+// （CN 5.9.3 main/account.js@378649）固定 `pageSize:200` 并以 `accounts.length < 200`
+// 作为翻页终止条件；`queryCreditPackages` 再把上界钳到 `ac=200`。页终止判据与
+// 请求体两处共用本常量，避免再次漂移。
+const resourcePackagePageSize = 200
+
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
+//
+// body 口径对齐官方桌面 DesktopAccountRepo 的 validCreditPackages
+// （CN 5.9.3 main/account.js@418507）：`{Status: [0,3], OnlyValidPeriod: true}` 再由
+// queryCreditPackages 补 `IsDisplayTotalInfo: true` 与分页字段——即「只取当前有效
+// 周期」由 OnlyValidPeriod 表达，桌面不发 slice 时间窗口。SlicePeriod* 属另一套
+// BackendProvider 实现，桌面不出现，本仓也不发。
 func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.Duration) (
 	expiring int64, totals *resourceTotals,
 ) {
 	totals = &resourceTotals{}
-
-	// 切片日期窗口按上游 UTC+8 墙钟计算；用部署机本地时区会在非 UTC+8 环境把
-	// 「今天」算错一天，拿到错误周期的免费包。
-	nowCST := now.In(softRateResetLoc)
-	dayStart := time.Date(nowCST.Year(), nowCST.Month(), nowCST.Day(), 0, 0, 0, 0, softRateResetLoc)
-	dayEnd := dayStart.Add(24*time.Hour - time.Second)
 
 	specs := []struct {
 		path string
@@ -4296,10 +4302,8 @@ func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.D
 		{
 			path: "/billing/meter/get-user-resource-free-packages",
 			body: map[string]any{
-				"Status": []int{0, 3}, "IsDisplayTotalInfo": true,
-				"PackageCodes":         freeResourcePackageCodes,
-				"SlicePeriodStartTime": dayStart.Format(packageEndLayout),
-				"SlicePeriodEndTime":   dayEnd.Format(packageEndLayout),
+				"Status": []int{0, 3}, "IsDisplayTotalInfo": true, "OnlyValidPeriod": true,
+				"PackageCodes": freeResourcePackageCodes,
 			},
 		},
 	}
@@ -4315,11 +4319,12 @@ func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.D
 
 // collectPackageExpiry 分页拉取单类积分包并累加到期批次。TotalCount>0 时以其为
 // 终止条件；否则以空页终止；单类最多 100 页（防御上游异常无限翻页）。
+// 页大小跟随 resourcePackagePageSize（桌面 200），「不足一页即终止」逻辑不变。
 func (c *Client) collectPackageExpiry(
 	account *auth.Auth, path string, base map[string]any,
 	now time.Time, soon time.Duration, totals *resourceTotals,
 ) error {
-	const pageSize = 100
+	const pageSize = resourcePackagePageSize
 
 	seen := 0
 
@@ -4362,7 +4367,7 @@ func (c *Client) fetchPackagePage(
 ) (packagePageResp, error) {
 	body := maps.Clone(base)
 	body["PageNumber"] = page
-	body["PageSize"] = 100
+	body["PageSize"] = resourcePackagePageSize
 
 	data, err := c.billingMeterJSONHeaders(account, []string{path, "/v2" + path}, body,
 		map[string]string{"Accept-Language": billingAcceptLanguage(account)},

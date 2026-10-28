@@ -443,9 +443,10 @@ func TestSummaryResourceAcceptsStringCapacity(t *testing.T) {
 	}
 }
 
-// TestResourcePackageDayWindowUsesCST 免费包切片窗口按 UTC+8 取「今天」，
-// 不能使用部署机本地时区（非 UTC+8 环境会错一天）。
-func TestResourcePackageDayWindowUsesCST(t *testing.T) {
+// TestResourcePackageFreeBodyDesktopShape free 包 body 对齐官方桌面 validCreditPackages：
+// `Status:[0,3]` + `OnlyValidPeriod:true` + `IsDisplayTotalInfo:true` + `PageSize:200`，
+// 不发 SlicePeriod*（那是另一套 BackendProvider 实现的字段，桌面不出现）。
+func TestResourcePackageFreeBodyDesktopShape(t *testing.T) {
 	t.Parallel()
 
 	var freeBody []byte
@@ -458,16 +459,24 @@ func TestResourcePackageDayWindowUsesCST(t *testing.T) {
 		return jsonResp(200, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`), nil
 	})
 
-	// UTC 2026-10-19 17:30 = CST 2026-10-20 01:30。
-	now := time.Date(2026, 10, 19, 17, 30, 0, 0, time.UTC)
-
-	if _, _ = client.resourcePackages(&auth.Auth{AccessToken: "at", UID: "u1"}, now, 0); len(freeBody) == 0 {
+	if _, _ = client.resourcePackages(&auth.Auth{AccessToken: "at", UID: "u1"}, time.Now(), 0); len(freeBody) == 0 {
 		t.Fatal("free package request not captured")
 	}
 
-	if !strings.Contains(string(freeBody), `"SlicePeriodStartTime":"2026-10-20 00:00:00"`) ||
-		!strings.Contains(string(freeBody), `"SlicePeriodEndTime":"2026-10-20 23:59:59"`) {
-		t.Errorf("free package window=%s want CST 2026-10-20", freeBody)
+	for _, want := range []string{
+		`"OnlyValidPeriod":true`,
+		`"PageSize":200`,
+		`"IsDisplayTotalInfo":true`,
+	} {
+		if !strings.Contains(string(freeBody), want) {
+			t.Errorf("free body=%s missing %s", freeBody, want)
+		}
+	}
+
+	for _, unwanted := range []string{"SlicePeriodStartTime", "SlicePeriodEndTime"} {
+		if strings.Contains(string(freeBody), unwanted) {
+			t.Errorf("free body=%s 不应含 %s（桌面不发 slice 窗口）", freeBody, unwanted)
+		}
 	}
 }
 
