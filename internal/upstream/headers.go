@@ -44,7 +44,7 @@ const (
 // （见 internal/upstream/UPSTREAM.md §六）。
 func (s surface) chatFamily() bool {
 	switch s {
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceModelBusy:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
 		return true
 	default:
 		return false
@@ -178,6 +178,16 @@ func (c *Client) billingReportUA(a *auth.Auth) string {
 	return c.billingUA(a)
 }
 
+// desktopUA 桌面产品面 UA：显式 user_agent 覆盖优先，否则 profile 冻结的桌面三段式
+// （与 chat 的 chatUA 是两条 surface，不可互相顶替）。
+func (c *Client) desktopUA(account *auth.Auth) string {
+	if c != nil && c.UserAgent != "" {
+		return c.UserAgent
+	}
+
+	return c.desktopUAFor(account)
+}
+
 // billingSurfaceUA billing meter 类面（get-user-resource / summary / packages /
 // 签到 / balance）的 UA：显式 user_agent 覆盖优先，否则桌面三段式；
 // client_name="SaaS" 是显式逃生门——不写 UA 键，保留 Go transport 默认 UA。
@@ -200,7 +210,10 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 		return c.billingSurfaceUA(account)
 	case surfaceReport:
 		return c.billingReportUA(account)
-	case surfaceModelBusy, surfaceRefresh, surfaceV3Config:
+	case surfaceModelBusy:
+		// 渲染层探针面：真机是与「桌面产品面」同源的三段式 UA。
+		return c.desktopUA(account)
+	case surfaceRefresh, surfaceV3Config:
 		// refresh / v3-config：与 chat 同源的客户端 UA（v3-config 由调用方按
 		// 探测目标换成 IDE / CLI UA，见 V3ConfigHeaders）。
 		return c.userAgent(account)
@@ -356,11 +369,8 @@ func (c *Client) chatFamilyHeaders(
 		// 出图是非流式 JSON：Accept 改回 JSON，Content-Type 保持 chat 形态。
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
-	case surfaceModelBusy:
-		// 渲染层 busy 探针：只把 Accept / Content-Type 改成 JSON 面形态。
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Content-Type", "application/json")
-	case surfaceChat, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth:
+	case surfaceChat, surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config,
+		surfaceGrowth:
 		// chat 面沿用上面构造的 chat 流式头集；轻头族各面已在 applyHeaders 分流。
 	}
 }
@@ -368,9 +378,15 @@ func (c *Client) chatFamilyHeaders(
 // lightHeaders 非 chat「轻头族」base：Accept / Content-Type / UA / Authorization /
 // X-User-Id / X-Domain，各面只覆盖差异项。真机证据逐面见 UPSTREAM.md §六。
 //
-//nolint:cyclop,gocyclo // 头族按 surface 线性展开，拆成多个小函数反而更难对照真机表。
+//nolint:cyclop,gocyclo,maintidx // 头族按 surface 线性展开，拆成多个小函数反而更难对照真机表。
 func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth) {
-	req.Header.Set("Accept", "application/json")
+	accept := "application/json"
+	if srf == surfaceModelBusy {
+		// 渲染层 wb.http.post 的宽松 Accept（真机 /v2/chat/busy）。
+		accept = "application/json, text/plain, */*"
+	}
+
+	req.Header.Set("Accept", accept)
 	req.Header.Set("Content-Type", "application/json")
 	// AccessToken 加锁快照（同 chatFamilyHeaders：keepalive 可在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
@@ -389,7 +405,18 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 		req.Header.Set("X-User-Id", account.UID)
 	}
 
+	// X-Domain：账号 domain 优先，否则取 chat base 的 host（真机各面都是 host 形态）。
+	req.Header.Set("X-Domain", domainHostFor(account, c.chatBase(account)))
+
 	switch srf {
+	case surfaceModelBusy:
+		// 渲染层高频探针：真机恰好 8 个轻头——Accept / Content-Type /
+		// User-Agent / X-Request-ID / X-Product / Authorization / X-User-Id / X-Domain。
+		// 没有会话四件套、acp-connection-id、baggage、b3 / trace、X-Requested-With、
+		// X-Codebuddy-Request，也没有企业头（真机样本是个人号；企业号是否带
+		// X-Enterprise-Id / X-Tenant-Id 无证据，按「不猜测」不发，多一条反而是
+		// 更明显的非官方指纹。见 UPSTREAM.md §六，issue #371）。
+		req.Header.Set("X-Product", "SaaS")
 	case surfaceRefresh:
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		// X-Domain：账号 domain 优先；global 缺省固定 www.workbuddy.ai；CN 个人号
@@ -407,20 +434,15 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 	case surfaceV3Config:
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("X-Product", "SaaS")
-		req.Header.Set("X-Domain", domainHostFor(account, c.chatBase(account)))
 		injectEnterpriseHeaders(req, account)
 	case surfaceBilling, surfaceReport, surfaceGrowth:
-		// billing 域各面（meter / report / growth 暂时共用）：domain 与 enterprise
-		// 只在真有值时发，个人号不发声明头。
-		if d := account.DomainValue(); d != "" {
-			req.Header.Set("X-Domain", d)
-		}
-
+		// billing 域各面（meter / report / growth 暂时共用）：企业头只在真有值时发，
+		// 个人号不发声明头。
 		if account.EnterpriseID != "" {
 			req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
 			req.Header.Set("X-Tenant-Id", account.EnterpriseID)
 		}
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceModelBusy:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
 		// 不走轻头族（chatFamily() 已在 applyHeaders 分流）。
 	}
 }
@@ -822,6 +844,11 @@ func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 // ReportHeaders 活跃上报面（POST {billingBase}/v2/report）请求头。
 func (c *Client) ReportHeaders(req *http.Request, account *auth.Auth) {
 	c.applyHeaders(surfaceReport, req, account, "", ChatMeta{})
+}
+
+// ModelBusyHeaders 渲染层繁忙度探针面（/v2/chat/busy）请求头。
+func (c *Client) ModelBusyHeaders(req *http.Request, account *auth.Auth) {
+	c.applyHeaders(surfaceModelBusy, req, account, "", ChatMeta{})
 }
 
 // GrowthHeaders growth 面（/v2/activity/growth/*：任务、猫猫旅行、连登、礼包）请求头。

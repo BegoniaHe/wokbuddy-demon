@@ -104,7 +104,7 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 | webfetch 的 `X-Wb-Uid` | 与 `X-User-Id` 同值（账号 uid） | `WebFetch` 单独注入 | 官方只在 webfetch / knowledge_search 发，不扩散到 search / agentic_search / images |
 | agentic_search | `Content-Type` / `Authorization` / 可选 `X-Conversation-Request-ID` | 复用 chat 头族 + `Accept: text/event-stream` | 同上；SSE 契约优先 |
 | images | Content-Type / Authorization / conversation / identity | 复用 chat 头族 | 同上 |
-| chat/busy | renderer `wb.http.post` | 复用 chat 头族 | 同上 |
+| chat/busy | renderer `wb.http.post`，8 个轻头（`Accept` 宽松值 / `Content-Type` / 三段 UA / `X-Request-ID` / `X-Product: SaaS` / `Authorization` / `X-User-Id` / `X-Domain`） | 独立轻头族（`surfaceModelBusy`） | 2026-10-28 真机：该路径没有任何会话头 / `acp-connection-id` / `baggage` / b3 / `x-stainless-*` / `X-Codebuddy-Request`（#371）。企业账号的 `X-Enterprise-Id` / `X-Tenant-Id` 取舍：真机样本是个人号，无证据，按「不猜测」不发 |
 
 证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.9.3 包内
 `X-Agent-Runtime` 已是基线行为（`normalizeAgentRuntime` 不在枚举内回落 `other`），

@@ -69,8 +69,8 @@ func (c *Client) modelBusyBatch(
 		return nil, fmt.Errorf("ModelBusy: %w", err)
 	}
 
-	// 官方渲染层复用 chat 会话头；只覆盖 Accept 为 JSON（非 SSE）。
-	// 统一指纹是刻意取舍，理由与边界见 `internal/upstream/UPSTREAM.md` §六。
+	// 官方渲染层走通用 http 封装，不构造会话头：真机只有 8 个轻头。
+	// 头族见 headers.go 的 lightHeaders，取舍见 `internal/upstream/UPSTREAM.md` §六。
 	c.applyHeaders(surfaceModelBusy, req, account, "", ChatMeta{})
 
 	resp, err := c.HTTP.Do(req)

@@ -83,6 +83,7 @@ func TestCodebuddyRequestOnlyOnChatFamily(t *testing.T) {
 		call func(req *http.Request)
 	}{
 		{"billing", func(req *http.Request) { client.BillingHeaders(req, account) }},
+		{"busy", func(req *http.Request) { client.ModelBusyHeaders(req, account) }},
 		{"report", func(req *http.Request) { client.ReportHeaders(req, account) }},
 		{"refresh", func(req *http.Request) { client.RefreshHeaders(req, account) }},
 		{"v3config", func(req *http.Request) { client.V3ConfigHeaders(req, account, "") }},
@@ -178,4 +179,77 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestModelBusyGoldenHeaderSet /v2/chat/busy 只有一个 8 轻头形态：真机（个人号）
+// 去掉 Host / Connection / Content-Length 后恰好 8 个，多一个就是非官方指纹。
+func TestModelBusyGoldenHeaderSet(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/busy", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ModelBusyHeaders(req, account)
+
+	assertHeaderKeys(t, req,
+		"Accept", "Content-Type", "User-Agent", "X-Request-Id",
+		"X-Product", "Authorization", "X-User-Id", "X-Domain",
+	)
+
+	for name, want := range map[string]string{
+		"Accept":        "application/json, text/plain, */*",
+		"Content-Type":  "application/json",
+		"X-Product":     "SaaS",
+		"Authorization": "Bearer at",
+		"X-User-Id":     "u1",
+		"X-Domain":      "www.workbuddy.cn",
+		"User-Agent":    "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+	} {
+		if got := req.Header.Get(name); got != want {
+			t.Errorf("%s=%q want %q", name, got, want)
+		}
+	}
+
+	if got := req.Header.Get("X-Request-ID"); !uuidV7Hex32.MatchString(got) {
+		t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
+	}
+
+	// 会话头族 / 链路族 / 归属族一律不发。
+	for _, name := range []string{
+		"X-Conversation-Id", "X-Conversation-Request-Id", "X-Conversation-Message-Id",
+		"X-Root-Request-Id", "Acp-Connection-Id", "X-Trace-Id", "Traceparent", "B3",
+		"X-Agent-Runtime", "X-Agent-Purpose", "X-Agent-Type", "X-Ide-Name",
+		"X-Private-Data", "X-Requested-With", "X-Codebuddy-Request",
+		"X-Enterprise-Id", "X-Tenant-Id", "X-No-Enterprise-Id",
+	} {
+		if got := req.Header.Get(name); got != "" {
+			t.Errorf("busy 不应发 %s=%q", name, got)
+		}
+	}
+}
+
+// TestModelBusyEnterpriseAccountBareToo 企业账号同样 8 轻头：真机样本是个人号，
+// 企业号是否带 X-Enterprise-Id / X-Tenant-Id 无证据，按「不猜测」不发。
+func TestModelBusyEnterpriseAccountBareToo(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := &auth.Auth{UID: "u-ent", AccessToken: "at", EnterpriseID: "ent-1", Domain: "www.workbuddy.cn"}
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/busy", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ModelBusyHeaders(req, account)
+
+	assertHeaderKeys(t, req,
+		"Accept", "Content-Type", "User-Agent", "X-Request-Id",
+		"X-Product", "Authorization", "X-User-Id", "X-Domain",
+	)
 }
