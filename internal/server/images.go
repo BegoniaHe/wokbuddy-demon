@@ -249,19 +249,7 @@ func (h *Handler) forwardImages(
 
 	status, raw, err := call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 
-	var (
-		uerr        *upstream.Error
-		refreshFail error
-	)
-	if errors.As(err, &uerr) && status == http.StatusUnauthorized {
-		// 401 同号 refresh 重放一次；refresh 失败时按 refresh 错误分类，不能拿原始
-		// 401 记会话失效——网络/上游 5xx 会让健康号被连续三次失败误禁用。
-		refreshFail = h.cfg.Upstream.RefreshToken(acct)
-		if refreshFail == nil {
-			_ = acct.SaveAtomicRetry()
-			status, raw, err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
-		}
-	}
+	status, raw, err, refreshFail := h.retryImagesAfterRefresh(r, acct, body, meta, call, status, raw, err)
 
 	h.recordImagesAttempt(acct, realm, bareModel, raw, err, started, r)
 
@@ -275,6 +263,7 @@ func (h *Handler) forwardImages(
 			return
 		}
 
+		var uerr *upstream.Error
 		if !errors.As(err, &uerr) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "image request failed at transport layer")
 
@@ -286,15 +275,48 @@ func (h *Handler) forwardImages(
 		return
 	}
 
+	// 与 chat / search 同口径：出图实测成功即证明账号可用，清熔断与连败计数
+	// （只记失败不记成功会让恢复的账号一直挂着「连败中」）。
+	h.cfg.Pool.NoteSuccess(acct.UID)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
 }
 
+// retryImagesAfterRefresh 上游 401 时同号 refresh 后重放一次；第二返回值是
+// refresh 错误（refresh 失败时保持原始 401 结果）。
+//
+// 不能拿原始 401 记会话失效：refresh 失败可能只是网络 / 上游 5xx，健康号会被连续
+// 三次失败误禁用。非 401 或非 *upstream.Error 原样返回。
+//
+//nolint:gocritic // ChatMeta 值传递与 upstream.ChatHeaders 同一 API。
+func (h *Handler) retryImagesAfterRefresh(
+	r *http.Request, acct *auth.Auth, body []byte, meta upstream.ChatMeta, call imagesCall,
+	status int, raw []byte, err error,
+) (int, []byte, error, error) {
+	var uerr *upstream.Error
+	if !errors.As(err, &uerr) || status != http.StatusUnauthorized {
+		return status, raw, err, nil
+	}
+
+	refreshFail := h.cfg.Upstream.RefreshToken(acct)
+	if refreshFail != nil {
+		return status, raw, err, refreshFail
+	}
+
+	_ = acct.SaveAtomicRetry()
+
+	status, raw, err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+
+	return status, raw, err, nil
+}
+
+// imagesCall 一次图像上游尝试的签名（出图与图生图一致）。
+type imagesCall func(context.Context, *auth.Auth, []byte, string, upstream.ChatMeta) (int, []byte, error)
+
 // imageCaller 按上游路径选出图 / 图生图入口：两者签名相同，只有上游路径不同。
-func (h *Handler) imageCaller(upstreamPath string) func(
-	context.Context, *auth.Auth, []byte, string, upstream.ChatMeta,
-) (int, []byte, error) {
+func (h *Handler) imageCaller(upstreamPath string) imagesCall {
 	if upstreamPath == upstream.ImageEditsPath {
 		return h.cfg.Upstream.EditImage
 	}

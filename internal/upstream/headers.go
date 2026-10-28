@@ -186,6 +186,14 @@ func (c *Client) billingMeterUA(account *auth.Auth) string {
 	return c.desktopUAFor(account)
 }
 
+// BillingMeterUserAgent billing meter 面的出站 UA，供复用同一批 billing 端点的
+// 进程内 CLI（cmd/credit）对齐服务端指纹。优先级与出站路径同源
+// （显式 user_agent > profile 抓包值 > 桌面三段式；client_name="SaaS" 返回空串），
+// 避免第二份优先级逻辑各自漂移。
+func (c *Client) BillingMeterUserAgent(a *auth.Auth) string {
+	return c.billingMeterUA(a)
+}
+
 // lightUA 轻头族各面的 UA：显式 user_agent 覆盖优先（各面自带默认见下）。
 func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 	switch srf {
@@ -251,7 +259,7 @@ func (c *Client) deviceToken(account *auth.Auth) string {
 	return c.resolveDeviceToken(account)
 }
 
-// checkinHeaders 签到专用请求头：X-Device-Token（取值为空时不注入）。
+// checkinHeaders 签到面请求头：X-Device-Token（取值为空时不注入）。
 // 签到是除 chat 之外的另一个消费面（见 resolveDeviceToken）：summary / packages /
 // report / busy / v3-config / refresh / growth 与 agenttool 四路都不带（真机口径）。
 func (c *Client) checkinHeaders(a *auth.Auth) map[string]string {
@@ -618,7 +626,7 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	c.applyHeaders(surfaceChat, req, account3, clientIP, meta)
 }
 
-// ImagesHeaders 出图面（/v2/images/generations）请求头。
+// ImagesHeaders 图像面（/v2/images/generations 与 /v2/images/edits）请求头。
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
 func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {

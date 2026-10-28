@@ -4919,7 +4919,8 @@ func cyclePackageAmounts(account respAccount) (remain, used, size int64) {
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
-// 签到是 X-Device-Token 的两个消费点之一（另一个是 auth/state），见 checkinHeaders。
+// 签到是 X-Device-Token 的消费面之一（另一处是 chat，见 chatSurfaceOverrides；
+// auth/state 是面板登录面，不经本包），见 checkinHeaders。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
 	return c.retryBillingTransient(func() error {
 		_, err := c.billingMeterJSONHeaders(a, checkinMeterPaths(), map[string]any{}, c.checkinHeaders(a))

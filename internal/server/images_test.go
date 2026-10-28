@@ -103,6 +103,49 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 	}
 }
 
+// TestImagesSuccessClearsAccountPenalty 出图成功必须与 chat / search 同口径调
+// Pool.NoteSuccess：否则上游恢复后出图成功的账号仍挂着熔断/连败计数，
+// 直到别的 chat 请求偶然成功才归零。
+func TestImagesSuccessClearsAccountPenalty(t *testing.T) {
+	t.Parallel()
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[{"url":"https://img.example/a.png"}]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	state.NoteError("u1")
+	state.NoteFailures("u1")
+
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	status, ok := state.Status("u1")
+	if !ok {
+		t.Fatal("account missing")
+	}
+
+	if status.ConsecutiveFails != 0 || status.BreakerFails != 0 {
+		t.Errorf("consecutive_fails=%d breaker_fails=%d want 0/0（成功须清罚）",
+			status.ConsecutiveFails, status.BreakerFails)
+	}
+}
+
 func TestImagesRealmDirectNoFallback(t *testing.T) {
 	t.Parallel()
 

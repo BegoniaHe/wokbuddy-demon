@@ -23,7 +23,8 @@ import (
 )
 
 // reportPath 活跃上报通道（实测）。默认走 CN billing 域（workbuddy.cn，可用
-// cn.billing_base 退回 codebuddy.cn）；桌面 /v2/report 是另一条 surface，走 webBase。
+// cn.billing_base 退回 codebuddy.cn）；桌面 /v2/report 走 chatBase（desktopBase），
+// Web 上报才走 webBase——三者共用该路径但是不同 surface。
 const reportPath = "/v2/report"
 
 // billingJSON 发 billing 域（billingBase，workbuddy.cn）请求并解信封；body 为 nil 时不带请求体。
