@@ -4242,6 +4242,9 @@ func packageExpiryTime(pkg *billingPackageAccount) (time.Time, bool) {
 
 // 官方桌面端按包类型拆分查询，且上游要求显式下发 PackageCodes（缺失直接返回
 // 10001 PackageCodes required）。付费包与免费/赠送包分属两个端点，码表不可混用。
+//
+// 码表对齐 CN 5.9.3 `main/account.js` 的 `Fs`（paid）/ `Is`（free）两个数组；
+// `buddyOneVip`（TCACA_code_043）是 5.9.3 才加进 paid 的码，5.8.x 包内没有它。
 var (
 	paidResourcePackageCodes = []string{
 		"TCACA_code_002_AkiJS3ZHF5",
@@ -4250,6 +4253,7 @@ var (
 		"TCACA_code_023_4xbGhMrE6q",
 		"TCACA_code_026_BaESVICNoi",
 		"TCACA_code_027_0FCGVA6vSa",
+		"TCACA_code_043_6oIkxT7Z0S",
 		"TCACA_code_009_0XmEQc2xOf",
 		"TCACA_code_038_OhvqZtiPKr",
 		"TCACA_code_036_lupO5WgNdG",
@@ -4269,15 +4273,37 @@ var (
 	}
 )
 
+// resourcePackagePageSize 积分包分页大小。官方桌面 daemon 链的 `fetchAllPages`
+// （CN 5.9.3 main/account.js@378532）固定传 `pageSize:200`，并以
+// `accounts.length < 200` 作为翻页终止条件。页终止判据与请求体两处共用本常量，
+// 避免再次漂移。
+const resourcePackagePageSize = 200
+
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
+//
+// body 口径对齐**桌面 daemon 的用量链** `UsageService.getPersonalUsage`
+// （CN 5.9.3 main/authority-snapshot.js@469554）：它复用 main/account.js 的
+// `fetchUserResources` / `fetchAllPages`（@378532，`pageSize:200` 且以「不足 200 条」
+// 终止），经 `fetchResourcePackagesPage`（@468153）组体
+// `{PageNumber, PageSize, PackageCodes, Status:[0,3], ...extra}`：
+//   - paid 的 extra 是 `{NeedRenewInfo: true}`；
+//   - free 的 extra 是 `buildSlicePeriodRange()`（account.js@378135，导出名 `P`），
+//     即 `SlicePeriodStartTime` / `SlicePeriodEndTime` 的当日窗口。
+//
+// `OnlyValidPeriod` / `Status` 的另一套口径在渲染层 `CloudAccountRepo.validCreditPackages`
+// （account.js@418501，面板用量页用）：它发 `{Status:[0,3], OnlyValidPeriod:true}`
+// 且不带 slice 窗口。那是「渲染层 → 面板」的 surface，与 daemon 的余额刷新不同源，
+// 本仓按 daemon 口径走 slice 窗口，不发送 OnlyValidPeriod。
+// `IsDisplayTotalInfo` 不在 daemon 的组体里，本仓照发（既有字段，改它属另一次改动）。
 func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.Duration) (
 	expiring int64, totals *resourceTotals,
 ) {
 	totals = &resourceTotals{}
 
-	// 切片日期窗口按上游 UTC+8 墙钟计算；用部署机本地时区会在非 UTC+8 环境把
-	// 「今天」算错一天，拿到错误周期的免费包。
+	// 切片日期窗口按上游 UTC+8 墙钟计算（桌面 buildSlicePeriodRange 用本地时区
+	// 的 00:00:00 / 23:59:59）；用部署机本地时区会在非 UTC+8 环境把「今天」算错
+	// 一天，拿到错误周期的免费包。
 	nowCST := now.In(softRateResetLoc)
 	dayStart := time.Date(nowCST.Year(), nowCST.Month(), nowCST.Day(), 0, 0, 0, 0, softRateResetLoc)
 	dayEnd := dayStart.Add(24*time.Hour - time.Second)
@@ -4315,11 +4341,12 @@ func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.D
 
 // collectPackageExpiry 分页拉取单类积分包并累加到期批次。TotalCount>0 时以其为
 // 终止条件；否则以空页终止；单类最多 100 页（防御上游异常无限翻页）。
+// 页大小跟随 resourcePackagePageSize（桌面 200），「不足一页即终止」逻辑不变。
 func (c *Client) collectPackageExpiry(
 	account *auth.Auth, path string, base map[string]any,
 	now time.Time, soon time.Duration, totals *resourceTotals,
 ) error {
-	const pageSize = 100
+	const pageSize = resourcePackagePageSize
 
 	seen := 0
 
@@ -4362,7 +4389,7 @@ func (c *Client) fetchPackagePage(
 ) (packagePageResp, error) {
 	body := maps.Clone(base)
 	body["PageNumber"] = page
-	body["PageSize"] = 100
+	body["PageSize"] = resourcePackagePageSize
 
 	data, err := c.billingMeterJSONHeaders(account, []string{path, "/v2" + path}, body,
 		map[string]string{"Accept-Language": billingAcceptLanguage(account)},
