@@ -625,7 +625,7 @@ func TestImagesEditsDisabledMentionsEditsPath(t *testing.T) {
 	}
 }
 
-// TestImagesEditsRealmPrefixStripped edits 与 generations 共用 rewriteImageModel：
+// TestImagesEditsRealmPrefixStripped edits 与 generations 共用 rewriteModel：
 // 带域前缀的 model 只改 body.model，image / input_fidelity 不动。
 func TestImagesEditsRealmPrefixStripped(t *testing.T) {
 	t.Parallel()
@@ -818,5 +818,45 @@ func TestImagesEditsMultipartRejectedBeforeBodyLimit(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), "multipart/form-data is not supported") {
 		t.Errorf("body=%s want multipart 提示", rec.Body)
+	}
+}
+
+// TestImagesEditsPreservesLargeNumericFields 带域前缀改写只换 model，其余字段按
+// 字面量保留：走 float64 会把 seed 9007199254740993 悄悄改成 ...992，出图结果漂移。
+func TestImagesEditsPreservesLargeNumericFields(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	body := `{"model":"cn:image-to-image","prompt":"cat","seed":9007199254740993}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(string(gotBody), `"seed":9007199254740993`) {
+		t.Fatalf("body=%s seed 被改写成浮点形态", gotBody)
+	}
+
+	if !strings.Contains(string(gotBody), `"model":"image-to-image"`) {
+		t.Fatalf("body=%s model 未去掉 realm 前缀", gotBody)
 	}
 }

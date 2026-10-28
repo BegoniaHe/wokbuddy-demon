@@ -71,7 +71,8 @@ func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPa
 	}
 
 	if prefixed {
-		body = rewriteImageModel(body, bareModel)
+		// 与 chat 同一份改写逻辑（logging.go rewriteModel）：只换 model，其余字段原样。
+		body = rewriteModel(body, bareModel)
 	}
 
 	h.forwardImages(w, r, acct, body, realm, bareModel, upstreamPath)
@@ -209,23 +210,6 @@ func (h *Handler) imageModelVisible(w http.ResponseWriter, realm, bareModel stri
 	}
 
 	return true
-}
-
-// rewriteImageModel 去掉 body.model 的 realm 前缀（上游只认裸名）。
-func rewriteImageModel(body []byte, bareModel string) []byte {
-	var obj map[string]any
-	if json.Unmarshal(body, &obj) != nil || obj == nil {
-		return body
-	}
-
-	obj["model"] = bareModel
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-
-	return out
 }
 
 // ensureImagesToken 临近过期先刷新；失败写出 502。
