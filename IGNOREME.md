@@ -294,6 +294,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
 | 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭；`deep=true` 需 `features.search_deep`） |
 | 官方工具出口 | `POST /v2/chat/busy`（模型忙预检，只读本地池状态）、`POST /v1/tools/fetch` / `POST /v1/fetch`（官方服务端抓取，需 `features.web_fetch_endpoint=true`） |
+| 官方图像 | `POST /v1/images/generations`（出图）、`POST /v1/images/edits`（图生图，JSON 形态、非 multipart），需 `features.images_endpoint=true` |
 | Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
 
 Codex CLI 等使用 Responses API 的客户端：
@@ -387,7 +388,7 @@ gemini
 - **错误码分类**：`11125/11129/11130/11132/11137-11139/11148-11155/12654/14405` 为请求级错误，不罚号、不轮转；`11102` 模型目录不存在直接 `404` fail-fast，`11136` 换号并写入 (账号,模型) 负缓存（不写路由熔断），`11141` 模型下线直接 fail-fast；`11-128 + request illegal` 按**通道校验失败**处理（不罚号、不降级重试、继续轮转，轮转耗尽回 400 `channel_refused`），其余 `11-128` 入站按内容拦截；`11140 + request illegal` 才是账号受限（禁用，需在 WorkBuddy 提交反馈申诉后重登），裸 `request illegal` 不再升级成账号故障；`6000-6008` 按限流处理（`6004` 保持模型级冷却）。HTTP 200 + 非零业务码与 SSE error 帧均按帧内/结构化 `code` 分类。
 - **签到 / 余额**：两 realm 均优先 `/v2/billing/meter/daily-checkin`，404 回落旧路径；`1001` 视为已签到，`1002/1003` 视为活动未开启。余额以 `get-user-resource-summary` 为主，失败回落 `get-user-resource`，并解析精确容量、切片额度与到期字段。
 - **模型目录**：应用 `availableModels` / `disabled` / `aliases` 过滤；CN 在 `/console` 无 CLI 过滤集时回落 `/v2/enterprises/personal/models`，`/v3/config` 同时使用桌面端与 IDE UA。上游 alias 参与请求解析，`models.aliases` 配置优先。
-- **growth / travel**：Bearer 通道优先 `/v2/activity/growth/*`，404 回落旧路径；travel claim 支持带 `record_id` 与空 body 两种形态，并发送 `X-Product-Code: workbuddy`。
+- **growth / travel**：Bearer 通道优先 `/v2/activity/growth/*`，404 回落旧路径；travel claim 首选空对象 `{}`（官方桌面形态，零字节 body 会被上游 JSON 解析判 400），`{record_id}` 仅在最后一跳收到 400（且调用方确有 record_id）时兜底一次，record_id 缺失不再跳过领奖；三跳都发 `X-Product-Code: workbuddy`。
 - **桌面指纹**：`X-Domain` 使用 host 形态；企业账号上报事件带 `enterpriseId` / `enterprise`；不伪造 `qimei36`。
 
 ### Webhook 告警
@@ -489,7 +490,7 @@ gemini
 | `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
 | `features.search_deep` | `false` | 允许 `POST /v1/search/messages` 的 `deep:true`：上游 `/agenttool/v1/agentic_search` 综述式检索，单次最长 120s、只做单次尝试（不随 `upstream.rotate_max` 放大）。热生效 |
 | `features.web_fetch_endpoint` | `false` | 开放 `POST /v1/tools/fetch`（`/v1/fetch` 同义别名）：官方服务端抓取（上游 `/agenttool/v1/webfetch`），入口做 scheme / userinfo / 私网 SSRF 校验，仅 CN 域。热生效 |
-| `features.images_endpoint` | `false` | 开放 `POST /v1/images/generations`：官方出图；尚未在真实账号验证鉴权与计费，默认关闭。热生效 |
+| `features.images_endpoint` | `false` | 开放 `POST /v1/images/generations`（官方出图）与 `POST /v1/images/edits`（官方图生图，JSON 形态）；尚未在真实账号验证鉴权与计费，默认关闭。两端点共用本开关。热生效 |
 | `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |
 | `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |

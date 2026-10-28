@@ -231,3 +231,52 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 		}
 	}
 }
+
+// uuidV7HyphenTestPattern 带连字符 UUIDv7：第 13 位为 7、变体位 10xx。
+var uuidV7HyphenTestPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// TestUUIDv7AtStableAndPlausible 同种子 + 同基准恒同值；异种子互异；时间戳前缀
+// 落在「基准时刻前 1 小时」窗口内（可信时间）。
+func TestUUIDv7AtStableAndPlausible(t *testing.T) {
+	t.Parallel()
+
+	base := time.Date(2026, 10, 28, 10, 0, 0, 0, time.UTC)
+	seed := "wb2a:acp:0f0e0d0c-0b0a-4908-8706-050403020100"
+
+	first := UUIDv7At(seed, base)
+	second := UUIDv7At(seed, base)
+
+	if first != second {
+		t.Fatalf("同种子派生不一致: %q != %q", first, second)
+	}
+
+	if !uuidV7HyphenTestPattern.MatchString(first) {
+		t.Fatalf("UUIDv7At() = %q 不匹配带连字符 UUIDv7", first)
+	}
+
+	if UUIDv7At("wb2a:acp:other", base) == first {
+		t.Fatal("不同种子派生出相同值")
+	}
+
+	got := uuidTimestampMillis(t, first)
+	lower := base.Add(-time.Hour).UnixMilli()
+
+	if got < lower || got > base.UnixMilli() {
+		t.Fatalf("派生时间戳=%d 不在 [%d,%d]（基准前 1 小时窗口）", got, lower, base.UnixMilli())
+	}
+}
+
+// uuidTimestampMillis 解析带连字符 UUIDv7 前 48 bit 的毫秒时间戳。
+func uuidTimestampMillis(t *testing.T, id string) int64 {
+	t.Helper()
+
+	raw, err := hex.DecodeString(strings.ReplaceAll(id, "-", ""))
+	if err != nil {
+		t.Fatalf("DecodeString(%q): %v", id, err)
+	}
+
+	var high [8]byte
+	copy(high[2:], raw[:6])
+
+	return int64(binary.BigEndian.Uint64(high[:]))
+}

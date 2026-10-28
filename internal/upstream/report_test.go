@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -139,5 +140,99 @@ func TestIsTransientBillingErrProcessing(t *testing.T) {
 				t.Fatalf("isTransientBillingErr(%v)=%v want %v", testCase.err, got, testCase.want)
 			}
 		})
+	}
+}
+
+// TestChatRequestEventShapeMatches593 钉住 chat_request_send 的 5.9.3 载荷键集：
+// 键集**精确相等**（不多不少），agentType=main、isMaxMode=false、fileUri 为空串；
+// 5.8.x 的 maxToken / maxSteps / temperature / maxRetries / skillCount / totalCount
+// 不再出现；无工作区时不产生 vcs* 四键（VcsInfoProcessor 只在 fileUri 非空时改写，
+// #366）。
+func TestChatRequestEventShapeMatches593(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{UID: "u-shape", AccessToken: "at"}
+	event := newChatRequestEvent(account, "conv-1", "01a17a9c4d2f7b3e8c5a6d4e2f1b0a93", "glm-5.2", "GLM 5.2")
+
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	wantKeys := []string{
+		"eventCode", "timestamp", "reportDelay", "mode", "conversationId", "requestId",
+		"inputLength", "requestModelId", "requestModelName", "isPlan",
+		"isAutoExecuteTerminal", "isAutoModify", "codebaseEnable", "isMaxMode",
+		"mentionContexts", "knowledgeId", "knowledgeName", "codebaseId",
+		"mentionContextCount", "command", "expertId", "recommendId", "skillId",
+		"fileUri", "presentAt", "traceId",
+		"rootRequestId", "parentConversationId", "agentName", "agentType", "userId",
+	}
+
+	gotKeys := make([]string, 0, len(got))
+	for key := range got {
+		gotKeys = append(gotKeys, key)
+	}
+
+	slices.Sort(gotKeys)
+
+	wanted := slices.Clone(wantKeys)
+	slices.Sort(wanted)
+
+	if !slices.Equal(gotKeys, wanted) {
+		t.Fatalf("载荷键集不符\n got=%v\nwant=%v", gotKeys, wanted)
+	}
+
+	assertChatRequestEventValues(t, event, got)
+}
+
+// assertChatRequestEventValues 断言 5.9.3 的字段取值语义：agentType=main、
+// isMaxMode=false、agentName 空串、fileUri 空串；条件发字段不出现、已删字段不复活、
+// 无工作区时不出现 vcs* 四键。
+func assertChatRequestEventValues(t *testing.T, event chatRequestEvent, got map[string]any) {
+	t.Helper()
+
+	if event.AgentType != "main" {
+		t.Errorf("agentType=%q want main（官方只可能是 main/subagent/team）", event.AgentType)
+	}
+
+	if event.IsMaxMode {
+		t.Error("isMaxMode 必须为 false（网关无 thinking 覆盖状态）")
+	}
+
+	if event.AgentName != "" {
+		t.Errorf("agentName=%q want 空串（官方空值形态）", event.AgentName)
+	}
+
+	if event.FileURI != "" {
+		t.Errorf("fileUri=%q want 空串（无工作区）", event.FileURI)
+	}
+
+	// VcsInfoProcessor 只在 fileUri 非空时写 vcs* 四键并删掉 fileUri；网关无工作区，
+	// 官方在该形态下四个键都不出现。
+	for _, key := range []string{"vcsType", "vcsRepo", "vcsBranchName", "vcsRevId"} {
+		if _, ok := got[key]; ok {
+			t.Errorf("无工作区时 %s 不应出现在载荷里（官方只在 fileUri 非空时写）", key)
+		}
+	}
+
+	assertAbsent(t, got, "网关无该状态，不应出现在载荷里", "source", "inputAttemptId", "connectorId")
+	assertAbsent(t, got, "5.9.3 已废弃字段仍在载荷里",
+		"maxToken", "maxSteps", "temperature", "maxRetries", "skillCount", "totalCount")
+}
+
+// assertAbsent 断言这些键都不在载荷里。
+func assertAbsent(t *testing.T, got map[string]any, msg string, keys ...string) {
+	t.Helper()
+
+	for _, key := range keys {
+		if _, ok := got[key]; ok {
+			t.Errorf("%s: %s", msg, key)
+		}
 	}
 }

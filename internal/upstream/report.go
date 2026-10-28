@@ -22,24 +22,16 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
-// reportPath 活跃上报通道（实测）。默认走 CN billing 域（codebuddy.cn，可用
-// cn.billing_base 覆盖）；桌面 /v2/report 是另一条 surface，走 webBase。
+// reportPath 活跃上报通道（实测）。默认走 CN billing 域（workbuddy.cn，可用
+// cn.billing_base 退回 codebuddy.cn）；桌面 /v2/report 是另一条 surface，走 webBase。
 const reportPath = "/v2/report"
 
-// billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
-// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
-// report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+// billingJSON 发 billing 域（billingBase，workbuddy.cn）请求并解信封；body 为 nil 时不带请求体。
+// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + growth 头族；billing 域走 billingBase）。
+// checkin / balance 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+// 活跃上报走 reportJSON（surfaceReport 头族），不在此列。
 func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessage, error) {
 	return c.billingJSONLimit(a, path, body, defaultJSONBodyLimit)
-}
-
-// billingJSONHeaders 同 billingJSON，额外注入调用方指定的请求头
-// （summary / packages 的 Accept-Language、report 的显式 UA、签到的 device token）。
-// headers 为空时不额外注入。
-func (c *Client) billingJSONHeaders(
-	a *auth.Auth, path string, body any, headers map[string]string,
-) (json.RawMessage, error) {
-	return c.billingJSONLimitHeaders(a, path, body, defaultJSONBodyLimit, headers)
 }
 
 // billingJSONLimit 同 billingJSON，允许调用方指定响应体上限（逐笔用量页含 prompt，
@@ -54,13 +46,24 @@ func (c *Client) billingJSONLimit(
 func (c *Client) billingJSONLimitHeaders(
 	a *auth.Auth, path string, body any, maxBytes int64, headers map[string]string,
 ) (json.RawMessage, error) {
-	return c.domainJSONLimitHeaders(a, c.billingBase(a), http.MethodPost, path, body, maxBytes, headers)
+	return c.domainJSONLimitHeaders(
+		a, surfaceBilling, c.billingBase(a), http.MethodPost, path, body, maxBytes, headers,
+	)
+}
+
+// reportJSON 活跃上报面（POST {billingBase}/v2/report）请求：surfaceReport 头族 +
+// billing 域 base，body 为事件数组。
+func (c *Client) reportJSON(a *auth.Auth, body any) (json.RawMessage, error) {
+	return c.domainJSONLimitHeaders(
+		a, surfaceReport, c.billingBase(a), http.MethodPost, reportPath, body, defaultJSONBodyLimit, nil,
+	)
 }
 
 // domainJSONLimitHeaders 对指定 base 域发请求并解信封，额外指定响应体上限与
-// 调用方指定的请求头。
+// 调用方指定的请求头。头族按 surface 由 applyHeaders 构造。
 func (c *Client) domainJSONLimitHeaders(
-	account *auth.Auth, base, method, path string, body any, maxBytes int64, headers map[string]string,
+	account *auth.Auth, srf surface, base, method, path string, body any, maxBytes int64,
+	headers map[string]string,
 ) (json.RawMessage, error) {
 	var rdr io.Reader
 
@@ -78,7 +81,7 @@ func (c *Client) domainJSONLimitHeaders(
 		return nil, fmt.Errorf("domainJSONLimit: %w", err)
 	}
 
-	c.BillingHeaders(req, account)
+	c.applyHeaders(srf, req, account, "", ChatMeta{})
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -193,7 +196,22 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 	return err
 }
 
-// chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。
+// chatRequestEvent 客户端 chat_request_send 事件形状（对齐 CN 5.9.3 的
+// `reportChatRequestSendTelemetry()`，issue #366）。
+//
+// 与 5.8.x 的差异：删掉 maxToken / maxSteps / temperature / maxRetries / skillCount /
+// totalCount（5.9.3 不再发）；新增 isMaxMode（网关无 thinking 覆盖状态，按官方默认
+// false）以及 source / inputAttemptId / connectorId（官方是条件发，网关取不到就整键
+// 不发，不伪造）。
+//
+// fileUri / vcs* 的具体形态由 VcsInfoProcessor 决定：它拿事件里的 fileUri 当工作区
+// 路径，**只有 fileUri 是非空字符串时**才写 vcsType / vcsRepo / vcsBranchName /
+// vcsRevId 并删掉 fileUri（`if(e&&"string"==typeof e)try{…}finally{delete e.fileUri}`）。
+// 网关没有工作区，fileUri 为空串，处理器不会改写——所以官方在这一形态下发的是
+// `fileUri: ""` 且**没有** vcs* 四键；发四个空串 vcs 键反而是官方从不出现的组合。
+//
+// agentType 只可能是 main / subagent / team，网关模拟本地主会话故发 main；
+// agentName 取官方 `agentName || meta.agentName` 的空值形态（不写死 "default"）。
 // userId 为必填字段（= a.UID）；conversationId 由调用方生成，无需真实会话。
 type chatRequestEvent struct {
 	EventCode             string `json:"eventCode"`
@@ -209,10 +227,10 @@ type chatRequestEvent struct {
 	IsAutoExecuteTerminal bool   `json:"isAutoExecuteTerminal"`
 	IsAutoModify          bool   `json:"isAutoModify"`
 	CodebaseEnable        bool   `json:"codebaseEnable"`
-	MaxToken              int    `json:"maxToken"`
-	MaxSteps              int    `json:"maxSteps"`
-	Temperature           int    `json:"temperature"`
-	MaxRetries            int    `json:"maxRetries"`
+	IsMaxMode             bool   `json:"isMaxMode"`
+	Source                string `json:"source,omitempty"`
+	InputAttemptID        string `json:"inputAttemptId,omitempty"`
+	ConnectorID           string `json:"connectorId,omitempty"`
 	MentionContexts       []any  `json:"mentionContexts"`
 	KnowledgeID           []any  `json:"knowledgeId"`
 	KnowledgeName         []any  `json:"knowledgeName"`
@@ -222,8 +240,6 @@ type chatRequestEvent struct {
 	ExpertID              string `json:"expertId"`
 	RecommendID           string `json:"recommendId"`
 	SkillID               string `json:"skillId"`
-	SkillCount            int    `json:"skillCount"`
-	TotalCount            int    `json:"totalCount"`
 	FileURI               string `json:"fileUri"`
 	PresentAt             int64  `json:"presentAt"`
 	TraceID               string `json:"traceId"`
@@ -266,20 +282,13 @@ func (c *Client) ReportChatActivityModel(
 		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
 
-	// billing 域 /v2/report 是单段 UA 例外：官方桌面端在该面显式发 `WorkBuddy/<ver>`
-	// （banner / 白名单类同形），其余 billing 端点走 RestOperations 全局拦截器的
-	// desktopUAFor 三段式（见 BillingHeaders）。
-	headers := map[string]string{}
-	if ua := c.billingReportUA(account2); ua != "" {
-		headers["User-Agent"] = ua
-	}
-
-	_, err = c.billingJSONHeaders(account2, reportPath, json.RawMessage(raw), headers)
+	_, err = c.reportJSON(account2, json.RawMessage(raw))
 
 	return err
 }
 
 // newChatRequestEvent 构造 chat_request_send 事件；字段为零值即为官方默认。
+// fileUri 恒发空串：网关没有工作区，官方在该形态下也不会产生 vcs* 四键。
 func newChatRequestEvent(
 	account *auth.Auth, conversationID, requestID, modelID, modelName string,
 ) chatRequestEvent {
@@ -299,28 +308,26 @@ func newChatRequestEvent(
 		IsAutoExecuteTerminal: false,
 		IsAutoModify:          false,
 		CodebaseEnable:        false,
-		MaxToken:              0,
-		MaxSteps:              0,
-		Temperature:           0,
-		MaxRetries:            0,
-		MentionContexts:       []any{},
-		KnowledgeID:           []any{},
-		KnowledgeName:         []any{},
-		CodebaseID:            "",
-		MentionContextCount:   0,
-		Command:               "",
-		ExpertID:              "",
-		RecommendID:           "",
-		SkillID:               "",
-		SkillCount:            0,
-		TotalCount:            0,
-		FileURI:               "",
-		PresentAt:             now,
-		TraceID:               requestID,
-		RootRequestID:         requestID,
-		ParentConversationID:  conversationID,
-		AgentName:             "default",
-		AgentType:             "conversation",
-		UserID:                account.UID,
+		// 网关没有 thinking 覆盖状态，取官方默认 false。
+		IsMaxMode: false,
+		// source / inputAttemptId / connectorId：官方条件发，网关无对应状态 → 不发。
+		MentionContexts:      []any{},
+		KnowledgeID:          []any{},
+		KnowledgeName:        []any{},
+		CodebaseID:           "",
+		MentionContextCount:  0,
+		Command:              "",
+		ExpertID:             "",
+		RecommendID:          "",
+		SkillID:              "",
+		FileURI:              "",
+		PresentAt:            now,
+		TraceID:              requestID,
+		RootRequestID:        requestID,
+		ParentConversationID: conversationID,
+		// 网关没有 agent 上下文：与官方空值形态一致，不写死默认名。
+		AgentName: "",
+		AgentType: "main",
+		UserID:    account.UID,
 	}
 }

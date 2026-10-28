@@ -13,6 +13,10 @@ import (
 var (
 	uuidV4HeaderPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	uuidV7HeaderPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
+	// uuidV7HyphenPattern 带连字符 UUIDv7（官方 acp-connection-id 形态）。
+	uuidV7HyphenPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// uuidV432HeaderPattern UUIDv4 形态的 32 hex（trace 族：第 13 位为 4、变体位 10xx）。
+	uuidV432HeaderPattern = regexp.MustCompile(`^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 )
 
 // TestConversationHeaderFallback 无客户端 conversationId 时，出站头使用
@@ -43,7 +47,8 @@ func TestConversationHeaderFallback(t *testing.T) {
 
 // TestConversationHeaderAlwaysEmitted 零值 meta（搜索/夜猫子/模型探测等直接
 // ChatHeaders 的路径）也必须带 X-Conversation-Id：上游渠道校验要求该头恒在。
-// 会话 ID 兜底为 UUIDv4，请求/消息 ID 为 UUIDv7 32 hex。
+// 会话 ID 兜底为 UUIDv4（真机主请求也是 v4），请求/消息 ID 为 UUIDv7 32 hex，
+// acp-connection-id 为带连字符 UUIDv7（真机形态）。
 func TestConversationHeaderAlwaysEmitted(t *testing.T) {
 	t.Parallel()
 
@@ -66,8 +71,8 @@ func TestConversationHeaderAlwaysEmitted(t *testing.T) {
 		}
 	}
 
-	if got := req.Header.Get("Acp-Connection-Id"); !uuidV4HeaderPattern.MatchString(got) {
-		t.Fatalf("Acp-Connection-Id=%q want UUIDv4", got)
+	if got := req.Header.Get("Acp-Connection-Id"); !uuidV7HyphenPattern.MatchString(got) {
+		t.Fatalf("Acp-Connection-Id=%q want UUIDv7（带连字符）", got)
 	}
 }
 
@@ -336,14 +341,15 @@ func TestRefreshHeadersTrace(t *testing.T) {
 
 	hex16 := regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+	// trace 族是独立随机值（UUIDv4 形态，无 v7 时间戳前缀），与业务请求 ID 解耦。
 	traceID := req.Header.Get("X-Trace-Id")
-	if !uuidV7HeaderPattern.MatchString(traceID) {
-		t.Errorf("X-Trace-Id=%q want UUIDv7 32 hex", traceID)
+	if !uuidV432HeaderPattern.MatchString(traceID) {
+		t.Errorf("X-Trace-Id=%q want 随机 UUIDv4 形态 32 hex", traceID)
 	}
 
 	b3Trace := req.Header.Get("X-B3-Traceid")
-	if !uuidV7HeaderPattern.MatchString(b3Trace) {
-		t.Errorf("X-B3-Traceid=%q want UUIDv7 32 hex", b3Trace)
+	if !uuidV432HeaderPattern.MatchString(b3Trace) {
+		t.Errorf("X-B3-Traceid=%q want 随机 UUIDv4 形态 32 hex", b3Trace)
 	}
 
 	spanID := req.Header.Get("X-B3-Spanid")
@@ -365,7 +371,9 @@ func TestRefreshHeadersTrace(t *testing.T) {
 		t.Errorf("X-B3-Sampled=%q want 1", got)
 	}
 
-	for _, name := range []string{"X-Conversation-Id", "X-Conversation-Request-Id", "X-Conversation-Message-Id", "X-Request-ID"} {
+	// 会话四件套不出现（refresh 不是对话轮）；X-Request-ID 是另一语义的
+	// 业务请求 ID，见 TestLightSurfaceGoldenHeaderSets。
+	for _, name := range []string{"X-Conversation-Id", "X-Conversation-Request-Id", "X-Conversation-Message-Id"} {
 		if got := req.Header.Get(name); got != "" {
 			t.Errorf("refresh 不应发 %s=%q", name, got)
 		}
@@ -476,9 +484,10 @@ func TestPrivateDataHeaderPerRealm(t *testing.T) {
 	}
 }
 
-// TestAgentRuntimeHeaderAllSurfaces 官方 5.9.3 在 chat / images / search / webfetch
-// 全发 X-Agent-Runtime，网关统一官方兜底值 other。ImagesHeaders / SearchHeaders
-// 复用 ChatHeaders，自动继承该头（issue #345）。
+// TestAgentRuntimeHeaderAllSurfaces X-Agent-Runtime 按 surface 钉死取值：
+// chat = local-agent（真机桌面本地会话的真实值，other 0 次）；
+// agenttool 四路（images / search / webfetch / agentic_search）无真机证据，
+// 维持官方兜底值 other，写死断言避免日后无声漂移（#345 / #373）。
 func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 	t.Parallel()
 
@@ -488,10 +497,39 @@ func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 	headerSets := []struct {
 		name string
 		call func(req *http.Request)
+		want string
 	}{
-		{"chat", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
-		{"images", func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) }},
-		{"search", func(req *http.Request) { client.SearchHeaders(req, account, "", ChatMeta{}) }},
+		{
+			name: "chat",
+			call: func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) },
+			want: "local-agent",
+		},
+		{
+			name: "images",
+			call: func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) },
+			want: "other",
+		},
+		{
+			name: "search",
+			call: func(req *http.Request) {
+				client.applyHeaders(surfaceSearch, req, account, "", ChatMeta{})
+			},
+			want: "other",
+		},
+		{
+			name: "webfetch",
+			call: func(req *http.Request) {
+				client.applyHeaders(surfaceWebFetch, req, account, "", ChatMeta{})
+			},
+			want: "other",
+		},
+		{
+			name: "agentic_search",
+			call: func(req *http.Request) {
+				client.applyHeaders(surfaceAgenticSearch, req, account, "", ChatMeta{})
+			},
+			want: "other",
+		},
 	}
 
 	for _, headerCase := range headerSets {
@@ -505,8 +543,8 @@ func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 
 			headerCase.call(req)
 
-			if got := req.Header.Get("X-Agent-Runtime"); got != "other" {
-				t.Fatalf("X-Agent-Runtime=%q want other", got)
+			if got := req.Header.Get("X-Agent-Runtime"); got != headerCase.want {
+				t.Fatalf("X-Agent-Runtime=%q want %q", got, headerCase.want)
 			}
 		})
 	}

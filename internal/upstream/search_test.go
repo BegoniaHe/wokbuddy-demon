@@ -103,7 +103,7 @@ func TestSearchHeadersReuseChatFingerprint(t *testing.T) {
 
 	client := newProfileClient(t)
 	req := httptest.NewRequest(http.MethodPost, "https://upstream.test/agenttool/v1/search", nil)
-	client.SearchHeaders(req, &auth.Auth{AccessToken: "at", UID: "u1"}, "", ChatMeta{})
+	client.applyHeaders(surfaceSearch, req, &auth.Auth{AccessToken: "at", UID: "u1"}, "", ChatMeta{})
 
 	for _, name := range []string{"X-Agent-Intent", "X-Private-Data", "X-Agent-Runtime"} {
 		if got := req.Header.Get(name); got == "" {

@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"cmp"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1282,8 +1283,9 @@ type Client struct {
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认形态）。
 	// 空 = 按 realm 取部署 profile 的冻结字面量：chat/refresh/FetchModels 用
-	// emit.chatUA；billing meter / 签到 / growth 走 emit.desktopUA（RestOperations
-	// 全局拦截器）；emit.billingUA 只服务 /v2/report 与 banner 这类显式单段面。
+	// emit.chatUA；report / busy 走 emit.desktopUA；billing meter 走 profile 抓包的
+	// emit.billingMeterUA（缺失回落 desktopUA）；growth 固定 "node" 裸 fetch。
+	// emit.billingUA 已无消费方，仅保留字段以兼容现有 profile 文件。
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
@@ -1307,14 +1309,14 @@ type Client struct {
 	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 传入 ChatStream。
 	PassthroughIP bool
 
-	// DeviceToken 签到专用设备风控 Token（X-Device-Token 头）全局兜底来源：
-	// config upstream.device_token。官方只在该头的 auth/state 与签到消费点使用，
-	// 本仓只在签到路径注入（见 checkinHeaders）。
+	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：
+	// config upstream.device_token。消费面是 chat 与签到（真机口径，见
+	// resolveDeviceToken）；其余面不注入。
 	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
 	DeviceToken string
 
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
-	// 与 DeviceToken 同口径：只用于签到。
+	// 与 DeviceToken 同口径：只用于 chat 与签到。
 	DeviceTokenFile string
 
 	// BalanceObserver 余额观测回调（可选）：每次成功查询余额后回调 (uid, remain, total)，
@@ -1322,7 +1324,7 @@ type Client struct {
 	// 且回调失败不影响余额查询主路径（账本只是观测附属物）。
 	BalanceObserver func(uid string, remain, total int64)
 	ChatBaseCN      string
-	BillingBaseCN   string // billing 域默认 codebuddy.cn；可用 cn.billing_base 覆盖（MP 埋点不跟随）。
+	BillingBaseCN   string // billing 域默认 workbuddy.cn；可用 cn.billing_base 覆盖（MP 埋点不跟随）。
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
@@ -1355,7 +1357,7 @@ func New() *Client {
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		ChatBaseCN:    defaultCNChatBase,
-		BillingBaseCN: "https://www.codebuddy.cn",
+		BillingBaseCN: defaultCNBillingBase,
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
@@ -1415,6 +1417,11 @@ const officialGlobalBase = "https://www.codebuddy.ai"
 // CN 官方 origin 顺序：workbuddy.cn 为主，copilot.tencent.com / wb.tencentbuddy.com
 // 为兜底（仅在首 token 前可重放）。显式覆盖 chat base 时只用该值。
 const defaultCNChatBase = "https://www.workbuddy.cn"
+
+// defaultCNBillingBase CN 缺省 billing base：官方桌面 5.9.3 的 billing / 签到 /
+// 活跃上报全部打产品域 workbuddy.cn（真机 14 条业务请求 0 条打 codebuddy.cn）。
+// 需要退回旧口径时显式配置 cn.billing_base。
+const defaultCNBillingBase = "https://www.workbuddy.cn"
 
 var cnChatFallbackBases = []string{
 	"https://copilot.tencent.com",
@@ -1875,8 +1882,6 @@ func adoptNewerTokensFromDisk(account *auth.Auth) bool {
 }
 
 // refreshTokenOnce 是单次刷新本体（调用方 RefreshToken 已保证同账号串行）。
-//
-//nolint:funlen // 刷新三段式（快照/请求/回写）线性展开。
 func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, error) {
 	// 第 1 段（锁内）：读快照。
 	rtSnapshot, atBefore, err := refreshTokenSnapshot(account10)
@@ -1909,17 +1914,8 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 	var lastErr error
 
 	for i, base := range origins {
-		endpoint := base + "/v2/plugin/auth/token/refresh"
-
-		req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, http.NoBody)
-		if reqErr != nil {
-			return refreshTokenResponse{}, fmt.Errorf("RefreshToken: %w", reqErr)
-		}
-
-		c.RefreshHeaders(req, &hdrSnapshot)
-
 		// 网络 I/O（锁外，30s 上限）。
-		data, lastErr = c.doJSON(req)
+		data, lastErr = c.refreshAt(ctx, base, &hdrSnapshot)
 		if lastErr == nil {
 			break
 		}
@@ -1939,6 +1935,25 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 	commitRefreshedToken(account10, tok, atBefore, rtSnapshot)
 
 	return tok, nil
+}
+
+// refreshBody 官方 refresh 请求体：空 JSON 对象（真机 Content-Length: 2）。
+// `refreshSession()` 显式传空对象，不是无 body——空 body 会让 Content-Length 变 0，
+// 与真机形态不同（#370）。
+const refreshBody = "{}"
+
+// refreshAt 向单个 origin 发一次 refresh 请求并解信封。
+func (c *Client) refreshAt(ctx context.Context, base string, hdr *auth.Auth) (json.RawMessage, error) {
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, base+"/v2/plugin/auth/token/refresh", strings.NewReader(refreshBody),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("RefreshToken: %w", err)
+	}
+
+	c.RefreshHeaders(req, hdr)
+
+	return c.doJSON(req)
 }
 
 // commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
@@ -2092,6 +2107,52 @@ func modelFromBody(body []byte) string {
 	return peek.Model
 }
 
+// chatBodyGzip 是否对 chat 出站 body 做 gzip。
+//
+// 官方 `RequestBodyGzip`（CN 5.9.3 为 true）对模型请求**无条件**压缩：主请求 45KB
+// 压、辅助请求 1.2KB 也压，包内没有字节阈值。唯一与之相关的跳过条件是「显式自定义
+// base_url / 模型 url」——本仓把 cn/global 的 chat_base 被显式覆盖（不等于该 realm
+// 默认 base）视为同一条件：不给非官方中继发压缩体。
+func (c *Client) chatBodyGzip(a *auth.Auth) bool {
+	if c.globalOn(a) {
+		return strings.TrimSpace(c.ChatBaseGlobal) == ""
+	}
+
+	base := normalizeChatBase(c.ChatBaseCN)
+
+	return base == "" || base == defaultCNChatBase
+}
+
+// chatPayload 返回本次 chat 实际发送的 body 与 Content-Encoding。
+// 压缩在 origin 轮转循环外做一次，跨 origin 重放复用同一份字节（不重复压）。
+func (c *Client) chatPayload(a *auth.Auth, prepared []byte) ([]byte, string, error) {
+	if !c.chatBodyGzip(a) {
+		return prepared, "", nil
+	}
+
+	return gzipChatBody(prepared)
+}
+
+// gzipChatBody 压缩 chat 出站 body，返回压缩后字节与 Content-Encoding 取值。
+//
+// 不手工设 Accept-Encoding：那是**响应**侧协商，手设会关掉 Go transport 的透明解压，
+// SSE 与 JSON 响应都得自己解，反而坏掉。也不手工设 Content-Length：body 是
+// bytes.Reader 时 http.NewRequest 会算出压缩后长度（与真机一致）。
+func gzipChatBody(body []byte) ([]byte, string, error) {
+	var buf bytes.Buffer
+
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write(body); err != nil {
+		return nil, "", fmt.Errorf("gzip chat body: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, "", fmt.Errorf("gzip chat body: %w", err)
+	}
+
+	return buf.Bytes(), "gzip", nil
+}
+
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单；仅 header 构造读取一次。
 func (c *Client) ChatStreamContext(
 	ctx context.Context, account3 *auth.Auth, body []byte, clientIP string, meta ChatMeta,
@@ -2107,34 +2168,63 @@ func (c *Client) ChatStreamContext(
 		prepared = injectConversationRequestID(prepared, meta.ConversationRequestID)
 	}
 
+	payload, contentEncoding, payloadErr := c.chatPayload(account3, prepared)
+	if payloadErr != nil {
+		return nil, 0, nil, payloadErr
+	}
+
 	headerTimeout, idleTimeout := c.modelTimeout(account3.Realm(), modelFromBody(prepared))
 	chatHTTP := c.chatHTTPForAccount(account3, headerTimeout)
 	path := c.chatPaths(account3)[0]
 	origins := c.chatOrigins(account3)
 
-	var lastErr error
+	out := chatOutbound{
+		Account: account3, Payload: payload, ContentEncoding: contentEncoding,
+		Path: path, ClientIP: clientIP, Meta: meta,
+	}
 
+	attempt := c.chatStreamWithReplay(ctx, out, chatHTTP, idleTimeout, origins)
+	if attempt.err == nil && attempt.status < http.StatusBadRequest {
+		return attempt.rc, attempt.status, nil, nil
+	}
+
+	return nil, attempt.status, attempt.body, attempt.err
+}
+
+// chatOutbound 一次 chat 出站的请求装配输入（origin 轮转期间不变）。
+type chatOutbound struct {
+	Account         *auth.Auth
+	Payload         []byte
+	ContentEncoding string
+	Path            string
+	ClientIP        string
+	Meta            ChatMeta
+}
+
+// chatStreamWithReplay 按 origin 顺序尝试 chat 请求：首 token 前可重放的状态码
+// 换下一个 origin，其余（含成功）立即返回该次尝试。
+//
+// 调用方已取消（客户端断连/超时）时不再向后续 origin 重放：请求已无消费者，
+// 继续发只会放大上游请求量。
+//
+//nolint:gocritic // chatOutbound 值传递：字段在循环内只读，指针化反而让调用点更吵。
+func (c *Client) chatStreamWithReplay(
+	ctx context.Context, out chatOutbound, chatHTTP *http.Client, idleTimeout time.Duration, origins []string,
+) chatAttempt {
 	for index, base := range origins {
-		attempt := c.chatStreamAt(ctx, account3, prepared, base, path, clientIP, meta, chatHTTP, idleTimeout)
+		attempt := c.chatStreamAt(ctx, out, base, chatHTTP, idleTimeout)
 		if attempt.err == nil && attempt.status < http.StatusBadRequest {
-			return attempt.rc, attempt.status, nil, nil
+			return attempt
 		}
 
-		lastErr = attempt.err
-		if attempt.replay && index < len(origins)-1 {
-			// 调用方已取消（客户端断连/超时）时不再向后续 origin 重放：
-			// 请求已无消费者，继续发只会放大上游请求量。
-			if ctx.Err() != nil {
-				return nil, attempt.status, attempt.body, attempt.err
-			}
-
+		if attempt.replay && index < len(origins)-1 && ctx.Err() == nil {
 			continue
 		}
 
-		return nil, attempt.status, attempt.body, attempt.err
+		return attempt
 	}
 
-	return nil, 0, nil, lastErr
+	return chatAttempt{}
 }
 
 // chatAttempt 单 origin 的一次 chat 尝试结果。
@@ -2148,21 +2238,24 @@ type chatAttempt struct {
 
 // chatStreamAt 向单个 origin 发起 chat 请求。replay 表示首 token 前可换 origin 重放。
 //
-//nolint:funlen,gocritic,maintidx,revive // ChatMeta 值传递保持调用链简单；请求装配线性展开。
+//nolint:funlen,gocritic,maintidx // 请求装配与错误分类线性展开，拆开反而更难对照。
 func (c *Client) chatStreamAt(
-	ctx context.Context, account3 *auth.Auth, prepared []byte, base, path, clientIP string,
-	meta ChatMeta, chatHTTP *http.Client, idleTimeout time.Duration,
+	ctx context.Context, out chatOutbound, base string, chatHTTP *http.Client, idleTimeout time.Duration,
 ) chatAttempt {
-	endpoint := base + path
+	endpoint := base + out.Path
 
 	req, err := http.NewRequestWithContext(
-		context.Background(), http.MethodPost, endpoint, bytes.NewReader(prepared),
+		context.Background(), http.MethodPost, endpoint, bytes.NewReader(out.Payload),
 	)
 	if err != nil {
 		return chatAttempt{err: fmt.Errorf("ChatStreamContext: %w", err)}
 	}
 
-	c.ChatHeaders(req, account3, clientIP, meta)
+	c.ChatHeaders(req, out.Account, out.ClientIP, out.Meta)
+
+	if out.ContentEncoding != "" {
+		req.Header.Set("Content-Encoding", out.ContentEncoding)
+	}
 	// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 	// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -2173,7 +2266,7 @@ func (c *Client) chatStreamAt(
 		cancel()
 
 		log.Printf("ERR: [upstream] chat_stream acct=%s origin=%s: transport error: %v",
-			logfmt.Label(account3.UID, account3.NicknameValue()), base, err)
+			logfmt.Label(out.Account.UID, out.Account.NicknameValue()), base, err)
 		roundTripCloseIdle(chatHTTP.Transport)
 
 		return chatAttempt{err: fmt.Errorf("ChatStreamContext: %w", err), replay: true}
@@ -2190,14 +2283,14 @@ func (c *Client) chatStreamAt(
 
 	if readErr != nil {
 		log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v",
-			logfmt.Label(account3.UID, account3.NicknameValue()), readErr)
+			logfmt.Label(out.Account.UID, out.Account.NicknameValue()), readErr)
 
 		return chatAttempt{err: fmt.Errorf("read body: %w", readErr), replay: true}
 	}
 
 	kind := Classify(resp.StatusCode, string(raw))
 	log.Printf("WARN: [upstream] chat_stream acct=%s origin=%s: upstream %d %s body=%s",
-		logfmt.Label(account3.UID, account3.NicknameValue()), base, resp.StatusCode, kind,
+		logfmt.Label(out.Account.UID, out.Account.NicknameValue()), base, resp.StatusCode, kind,
 		RedactForLog(string(raw), 200))
 
 	if kind == ErrNone {
@@ -3330,25 +3423,6 @@ func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults m
 	return c.effortsSnapshot("global"), c.defaultEffortsSnapshot("global")
 }
 
-// v3ConfigDomain /v3/config 的 X-Domain：优先账号落盘 domain，否则 chatBase host。
-func v3ConfigDomain(a *auth.Auth, chatBase string) string {
-	if a != nil {
-		// Domain 加锁快照（见 auth.DomainValue：keepalive 刷新在 a.mu 内改写）。
-		if d := strings.TrimSpace(a.DomainValue()); d != "" {
-			d = strings.TrimPrefix(d, "https://")
-			d = strings.TrimPrefix(d, "http://")
-
-			return strings.TrimSuffix(d, "/")
-		}
-	}
-
-	if u, err := url.Parse(chatBase); err == nil && u.Host != "" {
-		return u.Host
-	}
-
-	return "copilot.tencent.com"
-}
-
 // fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
 // ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
@@ -3410,25 +3484,7 @@ func (c *Client) newV3ConfigRequest(account8 *auth.Auth, str string) (*http.Requ
 		return nil, fmt.Errorf("newV3ConfigRequest: %w", err)
 	}
 
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	// AccessToken 加锁快照（同 fetchEnterpriseModels）。
-	req.Header.Set("Authorization", "Bearer "+account8.AccessTokenValue())
-
-	if account8 != nil && account8.UID != "" {
-		req.Header.Set("X-User-Id", account8.UID)
-	}
-
-	injectEnterpriseHeaders(req, account8)
-	req.Header.Set("X-Domain", v3ConfigDomain(account8, c.chatBase(account8)))
-	req.Header.Set("X-Product", "SaaS")
-
-	if str == "" {
-		str = codeBuddyIDEUA
-	}
-
-	req.Header.Set("User-Agent", str)
-	c.injectCodeBuddyRequest(req)
+	c.V3ConfigHeaders(req, account8, str)
 
 	return req, nil
 }
@@ -4242,6 +4298,9 @@ func packageExpiryTime(pkg *billingPackageAccount) (time.Time, bool) {
 
 // 官方桌面端按包类型拆分查询，且上游要求显式下发 PackageCodes（缺失直接返回
 // 10001 PackageCodes required）。付费包与免费/赠送包分属两个端点，码表不可混用。
+//
+// 码表对齐 CN 5.9.3 `main/account.js` 的 `Fs`（paid）/ `Is`（free）两个数组；
+// `buddyOneVip`（TCACA_code_043）是 5.9.3 才加进 paid 的码，5.8.x 包内没有它。
 var (
 	paidResourcePackageCodes = []string{
 		"TCACA_code_002_AkiJS3ZHF5",
@@ -4250,6 +4309,7 @@ var (
 		"TCACA_code_023_4xbGhMrE6q",
 		"TCACA_code_026_BaESVICNoi",
 		"TCACA_code_027_0FCGVA6vSa",
+		"TCACA_code_043_6oIkxT7Z0S",
 		"TCACA_code_009_0XmEQc2xOf",
 		"TCACA_code_038_OhvqZtiPKr",
 		"TCACA_code_036_lupO5WgNdG",
@@ -4269,15 +4329,37 @@ var (
 	}
 )
 
+// resourcePackagePageSize 积分包分页大小。官方桌面 daemon 链的 `fetchAllPages`
+// （CN 5.9.3 main/account.js@378532）固定传 `pageSize:200`，并以
+// `accounts.length < 200` 作为翻页终止条件。页终止判据与请求体两处共用本常量，
+// 避免再次漂移。
+const resourcePackagePageSize = 200
+
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
+//
+// body 口径对齐**桌面 daemon 的用量链** `UsageService.getPersonalUsage`
+// （CN 5.9.3 main/authority-snapshot.js@469554）：它复用 main/account.js 的
+// `fetchUserResources` / `fetchAllPages`（@378532，`pageSize:200` 且以「不足 200 条」
+// 终止），经 `fetchResourcePackagesPage`（@468153）组体
+// `{PageNumber, PageSize, PackageCodes, Status:[0,3], ...extra}`：
+//   - paid 的 extra 是 `{NeedRenewInfo: true}`；
+//   - free 的 extra 是 `buildSlicePeriodRange()`（account.js@378135，导出名 `P`），
+//     即 `SlicePeriodStartTime` / `SlicePeriodEndTime` 的当日窗口。
+//
+// `OnlyValidPeriod` / `Status` 的另一套口径在渲染层 `CloudAccountRepo.validCreditPackages`
+// （account.js@418501，面板用量页用）：它发 `{Status:[0,3], OnlyValidPeriod:true}`
+// 且不带 slice 窗口。那是「渲染层 → 面板」的 surface，与 daemon 的余额刷新不同源，
+// 本仓按 daemon 口径走 slice 窗口，不发送 OnlyValidPeriod。
+// `IsDisplayTotalInfo` 不在 daemon 的组体里，本仓照发（既有字段，改它属另一次改动）。
 func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.Duration) (
 	expiring int64, totals *resourceTotals,
 ) {
 	totals = &resourceTotals{}
 
-	// 切片日期窗口按上游 UTC+8 墙钟计算；用部署机本地时区会在非 UTC+8 环境把
-	// 「今天」算错一天，拿到错误周期的免费包。
+	// 切片日期窗口按上游 UTC+8 墙钟计算（桌面 buildSlicePeriodRange 用本地时区
+	// 的 00:00:00 / 23:59:59）；用部署机本地时区会在非 UTC+8 环境把「今天」算错
+	// 一天，拿到错误周期的免费包。
 	nowCST := now.In(softRateResetLoc)
 	dayStart := time.Date(nowCST.Year(), nowCST.Month(), nowCST.Day(), 0, 0, 0, 0, softRateResetLoc)
 	dayEnd := dayStart.Add(24*time.Hour - time.Second)
@@ -4315,11 +4397,12 @@ func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.D
 
 // collectPackageExpiry 分页拉取单类积分包并累加到期批次。TotalCount>0 时以其为
 // 终止条件；否则以空页终止；单类最多 100 页（防御上游异常无限翻页）。
+// 页大小跟随 resourcePackagePageSize（桌面 200），「不足一页即终止」逻辑不变。
 func (c *Client) collectPackageExpiry(
 	account *auth.Auth, path string, base map[string]any,
 	now time.Time, soon time.Duration, totals *resourceTotals,
 ) error {
-	const pageSize = 100
+	const pageSize = resourcePackagePageSize
 
 	seen := 0
 
@@ -4362,7 +4445,7 @@ func (c *Client) fetchPackagePage(
 ) (packagePageResp, error) {
 	body := maps.Clone(base)
 	body["PageNumber"] = page
-	body["PageSize"] = 100
+	body["PageSize"] = resourcePackagePageSize
 
 	data, err := c.billingMeterJSONHeaders(account, []string{path, "/v2" + path}, body,
 		map[string]string{"Accept-Language": billingAcceptLanguage(account)},

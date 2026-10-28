@@ -278,13 +278,13 @@ type Config struct {
 		// 让 CN 域指向自建/自选入口时，回落到官方域会绕过该入口。
 		// 注意本 fork 的默认域已经是 workbuddy.cn 且自带回落链，常规部署无需设置。
 		ChatBase string `json:"chat_base"`
-		// BillingBase 国内版（cn realm）billing / 签到 / 活跃上报 base 覆盖；
-		// 空 = 保持内置 https://www.codebuddy.cn（默认行为不变）。
+		// BillingBase 国内版（cn realm）billing / 签到 / 活跃上报 base 覆盖。
+		// 空 = 内置默认 https://www.workbuddy.cn（与官方 5.9.3 桌面一致：billing /
+		// 签到 / 活跃上报全部打产品域，真机 14 条业务请求 0 条打 codebuddy.cn）。
 		//
-		// 官方桌面把签到 / 资源 / 增长事件发到产品 endpoint https://www.workbuddy.cn；
-		// 本仓默认仍保留 codebuddy.cn，直至用真实 CN token 实测确认后再决定是否切换。
+		// 灰度逃生门：显式填 https://www.codebuddy.cn 可退回旧口径。
 		// 影响 billing / 签到 / 活跃上报（report.go，走 billingBase）；不影响 growth 任务 /
-		// 旅行（走 chatBase）、桌面 /v2/report（走 desktopBase → chatBase）、Web 上报
+		// 旅行（走 chatBase）、桌面 /v2/report（走 chatBase）、Web 上报
 		// （走 webBase）与小程序埋点（固定 codebuddy.cn）。
 		BillingBase string `json:"billing_base"`
 	} `json:"cn"`
@@ -315,11 +315,11 @@ type Config struct {
 		// ClientName 自定义用量归属名：非空时 X-Product 与 X-IDE-Name/Type 跟随该值。
 		// 空 = 官方桌面端默认（X-Product="SaaS"、X-IDE-Name/Type="WorkBuddy"）。
 		ClientName string `json:"client_name"`
-		// DeviceToken 签到专用设备风控 Token（X-Device-Token 头）全局兜底；空 = 不注入。
-		// 每号 auth 文件的 device_token 键优先于本项。
+		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底；空 = 不注入。
+		// 消费面是 chat 与签到（真机口径）；每号 auth 文件的 device_token 键优先于本项。
 		DeviceToken string `json:"device_token"`
 		// DeviceTokenFile device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
-		// 与 DeviceToken 同口径：只用于签到（daily-checkin / checkin-activity-status）。
+		// 与 DeviceToken 同口径：只用于 chat 与签到（checkin-activity-status 等）。
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
@@ -358,7 +358,8 @@ type Config struct {
 		// WebFetchEndpoint 是否开放 POST /v1/tools/fetch（官方 /agenttool/v1/webfetch
 		// 的 DSH 形态出口，issue #276）。默认 false。
 		WebFetchEndpoint bool `json:"web_fetch_endpoint"`
-		// ImagesEndpoint 是否开放 POST /v1/images/generations（issue #253）。
+		// ImagesEndpoint 是否开放 POST /v1/images/generations 与 /v1/images/edits
+		// （issue #253 出图、issue #357 图生图，共用同一开关）。
 		// 默认 false：图像端点尚未在真实账号验证鉴权/计费，与 search_endpoint 同口径。
 		ImagesEndpoint bool `json:"images_endpoint"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给

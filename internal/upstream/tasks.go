@@ -3,7 +3,7 @@
 // 来源：上游 scripts/task_common.py 实测口径（list_tasks/accept_tasks/claim_reward），
 // 集成进主程序后不再需要外部脚本。
 //
-// 端点（chatBase，BillingHeaders）：
+// 端点（chatBase，growth 头族）：
 //   - GET  /v2/activity/growth/tasks                全量任务列表（含 progress/accept_status）
 //   - POST /v2/activity/growth/tasks/accept         {"task_codes":[...]} not_accepted → accepted
 //   - POST /v2/activity/growth/tasks/reward/claim   {"task_code":"..."} 完成态领奖
@@ -105,7 +105,7 @@ func (c *Client) growthJSONMP(account2 *auth.Auth, method, path string, body any
 		return nil, fmt.Errorf("growthJSONMP: %w", err)
 	}
 
-	c.BillingHeaders(req, account2)
+	c.applyHeaders(surfaceGrowth, req, account2, "", ChatMeta{})
 	req.Header.Set("X-Client-Platform", mpPlatform)
 
 	return c.doJSON(req)
@@ -128,7 +128,7 @@ func (c *Client) ClaimRewardMP(account *auth.Auth, taskCode string) (credit, ene
 		return 0, 0, fmt.Errorf("ClaimRewardMP: %w", err)
 	}
 
-	c.BillingHeaders(req, account)
+	c.applyHeaders(surfaceGrowth, req, account, "", ChatMeta{})
 	req.Header.Set("X-Client-Platform", mpPlatform)
 
 	data, err := c.doJSON(req)

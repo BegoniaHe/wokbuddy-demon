@@ -6,9 +6,10 @@
 //   - 专家任务：expert_actual_use。
 //   - 模型 / 灵感任务：带模型字段的对话事件与 playbook 事件组。
 //
-// 端点基址固定 www.codebuddy.cn；billing / 签到 / 活跃上报（billing 域）可被
-// cn.billing_base 覆盖，但 MP 埋点属于另一 surface，不跟随该覆盖。桌面 /v2/report
-// 走 webBase，growth 任务 / 旅行走 chatBase，同样不受该配置影响。
+// 端点基址固定 www.codebuddy.cn（官方 MP 事件只走该域）；billing / 签到 / 活跃上报
+// （billing 域）默认打 www.workbuddy.cn、可被 cn.billing_base 覆盖，而 MP 埋点属于另一
+// surface，不跟随该覆盖。桌面 /v2/report 走 chatBase，growth 任务 / 旅行走 chatBase，
+// 同样不受该配置影响。
 // 信封 {code,msg,data}，code=0 成功。
 package upstream
 
@@ -35,7 +36,8 @@ var errMpReportNoEvents = errors.New("mp report: no events")
 const mpReportPath = "/v2/report"
 
 // mpReportBaseCN 小程序埋点固定基址。官方 MP 事件只走 codebuddy.cn；
-// 桌面 / 增长事件与 Web/MP 事件是两个 base，不跟随 cn.billing_base 灰度覆盖。
+// 桌面 / 增长事件与 Web/MP 事件是两个 base，不跟随 cn.billing_base 覆盖（billing 域
+// 默认已改为 workbuddy.cn，MP 面不受影响）。
 const mpReportBaseCN = "https://www.codebuddy.cn"
 
 // schoolOpenDayActivityID 校园日活动 id（school_season 事件 activityId 字段值）。

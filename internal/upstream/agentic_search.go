@@ -85,7 +85,7 @@ func (c *Client) AgenticSearch(
 	ctx, cancel := context.WithTimeout(ctx, agenticSearchTimeout)
 	defer cancel()
 
-	req, err := c.newAgentToolRequest(ctx, account, agenticSearchPath, body, "text/event-stream", meta)
+	req, err := c.newAgentToolRequest(ctx, account, agenticSearchPath, body, surfaceAgenticSearch, meta)
 	if err != nil {
 		return nil, fmt.Errorf("agentic search request: %w", err)
 	}

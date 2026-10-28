@@ -1,13 +1,20 @@
-// images.go POST /v1/images/generations：官方出图端点透传（issue #253）。
+// images.go POST /v1/images/generations 与 POST /v1/images/edits：官方图像端点透传
+// （出图 issue #253、图生图 issue #357）。
 //
 // 默认关闭（features.images_endpoint）。开启后：
 //   - 鉴权/命名密钥限额复用 withClientAuth；
 //   - 模型按 realm 前缀直路由（无本域账号 fail-fast，不跨域回落）；
 //   - 单次尝试，不换号（保守策略，避免重复出图计费）；
 //   - 响应 {created,data,usage} 原样透出，usage 与 reqlog 照常记账。
+//
+// 入站只接受 JSON body（即上游形态：edits 的 image 是 data URL / http URL /
+// 裸 base64 字符串或数组，不是文件分片）。OpenAI 官方 multipart 形态**不在范围内**，
+// 需要 multipart 的客户端请自行把文件转成 data URL 再发——这是刻意取舍，
+// 不是漏实现；加 multipart 解析等于在网关里再写一遍文件上传与掩码逻辑。
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -25,9 +32,18 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
-// imagesGenerationsHandler 出图入口（鉴权由 withClientAuth 负责）。
-func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Request) {
-	body, realm, bareModel, prefixed, ok := h.readImagesRequest(w, r)
+// imagesEndpointHandler 图像端点入口（鉴权由 withClientAuth 负责）。
+// upstreamPath 决定打到哪个上游端点：generations 与 edits 共用同一套校验、
+// 选号、记账与错误处置，差异只有上游路径与关闭时的提示文案。
+func (h *Handler) imagesEndpointHandler(upstreamPath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h.serveImages(w, r, upstreamPath)
+	}
+}
+
+// serveImages 图像端点主体：读请求 → 选号 → 租约 → 刷新 → 打上游。
+func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPath string) {
+	body, realm, bareModel, prefixed, ok := h.readImagesRequest(w, r, upstreamPath)
 	if !ok {
 		return
 	}
@@ -55,51 +71,36 @@ func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Reques
 	}
 
 	if prefixed {
-		body = rewriteImageModel(body, bareModel)
+		// 与 chat 同一份改写逻辑（logging.go rewriteModel）：只换 model，其余字段原样。
+		body = rewriteModel(body, bareModel)
 	}
 
-	h.generateImages(w, r, acct, body, realm, bareModel)
+	h.forwardImages(w, r, acct, body, realm, bareModel, upstreamPath)
 }
 
 // readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
-//
-//nolint:funlen,maintidx // 校验顺序即语义，平铺便于核对拒绝路径。
+// 校验顺序即语义，平铺便于核对拒绝路径。
 func (h *Handler) readImagesRequest(
-	w http.ResponseWriter, r *http.Request,
+	w http.ResponseWriter, r *http.Request, upstreamPath string,
 ) ([]byte, string, string, bool, bool) {
 	if !h.loadLive().ImagesEndpoint {
+		// 文案按入站端点区分，避免只提 generations 时让人以为 edits 没做开关。
 		writeOpenAIError(w, http.StatusNotFound, "not_found",
-			"images endpoint is disabled; enable features.images_endpoint to use POST /v1/images/generations")
+			"images endpoint is disabled; enable features.images_endpoint to use POST "+r.URL.Path)
 
 		return nil, "", "", false, false
 	}
 
-	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if isBodyTooLarge(err) {
-			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "")
-
-			return nil, "", "", false, false
-		}
-
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-
+	body, ok := h.readImagesBody(w, r, upstreamPath)
+	if !ok {
 		return nil, "", "", false, false
 	}
 
-	var peek struct {
-		Model string `json:"model"`
-	}
-	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
-
+	rawModel, ok := imageRequestModel(w, body)
+	if !ok {
 		return nil, "", "", false, false
 	}
 
-	rawModel := strings.TrimSpace(peek.Model)
 	keyRealm := keyRealmFrom(r.Context())
 
 	realm, bareModel, err := resolveKeyModel(rawModel, h.requestModelAliases(rawModel, keyRealm), keyRealm)
@@ -126,6 +127,71 @@ func (h *Handler) readImagesRequest(
 	return body, realm, bareModel, rawModel != bareModel, true
 }
 
+// readImagesBody 读取并校验入站 body 形态与大小。
+//
+// multipart 判定必须在读 body 之前：OpenAI 官方 edits 形态就是 multipart，先
+// ReadAll 会让大文件上传先吃满 server.max_body_bytes 再回 413，把「形态不支持」
+// 误报成「请求体过大」，客户端会去调大上限而不是换形态。
+func (h *Handler) readImagesBody(
+	w http.ResponseWriter, r *http.Request, upstreamPath string,
+) ([]byte, bool) {
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		writeMultipartUnsupported(w, upstreamPath)
+
+		return nil, false
+	}
+
+	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "")
+
+			return nil, false
+		}
+
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+
+		return nil, false
+	}
+
+	return body, true
+}
+
+// writeMultipartUnsupported 对 OpenAI 官方 multipart 形态给出明确 400。
+// 不这么写时，multipart body 解析失败会落成 "model is required"，把「形态不支持」
+// 误报成「缺字段」，客户端会反复补 model 而不是换形态。
+//
+// 补充说明按端点分化：只有 edits 有 `image` 字段可承载文件内容，generations 没有，
+// 对它说「把图放进 image 字段」是错的引导。
+func writeMultipartUnsupported(w http.ResponseWriter, upstreamPath string) {
+	hint := "send a JSON body (`model` + `prompt`) instead of multipart form data"
+	if upstreamPath == upstream.ImageEditsPath {
+		hint = "put the image in the JSON `image` field as a data URL, http(s) URL or raw base64 " +
+			"string (array also allowed) instead of uploading a file part"
+	}
+
+	writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request",
+		"multipart/form-data is not supported; send a JSON body instead", hint)
+}
+
+// imageRequestModel 从入站 JSON body 取 model；字段缺失或不是 JSON 时写出 400。
+// multipart 已由调用方在读 body 前拒绝（见 readImagesRequest）。
+func imageRequestModel(w http.ResponseWriter, body []byte) (string, bool) {
+	var peek struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
+
+		return "", false
+	}
+
+	return strings.TrimSpace(peek.Model), true
+}
+
 // imageModelVisible 出图前的模型可见性：models.hidden 与 models.allowed 同口径，
 // 任一拒绝即 400 model_unavailable（不打上游、不占号），且先于命名密钥白名单。
 func (h *Handler) imageModelVisible(w http.ResponseWriter, realm, bareModel string) bool {
@@ -144,23 +210,6 @@ func (h *Handler) imageModelVisible(w http.ResponseWriter, realm, bareModel stri
 	}
 
 	return true
-}
-
-// rewriteImageModel 去掉 body.model 的 realm 前缀（上游只认裸名）。
-func rewriteImageModel(body []byte, bareModel string) []byte {
-	var obj map[string]any
-	if json.Unmarshal(body, &obj) != nil || obj == nil {
-		return body
-	}
-
-	obj["model"] = bareModel
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-
-	return out
 }
 
 // ensureImagesToken 临近过期先刷新；失败写出 502。
@@ -183,9 +232,10 @@ func (h *Handler) ensureImagesToken(w http.ResponseWriter, acct *auth.Auth) bool
 	return true
 }
 
-// generateImages 发起上游请求，401 同号 refresh 重放一次后记账/收尾。
-func (h *Handler) generateImages(
-	w http.ResponseWriter, r *http.Request, acct *auth.Auth, body []byte, realm, bareModel string,
+// forwardImages 发起上游请求，401 同号 refresh 重放一次后记账/收尾。
+// upstreamPath 为 /v2/images/generations 或 /v2/images/edits，两者策略完全一致。
+func (h *Handler) forwardImages(
+	w http.ResponseWriter, r *http.Request, acct *auth.Auth, body []byte, realm, bareModel, upstreamPath string,
 ) {
 	meta := upstream.ChatMeta{
 		// X-Conversation-Request-ID 是轮级聚合主键，与 chat/search 同口径用 UUIDv7
@@ -195,7 +245,9 @@ func (h *Handler) generateImages(
 	}
 	started := time.Now()
 
-	status, raw, err := h.cfg.Upstream.GenerateImage(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+	call := h.imageCaller(upstreamPath)
+
+	status, raw, err := call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 
 	var (
 		uerr        *upstream.Error
@@ -207,7 +259,7 @@ func (h *Handler) generateImages(
 		refreshFail = h.cfg.Upstream.RefreshToken(acct)
 		if refreshFail == nil {
 			_ = acct.SaveAtomicRetry()
-			status, raw, err = h.cfg.Upstream.GenerateImage(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+			status, raw, err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 		}
 	}
 
@@ -237,6 +289,17 @@ func (h *Handler) generateImages(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
+}
+
+// imageCaller 按上游路径选出图 / 图生图入口：两者签名相同，只有上游路径不同。
+func (h *Handler) imageCaller(upstreamPath string) func(
+	context.Context, *auth.Auth, []byte, string, upstream.ChatMeta,
+) (int, []byte, error) {
+	if upstreamPath == upstream.ImageEditsPath {
+		return h.cfg.Upstream.EditImage
+	}
+
+	return h.cfg.Upstream.GenerateImage
 }
 
 // handleImagesError 出图错误处置：请求级错误直接透传；账号级错误按统一策略冷却，

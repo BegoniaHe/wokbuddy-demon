@@ -21,8 +21,8 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 与 billing meter 都走桌面全局 UA 拦截器的三段式；billing 只有
-// /v2/report 显式发单段 WorkBuddy/<ver>（官方 banner 白名单头组）。
+// chat 与 /v2/report 都发三段式桌面 UA（真机同形）；billing meter 面另有
+// profile 抓包串，由 TestBillingMeterUA 覆盖。
 // 显式 client_name="SaaS" 才还原旧行为：不写 UA 键，回落 Go 默认 UA。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	t.Parallel()
@@ -53,7 +53,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: billingUAWorkBuddy,
+			wantUA: defaultUAString,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -187,8 +187,6 @@ const (
 	defaultUAString      = "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"
 	explicitString       = "MyCustomAgent/3.1"
 	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/8.8.8"
-	billingUAWorkBuddy   = "WorkBuddy/9.9.9"
-	billingUACustomVer   = "WorkBuddy/6.0.0"
 	billingUAAgentString = "BillingAgent/1"
 )
 
@@ -335,8 +333,9 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 	}
 }
 
-// TestBillingReportUA report 是 billing 域唯一的显式 UA 面：单段
-// `WorkBuddy/<clientVersion>`（不带 CLI 段），显式 user_agent 优先。
+// TestBillingReportUA /v2/report 面 UA 是 desktop surface 的三段式（真机同形），
+// 单段 `WorkBuddy/<ver>` 的旧口径不成立（#367）。显式 user_agent 优先；
+// `client_name="SaaS"` 的免 UA 逃生门只作用于 billing meter 面，不影响 report。
 func TestBillingReportUA(t *testing.T) {
 	t.Parallel()
 
@@ -347,10 +346,9 @@ func TestBillingReportUA(t *testing.T) {
 		client *Client
 		want   string
 	}{
-		{"profile_default", &Client{ClientName: "WorkBuddy", Profile: testProfileSet(t)}, billingUAWorkBuddy},
-		{"client_version_override", &Client{ClientName: "WorkBuddy", ClientVersion: "6.0.0"}, billingUACustomVer},
+		{"profile_default", &Client{ClientName: "WorkBuddy", Profile: testProfileSet(t)}, defaultUAString},
 		{"explicit_user_agent", &Client{ClientName: "WorkBuddy", UserAgent: billingUAAgentString}, billingUAAgentString},
-		{"saas_no_ua", &Client{ClientName: "SaaS", Profile: testProfileSet(t)}, ""},
+		{"saas_keeps_desktop_ua", &Client{ClientName: "SaaS", Profile: testProfileSet(t)}, defaultUAString},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -383,10 +381,12 @@ func TestBillingReportUA(t *testing.T) {
 	}
 }
 
-// TestBillingHeadersDefaultDesktopUA 官方 billing `buildHeaders` 本身不带 UA，
-// 但 `context.http` 的 RestOperations 注册了 WorkbuddyUserAgentHttpInterceptor，
-// 默认 meter 请求最终带桌面三段式 UA；billingUA() 仍保留给 report 用。
-func TestBillingHeadersDefaultDesktopUA(t *testing.T) {
+// billingMeterUAProfileFixture 测试 profile 冻结的 billing meter 抓包 UA（假值）。
+const billingMeterUAProfileFixture = "axios/9.9.9"
+
+// TestBillingMeterUAFromProfile billing meter 面 UA 取 profile 的抓包字段
+// （官方该面没有桌面 UA 拦截器，UA 是 axios 默认串，#374）。
+func TestBillingMeterUAFromProfile(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
@@ -411,26 +411,46 @@ func TestBillingHeadersDefaultDesktopUA(t *testing.T) {
 		t.Fatalf("userResource: %v", err)
 	}
 
-	if want := client.desktopUAFor(account); got != want {
-		t.Errorf("billing meter UA = %q want %q（桌面全局拦截器）", got, want)
+	if got != billingMeterUAProfileFixture {
+		t.Errorf("billing meter UA = %q want %q（profile 抓包值）", got, billingMeterUAProfileFixture)
 	}
 
-	if ua := client.billingUA(account); ua != "WorkBuddy/6.0.0" {
-		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", ua)
+	// 显式 user_agent 优先于 profile。
+	client.UserAgent = "BillingAgent/1"
+
+	if ua := client.billingMeterUA(account); ua != "BillingAgent/1" {
+		t.Errorf("billingMeterUA() = %q want BillingAgent/1", ua)
 	}
 
+	client.UserAgent = ""
 	client.ClientName = "SaaS"
-	if ua := client.billingUA(account); ua != "" {
-		t.Errorf("billingUA() SaaS = %q want empty", ua)
+
+	if ua := client.billingMeterUA(account); ua != "" {
+		t.Errorf("billingMeterUA() SaaS = %q want empty", ua)
 	}
 
-	// client_name="SaaS" 是显式逃生门：不写桌面 UA 键，回落 Go 默认 UA。
+	// client_name="SaaS" 是显式逃生门：不写 UA 键，回落 Go 默认 UA。
 	if _, _, err := client.UserResource(account); err != nil {
 		t.Fatalf("userResource SaaS: %v", err)
 	}
 
 	if got != "Go-http-client/1.1" {
 		t.Errorf("SaaS billing meter UA = %q want %q", got, "Go-http-client/1.1")
+	}
+}
+
+// TestBillingMeterUAWithoutCaptureFallsBackDesktop profile 未重抓（没有
+// emit.billingMeterUA）时回落桌面三段式，行为与灰度前一致。
+func TestBillingMeterUAWithoutCaptureFallsBackDesktop(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	client := &Client{Profile: testProfileSet(t)}
+	client.Profile.ForRealm("cn").Emit.BillingMeterUA = ""
+
+	if got, want := client.billingMeterUA(account), client.desktopUAFor(account); got != want {
+		t.Errorf("billing meter UA = %q want %q（回落 desktopUA）", got, want)
 	}
 }
 

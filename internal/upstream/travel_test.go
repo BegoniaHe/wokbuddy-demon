@@ -129,7 +129,13 @@ func TestTravelClaimReturnsReward(t *testing.T) {
 			return nil, err
 		}
 
-		got, _ = io.ReadAll(r.Body)
+		if r.Header.Get("X-Product-Code") != "workbuddy" {
+			t.Errorf("X-Product-Code=%q want workbuddy", r.Header.Get("X-Product-Code"))
+		}
+
+		if r.Body != nil {
+			got, _ = io.ReadAll(r.Body)
+		}
 
 		return jsonResp(200, `{"code":0,"msg":"ok","data":{"reward_credit":9}}`), nil
 	})
@@ -143,8 +149,13 @@ func TestTravelClaimReturnsReward(t *testing.T) {
 		t.Errorf("reward=%d want 9", reward)
 	}
 
-	if !bytes.Contains(got, []byte(`"record_id":42`)) {
-		t.Errorf("claim body missing record_id: %s", got)
+	// 首发即官方桌面形态：空对象 body `{}`（不是零字节），成功路径不带 record_id。
+	if string(bytes.TrimSpace(got)) != "{}" {
+		t.Errorf("claim body=%q want {} (官方桌面固定发空对象)", got)
+	}
+
+	if bytes.Contains(got, []byte("record_id")) {
+		t.Errorf("claim body=%q 不应含 record_id", got)
 	}
 }
 
@@ -318,9 +329,9 @@ func TestTravel401ClassifiedSessionDead(t *testing.T) {
 	}
 }
 
-// TestTravelClaimEmptyBodyFallback 带 record_id 收到参数错误后，空 body 重试一次；
-// 两种请求都携带 X-Product-Code。
-func TestTravelClaimEmptyBodyFallback(t *testing.T) {
+// TestTravelClaimRecordIDFallback 空对象 body 首选；上游坚持要 record_id（400）时，
+// 在最后一次用的路径上带 record_id 兜底一次；两次请求都携带 X-Product-Code。
+func TestTravelClaimRecordIDFallback(t *testing.T) {
 	t.Parallel()
 
 	var calls int
@@ -338,15 +349,15 @@ func TestTravelClaimEmptyBodyFallback(t *testing.T) {
 		}
 
 		if calls == 1 {
-			if !bytes.Contains(body, []byte(`"record_id":42`)) {
-				t.Errorf("first body=%s want record_id", body)
+			if string(bytes.TrimSpace(body)) != "{}" {
+				t.Errorf("first body=%q want {}", body)
 			}
 
 			return jsonResp(400, `{"code":400,"msg":"parameter error"}`), nil
 		}
 
-		if len(body) != 0 {
-			t.Errorf("fallback body=%s want empty", body)
+		if !bytes.Contains(body, []byte(`"record_id":42`)) {
+			t.Errorf("fallback body=%s want record_id", body)
 		}
 
 		return jsonResp(200, `{"code":0,"data":{"reward_credit":5}}`), nil
@@ -359,6 +370,76 @@ func TestTravelClaimEmptyBodyFallback(t *testing.T) {
 
 	if calls != 2 {
 		t.Errorf("calls=%d want 2", calls)
+	}
+}
+
+// TestTravelClaimEmptyBody404FallsBackToLegacyPath 首发 /v2 空对象 body 收到 404 时，
+// 第二跳改无前缀路径、body 仍为 `{}`（非 400 不触发 record_id 兜底）。
+func TestTravelClaimEmptyBody404FallsBackToLegacyPath(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+
+	client := testClient(func(r *http.Request) (*http.Response, error) {
+		paths = append(paths, r.URL.Path)
+
+		var body []byte
+		if r.Body != nil {
+			body, _ = io.ReadAll(r.Body)
+		}
+
+		if string(bytes.TrimSpace(body)) != "{}" {
+			t.Errorf("path=%s body=%q want {}", r.URL.Path, body)
+		}
+
+		if r.URL.Path == "/v2/activity/growth/buddy/travel/claim" {
+			return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
+		}
+
+		return jsonResp(200, `{"code":0,"data":{"reward_credit":3}}`), nil
+	})
+
+	reward, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 42)
+	if err != nil || reward != 3 {
+		t.Fatalf("reward=%d err=%v", reward, err)
+	}
+
+	want := []string{"/v2/activity/growth/buddy/travel/claim", "/activity/growth/buddy/travel/claim"}
+	if len(paths) != len(want) {
+		t.Fatalf("paths=%v want %v", paths, want)
+	}
+
+	for i := range want {
+		if paths[i] != want[i] {
+			t.Errorf("paths=%v want %v", paths, want)
+
+			break
+		}
+	}
+}
+
+// TestTravelClaimDoubleNotFoundStops 两跳都是 404 时不再打 record_id 兜底：
+// 端点不存在换成带 record_id 的 body 也不可能成功，只会用第三次结果覆盖 ErrNotFound。
+func TestTravelClaimDoubleNotFoundStops(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		calls++
+
+		return jsonResp(404, `{"code":404,"msg":"not found"}`), nil
+	})
+
+	_, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 42)
+
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Kind != ErrNotFound {
+		t.Errorf("err=%v want ErrNotFound", err)
+	}
+
+	if calls != 2 {
+		t.Errorf("calls=%d want 2（404 不触发 record_id 兜底）", calls)
 	}
 }
 
@@ -408,8 +489,33 @@ func TestGrowthPathAlreadyV2NotDoubled(t *testing.T) {
 	}
 }
 
-// TestTravelClaimReturnsLastError 空 body 重试失败时返回最后一次错误分类，
-// 不被更早的参数错误覆盖。
+// TestTravelClaimNoRecordIDSkipsFallback 上游 400 但调用方没有 record_id 时不再打
+// `{"record_id":0}` 兜底：官方形态不需要它，补一次注定失败的请求只会掩盖真实错误。
+func TestTravelClaimNoRecordIDSkipsFallback(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		calls++
+
+		return jsonResp(400, `{"code":400,"msg":"parameter error"}`), nil
+	})
+
+	_, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 0)
+
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Status != 400 {
+		t.Errorf("err=%v want 400", err)
+	}
+
+	if calls != 1 {
+		t.Errorf("calls=%d want 1（record_id 为 0 不触发兜底）", calls)
+	}
+}
+
+// TestTravelClaimReturnsLastError 空 body 400 → record_id 兜底 500 时返回最后一次
+// 错误分类（ErrServer），不被更早的参数错误覆盖。
 func TestTravelClaimReturnsLastError(t *testing.T) {
 	t.Parallel()
 

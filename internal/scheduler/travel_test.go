@@ -1,9 +1,11 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -24,7 +26,8 @@ type travelStub struct {
 
 	infoCalls, statusCalls, departCalls atomic.Int32
 	claimCalls, firstCalls, agreeCalls  atomic.Int32
-	location, record                    atomic.Int64
+	location                            atomic.Int64
+	claimBody                           atomic.Value // string：最近一次 claim 的 body（已 trim）
 }
 
 func (s *travelStub) handler() http.Handler {
@@ -49,12 +52,10 @@ func (s *travelStub) handler() http.Handler {
 		case "/activity/growth/buddy/travel/claim":
 			s.claimCalls.Add(1)
 
-			var body struct {
-				RecordID int64 `json:"record_id"`
-			}
-
-			_ = json.NewDecoder(r.Body).Decode(&body)
-			s.record.Store(body.RecordID)
+			// 官方桌面 claim 固定发空对象 `{}`（record_id 只作到站判据与 400 兜底），
+			// 记录实际 body 供断言。
+			raw, _ := io.ReadAll(r.Body)
+			s.claimBody.Store(string(bytes.TrimSpace(raw)))
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{"reward_credit":9}}`))
 		case "/activity/growth/buddy/first":
 			s.firstCalls.Add(1)
@@ -227,7 +228,6 @@ func TestRunTravelStateMachine(t *testing.T) {
 		wantFirst    int32
 		wantAgree    int32
 		wantLocation int64
-		wantRecord   int64
 	}{
 		{
 			name: "无猫-领养成功", buddy: "null",
@@ -255,12 +255,13 @@ func TestRunTravelStateMachine(t *testing.T) {
 		{
 			name: "有猫-arrived-领奖", buddy: buddyPresent,
 			state:    `{"state":"arrived","record_id":42,"reward_credit":9}`,
-			wantInfo: 1, wantStatus: 1, wantClaim: 1, wantRecord: 42,
+			wantInfo: 1, wantStatus: 1, wantClaim: 1,
 		},
 		{
-			name: "有猫-arrived-缺record_id-跳过领奖", buddy: buddyPresent,
+			// 官方 claim body 是空对象，record_id 缺失不是跳过条件（旧实现漏领）。
+			name: "有猫-arrived-缺record_id-照常领奖", buddy: buddyPresent,
 			state:    `{"state":"arrived","record_id":0}`,
-			wantInfo: 1, wantStatus: 1,
+			wantInfo: 1, wantStatus: 1, wantClaim: 1,
 		},
 		{
 			name: "有猫-未知状态-跳过", buddy: buddyPresent,
@@ -303,8 +304,11 @@ func TestRunTravelStateMachine(t *testing.T) {
 				t.Errorf("location_id=%d want %d", stub.location.Load(), testCase.wantLocation)
 			}
 
-			if testCase.wantClaim > 0 && stub.record.Load() != testCase.wantRecord {
-				t.Errorf("record_id=%d want %d", stub.record.Load(), testCase.wantRecord)
+			// 领奖请求体是空对象 `{}`：record_id 只作到站判据，不进官方形态的请求体。
+			if testCase.wantClaim > 0 {
+				if got, _ := stub.claimBody.Load().(string); got != "{}" {
+					t.Errorf("claim body=%q want {}（官方桌面固定发空对象）", got)
+				}
 			}
 		})
 	}

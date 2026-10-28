@@ -217,15 +217,10 @@ func (s *Scheduler) travelDepart(account2 *auth.Auth, ts *upstream.TravelState) 
 	return true
 }
 
-// travelClaim 到站领奖（必须带 record_id）。
+// travelClaim 到站领奖。官方请求体是空对象 `{}`，record_id 只作 400 兜底，
+// 因此 record_id 缺失不构成跳过理由：status 说 arrived 就去领，否则上游不给
+// record_id 的账号每次都漏领（旧实现把 record_id 当必填前置）。
 func (s *Scheduler) travelClaim(account *auth.Auth, travelState *upstream.TravelState) bool {
-	if travelState.RecordID == 0 {
-		log.Printf("travel %s: claim skipped (arrived but no record_id)",
-			logfmt.Label(account.UID, account.NicknameValue()))
-
-		return true
-	}
-
 	reward, err := s.cfg.Upstream.TravelClaim(account, travelState.RecordID)
 	if err != nil {
 		log.Printf("travel %s: claim record=%d: %v",

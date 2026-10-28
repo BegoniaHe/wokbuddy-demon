@@ -1,5 +1,5 @@
 // travel.go growth 域「猫猫旅行」接口：状态查询 / 派出 / 领奖 / 领养 / 协议。
-// 全部走 chatBase + BillingHeaders，信封同 doJSON；路径默认 /v2 优先、404 回落旧路径。
+// 全部走 chatBase + growth 头族，信封同 doJSON；路径默认 /v2 优先、404 回落旧路径。
 package upstream
 
 import (
@@ -36,7 +36,7 @@ type Buddy struct {
 type TravelState struct {
 	State             string `json:"state"`               // idle / traveling / arrived
 	DailyLimitReached bool   `json:"daily_limit_reached"` // 今日已派出过（自然日 00:00 CST 重置）
-	RecordID          int64  `json:"record_id"`           // 在途/到站记录 id，claim 必带
+	RecordID          int64  `json:"record_id"`           // 在途/到站记录 id；到站判据，claim 只作 400 兜底
 	RewardCredit      int64  `json:"reward_credit"`       // 到站可领奖励积分
 }
 
@@ -67,7 +67,7 @@ func (c *Client) growthJSONPath(
 	account *auth.Auth, method, path string, body any, headers map[string]string,
 ) (json.RawMessage, error) {
 	return c.domainJSONLimitHeaders(
-		account, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers,
+		account, surfaceGrowth, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers,
 	)
 }
 
@@ -93,27 +93,38 @@ func (c *Client) TravelDepart(a *auth.Auth, locationID int) error {
 }
 
 // TravelClaim 领取到站奖励，返回 reward_credit。
-// 官方客户端存在两种请求形态：带 record_id 与空 body。带 record_id 收到参数错误
-// 或 404 时，用空 body 重试一次；多次尝试都失败时返回最后一次错误（避免用首个
-// 404 覆盖会话失效/服务端错误，让调用方仍能按真实分类处置账号）。
+//
+// 首选空对象 body（`{}`）：官方桌面 claimTravelReward 固定
+// `http.post('/activity/growth/buddy/travel/claim', {}, productHeaders)`（CN 5.9.3
+// main/server.js@337115 与 @422336，5.8.3 同形），是**空 JSON 对象**而不是零字节
+// body——Content-Length 与 body 都要按 `{}` 发，否则上游 JSON 解析会 400。
+// 本仓首发请求因此也不带 record_id。`{"record_id":N}` 是历史形态，静态包内不存在，
+// 仅作 400 兜底：触发条件是上游坚持要 record_id。
+//
+// 请求顺序（三跳，最多 3 次）：
+//  1. POST /v2 + travelClaimPath，body `{}`；
+//  2. 仅当上一跳是 404（路径不存在）时换成无前缀 travelClaimPath，body 仍为 `{}`；
+//  3. 仅当最后一跳是 400（参数错误）且调用方有 record_id 时，在最后一次用的路径上
+//     带 record_id 再试一次。
+//
+// 多次尝试都失败时返回最后一次错误（避免用更早的 404 / 参数错误覆盖会话失效或
+// 服务端错误，让调用方仍能按真实分类处置账号）。
 func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) {
 	headers := map[string]string{"X-Product-Code": "workbuddy"}
 	lastPath := "/v2" + travelClaimPath
 
-	data, err := c.growthJSONPath(
-		account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers,
-	)
+	data, err := c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{}, headers)
 	if err != nil && isKind(err, ErrNotFound) {
 		lastPath = travelClaimPath
+		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{}, headers)
+	}
+
+	if err != nil && claimNeedsRecordIDBody(err, recordID) {
+		// 带 record_id 兜底的成败都覆盖上一次：失败时保留最后一次错误分类
+		// （如会话失效/服务端错误），不被更早的参数错误掩盖。
 		data, err = c.growthJSONPath(
 			account, http.MethodPost, lastPath, map[string]any{"record_id": recordID}, headers,
 		)
-	}
-
-	if err != nil && claimNeedsEmptyBody(err) {
-		// 空 body 重试的成败都覆盖上一次：失败时保留最后一次错误分类
-		// （如会话失效/服务端错误），不被更早的参数错误掩盖。
-		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, nil, headers)
 	}
 
 	if err != nil {
@@ -205,14 +216,24 @@ func isKind(err error, kind ErrKind) bool {
 	return errors.As(err, &upstreamErr) && upstreamErr.Kind == kind
 }
 
-// claimNeedsEmptyBody 判定 claim 是否需要空 body 重试：404 或参数错误。
-func claimNeedsEmptyBody(err error) bool {
+// claimNeedsRecordIDBody 判定 claim 是否需要带 record_id 兜底重试：仅参数错误（400）
+// 且调用方确实拿到了 record_id。
+//
+// 不认 404：上一跳已把 404 换成无前缀路径再试，两条路径都 404 说明端点不存在，
+// 带 record_id 打第三次不可能成功，只会用这次结果覆盖真实的 ErrNotFound 分类。
+// record_id 为 0 时同样不兜底：官方形态不需要它，带上 `{"record_id":0}` 只会把
+// 「到达但状态里没有 record_id」变成一次注定失败的请求。
+func claimNeedsRecordIDBody(err error, recordID int64) bool {
+	if recordID == 0 {
+		return false
+	}
+
 	var upstreamErr *Error
 	if !errors.As(err, &upstreamErr) {
 		return false
 	}
 
-	return upstreamErr.Kind == ErrNotFound || upstreamErr.Status == http.StatusBadRequest
+	return upstreamErr.Status == http.StatusBadRequest
 }
 
 // IsBuddyTaskIncomplete 判定「领养门槛未达标」：HTTP 400 + first_buddy 关键词。

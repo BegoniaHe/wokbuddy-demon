@@ -340,8 +340,16 @@ func (*Handler) notFound(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
 	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
-	// 图像生成（issue #253）：默认关闭，开启后独立透传 /v2/images/generations。
-	h.mux.HandleFunc("POST /v1/images/generations", h.withRecovery(h.withClientAuth(h.imagesGenerationsHandler)))
+	// 图像端点（issue #253 出图、issue #357 图生图）：默认关闭，开启后独立透传
+	// /v2/images/generations 与 /v2/images/edits（同一套校验/选号/记账）。
+	h.mux.HandleFunc(
+		"POST /v1/images/generations",
+		h.withRecovery(h.withClientAuth(h.imagesEndpointHandler(upstream.ImageGenerationsPath))),
+	)
+	h.mux.HandleFunc(
+		"POST /v1/images/edits",
+		h.withRecovery(h.withClientAuth(h.imagesEndpointHandler(upstream.ImageEditsPath))),
+	)
 	// 官方客户端模型忙预检（issue #273）：只读本地池状态，不产生上游请求。
 	h.mux.HandleFunc("POST /v2/chat/busy", h.withRecovery(h.withClientAuth(h.busyHandler)))
 	// 官方 webfetch 的 DSH 形态出口（issue #276）：默认关闭，/v1/fetch 为同义别名。
@@ -2714,7 +2722,7 @@ func (f *chatFlow) retryModelNotFoundCrossRealm(
 func (*Handler) tracedPath(r *http.Request) bool {
 	switch r.URL.Path {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
-		"/v1/responses", "/v1/search/messages", "/v1/images/generations",
+		"/v1/responses", "/v1/search/messages", "/v1/images/generations", "/v1/images/edits",
 		"/v1/tools/fetch", "/v1/fetch":
 		return true
 	}

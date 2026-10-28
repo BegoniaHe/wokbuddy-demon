@@ -443,9 +443,12 @@ func TestSummaryResourceAcceptsStringCapacity(t *testing.T) {
 	}
 }
 
-// TestResourcePackageDayWindowUsesCST 免费包切片窗口按 UTC+8 取「今天」，
-// 不能使用部署机本地时区（非 UTC+8 环境会错一天）。
-func TestResourcePackageDayWindowUsesCST(t *testing.T) {
+// TestResourcePackageFreeBodyDesktopShape free 包 body 对齐桌面 daemon 用量链
+// `UsageService.getPersonalUsage` → `fetchResourcePackagesPage`（CN 5.9.3
+// main/authority-snapshot.js@469554 / @468153）：`Status:[0,3]` + `PageSize:200` +
+// 当日 slice 窗口（`buildSlicePeriodRange`，account.js@378135）。
+// 渲染层 `validCreditPackages` 的 `OnlyValidPeriod` 属另一条 surface，本仓不发。
+func TestResourcePackageFreeBodyDesktopShape(t *testing.T) {
 	t.Parallel()
 
 	var freeBody []byte
@@ -465,9 +468,20 @@ func TestResourcePackageDayWindowUsesCST(t *testing.T) {
 		t.Fatal("free package request not captured")
 	}
 
-	if !strings.Contains(string(freeBody), `"SlicePeriodStartTime":"2026-10-20 00:00:00"`) ||
-		!strings.Contains(string(freeBody), `"SlicePeriodEndTime":"2026-10-20 23:59:59"`) {
-		t.Errorf("free package window=%s want CST 2026-10-20", freeBody)
+	for _, want := range []string{
+		`"Status":[0,3]`,
+		`"PageSize":200`,
+		`"SlicePeriodStartTime":"2026-10-20 00:00:00"`,
+		`"SlicePeriodEndTime":"2026-10-20 23:59:59"`,
+	} {
+		if !strings.Contains(string(freeBody), want) {
+			t.Errorf("free body=%s missing %s", freeBody, want)
+		}
+	}
+
+	// 渲染层 validCreditPackages 的字段不在 daemon 链路上。
+	if strings.Contains(string(freeBody), "OnlyValidPeriod") {
+		t.Errorf("free body=%s 不应含 OnlyValidPeriod（那是渲染层 surface）", freeBody)
 	}
 }
 
@@ -496,6 +510,12 @@ func TestResourcePackageExpirySendsPackageCodes(t *testing.T) {
 	if !strings.Contains(bodies["paid"], paidResourcePackageCodes[0]) ||
 		strings.Contains(bodies["paid"], freeResourcePackageCodes[0]) {
 		t.Errorf("paid body=%s want paid codes only", bodies["paid"])
+	}
+
+	// buddyOneVip（TCACA_code_043）在 CN 5.9.3 的 paid 列表 `Fs` 里，5.8.x 还没有；
+	// 少了它，BuddyOne 会员包不计入付费包到期与余额。
+	if !strings.Contains(bodies["paid"], "TCACA_code_043_6oIkxT7Z0S") {
+		t.Errorf("paid body=%s 缺 buddyOneVip 码（CN 5.9.3 Fs）", bodies["paid"])
 	}
 
 	if !strings.Contains(bodies["free"], freeResourcePackageCodes[0]) ||

@@ -70,8 +70,8 @@ func TestClientProfileOverridesFingerprint(t *testing.T) {
 		t.Errorf("userAgent=%q want %q", got, want)
 	}
 
-	if got, want := client.billingUA(account), "WorkBuddy/9.9.9"; got != want {
-		t.Errorf("billingUA=%q want %q", got, want)
+	if got, want := client.billingMeterUA(account), client.desktopUAFor(account); got != want {
+		t.Errorf("billingMeterUA=%q want %q（profile 无抓包字段时回落 desktopUA）", got, want)
 	}
 
 	if got, want := client.desktopUAFor(account), "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"; got != want {
@@ -113,8 +113,10 @@ func TestClientProfileExplicitVersionWins(t *testing.T) {
 		t.Errorf("userAgent=%q want %q", got, want)
 	}
 
-	if got, want := client.billingUA(account), "WorkBuddy/6.0.0"; got != want {
-		t.Errorf("billingUA=%q want %q", got, want)
+	// desktop 面（report / meter / busy）的 UA 只用 profile 冻结字面量，显式
+	// client_version 不参与拼装（与 chat 面的 userAgent 不同面）。
+	if got, want := client.desktopUA(account), client.desktopUAFor(account); got != want {
+		t.Errorf("desktopUA=%q want %q", got, want)
 	}
 }
 
@@ -146,7 +148,7 @@ func TestClientProfileExplicitCLIWins(t *testing.T) {
 		t.Errorf("unexpected explicit user agent %q", got)
 	}
 
-	if got := client.billingUA(account); !strings.Contains(got, "9.9.9") {
-		t.Errorf("billingUA=%q 应继续使用 profile 版本", got)
+	if got := client.desktopUA(account); !strings.Contains(got, "9.9.9") {
+		t.Errorf("desktopUA=%q 应继续使用 profile 版本", got)
 	}
 }

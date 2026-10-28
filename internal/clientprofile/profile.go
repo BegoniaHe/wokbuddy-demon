@@ -57,6 +57,10 @@ type Emit struct {
 	DesktopExtVersion string  `json:"desktopExtVersion"`
 	LoginPlatform     string  `json:"loginPlatform"`
 	LoginUA           *string `json:"loginUA"`
+	// BillingMeterUA billing meter 族（/billing/meter/*）的出站 UA 抓包值：
+	// 官方该面没有桌面 UA 拦截器，UA 由 axios 自身默认值补上。**可选**字段——
+	// 旧 profile 没有它时为空，出站回落 desktopUA（不自造值、不按版本拼接）。
+	BillingMeterUA string `json:"billingMeterUA"`
 }
 
 // Evidence 单个 surface 的来源证据。
@@ -300,6 +304,7 @@ func validateEmit(emit *Emit) error {
 		"chatUA": emit.ChatUA, "desktopUA": emit.DesktopUA, "billingUA": emit.BillingUA,
 		"xIdeVersion": emit.XIdeVersion, "desktopIdeVersion": emit.DesktopIdeVersion,
 		"desktopExtVersion": emit.DesktopExtVersion, "loginPlatform": emit.LoginPlatform,
+		"billingMeterUA": emit.BillingMeterUA,
 	}
 	if emit.LoginUA != nil {
 		values["loginUA"] = *emit.LoginUA
@@ -417,6 +422,11 @@ func requiredEvidenceKeys(emit *Emit) []string {
 
 	if emit.LoginUA != nil {
 		keys = append(keys, "loginUA")
+	}
+
+	// billingMeterUA 是可选面：出现了就必须有证据（抓包 note）。
+	if emit.BillingMeterUA != "" {
+		keys = append(keys, "billingMeterUA")
 	}
 
 	return keys

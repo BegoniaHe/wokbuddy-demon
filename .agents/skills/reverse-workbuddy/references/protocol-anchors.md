@@ -50,6 +50,9 @@
   - `checkinHeaders()`：`X-Device-Token`，**只在签到**（daily-checkin /
     checkin-activity-status）注入；文件兜底见 `internal/upstream/device_token.go`。
     官方也只在这两处 + `/v2/plugin/auth/state`（面板登录面，不在本仓出站面）消费。
+    同一注入点**不发** `X-Device-Token-Error`：该头只在 Turing SDK 取不到 token 时
+    出现，取值是 SDK 原生错误串（截断到 64 字符 ASCII），本仓没有同源错误域，
+    伪造取值等于自造指纹；结论见 `internal/upstream/UPSTREAM.md` §六。
   - 会话头族 `X-Conversation-Id` / `-Request-Id` / `-Message-Id` /
     `X-Request-ID` / `X-Root-Request-Id`（`ChatMeta`）。
   - body 侧 `conversationRequestId`：官方桌面端在当前轮最后一条 user 消息的
@@ -97,7 +100,13 @@
   已覆盖 `checkin-activity-status`（`CheckinActivityStatus`）、
   `get-user-resource-summary`（`fetchResourceSummary`）、
   `get-user-resource-{paid,free}-packages`（`fetchPackagePage`）；
-  仅 `checkin-status`（无 `-activity`，官方 `BackendProvider.getCheckinStatus`）仍未覆盖（首查项）。
+  `checkin-status`（无 `-activity`）已定性为 IDE/CLI 面：它只出现在
+  `BackendProvider.getCheckinStatus`（CN 5.9.3 `main/account.js@399217` /
+  `renderer/assets/common-Cklb-JUT.js@443241`）与渲染层 IPC，桌面 daemon 自己走
+  `${endpoint}/v2/billing/meter/checkin-activity-status`
+  （`main/authority-snapshot.js@463251`，本仓 `CheckinActivityStatus` 已覆盖）。
+  本仓无调用方，**刻意不实现**，不再当首查项；理由见
+  `internal/upstream/UPSTREAM.md` §六「checkin 面有两个端点」那条。
 
 ## 已知未覆盖 / 形态存疑入口
 
@@ -112,11 +121,18 @@
   不是 CLI 排队。本仓已覆盖出站解析（`internal/upstream/modelbusy.go`）与入站只读
   预检（`internal/server/busy.go`）；不要让它参与选号。
 - `/v2/images/generations`、`/v2/images/edits`：官方 CLI 出图 / 图生图，
-  CN 5.8.3 与 global 5.8.4 同源；`generations` 已覆盖
-  （`internal/upstream/images.go`，入站 `features.images_endpoint` 门控），
-  `edits` 仍未覆盖。
+  CN 5.8.3 与 global 5.8.4 同源；**两者均已覆盖**（`internal/upstream/images.go`
+  的 `GenerateImage` / `EditImage`，入站 `features.images_endpoint` 门控）。
+  `edits` 是 JSON 形态（`Content-Type: application/json`，非 multipart），
+  body 为 `model` / `prompt` / `size` + 可选 `image`（data URL / http URL / 裸
+  base64，单个字符串或数组）+ 可选 `input_fidelity` 透传；见 UPSTREAM.md §六。
 - `/agenttool/v1/search`、`/agenttool/v1/webfetch`、`/agenttool/v1/agentic_search`：
   官方联网搜索 / 抓取 / 综述式检索；本仓库均已覆盖
   （`internal/upstream/{search,webfetch,agentic_search}.go`）。
 - `/v2/user-asset/*`：appearance/set 已覆盖，skill/assets 族未覆盖。
 - `/v2/service-proxy`、`/v3/group/*`、`/v2/spans`：客户端内部域，非网关目标。
+
+无桌面包证的端点（`get-user-request-usage`、`/billing/ide/trial`、
+`/billing/area/get-country-code` 等，契约来自第三方脚本 / 实测 / 参考实现）集中列在
+`internal/upstream/UPSTREAM.md` §六「无桌面包证端点」表，写报告时按那张表取来源口径，
+不要当成已对齐官方客户端。
