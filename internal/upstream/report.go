@@ -266,8 +266,9 @@ func (c *Client) ReportChatActivityModel(
 		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
 
-	// billing 域 /v2/report 是 UA 例外：官方桌面端在该面显式发 `WorkBuddy/<ver>`
-	// 单段 UA（banner / 白名单类同形），其余 billing 端点默认不发 UA（#344）。
+	// billing 域 /v2/report 是单段 UA 例外：官方桌面端在该面显式发 `WorkBuddy/<ver>`
+	// （banner / 白名单类同形），其余 billing 端点走 RestOperations 全局拦截器的
+	// desktopUAFor 三段式（见 BillingHeaders）。
 	headers := map[string]string{}
 	if ua := c.billingReportUA(account2); ua != "" {
 		headers["User-Agent"] = ua
