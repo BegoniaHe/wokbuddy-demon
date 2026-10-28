@@ -106,7 +106,11 @@ function scan(sel) {
     const st = (subtrees[subtree] ||= { files: 0, bytes: 0, edges: 0 });
     st.files++;
     st.bytes += text.length;
+    // 先被下游引用时这里已经建了 unread 占位；扫到本文件就要补上真实 bytes 并摘掉标记，
+    // 否则「被谁引用」决定了节点能不能进 hubs / orphans 排序（早被引用的全被漏掉）。
     const node = (nodes[rel] ||= { bytes: text.length, out: 0, in: 0, external: 0 });
+    node.bytes = text.length;
+    delete node.unread;
     // 同一文件内同一 specifier 出现 N 次只记一条边，但保留次数便于看是否被复用
     const perTarget = new Map();
     for (const { spec, kind } of scanSpecifiers(text)) {

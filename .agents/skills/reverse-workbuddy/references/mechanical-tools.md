@@ -57,14 +57,18 @@ node .agents/skills/reverse-workbuddy/scripts/split_inline_modules.mjs \
 
 | 指标 | 数值 |
 | --- | --- |
-| asar 树 | 13864 文件 / 581MB（`node_modules` 占 355MB，通常直接排除） |
-| `main/` | 176 js / 17MB，平均 3.1KB/行，`__esmMin` 包装 0 处（已是「一文件一模块」） |
-| `main/` 边 | 721 条内部 require 边 |
-| 可读导出名 | 182 模块 / 45 个 facade / 137 条可读名（`transport.js` 单模块 31 条） |
-| 字面量 | `main/` 96544 个 / 42031 唯一 |
-| 格式化 | 181 文件 17MB→21MB，5793 行→517007 行，token 回校 0 失败 |
+| asar 树 | 13864 文件 / 581MB（`node_modules` 占 315MB，通常直接排除） |
+| `main/` | 176 js / 17MB / 5584 行，平均 3.0KB/行（一文件一模块；`__esmMin` 只出现在 `rolldown-runtime.js` 的定义处） |
+| `main/` 边 | 736 条 require 边，其中 142 条指向 `rolldown-runtime.js` |
+| 可读导出名 | 182 模块 / 45 个 facade / 137 条可读名 / 32 条 dangling（`transport.js` 单模块 30 条） |
+| 字面量 | `main/` 127998 个 / 51998 唯一（`--min-len 4 --max-len 300`） |
+| 格式化 | 181 文件 17MB→21MB，5793 行→516218 行，token 回校 0 失败 |
 | 重命名 | 181 文件 / 195534 个标识符，AST 结构校验 0 失败 |
 | 拆块 | 13 个 >300KB 文件 → 2279 块，字节区间无重叠 |
+
+> 上表数字随版本与 `--min-len/--max-len/--dirs` 变化，改动脚本后要重跑并同步更新。
+> 反例本身也是证据：`main/dist.js` 只有 292KB，`--min-bytes 300000` 默认口径切不到它，
+> 要用 `--files` 点名才会拆（实测 105 处工厂 → 拆块脚本报的 140 块含嵌套工厂）。
 
 ## 事实边界（写进报告前必须区分）
 
@@ -73,7 +77,9 @@ node .agents/skills/reverse-workbuddy/scripts/split_inline_modules.mjs \
 - `rename_scope` 的 `vN` 只在单模块内稳定；新增一个变量会让其后编号整体平移。
 - `split_inline_modules` 切的是语法块不是原模块，块内仍引用外层作用域变量。
 - `format_tree --engine terser` 会规范化引号/转义/分号，此时 `--verify` 退化为「acorn 可解析」；
-  `--engine lex`（默认）才会做逐 token 比对。
+  `--engine lex`（默认）才会做逐 token 比对，并额外卡两条仅靠 token 值看不出的边界：
+  相邻标点被粘成运算符（`+ +` → `++`）与原文有换行的 ASI 边界被抹平。
+  压缩产物里 `a+ +!o`、`return null⏎const` 都真实存在，漏掉这两条会产出非法 JS。
 
 ## Verify
 
