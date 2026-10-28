@@ -1,12 +1,15 @@
 package upstream
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -482,5 +485,43 @@ func TestChatBaggage(t *testing.T) {
 
 	if got := other.Header.Get("Baggage"); got != "" {
 		t.Errorf("search baggage=%q want empty", got)
+	}
+}
+
+// TestAcpConnectionIDIsUUIDv7 acp-connection-id 是会话级带连字符 UUIDv7：
+// 第 13 位为 7、变体位 10xx、同 conversationId 恒同值、时间戳前缀落在可信时间（#372）。
+func TestAcpConnectionIDIsUUIDv7(t *testing.T) {
+	t.Parallel()
+
+	const convID = "0f0e0d0c-0b0a-4908-8706-050403020100"
+
+	first := acpConnectionID(convID)
+
+	if !uuidV7HyphenPattern.MatchString(first) {
+		t.Fatalf("acp-connection-id=%q want 带连字符 UUIDv7", first)
+	}
+
+	if got := acpConnectionID(convID); got != first {
+		t.Fatalf("同 convID 派生值不稳定: %q != %q", got, first)
+	}
+
+	if acpConnectionID("another-conversation") == first {
+		t.Fatal("不同 convID 派生出相同 acp-connection-id")
+	}
+
+	// 时间戳前缀必须落在进程启动基准前 1 小时窗口内（可信时间，不是固定哨兵值）。
+	raw, err := hex.DecodeString(strings.ReplaceAll(first, "-", ""))
+	if err != nil {
+		t.Fatalf("DecodeString(%q): %v", first, err)
+	}
+
+	var high [8]byte
+	copy(high[2:], raw[:6])
+
+	stamp := int64(binary.BigEndian.Uint64(high[:]))
+	lower := acpConnectionEpoch.Add(-time.Hour).UnixMilli()
+
+	if stamp < lower || stamp > acpConnectionEpoch.UnixMilli() {
+		t.Fatalf("acp-connection-id 时间戳=%d 不在 [%d,%d]", stamp, lower, acpConnectionEpoch.UnixMilli())
 	}
 }

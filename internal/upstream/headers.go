@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
@@ -681,8 +682,8 @@ func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 //     b3、X-B3-TraceId/ParentSpanId/SpanId/Sampled、X-Trace-ID（Zr）。B3 规范只认
 //     16/32 hex TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId
 //     回落 messageID（恒 32 hex），SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
-//   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
-//     实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v4 形态 UUID。
+//   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级带连字符 UUIDv7）。
+//     本网关按实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v7 形态 UUID。
 //
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单；头族注入线性展开。
 func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
@@ -762,10 +763,19 @@ func setHeaderIfNonEmpty(req *http.Request, name, value string) {
 	}
 }
 
-// acpConnectionID 由会话 id 稳定派生 acp-connection-id（官方桌面端为会话级 UUID）。
-// 幂等：同一 conversationId 恒同值；输出为 v4 形态 UUID（8-4-4-4-12）。
+// acpConnectionEpoch acp-connection-id 派生用的时间基准（进程启动时刻）。
+// ACP 连接本身随进程重建，重启换基准与语义一致。
+var acpConnectionEpoch = time.Now()
+
+// acpConnectionID 由会话 id 稳定派生 acp-connection-id。
+//
+// 官方 5.9.3 是会话级**带连字符 UUIDv7**（真机：主/辅助请求同值，version=7，
+// 前 48 bit 可解出毫秒时间戳）。本仓此前派生 v4 形态，版本位即可判别。
+// 这里用「时间基准回拨 [0,1h) 的确定性偏移」生成前缀：同一 conversationId 在进程内
+// 恒同值、前缀落在可信时间，且纯派生——不引入随会话数无界增长的惰性缓存
+// （见 session/ids.go 顶部说明）。
 func acpConnectionID(conversationID string) string {
-	return deriveUUIDv4("wb2a:acp:" + conversationID)
+	return session.UUIDv7At("wb2a:acp:"+conversationID, acpConnectionEpoch)
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。

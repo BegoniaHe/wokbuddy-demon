@@ -48,8 +48,41 @@ func NewMessageID() string {
 // 前 48 位为 Unix 毫秒时间戳，剩余位来自 crypto/rand；熵源失败时回落
 // math/rand/v2，版本/变体位仍在返回前强制写入。
 func NewUUIDv7Hex() string {
-	var buf [16]byte
-	if _, err := cryptorand.Read(buf[:]); err != nil {
+	return uuidV7Hex(newUUIDv7Bytes())
+}
+
+// NewUUIDv7 生成带连字符的 UUIDv7（8-4-4-4-12，version=7、variant=10xx，前 48 bit
+// 为当前毫秒时间戳）。官方桌面端的 X-Conversation-ID 兜底与 acp-connection-id 都是
+// 这个形态（`mintUuidV7Hyphen()`）。
+func NewUUIDv7() string {
+	return uuidV7Canonical(newUUIDv7Bytes())
+}
+
+// UUIDv7At 由种子与时间基准**稳定派生**带连字符 UUIDv7：前 48 bit 时间戳取
+// 「基准时刻 - [0, 1h) 的确定性偏移」（偏移来自 sha256(seed)），其余位取同一哈希。
+// 同种子 + 同基准恒同值，不同种子互异；纯派生，无缓存（内存不随键数增长）。
+// 时间戳前缀始终落在基准时刻前 1 小时内，形态与官方 UUIDv7 不可区分。
+func UUIDv7At(seed string, base time.Time) string {
+	sum := sha256.Sum256([]byte(seed))
+
+	offset := binary.BigEndian.Uint64(sum[16:24]) % uint64(time.Hour/time.Millisecond)
+
+	var timestamp [8]byte
+	binary.BigEndian.PutUint64(timestamp[:], uint64(base.UnixMilli())-offset)
+
+	b := sum[:16]
+	// Unix 毫秒只占 8 字节的后 6 字节，UUIDv7 取低 48 位时间戳。
+	copy(b[:6], timestamp[2:])
+
+	return uuidV7Canonical(b)
+}
+
+// newUUIDv7Bytes 生成 16 字节 UUIDv7 原始位：前 48 bit 为 Unix 毫秒时间戳，
+// 其余位来自 crypto/rand（熵源失败回落 math/rand/v2）。版本/变体位由
+// uuidV7Hex / uuidV7Canonical 写入。
+func newUUIDv7Bytes() []byte {
+	buf := make([]byte, 16)
+	if _, err := cryptorand.Read(buf); err != nil {
 		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())  //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 	}
@@ -59,7 +92,7 @@ func NewUUIDv7Hex() string {
 	// Unix 毫秒只占 8 字节的后 6 字节（高 2 字节恒 0），UUIDv7 取低 48 位时间戳。
 	copy(buf[:6], timestamp[2:])
 
-	return uuidV7Hex(buf[:])
+	return buf
 }
 
 // NewUUIDv4 生成标准带连字符 UUIDv4（8-4-4-4-12，version=4、variant=10xx），
@@ -82,10 +115,24 @@ func NewUUIDv4() string {
 // uuidV7Hex 将 16 字节的版本/变体位改成 UUIDv7 后编码为 32 hex。
 // 调用方保证 b 至少 16 字节（可直接传 sha256 派生结果）。
 func uuidV7Hex(b []byte) string {
-	b[6] = b[6]&uuidVersionMask | uuidVersion7Bits
-	b[8] = b[8]&uuidVariantMask | uuidVariantBits
+	setUUIDv7Bits(b)
 
 	return hex.EncodeToString(b[:16])
+}
+
+// uuidV7Canonical 同 uuidV7Hex，输出带连字符形态（8-4-4-4-12）。
+func uuidV7Canonical(b []byte) string {
+	setUUIDv7Bits(b)
+
+	h := hex.EncodeToString(b[:16])
+
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// setUUIDv7Bits 写入 UUIDv7 的版本位（0111）与变体位（10xx）。
+func setUUIDv7Bits(b []byte) {
+	b[6] = b[6]&uuidVersionMask | uuidVersion7Bits
+	b[8] = b[8]&uuidVariantMask | uuidVariantBits
 }
 
 // deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法

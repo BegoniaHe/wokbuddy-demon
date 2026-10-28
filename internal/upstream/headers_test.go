@@ -13,6 +13,8 @@ import (
 var (
 	uuidV4HeaderPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 	uuidV7HeaderPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
+	// uuidV7HyphenPattern 带连字符 UUIDv7（官方 acp-connection-id 形态）。
+	uuidV7HyphenPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 )
 
 // TestConversationHeaderFallback 无客户端 conversationId 时，出站头使用
@@ -43,7 +45,8 @@ func TestConversationHeaderFallback(t *testing.T) {
 
 // TestConversationHeaderAlwaysEmitted 零值 meta（搜索/夜猫子/模型探测等直接
 // ChatHeaders 的路径）也必须带 X-Conversation-Id：上游渠道校验要求该头恒在。
-// 会话 ID 兜底为 UUIDv4，请求/消息 ID 为 UUIDv7 32 hex。
+// 会话 ID 兜底为 UUIDv4（真机主请求也是 v4），请求/消息 ID 为 UUIDv7 32 hex，
+// acp-connection-id 为带连字符 UUIDv7（真机形态）。
 func TestConversationHeaderAlwaysEmitted(t *testing.T) {
 	t.Parallel()
 
@@ -66,8 +69,8 @@ func TestConversationHeaderAlwaysEmitted(t *testing.T) {
 		}
 	}
 
-	if got := req.Header.Get("Acp-Connection-Id"); !uuidV4HeaderPattern.MatchString(got) {
-		t.Fatalf("Acp-Connection-Id=%q want UUIDv4", got)
+	if got := req.Header.Get("Acp-Connection-Id"); !uuidV7HyphenPattern.MatchString(got) {
+		t.Fatalf("Acp-Connection-Id=%q want UUIDv7（带连字符）", got)
 	}
 }
 

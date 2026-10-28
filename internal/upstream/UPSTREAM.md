@@ -86,6 +86,9 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - chat UA 由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 构造；第二段是 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`），显式 `client_version` / `cli_version` 覆盖时同样按 realm 取品牌；`/v2/report` 的 UA 是 desktop surface，两者不可混用。
 - 401 同号 refresh + replay；refresh 401/403 映射会话失效；同账号/同 RT refresh 单飞（60s 按需复用）。
 - 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端没给会话 ID 时生成 UUIDv4（不影响 prompt cache key）。
+  `acp-connection-id` 是会话级**带连字符 UUIDv7**（真机主/辅助请求同值、version=7、时间戳前缀可解），
+  按 conversationId 稳定派生、前缀取进程启动时刻前 1 小时内的确定性偏移；主请求的 `X-Conversation-ID`
+  真机实测是 v4（辅助请求才是 v7），故该头兜底**保持 v4**（#372）。
 - 出站头族按 **surface** 集中构造（`internal/upstream/headers.go` 的 `applyHeaders`）：chat 与 agenttool 四路复用 chat 头族，billing / report / refresh / v3-config / growth 走轻头族 base（Accept / Content-Type / UA / Authorization / X-User-Id / X-Domain / X-Request-ID）再按面覆盖。surface 差异只在该文件表达，调用点不得各自 Set / Del。
 - `upstream.user_agent` 是**全部出站**的显式逃生门：各面自带默认（chat 三段式 / billing meter 抓包串 / report 单段 / growth `node`）都让位给该值；`client_name="SaaS"` 仍是 billing 面的「不写 UA 键」逃生门。
 - 首条消息非 system 时补官方 `"You are CodeBuddy Code.\n"` fallback（CN/global 都补）。
