@@ -8,12 +8,23 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
-// TestCNBillingBaseConfig cn.billing_base 默认必须为空（保持内置 codebuddy.cn）。
+// TestCNBillingBaseConfig cn.billing_base 默认必须为空：空 = 走内置默认
+// workbuddy.cn（与官方 5.9.3 桌面一致），显式填 codebuddy.cn 才退回旧口径。
 func TestCNBillingBaseConfig(t *testing.T) {
 	t.Parallel()
 
 	if base := Default().CN.BillingBase; base != "" {
-		t.Fatalf("默认 cn.billing_base 必须为空（保持 codebuddy.cn），got %q", base)
+		t.Fatalf("默认 cn.billing_base 必须为空（空 = 内置 workbuddy.cn），got %q", base)
+	}
+}
+
+// TestCNBillingBaseDefaultIsWorkbuddyCN 内置默认 billing base 指向 workbuddy.cn。
+func TestCNBillingBaseDefaultIsWorkbuddyCN(t *testing.T) {
+	t.Parallel()
+
+	client := upstream.New()
+	if base := client.BillingBaseCN; base != "https://www.workbuddy.cn" {
+		t.Fatalf("内置 BillingBaseCN=%q want https://www.workbuddy.cn", base)
 	}
 }
 

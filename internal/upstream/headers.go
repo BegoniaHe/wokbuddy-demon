@@ -148,36 +148,6 @@ func (c *Client) userAgent(a *auth.Auth) string {
 	return c.defaultWorkBuddyUAFor(a)
 }
 
-// billingUA billing 域 report / banner 类显式 UA：单段 `WorkBuddy/<clientVersion>`
-// （官方 banner/上报显式覆写形态，不带 CLI 段）。默认取 profile 字面量；显式
-// client_version 覆盖时按该版本拼装；client_name="SaaS" 返回空串（不写 UA 键，
-// 回落 Go 默认 UA）。
-func (c *Client) billingUA(account *auth.Auth) string {
-	if c == nil || c.attributionClientName() == "SaaS" {
-		return ""
-	}
-
-	if c.ClientVersion == "" {
-		if p := c.profileFor(account); p != nil {
-			return p.Emit.BillingUA
-		}
-
-		return ""
-	}
-
-	return "WorkBuddy/" + c.clientVersionFor(account)
-}
-
-// billingReportUA billing 域 /v2/report 的 UA：显式 user_agent 优先，其余回落
-// billingUA；空串表示不写 UA 键、回落 Go 默认 UA（client_name="SaaS"）。
-func (c *Client) billingReportUA(a *auth.Auth) string {
-	if c != nil && c.UserAgent != "" {
-		return c.UserAgent
-	}
-
-	return c.billingUA(a)
-}
-
 // desktopUA 桌面产品面 UA：显式 user_agent 覆盖优先，否则 profile 冻结的桌面三段式
 // （与 chat 的 chatUA 是两条 surface，不可互相顶替）。
 func (c *Client) desktopUA(account *auth.Auth) string {
@@ -224,7 +194,9 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 		// /v2/activity/growth/* 是 Node 原生 fetch 裸调用，真机 UA 直接是 "node"。
 		return "node"
 	case surfaceReport:
-		return c.billingReportUA(account)
+		// /v2/report 真机是同 desktop surface 的三段式 UA（单段 billingReportUA 的
+		// 旧口径不成立，见 #367）。
+		return c.desktopUA(account)
 	case surfaceModelBusy:
 		// 渲染层探针面：真机是与「桌面产品面」同源的三段式 UA。
 		return c.desktopUA(account)
@@ -400,13 +372,22 @@ func (*Client) chatSurfaceOverrides(srf surface, req *http.Request, account *aut
 // 真机证据逐面见 UPSTREAM.md §六。
 func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth) {
 	accept := "application/json"
-	if srf == surfaceModelBusy {
+	contentType := "application/json"
+
+	switch srf {
+	case surfaceModelBusy:
 		// 渲染层 wb.http.post 的宽松 Accept（真机 /v2/chat/busy）。
 		accept = "application/json, text/plain, */*"
+	case surfaceReport:
+		// /v2/report 真机：Accept 宽松值 + Content-Type 带 charset（与 meter 面不同）。
+		accept = "application/json, text/plain, */*"
+		contentType = "application/json;charset=UTF-8"
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages,
+		surfaceBilling, surfaceRefresh, surfaceV3Config, surfaceGrowth:
 	}
 
 	req.Header.Set("Accept", accept)
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	// AccessToken 加锁快照（同 chatFamilyHeaders：keepalive 可在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 	// X-Request-ID：官方 HTTP 层给每条非 chat 业务请求补 32 hex 随机值（UUIDv7 形态）。
@@ -749,7 +730,7 @@ func validTraceID(str string) bool {
 }
 
 // attributionClientName 生效的自定义归属名：ClientName 非空取之；空 = 默认官方桌面端
-// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。billingUA / billingMeterUA 与
+// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。billingMeterUA 与
 // chatFamilyHeaders 共用它判断是否禁用 UA。
 func (c *Client) attributionClientName() string {
 	if c != nil && c.ClientName != "" {

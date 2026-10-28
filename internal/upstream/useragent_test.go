@@ -53,7 +53,7 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: billingUAWorkBuddy,
+			wantUA: defaultUAString,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -187,8 +187,6 @@ const (
 	defaultUAString      = "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"
 	explicitString       = "MyCustomAgent/3.1"
 	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/8.8.8"
-	billingUAWorkBuddy   = "WorkBuddy/9.9.9"
-	billingUACustomVer   = "WorkBuddy/6.0.0"
 	billingUAAgentString = "BillingAgent/1"
 )
 
@@ -335,8 +333,9 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 	}
 }
 
-// TestBillingReportUA report 是 billing 域唯一的显式 UA 面：单段
-// `WorkBuddy/<clientVersion>`（不带 CLI 段），显式 user_agent 优先。
+// TestBillingReportUA /v2/report 面 UA 是 desktop surface 的三段式（真机同形），
+// 单段 `WorkBuddy/<ver>` 的旧口径不成立（#367）。显式 user_agent 优先；
+// `client_name="SaaS"` 的免 UA 逃生门只作用于 billing meter 面，不影响 report。
 func TestBillingReportUA(t *testing.T) {
 	t.Parallel()
 
@@ -347,10 +346,9 @@ func TestBillingReportUA(t *testing.T) {
 		client *Client
 		want   string
 	}{
-		{"profile_default", &Client{ClientName: "WorkBuddy", Profile: testProfileSet(t)}, billingUAWorkBuddy},
-		{"client_version_override", &Client{ClientName: "WorkBuddy", ClientVersion: "6.0.0"}, billingUACustomVer},
+		{"profile_default", &Client{ClientName: "WorkBuddy", Profile: testProfileSet(t)}, defaultUAString},
 		{"explicit_user_agent", &Client{ClientName: "WorkBuddy", UserAgent: billingUAAgentString}, billingUAAgentString},
-		{"saas_no_ua", &Client{ClientName: "SaaS", Profile: testProfileSet(t)}, ""},
+		{"saas_keeps_desktop_ua", &Client{ClientName: "SaaS", Profile: testProfileSet(t)}, defaultUAString},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {

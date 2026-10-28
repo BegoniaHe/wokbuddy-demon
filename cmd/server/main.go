@@ -666,7 +666,8 @@ func configureUpstream(cfg *Config, client *upstream.Client) error {
 	if base := strings.TrimSpace(cfg.CN.ChatBase); base != "" {
 		client.ChatBaseCN = base
 	}
-	// cn.billing_base：仅非空时覆盖 CN billing 域（空 = 保持内置 codebuddy.cn）；
+	// cn.billing_base：仅非空时覆盖 CN billing 域（空 = 内置默认 workbuddy.cn，
+	// 与官方 5.9.3 桌面一致）；显式填 https://www.codebuddy.cn 可退回旧口径。
 	// 小程序埋点使用独立常量，不跟随该覆盖。
 	if base := strings.TrimSpace(cfg.CN.BillingBase); base != "" {
 		client.BillingBaseCN = base
