@@ -157,6 +157,14 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 
 读这张表时不要反推「官方客户端里有这个端点」：前三条的形态来自第三方脚本、参考实现或实测，`claim-*` / `compensation-status` 出自 Web 契约；四行在桌面 static 包内都没有任何字面量证据。要重新论证时按上表列为起点，而不是把它们当作已对齐桌面。
 
+活跃上报 `/v2/report` 的 `chat_request_send` 事件按 CN 5.9.3 形状发（#366）：删掉
+`maxToken` / `maxSteps` / `temperature` / `maxRetries` / `skillCount` / `totalCount` 与
+`fileUri`；补 `isMaxMode`（网关无 thinking 覆盖状态 → `false`）、`source` / `inputAttemptId` /
+`connectorId`（官方条件发，网关无状态则整键不发）、`vcsType` / `vcsRepo` / `vcsBranchName` /
+`vcsRevId`（无工作区 → 空串）；`agentType` 发 `main`，`agentName` 取官方空值形态。
+该事件的键集会否被上游校验未知，改动后建议做一次账号回归（点亮 growth 连登与
+`first_buddy` 任务）。
+
 桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。
 
 ## 七、参考 fork 审计工具（sync-upstream 技能）
