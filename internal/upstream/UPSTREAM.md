@@ -140,7 +140,8 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | 非 chat 业务面的 `X-Request-ID` | 已对齐（refresh / v3-config / billing / busy / report） | 官方 HTTP 层 `applyRequestId` 对每条业务请求补 32 hex（UUIDv7 形态）；`/v2/activity/growth/*` 是 Node 裸 fetch 面，真机**不带**该头，故 growth 不在覆盖范围（#369 / #375） |
 | `X-Stainless-*` | 不补 | 由 OpenAI Node SDK 自动生成；本仓出站不是 Node SDK，补等于伪造 SDK 运行时版本 |
 | `X-Codebuddy-Request: 1` | 仅 chat 族（chat + agenttool 四路） | 2026-10-28 真机抓包：7 条 chat 全带；refresh / busy / report / v3-config / billing / growth 共 14 条业务请求 0 命中（#368）。agenttool 四路无真机证据，沿 chat 头族一起发 |
-| 个人号 `X-No-Enterprise-Id` / `X-No-Department-Info` | 刻意保留 | 非 chat 端点也声明无部门信息（#298），按 chat-only 收窄会回退该修复 |
+| 个人号 `X-No-Enterprise-Id` | 刻意保留 | chat 族（`injectCNChatHeaders`）与轻头族的 refresh / v3-config（`injectEnterpriseHeaders`）都发；billing / report / busy / growth 真机不带企业头，仅在企业 ID 非空时发 `X-Enterprise-Id` / `X-Tenant-Id`（#298） |
+| 个人号 `X-No-Department-Info` | 仅 chat 族与模型目录系 | 只由 `injectChatDomain` 注入（chat 族 + `FetchModels` / `globalModelsOnce`）；轻头族各面不发——#298 的原始修复点在这两条路径，不在 billing / report |
 | W3C `baggage`（chat） | 已对齐（4 条） | 真机逐字 `buddyId=,buddyName=,codebuddy.session_id=<会话 id>,codebuddy.conversation_request_id=<请求 id>`；两个 buddy 键是官方无 buddy 上下文时的空值形态，两个 codebuddy 键与同请求 `X-Conversation-Id` / `X-Conversation-Request-Id` 同值。包内还有 `conversation_message_id` / `root_request_id` 两个键常量，但 chat 真机**没发**，多发反而更明显；`tracestate` 仅跨进程 span 携带时下发，网关不伪造（#364） |
 | `X-Private-Data`（CLI chat） | 已对齐（按账号身份） | CN 5.9.3 的 `applyPrivateDataHeaderPolicy` 在个人号默认分支发 `false`、企业号（`isEnterpriseEditionAccount`：enterpriseId 非空或 type 为 ultimate/exclusive）发 `true`；global 基线仍是 5.8.4，走 `DisableYuanbaoChannel=true` 仍发 `true`，升到 5.9.x 后按同一逻辑复核。远端 abTest / 会话 meta `privateDataSticky` 不在网关范围 |
 | `X-Private-Data`（桌面专家路径） | 已对齐（固定 `true`） | 官方桌面主进程 chat 走 `applyGatewayHeaders`，兜底表 `VF` 里该头硬编码 `true`；`buildVlmGatewayHeaders` 同样硬编码。与 CLI chat 分属两条 surface，不能共用阈值；CN 5.9.3 / global 5.8.4 同形 |

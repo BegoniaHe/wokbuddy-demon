@@ -654,7 +654,8 @@ export function ConfigView() {
               <FieldLabel>国内版 Billing Base</FieldLabel>
               {text('cn_billing_base', { placeholder: '留空 = 内置默认 workbuddy.cn' })}
               <FieldDescription>
-                billing / 签到 / 活跃上报；填 https://www.codebuddy.cn 可退回旧口径。不影响任务 / 旅行 / 上报与小程序埋点；需重启
+                billing / 签到 / 活跃上报；填 https://www.codebuddy.cn 可退回旧口径。不影响 growth 任务 / 旅行、桌面与 Web 的
+                /v2/report 与小程序埋点；需重启
               </FieldDescription>
             </Field>
           </div>
