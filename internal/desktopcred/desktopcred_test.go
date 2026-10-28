@@ -92,6 +92,7 @@ func writeAuthFileWithExpiry(t *testing.T, secret, domain string, encrypted bool
 		"account": map[string]any{
 			"uid": "u1", "enterpriseId": "e1", "nickname": "nick",
 			"idSource": "static_key", "departmentFullName": "研发部",
+			"type": "ultimate",
 		},
 	}
 	raw, _ := json.Marshal(doc)
@@ -137,6 +138,11 @@ func assertImportedAuth(t *testing.T, account *auth.Auth) {
 
 	if account.IDSource != "static_key" || account.DepartmentFullName != "研发部" {
 		t.Fatalf("身份头字段未随桌面凭证恢复: %+v", account)
+	}
+
+	// account.type 决定出站 X-Private-Data：丢了会让 ultimate 账号退化成个人号。
+	if account.EditionType != "ultimate" {
+		t.Fatalf("账号版本未随桌面凭证恢复: %+v", account)
 	}
 
 	if !account.IsGlobal() {

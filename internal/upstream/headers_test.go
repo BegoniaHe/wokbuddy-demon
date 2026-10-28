@@ -288,8 +288,9 @@ func TestIdentityHeaders(t *testing.T) {
 	}
 }
 
-// TestChatHeadersNoAcceptLanguage chat 路径不发 Accept-Language；billing 仍按 realm 带。
-func TestChatHeadersNoAcceptLanguage(t *testing.T) {
+// TestBillingAcceptLanguageOnlyOnSummaryAndPackages chat 与 billing 默认头族都不发
+// Accept-Language；只有 summary / packages 由调用方带语言短码（zh / en）。
+func TestBillingAcceptLanguageOnlyOnSummaryAndPackages(t *testing.T) {
 	t.Parallel()
 
 	client := New()
@@ -305,8 +306,21 @@ func TestChatHeadersNoAcceptLanguage(t *testing.T) {
 	billing, _ := http.NewRequest(http.MethodPost, "https://example.invalid/billing", http.NoBody)
 	client.BillingHeaders(billing, acct)
 
-	if got := billing.Header.Get("Accept-Language"); got != "zh-CN" {
-		t.Fatalf("billing Accept-Language=%q want zh-CN", got)
+	if got := billing.Header.Get("Accept-Language"); got != "" {
+		t.Fatalf("billing Accept-Language=%q want empty", got)
+	}
+
+	if got := billingAcceptLanguage(acct); got != "zh" {
+		t.Fatalf("CN Accept-Language=%q want zh（短码）", got)
+	}
+
+	global := &auth.Auth{UID: "u2", AccessToken: "at"}
+	if _, err := auth.BackfillRealmFor(global, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor: %v", err)
+	}
+
+	if got := billingAcceptLanguage(global); got != "en" {
+		t.Fatalf("global Accept-Language=%q want en（短码）", got)
 	}
 }
 
@@ -420,6 +434,79 @@ func TestRefreshDomain(t *testing.T) {
 
 			if got := req.Header.Get("X-Domain"); got != testCase.want {
 				t.Errorf("X-Domain=%q want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestPrivateDataHeaderPerRealm X-Private-Data 按账号身份分层：CN 5.9.3 官方
+// applyPrivateDataHeaderPolicy 在个人号默认分支发 false、企业号（isEnterpriseEditionAccount：
+// enterpriseId 非空或 type=ultimate/exclusive）发 true；global 基线仍是 5.8.4，
+// 走 DisableYuanbaoChannel=true 仍发 true（issue #343）。
+func TestPrivateDataHeaderPerRealm(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		account *auth.Auth
+		want    string
+	}{
+		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at", EditionType: "personal"}, "false"},
+		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
+		{"CN ultimate 无 enterpriseId", &auth.Auth{UID: "u-cn-ult", AccessToken: "at", EditionType: "ultimate"}, "true"},
+		{"CN exclusive 无 enterpriseId", &auth.Auth{UID: "u-cn-exc", AccessToken: "at", EditionType: "Exclusive"}, "true"},
+		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			New().ChatHeaders(req, testCase.account, "", ChatMeta{})
+
+			if got := req.Header.Get("X-Private-Data"); got != testCase.want {
+				t.Fatalf("X-Private-Data=%q want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestAgentRuntimeHeaderAllSurfaces 官方 5.9.3 在 chat / images / search / webfetch
+// 全发 X-Agent-Runtime，网关统一官方兜底值 other。ImagesHeaders / SearchHeaders
+// 复用 ChatHeaders，自动继承该头（issue #345）。
+func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
+	t.Parallel()
+
+	client := New()
+	account := &auth.Auth{UID: "u1", AccessToken: "at"}
+
+	headerSets := []struct {
+		name string
+		call func(req *http.Request)
+	}{
+		{"chat", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
+		{"images", func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) }},
+		{"search", func(req *http.Request) { client.SearchHeaders(req, account, "", ChatMeta{}) }},
+	}
+
+	for _, headerCase := range headerSets {
+		t.Run(headerCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "https://example.invalid/x", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			headerCase.call(req)
+
+			if got := req.Header.Get("X-Agent-Runtime"); got != "other" {
+				t.Fatalf("X-Agent-Runtime=%q want other", got)
 			}
 		})
 	}

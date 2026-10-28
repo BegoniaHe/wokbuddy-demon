@@ -78,16 +78,10 @@ func newSecurePanel(t *testing.T) (*Panel, *pool.Pool, *httptest.Server) {
 	return &Panel{cfg: Config{Pool: p, Upstream: up, AuthDir: t.TempDir()}}, p, srv
 }
 
-func TestExportImportEncryptedEndToEnd(t *testing.T) {
-	t.Parallel()
-	panel2, p, _ := newSecurePanel(t)
-	p.Add(&auth.Auth{
-		UID: "u1", AccessToken: "at-secret", RefreshToken: "rt-secret",
-		ExpiresAt: 9999999999, Nickname: "甲",
-		IDSource: "static_key", DepartmentFullName: "研发部",
-	})
+// exportEncryptedEnvelope 走 export/encrypted 端点并返回加密信封字节。
+func exportEncryptedEnvelope(t *testing.T, panel2 *Panel) []byte {
+	t.Helper()
 
-	// 导出。
 	body, _ := json.Marshal(map[string]string{"password": "correct horse battery"})
 	rec := httptest.NewRecorder()
 	panel2.exportEncrypted(rec, httptest.NewRequest(http.MethodPost, "/panel/api/export/encrypted", bytes.NewReader(body)))
@@ -96,46 +90,69 @@ func TestExportImportEncryptedEndToEnd(t *testing.T) {
 		t.Fatalf("export code=%d body=%s", rec.Code, rec.Body)
 	}
 
-	envelope := rec.Body.Bytes()
-	if bytes.Contains(envelope, []byte("at-secret")) {
-		t.Fatal("导出文件不得含明文 token")
-	}
+	return rec.Body.Bytes()
+}
 
-	// 导入到一个新面板。
-	pn2, testCase, _ := newSecurePanel(t)
+// importEncryptedEnvelope 把加密信封导入另一个面板，返回导入/跳过计数与响应体。
+func importEncryptedEnvelope(t *testing.T, panel2 *Panel, envelope []byte) (imported, skipped int, body []byte) {
+	t.Helper()
 
 	var buf bytes.Buffer
 
 	writer := multipart.NewWriter(&buf)
 	fw, _ := writer.CreateFormFile("file", "export.wbenc.json")
-	fw.Write(envelope)
-	writer.WriteField("password", "correct horse battery")
-	writer.Close()
+	_, _ = fw.Write(envelope)
+	_ = writer.WriteField("password", "correct horse battery")
+	_ = writer.Close()
 
 	req := httptest.NewRequest(http.MethodPost, "/panel/api/import/encrypted", &buf)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	rec2 := httptest.NewRecorder()
-	pn2.importEncrypted(rec2, req)
+	rec := httptest.NewRecorder()
+	panel2.importEncrypted(rec, req)
 
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("import code=%d body=%s", rec2.Code, rec2.Body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import code=%d body=%s", rec.Code, rec.Body)
 	}
 
 	var res struct {
 		Imported int `json:"imported"`
 		Skipped  int `json:"skipped"`
 	}
-	json.Unmarshal(rec2.Body.Bytes(), &res)
 
-	if res.Imported != 1 || res.Skipped != 0 {
-		t.Fatalf("imported=%d skipped=%d want 1/0 body=%s", res.Imported, res.Skipped, rec2.Body)
+	_ = json.Unmarshal(rec.Body.Bytes(), &res)
+
+	return res.Imported, res.Skipped, rec.Body.Bytes()
+}
+
+func TestExportImportEncryptedEndToEnd(t *testing.T) {
+	t.Parallel()
+	panel2, p, _ := newSecurePanel(t)
+	p.Add(&auth.Auth{
+		UID: "u1", AccessToken: "at-secret", RefreshToken: "rt-secret",
+		ExpiresAt: 9999999999, Nickname: "甲",
+		IDSource: "static_key", DepartmentFullName: "研发部", EditionType: "ultimate",
+	})
+
+	envelope := exportEncryptedEnvelope(t, panel2)
+	if bytes.Contains(envelope, []byte("at-secret")) {
+		t.Fatal("导出文件不得含明文 token")
+	}
+
+	// 导入到一个新面板。
+	pn2, testCase, _ := newSecurePanel(t)
+	imported, skipped, body := importEncryptedEnvelope(t, pn2, envelope)
+
+	if imported != 1 || skipped != 0 {
+		t.Fatalf("imported=%d skipped=%d want 1/0 body=%s", imported, skipped, body)
 	}
 
 	if a := testCase.AuthByUID("u1"); a == nil || a.AccessTokenValue() != "at-secret" {
 		t.Fatalf("imported account missing or token mismatch: %+v", a)
 	} else if a.IDSource != "static_key" || a.DepartmentFullName != "研发部" {
 		t.Fatalf("身份头字段未随备份恢复: %+v", a)
+	} else if a.EditionType != "ultimate" {
+		t.Fatalf("账号版本未随备份恢复: %+v", a)
 	}
 }
 

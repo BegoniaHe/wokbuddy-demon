@@ -33,22 +33,32 @@ func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessa
 	return c.billingJSONLimit(a, path, body, defaultJSONBodyLimit)
 }
 
+// billingJSONHeaders 同 billingJSON，额外注入调用方指定的请求头
+// （summary / packages 的 Accept-Language、report 的显式 UA、签到的 device token）。
+// headers 为空时不额外注入。
+func (c *Client) billingJSONHeaders(
+	a *auth.Auth, path string, body any, headers map[string]string,
+) (json.RawMessage, error) {
+	return c.billingJSONLimitHeaders(a, path, body, defaultJSONBodyLimit, headers)
+}
+
 // billingJSONLimit 同 billingJSON，允许调用方指定响应体上限（逐笔用量页含 prompt，
 // 单页 1000 条可超过 1 MiB）。
 func (c *Client) billingJSONLimit(
 	a *auth.Auth, path string, body any, maxBytes int64,
 ) (json.RawMessage, error) {
-	return c.domainJSONLimit(a, c.billingBase(a), http.MethodPost, path, body, maxBytes)
+	return c.billingJSONLimitHeaders(a, path, body, maxBytes, nil)
 }
 
-// domainJSONLimit 对指定 base 域发请求并解信封，额外指定响应体上限。
-func (c *Client) domainJSONLimit(
-	account *auth.Auth, base, method, path string, body any, maxBytes int64,
+// billingJSONLimitHeaders 同 billingJSONLimit，额外注入调用方指定的请求头。
+func (c *Client) billingJSONLimitHeaders(
+	a *auth.Auth, path string, body any, maxBytes int64, headers map[string]string,
 ) (json.RawMessage, error) {
-	return c.domainJSONLimitHeaders(account, base, method, path, body, maxBytes, nil)
+	return c.domainJSONLimitHeaders(a, c.billingBase(a), http.MethodPost, path, body, maxBytes, headers)
 }
 
-// domainJSONLimitHeaders 同 domainJSONLimit，额外注入调用方指定的请求头。
+// domainJSONLimitHeaders 对指定 base 域发请求并解信封，额外指定响应体上限与
+// 调用方指定的请求头。
 func (c *Client) domainJSONLimitHeaders(
 	account *auth.Auth, base, method, path string, body any, maxBytes int64, headers map[string]string,
 ) (json.RawMessage, error) {
@@ -77,22 +87,37 @@ func (c *Client) domainJSONLimitHeaders(
 	return c.doJSONLimit(req, maxBytes)
 }
 
-// billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
-// 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时换有 /v2 前缀
-// （上游新旧路径分叉）；cn 先有 /v2，404 时回落无 /v2（官方桌面 resourcePrefix 为空）。
-// 两 realm 都可能在 404 时换路径。
+// billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / summary /
+// packages / daily-checkin）按候选序列做双路径 fallback：两 realm 都是无前缀优先
+// （官方 5.9.3 桌面端 resourcePrefix 为空串），ErrNotFound 时换 `/v2` 前缀。
+// 签到是例外：候选由 checkinMeterPaths 给出，仍是 `/v2` 优先。
 func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.RawMessage, error) {
 	return c.billingMeterJSONLimit(a, paths, body, defaultJSONBodyLimit)
+}
+
+// billingMeterJSONHeaders 同 billingMeterJSON，额外给每个候选路径注入 headers
+// （summary / packages 的 Accept-Language、签到的 X-Device-Token）。
+func (c *Client) billingMeterJSONHeaders(
+	a *auth.Auth, paths []string, body any, headers map[string]string,
+) (json.RawMessage, error) {
+	return c.billingMeterJSONLimitHeaders(a, paths, body, defaultJSONBodyLimit, headers)
 }
 
 // billingMeterJSONLimit 同 billingMeterJSON，允许调用方指定响应体上限。
 func (c *Client) billingMeterJSONLimit(
 	a *auth.Auth, paths []string, body any, maxBytes int64,
 ) (json.RawMessage, error) {
+	return c.billingMeterJSONLimitHeaders(a, paths, body, maxBytes, nil)
+}
+
+// billingMeterJSONLimitHeaders 同 billingMeterJSONLimit，额外注入调用方指定的请求头。
+func (c *Client) billingMeterJSONLimitHeaders(
+	a *auth.Auth, paths []string, body any, maxBytes int64, headers map[string]string,
+) (json.RawMessage, error) {
 	var lastErr error
 
 	for i, path := range paths {
-		data, err := c.billingJSONLimit(a, path, body, maxBytes)
+		data, err := c.billingJSONLimitHeaders(a, path, body, maxBytes, headers)
 		if err == nil {
 			return data, nil
 		}
@@ -241,7 +266,15 @@ func (c *Client) ReportChatActivityModel(
 		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
 
-	_, err = c.billingJSON(account2, reportPath, json.RawMessage(raw))
+	// billing 域 /v2/report 是单段 UA 例外：官方桌面端在该面显式发 `WorkBuddy/<ver>`
+	// （banner / 白名单类同形），其余 billing 端点走 RestOperations 全局拦截器的
+	// desktopUAFor 三段式（见 BillingHeaders）。
+	headers := map[string]string{}
+	if ua := c.billingReportUA(account2); ua != "" {
+		headers["User-Agent"] = ua
+	}
+
+	_, err = c.billingJSONHeaders(account2, reportPath, json.RawMessage(raw), headers)
 
 	return err
 }

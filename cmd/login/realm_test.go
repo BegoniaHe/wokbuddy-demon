@@ -159,11 +159,7 @@ func TestBuildLoginOutputRealmAlwaysSet(t *testing.T) {
 		ExpiresIn    int64  `json:"expiresIn"`
 		Domain       string `json:"domain"`
 	}{AccessToken: "at", RefreshToken: "rt", ExpiresIn: 3600, Domain: "www.codebuddy.cn"}
-	acct := struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-	}{UID: "u1", Nickname: "n1"}
+	acct := accountInfo{UID: "u1", Nickname: "n1", Type: "personal"}
 
 	cases := []struct {
 		name      string
@@ -191,6 +187,11 @@ func TestBuildLoginOutputRealmAlwaysSet(t *testing.T) {
 
 			if m != item.wantRealm {
 				t.Errorf("realm=%q want %q", m, item.wantRealm)
+			}
+
+			// 账号版本必须透传：官方与企业 ID 并列用它判定企业版出站头。
+			if got, _ := out["type"].(string); got != "personal" {
+				t.Errorf("type=%q want personal", got)
 			}
 		})
 	}

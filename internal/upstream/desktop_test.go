@@ -47,6 +47,15 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 		t.Errorf("UA=%q want %q", gotUA, want)
 	}
 
+	// body 的 userAgent 取 Electron 主进程 navigator.userAgent，与 HTTP 头不同源。
+	if got[0]["userAgent"] != desktopReportUA {
+		t.Errorf("userAgent=%v want %q（navigator.userAgent）", got[0]["userAgent"], desktopReportUA)
+	}
+
+	if got := got[0]["os"]; got != "Win32" {
+		t.Errorf("os=%v want Win32（navigator.platform）", got)
+	}
+
 	assertDesktopEventFingerprint(t, got)
 }
 
@@ -117,6 +126,44 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	}
 
 	assertDesktopMachineFingerprint(t, table)
+}
+
+// TestReportDesktopEventBusinessFieldsOverride 业务载荷同名键优先于公共指纹：
+// 真实设备对齐时可用 os / userAgent 覆盖默认伪装值。
+func TestReportDesktopEventBusinessFieldsOverride(t *testing.T) {
+	t.Parallel()
+
+	var got []map[string]any
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("body must be array: %v", err)
+		}
+
+		w.Write([]byte(`{"code":0,"msg":"OK"}`))
+	}))
+	defer srv.Close()
+
+	client := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, Profile: testProfileSet(t)}
+	account := &auth.Auth{AccessToken: "at", UID: "u-override"}
+
+	err := client.ReportDesktopEvent(account, DesktopEvent{
+		"eventCode": "agent_task_created",
+		"os":        "Linux",
+		"userAgent": "RealDevice/1",
+	})
+	if err != nil {
+		t.Fatalf("report desktop: %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("events=%d want 1", len(got))
+	}
+
+	if got[0]["os"] != "Linux" || got[0]["userAgent"] != "RealDevice/1" {
+		t.Errorf("os/userAgent=%v/%v want Linux/RealDevice/1（业务字段优先）", got[0]["os"], got[0]["userAgent"])
+	}
 }
 
 // TestDesktopSessionIDProcessScoped sessionId 在同一进程内按账号稳定、不同账号不同，
@@ -213,8 +260,25 @@ func TestDesktopFingerprintPerRealm(t *testing.T) {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
 
+	assertDesktopReportUAAndOS(t, cnFP, "CN")
+
 	if got, want := client.desktopUAFor(globalAccount), "workbuddy-ai/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
+	}
+
+	assertDesktopReportUAAndOS(t, globalFP, "global")
+}
+
+// assertDesktopReportUAAndOS 断言 body 的 userAgent 取 navigator 形态、os 对齐 Win32。
+func assertDesktopReportUAAndOS(t *testing.T, fingerprint map[string]any, realm string) {
+	t.Helper()
+
+	if fingerprint["userAgent"] != desktopReportUA {
+		t.Errorf("%s userAgent=%v want %q", realm, fingerprint["userAgent"], desktopReportUA)
+	}
+
+	if fingerprint["os"] != "Win32" {
+		t.Errorf("%s os=%v want Win32", realm, fingerprint["os"])
 	}
 }
 
@@ -397,5 +461,38 @@ func TestReadServerRequestIDSkipsInvalidID(t *testing.T) {
 
 	if got != want {
 		t.Fatalf("requestID=%q want %q", got, want)
+	}
+}
+
+// TestDesktopExpertHeadersPrivateDataAlwaysTrue 桌面专家路径是桌面主进程 chat
+// surface：官方 `applyGatewayHeaders` 的兜底表 `VF` 与 `buildVlmGatewayHeaders`
+// 都把 X-Private-Data 硬编码为 true（CN 5.9.3 / global 5.8.4 同形），与 CLI chat
+// 的 privateDataHeaderValue 分属两条 surface，不能共用（issue #343 / #348）。
+func TestDesktopExpertHeadersPrivateDataAlwaysTrue(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+
+	cases := []struct {
+		name    string
+		account *auth.Auth
+		want    string
+	}{
+		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "true"},
+		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
+		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequest(http.MethodPost, "https://upstream.test/v2/chat/completions", nil)
+			client.setDesktopExpertHeaders(req, testCase.account, "conv-1", "")
+
+			if got := req.Header.Get("X-Private-Data"); got != testCase.want {
+				t.Fatalf("X-Private-Data=%q want %q", got, testCase.want)
+			}
+		})
 	}
 }

@@ -88,10 +88,10 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端没给会话 ID 时生成 UUIDv4（不影响 prompt cache key）。
 - 首条消息非 system 时补官方 `"You are CodeBuddy Code.\n"` fallback（CN/global 都补）。
 - `6004` 带重置、`14003` 模型级限流只冷该模型；`14003` 用 10s→1m 短窗且不喂路由熔断；`6004` 无重置按账号级保守退避并记模型审计；`11158` 仅在 400/404 时与 `11136` 同归账号级模型权限避让，429+11158 归限流。
-- CN billing/meter `/v2` 优先、无 `/v2` 回落（官方桌面 resourcePrefix 为空）。分 surface 取 base：桌面 report 走 `desktopBase`（即 `chatBase`），Web report 走 `webBase`，growth 任务 / 旅行走 `chatBase`，billing / 签到 / 活跃上报走 `billingBase`。本仓 CN billing 默认仍走 `codebuddy.cn`，可用 `cn.billing_base` 灰度切到 `workbuddy.cn`；小程序埋点固定 `codebuddy.cn`，不跟随覆盖。这是 surface 取舍，不是遗漏。
+- billing/meter 的 summary / packages / get-user-resource 无前缀优先、`/v2` 回落（官方桌面 `resourcePrefix` 为空串）；签到例外保持 `/v2` 优先（官方 `DesktopAccountRepo.billingPrefix` 覆写为 `/v2`）。billing 的 `buildHeaders` 默认不带 UA，但 `context.http` 的 CellJS RestOperations 注册了 `WorkbuddyUserAgentHttpInterceptor`，meter 最终带桌面三段式 UA（`desktopUAFor`）；`Accept-Language` / `X-Device-Token` 默认不发：summary 与 packages 由调用方带 `Accept-Language: zh|en`（短码，不是 `zh-CN`/`en-US`），`/v2/report` 例外显式发单段 `WorkBuddy/<ver>` UA（显式 `user_agent` 优先），`X-Device-Token` 只在签到注入（`/v2/plugin/auth/state` 是面板登录面，不经 `internal/upstream`）。分 surface 取 base：桌面 report 走 `desktopBase`（即 `chatBase`），Web report 走 `webBase`，growth 任务 / 旅行走 `chatBase`，billing / 签到 / 活跃上报走 `billingBase`。本仓 CN billing 默认仍走 `codebuddy.cn`，可用 `cn.billing_base` 灰度切到 `workbuddy.cn`；小程序埋点固定 `codebuddy.cn`，不跟随覆盖。这是 surface 取舍，不是遗漏。
 - SSE 接受 `delta.reasoning`、重复 tool id 去重、`finish_reason` 后 EOF 正常收尾；reasoning-only 不记成功。
-- 签到两 realm `/v2` 优先；余额 summary 为主、旧端点兜底；模型目录应用 `availableModels` / `disabled` / `aliases`。`/v1/models` 发现输出再按官方默认会话 agent（`/v3/config data.agents`，企业端点 `agents` 兜底；`tags` 含 default → `name=cli` → 首个有 models）裁剪，仅隐藏展示条目，`FetchModels`、面板与请求路由保持全量。
-- growth `/v2` 优先；travel claim 支持 `record_id` 与空 body；桌面 report `X-Domain` 为 host 形态。
+- 签到两 realm `/v2` 优先；余额 summary 为主、旧端点兜底；模型目录应用 `availableModels` / `disabled` / `aliases`（企业 `/console/enterprises/<enterpriseId|personal>/models` 按账号拼接，`/v2/enterprises/personal/models` 回落仍固定 personal）。`/v1/models` 发现输出再按官方默认会话 agent（`/v3/config data.agents`，企业端点 `agents` 兜底；`tags` 含 default → `name=cli` → 首个有 models）裁剪，仅隐藏展示条目，`FetchModels`、面板与请求路由保持全量。
+- growth `/v2` 优先；travel claim 支持 `record_id` 与空 body；桌面 report `X-Domain` 为 host 形态，body 指纹带 `userAgent=Node.js/22`（官方 Electron 主进程 `navigator.userAgent`）与 `os=Win32`（官方 `navigator.platform`），与 HTTP 头 UA 不同源。
 - 队列业务码 `6020/6021/6022`、限流族 `6000-6008`、额度/认证码按客户端枚举实现；请求级码（`11125/11129/.../11155`、`12654/14405`）不罚号不轮转，`11136` 换号并做模型级避让，`11141` 模型下线 fail-fast，`11102` 模型目录不存在按请求级 404 fail-fast（不换号），`11-128` 入站按内容拦截。
 - SSE error 帧与 HTTP 200 业务信封优先按结构化 `code`（含 `bizCode`）分类，取不到再回落 message；客户端 `data.statusCode`/`actions`、`cgicode/ret/retcode` 与 `172xx` 技能码尚未进入聊天主路径验证，暂不实现。
 
@@ -100,13 +100,18 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 | surface | 官方形态 | 本仓 | 取舍 |
 | --- | --- | --- | --- |
 | search / webfetch | raw `fetch`，`CLI/<desktop version>` UA，头更少 | 复用 chat 头族 | 统一指纹，避免同账号多客户端 |
+| webfetch 的 `X-Wb-Uid` | 与 `X-User-Id` 同值（账号 uid） | `WebFetch` 单独注入 | 官方只在 webfetch / knowledge_search 发，不扩散到 search / agentic_search / images |
 | agentic_search | `Content-Type` / `Authorization` / 可选 `X-Conversation-Request-ID` | 复用 chat 头族 + `Accept: text/event-stream` | 同上；SSE 契约优先 |
 | images | Content-Type / Authorization / conversation / identity | 复用 chat 头族 | 同上 |
 | chat/busy | renderer `wb.http.post` | 复用 chat 头族 | 同上 |
 
-证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.8.3 / global 5.8.4
-基线包内 `X-Agent-Runtime` 0 命中（对应 CLI 2.161.0）；保留该头的依据是更晚 CLI 的
-搜索端点观测，待新基线复核。版本值仍只来自部署 profile，不进入仓库内置常量。
+证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.9.3 包内
+`X-Agent-Runtime` 已是基线行为（`normalizeAgentRuntime` 不在枚举内回落 `other`），
+官方在 chat / images / search / webfetch 全发；本仓统一由 `ChatHeaders` 发官方兜底值
+`other`（网关没有 session meta / `CODEBUDDY_AGENT_RUNTIME` 来源）。同版 `X-Wb-Uid`
+只出现在 webfetch（与 knowledge_search），取值与 `X-User-Id` 同源，故仅在 `WebFetch`
+单独注入，不扩散到 search / agentic_search / images。版本值仍只来自部署 profile，
+不进入仓库内置常量。
 
 chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 
@@ -117,6 +122,8 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | `X-Stainless-*` | 不补 | 由 OpenAI Node SDK 自动生成；本仓出站不是 Node SDK，补等于伪造 SDK 运行时版本 |
 | `X-Codebuddy-Request: 1` | 刻意保留 | D1 风控闸门头；官方 chat adapter 未注入、daemon/ACP 注入，但无实测证明移除安全 |
 | 个人号 `X-No-Enterprise-Id` / `X-No-Department-Info` | 刻意保留 | 非 chat 端点也声明无部门信息（#298），按 chat-only 收窄会回退该修复 |
+| `X-Private-Data`（CLI chat） | 已对齐（按账号身份） | CN 5.9.3 的 `applyPrivateDataHeaderPolicy` 在个人号默认分支发 `false`、企业号（`isEnterpriseEditionAccount`：enterpriseId 非空或 type 为 ultimate/exclusive）发 `true`；global 基线仍是 5.8.4，走 `DisableYuanbaoChannel=true` 仍发 `true`，升到 5.9.x 后按同一逻辑复核。远端 abTest / 会话 meta `privateDataSticky` 不在网关范围 |
+| `X-Private-Data`（桌面专家路径） | 已对齐（固定 `true`） | 官方桌面主进程 chat 走 `applyGatewayHeaders`，兜底表 `VF` 里该头硬编码 `true`；`buildVlmGatewayHeaders` 同样硬编码。与 CLI chat 分属两条 surface，不能共用阈值；CN 5.9.3 / global 5.8.4 同形 |
 | custom model 的 `X-Private-Data` | 不适用 | 本仓没有 custom 模型上游路由（`isCustomModel` 仅用于模型目录可见性），无触达路径 |
 
 桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。

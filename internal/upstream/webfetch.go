@@ -86,6 +86,12 @@ func (c *Client) WebFetch(
 	if err != nil {
 		return nil, fmt.Errorf("webfetch request: %w", err)
 	}
+	// 官方 5.9.3 的 webfetch 头构造带 X-Wb-Uid，取值与 X-User-Id 同源（账号 uid）。
+	// 只有 webfetch 与 knowledge_search 发该头，故在此单独注入，不进 SearchHeaders
+	// （search / agentic_search / images 都不带）。uid 为空时不发空头。
+	if account != nil && account.UID != "" {
+		httpReq.Header.Set("X-Wb-Uid", account.UID)
+	}
 
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {

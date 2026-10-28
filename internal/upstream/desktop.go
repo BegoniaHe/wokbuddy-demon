@@ -52,6 +52,9 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
+	// desktopReportUA 官方 report body 的 navigator.userAgent：Electron 主进程
+	// 跑在 Node 22 上，Node 只暴露主版本号。HTTP 头仍用 desktopUAFor。
+	desktopReportUA = "Node.js/22"
 )
 
 // desktopLocal 桌面端事件中 source/mode 字段的本地标记值（官方分发端恒发此值）。
@@ -308,9 +311,9 @@ func (c *Client) desktopSessionID(a *auth.Auth) string {
 }
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-// 版本/commit/releaseDate 按 realm 取部署 profile 的官方分发包真值；os/arch 固定为常见桌面
-// （win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露宿主平台；
-// osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
+// 版本/commit/releaseDate 按 realm 取部署 profile 的官方分发包真值；os/arch 对齐官方
+// `navigator.platform`（Win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露
+// 宿主平台；osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
 func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 	desktopBuild2 := c.desktopBuildFor(account7)
 	osVersion, cpu, memorySize := desktopHardware(account7)
@@ -334,13 +337,17 @@ func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"sessionId":   c.desktopSessionID(account7),
 		"extName":     "workbuddy-desktop",
 		keyExtVersion: c.desktopExtVersionFor(account7),
-		"os":          "win32",
-		"arch":        "x64",
-		"osVersion":   osVersion,
-		"cpuModel":    cpu.Name,
-		"cpuCores":    cpu.Threads,
-		"memorySize":  memorySize,
-		"timestamp":   now,
+		// 官方 report body 取 Electron 主进程的 navigator.userAgent
+		// （Windows 下 Node 22 为 Node.js/22）与 navigator.platform（Win32），
+		// 与 /v2/report 的 HTTP 头 UA 不同源。
+		"userAgent":  desktopReportUA,
+		"os":         "Win32",
+		"arch":       "x64",
+		"osVersion":  osVersion,
+		"cpuModel":   cpu.Name,
+		"cpuCores":   cpu.Threads,
+		"memorySize": memorySize,
+		"timestamp":  now,
 	}
 
 	if tz := desktopTimezone(account7.Realm()); tz != "" {
@@ -830,6 +837,11 @@ func (c *Client) DesktopChatWithExpert(
 // setDesktopExpertHeaders 注入桌面指纹 chat 请求头（可带 X-Expert-Id）。
 // 对齐官方桌面端 chat 头组：完整三段 UA + X-Agent-Intent/Purpose/Type + X-Private-Data
 // + 会话头族 + traceparent/b3/X-B3-* 链路族 + acp-connection-id。
+//
+// X-Private-Data 固定 true：桌面主进程 chat 走 `applyGatewayHeaders`，其兜底表
+// `VF` 里该头恒为 `true`（CN 5.9.3 / global 5.8.4 同形）；`buildVlmGatewayHeaders`
+// 同样硬编码。CLI chat 的 false 判定（privateDataHeaderValue）是另一条 surface，
+// 不可复用——桌面指纹一旦发 false 就与官方桌面客户端不一致。
 func (c *Client) setDesktopExpertHeaders(
 	req *http.Request, account5 *auth.Auth, conversationID, expertID string,
 ) {

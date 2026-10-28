@@ -244,9 +244,12 @@ type tokenBundle struct {
 }
 
 // accountInfo 是 login/account 返回的账号标识。
+// Type 是账号版本（personal / ultimate / exclusive）：官方与企业 ID 并列用它判定
+// 企业版，落盘 auth 必须保留，否则后续出站头会误判为个人号。
 type accountInfo struct {
 	UID          string `json:"uid"`
 	EnterpriseID string `json:"enterpriseId"`
+	Type         string `json:"type"`
 	Nickname     string `json:"nickname"`
 }
 
@@ -631,6 +634,7 @@ func buildLoginOutput(tok tokenBundle, realm string, acct accountInfo) map[strin
 		"realm":         auth2.ResolveRealm(realm, tok.Domain),
 		"uid":           acct.UID,
 		"enterprise_id": acct.EnterpriseID,
+		"type":          acct.Type,
 		"nickname":      acct.Nickname,
 	}
 }

@@ -52,6 +52,11 @@ type Auth struct {
 	realm        string
 	UID          string
 	EnterpriseID string
+	// EditionType 账号版本标识（account.type / 扁平形 type，如 personal /
+	// ultimate / exclusive）。官方 `isEnterpriseEditionAccount` 把它与
+	// enterpriseId 并列判定企业版；本字段只用于该判定，**不参与** IsEnterprise()
+	// 的任务门控（那里只用 enterpriseId，改动会改变签到/成长任务的行为）。
+	EditionType string
 	// IdSource 身份来源（account.idSource / 扁平形 idSource）。静态 Key 形态
 	// enterpriseId 为空但 idSource 非空，出站仍需发企业身份头族。
 	IDSource string
@@ -303,6 +308,29 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == realmGlobal }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
+// IsEnterpriseEdition 对齐官方 `isEnterpriseEditionAccount`：enterpriseId 非空，
+// 或 account.type 命中 ultimate / exclusive（企业版没有 enterpriseId 的静态 Key 形态）。
+//
+// 只用于出站头判定（X-Private-Data），不要拿它替换 IsEnterprise() 做任务门控：
+// 后者的实证依据是 enterpriseId 形态下上游拒绝签到/成长任务，扩大判据会改变
+// 现有账号被跳过的范围。
+func (a *Auth) IsEnterpriseEdition() bool {
+	if a == nil {
+		return false
+	}
+
+	if a.IsEnterprise() {
+		return true
+	}
+
+	switch strings.ToLower(strings.TrimSpace(a.EditionType)) {
+	case "ultimate", "exclusive":
+		return true
+	default:
+		return false
+	}
+}
+
 // jwtTokenSource 从 access token 的 JWT payload 读 token_source。
 //
 // token_source 只是**认证方法**（如 enterprise_switch 表示这次会话通过企业切换
@@ -475,6 +503,7 @@ func parseNestedAuth(raw []byte) (Auth, error) {
 		Account struct {
 			UID                string `json:"uid"`
 			EnterpriseID       string `json:"enterpriseId"`
+			EditionType        string `json:"type"`
 			IDSource           string `json:"idSource"`
 			DepartmentFullName string `json:"departmentFullName"`
 			Nickname           string `json:"nickname"`
@@ -494,6 +523,7 @@ func parseNestedAuth(raw []byte) (Auth, error) {
 		realm:              n.Auth.Realm,
 		UID:                n.Account.UID,
 		EnterpriseID:       n.Account.EnterpriseID,
+		EditionType:        n.Account.EditionType,
 		IDSource:           n.Account.IDSource,
 		DepartmentFullName: n.Account.DepartmentFullName,
 		Nickname:           n.Account.Nickname,
@@ -511,6 +541,7 @@ func parseFlatAuth(raw []byte) (Auth, error) {
 		Realm              string `json:"realm"`
 		UID                string `json:"uid"`
 		EnterpriseID       string `json:"enterpriseId"`
+		EditionType        string `json:"type"`
 		IDSource           string `json:"idSource"`
 		DepartmentFullName string `json:"departmentFullName"`
 		Nickname           string `json:"nickname"`
@@ -528,6 +559,7 @@ func parseFlatAuth(raw []byte) (Auth, error) {
 		realm:              item.Realm,
 		UID:                item.UID,
 		EnterpriseID:       item.EnterpriseID,
+		EditionType:        item.EditionType,
 		IDSource:           item.IDSource,
 		DepartmentFullName: item.DepartmentFullName,
 		Nickname:           item.Nickname,
@@ -561,12 +593,16 @@ func (a *Auth) SaveAtomic() error {
 		"enterpriseId": a.EnterpriseID,
 		"nickname":     a.Nickname,
 	}
-	if a.IDSource != "" {
-		accountDoc["idSource"] = a.IDSource
-	}
-
-	if a.DepartmentFullName != "" {
-		accountDoc["departmentFullName"] = a.DepartmentFullName
+	// 可选身份字段只在有值时写回：手写账号通常没有这些键，写空键会让插件侧
+	// 读到「已填但为空」的版本 / 来源（type 尤其：空串不等于 personal）。
+	for key, value := range map[string]string{
+		"type":               a.EditionType,
+		"idSource":           a.IDSource,
+		"departmentFullName": a.DepartmentFullName,
+	} {
+		if value != "" {
+			accountDoc[key] = value
+		}
 	}
 
 	doc := map[string]any{

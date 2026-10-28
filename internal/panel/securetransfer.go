@@ -57,7 +57,11 @@ type secureAccount struct {
 	Domain       string `json:"domain,omitempty"`
 	Realm        string `json:"realm,omitempty"`
 	EnterpriseID string `json:"enterprise_id,omitempty"`
-	DeviceToken  string `json:"device_token,omitempty"`
+	// EditionType 账号版本（account.type：personal / ultimate / exclusive）。
+	// 出站 X-Private-Data 的企业版判定除 enterpriseId 外还看该值，备份丢它会
+	// 让「无 enterpriseId 的 ultimate/exclusive 账号」导入后退化成个人号。
+	EditionType string `json:"edition_type,omitempty"`
+	DeviceToken string `json:"device_token,omitempty"`
 	// 静态 Key / 企业身份头字段：导出再导入后出站仍需 X-Id-Source 与
 	// X-Department-Info，不能只保留 enterpriseId。
 	IDSource           string `json:"id_source,omitempty"`
@@ -200,6 +204,7 @@ func (p *Panel) collectSecureAccounts() []secureAccount {
 			Domain:             account.DomainValue(),
 			Realm:              account.Realm(),
 			EnterpriseID:       account.EnterpriseID,
+			EditionType:        account.EditionType,
 			DeviceToken:        account.DeviceToken,
 			IDSource:           account.IDSource,
 			DepartmentFullName: account.DepartmentFullName,
@@ -394,6 +399,7 @@ func buildSecureAuth(acc *secureAccount, strVal, at, str, authDir string) *auth.
 		UID:                strVal,
 		Nickname:           acc.Nickname,
 		EnterpriseID:       acc.EnterpriseID,
+		EditionType:        acc.EditionType,
 		DeviceToken:        acc.DeviceToken,
 		IDSource:           acc.IDSource,
 		DepartmentFullName: acc.DepartmentFullName,

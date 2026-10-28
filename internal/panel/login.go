@@ -363,9 +363,12 @@ func (p *Panel) lookupLoginSession(state string) (loginSession, bool) {
 }
 
 // loginAccount login/account 端点返回的账号字段。
+// type 是账号版本（personal / ultimate / exclusive），官方据此与企业 ID 并列判定
+// 企业版（X-Private-Data 等出站头），登录落盘必须保留。
 type loginAccount struct {
 	UID          string `json:"uid"`
 	EnterpriseID string `json:"enterpriseId"`
+	EditionType  string `json:"type"`
 	Nickname     string `json:"nickname"`
 }
 
@@ -651,6 +654,7 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 		Domain:       tok.Domain,
 		UID:          acct.UID,
 		EnterpriseID: acct.EnterpriseID,
+		EditionType:  acct.EditionType,
 		Nickname:     acct.Nickname,
 		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
 	}

@@ -112,9 +112,11 @@ func (c *Client) userAgent(a *auth.Auth) string {
 	return c.defaultWorkBuddyUAFor(a)
 }
 
-// billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
-// （官方 banner/上报显式覆写形态，不带 CLI 段）。默认取 profile 字面量；
-// 显式 client_version 覆盖时按该版本拼装；client_name="SaaS" 才不设 UA（Go 默认 UA）。
+// billingUA billing 域 report / banner 类显式 UA：单段 `WorkBuddy/<clientVersion>`
+// （官方 banner/上报显式覆写形态，不带 CLI 段）。billing meter 默认走桌面全局
+// UA 拦截器（desktopUAFor 三段式），该值只用于 report 这类显式覆写的例外面
+// （见 billingReportUA）。默认取 profile 字面量；显式 client_version 覆盖时按该版本
+// 拼装；client_name="SaaS" 返回空串（不写 UA 键，回落 Go 默认 UA）。
 func (c *Client) billingUA(account *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
@@ -131,9 +133,24 @@ func (c *Client) billingUA(account *auth.Auth) string {
 	return "WorkBuddy/" + c.clientVersionFor(account)
 }
 
-// resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
+// billingReportUA billing 域 /v2/report 的 UA：官方桌面端在该面显式发单段
+// `WorkBuddy/<ver>`（与 banner / 白名单类同形），是 billing 域里唯一的单段 UA
+// 例外——其余 billing 端点走 desktopUAFor 三段式（RestOperations 全局拦截器）。
+// 显式 user_agent 优先，其余回落 billingUA；空串表示不写 UA 键、回落 Go 默认 UA
+// （client_name="SaaS"）。
+func (c *Client) billingReportUA(a *auth.Auth) string {
+	if c != nil && c.UserAgent != "" {
+		return c.UserAgent
+	}
+
+	return c.billingUA(a)
+}
+
+// resolveDeviceToken 解析签到专用 X-Device-Token 的取值。
 // 优先级：auth.Auth.DeviceToken（每号）> Client.DeviceToken（config 全局）> 文件兜底。
 // 三者皆空/读失败则返回空串（调用方不注入该头，优雅降级）。
+// 官方只在 /v2/plugin/auth/state 与签到（daily-checkin / checkin-activity-status）
+// 消费该头，本仓只在签到路径注入（见 checkinHeaders；#342）。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	if a != nil && a.DeviceToken != "" {
 		return a.DeviceToken
@@ -150,11 +167,16 @@ func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	return ""
 }
 
-// injectDeviceToken 在 req 注入 X-Device-Token 头（仅当取到非空 token）。
-func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
+// checkinHeaders 签到专用请求头：X-Device-Token（取值为空时不注入）。
+// 官方 5.9.3 只在该头的 /v2/plugin/auth/state 与签到消费点发；chat / images /
+// search / webfetch / modelbusy 与 billing 默认面（report / travel / balance 等）
+// 都不带（#342）。auth/state 是面板登录面，不经过 internal/upstream。
+func (c *Client) checkinHeaders(a *auth.Auth) map[string]string {
 	if tok := c.resolveDeviceToken(a); tok != "" {
-		req.Header.Set("X-Device-Token", tok)
+		return map[string]string{"X-Device-Token": tok}
 	}
+
+	return nil
 }
 
 // UUID version/variant 位掩码（RFC 4122）。
@@ -195,18 +217,21 @@ func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	// X-CodeBuddy-Request: 1（D1 风控闸门头）。官方 chat adapter 未注入，
 	// daemon/ACP 注入；本仓无实测证明移除安全，按 D1 保留（见 UPSTREAM.md §六）。
 	req.Header.Set("X-Codebuddy-Request", "1")
-	// chat/通用 API 不发 Accept-Language：官方 chat 路径没有该头（只有 billing/
-	// account 分页按 locale 带，见 BillingHeaders）。为「看起来像浏览器」补该头反而
-	// 增加非官方指纹（issue #249）。
+	// chat/通用 API 不发 Accept-Language：官方 chat 路径没有该头（billing 域也只有
+	// summary / packages 分页按 locale 带，见 fetchResourceSummary / fetchPackagePage）。
+	// 为「看起来像浏览器」补该头反而增加非官方指纹（issue #249）。
 }
 
-// acceptLanguageFor 按账号 realm 返回 Accept-Language：global → en-US，cn → zh-CN。
-func acceptLanguageFor(a *auth.Auth) string {
+// billingAcceptLanguage 按账号 realm 返回 billing 分页的 Accept-Language：
+// global → en，cn → zh（官方 `resolveBillingAcceptLanguage` 返回语言短码，
+// 不是 zh-CN / en-US）。只用于 summary 与 packages 两类请求，其余 billing
+// 端点官方不发该头。
+func billingAcceptLanguage(a *auth.Auth) string {
 	if a != nil && a.IsGlobal() {
-		return "en-US"
+		return "en"
 	}
 
-	return "zh-CN"
+	return "zh"
 }
 
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
@@ -245,6 +270,9 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	c.CommonHeaders(req, account3)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime；
+	// 网关没有 session meta / CODEBUDDY_AGENT_RUNTIME 来源，统一发官方兜底值 other。
+	req.Header.Set("X-Agent-Runtime", "other")
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
 	if at := account3.AccessTokenValue(); at != "" {
@@ -274,8 +302,9 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	c.injectIdentityHeaders(req, account3)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
-	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
-	c.injectDeviceToken(req, account3)
+	// X-Device-Token 不注入 chat：官方只在该头的 /v2/plugin/auth/state 与签到
+	// 消费点使用，chat / search / webfetch / images / modelbusy 都不带（#342）。
+	// 签到专用注入见 Client.checkinHeaders。
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
 }
@@ -455,7 +484,8 @@ func validTraceID(str string) bool {
 }
 
 // attributionClientName 生效的自定义归属名：ClientName 非空取之；空 = 默认官方桌面端
-// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。仅 billingUA 用它判断是否禁用 UA。
+// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。billingUA 与 BillingHeaders
+// 共用它判断是否禁用 UA。
 func (c *Client) attributionClientName() string {
 	if c != nil && c.ClientName != "" {
 		return c.ClientName
@@ -464,21 +494,39 @@ func (c *Client) attributionClientName() string {
 	return "WorkBuddy"
 }
 
+// privateDataHeaderValue 返回 CLI chat 的 X-Private-Data 取值。
+// CN 5.9.3 官方 `applyPrivateDataHeaderPolicy` 在个人号的默认分支发 false，
+// 企业号因 `isEnterpriseEditionAccount`（enterpriseId 非空或 type 为
+// ultimate / exclusive）命中同一判定而发 true；global 基线仍是 5.8.4，
+// 只走 `DisableYuanbaoChannel=true` → `h=false` → true，等 global 升到 5.9.x
+// 后按同一逻辑复核。
+// 远端 abTest（DefaultModelOptimizationOff）与会话 meta `privateDataSticky`
+// 都不在网关范围：本仓没有这两类状态来源，只对齐静态默认分支。
+// 桌面专家 chat 路径不走本函数：官方桌面 `applyGatewayHeaders` 的兜底表
+// 硬编码 true，见 setDesktopExpertHeaders。
+func privateDataHeaderValue(account *auth.Auth) string {
+	if account != nil && (account.IsGlobal() || account.IsEnterpriseEdition()) {
+		return "true"
+	}
+
+	return "false"
+}
+
 // injectAttribution 注入桌面客户端 chat 归属头（X-Agent-Purpose / X-Agent-Intent /
 // X-Agent-Type / X-IDE-* / X-Product / X-Private-Data）。仅在 chat/completions 路径生效。
 //
 // 默认（ClientName 空）对齐官方桌面端 chat 指纹：
 //
 //	X-Agent-Purpose=conversation、X-Agent-Intent=craft、X-Agent-Type=main、
-//	X-Private-Data=true、X-IDE-Name/Type=WorkBuddy、X-IDE-Version=<realm 版本>、
-//	X-Product=SaaS（=deploymentType）。
+//	X-Private-Data=<见 privateDataHeaderValue>、
+//	X-IDE-Name/Type=WorkBuddy、X-IDE-Version=<realm 版本>、X-Product=SaaS（=deploymentType）。
 //
 // 显式 ClientName 非空时 X-Product 与 X-IDE-Name/Type 跟随该值（自定义归因逃生门）。
 func (c *Client) injectAttribution(req *http.Request, account4 *auth.Auth) {
 	req.Header.Set("X-Agent-Purpose", "conversation")
 	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Agent-Type", "main")
-	req.Header.Set("X-Private-Data", "true")
+	req.Header.Set("X-Private-Data", privateDataHeaderValue(account4))
 
 	name := "WorkBuddy"
 	product := "SaaS" // 官方 chat X-Product=deploymentType（SaaS）
@@ -560,21 +608,28 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 }
 
 // BillingHeaders billing 接口请求头。
-// UA 语义：默认**不设置**（保持现状，Go 客户端自带默认 UA）；仅当显式配置
-// c.UserAgent 非空才覆盖——避免默认路径给 billing 引入新的 UA 指纹。
+// 官方 5.9.3 的 billing `buildHeaders` 只有 Accept / Authorization / Content-Type /
+// X-User-Id（外加按需的企业与 X-Domain 头），没有 Accept-Language、没有
+// X-Requested-With，也没有 X-Device-Token（签到单独注入，见 Client.checkinHeaders）。
+// 但 billing 的 `context.http` 来自 `createMainProcessHttp` → CellJS RestOperations，
+// 全局注册了 `WorkbuddyUserAgentHttpInterceptor`，默认 UA 是桌面三段式
+// （desktopUAFor），不是空串。例外是 billing 域 /v2/report 的显式单段 UA，见
+// Client.billingReportUA。
+//
+// 显式配置 c.UserAgent 时优先发用户值；`client_name="SaaS"` 是显式逃生门，
+// 此时不写 User-Agent 键，保留 Go transport 的默认 UA（旧行为）。
 func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 	// AccessToken 加锁快照（同 ChatHeaders：keepalive 可在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account6.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
-	// Accept-Language 按 realm 切（D5，billing 域未走 CommonHeaders，单独注入）。
-	req.Header.Set("Accept-Language", acceptLanguageFor(account6))
 
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
-	} else if ua := c.billingUA(account6); ua != "" {
-		req.Header.Set("User-Agent", ua)
+	} else if c.attributionClientName() != "SaaS" {
+		// client_name="SaaS" 是显式逃生门：不注入桌面 UA，保留 Go 默认 UA。
+		req.Header.Set("User-Agent", c.desktopUAFor(account6))
 	}
 
 	if account6.UID != "" {
@@ -589,8 +644,6 @@ func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 	if d := account6.DomainValue(); d != "" {
 		req.Header.Set("X-Domain", d)
 	}
-	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
-	c.injectDeviceToken(req, account6)
 }
 
 // RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。

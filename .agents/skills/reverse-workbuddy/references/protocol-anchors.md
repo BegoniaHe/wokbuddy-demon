@@ -18,20 +18,28 @@
     （global 曾走 `/console` 路径，因 WAF body 规则改回 `/v2` 单路径）。
   - `chatOrigins()` / `RefreshToken()`：CN 首 token 前按 workbuddy.cn →
     copilot.tencent.com → wb.tencentbuddy.com 回落。
-  - `billingMeterPaths()`：global 无 `/v2` 前缀优先，404 回落；CN 只用
-    `/v2/...`。`checkinMeterPaths()`：两 realm 均 `/v2` 优先，404 回落旧路径。
+  - `billingMeterPaths()`：两 realm 一致的无前缀优先（官方 `resourcePrefix` 空串），
+    404 回落 `/v2`。`checkinMeterPaths()`：两 realm 均 `/v2` 优先
+    （`DesktopAccountRepo.billingPrefix=/v2`），404 回落旧路径。
   - `WebBaseCN`（`https://www.workbuddy.cn`）：任务领奖 / profile 域。
   - `/v3/config` 拉取 + `X-Domain`：见 `internal/upstream/client.go` 1874 附近。
+  - 企业模型目录：`/console/enterprises/<enterpriseId|personal>/models`（官方
+    `CloudAgentProvider.getModels()` 按账号拼 `enterpriseId`），失败回落
+    `/v2/enterprises/personal/models`（官方 daemon 侧固定 personal）。
 - 桌面指纹上报：`internal/upstream/desktop.go`：`/v2/report`、
   `/v2/user-asset/appearance/set`、`desktopFingerprint`（commit / releaseDate
-  来自部署 profile，源码无固定构建常量）。
+  来自部署 profile，源码无固定构建常量；body 的 `userAgent` 固定为
+  `Node.js/22`（Electron 主进程 `navigator.userAgent`），与 HTTP 头桌面 UA
+  不同源；`os` 为 `Win32`（官方 `navigator.platform`））。
 
 ## 请求头族
 
 - `internal/upstream/headers.go`
-  - `userAgent()` / `billingUA()` / `desktopUAFor()` 默认取部署 profile 的冻结
-    字面量（`internal/clientprofile`）；显式 config `user_agent` /
-    `client_version` / `cli_version` 才覆盖版本段。
+  - `userAgent()` / `desktopUAFor()` 默认取部署 profile 的冻结字面量
+    （`internal/clientprofile`）；显式 config `user_agent` / `client_version` /
+    `cli_version` 才覆盖版本段。billing meter 走 `restOperations` 的
+    `WorkbuddyUserAgentHttpInterceptor`，默认与 `desktopUA` 同形；`billingUA()`
+    只服务 billing 域 report / banner 这类显式单段 UA 面。
   - chat UA 模板（`cli/dist/codebuddy-lite-wb.mjs` 的
     `UserAgentHttpInterceptor.buildUserAgent`）：
     `WorkBuddy/<platformVersion> <applicationName>/<platformVersion> CLI/<cliVersion>`。
@@ -39,8 +47,9 @@
     `cli/product.json`（CN `WorkBuddy` / global `workbuddy-ai`）；extension 为
     `CLI/<cli>`。服务端不注入 `CLIENT_INFO_APPLICATION_NAME`。`/v2/report` 的
     desktop UA 是另一条 surface，不共用该模板。
-  - `injectDeviceToken()`：`X-Device-Token`，文件兜底见
-    `internal/upstream/device_token.go`。
+  - `checkinHeaders()`：`X-Device-Token`，**只在签到**（daily-checkin /
+    checkin-activity-status）注入；文件兜底见 `internal/upstream/device_token.go`。
+    官方也只在这两处 + `/v2/plugin/auth/state`（面板登录面，不在本仓出站面）消费。
   - 会话头族 `X-Conversation-Id` / `-Request-Id` / `-Message-Id` /
     `X-Request-ID` / `X-Root-Request-Id`（`ChatMeta`）。
   - body 侧 `conversationRequestId`：官方桌面端在当前轮最后一条 user 消息的
@@ -53,14 +62,24 @@
     `auth.method` 非空就会发；但参考实现 issue #51 的 CN/global 个人号真机抓包
     （2026-10-22）两版均未出现这两个头，企业号才出现。个人号判据按
     `EnterpriseID`，不要按 `token_source`。
-  - `Accept-Language`：官方 chat 路径不发；billing/account 分页请求才带 locale
-    （`main/account.js`）。本仓 `CommonHeaders` 在 chat 也发，属待清理差异。
+  - `Accept-Language`：官方 chat 路径不发；只有 billing 的 summary / packages
+    分页带短码 `zh` / `en`（`resolveBillingAcceptLanguage`）。本仓 `CommonHeaders`
+    与 `BillingHeaders` 都不发，只在 summary / packages 注入。
   - chat 桌面头组：`setDesktopExpertHeaders()`（`X-Domain` / `X-Product=SaaS` /
-    `X-User-Id` / `X-Agent-Intent|Purpose|Type` / `X-Private-Data` /
-    `X-Ide-Name|Type|Version` / `X-Codebuddy-Request` /
-    traceparent + b3 单头 + `X-B3-*` 四件套）。
+    `X-User-Id` / `X-Agent-Intent|Purpose|Type` /
+    `X-Private-Data`（**固定 `true`**：官方桌面主进程 `applyGatewayHeaders` 兜底表
+    `VF` 与 `buildVlmGatewayHeaders` 都硬编码 `true`，CN 5.9.3 / global 5.8.4 同形；
+    CLI chat 的 `privateDataHeaderValue()` 是另一条 surface：CN 个人号 `false`、
+    企业号（含 `type=ultimate|exclusive` 无 enterpriseId）`true`、global 5.8.4
+    `true`）/ `X-Ide-Name|Type|Version` /
+    `X-Codebuddy-Request` / traceparent + b3 单头 + `X-B3-*` 四件套）。
+  - `X-Agent-Runtime`：5.9.3 起官方在 chat / images / search / webfetch 全发；
+    `ChatHeaders` 统一发兜底值 `other`（网关无 session meta /
+    `CODEBUDDY_AGENT_RUNTIME` 来源）。`X-Wb-Uid` 只在 `WebFetch` 发，
+    取值与 `X-User-Id` 同值（官方仅 webfetch / knowledge_search 发）。
 - 客户端侧对照：
-  - `<app-asar>/main/*.js`：官方 UA、`X-IDE-*`、`X-Agent-*`、`X-Device-Token`。
+  - `<app-asar>/main/*.js`：官方 UA、`X-IDE-*`、`X-Agent-*`、`X-Wb-Uid`、
+    `X-Device-Token`。
   - `<app-asar>/renderer/assets/esm-*.js`：渲染层 `X-AI-Scenario|Channel|Model|
     Thinking|Online|SPACE` 族（仅 5.7.6 global 包见字面量；判断是否真出网）。
   - `<app-asar>/node_modules/openai/internal/detect-platform.js`：
@@ -74,10 +93,11 @@
   lottery/draw,redeem}`。
 - `internal/upstream/blackcat.go`：`/activity/growth/{heatmap,makeup-cards/use}`。
 - `internal/scheduler/travel*.go`：`/activity/growth/buddy/travel/*`。
-- 客户端对照：`rg -o '/v2/activity/[a-z/-]*' <app-asar>`；已知客户端还有
-  `/v2/billing/meter/checkin-activity-status` / `checkin-status` /
-  `get-user-resource-free-packages` / `get-user-resource-paid-packages` /
-  `get-user-resource-summary`，本仓库未覆盖（首查项）。
+- 客户端对照：`rg -o '/v2/activity/[a-z/-]*' <app-asar>`；billing/meter 族
+  已覆盖 `checkin-activity-status`（`CheckinActivityStatus`）、
+  `get-user-resource-summary`（`fetchResourceSummary`）、
+  `get-user-resource-{paid,free}-packages`（`fetchPackagePage`）；
+  仅 `checkin-status`（无 `-activity`，官方 `BackendProvider.getCheckinStatus`）仍未覆盖（首查项）。
 
 ## 已知未覆盖 / 形态存疑入口
 
@@ -92,7 +112,9 @@
   不是 CLI 排队。本仓已覆盖出站解析（`internal/upstream/modelbusy.go`）与入站只读
   预检（`internal/server/busy.go`）；不要让它参与选号。
 - `/v2/images/generations`、`/v2/images/edits`：官方 CLI 出图 / 图生图，
-  CN 5.8.3 与 global 5.8.4 同源；本仓库尚未覆盖。
+  CN 5.8.3 与 global 5.8.4 同源；`generations` 已覆盖
+  （`internal/upstream/images.go`，入站 `features.images_endpoint` 门控），
+  `edits` 仍未覆盖。
 - `/agenttool/v1/search`、`/agenttool/v1/webfetch`、`/agenttool/v1/agentic_search`：
   官方联网搜索 / 抓取 / 综述式检索；本仓库均已覆盖
   （`internal/upstream/{search,webfetch,agentic_search}.go`）。

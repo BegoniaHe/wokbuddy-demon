@@ -115,7 +115,7 @@ func TestUserResourceDetailedRetriesTransient500(t *testing.T) {
 	var calls atomic.Int32
 
 	client := testClient(func(r *http.Request) (*http.Response, error) {
-		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+		if !strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource") {
 			return nil, errWrongPath
 		}
 
