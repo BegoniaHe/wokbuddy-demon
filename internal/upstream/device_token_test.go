@@ -15,10 +15,11 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// TestDeviceTokenInjectedOnCheckinOnly 官方 5.9.3 只在该头的 auth/state 与签到消费点
-// 发 X-Device-Token：daily-checkin / checkin-activity-status 注入，chat / report /
-// balance 都不带（#342）。
-func TestDeviceTokenInjectedOnCheckinOnly(t *testing.T) {
+// TestDeviceTokenInjectedOnChatAndCheckin 真机 2026-10-28 抓包：X-Device-Token 出现在
+// chat（/v2/chat/completions）与签到（daily-checkin / checkin-activity-status）；
+// report / billing meter / busy / v3-config / refresh / growth / agenttool 都不带
+// （#342 的「只在 auth/state 与签到」对 chat 不成立，见 #376）。
+func TestDeviceTokenInjectedOnChatAndCheckin(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth"}
@@ -57,8 +58,15 @@ func TestDeviceTokenInjectedOnCheckinOnly(t *testing.T) {
 		apply func(*http.Request)
 	}{
 		{"/v2/chat/completions", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
-		{"/v2/report", func(req *http.Request) { client.BillingHeaders(req, account) }},
+		{"/v2/report", func(req *http.Request) { client.ReportHeaders(req, account) }},
 		{"/billing/meter/get-user-resource", func(req *http.Request) { client.BillingHeaders(req, account) }},
+		{"/v2/chat/busy", func(req *http.Request) { client.ModelBusyHeaders(req, account) }},
+		{"/v3/config", func(req *http.Request) { client.V3ConfigHeaders(req, account, "") }},
+		{"/v2/plugin/auth/token/refresh", func(req *http.Request) { client.RefreshHeaders(req, account) }},
+		{"/v2/activity/growth/buddy/info", func(req *http.Request) { client.GrowthHeaders(req, account) }},
+		{"/agenttool/v1/search", func(req *http.Request) {
+			client.applyHeaders(surfaceSearch, req, account, "", ChatMeta{})
+		}},
 	} {
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+surface.path, nil)
 		surface.apply(req)
@@ -74,9 +82,14 @@ func TestDeviceTokenInjectedOnCheckinOnly(t *testing.T) {
 	want := map[string]string{
 		"/v2/billing/meter/daily-checkin":           "tok-from-auth",
 		"/v2/billing/meter/checkin-activity-status": "tok-from-auth",
-		"/v2/chat/completions":                      "",
+		"/v2/chat/completions":                      "tok-from-auth",
 		"/v2/report":                                "",
 		"/billing/meter/get-user-resource":          "",
+		"/v2/chat/busy":                             "",
+		"/v3/config":                                "",
+		"/v2/plugin/auth/token/refresh":             "",
+		"/v2/activity/growth/buddy/info":            "",
+		"/agenttool/v1/search":                      "",
 	}
 
 	for path, wantTok := range want {

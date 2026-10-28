@@ -1308,14 +1308,14 @@ type Client struct {
 	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 传入 ChatStream。
 	PassthroughIP bool
 
-	// DeviceToken 签到专用设备风控 Token（X-Device-Token 头）全局兜底来源：
-	// config upstream.device_token。官方只在该头的 auth/state 与签到消费点使用，
-	// 本仓只在签到路径注入（见 checkinHeaders）。
+	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：
+	// config upstream.device_token。消费面是 chat 与签到（真机口径，见
+	// resolveDeviceToken）；其余面不注入。
 	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
 	DeviceToken string
 
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
-	// 与 DeviceToken 同口径：只用于签到。
+	// 与 DeviceToken 同口径：只用于 chat 与签到。
 	DeviceTokenFile string
 
 	// BalanceObserver 余额观测回调（可选）：每次成功查询余额后回调 (uid, remain, total)，

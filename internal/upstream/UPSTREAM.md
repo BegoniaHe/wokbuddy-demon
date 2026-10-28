@@ -131,6 +131,7 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | 项 | 状态 | 依据 |
 | --- | --- | --- |
 | refresh trace（`X-Trace-Id` / `Traceparent` / `B3` / `X-B3-*`） | 已对齐 | 官方 `cli/dist/codebuddy-lite-wb.mjs` 的 `AccountScopedAuth.refreshSession()` 追加 `traceSpan.requestHeaders`；网关无活动 span，故生成自洽的新链路 id |
+| chat `X-Device-Token` | 已对齐（维护者已拍板：发） | 真机 chat 主请求与辅助请求**都带**该头，与产品面公共头同层出现（`X-Private-Data` / `X-Codebuddy-Request` / `X-IDE-*` / `X-Product` / `X-Domain` / `X-User-Id` / `baggage` / trace 族 / `x-stainless-*` 同层），不在 `buildConversationHeaders` 的会话头族里；`#342` 的「只在 auth/state 与签到消费」对 chat 不成立（#376）。Trade-off：该头是风控标识，跨 surface 复用会把 chat 与签到关联到同一设备——发 = 更像官方，不发 = 更少设备关联；本仓**发**。其余面（summary / packages / report / busy / v3-config / refresh / growth / agenttool）真机不带，维持不发 |
 | chat `Accept` | 已对齐 | 真机 chat（含 `stream: true`）仍发 `application/json`，不改 `text/event-stream`（#377）。agenttool 四路真机未取证，search / webfetch 保持 `application/json`、agentic_search 保持 `text/event-stream`（SSE 契约优先），仅 chat 有真机证据 |
 | chat trace id 取值 | 已对齐 | 真机 `X-Trace-ID` / `X-B3-TraceId` / `traceparent` 的 trace-id 是 32 hex **随机值**（第 13 位为 4，无 v7 时间戳前缀），三处同值且 ≠ `X-Conversation-Request-ID`；本仓改为独立生成（`session.NewTraceID`），入站透传 `X-Trace-ID` 仍优先（#377） |
 | 轻头族 `X-Domain` | 已对齐 | 官方 `enterpriseHeaders()` 无 domain 时回落 **endpoint authority**；轻头族各面（refresh / v3-config / billing / report / busy / growth）统一按本次请求 URL 的 host 取值，不回落 chat base——billing 面走 `billing_base`，取 chat host 会把别的域发给 billing。`cn.chat_base` / `cn.billing_base` 覆盖时各自跟随 |
