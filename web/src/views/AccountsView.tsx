@@ -11,7 +11,14 @@ import {
   rateLimitMeta,
   type RateLimitRow,
 } from '@/lib/format';
-import { expBatches, expBucketsFromSnapshot, expDaysLeft, type Package } from '@/lib/expiry';
+import {
+  expBatches,
+  expBucketsFromSnapshot,
+  expDaysLeft,
+  expTotals,
+  type ExpiryDayTotal,
+  type Package,
+} from '@/lib/expiry';
 import { fmtTok } from '@/lib/format';
 import { toast } from '@/components/Toaster';
 import { useConfirm, type ConfirmOptions } from '@/components/ConfirmDialog';
@@ -249,6 +256,7 @@ export function AccountsView() {
 interface PackageAccount {
   uid?: string;
   nickname?: string;
+  realm?: string;
   error?: string;
   packages?: Package[];
 }
@@ -309,6 +317,34 @@ function snapshotPackages(a: Account): Package[] {
   return [{ remain: a.credits_earliest_remaining, end_time: String(a.credits_earliest_expiry).slice(0, 10) }];
 }
 
+// expiryRealmLabel 合计块的域标题：只有单一 realm 时调用方不渲染（避免冗余标题）。
+const EXPIRY_REALM_LABEL: Record<string, string> = { cn: '国内版 CN', global: '国际版 Global' };
+
+// expiryTotalRows 合计区逐日行：日期 · 该日全站到期积分 · 涉及账号数。
+// 「日均需耗」是逐账号口径，跨号相加没有意义，因此这里不出现该列。
+// 超过 8 行时把剩余各行并成一行「其余 N 天合计」，保持卡片可读。
+function expiryTotalRows(rows: ExpiryDayTotal[]) {
+  const head = rows.slice(0, 8);
+  const tail = rows.slice(8);
+  return (
+    <>
+      {head.map((r) => (
+        <div key={r.date} className="flex items-center gap-2.5 border-t border-border/60 py-1.5 text-xs first:border-t-0">
+          <span className="w-12 flex-none font-mono tabular-nums">{r.date.slice(5)}</span>
+          <span className="w-24 flex-none font-mono tabular-nums">{fmtTok(r.remain)}</span>
+          <span className="font-mono tabular-nums text-muted-foreground">{r.accounts} 个账号</span>
+        </div>
+      ))}
+      {tail.length ? (
+        <div className="flex items-center gap-2.5 border-t border-border/60 py-1.5 text-xs">
+          <span className="flex-none text-muted-foreground">其余 {tail.length} 天合计</span>
+          <span className="font-mono tabular-nums">{fmtTok(tail.reduce((s, r) => s + r.remain, 0))}</span>
+        </div>
+      ) : null}
+    </>
+  );
+}
+
 function ExpiryBox({
   overview,
   detail,
@@ -324,6 +360,8 @@ function ExpiryBox({
 }) {
   // 折叠态记在本机（默认展开）：到期提醒是常驻卡片，占屏明显。
   const [expanded, setExpanded] = useLocalFlag('wb2api.expfold.v1', true);
+  // 跨账号合计块默认收起：不改变卡片默认展示（issue #102），展开状态本机记忆。
+  const [totalsOpen, setTotalsOpen] = useLocalFlag('wb2api.exptotals.v1', false);
 
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -331,7 +369,15 @@ function ExpiryBox({
   // 两条路径（实时明细 / 本地快照）统一成同一份「账号 + 到期包」，渲染只写一次。
   const list: PackageAccount[] = detail
     ? (detail.accounts ?? [])
-    : (overview.accounts ?? []).map((a) => ({ uid: a.uid, nickname: a.nickname, packages: snapshotPackages(a) }));
+    : (overview.accounts ?? []).map((a) => ({
+        uid: a.uid,
+        nickname: a.nickname,
+        realm: a.realm,
+        packages: snapshotPackages(a),
+      }));
+
+  // 跨账号按自然日合计：与下面逐账号行同函数、同过滤条件，因此「同日各行之和 = 合计行」。
+  const totals = expTotals(list, today);
 
   const keyed = list.map((a) => {
     let key: string | null = null;
@@ -418,6 +464,15 @@ function ExpiryBox({
         <CardAction>
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-xs text-muted-foreground">{note}</span>
+            <Button
+              size="xs"
+              variant="ghost"
+              aria-expanded={totalsOpen}
+              aria-controls="expiry-totals"
+              onClick={() => setTotalsOpen()}
+            >
+              {totalsOpen ? '收起合计' : '按日合计'}
+            </Button>
             <Button size="xs" disabled={checking} onClick={onCheck}>
               {checking ? '查询中…' : '检查'}
             </Button>
@@ -435,6 +490,27 @@ function ExpiryBox({
       </CardHeader>
       {expanded ? (
         <CardContent id="expiry-box-body">
+          {totalsOpen ? (
+            <div id="expiry-totals" className="mb-2 border-b border-border/60 pb-2">
+              <p className="py-1 text-2xs text-muted-foreground">
+                按到期日合计（同口径：只算未过期批次；日均需耗不跨号相加）
+              </p>
+              {totals.length === 0 ? (
+                <p className="py-2 text-xs text-muted-foreground">暂无未过期批次</p>
+              ) : (
+                totals.map((r, i) => (
+                  <div key={r.realm} className={i > 0 ? 'mt-2' : undefined}>
+                    {totals.length > 1 ? (
+                      <div className="py-1 text-2xs font-semibold text-muted-foreground">
+                        {EXPIRY_REALM_LABEL[r.realm] || r.realm}
+                      </div>
+                    ) : null}
+                    {expiryTotalRows(r.rows)}
+                  </div>
+                ))
+              )}
+            </div>
+          ) : null}
           {rows.length ? rows : <p className="py-4 text-center text-muted-foreground">没有账号</p>}
         </CardContent>
       ) : null}
