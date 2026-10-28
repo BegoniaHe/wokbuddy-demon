@@ -108,7 +108,7 @@ func (c *Client) growthJSONMP(account2 *auth.Auth, method, path string, body any
 	c.applyHeaders(surfaceGrowth, req, account2, "", ChatMeta{})
 	req.Header.Set("X-Client-Platform", mpPlatform)
 
-	return c.doJSON(req)
+	return c.doJSONFor(account2, req)
 }
 
 // AcceptTasksMP 接受小程序限定任务（mp 头；缺头实测 task not found）。
@@ -131,7 +131,7 @@ func (c *Client) ClaimRewardMP(account *auth.Auth, taskCode string) (credit, ene
 	c.applyHeaders(surfaceGrowth, req, account, "", ChatMeta{})
 	req.Header.Set("X-Client-Platform", mpPlatform)
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSONFor(account, req)
 	if err != nil {
 		// chat 域对该路径 400（部分任务/租户形态）→ Web 域降级（已实测可领）。
 		ue := &Error{}
@@ -286,7 +286,7 @@ func (c *Client) ClaimReward(account3 *auth.Auth, taskCode string) (credit, ener
 		req.Header.Set("X-Domain", d)
 	}
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSONFor(account3, req)
 	if err != nil {
 		return 0, 0, err
 	}

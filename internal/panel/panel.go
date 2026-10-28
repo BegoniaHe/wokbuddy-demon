@@ -72,8 +72,9 @@ type Config struct {
 	// LoadConfig 返回解析后的配置对象（前端展示/校验用，具体类型由 main 注入的闭包决定）；
 	// nil 时配置页返回 501。
 	ConfigPath string
-	// ProxySlots 可供账号绑定的出站代理槽（issue #96）。
-	ProxySlots []ProxySlotInfo
+	// ProxySlots 可供账号绑定的出站代理槽（issue #96）。provider 形态（issue #39）：
+	// 槽配置热生效，闭包每次读当前生效配置，不捕获装配期快照；nil 安全（= 无槽）。
+	ProxySlots func() []ProxySlotInfo
 	// Pricing 等价价格缓存（issue #99）；nil = 关闭或未初始化。
 	Pricing     *pricing.Catalog
 	PricingRate float64
@@ -508,7 +509,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"max_in_flight_total":  p.cfg.Pool.MaxInFlightTotal(),
 		"daily_limited":        p.cfg.Pool.DailyLimitedUIDs(),
 		"daily_reset_at":       nextLocalMidnight(),
-		"proxy_slots":          p.cfg.ProxySlots,
+		"proxy_slots":          p.proxySlots(),
 		"accounts":             p.cfg.Pool.List(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
@@ -843,8 +844,17 @@ func (p *Panel) accountProxySlot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// proxySlots 返回当前生效的代理槽视图（provider 为空时返回 nil）。
+func (p *Panel) proxySlots() []ProxySlotInfo {
+	if p.cfg.ProxySlots == nil {
+		return nil
+	}
+
+	return p.cfg.ProxySlots()
+}
+
 func (p *Panel) hasProxySlot(id string) bool {
-	for _, slot := range p.cfg.ProxySlots {
+	for _, slot := range p.proxySlots() {
 		if slot.ID == id {
 			return true
 		}

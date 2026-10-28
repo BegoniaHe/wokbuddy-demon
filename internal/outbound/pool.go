@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -31,7 +32,25 @@ type proxyState struct {
 	proxy        *Proxy
 	failures     int
 	cooldownTill time.Time
+	// 健康快照（issue #39）：面板只读展示用，与冷却判定同源更新。
+	lastOK     time.Time
+	lastErr    string // 已脱敏，≤200 字符
+	lastFailAt time.Time
 }
+
+// Health 单个代理的健康快照（只读展示用）。
+type Health struct {
+	Index       int    `json:"index"`
+	Proxy       string `json:"proxy"` // Masked()
+	Failures    int    `json:"failures"`
+	CooldownSec int    `json:"cooldown_sec"` // 剩余冷却秒数，0 = 健康
+	LastOK      string `json:"last_ok,omitempty"`
+	LastError   string `json:"last_error,omitempty"`
+	LastFailAt  string `json:"last_fail_at,omitempty"`
+}
+
+// healthErrLimit lastErr 的截断长度：足够定位原因，又不会把长 URL/堆栈塞进快照。
+const healthErrLimit = 200
 
 // New 由代理 URL 列表构造池；任一 URL 非法即报错。空列表返回直连池。
 func New(rawURLs []string) (*Pool, error) {
@@ -48,8 +67,47 @@ func New(rawURLs []string) (*Pool, error) {
 	return &Pool{states: states, now: time.Now}, nil
 }
 
+// Health 返回池内每个代理的健康快照（issue #39）：面板只读展示 + 出口探测共用。
+// 时间一律 RFC3339 UTC；CooldownSec 用 pool.now() 计算剩余，0 = 当前健康。
+func (pool *Pool) Health() []Health {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	now := pool.now()
+	out := make([]Health, 0, len(pool.states))
+
+	for index, entry := range pool.states {
+		health := Health{Index: index, Proxy: entry.proxy.Masked(), Failures: entry.failures}
+		if remain := entry.cooldownTill.Sub(now); remain > 0 {
+			health.CooldownSec = int(math.Ceil(remain.Seconds()))
+		}
+
+		if !entry.lastOK.IsZero() {
+			health.LastOK = entry.lastOK.UTC().Format(time.RFC3339)
+		}
+
+		health.LastError = entry.lastErr
+		if !entry.lastFailAt.IsZero() {
+			health.LastFailAt = entry.lastFailAt.UTC().Format(time.RFC3339)
+		}
+
+		out = append(out, health)
+	}
+
+	return out
+}
+
 // Len 返回池内代理数（0 = 直连）。
 func (pool *Pool) Len() int { return len(pool.states) }
+
+// Masked 返回池内首个代理的脱敏地址（面板槽视图用）；空池返回空串。
+func (pool *Pool) Masked() string {
+	if len(pool.states) == 0 {
+		return ""
+	}
+
+	return pool.states[0].proxy.Masked()
+}
 
 // DialContext 经健康代理建立到 addr 的连接：从轮转游标起依次尝试健康代理，
 // 失败者记冷却并回落下一个；全部冷却时半开探测冷却最早者。无代理则直连。
@@ -119,13 +177,13 @@ func (pool *Pool) dialProxy(
 	conn, err := proxyState2.proxy.dial(ctx, network, addr)
 	if err != nil {
 		if ctx.Err() == nil {
-			pool.recordFailure(proxyState2, now)
+			pool.recordFailure(proxyState2, now, proxyState2.proxy.redact(err.Error(), healthErrLimit))
 		}
 
 		return nil, err
 	}
 
-	pool.recordSuccess(proxyState2)
+	pool.recordSuccess(proxyState2, now)
 
 	return conn, nil
 }
@@ -155,7 +213,7 @@ func (pool *Pool) earliest() *proxyState {
 }
 
 // recordFailure 记一次失败：failures++ 并按指数退避设置冷却截止。
-func (pool *Pool) recordFailure(proxyState2 *proxyState, now time.Time) {
+func (pool *Pool) recordFailure(proxyState2 *proxyState, now time.Time, reason string) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
@@ -171,13 +229,17 @@ func (pool *Pool) recordFailure(proxyState2 *proxyState, now time.Time) {
 	}
 
 	proxyState2.cooldownTill = now.Add(duration)
+	proxyState2.lastFailAt = now
+	proxyState2.lastErr = reason
 }
 
 // recordSuccess 记一次成功：清零失败与冷却。
-func (pool *Pool) recordSuccess(st *proxyState) {
+func (pool *Pool) recordSuccess(entry *proxyState, now time.Time) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
-	st.failures = 0
-	st.cooldownTill = time.Time{}
+	entry.failures = 0
+	entry.cooldownTill = time.Time{}
+	entry.lastOK = now
+	entry.lastErr = ""
 }

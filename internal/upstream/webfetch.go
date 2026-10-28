@@ -87,7 +87,7 @@ func (c *Client) WebFetch(
 		return nil, fmt.Errorf("webfetch request: %w", err)
 	}
 
-	resp, err := c.HTTP.Do(httpReq)
+	resp, err := c.HTTPForAccount(account).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("webfetch do: %w", err)
 	}

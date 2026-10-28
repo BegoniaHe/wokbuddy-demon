@@ -73,7 +73,7 @@ func (c *Client) modelBusyBatch(
 	// 头族见 headers.go 的 lightHeaders，取舍见 `internal/upstream/UPSTREAM.md` §六。
 	c.applyHeaders(surfaceModelBusy, req, account, "", ChatMeta{})
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("ModelBusy: %w", err)
 	}

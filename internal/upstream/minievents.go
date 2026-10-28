@@ -106,7 +106,7 @@ func (c *Client) ReportMPEvent(account *auth.Auth, events ...map[string]any) err
 	req.Header.Set("X-Client-Version", "2.4.0")
 	req.Header.Set("X-Client-Platform", "mp-weixin")
 	req.Header.Set("X-Platform", "wechatmp")
-	_, err = c.doJSON(req)
+	_, err = c.doJSONFor(account, req)
 
 	return err
 }

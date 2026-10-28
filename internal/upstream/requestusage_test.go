@@ -184,7 +184,7 @@ func TestDoJSONLimitRejectsOversize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := client.doJSONLimit(req, 8); err == nil || !strings.Contains(err.Error(), "response body exceeds") {
+	if _, err := client.doJSONLimitFor(nil, req, 8); err == nil || !strings.Contains(err.Error(), "response body exceeds") {
 		t.Fatalf("err=%v want body-limit error", err)
 	}
 }

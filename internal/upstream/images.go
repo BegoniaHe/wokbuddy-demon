@@ -85,7 +85,7 @@ func (c *Client) postImage(
 
 	c.ImagesHeaders(req, account, clientIP, meta)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return 0, nil, fmt.Errorf("postImage %s: %w", path, err)
 	}

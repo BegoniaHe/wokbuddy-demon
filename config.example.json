@@ -108,7 +108,8 @@
     "rotate_budget": "0",
     "rotate_status_codes": [],
     "proxies": [],
-    "proxy_slots": []
+    "proxy_slots": [],
+    "realm_proxy_slots": {}
   },
   "features": {
     "sanitize_blacklist_fingerprints": true,

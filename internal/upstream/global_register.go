@@ -90,6 +90,9 @@ func (*Client) globalRegisterReq(base, method, url, token string, body any) (*ht
 }
 
 // globalRegisterJSON 发注册链路请求并解外层信封（code/msg）。
+//
+// 无账号作用域（issue #39）：注册发生在拿到账号之前，不存在绑定槽或 realm 默认槽，
+// 故保持 c.HTTP（全局 proxies 池/直连）。
 func (c *Client) globalRegisterJSON(req *http.Request) (code int, msg string, raw json.RawMessage, err error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

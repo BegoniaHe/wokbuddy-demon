@@ -94,16 +94,20 @@ func redactURLError(err error) error {
 // ParseProxy 解析代理 URL：支持 http://、https://、socks5://、socks5h://，
 // 可选 user:pass 认证；缺省端口按 scheme 回落（80/443/1080）。
 func ParseProxy(raw string) (*Proxy, error) {
-	url2, err := url.Parse(strings.TrimSpace(raw))
+	trimmed := strings.TrimSpace(raw)
+	// 四段式 host:port:user:pass（无 scheme）按 socks5 处理，见 isFourPartProxy。
+	if isFourPartProxy(trimmed) {
+		return parseFourPartProxy(trimmed)
+	}
+
+	url2, err := url.Parse(trimmed)
 	if err != nil {
 		// 不直接回显 raw / err：两者都可能含 user:pass。
 		return nil, fmt.Errorf("proxy 地址解析失败: %w", redactURLError(err))
 	}
 
 	scheme := strings.ToLower(url2.Scheme)
-	switch scheme {
-	case "http", "https", "socks5", "socks5h":
-	default:
+	if !supportedProxyScheme[scheme] {
 		return nil, fmt.Errorf("proxy: 不支持的 scheme %q（http/https/socks5/socks5h）: %w",
 			url2.Scheme, errParseProxyFailed)
 	}
@@ -115,14 +119,7 @@ func ParseProxy(raw string) (*Proxy, error) {
 
 	port := url2.Port()
 	if port == "" {
-		switch scheme {
-		case "http":
-			port = "80"
-		case "https":
-			port = "443"
-		default:
-			port = "1080"
-		}
+		port = defaultProxyPort(scheme)
 	}
 
 	proxy := &Proxy{
@@ -138,6 +135,87 @@ func ParseProxy(raw string) (*Proxy, error) {
 	}
 
 	return proxy, nil
+}
+
+// supportedProxyScheme 出站支持的代理 scheme 集合。
+var supportedProxyScheme = map[string]bool{
+	"http": true, "https": true, "socks5": true, "socks5h": true,
+}
+
+// isFourPartProxy 判定四段式 host:port:user:pass（无 scheme）：机场/代理商家最常见
+// 的默认口令形态（issue #39）。含 [ 的 IPv6 字面量与带 scheme/路径/认证的串不适用
+// 此形态，交回标准 URL 解析。
+func isFourPartProxy(trimmed string) bool {
+	return !strings.Contains(trimmed, "://") && strings.Count(trimmed, ":") >= 3 &&
+		!strings.ContainsAny(trimmed, "[/@")
+}
+
+// defaultProxyPort 缺省端口按 scheme 回落（80/443/1080）。
+func defaultProxyPort(scheme string) string {
+	switch scheme {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return "1080"
+	}
+}
+
+// Masked 脱敏后的代理地址 scheme://host:port：**永不**包含 user/pass，面板展示
+// 与日志一律用它（issue #39）。
+func (p *Proxy) Masked() string {
+	return p.scheme + "://" + p.addr
+}
+
+// redact 把本代理的口令/用户名从任意字符串里抹掉，并截断到 limit 字符。
+// 用于把底层错误串落到健康快照（错误可能回显 URL）。
+func (p *Proxy) redact(text string, limit int) string {
+	if p.pass != "" {
+		text = strings.ReplaceAll(text, p.pass, "***")
+	}
+
+	if p.user != "" {
+		text = strings.ReplaceAll(text, p.user, "***")
+	}
+
+	runes := []rune(text)
+	if len(runes) > limit {
+		return string(runes[:limit])
+	}
+
+	return text
+}
+
+// parseFourPartProxy 解析四段式 host:port:user:pass（按 socks5 落地）。
+// 错误信息一律不含原始串——它含口令。
+func parseFourPartProxy(raw string) (*Proxy, error) {
+	parts := strings.SplitN(raw, ":", 4)
+	if len(parts) != 4 {
+		return nil, errParseProxyFailed
+	}
+
+	host := strings.TrimSpace(parts[0])
+	if host == "" {
+		return nil, errProxyHost
+	}
+
+	portStr := strings.TrimSpace(parts[1])
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("proxy: 端口必须是 1..65535 的整数: %w", errParseProxyFailed)
+	}
+
+	return &Proxy{
+		raw:              raw,
+		scheme:           "socks5",
+		host:             host,
+		addr:             net.JoinHostPort(host, strconv.Itoa(port)),
+		user:             parts[2],
+		pass:             parts[3],
+		handshakeTimeout: handshakeTimeout,
+	}, nil
 }
 
 // dial 经本代理建立到 addr 的连接（network 仅支持 tcp）。
