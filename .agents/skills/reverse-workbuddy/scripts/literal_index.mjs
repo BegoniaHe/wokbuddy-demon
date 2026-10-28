@@ -136,6 +136,8 @@ if (args.compare) {
   for (const [value, row] of Object.entries(left.literals)) {
     if (!(value in right.literals)) removed.push({ value, count: row.count, files: Object.keys(row.files) });
   }
+  // --only-added：只留新增项，省掉 removed/changed 的噪音（本来就在头部注释里承诺过）
+  const onlyAdded = args['only-added'] === true;
   data = {
     left: a,
     right: b,
@@ -144,12 +146,12 @@ if (args.compare) {
       leftUnique: left.stats.unique,
       rightUnique: right.stats.unique,
       added: added.length,
-      removed: removed.length,
-      changed: changed.length,
+      removed: onlyAdded ? 0 : removed.length,
+      changed: onlyAdded ? 0 : changed.length,
     },
     added,
-    removed,
-    changed,
+    removed: onlyAdded ? [] : removed,
+    changed: onlyAdded ? [] : changed,
   };
 } else if (args.target) {
   data = emit(String(args.target));

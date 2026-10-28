@@ -141,9 +141,12 @@ for (const file of walkFiles(asar)) {
   const text = readText(file);
   if (text === null) continue;
   const destDir = path.join(destRoot, path.dirname(rel).replace(/[^A-Za-z0-9/_-]/g, '_'), path.basename(rel, '.js'));
+  // 先清空该文件的块目录：重跑时块数变少会留下上一轮的 chunk-NNN.js，
+  // 产物就不再「同一棵树跑两遍字节一致」。
+  fs.rmSync(destDir, { recursive: true, force: true });
   fs.mkdirSync(destDir, { recursive: true });
   const result = splitFile(asar, rel, text, destDir, factories);
-  report.files.push({ ...result, bytes: text.length, lines: countLines(text), outDir: path.relative(process.cwd(), destDir) });
+  report.files.push({ ...result, bytes: text.length, lines: countLines(text), outDir: path.relative(outRoot, destDir) });
   totalChunks += result.chunks.length;
   totalBytes += text.length;
 }

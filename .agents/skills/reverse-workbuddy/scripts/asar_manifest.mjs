@@ -41,7 +41,8 @@ function manifest(sel) {
   }
   return {
     target: sel,
-    asar: path.relative(process.cwd(), asar) || '.',
+    // 相对 root 而不是 cwd：否则同一棵树在不同目录下跑出不同字节，破坏「产物可复现」
+    asar: path.relative(root, asar) || '.',
     totalBytes: total,
     summary: { files: Object.keys(files).length, bytes: total, byKind: sortObject(byKind) },
     files: sortObject(files),

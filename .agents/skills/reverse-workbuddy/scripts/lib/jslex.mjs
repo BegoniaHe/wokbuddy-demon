@@ -48,10 +48,15 @@ function isDigit(c) {
   return c >= 48 && c <= 57;
 }
 
-function isRegexStart(prev) {
+// `)` 之后既可能是除法也可能是正则：只有闭合的是控制语句括号（`if(...)` / `for(...)`）
+// 时才是正则。压缩产物里 `for(let[n,s]of e)/^[a-z]/i.test(n)&&…` 很常见，
+// 不区分这一点就会把正则拆成三个 `/` 标点，排版后直接变成语法错误。
+const CONTROL_KEYWORDS = new Set(['if', 'for', 'while', 'with', 'switch', 'catch']);
+
+function isRegexStart(prev, afterCondParen = false) {
   if (prev === null) return true;
   if (prev.t === TOKEN.NAME) return REGEX_KEYWORDS.has(prev.v);
-  if (prev.t === TOKEN.PUNCT) return REGEX_PUNCT.has(prev.v);
+  if (prev.t === TOKEN.PUNCT) return prev.v === ')' ? afterCondParen : REGEX_PUNCT.has(prev.v);
   return false;
 }
 
@@ -161,14 +166,26 @@ function skipRegex(src, i) {
 
 /**
  * 核心分词循环。`onToken` 逐词回调，避免大文件把整棵 token 数组留在内存里。
- * token: { t: TOKEN.*, v: string, start: number, end: number }
+ * token: { t: TOKEN.*, v: string, start: number, end: number, nl: boolean }
+ *   `nl` 表示该 token 之前是否有换行（含中间的注释）。排版器靠它保住 ASI 边界：
+ *   换行在 JS 里是有语义的（`return\n{x}` 与 `return {x}` 不同），不能随手吞掉。
  * 字符串/模板串的 `v` 是不含定界符的原文（模板串里的 ${} 保留原样）。
  */
 export function lex(src, onToken) {
   let i = 0;
   let prev = null;
+  let prevEnd = 0;
+  // 括号栈只记「这个 `(` 是不是控制语句的括号」，用来判定 `)` 之后的 `/` 是正则还是除法
+  const parens = [];
+  let afterCondParen = false;
   const emit = tok => {
+    tok.nl = tok.start > prevEnd && src.slice(prevEnd, tok.start).includes('\n');
     onToken(tok);
+    prevEnd = tok.end;
+    if (tok.t === TOKEN.PUNCT) {
+      if (tok.v === '(') parens.push(Boolean(prev && prev.t === TOKEN.NAME && CONTROL_KEYWORDS.has(prev.v)));
+      else if (tok.v === ')') afterCondParen = parens.pop() === true;
+    }
     if (tok.t !== TOKEN.COMMENT) prev = tok;
   };
   while (i < src.length) {
@@ -209,7 +226,7 @@ export function lex(src, onToken) {
       continue;
     }
     // 正则
-    if (c === 47 && isRegexStart(prev)) {
+    if (c === 47 && isRegexStart(prev, afterCondParen)) {
       const end = skipRegex(src, i);
       if (end <= src.length && end > i + 1) {
         emit({ t: TOKEN.REGEX, v: src.slice(i + 1, end), start: i, end });
