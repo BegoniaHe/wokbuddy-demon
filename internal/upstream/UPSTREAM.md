@@ -132,10 +132,16 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | custom model 的 `X-Private-Data` | 不适用 | 本仓没有 custom 模型上游路由（`isCustomModel` 仅用于模型目录可见性），无触达路径 |
 
 活跃上报 `/v2/report` 的 `chat_request_send` 事件按 CN 5.9.3 形状发（#366）：删掉
-`maxToken` / `maxSteps` / `temperature` / `maxRetries` / `skillCount` / `totalCount` 与
-`fileUri`；补 `isMaxMode`（网关无 thinking 覆盖状态 → `false`）、`source` / `inputAttemptId` /
-`connectorId`（官方条件发，网关无状态则整键不发）、`vcsType` / `vcsRepo` / `vcsBranchName` /
-`vcsRevId`（无工作区 → 空串）；`agentType` 发 `main`，`agentName` 取官方空值形态。
+`maxToken` / `maxSteps` / `temperature` / `maxRetries` / `skillCount` / `totalCount`；
+补 `isMaxMode`（网关无 thinking 覆盖状态 → `false`）、`source` / `inputAttemptId` /
+`connectorId`（官方条件发，网关无状态则整键不发）；`agentType` 发 `main`，`agentName`
+取官方空值形态。
+
+`fileUri` 保留为空串、**不发** `vcsType` / `vcsRepo` / `vcsBranchName` / `vcsRevId`：
+包内 `VcsInfoProcessor.process({event})` 是 `let i=event.fileUri; if(i&&"string"==typeof i)
+try{写入 vcs* 四键}catch{}finally{delete event.fileUri}`——只有工作区路径非空时才替换成
+四元组。网关没有工作区，官方在同一形态下发的是 `fileUri: ""` 且四键缺席，补四个空串
+反而是官方从不出现的组合。
 该事件的键集会否被上游校验未知，改动后建议做一次账号回归（点亮 growth 连登与
 `first_buddy` 任务）。
 

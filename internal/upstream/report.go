@@ -200,9 +200,16 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 // `reportChatRequestSendTelemetry()`，issue #366）。
 //
 // 与 5.8.x 的差异：删掉 maxToken / maxSteps / temperature / maxRetries / skillCount /
-// totalCount（5.9.3 不再发）与 fileUri（被 VcsInfoProcessor 换成 vcs* 四元组）；
-// 新增 isMaxMode（网关无 thinking 覆盖状态，按官方默认 false）以及 source /
-// inputAttemptId / connectorId（官方是条件发，网关取不到就整键不发，不伪造）。
+// totalCount（5.9.3 不再发）；新增 isMaxMode（网关无 thinking 覆盖状态，按官方默认
+// false）以及 source / inputAttemptId / connectorId（官方是条件发，网关取不到就整键
+// 不发，不伪造）。
+//
+// fileUri / vcs* 的具体形态由 VcsInfoProcessor 决定：它拿事件里的 fileUri 当工作区
+// 路径，**只有 fileUri 是非空字符串时**才写 vcsType / vcsRepo / vcsBranchName /
+// vcsRevId 并删掉 fileUri（`if(e&&"string"==typeof e)try{…}finally{delete e.fileUri}`）。
+// 网关没有工作区，fileUri 为空串，处理器不会改写——所以官方在这一形态下发的是
+// `fileUri: ""` 且**没有** vcs* 四键；发四个空串 vcs 键反而是官方从不出现的组合。
+//
 // agentType 只可能是 main / subagent / team，网关模拟本地主会话故发 main；
 // agentName 取官方 `agentName || meta.agentName` 的空值形态（不写死 "default"）。
 // userId 为必填字段（= a.UID）；conversationId 由调用方生成，无需真实会话。
@@ -233,10 +240,7 @@ type chatRequestEvent struct {
 	ExpertID              string `json:"expertId"`
 	RecommendID           string `json:"recommendId"`
 	SkillID               string `json:"skillId"`
-	VCSType               string `json:"vcsType"`
-	VCSRepo               string `json:"vcsRepo"`
-	VCSBranchName         string `json:"vcsBranchName"`
-	VCSRevID              string `json:"vcsRevId"`
+	FileURI               string `json:"fileUri"`
 	PresentAt             int64  `json:"presentAt"`
 	TraceID               string `json:"traceId"`
 	RootRequestID         string `json:"rootRequestId"`
@@ -284,7 +288,7 @@ func (c *Client) ReportChatActivityModel(
 }
 
 // newChatRequestEvent 构造 chat_request_send 事件；字段为零值即为官方默认。
-// vcs* 四元组恒发空串：官方在无 Git 工作区时就是空串形态（不是不发）。
+// fileUri 恒发空串：网关没有工作区，官方在该形态下也不会产生 vcs* 四键。
 func newChatRequestEvent(
 	account *auth.Auth, conversationID, requestID, modelID, modelName string,
 ) chatRequestEvent {
@@ -316,10 +320,7 @@ func newChatRequestEvent(
 		ExpertID:             "",
 		RecommendID:          "",
 		SkillID:              "",
-		VCSType:              "",
-		VCSRepo:              "",
-		VCSBranchName:        "",
-		VCSRevID:             "",
+		FileURI:              "",
 		PresentAt:            now,
 		TraceID:              requestID,
 		RootRequestID:        requestID,
