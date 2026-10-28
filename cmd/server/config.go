@@ -278,13 +278,13 @@ type Config struct {
 		// 让 CN 域指向自建/自选入口时，回落到官方域会绕过该入口。
 		// 注意本 fork 的默认域已经是 workbuddy.cn 且自带回落链，常规部署无需设置。
 		ChatBase string `json:"chat_base"`
-		// BillingBase 国内版（cn realm）billing / 签到 / 活跃上报 base 覆盖；
-		// 空 = 保持内置 https://www.codebuddy.cn（默认行为不变）。
+		// BillingBase 国内版（cn realm）billing / 签到 / 活跃上报 base 覆盖。
+		// 空 = 内置默认 https://www.workbuddy.cn（与官方 5.9.3 桌面一致：billing /
+		// 签到 / 活跃上报全部打产品域，真机 14 条业务请求 0 条打 codebuddy.cn）。
 		//
-		// 官方桌面把签到 / 资源 / 增长事件发到产品 endpoint https://www.workbuddy.cn；
-		// 本仓默认仍保留 codebuddy.cn，直至用真实 CN token 实测确认后再决定是否切换。
+		// 灰度逃生门：显式填 https://www.codebuddy.cn 可退回旧口径。
 		// 影响 billing / 签到 / 活跃上报（report.go，走 billingBase）；不影响 growth 任务 /
-		// 旅行（走 chatBase）、桌面 /v2/report（走 desktopBase → chatBase）、Web 上报
+		// 旅行（走 chatBase）、桌面 /v2/report（走 chatBase）、Web 上报
 		// （走 webBase）与小程序埋点（固定 codebuddy.cn）。
 		BillingBase string `json:"billing_base"`
 	} `json:"cn"`

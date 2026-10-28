@@ -1322,7 +1322,7 @@ type Client struct {
 	// 且回调失败不影响余额查询主路径（账本只是观测附属物）。
 	BalanceObserver func(uid string, remain, total int64)
 	ChatBaseCN      string
-	BillingBaseCN   string // billing 域默认 codebuddy.cn；可用 cn.billing_base 覆盖（MP 埋点不跟随）。
+	BillingBaseCN   string // billing 域默认 workbuddy.cn；可用 cn.billing_base 覆盖（MP 埋点不跟随）。
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
 	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
 	WebBaseCN string
@@ -1355,7 +1355,7 @@ func New() *Client {
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		ChatBaseCN:    defaultCNChatBase,
-		BillingBaseCN: "https://www.codebuddy.cn",
+		BillingBaseCN: defaultCNBillingBase,
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
@@ -1415,6 +1415,11 @@ const officialGlobalBase = "https://www.codebuddy.ai"
 // CN 官方 origin 顺序：workbuddy.cn 为主，copilot.tencent.com / wb.tencentbuddy.com
 // 为兜底（仅在首 token 前可重放）。显式覆盖 chat base 时只用该值。
 const defaultCNChatBase = "https://www.workbuddy.cn"
+
+// defaultCNBillingBase CN 缺省 billing base：官方桌面 5.9.3 的 billing / 签到 /
+// 活跃上报全部打产品域 workbuddy.cn（真机 14 条业务请求 0 条打 codebuddy.cn）。
+// 需要退回旧口径时显式配置 cn.billing_base。
+const defaultCNBillingBase = "https://www.workbuddy.cn"
 
 var cnChatFallbackBases = []string{
 	"https://copilot.tencent.com",

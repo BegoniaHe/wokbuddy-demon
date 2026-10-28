@@ -22,11 +22,11 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
-// reportPath 活跃上报通道（实测）。默认走 CN billing 域（codebuddy.cn，可用
-// cn.billing_base 覆盖）；桌面 /v2/report 是另一条 surface，走 webBase。
+// reportPath 活跃上报通道（实测）。默认走 CN billing 域（workbuddy.cn，可用
+// cn.billing_base 退回 codebuddy.cn）；桌面 /v2/report 是另一条 surface，走 webBase。
 const reportPath = "/v2/report"
 
-// billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
+// billingJSON 发 billing 域（billingBase，workbuddy.cn）请求并解信封；body 为 nil 时不带请求体。
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + growth 头族；billing 域走 billingBase）。
 // checkin / balance 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
 // 活跃上报走 reportJSON（surfaceReport 头族），不在此列。
