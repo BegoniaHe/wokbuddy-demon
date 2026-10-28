@@ -113,10 +113,10 @@ func (c *Client) userAgent(a *auth.Auth) string {
 }
 
 // billingUA billing 域 report / banner 类显式 UA：单段 `WorkBuddy/<clientVersion>`
-// （官方 banner/上报显式覆写形态，不带 CLI 段）。默认 billing meter 请求**不发** UA，
-// 该值只用于 report 这类显式 UA 的例外面（见 billingReportUA）。
-// 默认取 profile 字面量；显式 client_version 覆盖时按该版本拼装；
-// client_name="SaaS" 才不设 UA（Go 默认 UA）。
+// （官方 banner/上报显式覆写形态，不带 CLI 段）。billing meter 默认走桌面全局
+// UA 拦截器（desktopUAFor 三段式），该值只用于 report 这类显式覆写的例外面
+// （见 billingReportUA）。默认取 profile 字面量；显式 client_version 覆盖时按该版本
+// 拼装；client_name="SaaS" 返回空串（不写 UA 键，回落 Go 默认 UA）。
 func (c *Client) billingUA(account *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
@@ -133,9 +133,11 @@ func (c *Client) billingUA(account *auth.Auth) string {
 	return "WorkBuddy/" + c.clientVersionFor(account)
 }
 
-// billingReportUA billing 域 /v2/report 的 UA：官方桌面端在该面显式发
-// `WorkBuddy/<ver>`（与 banner / 白名单类同形），是 billing 默认不发 UA 的唯一例外。
-// 显式 user_agent 优先，其余回落 billingUA；空串表示不发（client_name="SaaS"）。
+// billingReportUA billing 域 /v2/report 的 UA：官方桌面端在该面显式发单段
+// `WorkBuddy/<ver>`（与 banner / 白名单类同形），是 billing 域里唯一的单段 UA
+// 例外——其余 billing 端点走 desktopUAFor 三段式（RestOperations 全局拦截器）。
+// 显式 user_agent 优先，其余回落 billingUA；空串表示不写 UA 键、回落 Go 默认 UA
+// （client_name="SaaS"）。
 func (c *Client) billingReportUA(a *auth.Auth) string {
 	if c != nil && c.UserAgent != "" {
 		return c.UserAgent
@@ -482,7 +484,8 @@ func validTraceID(str string) bool {
 }
 
 // attributionClientName 生效的自定义归属名：ClientName 非空取之；空 = 默认官方桌面端
-// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。仅 billingUA 用它判断是否禁用 UA。
+// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。billingUA 与 BillingHeaders
+// 共用它判断是否禁用 UA。
 func (c *Client) attributionClientName() string {
 	if c != nil && c.ClientName != "" {
 		return c.ClientName
@@ -491,14 +494,18 @@ func (c *Client) attributionClientName() string {
 	return "WorkBuddy"
 }
 
-// privateDataHeaderValue 返回 X-Private-Data 的取值（chat 与桌面专家路径同口径）：
+// privateDataHeaderValue 返回 CLI chat 的 X-Private-Data 取值。
 // CN 5.9.3 官方 `applyPrivateDataHeaderPolicy` 在个人号的默认分支发 false，
-// 企业号因 `isEnterpriseEdition` 命中同一判定而发 true；global 基线仍是 5.8.4，
-// 旧逻辑发 true，等 global 升到 5.9.x 后按同一逻辑复核。
+// 企业号因 `isEnterpriseEditionAccount`（enterpriseId 非空或 type 为
+// ultimate / exclusive）命中同一判定而发 true；global 基线仍是 5.8.4，
+// 只走 `DisableYuanbaoChannel=true` → `h=false` → true，等 global 升到 5.9.x
+// 后按同一逻辑复核。
 // 远端 abTest（DefaultModelOptimizationOff）与会话 meta `privateDataSticky`
 // 都不在网关范围：本仓没有这两类状态来源，只对齐静态默认分支。
+// 桌面专家 chat 路径不走本函数：官方桌面 `applyGatewayHeaders` 的兜底表
+// 硬编码 true，见 setDesktopExpertHeaders。
 func privateDataHeaderValue(account *auth.Auth) string {
-	if account != nil && (account.IsGlobal() || account.IsEnterprise()) {
+	if account != nil && (account.IsGlobal() || account.IsEnterpriseEdition()) {
 		return "true"
 	}
 
@@ -511,7 +518,7 @@ func privateDataHeaderValue(account *auth.Auth) string {
 // 默认（ClientName 空）对齐官方桌面端 chat 指纹：
 //
 //	X-Agent-Purpose=conversation、X-Agent-Intent=craft、X-Agent-Type=main、
-//	X-Private-Data=<CN 个人 false / 企业或 global true，见 privateDataHeaderValue>、
+//	X-Private-Data=<见 privateDataHeaderValue>、
 //	X-IDE-Name/Type=WorkBuddy、X-IDE-Version=<realm 版本>、X-Product=SaaS（=deploymentType）。
 //
 // 显式 ClientName 非空时 X-Product 与 X-IDE-Name/Type 跟随该值（自定义归因逃生门）。
@@ -602,14 +609,15 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 
 // BillingHeaders billing 接口请求头。
 // 官方 5.9.3 的 billing `buildHeaders` 只有 Accept / Authorization / Content-Type /
-// X-User-Id（外加按需的企业与 X-Domain 头）：没有 UA、没有 Accept-Language、
-// 没有 X-Requested-With，也没有 X-Device-Token（签到单独注入，见
-// Client.checkinHeaders）。例外是 billing 域 /v2/report 的显式 UA，见
+// X-User-Id（外加按需的企业与 X-Domain 头），没有 Accept-Language、没有
+// X-Requested-With，也没有 X-Device-Token（签到单独注入，见 Client.checkinHeaders）。
+// 但 billing 的 `context.http` 来自 `createMainProcessHttp` → CellJS RestOperations，
+// 全局注册了 `WorkbuddyUserAgentHttpInterceptor`，默认 UA 是桌面三段式
+// （desktopUAFor），不是空串。例外是 billing 域 /v2/report 的显式单段 UA，见
 // Client.billingReportUA。
 //
-// 默认路径必须显式压掉 Go 默认 UA：net/http 只在请求头不存在 User-Agent 键时
-// 回填 Go-http-client/1.1；这里写入空值让 transport 直接省略该头（空值不写出）。
-// 显式配置 c.UserAgent 时仍发用户值（逃生门）。
+// 显式配置 c.UserAgent 时优先发用户值；`client_name="SaaS"` 是显式逃生门，
+// 此时不写 User-Agent 键，保留 Go transport 的默认 UA（旧行为）。
 func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 	// AccessToken 加锁快照（同 ChatHeaders：keepalive 可在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account6.AccessTokenValue())
@@ -619,8 +627,9 @@ func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
-	} else {
-		req.Header.Set("User-Agent", "")
+	} else if c.attributionClientName() != "SaaS" {
+		// client_name="SaaS" 是显式逃生门：不注入桌面 UA，保留 Go 默认 UA。
+		req.Header.Set("User-Agent", c.desktopUAFor(account6))
 	}
 
 	if account6.UID != "" {

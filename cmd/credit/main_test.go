@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,7 +51,7 @@ func TestNewUserResourceRequestNestedAndFlat(t *testing.T) {
 
 			account := parseTestAuth(t, testCase.raw)
 
-			req, err := newUserResourceRequest(account)
+			req, err := newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account)
 			if err != nil {
 				t.Fatalf("newUserResourceRequest: %v", err)
 			}
@@ -78,8 +79,8 @@ func TestNewUserResourceRequestNestedAndFlat(t *testing.T) {
 	}
 }
 
-// TestUserResourceRequestUsesIssuingDomain 三域映射与路径前缀保持不变：
-// codebuddy.ai / workbuddy.ai 无 /v2，codebuddy.cn 带 /v2。
+// TestUserResourceRequestUsesIssuingDomain 三域映射保持不变，首候选路径统一为
+// 无 `/v2` 前缀（官方 5.9.3 resourcePrefix 为空串，两 realm 同形）。
 func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 	t.Parallel()
 
@@ -91,7 +92,7 @@ func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 		{
 			name: "国内站",
 			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"}}`,
-			want: "https://www.codebuddy.cn/v2/billing/meter/get-user-resource",
+			want: "https://www.codebuddy.cn/billing/meter/get-user-resource",
 		},
 		{
 			name: "官方国际站",
@@ -119,7 +120,9 @@ func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			req, err := newUserResourceRequest(parseTestAuth(t, testCase.raw))
+			account := parseTestAuth(t, testCase.raw)
+
+			req, err := newUserResourceRequest(billingBaseFor(account), userResourcePaths()[0], account)
 			if err != nil {
 				t.Fatalf("newUserResourceRequest: %v", err)
 			}
@@ -326,5 +329,67 @@ func TestCollectAccountsRefreshFailureRow(t *testing.T) {
 
 	if !strings.HasPrefix(accounts[0].Error, "refresh: ") {
 		t.Errorf("error=%q want refresh: prefix", accounts[0].Error)
+	}
+}
+
+// TestFetchUserResourceFallsBackOn404 无前缀路径 404 时换 `/v2` 重试，且成功响应正常聚合。
+func TestFetchUserResourceFallsBackOn404(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+
+		if r.URL.Path == "/billing/meter/get-user-resource" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{
+			"TotalDosage":0,
+			"Accounts":[{"CapacityRemain":30,"CapacityUsed":70,"CapacitySize":100}]
+		}}}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	account := parseTestAuth(t, `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"},"account":{"uid":"u-fb"}}`)
+
+	remain, used, size, packs, err := fetchUserResourceAt(srv.Client(), srv.URL, account)
+	if err != nil {
+		t.Fatalf("fetchUserResourceAt: %v", err)
+	}
+
+	if want := []string{"/billing/meter/get-user-resource", "/v2/billing/meter/get-user-resource"}; !slices.Equal(paths, want) {
+		t.Errorf("paths=%v want %v", paths, want)
+	}
+
+	if remain != 30 || used != 70 || size != 100 || packs != 1 {
+		t.Errorf("remain/used/size/packs=%d/%d/%d/%d", remain, used, size, packs)
+	}
+}
+
+// TestFetchUserResourceNoFallbackOnOther4xx 非 404 的 4xx 不换路径（鉴权/参数错误重试无益）。
+func TestFetchUserResourceNoFallbackOnOther4xx(t *testing.T) {
+	t.Parallel()
+
+	var paths []string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	t.Cleanup(srv.Close)
+
+	account := parseTestAuth(t, `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"},"account":{"uid":"u-401"}}`)
+
+	if _, _, _, _, err := fetchUserResourceAt(srv.Client(), srv.URL, account); err == nil {
+		t.Fatal("401 应返回错误")
+	}
+
+	if want := []string{"/billing/meter/get-user-resource"}; !slices.Equal(paths, want) {
+		t.Errorf("paths=%v want %v", paths, want)
 	}
 }

@@ -21,9 +21,9 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 域只有 /v2/report 显式发
-// 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组），billing meter 默认不发 UA。
-// 显式 client_name="SaaS" 才还原"report 也不设 UA"的旧行为。
+// chat/refresh 与 billing meter 都走桌面全局 UA 拦截器的三段式；billing 只有
+// /v2/report 显式发单段 WorkBuddy/<ver>（官方 banner 白名单头组）。
+// 显式 client_name="SaaS" 才还原旧行为：不写 UA 键，回落 Go 默认 UA。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	t.Parallel()
 
@@ -350,6 +350,7 @@ func TestBillingReportUA(t *testing.T) {
 		{"profile_default", &Client{ClientName: "WorkBuddy", Profile: testProfileSet(t)}, billingUAWorkBuddy},
 		{"client_version_override", &Client{ClientName: "WorkBuddy", ClientVersion: "6.0.0"}, billingUACustomVer},
 		{"explicit_user_agent", &Client{ClientName: "WorkBuddy", UserAgent: billingUAAgentString}, billingUAAgentString},
+		{"saas_no_ua", &Client{ClientName: "SaaS", Profile: testProfileSet(t)}, ""},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -382,20 +383,17 @@ func TestBillingReportUA(t *testing.T) {
 	}
 }
 
-// TestBillingHeadersDefaultNoUA 官方 billing `buildHeaders` 没有 UA：默认 meter
-// 请求在服务端看不到 User-Agent 键（显式压空串让 Go transport 省略该头）；
-// billingUA() 仍保留给 report 用，显式 client_name="SaaS" 时为空。
-func TestBillingHeadersDefaultNoUA(t *testing.T) {
+// TestBillingHeadersDefaultDesktopUA 官方 billing `buildHeaders` 本身不带 UA，
+// 但 `context.http` 的 RestOperations 注册了 WorkbuddyUserAgentHttpInterceptor，
+// 默认 meter 请求最终带桌面三段式 UA；billingUA() 仍保留给 report 用。
+func TestBillingHeadersDefaultDesktopUA(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
 
-	var present bool
-
 	var got string
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, present = r.Header["User-Agent"]
 		got = r.Header.Get("User-Agent")
 
 		w.WriteHeader(http.StatusOK)
@@ -413,8 +411,8 @@ func TestBillingHeadersDefaultNoUA(t *testing.T) {
 		t.Fatalf("userResource: %v", err)
 	}
 
-	if present {
-		t.Errorf("billing meter 请求带了 User-Agent = %q，want 无该头", got)
+	if want := client.desktopUAFor(account); got != want {
+		t.Errorf("billing meter UA = %q want %q（桌面全局拦截器）", got, want)
 	}
 
 	if ua := client.billingUA(account); ua != "WorkBuddy/6.0.0" {
@@ -424,6 +422,15 @@ func TestBillingHeadersDefaultNoUA(t *testing.T) {
 	client.ClientName = "SaaS"
 	if ua := client.billingUA(account); ua != "" {
 		t.Errorf("billingUA() SaaS = %q want empty", ua)
+	}
+
+	// client_name="SaaS" 是显式逃生门：不写桌面 UA 键，回落 Go 默认 UA。
+	if _, _, err := client.UserResource(account); err != nil {
+		t.Fatalf("userResource SaaS: %v", err)
+	}
+
+	if got != "Go-http-client/1.1" {
+		t.Errorf("SaaS billing meter UA = %q want %q", got, "Go-http-client/1.1")
 	}
 }
 

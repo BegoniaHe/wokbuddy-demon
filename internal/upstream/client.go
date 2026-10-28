@@ -1282,7 +1282,8 @@ type Client struct {
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认形态）。
 	// 空 = 按 realm 取部署 profile 的冻结字面量：chat/refresh/FetchModels 用
-	// emit.chatUA，billing/checkin/banner 用 emit.billingUA。
+	// emit.chatUA；billing meter / 签到 / growth 走 emit.desktopUA（RestOperations
+	// 全局拦截器）；emit.billingUA 只服务 /v2/report 与 banner 这类显式单段面。
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
@@ -1549,16 +1550,16 @@ const (
 )
 
 // billingMeterPaths 返回 billing/meter 域路径候选序列：两 realm 一致的无前缀优先、
-// 404 回落 `/v2`。官方桌面端 `resourcePrefix` 为空串，故不再按 realm 分叉；
+// 404 回落 `/v2`。官方桌面端 `resourcePrefix` 为空串，故不按 realm 分叉；
 // 签到例外见 checkinMeterPaths。仅作用于 /billing/meter/* 族；report `/v2/report`
 // 不参与，其他 billing 端点（growth 等）路径不含 /billing/meter 前缀，走原常量不受影响。
-func (*Client) billingMeterPaths(*auth.Auth) []string {
+func billingMeterPaths() []string {
 	return []string{billingMeterPath, billingMeterPathV2}
 }
 
 // checkinMeterPaths 签到路径候选：两 realm 均 `/v2` 优先，404 时回落无 `/v2`
 // （官方 DesktopAccountRepo.billingPrefix=/v2；旧路径保留 fallback）。
-func (*Client) checkinMeterPaths(a *auth.Auth) []string {
+func checkinMeterPaths() []string {
 	return []string{dailyCheckinPathV2, dailyCheckinPath}
 }
 
@@ -3633,7 +3634,7 @@ func (c *Client) CreditPackages(account2 *auth.Auth) ([]CreditPackage, int64, in
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
 
-	data, err := c.billingMeterJSON(account2, c.billingMeterPaths(account2), body)
+	data, err := c.billingMeterJSON(account2, billingMeterPaths(), body)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -4487,7 +4488,7 @@ func (c *Client) personalResource(
 	err := c.retryBillingTransient(func() error {
 		var e error
 
-		data, e = c.billingMeterJSON(account, c.billingMeterPaths(account), body)
+		data, e = c.billingMeterJSON(account, billingMeterPaths(), body)
 
 		return e
 	})
@@ -4838,7 +4839,7 @@ func cyclePackageAmounts(account respAccount) (remain, used, size int64) {
 // 签到是 X-Device-Token 的两个消费点之一（另一个是 auth/state），见 checkinHeaders。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
 	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSONHeaders(a, c.checkinMeterPaths(a), map[string]any{}, c.checkinHeaders(a))
+		_, err := c.billingMeterJSONHeaders(a, checkinMeterPaths(), map[string]any{}, c.checkinHeaders(a))
 		return err
 	})
 }

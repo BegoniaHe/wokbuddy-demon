@@ -47,9 +47,9 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 		t.Errorf("UA=%q want %q", gotUA, want)
 	}
 
-	// body 的 userAgent 与上报头同源，os 对齐 navigator.platform（Win32）。
-	if want := client.desktopUAFor(account); got[0]["userAgent"] != want {
-		t.Errorf("userAgent=%v want %q（与桌面上报 UA 同源）", got[0]["userAgent"], want)
+	// body 的 userAgent 取 Electron 主进程 navigator.userAgent，与 HTTP 头不同源。
+	if got[0]["userAgent"] != desktopReportUA {
+		t.Errorf("userAgent=%v want %q（navigator.userAgent）", got[0]["userAgent"], desktopReportUA)
 	}
 
 	if got := got[0]["os"]; got != "Win32" {
@@ -260,21 +260,21 @@ func TestDesktopFingerprintPerRealm(t *testing.T) {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
 
-	assertDesktopUAAndOS(t, cnFP, client, cnAccount, "CN")
+	assertDesktopReportUAAndOS(t, cnFP, "CN")
 
 	if got, want := client.desktopUAFor(globalAccount), "workbuddy-ai/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
 	}
 
-	assertDesktopUAAndOS(t, globalFP, client, globalAccount, "global")
+	assertDesktopReportUAAndOS(t, globalFP, "global")
 }
 
-// assertDesktopUAAndOS 断言指纹的 userAgent 与桌面上报 UA 同源、os 对齐 Win32。
-func assertDesktopUAAndOS(t *testing.T, fingerprint map[string]any, client *Client, account *auth.Auth, realm string) {
+// assertDesktopReportUAAndOS 断言 body 的 userAgent 取 navigator 形态、os 对齐 Win32。
+func assertDesktopReportUAAndOS(t *testing.T, fingerprint map[string]any, realm string) {
 	t.Helper()
 
-	if want := client.desktopUAFor(account); fingerprint["userAgent"] != want {
-		t.Errorf("%s userAgent=%v want %q", realm, fingerprint["userAgent"], want)
+	if fingerprint["userAgent"] != desktopReportUA {
+		t.Errorf("%s userAgent=%v want %q", realm, fingerprint["userAgent"], desktopReportUA)
 	}
 
 	if fingerprint["os"] != "Win32" {
@@ -464,10 +464,11 @@ func TestReadServerRequestIDSkipsInvalidID(t *testing.T) {
 	}
 }
 
-// TestDesktopExpertHeadersPrivateDataPerRealm 桌面专家路径与 chat 同口径：
-// X-Private-Data 取 privateDataHeaderValue（CN 个人 false / 企业或 global true），
-// 避免两条 chat 出口出现第三种取值（issue #343）。
-func TestDesktopExpertHeadersPrivateDataPerRealm(t *testing.T) {
+// TestDesktopExpertHeadersPrivateDataAlwaysTrue 桌面专家路径是桌面主进程 chat
+// surface：官方 `applyGatewayHeaders` 的兜底表 `VF` 与 `buildVlmGatewayHeaders`
+// 都把 X-Private-Data 硬编码为 true（CN 5.9.3 / global 5.8.4 同形），与 CLI chat
+// 的 privateDataHeaderValue 分属两条 surface，不能共用（issue #343 / #348）。
+func TestDesktopExpertHeadersPrivateDataAlwaysTrue(t *testing.T) {
 	t.Parallel()
 
 	client := newProfileClient(t)
@@ -477,7 +478,7 @@ func TestDesktopExpertHeadersPrivateDataPerRealm(t *testing.T) {
 		account *auth.Auth
 		want    string
 	}{
-		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "false"},
+		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "true"},
 		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
 		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
 	}
