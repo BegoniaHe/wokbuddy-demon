@@ -593,12 +593,15 @@ export function ConfigView() {
                   {clears.device_token ? '取消清除' : '清除'}
                 </Button>
               </div>
-              <FieldDescription>已设置时留空保持不变；点「清除」保存后置空；账号级 token 优先；需重启</FieldDescription>
+              <FieldDescription>
+                只在签到（daily-checkin / checkin-activity-status）注入，官方仅这两处消费；已设置时留空保持不变；点「清除」保存后置空；账号级
+                token 优先；需重启
+              </FieldDescription>
             </Field>
             <Field>
               <FieldLabel>设备 Token 文件</FieldLabel>
               {text('device_token_file', { placeholder: '留空 = 不读取文件' })}
-              <FieldDescription>桌面端落盘 token 路径，5 分钟读取缓存；需重启</FieldDescription>
+              <FieldDescription>桌面端落盘 token 路径，5 分钟读取缓存；同样只用于签到；需重启</FieldDescription>
             </Field>
           </div>
           {check('passthrough_ip', '向上游透传客户端 IP', '默认关闭；开启前确认反代信任边界，需重启')}
