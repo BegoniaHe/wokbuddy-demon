@@ -216,6 +216,9 @@ node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn --cap
 - `references/protocol-anchors.md`：协议面事实源与本仓库 `path:line` 锚点速查。
 - `references/rea-toolchain.md`：REA 静态分析编排（ASAR 应用图、版本比对、
   抓包归档归纳）与约束。默认先用 `scripts/protocol_sweep.mjs`，不够再上 REA。
+- `references/mechanical-tools.md`：跨版本机械整理脚本（清单 / 依赖图 / 导出面 /
+  字面量 / 格式化 / 重命名 / 拆块）的用法、推荐顺序与事实边界。需要跨版本
+  结构化对比时先读它，不要人肉读压缩单行文件。
 - `scripts/download_latest.mjs`：查官方更新接口并下载 cn / global 最新包。
 - `scripts/extract_asar.mjs`：ASAR 提取；`scripts/protocol_sweep.mjs`：粗扫。
 - `scripts/runtime_probe.mjs`：opt-in Wine 运行时探针；隔离输出、白名单头、

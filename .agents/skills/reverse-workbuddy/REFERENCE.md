@@ -7,6 +7,9 @@
   同步该文件与校验器。
 - `references/protocol-anchors.md`：协议面事实源与锚点速查（端点 / 头族 /
   realm 常量在本仓库的 `path:line`）。调研时先读它，再打开对应文件核实。
+- `references/mechanical-tools.md`：跨版本机械整理脚本用法与事实边界。八个脚本
+  只扫 `.tmp/workbuddy/<realm>/<ver>/app-asar/`、只往 `.tmp/` 落产物，join key
+  只用相对路径与可读导出名；跨版本比对先跑 `asar_manifest.mjs` 再按需下钻。
 - `scripts/extract_asar.mjs`：从 `.app/Contents/Resources/app.asar` 提取文件树。
   用法（在解包目标版本目录下）：
 
