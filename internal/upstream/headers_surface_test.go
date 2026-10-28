@@ -677,3 +677,105 @@ func TestRefreshHeadersMatchCapture(t *testing.T) {
 		t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
 	}
 }
+
+// TestReportHeadersGoldenSet /v2/report 真机头集：三段式 UA（不是 billing meter 的
+// axios 串）、`Content-Type: application/json;charset=UTF-8`、宽松 Accept、带
+// X-Request-ID；键集精确相等（#367）。
+func TestReportHeadersGoldenSet(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/report", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ReportHeaders(req, account)
+
+	assertHeaderKeys(t, req,
+		"Accept", "Authorization", "Content-Type", "User-Agent", "X-Domain",
+		"X-Request-Id", "X-User-Id",
+	)
+
+	for name, want := range map[string]string{
+		"Accept":       "application/json, text/plain, */*",
+		"Content-Type": "application/json;charset=UTF-8",
+		"User-Agent":   defaultUAString, // 三段式 desktop surface UA
+		"X-Domain":     "www.workbuddy.cn",
+	} {
+		if got := req.Header.Get(name); got != want {
+			t.Errorf("%s=%q want %q", name, got, want)
+		}
+	}
+}
+
+// TestBillingBaseDefaultsToWorkbuddyCN billing / 签到 / 活跃上报默认打 workbuddy.cn：
+// 官方 5.9.3 桌面全部走产品域，真机 0 条打 codebuddy.cn（#367）。
+func TestBillingBaseDefaultsToWorkbuddyCN(t *testing.T) {
+	t.Parallel()
+
+	var hosts []string
+
+	client := &Client{
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			hosts = append(hosts, r.URL.Host)
+			return jsonResp(200, `{"code":0,"data":{"packages":[]}}`), nil
+		})},
+		ChatBaseCN:    "https://www.workbuddy.cn",
+		WebBaseCN:     "https://www.workbuddy.cn",
+		GlobalEnabled: false,
+	}
+	client.BillingBaseCN = defaultCNBillingBase
+
+	account := surfaceGoldenAccount()
+
+	if err := client.ReportChatActivity(account, "conv-id", ""); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	if _, _, err := client.UserResource(account); err != nil {
+		t.Fatalf("userResource: %v", err)
+	}
+
+	if len(hosts) == 0 {
+		t.Fatal("未观察到 billing 域请求")
+	}
+
+	for _, host := range hosts {
+		if host != "www.workbuddy.cn" {
+			t.Errorf("billing 请求 host=%q want www.workbuddy.cn", host)
+		}
+	}
+
+	// New() 的内置默认值同样是 workbuddy.cn。
+	if got := New().BillingBaseCN; got != "https://www.workbuddy.cn" {
+		t.Errorf("New().BillingBaseCN=%q want https://www.workbuddy.cn", got)
+	}
+}
+
+// TestBillingBaseOverrideStillWorks 显式覆盖 cn.billing_base 时全量跟随（灰度逃生门）。
+func TestBillingBaseOverrideStillWorks(t *testing.T) {
+	t.Parallel()
+
+	var hosts []string
+
+	client := &Client{
+		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+			hosts = append(hosts, r.URL.Host)
+			return jsonResp(200, `{"code":0}`), nil
+		})},
+		GlobalEnabled: false,
+		ChatBaseCN:    "https://www.workbuddy.cn",
+		BillingBaseCN: "https://www.codebuddy.cn",
+	}
+
+	if err := client.ReportChatActivity(surfaceGoldenAccount(), "conv-id", ""); err != nil {
+		t.Fatalf("report: %v", err)
+	}
+
+	if len(hosts) != 1 || hosts[0] != "www.codebuddy.cn" {
+		t.Fatalf("hosts=%v want [www.codebuddy.cn]", hosts)
+	}
+}
