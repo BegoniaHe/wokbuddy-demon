@@ -33,6 +33,7 @@ var ErrNotApplied = errors.New("没有可还原的写入记录")
 var (
 	errAPIKey        = errors.New("api_key 不能为空")
 	errBaseURLHTTPS  = errors.New("base_url 必须是 http(s) 地址")
+	errModelList     = errors.New("models 含非法项")
 	errApplyFailed   = errors.New("Apply failed")
 	errRestoreFailed = errors.New("Restore failed")
 )
@@ -41,6 +42,9 @@ type Options struct {
 	BaseURL string `json:"base_url"`
 	APIKey  string `json:"api_key"`
 	Model   string `json:"model"`
+	// Models 非空时覆盖 Model：第 0 个元素作为默认模型（Model 被忽略），
+	// 其余按客户端能力写入（OpenCode 全量 / Codex profiles / Claude 仅默认）。
+	Models []string `json:"models"`
 }
 
 // Status 单个客户端状态。
@@ -160,11 +164,71 @@ func validateOptions(opts *Options) error {
 
 	opts.BaseURL = baseURL
 
+	models, err := normalizeModelList(opts.Models)
+	if err != nil {
+		return err
+	}
+
+	opts.Models = models
+	if len(models) > 0 {
+		// 归一后非空：列表第一项即默认模型，Model 被忽略。
+		opts.Model = models[0]
+
+		return nil
+	}
+
 	if strings.TrimSpace(opts.Model) == "" {
 		opts.Model = "glm-5.2"
 	}
 
 	return nil
+}
+
+// maxModelList 模型列表上限：超出截断（不报错），避免把整份目录写进客户端配置。
+const maxModelList = 200
+
+// normalizeModelList trim、丢空、去重（保序）、上限截断，并拒绝会写坏 TOML / JSON
+// 的控制字符。不做字符集校验：模型 id 由上游决定（含 : . / - 都合法）。
+func normalizeModelList(list []string) ([]string, error) {
+	if len(list) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[string]struct{}, len(list))
+	out := make([]string, 0, len(list))
+
+	for _, raw := range list {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+
+		if strings.ContainsAny(id, "\r\n\t") {
+			return nil, fmt.Errorf("%w: 含换行/制表符 %q 的模型 id 无法写入客户端配置", errModelList, id)
+		}
+
+		if _, dup := seen[id]; dup {
+			continue
+		}
+
+		seen[id] = struct{}{}
+		out = append(out, id)
+
+		if len(out) == maxModelList {
+			break
+		}
+	}
+
+	return out, nil
+}
+
+// modelList 三家客户端共用的模型清单：Models 非空取它（已归一），否则回落单模型。
+func modelList(opts Options) []string {
+	if len(opts.Models) > 0 {
+		return opts.Models
+	}
+
+	return []string{opts.Model}
 }
 
 // Apply 写入网关专属配置。
@@ -371,6 +435,9 @@ func loadConfigDoc(existing []byte, label string) (map[string]any, error) {
 	return doc, nil
 }
 
+// applyClaude 只写单个默认模型（opts.Model = 列表第一项）：
+// Claude Code 的 settings.json 没有多模型字段，其余模型在 Claude Code 内用
+// `/model <id>` 切换，不写进配置。
 func applyClaude(existing []byte, opts Options) ([]byte, error) {
 	doc, err := loadConfigDoc(existing, "Claude")
 	if err != nil {
@@ -442,8 +509,16 @@ name = "WokBuddy Demon"
 base_url = %q
 wire_api = "chat"
 experimental_bearer_token = %q
-%s
-`, v1Base(opts.BaseURL), opts.APIKey, codexEnd)
+`, v1Base(opts.BaseURL), opts.APIKey)
+
+	// 其余模型写成 profiles：`codex --profile "<id>"` 直接切换。表名必须用双引号
+	// 包裹原始 id（模型 id 可含 : . / -），且只写这两个键，不覆盖用户自有 profile。
+	for _, id := range modelList(opts)[1:] {
+		fmt.Fprintf(&builder, "\n[profiles.%q]\nmodel = %q\nmodel_provider = \"wokbuddy\"\n", id, id)
+	}
+
+	builder.WriteString(codexEnd)
+	builder.WriteString("\n")
 
 	if tables = strings.TrimSpace(tables); tables != "" {
 		builder.WriteString("\n")
@@ -497,7 +572,11 @@ func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 		provider = map[string]any{}
 	}
 
-	models := map[string]any{opts.Model: map[string]any{}}
+	models := make(map[string]any, len(modelList(opts)))
+	for _, id := range modelList(opts) {
+		models[id] = map[string]any{}
+	}
+
 	provider["wokbuddy"] = map[string]any{
 		"npm":  "@ai-sdk/openai-compatible",
 		"name": "WokBuddy Demon",
