@@ -534,3 +534,329 @@ func TestImagesAllowedModelRejected(t *testing.T) {
 		t.Fatal("白名单外模型不得打上游")
 	}
 }
+
+// TestImagesEditsForwardedToEditsPath 开启开关后 /v1/images/edits 被转发到
+// /v2/images/edits（JSON 形态原样透传，不拆 image 字段）。
+func TestImagesEditsForwardedToEditsPath(t *testing.T) {
+	t.Parallel()
+
+	var gotPath, gotAccept string
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotPath = r.URL.Path
+			gotAccept = r.Header.Get("Accept")
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK,
+				`{"created":1,"data":[{"url":"https://img.example/edited.png"}],"usage":{"total_tokens":9}}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	body := `{"model":"image-to-image","prompt":"make it blue","image":["data:image/png;base64,AAA"],"input_fidelity":"high"}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if gotPath != "/v2/images/edits" {
+		t.Fatalf("path=%s want /v2/images/edits", gotPath)
+	}
+
+	if gotAccept != "application/json" {
+		t.Fatalf("accept=%q", gotAccept)
+	}
+
+	if string(gotBody) != body {
+		t.Fatalf("body must be passed through untouched: %s", gotBody)
+	}
+
+	if !strings.Contains(rec.Body.String(), "edited.png") {
+		t.Fatalf("response not passed through: %s", rec.Body)
+	}
+}
+
+// TestImagesEditsDisabledMentionsEditsPath 关闭时的文案按端点区分：
+// edits 请求必须提到 /v1/images/edits，generations 文案保持原样。
+func TestImagesEditsDisabledMentionsEditsPath(t *testing.T) {
+	t.Parallel()
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 200, `{}`, false }),
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: false}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits",
+		strings.NewReader(`{"model":"image-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), "POST /v1/images/edits") {
+		t.Fatalf("body=%s want mention POST /v1/images/edits", rec.Body)
+	}
+
+	if strings.Contains(rec.Body.String(), "/v1/images/generations") {
+		t.Fatalf("body=%s must not mention generations", rec.Body)
+	}
+
+	// generations 的文案保持原样。
+	recGen := httptest.NewRecorder()
+	handler.ServeHTTP(recGen, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if !strings.Contains(recGen.Body.String(), "enable features.images_endpoint to use POST /v1/images/generations") {
+		t.Fatalf("generations body=%s want unchanged copy", recGen.Body)
+	}
+}
+
+// TestImagesEditsRealmPrefixStripped edits 与 generations 共用 rewriteModel：
+// 带域前缀的 model 只改 body.model，image / input_fidelity 不动。
+func TestImagesEditsRealmPrefixStripped(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits",
+		strings.NewReader(`{"model":"cn:image-to-image","prompt":"cat","image":"data:image/png;base64,AAA"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(string(gotBody), `"model":"image-to-image"`) || strings.Contains(string(gotBody), "cn:") {
+		t.Fatalf("body=%s", gotBody)
+	}
+
+	if !strings.Contains(string(gotBody), `"image":"data:image/png;base64,AAA"`) {
+		t.Fatalf("image field lost: %s", gotBody)
+	}
+}
+
+// TestImagesEditsRejectsMultipartBody edits 只收 JSON（上游形态）：multipart 形态必须
+// 明确报「形态不支持并给出 JSON 写法」，不能因为解析失败落成误导性的 "model is required"，
+// 且不得打上游。
+func TestImagesEditsRejectsMultipartBody(t *testing.T) {
+	t.Parallel()
+
+	upstreamCalled := false
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			upstreamCalled = true
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	const boundary = "----wbBoundary"
+
+	body := "--" + boundary + "\r\n" +
+		`Content-Disposition: form-data; name="model"` + "\r\n\r\n" +
+		"image-to-image\r\n" +
+		"--" + boundary + "\r\n" +
+		`Content-Disposition: form-data; name="image"; filename="a.png"` + "\r\n" +
+		"Content-Type: image/png\r\n\r\n" + "PNGDATA\r\n" +
+		"--" + boundary + "--\r\n"
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if upstreamCalled {
+		t.Fatal("multipart 请求不得打上游")
+	}
+
+	got := rec.Body.String()
+
+	for _, want := range []string{"multipart/form-data is not supported", "data URL"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("body=%s want mention %q", got, want)
+		}
+	}
+
+	if strings.Contains(got, "model is required") {
+		t.Errorf("body=%s 不能把形态问题误报为缺 model", got)
+	}
+}
+
+// TestImagesGenerationsMultipartHintStaysModelPrompt generations 没有 `image` 字段，
+// multipart 拒绝时不能照搬 edits 的「把图放进 image 字段」引导（那会让人以为
+// generations 支持图生图）。两端点共用一条拒绝文案，提示必须按端点分化。
+func TestImagesGenerationsMultipartHintStaysModelPrompt(t *testing.T) {
+	t.Parallel()
+
+	upstreamCalled := false
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			upstreamCalled = true
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader("--b\r\n"+strings.Repeat("x", 64)+"\r\n--b--\r\n"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=b")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if upstreamCalled {
+		t.Fatal("multipart 请求不得打上游")
+	}
+
+	got := rec.Body.String()
+
+	if !strings.Contains(got, "multipart/form-data is not supported") {
+		t.Errorf("body=%s want multipart 提示", got)
+	}
+
+	if strings.Contains(got, "`image` field") {
+		t.Errorf("body=%s generations 没有 image 字段，不能照搬 edits 引导", got)
+	}
+}
+
+// TestImagesEditsMultipartRejectedBeforeBodyLimit multipart 判定先于读 body：
+// 超过 server.max_body_bytes 的上传也必须回 400 形态提示，而不是 413 体积超限
+// （后者会引导客户端去调大上限而不是换形态）。
+func TestImagesEditsMultipartRejectedBeforeBodyLimit(t *testing.T) {
+	t.Parallel()
+
+	upstreamCalled := false
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			upstreamCalled = true
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:     client,
+		Live:         livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+		MaxBodyBytes: 8,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits",
+		strings.NewReader("--b\r\n"+strings.Repeat("x", 4096)+"\r\n--b--\r\n"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=b")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s want 400（形态优先于体积）", rec.Code, rec.Body)
+	}
+
+	if upstreamCalled {
+		t.Fatal("multipart 请求不得打上游")
+	}
+
+	if !strings.Contains(rec.Body.String(), "multipart/form-data is not supported") {
+		t.Errorf("body=%s want multipart 提示", rec.Body)
+	}
+}
+
+// TestImagesEditsPreservesLargeNumericFields 带域前缀改写只换 model，其余字段按
+// 字面量保留：走 float64 会把 seed 9007199254740993 悄悄改成 ...992，出图结果漂移。
+func TestImagesEditsPreservesLargeNumericFields(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	body := `{"model":"cn:image-to-image","prompt":"cat","seed":9007199254740993}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(string(gotBody), `"seed":9007199254740993`) {
+		t.Fatalf("body=%s seed 被改写成浮点形态", gotBody)
+	}
+
+	if !strings.Contains(string(gotBody), `"model":"image-to-image"`) {
+		t.Fatalf("body=%s model 未去掉 realm 前缀", gotBody)
+	}
+}

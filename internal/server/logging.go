@@ -3,6 +3,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -651,8 +652,14 @@ func rewriteModel(body []byte, bare string) []byte {
 		return body
 	}
 
+	// UseNumber：seed / 大整数 id 这类字段按字面量保留。走 float64 会把
+	// 9007199254740993 变成 ...992，出图 seed 就悄悄变了。
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+
+	if err := dec.Decode(&obj); err != nil {
 		return body
 	}
 

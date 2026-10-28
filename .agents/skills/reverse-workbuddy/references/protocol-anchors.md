@@ -121,9 +121,11 @@
   不是 CLI 排队。本仓已覆盖出站解析（`internal/upstream/modelbusy.go`）与入站只读
   预检（`internal/server/busy.go`）；不要让它参与选号。
 - `/v2/images/generations`、`/v2/images/edits`：官方 CLI 出图 / 图生图，
-  CN 5.8.3 与 global 5.8.4 同源；`generations` 已覆盖
-  （`internal/upstream/images.go`，入站 `features.images_endpoint` 门控），
-  `edits` 仍未覆盖。
+  CN 5.8.3 与 global 5.8.4 同源；**两者均已覆盖**（`internal/upstream/images.go`
+  的 `GenerateImage` / `EditImage`，入站 `features.images_endpoint` 门控）。
+  `edits` 是 JSON 形态（`Content-Type: application/json`，非 multipart），
+  body 为 `model` / `prompt` / `size` + 可选 `image`（data URL / http URL / 裸
+  base64，单个字符串或数组）+ 可选 `input_fidelity` 透传；见 UPSTREAM.md §六。
 - `/agenttool/v1/search`、`/agenttool/v1/webfetch`、`/agenttool/v1/agentic_search`：
   官方联网搜索 / 抓取 / 综述式检索；本仓库均已覆盖
   （`internal/upstream/{search,webfetch,agentic_search}.go`）。

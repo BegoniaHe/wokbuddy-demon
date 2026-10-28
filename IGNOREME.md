@@ -294,6 +294,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
 | 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭；`deep=true` 需 `features.search_deep`） |
 | 官方工具出口 | `POST /v2/chat/busy`（模型忙预检，只读本地池状态）、`POST /v1/tools/fetch` / `POST /v1/fetch`（官方服务端抓取，需 `features.web_fetch_endpoint=true`） |
+| 官方图像 | `POST /v1/images/generations`（出图）、`POST /v1/images/edits`（图生图，JSON 形态、非 multipart），需 `features.images_endpoint=true` |
 | Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
 
 Codex CLI 等使用 Responses API 的客户端：
@@ -489,7 +490,7 @@ gemini
 | `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
 | `features.search_deep` | `false` | 允许 `POST /v1/search/messages` 的 `deep:true`：上游 `/agenttool/v1/agentic_search` 综述式检索，单次最长 120s、只做单次尝试（不随 `upstream.rotate_max` 放大）。热生效 |
 | `features.web_fetch_endpoint` | `false` | 开放 `POST /v1/tools/fetch`（`/v1/fetch` 同义别名）：官方服务端抓取（上游 `/agenttool/v1/webfetch`），入口做 scheme / userinfo / 私网 SSRF 校验，仅 CN 域。热生效 |
-| `features.images_endpoint` | `false` | 开放 `POST /v1/images/generations`：官方出图；尚未在真实账号验证鉴权与计费，默认关闭。热生效 |
+| `features.images_endpoint` | `false` | 开放 `POST /v1/images/generations`（官方出图）与 `POST /v1/images/edits`（官方图生图，JSON 形态）；尚未在真实账号验证鉴权与计费，默认关闭。两端点共用本开关。热生效 |
 | `features.local_web_tool_rounds` | `3` | 本地工具最多代跑轮数，封顶 8 |
 | `features.multimodal_routing` | `false` | 请求带图/音频/文件而当前模型能力不匹配时：`false` 返回 400 `model_capability`；`true` 在同域目录内改选支持该模态的模型并重写 `model` |
 | `schedule.checkin_hours` | `[9, 21]` | 每日整点签到 + 余额查询解冻 |

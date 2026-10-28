@@ -34,8 +34,9 @@ type Snapshot struct {
 	SearchDeep bool
 	// WebFetchEndpoint 是否开放 POST /v1/tools/fetch（issue #276）。
 	WebFetchEndpoint bool
-	// ImagesEndpoint 是否开放 POST /v1/images/generations（features.images_endpoint，
-	// 默认 false）。未在真实账号验证前不默认开启（issue #253）。
+	// ImagesEndpoint 是否开放 POST /v1/images/generations 与 POST /v1/images/edits
+	// （features.images_endpoint，默认 false）。未在真实账号验证前不默认开启
+	// （issue #253 出图、issue #357 图生图，两端点共用本开关）。
 	ImagesEndpoint bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
