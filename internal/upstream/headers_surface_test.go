@@ -178,6 +178,13 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 			if got := req.Header.Get("X-Request-ID"); !uuidV7Hex32.MatchString(got) {
 				t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
 			}
+
+			if testCase.name == "v3config" {
+				// /v3/config 的 Accept 是宽松值（官方 RestOperations 默认），别收窄。
+				if got := req.Header.Get("Accept"); got != "application/json, text/plain, */*" {
+					t.Errorf("v3config Accept=%q want 宽松值", got)
+				}
+			}
 		})
 	}
 }

@@ -458,6 +458,9 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 
 		injectEnterpriseHeaders(req, account)
 	case surfaceV3Config:
+		// 该端点对 Accept 也要宽松值（官方 RestOperations 默认）；轻头族 base 的
+		// application/json 是收窄的，故在此还原。
+		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("X-Product", "SaaS")
 		injectEnterpriseHeaders(req, account)
