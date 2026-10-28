@@ -291,6 +291,11 @@ func (c *Client) chatFamilyHeaders(
 ) {
 	c.CommonHeaders(req, account)
 
+	// X-Codebuddy-Request: 1（风控闸门头）。真机 2026-10-28 抓包：7 条 chat 全带，
+	// refresh / busy / report / v3-config / billing / growth 共 14 条非 chat 业务请求
+	// 一条都没有，故只在本族（chat + agenttool 四路，agenttool 无真机证据、沿 chat
+	// 头族一起发）注入；轻头族各面不发（#368）。
+	req.Header.Set("X-Codebuddy-Request", "1")
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime；
@@ -367,9 +372,6 @@ func (c *Client) chatFamilyHeaders(
 func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	// X-CodeBuddy-Request: 1（D1 风控闸门头）。官方 chat adapter 未注入，
-	// daemon/ACP 注入；本仓无实测证明移除安全，按 D1 保留（见 UPSTREAM.md §六）。
-	req.Header.Set("X-Codebuddy-Request", "1")
 	// AccessToken 加锁快照（同 chatFamilyHeaders：keepalive 可在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 
