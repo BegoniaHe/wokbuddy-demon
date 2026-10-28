@@ -24,7 +24,7 @@ func FuzzPrepareBodyOpt(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out := PrepareBodyOptWithEffortsAndDefault(data, true,
-			map[string][]string{"m": {"low", "high"}}, map[string]string{"m": "high"})
+			map[string][]string{"m": {"low", "high"}}, map[string]string{"m": "high"}, 0)
 		if !json.Valid(data) {
 			return
 		}

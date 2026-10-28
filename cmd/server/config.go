@@ -381,6 +381,10 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// HistoryKeepTurns 保留最近 N 轮 user 历史（0 = 关闭，默认）。
+		// 「一轮」按 user 消息计；裁剪保留开头连续 system/developer + 倒数第 N 条 user 起的尾部。
+		// 热生效（无需重启）。
+		HistoryKeepTurns int `json:"history_keep_turns"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
@@ -2379,6 +2383,14 @@ func (c *Config) normalizePrompt() error {
 		}
 
 		c.PromptText = text
+	}
+
+	// prompt.history_keep_turns：0 = 关闭（默认）；1..1000 = 只保留最近 N 轮 user 历史。
+	// 负数/非法值直接失败（不静默当 0，否则用户以为开了其实没裁）；
+	// 上限 1000 是护栏：误填巨大值时「以为开了其实永远不会触发裁剪」，比报错更坑。
+	if v := c.Prompt.HistoryKeepTurns; v < 0 || v > 1000 {
+		return fmt.Errorf("prompt.history_keep_turns: %d 超出范围（0 = 关闭，1..1000 = 保留轮数）: %w",
+			v, errNormalizePromptFailed)
 	}
 
 	return nil

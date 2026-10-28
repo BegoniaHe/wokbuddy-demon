@@ -717,6 +717,13 @@ export function ConfigView() {
               {text('prompt_file', { placeholder: '留空 = 内置默认提示词' })}
               <FieldDescription>需重启</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>保留历史轮数</FieldLabel>
+              {num('history_keep_turns', { min: 0, placeholder: '0' })}
+              <FieldDescription>
+                0 = 不裁剪（默认）；N = 只保留最近 N 轮 user 历史，更早的丢弃；system 提示词始终保留；热生效
+              </FieldDescription>
+            </Field>
           </div>
           <Separator className="my-4" />
           {check('sanitize_blacklist_fingerprints', '出站请求指纹脱敏')}

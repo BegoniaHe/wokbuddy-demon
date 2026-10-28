@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -887,6 +888,75 @@ func TestPromptInvalidMode(t *testing.T) {
 
 	if _, err := Load(fp); err == nil {
 		t.Fatal("want error for invalid prompt.mode")
+	}
+}
+
+// TestPromptHistoryKeepTurnsDefault prompt.history_keep_turns 缺省 0 = 关闭（零回归）。
+func TestPromptHistoryKeepTurnsDefault(t *testing.T) {
+	t.Parallel()
+
+	config, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if config.Prompt.HistoryKeepTurns != 0 {
+		t.Errorf("HistoryKeepTurns=%d want 0", config.Prompt.HistoryKeepTurns)
+	}
+}
+
+// TestPromptHistoryKeepTurnsRejectsBad 负数与 >1000 在加载与面板保存（ParseConfigInto）
+// 两条路径都必须报错，且错误信息含字段路径。
+func TestPromptHistoryKeepTurnsRejectsBad(t *testing.T) {
+	t.Parallel()
+
+	for _, bad := range []int{-1, -100, 1001} {
+		t.Run(fmt.Sprintf("非法值 %d", bad), func(t *testing.T) {
+			t.Parallel()
+
+			raw, err := json.Marshal(map[string]any{"prompt": map[string]any{"history_keep_turns": bad}})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cfgPath := filepath.Join(t.TempDir(), "c.json")
+			os.WriteFile(cfgPath, raw, 0o600)
+
+			_, loadErr := Load(cfgPath)
+			if loadErr == nil {
+				t.Fatalf("history_keep_turns=%d 应报错", bad)
+			}
+
+			if !strings.Contains(loadErr.Error(), "prompt.history_keep_turns") {
+				t.Errorf("错误信息须含 prompt.history_keep_turns，得到 %v", loadErr)
+			}
+			// 面板保存走 ParseConfigInto（同一 normalize 管线），必须同样拒绝。
+			if _, parseErr := ParseConfig(raw); parseErr == nil {
+				t.Fatalf("面板保存路径 history_keep_turns=%d 应报错", bad)
+			}
+		})
+	}
+}
+
+// TestPromptHistoryKeepTurnsAccepted 合法值原样保留（1..1000）。
+func TestPromptHistoryKeepTurnsAccepted(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(map[string]any{"prompt": map[string]any{"history_keep_turns": 7}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "c.json")
+	os.WriteFile(cfgPath, raw, 0o600)
+
+	config, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if config.Prompt.HistoryKeepTurns != 7 {
+		t.Errorf("HistoryKeepTurns=%d want 7", config.Prompt.HistoryKeepTurns)
 	}
 }
 
