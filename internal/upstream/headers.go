@@ -246,11 +246,14 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 	return ""
 }
 
-// resolveDeviceToken 解析签到专用 X-Device-Token 的取值。
+// resolveDeviceToken 解析 X-Device-Token 的取值。
 // 优先级：auth.Auth.DeviceToken（每号）> Client.DeviceToken（config 全局）> 文件兜底。
 // 三者皆空/读失败则返回空串（调用方不注入该头，优雅降级）。
-// 官方只在 /v2/plugin/auth/state 与签到（daily-checkin / checkin-activity-status）
-// 消费该头，本仓只在签到路径注入（见 checkinHeaders；#342）。
+//
+// 消费面（真机 2026-10-28 抓包）：chat（/v2/chat/completions，主请求与辅助请求都带）、
+// 签到（checkin-activity-status）、/v2/plugin/auth/state（面板登录面，不经本包）。
+// 其余面（summary / packages / report / busy / v3-config / refresh / growth）不带。
+// #342 的「官方只在 auth/state 与签到消费」对 chat 不成立（#376）。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	if a != nil && a.DeviceToken != "" {
 		return a.DeviceToken
@@ -267,10 +270,18 @@ func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	return ""
 }
 
+// deviceToken 返回本次请求可用的 device token（chat 面注入用；空 = 不注入）。
+func (c *Client) deviceToken(account *auth.Auth) string {
+	if c == nil {
+		return ""
+	}
+
+	return c.resolveDeviceToken(account)
+}
+
 // checkinHeaders 签到专用请求头：X-Device-Token（取值为空时不注入）。
-// 官方 5.9.3 只在该头的 /v2/plugin/auth/state 与签到消费点发；chat / images /
-// search / webfetch / modelbusy 与 billing 默认面（report / travel / balance 等）
-// 都不带（#342）。auth/state 是面板登录面，不经过 internal/upstream。
+// 签到是除 chat 之外的另一个消费面（见 resolveDeviceToken）：summary / packages /
+// report / busy / v3-config / refresh / growth 与 agenttool 四路都不带（真机口径）。
 func (c *Client) checkinHeaders(a *auth.Auth) map[string]string {
 	if tok := c.resolveDeviceToken(a); tok != "" {
 		return map[string]string{"X-Device-Token": tok}
@@ -366,9 +377,8 @@ func (c *Client) chatFamilyHeaders(
 	c.injectIdentityHeaders(req, account)
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
-	// X-Device-Token 不注入 chat：官方只在该头的 /v2/plugin/auth/state 与签到
-	// 消费点使用，chat / search / webfetch / images / modelbusy 都不带（#342）。
-	// 签到专用注入见 Client.checkinHeaders。
+	// X-Device-Token：chat 面注入（见 chatSurfaceOverrides），agenttool 四路与
+	// 其余面不注入（真机口径见 #376）；签到路径的注入见 Client.checkinHeaders。
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
 
@@ -377,7 +387,7 @@ func (c *Client) chatFamilyHeaders(
 
 // chatSurfaceOverrides chat 头族内的 surface 差异：agenttool 四路是同步 JSON / SSE，
 // 头集与 chat 流式不同。
-func (*Client) chatSurfaceOverrides(srf surface, req *http.Request, account *auth.Auth) {
+func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *auth.Auth) {
 	switch srf {
 	case surfaceSearch, surfaceWebFetch, surfaceAgenticSearch:
 		// 官方 WebSearchTool / fetchContentViaApi 头族：非流式 JSON，Content-Type
@@ -402,6 +412,13 @@ func (*Client) chatSurfaceOverrides(srf surface, req *http.Request, account *aut
 		// 兜底分支）；桌面本地会话恒为 local-agent，真机 other 0 次。网关模拟的是
 		// 本地会话，故发 local-agent。
 		req.Header.Set("X-Agent-Runtime", "local-agent")
+		// X-Device-Token：真机 chat（主请求与辅助请求）**都带**该头，与产品面公共头
+		// 同层出现，不在会话头族里（#376）。取值沿用 resolveDeviceToken 的既有优先级；
+		// 取不到就不发（不伪造）。其余面（summary / packages / report / busy /
+		// v3-config / refresh / growth / agenttool）真机都不带，故只在本分支注入。
+		if token := c.deviceToken(account); token != "" {
+			req.Header.Set("X-Device-Token", token)
+		}
 		// chat 面补 W3C baggage（真机 4 条：buddy 两空值键 + 两个 codebuddy 键）。
 		req.Header.Set("Baggage", baggageValue(
 			req.Header.Get("X-Conversation-Id"), req.Header.Get("X-Conversation-Request-Id"),

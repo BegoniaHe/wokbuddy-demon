@@ -39,9 +39,12 @@ func assertHeaderKeys(t *testing.T, req *http.Request, want ...string) {
 }
 
 // surfaceGoldenAccount 黄金头集用例的固定账号：CN 个人号（有 domain，避免
-// X-No-* 声明头干扰键集比对）。
+// X-No-* 声明头干扰键集比对）；带 device token，用于钉住「只有 chat 面发该头」。
 func surfaceGoldenAccount() *auth.Auth {
-	return &auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", Domain: "www.workbuddy.cn"}
+	return &auth.Auth{
+		UID: "u1", AccessToken: "at", RefreshToken: "rt",
+		Domain: "www.workbuddy.cn", DeviceToken: "dev-token-1",
+	}
 }
 
 // TestCodebuddyRequestOnlyOnChatFamily X-Codebuddy-Request 只出现在 chat 头族
@@ -559,6 +562,7 @@ func TestChatGoldenHeaderSet(t *testing.T) {
 		"X-Conversation-Request-Id", "X-Domain", "X-Ide-Name", "X-Ide-Type", "X-Ide-Version",
 		"X-No-Enterprise-Id", "X-Private-Data", "X-Product", "X-Request-Id",
 		"X-Requested-With", "X-Root-Request-Id", "X-Trace-Id", "X-User-Id",
+		"X-Device-Token",
 	)
 
 	if got := req.Header.Get("Accept"); got != "application/json" {
