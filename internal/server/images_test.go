@@ -534,3 +534,133 @@ func TestImagesAllowedModelRejected(t *testing.T) {
 		t.Fatal("白名单外模型不得打上游")
 	}
 }
+
+// TestImagesEditsForwardedToEditsPath 开启开关后 /v1/images/edits 被转发到
+// /v2/images/edits（JSON 形态原样透传，不拆 image 字段）。
+func TestImagesEditsForwardedToEditsPath(t *testing.T) {
+	t.Parallel()
+
+	var gotPath, gotAccept string
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotPath = r.URL.Path
+			gotAccept = r.Header.Get("Accept")
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK,
+				`{"created":1,"data":[{"url":"https://img.example/edited.png"}],"usage":{"total_tokens":9}}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	body := `{"model":"image-to-image","prompt":"make it blue","image":["data:image/png;base64,AAA"],"input_fidelity":"high"}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if gotPath != "/v2/images/edits" {
+		t.Fatalf("path=%s want /v2/images/edits", gotPath)
+	}
+
+	if gotAccept != "application/json" {
+		t.Fatalf("accept=%q", gotAccept)
+	}
+
+	if string(gotBody) != body {
+		t.Fatalf("body must be passed through untouched: %s", gotBody)
+	}
+
+	if !strings.Contains(rec.Body.String(), "edited.png") {
+		t.Fatalf("response not passed through: %s", rec.Body)
+	}
+}
+
+// TestImagesEditsDisabledMentionsEditsPath 关闭时的文案按端点区分：
+// edits 请求必须提到 /v1/images/edits，generations 文案保持原样。
+func TestImagesEditsDisabledMentionsEditsPath(t *testing.T) {
+	t.Parallel()
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: newFakeUpstream(t, func(string) (int, string, bool) { return 200, `{}`, false }),
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: false}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits",
+		strings.NewReader(`{"model":"image-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), "POST /v1/images/edits") {
+		t.Fatalf("body=%s want mention POST /v1/images/edits", rec.Body)
+	}
+
+	if strings.Contains(rec.Body.String(), "/v1/images/generations") {
+		t.Fatalf("body=%s must not mention generations", rec.Body)
+	}
+
+	// generations 的文案保持原样。
+	recGen := httptest.NewRecorder()
+	handler.ServeHTTP(recGen, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if !strings.Contains(recGen.Body.String(), "enable features.images_endpoint to use POST /v1/images/generations") {
+		t.Fatalf("generations body=%s want unchanged copy", recGen.Body)
+	}
+}
+
+// TestImagesEditsRealmPrefixStripped edits 与 generations 共用 rewriteImageModel：
+// 带域前缀的 model 只改 body.model，image / input_fidelity 不动。
+func TestImagesEditsRealmPrefixStripped(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/edits",
+		strings.NewReader(`{"model":"cn:image-to-image","prompt":"cat","image":"data:image/png;base64,AAA"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(string(gotBody), `"model":"image-to-image"`) || strings.Contains(string(gotBody), "cn:") {
+		t.Fatalf("body=%s", gotBody)
+	}
+
+	if !strings.Contains(string(gotBody), `"image":"data:image/png;base64,AAA"`) {
+		t.Fatalf("image field lost: %s", gotBody)
+	}
+}

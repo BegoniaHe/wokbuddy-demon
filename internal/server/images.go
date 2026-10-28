@@ -1,13 +1,20 @@
-// images.go POST /v1/images/generations：官方出图端点透传（issue #253）。
+// images.go POST /v1/images/generations 与 POST /v1/images/edits：官方图像端点透传
+// （出图 issue #253、图生图 issue #357）。
 //
 // 默认关闭（features.images_endpoint）。开启后：
 //   - 鉴权/命名密钥限额复用 withClientAuth；
 //   - 模型按 realm 前缀直路由（无本域账号 fail-fast，不跨域回落）；
 //   - 单次尝试，不换号（保守策略，避免重复出图计费）；
 //   - 响应 {created,data,usage} 原样透出，usage 与 reqlog 照常记账。
+//
+// 入站只接受 JSON body（即上游形态：edits 的 image 是 data URL / http URL /
+// 裸 base64 字符串或数组，不是文件分片）。OpenAI 官方 multipart 形态**不在范围内**，
+// 需要 multipart 的客户端请自行把文件转成 data URL 再发——这是刻意取舍，
+// 不是漏实现；加 multipart 解析等于在网关里再写一遍文件上传与掩码逻辑。
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -25,8 +32,17 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
-// imagesGenerationsHandler 出图入口（鉴权由 withClientAuth 负责）。
-func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Request) {
+// imagesEndpointHandler 图像端点入口（鉴权由 withClientAuth 负责）。
+// upstreamPath 决定打到哪个上游端点：generations 与 edits 共用同一套校验、
+// 选号、记账与错误处置，差异只有上游路径与关闭时的提示文案。
+func (h *Handler) imagesEndpointHandler(upstreamPath string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		h.serveImages(w, r, upstreamPath)
+	}
+}
+
+// serveImages 图像端点主体：读请求 → 选号 → 租约 → 刷新 → 打上游。
+func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPath string) {
 	body, realm, bareModel, prefixed, ok := h.readImagesRequest(w, r)
 	if !ok {
 		return
@@ -58,7 +74,7 @@ func (h *Handler) imagesGenerationsHandler(w http.ResponseWriter, r *http.Reques
 		body = rewriteImageModel(body, bareModel)
 	}
 
-	h.generateImages(w, r, acct, body, realm, bareModel)
+	h.forwardImages(w, r, acct, body, realm, bareModel, upstreamPath)
 }
 
 // readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
@@ -68,8 +84,9 @@ func (h *Handler) readImagesRequest(
 	w http.ResponseWriter, r *http.Request,
 ) ([]byte, string, string, bool, bool) {
 	if !h.loadLive().ImagesEndpoint {
+		// 文案按入站端点区分，避免只提 generations 时让人以为 edits 没做开关。
 		writeOpenAIError(w, http.StatusNotFound, "not_found",
-			"images endpoint is disabled; enable features.images_endpoint to use POST /v1/images/generations")
+			"images endpoint is disabled; enable features.images_endpoint to use POST "+r.URL.Path)
 
 		return nil, "", "", false, false
 	}
@@ -183,9 +200,10 @@ func (h *Handler) ensureImagesToken(w http.ResponseWriter, acct *auth.Auth) bool
 	return true
 }
 
-// generateImages 发起上游请求，401 同号 refresh 重放一次后记账/收尾。
-func (h *Handler) generateImages(
-	w http.ResponseWriter, r *http.Request, acct *auth.Auth, body []byte, realm, bareModel string,
+// forwardImages 发起上游请求，401 同号 refresh 重放一次后记账/收尾。
+// upstreamPath 为 /v2/images/generations 或 /v2/images/edits，两者策略完全一致。
+func (h *Handler) forwardImages(
+	w http.ResponseWriter, r *http.Request, acct *auth.Auth, body []byte, realm, bareModel, upstreamPath string,
 ) {
 	meta := upstream.ChatMeta{
 		// X-Conversation-Request-ID 是轮级聚合主键，与 chat/search 同口径用 UUIDv7
@@ -195,7 +213,9 @@ func (h *Handler) generateImages(
 	}
 	started := time.Now()
 
-	status, raw, err := h.cfg.Upstream.GenerateImage(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+	call := h.imageCaller(upstreamPath)
+
+	status, raw, err := call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 
 	var (
 		uerr        *upstream.Error
@@ -207,7 +227,7 @@ func (h *Handler) generateImages(
 		refreshFail = h.cfg.Upstream.RefreshToken(acct)
 		if refreshFail == nil {
 			_ = acct.SaveAtomicRetry()
-			status, raw, err = h.cfg.Upstream.GenerateImage(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+			status, raw, err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 		}
 	}
 
@@ -237,6 +257,17 @@ func (h *Handler) generateImages(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(raw)
+}
+
+// imageCaller 按上游路径选出图 / 图生图入口：两者签名相同，只有上游路径不同。
+func (h *Handler) imageCaller(upstreamPath string) func(
+	context.Context, *auth.Auth, []byte, string, upstream.ChatMeta,
+) (int, []byte, error) {
+	if upstreamPath == upstream.ImageEditsPath {
+		return h.cfg.Upstream.EditImage
+	}
+
+	return h.cfg.Upstream.GenerateImage
 }
 
 // handleImagesError 出图错误处置：请求级错误直接透传；账号级错误按统一策略冷却，

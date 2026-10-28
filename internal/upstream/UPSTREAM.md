@@ -92,6 +92,7 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - SSE 接受 `delta.reasoning`、重复 tool id 去重、`finish_reason` 后 EOF 正常收尾；reasoning-only 不记成功。
 - 签到两 realm `/v2` 优先；余额 summary 为主、旧端点兜底；模型目录应用 `availableModels` / `disabled` / `aliases`（企业 `/console/enterprises/<enterpriseId|personal>/models` 按账号拼接，`/v2/enterprises/personal/models` 回落仍固定 personal）。`/v1/models` 发现输出再按官方默认会话 agent（`/v3/config data.agents`，企业端点 `agents` 兜底；`tags` 含 default → `name=cli` → 首个有 models）裁剪，仅隐藏展示条目，`FetchModels`、面板与请求路由保持全量。
 - growth `/v2` 优先；travel claim 支持 `record_id` 与空 body；桌面 report `X-Domain` 为 host 形态，body 指纹带 `userAgent=Node.js/22`（官方 Electron 主进程 `navigator.userAgent`）与 `os=Win32`（官方 `navigator.platform`），与 HTTP 头 UA 不同源。
+- images 两个端点都已覆盖：`/v2/images/generations`（`GenerateImage`）与 `/v2/images/edits`（`EditImage`），均受入站 `features.images_endpoint` 门控、单次尝试不换号。edits 是 **JSON 形态**（官方 `ImageService.editImage`：`Content-Type: application/json`，**不是 multipart**），body 为 `model` / `prompt` / `size`（默认 1024x1024）+ 可选 `image`（data URL / http URL / 裸 base64，单个字符串或字符串数组）+ 可选 `input_fidelity` 原样透传；头族与 generations 相同（`ImagesHeaders`）。CN 5.9.3 `cli/dist/codebuddy-lite-wb.mjs@6220394`。
 - 队列业务码 `6020/6021/6022`、限流族 `6000-6008`、额度/认证码按客户端枚举实现；请求级码（`11125/11129/.../11155`、`12654/14405`）不罚号不轮转，`11136` 换号并做模型级避让，`11141` 模型下线 fail-fast，`11102` 模型目录不存在按请求级 404 fail-fast（不换号），`11-128` 入站按内容拦截。
 - SSE error 帧与 HTTP 200 业务信封优先按结构化 `code`（含 `bizCode`）分类，取不到再回落 message；客户端 `data.statusCode`/`actions`、`cgicode/ret/retcode` 与 `172xx` 技能码尚未进入聊天主路径验证，暂不实现。
 
@@ -102,7 +103,7 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 | search / webfetch | raw `fetch`，`CLI/<desktop version>` UA，头更少 | 复用 chat 头族 | 统一指纹，避免同账号多客户端 |
 | webfetch 的 `X-Wb-Uid` | 与 `X-User-Id` 同值（账号 uid） | `WebFetch` 单独注入 | 官方只在 webfetch / knowledge_search 发，不扩散到 search / agentic_search / images |
 | agentic_search | `Content-Type` / `Authorization` / 可选 `X-Conversation-Request-ID` | 复用 chat 头族 + `Accept: text/event-stream` | 同上；SSE 契约优先 |
-| images | Content-Type / Authorization / conversation / identity | 复用 chat 头族 | 同上 |
+| images（generations + edits） | Content-Type / Authorization / conversation / identity | 复用 chat 头族 | 同上；两个端点同族同策略 |
 | chat/busy | renderer `wb.http.post` | 复用 chat 头族 | 同上 |
 
 证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.9.3 包内
