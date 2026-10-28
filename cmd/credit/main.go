@@ -10,7 +10,7 @@
 //	 "total":{"remain":N,"used":N,"size":N,"accounts":N,"ok":N,"failed":N},
 //	 "accounts":[{"uid","nickname","remain","used","size","packages","ok","error?"}]}
 //
-// 接口与聚合逻辑：POST codebuddy.cn/v2/billing/meter/get-user-resource，聚合所有 package 的
+// 接口与聚合逻辑：POST <计费域>/billing/meter/get-user-resource（404 回落 /v2），聚合所有 package 的
 // Cycle* 字段，TotalDosage 作 size 下限。
 package main
 
@@ -49,6 +49,9 @@ var (
 	errFetchUserResourceFailed = errors.New("fetchUserResource failed")
 	errParseUserResourceFailed = errors.New("parseUserResource failed")
 )
+
+// maxErrorBodyDrain 4xx/5xx 响应体排空上限：只为复用连接，不解析内容。
+const maxErrorBodyDrain = 4 << 10
 
 // billingBaseFor 按账号 realm 与 domain 选择计费域。判定口径与
 // internal/auth.Realm() 一致：显式 realm=global 或 domain 落在 global 域家族
@@ -132,30 +135,60 @@ func cycleRemainUsed(resourcePackage2 resourcePackage) (remain, used, size int64
 	return remain, used, size
 }
 
-func fetchUserResource(account *auth.Auth) (remain, used, size int64, packs int, err error) {
-	req, err := newUserResourceRequest(account)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-
-	client := &http.Client{Timeout: 20 * time.Second}
-
-	resp, err := client.Do(req) //nolint:gosec // URL 由固定计费域 + 路径拼接，非请求输入
-	if err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("fetchUserResource: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		return 0, 0, 0, 0, fmt.Errorf("http %d: %w", resp.StatusCode, errFetchUserResourceFailed)
-	}
-
-	return parseUserResource(resp.Body)
+// userResourcePaths 余额查询路径候选：两 realm 一致的无前缀优先、404 回落 `/v2`
+// （官方 5.9.3 桌面端 resourcePrefix 为空串；与 internal/upstream.billingMeterPaths 同口径）。
+func userResourcePaths() []string {
+	return []string{"/billing/meter/get-user-resource", "/v2/billing/meter/get-user-resource"}
 }
 
-// newUserResourceRequest 构造 meter/get-user-resource 请求：按 realm 选计费域与路径，
-// 并带上账号身份头（X-User-Id / X-Enterprise-Id / X-Tenant-Id / X-Domain）。
-func newUserResourceRequest(account *auth.Auth) (*http.Request, error) {
+func fetchUserResource(account *auth.Auth) (remain, used, size int64, packs int, err error) {
+	return fetchUserResourceAt(&http.Client{Timeout: 20 * time.Second}, billingBaseFor(account), account)
+}
+
+// fetchUserResourceAt 在指定计费域上按 userResourcePaths 依序请求：仅 404 换下一候选，
+// 其余错误直接返回。base 由调用方给出，便于按域测试回落链。
+func fetchUserResourceAt(
+	client *http.Client, base string, account *auth.Auth,
+) (remain, used, size int64, packs int, err error) {
+	paths := userResourcePaths()
+
+	for i, path := range paths {
+		req, reqErr := newUserResourceRequest(base, path, account)
+		if reqErr != nil {
+			return 0, 0, 0, 0, reqErr
+		}
+
+		resp, doErr := client.Do(req)
+		if doErr != nil {
+			return 0, 0, 0, 0, fmt.Errorf("fetchUserResource: %w", doErr)
+		}
+
+		if resp.StatusCode >= http.StatusBadRequest {
+			// 先排空再关，保住连接复用（404 换路径时同样的连接要接着用）。
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyDrain))
+			resp.Body.Close()
+
+			// 仅 404 换路径（路径不存在才值得 fallback）；其他错误直接返回。
+			if resp.StatusCode == http.StatusNotFound && i < len(paths)-1 {
+				continue
+			}
+
+			return 0, 0, 0, 0, fmt.Errorf("http %d: %w", resp.StatusCode, errFetchUserResourceFailed)
+		}
+
+		remain, used, size, packs, err = parseUserResource(resp.Body)
+		resp.Body.Close()
+
+		return remain, used, size, packs, err
+	}
+
+	return 0, 0, 0, 0, fmt.Errorf("http %d: %w", http.StatusNotFound, errFetchUserResourceFailed)
+}
+
+// newUserResourceRequest 构造 meter/get-user-resource 请求：计费域与路径由调用方给出
+// （见 billingBaseFor / userResourcePaths），并带上账号身份头
+// （X-User-Id / X-Enterprise-Id / X-Tenant-Id / X-Domain）。
+func newUserResourceRequest(base, path string, account *auth.Auth) (*http.Request, error) {
 	now := time.Now()
 
 	body, err := json.Marshal(map[string]any{
@@ -168,13 +201,6 @@ func newUserResourceRequest(account *auth.Auth) (*http.Request, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("newUserResourceRequest: %w", err)
-	}
-
-	base := billingBaseFor(account)
-	// global 域无 /v2 前缀（与 internal/upstream 的 billingMeterPaths 同口径）。
-	path := "/v2/billing/meter/get-user-resource"
-	if base != billingBaseCN {
-		path = "/billing/meter/get-user-resource"
 	}
 
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, base+path, bytes.NewReader(body))
