@@ -79,6 +79,7 @@
 | `xIdeVersion` | 是 | `X-Ide-Version` | 与 `chatUA` 同源的版本 |
 | `desktopIdeVersion` | 是 | 上报事件 `ideVersion` | Win32 桌面端构建串 |
 | `desktopExtVersion` | 是 | 上报事件 `extVersion`（须等于 `source.version`） | 官方 `pluginVersion`（产品版本） |
+| `billingMeterUA` | 否 | billing meter 族（`/billing/meter/*`）的出站 UA。官方该面没有桌面 UA 拦截器，UA 是 axios 库自身默认串，只能从抓包取值；缺省回落 `desktopUA` | 2026-10-28 mitmproxy 抓包（`/billing/meter/get-user-resource-*`）→ `evidence.source = "traffic"` |
 | `loginPlatform` | 否 | OAuth `platform=` 参数 | `plugin/auth/state` 调用处 |
 | `loginUA` | 否 | 登录流 UA | 与 `desktopUA` 同源（`restOperations` 拦截器） |
 
@@ -98,6 +99,10 @@ global `workbuddy-ai`），`userAgentExtension` 为 `CLI/<cli>`。
 2. `traffic`：抓包实测。`note` 必须给日期与端点，值仍需与包内版本事实相符；
    不要求 `file` / `snippet`，给了 `file` 也只校验为相对路径。
 禁止 `default` / `guessed` 之类凭空来源。找不到就给 `null` + `missing`。
+
+`billingMeterUA` 是纯抓包面（包内没有该 UA 字面量，值来自 axios 运行时默认），
+出现时必须给 `traffic` 证据（`note` 写抓包日期 + 端点）；没有就整个字段留空，
+出站回落 `desktopUA`，不要用旧版本的已知值拼一个。
 
 ## 校验规则（Go validator，启动期与测试共用）
 
