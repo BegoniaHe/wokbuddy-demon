@@ -27,8 +27,9 @@ import (
 const reportPath = "/v2/report"
 
 // billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
-// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
-// report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + growth 头族；billing 域走 billingBase）。
+// checkin / balance 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+// 活跃上报走 reportJSON（surfaceReport 头族），不在此列。
 func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessage, error) {
 	return c.billingJSONLimit(a, path, body, defaultJSONBodyLimit)
 }

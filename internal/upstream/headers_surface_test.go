@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"slices"
 	"strings"
@@ -278,6 +279,101 @@ func TestBillingMeterUAAllMeterPaths(t *testing.T) {
 
 		if got := req.Header.Get("User-Agent"); got != billingMeterUAProfileFixture {
 			t.Errorf("%s User-Agent=%q want %q（profile 抓包值）", path, got, billingMeterUAProfileFixture)
+		}
+	}
+}
+
+// TestGrowthGoldenHeaderSet growth 面（/activity/growth/*）是 Node 原生 fetch：
+// UA=node、accept-language=*、sec-fetch-mode=cors，没有 X-Request-ID / X-Product /
+// X-Requested-With / X-Codebuddy-Request（#375）。真机 9 个头里 `accept-encoding`
+// 由 Go transport 发送，不在 req.Header 里，故此处断言 8 项。
+func TestGrowthGoldenHeaderSet(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	req, err := http.NewRequest(http.MethodGet, "https://www.workbuddy.cn/v2/activity/growth/buddy/info", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.GrowthHeaders(req, account)
+
+	assertHeaderKeys(t, req,
+		"Accept", "Accept-Language", "Authorization", "Content-Type",
+		"Sec-Fetch-Mode", "User-Agent", "X-Domain", "X-User-Id",
+	)
+
+	for name, want := range map[string]string{
+		"Accept":          "application/json",
+		"Accept-Language": "*",
+		"Content-Type":    "application/json", // GET 也照发（真机如此）
+		"Sec-Fetch-Mode":  "cors",
+		"User-Agent":      "node",
+		"X-User-Id":       "u1",
+		"X-Domain":        "www.workbuddy.cn",
+		"Authorization":   "Bearer at",
+	} {
+		if got := req.Header.Get(name); got != want {
+			t.Errorf("%s=%q want %q", name, got, want)
+		}
+	}
+}
+
+// TestGrowthPathsUseNodeFingerprint 三条已实测/已用路径（buddy/info、travel/status、
+// streak）走同一 growth 头族；其余 /activity/growth/* 路径（tasks、heatmap、
+// lottery、makeup-cards 等）是**同面假设**，无逐路径抓包证据，注释见 UPSTREAM.md。
+func TestGrowthPathsUseNodeFingerprint(t *testing.T) {
+	t.Parallel()
+
+	paths := make(map[string]struct{})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != "node" {
+			t.Errorf("%s User-Agent=%q want node", r.URL.Path, got)
+		}
+
+		if got := r.Header.Get("X-Codebuddy-Request"); got != "" {
+			t.Errorf("%s X-Codebuddy-Request=%q want empty", r.URL.Path, got)
+		}
+
+		if got := r.Header.Get("X-Request-ID"); got != "" {
+			t.Errorf("%s X-Request-ID=%q want empty", r.URL.Path, got)
+		}
+
+		if got := r.Header.Get("Accept-Language"); got != "*" {
+			t.Errorf("%s Accept-Language=%q want *", r.URL.Path, got)
+		}
+
+		paths[strings.TrimPrefix(r.URL.Path, "/v2")] = struct{}{}
+
+		w.Write([]byte(`{"code":0,"data":{"buddy":{"id":1,"name":"x"},"state":"idle","streak":{"days":1},"tasks":[]}}`))
+	}))
+	defer srv.Close()
+
+	client := &Client{HTTP: srv.Client(), ChatHTTP: srv.Client(), ChatBaseCN: srv.URL, Profile: testProfileSet(t)}
+	account := surfaceGoldenAccount()
+
+	if _, err := client.BuddyInfo(account); err != nil {
+		t.Fatalf("BuddyInfo: %v", err)
+	}
+
+	if _, err := client.TravelStatus(account); err != nil {
+		t.Fatalf("TravelStatus: %v", err)
+	}
+
+	if _, err := client.GrowthStreak(account); err != nil {
+		t.Fatalf("GrowthStreak: %v", err)
+	}
+
+	for _, want := range []string{
+		"/activity/growth/buddy/info",
+		"/activity/growth/buddy/travel/status",
+		"/activity/growth/streak",
+	} {
+		if _, ok := paths[want]; !ok {
+			t.Errorf("未观察到 %s 请求，got=%v", want, paths)
 		}
 	}
 }

@@ -218,8 +218,11 @@ func (c *Client) billingMeterUA(account *auth.Auth) string {
 // lightUA 轻头族各面的 UA：显式 user_agent 覆盖优先（各面自带默认见下）。
 func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 	switch srf {
-	case surfaceBilling, surfaceGrowth:
+	case surfaceBilling:
 		return c.billingMeterUA(account)
+	case surfaceGrowth:
+		// /v2/activity/growth/* 是 Node 原生 fetch 裸调用，真机 UA 直接是 "node"。
+		return "node"
 	case surfaceReport:
 		return c.billingReportUA(account)
 	case surfaceModelBusy:
@@ -310,7 +313,7 @@ func (c *Client) applyHeaders(
 // chatFamilyHeaders chat 与 agenttool 四路的头族：CommonHeaders 基础 +
 // chat 身份 / 归属 / 会话头族，按 surface 覆盖 Accept 与 Content-Type。
 //
-//nolint:cyclop,gocyclo,maintidx,gocritic // 头族按 surface 线性展开，拆开反而看不出「同族差异」；ChatMeta 值传递。
+//nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
 func (c *Client) chatFamilyHeaders(
 	srf surface, req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta,
 ) {
@@ -361,7 +364,12 @@ func (c *Client) chatFamilyHeaders(
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
 
-	// surface 覆盖：agenttool 四路与 busy 都不是 chat 流式，头集不同。
+	c.chatSurfaceOverrides(srf, req, account)
+}
+
+// chatSurfaceOverrides chat 头族内的 surface 差异：agenttool 四路是同步 JSON / SSE，
+// 头集与 chat 流式不同。
+func (*Client) chatSurfaceOverrides(srf surface, req *http.Request, account *auth.Auth) {
 	switch srf {
 	case surfaceSearch, surfaceWebFetch, surfaceAgenticSearch:
 		// 官方 WebSearchTool / fetchContentViaApi 头族：非流式 JSON，Content-Type
@@ -388,9 +396,8 @@ func (c *Client) chatFamilyHeaders(
 }
 
 // lightHeaders 非 chat「轻头族」base：Accept / Content-Type / UA / Authorization /
-// X-User-Id / X-Domain，各面只覆盖差异项。真机证据逐面见 UPSTREAM.md §六。
-//
-//nolint:cyclop,gocyclo,maintidx // 头族按 surface 线性展开，拆成多个小函数反而更难对照真机表。
+// X-User-Id / X-Domain / X-Request-ID；各面的差异项见 lightSurfaceOverrides。
+// 真机证据逐面见 UPSTREAM.md §六。
 func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth) {
 	accept := "application/json"
 	if srf == surfaceModelBusy {
@@ -420,6 +427,13 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 	// X-Domain：账号 domain 优先，否则取 chat base 的 host（真机各面都是 host 形态）。
 	req.Header.Set("X-Domain", domainHostFor(account, c.chatBase(account)))
 
+	c.lightSurfaceOverrides(srf, req, account)
+}
+
+// lightSurfaceOverrides 轻头族各面的差异项。
+//
+//nolint:cyclop,gocyclo // 头族按 surface 线性展开；拆得更碎反而更难对照真机表。
+func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *auth.Auth) {
 	switch srf {
 	case surfaceModelBusy:
 		// 渲染层高频探针：真机恰好 8 个轻头——Accept / Content-Type /
@@ -447,9 +461,20 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("X-Product", "SaaS")
 		injectEnterpriseHeaders(req, account)
-	case surfaceBilling, surfaceReport, surfaceGrowth:
-		// billing 域各面（meter / report / growth 暂时共用）：企业头只在真有值时发，
-		// 个人号不发声明头。
+	case surfaceGrowth:
+		// 官方 growth 面是 Node fetch：UA=node、accept-language=*、sec-fetch-mode=cors，
+		// 且**没有** X-Request-ID / X-Product / X-Requested-With / X-Codebuddy-Request。
+		// Content-Type 在 GET 上也照发（真机如此，不按 HTTP 惯例省）。
+		// 企业头维持既有行为（真机样本是个人号，是否该发无证据）。
+		req.Header.Set("Accept-Language", "*")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+
+		if account.EnterpriseID != "" {
+			req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
+			req.Header.Set("X-Tenant-Id", account.EnterpriseID)
+		}
+	case surfaceBilling, surfaceReport:
+		// billing 域面（meter / report）：企业头只在真有值时发，个人号不发声明头。
 		if account.EnterpriseID != "" {
 			req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
 			req.Header.Set("X-Tenant-Id", account.EnterpriseID)
