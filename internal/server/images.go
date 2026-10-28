@@ -79,7 +79,7 @@ func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPa
 
 // readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
 //
-//nolint:funlen,maintidx // 校验顺序即语义，平铺便于核对拒绝路径。
+//nolint:funlen // 校验顺序即语义，平铺便于核对拒绝路径。
 func (h *Handler) readImagesRequest(
 	w http.ResponseWriter, r *http.Request,
 ) ([]byte, string, string, bool, bool) {
@@ -107,16 +107,11 @@ func (h *Handler) readImagesRequest(
 		return nil, "", "", false, false
 	}
 
-	var peek struct {
-		Model string `json:"model"`
-	}
-	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
-
+	rawModel, ok := imageRequestModel(w, r, body)
+	if !ok {
 		return nil, "", "", false, false
 	}
 
-	rawModel := strings.TrimSpace(peek.Model)
 	keyRealm := keyRealmFrom(r.Context())
 
 	realm, bareModel, err := resolveKeyModel(rawModel, h.requestModelAliases(rawModel, keyRealm), keyRealm)
@@ -141,6 +136,33 @@ func (h *Handler) readImagesRequest(
 	}
 
 	return body, realm, bareModel, rawModel != bareModel, true
+}
+
+// imageRequestModel 从入站 body 取 model；形态不支持或字段缺失时写出 400。
+//
+// OpenAI 官方 edits 形态是 multipart/form-data，本仓只收 JSON（上游形态）。
+// 不做这层判定时，multipart body 解析失败会落成 "model is required"，把「形态
+// 不支持」误报成「缺字段」，客户端会反复补 model 而不是换形态。
+func imageRequestModel(w http.ResponseWriter, r *http.Request, body []byte) (string, bool) {
+	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
+		writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request",
+			"multipart/form-data is not supported; send a JSON body instead",
+			"put the image in the JSON `image` field as a data URL, http(s) URL or raw base64 "+
+				"string (array also allowed) instead of uploading a file part")
+
+		return "", false
+	}
+
+	var peek struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
+
+		return "", false
+	}
+
+	return strings.TrimSpace(peek.Model), true
 }
 
 // imageModelVisible 出图前的模型可见性：models.hidden 与 models.allowed 同口径，

@@ -358,7 +358,8 @@ type Config struct {
 		// WebFetchEndpoint 是否开放 POST /v1/tools/fetch（官方 /agenttool/v1/webfetch
 		// 的 DSH 形态出口，issue #276）。默认 false。
 		WebFetchEndpoint bool `json:"web_fetch_endpoint"`
-		// ImagesEndpoint 是否开放 POST /v1/images/generations（issue #253）。
+		// ImagesEndpoint 是否开放 POST /v1/images/generations 与 /v1/images/edits
+		// （issue #253 出图、issue #357 图生图，共用同一开关）。
 		// 默认 false：图像端点尚未在真实账号验证鉴权/计费，与 search_endpoint 同口径。
 		ImagesEndpoint bool `json:"images_endpoint"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给

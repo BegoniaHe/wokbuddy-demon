@@ -664,3 +664,64 @@ func TestImagesEditsRealmPrefixStripped(t *testing.T) {
 		t.Fatalf("image field lost: %s", gotBody)
 	}
 }
+
+// TestImagesEditsRejectsMultipartBody edits 只收 JSON（上游形态）：multipart 形态必须
+// 明确报「形态不支持并给出 JSON 写法」，不能因为解析失败落成误导性的 "model is required"，
+// 且不得打上游。
+func TestImagesEditsRejectsMultipartBody(t *testing.T) {
+	t.Parallel()
+
+	upstreamCalled := false
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			upstreamCalled = true
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	const boundary = "----wbBoundary"
+
+	body := "--" + boundary + "\r\n" +
+		`Content-Disposition: form-data; name="model"` + "\r\n\r\n" +
+		"image-to-image\r\n" +
+		"--" + boundary + "\r\n" +
+		`Content-Disposition: form-data; name="image"; filename="a.png"` + "\r\n" +
+		"Content-Type: image/png\r\n\r\n" + "PNGDATA\r\n" +
+		"--" + boundary + "--\r\n"
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(body))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if upstreamCalled {
+		t.Fatal("multipart 请求不得打上游")
+	}
+
+	got := rec.Body.String()
+
+	for _, want := range []string{"multipart/form-data is not supported", "data URL"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("body=%s want mention %q", got, want)
+		}
+	}
+
+	if strings.Contains(got, "model is required") {
+		t.Errorf("body=%s 不能把形态问题误报为缺 model", got)
+	}
+}
