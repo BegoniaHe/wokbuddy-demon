@@ -75,7 +75,7 @@
 | --- | --- | --- | --- |
 | `chatUA` | 是 | chat / refresh / FetchModels | CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 最终输出；第二段品牌取 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`） |
 | `desktopUA` | 是 | `/v2/report`、白名单类上报 | Win32 `main/*.js`、桌面端构建串 |
-| `billingUA` | 是 | 仅 billing 域 report / banner 这类显式单段 UA 面（billing meter 走 `restOperations` 全局拦截器，默认同 `desktopUA`） | Win32 包内显式覆写 |
+| `billingUA` | 是 | **已无消费方**（schema 保留位：删除字段会让既有 `data/client-profiles/*.json` 校验失败）。历史上服务 billing 域 report / banner 的单段 UA 面；2026-10-28 抓包确认该面不存在（`/v2/report` 走三段式 `desktopUA`），billing meter 的 UA 见下行 `billingMeterUA` | Win32 包内显式覆写 |
 | `xIdeVersion` | 是 | `X-Ide-Version` | 与 `chatUA` 同源的版本 |
 | `desktopIdeVersion` | 是 | 上报事件 `ideVersion` | Win32 桌面端构建串 |
 | `desktopExtVersion` | 是 | 上报事件 `extVersion`（须等于 `source.version`） | 官方 `pluginVersion`（产品版本） |

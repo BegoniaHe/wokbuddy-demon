@@ -251,7 +251,7 @@ func (c *Client) deviceToken(account *auth.Auth) string {
 	return c.resolveDeviceToken(account)
 }
 
-// checkinHeaders 签到专用请求头：X-Device-Token（取值为空时不注入）。
+// checkinHeaders 签到面请求头：X-Device-Token（取值为空时不注入）。
 // 签到是除 chat 之外的另一个消费面（见 resolveDeviceToken）：summary / packages /
 // report / busy / v3-config / refresh / growth 与 agenttool 四路都不带（真机口径）。
 func (c *Client) checkinHeaders(a *auth.Auth) map[string]string {
@@ -618,7 +618,7 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 	c.applyHeaders(surfaceChat, req, account3, clientIP, meta)
 }
 
-// ImagesHeaders 出图面（/v2/images/generations）请求头。
+// ImagesHeaders 图像面（/v2/images/generations 与 /v2/images/edits）请求头。
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
 func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {

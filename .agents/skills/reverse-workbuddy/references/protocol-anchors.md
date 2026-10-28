@@ -22,7 +22,8 @@
     404 回落 `/v2`。`checkinMeterPaths()`：两 realm 均 `/v2` 优先
     （`DesktopAccountRepo.billingPrefix=/v2`），404 回落旧路径。
   - `WebBaseCN`（`https://www.workbuddy.cn`）：任务领奖 / profile 域。
-  - `/v3/config` 拉取 + `X-Domain`：见 `internal/upstream/client.go` 1874 附近。
+  - `/v3/config` 拉取：`internal/upstream/client.go` 的 `fetchV3ConfigModelMap` /
+    `newV3ConfigRequest`；头族见 `V3ConfigHeaders`（`internal/upstream/headers.go`）。
   - 企业模型目录：`/console/enterprises/<enterpriseId|personal>/models`（官方
     `CloudAgentProvider.getModels()` 按账号拼 `enterpriseId`），失败回落
     `/v2/enterprises/personal/models`（官方 daemon 侧固定 personal）。
@@ -37,9 +38,11 @@
 - `internal/upstream/headers.go`
   - `userAgent()` / `desktopUAFor()` 默认取部署 profile 的冻结字面量
     （`internal/clientprofile`）；显式 config `user_agent` / `client_version` /
-    `cli_version` 才覆盖版本段。billing meter 走 `restOperations` 的
-    `WorkbuddyUserAgentHttpInterceptor`，默认与 `desktopUA` 同形；`billingUA()`
-    只服务 billing 域 report / banner 这类显式单段 UA 面。
+    `cli_version` 才覆盖版本段。billing meter 面**没有**桌面 UA 拦截器（2026-10-28
+    抓包证伪了 `restOperations` 全局 `WorkbuddyUserAgentHttpInterceptor` 的推断），
+    UA 是 axios 库默认串，冻结在 profile 的 `emit.billingMeterUA`（`source=traffic`，
+    缺失回落 `desktopUA`）；`/v2/report` 用三段式 `desktopUA`。profile 的
+    `emit.billingUA` 字段已无消费方，仅为旧 profile 文件保留（不要按它取 UA）。
   - chat UA 模板（`cli/dist/codebuddy-lite-wb.mjs` 的
     `UserAgentHttpInterceptor.buildUserAgent`）：
     `WorkBuddy/<platformVersion> <applicationName>/<platformVersion> CLI/<cliVersion>`。
@@ -47,9 +50,12 @@
     `cli/product.json`（CN `WorkBuddy` / global `workbuddy-ai`）；extension 为
     `CLI/<cli>`。服务端不注入 `CLIENT_INFO_APPLICATION_NAME`。`/v2/report` 的
     desktop UA 是另一条 surface，不共用该模板。
-  - `checkinHeaders()`：`X-Device-Token`，**只在签到**（daily-checkin /
-    checkin-activity-status）注入；文件兜底见 `internal/upstream/device_token.go`。
-    官方也只在这两处 + `/v2/plugin/auth/state`（面板登录面，不在本仓出站面）消费。
+  - `X-Device-Token` 的注入面（真机 2026-10-28 抓包）：chat
+    （`chatSurfaceOverrides` 的 `surfaceChat` 分支）与签到（`checkinHeaders()`，
+    daily-checkin / checkin-activity-status）；官方另有 `/v2/plugin/auth/state`
+    （面板登录面，不在本仓出站面）。其余面（summary / packages / report / busy /
+    v3-config / refresh / growth / agenttool）都不带。文件兜底见
+    `internal/upstream/device_token.go`。
     同一注入点**不发** `X-Device-Token-Error`：该头只在 Turing SDK 取不到 token 时
     出现，取值是 SDK 原生错误串（截断到 64 字符 ASCII），本仓没有同源错误域，
     伪造取值等于自造指纹；结论见 `internal/upstream/UPSTREAM.md` §六。
@@ -77,9 +83,11 @@
     `true`）/ `X-Ide-Name|Type|Version` /
     `X-Codebuddy-Request` / traceparent + b3 单头 + `X-B3-*` 四件套）。
   - `X-Agent-Runtime`：5.9.3 起官方在 chat / images / search / webfetch 全发；
-    `ChatHeaders` 统一发兜底值 `other`（网关无 session meta /
-    `CODEBUDDY_AGENT_RUNTIME` 来源）。`X-Wb-Uid` 只在 `WebFetch` 发，
-    取值与 `X-User-Id` 同值（官方仅 webfetch / knowledge_search 发）。
+    chat 面发 `local-agent`（真机恒为该值，`other` 只是取不到会话 runtime 时的
+    not-in-enum 兜底），agenttool 四路无真机证据故维持兜底值 `other`
+    （见 `chatFamilyHeaders` / `chatSurfaceOverrides`）。`X-Wb-Uid` 只在
+    `surfaceWebFetch` 发，取值与 `X-User-Id` 同值（官方仅 webfetch /
+    knowledge_search 发）。
 - 客户端侧对照：
   - `<app-asar>/main/*.js`：官方 UA、`X-IDE-*`、`X-Agent-*`、`X-Wb-Uid`、
     `X-Device-Token`。

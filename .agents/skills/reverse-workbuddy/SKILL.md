@@ -136,7 +136,8 @@ description: >
    - 只从 Win32 `app-asar/` 取 `references/client-profile.md` 的 surface 表逐项
      **包内字面量**：
      `chatUA` / `desktopUA` / `billingUA` / `xIdeVersion` / `desktopIdeVersion` /
-     `desktopExtVersion` / `loginPlatform`。不从 `version` 拼任何串；
+     `desktopExtVersion` / `loginPlatform`（`billingUA` 仍属 schema 必填但已无消费方，
+     按包内字面量照填即可）。不从 `version` 拼任何串；
      `desktopExtVersion` 仍须核对为与 `source.version` 相等（产品版本）。
    - `chatUA` 取 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
      `UserAgentHttpInterceptor.buildUserAgent` 输出；`main/server.js` 是 daemon/VLM
@@ -144,6 +145,8 @@ description: >
    - 双源核对：Win32 `product.json` 的版本与 commit、包内 bundle 版本字面量、
      update 接口返回版本，三处必须一致；不一致就停下报告，不挑「看起来对的」那个。
      macOS 同版本包只用于旁证，不得覆盖 Win32 的 commit/releaseDate。
+   - billing meter 族的 UA 只能靠抓包（官方该面无桌面 UA 拦截器，值是 axios 默认串），
+     落 `billingMeterUA` 且 `source: "traffic"`；缺失时回落 `desktopUA`。
    - 为每个值写 `evidence`：`package` 来源给相对文件路径 + 可逐字 grep 到的
      snippet；抓包来源写 `source: "traffic"` 并在 `note` 记日期与端点。
    - 跑校验器；缺必需 surface 即视为生成失败，不落盘。

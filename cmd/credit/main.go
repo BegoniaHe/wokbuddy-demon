@@ -35,10 +35,13 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
-const billingBaseCN = "https://www.codebuddy.cn"
+// billingBaseCN CN 缺省计费域：与 internal/upstream 的 defaultCNBillingBase 同口径
+// （官方 5.9.3 桌面 billing 打产品域 workbuddy.cn）。旧口径 codebuddy.cn 仍是
+// CN 域，auth 文件显式写该 domain 的账号照常可用，只是不再作为缺省基域。
+const billingBaseCN = "https://www.workbuddy.cn"
 
 // billingBaseGlobal 旧桌面端国际版计费域。global 账号打 CN 域会得到 401：
-// www.codebuddy.cn 不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
+// CN 域不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
 const billingBaseGlobal = "https://www.workbuddy.ai"
 
 // billingBaseOfficial 官方国际站（CodeBuddy CLI externalDomain）计费域。

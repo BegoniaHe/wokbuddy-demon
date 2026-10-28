@@ -79,8 +79,10 @@ func TestNewUserResourceRequestNestedAndFlat(t *testing.T) {
 	}
 }
 
-// TestUserResourceRequestUsesIssuingDomain 三域映射保持不变，首候选路径统一为
-// 无 `/v2` 前缀（官方 5.9.3 resourcePrefix 为空串，两 realm 同形）。
+// TestUserResourceRequestUsesIssuingDomain 三域映射与 internal/upstream 同口径：
+// CN 账号（含 domain=codebuddy.cn）缺省打 workbuddy.cn，global 按签发域分
+// workbuddy.ai / codebuddy.ai；首候选路径统一为无 `/v2` 前缀（官方 5.9.3
+// resourcePrefix 为空串，两 realm 同形）。
 func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 	t.Parallel()
 
@@ -90,9 +92,14 @@ func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 		want string
 	}{
 		{
-			name: "国内站",
+			name: "国内站（domain=codebuddy.cn 仍判 cn，缺省打 workbuddy.cn）",
 			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"}}`,
-			want: "https://www.codebuddy.cn/billing/meter/get-user-resource",
+			want: "https://www.workbuddy.cn/billing/meter/get-user-resource",
+		},
+		{
+			name: "国内站无 domain",
+			raw:  `{"auth":{"accessToken":"at"}}`,
+			want: "https://www.workbuddy.cn/billing/meter/get-user-resource",
 		},
 		{
 			name: "官方国际站",

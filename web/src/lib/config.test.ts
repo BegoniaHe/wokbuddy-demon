@@ -80,6 +80,10 @@ describe('collectConfig', () => {
   it('覆盖型字段空串照发', () => {
     expect(collectConfig({ user_agent: '' })).toEqual({ upstream: { user_agent: '' } });
     expect(collectConfig({ timing_salt: '' })).toEqual({ schedule: { timing_salt: '' } });
+    // base 覆盖项清空必须下发给后端才能回内置默认（cn.billing_base 是灰度逃生门）。
+    expect(collectConfig({ cn_billing_base: '' })).toEqual({ cn: { billing_base: '' } });
+    expect(collectConfig({ cn_chat_base: '' })).toEqual({ cn: { chat_base: '' } });
+    expect(collectConfig({ global_billing_base: '' })).toEqual({ global: { billing_base: '' } });
   });
   it('hours 字段拆分成数字数组', () => {
     expect(collectConfig({ checkin_hours: '9, 21' })).toEqual({ schedule: { checkin_hours: [9, 21] } });
