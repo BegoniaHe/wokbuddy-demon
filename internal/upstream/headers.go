@@ -562,7 +562,8 @@ func domainHostFor(account *auth.Auth, endpoint string) string {
 func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
-	// chat 流式路径在 chatFamilyHeaders 覆盖。
+	// chat 面真机也发 application/json（#377），不再按流式覆盖；轻头族各面在自己的
+	// 分支里覆盖（busy / refresh / v3-config 是宽松值）。
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("User-Agent", c.userAgent(account2))
@@ -586,7 +587,8 @@ func billingAcceptLanguage(a *auth.Auth) string {
 // ChatMeta 一次 chat 出站的会话头族元数据（issue #35：后台按 X-Conversation-Request-ID
 // 聚合请求，官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID）。
 // handler 在轮转循环外生成 conversationID / conversationRequestID，循环内每次出站
-// 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
+// 复用同值；TraceID 透传入站值（空 = 独立生成随机 32 hex，不再回落
+// conversationRequestID——真机两者形态与取值都不同）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
 	ConversationID        string // X-Conversation-ID：入站头/body 提取值，非空时优先
@@ -599,7 +601,7 @@ type ChatMeta struct {
 	AgentType             string // X-Agent-Type：入站透传值，空则保留默认指纹
 	Compaction            string // X-Compaction：入站透传值，空则不发
 	ContextCompacted      string // X-Context-Compacted：入站透传值，空则不发
-	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	TraceID               string // X-Trace-ID：入站透传值，空则独立生成随机 32 hex
 }
 
 // ChatHeaders chat 面（/v2/chat/completions）请求头。
@@ -686,8 +688,9 @@ func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 //   - X-Trace-ID / traceparent / b3 / X-B3-*：链路族。官方桌面端 daemon 用
 //     randomBytes(16/8/8) 生成 traceId/spanId/parentSpanId 三件套，同时写 traceparent、
 //     b3、X-B3-TraceId/ParentSpanId/SpanId/Sampled、X-Trace-ID（Zr）。B3 规范只认
-//     16/32 hex TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId
-//     回落 messageID（恒 32 hex），SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
+//     随机 32 hex（与 conversationRequestID 不同值）；B3 规范只认 16/32 hex TraceId，
+//     入站透传的 X-Trace-ID 非法时 TraceId 回落 messageID（恒 32 hex），
+//     SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
 //   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级带连字符 UUIDv7）。
 //     本网关按实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v7 形态 UUID。
 //

@@ -51,13 +51,6 @@ func NewUUIDv7Hex() string {
 	return uuidV7Hex(newUUIDv7Bytes())
 }
 
-// NewUUIDv7 生成带连字符的 UUIDv7（8-4-4-4-12，version=7、variant=10xx，前 48 bit
-// 为当前毫秒时间戳）。官方桌面端的 X-Conversation-ID 兜底与 acp-connection-id 都是
-// 这个形态（`mintUuidV7Hyphen()`）。
-func NewUUIDv7() string {
-	return uuidV7Canonical(newUUIDv7Bytes())
-}
-
 // UUIDv7At 由种子与时间基准**稳定派生**带连字符 UUIDv7：前 48 bit 时间戳取
 // 「基准时刻 - [0, 1h) 的确定性偏移」（偏移来自 sha256(seed)），其余位取同一哈希。
 // 同种子 + 同基准恒同值，不同种子互异；纯派生，无缓存（内存不随键数增长）。
