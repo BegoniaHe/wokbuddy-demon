@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -143,8 +144,8 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 			keys: []string{
 				"Accept", "Authorization", "B3", "Content-Type", "Traceparent", "User-Agent",
 				"X-Auth-Refresh-Source", "X-B3-Parentspanid", "X-B3-Sampled", "X-B3-Spanid",
-				"X-B3-Traceid", "X-Domain", "X-No-Enterprise-Id", "X-Refresh-Token",
-				"X-Request-Id", "X-Requested-With", "X-Trace-Id", "X-User-Id",
+				"X-B3-Traceid", "X-Domain", "X-No-Enterprise-Id", "X-Product",
+				"X-Refresh-Token", "X-Request-Id", "X-Requested-With", "X-Trace-Id", "X-User-Id",
 			},
 		},
 		{
@@ -616,5 +617,63 @@ func assertTraceFamily(t *testing.T, req *http.Request, convReqID string) {
 	spanID := req.Header.Get("X-B3-Spanid")
 	if got, want := req.Header.Get("Traceparent"), "00-"+traceID+"-"+spanID+"-01"; got != want {
 		t.Errorf("Traceparent=%q want %q", got, want)
+	}
+}
+
+// TestRefreshHeadersMatchCapture refresh 面真机 11 头 + body `{}`：Accept 是宽松值、
+// Authorization / X-User-Id / X-Request-ID 与 X-Refresh-Token 同时存在（与 chat 相反，
+// chat 绝不带 RT），body 是 2 字节 `{}` 而不是无 body（#370）。
+func TestRefreshHeadersMatchCapture(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	var (
+		gotBody   string
+		gotLength string
+		gotHeader http.Header
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		gotBody = string(raw)
+		gotLength = r.Header.Get("Content-Length")
+		gotHeader = r.Header.Clone()
+
+		w.Write([]byte(`{"code":0,"data":{"accessToken":"new-at","refreshToken":"new-rt","expiresIn":3600}}`))
+	}))
+	defer srv.Close()
+
+	client.ChatBaseCN = srv.URL
+
+	if err := client.RefreshToken(account); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	if gotBody != "{}" {
+		t.Errorf("refresh body=%q want {}", gotBody)
+	}
+
+	if gotLength != "" && gotLength != "2" {
+		t.Errorf("Content-Length=%q want 2（或由 transport 自动计算）", gotLength)
+	}
+
+	for name, want := range map[string]string{
+		"Accept":                "application/json, text/plain, */*",
+		"Authorization":         "Bearer at",
+		"X-User-Id":             "u1",
+		"X-Refresh-Token":       "rt",
+		"X-Auth-Refresh-Source": "plugin",
+		"X-Product":             "SaaS",
+		"X-Domain":              "www.workbuddy.cn",
+	} {
+		if got := gotHeader.Get(name); got != want {
+			t.Errorf("%s=%q want %q", name, got, want)
+		}
+	}
+
+	if got := gotHeader.Get("X-Request-ID"); !uuidV7Hex32.MatchString(got) {
+		t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
 	}
 }
