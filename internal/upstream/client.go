@@ -4269,29 +4269,40 @@ var (
 	}
 )
 
-// resourcePackagePageSize 积分包分页大小。官方桌面 `fetchAllPages`
-// （CN 5.9.3 main/account.js@378649）固定 `pageSize:200` 并以 `accounts.length < 200`
-// 作为翻页终止条件；`queryCreditPackages` 再把上界钳到 `ac=200`。页终止判据与
-// 请求体两处共用本常量，避免再次漂移。
+// resourcePackagePageSize 积分包分页大小。官方桌面 daemon 链的 `fetchAllPages`
+// （CN 5.9.3 main/account.js@378532）固定传 `pageSize:200`，并以
+// `accounts.length < 200` 作为翻页终止条件。页终止判据与请求体两处共用本常量，
+// 避免再次漂移。
 const resourcePackagePageSize = 200
 
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
 //
-// body 口径对齐官方桌面 `CloudAccountRepo.validCreditPackages`
-// （CN 5.9.3 main/account.js@418501，`DesktopAccountRepo` 继承该方法）：它把
-// `{Status: [0,3], OnlyValidPeriod: true}` 交给 `queryCreditPackages`，后者再补
-// `IsDisplayTotalInfo: true` 与分页字段，并用**同一份 body** 并发打 paid / free 两个
-// 端点——即「只取当前有效周期」由 OnlyValidPeriod 表达，桌面不发 slice 时间窗口。
-// SlicePeriod* 只出现在 `BackendProvider`（IDE/CLI 面）的 free 查询里，桌面不出现，
-// 本仓也不发。
+// body 口径对齐**桌面 daemon 的用量链** `UsageService.getPersonalUsage`
+// （CN 5.9.3 main/authority-snapshot.js@469554）：它复用 main/account.js 的
+// `fetchUserResources` / `fetchAllPages`（@378532，`pageSize:200` 且以「不足 200 条」
+// 终止），经 `fetchResourcePackagesPage`（@468153）组体
+// `{PageNumber, PageSize, PackageCodes, Status:[0,3], ...extra}`：
+//   - paid 的 extra 是 `{NeedRenewInfo: true}`；
+//   - free 的 extra 是 `buildSlicePeriodRange()`（account.js@378135，导出名 `P`），
+//     即 `SlicePeriodStartTime` / `SlicePeriodEndTime` 的当日窗口。
 //
-// 本仓 paid 仍保留 `NeedRenewInfo`（BackendProvider 口径）且未带 OnlyValidPeriod，
-// 与桌面这条链路的 body 不完全同形；要完全对齐属于另一次改动，避免混进本 PR。
+// `OnlyValidPeriod` / `Status` 的另一套口径在渲染层 `CloudAccountRepo.validCreditPackages`
+// （account.js@418501，面板用量页用）：它发 `{Status:[0,3], OnlyValidPeriod:true}`
+// 且不带 slice 窗口。那是「渲染层 → 面板」的 surface，与 daemon 的余额刷新不同源，
+// 本仓按 daemon 口径走 slice 窗口，不发送 OnlyValidPeriod。
+// `IsDisplayTotalInfo` 不在 daemon 的组体里，本仓照发（既有字段，改它属另一次改动）。
 func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.Duration) (
 	expiring int64, totals *resourceTotals,
 ) {
 	totals = &resourceTotals{}
+
+	// 切片日期窗口按上游 UTC+8 墙钟计算（桌面 buildSlicePeriodRange 用本地时区
+	// 的 00:00:00 / 23:59:59）；用部署机本地时区会在非 UTC+8 环境把「今天」算错
+	// 一天，拿到错误周期的免费包。
+	nowCST := now.In(softRateResetLoc)
+	dayStart := time.Date(nowCST.Year(), nowCST.Month(), nowCST.Day(), 0, 0, 0, 0, softRateResetLoc)
+	dayEnd := dayStart.Add(24*time.Hour - time.Second)
 
 	specs := []struct {
 		path string
@@ -4307,8 +4318,10 @@ func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.D
 		{
 			path: "/billing/meter/get-user-resource-free-packages",
 			body: map[string]any{
-				"Status": []int{0, 3}, "IsDisplayTotalInfo": true, "OnlyValidPeriod": true,
-				"PackageCodes": freeResourcePackageCodes,
+				"Status": []int{0, 3}, "IsDisplayTotalInfo": true,
+				"PackageCodes":         freeResourcePackageCodes,
+				"SlicePeriodStartTime": dayStart.Format(packageEndLayout),
+				"SlicePeriodEndTime":   dayEnd.Format(packageEndLayout),
 			},
 		},
 	}

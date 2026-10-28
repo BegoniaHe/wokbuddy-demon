@@ -443,9 +443,11 @@ func TestSummaryResourceAcceptsStringCapacity(t *testing.T) {
 	}
 }
 
-// TestResourcePackageFreeBodyDesktopShape free 包 body 对齐官方桌面 validCreditPackages：
-// `Status:[0,3]` + `OnlyValidPeriod:true` + `IsDisplayTotalInfo:true` + `PageSize:200`，
-// 不发 SlicePeriod*（那是另一套 BackendProvider 实现的字段，桌面不出现）。
+// TestResourcePackageFreeBodyDesktopShape free 包 body 对齐桌面 daemon 用量链
+// `UsageService.getPersonalUsage` → `fetchResourcePackagesPage`（CN 5.9.3
+// main/authority-snapshot.js@469554 / @468153）：`Status:[0,3]` + `PageSize:200` +
+// 当日 slice 窗口（`buildSlicePeriodRange`，account.js@378135）。
+// 渲染层 `validCreditPackages` 的 `OnlyValidPeriod` 属另一条 surface，本仓不发。
 func TestResourcePackageFreeBodyDesktopShape(t *testing.T) {
 	t.Parallel()
 
@@ -459,25 +461,27 @@ func TestResourcePackageFreeBodyDesktopShape(t *testing.T) {
 		return jsonResp(200, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`), nil
 	})
 
-	if _, _ = client.resourcePackages(&auth.Auth{AccessToken: "at", UID: "u1"}, time.Now(), 0); len(freeBody) == 0 {
+	// UTC 2026-10-19 17:30 = CST 2026-10-20 01:30。
+	now := time.Date(2026, 10, 19, 17, 30, 0, 0, time.UTC)
+
+	if _, _ = client.resourcePackages(&auth.Auth{AccessToken: "at", UID: "u1"}, now, 0); len(freeBody) == 0 {
 		t.Fatal("free package request not captured")
 	}
 
 	for _, want := range []string{
 		`"Status":[0,3]`,
-		`"OnlyValidPeriod":true`,
 		`"PageSize":200`,
-		`"IsDisplayTotalInfo":true`,
+		`"SlicePeriodStartTime":"2026-10-20 00:00:00"`,
+		`"SlicePeriodEndTime":"2026-10-20 23:59:59"`,
 	} {
 		if !strings.Contains(string(freeBody), want) {
 			t.Errorf("free body=%s missing %s", freeBody, want)
 		}
 	}
 
-	for _, unwanted := range []string{"SlicePeriodStartTime", "SlicePeriodEndTime"} {
-		if strings.Contains(string(freeBody), unwanted) {
-			t.Errorf("free body=%s 不应含 %s（桌面不发 slice 窗口）", freeBody, unwanted)
-		}
+	// 渲染层 validCreditPackages 的字段不在 daemon 链路上。
+	if strings.Contains(string(freeBody), "OnlyValidPeriod") {
+		t.Errorf("free body=%s 不应含 OnlyValidPeriod（那是渲染层 surface）", freeBody)
 	}
 }
 
