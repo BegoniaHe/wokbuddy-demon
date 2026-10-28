@@ -21,8 +21,8 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 与 billing meter 都走桌面全局 UA 拦截器的三段式；billing 只有
-// /v2/report 显式发单段 WorkBuddy/<ver>（官方 banner 白名单头组）。
+// chat 与 /v2/report 都发三段式桌面 UA（真机同形）；billing meter 面另有
+// profile 抓包串，由 TestBillingMeterUA 覆盖。
 // 显式 client_name="SaaS" 才还原旧行为：不写 UA 键，回落 Go 默认 UA。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	t.Parallel()

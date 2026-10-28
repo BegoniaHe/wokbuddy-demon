@@ -412,8 +412,8 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 
 	// X-Domain：账号 domain 优先，否则取本次请求的 endpoint authority（真机各面
 	// 都是 host 形态，官方 enterpriseHeaders() 同样回落 endpoint authority）。
-	// 不能统一回落 chat base：billing 面走 billingBase（codebuddy.cn），回落到 chat
-	// base 会让 billing 请求带上不属于该域的主机名。
+	// 不能统一回落 chat base：billing 面走 billingBase（可被 cn.billing_base 指到
+	// 另一个域），回落到 chat base 会让 billing 请求带上不属于该域的主机名。
 	endpoint := req.URL.Host
 	if endpoint == "" {
 		endpoint = c.chatBase(account)

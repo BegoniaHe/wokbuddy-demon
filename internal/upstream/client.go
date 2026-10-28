@@ -1282,8 +1282,9 @@ type Client struct {
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认形态）。
 	// 空 = 按 realm 取部署 profile 的冻结字面量：chat/refresh/FetchModels 用
-	// emit.chatUA；billing meter / 签到 / growth 走 emit.desktopUA（RestOperations
-	// 全局拦截器）；emit.billingUA 只服务 /v2/report 与 banner 这类显式单段面。
+	// emit.chatUA；report / busy 走 emit.desktopUA；billing meter 走 profile 抓包的
+	// emit.billingMeterUA（缺失回落 desktopUA）；growth 固定 "node" 裸 fetch。
+	// emit.billingUA 已无消费方，仅保留字段以兼容现有 profile 文件。
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
