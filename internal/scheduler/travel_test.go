@@ -258,9 +258,10 @@ func TestRunTravelStateMachine(t *testing.T) {
 			wantInfo: 1, wantStatus: 1, wantClaim: 1,
 		},
 		{
-			name: "有猫-arrived-缺record_id-跳过领奖", buddy: buddyPresent,
+			// 官方 claim body 是空对象，record_id 缺失不是跳过条件（旧实现漏领）。
+			name: "有猫-arrived-缺record_id-照常领奖", buddy: buddyPresent,
 			state:    `{"state":"arrived","record_id":0}`,
-			wantInfo: 1, wantStatus: 1,
+			wantInfo: 1, wantStatus: 1, wantClaim: 1,
 		},
 		{
 			name: "有猫-未知状态-跳过", buddy: buddyPresent,

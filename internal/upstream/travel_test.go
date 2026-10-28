@@ -489,6 +489,31 @@ func TestGrowthPathAlreadyV2NotDoubled(t *testing.T) {
 	}
 }
 
+// TestTravelClaimNoRecordIDSkipsFallback 上游 400 但调用方没有 record_id 时不再打
+// `{"record_id":0}` 兜底：官方形态不需要它，补一次注定失败的请求只会掩盖真实错误。
+func TestTravelClaimNoRecordIDSkipsFallback(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		calls++
+
+		return jsonResp(400, `{"code":400,"msg":"parameter error"}`), nil
+	})
+
+	_, err := client.TravelClaim(&auth.Auth{AccessToken: "at", UID: "u1"}, 0)
+
+	var upstreamErr *Error
+	if !errors.As(err, &upstreamErr) || upstreamErr.Status != 400 {
+		t.Errorf("err=%v want 400", err)
+	}
+
+	if calls != 1 {
+		t.Errorf("calls=%d want 1（record_id 为 0 不触发兜底）", calls)
+	}
+}
+
 // TestTravelClaimReturnsLastError 空 body 400 → record_id 兜底 500 时返回最后一次
 // 错误分类（ErrServer），不被更早的参数错误覆盖。
 func TestTravelClaimReturnsLastError(t *testing.T) {

@@ -387,7 +387,7 @@ gemini
 - **错误码分类**：`11125/11129/11130/11132/11137-11139/11148-11155/12654/14405` 为请求级错误，不罚号、不轮转；`11102` 模型目录不存在直接 `404` fail-fast，`11136` 换号并写入 (账号,模型) 负缓存（不写路由熔断），`11141` 模型下线直接 fail-fast；`11-128 + request illegal` 按**通道校验失败**处理（不罚号、不降级重试、继续轮转，轮转耗尽回 400 `channel_refused`），其余 `11-128` 入站按内容拦截；`11140 + request illegal` 才是账号受限（禁用，需在 WorkBuddy 提交反馈申诉后重登），裸 `request illegal` 不再升级成账号故障；`6000-6008` 按限流处理（`6004` 保持模型级冷却）。HTTP 200 + 非零业务码与 SSE error 帧均按帧内/结构化 `code` 分类。
 - **签到 / 余额**：两 realm 均优先 `/v2/billing/meter/daily-checkin`，404 回落旧路径；`1001` 视为已签到，`1002/1003` 视为活动未开启。余额以 `get-user-resource-summary` 为主，失败回落 `get-user-resource`，并解析精确容量、切片额度与到期字段。
 - **模型目录**：应用 `availableModels` / `disabled` / `aliases` 过滤；CN 在 `/console` 无 CLI 过滤集时回落 `/v2/enterprises/personal/models`，`/v3/config` 同时使用桌面端与 IDE UA。上游 alias 参与请求解析，`models.aliases` 配置优先。
-- **growth / travel**：Bearer 通道优先 `/v2/activity/growth/*`，404 回落旧路径；travel claim 首选空对象 `{}`（官方桌面形态，零字节 body 会被上游 JSON 解析判 400），`{record_id}` 仅在最后一跳收到 400 时兜底一次；两跳都发 `X-Product-Code: workbuddy`。
+- **growth / travel**：Bearer 通道优先 `/v2/activity/growth/*`，404 回落旧路径；travel claim 首选空对象 `{}`（官方桌面形态，零字节 body 会被上游 JSON 解析判 400），`{record_id}` 仅在最后一跳收到 400（且调用方确有 record_id）时兜底一次，record_id 缺失不再跳过领奖；三跳都发 `X-Product-Code: workbuddy`。
 - **桌面指纹**：`X-Domain` 使用 host 形态；企业账号上报事件带 `enterpriseId` / `enterprise`；不伪造 `qimei36`。
 
 ### Webhook 告警
