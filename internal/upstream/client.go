@@ -4278,11 +4278,16 @@ const resourcePackagePageSize = 200
 // resourcePackageExpiry 拉取 paid/free 积分包分页，计算最早到期批次与窗口内到期余额。
 // 汇总接口已给出 remain/total；本函数只补逐包到期信息，失败不阻断汇总结果。
 //
-// body 口径对齐官方桌面 DesktopAccountRepo 的 validCreditPackages
-// （CN 5.9.3 main/account.js@418507）：`{Status: [0,3], OnlyValidPeriod: true}` 再由
-// queryCreditPackages 补 `IsDisplayTotalInfo: true` 与分页字段——即「只取当前有效
-// 周期」由 OnlyValidPeriod 表达，桌面不发 slice 时间窗口。SlicePeriod* 属另一套
-// BackendProvider 实现，桌面不出现，本仓也不发。
+// body 口径对齐官方桌面 `CloudAccountRepo.validCreditPackages`
+// （CN 5.9.3 main/account.js@418501，`DesktopAccountRepo` 继承该方法）：它把
+// `{Status: [0,3], OnlyValidPeriod: true}` 交给 `queryCreditPackages`，后者再补
+// `IsDisplayTotalInfo: true` 与分页字段，并用**同一份 body** 并发打 paid / free 两个
+// 端点——即「只取当前有效周期」由 OnlyValidPeriod 表达，桌面不发 slice 时间窗口。
+// SlicePeriod* 只出现在 `BackendProvider`（IDE/CLI 面）的 free 查询里，桌面不出现，
+// 本仓也不发。
+//
+// 本仓 paid 仍保留 `NeedRenewInfo`（BackendProvider 口径）且未带 OnlyValidPeriod，
+// 与桌面这条链路的 body 不完全同形；要完全对齐属于另一次改动，避免混进本 PR。
 func (c *Client) resourcePackages(account *auth.Auth, now time.Time, soon time.Duration) (
 	expiring int64, totals *resourceTotals,
 ) {

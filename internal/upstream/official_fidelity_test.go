@@ -464,6 +464,7 @@ func TestResourcePackageFreeBodyDesktopShape(t *testing.T) {
 	}
 
 	for _, want := range []string{
+		`"Status":[0,3]`,
 		`"OnlyValidPeriod":true`,
 		`"PageSize":200`,
 		`"IsDisplayTotalInfo":true`,
