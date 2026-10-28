@@ -332,8 +332,9 @@ func (c *Client) chatFamilyHeaders(
 	req.Header.Set("X-Codebuddy-Request", "1")
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime；
-	// 网关没有 session meta / CODEBUDDY_AGENT_RUNTIME 来源，统一发官方兜底值 other。
+	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime。
+	// 默认官方兜底值 other；chat 面在 chatSurfaceOverrides 里改成真机实际取值
+	// local-agent（agenttool 四路无真机证据，维持 other，#373）。
 	req.Header.Set("X-Agent-Runtime", "other")
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
@@ -396,6 +397,10 @@ func (*Client) chatSurfaceOverrides(srf surface, req *http.Request, account *aut
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
 	case surfaceChat:
+		// X-Agent-Runtime：官方 `other` 只在取不到会话 runtime 时出现（not-in-enum
+		// 兜底分支）；桌面本地会话恒为 local-agent，真机 other 0 次。网关模拟的是
+		// 本地会话，故发 local-agent。
+		req.Header.Set("X-Agent-Runtime", "local-agent")
 		// chat 面补 W3C baggage（真机 4 条：buddy 两空值键 + 两个 codebuddy 键）。
 		req.Header.Set("Baggage", baggageValue(
 			req.Header.Get("X-Conversation-Id"), req.Header.Get("X-Conversation-Request-Id"),

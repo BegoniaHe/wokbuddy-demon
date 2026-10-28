@@ -481,9 +481,10 @@ func TestPrivateDataHeaderPerRealm(t *testing.T) {
 	}
 }
 
-// TestAgentRuntimeHeaderAllSurfaces 官方 5.9.3 在 chat / images / search / webfetch
-// 全发 X-Agent-Runtime，网关统一官方兜底值 other。ImagesHeaders / SearchHeaders
-// 复用 ChatHeaders，自动继承该头（issue #345）。
+// TestAgentRuntimeHeaderAllSurfaces X-Agent-Runtime 按 surface 钉死取值：
+// chat = local-agent（真机桌面本地会话的真实值，other 0 次）；
+// agenttool 四路（images / search / webfetch / agentic_search）无真机证据，
+// 维持官方兜底值 other，写死断言避免日后无声漂移（#345 / #373）。
 func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 	t.Parallel()
 
@@ -493,12 +494,39 @@ func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 	headerSets := []struct {
 		name string
 		call func(req *http.Request)
+		want string
 	}{
-		{"chat", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
-		{"images", func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) }},
-		{"search", func(req *http.Request) {
-			client.applyHeaders(surfaceSearch, req, account, "", ChatMeta{})
-		}},
+		{
+			name: "chat",
+			call: func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) },
+			want: "local-agent",
+		},
+		{
+			name: "images",
+			call: func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) },
+			want: "other",
+		},
+		{
+			name: "search",
+			call: func(req *http.Request) {
+				client.applyHeaders(surfaceSearch, req, account, "", ChatMeta{})
+			},
+			want: "other",
+		},
+		{
+			name: "webfetch",
+			call: func(req *http.Request) {
+				client.applyHeaders(surfaceWebFetch, req, account, "", ChatMeta{})
+			},
+			want: "other",
+		},
+		{
+			name: "agentic_search",
+			call: func(req *http.Request) {
+				client.applyHeaders(surfaceAgenticSearch, req, account, "", ChatMeta{})
+			},
+			want: "other",
+		},
 	}
 
 	for _, headerCase := range headerSets {
@@ -512,8 +540,8 @@ func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 
 			headerCase.call(req)
 
-			if got := req.Header.Get("X-Agent-Runtime"); got != "other" {
-				t.Fatalf("X-Agent-Runtime=%q want other", got)
+			if got := req.Header.Get("X-Agent-Runtime"); got != headerCase.want {
+				t.Fatalf("X-Agent-Runtime=%q want %q", got, headerCase.want)
 			}
 		})
 	}

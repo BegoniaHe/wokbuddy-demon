@@ -114,9 +114,11 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 | chat/busy | renderer `wb.http.post`，8 个轻头（`Accept` 宽松值 / `Content-Type` / 三段 UA / `X-Request-ID` / `X-Product: SaaS` / `Authorization` / `X-User-Id` / `X-Domain`） | 独立轻头族（`surfaceModelBusy`） | 2026-10-28 真机：该路径没有任何会话头 / `acp-connection-id` / `baggage` / b3 / `x-stainless-*` / `X-Codebuddy-Request`（#371）。企业账号的 `X-Enterprise-Id` / `X-Tenant-Id` 取舍：真机样本是个人号，无证据，按「不猜测」不发 |
 
 证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.9.3 包内
-`X-Agent-Runtime` 已是基线行为（`normalizeAgentRuntime` 不在枚举内回落 `other`），
-官方在 chat / images / search / webfetch 全发；本仓由 chat 头族（`chatFamilyHeaders`）
-统一发官方兜底值 `other`（网关没有 session meta / `CODEBUDDY_AGENT_RUNTIME` 来源）。
+`X-Agent-Runtime` 官方在 chat / images / search / webfetch 全发，枚举是
+`local-agent` / `cloud-agent` / `agent-agent`，`other` 只是取不到会话 runtime 时的
+not-in-enum 兜底值。2026-10-28 chat 真机全量请求恒为 `local-agent`（`other` 0 次），
+故 chat 面发 `local-agent`；agenttool 四路**仅 chat 有真机证据**，维持兜底值 `other`，
+抓到各自的真机头集后再扩（#373）。
 同版 `X-Wb-Uid` 只出现在 webfetch（与 knowledge_search），取值与 `X-User-Id` 同源，
 故只在 `surfaceWebFetch` 注入，不扩散到 search / agentic_search / images。
 版本值仍只来自部署 profile，不进入仓库内置常量。
