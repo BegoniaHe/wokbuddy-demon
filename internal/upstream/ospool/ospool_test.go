@@ -114,7 +114,7 @@ func TestPickReturnsReleasedValue(t *testing.T) {
 	}
 }
 
-// TestReleasesCoverDesktopTarget 回归 #318：桌面指纹固定 os=win32/arch=x64，
+// TestReleasesCoverDesktopTarget 回归 #318：桌面指纹固定 os=Win32/arch=x64，
 // 因此版本池不能收入 ARM 独占的 26H1（28000），同时必须覆盖 Windows 10 22H2
 // 存量设备。build 不得重复，否则 Pick 的权重分布会偏向重复项。
 func TestReleasesCoverDesktopTarget(t *testing.T) {
