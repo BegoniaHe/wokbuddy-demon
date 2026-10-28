@@ -15,6 +15,8 @@ var (
 	uuidV7HeaderPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 	// uuidV7HyphenPattern 带连字符 UUIDv7（官方 acp-connection-id 形态）。
 	uuidV7HyphenPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+	// uuidV432HeaderPattern UUIDv4 形态的 32 hex（trace 族：第 13 位为 4、变体位 10xx）。
+	uuidV432HeaderPattern = regexp.MustCompile(`^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 )
 
 // TestConversationHeaderFallback 无客户端 conversationId 时，出站头使用
@@ -339,14 +341,15 @@ func TestRefreshHeadersTrace(t *testing.T) {
 
 	hex16 := regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+	// trace 族是独立随机值（UUIDv4 形态，无 v7 时间戳前缀），与业务请求 ID 解耦。
 	traceID := req.Header.Get("X-Trace-Id")
-	if !uuidV7HeaderPattern.MatchString(traceID) {
-		t.Errorf("X-Trace-Id=%q want UUIDv7 32 hex", traceID)
+	if !uuidV432HeaderPattern.MatchString(traceID) {
+		t.Errorf("X-Trace-Id=%q want 随机 UUIDv4 形态 32 hex", traceID)
 	}
 
 	b3Trace := req.Header.Get("X-B3-Traceid")
-	if !uuidV7HeaderPattern.MatchString(b3Trace) {
-		t.Errorf("X-B3-Traceid=%q want UUIDv7 32 hex", b3Trace)
+	if !uuidV432HeaderPattern.MatchString(b3Trace) {
+		t.Errorf("X-B3-Traceid=%q want 随机 UUIDv4 形态 32 hex", b3Trace)
 	}
 
 	spanID := req.Header.Get("X-B3-Spanid")

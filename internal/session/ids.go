@@ -98,8 +98,23 @@ func newUUIDv7Bytes() []byte {
 // NewUUIDv4 生成标准带连字符 UUIDv4（8-4-4-4-12，version=4、variant=10xx），
 // 用于会话级兜底 ID（官方 crypto.randomUUID() 同款形态）。
 func NewUUIDv4() string {
-	var buf [16]byte
-	if _, err := cryptorand.Read(buf[:]); err != nil {
+	h := hex.EncodeToString(newRandomUUIDv4Bytes())
+
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// NewTraceID 生成 32 位小写 hex 的随机 trace id（UUIDv4 形态：第 13 位为 4、
+// 变体位 10xx，**无** UUIDv7 时间戳前缀）。
+// 官方 chat 的 X-Trace-Id / X-B3-TraceId / traceparent trace-id 三处同值、形态为
+// 随机 v4 且与 X-Conversation-Request-ID（v7）不同值——两者可判别，不能互相复用。
+func NewTraceID() string {
+	return hex.EncodeToString(newRandomUUIDv4Bytes())
+}
+
+// newRandomUUIDv4Bytes 生成 16 字节 UUIDv4 原始位（version=4、variant=10xx）。
+func newRandomUUIDv4Bytes() []byte {
+	buf := make([]byte, 16)
+	if _, err := cryptorand.Read(buf); err != nil {
 		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())  //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 	}
@@ -107,9 +122,7 @@ func NewUUIDv4() string {
 	buf[6] = buf[6]&uuidVersionMask | uuidVersion4Bits
 	buf[8] = buf[8]&uuidVariantMask | uuidVariantBits
 
-	h := hex.EncodeToString(buf[:])
-
-	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+	return buf
 }
 
 // uuidV7Hex 将 16 字节的版本/变体位改成 UUIDv7 后编码为 32 hex。

@@ -330,8 +330,9 @@ func (c *Client) chatFamilyHeaders(
 	// 一条都没有，故只在本族（chat + agenttool 四路，agenttool 无真机证据、沿 chat
 	// 头族一起发）注入；轻头族各面不发（#368）。
 	req.Header.Set("X-Codebuddy-Request", "1")
-	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	// Accept 沿用 CommonHeaders 的 application/json：真机 chat（含 stream:true）也发
+	// application/json，不改 text/event-stream（#377）。agenttool 四路的 Accept 差异
+	// 见 chatSurfaceOverrides。
 	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime。
 	// 默认官方兜底值 other；chat 面在 chatSurfaceOverrides 里改成真机实际取值
 	// local-agent（agenttool 四路无真机证据，维持 other，#373）。
@@ -732,20 +733,24 @@ func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	setHeaderIfNonEmpty(req, "X-Compaction", meta.Compaction)
 	setHeaderIfNonEmpty(req, "X-Context-Compacted", meta.ContextCompacted)
 
-	injectTraceHeaders(req, meta.TraceID, convReqID, messageID)
+	injectTraceHeaders(req, meta.TraceID, messageID)
 }
 
 // injectTraceHeaders 注入链路头族（X-Trace-Id / traceparent / b3 / X-B3-*）。
-// chat 与 refresh 共用：官方 refresh 复用当前 trace span；网关侧 refresh 没有
-// 活动 span，由调用方生成一组自洽的新链路 id。
-func injectTraceHeaders(req *http.Request, traceID, b3Seed, messageID string) {
+//
+// chat 与 refresh 共用。trace id 是**独立生成的 32 hex 随机值**（UUIDv4 形态，无
+// UUIDv7 时间戳前缀）：真机 chat 的 X-Trace-ID / X-B3-TraceId / traceparent
+// trace-id 三处同值、与 X-Conversation-Request-ID（v7，带时间戳前缀）不同值。
+// 此前把 conversationRequestID 直接当 trace 用，两者形态可判别（#377）。
+// 入站透传的 X-Trace-ID 仍优先（客户端已有链路时跟随，不自造）。
+func injectTraceHeaders(req *http.Request, traceID, messageID string) {
 	if traceID == "" {
-		traceID = b3Seed
+		traceID = session.NewTraceID()
 	}
 
 	req.Header.Set("X-Trace-Id", traceID)
 
-	b3Trace := b3Seed
+	b3Trace := traceID
 	if !validTraceID(b3Trace) {
 		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
 	}
@@ -957,7 +962,7 @@ func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 
 	// 官方 refresh 复用当前 trace span；网关侧无活动 span，故生成一组自洽的新链路 id。
-	injectTraceHeaders(req, session.NewUUIDv7Hex(), session.NewUUIDv7Hex(), session.NewUUIDv7Hex())
+	injectTraceHeaders(req, "", session.NewMessageID())
 }
 
 // V3ConfigHeaders /v3/config 头族。该端点对 UA 敏感（必须带 CodeBuddy/CodeBuddyIDE
