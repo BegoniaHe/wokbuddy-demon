@@ -725,3 +725,48 @@ func TestImagesEditsRejectsMultipartBody(t *testing.T) {
 		t.Errorf("body=%s 不能把形态问题误报为缺 model", got)
 	}
 }
+
+// TestImagesEditsMultipartRejectedBeforeBodyLimit multipart 判定先于读 body：
+// 超过 server.max_body_bytes 的上传也必须回 400 形态提示，而不是 413 体积超限
+// （后者会引导客户端去调大上限而不是换形态）。
+func TestImagesEditsMultipartRejectedBeforeBodyLimit(t *testing.T) {
+	t.Parallel()
+
+	upstreamCalled := false
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			upstreamCalled = true
+
+			return jsonResponse(http.StatusOK, `{"created":1,"data":[]}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:     client,
+		Live:         livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+		MaxBodyBytes: 8,
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/images/edits",
+		strings.NewReader("--b\r\n"+strings.Repeat("x", 4096)+"\r\n--b--\r\n"))
+	req.Header.Set("Content-Type", "multipart/form-data; boundary=b")
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s want 400（形态优先于体积）", rec.Code, rec.Body)
+	}
+
+	if upstreamCalled {
+		t.Fatal("multipart 请求不得打上游")
+	}
+
+	if !strings.Contains(rec.Body.String(), "multipart/form-data is not supported") {
+		t.Errorf("body=%s want multipart 提示", rec.Body)
+	}
+}

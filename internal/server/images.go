@@ -78,8 +78,7 @@ func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPa
 }
 
 // readImagesRequest 读取并校验出图请求（开关、body、model、key realm）。
-//
-//nolint:funlen // 校验顺序即语义，平铺便于核对拒绝路径。
+// 校验顺序即语义，平铺便于核对拒绝路径。
 func (h *Handler) readImagesRequest(
 	w http.ResponseWriter, r *http.Request,
 ) ([]byte, string, string, bool, bool) {
@@ -91,23 +90,12 @@ func (h *Handler) readImagesRequest(
 		return nil, "", "", false, false
 	}
 
-	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		if isBodyTooLarge(err) {
-			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "")
-
-			return nil, "", "", false, false
-		}
-
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-
+	body, ok := h.readImagesBody(w, r)
+	if !ok {
 		return nil, "", "", false, false
 	}
 
-	rawModel, ok := imageRequestModel(w, r, body)
+	rawModel, ok := imageRequestModel(w, body)
 	if !ok {
 		return nil, "", "", false, false
 	}
@@ -138,21 +126,50 @@ func (h *Handler) readImagesRequest(
 	return body, realm, bareModel, rawModel != bareModel, true
 }
 
-// imageRequestModel 从入站 body 取 model；形态不支持或字段缺失时写出 400。
+// readImagesBody 读取并校验入站 body 形态与大小。
 //
-// OpenAI 官方 edits 形态是 multipart/form-data，本仓只收 JSON（上游形态）。
-// 不做这层判定时，multipart body 解析失败会落成 "model is required"，把「形态
-// 不支持」误报成「缺字段」，客户端会反复补 model 而不是换形态。
-func imageRequestModel(w http.ResponseWriter, r *http.Request, body []byte) (string, bool) {
+// multipart 判定必须在读 body 之前：OpenAI 官方 edits 形态就是 multipart，先
+// ReadAll 会让大文件上传先吃满 server.max_body_bytes 再回 413，把「形态不支持」
+// 误报成「请求体过大」，客户端会去调大上限而不是换形态。
+func (h *Handler) readImagesBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
 	if strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
-		writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request",
-			"multipart/form-data is not supported; send a JSON body instead",
-			"put the image in the JSON `image` field as a data URL, http(s) URL or raw base64 "+
-				"string (array also allowed) instead of uploading a file part")
+		writeMultipartUnsupported(w)
 
-		return "", false
+		return nil, false
 	}
 
+	limitRequestBody(w, r, h.cfg.MaxBodyBytes)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		if isBodyTooLarge(err) {
+			writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+				bodyTooLargeMessage(h.cfg.MaxBodyBytes), "")
+
+			return nil, false
+		}
+
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+
+		return nil, false
+	}
+
+	return body, true
+}
+
+// writeMultipartUnsupported 对 OpenAI 官方 multipart 形态给出明确 400。
+// 不这么写时，multipart body 解析失败会落成 "model is required"，把「形态不支持」
+// 误报成「缺字段」，客户端会反复补 model 而不是换形态。
+func writeMultipartUnsupported(w http.ResponseWriter) {
+	writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request",
+		"multipart/form-data is not supported; send a JSON body instead",
+		"put the image in the JSON `image` field as a data URL, http(s) URL or raw base64 "+
+			"string (array also allowed) instead of uploading a file part")
+}
+
+// imageRequestModel 从入站 JSON body 取 model；字段缺失或不是 JSON 时写出 400。
+// multipart 已由调用方在读 body 前拒绝（见 readImagesRequest）。
+func imageRequestModel(w http.ResponseWriter, body []byte) (string, bool) {
 	var peek struct {
 		Model string `json:"model"`
 	}
