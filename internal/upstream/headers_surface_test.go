@@ -429,3 +429,58 @@ func TestGrowthPathsUseNodeFingerprint(t *testing.T) {
 		}
 	}
 }
+
+// TestChatBaggage 断言 chat 出站的 W3C baggage 逐字形态：只有 4 条（buddy 两空值键
+// + codebuddy.session_id + codebuddy.conversation_request_id），且两个 codebuddy 键
+// 与同请求的 X-Conversation-Id / X-Conversation-Request-Id 逐项同值（#364 真机口径）。
+// 真机没发 conversation_message_id / root_request_id，故这两条必须**不出现**。
+func TestChatBaggage(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ChatHeaders(req, account, "", ChatMeta{
+		ConversationID:        "0f0e0d0c-0b0a-4908-8706-050403020100",
+		ConversationRequestID: "01a17a9c4d2f7b3e8c5a6d4e2f1b0a93",
+	})
+
+	wantBaggage := "buddyId=,buddyName=," +
+		"codebuddy.session_id=" + req.Header.Get("X-Conversation-Id") +
+		",codebuddy.conversation_request_id=" + req.Header.Get("X-Conversation-Request-Id")
+
+	if got := req.Header.Get("Baggage"); got != wantBaggage {
+		t.Fatalf("baggage=%q want %q", got, wantBaggage)
+	}
+
+	if want, got := "0f0e0d0c-0b0a-4908-8706-050403020100", req.Header.Get("X-Conversation-Id"); got != want {
+		t.Fatalf("X-Conversation-Id=%q want %q", got, want)
+	}
+
+	if want, got := "01a17a9c4d2f7b3e8c5a6d4e2f1b0a93", req.Header.Get("X-Conversation-Request-Id"); got != want {
+		t.Fatalf("X-Conversation-Request-Id=%q want %q", got, want)
+	}
+
+	for _, forbidden := range []string{"conversation_message_id", "root_request_id", "tracestate"} {
+		if strings.Contains(req.Header.Get("Baggage"), forbidden) {
+			t.Errorf("baggage 不应包含 %q：%q", forbidden, req.Header.Get("Baggage"))
+		}
+	}
+
+	// baggage 只在 chat 面：agenttool 四路与轻头族各面都不发。
+	other, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/agenttool/v1/search", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.applyHeaders(surfaceSearch, other, account, "", ChatMeta{})
+
+	if got := other.Header.Get("Baggage"); got != "" {
+		t.Errorf("search baggage=%q want empty", got)
+	}
+}

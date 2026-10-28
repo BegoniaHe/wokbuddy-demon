@@ -394,9 +394,13 @@ func (*Client) chatSurfaceOverrides(srf surface, req *http.Request, account *aut
 		// 出图是非流式 JSON：Accept 改回 JSON，Content-Type 保持 chat 形态。
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
-	case surfaceChat, surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config,
-		surfaceGrowth:
-		// chat 面沿用上面构造的 chat 流式头集；轻头族各面已在 applyHeaders 分流。
+	case surfaceChat:
+		// chat 面补 W3C baggage（真机 4 条：buddy 两空值键 + 两个 codebuddy 键）。
+		req.Header.Set("Baggage", baggageValue(
+			req.Header.Get("X-Conversation-Id"), req.Header.Get("X-Conversation-Request-Id"),
+		))
+	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth:
+		// 轻头族各面已在 applyHeaders 分流。
 	}
 }
 
@@ -501,6 +505,19 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
 		// 不走轻头族（chatFamily() 已在 applyHeaders 分流）。
 	}
+}
+
+// baggageValue chat 面 W3C baggage 取值（真机逐字形态）：
+//
+//	buddyId=,buddyName=,codebuddy.session_id=<会话 id>,codebuddy.conversation_request_id=<请求 id>
+//
+// 真机只有这 4 条：buddy 两键是官方无 buddy 上下文时的空值形态，两个 codebuddy 键与
+// 同请求的 X-Conversation-Id / X-Conversation-Request-Id 逐项同值。官方包内还有
+// conversation_message_id / root_request_id 两个键常量，但 chat 真机没发——多发反而
+// 更明显（#364）。tracestate 仅在跨进程 span 携带时下发，网关无该状态，不伪造。
+func baggageValue(convID, convReqID string) string {
+	return "buddyId=,buddyName=,codebuddy.session_id=" + convID +
+		",codebuddy.conversation_request_id=" + convReqID
 }
 
 // domainHostFor 轻头族的 X-Domain：账号 domain（去 scheme 与尾斜杠）优先，
