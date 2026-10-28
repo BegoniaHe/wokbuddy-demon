@@ -188,16 +188,28 @@ func (c *Client) desktopUA(account *auth.Auth) string {
 	return c.desktopUAFor(account)
 }
 
-// billingSurfaceUA billing meter 类面（get-user-resource / summary / packages /
-// 签到 / balance）的 UA：显式 user_agent 覆盖优先，否则桌面三段式；
-// client_name="SaaS" 是显式逃生门——不写 UA 键，保留 Go transport 默认 UA。
-func (c *Client) billingSurfaceUA(account *auth.Auth) string {
+// billingMeterUA billing meter 类面（get-user-resource / summary / packages /
+// 签到 / balance）的 UA。
+//
+// 2026-10-28 真机抓包（mitmproxy 解密）证伪了「billing `context.http` 走
+// RestOperations 全局桌面 UA 拦截器」的推断：这三个端点没有任何拦截器，UA 就是
+// axios 库自身默认串。该值来自抓包而非包内片段，按仓库政策冻结在 profile 的
+// emit.billingMeterUA（source=traffic），不在代码里按版本号拼。
+//
+// 优先级：显式 user_agent > profile 抓包值 > 桌面三段式（profile 未重抓时回落，
+// 行为与灰度前一致）。client_name="SaaS" 是显式逃生门——不写 UA 键，保留 Go
+// transport 默认 UA。
+func (c *Client) billingMeterUA(account *auth.Auth) string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
 	}
 
 	if c.UserAgent != "" {
 		return c.UserAgent
+	}
+
+	if p := c.profileFor(account); p != nil && p.Emit.BillingMeterUA != "" {
+		return p.Emit.BillingMeterUA
 	}
 
 	return c.desktopUAFor(account)
@@ -207,7 +219,7 @@ func (c *Client) billingSurfaceUA(account *auth.Auth) string {
 func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 	switch srf {
 	case surfaceBilling, surfaceGrowth:
-		return c.billingSurfaceUA(account)
+		return c.billingMeterUA(account)
 	case surfaceReport:
 		return c.billingReportUA(account)
 	case surfaceModelBusy:
@@ -709,7 +721,7 @@ func validTraceID(str string) bool {
 }
 
 // attributionClientName 生效的自定义归属名：ClientName 非空取之；空 = 默认官方桌面端
-// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。billingUA / billingSurfaceUA 与
+// 形态（X-IDE-Name/Type=WorkBuddy、X-Product=SaaS）。billingUA / billingMeterUA 与
 // chatFamilyHeaders 共用它判断是否禁用 UA。
 func (c *Client) attributionClientName() string {
 	if c != nil && c.ClientName != "" {
@@ -836,7 +848,7 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 // 官方 `buildHeaders` 只有 Accept / Authorization / Content-Type / X-User-Id
 // （外加按需的企业与 X-Domain 头），没有 Accept-Language、没有
 // X-Requested-With，也没有 X-Device-Token（签到单独注入，见 Client.checkinHeaders）。
-// UA 见 billingSurfaceUA。
+// UA 见 billingMeterUA（axios 默认串，取自抓包）。
 func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 	c.applyHeaders(surfaceBilling, req, account6, "", ChatMeta{})
 }

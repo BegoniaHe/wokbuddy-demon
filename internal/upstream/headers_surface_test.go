@@ -253,3 +253,31 @@ func TestModelBusyEnterpriseAccountBareToo(t *testing.T) {
 		"X-Product", "Authorization", "X-User-Id", "X-Domain",
 	)
 }
+
+// TestBillingMeterUAAllMeterPaths billing meter 三个真实端点
+// （get-user-resource / summary / free-packages）共用 BillingHeaders，UA 恒为
+// profile 冻结的抓包值——官方该面 UA 由 axios 默认值补上，不是桌面拦截器（#374）。
+func TestBillingMeterUAAllMeterPaths(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	for _, path := range []string{
+		"/billing/meter/get-user-resource",
+		"/billing/meter/get-user-resource-summary",
+		"/billing/meter/get-user-resource-free-packages",
+		"/v2/billing/meter/checkin-activity-status",
+	} {
+		req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn"+path, http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		client.BillingHeaders(req, account)
+
+		if got := req.Header.Get("User-Agent"); got != billingMeterUAProfileFixture {
+			t.Errorf("%s User-Agent=%q want %q（profile 抓包值）", path, got, billingMeterUAProfileFixture)
+		}
+	}
+}
