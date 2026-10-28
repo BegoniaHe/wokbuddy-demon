@@ -66,6 +66,7 @@ DOMAIN=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin
 USER_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('uid',''))")
 ENT_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('enterprise_id',''))")
 NICKNAME=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('nickname',''))")
+EDITION=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('type',''))")
 
 if [[ -z "$USER_ID" ]]; then
     echo "无法获取 uid，请检查 token 是否有效"
@@ -134,18 +135,26 @@ WB2A_LOGIN_EXPIRES_AT="$EXPIRES_AT" \
 WB2A_LOGIN_DOMAIN="$DOMAIN" \
 WB2A_LOGIN_USER_ID="$USER_ID" \
 WB2A_LOGIN_ENT_ID="$ENT_ID" \
+WB2A_LOGIN_EDITION="$EDITION" \
 WB2A_LOGIN_NICKNAME="$NICKNAME" \
 WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
 WB2A_LOGIN_ACTION="$ACTION" \
 python3 - <<'PYEOF'
 import json, os
 
+account = {
+    "uid": os.environ["WB2A_LOGIN_USER_ID"],
+    "enterpriseId": os.environ["WB2A_LOGIN_ENT_ID"],
+    "nickname": os.environ["WB2A_LOGIN_NICKNAME"],
+}
+# type 是账号版本（personal / ultimate / exclusive），官方与企业 ID 并列用它判定
+# 企业版出站头；未取到时不写该键，避免塞空串。
+edition = os.environ.get("WB2A_LOGIN_EDITION", "")
+if edition:
+    account["type"] = edition
+
 auth = {
-    "account": {
-        "uid": os.environ["WB2A_LOGIN_USER_ID"],
-        "enterpriseId": os.environ["WB2A_LOGIN_ENT_ID"],
-        "nickname": os.environ["WB2A_LOGIN_NICKNAME"],
-    },
+    "account": account,
     "auth": {
         "accessToken": os.environ["WB2A_LOGIN_TOKEN"],
         "refreshToken": os.environ["WB2A_LOGIN_REFRESH"],

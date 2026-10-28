@@ -464,10 +464,11 @@ func TestReadServerRequestIDSkipsInvalidID(t *testing.T) {
 	}
 }
 
-// TestDesktopExpertHeadersPrivateDataPerRealm 桌面专家路径与 chat 同口径：
-// X-Private-Data 取 privateDataHeaderValue（CN 个人 false / 企业或 global true），
-// 避免两条 chat 出口出现第三种取值（issue #343）。
-func TestDesktopExpertHeadersPrivateDataPerRealm(t *testing.T) {
+// TestDesktopExpertHeadersPrivateDataAlwaysTrue 桌面专家路径是桌面主进程 chat
+// surface：官方 `applyGatewayHeaders` 的兜底表 `VF` 与 `buildVlmGatewayHeaders`
+// 都把 X-Private-Data 硬编码为 true（CN 5.9.3 / global 5.8.4 同形），与 CLI chat
+// 的 privateDataHeaderValue 分属两条 surface，不能共用（issue #343 / #348）。
+func TestDesktopExpertHeadersPrivateDataAlwaysTrue(t *testing.T) {
 	t.Parallel()
 
 	client := newProfileClient(t)
@@ -477,7 +478,7 @@ func TestDesktopExpertHeadersPrivateDataPerRealm(t *testing.T) {
 		account *auth.Auth
 		want    string
 	}{
-		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "false"},
+		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "true"},
 		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
 		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
 	}
