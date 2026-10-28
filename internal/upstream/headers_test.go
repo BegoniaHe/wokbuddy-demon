@@ -365,7 +365,9 @@ func TestRefreshHeadersTrace(t *testing.T) {
 		t.Errorf("X-B3-Sampled=%q want 1", got)
 	}
 
-	for _, name := range []string{"X-Conversation-Id", "X-Conversation-Request-Id", "X-Conversation-Message-Id", "X-Request-ID"} {
+	// 会话四件套不出现（refresh 不是对话轮）；X-Request-ID 是另一语义的
+	// 业务请求 ID，见 TestLightSurfaceGoldenHeaderSets。
+	for _, name := range []string{"X-Conversation-Id", "X-Conversation-Request-Id", "X-Conversation-Message-Id"} {
 		if got := req.Header.Get(name); got != "" {
 			t.Errorf("refresh 不应发 %s=%q", name, got)
 		}
@@ -491,7 +493,9 @@ func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 	}{
 		{"chat", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
 		{"images", func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) }},
-		{"search", func(req *http.Request) { client.SearchHeaders(req, account, "", ChatMeta{}) }},
+		{"search", func(req *http.Request) {
+			client.applyHeaders(surfaceSearch, req, account, "", ChatMeta{})
+		}},
 	}
 
 	for _, headerCase := range headerSets {

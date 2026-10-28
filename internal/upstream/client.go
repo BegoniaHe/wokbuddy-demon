@@ -3330,25 +3330,6 @@ func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults m
 	return c.effortsSnapshot("global"), c.defaultEffortsSnapshot("global")
 }
 
-// v3ConfigDomain /v3/config 的 X-Domain：优先账号落盘 domain，否则 chatBase host。
-func v3ConfigDomain(a *auth.Auth, chatBase string) string {
-	if a != nil {
-		// Domain 加锁快照（见 auth.DomainValue：keepalive 刷新在 a.mu 内改写）。
-		if d := strings.TrimSpace(a.DomainValue()); d != "" {
-			d = strings.TrimPrefix(d, "https://")
-			d = strings.TrimPrefix(d, "http://")
-
-			return strings.TrimSuffix(d, "/")
-		}
-	}
-
-	if u, err := url.Parse(chatBase); err == nil && u.Host != "" {
-		return u.Host
-	}
-
-	return "copilot.tencent.com"
-}
-
 // fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
 // ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
@@ -3410,25 +3391,7 @@ func (c *Client) newV3ConfigRequest(account8 *auth.Auth, str string) (*http.Requ
 		return nil, fmt.Errorf("newV3ConfigRequest: %w", err)
 	}
 
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	// AccessToken 加锁快照（同 fetchEnterpriseModels）。
-	req.Header.Set("Authorization", "Bearer "+account8.AccessTokenValue())
-
-	if account8 != nil && account8.UID != "" {
-		req.Header.Set("X-User-Id", account8.UID)
-	}
-
-	injectEnterpriseHeaders(req, account8)
-	req.Header.Set("X-Domain", v3ConfigDomain(account8, c.chatBase(account8)))
-	req.Header.Set("X-Product", "SaaS")
-
-	if str == "" {
-		str = codeBuddyIDEUA
-	}
-
-	req.Header.Set("User-Agent", str)
-	c.injectCodeBuddyRequest(req)
+	c.V3ConfigHeaders(req, account8, str)
 
 	return req, nil
 }

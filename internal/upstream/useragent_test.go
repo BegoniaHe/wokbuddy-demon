@@ -383,10 +383,12 @@ func TestBillingReportUA(t *testing.T) {
 	}
 }
 
-// TestBillingHeadersDefaultDesktopUA 官方 billing `buildHeaders` 本身不带 UA，
-// 但 `context.http` 的 RestOperations 注册了 WorkbuddyUserAgentHttpInterceptor，
-// 默认 meter 请求最终带桌面三段式 UA；billingUA() 仍保留给 report 用。
-func TestBillingHeadersDefaultDesktopUA(t *testing.T) {
+// billingMeterUAProfileFixture 测试 profile 冻结的 billing meter 抓包 UA（假值）。
+const billingMeterUAProfileFixture = "axios/9.9.9"
+
+// TestBillingMeterUAFromProfile billing meter 面 UA 取 profile 的抓包字段
+// （官方该面没有桌面 UA 拦截器，UA 是 axios 默认串，#374）。
+func TestBillingMeterUAFromProfile(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
@@ -411,26 +413,46 @@ func TestBillingHeadersDefaultDesktopUA(t *testing.T) {
 		t.Fatalf("userResource: %v", err)
 	}
 
-	if want := client.desktopUAFor(account); got != want {
-		t.Errorf("billing meter UA = %q want %q（桌面全局拦截器）", got, want)
+	if got != billingMeterUAProfileFixture {
+		t.Errorf("billing meter UA = %q want %q（profile 抓包值）", got, billingMeterUAProfileFixture)
 	}
 
-	if ua := client.billingUA(account); ua != "WorkBuddy/6.0.0" {
-		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", ua)
+	// 显式 user_agent 优先于 profile。
+	client.UserAgent = "BillingAgent/1"
+
+	if ua := client.billingMeterUA(account); ua != "BillingAgent/1" {
+		t.Errorf("billingMeterUA() = %q want BillingAgent/1", ua)
 	}
 
+	client.UserAgent = ""
 	client.ClientName = "SaaS"
-	if ua := client.billingUA(account); ua != "" {
-		t.Errorf("billingUA() SaaS = %q want empty", ua)
+
+	if ua := client.billingMeterUA(account); ua != "" {
+		t.Errorf("billingMeterUA() SaaS = %q want empty", ua)
 	}
 
-	// client_name="SaaS" 是显式逃生门：不写桌面 UA 键，回落 Go 默认 UA。
+	// client_name="SaaS" 是显式逃生门：不写 UA 键，回落 Go 默认 UA。
 	if _, _, err := client.UserResource(account); err != nil {
 		t.Fatalf("userResource SaaS: %v", err)
 	}
 
 	if got != "Go-http-client/1.1" {
 		t.Errorf("SaaS billing meter UA = %q want %q", got, "Go-http-client/1.1")
+	}
+}
+
+// TestBillingMeterUAWithoutCaptureFallsBackDesktop profile 未重抓（没有
+// emit.billingMeterUA）时回落桌面三段式，行为与灰度前一致。
+func TestBillingMeterUAWithoutCaptureFallsBackDesktop(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	client := &Client{Profile: testProfileSet(t)}
+	client.Profile.ForRealm("cn").Emit.BillingMeterUA = ""
+
+	if got, want := client.billingMeterUA(account), client.desktopUAFor(account); got != want {
+		t.Errorf("billing meter UA = %q want %q（回落 desktopUA）", got, want)
 	}
 }
 

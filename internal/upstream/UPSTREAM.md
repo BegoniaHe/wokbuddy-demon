@@ -86,11 +86,14 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - chat UA 由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 构造；第二段是 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`），显式 `client_version` / `cli_version` 覆盖时同样按 realm 取品牌；`/v2/report` 的 UA 是 desktop surface，两者不可混用。
 - 401 同号 refresh + replay；refresh 401/403 映射会话失效；同账号/同 RT refresh 单飞（60s 按需复用）。
 - 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端没给会话 ID 时生成 UUIDv4（不影响 prompt cache key）。
+- 出站头族按 **surface** 集中构造（`internal/upstream/headers.go` 的 `applyHeaders`）：chat 与 agenttool 四路复用 chat 头族，billing / report / refresh / v3-config / growth 走轻头族 base（Accept / Content-Type / UA / Authorization / X-User-Id / X-Domain / X-Request-ID）再按面覆盖。surface 差异只在该文件表达，调用点不得各自 Set / Del。
+- `upstream.user_agent` 是**全部出站**的显式逃生门：各面自带默认（chat 三段式 / billing meter 抓包串 / report 单段 / growth `node`）都让位给该值；`client_name="SaaS"` 仍是 billing 面的「不写 UA 键」逃生门。
 - 首条消息非 system 时补官方 `"You are CodeBuddy Code.\n"` fallback（CN/global 都补）。
 - `6004` 带重置、`14003` 模型级限流只冷该模型；`14003` 用 10s→1m 短窗且不喂路由熔断；`6004` 无重置按账号级保守退避并记模型审计；`11158` 仅在 400/404 时与 `11136` 同归账号级模型权限避让，429+11158 归限流。
-- billing/meter 的 summary / packages / get-user-resource 无前缀优先、`/v2` 回落（官方桌面 `resourcePrefix` 为空串）；签到例外保持 `/v2` 优先（官方 `DesktopAccountRepo.billingPrefix` 覆写为 `/v2`）。packages 按**桌面 daemon 用量链**取形：`UsageService.getPersonalUsage`（CN 5.9.3 `main/authority-snapshot.js@469554`）复用 `main/account.js` 的 `fetchUserResources` / `fetchAllPages`（`@378532`，`pageSize:200` 且以「不足 200 条」终止）与 `fetchResourcePackagesPage`（`@468153`），body 为 `{PageNumber, PageSize, PackageCodes, Status:[0,3], ...extra}`，paid 的 extra 是 `NeedRenewInfo:true`、free 的 extra 是 `buildSlicePeriodRange()`（`@378135`，导出名 `P`）的当日 `SlicePeriodStartTime`/`SlicePeriodEndTime` 窗口。`OnlyValidPeriod` / 无 slice 窗口的形态属渲染层 `CloudAccountRepo.validCreditPackages`（`@418501`，面板用量页用）那条 surface，本仓不采用。billing 的 `buildHeaders` 默认不带 UA，但 `context.http` 的 CellJS RestOperations 注册了 `WorkbuddyUserAgentHttpInterceptor`，meter 最终带桌面三段式 UA（`desktopUAFor`）；`Accept-Language` / `X-Device-Token` 默认不发：summary 与 packages 由调用方带 `Accept-Language: zh|en`（短码，不是 `zh-CN`/`en-US`），`/v2/report` 例外显式发单段 `WorkBuddy/<ver>` UA（显式 `user_agent` 优先），`X-Device-Token` 只在签到注入（`/v2/plugin/auth/state` 是面板登录面，不经 `internal/upstream`）。分 surface 取 base：桌面 report 走 `desktopBase`（即 `chatBase`），Web report 走 `webBase`，growth 任务 / 旅行走 `chatBase`，billing / 签到 / 活跃上报走 `billingBase`。本仓 CN billing 默认仍走 `codebuddy.cn`，可用 `cn.billing_base` 灰度切到 `workbuddy.cn`；小程序埋点固定 `codebuddy.cn`，不跟随覆盖。这是 surface 取舍，不是遗漏。
+- billing/meter 的 summary / packages / get-user-resource 无前缀优先、`/v2` 回落（官方桌面 `resourcePrefix` 为空串）；签到例外保持 `/v2` 优先（官方 `DesktopAccountRepo.billingPrefix` 覆写为 `/v2`）。packages 按**桌面 daemon 用量链**取形：`UsageService.getPersonalUsage`（CN 5.9.3 `main/authority-snapshot.js@469554`）复用 `main/account.js` 的 `fetchUserResources` / `fetchAllPages`（`@378532`，`pageSize:200` 且以「不足 200 条」终止）与 `fetchResourcePackagesPage`（`@468153`），body 为 `{PageNumber, PageSize, PackageCodes, Status:[0,3], ...extra}`，paid 的 extra 是 `NeedRenewInfo:true`、free 的 extra 是 `buildSlicePeriodRange()`（`@378135`，导出名 `P`）的当日 `SlicePeriodStartTime`/`SlicePeriodEndTime` 窗口。`OnlyValidPeriod` / 无 slice 窗口的形态属渲染层 `CloudAccountRepo.validCreditPackages`（`@418501`，面板用量页用）那条 surface，本仓不采用。billing 的 `buildHeaders` 不带 UA，且**没有**桌面 UA 拦截器：2026-10-28 抓包证伪了「RestOperations 全局 `WorkbuddyUserAgentHttpInterceptor`」的推断，meter 面的 UA 就是 axios 库默认串，冻结在 profile 的 `emit.billingMeterUA`（`source=traffic`；字段缺失时回落 `desktopUA`，需重抓 profile 后才逐字生效）。`Accept-Language` / `X-Device-Token` 默认不发：summary 与 packages 由调用方带 `Accept-Language: zh|en`（短码，不是 `zh-CN`/`en-US`），`/v2/report` 例外显式发单段 `WorkBuddy/<ver>` UA（显式 `user_agent` 优先），`X-Device-Token` 只在签到注入（`/v2/plugin/auth/state` 是面板登录面，不经 `internal/upstream`）。分 surface 取 base：桌面 report 走 `desktopBase`（即 `chatBase`），Web report 走 `webBase`，growth 任务 / 旅行走 `chatBase`，billing / 签到 / 活跃上报走 `billingBase`。本仓 CN billing 默认仍走 `codebuddy.cn`，可用 `cn.billing_base` 灰度切到 `workbuddy.cn`；小程序埋点固定 `codebuddy.cn`，不跟随覆盖。这是 surface 取舍，不是遗漏。
 - checkin 面有两个端点，本仓只做桌面那条：`/billing/meter/checkin-activity-status` 由官方桌面 daemon 走 `${endpoint}/v2/billing/meter/checkin-activity-status`（CN 5.9.3 `main/authority-snapshot.js@463251`，body `{}` + `getTuringDeviceTokenResult` 的 token 头），本仓 `CheckinActivityStatus` 覆盖的正是这条，也是调度器唯一调用方；`/billing/meter/checkin-status`（无 `-activity`）只出现在 IDE/CLI 侧 `BackendProvider.getCheckinStatus`（CN 5.9.3 `main/account.js@399217`、`renderer/assets/common-Cklb-JUT.js@443241`）与渲染层 IPC 面，本仓没有调用方，**刻意不实现**（不加推测性接口）。
 - `X-Device-Token-Error` 只在 Turing SDK 取不到 token 时发，取值是 SDK 原生错误串（CN 5.9.3 `main/turing-sdk.js@674` 的 `unsupported platform <platform>`、`@817` 的 `native/turing-sdk is missing from the application bundle`），发出前经 `sanitizeTuringHeaderValue` 截断到 64 字符 ASCII（`main/authority-snapshot.js@452286`；取用点 `getTuringDeviceTokenResult@454671`、`buildHeadersWithTuringToken@466339`（`checkin-activity-status` 的调用点 `@463317`））。本仓 device token 走 `upstream.device_token_file` / 每号 auth 文件的 `device_token` 兜底（`resolveDeviceToken`），没有同源错误域，因此**不发该头**——伪造取值等于自造指纹。
+- **刻意偏离：billing 面 `Accept-Encoding`**。真机是 `gzip, compress, deflate, br`；本仓不显式设置，交给 Go transport（发 `gzip` 并透明解压响应）。手工 Set 该头会关掉 `Transport.DisableCompression=false` 的自动解压，SSE 与 JSON 响应都得自己解，代价远大于收益，故不跟。
 - SSE 接受 `delta.reasoning`、重复 tool id 去重、`finish_reason` 后 EOF 正常收尾；reasoning-only 不记成功。
 - 签到两 realm `/v2` 优先；余额 summary 为主、旧端点兜底；模型目录应用 `availableModels` / `disabled` / `aliases`（企业 `/console/enterprises/<enterpriseId|personal>/models` 按账号拼接，`/v2/enterprises/personal/models` 回落仍固定 personal）。`/v1/models` 发现输出再按官方默认会话 agent（`/v3/config data.agents`，企业端点 `agents` 兜底；`tags` 含 default → `name=cli` → 首个有 models）裁剪，仅隐藏展示条目，`FetchModels`、面板与请求路由保持全量。
 - growth `/v2` 优先；travel claim 空对象 `{}` 首选（官方桌面固定 `post(path, {}, productHeaders)`，是空 JSON 对象不是零字节 body），`{record_id}` 仅作 400 兜底（record_id 为 0 时不兜底，调度器也不因缺它跳过领奖）；桌面 report `X-Domain` 为 host 形态，body 指纹带 `userAgent=Node.js/22`（官方 Electron 主进程 `navigator.userAgent`）与 `os=Win32`（官方 `navigator.platform`），与 HTTP 头 UA 不同源。
@@ -106,24 +109,26 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 | webfetch 的 `X-Wb-Uid` | 与 `X-User-Id` 同值（账号 uid） | `WebFetch` 单独注入 | 官方只在 webfetch / knowledge_search 发，不扩散到 search / agentic_search / images |
 | agentic_search | `Content-Type` / `Authorization` / 可选 `X-Conversation-Request-ID` | 复用 chat 头族 + `Accept: text/event-stream` | 同上；SSE 契约优先 |
 | images（generations + edits） | Content-Type / Authorization / conversation / identity | 复用 chat 头族 | 同上；两个端点同族同策略 |
-| chat/busy | renderer `wb.http.post` | 复用 chat 头族 | 同上 |
+| growth（`/v2/activity/growth/*`） | Node 原生 `fetch`：`user-agent: node`（显式 `upstream.user_agent` 仍优先，见下）、`accept-language: *`、`sec-fetch-mode: cors`、`accept-encoding: br, gzip, deflate`，无 `X-Request-ID` / `X-Product` / `X-Requested-With` | 独立轻头族（`surfaceGrowth`，`GrowthHeaders`） | 2026-10-28 真机 `buddy/info` 逐字比对（#375）。实测只命中 `buddy/info` 一条；`travel/status\|depart\|claim`、`streak`、`tasks`、`heatmap`、`lottery`、`makeup-cards` 同仓库同域同为 `productHeaders` 来源，按**同面假设**复用，尚无逐路径抓包 |
+| chat/busy | renderer `wb.http.post`，8 个轻头（`Accept` 宽松值 / `Content-Type` / 三段 UA / `X-Request-ID` / `X-Product: SaaS` / `Authorization` / `X-User-Id` / `X-Domain`） | 独立轻头族（`surfaceModelBusy`） | 2026-10-28 真机：该路径没有任何会话头 / `acp-connection-id` / `baggage` / b3 / `x-stainless-*` / `X-Codebuddy-Request`（#371）。企业账号的 `X-Enterprise-Id` / `X-Tenant-Id` 取舍：真机样本是个人号，无证据，按「不猜测」不发 |
 
 证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.9.3 包内
 `X-Agent-Runtime` 已是基线行为（`normalizeAgentRuntime` 不在枚举内回落 `other`），
-官方在 chat / images / search / webfetch 全发；本仓统一由 `ChatHeaders` 发官方兜底值
-`other`（网关没有 session meta / `CODEBUDDY_AGENT_RUNTIME` 来源）。同版 `X-Wb-Uid`
-只出现在 webfetch（与 knowledge_search），取值与 `X-User-Id` 同源，故仅在 `WebFetch`
-单独注入，不扩散到 search / agentic_search / images。版本值仍只来自部署 profile，
-不进入仓库内置常量。
+官方在 chat / images / search / webfetch 全发；本仓由 chat 头族（`chatFamilyHeaders`）
+统一发官方兜底值 `other`（网关没有 session meta / `CODEBUDDY_AGENT_RUNTIME` 来源）。
+同版 `X-Wb-Uid` 只出现在 webfetch（与 knowledge_search），取值与 `X-User-Id` 同源，
+故只在 `surfaceWebFetch` 注入，不扩散到 search / agentic_search / images。
+版本值仍只来自部署 profile，不进入仓库内置常量。
 
 chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 
 | 项 | 状态 | 依据 |
 | --- | --- | --- |
 | refresh trace（`X-Trace-Id` / `Traceparent` / `B3` / `X-B3-*`） | 已对齐 | 官方 `cli/dist/codebuddy-lite-wb.mjs` 的 `AccountScopedAuth.refreshSession()` 追加 `traceSpan.requestHeaders`；网关无活动 span，故生成自洽的新链路 id |
-| CN refresh `X-Domain` | 已对齐 | 官方 `enterpriseHeaders()` 无 domain 时回落 endpoint authority；本仓回落 chat endpoint host，`cn.chat_base` 覆盖时跟随 |
+| 轻头族 `X-Domain` | 已对齐 | 官方 `enterpriseHeaders()` 无 domain 时回落 **endpoint authority**；轻头族各面（refresh / v3-config / billing / report / busy / growth）统一按本次请求 URL 的 host 取值，不回落 chat base——billing 面走 `billing_base`，取 chat host 会把别的域发给 billing。`cn.chat_base` / `cn.billing_base` 覆盖时各自跟随 |
+| 非 chat 业务面的 `X-Request-ID` | 已对齐（refresh / v3-config / billing / busy / report） | 官方 HTTP 层 `applyRequestId` 对每条业务请求补 32 hex（UUIDv7 形态）；`/v2/activity/growth/*` 是 Node 裸 fetch 面，真机**不带**该头，故 growth 不在覆盖范围（#369 / #375） |
 | `X-Stainless-*` | 不补 | 由 OpenAI Node SDK 自动生成；本仓出站不是 Node SDK，补等于伪造 SDK 运行时版本 |
-| `X-Codebuddy-Request: 1` | 刻意保留 | D1 风控闸门头；官方 chat adapter 未注入、daemon/ACP 注入，但无实测证明移除安全 |
+| `X-Codebuddy-Request: 1` | 仅 chat 族（chat + agenttool 四路） | 2026-10-28 真机抓包：7 条 chat 全带；refresh / busy / report / v3-config / billing / growth 共 14 条业务请求 0 命中（#368）。agenttool 四路无真机证据，沿 chat 头族一起发 |
 | 个人号 `X-No-Enterprise-Id` / `X-No-Department-Info` | 刻意保留 | 非 chat 端点也声明无部门信息（#298），按 chat-only 收窄会回退该修复 |
 | `X-Private-Data`（CLI chat） | 已对齐（按账号身份） | CN 5.9.3 的 `applyPrivateDataHeaderPolicy` 在个人号默认分支发 `false`、企业号（`isEnterpriseEditionAccount`：enterpriseId 非空或 type 为 ultimate/exclusive）发 `true`；global 基线仍是 5.8.4，走 `DisableYuanbaoChannel=true` 仍发 `true`，升到 5.9.x 后按同一逻辑复核。远端 abTest / 会话 meta `privateDataSticky` 不在网关范围 |
 | `X-Private-Data`（桌面专家路径） | 已对齐（固定 `true`） | 官方桌面主进程 chat 走 `applyGatewayHeaders`，兜底表 `VF` 里该头硬编码 `true`；`buildVlmGatewayHeaders` 同样硬编码。与 CLI chat 分属两条 surface，不能共用阈值；CN 5.9.3 / global 5.8.4 同形 |

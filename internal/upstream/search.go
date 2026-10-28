@@ -77,29 +77,15 @@ type SearchOutcome struct {
 	ResponseTimeMs int64          `json:"response_time_ms,omitempty"`
 }
 
-// SearchHeaders 搜索请求头。
+// agenttool 四路的头族差异（Accept / Content-Type / X-Wb-Uid）在 headers.go 的
+// chatFamilyHeaders 里按 surface 集中表达：search 与 webfetch 是非流式 JSON
+// （Content-Type 带 charset），agentic_search 走 SSE（Accept: text/event-stream），
+// 只有 webfetch 带 X-Wb-Uid。
 //
-// 复用 ChatHeaders 的桌面端全套头族，再按官方 WebSearchTool 的差异覆盖三处：
-//   - Accept：搜索是非流式 JSON（ChatHeaders 为 chat 流式设成 event-stream，必须覆盖）
-//   - Content-Type：官方带 charset（CommonHeaders 的 chat 形态不带）
-//   - X-Agent-Intent：官方固定 "craft"（搜索请求不携带会话 mode）
-//
-// X-Agent-Runtime 不再单独覆盖：5.9.3 起官方在 chat / images / search / webfetch 全发，
-// 统一由 ChatHeaders 发官方兜底值 other。
-//
-// 为什么整体复用而不是照抄官方精简头清单：官方 CLI 的搜索头就是它同一个客户端的
-// 通用头（chat 与搜索共用同一 UA 与会话头族）。本仓库出站身份是桌面端，若搜索另发
-// 一套精简头，上游会看到「同账号同时段两种客户端指纹」，反而更像异常。
-// 决策记录见 `internal/upstream/UPSTREAM.md` §六：非 chat 端点沿用统一桌面指纹，
-// 不按 surface 拆分；改动前先看该记录。
-//
-//nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一口径（公开 API 简单）。
-func (c *Client) SearchHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {
-	c.ChatHeaders(req, account, clientIP, meta)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("X-Agent-Intent", "craft")
-}
+// 为什么整体复用 chat 头族而不是照抄官方精简头清单：官方 CLI 的搜索头就是它同一个
+// 客户端的通用头（chat 与搜索共用同一 UA 与会话头族）。本仓库出站身份是桌面端，若
+// 搜索另发一套精简头，上游会看到「同账号同时段两种客户端指纹」，反而更像异常。
+// 决策记录见 `internal/upstream/UPSTREAM.md` §六。
 
 // ClampSearchMaxResults 把调用方给的条数收敛到 [1, SearchMaxResultsCap]；
 // <=0 视为未指定，回落官方默认值。
@@ -251,7 +237,7 @@ func (c *Client) Search(
 	ctx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
-	req, err := c.newAgentToolRequest(ctx, account, searchPath, body, "application/json", meta)
+	req, err := c.newAgentToolRequest(ctx, account, searchPath, body, surfaceSearch, meta)
 	if err != nil {
 		return nil, fmt.Errorf("search request: %w", err)
 	}
@@ -260,10 +246,10 @@ func (c *Client) Search(
 }
 
 // newAgentToolRequest 构造 agenttool 系请求（search / webfetch / agentic_search）：
-// base 先归一，再复用 SearchHeaders 的同源头族，按端点覆盖 Accept。
+// base 先归一，头族按 surface 由 applyHeaders 统一构造（差异见 chatFamilyHeaders）。
 func (c *Client) newAgentToolRequest(
-	//nolint:gocritic // ChatMeta 值传递与 SearchHeaders 保持同一口径。
-	ctx context.Context, account *auth.Auth, path string, body []byte, accept string, meta ChatMeta,
+	//nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一口径。
+	ctx context.Context, account *auth.Auth, path string, body []byte, srf surface, meta ChatMeta,
 ) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(
 		ctx, http.MethodPost, normalizeChatBase(c.chatBase(account))+path, bytes.NewReader(body),
@@ -272,8 +258,7 @@ func (c *Client) newAgentToolRequest(
 		return nil, fmt.Errorf("new agenttool request: %w", err)
 	}
 
-	c.SearchHeaders(req, account, "", meta)
-	req.Header.Set("Accept", accept)
+	c.applyHeaders(srf, req, account, "", meta)
 
 	return req, nil
 }

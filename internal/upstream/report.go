@@ -27,19 +27,11 @@ import (
 const reportPath = "/v2/report"
 
 // billingJSON 发 billing 域（billingBase，codebuddy.cn）请求并解信封；body 为 nil 时不带请求体。
-// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + BillingHeaders；billing 域走 billingBase）。
-// report/checkin 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+// 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + growth 头族；billing 域走 billingBase）。
+// checkin / balance 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
+// 活跃上报走 reportJSON（surfaceReport 头族），不在此列。
 func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessage, error) {
 	return c.billingJSONLimit(a, path, body, defaultJSONBodyLimit)
-}
-
-// billingJSONHeaders 同 billingJSON，额外注入调用方指定的请求头
-// （summary / packages 的 Accept-Language、report 的显式 UA、签到的 device token）。
-// headers 为空时不额外注入。
-func (c *Client) billingJSONHeaders(
-	a *auth.Auth, path string, body any, headers map[string]string,
-) (json.RawMessage, error) {
-	return c.billingJSONLimitHeaders(a, path, body, defaultJSONBodyLimit, headers)
 }
 
 // billingJSONLimit 同 billingJSON，允许调用方指定响应体上限（逐笔用量页含 prompt，
@@ -54,13 +46,24 @@ func (c *Client) billingJSONLimit(
 func (c *Client) billingJSONLimitHeaders(
 	a *auth.Auth, path string, body any, maxBytes int64, headers map[string]string,
 ) (json.RawMessage, error) {
-	return c.domainJSONLimitHeaders(a, c.billingBase(a), http.MethodPost, path, body, maxBytes, headers)
+	return c.domainJSONLimitHeaders(
+		a, surfaceBilling, c.billingBase(a), http.MethodPost, path, body, maxBytes, headers,
+	)
+}
+
+// reportJSON 活跃上报面（POST {billingBase}/v2/report）请求：surfaceReport 头族 +
+// billing 域 base，body 为事件数组。
+func (c *Client) reportJSON(a *auth.Auth, body any) (json.RawMessage, error) {
+	return c.domainJSONLimitHeaders(
+		a, surfaceReport, c.billingBase(a), http.MethodPost, reportPath, body, defaultJSONBodyLimit, nil,
+	)
 }
 
 // domainJSONLimitHeaders 对指定 base 域发请求并解信封，额外指定响应体上限与
-// 调用方指定的请求头。
+// 调用方指定的请求头。头族按 surface 由 applyHeaders 构造。
 func (c *Client) domainJSONLimitHeaders(
-	account *auth.Auth, base, method, path string, body any, maxBytes int64, headers map[string]string,
+	account *auth.Auth, srf surface, base, method, path string, body any, maxBytes int64,
+	headers map[string]string,
 ) (json.RawMessage, error) {
 	var rdr io.Reader
 
@@ -78,7 +81,7 @@ func (c *Client) domainJSONLimitHeaders(
 		return nil, fmt.Errorf("domainJSONLimit: %w", err)
 	}
 
-	c.BillingHeaders(req, account)
+	c.applyHeaders(srf, req, account, "", ChatMeta{})
 
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -266,15 +269,7 @@ func (c *Client) ReportChatActivityModel(
 		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
 
-	// billing 域 /v2/report 是单段 UA 例外：官方桌面端在该面显式发 `WorkBuddy/<ver>`
-	// （banner / 白名单类同形），其余 billing 端点走 RestOperations 全局拦截器的
-	// desktopUAFor 三段式（见 BillingHeaders）。
-	headers := map[string]string{}
-	if ua := c.billingReportUA(account2); ua != "" {
-		headers["User-Agent"] = ua
-	}
-
-	_, err = c.billingJSONHeaders(account2, reportPath, json.RawMessage(raw), headers)
+	_, err = c.reportJSON(account2, json.RawMessage(raw))
 
 	return err
 }

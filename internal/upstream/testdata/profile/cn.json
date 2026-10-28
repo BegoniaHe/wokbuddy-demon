@@ -20,17 +20,54 @@
     "desktopIdeVersion": "9.9.9",
     "desktopExtVersion": "9.9.9",
     "loginPlatform": "workbuddy",
-    "loginUA": "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8"
+    "loginUA": "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+    "billingMeterUA": "axios/9.9.9"
   },
   "missing": [],
   "evidence": {
-    "chatUA": {"source": "package", "file": "cli/dist/codebuddy-lite-wb.mjs", "snippet": "x"},
-    "desktopUA": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
-    "billingUA": {"source": "package", "file": "main/tar.js", "snippet": "x"},
-    "xIdeVersion": {"source": "package", "file": "main/server.js", "snippet": "x"},
-    "desktopIdeVersion": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
-    "desktopExtVersion": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
-    "loginPlatform": {"source": "package", "file": "cli/product.json", "snippet": "x"},
-    "loginUA": {"source": "package", "file": "main/module-base.js", "snippet": "x"}
+    "chatUA": {
+      "source": "package",
+      "file": "cli/dist/codebuddy-lite-wb.mjs",
+      "snippet": "x"
+    },
+    "desktopUA": {
+      "source": "package",
+      "file": "main/module-base.js",
+      "snippet": "x"
+    },
+    "billingUA": {
+      "source": "package",
+      "file": "main/tar.js",
+      "snippet": "x"
+    },
+    "xIdeVersion": {
+      "source": "package",
+      "file": "main/server.js",
+      "snippet": "x"
+    },
+    "desktopIdeVersion": {
+      "source": "package",
+      "file": "main/module-base.js",
+      "snippet": "x"
+    },
+    "desktopExtVersion": {
+      "source": "package",
+      "file": "main/module-base.js",
+      "snippet": "x"
+    },
+    "loginPlatform": {
+      "source": "package",
+      "file": "cli/product.json",
+      "snippet": "x"
+    },
+    "loginUA": {
+      "source": "package",
+      "file": "main/module-base.js",
+      "snippet": "x"
+    },
+    "billingMeterUA": {
+      "source": "traffic",
+      "note": "2026-10-28 抓包 /billing/meter/* 用户面 UA（测试假值）"
+    }
   }
 }

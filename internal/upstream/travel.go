@@ -1,5 +1,5 @@
 // travel.go growth 域「猫猫旅行」接口：状态查询 / 派出 / 领奖 / 领养 / 协议。
-// 全部走 chatBase + BillingHeaders，信封同 doJSON；路径默认 /v2 优先、404 回落旧路径。
+// 全部走 chatBase + growth 头族，信封同 doJSON；路径默认 /v2 优先、404 回落旧路径。
 package upstream
 
 import (
@@ -67,7 +67,7 @@ func (c *Client) growthJSONPath(
 	account *auth.Auth, method, path string, body any, headers map[string]string,
 ) (json.RawMessage, error) {
 	return c.domainJSONLimitHeaders(
-		account, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers,
+		account, surfaceGrowth, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers,
 	)
 }
 
