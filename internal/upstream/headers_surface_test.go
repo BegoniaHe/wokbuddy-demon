@@ -146,7 +146,7 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 			url:  "https://www.workbuddy.cn/v3/config",
 			call: func(req *http.Request) { client.V3ConfigHeaders(req, account, "") },
 			keys: []string{
-				"Accept", "Authorization", "Content-Type", "User-Agent", "X-Domain",
+				"Accept", "Authorization", "User-Agent", "X-Domain",
 				"X-No-Enterprise-Id", "X-Product", "X-Request-Id", "X-Requested-With",
 				"X-User-Id",
 			},

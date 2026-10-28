@@ -476,6 +476,9 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("X-Product", "SaaS")
+		// GET 无 body，真机两路 v3-config 都不带 Content-Type；轻头族 base 会多发，
+		// 这里删掉（重构前 newV3ConfigRequest 也没有该头）。
+		req.Header.Del("Content-Type")
 		injectEnterpriseHeaders(req, account)
 	case surfaceGrowth:
 		// 官方 growth 面是 Node fetch：UA=node、accept-language=*、sec-fetch-mode=cors，
