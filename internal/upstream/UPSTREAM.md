@@ -126,6 +126,17 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | `X-Private-Data`（桌面专家路径） | 已对齐（固定 `true`） | 官方桌面主进程 chat 走 `applyGatewayHeaders`，兜底表 `VF` 里该头硬编码 `true`；`buildVlmGatewayHeaders` 同样硬编码。与 CLI chat 分属两条 surface，不能共用阈值；CN 5.9.3 / global 5.8.4 同形 |
 | custom model 的 `X-Private-Data` | 不适用 | 本仓没有 custom 模型上游路由（`isCustomModel` 仅用于模型目录可见性），无触达路径 |
 
+无桌面包证端点（**实现依据 ≠ 已对齐官方客户端**；检索范围：截至 CN 5.9.3、CN 5.8.3、global 5.8.4 三包 `app-asar` 内 `*.js` / `*.mjs` 均为 0 命中，路径字面量不出现）：
+
+| 路径 | 实现位置（符号为准，行号仅提示） | 契约来源 / 口径 |
+| --- | --- | --- |
+| `/billing/meter/get-user-request-usage` | `internal/upstream/requestusage.go:19-20`（#31） | 第三方 WorkDaddy 脚本 `credit-request-usage.js` + 实测 |
+| `/billing/ide/trial` | `internal/upstream/trial.go:13`（`global_register.go` 亦有记录） | 实测 / 参考实现 |
+| `/billing/area/get-country-code` | `internal/upstream/global_register.go:124` | 实测 / 参考实现 |
+| `/billing/meter/claim-gift`、`claim-compensation`、`compensation-status` | `internal/upstream/blackcat.go:92,97`、`compensation.go:28` | 本文件末尾「桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准」总口径已覆盖，不单独论证 |
+
+读这张表时不要反推「官方客户端里有这个端点」：前三条的形态来自第三方脚本、参考实现或实测，`claim-*` / `compensation-status` 出自 Web 契约；四行在桌面 static 包内都没有任何字面量证据。要重新论证时按上表列为起点，而不是把它们当作已对齐桌面。
+
 桌面包内没有证据的任务体系（连登/抽奖/补签/礼包/补偿/校园活动）继续以 Web 契约为准，不随桌面端迁移。
 
 ## 七、参考 fork 审计工具（sync-upstream 技能）

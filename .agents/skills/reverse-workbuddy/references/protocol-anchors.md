@@ -120,3 +120,8 @@
   （`internal/upstream/{search,webfetch,agentic_search}.go`）。
 - `/v2/user-asset/*`：appearance/set 已覆盖，skill/assets 族未覆盖。
 - `/v2/service-proxy`、`/v3/group/*`、`/v2/spans`：客户端内部域，非网关目标。
+
+无桌面包证的端点（`get-user-request-usage`、`/billing/ide/trial`、
+`/billing/area/get-country-code` 等，契约来自第三方脚本 / 实测 / 参考实现）集中列在
+`internal/upstream/UPSTREAM.md` §六「无桌面包证端点」表，写报告时按那张表取来源口径，
+不要当成已对齐官方客户端。
