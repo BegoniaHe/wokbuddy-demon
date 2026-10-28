@@ -455,3 +455,58 @@ func TestBillingMeterUAWithoutCaptureFallsBackDesktop(t *testing.T) {
 }
 
 var _ = io.Discard
+
+// TestUserAgentOverrideDesktopSurfaces 桌面面上报（/v2/report 桌面指纹、user-asset、
+// 专家市场）同样受 upstream.user_agent 覆盖：这些请求此前直接取 profile 字面量，
+// 绕过配置项「非空时全路径生效」的契约。
+func TestUserAgentOverrideDesktopSurfaces(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	const want = "CustomDesktop/1.0"
+
+	cases := []struct {
+		name string
+		call func(c *Client) error
+	}{
+		{"desktop_report", func(c *Client) error {
+			return c.ReportDesktopEvent(account, DesktopEvent{"eventCode": "agent_task_created"})
+		}},
+		{"appearance_set", func(c *Client) error {
+			return c.SetAppearanceTheme(account, "light")
+		}},
+		{"market_expert_list", func(c *Client) error {
+			_, err := c.MarketExpertList(account, "agent")
+
+			return err
+		}},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var got string
+
+			client := &Client{
+				HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+					got = r.Header.Get("User-Agent")
+
+					return jsonResp(200, `{"code":0,"data":{"experts":[]}}`), nil
+				})},
+				ChatBaseCN: "https://chat.example",
+				UserAgent:  want,
+				Profile:    testProfileSet(t),
+			}
+
+			if err := testCase.call(client); err != nil {
+				t.Fatalf("call: %v", err)
+			}
+
+			if got != want {
+				t.Errorf("UA = %q want %q（显式 user_agent 必须全路径生效）", got, want)
+			}
+		})
+	}
+}

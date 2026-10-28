@@ -144,19 +144,25 @@ func userResourcePaths() []string {
 	return []string{"/billing/meter/get-user-resource", "/v2/billing/meter/get-user-resource"}
 }
 
-func fetchUserResource(account *auth.Auth) (remain, used, size int64, packs int, err error) {
-	return fetchUserResourceAt(&http.Client{Timeout: 20 * time.Second}, billingBaseFor(account), account)
+func fetchUserResource(
+	client *upstream.Client, account *auth.Auth,
+) (remain, used, size int64, packs int, err error) {
+	// UA 与服务端 billing meter 面同源：CLI 用 Go 默认 UA 打同一端点，是明显的
+	// 非官方指纹（且与 chat 面不一致）。
+	agent := client.BillingMeterUserAgent(account)
+
+	return fetchUserResourceAt(&http.Client{Timeout: 20 * time.Second}, billingBaseFor(account), account, agent)
 }
 
 // fetchUserResourceAt 在指定计费域上按 userResourcePaths 依序请求：仅 404 换下一候选，
 // 其余错误直接返回。base 由调用方给出，便于按域测试回落链。
 func fetchUserResourceAt(
-	client *http.Client, base string, account *auth.Auth,
+	client *http.Client, base string, account *auth.Auth, agent string,
 ) (remain, used, size int64, packs int, err error) {
 	paths := userResourcePaths()
 
 	for i, path := range paths {
-		req, reqErr := newUserResourceRequest(base, path, account)
+		req, reqErr := newUserResourceRequest(base, path, account, agent)
 		if reqErr != nil {
 			return 0, 0, 0, 0, reqErr
 		}
@@ -191,7 +197,7 @@ func fetchUserResourceAt(
 // newUserResourceRequest 构造 meter/get-user-resource 请求：计费域与路径由调用方给出
 // （见 billingBaseFor / userResourcePaths），并带上账号身份头
 // （X-User-Id / X-Enterprise-Id / X-Tenant-Id / X-Domain）。
-func newUserResourceRequest(base, path string, account *auth.Auth) (*http.Request, error) {
+func newUserResourceRequest(base, path string, account *auth.Auth, agent string) (*http.Request, error) {
 	now := time.Now()
 
 	body, err := json.Marshal(map[string]any{
@@ -214,6 +220,10 @@ func newUserResourceRequest(base, path string, account *auth.Auth) (*http.Reques
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
+
+	if agent != "" {
+		req.Header.Set("User-Agent", agent)
+	}
 
 	if account.UID != "" {
 		req.Header.Set("X-User-Id", account.UID)
@@ -372,7 +382,7 @@ func collectAccounts(files []string, client *upstream.Client) []accountResult {
 			continue
 		}
 
-		remain, used, size, packs, err := fetchUserResource(account)
+		remain, used, size, packs, err := fetchUserResource(client, account)
 		if err != nil {
 			res.Error = err.Error()
 		} else {

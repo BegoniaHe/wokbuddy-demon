@@ -186,6 +186,14 @@ func (c *Client) billingMeterUA(account *auth.Auth) string {
 	return c.desktopUAFor(account)
 }
 
+// BillingMeterUserAgent billing meter 面的出站 UA，供复用同一批 billing 端点的
+// 进程内 CLI（cmd/credit）对齐服务端指纹。优先级与出站路径同源
+// （显式 user_agent > profile 抓包值 > 桌面三段式；client_name="SaaS" 返回空串），
+// 避免第二份优先级逻辑各自漂移。
+func (c *Client) BillingMeterUserAgent(a *auth.Auth) string {
+	return c.billingMeterUA(a)
+}
+
 // lightUA 轻头族各面的 UA：显式 user_agent 覆盖优先（各面自带默认见下）。
 func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 	switch srf {

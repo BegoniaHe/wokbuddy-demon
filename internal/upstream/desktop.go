@@ -101,6 +101,9 @@ func (c *Client) desktopExtVersionFor(account *auth.Auth) string {
 // desktopUAFor 桌面上报/白名单类出站 UA：直接取 profile 冻结字面量。
 // 与 chat 链路的 SDK 形态不同：这是 /v2/report 等非 SDK 请求的官方形态。
 // profile 缺失返回空串（启动期已拒绝该状态）。
+//
+// 调用点请用 desktopUA（先看 upstream.user_agent 覆盖）——本函数只是 profile 字面量
+// 取值器，直接调它会绕过配置项契约「非空时全路径生效」。
 func (c *Client) desktopUAFor(account *auth.Auth) string {
 	if p := c.profileFor(account); p != nil {
 		return p.Emit.DesktopUA
@@ -405,7 +408,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	req.Header.Set("Authorization", "Bearer "+account2.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", c.desktopUAFor(account2))
+	req.Header.Set("User-Agent", c.desktopUA(account2))
 	req.Header.Set("X-Domain", c.desktopDomain(account2))
 	req.Header.Set("X-Product", "SaaS")
 	injectEnterpriseHeaders(req, account2)
@@ -545,7 +548,7 @@ func (c *Client) SetAppearanceTheme(account *auth.Auth, resourceKey string) erro
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", c.desktopUAFor(account))
+	req.Header.Set("User-Agent", c.desktopUA(account))
 	req.Header.Set("X-Product", "SaaS")
 
 	if account.UID != "" {
@@ -743,7 +746,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 
 	req.Header.Set("Authorization", "Bearer "+account4.AccessTokenValue())
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", c.desktopUAFor(account4))
+	req.Header.Set("User-Agent", c.desktopUA(account4))
 	req.Header.Set("X-Domain", c.desktopDomain(account4))
 	req.Header.Set("X-Product", "SaaS")
 
