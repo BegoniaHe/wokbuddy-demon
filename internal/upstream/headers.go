@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
@@ -329,10 +330,12 @@ func (c *Client) chatFamilyHeaders(
 	// 一条都没有，故只在本族（chat + agenttool 四路，agenttool 无真机证据、沿 chat
 	// 头族一起发）注入；轻头族各面不发（#368）。
 	req.Header.Set("X-Codebuddy-Request", "1")
-	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime；
-	// 网关没有 session meta / CODEBUDDY_AGENT_RUNTIME 来源，统一发官方兜底值 other。
+	// Accept 沿用 CommonHeaders 的 application/json：真机 chat（含 stream:true）也发
+	// application/json，不改 text/event-stream（#377）。agenttool 四路的 Accept 差异
+	// 见 chatSurfaceOverrides。
+	// 官方 5.9.3 在 chat / images / search / webfetch 全发 X-Agent-Runtime。
+	// 默认官方兜底值 other；chat 面在 chatSurfaceOverrides 里改成真机实际取值
+	// local-agent（agenttool 四路无真机证据，维持 other，#373）。
 	req.Header.Set("X-Agent-Runtime", "other")
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
 	// （见 auth.AccessTokenValue 注释）。
@@ -394,9 +397,17 @@ func (*Client) chatSurfaceOverrides(srf surface, req *http.Request, account *aut
 		// 出图是非流式 JSON：Accept 改回 JSON，Content-Type 保持 chat 形态。
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
-	case surfaceChat, surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config,
-		surfaceGrowth:
-		// chat 面沿用上面构造的 chat 流式头集；轻头族各面已在 applyHeaders 分流。
+	case surfaceChat:
+		// X-Agent-Runtime：官方 `other` 只在取不到会话 runtime 时出现（not-in-enum
+		// 兜底分支）；桌面本地会话恒为 local-agent，真机 other 0 次。网关模拟的是
+		// 本地会话，故发 local-agent。
+		req.Header.Set("X-Agent-Runtime", "local-agent")
+		// chat 面补 W3C baggage（真机 4 条：buddy 两空值键 + 两个 codebuddy 键）。
+		req.Header.Set("Baggage", baggageValue(
+			req.Header.Get("X-Conversation-Id"), req.Header.Get("X-Conversation-Request-Id"),
+		))
+	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth:
+		// 轻头族各面已在 applyHeaders 分流。
 	}
 }
 
@@ -503,6 +514,19 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 	}
 }
 
+// baggageValue chat 面 W3C baggage 取值（真机逐字形态）：
+//
+//	buddyId=,buddyName=,codebuddy.session_id=<会话 id>,codebuddy.conversation_request_id=<请求 id>
+//
+// 真机只有这 4 条：buddy 两键是官方无 buddy 上下文时的空值形态，两个 codebuddy 键与
+// 同请求的 X-Conversation-Id / X-Conversation-Request-Id 逐项同值。官方包内还有
+// conversation_message_id / root_request_id 两个键常量，但 chat 真机没发——多发反而
+// 更明显（#364）。tracestate 仅在跨进程 span 携带时下发，网关无该状态，不伪造。
+func baggageValue(convID, convReqID string) string {
+	return "buddyId=,buddyName=,codebuddy.session_id=" + convID +
+		",codebuddy.conversation_request_id=" + convReqID
+}
+
 // domainHostFor 轻头族的 X-Domain：账号 domain（去 scheme 与尾斜杠）优先，
 // 否则取 endpoint 的 host（真机为产品域 host 形态，不是完整 URL）。
 func domainHostFor(account *auth.Auth, endpoint string) string {
@@ -538,7 +562,8 @@ func domainHostFor(account *auth.Auth, endpoint string) string {
 func (c *Client) CommonHeaders(req *http.Request, account2 *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
-	// chat 流式路径在 chatFamilyHeaders 覆盖。
+	// chat 面真机也发 application/json（#377），不再按流式覆盖；轻头族各面在自己的
+	// 分支里覆盖（busy / refresh / v3-config 是宽松值）。
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("User-Agent", c.userAgent(account2))
@@ -562,7 +587,8 @@ func billingAcceptLanguage(a *auth.Auth) string {
 // ChatMeta 一次 chat 出站的会话头族元数据（issue #35：后台按 X-Conversation-Request-ID
 // 聚合请求，官方客户端一次 user send 内所有 tool call/重试/换号复用同一个 ID）。
 // handler 在轮转循环外生成 conversationID / conversationRequestID，循环内每次出站
-// 复用同值；TraceID 透传入站值（空 = 回落 conversationRequestID）。
+// 复用同值；TraceID 透传入站值（空 = 独立生成随机 32 hex，不再回落
+// conversationRequestID——真机两者形态与取值都不同）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
 	ConversationID        string // X-Conversation-ID：入站头/body 提取值，非空时优先
@@ -575,7 +601,7 @@ type ChatMeta struct {
 	AgentType             string // X-Agent-Type：入站透传值，空则保留默认指纹
 	Compaction            string // X-Compaction：入站透传值，空则不发
 	ContextCompacted      string // X-Context-Compacted：入站透传值，空则不发
-	TraceID               string // X-Trace-ID：入站透传值，空则回落 conversationRequestID
+	TraceID               string // X-Trace-ID：入站透传值，空则独立生成随机 32 hex
 }
 
 // ChatHeaders chat 面（/v2/chat/completions）请求头。
@@ -662,10 +688,11 @@ func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 //   - X-Trace-ID / traceparent / b3 / X-B3-*：链路族。官方桌面端 daemon 用
 //     randomBytes(16/8/8) 生成 traceId/spanId/parentSpanId 三件套，同时写 traceparent、
 //     b3、X-B3-TraceId/ParentSpanId/SpanId/Sampled、X-Trace-ID（Zr）。B3 规范只认
-//     16/32 hex TraceId 与 16 hex SpanId；入站 conversationRequestID 非法时 TraceId
-//     回落 messageID（恒 32 hex），SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
-//   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级 UUID）。本网关按
-//     实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v4 形态 UUID。
+//     随机 32 hex（与 conversationRequestID 不同值）；B3 规范只认 16/32 hex TraceId，
+//     入站透传的 X-Trace-ID 非法时 TraceId 回落 messageID（恒 32 hex），
+//     SpanId 取 messageID[:16]、ParentSpanId 另取随机 16 hex。
+//   - acp-connection-id：会话级 ACP 连接 id（官方为 session 级带连字符 UUIDv7）。
+//     本网关按实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v7 形态 UUID。
 //
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单；头族注入线性展开。
 func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
@@ -709,20 +736,24 @@ func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	setHeaderIfNonEmpty(req, "X-Compaction", meta.Compaction)
 	setHeaderIfNonEmpty(req, "X-Context-Compacted", meta.ContextCompacted)
 
-	injectTraceHeaders(req, meta.TraceID, convReqID, messageID)
+	injectTraceHeaders(req, meta.TraceID, messageID)
 }
 
 // injectTraceHeaders 注入链路头族（X-Trace-Id / traceparent / b3 / X-B3-*）。
-// chat 与 refresh 共用：官方 refresh 复用当前 trace span；网关侧 refresh 没有
-// 活动 span，由调用方生成一组自洽的新链路 id。
-func injectTraceHeaders(req *http.Request, traceID, b3Seed, messageID string) {
+//
+// chat 与 refresh 共用。trace id 是**独立生成的 32 hex 随机值**（UUIDv4 形态，无
+// UUIDv7 时间戳前缀）：真机 chat 的 X-Trace-ID / X-B3-TraceId / traceparent
+// trace-id 三处同值、与 X-Conversation-Request-ID（v7，带时间戳前缀）不同值。
+// 此前把 conversationRequestID 直接当 trace 用，两者形态可判别（#377）。
+// 入站透传的 X-Trace-ID 仍优先（客户端已有链路时跟随，不自造）。
+func injectTraceHeaders(req *http.Request, traceID, messageID string) {
 	if traceID == "" {
-		traceID = b3Seed
+		traceID = session.NewTraceID()
 	}
 
 	req.Header.Set("X-Trace-Id", traceID)
 
-	b3Trace := b3Seed
+	b3Trace := traceID
 	if !validTraceID(b3Trace) {
 		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
 	}
@@ -745,10 +776,19 @@ func setHeaderIfNonEmpty(req *http.Request, name, value string) {
 	}
 }
 
-// acpConnectionID 由会话 id 稳定派生 acp-connection-id（官方桌面端为会话级 UUID）。
-// 幂等：同一 conversationId 恒同值；输出为 v4 形态 UUID（8-4-4-4-12）。
+// acpConnectionEpoch acp-connection-id 派生用的时间基准（进程启动时刻）。
+// ACP 连接本身随进程重建，重启换基准与语义一致。
+var acpConnectionEpoch = time.Now()
+
+// acpConnectionID 由会话 id 稳定派生 acp-connection-id。
+//
+// 官方 5.9.3 是会话级**带连字符 UUIDv7**（真机：主/辅助请求同值，version=7，
+// 前 48 bit 可解出毫秒时间戳）。本仓此前派生 v4 形态，版本位即可判别。
+// 这里用「时间基准回拨 [0,1h) 的确定性偏移」生成前缀：同一 conversationId 在进程内
+// 恒同值、前缀落在可信时间，且纯派生——不引入随会话数无界增长的惰性缓存
+// （见 session/ids.go 顶部说明）。
 func acpConnectionID(conversationID string) string {
-	return deriveUUIDv4("wb2a:acp:" + conversationID)
+	return session.UUIDv7At("wb2a:acp:"+conversationID, acpConnectionEpoch)
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
@@ -925,7 +965,7 @@ func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 
 	// 官方 refresh 复用当前 trace span；网关侧无活动 span，故生成一组自洽的新链路 id。
-	injectTraceHeaders(req, session.NewUUIDv7Hex(), session.NewUUIDv7Hex(), session.NewUUIDv7Hex())
+	injectTraceHeaders(req, "", session.NewMessageID())
 }
 
 // V3ConfigHeaders /v3/config 头族。该端点对 UA 敏感（必须带 CodeBuddy/CodeBuddyIDE

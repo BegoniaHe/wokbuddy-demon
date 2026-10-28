@@ -1,12 +1,15 @@
 package upstream
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -427,5 +430,187 @@ func TestGrowthPathsUseNodeFingerprint(t *testing.T) {
 		if _, ok := paths[want]; !ok {
 			t.Errorf("未观察到 %s 请求，got=%v", want, paths)
 		}
+	}
+}
+
+// TestChatBaggage 断言 chat 出站的 W3C baggage 逐字形态：只有 4 条（buddy 两空值键
+// + codebuddy.session_id + codebuddy.conversation_request_id），且两个 codebuddy 键
+// 与同请求的 X-Conversation-Id / X-Conversation-Request-Id 逐项同值（#364 真机口径）。
+// 真机没发 conversation_message_id / root_request_id，故这两条必须**不出现**。
+func TestChatBaggage(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ChatHeaders(req, account, "", ChatMeta{
+		ConversationID:        "0f0e0d0c-0b0a-4908-8706-050403020100",
+		ConversationRequestID: "01a17a9c4d2f7b3e8c5a6d4e2f1b0a93",
+	})
+
+	wantBaggage := "buddyId=,buddyName=," +
+		"codebuddy.session_id=" + req.Header.Get("X-Conversation-Id") +
+		",codebuddy.conversation_request_id=" + req.Header.Get("X-Conversation-Request-Id")
+
+	if got := req.Header.Get("Baggage"); got != wantBaggage {
+		t.Fatalf("baggage=%q want %q", got, wantBaggage)
+	}
+
+	if want, got := "0f0e0d0c-0b0a-4908-8706-050403020100", req.Header.Get("X-Conversation-Id"); got != want {
+		t.Fatalf("X-Conversation-Id=%q want %q", got, want)
+	}
+
+	if want, got := "01a17a9c4d2f7b3e8c5a6d4e2f1b0a93", req.Header.Get("X-Conversation-Request-Id"); got != want {
+		t.Fatalf("X-Conversation-Request-Id=%q want %q", got, want)
+	}
+
+	for _, forbidden := range []string{"conversation_message_id", "root_request_id", "tracestate"} {
+		if strings.Contains(req.Header.Get("Baggage"), forbidden) {
+			t.Errorf("baggage 不应包含 %q：%q", forbidden, req.Header.Get("Baggage"))
+		}
+	}
+
+	// baggage 只在 chat 面：agenttool 四路与轻头族各面都不发。
+	other, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/agenttool/v1/search", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.applyHeaders(surfaceSearch, other, account, "", ChatMeta{})
+
+	if got := other.Header.Get("Baggage"); got != "" {
+		t.Errorf("search baggage=%q want empty", got)
+	}
+}
+
+// TestAcpConnectionIDIsUUIDv7 acp-connection-id 是会话级带连字符 UUIDv7：
+// 第 13 位为 7、变体位 10xx、同 conversationId 恒同值、时间戳前缀落在可信时间（#372）。
+func TestAcpConnectionIDIsUUIDv7(t *testing.T) {
+	t.Parallel()
+
+	const convID = "0f0e0d0c-0b0a-4908-8706-050403020100"
+
+	first := acpConnectionID(convID)
+
+	if !uuidV7HyphenPattern.MatchString(first) {
+		t.Fatalf("acp-connection-id=%q want 带连字符 UUIDv7", first)
+	}
+
+	if got := acpConnectionID(convID); got != first {
+		t.Fatalf("同 convID 派生值不稳定: %q != %q", got, first)
+	}
+
+	if acpConnectionID("another-conversation") == first {
+		t.Fatal("不同 convID 派生出相同 acp-connection-id")
+	}
+
+	// 时间戳前缀必须落在进程启动基准前 1 小时窗口内（可信时间，不是固定哨兵值）。
+	raw, err := hex.DecodeString(strings.ReplaceAll(first, "-", ""))
+	if err != nil {
+		t.Fatalf("DecodeString(%q): %v", first, err)
+	}
+
+	var high [8]byte
+	copy(high[2:], raw[:6])
+
+	stamp := int64(binary.BigEndian.Uint64(high[:]))
+	lower := acpConnectionEpoch.Add(-time.Hour).UnixMilli()
+
+	if stamp < lower || stamp > acpConnectionEpoch.UnixMilli() {
+		t.Fatalf("acp-connection-id 时间戳=%d 不在 [%d,%d]", stamp, lower, acpConnectionEpoch.UnixMilli())
+	}
+}
+
+// TestChatGoldenHeaderSet chat 面黄金头集：键集**精确相等**（多发漏发都红），
+// 并钉住真机取值——Accept=application/json（流式也不发 event-stream）、
+// X-Agent-Runtime=local-agent、trace 三处同值且是随机 v4 形态、与
+// X-Conversation-Request-ID（v7）解耦；会话 ID 兜底仍是 v4、acp id 是 v7。
+func TestChatGoldenHeaderSet(t *testing.T) {
+	t.Parallel()
+
+	const (
+		convID    = "0f0e0d0c-0b0a-4908-8706-050403020100"
+		convReqID = "01a17a9c4d2f7b3e8c5a6d4e2f1b0a93"
+	)
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ChatHeaders(req, account, "", ChatMeta{
+		ConversationID:        convID,
+		ConversationRequestID: convReqID,
+	})
+
+	assertHeaderKeys(t, req,
+		"Accept", "Acp-Connection-Id", "Authorization", "B3", "Baggage", "Content-Type",
+		"Traceparent", "User-Agent", "X-Agent-Intent", "X-Agent-Purpose", "X-Agent-Runtime",
+		"X-Agent-Type", "X-B3-Parentspanid", "X-B3-Sampled", "X-B3-Spanid", "X-B3-Traceid",
+		"X-Codebuddy-Request", "X-Conversation-Id", "X-Conversation-Message-Id",
+		"X-Conversation-Request-Id", "X-Domain", "X-Ide-Name", "X-Ide-Type", "X-Ide-Version",
+		"X-No-Enterprise-Id", "X-Private-Data", "X-Product", "X-Request-Id",
+		"X-Requested-With", "X-Root-Request-Id", "X-Trace-Id", "X-User-Id",
+	)
+
+	if got := req.Header.Get("Accept"); got != "application/json" {
+		t.Errorf("Accept=%q want application/json（流式也不发 event-stream）", got)
+	}
+
+	if got := req.Header.Get("X-Agent-Runtime"); got != "local-agent" {
+		t.Errorf("X-Agent-Runtime=%q want local-agent", got)
+	}
+
+	assertTraceFamily(t, req, convReqID)
+
+	// 会话 ID 兜底保持 v4（真机主请求就是 v4）；acp id 是带连字符 v7。
+	if got := req.Header.Get("X-Conversation-Id"); got != convID {
+		t.Errorf("X-Conversation-Id=%q want %q", got, convID)
+	}
+
+	if got := req.Header.Get("X-Conversation-Request-Id"); got != convReqID {
+		t.Errorf("X-Conversation-Request-Id=%q want %q", got, convReqID)
+	}
+
+	// X-Request-ID 是消息级 ID，与 X-Conversation-Message-Id 同值且不等于轮级 ID。
+	messageID := req.Header.Get("X-Conversation-Message-Id")
+	if got := req.Header.Get("X-Request-ID"); got != messageID {
+		t.Errorf("X-Request-ID=%q want =X-Conversation-Message-Id %q", got, messageID)
+	}
+
+	if !uuidV7Hex32.MatchString(messageID) {
+		t.Errorf("X-Conversation-Message-Id=%q want UUIDv7 32 hex", messageID)
+	}
+}
+
+// assertTraceFamily trace 三处（X-Trace-Id / X-B3-Traceid / traceparent）同值、
+// 为随机 UUIDv4 形态 32 hex，且与轮级 X-Conversation-Request-ID 不同值。
+func assertTraceFamily(t *testing.T, req *http.Request, convReqID string) {
+	t.Helper()
+
+	traceID := req.Header.Get("X-Trace-Id")
+	if !uuidV432HeaderPattern.MatchString(traceID) {
+		t.Errorf("X-Trace-Id=%q want 随机 UUIDv4 形态 32 hex", traceID)
+	}
+
+	if traceID == convReqID {
+		t.Error("X-Trace-Id 不得复用 X-Conversation-Request-ID（两者形态可判别）")
+	}
+
+	if got := req.Header.Get("X-B3-Traceid"); got != traceID {
+		t.Errorf("X-B3-Traceid=%q want 与 X-Trace-Id 同值 %q", got, traceID)
+	}
+
+	spanID := req.Header.Get("X-B3-Spanid")
+	if got, want := req.Header.Get("Traceparent"), "00-"+traceID+"-"+spanID+"-01"; got != want {
+		t.Errorf("Traceparent=%q want %q", got, want)
 	}
 }

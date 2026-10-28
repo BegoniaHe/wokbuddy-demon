@@ -5,6 +5,7 @@ package upstream
 import (
 	"bytes"
 	"cmp"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2092,6 +2093,52 @@ func modelFromBody(body []byte) string {
 	return peek.Model
 }
 
+// chatBodyGzip 是否对 chat 出站 body 做 gzip。
+//
+// 官方 `RequestBodyGzip`（CN 5.9.3 为 true）对模型请求**无条件**压缩：主请求 45KB
+// 压、辅助请求 1.2KB 也压，包内没有字节阈值。唯一与之相关的跳过条件是「显式自定义
+// base_url / 模型 url」——本仓把 cn/global 的 chat_base 被显式覆盖（不等于该 realm
+// 默认 base）视为同一条件：不给非官方中继发压缩体。
+func (c *Client) chatBodyGzip(a *auth.Auth) bool {
+	if c.globalOn(a) {
+		return strings.TrimSpace(c.ChatBaseGlobal) == ""
+	}
+
+	base := normalizeChatBase(c.ChatBaseCN)
+
+	return base == "" || base == defaultCNChatBase
+}
+
+// chatPayload 返回本次 chat 实际发送的 body 与 Content-Encoding。
+// 压缩在 origin 轮转循环外做一次，跨 origin 重放复用同一份字节（不重复压）。
+func (c *Client) chatPayload(a *auth.Auth, prepared []byte) ([]byte, string, error) {
+	if !c.chatBodyGzip(a) {
+		return prepared, "", nil
+	}
+
+	return gzipChatBody(prepared)
+}
+
+// gzipChatBody 压缩 chat 出站 body，返回压缩后字节与 Content-Encoding 取值。
+//
+// 不手工设 Accept-Encoding：那是**响应**侧协商，手设会关掉 Go transport 的透明解压，
+// SSE 与 JSON 响应都得自己解，反而坏掉。也不手工设 Content-Length：body 是
+// bytes.Reader 时 http.NewRequest 会算出压缩后长度（与真机一致）。
+func gzipChatBody(body []byte) ([]byte, string, error) {
+	var buf bytes.Buffer
+
+	writer := gzip.NewWriter(&buf)
+	if _, err := writer.Write(body); err != nil {
+		return nil, "", fmt.Errorf("gzip chat body: %w", err)
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, "", fmt.Errorf("gzip chat body: %w", err)
+	}
+
+	return buf.Bytes(), "gzip", nil
+}
+
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单；仅 header 构造读取一次。
 func (c *Client) ChatStreamContext(
 	ctx context.Context, account3 *auth.Auth, body []byte, clientIP string, meta ChatMeta,
@@ -2107,34 +2154,63 @@ func (c *Client) ChatStreamContext(
 		prepared = injectConversationRequestID(prepared, meta.ConversationRequestID)
 	}
 
+	payload, contentEncoding, payloadErr := c.chatPayload(account3, prepared)
+	if payloadErr != nil {
+		return nil, 0, nil, payloadErr
+	}
+
 	headerTimeout, idleTimeout := c.modelTimeout(account3.Realm(), modelFromBody(prepared))
 	chatHTTP := c.chatHTTPForAccount(account3, headerTimeout)
 	path := c.chatPaths(account3)[0]
 	origins := c.chatOrigins(account3)
 
-	var lastErr error
+	out := chatOutbound{
+		Account: account3, Payload: payload, ContentEncoding: contentEncoding,
+		Path: path, ClientIP: clientIP, Meta: meta,
+	}
 
+	attempt := c.chatStreamWithReplay(ctx, out, chatHTTP, idleTimeout, origins)
+	if attempt.err == nil && attempt.status < http.StatusBadRequest {
+		return attempt.rc, attempt.status, nil, nil
+	}
+
+	return nil, attempt.status, attempt.body, attempt.err
+}
+
+// chatOutbound 一次 chat 出站的请求装配输入（origin 轮转期间不变）。
+type chatOutbound struct {
+	Account         *auth.Auth
+	Payload         []byte
+	ContentEncoding string
+	Path            string
+	ClientIP        string
+	Meta            ChatMeta
+}
+
+// chatStreamWithReplay 按 origin 顺序尝试 chat 请求：首 token 前可重放的状态码
+// 换下一个 origin，其余（含成功）立即返回该次尝试。
+//
+// 调用方已取消（客户端断连/超时）时不再向后续 origin 重放：请求已无消费者，
+// 继续发只会放大上游请求量。
+//
+//nolint:gocritic // chatOutbound 值传递：字段在循环内只读，指针化反而让调用点更吵。
+func (c *Client) chatStreamWithReplay(
+	ctx context.Context, out chatOutbound, chatHTTP *http.Client, idleTimeout time.Duration, origins []string,
+) chatAttempt {
 	for index, base := range origins {
-		attempt := c.chatStreamAt(ctx, account3, prepared, base, path, clientIP, meta, chatHTTP, idleTimeout)
+		attempt := c.chatStreamAt(ctx, out, base, chatHTTP, idleTimeout)
 		if attempt.err == nil && attempt.status < http.StatusBadRequest {
-			return attempt.rc, attempt.status, nil, nil
+			return attempt
 		}
 
-		lastErr = attempt.err
-		if attempt.replay && index < len(origins)-1 {
-			// 调用方已取消（客户端断连/超时）时不再向后续 origin 重放：
-			// 请求已无消费者，继续发只会放大上游请求量。
-			if ctx.Err() != nil {
-				return nil, attempt.status, attempt.body, attempt.err
-			}
-
+		if attempt.replay && index < len(origins)-1 && ctx.Err() == nil {
 			continue
 		}
 
-		return nil, attempt.status, attempt.body, attempt.err
+		return attempt
 	}
 
-	return nil, 0, nil, lastErr
+	return chatAttempt{}
 }
 
 // chatAttempt 单 origin 的一次 chat 尝试结果。
@@ -2148,21 +2224,24 @@ type chatAttempt struct {
 
 // chatStreamAt 向单个 origin 发起 chat 请求。replay 表示首 token 前可换 origin 重放。
 //
-//nolint:funlen,gocritic,maintidx,revive // ChatMeta 值传递保持调用链简单；请求装配线性展开。
+//nolint:funlen,gocritic,maintidx // 请求装配与错误分类线性展开，拆开反而更难对照。
 func (c *Client) chatStreamAt(
-	ctx context.Context, account3 *auth.Auth, prepared []byte, base, path, clientIP string,
-	meta ChatMeta, chatHTTP *http.Client, idleTimeout time.Duration,
+	ctx context.Context, out chatOutbound, base string, chatHTTP *http.Client, idleTimeout time.Duration,
 ) chatAttempt {
-	endpoint := base + path
+	endpoint := base + out.Path
 
 	req, err := http.NewRequestWithContext(
-		context.Background(), http.MethodPost, endpoint, bytes.NewReader(prepared),
+		context.Background(), http.MethodPost, endpoint, bytes.NewReader(out.Payload),
 	)
 	if err != nil {
 		return chatAttempt{err: fmt.Errorf("ChatStreamContext: %w", err)}
 	}
 
-	c.ChatHeaders(req, account3, clientIP, meta)
+	c.ChatHeaders(req, out.Account, out.ClientIP, out.Meta)
+
+	if out.ContentEncoding != "" {
+		req.Header.Set("Content-Encoding", out.ContentEncoding)
+	}
 	// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 	// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 	reqCtx, cancel := context.WithCancel(ctx)
@@ -2173,7 +2252,7 @@ func (c *Client) chatStreamAt(
 		cancel()
 
 		log.Printf("ERR: [upstream] chat_stream acct=%s origin=%s: transport error: %v",
-			logfmt.Label(account3.UID, account3.NicknameValue()), base, err)
+			logfmt.Label(out.Account.UID, out.Account.NicknameValue()), base, err)
 		roundTripCloseIdle(chatHTTP.Transport)
 
 		return chatAttempt{err: fmt.Errorf("ChatStreamContext: %w", err), replay: true}
@@ -2190,14 +2269,14 @@ func (c *Client) chatStreamAt(
 
 	if readErr != nil {
 		log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v",
-			logfmt.Label(account3.UID, account3.NicknameValue()), readErr)
+			logfmt.Label(out.Account.UID, out.Account.NicknameValue()), readErr)
 
 		return chatAttempt{err: fmt.Errorf("read body: %w", readErr), replay: true}
 	}
 
 	kind := Classify(resp.StatusCode, string(raw))
 	log.Printf("WARN: [upstream] chat_stream acct=%s origin=%s: upstream %d %s body=%s",
-		logfmt.Label(account3.UID, account3.NicknameValue()), base, resp.StatusCode, kind,
+		logfmt.Label(out.Account.UID, out.Account.NicknameValue()), base, resp.StatusCode, kind,
 		RedactForLog(string(raw), 200))
 
 	if kind == ErrNone {
