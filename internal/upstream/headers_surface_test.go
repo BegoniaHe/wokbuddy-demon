@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -101,6 +102,79 @@ func TestCodebuddyRequestOnlyOnChatFamily(t *testing.T) {
 
 			if got := req.Header.Get("X-Codebuddy-Request"); got != "" {
 				t.Errorf("%s X-Codebuddy-Request=%q want empty", testCase.name, got)
+			}
+		})
+	}
+}
+
+// hex32 32 位小写 hex（无版本位约束的随机 ID 形态断言用）。
+var hex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// uuidV7Hex32 UUIDv7 形态的 32 hex（第 13 位为 7、变体位 10xx）。
+var uuidV7Hex32 = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
+
+// TestLightSurfaceGoldenHeaderSets 轻头族黄金头集：refresh / v3-config / billing
+// 三路的键集**精确相等**（多发漏发都红），并断言 X-Request-ID 为 32 hex（#369）。
+// 官方 HTTP 层给每条非 chat 业务请求补该头，chat 面的同名头是消息级 ID。
+func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	account := surfaceGoldenAccount()
+
+	cases := []struct {
+		name string
+		url  string
+		call func(req *http.Request)
+		keys []string
+	}{
+		{
+			name: "refresh",
+			url:  "https://www.workbuddy.cn/v2/plugin/auth/token/refresh",
+			call: func(req *http.Request) { client.RefreshHeaders(req, account) },
+			keys: []string{
+				"Accept", "Authorization", "B3", "Content-Type", "Traceparent", "User-Agent",
+				"X-Auth-Refresh-Source", "X-B3-Parentspanid", "X-B3-Sampled", "X-B3-Spanid",
+				"X-B3-Traceid", "X-Domain", "X-No-Enterprise-Id", "X-Refresh-Token",
+				"X-Request-Id", "X-Requested-With", "X-Trace-Id", "X-User-Id",
+			},
+		},
+		{
+			name: "v3config",
+			url:  "https://www.workbuddy.cn/v3/config",
+			call: func(req *http.Request) { client.V3ConfigHeaders(req, account, "") },
+			keys: []string{
+				"Accept", "Authorization", "Content-Type", "User-Agent", "X-Domain",
+				"X-No-Enterprise-Id", "X-Product", "X-Request-Id", "X-Requested-With",
+				"X-User-Id",
+			},
+		},
+		{
+			name: "billing",
+			url:  "https://www.workbuddy.cn/billing/meter/get-user-resource-summary",
+			call: func(req *http.Request) { client.BillingHeaders(req, account) },
+			keys: []string{
+				"Accept", "Authorization", "Content-Type", "User-Agent", "X-Domain",
+				"X-Request-Id", "X-User-Id",
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, testCase.url, http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			testCase.call(req)
+
+			assertHeaderKeys(t, req, testCase.keys...)
+
+			if got := req.Header.Get("X-Request-ID"); !uuidV7Hex32.MatchString(got) {
+				t.Errorf("X-Request-ID=%q want UUIDv7 32 hex", got)
 			}
 		})
 	}

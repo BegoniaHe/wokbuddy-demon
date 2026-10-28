@@ -374,6 +374,12 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 	req.Header.Set("Content-Type", "application/json")
 	// AccessToken 加锁快照（同 chatFamilyHeaders：keepalive 可在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
+	// X-Request-ID：官方 HTTP 层给每条非 chat 业务请求补 32 hex 随机值（UUIDv7 形态）。
+	// growth 面是 Node 原生 fetch，真机不带该头；chat 面的同名头是消息级 ID
+	// （= X-Conversation-Message-ID），语义不同，见 injectConversationHeaders。
+	if srf != surfaceGrowth {
+		req.Header.Set("X-Request-ID", session.NewUUIDv7Hex())
+	}
 
 	if ua := c.lightUA(srf, account); ua != "" {
 		req.Header.Set("User-Agent", ua)
