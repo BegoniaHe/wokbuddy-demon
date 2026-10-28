@@ -315,10 +315,11 @@ type Config struct {
 		// ClientName 自定义用量归属名：非空时 X-Product 与 X-IDE-Name/Type 跟随该值。
 		// 空 = 官方桌面端默认（X-Product="SaaS"、X-IDE-Name/Type="WorkBuddy"）。
 		ClientName string `json:"client_name"`
-		// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底；空 = 不注入。
+		// DeviceToken 签到专用设备风控 Token（X-Device-Token 头）全局兜底；空 = 不注入。
 		// 每号 auth 文件的 device_token 键优先于本项。
 		DeviceToken string `json:"device_token"`
 		// DeviceTokenFile device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
+		// 与 DeviceToken 同口径：只用于签到（daily-checkin / checkin-activity-status）。
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`

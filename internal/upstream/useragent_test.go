@@ -3,6 +3,7 @@ package upstream
 import (
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -20,9 +21,9 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
-// 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组，默认伪造桌面端指纹）；
-// 显式 client_name="SaaS" 才还原"billing 不设 UA"的旧行为。
+// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 域只有 /v2/report 显式发
+// 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组），billing meter 默认不发 UA。
+// 显式 client_name="SaaS" 才还原"report 也不设 UA"的旧行为。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	t.Parallel()
 
@@ -334,100 +335,95 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 	}
 }
 
-// TestBillingUA_WhenClientNameSet billing/checkin 路径：client_name 非空时用单段
-// `WorkBuddy/<clientVersion>`（不带 CLI 段，对齐官方 banner/check-in 显式头组）。
-func TestBillingUA_WhenClientNameSet(t *testing.T) {
+// TestBillingReportUA report 是 billing 域唯一的显式 UA 面：单段
+// `WorkBuddy/<clientVersion>`（不带 CLI 段），显式 user_agent 优先。
+func TestBillingReportUA(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
-	// 默认 client_version → profile.billingUA
-	client := &Client{
-		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			if got := r.Header.Get("User-Agent"); got != billingUAWorkBuddy {
-				t.Errorf("billing UA = %q want %q (path=%s)", got, billingUAWorkBuddy, r.URL.Path)
+
+	cases := []struct {
+		name   string
+		client *Client
+		want   string
+	}{
+		{"profile_default", &Client{ClientName: "WorkBuddy", Profile: testProfileSet(t)}, billingUAWorkBuddy},
+		{"client_version_override", &Client{ClientName: "WorkBuddy", ClientVersion: "6.0.0"}, billingUACustomVer},
+		{"explicit_user_agent", &Client{ClientName: "WorkBuddy", UserAgent: billingUAAgentString}, billingUAAgentString},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var got, gotPath string
+
+			client := testCase.client
+			client.HTTP = &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
+				got = r.Header.Get("User-Agent")
+				gotPath = r.URL.Path
+
+				return jsonResp(200, `{"code":0}`), nil
+			})}
+			client.ChatBaseCN = "https://chat.example"
+			client.BillingBaseCN = "https://billing.example"
+
+			if err := client.ReportChatActivity(account, "cid", ""); err != nil {
+				t.Fatalf("report: %v", err)
 			}
 
-			return jsonResp(200, `{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`), nil
-		})},
-		ChatBaseCN:    "https://chat.example",
-		BillingBaseCN: "https://billing.example",
-		ClientName:    "WorkBuddy",
-		Profile:       testProfileSet(t),
-	}
-	if _, _, err := client.UserResource(account); err != nil {
-		t.Errorf("userResource: %v", err)
-	}
-	// 自定义 client_version → WorkBuddy/6.0.0
-	testCase2 := &Client{
-		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			if got := r.Header.Get("User-Agent"); got != billingUACustomVer {
-				t.Errorf("billing UA = %q want %q", got, billingUACustomVer)
+			if gotPath != reportPath {
+				t.Errorf("path = %q want %q", gotPath, reportPath)
 			}
 
-			return jsonResp(200, `{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`), nil
-		})},
-		ChatBaseCN:    "https://chat.example",
-		BillingBaseCN: "https://billing.example",
-		ClientName:    "WorkBuddy",
-		ClientVersion: "6.0.0",
-	}
-	if _, _, err := testCase2.UserResource(account); err != nil {
-		t.Errorf("userResource v2: %v", err)
-	}
-	// 显式 user_agent 仍优先于 billingUA
-	testCase := &Client{
-		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			if got := r.Header.Get("User-Agent"); got != billingUAAgentString {
-				t.Errorf("billing UA = %q want %q", got, billingUAAgentString)
+			if got != testCase.want {
+				t.Errorf("report UA = %q want %q", got, testCase.want)
 			}
-
-			return jsonResp(200, `{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`), nil
-		})},
-		ChatBaseCN:    "https://chat.example",
-		BillingBaseCN: "https://billing.example",
-		ClientName:    "WorkBuddy",
-		UserAgent:     billingUAAgentString,
-	}
-	if _, _, err := testCase.UserResource(account); err != nil {
-		t.Errorf("userResource v3: %v", err)
+		})
 	}
 }
 
-// TestBillingUA_WhenClientNameEmpty client_name 空 = 默认对齐官方桌面端：
-// billing UA 单段 WorkBuddy/<clientVersion>；显式 client_name="SaaS" 才不设 UA。
-func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
+// TestBillingHeadersDefaultNoUA 官方 billing `buildHeaders` 没有 UA：默认 meter
+// 请求在服务端看不到 User-Agent 键（显式压空串让 Go transport 省略该头）；
+// billingUA() 仍保留给 report 用，显式 client_name="SaaS" 时为空。
+func TestBillingHeadersDefaultNoUA(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
 
-	var str string
+	var present bool
 
-	const fullResp = `{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`
+	var got string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, present = r.Header["User-Agent"]
+		got = r.Header.Get("User-Agent")
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"response":{"data":{"accounts":[{"PackageName":"x","CycleCapacitySize":100,"CycleCapacityUsed":0}]}}}}`))
+	}))
+	defer srv.Close()
 
 	client := &Client{
-		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
-			str = r.Header.Get("User-Agent")
-			return jsonResp(200, fullResp), nil
-		})},
-		ChatBaseCN:    "https://chat.example",
-		BillingBaseCN: "https://billing.example",
+		HTTP:          srv.Client(),
+		BillingBaseCN: srv.URL,
 		ClientVersion: "6.0.0",
+		Profile:       testProfileSet(t),
 	}
 	if _, _, err := client.UserResource(account); err != nil {
-		t.Errorf("userResource: %v", err)
+		t.Fatalf("userResource: %v", err)
 	}
 
-	if str != "WorkBuddy/6.0.0" {
-		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", str)
+	if present {
+		t.Errorf("billing meter 请求带了 User-Agent = %q，want 无该头", got)
 	}
 
-	if got := client.billingUA(account); got != "WorkBuddy/6.0.0" {
-		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", got)
+	if ua := client.billingUA(account); ua != "WorkBuddy/6.0.0" {
+		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", ua)
 	}
-	// 显式 SaaS 还原旧行为（不设 UA）。
+
 	client.ClientName = "SaaS"
-	if got := client.billingUA(account); got != "" {
-		t.Errorf("billingUA() SaaS = %q want empty", got)
+	if ua := client.billingUA(account); ua != "" {
+		t.Errorf("billingUA() SaaS = %q want empty", ua)
 	}
 }
 
