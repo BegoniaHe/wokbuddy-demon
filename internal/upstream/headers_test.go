@@ -491,7 +491,9 @@ func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 	}{
 		{"chat", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
 		{"images", func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) }},
-		{"search", func(req *http.Request) { client.SearchHeaders(req, account, "", ChatMeta{}) }},
+		{"search", func(req *http.Request) {
+			client.applyHeaders(surfaceSearch, req, account, "", ChatMeta{})
+		}},
 	}
 
 	for _, headerCase := range headerSets {

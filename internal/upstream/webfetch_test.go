@@ -213,7 +213,9 @@ func TestWbUidOnlyOnWebFetch(t *testing.T) {
 		name string
 		call func(req *http.Request)
 	}{
-		{"search", func(req *http.Request) { New().SearchHeaders(req, account, "", ChatMeta{}) }},
+		{"search", func(req *http.Request) {
+			New().applyHeaders(surfaceSearch, req, account, "", ChatMeta{})
+		}},
 		{"images", func(req *http.Request) { New().ImagesHeaders(req, account, "", ChatMeta{}) }},
 	} {
 		t.Run(headerCase.name, func(t *testing.T) {

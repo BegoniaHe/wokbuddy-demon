@@ -71,9 +71,7 @@ func (c *Client) modelBusyBatch(
 
 	// 官方渲染层复用 chat 会话头；只覆盖 Accept 为 JSON（非 SSE）。
 	// 统一指纹是刻意取舍，理由与边界见 `internal/upstream/UPSTREAM.md` §六。
-	c.ChatHeaders(req, account, "", ChatMeta{})
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
+	c.applyHeaders(surfaceModelBusy, req, account, "", ChatMeta{})
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
