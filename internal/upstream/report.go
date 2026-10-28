@@ -196,7 +196,15 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 	return err
 }
 
-// chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。
+// chatRequestEvent 客户端 chat_request_send 事件形状（对齐 CN 5.9.3 的
+// `reportChatRequestSendTelemetry()`，issue #366）。
+//
+// 与 5.8.x 的差异：删掉 maxToken / maxSteps / temperature / maxRetries / skillCount /
+// totalCount（5.9.3 不再发）与 fileUri（被 VcsInfoProcessor 换成 vcs* 四元组）；
+// 新增 isMaxMode（网关无 thinking 覆盖状态，按官方默认 false）以及 source /
+// inputAttemptId / connectorId（官方是条件发，网关取不到就整键不发，不伪造）。
+// agentType 只可能是 main / subagent / team，网关模拟本地主会话故发 main；
+// agentName 取官方 `agentName || meta.agentName` 的空值形态（不写死 "default"）。
 // userId 为必填字段（= a.UID）；conversationId 由调用方生成，无需真实会话。
 type chatRequestEvent struct {
 	EventCode             string `json:"eventCode"`
@@ -212,10 +220,10 @@ type chatRequestEvent struct {
 	IsAutoExecuteTerminal bool   `json:"isAutoExecuteTerminal"`
 	IsAutoModify          bool   `json:"isAutoModify"`
 	CodebaseEnable        bool   `json:"codebaseEnable"`
-	MaxToken              int    `json:"maxToken"`
-	MaxSteps              int    `json:"maxSteps"`
-	Temperature           int    `json:"temperature"`
-	MaxRetries            int    `json:"maxRetries"`
+	IsMaxMode             bool   `json:"isMaxMode"`
+	Source                string `json:"source,omitempty"`
+	InputAttemptID        string `json:"inputAttemptId,omitempty"`
+	ConnectorID           string `json:"connectorId,omitempty"`
 	MentionContexts       []any  `json:"mentionContexts"`
 	KnowledgeID           []any  `json:"knowledgeId"`
 	KnowledgeName         []any  `json:"knowledgeName"`
@@ -225,9 +233,10 @@ type chatRequestEvent struct {
 	ExpertID              string `json:"expertId"`
 	RecommendID           string `json:"recommendId"`
 	SkillID               string `json:"skillId"`
-	SkillCount            int    `json:"skillCount"`
-	TotalCount            int    `json:"totalCount"`
-	FileURI               string `json:"fileUri"`
+	VCSType               string `json:"vcsType"`
+	VCSRepo               string `json:"vcsRepo"`
+	VCSBranchName         string `json:"vcsBranchName"`
+	VCSRevID              string `json:"vcsRevId"`
 	PresentAt             int64  `json:"presentAt"`
 	TraceID               string `json:"traceId"`
 	RootRequestID         string `json:"rootRequestId"`
@@ -275,6 +284,7 @@ func (c *Client) ReportChatActivityModel(
 }
 
 // newChatRequestEvent 构造 chat_request_send 事件；字段为零值即为官方默认。
+// vcs* 四元组恒发空串：官方在无 Git 工作区时就是空串形态（不是不发）。
 func newChatRequestEvent(
 	account *auth.Auth, conversationID, requestID, modelID, modelName string,
 ) chatRequestEvent {
@@ -294,28 +304,29 @@ func newChatRequestEvent(
 		IsAutoExecuteTerminal: false,
 		IsAutoModify:          false,
 		CodebaseEnable:        false,
-		MaxToken:              0,
-		MaxSteps:              0,
-		Temperature:           0,
-		MaxRetries:            0,
-		MentionContexts:       []any{},
-		KnowledgeID:           []any{},
-		KnowledgeName:         []any{},
-		CodebaseID:            "",
-		MentionContextCount:   0,
-		Command:               "",
-		ExpertID:              "",
-		RecommendID:           "",
-		SkillID:               "",
-		SkillCount:            0,
-		TotalCount:            0,
-		FileURI:               "",
-		PresentAt:             now,
-		TraceID:               requestID,
-		RootRequestID:         requestID,
-		ParentConversationID:  conversationID,
-		AgentName:             "default",
-		AgentType:             "conversation",
-		UserID:                account.UID,
+		// 网关没有 thinking 覆盖状态，取官方默认 false。
+		IsMaxMode: false,
+		// source / inputAttemptId / connectorId：官方条件发，网关无对应状态 → 不发。
+		MentionContexts:      []any{},
+		KnowledgeID:          []any{},
+		KnowledgeName:        []any{},
+		CodebaseID:           "",
+		MentionContextCount:  0,
+		Command:              "",
+		ExpertID:             "",
+		RecommendID:          "",
+		SkillID:              "",
+		VCSType:              "",
+		VCSRepo:              "",
+		VCSBranchName:        "",
+		VCSRevID:             "",
+		PresentAt:            now,
+		TraceID:              requestID,
+		RootRequestID:        requestID,
+		ParentConversationID: conversationID,
+		// 网关没有 agent 上下文：与官方空值形态一致，不写死默认名。
+		AgentName: "",
+		AgentType: "main",
+		UserID:    account.UID,
 	}
 }
