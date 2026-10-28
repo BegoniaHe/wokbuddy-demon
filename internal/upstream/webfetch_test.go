@@ -53,6 +53,8 @@ func TestWebFetchRequestShape(t *testing.T) {
 	assertHeaderValue(t, gotHeaders, "X-Conversation-Id", "conv-1")
 	assertHeaderValue(t, gotHeaders, "X-Conversation-Request-Id", "req-1")
 	assertHeaderValue(t, gotHeaders, "X-Trace-Id", "trace-1")
+	// 官方 5.9.3 的 webfetch 头构造带 X-Wb-Uid，取值与 X-User-Id 同源（issue #346）。
+	assertHeaderValue(t, gotHeaders, "X-Wb-Uid", "u1")
 
 	if out.Content != "# hi" || out.URL != "https://example.com/a" || out.ContentType != "text/markdown" {
 		t.Fatalf("outcome=%+v", out)
@@ -197,4 +199,81 @@ func assertHeaderValue(t *testing.T, header http.Header, name, want string) {
 	if got := header.Get(name); got != want {
 		t.Errorf("%s=%q want %q", name, got, want)
 	}
+}
+
+// TestWbUidOnlyOnWebFetch X-Wb-Uid 只对 webfetch 发（官方仅 webfetch /
+// knowledge_search 发）：search / agentic_search / images 的同源头族都不带，
+// 账号 uid 为空时也不注入空头（issue #346）。
+func TestWbUidOnlyOnWebFetch(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at"}
+
+	for _, headerCase := range []struct {
+		name string
+		call func(req *http.Request)
+	}{
+		{"search", func(req *http.Request) { New().SearchHeaders(req, account, "", ChatMeta{}) }},
+		{"images", func(req *http.Request) { New().ImagesHeaders(req, account, "", ChatMeta{}) }},
+	} {
+		t.Run(headerCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "https://example.invalid/x", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			headerCase.call(req)
+
+			if got := req.Header.Get("X-Wb-Uid"); got != "" {
+				t.Fatalf("%s X-Wb-Uid=%q want empty", headerCase.name, got)
+			}
+		})
+	}
+
+	t.Run("agentic_search", func(t *testing.T) {
+		t.Parallel()
+
+		var got string
+
+		client := testClient(func(r *http.Request) (*http.Response, error) {
+			got = r.Header.Get("X-Wb-Uid")
+
+			return jsonResp(200, "event: done\ndata: {\"synthesis\":{\"content\":\"x\"}}\n\n"), nil
+		})
+
+		if _, err := client.AgenticSearch(
+			context.Background(), account, "研究 go", "internal", ChatMeta{},
+		); err != nil {
+			t.Fatalf("agentic search: %v", err)
+		}
+
+		if got != "" {
+			t.Fatalf("agentic_search X-Wb-Uid=%q want empty", got)
+		}
+	})
+
+	t.Run("webfetch 空 uid 不注入空头", func(t *testing.T) {
+		t.Parallel()
+
+		var present bool
+
+		client := testClient(func(r *http.Request) (*http.Response, error) {
+			_, present = r.Header["X-Wb-Uid"]
+
+			return jsonResp(200, `{"code":0,"content_type":"text/plain","content":"ok"}`), nil
+		})
+
+		if _, err := client.WebFetch(
+			context.Background(), &auth.Auth{AccessToken: "at"},
+			WebFetchRequest{URL: "https://example.com"}, ChatMeta{},
+		); err != nil {
+			t.Fatalf("webfetch: %v", err)
+		}
+
+		if present {
+			t.Fatal("uid 为空时不应注入 X-Wb-Uid")
+		}
+	})
 }

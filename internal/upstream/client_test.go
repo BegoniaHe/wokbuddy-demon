@@ -467,7 +467,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 
 	rc.Close()
 	// 官方桌面端 chat 指纹：X-Product=SaaS、X-IDE-Type=WorkBuddy、X-IDE-Version=realm 版本、
-	// X-Agent-Intent=craft、X-Private-Data=true。
+	// X-Agent-Intent=craft、X-Private-Data=true（CN 5.9.3 企业号分支；本用例账号带 enterpriseId）。
 	want := map[string]string{
 		"Authorization":  "Bearer at",
 		"X-User-Id":      "u1",

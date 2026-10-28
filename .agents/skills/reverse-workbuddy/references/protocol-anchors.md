@@ -56,11 +56,17 @@
   - `Accept-Language`：官方 chat 路径不发；billing/account 分页请求才带 locale
     （`main/account.js`）。本仓 `CommonHeaders` 在 chat 也发，属待清理差异。
   - chat 桌面头组：`setDesktopExpertHeaders()`（`X-Domain` / `X-Product=SaaS` /
-    `X-User-Id` / `X-Agent-Intent|Purpose|Type` / `X-Private-Data` /
-    `X-Ide-Name|Type|Version` / `X-Codebuddy-Request` /
-    traceparent + b3 单头 + `X-B3-*` 四件套）。
+    `X-User-Id` / `X-Agent-Intent|Purpose|Type` /
+    `X-Private-Data`（`privateDataHeaderValue()`：CN 5.9.3 个人号 `false`、
+    企业号 `true`；global 5.8.4 旧基线仍 `true`）/ `X-Ide-Name|Type|Version` /
+    `X-Codebuddy-Request` / traceparent + b3 单头 + `X-B3-*` 四件套）。
+  - `X-Agent-Runtime`：5.9.3 起官方在 chat / images / search / webfetch 全发；
+    `ChatHeaders` 统一发兜底值 `other`（网关无 session meta /
+    `CODEBUDDY_AGENT_RUNTIME` 来源）。`X-Wb-Uid` 只在 `WebFetch` 发，
+    取值与 `X-User-Id` 同值（官方仅 webfetch / knowledge_search 发）。
 - 客户端侧对照：
-  - `<app-asar>/main/*.js`：官方 UA、`X-IDE-*`、`X-Agent-*`、`X-Device-Token`。
+  - `<app-asar>/main/*.js`：官方 UA、`X-IDE-*`、`X-Agent-*`、`X-Wb-Uid`、
+    `X-Device-Token`。
   - `<app-asar>/renderer/assets/esm-*.js`：渲染层 `X-AI-Scenario|Channel|Model|
     Thinking|Online|SPACE` 族（仅 5.7.6 global 包见字面量；判断是否真出网）。
   - `<app-asar>/node_modules/openai/internal/detect-platform.js`：

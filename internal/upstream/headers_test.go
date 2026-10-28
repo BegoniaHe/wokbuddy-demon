@@ -424,3 +424,74 @@ func TestRefreshDomain(t *testing.T) {
 		})
 	}
 }
+
+// TestPrivateDataHeaderPerRealm X-Private-Data 按账号身份分层：CN 5.9.3 官方
+// applyPrivateDataHeaderPolicy 在个人号默认分支发 false、企业号发 true；
+// global 基线仍是 5.8.4，旧逻辑发 true，等 global 升到 5.9.x 后按同一逻辑复核
+// （issue #343）。
+func TestPrivateDataHeaderPerRealm(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		account *auth.Auth
+		want    string
+	}{
+		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "false"},
+		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
+		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			New().ChatHeaders(req, testCase.account, "", ChatMeta{})
+
+			if got := req.Header.Get("X-Private-Data"); got != testCase.want {
+				t.Fatalf("X-Private-Data=%q want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestAgentRuntimeHeaderAllSurfaces 官方 5.9.3 在 chat / images / search / webfetch
+// 全发 X-Agent-Runtime，网关统一官方兜底值 other。ImagesHeaders / SearchHeaders
+// 复用 ChatHeaders，自动继承该头（issue #345）。
+func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
+	t.Parallel()
+
+	client := New()
+	account := &auth.Auth{UID: "u1", AccessToken: "at"}
+
+	headerSets := []struct {
+		name string
+		call func(req *http.Request)
+	}{
+		{"chat", func(req *http.Request) { client.ChatHeaders(req, account, "", ChatMeta{}) }},
+		{"images", func(req *http.Request) { client.ImagesHeaders(req, account, "", ChatMeta{}) }},
+		{"search", func(req *http.Request) { client.SearchHeaders(req, account, "", ChatMeta{}) }},
+	}
+
+	for _, headerCase := range headerSets {
+		t.Run(headerCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "https://example.invalid/x", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			headerCase.call(req)
+
+			if got := req.Header.Get("X-Agent-Runtime"); got != "other" {
+				t.Fatalf("X-Agent-Runtime=%q want other", got)
+			}
+		})
+	}
+}

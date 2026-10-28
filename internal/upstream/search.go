@@ -79,12 +79,13 @@ type SearchOutcome struct {
 
 // SearchHeaders 搜索请求头。
 //
-// 复用 ChatHeaders 的桌面端全套头族，再按官方 WebSearchTool 的差异覆盖四处：
+// 复用 ChatHeaders 的桌面端全套头族，再按官方 WebSearchTool 的差异覆盖三处：
 //   - Accept：搜索是非流式 JSON（ChatHeaders 为 chat 流式设成 event-stream，必须覆盖）
 //   - Content-Type：官方带 charset（CommonHeaders 的 chat 形态不带）
 //   - X-Agent-Intent：官方固定 "craft"（搜索请求不携带会话 mode）
-//   - X-Agent-Runtime：5.8.3 / 5.8.4 基线包内无该头（对应 CLI 2.161.0）；
-//     保留依据是更晚 CLI 的搜索端点观测，待新基线复核
+//
+// X-Agent-Runtime 不再单独覆盖：5.9.3 起官方在 chat / images / search / webfetch 全发，
+// 统一由 ChatHeaders 发官方兜底值 other。
 //
 // 为什么整体复用而不是照抄官方精简头清单：官方 CLI 的搜索头就是它同一个客户端的
 // 通用头（chat 与搜索共用同一 UA 与会话头族）。本仓库出站身份是桌面端，若搜索另发
@@ -98,7 +99,6 @@ func (c *Client) SearchHeaders(req *http.Request, account *auth.Auth, clientIP s
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
 	req.Header.Set("X-Agent-Intent", "craft")
-	req.Header.Set("X-Agent-Runtime", "other")
 }
 
 // ClampSearchMaxResults 把调用方给的条数收敛到 [1, SearchMaxResultsCap]；

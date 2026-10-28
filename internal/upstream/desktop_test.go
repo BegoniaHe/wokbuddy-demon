@@ -399,3 +399,35 @@ func TestReadServerRequestIDSkipsInvalidID(t *testing.T) {
 		t.Fatalf("requestID=%q want %q", got, want)
 	}
 }
+
+// TestDesktopExpertHeadersPrivateDataPerRealm 桌面专家路径与 chat 同口径：
+// X-Private-Data 取 privateDataHeaderValue（CN 个人 false / 企业或 global true），
+// 避免两条 chat 出口出现第三种取值（issue #343）。
+func TestDesktopExpertHeadersPrivateDataPerRealm(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+
+	cases := []struct {
+		name    string
+		account *auth.Auth
+		want    string
+	}{
+		{"CN 个人号", &auth.Auth{UID: "u-cn", AccessToken: "at"}, "false"},
+		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
+		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequest(http.MethodPost, "https://upstream.test/v2/chat/completions", nil)
+			client.setDesktopExpertHeaders(req, testCase.account, "conv-1", "")
+
+			if got := req.Header.Get("X-Private-Data"); got != testCase.want {
+				t.Fatalf("X-Private-Data=%q want %q", got, testCase.want)
+			}
+		})
+	}
+}
