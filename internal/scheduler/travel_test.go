@@ -26,7 +26,8 @@ type travelStub struct {
 
 	infoCalls, statusCalls, departCalls atomic.Int32
 	claimCalls, firstCalls, agreeCalls  atomic.Int32
-	location, claimBodyLen              atomic.Int64
+	location                            atomic.Int64
+	claimBody                           atomic.Value // string：最近一次 claim 的 body（已 trim）
 }
 
 func (s *travelStub) handler() http.Handler {
@@ -51,10 +52,10 @@ func (s *travelStub) handler() http.Handler {
 		case "/activity/growth/buddy/travel/claim":
 			s.claimCalls.Add(1)
 
-			// 官方桌面 claim 只发空 body（record_id 只作到站判据与 400 兜底），
-			// 记录实际 body 长度供断言。
+			// 官方桌面 claim 固定发空对象 `{}`（record_id 只作到站判据与 400 兜底），
+			// 记录实际 body 供断言。
 			raw, _ := io.ReadAll(r.Body)
-			s.claimBodyLen.Store(int64(len(bytes.TrimSpace(raw))))
+			s.claimBody.Store(string(bytes.TrimSpace(raw)))
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{"reward_credit":9}}`))
 		case "/activity/growth/buddy/first":
 			s.firstCalls.Add(1)
@@ -302,9 +303,11 @@ func TestRunTravelStateMachine(t *testing.T) {
 				t.Errorf("location_id=%d want %d", stub.location.Load(), testCase.wantLocation)
 			}
 
-			// 领奖请求体为空：record_id 只作到站判据，不进官方形态的请求体。
-			if testCase.wantClaim > 0 && stub.claimBodyLen.Load() != 0 {
-				t.Errorf("claim body len=%d want 0（官方只发空 body）", stub.claimBodyLen.Load())
+			// 领奖请求体是空对象 `{}`：record_id 只作到站判据，不进官方形态的请求体。
+			if testCase.wantClaim > 0 {
+				if got, _ := stub.claimBody.Load().(string); got != "{}" {
+					t.Errorf("claim body=%q want {}（官方桌面固定发空对象）", got)
+				}
 			}
 		})
 	}

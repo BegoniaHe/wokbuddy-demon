@@ -149,9 +149,9 @@ func TestTravelClaimReturnsReward(t *testing.T) {
 		t.Errorf("reward=%d want 9", reward)
 	}
 
-	// 首发即官方桌面形态：空 body，成功路径不带 record_id。
-	if len(bytes.TrimSpace(got)) != 0 {
-		t.Errorf("claim body=%q want empty (官方桌面只发 {})", got)
+	// 首发即官方桌面形态：空对象 body `{}`（不是零字节），成功路径不带 record_id。
+	if string(bytes.TrimSpace(got)) != "{}" {
+		t.Errorf("claim body=%q want {} (官方桌面固定发空对象)", got)
 	}
 
 	if bytes.Contains(got, []byte("record_id")) {
@@ -329,7 +329,7 @@ func TestTravel401ClassifiedSessionDead(t *testing.T) {
 	}
 }
 
-// TestTravelClaimRecordIDFallback 空 body 首选；上游坚持要 record_id（400）时，
+// TestTravelClaimRecordIDFallback 空对象 body 首选；上游坚持要 record_id（400）时，
 // 在最后一次用的路径上带 record_id 兜底一次；两次请求都携带 X-Product-Code。
 func TestTravelClaimRecordIDFallback(t *testing.T) {
 	t.Parallel()
@@ -349,8 +349,8 @@ func TestTravelClaimRecordIDFallback(t *testing.T) {
 		}
 
 		if calls == 1 {
-			if len(bytes.TrimSpace(body)) != 0 {
-				t.Errorf("first body=%q want empty", body)
+			if string(bytes.TrimSpace(body)) != "{}" {
+				t.Errorf("first body=%q want {}", body)
 			}
 
 			return jsonResp(400, `{"code":400,"msg":"parameter error"}`), nil
@@ -373,8 +373,8 @@ func TestTravelClaimRecordIDFallback(t *testing.T) {
 	}
 }
 
-// TestTravelClaimEmptyBody404FallsBackToLegacyPath 首发 /v2 空 body 收到 404 时，
-// 第二跳改无前缀路径、body 仍为空（非 400 不触发 record_id 兜底）。
+// TestTravelClaimEmptyBody404FallsBackToLegacyPath 首发 /v2 空对象 body 收到 404 时，
+// 第二跳改无前缀路径、body 仍为 `{}`（非 400 不触发 record_id 兜底）。
 func TestTravelClaimEmptyBody404FallsBackToLegacyPath(t *testing.T) {
 	t.Parallel()
 
@@ -388,8 +388,8 @@ func TestTravelClaimEmptyBody404FallsBackToLegacyPath(t *testing.T) {
 			body, _ = io.ReadAll(r.Body)
 		}
 
-		if len(bytes.TrimSpace(body)) != 0 {
-			t.Errorf("path=%s body=%q want empty", r.URL.Path, body)
+		if string(bytes.TrimSpace(body)) != "{}" {
+			t.Errorf("path=%s body=%q want {}", r.URL.Path, body)
 		}
 
 		if r.URL.Path == "/v2/activity/growth/buddy/travel/claim" {

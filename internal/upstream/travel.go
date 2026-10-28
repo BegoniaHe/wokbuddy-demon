@@ -94,13 +94,16 @@ func (c *Client) TravelDepart(a *auth.Auth, locationID int) error {
 
 // TravelClaim 领取到站奖励，返回 reward_credit。
 //
-// 首选空 body：官方桌面 claimTravelReward 只发 `{}`（CN 5.9.3 main/server.js@337115 与
-// @422336，5.8.3 同形），本仓首发请求因此也不带 record_id。`{"record_id":N}` 是历史
-// 形态，静态包内不存在，仅作 400 兜底：触发条件是上游坚持要 record_id。
+// 首选空对象 body（`{}`）：官方桌面 claimTravelReward 固定
+// `http.post('/activity/growth/buddy/travel/claim', {}, productHeaders)`（CN 5.9.3
+// main/server.js@337115 与 @422336，5.8.3 同形），是**空 JSON 对象**而不是零字节
+// body——Content-Length 与 body 都要按 `{}` 发，否则上游 JSON 解析会 400。
+// 本仓首发请求因此也不带 record_id。`{"record_id":N}` 是历史形态，静态包内不存在，
+// 仅作 400 兜底：触发条件是上游坚持要 record_id。
 //
 // 请求顺序（三跳，最多 3 次）：
-//  1. POST /v2 + travelClaimPath，空 body；
-//  2. 仅当上一跳是 404（路径不存在）时换成无前缀 travelClaimPath，body 仍为空；
+//  1. POST /v2 + travelClaimPath，body `{}`；
+//  2. 仅当上一跳是 404（路径不存在）时换成无前缀 travelClaimPath，body 仍为 `{}`；
 //  3. 仅当最后一跳仍是 400 / 参数错误时，在最后一次用的路径上带 record_id 再试一次。
 //
 // 多次尝试都失败时返回最后一次错误（避免用更早的 404 / 参数错误覆盖会话失效或
@@ -109,10 +112,10 @@ func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) 
 	headers := map[string]string{"X-Product-Code": "workbuddy"}
 	lastPath := "/v2" + travelClaimPath
 
-	data, err := c.growthJSONPath(account, http.MethodPost, lastPath, nil, headers)
+	data, err := c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{}, headers)
 	if err != nil && isKind(err, ErrNotFound) {
 		lastPath = travelClaimPath
-		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, nil, headers)
+		data, err = c.growthJSONPath(account, http.MethodPost, lastPath, map[string]any{}, headers)
 	}
 
 	if err != nil && claimNeedsRecordIDBody(err) {
