@@ -222,6 +222,11 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 		return c.billingMeterUA(account)
 	case surfaceGrowth:
 		// /v2/activity/growth/* 是 Node 原生 fetch 裸调用，真机 UA 直接是 "node"。
+		// 显式 user_agent 仍优先：该配置项的口径是「全部出站生效」，growth 不能例外。
+		if c.UserAgent != "" {
+			return c.UserAgent
+		}
+
 		return "node"
 	case surfaceReport:
 		return c.billingReportUA(account)
@@ -424,8 +429,16 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 		req.Header.Set("X-User-Id", account.UID)
 	}
 
-	// X-Domain：账号 domain 优先，否则取 chat base 的 host（真机各面都是 host 形态）。
-	req.Header.Set("X-Domain", domainHostFor(account, c.chatBase(account)))
+	// X-Domain：账号 domain 优先，否则取本次请求的 endpoint authority（真机各面
+	// 都是 host 形态，官方 enterpriseHeaders() 同样回落 endpoint authority）。
+	// 不能统一回落 chat base：billing 面走 billingBase（codebuddy.cn），回落到 chat
+	// base 会让 billing 请求带上不属于该域的主机名。
+	endpoint := req.URL.Host
+	if endpoint == "" {
+		endpoint = c.chatBase(account)
+	}
+
+	req.Header.Set("X-Domain", domainHostFor(account, endpoint))
 
 	c.lightSurfaceOverrides(srf, req, account)
 }
@@ -488,8 +501,8 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 }
 
 // domainHostFor 轻头族的 X-Domain：账号 domain（去 scheme 与尾斜杠）优先，
-// 否则取 chat base 的 host（真机为产品域 host 形态，不是完整 URL）。
-func domainHostFor(account *auth.Auth, chatBase string) string {
+// 否则取 endpoint 的 host（真机为产品域 host 形态，不是完整 URL）。
+func domainHostFor(account *auth.Auth, endpoint string) string {
 	if account != nil {
 		// Domain 加锁快照（见 auth.DomainValue：keepalive 刷新在 a.mu 内改写）。
 		if d := strings.TrimSpace(account.DomainValue()); d != "" {
@@ -500,8 +513,13 @@ func domainHostFor(account *auth.Auth, chatBase string) string {
 		}
 	}
 
-	if u, err := url.Parse(chatBase); err == nil && u.Host != "" {
+	if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
 		return u.Host
+	}
+
+	// endpoint 也可能是裸 host（refresh 面传 req.URL.Host）：无 scheme、无路径时原样返回。
+	if h := strings.TrimSpace(endpoint); h != "" && !strings.Contains(h, "/") {
+		return h
 	}
 
 	return "copilot.tencent.com"

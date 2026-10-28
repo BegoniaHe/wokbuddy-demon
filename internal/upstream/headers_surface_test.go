@@ -328,6 +328,51 @@ func TestGrowthGoldenHeaderSet(t *testing.T) {
 	}
 }
 
+// TestGrowthUAHonorsExplicitUserAgent growth 面默认 UA 是 node，但显式
+// upstream.user_agent 的口径是「全部出站生效」，不能在该面被 node 静默吞掉。
+func TestGrowthUAHonorsExplicitUserAgent(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	client.UserAgent = "custom/1.0"
+
+	req, err := http.NewRequest(http.MethodGet, "https://www.workbuddy.cn/v2/activity/growth/buddy/info", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.GrowthHeaders(req, surfaceGoldenAccount())
+
+	if got := req.Header.Get("User-Agent"); got != "custom/1.0" {
+		t.Errorf("User-Agent=%q want custom/1.0（显式配置优先于 node 默认）", got)
+	}
+}
+
+// TestLightSurfaceXDomainFollowsEndpoint 轻头族无账号 domain 时，X-Domain 必须取
+// 本次请求的 endpoint host，而不是 chat base：billing 面走 billingBase
+// （codebuddy.cn），回落到 chat base 会把 workbuddy.cn 发给 billing 域。
+func TestLightSurfaceXDomainFollowsEndpoint(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	client.ChatBaseCN = "https://www.workbuddy.cn"
+	client.BillingBaseCN = "https://www.codebuddy.cn"
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at"}
+
+	req, err := http.NewRequest(http.MethodPost,
+		"https://www.codebuddy.cn/billing/meter/get-user-resource-summary", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.BillingHeaders(req, account)
+
+	if got := req.Header.Get("X-Domain"); got != "www.codebuddy.cn" {
+		t.Errorf("X-Domain=%q want www.codebuddy.cn（endpoint authority，不是 chat base）", got)
+	}
+}
+
 // TestGrowthPathsUseNodeFingerprint 三条已实测/已用路径（buddy/info、travel/status、
 // streak）走同一 growth 头族；其余 /activity/growth/* 路径（tasks、heatmap、
 // lottery、makeup-cards 等）是**同面假设**，无逐路径抓包证据，注释见 UPSTREAM.md。
