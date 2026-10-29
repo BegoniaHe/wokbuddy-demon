@@ -1429,7 +1429,11 @@ type chatFlow struct {
 	lastErr         error
 	modelBlock      pool.ModelBlockStatus
 	degradedApplied bool
-	heldUID         string
+	// splitRetried 是否已因 11128「渠道未授权」把 system 按句界拆开重试过（只重试一次）。
+	splitRetried bool
+	// splitRetryPending 本次拆句重试不占 MaxRotate 名额，由 runRotation 追加一次循环。
+	splitRetryPending bool
+	heldUID           string
 	// 请求级积分预扣（issue #116 P1-1）：reservedUID 非空时释放时归还。
 	reservedUID     string
 	reservedCredits float64
@@ -1941,7 +1945,9 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 		deadline = time.Now().Add(f.h.cfg.RotateBudget)
 	}
 
-	for i := range f.h.cfg.MaxRotate {
+	for i := 0; f.rotationAllowed(i); i++ {
+		// 拆句同号重试不消耗 MaxRotate 名额：MaxRotate=1 的单号池也要拿到这一次机会。
+		f.splitRetryPending = false
 		// 预算检查放在循环顶部（含上一轮退避之后）：退避已把耗时推过预算时立即停。
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			log.Printf("WARN: [server] rotate budget %s exhausted after %d attempt(s): stop rotating",
@@ -1967,6 +1973,12 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 	}
 
 	return false
+}
+
+// rotationAllowed 报告第 i 次尝试是否仍在轮转预算内：拆句同号重试不消耗 MaxRotate
+// 名额，由 splitRetryPending 追加一次循环（issue #389）。
+func (f *chatFlow) rotationAllowed(i int) bool {
+	return i < f.h.cfg.MaxRotate || f.splitRetryPending
 }
 
 // recordRotation 把轮换原因写入决策链（上限 8 条）。
@@ -2571,8 +2583,34 @@ func (f *chatFlow) handleTransportError(
 	return rotContinue
 }
 
-// retryContentBlocked 内容拦截首次命中时切降级提示词同请求重试。
-func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth) bool {
+// retryContentBlocked 「system 连续原文」拦截的同号重试：先按句界拆 system 保住客户端
+// 人设，拆句不适用（或拆完仍被 ErrContentBlocked 拦）才回落到既有中性降级重试。
+//
+// 顺序即优先级（issue #389）：
+//  1. 拆句救援，两族拦截都适用：
+//     - 11128「渠道未授权」（ErrContentBlocked 里的实测形态）：上游按 system 里的连续
+//     原文匹配，把多句长 system 按句界拆成两条即可绕开（实测 200）；
+//     - 11-128「通道校验失败」（ErrChannelRefused）：分类器按码+文案定性，同样按连续
+//     原文匹配，拆句后实测 200。
+//     两者都只重试一次、同号、正文逐字保留（客户端人设/项目约定不丢）；不换号、不罚
+//     号、不计连败，也**不**触发全局降级窗口——degrade.Trigger 会把整池降到次日 0 点，
+//     代价远大于一次重试。
+//  2. 拆句不适用（人格句这类拆开会废指令的短段）或拆完仍是 11128：回落到中性提示词降级
+//     重试（既有兜底，保留）。11-128 不走中性降级：通道证据在客户端一侧，换措辞无用，
+//     拆句后仍失败即按既有零动作透传（不罚号）。
+func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth, respBody []byte) bool {
+	if body, ok := f.splitSystemRetry(kind, respBody); ok {
+		f.body = body
+		f.splitRetried = true
+		f.splitRetryPending = true
+		delete(f.tried, acct.UID) // 同号重试：单账号池也要拿到这一次机会
+		f.releaseHeld()
+		log.Printf("INFO: [server] %s acct=%s model=%s: retry with sentence-split system (persona kept)",
+			kind, logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return true
+	}
+
 	if kind != upstream.ErrContentBlocked || !f.canDegrade() || f.degradedApplied {
 		return false
 	}
@@ -2585,6 +2623,35 @@ func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth) b
 	log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 
 	return true
+}
+
+// splitSystemRetry 判定并构造「按句界拆 system」的同号重试 body：只在 11128 形态、且
+// 入站 body 里确有可拆的多句 system 段（拆完 ≥2 条、每条不止一句）时生效。
+//
+// 拆句在**入站 body**（f.body）上做：ChatStreamContext 内部会重新 prepareBody，
+// 因此这里只需替换 f.body。请求级聚合（conversationRequestID / 会话头）在轮转前
+// 已由 buildChatMeta 定型，不受 body 改写影响。
+func (f *chatFlow) splitSystemRetry(kind upstream.ErrKind, respBody []byte) ([]byte, bool) {
+	if f.splitRetried || f.degradedApplied || !f.canDegrade() || !fingerprintBlocked(kind, respBody) {
+		return nil, false
+	}
+
+	return prompt.SplitSystemBySentences(f.body)
+}
+
+// fingerprintBlocked 报告该响应是否是「system 连续原文」拦截——拆句唯一适用的两族：
+//   - ErrChannelRefused（11-128 + request illegal）：分类器已按码+文案定性，不再复核；
+//   - ErrContentBlocked：必须 11128 码坐实。其余内容拦截（裸指纹、敏感词）按词命中，
+//     拆句无效，仍走既有中性降级重试。
+func fingerprintBlocked(kind upstream.ErrKind, respBody []byte) bool {
+	switch kind {
+	case upstream.ErrChannelRefused:
+		return true
+	case upstream.ErrContentBlocked:
+		return upstream.IsUnapprovedChannel(string(respBody))
+	default:
+		return false
+	}
 }
 
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
@@ -2615,7 +2682,7 @@ func (f *chatFlow) handleHTTPError(
 	// 到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append 降级重试同样退化
 	// 为 replace——原文在场只会确定性再撞 400）。第二次仍被拦 → 回内容防火墙错误。
 	// 内容问题非账号问题：applyErrorPolicy 不罚账号。
-	if f.retryContentBlocked(kind, acct) {
+	if f.retryContentBlocked(kind, acct, respBody) {
 		return rotContinue
 	}
 	// 队列/并发业务码（6020/6021/6022）：账号本身健康，换号不会改变队列位置；
@@ -2823,7 +2890,7 @@ func (f *chatFlow) handleRequestLevelError(
 	}
 
 	f.out.Error(status, code, msg,
-		f.h.hintOf(kind, raw, f.bareModel, f.reqHasImage, uerr))
+		f.h.hintOf(kind, raw, f.bareModel, f.reqHasImage, f.declaredToolCount > 0, uerr))
 	f.st.status = status
 	f.st.outcome = reqlog.OutcomeHTTPError
 }
@@ -2897,7 +2964,7 @@ func (f *chatFlow) handleStreamSuccess(
 	repair := upstream.NewMarkupRepair(f.declaredTools, true)
 
 	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
-		return f.h.hintContext(f.bareModel, f.reqHasImage)
+		return f.h.hintContext(f.bareModel, f.reqHasImage, f.declaredToolCount > 0)
 	}), repair, func(payload string) { errFrame = payload })
 	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
 
@@ -3920,7 +3987,7 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 		return status, code, msg, hint, false
 	}
 
-	hint = f.h.hintOf(upErr.Kind, upErr.Msg, f.bareModel, f.reqHasImage, upErr)
+	hint = f.h.hintOf(upErr.Kind, upErr.Msg, f.bareModel, f.reqHasImage, f.declaredToolCount > 0, upErr)
 	switch upErr.Kind {
 	case upstream.ErrSoftRate:
 		status = http.StatusTooManyRequests
@@ -4419,8 +4486,8 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 // 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
 // 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 10min 未
 // 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
-func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
-	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}
+func (h *Handler) hintContext(bareModel string, hasImage, hasTools bool) upstream.HintContext {
+	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage, HasTools: hasTools}
 	if bareModel == "" {
 		return ctx
 	}
@@ -4443,14 +4510,14 @@ func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintCont
 // body 原文判定（防御路径）。transport 层错误（lastErr 非 *upstream.Error 且
 // 上游没回 body）→ 无 hint（不编造）。
 func (h *Handler) hintOf(
-	kind upstream.ErrKind, body, bareModel string, hasImage bool, uerr *upstream.Error,
+	kind upstream.ErrKind, body, bareModel string, hasImage, hasTools bool, uerr *upstream.Error,
 ) string {
 	msg := body
 	if uerr != nil && uerr.Msg != "" {
 		msg = uerr.Msg
 	}
 
-	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage, hasTools))
 }
 
 // secondsUntilLocalMidnight 返回距离本地次日 0 点的秒数（至少 1）。

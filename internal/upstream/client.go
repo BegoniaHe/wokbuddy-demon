@@ -183,6 +183,22 @@ const accountRestrictedMsg = "request illegal"
 // `{"code":"11-128",...}`（部分版本是非法 JSON），因此按字节子串而不是 JSON 字段判定。
 const channelRefusedCode = "11-128"
 
+// unapprovedChannelCode 上游「渠道未授权」业务码 11128。实测形态：
+// 400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}
+// ——system 里出现连续原文指纹（如 DSH 的 @ 路径说明段）即触发。
+//
+// 与 channelRefusedCode（"11-128"，带连字符）**不是**同一个码：11128 的连续原文
+// 特征是可救的（同义改写 / 按句界拆 system 后即可 200），归 ErrContentBlocked 走
+// 同号重试；11-128 才是通道侧问题（零动作）。
+const unapprovedChannelCode = "11128"
+
+// IsUnapprovedChannel 报告 body 是否是 11128「渠道未授权」形态：网关按句界拆 system
+// 抢救的唯一判据（见 server.retryContentBlocked）。只认 JSON code 字段形态，不做
+// 裸子串匹配——11128 是合法 token 数，裸匹配会误伤。
+func IsUnapprovedChannel(body string) bool {
+	return codeMarker(strings.ToLower(body), unapprovedChannelCode)
+}
+
 // IsChannelRefused 报告 body 是否是「11-128 通道校验失败」形态：码命中 11-128
 // **且**文案含 request illegal。通道校验问题在客户端/通道一侧（UA、头、中间代理、
 // 入站形态），账号健康，不该罚号也不该走内容拦截的降级重试。
