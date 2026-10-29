@@ -1431,7 +1431,9 @@ type chatFlow struct {
 	degradedApplied bool
 	// splitRetried 是否已因 11128「渠道未授权」把 system 按句界拆开重试过（只重试一次）。
 	splitRetried bool
-	heldUID      string
+	// splitRetryPending 本次拆句重试不占 MaxRotate 名额，由 runRotation 追加一次循环。
+	splitRetryPending bool
+	heldUID           string
 	// 请求级积分预扣（issue #116 P1-1）：reservedUID 非空时释放时归还。
 	reservedUID     string
 	reservedCredits float64
@@ -1943,7 +1945,9 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 		deadline = time.Now().Add(f.h.cfg.RotateBudget)
 	}
 
-	for i := range f.h.cfg.MaxRotate {
+	for i := 0; f.rotationAllowed(i); i++ {
+		// 拆句同号重试不消耗 MaxRotate 名额：MaxRotate=1 的单号池也要拿到这一次机会。
+		f.splitRetryPending = false
 		// 预算检查放在循环顶部（含上一轮退避之后）：退避已把耗时推过预算时立即停。
 		if !deadline.IsZero() && !time.Now().Before(deadline) {
 			log.Printf("WARN: [server] rotate budget %s exhausted after %d attempt(s): stop rotating",
@@ -1969,6 +1973,12 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 	}
 
 	return false
+}
+
+// rotationAllowed 报告第 i 次尝试是否仍在轮转预算内：拆句同号重试不消耗 MaxRotate
+// 名额，由 splitRetryPending 追加一次循环（issue #389）。
+func (f *chatFlow) rotationAllowed(i int) bool {
+	return i < f.h.cfg.MaxRotate || f.splitRetryPending
 }
 
 // recordRotation 把轮换原因写入决策链（上限 8 条）。
@@ -2592,6 +2602,7 @@ func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth, r
 	if body, ok := f.splitSystemRetry(kind, respBody); ok {
 		f.body = body
 		f.splitRetried = true
+		f.splitRetryPending = true
 		delete(f.tried, acct.UID) // 同号重试：单账号池也要拿到这一次机会
 		f.releaseHeld()
 		log.Printf("INFO: [server] %s acct=%s model=%s: retry with sentence-split system (persona kept)",

@@ -3282,6 +3282,36 @@ func TestChannelRefusedSplitsSystemInsteadOfRotating(t *testing.T) {
 	}
 }
 
+// TestChannelRefusedSplitRetryNotCappedByMaxRotate MaxRotate=1 的默认单号部署形态下，
+// 拆句同号重试不消耗轮转名额：仍要发出第二次上游请求并拿到 200（issue #389）。
+func TestChannelRefusedSplitRetryNotCappedByMaxRotate(t *testing.T) {
+	t.Parallel()
+
+	var bodies [][]byte
+
+	client := recordChatUpstream(&bodies, func(n int, _ []byte) *http.Response {
+		if n == 1 {
+			return errorJSON(http.StatusBadRequest, channelRefusedBody)
+		}
+
+		return streamOK()
+	})
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough", MaxRotate: 1})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(newChatBody(t, sysLong, "true"))))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s (want 200 after sentence-split retry)", rec.Code, rec.Body)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (400 + split retry), got %d", len(bodies))
+	}
+}
+
 // TestContentBlockedWithoutUnapprovedCodeNotSplit 无 11128 码的内容拦截（按词命中，拆句
 // 无效）不走拆句：仍按既有人设保护逻辑落到中性降级重试。
 func TestContentBlockedWithoutUnapprovedCodeNotSplit(t *testing.T) {
