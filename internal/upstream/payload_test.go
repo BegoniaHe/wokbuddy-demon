@@ -877,3 +877,105 @@ func TestChatStreamInjectsConversationRequestBody(t *testing.T) {
 		t.Fatalf("body=%s", got)
 	}
 }
+
+// TestNormalizeToolEnumTypes 工具 schema 只写 enum 不写 type 时补出可无损推断的 type
+// （11133 实案：kimi-k3.1-pro / kimi-k3-1 对参数 schema 严格校验，属性只给 enum 直接
+// 整单 400 code=11133；补上 type 即 200，hy3 / glm-5.3 不受影响）。
+// 边界：推断不出唯一类型（混合标量 / 含 null / 空数组）保持原样，不猜。
+func TestNormalizeToolEnumTypes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		enum string // properties.<name> 的 schema 原样 JSON
+		want string // 期望补出的 type（空 = 不补）
+	}{
+		{name: "string", enum: `{"enum":["low","high"]}`, want: "string"},
+		{name: "integer", enum: `{"enum":[1,2,3]}`, want: "integer"},
+		{name: "number", enum: `{"enum":[0.5,1]}`, want: "number"},
+		{name: "boolean", enum: `{"enum":[true,false]}`, want: "boolean"},
+		{name: "explicit type kept", enum: `{"type":"string","enum":["a"]}`, want: "string"},
+		{name: "mixed scalars untouched", enum: `{"enum":["1",2]}`, want: ""},
+		{name: "null in enum untouched", enum: `{"enum":["a",null]}`, want: ""},
+		{name: "empty enum untouched", enum: `{"enum":[]}`, want: ""},
+		{name: "no enum untouched", enum: `{"description":"x"}`, want: ""},
+		{name: "object enum member untouched", enum: `{"enum":[{"a":1}]}`, want: ""},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			body := `{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":"hi"}],"tools":[` +
+				`{"type":"function","function":{"name":"pick","parameters":{"type":"object","properties":{` +
+				`"level":` + testCase.enum + `},"required":["level"]}}}]}`
+
+			out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+
+			got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "level", "type")
+			if got != testCase.want {
+				t.Fatalf("inferred type = %q, want %q (schema %s)", got, testCase.want, testCase.enum)
+			}
+		})
+	}
+}
+
+// enum 取值一字不改，只是补类型；嵌套 schema（anyOf / items）同样生效。
+func TestNormalizeToolEnumTypesKeepValuesAndNested(t *testing.T) {
+	t.Parallel()
+
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","properties":{"level":{"enum":["low","high"]}},` +
+		`"anyOf":[{"properties":{"tier":{"enum":[1,2]}}}],` +
+		`"items":{"enum":[true]}}}}]}`
+
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "level", "type"); got != "string" {
+		t.Fatalf("top-level enum type = %q, want string", got)
+	}
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "anyOf", 0, "properties", "tier", "type"); got != "integer" {
+		t.Fatalf("nested anyOf enum type = %q, want integer", got)
+	}
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "items", "type"); got != "boolean" {
+		t.Fatalf("items enum type = %q, want boolean", got)
+	}
+
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+
+	level := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)["level"].(map[string]any)
+
+	enum, _ := json.Marshal(level["enum"])
+	if string(enum) != `["low","high"]` {
+		t.Fatalf("enum values mutated: %s", enum)
+	}
+}
+
+// response_format 与 const 是**输出**约束：补错类型会改语义，不在规整范围内。
+func TestNormalizeToolEnumTypesOutputConstraintsUntouched(t *testing.T) {
+	t.Parallel()
+
+	body := `{"messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":` +
+		`{"type":"object","properties":{"level":{"enum":["low","high"]}}}}},` +
+		`"tools":[{"type":"function","function":{"name":"t","parameters":{"type":"object","properties":{` +
+		`"mode":{"const":"fast"}}}}}]}`
+
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+
+	if got := lookupToolPattern(t, out, "response_format", "json_schema", "schema", "properties", "level", "type"); got != "" {
+		t.Fatalf("response_format enum 被补了 type: %q", got)
+	}
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "mode", "type"); got != "" {
+		t.Fatalf("const 节点被补了 type: %q", got)
+	}
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "mode", "const"); got != "fast" {
+		t.Fatalf("const 取值被改: %q", got)
+	}
+}

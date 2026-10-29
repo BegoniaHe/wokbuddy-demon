@@ -37,6 +37,12 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		if ctx.HasImage && ctx.ModelInCatalog && !ctx.ModelSupportsImages {
 			return "model " + ctx.Model + " does not support images; pick one with supports_images=true from /v1/models"
 		}
+		// 工具定义（参数 schema）被模型供应商拒收：说清是 schema 校验，不是请求体语法
+		// ——否则用户只会看到「参数不合法」，猜不到要改 tools。
+		if isToolSchemaRejection(msg) {
+			return "tool definitions were rejected by the model provider (parameter schema validation, " +
+				"not request body syntax); check tools[].function.parameters"
+		}
 
 		return "request parameters were rejected by the model provider; check message format and model capabilities"
 	}
@@ -206,6 +212,27 @@ func isModelParamInvalid(body string) bool {
 		strings.Contains(lower, "model_param_invalid") ||
 		strings.Contains(lower, "invalid request parameters") ||
 		strings.Contains(lower, "request parameters do not meet the current model requirements")
+}
+
+// toolSchemaRejectMarkers 工具 schema 校验的拒收文案家族（小写）。实测形态：
+// 400 {"code":11133,"msg":"Invalid request parameters","extError":{"code":"400001",
+// "message":"the request parameters were rejected by the model provider"}}
+// ——属性 schema 只写 enum 不写 type 时，kimi 系模型整单拒收（见 payload.go 的
+// inferEnumType）；文案本身不提 tools，故只能按「模型供应商侧拒收」这一句判定。
+var toolSchemaRejectMarkers = []string{"rejected by the model provider", "rejected by model provider"}
+
+// isToolSchemaRejection 报告 11133 body 是否指向**工具定义（参数 schema）校验**而非
+// 请求体语法。两个信号任一成立即算：供应商侧拒收文案；或 param 明确指向工具参数。
+// 判定只影响 gateway_hint 文案（补充说明，非权威分类），误判代价是多一条中性提示。
+func isToolSchemaRejection(body string) bool {
+	lower := strings.ToLower(body)
+	if containsAnyLower(lower, toolSchemaRejectMarkers) {
+		return true
+	}
+
+	param := strings.ToLower(businessErrorParam(body))
+
+	return strings.Contains(param, "tool") || strings.Contains(param, "function")
 }
 
 // isInvalidImageData 上游 11135 body 判定（code 11135 / invalid_image_data /

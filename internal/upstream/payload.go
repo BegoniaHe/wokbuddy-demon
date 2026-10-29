@@ -7,6 +7,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"math"
 	"slices"
 	"strings"
 )
@@ -47,7 +48,7 @@ func PrepareBodyOptWithEffortsAndDefault(
 
 	normalizeToolChoice(obj)
 	normalizeStop(obj)
-	normalizeToolPatterns(obj)
+	normalizeToolSchemas(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
 	// 防御层：第三方把 reasoning_text / reasoning 当成 content part 回放时，上游 content
@@ -591,7 +592,8 @@ func toolChoiceFunctionName(table map[string]any) string {
 	return "auto"
 }
 
-// normalizeToolPatterns 归一化 tools 子树里 pattern 的非标准转义 `\_`（→ `_`）。
+// normalizeToolSchemas 规整 tools 子树的 JSON Schema：pattern 的非标转义 `\_`（→ `_`）
+// + 只写 enum 不写 type 的属性补出可无损推断的 type。
 //
 // 上游对 tools[].function.parameters 做严格 JSON Schema/正则文法校验，pattern 含
 // `\_`（转义的字面量下划线）会整体拒收：400 code=11129 invalid_function_call_
@@ -606,7 +608,7 @@ func toolChoiceFunctionName(table map[string]any) string {
 // 200），工具方功能不变。只动 tools 子树（pattern 值 + patternProperties 键）；
 // 消息正文里的 `\_`（如 Windows 路径 C:\_x）不碰。其余非标转义（`\:` 等）未证实
 // 触发，不扩面——有实案再议。独立于 sanitize 开关：这是「让请求通过」，不是脱敏。
-func normalizeToolPatterns(obj map[string]any) {
+func normalizeToolSchemas(obj map[string]any) {
 	rawTools, ok := obj["tools"].([]any)
 	if !ok {
 		return
@@ -619,38 +621,124 @@ func normalizeToolPatterns(obj map[string]any) {
 		}
 		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
 		if fn, ok := tool["function"].(map[string]any); ok {
-			unescapePatternLiteralEscapes(fn["parameters"])
+			normalizeSchemaTree(fn["parameters"])
 		}
 
-		unescapePatternLiteralEscapes(tool["parameters"])
+		normalizeSchemaTree(tool["parameters"])
 	}
 }
 
-// unescapePatternLiteralEscapes 递归改写 schema 树里 pattern 值与 patternProperties
-// 键中的 `\_` → `_`（patternProperties 的键也是正则；map 键不可原地改，命中时重建
-// 该层）。
-func unescapePatternLiteralEscapes(node any) {
+// normalizeSchemaTree 递归规整 schema 树的单个节点，两件事：
+//
+//  1. pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是
+//     正则；map 键不可原地改，命中时重建该层）；
+//  2. 只写 enum、没写 type 的属性补出 type（见 inferEnumType）。
+//
+// 第 2 条的实案：工具参数 schema 写成 {"enum":["a","b"]} 而不给 type，Kimi 系模型
+// 严格校验后整单 400 code=11133（Invalid request parameters，extError「the request
+// parameters were rejected by the model provider」）——该模型对这类客户端等于全废；
+// 补上 "type":"string" 即 200（hy3 / glm-5.3 不受影响）。
+func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
 		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
 			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
 		}
 
-		unescapePatternProperties(n)
+		inferEnumType(n)
+
+		normalizePatternProperties(n)
 
 		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+			normalizeSchemaTree(v)
 		}
 	case []any:
 		for _, v := range n {
-			unescapePatternLiteralEscapes(v)
+			normalizeSchemaTree(v)
 		}
 	}
 }
 
-// unescapePatternProperties 改写 patternProperties 键里的 `\_`（map 键不可原地改，
+// inferEnumType 给「有 enum 无 type」的 schema 节点补出可无损推断的 type；推不出唯一
+// 类型就不写（不猜——让上游按原语义报错，好过补错类型改掉契约）。
+//
+// 只走 tools 子树的遍历，const 与 response_format 不在范围内：那是**输出**约束，
+// 补 type 会改语义。
+func inferEnumType(n map[string]any) {
+	if _, hasType := n["type"]; hasType {
+		return
+	}
+
+	enum, ok := n["enum"].([]any)
+	if !ok || len(enum) == 0 {
+		return
+	}
+
+	if kind, ok := enumScalarType(enum); ok {
+		n["type"] = kind
+	}
+}
+
+// enumScalarType 推断 enum 取值的唯一标量类型：全串 string、全整数 integer、
+// 含小数 number、全布尔 boolean。
+//
+// 其余形态一律 ok=false（保持原样）：含 null（JSON Schema 里 null 要 type 联合，补单
+// 值会改语义）、对象/数组、混合标量（"1" 与 1 并存、布尔与数字并存）都没有唯一无损
+// 答案。数字按 json 解码后的 float64 看：整数值（含 1.0）算 integer，带小数才算
+// number——JSON Schema 的 integer 接受 1.0，取更窄的那个。
+func enumScalarType(enum []any) (string, bool) {
+	kind := ""
+
+	for _, item := range enum {
+		cur, ok := enumItemType(item)
+		if !ok {
+			return "", false
+		}
+
+		if kind, ok = mergeEnumType(kind, cur); !ok {
+			return "", false
+		}
+	}
+
+	return kind, kind != ""
+}
+
+// enumItemType 单个 enum 取值的标量类型；非标量（null / 对象 / 数组）判否。
+func enumItemType(item any) (string, bool) {
+	switch value := item.(type) {
+	case string:
+		return "string", true
+	case bool:
+		return "boolean", true
+	case float64:
+		if value != math.Trunc(value) {
+			return "number", true
+		}
+
+		return "integer", true
+	case int, int64:
+		return "integer", true
+	default:
+		return "", false
+	}
+}
+
+// mergeEnumType 合并两个已推断类型：同类型不变，整型与小数混合取 number（仍是唯一
+// 无损答案），其余混合放弃推断。
+func mergeEnumType(kind, cur string) (string, bool) {
+	switch {
+	case kind == "" || kind == cur:
+		return cur, true
+	case (kind == "integer" && cur == "number") || (kind == "number" && cur == "integer"):
+		return "number", true
+	default:
+		return "", false
+	}
+}
+
+// normalizePatternProperties 改写 patternProperties 键里的 `\_`（map 键不可原地改，
 // 命中时重建该层并写回 n）。
-func unescapePatternProperties(n map[string]any) {
+func normalizePatternProperties(n map[string]any) {
 	props, ok := n["patternProperties"].(map[string]any)
 	if !ok {
 		return
