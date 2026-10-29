@@ -181,6 +181,15 @@ func validateOptions(opts *Options) error {
 		opts.Model = "glm-5.2"
 	}
 
+	// 单模型路径同样校验：Codex 用 %q 写 model，\x01 之类会写成 TOML 不认的转义，
+	// 整份 config.toml 解析失败。此前只有 Models 列表路径过校验，单模型绕过了它。
+	model, err := normalizeModelID(opts.Model)
+	if err != nil {
+		return err
+	}
+
+	opts.Model = model
+
 	return nil
 }
 
@@ -201,13 +210,13 @@ func normalizeModelList(list []string) ([]string, error) {
 	out := make([]string, 0, len(list))
 
 	for _, raw := range list {
-		id := strings.TrimSpace(raw)
-		if id == "" {
-			continue
+		id, err := normalizeModelID(raw)
+		if err != nil {
+			return nil, err
 		}
 
-		if strings.ContainsFunc(id, isControlRune) {
-			return nil, fmt.Errorf("%w: 含控制字符 %q 的模型 id 无法写入客户端配置", errModelList, id)
+		if id == "" {
+			continue
 		}
 
 		if _, dup := seen[id]; dup {
@@ -223,6 +232,21 @@ func normalizeModelList(list []string) ([]string, error) {
 	}
 
 	return out, nil
+}
+
+// normalizeModelID trim 后校验单个模型 id：空串返回空串（调用方决定是否丢弃），
+// 含控制字符返回 errModelList。
+func normalizeModelID(raw string) (string, error) {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return "", nil
+	}
+
+	if strings.ContainsFunc(id, isControlRune) {
+		return "", fmt.Errorf("%w: 含控制字符 %q 的模型 id 无法写入客户端配置", errModelList, id)
+	}
+
+	return id, nil
 }
 
 // isControlRune 判定 C0/C1 控制字符（含 \r \n \t 与 DEL）。

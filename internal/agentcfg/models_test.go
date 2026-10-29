@@ -315,3 +315,27 @@ func TestNormalizeModelListRejectsControlRunes(t *testing.T) {
 		t.Fatalf("合法 id 被拒：%v", got)
 	}
 }
+
+// TestValidateOptionsRejectsControlCharsInSingleModel 单模型路径（不带 models 列表）
+// 同样拒绝控制字符：Codex 用 %q 写 model 根键，\x01 会被写成 TOML 不认的转义，
+// 整份 config.toml 解析失败。此前只有列表路径过校验。
+func TestValidateOptionsRejectsControlCharsInSingleModel(t *testing.T) {
+	t.Parallel()
+
+	for _, bad := range []string{"a\x01b", "m\nn", "m\rn", "m\tn", "m\x7fn", "m\u0085n"} {
+		opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk", Model: bad}
+		if err := validateOptions(&opts); !errors.Is(err, errModelList) {
+			t.Fatalf("单模型 %q 应被拒绝，得到 %v", bad, err)
+		}
+	}
+
+	// 合法单模型原样保留（含 : . / -）。
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk", Model: " global:kimi-k3 "}
+	if err := validateOptions(&opts); err != nil {
+		t.Fatalf("合法单模型不应报错: %v", err)
+	}
+
+	if opts.Model != "global:kimi-k3" {
+		t.Fatalf("Model = %q, want trim 后的 global:kimi-k3", opts.Model)
+	}
+}
