@@ -91,10 +91,13 @@ func (*Client) globalRegisterReq(base, method, url, token string, body any) (*ht
 
 // globalRegisterJSON 发注册链路请求并解外层信封（code/msg）。
 //
-// 无账号作用域（issue #39）：注册发生在拿到账号之前，不存在绑定槽或 realm 默认槽，
-// 故保持 c.HTTP（全局 proxies 池/直连）。
-func (c *Client) globalRegisterJSON(req *http.Request) (code int, msg string, raw json.RawMessage, err error) {
-	resp, err := c.HTTP.Do(req)
+// 账号作用域（issue #39）：注册激活 / 补地区都带该账号的 access token 与
+// X-User-Id，属于「这个账号在出站」，因此必须走账号出口（绑定槽 → realm 默认槽
+// → 全局池 → 直连）。走 c.HTTP 会让绑了槽的 global 账号在这里暴露宿主机 IP。
+func (c *Client) globalRegisterJSON(
+	account *auth.Auth, req *http.Request,
+) (code int, msg string, raw json.RawMessage, err error) {
+	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return 0, "", nil, fmt.Errorf("globalRegisterJSON: %w", err)
 	}
@@ -130,7 +133,7 @@ func (c *Client) GlobalFetchCountries(account2 *auth.Auth, intlOnly bool) ([]Glo
 		return nil, err
 	}
 
-	code, msg, raw, err := c.globalRegisterJSON(req)
+	code, msg, raw, err := c.globalRegisterJSON(account2, req)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +221,7 @@ func (c *Client) GlobalRegisterStatus(account *auth.Auth) (activated, needsRegio
 
 	req.Header.Set("X-User-Id", account.UID)
 
-	code, m, _, err := c.globalRegisterJSON(req)
+	code, m, _, err := c.globalRegisterJSON(account, req)
 	if err != nil {
 		return false, false, "", err
 	}
@@ -253,7 +256,7 @@ func (c *Client) GlobalSubmitRegion(account3 *auth.Auth, country *GlobalCountry)
 		return err
 	}
 
-	code, msg, _, err := c.globalRegisterJSON(req)
+	code, msg, _, err := c.globalRegisterJSON(account3, req)
 	if err != nil {
 		return err
 	}

@@ -99,6 +99,16 @@ func TestAccountEgressUsesSlotDial(t *testing.T) {
 		{"EditImage", func(c *Client, a *auth.Auth) {
 			_, _, _ = c.EditImage(context.Background(), a, []byte(`{}`), "", ChatMeta{})
 		}},
+		// 注册激活链路同样带账号 token（issue #39）：绑了槽的 global 账号不能在这里
+		// 暴露宿主机 IP。
+		{"GlobalRegisterStatus", func(c *Client, a *auth.Auth) {
+			a.Domain = "https://www.codebuddy.ai"
+			_, _, _, _ = c.GlobalRegisterStatus(a)
+		}},
+		{"GlobalFetchCountries", func(c *Client, a *auth.Auth) {
+			a.Domain = "https://www.codebuddy.ai"
+			_, _ = c.GlobalFetchCountries(a, true)
+		}},
 	}
 
 	for _, testCase := range cases {
