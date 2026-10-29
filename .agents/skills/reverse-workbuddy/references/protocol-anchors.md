@@ -24,6 +24,10 @@
   - `WebBaseCN`（`https://www.workbuddy.cn`）：任务领奖 / profile 域。
   - `/v3/config` 拉取：`internal/upstream/client.go` 的 `fetchV3ConfigModelMap` /
     `newV3ConfigRequest`；头族见 `V3ConfigHeaders`（`internal/upstream/headers.go`）。
+    可见性判定在此一并写入：`data.agents` 的默认会话 agent 白名单（#319）与
+    `data.productFeaturesConfig.ModelRateLimitCap.lines[].paidId` 的付费线路变体
+    （#402，`internal/upstream/paidline.go`，排除表 `yae` 见渲染层
+    `renderer/assets/common-*.js` 的 `isIOAEnterpriseId` 常量）。
   - 企业模型目录：`/console/enterprises/<enterpriseId|personal>/models`（官方
     `CloudAgentProvider.getModels()` 按账号拼 `enterpriseId`），失败回落
     `/v2/enterprises/personal/models`（官方 daemon 侧固定 personal）。
@@ -77,10 +81,10 @@
   - chat 桌面头组：`setDesktopExpertHeaders()`（`X-Domain` / `X-Product=SaaS` /
     `X-User-Id` / `X-Agent-Intent|Purpose|Type` /
     `X-Private-Data`（**固定 `true`**：官方桌面主进程 `applyGatewayHeaders` 兜底表
-    `VF` 与 `buildVlmGatewayHeaders` 都硬编码 `true`，CN 5.9.3 / global 5.8.4 同形；
-    CLI chat 的 `privateDataHeaderValue()` 是另一条 surface：CN 个人号 `false`、
-    企业号（含 `type=ultimate|exclusive` 无 enterpriseId）`true`、global 5.8.4
-    `true`）/ `X-Ide-Name|Type|Version` /
+    `VF` 与 `buildVlmGatewayHeaders` 都硬编码 `true`，CN / global 5.9.3 同形；
+    CLI chat 的 `privateDataHeaderValue()` 是另一条 surface：个人号 `false`、
+    企业号（含 `type=ultimate|exclusive` 无 enterpriseId）`true`，CN / global 5.9.3
+    同源同形，判据只有 `isEnterpriseEditionAccount`、与域无关）/ `X-Ide-Name|Type|Version` /
     `X-Codebuddy-Request` / traceparent + b3 单头 + `X-B3-*` 四件套）。
   - `X-Agent-Runtime`：5.9.3 起官方在 chat / images / search / webfetch 全发；
     chat 面发 `local-agent`（真机恒为该值，`other` 只是取不到会话 runtime 时的
@@ -127,9 +131,11 @@
 - `/v2/chat/busy`：渲染层模型繁忙度探测（`renderer/assets/contexts-*.js`），
   单次最多 50 个模型，levels 为 `idle|normal|busy|congested|unavailable|unknown`；
   不是 CLI 排队。本仓已覆盖出站解析（`internal/upstream/modelbusy.go`）与入站只读
-  预检（`internal/server/busy.go`）；不要让它参与选号。
+  预检（`internal/server/busy.go`）；不要让它参与选号。**global 域上游未部署这条
+  路径（一律 404；见 issue #401 的 live 证据）**，出站侧按域记住「无此观测」后
+  不再重打。
 - `/v2/images/generations`、`/v2/images/edits`：官方 CLI 出图 / 图生图，
-  CN 5.8.3 与 global 5.8.4 同源；**两者均已覆盖**（`internal/upstream/images.go`
+  CN 5.8.3 / global 5.8.4 / 两域 5.9.3 同源；**两者均已覆盖**（`internal/upstream/images.go`
   的 `GenerateImage` / `EditImage`，入站 `features.images_endpoint` 门控）。
   `edits` 是 JSON 形态（`Content-Type: application/json`，非 multipart），
   body 为 `model` / `prompt` / `size` + 可选 `image`（data URL / http URL / 裸

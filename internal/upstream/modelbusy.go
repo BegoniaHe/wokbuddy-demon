@@ -4,6 +4,9 @@
 // idle|normal|busy|congested|unavailable|unknown。本客户端按 50 一批发送，
 // 并兼容 map / 数组两种响应形态；失败只由调用方并入观测错误，不影响模型目录
 // 与选号。
+//
+// global 域（www.workbuddy.ai）上游**没有**这条路径，一律 404：按域记住「该域无此
+// 观测」后本进程不再重复请求（issue #401）。记忆只对 404 生效，超时/5xx 照常报错。
 package upstream
 
 import (
@@ -13,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net/http"
 	"strings"
@@ -36,6 +40,11 @@ func (c *Client) ModelBusy(
 		return map[string]string{}, nil
 	}
 
+	realm := modelBusyRealm(account)
+	if c.modelBusyRealmMissing(realm) {
+		return map[string]string{}, nil
+	}
+
 	out := make(map[string]string, len(models))
 
 	for start := 0; start < len(models); start += modelBusyBatch {
@@ -48,6 +57,12 @@ func (c *Client) ModelBusy(
 		}
 
 		maps.Copy(out, levels)
+
+		// 本批刚判定该域没有这条观测：后续批次必然同样 404，直接收尾，不在同一次
+		// 调用里重复打上游（issue #401）。
+		if c.modelBusyRealmMissing(realm) {
+			break
+		}
 	}
 
 	return out, nil
@@ -88,6 +103,14 @@ func (c *Client) modelBusyBatch(
 		return nil, fmt.Errorf("%w: > %d bytes", errModelBusyTooLarge, modelBusyMaxBody)
 	}
 
+	// 404 = 该域没有这条观测（global 服务端未部署），不是「这次查询失败」：
+	// 记住后返回空表，调用方既不填 busy 列也不产生错误条目（issue #401）。
+	if resp.StatusCode == http.StatusNotFound {
+		c.markModelBusyRealmMissing(modelBusyRealm(account), resp.StatusCode, string(body))
+
+		return map[string]string{}, nil
+	}
+
 	if resp.StatusCode >= http.StatusBadRequest {
 		return nil, &Error{
 			Kind: Classify(resp.StatusCode, string(body)), Status: resp.StatusCode,
@@ -96,6 +119,54 @@ func (c *Client) modelBusyBatch(
 	}
 
 	return parseModelBusy(body), nil
+}
+
+// modelBusyRealm 繁忙度记忆用的域键：无账号时不记忆（空串不落桶）。
+func modelBusyRealm(account *auth.Auth) string {
+	if account == nil {
+		return ""
+	}
+
+	return account.Realm()
+}
+
+// modelBusyRealmMissing 报告该域是否已被判定为「没有 /v2/chat/busy」。
+func (c *Client) modelBusyRealmMissing(realm string) bool {
+	if c == nil || realm == "" {
+		return false
+	}
+
+	c.busyMu.Lock()
+	defer c.busyMu.Unlock()
+
+	return c.busyMissingRealm[realm]
+}
+
+// markModelBusyRealmMissing 记住「该域没有这条观测」并记一行日志。
+//
+// 只在 404 时调用：404 是「路径不存在」的结构性事实，重试同一个域不会变；超时/5xx
+// 是偶发失败，不能记忆——否则一次网络抖动就会让该域整轮观测静默消失。
+func (c *Client) markModelBusyRealmMissing(realm string, status int, body string) {
+	if c == nil || realm == "" {
+		return
+	}
+
+	c.busyMu.Lock()
+	defer c.busyMu.Unlock()
+
+	if c.busyMissingRealm[realm] {
+		return
+	}
+
+	if c.busyMissingRealm == nil {
+		c.busyMissingRealm = make(map[string]bool, 2)
+	}
+
+	c.busyMissingRealm[realm] = true
+
+	log.Printf("INFO: [upstream] model busy realm=%s: %s not deployed upstream (http %d: %s); "+
+		"model busy observation disabled for this realm until restart", realm, modelBusyPath, status,
+		RedactForLog(strings.TrimSpace(body), 120))
 }
 
 // parseModelBusy 兼容 {code,data} 信封与 map/数组响应。

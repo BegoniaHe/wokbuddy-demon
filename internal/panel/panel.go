@@ -586,40 +586,63 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 // 各域独立探测、独立容错：某域无可用账号则整域跳过；两域全空时才报错
 // （有错误明细回 502，一个账号都没有回 503）。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
+	// 目录错误与繁忙度错误分开收集（issue #401）：catalogErrs 决定「整份视图是否可信」
+	// （为空时进 502 文案），busyErrs 只影响一列观测（少一列 busy，不影响目录）。
+	out, catalogErrs := p.collectAllModels()
+
+	var busyErrs []string
+	if len(out) > 0 {
+		p.attachModelBusy(out, &busyErrs)
+	}
+
+	if len(out) == 0 {
+		writeModelsEmpty(w, catalogErrs)
+
+		return
+	}
+
+	// fetch_errors 只讲目录（视图是否可信）：繁忙度明细另走 busy_errors，避免「少一列
+	// 观测」把「目录拿不到」的原因淹掉。
+	resp := map[string]any{"ok": true, "models": out, "fetch_errors": catalogErrs}
+	if len(busyErrs) > 0 {
+		resp["busy_errors"] = busyErrs
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// collectAllModels 双域目录收集：各域独立探测、独立容错，错误只收目录面（cn:/global:）。
+func (p *Panel) collectAllModels() ([]map[string]any, []string) {
 	out := make([]map[string]any, 0)
 
-	var fetchErrs []string
+	var errs []string
 
 	if entries, errMsg := p.collectCNModels(); len(entries) > 0 || errMsg != "" {
 		out = append(out, entries...)
 		if errMsg != "" {
-			fetchErrs = append(fetchErrs, errMsg)
+			errs = append(errs, errMsg)
 		}
 	}
 
 	if entries, errMsg := p.collectGlobalModels(); len(entries) > 0 || errMsg != "" {
 		out = append(out, entries...)
 		if errMsg != "" {
-			fetchErrs = append(fetchErrs, errMsg)
+			errs = append(errs, errMsg)
 		}
 	}
 
-	if len(out) > 0 {
-		p.attachModelBusy(out, &fetchErrs)
-	}
+	return out, errs
+}
 
-	if len(out) == 0 {
-		if len(fetchErrs) > 0 {
-			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
-			return
-		}
-
-		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+// writeModelsEmpty 两域全空：有目录错误明细回 502，一个账号都没有回 503。
+func writeModelsEmpty(w http.ResponseWriter, catalogErrs []string) {
+	if len(catalogErrs) > 0 {
+		writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(catalogErrs, "; "))
 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out, "fetch_errors": fetchErrs})
+	writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 }
 
 // collectCNModels 查 CN 域模型：无可用 CN 账号或账号缺失时返回空；查询失败返回

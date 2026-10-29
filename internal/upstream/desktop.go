@@ -842,7 +842,7 @@ func (c *Client) DesktopChatWithExpert(
 // + 会话头族 + traceparent/b3/X-B3-* 链路族 + acp-connection-id。
 //
 // X-Private-Data 固定 true：桌面主进程 chat 走 `applyGatewayHeaders`，其兜底表
-// `VF` 里该头恒为 `true`（CN 5.9.3 / global 5.8.4 同形）；`buildVlmGatewayHeaders`
+// `VF` 里该头恒为 `true`（CN / global 5.9.3 同形）；`buildVlmGatewayHeaders`
 // 同样硬编码。CLI chat 的 false 判定（privateDataHeaderValue）是另一条 surface，
 // 不可复用——桌面指纹一旦发 false 就与官方桌面客户端不一致。
 func (c *Client) setDesktopExpertHeaders(

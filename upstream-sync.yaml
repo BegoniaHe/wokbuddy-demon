@@ -14,33 +14,43 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 9ca34c2b3fc67d8e971224d0795947a69e5ea51b
-  audited_at_utc: 2026-10-28T16:38:12Z
+  commit: 9f70e00188c30d859505378ae5d9b9779029dc06
+  audited_at_utc: 2026-10-29T12:57:14Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
   reviewed_window:
-    from: 2026-10-25
-    to: 2026-10-28
-    non_merge_commits: 29
+    from: 2026-10-28
+    to: 2026-10-29
+    non_merge_commits: 14
   dispositions:
-    issue: 5
-    revisit: 2
-    skip: 31
+    issue: 4
+    revisit: 3
+    skip: 10
   issues:
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/400
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/401
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/402
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/403
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/404
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/388
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/389
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/390
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/391
   note: >-
-    2026-10-28 审计 33ce2f1..9ca34c2（29 条非 merge + 9 条 merge），官方基线
-    升到 Win32 cn/global 5.9.3.42398134（commit d4692421）。区间内的 5.9.3
-    请求契约对齐（ee1c80d / 8ecf115 / 47f1ed6）已由本仓 #364–#377 全部落地并
-    关单，故整体 skip；确认 4 个缺口开 Issue #388（sanitize 未覆盖 DSH @ 路径段）、
-    #389（11-128 后无「按句界拆 system」重试）、#390（schema enum 缺 type 未推断）、
-    #391（6021 队列满回 503）；2 条挂 revisit：/v1/embeddings 端点（新特性非协议
-    缺口，KISS 暂不做）、baggage 条件键 x-agent-runtime / x-agent-intent（官方包内
-    存在，但与 #364 真机 4 条样本冲突，待真机复核）。面板 / AutoBot / updater /
-    models.allowed / tools 计数 / makeup 上限 / 11102 无负缓存等按形态差异或已覆盖
-    skip。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
+    2026-10-29 审计 9ca34c2..9f70e00（14 条非 merge + 3 条 merge），官方基线维持
+    Win32 cn/global 5.9.3.42398134（commit d4692421，本轮重新下载解包并逐条比对包内
+    cli/product.json 与 cli/dist/*.mjs）。区间内 4 条确认缺口开 Issue：#401（global 域
+    无 /v2/chat/busy，404 未按域记忆且繁忙度失败混进模型目录错误面）、#402
+    （ModelRateLimitCap.lines[].paidId 不单独成行，hy3 与 hy3-x 同列）、#403（号都在途
+    占满直接 503，不等待名额）、#404（非流式调用方断开被记成 502 upstream_parse）。
+    另把 2026-10-28 判 skip 的 ee1c80d（5.9.3 九处契约对齐）改成 issue #400：X-Private-Data
+    只对 CN 落地，global 个人号仍发 true（官方 global 5.9.3 与 CN 同源同形，个人号 false /
+    企业版 true）。3 条挂 revisit：面板任务轮次撞 429 后不等待重试（本仓无失败样本）、
+    e8eca81 与 854e74c 的 CN Kimi 工具 schema 兼容（「Kimi 系拒收 $ref」只有外部实测，官方包
+    无对应规则；其中的 enum 缺 type 归 #390、普通 429 按模型隔离冷却本仓已有）。
+    10 条 skip 的形态差异：embeddings 端点族（本仓无此面）、updater 自更新（本仓无
+    internal/updater）、面板 app.js 备注按钮与账号池域名分类（web/src 已覆盖）、global
+    网页会话链活跃（与 PR #45 实测冲突，缺官方包证据）、以及 3 条 merge 封装提交。
+    审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。

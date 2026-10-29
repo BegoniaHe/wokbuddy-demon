@@ -466,7 +466,7 @@ func TestReadServerRequestIDSkipsInvalidID(t *testing.T) {
 
 // TestDesktopExpertHeadersPrivateDataAlwaysTrue 桌面专家路径是桌面主进程 chat
 // surface：官方 `applyGatewayHeaders` 的兜底表 `VF` 与 `buildVlmGatewayHeaders`
-// 都把 X-Private-Data 硬编码为 true（CN 5.9.3 / global 5.8.4 同形），与 CLI chat
+// 都把 X-Private-Data 硬编码为 true（CN / global 5.9.3 同形），与 CLI chat
 // 的 privateDataHeaderValue 分属两条 surface，不能共用（issue #343 / #348）。
 func TestDesktopExpertHeadersPrivateDataAlwaysTrue(t *testing.T) {
 	t.Parallel()

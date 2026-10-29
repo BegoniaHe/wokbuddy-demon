@@ -183,6 +183,22 @@ const accountRestrictedMsg = "request illegal"
 // `{"code":"11-128",...}`（部分版本是非法 JSON），因此按字节子串而不是 JSON 字段判定。
 const channelRefusedCode = "11-128"
 
+// unapprovedChannelCode 上游「渠道未授权」业务码 11128。实测形态：
+// 400 {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}
+// ——system 里出现连续原文指纹（如 DSH 的 @ 路径说明段）即触发。
+//
+// 与 channelRefusedCode（"11-128"，带连字符）**不是**同一个码：11128 的连续原文
+// 特征是可救的（同义改写 / 按句界拆 system 后即可 200），归 ErrContentBlocked 走
+// 同号重试；11-128 才是通道侧问题（零动作）。
+const unapprovedChannelCode = "11128"
+
+// IsUnapprovedChannel 报告 body 是否是 11128「渠道未授权」形态：网关按句界拆 system
+// 抢救的唯一判据（见 server.retryContentBlocked）。只认 JSON code 字段形态，不做
+// 裸子串匹配——11128 是合法 token 数，裸匹配会误伤。
+func IsUnapprovedChannel(body string) bool {
+	return codeMarker(strings.ToLower(body), unapprovedChannelCode)
+}
+
 // IsChannelRefused 报告 body 是否是「11-128 通道校验失败」形态：码命中 11-128
 // **且**文案含 request illegal。通道校验问题在客户端/通道一侧（UA、头、中间代理、
 // 入站形态），账号健康，不该罚号也不该走内容拦截的降级重试。
@@ -1273,6 +1289,13 @@ type Client struct {
 	desktopSessionMu  sync.Mutex
 	desktopSessionIDs map[string]string
 
+	// busyMu/busyMissingRealm 记录「该域上游没有 /v2/chat/busy 这条观测」的 realm
+	// （issue #401）：global 服务端未部署该路径，一律 404。只有 404 才置位，之后本进程
+	// 对该域直接返回空表 + nil，不再白打一次上游、也不再往面板错误面里塞噪音；
+	// 非 404（超时/5xx）照旧报错，不被这条记忆吞掉。上游若补上端点，重启即重新探测。
+	busyMu           sync.Mutex
+	busyMissingRealm map[string]bool
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。
@@ -2035,20 +2058,11 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()
 
-	// RefreshHeaders 读取 a 的字段（domain/uid 等）注入请求头——需在锁内取快照值，
-	// 用一个显式逐字段拷贝的临时 auth 构造头（不拷贝 sync.Mutex，避免 vet copies-lock）。
-	account10.Lock()
-	hdrSnapshot := auth.Auth{
-		AccessToken:  account10.AccessToken,
-		RefreshToken: rtSnapshot,
-		ExpiresAt:    account10.ExpiresAt,
-		Domain:       account10.Domain,
-		UID:          account10.UID,
-		EnterpriseID: account10.EnterpriseID,
-		Nickname:     account10.Nickname,
-		DeviceToken:  account10.DeviceToken,
-	}
-	account10.Unlock()
+	// RefreshHeaders 读取快照的字段（domain/realm/uid 等）注入请求头，refreshAt 也
+	// 用它做账号出口选路——故必须走 Auth.Snapshot（锁内逐字段拷贝，含 realm）；
+	// 手写字段表会漏 realm，把只写了 realm 的 global 账号判成 cn。
+	hdrSnapshot := account10.Snapshot()
+	hdrSnapshot.RefreshToken = rtSnapshot
 
 	var data json.RawMessage
 
@@ -3631,6 +3645,9 @@ func (c *Client) fetchV3ConfigModelMap(account *auth.Auth, ua string) (map[strin
 	// 官方客户端在 availableModels 之后还会按默认会话 agent 的 models 白名单裁剪；
 	// 这里只给条目打内部标记，保留全量目录供面板 / effort 缓存使用。
 	applyChatWhitelistToMap(out, env.Data.Agents)
+	// 官方菜单的第二条可见性规则（issue #402）：ModelRateLimitCap.lines[].paidId 的
+	// 付费线路变体不单独成行，这里只给命中项打不可见标记。
+	applyPaidLineFilter(out, account, env.Data.ProductFeaturesConfig.ModelRateLimitCap)
 
 	if len(out) == 0 {
 		return nil, errV3ConfigReturnedEmptyModels
@@ -3675,6 +3692,8 @@ type v3ProductFeaturesConfig struct {
 	ModelTrialBanner struct {
 		Banners []v3TrialBanner `json:"banners"`
 	} `json:"ModelTrialBanner"`
+	// 付费线路定义（issue #402）：见 paidline.go。上游不下发时为空值，过滤不启用。
+	ModelRateLimitCap v3ModelRateLimitCap `json:"ModelRateLimitCap"`
 }
 
 // v3TrialBanner 单条试用模型横幅。

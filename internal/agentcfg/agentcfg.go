@@ -33,7 +33,7 @@ var ErrNotApplied = errors.New("没有可还原的写入记录")
 var (
 	errAPIKey        = errors.New("api_key 不能为空")
 	errBaseURLHTTPS  = errors.New("base_url 必须是 http(s) 地址")
-	errModelList     = errors.New("models 含非法项")
+	errModelList     = errors.New("模型 id 含非法项")
 	errApplyFailed   = errors.New("Apply failed")
 	errRestoreFailed = errors.New("Restore failed")
 )
@@ -151,8 +151,8 @@ func (m *Manager) statusLocked() []Status {
 
 // validateOptions 校验写入参数并补默认模型。
 func validateOptions(opts *Options) error {
-	if strings.TrimSpace(opts.APIKey) == "" {
-		return errAPIKey
+	if err := normalizeAPIKey(opts); err != nil {
+		return err
 	}
 
 	baseURL := strings.TrimSpace(opts.BaseURL)
@@ -181,6 +181,36 @@ func validateOptions(opts *Options) error {
 		opts.Model = "glm-5.2"
 	}
 
+	// 单模型路径同样校验：Codex 用 %q 写 model，\x01 之类会写成 TOML 不认的转义，
+	// 整份 config.toml 解析失败。此前只有 Models 列表路径过校验，单模型绕过了它。
+	model, err := normalizeModelID(opts.Model)
+	if err != nil {
+		return err
+	}
+
+	opts.Model = model
+
+	return nil
+}
+
+// normalizeAPIKey 校验并 trim api_key。
+//
+// 为何要拦控制字符：api_key 与 model 同经 Go 的 %q 写入 Codex 的 config.toml，
+// 0x01 之类会写成 TOML 不认的 `\x01` 转义（Codex 用 Rust toml crate，只认
+// \uXXXX 与短转义），整份 config.toml 解析失败。为何要 trim：网关侧 config.json
+// 加载按去首尾空白口径比较，粘贴带空白的密钥本来也永远匹配不上，写出去只是
+// 「配置成功、请求恒 401」。
+func normalizeAPIKey(opts *Options) error {
+	opts.APIKey = strings.TrimSpace(opts.APIKey)
+	if opts.APIKey == "" {
+		return errAPIKey
+	}
+
+	if strings.ContainsFunc(opts.APIKey, isControlRune) {
+		// 不回显密钥本体或片段：该错误会经面板 agentsApply 原样回给 HTTP 调用方。
+		return fmt.Errorf("api_key 含控制字符，无法写入客户端配置: %w", errAPIKey)
+	}
+
 	return nil
 }
 
@@ -201,13 +231,13 @@ func normalizeModelList(list []string) ([]string, error) {
 	out := make([]string, 0, len(list))
 
 	for _, raw := range list {
-		id := strings.TrimSpace(raw)
-		if id == "" {
-			continue
+		id, err := normalizeModelID(raw)
+		if err != nil {
+			return nil, err
 		}
 
-		if strings.ContainsFunc(id, isControlRune) {
-			return nil, fmt.Errorf("%w: 含控制字符 %q 的模型 id 无法写入客户端配置", errModelList, id)
+		if id == "" {
+			continue
 		}
 
 		if _, dup := seen[id]; dup {
@@ -223,6 +253,21 @@ func normalizeModelList(list []string) ([]string, error) {
 	}
 
 	return out, nil
+}
+
+// normalizeModelID trim 后校验单个模型 id：空串返回空串（调用方决定是否丢弃），
+// 含控制字符返回 errModelList。
+func normalizeModelID(raw string) (string, error) {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return "", nil
+	}
+
+	if strings.ContainsFunc(id, isControlRune) {
+		return "", fmt.Errorf("%w: 含控制字符 %q 的模型 id 无法写入客户端配置", errModelList, id)
+	}
+
+	return id, nil
 }
 
 // isControlRune 判定 C0/C1 控制字符（含 \r \n \t 与 DEL）。

@@ -1,6 +1,7 @@
 // modelbusy.go 面板模型页的官方繁忙度观测（issue #258）。
 //
-// 纯只读：失败只并入模型页 fetchErrs，不阻断模型目录、不参与选号。
+// 纯只读：失败只并入模型页 busyErrs（与目录错误面分离，issue #401），不阻断模型
+// 目录、不参与选号。
 package panel
 
 import (
@@ -12,7 +13,7 @@ import (
 // attachModelBusy 给已构造的模型条目补 busy 字段（按 realm 各取一个可用账号）。
 //
 //nolint:gocognit // 逐模型附加繁忙度并汇总错误，线性展开。
-func (p *Panel) attachModelBusy(out []map[string]any, fetchErrs *[]string) {
+func (p *Panel) attachModelBusy(out []map[string]any, busyErrs *[]string) {
 	for _, realm := range []string{"cn", "global"} {
 		names := modelNamesForRealm(out, realm)
 		if len(names) == 0 {
@@ -35,7 +36,7 @@ func (p *Panel) attachModelBusy(out []map[string]any, fetchErrs *[]string) {
 		cancel()
 
 		if err != nil {
-			*fetchErrs = append(*fetchErrs, realm+": busy: "+err.Error())
+			*busyErrs = append(*busyErrs, realm+": busy: "+err.Error())
 
 			continue
 		}

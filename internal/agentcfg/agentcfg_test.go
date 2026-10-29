@@ -421,3 +421,52 @@ func TestApplyCodexSalvagesLegacyBlock(t *testing.T) {
 		t.Fatalf("旧格式重建结果异常:\n%s", text)
 	}
 }
+
+// TestValidateOptionsRejectsControlCharsInAPIKey api_key 与 model 一样经 Go 的 %q
+// 写进 Codex 的 config.toml：0x01 会写成 TOML 不认的 `\x01` 转义，整份
+// config.toml 解析失败（Codex 是 Rust toml crate，只认 \uXXXX 与短转义）。
+// 单模型校验补上后，同一处遗漏仍留在 api_key 上。
+func TestValidateOptionsRejectsControlCharsInAPIKey(t *testing.T) {
+	t.Parallel()
+
+	// 只测 trim 之后仍残留的控制字符：首尾空白（含 \n / \r / U+0085）由 trim
+	// 正常吸收（见下一条用例），内嵌的 \t / \x01 / DEL / C1 会原样落进 config.toml。
+	for _, bad := range []string{"sk\x01bad", "sk\tbad", "sk\x7f", "sk\u0085bad"} {
+		opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: bad, Model: "glm-5.2"}
+		if err := validateOptions(&opts); !errors.Is(err, errAPIKey) {
+			t.Fatalf("api_key %q 应被拒绝，得到 %v", bad, err)
+		} else if strings.Contains(err.Error(), "sk") || strings.Contains(err.Error(), bad) {
+			// 错误会经面板 agentsApply 回给调用方：不得回显密钥本体或片段。
+			t.Fatalf("api_key 校验错误回显了密钥: %v", err)
+		}
+	}
+}
+
+// TestApplyCodexKeySurvivesTOMLRoundTrip 端到端：正常密钥写出的 config.toml
+// 不含 TOML 不认的转义；粘贴带首尾空白的密钥落盘前被 trim（否则请求恒 401，
+// 却表现为「配置写入成功」）。
+func TestApplyCodexKeySurvivesTOMLRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	m := New(home, filepath.Join(home, "backups"))
+
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "  sk-pasted  ", Model: "glm-5.2"}
+	if _, err := m.Apply("codex", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(raw)
+	if !strings.Contains(text, `experimental_bearer_token = "sk-pasted"`) {
+		t.Fatalf("api_key 未 trim 或写出形态异常:\n%s", text)
+	}
+	// Go 的 %q 只会对这种字符写 \xNN，而 toml crate 不认该转义。
+	if strings.Contains(text, `\x`) {
+		t.Fatalf("config.toml 含 TOML 不认的 \\xNN 转义:\n%s", text)
+	}
+}
