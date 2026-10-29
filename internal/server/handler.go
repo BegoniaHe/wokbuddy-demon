@@ -2758,8 +2758,12 @@ func failFastKind(kind upstream.ErrKind) bool {
 
 // handleQueueError 处置官方客户端的队列/并发业务码：
 //   - 6020 WAITING：429 + Retry-After（上游未给则 5s），客户端可重试，不换号；
-//   - 6021 FULL：503 队列已满；
+//   - 6021 FULL：429 + Retry-After（上游未给则 5s），对外码 queue_full 与 6020 区分；
 //   - 6022 USER_LIMIT：429 用户并发上限。
+//
+// 三档都是「稍后再试」的容量语义，一律 429：上游对 6021 本体回的就是 429，翻译成
+// 503 会让调用侧（WorkBuddy CLI 一类）按「服务不可用」直接中断任务（issue #391）。
+// 账号本身健康，全程不换号、不罚号、不熔断。
 func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr *upstream.Error) {
 	msg := strings.TrimSpace(string(respBody))
 	if msg == "" && uerr != nil {
@@ -2772,25 +2776,36 @@ func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr
 
 	switch {
 	case kind == upstream.ErrQueueWaiting:
-		retry := 5
-		if uerr != nil && uerr.RetryAfter > 0 {
-			retry = int(uerr.RetryAfter / time.Second)
-			if retry <= 0 {
-				retry = 1
-			}
-		}
-
-		f.out.Header("Retry-After", strconv.Itoa(retry))
+		f.out.Header("Retry-After", strconv.Itoa(queueRetryAfterSeconds(uerr)))
 		f.out.Error(http.StatusTooManyRequests, "queue_waiting", msg, "队列排队中，按 Retry-After 重试")
 	case code == "6022":
 		f.st.status = http.StatusTooManyRequests
 		f.out.Error(http.StatusTooManyRequests, "user_concurrency_limit", msg, "并发请求数已达上限，稍后重试")
 	default:
-		f.st.status = http.StatusServiceUnavailable
-		f.out.Error(http.StatusServiceUnavailable, "queue_full", msg, "上游队列已满，稍后重试")
+		// 6021 队列满：保守 5s（与 6020 的兜底一致）。客户端看到 queue_full 就知道是
+		// 「队列满」而不是「账号不可用」，按 Retry-After 退避即可恢复。
+		f.st.status = http.StatusTooManyRequests
+		f.out.Header("Retry-After", strconv.Itoa(queueRetryAfterSeconds(uerr)))
+		f.out.Error(http.StatusTooManyRequests, "queue_full", msg, "上游队列已满，稍后重试")
 	}
 
 	f.lastErr = &upstream.Error{Kind: kind, Status: f.st.status, Msg: msg}
+}
+
+// queueRetryAfterSeconds 队列/容量类响应的 Retry-After 秒数：优先采信上游信封里的
+// 重置时间，缺失或非正数时给保守 5s（6020/6021 共用同一兜底）。
+func queueRetryAfterSeconds(uerr *upstream.Error) int {
+	const fallback = 5
+
+	if uerr == nil || uerr.RetryAfter <= 0 {
+		return fallback
+	}
+
+	if retry := int(uerr.RetryAfter / time.Second); retry > 0 {
+		return retry
+	}
+
+	return 1
 }
 
 // handleRequestLevelError 透传请求级错误：不轮转、message 装上游原文、附 gateway_hint。
