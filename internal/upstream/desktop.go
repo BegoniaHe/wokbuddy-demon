@@ -418,7 +418,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 		req.Header.Set("X-User-Id", account2.UID)
 	}
 
-	_, err = c.doJSON(req)
+	_, err = c.doJSONFor(account2, req)
 
 	return err
 }
@@ -555,7 +555,7 @@ func (c *Client) SetAppearanceTheme(account *auth.Auth, resourceKey string) erro
 		req.Header.Set("X-User-Id", account.UID)
 	}
 
-	_, err = c.doJSON(req)
+	_, err = c.doJSONFor(account, req)
 
 	return err
 }
@@ -635,7 +635,7 @@ func (c *Client) ReportWebEvent(account6 *auth.Auth, eventCode, pageURL, element
 		req.Header.Set("X-User-Id", account6.UID)
 	}
 
-	_, err = c.doJSON(req)
+	_, err = c.doJSONFor(account6, req)
 
 	return err
 }
@@ -758,7 +758,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 		Experts []MarketExpert `json:"experts"`
 	}
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSONFor(account4, req)
 	if err != nil {
 		return nil, err
 	}
@@ -813,7 +813,7 @@ func (c *Client) DesktopChatWithExpert(
 		debugChatRequest(req)
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPForAccount(account3).Do(req)
 	if err != nil {
 		return "", "", fmt.Errorf("DesktopChatWithExpert: %w", err)
 	}

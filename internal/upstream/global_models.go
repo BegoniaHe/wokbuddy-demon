@@ -588,7 +588,7 @@ func (c *Client) globalModelsOnce(
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account3.AccessTokenValue())
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPForAccount(account3).Do(req)
 	if err != nil {
 		return nil, nil, modelChatWhitelist{}, fmt.Errorf("globalModelsOnce: %w", err)
 	}

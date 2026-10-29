@@ -29,6 +29,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 )
 
 var (
@@ -1242,14 +1243,29 @@ type Client struct {
 	timeoutMu      sync.Mutex
 	timeoutClients map[time.Duration]*http.Client
 
-	// AccountRoute 返回账号绑定的出站代理槽与拨号器（issue #96）；空 = 默认。
-	AccountRoute func(a *auth.Auth) (
+	// accountRoute 账号出口选路（issue #96）；空 = 默认。用 atomic 指针承载
+	// （与 proxyDialer 同理）：面板保存代理配置时会整体替换这个闭包，而
+	// slotClient 每个请求都读——普通字段会与在途请求构成数据竞争。
+	accountRoute atomic.Pointer[func(a *auth.Auth) (
 		slot string, dial func(ctx context.Context, network, addr string) (net.Conn, error),
-	)
+	)]
 	// slotMu/slotClients 按「槽 + header 超时」缓存独立 Transport，避免同一账号的
 	// 连接被其他出口复用；条目数受槽数 × 模型超时数约束。
+	// slotGen 每次出口变更 +1：读到旧路由的请求不得把自己插进新出口的缓存，否则
+	// 旧拨号器会被钉在缓存里，直到下一次配置保存才失效。
 	slotMu      sync.Mutex
 	slotClients map[string]*http.Client
+	slotGen     atomic.Uint64
+
+	// proxyDialer 出站底层拨号器（代理池接入点，issue #15；热生效改造见 #39）。
+	// 用 atomic 指针承载：面板改代理时整体替换，**不**就地改 Transport.DialContext
+	// ——后者与在途请求构成数据竞争。Transport 装的是稳定包装（c.dialContext），
+	// 每次拨号读取当前值，故替换后新连接立即走新出口。
+	proxyDialer atomic.Pointer[func(ctx context.Context, network, addr string) (net.Conn, error)]
+
+	// registry 当前生效的出站注册表（issue #39）：槽 -> 池 / realm 默认槽。
+	// 整体替换（*outbound.Registry 构造后不可变）；nil = 未装配。
+	registry atomic.Pointer[outbound.Registry]
 
 	// desktopSessionMu/desktopSessionIDs 桌面 /v2/report 的进程内 sessionId 缓存。
 	// 官方 sessionId 跟随客户端进程生命周期：同一账号在进程内保持稳定，重启后刷新，
@@ -1356,10 +1372,10 @@ type Client struct {
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
-	tr := newTransport()
+	transport := newTransport()
 	client := &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: transport},
+		ChatHTTP:      &http.Client{Timeout: 0, Transport: transport}, // 无总时长；首字节由 ResponseHeaderTimeout 管
 		ChatBaseCN:    defaultCNChatBase,
 		BillingBaseCN: defaultCNBillingBase,
 		WebBaseCN:     "https://www.workbuddy.cn",
@@ -1368,13 +1384,35 @@ func New() *Client {
 		GlobalEnabled: true,
 	}
 	client.SanitizeFingerprints.Store(true)
+	// 稳定拨号包装（issue #39）：Transport 装 c.dialContext，出口由 atomic 指针承载，
+	// 面板改代理时整体替换即可热生效。基线为直连（与未配置代理的行为一致）。
+	transport.DialContext = client.dialContext
+	client.SetDialer(nil)
 
 	return client
 }
 
+// dialContext 稳定的出站拨号包装：每次拨号读取当前 proxyDialer，故 SetDialer /
+// SetProxyRegistry 的替换对**新连接**立即生效，且在途请求不受影响（issue #39）。
+func (c *Client) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	dial := c.proxyDialer.Load()
+	if dial == nil || *dial == nil {
+		// 理论上不可达：New() 与 SetDialer 都会落基线。
+		conn, err := newDialer().DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, fmt.Errorf("direct dial: %w", err)
+		}
+
+		return conn, nil
+	}
+
+	return (*dial)(ctx, network, addr)
+}
+
 // SetDialer 替换出站底层拨号器（代理池接入点，issue #15）。base 为 nil 时回落
 // 内置直连拨号器。保留 writeDeadlineConn 写 deadline 包装（连接层加固不回退）。
-// 装配期调用（首次请求前）；HTTP 与 ChatHTTP 共用同一 Transport，设置一次即覆盖两者。
+// 运行期可安全调用（issue #39 热生效）：替换 atomic 指针 + 清空按槽缓存的 client，
+// 不就地改 Transport.DialContext（那会与在途请求构成数据竞争）。
 func (c *Client) SetDialer(base func(ctx context.Context, network, addr string) (net.Conn, error)) {
 	if base == nil {
 		base = newDialer().DialContext
@@ -1390,16 +1428,103 @@ func (c *Client) SetDialer(base func(ctx context.Context, network, addr string) 
 
 		return &writeDeadlineConn{Conn: conn, writeTimeout: duration}, nil
 	}
-	if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
-		tr.DialContext = wrap
-	}
+	c.proxyDialer.Store(&wrap)
 
-	if c.ChatHTTP != nil {
-		if tr, ok := c.ChatHTTP.Transport.(*http.Transport); ok {
-			tr.DialContext = wrap
+	// 出口变了：旧出口的空闲连接不得继续被复用。只清按槽缓存不够——共享
+	// Transport（c.HTTP / c.ChatHTTP / 按超时克隆的 chat client）里已建好的空闲
+	// 连接是**旧出口**上拨出来的，复用它们等于热改不生效，直到 IdleConnTimeout
+	// （30s）自然过期才换新出口。
+	c.closeIdleConnections()
+	c.invalidateSlotClients()
+}
+
+// closeIdleConnections 关闭当前所有 Transport 的空闲连接（不动在途连接）。
+// 出口热改后必须调用：空闲连接属于旧出口，复用会让新出口要等空闲超时才生效。
+func (c *Client) closeIdleConnections() {
+	for _, hc := range []*http.Client{c.HTTP, c.ChatHTTP} {
+		if hc == nil {
+			continue
+		}
+
+		if ci, ok := hc.Transport.(closeIdler); ok {
+			ci.CloseIdleConnections()
 		}
 	}
+
+	c.timeoutMu.Lock()
+	for _, hc := range c.timeoutClients {
+		if ci, ok := hc.Transport.(closeIdler); ok {
+			ci.CloseIdleConnections()
+		}
+	}
+	c.timeoutMu.Unlock()
 }
+
+// invalidateSlotClients 作废按槽缓存的 client 并推进出口代数：关闭其空闲连接
+// （那些连接挂在旧出口）、清空缓存让新连接走新出口，推进代数让「构建期读到旧
+// 路由」的请求放弃入缓存。
+func (c *Client) invalidateSlotClients() {
+	c.slotMu.Lock()
+
+	c.slotGen.Add(1)
+
+	for _, hc := range c.slotClients {
+		if ci, ok := hc.Transport.(closeIdler); ok {
+			ci.CloseIdleConnections()
+		}
+	}
+
+	clear(c.slotClients)
+	c.slotMu.Unlock()
+}
+
+// SetAccountRoute 整体替换账号出口选路（issue #39 热生效）。运行期安全：先原子
+// 替换闭包，再作废按槽缓存的 client——顺序不可颠倒，否则替换前的在途请求会用
+// 旧出口的拨号器构造出「新代数」的缓存条目并被长期复用。
+func (c *Client) SetAccountRoute(route func(a *auth.Auth) (
+	slot string, dial func(ctx context.Context, network, addr string) (net.Conn, error),
+),
+) {
+	if route == nil {
+		c.accountRoute.Store(nil)
+		c.invalidateSlotClients()
+
+		return
+	}
+
+	c.accountRoute.Store(&route)
+	c.invalidateSlotClients()
+}
+
+// AccountRoute 解析账号当前的出口选路（nil 安全）；空槽 + nil 拨号器 = 走全局
+// 池或直连。供面板/测试查看当前生效路由。
+func (c *Client) AccountRoute(account *auth.Auth) (
+	string, func(ctx context.Context, network, addr string) (net.Conn, error),
+) {
+	route := c.accountRoute.Load()
+	if route == nil || account == nil {
+		return "", nil
+	}
+
+	return (*route)(account)
+}
+
+// SetProxyRegistry 整体替换出站注册表（issue #39）：全局池接入拨号器并清空按槽
+// 缓存的 client。注册表本身留下供面板 / 出口探测读取（*Registry 构造后不可变，
+// 故整体替换即可，无需加锁）。
+func (c *Client) SetProxyRegistry(reg *outbound.Registry) {
+	c.registry.Store(reg)
+
+	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	if pool := reg.Global(); pool != nil {
+		dial = pool.DialContext
+	}
+
+	c.SetDialer(dial)
+}
+
+// ProxyRegistry 返回当前生效的出站注册表；nil = 未装配（直连）。
+func (c *Client) ProxyRegistry() *outbound.Registry { return c.registry.Load() }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
 func (c *Client) chatHTTP() *http.Client {
@@ -1679,23 +1804,35 @@ func (c *Client) webBase(a *auth.Auth) string {
 // defaultJSONBodyLimit doJSON 默认响应体上限（1 MiB）。
 const defaultJSONBodyLimit int64 = 1 << 20
 
-// doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
-// body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
-// Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	return c.doJSONLimit(req, defaultJSONBodyLimit)
+// doJSONFor 经账号出口 client 发请求并解信封（issue #39）：账号绑定了槽或命中
+// realm 默认槽时必须用它。account 为 nil 时等价 c.HTTP（无账号作用域的调用）。
+func (c *Client) doJSONFor(account *auth.Auth, req *http.Request) (json.RawMessage, error) {
+	return c.doJSONAt(c.HTTPForAccount(account), req, defaultJSONBodyLimit)
 }
 
-// doJSONLimit 同 doJSON，但允许调用方指定响应体上限。超限返回明确错误而不是把
-// 半截 body 交给 json.Unmarshal（后者只会报 "unexpected end of JSON input"）。
-func (c *Client) doJSONLimit(req *http.Request, maxBytes int64) (json.RawMessage, error) {
+// doJSONLimitFor 同 doJSONFor，但允许调用方指定响应体上限。
+func (c *Client) doJSONLimitFor(
+	account *auth.Auth, req *http.Request, maxBytes int64,
+) (json.RawMessage, error) {
+	return c.doJSONAt(c.HTTPForAccount(account), req, maxBytes)
+}
+
+// doJSONAt 用指定 client 发出请求并解信封。账号在作用域内的调用必须经
+// doJSONFor / doJSONLimitFor（它们取 HTTPForAccount），绝不在这里回落 c.HTTP
+// ——issue #39 要求绑定槽或 realm 默认槽命中后全部出站都走该出口。
+//
+// 非 2xx 或业务 code != 0 → 带 body 片段的 *Error；body 读失败（连接中断/空闲
+// 掐流/截断）→ 普通错误（半截 body 不进 Classify，不参与账号惩罚）。
+// maxBytes <= 0 时按默认上限；超限返回明确错误而不是把半截 body 交给
+// json.Unmarshal（后者只会报 "unexpected end of JSON input"）。
+func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (json.RawMessage, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultJSONBodyLimit
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("doJSONLimit: %w", err)
+		return nil, fmt.Errorf("doJSONAt: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -1959,7 +2096,7 @@ func (c *Client) refreshAt(ctx context.Context, base string, hdr *auth.Auth) (js
 
 	c.RefreshHeaders(req, hdr)
 
-	return c.doJSON(req)
+	return c.doJSONFor(hdr, req)
 }
 
 // commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
@@ -2386,20 +2523,36 @@ func (c *Client) chatHTTPForHeader(duration time.Duration) *http.Client {
 	return client
 }
 
+// HTTPForAccount 返回账号出口专用的短请求 client（issue #39）：命中账号绑定槽或
+// realm 默认槽时使用按槽缓存的独立 Transport，未命中回落 c.HTTP（全局池或直连）。
+// 账号作用域内的全部非 chat 出站（余额/签到/保活/旅行/report/tasks/search/
+// webfetch/images/模型探测/refresh）都必须经它，不得直接用 c.HTTP。
+func (c *Client) HTTPForAccount(a *auth.Auth) *http.Client {
+	return c.slotClient(a, c.HTTP, "http|")
+}
+
 // chatHTTPForAccount 返回账号代理槽专用的 chat client（issue #96）。未绑定槽
 // 或未配置路由时回落到默认 client；每个槽使用独立 Transport，连接池不跨账号共享。
 func (c *Client) chatHTTPForAccount(account5 *auth.Auth, duration2 time.Duration) *http.Client {
-	base := c.chatHTTPForHeader(duration2)
-	if c.AccountRoute == nil || account5 == nil {
-		return base
-	}
+	return c.slotClient(account5, c.chatHTTPForHeader(duration2), "chat|"+duration2.String()+"|")
+}
 
-	slot, dial := c.AccountRoute(account5)
+// slotClient 按「槽 + base client」返回账号出口专用 client（issue #96/#39）：
+// 未配置路由、无绑定槽或槽拨号器为 nil 时回落 base。
+//
+// 键前缀区分用途（chat 带 header 超时维度，短请求不带），两者共用 slotClients
+// 与 slotMu —— 同一槽的不同参数不能共用 Transport（参数不同），故键必须含参数。
+func (c *Client) slotClient(a *auth.Auth, base *http.Client, prefix string) *http.Client {
+	// 先取代数再取路由：反序会出现「读到旧路由 + 新代数」的组合，让旧出口的
+	// 拨号器被当作当前出口缓存放进 slotClients（出口热改后长期不生效）。
+	gen := c.slotGen.Load()
+
+	slot, dial := c.AccountRoute(a)
 	if slot == "" || dial == nil {
 		return base
 	}
 
-	key := slot + "|" + duration2.String()
+	key := prefix + slot
 
 	c.slotMu.Lock()
 	defer c.slotMu.Unlock()
@@ -2424,6 +2577,12 @@ func (c *Client) chatHTTPForAccount(account5 *auth.Auth, duration2 time.Duration
 		return &writeDeadlineConn{Conn: conn, writeTimeout: duration}, nil
 	}
 	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
+
+	// 构建期间出口被换掉（代数已推进）：本次照用这条连接，但不得写进新出口的
+	// 缓存——那会把旧拨号器钉死在这里。
+	if c.slotGen.Load() != gen {
+		return client
+	}
 
 	if c.slotClients == nil {
 		c.slotClients = map[string]*http.Client{}
@@ -2788,7 +2947,7 @@ func (c *Client) fetchEnterpriseModelsPath(
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account7.AccessTokenValue())
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPForAccount(account7).Do(req)
 	if err != nil {
 		return nil, modelChatWhitelist{}, fmt.Errorf("fetchEnterpriseModels: %w", err)
 	}
@@ -3433,13 +3592,13 @@ func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults m
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
 // ua 为该次请求的 User-Agent；空串等价 codeBuddyIDEUA。该端点对 UA 敏感且**不同 UA 下发
 // 不同模型集合**（见 codeBuddyCLIUA 注释），global 探测据此并发两路取并集。
-func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
-	req, err := c.newV3ConfigRequest(a, ua)
+func (c *Client) fetchV3ConfigModelMap(account *auth.Auth, ua string) (map[string]ModelInfo, error) {
+	req, err := c.newV3ConfigRequest(account, ua)
 	if err != nil {
 		return nil, err
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetchV3ConfigModelMap: %w", err)
 	}

@@ -44,7 +44,7 @@ func (c *Client) FetchAccountProfile(account *auth.Auth) (string, error) {
 		req.Header.Set("User-Agent", ua)
 	}
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSONFor(account, req)
 	if err != nil {
 		return "", err
 	}

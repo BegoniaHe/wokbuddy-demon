@@ -16,9 +16,10 @@ func TestChatHTTPForAccountUsesPerSlotClient(t *testing.T) {
 
 	client := New()
 	dial := func(context.Context, string, string) (net.Conn, error) { return nil, errUnused }
-	client.AccountRoute = func(a *auth.Auth) (string, func(context.Context, string, string) (net.Conn, error)) {
+
+	client.SetAccountRoute(func(a *auth.Auth) (string, testDial) {
 		return a.UID, dial
-	}
+	})
 	client2 := client.chatHTTPForAccount(&auth.Auth{UID: "slot-a"}, 0)
 
 	a2 := client.chatHTTPForAccount(&auth.Auth{UID: "slot-b"}, 0)

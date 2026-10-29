@@ -30,7 +30,6 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
-	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
@@ -283,7 +282,10 @@ func setupUpstream(
 		return nil, nil, nil, err
 	}
 
-	configureAccountRouting(state2, client, cfg)
+	// 注册表在 configureUpstream 内已装入 client（SetProxyRegistry），这里取回同一份
+	// 接账号选路并发布面板槽视图（issue #39）。
+	configureAccountRouting(state2, client, client.ProxyRegistry())
+	publishProxySlots(cfg)
 
 	notifier := notify.New(notify.Config{URL: cfg.Notify.WebhookURL, Events: cfg.Notify.Events})
 
@@ -371,7 +373,7 @@ func newPanel(
 		ProbeFile:      stateSibling(cfg.StateFile, "output_probes.json"),
 		ProbeStateFile: stateSibling(cfg.StateFile, "model_probes.json"),
 		ConfigPath:     cfgPath,
-		ProxySlots:     proxySlotInfos(cfg),
+		ProxySlots:     currentProxySlotViews,
 		Pricing:        obs.pricing,
 		PricingRate:    cfg.Pricing.ExchangeRate,
 		Quota:          obs.quota,
@@ -687,16 +689,18 @@ func configureUpstream(cfg *Config, client *upstream.Client) error {
 	// 数据目录与 state.json 同风格（Docker volume 持久化路径）。首次缺失/损坏自动
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
-	// 出站代理池（issue #15）：非空时按健康轮换，失败代理进入冷却；空 = 直连。
-	// URL 合法性已在 config 解析阶段校验（非法即拒绝启动），此处构造理论上不失败。
-	if len(cfg.Upstream.Proxies) > 0 {
-		proxyPool, err := outbound.New(cfg.Upstream.Proxies)
-		if err != nil {
-			log.Printf("WARN: [server] 出站代理配置无效，回退直连: %v", err)
-		} else {
-			client.SetDialer(proxyPool.DialContext)
-			log.Printf("出站代理池已启用：%d 个代理（失败自动冷却轮换）", proxyPool.Len())
-		}
+	// 出站代理出口（issue #15/#96/#39）：全局池 + 命名槽 + realm 默认槽统一走
+	// 注册表（buildProxyRegistry）；URL 合法性已在 config 解析阶段校验（非法即拒绝
+	// 启动），此处构造理论上不失败。空配置 → 注册表为直连。
+	reg, err := buildProxyRegistry(cfg)
+	if err != nil {
+		return fmt.Errorf("build proxy registry: %w", err)
+	}
+
+	client.SetProxyRegistry(reg)
+
+	if proxyPool := reg.Global(); proxyPool != nil {
+		log.Printf("出站代理池已启用：%d 个代理（失败自动冷却轮换）", proxyPool.Len())
 	}
 
 	return nil
@@ -1037,6 +1041,9 @@ func applyRuntimeConfig(
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
 	sch.SetTimingShape(newCfg.Timing)
+	// 代理出口热生效（issue #39）：重建注册表 → 原子替换拨号器 + 重接账号选路 +
+	// 刷新面板槽视图。构造失败保留旧出口（非法配置已在落盘前拒绝）。
+	applyProxyRegistry(newCfg, state9, client3)
 }
 
 // configBackupPath 单代配置备份路径（只留上一版，KISS）。
@@ -1127,7 +1134,8 @@ var restartFieldPaths = []string{
 	"upstream.client_version", "upstream.cli_version", "upstream.client_name",
 	"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip",
 	"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",
-	"upstream.proxies",
+	// 代理出口（proxies / proxy_slots / realm_proxy_slots）走注册表整体替换，
+	// 三个字段均热生效（issue #39），故不列在此处。
 	// 出站解析器在 Dialer 构造期一次性装入，运行期改无效。
 	"dns_servers",
 	// global 路由在 configureUpstream / auth / handler 构造期捕获。
