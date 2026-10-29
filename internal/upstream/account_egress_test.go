@@ -116,8 +116,8 @@ func TestAccountEgressUsesSlotDial(t *testing.T) {
 }
 
 // TestSetDialerHotSwap 运行期替换拨号器（issue #39 热生效）：替换后新连接走新
-// 拨号器。替换只改 atomic 指针 + 清按槽缓存，不就地改 Transport（故与在途请求
-// 无数据竞争，`go test -race` 覆盖）。
+// 拨号器。替换只改 atomic 指针 + 关闭空闲连接 + 清按槽缓存，不就地改 Transport
+// （故与在途请求无数据竞争，`go test -race` 覆盖）。
 func TestSetDialerHotSwap(t *testing.T) {
 	t.Parallel()
 
@@ -137,9 +137,9 @@ func TestSetDialerHotSwap(t *testing.T) {
 		t.Fatal("首请求应经首装拨号器")
 	}
 
+	// 不手工关连接池：SetDialer 自身必须丢弃旧出口的空闲连接（否则连接池复用
+	// 会让第二次请求不再拨号，热改要等 IdleConnTimeout 才生效）。
 	client.SetDialer(countingDial(&newCalls))
-	// 丢弃旧出口的空闲连接：连接池复用会让第二次请求不再拨号，掩盖替换效果。
-	client.HTTP.CloseIdleConnections()
 	httpGetOK(t, client.HTTP, server.URL)
 
 	if newCalls.Load() == 0 {

@@ -1426,15 +1426,50 @@ func (c *Client) SetDialer(base func(ctx context.Context, network, addr string) 
 	}
 	c.proxyDialer.Store(&wrap)
 
-	// 出口变了：旧出口的空闲连接不得继续被复用。
+	// 出口变了：旧出口的空闲连接不得继续被复用。只清按槽缓存不够——共享
+	// Transport（c.HTTP / c.ChatHTTP / 按超时克隆的 chat client）里已建好的空闲
+	// 连接是**旧出口**上拨出来的，复用它们等于热改不生效，直到 IdleConnTimeout
+	// （30s）自然过期才换新出口。
+	c.closeIdleConnections()
 	c.invalidateSlotClients()
 }
 
-// invalidateSlotClients 作废按槽缓存的 client 并推进出口代数：清空缓存让新
-// 连接走新出口，推进代数让「构建期读到旧路由」的请求放弃入缓存。
+// closeIdleConnections 关闭当前所有 Transport 的空闲连接（不动在途连接）。
+// 出口热改后必须调用：空闲连接属于旧出口，复用会让新出口要等空闲超时才生效。
+func (c *Client) closeIdleConnections() {
+	for _, hc := range []*http.Client{c.HTTP, c.ChatHTTP} {
+		if hc == nil {
+			continue
+		}
+
+		if ci, ok := hc.Transport.(closeIdler); ok {
+			ci.CloseIdleConnections()
+		}
+	}
+
+	c.timeoutMu.Lock()
+	for _, hc := range c.timeoutClients {
+		if ci, ok := hc.Transport.(closeIdler); ok {
+			ci.CloseIdleConnections()
+		}
+	}
+	c.timeoutMu.Unlock()
+}
+
+// invalidateSlotClients 作废按槽缓存的 client 并推进出口代数：关闭其空闲连接
+// （那些连接挂在旧出口）、清空缓存让新连接走新出口，推进代数让「构建期读到旧
+// 路由」的请求放弃入缓存。
 func (c *Client) invalidateSlotClients() {
 	c.slotMu.Lock()
+
 	c.slotGen.Add(1)
+
+	for _, hc := range c.slotClients {
+		if ci, ok := hc.Transport.(closeIdler); ok {
+			ci.CloseIdleConnections()
+		}
+	}
+
 	clear(c.slotClients)
 	c.slotMu.Unlock()
 }
