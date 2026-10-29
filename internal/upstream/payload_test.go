@@ -979,3 +979,52 @@ func TestNormalizeToolEnumTypesOutputConstraintsUntouched(t *testing.T) {
 		t.Fatalf("const 取值被改: %q", got)
 	}
 }
+
+// TestNormalizeToolSchemasSkipsValueKeywords default / examples / const / enum 是值域
+// 不是子 schema：递归必须在它们处止步，否则默认值里的对象会被凭空补上 type、
+// 字符串里的 `\_` 会被改写（下发的默认值与客户端原意不符）。
+func TestNormalizeToolSchemasSkipsValueKeywords(t *testing.T) {
+	t.Parallel()
+
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","properties":{"cfg":{"type":"object","properties":{` +
+		`"level":{"type":"string"}},` +
+		`"default":{"enum":["a","b"],"note":"x\\_y"},` +
+		`"examples":[{"enum":[1,2]}]}}}}}]}`
+
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+
+	props := []any{"tools", 0, "function", "parameters", "properties", "cfg"}
+
+	if got := lookupToolPattern(t, out, append(props, "default", "type")...); got != "" {
+		t.Fatalf("default 内被补了 type: %q", got)
+	}
+
+	if got := lookupToolPattern(t, out, append(props, "default", "note")...); got != `x\_y` {
+		t.Fatalf("default 内的反斜杠下划线被改写: %q", got)
+	}
+
+	if got := lookupToolPattern(t, out, append(props, "examples", 0, "type")...); got != "" {
+		t.Fatalf("examples 内被补了 type: %q", got)
+	}
+
+	// 真正的子 schema 仍照常归一。
+	if got := lookupToolPattern(t, out, append(props, "properties", "level", "type")...); got != "string" {
+		t.Fatalf("子 schema 未归一: %q", got)
+	}
+}
+
+// TestNormalizeToolSchemasPropertyNamedLikeValueKeyword 属性名与值域键同名（合法：
+// properties 里可以有一个叫 enum 的参数）时仍要进它自己的 schema。
+func TestNormalizeToolSchemasPropertyNamedLikeValueKeyword(t *testing.T) {
+	t.Parallel()
+
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","properties":{"enum":{"enum":["a","b"]}}}}}]}`
+
+	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "enum", "type"); got != "string" {
+		t.Fatalf("名为 enum 的属性未归一: %q", got)
+	}
+}

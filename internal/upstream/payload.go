@@ -649,13 +649,43 @@ func normalizeSchemaTree(node any) {
 
 		normalizePatternProperties(n)
 
-		for _, v := range n {
-			normalizeSchemaTree(v)
+		for k, v := range n {
+			normalizeSchemaChild(k, v)
 		}
 	case []any:
 		for _, v := range n {
 			normalizeSchemaTree(v)
 		}
+	}
+}
+
+// schemaValueKeys 承载**数据取值**而非子 schema 的键：default / examples / const /
+// enum。递归必须在此止步——它们是值域，不是 schema 子树；进到默认值或示例里补
+// type、把 `\_` 改成 `_`，改的是客户端写的数据本身（default 里的对象会凭空多出
+// 一个 type 键），实际下发的默认值/示例就与原意不符。
+var schemaValueKeys = []string{"default", "examples", "const", "enum"}
+
+// schemaMapKeys 值为「名字 → 子 schema」映射的键。必须显式处理：键名由用户决定
+// （properties 里完全可以有叫 enum / default 的属性），不能靠 schemaValueKeys 过滤。
+var schemaMapKeys = []string{"properties", "patternProperties", "$defs", "definitions"}
+
+// normalizeSchemaChild 按 schema 关键字归一递归方向：值域键不进入，名字映射键
+// 逐个进，其余（items / anyOf / allOf / $ref 等）按普通子树进。
+func normalizeSchemaChild(key string, value any) {
+	switch {
+	case slices.Contains(schemaValueKeys, key):
+		return
+	case slices.Contains(schemaMapKeys, key):
+		children, ok := value.(map[string]any)
+		if !ok {
+			return
+		}
+
+		for _, child := range children {
+			normalizeSchemaTree(child)
+		}
+	default:
+		normalizeSchemaTree(value)
 	}
 }
 

@@ -75,7 +75,6 @@ var sanitizeRewrites = [][2]string{
 	},
 }
 
-// sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 // sanitizeDshPathsProbe DSH 0.3.x 系统提示里「@ 开头的路径怎么解析」那一段的截断前缀。
 // 预检（sanitizeFeatures）与本文件的门控共用同一字面量，避免两处漂移。
 const sanitizeDshPathsProbe = "Tokens prefixed with @"
@@ -105,6 +104,7 @@ const sanitizeDshPathsReplacement = "Paths beginning with @ refer to files the u
 	"and never claim to have inspected it before reading. The @\"...\" form only quotes a path " +
 	"that contains spaces."
 
+// sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
 		return text
