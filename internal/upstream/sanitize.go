@@ -13,11 +13,12 @@ import (
 // sanitizeFeatures 特征预检：任一命中才进入净化（strings.Contains 快速路径，
 // 普通请求全不中 → 原样返回，零分配）。
 var sanitizeFeatures = []string{
-	"x-anthropic-billing-header", // header 键值段键名
-	"cc_entrypoint=",             // 尾随裸键值（截断前缀即可命中）
-	"You are Claude Code",        // 身份句（截断前缀即可命中）
-	"Main branch (",              // 注入指令句（截断前缀即可命中）
-	"DeepSeek Harness",           // DSH 身份句品牌词：上游按非官方渠道整单拦
+	sanitizeDshPathsProbe,                             // DSH 0.3.x 的 @ 路径说明段（段内不含任何品牌词）
+	"x-anthropic-billing-header",                      // header 键值段键名
+	"cc_entrypoint=",                                  // 尾随裸键值（截断前缀即可命中）
+	"You are Claude Code",                             // 身份句（截断前缀即可命中）
+	"Main branch (",                                   // 注入指令句（截断前缀即可命中）
+	"DeepSeek Harness",                                // DSH 身份句品牌词：上游按非官方渠道整单拦
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
 }
@@ -75,6 +76,35 @@ var sanitizeRewrites = [][2]string{
 }
 
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
+// sanitizeDshPathsProbe DSH 0.3.x 系统提示里「@ 开头的路径怎么解析」那一段的截断前缀。
+// 预检（sanitizeFeatures）与本文件的门控共用同一字面量，避免两处漂移。
+const sanitizeDshPathsProbe = "Tokens prefixed with @"
+
+// sanitizeDshPathsRe DSH 0.3.x 的 @ 路径说明段：上游按连续原文匹配拦截
+// （实测只发首句 200，前两句连排即 400 {"code":11128,"msg":"Illegal API invocation
+// from an unapproved channel"}），而这一段**不含任何品牌词**，其余预检特征一条都对不上，
+// 于是原文原样出站、必然 400。
+//
+// 处置是同义改写而不是删除：@ 路径、相对路径基准、结尾斜杠表示目录、其余按文件读、
+// @"..." 用于含空格的路径——语义全保留，DSH 读提示词的行为不变，只让连续特征失配。
+//
+// (?is)：段内本来就有换行，. 必须跨行；大小写不敏感只为兜住首字母大写的变体。
+// 结尾统一锚到 "…path (containing|that contains) spaces."：两种线上措辞的末句都落在
+// 这里（当前写法用 that contains、更早写法用 containing），中间的差异（point to /
+// identify、open it with the read tool / use the read tool）由非贪婪 .*? 一并跨过。
+// 段外的 @ 不匹配：邮箱、npm 包名、含 @ 的路径都不在 "Tokens prefixed with @" 之后。
+var sanitizeDshPathsRe = regexp.MustCompile(
+	`(?is)Tokens prefixed with @ are paths the user explicitly referenced\..*?` +
+		`path (?:containing|that contains) spaces\.`)
+
+// sanitizeDshPathsReplacement 整段同义改写：逐句保留原意，只换措辞。
+const sanitizeDshPathsReplacement = "Paths beginning with @ refer to files the user explicitly mentioned. " +
+	"Relative paths are resolved against the project root; absolute paths point to files or " +
+	"directories on the host. A trailing slash marks a directory, so list it when its contents " +
+	"matter. Anything else is a file: open it with the read tool when its contents are needed, " +
+	"and never claim to have inspected it before reading. The @\"...\" form only quotes a path " +
+	"that contains spaces."
+
 func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
 		return text
@@ -82,6 +112,11 @@ func sanitizeText(text string) string {
 
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
+	}
+
+	// @ 路径说明段：预检已是该段字面量，这里再挡一次，无关文本不跑跨行正则。
+	if strings.Contains(text, sanitizeDshPathsProbe) {
+		text = sanitizeDshPathsRe.ReplaceAllString(text, sanitizeDshPathsReplacement)
 	}
 
 	if sanitizeHdrRe.MatchString(text) {

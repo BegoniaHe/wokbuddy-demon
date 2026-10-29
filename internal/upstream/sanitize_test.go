@@ -475,3 +475,151 @@ func TestSanitizeDSHHarness(t *testing.T) {
 		t.Fatalf("sanitized=%q want DeepSeekRuntime", got)
 	}
 }
+
+// DSH 0.3.x 的 @ 路径说明段是**唯一不含品牌词**的 DSH 指纹：其余预检特征一条都对不上，
+// 原文原样出站即 400 {"code":11128,...}（Illegal API invocation from an unapproved
+// channel）。钉住四条：整段被改写、两种线上措辞都覆盖、跨行形态也覆盖、段外文本不动。
+const (
+	// 当前线上措辞（DSH 0.3.x：point to / open it with the read tool / path that contains）。
+	dshAtPathNow = "Tokens prefixed with @ are paths the user explicitly referenced. " +
+		"Relative paths resolve from the workspace root; absolute paths point to " +
+		"files or directories on the host. A trailing slash marks a directory, so " +
+		"list it when its contents matter. Anything else is a file: open it with " +
+		"the read tool when its contents are needed, and never claim to have " +
+		"inspected it before reading. The @\"...\" form only quotes a path that " +
+		"contains spaces."
+	// 更早的措辞（identify / use the read tool / quotes a path containing）。
+	dshAtPathOld = "Tokens prefixed with @ are paths the user explicitly referenced. " +
+		"Relative paths resolve from the workspace root; absolute paths identify " +
+		"files or directories on the host. A trailing slash marks a directory: " +
+		"list it when its contents matter. Anything else is a file: use the read " +
+		"tool when its contents are needed, and do not claim to have inspected it " +
+		"before reading. @\"...\" quotes a path containing spaces."
+)
+
+// 预检与改写：整段替换成同义改写串，且语义要点齐全（DSH 读提示词的行为不变）。
+func TestDshAtPathSegmentRewritten(t *testing.T) {
+	t.Parallel()
+
+	if !hasFingerprint(dshAtPathNow) {
+		t.Fatal("@ 路径段未被特征预检命中：整条净化链都不会启动")
+	}
+
+	out := sanitizeText(dshAtPathNow)
+	if out != sanitizeDshPathsReplacement {
+		t.Fatalf("整段未被替换:\n got=%q\nwant=%q", out, sanitizeDshPathsReplacement)
+	}
+
+	if strings.Contains(out, sanitizeDshPathsProbe) {
+		t.Errorf("原文残留在出站文本里: %q", out)
+	}
+	// 语义四点（相对路径基准 / 结尾斜杠 / 按文件读 / 引号形态）必须都在。
+	for _, want := range []string{"project root", "trailing slash", "read tool", "@\"...\""} {
+		if !strings.Contains(out, want) {
+			t.Errorf("改写丢语义 %q: %q", want, out)
+		}
+	}
+}
+
+// 更早的措辞（identify / use the read tool / quotes a path containing spaces）同段同义：
+// 结尾分支必须也吃下它，否则该版本 DSH 依旧整单 400。
+func TestDshAtPathOlderWordingRewritten(t *testing.T) {
+	t.Parallel()
+
+	if out := sanitizeText(dshAtPathOld); out != sanitizeDshPathsReplacement {
+		t.Fatalf("旧措辞未覆盖:\n got=%q\nwant=%q", out, sanitizeDshPathsReplacement)
+	}
+}
+
+// 段内本来就有换行：(?s) 缺失时 .*? 跨不过去，只改半段等于没改。
+func TestDshAtPathMultilineRewritten(t *testing.T) {
+	t.Parallel()
+
+	in := strings.Replace(dshAtPathNow, "Relative paths", "\n\nRelative paths", 1)
+
+	out := sanitizeText(in)
+	if strings.Contains(out, sanitizeDshPathsProbe) || !strings.Contains(out, "Paths beginning with @") {
+		t.Fatalf("跨行形态未覆盖: %q", out)
+	}
+}
+
+// 段落嵌在更长的 system 里时只换这一段，前后文逐字原样。
+func TestDshAtPathEmbeddedKeepsSurroundings(t *testing.T) {
+	t.Parallel()
+
+	in := "before\n\n" + dshAtPathNow + "\n\nafter"
+	if out := sanitizeText(in); out != "before\n\n"+sanitizeDshPathsReplacement+"\n\nafter" {
+		t.Fatalf("前后文被动了: %q", out)
+	}
+}
+
+// 段外的 @ 是普通文本（邮箱、npm 包名、Windows 路径）：既不触发预检也不被改写。
+func TestDshAtPathUnrelatedTextUntouched(t *testing.T) {
+	t.Parallel()
+
+	for _, text := range []string{
+		"Mail me at someone@example.com and open C:\\cache\\@tmp.",
+		"npm i @deepseek-ai/dsh-llm",
+		"Tokens prefixed with # are things you should not touch here.",
+		"Relative paths resolve from the workspace root, but this is not the paragraph.",
+	} {
+		if hasFingerprint(text) {
+			t.Errorf("误触发预检: %q", text)
+		}
+
+		if out := sanitizeText(text); out != text {
+			t.Errorf("误改写: %q -> %q", text, out)
+		}
+	}
+}
+
+// 出站边界：@ 路径段在 system 里时，发往上游的 wire body 必须已被改写。
+func TestChatStreamWireBodyDshAtPathSegmentSanitized(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	server := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	})
+	defer server.Close()
+
+	client := New()
+	client.SanitizeFingerprints.Store(true)
+	client.ChatBaseCN = server.URL
+	acct := &auth.Auth{AccessToken: "test-token", Domain: "copilot.tencent.com", UID: "u1"}
+
+	raw, err := json.Marshal(map[string]any{
+		"model": "hy3",
+		"messages": []any{
+			map[string]any{"role": "system", "content": dshAtPathNow},
+			map[string]any{"role": "user", "content": "say ok"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := raw
+
+	rc, status, respBody, err := client.ChatStream(acct, body, "", ChatMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	if status >= 400 {
+		t.Fatalf("upstream status %d: %s", status, respBody)
+	}
+
+	if strings.Contains(string(gotBody), sanitizeDshPathsProbe) {
+		t.Fatalf("wire body 仍带 @ 路径段原文: %s", gotBody)
+	}
+
+	if !strings.Contains(string(gotBody), "Paths beginning with @") {
+		t.Fatalf("wire body 未被改写: %s", gotBody)
+	}
+}
