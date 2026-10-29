@@ -8,6 +8,17 @@ import { Button } from '@/components/ui/button';
 import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  Select,
+  SelectContent,
+  SelectOptions,
+  SelectTrigger,
+  SelectValue,
+  selectOptionItems,
+  type SelectOption,
+} from '@/components/ui/select';
+import { MAX_IMPORT_MODELS, countByRealm, selectModelIDs, type ModelRealmFilter } from '@/lib/agents';
+import type { ModelEntry } from '@/lib/models';
 
 type AgentStatus = {
   id: string;
@@ -19,12 +30,34 @@ type AgentStatus = {
   applied_at?: string;
 };
 
+// MODEL_SOURCE_OPTIONS 模型来源：单个模型（现状）/ 全部上游模型（#20 一键导入）。
+const MODEL_SOURCE_OPTIONS: SelectOption[] = [
+  { value: 'single', label: '单个模型' },
+  { value: 'all', label: '全部上游模型' },
+];
+
+// REALM_FILTER_OPTIONS 全部模型模式的域过滤。
+const REALM_FILTER_OPTIONS: SelectOption[] = [
+  { value: 'all', label: '两域' },
+  { value: 'cn', label: '只看 cn' },
+  { value: 'global', label: '只看 global' },
+];
+
+// CLIENT_MODEL_SUPPORT 各客户端的多模型能力说明（避免用户以为三处行为一致）。
+const CLIENT_MODEL_SUPPORT: Record<string, string> = {
+  opencode: '全部模型写进 provider.wokbuddy.models',
+  codex: '额外模型写成 profiles，用 codex --profile "<id>" 切换',
+  claude: '只写默认模型，其余在 Claude Code 内用 /model <id> 切换',
+};
+
 // AgentsView 本机智能体一键配置（issue #102）：仅回环访问。
 export function AgentsView() {
   const qc = useQueryClient();
   const [apiKey, setApiKey] = useState('');
   const [baseURL, setBaseURL] = useState('http://127.0.0.1:7863');
   const [model, setModel] = useState('glm-5.2');
+  const [modelSource, setModelSource] = useState<'single' | 'all'>('single');
+  const [realmFilter, setRealmFilter] = useState<ModelRealmFilter>('all');
   const [busy, setBusy] = useState('');
   const { confirm, confirmDialog } = useConfirm();
 
@@ -34,14 +67,34 @@ export function AgentsView() {
   });
   const clients = q.data?.clients || [];
 
+  // all 模式才拉模型清单（与 ModelsView 同 key，复用缓存）。
+  const modelsQ = useQuery({
+    queryKey: ['models'],
+    queryFn: () => api<{ models?: ModelEntry[] }>('models'),
+    enabled: modelSource === 'all',
+  });
+  const ids = modelSource === 'all' ? selectModelIDs(modelsQ.data?.models, realmFilter) : [];
+  const counts = countByRealm(ids);
+  // all 模式清单读取失败时禁用写入：宁可写不进去，也不要写一份空模型清单。
+  const blocked = modelSource === 'all' && (modelsQ.isError || ids.length === 0);
+
   const apply = async (id: string) => {
     if (!apiKey.trim()) {
       toast('请填写 API key（只写入本机客户端配置）', 'err');
       return;
     }
+    if (modelSource === 'all' && ids.length === 0) {
+      toast('模型清单为空，可切回单个模型', 'err');
+      return;
+    }
     setBusy(id);
     try {
-      await postJSON('agents/' + id + '/apply', { api_key: apiKey.trim(), base_url: baseURL.trim(), model: model.trim() });
+      // all 模式只传 models（第一个元素即默认模型，model 不传）。
+      const body =
+        modelSource === 'all'
+          ? { api_key: apiKey.trim(), base_url: baseURL.trim(), models: ids }
+          : { api_key: apiKey.trim(), base_url: baseURL.trim(), model: model.trim() };
+      await postJSON('agents/' + id + '/apply', body);
       toast('已写入配置并备份原件', 'ok');
       await qc.invalidateQueries({ queryKey: ['agents'] });
     } catch (e) {
@@ -110,9 +163,54 @@ export function AgentsView() {
             <Input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="config.json 中的 api_key" />
           </Field>
           <Field>
-            <FieldLabel>默认模型</FieldLabel>
-            <Input value={model} onChange={(e) => setModel(e.target.value)} placeholder="glm-5.2" />
+            <FieldLabel>模型来源</FieldLabel>
+            <Select
+              items={selectOptionItems(MODEL_SOURCE_OPTIONS)}
+              value={modelSource}
+              onValueChange={(v) => setModelSource(v === 'all' ? 'all' : 'single')}>
+              <SelectTrigger aria-label="模型来源">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectOptions options={MODEL_SOURCE_OPTIONS} />
+              </SelectContent>
+            </Select>
+            <FieldDescription>单个模型 = 现状；全部上游模型 = 一次写入 /panel/api/models 的清单</FieldDescription>
           </Field>
+          {modelSource === 'single' ? (
+            <Field>
+              <FieldLabel>默认模型</FieldLabel>
+              <Input value={model} onChange={(e) => setModel(e.target.value)} placeholder="glm-5.2" />
+              <FieldDescription>写进各客户端的默认 model</FieldDescription>
+            </Field>
+          ) : (
+            <>
+              <Field>
+                <FieldLabel>域过滤</FieldLabel>
+                <Select
+                  items={selectOptionItems(REALM_FILTER_OPTIONS)}
+                  value={realmFilter}
+                  onValueChange={(v) => setRealmFilter(v === 'cn' || v === 'global' ? v : 'all')}>
+                  <SelectTrigger aria-label="域过滤">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectOptions options={REALM_FILTER_OPTIONS} />
+                  </SelectContent>
+                </Select>
+                <FieldDescription>
+                  {modelsQ.isError
+                    ? '读取模型清单失败：' + (modelsQ.error as Error).message + '，可切回单个模型'
+                    : '将写入 ' + ids.length + ' 个模型（CN ' + counts.cn + ' · Global ' + counts.global + '）'}
+                </FieldDescription>
+              </Field>
+              {modelsQ.isError ? null : (
+                <p className="text-2xs text-muted-foreground md:col-span-1">
+                  第一个模型即默认模型；清单上限 {MAX_IMPORT_MODELS} 个，超出仅写入前 {MAX_IMPORT_MODELS} 个。
+                </p>
+              )}
+            </>
+          )}
         </CardContent>
       </Card>
 
@@ -141,8 +239,9 @@ export function AgentsView() {
                   {c.modified ? <span className="text-2xs text-destructive">外部修改</span> : null}
                 </div>
                 <div className="truncate font-mono text-2xs text-muted-foreground">{c.path}</div>
+                <div className="text-2xs text-muted-foreground">{CLIENT_MODEL_SUPPORT[c.id] || ''}</div>
               </div>
-              <Button size="xs" disabled={busy === c.id} onClick={() => void apply(c.id)}>
+              <Button size="xs" disabled={busy === c.id || blocked} onClick={() => void apply(c.id)}>
                 写入
               </Button>
               <Button size="xs" variant="ghost" disabled={!c.applied || busy === c.id} onClick={() => void restore(c)}>
