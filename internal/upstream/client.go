@@ -1273,6 +1273,13 @@ type Client struct {
 	desktopSessionMu  sync.Mutex
 	desktopSessionIDs map[string]string
 
+	// busyMu/busyMissingRealm 记录「该域上游没有 /v2/chat/busy 这条观测」的 realm
+	// （issue #401）：global 服务端未部署该路径，一律 404。只有 404 才置位，之后本进程
+	// 对该域直接返回空表 + nil，不再白打一次上游、也不再往面板错误面里塞噪音；
+	// 非 404（超时/5xx）照旧报错，不被这条记忆吞掉。上游若补上端点，重启即重新探测。
+	busyMu           sync.Mutex
+	busyMissingRealm map[string]bool
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。
