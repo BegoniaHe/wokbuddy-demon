@@ -3638,6 +3638,9 @@ func (c *Client) fetchV3ConfigModelMap(account *auth.Auth, ua string) (map[strin
 	// 官方客户端在 availableModels 之后还会按默认会话 agent 的 models 白名单裁剪；
 	// 这里只给条目打内部标记，保留全量目录供面板 / effort 缓存使用。
 	applyChatWhitelistToMap(out, env.Data.Agents)
+	// 官方菜单的第二条可见性规则（issue #402）：ModelRateLimitCap.lines[].paidId 的
+	// 付费线路变体不单独成行，这里只给命中项打不可见标记。
+	applyPaidLineFilter(out, account, env.Data.ProductFeaturesConfig.ModelRateLimitCap)
 
 	if len(out) == 0 {
 		return nil, errV3ConfigReturnedEmptyModels
@@ -3682,6 +3685,8 @@ type v3ProductFeaturesConfig struct {
 	ModelTrialBanner struct {
 		Banners []v3TrialBanner `json:"banners"`
 	} `json:"ModelTrialBanner"`
+	// 付费线路定义（issue #402）：见 paidline.go。上游不下发时为空值，过滤不启用。
+	ModelRateLimitCap v3ModelRateLimitCap `json:"ModelRateLimitCap"`
 }
 
 // v3TrialBanner 单条试用模型横幅。
