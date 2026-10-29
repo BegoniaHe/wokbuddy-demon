@@ -2879,7 +2879,7 @@ func (f *chatFlow) handleRequestLevelError(
 	}
 
 	f.out.Error(status, code, msg,
-		f.h.hintOf(kind, raw, f.bareModel, f.reqHasImage, uerr))
+		f.h.hintOf(kind, raw, f.bareModel, f.reqHasImage, f.declaredToolCount > 0, uerr))
 	f.st.status = status
 	f.st.outcome = reqlog.OutcomeHTTPError
 }
@@ -2953,7 +2953,7 @@ func (f *chatFlow) handleStreamSuccess(
 	repair := upstream.NewMarkupRepair(f.declaredTools, true)
 
 	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
-		return f.h.hintContext(f.bareModel, f.reqHasImage)
+		return f.h.hintContext(f.bareModel, f.reqHasImage, f.declaredToolCount > 0)
 	}), repair, func(payload string) { errFrame = payload })
 	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
 
@@ -3976,7 +3976,7 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 		return status, code, msg, hint, false
 	}
 
-	hint = f.h.hintOf(upErr.Kind, upErr.Msg, f.bareModel, f.reqHasImage, upErr)
+	hint = f.h.hintOf(upErr.Kind, upErr.Msg, f.bareModel, f.reqHasImage, f.declaredToolCount > 0, upErr)
 	switch upErr.Kind {
 	case upstream.ErrSoftRate:
 		status = http.StatusTooManyRequests
@@ -4475,8 +4475,8 @@ func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint str
 // 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
 // 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 10min 未
 // 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
-func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
-	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}
+func (h *Handler) hintContext(bareModel string, hasImage, hasTools bool) upstream.HintContext {
+	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage, HasTools: hasTools}
 	if bareModel == "" {
 		return ctx
 	}
@@ -4499,14 +4499,14 @@ func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintCont
 // body 原文判定（防御路径）。transport 层错误（lastErr 非 *upstream.Error 且
 // 上游没回 body）→ 无 hint（不编造）。
 func (h *Handler) hintOf(
-	kind upstream.ErrKind, body, bareModel string, hasImage bool, uerr *upstream.Error,
+	kind upstream.ErrKind, body, bareModel string, hasImage, hasTools bool, uerr *upstream.Error,
 ) string {
 	msg := body
 	if uerr != nil && uerr.Msg != "" {
 		msg = uerr.Msg
 	}
 
-	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
+	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage, hasTools))
 }
 
 // secondsUntilLocalMidnight 返回距离本地次日 0 点的秒数（至少 1）。

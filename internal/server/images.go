@@ -368,7 +368,7 @@ func (h *Handler) handleImagesError(
 		msg = "upstream image request failed"
 	}
 
-	writeOpenAIErrorHint(w, outStatus, code, msg, h.hintOf(kind, string(raw), model, true, uerr))
+	writeOpenAIErrorHint(w, outStatus, code, msg, h.hintOf(kind, string(raw), model, true, false, uerr))
 }
 
 // recordImagesAttempt 记账：reqlog 结果 + usage（响应 usage 缺失时仍记一次请求）。

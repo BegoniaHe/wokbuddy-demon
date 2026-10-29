@@ -91,6 +91,40 @@ func TestSplitSystemBySentencesNonSystemUntouched(t *testing.T) {
 	}
 }
 
+// TestSplitSystemBySentencesPreservesBytes 拆句只改消息边界：首尾空白原样保留、
+// 大整数按字面量保留（不因 float64 往返被改成 ...800）。
+func TestSplitSystemBySentencesPreservesBytes(t *testing.T) {
+	t.Parallel()
+
+	system := "\n  You are a coding agent. Keep going. Stay short. Be exact.\n"
+	body := []byte(`{"seed":9007199254740993,"messages":[` +
+		`{"role":"system","content":` + jsonString(t, system) + `},` +
+		`{"role":"user","content":"hi"}]}`)
+
+	out, ok := SplitSystemBySentences(body)
+	if !ok {
+		t.Fatal("多句长 system 未拆分")
+	}
+
+	if !strings.Contains(string(out), `"seed":9007199254740993`) {
+		t.Fatalf("大整数被改写: %s", out)
+	}
+
+	obj := decodeSplit(t, out)
+	if len(obj.Messages) != 3 {
+		t.Fatalf("messages = %d, want 3", len(obj.Messages))
+	}
+
+	// 两条拼接必须逐字还原原文（含首尾空白与换行）。
+	if joined := obj.Messages[0].Content + obj.Messages[1].Content; joined != system {
+		t.Fatalf("拆句改动正文:\n got=%q\nwant=%q", joined, system)
+	}
+
+	if !strings.HasPrefix(obj.Messages[0].Content, "\n  ") || !strings.HasSuffix(obj.Messages[1].Content, "\n") {
+		t.Fatalf("首尾空白丢失: %q / %q", obj.Messages[0].Content, obj.Messages[1].Content)
+	}
+}
+
 // TestSplitSentences 句界判定：缩写/小数/文件名不被切开，中文句末标点照切。
 func TestSplitSentences(t *testing.T) {
 	t.Parallel()

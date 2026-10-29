@@ -24,7 +24,8 @@ import (
 // hint 或无 hint）：
 //   - HasImage：请求体是否携带 image_url part（11133 的「模型不支持图片」指向前提）；
 //   - Model / ModelInCatalog / ModelSupportsImages：模型目录对该模型的
-//     supports_images 声明（目录未收录 → 不做「不支持」判定，防查不到误判成不支持）。
+//     supports_images 声明（目录未收录 → 不做「不支持」判定，防查不到误判成不支持）；
+//   - HasTools：请求体是否声明了 tools（工具 schema 校验 hint 的前提）。
 //
 // 判定次序：11133/11135 上游业务码**先于** Kind 表——实测这两族归 ErrClient/
 // ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
@@ -38,8 +39,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 			return "model " + ctx.Model + " does not support images; pick one with supports_images=true from /v1/models"
 		}
 		// 工具定义（参数 schema）被模型供应商拒收：说清是 schema 校验，不是请求体语法
-		// ——否则用户只会看到「参数不合法」，猜不到要改 tools。
-		if isToolSchemaRejection(msg) {
+		// ——否则用户只会看到「参数不合法」，猜不到要改 tools。只在请求**确实声明了
+		// tools** 时这么说：供应商侧拒收的文案（"rejected by the model provider"）对
+		// 任何参数错都通用，没带 tools 的请求按它指去改 tools 只会误导。
+		if isToolSchemaRejection(msg, ctx.HasTools) {
 			return "tool definitions were rejected by the model provider (parameter schema validation, " +
 				"not request body syntax); check tools[].function.parameters"
 		}
@@ -90,6 +93,7 @@ var gatewayHintByKind = map[ErrKind]string{
 type HintContext struct {
 	Model               string // 请求裸模型名（可空）
 	HasImage            bool   // 请求体是否携带 image_url part
+	HasTools            bool   // 请求体是否声明了 tools（工具 schema hint 的前提）
 	ModelSupportsImages bool   // 模型目录 supports_images 声明（仅 ModelInCatalog 时有意义）
 	ModelInCatalog      bool   // 模型目录是否收录该模型（「不支持」判定的前提）
 }
@@ -222,17 +226,18 @@ func isModelParamInvalid(body string) bool {
 var toolSchemaRejectMarkers = []string{"rejected by the model provider", "rejected by model provider"}
 
 // isToolSchemaRejection 报告 11133 body 是否指向**工具定义（参数 schema）校验**而非
-// 请求体语法。两个信号任一成立即算：供应商侧拒收文案；或 param 明确指向工具参数。
+// 请求体语法。两个信号任一成立即算：param 明确指向工具参数（与请求形态无关）；或
+// 供应商侧拒收文案 **且请求确实声明了 tools**（hasTools）——那句文案对任何参数错都
+// 通用，没带 tools 的请求按它指去改 tools 只会误导。
+//
 // 判定只影响 gateway_hint 文案（补充说明，非权威分类），误判代价是多一条中性提示。
-func isToolSchemaRejection(body string) bool {
-	lower := strings.ToLower(body)
-	if containsAnyLower(lower, toolSchemaRejectMarkers) {
+func isToolSchemaRejection(body string, hasTools bool) bool {
+	param := strings.ToLower(businessErrorParam(body))
+	if strings.Contains(param, "tool") || strings.Contains(param, "function") {
 		return true
 	}
 
-	param := strings.ToLower(businessErrorParam(body))
-
-	return strings.Contains(param, "tool") || strings.Contains(param, "function")
+	return hasTools && containsAnyLower(strings.ToLower(body), toolSchemaRejectMarkers)
 }
 
 // isInvalidImageData 上游 11135 body 判定（code 11135 / invalid_image_data /

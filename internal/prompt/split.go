@@ -11,9 +11,9 @@
 package prompt
 
 import (
+	"bytes"
 	"encoding/json"
 	"maps"
-	"slices"
 	"strings"
 	"unicode"
 )
@@ -34,8 +34,15 @@ func SplitSystemBySentences(body []byte) ([]byte, bool) {
 		return body, false
 	}
 
+	// UseNumber：seed / 大整数 id 这类字段按字面量保留。走 float64 会把
+	// 9007199254740993 变成 ...992——拆句只是改消息边界，不能顺手改掉客户端的数据
+	// （与 internal/server/logging.go 的 rewriteModel 同口径）。
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+
+	if err := dec.Decode(&obj); err != nil || obj == nil {
 		return body, false
 	}
 
@@ -113,12 +120,14 @@ func splitContentBySentences(text string) []string {
 
 	half := (len(sentences) + 1) / 2
 
+	// 不 TrimSpace：句界切点已把句尾空白归前一条，两条直接拼接即原文。整体首尾空白
+	// 也照原样留在首条 / 尾条上——拆句只改消息边界，一个字都不动。
 	parts := []string{
-		strings.TrimSpace(strings.Join(sentences[:half], "")),
-		strings.TrimSpace(strings.Join(sentences[half:], "")),
+		strings.Join(sentences[:half], ""),
+		strings.Join(sentences[half:], ""),
 	}
 
-	if slices.Contains(parts, "") {
+	if strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
 		return nil
 	}
 
