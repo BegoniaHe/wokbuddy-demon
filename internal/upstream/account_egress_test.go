@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,12 @@ func newEgressClient(t *testing.T) (*Client, *auth.Auth, *egressProbe) {
 	client.ChatBaseCN = server.URL
 	client.BillingBaseCN = server.URL
 	client.WebBaseCN = server.URL
+	// global 域 base 同样钉到 httptest：GlobalRegisterStatus / GlobalFetchCountries 走
+	// globalRegisterBase（显式 billing_base 优先），不钉就会真打 codebuddy.ai——
+	// 用例只剩「有没有走槽」的断言，却把真网络 I/O 与残留拨号 goroutine 带进来
+	// （CI 的 goleak 会红）。
+	client.ChatBaseGlobal = server.URL
+	client.BillingBaseGlobal = server.URL
 	// 计费/签到重试间隔：避免单次抖动用例白等默认 2s。
 	client.RetryDelay = time.Millisecond
 
@@ -102,7 +109,7 @@ func TestAccountEgressUsesSlotDial(t *testing.T) {
 		// 注册激活链路同样带账号 token（issue #39）：绑了槽的 global 账号不能在这里
 		// 暴露宿主机 IP。
 		{"GlobalRegisterStatus", func(c *Client, a *auth.Auth) {
-			a.Domain = "https://www.codebuddy.ai"
+			a.Domain = "https://www.codebuddy.ai" // Realm()=global；base 由 BillingBaseGlobal 钉到 httptest
 			_, _, _, _ = c.GlobalRegisterStatus(a)
 		}},
 		{"GlobalFetchCountries", func(c *Client, a *auth.Auth) {
@@ -173,7 +180,11 @@ func countingDial(counter *atomic.Int64) func(ctx context.Context, network, addr
 	}
 }
 
-// httpGetOK 发一次 GET 并关闭响应体（只关心是否有请求真的发出去）。
+// httpGetOK 发一次 GET、读尽并关闭响应体（只关心是否有请求真的发出去）。
+//
+// 必须读到 EOF 再 Close：net/http 是在 readLoop 读完 body 后才把连接放回空闲池的，
+// 只 Close 会让「放回池」晚于调用方的下一次 SetDialer，于是 CloseIdleConnections
+// 扑空、随后连接又被复用——热替换用例会间歇性假红。
 func httpGetOK(t *testing.T, hc *http.Client, url string) {
 	t.Helper()
 
@@ -182,6 +193,7 @@ func httpGetOK(t *testing.T, hc *http.Client, url string) {
 		t.Fatalf("get %s: %v", url, err)
 	}
 
+	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 }
 
