@@ -33,7 +33,7 @@ var ErrNotApplied = errors.New("没有可还原的写入记录")
 var (
 	errAPIKey        = errors.New("api_key 不能为空")
 	errBaseURLHTTPS  = errors.New("base_url 必须是 http(s) 地址")
-	errModelList     = errors.New("models 含非法项")
+	errModelList     = errors.New("模型 id 含非法项")
 	errApplyFailed   = errors.New("Apply failed")
 	errRestoreFailed = errors.New("Restore failed")
 )
@@ -151,8 +151,8 @@ func (m *Manager) statusLocked() []Status {
 
 // validateOptions 校验写入参数并补默认模型。
 func validateOptions(opts *Options) error {
-	if strings.TrimSpace(opts.APIKey) == "" {
-		return errAPIKey
+	if err := normalizeAPIKey(opts); err != nil {
+		return err
 	}
 
 	baseURL := strings.TrimSpace(opts.BaseURL)
@@ -189,6 +189,26 @@ func validateOptions(opts *Options) error {
 	}
 
 	opts.Model = model
+
+	return nil
+}
+
+// normalizeAPIKey 校验并 trim api_key。
+//
+// 为何要拦控制字符：api_key 与 model 同经 Go 的 %q 写入 Codex 的 config.toml，
+// 0x01 之类会写成 TOML 不认的 `\x01` 转义（Codex 用 Rust toml crate，只认
+// \uXXXX 与短转义），整份 config.toml 解析失败。为何要 trim：网关侧 config.json
+// 加载按去首尾空白口径比较，粘贴带空白的密钥本来也永远匹配不上，写出去只是
+// 「配置成功、请求恒 401」。
+func normalizeAPIKey(opts *Options) error {
+	opts.APIKey = strings.TrimSpace(opts.APIKey)
+	if opts.APIKey == "" {
+		return errAPIKey
+	}
+
+	if strings.ContainsFunc(opts.APIKey, isControlRune) {
+		return fmt.Errorf("api_key 含控制字符 %q，无法写入客户端配置: %w", opts.APIKey, errAPIKey)
+	}
 
 	return nil
 }
