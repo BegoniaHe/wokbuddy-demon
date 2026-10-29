@@ -512,21 +512,91 @@ experimental_bearer_token = %q
 `, v1Base(opts.BaseURL), opts.APIKey)
 
 	// 其余模型写成 profiles：`codex --profile "<id>"` 直接切换。表名必须用双引号
-	// 包裹原始 id（模型 id 可含 : . / -），且只写这两个键，不覆盖用户自有 profile。
-	for _, id := range modelList(opts)[1:] {
+	// 包裹原始 id（模型 id 可含 : . / -）。用户自有 profile 原样保留，只让出与本次
+	// 写入同名的键——同名表重复声明会让整份 config.toml 解析失败。
+	extra := modelList(opts)[1:]
+	for _, id := range extra {
 		fmt.Fprintf(&builder, "\n[profiles.%q]\nmodel = %q\nmodel_provider = \"wokbuddy\"\n", id, id)
 	}
 
 	builder.WriteString(codexEnd)
 	builder.WriteString("\n")
 
-	if tables = strings.TrimSpace(tables); tables != "" {
+	if tables = strings.TrimSpace(stripCodexProfiles(tables, extra)); tables != "" {
 		builder.WriteString("\n")
 		builder.WriteString(tables)
 		builder.WriteString("\n")
 	}
 
 	return []byte(builder.String()), nil
+}
+
+// stripCodexProfiles 从表段里删掉与托管 profile 同名的 `[profiles.<id>]` 块（含其
+// 键行）。同名表在 TOML 里重复声明是硬错误，Codex 会整份配置加载失败；用户自有的
+// 其它 profile 与表原样保留。
+func stripCodexProfiles(tables string, ids []string) string {
+	if tables == "" || len(ids) == 0 {
+		return tables
+	}
+
+	drop := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		drop[id] = true
+	}
+
+	var (
+		out   []string
+		block []string
+		keep  bool
+	)
+
+	flush := func() {
+		if keep {
+			out = append(out, block...)
+		}
+	}
+
+	for _, line := range strings.SplitAfter(tables, "\n") {
+		// 任何表头都结束上一个块：否则被丢弃的 profile 会把紧随其后的
+		// 其它表一并吞掉（[model_providers.x] 等与 profile 无关的表不能连坐）。
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			flush()
+
+			id, isProfile := codexProfileHeaderID(line)
+			block, keep = []string{line}, !isProfile || !drop[id]
+
+			continue
+		}
+
+		block = append(block, line)
+	}
+
+	flush()
+
+	return strings.Join(out, "")
+}
+
+// codexProfileHeaderID 解析 `[profiles.<id>]` 表头并返回裸 id；其它行返回 false。
+func codexProfileHeaderID(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "[profiles.") || strings.HasPrefix(trimmed, "[[") {
+		return "", false
+	}
+
+	end := strings.IndexByte(trimmed, ']')
+	if end < 0 {
+		return "", false
+	}
+
+	key := strings.TrimSpace(trimmed[len("[profiles."):end])
+	key = strings.TrimPrefix(strings.TrimSuffix(key, "\""), "\"")
+	key = strings.TrimPrefix(strings.TrimSuffix(key, "'"), "'")
+
+	if key == "" {
+		return "", false
+	}
+
+	return key, true
 }
 
 // removeCodexBlock 删除上一次写入的托管段（含标记），其余内容原样保留。

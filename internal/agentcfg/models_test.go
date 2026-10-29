@@ -194,6 +194,34 @@ func TestApplyCodexKeepsUserProfiles(t *testing.T) {
 	}
 }
 
+// TestApplyCodexReplacesSameNameUserProfile 用户自有 profile 与托管 profile 同名时
+// 必须让位：同名 `[profiles.<id>]` 重复声明会让整份 config.toml（TOML）解析失败，
+// Codex 直接加载不了配置。
+func TestApplyCodexReplacesSameNameUserProfile(t *testing.T) {
+	t.Parallel()
+
+	existing := []byte("model = \"old\"\n\n[profiles.\"global:kimi-k3\"]\nmodel = \"user-thing\"\n\n[profiles.mine]\nmodel = \"keep-me\"\n")
+	opts := Options{
+		BaseURL: "http://127.0.0.1:7863",
+		APIKey:  "sk-test",
+		Models:  []string{"cn:glm-5.3", "global:kimi-k3"},
+	}
+
+	out := string(applyBytes(t, "codex", existing, opts))
+
+	if n := strings.Count(out, `[profiles."global:kimi-k3"]`); n != 1 {
+		t.Fatalf("同名 profile 声明 %d 次（TOML 重复声明会整份失效）：\n%s", n, out)
+	}
+
+	if strings.Contains(out, "user-thing") {
+		t.Fatalf("同名用户 profile 的键行应被让出：\n%s", out)
+	}
+
+	if !strings.Contains(out, `[profiles.mine]`) || !strings.Contains(out, `model = "keep-me"`) {
+		t.Fatalf("无关用户 profile 被破坏：\n%s", out)
+	}
+}
+
 func TestApplyOpenCodeWritesAllModels(t *testing.T) {
 	t.Parallel()
 
