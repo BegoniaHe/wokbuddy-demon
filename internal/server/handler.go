@@ -1437,7 +1437,8 @@ type chatFlow struct {
 	// 标签）。各换号 return rotContinue 分支写入；degrade 复用同号重试、不算换号，
 	// 保持空值即跳过计数。
 	rotateReason string
-	// busyWaited 本次请求是否已为 14003 模型繁忙等待过（只等一次，issue #254）。
+	// busyWaited 本次请求是否已等待过一次（14003 模型繁忙或本域在途名额占满，
+	// 两者共用同一「只等一次」预算，issue #254 / #403）。
 	busyWaited bool
 	// zeroRetried 是否已因「length + 零输出」关闭思考重发过（只重发一次，issue #244）。
 	zeroRetried bool
@@ -2363,20 +2364,66 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 }
 
-// pickAccountWithBusyWait 选号；纯 14003 全池阻塞时等待一次后重选（issue #254）。
+// pickAccountWithBusyWait 选号；选不到时有一次「等一等再重选」的机会，两类等待共用
+// 同一预算与同一「只等一次」标记：
+//   - 14003 模型繁忙短窗（issue #254）：等到短窗结束再重选；
+//   - 本域在途名额占满（issue #403）：轮询等名额释放再重选。
+//
+// 两者都不在等待期间占名额，等不到就照既有路径收敛（503 no_healthy_account）。
 func (f *chatFlow) pickAccountWithBusyWait(ctx context.Context) *auth.Auth {
 	acct := f.pickAccount()
 	if acct != nil {
 		return acct
 	}
 
-	if f.busyWaited || !f.waitForModelBusy(ctx) {
+	if f.busyWaited {
+		return nil
+	}
+
+	if !f.waitForModelBusy(ctx) && !f.waitForSlot(ctx, modelBusyWaitMax) {
 		return nil
 	}
 
 	f.busyWaited = true
 
 	return f.pickAccount()
+}
+
+// slotWaitPoll 名额等待的轮询间隔：短到「刚释放就能注意到」，长到不会把池锁刷爆。
+const slotWaitPoll = 50 * time.Millisecond
+
+// waitForSlot 本域在途名额全满时按 slotWaitPoll 轮询等名额（≤budget，受 ctx 取消）。
+//
+// 判据交给 Pool.SlotWaitForRealm：只有「本域有健康号、只是名额满」才值得等；一旦它
+// 不再成立（名额释放，或本域已没有能服务该模型的号），立即返回 true 让调用方重选一次
+// ——重选结果就是最终结论，本函数不替选号下判断。返回 false 表示等到预算耗尽或 ctx
+// 取消，请求按既有 503 收敛。等待期间清空本轮 tried（理由同 waitForModelBusy：窗口
+// 过后旧排除集会挡住刚恢复的号）。
+func (f *chatFlow) waitForSlot(ctx context.Context, budget time.Duration) bool {
+	if !f.h.cfg.Pool.SlotWaitForRealm(f.bareModel, f.realm) {
+		return false
+	}
+
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(slotWaitPoll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline.C:
+			return false
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			if !f.h.cfg.Pool.SlotWaitForRealm(f.bareModel, f.realm) {
+				clear(f.tried)
+
+				return true
+			}
+		}
+	}
 }
 
 // waitForModelBusy 纯 14003 全池阻塞时等待一次（≤10s，受 ctx 取消）。等待期间
