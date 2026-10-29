@@ -447,10 +447,10 @@ func TestRefreshDomain(t *testing.T) {
 	}
 }
 
-// TestPrivateDataHeaderPerRealm X-Private-Data 按账号身份分层：CN 5.9.3 官方
-// applyPrivateDataHeaderPolicy 在个人号默认分支发 false、企业号（isEnterpriseEditionAccount：
-// enterpriseId 非空或 type=ultimate/exclusive）发 true；global 基线仍是 5.8.4，
-// 走 DisableYuanbaoChannel=true 仍发 true（issue #343）。
+// TestPrivateDataHeaderPerRealm X-Private-Data 按账号身份分层、与域无关：官方 5.9.3
+// （CN / global 同源同形）在个人号默认分支发 false、企业号（isEnterpriseEditionAccount：
+// enterpriseId 非空或 type=ultimate/exclusive）发 true。global 5.8.4 时代按
+// DisableYuanbaoChannel 一律发 true 的旧口径已作废（issue #343 / #400）。
 func TestPrivateDataHeaderPerRealm(t *testing.T) {
 	t.Parallel()
 
@@ -463,7 +463,13 @@ func TestPrivateDataHeaderPerRealm(t *testing.T) {
 		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
 		{"CN ultimate 无 enterpriseId", &auth.Auth{UID: "u-cn-ult", AccessToken: "at", EditionType: "ultimate"}, "true"},
 		{"CN exclusive 无 enterpriseId", &auth.Auth{UID: "u-cn-exc", AccessToken: "at", EditionType: "Exclusive"}, "true"},
-		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "true"},
+		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "false"},
+		{"global 个人号 ultimate 无 enterpriseId", &auth.Auth{
+			UID: "u-gl-ult", AccessToken: "at", Domain: "www.workbuddy.ai", EditionType: "ultimate",
+		}, "true"},
+		{"global 企业号", &auth.Auth{
+			UID: "u-gl-ent", AccessToken: "at", Domain: "www.workbuddy.ai", EnterpriseID: "ent-9",
+		}, "true"},
 	}
 
 	for _, testCase := range cases {
