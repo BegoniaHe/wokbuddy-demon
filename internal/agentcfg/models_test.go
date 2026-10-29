@@ -293,3 +293,25 @@ func TestApplyClaudeUsesFirstModel(t *testing.T) {
 		t.Fatalf("ANTHROPIC_BASE_URL = %q，必须是不带 /v1 的根地址", doc.Env["ANTHROPIC_BASE_URL"])
 	}
 }
+
+// TestNormalizeModelListRejectsControlRunes 控制字符必须整条拒绝：Codex 配置走
+// Go 的 %q 输出，`\x01` 这种转义 TOML 不认，会连累整份 config.toml 解析失败。
+func TestNormalizeModelListRejectsControlRunes(t *testing.T) {
+	t.Parallel()
+
+	for _, id := range []string{"cn:a\x01b", "cn:a\nb", "cn:a\tb", "cn:a\x7fb"} {
+		if _, err := normalizeModelList([]string{"cn:ok", id}); err == nil {
+			t.Fatalf("模型 id %q 含控制字符却未被拒绝", id)
+		}
+	}
+
+	// 正常 id（含 : . / - 与中文）照旧放行。
+	got, err := normalizeModelList([]string{"cn:glm-5.2", " global:kimi-k3 ", "cn:模型/v1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("合法 id 被拒：%v", got)
+	}
+}

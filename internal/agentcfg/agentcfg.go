@@ -189,6 +189,9 @@ const maxModelList = 200
 
 // normalizeModelList trim、丢空、去重（保序）、上限截断，并拒绝会写坏 TOML / JSON
 // 的控制字符。不做字符集校验：模型 id 由上游决定（含 : . / - 都合法）。
+//
+// 控制字符一律拒绝：写 Codex 的 config.toml 走 Go 的 %q，它把 \x01 之类输出成
+// `\x01`——TOML 不认这种转义，整份配置解析失败。只拦 \r\n\t 不够。
 func normalizeModelList(list []string) ([]string, error) {
 	if len(list) == 0 {
 		return nil, nil
@@ -203,8 +206,8 @@ func normalizeModelList(list []string) ([]string, error) {
 			continue
 		}
 
-		if strings.ContainsAny(id, "\r\n\t") {
-			return nil, fmt.Errorf("%w: 含换行/制表符 %q 的模型 id 无法写入客户端配置", errModelList, id)
+		if strings.ContainsFunc(id, isControlRune) {
+			return nil, fmt.Errorf("%w: 含控制字符 %q 的模型 id 无法写入客户端配置", errModelList, id)
 		}
 
 		if _, dup := seen[id]; dup {
@@ -220,6 +223,11 @@ func normalizeModelList(list []string) ([]string, error) {
 	}
 
 	return out, nil
+}
+
+// isControlRune 判定 C0/C1 控制字符（含 \r \n \t 与 DEL）。
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 // modelList 三家客户端共用的模型清单：Models 非空取它（已归一），否则回落单模型。
