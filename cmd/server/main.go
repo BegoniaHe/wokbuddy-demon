@@ -643,6 +643,8 @@ func configureUpstream(cfg *Config, client *upstream.Client) error {
 
 	client.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	client.ConversationRequestBody.Store(cfg.Features.ConversationRequestBody)
+	// 历史裁剪轮数（issue #99）：装配期首值，面板保存时同路径热改。
+	client.HistoryKeepTurns.Store(int64(cfg.Prompt.HistoryKeepTurns))
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -1010,6 +1012,8 @@ func applyRuntimeConfig(
 	live.Store(liveSnapshot(newCfg))
 	client3.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	client3.ConversationRequestBody.Store(newCfg.Features.ConversationRequestBody)
+	// prompt.history_keep_turns 热生效（prompt.mode / prompt.file 仍需重启）。
+	client3.HistoryKeepTurns.Store(int64(newCfg.Prompt.HistoryKeepTurns))
 	state9.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	state9.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	state9.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -1131,6 +1135,8 @@ var restartFieldPaths = []string{
 	// cn.chat_base / cn.billing_base 同样在 configureUpstream 一次性写入 client。
 	"cn.chat_base", "cn.billing_base",
 	// 提示词模式与文件在 handler 构造期解析。
+	// prompt.history_keep_turns 不在本表：它只改出站 body 的历史裁剪轮数，走
+	// upstream.Client.HistoryKeepTurns（atomic）热生效。
 	"prompt.mode", "prompt.file",
 	// Redis 客户端在启动期装配。
 	"upstash.url", "upstash.token",

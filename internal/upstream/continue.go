@@ -493,6 +493,13 @@ func mergeUsageNumbers(dst, src map[string]any) {
 
 // BuildContinuationBody 在原始请求体后追加 assistant 部分正文与续写指令。
 // 返回的新 body 仍交给 ChatStreamContext（经 prepareBody 脱敏/思考/缓存键管线）。
+// continuationInstruction 截断续写时追加的合成 user 指令。历史裁剪按「user 消息
+// 算一轮」计数，这条合成消息不算客户端的一轮（见 history.go 的 trimHistory），
+// 否则 prompt.history_keep_turns=1 时会把它顶成唯一一轮、连被续写的 partial
+// 正文一起裁掉。
+const continuationInstruction = "Continue the previous response from exactly where it stopped. " +
+	"Do not repeat any text already produced. Do not add commentary."
+
 func BuildContinuationBody(src []byte, partial string) []byte {
 	var obj map[string]any
 	if json.Unmarshal(src, &obj) != nil || obj == nil {
@@ -502,11 +509,7 @@ func BuildContinuationBody(src []byte, partial string) []byte {
 	msgs, _ := obj["messages"].([]any)
 	msgs = append(msgs,
 		map[string]any{"role": "assistant", "content": partial},
-		map[string]any{
-			"role": "user",
-			"content": "Continue the previous response from exactly where it stopped. " +
-				"Do not repeat any text already produced. Do not add commentary.",
-		},
+		map[string]any{"role": "user", "content": continuationInstruction},
 	)
 	obj["messages"] = msgs
 

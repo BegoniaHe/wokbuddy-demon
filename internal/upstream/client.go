@@ -1281,6 +1281,10 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// HistoryKeepTurns 出站历史裁剪保留轮数（0 = 关闭）。面板保存热改 + chat 热路径
+	// 并发读，用 atomic.Int64 消除数据竞争。
+	HistoryKeepTurns atomic.Int64
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认形态）。
 	// 空 = 按 realm 取部署 profile 的冻结字面量：chat/refresh/FetchModels 用
 	// emit.chatUA；report / busy 走 emit.desktopUA；billing meter 走 profile 抓包的
@@ -1595,7 +1599,9 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
+	// prompt.history_keep_turns > 0 时按轮裁剪（issue #99）；0 = 关闭，零回归。
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs,
+		int(c.HistoryKeepTurns.Load()))
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)

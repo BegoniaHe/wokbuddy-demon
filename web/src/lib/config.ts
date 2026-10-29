@@ -98,6 +98,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'upstash_token', path: ['upstash', 'token'], kind: 'password', secret: true },
   { name: 'prompt_mode', path: ['prompt', 'mode'], kind: 'select' },
   { name: 'prompt_file', path: ['prompt', 'file'], kind: 'text' },
+  { name: 'history_keep_turns', path: ['prompt', 'history_keep_turns'], kind: 'number' },
   { name: 'sanitize_blacklist_fingerprints', path: ['features', 'sanitize_blacklist_fingerprints'], kind: 'checkbox' },
   { name: 'multimodal_routing', path: ['features', 'multimodal_routing'], kind: 'checkbox' },
   { name: 'local_web_tools', path: ['features', 'local_web_tools'], kind: 'checkbox' },
