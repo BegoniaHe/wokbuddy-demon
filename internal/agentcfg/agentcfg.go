@@ -495,21 +495,30 @@ func v1Base(base string) string {
 // applyCodex 写入 Codex 配置：根键必须位于首个表头之前，provider 表追加到文末。
 // 直接追加到文件末尾会把根键写进已有 [profiles.*] 表（TOML 语义），因此这里
 // 先拆出根段再重建，并清掉同名根键避免 duplicate key。
+//
+// 托管段只放本工具写入的键与表，用户根键（注释、approval_policy 等）留在段外：
+// 否则 removeCodexBlock 整段删除会连坐用户配置，第二次 Apply 就永久丢失。
 func applyCodex(existing []byte, opts Options) ([]byte, error) {
-	text := removeCodexBlock(string(existing))
+	original := string(existing)
+	salvaged := codexBlockUserRoot(original)
+	text := removeCodexBlock(original)
+
 	root, tables := splitCodexRoot(text)
 	root = codexRootModel.ReplaceAllString(root, "")
 	root = codexRootModelProvider.ReplaceAllString(root, "")
 	root = strings.TrimSpace(root)
 
-	var builder strings.Builder
-	fmt.Fprintf(&builder, "%s\nmodel_provider = \"wokbuddy\"\nmodel = %q\n", codexStart, opts.Model)
-
-	if root != "" {
-		builder.WriteString("\n")
-		builder.WriteString(root)
-		builder.WriteString("\n")
+	if salvaged != "" {
+		root = strings.TrimSpace(salvaged + "\n" + root)
 	}
+
+	var builder strings.Builder
+	if root != "" {
+		builder.WriteString(root)
+		builder.WriteString("\n\n")
+	}
+
+	fmt.Fprintf(&builder, "%s\nmodel_provider = \"wokbuddy\"\nmodel = %q\n", codexStart, opts.Model)
 
 	fmt.Fprintf(&builder, `
 [model_providers.wokbuddy]
@@ -605,6 +614,24 @@ func codexProfileHeaderID(line string) (string, bool) {
 	}
 
 	return key, true
+}
+
+// codexBlockUserRoot 从旧版托管段里取回被写进去的用户根键。旧实现把整段根键塞进
+// 标记之间，整段删除会连坐用户配置；这里在删除前先把其中的非托管根键捞出。
+// 新格式的用户根键已在段外，此函数返回空串。
+func codexBlockUserRoot(text string) string {
+	_, after, ok := strings.Cut(text, codexStart)
+	if !ok {
+		return ""
+	}
+
+	inner, _, _ := strings.Cut(after, codexEnd)
+
+	root, _ := splitCodexRoot(inner)
+	root = codexRootModel.ReplaceAllString(root, "")
+	root = codexRootModelProvider.ReplaceAllString(root, "")
+
+	return strings.TrimSpace(root)
 }
 
 // removeCodexBlock 删除上一次写入的托管段（含标记），其余内容原样保留。

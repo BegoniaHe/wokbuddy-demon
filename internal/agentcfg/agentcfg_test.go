@@ -304,3 +304,120 @@ func TestApplyNullExistingConfig(t *testing.T) {
 		t.Fatalf("opencode provider=%v", provider)
 	}
 }
+
+// TestApplyCodexKeepsUserRootKeysOutOfBlock 用户根键与注释必须留在托管段之外，
+// 否则第二次 Apply 会随托管段一起被删掉（不可幂等）。
+func TestApplyCodexKeepsUserRootKeysOutOfBlock(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	original := "# user config\nmodel = \"o3\"\napproval_policy = \"never\"\n\n[profiles.mine]\nmodel = \"o3\"\n"
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(home, filepath.Join(home, "backups"))
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk-test", Model: "glm-5.2"}
+
+	for i := range 2 {
+		if _, err := m.Apply("codex", opts); err != nil {
+			t.Fatalf("apply #%d: %v", i+1, err)
+		}
+
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		assertCodexUserRootPreserved(t, i+1, string(raw))
+	}
+}
+
+// assertCodexUserRootPreserved 校验用户根键留在托管段外且未被重复写入。
+func assertCodexUserRootPreserved(t *testing.T, round int, text string) {
+	t.Helper()
+
+	for _, want := range []string{"# user config", `approval_policy = "never"`, `[profiles.mine]`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("apply #%d 丢失 %q:\n%s", round, want, text)
+		}
+	}
+
+	if strings.Count(text, `approval_policy =`) != 1 || strings.Count(text, codexStart) != 1 {
+		t.Fatalf("apply #%d 出现重复/缺失:\n%s", round, text)
+	}
+
+	block, ok := codexBlockSpan(text)
+	if !ok {
+		t.Fatalf("apply #%d 托管段标记缺失:\n%s", round, text)
+	}
+
+	if strings.Contains(block, "approval_policy") || strings.Contains(block, "# user config") {
+		t.Fatalf("apply #%d 用户根键被写进托管段:\n%s", round, text)
+	}
+
+	for _, want := range []string{`base_url = "http://127.0.0.1:7863/v1"`, `experimental_bearer_token = "sk-test"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("apply #%d 托管 provider 表残缺 %q:\n%s", round, want, text)
+		}
+	}
+}
+
+// codexBlockSpan 返回托管段内容（不含标记），标记缺失时返回 false。
+func codexBlockSpan(text string) (string, bool) {
+	_, after, ok := strings.Cut(text, codexStart)
+	if !ok {
+		return "", false
+	}
+
+	block, _, ok := strings.Cut(after, codexEnd)
+
+	return block, ok
+}
+
+// TestApplyCodexSalvagesLegacyBlock 旧格式把用户根键写进了托管段：重建时应先捞出
+// 再删除段，避免升级即丢配置。
+func TestApplyCodexSalvagesLegacyBlock(t *testing.T) {
+	t.Parallel()
+	home := t.TempDir()
+
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := codexStart + "\nmodel_provider = \"wokbuddy\"\nmodel = \"m1\"\n\n" +
+		"# user config\napproval_policy = \"never\"\n\n" +
+		"[model_providers.wokbuddy]\nname = \"WokBuddy Demon\"\n" + codexEnd + "\n"
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(home, filepath.Join(home, "backups"))
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk-test", Model: "glm-5.2"}
+
+	if _, err := m.Apply("codex", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	text := string(raw)
+	for _, want := range []string{"# user config", `approval_policy = "never"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("旧格式用户根键未保留 %q:\n%s", want, text)
+		}
+	}
+
+	if strings.Count(text, "model =") != 1 || !strings.Contains(text, `experimental_bearer_token = "sk-test"`) {
+		t.Fatalf("旧格式重建结果异常:\n%s", text)
+	}
+}
