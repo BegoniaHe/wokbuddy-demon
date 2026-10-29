@@ -3236,3 +3236,82 @@ func TestContentBlocked11128PersonaNotSplit(t *testing.T) {
 		t.Fatalf("人格句不该被拆成多条 system: %s", bodies[1])
 	}
 }
+
+// channelRefusedBody 11-128「通道校验失败」上游原文（码 + request illegal 双条件）。
+const channelRefusedBody = `{"code":"11-128","msg":"request illegal"}`
+
+// TestChannelRefusedSplitsSystemInsteadOfRotating 11-128 与 11128 同属「system 连续原文」
+// 拦截：同样先按句界拆 system 同号重试（issue #389），拆完 200 就不换号、不罚号。
+func TestChannelRefusedSplitsSystemInsteadOfRotating(t *testing.T) {
+	t.Parallel()
+
+	var bodies [][]byte
+
+	client := recordChatUpstream(&bodies, func(n int, _ []byte) *http.Response {
+		if n == 1 {
+			return errorJSON(http.StatusBadRequest, channelRefusedBody)
+		}
+
+		return streamOK()
+	})
+	// 单账号池：拆句重试必须落在同一个号上，否则这次重试根本拿不到（tried 已记）。
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(newChatBody(t, sysLong, "true"))))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s (want 200 after sentence-split retry)", rec.Code, rec.Body)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (11-128 + split retry), got %d", len(bodies))
+	}
+
+	assertSentenceSplit(t, bodies[1])
+
+	if handler.degrade.Active() {
+		t.Fatal("11-128 拆句重试不该触发全局降级窗口")
+	}
+
+	if total, healthy, cooling, disabled, _ := accounts.CountsDetailed(); total != 1 || healthy != 1 ||
+		cooling != 0 || disabled != 0 {
+		t.Fatalf("账号状态被改动: total=%d healthy=%d cooling=%d disabled=%d", total, healthy, cooling, disabled)
+	}
+}
+
+// TestContentBlockedWithoutUnapprovedCodeNotSplit 无 11128 码的内容拦截（按词命中，拆句
+// 无效）不走拆句：仍按既有人设保护逻辑落到中性降级重试。
+func TestContentBlockedWithoutUnapprovedCodeNotSplit(t *testing.T) {
+	t.Parallel()
+
+	var bodies [][]byte
+
+	client := recordChatUpstream(&bodies, func(int, []byte) *http.Response {
+		return errorJSON(http.StatusBadRequest, `{"code":"11-128","msg":"unsafe content"}`)
+	})
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(newChatBody(t, sysLong, "true"))))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 (content blocked)", rec.Code)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (block + degraded retry), got %d", len(bodies))
+	}
+
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Fatalf("非 11128 的内容拦截应走中性降级: %s", bodies[1])
+	}
+
+	if strings.Count(string(bodies[1]), `"role":"system"`) != 1 {
+		t.Fatalf("非 11128 的内容拦截不该拆句: %s", bodies[1])
+	}
+}
