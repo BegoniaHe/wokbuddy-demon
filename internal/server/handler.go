@@ -2931,6 +2931,9 @@ func shouldWarnStopWithoutToolCalls(declared, calls int, finishReason, outcome s
 // tool_calls」的回合（issue #44）。这类终态在上游侧是合法的，但 agent 客户端会
 // 判定回合正常完成 → 工具一次没跑、任务静默停住。网关侧此前完全无痕，这里只加
 // 观测：不重试、不补帧、不改 finish_reason（判据与处置留待后续 issue）。
+//
+// model 用 f.bareModel（出站真名）而非 st.model（客户端原始请求名，可能带
+// realm 前缀或别名）：与相邻 WARN 同口径，且请求流水行已经打印过后者。
 func (f *chatFlow) warnStopWithoutToolCalls(finishReason string) {
 	if !shouldWarnStopWithoutToolCalls(
 		f.st.toolsDeclared, f.st.toolCalls, finishReason, f.st.outcome,
@@ -2940,7 +2943,7 @@ func (f *chatFlow) warnStopWithoutToolCalls(finishReason string) {
 
 	log.Printf("WARN: [server] %s acct=%s model=%s: finish_reason=stop without tool_calls "+
 		"despite %d tool(s) declared (client will treat the turn as completed; tools never ran)",
-		f.st.mode, logfmt.Label(f.st.uid, f.st.nick), f.st.model, f.st.toolsDeclared)
+		f.st.mode, logfmt.Label(f.st.uid, f.st.nick), f.bareModel, f.st.toolsDeclared)
 }
 
 // retryZeroOutputLength 处理 finish_reason=length 且零输出：同额度关闭 thinking
