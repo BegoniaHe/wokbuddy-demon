@@ -3330,11 +3330,7 @@ func (f *chatFlow) handleNonStreamSuccess(
 	rc.Close()
 
 	if err != nil {
-		if payload := upstream.ErrorFramePayload(err); payload != "" {
-			return f.handleNonStreamErrorFrame(ctx, acct, payload, attemptStarted, i)
-		}
-
-		return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
+		return f.handleNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
 	}
 
 	if action, handled := f.retryNonStreamZeroOutput(ctx, acct, resp, attemptStarted, i); handled {
@@ -3591,9 +3587,57 @@ func (f *chatFlow) setCacheTokensFromUsage(usageMap map[string]any) {
 
 // retryNonStreamAggregateError 处置空流 / EOF 截断：截断的 content 不是完整回答，
 // 绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试；轮转耗尽才回 502。
+// handleNonStreamAggregateError 非流式聚合失败的三路分流：
+//  1. 上游 error 帧：按帧内容分类（与流式同口径）；
+//  2. 调用方已断开（ctx 取消）：interrupted/499，不是上游解析失败（issue #404）；
+//  3. 其余（真截断/坏帧/超限）：502 upstream_parse 并换号。
+func (f *chatFlow) handleNonStreamAggregateError(
+	ctx context.Context, acct *auth.Auth, err error, attemptStarted time.Time, i int,
+) rotationAction {
+	if payload := upstream.ErrorFramePayload(err); payload != "" {
+		return f.handleNonStreamErrorFrame(ctx, acct, payload, attemptStarted, i)
+	}
+
+	if ctx.Err() != nil {
+		return f.nonStreamCallerGone(acct, err, attemptStarted)
+	}
+
+	return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
+}
+
+// clientClosedRequestStatus 499「客户端已断开」：非标准但业界通用（nginx 约定），
+// 只进请求日志与指标，不写进响应体（连接已关）。
+const clientClosedRequestStatus = 499
+
+// nonStreamCallerGone 非流式聚合期间调用方已断开（ctx 取消，issue #404）：上游帧可能
+// 完好，只是聚合读被打断——这不该记成上游解析失败（502 upstream_parse），否则 CDN /
+// 反代回源超时（Cloudflare 100s、EdgeOne 15s、nginx 60s 都是正常工作范围）会被算成
+// 上游故障，`upstream_parse` 这个信号也就不再可信。
+//
+// 处置与流式同名分支一致：账号照常记成功（不冷却、不喂连败、不轮换），请求日志记
+// interrupted + 499，不写响应体。返回 rotDone 表示「请求到此为止，不要再写响应」。
+func (f *chatFlow) nonStreamCallerGone(acct *auth.Auth, err error, attemptStarted time.Time) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.noteSuccessAndBind(acct)
+
+	f.st.status = clientClosedRequestStatus
+	f.st.outcome = reqlog.OutcomeInterrupted
+
+	log.Printf("INFO: [server] non-stream acct=%s model=%s: caller gone (ctx canceled before response): %v",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, err)
+
+	return rotDone
+}
+
 func (f *chatFlow) retryNonStreamAggregateError(
 	ctx context.Context, acct *auth.Auth, err error, attemptStarted time.Time, i int,
 ) rotationAction {
+	// 入口再判一次调用方是否已断开：调用方在本函数执行前断连时，这里同样不能把
+	// 「人走了」记成上游解析失败（issue #404）。
+	if ctx.Err() != nil {
+		return f.nonStreamCallerGone(acct, err, attemptStarted)
+	}
+
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	// fail：释放本次在途租约（否则下一轮 heldUID 被覆盖后该账号名额永不归还）
 	// + 失败号正是粘性号时解绑。
