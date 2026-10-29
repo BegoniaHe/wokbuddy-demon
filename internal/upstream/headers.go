@@ -833,17 +833,21 @@ func (c *Client) attributionClientName() string {
 }
 
 // privateDataHeaderValue 返回 CLI chat 的 X-Private-Data 取值。
-// CN 5.9.3 官方 `applyPrivateDataHeaderPolicy` 在个人号的默认分支发 false，
-// 企业号因 `isEnterpriseEditionAccount`（enterpriseId 非空或 type 为
-// ultimate / exclusive）命中同一判定而发 true；global 基线仍是 5.8.4，
-// 只走 `DisableYuanbaoChannel=true` → `h=false` → true，等 global 升到 5.9.x
-// 后按同一逻辑复核。
+//
+// 官方 5.9.3（CN 与 global 同源同形）该头是「模型优化开关」的派生值：
+// `resolveModelOptimizationEnabled` 在个人号默认开 → 发 false；企业版默认关 → 发
+// true。判据只有 `isEnterpriseEditionAccount`（enterpriseId 非空或 type 为
+// ultimate / exclusive），**与域无关**。
+//
+// global 5.8.4 时代按 `DisableYuanbaoChannel=true` 一律发 true 的旧口径已随 global
+// 升到 5.9.3 作废（issue #400）：两域共用同一口径，global 个人号同样发 false。
+//
 // 远端 abTest（DefaultModelOptimizationOff）与会话 meta `privateDataSticky`
 // 都不在网关范围：本仓没有这两类状态来源，只对齐静态默认分支。
 // 桌面专家 chat 路径不走本函数：官方桌面 `applyGatewayHeaders` 的兜底表
 // 硬编码 true，见 setDesktopExpertHeaders。
 func privateDataHeaderValue(account *auth.Auth) string {
-	if account != nil && (account.IsGlobal() || account.IsEnterpriseEdition()) {
+	if account != nil && account.IsEnterpriseEdition() {
 		return "true"
 	}
 
