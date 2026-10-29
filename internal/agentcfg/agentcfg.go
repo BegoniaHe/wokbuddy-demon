@@ -207,7 +207,8 @@ func normalizeAPIKey(opts *Options) error {
 	}
 
 	if strings.ContainsFunc(opts.APIKey, isControlRune) {
-		return fmt.Errorf("api_key 含控制字符 %q，无法写入客户端配置: %w", opts.APIKey, errAPIKey)
+		// 不回显密钥本体或片段：该错误会经面板 agentsApply 原样回给 HTTP 调用方。
+		return fmt.Errorf("api_key 含控制字符，无法写入客户端配置: %w", errAPIKey)
 	}
 
 	return nil

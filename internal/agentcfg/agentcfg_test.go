@@ -435,6 +435,9 @@ func TestValidateOptionsRejectsControlCharsInAPIKey(t *testing.T) {
 		opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: bad, Model: "glm-5.2"}
 		if err := validateOptions(&opts); !errors.Is(err, errAPIKey) {
 			t.Fatalf("api_key %q 应被拒绝，得到 %v", bad, err)
+		} else if strings.Contains(err.Error(), "sk") || strings.Contains(err.Error(), bad) {
+			// 错误会经面板 agentsApply 回给调用方：不得回显密钥本体或片段。
+			t.Fatalf("api_key 校验错误回显了密钥: %v", err)
 		}
 	}
 }
