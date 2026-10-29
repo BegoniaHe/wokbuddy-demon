@@ -12,34 +12,21 @@ import (
 // trimHistory 保留开头连续 system/developer 消息 + 倒数第 keep 条 user 起的尾部。
 // keep <= 0 或消息数不足时原样返回（dropped=0）。
 //
-// 「一轮」= 一条 user 消息（含多模态 content 的 user 消息）；tool / assistant 不参与计数。
+// 「一轮」= 一条 user 消息（含多模态 content 的 user 消息）；tool / assistant 与网关
+// 自己追加的截断续写指令不参与计数。
 // 裁剪起点之前的消息：仅当全是 system/developer 时才保留在头部，其余整体丢弃——保证
 // 「开头连续」语义，不出现「system → 被删段 → 保留 system」的荒谬结果。
 func trimHistory(msgs []any, keep int) (out []any, dropped int) {
 	if keep <= 0 || len(msgs) == 0 {
 		return msgs, 0
 	}
-	// 从尾部往前数第 keep 条 user 的下标即裁剪起点。
-	start := -1
-	seen := 0
 
-	for i, m := range slices.Backward(msgs) {
-		if messageRole(m) != "user" {
-			continue
-		}
-
-		seen++
-		if seen == keep {
-			start = i
-
-			break
-		}
-	}
-
+	start := trimStart(msgs, keep)
 	if start < 0 {
 		// 本请求 user 消息数 <= keep：原样不动。
 		return msgs, 0
 	}
+
 	// 头部只保留开头连续 system/developer；遇到第一条非 system/developer 即停。
 	head := 0
 	for head < start && isSystemRole(messageRole(msgs[head])) {
@@ -56,6 +43,25 @@ func trimHistory(msgs []any, keep int) (out []any, dropped int) {
 	out = append(out, msgs[start:]...)
 
 	return out, start - head
+}
+
+// trimStart 从尾部往前数第 keep 条「客户端 user 消息」的下标；不足 keep 条返回 -1。
+// 网关自己追加的续写指令不算一轮（见 isContinuationInstruction）。
+func trimStart(msgs []any, keep int) int {
+	seen := 0
+
+	for i, m := range slices.Backward(msgs) {
+		if messageRole(m) != "user" || isContinuationInstruction(m) {
+			continue
+		}
+
+		seen++
+		if seen == keep {
+			return i
+		}
+	}
+
+	return -1
 }
 
 // trimHistoryInObj 对出站 body 应用按轮裁剪：切片 + 孤儿 tool 配对清理 + 一行 INFO。
@@ -99,6 +105,21 @@ func messageRole(msg any) string {
 	role, _ := m["role"].(string)
 
 	return role
+}
+
+// isContinuationInstruction 判定网关自己追加的截断续写指令（continue.go 的
+// continuationInstruction）。它不是客户端的一轮对话，不能参与按轮计数：否则
+// keep=1 时裁剪起点落到这条合成消息上，被续写的 partial 正文与被追问的原始
+// 轮次一起被丢掉，续写请求只剩「继续写」一句。
+func isContinuationInstruction(msg any) bool {
+	m, ok := msg.(map[string]any)
+	if !ok {
+		return false
+	}
+
+	content, _ := m["content"].(string)
+
+	return content == continuationInstruction
 }
 
 // isSystemRole 提示词类角色：system 与 developer（OpenAI 新口径）一律视同。

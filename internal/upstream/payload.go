@@ -73,7 +73,7 @@ func PrepareBodyOptWithEffortsAndDefault(
 		obj["messages"] = msgs
 	}
 
-	trimHistoryInObj(obj, historyKeepTurns) // issue #99：必须排在配对三步之后
+	trimHistoryInObj(obj, historyKeepTurns) // issue #99：排在配对三步之后
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。

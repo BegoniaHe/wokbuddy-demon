@@ -252,3 +252,26 @@ func TestPrepareBodyTrimsHistory(t *testing.T) {
 		t.Fatalf("keep=0 消息数 = %d, want 6", len(got.Messages))
 	}
 }
+
+// TestTrimHistoryIgnoresContinuationInstruction 截断续写会追加一条合成的 user
+// 指令：它不算客户端的一轮，否则 keep=1 时裁剪起点落在它上面，被续写的 partial
+// 正文一起被裁掉，续写请求退化成「继续写」一句。
+func TestTrimHistoryIgnoresContinuationInstruction(t *testing.T) {
+	t.Parallel()
+
+	msgs := toAny([]map[string]any{
+		msg("system", "sys"),
+		msg("user", "u1"),
+		msg("assistant", "partial"),
+		{"role": "user", "content": continuationInstruction, "tag": "cont"},
+	})
+
+	out, dropped := trimHistory(msgs, 1)
+	if want := []string{"sys", "u1", "partial", "cont"}; !reflect.DeepEqual(tags(out), want) {
+		t.Fatalf("输出 = %v, want %v（合成指令不得顶掉客户端那一轮）", tags(out), want)
+	}
+
+	if dropped != 0 {
+		t.Fatalf("dropped = %d, want 0", dropped)
+	}
+}
