@@ -419,3 +419,61 @@ func TestResolveRealm(t *testing.T) {
 		}
 	}
 }
+
+// TestSnapshotKeepsRealmAndFields 快照必须逐字段拷全，尤其 realm：
+// 只拷 domain 的快照会让「只写了 realm」的 global 账号被判成 cn。
+func TestSnapshotKeepsRealmAndFields(t *testing.T) {
+	t.Parallel()
+
+	account := &Auth{
+		AccessToken: "at", RefreshToken: "rt", ExpiresAt: 42,
+		Domain: "www.workbuddy.ai", UID: "u1", EnterpriseID: "e1",
+		EditionType: "personal", IDSource: "key", DepartmentFullName: "d",
+		Nickname: "nick", DeviceToken: "dt", FilePath: "/tmp/a.json",
+	}
+	if _, err := BackfillRealmFor(account, "global"); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := account.Snapshot()
+	if got := snap.Realm(); got != "global" {
+		t.Fatalf("snapshot realm=%q want global", got)
+	}
+
+	// 清掉 domain 后仍应按快照的 realm 判域（只写 realm 的登录路径形态）。
+	snap.Domain = ""
+	if got := snap.Realm(); got != "global" {
+		t.Fatalf("realm-only snapshot realm=%q want global", got)
+	}
+
+	// 逐字段比对（不用 %+v：Auth 含 sync.Mutex，按值打印会触发 copylocks）。
+	for _, field := range []struct {
+		name      string
+		got, want string
+	}{
+		{"AccessToken", snap.AccessToken, "at"},
+		{"RefreshToken", snap.RefreshToken, "rt"},
+		{"UID", snap.UID, "u1"},
+		{"EnterpriseID", snap.EnterpriseID, "e1"},
+		{"EditionType", snap.EditionType, "personal"},
+		{"IDSource", snap.IDSource, "key"},
+		{"DepartmentFullName", snap.DepartmentFullName, "d"},
+		{"Nickname", snap.Nickname, "nick"},
+		{"DeviceToken", snap.DeviceToken, "dt"},
+		{"FilePath", snap.FilePath, "/tmp/a.json"},
+	} {
+		if field.got != field.want {
+			t.Errorf("snapshot %s=%q want %q", field.name, field.got, field.want)
+		}
+	}
+
+	if snap.ExpiresAt != 42 {
+		t.Errorf("snapshot ExpiresAt=%d want 42", snap.ExpiresAt)
+	}
+
+	// nil 安全。
+	nilSnap := (*Auth)(nil).Snapshot()
+	if got := nilSnap.Realm(); got != "cn" {
+		t.Fatalf("nil snapshot realm=%q want cn", got)
+	}
+}

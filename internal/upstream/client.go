@@ -2035,20 +2035,11 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
 	defer cancel()
 
-	// RefreshHeaders 读取 a 的字段（domain/uid 等）注入请求头——需在锁内取快照值，
-	// 用一个显式逐字段拷贝的临时 auth 构造头（不拷贝 sync.Mutex，避免 vet copies-lock）。
-	account10.Lock()
-	hdrSnapshot := auth.Auth{
-		AccessToken:  account10.AccessToken,
-		RefreshToken: rtSnapshot,
-		ExpiresAt:    account10.ExpiresAt,
-		Domain:       account10.Domain,
-		UID:          account10.UID,
-		EnterpriseID: account10.EnterpriseID,
-		Nickname:     account10.Nickname,
-		DeviceToken:  account10.DeviceToken,
-	}
-	account10.Unlock()
+	// RefreshHeaders 读取快照的字段（domain/realm/uid 等）注入请求头，refreshAt 也
+	// 用它做账号出口选路——故必须走 Auth.Snapshot（锁内逐字段拷贝，含 realm）；
+	// 手写字段表会漏 realm，把只写了 realm 的 global 账号判成 cn。
+	hdrSnapshot := account10.Snapshot()
+	hdrSnapshot.RefreshToken = rtSnapshot
 
 	var data json.RawMessage
 
