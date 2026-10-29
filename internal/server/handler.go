@@ -2840,8 +2840,12 @@ func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr
 	f.lastErr = &upstream.Error{Kind: kind, Status: f.st.status, Msg: msg}
 }
 
-// queueRetryAfterSeconds 队列/容量类响应的 Retry-After 秒数：优先采信上游信封里的
-// 重置时间，缺失或非正数时给保守 5s（6020/6021 共用同一兜底）。
+// queueRetryAfterSeconds 队列/容量类响应的 Retry-After 秒数：优先采信上游响应头
+// （`Retry-After` / `Retry-After-Ms` / `X-Ratelimit-Reset`，见 upstream.ParseRetryAfter）
+// 明示的重置时间，缺失或非正数时给保守 5s（6020/6021 共用同一兜底）。
+//
+// 上游把等待时长写在 **body** 的 `data.retry_after` 时这里读不到（本仓只解析响应头），
+// 一律落 5s 兜底——比上游要求的更早重试一次，不改变语义，故不在本次范围内扩面。
 func queueRetryAfterSeconds(uerr *upstream.Error) int {
 	const fallback = 5
 
