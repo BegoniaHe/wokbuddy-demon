@@ -1429,7 +1429,9 @@ type chatFlow struct {
 	lastErr         error
 	modelBlock      pool.ModelBlockStatus
 	degradedApplied bool
-	heldUID         string
+	// splitRetried 是否已因 11128「渠道未授权」把 system 按句界拆开重试过（只重试一次）。
+	splitRetried bool
+	heldUID      string
 	// 请求级积分预扣（issue #116 P1-1）：reservedUID 非空时释放时归还。
 	reservedUID     string
 	reservedCredits float64
@@ -2571,9 +2573,33 @@ func (f *chatFlow) handleTransportError(
 	return rotContinue
 }
 
-// retryContentBlocked 内容拦截首次命中时切降级提示词同请求重试。
-func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth) bool {
-	if kind != upstream.ErrContentBlocked || !f.canDegrade() || f.degradedApplied {
+// retryContentBlocked 内容拦截的同号重试：11128 先按句界拆 system 保住客户端人设，
+// 拆句不适用或拆完仍被拦才回落到既有中性降级重试。
+//
+// 顺序即优先级（issue #389）：
+//  1. 11128「渠道未授权」：上游按 system 里的连续原文匹配，把多句长 system 按句界拆成
+//     两条即可绕开（实测 200），客户端人设/项目约定逐字保留。只重试一次；不换号、不罚
+//     号、不计连败，也**不**触发全局降级窗口——degrade.Trigger 会把整池降到次日 0 点，
+//     代价远大于一次重试。
+//  2. 拆句不适用（人格句这类拆开会废指令的短段）或仍被拦：回落到中性提示词降级重试
+//     （既有兜底，保留）。
+func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth, respBody []byte) bool {
+	if kind != upstream.ErrContentBlocked || !f.canDegrade() {
+		return false
+	}
+
+	if body, ok := f.splitSystemRetry(respBody); ok {
+		f.body = body
+		f.splitRetried = true
+		delete(f.tried, acct.UID) // 同号重试：单账号池也要拿到这一次机会
+		f.releaseHeld()
+		log.Printf("INFO: [server] 11128 acct=%s model=%s: retry with sentence-split system (persona kept)",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return true
+	}
+
+	if f.degradedApplied {
 		return false
 	}
 
@@ -2585,6 +2611,20 @@ func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth) b
 	log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
 
 	return true
+}
+
+// splitSystemRetry 判定并构造「按句界拆 system」的同号重试 body：只在 11128 形态、且
+// 入站 body 里确有可拆的多句 system 段（拆完 ≥2 条、每条不止一句）时生效。
+//
+// 拆句在**入站 body**（f.body）上做：ChatStreamContext 内部会重新 prepareBody，
+// 因此这里只需替换 f.body。请求级聚合（conversationRequestID / 会话头）在轮转前
+// 已由 buildChatMeta 定型，不受 body 改写影响。
+func (f *chatFlow) splitSystemRetry(respBody []byte) ([]byte, bool) {
+	if f.splitRetried || f.degradedApplied || !upstream.IsUnapprovedChannel(string(respBody)) {
+		return nil, false
+	}
+
+	return prompt.SplitSystemBySentences(f.body)
 }
 
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
@@ -2615,7 +2655,7 @@ func (f *chatFlow) handleHTTPError(
 	// 到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append 降级重试同样退化
 	// 为 replace——原文在场只会确定性再撞 400）。第二次仍被拦 → 回内容防火墙错误。
 	// 内容问题非账号问题：applyErrorPolicy 不罚账号。
-	if f.retryContentBlocked(kind, acct) {
+	if f.retryContentBlocked(kind, acct, respBody) {
 		return rotContinue
 	}
 	// 队列/并发业务码（6020/6021/6022）：账号本身健康，换号不会改变队列位置；

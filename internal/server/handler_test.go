@@ -2020,13 +2020,13 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 		})},
 		ChatBaseCN: "https://fake.example",
 	}
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	h := NewHandler(&Config{Pool: p, Upstream: client, PromptMode: "passthrough"})
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"原始指纹"},{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s (want 200 after degraded retry)", rec.Code, rec.Body)
@@ -3025,5 +3025,214 @@ func TestChatStickySoftEscapeFallsBackWhenNoAlternative(t *testing.T) {
 
 	if used != "Bearer at-busy" {
 		t.Fatalf("单号池应回落原号: authz=%q", used)
+	}
+}
+
+// sysLong 4 句长 system（最少可拆形态：拆成 2+2，每条都不是单句）。
+const sysLong = "You are a coding agent. " +
+	"You may read files under the project root. " +
+	"Relative paths resolve against the project root. " +
+	"Never claim to have read a file before reading it."
+
+// sysPersona 人格句：单句短指令，拆开会废掉指令，不得进入拆句路径。
+const sysPersona = "You are a helpful assistant."
+
+// unapprovedChannelBody 11128「渠道未授权」上游原文（实测形态）。
+const unapprovedChannelBody = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`
+
+// newChatBody 组装一次 chat 请求体（system 内容按参数注入）。
+func newChatBody(t *testing.T, system, stream string) string {
+	t.Helper()
+
+	sys, err := json.Marshal(system)
+	if err != nil {
+		t.Fatalf("marshal system: %v", err)
+	}
+
+	return `{"model":"glm-5.2","stream":` + stream + `,"messages":[` +
+		`{"role":"system","content":` + string(sys) + `},` +
+		`{"role":"user","content":"hi"}]}`
+}
+
+// captureUpstream 记录每次出站 body，并按 respond(第几次调用, body) 决定响应。
+func recordChatUpstream(bodies *[][]byte, respond func(n int, body []byte) *http.Response) *upstream.Client {
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			*bodies = append(*bodies, raw)
+
+			return respond(len(*bodies), raw), nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+}
+
+// errorJSON / streamOK 造两种响应（内容拦截 / SSE 成功）。
+func errorJSON(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func streamOK() *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sseOK)),
+	}
+}
+
+// TestContentBlocked11128SplitsSystemInsteadOfDegrading 11128「渠道未授权」先按句界拆
+// system 同号重试：客户端人设/项目约定逐字保留（不整段换成中性提示词），且不打开全局
+// 降级窗口（issue #389）。仅重试一次、不换号（两个请求都打到同一个账号）。
+func TestContentBlocked11128SplitsSystemInsteadOfDegrading(t *testing.T) {
+	t.Parallel()
+
+	var bodies [][]byte
+
+	client := recordChatUpstream(&bodies, func(n int, _ []byte) *http.Response {
+		if n == 1 {
+			return errorJSON(http.StatusBadRequest, unapprovedChannelBody)
+		}
+
+		return streamOK()
+	})
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(newChatBody(t, sysLong, "true"))))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s (want 200 after sentence-split retry)", rec.Code, rec.Body)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("want 2 upstream calls (400 + split retry), got %d", len(bodies))
+	}
+
+	assertSentenceSplit(t, bodies[1])
+
+	if handler.degrade.Active() {
+		t.Fatal("11128 拆句重试不该触发全局降级窗口")
+	}
+}
+
+// assertSentenceSplit 断言重试 body 已按句界拆成两条 system，且原文与中性提示词互不
+// 混入（拆句救援的两条硬要求）。
+func assertSentenceSplit(t *testing.T, body []byte) {
+	t.Helper()
+
+	var retry struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &retry); err != nil {
+		t.Fatalf("retry body not json: %v (%s)", err, body)
+	}
+
+	systems := 0
+	personaKept := false
+
+	for _, msg := range retry.Messages {
+		if msg.Role != "system" {
+			continue
+		}
+
+		systems++
+
+		if strings.Contains(msg.Content, "read files under the project root") {
+			personaKept = true
+		}
+	}
+
+	if systems != 2 {
+		t.Fatalf("retry body want 2 system messages (sentence split), got %d: %s", systems, body)
+	}
+
+	if !personaKept {
+		t.Fatalf("拆句后客户端 system 内容丢失: %s", body)
+	}
+
+	if strings.Contains(string(body), prompt.Degraded) {
+		t.Fatalf("拆句路径不该换成中性提示词: %s", body)
+	}
+}
+
+// TestContentBlocked11128StillBlockedFallsBackToDegraded 拆句后仍 11128 → 回落到既有中性
+// 降级兜底（只透传上游原文），账号状态零变化：不冷却、不禁用、不喂连败。
+func TestContentBlocked11128StillBlockedFallsBackToDegraded(t *testing.T) {
+	t.Parallel()
+
+	var bodies [][]byte
+
+	client := recordChatUpstream(&bodies, func(int, []byte) *http.Response {
+		return errorJSON(http.StatusBadRequest, unapprovedChannelBody)
+	})
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(newChatBody(t, sysLong, "true"))))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 (still blocked)", rec.Code)
+	}
+	// 上游原文透传（首个错误即唯一错误，body 三次相同）。
+	if !strings.Contains(rec.Body.String(), "11128") {
+		t.Fatalf("应透传上游原文: %s", rec.Body)
+	}
+	// 拆句一次 + 中性降级一次 = 第三次仍是首个 400，不再重试。
+	if len(bodies) != 3 {
+		t.Fatalf("want 3 upstream calls (400 + split retry + degraded retry), got %d", len(bodies))
+	}
+
+	if !strings.Contains(string(bodies[2]), prompt.Degraded) {
+		t.Fatalf("兜底重试应为中性提示词: %s", bodies[2])
+	}
+	// 账号状态零变化：没有冷却、没有禁用。
+	total, healthy, cooling, disabled, _ := accounts.CountsDetailed()
+	if total != 1 || healthy != 1 || cooling != 0 || disabled != 0 {
+		t.Fatalf("账号状态被改动: total=%d healthy=%d cooling=%d disabled=%d", total, healthy, cooling, disabled)
+	}
+}
+
+// TestContentBlocked11128PersonaNotSplit 人格句（单句短指令）不拆：拆开会废掉指令，
+// 直接走既有中性降级兜底。
+func TestContentBlocked11128PersonaNotSplit(t *testing.T) {
+	t.Parallel()
+
+	var bodies [][]byte
+
+	client := recordChatUpstream(&bodies, func(n int, _ []byte) *http.Response {
+		if n == 1 {
+			return errorJSON(http.StatusBadRequest, unapprovedChannelBody)
+		}
+
+		return streamOK()
+	})
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(newChatBody(t, sysPersona, "true"))))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s (want 200 after degraded retry)", rec.Code, rec.Body)
+	}
+	// 人格句没拆 → 直接降级：第二次出站 body 是中性提示词、只有一条 system。
+	if !strings.Contains(string(bodies[1]), prompt.Degraded) {
+		t.Fatalf("人格句应走降级兜底而不是拆句: %s", bodies[1])
+	}
+
+	if strings.Count(string(bodies[1]), `"role":"system"`) != 1 {
+		t.Fatalf("人格句不该被拆成多条 system: %s", bodies[1])
 	}
 }
