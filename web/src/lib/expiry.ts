@@ -25,6 +25,63 @@ export function expDaysLeft(dateStr: string, today: Date): number {
   return Math.round((new Date(dateStr + 'T00:00:00').getTime() - today.getTime()) / 86400000);
 }
 
+// ExpiryDayTotal 某自然日全站到期合计。
+export interface ExpiryDayTotal {
+  date: string;
+  remain: number;
+  accounts: number;
+}
+
+// ExpiryRealmTotal 单个 realm 的按日合计（realm 空按 cn）。
+export interface ExpiryRealmTotal {
+  realm: string;
+  rows: ExpiryDayTotal[];
+  accounts: number;
+}
+
+// realmRank realm 分块顺序：cn 在前、global 次之，其它（上游新增域）垫底。
+function realmRank(realm: string): number {
+  if (realm === 'cn') return 0;
+  if (realm === 'global') return 1;
+  return 2;
+}
+
+// expTotals 跨账号按自然日合计（口径与 expBatches 一致：只算未过期、remain>0 的批次）。
+// 逐账号复用 expBatches，不另写一套归并逻辑；上游已按自然日聚合，因此按 date 字符串
+// 分组即为自然日口径，不做任何时区换算。error 账号的 packages 不可信，直接跳过。
+export function expTotals(
+  accts: { realm?: string; error?: string; packages?: Package[] }[],
+  today: Date,
+): ExpiryRealmTotal[] {
+  const byRealm = new Map<string, { rows: Map<string, ExpiryDayTotal>; accounts: number }>();
+  for (const a of accts || []) {
+    if (a.error) continue;
+    const realm = (a.realm || '').trim().toLowerCase() || 'cn';
+    const batches = expBatches(a.packages).filter((b) => expDaysLeft(b.date, today) >= 0);
+    if (!batches.length) continue;
+    let bucket = byRealm.get(realm);
+    if (!bucket) {
+      bucket = { rows: new Map(), accounts: 0 };
+      byRealm.set(realm, bucket);
+    }
+    bucket.accounts += 1;
+    for (const b of batches) {
+      // expBatches 已把账号内同日多批合并，这里每个日期对同一账号只累加一次账号数。
+      const row = bucket.rows.get(b.date) || { date: b.date, remain: 0, accounts: 0 };
+      row.remain += b.remain;
+      row.accounts += 1;
+      bucket.rows.set(b.date, row);
+    }
+  }
+  return [...byRealm.entries()]
+    .sort((x, y) => realmRank(x[0]) - realmRank(y[0]) || (x[0] < y[0] ? -1 : 1))
+    .map(([realm, v]) => ({
+      realm,
+      accounts: v.accounts,
+      rows: [...v.rows.values()].sort((x, y) => (x.date < y.date ? -1 : 1)),
+    }));
+}
+
 // ExpiryBucket 上游快照里的逐日到期批次（与「检查」明细同口径的按日聚合）。
 export interface ExpiryBucket {
   date?: string;
