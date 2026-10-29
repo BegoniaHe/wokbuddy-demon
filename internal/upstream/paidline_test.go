@@ -32,8 +32,18 @@ func TestIsEligiblePaidLineUser(t *testing.T) {
 		{"personal", &auth.Auth{UID: "u1", EditionType: "personal"}, true},
 		{"pro", &auth.Auth{UID: "u1", EditionType: "pro"}, true},
 		{"PRO 大写", &auth.Auth{UID: "u1", EditionType: " PRO "}, true},
-		// 排除表不可得 → 不排除：带 enterpriseId 的 pro 仍按 eligible 处理。
-		{"pro 带 enterpriseId", &auth.Auth{UID: "u1", EditionType: "pro", EnterpriseID: "ent-1"}, true},
+		{"pro 带普通 enterpriseId", &auth.Auth{UID: "u1", EditionType: "pro", EnterpriseID: "ent-1"}, true},
+		// 官方排除表 yae：与 isIOAEnterpriseId 同一份常量，命中即不 eligible。
+		{
+			"personal 命中排除表 A",
+			&auth.Auth{UID: "u1", EditionType: "personal", EnterpriseID: "esoikz80kd8g"},
+			false,
+		},
+		{
+			"personal 命中排除表 B（首尾空白）",
+			&auth.Auth{UID: "u1", EditionType: "personal", EnterpriseID: " etahzsqej0n4 "},
+			false,
+		},
 		{"ultimate", &auth.Auth{UID: "u1", EditionType: "ultimate"}, false},
 		{"exclusive", &auth.Auth{UID: "u1", EditionType: "Exclusive"}, false},
 		{"无版本号", &auth.Auth{UID: "u1"}, false},
@@ -70,6 +80,12 @@ func TestApplyPaidLineFilterHidesOnlyHitPaidIDs(t *testing.T) {
 		{"无版本号不生效", &auth.Auth{UID: "u1"}, capHit, false},
 		{"无配置不生效", &auth.Auth{UID: "u1", EditionType: "personal"}, v3ModelRateLimitCap{}, false},
 		{"paidId 未命中目录", &auth.Auth{UID: "u1", EditionType: "personal"}, capMiss, false},
+		{
+			"排除表企业号不生效",
+			&auth.Auth{UID: "u1", EditionType: "personal", EnterpriseID: "esoikz80kd8g"},
+			capHit,
+			false,
+		},
 		{
 			"line 缺 paidId",
 			&auth.Auth{UID: "u1", EditionType: "personal"},

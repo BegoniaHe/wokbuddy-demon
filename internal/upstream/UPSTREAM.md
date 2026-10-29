@@ -144,10 +144,10 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | 个人号 `X-No-Department-Info` | 仅 chat 族与模型目录系 | 只由 `injectChatDomain` 注入（chat 族 + `FetchModels` / `globalModelsOnce`）；轻头族各面不发——#298 的原始修复点在这两条路径，不在 billing / report |
 | W3C `baggage`（chat） | 已对齐（4 条） | 真机逐字 `buddyId=,buddyName=,codebuddy.session_id=<会话 id>,codebuddy.conversation_request_id=<请求 id>`；两个 buddy 键是官方无 buddy 上下文时的空值形态，两个 codebuddy 键与同请求 `X-Conversation-Id` / `X-Conversation-Request-Id` 同值。包内还有 `conversation_message_id` / `root_request_id` 两个键常量，但 chat 真机**没发**，多发反而更明显；`tracestate` 仅跨进程 span 携带时下发，网关不伪造（#364） |
 | `X-Private-Data`（CLI chat） | 已对齐（按账号身份，与域无关） | CN 与 global 5.9.3 同源同形：`resolveModelOptimizationEnabled` 在个人号默认开模型优化 → 发 `false`，企业版默认关 → 发 `true`；判据只有 `isEnterpriseEditionAccount`（enterpriseId 非空或 type 为 ultimate/exclusive）。global 5.8.4 时代按 `DisableYuanbaoChannel=true` 一律发 `true` 的口径已作废（#400）。远端 abTest / 会话 meta `privateDataSticky` 不在网关范围 |
-| `X-Private-Data`（桌面专家路径） | 已对齐（固定 `true`） | 官方桌面主进程 chat 走 `applyGatewayHeaders`，兜底表 `VF` 里该头硬编码 `true`；`buildVlmGatewayHeaders` 同样硬编码。与 CLI chat 分属两条 surface，不能共用阈值；CN 5.9.3 / global 5.8.4 同形 |
+| `X-Private-Data`（桌面专家路径） | 已对齐（固定 `true`） | 官方桌面主进程 chat 走 `applyGatewayHeaders`，兜底表 `VF` 里该头硬编码 `true`；`buildVlmGatewayHeaders` 同样硬编码。与 CLI chat 分属两条 surface，不能共用阈值；CN / global 5.9.3 同形 |
 | custom model 的 `X-Private-Data` | 不适用 | 本仓没有 custom 模型上游路由（`isCustomModel` 仅用于模型目录可见性），无触达路径 |
 
-无桌面包证端点（**实现依据 ≠ 已对齐官方客户端**；检索范围：截至 CN 5.9.3、CN 5.8.3、global 5.8.4 三包 `app-asar` 内 `*.js` / `*.mjs` 均为 0 命中，路径字面量不出现）：
+无桌面包证端点（**实现依据 ≠ 已对齐官方客户端**；检索范围：截至 CN 5.9.3、CN 5.8.3、global 5.9.3、global 5.8.4 四包 `app-asar` 内 `*.js` / `*.mjs` 均为 0 命中，路径字面量不出现）：
 
 | 路径 | 实现位置（符号为准，行号仅提示） | 契约来源 / 口径 |
 | --- | --- | --- |

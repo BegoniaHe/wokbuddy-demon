@@ -10,7 +10,8 @@
 // 白名单会把这些付费变体一并列出来，需要这一步收尾。
 //
 // 语义照抄官方：
-//   - eligible = `account.type ∈ {personal, pro}` 且 `enterpriseId` 不在排除表；
+//   - eligible = `account.type ∈ {personal, pro}` 且 `enterpriseId` 不在排除表（官方
+//     `yae`，与 `isIOAEnterpriseId` 同一份常量）；
 //   - 只有 eligible 且 lines 非空才考虑启用，且必须**至少一项 paidId 命中当前目录**
 //     才整体过滤（官方 `e.some(...) ? filter : slice`）；
 //   - 只隐藏命中的 paidId，`freeId` 一律不动；
@@ -18,12 +19,15 @@
 //     做产品决策）。
 //
 // 只写 `ModelInfo.ChatVisible`：不影响路由、面板全量目录与 effort 能力缓存。
+//
+// 配置只出现在 `/v3/config`：v3 全失败、退回企业端点那一路时拿不到 lines，规则
+// 自然不启用（不编造缺省行）。
 package upstream
 
 import (
 	"log"
+	"slices"
 	"strings"
-	"sync"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -43,14 +47,16 @@ type v3PaidLine struct {
 	PaidID string `json:"paidId"`
 }
 
-// paidLineExclusionNoticeOnce 排除表缺失的提示只打一次，避免每次拉目录刷日志。
-var paidLineExclusionNoticeOnce sync.Once
+// paidLineExcludedEnterpriseIDs 官方 `isEligiblePaidLineUser` 的排除表（`yae`）。
+//
+// 官方 `renderer/assets/contexts-*.js` 从 `common-*.js` 导入该常量，与
+// `isIOAEnterpriseId` 共用同一份两元素数组（CN / global 5.9.3 同形，导出名 `u`）。
+// IOA 企业号在官方不进付费线路合并；漏掉这两个 id 会把官方照常显示的付费变体藏掉
+// （issue #402）。
+var paidLineExcludedEnterpriseIDs = []string{"esoikz80kd8g", "etahzsqej0n4"}
 
 // isEligiblePaidLineUser 对齐官方 `isEligiblePaidLineUser`：
 // `type ∈ {personal, pro}` 且 `enterpriseId` 不在排除表。
-//
-// 官方排除表（`yae`）是压缩包里的常量数组，本仓无处可依；取不到就按「不排除」处理
-// 并记一次日志——自行发明名单会把合法个人号静默挡在规则外，比多隐藏几个变体更糟。
 func isEligiblePaidLineUser(account *auth.Auth) bool {
 	if account == nil {
 		return false
@@ -62,12 +68,7 @@ func isEligiblePaidLineUser(account *auth.Auth) bool {
 		return false
 	}
 
-	paidLineExclusionNoticeOnce.Do(func() {
-		log.Printf("INFO: [upstream] paid-line filter: official enterpriseId exclusion list " +
-			"unavailable, treating every personal/pro account as eligible (issue #402)")
-	})
-
-	return true
+	return !slices.Contains(paidLineExcludedEnterpriseIDs, strings.TrimSpace(account.EnterpriseID))
 }
 
 // applyPaidLineFilter 按官方 `filterVisiblePaidLineModels` 隐藏命中的 paidId 变体。

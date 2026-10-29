@@ -3,6 +3,7 @@ package upstream
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -49,6 +50,32 @@ func TestModelBusyRemembersMissingRealm(t *testing.T) {
 
 	if !client.modelBusyRealmMissing("global") {
 		t.Fatal("记忆未落到 global 桶")
+	}
+}
+
+// TestModelBusyStopsAfter404InSameCall 一次调用跨多批（>50 模型）时，首批 404 后
+// 不再接着打剩下的批次：本进程已判定该域没有这条观测（issue #401）。
+func TestModelBusyStopsAfter404InSameCall(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	client := testClient(func(*http.Request) (*http.Response, error) {
+		calls++
+
+		return jsonResp(http.StatusNotFound, `{"error_msg":"404 Route Not Found"}`), nil
+	})
+
+	models := make([]string, 0, 120)
+	for i := range 120 {
+		models = append(models, "m"+strconv.Itoa(i))
+	}
+
+	if _, err := client.ModelBusy(context.Background(), globalBusyAccount(), models); err != nil {
+		t.Fatalf("err=%v want nil", err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("calls=%d want 1（首批 404 后应直接收尾）", calls)
 	}
 }
 

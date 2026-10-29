@@ -57,6 +57,12 @@ func (c *Client) ModelBusy(
 		}
 
 		maps.Copy(out, levels)
+
+		// 本批刚判定该域没有这条观测：后续批次必然同样 404，直接收尾，不在同一次
+		// 调用里重复打上游（issue #401）。
+		if c.modelBusyRealmMissing(realm) {
+			break
+		}
 	}
 
 	return out, nil
@@ -160,7 +166,7 @@ func (c *Client) markModelBusyRealmMissing(realm string, status int, body string
 
 	log.Printf("INFO: [upstream] model busy realm=%s: %s not deployed upstream (http %d: %s); "+
 		"model busy observation disabled for this realm until restart", realm, modelBusyPath, status,
-		truncate(strings.TrimSpace(body), 120))
+		RedactForLog(strings.TrimSpace(body), 120))
 }
 
 // parseModelBusy 兼容 {code,data} 信封与 map/数组响应。
