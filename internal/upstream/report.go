@@ -88,7 +88,7 @@ func (c *Client) domainJSONLimitHeaders(
 		req.Header.Set(k, v)
 	}
 
-	return c.doJSONLimit(req, maxBytes)
+	return c.doJSONLimitFor(account, req, maxBytes)
 }
 
 // billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / summary /

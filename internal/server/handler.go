@@ -2902,9 +2902,48 @@ func (f *chatFlow) handleStreamSuccess(
 	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
 
 	f.finishStreamStats(acct, stats, repair, attemptStarted)
+	// 观测（issue #44）：必须在 finishStreamStats 之后——f.st.toolsDeclared /
+	// toolCalls 在那里才写入。
+	f.warnStopWithoutToolCalls(stats.FinishReason())
 	stream.Close()
 
 	return rotDone
+}
+
+// shouldWarnStopWithoutToolCalls 判定「声明了 tools、上游 finish_reason=stop、却
+// 零 tool_calls」的回合（issue #44）。
+//
+// 三条件同时成立才报：本请求声明了 tools（declared > 0）、本轮零工具调用
+// （calls == 0，已含 markup 修复还原的调用）、finish_reason == "stop"。
+// 另加一票否决：只在「本轮整体成功」（outcome == OutcomeSuccess）时报，避免与
+// 既有的空流/截断/error frame WARN 重复刷屏。
+//
+// 反例保护：未声明 tools 的纯对话 stop 是正常形态，由 declared > 0 这道闸排除。
+func shouldWarnStopWithoutToolCalls(declared, calls int, finishReason, outcome string) bool {
+	if declared <= 0 || calls > 0 || finishReason != "stop" {
+		return false
+	}
+
+	return outcome == reqlog.OutcomeSuccess
+}
+
+// warnStopWithoutToolCalls 报告「声明了 tools、上游 finish_reason=stop、却零
+// tool_calls」的回合（issue #44）。这类终态在上游侧是合法的，但 agent 客户端会
+// 判定回合正常完成 → 工具一次没跑、任务静默停住。网关侧此前完全无痕，这里只加
+// 观测：不重试、不补帧、不改 finish_reason（判据与处置留待后续 issue）。
+//
+// model 用 f.bareModel（出站真名）而非 st.model（客户端原始请求名，可能带
+// realm 前缀或别名）：与相邻 WARN 同口径，且请求流水行已经打印过后者。
+func (f *chatFlow) warnStopWithoutToolCalls(finishReason string) {
+	if !shouldWarnStopWithoutToolCalls(
+		f.st.toolsDeclared, f.st.toolCalls, finishReason, f.st.outcome,
+	) {
+		return
+	}
+
+	log.Printf("WARN: [server] %s acct=%s model=%s: finish_reason=stop without tool_calls "+
+		"despite %d tool(s) declared (client will treat the turn as completed; tools never ran)",
+		f.st.mode, logfmt.Label(f.st.uid, f.st.nick), f.bareModel, f.st.toolsDeclared)
 }
 
 // retryZeroOutputLength 处理 finish_reason=length 且零输出：同额度关闭 thinking
@@ -3280,6 +3319,9 @@ func (f *chatFlow) handleNonStreamSuccess(
 	f.st.status = http.StatusOK
 	f.st.outcome = reqlog.OutcomeSuccess
 	f.st.toks = completionTokens(resp)
+	// 观测（issue #44）：与流式同判据，必须在 toolsDeclared / toolCalls / outcome
+	// 都写完之后调。
+	f.warnStopWithoutToolCalls(nonStreamFinishReason(resp))
 	// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 	f.noteSuccessAndBind(acct)
 	// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
@@ -3349,6 +3391,19 @@ func firstChoice(resp map[string]any) map[string]any {
 	choice, _ := choices[0].(map[string]any)
 
 	return choice
+}
+
+// nonStreamFinishReason 取聚合响应 choices[0].finish_reason；缺失或类型不符返回 ""
+// （供 issue #44 的「stop 且零 tool_calls」观测判定，与 `firstChoice` 同源）。
+func nonStreamFinishReason(resp map[string]any) string {
+	choice := firstChoice(resp)
+	if choice == nil {
+		return ""
+	}
+
+	fr, _ := choice["finish_reason"].(string)
+
+	return fr
 }
 
 // responseToolCallCount 统计聚合响应 choices[0].message 的工具调用条数：tool_calls
@@ -3808,6 +3863,8 @@ func futureOrZero(t, now time.Time) time.Time {
 //     与 no_healthy_account 区分——两者的排查方向完全不同（前者是上游慢，后者是号全挂）。
 //   - 上游流截断/空流且所有号都如此（issue #105）：502 + upstream_parse，与「解析失败」
 //     同口径——客户端别把「上游坏了」读成「号全挂了」而盲目重试。
+//   - 出站代理层失败（issue #15/#39）：502 + proxy_dial_failed。代理槽不可用是部署侧
+//     配置问题，与号池健康无关；落回 no_healthy_account 会让运维去查账号。
 func localErrorEnvelope(
 	err error, fallbackStatus int, fallbackCode, fallbackMsg string,
 ) (status int, code, msg string, ok bool) {
@@ -3827,6 +3884,14 @@ func localErrorEnvelope(
 		// 非流式聚合总量超限（issue #113）：同 502 upstream_parse，不落回
 		// no_healthy_account（那会把「上游吐了超大响应」表述成「号全挂了」）。
 		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	case errors.Is(err, outbound.ErrProxyDial):
+		// 出站代理层失败（issue #15/#39）：回 502 而不是 no_healthy_account。原文含
+		// 槽 id 与上游地址，只回固定文案（细节留在 WARN 行），不把部署配置回显给客户端。
+		return http.StatusBadGateway, "proxy_dial_failed",
+			"outbound proxy dial failed: the account's egress proxy is unavailable and " +
+				"the request was not routed to a direct connection; check upstream.proxy_slots / " +
+				"realm_proxy_slots",
+			true
 	default:
 		return fallbackStatus, fallbackCode, fallbackMsg, false
 	}

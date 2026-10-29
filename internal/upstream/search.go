@@ -242,7 +242,7 @@ func (c *Client) Search(
 		return nil, fmt.Errorf("search request: %w", err)
 	}
 
-	return c.doSearch(req)
+	return c.doSearch(account, req)
 }
 
 // newAgentToolRequest 构造 agenttool 系请求（search / webfetch / agentic_search）：
@@ -269,8 +269,8 @@ func (c *Client) newAgentToolRequest(
 //   - HTTP >= 400 → Classify 出 Kind，包成 *Error
 //   - 2xx 但 code != 0 → 业务错误（Classify 判不出时兜底 ErrClient）
 //   - 读体失败 → 普通 error（半截 body 不参与账号惩罚）
-func (c *Client) doSearch(req *http.Request) (*SearchOutcome, error) {
-	resp, err := c.HTTP.Do(req)
+func (c *Client) doSearch(account *auth.Auth, req *http.Request) (*SearchOutcome, error) {
+	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("search do: %w", err)
 	}

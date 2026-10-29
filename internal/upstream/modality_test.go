@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 )
@@ -29,15 +30,16 @@ func TestNormalizeModalities(t *testing.T) {
 
 // TestEffectiveInputModalitiesPriority 来源优先级：上游字段 > models.dev >
 // supports_images 推导；三级都无 → nil（未知，不宣称）。
+//
+//nolint:paralleltest // 依赖包级 modelsDev 单例，必须串行执行
 func TestEffectiveInputModalitiesPriority(t *testing.T) {
-	t.Parallel()
+	lockModelsDev(t)
+
 	// 1) 上游字段优先。
 	if got := (&ModelInfo{ID: "m", InputModalities: []string{"text", "audio"}, SupportsImages: true}).EffectiveInputModalities(); !reflect.DeepEqual(got, []string{"text", "audio"}) {
 		t.Errorf("upstream field priority: got %v", got)
 	}
 	// 2) models.dev 兜底（注入进程内索引）。
-	resetModelsDev()
-	t.Cleanup(resetModelsDev)
 	modelsDev.mu.Lock()
 	modelsDev.modalities = map[string][]string{"m": {"text", "file"}}
 	modelsDev.mu.Unlock()
@@ -56,8 +58,11 @@ func TestEffectiveInputModalitiesPriority(t *testing.T) {
 }
 
 // TestSupportsModalityUnknownAllows 能力未知时 SupportsModality 放行（不拒绝）。
+//
+//nolint:paralleltest // 未知能力判定依赖包级 modelsDev 单例为空，必须串行执行
 func TestSupportsModalityUnknownAllows(t *testing.T) {
-	t.Parallel()
+	// 见 lockModelsDev：串行取单例，避免并行用例注入的索引让「未知」变成已知。
+	lockModelsDev(t)
 
 	if !(&ModelInfo{ID: "unknown"}).SupportsModality(ModalityImage) {
 		t.Error("unknown capability must allow (cannot prove unsupported)")
@@ -143,14 +148,30 @@ func TestParseModelsDevModalities(t *testing.T) {
 }
 
 // TestLookupModelsDevModalitiesNotLoaded 文档未加载：ok=false，不触发网络。
+//
+//nolint:paralleltest // 依赖包级 modelsDev 单例，必须串行执行
 func TestLookupModelsDevModalitiesNotLoaded(t *testing.T) {
-	t.Parallel()
-	resetModelsDev()
-	t.Cleanup(resetModelsDev)
+	lockModelsDev(t)
 
 	if _, ok := lookupModelsDevModalities("m"); ok {
 		t.Error("未加载文档时应返回 ok=false")
 	}
+}
+
+// modelsDevTestMu 串行化操作包级 modelsDev 单例的用例：resetModelsDev 会清空
+// 全进程共享的 doc/modalities/negatives，并行执行时互相踩踏（-shuffle 下随机失败）。
+var modelsDevTestMu sync.Mutex
+
+// lockModelsDev 取得 modelsDev 单例的测试独占权：进入时重置，退出时先重置再解锁
+// （Cleanup 逆序执行，故 resetModelsDev 在解锁前跑完）。
+func lockModelsDev(t *testing.T) {
+	t.Helper()
+
+	modelsDevTestMu.Lock()
+
+	t.Cleanup(modelsDevTestMu.Unlock)
+	resetModelsDev()
+	t.Cleanup(resetModelsDev)
 }
 
 // resetModelsDev 测试隔离：清空单例状态（doc/fetched/lastFetch/negatives）。

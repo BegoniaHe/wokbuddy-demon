@@ -42,7 +42,6 @@ func TestRestartRequiredFieldsAssemblyChanges(t *testing.T) {
 		{"pricing.enabled", func(c *Config) { c.Pricing.Enabled = !c.Pricing.Enabled }},
 		{"pricing.refresh_minutes", func(c *Config) { c.Pricing.RefreshMinutes++ }},
 		{"pricing.exchange_rate", func(c *Config) { c.Pricing.ExchangeRate += 0.1 }},
-		{"upstream.proxies", func(c *Config) { c.Upstream.Proxies = []string{"http://127.0.0.1:8080"} }},
 		{"global.chat_base", func(c *Config) { c.Global.ChatBase = "https://example.test" }},
 		{"prompt.mode", func(c *Config) { c.Prompt.Mode = "append" }},
 		{"session_sticky.enabled", func(c *Config) { c.SessionSticky.Enabled = false }},

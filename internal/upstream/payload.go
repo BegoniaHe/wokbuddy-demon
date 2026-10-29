@@ -15,9 +15,12 @@ import (
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
 //
+// historyKeepTurns > 0 时在 tool 配对三步之后、注入 thinking 之前按轮裁剪历史
+// （issue #99）；0 = 关闭，与既有行为完全一致。
+//
 //nolint:maintidx // 多段 payload 变换线性展开，拆开需重复传递解析结果。
 func PrepareBodyOptWithEffortsAndDefault(
-	src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string,
+	src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, historyKeepTurns int,
 ) []byte {
 	if len(src) == 0 {
 		return src
@@ -69,6 +72,8 @@ func PrepareBodyOptWithEffortsAndDefault(
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs
 	}
+
+	trimHistoryInObj(obj, historyKeepTurns) // issue #99：排在配对三步之后
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。

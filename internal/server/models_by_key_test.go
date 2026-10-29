@@ -400,3 +400,30 @@ func TestModelsByKeyRetrieveAnthropicNotFound(t *testing.T) {
 		t.Fatalf("404 不应泄露模型存在性: %s", body)
 	}
 }
+
+// TestFakeUpstreamIgnoresModelsDev models.dev 目录拉取与上游共用 client，但不得
+// 计入上游调用次数（否则「列表不触发上游请求」断言会被异步拉取随机打破）。
+func TestFakeUpstreamIgnoresModelsDev(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int64
+
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls.Add(1)
+		return 200, sseOK, true
+	})
+
+	resp, err := up.HTTP.Get(upstream.ModelsDevURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("models.dev 桩应返回 200，got %d", resp.StatusCode)
+	}
+
+	if calls.Load() != 0 {
+		t.Fatalf("models.dev 拉取不得计入上游调用: calls=%d", calls.Load())
+	}
+}

@@ -334,6 +334,10 @@ type Config struct {
 		// ProxySlots 命名出站代理槽（issue #96）：账号绑定后使用独立 Transport，
 		// 未绑定账号继续走 Proxies 全局池/直连。
 		ProxySlots []ProxySlot `json:"proxy_slots"`
+		// RealmProxySlots realm → 默认代理槽（issue #39/#3）：账号自身未绑定槽时按
+		// 账号 realm 选出口；两者都未设置时走 proxies 全局池/直连。空 = 不启用（默认）。
+		// 键只允许 cn / global，值必须是已启用的 proxy_slots[].id。热生效。
+		RealmProxySlots map[string]string `json:"realm_proxy_slots"`
 		// Proxies 出站代理列表（issue #15）：支持 http://、https://、socks5://
 		// （可选 user:pass）；非空时出站按健康轮换，失败代理进入冷却。空 = 直连（默认）。
 		Proxies []string `json:"proxies"`
@@ -381,6 +385,10 @@ type Config struct {
 		// File 提示词文件路径；空 = 内置默认 defaultprompt.md；
 		// 路径非空但不可读 → 启动报错（fail fast，避免静默回落到内置默认）。
 		File string `json:"file"`
+		// HistoryKeepTurns 保留最近 N 轮 user 历史（0 = 关闭，默认）。
+		// 「一轮」按 user 消息计；裁剪保留开头连续 system/developer + 倒数第 N 条 user 起的尾部。
+		// 热生效（无需重启）。
+		HistoryKeepTurns int `json:"history_keep_turns"`
 	} `json:"prompt"`
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
@@ -1445,6 +1453,8 @@ func (c *Config) normalizeProxies() error {
 	}
 
 	seen := make(map[string]bool, len(c.Upstream.ProxySlots))
+	enabled := make(map[string]bool, len(c.Upstream.ProxySlots))
+
 	for i := range c.Upstream.ProxySlots {
 		slot := &c.Upstream.ProxySlots[i]
 		slot.ID = strings.TrimSpace(slot.ID)
@@ -1462,7 +1472,48 @@ func (c *Config) normalizeProxies() error {
 		if _, err := outbound.ParseProxy(slot.URL); err != nil {
 			return fmt.Errorf("upstream.proxy_slots[%s]: %w", slot.ID, err)
 		}
+
+		if slot.Enabled {
+			enabled[slot.ID] = true
+		}
 	}
+
+	return c.normalizeRealmProxySlots(enabled)
+}
+
+// normalizeRealmProxySlots 归一 realm 默认出口（issue #39）：键 trim+小写后只允许
+// cn / global；值为空 = 未设置（从 map 删除，不报错）；值必须命中已启用的槽 id。
+// enabled 是已通过校验的槽 id 集合（只含 Enabled 的槽）。
+func (c *Config) normalizeRealmProxySlots(enabled map[string]bool) error {
+	if len(c.Upstream.RealmProxySlots) == 0 {
+		return nil
+	}
+
+	out := make(map[string]string, len(c.Upstream.RealmProxySlots))
+
+	for realm, id := range c.Upstream.RealmProxySlots {
+		key := strings.ToLower(strings.TrimSpace(realm))
+		switch key {
+		case "cn", "global":
+		default:
+			return fmt.Errorf("upstream.realm_proxy_slots[%s]: realm 只允许 cn / global: %w",
+				realm, errNormalizeProxiesFailed)
+		}
+
+		slotID := strings.TrimSpace(id)
+		if slotID == "" {
+			continue // 空值 = 未设置
+		}
+
+		if !enabled[slotID] {
+			return fmt.Errorf("upstream.realm_proxy_slots[%s]: 未定义的代理槽 %q: %w",
+				realm, slotID, errNormalizeProxiesFailed)
+		}
+
+		out[key] = slotID
+	}
+
+	c.Upstream.RealmProxySlots = out
 
 	return nil
 }
@@ -2379,6 +2430,14 @@ func (c *Config) normalizePrompt() error {
 		}
 
 		c.PromptText = text
+	}
+
+	// prompt.history_keep_turns：0 = 关闭（默认）；1..1000 = 只保留最近 N 轮 user 历史。
+	// 负数/非法值直接失败（不静默当 0，否则用户以为开了其实没裁）；
+	// 上限 1000 是护栏：误填巨大值时「以为开了其实永远不会触发裁剪」，比报错更坑。
+	if v := c.Prompt.HistoryKeepTurns; v < 0 || v > 1000 {
+		return fmt.Errorf("prompt.history_keep_turns: %d 超出范围（0 = 关闭，1..1000 = 保留轮数）: %w",
+			v, errNormalizePromptFailed)
 	}
 
 	return nil

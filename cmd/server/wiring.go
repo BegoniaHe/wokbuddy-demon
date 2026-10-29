@@ -5,15 +5,12 @@ import (
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
-	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
-	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
@@ -105,73 +102,6 @@ func setDailyUsageProvider(p *pool.Pool, rec *usage.Recorder) {
 
 		return out
 	})
-}
-
-// buildProxySlotDials 构造账号代理槽的拨号器（issue #96）。
-func buildProxySlotDials(
-	cfg *Config,
-) map[string]func(ctx context.Context, network, addr string) (net.Conn, error) {
-	out := make(
-		map[string]func(ctx context.Context, network, addr string) (net.Conn, error),
-		len(cfg.Upstream.ProxySlots),
-	)
-	for _, slot := range cfg.Upstream.ProxySlots {
-		if !slot.Enabled {
-			continue
-		}
-
-		slotPool, err := outbound.New([]string{slot.URL})
-		if err != nil {
-			log.Printf("WARN: [server] 代理槽 %s 无效，忽略: %v", slot.ID, err)
-			continue
-		}
-
-		out[slot.ID] = slotPool.DialContext
-	}
-
-	return out
-}
-
-// proxySlotInfos 把配置的代理槽映射为面板展示信息（issue #96）。
-func proxySlotInfos(cfg *Config) []panel.ProxySlotInfo {
-	out := make([]panel.ProxySlotInfo, 0, len(cfg.Upstream.ProxySlots))
-	for _, slot := range cfg.Upstream.ProxySlots {
-		if slot.Enabled {
-			out = append(out, panel.ProxySlotInfo{ID: slot.ID, Name: slot.Name})
-		}
-	}
-
-	return out
-}
-
-// configureAccountRouting 把账号代理槽接到上游 client（issue #96）。
-func configureAccountRouting(state2 *pool.Pool, up *upstream.Client, cfg *Config) {
-	slotDials := buildProxySlotDials(cfg)
-
-	var missingSlots sync.Map
-
-	up.AccountRoute = func(
-		acct *auth.Auth,
-	) (string, func(ctx context.Context, network, addr string) (net.Conn, error)) {
-		if acct == nil {
-			return "", nil
-		}
-
-		slot := state2.ProxySlotOf(acct.UID)
-		if slot == "" {
-			return "", nil
-		}
-
-		if dial, ok := slotDials[slot]; ok {
-			return slot, dial
-		}
-
-		if _, warned := missingSlots.LoadOrStore(slot, true); !warned {
-			log.Printf("WARN: [server] 代理槽 %s 不可用（未配置或已禁用），已绑定账号回落默认出口", slot)
-		}
-
-		return "", nil
-	}
 }
 
 // newPricingCatalog 按配置创建价格缓存（issue #99）；关闭时返回 nil。

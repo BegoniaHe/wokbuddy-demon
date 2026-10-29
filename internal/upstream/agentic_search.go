@@ -90,7 +90,7 @@ func (c *Client) AgenticSearch(
 		return nil, fmt.Errorf("agentic search request: %w", err)
 	}
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("agentic search do: %w", err)
 	}

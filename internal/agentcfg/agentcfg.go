@@ -33,6 +33,7 @@ var ErrNotApplied = errors.New("没有可还原的写入记录")
 var (
 	errAPIKey        = errors.New("api_key 不能为空")
 	errBaseURLHTTPS  = errors.New("base_url 必须是 http(s) 地址")
+	errModelList     = errors.New("models 含非法项")
 	errApplyFailed   = errors.New("Apply failed")
 	errRestoreFailed = errors.New("Restore failed")
 )
@@ -41,6 +42,9 @@ type Options struct {
 	BaseURL string `json:"base_url"`
 	APIKey  string `json:"api_key"`
 	Model   string `json:"model"`
+	// Models 非空时覆盖 Model：第 0 个元素作为默认模型（Model 被忽略），
+	// 其余按客户端能力写入（OpenCode 全量 / Codex profiles / Claude 仅默认）。
+	Models []string `json:"models"`
 }
 
 // Status 单个客户端状态。
@@ -160,11 +164,79 @@ func validateOptions(opts *Options) error {
 
 	opts.BaseURL = baseURL
 
+	models, err := normalizeModelList(opts.Models)
+	if err != nil {
+		return err
+	}
+
+	opts.Models = models
+	if len(models) > 0 {
+		// 归一后非空：列表第一项即默认模型，Model 被忽略。
+		opts.Model = models[0]
+
+		return nil
+	}
+
 	if strings.TrimSpace(opts.Model) == "" {
 		opts.Model = "glm-5.2"
 	}
 
 	return nil
+}
+
+// maxModelList 模型列表上限：超出截断（不报错），避免把整份目录写进客户端配置。
+const maxModelList = 200
+
+// normalizeModelList trim、丢空、去重（保序）、上限截断，并拒绝会写坏 TOML / JSON
+// 的控制字符。不做字符集校验：模型 id 由上游决定（含 : . / - 都合法）。
+//
+// 控制字符一律拒绝：写 Codex 的 config.toml 走 Go 的 %q，它把 \x01 之类输出成
+// `\x01`——TOML 不认这种转义，整份配置解析失败。只拦 \r\n\t 不够。
+func normalizeModelList(list []string) ([]string, error) {
+	if len(list) == 0 {
+		return nil, nil
+	}
+
+	seen := make(map[string]struct{}, len(list))
+	out := make([]string, 0, len(list))
+
+	for _, raw := range list {
+		id := strings.TrimSpace(raw)
+		if id == "" {
+			continue
+		}
+
+		if strings.ContainsFunc(id, isControlRune) {
+			return nil, fmt.Errorf("%w: 含控制字符 %q 的模型 id 无法写入客户端配置", errModelList, id)
+		}
+
+		if _, dup := seen[id]; dup {
+			continue
+		}
+
+		seen[id] = struct{}{}
+		out = append(out, id)
+
+		if len(out) == maxModelList {
+			break
+		}
+	}
+
+	return out, nil
+}
+
+// isControlRune 判定 C0/C1 控制字符（含 \r \n \t 与 DEL）。
+func isControlRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
+// modelList 三家客户端共用的模型清单：Models 非空取它（已归一），否则回落单模型。
+func modelList(opts Options) []string {
+	if len(opts.Models) > 0 {
+		return opts.Models
+	}
+
+	return []string{opts.Model}
 }
 
 // Apply 写入网关专属配置。
@@ -371,6 +443,9 @@ func loadConfigDoc(existing []byte, label string) (map[string]any, error) {
 	return doc, nil
 }
 
+// applyClaude 只写单个默认模型（opts.Model = 列表第一项）：
+// Claude Code 的 settings.json 没有多模型字段，其余模型在 Claude Code 内用
+// `/model <id>` 切换，不写进配置。
 func applyClaude(existing []byte, opts Options) ([]byte, error) {
 	doc, err := loadConfigDoc(existing, "Claude")
 	if err != nil {
@@ -420,21 +495,30 @@ func v1Base(base string) string {
 // applyCodex 写入 Codex 配置：根键必须位于首个表头之前，provider 表追加到文末。
 // 直接追加到文件末尾会把根键写进已有 [profiles.*] 表（TOML 语义），因此这里
 // 先拆出根段再重建，并清掉同名根键避免 duplicate key。
+//
+// 托管段只放本工具写入的键与表，用户根键（注释、approval_policy 等）留在段外：
+// 否则 removeCodexBlock 整段删除会连坐用户配置，第二次 Apply 就永久丢失。
 func applyCodex(existing []byte, opts Options) ([]byte, error) {
-	text := removeCodexBlock(string(existing))
+	original := string(existing)
+	salvaged := codexBlockUserRoot(original)
+	text := removeCodexBlock(original)
+
 	root, tables := splitCodexRoot(text)
 	root = codexRootModel.ReplaceAllString(root, "")
 	root = codexRootModelProvider.ReplaceAllString(root, "")
 	root = strings.TrimSpace(root)
 
-	var builder strings.Builder
-	fmt.Fprintf(&builder, "%s\nmodel_provider = \"wokbuddy\"\nmodel = %q\n", codexStart, opts.Model)
-
-	if root != "" {
-		builder.WriteString("\n")
-		builder.WriteString(root)
-		builder.WriteString("\n")
+	if salvaged != "" {
+		root = strings.TrimSpace(salvaged + "\n" + root)
 	}
+
+	var builder strings.Builder
+	if root != "" {
+		builder.WriteString(root)
+		builder.WriteString("\n\n")
+	}
+
+	fmt.Fprintf(&builder, "%s\nmodel_provider = \"wokbuddy\"\nmodel = %q\n", codexStart, opts.Model)
 
 	fmt.Fprintf(&builder, `
 [model_providers.wokbuddy]
@@ -442,16 +526,112 @@ name = "WokBuddy Demon"
 base_url = %q
 wire_api = "chat"
 experimental_bearer_token = %q
-%s
-`, v1Base(opts.BaseURL), opts.APIKey, codexEnd)
+`, v1Base(opts.BaseURL), opts.APIKey)
 
-	if tables = strings.TrimSpace(tables); tables != "" {
+	// 其余模型写成 profiles：`codex --profile "<id>"` 直接切换。表名必须用双引号
+	// 包裹原始 id（模型 id 可含 : . / -）。用户自有 profile 原样保留，只让出与本次
+	// 写入同名的键——同名表重复声明会让整份 config.toml 解析失败。
+	extra := modelList(opts)[1:]
+	for _, id := range extra {
+		fmt.Fprintf(&builder, "\n[profiles.%q]\nmodel = %q\nmodel_provider = \"wokbuddy\"\n", id, id)
+	}
+
+	builder.WriteString(codexEnd)
+	builder.WriteString("\n")
+
+	if tables = strings.TrimSpace(stripCodexProfiles(tables, extra)); tables != "" {
 		builder.WriteString("\n")
 		builder.WriteString(tables)
 		builder.WriteString("\n")
 	}
 
 	return []byte(builder.String()), nil
+}
+
+// stripCodexProfiles 从表段里删掉与托管 profile 同名的 `[profiles.<id>]` 块（含其
+// 键行）。同名表在 TOML 里重复声明是硬错误，Codex 会整份配置加载失败；用户自有的
+// 其它 profile 与表原样保留。
+func stripCodexProfiles(tables string, ids []string) string {
+	if tables == "" || len(ids) == 0 {
+		return tables
+	}
+
+	drop := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		drop[id] = true
+	}
+
+	var (
+		out   []string
+		block []string
+		keep  bool
+	)
+
+	flush := func() {
+		if keep {
+			out = append(out, block...)
+		}
+	}
+
+	for _, line := range strings.SplitAfter(tables, "\n") {
+		// 任何表头都结束上一个块：否则被丢弃的 profile 会把紧随其后的
+		// 其它表一并吞掉（[model_providers.x] 等与 profile 无关的表不能连坐）。
+		if strings.HasPrefix(strings.TrimSpace(line), "[") {
+			flush()
+
+			id, isProfile := codexProfileHeaderID(line)
+			block, keep = []string{line}, !isProfile || !drop[id]
+
+			continue
+		}
+
+		block = append(block, line)
+	}
+
+	flush()
+
+	return strings.Join(out, "")
+}
+
+// codexProfileHeaderID 解析 `[profiles.<id>]` 表头并返回裸 id；其它行返回 false。
+func codexProfileHeaderID(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "[profiles.") || strings.HasPrefix(trimmed, "[[") {
+		return "", false
+	}
+
+	end := strings.IndexByte(trimmed, ']')
+	if end < 0 {
+		return "", false
+	}
+
+	key := strings.TrimSpace(trimmed[len("[profiles."):end])
+	key = strings.TrimPrefix(strings.TrimSuffix(key, "\""), "\"")
+	key = strings.TrimPrefix(strings.TrimSuffix(key, "'"), "'")
+
+	if key == "" {
+		return "", false
+	}
+
+	return key, true
+}
+
+// codexBlockUserRoot 从旧版托管段里取回被写进去的用户根键。旧实现把整段根键塞进
+// 标记之间，整段删除会连坐用户配置；这里在删除前先把其中的非托管根键捞出。
+// 新格式的用户根键已在段外，此函数返回空串。
+func codexBlockUserRoot(text string) string {
+	_, after, ok := strings.Cut(text, codexStart)
+	if !ok {
+		return ""
+	}
+
+	inner, _, _ := strings.Cut(after, codexEnd)
+
+	root, _ := splitCodexRoot(inner)
+	root = codexRootModel.ReplaceAllString(root, "")
+	root = codexRootModelProvider.ReplaceAllString(root, "")
+
+	return strings.TrimSpace(root)
 }
 
 // removeCodexBlock 删除上一次写入的托管段（含标记），其余内容原样保留。
@@ -497,7 +677,11 @@ func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 		provider = map[string]any{}
 	}
 
-	models := map[string]any{opts.Model: map[string]any{}}
+	models := make(map[string]any, len(modelList(opts)))
+	for _, id := range modelList(opts) {
+		models[id] = map[string]any{}
+	}
+
 	provider["wokbuddy"] = map[string]any{
 		"npm":  "@ai-sdk/openai-compatible",
 		"name": "WokBuddy Demon",

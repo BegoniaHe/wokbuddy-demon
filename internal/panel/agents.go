@@ -39,6 +39,9 @@ func (p *Panel) agentsApply(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var opts agentcfg.Options
+	// 字段透传：Options 直接由 body 解码，decodeJSONBody 没有字段白名单，
+	// 因此 models（由前端从 /panel/api/models 取 id 列表）随 JSON 自动透传，
+	// 无需在此枚举。
 	if err := decodeJSONBody(r.Body, &opts); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return

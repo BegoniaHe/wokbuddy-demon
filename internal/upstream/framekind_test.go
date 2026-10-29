@@ -71,7 +71,7 @@ func TestDoJSONPreservesStructuredCode(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			_, err = client.doJSON(req)
+			_, err = client.doJSONFor(nil, req)
 
 			var uerr *Error
 			if !errors.As(err, &uerr) {
@@ -104,7 +104,7 @@ func TestDoJSONKeepsCodeBeyondTruncation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = client.doJSON(req)
+	_, err = client.doJSONFor(nil, req)
 
 	var uerr *Error
 	if !errors.As(err, &uerr) {
