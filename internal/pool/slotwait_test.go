@@ -81,6 +81,39 @@ func TestSlotWaitForRealmModelCooling(t *testing.T) {
 	}
 }
 
+// TestSlotWaitForRealmDailyLimit 日限到点的号即便名额占满也不会接活。
+func TestSlotWaitForRealmDailyLimit(t *testing.T) {
+	t.Parallel()
+
+	state := slotWaitPool(t, true)
+	state.SetDailyLimits(DailyLimits{Tokens: 100}, DailyLimits{}, DailyLimits{})
+	state.SetDailyUsageProvider(func() map[string]DailyUsage {
+		return map[string]DailyUsage{"u1": {Tokens: 100}}
+	})
+
+	if state.SlotWaitForRealm("glm-5.2", "cn") {
+		t.Fatal("日限已到的号不该进等待判据")
+	}
+}
+
+// TestSlotWaitForRealmRouteCooling 整条路由冷却时选号必然失败，等名额无意义。
+func TestSlotWaitForRealmRouteCooling(t *testing.T) {
+	t.Parallel()
+
+	state := slotWaitPool(t, true)
+	for range routeFailureThreshold {
+		state.NoteRouteFailure("cn", "glm-5.2")
+	}
+
+	if state.SlotWaitForRealm("glm-5.2", "cn") {
+		t.Fatal("路由冷却期间不该让请求等名额")
+	}
+
+	if !state.SlotWaitForRealm("glm-5.3", "cn") {
+		t.Fatal("其他模型的路由未冷却，名额满时仍应值得等")
+	}
+}
+
 // TestSlotWaitForRealmOtherRealm 异域账号不参与本域判定。
 func TestSlotWaitForRealmOtherRealm(t *testing.T) {
 	t.Parallel()
