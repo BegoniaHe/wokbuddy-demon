@@ -93,10 +93,15 @@ func applyPaidLineFilter(out map[string]ModelInfo, account *auth.Auth, rateCap v
 	log.Printf("INFO: [upstream] paid-line filter: realm=%s hidden=%d", account.Realm(), hidden)
 }
 
-// paidLineIDSet 收集 lines[] 里非空的 paidId（缺 paidId 的 line 官方 parseLine 直接丢弃）。
+// paidLineIDSet 收集 lines[] 里的 paidId（缺 freeId 或 paidId 的 line 官方 parseLine
+// 直接丢弃）。
 func paidLineIDSet(rateCap v3ModelRateLimitCap) map[string]bool {
 	paidIDs := make(map[string]bool, len(rateCap.Lines))
 	for _, line := range rateCap.Lines {
+		if strings.TrimSpace(line.FreeID) == "" {
+			continue
+		}
+
 		if id := strings.TrimSpace(line.PaidID); id != "" {
 			paidIDs[id] = true
 		}

@@ -92,6 +92,12 @@ func TestApplyPaidLineFilterHidesOnlyHitPaidIDs(t *testing.T) {
 			v3ModelRateLimitCap{Lines: []v3PaidLine{{FreeID: "hy3", PaidID: " "}}},
 			false,
 		},
+		{
+			"line 缺 freeId",
+			&auth.Auth{UID: "u1", EditionType: "personal"},
+			v3ModelRateLimitCap{Lines: []v3PaidLine{{PaidID: "hy3-x"}}},
+			false,
+		},
 		{"nil 账号", nil, capHit, false},
 	}
 
