@@ -2453,7 +2453,8 @@ func (f *chatFlow) waitForModelBusy(ctx context.Context) bool {
 	}
 }
 
-// modelBusyWaitMax 14003 单次请求最多等待时长（issue #254）。
+// modelBusyWaitMax 单次请求「等一等再重选」的等待上限：14003 模型繁忙短窗
+// （issue #254）与本域在途名额占满（issue #403）共用同一预算。
 const modelBusyWaitMax = 10 * time.Second
 
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，
@@ -3585,8 +3586,6 @@ func (f *chatFlow) setCacheTokensFromUsage(usageMap map[string]any) {
 	f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = hitInt, missInt, true
 }
 
-// retryNonStreamAggregateError 处置空流 / EOF 截断：截断的 content 不是完整回答，
-// 绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试；轮转耗尽才回 502。
 // handleNonStreamAggregateError 非流式聚合失败的三路分流：
 //  1. 上游 error 帧：按帧内容分类（与流式同口径）；
 //  2. 调用方已断开（ctx 取消）：interrupted/499，不是上游解析失败（issue #404）；
@@ -3629,6 +3628,9 @@ func (f *chatFlow) nonStreamCallerGone(acct *auth.Auth, err error, attemptStarte
 	return rotDone
 }
 
+// retryNonStreamAggregateError 处置空流 / EOF 截断 / 坏帧：截断的 content 不是完整
+// 回答，绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试；轮转耗尽
+// 才回 502 upstream_parse。
 func (f *chatFlow) retryNonStreamAggregateError(
 	ctx context.Context, acct *auth.Auth, err error, attemptStarted time.Time, i int,
 ) rotationAction {
