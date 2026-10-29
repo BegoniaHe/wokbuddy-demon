@@ -93,13 +93,15 @@ type slotDial = func(ctx context.Context, network, addr string) (net.Conn, error
 func configureAccountRouting(state3 *pool.Pool, up *upstream.Client, reg *outbound.Registry) {
 	var warned sync.Map
 
-	up.AccountRoute = func(account *auth.Auth) (string, slotDial) {
+	// SetAccountRoute 而非直写字段：面板保存会重接选路，而 chat / 短请求每条都读
+	// 它（热改与在途请求并发），故走 client 的原子替换入口（顺带清空按槽缓存）。
+	up.SetAccountRoute(func(account *auth.Auth) (string, slotDial) {
 		if account == nil {
 			return "", nil
 		}
 
 		return accountEgress(state3, reg, &warned, account)
-	}
+	})
 }
 
 // accountEgress 按出口优先级为账号选拨号器：账号绑定槽 > realm 默认槽 > 空

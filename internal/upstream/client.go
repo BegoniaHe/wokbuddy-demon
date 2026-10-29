@@ -1243,14 +1243,19 @@ type Client struct {
 	timeoutMu      sync.Mutex
 	timeoutClients map[time.Duration]*http.Client
 
-	// AccountRoute 返回账号绑定的出站代理槽与拨号器（issue #96）；空 = 默认。
-	AccountRoute func(a *auth.Auth) (
+	// accountRoute 账号出口选路（issue #96）；空 = 默认。用 atomic 指针承载
+	// （与 proxyDialer 同理）：面板保存代理配置时会整体替换这个闭包，而
+	// slotClient 每个请求都读——普通字段会与在途请求构成数据竞争。
+	accountRoute atomic.Pointer[func(a *auth.Auth) (
 		slot string, dial func(ctx context.Context, network, addr string) (net.Conn, error),
-	)
+	)]
 	// slotMu/slotClients 按「槽 + header 超时」缓存独立 Transport，避免同一账号的
 	// 连接被其他出口复用；条目数受槽数 × 模型超时数约束。
+	// slotGen 每次出口变更 +1：读到旧路由的请求不得把自己插进新出口的缓存，否则
+	// 旧拨号器会被钉在缓存里，直到下一次配置保存才失效。
 	slotMu      sync.Mutex
 	slotClients map[string]*http.Client
+	slotGen     atomic.Uint64
 
 	// proxyDialer 出站底层拨号器（代理池接入点，issue #15；热生效改造见 #39）。
 	// 用 atomic 指针承载：面板改代理时整体替换，**不**就地改 Transport.DialContext
@@ -1422,9 +1427,47 @@ func (c *Client) SetDialer(base func(ctx context.Context, network, addr string) 
 	c.proxyDialer.Store(&wrap)
 
 	// 出口变了：旧出口的空闲连接不得继续被复用。
+	c.invalidateSlotClients()
+}
+
+// invalidateSlotClients 作废按槽缓存的 client 并推进出口代数：清空缓存让新
+// 连接走新出口，推进代数让「构建期读到旧路由」的请求放弃入缓存。
+func (c *Client) invalidateSlotClients() {
 	c.slotMu.Lock()
+	c.slotGen.Add(1)
 	clear(c.slotClients)
 	c.slotMu.Unlock()
+}
+
+// SetAccountRoute 整体替换账号出口选路（issue #39 热生效）。运行期安全：先原子
+// 替换闭包，再作废按槽缓存的 client——顺序不可颠倒，否则替换前的在途请求会用
+// 旧出口的拨号器构造出「新代数」的缓存条目并被长期复用。
+func (c *Client) SetAccountRoute(route func(a *auth.Auth) (
+	slot string, dial func(ctx context.Context, network, addr string) (net.Conn, error),
+),
+) {
+	if route == nil {
+		c.accountRoute.Store(nil)
+		c.invalidateSlotClients()
+
+		return
+	}
+
+	c.accountRoute.Store(&route)
+	c.invalidateSlotClients()
+}
+
+// AccountRoute 解析账号当前的出口选路（nil 安全）；空槽 + nil 拨号器 = 走全局
+// 池或直连。供面板/测试查看当前生效路由。
+func (c *Client) AccountRoute(account *auth.Auth) (
+	string, func(ctx context.Context, network, addr string) (net.Conn, error),
+) {
+	route := c.accountRoute.Load()
+	if route == nil || account == nil {
+		return "", nil
+	}
+
+	return (*route)(account)
 }
 
 // SetProxyRegistry 整体替换出站注册表（issue #39）：全局池接入拨号器并清空按槽
@@ -2459,9 +2502,9 @@ func (c *Client) chatHTTPForAccount(account5 *auth.Auth, duration2 time.Duration
 // 键前缀区分用途（chat 带 header 超时维度，短请求不带），两者共用 slotClients
 // 与 slotMu —— 同一槽的不同参数不能共用 Transport（参数不同），故键必须含参数。
 func (c *Client) slotClient(a *auth.Auth, base *http.Client, prefix string) *http.Client {
-	if c.AccountRoute == nil || a == nil {
-		return base
-	}
+	// 先取代数再取路由：反序会出现「读到旧路由 + 新代数」的组合，让旧出口的
+	// 拨号器被当作当前出口缓存放进 slotClients（出口热改后长期不生效）。
+	gen := c.slotGen.Load()
 
 	slot, dial := c.AccountRoute(a)
 	if slot == "" || dial == nil {
@@ -2493,6 +2536,12 @@ func (c *Client) slotClient(a *auth.Auth, base *http.Client, prefix string) *htt
 		return &writeDeadlineConn{Conn: conn, writeTimeout: duration}, nil
 	}
 	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
+
+	// 构建期间出口被换掉（代数已推进）：本次照用这条连接，但不得写进新出口的
+	// 缓存——那会把旧拨号器钉死在这里。
+	if c.slotGen.Load() != gen {
+		return client
+	}
 
 	if c.slotClients == nil {
 		c.slotClients = map[string]*http.Client{}

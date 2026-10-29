@@ -49,9 +49,10 @@ func newEgressClient(t *testing.T) (*Client, *auth.Auth, *egressProbe) {
 	client.RetryDelay = time.Millisecond
 
 	probe := &egressProbe{}
-	client.AccountRoute = func(*auth.Auth) (string, func(context.Context, string, string) (net.Conn, error)) {
+
+	client.SetAccountRoute(func(*auth.Auth) (string, testDial) {
 		return "slot-a", probe.dial
-	}
+	})
 
 	account := &auth.Auth{
 		UID: "u-egress", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999,
@@ -189,9 +190,9 @@ func TestHTTPForAccountFallsBackWithoutRoute(t *testing.T) {
 		t.Fatal("nil 账号应回落 c.HTTP")
 	}
 
-	client.AccountRoute = func(*auth.Auth) (string, func(context.Context, string, string) (net.Conn, error)) {
+	client.SetAccountRoute(func(*auth.Auth) (string, testDial) {
 		return "", nil
-	}
+	})
 
 	if got := client.HTTPForAccount(&auth.Auth{UID: "u"}); got != client.HTTP {
 		t.Fatal("空槽应回落 c.HTTP")
@@ -205,9 +206,10 @@ func TestHTTPForAccountCachesPerSlot(t *testing.T) {
 
 	client := New()
 	dial := func(context.Context, string, string) (net.Conn, error) { return nil, errUnused }
-	client.AccountRoute = func(a *auth.Auth) (string, func(context.Context, string, string) (net.Conn, error)) {
+
+	client.SetAccountRoute(func(a *auth.Auth) (string, testDial) {
 		return a.UID, dial
-	}
+	})
 
 	first := client.HTTPForAccount(&auth.Auth{UID: "slot-a"})
 	if other := client.HTTPForAccount(&auth.Auth{UID: "slot-b"}); other == first {
