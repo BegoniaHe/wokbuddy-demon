@@ -149,6 +149,40 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// Snapshot 返回账号字段的只读快照（锁内逐字段拷贝）。
+//
+// 用途：需要在锁外构造请求头 / 做出口选路时，直接用返回值代替原对象，
+// 避免与 keepalive 刷新并发读写（sync.Mutex 不可拷贝，故显式列字段）。
+//
+// 必须带上 realm：Realm() 在 realm 为空时按 domain / token iss 回落，而登录路径
+// 只写 realm 不写 domain——只拷 domain 的快照会把 global 账号判成 cn，
+// 导致 refresh 头族与出站选路错域。
+func (a *Auth) Snapshot() Auth {
+	if a == nil {
+		return Auth{}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return Auth{
+		AccessToken:        a.AccessToken,
+		RefreshToken:       a.RefreshToken,
+		ExpiresAt:          a.ExpiresAt,
+		Domain:             a.Domain,
+		realm:              a.realm,
+		UID:                a.UID,
+		EnterpriseID:       a.EnterpriseID,
+		EditionType:        a.EditionType,
+		IDSource:           a.IDSource,
+		DepartmentFullName: a.DepartmentFullName,
+		Nickname:           a.Nickname,
+		DeviceToken:        a.DeviceToken,
+		FilePath:           a.FilePath,
+		retired:            a.retired,
+	}
+}
+
 // NicknameValue 加锁读取 Nickname（Pool.SetNickname 会在运行期改写它）。
 func (a *Auth) NicknameValue() string {
 	if a == nil {
