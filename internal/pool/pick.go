@@ -807,6 +807,40 @@ func (p *Pool) inFlightFull(entry4 *entry) bool {
 	return entry4.inFlight.Load() >= int64(limit)
 }
 
+// SlotWaitForRealm 报告「本域有能服务该模型的健康号，只是把在途名额占满」——即再等
+// 一小会儿名额就会释放，值得让请求等一次名额再重选（issue #403）。
+//
+// 以下条件同时成立才算「值得等」，任一条不成立都说明等下去不会变好（不该让请求干耗）：
+//   - 本域存在能服务该模型的健康号（未禁用/未暂停/未冷却/模型级无冷却）；
+//   - 其中至少一个已占满在途名额——名额满正是要等的那个原因；
+//   - 该号不被积分保底或当日护栏挡住——触底号等多久都不会接这个收费模型，
+//     日限到点的号也不会因名额释放而恢复；
+//   - 该 (realm, model) 路由不在冷却期——整条路由冷却时选号必然失败，等名额无意义。
+func (p *Pool) SlotWaitForRealm(model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	now := p.now()
+
+	if p.routeCoolingLocked(realm, model, now) {
+		return false
+	}
+
+	for _, item := range p.byUID {
+		if modelBlockIgnores(item, realm) || !item.healthyForModel(now, model) || !p.inFlightFull(item) {
+			continue
+		}
+
+		if p.floorBlockedForRealmModel(item, model, realm, now) || p.dailyBlocked(item, model, realm, now) {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond

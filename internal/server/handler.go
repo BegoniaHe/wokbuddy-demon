@@ -461,6 +461,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		defer func() {
 			status := obs.status
+			// 调用方已断开（499）等「不写响应体」的收尾路径没有 header 可捕获，回落到
+			// chat 统计里已定性的状态，避免 reqlog 把中断记成 200。
+			if status == 0 && trace.stat != nil {
+				status = trace.stat.status
+			}
+
 			if status == 0 {
 				status = http.StatusOK
 			}
@@ -1441,7 +1447,8 @@ type chatFlow struct {
 	// 标签）。各换号 return rotContinue 分支写入；degrade 复用同号重试、不算换号，
 	// 保持空值即跳过计数。
 	rotateReason string
-	// busyWaited 本次请求是否已为 14003 模型繁忙等待过（只等一次，issue #254）。
+	// busyWaited 本次请求是否已等待过一次（14003 模型繁忙或本域在途名额占满，
+	// 两者共用同一「只等一次」预算，issue #254 / #403）。
 	busyWaited bool
 	// zeroRetried 是否已因「length + 零输出」关闭思考重发过（只重发一次，issue #244）。
 	zeroRetried bool
@@ -2375,20 +2382,66 @@ func mergePickTrace(dst *reqlog.DecisionTrace, src pool.PickTrace) {
 	}
 }
 
-// pickAccountWithBusyWait 选号；纯 14003 全池阻塞时等待一次后重选（issue #254）。
+// pickAccountWithBusyWait 选号；选不到时有一次「等一等再重选」的机会，两类等待共用
+// 同一预算与同一「只等一次」标记：
+//   - 14003 模型繁忙短窗（issue #254）：等到短窗结束再重选；
+//   - 本域在途名额占满（issue #403）：轮询等名额释放再重选。
+//
+// 两者都不在等待期间占名额，等不到就照既有路径收敛（503 no_healthy_account）。
 func (f *chatFlow) pickAccountWithBusyWait(ctx context.Context) *auth.Auth {
 	acct := f.pickAccount()
 	if acct != nil {
 		return acct
 	}
 
-	if f.busyWaited || !f.waitForModelBusy(ctx) {
+	if f.busyWaited {
+		return nil
+	}
+
+	if !f.waitForModelBusy(ctx) && !f.waitForSlot(ctx, modelBusyWaitMax) {
 		return nil
 	}
 
 	f.busyWaited = true
 
 	return f.pickAccount()
+}
+
+// slotWaitPoll 名额等待的轮询间隔：短到「刚释放就能注意到」，长到不会把池锁刷爆。
+const slotWaitPoll = 50 * time.Millisecond
+
+// waitForSlot 本域在途名额全满时按 slotWaitPoll 轮询等名额（≤budget，受 ctx 取消）。
+//
+// 判据交给 Pool.SlotWaitForRealm：只有「本域有健康号、只是名额满」才值得等；一旦它
+// 不再成立（名额释放，或本域已没有能服务该模型的号），立即返回 true 让调用方重选一次
+// ——重选结果就是最终结论，本函数不替选号下判断。返回 false 表示等到预算耗尽或 ctx
+// 取消，请求按既有 503 收敛。等待期间清空本轮 tried（理由同 waitForModelBusy：窗口
+// 过后旧排除集会挡住刚恢复的号）。
+func (f *chatFlow) waitForSlot(ctx context.Context, budget time.Duration) bool {
+	if !f.h.cfg.Pool.SlotWaitForRealm(f.bareModel, f.realm) {
+		return false
+	}
+
+	deadline := time.NewTimer(budget)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(slotWaitPoll)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-deadline.C:
+			return false
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+			if !f.h.cfg.Pool.SlotWaitForRealm(f.bareModel, f.realm) {
+				clear(f.tried)
+
+				return true
+			}
+		}
+	}
 }
 
 // waitForModelBusy 纯 14003 全池阻塞时等待一次（≤10s，受 ctx 取消）。等待期间
@@ -2418,7 +2471,8 @@ func (f *chatFlow) waitForModelBusy(ctx context.Context) bool {
 	}
 }
 
-// modelBusyWaitMax 14003 单次请求最多等待时长（issue #254）。
+// modelBusyWaitMax 单次请求「等一等再重选」的等待上限：14003 模型繁忙短窗
+// （issue #254）与本域在途名额占满（issue #403）共用同一预算。
 const modelBusyWaitMax = 10 * time.Second
 
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，
@@ -2825,8 +2879,12 @@ func failFastKind(kind upstream.ErrKind) bool {
 
 // handleQueueError 处置官方客户端的队列/并发业务码：
 //   - 6020 WAITING：429 + Retry-After（上游未给则 5s），客户端可重试，不换号；
-//   - 6021 FULL：503 队列已满；
+//   - 6021 FULL：429 + Retry-After（上游未给则 5s），对外码 queue_full 与 6020 区分；
 //   - 6022 USER_LIMIT：429 用户并发上限。
+//
+// 三档都是「稍后再试」的容量语义，一律 429：上游对 6021 本体回的就是 429，翻译成
+// 503 会让调用侧（WorkBuddy CLI 一类）按「服务不可用」直接中断任务（issue #391）。
+// 账号本身健康，全程不换号、不罚号、不熔断。
 func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr *upstream.Error) {
 	msg := strings.TrimSpace(string(respBody))
 	if msg == "" && uerr != nil {
@@ -2839,25 +2897,40 @@ func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr
 
 	switch {
 	case kind == upstream.ErrQueueWaiting:
-		retry := 5
-		if uerr != nil && uerr.RetryAfter > 0 {
-			retry = int(uerr.RetryAfter / time.Second)
-			if retry <= 0 {
-				retry = 1
-			}
-		}
-
-		f.out.Header("Retry-After", strconv.Itoa(retry))
+		f.out.Header("Retry-After", strconv.Itoa(queueRetryAfterSeconds(uerr)))
 		f.out.Error(http.StatusTooManyRequests, "queue_waiting", msg, "队列排队中，按 Retry-After 重试")
 	case code == "6022":
 		f.st.status = http.StatusTooManyRequests
 		f.out.Error(http.StatusTooManyRequests, "user_concurrency_limit", msg, "并发请求数已达上限，稍后重试")
 	default:
-		f.st.status = http.StatusServiceUnavailable
-		f.out.Error(http.StatusServiceUnavailable, "queue_full", msg, "上游队列已满，稍后重试")
+		// 6021 队列满：保守 5s（与 6020 的兜底一致）。客户端看到 queue_full 就知道是
+		// 「队列满」而不是「账号不可用」，按 Retry-After 退避即可恢复。
+		f.st.status = http.StatusTooManyRequests
+		f.out.Header("Retry-After", strconv.Itoa(queueRetryAfterSeconds(uerr)))
+		f.out.Error(http.StatusTooManyRequests, "queue_full", msg, "上游队列已满，稍后重试")
 	}
 
 	f.lastErr = &upstream.Error{Kind: kind, Status: f.st.status, Msg: msg}
+}
+
+// queueRetryAfterSeconds 队列/容量类响应的 Retry-After 秒数：优先采信上游响应头
+// （`Retry-After` / `Retry-After-Ms` / `X-Ratelimit-Reset`，见 upstream.ParseRetryAfter）
+// 明示的重置时间，缺失或非正数时给保守 5s（6020/6021 共用同一兜底）。
+//
+// 上游把等待时长写在 **body** 的 `data.retry_after` 时这里读不到（本仓只解析响应头），
+// 一律落 5s 兜底——比上游要求的更早重试一次，不改变语义，故不在本次范围内扩面。
+func queueRetryAfterSeconds(uerr *upstream.Error) int {
+	const fallback = 5
+
+	if uerr == nil || uerr.RetryAfter <= 0 {
+		return fallback
+	}
+
+	if retry := int(uerr.RetryAfter / time.Second); retry > 0 {
+		return retry
+	}
+
+	return 1
 }
 
 // handleRequestLevelError 透传请求级错误：不轮转、message 装上游原文、附 gateway_hint。
@@ -3335,11 +3408,7 @@ func (f *chatFlow) handleNonStreamSuccess(
 	rc.Close()
 
 	if err != nil {
-		if payload := upstream.ErrorFramePayload(err); payload != "" {
-			return f.handleNonStreamErrorFrame(ctx, acct, payload, attemptStarted, i)
-		}
-
-		return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
+		return f.handleNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
 	}
 
 	if action, handled := f.retryNonStreamZeroOutput(ctx, acct, resp, attemptStarted, i); handled {
@@ -3594,11 +3663,60 @@ func (f *chatFlow) setCacheTokensFromUsage(usageMap map[string]any) {
 	f.st.cacheHit, f.st.cacheMiss, f.st.hasCache = hitInt, missInt, true
 }
 
-// retryNonStreamAggregateError 处置空流 / EOF 截断：截断的 content 不是完整回答，
-// 绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试；轮转耗尽才回 502。
+// handleNonStreamAggregateError 非流式聚合失败的三路分流：
+//  1. 上游 error 帧：按帧内容分类（与流式同口径）；
+//  2. 调用方已断开（ctx 取消）：interrupted/499，不是上游解析失败（issue #404）；
+//  3. 其余（真截断/坏帧/超限）：502 upstream_parse 并换号。
+func (f *chatFlow) handleNonStreamAggregateError(
+	ctx context.Context, acct *auth.Auth, err error, attemptStarted time.Time, i int,
+) rotationAction {
+	if payload := upstream.ErrorFramePayload(err); payload != "" {
+		return f.handleNonStreamErrorFrame(ctx, acct, payload, attemptStarted, i)
+	}
+
+	if ctx.Err() != nil {
+		return f.nonStreamCallerGone(acct, err, attemptStarted)
+	}
+
+	return f.retryNonStreamAggregateError(ctx, acct, err, attemptStarted, i)
+}
+
+// clientClosedRequestStatus 499「客户端已断开」：非标准但业界通用（nginx 约定），
+// 只进请求日志与指标，不写进响应体（连接已关）。
+const clientClosedRequestStatus = 499
+
+// nonStreamCallerGone 非流式聚合期间调用方已断开（ctx 取消，issue #404）：上游帧可能
+// 完好，只是聚合读被打断——这不该记成上游解析失败（502 upstream_parse），否则 CDN /
+// 反代回源超时（Cloudflare 100s、EdgeOne 15s、nginx 60s 都是正常工作范围）会被算成
+// 上游故障，`upstream_parse` 这个信号也就不再可信。
+//
+// 处置与流式同名分支一致：账号照常记成功（不冷却、不喂连败、不轮换），请求日志记
+// interrupted + 499，不写响应体。返回 rotDone 表示「请求到此为止，不要再写响应」。
+func (f *chatFlow) nonStreamCallerGone(acct *auth.Auth, err error, attemptStarted time.Time) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.noteSuccessAndBind(acct)
+
+	f.st.status = clientClosedRequestStatus
+	f.st.outcome = reqlog.OutcomeInterrupted
+
+	log.Printf("INFO: [server] non-stream acct=%s model=%s: caller gone (ctx canceled before response): %v",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, err)
+
+	return rotDone
+}
+
+// retryNonStreamAggregateError 处置空流 / EOF 截断 / 坏帧：截断的 content 不是完整
+// 回答，绝不当成功写回。非流式路径客户端还没看到任何字节，可以换号重试；轮转耗尽
+// 才回 502 upstream_parse。
 func (f *chatFlow) retryNonStreamAggregateError(
 	ctx context.Context, acct *auth.Auth, err error, attemptStarted time.Time, i int,
 ) rotationAction {
+	// 入口再判一次调用方是否已断开：调用方在本函数执行前断连时，这里同样不能把
+	// 「人走了」记成上游解析失败（issue #404）。
+	if ctx.Err() != nil {
+		return f.nonStreamCallerGone(acct, err, attemptStarted)
+	}
+
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	// fail：释放本次在途租约（否则下一轮 heldUID 被覆盖后该账号名额永不归还）
 	// + 失败号正是粘性号时解绑。

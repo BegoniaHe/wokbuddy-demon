@@ -100,7 +100,8 @@ func TestChat401RefreshesAndReplaysOnce(t *testing.T) {
 }
 
 // TestChatQueueFullIsChannelLevel 队列满载（6021 / 只有 queue.full 文案）是渠道级
-// 容量事件：只打一次上游、不轮转、账号零惩罚，返回 503 + queue_full 透传上游原文。
+// 容量事件：只打一次上游、不轮转、账号零惩罚，返回 429 + Retry-After + queue_full
+// 透传上游原文（issue #391：503 会让调用侧按「服务不可用」中断任务）。
 func TestChatQueueFullIsChannelLevel(t *testing.T) {
 	t.Parallel()
 
@@ -122,7 +123,17 @@ func TestChatQueueFullIsChannelLevel(t *testing.T) {
 	}
 }
 
-// assertQueueFullChannelLevel 单次断言：只打一次上游、503 queue_full、账号零惩罚。
+// assertRetryAfterHeader 断言 429 带 Retry-After：调用侧据它退避，而不是把 4xx 当致命
+// 错误（issue #391：队列语义不能被翻译成「服务不可用」）。
+func assertRetryAfterHeader(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+
+	if rec.Header().Get("Retry-After") == "" {
+		t.Errorf("429 must carry Retry-After, headers=%v", rec.Header())
+	}
+}
+
+// assertQueueFullChannelLevel 单次断言：只打一次上游、429 + queue_full、账号零惩罚。
 func assertQueueFullChannelLevel(t *testing.T, status int, body string) {
 	t.Helper()
 
@@ -150,9 +161,11 @@ func assertQueueFullChannelLevel(t *testing.T, status int, body string) {
 
 	rec := postChat(t, h, `{"model":"glm-5.2","messages":[]}`)
 
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("code=%d want 503, body=%s", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429, body=%s", rec.Code, rec.Body)
 	}
+
+	assertRetryAfterHeader(t, rec)
 
 	got := rec.Body.String()
 	if !strings.Contains(got, "queue_full") || !strings.Contains(got, "queue.full.title") {
