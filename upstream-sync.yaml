@@ -14,30 +14,33 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 33ce2f15025c59e38b71da5b92cde403a2ca35d1
-  audited_at_utc: 2026-10-26T07:21:49Z
+  commit: 9ca34c2b3fc67d8e971224d0795947a69e5ea51b
+  audited_at_utc: 2026-10-28T16:38:12Z
   sync_method: audit
   official_baseline:
-    cn: 5.8.3.41334564-db0e9b51 (commit db0e9b51b7fa0b383f41f5b0b83dd442c8557918)
-    global: 5.8.4.41366630-73952edb (commit 73952edb48da46bd0b244661efe22f4f247c4977)
+    cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
+    global: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
   reviewed_window:
     from: 2026-10-25
-    to: 2026-10-26
-    non_merge_commits: 19
+    to: 2026-10-28
+    non_merge_commits: 29
   dispositions:
     issue: 5
-    skip: 19
+    revisit: 2
+    skip: 31
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/293
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/294
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/295
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/296
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/297
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/388
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/389
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/390
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/391
   note: >-
-    2026-10-26 审计 4662949..33ce2f1（19 条非 merge + 5 条 merge），官方
-    Win32 cn 5.8.3 / global 5.8.4 包与上一基线一致（无协议 drift）。19 条
-    非 merge 中 11 条已由本仓独立演进覆盖或属参考 fork 面板/测试形态，按 skip
-    记录；确认 5 个缺口并开 Issue #293–#297（redisstore LoadBinds N+1、
-    credit CLI refresh/坏文件、登录轮询可观测性、池状态迁移日志、弱 api_key
-    启动告警）。signin 结构化幂等码 10001 需在签到端点实测并与充值码区分，
-    本次未单开 Issue。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
+    2026-10-28 审计 33ce2f1..9ca34c2（29 条非 merge + 9 条 merge），官方基线
+    升到 Win32 cn/global 5.9.3.42398134（commit d4692421）。区间内的 5.9.3
+    请求契约对齐（ee1c80d / 8ecf115 / 47f1ed6）已由本仓 #364–#377 全部落地并
+    关单，故整体 skip；确认 4 个缺口开 Issue #388（sanitize 未覆盖 DSH @ 路径段）、
+    #389（11-128 后无「按句界拆 system」重试）、#390（schema enum 缺 type 未推断）、
+    #391（6021 队列满回 503）；2 条挂 revisit：/v1/embeddings 端点（新特性非协议
+    缺口，KISS 暂不做）、baggage 条件键 x-agent-runtime / x-agent-intent（官方包内
+    存在，但与 #364 真机 4 条样本冲突，待真机复核）。面板 / AutoBot / updater /
+    models.allowed / tools 计数 / makeup 上限 / 11102 无负缓存等按形态差异或已覆盖
+    skip。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
