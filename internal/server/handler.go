@@ -3808,6 +3808,8 @@ func futureOrZero(t, now time.Time) time.Time {
 //     与 no_healthy_account 区分——两者的排查方向完全不同（前者是上游慢，后者是号全挂）。
 //   - 上游流截断/空流且所有号都如此（issue #105）：502 + upstream_parse，与「解析失败」
 //     同口径——客户端别把「上游坏了」读成「号全挂了」而盲目重试。
+//   - 出站代理层失败（issue #15/#39）：502 + proxy_dial_failed。代理槽不可用是部署侧
+//     配置问题，与号池健康无关；落回 no_healthy_account 会让运维去查账号。
 func localErrorEnvelope(
 	err error, fallbackStatus int, fallbackCode, fallbackMsg string,
 ) (status int, code, msg string, ok bool) {
@@ -3827,6 +3829,14 @@ func localErrorEnvelope(
 		// 非流式聚合总量超限（issue #113）：同 502 upstream_parse，不落回
 		// no_healthy_account（那会把「上游吐了超大响应」表述成「号全挂了」）。
 		return http.StatusBadGateway, "upstream_parse", err.Error(), true
+	case errors.Is(err, outbound.ErrProxyDial):
+		// 出站代理层失败（issue #15/#39）：回 502 而不是 no_healthy_account。原文含
+		// 槽 id 与上游地址，只回固定文案（细节留在 WARN 行），不把部署配置回显给客户端。
+		return http.StatusBadGateway, "proxy_dial_failed",
+			"outbound proxy dial failed: the account's egress proxy is unavailable and " +
+				"the request was not routed to a direct connection; check upstream.proxy_slots / " +
+				"realm_proxy_slots",
+			true
 	default:
 		return fallbackStatus, fallbackCode, fallbackMsg, false
 	}
