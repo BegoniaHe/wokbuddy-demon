@@ -51,7 +51,10 @@ func TestNonStreamCallerGoneIsInterrupted(t *testing.T) {
 
 	var buf bytes.Buffer
 
-	handler := NewHandler(&Config{Pool: state, Upstream: callerGoneUpstream(&calls, cancel), SoftCooldown: time.Minute})
+	reqLog := reqlog.New(reqlog.Config{})
+	handler := NewHandler(&Config{
+		Pool: state, Upstream: callerGoneUpstream(&calls, cancel), SoftCooldown: time.Minute, RequestLog: reqLog,
+	})
 	handler.chatLogOut = &buf
 	handler.chatLogEnabled = true
 
@@ -75,6 +78,9 @@ func TestNonStreamCallerGoneIsInterrupted(t *testing.T) {
 		t.Errorf("请求日志不该出现 upstream_parse:\n%s", row)
 	}
 
+	// 归档事件与流水行同口径：499/interrupted，不能因没写响应体就回落成 200。
+	assertCallerGoneReqLog(t, reqLog)
+
 	if n := calls.Load(); n != 1 {
 		t.Errorf("upstream calls=%d want 1 (调用方已走，不轮转)", n)
 	}
@@ -86,6 +92,21 @@ func TestNonStreamCallerGoneIsInterrupted(t *testing.T) {
 
 	if acctStatus.SuccessCount != 1 {
 		t.Errorf("success_count=%d want 1（与流式 interrupted 同口径：上游帧无恙）", acctStatus.SuccessCount)
+	}
+}
+
+// assertCallerGoneReqLog 归档事件必须与流水行同口径：499/interrupted 且不算成功。
+func assertCallerGoneReqLog(t *testing.T, reqLog *reqlog.Recorder) {
+	t.Helper()
+
+	snap := reqLog.Snapshot()
+	if len(snap.Recent) != 1 {
+		t.Fatalf("recent=%+v", snap.Recent)
+	}
+
+	ev := snap.Recent[0]
+	if ev.Status != clientClosedRequestStatus || ev.Outcome != reqlog.OutcomeInterrupted || ev.OK {
+		t.Errorf("reqlog 应按 499/interrupted 记账: %+v", ev)
 	}
 }
 
