@@ -469,7 +469,12 @@ function ExpiryBox({
               variant="ghost"
               aria-expanded={totalsOpen}
               aria-controls="expiry-totals"
-              onClick={() => setTotalsOpen()}
+              onClick={() => {
+                // 合计块渲染在 expanded 分支内：卡片折叠时点它只会翻标签、屏幕上
+                // 什么都不变，故折叠态一并展开（否则按钮像是坏了）。
+                if (!expanded) setExpanded(true);
+                setTotalsOpen();
+              }}
             >
               {totalsOpen ? '收起合计' : '按日合计'}
             </Button>
