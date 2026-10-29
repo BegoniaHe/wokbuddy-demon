@@ -55,11 +55,19 @@ const sseOK = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\"
 
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
+//
+// models.dev 目录拉取（models.dev 的按需兜底）复用同一个 HTTP client，但目标不是
+// 上游：这里按 host 短路返回空文档，既不联网也不进入 behavior（避免污染各用例的
+// 「上游调用次数」断言）。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {
 	t.Helper()
 
 	return &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Host == "models.dev" {
+				return jsonResponse(http.StatusOK, "{}"), nil
+			}
+
 			authz := r.Header.Get("Authorization")
 			status, body, isStream := behavior(authz)
 
