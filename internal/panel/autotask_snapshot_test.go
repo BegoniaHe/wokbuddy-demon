@@ -446,9 +446,9 @@ func TestRunAutoAllAcceptsSharedTaskOnce(t *testing.T) {
 	}
 }
 
-// TestRunAutoAllRefreshesMPAfterBatchAccept mp 批量 accept 后快照必须更新为
-// accepted；否则每个 mp 动作会再走一次 accept+回读，抵消本轮快照的收益。
-func TestRunAutoAllRefreshesMPAfterBatchAccept(t *testing.T) {
+// TestRunAutoAllMPActionSeesBatchAccept mp 批量 accept 后，动作执行前的实时
+// 回读必须看到 accepted，避免按快照中的接受前状态重复 accept。
+func TestRunAutoAllMPActionSeesBatchAccept(t *testing.T) {
 	t.Parallel()
 
 	upstreamStub := &snapshotUpstream{
@@ -467,7 +467,7 @@ func TestRunAutoAllRefreshesMPAfterBatchAccept(t *testing.T) {
 	}
 
 	if seen.AcceptStatus != "accepted" {
-		t.Errorf("动作任务 accept_status=%q want accepted（批量接受后需刷新快照）", seen.AcceptStatus)
+		t.Errorf("动作任务 accept_status=%q want accepted（批量接受后动作前读取应为 accepted）", seen.AcceptStatus)
 	}
 
 	_, mpCalls, acceptCalls, _, _ := upstreamStub.counts()
@@ -475,13 +475,13 @@ func TestRunAutoAllRefreshesMPAfterBatchAccept(t *testing.T) {
 		t.Errorf("accept=%d want 1", acceptCalls)
 	}
 
-	if mpCalls != 4 {
-		t.Errorf("mp GET=%d want 4（执行前 + 批量接受后刷新 + 动作前实时读取 + 动作后回读）", mpCalls)
+	if mpCalls != 3 {
+		t.Errorf("mp GET=%d want 3（执行前 + 动作前实时读取 + 动作后回读）", mpCalls)
 	}
 }
 
 // TestRunAutoAllMPLookupPrefersMPOverDefaultSnapshot 同一 mp code 同时出现在
-// 默认/mp 列表时，默认列表的 accept 前状态不得覆盖已刷新的 mp 快照。
+// 默认/mp 列表时，默认列表的 accept 前状态不得覆盖 accept 后的 mp 快照。
 func TestRunAutoAllMPLookupPrefersMPOverDefaultSnapshot(t *testing.T) {
 	t.Parallel()
 

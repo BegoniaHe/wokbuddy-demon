@@ -1507,15 +1507,6 @@ func (p *Panel) runAutoAllActions(account6 *auth.Auth, actions []autoAction) []m
 	snapshot.mpTasks, snapshot.mpErr = p.cfg.Upstream.ListTasksMP(account6)
 	snapshot.mpByCode = indexTasksByCode(snapshot.mpTasks)
 	out = append(out, p.autoAcceptBatchMP(account6, snapshot.mpTasks)...)
-	// mp 批量 accept 成功后，上面的列表仍是接受前状态（not_accepted），而
-	// acceptMPTaskIfNeeded/acceptMPAndRefresh 会据此重复 accept。批量接受后
-	// 再读一次拿真实登记状态；失败时保留旧快照，动作侧仍按码 accept+回读验证。
-	if len(pendingTaskCodes(snapshot.mpTasks)) > 0 {
-		if mpTasks, err := p.cfg.Upstream.ListTasksMP(account6); err == nil {
-			snapshot.mpTasks = mpTasks
-			snapshot.mpByCode = indexTasksByCode(mpTasks)
-		}
-	}
 
 	for _, act := range actions {
 		out = append(out, p.autoRunActionWithSnapshot(account6, act, snapshot))
@@ -1568,8 +1559,8 @@ func (s *autoTaskSnapshot) lookupBeforeAction(code string) (*upstream.Task, bool
 }
 
 // lookupMPBeforeAction 定位 mp 专属任务。mp 列表是权威口径：两口径同时下发
-// 同一 code 时必须取 mp 快照，否则默认列表 accept 前的旧状态会绕过批量接受后
-// 的 mp 刷新；仅 mp 列表读取失败时才回退默认快照。
+// 同一 code 时必须取 mp 快照，否则默认列表 accept 前的旧状态会覆盖 mp 批量
+// 接受结果；仅 mp 列表读取失败时才回退默认快照。
 func (s *autoTaskSnapshot) lookupMPBeforeAction(code string) (*upstream.Task, bool) {
 	if s.mpErr == nil {
 		if t, ok := taskFromSnapshot(s.mpByCode, code); ok {
