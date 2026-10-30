@@ -39,6 +39,10 @@
   落盘路径：`.tmp/workbuddy/<realm>/<version>/`，`<version>` 取文件名中的
   完整版本串（含构建 hash，如 `5.8.4.41366630-73952edb`）。
 
+- `scripts/wine_login.py`：用 `auths/<uid>.json` 注入客户端登录态后启动。何时用、
+  边界与成功判定见 `SKILL.md`「用网关凭证登录 wine 客户端」；登录态落盘形制与
+  证据锚点见 `references/protocol-anchors.md`「客户端登录态落盘」。
+
 ## 已知数据形态（2026-10-22 核对，Win32）
 
 | Realm | 包版本 | `cli/product.json` `productName` | `endpoint` | `authentication.id` | commit | date |

@@ -146,6 +146,35 @@
 - `/v2/user-asset/*`：appearance/set 已覆盖，skill/assets 族未覆盖。
 - `/v2/service-proxy`、`/v3/group/*`、`/v2/spans`：客户端内部域，非网关目标。
 
+## 客户端登录态落盘（auth session）
+
+写「用网关凭证登录客户端」或排查登录态时的事实锚点（Win32 5.9.3 核对）：
+
+- 路径：`<sharedDataPath>/auth/<authentication.id>.info`。
+  `<sharedDataPath>` = `<basePath>/Data/Public`，win32 `basePath` =
+  `%USERPROFILE%\AppData\Local\<产品目录>`（`main/module-base.js:FilePathServiceImpl`）；
+  `authentication.id` 取 `cli/product.json`（CN/global 均 `workbuddy-desktop`，见
+  REFERENCE.md 的形态表）。wine prefix 里实测落在
+  `drive_c/users/<u>/AppData/Local/CodeBuddyExtension/Data/Public/auth/`。
+- 顶层结构：`{auth, account, accounts[], allAccounts[]}`；
+  `auth` = `accessToken` / `refreshToken` / `tokenType` / `expiresAt`(ms) /
+  `refreshExpiresAt`(ms) / `lastRefreshTime`(ms) / `expiresIn` / `refreshExpiresIn`
+  / `sessionState` / `scope` / `notBeforePolicy` / `domain`；
+  `accounts`/`allAccounts` 是账号切换快照，**刷新时为空会直接报
+  `Failed to refresh session: account list is empty`**（`main/common2.js`）。
+- 敏感字段（`auth.accessToken`、`auth.refreshToken`、`account|allAccounts[].nickname`、
+  `phoneNumber`、`departmentFullName`，见 `main/credential-protection.js` 的字段表）
+  在磁盘上是 `$wbEncrypted` 信封（AES-256-GCM，`suite=1`，AAD 只含
+  framing/keyId/suite，见 `buildAuthenticatedContextAad`；本仓读取实现
+  `internal/desktopcred/`）。但 `decodeString` 对普通字符串**原样放行**，所以明文
+  注入可用，客户端读到后会走 migration 重新 seal。
+- 账号元数据来源：`GET {endpoint}/v2/plugin/accounts`（`main/common2.js:getAccountSnapshot`
+  拼 `${prefixPath}=/plugin`），返回对象字段与 `account` 一一对应；带
+  `Authorization: Bearer` + `X-User-Id`，坏 token 直接 401。
+- 登录态刷新：`/v2/plugin/auth/token/refresh`（`X-Refresh-Token`），与网关同源；
+  文件目录有 watcher，外部改写会热加载（`main/file-authentication-storage.js`），
+  登出靠 `<name>.info.logged-out` 标记。
+
 无桌面包证的端点（`get-user-request-usage`、`/billing/ide/trial`、
 `/billing/area/get-country-code` 等，契约来自第三方脚本 / 实测 / 参考实现）集中列在
 `internal/upstream/UPSTREAM.md` §六「无桌面包证端点」表，写报告时按那张表取来源口径，
