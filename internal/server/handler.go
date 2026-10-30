@@ -460,18 +460,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.cfg.RequestLog.Begin()
 
 		defer func() {
-			status := obs.status
-			// 调用方已断开（499）等「不写响应体」的收尾路径没有 header 可捕获，回落到
-			// chat 统计里已定性的状态，避免 reqlog 把中断记成 200。
-			if status == 0 && trace.stat != nil {
-				status = trace.stat.status
-			}
-
-			if status == 0 {
-				status = http.StatusOK
-			}
-
-			ev := trace.event(status)
+			ev := trace.finalEvent(obs.status)
 			h.cfg.RequestLog.Record(&ev)
 		}()
 

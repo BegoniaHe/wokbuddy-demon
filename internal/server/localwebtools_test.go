@@ -303,7 +303,10 @@ func TestLocalWebToolLoopStopsOnRequestCancel(t *testing.T) {
 
 	up := recordingUpstream(t, []string{twoToolCallSSE, sseOK}, &seen)
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	handler := NewHandler(&Config{Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3})
+	reqLog := reqlog.New(reqlog.Config{})
+	handler := NewHandler(&Config{
+		Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3, RequestLog: reqLog,
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -342,6 +345,21 @@ func TestLocalWebToolLoopStopsOnRequestCancel(t *testing.T) {
 
 	if len(seen) != 1 {
 		t.Fatalf("上游收到 %d 次请求，want 1（取消后不得再开新一轮）", len(seen))
+	}
+
+	// 调用方已断开：连接已关，不写响应体、不回落成 502（issue #404 同口径）。
+	if rec.Body.Len() != 0 {
+		t.Fatalf("调用方已断开时不该写响应体，got %d bytes: %s", rec.Body.Len(), rec.Body)
+	}
+
+	snap := reqLog.Snapshot()
+	if len(snap.Recent) != 1 {
+		t.Fatalf("recent=%+v", snap.Recent)
+	}
+
+	ev := snap.Recent[0]
+	if ev.Status != clientClosedRequestStatus || ev.Outcome != reqlog.OutcomeInterrupted || ev.OK {
+		t.Errorf("reqlog 应按 499/interrupted 记账: %+v", ev)
 	}
 }
 

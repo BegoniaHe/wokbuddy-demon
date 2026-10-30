@@ -28,6 +28,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -126,6 +127,10 @@ func (h *Handler) serveResponsesWithLocalTools(
 
 	final, err := h.runLocalWebToolLoop(r, req, msgs, model)
 	if err != nil {
+		// 调用方已断开：同 #404 口径，不写响应体、不压成 502 污染上游故障样本。
+		if localToolCallerGone(r) {
+			return
+		}
 		// 内层请求级错误（content_blocked / prompt_too_long / 参数错 / 模型不存在）
 		// 保留原状态码与分类 code，不压平成 502（issue #416）。
 		if toolErr, ok := errors.AsType[*localWebToolLoopError](err); ok {
@@ -150,6 +155,21 @@ func (h *Handler) serveResponsesWithLocalTools(
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// localToolCallerGone 报告入站请求是否已断开，并把请求日志定性为 499 / interrupted：
+// 连接已关，写响应体没有意义；最后一轮 chatStat 可能仍是成功，不能用来冒充结果。
+func localToolCallerGone(r *http.Request) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+
+	if trace := requestTraceFrom(r); trace != nil {
+		trace.fallbackStatus = clientClosedRequestStatus
+		trace.noteOutcome(reqlog.OutcomeInterrupted)
+	}
+
+	return true
 }
 
 // runLocalWebToolLoop 反复执行模型请求与本地工具，返回最终 chat 响应。

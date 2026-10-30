@@ -744,6 +744,10 @@ type requestTrace struct {
 	account string
 	model   string
 	outcome string
+	// fallbackStatus 处理器未写响应体时用于归档的状态（如调用方断开 499）。
+	// 优先级高于 stat：本地工具循环中断时最后一轮 chatStat 仍是成功状态，
+	// 不能用它冒充最终结果。
+	fallbackStatus int
 }
 
 // noteChatStat 登记一轮 chat 统计：stat 保留最后一轮，stats 逐轮累积。
@@ -818,6 +822,15 @@ func (t *requestTrace) noteResult(account, model, outcome string) {
 	t.account, t.model, t.outcome = account, model, outcome
 }
 
+// noteOutcome 只覆盖请求级结果，保留 chat 统计里已有的账号/模型（nil 安全）。
+func (t *requestTrace) noteOutcome(outcome string) {
+	if t == nil {
+		return
+	}
+
+	t.outcome = outcome
+}
+
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
 // 来源信息比 token 计数敏感，是否落盘由 logging.request_client_info 决定。
 func (t *requestTrace) captureClientInfo(r *http.Request, trusted []*net.IPNet) {
@@ -858,6 +871,25 @@ func requestTraceFrom(r *http.Request) *requestTrace {
 	return tr
 }
 
+// finalEvent 定性最终状态：调用方已断开（499）等「不写响应体」的路径没有 header
+// 可捕获，回落到处理器显式状态（fallbackStatus），再回落 chat 统计，避免记成 200。
+func (t *requestTrace) finalEvent(observed int) reqlog.Event {
+	status := observed
+	if status == 0 && t.fallbackStatus != 0 {
+		status = t.fallbackStatus
+	}
+
+	if status == 0 && t.stat != nil {
+		status = t.stat.status
+	}
+
+	if status == 0 {
+		status = http.StatusOK
+	}
+
+	return t.event(status)
+}
+
 func (t *requestTrace) event(status int) reqlog.Event {
 	event := reqlog.Event{
 		Time:      t.start,
@@ -872,12 +904,12 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	if stat == nil {
 		// 非 chat 路径（搜索）：用 handler 写入的元数据，保持与 chat 行同字段口径。
 		event.Account, event.Model = t.account, t.model
-
-		if t.outcome != "" {
-			event.Outcome = t.outcome
-		}
 	} else {
 		applyChatStat(&event, stat)
+	}
+	// 显式结果优先于底层统计：本地工具循环中断时 chatStat 仍带成功 outcome。
+	if t.outcome != "" {
+		event.Outcome = t.outcome
 	}
 
 	event.KeyID = t.keyID
