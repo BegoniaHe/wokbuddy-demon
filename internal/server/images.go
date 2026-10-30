@@ -250,8 +250,10 @@ func (h *Handler) forwardImages(
 
 	call := h.imageCaller(upstreamPath)
 
-	first := imagesAttempt{started: time.Now()}
+	firstStart := time.Now()
+	first := imagesAttempt{}
 	first.status, first.raw, first.err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+	first.latencyMs = attemptLatencyMs(firstStart)
 
 	final, retried, refreshFail := h.retryImagesAfterRefresh(r, acct, body, meta, call, first)
 	if retried {
@@ -292,12 +294,14 @@ func (h *Handler) forwardImages(
 	_, _ = w.Write(final.raw)
 }
 
-// imagesAttempt 一次出图上游尝试的结果与起始时刻（用于逐跳记延迟）。
+// imagesAttempt 一次出图上游尝试的结果与本跳耗时。
+// 耗时必须在**该跳返回时**采样：首跳的记账发生在 refresh + 重放之后，
+// 若此时才用起始时刻计算，会把刷新与重放耗时重复算进首跳（issue #424）。
 type imagesAttempt struct {
-	status  int
-	raw     []byte
-	err     error
-	started time.Time
+	status    int
+	raw       []byte
+	err       error
+	latencyMs int64
 }
 
 // retryImagesAfterRefresh 上游 401 时同号 refresh 后重放一次。
@@ -324,8 +328,10 @@ func (h *Handler) retryImagesAfterRefresh(
 
 	_ = acct.SaveAtomicRetry()
 
-	second := imagesAttempt{started: time.Now()}
+	secondStart := time.Now()
+	second := imagesAttempt{}
 	second.status, second.raw, second.err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+	second.latencyMs = attemptLatencyMs(secondStart)
 
 	return second, true, nil
 }
@@ -407,7 +413,7 @@ func (h *Handler) recordImagesAttempt(
 	}
 
 	delta := &usage.Delta{
-		LatencyMs: attemptLatencyMs(attempt.started), HasLatency: true,
+		LatencyMs: attempt.latencyMs, HasLatency: true,
 	}
 	ok := attempt.err == nil
 
