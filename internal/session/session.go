@@ -272,6 +272,8 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 		r.cfg.Store.DelBind(key)
 	}
 
+	// 镜像写必须与内存状态在同一把锁内提交：否则 Unbind 的删条目 + DelBind 可以
+	// 插进「解锁 → SetBind」之间，让已解绑的绑定在 Redis 里复活（issue #417）。
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 
 	return uid, true
@@ -366,13 +368,11 @@ func (r *Router) touch(key, uid, model string, now time.Time) {
 
 	entry2.lastActive = now
 	r.entries[key] = entry2
-	r.mu.Unlock()
-
-	if suppressed {
-		return
+	// 镜像写留在锁内：与 Unbind/Degrade 的删除同序，避免已解绑的绑定复活。
+	if !suppressed {
+		r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 	}
-
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.mu.Unlock()
 }
 
 // pruneAvoidLocked 清理该会话已失效的抑制窗口，返回当前绑定是否仍被抑制。
@@ -444,8 +444,9 @@ func (r *Router) Bind(key, uid string) {
 			r.avoid[key] = kept
 		}
 	}
+
+	r.cfg.Store.SetBind(key, uid, r.cfg.TTL) // 与内存绑定同锁提交，保持镜像顺序
 	r.mu.Unlock()
-	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
 // avoidActive 报告会话当前绑定是否仍处于降级抑制：窗口内禁止复用原账号；
@@ -518,8 +519,8 @@ func (r *Router) Degrade(key, uid string, duration time.Duration) {
 	r.avoid[key] = list
 	entry2.lastActive = now
 	r.entries[key] = entry2
+	r.cfg.Store.DelBind(key) // 与内存状态同锁提交，避免后续 SetBind 与删除乱序
 	r.mu.Unlock()
-	r.cfg.Store.DelBind(key)
 }
 
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
@@ -529,12 +530,9 @@ func (r *Router) Unbind(key string) bool {
 	_, found := r.entries[key]
 	if found {
 		delete(r.entries, key)
+		r.cfg.Store.DelBind(key) // 同锁提交删除，防止并发 SetBind 把绑定写回
 	}
 	r.mu.Unlock()
-
-	if found {
-		r.cfg.Store.DelBind(key)
-	}
 
 	return found
 }
@@ -564,6 +562,7 @@ func (r *Router) gcOnce(now time.Time) int {
 	for _, key := range expiredKeys {
 		delete(r.entries, key)
 		delete(r.avoid, key)
+		r.cfg.Store.DelBind(key) // 同锁提交删除，避免与并发 SetBind 乱序
 	}
 	// 已解绑且窗口过期的抑制记录不再有用（绑定中的过期记录保留给 LowLoad 门控，
 	// 由 touch 在回纳时清除）。
@@ -586,10 +585,6 @@ func (r *Router) gcOnce(now time.Time) int {
 		}
 	}
 	r.mu.Unlock()
-
-	for _, key := range expiredKeys {
-		r.cfg.Store.DelBind(key)
-	}
 
 	return len(expiredKeys)
 }

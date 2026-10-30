@@ -1,6 +1,7 @@
 package redisstore
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,16 +81,16 @@ func TestBindKeyPrefix(t *testing.T) {
 }
 
 // TestZeroValueConcurrentInit（R3）：零值 Upstash 并发 goWrite/Close 时
-// 队列/写者只能初始化一次，不能出现字段写竞争。
+// 队列/写者池只能初始化一次，不能出现字段写竞争。
 func TestZeroValueConcurrentInit(t *testing.T) {
 	t.Parallel()
 
 	var store Upstash
 
 	var wg sync.WaitGroup
-	for range 16 {
+	for i := range 16 {
 		wg.Go(func() {
-			store.goWrite(func() {})
+			store.goWrite("k"+strconv.Itoa(i), func() {})
 		})
 	}
 
@@ -108,23 +109,28 @@ func TestCloseDrainsQueuedWrites(t *testing.T) {
 	var store Upstash
 
 	release := make(chan struct{})
-	started := make(chan struct{})
+	started := make(chan struct{}, writeWorkers)
 
 	var ran atomic.Int64
 
-	// 首个写阻塞住写者，后续写只能排队，模拟 Close 前已提交但未执行的写。
-	store.goWrite(func() {
-		close(started)
-		<-release
-		ran.Add(1)
-	})
+	// 占满全部写者，后续写只能排队，模拟 Close 前已提交但未执行的写。
+	for i := range writeWorkers {
+		store.goWrite("busy"+strconv.Itoa(i), func() {
+			started <- struct{}{}
 
-	<-started
+			<-release
+			ran.Add(1)
+		})
+	}
+
+	for range writeWorkers {
+		<-started
+	}
 
 	const queued = 3
 
-	for range queued {
-		store.goWrite(func() { ran.Add(1) })
+	for i := range queued {
+		store.goWrite("queued"+strconv.Itoa(i), func() { ran.Add(1) })
 	}
 
 	closed := make(chan struct{})
@@ -150,51 +156,106 @@ func TestCloseDrainsQueuedWrites(t *testing.T) {
 		t.Fatal("Close did not return after writes completed")
 	}
 
-	if got, want := ran.Load(), int64(1+queued); got != want {
+	if got, want := ran.Load(), int64(writeWorkers+queued); got != want {
 		t.Fatalf("ran=%d want %d (queued writes must run before Close returns)", got, want)
 	}
 }
 
-// TestWritesRunInSubmissionOrder（#417）：并发提交的写必须按提交顺序落地，慢的
-// 先提交写不能被后提交的写越过，否则旧快照 / 已解绑的绑定会覆盖新值。
-func TestWritesRunInSubmissionOrder(t *testing.T) {
+// recordInflight 记录本轮同时在途数峰值（同 key 只允许 1）。
+func recordInflight(maxSeen, inflight *atomic.Int64) {
+	maxSeen.Store(max(maxSeen.Load(), inflight.Add(1)))
+	inflight.Add(-1)
+}
+
+// TestSameKeyWritesAreSerializedAndCoalesced（#417）：同一 key 的写必须按提交顺序
+// 串行落地，且尚未开始的同 key 写只保留最后一笔（覆盖语义），避免每请求一次
+// SetBind 在慢链路上按请求数堆积。
+func TestSameKeyWritesAreSerializedAndCoalesced(t *testing.T) {
 	t.Parallel()
 
 	var store Upstash
 
-	const total = 32
+	release := make(chan struct{})
+	started := make(chan struct{})
+	seen := make(chan int, 8)
 
 	var (
-		mu   sync.Mutex
-		seen []int
+		inflight atomic.Int64
+		maxSeen  atomic.Int64
 	)
 
-	for i := range total {
-		store.goWrite(func() {
-			// 先提交的写人为拖慢，验证后提交者不会越过它。
-			time.Sleep(time.Millisecond)
+	store.goWrite("k", func() {
+		close(started)
 
-			mu.Lock()
+		<-release
 
-			seen = append(seen, i)
-			mu.Unlock()
+		recordInflight(&maxSeen, &inflight)
+
+		seen <- 0
+	})
+
+	<-started
+
+	for i := 1; i <= 5; i++ {
+		store.goWrite("k", func() {
+			recordInflight(&maxSeen, &inflight)
+
+			seen <- i
 		})
 	}
+
+	close(release)
 
 	if err := store.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	mu.Lock()
-	defer mu.Unlock()
+	close(seen)
 
-	if len(seen) != total {
-		t.Fatalf("ran=%d want %d", len(seen), total)
+	if maxSeen.Load() != 1 {
+		t.Fatalf("同 key 并发执行 %d 次，必须串行", maxSeen.Load())
 	}
 
-	for idx, got := range seen {
-		if got != idx {
-			t.Fatalf("write order[%d]=%d want %d（写必须按提交顺序落地）", idx, got, idx)
+	var order []int
+	for v := range seen {
+		order = append(order, v)
+	}
+
+	// 首笔已开工不可合并；排队中的 5 笔只保留最后一笔。
+	if len(order) != 2 || order[0] != 0 || order[1] != 5 {
+		t.Fatalf("order=%v want [0 5]（首笔 + 合并后的最后一笔）", order)
+	}
+}
+
+// TestDifferentKeysRunConcurrently：不同 key 的写由写者池并行执行，慢链路吞吐
+// 不应退化为单写者的 1/RTT。
+func TestDifferentKeysRunConcurrently(t *testing.T) {
+	t.Parallel()
+
+	var store Upstash
+
+	release := make(chan struct{})
+	started := make(chan struct{}, writeWorkers)
+
+	for i := range writeWorkers {
+		store.goWrite("k"+strconv.Itoa(i), func() {
+			started <- struct{}{}
+
+			<-release
+		})
+	}
+
+	for range writeWorkers {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("不同 key 的写没有并发执行（已启动 %d/%d）", len(started), writeWorkers)
 		}
+	}
+
+	close(release)
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }

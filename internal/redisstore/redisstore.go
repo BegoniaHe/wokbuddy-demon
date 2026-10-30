@@ -1,12 +1,14 @@
 // Package redisstore 封装 Upstash（Redis）持久化，并提供内存降级（Noop）。
 //
 // 设计约束：Upstash 走公网 TLS，单次 RTT 可能 50~300ms，因此所有写操作都是
-// fire-and-forget（交给单写者 goroutine 串行落地 + 失败仅 debug 日志），读操作只
-// 发生在启动时（加载粘性会话镜像、恢复冷却/熔断快照）。内存为主、Redis 为辅。
+// fire-and-forget（交给写者池后台落地 + 失败仅 debug 日志），读操作只发生在
+// 启动时（加载粘性会话镜像、恢复冷却/熔断快照）。内存为主、Redis 为辅。
 //
-// 单写者（issue #417）：早先每次写起独立 goroutine，完成顺序不受提交顺序约束，
-// 旧快照 / 已解绑的绑定可能后落地覆盖新值。现在统一入队、由一个 goroutine 按
-// 提交顺序串行执行；Close 仍保证已提交的写全部执行完。
+// 写模型（issue #417）：早先每次写起独立 goroutine，完成顺序不受提交顺序约束，
+// 旧快照 / 已解绑的绑定可能后落地覆盖新值。现在写进入有界队列，由写者池并发执行，
+// 但**同一个 Redis key 的写严格按提交顺序串行**；排队中的同 key 写只保留最后一笔
+// （覆盖写语义），避免每请求一次 SetBind 在慢链路上无限堆积。Close 仍保证已提交
+// 的写全部执行完。
 //
 // 未配置 url / 连接失败时降级为 Noop：一切功能照常工作（纯内存模式），
 // 上层只打一条启动警告日志。
@@ -23,8 +25,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// keyTTL 粘性会话镜像 + 状态快照的默认 TTL（redis 侧兜底，防脏数据长期滞留）。
-const keyTTL = 7 * 24 * time.Hour
+const (
+	// keyTTL 粘性会话镜像 + 状态快照的默认 TTL（redis 侧兜底，防脏数据长期滞留）。
+	keyTTL = 7 * 24 * time.Hour
+	// writeWorkers 写者池并发度：跨 key 并行，单 key 仍串行。慢链路 RTT 下吞吐为
+	// writeWorkers/RTT；同 key 合并后队列长度以活跃 key 数为界，不会按请求数堆积。
+	writeWorkers = 8
+)
 
 // Store 只放本期需要的方法。上下文由实现内部构造（读操作配短超时，写操作 fire-and-forget）。
 //
@@ -114,28 +121,38 @@ func normalizeURL(url, token string) string {
 
 // Upstash 真实现：redis.Client 封装。
 //
-// 写模型（issue #417）：所有异步写进入同一条队列，由 runWriter 单个 goroutine 按
-// 提交顺序串行落地。这消除了「后提交的先完成、旧快照覆盖新值」的乱序窗口；
-// 写仍是 fire-and-forget（调用方不等待），Close 前提交的写保证执行完，Close 后
-// 提交的写直接丢弃。
+// 写模型（issue #417）：写进入队列，由 writeWorkers 个写者并发执行；同一 Redis
+// key 的写严格按提交顺序串行，排队中的同 key 写合并为最后一笔。写仍是
+// fire-and-forget（调用方不等待），Close 前提交的写保证执行完，Close 后提交的
+// 写直接丢弃。
 type Upstash struct {
 	client *redis.Client
-	// mu 保护 queue / stopped：入队顺序即提交顺序（单写者据此串行执行）。
+	// mu 保护 queue/pending/busy/stopped；cond 挂在 mu 上，写者等活/关停广播用。
 	mu sync.Mutex
-	// queue 未执行的写（FIFO）；notify 有新写时唤醒空闲的写者（cap=1 合并唤醒）。
-	queue  []func()
-	notify chan struct{}
+	// queue 待执行写（FIFO）；pending 记录每个 key 最后一条未开始的写，新写可
+	// 原地替换它（覆盖语义）；busy 标记正在执行的 key，保证同 key 串行。
+	queue   []*writeJob
+	pending map[string]*writeJob
+	busy    map[string]bool
+	cond    *sync.Cond
 	// stopped Close 后置位：此后提交的写直接丢弃，写者排空队列后退出。
 	stopped bool
-	// initOnce 保证 queue/notify 初始化与写者启动只发生一次（并发 goWrite/Close 安全）。
+	// initOnce 保证队列/写者池初始化只发生一次（并发 goWrite/Close 安全）。
 	initOnce sync.Once
 	// wg 已提交未完成的写（Close 排空用）。
 	wg sync.WaitGroup
 }
 
-// goWrite 以 fire-and-forget 方式登记一次写：入队后由单写者串行执行。
+// writeJob 一次异步写：key 是 Redis key（同 key 串行 + 合并），fn 执行实际命令。
+type writeJob struct {
+	key string
+	fn  func()
+}
+
+// goWrite 以 fire-and-forget 方式登记一次写：按 key 入队，由写者池落地。
 // Close 前提交的写必然执行（停机镜像完整性），Close 后提交的写直接丢弃。
-func (u *Upstash) goWrite(fn func()) {
+// 同 key 尚未开始的写会被原地替换为新 fn（覆盖写，后写胜出）。
+func (u *Upstash) goWrite(key string, fn func()) {
 	u.ensureInit()
 	u.mu.Lock()
 
@@ -145,55 +162,84 @@ func (u *Upstash) goWrite(fn func()) {
 		return
 	}
 
-	u.queue = append(u.queue, fn)
-	// 与入队同锁 Add：Close 在同一把锁下置 stopped 并 wg.Wait，Wait 与 Add
-	// 不并发（否则零计数下并发 Add 属 WaitGroup 误用）。
+	// 合并：该 key 还有未开始的写时直接替换，不新增队列项与 wg 计数。
+	if job, ok := u.pending[key]; ok {
+		job.fn = fn
+		u.mu.Unlock()
+
+		return
+	}
+
+	job := &writeJob{key: key, fn: fn}
+	u.queue = append(u.queue, job)
+	u.pending[key] = job
+	// 与入队同一把锁 Add：Close 在同一把锁下置 stopped 并 wg.Wait，
+	// Wait 与 Add 不并发（否则零计数下并发 Add 属 WaitGroup 误用）。
 	u.wg.Add(1)
 	u.mu.Unlock()
 
-	// 非阻塞唤醒：缓冲 1 已足够，写者醒来后会把队列取空。
-	select {
-	case u.notify <- struct{}{}:
-	default:
-	}
+	u.cond.Signal()
 }
 
-// ensureInit 初始化队列与 done 标志并启动写者（幂等）。
-// New 与测试零值构造共用同一入口；sync.Once 保证并发首用时不竞争。
+// ensureInit 初始化队列与写者池（幂等）。New 与测试零值构造共用同一入口。
 func (u *Upstash) ensureInit() {
 	u.initOnce.Do(func() {
-		u.queue = make([]func(), 0)
-		u.notify = make(chan struct{}, 1)
+		u.queue = make([]*writeJob, 0)
+		u.pending = map[string]*writeJob{}
+		u.busy = map[string]bool{}
+		u.cond = sync.NewCond(&u.mu)
 
-		go u.runWriter()
+		for range writeWorkers {
+			go u.runWriter()
+		}
 	})
 }
 
-// runWriter 单写者：按入队顺序执行写；队列空且已停止时退出。
+// runWriter 写者：取一条 key 空闲的写执行；同 key 串行，跨 key 并行。
 func (u *Upstash) runWriter() {
 	for {
-		u.mu.Lock()
-
-		if len(u.queue) == 0 {
-			if u.stopped {
-				u.mu.Unlock()
-
-				return
-			}
-
-			u.mu.Unlock()
-			<-u.notify
-
-			continue
+		job := u.claim()
+		if job == nil {
+			return // 已停止且队列排空
 		}
 
-		fn := u.queue[0]
-		u.queue[0] = nil // 立即释放闭包引用，避免长队列滞留已执行写
-		u.queue = u.queue[1:]
-		u.mu.Unlock()
+		job.fn()
 
-		fn()
+		u.mu.Lock()
+		delete(u.busy, job.key)
+		u.mu.Unlock()
 		u.wg.Done()
+		u.cond.Broadcast() // 该 key 解锁后可能有排队写可开工
+	}
+}
+
+// claim 等待并取一条可执行的写并标记其 key 忙；收到关停且队列排空时返回 nil。
+// 队列里的写若 key 都在执行中，必须等（不能越过在途写，也不能空转）。
+func (u *Upstash) claim() *writeJob {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	for {
+		for i, job := range u.queue {
+			if u.busy[job.key] {
+				continue // 同 key 正在执行：保持提交顺序
+			}
+
+			u.queue = append(u.queue[:i], u.queue[i+1:]...)
+			if u.pending[job.key] == job {
+				delete(u.pending, job.key) // 已开工：后续同 key 写必须重新入队
+			}
+
+			u.busy[job.key] = true
+
+			return job
+		}
+
+		if u.stopped && len(u.queue) == 0 {
+			return nil
+		}
+
+		u.cond.Wait()
 	}
 }
 
@@ -208,10 +254,7 @@ func (u *Upstash) Close() error {
 	u.stopped = true
 	u.mu.Unlock()
 
-	select {
-	case u.notify <- struct{}{}:
-	default:
-	}
+	u.cond.Broadcast()
 
 	done := make(chan struct{})
 
@@ -248,7 +291,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 		ttl = keyTTL
 	}
 
-	u.goWrite(func() {
+	u.goWrite(bindKey(key), func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
@@ -260,7 +303,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 
 // DelBind 异步删除粘性会话绑定。
 func (u *Upstash) DelBind(key string) {
-	u.goWrite(func() {
+	u.goWrite(bindKey(key), func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
@@ -272,7 +315,7 @@ func (u *Upstash) DelBind(key string) {
 
 // SaveState 异步写池状态 JSON 快照。
 func (u *Upstash) SaveState(data []byte) {
-	u.goWrite(func() {
+	u.goWrite(stateKey, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
