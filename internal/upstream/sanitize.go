@@ -252,17 +252,27 @@ func sanitizeJSONString(raw string) (string, bool) {
 // sanitizeJSONValues 结构化净化：解析 JSON → 递归净化字符串值 → 重新编码。
 // 键名保持原样（指纹只落在值里）；解析/编码失败返回 false 由调用方保留文本结果。
 func sanitizeJSONValues(raw string) (string, bool) {
+	// UseNumber 保留数字原始字面量：默认 float64 会把 20 位整数截成
+	// 12345678901234567000，工具参数里的 id / 时间戳随之变成另一个值。
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+
 	var value any
-	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+	if err := decoder.Decode(&value); err != nil {
 		return "", false
 	}
 
-	out, err := json.Marshal(sanitizeJSONNode(value))
-	if err != nil {
+	var buf strings.Builder
+
+	encoder := json.NewEncoder(&buf)
+	// 工具参数按原样语义重新编码：不把 < > & 转成 \u003c 等 HTML 转义。
+	encoder.SetEscapeHTML(false)
+
+	if err := encoder.Encode(sanitizeJSONNode(value)); err != nil {
 		return "", false
 	}
 
-	return string(out), true
+	return strings.TrimSuffix(buf.String(), "\n"), true
 }
 
 // sanitizeJSONNode 递归净化 JSON 节点里的字符串值。

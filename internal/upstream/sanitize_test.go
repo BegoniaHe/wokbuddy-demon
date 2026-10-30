@@ -713,3 +713,37 @@ func TestPlainContentHeaderStillStripped(t *testing.T) {
 		t.Errorf("surrounding text lost: %q", out)
 	}
 }
+
+// 结构化兜底必须保持工具参数语义：数字按原始字面量保留（float64 会把 20 位整数
+// 截成 1.2345678901234567e+19），字符串不得被 HTML 转义（`<` → `\u003c`）。
+func TestSanitizeJSONStringFallbackPreservesValues(t *testing.T) {
+	t.Parallel()
+
+	// DSH @ 路径段改写后正文含裸 `"`，纯文本结果不再是合法 JSON，强制走结构化兜底。
+	raw := `{"text":"` + sanitizeDshPathsProbe + ` are paths the user explicitly referenced. ` +
+		`See path containing spaces.",` +
+		`"big":12345678901234567890,"html":"<b>&</b>","nested":{"id":12345678901234567890}}`
+	if !json.Valid([]byte(raw)) {
+		t.Fatalf("用例本身不是合法 JSON: %q", raw)
+	}
+
+	out, changed := sanitizeJSONString(raw)
+	if !changed {
+		t.Fatal("未检测到指纹")
+	}
+
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("产物不是合法 JSON: %q", out)
+	}
+
+	if strings.Contains(strings.ToLower(out), "billing") {
+		t.Errorf("指纹未剥离: %q", out)
+	}
+
+	// 结构化兜底走编码器：数字与字符串字面量必须逐字保留。
+	for _, want := range []string{`"big":12345678901234567890`, `"id":12345678901234567890`, `"<b>&</b>"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("产物丢失 %s: %q", want, out)
+		}
+	}
+}
