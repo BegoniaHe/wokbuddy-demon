@@ -55,6 +55,9 @@ type autoAction struct {
 	// runWithTask 可选：动作需要任务进度时，由执行器在动作开始前按码读取最新详情，
 	// 不复用批量预检快照（快照可能已过期）。动作后回读仍由 autoRunAction 重新请求。
 	runWithTask func(p *Panel, a *auth.Auth, before *upstream.Task) (string, error)
+	// rereadBeforeCheck 与其他动作共享进度时置 true：执行前预检必须回读最新任务，
+	// 不能按本轮起始快照重复执行已经点亮的事件链。
+	rereadBeforeCheck bool
 }
 
 // autoActions 已实现的任务动作表（顺序即执行顺序：先解锁依赖项）。
@@ -87,9 +90,10 @@ var autoActions = []autoAction{
 		run:      runBuddyApp,
 	},
 	{
-		TaskCode: "Buddy_App_QQ",
-		Desc:     "上报「进入企鹅教师助手」事件链（已验证：纯 API 可点亮）",
-		run:      runBuddyApp,
+		TaskCode:          "Buddy_App_QQ",
+		Desc:              "上报「进入企鹅教师助手」事件链（已验证：纯 API 可点亮）",
+		run:               runBuddyApp,
+		rereadBeforeCheck: true,
 	},
 	{
 		TaskCode: "automation_1",
@@ -1649,7 +1653,7 @@ func (p *Panel) autoRunActionWithSnapshot(
 ) map[string]any {
 	item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
 
-	before, err := p.taskForAutoAction(account5, act.TaskCode, snapshot)
+	before, err := p.taskForAutoAction(account5, act, snapshot)
 	if err != nil {
 		item["status"] = "error"
 		item["message"] = "查询失败: " + err.Error()
@@ -1707,16 +1711,22 @@ func (p *Panel) autoRunActionWithSnapshot(
 }
 
 // taskForAutoAction 优先从共享快照定位任务；相关口径读取失败时逐项回退查询。
+// 与其他动作共享进度的任务（rereadBeforeCheck）必须按码回读最新状态，否则前序
+// 动作已点亮时仍会按起始快照重复执行。
 func (p *Panel) taskForAutoAction(
-	account *auth.Auth, code string, snapshot *autoTaskSnapshot,
+	account *auth.Auth, act autoAction, snapshot *autoTaskSnapshot,
 ) (*upstream.Task, error) {
 	if snapshot != nil {
-		if before, resolved := snapshot.lookupBeforeAction(code); resolved {
+		if act.rereadBeforeCheck {
+			return p.taskByCodeForAction(account, act.TaskCode)
+		}
+
+		if before, resolved := snapshot.lookupBeforeAction(act.TaskCode); resolved {
 			return before, nil
 		}
 	}
 
-	return p.taskByCode(account, code)
+	return p.taskByCode(account, act.TaskCode)
 }
 
 // executeAutoAction 在共享快照路径执行动作前按码回读任务。快照只用于预检，

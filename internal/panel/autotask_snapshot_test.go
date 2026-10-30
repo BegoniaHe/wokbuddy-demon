@@ -575,3 +575,61 @@ func TestMPTaskBaseEntriesReadOnce(t *testing.T) {
 		})
 	}
 }
+
+// TestRunAutoAllSharedEventTaskRereadsBeforeAction Buddy_App 与 Buddy_App_QQ
+// 共用同一条事件链：前者点亮后，后者的执行前预检必须回读最新状态，不能按
+// 本轮起始快照再跑一遍事件链。
+func TestRunAutoAllSharedEventTaskRereadsBeforeAction(t *testing.T) {
+	t.Parallel()
+
+	upstreamStub := &snapshotUpstream{
+		defaultTasks: []string{"Buddy_App", "Buddy_App_QQ"},
+		currents: map[string]int64{
+			"Buddy_App":    0,
+			"Buddy_App_QQ": 0,
+		},
+	}
+	panel := upstreamStub.panel(t)
+
+	first := autoAction{
+		TaskCode: "Buddy_App",
+		Desc:     "测试共享事件动作",
+		run: func(*Panel, *auth.Auth) (string, error) {
+			upstreamStub.mu.Lock()
+			upstreamStub.actionCalls++
+			upstreamStub.currents["Buddy_App"] = 1
+			upstreamStub.currents["Buddy_App_QQ"] = 1
+			upstreamStub.mu.Unlock()
+
+			return "动作完成", nil
+		},
+	}
+
+	second := *autoActionFor("Buddy_App_QQ")
+	second.run = func(*Panel, *auth.Auth) (string, error) {
+		upstreamStub.mu.Lock()
+		upstreamStub.actionCalls++
+		upstreamStub.mu.Unlock()
+
+		return "共享事件任务不应重复执行", nil
+	}
+	second.runWithTask = nil
+
+	results := panel.runAutoAllActions(accountForSnapshot(t, panel), []autoAction{first, second})
+	if len(results) != 2 {
+		t.Fatalf("results=%d want 2", len(results))
+	}
+
+	if results[1]["status"] != "skipped" {
+		t.Errorf("共享事件任务 status=%v want skipped（执行前预检应看到最新进度）", results[1]["status"])
+	}
+
+	_, _, _, actionCalls, claimCalls := upstreamStub.counts()
+	if actionCalls != 1 {
+		t.Errorf("动作调用=%d want 1（Buddy_App_QQ 不应重复上报事件链）", actionCalls)
+	}
+
+	if claimCalls != 2 {
+		t.Errorf("claim=%d want 2（两个任务各领一次）", claimCalls)
+	}
+}
