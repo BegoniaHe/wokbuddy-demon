@@ -16,6 +16,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -39,28 +40,43 @@ func (s *Scheduler) streakAll(ctx context.Context, trigger string) (total, succe
 			break
 		}
 
-		st := &list[i]
-		if st.Disabled {
+		account := s.streakAuth(&list[i])
+		if account == nil {
 			continue
 		}
 
-		account := s.cfg.Pool.AuthByUID(st.UID)
-		if account == nil || account.AccessTokenValue() == "" {
-			continue
+		ok := s.streakBonusAccount(ctx, account)
+		if !ok && ctx.Err() != nil {
+			// 取消导致的中断不是账号失败：停机时任务中心不应显示一批失败号。
+			break
 		}
 
-		if account.IsGlobal() {
-			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
-		}
-
-		if account.IsEnterprise() {
-			continue // 企业版门控：无个人成长体系（/activity/growth/streak 上游一律 403）
-		}
-
-		runCounters2.record(s.streakBonusAccount(ctx, account))
+		runCounters2.record(ok)
 	}
 
 	return runCounters2.total, runCounters2.success, runCounters2.failure
+}
+
+// streakAuth 返回连登管家应处理的账号；禁用 / 无 token / global / 企业版返回 nil。
+func (s *Scheduler) streakAuth(st *pool.Status) *auth.Auth {
+	if st.Disabled {
+		return nil
+	}
+
+	account := s.cfg.Pool.AuthByUID(st.UID)
+	if account == nil || account.AccessTokenValue() == "" {
+		return nil
+	}
+
+	if account.IsGlobal() {
+		return nil // D4 门控：global 无 CN 任务体系，不发起任何上游调用
+	}
+
+	if account.IsEnterprise() {
+		return nil // 企业版门控：无个人成长体系（/activity/growth/streak 上游一律 403）
+	}
+
+	return account
 }
 
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
@@ -231,7 +247,8 @@ func (s *Scheduler) useMakeupCards(
 ) (used, remainingCards, leftForNextRound int) {
 	for i, day := range slices.Backward(missed) {
 		if ctx.Err() != nil {
-			return used, remaining, len(missed) - i
+			// 由近及远遍历：下标 0..i 尚未处理，共 i+1 天。
+			return used, remaining, i + 1
 		}
 
 		if remaining <= 0 {

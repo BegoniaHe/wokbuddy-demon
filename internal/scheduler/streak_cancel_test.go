@@ -49,7 +49,8 @@ func TestStreakAllStopsOnCancelAtAccountBoundary(t *testing.T) {
 		t.Fatalf("upstream calls=%d want 1（取消后不得继续第二个账号）", got)
 	}
 
-	if total != 1 {
-		t.Fatalf("total=%d want 1（只尝试第一个账号）", total)
+	// 取消造成的中断不计入尝试/失败：停机时任务中心不应出现一批失败号。
+	if total != 0 {
+		t.Fatalf("total=%d want 0（取消中断不计入账号结果）", total)
 	}
 }
