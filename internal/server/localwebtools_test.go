@@ -8,9 +8,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -121,7 +123,7 @@ func TestLocalWebToolLoop(t *testing.T) {
 	up := recordingUpstream(t, []string{toolCallSSE, sseOK}, &seen)
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(&Config{Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3})
-	h.webSearch = func(query string) (string, error) { return "result:" + query, nil }
+	h.webSearch = func(_ context.Context, query string) (string, error) { return "result:" + query, nil }
 	body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
@@ -143,6 +145,58 @@ func TestLocalWebToolLoop(t *testing.T) {
 	}
 }
 
+// toolCallSSEWithUsage 首轮工具调用并携带 usage：用于校验多轮归档累加。
+const toolCallSSEWithUsage = "data: {\"id\":\"chatcmpl-1\",\"created\":1753600000,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"go\\\"}\"}}]}}]}\n\n" +
+	"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestLocalWebToolLoopArchivesAllRounds 多轮本地工具请求的归档必须累加各轮
+// attempts 与 token，而不是只保留最后一轮（issue #419）。
+func TestLocalWebToolLoopArchivesAllRounds(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+
+	up := recordingUpstream(t, []string{toolCallSSEWithUsage, sseOK}, &seen)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	reqLog := reqlog.New(reqlog.Config{})
+	handler := NewHandler(&Config{
+		Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3, RequestLog: reqLog,
+	})
+	handler.webSearch = func(context.Context, string) (string, error) { return "result", nil }
+	body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("upstream calls=%d want 2", len(seen))
+	}
+
+	recent := reqLog.Snapshot().Recent
+	if len(recent) != 1 {
+		t.Fatalf("归档条数=%d want 1", len(recent))
+	}
+
+	event := recent[0]
+	if event.Attempts != 2 {
+		t.Errorf("attempts=%d want 2（两轮各一次上游请求）", event.Attempts)
+	}
+
+	// 首轮 3/2/5 + 末轮 1/1/2。
+	if event.PromptTokens != 4 || event.CompletionTokens != 3 || event.TotalTokens != 7 {
+		t.Errorf("tokens=%d/%d/%d want 4/3/7",
+			event.PromptTokens, event.CompletionTokens, event.TotalTokens)
+	}
+
+	if event.Outcome != reqlog.OutcomeSuccess {
+		t.Errorf("outcome=%q want %q", event.Outcome, reqlog.OutcomeSuccess)
+	}
+}
+
 func TestLocalWebToolRoundLimit(t *testing.T) {
 	t.Parallel()
 
@@ -151,7 +205,7 @@ func TestLocalWebToolRoundLimit(t *testing.T) {
 	up := recordingUpstream(t, []string{toolCallSSE}, &seen)
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(&Config{Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 1})
-	h.webSearch = func(string) (string, error) { return "result", nil }
+	h.webSearch = func(context.Context, string) (string, error) { return "result", nil }
 	body := `{"model":"glm-5.2","input":"search","tools":[{"type":"web_search"}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
@@ -229,5 +283,151 @@ func TestDeclaredLocalWebToolsAdditionalTools(t *testing.T) {
 	wanted, ok := declaredLocalWebTools(body)
 	if !ok || !wanted["web_search"] || !wanted["web_fetch"] {
 		t.Fatalf("wanted=%v ok=%v", wanted, ok)
+	}
+}
+
+// twoToolCallSSE 单轮内返回两个本地工具调用：用于验证取消后不再执行剩余工具。
+const twoToolCallSSE = "data: {\"id\":\"chatcmpl-1\",\"created\":1753600000,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[" +
+	"{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"a\\\"}\"}}," +
+	"{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"b\\\"}\"}}" +
+	"]}}]}\n\n" +
+	"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestLocalWebToolLoopStopsOnRequestCancel 入站请求取消后：工具侧 ctx 立刻收到取消
+// 信号，剩余工具与后续上游轮次都不再发起（issue #415）。
+func TestLocalWebToolLoopStopsOnRequestCancel(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+
+	up := recordingUpstream(t, []string{twoToolCallSSE, sseOK}, &seen)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	reqLog := reqlog.New(reqlog.Config{})
+	handler := NewHandler(&Config{
+		Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3, RequestLog: reqLog,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		calls     atomic.Int32
+		sawCancel atomic.Bool
+	)
+
+	handler.webSearch = func(toolCtx context.Context, _ string) (string, error) {
+		calls.Add(1)
+		// 模拟客户端在工具抓取中断开。
+		cancel()
+
+		if err := toolCtx.Err(); err != nil {
+			sawCancel.Store(true)
+
+			return "", err
+		}
+
+		return "result", nil
+	}
+
+	body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !sawCancel.Load() {
+		t.Fatal("工具调用未收到入站请求的取消信号")
+	}
+
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("工具调用 %d 次，want 1（取消后不得继续发起剩余工具）", n)
+	}
+
+	if len(seen) != 1 {
+		t.Fatalf("上游收到 %d 次请求，want 1（取消后不得再开新一轮）", len(seen))
+	}
+
+	// 调用方已断开：连接已关，不写响应体、不回落成 502（issue #404 同口径）。
+	if rec.Body.Len() != 0 {
+		t.Fatalf("调用方已断开时不该写响应体，got %d bytes: %s", rec.Body.Len(), rec.Body)
+	}
+
+	snap := reqLog.Snapshot()
+	if len(snap.Recent) != 1 {
+		t.Fatalf("recent=%+v", snap.Recent)
+	}
+
+	ev := snap.Recent[0]
+	if ev.Status != clientClosedRequestStatus || ev.Outcome != reqlog.OutcomeInterrupted || ev.OK {
+		t.Errorf("reqlog 应按 499/interrupted 记账: %+v", ev)
+	}
+}
+
+// TestLocalWebToolLoopPreservesRequestLevelError 内层请求级错误保留状态码与分类
+// code，message 有界且不含完整上游 body（issue #416）。
+func TestLocalWebToolLoopPreservesRequestLevelError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		body     string
+		wantCode string
+	}{
+		{
+			name:     "content_blocked",
+			body:     `{"code":"11-128","msg":"blocked by security policy ` + strings.Repeat("lorem ipsum ", 400) + `TAIL-MARKER"}`,
+			wantCode: "content_blocked",
+		},
+		{
+			name:     "prompt_too_long",
+			body:     `{"code":11115,"msg":"prompt is too long: ` + strings.Repeat("lorem ipsum ", 400) + `TAIL-MARKER"}`,
+			wantCode: "prompt_too_long",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstreamClient := newFakeUpstream(t, func(string) (int, string, bool) {
+				return http.StatusBadRequest, testCase.body, false
+			})
+			p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+			// custom 提示词模式：content_blocked 不触发降级重试，单次上游调用即可观察。
+			handler := NewHandler(&Config{
+				Pool: p, Upstream: upstreamClient, LocalWebTools: true, LocalWebToolRounds: 3,
+				PromptMode: "custom", PromptText: "SYS",
+			})
+
+			body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code=%d want 400（保留内层状态码），body=%s", rec.Code, rec.Body)
+			}
+
+			var env struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body)
+			}
+
+			if env.Error.Code != testCase.wantCode {
+				t.Errorf("error.code=%q want %q", env.Error.Code, testCase.wantCode)
+			}
+
+			if len(env.Error.Message) > localWebToolErrorMessageLimit {
+				t.Errorf("message %d 字节超过上限 %d", len(env.Error.Message), localWebToolErrorMessageLimit)
+			}
+
+			if strings.Contains(env.Error.Message, "TAIL-MARKER") {
+				t.Errorf("message 透传了完整上游 body 尾部: %q", env.Error.Message)
+			}
+		})
 	}
 }
