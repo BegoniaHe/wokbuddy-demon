@@ -80,7 +80,7 @@ func TestBindKeyPrefix(t *testing.T) {
 }
 
 // TestZeroValueConcurrentInit（R3）：零值 Upstash 并发 goWrite/Close 时
-// sem/done 只能初始化一次，不能出现字段写竞争。
+// 队列/写者只能初始化一次，不能出现字段写竞争。
 func TestZeroValueConcurrentInit(t *testing.T) {
 	t.Parallel()
 
@@ -100,31 +100,27 @@ func TestZeroValueConcurrentInit(t *testing.T) {
 	wg.Wait()
 }
 
-// TestCloseDrainsQueuedWrites 锁定 Close 的停机契约：写槽占满时排在 sem 上
-// 的写也必须在 Close 返回前执行，不能因 close(done) 被丢弃。
+// TestCloseDrainsQueuedWrites 锁定 Close 的停机契约：Close 前已提交但尚未执行的
+// 写也必须在 Close 返回前执行，不能因关停被丢弃。
 func TestCloseDrainsQueuedWrites(t *testing.T) {
 	t.Parallel()
 
 	var store Upstash
 
 	release := make(chan struct{})
-
-	var started sync.WaitGroup
+	started := make(chan struct{})
 
 	var ran atomic.Int64
 
-	for range writeConcurrencyLimit {
-		started.Add(1)
-		store.goWrite(func() {
-			started.Done()
-			<-release
-			ran.Add(1)
-		})
-	}
+	// 首个写阻塞住写者，后续写只能排队，模拟 Close 前已提交但未执行的写。
+	store.goWrite(func() {
+		close(started)
+		<-release
+		ran.Add(1)
+	})
 
-	started.Wait()
+	<-started
 
-	// 写槽已满：这 3 个写只能排在 sem 上，模拟 Close 前已提交但未执行的写。
 	const queued = 3
 
 	for range queued {
@@ -154,7 +150,51 @@ func TestCloseDrainsQueuedWrites(t *testing.T) {
 		t.Fatal("Close did not return after writes completed")
 	}
 
-	if got, want := ran.Load(), int64(writeConcurrencyLimit+queued); got != want {
+	if got, want := ran.Load(), int64(1+queued); got != want {
 		t.Fatalf("ran=%d want %d (queued writes must run before Close returns)", got, want)
+	}
+}
+
+// TestWritesRunInSubmissionOrder（#417）：并发提交的写必须按提交顺序落地，慢的
+// 先提交写不能被后提交的写越过，否则旧快照 / 已解绑的绑定会覆盖新值。
+func TestWritesRunInSubmissionOrder(t *testing.T) {
+	t.Parallel()
+
+	var store Upstash
+
+	const total = 32
+
+	var (
+		mu   sync.Mutex
+		seen []int
+	)
+
+	for i := range total {
+		store.goWrite(func() {
+			// 先提交的写人为拖慢，验证后提交者不会越过它。
+			time.Sleep(time.Millisecond)
+
+			mu.Lock()
+
+			seen = append(seen, i)
+			mu.Unlock()
+		})
+	}
+
+	if err := store.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(seen) != total {
+		t.Fatalf("ran=%d want %d", len(seen), total)
+	}
+
+	for idx, got := range seen {
+		if got != idx {
+			t.Fatalf("write order[%d]=%d want %d（写必须按提交顺序落地）", idx, got, idx)
+		}
 	}
 }

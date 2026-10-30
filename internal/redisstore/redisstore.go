@@ -1,8 +1,12 @@
 // Package redisstore 封装 Upstash（Redis）持久化，并提供内存降级（Noop）。
 //
 // 设计约束：Upstash 走公网 TLS，单次 RTT 可能 50~300ms，因此所有写操作都是
-// fire-and-forget（后台 goroutine + 失败仅 debug 日志），读操作只发生在启动时
-// （加载粘性会话镜像、恢复冷却/熔断快照）。内存为主、Redis 为辅。
+// fire-and-forget（交给单写者 goroutine 串行落地 + 失败仅 debug 日志），读操作只
+// 发生在启动时（加载粘性会话镜像、恢复冷却/熔断快照）。内存为主、Redis 为辅。
+//
+// 单写者（issue #417）：早先每次写起独立 goroutine，完成顺序不受提交顺序约束，
+// 旧快照 / 已解绑的绑定可能后落地覆盖新值。现在统一入队、由一个 goroutine 按
+// 提交顺序串行执行；Close 仍保证已提交的写全部执行完。
 //
 // 未配置 url / 连接失败时降级为 Noop：一切功能照常工作（纯内存模式），
 // 上层只打一条启动警告日志。
@@ -21,10 +25,6 @@ import (
 
 // keyTTL 粘性会话镜像 + 状态快照的默认 TTL（redis 侧兜底，防脏数据长期滞留）。
 const keyTTL = 7 * 24 * time.Hour
-
-// writeConcurrencyLimit fire-and-forget 异步写的在途上限（发现 4：写 goroutine
-// 无信号量限制，高写入速率下可瞬时堆积）。超过的排队不丢弃——写语义不变（见 goWrite）。
-const writeConcurrencyLimit = 8
 
 // Store 只放本期需要的方法。上下文由实现内部构造（读操作配短超时，写操作 fire-and-forget）。
 //
@@ -114,86 +114,104 @@ func normalizeURL(url, token string) string {
 
 // Upstash 真实现：redis.Client 封装。
 //
-// 写并发上限（发现 4）：三个异步写共享 sem（cap=writeConcurrencyLimit 的信号量），
-// 在途写超过上限时新写排队不丢弃——语义仍是 fire-and-forget，只是把"无限堆积"
-// 收敛为"有界排队"。Close 前已提交的写（含排队中）保证执行完，Close 后新提交
-// 的写直接丢弃。
+// 写模型（issue #417）：所有异步写进入同一条队列，由 runWriter 单个 goroutine 按
+// 提交顺序串行落地。这消除了「后提交的先完成、旧快照覆盖新值」的乱序窗口；
+// 写仍是 fire-and-forget（调用方不等待），Close 前提交的写保证执行完，Close 后
+// 提交的写直接丢弃。
 type Upstash struct {
 	client *redis.Client
-	// sem 写信号量（有界在途写）与 done 关停标志（Close 关闭）由 ensureInit 一次性
-	// 初始化：New 与测试零值构造共用，避免并发首用时无锁写这两个字段。
-	sem  chan struct{}
-	done chan struct{}
-	// initOnce 保证 sem/done 的初始化只发生一次（并发 goWrite/Close 安全）。
+	// mu 保护 queue / stopped：入队顺序即提交顺序（单写者据此串行执行）。
+	mu sync.Mutex
+	// queue 未执行的写（FIFO）；notify 有新写时唤醒空闲的写者（cap=1 合并唤醒）。
+	queue  []func()
+	notify chan struct{}
+	// stopped Close 后置位：此后提交的写直接丢弃，写者排空队列后退出。
+	stopped bool
+	// initOnce 保证 queue/notify 初始化与写者启动只发生一次（并发 goWrite/Close 安全）。
 	initOnce sync.Once
-	// closeOnce 保证 Close 幂等（多次调用只关一次 done channel）。
-	closeOnce sync.Once
-	// submitMu 收窄 goWrite 的提交/关停竞态：goWrite 先查 done 再登记 wg，
-	// Close 先关 done 再等 wg——两侧互斥后，「Close 前提交的写必然执行」
-	// 不再依赖 goroutine 调度时序（83d18ae 原版存在窗口：排队写在 Close
-	// 关 done 之后才跑到检查点会被误丢；TestCloseDrainsQueuedWrites 覆盖该契约）。
-	submitMu sync.Mutex
 	// wg 已提交未完成的写（Close 排空用）。
 	wg sync.WaitGroup
 }
 
-// goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
-// 必然执行（停机镜像完整性），Close 后提交的写直接丢弃（进程已在退出）。
+// goWrite 以 fire-and-forget 方式登记一次写：入队后由单写者串行执行。
+// Close 前提交的写必然执行（停机镜像完整性），Close 后提交的写直接丢弃。
 func (u *Upstash) goWrite(fn func()) {
 	u.ensureInit()
-	u.submitMu.Lock()
+	u.mu.Lock()
 
-	select {
-	case <-u.done:
-		u.submitMu.Unlock() // 关停后提交的写：直接丢弃
+	if u.stopped {
+		u.mu.Unlock() // 关停后提交的写：直接丢弃
 
 		return
+	}
+
+	u.queue = append(u.queue, fn)
+	// 与入队同锁 Add：Close 在同一把锁下置 stopped 并 wg.Wait，Wait 与 Add
+	// 不并发（否则零计数下并发 Add 属 WaitGroup 误用）。
+	u.wg.Add(1)
+	u.mu.Unlock()
+
+	// 非阻塞唤醒：缓冲 1 已足够，写者醒来后会把队列取空。
+	select {
+	case u.notify <- struct{}{}:
 	default:
 	}
-	// 先检查 done 再 Add：Close 在同一把 submitMu 下关 done，因此关停后不会再有
-	// 新的 Add；Wait 与 Add 不并发（否则零计数下并发 Add 属 WaitGroup 误用）。
-	u.wg.Add(1)
-	u.submitMu.Unlock()
-
-	go func() {
-		defer u.wg.Done()
-		// 只阻塞抢写槽，不检查 done：此处若select done，已阻塞排队的写会在
-		// close(done) 唤醒时全部走丢弃分支（selrand5 实测 100%），「Close 前
-		// 提交的写（含排队中）必然执行」的契约被内部检查破坏——旧实现在此检查
-		// 会让排队写被间歇丢弃。丢弃语义已由提交点（submitMu 下的 done 检查）
-		// 唯一承担；此处提交已冻结在 wg 中，Close 的 wg.Wait 必然等到它执行完。
-		u.sem <- struct{}{}
-		defer func() { <-u.sem }()
-
-		fn()
-	}()
 }
 
-// ensureInit 初始化 sem/done（幂等）。New 与测试零值构造共用同一入口；
-// sync.Once 保证并发 goWrite/Close 首用时不会竞争写字段。
+// ensureInit 初始化队列与 done 标志并启动写者（幂等）。
+// New 与测试零值构造共用同一入口；sync.Once 保证并发首用时不竞争。
 func (u *Upstash) ensureInit() {
 	u.initOnce.Do(func() {
-		if u.sem == nil {
-			u.sem = make(chan struct{}, writeConcurrencyLimit)
-		}
+		u.queue = make([]func(), 0)
+		u.notify = make(chan struct{}, 1)
 
-		if u.done == nil {
-			u.done = make(chan struct{})
-		}
+		go u.runWriter()
 	})
 }
 
+// runWriter 单写者：按入队顺序执行写；队列空且已停止时退出。
+func (u *Upstash) runWriter() {
+	for {
+		u.mu.Lock()
+
+		if len(u.queue) == 0 {
+			if u.stopped {
+				u.mu.Unlock()
+
+				return
+			}
+
+			u.mu.Unlock()
+			<-u.notify
+
+			continue
+		}
+
+		fn := u.queue[0]
+		u.queue[0] = nil // 立即释放闭包引用，避免长队列滞留已执行写
+		u.queue = u.queue[1:]
+		u.mu.Unlock()
+
+		fn()
+		u.wg.Done()
+	}
+}
+
 // Close 等待已提交的异步写全部执行完毕，再关底层 redis 连接；幂等。
-// 之后新提交的写直接丢弃（goWrite 的 done 检查）。停机路径在 pool.Close() 后调用：
-// pool 的最后一次 Flush→SaveState 已提交，本方法保证它写完才返回。
+// 之后新提交的写直接丢弃（goWrite 的 stopped 检查）。停机路径在 pool.Close() 后
+// 调用：pool 的最后一次 Flush→SaveState 已提交，本方法保证它写完才返回。
 func (u *Upstash) Close() error {
 	u.ensureInit()
-	// 先关 done 再等 wg：与 goWrite 的 submitMu 互斥后，此时「已提交的写」集合
-	// 已冻结（此后新提交的直接丢弃），wg.Wait 排空即覆盖在途 + 排队两层——
-	// 原 sem 探测法在排队写尚未跑到抢槽点时会误判已排空（83d18ae 竞态）。
-	u.submitMu.Lock()
-	u.closeOnce.Do(func() { close(u.done) })
-	u.submitMu.Unlock()
+	// 先置 stopped 再等 wg：与 goWrite 的 mu 互斥后，「已提交的写」集合已冻结
+	// （此后新提交的直接丢弃），写者会把剩余队列排空，wg.Wait 覆盖全部。
+	u.mu.Lock()
+	u.stopped = true
+	u.mu.Unlock()
+
+	select {
+	case u.notify <- struct{}{}:
+	default:
+	}
 
 	done := make(chan struct{})
 
