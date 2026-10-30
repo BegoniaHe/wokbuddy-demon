@@ -153,8 +153,6 @@ func (f *makeupFixture) snapshotUsed() []string {
 	return append([]string(nil), f.used...)
 }
 
-// TestMakeupRecentPerRoundCap 每轮上限：cap=1 分两轮继续、cap=0 全补、
-// cap 大于漏签数全部补完；补签顺序仍由近及远。
 // TestUseMakeupCardsCancelLeavesCorrectRemainder：取消时报告的是尚未处理的漏签天数
 // （由近及远遍历，下标 0..i 共 i+1 天），不能按 len-i 误报。
 func TestUseMakeupCardsCancelLeavesCorrectRemainder(t *testing.T) {
@@ -181,6 +179,8 @@ func TestUseMakeupCardsCancelLeavesCorrectRemainder(t *testing.T) {
 	}
 }
 
+// TestMakeupRecentPerRoundCap 每轮上限：cap=1 分两轮继续、cap=0 全补、
+// cap 大于漏签数全部补完；补签顺序仍由近及远。
 func TestMakeupRecentPerRoundCap(t *testing.T) {
 	t.Parallel()
 
