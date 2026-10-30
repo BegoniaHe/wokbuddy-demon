@@ -299,6 +299,14 @@ func (c *Client) applyHeaders(
 	srf surface, req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta,
 ) {
 	if srf.chatFamily() {
+		// chat 头族固定 30+ 条（CommonHeaders + 身份 / 归属 / 会话 / 追踪）。
+		// 逐条 Set 走默认空 map 会让桶数组扩容 4 次，每请求约 5KB 扩容垃圾；
+		// 这里一次按上限预分配（hint 40 与 32 同桶数，覆盖满 meta 的 35 条）。
+		// 只在 header 为空时替换：调用方已设头的场景保持原 map。
+		if len(req.Header) == 0 {
+			req.Header = make(http.Header, 40)
+		}
+
 		c.chatFamilyHeaders(srf, req, account, clientIP, meta)
 
 		return

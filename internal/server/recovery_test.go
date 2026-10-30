@@ -131,6 +131,57 @@ func TestWithRecoveryAfterReadFrom(t *testing.T) {
 	}
 }
 
+// stringWriterProbe 记录底层走的是 Write 还是 WriteString（io.StringWriter 快路径）。
+type stringWriterProbe struct {
+	*httptest.ResponseRecorder
+
+	writes      int
+	writeString int
+}
+
+func (p *stringWriterProbe) Write(b []byte) (int, error) {
+	p.writes++
+
+	return p.ResponseRecorder.Write(b) //nolint:wrapcheck // 测试用 writer 原样透传
+}
+
+func (p *stringWriterProbe) WriteString(s string) (int, error) {
+	p.writeString++
+
+	return p.ResponseRecorder.WriteString(s) //nolint:wrapcheck // 测试用 writer 原样透传
+}
+
+// TestWithRecoveryWriteStringForwards 兜底 writer 必须把 io.StringWriter 快路径
+// 传给底层：不转发时 io.WriteString 会退化成 []byte 拷贝——SSE 每帧都要写一次
+// 载荷，等于每帧白拷一整帧。同时 WriteString 也要算「已写头」，panic 后不得再
+// 追加错误体。
+func TestWithRecoveryWriteStringForwards(t *testing.T) {
+	t.Parallel()
+
+	quietPanicLog(t)
+
+	h := NewHandler(&Config{})
+	probe := &stringWriterProbe{ResponseRecorder: httptest.NewRecorder()}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+
+	h.withRecovery(func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := io.WriteString(w, "partial"); err != nil {
+			t.Errorf("WriteString: %v", err)
+		}
+
+		panic("late boom")
+	})(probe, req)
+
+	if probe.writeString != 1 || probe.writes != 0 {
+		t.Fatalf("writeString=%d writes=%d want 1/0（未走 io.StringWriter 快路径）",
+			probe.writeString, probe.writes)
+	}
+
+	if got := probe.Body.String(); got != "partial" {
+		t.Fatalf("body=%q want %q", got, "partial")
+	}
+}
+
 // TestWithRecoveryAfterFlush 只 Flush（尚未 Write）也已发送响应头，随后 panic 不得
 // 再追加错误体。
 func TestWithRecoveryAfterFlush(t *testing.T) {

@@ -83,6 +83,18 @@ func (w *recoveryWriter) Write(p []byte) (int, error) {
 	return w.ResponseWriter.Write(p)
 }
 
+// WriteString 透传到支持 io.StringWriter 的底层 writer。
+//
+// 嵌入的是 http.ResponseWriter 接口，而该接口没有 WriteString，不显式转发就无法
+// 提升底层（*http.response / ResponseRecorder）的 WriteString 快路径：上层
+// io.WriteString 会退化成 []byte(s) 拷贝——SSE 透传每帧都要写一次载荷，等于每帧
+// 白拷一整帧。语义与 Write 一致（同样标记已写头）。
+func (w *recoveryWriter) WriteString(data string) (int, error) {
+	w.wroteHeader = true
+
+	return io.WriteString(w.ResponseWriter, data) //nolint:wrapcheck // io.Writer 实现原样透传错误
+}
+
 func (w *recoveryWriter) Flush() {
 	// Flush 会让 net/http 立即发送响应头；未标记时随后 panic 会被误判成
 	// 「尚未写头」，向已开始的响应追加错误体。

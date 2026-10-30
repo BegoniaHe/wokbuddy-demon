@@ -371,16 +371,6 @@ type anthropicConversion struct {
 	options anthropicResponseOptions
 }
 
-// anthropicConvert 转换请求体并保留响应编码选项。
-func anthropicConvert(body []byte) (anthropicConversion, error) {
-	req, err := decodeAnthropicRequest(body)
-	if err != nil {
-		return anthropicConversion{}, err
-	}
-
-	return anthropicConvertRequest(req)
-}
-
 // anthropicConvertRequest 把已解码请求转换为内部 chat 请求（不做搜索）。
 func anthropicConvertRequest(req *anthropicRequest) (anthropicConversion, error) {
 	out, err := buildOpenAIRequest(req)
@@ -1795,16 +1785,7 @@ func (r *anthropicResponder) Stream(
 	anthropicStreamWriter2 := newAnthropicStreamWriterWithOptions(r.w, r.model, r.options)
 	anthropicStreamWriter2.prelude = r.prelude
 
-	opts := make([]upstream.StreamOption, 0, 2)
-	if onErrFrame != nil {
-		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
-	}
-
-	opts = append(opts, upstream.WithMarkupRepair(repair))
-	if r.keepalive > 0 {
-		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
-	}
-
+	opts := streamHintOptions(r.keepalive, repair, onErrFrame)
 	if err := upstream.StreamHint(anthropicStreamWriter2, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}
@@ -2169,34 +2150,13 @@ func (a *anthropicStreamWriter) Write(nums []byte) (int, error) {
 	return writeSSELines(&a.pending, nums, a.handleLine)
 }
 
-// handleLine 处理单行：data 帧转换，[DONE] 收尾，注释/空行忽略。
+// handleLine 处理单行：data 帧转换，[DONE] 收尾，注释行原样转发（其余忽略）。
 func (a *anthropicStreamWriter) handleLine(line string) error {
 	if a.finished {
 		return nil
 	}
-	// SSE 注释（如上游静默心跳 ": keepalive"）原样转发；上游写路径已设置
-	// 单次写截止，这里只负责补帧尾并 flush。
-	if strings.HasPrefix(line, ":") {
-		if _, err := io.WriteString(a.w, line+"\n\n"); err != nil {
-			return fmt.Errorf("handleLine: %w", err)
-		}
 
-		a.Flush()
-
-		return nil
-	}
-
-	// SSE 的 data 字段允许省略冒号后的空格；这里统一 TrimSpace 后再分派。
-	if payload, ok := strings.CutPrefix(line, "data:"); ok {
-		payload = strings.TrimSpace(payload)
-		if payload == "[DONE]" {
-			return a.finish()
-		}
-
-		return a.handleChunk(payload)
-	}
-
-	return nil
+	return handleSSELine(a.w, a.fl, line, a.finish, a.handleChunk)
 }
 
 // handleChunk 解析 OpenAI chunk 并写出对应 Anthropic 事件。

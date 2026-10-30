@@ -1203,16 +1203,7 @@ func (r *responsesResponder) Stream(
 ) error {
 	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions, r.customTools, r.namespaces)
 
-	opts := make([]upstream.StreamOption, 0, 2)
-	if onErrFrame != nil {
-		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
-	}
-
-	opts = append(opts, upstream.WithMarkupRepair(repair))
-	if r.keepalive > 0 {
-		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
-	}
-
+	opts := streamHintOptions(r.keepalive, repair, onErrFrame)
 	if err := upstream.StreamHint(responsesStreamWriter2, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}
@@ -1591,52 +1582,12 @@ func (s *responsesStreamWriter) Write(nums []byte) (int, error) {
 	return writeSSELines(&s.pending, nums, s.handleLine)
 }
 
-// writeSSELines 按行拆分 SSE 数据并交给 handleLine，返回本次写入字节数。
-func writeSSELines(pending *[]byte, nums []byte, handle func(string) error) (int, error) {
-	*pending = append(*pending, nums...)
-	for {
-		i := bytes.IndexByte(*pending, '\n')
-		if i < 0 {
-			break
-		}
-
-		line := strings.TrimRight(string((*pending)[:i]), "\r")
-
-		*pending = (*pending)[i+1:]
-
-		if err := handle(line); err != nil {
-			return 0, err
-		}
-	}
-
-	return len(nums), nil
-}
-
 func (s *responsesStreamWriter) handleLine(line string) error {
 	if s.finished {
 		return nil
 	}
 
-	if strings.HasPrefix(line, ":") {
-		if _, err := io.WriteString(s.w, line+"\n\n"); err != nil {
-			return fmt.Errorf("handleLine: %w", err)
-		}
-
-		s.Flush()
-
-		return nil
-	}
-
-	if !strings.HasPrefix(line, "data: ") {
-		return nil
-	}
-
-	payload := strings.TrimPrefix(line, "data: ")
-	if payload == "[DONE]" {
-		return s.finish()
-	}
-
-	return s.handleChunk(payload)
+	return handleSSELine(s.w, s.fl, line, s.finish, s.handleChunk)
 }
 
 func (s *responsesStreamWriter) handleChunk(payload string) error {

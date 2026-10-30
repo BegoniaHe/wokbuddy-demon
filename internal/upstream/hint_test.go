@@ -50,3 +50,39 @@ func TestGatewayHintModelParamInvalidToolSchema(t *testing.T) {
 		}
 	}
 }
+
+// TestBusinessFrameError 钉住顶层业务错误信封的判定口径：code 字符串/数字均可，
+// 0 与空串不是错误，error/choices 帧归各自的既有分支处理。
+func TestBusinessFrameError(t *testing.T) {
+	t.Parallel()
+
+	for _, want := range []struct {
+		name string
+		body string
+		code string
+		msg  string
+		ok   bool
+	}{
+		{"数字 code", `{"code":10001,"msg":"quota exceeded"}`, "10001", "quota exceeded", true},
+		{"字符串 code", `{"code":" 10001 ","msg":"quota exceeded"}`, "10001", "quota exceeded", true},
+		{"message 兜底", `{"code":10001,"message":"quota exceeded"}`, "10001", "quota exceeded", true},
+		{"零 code", `{"code":0,"msg":"ok"}`, "", "", false},
+		{"零字符串 code", `{"code":"0","msg":"ok"}`, "", "", false},
+		{"空 code", `{"code":"","msg":"ok"}`, "", "", false},
+		{"缺 code", `{"msg":"ok"}`, "", "", false},
+		{"缺 msg", `{"code":10001}`, "", "", false},
+		{"error 帧不在此列", `{"code":10001,"msg":"x","error":{"code":1}}`, "", "", false},
+		{"choices 帧不在此列", `{"code":10001,"msg":"x","choices":[]}`, "", "", false},
+		{"非 JSON", `not json`, "", "", false},
+		{"顶层 null", `null`, "", "", false},
+	} {
+		t.Run(want.name, func(t *testing.T) {
+			t.Parallel()
+
+			code, msg, ok := BusinessFrameError(want.body)
+			if code != want.code || msg != want.msg || ok != want.ok {
+				t.Fatalf("got (%q,%q,%v), want (%q,%q,%v)", code, msg, ok, want.code, want.msg, want.ok)
+			}
+		})
+	}
+}

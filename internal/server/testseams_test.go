@@ -14,6 +14,17 @@ func anthropicToOpenAI(body []byte) ([]byte, string, bool, error) {
 	return converted.openAI, converted.model, converted.stream, nil
 }
 
+// anthropicConvert 解码入站请求体并转换，等价于生产入口
+// anthropicConvertWithSearch 的「不执行搜索」分支。
+func anthropicConvert(body []byte) (anthropicConversion, error) {
+	req, err := decodeAnthropicRequest(body)
+	if err != nil {
+		return anthropicConversion{}, err
+	}
+
+	return anthropicConvertRequest(req)
+}
+
 func anthropicMessageFromOpenAI(body any, model string) map[string]any {
 	return anthropicMessageFromOpenAIWithOptions(body, model, anthropicResponseOptions{})
 }

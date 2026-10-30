@@ -12,17 +12,29 @@ import (
 	"strings"
 )
 
-// PrepareBodyOptWithEffortsAndDefault 完整管线：efforts 降级 + thinking.go 按
-// defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
-// （deepseek 缺档回退硬编码 high）。
+// chatBodyRewrite 一次出站 chat body 改写的全部输入。零值 = 只做基础规范化
+// （不带任何 chat 出站专属步骤）。
+type chatBodyRewrite struct {
+	sanitize         bool
+	efforts          map[string][]string
+	defaultEfforts   map[string]string
+	historyKeepTurns int
+
+	// 以下四项仅供 chat 出站（基础规范化不管，零值 = 与旧入口同口径）：
+	leadingSystem  bool   // 首条非 system 时补官方 fallback system
+	injectCacheKey bool   // 注入 prompt_cache_key（按 uid 隔离）
+	uid            string // cache key 的账号隔离段
+	conversationID string // cache key 的会话哈希源
+	requestID      string // 非空 → 给当前轮最后一条 user 消息注入 conversationRequestId
+}
+
+// rewriteChatBody 解码一次、套用全部改写、再编码一次。
 //
-// historyKeepTurns > 0 时在 tool 配对三步之后、注入 thinking 之前按轮裁剪历史
-// （issue #99）；0 = 关闭，与既有行为完全一致。
-//
-//nolint:maintidx // 多段 payload 变换线性展开，拆开需重复传递解析结果。
-func PrepareBodyOptWithEffortsAndDefault(
-	src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string, historyKeepTurns int,
-) []byte {
+// 出站链路原本是「规范化 → 补首条 system → 注入 cache key → 注入 conversation
+// RequestId」四个独立函数，每个都整解整编一遍 body：几十 KB 的体每请求因此要
+// unmarshal/marshal 3~4 轮。合并成一轮后编码顺序不变（map 键按字典序输出），
+// 产物与串联版逐字节一致。
+func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -31,6 +43,31 @@ func PrepareBodyOptWithEffortsAndDefault(
 	if err := json.Unmarshal(src, &obj); err != nil || obj == nil {
 		return src
 	}
+
+	normalizeChatBody(obj, rewrite)
+
+	if rewrite.leadingSystem {
+		ensureLeadingSystemObj(obj)
+	}
+
+	if rewrite.injectCacheKey {
+		injectPromptCacheKeyObj(obj, rewrite.uid, rewrite.conversationID)
+	}
+
+	injectConversationRequestIDObj(obj, rewrite.requestID)
+
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return src
+	}
+
+	return out
+}
+
+// normalizeChatBody 对已解码 body 套用基础规范化序列（保持既有顺序语义）。
+func normalizeChatBody(obj map[string]any, rewrite *chatBodyRewrite) {
+	sanitize, efforts, defaultEfforts, historyKeepTurns :=
+		rewrite.sanitize, rewrite.efforts, rewrite.defaultEfforts, rewrite.historyKeepTurns
 
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
@@ -90,13 +127,6 @@ func PrepareBodyOptWithEffortsAndDefault(
 			sanitizeMessages(msgs)
 		}
 	}
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return src
-	}
-
-	return out
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
@@ -487,42 +517,24 @@ func isReasoningPartType(partType string) bool {
 // 也复用同一常量，避免两处兜底文案漂移。
 const LeadingSystemFallback = "You are CodeBuddy Code.\n"
 
-// ensureLeadingSystem 首条消息非 system 时在 messages 最前补一条官方 fallback system。
-//
-// 上游对部分账号灰度启用形态校验：messages[0] 不是 system 即 400 11-128
+// ensureLeadingSystemObj 首条消息非 system 时在 messages 最前补一条官方 fallback
+// system。上游对部分账号灰度启用形态校验：messages[0] 不是 system 即 400 11-128
 // "first message is not system prompt"。补的必须是官方分发包存在的字节
 // （LeadingSystemFallback），不能用自造句——自造句本身是渠道指纹。
-// 两个 realm 都套用；首条已是 system 时不重复注入。body 不可解析时原样返回。
-func ensureLeadingSystem(body []byte) []byte {
-	if len(body) == 0 {
-		return body
-	}
-
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return body
-	}
-
+// 两个 realm 都套用；首条已是 system 时不重复注入。
+func ensureLeadingSystemObj(obj map[string]any) {
 	msgs, ok := obj["messages"].([]any)
 	if !ok || len(msgs) == 0 {
-		return body
+		return
 	}
 
-	first, ok := msgs[0].(map[string]any)
-	if ok {
+	if first, ok := msgs[0].(map[string]any); ok {
 		if role, _ := first["role"].(string); strings.EqualFold(strings.TrimSpace(role), "system") {
-			return body // 首条已是 system：不注入
+			return // 首条已是 system：不注入
 		}
 	}
 
 	obj["messages"] = append([]any{map[string]any{"role": "system", "content": LeadingSystemFallback}}, msgs...)
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-
-	return out
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
@@ -791,24 +803,17 @@ func normalizePatternProperties(n map[string]any) {
 	}
 }
 
-// injectConversationRequestID 给当前轮最后一条 user 消息补
+// injectConversationRequestIDObj 给当前轮最后一条 user 消息补
 // conversationRequestId / startsNewUserRequest（issue #249）。只改最后一条 user，
-// 历史轮次不动；客户端自带值优先。没有 user 消息或 body 不可解析时原样返回。
-//
-//nolint:cyclop,gocognit,gocyclo // 解析 + 找到最后一条 user + 保留客户端值。
-func injectConversationRequestID(body []byte, requestID string) []byte {
-	if requestID == "" || len(body) == 0 {
-		return body
-	}
-
-	var obj map[string]any
-	if json.Unmarshal(body, &obj) != nil || obj == nil {
-		return body
+// 历史轮次不动；客户端自带值优先。requestID 为空或无 user 消息时零操作。
+func injectConversationRequestIDObj(obj map[string]any, requestID string) {
+	if requestID == "" {
+		return
 	}
 
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
-		return body
+		return
 	}
 
 	for _, raw := range slices.Backward(msgs) {
@@ -831,11 +836,4 @@ func injectConversationRequestID(body []byte, requestID string) []byte {
 
 		break
 	}
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-
-	return out
 }

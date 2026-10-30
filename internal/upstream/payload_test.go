@@ -781,27 +781,28 @@ func mustMarshal(t *testing.T, v any) string {
 	return string(raw)
 }
 
-// TestEnsureLeadingSystem 首条非 system 时补官方 fallback；已是 system 时逐字不动。
+// TestEnsureLeadingSystem 首条非 system 时补官方 fallback；已是 system 时不动。
 func TestEnsureLeadingSystem(t *testing.T) {
 	t.Parallel()
 
-	out := ensureLeadingSystem([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
-
-	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
-		t.Fatal(err)
-	}
+	obj := map[string]any{"model": "m", "messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+	ensureLeadingSystemObj(obj)
 
 	msgs := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("want injected system + original, got %v", msgs)
+	}
 
 	first := msgs[0].(map[string]any)
 	if first["role"] != "system" || first["content"] != LeadingSystemFallback {
 		t.Fatalf("first=%v", first)
 	}
 
-	in := []byte(`{"messages":[{"role":"system","content":"S"}]}`)
-	if got := ensureLeadingSystem(in); string(got) != string(in) {
-		t.Fatalf("system-first body changed: %s", got)
+	kept := map[string]any{"messages": []any{map[string]any{"role": "system", "content": "S"}}}
+	ensureLeadingSystemObj(kept)
+
+	if msgs := kept["messages"].([]any); len(msgs) != 1 {
+		t.Fatalf("system-first body must not be touched: %v", msgs)
 	}
 }
 
@@ -809,17 +810,17 @@ func TestEnsureLeadingSystem(t *testing.T) {
 func TestInjectConversationRequestID(t *testing.T) {
 	t.Parallel()
 
-	in := `{"model":"m","messages":[` +
+	body := `{"model":"m","messages":[` +
 		`{"role":"user","content":"old"},` +
 		`{"role":"assistant","content":"a"},` +
 		`{"role":"user","content":"new","conversationRequestId":"client-id"}]}`
 
-	out := injectConversationRequestID([]byte(in), "server-id")
-
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := json.Unmarshal([]byte(body), &obj); err != nil {
 		t.Fatal(err)
 	}
+
+	injectConversationRequestIDObj(obj, "server-id")
 
 	msgs := obj["messages"].([]any)
 

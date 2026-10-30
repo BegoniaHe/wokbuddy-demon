@@ -35,13 +35,16 @@ const maxSSEAggregateBytes = 32 << 20
 // server 末端错误映射与单行超限同口径：502 upstream_parse。
 var ErrSSEAggregateTooLong = errors.New("sse aggregate exceeds size limit")
 
-// readSSELine 读一行（含 '\n'），单行字节数超过 MaxSSELineBytes 时返回
+// ReadSSELine 读一行（含 '\n'），单行字节数超过 MaxSSELineBytes 时返回
 // ErrSSELineTooLong 而不继续累积内存。语义对齐 bufio.Reader.ReadString：
 // 行尾不带 '\n' 时返回该行 + io.EOF；'\n' 结尾时返回 err=nil。
 //
 // 实现不依赖 ReadString 的字符串拼接：超长行会被 ReadString 反复 concat 成
 // 任意大小。这里自己按 chunk 累积，超限立即失败。
-func readSSELine(br *bufio.Reader) (string, error) {
+//
+// 导出是因为 server 的 chatStatsReader 也要在透传同一条流时按同一上限切行：
+// 上限与哨兵必须只有一份实现，否则两侧对「上游单行超大」会给出不同判定。
+func ReadSSELine(br *bufio.Reader) (string, error) {
 	var builder strings.Builder
 
 	for {

@@ -124,10 +124,36 @@ func TestNormalizeIPVariants(t *testing.T) {
 		" ::1 ":        "::1",
 		"unknown":      "",
 		"":             "",
+		// 前导零不是规范形态，ParseIP 直接拒掉：不能走「原串即规范」的快路径。
+		"01.2.3.4":       "",
+		"1.2.3.004":      "",
+		"1.2.3.4.5":      "",
+		"::ffff:1.2.3.4": "1.2.3.4",
 	}
 	for in, want := range cases {
 		if got := normalizeIP(in); got != want {
 			t.Errorf("normalizeIP(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+// TestNormalizeIPMatchesNetIPString 规范 IPv4 快路径（直接返回原串，省掉
+// net.IP.String() 的每次分配）必须与 ParseIP + String() 的结果完全一致。
+func TestNormalizeIPMatchesNetIPString(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{
+		"0.0.0.0", "9.9.9.9", "10.0.0.1", "127.0.0.1", "255.255.255.255",
+		"1.2.3.4", "192.0.2.1", "198.51.100.9", "203.0.113.7",
+		"::1", "2001:db8::1", "fe80::1", "::ffff:192.0.2.1",
+	} {
+		ip := net.ParseIP(raw)
+		if ip == nil {
+			t.Fatalf("ParseIP(%q)=nil（用例本身非法）", raw)
+		}
+
+		if got, want := normalizeIP(raw), ip.String(); got != want {
+			t.Errorf("normalizeIP(%q)=%q want %q", raw, got, want)
 		}
 	}
 }

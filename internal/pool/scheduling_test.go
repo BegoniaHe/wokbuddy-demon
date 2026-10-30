@@ -184,3 +184,40 @@ func TestReserveForRequestFreeModelNoop(t *testing.T) {
 		t.Fatalf("free model amount=%v ok=%v want 0,true", amount, ok)
 	}
 }
+
+// EstimatePromptTokens 直接在字节上逐 rune 解码（不复制 body）。与 range string
+// 的参考实现逐用例比对，含 ASCII / CJK / 混合 / 非法 UTF-8 / 空体。
+func TestEstimatePromptTokensMatchesRuneRange(t *testing.T) {
+	t.Parallel()
+
+	reference := func(body []byte) int {
+		ascii, cjk := 0, 0
+
+		for _, r := range string(body) {
+			if r >= cjkRangeStart {
+				cjk++
+			} else {
+				ascii++
+			}
+		}
+
+		return ascii/4 + int(float64(cjk)/1.5)
+	}
+
+	cases := [][]byte{
+		nil,
+		{},
+		[]byte("hello world"),
+		[]byte("请分析这段日志"),
+		[]byte("混合 ascii 与 CJK 中文 content"),
+		{0xff, 0xfe, 'a'}, // 非法 UTF-8：RuneError + 宽度 1
+		{0xe4, 0xbd},      // 截断的多字节序列
+		[]byte(`{"messages":[{"role":"user","content":"你好 hello"}]}`),
+	}
+
+	for _, body := range cases {
+		if got, want := EstimatePromptTokens(body), reference(body); got != want {
+			t.Fatalf("EstimatePromptTokens(%q)=%d want %d", body, got, want)
+		}
+	}
+}

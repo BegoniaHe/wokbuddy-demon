@@ -1743,7 +1743,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
-	chatStat2 := newChatStat(time.Now(), chatInput2.body, chatInput2.stream, h.chatLogOut, h.chatLogEnabled)
+	chatStat2 := newChatStat(time.Now(), chatInput2.model, chatInput2.stream, h.chatLogOut, h.chatLogEnabled)
 
 	chatStat2.decision = h.sampleDecisionTrace()
 	if chatInput2.trace != nil {
@@ -1844,8 +1844,6 @@ func (f *chatFlow) canDegrade() bool {
 //   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；无则回落会话键；
 //   - conversationRequestID：入站 X-Conversation-Request-Id 透传优先，否则按粘性 key
 //     进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID）。
-//
-//nolint:cyclop // 会话请求 id 多级回退，switch 顺序即语义。
 func (f *chatFlow) buildChatMeta() {
 	// 入站已带 X-Conversation-Request-Id 时直接透传，轮级键不参与输出：跳过整包
 	// messages 解析（长请求省一次全量反序列化）。
@@ -1854,40 +1852,16 @@ func (f *chatFlow) buildChatMeta() {
 		f.turnKeyBody = nil
 	}
 
-	convID := f.inboundSession.conversationID
-	if convID == "" {
-		convID = f.explicitConvID
-	}
-
-	if convID == "" {
-		convID = f.sessKey
-	}
-
 	f.chatMeta = upstream.ChatMeta{
-		ConversationID:       convID,
-		RootRequestID:        f.inboundSession.rootRequestID,
-		ParentConversationID: f.inboundSession.parentConversationID,
-		AgentIntent:          f.inboundSession.agentIntent,
-		AgentPurpose:         f.inboundSession.agentPurpose,
-		AgentType:            f.inboundSession.agentType,
-		Compaction:           f.inboundSession.compaction,
-		ContextCompacted:     f.inboundSession.contextCompacted,
-	}
-	switch {
-	case f.convReqID != "":
-		f.chatMeta.ConversationRequestID = f.convReqID
-	case f.turnKey != "" && f.sessKey != "":
-		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞（#170 统一轮级）。
-		f.chatMeta.ConversationRequestID = session.TurnRequestID(f.sessKey + ":" + f.turnKey)
-	case f.turnKey != "":
-		// 无会话键客户端：纯轮级键（既有兜底语义不变，存量会话键值零漂移）。
-		f.chatMeta.ConversationRequestID = session.TurnRequestID(f.turnKey)
-	case f.sessKey != "":
-		// 残留空态兜底（无 user 消息/无可签名内容）：会话级聚合，好于请求级随机。
-		f.chatMeta.ConversationRequestID = session.RequestIDForKey(f.sessKey)
-	default:
-		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
-		f.chatMeta.ConversationRequestID = session.TurnRequestID("")
+		ConversationID:        f.conversationID(),
+		RootRequestID:         f.inboundSession.rootRequestID,
+		ParentConversationID:  f.inboundSession.parentConversationID,
+		AgentIntent:           f.inboundSession.agentIntent,
+		AgentPurpose:          f.inboundSession.agentPurpose,
+		AgentType:             f.inboundSession.agentType,
+		Compaction:            f.inboundSession.compaction,
+		ContextCompacted:      f.inboundSession.contextCompacted,
+		ConversationRequestID: f.conversationRequestID(),
 	}
 
 	if f.chatMeta.ConversationID == "" {
@@ -1898,6 +1872,41 @@ func (f *chatFlow) buildChatMeta() {
 	}
 
 	f.chatMeta.TraceID = f.traceID
+}
+
+// conversationID 会话 ID 取值顺序：入站官方会话元数据 → body 提取的显式会话 ID
+// → 粘性会话键。全空返回空串（不伪造）。
+func (f *chatFlow) conversationID() string {
+	if id := f.inboundSession.conversationID; id != "" {
+		return id
+	}
+
+	if f.explicitConvID != "" {
+		return f.explicitConvID
+	}
+
+	return f.sessKey
+}
+
+// conversationRequestID 对话轮级聚合 ID：入站透传优先，否则按「轮级复合 →
+// 纯轮级 → 会话级 → 请求级随机」依次回落，越靠前越能聚合同一轮的多账号重试。
+func (f *chatFlow) conversationRequestID() string {
+	switch {
+	case f.convReqID != "":
+		return f.convReqID
+	case f.turnKey != "" && f.sessKey != "":
+		// 轮级复合键：sessKey 入键防跨会话同轮文本互撞（#170 统一轮级）。
+		return session.TurnRequestID(f.sessKey + ":" + f.turnKey)
+	case f.turnKey != "":
+		// 无会话键客户端：纯轮级键（既有兜底语义不变，存量会话键值零漂移）。
+		return session.TurnRequestID(f.turnKey)
+	case f.sessKey != "":
+		// 残留空态兜底（无 user 消息/无可签名内容）：会话级聚合，好于请求级随机。
+		return session.RequestIDForKey(f.sessKey)
+	default:
+		// 无会话键也无轮级键：请求级随机（轮转内捕获一次即共享）。
+		return session.TurnRequestID("")
+	}
 }
 
 // releaseHeld 释放在途租约与请求级预扣（幂等）。
@@ -2098,6 +2107,14 @@ func (f *chatFlow) skipReserved(ctx context.Context, acct *auth.Auth, i int) rot
 // reserveCredits 请求级预扣（issue #116 P1-1）：按请求体估算 prompt 与 max_tokens，
 // 在 credits 中预留估算成本；余额不足时返回 false，调用方跳过该账号。
 func (f *chatFlow) reserveCredits(acct *auth.Auth) bool {
+	// 积分保底关闭（credit_floor=0，默认）时 ReserveForRequest 必然直接放行：
+	// 提前返回，省掉两次整份 body 扫描（EstimatePromptTokens 逐 rune 遍历全文 +
+	// maxOutputTokensFromBody 整解一遍 JSON）。几十 KB 的请求每轮白付约 0.5ms，
+	// 且换号重试时每个账号再付一次。
+	if f.h.cfg.Pool.CreditFloor() <= 0 {
+		return true
+	}
+
 	amount, ok := f.h.cfg.Pool.ReserveForRequest(
 		acct.UID, f.bareModel, acct.Realm(),
 		pool.EstimatePromptTokens(f.body), maxOutputTokensFromBody(f.body),
@@ -2476,7 +2493,7 @@ func (f *chatFlow) waitForModelBusy(ctx context.Context) bool {
 const modelBusyWaitMax = 10 * time.Second
 
 // retryAcquireFailed 处置并发抢名额失败：被抢的若是粘性号则立即解绑并回落普通轮换，
-// 避免下一轮仍撞同一个满载粘性号再浪费一次 PickByUID 往返。
+// 避免下一轮仍撞同一个满载粘性号再浪费一次 PickByUIDForModel 往返。
 func (f *chatFlow) retryAcquireFailed(ctx context.Context, acct *auth.Auth, i int) rotationAction {
 	if f.stickyUID != "" && acct.UID == f.stickyUID {
 		f.unbindSticky()
@@ -2995,23 +3012,12 @@ func (f *chatFlow) handleStreamSuccess(
 	// 首帧否决窗口（issue #244）：在写出任何字节前预览首段，error/顶层业务码/零输出
 	// 都还能换号或关闭思考重发，不再出现「200 + error 帧」。
 	probe := upstream.ProbeStream(rc)
+	// 预览行缓冲来自全局池：必须在流结束后归还——Close 时点太早，见
+	// upstream.StreamProbe.Release。defer 与返回值顺序无关，veto/正常/错误路径都覆盖。
+	defer probe.Release()
 
-	if probe.ZeroOutputLength {
-		rc.Close()
-
-		return f.retryZeroOutputLength(ctx, acct, attemptStarted, i)
-	}
-
-	if probe.Kind != upstream.ErrNone {
-		rc.Close()
-
-		return f.handlePreStreamErrorFrame(ctx, acct, probe, attemptStarted, i)
-	}
-
-	if probe.Empty {
-		rc.Close()
-
-		return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i)
+	if action, vetoed := f.probeVeto(ctx, acct, rc, probe, attemptStarted, i); vetoed {
+		return action
 	}
 
 	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
@@ -3021,10 +3027,17 @@ func (f *chatFlow) handleStreamSuccess(
 	f.st.status = http.StatusOK
 
 	stream := probe.ReadCloser(rc)
+	// cont 非 nil 时其 64KB 行缓冲来自全局池，必须在 Stream 返回后 Release
+	// （那时读 goroutine 已退出；Close 时点太早，见 upstream.TextContinueReader.Release）。
+	var cont *upstream.TextContinueReader
+
 	if !probe.HasTool && probe.Text != "" {
-		stream = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
+		cont = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
 			return f.continueUpstream(ctx, acct, partial)
 		})
+		stream = cont
+		// 惰性 defer：Release 自带 nil 判定，normal 路径与提前返回路径都不会漏还。
+		defer cont.Release()
 	}
 
 	stats := newChatStatsReaderSince(stream, f.st.start)
@@ -3208,6 +3221,57 @@ func (f *chatFlow) handlePreStreamErrorFrame(
 	}
 
 	f.rotateReason = kind.String()
+
+	return rotContinue
+}
+
+// probeVeto 首帧否决窗口的处置分派：命中即关闭上游 body 并给出轮转动作。
+// 四个分支都是「已读字节不能原样交给客户端」的异常首段，顺序即优先级。
+func (f *chatFlow) probeVeto(
+	ctx context.Context, acct *auth.Auth, rc io.ReadCloser,
+	probe *upstream.StreamProbe, attemptStarted time.Time, i int,
+) (rotationAction, bool) {
+	switch {
+	case probe.SizeLimited:
+		rc.Close()
+
+		return f.handlePreStreamSizeLimit(ctx, acct, attemptStarted, i), true
+	case probe.ZeroOutputLength:
+		rc.Close()
+
+		return f.retryZeroOutputLength(ctx, acct, attemptStarted, i), true
+	case probe.Kind != upstream.ErrNone:
+		rc.Close()
+
+		return f.handlePreStreamErrorFrame(ctx, acct, probe, attemptStarted, i), true
+	case probe.Empty:
+		rc.Close()
+
+		return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i), true
+	default:
+		return rotContinue, false
+	}
+}
+
+// handlePreStreamSizeLimit 首段预览即撞上单行上限（MaxSSELineBytes，issue #113）：
+// 已读的部分行不能回放，按上游失败换号；轮转耗尽时由 localErrorEnvelope 把
+// 包装后的哨兵归 502 upstream_parse（与透传层同一分类）。
+func (f *chatFlow) handlePreStreamSizeLimit(
+	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	f.fail(acct.UID)
+	f.st.status = http.StatusBadGateway
+	f.lastErr = fmt.Errorf("upstream sse line exceeds %d bytes: %w",
+		upstream.MaxSSELineBytes, upstream.ErrSSELineTooLong)
+	log.Printf("WARN: [server] stream acct=%s model=%s: line over %d bytes before first content (rotating)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, upstream.MaxSSELineBytes)
+
+	if !rotateBackoff(ctx, i) {
+		return rotBreak
+	}
+
+	f.rotateReason = "sse_line_too_long"
 
 	return rotContinue
 }

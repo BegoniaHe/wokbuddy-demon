@@ -20,6 +20,10 @@ func TestFinalErrorEnvelopeLocalErrorsNoPoolHint(t *testing.T) {
 		err  error
 	}{
 		{"line too long", upstream.ErrSSELineTooLong},
+		// 首帧预览撞上限时 handler 存的是包装后的错误（带实际上限值），
+		// 分类必须仍按哨兵命中（handlePreStreamSizeLimit）。
+		{"line too long (wrapped)", fmt.Errorf("upstream sse line exceeds %d bytes: %w",
+			upstream.MaxSSELineBytes, upstream.ErrSSELineTooLong)},
 		{"aggregate too long", upstream.ErrSSEAggregateTooLong},
 	}
 	for _, c := range cases {

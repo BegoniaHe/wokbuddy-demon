@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -21,6 +22,29 @@ func TestProbeStreamBusinessFrame(t *testing.T) {
 
 	if probe.Frame == "" {
 		t.Fatal("frame should be captured")
+	}
+}
+
+// TestProbeStreamLineTooLong 预览阶段单行超上限（issue #113）：总量上限是读完
+// 一行之后才判的，挡不住单行把内存撑到任意大小。此时标记 SizeLimited 且不回放
+// 半行，由 handler 按 upstream_parse 收尾。
+func TestProbeStreamLineTooLong(t *testing.T) {
+	t.Parallel()
+
+	huge := "data: " + strings.Repeat("x", MaxSSELineBytes)
+
+	probe := ProbeStream(strings.NewReader(huge + "\n\n"))
+
+	if !probe.SizeLimited {
+		t.Fatal("SizeLimited=false，超长单行未被识别")
+	}
+
+	if probe.Kind != ErrNone {
+		t.Errorf("kind=%v want ErrNone（分类交给 handler）", probe.Kind)
+	}
+
+	if len(probe.buffered) > probeMaxBytes {
+		t.Errorf("buffered=%d bytes want <= %d（不保留超长行）", len(probe.buffered), probeMaxBytes)
 	}
 }
 
@@ -96,6 +120,137 @@ func TestTextContinueReaderSplicesLength(t *testing.T) {
 
 	if partial != "hello " {
 		t.Fatalf("partial=%q", partial)
+	}
+}
+
+// TestTextContinueReaderLineTooLong 单行超限（issue #113）：续写层此前用
+// ReadString 无上限拼接，超长无换行行能把内存撑到任意大小；现在与 stream /
+// Aggregate 同口径，超限即按上游失败上抛，不留残缺行。
+func TestTextContinueReaderLineTooLong(t *testing.T) {
+	t.Parallel()
+
+	huge := strings.Repeat("x", MaxSSELineBytes+1024)
+
+	r := NewTextContinueReader(closeString{strings.NewReader(huge)}, "", false, nil)
+	defer r.Close()
+
+	buf := make([]byte, 64*1024)
+
+	var err error
+
+	for range 16 {
+		_, err = r.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+
+	if !errors.Is(err, ErrSSELineTooLong) {
+		t.Fatalf("err=%v want ErrSSELineTooLong", err)
+	}
+
+	if errors.Is(err, io.EOF) {
+		t.Fatal("超长行不得按正常 EOF 收尾")
+	}
+}
+
+// TestTextContinueReaderReleaseStopsReads Release 之后不得还能读到数据：行缓冲
+// 已还给全局池，任何残留读取都会读到别的流的内容（幂等 + nil 安全也不得 panic）。
+func TestTextContinueReaderReleaseStopsReads(t *testing.T) {
+	t.Parallel()
+
+	r := NewTextContinueReader(closeString{strings.NewReader("data: hi\n\n")}, "", false, nil)
+	r.Release()
+
+	if _, err := r.Read(make([]byte, 16)); !errors.Is(err, io.EOF) {
+		t.Fatalf("err=%v want io.EOF（Release 后不得再读）", err)
+	}
+
+	r.Release() // 幂等
+
+	var nilReader *TextContinueReader
+
+	nilReader.Release() // nil 安全
+}
+
+// TestTextContinueReaderBufferPooled 行缓冲必须跨流复用：不池化时每流一次 64KB
+// 分配，是流式请求里最大的一笔垃圾（实测占 B/op 约 2/3）。
+//
+//nolint:paralleltest // testing.AllocsPerRun 不能在并行测试里调用（会直接 panic）。
+func TestTextContinueReaderBufferPooled(t *testing.T) {
+	// 池在不同 P 上是私有的，AllocsPerRun 固定在同一 goroutine 内跑。
+	// src 建在闭包外：每次新建 strings.Reader 自带一次分配，会盖住要测的那笔。
+	src := closeString{strings.NewReader("")}
+	NewTextContinueReader(src, "", false, nil).Release()
+
+	allocs := testing.AllocsPerRun(64, func() {
+		r := NewTextContinueReader(src, "", false, nil)
+		r.Release()
+	})
+
+	// 复用命中时只剩 reader 结构体本身；未复用时还会多出 bufio.Reader + 64KB 缓冲。
+	if allocs > 2 {
+		t.Fatalf("allocs/op=%v want <=2（64KB 行缓冲未被复用）", allocs)
+	}
+}
+
+// TestStreamProbeReleaseStopsReads Release 之后不得还能读到上游剩余流：行缓冲
+// 已还给全局池，残留读取会读到别的请求的内容（幂等 + nil 安全也不得 panic）。
+func TestStreamProbeReleaseStopsReads(t *testing.T) {
+	t.Parallel()
+
+	probe := ProbeStream(strings.NewReader(
+		"data: {\"choices\":[{\"delta\":{\"content\":\"你\"}}]}\n\ndata: tail\n\n"))
+	if probe.Text != "你" {
+		t.Fatalf("Text=%q want 你", probe.Text)
+	}
+
+	// Release 前：已预览字节 + 上游剩余流都能读到。
+	rest, err := io.ReadAll(probe.Reader())
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+
+	if !strings.Contains(string(rest), "tail") {
+		t.Fatalf("rest=%q want 含上游剩余流", rest)
+	}
+
+	probe.Release()
+
+	// Release 后：只剩已预览字节，剩余流不再可达。
+	rest, err = io.ReadAll(probe.Reader())
+	if err != nil {
+		t.Fatalf("ReadAll after Release: %v", err)
+	}
+
+	if strings.Contains(string(rest), "tail") {
+		t.Fatalf("rest=%q Release 后不得再读上游", rest)
+	}
+
+	probe.Release() // 幂等
+
+	var nilProbe *StreamProbe
+
+	nilProbe.Release() // nil 安全
+}
+
+// TestStreamProbeReaderPooled 预览行缓冲必须跨请求复用：不池化时每请求一次 4KB
+// 分配（流式 B/op 里除 JSON 解码外最大的一笔）。
+//
+//nolint:paralleltest // testing.AllocsPerRun 不能在并行测试里调用（会直接 panic）。
+func TestStreamProbeReaderPooled(t *testing.T) {
+	// 池在不同 P 上是私有的，AllocsPerRun 固定在同一 goroutine 内跑。
+	// src 建在闭包外：每次新建 strings.Reader 自带一次分配，会盖住要测的那笔。
+	src := strings.NewReader("")
+	ProbeStream(src).Release()
+
+	allocs := testing.AllocsPerRun(64, func() {
+		ProbeStream(src).Release()
+	})
+
+	// 复用命中时只剩 StreamProbe 结构体本身；未复用时还会多出 bufio.Reader + 4KB 缓冲。
+	if allocs > 1 {
+		t.Fatalf("allocs/op=%v want <=1（4KB 预览行缓冲未被复用）", allocs)
 	}
 }
 

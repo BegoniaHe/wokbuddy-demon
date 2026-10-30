@@ -34,9 +34,9 @@ const (
 // UUID 语义的短标识；消息/请求级 ID 用 NewUUIDv7Hex。crypto/rand 失败（理论上
 // 不可能）时回落 math/rand/v2 双 uint64 拼 32 hex——恒 32 hex、恒合法。
 func NewMessageID() string {
-	b := make([]byte, 16)
-	if _, err := cryptorand.Read(b); err == nil {
-		return hex.EncodeToString(b)
+	var b [16]byte
+	if _, err := cryptorand.Read(b[:]); err == nil {
+		return hex.EncodeToString(b[:])
 	}
 	// 熵源故障的极端兜底：仍保证 32 hex（fallbackID 不 panic、不空串）。
 	return fmt.Sprintf("%016x%016x", rand.Uint64()|1, rand.Uint64()) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
@@ -48,7 +48,9 @@ func NewMessageID() string {
 // 前 48 位为 Unix 毫秒时间戳，剩余位来自 crypto/rand；熵源失败时回落
 // math/rand/v2，版本/变体位仍在返回前强制写入。
 func NewUUIDv7Hex() string {
-	return uuidV7Hex(newUUIDv7Bytes())
+	b := newUUIDv7Bytes()
+
+	return uuidV7Hex(b[:])
 }
 
 // UUIDv7At 由种子与时间基准**稳定派生**带连字符 UUIDv7：前 48 bit 时间戳取
@@ -73,9 +75,9 @@ func UUIDv7At(seed string, base time.Time) string {
 // newUUIDv7Bytes 生成 16 字节 UUIDv7 原始位：前 48 bit 为 Unix 毫秒时间戳，
 // 其余位来自 crypto/rand（熵源失败回落 math/rand/v2）。版本/变体位由
 // uuidV7Hex / uuidV7Canonical 写入。
-func newUUIDv7Bytes() []byte {
-	buf := make([]byte, 16)
-	if _, err := cryptorand.Read(buf); err != nil {
+func newUUIDv7Bytes() [16]byte {
+	var buf [16]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
 		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())  //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 	}
@@ -91,7 +93,8 @@ func newUUIDv7Bytes() []byte {
 // NewUUIDv4 生成标准带连字符 UUIDv4（8-4-4-4-12，version=4、variant=10xx），
 // 用于会话级兜底 ID（官方 crypto.randomUUID() 同款形态）。
 func NewUUIDv4() string {
-	h := hex.EncodeToString(newRandomUUIDv4Bytes())
+	b := newRandomUUIDv4Bytes()
+	h := hex.EncodeToString(b[:])
 
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
@@ -101,13 +104,15 @@ func NewUUIDv4() string {
 // 官方 chat 的 X-Trace-Id / X-B3-TraceId / traceparent trace-id 三处同值、形态为
 // 随机 v4 且与 X-Conversation-Request-ID（v7）不同值——两者可判别，不能互相复用。
 func NewTraceID() string {
-	return hex.EncodeToString(newRandomUUIDv4Bytes())
+	b := newRandomUUIDv4Bytes()
+
+	return hex.EncodeToString(b[:])
 }
 
 // newRandomUUIDv4Bytes 生成 16 字节 UUIDv4 原始位（version=4、variant=10xx）。
-func newRandomUUIDv4Bytes() []byte {
-	buf := make([]byte, 16)
-	if _, err := cryptorand.Read(buf); err != nil {
+func newRandomUUIDv4Bytes() [16]byte {
+	var buf [16]byte
+	if _, err := cryptorand.Read(buf[:]); err != nil {
 		binary.BigEndian.PutUint64(buf[0:8], rand.Uint64()|1) //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 		binary.BigEndian.PutUint64(buf[8:16], rand.Uint64())  //nolint:gosec // crypto/rand 失败后的 ID 兜底，非安全用途
 	}

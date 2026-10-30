@@ -77,16 +77,6 @@ func shadowParseEvents(t *testing.T, raw string) []shadowEvent {
 	return events
 }
 
-func shadowDeltaName(name string) bool {
-	switch name {
-	case "response.output_text.delta", "response.function_call_arguments.delta",
-		"response.custom_tool_call_input.delta":
-		return true
-	default:
-		return false
-	}
-}
-
 func shadowTerminalName(name string) bool {
 	switch name {
 	case "response.completed", "response.incomplete", "response.failed":

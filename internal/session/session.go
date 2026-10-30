@@ -696,7 +696,7 @@ type metadataProbe struct {
 //
 // 第 5 项 prompt_cache_key：pi-ai 驱动的客户端（dsh 等）把会话 ID 放在这个 OpenAI
 // 前缀缓存字段里（而非 conversation_id），网关在 upstream 侧本就认它（见
-// InjectPromptCacheKey 优先级 1：客户端自带则原值保留）。纳入识别后，这类客户端
+// internal/upstream/cache_key.go：客户端自带则原值保留）。纳入识别后，这类客户端
 // 无需改配置即可命中粘性。置于显式会话键之后、派生键之前，绝不抢占 conversation
 // 维度的优先级。
 //

@@ -32,7 +32,7 @@ func TestReadSSELineNormalLines(t *testing.T) {
 
 			br := bufio.NewReaderSize(strings.NewReader(item.raw), 8)
 
-			got, err := readSSELine(br)
+			got, err := ReadSSELine(br)
 			if got != item.want {
 				t.Errorf("line=%q want %q", got, item.want)
 			}
@@ -57,7 +57,7 @@ func TestReadSSELineTooLong(t *testing.T) {
 	huge := strings.Repeat("x", MaxSSELineBytes+1024)
 	br := bufio.NewReaderSize(strings.NewReader(huge), 64*1024)
 
-	_, err := readSSELine(br)
+	_, err := ReadSSELine(br)
 	if !errors.Is(err, ErrSSELineTooLong) {
 		t.Fatalf("err=%v want ErrSSELineTooLong", err)
 	}
@@ -71,7 +71,7 @@ func TestReadSSELineExactlyAtLimit(t *testing.T) {
 	line := strings.Repeat("x", MaxSSELineBytes-1) + "\n"
 	br := bufio.NewReaderSize(strings.NewReader(line), 64*1024)
 
-	got, err := readSSELine(br)
+	got, err := ReadSSELine(br)
 	if err != nil {
 		t.Fatalf("err=%v want nil (line length %d == limit)", err, len(line))
 	}
