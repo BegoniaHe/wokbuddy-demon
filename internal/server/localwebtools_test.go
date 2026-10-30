@@ -291,3 +291,72 @@ func TestLocalWebToolLoopStopsOnRequestCancel(t *testing.T) {
 		t.Fatalf("上游收到 %d 次请求，want 1（取消后不得再开新一轮）", len(seen))
 	}
 }
+
+// TestLocalWebToolLoopPreservesRequestLevelError 内层请求级错误保留状态码与分类
+// code，message 有界且不含完整上游 body（issue #416）。
+func TestLocalWebToolLoopPreservesRequestLevelError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		body     string
+		wantCode string
+	}{
+		{
+			name:     "content_blocked",
+			body:     `{"code":"11-128","msg":"blocked by security policy ` + strings.Repeat("lorem ipsum ", 400) + `TAIL-MARKER"}`,
+			wantCode: "content_blocked",
+		},
+		{
+			name:     "prompt_too_long",
+			body:     `{"code":11115,"msg":"prompt is too long: ` + strings.Repeat("lorem ipsum ", 400) + `TAIL-MARKER"}`,
+			wantCode: "prompt_too_long",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstreamClient := newFakeUpstream(t, func(string) (int, string, bool) {
+				return http.StatusBadRequest, testCase.body, false
+			})
+			p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+			// custom 提示词模式：content_blocked 不触发降级重试，单次上游调用即可观察。
+			handler := NewHandler(&Config{
+				Pool: p, Upstream: upstreamClient, LocalWebTools: true, LocalWebToolRounds: 3,
+				PromptMode: "custom", PromptText: "SYS",
+			})
+
+			body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code=%d want 400（保留内层状态码），body=%s", rec.Code, rec.Body)
+			}
+
+			var env struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body)
+			}
+
+			if env.Error.Code != testCase.wantCode {
+				t.Errorf("error.code=%q want %q", env.Error.Code, testCase.wantCode)
+			}
+
+			if len(env.Error.Message) > localWebToolErrorMessageLimit {
+				t.Errorf("message %d 字节超过上限 %d", len(env.Error.Message), localWebToolErrorMessageLimit)
+			}
+
+			if strings.Contains(env.Error.Message, "TAIL-MARKER") {
+				t.Errorf("message 透传了完整上游 body 尾部: %q", env.Error.Message)
+			}
+		})
+	}
+}

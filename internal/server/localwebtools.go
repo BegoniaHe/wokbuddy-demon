@@ -38,6 +38,9 @@ const (
 	webToolMaxTextBytes       = 32 << 10
 	webFetchTimeout           = 15 * time.Second
 	webSearchTimeout          = 10 * time.Second
+	// localWebToolErrorMessageLimit 回给客户端的错误 message 上限：上游原文可能很长，
+	// 整段透传既无用又可能带内部细节（issue #416）。
+	localWebToolErrorMessageLimit = 512
 )
 
 // 测试可替换的实现注入点（不导出）。
@@ -47,7 +50,6 @@ var (
 )
 
 var (
-	errRunLocalWebToolLoopFailed   = errors.New("runLocalWebToolLoop failed")
 	errEmptyUpstreamResponse       = errors.New("empty upstream response")
 	errLocalWebToolLoopExhausted   = errors.New("local web tool loop exhausted")
 	errLocalWebToolLoopRequiresNon = errors.New("local web tool loop requires non-stream response")
@@ -124,7 +126,17 @@ func (h *Handler) serveResponsesWithLocalTools(
 
 	final, err := h.runLocalWebToolLoop(r, req, msgs, model)
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadGateway, "local_web_tool_failed", err.Error())
+		// 内层请求级错误（content_blocked / prompt_too_long / 参数错 / 模型不存在）
+		// 保留原状态码与分类 code，不压平成 502（issue #416）。
+		if toolErr, ok := errors.AsType[*localWebToolLoopError](err); ok {
+			writeOpenAIError(w, toolErr.status, toolErr.code, toolErr.msg)
+
+			return
+		}
+
+		writeOpenAIError(w, http.StatusBadGateway, "local_web_tool_failed",
+			upstream.RedactForLog(err.Error(), localWebToolErrorMessageLimit))
+
 		return
 	}
 
@@ -146,6 +158,7 @@ func (h *Handler) runLocalWebToolLoop(
 ) (map[string]any, error) {
 	ctx := r.Context()
 	maxRounds := h.localWebToolRounds()
+
 	for round := 0; round <= maxRounds; round++ {
 		// 入站请求取消/断开后不再发起新的一轮上游调用（issue #415）。
 		if cerr := ctx.Err(); cerr != nil {
@@ -157,23 +170,9 @@ func (h *Handler) runLocalWebToolLoop(
 			req["tool_choice"] = "none"
 		}
 
-		raw, err := json.Marshal(req)
+		obj, err := h.runLocalWebToolRound(r, req, model)
 		if err != nil {
-			return nil, fmt.Errorf("encode request: %w", err)
-		}
-
-		buf := &bufferResponder{}
-		chatInput2 := newChatInputFromRequest(r, raw, false, model)
-		chatInput2.clientIP = httpauth.ClientIP(r, h.cfg.TrustedProxies)
-		h.serveChat(r, &chatInput2, buf)
-
-		if buf.status != 0 {
-			return nil, fmt.Errorf("%s: %s: %w", buf.code, buf.msg, errRunLocalWebToolLoopFailed)
-		}
-
-		obj, _ := buf.body.(map[string]any)
-		if obj == nil {
-			return nil, errEmptyUpstreamResponse
+			return nil, err
 		}
 
 		calls, ok := localToolCalls(obj)
@@ -182,19 +181,76 @@ func (h *Handler) runLocalWebToolLoop(
 		}
 
 		msgs = append(msgs, assistantToolMessage(obj))
-		for _, call := range calls {
-			// 每个工具调用前再确认一次：抓取进行中断开时剩余工具不再发起（#415）。
-			if cerr := ctx.Err(); cerr != nil {
-				return nil, cerr
-			}
 
-			msgs = append(msgs, h.toolResultMessage(ctx, call))
+		msgs, err = h.appendLocalToolResults(ctx, msgs, calls)
+		if err != nil {
+			return nil, err
 		}
 
 		req["messages"] = msgs
 	}
 
 	return nil, errLocalWebToolLoopExhausted
+}
+
+// runLocalWebToolRound 执行一轮上游请求并返回解析后的 chat 响应。
+func (h *Handler) runLocalWebToolRound(
+	r *http.Request, req map[string]any, model string,
+) (map[string]any, error) {
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("encode request: %w", err)
+	}
+
+	buf := &bufferResponder{}
+	chatInput2 := newChatInputFromRequest(r, raw, false, model)
+	chatInput2.clientIP = httpauth.ClientIP(r, h.cfg.TrustedProxies)
+	h.serveChat(r, &chatInput2, buf)
+
+	if buf.status != 0 {
+		return nil, &localWebToolLoopError{
+			status: buf.status,
+			code:   buf.code,
+			// 上游原文可能有界透传为 message，但必须脱敏且截断，不能整段回给客户端。
+			msg: upstream.RedactForLog(buf.msg, localWebToolErrorMessageLimit),
+		}
+	}
+
+	obj, _ := buf.body.(map[string]any)
+	if obj == nil {
+		return nil, errEmptyUpstreamResponse
+	}
+
+	return obj, nil
+}
+
+// appendLocalToolResults 执行本轮工具调用；每次调用前确认入站请求仍在（#415）。
+func (h *Handler) appendLocalToolResults(
+	ctx context.Context, msgs []any, calls []localToolCall,
+) ([]any, error) {
+	for _, call := range calls {
+		// 抓取进行中断开时，剩余工具不再发起（#415）。
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+
+		msgs = append(msgs, h.toolResultMessage(ctx, call))
+	}
+
+	return msgs, nil
+}
+
+// localWebToolLoopError 内层 serveChat 的请求级错误：保留内层状态码与分类 code，
+// 由 serveResponsesWithLocalTools 按原语义回给客户端。只有无法归类的错误才回 502。
+// message 已脱敏并按 localWebToolErrorMessageLimit 截断（issue #416）。
+type localWebToolLoopError struct {
+	status int
+	code   string
+	msg    string
+}
+
+func (e *localWebToolLoopError) Error() string {
+	return e.code + ": " + e.msg
 }
 
 // localToolCalls 提取仅由网关执行的工具调用；出现客户端 function 调用时返回
