@@ -14,43 +14,29 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 9f70e00188c30d859505378ae5d9b9779029dc06
-  audited_at_utc: 2026-10-29T12:57:14Z
+  commit: 5caddab9958ed719c7fa6329a37de45747d34cf9
+  audited_at_utc: 2026-10-30T16:31:53Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
-    global: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
+    global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
-    from: 2026-10-28
-    to: 2026-10-29
-    non_merge_commits: 14
+    from: 2026-10-30
+    to: 2026-10-30
+    non_merge_commits: 5
   dispositions:
-    issue: 4
-    revisit: 3
-    skip: 10
+    issue: 1
+    revisit: 1
+    skip: 3
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/400
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/401
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/402
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/403
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/404
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/388
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/389
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/390
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/391
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/429
   note: >-
-    2026-10-29 审计 9ca34c2..9f70e00（14 条非 merge + 3 条 merge），官方基线维持
-    Win32 cn/global 5.9.3.42398134（commit d4692421，本轮重新下载解包并逐条比对包内
-    cli/product.json 与 cli/dist/*.mjs）。区间内 4 条确认缺口开 Issue：#401（global 域
-    无 /v2/chat/busy，404 未按域记忆且繁忙度失败混进模型目录错误面）、#402
-    （ModelRateLimitCap.lines[].paidId 不单独成行，hy3 与 hy3-x 同列）、#403（号都在途
-    占满直接 503，不等待名额）、#404（非流式调用方断开被记成 502 upstream_parse）。
-    另把 2026-10-28 判 skip 的 ee1c80d（5.9.3 九处契约对齐）改成 issue #400：X-Private-Data
-    只对 CN 落地，global 个人号仍发 true（官方 global 5.9.3 与 CN 同源同形，个人号 false /
-    企业版 true）。3 条挂 revisit：面板任务轮次撞 429 后不等待重试（本仓无失败样本）、
-    e8eca81 与 854e74c 的 CN Kimi 工具 schema 兼容（「Kimi 系拒收 $ref」只有外部实测，官方包
-    无对应规则；其中的 enum 缺 type 归 #390、普通 429 按模型隔离冷却本仓已有）。
-    10 条 skip 的形态差异：embeddings 端点族（本仓无此面）、updater 自更新（本仓无
-    internal/updater）、面板 app.js 备注按钮与账号池域名分类（web/src 已覆盖）、global
-    网页会话链活跃（与 PR #45 实测冲突，缺官方包证据）、以及 3 条 merge 封装提交。
+    2026-10-30 审计 9f70e00..5caddab（5 条非 merge），官方 Win32 基线刷新为
+    cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901。开 #429：
+    一键完成先批量拉默认/mp 列表，随后 26 个动作又逐项 ListTasks，mp 专属码再回落，
+    列表外 code 也会先空查询。当前仓已不会为列表外任务 accept/report/claim，所以
+    Issue 只要求每轮复用任务快照、预过滤并保留列表失败降级；收益是消除重复 GET、
+    降低软限流概率，不改任务目录或领奖语义。96a33f1 声称四个任务下架并删除夜猫子
+    排程，但官方 app-asar 无 growth/tasks 与任务 code 字面量，任务目录由服务端下发，
+    本仓也无运行时快照，按 revisit；其余 3 条纯注释/文案清理依赖该未证实前提，按 skip。
     审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
