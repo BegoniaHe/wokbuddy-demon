@@ -466,6 +466,40 @@ func TestRunAutoAllAcceptsSharedTaskOnce(t *testing.T) {
 	}
 }
 
+// TestRunAutoAllRefreshesMPAfterBatchAccept mp 批量 accept 后快照必须更新为
+// accepted；否则每个 mp 动作会再走一次 accept+回读，抵消本轮快照的收益。
+func TestRunAutoAllRefreshesMPAfterBatchAccept(t *testing.T) {
+	t.Parallel()
+
+	upstreamStub := &snapshotUpstream{
+		mpTasks:       []string{"Sequential_Tasks_1"},
+		acceptedCodes: map[string]bool{},
+	}
+	panel := upstreamStub.panel(t)
+
+	var seen upstream.Task
+
+	results := panel.runAutoAllActions(accountForSnapshot(t, panel), []autoAction{
+		snapshotActionWithTask("Sequential_Tasks_1", upstreamStub, &seen),
+	})
+	if len(results) != 2 || results[1]["status"] != "done" {
+		t.Fatalf("results=%v want 批量接受 + 一个动作", results)
+	}
+
+	if seen.AcceptStatus != "accepted" {
+		t.Errorf("动作任务 accept_status=%q want accepted（批量接受后需刷新快照）", seen.AcceptStatus)
+	}
+
+	_, mpCalls, acceptCalls, _, _ := upstreamStub.counts()
+	if acceptCalls != 1 {
+		t.Errorf("accept=%d want 1", acceptCalls)
+	}
+
+	if mpCalls != 3 {
+		t.Errorf("mp GET=%d want 3（执行前 + 批量接受后刷新 + 动作后回读）", mpCalls)
+	}
+}
+
 // TestMPTaskBaseEntriesReadOnce 单任务/队列入口不得因快照包装多读一次
 // mp 列表：target=0 时基础入口保留旧行为，只读一次。
 func TestMPTaskBaseEntriesReadOnce(t *testing.T) {

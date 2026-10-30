@@ -1539,6 +1539,15 @@ func (p *Panel) runAutoAllActions(account6 *auth.Auth, actions []autoAction) []m
 	snapshot.mpTasks, snapshot.mpErr = p.cfg.Upstream.ListTasksMP(account6)
 	snapshot.mpByCode = indexTasksByCode(snapshot.mpTasks)
 	out = append(out, p.autoAcceptBatchMP(account6, snapshot.mpTasks)...)
+	// mp 批量 accept 成功后，上面的列表仍是接受前状态（not_accepted），而
+	// acceptMPTaskIfNeeded/acceptMPAndRefresh 会据此重复 accept。批量接受后
+	// 再读一次拿真实登记状态；失败时保留旧快照，动作侧仍按码 accept+回读验证。
+	if len(pendingTaskCodes(snapshot.mpTasks)) > 0 {
+		if mpTasks, err := p.cfg.Upstream.ListTasksMP(account6); err == nil {
+			snapshot.mpTasks = mpTasks
+			snapshot.mpByCode = indexTasksByCode(mpTasks)
+		}
+	}
 
 	for _, act := range actions {
 		out = append(out, p.autoRunActionWithSnapshot(account6, act, snapshot))
