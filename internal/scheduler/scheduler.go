@@ -772,7 +772,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 	}
 	// 连登管家作为独立任务族运行（自己的守卫/状态），触发来源标记为签到后置，
 	// 与独立手动/排程区分；已在跑时跳过并留一行日志，避免用户误以为已执行。
-	if !s.runTaskSync(context.Background(), TaskStreak, TriggerCheckinFollowup) {
+	if !s.runTaskSync(ctx, TaskStreak, TriggerCheckinFollowup) {
 		log.Printf("INFO: [scheduler] 连登管家已在运行，本轮签到后置触发跳过")
 	}
 

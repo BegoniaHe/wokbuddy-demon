@@ -176,7 +176,7 @@ func (s *Scheduler) runTaskBody(ctx context.Context, task, trigger string) (tota
 	case TaskBlackcat:
 		return s.blackcatAll(ctx)
 	case TaskStreak:
-		return s.streakAll(trigger)
+		return s.streakAll(ctx, trigger)
 	default:
 		return 0, 0, 0
 	}

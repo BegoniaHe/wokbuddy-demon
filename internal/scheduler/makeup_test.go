@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -69,7 +70,7 @@ func TestMakeupRecentNearToFar(t *testing.T) {
 	client := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	scheduler := New(&Config{Pool: state, Upstream: client})
 
-	scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+	scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -181,7 +182,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		scheduler := newScheduler(srv)
 		scheduler.SetMakeupCardsPerRound(1)
-		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 1 || got[0] != days[1] {
 			t.Fatalf("第一轮 used=%v want [%s]", got, days[1])
@@ -189,7 +190,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		next := newScheduler(srv)
 		next.SetMakeupCardsPerRound(1)
-		next.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		next.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 2 || got[1] != days[0] {
 			t.Fatalf("第二轮 used=%v want [%s %s]", got, days[1], days[0])
@@ -204,7 +205,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		scheduler := newScheduler(srv)
 		scheduler.SetMakeupCardsPerRound(0)
-		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 2 || got[0] != days[1] || got[1] != days[0] {
 			t.Fatalf("used=%v want [%s %s]", got, days[1], days[0])
@@ -219,7 +220,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		scheduler := newScheduler(srv)
 		scheduler.SetMakeupCardsPerRound(10)
-		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 2 {
 			t.Fatalf("used=%v want 2 天全补", got)
