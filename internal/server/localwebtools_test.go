@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -121,7 +122,7 @@ func TestLocalWebToolLoop(t *testing.T) {
 	up := recordingUpstream(t, []string{toolCallSSE, sseOK}, &seen)
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(&Config{Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3})
-	h.webSearch = func(query string) (string, error) { return "result:" + query, nil }
+	h.webSearch = func(_ context.Context, query string) (string, error) { return "result:" + query, nil }
 	body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
@@ -151,7 +152,7 @@ func TestLocalWebToolRoundLimit(t *testing.T) {
 	up := recordingUpstream(t, []string{toolCallSSE}, &seen)
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(&Config{Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 1})
-	h.webSearch = func(string) (string, error) { return "result", nil }
+	h.webSearch = func(context.Context, string) (string, error) { return "result", nil }
 	body := `{"model":"glm-5.2","input":"search","tools":[{"type":"web_search"}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
@@ -229,5 +230,64 @@ func TestDeclaredLocalWebToolsAdditionalTools(t *testing.T) {
 	wanted, ok := declaredLocalWebTools(body)
 	if !ok || !wanted["web_search"] || !wanted["web_fetch"] {
 		t.Fatalf("wanted=%v ok=%v", wanted, ok)
+	}
+}
+
+// twoToolCallSSE 单轮内返回两个本地工具调用：用于验证取消后不再执行剩余工具。
+const twoToolCallSSE = "data: {\"id\":\"chatcmpl-1\",\"created\":1753600000,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[" +
+	"{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"a\\\"}\"}}," +
+	"{\"index\":1,\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"b\\\"}\"}}" +
+	"]}}]}\n\n" +
+	"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestLocalWebToolLoopStopsOnRequestCancel 入站请求取消后：工具侧 ctx 立刻收到取消
+// 信号，剩余工具与后续上游轮次都不再发起（issue #415）。
+func TestLocalWebToolLoopStopsOnRequestCancel(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+
+	up := recordingUpstream(t, []string{twoToolCallSSE, sseOK}, &seen)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		calls     atomic.Int32
+		sawCancel atomic.Bool
+	)
+
+	handler.webSearch = func(toolCtx context.Context, _ string) (string, error) {
+		calls.Add(1)
+		// 模拟客户端在工具抓取中断开。
+		cancel()
+
+		if err := toolCtx.Err(); err != nil {
+			sawCancel.Store(true)
+
+			return "", err
+		}
+
+		return "result", nil
+	}
+
+	body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if !sawCancel.Load() {
+		t.Fatal("工具调用未收到入站请求的取消信号")
+	}
+
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("工具调用 %d 次，want 1（取消后不得继续发起剩余工具）", n)
+	}
+
+	if len(seen) != 1 {
+		t.Fatalf("上游收到 %d 次请求，want 1（取消后不得再开新一轮）", len(seen))
 	}
 }

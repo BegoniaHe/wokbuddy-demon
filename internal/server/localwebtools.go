@@ -144,8 +144,14 @@ func (h *Handler) serveResponsesWithLocalTools(
 func (h *Handler) runLocalWebToolLoop(
 	r *http.Request, req map[string]any, msgs []any, model string,
 ) (map[string]any, error) {
+	ctx := r.Context()
 	maxRounds := h.localWebToolRounds()
 	for round := 0; round <= maxRounds; round++ {
+		// 入站请求取消/断开后不再发起新的一轮上游调用（issue #415）。
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+
 		if round == maxRounds {
 			// 代跑轮数用尽：禁止继续调用工具，让模型基于已有结果收尾。
 			req["tool_choice"] = "none"
@@ -177,7 +183,12 @@ func (h *Handler) runLocalWebToolLoop(
 
 		msgs = append(msgs, assistantToolMessage(obj))
 		for _, call := range calls {
-			msgs = append(msgs, h.toolResultMessage(call))
+			// 每个工具调用前再确认一次：抓取进行中断开时剩余工具不再发起（#415）。
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, cerr
+			}
+
+			msgs = append(msgs, h.toolResultMessage(ctx, call))
 		}
 
 		req["messages"] = msgs
@@ -246,12 +257,12 @@ func assistantToolMessage(obj map[string]any) map[string]any {
 
 // toolResultMessage 执行本地工具并构造 role=tool 消息；失败以文本回传，让模型
 // 能看到具体原因继续回答。
-func (h *Handler) toolResultMessage(call localToolCall) map[string]any {
-	content := h.executeLocalTool(call)
+func (h *Handler) toolResultMessage(ctx context.Context, call localToolCall) map[string]any {
+	content := h.executeLocalTool(ctx, call)
 	return map[string]any{"role": "tool", keyToolCallID: call.ID, "content": content}
 }
 
-func (h *Handler) executeLocalTool(call localToolCall) string {
+func (h *Handler) executeLocalTool(ctx context.Context, call localToolCall) string {
 	var args struct {
 		Query string `json:"query"`
 		URL   string `json:"url"`
@@ -260,14 +271,14 @@ func (h *Handler) executeLocalTool(call localToolCall) string {
 	_ = json.Unmarshal([]byte(call.Arguments), &args)
 	switch call.Name {
 	case webSearchTool:
-		out, err := h.webSearch(args.Query)
+		out, err := h.webSearch(ctx, args.Query)
 		if err != nil {
 			return "web_search error: " + err.Error()
 		}
 
 		return out
 	case "web_fetch":
-		out, err := h.webFetch(args.URL)
+		out, err := h.webFetch(ctx, args.URL)
 		if err != nil {
 			return "web_fetch error: " + err.Error()
 		}
@@ -414,13 +425,13 @@ func emitBufferedMessage(event func(string, map[string]any), item map[string]any
 }
 
 // webSearch 调用 DuckDuckGo HTML 搜索并提取标题/链接/摘要。
-func webSearch(query string) (string, error) {
+func webSearch(ctx context.Context, query string) (string, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return "", errQuery
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), webSearchTimeout)
+	ctx, cancel := context.WithTimeout(ctx, webSearchTimeout)
 	defer cancel()
 
 	target := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
@@ -496,8 +507,8 @@ func cleanDuckDuckGoLink(href string) string {
 }
 
 // webFetch 抓取公网文本 URL；拒绝私网/回环/内网解析，限制大小与超时。
-func webFetch(rawURL string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), webFetchTimeout)
+func webFetch(ctx context.Context, rawURL string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, webFetchTimeout)
 	defer cancel()
 
 	body, contentType, err := fetchRaw(ctx, rawURL, webToolMaxResponseBytes)

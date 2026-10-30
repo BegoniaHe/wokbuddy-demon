@@ -170,8 +170,8 @@ type Handler struct {
 	// 让反代/LB 摘流；listener 仍继续受理宽限期内的请求。
 	shuttingDown atomic.Bool
 	// webSearch/webFetch 本地 web 工具实现（默认包级函数；测试可注入）。
-	webSearch func(string) (string, error)
-	webFetch  func(string) (string, error)
+	webSearch func(context.Context, string) (string, error)
+	webFetch  func(context.Context, string) (string, error)
 	// modelsCache 动态模型缓存（默认进程级；测试可注入独立实例）。
 	modelsCache *modelsCache
 	// chatLogOut/chatLogEnabled 请求表格日志出口与开关（测试可注入本地 buffer）。
