@@ -52,15 +52,19 @@ type autoAction struct {
 	Desc     string // 展示用说明
 	Attempt  bool   // true = 尝试型（上游未证实可脚本化，跑了可能不点亮）
 	run      func(p *Panel, a *auth.Auth) (string, error)
+	// runWithTask 可选：动作需要执行前任务详情时，直接复用调用方已读取的任务，
+	// 避免动作内部再次拉整份列表。动作后回读仍由 autoRunAction 重新请求。
+	runWithTask func(p *Panel, a *auth.Auth, before *upstream.Task) (string, error)
 }
 
 // autoActions 已实现的任务动作表（顺序即执行顺序：先解锁依赖项）。
 // first_buddy 依赖活跃上报解锁，故 chat_5/first_buddy 的执行都自带 report 步骤。
 var autoActions = []autoAction{
 	{
-		TaskCode: "chat_5",
-		Desc:     "上报 5 条对话活跃事件（自动补足差额）",
-		run:      runChat5,
+		TaskCode:    "chat_5",
+		Desc:        "上报 5 条对话活跃事件（自动补足差额）",
+		run:         runChat5,
+		runWithTask: runChat5WithTask,
 	},
 	{
 		TaskCode: "first_buddy",
@@ -149,44 +153,52 @@ var autoActions = []autoAction{
 		run:      runBlackCat,
 	},
 	{
-		TaskCode: "school_season",
-		Desc:     "校园日（小程序口径）：accept → mini 对话+activityId 上报 → 领奖（+100c+5e）",
-		run:      runSchoolSeason,
+		TaskCode:    "school_season",
+		Desc:        "校园日（小程序口径）：accept → mini 对话+activityId 上报 → 领奖（+100c+5e）",
+		run:         runSchoolSeason,
+		runWithTask: runMPMiniChatTaskWithTask("school_season", true),
 	},
 	{
-		TaskCode: "Sequential_Tasks_1",
-		Desc:     "小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）",
-		run:      runSequentialChat,
+		TaskCode:    "Sequential_Tasks_1",
+		Desc:        "小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）",
+		run:         runSequentialChat,
+		runWithTask: runMPMiniChatTaskWithTask("Sequential_Tasks_1", false),
 	},
 	{
-		TaskCode: "Sequential_Tasks_2",
-		Desc:     "小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 领奖（+200c+5e）",
-		run:      runMiniExpert,
+		TaskCode:    "Sequential_Tasks_2",
+		Desc:        "小程序选专家对话（小程序口径）：市场专家 id → accept → expert_actual_use 上报 → 领奖（+200c+5e）",
+		run:         runMiniExpert,
+		runWithTask: runMiniExpertWithTask,
 	},
 	{
-		TaskCode: "Sequential_Tasks_3",
-		Desc:     "小程序五次对话（小程序口径）：accept → mini 对话上报 ×5（自动补差额）→ 领奖（+300c+5e）",
-		run:      runSequentialChat5,
+		TaskCode:    "Sequential_Tasks_3",
+		Desc:        "小程序五次对话（小程序口径）：accept → mini 对话上报 ×5（自动补差额）→ 领奖（+300c+5e）",
+		run:         runSequentialChat5,
+		runWithTask: runMPMiniChatTaskWithTask("Sequential_Tasks_3", false),
 	},
 	{
-		TaskCode: "Sequential_Tasks_4",
-		Desc:     "小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件（PC 同源）→ 领奖（判据待解锁验证）",
-		run:      runSequentialAutomation,
+		TaskCode:    "Sequential_Tasks_4",
+		Desc:        "小程序定时任务（预留，每日零点解锁一环）：accept → 定时任务创建事件（PC 同源）→ 领奖（判据待解锁验证）",
+		run:         runSequentialAutomation,
+		runWithTask: runSequentialAutomationWithTask,
 	},
 	{
-		TaskCode: "Sequential_Tasks_5",
-		Desc:     "小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 领奖（判据待解锁验证）",
-		run:      runSequentialModelChat,
+		TaskCode:    "Sequential_Tasks_5",
+		Desc:        "小程序使用 GLM5.2（预留）：accept → 带模型字段的 mini 对话上报 → 领奖（判据待解锁验证）",
+		run:         runSequentialModelChat,
+		runWithTask: runSequentialModelChatWithTask,
 	},
 	{
-		TaskCode: "Sequential_Tasks_6",
-		Desc:     "小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 领奖",
-		run:      runSequentialChat10,
+		TaskCode:    "Sequential_Tasks_6",
+		Desc:        "小程序十次对话（预留）：accept → mini 对话上报 ×target（自动补差额）→ 领奖",
+		run:         runSequentialChat10,
+		runWithTask: runMPMiniChatTaskWithTask("Sequential_Tasks_6", false),
 	},
 	{
-		TaskCode: "Sequential_Tasks_7",
-		Desc:     "体验灵感功能（预留，疑 PC 口径 +500c+5e）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）",
-		run:      runSequentialPlaybook,
+		TaskCode:    "Sequential_Tasks_7",
+		Desc:        "体验灵感功能（预留，疑 PC 口径 +500c+5e）：accept → 灵感事件组（PC+mp 双形态）→ 领奖（判据待解锁验证）",
+		run:         runSequentialPlaybook,
+		runWithTask: runSequentialPlaybookWithTask,
 	},
 }
 
@@ -378,6 +390,19 @@ func (p *Panel) runMPMiniChatTask(account7 *auth.Auth, code string, withActivity
 		return "", err
 	}
 
+	return p.runMPMiniChatTaskWithTask(account7, code, withActivityID, t)
+}
+
+// runMPMiniChatTaskWithTask 使用调用方已读取的 mp 任务开始闭环；accept 后仍会
+// 实时回读以获取真实 target/current。
+func (p *Panel) runMPMiniChatTaskWithTask(
+	account7 *auth.Auth, code string, withActivityID bool, t *upstream.Task,
+) (string, error) {
+	t, err := p.refreshAcceptedMPTask(account7, code, t)
+	if err != nil {
+		return "", err
+	}
+
 	if t == nil {
 		return "mp 口径未下发该任务（活动可能已结束）", nil
 	}
@@ -560,6 +585,15 @@ func runSchoolSeason(p *Panel, a *auth.Auth) (string, error) {
 	return p.runMPMiniChatTask(a, "school_season", true)
 }
 
+// runMPMiniChatTaskWithTask 复用调用方已读取的 mp 任务执行同类闭环。
+func runMPMiniChatTaskWithTask(
+	code string, withActivityID bool,
+) func(*Panel, *auth.Auth, *upstream.Task) (string, error) {
+	return func(p *Panel, a *auth.Auth, before *upstream.Task) (string, error) {
+		return p.runMPMiniChatTaskWithTask(a, code, withActivityID, before)
+	}
+}
+
 // runSequentialChat 完成 Sequential_Tasks_1「小程序内完成 1 次有效对话」。
 // 判据 = mini chat_request_send（无 activityId，服务端按 source=mini_program
 // 指纹关联；上游 task_runner 实测 +100c+5e）。
@@ -592,6 +626,18 @@ func (p *Panel) runSequentialEventTask(
 	account23 *auth.Auth, code string, primary, fallback func() error,
 ) (string, error) {
 	t, err := p.taskByCodeMP(account23, code)
+	if err != nil {
+		return "", err
+	}
+
+	return p.runSequentialEventTaskWithTask(account23, code, t, primary, fallback)
+}
+
+// runSequentialEventTaskWithTask 使用调用方已读取的 mp 任务执行 Sequential 闭环。
+func (p *Panel) runSequentialEventTaskWithTask(
+	account23 *auth.Auth, code string, t *upstream.Task, primary, fallback func() error,
+) (string, error) {
+	t, err := p.refreshAcceptedMPTask(account23, code, t)
 	if err != nil {
 		return "", err
 	}
@@ -639,11 +685,37 @@ func runSequentialAutomation(p *Panel, a *auth.Auth) (string, error) {
 		}, nil)
 }
 
+// runSequentialAutomationWithTask 复用前置任务快照执行同上闭环。
+func runSequentialAutomationWithTask(p *Panel, a *auth.Auth, before *upstream.Task) (string, error) {
+	return p.runSequentialEventTaskWithTask(a, "Sequential_Tasks_4", before,
+		func() error {
+			return p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopAutomationCreateEvent("日常任务提醒"))
+		}, nil)
+}
+
 // runSequentialModelChat 完成 Sequential_Tasks_5「使用 GLM5.2」（预留）。
 // primary：mp 对话事件带 requestModelId/requestModelName=glm-5.2（mpsrc main 32904
 // 发射点实测形状）；fallback：PC 域模型活跃上报（Model_chat_GLM5.2 同源）。
 func runSequentialModelChat(panel2 *Panel, account3 *auth.Auth) (string, error) {
 	return panel2.runSequentialEventTask(account3, "Sequential_Tasks_5",
+		func() error {
+			conv := session.NewUUIDv4()
+			return panel2.cfg.Upstream.ReportMPEvent(account3, upstream.MiniChatModelEvent(conv, "glm-5.2", "GLM-5.2"))
+		},
+		func() error {
+			return panel2.cfg.Upstream.ReportChatActivityModel(
+				account3,
+				session.NewUUIDv4(),
+				"",
+				"glm-5.2",
+				"GLM-5.2",
+			)
+		})
+}
+
+// runSequentialModelChatWithTask 复用前置任务快照执行同上闭环。
+func runSequentialModelChatWithTask(panel2 *Panel, account3 *auth.Auth, before *upstream.Task) (string, error) {
+	return panel2.runSequentialEventTaskWithTask(account3, "Sequential_Tasks_5", before,
 		func() error {
 			conv := session.NewUUIDv4()
 			return panel2.cfg.Upstream.ReportMPEvent(account3, upstream.MiniChatModelEvent(conv, "glm-5.2", "GLM-5.2"))
@@ -678,6 +750,30 @@ func runSequentialPlaybook(panel4 *Panel, account *auth.Auth) (string, error) {
 		})
 }
 
+// runSequentialPlaybookWithTask 复用前置任务快照执行同上闭环。
+func runSequentialPlaybookWithTask(
+	panel *Panel, account *auth.Auth, before *upstream.Task,
+) (string, error) {
+	return panel.runSequentialEventTaskWithTask(account, "Sequential_Tasks_7", before,
+		func() error {
+			conv := session.NewUUIDv4()
+			req := session.NewUUIDv7Hex()
+
+			return panel.cfg.Upstream.ReportDesktopEvent(account,
+				upstream.DesktopPlaybookPromptSequence(
+					conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸",
+				)...)
+		},
+		func() error {
+			return panel.cfg.Upstream.ReportMPEvent(
+				account,
+				upstream.MiniPlaybookEvents(
+					"pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸",
+				)...,
+			)
+		})
+}
+
 // runMiniExpert 完成 Sequential_Tasks_2「在小程序内选中专家并完成有效对话」。
 // 判据 = mp 指纹 expert_actual_use（**不带** activityId/conversationId、
 // extVersion=2.2.8、type=send_message——小程序源码实测形状，与 school 域 expert
@@ -689,6 +785,18 @@ func runMiniExpert(panel4 *Panel, account4 *auth.Auth) (string, error) {
 	const code = "Sequential_Tasks_2"
 
 	t, err := panel4.taskByCodeMP(account4, code)
+	if err != nil {
+		return "", err
+	}
+
+	return runMiniExpertWithTask(panel4, account4, t)
+}
+
+// runMiniExpertWithTask 使用调用方已读取的 mp 任务执行专家使用闭环。
+func runMiniExpertWithTask(panel4 *Panel, account4 *auth.Auth, t *upstream.Task) (string, error) {
+	const code = "Sequential_Tasks_2"
+
+	t, err := panel4.refreshAcceptedMPTask(account4, code, t)
 	if err != nil {
 		return "", err
 	}
@@ -728,6 +836,18 @@ func runMiniExpert(panel4 *Panel, account4 *auth.Auth) (string, error) {
 	t, _ = panel4.pollTaskMPFrom(account4, code, target, t, nil)
 
 	return panel4.finishMPTask(account4, code, target, t, "已上报但进度未归账（异步计分，下次重试）")
+}
+
+// refreshAcceptedMPTask 批量 accept 后快照仍是 accept 前状态，部分任务 target=0；
+// 此时按码回读一次拿真实 target/current，避免按兜底目标少报。已下发目标的任务直接复用。
+func (p *Panel) refreshAcceptedMPTask(
+	account *auth.Auth, code string, task *upstream.Task,
+) (*upstream.Task, error) {
+	if task == nil || task.Target > 0 {
+		return task, nil
+	}
+
+	return p.taskByCodeMP(account, code)
 }
 
 // marketExpertForMini 解析市场真实专家（accept 前置，避免半程态）。不可用时 ok
@@ -898,6 +1018,11 @@ func runChat5(panel *Panel, account25 *auth.Auth) (string, error) {
 		return "", err
 	}
 
+	return runChat5WithTask(panel, account25, t)
+}
+
+// runChat5WithTask 使用调用方已读取的任务进度执行上报。
+func runChat5WithTask(panel *Panel, account25 *auth.Auth, t *upstream.Task) (string, error) {
 	if t == nil {
 		return "", errStatic
 	}
@@ -1373,27 +1498,94 @@ func runExpertBatch(panel8 *Panel, account15 *auth.Auth, expertType string, coun
 // 流程：先把所有未接受的任务批量 accept（规范状态机；上游脚本建议"先 accept"），
 // 再逐项执行行为链路。accept 不是进度产生的必要条件，但让后续状态流转规范。
 func (p *Panel) runAutoAll(account6 *auth.Auth) []map[string]any {
-	out := make([]map[string]any, 0, len(autoActions)+2)
-	// 阶段 0/0b：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
-	out = append(out, p.autoAcceptBatch(account6)...)
+	return p.runAutoAllActions(account6, autoActions)
+}
 
-	out = append(out, p.autoAcceptBatchMP(account6)...)
-	for _, act := range autoActions {
-		out = append(out, p.autoRunAction(account6, act))
+// runAutoAllActions 使用一份执行前任务快照跑指定动作表。测试可传入独立动作表，
+// 不修改进程级 autoActions。
+func (p *Panel) runAutoAllActions(account6 *auth.Auth, actions []autoAction) []map[string]any {
+	snapshot := p.loadAutoTaskSnapshot(account6)
+	out := make([]map[string]any, 0, len(actions)+2)
+	// 阶段 0/0b：复用执行前快照批量接受尚未接受的任务（失败不阻塞）。
+	out = append(out, p.autoAcceptBatch(account6, snapshot.defaultTasks)...)
+
+	out = append(out, p.autoAcceptBatchMP(account6, snapshot.mpTasks)...)
+
+	for _, act := range actions {
+		out = append(out, p.autoRunActionWithSnapshot(account6, act, snapshot))
 	}
 
 	return out
 }
 
+// autoTaskSnapshot 一轮「一键完成」共用的默认/mp 任务列表。
+// 动作后回读不复用该快照：上游计分异步，执行后必须重新读取最新状态。
+type autoTaskSnapshot struct {
+	defaultTasks  []upstream.Task
+	defaultErr    error
+	mpTasks       []upstream.Task
+	mpErr         error
+	defaultByCode map[string]upstream.Task
+	mpByCode      map[string]upstream.Task
+}
+
+// loadAutoTaskSnapshot 各拉一次默认/mp 列表，并建立 code 索引。
+func (p *Panel) loadAutoTaskSnapshot(a *auth.Auth) *autoTaskSnapshot {
+	snapshot := &autoTaskSnapshot{}
+	snapshot.defaultTasks, snapshot.defaultErr = p.cfg.Upstream.ListTasks(a)
+	snapshot.mpTasks, snapshot.mpErr = p.cfg.Upstream.ListTasksMP(a)
+	snapshot.defaultByCode = indexTasksByCode(snapshot.defaultTasks)
+	snapshot.mpByCode = indexTasksByCode(snapshot.mpTasks)
+
+	return snapshot
+}
+
+// indexTasksByCode 按 task_code 建索引；重复项保留首个，与列表查找语义一致。
+func indexTasksByCode(tasks []upstream.Task) map[string]upstream.Task {
+	byCode := make(map[string]upstream.Task, len(tasks))
+	for i := range tasks {
+		if _, exists := byCode[tasks[i].TaskCode]; !exists {
+			byCode[tasks[i].TaskCode] = tasks[i]
+		}
+	}
+
+	return byCode
+}
+
+// lookupBeforeAction 从执行前快照定位任务。resolved=false 表示相关列表读取失败，
+// 调用方应回退到 taskByCode 的既有逐项查询/错误语义。
+func (s *autoTaskSnapshot) lookupBeforeAction(code string) (*upstream.Task, bool) {
+	if s.defaultErr == nil {
+		if t, ok := s.defaultByCode[code]; ok {
+			return &t, true
+		}
+	}
+
+	if isMPTaskCode(code) {
+		// mp 列表是 mp 专属任务的权威口径；默认列表失败时仍可直接复用 mp 快照。
+		if s.mpErr == nil {
+			if t, ok := s.mpByCode[code]; ok {
+				return &t, true
+			}
+
+			return nil, true
+		}
+
+		return nil, false
+	}
+
+	// 非 mp 任务只有默认列表可判定；读取失败时交回 taskByCode 的既有错误语义。
+	if s.defaultErr != nil {
+		return nil, false
+	}
+
+	return nil, true
+}
+
 // autoAcceptBatch 批量接受默认口径未接受任务，返回结果条目（列表失败静默）。
 //
 //nolint:dupl // CN/MP 两套上游接口并排，保持结构对照。
-func (p *Panel) autoAcceptBatch(account21 *auth.Auth) []map[string]any {
-	tasks, err := p.cfg.Upstream.ListTasks(account21)
-	if err != nil {
-		return nil
-	}
-
+func (p *Panel) autoAcceptBatch(account21 *auth.Auth, tasks []upstream.Task) []map[string]any {
 	codes := pendingTaskCodes(tasks)
 	if len(codes) == 0 {
 		return nil
@@ -1417,12 +1609,7 @@ func (p *Panel) autoAcceptBatch(account21 *auth.Auth) []map[string]any {
 // autoAcceptBatchMP 批量接受小程序口径未接受任务，返回结果条目（列表失败静默）。
 //
 //nolint:dupl // 同 autoAcceptBatch：两套接口结构对照。
-func (p *Panel) autoAcceptBatchMP(account11 *auth.Auth) []map[string]any {
-	mpTasks, err := p.cfg.Upstream.ListTasksMP(account11)
-	if err != nil {
-		return nil
-	}
-
+func (p *Panel) autoAcceptBatchMP(account11 *auth.Auth, mpTasks []upstream.Task) []map[string]any {
 	codes := pendingTaskCodes(mpTasks)
 	if len(codes) == 0 {
 		return nil
@@ -1444,12 +1631,20 @@ func (p *Panel) autoAcceptBatchMP(account11 *auth.Auth) []map[string]any {
 }
 
 // autoRunAction 执行单个任务动作并组装结果条目（单项失败不影响后续项）。
+func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]any {
+	return p.autoRunActionWithSnapshot(account5, act, nil)
+}
+
+// autoRunActionWithSnapshot 优先使用一轮共享快照做执行前检查；快照未覆盖时
+// 回退 taskByCode。动作后仍通过 taskByCodeAfterAction 读取最新异步进度。
 //
 //nolint:funlen // 动作分派/结果组装线性展开。
-func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]any {
+func (p *Panel) autoRunActionWithSnapshot(
+	account5 *auth.Auth, act autoAction, snapshot *autoTaskSnapshot,
+) map[string]any {
 	item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
 
-	before, err := p.taskByCode(account5, act.TaskCode)
+	before, err := p.taskForAutoAction(account5, act.TaskCode, snapshot)
 	if err != nil {
 		item["status"] = "error"
 		item["message"] = "查询失败: " + err.Error()
@@ -1482,7 +1677,7 @@ func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]an
 		return item
 	}
 
-	msg, err := act.run(p, account5)
+	msg, err := p.executeAutoAction(account5, act, before, snapshot)
 	if err != nil {
 		item["status"] = "error"
 		item["message"] = err.Error()
@@ -1504,6 +1699,30 @@ func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]an
 	time.Sleep(reportGap) // 项间节流（仅成功路径，与既有语义一致）
 
 	return item
+}
+
+// taskForAutoAction 优先从共享快照定位任务；相关口径读取失败时逐项回退查询。
+func (p *Panel) taskForAutoAction(
+	account *auth.Auth, code string, snapshot *autoTaskSnapshot,
+) (*upstream.Task, error) {
+	if snapshot != nil {
+		if before, resolved := snapshot.lookupBeforeAction(code); resolved {
+			return before, nil
+		}
+	}
+
+	return p.taskByCode(account, code)
+}
+
+// executeAutoAction 在共享快照路径优先复用已定位任务，避免动作内部重复拉列表。
+func (p *Panel) executeAutoAction(
+	account *auth.Auth, act autoAction, before *upstream.Task, snapshot *autoTaskSnapshot,
+) (string, error) {
+	if snapshot != nil && act.runWithTask != nil {
+		return act.runWithTask(p, account, before)
+	}
+
+	return act.run(p, account)
 }
 
 // autoClaimItem 达标自动领奖，把结果写进结果条目（claim_error 供前端提示）。
