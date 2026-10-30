@@ -842,20 +842,31 @@ func (c *Client) attributionClientName() string {
 
 // privateDataHeaderValue 返回 CLI chat 的 X-Private-Data 取值。
 //
-// 官方 5.9.3（CN 与 global 同源同形）该头是「模型优化开关」的派生值：
-// `resolveModelOptimizationEnabled` 在个人号默认开 → 发 false；企业版默认关 → 发
-// true。判据只有 `isEnterpriseEditionAccount`（enterpriseId 非空或 type 为
-// ultimate / exclusive），**与域无关**。
+// 该值是 `productFeatures.DefaultModelOptimizationOff` 取反派生：官方
+// `ModelProvider.getCustomHeaders` 读 abTest 的该键，命中即按取反覆盖默认 true，
+// 再经 `resolveModelOptimizationEnabled` 折算成「模型优化开关」；header 是它的反值
+// （A ? "false" : "true"）。该键 CN 与 global 取值相反（CN=false → 开关开 → false；
+// global=true → 开关关 → true），故按 realm 分层：
 //
-// global 5.8.4 时代按 `DisableYuanbaoChannel=true` 一律发 true 的旧口径已随 global
-// 升到 5.9.3 作废（issue #400）：两域共用同一口径，global 个人号同样发 false。
+//	企业版            → true（企业版恒关模型优化）
+//	global 个人号     → true（global `cli/product.json` DefaultModelOptimizationOff=true）
+//	CN 个人号         → false
 //
-// 远端 abTest（DefaultModelOptimizationOff）与会话 meta `privateDataSticky`
-// 都不在网关范围：本仓没有这两类状态来源，只对齐静态默认分支。
+// 本条修正了 issue #400 把判据收成「只按企业身份、与域无关」的误判；global 5.8.4
+// 时代按 `DisableYuanbaoChannel=true` 一律发 true 的旧理由已作废，现依据是 global
+// 产品配置本身。该值随客户端产品配置漂移，每轮基线审计需复核。
+//
+// 远端 abTest / executionConfiguration（host 下发的产品配置，优先级高于本地
+// product.json）与会话 meta `privateDataSticky` 都不在网关范围：本仓没有这两类状态
+// 来源，只对齐静态默认分支。
 // 桌面专家 chat 路径不走本函数：官方桌面 `applyGatewayHeaders` 的兜底表
 // 硬编码 true，见 setDesktopExpertHeaders。
 func privateDataHeaderValue(account *auth.Auth) string {
-	if account != nil && account.IsEnterpriseEdition() {
+	if account == nil {
+		return "false"
+	}
+
+	if account.IsEnterpriseEdition() || account.IsGlobal() {
 		return "true"
 	}
 
