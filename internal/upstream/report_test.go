@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"slices"
 	"strings"
@@ -126,7 +127,10 @@ func TestIsTransientBillingErrProcessing(t *testing.T) {
 		{"429 普通限流", &Error{Kind: ErrSoftRate, Status: 429, Msg: "rate limit"}, false},
 		{"业务错误", &Error{Kind: ErrClient, Status: 400, Msg: "请求处理中"}, false},
 		{"5xx", &Error{Kind: ErrServer, Status: 500}, true},
-		{"网络错误", io.ErrUnexpectedEOF, true},
+		// 传输层错误（*url.Error）重试；io.ErrUnexpectedEOF 这类读取截断属于
+		// 本地确定性失败，按 issue #423 不再重试。
+		{"网络错误", &url.Error{Op: "Post", URL: "https://billing.example", Err: io.ErrUnexpectedEOF}, true},
+		{"读取截断", io.ErrUnexpectedEOF, false},
 	}
 
 	for _, testCase := range cases {

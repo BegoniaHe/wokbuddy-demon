@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"io"
 	"log"
 	"net/http"
@@ -39,7 +40,7 @@ func TestCheckinOneInactiveNotMarkedDone(t *testing.T) {
 
 	scheduler.logger = log.New(&buf, "", 0)
 
-	scheduler.checkinOne("u1", "nick", account)
+	scheduler.checkinOne(context.Background(), "u1", "nick", account)
 
 	st, _ := state.Status("u1")
 	if st.CheckinDone {
@@ -74,7 +75,7 @@ func TestCheckinOneAlreadyMarkedDone(t *testing.T) {
 
 	scheduler.logger = log.New(io.Discard, "", 0)
 
-	scheduler.checkinOne("u1", "nick", account)
+	scheduler.checkinOne(context.Background(), "u1", "nick", account)
 
 	st, _ := state.Status("u1")
 	if !st.CheckinDone {

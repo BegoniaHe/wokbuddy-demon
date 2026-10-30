@@ -42,6 +42,10 @@ type fetchGlobalModelsCache struct {
 	infos    []ModelInfo // 成功缓存：对象形态的全字段条目（窄表/失败形态为 nil）
 	fetched  time.Time
 	lastFail time.Time
+
+	// probeDone 单飞标记：非 nil 表示已有一轮探测在跑，其余调用等待该通道关闭后
+	// 直接复用缓存（成功或负缓存）。锁只保护该字段，网络请求全程在锁外。
+	probeDone chan struct{}
 }
 
 // globalModelsTTL / globalModelsFailCooldown 探测缓存时长：成功 1h，失败 5min 负缓存。
@@ -93,6 +97,37 @@ func (c *Client) fetchGlobalModelsOnce(account *auth.Auth) (names []string, info
 	if cachedNames, cachedInfos, hit := c.globalModelsCacheHit(); hit {
 		return cachedNames, cachedInfos
 	}
+
+	// 单飞：缓存/负缓存都未命中时，同一时刻只允许一轮 probeGlobalModels——探测
+	// 每轮固定 3 路 /v3/config + 企业端点家族（最多 2 路），并发调用各打一轮会把
+	// 出站请求按调用数放大（globalModelsTTL / 负缓存刚过期的瞬间最容易撞上），
+	// 同一账号被限流后连带影响真正需要选号的请求（issue #418）。
+	//
+	// 其余调用等首个探测关闭 done 后重查缓存：成功与失败（负缓存）都复用同一结果。
+	// 探测状态用 globalModels 自身的锁保护，但只读写 probeDone 字段，不在锁内发请求
+	// （否则缓存命中路径会被一轮慢探测整体阻塞）。
+	c.globalModels.Lock()
+
+	if done := c.globalModels.probeDone; done != nil {
+		c.globalModels.Unlock()
+		<-done
+
+		cachedNames, cachedInfos, _ := c.globalModelsCacheHit()
+
+		return cachedNames, cachedInfos
+	}
+
+	done := make(chan struct{})
+	c.globalModels.probeDone = done
+	c.globalModels.Unlock()
+
+	defer func() {
+		c.globalModels.Lock()
+		c.globalModels.probeDone = nil
+		c.globalModels.Unlock()
+
+		close(done)
+	}()
 
 	names, infos, efforts, defaults, err := c.probeGlobalModels(account)
 	if err != nil || len(names) == 0 {

@@ -2,6 +2,7 @@
 package upstream
 
 import (
+	"context"
 	"net/http"
 	"slices"
 	"strings"
@@ -58,7 +59,7 @@ func assertBillingAcceptLanguage(t *testing.T, realm, want string) {
 		client.BillingBaseGlobal = "https://billing.example"
 	}
 
-	if _, err := client.fetchResourceSummary(account); err != nil {
+	if _, err := client.fetchResourceSummary(context.Background(), account); err != nil {
 		t.Fatalf("summary: %v", err)
 	}
 
@@ -109,7 +110,7 @@ func TestBillingSummaryAndPackagesNoPrefixFirst(t *testing.T) {
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
 
-	if _, err := client.fetchResourceSummary(account); err != nil {
+	if _, err := client.fetchResourceSummary(context.Background(), account); err != nil {
 		t.Fatalf("summary: %v", err)
 	}
 
@@ -163,7 +164,7 @@ func TestCheckinKeepsV2First(t *testing.T) {
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
 
-	if err := client.DailyCheckin(account); err != nil {
+	if err := client.DailyCheckin(context.Background(), account); err != nil {
 		t.Fatalf("daily-checkin: %v", err)
 	}
 

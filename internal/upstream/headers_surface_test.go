@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"io"
@@ -735,7 +736,7 @@ func TestBillingBaseDefaultsToWorkbuddyCN(t *testing.T) {
 		t.Fatalf("report: %v", err)
 	}
 
-	if _, _, err := client.UserResource(account); err != nil {
+	if _, _, err := client.UserResource(context.Background(), account); err != nil {
 		t.Fatalf("userResource: %v", err)
 	}
 

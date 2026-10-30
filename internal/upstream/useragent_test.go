@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -142,7 +143,7 @@ func TestUserAgentOverrideBilling(t *testing.T) {
 		BillingBaseCN: "https://billing.example",
 		UserAgent:     "CustomAgent/1",
 	}
-	if _, _, err := client.UserResource(account); err != nil {
+	if _, _, err := client.UserResource(context.Background(), account); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
 }
@@ -407,7 +408,7 @@ func TestBillingMeterUAFromProfile(t *testing.T) {
 		ClientVersion: "6.0.0",
 		Profile:       testProfileSet(t),
 	}
-	if _, _, err := client.UserResource(account); err != nil {
+	if _, _, err := client.UserResource(context.Background(), account); err != nil {
 		t.Fatalf("userResource: %v", err)
 	}
 
@@ -430,7 +431,7 @@ func TestBillingMeterUAFromProfile(t *testing.T) {
 	}
 
 	// client_name="SaaS" 是显式逃生门：不写 UA 键，回落 Go 默认 UA。
-	if _, _, err := client.UserResource(account); err != nil {
+	if _, _, err := client.UserResource(context.Background(), account); err != nil {
 		t.Fatalf("userResource SaaS: %v", err)
 	}
 

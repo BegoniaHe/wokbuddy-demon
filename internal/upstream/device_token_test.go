@@ -45,7 +45,7 @@ func TestDeviceTokenInjectedOnChatAndCheckin(t *testing.T) {
 		BillingBaseCN: srv.URL,
 	}
 
-	if err := client.DailyCheckin(account); err != nil {
+	if err := client.DailyCheckin(context.Background(), account); err != nil {
 		t.Fatalf("daily-checkin: %v", err)
 	}
 
@@ -125,7 +125,7 @@ func TestDeviceTokenNotInjected_WhenEmpty(t *testing.T) {
 		// DeviceToken / DeviceTokenFile 皆空
 	}
 
-	if err := client.DailyCheckin(account); err != nil {
+	if err := client.DailyCheckin(context.Background(), account); err != nil {
 		t.Fatalf("daily-checkin: %v", err)
 	}
 
@@ -183,7 +183,7 @@ func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
 				DeviceTokenFile: filePath,
 			}
 
-			if err := client.DailyCheckin(account); err != nil {
+			if err := client.DailyCheckin(context.Background(), account); err != nil {
 				t.Fatalf("daily-checkin: %v", err)
 			}
 

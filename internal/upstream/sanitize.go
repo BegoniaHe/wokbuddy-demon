@@ -6,6 +6,7 @@
 package upstream
 
 import (
+	"encoding/json"
 	"regexp"
 	"strings"
 )
@@ -24,7 +25,9 @@ var sanitizeFeatures = []string{
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
-var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
+// 右边界只到 `;` 或结构性字符（`"` / `}` / 反斜杠 / 换行）：值里一旦出现 JSON 结构
+// 就不能继续吞，否则单行 JSON 里的指纹会把引号与大括号一并删掉、产出非法 JSON（#414）。
+var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;"}\\\n\r]*;?\s*`)
 
 // sanitizeBareHdrRe 兜底层：裸键名（无冒号无值）同样是指纹——2026-09-13 实验 F4
 // 证实 assistant 消息里反引号引用裸键名即触发上游 400，而剥离层要求冒号、对裸串无效。
@@ -37,7 +40,8 @@ var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?
 var sanitizeBareHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
 
 // sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
-var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
+// 右边界同 sanitizeHdrRe：停在 `;` 与 JSON 结构字符，不跨引号/大括号（#414）。
+var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;"}\\\n\r]*;?\s*`)
 
 // sanitizeRewrites 改写层：全模板句逐字替换（每句只改一个词，语义不变）。
 //
@@ -214,13 +218,83 @@ func sanitizeToolCalls(v any) bool {
 			continue
 		}
 
-		if s := sanitizeText(args); s != args {
+		if s, argsChanged := sanitizeJSONString(args); argsChanged {
 			fn["arguments"] = s
 			changed = true
 		}
 	}
 
 	return changed
+}
+
+// sanitizeJSONString 净化字符串化 JSON（工具参数），并保证产物仍是合法 JSON。
+//
+// 纯文本替换的右边界已收窄到不吞 JSON 结构字符（`"` / `}` / 反斜杠 / 换行），
+// 但转义引号这类场景仍可能留下配对不上的反斜杠；此时改为结构化净化：解析 →
+// 递归净化字符串值 → 重新编码，由编码器负责转义，非法 JSON 不再出站。
+// 原参数本身就不是合法 JSON 时不做结构化尝试（工具参数未必都是 JSON，保持纯文本
+// 净化结果，不把不可解析的原文整段丢弃）。
+func sanitizeJSONString(raw string) (string, bool) {
+	out := sanitizeText(raw)
+	if out == raw {
+		return raw, false
+	}
+
+	if !json.Valid([]byte(out)) && json.Valid([]byte(raw)) {
+		if structured, ok := sanitizeJSONValues(raw); ok {
+			out = structured
+		}
+	}
+
+	return out, true
+}
+
+// sanitizeJSONValues 结构化净化：解析 JSON → 递归净化字符串值 → 重新编码。
+// 键名保持原样（指纹只落在值里）；解析/编码失败返回 false 由调用方保留文本结果。
+func sanitizeJSONValues(raw string) (string, bool) {
+	// UseNumber 保留数字原始字面量：默认 float64 会把 20 位整数截成
+	// 12345678901234567000，工具参数里的 id / 时间戳随之变成另一个值。
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return "", false
+	}
+
+	var buf strings.Builder
+
+	encoder := json.NewEncoder(&buf)
+	// 工具参数按原样语义重新编码：不把 < > & 转成 \u003c 等 HTML 转义。
+	encoder.SetEscapeHTML(false)
+
+	if err := encoder.Encode(sanitizeJSONNode(value)); err != nil {
+		return "", false
+	}
+
+	return strings.TrimSuffix(buf.String(), "\n"), true
+}
+
+// sanitizeJSONNode 递归净化 JSON 节点里的字符串值。
+func sanitizeJSONNode(value any) any {
+	switch node := value.(type) {
+	case string:
+		return sanitizeText(node)
+	case []any:
+		for i := range node {
+			node[i] = sanitizeJSONNode(node[i])
+		}
+
+		return node
+	case map[string]any:
+		for key := range node {
+			node[key] = sanitizeJSONNode(node[key])
+		}
+
+		return node
+	}
+
+	return value
 }
 
 // sanitizeMessages 净化 messages 中的 content 与 tool_calls；任一命中返回 true。

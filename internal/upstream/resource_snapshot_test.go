@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
@@ -32,7 +33,7 @@ func TestUserResourceSnapshotBucketsByDay(t *testing.T) {
 		}
 	})
 
-	snap, err := client.UserResourceSnapshot(&auth.Auth{AccessToken: "at", UID: "u1"}, 0)
+	snap, err := client.UserResourceSnapshot(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, 0)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
@@ -72,12 +73,12 @@ func TestUserResourceDetailedMatchesSnapshot(t *testing.T) {
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1"}
 
-	snap, err := client.UserResourceSnapshot(account, 0)
+	snap, err := client.UserResourceSnapshot(context.Background(), account, 0)
 	if err != nil {
 		t.Fatalf("snapshot: %v", err)
 	}
 
-	_, _, _, earliestAt, earliestRemaining, err := client.UserResourceDetailedWithExpiry(account, 0)
+	_, _, _, earliestAt, earliestRemaining, err := client.UserResourceDetailedWithExpiry(context.Background(), account, 0)
 	if err != nil {
 		t.Fatalf("detailed: %v", err)
 	}

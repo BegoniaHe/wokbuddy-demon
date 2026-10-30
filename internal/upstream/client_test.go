@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -662,7 +663,7 @@ func TestUserResourceAggregation(t *testing.T) {
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
 
-	remain, total, err := client.UserResource(a)
+	remain, total, err := client.UserResource(context.Background(), a)
 	if err != nil {
 		t.Fatalf("resource: %v", err)
 	}
@@ -685,7 +686,7 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 		]}}}}`), nil
 	})
 
-	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at"})
+	remain, total, err := client.UserResource(context.Background(), &auth.Auth{AccessToken: "at"})
 	if err != nil || remain != 0 {
 		t.Errorf("remain=%d err=%v, want 0 (clamped)", remain, err)
 	}
@@ -706,7 +707,7 @@ func TestDailyCheckinAlready(t *testing.T) {
 		return jsonResp(200, `{"code":14001,"msg":"今日已签到"}`), nil
 	})
 
-	err := client.DailyCheckin(&auth.Auth{AccessToken: "at"})
+	err := client.DailyCheckin(context.Background(), &auth.Auth{AccessToken: "at"})
 	if err == nil || !strings.Contains(err.Error(), "已签到") {
 		t.Errorf("err=%v", err)
 	}
@@ -1031,7 +1032,7 @@ func TestUserResourceNoPrefixFirstFallsBackToV2(t *testing.T) {
 		}
 	})
 
-	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	remain, total, err := client.UserResource(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil || remain != 700 || total != 1000 {
 		t.Fatalf("remain=%d total=%d err=%v want 700/1000", remain, total, err)
 	}

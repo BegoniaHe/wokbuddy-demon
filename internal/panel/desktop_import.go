@@ -62,7 +62,7 @@ func (p *Panel) desktopImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	imported, errs, importedAuths := p.importDesktopFiles(targets, allowed, req.Key)
-	p.postImportAccounts(importedAuths)
+	p.postImportAccounts(r.Context(), importedAuths)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
 		"total":    len(targets),
