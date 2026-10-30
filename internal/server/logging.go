@@ -748,6 +748,10 @@ type requestTrace struct {
 	// 优先级高于 stat：本地工具循环中断时最后一轮 chatStat 仍是成功状态，
 	// 不能用它冒充最终结果。
 	fallbackStatus int
+	// forcedOutcome 显式覆盖归档结果（中断等没有 chatStat 可表达的终态）。
+	// 与 outcome 分开：outcome 是搜索等非 chat 路径的记账元数据，/v1/messages
+	// 的 web_search 前置会先写它，随后真正的 chat 结果（含失败）不能被它盖掉。
+	forcedOutcome string
 }
 
 // noteChatStat 登记一轮 chat 统计：stat 保留最后一轮，stats 逐轮累积。
@@ -822,13 +826,14 @@ func (t *requestTrace) noteResult(account, model, outcome string) {
 	t.account, t.model, t.outcome = account, model, outcome
 }
 
-// noteOutcome 只覆盖请求级结果，保留 chat 统计里已有的账号/模型（nil 安全）。
-func (t *requestTrace) noteOutcome(outcome string) {
+// noteForcedOutcome 记录必须盖过底层统计的请求级终态（如本地工具循环中断），
+// 保留 chat 统计里已有的账号/模型（nil 安全）。
+func (t *requestTrace) noteForcedOutcome(outcome string) {
 	if t == nil {
 		return
 	}
 
-	t.outcome = outcome
+	t.forcedOutcome = outcome
 }
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
@@ -904,12 +909,17 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	if stat == nil {
 		// 非 chat 路径（搜索）：用 handler 写入的元数据，保持与 chat 行同字段口径。
 		event.Account, event.Model = t.account, t.model
+
+		if t.outcome != "" {
+			event.Outcome = t.outcome
+		}
 	} else {
 		applyChatStat(&event, stat)
 	}
-	// 显式结果优先于底层统计：本地工具循环中断时 chatStat 仍带成功 outcome。
-	if t.outcome != "" {
-		event.Outcome = t.outcome
+	// 只有请求级终态（中断）盖过底层统计：/v1/messages 的 web_search 前置也会写
+	// outcome，但它不代表随后 chat 的成败。
+	if t.forcedOutcome != "" {
+		event.Outcome = t.forcedOutcome
 	}
 
 	event.KeyID = t.keyID

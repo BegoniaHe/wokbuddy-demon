@@ -166,7 +166,7 @@ func localToolCallerGone(r *http.Request) bool {
 
 	if trace := requestTraceFrom(r); trace != nil {
 		trace.fallbackStatus = clientClosedRequestStatus
-		trace.noteOutcome(reqlog.OutcomeInterrupted)
+		trace.noteForcedOutcome(reqlog.OutcomeInterrupted)
 	}
 
 	return true
