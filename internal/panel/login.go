@@ -419,7 +419,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.finishLoginPoll(w, state, sess.realm, account, acct)
+	p.finishLoginPoll(r.Context(), w, state, sess.realm, account, acct)
 }
 
 // dropLoginSession 移除登录会话（成功、终态失败共用）；幂等。
@@ -432,9 +432,9 @@ func (p *Panel) dropLoginSession(state string) {
 // finishLoginPoll 登录成功后的收尾：顺带签到 + 余额刷新（幂等；失败只体现在
 // 返回字段里），清理会话并回写结果。
 func (p *Panel) finishLoginPoll(
-	w http.ResponseWriter, state, realm string, account *auth.Auth, acct loginAccount,
+	ctx context.Context, w http.ResponseWriter, state, realm string, account *auth.Auth, acct loginAccount,
 ) {
-	checkinMsg, remain, total := p.postLoginTasks(account, realm, acct.UID)
+	checkinMsg, remain, total := p.postLoginTasks(ctx, account, realm, acct.UID)
 
 	p.dropLoginSession(state)
 	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, realm)
@@ -681,7 +681,9 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 // postLoginTasks 登录完成后的签到/激活与余额刷新，返回 (提示消息, 余额, 总额)。
 // realm 分支：CN 走 DailyCheckin；global 登录时改为注册激活 + trial 领取（签到由
 // 调度器统一执行，与 CN 同口径）；企业版跳过签到（上游不支持）。
-func (p *Panel) postLoginTasks(account2 *auth.Auth, realm, uid string) (string, int64, int64) {
+func (p *Panel) postLoginTasks(
+	ctx context.Context, account2 *auth.Auth, realm, uid string,
+) (string, int64, int64) {
 	checkinMsg := ""
 	if realm == "global" {
 		checkinMsg = p.activateGlobalLogin(account2, uid)
@@ -689,13 +691,13 @@ func (p *Panel) postLoginTasks(account2 *auth.Auth, realm, uid string) (string, 
 		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
 		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
 		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
-		if err := p.cfg.Upstream.DailyCheckin(account2); err != nil {
+		if err := p.cfg.Upstream.DailyCheckin(ctx, account2); err != nil {
 			checkinMsg = err.Error()
 		}
 	}
 
 	remain, total := int64(-1), int64(0)
-	if rm, tt, err := p.cfg.Upstream.UserResource(account2); err == nil {
+	if rm, tt, err := p.cfg.Upstream.UserResource(ctx, account2); err == nil {
 		remain, total = rm, tt
 		p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 	}

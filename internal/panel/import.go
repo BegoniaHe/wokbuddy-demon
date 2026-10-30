@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -64,7 +65,7 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	importedAuths, imported, skipped, errs := p.persistCockpitAccounts(accounts)
 
 	// 阶段 2（有界并发）：签到/激活/余额查询。失败仅记日志，不阻断导入。
-	p.postImportAccounts(importedAuths)
+	p.postImportAccounts(r.Context(), importedAuths)
 
 	total := len(accounts)
 	log.Printf("panel: cockpit import finished total=%d imported=%d skipped=%d", total, imported, skipped)
@@ -196,7 +197,7 @@ func (p *Panel) persistCockpitAccount(acc *cockpitAccount) (*auth.Auth, string) 
 // （issue #107）：逐号上游调用不再串行放大单请求时长，也不会无界并发打满上游。
 // cockpit / 桌面端 / 加密备份导入共用（加密备份此前串行逐号调用）。
 // 所有失败只记日志，不改变导入结果。
-func (p *Panel) postImportAccounts(accounts []*auth.Auth) {
+func (p *Panel) postImportAccounts(ctx context.Context, accounts []*auth.Auth) {
 	sem := make(chan struct{}, importWorkers)
 
 	var wg sync.WaitGroup
@@ -211,9 +212,9 @@ func (p *Panel) postImportAccounts(accounts []*auth.Auth) {
 			defer func() { <-sem }()
 
 			uid := account3.UID
-			p.importCheckin(account3, uid)
+			p.importCheckin(ctx, account3, uid)
 
-			if rm, tt, err := p.cfg.Upstream.UserResource(account3); err == nil {
+			if rm, tt, err := p.cfg.Upstream.UserResource(ctx, account3); err == nil {
 				p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 			}
 		}(item)
@@ -271,13 +272,13 @@ func (p *Panel) persistImportedAuth(account *auth.Auth, realm, uid string) error
 // importCheckin 导入后的签到/激活（幂等；失败仅记日志，不阻断导入）。realm 取落盘
 // 后的 a.Realm()，与 persistImportedAuth 的 BackfillRealm/iss 兜底结果一致，避免
 // 本地按 domain 推断的 realm 与最终写入的 realm 分叉而漏掉 global 激活/trial。
-func (p *Panel) importCheckin(account4 *auth.Auth, uid string) {
+func (p *Panel) importCheckin(ctx context.Context, account4 *auth.Auth, uid string) {
 	if account4.Realm() == "global" {
 		p.importGlobalActivation(account4, uid)
 		return
 	}
 
-	if err := p.cfg.Upstream.DailyCheckin(account4); err != nil {
+	if err := p.cfg.Upstream.DailyCheckin(ctx, account4); err != nil {
 		log.Printf("panel: import checkin uid=%s: %v", uid, err)
 	}
 }

@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,7 +34,7 @@ func TestEnterpriseResourceMapsAllocatedQuota(t *testing.T) {
 	account := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
 
 	// soon=0：不分桶，但最早到期批次仍要记录。
-	remain, total, expiring, earliestAt, earliestRemaining, err := client.UserResourceDetailedWithExpiry(account, 0)
+	remain, total, expiring, earliestAt, earliestRemaining, err := client.UserResourceDetailedWithExpiry(context.Background(), account, 0)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -41,7 +42,7 @@ func TestEnterpriseResourceMapsAllocatedQuota(t *testing.T) {
 	assertEnterpriseAllocatedQuota(t, gotPath, gotEnt, remain, total, expiring, earliestAt, earliestRemaining)
 
 	// soon 覆盖周期末 → 整份剩余额度计入 expiring（prefer_expiring 据此优先消耗）。
-	_, _, expiring2, _, _, err := client.UserResourceDetailedWithExpiry(account, 30*24*time.Hour)
+	_, _, expiring2, _, _, err := client.UserResourceDetailedWithExpiry(context.Background(), account, 30*24*time.Hour)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -92,7 +93,7 @@ func TestEnterpriseResourceUnlimited(t *testing.T) {
 	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
 	a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := c.UserResourceDetailedWithExpiry(a, 30*24*time.Hour)
+	remain, total, expiring, earliestAt, earliestRemaining, err := c.UserResourceDetailedWithExpiry(context.Background(), a, 30*24*time.Hour)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -119,7 +120,7 @@ func TestEnterpriseResourceSnakeCase(t *testing.T) {
 	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
 	a := &auth.Auth{UID: "u1", AccessToken: "at", EnterpriseID: "ent-1"}
 
-	remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+	remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(context.Background(), a, 0)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}
@@ -150,7 +151,7 @@ func TestPersonalResourceStaysOnPackageEndpoint(t *testing.T) {
 	c := &Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}
 	a := &auth.Auth{UID: "u1", AccessToken: "at"}
 
-	remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(a, 0)
+	remain, total, _, _, _, err := c.UserResourceDetailedWithExpiry(context.Background(), a, 0)
 	if err != nil {
 		t.Fatalf("err=%v", err)
 	}

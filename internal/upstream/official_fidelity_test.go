@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -382,7 +383,7 @@ func TestSummaryResourceFallbackOnInvalidCapacity(t *testing.T) {
 		]}}}}`), nil
 	})
 
-	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	remain, total, err := client.UserResource(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil || remain != 400 || total != 500 {
 		t.Fatalf("remain=%d total=%d err=%v want fallback 400/500", remain, total, err)
 	}
@@ -433,7 +434,7 @@ func TestSummaryResourceAcceptsStringCapacity(t *testing.T) {
 		}
 	})
 
-	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	remain, total, err := client.UserResource(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil || remain != 700 || total != 1000 {
 		t.Fatalf("remain=%d total=%d err=%v want summary 700/1000", remain, total, err)
 	}
@@ -555,7 +556,7 @@ func TestSummaryResourcePrimaryAndFallback(t *testing.T) {
 		}
 	})
 
-	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	remain, total, err := client.UserResource(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil || remain != 700 || total != 1000 {
 		t.Fatalf("summary remain=%d total=%d err=%v want 700/1000", remain, total, err)
 	}
@@ -571,7 +572,7 @@ func TestSummaryResourcePrimaryAndFallback(t *testing.T) {
 		]}}}}`), nil
 	})
 
-	remain, total, err = client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	remain, total, err = client.UserResource(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil || remain != 400 || total != 500 {
 		t.Fatalf("fallback remain=%d total=%d err=%v want 400/500", remain, total, err)
 	}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -126,7 +127,7 @@ func processAccount(str string, client *upstream.Client) row {
 		return r
 	}
 
-	err = client.DailyCheckin(account)
+	err = client.DailyCheckin(context.Background(), account)
 	switch upstream.ClassifyCheckin(err) {
 	case upstream.CheckinOK:
 		r.status = "OK"
@@ -140,7 +141,7 @@ func processAccount(str string, client *upstream.Client) row {
 		r.detail = short(err.Error())
 	}
 	// 顺手查余额
-	if remain, _, qerr := client.UserResource(account); qerr == nil {
+	if remain, _, qerr := client.UserResource(context.Background(), account); qerr == nil {
 		r.remain, r.hasQuota = remain, true
 	}
 

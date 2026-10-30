@@ -82,7 +82,7 @@ func TestAccountEgressUsesSlotDial(t *testing.T) {
 	}{
 		{"FetchModels", func(c *Client, a *auth.Auth) { _, _ = c.FetchModels(a) }},
 		{"CreditPackages", func(c *Client, a *auth.Auth) { _, _, _, _ = c.CreditPackages(a) }},
-		{"DailyCheckin", func(c *Client, a *auth.Auth) { _ = c.DailyCheckin(a) }},
+		{"DailyCheckin", func(c *Client, a *auth.Auth) { _ = c.DailyCheckin(context.Background(), a) }},
 		{"CheckinActivityStatus", func(c *Client, a *auth.Auth) { _, _ = c.CheckinActivityStatus(a) }},
 		{"RefreshToken", func(c *Client, a *auth.Auth) { _ = c.RefreshToken(a) }},
 		{"ReportChatActivity", func(c *Client, a *auth.Auth) {

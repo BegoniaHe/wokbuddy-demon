@@ -943,12 +943,14 @@ func (*Panel) accountToggle(
 // global 账号与调度器同口径正常签到（upstream.DailyCheckin 按 realm 分流）。
 // 其余情况按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游
 // 非错误态，不标记已签、给出可区分文案（issue #27）；其余才是真失败。
-func (p *Panel) runCheckin(a *auth.Auth, uid string) (denyReason string, done bool, msg string) {
-	if denyReason = checkinDenyReason(a); denyReason != "" {
+func (p *Panel) runCheckin(
+	ctx context.Context, account *auth.Auth, uid string,
+) (denyReason string, done bool, msg string) {
+	if denyReason = checkinDenyReason(account); denyReason != "" {
 		return denyReason, false, denyReason
 	}
 
-	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+	if err := p.cfg.Upstream.DailyCheckin(ctx, account); err != nil {
 		switch upstream.ClassifyCheckin(err) {
 		case upstream.CheckinAlready:
 			p.cfg.Pool.NoteCheckinDone(uid)
@@ -980,7 +982,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 额度查询按 realm/企业口径分流（upstream.UserResourceSnapshot）。
 	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
-	denyReason, checkinDone, checkinMsg := p.runCheckin(account, uid)
+	denyReason, checkinDone, checkinMsg := p.runCheckin(r.Context(), account, uid)
 
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
 	if denyReason != "" {
@@ -999,7 +1001,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 
 	// 用含逐日到期批次的快照写入：单号签到同样保留完整批次，而不是把后台刷新
 	// 刚写入的批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
-	snap, err := p.cfg.Upstream.UserResourceSnapshot(account, p.expiringSoonWindow())
+	snap, err := p.cfg.Upstream.UserResourceSnapshot(r.Context(), account, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
@@ -1026,7 +1028,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 与签到/后台刷新同口径：写完整批次，单号刷新不清空到期明细。
-	snap, err := p.cfg.Upstream.UserResourceSnapshot(account, p.expiringSoonWindow())
+	snap, err := p.cfg.Upstream.UserResourceSnapshot(r.Context(), account, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
