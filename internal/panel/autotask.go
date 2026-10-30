@@ -52,8 +52,8 @@ type autoAction struct {
 	Desc     string // 展示用说明
 	Attempt  bool   // true = 尝试型（上游未证实可脚本化，跑了可能不点亮）
 	run      func(p *Panel, a *auth.Auth) (string, error)
-	// runWithTask 可选：动作需要执行前任务详情时，直接复用调用方已读取的任务，
-	// 避免动作内部再次拉整份列表。动作后回读仍由 autoRunAction 重新请求。
+	// runWithTask 可选：动作需要任务进度时，由执行器在动作开始前按码读取最新详情，
+	// 不复用批量预检快照（快照可能已过期）。动作后回读仍由 autoRunAction 重新请求。
 	runWithTask func(p *Panel, a *auth.Auth, before *upstream.Task) (string, error)
 }
 
@@ -393,16 +393,10 @@ func (p *Panel) runMPMiniChatTask(account7 *auth.Auth, code string, withActivity
 	return p.runMPMiniChatTaskFrom(account7, code, withActivityID, t)
 }
 
-// runMPMiniChatTaskWithTask 使用快照任务开始闭环；快照可能停在 accept 前
-// （target=0），先按码回读真实目标再复用闭环主体。
+// runMPMiniChatTaskWithTask 使用动作开始前按码读取的最新任务执行闭环。
 func (p *Panel) runMPMiniChatTaskWithTask(
 	account7 *auth.Auth, code string, withActivityID bool, t *upstream.Task,
 ) (string, error) {
-	t, err := p.refreshAcceptedMPTask(account7, code, t)
-	if err != nil {
-		return "", err
-	}
-
 	return p.runMPMiniChatTaskFrom(account7, code, withActivityID, t)
 }
 
@@ -641,16 +635,10 @@ func (p *Panel) runSequentialEventTask(
 	return p.runSequentialEventTaskFrom(account23, code, t, primary, fallback)
 }
 
-// runSequentialEventTaskWithTask 使用快照任务执行 Sequential 闭环；快照可能停在
-// accept 前（target=0），先按码回读真实目标。
+// runSequentialEventTaskWithTask 使用动作开始前按码读取的最新任务执行闭环。
 func (p *Panel) runSequentialEventTaskWithTask(
 	account23 *auth.Auth, code string, t *upstream.Task, primary, fallback func() error,
 ) (string, error) {
-	t, err := p.refreshAcceptedMPTask(account23, code, t)
-	if err != nil {
-		return "", err
-	}
-
 	return p.runSequentialEventTaskFrom(account23, code, t, primary, fallback)
 }
 
@@ -808,16 +796,8 @@ func runMiniExpert(panel4 *Panel, account4 *auth.Auth) (string, error) {
 	return runMiniExpertFrom(panel4, account4, t)
 }
 
-// runMiniExpertWithTask 使用快照任务执行专家使用闭环；快照可能停在 accept 前
-// （target=0），先按码回读真实目标。
+// runMiniExpertWithTask 使用动作开始前按码读取的最新任务执行专家使用闭环。
 func runMiniExpertWithTask(panel4 *Panel, account4 *auth.Auth, t *upstream.Task) (string, error) {
-	const code = "Sequential_Tasks_2"
-
-	t, err := panel4.refreshAcceptedMPTask(account4, code, t)
-	if err != nil {
-		return "", err
-	}
-
 	return runMiniExpertFrom(panel4, account4, t)
 }
 
@@ -860,18 +840,6 @@ func runMiniExpertFrom(panel4 *Panel, account4 *auth.Auth, t *upstream.Task) (st
 	t, _ = panel4.pollTaskMPFrom(account4, code, target, t, nil)
 
 	return panel4.finishMPTask(account4, code, target, t, "已上报但进度未归账（异步计分，下次重试）")
-}
-
-// refreshAcceptedMPTask 批量 accept 后快照仍是 accept 前状态，部分任务 target=0；
-// 此时按码回读一次拿真实 target/current，避免按兜底目标少报。已下发目标的任务直接复用。
-func (p *Panel) refreshAcceptedMPTask(
-	account *auth.Auth, code string, task *upstream.Task,
-) (*upstream.Task, error) {
-	if task == nil || task.Target > 0 {
-		return task, nil
-	}
-
-	return p.taskByCodeMP(account, code)
 }
 
 // marketExpertForMini 解析市场真实专家（accept 前置，避免半程态）。不可用时 ok
@@ -1723,7 +1691,7 @@ func (p *Panel) autoRunActionWithSnapshot(
 		return item
 	}
 
-	msg, err := p.executeAutoAction(account5, act, before, snapshot)
+	msg, err := p.executeAutoAction(account5, act, snapshot)
 	if err != nil {
 		item["status"] = "error"
 		item["message"] = err.Error()
@@ -1760,15 +1728,31 @@ func (p *Panel) taskForAutoAction(
 	return p.taskByCode(account, code)
 }
 
-// executeAutoAction 在共享快照路径优先复用已定位任务，避免动作内部重复拉列表。
+// executeAutoAction 在共享快照路径执行动作前按码回读任务。快照只用于预检，
+// 不能用其中的 current/target 计算差额：前序动作可能耗时数分钟，进度已漂移。
 func (p *Panel) executeAutoAction(
-	account *auth.Auth, act autoAction, before *upstream.Task, snapshot *autoTaskSnapshot,
+	account *auth.Auth, act autoAction, snapshot *autoTaskSnapshot,
 ) (string, error) {
 	if snapshot != nil && act.runWithTask != nil {
-		return act.runWithTask(p, account, before)
+		fresh, err := p.taskByCodeForAction(account, act.TaskCode)
+		if err != nil {
+			return "", err
+		}
+
+		return act.runWithTask(p, account, fresh)
 	}
 
 	return act.run(p, account)
+}
+
+// taskByCodeForAction 按动作口径读取最新任务详情：mp 专属码只读 mp 列表，
+// 避免默认列表里同 code 的旧状态覆盖 mp 进度。
+func (p *Panel) taskByCodeForAction(account *auth.Auth, code string) (*upstream.Task, error) {
+	if isMPTaskCode(code) {
+		return p.taskByCodeMP(account, code)
+	}
+
+	return p.taskByCode(account, code)
 }
 
 // autoClaimItem 达标自动领奖，把结果写进结果条目（claim_error 供前端提示）。

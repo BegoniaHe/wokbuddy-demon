@@ -355,9 +355,9 @@ func TestRunAutoAllSnapshotPostActionReadback(t *testing.T) {
 	}
 }
 
-// TestRunAutoAllActionReusesSnapshotTask 动作执行器拿到与执行前检查相同的任务，
-// 不再自行拉取任务列表。
-func TestRunAutoAllActionReusesSnapshotTask(t *testing.T) {
+// TestRunAutoAllActionReadsFreshTask 动作执行前必须按码回读：快照中的
+// current/target 可能已被前序动作改变，不能用于计算补报差额。
+func TestRunAutoAllActionReadsFreshTask(t *testing.T) {
 	t.Parallel()
 
 	upstreamStub := &snapshotUpstream{
@@ -375,13 +375,13 @@ func TestRunAutoAllActionReusesSnapshotTask(t *testing.T) {
 		t.Fatalf("results=%v want one done item", results)
 	}
 
-	if seen.TaskCode != "chat_5" || seen.Target != 1 || seen.AcceptStatus != "accepted" {
-		t.Errorf("动作任务=%+v want 快照中的 chat_5", seen)
+	if seen.TaskCode != "chat_5" || seen.Target != 1 || seen.Current != 1 {
+		t.Errorf("动作任务=%+v want 实时读取的 1/1（不得复用快照 0/1）", seen)
 	}
 
 	defaultCalls, _, _, actionCalls, _ := upstreamStub.counts()
-	if defaultCalls != 2 {
-		t.Errorf("default GET=%d want 2（快照 + 动作后回读）", defaultCalls)
+	if defaultCalls != 3 {
+		t.Errorf("default GET=%d want 3（快照 + 动作前实时读取 + 动作后回读）", defaultCalls)
 	}
 
 	if actionCalls != 1 {
@@ -389,57 +389,37 @@ func TestRunAutoAllActionReusesSnapshotTask(t *testing.T) {
 	}
 }
 
-// TestRefreshAcceptedMPTaskReadsMissingTarget 快照 target=0 时按码回读真实目标；
-// 覆盖批量 accept 前后的登记状态，动作侧不能沿用兜底目标。
-func TestRefreshAcceptedMPTaskReadsMissingTarget(t *testing.T) {
+// TestRunAutoAllMPActionReadsFreshTask mp 动作同样按码实时回读，且只读 mp 口径。
+func TestRunAutoAllMPActionReadsFreshTask(t *testing.T) {
 	t.Parallel()
 
-	upstreamStub := &snapshotUpstream{mpTasks: []string{"Sequential_Tasks_1"}}
-	panel := upstreamStub.panel(t)
-	account := accountForSnapshot(t, panel)
-
-	for _, status := range []string{"accepted", "not_accepted", ""} {
-		refreshed, err := panel.refreshAcceptedMPTask(
-			account,
-			"Sequential_Tasks_1",
-			&upstream.Task{TaskCode: "Sequential_Tasks_1", AcceptStatus: status},
-		)
-		if err != nil {
-			t.Fatalf("refreshAcceptedMPTask(%q): %v", status, err)
-		}
-
-		if refreshed == nil || refreshed.Target != 1 {
-			t.Errorf("status=%q refreshed=%+v want target=1", status, refreshed)
-		}
+	upstreamStub := &snapshotUpstream{
+		mpTasks:            []string{"Sequential_Tasks_3"},
+		progressOnReadback: 2,
 	}
-
-	_, mpCalls, _, _, _ := upstreamStub.counts()
-	if mpCalls != 3 {
-		t.Errorf("mp GET=%d want 3", mpCalls)
-	}
-}
-
-// TestRefreshAcceptedMPTaskKeepsKnownTarget 快照已有真实目标时不得额外读取。
-func TestRefreshAcceptedMPTaskKeepsKnownTarget(t *testing.T) {
-	t.Parallel()
-
-	upstreamStub := &snapshotUpstream{mpTasks: []string{"Sequential_Tasks_1"}}
 	panel := upstreamStub.panel(t)
 
-	before := &upstream.Task{TaskCode: "Sequential_Tasks_1", Target: 5, AcceptStatus: "accepted"}
+	var seen upstream.Task
 
-	refreshed, err := panel.refreshAcceptedMPTask(accountForSnapshot(t, panel), "Sequential_Tasks_1", before)
-	if err != nil {
-		t.Fatalf("refreshAcceptedMPTask: %v", err)
+	results := panel.runAutoAllActions(accountForSnapshot(t, panel), []autoAction{
+		snapshotActionWithTask("Sequential_Tasks_3", upstreamStub, &seen),
+	})
+	if len(results) != 1 || results[0]["status"] != "done" {
+		t.Fatalf("results=%v want one done item", results)
 	}
 
-	if refreshed != before {
-		t.Errorf("refreshed=%+v want unchanged pointer", refreshed)
+	if seen.TaskCode != "Sequential_Tasks_3" || seen.Target != 1 || seen.Current != 1 {
+		t.Errorf("动作任务=%+v want 实时读取的 1/1（不得复用快照 0/1）", seen)
 	}
 
-	_, mpCalls, _, _, _ := upstreamStub.counts()
-	if mpCalls != 0 {
-		t.Errorf("mp GET=%d want 0", mpCalls)
+	defaultCalls, mpCalls, _, actionCalls, _ := upstreamStub.counts()
+	if defaultCalls != 1 || mpCalls != 3 {
+		t.Errorf("任务 GET default/mp=%d/%d want 1/3（快照 + 动作前实时读取 + 动作后回读）",
+			defaultCalls, mpCalls)
+	}
+
+	if actionCalls != 1 {
+		t.Errorf("动作调用=%d want 1", actionCalls)
 	}
 }
 
@@ -495,8 +475,8 @@ func TestRunAutoAllRefreshesMPAfterBatchAccept(t *testing.T) {
 		t.Errorf("accept=%d want 1", acceptCalls)
 	}
 
-	if mpCalls != 3 {
-		t.Errorf("mp GET=%d want 3（执行前 + 批量接受后刷新 + 动作后回读）", mpCalls)
+	if mpCalls != 4 {
+		t.Errorf("mp GET=%d want 4（执行前 + 批量接受后刷新 + 动作前实时读取 + 动作后回读）", mpCalls)
 	}
 }
 
@@ -526,8 +506,8 @@ func TestRunAutoAllMPLookupPrefersMPOverDefaultSnapshot(t *testing.T) {
 	}
 
 	defaultCalls, mpCalls, acceptCalls, _, _ := upstreamStub.counts()
-	if defaultCalls != 1 || mpCalls != 2 {
-		t.Errorf("任务 GET default/mp=%d/%d want 1/2", defaultCalls, mpCalls)
+	if defaultCalls != 1 || mpCalls != 3 {
+		t.Errorf("任务 GET default/mp=%d/%d want 1/3", defaultCalls, mpCalls)
 	}
 
 	if acceptCalls != 1 {
