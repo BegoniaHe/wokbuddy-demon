@@ -3,8 +3,10 @@
 package panel
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +28,12 @@ type snapshotUpstream struct {
 	defaultTasks       []string
 	mpTasks            []string
 	progressOnReadback int
+	// acceptedCodes 非 nil 时模拟 accept 落账：列表先返回 not_accepted，
+	// accept 请求后才转 accepted。
+	acceptedCodes map[string]bool
+	// targets/currents 按 code 覆盖列表下发的进度，用于构造 target=0 形态。
+	targets  map[string]int64
+	currents map[string]int64
 }
 
 func (u *snapshotUpstream) panel(t *testing.T) *Panel {
@@ -42,6 +50,8 @@ func (u *snapshotUpstream) panel(t *testing.T) *Panel {
 			u.handleTaskList(w, r)
 		case r.URL.Path == "/v2/activity/growth/tasks/accept":
 			u.acceptCalls++
+			u.handleAccept(r)
+
 			_, _ = w.Write([]byte(`{"code":0,"msg":"ok"}`))
 		case strings.HasSuffix(r.URL.Path, "/claim"):
 			u.claimCalls++
@@ -74,24 +84,52 @@ func (u *snapshotUpstream) handleTaskList(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 首次执行前读取返回未完成；动作后读取返回达标，模拟异步计分。
-	current := 0
-	if u.progressOnReadback > 0 && u.defaultCalls+u.mpCalls > u.progressOnReadback {
-		current = 1
-	}
-
-	currentText := "0"
-	if current == 1 {
-		currentText = "1"
-	}
-
 	items := make([]string, 0, len(codes))
 	for _, code := range codes {
-		items = append(items, `{"task_code":"`+code+`","target":1,"current":`+
-			currentText+`,"accept_status":"accepted"}`)
+		// 首次执行前读取返回未完成；动作后读取返回达标，模拟异步计分。
+		current := int64(0)
+		if u.progressOnReadback > 0 && u.defaultCalls+u.mpCalls > u.progressOnReadback {
+			current = 1
+		}
+
+		if v, ok := u.currents[code]; ok {
+			current = v
+		}
+
+		target := int64(1)
+		if v, ok := u.targets[code]; ok {
+			target = v
+		}
+
+		status := "accepted"
+		if u.acceptedCodes != nil && !u.acceptedCodes[code] {
+			status = "not_accepted"
+		}
+
+		items = append(items, `{"task_code":"`+code+`","target":`+
+			strconv.FormatInt(target, 10)+`,"current":`+strconv.FormatInt(current, 10)+
+			`,"accept_status":"`+status+`"}`)
 	}
 
 	_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"tasks":[` + strings.Join(items, ",") + `]}}`))
+}
+
+// handleAccept 把本次 accept 的 code 记为已接受（模拟上游状态流转）。
+func (u *snapshotUpstream) handleAccept(r *http.Request) {
+	if u.acceptedCodes == nil {
+		return
+	}
+
+	var body struct {
+		TaskCodes []string `json:"task_codes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return
+	}
+
+	for _, code := range body.TaskCodes {
+		u.acceptedCodes[code] = true
+	}
 }
 
 func (u *snapshotUpstream) beginTaskList(r *http.Request) ([]string, bool) {
@@ -402,5 +440,89 @@ func TestRefreshAcceptedMPTaskKeepsKnownTarget(t *testing.T) {
 	_, mpCalls, _, _, _ := upstreamStub.counts()
 	if mpCalls != 0 {
 		t.Errorf("mp GET=%d want 0", mpCalls)
+	}
+}
+
+// TestRunAutoAllAcceptsSharedTaskOnce 默认列表接受后 mp 列表已是 accepted，
+// 同一 code 不得被两套批量 accept 各提交一次。
+func TestRunAutoAllAcceptsSharedTaskOnce(t *testing.T) {
+	t.Parallel()
+
+	upstreamStub := &snapshotUpstream{
+		defaultTasks:  []string{"chat_5"},
+		mpTasks:       []string{"chat_5"},
+		acceptedCodes: map[string]bool{},
+	}
+	panel := upstreamStub.panel(t)
+
+	results := panel.runAutoAllActions(accountForSnapshot(t, panel), nil)
+	if len(results) != 1 || results[0]["status"] != "done" {
+		t.Fatalf("results=%v want 一次批量接受结果", results)
+	}
+
+	_, _, acceptCalls, _, _ := upstreamStub.counts()
+	if acceptCalls != 1 {
+		t.Errorf("accept=%d want 1（默认批量接受后 mp 列表应已落账）", acceptCalls)
+	}
+}
+
+// TestMPTaskBaseEntriesReadOnce 单任务/队列入口不得因快照包装多读一次
+// mp 列表：target=0 时基础入口保留旧行为，只读一次。
+func TestMPTaskBaseEntriesReadOnce(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		code string
+		run  func(*Panel, *auth.Auth) (string, error)
+	}{
+		{
+			name: "mini chat",
+			code: "Sequential_Tasks_1",
+			run: func(p *Panel, a *auth.Auth) (string, error) {
+				return p.runMPMiniChatTask(a, "Sequential_Tasks_1", false)
+			},
+		},
+		{
+			name: "sequential event",
+			code: "Sequential_Tasks_4",
+			run: func(p *Panel, a *auth.Auth) (string, error) {
+				return p.runSequentialEventTask(a, "Sequential_Tasks_4", func() error {
+					panic("达标时不应上报判据事件")
+				}, nil)
+			},
+		},
+		{
+			name: "mini expert",
+			code: "Sequential_Tasks_2",
+			run:  runMiniExpert,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstreamStub := &snapshotUpstream{
+				mpTasks:  []string{testCase.code},
+				targets:  map[string]int64{testCase.code: 0},
+				currents: map[string]int64{testCase.code: 1},
+			}
+			panel := upstreamStub.panel(t)
+
+			msg, err := testCase.run(panel, accountForSnapshot(t, panel))
+			if err != nil {
+				t.Fatalf("%s: %v", testCase.name, err)
+			}
+
+			if !strings.Contains(msg, "已领取") {
+				t.Errorf("msg=%q want 已领取", msg)
+			}
+
+			_, mpCalls, _, _, _ := upstreamStub.counts()
+			if mpCalls != 1 {
+				t.Errorf("mp GET=%d want 1（基础入口不得额外 refresh）", mpCalls)
+			}
+		})
 	}
 }

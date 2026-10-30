@@ -390,11 +390,11 @@ func (p *Panel) runMPMiniChatTask(account7 *auth.Auth, code string, withActivity
 		return "", err
 	}
 
-	return p.runMPMiniChatTaskWithTask(account7, code, withActivityID, t)
+	return p.runMPMiniChatTaskFrom(account7, code, withActivityID, t)
 }
 
-// runMPMiniChatTaskWithTask 使用调用方已读取的 mp 任务开始闭环；accept 后仍会
-// 实时回读以获取真实 target/current。
+// runMPMiniChatTaskWithTask 使用快照任务开始闭环；快照可能停在 accept 前
+// （target=0），先按码回读真实目标再复用闭环主体。
 func (p *Panel) runMPMiniChatTaskWithTask(
 	account7 *auth.Auth, code string, withActivityID bool, t *upstream.Task,
 ) (string, error) {
@@ -403,6 +403,14 @@ func (p *Panel) runMPMiniChatTaskWithTask(
 		return "", err
 	}
 
+	return p.runMPMiniChatTaskFrom(account7, code, withActivityID, t)
+}
+
+// runMPMiniChatTaskFrom 使用调用方已读取的 mp 任务执行闭环；accept 后仍会
+// 实时回读以获取真实 target/current。
+func (p *Panel) runMPMiniChatTaskFrom(
+	account7 *auth.Auth, code string, withActivityID bool, t *upstream.Task,
+) (string, error) {
 	if t == nil {
 		return "mp 口径未下发该任务（活动可能已结束）", nil
 	}
@@ -630,10 +638,11 @@ func (p *Panel) runSequentialEventTask(
 		return "", err
 	}
 
-	return p.runSequentialEventTaskWithTask(account23, code, t, primary, fallback)
+	return p.runSequentialEventTaskFrom(account23, code, t, primary, fallback)
 }
 
-// runSequentialEventTaskWithTask 使用调用方已读取的 mp 任务执行 Sequential 闭环。
+// runSequentialEventTaskWithTask 使用快照任务执行 Sequential 闭环；快照可能停在
+// accept 前（target=0），先按码回读真实目标。
 func (p *Panel) runSequentialEventTaskWithTask(
 	account23 *auth.Auth, code string, t *upstream.Task, primary, fallback func() error,
 ) (string, error) {
@@ -642,6 +651,13 @@ func (p *Panel) runSequentialEventTaskWithTask(
 		return "", err
 	}
 
+	return p.runSequentialEventTaskFrom(account23, code, t, primary, fallback)
+}
+
+// runSequentialEventTaskFrom 使用调用方已读取的 mp 任务执行 Sequential 闭环。
+func (p *Panel) runSequentialEventTaskFrom(
+	account23 *auth.Auth, code string, t *upstream.Task, primary, fallback func() error,
+) (string, error) {
 	if t == nil {
 		return "mp 口径未下发该任务（前置任务未完成或活动未开始）", nil
 	}
@@ -789,10 +805,11 @@ func runMiniExpert(panel4 *Panel, account4 *auth.Auth) (string, error) {
 		return "", err
 	}
 
-	return runMiniExpertWithTask(panel4, account4, t)
+	return runMiniExpertFrom(panel4, account4, t)
 }
 
-// runMiniExpertWithTask 使用调用方已读取的 mp 任务执行专家使用闭环。
+// runMiniExpertWithTask 使用快照任务执行专家使用闭环；快照可能停在 accept 前
+// （target=0），先按码回读真实目标。
 func runMiniExpertWithTask(panel4 *Panel, account4 *auth.Auth, t *upstream.Task) (string, error) {
 	const code = "Sequential_Tasks_2"
 
@@ -800,6 +817,13 @@ func runMiniExpertWithTask(panel4 *Panel, account4 *auth.Auth, t *upstream.Task)
 	if err != nil {
 		return "", err
 	}
+
+	return runMiniExpertFrom(panel4, account4, t)
+}
+
+// runMiniExpertFrom 使用调用方已读取的 mp 任务执行专家使用闭环。
+func runMiniExpertFrom(panel4 *Panel, account4 *auth.Auth, t *upstream.Task) (string, error) {
+	const code = "Sequential_Tasks_2"
 
 	if t == nil {
 		return "mp 口径未下发该任务（活动可能已结束）", nil
@@ -1504,11 +1528,16 @@ func (p *Panel) runAutoAll(account6 *auth.Auth) []map[string]any {
 // runAutoAllActions 使用一份执行前任务快照跑指定动作表。测试可传入独立动作表，
 // 不修改进程级 autoActions。
 func (p *Panel) runAutoAllActions(account6 *auth.Auth, actions []autoAction) []map[string]any {
-	snapshot := p.loadAutoTaskSnapshot(account6)
+	snapshot := &autoTaskSnapshot{}
 	out := make([]map[string]any, 0, len(actions)+2)
 	// 阶段 0/0b：复用执行前快照批量接受尚未接受的任务（失败不阻塞）。
+	snapshot.defaultTasks, snapshot.defaultErr = p.cfg.Upstream.ListTasks(account6)
+	snapshot.defaultByCode = indexTasksByCode(snapshot.defaultTasks)
 	out = append(out, p.autoAcceptBatch(account6, snapshot.defaultTasks)...)
-
+	// mp 列表是默认口径超集：默认批量 accept 后再读，避免同一任务被两套接口
+	// 各接受一次（旧实现的两份列表分别读取，天然带有该先后顺序）。
+	snapshot.mpTasks, snapshot.mpErr = p.cfg.Upstream.ListTasksMP(account6)
+	snapshot.mpByCode = indexTasksByCode(snapshot.mpTasks)
 	out = append(out, p.autoAcceptBatchMP(account6, snapshot.mpTasks)...)
 
 	for _, act := range actions {
@@ -1527,17 +1556,6 @@ type autoTaskSnapshot struct {
 	mpErr         error
 	defaultByCode map[string]upstream.Task
 	mpByCode      map[string]upstream.Task
-}
-
-// loadAutoTaskSnapshot 各拉一次默认/mp 列表，并建立 code 索引。
-func (p *Panel) loadAutoTaskSnapshot(a *auth.Auth) *autoTaskSnapshot {
-	snapshot := &autoTaskSnapshot{}
-	snapshot.defaultTasks, snapshot.defaultErr = p.cfg.Upstream.ListTasks(a)
-	snapshot.mpTasks, snapshot.mpErr = p.cfg.Upstream.ListTasksMP(a)
-	snapshot.defaultByCode = indexTasksByCode(snapshot.defaultTasks)
-	snapshot.mpByCode = indexTasksByCode(snapshot.mpTasks)
-
-	return snapshot
 }
 
 // indexTasksByCode 按 task_code 建索引；重复项保留首个，与列表查找语义一致。
