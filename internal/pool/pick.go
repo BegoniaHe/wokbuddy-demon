@@ -638,6 +638,10 @@ func (p *Pool) dailyBlockClass(
 }
 
 // DailyLimitedUIDs 返回达到日 token 或日积分上限的账号（面板徽章用）。
+//
+// 口径说明（issue #420）：这是**账号级**展示，积分分支不看模型是否收费；选号用
+// dailyBlockedUsage 的积分分支要求 paidModel，因此「积分达限但只在跑免费模型」的
+// 账号仍可服务，但这里仍会挂「日限」徽章。面板文案已注明积分日限仅对收费模型生效。
 func (p *Pool) DailyLimitedUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -677,7 +681,9 @@ func resumesBeforeMidnight(e *entry, now time.Time, model string) bool {
 	return resume.Before(midnight)
 }
 
-// dailyLimitHit 报告账号是否命中任一日限额（含账号×模型 token）。
+// dailyLimitHit 报告账号是否命中任一日限额（含账号×模型 token），仅供账号级
+// 徽章展示：积分分支只比用量、不看模型是否收费，比选号的 dailyBlockedUsage 宽松
+// （见 DailyLimitedUIDs 的口径说明，issue #420）。
 func dailyLimitHit(lim DailyLimits, dailyUsage DailyUsage) bool {
 	if lim.Tokens > 0 && dailyUsage.Tokens >= lim.Tokens {
 		return true

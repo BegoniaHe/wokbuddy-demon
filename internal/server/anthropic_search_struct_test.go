@@ -11,6 +11,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -83,6 +84,54 @@ func TestAnthropicWebSearchExecutesServerTool(t *testing.T) {
 
 	if !strings.Contains(string(chatBody), "https://weather.example") {
 		t.Fatalf("search results must be injected into chat context: %s", chatBody)
+	}
+}
+
+// TestAnthropicWebSearchPreludeDoesNotMaskChatFailure 搜索成功但随后 chat 失败时，
+// 归档结果必须是 chat 的失败：搜索前置写入的 outcome 只是中间状态，不能盖掉
+// 请求最终结果（否则 reqlog 出现 outcome=success + 5xx + OK=false）。
+func TestAnthropicWebSearchPreludeDoesNotMaskChatFailure(t *testing.T) {
+	t.Parallel()
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "/agenttool/v1/search") {
+				return jsonResponse(http.StatusOK,
+					`{"query":"weather","results":[{"title":"Weather","url":"https://weather.example","snippet":"sunny"}],"total_results":1}`), nil
+			}
+
+			return jsonResponse(http.StatusInternalServerError, `{"code":500,"msg":"boom"}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	reqLog := reqlog.New(reqlog.Config{})
+	handler := NewHandler(&Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   client,
+		Live:       livecfg.New(livecfg.Snapshot{SearchEndpoint: true}),
+		RequestLog: reqLog,
+	})
+
+	body := `{"model":"glm-5.2","max_tokens":64,"stream":false,
+		"messages":[{"role":"user","content":"what is the weather"}],
+		"tools":[{"type":"web_search_20250305","name":"web_search"}]}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body)))
+
+	if rec.Code == http.StatusOK {
+		t.Fatalf("上游 chat 失败时不应回 200：%s", rec.Body)
+	}
+
+	snap := reqLog.Snapshot()
+	if len(snap.Recent) != 1 {
+		t.Fatalf("recent=%+v", snap.Recent)
+	}
+
+	ev := snap.Recent[0]
+	if ev.Outcome != reqlog.OutcomeHTTPError || ev.OK {
+		t.Errorf("归档应按 chat 失败记账: outcome=%q status=%d ok=%v", ev.Outcome, ev.Status, ev.OK)
 	}
 }
 

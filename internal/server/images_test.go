@@ -6,13 +6,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
 func jsonResponse(status int, body string) *http.Response {
@@ -100,6 +103,136 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), `"url":"https://img.example/a.png"`) {
 		t.Fatalf("response not passed through: %s", rec.Body)
+	}
+}
+
+// TestImagesRefreshedReplayRecordsBothAttempts 401 → refresh → 200 必须在用量里留下
+// 两条请求：首跳 401 单独记账（失败一条），token 只取成功那一跳，不得把整段延迟
+// 都算进成功请求（issue #424）。
+func TestImagesRefreshedReplayRecordsBothAttempts(t *testing.T) {
+	t.Parallel()
+
+	var imageCalls int
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "/images/") {
+				imageCalls++
+				if imageCalls == 1 {
+					return jsonResponse(http.StatusUnauthorized, `{"code":12153,"msg":"offline user session"}`), nil
+				}
+
+				return jsonResponse(http.StatusOK,
+					`{"created":1,"data":[{"url":"https://img.example/a.png"}],`+
+						`"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`), nil
+			}
+
+			return jsonResponse(http.StatusOK,
+				`{"code":0,"msg":"ok","data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":3600}}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	usageRec := usage.New("")
+	handler := NewHandler(&Config{
+		Pool: testPoolWith(&auth.Auth{
+			UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999,
+		}),
+		Upstream: client,
+		Usage:    usageRec,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if imageCalls != 2 {
+		t.Fatalf("imageCalls=%d want 2（401 后 refresh 重放一次）", imageCalls)
+	}
+
+	totals := usageRec.Snapshot(24, nil).Totals
+	if totals.Requests != 2 || totals.Errors != 1 {
+		t.Errorf("requests=%d errors=%d want 2/1（首跳 401 单独留痕）", totals.Requests, totals.Errors)
+	}
+
+	// token 只取自拿到响应体的那一跳，不能被两跳重复计入。
+	if totals.PromptTokens != 3 || totals.CompletionTok != 4 || totals.TotalTokens != 7 {
+		t.Errorf("tokens=%d/%d/%d want 3/4/7",
+			totals.PromptTokens, totals.CompletionTok, totals.TotalTokens)
+	}
+}
+
+// TestImagesReplayLatencyPerHop 每跳延迟必须在该跳返回时定格：401 之后还要
+// refresh + 重放。若拖到记账时才用首跳起始时刻计算，首跳会把刷新与重放的耗时
+// 一起算进去，两跳的平均延迟随之翻倍（issue #424 的逐跳延迟口径）。
+func TestImagesReplayLatencyPerHop(t *testing.T) {
+	t.Parallel()
+
+	const (
+		hopDelay     = 5 * time.Millisecond
+		refreshDelay = 600 * time.Millisecond
+		// 正确口径两跳各 ≈5ms/0ms（均值≈3ms）；把 refresh 算进首跳则≈300ms。
+		// 阈值取中间值，CI 抖动与回归判定都留足余量。
+		maxAvg = 250.0
+	)
+
+	var imageCalls atomic.Int32
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "/images/") {
+				if imageCalls.Add(1) == 1 {
+					time.Sleep(hopDelay)
+
+					return jsonResponse(http.StatusUnauthorized, `{"code":12153,"msg":"offline user session"}`), nil
+				}
+
+				return jsonResponse(http.StatusOK,
+					`{"created":1,"data":[{"url":"https://img.example/a.png"}]}`), nil
+			}
+
+			// 慢刷新必须只体现在刷新自身，不能渗进首跳延迟。
+			time.Sleep(refreshDelay)
+
+			return jsonResponse(http.StatusOK,
+				`{"code":0,"msg":"ok","data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":3600}}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	usageRec := usage.New("")
+	handler := NewHandler(&Config{
+		Pool: testPoolWith(&auth.Auth{
+			UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999,
+		}),
+		Upstream: client,
+		Usage:    usageRec,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	totals := usageRec.Snapshot(24, nil).Totals
+	if totals.Requests != 2 {
+		t.Fatalf("requests=%d want 2", totals.Requests)
+	}
+
+	if totals.AvgLatencyMs >= maxAvg {
+		t.Errorf("avg_latency_ms=%.0f 超过 %.0f：首跳延迟把 refresh/重放耗时算进去了",
+			totals.AvgLatencyMs, maxAvg)
 	}
 }
 

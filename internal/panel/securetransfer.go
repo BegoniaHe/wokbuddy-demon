@@ -276,7 +276,7 @@ func (p *Panel) importEncrypted(w http.ResponseWriter, r *http.Request) {
 	importedAuths, imported, skipped, errs := p.persistSecureAccounts(accounts)
 
 	// 阶段 2（有界并发）：签到/激活/余额查询，与其它批量导入同策略。
-	p.postImportAccounts(importedAuths)
+	p.postImportAccounts(r.Context(), importedAuths)
 	log.Printf("panel: 加密导入 finished total=%d imported=%d skipped=%d", len(accounts), imported, skipped)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,

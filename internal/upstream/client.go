@@ -4162,8 +4162,8 @@ func creditPackageAmounts(
 	return cycle, remain, used, size
 }
 
-func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
-	remain, total, _, err = c.UserResourceDetailed(a, 0)
+func (c *Client) UserResource(ctx context.Context, a *auth.Auth) (remain, total int64, err error) {
+	remain, total, _, err = c.UserResourceDetailed(ctx, a, 0)
 	return remain, total, err
 }
 
@@ -4198,9 +4198,9 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // 钳 [0,size] 与 used 修正；消除双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(
-	a *auth.Auth, soon time.Duration,
+	ctx context.Context, a *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, err error) {
-	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(ctx, a, soon)
 
 	return remain, total, expiring, err
 }
@@ -4258,12 +4258,12 @@ const (
 //
 //nolint:revive // 资源快照多返回值，拆 struct 会波及全部调用点。
 func (c *Client) enterpriseResource(
-	account6 *auth.Auth, soon time.Duration,
+	ctx context.Context, account6 *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	// 与个人口径一致：余额是签到后的紧邻调用，偶发 500 值得有界重试。
 	var data json.RawMessage
 
-	err = c.retryBillingTransient(func() error {
+	err = c.retryBillingTransient(ctx, func() error {
 		var e error
 
 		data, e = c.billingJSON(account6, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
@@ -4435,10 +4435,10 @@ type resourceSummaryResp struct {
 // fetchResourceSummary 查询额度汇总（官方桌面端主路径）。
 // 官方 5.9.3 `resourcePrefix` 为空串：无前缀路径优先，404 回落 `/v2`。
 // Accept-Language 只在这类 summary / packages 请求上带（官方由调用方注入 zh/en）。
-func (c *Client) fetchResourceSummary(account *auth.Auth) (resourceSummaryResp, error) {
+func (c *Client) fetchResourceSummary(ctx context.Context, account *auth.Auth) (resourceSummaryResp, error) {
 	var data json.RawMessage
 
-	err := c.retryBillingTransient(func() error {
+	err := c.retryBillingTransient(ctx, func() error {
 		var fetchErr error
 
 		data, fetchErr = c.billingMeterJSONHeaders(account,
@@ -4699,9 +4699,9 @@ func addPackageExpiry(
 //
 //nolint:revive // 同 enterpriseResource：资源快照多返回值。
 func (c *Client) UserResourceDetailedWithExpiry(
-	account *auth.Auth, soon time.Duration,
+	ctx context.Context, account *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
-	snap, err := c.UserResourceSnapshot(account, soon)
+	snap, err := c.UserResourceSnapshot(ctx, account, soon)
 	if err != nil {
 		return 0, 0, 0, time.Time{}, 0, err
 	}
@@ -4720,11 +4720,13 @@ func (c *Client) UserResourceDetailedWithExpiry(
 
 // UserResourceSnapshot 查询余额并返回含逐日到期批次的完整快照。企业版走企业口径
 // （额度体系无「资源包到期批次」，Buckets 恒空）。
-func (c *Client) UserResourceSnapshot(account *auth.Auth, soon time.Duration) (ResourceSnapshot, error) {
+func (c *Client) UserResourceSnapshot(
+	ctx context.Context, account *auth.Auth, soon time.Duration,
+) (ResourceSnapshot, error) {
 	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
 	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
 	if account.IsEnterprise() {
-		remain, total, expiring, earliestAt, earliestRemaining, err := c.enterpriseResource(account, soon)
+		remain, total, expiring, earliestAt, earliestRemaining, err := c.enterpriseResource(ctx, account, soon)
 		if err != nil {
 			return ResourceSnapshot{}, err
 		}
@@ -4743,7 +4745,7 @@ func (c *Client) UserResourceSnapshot(account *auth.Auth, soon time.Duration) (R
 		return snap, nil
 	}
 
-	remain, total, expiring, totals, err := c.personalResource(account, soon)
+	remain, total, expiring, totals, err := c.personalResource(ctx, account, soon)
 	if err != nil {
 		return ResourceSnapshot{}, err
 	}
@@ -4753,11 +4755,11 @@ func (c *Client) UserResourceSnapshot(account *auth.Auth, soon time.Duration) (R
 
 // personalResource 个人号余额查询主体：返回汇总与含日桶的累加器。
 func (c *Client) personalResource(
-	account *auth.Auth, soon time.Duration,
+	ctx context.Context, account *auth.Auth, soon time.Duration,
 ) (int64, int64, int64, *resourceTotals, error) {
 	now := time.Now()
 	// 官方桌面端主路径：summary 汇总 remain/total；失败时回落旧 get-user-resource。
-	if summary, serr := c.fetchResourceSummary(account); serr == nil && len(summary.Packages) > 0 {
+	if summary, serr := c.fetchResourceSummary(ctx, account); serr == nil && len(summary.Packages) > 0 {
 		remain, total := summary.summaryTotals()
 		expiring, totals := c.resourcePackages(account, now, soon)
 
@@ -4778,7 +4780,7 @@ func (c *Client) personalResource(
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
 	var data json.RawMessage
 
-	err := c.retryBillingTransient(func() error {
+	err := c.retryBillingTransient(ctx, func() error {
 		var e error
 
 		data, e = c.billingMeterJSON(account, billingMeterPaths(), body)
@@ -5131,8 +5133,8 @@ func cyclePackageAmounts(account respAccount) (remain, used, size int64) {
 // 让该账号整天漏签；「已签到」等业务错误不重试。
 // 签到是 X-Device-Token 的消费面之一（另一处是 chat，见 chatSurfaceOverrides；
 // auth/state 是面板登录面，不经本包），见 checkinHeaders。
-func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
+func (c *Client) DailyCheckin(ctx context.Context, a *auth.Auth) error {
+	return c.retryBillingTransient(ctx, func() error {
 		_, err := c.billingMeterJSONHeaders(a, checkinMeterPaths(), map[string]any{}, c.checkinHeaders(a))
 		return err
 	})

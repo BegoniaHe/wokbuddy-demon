@@ -14,7 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -158,10 +160,21 @@ var billingProcessingMarkers = []string{"请求处理中", "processing"}
 
 // isTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
 // 上游 5xx（ErrServer，实测偶发 "code 10000 / API request failed with status
-// code: 500"）、网络层错误（非 *Error 的传输失败），以及 429「请求处理中」
-// 这类瞬时状态。其余业务错误（已签到/参数错/余额耗尽）不重试。
+// code: 500"）、网络层错误，以及 429「请求处理中」这类瞬时状态。其余业务错误
+// （已签到/参数错/余额耗尽）与本地确定性错误不重试。
+//
+// 取消/超时（context.Canceled / DeadlineExceeded）先判掉：它们是本地信号而不是上游
+// 抖动，重试只会白等退避并补打上游（issue #423）。注意 context.DeadlineExceeded 自身
+// 也实现 net.Error，所以这一步必须排在网络层判定之前。
+//
+// 非 *Error 的错误只放行明确的传输层错误（*url.Error / net.Error）；解码失败、
+// 参数校验等本地确定性错误一律不重试。
 func isTransientBillingErr(err error) bool {
 	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
@@ -173,13 +186,21 @@ func isTransientBillingErr(err error) bool {
 		return ue.Kind == ErrSoftRate && containsAnyDual(strings.ToLower(ue.Msg), ue.Msg, billingProcessingMarkers)
 	}
 
-	return true
+	if _, ok := errors.AsType[*url.Error](err); ok {
+		return true
+	}
+
+	var netErr net.Error
+
+	return errors.As(err, &netErr)
 }
 
 // retryBillingTransient 对签到/余额这类低频维护调用做瞬时错误有界重试：
 // 最多补打 2 次（间隔 2s、4s），首次成功或非瞬时错误立即返回。chat 热路径
 // 不用本策略——它有自己的换号轮转语义，重试会放大在途请求。
-func (c *Client) retryBillingTransient(fn func() error) error {
+//
+// ctx 传入调用方的请求/任务上下文：等待被取消时立即返回 ctx.Err()，不再补打上游。
+func (c *Client) retryBillingTransient(ctx context.Context, fn func() error) error {
 	err := fn()
 	if err == nil || !isTransientBillingErr(err) {
 		return err
@@ -187,7 +208,9 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 
 	delay := c.retryDelay()
 	for i := 1; i <= 2; i++ {
-		time.Sleep(time.Duration(i) * delay)
+		if !sleepCtx(ctx, time.Duration(i)*delay) {
+			return ctx.Err()
+		}
 
 		if err = fn(); err == nil || !isTransientBillingErr(err) {
 			return err
@@ -195,6 +218,24 @@ func (c *Client) retryBillingTransient(fn func() error) error {
 	}
 
 	return err
+}
+
+// sleepCtx 可取消等待：ctx 取消立即返回 false，睡满返回 true。d<=0 直接按 ctx
+// 当前状态放行（与 scheduler / server 的同名辅助同口径）。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+
+	t := time.NewTimer(d)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // chatRequestEvent 客户端 chat_request_send 事件形状（对齐 CN 5.9.3 的

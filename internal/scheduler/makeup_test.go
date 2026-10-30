@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -69,7 +70,7 @@ func TestMakeupRecentNearToFar(t *testing.T) {
 	client := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
 	scheduler := New(&Config{Pool: state, Upstream: client})
 
-	scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+	scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -152,6 +153,32 @@ func (f *makeupFixture) snapshotUsed() []string {
 	return append([]string(nil), f.used...)
 }
 
+// TestUseMakeupCardsCancelLeavesCorrectRemainder：取消时报告的是尚未处理的漏签天数
+// （由近及远遍历，下标 0..i 共 i+1 天），不能按 len-i 误报。
+func TestUseMakeupCardsCancelLeavesCorrectRemainder(t *testing.T) {
+	t.Parallel()
+
+	scheduler := New(&Config{
+		Pool:     pool.New(""),
+		Upstream: &upstream.Client{HTTP: http.DefaultClient},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	used, remaining, left := scheduler.useMakeupCards(
+		ctx, &auth.Auth{UID: "u1", AccessToken: "at"}, []string{"2026-10-01", "2026-10-02", "2026-10-03"}, 5, 0,
+	)
+
+	if used != 0 || remaining != 5 {
+		t.Fatalf("used=%d remaining=%d want 0/5（取消后不得用卡）", used, remaining)
+	}
+
+	if left != 3 {
+		t.Fatalf("left=%d want 3（三天全未处理）", left)
+	}
+}
+
 // TestMakeupRecentPerRoundCap 每轮上限：cap=1 分两轮继续、cap=0 全补、
 // cap 大于漏签数全部补完；补签顺序仍由近及远。
 func TestMakeupRecentPerRoundCap(t *testing.T) {
@@ -181,7 +208,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		scheduler := newScheduler(srv)
 		scheduler.SetMakeupCardsPerRound(1)
-		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 1 || got[0] != days[1] {
 			t.Fatalf("第一轮 used=%v want [%s]", got, days[1])
@@ -189,7 +216,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		next := newScheduler(srv)
 		next.SetMakeupCardsPerRound(1)
-		next.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		next.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 2 || got[1] != days[0] {
 			t.Fatalf("第二轮 used=%v want [%s %s]", got, days[1], days[0])
@@ -204,7 +231,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		scheduler := newScheduler(srv)
 		scheduler.SetMakeupCardsPerRound(0)
-		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 2 || got[0] != days[1] || got[1] != days[0] {
 			t.Fatalf("used=%v want [%s %s]", got, days[1], days[0])
@@ -219,7 +246,7 @@ func TestMakeupRecentPerRoundCap(t *testing.T) {
 
 		scheduler := newScheduler(srv)
 		scheduler.SetMakeupCardsPerRound(10)
-		scheduler.makeupRecent(&auth.Auth{UID: "u1", AccessToken: "at"})
+		scheduler.makeupRecent(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
 
 		if got := fixture.snapshotUsed(); len(got) != 2 {
 			t.Fatalf("used=%v want 2 天全补", got)

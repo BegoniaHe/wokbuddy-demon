@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"net/http"
 	"testing"
 
@@ -25,7 +26,7 @@ func TestBalanceObserverNotifies(t *testing.T) {
 		gotUID, gotRemain, gotTotal = uid, remain, total
 	}
 
-	if _, _, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+	if _, _, err := client.UserResource(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
 		t.Fatalf("resource: %v", err)
 	}
 
@@ -55,7 +56,7 @@ func TestBalanceObserverNotifiesSchedulerPath(t *testing.T) {
 		}
 	}
 
-	if _, _, _, _, _, err := client.UserResourceDetailedWithExpiry(&auth.Auth{AccessToken: "at", UID: "u1"}, 0); err != nil {
+	if _, _, _, _, _, err := client.UserResourceDetailedWithExpiry(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, 0); err != nil {
 		t.Fatalf("resource: %v", err)
 	}
 
@@ -75,7 +76,7 @@ func TestBalanceObserverPanicIsolated(t *testing.T) {
 	})
 	client.BalanceObserver = func(string, int64, int64) { panic("boom") }
 
-	remain, total, err := client.UserResource(&auth.Auth{AccessToken: "at", UID: "u1"})
+	remain, total, err := client.UserResource(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"})
 	if err != nil {
 		t.Fatalf("回调 panic 不应影响查询结果: %v", err)
 	}
@@ -104,7 +105,7 @@ func TestBalanceObserverNotifiesSummaryPath(t *testing.T) {
 		}
 	}
 
-	if _, err := client.fetchResourceSummary(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+	if _, err := client.fetchResourceSummary(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
 		t.Fatalf("summary: %v", err)
 	}
 
@@ -126,7 +127,7 @@ func TestBalanceObserverSkipsEmptySummary(t *testing.T) {
 
 	client.BalanceObserver = func(string, int64, int64) { calls++ }
 
-	if _, err := client.fetchResourceSummary(&auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
+	if _, err := client.fetchResourceSummary(context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}); err != nil {
 		t.Fatalf("summary: %v", err)
 	}
 
@@ -165,7 +166,7 @@ func TestBalanceObserverNotifiesEnterprisePath(t *testing.T) {
 	}
 
 	account := &auth.Auth{UID: "e1", AccessToken: "at", EnterpriseID: "ent-1"}
-	if _, _, _, _, _, err := client.UserResourceDetailedWithExpiry(account, 0); err != nil {
+	if _, _, _, _, _, err := client.UserResourceDetailedWithExpiry(context.Background(), account, 0); err != nil {
 		t.Fatalf("enterprise resource: %v", err)
 	}
 

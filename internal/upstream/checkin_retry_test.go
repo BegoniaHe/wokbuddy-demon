@@ -4,6 +4,7 @@
 package upstream
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -37,7 +38,7 @@ func TestDailyCheckinRetriesTransient500(t *testing.T) {
 
 		return jsonResp(200, `{"code":0,"data":{}}`), nil
 	})
-	if err := client.DailyCheckin(&auth.Auth{AccessToken: "at"}); err != nil {
+	if err := client.DailyCheckin(context.Background(), &auth.Auth{AccessToken: "at"}); err != nil {
 		t.Fatalf("首次 500 应重试成功，err=%v", err)
 	}
 
@@ -57,7 +58,7 @@ func TestDailyCheckinRetriesExhausted(t *testing.T) {
 		return jsonResp(500, `{"code":10000,"msg":"API request failed with status code: 500"}`), nil
 	})
 
-	err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
+	err := c.DailyCheckin(context.Background(), &auth.Auth{AccessToken: "at"})
 	if err == nil {
 		t.Fatal("持续 500 应返回错误")
 	}
@@ -79,7 +80,7 @@ func TestDailyCheckinNoRetryOnBusinessError(t *testing.T) {
 		return jsonResp(200, `{"code":14001,"msg":"今日已签到"}`), nil
 	})
 
-	err := client.DailyCheckin(&auth.Auth{AccessToken: "at"})
+	err := client.DailyCheckin(context.Background(), &auth.Auth{AccessToken: "at"})
 	if err == nil || !IsAlreadyCheckin(err) {
 		t.Fatalf("err=%v want already-checkin business error", err)
 	}
@@ -99,7 +100,7 @@ func TestDailyCheckinNoRetryOn4xx(t *testing.T) {
 		calls.Add(1)
 		return jsonResp(403, `{"code":11140,"msg":"request illegal"}`), nil
 	})
-	if err := c.DailyCheckin(&auth.Auth{AccessToken: "at"}); err == nil {
+	if err := c.DailyCheckin(context.Background(), &auth.Auth{AccessToken: "at"}); err == nil {
 		t.Fatal("403 应返回错误")
 	}
 
@@ -128,7 +129,7 @@ func TestUserResourceDetailedRetriesTransient500(t *testing.T) {
 		]}}}}`), nil
 	})
 
-	remain, _, _, _, _, err := client.UserResourceDetailedWithExpiry(&auth.Auth{AccessToken: "at"}, 0)
+	remain, _, _, _, _, err := client.UserResourceDetailedWithExpiry(context.Background(), &auth.Auth{AccessToken: "at"}, 0)
 	if err != nil || remain != 60 {
 		t.Fatalf("remain=%d err=%v, want 60 nil", remain, err)
 	}

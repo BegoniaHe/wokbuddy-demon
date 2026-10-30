@@ -1635,13 +1635,15 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 		n, werr := s.flushData()
 		return n, false, werr
 	default:
-		// 注释/其他行：原样透传
+		// 注释 / `event:` / `id:` / `retry:` 等非 data 行原样透传，不 flush 缓冲中的
+		// data：SSE 事件只由空行分派（见 WHATWG EventSource 解析），非 data 字段属于
+		// 同一事件，提前 flush 会插入空行、把 event type/id 甩到下一个事件（#421）。
 		if werr := s.writeAll(line); werr != nil {
 			return 0, false, werr
 		}
-	}
 
-	return 0, false, nil
+		return 0, false, nil
+	}
 }
 
 // appendDataLine 把一行 data 追加到当前事件缓冲，并施加事件总量上限：

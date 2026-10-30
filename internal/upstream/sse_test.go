@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1411,7 +1412,7 @@ func TestUserResourceDetailedWithExpirySnapshot(t *testing.T) {
 		return jsonResp(200, payload), nil
 	})
 
-	remain, total, expiring, earliestAt, earliestRemaining, err := client.UserResourceDetailedWithExpiry(
+	remain, total, expiring, earliestAt, earliestRemaining, err := client.UserResourceDetailedWithExpiry(context.Background(),
 		&auth.Auth{AccessToken: "at", UID: "u1"}, 48*time.Hour,
 	)
 	if err != nil {

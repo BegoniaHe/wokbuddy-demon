@@ -447,12 +447,22 @@ func TestRefreshDomain(t *testing.T) {
 	}
 }
 
-// TestPrivateDataHeaderPerRealm X-Private-Data 按账号身份分层、与域无关：官方 5.9.3
-// （CN / global 同源同形）在个人号默认分支发 false、企业号（isEnterpriseEditionAccount：
-// enterpriseId 非空或 type=ultimate/exclusive）发 true。global 5.8.4 时代按
-// DisableYuanbaoChannel 一律发 true 的旧口径已作废（issue #343 / #400）。
+// TestPrivateDataHeaderPerRealm X-Private-Data 按账号身份与 realm 分层：官方
+// `cli/product.json` 的 `DefaultModelOptimizationOff` CN=false / global=true，
+// 该 header 是其取反派生，故 global 个人号发 true、CN 个人号发 false；企业号
+// （isEnterpriseEditionAccount：enterpriseId 非空或 type=ultimate/exclusive）恒 true。
+// global 5.8.4 时代按 DisableYuanbaoChannel 一律发 true 的旧口径已作废（issue #343 /
+// #400），本条按 global 产品配置恢复 true（issue #411）。
 func TestPrivateDataHeaderPerRealm(t *testing.T) {
 	t.Parallel()
+
+	// realm 两种入参形态都要覆盖：Domain 后缀推导 与 显式 BackfillRealmFor。
+	globalByDomain := &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}
+
+	globalByBackfill := &auth.Auth{UID: "u-gl-bf", AccessToken: "at"}
+	if _, err := auth.BackfillRealmFor(globalByBackfill, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor: %v", err)
+	}
 
 	cases := []struct {
 		name    string
@@ -463,7 +473,8 @@ func TestPrivateDataHeaderPerRealm(t *testing.T) {
 		{"CN 企业号", &auth.Auth{UID: "u-cn-ent", AccessToken: "at", EnterpriseID: "ent-1"}, "true"},
 		{"CN ultimate 无 enterpriseId", &auth.Auth{UID: "u-cn-ult", AccessToken: "at", EditionType: "ultimate"}, "true"},
 		{"CN exclusive 无 enterpriseId", &auth.Auth{UID: "u-cn-exc", AccessToken: "at", EditionType: "Exclusive"}, "true"},
-		{"global 个人号", &auth.Auth{UID: "u-gl", AccessToken: "at", Domain: "www.workbuddy.ai"}, "false"},
+		{"global 个人号（Domain 推导）", globalByDomain, "true"},
+		{"global 个人号（BackfillRealmFor）", globalByBackfill, "true"},
 		{"global 个人号 ultimate 无 enterpriseId", &auth.Auth{
 			UID: "u-gl-ult", AccessToken: "at", Domain: "www.workbuddy.ai", EditionType: "ultimate",
 		}, "true"},

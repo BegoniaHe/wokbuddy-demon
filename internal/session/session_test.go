@@ -5,6 +5,7 @@ import (
 	"maps"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -502,5 +503,80 @@ func TestResolveFastPathUsesAvailableOne(t *testing.T) {
 
 	if oneCalls != 1 || allCalls != 0 {
 		t.Fatalf("fast path calls: AvailableOne=%d Available=%d, want 1/0", oneCalls, allCalls)
+	}
+}
+
+// blockingSetStore 让 SetBind 在写入前阻塞，把「镜像写进行中」变成一个可观测状态。
+type blockingSetStore struct {
+	*countingStore
+
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	block   atomic.Bool
+}
+
+func (s *blockingSetStore) SetBind(key, uid string, ttl time.Duration) {
+	// 只在进入并发段后阻塞：前面的 Bind 需要正常返回。
+	if s.block.Load() {
+		s.once.Do(func() {
+			close(s.entered)
+		})
+		<-s.release
+	}
+
+	s.countingStore.SetBind(key, uid, ttl)
+}
+
+// TestUnbindCannotBeOverwrittenByStaleMirror（#417 补充）：镜像写与内存绑定必须在
+// 同一把锁内提交。否则 Unbind 可以插进「解锁 → SetBind」之间，让已解绑的绑定在
+// Redis 里复活，重启后又恢复成粘性映射。
+func TestUnbindCannotBeOverwrittenByStaleMirror(t *testing.T) {
+	t.Parallel()
+
+	countingStore2 := newCountingStore()
+	store := &blockingSetStore{
+		countingStore: countingStore2,
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	r := routerWith(store, []string{"a1"}, time.Minute)
+	r.Bind("c1", "a1")
+
+	var wg sync.WaitGroup
+
+	store.block.Store(true)
+	wg.Go(func() { r.ResolveExisting("c1", "") })
+
+	<-store.entered // 镜像写已开始（touch 的 SetBind 进行中）
+
+	unbound := make(chan struct{})
+
+	wg.Go(func() {
+		r.Unbind("c1")
+		close(unbound)
+	})
+
+	select {
+	case <-unbound:
+		close(store.release)
+		wg.Wait()
+		t.Fatal("镜像写未完成时 Unbind 就返回了：解绑可能被陈旧镜像写回")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(store.release)
+	wg.Wait()
+
+	if _, inMemory := r.boundUID("c1"); inMemory {
+		t.Fatal("Unbind 后内存不应还有绑定")
+	}
+
+	countingStore2.mu.Lock()
+	_, inStore := countingStore2.binds["c1"]
+	countingStore2.mu.Unlock()
+
+	if inStore {
+		t.Fatal("Unbind 后 Store 不得残留绑定（陈旧镜像把解绑写回）")
 	}
 }

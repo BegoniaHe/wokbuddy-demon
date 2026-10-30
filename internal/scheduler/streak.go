@@ -16,6 +16,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -26,44 +27,77 @@ func (s *Scheduler) RunStreakBonusNow() {
 }
 
 // streakAll 连登兑换 + 抽奖实体；返回尝试/成功/失败账号数（门控跳过不计数）。
-func (s *Scheduler) streakAll(trigger string) (total, success, failure int) {
+// ctx 来自触发本轮的任务父上下文：每个账号边界检查取消，停机时不必等整轮跑完
+// （issue #422）。
+func (s *Scheduler) streakAll(ctx context.Context, trigger string) (total, success, failure int) {
 	_ = trigger
 
 	var runCounters2 runCounters
 
 	list := s.cfg.Pool.List()
 	for i := range list {
-		st := &list[i]
-		if st.Disabled {
+		if ctx.Err() != nil {
+			break
+		}
+
+		account := s.streakAuth(&list[i])
+		if account == nil {
 			continue
 		}
 
-		account := s.cfg.Pool.AuthByUID(st.UID)
-		if account == nil || account.AccessTokenValue() == "" {
-			continue
+		ok := s.streakBonusAccount(ctx, account)
+		if !ok && ctx.Err() != nil {
+			// 取消导致的中断不是账号失败：停机时任务中心不应显示一批失败号。
+			break
 		}
 
-		if account.IsGlobal() {
-			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
-		}
-
-		if account.IsEnterprise() {
-			continue // 企业版门控：无个人成长体系（/activity/growth/streak 上游一律 403）
-		}
-
-		runCounters2.record(s.streakBonusAccount(account))
+		runCounters2.record(ok)
 	}
 
 	return runCounters2.total, runCounters2.success, runCounters2.failure
 }
 
+// streakAuth 返回连登管家应处理的账号；禁用 / 无 token / global / 企业版返回 nil。
+func (s *Scheduler) streakAuth(st *pool.Status) *auth.Auth {
+	if st.Disabled {
+		return nil
+	}
+
+	account := s.cfg.Pool.AuthByUID(st.UID)
+	if account == nil || account.AccessTokenValue() == "" {
+		return nil
+	}
+
+	if account.IsGlobal() {
+		return nil // D4 门控：global 无 CN 任务体系，不发起任何上游调用
+	}
+
+	if account.IsEnterprise() {
+		return nil // 企业版门控：无个人成长体系（/activity/growth/streak 上游一律 403）
+	}
+
+	return account
+}
+
 // streakBonusAccount 单账号：补签保连登 → 礼包/补偿 → 兑换所有已解锁档位 → 抽完所有 chances。
 // 返回 false 仅表示主链路（连登状态/抽奖次数）查询失败；可选的礼包/补签失败不改变结果。
-func (s *Scheduler) streakBonusAccount(account3 *auth.Auth) bool {
+func (s *Scheduler) streakBonusAccount(ctx context.Context, account3 *auth.Auth) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
 	// 0. 补签保连登：本月漏签由近及远补，受补签卡余额限制（issue #250）。
-	s.makeupRecent(account3)
+	s.makeupRecent(ctx, account3)
+
+	if ctx.Err() != nil {
+		return false
+	}
 	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
-	s.claimStreakGifts(account3)
+	s.claimStreakGifts(ctx, account3)
+
+	if ctx.Err() != nil {
+		return false
+	}
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(account3)
 	if err != nil {
@@ -71,7 +105,11 @@ func (s *Scheduler) streakBonusAccount(account3 *auth.Auth) bool {
 		return false
 	}
 
-	s.redeemUnlockedTiers(account3, full)
+	s.redeemUnlockedTiers(ctx, account3, full)
+
+	if ctx.Err() != nil {
+		return false
+	}
 
 	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
 	chances, err := s.cfg.Upstream.LotteryChances(account3)
@@ -80,13 +118,17 @@ func (s *Scheduler) streakBonusAccount(account3 *auth.Auth) bool {
 		return false
 	}
 
-	s.drawAllLottery(account3, chances)
+	s.drawAllLottery(ctx, account3, chances)
 
 	return true
 }
 
 // claimStreakGifts 领取新手礼包与补偿（各一次，业务错误静默跳过）。
-func (s *Scheduler) claimStreakGifts(account4 *auth.Auth) {
+func (s *Scheduler) claimStreakGifts(ctx context.Context, account4 *auth.Auth) {
+	if ctx.Err() != nil {
+		return
+	}
+
 	if credit, err := s.cfg.Upstream.ClaimGift(account4); err == nil {
 		if credit > 0 {
 			log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", logfmt.Label(account4.UID, account4.NicknameValue()), credit)
@@ -102,13 +144,17 @@ func (s *Scheduler) claimStreakGifts(account4 *auth.Auth) {
 }
 
 // redeemUnlockedTiers 兑换所有已解锁档位（locked/claimed 跳过；未解锁 403 静默）。
-func (s *Scheduler) redeemUnlockedTiers(account *auth.Auth, full *upstream.StreakFull) {
+func (s *Scheduler) redeemUnlockedTiers(ctx context.Context, account *auth.Auth, full *upstream.StreakFull) {
 	statuses := map[string]string{
 		"7d":  full.RedemptionStatus.Tier7dStatus,
 		"14d": full.RedemptionStatus.Tier14dStatus,
 		"28d": full.RedemptionStatus.Tier28dStatus,
 	}
 	for _, tier := range full.RedemptionStatus.Tiers {
+		if ctx.Err() != nil {
+			return
+		}
+
 		status := statuses[tier.Tier]
 		if status == "locked" || status == "claimed" {
 			continue
@@ -128,8 +174,12 @@ func (s *Scheduler) redeemUnlockedTiers(account *auth.Auth, full *upstream.Strea
 }
 
 // drawAllLottery 按当前抽奖次数全部抽完，遇错即停。
-func (s *Scheduler) drawAllLottery(account5 *auth.Auth, chances int) {
+func (s *Scheduler) drawAllLottery(ctx context.Context, account5 *auth.Auth, chances int) {
 	for i := range chances {
+		if ctx.Err() != nil {
+			return
+		}
+
 		raw, err := s.cfg.Upstream.LotteryDraw(account5)
 		if err != nil {
 			log.Printf("streak-bonus %s: draw: %v", logfmt.Label(account5.UID, account5.NicknameValue()), err)
@@ -157,7 +207,7 @@ func compactJSON(raw json.RawMessage) string {
 // makeupRecent 本月漏签由近及远补签，受补签卡余额与每轮上限限制；
 // 无卡/无漏签/查询失败静默。只在有漏签时才查连登详情与补签卡余额，
 // 避免无漏签账号多打一次上游。
-func (s *Scheduler) makeupRecent(account2 *auth.Auth) {
+func (s *Scheduler) makeupRecent(ctx context.Context, account2 *auth.Auth) {
 	now := cst.Now()
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, cst.Loc)
 	yesterday := now.AddDate(0, 0, -1)
@@ -179,7 +229,7 @@ func (s *Scheduler) makeupRecent(account2 *auth.Auth) {
 
 	maxPerRound := int(s.makeupPerRound.Load())
 
-	used, remaining, leftForNextRound := s.useMakeupCards(account2, missed, remaining, maxPerRound)
+	used, remaining, leftForNextRound := s.useMakeupCards(ctx, account2, missed, remaining, maxPerRound)
 	if used > 0 {
 		log.Printf("streak-bonus %s: 本次补签 %d 天，剩余补签卡 %d 张",
 			logfmt.Label(account2.UID, account2.NicknameValue()), used, remaining)
@@ -193,9 +243,14 @@ func (s *Scheduler) makeupRecent(account2 *auth.Auth) {
 
 // useMakeupCards 由近及远补签，返回成功数、剩余卡数与留待下一轮的漏签天数。
 func (s *Scheduler) useMakeupCards(
-	account2 *auth.Auth, missed []string, remaining, maxPerRound int,
+	ctx context.Context, account2 *auth.Auth, missed []string, remaining, maxPerRound int,
 ) (used, remainingCards, leftForNextRound int) {
 	for i, day := range slices.Backward(missed) {
+		if ctx.Err() != nil {
+			// 由近及远遍历：下标 0..i 尚未处理，共 i+1 天。
+			return used, remaining, i + 1
+		}
+
 		if remaining <= 0 {
 			return used, remaining, 0
 		}

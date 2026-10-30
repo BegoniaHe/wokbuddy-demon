@@ -762,7 +762,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 
 		targets = append(targets, batchTarget{
 			uid: account.UID,
-			run: func() bool { return s.runCheckinAccount(status, account, expiringSoon) },
+			run: func() bool { return s.runCheckinAccount(ctx, status, account, expiringSoon) },
 		})
 	}
 
@@ -772,7 +772,7 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 	}
 	// 连登管家作为独立任务族运行（自己的守卫/状态），触发来源标记为签到后置，
 	// 与独立手动/排程区分；已在跑时跳过并留一行日志，避免用户误以为已执行。
-	if !s.runTaskSync(context.Background(), TaskStreak, TriggerCheckinFollowup) {
+	if !s.runTaskSync(ctx, TaskStreak, TriggerCheckinFollowup) {
 		log.Printf("INFO: [scheduler] 连登管家已在运行，本轮签到后置触发跳过")
 	}
 
@@ -799,18 +799,18 @@ func (s *Scheduler) checkinAuth(st *pool.Status, includeDisabled bool) (*auth.Au
 // runCheckinAccount 执行单账号签到（企业版跳过）+ 余额刷新。
 // 返回该账号本轮是否成功（签到失败或余额查询失败均记失败）。
 func (s *Scheduler) runCheckinAccount(
-	status *pool.Status, account *auth.Auth, expiringSoon time.Duration,
+	ctx context.Context, status *pool.Status, account *auth.Auth, expiringSoon time.Duration,
 ) bool {
 	ok := true
 	// 企业版无签到体系：上游直接 400；跳过签到，但余额查询照常跑
 	// （企业额度是 credit_floor 判定与面板额度展示的唯一数据源）。
 	if !account.IsEnterprise() {
-		ok = s.checkinOne(status.UID, status.Nickname, account)
+		ok = s.checkinOne(ctx, status.UID, status.Nickname, account)
 	}
 
 	// 用含逐日到期批次的快照写入：签到链路也保留完整批次，避免把后台刷新刚写入的
 	// 批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
-	snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+	snap, err := s.cfg.Upstream.UserResourceSnapshot(ctx, account, expiringSoon)
 	if err != nil {
 		log.Printf("user-resource %s: %v", logfmt.Label(status.UID, status.Nickname), err)
 		return false
@@ -827,7 +827,7 @@ func (s *Scheduler) runCheckinAccount(
 
 // checkinOne 单账号签到并落一行结果日志：按 CheckinResult 分类呈现——成功/幂等/
 // 活动未开启（非错误态）分开表述，只有真失败记 error 行；均不阻断后续余额查询。
-func (s *Scheduler) checkinOne(uid, nickname string, account *auth.Auth) bool {
+func (s *Scheduler) checkinOne(ctx context.Context, uid, nickname string, account *auth.Auth) bool {
 	// 先查签到活动状态：今日已签则跳过重复请求；状态查询失败时回落直接签到。
 	if checked, err := s.cfg.Upstream.CheckinActivityStatus(account); err == nil && checked {
 		s.cfg.Pool.NoteCheckinDone(uid)
@@ -836,7 +836,7 @@ func (s *Scheduler) checkinOne(uid, nickname string, account *auth.Auth) bool {
 		return true
 	}
 
-	err := s.cfg.Upstream.DailyCheckin(account)
+	err := s.cfg.Upstream.DailyCheckin(ctx, account)
 	switch upstream.ClassifyCheckin(err) {
 	case upstream.CheckinOK:
 		// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
@@ -1131,7 +1131,7 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			s.refreshBalanceAccount(account4, uid, expiringSoon)
+			s.refreshBalanceAccount(ctx, account4, uid, expiringSoon)
 		}(account, status.UID)
 	}
 
@@ -1143,10 +1143,12 @@ loop:
 
 // refreshBalanceAccount 单账号余额刷新：401 先 refresh 求证（issue #245），
 // 成功后写快照并做低额度告警。
-func (s *Scheduler) refreshBalanceAccount(account *auth.Auth, uid string, expiringSoon time.Duration) {
-	snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+func (s *Scheduler) refreshBalanceAccount(
+	ctx context.Context, account *auth.Auth, uid string, expiringSoon time.Duration,
+) {
+	snap, err := s.cfg.Upstream.UserResourceSnapshot(ctx, account, expiringSoon)
 	if err != nil && upstream.IsCredentialDead(err) {
-		snap, err = s.refreshThenSnapshot(account, expiringSoon)
+		snap, err = s.refreshThenSnapshot(ctx, account, expiringSoon)
 	}
 
 	if err != nil {
@@ -1163,7 +1165,7 @@ func (s *Scheduler) refreshBalanceAccount(account *auth.Auth, uid string, expiri
 // refreshThenSnapshot 余额 401 的 refresh 求证：refresh 成功 → 重试一次快照；
 // refresh 仍失败且为凭证失效 → 计入 session dead（连续阈值才禁用），否则原样返回。
 func (s *Scheduler) refreshThenSnapshot(
-	account *auth.Auth, expiringSoon time.Duration,
+	ctx context.Context, account *auth.Auth, expiringSoon time.Duration,
 ) (upstream.ResourceSnapshot, error) {
 	refreshErr := s.cfg.Upstream.RefreshToken(account)
 	if refreshErr == nil {
@@ -1172,7 +1174,7 @@ func (s *Scheduler) refreshThenSnapshot(
 				logfmt.Label(account.UID, account.NicknameValue()), saveErr)
 		}
 
-		snap, err := s.cfg.Upstream.UserResourceSnapshot(account, expiringSoon)
+		snap, err := s.cfg.Upstream.UserResourceSnapshot(ctx, account, expiringSoon)
 		if err != nil {
 			return snap, fmt.Errorf("snapshot after refresh: %w", err)
 		}
