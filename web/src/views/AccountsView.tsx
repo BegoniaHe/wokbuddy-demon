@@ -791,7 +791,7 @@ function AccountRow({
           </span>
           {s.realm === 'global' ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">国际版</span> : null}
           {s.enterprise ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">企业版</span> : null}
-          {dailyLimited ? <Tag tone="warn" title="已达每日限额，本地 0 点恢复">日限</Tag> : null}
+          {dailyLimited ? <Tag tone="warn" title="已达每日限额，本地 0 点恢复；积分日限仅对收费模型生效，免费模型仍可服务">日限</Tag> : null}
           {proxySlots.length ? (
             <select
               className="flex-none rounded-md border border-border bg-secondary px-1 py-px text-2xs text-muted-foreground"
