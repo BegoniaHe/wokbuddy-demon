@@ -434,14 +434,18 @@ func trimLine(line string) string {
 	return line
 }
 
-// ssePayload 从 "data: ..." 行取 payload。
+// ssePayload 从 "data: ..." 行取 payload（SSE 允许 "data:" 后不带空格）。
+//
+// 与 server / upstream 两侧同口径：载荷两端空白一并去掉。上游偶发 "[DONE] "
+// 这类尾随空白，严格等值会让探测把终止帧当噪声继续读——上游不主动关连接时
+// 要等到超时才收尾，可用的模型被判成解析失败。
 func ssePayload(line string) (string, bool) {
-	const prefix = "data: "
-	if len(line) <= len(prefix) || line[:len(prefix)] != prefix {
+	payload, ok := strings.CutPrefix(line, "data:")
+	if !ok {
 		return "", false
 	}
 
-	return line[len(prefix):], true
+	return strings.TrimSpace(payload), true
 }
 
 // probeErrorClass 把传输层错误归一为可读分类（探测只做观测，不参与路由）。
