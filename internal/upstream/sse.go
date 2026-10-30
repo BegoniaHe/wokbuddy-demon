@@ -1635,13 +1635,21 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 		n, werr := s.flushData()
 		return n, false, werr
 	default:
-		// 注释/其他行：原样透传
-		if werr := s.writeAll(line); werr != nil {
-			return 0, false, werr
-		}
+		n, werr := s.flushThenWriteLine(line)
+		return n, false, werr
+	}
+}
+
+// flushThenWriteLine 先落帧已缓冲的 data，再原样透传非 data 行（`event:` / `id:` /
+// `retry:` / 心跳注释）。否则 data 与空行之间插入的事件字段会先于数据写出，事件
+// 类型/序号与数据分离（issue #421）。[DONE] 与空行两个分支同理。
+func (s *streamWriter) flushThenWriteLine(line string) (int, error) {
+	n, err := s.flushData()
+	if err != nil {
+		return n, err
 	}
 
-	return 0, false, nil
+	return n, s.writeAll(line)
 }
 
 // appendDataLine 把一行 data 追加到当前事件缓冲，并施加事件总量上限：
