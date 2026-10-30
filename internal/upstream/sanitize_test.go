@@ -623,3 +623,93 @@ func TestChatStreamWireBodyDshAtPathSegmentSanitized(t *testing.T) {
 		t.Fatalf("wire body 未被改写: %s", gotBody)
 	}
 }
+
+// issue #414：指纹出现在单行 JSON 字符串里时，净化不能吞掉 JSON 结构字符。
+// 旧右边界只到 `;`/换行，会把整行尾部连引号大括号一起删掉，产出非法 JSON；
+// 收紧后（并对转义引号场景走结构化兜底）产物必须仍是合法 JSON。
+func TestToolArgumentsJSONStaysValid(t *testing.T) {
+	t.Parallel()
+
+	args, err := json.Marshal(map[string]any{
+		"curl": "-H \"" + ccHeader + "\"",
+		"cmd":  "cc_version=2.1.0 cc_entrypoint=cli",
+		"x":    1,
+		"note": "keep this tail",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	msgs := []any{
+		map[string]any{"role": "user", "content": "run"},
+		map[string]any{"role": "assistant", "content": nil, "tool_calls": []any{
+			map[string]any{"id": "c1", "type": "function", "function": map[string]any{
+				"name":      "Bash",
+				"arguments": string(args),
+			}},
+		}},
+	}
+	if !sanitizeMessages(msgs) {
+		t.Fatal("sanitizeMessages 未报告改动")
+	}
+
+	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
+	got := fn["arguments"].(string)
+
+	if !json.Valid([]byte(got)) {
+		t.Fatalf("净化后 arguments 不是合法 JSON: %q", got)
+	}
+
+	if strings.Contains(strings.ToLower(got), "billing") || strings.Contains(got, "cc_version") {
+		t.Errorf("指纹未被剥离: %q", got)
+	}
+	// 值被删空但键与尾部内容必须还在（旧实现会吞掉 `","x":1...`）。
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+		t.Fatalf("解码失败: %v", err)
+	}
+
+	if _, ok := decoded["x"]; !ok {
+		t.Errorf("JSON 结构被破坏，缺少键 x: %q", got)
+	}
+}
+
+// 转义引号是纯文本替换的已知残留场景：`\"` 两侧被删后可能留下孤立反斜杠，
+// 结构化兜底负责把它重新编码成合法 JSON。
+func TestSanitizeJSONStringEscapedQuote(t *testing.T) {
+	t.Parallel()
+
+	raw := `{"curl":"-H \"` + ccHeader + `\"","x":1}`
+	if !json.Valid([]byte(raw)) {
+		t.Fatalf("用例本身不是合法 JSON: %q", raw)
+	}
+
+	out, changed := sanitizeJSONString(raw)
+	if !changed {
+		t.Fatal("未检测到指纹")
+	}
+
+	if !json.Valid([]byte(out)) {
+		t.Fatalf("产物不是合法 JSON: %q", out)
+	}
+
+	if strings.Contains(strings.ToLower(out), "billing") {
+		t.Errorf("指纹未剥离: %q", out)
+	}
+}
+
+// 控制位：纯文本 content 的净化语义不回退——键值整段剥离、正文其余内容保留。
+func TestPlainContentHeaderStillStripped(t *testing.T) {
+	t.Parallel()
+
+	in := "before\n" + ccHeader + "\nafter"
+	out := sanitizeText(in)
+
+	if strings.Contains(strings.ToLower(out), "billing") {
+		t.Errorf("header not stripped: %q", out)
+	}
+
+	if !strings.Contains(out, "before") || !strings.Contains(out, "after") {
+		t.Errorf("surrounding text lost: %q", out)
+	}
+}
