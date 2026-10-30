@@ -132,7 +132,7 @@ type fireSlot struct {
 }
 
 // nextFireFor 返回 now 之后最近的抖动后触发时刻及其基准整点。
-// 抖动只向前且 W 由调用方保证 <= 59m；W=0 时与 nextFireIn 完全一致。
+// 抖动只向前且 W 由调用方保证 <= 59m；W=0 时与无抖动整点语义完全一致。
 func nextFireFor(
 	now time.Time, kind taskKind, hours []int, loc *time.Location, window time.Duration, salt string,
 ) fireSlot {
@@ -149,7 +149,7 @@ func nextFireFor(
 		at := base.Add(jitterWithinHour(salt, kind, hour, base, window))
 
 		if !at.After(now) {
-			// 与 nextFireIn 同口径：按墙钟日推进，不做 Add(24h)。
+			// 与无抖动整点语义同口径：按墙钟日推进，不做 Add(24h)。
 			y, m, d := localNow.Date()
 			base = slotOn(time.Date(y, m, d+1, 12, 0, 0, 0, loc), hour)
 			at = base.Add(jitterWithinHour(salt, kind, hour, base, window))

@@ -123,13 +123,18 @@ type chatStat struct {
 }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
-func newChatStat(now time.Time, body []byte, stream bool, out io.Writer, enabled bool) *chatStat {
+// model 由调用方从已解析的入站输入传入，避免对同一请求体重复反序列化。
+func newChatStat(now time.Time, model string, stream bool, out io.Writer, enabled bool) *chatStat {
 	mode := "sync"
 	if stream {
 		mode = "stream"
 	}
 
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, out: out, enabled: enabled}
+	if model == "" {
+		model = "-"
+	}
+
+	return &chatStat{start: now, model: model, mode: mode, toks: -1, out: out, enabled: enabled}
 }
 
 // done 幂等落一行表格日志。
@@ -163,9 +168,8 @@ type chatStatsReader struct {
 	hasCompletionTokens bool
 	hasTotalTokens      bool
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
-	hasCredit  bool
-	credit     float64
-	errorFrame bool
+	hasCredit bool
+	credit    float64
 	// cacheHit/cacheMiss 上游末帧 usage.prompt_cache_hit_tokens / miss_tokens，
 	// 供用量桶的命中率维度与 reqlog 逐次记录（issue #92）。
 	hasCacheHit  bool
@@ -182,7 +186,7 @@ type chatStatsReader struct {
 	toolCallHasIndex   bool
 	toolCallNextIndex  int
 	legacyFunctionCall bool
-	pend               []byte // 已读未返回的行缓存
+	pend               string // 已读未返回的行缓存（string 直接 copy 进 dst，省一次转换分配）
 }
 
 // chatStatsReader 必须实现 io.Closer：keepalive 流返回前由 upstream 关闭并等待
@@ -281,21 +285,22 @@ type sseChoiceFrame struct {
 	FinishReason *string       `json:"finish_reason"`
 }
 
-// sseChunkFrame SSE data 帧的最小解析形态：error 原文 + usage + 输出健康度。
+// sseChunkFrame SSE data 帧的最小解析形态：usage + 输出健康度。
 type sseChunkFrame struct {
-	Error   json.RawMessage  `json:"error"`
 	Usage   *sseUsageFrame   `json:"usage"`
 	Choices []sseChoiceFrame `json:"choices"`
 }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
+//
+// 与上游透传侧（upstream.handleStreamLine）同口径：SSE 允许 "data:" 后不带空格，
+// 只认 "data: " 会让这类上游的用量与首字延迟整段统计不到。
 func (s *chatStatsReader) parseSSELine(line string) {
-	line = strings.TrimRight(line, "\r\n")
-	if !strings.HasPrefix(line, "data: ") {
+	payload, ok := sseDataPayload(line)
+	if !ok {
 		return
 	}
 
-	payload := strings.TrimPrefix(line, "data: ")
 	if payload == "[DONE]" {
 		return
 	}
@@ -308,10 +313,6 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	var chunk sseChunkFrame
 	if json.Unmarshal([]byte(payload), &chunk) != nil {
 		return
-	}
-
-	if len(chunk.Error) > 0 {
-		s.errorFrame = true
 	}
 
 	s.noteChoices(chunk.Choices)
@@ -587,62 +588,44 @@ func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 	})
 }
 
-// SawErrorFrame 报告流中是否透传过 SSE error 帧。
-func (s *chatStatsReader) SawErrorFrame() bool { return s.errorFrame }
-
 // Read 返回原始数据，同时解析统计 TTFB/token。
-// 单行上限与 upstream SSE 读取同口径（upstream.MaxSSELineBytes，issue #113）：
-// 统计层自己也是按行读取点，不设限会把超长行原样拷贝给下游透传。
+// 切行与单行上限统一走 upstream.ReadSSELine：与透传侧同一份实现（同一
+// MaxSSELineBytes / ErrSSELineTooLong，issue #113）。统计层自己也是按行读取点，
+// 不设限会把超长行原样拷贝给下游透传。
 func (s *chatStatsReader) Read(nums []byte) (int, error) {
-	if len(s.pend) > 0 {
-		n := copy(nums, s.pend)
-		s.pend = s.pend[n:]
-
-		return n, nil
+	if s.pend != "" {
+		return s.take(nums), nil
 	}
 
-	line, err := readSSEStatsLine(s.br)
+	line, err := upstream.ReadSSELine(s.br)
 	if err != nil && !errors.Is(err, io.EOF) {
-		return 0, err // 超长行 / 读错误：上抛，不拷贝部分行
+		// 超长行 / 读错误：上抛，不拷贝部分行。
+		return 0, fmt.Errorf("stats sse line: %w", err)
 	}
 
 	if line != "" {
 		s.parseSSELine(line)
-		s.pend = []byte(line)
-		n := copy(nums, s.pend)
-		s.pend = s.pend[n:]
+		s.pend = line
 
-		return n, nil
+		return s.take(nums), nil
 	}
 
-	return 0, err
+	if err == nil {
+		return 0, nil
+	}
+	// 结尾无剩余数据：保持 io.EOF 原样，上层流循环据此判定正常结束。
+	return 0, io.EOF
 }
 
-// readSSEStatsLine 读一行，单行超过 upstream.MaxSSELineBytes 时返回
-// upstream.ErrSSELineTooLong（issue #113）。语义对齐 ReadString：行尾不带 '\n'
-// 时返回该行 + io.EOF。自己按 chunk 累积，超限立即失败（ReadString 的字符串
-// 拼接会把超长行 concat 成任意大小）。
-func readSSEStatsLine(br *bufio.Reader) (string, error) {
-	var builder strings.Builder
+// take 把已读未返回的行拷进 dst 并推进偏移，返回本次交付字节数。
+//
+// pend 保持 string：copy([]byte, string) 是内建允许的方向，不需要先转 []byte，
+// 每帧省一次整行转换分配 + 一次额外 memcpy（流式请求每帧都会走这里）。
+func (s *chatStatsReader) take(dst []byte) int {
+	n := copy(dst, s.pend)
+	s.pend = s.pend[n:]
 
-	for {
-		chunk, err := br.ReadSlice('\n')
-		if builder.Len()+len(chunk) > upstream.MaxSSELineBytes {
-			return "", fmt.Errorf("%w: > %d bytes", upstream.ErrSSELineTooLong, upstream.MaxSSELineBytes)
-		}
-
-		builder.Write(chunk)
-
-		if err == nil {
-			return builder.String(), nil
-		}
-
-		if errors.Is(err, bufio.ErrBufferFull) {
-			continue
-		}
-
-		return builder.String(), err
-	}
+	return n
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
@@ -675,18 +658,6 @@ func rewriteModel(body []byte, bare string) []byte {
 	}
 
 	return out
-}
-
-// parseModelFromBody 从请求 JSON 取 model 字段，缺省标 "-"。
-func parseModelFromBody(body []byte) string {
-	var obj struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &obj); err != nil || obj.Model == "" {
-		return "-"
-	}
-
-	return obj.Model
 }
 
 // usageDeltaFromResponse 从非流式聚合响应中提取明确存在的 token 字段。
@@ -906,6 +877,16 @@ func (o *responseObserver) Write(p []byte) (int, error) {
 	}
 
 	return o.ResponseWriter.Write(p)
+}
+
+// WriteString 同 recoveryWriter：不显式转发就不能提升底层的 io.StringWriter，
+// SSE 每帧的载荷会被 io.WriteString 退化成一整份 []byte 拷贝。
+func (o *responseObserver) WriteString(data string) (int, error) {
+	if o.status == 0 {
+		o.status = http.StatusOK
+	}
+
+	return io.WriteString(o.ResponseWriter, data) //nolint:wrapcheck // io.Writer 实现原样透传错误
 }
 
 func (o *responseObserver) Flush() {

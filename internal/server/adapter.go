@@ -113,19 +113,28 @@ func (r *httpResponder) Header(name, value string) {
 func (r *httpResponder) Stream(
 	rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string),
 ) error {
-	opts := make([]upstream.StreamOption, 0, 2)
-	if onErrFrame != nil {
-		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
-	}
-
-	opts = append(opts, upstream.WithMarkupRepair(repair))
-	if r.keepalive > 0 {
-		opts = append(opts, upstream.WithKeepaliveInterval(r.keepalive))
-	}
-
+	opts := streamHintOptions(r.keepalive, repair, onErrFrame)
 	if err := upstream.StreamHint(r.w, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}
 
 	return nil
+}
+
+// streamHintOptions 组装 StreamHint 的旁路选项（error 帧观察 → 标记修复 → 保活）。
+// 四路响应编码器共用同一口径，避免各自维护一份选项拼装顺序。
+func streamHintOptions(
+	keepalive time.Duration, repair *upstream.MarkupRepair, onErrFrame func(string),
+) []upstream.StreamOption {
+	opts := make([]upstream.StreamOption, 0, 3)
+	if onErrFrame != nil {
+		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
+	}
+
+	opts = append(opts, upstream.WithMarkupRepair(repair))
+	if keepalive > 0 {
+		opts = append(opts, upstream.WithKeepaliveInterval(keepalive))
+	}
+
+	return opts
 }

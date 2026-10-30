@@ -12,9 +12,11 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 )
 
 // ContinueOpener 发起一次续写请求；partial 是已输出的正文。
@@ -37,20 +39,57 @@ type TextContinueReader struct {
 	continueTried bool
 	continued     bool
 	continuation  bool
-	done          bool
-	err           error
+	// streamGen 每次切换底层流（续写）+1：Read 用它判断「本行处理期间流已换」，
+	// 而不是比较 reader 指针——切换实现为同一条 bufio Reset，指针不变。
+	streamGen uint64
+	done      bool
+	released  bool
+	err       error
+}
+
+// continueReaderPool 续写层 64KB 行缓冲的复用池。
+//
+// 归还点不能放在 Close：keepalive 路径会在读 goroutine 仍阻塞在上游 Read 时先
+// Close 底层流解阻塞（见 streamWithKeepalive），此刻把缓冲放回池就会与仍在读的
+// goroutine 撞车。调用方必须在 Stream 返回后调用 Release——那时 Stream 已保证
+// 读 goroutine 退出。
+var continueReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, 64*1024) },
 }
 
 // NewTextContinueReader 包装上游流。initialText 是 ProbeStream 已消费的正文。
+//
+// 行缓冲从 continueReaderPool 取（64KB，每流一次）；调用方在 Stream 返回后必须
+// 调 Release 归还，见该方法的说明。
 func NewTextContinueReader(
 	src io.ReadCloser, initialText string, hasTool bool, open ContinueOpener,
 ) *TextContinueReader {
+	reader, _ := continueReaderPool.Get().(*bufio.Reader)
+	if reader == nil {
+		reader = bufio.NewReaderSize(nil, 64*1024)
+	}
+
+	reader.Reset(src)
+
 	r := &TextContinueReader{
-		src: src, reader: bufio.NewReaderSize(src, 64*1024), open: open, hasTool: hasTool,
+		src: src, reader: reader, open: open, hasTool: hasTool,
 	}
 	r.text.WriteString(initialText)
 
 	return r
+}
+
+// Release 归还行缓冲（幂等）。只能在整个流确实读完之后调用：调用方在 Stream
+// 返回后调——那之后本 reader 不会再被读。
+func (c *TextContinueReader) Release() {
+	if c == nil || c.released {
+		return
+	}
+
+	c.released = true
+	c.done = true
+	c.reader.Reset(nil)
+	continueReaderPool.Put(c.reader)
 }
 
 // Read 实现 io.Reader：优先返回内部缓冲，行级解析并改写终态。
@@ -66,26 +105,47 @@ func (c *TextContinueReader) Read(dst []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		readerBefore := c.reader
-		line, err := c.reader.ReadString('\n')
+		genBefore := c.streamGen
+		line, err := ReadSSELine(c.reader)
+
+		// 单行超限（issue #113）：与 stream / Aggregate 同口径，按上游失败上抛。
+		// 此前这里用 ReadString，超长无换行行会被无上限拼接，是本路径唯一的
+		// 无界内存点；超限后也不尝试续写（续写段同样在此处读取）。
+		if errors.Is(err, ErrSSELineTooLong) {
+			c.err = err
+			c.done = true
+
+			continue
+		}
+
 		c.handleLine(line)
 
-		if err != nil {
-			// handleLine 内已成功切到续写流时，旧 reader 的 EOF/读错误不得终止新的
-			// 读取循环：否则续写段会被直接丢弃（无尾随换行的 [DONE] 尤其常见）。
-			if c.reader != readerBefore {
-				continue
-			}
-
-			c.handleEOF()
-
-			if err != io.EOF {
-				c.err = err
-			}
+		if err != nil && !c.afterReadError(genBefore, err) {
+			continue
 		}
 	}
 
 	return c.out.Read(dst)
+}
+
+// afterReadError 处理读错误并返回是否继续读取同一循环。
+//
+// handleLine 内已成功切到续写流时（streamGen 变化），旧流的 EOF/读错误不得终止
+// 新的读取循环：否则续写段会被直接丢弃（无尾随换行的 [DONE] 尤其常见），故返回
+// false 让调用方继续读新流。其余情况按 EOF / 真错误收尾，补发暂存帧与续写也由
+// handleEOF 负责。
+func (c *TextContinueReader) afterReadError(genBefore uint64, err error) bool {
+	if c.streamGen != genBefore {
+		return false
+	}
+
+	c.handleEOF()
+
+	if !errors.Is(err, io.EOF) {
+		c.err = err
+	}
+
+	return true
 }
 
 // Close 关闭当前上游流。
@@ -97,26 +157,17 @@ func (c *TextContinueReader) Close() error {
 	return c.src.Close()
 }
 
-// handleLine 处理一行：解析 finish_reason/正文，必要时暂存 length 终态。
-//
-//nolint:cyclop,funlen,gocyclo // 行类型分派 + 终态暂存，保持单入口避免状态散落。
+// handleLine 处理一行：非 data 行原样透传，data 行按 [DONE] / JSON 帧分派。
 func (c *TextContinueReader) handleLine(line string) {
-	trimmed := strings.TrimRight(line, "\r\n")
-	if !strings.HasPrefix(trimmed, "data: ") {
+	payload, isData := sseDataPayload(strings.TrimRight(line, "\r\n"))
+	if !isData {
 		c.out.WriteString(line)
 
 		return
 	}
 
-	payload := strings.TrimPrefix(trimmed, "data: ")
-	if payload == "[DONE]" {
-		if c.finishLength && !c.continued {
-			if c.tryContinue() {
-				return
-			}
-		}
-
-		c.out.WriteString(line)
+	if sseDone(payload) {
+		c.handleDone(line)
 
 		return
 	}
@@ -130,6 +181,21 @@ func (c *TextContinueReader) handleLine(line string) {
 		return
 	}
 
+	c.handleFrame(line, frame)
+}
+
+// handleDone 处理 [DONE]：首段因 length 截断且尚未续写时，先换流续写并吞掉本行；
+// 否则原行透传。
+func (c *TextContinueReader) handleDone(line string) {
+	if c.finishLength && !c.continued && c.tryContinue() {
+		return
+	}
+
+	c.out.WriteString(line)
+}
+
+// handleFrame 处理 JSON 帧：错误帧原样重编码，正常帧按是否需要改写决定透传方式。
+func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 	c.captureMeta(frame)
 
 	if _, hasErr := frame["error"]; hasErr {
@@ -138,7 +204,7 @@ func (c *TextContinueReader) handleLine(line string) {
 		return
 	}
 
-	if _, _, isErr := BusinessFrameError(payload); isErr {
+	if _, _, isErr := frameBusinessError(frame); isErr {
 		c.writeFrameJSON(frame)
 
 		return
@@ -148,6 +214,14 @@ func (c *TextContinueReader) handleLine(line string) {
 
 	if c.finishLength && !c.continued {
 		c.holdLengthFrame(line, frame)
+
+		return
+	}
+
+	// 非续写段不需要改写 id/model/usage：整行原样透传，省掉每帧一次 marshal
+	// （续写段才走 writeFrameJSON 的重编码）。
+	if !c.continuation {
+		c.out.WriteString(line)
 
 		return
 	}
@@ -447,7 +521,11 @@ func (c *TextContinueReader) tryContinue() bool {
 
 	_ = c.src.Close()
 	c.src = next
-	c.reader = bufio.NewReaderSize(next, 64*1024)
+	// 复用同一条 64KB 行缓冲：老流的残留（被截断的尾巴）本就该丢弃，
+	// Reset 与新建 reader 的语义一致，省掉续写路径上的一次 64KB 分配。
+	// streamGen 必须同时 +1，Read 靠它识别流已切换。
+	c.reader.Reset(next)
+	c.streamGen++
 	c.continued = true
 	c.continuation = true
 	c.finishLength = false

@@ -374,6 +374,65 @@ func TestReadProbeLineMatchesReadString(t *testing.T) {
 	}
 }
 
+// holdOpenReader 交付完预置内容后阻塞，直到 release 被关闭——模拟上游在
+// [DONE] 之后复用连接、不主动关流。
+type holdOpenReader struct {
+	r       *strings.Reader
+	release chan struct{}
+}
+
+func (h *holdOpenReader) Read(p []byte) (int, error) {
+	if h.r.Len() > 0 {
+		return h.r.Read(p) //nolint:wrapcheck // 测试用 Reader：原样透传读取结果
+	}
+
+	<-h.release
+
+	return 0, io.EOF
+}
+
+// TestReadProbeStreamDoneWithTrailingSpaceStops 终止帧带尾随空白时也必须收尾：
+// 严格等值会把 "[DONE] " 当噪声继续读，上游不关连接时探测要等到超时才结束，
+// 把可用模型判成解析失败。
+func TestReadProbeStreamDoneWithTrailingSpaceStops(t *testing.T) {
+	t.Parallel()
+
+	rc := &holdOpenReader{
+		r: strings.NewReader(
+			"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+				"data: [DONE] \n\n",
+		),
+		release: make(chan struct{}),
+	}
+
+	defer close(rc.release)
+
+	type probeResult struct {
+		ttft  int64
+		class string
+	}
+
+	done := make(chan probeResult, 1)
+
+	go func() {
+		ttft, _, class, _ := readProbeStream(time.Now(), rc)
+		done <- probeResult{ttft: ttft, class: class}
+	}()
+
+	select {
+	case got := <-done:
+		if got.class != "" {
+			t.Fatalf("class=%q want 成功（终止帧应被识别）", got.class)
+		}
+
+		if got.ttft <= 0 {
+			t.Errorf("ttft=%d want > 0", got.ttft)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("尾随空白的 [DONE] 未被识别，探测仍在等待更多数据")
+	}
+}
+
 // TestReadProbeStreamOverlongLine 无换行超长行按读取上限截断，按解析失败记录。
 func TestReadProbeStreamOverlongLine(t *testing.T) {
 	t.Parallel()

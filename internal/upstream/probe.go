@@ -11,8 +11,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
+	"sync"
 )
 
 // StreamProbe 预览结果。
@@ -31,6 +33,9 @@ type StreamProbe struct {
 	Text string
 	// HasTool 预览阶段是否出现工具调用（有工具时不做正文续写）。
 	HasTool bool
+	// SizeLimited 预览阶段撞上单行上限（MaxSSELineBytes，issue #113）：已读字节
+	// 不再回放，由 handler 按 upstream_parse 收尾并换号。与透传层同一哨兵语义。
+	SizeLimited bool
 	// passThrough 已出现合法终态（如 content_filter）但无正文：直接透传，
 	// 不按账号故障轮转。
 	passThrough bool
@@ -40,7 +45,12 @@ type StreamProbe struct {
 }
 
 // Reader 返回「已预览字节 + 上游剩余流」的读取器。
+// Release 之后上游剩余流不再可达，只剩已预览字节。
 func (p *StreamProbe) Reader() io.Reader {
+	if p.reader == nil {
+		return bytes.NewReader(p.buffered)
+	}
+
 	return io.MultiReader(bytes.NewReader(p.buffered), p.reader)
 }
 
@@ -69,12 +79,67 @@ func (p *probedReadCloser) Close() error {
 // 无界缓冲）。正常首帧/首个正文远小于该值。
 const probeMaxBytes = 256 * 1024
 
+// probeReaderSize 预览行缓冲大小：4KB（不是 sseReaderPool 那档 64KB）。
+const probeReaderSize = 4 * 1024
+
+// probeReaderPool 预览行缓冲的复用池：每请求一条、随请求存活整条流，
+// 不池化就是每请求一次 4KB 垃圾（流式 B/op 里除 JSON 解码外最大的一笔）。
+//
+// 归还点不能放在 probedReadCloser.Close：keepalive 路径会先 Close 底层流解阻塞、
+// 再等读 goroutine 退出（见 streamWithKeepalive），此刻 reader 可能正被读。
+// 调用方必须在流结束后调 Release。
+var probeReaderPool = sync.Pool{
+	New: func() any { return bufio.NewReaderSize(nil, probeReaderSize) },
+}
+
+// getProbeReader 取一条预览行缓冲（池未命中时新建）。
+func getProbeReader() *bufio.Reader {
+	reader, _ := probeReaderPool.Get().(*bufio.Reader)
+	if reader == nil {
+		return bufio.NewReaderSize(nil, probeReaderSize)
+	}
+
+	return reader
+}
+
+// Release 归还预览行缓冲（幂等、nil 安全）。只能在整个流确实读完之后调用。
+func (p *StreamProbe) Release() {
+	if p == nil || p.reader == nil {
+		return
+	}
+
+	p.reader.Reset(nil)
+	probeReaderPool.Put(p.reader)
+
+	p.reader = nil
+}
+
 // ProbeStream 预览上游 SSE 流。返回的 StreamProbe 总可安全调用 Reader。
+//
+// 行缓冲 4KB 而不是 64KB：预览阶段只需读到首个实质输出（通常一两帧），而预览
+// 结束后这条 reader 只做透传——下游 stats/SSE 都以 ≥4KB 的缓冲读它，bufio 在
+// 「缓冲空 + 请求长度 ≥ 缓冲大小」时直接读到目标切片，所以 64KB 缓冲在这里既
+// 不会被填满（纯白占内存），也不省 syscall。缓冲本身跨请求复用（probeReaderPool），
+// 调用方在流结束后必须 Release。
+// 超长单行（>4KB）由 ReadSSELine 的分片收集处理，超过 MaxSSELineBytes 即失败。
 func ProbeStream(r io.Reader) *StreamProbe {
-	probe := &StreamProbe{reader: bufio.NewReaderSize(r, 64*1024)}
+	reader := getProbeReader()
+	reader.Reset(r)
+
+	probe := &StreamProbe{reader: reader}
 
 	for len(probe.buffered) < probeMaxBytes {
-		line, err := probe.reader.ReadString('\n')
+		// 用 ReadSSELine 而不是 ReadString：单行超过 MaxSSELineBytes 时立即失败，
+		// 不再无上限拼接——预览窗口的总量上限是「读完一行之后」才判的，挡不住
+		// 单行把内存撑到任意大小（issue #113 的同一类风险）。
+		line, err := ReadSSELine(probe.reader)
+		if errors.Is(err, ErrSSELineTooLong) {
+			// 部分行已从 bufio 消费掉：不能回放（会把半行拼给客户端），
+			// 直接交给 handler 按上游失败收尾。
+			probe.SizeLimited = true
+
+			return probe
+		}
 
 		probe.buffered = append(probe.buffered, line...)
 		probe.inspectLine(line)
@@ -98,13 +163,12 @@ func ProbeStream(r io.Reader) *StreamProbe {
 
 // inspectLine 解析一行：出现实质输出即视为可放行；error/业务错误/零输出终止预览。
 func (p *StreamProbe) inspectLine(line string) {
-	line = strings.TrimRight(line, "\r\n")
-	if !strings.HasPrefix(line, "data: ") {
+	payload, ok := sseDataPayload(strings.TrimRight(line, "\r\n"))
+	if !ok {
 		return
 	}
 
-	payload := strings.TrimPrefix(line, "data: ")
-	if payload == "[DONE]" {
+	if sseDone(payload) {
 		if !p.hasSubstantive() {
 			p.Empty = true
 		}
@@ -128,7 +192,7 @@ func (p *StreamProbe) inspectLine(line string) {
 		return
 	}
 
-	if _, _, isErr := BusinessFrameError(payload); isErr {
+	if _, _, isErr := frameBusinessError(frame); isErr {
 		p.Kind = FrameKind(payload)
 		if p.Kind == ErrNone {
 			p.Kind = ErrClient

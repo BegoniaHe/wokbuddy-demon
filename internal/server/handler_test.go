@@ -596,6 +596,142 @@ func TestChatStreamPassthrough(t *testing.T) {
 	assertChatSuccessUsage(t, handler.cfg.Pool, "u1")
 }
 
+// TestChatStreamKeepaliveReleasesContinueBuffer keepalive 路径 + 续写层同时在场时，
+// 行缓冲的归还必须发生在读 goroutine 退出之后：streamWithKeepalive 是「先 Close
+// 底层流解阻塞、再等 goroutine 退出」，若在 Close 时点归还，同一块缓冲可能被另一
+// 条并发流取走并与仍在读的 goroutine 撞车。这里并发跑多条静默流把心跳逼出来，
+// -race 下应零竞争，且各条流的内容互不串味。
+func TestChatStreamKeepaliveReleasesContinueBuffer(t *testing.T) {
+	t.Parallel()
+
+	fakeUp := &upstream.Client{HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		sink, source := io.Pipe()
+
+		go func() {
+			defer source.Close()
+
+			_, _ = io.WriteString(source,
+				"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n")
+
+			// 静默一段：心跳定时器与阻塞中的读 goroutine 真实并发。
+			time.Sleep(30 * time.Millisecond)
+
+			_, _ = io.WriteString(source,
+				"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好\"},"+
+					"\"finish_reason\":\"stop\"}]}\n\n")
+			_, _ = io.WriteString(source, "data: [DONE]\n\n")
+		}()
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       sink,
+		}, nil
+	})}, ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example"}
+
+	handler := NewHandler(&Config{
+		Pool:              testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:          fakeUp,
+		KeepaliveInterval: 5 * time.Millisecond,
+	})
+
+	const rounds = 4
+
+	bodies := make([]string, rounds)
+
+	var wait sync.WaitGroup
+
+	wait.Add(rounds)
+
+	for i := range rounds {
+		go func() {
+			defer wait.Done()
+
+			rec := postChat(t, handler, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+			bodies[i] = rec.Body.String()
+		}()
+	}
+
+	wait.Wait()
+
+	for i, body := range bodies {
+		if !strings.Contains(body, ": keepalive") {
+			t.Errorf("第 %d 条流缺心跳注释帧，keepalive 路径未被覆盖", i)
+		}
+
+		if !strings.Contains(body, "你") || !strings.Contains(body, "好") {
+			t.Errorf("第 %d 条流 body=%q want 两段正文", i, body)
+		}
+
+		if !strings.Contains(body, "data: [DONE]") {
+			t.Errorf("第 %d 条流缺终止帧: %q", i, body)
+		}
+	}
+}
+
+// failAfterFirstWrite 首次写成功后一律失败：把「主循环已退出、读 goroutine 仍
+// 阻塞在上游读」这个时点固定下来（预览/续写行缓冲的归还点必须晚于它）。
+type failAfterFirstWrite struct {
+	header http.Header
+
+	writes int
+}
+
+func (w *failAfterFirstWrite) Header() http.Header { return w.header }
+
+func (w *failAfterFirstWrite) WriteHeader(int) {}
+
+func (w *failAfterFirstWrite) Write(chunk []byte) (int, error) {
+	w.writes++
+	if w.writes > 1 {
+		return 0, io.ErrClosedPipe
+	}
+
+	return len(chunk), nil
+}
+
+// TestChatStreamKeepaliveReleaseWithBlockedRead 把缓冲归还时点固定在最危险的形态：
+// 主循环因客户端写失败提前退出、读 goroutine 仍阻塞在该上游流的读里。
+// upstream.streamWithKeepalive 是「先 Close 解阻塞、再等 goroutine 退出」，
+// 若预览行缓冲在 Close 时点归还，同一块缓冲会被下一条流取走并与仍在读的
+// goroutine 撞车；归还点必须晚于 Stream 返回。-race 下应零竞争。
+func TestChatStreamKeepaliveReleaseWithBlockedRead(t *testing.T) {
+	t.Parallel()
+
+	fakeUp := &upstream.Client{HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		sink, source := io.Pipe()
+
+		t.Cleanup(func() { _ = source.Close() })
+
+		go func() {
+			_, _ = io.WriteString(source,
+				"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你\"}}]}\n\n")
+			// 之后保持静默：读 goroutine 停在本次上游读上，直到 Close 解阻塞。
+		}()
+
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       sink,
+		}, nil
+	})}, ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example"}
+
+	handler := NewHandler(&Config{
+		Pool:              testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:          fakeUp,
+		KeepaliveInterval: 5 * time.Millisecond,
+	})
+
+	w := &failAfterFirstWrite{header: http.Header{}}
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+
+	// 首帧 + 至少一次心跳：确认确实是「心跳写失败后才收尾」这条路径。
+	if w.writes < 2 {
+		t.Fatalf("writes=%d want >=2（未走到心跳写失败收尾）", w.writes)
+	}
+}
+
 // TestChatStreamRecordsTTFT 流式成功时 TTFT 采样写入账号摘要与 usage 时序（issue #16）。
 func TestChatStreamRecordsTTFT(t *testing.T) {
 	t.Parallel()
@@ -953,7 +1089,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
+	// bad 占满唯一在途名额：PickByUIDForModel 返回不可用（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
 	state.SetMaxInFlight(1)
 	state.Acquire("bad")
 

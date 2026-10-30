@@ -2229,3 +2229,36 @@ func TestStreamMultiLineDataEventSizeLimit(t *testing.T) {
 		t.Fatalf("missing DONE: %s", body)
 	}
 }
+
+// 上游可能发 "data:{...}"（无空格）：所有读取路径统一经 sseDataPayload 归一。
+// 聚合路径曾只认 "data: "，这类上游的非流式请求会被判空流（errEmptyStream）。
+func TestStreamAggregatorAcceptsDataWithoutSpace(t *testing.T) {
+	t.Parallel()
+
+	agg := newStreamAggregator()
+
+	done, err := agg.handleLine(`data:{"id":"c1","model":"m","choices":[{"delta":{"content":"hi"}}]}`)
+	if err != nil || done {
+		t.Fatalf("content frame done=%v err=%v", done, err)
+	}
+
+	done, err = agg.handleLine("data:[DONE]")
+	if err != nil || !done {
+		t.Fatalf("[DONE] done=%v err=%v", done, err)
+	}
+
+	resp, err := agg.result()
+	if err != nil {
+		t.Fatalf("result: %v", err)
+	}
+
+	choices, _ := resp["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices=%v", resp["choices"])
+	}
+
+	message, _ := choices[0].(map[string]any)["message"].(map[string]any)
+	if message["content"] != "hi" {
+		t.Fatalf("content=%v want hi", message["content"])
+	}
+}

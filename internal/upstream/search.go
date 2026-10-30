@@ -58,14 +58,12 @@ const (
 	SearchMaxDomainLen = 253
 )
 
-// SearchResult 单条搜索结果。
-// site / favicon 是上游可选字段（官方客户端同样按「有才带」处理）。
+// SearchResult 单条搜索结果。上游响应里的 site / favicon 不在这里声明：
+// 网关只消费 title/url/snippet 组装 Anthropic 搜索块，多余字段解码时直接忽略。
 type SearchResult struct {
 	Title   string `json:"title"`
 	URL     string `json:"url"`
 	Snippet string `json:"snippet,omitempty"`
-	Site    string `json:"site,omitempty"`
-	Favicon string `json:"favicon,omitempty"`
 }
 
 // SearchOutcome 一次搜索的完整结果，字段名与上游响应一致，便于直接透出。

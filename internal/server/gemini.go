@@ -456,10 +456,11 @@ type geminiGenerationConfig struct {
 	ThinkingConfig     *geminiThinkingConfig `json:"thinkingConfig"`
 }
 
+// geminiThinkingConfig 客户端 thinkingConfig 中映射到上游的两个维度。
+// includeThoughts 不映射（网关不控制思考过程回传），解码时忽略。
 type geminiThinkingConfig struct {
-	ThinkingBudget  *int   `json:"thinkingBudget"`
-	ThinkingLevel   string `json:"thinkingLevel"`
-	IncludeThoughts *bool  `json:"includeThoughts"`
+	ThinkingBudget *int   `json:"thinkingBudget"`
+	ThinkingLevel  string `json:"thinkingLevel"`
 }
 
 func geminiApplyGeneration(out map[string]any, raw json.RawMessage) {
@@ -890,16 +891,7 @@ func (g *geminiResponder) Stream(
 ) error {
 	writer := newGeminiStreamWriter(g.w, g.model)
 
-	opts := make([]upstream.StreamOption, 0, 2)
-	if onErrFrame != nil {
-		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
-	}
-
-	opts = append(opts, upstream.WithMarkupRepair(repair))
-	if g.keepalive > 0 {
-		opts = append(opts, upstream.WithKeepaliveInterval(g.keepalive))
-	}
-
+	opts := streamHintOptions(g.keepalive, repair, onErrFrame)
 	if err := upstream.StreamHint(writer, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}
@@ -1139,31 +1131,7 @@ func (g *geminiStreamWriter) handleLine(line string) error {
 		return nil
 	}
 
-	if strings.HasPrefix(line, ":") {
-		if _, err := io.WriteString(g.w, line+"\n\n"); err != nil {
-			return fmt.Errorf("handleLine: %w", err)
-		}
-
-		g.Flush()
-
-		return nil
-	}
-
-	payload, ok := strings.CutPrefix(line, "data: ")
-	if !ok {
-		payload, ok = strings.CutPrefix(line, "data:")
-	}
-
-	if !ok {
-		return nil
-	}
-
-	payload = strings.TrimSpace(payload)
-	if payload == "[DONE]" {
-		return g.finish()
-	}
-
-	return g.handleChunk(payload)
+	return handleSSELine(g.w, g.fl, line, g.finish, g.handleChunk)
 }
 
 func (g *geminiStreamWriter) handleChunk(payload string) error {

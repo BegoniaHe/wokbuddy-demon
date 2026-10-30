@@ -109,7 +109,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	defer putSSEReader(reader)
 
 	for {
-		line, err := readSSELine(reader)
+		line, err := ReadSSELine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, err
 		}
@@ -169,15 +169,33 @@ func newStreamAggregator() *streamAggregator {
 	}
 }
 
+// sseDataPayload 取 SSE "data:" 行的载荷。SSE 规范允许 "data:" 后不带空格，
+// 上游两种形态都实测出现过（见 handleStreamLine 的 "data:" 分支），各读取路径
+// 统一经这里归一，避免有的路径认无空格形态、有的整段漏掉。
+func sseDataPayload(line string) (string, bool) {
+	payload, ok := strings.CutPrefix(line, "data:")
+	if !ok {
+		return "", false
+	}
+
+	return strings.TrimPrefix(payload, " "), true
+}
+
+// sseDone 判断 data 载荷是否为流终止标记。上游偶发尾随空白（"[DONE] "、"\r" 残留），
+// 严格等值会让聚合路径继续读到 EOF 并判成截断流，故按去空白后比较。
+func sseDone(payload string) bool {
+	return strings.TrimSpace(payload) == "[DONE]"
+}
+
 // handleLine 处理一行：data: 帧解析聚合，[DONE] 返回 true（调用方停止读取）。
 // 聚合总量超限时返回 ErrSSEAggregateTooLong（issue #113）。
 func (a *streamAggregator) handleLine(line string) (bool, error) {
-	if !strings.HasPrefix(line, "data: ") {
+	payload, ok := sseDataPayload(line)
+	if !ok {
 		return false, nil
 	}
 
-	payload := strings.TrimPrefix(line, "data: ")
-	if payload == "[DONE]" {
+	if sseDone(payload) {
 		// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
 		a.sawDone = true
 		return true, nil
@@ -207,11 +225,13 @@ func (a *streamAggregator) handleChunk(chunk map[string]any) error {
 		return &FrameError{Payload: string(payload)}
 	}
 	// 顶层 {code,msg} 业务错误帧：与 error 帧同口径上抛，不能聚合成功（issue #244）。
-	payload, err := json.Marshal(chunk)
-	if err == nil {
-		if _, _, isErr := BusinessFrameError(string(payload)); isErr {
-			return &FrameError{Payload: string(payload)}
+	if _, _, isErr := frameBusinessError(chunk); isErr {
+		payload, err := json.Marshal(chunk)
+		if err != nil {
+			return fmt.Errorf("marshal business error frame: %w", err)
 		}
+
+		return &FrameError{Payload: string(payload)}
 	}
 
 	a.mergeChunkMeta(chunk)
@@ -738,63 +758,61 @@ func appendStringIfNonEmpty(dst, src map[string]any, key string) {
 // 若空 name 的首片就占用该配额，真正的 name 会被当成重复而删掉，客户端最终拿到
 // 没有 name 的调用（Anthropic 面会整块丢弃 tool_use）。空 name 键本身是噪声，
 // 直接删掉但不占配额。
-//
-//nolint:gocognit // 工具名去重按 index/片段/空名分层，顺序即语义。
 func stripToolCallNames(obj map[string]any, tools *toolIndex, seen map[int]bool) {
-	choices, _ := obj["choices"].([]any)
-	for _, ci := range choices {
-		c, _ := ci.(map[string]any)
-		if c == nil {
-			continue
-		}
+	forEachToolCallDelta(obj, tools, func(idx int, table map[string]any) {
+		// OpenAI 流要求每片 tool_call 带 index；上游省略时按解析结果补齐，
+		// 否则 SDK 的累加器拿到 None index 会丢调用。写 float64 与 JSON 解码
+		// 形态一致：trackMaxToolIdx 等下游按 float64 读取。
+		table["index"] = float64(idx)
 
-		delta, _ := c["delta"].(map[string]any)
-		if delta == nil {
-			continue
-		}
-
-		tcs, _ := delta["tool_calls"].([]any)
-		for _, tci := range tcs {
-			table, _ := tci.(map[string]any)
-			if table == nil {
-				continue
+		fn, _ := table["function"].(map[string]any)
+		if seen[idx] {
+			// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
+			if fn != nil {
+				delete(fn, "name")
 			}
 
-			idx := tools.resolve(table)
-			// OpenAI 流要求每片 tool_call 带 index；上游省略时按解析结果补齐，
-			// 否则 SDK 的累加器拿到 None index 会丢调用。写 float64 与 JSON 解码
-			// 形态一致：trackMaxToolIdx 等下游按 float64 读取。
-			table["index"] = float64(idx)
-			if seen[idx] {
-				// 已发过首片：删除本分片的 name 键（存在即删，幂等）。
-				if fn, _ := table["function"].(map[string]any); fn != nil {
-					delete(fn, "name")
-				}
-
-				continue
-			}
-
-			fn, _ := table["function"].(map[string]any)
-			if name, _ := fn["name"].(string); name == "" {
-				// 空 name（键缺失/空串）：本片不占用「已下发」配额，name 可能随后片到达。
-				if fn != nil {
-					delete(fn, "name")
-				}
-
-				continue
-			}
-
-			seen[idx] = true
+			return
 		}
-	}
+
+		if name, _ := fn["name"].(string); name == "" {
+			// 空 name（键缺失/空串）：本片不占用「已下发」配额，name 可能随后片到达。
+			if fn != nil {
+				delete(fn, "name")
+			}
+
+			return
+		}
+
+		seen[idx] = true
+	})
 }
 
 // stripToolCallIDs 去除同一 tool_call index 后续分片里重复的 id 键。
 // 官方流首片带 id，后续分片可能重复携带同一 id；累加型客户端会把 id 当字符串
 // 拼接。保留首个 id，后续同 index 的 id 键删除。
-//
-//nolint:gocognit // 工具调用 id 去重按 index/片段/空名分层，顺序即语义。
 func stripToolCallIDs(obj map[string]any, tools *toolIndex, seen map[int]string) {
+	forEachToolCallDelta(obj, tools, func(idx int, table map[string]any) {
+		cid, _ := table["id"].(string)
+
+		if first, ok := seen[idx]; ok {
+			if cid != "" && cid == first {
+				delete(table, "id")
+			}
+
+			return
+		}
+
+		if cid != "" {
+			seen[idx] = cid
+		}
+	})
+}
+
+// forEachToolCallDelta 遍历本帧 choices[].delta.tool_calls[]，把解出的 index 与
+// tool_call 对象交给 visit。index 由 toolIndex 统一解析（兼容上游省略 index 的
+// 形态），因此两个去重函数共用同一套归属规则。
+func forEachToolCallDelta(obj map[string]any, tools *toolIndex, visit func(idx int, table map[string]any)) {
 	choices, _ := obj["choices"].([]any)
 	for _, ci := range choices {
 		c, _ := ci.(map[string]any)
@@ -814,20 +832,7 @@ func stripToolCallIDs(obj map[string]any, tools *toolIndex, seen map[int]string)
 				continue
 			}
 
-			idx := tools.resolve(table)
-
-			cid, _ := table["id"].(string)
-			if first, ok := seen[idx]; ok {
-				if cid != "" && cid == first {
-					delete(table, "id")
-				}
-
-				continue
-			}
-
-			if cid != "" {
-				seen[idx] = cid
-			}
+			visit(tools.resolve(table), table)
 		}
 	}
 }
@@ -1149,6 +1154,8 @@ func (s *streamWriter) setWriteDeadline(deadline time.Time) {
 		return
 	}
 
+	// 不缓存 ResponseController：它不逃逸，逐帧构造留在栈上；缓存进字段反而
+	// 让这唯一一份逃逸到堆（实测每流多 1 分配，逐帧零收益）。
 	_ = http.NewResponseController(s.w).SetWriteDeadline(deadline)
 }
 
@@ -1357,8 +1364,6 @@ func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall)
 // writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 // 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
 // 降级原样写出，但不计数）。
-//
-//nolint:cyclop,gocognit,gocyclo // 帧类型按 error/业务错误/修复/普通分派，线性更直观。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil || obj == nil {
@@ -1375,29 +1380,12 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 	// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
 	// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
 	if _, hasErr := obj["error"]; hasErr {
-		// 旁路通知（账号处置用）：原始 payload 交给观察者，透传字节不变。
-		if s.opts.onErrorFrame != nil {
-			s.opts.onErrorFrame(payload)
-		}
-
-		if werr := s.writeRaw(payload); werr != nil {
-			return 0, werr
-		}
-
-		return 1, nil
+		return s.emitErrorFrame(payload, payload)
 	}
 	// 顶层 {code,msg} 业务错误帧（issue #244）：原帧若直接走白名单会被洗成空
 	// chunk。观察者拿原始 payload 分类，客户端拿带原始 code/msg 的 error 帧。
-	if code, msg, isErr := BusinessFrameError(payload); isErr {
-		if s.opts.onErrorFrame != nil {
-			s.opts.onErrorFrame(payload)
-		}
-
-		if werr := s.writeRaw(BusinessErrorFrame(payload, code, msg)); werr != nil {
-			return 0, werr
-		}
-
-		return 1, nil
+	if code, msg, isErr := frameBusinessError(obj); isErr {
+		return s.emitErrorFrame(payload, BusinessErrorFrame(payload, code, msg))
 	}
 
 	frames := s.repairFrame(obj)
@@ -1413,6 +1401,20 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 		if werr := s.writeChunk(ch, payload); werr != nil {
 			return 0, werr
 		}
+	}
+
+	return 1, nil
+}
+
+// emitErrorFrame 写出一个错误帧并计一次有效转发：观察者（账号处置用）拿到的
+// 始终是上游原始 payload，写出的是 out（error 帧即原文，业务错误帧是重编码形态）。
+func (s *streamWriter) emitErrorFrame(original, out string) (int, error) {
+	if s.opts.onErrorFrame != nil {
+		s.opts.onErrorFrame(original)
+	}
+
+	if werr := s.writeRaw(out); werr != nil {
+		return 0, werr
 	}
 
 	return 1, nil
@@ -1441,7 +1443,7 @@ func (s *streamWriter) stream(r io.Reader) error {
 	validFrames := 0
 
 	for {
-		line, err := readSSELine(reader)
+		line, err := ReadSSELine(reader)
 		if err != nil && !errors.Is(err, io.EOF) {
 			// 超长行（防御上限，issue #113）：先给客户端一个明确的 error 帧再收尾，
 			// 不把超限行的已读部分当内容透传（也不回退——那正是 OOM 的成因）。
@@ -1548,7 +1550,7 @@ func asyncLines(r io.Reader) (<-chan lineResult, chan struct{}, <-chan struct{})
 		defer putSSEReader(reader)
 
 		for {
-			line, err := readSSELine(reader)
+			line, err := ReadSSELine(reader)
 			select {
 			case lines <- lineResult{line: line, err: err}:
 			case <-done:
@@ -1603,10 +1605,8 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 	trimmed := strings.TrimRight(line, "\r\n")
 	switch {
 	case strings.HasPrefix(trimmed, "data:"):
-		payload := strings.TrimPrefix(trimmed, "data:")
-
-		payload = strings.TrimPrefix(payload, " ") // SSE 允许 "data:" 后不带空格
-		if strings.TrimSpace(payload) == "[DONE]" {
+		payload, _ := sseDataPayload(trimmed) // SSE 允许 "data:" 后不带空格
+		if sseDone(payload) {
 			// 先吐出已累积的多行 data，再结束；[DONE] 统一在收尾写一次。
 			n, werr := s.flushData()
 			if werr != nil {

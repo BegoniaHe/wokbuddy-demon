@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -113,10 +114,17 @@ const cjkRangeStart = 0x2E80
 
 // EstimatePromptTokens 粗略估算请求的 prompt token：ASCII ≈ 4 字节/token，
 // CJK ≈ 1.5 字节/token。只用于请求前预扣，不参与计费或 usage 统计。
+//
+// 直接在字节切片上解码：`for _, r := range string(body)` 会把整份请求体复制一份
+// （几十 KB 的体每次预扣白分配一次），逐 rune 解码零分配且更快。非法字节的
+// 处理与 range string 一致（RuneError + 宽度 1）。
 func EstimatePromptTokens(body []byte) int {
 	ascii, cjk := 0, 0
 
-	for _, r := range string(body) {
+	for len(body) > 0 {
+		r, size := utf8.DecodeRune(body)
+		body = body[size:]
+
 		if r >= cjkRangeStart {
 			cjk++
 		} else {

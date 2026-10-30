@@ -15,7 +15,7 @@ func req(authz string) *http.Request {
 	return r
 }
 
-func TestVerifyBearer(t *testing.T) {
+func TestAuthenticateDefaultKey(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -40,52 +40,52 @@ func TestVerifyBearer(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := VerifyBearer(req(c.authz), c.key); got != c.want {
-				t.Errorf("VerifyBearer(key=%q, authz=%q) = %v, want %v", c.key, c.authz, got, c.want)
+			if got := Authenticate(req(c.authz), c.key, nil).OK; got != c.want {
+				t.Errorf("Authenticate(key=%q, authz=%q) = %v, want %v", c.key, c.authz, got, c.want)
 			}
 		})
 	}
 }
 
-// TestVerifyBearerWithoutHeaderStillCompares 缺头路径不应因"提前返回"而暴露形状差异：
+// TestAuthenticateWithoutHeaderStillCompares 缺头路径不应因"提前返回"而暴露形状差异：
 // 这里只验证它确实返回 false 且不 panic（常量时间的性质无法用单测断言，靠实现保证）。
-func TestVerifyBearerWithoutHeaderStillCompares(t *testing.T) {
+func TestAuthenticateWithoutHeaderStillCompares(t *testing.T) {
 	t.Parallel()
 
-	if VerifyBearer(req(""), "any-key") {
+	if Authenticate(req(""), "any-key", nil).OK {
 		t.Error("missing header must not pass")
 	}
 }
 
-// TestVerifyBearerAcceptXAPIKey Anthropic SDK 的 api_key 模式只发 x-api-key，
+// TestAuthenticateAcceptXAPIKey Anthropic SDK 的 api_key 模式只发 x-api-key，
 // 与 Bearer 同口径比较；Authorization 优先。
-func TestVerifyBearerAcceptXAPIKey(t *testing.T) {
+func TestAuthenticateAcceptXAPIKey(t *testing.T) {
 	t.Parallel()
 
 	r := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 	r.Header.Set("X-Api-Key", "sk-anthropic")
 
-	if !VerifyBearer(r, "sk-anthropic") {
+	if !Authenticate(r, "sk-anthropic", nil).OK {
 		t.Error("x-api-key 正确密钥应通过")
 	}
 
 	r.Header.Set("X-Api-Key", "sk-wrong")
 
-	if VerifyBearer(r, "sk-anthropic") {
+	if Authenticate(r, "sk-anthropic", nil).OK {
 		t.Error("x-api-key 错误密钥不应通过")
 	}
 
 	r.Header.Set("X-Api-Key", "sk-anthropic")
 	r.Header.Set("Authorization", "Bearer sk-bearer")
 
-	if !VerifyBearer(r, "sk-bearer") {
+	if !Authenticate(r, "sk-bearer", nil).OK {
 		t.Error("Authorization 应优先于 x-api-key")
 	}
 
 	gemini := httptest.NewRequest(http.MethodPost, "/v1beta/models/x:generateContent", nil)
 	gemini.Header.Set("X-Goog-Api-Key", "sk-gemini")
 
-	if !VerifyBearer(gemini, "sk-gemini") {
+	if !Authenticate(gemini, "sk-gemini", nil).OK {
 		t.Error("x-goog-api-key 正确密钥应通过")
 	}
 }
@@ -190,17 +190,5 @@ func TestAuthenticateManagement(t *testing.T) {
 					got, item.wantOK, item.wantScope, item.wantDef)
 			}
 		})
-	}
-}
-
-func TestScopeAllowsRead(t *testing.T) {
-	t.Parallel()
-
-	if ScopeNone.AllowsRead() || ScopeData.AllowsRead() {
-		t.Error("none/data 不应允许管理面读取")
-	}
-
-	if !ScopeReadonly.AllowsRead() || !ScopeAdmin.AllowsRead() {
-		t.Error("readonly/admin 应允许管理面读取")
 	}
 }

@@ -30,7 +30,7 @@ func TestInjectPromptCacheKey_PreservesExisting(t *testing.T) {
 	in := `{"model":"glm-5.2","messages":[],"prompt_cache_key":"client-set-key"}`
 
 	// Act
-	out := InjectPromptCacheKey([]byte(in), uid, conv)
+	out := injectPromptCacheKey([]byte(in), uid, conv)
 
 	// Assert
 	if got := extractCacheKey(t, out); got != "client-set-key" {
@@ -48,7 +48,7 @@ func TestInjectPromptCacheKey_UsesConversationID(t *testing.T) {
 	uid := "user-abc-123"
 	str := `{"model":"glm-5.2","messages":[],"conversation_id":"conv-42"}`
 
-	out := InjectPromptCacheKey([]byte(str), uid, "")
+	out := injectPromptCacheKey([]byte(str), uid, "")
 
 	got := extractCacheKey(t, out)
 	if strings.Contains(got, "wb2a") {
@@ -59,14 +59,14 @@ func TestInjectPromptCacheKey_UsesConversationID(t *testing.T) {
 		t.Fatalf("expected uid8 isolation prefix, got=%q", got)
 	}
 	// 同 conversation_id 两次出站 → 同 key（稳定）。
-	out2 := InjectPromptCacheKey([]byte(str), uid, "")
+	out2 := injectPromptCacheKey([]byte(str), uid, "")
 	if got2 := extractCacheKey(t, out2); got2 != got {
 		t.Fatalf("non-deterministic key for same conversation_id: %q vs %q", got, got2)
 	}
 	// 不同 conversation_id → 不同 key（哈希段区分）。
 	inB := `{"model":"glm-5.2","messages":[],"conversation_id":"conv-99"}`
 
-	gotB := extractCacheKey(t, InjectPromptCacheKey([]byte(inB), uid, ""))
+	gotB := extractCacheKey(t, injectPromptCacheKey([]byte(inB), uid, ""))
 	if gotB == got {
 		t.Fatalf("different conversation_id produced same key: %q", got)
 	}
@@ -81,8 +81,8 @@ func TestInjectPromptCacheKey_GeneratesStableKey(t *testing.T) {
 	conv := "conv-stable"
 	in := `{"model":"glm-5.2","messages":[]}`
 
-	a := InjectPromptCacheKey([]byte(in), uid, conv)
-	b := InjectPromptCacheKey([]byte(in), uid, conv)
+	a := injectPromptCacheKey([]byte(in), uid, conv)
+	b := injectPromptCacheKey([]byte(in), uid, conv)
 
 	ka, kb := extractCacheKey(t, a), extractCacheKey(t, b)
 	if ka != kb {
@@ -98,9 +98,9 @@ func TestInjectPromptCacheKey_AccountIsolation(t *testing.T) {
 	conv := "conv-shared"
 	in := `{"model":"glm-5.2","messages":[]}`
 
-	str := extractCacheKey(t, InjectPromptCacheKey([]byte(in), "user-aaa-111", conv))
+	str := extractCacheKey(t, injectPromptCacheKey([]byte(in), "user-aaa-111", conv))
 
-	str2 := extractCacheKey(t, InjectPromptCacheKey([]byte(in), "user-bbb-222", conv))
+	str2 := extractCacheKey(t, injectPromptCacheKey([]byte(in), "user-bbb-222", conv))
 	if str == str2 {
 		t.Fatalf("cross-account key collision: both=%q", str)
 	}
@@ -117,7 +117,7 @@ func TestInjectPromptCacheKey_Format(t *testing.T) {
 
 	uid := "1234567890abcdef"
 	in := `{"model":"glm-5.2","messages":[]}`
-	out := InjectPromptCacheKey([]byte(in), uid, "conv-fmt")
+	out := injectPromptCacheKey([]byte(in), uid, "conv-fmt")
 
 	got := extractCacheKey(t, out)
 	if strings.Contains(got, "wb2a") {
@@ -137,7 +137,7 @@ func TestInjectPromptCacheKey_EmptyConversation(t *testing.T) {
 
 	uid := "user-abc-123"
 	in := `{"model":"glm-5.2","messages":[]}`
-	out := InjectPromptCacheKey([]byte(in), uid, "")
+	out := injectPromptCacheKey([]byte(in), uid, "")
 
 	got := extractCacheKey(t, out)
 	if got == "" {
@@ -159,8 +159,8 @@ func TestInjectPromptCacheKey_NullBody(t *testing.T) {
 
 	body := []byte(`null`)
 
-	if out := InjectPromptCacheKey(body, "user-abc-123", "conv-xyz"); string(out) != string(body) {
-		t.Fatalf("InjectPromptCacheKey(null) = %q, want 原样返回", out)
+	if out := injectPromptCacheKey(body, "user-abc-123", "conv-xyz"); string(out) != string(body) {
+		t.Fatalf("injectPromptCacheKey(null) = %q, want 原样返回", out)
 	}
 }
 

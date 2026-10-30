@@ -1738,7 +1738,10 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+//
+// 全部改写（规范化 / 补首条 system / prompt_cache_key / conversationRequestId）
+// 在同一次解码内完成：每步单独整解整编会让几十 KB 的体每请求编解码 3~4 轮。
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID, conversationRequestID string) []byte {
 	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
@@ -1747,14 +1750,19 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
 
-	// prompt.history_keep_turns > 0 时按轮裁剪（issue #99）；0 = 关闭，零回归。
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs,
-		int(c.HistoryKeepTurns.Load()))
-	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
-	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
-	body = InjectPromptCacheKey(body, uid, conversationID)
+	rewrite := chatBodyRewrite{
+		sanitize: c.SanitizeFingerprints.Load(), efforts: efforts, defaultEfforts: defs,
+		// prompt.history_keep_turns > 0 时按轮裁剪（issue #99）；0 = 关闭，零回归。
+		historyKeepTurns: int(c.HistoryKeepTurns.Load()),
+		// 首条不是 system 时补官方 fallback（上游灰度校验 11-128）。
+		leadingSystem: true,
+		// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
+		// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
+		injectCacheKey: true, uid: uid, conversationID: conversationID,
+		requestID: conversationRequestID,
+	}
 
-	return body
+	return rewriteChatBody(body, &rewrite)
 }
 
 // effortsSnapshot 返回 effort 能力缓存的只读快照；nil 表示未知（透传不降级）。
@@ -2290,6 +2298,14 @@ func (c *Client) chatPayload(a *auth.Auth, prepared []byte) ([]byte, string, err
 	return gzipChatBody(prepared)
 }
 
+// gzipWriterPool 复用 gzip 压缩器：gzip.NewWriter 每次要分配约 1MB 的 flate
+// 状态，chat 出站每个请求都压一次 body，池化后可省掉这部分分配。池只保存
+// 压缩器本身，不持有任何请求数据（归还前 Reset(io.Discard) 断开对输出 buffer
+// 的引用，避免把已返回的压缩字节一起吊在池里）。
+var gzipWriterPool = sync.Pool{
+	New: func() any { return gzip.NewWriter(io.Discard) },
+}
+
 // gzipChatBody 压缩 chat 出站 body，返回压缩后字节与 Content-Encoding 取值。
 //
 // 不手工设 Accept-Encoding：那是**响应**侧协商，手设会关掉 Go transport 的透明解压，
@@ -2298,7 +2314,13 @@ func (c *Client) chatPayload(a *auth.Auth, prepared []byte) ([]byte, string, err
 func gzipChatBody(body []byte) ([]byte, string, error) {
 	var buf bytes.Buffer
 
-	writer := gzip.NewWriter(&buf)
+	writer, _ := gzipWriterPool.Get().(*gzip.Writer)
+	if writer == nil {
+		writer = gzip.NewWriter(io.Discard)
+	}
+
+	writer.Reset(&buf)
+
 	if _, err := writer.Write(body); err != nil {
 		return nil, "", fmt.Errorf("gzip chat body: %w", err)
 	}
@@ -2306,6 +2328,9 @@ func gzipChatBody(body []byte) ([]byte, string, error) {
 	if err := writer.Close(); err != nil {
 		return nil, "", fmt.Errorf("gzip chat body: %w", err)
 	}
+
+	writer.Reset(io.Discard)
+	gzipWriterPool.Put(writer)
 
 	return buf.Bytes(), "gzip", nil
 }
@@ -2318,12 +2343,13 @@ func (c *Client) ChatStreamContext(
 		ctx = context.Background()
 	}
 
-	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID)
-	prepared = ensureLeadingSystem(prepared)
-
-	if c.ConversationRequestBody.Load() && meta.ConversationRequestID != "" {
-		prepared = injectConversationRequestID(prepared, meta.ConversationRequestID)
+	// conversationRequestId 注入（issue #249）：默认关闭，仅在 features 打开时带真实轮级 ID。
+	conversationRequestID := ""
+	if c.ConversationRequestBody.Load() {
+		conversationRequestID = meta.ConversationRequestID
 	}
+
+	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID, conversationRequestID)
 
 	payload, contentEncoding, payloadErr := c.chatPayload(account3, prepared)
 	if payloadErr != nil {
@@ -3247,10 +3273,10 @@ type v3ModelPromotion struct {
 	Schedule *v3PromoSchedule `json:"schedule"`
 }
 
-// v3PromoSchedule 优惠的生效时段定义（daily 窗口可跨午夜）。
+// v3PromoSchedule 优惠的生效时段定义（daily 窗口可跨午夜，按 cst 解释；
+// 上游的 timezone 字段实测恒为 Asia/Shanghai，不参与判定，故不声明）。
 type v3PromoSchedule struct {
 	Daily      []v3PromoWindow `json:"daily"`
-	Timezone   string          `json:"timezone"`  // 实测恒 Asia/Shanghai
 	ValidFrom  string          `json:"validFrom"` // RFC3339，可缺省
 	ValidUntil string          `json:"validUntil"`
 }

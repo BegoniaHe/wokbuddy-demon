@@ -166,8 +166,8 @@ description: >
 ## Opt-in runtime verification (Wine)
 
 静态包无法回答「真实 chat 请求头/UA」时，用户显式授权且使用测试账号后，可运行
-`scripts/runtime_probe.mjs`。它是唯一允许启动官方客户端的入口，仍遵守上面的脱敏
-与提权边界。
+`scripts/runtime_probe.mjs`。允许启动官方客户端的只有两个入口：它（采集）与
+`scripts/wine_login.py`（用网关凭证登录后启动，见下）；两者都遵守上面的脱敏边界。
 
 ```bash
 # 只采集启动/CDP/客户端日志，不发消息
@@ -196,8 +196,45 @@ node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn --cap
 - 提权只走 `pkexec`；脚本不包含 sudo 密码，也不在非交互环境注入凭据。
 - 结束后确认进程已停止；复用现有 prefix 时不执行全局 `wineserver -k`。
 
+### 用网关凭证登录 wine 客户端（`scripts/wine_login.py`）
+
+需要「用 `auths/<uid>.json` 的账号把客户端登进去」时（例如核对某个账号在真机上的
+行为），用这个脚本，不要手工改客户端文件：
+
+```bash
+python3 .agents/skills/reverse-workbuddy/scripts/wine_login.py \
+  --auth auths/<uid>.json            # 注入会话 → 启动客户端
+python3 …/wine_login.py --auth auths/<uid>.json --dry-run   # 只打印计划，不写不启动
+python3 …/wine_login.py --auth auths/<uid>.json --no-launch # 只注入
+python3 …/wine_login.py                                    # 不注入，纯启动
+# 国际版 / 自定义 prefix / 指定 exe
+python3 …/wine_login.py --realm global --prefix ~/.wine
+```
+
+权限与边界：
+
+- 只用于用户**显式授权**且为本人或测试账号的场合；脚本会顶掉该 prefix 里当前
+  登录的账号（旧会话自动备份为 `workbuddy-desktop.info.bak-<ts>`）。
+- 默认拒绝在客户端运行时写入（运行中切换会与内存态打架）；`--force` 才允许，
+  此时依赖客户端自身的 auth 文件 watcher 热加载。
+- 注入的 token 来自网关凭证，会和网关争同一个 refreshToken 的刷新节奏；服务端
+  不撤销旧 RT（见 `internal/upstream/client.go` 的 rotate 注释），但同一账号不要
+  长期两边同时跑。
+- 写入的是**明文** token（客户端读到后自行 re-seal）。验证成功后不要把这个 `.info`
+  复制进报告或 `.tmp/` 产物；脚本输出只给掩码。
+- 上游账号元数据（`uin`、`deployStatus` 等）由脚本从 `/v2/plugin/accounts` 取，
+  不要手填。
+
+成功判定：`~/.workbuddy/logs/main.log` 出现 `Restored auth session from file,
+userId: …`，且 `.info` 里的 `accessToken` 重新变成 `$wbEncrypted` 信封。落盘形制、
+字段清单与 `decodeString` 明文放行的证据见 `references/protocol-anchors.md`。
+
 已知无效路径（不要再重复试）：
 
+- 客户端**没有** `--auth` / `--token` 之类的登录启动参数；只有 CLI 面的环境变量
+  `CODEBUDDY_AUTH_TOKEN`（`cli/dist/codebuddy-lite-wb.mjs` 的
+  `authenticationStorageImpl`），它不影响桌面登录态，混用会造成两套身份。要「启动
+  即登录」只能由启动器先写会话文件（即上面的脚本）。
 - `NODE_OPTIONS=--require=...` 会被 Electron 打包应用拒绝。
 - `NODE_DEBUG=http,https` 只输出 socket 内部信息，不打印请求头。
 - renderer CDP 看不到主进程/CLI 发出的 chat、`/v2/report`、`/v3/config`。
@@ -226,6 +263,9 @@ node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn --cap
 - `scripts/extract_asar.mjs`：ASAR 提取；`scripts/protocol_sweep.mjs`：粗扫。
 - `scripts/runtime_probe.mjs`：opt-in Wine 运行时探针；隔离输出、白名单头、
   默认删除原始日志；抓包提权只走 `pkexec`。
+- `scripts/wine_login.py`：用 `auths/<uid>.json` 注入客户端登录态后启动（启动参数
+  形态）。用法与边界见上文「用网关凭证登录 wine 客户端」，落盘形制见
+  `references/protocol-anchors.md`「客户端登录态落盘」。
 
 ## Verify
 
@@ -242,3 +282,6 @@ node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn --cap
 - 运行 `runtime_probe.mjs` 后，`summary.json` 不含 token/UID/Cookie；原始
   NetLog/stdout 默认已删除（或 `--keep-raw` 且明确不提交）。
 - `--capture` 只通过 `pkexec` 提权；脚本中不存在 sudo 密码或明文凭据。
+- 用 `scripts/wine_login.py` 注入后，`.info` 必须已变回 `$wbEncrypted`（客户端完成
+  migration），且 `--dry-run` 输出的 session 路径落在目标 WINEPREFIX 内；报告里不得
+  出现注入用的 token、uid 原文。

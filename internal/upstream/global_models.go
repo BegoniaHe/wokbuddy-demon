@@ -25,33 +25,6 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// GlobalModelNames 国际版（global realm）历史静态名单（PLAN §7.2 附录 21 名）。
-// 纯动态化后**不再作为模型目录的基底/兜底**：/v1/models 只透出上游实际下发的模型。
-// 保留仅作历史对照（global e2e 观测日志差集参照）。
-var GlobalModelNames = []string{
-	"default-model",
-	modelFastID,
-	"balanced-model",
-	"primary-model",
-	"hy4-preview",
-	"gpt-5.6-sol",
-	"gpt-5.6-terra",
-	"deep-model",
-	"deepseek-v4.1-flash",
-	"gpt-6-astra",
-	"hy4-preview-f",
-	"hy3",
-	"glm-5.2",
-	"gpt-5.6-luna",
-	"gpt-5.5",
-	"gpt-5.4",
-	"gpt-5.3-codex",
-	"gemini-3.5-flash",
-	"glm-5.3",
-	"kimi-k3",
-	"kimi-k2.6",
-}
-
 var (
 	errGlobalModelsOnceFailed                   = errors.New("globalModelsOnce failed")
 	errGlobalModelsEmptyList                    = errors.New("global models empty list")
@@ -685,29 +658,31 @@ func parseGlobalModelNames(raw []byte) (globalCatalogParse, error) {
 	}, nil
 }
 
-// resolveAvailableModels 从 payload 任意层级提取 availableModels。
-// 支持字符串数组与对象数组（_meta["codebuddy.ai"].availableModels 为对象形态）。
+// payloadFind 在 payload 的任意层级按 key 找第一个能解码为非空切片的值。
+// 上游把同一份目录塞进多层信封（_meta / data / 数组套数组），键名与值形态都随
+// 版本漂移，因此按「键 → 宽松解码」递归找，找到即返回。availableModels 与
+// agents 两个提取口只差键名与元素类型，合并到这一处。
 //
-//nolint:cyclop,gocognit,gocyclo,modernize,dupl // 递归遍历多信封，抽取 availableModels。
-func resolveAvailableModels(payload json.RawMessage) []string {
+//nolint:gocognit // 递归遍历多信封，键/数组两类分支集中。
+func payloadFind[S ~[]E, E any](payload json.RawMessage, key string) S {
 	var root any
 	if json.Unmarshal(payload, &root) != nil {
 		return nil
 	}
 
-	var found []string
+	var found S
 
 	var walk func(any) bool
 
 	walk = func(value any) bool {
 		switch node := value.(type) {
 		case map[string]any:
-			if raw, ok := node["availableModels"]; ok {
+			if raw, ok := node[key]; ok {
 				encoded, err := json.Marshal(raw)
 				if err == nil {
-					var ids modelIDList
-					if json.Unmarshal(encoded, &ids) == nil && len(ids) > 0 {
-						found = ids
+					var typed S
+					if json.Unmarshal(encoded, &typed) == nil && len(typed) > 0 {
+						found = typed
 						return true
 					}
 				}
@@ -719,11 +694,7 @@ func resolveAvailableModels(payload json.RawMessage) []string {
 				}
 			}
 		case []any:
-			for _, child := range node {
-				if walk(child) {
-					return true
-				}
-			}
+			return slices.ContainsFunc(node, walk)
 		}
 
 		return false
@@ -734,53 +705,16 @@ func resolveAvailableModels(payload json.RawMessage) []string {
 	return found
 }
 
+// resolveAvailableModels 从 payload 任意层级提取 availableModels。
+// 支持字符串数组与对象数组（_meta["codebuddy.ai"].availableModels 为对象形态）。
+func resolveAvailableModels(payload json.RawMessage) []string {
+	return payloadFind[modelIDList](payload, "availableModels")
+}
+
 // resolveGlobalAgents 从 payload 任意层级提取 agents（global 多信封兜底）。
 // 找不到或结构不符返回 nil，调用方据此保持「无判定」。
-//
-//nolint:cyclop,gocognit,gocyclo,modernize,dupl // 递归遍历多信封，抽取 agents。
 func resolveGlobalAgents(payload json.RawMessage) []modelAgent {
-	var root any
-	if json.Unmarshal(payload, &root) != nil {
-		return nil
-	}
-
-	var found []modelAgent
-
-	var walk func(any) bool
-
-	walk = func(value any) bool {
-		switch node := value.(type) {
-		case map[string]any:
-			if raw, ok := node["agents"]; ok {
-				encoded, err := json.Marshal(raw)
-				if err == nil {
-					var agents modelAgents
-					if json.Unmarshal(encoded, &agents) == nil && len(agents) > 0 {
-						found = agents
-						return true
-					}
-				}
-			}
-
-			for _, child := range node {
-				if walk(child) {
-					return true
-				}
-			}
-		case []any:
-			for _, child := range node {
-				if walk(child) {
-					return true
-				}
-			}
-		}
-
-		return false
-	}
-
-	walk(root)
-
-	return found
+	return payloadFind[modelAgents](payload, "agents")
 }
 
 // filterGlobalCatalog 按 availableModels 过滤模型名单与对象条目（空集合不限制）。

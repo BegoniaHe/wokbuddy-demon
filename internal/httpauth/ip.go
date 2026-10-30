@@ -132,10 +132,47 @@ func normalizeIP(raw string) string {
 	}
 
 	if ip := net.ParseIP(value); ip != nil {
+		// 常见形态（点分十进制 IPv4）已被 ParseIP 校验过取值，规范串就是输入
+		// 本身——直接返回原串：net.IP.String() 每次都要新建一个字符串，这条路径
+		// 每个请求会走多次（来源记录、限速、上游 IP 头）。
+		if ip.To4() != nil && isCanonicalIPv4(value) {
+			return value
+		}
+
 		return ip.String()
 	}
 
 	return ""
+}
+
+// isCanonicalIPv4 报告 value 是否已是规范点分十进制 IPv4。取值合法性由
+// net.ParseIP 保证，这里只判形态：四段、每段 1–3 位、无前导零。
+func isCanonicalIPv4(value string) bool {
+	segments, digits := 0, 0
+
+	for i := range len(value) {
+		octet := value[i]
+		if octet == '.' {
+			if digits == 0 {
+				return false
+			}
+
+			segments++
+
+			digits = 0
+
+			continue
+		}
+		// 非数字、段内超过 3 位、"01" 这类前导零都不是规范形态（"0" 单段合法：
+		// 只在段内已有数字时才判前导零）。
+		if octet < '0' || octet > '9' || digits >= 3 || (digits == 1 && value[i-1] == '0') {
+			return false
+		}
+
+		digits++
+	}
+
+	return segments == 3 && digits > 0
 }
 
 func inNets(ip string, nets []*net.IPNet) bool {

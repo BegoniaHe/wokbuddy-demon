@@ -12,11 +12,10 @@ package upstream
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"strings"
 )
 
-// InjectPromptCacheKey 在已改写的出站 body 上注入 prompt_cache_key 字段。
+// injectPromptCacheKeyObj 在已解码的出站 body 上注入 prompt_cache_key 字段。
 //
 // 优先级：
 //  1. body 已带 prompt_cache_key → 原值保留（客户端自知复用哪个键）
@@ -31,19 +30,10 @@ import (
 // 入参 uid 为账号 UID（空则用 "-"，但仍会注入键；调用方应保证传真实 UID）。
 // 入参 conversationID 为网关解析出的会话标识（body 里没有 conversation_id 时用它做哈希源）。
 // 两源都空时 convHex 为定值（每次新会话不复用前缀，但仍保留账号隔离段）。
-// body 不可解析时原样返回（与 prepareBody 语义一致：坏 body 不二次错误化）。
-func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
-	if len(body) == 0 {
-		return body
-	}
-
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
-		return body // 坏 body / 顶层 null：无字段可写，保持原文
-	}
+func injectPromptCacheKeyObj(obj map[string]any, uid, conversationID string) {
 	// 优先级 1：客户端已显式带 key → 绝不覆盖。
 	if existing, ok := obj["prompt_cache_key"].(string); ok && existing != "" {
-		return body
+		return
 	}
 	// 优先级 2：body 里的 conversation_id / conversationId 做会话哈希源。
 	conv := conversationID
@@ -53,15 +43,7 @@ func InjectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 		conv = v
 	}
 
-	key := buildCacheKey(uid, conv)
-	obj["prompt_cache_key"] = key
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-
-	return out
+	obj["prompt_cache_key"] = buildCacheKey(uid, conv)
 }
 
 // buildCacheKey 生成 `<uid8>-<convHex>` 格式的稳定 cache key。

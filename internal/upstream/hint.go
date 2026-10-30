@@ -110,7 +110,7 @@ func NoHealthyAccountHint() string { return noHealthyHint }
 // 不会为每个成功请求触发）。
 func FrameHintFunc(ctxFn func() HintContext) func(string) string {
 	return func(payload string) string {
-		if payload == "" || payload == "[DONE]" {
+		if payload == "" || sseDone(payload) {
 			return ""
 		}
 
@@ -279,6 +279,12 @@ func BusinessFrameError(payload string) (code, msg string, ok bool) {
 		return "", "", false
 	}
 
+	return frameBusinessError(frame)
+}
+
+// frameBusinessError 判定已解码帧是否为顶层业务错误信封。调用方通常已经为白名单/
+// 聚合解过帧，这里直接读 map，避免每帧再编解码一次。
+func frameBusinessError(frame map[string]any) (code, msg string, ok bool) {
 	if _, hasErr := frame["error"]; hasErr {
 		return "", "", false
 	}
@@ -292,7 +298,13 @@ func BusinessFrameError(payload string) (code, msg string, ok bool) {
 		return "", "", false
 	}
 
-	code = firstJSONCode(mustRaw(rawCode))
+	switch v := rawCode.(type) {
+	case string:
+		code = strings.TrimSpace(v)
+	case float64:
+		code = strconv.FormatFloat(v, 'f', -1, 64)
+	}
+
 	if code == "" || code == "0" {
 		return "", "", false
 	}
@@ -307,14 +319,6 @@ func BusinessFrameError(payload string) (code, msg string, ok bool) {
 	}
 
 	return code, msg, true
-}
-
-// mustRaw 把已解码值重新编码为 json.RawMessage（仅用于复用 firstJSONCode）。
-func mustRaw(value any) json.RawMessage {
-	//nolint:errchkjson // value 来自已解码 JSON，Marshal 不会失败。
-	raw, _ := json.Marshal(value)
-
-	return raw
 }
 
 // stringValueAny 读取任意 JSON 标量的字符串形态（数字/字符串）。

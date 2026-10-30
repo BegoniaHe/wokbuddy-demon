@@ -16,10 +16,6 @@
 // 搭配：新系统不配老平台，具体门槛由桌面指纹抽样逻辑使用。
 package ospool
 
-import (
-	"math/rand/v2"
-)
-
 // Family 版本所属的 Windows 大版本。
 const (
 	FamilyWindows10 = "Windows 10"
@@ -64,24 +60,4 @@ var Releases = []Release{
 		Family: FamilyWindows10, Version: "22H2", Build: "10.0.19045",
 		Weight: 40, MinCPUYear: 2017, Source: Windows10SourceURL,
 	},
-}
-
-// Pick 按 Weight 加权随机选一个版本；rng 由调用方按账号稳定派生。
-func Pick(rng *rand.Rand) Release {
-	total := 0
-	for _, release := range Releases {
-		total += release.Weight
-	}
-
-	pick := rng.IntN(total)
-
-	for _, release := range Releases {
-		if pick < release.Weight {
-			return release
-		}
-
-		pick -= release.Weight
-	}
-
-	return Releases[len(Releases)-1]
 }

@@ -159,6 +159,26 @@ func TestChatStatsReaderTTFBOnlyOnDataFrame(t *testing.T) {
 	}
 }
 
+// 上游可能发 "data:{...}"（无空格）：stats 侧必须与透传侧同口径，否则这类上游
+// 的 TTFB 与 usage 整段丢失。
+func TestChatStatsReaderAcceptsDataWithoutSpace(t *testing.T) {
+	t.Parallel()
+
+	var chatStatsReader2 chatStatsReader
+
+	chatStatsReader2.start = time.Now().Add(-time.Second)
+	chatStatsReader2.parseSSELine(`data:{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`)
+
+	if chatStatsReader2.TTFB() <= 0 {
+		t.Errorf("ttfb=%v want >0", chatStatsReader2.TTFB())
+	}
+
+	usage := chatStatsReader2.Usage()
+	if !usage.HasTotalTokens || usage.TotalTokens != 7 {
+		t.Errorf("usage=%+v, want total=7", usage)
+	}
+}
+
 func TestChatStatsReaderBytesPassthrough(t *testing.T) {
 	t.Parallel()
 
@@ -168,6 +188,32 @@ func TestChatStatsReaderBytesPassthrough(t *testing.T) {
 	out, _ := io.ReadAll(r)
 	if string(out) != sse {
 		t.Errorf("passthrough mismatch:\n got %q\nwant %q", out, sse)
+	}
+}
+
+// TestResponseObserverWriteString 观察 writer 必须同样转发 io.StringWriter 快路径，
+// 并按 Write 的口径把状态记为 200：否则 reqlog 会把已写出响应体的请求记成 0。
+func TestResponseObserverWriteString(t *testing.T) {
+	t.Parallel()
+
+	probe := &stringWriterProbe{ResponseRecorder: httptest.NewRecorder()}
+	obs := &responseObserver{ResponseWriter: probe}
+
+	if _, err := io.WriteString(obs, "ok"); err != nil {
+		t.Fatalf("WriteString: %v", err)
+	}
+
+	if probe.writeString != 1 || probe.writes != 0 {
+		t.Fatalf("writeString=%d writes=%d want 1/0（未走 io.StringWriter 快路径）",
+			probe.writeString, probe.writes)
+	}
+
+	if obs.status != http.StatusOK {
+		t.Fatalf("status=%d want 200", obs.status)
+	}
+
+	if got := probe.Body.String(); got != "ok" {
+		t.Fatalf("body=%q want %q", got, "ok")
 	}
 }
 
@@ -380,19 +426,16 @@ func TestRequestMetricsDetectsStreamErrorFrame(t *testing.T) {
 	}
 }
 
-func TestParseModelFromBody(t *testing.T) {
+func TestNewChatStatModelFallback(t *testing.T) {
 	t.Parallel()
 
-	if got := parseModelFromBody([]byte(`{"model":"deepseek-v4-flash","stream":true}`)); got != "deepseek-v4-flash" {
-		t.Errorf("got %q", got)
+	stat := newChatStat(time.Now(), "deepseek-v4-flash", true, io.Discard, false)
+	if stat.model != "deepseek-v4-flash" || stat.mode != "stream" {
+		t.Errorf("got model=%q mode=%q", stat.model, stat.mode)
 	}
 
-	if got := parseModelFromBody([]byte(`{}`)); got != "-" {
-		t.Errorf("got %q want -", got)
-	}
-
-	if got := parseModelFromBody([]byte(`not json`)); got != "-" {
-		t.Errorf("got %q want -", got)
+	if got := newChatStat(time.Now(), "", false, io.Discard, false).model; got != "-" {
+		t.Errorf("空模型应记为 -，got %q", got)
 	}
 }
 

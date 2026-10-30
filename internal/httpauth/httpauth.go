@@ -15,21 +15,6 @@ import (
 // bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
 const bearerPrefix = "Bearer "
 
-// VerifyBearer 校验请求头是否携带正确的 Bearer 密钥（或 Anthropic 客户端的 X-Api-Key）。
-//
-// key 为空表示"未启用鉴权"，恒返回 true（调用方据此放行）。
-// 比较用 SHA-256 摘要 + subtle.ConstantTimeCompare：
-//   - 常量时间，不因前缀匹配长度而泄露信息；
-//   - 先摘要再比较，长度差异被吸收进摘要（不会因长度不同提前返回）；
-//   - 摘要本身不可逆，即便有侧信道也拿不到密钥原文。
-func VerifyBearer(r *http.Request, key string) bool {
-	if key == "" {
-		return true
-	}
-	// 缺头/方案不对时 bearerToken 返回空串，仍走一次摘要比较，保持耗时形状一致。
-	return subtle.ConstantTimeCompare(digest(bearerToken(r)), digest(key)) == 1
-}
-
 // Key 一把命名密钥的最小校验视图：ID 用于回执与计数，Hash 是密钥的 SHA-256
 // 摘要（定长 32 字节，多候选比较因此天然常量时间）。
 type Key struct {
@@ -44,7 +29,7 @@ type AuthResult struct {
 	IsDefault bool   // 命中默认密钥（或未启用鉴权而放行）
 }
 
-// HashKey 返回密钥的 SHA-256 摘要（与 VerifyBearer 内部 digest 同口径），
+// HashKey 返回密钥的 SHA-256 摘要（与 Authenticate 内部 digest 同口径），
 // 供命名密钥库持久化与比较复用——比较原语只此一份，不另起实现。
 func HashKey(key string) []byte { return digest(key) }
 
@@ -101,9 +86,6 @@ const (
 	// ScopeAdmin 管理面完整凭据。
 	ScopeAdmin
 )
-
-// AllowsRead 报告该作用域能否读取管理面（admin 或 readonly）。
-func (s Scope) AllowsRead() bool { return s == ScopeAdmin || s == ScopeReadonly }
 
 // ScopeResult 管理/运维面一次作用域鉴权的结果。
 type ScopeResult struct {
