@@ -731,6 +731,9 @@ type requestTrace struct {
 	path  string
 	start time.Time
 	stat  *chatStat
+	// stats 本次请求内每轮 chat 统计（本地 web 工具循环会多次调用 serveChat）。
+	// stat 保留最后一轮（状态码回落用），stats 供归档合并为请求级汇总（issue #419）。
+	stats []*chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -741,6 +744,69 @@ type requestTrace struct {
 	account string
 	model   string
 	outcome string
+}
+
+// noteChatStat 登记一轮 chat 统计：stat 保留最后一轮，stats 逐轮累积。
+// 归档在 event() 里按请求合并（本地 web 工具循环多轮，issue #419）。
+func (t *requestTrace) noteChatStat(stat *chatStat) {
+	if t == nil || stat == nil {
+		return
+	}
+
+	t.stat = stat
+	t.stats = append(t.stats, stat)
+}
+
+// chatStatSummary 返回归档用的统计：单轮直接复用，多轮合并为请求级汇总。
+//
+// 合并口径（issue #419）：attempts / tokens / credit / 缓存 / 工具调用数逐轮累加，
+// 与命名密钥用量（recordKeyUsage 累加）保持一致；ttfb、toolsDeclared、decision
+// 取首轮（请求级属性）；model / uid / nick / outcome / status 取最后一轮，
+// 反映最终对外表现。
+func (t *requestTrace) chatStatSummary() *chatStat {
+	switch len(t.stats) {
+	case 0:
+		return t.stat
+	case 1:
+		return t.stats[0]
+	}
+
+	merged := *t.stats[0]
+	merged.attempts = 0
+	merged.promptTokens, merged.completionTokens, merged.totalTokens = 0, 0, 0
+	merged.credit, merged.hasCredit = 0, false
+	merged.cacheHit, merged.cacheMiss, merged.hasCache = 0, 0, false
+	merged.toolCalls = 0
+	merged.dailyLimited = false
+	merged.toks = -1
+
+	for _, roundStat := range t.stats {
+		merged.attempts += roundStat.attempts
+		merged.promptTokens += roundStat.promptTokens
+		merged.completionTokens += roundStat.completionTokens
+		merged.totalTokens += roundStat.totalTokens
+		merged.credit += roundStat.credit
+		merged.hasCredit = merged.hasCredit || roundStat.hasCredit
+		merged.cacheHit += roundStat.cacheHit
+		merged.cacheMiss += roundStat.cacheMiss
+		merged.hasCache = merged.hasCache || roundStat.hasCache
+		merged.toolCalls += roundStat.toolCalls
+		merged.dailyLimited = merged.dailyLimited || roundStat.dailyLimited
+
+		if roundStat.toks >= 0 {
+			if merged.toks < 0 {
+				merged.toks = 0
+			}
+
+			merged.toks += roundStat.toks
+		}
+	}
+
+	last := t.stats[len(t.stats)-1]
+	merged.model, merged.uid, merged.nick = last.model, last.uid, last.nick
+	merged.outcome, merged.status = last.outcome, last.status
+
+	return &merged
 }
 
 // noteResult 记录非 chat 路径的账号/模型/结果（搜索端点调用；nil 安全）。
@@ -802,7 +868,8 @@ func (t *requestTrace) event(status int) reqlog.Event {
 	duration := time.Since(t.start)
 	event.DurationMs = max(duration.Milliseconds(), 1)
 
-	if t.stat == nil {
+	stat := t.chatStatSummary()
+	if stat == nil {
 		// 非 chat 路径（搜索）：用 handler 写入的元数据，保持与 chat 行同字段口径。
 		event.Account, event.Model = t.account, t.model
 
@@ -810,15 +877,15 @@ func (t *requestTrace) event(status int) reqlog.Event {
 			event.Outcome = t.outcome
 		}
 	} else {
-		applyChatStat(&event, t.stat)
+		applyChatStat(&event, stat)
 	}
 
 	event.KeyID = t.keyID
 	event.ClientIP = t.clientIP
 
 	event.UserAgent = t.userAgent
-	if t.stat != nil {
-		event.Decision = t.stat.decision
+	if stat != nil {
+		event.Decision = stat.decision
 	}
 
 	if event.Outcome == "" {

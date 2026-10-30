@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -141,6 +142,58 @@ func TestLocalWebToolLoop(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), `"output_text":"你好"`) {
 		t.Errorf("final response missing text: %s", rec.Body)
+	}
+}
+
+// toolCallSSEWithUsage 首轮工具调用并携带 usage：用于校验多轮归档累加。
+const toolCallSSEWithUsage = "data: {\"id\":\"chatcmpl-1\",\"created\":1753600000,\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"query\\\":\\\"go\\\"}\"}}]}}]}\n\n" +
+	"data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n" +
+	"data: [DONE]\n\n"
+
+// TestLocalWebToolLoopArchivesAllRounds 多轮本地工具请求的归档必须累加各轮
+// attempts 与 token，而不是只保留最后一轮（issue #419）。
+func TestLocalWebToolLoopArchivesAllRounds(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+
+	up := recordingUpstream(t, []string{toolCallSSEWithUsage, sseOK}, &seen)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	reqLog := reqlog.New(reqlog.Config{})
+	handler := NewHandler(&Config{
+		Pool: p, Upstream: up, LocalWebTools: true, LocalWebToolRounds: 3, RequestLog: reqLog,
+	})
+	handler.webSearch = func(context.Context, string) (string, error) { return "result", nil }
+	body := `{"model":"glm-5.2","input":"search go","tools":[{"type":"web_search"}]}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("upstream calls=%d want 2", len(seen))
+	}
+
+	recent := reqLog.Snapshot().Recent
+	if len(recent) != 1 {
+		t.Fatalf("归档条数=%d want 1", len(recent))
+	}
+
+	event := recent[0]
+	if event.Attempts != 2 {
+		t.Errorf("attempts=%d want 2（两轮各一次上游请求）", event.Attempts)
+	}
+
+	// 首轮 3/2/5 + 末轮 1/1/2。
+	if event.PromptTokens != 4 || event.CompletionTokens != 3 || event.TotalTokens != 7 {
+		t.Errorf("tokens=%d/%d/%d want 4/3/7",
+			event.PromptTokens, event.CompletionTokens, event.TotalTokens)
+	}
+
+	if event.Outcome != reqlog.OutcomeSuccess {
+		t.Errorf("outcome=%q want %q", event.Outcome, reqlog.OutcomeSuccess)
 	}
 }
 

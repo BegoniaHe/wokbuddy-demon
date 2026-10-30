@@ -1747,7 +1747,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 
 	chatStat2.decision = h.sampleDecisionTrace()
 	if chatInput2.trace != nil {
-		chatInput2.trace.stat = chatStat2
+		chatInput2.trace.noteChatStat(chatStat2)
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		chatStat2.clientIP, chatStat2.userAgent = chatInput2.trace.clientIP, chatInput2.trace.userAgent
