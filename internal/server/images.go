@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -234,6 +235,9 @@ func (h *Handler) ensureImagesToken(w http.ResponseWriter, acct *auth.Auth) bool
 
 // forwardImages 发起上游请求，401 同号 refresh 重放一次后记账/收尾。
 // upstreamPath 为 /v2/images/generations 或 /v2/images/edits，两者策略完全一致。
+//
+// 记账与 chat 同口径：每次上游尝试各记一条用量与延迟，401 首跳不因重放成功而
+// 消失（issue #424）；token / credit 只取自拿到响应体的那一跳。
 func (h *Handler) forwardImages(
 	w http.ResponseWriter, r *http.Request, acct *auth.Auth, body []byte, realm, bareModel, upstreamPath string,
 ) {
@@ -243,17 +247,21 @@ func (h *Handler) forwardImages(
 		ConversationRequestID: session.NewUUIDv7Hex(),
 		ConversationID:        metaConversationID(r),
 	}
-	started := time.Now()
 
 	call := h.imageCaller(upstreamPath)
 
-	status, raw, err := call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+	first := imagesAttempt{started: time.Now()}
+	first.status, first.raw, first.err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 
-	status, raw, err, refreshFail := h.retryImagesAfterRefresh(r, acct, body, meta, call, status, raw, err)
+	final, retried, refreshFail := h.retryImagesAfterRefresh(r, acct, body, meta, call, first)
+	if retried {
+		// 首跳（401）单独留痕：与 chat 每次尝试都记一次用量同口径（issue #424）。
+		h.recordImagesAttempt(acct, realm, bareModel, first, r)
+	}
 
-	h.recordImagesAttempt(acct, realm, bareModel, raw, err, started, r)
+	h.recordImagesAttempt(acct, realm, bareModel, final, r)
 
-	if err != nil {
+	if final.err != nil {
 		if refreshFail != nil && !upstream.IsCredentialDead(refreshFail) {
 			// 与 chat 的 penalizeRefreshFailure 非会话失效分支同口径：只喂熔断计数，
 			// 不累计 session dead。
@@ -264,13 +272,13 @@ func (h *Handler) forwardImages(
 		}
 
 		var uerr *upstream.Error
-		if !errors.As(err, &uerr) {
+		if !errors.As(final.err, &uerr) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "image request failed at transport layer")
 
 			return
 		}
 
-		h.handleImagesError(w, acct, bareModel, status, raw, uerr)
+		h.handleImagesError(w, acct, bareModel, final.status, final.raw, uerr)
 
 		return
 	}
@@ -280,36 +288,46 @@ func (h *Handler) forwardImages(
 	h.cfg.Pool.NoteSuccess(acct.UID)
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(raw)
+	w.WriteHeader(final.status)
+	_, _ = w.Write(final.raw)
 }
 
-// retryImagesAfterRefresh 上游 401 时同号 refresh 后重放一次；第二返回值是
-// refresh 错误（refresh 失败时保持原始 401 结果）。
+// imagesAttempt 一次出图上游尝试的结果与起始时刻（用于逐跳记延迟）。
+type imagesAttempt struct {
+	status  int
+	raw     []byte
+	err     error
+	started time.Time
+}
+
+// retryImagesAfterRefresh 上游 401 时同号 refresh 后重放一次。
+//
+// 返回 (最终结果, 是否发生过重放, refresh 错误)：refresh 失败时保持原始 401 结果
+// 且不算重放（首跳即终态，只记一次）。调用方据此给首跳单独留痕（issue #424）。
 //
 // 不能拿原始 401 记会话失效：refresh 失败可能只是网络 / 上游 5xx，健康号会被连续
 // 三次失败误禁用。非 401 或非 *upstream.Error 原样返回。
 //
 //nolint:gocritic // ChatMeta 值传递与 upstream.ChatHeaders 同一 API。
 func (h *Handler) retryImagesAfterRefresh(
-	r *http.Request, acct *auth.Auth, body []byte, meta upstream.ChatMeta, call imagesCall,
-	status int, raw []byte, err error,
-) (int, []byte, error, error) {
+	r *http.Request, acct *auth.Auth, body []byte, meta upstream.ChatMeta, call imagesCall, first imagesAttempt,
+) (imagesAttempt, bool, error) {
 	var uerr *upstream.Error
-	if !errors.As(err, &uerr) || status != http.StatusUnauthorized {
-		return status, raw, err, nil
+	if !errors.As(first.err, &uerr) || first.status != http.StatusUnauthorized {
+		return first, false, nil
 	}
 
 	refreshFail := h.cfg.Upstream.RefreshToken(acct)
 	if refreshFail != nil {
-		return status, raw, err, refreshFail
+		return first, false, fmt.Errorf("refresh token: %w", refreshFail)
 	}
 
 	_ = acct.SaveAtomicRetry()
 
-	status, raw, err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
+	second := imagesAttempt{started: time.Now()}
+	second.status, second.raw, second.err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 
-	return status, raw, err, nil
+	return second, true, nil
 }
 
 // imagesCall 一次图像上游尝试的签名（出图与图生图一致）。
@@ -371,14 +389,16 @@ func (h *Handler) handleImagesError(
 	writeOpenAIErrorHint(w, outStatus, code, msg, h.hintOf(kind, string(raw), model, true, false, uerr))
 }
 
-// recordImagesAttempt 记账：reqlog 结果 + usage（响应 usage 缺失时仍记一次请求）。
+// recordImagesAttempt 记一次上游尝试的账：reqlog 结果 + usage（响应 usage 缺失时
+// 仍记一次请求，与 chat 的失败尝试同口径）。多次尝试（401 重放）各自调用一次，
+// 延迟各跳独立（issue #424）。
 //
 //nolint:funlen // 记账分支按结果形态线性展开。
 func (h *Handler) recordImagesAttempt(
-	acct *auth.Auth, realm, model string, raw []byte, err error, started time.Time, r *http.Request,
+	acct *auth.Auth, realm, model string, attempt imagesAttempt, r *http.Request,
 ) {
 	outcome := reqlog.OutcomeSuccess
-	if err != nil {
+	if attempt.err != nil {
 		outcome = reqlog.OutcomeHTTPError
 	}
 
@@ -387,9 +407,9 @@ func (h *Handler) recordImagesAttempt(
 	}
 
 	delta := &usage.Delta{
-		LatencyMs: attemptLatencyMs(started), HasLatency: true,
+		LatencyMs: attemptLatencyMs(attempt.started), HasLatency: true,
 	}
-	ok := err == nil
+	ok := attempt.err == nil
 
 	if ok {
 		var payload struct {
@@ -400,7 +420,7 @@ func (h *Handler) recordImagesAttempt(
 				Credit           float64 `json:"credit"`
 			} `json:"usage"`
 		}
-		if json.Unmarshal(raw, &payload) == nil {
+		if json.Unmarshal(attempt.raw, &payload) == nil {
 			delta.PromptTokens, delta.HasPromptTokens = payload.Usage.PromptTokens, payload.Usage.PromptTokens > 0
 			delta.CompletionTokens, delta.HasCompletion =
 				payload.Usage.CompletionTokens, payload.Usage.CompletionTokens > 0

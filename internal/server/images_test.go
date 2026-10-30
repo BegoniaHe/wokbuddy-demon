@@ -13,6 +13,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
 )
 
 func jsonResponse(status int, body string) *http.Response {
@@ -100,6 +101,68 @@ func TestImagesPassthroughAndUsage(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), `"url":"https://img.example/a.png"`) {
 		t.Fatalf("response not passed through: %s", rec.Body)
+	}
+}
+
+// TestImagesRefreshedReplayRecordsBothAttempts 401 → refresh → 200 必须在用量里留下
+// 两条请求：首跳 401 单独记账（失败一条），token 只取成功那一跳，不得把整段延迟
+// 都算进成功请求（issue #424）。
+func TestImagesRefreshedReplayRecordsBothAttempts(t *testing.T) {
+	t.Parallel()
+
+	var imageCalls int
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "/images/") {
+				imageCalls++
+				if imageCalls == 1 {
+					return jsonResponse(http.StatusUnauthorized, `{"code":12153,"msg":"offline user session"}`), nil
+				}
+
+				return jsonResponse(http.StatusOK,
+					`{"created":1,"data":[{"url":"https://img.example/a.png"}],`+
+						`"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}`), nil
+			}
+
+			return jsonResponse(http.StatusOK,
+				`{"code":0,"msg":"ok","data":{"accessToken":"newat","refreshToken":"newrt","expiresIn":3600}}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	usageRec := usage.New("")
+	handler := NewHandler(&Config{
+		Pool: testPoolWith(&auth.Auth{
+			UID: "u1", AccessToken: "at1", RefreshToken: "rt1", ExpiresAt: 9999999999,
+		}),
+		Upstream: client,
+		Usage:    usageRec,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if imageCalls != 2 {
+		t.Fatalf("imageCalls=%d want 2（401 后 refresh 重放一次）", imageCalls)
+	}
+
+	totals := usageRec.Snapshot(24, nil).Totals
+	if totals.Requests != 2 || totals.Errors != 1 {
+		t.Errorf("requests=%d errors=%d want 2/1（首跳 401 单独留痕）", totals.Requests, totals.Errors)
+	}
+
+	// token 只取自拿到响应体的那一跳，不能被两跳重复计入。
+	if totals.PromptTokens != 3 || totals.CompletionTok != 4 || totals.TotalTokens != 7 {
+		t.Errorf("tokens=%d/%d/%d want 3/4/7",
+			totals.PromptTokens, totals.CompletionTok, totals.TotalTokens)
 	}
 }
 
