@@ -1,7 +1,6 @@
 package ospool
 
 import (
-	"math/rand/v2"
 	"regexp"
 	"strconv"
 	"strings"
@@ -89,34 +88,9 @@ func TestReleaseFamilyMatchesBuild(t *testing.T) {
 	}
 }
 
-func TestPickReturnsReleasedValue(t *testing.T) {
-	t.Parallel()
-
-	valid := make(map[string]bool, len(Releases))
-	for _, release := range Releases {
-		valid[release.Build] = true
-	}
-
-	rng := rand.New(rand.NewPCG(1, 2))
-	seen := make(map[string]bool, len(Releases))
-
-	for range 200 {
-		picked := Pick(rng)
-		if !valid[picked.Build] {
-			t.Fatalf("Pick 返回不在池内的 build: %q", picked.Build)
-		}
-
-		seen[picked.Build] = true
-	}
-
-	if len(seen) < 2 {
-		t.Fatalf("200 次挑选只命中 %d 个版本，权重分布异常", len(seen))
-	}
-}
-
 // TestReleasesCoverDesktopTarget 回归 #318：桌面指纹固定 os=Win32/arch=x64，
 // 因此版本池不能收入 ARM 独占的 26H1（28000），同时必须覆盖 Windows 10 22H2
-// 存量设备。build 不得重复，否则 Pick 的权重分布会偏向重复项。
+// 存量设备。build 不得重复，否则加权抽样的分布会偏向重复项。
 func TestReleasesCoverDesktopTarget(t *testing.T) {
 	t.Parallel()
 

@@ -33,25 +33,19 @@ const (
 	importWorkers = 3
 )
 
-// cockpitAccount 映射 cockpit tools 导出格式的单个账号。
+// cockpitAccount 映射 cockpit tools 导出格式的单个账号：只保留导入实际消费的
+// 字段（凭证 / realm 推断 / 过期时间 / 昵称）。导出文件里的其余键由 json 解码
+// 直接忽略——此前为「字段齐全」声明了 token_type/status/checkin_streak 等十来个
+// 从不读取的字段，既无落盘也无展示，纯噪声。
 type cockpitAccount struct {
-	ID             string `json:"id"`
-	Email          string `json:"email"`
-	UID            string `json:"uid"`
-	Nickname       string `json:"nickname"`
-	AccessToken    string `json:"access_token"`
-	RefreshToken   string `json:"refresh_token"`
-	TokenType      string `json:"token_type"`
-	ExpiresAt      int64  `json:"expires_at"`
-	Domain         string `json:"domain"`
-	DosageNotify   string `json:"dosage_notify_code"`
-	PaymentType    string `json:"payment_type"`
-	Status         string `json:"status"`
-	UsageUpdatedAt int64  `json:"usage_updated_at"`
-	LastCheckin    int64  `json:"last_checkin_time"`
-	CheckinStreak  int    `json:"checkin_streak"`
-	CreatedAt      int64  `json:"created_at"`
-	LastUsed       int64  `json:"last_used"`
+	ID           string `json:"id"`
+	Email        string `json:"email"`
+	UID          string `json:"uid"`
+	Nickname     string `json:"nickname"`
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresAt    int64  `json:"expires_at"`
+	Domain       string `json:"domain"`
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。

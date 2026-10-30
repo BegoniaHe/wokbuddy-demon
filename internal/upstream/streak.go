@@ -27,23 +27,17 @@ func clientToken() string {
 	return session.NewUUIDv4()
 }
 
-// StreakFull 连登完整状态（GET /activity/growth/streak）。
+// StreakFull 连登状态（GET /activity/growth/streak）中调度实际消费的部分：
+// 兑换用各档状态 + 档位清单，补签用补签卡余额。streak 天数与「距下一档还有几天」
+// 等展示字段不在这里声明——网关不做展示，解码时直接忽略。
 type StreakFull struct {
-	Streak struct {
-		Days              int    `json:"days"`
-		MonthTotalDays    int    `json:"month_total_days"`
-		NextTier          string `json:"next_tier"`
-		NextTierRemaining int    `json:"next_tier_remaining"`
-	} `json:"streak"`
 	MakeupCards struct {
 		Balance int `json:"balance"`
-		Max     int `json:"max"`
 	} `json:"makeup_cards"`
 	RedemptionStatus struct {
 		Tier7dStatus  string `json:"tier_7d_status"`
 		Tier14dStatus string `json:"tier_14d_status"`
 		Tier28dStatus string `json:"tier_28d_status"`
-		RemainingDays int    `json:"remaining_days"`
 		Tiers         []struct {
 			Tier    string `json:"tier"`
 			Days    int    `json:"days"`

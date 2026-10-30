@@ -335,11 +335,6 @@ func poke(ch chan struct{}) {
 	}
 }
 
-// nextFireIn 返回 now 之后最近的一个整点触发时间（无抖动），小时按 now 的时区解释。
-func nextFireIn(now time.Time, hours []int) time.Time {
-	return nextFireFor(now, taskCheckin, hours, nil, 0, "").at
-}
-
 // slotOn 返回 day 当天墙钟 hour:00 的实际时刻；该墙钟时刻被夏令时拨快抹掉时，
 // 取跳过区间之后的第一个实际时刻（部分小时被跳过时可能是 02:30/03:45）。
 //
@@ -473,16 +468,8 @@ func earliestSlot(slots []wakeSlot) time.Time {
 	return earliest
 }
 
-// nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
-// 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
-// 排程参数在 schedMu 下快照，与 Reconfigure 的并发写隔离。
-func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
-	earliest, kinds, _ := s.nextWakeDetail(now)
-
-	return earliest, kinds
-}
-
-// nextWakeDetail 同 nextWake，额外返回该唤醒时刻的抖动偏移（无抖动为 0），供 Run 日志对账。
+// nextWakeDetail 返回 now 之后最近的唤醒时刻、该时刻需要执行的全部任务，
+// 以及该唤醒时刻的抖动偏移（无抖动为 0），供 Run 日志对账。
 func (s *Scheduler) nextWakeDetail(now time.Time) (time.Time, []taskKind, time.Duration) {
 	slots := s.candidateSlots(now)
 
@@ -527,7 +514,7 @@ const wakeupLateThreshold = 1 * time.Second
 // awaitWakeupGrace 迟到唤醒补跑派发前的网络宽限：槽位时刻已过点超过阈值
 // （机器刚从睡眠唤醒）时先等满 wakeupGraceDelay 让网络栈/DNS 就绪再派发。
 // 准点/阈值内抖动零延迟直接放行。ctx 取消立即返回 false（优雅停机不等宽限
-// 睡满，本批放弃，下轮 nextWake 照旧从"现在"起算）。返回是否继续派发。
+// 睡满，本批放弃，下轮 nextWakeDetail 照旧从"现在"起算）。返回是否继续派发。
 func awaitWakeupGrace(ctx context.Context, planned time.Time) bool {
 	if late := time.Since(planned); late <= wakeupLateThreshold {
 		return ctx.Err() == nil // 准点触发：零延迟放行
@@ -591,7 +578,7 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 // startupCatchup 启动补跑：进程停机跨过当天时点后，迟到唤醒补跑救不了
 // （它只管进程活着时 timer 被睡眠冻结）。这里补一轮，按天记录，重启不重复打上游。
 func (s *Scheduler) startupCatchup(ctx context.Context) bool {
-	// 补跑期间可能跨过后续时点：只算一次会让刚跨过的时点被首轮 nextWake 推到
+	// 补跑期间可能跨过后续时点：只算一次会让刚跨过的时点被首轮 nextWakeDetail 推到
 	// 明天而漏跑。每轮重新取墙钟判定，只补「本轮新出现」的任务族（attempted 去重，
 	// 避免 RunStampFile 未配置时重复打上游）。
 	attempted := make(map[taskKind]bool)
@@ -671,8 +658,8 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
 			// 多号 × 间隔 ≈ 数分钟睡眠）不再阻塞同槽其他任务族；返回前等全部
-			// 任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠的风险与
-			// 串行版相同——nextWake 只挑现在之后的时点）。
+			// 任务收尾（下一轮 nextWakeDetail 照旧从"现在"起算，多轮重叠的风险与
+			// 串行版相同——nextWakeDetail 只挑现在之后的时点）。
 			s.runBatch(ctx, kinds)
 		}
 	}

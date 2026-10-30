@@ -230,8 +230,6 @@ type chatRequestEvent struct {
 	CodebaseEnable        bool   `json:"codebaseEnable"`
 	IsMaxMode             bool   `json:"isMaxMode"`
 	Source                string `json:"source,omitempty"`
-	InputAttemptID        string `json:"inputAttemptId,omitempty"`
-	ConnectorID           string `json:"connectorId,omitempty"`
 	MentionContexts       []any  `json:"mentionContexts"`
 	KnowledgeID           []any  `json:"knowledgeId"`
 	KnowledgeName         []any  `json:"knowledgeName"`

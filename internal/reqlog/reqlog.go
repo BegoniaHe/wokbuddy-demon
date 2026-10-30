@@ -29,7 +29,6 @@ const (
 	defaultReadMax      = 1000
 	defaultReadFallback = 200
 	defaultMaxBytes     = 100 << 20
-	archiveFileGlob     = "requests-*.jsonl"
 )
 
 // NewRequestID 生成不含用户信息的本地请求 ID。

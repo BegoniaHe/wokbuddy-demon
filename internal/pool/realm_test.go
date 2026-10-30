@@ -73,7 +73,7 @@ func TestAvailableUIDsForModelRealm(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("AvailableUIDsForModelRealm(glm-5.2,global)=%v want %v", got, want)
 	}
-	// realm=="" → 等价 AvailableUIDsForModel（模型豁免照常：cn1 仍被该模型冷却排除）。
+	// realm=="" → 不做 realm 过滤（模型豁免照常：cn1 仍被该模型冷却排除）。
 	got = pool.AvailableUIDsForModelRealm("glm-5.2", "")
 
 	want = []string{"cn2", "g1", "g2"}

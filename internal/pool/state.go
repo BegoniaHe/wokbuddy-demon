@@ -1,5 +1,5 @@
 // 账号状态演进与查询：禁用/12153 连续计数判定、成功与错误入账、复活解冻，
-// 以及状态查询（Status/AvailableUIDs/PickByUID/CountsDetailed/ServableNow/List）。
+// 以及状态查询（Status/AvailableUIDs/PickByUIDForModel/CountsDetailed/ServableNow/List）。
 package pool
 
 import (
@@ -430,33 +430,6 @@ func (p *Pool) AvailableUIDs() []string {
 	return uids
 }
 
-// AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
-// 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
-// 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
-func (p *Pool) AvailableUIDsForModel(model string) []string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	now := p.now()
-
-	uids := make([]string, 0, len(p.byUID))
-	for uid, e := range p.byUID {
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-
-		if p.inFlightFull(e) {
-			continue
-		}
-
-		uids = append(uids, uid)
-	}
-
-	slices.Sort(uids)
-
-	return uids
-}
-
 // StickyPick 粘性命中结果：命中 / 硬不可用 / 软逃逸（负载或健康因子越界）。
 type StickyPick int
 
@@ -469,7 +442,7 @@ const (
 	StickyEscaped
 )
 
-// PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
+// PickByUIDForModel 按 uid 取绑定账号：用 healthyForModel 校验，绑定号在当前模型被
 // 6004 限流时返回不可用，让调用方（handler）解绑并回落普通轮换。
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
@@ -523,33 +496,6 @@ func (p *Pool) PickByUIDForModel(uid, model, realm string) (*auth.Auth, StickyPi
 	entry2.usedSeq = p.pickSeq
 
 	return entry2.a, StickyPicked
-}
-
-// PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
-// 否则返回 nil。供会话粘性路由命中校验与直取使用。
-func (p *Pool) PickByUID(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	entry2, ok := p.byUID[uid]
-	if !ok {
-		return nil
-	}
-
-	now := p.now()
-	if !entry2.healthy(now) {
-		return nil
-	}
-
-	if p.inFlightFull(entry2) {
-		return nil
-	}
-
-	entry2.lastUsed = now
-	p.pickSeq++
-	entry2.usedSeq = p.pickSeq
-
-	return entry2.a
 }
 
 // CountsDetailed 返回 total/healthy/cooling/disabled/inFlightFull 五类计数。

@@ -13,10 +13,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-var (
-	uuidV4TestPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
-	uuidV7TestPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
-)
+var uuidV7TestPattern = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 
 // TestReportChatActivitySendsArrayWithUserID 断言出站 body 是数组、含 userId、eventCode 正确。
 func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
