@@ -1582,23 +1582,8 @@ func indexTasksByCode(tasks []upstream.Task) map[string]upstream.Task {
 // lookupBeforeAction 从执行前快照定位任务。resolved=false 表示相关列表读取失败，
 // 调用方应回退到 taskByCode 的既有逐项查询/错误语义。
 func (s *autoTaskSnapshot) lookupBeforeAction(code string) (*upstream.Task, bool) {
-	if s.defaultErr == nil {
-		if t, ok := s.defaultByCode[code]; ok {
-			return &t, true
-		}
-	}
-
 	if isMPTaskCode(code) {
-		// mp 列表是 mp 专属任务的权威口径；默认列表失败时仍可直接复用 mp 快照。
-		if s.mpErr == nil {
-			if t, ok := s.mpByCode[code]; ok {
-				return &t, true
-			}
-
-			return nil, true
-		}
-
-		return nil, false
+		return s.lookupMPBeforeAction(code)
 	}
 
 	// 非 mp 任务只有默认列表可判定；读取失败时交回 taskByCode 的既有错误语义。
@@ -1606,7 +1591,41 @@ func (s *autoTaskSnapshot) lookupBeforeAction(code string) (*upstream.Task, bool
 		return nil, false
 	}
 
+	if t, ok := taskFromSnapshot(s.defaultByCode, code); ok {
+		return t, true
+	}
+
+	// 默认列表读取成功但无此任务：可确定列表外，不再逐项查询。
 	return nil, true
+}
+
+// lookupMPBeforeAction 定位 mp 专属任务。mp 列表是权威口径：两口径同时下发
+// 同一 code 时必须取 mp 快照，否则默认列表 accept 前的旧状态会绕过批量接受后
+// 的 mp 刷新；仅 mp 列表读取失败时才回退默认快照。
+func (s *autoTaskSnapshot) lookupMPBeforeAction(code string) (*upstream.Task, bool) {
+	if s.mpErr == nil {
+		if t, ok := taskFromSnapshot(s.mpByCode, code); ok {
+			return t, true
+		}
+
+		return nil, true
+	}
+
+	if s.defaultErr != nil {
+		return nil, false
+	}
+
+	return taskFromSnapshot(s.defaultByCode, code)
+}
+
+// taskFromSnapshot 从索引取任务副本；未命中返回 false。
+func taskFromSnapshot(byCode map[string]upstream.Task, code string) (*upstream.Task, bool) {
+	t, ok := byCode[code]
+	if !ok {
+		return nil, false
+	}
+
+	return &t, true
 }
 
 // autoAcceptBatch 批量接受默认口径未接受任务，返回结果条目（列表失败静默）。

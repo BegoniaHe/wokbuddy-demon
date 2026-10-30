@@ -500,6 +500,41 @@ func TestRunAutoAllRefreshesMPAfterBatchAccept(t *testing.T) {
 	}
 }
 
+// TestRunAutoAllMPLookupPrefersMPOverDefaultSnapshot 同一 mp code 同时出现在
+// 默认/mp 列表时，默认列表的 accept 前状态不得覆盖已刷新的 mp 快照。
+func TestRunAutoAllMPLookupPrefersMPOverDefaultSnapshot(t *testing.T) {
+	t.Parallel()
+
+	upstreamStub := &snapshotUpstream{
+		defaultTasks:  []string{"Sequential_Tasks_1"},
+		mpTasks:       []string{"Sequential_Tasks_1"},
+		acceptedCodes: map[string]bool{},
+	}
+	panel := upstreamStub.panel(t)
+
+	var seen upstream.Task
+
+	results := panel.runAutoAllActions(accountForSnapshot(t, panel), []autoAction{
+		snapshotActionWithTask("Sequential_Tasks_1", upstreamStub, &seen),
+	})
+	if len(results) != 2 || results[1]["status"] != "done" {
+		t.Fatalf("results=%v want 批量接受 + 一个动作", results)
+	}
+
+	if seen.AcceptStatus != "accepted" {
+		t.Errorf("动作任务 accept_status=%q want accepted（mp 快照优先）", seen.AcceptStatus)
+	}
+
+	defaultCalls, mpCalls, acceptCalls, _, _ := upstreamStub.counts()
+	if defaultCalls != 1 || mpCalls != 2 {
+		t.Errorf("任务 GET default/mp=%d/%d want 1/2", defaultCalls, mpCalls)
+	}
+
+	if acceptCalls != 1 {
+		t.Errorf("accept=%d want 1（默认批量接受后不得重复接受）", acceptCalls)
+	}
+}
+
 // TestMPTaskBaseEntriesReadOnce 单任务/队列入口不得因快照包装多读一次
 // mp 列表：target=0 时基础入口保留旧行为，只读一次。
 func TestMPTaskBaseEntriesReadOnce(t *testing.T) {
