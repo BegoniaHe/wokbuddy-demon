@@ -143,6 +143,7 @@ func (c *Client) fetchGlobalModelsOnce(account *auth.Auth) (names []string, info
 	}
 
 	c.storeModelRates("global", infos)
+	c.storeModelMaxOut("global", infos)
 	c.storeModelAliases("global", infos)
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，

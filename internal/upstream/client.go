@@ -1308,6 +1308,10 @@ type Client struct {
 	// modelRates 缓存各模型当前生效积分倍率（规范化数值，如 "0.5"）。
 	// 与 efforts 共用 realm 分层和锁；每次成功刷新模型目录时整体替换对应域。
 	modelRates map[string]map[string]string
+	// modelMaxOut 缓存各模型输出上限（maxOutputTokens，随模型目录刷新）。
+	// 供出站请求体补默认 max_tokens：上游对缺失限额的请求套保守默认（实测
+	// 32000），Codex 等不发限额的客户端写大文件会被无声截断。与 efforts 共用锁。
+	modelMaxOut map[string]map[string]int64
 	// aliasMu/aliases 缓存各 realm 的上游模型别名 → 规范模型 ID。
 	aliasMu sync.RWMutex
 	aliases map[string]map[string]string
@@ -1739,10 +1743,11 @@ func (c *Client) chatBase(a *auth.Auth) string {
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 // realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
 //
-// 全部改写（规范化 / 补首条 system / prompt_cache_key / conversationRequestId）
-// 在同一次解码内完成：每步单独整解整编会让几十 KB 的体每请求编解码 3~4 轮。
+// 全部改写（规范化 / 补首条 system / prompt_cache_key / conversationRequestId /
+// max_tokens / agent）在同一次解码内完成：每步单独整解整编会让几十 KB 的体每请求
+// 编解码 3~4 轮。
 func (c *Client) prepareBody(body []byte, realm, uid, conversationID, conversationRequestID string) []byte {
-	efforts, defs := c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm)
+	efforts, defs, maxOut := c.chatBodySnapshots(realm)
 	if realmKey(realm) == "global" {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
 		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
@@ -1751,7 +1756,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID, conversati
 	}
 
 	rewrite := chatBodyRewrite{
-		sanitize: c.SanitizeFingerprints.Load(), efforts: efforts, defaultEfforts: defs,
+		sanitize: c.SanitizeFingerprints.Load(), efforts: efforts, defaultEfforts: defs, maxOut: maxOut,
 		// prompt.history_keep_turns > 0 时按轮裁剪（issue #99）；0 = 关闭，零回归。
 		historyKeepTurns: int(c.HistoryKeepTurns.Load()),
 		// 首条不是 system 时补官方 fallback（上游灰度校验 11-128）。
@@ -1760,9 +1765,38 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID, conversati
 		// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 		injectCacheKey: true, uid: uid, conversationID: conversationID,
 		requestID: conversationRequestID,
+		// 官方 chat body 除首条 system 外每条消息恒带 agent:"cli"。
+		agentCLI: true,
 	}
 
 	return rewriteChatBody(body, &rewrite)
+}
+
+// chatBodySnapshots 一次读锁取出出站改写需要的三类目录快照：effort 档位、
+// 模型声明默认档、输出上限。任一桶为空都返回 nil（调用方按「未知」处理）。
+// 与 effortsSnapshot 同契约：写入时克隆/新建、发布后不可变，读路径零拷贝。
+func (c *Client) chatBodySnapshots(realm string) (map[string][]string, map[string]string, map[string]int64) {
+	k := realmKey(realm)
+
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+
+	efforts := c.efforts[k]
+	if len(efforts) == 0 {
+		efforts = nil
+	}
+
+	defs := c.defaultEfforts[k]
+	if len(defs) == 0 {
+		defs = nil
+	}
+
+	maxOut := c.modelMaxOut[k]
+	if len(maxOut) == 0 {
+		maxOut = nil
+	}
+
+	return efforts, defs, maxOut
 }
 
 // effortsSnapshot 返回 effort 能力缓存的只读快照；nil 表示未知（透传不降级）。
@@ -2855,6 +2889,7 @@ func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 	}
 
 	c.storeModelRates(account9.Realm(), out)
+	c.storeModelMaxOut(account9.Realm(), out)
 	c.storeModelAliases(account9.Realm(), out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
@@ -3556,6 +3591,41 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 	}
 
 	c.modelRates[realmKey(realm)] = rates
+}
+
+// storeModelMaxOut 按 realm 整体替换模型输出上限快照（maxOutputTokens）。
+// 供出站请求体补默认 max_tokens（见 payload.go injectCatalogMaxTokens）——上游
+// 对缺失限额的请求套保守默认（实测 32000），目录声明的值才是模型真实预算。
+// 与 modelRates 同口径：目录刷新即整体替换，空快照 = 该域无可用上限（不补默认）。
+// 别名与规范 ID 同值入桶：客户端可直接用目录别名请求（与 storeModelAliases
+// 的 last-wins 一致），否则带别名的请求会漏补、回落上游保守默认。
+func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
+	out := make(map[string]int64, len(infos))
+	for i := range infos {
+		info := &infos[i]
+		if info.ID == "" || info.MaxTokens <= 0 {
+			continue
+		}
+
+		out[info.ID] = info.MaxTokens
+		for _, alias := range info.Aliases {
+			alias = strings.TrimSpace(alias)
+			if alias == "" || alias == info.ID {
+				continue
+			}
+
+			out[alias] = info.MaxTokens
+		}
+	}
+
+	c.effortsMu.Lock()
+	defer c.effortsMu.Unlock()
+
+	if c.modelMaxOut == nil {
+		c.modelMaxOut = make(map[string]map[string]int64)
+	}
+
+	c.modelMaxOut[realmKey(realm)] = out
 }
 
 // storeModelAliases 用最新目录整体替换指定 realm 的别名映射。

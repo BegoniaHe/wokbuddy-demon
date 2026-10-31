@@ -52,9 +52,15 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopReportUA 官方 report body 的 navigator.userAgent：Electron 主进程
-	// 跑在 Node 22 上，Node 只暴露主版本号。HTTP 头仍用 desktopUAFor。
-	desktopReportUA = "Node.js/22"
+
+	// desktopReportDebounceMs 官方 StandardEventService 的批窗口：每条事件入队都会
+	// 调 runOnceScheduler.schedule()，而 RunOnceScheduler.schedule 先 cancel 再重设
+	// 2s 定时器（debounce），所以 flush 发生在最后一条事件之后 2s
+	// （common3.js 的 S=2e3；common.js 的 RunOnceScheduler.schedule）。
+	desktopReportDebounceMs int64 = 2000
+	// desktopEventGapMs 同一批内相邻事件的发生间隔近似值。网关没有真实时序，
+	// 固定步长只影响同批事件的相对 timestamp / reportDelay。
+	desktopEventGapMs int64 = 20
 )
 
 // desktopLocal 桌面端事件中 source/mode 字段的本地标记值（官方分发端恒发此值）。
@@ -159,6 +165,8 @@ const (
 	keyElementName          = "elementName"
 	keyRootRequestID        = "rootRequestId"
 	keyParentConversationID = "parentConversationId"
+	keyRequestModelID       = "requestModelId"
+	keyRequestModelName     = "requestModelName"
 	modelFastID             = "fast-model"
 	keyExtVersion           = "extVersion"
 )
@@ -315,15 +323,17 @@ func (c *Client) desktopSessionID(a *auth.Auth) string {
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 // 版本/commit/releaseDate 按 realm 取部署 profile 的官方分发包真值；os/arch 对齐官方
-// `navigator.platform`（Win32/x64）——本网关非桌面运行，保留「伪装桌面」常量而非暴露
-// 宿主平台；osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现不同机型。
+// 报告服务的 OSEventProcessor（`process.platform` → win32 / `process.arch` → x64），
+// 不暴露宿主平台；osVersion/cpuModel/cpuCores/memorySize 按 uid 稳定派生，各账号呈现
+// 不同机型（官方上报真实宿主硬件，派生值只是避免跨账号共用同一台机器）。
 func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 	desktopBuild2 := c.desktopBuildFor(account7)
 	osVersion, cpu, memorySize := desktopHardware(account7)
 	now := time.Now().UnixMilli()
 
 	fingerprint := map[string]any{
-		// 单请求立即发送：官方构造时为 0、发送前按当前时间重算，此处等价于 0。
+		// 构造态 0：官方入队时同样写 0，flush 前再按批窗口重算
+		// （由 stampDesktopReportDelay 在发送前覆盖）。
 		"reportDelay":  0,
 		"userId":       account7.UID,
 		"username":     account7.NicknameValue(),
@@ -340,17 +350,20 @@ func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 		"sessionId":   c.desktopSessionID(account7),
 		"extName":     "workbuddy-desktop",
 		keyExtVersion: c.desktopExtVersionFor(account7),
-		// 官方 report body 取 Electron 主进程的 navigator.userAgent
-		// （Windows 下 Node 22 为 Node.js/22）与 navigator.platform（Win32），
-		// 与 /v2/report 的 HTTP 头 UA 不同源。
-		"userAgent":  desktopReportUA,
-		"os":         "Win32",
+		// 官方报告服务对每个事件都跑 OSEventProcessor：os/arch 取 Node 运行时
+		// 平台串（win32/x64），不是浏览器 navigator.platform 的 "Win32"；
+		// OSEventProcessor 不写 userAgent（该键来自 CloudProductMetricsReporter
+		// 等其它 reporter，不属于本事件链）。
+		"os":         "win32",
 		"arch":       "x64",
 		"osVersion":  osVersion,
 		"cpuModel":   cpu.Name,
 		"cpuCores":   cpu.Threads,
 		"memorySize": memorySize,
 		"timestamp":  now,
+		// BuddyEventProcessor：无 buddy 上下文时官方也发空串，不用省略键。
+		"buddyId":   "",
+		"buddyName": "",
 	}
 
 	if tz := desktopTimezone(account7.Realm()); tz != "" {
@@ -372,6 +385,70 @@ func (c *Client) desktopFingerprint(account7 *auth.Auth) map[string]any {
 	return fingerprint
 }
 
+// stampDesktopReportDelay 按官方 debounce 批模型回填 timestamp / reportDelay。
+//
+// 官方 report() 入队时写 timestamp=now、reportDelay=0，每次入队都重置 2s 定时器；
+// flush 前 computeReportDelay 把每条改成 now-timestamp（common3.js）。因此：
+//   - 末条事件 ≈ 2000ms；
+//   - 越早的事件越大（2000 + 与末条的时间差）；
+//   - 只有 reportSync / 退出时 onStop 提前 flush 才会 < 2000。
+//
+// 延迟只取决于事件入队到 flush 的间隔，与请求体大小无关：重算发生在 JSON
+// 序列化和网络发送之前。业务载荷自带可解析的数值 timestamp 时保留原值（官方同样
+// 保留），只重算 reportDelay；时间戳不可解析（nil / 字符串等）时按无自带时间处理，
+// 用批模型回填——避免发出「reportDelay=0 + 非法 timestamp」的矛盾组合。
+func stampDesktopReportDelay(arr []map[string]any, ownTimestamp []bool, now int64) {
+	last := len(arr) - 1
+
+	for i, m := range arr {
+		if ownTimestamp[i] {
+			ts, _ := desktopMillis(m["timestamp"])
+			m["reportDelay"] = now - ts
+
+			continue
+		}
+
+		at := now - desktopReportDebounceMs - int64(last-i)*desktopEventGapMs
+		m["timestamp"] = at
+		m["reportDelay"] = now - at
+	}
+}
+
+// desktopMillis 取事件里的毫秒时间戳（Go 构造值或 JSON 解码值）。
+func desktopMillis(v any) (int64, bool) {
+	switch n := v.(type) {
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case float64:
+		return int64(n), true
+	default:
+		return 0, false
+	}
+}
+
+// desktopReportEvents 合并公共指纹与业务载荷（业务字段优先），并在发送前按
+// debounce 批模型回填每条事件的 timestamp / reportDelay。
+func desktopReportEvents(fingerprint map[string]any, events []DesktopEvent, now int64) []map[string]any {
+	arr := make([]map[string]any, 0, len(events))
+	ownTimestamp := make([]bool, len(events))
+
+	for i, event := range events {
+		// 只有能解析的数值 timestamp 才算「业务自带」；nil / 字符串交给批模型回填。
+		_, ownTimestamp[i] = desktopMillis(event["timestamp"])
+
+		m := map[string]any{}
+		maps.Copy(m, fingerprint)
+		maps.Copy(m, event)
+		arr = append(arr, m)
+	}
+
+	stampDesktopReportDelay(arr, ownTimestamp, now)
+
+	return arr
+}
+
 // ReportDesktopEvent 以桌面客户端指纹向 chatBase 的 /v2/report 批量上报事件。
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
 // 业务字段优先（可用于覆盖 machineId 等设备标识做真实设备对齐）。
@@ -380,15 +457,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 		return errDesktopReportNoEvents
 	}
 
-	fp := c.desktopFingerprint(account2)
-
-	arr := make([]map[string]any, 0, len(events))
-	for _, ev := range events {
-		m := map[string]any{}
-		maps.Copy(m, fp)
-		maps.Copy(m, ev)
-		arr = append(arr, m)
-	}
+	arr := desktopReportEvents(c.desktopFingerprint(account2), events, time.Now().UnixMilli())
 
 	raw, err := json.Marshal(arr)
 	if err != nil {
@@ -411,7 +480,8 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	req.Header.Set("User-Agent", c.desktopUA(account2))
 	req.Header.Set("X-Domain", c.desktopDomain(account2))
 	req.Header.Set("X-Product", "SaaS")
-	injectEnterpriseHeaders(req, account2)
+	// 与 surfaceReport 同口径：个人号不发 X-No-Enterprise-Id 声明头（#298）。
+	injectLightEnterpriseHeaders(req, account2)
 	req.Header.Set("X-Request-ID", session.NewUUIDv7Hex())
 
 	if account2.UID != "" {
@@ -431,14 +501,25 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 // 改成 UUID 后不能复用同一值，否则两条消息在后台落到同一个 messageId）。
 func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelName string) []DesktopEvent {
 	assistantMessageID := session.NewUUIDv7Hex()
+	// 官方 traceId 是会话级 W3C trace id（随机 v4），requestId 是 UUIDv7 的
+	// conversationRequestId；两者不同源，整条链共用同一个 traceId。
+	traceID := session.NewTraceID()
+	// 事件按 2s debounce 批模型上报：presentAt 与 stampDesktopReportDelay 回填的
+	// timestamp 对齐，避免出现「presentAt=now、timestamp=now-2s」的矛盾组合。
+	base := time.Now().UnixMilli() - desktopReportDebounceMs
+	presentAt := func(index int64) int64 { return base - (5-index)*desktopEventGapMs }
 
 	return []DesktopEvent{
 		desktopTaskCreated(conversationID, messageID, modelID, modelName),
-		desktopMessageSend(conversationID, requestID, assistantMessageID),
-		desktopRequestSend(conversationID, requestID),
-		desktopMessageResponse(conversationID, requestID, assistantMessageID, modelID),
-		desktopMessageStatus(conversationID, requestID, assistantMessageID),
-		desktopRequestResponse(conversationID, requestID),
+		desktopMessageSend(
+			conversationID, requestID, assistantMessageID, modelID, modelName, traceID, presentAt(1),
+		),
+		desktopRequestSend(conversationID, requestID, modelID, modelName, traceID, presentAt(2)),
+		desktopMessageResponse(
+			conversationID, requestID, assistantMessageID, modelID, modelName, traceID, presentAt(3),
+		),
+		desktopMessageStatus(conversationID, requestID, assistantMessageID, modelID, modelName, traceID),
+		desktopRequestResponse(conversationID, requestID, modelID, modelName, traceID, presentAt(5)),
 	}
 }
 
@@ -452,7 +533,7 @@ func desktopEvent(code string, extra map[string]any) DesktopEvent {
 func desktopTaskCreated(conversationID, messageID, modelID, modelName string) DesktopEvent {
 	return desktopEvent("agent_task_created", map[string]any{
 		"source": desktopLocal, "name": "working", "task_target": "local", "mode": "craft",
-		"requestModelId": modelID, "requestModelName": modelName,
+		keyRequestModelID: modelID, keyRequestModelName: modelName,
 		"has_repo": false, "repo_type": "none", "workspace_type": "empty",
 		"has_connector": false, "connector_types": []any{},
 		"has_mention": false, "mention_types": []any{},
@@ -464,63 +545,84 @@ func desktopTaskCreated(conversationID, messageID, modelID, modelName string) De
 	})
 }
 
-func desktopMessageSend(conversationID, requestID, messageID string) DesktopEvent {
+// 以下六段事件形状对齐 CN 5.9.3 的 telemetry 构造（reportMessageSendTelemetry /
+// reportChatRequestSendTelemetry / reportMessageResponseTelemetry* /
+// reportChatMessageStatus / reportChatRequestResponseTelemetry）。5.8.x 的
+// maxToken / maxSteps / temperature / maxRetries / skillCount / totalCount 已从
+// chat_request_send 移除；requestModelId/Name 与 requestId 是 5.9.3 各事件共有字段，
+// presentAt 只出现在 send / response 事件（chat_message_status 没有）。expertId 在
+// 无专家上下文时是 undefined，JSON 序列化整键省略。`codebuddy.session_id` /
+// `codebuddy.conversation_request_id` 是 W3C baggage 的键（见 headers.go），官方只把
+// 它们放进 traceparent / baggage 请求头，事件体里没有对应构造点。
+func desktopMessageSend(
+	conversationID, requestID, messageID, modelID, modelName, traceID string, presentAt int64,
+) DesktopEvent {
 	return desktopEvent("chat_message_send", map[string]any{
-		"messageId": messageID, "historyCount": 0,
-		"isContextTruncated": false, "currentStepCount": 1,
-		"traceId": requestID, keyRootRequestID: requestID,
-		keyParentConversationID: conversationID,
-		"agentName":             "cli", "agentType": "main",
+		keyConversationID: conversationID, "requestId": requestID, "messageId": messageID,
+		keyRequestModelID: modelID, keyRequestModelName: modelName,
+		"historyCount": 0, "isContextTruncated": false, "currentStepCount": 1,
+		"presentAt": presentAt, "traceId": traceID,
+		keyRootRequestID: requestID, keyParentConversationID: conversationID,
+		"agentName": "cli", "agentType": "main",
 	})
 }
 
-func desktopRequestSend(conversationID, requestID string) DesktopEvent {
+func desktopRequestSend(
+	conversationID, requestID, modelID, modelName, traceID string, presentAt int64,
+) DesktopEvent {
 	return desktopEvent("chat_request_send", map[string]any{
+		"mode": "craft", keyConversationID: conversationID, "requestId": requestID,
+		keyRequestModelID: modelID, keyRequestModelName: modelName,
 		"inputLength": 24, "isPlan": false, "isAutoExecuteTerminal": false,
-		"isAutoModify": false, "codebaseEnable": false, "maxToken": 0,
-		"maxSteps": 500, "temperature": 0, "maxRetries": 0,
+		"isAutoModify": false, "codebaseEnable": false, "isMaxMode": false,
 		"mentionContexts": []any{}, "knowledgeId": []any{}, "knowledgeName": []any{},
 		"codebaseId": "", "mentionContextCount": 0, "command": "",
-		"recommendId": "", "skillId": "", "skillCount": 0, "totalCount": 0,
-		"traceId": requestID, keyRootRequestID: requestID,
-		keyParentConversationID: conversationID,
-		"agentName":             "cli", "agentType": "main",
-		"codebuddy.session_id":              conversationID,
-		"codebuddy.conversation_request_id": requestID,
-	})
-}
-
-func desktopMessageResponse(conversationID, requestID, messageID, modelID string) DesktopEvent {
-	return desktopEvent("chat_message_response", map[string]any{
-		"messageId": messageID, "responseModelId": modelID,
-		"inputToken": 120, "outputToken": 80, "totalToken": 200,
-		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
-		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
-		"firstTokenAt": time.Now().UnixMilli(), "traceId": requestID,
-		keyConversationID: conversationID,
-		keyRootRequestID:  requestID, keyParentConversationID: conversationID,
-		"agentName": "cli", "agentType": "main",
-		"codebuddy.session_id":              conversationID,
-		"codebuddy.conversation_request_id": requestID,
-	})
-}
-
-func desktopMessageStatus(conversationID, requestID, messageID string) DesktopEvent {
-	return desktopEvent("chat_message_status", map[string]any{
-		"messageId": messageID, "messageErrorCode": "0",
-		"traceId": requestID, keyRootRequestID: requestID,
-		keyParentConversationID: conversationID,
-		"agentName":             "cli", "agentType": "main",
-	})
-}
-
-func desktopRequestResponse(conversationID, requestID string) DesktopEvent {
-	return desktopEvent("chat_request_response", map[string]any{
-		"mode": "craft", "toolCallCount": 0,
-		"inputToken": 120, "outputToken": 80, "totalToken": 200,
-		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
-		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
+		"recommendId": "", "skillId": "", "fileUri": "",
+		"presentAt": presentAt, "traceId": traceID,
 		keyRootRequestID: requestID, keyParentConversationID: conversationID,
+		"agentName": "cli", "agentType": "main",
+	})
+}
+
+func desktopMessageResponse(
+	conversationID, requestID, messageID, modelID, modelName, traceID string, presentAt int64,
+) DesktopEvent {
+	return desktopEvent("chat_message_response", map[string]any{
+		keyConversationID: conversationID, "requestId": requestID, "messageId": messageID,
+		keyRequestModelID: modelID, keyRequestModelName: modelName, "responseModelId": modelID,
+		"inputToken": 120, "outputToken": 80, "totalToken": 200,
+		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
+		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
+		"firstTokenAt": presentAt, "presentAt": presentAt, "traceId": traceID,
+		keyRootRequestID: requestID, keyParentConversationID: conversationID,
+		"agentName": "cli", "agentType": "main",
+	})
+}
+
+func desktopMessageStatus(
+	conversationID, requestID, messageID, modelID, modelName, traceID string,
+) DesktopEvent {
+	return desktopEvent("chat_message_status", map[string]any{
+		keyConversationID: conversationID, "requestId": requestID, "messageId": messageID,
+		keyRequestModelID: modelID, keyRequestModelName: modelName,
+		"messageErrorCode": "0", "traceId": traceID,
+		keyRootRequestID: requestID, keyParentConversationID: conversationID,
+		"agentName": "cli", "agentType": "main",
+	})
+}
+
+func desktopRequestResponse(
+	conversationID, requestID, modelID, modelName, traceID string, presentAt int64,
+) DesktopEvent {
+	return desktopEvent("chat_request_response", map[string]any{
+		"mode": "craft", keyConversationID: conversationID, "requestId": requestID,
+		keyRequestModelID: modelID, keyRequestModelName: modelName, "toolCallCount": 0,
+		"inputToken": 120, "outputToken": 80, "totalToken": 200,
+		"cachedTokens": 0, "cachedWriteTokens": 0, "cachedMissTokens": 0,
+		"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
+		"presentAt": presentAt, "traceId": traceID,
+		keyRootRequestID: requestID, keyParentConversationID: conversationID,
+		"agentName": "cli", "agentType": "main",
 	})
 }
 
@@ -1099,6 +1201,6 @@ func desktopExpertActualUse(marketExpert2 *MarketExpert, conversationID, request
 		"type":        cat, "expertType": marketExpert2.ExpertType, "source": "builtin", "version": ver,
 		"cost": 9000, "characterCount": 14,
 		keyConversationID: conversationID, "requestId": requestID, "messageId": session.NewUUIDv7Hex(),
-		"requestModelId": modelFastID, "requestModelName": modelFastID,
+		keyRequestModelID: modelFastID, keyRequestModelName: modelFastID,
 	}
 }

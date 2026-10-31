@@ -92,6 +92,8 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - 出站头族按 **surface** 集中构造（`internal/upstream/headers.go` 的 `applyHeaders`）：chat 与 agenttool 四路复用 chat 头族，billing / report / refresh / v3-config / growth 走轻头族 base（Accept / Content-Type / UA / Authorization / X-User-Id / X-Domain / X-Request-ID）再按面覆盖。surface 差异只在该文件表达，调用点不得各自 Set / Del。
 - `upstream.user_agent` 是**全部出站**的显式逃生门：各面自带默认（chat 三段式 / billing meter 抓包串 / report 三段式 / growth `node`）都让位给该值；`client_name="SaaS"` 仍是 billing meter 面的「不写 UA 键」逃生门（report 面不受它影响）。
 - 首条消息非 system 时补官方 `"You are CodeBuddy Code.\n"` fallback（CN/global 都补）。
+- chat 出站 body 缺省补 `max_tokens`：客户端未带（或显式 `null`）时按模型目录 `maxOutputTokens` 注入；非 null 的显式值优先，GPT 系仍受 ≥16 下限约束（注入先于 `clampGPTMinMaxTokens`，目录值不能绕过 clamp）。官方 CLI `configureModelConfig` 同样用目录 `getMaxOutputTokens` 补该字段；上游对缺失限额套保守默认（实测 32000），长输出会被无声截断。
+- chat 出站 body 除 leading system 外每条消息补 `agent: "cli"`：官方 `HistoryInterceptors`（priority=ProviderData）对每个输入项写 `providerData.agent`（主会话取当前 agent 名），`itemsToMessages` 再把 `providerData` 摊进消息；`systemInstructions` 由调用方在摊平结果上单独 unshift，只有这条 leading system 不带该键。主会话 agent 名来自 `cli/product.json` 的 `agents`（`name=cli`）。客户端已带非空值时保留不覆盖。
 - `6004` 带重置、`14003` 模型级限流只冷该模型；`14003` 用 10s→1m 短窗且不喂路由熔断；`6004` 无重置按账号级保守退避并记模型审计；`11158` 仅在 400/404 时与 `11136` 同归账号级模型权限避让，429+11158 归限流。
 - billing/meter 的 summary / packages / get-user-resource 无前缀优先、`/v2` 回落（官方桌面 `resourcePrefix` 为空串）；签到例外保持 `/v2` 优先（官方 `DesktopAccountRepo.billingPrefix` 覆写为 `/v2`）。packages 按**桌面 daemon 用量链**取形：`UsageService.getPersonalUsage`（CN 5.9.3 `main/authority-snapshot.js@469554`）复用 `main/account.js` 的 `fetchUserResources` / `fetchAllPages`（`@378532`，`pageSize:200` 且以「不足 200 条」终止）与 `fetchResourcePackagesPage`（`@468153`），body 为 `{PageNumber, PageSize, PackageCodes, Status:[0,3], ...extra}`，paid 的 extra 是 `NeedRenewInfo:true`、free 的 extra 是 `buildSlicePeriodRange()`（`@378135`，导出名 `P`）的当日 `SlicePeriodStartTime`/`SlicePeriodEndTime` 窗口。`OnlyValidPeriod` / 无 slice 窗口的形态属渲染层 `CloudAccountRepo.validCreditPackages`（`@418501`，面板用量页用）那条 surface，本仓不采用。billing 的 `buildHeaders` 不带 UA，且**没有**桌面 UA 拦截器：2026-10-28 抓包证伪了「RestOperations 全局 `WorkbuddyUserAgentHttpInterceptor`」的推断，meter 面的 UA 就是 axios 库默认串，冻结在 profile 的 `emit.billingMeterUA`（`source=traffic`；字段缺失时回落 `desktopUA`，需重抓 profile 后才逐字生效）。`Accept-Language` / `X-Device-Token` 默认不发：summary 与 packages 由调用方带 `Accept-Language: zh|en`（短码，不是 `zh-CN`/`en-US`），`/v2/report` 的 UA 走三段式 `desktopUA`（显式 `user_agent` 优先），`X-Device-Token` 只在 chat 与签到注入（chat 见 `chatSurfaceOverrides`，签到见 `checkinHeaders`；`/v2/plugin/auth/state` 是面板登录面，不经 `internal/upstream`）。分 surface 取 base：桌面 report 走 `desktopBase`（即 `chatBase`），Web report 走 `webBase`，growth 任务 / 旅行走 `chatBase`，billing / 签到 / 活跃上报走 `billingBase`。本仓 CN billing 默认改为 `workbuddy.cn`（官方 5.9.3 桌面 billing / 签到 / 活跃上报全部打产品域，2026-10-28 真机 14 条业务请求 0 条打 `codebuddy.cn`）；显式配 `cn.billing_base=https://www.codebuddy.cn` 可退回旧口径。小程序埋点固定 `codebuddy.cn`，不跟随覆盖。这是 surface 取舍，不是遗漏。
 - checkin 面有两个端点，本仓只做桌面那条：`/billing/meter/checkin-activity-status` 由官方桌面 daemon 走 `${endpoint}/v2/billing/meter/checkin-activity-status`（CN 5.9.3 `main/authority-snapshot.js@463251`，body `{}` + `getTuringDeviceTokenResult` 的 token 头），本仓 `CheckinActivityStatus` 覆盖的正是这条，也是调度器唯一调用方；`/billing/meter/checkin-status`（无 `-activity`）只出现在 IDE/CLI 侧 `BackendProvider.getCheckinStatus`（CN 5.9.3 `main/account.js@399217`、`renderer/assets/common-Cklb-JUT.js@443241`）与渲染层 IPC 面，本仓没有调用方，**刻意不实现**（不加推测性接口）。
@@ -101,7 +103,7 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - chat 出站 body **无条件 gzip**（`Content-Encoding: gzip`，`Content-Type: application/json` 不带 charset）：官方 `productFeatures.RequestBodyGzip` CN 为 true，包内 `GzipRequestProcessor` 没有字节阈值（真机主请求 45KB、辅助请求 1.2KB 都压）。唯一跳过条件是显式自定义 base——本仓对齐为「`cn.chat_base` / `global.chat_base` 被显式覆盖时不压」。不手设 `Accept-Encoding`（会关掉 Go 透明解压，SSE 直接坏），`Content-Length` 由 `bytes.Reader` 交给 `http.NewRequest` 算压缩后长度（#365）。
 - SSE 接受 `delta.reasoning`、重复 tool id 去重、`finish_reason` 后 EOF 正常收尾；reasoning-only 不记成功。
 - 签到两 realm `/v2` 优先；余额 summary 为主、旧端点兜底；模型目录应用 `availableModels` / `disabled` / `aliases`（企业 `/console/enterprises/<enterpriseId|personal>/models` 按账号拼接，`/v2/enterprises/personal/models` 回落仍固定 personal）。`/v1/models` 发现输出再按官方默认会话 agent（`/v3/config data.agents`，企业端点 `agents` 兜底；`tags` 含 default → `name=cli` → 首个有 models）裁剪，仅隐藏展示条目，`FetchModels`、面板与请求路由保持全量。同一层还有第二条可见性规则：`productFeaturesConfig.ModelRateLimitCap.lines[].paidId` 的付费线路变体不单独成行（`freeId` 那一行撞顶时客户端才切过去），`/v1/models` 随之隐藏命中的 `paidId`——只在个人号 / pro 且至少一项 `paidId` 命中目录时启用，上游不下发该配置则不启用（issue #402）。
-- growth `/v2` 优先；travel claim 空对象 `{}` 首选（官方桌面固定 `post(path, {}, productHeaders)`，是空 JSON 对象不是零字节 body），`{record_id}` 仅作 400 兜底（record_id 为 0 时不兜底，调度器也不因缺它跳过领奖）；桌面 report `X-Domain` 为 host 形态，body 指纹带 `userAgent=Node.js/22`（官方 Electron 主进程 `navigator.userAgent`）与 `os=Win32`（官方 `navigator.platform`），与 HTTP 头 UA 不同源。
+- growth `/v2` 优先；travel claim 空对象 `{}` 首选（官方桌面固定 `post(path, {}, productHeaders)`，是空 JSON 对象不是零字节 body），`{record_id}` 仅作 400 兜底（record_id 为 0 时不兜底，调度器也不因缺它跳过领奖）；桌面 report `X-Domain` 为 host 形态，body 指纹的 `os` / `arch` 取 `OSEventProcessor` 的 `process.platform()` / `process.arch()`（`win32` / `x64`），`osVersion` / `cpuModel` / `cpuCores` / `memorySize` 取宿主，报告服务**不写** `userAgent`（5.9.3 `main/module-base.js` OSEventProcessor；旧口径 `userAgent=Node.js/22` 来自 `CloudProductMetricsReporter` 那条上报路径，不属于本事件链）。
 - images 两个端点都已覆盖：`/v2/images/generations`（`GenerateImage`）与 `/v2/images/edits`（`EditImage`），均受入站 `features.images_endpoint` 门控、单次尝试不换号。edits 是 **JSON 形态**（官方 `ImageService.editImage`：`Content-Type: application/json`，**不是 multipart**），body 为 `model` / `prompt` / `size`（默认 1024x1024）+ 可选 `image`（data URL / http URL / 裸 base64，单个字符串或字符串数组）+ 可选 `input_fidelity` 原样透传；头族与 generations 相同（`ImagesHeaders`）。CN 5.9.3 `cli/dist/codebuddy-lite-wb.mjs@6220394`。
 - 队列业务码 `6020/6021/6022`、限流族 `6000-6008`、额度/认证码按客户端枚举实现；请求级码（`11125/11129/.../11155`、`12654/14405`）不罚号不轮转，`11136` 换号并做模型级避让，`11141` 模型下线 fail-fast，`11102` 模型目录不存在按请求级 404 fail-fast（不换号），`11-128` 入站按内容拦截。
 - SSE error 帧与 HTTP 200 业务信封优先按结构化 `code`（含 `bizCode`）分类，取不到再回落 message；客户端 `data.statusCode`/`actions`、`cgicode/ret/retcode` 与 `172xx` 技能码尚未进入聊天主路径验证，暂不实现。
@@ -160,15 +162,43 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 
 活跃上报 `/v2/report` 的 `chat_request_send` 事件按 CN 5.9.3 形状发（#366）：删掉
 `maxToken` / `maxSteps` / `temperature` / `maxRetries` / `skillCount` / `totalCount`；
-补 `isMaxMode`（网关无 thinking 覆盖状态 → `false`）、`source` / `inputAttemptId` /
-`connectorId`（官方条件发，网关无状态则整键不发）；`agentType` 发 `main`，`agentName`
-取官方空值形态。
+补 `isMaxMode`（取 `getOverrideThinking(id)?.thinkingEnabled===true`，网关无 thinking
+覆盖状态 → 官方默认值 `false`）、`agentType` 发 `main`。条件字段按客户端控制流整键
+省略，不照抄单份真机样本：`source`（`meta.pendingSource` 为 string 才带）、
+`inputAttemptId`（技能推荐链路才带）、`connectorId`（有值才带）。`agentName` 发
+`cli`：官方主会话取 `agentName:t.agentName||t.meta?.agentName`，主 agent 名来自
+`cli/product.json` 的 `agents`（`name=cli`），网关模拟的正是这条主会话路径；官方取不到
+agent 身份的旁路事件才会缺该键，网关没有对应路径，不模拟该形态。
 
-`fileUri` 保留为空串、**不发** `vcsType` / `vcsRepo` / `vcsBranchName` / `vcsRevId`：
-包内 `VcsInfoProcessor.process({event})` 是 `let i=event.fileUri; if(i&&"string"==typeof i)
-try{写入 vcs* 四键}catch{}finally{delete event.fileUri}`——只有工作区路径非空时才替换成
-四元组。网关没有工作区，官方在同一形态下发的是 `fileUri: ""` 且四键缺席，补四个空串
-反而是官方从不出现的组合。
+`vcsType` / `vcsRepo` / `vcsBranchName` / `vcsRevId` **不发**，`fileUri` 发空串：
+官方 `fileUri` 取 `workspaceFolders?.[0]?.uri?.fsPath || ""`，`VcsInfoProcessor`
+是 `let i=event.fileUri; if(i&&"string"==typeof i) try{写入四键}catch{}
+finally{delete event.fileUri}`——只有路径非空时才替换成四元组并删除 `fileUri`；
+空串走假分支，`fileUri: ""` 原样保留、四键不存在。补四个空串是「开了非 git 目录」
+的形态，不是网关该断言的状态。
+
+`reportDelay` 按官方 debounce 批模型回填 ≈ 2000：`report()` 入队写
+`timestamp=now` / `reportDelay=0`，`FIRE_DELAY=2e3` 后 flush 前
+`computeReportDelay` 改写为 `flush-timestamp`，故 `timestamp≈presentAt`、到达≈两者
+之和。恒 0 只对应 `reportSync` / 退出前 flush，不是常规上报形态。
+
+事件体在 `chatRequestEventMap` 里合并桌面指纹：报告的 ProductInfo / HostIDEInfo /
+ExtensionInfo / OS / Userinfo / Buddy 处理器链对**每个**事件生效，`chat_request_send`
+不是例外。`codebuddy.session_id` / `codebuddy.conversation_request_id` **不写进事件体**
+——官方把它们作为 W3C baggage 键注入 `traceparent` / `baggage` 请求头（见 §chat 头族），
+事件里的同名字段没有任何构造点。
+
+桌面 `DesktopChatSequence` 的六段事件同样按 CN 5.9.3 构造：`chat_request_send` 删掉
+5.8.x 限额字段、补 `isMaxMode=false` / `requestModelId` / `requestModelName` /
+`fileUri`；`chat_message_send` / `chat_message_response` / `chat_message_status` /
+`chat_request_response` 补 `requestId` / `requestModelId` / `requestModelName`，
+其中 `chat_message_status` 不带 `presentAt`（官方构造里没有该键），其余三段按官方
+`reportMessageSendTelemetry` 等构造补 `presentAt`。`traceId` 取会话级随机
+UUIDv4（官方 `session.traceId`），与 UUIDv7 的 `requestId` 不同源，整条链共用同一个值。
+
+该事件与桌面 `/v2/report` 同端点同头集，`surfaceReport` 发 `X-Product: SaaS`；
+billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
+
 该事件的键集会否被上游校验未知，改动后建议做一次账号回归（点亮 growth 连登与
 `first_buddy` 任务）。
 

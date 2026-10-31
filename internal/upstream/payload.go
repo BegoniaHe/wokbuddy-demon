@@ -18,14 +18,16 @@ type chatBodyRewrite struct {
 	sanitize         bool
 	efforts          map[string][]string
 	defaultEfforts   map[string]string
+	maxOut           map[string]int64
 	historyKeepTurns int
 
-	// 以下四项仅供 chat 出站（基础规范化不管，零值 = 与旧入口同口径）：
+	// 以下六项仅供 chat 出站（基础规范化不管，零值 = 与旧入口同口径）：
 	leadingSystem  bool   // 首条非 system 时补官方 fallback system
 	injectCacheKey bool   // 注入 prompt_cache_key（按 uid 隔离）
 	uid            string // cache key 的账号隔离段
 	conversationID string // cache key 的会话哈希源
 	requestID      string // 非空 → 给当前轮最后一条 user 消息注入 conversationRequestId
+	agentCLI       bool   // 除首条 system 外每条消息补 agent:"cli"（官方 chat body 形态）
 }
 
 // rewriteChatBody 解码一次、套用全部改写、再编码一次。
@@ -56,6 +58,10 @@ func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 
 	injectConversationRequestIDObj(obj, rewrite.requestID)
 
+	if rewrite.agentCLI {
+		injectAgentCLIObj(obj)
+	}
+
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
@@ -66,9 +72,12 @@ func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 
 // normalizeChatBody 对已解码 body 套用基础规范化序列（保持既有顺序语义）。
 func normalizeChatBody(obj map[string]any, rewrite *chatBodyRewrite) {
-	sanitize, efforts, defaultEfforts, historyKeepTurns :=
-		rewrite.sanitize, rewrite.efforts, rewrite.defaultEfforts, rewrite.historyKeepTurns
+	sanitize, efforts, defaultEfforts, maxOut, historyKeepTurns :=
+		rewrite.sanitize, rewrite.efforts, rewrite.defaultEfforts, rewrite.maxOut, rewrite.historyKeepTurns
 
+	// 先剥 realm 前缀：后续 max_tokens / thinking / effort 都按裸模型名查表，
+	// 晚一步就会查空。正常链路 handler 已剥过一次，这里兜裸用/测试入口。
+	normalizeModelName(obj)
 	obj["stream"] = true
 	// max_completion_tokens → max_tokens 翻译（吸收上游 PR #116，Closes #117）：
 	// OpenAI 规范里 max_tokens 已 deprecated、max_completion_tokens 是新字段；
@@ -76,6 +85,10 @@ func normalizeChatBody(obj map[string]any, rewrite *chatBodyRewrite) {
 	// /console 同源）只认 max_tokens——别名透传会被上游忽略后回落默认输出上限
 	// （实测 32000），长流任务被截。
 	translateMaxCompletionTokens(obj)
+	// 目录动态值补默认输出上限（同 PR #116 的另一个缺口：多数客户端连别名都
+	// 不发——Codex 实测不带任何限额字段，被上游默认 32000 截断）。必须先于
+	// clamp：目录值同样是出站 max_tokens，不能让注入绕过 GPT 下限。
+	injectCatalogMaxTokens(obj, maxOut)
 	clampGPTMinMaxTokens(obj)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
@@ -143,7 +156,9 @@ func translateMaxCompletionTokens(obj map[string]any) {
 		return
 	}
 
-	if _, explicit := obj["max_tokens"]; explicit {
+	// null 与缺失同义（下游 injectCatalogMaxTokens 也按未设置处理）：不能因为
+	// 「键存在」就吞掉客户端真正想表达的 max_completion_tokens。
+	if obj["max_tokens"] != nil {
 		return // 显式 max_tokens 优先：别名只删不译
 	}
 	// json.Unmarshal 数字 → float64（整数去整后回写，避免 1.28e5 科学计数法/小数
@@ -196,6 +211,45 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 	if num < gptMinMaxTokens {
 		obj["max_tokens"] = int64(gptMinMaxTokens)
 		log.Printf("max_tokens clamped model=%s %d -> %d", model, num, gptMinMaxTokens)
+	}
+}
+
+// normalizeModelName 把出站 model 剥成裸名：上游只认裸名，realm 前缀是网关侧
+// 路由协议。model 缺失或非字符串时保持原样（不二次错误化坏 body）。
+func normalizeModelName(obj map[string]any) {
+	cur, ok := obj["model"].(string)
+	if !ok {
+		return
+	}
+
+	prefix, rest, ok := strings.Cut(cur, ":")
+	if !ok || rest == "" || (prefix != "cn" && prefix != "global") {
+		return
+	}
+
+	obj["model"] = rest
+}
+
+// injectCatalogMaxTokens 无显式 max_tokens 时按模型目录补默认输出上限。
+// 上游对缺失限额的请求套保守默认（实测 32000）；目录声明的 maxOutputTokens 才是
+// 模型真实预算。`max_tokens: null` 与缺失同义（JSON 里 null 即「未设置」），同样补；
+// 非 null 的显式值优先。模型未收录或上限非正时零操作——目录也没值时 null 整键删除，
+// 不透传（null 不是合法限额，透传只会把无效值带给上游）。
+func injectCatalogMaxTokens(obj map[string]any, maxOut map[string]int64) {
+	cur, has := obj["max_tokens"]
+	if has && cur != nil {
+		return
+	}
+
+	model, _ := obj["model"].(string)
+	if v, ok := maxOut[model]; ok && v > 0 {
+		obj["max_tokens"] = v
+
+		return
+	}
+
+	if has {
+		delete(obj, "max_tokens")
 	}
 }
 
@@ -800,6 +854,37 @@ func normalizePatternProperties(n map[string]any) {
 
 	if rebuilt {
 		n["patternProperties"] = fixed
+	}
+}
+
+// injectAgentCLIObj 给除 leading system 外的每条消息补 agent:"cli"。
+// 官方 HistoryInterceptors 对每个输入项写 providerData.agent（主会话取当前 agent
+// 名 `cli`），itemsToMessages 再把 providerData 摊进消息；leading system 由
+// systemInstructions 单独 unshift，不带该键。客户端已自带非空值时保留，不覆盖。
+func injectAgentCLIObj(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+
+	for i, raw := range msgs {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// 官方 itemsToMessages 先把历史项摊平成消息（保留 providerData，
+		// 其中主会话每条都带 agent），再由调用方 unshift 一条 systemInstructions。
+		// 所以只有首条 system 没有 agent，历史里其余 system 项照常带。
+		if i == 0 {
+			if role, _ := msg["role"].(string); role == "system" {
+				continue
+			}
+		}
+
+		if v, _ := msg["agent"].(string); v == "" {
+			msg["agent"] = "cli"
+		}
 	}
 }
 

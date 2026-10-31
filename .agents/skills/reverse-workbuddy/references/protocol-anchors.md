@@ -33,9 +33,12 @@
     `/v2/enterprises/personal/models`（官方 daemon 侧固定 personal）。
 - 桌面指纹上报：`internal/upstream/desktop.go`：`/v2/report`、
   `/v2/user-asset/appearance/set`、`desktopFingerprint`（commit / releaseDate
-  来自部署 profile，源码无固定构建常量；body 的 `userAgent` 固定为
-  `Node.js/22`（Electron 主进程 `navigator.userAgent`），与 HTTP 头桌面 UA
-  不同源；`os` 为 `Win32`（官方 `navigator.platform`））。
+  来自部署 profile，源码无固定构建常量；`os` / `arch` 取报告服务
+  `OSEventProcessor` 的 `process.platform` / `process.arch`（`win32` / `x64`），
+  `osVersion` / `cpuModel` / `cpuCores` / `memorySize` 取宿主。事件体**不写**
+  `userAgent`；BuddyEventProcessor 在无 buddy 上下文时写空串 `buddyId` /
+  `buddyName`。旧口径 `userAgent=Node.js/22` / `os=Win32` 来自
+  `CloudProductMetricsReporter` 的另一条上报路径，不属于本事件链）。
 
 ## 请求头族
 
