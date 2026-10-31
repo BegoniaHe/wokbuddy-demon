@@ -519,19 +519,32 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 		req.Header.Set("Accept-Language", "*")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 
-		if account.EnterpriseID != "" {
-			req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
-			req.Header.Set("X-Tenant-Id", account.EnterpriseID)
-		}
-	case surfaceBilling, surfaceReport:
-		// billing 域面（meter / report）：企业头只在真有值时发，个人号不发声明头。
-		if account.EnterpriseID != "" {
-			req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
-			req.Header.Set("X-Tenant-Id", account.EnterpriseID)
-		}
+		injectLightEnterpriseHeaders(req, account)
+	case surfaceReport:
+		// /v2/report 与桌面 report 是同一端点：真机同头集，含 X-Product: SaaS
+		// （见 desktop.go 的 ReportDesktopEvent）。billing meter 面不发该头，故
+		// 两者在此分开。
+		req.Header.Set("X-Product", "SaaS")
+
+		injectLightEnterpriseHeaders(req, account)
+	case surfaceBilling:
+		// billing 域面（meter）：企业头只在真有值时发，个人号不发声明头。
+		injectLightEnterpriseHeaders(req, account)
 	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
 		// 不走轻头族（chatFamily() 已在 applyHeaders 分流）。
 	}
+}
+
+// injectLightEnterpriseHeaders 轻头族的条件企业头：企业 ID 非空才发
+// X-Enterprise-Id / X-Tenant-Id；个人号**不发**声明头（与 chat 族的
+// X-No-Enterprise-Id 相反，真机 billing / report / busy / growth 都不带，#298）。
+func injectLightEnterpriseHeaders(req *http.Request, account *auth.Auth) {
+	if account == nil || account.EnterpriseID == "" {
+		return
+	}
+
+	req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
+	req.Header.Set("X-Tenant-Id", account.EnterpriseID)
 }
 
 // baggageValue chat 面 W3C baggage 取值（真机逐字形态）：

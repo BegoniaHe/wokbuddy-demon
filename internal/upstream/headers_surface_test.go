@@ -681,7 +681,7 @@ func TestRefreshHeadersMatchCapture(t *testing.T) {
 
 // TestReportHeadersGoldenSet /v2/report 真机头集：三段式 UA（不是 billing meter 的
 // axios 串）、`Content-Type: application/json;charset=UTF-8`、宽松 Accept、带
-// X-Request-ID；键集精确相等（#367）。
+// X-Request-ID 与 X-Product: SaaS；键集精确相等（#367）。
 func TestReportHeadersGoldenSet(t *testing.T) {
 	t.Parallel()
 
@@ -697,7 +697,7 @@ func TestReportHeadersGoldenSet(t *testing.T) {
 
 	assertHeaderKeys(t, req,
 		"Accept", "Authorization", "Content-Type", "User-Agent", "X-Domain",
-		"X-Request-Id", "X-User-Id",
+		"X-Product", "X-Request-Id", "X-User-Id",
 	)
 
 	for name, want := range map[string]string{
@@ -705,6 +705,7 @@ func TestReportHeadersGoldenSet(t *testing.T) {
 		"Content-Type": "application/json;charset=UTF-8",
 		"User-Agent":   defaultUAString, // 三段式 desktop surface UA
 		"X-Domain":     "www.workbuddy.cn",
+		"X-Product":    "SaaS", // 同端点同头集（桌面 report 也发）
 	} {
 		if got := req.Header.Get(name); got != want {
 			t.Errorf("%s=%q want %q", name, got, want)

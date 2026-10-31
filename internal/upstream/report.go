@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -242,18 +243,24 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // `reportChatRequestSendTelemetry()`，issue #366）。
 //
 // 与 5.8.x 的差异：删掉 maxToken / maxSteps / temperature / maxRetries / skillCount /
-// totalCount（5.9.3 不再发）；新增 isMaxMode（网关无 thinking 覆盖状态，按官方默认
-// false）以及 source / inputAttemptId / connectorId（官方是条件发，网关取不到就整键
-// 不发，不伪造）。
+// totalCount（5.9.3 不再发）；补 isMaxMode。
 //
-// fileUri / vcs* 的具体形态由 VcsInfoProcessor 决定：它拿事件里的 fileUri 当工作区
-// 路径，**只有 fileUri 是非空字符串时**才写 vcsType / vcsRepo / vcsBranchName /
-// vcsRevId 并删掉 fileUri（`if(e&&"string"==typeof e)try{…}finally{delete e.fileUri}`）。
-// 网关没有工作区，fileUri 为空串，处理器不会改写——所以官方在这一形态下发的是
-// `fileUri: ""` 且**没有** vcs* 四键；发四个空串 vcs 键反而是官方从不出现的组合。
+// 条件字段按客户端控制流整键省略，不照抄单份真机样本：
+//   - `source`：官方 `...typeof meta.pendingSource=="string"?{source}:{}`，只有从
+//     特定入口发起才带；网关没有 pendingSource 状态，不发该键。
+//   - `inputAttemptId`：官方 `...s?.inputAttemptId?{inputAttemptId}:{}`，只由技能
+//     推荐链路携带；网关无该上下文，不发该键（同段 recommendId / skillId 才是
+//     `??""` 无条件发）。
+//   - `fileUri` / `vcs*`：官方 fileUri 取 `workspaceFolders?.[0]?.uri?.fsPath`，
+//     无工作区时是空串；`VcsInfoProcessor` 只在 fileUri 非空时写 vcs 四键并删除
+//     fileUri（`if(i&&"string"==typeof i) try{…} finally{delete fileUri}`），空串
+//     则原样保留。网关没有工作区，故发 `fileUri: ""` 且四键缺席。
+//
+// isMaxMode 取 `getOverrideThinking(id)?.thinkingEnabled===true`，普通会话即 false；
+// 网关没有 thinking 覆盖状态，按官方默认值发 false。
 //
 // agentType 只可能是 main / subagent / team，网关模拟本地主会话故发 main；
-// agentName 取官方 `agentName || meta.agentName` 的空值形态（不写死 "default"）。
+// agentName 取桌面内置 CLI 的 "cli"（与 chat_message_send 同口径）。
 // userId 为必填字段（= a.UID）；conversationId 由调用方生成，无需真实会话。
 type chatRequestEvent struct {
 	EventCode             string `json:"eventCode"`
@@ -270,17 +277,15 @@ type chatRequestEvent struct {
 	IsAutoModify          bool   `json:"isAutoModify"`
 	CodebaseEnable        bool   `json:"codebaseEnable"`
 	IsMaxMode             bool   `json:"isMaxMode"`
-	Source                string `json:"source,omitempty"`
 	MentionContexts       []any  `json:"mentionContexts"`
 	KnowledgeID           []any  `json:"knowledgeId"`
 	KnowledgeName         []any  `json:"knowledgeName"`
 	CodebaseID            string `json:"codebaseId"`
 	MentionContextCount   int    `json:"mentionContextCount"`
 	Command               string `json:"command"`
-	ExpertID              string `json:"expertId"`
+	FileURI               string `json:"fileUri"`
 	RecommendID           string `json:"recommendId"`
 	SkillID               string `json:"skillId"`
-	FileURI               string `json:"fileUri"`
 	PresentAt             int64  `json:"presentAt"`
 	TraceID               string `json:"traceId"`
 	RootRequestID         string `json:"rootRequestId"`
@@ -315,9 +320,14 @@ func (c *Client) ReportChatActivityModel(
 		modelName = modelID
 	}
 
-	raw, err := json.Marshal([]chatRequestEvent{
-		newChatRequestEvent(account2, conversationID, requestID, modelID, modelName),
-	})
+	activity := newChatRequestEvent(account2, conversationID, requestID, modelID, modelName)
+
+	event, err := c.chatRequestEventMap(account2, &activity)
+	if err != nil {
+		return fmt.Errorf("ReportChatActivityModel: %w", err)
+	}
+
+	raw, err := json.Marshal([]map[string]any{event})
 	if err != nil {
 		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
@@ -327,17 +337,48 @@ func (c *Client) ReportChatActivityModel(
 	return err
 }
 
+// chatRequestEventMap 把 chat 专属字段与桌面指纹合成一条完整事件，与官方报告
+// 服务的处理链一致：ProductInfo / HostIDEInfo / ExtensionInfo / OS / Userinfo /
+// Buddy 各 processor 会把设备与包指纹注入**每个**事件，chat_request_send 不是例外。
+// 业务字段优先（后者覆盖同名指纹），与官方 processor 的 `e.userId ||= …` 语义相反
+// 的一侧是「事件已带值时保留」，两种写法结果相同。
+//
+// 不补 turn carrier 的 `codebuddy.session_id` / `codebuddy.conversation_request_id`：
+// 官方把它们作为 W3C baggage 的键注入 traceparent/baggage 请求头，从不写进事件体。
+// vcs* 也不补——网关没有工作区，四键缺席而 fileUri 保留空串，见 chatRequestEvent
+// 的条件字段说明。
+func (c *Client) chatRequestEventMap(account *auth.Auth, activity *chatRequestEvent) (map[string]any, error) {
+	raw, err := json.Marshal(activity)
+	if err != nil {
+		return nil, fmt.Errorf("chatRequestEventMap: %w", err)
+	}
+
+	fields := make(map[string]any)
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, fmt.Errorf("chatRequestEventMap: %w", err)
+	}
+
+	event := c.desktopFingerprint(account)
+	maps.Copy(event, fields)
+
+	return event, nil
+}
+
 // newChatRequestEvent 构造 chat_request_send 事件；字段为零值即为官方默认。
-// fileUri 恒发空串：网关没有工作区，官方在该形态下也不会产生 vcs* 四键。
+//
+// 时间三件套按官方 debounce 批模型回填：report() 入队时写 timestamp=now、
+// reportDelay=0，FIRE_DELAY=2s 后才 flush，computeReportDelay 再把每条改成
+// flush-timestamp。因此出站事件是 timestamp≈presentAt（请求发起/入队时刻）、
+// reportDelay≈2000、到达≈两者之和；恒 0 只对应 reportSync / 退出前 flush。
 func newChatRequestEvent(
 	account *auth.Auth, conversationID, requestID, modelID, modelName string,
 ) chatRequestEvent {
-	now := time.Now().UnixMilli()
+	sentAt := time.Now().UnixMilli() - desktopReportDebounceMs
 
 	return chatRequestEvent{
 		EventCode:             "chat_request_send",
-		Timestamp:             now,
-		ReportDelay:           0,
+		Timestamp:             sentAt,
+		ReportDelay:           int(desktopReportDebounceMs),
 		Mode:                  "craft",
 		ConversationID:        conversationID,
 		RequestID:             requestID,
@@ -348,25 +389,26 @@ func newChatRequestEvent(
 		IsAutoExecuteTerminal: false,
 		IsAutoModify:          false,
 		CodebaseEnable:        false,
-		// 网关没有 thinking 覆盖状态，取官方默认 false。
-		IsMaxMode: false,
-		// source / inputAttemptId / connectorId：官方条件发，网关无对应状态 → 不发。
-		MentionContexts:      []any{},
-		KnowledgeID:          []any{},
-		KnowledgeName:        []any{},
-		CodebaseID:           "",
-		MentionContextCount:  0,
-		Command:              "",
-		ExpertID:             "",
-		RecommendID:          "",
-		SkillID:              "",
-		FileURI:              "",
-		PresentAt:            now,
-		TraceID:              requestID,
+		// 网关没有 thinking 覆盖状态，取官方默认值 false。
+		IsMaxMode:           false,
+		MentionContexts:     []any{},
+		KnowledgeID:         []any{},
+		KnowledgeName:       []any{},
+		CodebaseID:          "",
+		MentionContextCount: 0,
+		Command:             "",
+		// 官方无工作区时 fileUri 为空串，VcsInfoProcessor 不写 vcs 四键（空串走
+		// 的是 `if(fileUri)` 的假分支，finally 里的 delete 不执行）。
+		FileURI:     "",
+		RecommendID: "",
+		SkillID:     "",
+		PresentAt:   sentAt,
+		// traceId 是 W3C trace id（随机 v4 形态），与 requestId 的 UUIDv7 不同源。
+		TraceID:              session.NewTraceID(),
 		RootRequestID:        requestID,
 		ParentConversationID: conversationID,
-		// 网关没有 agent 上下文：与官方空值形态一致，不写死默认名。
-		AgentName: "",
+		// 桌面端内置 CLI 主会话：与 chat_message_send 事件同口径。
+		AgentName: "cli",
 		AgentType: "main",
 		UserID:    account.UID,
 	}

@@ -627,6 +627,7 @@ func TestClampGPTMinMaxTokens(t *testing.T) {
 		{"gpt at floor", `{"model":"gpt-6-luna","max_tokens":16,"messages":[]}`, float64(16)},
 		{"gpt above floor", `{"model":"gpt-6-sol","max_tokens":32000,"messages":[]}`, float64(32000)},
 		{"gpt alias translated then clamped", `{"model":"gpt-6-sol","max_completion_tokens":1,"messages":[]}`, float64(16)},
+		{"gpt null max_tokens still translates alias", `{"model":"gpt-6-sol","max_tokens":null,"max_completion_tokens":1,"messages":[]}`, float64(16)},
 		{"gpt absent untouched", `{"model":"gpt-6-sol","messages":[]}`, nil},
 		{"non-gpt untouched", `{"model":"hy4-preview-f","max_tokens":1,"messages":[]}`, float64(1)},
 	}
@@ -652,6 +653,281 @@ func TestClampGPTMinMaxTokens(t *testing.T) {
 				t.Fatalf("max_tokens = %v, want %v", got, item.want)
 			}
 		})
+	}
+}
+
+// TestNormalizeModelNameStripsRealmPrefix 上游只认裸模型名；cn:/global: 是网关
+// 路由协议，出站前必须剥掉，且只认精确小写前缀。
+func TestNormalizeModelNameStripsRealmPrefix(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		model any
+		want  any
+	}{
+		{"cn 前缀", "cn:glm-5.2", "glm-5.2"},
+		{"global 前缀", "global:gpt-5.6-sol", "gpt-5.6-sol"},
+		{"裸名不动", "glm-5.2", "glm-5.2"},
+		{"未知前缀视为裸名", "openai:gpt-5", "openai:gpt-5"},
+		{"空裸名不剥", "cn:", "cn:"},
+		{"非字符串不动", 42, 42},
+	}
+
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			obj := map[string]any{"model": item.model}
+			normalizeModelName(obj)
+
+			if obj["model"] != item.want {
+				t.Fatalf("model=%v want %v", obj["model"], item.want)
+			}
+		})
+	}
+}
+
+// TestInjectCatalogMaxTokens 目录声明的 maxOutputTokens 只补缺失值：显式
+// max_tokens 优先、目录外模型不补、空快照零操作。
+func TestInjectCatalogMaxTokens(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		body      map[string]any
+		maxOut    map[string]int64
+		normalize bool
+		want      any // nil 表示字段不存在
+	}{
+		{
+			"缺省按目录补",
+			map[string]any{"model": "glm-5.2"},
+			map[string]int64{"glm-5.2": 128000},
+			false,
+			int64(128000),
+		},
+		{
+			"显式值优先",
+			map[string]any{"model": "glm-5.2", "max_tokens": int64(100)},
+			map[string]int64{"glm-5.2": 128000},
+			false,
+			int64(100),
+		},
+		{
+			"null 视为未设置",
+			map[string]any{"model": "glm-5.2", "max_tokens": nil},
+			map[string]int64{"glm-5.2": 128000},
+			false,
+			int64(128000),
+		},
+		{
+			"null 且目录无值时整键删除",
+			map[string]any{"model": "glm-5.2", "max_tokens": nil},
+			nil,
+			false,
+			nil,
+		},
+		{
+			"目录外模型不补",
+			map[string]any{"model": "hy4-preview-f"},
+			map[string]int64{"glm-5.2": 128000},
+			false,
+			nil,
+		},
+		{
+			"上限非正不补",
+			map[string]any{"model": "glm-5.2"},
+			map[string]int64{"glm-5.2": 0},
+			false,
+			nil,
+		},
+		{
+			"空快照零操作",
+			map[string]any{"model": "glm-5.2"},
+			nil,
+			false,
+			nil,
+		},
+		{
+			"realm 前缀先剥再查表",
+			map[string]any{"model": "cn:glm-5.2"},
+			map[string]int64{"glm-5.2": 128000},
+			true,
+			int64(128000),
+		},
+	}
+
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			if item.normalize {
+				normalizeModelName(item.body)
+			}
+
+			injectCatalogMaxTokens(item.body, item.maxOut)
+
+			got, has := item.body["max_tokens"]
+			if item.want == nil {
+				if has {
+					t.Fatalf("max_tokens = %v, want absent", got)
+				}
+
+				return
+			}
+
+			if got != item.want {
+				t.Fatalf("max_tokens = %v, want %v", got, item.want)
+			}
+		})
+	}
+}
+
+// TestCatalogMaxTokensClampedForGPT 目录注入先于 GPT 下限 clamp：目录给出小于
+// 16 的上限时同样要抬到 16（顺序反了，注入值会绕过 clamp 直接出站 400）。
+func TestCatalogMaxTokensClampedForGPT(t *testing.T) {
+	t.Parallel()
+
+	out := rewriteChatBody([]byte(`{"model":"gpt-6-sol","messages":[]}`), &chatBodyRewrite{
+		maxOut: map[string]int64{"gpt-6-sol": 8},
+	})
+
+	obj, err := decodeBody(out)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if obj["max_tokens"] != float64(gptMinMaxTokens) {
+		t.Fatalf("max_tokens=%v want %d（目录值也要过 clamp）", obj["max_tokens"], gptMinMaxTokens)
+	}
+}
+
+// TestInjectAgentCLIObj 官方 chat body 除首条 system（systemInstructions）外每条消息
+// 都带 agent:"cli"：历史 user / assistant / 非首位 system 同样补，客户端已有非空值不覆盖。
+func TestInjectAgentCLIObj(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		msgs []any
+		want []any // 每条消息期望的 agent（nil 表示不存在）
+	}{
+		{
+			"除 leading system 外都补",
+			[]any{
+				map[string]any{"role": "system", "content": "sys"},
+				map[string]any{"role": "user", "content": "old"},
+				map[string]any{"role": "assistant", "content": "ok"},
+				map[string]any{"role": "user", "content": "new"},
+				map[string]any{"role": "tool", "content": "result"},
+			},
+			[]any{nil, "cli", "cli", "cli", "cli"},
+		},
+		{
+			"非首位 system 是历史项也要补",
+			[]any{
+				map[string]any{"role": "system", "content": "sys"},
+				map[string]any{"role": "user", "content": "old"},
+				map[string]any{"role": "system", "content": "history note"},
+				map[string]any{"role": "user", "content": "new"},
+			},
+			[]any{nil, "cli", "cli", "cli"},
+		},
+		{
+			"首条非 system 时照常补",
+			[]any{
+				map[string]any{"role": "user", "content": "x"},
+				map[string]any{"role": "system", "content": "history note"},
+			},
+			[]any{"cli", "cli"},
+		},
+		{
+			"已有非空值不覆盖",
+			[]any{
+				map[string]any{"role": "user", "content": "x", "agent": "custom"},
+				map[string]any{"role": "assistant", "content": "y", "agent": "explore"},
+			},
+			[]any{"custom", "explore"},
+		},
+		{
+			"空串按缺失处理",
+			[]any{map[string]any{"role": "user", "content": "x", "agent": ""}},
+			[]any{"cli"},
+		},
+		{
+			"无 user 消息也补 assistant",
+			[]any{map[string]any{"role": "assistant", "content": "x"}},
+			[]any{"cli"},
+		},
+	}
+
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			obj := map[string]any{"messages": item.msgs}
+			injectAgentCLIObj(obj)
+
+			msgs := obj["messages"].([]any)
+			for i, want := range item.want {
+				msg := msgs[i].(map[string]any)
+
+				got, has := msg["agent"]
+				if want == nil {
+					if has {
+						t.Fatalf("msgs[%d].agent = %v, want absent", i, got)
+					}
+
+					continue
+				}
+
+				if got != want {
+					t.Fatalf("msgs[%d].agent = %v, want %v", i, got, want)
+				}
+			}
+		})
+	}
+}
+
+// TestRewriteChatBodyCatalogMaxTokensAndAgent 集成：realm 前缀剥离后按裸名补
+// max_tokens，history 里除 leading system 外每条消息都补 agent:"cli"。
+func TestRewriteChatBodyCatalogMaxTokensAndAgent(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"cn:glm-5.2","messages":[` +
+		`{"role":"system","content":"sys"},` +
+		`{"role":"user","content":"old"},` +
+		`{"role":"assistant","content":"ok"},` +
+		`{"role":"user","content":"new"}]}`
+
+	out := rewriteChatBody([]byte(body), &chatBodyRewrite{
+		maxOut:   map[string]int64{"glm-5.2": 65536},
+		agentCLI: true,
+	})
+
+	obj, err := decodeBody(out)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if obj["model"] != "glm-5.2" {
+		t.Fatalf("model=%v want glm-5.2（realm 前缀应剥掉）", obj["model"])
+	}
+
+	if obj["max_tokens"] != float64(65536) {
+		t.Fatalf("max_tokens=%v want 65536（按目录补）", obj["max_tokens"])
+	}
+
+	msgs := obj["messages"].([]any)
+	if _, has := msgs[0].(map[string]any)["agent"]; has {
+		t.Fatal("leading system 消息不应补 agent")
+	}
+
+	for i := 1; i < len(msgs); i++ {
+		if got := msgs[i].(map[string]any)["agent"]; got != "cli" {
+			t.Fatalf("msgs[%d].agent=%v want cli（官方逐条摊 providerData.agent）", i, got)
+		}
 	}
 }
 

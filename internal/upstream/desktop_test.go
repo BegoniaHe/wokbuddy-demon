@@ -47,13 +47,13 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 		t.Errorf("UA=%q want %q", gotUA, want)
 	}
 
-	// body 的 userAgent 取 Electron 主进程 navigator.userAgent，与 HTTP 头不同源。
-	if got[0]["userAgent"] != desktopReportUA {
-		t.Errorf("userAgent=%v want %q（navigator.userAgent）", got[0]["userAgent"], desktopReportUA)
+	// 官方报告服务不写 userAgent（只有 Web 上报面才有浏览器 UA）。
+	if _, ok := got[0]["userAgent"]; ok {
+		t.Errorf("userAgent=%v 不应出现在桌面报告体（官方 OSEventProcessor 不写该键）", got[0]["userAgent"])
 	}
 
-	if got := got[0]["os"]; got != "Win32" {
-		t.Errorf("os=%v want Win32（navigator.platform）", got)
+	if got := got[0]["os"]; got != "win32" {
+		t.Errorf("os=%v want win32（process.platform）", got)
 	}
 
 	assertDesktopEventFingerprint(t, got)
@@ -73,6 +73,12 @@ func assertReportDesktopRequest(t *testing.T, r *http.Request) {
 
 	if r.Header.Get("X-Product") != "SaaS" {
 		t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
+	}
+
+	// 个人号不发企业声明头：与 surfaceReport 同口径，只有企业 ID 非空才发
+	// X-Enterprise-Id / X-Tenant-Id（#298）。
+	if got := r.Header.Get("X-No-Enterprise-Id"); got != "" {
+		t.Errorf("X-No-Enterprise-Id=%q want empty（桌面 report 个人号不发声明头）", got)
 	}
 
 	if got := r.Header.Get("X-Request-ID"); !uuidV7HeaderPattern.MatchString(got) {
@@ -111,8 +117,8 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 		t.Errorf("业务字段 mode=%v 被指纹覆盖或缺失", table["mode"])
 	}
 
-	if got, ok := table["reportDelay"].(float64); !ok || got != 0 {
-		t.Errorf("reportDelay=%v want 0（单请求立即发送）", table["reportDelay"])
+	if got, ok := table["reportDelay"].(float64); !ok || int64(got) != desktopReportDebounceMs {
+		t.Errorf("reportDelay=%v want %d（单条事件=debounce 窗口）", table["reportDelay"], desktopReportDebounceMs)
 	}
 
 	if _, ok := table["presentAt"]; ok {
@@ -128,8 +134,74 @@ func assertDesktopEventFingerprint(t *testing.T, got []map[string]any) {
 	assertDesktopMachineFingerprint(t, table)
 }
 
+// TestStampDesktopReportDelay 批模型：末条=debounce 窗口，越早的事件越大。
+func TestStampDesktopReportDelay(t *testing.T) {
+	t.Parallel()
+
+	now := int64(1_800_000_000_000)
+	arr := []map[string]any{{}, {}, {}}
+	stampDesktopReportDelay(arr, []bool{false, false, false}, now)
+
+	want := []int64{
+		desktopReportDebounceMs + 2*desktopEventGapMs,
+		desktopReportDebounceMs + desktopEventGapMs,
+		desktopReportDebounceMs,
+	}
+
+	for i, m := range arr {
+		if got, ok := m["reportDelay"].(int64); !ok || got != want[i] {
+			t.Errorf("event[%d] reportDelay=%v want %d", i, m["reportDelay"], want[i])
+		}
+
+		if got, ok := m["timestamp"].(int64); !ok || got != now-want[i] {
+			t.Errorf("event[%d] timestamp=%v want %d", i, m["timestamp"], now-want[i])
+		}
+	}
+}
+
+// TestStampDesktopReportDelayKeepsOwnTimestamp 业务自带 timestamp 时保留事件时间，
+// 只按 flush 时刻重算延迟（对齐官方 computeReportDelay）。
+func TestStampDesktopReportDelayKeepsOwnTimestamp(t *testing.T) {
+	t.Parallel()
+
+	now := int64(1_800_000_000_000)
+	own := now - 500
+	arr := []map[string]any{{"timestamp": own}}
+	stampDesktopReportDelay(arr, []bool{true}, now)
+
+	if got, _ := arr[0]["reportDelay"].(int64); got != 500 {
+		t.Errorf("reportDelay=%v want 500", arr[0]["reportDelay"])
+	}
+
+	if got, _ := arr[0]["timestamp"].(int64); got != own {
+		t.Errorf("timestamp=%v want %d", arr[0]["timestamp"], own)
+	}
+}
+
+// TestDesktopReportEventsNonNumericTimestampFallsBack 业务载荷的 timestamp 不可
+// 解析（字符串 / nil）时按批模型回填，不留下 reportDelay=0 + 非法时间戳的矛盾组合。
+func TestDesktopReportEventsNonNumericTimestampFallsBack(t *testing.T) {
+	t.Parallel()
+
+	now := int64(1_800_000_000_000)
+	arr := desktopReportEvents(
+		map[string]any{"timestamp": now},
+		[]DesktopEvent{{"eventCode": "x", "timestamp": "not-a-number"}},
+		now,
+	)
+
+	wantAt := now - desktopReportDebounceMs
+	if got, ok := arr[0]["timestamp"].(int64); !ok || got != wantAt {
+		t.Errorf("timestamp=%v want %d（不可解析时按批模型回填）", arr[0]["timestamp"], wantAt)
+	}
+
+	if got, ok := arr[0]["reportDelay"].(int64); !ok || got != desktopReportDebounceMs {
+		t.Errorf("reportDelay=%v want %d", arr[0]["reportDelay"], desktopReportDebounceMs)
+	}
+}
+
 // TestReportDesktopEventBusinessFieldsOverride 业务载荷同名键优先于公共指纹：
-// 真实设备对齐时可用 os / userAgent 覆盖默认伪装值。
+// 真实设备对齐时可用 os 等指纹键覆盖默认值（userAgent 默认不存在，传入即新增）。
 func TestReportDesktopEventBusinessFieldsOverride(t *testing.T) {
 	t.Parallel()
 
@@ -260,25 +332,25 @@ func TestDesktopFingerprintPerRealm(t *testing.T) {
 		t.Errorf("CN desktop UA=%q want %q", got, want)
 	}
 
-	assertDesktopReportUAAndOS(t, cnFP, "CN")
+	assertDesktopReportOS(t, cnFP, "CN")
 
 	if got, want := client.desktopUAFor(globalAccount), "workbuddy-ai/9.9.10 workbuddy-ai/9.9.10 CLI/8.8.9"; got != want {
 		t.Errorf("global desktop UA=%q want %q", got, want)
 	}
 
-	assertDesktopReportUAAndOS(t, globalFP, "global")
+	assertDesktopReportOS(t, globalFP, "global")
 }
 
-// assertDesktopReportUAAndOS 断言 body 的 userAgent 取 navigator 形态、os 对齐 Win32。
-func assertDesktopReportUAAndOS(t *testing.T, fingerprint map[string]any, realm string) {
+// assertDesktopReportOS 断言 body 的 os 对齐 Node 运行时平台串，且不伪造 userAgent。
+func assertDesktopReportOS(t *testing.T, fingerprint map[string]any, realm string) {
 	t.Helper()
 
-	if fingerprint["userAgent"] != desktopReportUA {
-		t.Errorf("%s userAgent=%v want %q", realm, fingerprint["userAgent"], desktopReportUA)
+	if fingerprint["os"] != "win32" {
+		t.Errorf("%s os=%v want win32", realm, fingerprint["os"])
 	}
 
-	if fingerprint["os"] != "Win32" {
-		t.Errorf("%s os=%v want Win32", realm, fingerprint["os"])
+	if _, ok := fingerprint["userAgent"]; ok {
+		t.Errorf("%s userAgent=%v 不应出现在桌面报告体", realm, fingerprint["userAgent"])
 	}
 }
 
@@ -331,6 +403,101 @@ func TestDesktopChatSequenceShape(t *testing.T) {
 
 	if resp["conversationId"] != "conv-1" {
 		t.Errorf("conversationId=%v want conv-1", resp["conversationId"])
+	}
+}
+
+// TestDesktopChatSequenceReportShape 桌面链的 chat_* 事件与 CLI 上报（report.go）
+// 同口径对齐 5.9.3：不再带 5.8.x 的 maxToken 等字段，补 requestId /
+// requestModelId / requestModelName，且无专家上下文时不发 expertId。
+func TestDesktopChatSequenceReportShape(t *testing.T) {
+	t.Parallel()
+
+	events := DesktopChatSequence("conv-1", "req-1", "msg-1", "fast-model", "Fast Model")
+
+	requestSend := events[2]
+	for _, stale := range []string{
+		"maxToken", "maxSteps", "temperature", "maxRetries", "skillCount", "totalCount",
+	} {
+		if _, ok := requestSend[stale]; ok {
+			t.Errorf("chat_request_send 仍带 5.8.x 字段 %q", stale)
+		}
+	}
+
+	if requestSend["isMaxMode"] != false || requestSend["requestId"] != "req-1" {
+		t.Errorf("isMaxMode=%v requestId=%v want false/req-1",
+			requestSend["isMaxMode"], requestSend["requestId"])
+	}
+
+	if requestSend["requestModelId"] != "fast-model" || requestSend["requestModelName"] != "Fast Model" {
+		t.Errorf("requestModelId/Name=%v/%v want fast-model/Fast Model",
+			requestSend["requestModelId"], requestSend["requestModelName"])
+	}
+
+	if _, ok := requestSend["expertId"]; ok {
+		t.Errorf("无专家上下文时 expertId 应整键省略（官方 undefined 序列化）")
+	}
+
+	// turn carrier 键是 W3C baggage 头，不是事件字段（5.9.3 事件体无构造点）。
+	assertDesktopEventsLackKeys(t, events,
+		"codebuddy.session_id", "codebuddy.conversation_request_id")
+}
+
+// assertDesktopEventsLackKeys 断言每个事件都不含给定键（用于确认请求头专用的
+// 字段没有被误写进事件体）。
+func assertDesktopEventsLackKeys(t *testing.T, events []DesktopEvent, keys ...string) {
+	t.Helper()
+
+	for i, event := range events {
+		for _, key := range keys {
+			if _, ok := event[key]; ok {
+				t.Errorf("events[%d] 不应带键 %q", i, key)
+			}
+		}
+	}
+}
+
+// TestDesktopChatSequenceRequestModelFields 桌面链各事件都带 5.9.3 的
+// requestId / requestModelId / requestModelName，供后台按模型归因。
+func TestDesktopChatSequenceRequestModelFields(t *testing.T) {
+	t.Parallel()
+
+	events := DesktopChatSequence("conv-1", "req-1", "msg-1", "fast-model", "Fast Model")
+
+	messageSend := events[1]
+	if messageSend["requestId"] != "req-1" || messageSend["requestModelId"] != "fast-model" {
+		t.Errorf("chat_message_send requestId/requestModelId=%v/%v",
+			messageSend["requestId"], messageSend["requestModelId"])
+	}
+
+	if got := events[5]["requestModelName"]; got != "Fast Model" {
+		t.Errorf("chat_request_response.requestModelName=%v want Fast Model", got)
+	}
+}
+
+// TestDesktopChatSequenceTraceID 整条链共用会话级 traceId：随机 UUIDv4，
+// 与 UUIDv7 的 requestId 不同源。
+func TestDesktopChatSequenceTraceID(t *testing.T) {
+	t.Parallel()
+
+	events := DesktopChatSequence("conv-1", "req-1", "msg-1", "fast-model", "Fast Model")
+
+	traceID, _ := events[2]["traceId"].(string)
+	if !uuidV4TestPattern.MatchString(traceID) {
+		t.Fatalf("traceId=%q want 32 位 UUIDv4 形态", traceID)
+	}
+
+	if traceID == "req-1" {
+		t.Fatalf("traceId 复用了 requestId")
+	}
+
+	for _, i := range []int{1, 2, 3, 4, 5} {
+		if got := events[i]["traceId"]; got != traceID {
+			t.Errorf("events[%d].traceId=%v want %q（整条链共用会话 trace）", i, got, traceID)
+		}
+
+		if got := events[i]["rootRequestId"]; got != "req-1" {
+			t.Errorf("events[%d].rootRequestId=%v want req-1", i, got)
+		}
 	}
 }
 
