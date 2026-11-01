@@ -1,0 +1,7 @@
+interface:
+  display_name: 'Ship an Issue as a PR'
+  short_description: 'Implement a planned issue and prepare its pull request'
+  default_prompt: 'Use $issue-to-pr to implement this issue from its plan, run the focused checks and cold review, then prepare a template-matched PR body under .tmp/issue-pr/ without merging.'
+
+policy:
+  allow_implicit_invocation: true

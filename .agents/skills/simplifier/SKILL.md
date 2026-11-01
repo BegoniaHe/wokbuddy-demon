@@ -96,6 +96,7 @@ User insists on the larger version → build it, no re-arguing.
 - Repo policy: `AGENTS.md`
 - Reference-fork audit: `sync-upstream`
 - Plans: `plan-issue`
+- Delivery: `issue-to-pr`
 
 ## Verify
 

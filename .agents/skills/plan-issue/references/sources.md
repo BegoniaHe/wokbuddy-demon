@@ -56,3 +56,25 @@ cc.bruniaux.com plan-pipeline were not vendored; usable rules
 (analyze-before-implement gate; file-existence / acyclic-deps as
 mechanical bars; clarify as a completeness check) are in
 `references/probe.md` and `references/verification.md`.
+
+## PRD and requirement-shaping sources
+
+Checked and adopted after the first source table. Only the listed rules
+entered this skill; no template, directory, or score was vendored.
+
+| Source | What this skill kept | What this skill dropped |
+| --- | --- | --- |
+| [jamesrochabrun/skills](https://github.com/jamesrochabrun/skills) `prd-generator` | Discovery questions for goal, users, constraints, and explicit non-goals; placed requirements with testable acceptance | Personas, AARRR/HEART metric catalogs, stakeholder sign-off, `validate_prd.sh` |
+| [silvainfm/claude-skills](https://github.com/silvainfm/claude-skills) `project-planner-skill` | Requirement IDs mapped to tasks; WHEN/IF acceptance phrasing; interface-first design | Three-document package, Python generators, project-architect role prompt |
+| [imohammadfaraz/claude-skills-for-product-manager](https://github.com/imohammadfaraz/claude-skills-for-product-manager) | Separate problem from solution; name empty, auth-failure, and degraded paths | Product-manager personas and PRD template |
+| [znck/spec-driven-development](https://github.com/znck/spec-driven-development) | Spec before code; keep planning state out of product docs | `.specs/` tree and versioned spec ceremony |
+| [eyaltoledano/claude-task-master](https://github.com/eyaltoledano/claude-task-master) | Dependency-aware task graph; work the frontier | CLI/MCP integration, task JSON format |
+| [galyarderlabs `prd-to-issues`](https://www.skillsdirectory.com/skills/galyarderlabs-prd-to-issues-e0da0443) | Tracer-bullet vertical slices; AFK/HITL task split | Auto-filed sub-Issues, native blocking links |
+| TDD katas: [GildedRose](https://github.com/emilybache/GildedRose-Refactoring-Kata), [Tennis](https://github.com/emilybache/Tennis-Refactoring-Kata), [garora/TDD-Katas](https://github.com/garora/TDD-Katas) | Red-before-green loop and a seam per slice | Kata catalogue as practice material, bootstraps |
+
+`galyarderlabs/prd-to-issues` was confirmed only through the skills
+directory page; `testdouble/contrived-code-katas` and
+`swkaberlin/kata-bootstraps` returned 404 at check time and are not cited as
+sources. Delivery-side sources (`implement`, `implement-spec`, `pr`,
+`code-review`, `tdd`) are recorded in
+`../issue-to-pr/references/sources.md`, not here.

@@ -68,6 +68,17 @@ zero-coverage requirements are BLOCKING.
     Desired behavior without a measurable outcome are BLOCKING.
 12. **Bug loop:** a `bug` plan names the red-capable command from
     research. A missing loop is BLOCKING.
+13. **Traceability:** when Desired behavior defines R-IDs, each maps to a
+    task, and each `Covers:` claim is exercised by that task's Acceptance.
+    The script catches unknown or unmapped IDs; an ID claimed by a task that
+    does not test it is BLOCKING.
+14. **Seams:** each task's test observes a public boundary, preferably an
+    existing one. A test planned against a private method or internal
+    collaborator is SUGGESTIONS when the real behavior is still covered,
+    BLOCKING when it would pass without the bug or feature.
+15. **Task mode:** an AFK task must be completable without a human. An HITL
+    task names the decision, credential, live probe, or visual judgment that
+    gates it. A task that silently needs approval is BLOCKING.
 
 Report the judgment pass as:
 
@@ -89,6 +100,9 @@ Empty BLOCKING is good if you actually checked.
 - The plan implements the ticket patch after reflection showed a
   different job and the chosen path is `better`
 - A requirement has no task and is not in Out of scope
+- An AFK task needs a human decision, credential, or live access it
+  does not name
+- A planned test cannot go red on the behavior it claims to cover
 - A `Modify:` path does not exist
 - Decision coverage still has unresolved contradictions that would change
   architecture or acceptance

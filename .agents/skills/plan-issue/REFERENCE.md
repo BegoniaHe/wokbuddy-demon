@@ -119,3 +119,8 @@ failure-path task.
 | --------------------------------------------- | ---------------- |
 | Audit `misakano7545/workbuddy2api-panel`      | `sync-upstream`  |
 | Change this checkout from an Issue or request | `plan-issue` (this skill) |
+| Ship an accepted plan as a branch and PR      | `issue-to-pr`    |
+
+A finished workspace is the delivery contract. `issue-to-pr` reads `PLAN.md`
+and `RESEARCH.md` from `.tmp/issue-plan/<run-id>/`; it does not re-research or
+re-scope. If the plan's SHA has drifted, refresh the plan here first.

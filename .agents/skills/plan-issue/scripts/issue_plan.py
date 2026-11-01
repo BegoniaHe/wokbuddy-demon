@@ -25,14 +25,17 @@ SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 ISSUE_ID_RE = re.compile(r"^issue-\d+$")
 LOCAL_ID_RE = re.compile(r"^local-[a-z0-9]+(?:-[a-z0-9]+)*$")
 REQUIRED_HEADINGS = (
-    "Goal",
-    "Architecture",
     "Constraints",
     "Current behavior",
     "Desired behavior",
     "Out of scope",
     "Tasks",
     "Verification",
+)
+GOAL_RE = re.compile(r"^\*{0,2}Goal:\*{0,2}\s+\S", re.IGNORECASE | re.MULTILINE)
+ARCHITECTURE_RE = re.compile(
+    r"^\*{0,2}Architecture:\*{0,2}\s+\S",
+    re.IGNORECASE | re.MULTILINE,
 )
 RESEARCH_HEADINGS = (
     "Request",
@@ -60,6 +63,20 @@ HEADING_RE = re.compile(r"^(#{1,3})\s+(.*\S)\s*$")
 TASK_HEADING_RE = re.compile(r"^###\s+Task\b", re.IGNORECASE)
 FILES_RE = re.compile(r"^\*{0,2}Files:\*{0,2}\s*$", re.IGNORECASE)
 VERIFY_RE = re.compile(r"^\*{0,2}Verify:\*{0,2}\s*$", re.IGNORECASE)
+MODE_LINE_RE = re.compile(
+    r"^\s*\*{0,2}Mode:\*{0,2}\s*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+COVERS_LINE_RE = re.compile(
+    r"^\s*\*{0,2}Covers:\*{0,2}\s*(.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+REQ_DEF_RE = re.compile(
+    r"^\s*[-*]\s+\*{0,2}(R\d+)\*{0,2}\s*[:：]",
+    re.MULTILINE,
+)
+REQ_ID_RE = re.compile(r"\bR\d+\b")
+TASK_MODES = ("AFK", "HITL")
 COMMAND_RE = re.compile(
     r"```(?:bash|sh|zsh)?\s*$|^\s*(?:go |make |bash |python3? |golangci-lint |\./|cd )",
     re.IGNORECASE | re.MULTILINE,
@@ -210,6 +227,10 @@ def validate_plan(markdown: str) -> list[str]:
     for heading in REQUIRED_HEADINGS:
         if heading not in titles:
             errors.append(f"missing heading: {heading}")
+    if GOAL_RE.search(markdown) is None:
+        errors.append("missing **Goal:** line")
+    if ARCHITECTURE_RE.search(markdown) is None:
+        errors.append("missing **Architecture:** line")
     tasks = [
         (title, body)
         for level, title, body in sections
@@ -230,6 +251,8 @@ def validate_plan(markdown: str) -> list[str]:
     forbidden = FORBIDDEN_RE.search(markdown)
     if forbidden:
         errors.append(f"forbidden artifact: {forbidden.group(0)}")
+    errors.extend(validate_requirement_coverage(markdown))
+    errors.extend(validate_task_modes(markdown))
     return errors
 
 
@@ -341,6 +364,52 @@ def validate_task_graph(markdown: str) -> list[str]:
     if remaining:
         cycle = ", ".join(f"Task {item}" for item in sorted(remaining))
         errors.append(f"Blocked by cycle: {cycle}")
+    return errors
+
+
+def validate_requirement_coverage(markdown: str) -> list[str]:
+    """Return errors when R-IDs are unmapped or Covers names an unknown ID."""
+    sections = split_sections(markdown)
+    desired = ""
+    task_bodies: list[str] = []
+    for level, title, body in sections:
+        if level == 2 and title == "Desired behavior":
+            desired = body
+        elif level == 3 and TASK_HEADING_RE.match(f"### {title}"):
+            task_bodies.append(body)
+    defined = list(dict.fromkeys(REQ_DEF_RE.findall(desired)))
+    covers: list[str] = []
+    for body in task_bodies:
+        for match in COVERS_LINE_RE.finditer(body):
+            covers.extend(REQ_ID_RE.findall(match.group(1)))
+    covers = list(dict.fromkeys(covers))
+    if not defined and not covers:
+        return []
+    if not defined:
+        return ["Covers names an R-ID that Desired behavior does not define"]
+    if not covers:
+        return ["Desired behavior defines R-IDs but no task has Covers:"]
+    errors = [
+        f"Desired behavior {rid} has no task Covers:"
+        for rid in defined
+        if rid not in covers
+    ]
+    errors.extend(
+        f"Covers names undefined {rid}" for rid in covers if rid not in defined
+    )
+    return errors
+
+
+def validate_task_modes(markdown: str) -> list[str]:
+    """Return errors for a task Mode outside AFK and HITL."""
+    errors: list[str] = []
+    for level, title, body in split_sections(markdown):
+        if level != 3 or TASK_HEADING_RE.match(f"### {title}") is None:
+            continue
+        for match in MODE_LINE_RE.finditer(body):
+            value = match.group(1).strip().strip("*_` ").upper()
+            if value not in TASK_MODES:
+                errors.append(f"{title}: Mode must be AFK or HITL, got {value!r}")
     return errors
 
 

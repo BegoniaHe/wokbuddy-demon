@@ -1,6 +1,6 @@
 ---
 name: plan-issue
-description: Turn a wokbuddy-demon GitHub Issue or change request into a code-backed implementation plan with file paths, acceptance criteria, and verification commands. Use when planning, triage, or a specification is requested; not for direct implementation, reference-fork audits, or product audits.
+description: Turn a wokbuddy-demon GitHub Issue or change request into a code-backed implementation plan with file paths, acceptance criteria, and verification commands, and grill a design when asked. Use when planning, triage, a specification or interview is requested, or the user asks to grill a plan; not for direct implementation, reference-fork audits, or product audits.
 license: MIT
 compatibility: >
   Codex CLI or OpenCode in the BegoniaHe/wokbuddy-demon checkout. Requires
@@ -31,8 +31,8 @@ facts or require approval of each intermediate document. Use the existing
 `--skip-probe` workspace mode to record that a guided interview is unnecessary.
 This skips the interview, not research or verification.
 
-Use guided probe only when the user asks for an interview, quiz, or facilitated
-design discussion. Read `references/probe.md` for that mode. A user can leave
+Use guided probe only when the user asks for an interview, quiz, grill, or
+facilitated design discussion. Read `references/probe.md` for that mode. A user can leave
 it at any time; keep their answers and continue without repeating questions.
 
 Ask only about unresolved decisions that change scope, architecture, behavior,
@@ -123,6 +123,13 @@ acceptance criteria, dependencies, and a real verification command. Include
 `config.example.json` synchronization and `README.md` updates where the behavior
 requires them. Do not paste full implementations into the plan.
 
+Scale traceability to risk. For `large` and `complex` plans, prefix desired
+behavior with `R<n>` IDs and map each in a task's `Covers:`; the validator
+rejects an unmapped ID or an unknown one. Mark tasks `**Mode:** HITL` when a
+human decision or live access gates them, and name that gate in Acceptance.
+Name the test **Seam** for every behavior task so the executor tests a public
+boundary, not an internal collaborator.
+
 Run:
 
 ```bash
@@ -145,3 +152,7 @@ For a planning-only request, stop here. For implementation already authorized
 in this conversation, use the finished plan and proceed. If implementation
 needs new authorization, ask once after the plan is reviewable and explain
 that the original request covered planning only.
+
+When the work continues to a branch and PR in this session, hand the workspace
+to `issue-to-pr`: it reads `PLAN.md` and `RESEARCH.md`, works the task frontier,
+and prepares the PR. Do not re-plan inside the delivery loop.

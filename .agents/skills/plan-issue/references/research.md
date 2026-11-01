@@ -120,6 +120,12 @@ Write the happy path and the relevant failure path as 触发 → 函数/阶段
 → 可观察结果. Quote only the lines that carry the signal. Name the
 symbol, not just the file.
 
+For a user-visible flow, check which of these exist before planning a fix:
+empty or first-run state, gateway or panel auth failure, upstream error or
+timeout, degraded mode after a breaker opens, and a missing credential. Record
+each as present with `path:line`, absent as a finding, or "not applicable" with
+a reason. Do not invent recovery behavior the request did not ask for.
+
 For a bug: distinguish **symptom** (what fails) from **mechanism**
 (how the current path produces it). Name one **red-capable** command
 that would catch the reporter's exact symptom (test, curl, CLI, or a

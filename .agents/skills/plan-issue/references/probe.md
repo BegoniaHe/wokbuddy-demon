@@ -19,7 +19,8 @@ uv run python .agents/skills/plan-issue/scripts/issue_plan.py skip-probe
 Write the following records concisely; they do not require separate approval:
 
 1. `BRIEF.md`: `**Problem:**` with the affected user, present behavior, and
-   desired outcome; name the runtime owner from research.
+   desired outcome; name the runtime owner from research. State the job, not
+   only the ticket's proposed patch: the Issue is a candidate solution.
 2. `QUIZ.md`: record that no guided interview was used. Preserve any real
    answers from an earlier guided phase, but do not invent questions.
 3. `REFLECT.md`: compare the current-path change with any justified alternative
@@ -108,10 +109,26 @@ This measures specification completeness, not the user's code knowledge. Record
 the question, options if used, actual answer, score, and remaining uncertainty.
 Explain material conflicts directly; do not force a retry or another quiz.
 
+Work the interview as a **design tree** in rounds. A question belongs to the
+current round only when everything it depends on is already settled; ask the
+whole current frontier at once, numbered, each with your recommended answer,
+and word it so "yes" accepts that recommendation. Answers reshape the tree, so
+dependent questions wait for the next round. Do not ask the user for a fact a
+grep, test, or `git log` can settle.
+
 Use `override` when the user chooses to proceed despite remaining uncertainty.
 If they end the interview, run `skip-probe`, preserve their answers, mark the
 verdict `skipped`, and continue in direct mode. Neither a score nor a path
 selection authorizes implementation or external writes.
+
+## Fog at `complex` depth
+
+When the destination is not yet sharp enough to state an executable slice, do
+not invent tasks to fill the plan. Write the unresolved area and the decision
+that would unblock it in `QUESTIONS.md`, keep `PLAN.md` at the decisions you can
+defend, and say the plan is not ready to execute. A question you can phrase
+precisely is a slice candidate; an area you can only gesture at stays fog until
+the blocking decision lands.
 
 ## Closing coverage
 

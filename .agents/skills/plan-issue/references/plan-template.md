@@ -33,7 +33,16 @@ docs) a change here would touch.
 ## Desired behavior
 
 Testable outcomes, including failure paths that matter. Prefer
-WHEN/THEN (or WHILE/IF) so each line has one interpretation.
+WHEN/THEN (or WHILE/IF) so each line has one interpretation. For
+`large` and `complex` plans, prefix each bullet with a stable ID:
+
+```markdown
+- R1: WHEN <trigger> THEN <observable>
+- R2: IF <failure> THEN <observable>
+```
+
+The validator requires every defined ID to appear in some task's
+`Covers:` and rejects an ID no bullet defines. Small plans may skip IDs.
 
 ## Out of scope
 
@@ -43,7 +52,10 @@ Bullet list. Include adjacent features that will look related.
 
 ### Task 1: <observable slice>
 
+**Covers:** <R-IDs from Desired behavior; omit when it defines none>
+**Mode:** AFK | HITL (delete the line when the task is AFK)
 **Blocked by:** none (or Task N)
+**Seam:** <public boundary the test observes, or "none: docs only">
 
 **Files:**
 
@@ -101,6 +113,16 @@ Non-blocking assumptions only. Blocking questions belong in
 - Every task has **Files**, **Acceptance**, and **Verify** with a real
   command from `REFERENCE.md`. **Blocked by** is required when tasks
   are not a linear chain.
+- **Seam:** name the public boundary the test observes. Prefer an
+  existing seam and the highest one that reaches the behavior; a new
+  seam needs a stated reason. Do not plan a test against a private
+  method or an internal collaborator.
+- **Covers:** map the task to the R-IDs it closes. A requirement with
+  no task is a plan defect, not an implementation detail.
+- **Mode:** mark `HITL` only when a human decision, credential, live
+  probe, or visual judgment gates the task; say which one in
+  **Acceptance**. Leave every other task AFK so an executor can work
+  the frontier alone. Never mark HITL to dodge work.
 - Fold scaffolding, config, and docs into the task that needs them.
 - If a task would exceed about five files or two independent
   subsystems, split it.
