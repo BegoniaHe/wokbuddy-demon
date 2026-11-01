@@ -9,9 +9,10 @@ import (
 	"testing"
 )
 
-// loginHit 记录一次设备授权请求的路径与头，供头集断言使用。
+// loginHit 记录一次设备授权请求的路径、查询与头，供头集断言使用。
 type loginHit struct {
 	path   string
+	query  string
 	header http.Header
 }
 
@@ -22,7 +23,7 @@ func recordLoginFlow(t *testing.T, realm, platform, origin string) []loginHit {
 	var hits []loginHit
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hits = append(hits, loginHit{path: r.URL.Path, header: r.Header.Clone()})
+		hits = append(hits, loginHit{path: r.URL.Path, query: r.URL.RawQuery, header: r.Header.Clone()})
 
 		switch r.URL.Path {
 		case "/v2/plugin/auth/state":
@@ -52,13 +53,18 @@ func recordLoginFlow(t *testing.T, realm, platform, origin string) []loginHit {
 }
 
 // assertLoginProductHeaders 断言单条设备授权请求的产品头与未登录态声明头。
-func assertLoginProductHeaders(t *testing.T, hit loginHit, wantPath, wantNoAuth string, bearer bool) {
+// platform 非空时还核对 auth/state 的查询参数，避免两域身份串用。
+func assertLoginProductHeaders(t *testing.T, hit loginHit, wantPath, wantNoAuth, platform string, bearer bool) {
 	t.Helper()
 
 	if hit.path != wantPath {
 		t.Errorf("path=%s want %s", hit.path, wantPath)
 
 		return
+	}
+
+	if platform != "" && hit.query != "platform="+platform {
+		t.Errorf("%s query=%q want platform=%s", wantPath, hit.query, platform)
 	}
 
 	header := hit.header
@@ -115,7 +121,14 @@ func TestLoginDeviceAuthSendsXProduct(t *testing.T) {
 			}
 
 			for i := range want {
-				assertLoginProductHeaders(t, hits[i], want[i].path, want[i].wantNoAuth, want[i].bearer)
+				platform := ""
+				if want[i].path == "/v2/plugin/auth/state" {
+					platform = item.platform
+				}
+
+				assertLoginProductHeaders(
+					t, hits[i], want[i].path, want[i].wantNoAuth, platform, want[i].bearer,
+				)
 			}
 		})
 	}
