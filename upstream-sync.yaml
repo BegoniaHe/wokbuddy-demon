@@ -14,29 +14,30 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 5caddab9958ed719c7fa6329a37de45747d34cf9
-  audited_at_utc: 2026-10-30T16:31:53Z
+  commit: 4d7d1e670ce45e72f2db80e2812a133c05bf91ae
+  audited_at_utc: 2026-11-01T08:42:21Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
-    from: 2026-10-30
-    to: 2026-10-30
-    non_merge_commits: 5
+    from: 2026-10-31
+    to: 2026-11-01
+    non_merge_commits: 31
   dispositions:
-    issue: 1
-    revisit: 1
-    skip: 3
+    issue: 2
+    revisit: 10
+    skip: 19
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/429
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/432
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/433
   note: >-
-    2026-10-30 审计 9f70e00..5caddab（5 条非 merge），官方 Win32 基线刷新为
-    cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901。开 #429：
-    一键完成先批量拉默认/mp 列表，随后 26 个动作又逐项 ListTasks，mp 专属码再回落，
-    列表外 code 也会先空查询。当前仓已不会为列表外任务 accept/report/claim，所以
-    Issue 只要求每轮复用任务快照、预过滤并保留列表失败降级；收益是消除重复 GET、
-    降低软限流概率，不改任务目录或领奖语义。96a33f1 声称四个任务下架并删除夜猫子
-    排程，但官方 app-asar 无 growth/tasks 与任务 code 字面量，任务目录由服务端下发，
-    本仓也无运行时快照，按 revisit；其余 3 条纯注释/文案清理依赖该未证实前提，按 skip。
-    审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
+    2026-11-01 审计 5caddab..4d7d1e67（31 条非 merge）。官方更新接口版本未变，
+    仍是 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，沿用本地
+    已解包的 Win32 app-asar。开 #432：非流式 mergeUsageTotals 与流式续写都把
+    prompt/cache 按段数累加，续写段 prompt 已含整段上下文。开 #433：登录
+    auth/state、auth/token、login/account 未发 REST 拦截器必补的 X-Product: SaaS。
+    头名大小写、头序、JA3、Connection、Accept-Encoding、15021、登录禁 h2、
+    chat 面 X-No-* 取值 "1" 对照官方字面量 "true"，都只有抓包能定案，记 revisit。
+    代理池、历史裁剪、跨账号合计、6020 不轮转、分域 base 编辑本仓已有等价行为，
+    按 skip。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
