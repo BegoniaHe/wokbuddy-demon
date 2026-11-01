@@ -154,6 +154,9 @@ func commonHeaders(origin, userAgent string) func(*http.Request) {
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Referer", origin+"/")
 		req.Header.Set("User-Agent", userAgent)
+		// 官方 REST 拦截器在请求未自带 X-Product 时补 deploymentType；
+		// 两版 cli/product.json 都是 SaaS。本仓不走那层客户端，这里显式带上。
+		req.Header.Set("X-Product", "SaaS")
 	}
 }
 
