@@ -14,30 +14,31 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 4d7d1e670ce45e72f2db80e2812a133c05bf91ae
-  audited_at_utc: 2026-11-01T08:42:21Z
+  commit: edcfdf80d93c69b0e24353ebc09281700fa8a311
+  audited_at_utc: 2026-11-02T23:10:00Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
-    from: 2026-10-31
-    to: 2026-11-01
-    non_merge_commits: 31
+    from: 2026-11-01
+    to: 2026-11-02
+    non_merge_commits: 22
   dispositions:
-    issue: 2
-    revisit: 10
-    skip: 19
+    issue: 4
+    revisit: 0
+    skip: 20
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/432
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/433
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/436
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/437
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/438
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/439
   note: >-
-    2026-11-01 审计 5caddab..4d7d1e67（31 条非 merge）。官方更新接口版本未变，
-    仍是 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，沿用本地
-    已解包的 Win32 app-asar。开 #432：非流式 mergeUsageTotals 与流式续写都把
-    prompt/cache 按段数累加，续写段 prompt 已含整段上下文。开 #433：登录
-    auth/state、auth/token、login/account 未发 REST 拦截器必补的 X-Product: SaaS。
-    头名大小写、头序、JA3、Connection、Accept-Encoding、15021、登录禁 h2、
-    chat 面 X-No-* 取值 "1" 对照官方字面量 "true"，都只有抓包能定案，记 revisit。
-    代理池、历史裁剪、跨账号合计、6020 不轮转、分域 base 编辑本仓已有等价行为，
-    按 skip。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
+    2026-11-02 审计 4d7d1e67..edcfdf80（22 条非 merge + 2 条 merge）。官方更新
+    接口版本未变，仍是 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，
+    沿用本地已解包的 Win32 app-asar。新开 #438：/v3/config 未发官方
+    fetchFromRemoteOnce 的 Connection: close（包内字面量；keep-alive 只有抓包，
+    不纳入）。新开 #439：积分保底只有全局 credit_floor，不能按域覆盖。
+    模型别名通配链到既有 #436，面板默认拒绝链到既有 #437。AutoBot、proxypool、
+    旧 app.js 降级标注、成长任务快照跳过（一键完成已由 #429 覆盖）按 skip。
+    审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。

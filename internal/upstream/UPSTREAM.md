@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `4d7d1e670ce45e72f2db80e2812a133c05bf91ae`（2026-11-01）。该基线与本仓库无共同祖先，
+  `edcfdf80d93c69b0e24353ebc09281700fa8a311`（2026-11-02）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -46,7 +46,10 @@ credit CLI refresh/坏文件、登录轮询可观测性、池状态迁移日志�
 2026-11-01 续审 `5caddab..4d7d1e67`（31 条非 merge；官方 Win32 仍是 cn 5.9.3 /
 global 5.9.4），确认 2 个缺口并开 Issue #432（续写 usage 把 prompt 按段数累加）、
 #433（登录三端点漏发 `X-Product`）；头序、JA3、`X-No-*` 取值等只靠抓包的项记
-`revisit`。后续审计从 `4d7d1e67` 之后开始。
+`revisit`。2026-11-02 续审 `4d7d1e67..edcfdf80`（22 条非 merge + 2 条 merge；官方
+Win32 仍是 cn 5.9.3 / global 5.9.4），新开 #438（`/v3/config` 缺 `Connection: close`）、
+#439（积分保底不能按域覆盖）；别名通配与面板默认拒绝分别链到既有 #436、#437。
+后续审计从 `edcfdf80` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
