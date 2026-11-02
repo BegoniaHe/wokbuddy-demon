@@ -52,9 +52,11 @@ func recordLoginFlow(t *testing.T, realm, platform, origin string) []loginHit {
 	return hits
 }
 
-// assertLoginProductHeaders 断言单条设备授权请求的产品头与未登录态声明头。
+// assertLoginProductHeaders 断言单条设备授权请求的产品头、来源域与未登录态声明头。
 // platform 非空时还核对 auth/state 的查询参数，避免两域身份串用。
-func assertLoginProductHeaders(t *testing.T, hit loginHit, wantPath, wantNoAuth, platform string, bearer bool) {
+func assertLoginProductHeaders(
+	t *testing.T, hit loginHit, wantPath, wantOrigin, wantNoAuth, platform string, bearer bool,
+) {
 	t.Helper()
 
 	if hit.path != wantPath {
@@ -67,23 +69,26 @@ func assertLoginProductHeaders(t *testing.T, hit loginHit, wantPath, wantNoAuth,
 		t.Errorf("%s query=%q want platform=%s", wantPath, hit.query, platform)
 	}
 
-	header := hit.header
-	if got := header.Get("X-Product"); got != "SaaS" {
-		t.Errorf("%s X-Product=%q want SaaS", wantPath, got)
-	}
+	assertLoginHeader(t, hit.header, "X-Product", loginProductSaaS, wantPath)
+	assertLoginHeader(t, hit.header, "Origin", wantOrigin, wantPath)
+	assertLoginHeader(t, hit.header, "Referer", wantOrigin+"/", wantPath)
+	assertLoginHeader(t, hit.header, "X-No-Authorization", wantNoAuth, wantPath)
 
-	if got := header.Get("X-No-Authorization"); got != wantNoAuth {
-		t.Errorf("%s X-No-Authorization=%q want %q", wantPath, got, wantNoAuth)
-	}
-
-	if bearer && header.Get("Authorization") != "Bearer tok" {
-		t.Errorf("%s Authorization=%q want Bearer tok", wantPath, header.Get("Authorization"))
+	if bearer {
+		assertLoginHeader(t, hit.header, "Authorization", "Bearer tok", wantPath)
 	}
 
 	for _, name := range []string{"X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
-		if got := header.Get(name); got != "true" {
-			t.Errorf("%s %s=%q want true", wantPath, name, got)
-		}
+		assertLoginHeader(t, hit.header, name, "true", wantPath)
+	}
+}
+
+// assertLoginHeader 核对单个请求头；wantPath 只用于失败定位。
+func assertLoginHeader(t *testing.T, header http.Header, name, want, wantPath string) {
+	t.Helper()
+
+	if got := header.Get(name); got != want {
+		t.Errorf("%s %s=%q want %q", wantPath, name, got, want)
 	}
 }
 
@@ -94,12 +99,11 @@ func TestLoginDeviceAuthSendsXProduct(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		realm    string
-		platform string
-		origin   string
+		realm  string
+		origin string
 	}{
-		{realm: realmCN, platform: "workbuddy", origin: "https://www.codebuddy.cn"},
-		{realm: "global", platform: "workbuddy-ai", origin: "https://www.workbuddy.ai"},
+		{realm: realmCN, origin: originRefererCN},
+		{realm: realmGlobal, origin: originRefererGlobal},
 	}
 	want := []struct {
 		path       string
@@ -115,19 +119,26 @@ func TestLoginDeviceAuthSendsXProduct(t *testing.T) {
 		t.Run(item.realm, func(t *testing.T) {
 			t.Parallel()
 
-			hits := recordLoginFlow(t, item.realm, item.platform, item.origin)
-			if len(hits) < len(want) {
+			_, origin := realmConfig(item.realm)
+			if origin != item.origin {
+				t.Fatalf("origin=%q want %q", origin, item.origin)
+			}
+
+			platform := authPlatform(item.realm)
+
+			hits := recordLoginFlow(t, item.realm, platform, origin)
+			if len(hits) != len(want) {
 				t.Fatalf("hits=%d want %d", len(hits), len(want))
 			}
 
 			for i := range want {
-				platform := ""
+				queryPlatform := ""
 				if want[i].path == "/v2/plugin/auth/state" {
-					platform = item.platform
+					queryPlatform = platform
 				}
 
 				assertLoginProductHeaders(
-					t, hits[i], want[i].path, want[i].wantNoAuth, platform, want[i].bearer,
+					t, hits[i], want[i].path, origin, want[i].wantNoAuth, queryPlatform, want[i].bearer,
 				)
 			}
 		})
