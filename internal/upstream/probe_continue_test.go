@@ -383,8 +383,8 @@ func TestTextContinueReaderPreservesLengthWithSeparateUsage(t *testing.T) {
 	}
 }
 
-// TestTextContinueReaderMergesFirstUsage 续写成功时末帧 usage 必须包含首段用量，
-// 不能只保留续写段（issue #247，与非流式 mergeUsageTotals 同口径）。
+// TestTextContinueReaderMergesFirstUsage 续写成功时末帧 usage 与非流式同口径：
+// prompt/cache 取末段，completion/credit 累加首段，total 重算（issue #247 / #432）。
 func TestTextContinueReaderMergesFirstUsage(t *testing.T) {
 	t.Parallel()
 
@@ -404,7 +404,7 @@ func TestTextContinueReaderMergesFirstUsage(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		`"prompt_tokens":30`, `"completion_tokens":6`, `"total_tokens":36`, `"credit":3`, `"cached_tokens":8`,
+		`"prompt_tokens":20`, `"completion_tokens":6`, `"total_tokens":26`, `"credit":3`, `"cached_tokens":5`,
 	} {
 		if !strings.Contains(string(out), want) {
 			t.Errorf("merged usage missing %s: %s", want, out)
@@ -413,6 +413,43 @@ func TestTextContinueReaderMergesFirstUsage(t *testing.T) {
 
 	if strings.Contains(string(out), `"finish_reason":"length"`) {
 		t.Fatalf("length finish must be suppressed after successful continuation: %s", out)
+	}
+}
+
+// TestTextContinueReaderKeepsLastUsageWithoutPrompt 末段没有 prompt_tokens 时仍
+// 写出末段 usage：completion/credit 累加，total 保留末段原值，不回填首段 prompt
+// （issue #432）。
+func TestTextContinueReaderKeepsLastUsageWithoutPrompt(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"hello "}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"credit":1}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	second := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"completion_tokens":4,"total_tokens":9,"credit":2}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+		return closeString{strings.NewReader(second)}, nil
+	})
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := string(out)
+	if strings.Contains(body, `"prompt_tokens"`) && strings.Contains(body, `"finish_reason":"stop"`) {
+		// 末帧是带 stop 的续写帧；prompt 只能出现在被暂存改写前的首段 usage 帧。
+		stop := body[strings.LastIndex(body, `"finish_reason":"stop"`):]
+		if strings.Contains(stop, `"prompt_tokens"`) {
+			t.Fatalf("last frame must not revive first prompt: %s", body)
+		}
+	}
+
+	for _, want := range []string{`"completion_tokens":6`, `"total_tokens":9`, `"credit":3`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("merged usage missing %s: %s", want, body)
+		}
 	}
 }
 

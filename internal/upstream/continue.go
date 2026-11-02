@@ -57,6 +57,19 @@ var continueReaderPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, 64*1024) },
 }
 
+// promptUsageKeys 是续写合并时取末段、不累加的键。续写请求已带上前文，
+// prompt/cache 再加会按段数重复计量（issue #432）。
+var promptUsageKeys = map[string]struct{}{
+	"prompt_tokens":            {},
+	"input_tokens":             {},
+	"prompt_tokens_details":    {},
+	"input_tokens_details":     {},
+	"cached_tokens":            {},
+	"cache_read_input_tokens":  {},
+	"prompt_cache_hit_tokens":  {},
+	"prompt_cache_miss_tokens": {},
+}
+
 // NewTextContinueReader 包装上游流。initialText 是 ProbeStream 已消费的正文。
 //
 // 行缓冲从 continueReaderPool 取（64KB，每流一次）；调用方在 Stream 返回后必须
@@ -458,9 +471,9 @@ func (c *TextContinueReader) writeFrameJSON(frame map[string]any) {
 	c.out.WriteString("data: " + string(raw) + "\n\n")
 }
 
-// rewriteContinuationFrame 把续写帧的 id/model 对齐首段，并把首段 usage 合并进
-// 续写段 usage：续写是第二次上游调用，只报本段会让流式记账漏记首段
-// （issue #247，与非流式 mergeUsageTotals 同口径）。
+// rewriteContinuationFrame 把续写帧的 id/model 对齐首段，并把首段 usage 并进
+// 续写帧：prompt/cache 留末段，completion/credit 累加，total 重算。续写是第二次
+// 上游调用，只报本段会漏记首段完成量（issue #247 / #432，与非流式同口径）。
 func (c *TextContinueReader) rewriteContinuationFrame(frame map[string]any) {
 	if !c.continuation {
 		return
@@ -476,6 +489,7 @@ func (c *TextContinueReader) rewriteContinuationFrame(frame map[string]any) {
 
 	if usage, ok := frame["usage"].(map[string]any); ok && c.firstUsage != nil {
 		mergeUsageNumbers(usage, c.firstUsage)
+		recomputeMergedUsageTotal(usage)
 	}
 }
 
@@ -544,29 +558,55 @@ func (c *TextContinueReader) flushHeld() {
 	c.held = nil
 }
 
-// mergeUsageNumbers 递归把 src 的数值字段累加进 dst，缺失的非数值键直接补齐。
-// 只处理 usage 的数值树（prompt_tokens_details 等嵌套对象）。
+// mergeUsageNumbers 把 src（首段）并进 dst（末段）：prompt 侧只留末段（src 不补），
+// total_tokens 留给重算或保留末段原值，其余数值叶子相加，dst 缺失的键补上。
 func mergeUsageNumbers(dst, src map[string]any) {
 	for key, value := range src {
-		switch typed := value.(type) {
-		case map[string]any:
-			if target, ok := dst[key].(map[string]any); ok {
-				mergeUsageNumbers(target, typed)
+		applyMergedUsageLeaf(dst, key, value)
+	}
+}
 
-				continue
-			}
-		case float64:
-			if target, ok := dst[key].(float64); ok {
-				dst[key] = target + typed
+// applyMergedUsageLeaf 把首段的一个叶子并进末段。prompt 侧与 total_tokens 跳过；
+// 嵌套对象递归；两边都是 float64 则相加；末段没有的键补上。
+func applyMergedUsageLeaf(dst map[string]any, key string, value any) {
+	if key == "total_tokens" {
+		return
+	}
 
-				continue
-			}
+	if _, promptSide := promptUsageKeys[key]; promptSide {
+		return
+	}
+
+	switch typed := value.(type) {
+	case map[string]any:
+		if target, ok := dst[key].(map[string]any); ok {
+			mergeUsageNumbers(target, typed)
+
+			return
 		}
+	case float64:
+		if target, ok := dst[key].(float64); ok {
+			dst[key] = target + typed
 
-		if _, exists := dst[key]; !exists {
-			dst[key] = value
+			return
 		}
 	}
+
+	if _, exists := dst[key]; !exists {
+		dst[key] = value
+	}
+}
+
+// recomputeMergedUsageTotal 在末段带 prompt_tokens 时按「末段 prompt + 累计
+// completion」重写 total_tokens。没有该字段则保留末段原 total。
+func recomputeMergedUsageTotal(usageMap map[string]any) {
+	promptTokens, ok := usageMap["prompt_tokens"].(float64)
+	if !ok {
+		return
+	}
+
+	completion, _ := usageMap["completion_tokens"].(float64)
+	usageMap["total_tokens"] = promptTokens + completion
 }
 
 // BuildContinuationBody 在原始请求体后追加 assistant 部分正文与续写指令。

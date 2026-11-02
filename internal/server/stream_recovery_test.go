@@ -180,8 +180,10 @@ func TestNonStreamContinuation(t *testing.T) {
 	}
 }
 
-// TestNonStreamContinuationSumsUsage 续写两段请求的 usage 必须累加，不能只留第二段。
-func TestNonStreamContinuationSumsUsage(t *testing.T) {
+// TestNonStreamContinuationKeepsLastPrompt 续写段的 prompt 已含整段上下文：
+// prompt/cache 取末段，completion/credit 跨段累加，total 按末段 prompt + 累计
+// completion 重算（issue #432）。
+func TestNonStreamContinuationKeepsLastPrompt(t *testing.T) {
 	t.Parallel()
 
 	var calls atomic.Int32
@@ -209,21 +211,72 @@ func TestNonStreamContinuationSumsUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := map[string]float64{"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36, "credit": 3}
-	for key, value := range want {
-		if got, _ := parsed.Usage[key].(float64); got != value {
-			t.Errorf("usage.%s=%v want %v", key, parsed.Usage[key], value)
-		}
-	}
+	assertUsageNumbers(t, parsed.Usage, map[string]float64{
+		"prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26, "credit": 3,
+	})
 
 	details, _ := parsed.Usage["prompt_tokens_details"].(map[string]any)
-	if got, _ := details["cached_tokens"].(float64); got != 8 {
-		t.Errorf("cached_tokens=%v want 8", details["cached_tokens"])
+	if got, _ := details["cached_tokens"].(float64); got != 5 {
+		t.Errorf("cached_tokens=%v want 5", details["cached_tokens"])
 	}
 }
 
-// TestStreamContinuationSumsUsage 流式截断续写两段 usage 必须累加，且首段 length
-// 终态不得提前发给客户端（issue #247）。
+// TestMergeUsageTotalsThreeSegments 三段时 prompt 仍等于末段，不随段数增长；
+// completion 与 credit 等于三段之和（issue #432）。
+func TestMergeUsageTotalsThreeSegments(t *testing.T) {
+	t.Parallel()
+
+	first := map[string]any{"usage": map[string]any{
+		"prompt_tokens": 10.0, "completion_tokens": 2.0, "credit": 1.0, "total_tokens": 12.0,
+	}}
+	mergeUsageTotals(first, map[string]any{"usage": map[string]any{
+		"prompt_tokens": 20.0, "completion_tokens": 4.0, "credit": 2.0, "total_tokens": 24.0,
+	}})
+	mergeUsageTotals(first, map[string]any{"usage": map[string]any{
+		"prompt_tokens": 30.0, "completion_tokens": 8.0, "credit": 3.0, "total_tokens": 38.0,
+	}})
+
+	usage, _ := first["usage"].(map[string]any)
+	assertUsageNumbers(t, usage, map[string]float64{
+		"prompt_tokens": 30, "completion_tokens": 14, "credit": 6, "total_tokens": 44,
+	})
+}
+
+// TestMergeUsageTotalsKeepsLastWithoutPrompt 末段缺少 prompt_tokens 时仍保留末段
+// usage，不因 total 无法重算丢掉整段（issue #432）。
+func TestMergeUsageTotalsKeepsLastWithoutPrompt(t *testing.T) {
+	t.Parallel()
+
+	first := map[string]any{"usage": map[string]any{
+		"prompt_tokens": 10.0, "completion_tokens": 2.0, "credit": 1.0, "total_tokens": 12.0,
+	}}
+	mergeUsageTotals(first, map[string]any{"usage": map[string]any{
+		"completion_tokens": 4.0, "credit": 2.0, "total_tokens": 9.0,
+	}})
+
+	usage, _ := first["usage"].(map[string]any)
+	if _, ok := usage["prompt_tokens"]; ok {
+		t.Errorf("prompt_tokens=%v want absent (last segment has none)", usage["prompt_tokens"])
+	}
+
+	assertUsageNumbers(t, usage, map[string]float64{
+		"completion_tokens": 6, "credit": 3, "total_tokens": 9,
+	})
+}
+
+func assertUsageNumbers(t *testing.T, usage map[string]any, want map[string]float64) {
+	t.Helper()
+
+	for key, value := range want {
+		if got, _ := usage[key].(float64); got != value {
+			t.Errorf("usage.%s=%v want %v", key, usage[key], value)
+		}
+	}
+}
+
+// TestStreamContinuationSumsUsage 流式截断续写与非流式同口径：prompt 取末段，
+// completion/credit 累加，total 重算；首段 length 终态不得提前发给客户端
+// （issue #247 / #432）。
 //
 //nolint:cyclop // 端到端断言，线性展开更直观。
 func TestStreamContinuationSumsUsage(t *testing.T) {
@@ -276,7 +329,7 @@ func TestStreamContinuationSumsUsage(t *testing.T) {
 		}
 	}
 
-	for key, want := range map[string]float64{"prompt_tokens": 30, "completion_tokens": 6, "total_tokens": 36, "credit": 3} {
+	for key, want := range map[string]float64{"prompt_tokens": 20, "completion_tokens": 6, "total_tokens": 26, "credit": 3} {
 		if got, _ := usage[key].(float64); got != want {
 			t.Errorf("usage.%s=%v want %v (body=%s)", key, usage[key], want, body)
 		}
