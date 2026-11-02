@@ -141,7 +141,7 @@ func TestAuditRecordsPanickedMutation(t *testing.T) {
 	t.Parallel()
 
 	panel := New(&Config{Version: "test", AuditDir: t.TempDir()})
-	panel.mux.HandleFunc("POST /panel/api/panic", func(http.ResponseWriter, *http.Request) {
+	panel.route("POST /panel/api/panic", scopeAdmin, func(http.ResponseWriter, *http.Request) {
 		panic("boom")
 	})
 

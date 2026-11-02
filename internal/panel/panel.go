@@ -117,11 +117,25 @@ type ProxySlotInfo struct {
 	Name string `json:"name"`
 }
 
+// routeScope 是注册时绑定的作用域。未出现在表里的 /panel/api/* 一律拒绝，
+// 不存在「忘了包鉴权就静默公开」的路径。
+type routeScope int
+
+const (
+	// scopePublic 面板页面与静态资源：无秘密，匿名可取。
+	scopePublic routeScope = iota
+	// scopeRead 管理面只读：admin 或 readonly 均可。
+	scopeRead
+	// scopeAdmin 管理面写操作：只接受 admin。
+	scopeAdmin
+)
+
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
 // 本 mux 的 pattern 均带 /panel 前缀（外层不做前缀剥离）。
 type Panel struct {
 	cfg          Config
 	mux          *http.ServeMux
+	scopes       map[string]routeScope // pattern → 作用域；与 mux 同步写入
 	started      time.Time
 	logs         *Ring
 	probeTimeout time.Duration
@@ -209,6 +223,7 @@ func New(cfg *Config) *Panel {
 	panel := &Panel{
 		cfg:          config,
 		mux:          http.NewServeMux(),
+		scopes:       map[string]routeScope{},
 		started:      time.Now(),
 		logs:         NewRing(500),
 		probeTimeout: modelProbeTimeout,
@@ -241,102 +256,115 @@ func (p *Panel) routes() {
 }
 
 func (p *Panel) routesPages() {
-	p.mux.HandleFunc("GET /panel/{$}", p.index)
-	p.mux.HandleFunc("GET /panel/{path...}", p.asset)
-	p.mux.HandleFunc("GET /panel/api/overview", p.withReadAuth(p.overview))
-	p.mux.HandleFunc("GET /panel/api/logs", p.withReadAuth(p.logsHandler))
-	p.mux.HandleFunc("GET /panel/api/error_summary", p.withReadAuth(p.errorSummaryHandler))
-	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withReadAuth(p.requestMetrics))
-	p.mux.HandleFunc("GET /panel/api/request_logs", p.withReadAuth(p.requestLogs))
-	p.mux.HandleFunc("GET /panel/api/audit", p.withReadAuth(p.auditList))
-	p.mux.HandleFunc("GET /panel/api/agents", p.withReadAuth(p.agentsStatus))
-	p.mux.HandleFunc("POST /panel/api/agents/{client}/apply", p.withAdminAuth(p.agentsApply))
-	p.mux.HandleFunc("POST /panel/api/agents/{client}/restore", p.withAdminAuth(p.agentsRestore))
+	p.route("GET /panel/{$}", scopePublic, p.index)
+	p.route("GET /panel/{path...}", scopePublic, p.asset)
+	p.route("GET /panel/api/overview", scopeRead, p.overview)
+	p.route("GET /panel/api/logs", scopeRead, p.logsHandler)
+	p.route("GET /panel/api/error_summary", scopeRead, p.errorSummaryHandler)
+	p.route("GET /panel/api/request_metrics", scopeRead, p.requestMetrics)
+	p.route("GET /panel/api/request_logs", scopeRead, p.requestLogs)
+	p.route("GET /panel/api/audit", scopeRead, p.auditList)
+	p.route("GET /panel/api/agents", scopeRead, p.agentsStatus)
+	p.route("POST /panel/api/agents/{client}/apply", scopeAdmin, p.agentsApply)
+	p.route("POST /panel/api/agents/{client}/restore", scopeAdmin, p.agentsRestore)
 }
 
 //nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesAccounts() {
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAdminAuth(p.accountRevive))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAdminAuth(p.accountDisable))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/pause", p.withAdminAuth(p.accountPause))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/resume", p.withAdminAuth(p.accountResume))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy_slot", p.withAdminAuth(p.accountProxySlot))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAdminAuth(p.accountCheckin))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAdminAuth(p.accountBalance))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/travel", p.withAdminAuth(p.accountTravel))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAdminAuth(p.accountRemove))
+	p.route("POST /panel/api/accounts/{uid}/revive", scopeAdmin, p.accountRevive)
+	p.route("POST /panel/api/accounts/{uid}/disable", scopeAdmin, p.accountDisable)
+	p.route("POST /panel/api/accounts/{uid}/pause", scopeAdmin, p.accountPause)
+	p.route("POST /panel/api/accounts/{uid}/resume", scopeAdmin, p.accountResume)
+	p.route("POST /panel/api/accounts/{uid}/proxy_slot", scopeAdmin, p.accountProxySlot)
+	p.route("POST /panel/api/accounts/{uid}/checkin", scopeAdmin, p.accountCheckin)
+	p.route("POST /panel/api/accounts/{uid}/balance", scopeAdmin, p.accountBalance)
+	p.route("POST /panel/api/accounts/{uid}/travel", scopeAdmin, p.accountTravel)
+	p.route("POST /panel/api/accounts/{uid}/remove", scopeAdmin, p.accountRemove)
 }
 
 func (p *Panel) routesTasks() {
-	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withReadAuth(p.accountTasks))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAdminAuth(p.accountTaskAccept))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAdminAuth(p.taskAcceptAll))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/claim", p.withAdminAuth(p.accountTaskClaim))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto", p.withAdminAuth(p.accountTaskAuto))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/auto_all", p.withAdminAuth(p.accountTaskAutoAll))
-	p.mux.HandleFunc("POST /panel/api/tasks/scan_all", p.withAdminAuth(p.tasksScanAll))
-	p.mux.HandleFunc("POST /panel/api/tasks/run_queue", p.withAdminAuth(p.tasksRunQueue))
-	p.mux.HandleFunc("GET /panel/api/tasks/queue", p.withReadAuth(p.tasksQueueStatus))
-	p.mux.HandleFunc("GET /panel/api/tasks/runs", p.withReadAuth(p.tasksRuns))
-	p.mux.HandleFunc("POST /panel/api/checkin_all", p.withAdminAuth(p.checkinAll))
-	p.mux.HandleFunc("POST /panel/api/travel_all", p.withAdminAuth(p.travelAll))
-	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAdminAuth(p.activityAll))
-	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAdminAuth(p.keepaliveAll))
-	p.mux.HandleFunc("POST /panel/api/blackcat_all", p.withAdminAuth(p.blackcatAll))
-	p.mux.HandleFunc("POST /panel/api/streak_bonus_all", p.withAdminAuth(p.streakBonusAll))
-	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAdminAuth(p.balanceAll))
+	p.route("GET /panel/api/accounts/{uid}/tasks", scopeRead, p.accountTasks)
+	p.route("POST /panel/api/accounts/{uid}/tasks/accept", scopeAdmin, p.accountTaskAccept)
+	p.route("POST /panel/api/accounts/{uid}/tasks/accept_all", scopeAdmin, p.taskAcceptAll)
+	p.route("POST /panel/api/accounts/{uid}/tasks/claim", scopeAdmin, p.accountTaskClaim)
+	p.route("POST /panel/api/accounts/{uid}/tasks/auto", scopeAdmin, p.accountTaskAuto)
+	p.route("POST /panel/api/accounts/{uid}/tasks/auto_all", scopeAdmin, p.accountTaskAutoAll)
+	p.route("POST /panel/api/tasks/scan_all", scopeAdmin, p.tasksScanAll)
+	p.route("POST /panel/api/tasks/run_queue", scopeAdmin, p.tasksRunQueue)
+	p.route("GET /panel/api/tasks/queue", scopeRead, p.tasksQueueStatus)
+	p.route("GET /panel/api/tasks/runs", scopeRead, p.tasksRuns)
+	p.route("POST /panel/api/checkin_all", scopeAdmin, p.checkinAll)
+	p.route("POST /panel/api/travel_all", scopeAdmin, p.travelAll)
+	p.route("POST /panel/api/activity_all", scopeAdmin, p.activityAll)
+	p.route("POST /panel/api/keepalive_all", scopeAdmin, p.keepaliveAll)
+	p.route("POST /panel/api/blackcat_all", scopeAdmin, p.blackcatAll)
+	p.route("POST /panel/api/streak_bonus_all", scopeAdmin, p.streakBonusAll)
+	p.route("POST /panel/api/balance_all", scopeAdmin, p.balanceAll)
 }
 
 func (p *Panel) routesImport() {
-	p.mux.HandleFunc("POST /panel/api/login/start", p.withAdminAuth(p.loginStart))
-	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAdminAuth(p.loginPoll))
-	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAdminAuth(p.loginRegions))
-	p.mux.HandleFunc("POST /panel/api/import/cockpit", p.withAdminAuth(p.importCockpit))
-	p.mux.HandleFunc("GET /panel/api/import/desktop/scan", p.withAdminAuth(p.desktopScan))
-	p.mux.HandleFunc("POST /panel/api/import/desktop", p.withAdminAuth(p.desktopImport))
-	p.mux.HandleFunc("POST /panel/api/export/encrypted", p.withAdminAuth(p.exportEncrypted))
-	p.mux.HandleFunc("POST /panel/api/import/encrypted", p.withAdminAuth(p.importEncrypted))
+	p.route("POST /panel/api/login/start", scopeAdmin, p.loginStart)
+	p.route("GET /panel/api/login/poll", scopeAdmin, p.loginPoll)
+	p.route("GET /panel/api/login/regions", scopeAdmin, p.loginRegions)
+	p.route("POST /panel/api/import/cockpit", scopeAdmin, p.importCockpit)
+	p.route("GET /panel/api/import/desktop/scan", scopeAdmin, p.desktopScan)
+	p.route("POST /panel/api/import/desktop", scopeAdmin, p.desktopImport)
+	p.route("POST /panel/api/export/encrypted", scopeAdmin, p.exportEncrypted)
+	p.route("POST /panel/api/import/encrypted", scopeAdmin, p.importEncrypted)
 }
 
 //nolint:dupl // 同 routesAccounts：逐条平铺比抽象注册表更易检索。
 func (p *Panel) routesUsage() {
-	p.mux.HandleFunc("GET /panel/api/packages", p.withReadAuth(p.packages))
-	p.mux.HandleFunc("GET /panel/api/credit_history", p.withReadAuth(p.creditHistoryHandler))
+	p.route("GET /panel/api/packages", scopeRead, p.packages)
+	p.route("GET /panel/api/credit_history", scopeRead, p.creditHistoryHandler)
 	// 官方补偿（上游同步窗口 issue #204）：只读状态 + 逐号/全量「先查后领」。
-	p.mux.HandleFunc("GET /panel/api/compensation", p.withReadAuth(p.compensationStatus))
-	p.mux.HandleFunc("POST /panel/api/compensation_all", p.withAdminAuth(p.compensationAll))
-	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/compensation", p.withAdminAuth(p.accountCompensation))
-	p.mux.HandleFunc("GET /panel/api/usage", p.withReadAuth(p.usage))
-	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAdminAuth(p.usageSave))
-	p.mux.HandleFunc("GET /panel/api/usage/remaining", p.withReadAuth(p.usageRemaining))
-	p.mux.HandleFunc("POST /panel/api/usage/backfill", p.withAdminAuth(p.usageBackfill))
+	p.route("GET /panel/api/compensation", scopeRead, p.compensationStatus)
+	p.route("POST /panel/api/compensation_all", scopeAdmin, p.compensationAll)
+	p.route("POST /panel/api/accounts/{uid}/compensation", scopeAdmin, p.accountCompensation)
+	p.route("GET /panel/api/usage", scopeRead, p.usage)
+	p.route("POST /panel/api/usage/save", scopeAdmin, p.usageSave)
+	p.route("GET /panel/api/usage/remaining", scopeRead, p.usageRemaining)
+	p.route("POST /panel/api/usage/backfill", scopeAdmin, p.usageBackfill)
 }
 
 func (p *Panel) routesKeys() {
-	p.mux.HandleFunc("GET /panel/api/keys", p.withReadAuth(p.keysList))
-	p.mux.HandleFunc("POST /panel/api/keys", p.withAdminAuth(p.keysCreate))
-	p.mux.HandleFunc("POST /panel/api/keys/{id}/revoke", p.withAdminAuth(p.keysRevoke))
-	p.mux.HandleFunc("POST /panel/api/keys/{id}/delete", p.withAdminAuth(p.keysDelete))
-	p.mux.HandleFunc("GET /panel/api/pricing", p.withReadAuth(p.pricingHandler))
-	p.mux.HandleFunc("POST /panel/api/keys/{id}/limits", p.withAdminAuth(p.keysUpdateLimits))
-	p.mux.HandleFunc("POST /panel/api/keys/{id}/realm", p.withAdminAuth(p.keysUpdateRealm))
+	p.route("GET /panel/api/keys", scopeRead, p.keysList)
+	p.route("POST /panel/api/keys", scopeAdmin, p.keysCreate)
+	p.route("POST /panel/api/keys/{id}/revoke", scopeAdmin, p.keysRevoke)
+	p.route("POST /panel/api/keys/{id}/delete", scopeAdmin, p.keysDelete)
+	p.route("GET /panel/api/pricing", scopeRead, p.pricingHandler)
+	p.route("POST /panel/api/keys/{id}/limits", scopeAdmin, p.keysUpdateLimits)
+	p.route("POST /panel/api/keys/{id}/realm", scopeAdmin, p.keysUpdateRealm)
 }
 
 func (p *Panel) routesModels() {
-	p.mux.HandleFunc("GET /panel/api/models", p.withReadAuth(p.models))
-	p.mux.HandleFunc("GET /panel/api/model_probes", p.withReadAuth(p.modelProbes))
-	p.mux.HandleFunc("POST /panel/api/model_probes", p.withAdminAuth(p.modelProbe))
-	p.mux.HandleFunc("GET /panel/api/model_health", p.withReadAuth(p.modelHealth))
+	p.route("GET /panel/api/models", scopeRead, p.models)
+	p.route("GET /panel/api/model_probes", scopeRead, p.modelProbes)
+	p.route("POST /panel/api/model_probes", scopeAdmin, p.modelProbe)
+	p.route("GET /panel/api/model_health", scopeRead, p.modelHealth)
 }
 
 func (p *Panel) routesConfig() {
-	p.mux.HandleFunc("GET /panel/api/config", p.withAdminAuth(p.getConfig))
-	p.mux.HandleFunc("POST /panel/api/config", p.withAdminAuth(p.saveConfig))
-	p.mux.HandleFunc("POST /panel/api/config/restore", p.withAdminAuth(p.restoreConfig))
+	p.route("GET /panel/api/config", scopeAdmin, p.getConfig)
+	p.route("POST /panel/api/config", scopeAdmin, p.saveConfig)
+	p.route("POST /panel/api/config/restore", scopeAdmin, p.restoreConfig)
+}
+
+// route 把 pattern 同时写入 mux 与作用域表。重复 pattern 直接 panic：
+// 作用域只能有一份，静默覆盖会让后注册的 handler 失去登记。
+func (p *Panel) route(pattern string, scope routeScope, handler http.HandlerFunc) {
+	if _, ok := p.scopes[pattern]; ok {
+		panic("panel: 重复注册 " + pattern)
+	}
+
+	p.scopes[pattern] = scope
+	p.mux.HandleFunc(pattern, handler)
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
 // 与 401 错误响应全都带上（API 也可能在浏览器里被直接打开）。
+// /panel/api/* 在进入业务 handler 之前按注册表鉴权：未登记的路径（包括
+// mux 里根本没有的）一律 401，不回 404，避免暴露路径是否存在。
 // panelAPIMaxBodyBytes 管理面请求体统一上限（字节）。个别导入端点另有更小的
 // 内部上限；这里兜住未来新增的 handler，避免未设上限的读 body 占满内存。
 const panelAPIMaxBodyBytes = 16 << 20
@@ -349,6 +377,10 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		limitPanelBody(w, r)
+
+		if !p.authorizeAPI(w, r) {
+			return
+		}
 	}
 
 	if p.audit != nil && r.Method != http.MethodGet && r.Method != http.MethodHead &&
@@ -374,6 +406,77 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
+// authorizeAPI 对 /panel/api/* 按注册表作用域鉴权。
+//
+// 匹配直接复用 mux.Handler：命中已登记 pattern 才按 scope 放行。pattern 为空
+// 有两种来源，必须分开：
+//   - 方法不匹配：mux 返回 405 handler 且 pattern 为空，交给 mux 保持 405；
+//   - 没有任何登记路由能接住：直接 401，不进入业务 handler，也不消耗鉴权失败
+//     预算。带任意有效 key 同样 401：登记是放行的前提，key 不能发明路由。
+func (p *Panel) authorizeAPI(w http.ResponseWriter, r *http.Request) bool {
+	_, pattern := p.mux.Handler(r)
+	if pattern == "" {
+		if _, other := p.mux.Handler(methodProbe(r)); other != "" {
+			return true
+		}
+
+		writeErr(w, http.StatusUnauthorized, "invalid_api_key")
+
+		return false
+	}
+
+	scope, ok := p.scopes[pattern]
+	if !ok || scope == scopePublic {
+		// 作用域表与 mux 同步写入；API 前缀下出现 public 或缺失都是注册错误，
+		// 按未登记拒绝，不放行。
+		writeErr(w, http.StatusUnauthorized, "invalid_api_key")
+		return false
+	}
+
+	return p.allowScope(w, r, scope == scopeAdmin)
+}
+
+// methodProbe 复制请求并把方法换成 GET，用来区分「方法不匹配」与「路径未登记」。
+// GET 登记的 pattern 同时匹配 HEAD，所以探测方法用 GET 即可覆盖两种登记。
+func methodProbe(r *http.Request) *http.Request {
+	probe := r.Clone(r.Context())
+	probe.Method = http.MethodGet
+
+	return probe
+}
+
+// allowScope 校验管理面凭据是否满足作用域。requireAdmin 时 readonly 命中返回 403。
+// 鉴权失败限速、常量时间比较都走原有入口，这里只决定是否放行。
+func (p *Panel) allowScope(w http.ResponseWriter, r *http.Request, requireAdmin bool) bool {
+	ip := httpauth.ClientIP(r, p.cfg.TrustedProxies)
+	if ok, retry := p.authLimiter.Allow(ip); !ok {
+		seconds := max(int((retry+time.Second-1)/time.Second), 1)
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeErr(w, http.StatusTooManyRequests, "too_many_auth_failures")
+
+		return false
+	}
+
+	res := httpauth.AuthenticateManagement(r, p.apiKey(), p.adminKey(), p.readonlyKey())
+	if !res.OK {
+		p.authLimiter.Fail(ip)
+		writeErr(w, http.StatusUnauthorized, "invalid_api_key")
+
+		return false
+	}
+
+	p.authLimiter.Reset(ip)
+
+	if requireAdmin && res.Scope != httpauth.ScopeAdmin {
+		// 凭据有效但作用域不足：泛化 403，不区分不存在/已撤销/作用域不足。
+		writeErr(w, http.StatusForbidden, "forbidden")
+
+		return false
+	}
+
+	return true
+}
+
 // limitPanelBody 给管理面请求体套上统一上限。超限在 handler 读取时返回错误
 // （MaxBytesReader 负责），不会先把整个 body 缓冲进内存。
 func limitPanelBody(w http.ResponseWriter, r *http.Request) {
@@ -384,52 +487,11 @@ func limitPanelBody(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, panelAPIMaxBodyBytes)
 }
 
-// withReadAuth 管理面只读入口：admin 或 readonly 均可。默认 api_key 在未配置
+// 管理面鉴权在 ServeHTTP 按注册表作用域统一执行（authorizeAPI / allowScope），
+// 不在 handler 外包第二层：双重包装会让一次失败消耗两份限速预算。
+// 比较仍走 httpauth.AuthenticateManagement（常量时间、全候选遍历）。失败预算
+// 只在凭据校验失败时消耗；作用域不足返回 403，不消耗预算。默认 api_key 在未配置
 // admin/readonly 时回落为 admin（单密钥默认）。
-//
-// 鉴权统一走 httpauth.AuthenticateManagement（常量时间、全候选遍历）。失败预算
-// 只在凭据校验失败时消耗；作用域不足返回 403，不消耗预算。
-func (p *Panel) withReadAuth(next http.HandlerFunc) http.HandlerFunc {
-	return p.withManagementAuth(next, false)
-}
-
-// withAdminAuth 管理面写入口：只接受 admin；readonly 命中返回 403。
-func (p *Panel) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
-	return p.withManagementAuth(next, true)
-}
-
-// withManagementAuth 管理面统一鉴权。requireAdmin=true 时 readonly 命中返回 403。
-func (p *Panel) withManagementAuth(next http.HandlerFunc, requireAdmin bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		ip := httpauth.ClientIP(r, p.cfg.TrustedProxies)
-		if ok, retry := p.authLimiter.Allow(ip); !ok {
-			seconds := max(int((retry+time.Second-1)/time.Second), 1)
-			w.Header().Set("Retry-After", strconv.Itoa(seconds))
-			writeErr(w, http.StatusTooManyRequests, "too_many_auth_failures")
-
-			return
-		}
-
-		res := httpauth.AuthenticateManagement(r, p.apiKey(), p.adminKey(), p.readonlyKey())
-		if !res.OK {
-			p.authLimiter.Fail(ip)
-			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
-
-			return
-		}
-
-		p.authLimiter.Reset(ip)
-
-		if requireAdmin && res.Scope != httpauth.ScopeAdmin {
-			// 凭据有效但作用域不足：泛化 403，不区分不存在/已撤销/作用域不足。
-			writeErr(w, http.StatusForbidden, "forbidden")
-
-			return
-		}
-
-		next(w, r)
-	}
-}
 
 // apiKey 当前生效的默认数据面密钥（Live 优先，回落静态字段）。
 func (p *Panel) apiKey() string {
