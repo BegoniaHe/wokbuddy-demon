@@ -1079,6 +1079,7 @@ func (h *Handler) filterModelsForKey(entries []map[string]any, keyUse *keyUsage)
 // appendAliasEntries 把配置的模型别名追加到 /v1/models 列表（issue #52）。
 // 别名按名字排序保证输出稳定；与真实模型同 id 时以别名为准（请求解析同样
 // 别名优先），避免"列表显示一个、实际路由到另一个"。
+// 含 * / ? 的通配键不列入：它们不是可点名的模型 id，只在请求解析时匹配（issue #436）。
 func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string]bool) []map[string]any {
 	if len(h.cfg.ModelAliases) == 0 {
 		return out
@@ -1086,7 +1087,9 @@ func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string
 
 	names := make([]string, 0, len(h.cfg.ModelAliases))
 	for name := range h.cfg.ModelAliases {
-		names = append(names, name)
+		if !aliasIsWildcard(name) {
+			names = append(names, name)
+		}
 	}
 
 	slices.Sort(names)

@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"path"
 	"strings"
 )
 
@@ -54,10 +55,11 @@ func ResolveModel(model string) (realm, bare string) { return resolveModel(model
 // resolveRequestModel 在 realm 前缀之上应用模型别名（issue #52）：
 // 先剥请求的 realm 前缀，再按裸名查别名；别名目标的 realm 显式给出则以其为准，
 // 省略时继承请求侧 realm（裸请求即 cn）。未命中别名 → 与 resolveModel 完全一致。
+// 别名键可用 path.Match 通配（issue #436）：精确键优先，否则取命中的模式。
 func resolveRequestModel(model string, aliases map[string]string) (realm, bare string) {
 	realm, bare = resolveModel(model)
 
-	target, ok := aliases[bare]
+	target, ok := lookupAlias(bare, aliases)
 	if !ok {
 		return realm, bare
 	}
@@ -111,11 +113,59 @@ func explicitModelRealm(model string, aliases map[string]string) (string, bool) 
 		return realm, true
 	}
 
-	if target, ok := aliases[bare]; ok {
+	if target, ok := lookupAlias(bare, aliases); ok {
 		if targetRealm, _, targetPrefixed := splitRealm(target); targetPrefixed {
 			return targetRealm, true
 		}
 	}
 
 	return "", false
+}
+
+// aliasIsWildcard 报告别名键是否含通配符。这类键只参与请求解析，
+// 不当 /v1/models 的字面模型 id。
+func aliasIsWildcard(name string) bool {
+	return strings.ContainsAny(name, "*?")
+}
+
+// lookupAlias 按裸名查别名。精确键优先；否则在含 * / ? 的键里用 path.Match
+// 匹配，多个同时命中时模式更长优先，同长取字典序较小的模式。
+// 未命中返回 false，调用方保持透传。非法 glob 视为不匹配。
+func lookupAlias(bare string, aliases map[string]string) (string, bool) {
+	if target, ok := aliases[bare]; ok {
+		return target, true
+	}
+
+	bestPattern, found := "", false
+
+	for pattern := range aliases {
+		if !aliasIsWildcard(pattern) || !aliasPatternMatches(pattern, bare) {
+			continue
+		}
+
+		if !found || betterAliasPattern(pattern, bestPattern) {
+			bestPattern, found = pattern, true
+		}
+	}
+
+	if !found {
+		return "", false
+	}
+
+	return aliases[bestPattern], true
+}
+
+// betterAliasPattern 报告 candidate 是否优于 current：更长优先，同长取字典序较小。
+func betterAliasPattern(candidate, current string) bool {
+	if len(candidate) != len(current) {
+		return len(candidate) > len(current)
+	}
+
+	return candidate < current
+}
+
+// aliasPatternMatches 用 path.Match 做 glob；模式非法时当未命中，不中断请求。
+func aliasPatternMatches(pattern, bare string) bool {
+	ok, err := path.Match(pattern, bare)
+	return err == nil && ok
 }
