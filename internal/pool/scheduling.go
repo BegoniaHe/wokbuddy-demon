@@ -150,7 +150,8 @@ func (p *Pool) ReserveForRequest(uid, model, realm string, promptTokens, outputT
 		return 0, false
 	}
 
-	if p.creditFloor <= 0 || model == "" {
+	floor := p.creditFloorFor(realm)
+	if floor <= 0 || model == "" {
 		return 0, true
 	}
 
@@ -169,7 +170,7 @@ func (p *Pool) ReserveForRequest(uid, model, realm string, promptTokens, outputT
 	}
 
 	available := float64(entry2.credits) - entry2.reservedCredits
-	if available-amount < float64(p.creditFloor) {
+	if available-amount < float64(floor) {
 		return 0, false
 	}
 

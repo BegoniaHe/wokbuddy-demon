@@ -20,7 +20,7 @@ func TestStatusCreditFloor(t *testing.T) {
 	t.Parallel()
 
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
-	p.SetCreditFloor(100)
+	p.SetCreditFloor(100, nil)
 	h := NewHandler(&Config{Pool: p, Upstream: upstream.New()})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
@@ -36,6 +36,11 @@ func TestStatusCreditFloor(t *testing.T) {
 
 	if body["credit_floor"] != float64(100) {
 		t.Errorf("credit_floor=%v want 100", body["credit_floor"])
+	}
+
+	byRealm, _ := body["credit_floor_by_realm"].(map[string]any)
+	if byRealm["cn"] != float64(100) || byRealm["global"] != float64(100) {
+		t.Errorf("credit_floor_by_realm=%v want both 100", body["credit_floor_by_realm"])
 	}
 }
 
@@ -55,6 +60,39 @@ func TestStatusCreditFloorZeroOff(t *testing.T) {
 
 	if body["credit_floor"] != float64(0) {
 		t.Errorf("credit_floor=%v want 0 (off)", body["credit_floor"])
+	}
+
+	byRealm, _ := body["credit_floor_by_realm"].(map[string]any)
+	if byRealm["cn"] != float64(0) || byRealm["global"] != float64(0) {
+		t.Errorf("credit_floor_by_realm=%v want both 0", body["credit_floor_by_realm"])
+	}
+}
+
+// TestStatusCreditFloorByRealm /status 同时给出全局默认与两域回落后的生效值。
+// cn 显式 0 仍写出 0，不能因为零值被省略或回落成全局。
+func TestStatusCreditFloorByRealm(t *testing.T) {
+	t.Parallel()
+
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	cn := int64(0)
+	global := int64(350)
+	p.SetCreditFloor(100, map[string]*int64{"cn": &cn, "global": &global})
+	h := NewHandler(&Config{Pool: p, Upstream: upstream.New()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+
+	if body["credit_floor"] != float64(100) {
+		t.Errorf("credit_floor=%v want 100 (global default)", body["credit_floor"])
+	}
+
+	byRealm, _ := body["credit_floor_by_realm"].(map[string]any)
+	if byRealm["cn"] != float64(0) || byRealm["global"] != float64(350) {
+		t.Errorf("credit_floor_by_realm=%v want cn=0 global=350", body["credit_floor_by_realm"])
 	}
 }
 
@@ -80,7 +118,7 @@ func TestCreditFloorBlocksPaidRequest(t *testing.T) {
 
 	// 实验组：开 floor 100。
 	pool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetCredits("poor", 30, 0)
 	pool.NoteModelCost("poor", "paid-model", 2.9, 1000)
 
@@ -107,7 +145,7 @@ func TestCreditFloorAllowsFreeRequest(t *testing.T) {
 	t.Parallel()
 
 	pool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetCredits("poor", 30, 0)
 	pool.NoteModelCost("poor", "free-model", 0, 1000)
 
@@ -127,7 +165,7 @@ func TestCreditFloorPersistsAcquireRelease(t *testing.T) {
 	t.Parallel()
 
 	pool := testPoolWith(&auth.Auth{UID: "poor", AccessToken: "at", ExpiresAt: 9999999999})
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetCredits("poor", 30, 0)
 	pool.NoteModelCost("poor", "paid-model", 2.9, 1000)
 	pool.SetMaxInFlight(2)

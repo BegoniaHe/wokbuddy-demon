@@ -472,8 +472,12 @@ type Config struct {
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
-		// 默认 0 = 关闭；负值钳 0。
+		// 默认 0 = 关闭；负值钳 0。未在 CreditFloorByRealm 写明的域回落本值。
 		CreditFloor int64 `json:"credit_floor"`
+		// CreditFloorByRealm 按域覆盖积分保底（issue #439）。键只认 cn / global，
+		// 非法键剔除；负值钳 0。指针区分「键未写」（回落 CreditFloor）与显式 0
+		// （该域关闭保底）。JSON `{"cn":0}` 必须保留为关闭，不得回落全局。
+		CreditFloorByRealm map[string]*int64 `json:"credit_floor_by_realm"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -1763,6 +1767,8 @@ func (c *Config) normalizePoolDefaults() {
 		c.Pool.CreditFloor = 0
 	}
 
+	c.normalizeCreditFloorByRealm()
+
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -1790,6 +1796,36 @@ func (c *Config) normalizePoolDefaults() {
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
 	}
+}
+
+// normalizeCreditFloorByRealm 清洗按域保底：只留 cn / global，负值钳 0。
+// 键存在且值为 0 表示该域关闭，不回落全局；非法键丢掉，不报错。
+func (c *Config) normalizeCreditFloorByRealm() {
+	raw := c.Pool.CreditFloorByRealm
+	if len(raw) == 0 {
+		c.Pool.CreditFloorByRealm = nil
+		return
+	}
+
+	out := make(map[string]*int64, 2)
+
+	for _, realm := range []string{"cn", "global"} {
+		n, ok := raw[realm]
+		if !ok || n == nil {
+			continue
+		}
+
+		v := max(*n, 0)
+
+		out[realm] = &v
+	}
+
+	if len(out) == 0 {
+		c.Pool.CreditFloorByRealm = nil
+		return
+	}
+
+	c.Pool.CreditFloorByRealm = out
 }
 
 // normalizeUpstreamDefaults 补齐出站超时缺省值（header 120s / idle 300s）。

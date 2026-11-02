@@ -1045,10 +1045,14 @@ func (s *Scheduler) notifyTaskFailed(task, uid, nickname, realm string) {
 		map[string]any{"task": task})
 }
 
-// notifyCreditLow 余额低于 credit_floor 时告警（floor=0 关闭）。
+// notifyCreditLow 余额低于该账号域的生效保底时告警（该域 floor=0 关闭）。
 func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
-	floor := s.cfg.Pool.CreditFloor()
-	if floor <= 0 || remain >= floor || account3 == nil {
+	if account3 == nil {
+		return
+	}
+
+	floor := s.cfg.Pool.CreditFloorByRealm()[account3.Realm()]
+	if floor <= 0 || remain >= floor {
 		return
 	}
 

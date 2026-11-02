@@ -671,10 +671,12 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 「哪些号不能用」，本键回答「哪些模型不能用、锁了几个号、还要锁多久」。
 		// 与 ModelBlocked（请求失败时的单模型判定）互补；无锁时为 null。零回归只增键。
 		"model_locks": h.cfg.Pool.ModelLockView(),
-		// credit_floor 生效的积分保底值（0 = 关闭）。与 accounts[].credits +
-		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
-		// （运维口径：缺失会让人误以为没记录）。
-		"credit_floor": h.cfg.Pool.CreditFloor(),
+		// credit_floor 是全局默认（0 = 关闭），不是某域的生效值。
+		// credit_floor_by_realm 给出 cn / global 回落后的生效保底：未覆盖的域等于
+		// 全局值，显式 0 仍是 0。与 accounts[].credits + model_costs 对照即可判定
+		// 「某号为何对某模型不出票」。零值也显式写出（缺失会让人误以为没记录）。
+		"credit_floor":          h.cfg.Pool.CreditFloor(),
+		"credit_floor_by_realm": h.cfg.Pool.CreditFloorByRealm(),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -2096,11 +2098,12 @@ func (f *chatFlow) skipReserved(ctx context.Context, acct *auth.Auth, i int) rot
 // reserveCredits 请求级预扣（issue #116 P1-1）：按请求体估算 prompt 与 max_tokens，
 // 在 credits 中预留估算成本；余额不足时返回 false，调用方跳过该账号。
 func (f *chatFlow) reserveCredits(acct *auth.Auth) bool {
-	// 积分保底关闭（credit_floor=0，默认）时 ReserveForRequest 必然直接放行：
+	// 该账号域的积分保底关闭时 ReserveForRequest 必然直接放行：
 	// 提前返回，省掉两次整份 body 扫描（EstimatePromptTokens 逐 rune 遍历全文 +
 	// maxOutputTokensFromBody 整解一遍 JSON）。几十 KB 的请求每轮白付约 0.5ms，
-	// 且换号重试时每个账号再付一次。
-	if f.h.cfg.Pool.CreditFloor() <= 0 {
+	// 且换号重试时每个账号再付一次。按域判断：另一域开着保底不能让本域白付扫描，
+	// 也不能让本域开着保底却被全局 0 短路。
+	if f.h.cfg.Pool.CreditFloorByRealm()[acct.Realm()] <= 0 {
 		return true
 	}
 

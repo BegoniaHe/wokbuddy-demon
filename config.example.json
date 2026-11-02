@@ -175,7 +175,11 @@
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
     "cross_domain_fallback": false,
-    "credit_floor": 100
+    "credit_floor": 100,
+    "credit_floor_by_realm": {
+      "cn": 1000,
+      "global": 350
+    }
   },
   "session_sticky": {
     "enabled": true,
