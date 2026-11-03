@@ -30,34 +30,43 @@ type keyPacer struct {
 	emitted int64
 	// seen 返回已见正文的 token 估算（chatStatsReader 增量累计，只含 completion）。
 	seen func() int64
+	// exact 返回末帧 usage.completion_tokens；出现后用它替换本请求全部估算。
+	exact func() (int64, bool)
 	// waited 本请求已分配的累计等待；达到 maxWait 后不再延迟后续帧。
 	waited  time.Duration
 	maxWait time.Duration
+	// done 由请求 context 关闭，供 streamWriter 中断帧间等待。只保存通道，
+	// 不把 context 放进结构体（containedctx）。
+	done <-chan struct{}
 }
 
 // newKeyPacer 构造流式整形器并拨出本发请求的请求间隔。返回的初始债务由第一次
 // 查询（第二帧）经 PaceWait 读出，首帧不受影响。
-func newKeyPacer(ku *keyUsage, seen func() int64) *keyPacer {
+func newKeyPacer(
+	ku *keyUsage, seen func() int64, exact func() (int64, bool), done <-chan struct{},
+) *keyPacer {
 	ku.keys.PaceRequest(ku.id, time.Now())
 
-	return &keyPacer{keys: ku.keys, id: ku.id, seen: seen, maxWait: apikey.PaceMaxDelay}
+	return &keyPacer{
+		keys: ku.keys, id: ku.id, seen: seen, exact: exact,
+		maxWait: apikey.PaceMaxDelay, done: done,
+	}
 }
+
+// Done 转发请求取消信号，满足 upstream 的可选 cancelableResponsePacer 契约。
+func (p *keyPacer) Done() <-chan struct{} { return p.done }
 
 // WaitBeforeWrite 返回本帧写出前的等待（issue #448）。先把新看到的 completion
 // token 拨进 token 时间线，再读两条时间线中更晚的等待；0 = 时间线在过去，不插
 // 延迟。累计等待到顶后直接返回 0，剩余内容一次放完。
 func (p *keyPacer) WaitBeforeWrite() time.Duration {
+	now := time.Now()
+	p.reconcileEmitted(now)
+
+	// 封顶后仍必须先对账：末帧 usage 可能只在预算耗尽后的 [DONE] 前才出现，
+	// 漏掉这一次差额会永久污染跨请求 token 时间线。
 	if p.maxWait > 0 && p.waited >= p.maxWait {
 		return 0
-	}
-
-	now := time.Now()
-
-	if p.seen != nil {
-		if delta := p.seen() - p.emitted; delta > 0 {
-			p.keys.NoteEmitted(p.id, now, delta)
-			p.emitted += delta
-		}
 	}
 
 	wait := p.keys.PaceWait(p.id, now)
@@ -72,6 +81,27 @@ func (p *keyPacer) WaitBeforeWrite() time.Duration {
 	return wait
 }
 
+// reconcileEmitted 把本请求 token 时间线从当前估算调到最新目标：精确 usage 已到
+// 就用精确值，否则用正文估算。差额允许为负，NoteEmitted 会把高估的债务退回。
+func (p *keyPacer) reconcileEmitted(now time.Time) {
+	target := p.emitted
+
+	if p.exact != nil {
+		if exact, ok := p.exact(); ok {
+			target = exact
+		} else if p.seen != nil {
+			target = p.seen()
+		}
+	} else if p.seen != nil {
+		target = p.seen()
+	}
+
+	if delta := target - p.emitted; delta != 0 {
+		p.keys.NoteEmitted(p.id, now, delta)
+		p.emitted = target
+	}
+}
+
 // pacesResponse 报告本请求是否需要响应整形：命名密钥且配了 RPM/TPM。默认密钥与
 // 未配限速的命名密钥不进这条路径（R1：与改造前逐字节、同时序一致）。
 func (f *chatFlow) pacesResponse() bool {
@@ -80,7 +110,7 @@ func (f *chatFlow) pacesResponse() bool {
 
 // attachStreamPacer 把整形器挂到响应编码器（issue #448）。未配限速、或编码器
 // 不实现 streamPacerSetter（测试替身 / 本地缓冲出口）时无操作。
-func (f *chatFlow) attachStreamPacer(stats *chatStatsReader) {
+func (f *chatFlow) attachStreamPacer(ctx context.Context, stats *chatStatsReader) {
 	if !f.pacesResponse() {
 		return
 	}
@@ -90,7 +120,9 @@ func (f *chatFlow) attachStreamPacer(stats *chatStatsReader) {
 		return
 	}
 
-	setter.setStreamPacer(newKeyPacer(f.keyUsage, stats.paceEmittedTokens))
+	setter.setStreamPacer(newKeyPacer(
+		f.keyUsage, stats.paceEmittedTokens, stats.paceExactTokens, ctx.Done(),
+	))
 }
 
 // dropKeyPacing 客户端断开（ctx 取消）时退还一把密钥的整形债务（issue #448 验收

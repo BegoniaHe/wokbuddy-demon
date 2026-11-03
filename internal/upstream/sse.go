@@ -1003,6 +1003,13 @@ type ResponsePacer interface {
 	WaitBeforeWrite() time.Duration
 }
 
+// cancelableResponsePacer 可选取消通知：客户端断开时实现方关闭 Done，让
+// streamWriter 立即结束帧间等待。保留 ResponsePacer 单方法契约，测试替身与
+// 非 HTTP 出口无需实现。
+type cancelableResponsePacer interface {
+	Done() <-chan struct{}
+}
+
 // WithResponsePacer 挂上响应整形器。与 WithKeepaliveInterval 正交：心跳只在
 // 上游静默时写注释帧，pacer 只在有帧待写时延迟；两者可同时开启。
 func WithResponsePacer(p ResponsePacer) StreamOption {
@@ -1114,6 +1121,7 @@ type streamWriter struct {
 	// 帧数：首帧不等待（TTFT 语义），后续帧与结束标记按 pacer 节奏延迟。
 	pacer         ResponsePacer
 	framesWritten int
+	paceCanceled  bool
 }
 
 // newStreamWriter 初始化 SSE 透传写入器（设置 SSE headers + 跨帧状态）。
@@ -1190,14 +1198,27 @@ func (s *streamWriter) setWriteDeadline(deadline time.Time) {
 	_ = http.NewResponseController(s.w).SetWriteDeadline(deadline)
 }
 
-// writeSSE 原样写出一帧并 flush。
+// writeSSE 原样写出一帧 data: 并 flush；所有 data 帧（含 [DONE]、修复展开帧、
+// 合成帧和兜底 error 帧）都必须经过这里，才能共享响应整形。
 func (s *streamWriter) writeSSE(payload string) error {
+	s.paceFrame()
+
+	if s.paceCanceled {
+		return fmt.Errorf("%w: request canceled while pacing", errClientWrite)
+	}
+
 	return s.writeSegments("data: ", payload, "\n\n")
 }
 
 // writeSSEBytes 写出一帧已是 JSON 字节的载荷：直接写 []byte，省去
 // []byte→string 的整帧拷贝（流式高频路径每帧都会产生一份 json.Marshal 结果）。
 func (s *streamWriter) writeSSEBytes(payload []byte) error {
+	s.paceFrame()
+
+	if s.paceCanceled {
+		return fmt.Errorf("%w: request canceled while pacing", errClientWrite)
+	}
+
 	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
 
 	if _, err := io.WriteString(s.w, "data: "); err != nil {
@@ -1408,6 +1429,19 @@ func (s *streamWriter) paceFrame() {
 	s.framesWritten++
 
 	if wait := s.pacer.WaitBeforeWrite(); wait > 0 {
+		if cancelable, ok := s.pacer.(cancelableResponsePacer); ok {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+
+			select {
+			case <-cancelable.Done():
+				s.paceCanceled = true
+			case <-timer.C:
+			}
+
+			return
+		}
+
 		time.Sleep(wait)
 	}
 }
@@ -1416,8 +1450,6 @@ func (s *streamWriter) paceFrame() {
 // 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
 // 降级原样写出，但不计数）。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
-	s.paceFrame()
-
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil || obj == nil {
 		// 非 JSON 帧或顶层 null（nil map 没有可透传字段，后续写 id 会 panic）：
@@ -1743,13 +1775,7 @@ func (s *streamWriter) flushData() (int, error) {
 func (s *streamWriter) finishSizeLimit() {
 	_ = s.writeRaw(`{"error":{"message":"upstream sse line exceeded size limit",` +
 		`"type":"upstream_error","code":"upstream_parse"}}`)
-	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
-		return
-	}
-
-	if s.fl != nil {
-		s.fl.Flush()
-	}
+	_ = s.writeSSE("[DONE]")
 }
 
 // finish 收尾：标记修复尾部回吐 + 空流兜底 error 帧 + 保证恰好一个 [DONE]。
@@ -1766,8 +1792,8 @@ func (s *streamWriter) finish(validFrames *int) error {
 	}
 
 	s.writeFinishFallback(*validFrames)
-	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if err := s.writeAll("data: [DONE]\n\n"); err != nil {
+	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）；与普通 data 帧共享整形预算。
+	if err := s.writeSSE("[DONE]"); err != nil {
 		return err
 	}
 
