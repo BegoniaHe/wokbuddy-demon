@@ -1182,7 +1182,12 @@ type responsesResponder struct {
 	keepalive    time.Duration
 	customTools  map[string]bool
 	namespaces   map[string]responsesToolRef
+	// pacer 响应整形器（issue #448；nil = 关闭）。
+	pacer upstream.ResponsePacer
 }
+
+// setStreamPacer 挂响应整形器（issue #448；见 streamPacerSetter）。
+func (r *responsesResponder) setStreamPacer(p upstream.ResponsePacer) { r.pacer = p }
 
 func (r *responsesResponder) JSON(status int, body any) {
 	writeJSON(
@@ -1203,7 +1208,7 @@ func (r *responsesResponder) Stream(
 ) error {
 	responsesStreamWriter2 := newResponsesStreamWriter(r.w, r.model, r.instructions, r.customTools, r.namespaces)
 
-	opts := streamHintOptions(r.keepalive, repair, onErrFrame)
+	opts := streamHintOptions(r.keepalive, r.pacer, repair, onErrFrame)
 	if err := upstream.StreamHint(responsesStreamWriter2, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}

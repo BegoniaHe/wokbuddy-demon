@@ -600,12 +600,17 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		defer release()
 
-		keyUsage2 := &keyUsage{id: res.KeyID, realm: h.cfg.Keys.Realm(res.KeyID)}
+		keyUsage2 := &keyUsage{
+			id:    res.KeyID,
+			realm: h.cfg.Keys.Realm(res.KeyID),
+			keys:  h.cfg.Keys,
+		}
 
 		ctx := context.WithValue(r.Context(), keyUsageKey{}, keyUsage2)
 
 		next(w, r.WithContext(ctx))
 		h.cfg.Keys.RecordUsage(keyUsage2.id, keyUsage2.prompt, keyUsage2.completion, keyUsage2.total)
+		h.dropKeyPacing(ctx, keyUsage2.id)
 	}
 }
 
@@ -3044,10 +3049,15 @@ func (f *chatFlow) handleStreamSuccess(
 	// 弱判定——tools 声明在链路上丢失是实测最常见的泄漏成因。
 	repair := upstream.NewMarkupRepair(f.declaredTools, true)
 
+	// 响应整形（issue #448）：配了 RPM/TPM 的命名密钥把 GCRA 账本挂到写出侧，
+	// 首帧仍立即，后续帧按账本节奏推迟。
+	f.attachStreamPacer(stats)
+
 	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
 		return f.h.hintContext(f.bareModel, f.reqHasImage, f.declaredToolCount > 0)
 	}), repair, func(payload string) { errFrame = payload })
 	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
+	f.dropPacingIfClientGone(sErr)
 
 	f.finishStreamStats(acct, stats, repair, attemptStarted)
 	// 观测（issue #44）：必须在 finishStreamStats 之后——f.st.toolsDeclared /
@@ -3509,6 +3519,10 @@ func (f *chatFlow) handleNonStreamSuccess(
 	if f.st.hasCache {
 		cacheMissWarn.noteCacheTokens(f.bareModel, f.st.promptTokens, f.st.cacheHit, f.st.cacheMiss)
 	}
+
+	// 响应整形（issue #448 R8）：非流式只有一次写出，整笔账在写体前一次拨完并
+	// 睡到点。只推迟写出——状态码仍是 200，不会因为超速返回 429。
+	f.paceNonStreamWrite(ctx, resp)
 
 	f.out.JSON(http.StatusOK, resp)
 	f.st.status = http.StatusOK

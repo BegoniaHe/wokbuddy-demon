@@ -234,7 +234,8 @@ func paceTokenIntervalFor(s *Store, id string) time.Duration {
 	return time.Minute / time.Duration(limits.TPM)
 }
 
-// PaceWait 只读两条时间线中更晚的等待（不拨）：供结束标记与「延迟后重查」。
+// PaceWait 只读两条时间线中更晚的等待（不拨）：供写出侧的逐帧查询。同样受
+// paceMaxDelay 上限约束——到顶后写出侧把剩余内容一次放完，不再无限等待。
 func (s *Store) PaceWait(id string, now time.Time) time.Duration {
 	if s == nil || id == "" {
 		return 0
@@ -255,7 +256,19 @@ func (s *Store) PaceWait(id string, now time.Time) time.Duration {
 		tokWait = s.pace.waitTokens(id, now)
 	}
 
-	return max(reqWait, tokWait)
+	return min(max(reqWait, tokWait), paceMaxDelay)
+}
+
+// HasRateLimits 报告密钥是否配置了 RPM 或 TPM：未配置时写出路径完全不进整形
+// 账本（issue #448 R1——无速率限制的请求与改造前逐字节、同时序一致）。
+func (s *Store) HasRateLimits(id string) bool {
+	if s == nil || id == "" {
+		return false
+	}
+
+	limits, _, found := s.stateOf(id)
+
+	return found && (limits.RPM > 0 || limits.TPM > 0)
 }
 
 // DropPacing 删除一把密钥的整形时间线：客户端断开时退还未发出的延迟，

@@ -61,6 +61,13 @@ type chatResponder interface {
 	Stream(rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string)) error
 }
 
+// streamPacerSetter 响应编码器可选实现的整形器挂载点（issue #448）：核心在写出
+// 前把 GCRA 整形器交给编码器，编码器再经 WithResponsePacer 交给 StreamHint。
+// 不是 chatResponder 的一部分——测试替身与本地缓冲出口无需整形，保持端口契约不变。
+type streamPacerSetter interface {
+	setStreamPacer(p upstream.ResponsePacer)
+}
+
 // inboundSessionMeta 入站官方会话元数据（来自客户端 X-* 头）。
 // 网关只透传客户端显式给出的值，不自行补默认。
 type inboundSessionMeta struct {
