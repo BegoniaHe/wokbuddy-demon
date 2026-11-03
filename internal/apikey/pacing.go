@@ -19,10 +19,10 @@ import (
 	"time"
 )
 
-// paceMaxDelay 单条流（或单次非流式写）的累计整形等待上限。到顶后调用方把
-// 剩余内容一次放完，而不是无限等待——等待本身占着连接、在途槽与客户端超时，
-// 拖太久会让客户端超时重试，频率反向升高（issue #448 剩余风险）。
-const paceMaxDelay = 60 * time.Second
+// PaceMaxDelay 单条流（或单次非流式写）的累计整形等待上限，也是 TAT 距当前
+// 时刻的上限。到顶后调用方把剩余内容一次放完，而不是无限等待——等待本身占着
+// 连接、在途槽与客户端超时，拖太久会让客户端超时重试，频率反向升高。
+const PaceMaxDelay = 60 * time.Second
 
 // paceState 单把密钥的两条 GCRA 时间线（Theoretical Arrival Time，理论到达时刻）：
 //   - reqTAT：请求间隔时间线。每放行一发 +60/rpm 秒；
@@ -84,14 +84,16 @@ func (l *paceLedger) advanceReq(id string, now time.Time, rpm int) time.Duration
 		tat = now
 	}
 
-	state.reqTAT = tat
+	// 每发只允许把自己的间隔槽放进当前 60s 窗口；窗口外的存量债务不能靠
+	// 再次调用续期，否则高频请求会把 TAT 永久推到未来。
+	state.reqTAT = minTime(tat, now.Add(PaceMaxDelay))
 
-	return max(tat.Sub(now), 0)
+	return max(state.reqTAT.Sub(now), 0)
 }
 
 // advanceTokens token 速率调度：TAT = max(now, TAT+tokens*60/tpm)。
-// 按已经看到的 token 数计（prompt 估算 + 已吐出 completion），不按 max_tokens
-// 预扣——长上限会把首字之后的所有帧拖到数十秒后。
+// 只按已吐出的 completion 计，不把 prompt 或 max_tokens 预算扣进来：TPS 衡量
+// Decode 阶段新增输出，输入上下文不应占用输出速率的时间线。
 func (l *paceLedger) advanceTokens(id string, now time.Time, tpm int, tokens int64) time.Duration {
 	if tokens <= 0 {
 		return 0
@@ -109,9 +111,9 @@ func (l *paceLedger) advanceTokens(id string, now time.Time, tpm int, tokens int
 		tat = now
 	}
 
-	state.tokTAT = tat
+	state.tokTAT = minTime(tat, now.Add(PaceMaxDelay))
 
-	return max(tat.Sub(now), 0)
+	return max(state.tokTAT.Sub(now), 0)
 }
 
 // waitTAT 只读某条时间线（不拨）：供结束标记判断「还要等多久」。取哪条由
@@ -151,7 +153,7 @@ func (s *Store) PaceRequest(id string, now time.Time) time.Duration {
 		return 0
 	}
 
-	return min(s.pace.advanceReq(id, now, limits.RPM), paceMaxDelay)
+	return min(s.pace.advanceReq(id, now, limits.RPM), PaceMaxDelay)
 }
 
 // PaceTokens token 速率整形（TPM）：按 tokens 个已见 token 推进 token 时间线，
@@ -166,7 +168,7 @@ func (s *Store) PaceTokens(id string, now time.Time, tokens int64) time.Duration
 		return 0
 	}
 
-	return min(s.pace.advanceTokens(id, now, limits.TPM, tokens), paceMaxDelay)
+	return min(s.pace.advanceTokens(id, now, limits.TPM, tokens), PaceMaxDelay)
 }
 
 // PaceBoth 同时推进两条时间线并取更晚者：RPM 与 TPM 都配置时，结束时刻取
@@ -191,7 +193,17 @@ func (s *Store) PaceBoth(id string, now time.Time, tokens int64) time.Duration {
 		tokWait = s.pace.advanceTokens(id, now, limits.TPM, tokens)
 	}
 
-	return min(max(reqWait, tokWait), paceMaxDelay)
+	return min(max(reqWait, tokWait), PaceMaxDelay)
+}
+
+// minTime 返回较早的时刻。TAT 一律夹到 now+PaceMaxDelay：单次查询与长期账本
+// 都受同一上限约束，避免一次突发把后续请求永久推到未来。
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+
+	return b
 }
 
 // NoteEmitted 记录已吐出的 completion token（TPM 时间线的输入）。与
@@ -221,7 +233,7 @@ func (s *Store) NoteEmitted(id string, now time.Time, tokens int64) {
 		base = now
 	}
 
-	state.tokTAT = base.Add(time.Duration(tokens) * interval)
+	state.tokTAT = minTime(base.Add(time.Duration(tokens)*interval), now.Add(PaceMaxDelay))
 }
 
 // paceTokenIntervalFor 读取单 token 的间隔（60/tpm 秒）；未配置 TPM 返回 0。
@@ -235,7 +247,7 @@ func paceTokenIntervalFor(s *Store, id string) time.Duration {
 }
 
 // PaceWait 只读两条时间线中更晚的等待（不拨）：供写出侧的逐帧查询。同样受
-// paceMaxDelay 上限约束——到顶后写出侧把剩余内容一次放完，不再无限等待。
+// PaceMaxDelay 上限约束——到顶后写出侧把剩余内容一次放完，不再无限等待。
 func (s *Store) PaceWait(id string, now time.Time) time.Duration {
 	if s == nil || id == "" {
 		return 0
@@ -256,7 +268,7 @@ func (s *Store) PaceWait(id string, now time.Time) time.Duration {
 		tokWait = s.pace.waitTokens(id, now)
 	}
 
-	return min(max(reqWait, tokWait), paceMaxDelay)
+	return min(max(reqWait, tokWait), PaceMaxDelay)
 }
 
 // HasRateLimits 报告密钥是否配置了 RPM 或 TPM：未配置时写出路径完全不进整形

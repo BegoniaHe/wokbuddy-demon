@@ -995,7 +995,7 @@ type streamOptions struct {
 //   - 首帧不查询（streamWriter 保证 TTFT 等于上游自己的 TTFT），整形只推迟
 //     后续帧与结束标记；
 //   - 返回 0 = 不等待（空闲时间线在过去，不插任何延迟）；
-//   - 实现方把累计等待封顶（见 apikey 的 paceMaxDelay）：到顶后返回 0，其余内容
+//   - 实现方把累计等待封顶（见 apikey 的 PaceMaxDelay）：到顶后返回 0，其余内容
 //     一次放完，不无限占用连接。
 //
 // 传 nil = 关闭（与未设置时逐字节一致）。
