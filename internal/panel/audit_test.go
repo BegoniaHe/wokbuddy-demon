@@ -135,13 +135,43 @@ func TestAuditMiddlewareRecordsMutationsOnly(t *testing.T) {
 	}
 }
 
+// 鉴权失败的写尝试也必须留审计：审计包在鉴权外层，auth_failed 能查到端点。
+func TestAuditRecordsFailedMutationAuth(t *testing.T) {
+	t.Parallel()
+
+	panel := New(&Config{Version: "test", AuditDir: t.TempDir(), APIKey: "right-key"})
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/config", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer wrong-key")
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("code=%d want 401", rec.Code)
+	}
+
+	entries := panel.audit.Recent(1)
+	if len(entries) != 1 {
+		t.Fatalf("entries=%d want 1（鉴权失败的写尝试也要审计）", len(entries))
+	}
+
+	entry := entries[0]
+	if entry.Status != http.StatusUnauthorized || !entry.AuthFailed || entry.OK {
+		t.Fatalf("entry=%+v want 401/auth_failed/not-ok", entry)
+	}
+
+	if entry.Path != "/panel/api/config" || entry.Pattern != "POST /panel/api/config" {
+		t.Fatalf("entry path/pattern = %q/%q", entry.Path, entry.Pattern)
+	}
+}
+
 // panic 的管理面写操作也必须留审计：handler 可能在 panic 前已改了部分状态，
 // 否则这类变更完全不可追溯（且响应是 500）。
 func TestAuditRecordsPanickedMutation(t *testing.T) {
 	t.Parallel()
 
 	panel := New(&Config{Version: "test", AuditDir: t.TempDir()})
-	panel.mux.HandleFunc("POST /panel/api/panic", func(http.ResponseWriter, *http.Request) {
+	panel.route("POST /panel/api/panic", scopeAdmin, func(http.ResponseWriter, *http.Request) {
 		panic("boom")
 	})
 
