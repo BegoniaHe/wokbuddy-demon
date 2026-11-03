@@ -22,6 +22,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
+	srv "github.com/BegoniaHe/wokbuddy-demon/internal/server"
 )
 
 // placeholderAPIKey 是 config.example.json 里的公开占位密钥。
@@ -1180,7 +1181,7 @@ func (c *Config) normalizeAllowedModels() error {
 
 // resolveBackgroundTarget 返回后台改写目标最终出站时的 (realm, bare)。后台改写后
 // 仍会经过别名解析（resolveFlowModel）：目标写成别名时，白名单要校验解析后的真实
-// 模型；别名只解析一层，与 resolveRequestModel 同口径。
+// 模型；别名只解析一层，与 resolveRequestModel 同口径（含 * / ? 通配）。
 func (c *Config) resolveBackgroundTarget() (realm, bare string) {
 	if strings.TrimSpace(c.Models.BackgroundTarget) == "" {
 		return "", ""
@@ -1192,7 +1193,7 @@ func (c *Config) resolveBackgroundTarget() (realm, bare string) {
 		realm = "cn"
 	}
 
-	aliasTarget, ok := c.Models.Aliases[bare]
+	aliasTarget, ok := srv.LookupAlias(bare, c.Models.Aliases)
 	if !ok {
 		return realm, bare
 	}

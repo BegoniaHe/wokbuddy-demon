@@ -59,7 +59,7 @@ func ResolveModel(model string) (realm, bare string) { return resolveModel(model
 func resolveRequestModel(model string, aliases map[string]string) (realm, bare string) {
 	realm, bare = resolveModel(model)
 
-	target, ok := lookupAlias(bare, aliases)
+	target, ok := LookupAlias(bare, aliases)
 	if !ok {
 		return realm, bare
 	}
@@ -113,7 +113,7 @@ func explicitModelRealm(model string, aliases map[string]string) (string, bool) 
 		return realm, true
 	}
 
-	if target, ok := lookupAlias(bare, aliases); ok {
+	if target, ok := LookupAlias(bare, aliases); ok {
 		if targetRealm, _, targetPrefixed := splitRealm(target); targetPrefixed {
 			return targetRealm, true
 		}
@@ -128,10 +128,11 @@ func aliasIsWildcard(name string) bool {
 	return strings.ContainsAny(name, "*?")
 }
 
-// lookupAlias 按裸名查别名。精确键优先；否则在含 * / ? 的键里用 path.Match
+// LookupAlias 按裸名查别名。精确键优先；否则在含 * / ? 的键里用 path.Match
 // 匹配，多个同时命中时模式更长优先，同长取字典序较小的模式。
 // 未命中返回 false，调用方保持透传。非法 glob 视为不匹配。
-func lookupAlias(bare string, aliases map[string]string) (string, bool) {
+// 导出供 cmd/server 的配置期校验（后台改写目标）与请求解析同口径。
+func LookupAlias(bare string, aliases map[string]string) (string, bool) {
 	if target, ok := aliases[bare]; ok {
 		return target, true
 	}
