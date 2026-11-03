@@ -2831,7 +2831,7 @@ func (f *chatFlow) noteWafAndStop(kind upstream.ErrKind, acct *auth.Auth) bool {
 	return true
 }
 
-// retryModelNotFoundCrossRealm 11102「上游模型目录无此模型」+ 跨域回退：该域没有此
+// retryModelNotFoundCrossRealm 11102「该模型未接入或缺配置」+ 跨域回退：该域没有此
 // 模型时允许跨到另一域重取号一次（本 fork 的 11102 是请求级 fail-fast，与上游
 // 「负缓存后换域」链路不同，所以显式补一条一次性跨域分支）。不罚账号、不写模型负缓存。
 // ok=false 表示「本次不走跨域分支」，调用方继续既有 fail-fast 处置。
@@ -2955,7 +2955,8 @@ func queueRetryAfterSeconds(uerr *upstream.Error) int {
 //   - ErrPromptTooLong（11115）：上游原文含真实 token 数与上限值，最有价值。
 //   - ErrImageInvalid：图片格式/数据无效，同一 body 换号仍是同样解析错误。
 //   - ErrBadParams（11101）：请求体解析失败，继续轮转会把确定失败伪装成"号不可用"。
-//   - ErrModelNotFound（11102）：上游目录无此模型，所有账号同一答复，404 立即返回。
+//   - ErrModelNotFound（11102）：该模型未接入或缺配置（官方文案；模型权限是否
+//     账号维度未验证），404 立即返回。
 func (f *chatFlow) handleRequestLevelError(
 	acct *auth.Auth, kind upstream.ErrKind, respBody []byte, uerr *upstream.Error,
 ) {
@@ -2999,7 +3000,7 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 	case upstream.ErrModelAccess:
 		return "model_unavailable", "model is unavailable for this account"
 	case upstream.ErrModelNotFound:
-		return "model_not_found", "model not found in upstream catalog"
+		return "model_not_found", "model is unavailable at upstream"
 	default:
 		return "invalid_request", ""
 	}
