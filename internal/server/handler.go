@@ -3659,8 +3659,22 @@ func mergeNonStreamContinuation(first, second map[string]any) map[string]any {
 	return first
 }
 
-// mergeUsageTotals 把续写段的 usage 累加到首段：两段请求都真实消耗了 token/积分，
-// 只保留第二段会漏记首段用量。数值叶子递归相加，缺失键直接补齐。
+// prompt 侧取末段：续写请求已带上前文，prompt/cache 再累加会按段数重复计量
+// （issue #432）。完成侧与 credit 仍跨段相加。
+var promptUsageKeys = map[string]struct{}{
+	"prompt_tokens":            {},
+	"input_tokens":             {},
+	"prompt_tokens_details":    {},
+	"input_tokens_details":     {},
+	"cached_tokens":            {},
+	"cache_read_input_tokens":  {},
+	"prompt_cache_hit_tokens":  {},
+	"prompt_cache_miss_tokens": {},
+}
+
+// mergeUsageTotals 合并两段 usage：prompt/cache 取末段，completion/credit 累加，
+// total 按「末段 prompt + 累计 completion」重算。末段没有 prompt_tokens 时保留
+// 末段原 total，不因重算失败丢掉末段。
 func mergeUsageTotals(first, second map[string]any) {
 	secondUsage, ok := second["usage"].(map[string]any)
 	if !ok {
@@ -3675,26 +3689,76 @@ func mergeUsageTotals(first, second map[string]any) {
 	}
 
 	addUsageNumbers(firstUsage, secondUsage)
+
+	if !recomputeUsageTotal(firstUsage) {
+		// 末段没有 prompt_tokens 时不能重算，保留末段自己的 total，不要用首段的。
+		if total, ok := secondUsage["total_tokens"].(float64); ok {
+			firstUsage["total_tokens"] = total
+		}
+	}
 }
 
-// addUsageNumbers 递归把 src 的数值字段累加进 dst；非数值/缺失沿用 src。
+// addUsageNumbers 递归合并 usage：prompt 侧整段换成 src（末段没有的键删掉），
+// total_tokens 留给上层重算或保留末段原值，其余数值叶子相加。
 func addUsageNumbers(dst, src map[string]any) {
-	for key, value := range src {
-		switch typed := value.(type) {
-		case map[string]any:
-			if target, ok := dst[key].(map[string]any); ok {
-				addUsageNumbers(target, typed)
-				continue
-			}
-		case float64:
-			if target, ok := dst[key].(float64); ok {
-				dst[key] = target + typed
-				continue
-			}
+	for key := range dst {
+		if _, promptSide := promptUsageKeys[key]; !promptSide {
+			continue
 		}
 
-		dst[key] = value
+		if _, inSrc := src[key]; !inSrc {
+			delete(dst, key)
+		}
 	}
+
+	for key, value := range src {
+		applyUsageLeaf(dst, key, value)
+	}
+}
+
+// applyUsageLeaf 把 src 的一个叶子写进 dst。prompt 侧直接覆盖；嵌套对象递归；
+// 两边都是 float64 则相加；total_tokens 跳过。
+func applyUsageLeaf(dst map[string]any, key string, value any) {
+	if key == "total_tokens" {
+		return
+	}
+
+	if _, promptSide := promptUsageKeys[key]; promptSide {
+		dst[key] = value
+
+		return
+	}
+
+	switch typed := value.(type) {
+	case map[string]any:
+		if target, ok := dst[key].(map[string]any); ok {
+			addUsageNumbers(target, typed)
+
+			return
+		}
+	case float64:
+		if target, ok := dst[key].(float64); ok {
+			dst[key] = target + typed
+
+			return
+		}
+	}
+
+	dst[key] = value
+}
+
+// recomputeUsageTotal 在末段带 prompt_tokens 时按「末段 prompt + 累计 completion」
+// 重写 total_tokens。没有该字段返回 false，调用方保留末段原 total。
+func recomputeUsageTotal(usageMap map[string]any) bool {
+	promptTokens, ok := usageMap["prompt_tokens"].(float64)
+	if !ok {
+		return false
+	}
+
+	completion, _ := usageMap["completion_tokens"].(float64)
+	usageMap["total_tokens"] = promptTokens + completion
+
+	return true
 }
 
 // setCacheTokensFromUsage 用聚合响应 usage 填 st 的缓存三维观测（非流式收尾）。
