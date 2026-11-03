@@ -62,7 +62,7 @@ const (
 	ErrBadParams
 	ErrAccountFault  // 账号级授权/配额故障（11140 request illegal / 14017 trial not activated）→ 冷却轮换，不无限重试
 	ErrModelBlocked  // 11136 账号缺该模型权限 → (账号,模型) 负缓存避让，换号重试
-	ErrModelNotFound // 11102 上游模型目录无此模型 → 请求级 fail-fast：不罚号、不轮转、不写路由熔断
+	ErrModelNotFound // 11102 该模型未接入或缺配置（官方文案）→ 请求级 fail-fast：不罚号、不轮转、不写路由熔断
 	ErrModelAccess   // 11141 模型已下线 → 请求级 fail-fast + (账号,模型) 负缓存避让
 	ErrWafBlock      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
@@ -377,7 +377,8 @@ func ModelBlockReasonFor(body string) string {
 	return ModelBlockReason
 }
 
-// IsModelBlocked 报告 body 是否是「上游模型目录无此模型」(11102) 的确定性答复。
+// IsModelBlocked 报告 body 是否是 11102「该模型未接入或缺配置」的确定性答复
+// （官方 5.9.3 文案：当前模型不可用，没有接入或缺少配置）。
 //
 // 只比对 code/msg 等独立字段，绝不做整段文本子串匹配：错误体还带 requestId 等字段，
 // 拿整段文本匹配会把 "11102" 撞在 ID 上、误判一个本来能用的模型。判定 =
@@ -740,9 +741,11 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 	if status != http.StatusTooManyRequests && hasAnyBusinessCode(body, modelRetiredCodes...) {
 		return ErrModelAccess, true
 	}
-	// 11102「上游模型目录无此模型」：所有账号共享同一目录，换号必然得到同一答复。
+	// 11102「该模型未接入或缺配置」：官方客户端处置是让用户换模型（renderer 动作
+	// switchModel；CLI 对 service info not found 追加账号可用模型列表），不作账号处罚。
 	// 归 ErrModelNotFound 请求级 fail-fast——若等到通用 4xx 兜底归 ErrClient 会逐号
-	// 轮转，模型不存在时把一次失败放大 MaxRotate 倍。
+	// 轮转，把一次失败放大 MaxRotate 倍。官方未给出「换号能否成功」的证据，故默认
+	// 不换号；需要跨域兜底时由 pool.cross_domain_fallback 显式开启。
 	// 只认 400/404（见 IsModelBlocked），429+11102 落 status==429 层走限流语义。
 	if IsModelBlocked(status, body) {
 		return ErrModelNotFound, true

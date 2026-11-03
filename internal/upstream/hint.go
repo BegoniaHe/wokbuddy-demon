@@ -75,7 +75,7 @@ var gatewayHintByKind = map[ErrKind]string{
 	ErrHardCredit:  "account credits exhausted at upstream; waiting for daily check-in to restore",
 	ErrModelBlocked: "this account lacks permission for the requested model; " +
 		"the gateway will retry on another account",
-	ErrModelNotFound: "upstream model catalog has no such model; " +
+	ErrModelNotFound: "the requested model is unavailable at upstream (not integrated or misconfigured); " +
 		"check /v1/models and switch to a supported model",
 	ErrModelAccess: "this account cannot use the requested model; " +
 		"switch model or try another account",

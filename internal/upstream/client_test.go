@@ -87,7 +87,7 @@ func TestClassify(t *testing.T) {
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
-		// 11102「上游模型目录无此模型」：确定性答复，归 ErrModelNotFound 请求级 fail-fast。
+		// 11102「该模型未接入或缺配置」：确定性答复，归 ErrModelNotFound 请求级 fail-fast。
 		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelNotFound},
 		{400, `{"error":{"code":"11102","message":"model service info not found"}}`, ErrModelNotFound},
 		{400, `{"msg":"service info not found"}`, ErrModelNotFound},
