@@ -44,13 +44,17 @@ type Pool struct {
 	degradeThreshold   int
 	degradeCooldown    time.Duration
 	degradeCooldownMax time.Duration
-	// creditFloor 积分保底（SetCreditFloor 注入；0 = 关闭，缺省即现状）。
-	// 账号 credits < floor 时不再参与选号——防止收费请求把余额打穿、连免费模型都
+	// creditFloor 积分保底全局默认（SetCreditFloor 注入；0 = 关闭，缺省即现状）。
+	// 账号 credits < 该域生效值时不再参与选号——防止收费请求把余额打穿、连免费模型都
 	// 402 冷却到次日签到。签到回血（SetCreditsDetailed）越过 floor 即自动恢复。
 	// 全池触底且无免费模型可接时选号返回 nil（硬语义：宁 503 不打穿）。
 	// 收费与否的判据见 floorBlockedForModel：本地实测台账优先，缺失时用上游目录
 	// 倍率（modelRateOf 注入）兜底，避免「无观测的高价新模型」绕过保底。
-	creditFloor int64
+	// creditFloorCN / creditFloorGlobal 按域覆盖（issue #439）。指针区分「未覆盖」
+	// （回落 creditFloor）与显式 0（该域关闭）。读点一律走 creditFloorFor。
+	creditFloor       int64
+	creditFloorCN     *int64
+	creditFloorGlobal *int64
 	// 每日护栏（issue #95）：全局默认 + cn/global 字段级覆盖；0 = 关闭。
 	dailyDefault, dailyCN, dailyGlobal DailyLimits
 	dailyUsage                         func() map[string]DailyUsage
@@ -307,7 +311,8 @@ func (p *Pool) SetDegrade(threshold int, cooldown, cooldownMax time.Duration) {
 	applyPositive(&p.degradeCooldownMax, cooldownMax)
 }
 
-// CreditFloor 透出生效的积分保底值（/status 用）。0 = 关闭。
+// CreditFloor 透出全局积分保底（/status 的 credit_floor）。0 = 关闭。
+// 这是全局默认，不是某域的生效值；按域生效值见 CreditFloorByRealm。
 func (p *Pool) CreditFloor() int64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -315,16 +320,64 @@ func (p *Pool) CreditFloor() int64 {
 	return p.creditFloor
 }
 
+// CreditFloorByRealm 透出 cn / global 回落后的生效保底（/status 用）。
+// 两个键都给出：未覆盖的域等于全局 creditFloor，显式 0 仍是 0。
+func (p *Pool) CreditFloorByRealm() map[string]int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return map[string]int64{
+		"cn":     p.creditFloorFor("cn"),
+		"global": p.creditFloorFor("global"),
+	}
+}
+
 // SetCreditFloor 注入积分保底线（main 从 config 解析后调用）。
-// 0 = 关闭（缺省即现状，零回归）；负值非法保留原值（0）。
-// 语义见 Pool.creditFloor 字段注释。
-func (p *Pool) SetCreditFloor(n int64) {
+// 0 = 关闭（缺省即现状，零回归）；负值非法保留原值。
+// 语义见 Pool.creditFloor 字段注释。byRealm 的键只认 cn / global：
+// 键存在（含 *int64 == 0）覆盖该域，缺键回落 n；非法键忽略。负的覆盖值钳 0。
+// 传 nil map 清掉全部按域覆盖。
+func (p *Pool) SetCreditFloor(n int64, byRealm map[string]*int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if n >= 0 {
 		p.creditFloor = n
 	}
+
+	p.creditFloorCN = clampFloorOverride(byRealm["cn"])
+	p.creditFloorGlobal = clampFloorOverride(byRealm["global"])
+}
+
+// clampFloorOverride 复制一份覆盖值：nil = 未设置；负值钳 0。
+func clampFloorOverride(n *int64) *int64 {
+	if n == nil {
+		return nil
+	}
+
+	v := max(*n, 0)
+
+	return &v
+}
+
+// creditFloorFor 返回 realm 的生效保底。调用方需已持 p.mu。
+// 空 realm 与未知域回落全局：选号过滤已按账号域分桶，空 realm 只出现在
+// 不按域过滤的入口，此时两域若覆盖不同则无法单值表达，用全局默认。
+func (p *Pool) creditFloorFor(realm string) int64 {
+	var over *int64
+
+	switch realm {
+	case "cn":
+		over = p.creditFloorCN
+	case "global":
+		over = p.creditFloorGlobal
+	}
+
+	if over != nil {
+		return *over
+	}
+
+	return p.creditFloor
 }
 
 // DailyLimits 账号级每日护栏；0 = 关闭。

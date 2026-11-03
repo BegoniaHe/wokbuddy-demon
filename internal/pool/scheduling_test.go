@@ -146,7 +146,7 @@ func TestReserveForRequest(t *testing.T) {
 
 	pool := New("")
 	pool.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
-	pool.SetCreditFloor(150)
+	pool.SetCreditFloor(150, nil)
 	pool.NoteModelCost("u1", "paid", 22.3, 100000) // 0.223 credits/1k
 	pool.SetCredits("u1", 200, 0)                  // NoteModelCost 会实扣一次，重置到测试余额
 
@@ -176,12 +176,55 @@ func TestReserveForRequestFreeModelNoop(t *testing.T) {
 	pool := New("")
 	pool.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
 	pool.SetCredits("u1", 10, 0)
-	pool.SetCreditFloor(150)
+	pool.SetCreditFloor(150, nil)
 	pool.NoteModelCost("u1", "free", 0, 1000)
 
 	amount, ok := pool.ReserveForRequest("u1", "free", "cn", 100000, 2048)
 	if !ok || amount != 0 {
 		t.Fatalf("free model amount=%v ok=%v want 0,true", amount, ok)
+	}
+}
+
+// TestReserveForRequestUsesRealmFloor 预扣按请求 realm 的生效保底，不看全局。
+// cn=1000 拦截 400 分的号；同一余额打 global（350）放行。
+func TestReserveForRequestUsesRealmFloor(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	pool.SetCreditFloor(100, map[string]*int64{
+		"cn":     floorPtr(1000),
+		"global": floorPtr(350),
+	})
+	pool.NoteModelCost("u1", "paid", 22.3, 100000) // 0.223 credits/1k
+	pool.SetCredits("u1", 400, 0)
+
+	if _, ok := pool.ReserveForRequest("u1", "paid", "cn", 1000, 100); ok {
+		t.Fatal("cn floor 1000：400 分不足以预扣，应拒绝")
+	}
+
+	if _, ok := pool.ReserveForRequest("u1", "paid", "global", 1000, 100); !ok {
+		t.Fatal("global floor 350：同一余额应允许预扣")
+	}
+}
+
+// TestReserveForRequestRealmZeroDisables 某域显式 0 关闭预扣门槛。
+func TestReserveForRequestRealmZeroDisables(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	pool.SetCreditFloor(1000, map[string]*int64{"cn": floorPtr(0)})
+	pool.NoteModelCost("u1", "paid", 22.3, 100000)
+	pool.SetCredits("u1", 10, 0)
+
+	amount, ok := pool.ReserveForRequest("u1", "paid", "cn", 100000, 0)
+	if !ok || amount != 0 {
+		t.Fatalf("cn 显式 0 应跳过预扣，amount=%v ok=%v", amount, ok)
+	}
+
+	if _, ok := pool.ReserveForRequest("u1", "paid", "global", 1000, 100); ok {
+		t.Fatal("global 未覆盖应回落全局 1000 并拒绝")
 	}
 }
 

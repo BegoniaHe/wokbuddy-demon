@@ -504,12 +504,26 @@ func (p *Pool) selectCandidate(ordered, top []*entry, model string, now time.Tim
 
 // floorBlockedForRealmModel 同上，但带 realm 上下文（倍率按 (realm, 模型) 分桶，
 // 同名模型在 CN / global 两域倍率可不同）。realm 为空时按倍率表的空域键查。
-func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time.Time) bool {
-	if p.creditFloor <= 0 || model == "" || float64(e.credits)-e.reservedCredits >= float64(p.creditFloor) {
+func (p *Pool) floorBlockedForRealmModel(entry2 *entry, model, realm string, now time.Time) bool {
+	floor := p.creditFloorFor(floorRealmOf(entry2, realm))
+	if floor <= 0 || model == "" || float64(entry2.credits)-entry2.reservedCredits >= float64(floor) {
 		return false
 	}
 
-	return p.paidModel(e, model, realm, now)
+	return p.paidModel(entry2, model, realm, now)
+}
+
+// floorRealmOf 取保底用的域：请求域优先；空则用账号所属域（粘性路径）。
+func floorRealmOf(entry2 *entry, realm string) string {
+	if realm != "" {
+		return realm
+	}
+
+	if entry2 != nil && entry2.a != nil {
+		return entry2.a.Realm()
+	}
+
+	return ""
 }
 
 // paidModel 报告模型是否收费：本地实测优先，缺失时用上游目录倍率兜底。
