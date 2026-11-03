@@ -282,24 +282,26 @@ func TestRegisteredAPIRequiresAuth(t *testing.T) {
 	}
 }
 
-// 未登记路径匿名与带 admin key 都是 401，不是 404。
+// 未登记路径匿名与带 admin key 都是 401，不是 404；非 GET 方法也不能绕成 405。
 func TestUnregisteredAPIIsUnauthorized(t *testing.T) {
 	t.Parallel()
 
 	panel := newTestPanel()
 
-	for _, authz := range []string{"", "Bearer test-key"} {
-		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/panel/api/does-not-exist", nil)
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		for _, authz := range []string{"", "Bearer test-key"} {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(method, "/panel/api/does-not-exist", nil)
 
-		if authz != "" {
-			req.Header.Set("Authorization", authz)
-		}
+			if authz != "" {
+				req.Header.Set("Authorization", authz)
+			}
 
-		panel.ServeHTTP(rec, req)
+			panel.ServeHTTP(rec, req)
 
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("authz %q: code=%d want 401", authz, rec.Code)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s authz %q: code=%d want 401", method, authz, rec.Code)
+			}
 		}
 	}
 }

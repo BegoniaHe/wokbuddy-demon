@@ -417,13 +417,17 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //
 // 匹配直接复用 mux.Handler：命中已登记 pattern 才按 scope 放行。pattern 为空
 // 有两种来源，必须分开：
-//   - 方法不匹配：mux 返回 405 handler 且 pattern 为空，交给 mux 保持 405；
-//   - 没有任何登记路由能接住：直接 401，不进入业务 handler，也不消耗鉴权失败
-//     预算。带任意有效 key 同样 401：登记是放行的前提，key 不能发明路由。
+//   - 方法不匹配且 GET 探测命中已登记的非公开路由：交给 mux 保持 405；
+//   - 没有任何登记路由能接住（或只命中公开静态路由）：直接 401，不进入业务
+//     handler，也不消耗鉴权失败预算。带任意有效 key 同样 401：登记是放行的前提，
+//     key 不能发明路由。
 func (p *Panel) authorizeAPI(w http.ResponseWriter, r *http.Request) bool {
 	_, pattern := p.mux.Handler(r)
 	if pattern == "" {
-		if _, other := p.mux.Handler(methodProbe(r)); other != "" {
+		// 探测必须看作用域：未登记的 POST 等路径也会命中公开静态路由（405），
+		// 那不是「方法不匹配」，仍按未登记 401。
+		_, other := p.mux.Handler(methodProbe(r))
+		if scope, ok := p.scopes[other]; ok && scope != scopePublic {
 			return true
 		}
 
