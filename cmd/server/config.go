@@ -22,6 +22,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
+	srv "github.com/BegoniaHe/wokbuddy-demon/internal/server"
 )
 
 // placeholderAPIKey 是 config.example.json 里的公开占位密钥。
@@ -237,8 +238,9 @@ type Config struct {
 		// BackgroundTarget 后台模型改写目标；默认 deepseek-v4.1-flash。
 		BackgroundTarget string `json:"background_target"`
 		// Aliases 客户端模型别名 → 上游模型（issue #52）：
-		// {"claude-sonnet-4-5": "cn:hy4", "gpt-5-codex": "hy4"}。
-		// 键必须是裸名（不含 realm 前缀，大小写敏感）；值沿用 "[realm:]model"
+		// {"claude-sonnet-4-5": "cn:hy4", "claude-*": "cn:glm-5.2"}。
+		// 键必须是裸名（不含 realm 前缀，大小写敏感），可用 * / ? 通配
+		// （精确键优先，再按模式长度与字典序）；值沿用 "[realm:]model"
 		// 语法，省略 realm 时继承请求侧的 realm（裸请求即 cn）。
 		// 命中别名后选号/粘性/成本台账/日志一律使用解析后的裸模型名。
 		Aliases map[string]string `json:"aliases"`
@@ -472,8 +474,12 @@ type Config struct {
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到。
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
-		// 默认 0 = 关闭；负值钳 0。
+		// 默认 0 = 关闭；负值钳 0。未在 CreditFloorByRealm 写明的域回落本值。
 		CreditFloor int64 `json:"credit_floor"`
+		// CreditFloorByRealm 按域覆盖积分保底（issue #439）。键只认 cn / global，
+		// 非法键剔除；负值钳 0。指针区分「键未写」（回落 CreditFloor）与显式 0
+		// （该域关闭保底）。JSON `{"cn":0}` 必须保留为关闭，不得回落全局。
+		CreditFloorByRealm map[string]*int64 `json:"credit_floor_by_realm"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -1064,6 +1070,7 @@ func (c *Config) normalizeAPIKeys() error {
 // normalizeModelAliases 校验并归一化模型别名（issue #52）：键必须是裸名，
 // 值必须是可解析的非空 "[realm:]model"；首尾空白去掉，去空白后重名直接报错
 // （否则 map 覆盖顺序不确定，配置会静默丢一项）。
+// 键可含 * / ?（issue #436），含 ":" 的键、空目标仍拒绝。
 func (c *Config) normalizeModelAliases() error {
 	if len(c.Models.Aliases) == 0 {
 		return nil
@@ -1178,7 +1185,7 @@ func (c *Config) normalizeAllowedModels() error {
 
 // resolveBackgroundTarget 返回后台改写目标最终出站时的 (realm, bare)。后台改写后
 // 仍会经过别名解析（resolveFlowModel）：目标写成别名时，白名单要校验解析后的真实
-// 模型；别名只解析一层，与 resolveRequestModel 同口径。
+// 模型；别名只解析一层，与 resolveRequestModel 同口径（含 * / ? 通配）。
 func (c *Config) resolveBackgroundTarget() (realm, bare string) {
 	if strings.TrimSpace(c.Models.BackgroundTarget) == "" {
 		return "", ""
@@ -1190,7 +1197,7 @@ func (c *Config) resolveBackgroundTarget() (realm, bare string) {
 		realm = "cn"
 	}
 
-	aliasTarget, ok := c.Models.Aliases[bare]
+	aliasTarget, ok := srv.LookupAlias(bare, c.Models.Aliases)
 	if !ok {
 		return realm, bare
 	}
@@ -1763,6 +1770,8 @@ func (c *Config) normalizePoolDefaults() {
 		c.Pool.CreditFloor = 0
 	}
 
+	c.normalizeCreditFloorByRealm()
+
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -1790,6 +1799,36 @@ func (c *Config) normalizePoolDefaults() {
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
 	}
+}
+
+// normalizeCreditFloorByRealm 清洗按域保底：只留 cn / global，负值钳 0。
+// 键存在且值为 0 表示该域关闭，不回落全局；非法键丢掉，不报错。
+func (c *Config) normalizeCreditFloorByRealm() {
+	raw := c.Pool.CreditFloorByRealm
+	if len(raw) == 0 {
+		c.Pool.CreditFloorByRealm = nil
+		return
+	}
+
+	out := make(map[string]*int64, 2)
+
+	for _, realm := range []string{"cn", "global"} {
+		n, ok := raw[realm]
+		if !ok || n == nil {
+			continue
+		}
+
+		v := max(*n, 0)
+
+		out[realm] = &v
+	}
+
+	if len(out) == 0 {
+		c.Pool.CreditFloorByRealm = nil
+		return
+	}
+
+	c.Pool.CreditFloorByRealm = out
 }
 
 // normalizeUpstreamDefaults 补齐出站超时缺省值（header 120s / idle 300s）。

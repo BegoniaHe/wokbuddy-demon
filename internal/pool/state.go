@@ -475,7 +475,8 @@ func (p *Pool) PickByUIDForModel(uid, model, realm string) (*auth.Auth, StickyPi
 	if p.floorBlockedForRealmModel(entry2, model, entry2.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, "+
 			"unbind (paid model held out)",
-			logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()), model, entry2.credits, p.creditFloor)
+			logfmt.Label(entry2.a.UID, entry2.a.NicknameValue()), model, entry2.credits,
+			p.creditFloorFor(entry2.a.Realm()))
 
 		return nil, StickyUnavailable
 	}

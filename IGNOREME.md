@@ -517,14 +517,15 @@ gemini
 | `pricing.refresh_minutes` | `0` | 价格自动刷新周期；`0` = 只在启动时拉取一次 |
 | `pricing.exchange_rate` | `1` | 展示币种换算系数（1 = USD） |
 | `pool.max_in_flight_total` | `0` | 网关级全局在途上限；满额新请求返回 503 且不选号；`0` = 不限。热生效 |
-| `pool.credit_floor` | `0`（示例 `100`） | 积分保底：余额低于该值不再参与收费模型轮换；`0` = 关闭 |
+| `pool.credit_floor` | `0`（示例 `100`） | 积分保底全局默认：余额低于该域生效值不再参与收费模型轮换；`0` = 关闭 |
+| `pool.credit_floor_by_realm` | 不写 = 两域都用全局 | 按域覆盖，键只认 `cn` / `global`。未写的域回落 `credit_floor`；某域显式 `0` = 该域关闭（不回落全局）。非法键丢弃，负值钳 `0`。热生效。`/status` 的 `credit_floor` 是全局默认，`credit_floor_by_realm` 是两域回落后的生效值 |
 | `pool.cross_domain_fallback` | `false` | 裸模型名跨域回退：请求未显式指定域时，本域对该模型选不到号可换到另一域；上游 `11102`（目录无此模型）允许跨域重取号一次。显式 `cn:`/`global:` 前缀、别名目标显式前缀、命名密钥绑定出口**永不回退**。开启后请求可能落到客户端没点名的域并消耗该域额度/日限（记账按实际服务域）。热生效 |
 | `pool.strategy.cn` / `pool.strategy.global` | `weighted_random` | 按域选号策略：`weighted_random`（默认，加权随机）/ `round_robin`（严格轮转）/ `sequential_exhaust`（用完一个号再下一个）。**有序策略会关闭全冷却兜底与防撞号窗口**；游标按 (域, 模型) 持久化，切换策略清空该域游标。热生效 |
 | `pool.account_order.cn` / `pool.account_order.global` | `[]` | 有序策略的固定账号顺序（uid 数组）；未列出/异域 uid 自动跳过，其余按 uid 升序追加在后。热生效 |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
-| `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
+| `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；键含 `*` / `?` 时按 `path.Match` 通配（精确键优先，多个命中取模式更长、同长字典序小者），其它键按字面量匹配。命中后按目标裸模型选号/计费；通配键不出现在 `/v1/models`。改后需重启 |
 | `models.background_names` | `[]` | 客户端后台任务硬编码模型名（大小写不敏感）；命中后把 `model` 改写为 `background_target`。留空 = 关闭。热生效 |
 | `models.background_target` | `deepseek-v4.1-flash` | 后台模型改写目标；只改 `model`，其余请求原样透传 |
 | `models.hidden` | `[]` | 模型黑名单：裸名 = 两域都隐藏，`cn:` / `global:` 前缀 = 只藏该域（大小写敏感，前缀后必须写模型名）。命中的模型不在 `/v1/models` 列出（含别名条目），点名调用返回 400 `model_unavailable`（不打上游、不占选号）。热生效 |
@@ -534,7 +535,7 @@ gemini
 - 同一账号在途达到 `ceil(0.66 × max_in_flight)`（或健康因子低于 0.5）时，会话粘性命中会软逃逸；解绑后 20 秒内不再绑定回原号，窗口结束仍需回落到 `max_in_flight` 的 30% 以下。
 - 在途压力以 `1/(1+7×pressure²)` 乘性降权（负载率 40% 以下不打折），Top-5 排序与加权抽签同口径。
 - 全冷却兜底选中账号后进入 30 秒单飞探针窗口，其余并发不再选中同一号。
-- 开启 `pool.credit_floor` 时，请求前按 prompt 长度 + `max_tokens` 估算并预扣积分；余额不足以覆盖保底时跳过该号，所有成功/失败/断流路径都会释放预扣。
+- 开启 `pool.credit_floor`（或某域的 `credit_floor_by_realm`）时，请求前按 prompt 长度 + `max_tokens` 估算并预扣积分；余额不足以覆盖**该域生效保底**时跳过该号，所有成功/失败/断流路径都会释放预扣。
 
 ### 模型别名
 
@@ -552,10 +553,10 @@ gemini
 }
 ```
 
-- 键必须是裸模型名（不含 `cn:` / `global:` 前缀，大小写敏感）。
+- 键必须是裸模型名（不含 `cn:` / `global:` 前缀，大小写敏感）；含 `*` / `?` 的键按 `path.Match` 通配，其它键按字面量精确匹配。精确键优先；多个通配同时命中时取模式更长者，同长取字典序较小的模式。
 - 值沿用 `[realm:]model` 语法；省略 realm 时继承请求侧 realm（裸请求即 `cn`）。
 - 先剥请求的 realm 前缀再查别名；未命中则原样透传，行为与未配置别名一致。
-- 命中后选号、会话粘性、成本台账与日志统一使用解析后的裸模型名；`GET /v1/models` 会追加别名条目并附带 `upstream_id`。
+- 命中后选号、会话粘性、成本台账与日志统一使用解析后的裸模型名；`GET /v1/models` 会追加**精确**别名条目并附带 `upstream_id`，通配键不当作可点名的模型 id。
 - 别名在进程启动时装载，修改后需重启。
 
 ### 环境变量覆盖

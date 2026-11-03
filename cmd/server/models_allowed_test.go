@@ -139,6 +139,19 @@ func TestModelsAllowedBackgroundTargetAlias(t *testing.T) {
 			aliases: `{"fast":"glm-5.2"}`,
 			allowed: `["glm-5.2"]`,
 		},
+		{
+			name:    "通配别名解析后的真实模型被白名单覆盖",
+			target:  "claude-opus-4-1",
+			aliases: `{"claude-*":"glm-5.2"}`,
+			allowed: `["glm-5.2"]`,
+		},
+		{
+			name:    "通配别名只放行别名本身仍拒绝",
+			target:  "claude-opus-4-1",
+			aliases: `{"claude-*":"glm-5.2"}`,
+			allowed: `["claude-opus-4-1"]`,
+			wantErr: true,
+		},
 	}
 
 	for _, testCase := range cases {

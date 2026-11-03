@@ -112,7 +112,7 @@ docker compose up -d --build
 
 - `models.hidden`：黑名单。裸名 = `cn` 与 `global` 两域都隐藏，`cn:x` / `global:x` 只藏该域。命中后不出现在 `/v1/models`，点名调用返回 `400 model_unavailable`（不打上游、不占号）。热生效。
 - `models.allowed`：部署级白名单。语法与 `hidden` 相同，空数组 = 不启用（放行全部）。启用后只有名单内模型出现在 `/v1/models`，点名调用同样 `400 model_unavailable`；与 `hidden` 取交集，同时命中的模型拒绝。热生效。若开启后台模型改写（`models.background_names`），`models.background_target` 也必须在白名单内，否则启动即报错。
-- `models.aliases`：别名 → 上游模型。点名调用按解析后的**目标模型**受上面两套名单约束（目标被隐藏或不在白名单 → `400 model_unavailable`）；`/v1/models` 列表另外要求别名名字本身也在白名单内，否则该别名不列出（别名可用但不可见）。改别名需重启。
+- `models.aliases`：别名 → 上游模型。键可用 `*` / `?`（`path` 通配：`*` 任意长度含空、`?` 单字符）；精确键优先，多个通配同时命中时模式更长优先、同长取字典序较小的模式，未命中则原样透传。点名调用按解析后的**目标模型**受上面两套名单约束（目标被隐藏或不在白名单 → `400 model_unavailable`）；`/v1/models` 只列精确别名（通配键不出现），且要求别名名字本身也在白名单内，否则该别名不列出（别名可用但不可见）。改别名需重启。
 
 命名密钥自带的模型白名单（`/panel/` 密钥管理里的 glob）语义不变，与 `models.allowed` 取交集：两边都放行才可用。
 

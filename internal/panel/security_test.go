@@ -6,6 +6,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 )
 
 func newTestPanel() *Panel {
@@ -197,7 +200,8 @@ func TestValidUID(t *testing.T) {
 	}
 }
 
-// 未带密钥的 API 请求必须 401；携带正确密钥则通过鉴权层（不再是 401）。
+// 未带密钥的 API 请求必须 401。未登记路径即使带有效 key 也是 401：
+// 登记是放行前提，key 不能发明路由，也不能用 404 暴露路径是否存在。
 func TestAuthLayerBehavior(t *testing.T) {
 	t.Parallel()
 
@@ -208,13 +212,168 @@ func TestAuthLayerBehavior(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("no key: code=%d want 401", rec.Code)
 	}
-	// 用不存在的路由验证"带正确 key 已过鉴权"（避免触碰依赖 nil 的 handler）。
+
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "/panel/api/nonexistent", nil)
 	req2.Header.Set("Authorization", "Bearer test-key")
 	panel.ServeHTTP(rec2, req2)
 
-	if rec2.Code == http.StatusUnauthorized {
-		t.Error("valid key must pass the auth layer")
+	if rec2.Code != http.StatusUnauthorized {
+		t.Errorf("unregistered path with valid key: code=%d want 401", rec2.Code)
+	}
+}
+
+// patternPath 把注册 pattern 展开成可请求的 URL：丢掉方法前缀，通配段填占位值。
+func patternPath(pattern string) string {
+	path := pattern
+	if _, rest, ok := strings.Cut(pattern, " "); ok {
+		path = rest
+	}
+
+	replacer := strings.NewReplacer(
+		"{uid}", "fake-uid",
+		"{id}", "fake-id",
+		"{client}", "fake-client",
+		"{path...}", "static/app.js",
+		"{$}", "",
+	)
+
+	return replacer.Replace(path)
+}
+
+func patternMethod(pattern string) string {
+	if method, _, ok := strings.Cut(pattern, " "); ok {
+		return method
+	}
+
+	return http.MethodGet
+}
+
+// 每条已登记的 /panel/api/* 匿名都必须 401，不依赖各 handler 自己记得包鉴权。
+// 限速器放宽：一次遍历会打出远超默认失败预算的 401，那是限速行为不是鉴权缺口。
+func TestRegisteredAPIRequiresAuth(t *testing.T) {
+	t.Parallel()
+
+	panel := New(&Config{
+		Version:     "test",
+		APIKey:      "test-key",
+		AuthLimiter: httpauth.NewLimiter(1000, time.Minute),
+	})
+	seen := 0
+
+	for pattern, scope := range panel.scopes {
+		if scope == scopePublic || !strings.Contains(pattern, "/panel/api/") {
+			continue
+		}
+
+		seen++
+
+		path := patternPath(pattern)
+		rec := httptest.NewRecorder()
+		panel.ServeHTTP(rec, httptest.NewRequest(patternMethod(pattern), path, nil))
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s anonymous: code=%d want 401", pattern, rec.Code)
+		}
+	}
+
+	if seen == 0 {
+		t.Fatal("no API routes registered")
+	}
+}
+
+// 未登记路径匿名与带 admin key 都是 401，不是 404；非 GET 方法也不能绕成 405。
+func TestUnregisteredAPIIsUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	panel := newTestPanel()
+
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		for _, authz := range []string{"", "Bearer test-key"} {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(method, "/panel/api/does-not-exist", nil)
+
+			if authz != "" {
+				req.Header.Set("Authorization", authz)
+			}
+
+			panel.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s authz %q: code=%d want 401", method, authz, rec.Code)
+			}
+		}
+	}
+}
+
+// readonly 打 admin 路由是 403；admin key 过鉴权层（业务码即可，不再是 401/403）。
+func TestReadonlyCannotCallAdminRoute(t *testing.T) {
+	t.Parallel()
+
+	panel := New(&Config{Version: "test", AdminAPIKey: "admin-key", ReadonlyAPIKey: "read-key"})
+
+	readonly := httptest.NewRequest(http.MethodPost, "/panel/api/config", nil)
+	readonly.Header.Set("Authorization", "Bearer read-key")
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, readonly)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("readonly on admin route: code=%d want 403", rec.Code)
+	}
+
+	admin := httptest.NewRequest(http.MethodGet, "/panel/api/config", nil)
+	admin.Header.Set("Authorization", "Bearer admin-key")
+
+	rec2 := httptest.NewRecorder()
+	panel.ServeHTTP(rec2, admin)
+
+	if rec2.Code == http.StatusUnauthorized || rec2.Code == http.StatusForbidden {
+		t.Fatalf("admin key rejected: code=%d", rec2.Code)
+	}
+}
+
+// 已登记路由的错误方法保持 mux 的 405，不因 fail-closed 改成 401。
+func TestWrongMethodKeepsMethodNotAllowed(t *testing.T) {
+	t.Parallel()
+
+	panel := newTestPanel()
+	req := httptest.NewRequest(http.MethodPost, "/panel/api/overview", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST /panel/api/overview: code=%d want 405", rec.Code)
+	}
+}
+
+// 面板页面与静态资源是显式公开白名单，无需 key。
+func TestPublicAssetsNeedNoKey(t *testing.T) {
+	t.Parallel()
+
+	panel := newTestPanel()
+
+	for _, path := range []string{"/panel/", "/panel/" + firstStaticAsset(t)} {
+		rec := httptest.NewRecorder()
+		panel.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s: code=%d want 200", path, rec.Code)
+		}
+	}
+}
+
+// 非面板路径不在本 mux 内，保持 404，不套 API 的 401。
+func TestNonPanelPathStaysNotFound(t *testing.T) {
+	t.Parallel()
+
+	panel := newTestPanel()
+	rec := httptest.NewRecorder()
+	panel.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("GET /v1/models: code=%d want 404", rec.Code)
 	}
 }

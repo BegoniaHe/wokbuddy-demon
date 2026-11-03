@@ -24,6 +24,28 @@ func TestModelAliasesConfig(t *testing.T) {
 	}
 }
 
+func TestModelAliasesConfigAcceptsWildcards(t *testing.T) {
+	t.Parallel()
+
+	config := Default()
+
+	config.Models.Aliases = map[string]string{
+		"claude-*": "cn:glm-5.2",
+		"claude-?": " hy4 ",
+	}
+	if err := config.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+
+	if got := config.Models.Aliases["claude-*"]; got != "cn:glm-5.2" {
+		t.Fatalf("wildcard alias = %q, want cn:glm-5.2", got)
+	}
+
+	if got := config.Models.Aliases["claude-?"]; got != "hy4" {
+		t.Fatalf("wildcard alias = %q, want hy4", got)
+	}
+}
+
 func TestModelAliasesConfigRejectsInvalid(t *testing.T) {
 	t.Parallel()
 

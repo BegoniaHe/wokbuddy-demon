@@ -19,7 +19,7 @@ func TestCreditFloorBlocksPaidBelowFloor(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.Add(&auth.Auth{UID: "poor"})
 	pool.Add(&auth.Auth{UID: "rich"})
@@ -50,7 +50,7 @@ func TestCreditFloorAllowsFreeBelowFloor(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.Add(&auth.Auth{UID: "poor"})
 	pool.SetCredits("poor", 30, 0)
@@ -75,7 +75,7 @@ func TestCreditFloorAllowsUnknownBelowFloor(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.Add(&auth.Auth{UID: "poor"})
 	pool.SetCredits("poor", 30, 0)
@@ -99,7 +99,7 @@ func TestCreditFloorAllBelowReturnsNil(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.Add(&auth.Auth{UID: "a"})
 	pool.Add(&auth.Auth{UID: "b"})
 
@@ -121,7 +121,7 @@ func TestCreditFloorRecoversAfterCheckin(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.Add(&auth.Auth{UID: "only"})
 	pool.SetCredits("only", 30, 0)
@@ -170,7 +170,7 @@ func TestCreditFloorBoundaryAtFloor(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.Add(&auth.Auth{UID: "edge"})
 	pool.NoteModelCost("edge", "hy4-preview", 2.9, 1000)
@@ -190,7 +190,7 @@ func TestCreditFloorStickyPathBlocked(t *testing.T) {
 	t.Parallel()
 
 	pool := New("")
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.Add(&auth.Auth{UID: "sticky"})
 	pool.SetCredits("sticky", 30, 0)
 	pool.NoteModelCost("sticky", "hy4-preview", 2.9, 1000)
@@ -229,7 +229,7 @@ func TestCreditFloorBlocksUnobservedPaidModelByCatalogRate(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	// 上游目录：kimi-k3-1 = x1.62 收费。
 	pool.SetModelRateOf(rates(map[string]map[string]string{
 		"global": {"kimi-k3-1": "1.62"},
@@ -261,7 +261,7 @@ func TestCreditFloorUnobservedFreeModelStillAllowed(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.SetModelRateOf(rates(map[string]map[string]string{
 		"global": {"new-free": "0.00"},
@@ -286,7 +286,7 @@ func TestCreditFloorUnknownRateStillAllowed(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.SetModelRateOf(rates(map[string]map[string]string{
 		"global": {"known-paid": "3.31"}, // 目录里没有 unknown-model
@@ -311,7 +311,7 @@ func TestCreditFloorNoRateTableKeepsLegacyBehavior(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	// 不调 SetModelRateOf。
 
@@ -332,7 +332,7 @@ func TestCreditFloorLocalLedgerFreeBeatsCatalogPaid(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetRandomSource(func(n int64) int64 { return 0 })
 	pool.SetModelRateOf(rates(map[string]map[string]string{
 		"global": {"hy4-preview-f": "0.29"}, // 目录牌价收费
@@ -361,7 +361,7 @@ func TestCreditFloorBlocksFallbackPath(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(150)
+	pool.SetCreditFloor(150, nil)
 	pool.SetModelRateOf(rates(map[string]map[string]string{"global": {"kimi-k3": "1.62"}}))
 
 	poor := &auth.Auth{UID: "poor"}
@@ -384,7 +384,7 @@ func TestCreditFloorFallbackAllowsFreeModel(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(150)
+	pool.SetCreditFloor(150, nil)
 	pool.SetModelRateOf(rates(map[string]map[string]string{"global": {"hy3": "0.00"}}))
 
 	poor := &auth.Auth{UID: "poor"}
@@ -406,7 +406,7 @@ func TestCreditFloorStickyBlockedByCatalogRate(t *testing.T) {
 
 	pool := New("")
 	pool.SetCostExploreInterval(0)
-	pool.SetCreditFloor(100)
+	pool.SetCreditFloor(100, nil)
 	pool.SetModelRateOf(rates(map[string]map[string]string{
 		"global": {"kimi-k3-1": "1.62"},
 	}))
@@ -424,5 +424,151 @@ func TestCreditFloorStickyBlockedByCatalogRate(t *testing.T) {
 
 	if a, _ := pool.PickByUIDForModel("poor", "kimi-k3-1", ""); a == nil {
 		t.Fatal("回血越过 floor 后粘性号应恢复可选，got nil")
+	}
+}
+
+// floorPtr 造一份按域覆盖用的 int64 指针。
+func floorPtr(n int64) *int64 { return new(n) }
+
+// realmAuth 造一个已落盘 realm 的账号。
+func realmAuth(uid, realm string) *auth.Auth {
+	a := &auth.Auth{UID: uid}
+	auth.BackfillRealmFor(a, realm)
+
+	return a
+}
+
+// TestCreditFloorGlobalOnlyBothRealms 只配全局时两域同一阈值。
+func TestCreditFloorGlobalOnlyBothRealms(t *testing.T) {
+	t.Parallel()
+	withNoPickGap(t)
+
+	pool := New("")
+	pool.SetCostExploreInterval(0)
+	pool.SetCreditFloor(100, nil)
+	pool.Add(realmAuth("cn-poor", "cn"))
+	pool.Add(realmAuth("g-poor", "global"))
+	pool.SetCredits("cn-poor", 50, 0)
+	pool.SetCredits("g-poor", 50, 0)
+	pool.NoteModelCost("cn-poor", "paid", 2.9, 1000)
+	pool.NoteModelCost("g-poor", "paid", 2.9, 1000)
+
+	got := pool.CreditFloorByRealm()
+	if got["cn"] != 100 || got["global"] != 100 {
+		t.Fatalf("只配全局时两域生效值应都是 100，got %#v", got)
+	}
+
+	if a := pool.PickExcludingForRealm(nil, "paid", "cn"); a != nil {
+		t.Fatalf("cn 触底应按全局 100 拦截，got %s", a.UID)
+	}
+
+	if a := pool.PickExcludingForRealm(nil, "paid", "global"); a != nil {
+		t.Fatalf("global 触底应按全局 100 拦截，got %s", a.UID)
+	}
+}
+
+// TestCreditFloorByRealmSeparateThresholds cn=1000、global=350 分别拦截。
+func TestCreditFloorByRealmSeparateThresholds(t *testing.T) {
+	t.Parallel()
+	withNoPickGap(t)
+
+	pool := New("")
+	pool.SetCostExploreInterval(0)
+	pool.SetCreditFloor(100, map[string]*int64{
+		"cn":     floorPtr(1000),
+		"global": floorPtr(350),
+		"eu":     floorPtr(9999), // 非法键忽略
+	})
+	pool.Add(realmAuth("cn-mid", "cn"))
+	pool.Add(realmAuth("g-mid", "global"))
+	pool.SetCredits("cn-mid", 400, 0)
+	pool.SetCredits("g-mid", 400, 0)
+	pool.NoteModelCost("cn-mid", "paid", 2.9, 1000)
+	pool.NoteModelCost("g-mid", "paid", 2.9, 1000)
+
+	got := pool.CreditFloorByRealm()
+	if got["cn"] != 1000 || got["global"] != 350 {
+		t.Fatalf("生效值 cn=1000 global=350，got %#v", got)
+	}
+
+	if pool.CreditFloor() != 100 {
+		t.Fatalf("全局值应保持 100，got %d", pool.CreditFloor())
+	}
+
+	if a := pool.PickExcludingForRealm(nil, "paid", "cn"); a != nil {
+		t.Fatalf("cn 400 < 1000 应拦截，got %s", a.UID)
+	}
+
+	if a := pool.PickExcludingForRealm(nil, "paid", "global"); a == nil || a.UID != "g-mid" {
+		t.Fatalf("global 400 >= 350 应放行，got %v", a)
+	}
+}
+
+// TestCreditFloorRealmZeroDisables 某域显式 0 关闭，另一域回落全局。
+func TestCreditFloorRealmZeroDisables(t *testing.T) {
+	t.Parallel()
+	withNoPickGap(t)
+
+	pool := New("")
+	pool.SetCostExploreInterval(0)
+	pool.SetCreditFloor(100, map[string]*int64{"cn": floorPtr(0)})
+	pool.Add(realmAuth("cn-poor", "cn"))
+	pool.Add(realmAuth("g-poor", "global"))
+	pool.SetCredits("cn-poor", 10, 0)
+	pool.SetCredits("g-poor", 10, 0)
+	pool.NoteModelCost("cn-poor", "paid", 2.9, 1000)
+	pool.NoteModelCost("g-poor", "paid", 2.9, 1000)
+
+	got := pool.CreditFloorByRealm()
+	if got["cn"] != 0 || got["global"] != 100 {
+		t.Fatalf("cn 显式 0 关闭、global 回落 100，got %#v", got)
+	}
+
+	if a := pool.PickExcludingForRealm(nil, "paid", "cn"); a == nil || a.UID != "cn-poor" {
+		t.Fatalf("cn 显式 0 应放行触底号，got %v", a)
+	}
+
+	if a := pool.PickExcludingForRealm(nil, "paid", "global"); a != nil {
+		t.Fatalf("global 未覆盖应按全局 100 拦截，got %s", a.UID)
+	}
+}
+
+// TestCreditFloorByRealmNegativeClamped 负的覆盖值钳 0（该域关闭）。
+func TestCreditFloorByRealmNegativeClamped(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.SetCreditFloor(80, map[string]*int64{"global": floorPtr(-5)})
+
+	got := pool.CreditFloorByRealm()
+	if got["cn"] != 80 || got["global"] != 0 {
+		t.Fatalf("负覆盖钳 0、cn 回落全局，got %#v", got)
+	}
+}
+
+// TestCreditFloorStickyUsesAccountRealm 粘性命中按账号所属域的生效值拦截，
+// 不看全局，也不看请求传入的 realm 参数（粘性号已确定）。
+func TestCreditFloorStickyUsesAccountRealm(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.SetCreditFloor(100, map[string]*int64{
+		"cn":     floorPtr(1000),
+		"global": floorPtr(350),
+	})
+	pool.Add(realmAuth("cn-mid", "cn"))
+	pool.SetCredits("cn-mid", 400, 0)
+	pool.NoteModelCost("cn-mid", "paid", 2.9, 1000)
+
+	if a, _ := pool.PickByUIDForModel("cn-mid", "paid", "global"); a != nil {
+		t.Fatalf("粘性 cn 号 400 < cn floor 1000 应拦截，got %s", a.UID)
+	}
+
+	pool.Add(realmAuth("g-mid", "global"))
+	pool.SetCredits("g-mid", 400, 0)
+	pool.NoteModelCost("g-mid", "paid", 2.9, 1000)
+
+	if a, _ := pool.PickByUIDForModel("g-mid", "paid", "cn"); a == nil || a.UID != "g-mid" {
+		t.Fatalf("粘性 global 号 400 >= 350 应放行，got %v", a)
 	}
 }

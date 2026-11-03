@@ -839,7 +839,7 @@ func panelListenPath(listen string) string {
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/
-//     SetPreferExpiring/SetCreditFloor
+//     SetPreferExpiring/SetCreditFloor（含 credit_floor_by_realm）
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
@@ -970,7 +970,8 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 func applyPoolConfig(state *pool.Pool, cfg *Config) {
 	state.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	state.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（默认 30m；0 关停）
-	state.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
+	// 积分保底：全局默认 + 按域覆盖（未写的域回落全局；显式 0 = 该域关闭）。
+	state.SetCreditFloor(cfg.Pool.CreditFloor, cfg.Pool.CreditFloorByRealm)
 	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
 	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)

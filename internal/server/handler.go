@@ -671,10 +671,12 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 「哪些号不能用」，本键回答「哪些模型不能用、锁了几个号、还要锁多久」。
 		// 与 ModelBlocked（请求失败时的单模型判定）互补；无锁时为 null。零回归只增键。
 		"model_locks": h.cfg.Pool.ModelLockView(),
-		// credit_floor 生效的积分保底值（0 = 关闭）。与 accounts[].credits +
-		// model_costs 对照即可判定「某号为何对某模型不出票」。零值也显式写出
-		// （运维口径：缺失会让人误以为没记录）。
-		"credit_floor": h.cfg.Pool.CreditFloor(),
+		// credit_floor 是全局默认（0 = 关闭），不是某域的生效值。
+		// credit_floor_by_realm 给出 cn / global 回落后的生效保底：未覆盖的域等于
+		// 全局值，显式 0 仍是 0。与 accounts[].credits + model_costs 对照即可判定
+		// 「某号为何对某模型不出票」。零值也显式写出（缺失会让人误以为没记录）。
+		"credit_floor":          h.cfg.Pool.CreditFloor(),
+		"credit_floor_by_realm": h.cfg.Pool.CreditFloorByRealm(),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -1079,6 +1081,7 @@ func (h *Handler) filterModelsForKey(entries []map[string]any, keyUse *keyUsage)
 // appendAliasEntries 把配置的模型别名追加到 /v1/models 列表（issue #52）。
 // 别名按名字排序保证输出稳定；与真实模型同 id 时以别名为准（请求解析同样
 // 别名优先），避免"列表显示一个、实际路由到另一个"。
+// 含 * / ? 的通配键不列入：它们不是可点名的模型 id，只在请求解析时匹配（issue #436）。
 func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string]bool) []map[string]any {
 	if len(h.cfg.ModelAliases) == 0 {
 		return out
@@ -1086,7 +1089,9 @@ func (h *Handler) appendAliasEntries(out []map[string]any, chatHidden map[string
 
 	names := make([]string, 0, len(h.cfg.ModelAliases))
 	for name := range h.cfg.ModelAliases {
-		names = append(names, name)
+		if !aliasIsWildcard(name) {
+			names = append(names, name)
+		}
 	}
 
 	slices.Sort(names)
@@ -2096,11 +2101,12 @@ func (f *chatFlow) skipReserved(ctx context.Context, acct *auth.Auth, i int) rot
 // reserveCredits 请求级预扣（issue #116 P1-1）：按请求体估算 prompt 与 max_tokens，
 // 在 credits 中预留估算成本；余额不足时返回 false，调用方跳过该账号。
 func (f *chatFlow) reserveCredits(acct *auth.Auth) bool {
-	// 积分保底关闭（credit_floor=0，默认）时 ReserveForRequest 必然直接放行：
+	// 该账号域的积分保底关闭时 ReserveForRequest 必然直接放行：
 	// 提前返回，省掉两次整份 body 扫描（EstimatePromptTokens 逐 rune 遍历全文 +
 	// maxOutputTokensFromBody 整解一遍 JSON）。几十 KB 的请求每轮白付约 0.5ms，
-	// 且换号重试时每个账号再付一次。
-	if f.h.cfg.Pool.CreditFloor() <= 0 {
+	// 且换号重试时每个账号再付一次。按域判断：另一域开着保底不能让本域白付扫描，
+	// 也不能让本域开着保底却被全局 0 短路。
+	if f.h.cfg.Pool.CreditFloorByRealm()[acct.Realm()] <= 0 {
 		return true
 	}
 
@@ -3656,8 +3662,22 @@ func mergeNonStreamContinuation(first, second map[string]any) map[string]any {
 	return first
 }
 
-// mergeUsageTotals 把续写段的 usage 累加到首段：两段请求都真实消耗了 token/积分，
-// 只保留第二段会漏记首段用量。数值叶子递归相加，缺失键直接补齐。
+// prompt 侧取末段：续写请求已带上前文，prompt/cache 再累加会按段数重复计量
+// （issue #432）。完成侧与 credit 仍跨段相加。
+var promptUsageKeys = map[string]struct{}{
+	"prompt_tokens":            {},
+	"input_tokens":             {},
+	"prompt_tokens_details":    {},
+	"input_tokens_details":     {},
+	"cached_tokens":            {},
+	"cache_read_input_tokens":  {},
+	"prompt_cache_hit_tokens":  {},
+	"prompt_cache_miss_tokens": {},
+}
+
+// mergeUsageTotals 合并两段 usage：prompt/cache 取末段，completion/credit 累加，
+// total 按「末段 prompt + 累计 completion」重算。末段没有 prompt_tokens 时保留
+// 末段原 total，不因重算失败丢掉末段。
 func mergeUsageTotals(first, second map[string]any) {
 	secondUsage, ok := second["usage"].(map[string]any)
 	if !ok {
@@ -3672,26 +3692,76 @@ func mergeUsageTotals(first, second map[string]any) {
 	}
 
 	addUsageNumbers(firstUsage, secondUsage)
+
+	if !recomputeUsageTotal(firstUsage) {
+		// 末段没有 prompt_tokens 时不能重算，保留末段自己的 total，不要用首段的。
+		if total, ok := secondUsage["total_tokens"].(float64); ok {
+			firstUsage["total_tokens"] = total
+		}
+	}
 }
 
-// addUsageNumbers 递归把 src 的数值字段累加进 dst；非数值/缺失沿用 src。
+// addUsageNumbers 递归合并 usage：prompt 侧整段换成 src（末段没有的键删掉），
+// total_tokens 留给上层重算或保留末段原值，其余数值叶子相加。
 func addUsageNumbers(dst, src map[string]any) {
-	for key, value := range src {
-		switch typed := value.(type) {
-		case map[string]any:
-			if target, ok := dst[key].(map[string]any); ok {
-				addUsageNumbers(target, typed)
-				continue
-			}
-		case float64:
-			if target, ok := dst[key].(float64); ok {
-				dst[key] = target + typed
-				continue
-			}
+	for key := range dst {
+		if _, promptSide := promptUsageKeys[key]; !promptSide {
+			continue
 		}
 
-		dst[key] = value
+		if _, inSrc := src[key]; !inSrc {
+			delete(dst, key)
+		}
 	}
+
+	for key, value := range src {
+		applyUsageLeaf(dst, key, value)
+	}
+}
+
+// applyUsageLeaf 把 src 的一个叶子写进 dst。prompt 侧直接覆盖；嵌套对象递归；
+// 两边都是 float64 则相加；total_tokens 跳过。
+func applyUsageLeaf(dst map[string]any, key string, value any) {
+	if key == "total_tokens" {
+		return
+	}
+
+	if _, promptSide := promptUsageKeys[key]; promptSide {
+		dst[key] = value
+
+		return
+	}
+
+	switch typed := value.(type) {
+	case map[string]any:
+		if target, ok := dst[key].(map[string]any); ok {
+			addUsageNumbers(target, typed)
+
+			return
+		}
+	case float64:
+		if target, ok := dst[key].(float64); ok {
+			dst[key] = target + typed
+
+			return
+		}
+	}
+
+	dst[key] = value
+}
+
+// recomputeUsageTotal 在末段带 prompt_tokens 时按「末段 prompt + 累计 completion」
+// 重写 total_tokens。没有该字段返回 false，调用方保留末段原 total。
+func recomputeUsageTotal(usageMap map[string]any) bool {
+	promptTokens, ok := usageMap["prompt_tokens"].(float64)
+	if !ok {
+		return false
+	}
+
+	completion, _ := usageMap["completion_tokens"].(float64)
+	usageMap["total_tokens"] = promptTokens + completion
+
+	return true
 }
 
 // setCacheTokensFromUsage 用聚合响应 usage 填 st 的缓存三维观测（非流式收尾）。
