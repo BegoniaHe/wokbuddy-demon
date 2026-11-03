@@ -35,8 +35,8 @@ const (
 )
 
 // cockpitAccount 映射 cockpit tools 导出格式的单个账号：只保留导入实际消费的
-// 字段（凭证 / realm 推断 / 过期时间 / 昵称）。导出文件里的其余键由 json 解码
-// 直接忽略——此前为「字段齐全」声明了 token_type/status/checkin_streak 等十来个
+// 字段（凭证 / realm 推断 / 企业标识 / 过期时间 / 昵称）。导出文件里的其余键由
+// json 解码直接忽略——此前为「字段齐全」声明了 token_type/status/checkin_streak 等十来个
 // 从不读取的字段，既无落盘也无展示，纯噪声。
 type cockpitAccount struct {
 	ID           string `json:"id"`
@@ -47,6 +47,22 @@ type cockpitAccount struct {
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"`
 	Domain       string `json:"domain"`
+	// EnterpriseID 企业标识（issue #446）。cockpit 导出两种写法并存
+	// （enterprise_id / enterpriseId），两个键分别解码到两个字段后由
+	// enterpriseID() 归一（同一账号只会出现一种写法）。丢失该字段会让企业号
+	// 以个人号形态进池，后续签到 / 成长任务全部按个人号打上游（注定被拒）。
+	EnterpriseID string `json:"enterprise_id"`
+	// EnterpriseIDCamel enterpriseId 驼峰写法的落点。
+	EnterpriseIDCamel string `json:"enterpriseId"`
+}
+
+// enterpriseID 归一后的企业标识：两种 cockpit 导出写法取非空的那个（都不填 = 个人号）。
+func (acc *cockpitAccount) enterpriseID() string {
+	if id := strings.TrimSpace(acc.EnterpriseIDCamel); id != "" {
+		return id
+	}
+
+	return strings.TrimSpace(acc.EnterpriseID)
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。
@@ -224,7 +240,7 @@ func (p *Panel) postImportAccounts(ctx context.Context, accounts []*auth.Auth) {
 }
 
 // buildImportedAuth 由 cockpit 账号构造 auth：expires_at 毫秒转秒（缺省 +365 天），
-// nickname 缺失时回落 email。
+// nickname 缺失时回落 email，企业标识透传（issue #446）。
 func buildImportedAuth(acc *cockpitAccount, strVal, at, str2, authDir string) *auth.Auth {
 	// cockpit tools 的 expires_at 为毫秒时间戳，转为秒。
 	expiresAt := acc.ExpiresAt / 1000
@@ -244,6 +260,7 @@ func buildImportedAuth(acc *cockpitAccount, strVal, at, str2, authDir string) *a
 		Domain:       acc.Domain,
 		UID:          strVal,
 		Nickname:     nickname,
+		EnterpriseID: acc.enterpriseID(),
 		FilePath:     filepath.Join(authDir, fmt.Sprintf("workbuddy-%s.json", strVal)),
 	}
 }
@@ -275,6 +292,13 @@ func (p *Panel) persistImportedAuth(account *auth.Auth, realm, uid string) error
 func (p *Panel) importCheckin(ctx context.Context, account4 *auth.Auth, uid string) {
 	if account4.Realm() == "global" {
 		p.importGlobalActivation(account4, uid)
+		return
+	}
+
+	// 企业版无签到体系：上游 daily-checkin 恒 400「企业账号不支持该操作」
+	// （scheduler.runCheckinAccount 同款实测门控，issue #446）。额度查询照常——
+	// postImportAccounts 的 UserResource 已按 IsEnterprise 走企业口径。
+	if account4.IsEnterprise() {
 		return
 	}
 

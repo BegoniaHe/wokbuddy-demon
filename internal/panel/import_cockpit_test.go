@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -266,4 +267,141 @@ func TestCockpitImportBoundedConcurrency(t *testing.T) {
 	if got := atomic.LoadInt32(maxInFlight); got > importWorkers {
 		t.Errorf("max concurrent upstream calls=%d want <= %d", got, importWorkers)
 	}
+}
+
+// enterprisePayload 构造带企业标识的 cockpit 账号 JSON（camelCase 与 snake_case
+// 两种写法由 enterpriseIDKey 指定）。
+func enterprisePayload(t *testing.T, enterpriseIDKey string) []byte {
+	t.Helper()
+
+	raw, err := json.Marshal([]map[string]any{{
+		"id":            "ent",
+		"uid":           "u-ent",
+		"access_token":  "at-ent",
+		"refresh_token": "rt-ent",
+		"expires_at":    4102444800000,
+		"domain":        "workbuddy.cn",
+		enterpriseIDKey: "ent-1",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return raw
+}
+
+// TestCockpitImportKeepsEnterpriseID cockpit 导出的企业标识必须落盘（issue #446）：
+// enterprise_id / enterpriseId 两种写法都要写进 auth.Auth.EnterpriseID，否则企业号
+// 导入后退化成个人号，后续任务面全部按个人号打上游。
+func TestCockpitImportKeepsEnterpriseID(t *testing.T) {
+	t.Parallel()
+
+	for _, key := range []string{"enterprise_id", "enterpriseId"} {
+		t.Run(key, func(t *testing.T) {
+			t.Parallel()
+			panel, state, _, _ := newCockpitPanel(t)
+
+			rec := doCockpitImport(t, panel, enterprisePayload(t, key))
+
+			resp := decodeCockpitResp(t, rec)
+			if resp.Imported != 1 {
+				t.Fatalf("resp=%+v want imported=1", resp)
+			}
+
+			list := state.List()
+			if len(list) != 1 {
+				t.Fatalf("pool accounts=%d want 1", len(list))
+			}
+
+			a := state.AuthByUID("u-ent")
+			if a == nil {
+				t.Fatal("pool missing imported account")
+			}
+
+			if got := a.IsEnterprise(); !got {
+				t.Errorf("IsEnterprise()=%v want true (%s form lost)", got, key)
+			}
+
+			// 落盘形状同样带企业标识：重启加载后不能退化。
+			raw, err := os.ReadFile(filepath.Join(panel.cfg.AuthDir, "workbuddy-u-ent.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			parsed, err := auth.Parse(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if !parsed.IsEnterprise() {
+				t.Errorf("reloaded auth IsEnterprise()=false, enterprise id not persisted")
+			}
+		})
+	}
+}
+
+// TestCockpitImportSkipsEnterpriseCheckin 企业号导入后不得打签到（issue #446）：
+// 上游 daily-checkin 对企业号恒 400「企业账号不支持该操作」，白打一次；
+// 企业额度查询（UserResource）照常走企业口径端点。
+func TestCockpitImportSkipsEnterpriseCheckin(t *testing.T) {
+	t.Parallel()
+	panel, _, checkinHits, enterpriseHits := newEnterpriseAwareCockpitPanel(t)
+
+	rec := doCockpitImport(t, panel, enterprisePayload(t, "enterprise_id"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if n := atomic.LoadInt64(checkinHits); n != 0 {
+		t.Errorf("daily-checkin hits=%d want 0 (enterprise account)", n)
+	}
+
+	if n := atomic.LoadInt64(enterpriseHits); n != 1 {
+		t.Errorf("enterprise usage hits=%d want 1 (balance query still runs)", n)
+	}
+}
+
+// TestCockpitImportPersonalStillCheckins 个人号导入后照常签到：企业门控只跳
+// 企业号，不能顺手关掉个人号的导入签到（issue #446 回归护栏）。
+func TestCockpitImportPersonalStillCheckins(t *testing.T) {
+	t.Parallel()
+	panel, _, checkinHits, enterpriseHits := newEnterpriseAwareCockpitPanel(t)
+
+	rec := doCockpitImport(t, panel, cockpitAccountsJSON(t, 1))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if n := atomic.LoadInt64(checkinHits); n != 1 {
+		t.Errorf("daily-checkin hits=%d want 1 (personal account)", n)
+	}
+
+	if n := atomic.LoadInt64(enterpriseHits); n != 0 {
+		t.Errorf("enterprise usage hits=%d want 0 (personal account)", n)
+	}
+}
+
+// newEnterpriseAwareCockpitPanel 记录 daily-checkin 与企业额度查询两类端点命中。
+func newEnterpriseAwareCockpitPanel(t *testing.T) (*Panel, *pool.Pool, *int64, *int64) {
+	t.Helper()
+
+	var checkinHits, enterpriseHits int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/billing/meter/daily-checkin"):
+			atomic.AddInt64(&checkinHits, 1)
+		case strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-enterprise-user-usage"):
+			atomic.AddInt64(&enterpriseHits, 1)
+		}
+
+		_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	p := pool.New("")
+	pn := &Panel{cfg: Config{Pool: p, Upstream: up, AuthDir: t.TempDir()}}
+
+	return pn, p, &checkinHits, &enterpriseHits
 }
