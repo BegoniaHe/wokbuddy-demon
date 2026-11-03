@@ -253,8 +253,16 @@ func injectCatalogMaxTokens(obj map[string]any, maxOut map[string]int64) {
 	}
 }
 
-// effortRank 档位从低到高。
-var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6}
+// effortRank 档位从低到高。off/none/disabled 共享 rank 0：它们不是高低序列上的一环，
+// 而是「关闭思考」的显式意图（normalizeOffEffort 单独管线），降级选择一律跳过
+// （effortRankOff，见 applyBestEffort）。
+var effortRank = map[string]int{
+	"off": 0, "none": 0, "disabled": 0,
+	"minimal": 1, "low": 2, "medium": 3, "high": 4, "xhigh": 5, "max": 6,
+}
+
+// effortRankOff 关闭档位共用的 rank。`idx <= effortRankOff` 即「关闭档」判据。
+const effortRankOff = 0
 
 // normalizeReasoningEffort 按模型 supportedEfforts 降级 reasoning_effort（snake/camel 双字段兼容）。
 //   - 请求档位模型支持 → 原样透传
@@ -361,14 +369,21 @@ func resolveRequestEffort(obj map[string]any) (key, reqStr string, reqIdx int, k
 }
 
 // applyBestEffort 命中「≤请求档的最高支持档」时改写 obj[key]；返回是否命中。
+//
+// off/none/disabled 不是降级目标（issue #447）：官方 deriveReasoningCapabilities
+// 把 off 从 supportedEfforts 滤出（只留给 canDisableThinking），它是「关闭思考」
+// 的显式意图而非档位高低上的一环。把 off 当可选档会让 medium/low/minimal 被静默
+// 改写成 off，客户端请求的思考强度整个消失。
 func applyBestEffort(obj map[string]any, key, model, reqStr string, supported []string, reqIdx int) bool {
 	best, bestIdx := "", -1
 
-	for _, s := range supported {
-		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
-		if k && idx <= reqIdx && idx > bestIdx {
-			best, bestIdx = s, idx
+	for _, name := range supported {
+		idx, k := effortRank[strings.TrimSpace(strings.ToLower(name))]
+		if !k || idx <= effortRankOff || idx > reqIdx || idx <= bestIdx {
+			continue
 		}
+
+		best, bestIdx = name, idx
 	}
 
 	if best == "" {
@@ -387,14 +402,18 @@ func applyBestEffort(obj map[string]any, key, model, reqStr string, supported []
 const lowestEffortInit = 1 << 30
 
 // pickLowestEffort 取 supported 里 rank 最低的有效档位；无有效档返回 ""。
+// 同样跳过 off/none/disabled（rank ≤ effortRankOff，见 applyBestEffort）：支持档
+// 只剩 off 时返回空串，调用方据此透传，不把请求档改写成关闭思考。
 func pickLowestEffort(supported []string) string {
 	lowest, lowestIdx := "", lowestEffortInit
 
-	for _, s := range supported {
-		idx, k := effortRank[strings.TrimSpace(strings.ToLower(s))]
-		if k && idx < lowestIdx {
-			lowest, lowestIdx = s, idx
+	for _, name := range supported {
+		idx, k := effortRank[strings.TrimSpace(strings.ToLower(name))]
+		if !k || idx <= effortRankOff || idx >= lowestIdx {
+			continue
 		}
+
+		lowest, lowestIdx = name, idx
 	}
 
 	return lowest

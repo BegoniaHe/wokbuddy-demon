@@ -246,6 +246,51 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	}
 }
 
+// TestPrepareBodyEffortDowngradeSkipsOff off 不是降级目标（issue #447）：
+// 远端/global 探测的 supportedEfforts 原样保留 off，若把 off 当普通可选档，
+// 请求 medium/low/minimal 会被 applyBestEffort 静默改写成 off（thinking 被整个
+// 关闭而客户端无感知）；pickLowestEffort 同理会返回 off 而非最低正档。
+// 官方口径（cli/dist/codebuddy-lite-wb.mjs deriveReasoningCapabilities）：
+// supportedEfforts: i.filter(t=>"off"!==t)，off 只用于 canDisableThinking。
+func TestPrepareBodyEffortDowngradeSkipsOff(t *testing.T) {
+	t.Parallel()
+
+	efforts := map[string][]string{
+		"glm-off-high": {"off", "high", "xhigh"},
+		"glm-only-off": {"off"},
+	}
+
+	cases := []struct {
+		name    string
+		body    string
+		wantKey string
+		wantVal string
+	}{
+		{"medium 落到 high 而非 off", `{"model":"glm-off-high","reasoning_effort":"medium"}`, "reasoning_effort", "high"},
+		{"low 落到 high 而非 off", `{"model":"glm-off-high","reasoning_effort":"low"}`, "reasoning_effort", "high"},
+		{"minimal 落到 high 而非 off", `{"model":"glm-off-high","reasoning_effort":"minimal"}`, "reasoning_effort", "high"},
+		{"低于全部正档时取最低正档 high", `{"model":"glm-off-high","reasoning_effort":"minimal"}`, "reasoning_effort", "high"},
+		{"只声明 off 时透传不改写", `{"model":"glm-only-off","reasoning_effort":"medium"}`, "reasoning_effort", "medium"},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := PrepareBodyOptWithEfforts([]byte(item.body), false, efforts)
+
+			var m map[string]any
+			if err := json.Unmarshal(out, &m); err != nil {
+				t.Fatalf("unmarshal: %v (body=%s)", err, out)
+			}
+
+			got, ok := m[item.wantKey].(string)
+			if !ok || got != item.wantVal {
+				t.Errorf("%s=%v want %q (out=%s)", item.wantKey, m[item.wantKey], item.wantVal, out)
+			}
+		})
+	}
+}
+
 // TestPrepareBodyStreamOptions body 未显式带 stream_options 时注入
 // {include_usage: true}（D7，官方 CLI 流式必发）；body 已带则不覆盖。
 func TestPrepareBodyStreamOptions(t *testing.T) {
