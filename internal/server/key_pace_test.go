@@ -50,10 +50,10 @@ func newPaceHandlerWith(t *testing.T, lim apikey.Limits, stream string) (*Handle
 
 // paceSSEFrames 构造 n 个正文帧 + 收尾帧 + [DONE]：正文帧多到读侧会持续产出
 // token 估算，覆盖多帧整形与读写并发路径。
-func paceSSEFrames(n int) string {
+func paceSSEFrames(n, payloadLen int) string {
 	var out strings.Builder
 
-	payload := strings.Repeat("a", 40) // 每帧约 10 token
+	payload := strings.Repeat("a", payloadLen)
 	for range n {
 		out.WriteString(`data: {"id":"chatcmpl-1","object":"chat.completion.chunk",` +
 			`"created":1753600000,"model":"glm-5.2","choices":[{"index":0,` +
@@ -118,35 +118,125 @@ func TestKeyPaceStreamRPMStretches(t *testing.T) {
 	}
 }
 
-// TestKeyPaceStreamTPMStretches 只配 tpm 时（issue #448 R4）：token 账按
-// 「prompt 估算 + 已吐出正文」累计到时间线，连发的下一发据此推迟后续帧；不返回
-// 429、不影响 [DONE] 收尾。
+// TestKeyPaceStreamTPMStretches 只配 tpm 时（issue #448 R4）：token 账只按
+// Decode 阶段已吐出的 completion 累计，多帧流按该时间线推迟后续帧；不返回 429、
+// 不影响 [DONE] 收尾。输入提示词长度不参与该时间线，故请求体只放短 prompt。
 func TestKeyPaceStreamTPMStretches(t *testing.T) {
 	t.Parallel()
 
-	// tpm=24000 → 2.5ms/token；约 470 ASCII 字符 ≈ 118 token ≈ 295ms，再加 8 个
-	// 正文帧的增量账。多帧流同时覆盖读写并发路径。
-	handler, _, raw := newPaceHandlerWith(t, apikey.Limits{TPM: 24000}, paceSSEFrames(8))
+	// tpm=2400 → 25ms/token；8 帧各约 10 completion token，合计约 2s。
+	handler, _, raw := newPaceHandlerWith(t, apikey.Limits{TPM: 2400}, paceSSEFrames(8, 40))
 
-	body := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"` +
-		strings.Repeat("a", 400) + `"}]}`
+	body := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 
-	code, out, first := paceDo(t, handler, "/v1/chat/completions", raw, body, false)
+	code, out, elapsed := paceDo(t, handler, "/v1/chat/completions", raw, body, false)
 	if code != http.StatusOK {
-		t.Fatalf("首发 code=%d body=%s（TPM 不应返回 429）", code, out)
+		t.Fatalf("code=%d body=%s（TPM 不应返回 429）", code, out)
 	}
 
 	if !strings.Contains(out, "[DONE]") {
 		t.Fatalf("流式响应缺少 [DONE]: %s", out)
 	}
 
-	code, out, second := paceDo(t, handler, "/v1/chat/completions", raw, body, false)
-	if code != http.StatusOK {
-		t.Fatalf("第二发 code=%d body=%s", code, out)
+	if elapsed < 1500*time.Millisecond {
+		t.Fatalf("多帧流耗时=%v want ≥1.5s：tpm 未推迟后续帧", elapsed)
 	}
 
-	if second < first+150*time.Millisecond {
-		t.Fatalf("连发第二发耗时=%v（首发 %v）：tpm 整形未推迟后续帧", second, first)
+	if elapsed > 10*time.Second {
+		t.Fatalf("多帧流耗时=%v：tpm 整形等待失控", elapsed)
+	}
+}
+
+// TestKeyPacerChargesCompletionOnly 直接验 token 账的输入：seen 只提供
+// completion 增量时，下一次查询按 tpm 产生等待；prompt 没有参数可入账。
+func TestKeyPacerChargesCompletionOnly(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+
+	rec, _, err := store.Create("paced")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, err := store.UpdateLimits(rec.ID, apikey.Limits{TPM: 1200}); !ok || err != nil {
+		t.Fatalf("limits: %v %v", ok, err)
+	}
+
+	pacer := &keyPacer{
+		keys:    store,
+		id:      rec.ID,
+		seen:    func() int64 { return 240 },
+		maxWait: apikey.PaceMaxDelay,
+	}
+
+	// tpm=1200 → 50ms/token；240 completion token → 12s token 债务。
+	if got := pacer.WaitBeforeWrite(); got != 12*time.Second {
+		t.Fatalf("首查等待=%v want 12s（只按 240 completion token）", got)
+	}
+
+	// seen 未增长时不得重复入账；墙上时间只会让等待略减。
+	if got := pacer.WaitBeforeWrite(); got <= 0 || got > 12*time.Second {
+		t.Fatalf("重复查询等待=%v want (0, 12s] 且未重复入账", got)
+	}
+}
+
+// TestKeyPacerCapsPerRequestWait 单请求累计等待不得越过 60s：最后 10s 的预算
+// 只分配一次，之后即使账本仍有债务也直接放完剩余帧。
+func TestKeyPacerCapsPerRequestWait(t *testing.T) {
+	t.Parallel()
+
+	store := apikey.New("")
+
+	rec, _, err := store.Create("paced")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ok, err := store.UpdateLimits(rec.ID, apikey.Limits{RPM: 1}); !ok || err != nil {
+		t.Fatalf("limits: %v %v", ok, err)
+	}
+
+	// 两次请求间隔把账本推到 60s 后；用固定时钟无法注入 keyPacer，因此这里只
+	// 验证累计预算本身：最后 10s 只分配一次，下一帧起不再等待。
+	now := time.Now()
+	store.PaceRequest(rec.ID, now)
+	store.PaceRequest(rec.ID, now)
+
+	pacer := &keyPacer{
+		keys:    store,
+		id:      rec.ID,
+		waited:  apikey.PaceMaxDelay - 10*time.Second,
+		maxWait: apikey.PaceMaxDelay,
+	}
+
+	if got := pacer.WaitBeforeWrite(); got < 9*time.Second || got > 10*time.Second {
+		t.Fatalf("最后预算等待=%v want (9s, 10s]", got)
+	}
+
+	if got := pacer.WaitBeforeWrite(); got != 0 {
+		t.Fatalf("到顶后等待=%v want 0", got)
+	}
+}
+
+// TestPaceTokensForCompletionOnly 非流式 TPS 账只取 completion_tokens：
+// 相同 response 无论 prompt 多长，入账始终等于输出 token。
+func TestPaceTokensForCompletionOnly(t *testing.T) {
+	t.Parallel()
+
+	resp := map[string]any{
+		"usage": map[string]any{
+			"prompt_tokens":     int64(100000),
+			"completion_tokens": int64(42),
+		},
+	}
+
+	if got := paceTokensFor(resp); got != 42 {
+		t.Fatalf("paceTokensFor=%d want 42（只计 completion）", got)
+	}
+
+	if got := paceTokensFor(map[string]any{}); got != 0 {
+		t.Fatalf("usage 缺失时=%d want 0", got)
 	}
 }
 

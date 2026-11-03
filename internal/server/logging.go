@@ -387,15 +387,61 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 	}
 }
 
-// notePaceText 把本帧已吐出的正文计入整形账（issue #448 的 TPM 时间线输入）。
-// 思考正文（reasoning/reasoning_content）同样消耗上游 token 额度，一并计入，
-// 否则长思考流会被显著低估。
+// notePaceText 把本帧已吐出的 completion 输出计入整形账（issue #448 的 TPM
+// 时间线输入）。除正文、拒答和思考正文（reasoning/reasoning_content）外，工具
+// 调用的名称与 arguments 也是 Decode 阶段生成的输出 token，必须一并计入。
 func (s *chatStatsReader) notePaceText(delta *sseDeltaFrame) {
 	for _, text := range [4]*string{delta.Content, delta.Refusal, delta.ReasoningContent, delta.Reasoning} {
 		if text != nil {
 			s.paceEmitted.Add(paceTextTokens(*text))
 		}
 	}
+
+	s.notePaceToolCalls(delta.ToolCalls)
+	s.notePaceFunctionCall(delta.FunctionCall)
+}
+
+// toolCallPaceChunk 工具调用增量的最小字段；arguments 分片是本帧新增输出。
+type toolCallPaceChunk struct {
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// notePaceToolCalls 把 tool_calls 增量里的函数名与 arguments 计入 TPM 时间线。
+func (s *chatStatsReader) notePaceToolCalls(raw json.RawMessage) {
+	if !rawPayloadPresent(raw) {
+		return
+	}
+
+	var calls []toolCallPaceChunk
+	if json.Unmarshal(raw, &calls) != nil {
+		return
+	}
+
+	for i := range calls {
+		s.paceEmitted.Add(paceTextTokens(calls[i].Function.Name))
+		s.paceEmitted.Add(paceTextTokens(calls[i].Function.Arguments))
+	}
+}
+
+// notePaceFunctionCall 把旧式 function_call 的函数名与 arguments 计入 TPM 时间线。
+func (s *chatStatsReader) notePaceFunctionCall(raw json.RawMessage) {
+	if !rawPayloadPresent(raw) {
+		return
+	}
+
+	var call struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	if json.Unmarshal(raw, &call) != nil {
+		return
+	}
+
+	s.paceEmitted.Add(paceTextTokens(call.Name))
+	s.paceEmitted.Add(paceTextTokens(call.Arguments))
 }
 
 // noteToolCalls 对流式 tool_calls 增量做去重计数（issue #329）。

@@ -35,8 +35,8 @@ func TestPaceRequestIntervalRPM(t *testing.T) {
 	}
 }
 
-// TestPaceTokenRateTPM tpm=600（每秒 10 token）：已见 300 completion token 时，
-// 下一发结束时刻应被拨到约 30s 后；且 max_tokens 不参与（不按上限预扣）。
+// TestPaceTokenRateTPM tpm=600（每秒 10 completion token）：已见 300
+// completion token 时，下一发结束时刻应被拨到约 30s 后；且 max_tokens 不参与。
 func TestPaceTokenRateTPM(t *testing.T) {
 	t.Parallel()
 
@@ -82,9 +82,9 @@ func TestPaceTakesLaterOfBothSchedules(t *testing.T) {
 	}
 }
 
-// TestPaceCap 累计等待封顶：到顶后返回封顶值，调用方据此把剩余内容一次放完，
-// 而不是无限等待（issue #448 拖延上限）。
-func TestPaceCap(t *testing.T) {
+// TestPaceRequestTATCap 请求时间线封顶：到顶后返回封顶值，调用方据此把剩余内容
+// 一次放完，且 TAT 不越过 now+PaceMaxDelay，避免后续请求被永久推到未来。
+func TestPaceRequestTATCap(t *testing.T) {
 	t.Parallel()
 
 	store, id := newLimited(t, Limits{RPM: 1}) // 60s/req
@@ -95,8 +95,38 @@ func TestPaceCap(t *testing.T) {
 	store.PaceRequest(id, base)
 
 	wait := store.PaceRequest(id, base)
-	if want := paceMaxDelay; wait != want {
+	if want := PaceMaxDelay; wait != want {
 		t.Fatalf("超上限等待=%v want 封顶 %v", wait, want)
+	}
+
+	// 再连发也不能把账本推到 now+PaceMaxDelay 之后。
+	for range 10 {
+		if got := store.PaceRequest(id, base); got != PaceMaxDelay {
+			t.Fatalf("连续推进后等待=%v want 恒为 %v", got, PaceMaxDelay)
+		}
+	}
+}
+
+// TestPaceTokenTATCap token 时间线同样封顶：一次超量 completion 只能把 TAT
+// 推到 now+PaceMaxDelay，连续推进也不能继续把后续请求永久推远。
+func TestPaceTokenTATCap(t *testing.T) {
+	t.Parallel()
+
+	store, id := newLimited(t, Limits{TPM: 600}) // 10 token/s
+
+	base := time.Now()
+	store.NoteEmitted(id, base, 3000) // 名义债务 300s
+
+	if got := store.PaceWait(id, base); got != PaceMaxDelay {
+		t.Fatalf("超量 token 后等待=%v want 封顶 %v", got, PaceMaxDelay)
+	}
+
+	for range 10 {
+		store.NoteEmitted(id, base, 3000)
+
+		if got := store.PaceWait(id, base); got != PaceMaxDelay {
+			t.Fatalf("连续入账后等待=%v want 恒为 %v", got, PaceMaxDelay)
+		}
 	}
 }
 

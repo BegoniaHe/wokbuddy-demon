@@ -76,7 +76,7 @@ type Record struct {
 // Limits 一把命名密钥的可选限制；零值 = 不限。进程内计数，单实例语义。
 type Limits struct {
 	RPM           int      `json:"rpm,omitempty"`            // 每分钟请求数
-	TPM           int      `json:"tpm,omitempty"`            // 每分钟 token 数（按已完成请求累计）
+	TPM           int      `json:"tpm,omitempty"`            // 每分钟 completion token 数（Decode/输出；不含 prompt）
 	MaxConcurrent int      `json:"max_concurrent,omitempty"` // 最大并发请求数
 	Models        []string `json:"models,omitempty"`         // 模型白名单（glob，可带 cn:/global: 前缀）
 	// ExpiresAt 到期时刻（UTC）；nil = 永不过期。now >= ExpiresAt 即拒绝。

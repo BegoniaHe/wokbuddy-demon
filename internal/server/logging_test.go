@@ -821,6 +821,29 @@ data: [DONE]
 
 `
 
+// TestChatStatsReaderPaceToolOutput TPM 整形只统计 completion 输出：思考正文与
+// 工具调用参数都属于 Decode 输出，必须计入；prompt 字段不会进入该计数。
+func TestChatStatsReaderPaceToolOutput(t *testing.T) {
+	t.Parallel()
+
+	const sse = `data: {"choices":[{"index":0,"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"function":{"name":"exec","arguments":"{\"cmd\":\"ls\"}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"function_call":{"name":"legacy","arguments":"{}"}}}]}
+
+data: [DONE]
+
+`
+
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.ReadAll(r)
+
+	want := paceTextTokens("think") + paceTextTokens("exec") +
+		paceTextTokens(`{"cmd":"ls"}`) + paceTextTokens("legacy") + paceTextTokens("{}")
+	if got := r.paceEmittedTokens(); got != want {
+		t.Fatalf("paceEmittedTokens=%d want %d（仅 completion 输出）", got, want)
+	}
+}
+
 // TestChatStatsReaderToolCallCount 流式 tool_calls 按 index 去重：同 index 多帧只算
 // 1 条；不同 index 各 1 条；旧式 function_call 计 1 条。
 func TestChatStatsReaderToolCallCount(t *testing.T) {
