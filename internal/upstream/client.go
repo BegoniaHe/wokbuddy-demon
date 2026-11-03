@@ -3763,6 +3763,10 @@ func (c *Client) newV3ConfigRequest(account8 *auth.Auth, str string) (*http.Requ
 	}
 
 	c.V3ConfigHeaders(req, account8, str)
+	// 只关这一条连接：req.Close 让 transferWriter 写一行 Connection: close。
+	// 不要 Header.Set("Connection", "close")，否则写出时会再补一行，变成重复头。
+	// 通用头函数不碰 Connection，chat / billing / report / growth 保持复用。
+	req.Close = true
 
 	return req, nil
 }
