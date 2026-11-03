@@ -372,19 +372,18 @@ const panelAPIMaxBodyBytes = 16 << 20
 func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 
-	if strings.HasPrefix(r.URL.Path, "/panel/api/") {
+	apiPath := strings.HasPrefix(r.URL.Path, "/panel/api/")
+
+	if apiPath {
 		// 敏感数据（配置、账号、密钥）不允许浏览器或中间代理缓存。
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 		limitPanelBody(w, r)
-
-		if !p.authorizeAPI(w, r) {
-			return
-		}
 	}
 
-	if p.audit != nil && r.Method != http.MethodGet && r.Method != http.MethodHead &&
-		strings.HasPrefix(r.URL.Path, "/panel/api/") {
+	// 管理面写操作的审计必须包在鉴权外层：凭据错误的写尝试也要留痕
+	// （auth_failed），否则猜 admin key 的请求只剩限速器计数，审计里查不到。
+	if p.audit != nil && apiPath && r.Method != http.MethodGet && r.Method != http.MethodHead {
 		auditedWriter := &auditResponseWriter{w: w}
 
 		// panic 也要留审计：handler 可能已经写了部分状态变更，直接 abort 连接
@@ -398,8 +397,16 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			p.audit.Append(p.auditEntryFor(auditedWriter, r, false))
 		}()
 
+		if !p.authorizeAPI(auditedWriter, r) {
+			return
+		}
+
 		p.mux.ServeHTTP(auditedWriter, r)
 
+		return
+	}
+
+	if apiPath && !p.authorizeAPI(w, r) {
 		return
 	}
 
@@ -424,6 +431,10 @@ func (p *Panel) authorizeAPI(w http.ResponseWriter, r *http.Request) bool {
 
 		return false
 	}
+
+	// 记录命中的 pattern，供外层审计在鉴权失败时仍能标注端点（鉴权失败不会
+	// 走到 mux 的 pattern 写入点）。
+	r.Pattern = pattern
 
 	scope, ok := p.scopes[pattern]
 	if !ok || scope == scopePublic {
