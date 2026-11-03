@@ -673,7 +673,7 @@ PUID=$(id -u) PGID=$(id -g) docker compose up -d --force-recreate
 - 命名密钥**只作用于网关 API 面**（`POST /v1/chat/completions`、`POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`）；
 - 面板、`GET /status`、`GET /metrics` 仍**只认**默认 `api_key`（命名密钥是给客户端的，不获得管理/运维可见性）；
 - 每把密钥记录 `last_used_at`、请求数 / token 用量与被限制拒绝数，面板可查看；
-- 面板「限制」可设置每把密钥的 `rpm` / `tpm` / `max_concurrent` / 模型白名单（glob，可带 `cn:` / `global:` 前缀）；超限返回 `429 + Retry-After`，错误体按入站协议编码（OpenAI / Anthropic / Gemini 各自的信封），白名单未命中返回 `403 model_not_allowed`；未配置限制的密钥行为不变。限流为进程内单实例计数；
+- 面板「限制」可设置每把密钥的 `rpm` / `tpm` / `max_concurrent` / 模型白名单（glob，可带 `cn:` / `global:` 前缀）；`max_concurrent` 超限返回 `429 + Retry-After`，错误体按入站协议编码（OpenAI / Anthropic / Gemini 各自的信封），`rpm` / `tpm` 超速改为拉长已放行回复而不返回 429；`tpm` 只计 Decode 阶段新增的 completion/output token，prompt/input token 不计入。白名单未命中返回 `403 model_not_allowed`；未配置限制的密钥行为不变。限流为进程内单实例计数；
 - 白名单按别名 / 后台模型改写 / 模态路由解析后的**最终模型**匹配（例如 `models.aliases`、`models.background_names` 的目标，或 `features.multimodal_routing` 改选的模型）；只写客户端请求的原模型名不会生效，已有配置需改写成目标名；
 - 每把密钥可绑定出口（`cn` / `global` / 跟随模型）：绑定后不带前缀的请求只走对应域；与显式 `cn:` / `global:` 前缀冲突返回 `400 realm_binding_conflict`，不消耗账号或上游额度；
 - `api_key` 为空且未创建任何命名密钥时，网关仍为「不鉴权」放行（既有默认）。

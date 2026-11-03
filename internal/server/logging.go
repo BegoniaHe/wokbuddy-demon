@@ -185,13 +185,21 @@ type chatStatsReader struct {
 	toolCallIDs        map[string]int
 	toolCallHasIndex   bool
 	toolCallNextIndex  int
+	toolCallCurrent    int
 	legacyFunctionCall bool
+	paceToolNames      map[int]bool
+	paceLegacyName     bool
 	pend               string // 已读未返回的行缓存（string 直接 copy 进 dst，省一次转换分配）
-	// paceEmitted 已见正文的 token 估算（issue #448 响应整形）：TPM 时间线的增量
-	// 输入。与计费/用量无关，只决定写出节奏，故用 rune 估算而非等上游 usage 帧
-	// （流式 usage 通常只在末帧出现，等不到）。
+	// paceASCII/paceCJK 已见 completion 输出的字符数（issue #448 响应整形）：TPM
+	// 时间线的增量输入。先累计整条流的字符再统一换算，避免短分片逐个 floor 后系统性
+	// 低估。与计费/用量无关，只在末帧 usage 到达前决定写出节奏。
 	// 原子量：keepalive 模式下解析在读 goroutine、整形器查询在写 goroutine。
-	paceEmitted atomic.Int64
+	paceASCII atomic.Int64
+	paceCJK   atomic.Int64
+	// paceExact/paceExactSeen 末帧 usage.completion_tokens 的并发安全快照，供
+	// 写出 goroutine 在流结束前对账估算。
+	paceExact     atomic.Int64
+	paceExactSeen atomic.Bool
 }
 
 // chatStatsReader 必须实现 io.Closer：keepalive 流返回前由 upstream 关闭并等待
@@ -251,8 +259,15 @@ func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredi
 // TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
 func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
 
-// paceEmittedTokens 返回已见正文的 token 估算（响应整形用，issue #448）。
-func (s *chatStatsReader) paceEmittedTokens() int64 { return s.paceEmitted.Load() }
+// paceEmittedTokens 返回已见 completion 输出的 token 估算（响应整形用，issue #448）。
+func (s *chatStatsReader) paceEmittedTokens() int64 {
+	return pacedTextTokens(s.paceASCII.Load(), s.paceCJK.Load())
+}
+
+// paceExactTokens 返回流中已观测到的精确 completion_tokens。
+func (s *chatStatsReader) paceExactTokens() (int64, bool) {
+	return s.paceExact.Load(), s.paceExactSeen.Load()
+}
 
 // paceCJKStart CJK 统一表意文字的起始 rune（与 pool.EstimatePromptTokens 同口径）。
 const paceCJKStart = 0x2E80
@@ -271,7 +286,12 @@ func paceTextTokens(text string) int64 {
 		}
 	}
 
-	return int64(ascii/4 + int(float64(cjk)/1.5))
+	return pacedTextTokens(int64(ascii), int64(cjk))
+}
+
+// pacedTextTokens 把整条流累计的 ASCII/CJK 字符数换算为 token 估算。
+func pacedTextTokens(ascii, cjk int64) int64 {
+	return ascii/4 + int64(float64(cjk)/1.5)
 }
 
 // Usage 返回流式响应中已收到的 token usage 字段。
@@ -354,13 +374,45 @@ func (s *chatStatsReader) parseSSELine(line string) {
 func (s *chatStatsReader) noteChoices(choices []sseChoiceFrame) {
 	for i := range choices {
 		c := &choices[i]
-		s.noteDelta(&c.Delta)
-		s.noteDelta(&c.Message)
+		s.noteDelta(choiceDelta(c))
 
 		if c.FinishReason != nil && *c.FinishReason != "" {
 			s.finishReason = *c.FinishReason
 		}
 	}
+}
+
+// choiceDelta 合并同一 choice 的 delta/message：同一个字段优先取 delta，缺失时
+// 才回退 message。部分兼容上游会在同帧回显完整 message，不能把相同 completion
+// 内容同时记两遍。
+func choiceDelta(choice *sseChoiceFrame) *sseDeltaFrame {
+	delta := choice.Delta
+
+	if delta.Content == nil {
+		delta.Content = choice.Message.Content
+	}
+
+	if delta.Refusal == nil {
+		delta.Refusal = choice.Message.Refusal
+	}
+
+	if delta.ReasoningContent == nil {
+		delta.ReasoningContent = choice.Message.ReasoningContent
+	}
+
+	if delta.Reasoning == nil {
+		delta.Reasoning = choice.Message.Reasoning
+	}
+
+	if !rawPayloadPresent(delta.ToolCalls) {
+		delta.ToolCalls = choice.Message.ToolCalls
+	}
+
+	if !rawPayloadPresent(delta.FunctionCall) {
+		delta.FunctionCall = choice.Message.FunctionCall
+	}
+
+	return &delta
 }
 
 // noteDelta 合并单个增量/完整消息的实质输出标记。
@@ -393,7 +445,7 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 func (s *chatStatsReader) notePaceText(delta *sseDeltaFrame) {
 	for _, text := range [4]*string{delta.Content, delta.Refusal, delta.ReasoningContent, delta.Reasoning} {
 		if text != nil {
-			s.paceEmitted.Add(paceTextTokens(*text))
+			s.notePaceChars(*text)
 		}
 	}
 
@@ -401,8 +453,31 @@ func (s *chatStatsReader) notePaceText(delta *sseDeltaFrame) {
 	s.notePaceFunctionCall(delta.FunctionCall)
 }
 
+// notePaceChars 累计一段 completion 输出的 ASCII/CJK 字符数，换算推迟到查询时。
+func (s *chatStatsReader) notePaceChars(text string) {
+	var ascii, cjk int64
+
+	for _, r := range text {
+		if r >= paceCJKStart {
+			cjk++
+		} else {
+			ascii++
+		}
+	}
+
+	if ascii > 0 {
+		s.paceASCII.Add(ascii)
+	}
+
+	if cjk > 0 {
+		s.paceCJK.Add(cjk)
+	}
+}
+
 // toolCallPaceChunk 工具调用增量的最小字段；arguments 分片是本帧新增输出。
 type toolCallPaceChunk struct {
+	Index    *int   `json:"index"`
+	ID       string `json:"id"`
 	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
@@ -421,8 +496,17 @@ func (s *chatStatsReader) notePaceToolCalls(raw json.RawMessage) {
 	}
 
 	for i := range calls {
-		s.paceEmitted.Add(paceTextTokens(calls[i].Function.Name))
-		s.paceEmitted.Add(paceTextTokens(calls[i].Function.Arguments))
+		index := s.resolveToolCall(calls[i].Index, calls[i].ID)
+		if calls[i].Function.Name != "" && !s.paceToolNames[index] {
+			if s.paceToolNames == nil {
+				s.paceToolNames = map[int]bool{}
+			}
+
+			s.paceToolNames[index] = true
+			s.notePaceChars(calls[i].Function.Name)
+		}
+
+		s.notePaceChars(calls[i].Function.Arguments)
 	}
 }
 
@@ -440,8 +524,12 @@ func (s *chatStatsReader) notePaceFunctionCall(raw json.RawMessage) {
 		return
 	}
 
-	s.paceEmitted.Add(paceTextTokens(call.Name))
-	s.paceEmitted.Add(paceTextTokens(call.Arguments))
+	if call.Name != "" && !s.paceLegacyName {
+		s.paceLegacyName = true
+		s.notePaceChars(call.Name)
+	}
+
+	s.notePaceChars(call.Arguments)
 }
 
 // noteToolCalls 对流式 tool_calls 增量做去重计数（issue #329）。
@@ -463,6 +551,13 @@ func (s *chatStatsReader) noteToolCalls(raw json.RawMessage) {
 // noteToolCall 把单个增量归并到调用序号，规则与 internal/upstream 的 toolIndex 一致：
 // 省略 index 的上游按 id 绑定调用，后续无 index/id 的 arguments 分片延续最近一次调用。
 func (s *chatStatsReader) noteToolCall(index *int, id string) {
+	s.resolveToolCall(index, id)
+}
+
+// resolveToolCall 返回增量所属的调用序号，并按 index/id 归并到同一调用。规则与
+// internal/upstream 的 toolIndex 一致：index 优先；缺 index 时按 id 绑定；两者都缺
+// 的延续分片归最近一次调用，首个匿名分片才新开序号。
+func (s *chatStatsReader) resolveToolCall(index *int, id string) int {
 	if index != nil {
 		s.markToolCallIndex(*index)
 
@@ -470,26 +565,29 @@ func (s *chatStatsReader) noteToolCall(index *int, id string) {
 			s.bindToolCallID(id, *index)
 		}
 
-		return
+		return *index
 	}
 
 	if id != "" {
 		if idx, ok := s.toolCallIDs[id]; ok {
 			s.markToolCallIndex(idx)
 
-			return
+			return idx
 		}
 
-		s.bindToolCallID(id, s.nextToolCallIndex())
+		idx := s.nextToolCallIndex()
+		s.bindToolCallID(id, idx)
 
-		return
+		return idx
 	}
 
 	// 单个调用的延续分片无 index/id 是标准形态，归入最近一次调用；首个匿名分片
 	// 没有可归属的调用时才新开序号。
 	if !s.toolCallHasIndex {
-		s.nextToolCallIndex()
+		return s.nextToolCallIndex()
 	}
+
+	return s.toolCallCurrent
 }
 
 // markToolCallIndex 记录一个调用序号，并把它设为后续匿名分片的归属。
@@ -500,6 +598,7 @@ func (s *chatStatsReader) markToolCallIndex(index int) {
 
 	s.toolCallIndexes[index] = struct{}{}
 	s.toolCallHasIndex = true
+	s.toolCallCurrent = index
 }
 
 // bindToolCallID 把上游 tool_call id 绑定到调用序号。
@@ -589,6 +688,8 @@ func (s *chatStatsReader) applyUsage(sseUsageFrame2 *sseUsageFrame) {
 	if sseUsageFrame2.CompletionTokens != nil {
 		s.hasCompletionTokens = true
 		s.completionTokens = *sseUsageFrame2.CompletionTokens
+		s.paceExact.Store(int64(s.completionTokens))
+		s.paceExactSeen.Store(true)
 	}
 
 	if sseUsageFrame2.TotalTokens != nil {

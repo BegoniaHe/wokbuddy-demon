@@ -201,3 +201,35 @@ func TestPaceDropDebt(t *testing.T) {
 		t.Fatalf("DropPacing 后等待=%v want 0", wait)
 	}
 }
+
+// TestNoteEmittedCanReconcileEstimate 流式中途先按正文估算入账，末帧拿到精确
+// completion_tokens 后必须能把本请求的差额补上或退回，否则跨请求时间线会永久
+// 保留估算误差。
+func TestNoteEmittedCanReconcileEstimate(t *testing.T) {
+	t.Parallel()
+
+	store, id := newLimited(t, Limits{TPM: 600}) // 10 token/s
+
+	base := time.Now()
+	store.NoteEmitted(id, base, 300)  // 估算 300 → TAT +30s
+	store.NoteEmitted(id, base, -100) // 精确只有 200 → 退回 10s
+
+	if wait := store.PaceWait(id, base); wait < 19*time.Second || wait > 21*time.Second {
+		t.Fatalf("负向对账后等待=%v want ≈20s", wait)
+	}
+
+	store.NoteEmitted(id, base, 200) // 精确 400 → 再补 20s
+
+	if wait := store.PaceWait(id, base); wait < 39*time.Second || wait > 41*time.Second {
+		t.Fatalf("正向对账后等待=%v want ≈40s", wait)
+	}
+
+	// 退回量超过当前 TAT 时不能留下负时间线；下一次入账仍从 now 起算。
+	store.DropPacing(id)
+	store.NoteEmitted(id, base, 10)
+	store.NoteEmitted(id, base, -100)
+
+	if wait := store.PaceWait(id, base); wait != 0 {
+		t.Fatalf("过度退回后等待=%v want 0", wait)
+	}
+}

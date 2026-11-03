@@ -3051,7 +3051,7 @@ func (f *chatFlow) handleStreamSuccess(
 
 	// 响应整形（issue #448）：配了 RPM/TPM 的命名密钥把 GCRA 账本挂到写出侧，
 	// 首帧仍立即，后续帧按账本节奏推迟。
-	f.attachStreamPacer(stats)
+	f.attachStreamPacer(ctx, stats)
 
 	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
 		return f.h.hintContext(f.bareModel, f.reqHasImage, f.declaredToolCount > 0)

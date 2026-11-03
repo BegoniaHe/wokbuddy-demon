@@ -206,15 +206,17 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
-// NoteEmitted 记录已吐出的 completion token（TPM 时间线的输入）。与
-// RecordUsage 分离：后者是请求结束后的持久计数，前者是流中增量，
+// NoteEmitted 调整本请求已吐出的 completion token（TPM 时间线的输入）。
+// tokens 可为负：流中先按正文估算入账，末帧拿到精确 usage 后用差额把估算
+// 对账掉。与 RecordUsage 分离：后者是请求结束后的持久计数，前者是流中增量，
 // 必须在字节写出前调用才能把「已见 token」算进时间线。
 //
 // 基线是「现在」而不是零值 time：时间线的含义是「按当前速率，最早允许多少
 // token 到达」，已过去的 TAT（含从未初始化的零值）一律归到 now，空闲时
-// 时间线在过去，第一发零等待。
+// 时间线在过去，第一发零等待。退回量超过当前债务时夹在当前时刻，不能变成
+// 负时间线而白送后续突发额度。
 func (s *Store) NoteEmitted(id string, now time.Time, tokens int64) {
-	if s == nil || id == "" || tokens <= 0 {
+	if s == nil || id == "" || tokens == 0 {
 		return
 	}
 
@@ -233,7 +235,12 @@ func (s *Store) NoteEmitted(id string, now time.Time, tokens int64) {
 		base = now
 	}
 
-	state.tokTAT = minTime(base.Add(time.Duration(tokens)*interval), now.Add(PaceMaxDelay))
+	tat := base.Add(time.Duration(tokens) * interval)
+	if tat.Before(now) {
+		tat = now
+	}
+
+	state.tokTAT = minTime(tat, now.Add(PaceMaxDelay))
 }
 
 // paceTokenIntervalFor 读取单 token 的间隔（60/tpm 秒）；未配置 TPM 返回 0。
