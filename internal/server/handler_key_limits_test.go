@@ -3,17 +3,19 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// TestNamedKeyRPMAndDefaultKeyUnaffected 命名密钥超 RPM 返回 429 + Retry-After；
-// 默认密钥不受影响。
-func TestNamedKeyRPMAndDefaultKeyUnaffected(t *testing.T) {
+// TestNamedKeyRateNoLongerRejectsAndDefaultKeyUnaffected 新语义（issue #448）：
+// RPM 超速不再准入拒绝（请求照常放行，频率控制移交给 GCRA 整形账本）；
+// 默认密钥不受命名限制影响。
+func TestNamedKeyRateNoLongerRejectsAndDefaultKeyUnaffected(t *testing.T) {
 	t.Parallel()
 
 	store := apikey.New("")
@@ -23,7 +25,7 @@ func TestNamedKeyRPMAndDefaultKeyUnaffected(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ok, err := store.UpdateLimits(rec.ID, apikey.Limits{RPM: 1, TPM: 0, MaxConcurrent: 0, Models: nil}); err != nil || !ok {
+	if ok, err := store.UpdateLimits(rec.ID, apikey.Limits{RPM: 600, TPM: 0, MaxConcurrent: 0, Models: nil}); err != nil || !ok {
 		t.Fatalf("limits: %v %v", ok, err)
 	}
 
@@ -44,18 +46,12 @@ func TestNamedKeyRPMAndDefaultKeyUnaffected(t *testing.T) {
 
 		return recorder
 	}
-	if code := do(raw).Code; code != http.StatusOK {
-		t.Fatalf("第一个请求 code=%d", code)
-	}
 
-	limited := do(raw)
-	if limited.Code != http.StatusTooManyRequests {
-		t.Fatalf("超限 code=%d body=%s", limited.Code, limited.Body)
-	}
-
-	ra := limited.Header().Get("Retry-After")
-	if n, err := strconv.Atoi(ra); err != nil || n < 1 {
-		t.Fatalf("Retry-After=%q", ra)
+	// rpm=600（100ms/发）也连发三发：整形账本只影响写出节奏，不影响准入。
+	for i := range 3 {
+		if code := do(raw).Code; code != http.StatusOK {
+			t.Fatalf("第 %d 发 code=%d body=%s（RPM 不应再 429）", i, code, do(raw).Body)
+		}
 	}
 
 	if code := do("secret").Code; code != http.StatusOK {
@@ -63,9 +59,9 @@ func TestNamedKeyRPMAndDefaultKeyUnaffected(t *testing.T) {
 	}
 }
 
-// TestNamedKeyRPMAnthropicErrorShape 命名密钥超限时 /v1/messages 必须返回
-// Anthropic 错误信封，而不是 OpenAI 形态。
-func TestNamedKeyRPMAnthropicErrorShape(t *testing.T) {
+// TestNamedKeyConcurrencyAnthropicErrorShape 并发拒绝时 /v1/messages 必须返回
+// Anthropic 错误信封（type=rate_limit_error），且 message 带上可区分的错误码。
+func TestNamedKeyConcurrencyAnthropicErrorShape(t *testing.T) {
 	t.Parallel()
 
 	store := apikey.New("")
@@ -75,16 +71,29 @@ func TestNamedKeyRPMAnthropicErrorShape(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if ok, err := store.UpdateLimits(rec.ID, apikey.Limits{RPM: 1, TPM: 0, MaxConcurrent: 0, Models: nil}); err != nil || !ok {
+	if ok, err := store.UpdateLimits(rec.ID, apikey.Limits{MaxConcurrent: 1, RPM: 0, TPM: 0, Models: nil}); err != nil || !ok {
 		t.Fatalf("limits: %v %v", ok, err)
 	}
 
-	handler := NewHandler(&Config{APIKey: "secret", Keys: store})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	handler := NewHandler(&Config{
+		Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+			once.Do(func() { <-release })
+			return 200, sseOK, true
+		}),
+		APIKey: "secret",
+		Keys:   store,
+	})
 
 	do := func() *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/v1/messages/count_tokens",
-			strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+			strings.NewReader(`{"model":"glm-5.2","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
 		req.Header.Set("Authorization", "Bearer "+raw)
+		req.Header.Set("Anthropic-Version", "2023-06-01")
 
 		recorder := httptest.NewRecorder()
 		handler.ServeHTTP(recorder, req)
@@ -92,13 +101,15 @@ func TestNamedKeyRPMAnthropicErrorShape(t *testing.T) {
 		return recorder
 	}
 
-	if code := do().Code; code != http.StatusOK {
-		t.Fatalf("第一个请求 code=%d", code)
-	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+
+	go func() { done <- do() }()
+
+	time.Sleep(50 * time.Millisecond)
 
 	limited := do()
 	if limited.Code != http.StatusTooManyRequests {
-		t.Fatalf("超限 code=%d body=%s", limited.Code, limited.Body)
+		t.Fatalf("并发超限 code=%d body=%s", limited.Code, limited.Body)
 	}
 
 	if limited.Header().Get("Retry-After") == "" {
@@ -106,8 +117,15 @@ func TestNamedKeyRPMAnthropicErrorShape(t *testing.T) {
 	}
 
 	if body := limited.Body.String(); !strings.Contains(body, `"type":"error"`) ||
-		!strings.Contains(body, `"rate_limit_error"`) {
-		t.Fatalf("超限应返回 Anthropic 错误体: %s", body)
+		!strings.Contains(body, `"rate_limit_error"`) ||
+		!strings.Contains(body, "concurrency_limit_exceeded") {
+		t.Fatalf("并发拒绝应为带 concurrency_limit_exceeded 的 Anthropic 错误体: %s", body)
+	}
+
+	close(release)
+
+	if first := <-done; first.Code != http.StatusOK {
+		t.Fatalf("首条 code=%d body=%s", first.Code, first.Body)
 	}
 }
 

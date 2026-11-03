@@ -187,6 +187,11 @@ type chatStatsReader struct {
 	toolCallNextIndex  int
 	legacyFunctionCall bool
 	pend               string // 已读未返回的行缓存（string 直接 copy 进 dst，省一次转换分配）
+	// paceEmitted 已见正文的 token 估算（issue #448 响应整形）：TPM 时间线的增量
+	// 输入。与计费/用量无关，只决定写出节奏，故用 rune 估算而非等上游 usage 帧
+	// （流式 usage 通常只在末帧出现，等不到）。
+	// 原子量：keepalive 模式下解析在读 goroutine、整形器查询在写 goroutine。
+	paceEmitted atomic.Int64
 }
 
 // chatStatsReader 必须实现 io.Closer：keepalive 流返回前由 upstream 关闭并等待
@@ -245,6 +250,29 @@ func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredi
 
 // TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
 func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
+
+// paceEmittedTokens 返回已见正文的 token 估算（响应整形用，issue #448）。
+func (s *chatStatsReader) paceEmittedTokens() int64 { return s.paceEmitted.Load() }
+
+// paceCJKStart CJK 统一表意文字的起始 rune（与 pool.EstimatePromptTokens 同口径）。
+const paceCJKStart = 0x2E80
+
+// paceTextTokens 估算一段正文的 token 数：ASCII ≈ 4 字符/token，CJK ≈ 1.5 字符/token。
+// 只用于响应整形的 TPM 节奏（issue #448），不参与计费或用量统计；直接在 string 上
+// 逐 rune 解码，不复制。
+func paceTextTokens(text string) int64 {
+	ascii, cjk := 0, 0
+
+	for _, r := range text {
+		if r >= paceCJKStart {
+			cjk++
+		} else {
+			ascii++
+		}
+	}
+
+	return int64(ascii/4 + int(float64(cjk)/1.5))
+}
 
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() *pool.TokenUsageDelta {
@@ -345,6 +373,8 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 		s.hasRefusal = true
 	}
 
+	s.notePaceText(delta)
+
 	if rawPayloadPresent(delta.ToolCalls) {
 		s.hasToolCall = true
 		s.noteToolCalls(delta.ToolCalls)
@@ -354,6 +384,17 @@ func (s *chatStatsReader) noteDelta(delta *sseDeltaFrame) {
 	if functionCallHasPayload(delta.FunctionCall) {
 		s.hasToolCall = true
 		s.legacyFunctionCall = true
+	}
+}
+
+// notePaceText 把本帧已吐出的正文计入整形账（issue #448 的 TPM 时间线输入）。
+// 思考正文（reasoning/reasoning_content）同样消耗上游 token 额度，一并计入，
+// 否则长思考流会被显著低估。
+func (s *chatStatsReader) notePaceText(delta *sseDeltaFrame) {
+	for _, text := range [4]*string{delta.Content, delta.Refusal, delta.ReasoningContent, delta.Reasoning} {
+		if text != nil {
+			s.paceEmitted.Add(paceTextTokens(*text))
+		}
 	}
 }
 
