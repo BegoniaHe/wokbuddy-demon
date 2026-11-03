@@ -36,29 +36,25 @@ func readFile(t *testing.T, path string) []byte {
 	return raw
 }
 
-func TestAcquireRPM(t *testing.T) {
+// TestAcquireRPMAdmitsThenPaces 新语义（issue #448）：RPM 不再准入拒绝。
+// 超速请求照常放行，频率控制交给 PaceRequest 的 GCRA 账本（见 pacing_test.go）。
+// 旧断言「超过 RPM 即 RejectRateLimited」已被本用例取代——固定窗口拒绝会把
+// 客户端重试与窗口清零后的突发堆到上游账号上。
+func TestAcquireRPMAdmitsThenPaces(t *testing.T) {
 	t.Parallel()
 
 	store, id := newLimited(t, Limits{RPM: 2})
-	for i := range 2 {
+	for range 5 {
 		rel, _, reason := store.Acquire(id, "")
 		if reason != RejectNone {
-			t.Fatalf("request %d 应放行: %v", i, reason)
+			t.Fatalf("RPM 超速应放行（整形取代拒绝）: %v", reason)
 		}
 
 		rel()
 	}
-
-	rel, retry, reason := store.Acquire(id, "")
-	if reason != RejectRateLimited || rel != nil {
-		t.Fatalf("超过 RPM 应拒绝: reason=%v rel=%v", reason, rel != nil)
-	}
-
-	if retry <= 0 || retry > time.Minute {
-		t.Fatalf("retryAfter=%v", retry)
-	}
 }
 
+// TestAcquireConcurrency 并发超限仍立刻拒绝（监管，不整形）：不等待、不排队。
 func TestAcquireConcurrency(t *testing.T) {
 	t.Parallel()
 	store, id := newLimited(t, Limits{MaxConcurrent: 1})
@@ -68,8 +64,8 @@ func TestAcquireConcurrency(t *testing.T) {
 		t.Fatalf("首个请求应放行: %v", reason)
 	}
 
-	if _, _, reason := store.Acquire(id, ""); reason != RejectConcurrency {
-		t.Fatalf("并发超限应拒绝: %v", reason)
+	if _, retry, reason := store.Acquire(id, ""); reason != RejectConcurrency || retry <= 0 {
+		t.Fatalf("并发超限应拒绝: reason=%v retry=%v", reason, retry)
 	}
 
 	rel()
@@ -81,19 +77,20 @@ func TestAcquireConcurrency(t *testing.T) {
 	}
 }
 
-func TestAcquireTPM(t *testing.T) {
+// TestAcquireTPMAdmitsThenPaces 新语义（issue #448）：TPM 同样不再准入拒绝，
+// 由 PaceTokens / NoteEmitted 的 token 时间线整形。
+func TestAcquireTPMAdmitsThenPaces(t *testing.T) {
 	t.Parallel()
-	store, id := newLimited(t, Limits{TPM: 100})
-	store.RecordUsage(id, 0, 60, 60)
 
-	if _, _, reason := store.Acquire(id, ""); reason != RejectNone {
-		t.Fatalf("未达 TPM 应放行: %v", reason)
-	}
+	store, id := newLimited(t, Limits{TPM: 10})
+	for range 5 {
+		rel, _, reason := store.Acquire(id, "")
+		if reason != RejectNone {
+			t.Fatalf("TPM 超速应放行（整形取代拒绝）: %v", reason)
+		}
 
-	store.RecordUsage(id, 0, 50, 50)
-
-	if _, _, reason := store.Acquire(id, ""); reason != RejectRateLimited {
-		t.Fatalf("超过 TPM 应拒绝: %v", reason)
+		rel()
+		store.RecordUsage(id, 0, 100, 100)
 	}
 }
 

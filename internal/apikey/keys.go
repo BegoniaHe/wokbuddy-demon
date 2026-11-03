@@ -87,12 +87,10 @@ type Limits struct {
 	IPAllowlist []string `json:"ip_allowlist,omitempty"`
 }
 
-// limitRuntime 单把密钥的进程内限流状态（固定 1 分钟窗口）。
+// limitRuntime 单把密钥的进程内在途计数（只跟踪并发；RPM/TPM 改由 pace.go 的
+// GCRA 账本整形，issue #448）。
 type limitRuntime struct {
-	windowStart time.Time
-	rpm         int
-	tpm         int64
-	inflight    int
+	inflight int
 }
 
 // file 落盘结构。
@@ -112,6 +110,11 @@ type Store struct {
 
 	limMu  sync.Mutex
 	limits map[string]*limitRuntime
+	// pace 响应整形账本（issue #448）：RPM/TPM 的 GCRA 虚拟调度。与 limits
+	// 同锁保护（limMu 经各 Pace* 方法间接持有），密钥增删不触碰它——
+	// Delete/Revoke 后下一次 Pace* 会因 stateOf 未命中而空操作，
+	// 残留条目由 DropPacing 显式清理（客户端断开路径）。
+	pace *paceLedger
 
 	started  atomic.Bool
 	stopOnce sync.Once
@@ -124,6 +127,7 @@ func New(path string) *Store {
 	store := &Store{
 		path:   path,
 		limits: map[string]*limitRuntime{},
+		pace:   newPaceLedger(),
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 	}
@@ -330,6 +334,10 @@ func (s *Store) Keys() []httpauth.Key {
 }
 
 // RecordUsage 累计一把密钥的一次成功鉴权请求（含 token）。last_used_at 同步刷新。
+//
+// 只写持久计数（Record 字段）：TPM 整形账本由 NoteEmitted 在流中增量推进
+// （issue #448），不在这里补——请求结束才记账会把「已见 token」算晚，
+// 快模型在记账前已把多轮并发槽周转完。
 func (s *Store) RecordUsage(id string, prompt, completion, total int64) {
 	if s == nil || id == "" {
 		return
@@ -351,10 +359,6 @@ func (s *Store) RecordUsage(id string, prompt, completion, total int64) {
 		now := time.Now()
 		r.LastUsedAt = &now
 		s.dirty = true
-		s.limMu.Lock()
-		rt := s.runtimeLocked(id, now)
-		rt.tpm += total
-		s.limMu.Unlock()
 
 		return
 	}
@@ -469,8 +473,11 @@ const (
 )
 
 // Acquire 按命名密钥限制尝试进入一次请求。返回 release（放行时必须 defer 调用）、
-// 建议 Retry-After 与拒绝原因。检查顺序固定：过期 → IP 白名单 → 总量配额 →
-// RPM/TPM/并发。
+// 建议 Retry-After 与拒绝原因。检查顺序固定：过期 → IP 白名单 → 总量配额 → 并发。
+//
+// RPM/TPM **不再是准入拒绝**（issue #448）：超速请求照常放行，由 PaceRequest /
+// PaceBoth 在写出侧按 GCRA 账本整形（首帧立即、结束标记择晚）。固定窗口拒绝
+// 只会把客户端的重试与窗口清零后的突发堆到上游账号上，适得其反。
 //
 // 总量配额是准入时 best-effort：max_concurrent 条在途请求仍可能各消耗 token，
 // 因此允许有限超额，不做 token 预留。model 白名单不在此检查（请求体尚未解析），
@@ -487,19 +494,18 @@ func (s *Store) Acquire(id, ip string) (release func(), retryAfter time.Duration
 		return nil, 0, reason
 	}
 
-	if limits.RPM <= 0 && limits.TPM <= 0 && limits.MaxConcurrent <= 0 {
+	if limits.MaxConcurrent <= 0 {
 		return func() {}, 0, RejectNone
 	}
 
 	s.limMu.Lock()
 	defer s.limMu.Unlock()
 
-	limitRuntime2 := s.runtimeLocked(id, now)
-	if retry, rejection := allowLocked(limitRuntime2, limits); rejection != RejectNone {
-		return nil, retry, rejection
+	limitRuntime2 := s.runtimeLocked(id)
+	if limitRuntime2.inflight >= limits.MaxConcurrent {
+		return nil, time.Second, RejectConcurrency
 	}
 
-	limitRuntime2.rpm++
 	limitRuntime2.inflight++
 
 	return func() {
@@ -528,26 +534,6 @@ func checkKeyAdmission(limits Limits, totalTokens int64, ip string, now time.Tim
 	}
 
 	return RejectNone
-}
-
-// allowLocked 检查并发/RPM/TPM，返回建议等待时长与拒绝原因。
-//
-//nolint:gocritic // Limits 是值语义的配置快照，指针化会让调用点与不可变性都变复杂。
-func allowLocked(limitRuntime2 *limitRuntime, limits Limits) (time.Duration, RejectReason) {
-	if limits.MaxConcurrent > 0 && limitRuntime2.inflight >= limits.MaxConcurrent {
-		return time.Second, RejectConcurrency
-	}
-
-	retry := time.Until(limitRuntime2.windowStart.Add(time.Minute))
-	if limits.RPM > 0 && limitRuntime2.rpm >= limits.RPM {
-		return retry, RejectRateLimited
-	}
-
-	if limits.TPM > 0 && limitRuntime2.tpm >= int64(limits.TPM) {
-		return retry, RejectRateLimited
-	}
-
-	return 0, RejectNone
 }
 
 // ModelAllowed 报告模型是否命中密钥白名单（未配置 = 全部允许）。
@@ -893,18 +879,12 @@ func normalizeModelPatterns(raw []string) ([]string, error) {
 	return out, nil
 }
 
-// runtimeLocked 取/初始化密钥运行时；窗口过期时重置计数。
-func (s *Store) runtimeLocked(id string, now time.Time) *limitRuntime {
+// runtimeLocked 取/初始化密钥的并发运行时（持 limMu 调用）。
+func (s *Store) runtimeLocked(id string) *limitRuntime {
 	limitRuntime2 := s.limits[id]
 	if limitRuntime2 == nil {
 		limitRuntime2 = &limitRuntime{}
 		s.limits[id] = limitRuntime2
-	}
-
-	if limitRuntime2.windowStart.IsZero() || now.Sub(limitRuntime2.windowStart) >= time.Minute {
-		limitRuntime2.windowStart = now
-		limitRuntime2.rpm = 0
-		limitRuntime2.tpm = 0
 	}
 
 	return limitRuntime2
