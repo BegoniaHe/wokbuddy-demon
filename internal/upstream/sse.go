@@ -979,13 +979,38 @@ func normalizeFrameUsage(rawUsage any) any {
 
 // StreamOption StreamHint 的可选行为开关。
 // WithErrorFrameObserver 只做旁路观测、不改透传字节；WithMarkupRepair 会改写出站
-// 帧（把正文里的原生工具调用标记还原成 delta.tool_calls，见 dsml.go）。
+// 帧（把正文里的原生工具调用标记还原成 delta.tool_calls，见 dsml.go）；
+// WithResponsePacer 按密钥整形账本延迟写出（issue #448）。
 type StreamOption func(*streamOptions)
 
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
 	keepalive    time.Duration
+	pacer        ResponsePacer
+}
+
+// ResponsePacer 响应整形钩子（issue #448）：每帧写出前由 streamWriter 查询
+// 「本帧前应等待多久」。语义约定：
+//   - 首帧不查询（streamWriter 保证 TTFT 等于上游自己的 TTFT），整形只推迟
+//     后续帧与结束标记；
+//   - 返回 0 = 不等待（空闲时间线在过去，不插任何延迟）；
+//   - 实现方把累计等待封顶（见 apikey 的 paceMaxDelay）：到顶后返回 0，其余内容
+//     一次放完，不无限占用连接。
+//
+// 传 nil = 关闭（与未设置时逐字节一致）。
+type ResponsePacer interface {
+	WaitBeforeWrite() time.Duration
+}
+
+// WithResponsePacer 挂上响应整形器。与 WithKeepaliveInterval 正交：心跳只在
+// 上游静默时写注释帧，pacer 只在有帧待写时延迟；两者可同时开启。
+func WithResponsePacer(p ResponsePacer) StreamOption {
+	return func(o *streamOptions) {
+		if p != nil {
+			o.pacer = p
+		}
+	}
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -1084,6 +1109,11 @@ type streamWriter struct {
 	synthIdx       int
 	maxToolIdx     int
 	toolFinishSent bool
+
+	// pacer 响应整形器（issue #448；nil = 关闭）。framesWritten 记录已写出的
+	// 帧数：首帧不等待（TTFT 语义），后续帧与结束标记按 pacer 节奏延迟。
+	pacer         ResponsePacer
+	framesWritten int
 }
 
 // newStreamWriter 初始化 SSE 透传写入器（设置 SSE headers + 跨帧状态）。
@@ -1116,6 +1146,7 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 		tools:        newToolIndex(),
 		repair:       streamOptions2.markup,
 		maxToolIdx:   -1,
+		pacer:        streamOptions2.pacer,
 	}
 }
 
@@ -1361,10 +1392,32 @@ func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall)
 	return out
 }
 
+// paceFrame 帧写出前的整形等待（issue #448）。首帧不等待（TTFT 等于上游自己的
+// TTFT）；后续帧（含结束标记与流尾兜底帧）按 pacer 返回的时长睡眠。
+// pacer 为 nil 或返回 0 时零开销——未配限速的密钥走的就是这条路径，
+// 逐字节与时序同改造前。
+func (s *streamWriter) paceFrame() {
+	if s.pacer == nil || s.framesWritten == 0 {
+		if s.framesWritten == 0 {
+			s.framesWritten++ // 首帧记账（不等候）
+		}
+
+		return
+	}
+
+	s.framesWritten++
+
+	if wait := s.pacer.WaitBeforeWrite(); wait > 0 {
+		time.Sleep(wait)
+	}
+}
+
 // writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 // 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
 // 降级原样写出，但不计数）。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
+	s.paceFrame()
+
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil || obj == nil {
 		// 非 JSON 帧或顶层 null（nil map 没有可透传字段，后续写 id 会 panic）：
