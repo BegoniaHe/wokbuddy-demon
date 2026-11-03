@@ -49,6 +49,74 @@ func TestResolveRequestModelAliases(t *testing.T) {
 	}
 }
 
+// TestResolveRequestModelAliasWildcards 通配别名（issue #436）：精确键优先；
+// 多个通配同时命中时模式更长优先，同长取字典序较小的模式；未命中保持透传。
+func TestResolveRequestModelAliasWildcards(t *testing.T) {
+	t.Parallel()
+
+	aliases := map[string]string{
+		"claude-*":          "cn:glm-5.2",
+		"claude-sonnet-4-6": "cn:其他模型",
+		"gpt-?":             "cn:a",
+		"gpt-*":             "cn:b",
+		"haiku-?":           "cn:h1",
+		"haiku-*":           "cn:h2",
+		"long-*":            "cn:short",
+		"long-name-*":       "cn:longer",
+		"z?":                "cn:one",
+	}
+
+	cases := []struct {
+		in        string
+		wantRealm string
+		wantBare  string
+	}{
+		{"claude-sonnet-4-6", "cn", "其他模型"},
+		{"claude-opus-4-1", "cn", "glm-5.2"},
+		{"claude-", "cn", "glm-5.2"},
+		{"gpt-x", "cn", "b"},
+		{"haiku-k2", "cn", "h2"},
+		{"long-name-1", "cn", "longer"},
+		{"long-x", "cn", "short"},
+		{"zx", "cn", "one"},
+		{"zxy", "cn", "zxy"},
+		{"not-aliased", "cn", "not-aliased"},
+		{"global:claude-opus-4-1", "cn", "glm-5.2"},
+	}
+	for _, tc := range cases {
+		realm, bare := resolveRequestModel(tc.in, aliases)
+		if realm != tc.wantRealm || bare != tc.wantBare {
+			t.Errorf("resolveRequestModel(%q) = (%q,%q), want (%q,%q)",
+				tc.in, realm, bare, tc.wantRealm, tc.wantBare)
+		}
+	}
+}
+
+// TestModelsEndpointOmitsWildcardAliases /v1/models 只列精确别名，通配键不当模型 id。
+func TestModelsEndpointOmitsWildcardAliases(t *testing.T) {
+	t.Parallel()
+
+	handler := NewHandler(&Config{
+		Pool:        testPoolWith(),
+		Upstream:    upstream.New(),
+		modelsCache: &modelsCache{},
+		ModelAliases: map[string]string{
+			"claude-*":          "cn:glm-5.2",
+			"claude-?":          "cn:one",
+			"claude-sonnet-4-6": "cn:hy4",
+		},
+	})
+
+	ids := modelsListIDs(t, handler)
+	if ids["claude-*"] || ids["claude-?"] {
+		t.Fatalf("通配键不应出现在 /v1/models: %v", ids)
+	}
+
+	if !ids["claude-sonnet-4-6"] {
+		t.Fatalf("精确别名应列出: %v", ids)
+	}
+}
+
 // TestResolveRequestModelNoAliases 未配置别名时与 resolveModel 完全一致。
 func TestResolveRequestModelNoAliases(t *testing.T) {
 	t.Parallel()

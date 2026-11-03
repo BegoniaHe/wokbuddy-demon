@@ -524,7 +524,7 @@ gemini
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
 | `session_sticky.enabled` | `true` | 会话粘性开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
-| `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；命中后按目标裸模型选号/计费。改后需重启 |
+| `models.aliases` | `{}` | 客户端模型别名 → 上游 `[realm:]model`；键含 `*` / `?` 时按 `path.Match` 通配（精确键优先，多个命中取模式更长、同长字典序小者），其它键按字面量匹配。命中后按目标裸模型选号/计费；通配键不出现在 `/v1/models`。改后需重启 |
 | `models.background_names` | `[]` | 客户端后台任务硬编码模型名（大小写不敏感）；命中后把 `model` 改写为 `background_target`。留空 = 关闭。热生效 |
 | `models.background_target` | `deepseek-v4.1-flash` | 后台模型改写目标；只改 `model`，其余请求原样透传 |
 | `models.hidden` | `[]` | 模型黑名单：裸名 = 两域都隐藏，`cn:` / `global:` 前缀 = 只藏该域（大小写敏感，前缀后必须写模型名）。命中的模型不在 `/v1/models` 列出（含别名条目），点名调用返回 400 `model_unavailable`（不打上游、不占选号）。热生效 |
@@ -552,10 +552,10 @@ gemini
 }
 ```
 
-- 键必须是裸模型名（不含 `cn:` / `global:` 前缀，大小写敏感）。
+- 键必须是裸模型名（不含 `cn:` / `global:` 前缀，大小写敏感）；含 `*` / `?` 的键按 `path.Match` 通配，其它键按字面量精确匹配。精确键优先；多个通配同时命中时取模式更长者，同长取字典序较小的模式。
 - 值沿用 `[realm:]model` 语法；省略 realm 时继承请求侧 realm（裸请求即 `cn`）。
 - 先剥请求的 realm 前缀再查别名；未命中则原样透传，行为与未配置别名一致。
-- 命中后选号、会话粘性、成本台账与日志统一使用解析后的裸模型名；`GET /v1/models` 会追加别名条目并附带 `upstream_id`。
+- 命中后选号、会话粘性、成本台账与日志统一使用解析后的裸模型名；`GET /v1/models` 会追加**精确**别名条目并附带 `upstream_id`，通配键不当作可点名的模型 id。
 - 别名在进程启动时装载，修改后需重启。
 
 ### 环境变量覆盖

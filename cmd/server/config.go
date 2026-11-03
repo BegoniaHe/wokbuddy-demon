@@ -22,6 +22,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
+	srv "github.com/BegoniaHe/wokbuddy-demon/internal/server"
 )
 
 // placeholderAPIKey 是 config.example.json 里的公开占位密钥。
@@ -237,8 +238,9 @@ type Config struct {
 		// BackgroundTarget 后台模型改写目标；默认 deepseek-v4.1-flash。
 		BackgroundTarget string `json:"background_target"`
 		// Aliases 客户端模型别名 → 上游模型（issue #52）：
-		// {"claude-sonnet-4-5": "cn:hy4", "gpt-5-codex": "hy4"}。
-		// 键必须是裸名（不含 realm 前缀，大小写敏感）；值沿用 "[realm:]model"
+		// {"claude-sonnet-4-5": "cn:hy4", "claude-*": "cn:glm-5.2"}。
+		// 键必须是裸名（不含 realm 前缀，大小写敏感），可用 * / ? 通配
+		// （精确键优先，再按模式长度与字典序）；值沿用 "[realm:]model"
 		// 语法，省略 realm 时继承请求侧的 realm（裸请求即 cn）。
 		// 命中别名后选号/粘性/成本台账/日志一律使用解析后的裸模型名。
 		Aliases map[string]string `json:"aliases"`
@@ -1064,6 +1066,7 @@ func (c *Config) normalizeAPIKeys() error {
 // normalizeModelAliases 校验并归一化模型别名（issue #52）：键必须是裸名，
 // 值必须是可解析的非空 "[realm:]model"；首尾空白去掉，去空白后重名直接报错
 // （否则 map 覆盖顺序不确定，配置会静默丢一项）。
+// 键可含 * / ?（issue #436），含 ":" 的键、空目标仍拒绝。
 func (c *Config) normalizeModelAliases() error {
 	if len(c.Models.Aliases) == 0 {
 		return nil
@@ -1178,7 +1181,7 @@ func (c *Config) normalizeAllowedModels() error {
 
 // resolveBackgroundTarget 返回后台改写目标最终出站时的 (realm, bare)。后台改写后
 // 仍会经过别名解析（resolveFlowModel）：目标写成别名时，白名单要校验解析后的真实
-// 模型；别名只解析一层，与 resolveRequestModel 同口径。
+// 模型；别名只解析一层，与 resolveRequestModel 同口径（含 * / ? 通配）。
 func (c *Config) resolveBackgroundTarget() (realm, bare string) {
 	if strings.TrimSpace(c.Models.BackgroundTarget) == "" {
 		return "", ""
@@ -1190,7 +1193,7 @@ func (c *Config) resolveBackgroundTarget() (realm, bare string) {
 		realm = "cn"
 	}
 
-	aliasTarget, ok := c.Models.Aliases[bare]
+	aliasTarget, ok := srv.LookupAlias(bare, c.Models.Aliases)
 	if !ok {
 		return realm, bare
 	}
