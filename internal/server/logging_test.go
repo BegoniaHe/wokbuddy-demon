@@ -821,6 +821,89 @@ data: [DONE]
 
 `
 
+// TestChatStatsReaderPaceToolOutput TPM 整形只统计 completion 输出：思考正文与
+// 工具调用参数都属于 Decode 输出，必须计入；prompt 字段不会进入该计数。
+func TestChatStatsReaderPaceToolOutput(t *testing.T) {
+	t.Parallel()
+
+	const sse = `data: {"choices":[{"index":0,"delta":{"reasoning_content":"think","tool_calls":[{"index":0,"function":{"name":"exec","arguments":"{\"cmd\":\"ls\"}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"function_call":{"name":"legacy","arguments":"{}"}}}]}
+
+data: [DONE]
+
+`
+
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.ReadAll(r)
+
+	want := paceTextTokens("think" + "exec" + `{"cmd":"ls"}` + "legacy" + "{}")
+	if got := r.paceEmittedTokens(); got != want {
+		t.Fatalf("paceEmittedTokens=%d want %d（仅 completion 输出，按整条流累计估算）", got, want)
+	}
+}
+
+// TestChatStatsReaderPaceCountsShortFragments 按整条流累计字符后统一换算：
+// 逐分片换算会把 ASCII 1–3 字符和单个 CJK 字符都 floor 成 0，短分片流几乎
+// 不进 TPM 账。累计 8 个 ASCII 字符应至少折合 2 token。
+func TestChatStatsReaderPaceCountsShortFragments(t *testing.T) {
+	t.Parallel()
+
+	var sse strings.Builder
+	for _, text := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "中"} {
+		sse.WriteString(`data: {"choices":[{"index":0,"delta":{"content":"` + text + `"}}]}` + "\n\n")
+	}
+
+	sse.WriteString("data: [DONE]\n\n")
+
+	r := newChatStatsReaderSince(strings.NewReader(sse.String()), time.Now())
+	_, _ = io.ReadAll(r)
+
+	if got, want := r.paceEmittedTokens(), paceTextTokens("abcdefgh中"); got != want {
+		t.Fatalf("paceEmittedTokens=%d want %d（短分片不得逐个 floor）", got, want)
+	}
+}
+
+// TestChatStatsReaderPacePrefersDeltaOverMessage 同一 choice 同时携带 delta 与
+// message（部分兼容上游会回显完整消息）时，按字段优先取 delta，不得重复计数。
+func TestChatStatsReaderPacePrefersDeltaOverMessage(t *testing.T) {
+	t.Parallel()
+
+	const sse = `data: {"choices":[{"index":0,"delta":{"content":"same"},"message":{"content":"same"}}]}
+
+data: [DONE]
+
+`
+
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.ReadAll(r)
+
+	if got, want := r.paceEmittedTokens(), paceTextTokens("same"); got != want {
+		t.Fatalf("paceEmittedTokens=%d want %d（delta 与 message 的同内容不得双计）", got, want)
+	}
+}
+
+// TestChatStatsReaderPaceDeduplicatesToolCallName 同一 tool index 的 name 可能
+// 在后续分片重复出现；name 是调用元数据，只计首次，arguments 分片仍逐段累计。
+func TestChatStatsReaderPaceDeduplicatesToolCallName(t *testing.T) {
+	t.Parallel()
+
+	const sse = `data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"exec","arguments":""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"exec","arguments":"{}"}}]}}]}
+
+data: [DONE]
+
+`
+
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.ReadAll(r)
+
+	if got, want := r.paceEmittedTokens(), paceTextTokens("exec{}"); got != want {
+		t.Fatalf("paceEmittedTokens=%d want %d（重复 tool name 不得双计）", got, want)
+	}
+}
+
 // TestChatStatsReaderToolCallCount 流式 tool_calls 按 index 去重：同 index 多帧只算
 // 1 条；不同 index 各 1 条；旧式 function_call 计 1 条。
 func TestChatStatsReaderToolCallCount(t *testing.T) {

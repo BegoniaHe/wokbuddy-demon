@@ -91,7 +91,13 @@ func bodyTooLargeMessage(limit int64) string {
 type httpResponder struct {
 	w         http.ResponseWriter
 	keepalive time.Duration
+	// pacer 响应整形器（issue #448；nil = 关闭）。由核心在写出前挂上，只影响
+	// 流式帧的写出节奏，不改任何字节。
+	pacer upstream.ResponsePacer
 }
+
+// setStreamPacer 挂响应整形器（issue #448；见 streamPacerSetter）。
+func (r *httpResponder) setStreamPacer(p upstream.ResponsePacer) { r.pacer = p }
 
 // JSON 写出非流式成功响应（OpenAI JSON）。
 func (r *httpResponder) JSON(status int, body any) {
@@ -113,7 +119,7 @@ func (r *httpResponder) Header(name, value string) {
 func (r *httpResponder) Stream(
 	rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string),
 ) error {
-	opts := streamHintOptions(r.keepalive, repair, onErrFrame)
+	opts := streamHintOptions(r.keepalive, r.pacer, repair, onErrFrame)
 	if err := upstream.StreamHint(r.w, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}
@@ -121,12 +127,13 @@ func (r *httpResponder) Stream(
 	return nil
 }
 
-// streamHintOptions 组装 StreamHint 的旁路选项（error 帧观察 → 标记修复 → 保活）。
-// 四路响应编码器共用同一口径，避免各自维护一份选项拼装顺序。
+// streamHintOptions 组装 StreamHint 的旁路选项（error 帧观察 → 标记修复 → 保活
+// → 整形）。四路响应编码器共用同一口径，避免各自维护一份选项拼装顺序。
 func streamHintOptions(
-	keepalive time.Duration, repair *upstream.MarkupRepair, onErrFrame func(string),
+	keepalive time.Duration, pacer upstream.ResponsePacer,
+	repair *upstream.MarkupRepair, onErrFrame func(string),
 ) []upstream.StreamOption {
-	opts := make([]upstream.StreamOption, 0, 3)
+	opts := make([]upstream.StreamOption, 0, 4)
 	if onErrFrame != nil {
 		opts = append(opts, upstream.WithErrorFrameObserver(onErrFrame))
 	}
@@ -134,6 +141,10 @@ func streamHintOptions(
 	opts = append(opts, upstream.WithMarkupRepair(repair))
 	if keepalive > 0 {
 		opts = append(opts, upstream.WithKeepaliveInterval(keepalive))
+	}
+
+	if pacer != nil {
+		opts = append(opts, upstream.WithResponsePacer(pacer))
 	}
 
 	return opts

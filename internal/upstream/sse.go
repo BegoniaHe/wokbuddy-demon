@@ -979,13 +979,45 @@ func normalizeFrameUsage(rawUsage any) any {
 
 // StreamOption StreamHint 的可选行为开关。
 // WithErrorFrameObserver 只做旁路观测、不改透传字节；WithMarkupRepair 会改写出站
-// 帧（把正文里的原生工具调用标记还原成 delta.tool_calls，见 dsml.go）。
+// 帧（把正文里的原生工具调用标记还原成 delta.tool_calls，见 dsml.go）；
+// WithResponsePacer 按密钥整形账本延迟写出（issue #448）。
 type StreamOption func(*streamOptions)
 
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
 	keepalive    time.Duration
+	pacer        ResponsePacer
+}
+
+// ResponsePacer 响应整形钩子（issue #448）：每帧写出前由 streamWriter 查询
+// 「本帧前应等待多久」。语义约定：
+//   - 首帧不查询（streamWriter 保证 TTFT 等于上游自己的 TTFT），整形只推迟
+//     后续帧与结束标记；
+//   - 返回 0 = 不等待（空闲时间线在过去，不插任何延迟）；
+//   - 实现方把累计等待封顶（见 apikey 的 PaceMaxDelay）：到顶后返回 0，其余内容
+//     一次放完，不无限占用连接。
+//
+// 传 nil = 关闭（与未设置时逐字节一致）。
+type ResponsePacer interface {
+	WaitBeforeWrite() time.Duration
+}
+
+// cancelableResponsePacer 可选取消通知：客户端断开时实现方关闭 Done，让
+// streamWriter 立即结束帧间等待。保留 ResponsePacer 单方法契约，测试替身与
+// 非 HTTP 出口无需实现。
+type cancelableResponsePacer interface {
+	Done() <-chan struct{}
+}
+
+// WithResponsePacer 挂上响应整形器。与 WithKeepaliveInterval 正交：心跳只在
+// 上游静默时写注释帧，pacer 只在有帧待写时延迟；两者可同时开启。
+func WithResponsePacer(p ResponsePacer) StreamOption {
+	return func(o *streamOptions) {
+		if p != nil {
+			o.pacer = p
+		}
+	}
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -1084,6 +1116,12 @@ type streamWriter struct {
 	synthIdx       int
 	maxToolIdx     int
 	toolFinishSent bool
+
+	// pacer 响应整形器（issue #448；nil = 关闭）。framesWritten 记录已写出的
+	// 帧数：首帧不等待（TTFT 语义），后续帧与结束标记按 pacer 节奏延迟。
+	pacer         ResponsePacer
+	framesWritten int
+	paceCanceled  bool
 }
 
 // newStreamWriter 初始化 SSE 透传写入器（设置 SSE headers + 跨帧状态）。
@@ -1116,6 +1154,7 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 		tools:        newToolIndex(),
 		repair:       streamOptions2.markup,
 		maxToolIdx:   -1,
+		pacer:        streamOptions2.pacer,
 	}
 }
 
@@ -1159,14 +1198,27 @@ func (s *streamWriter) setWriteDeadline(deadline time.Time) {
 	_ = http.NewResponseController(s.w).SetWriteDeadline(deadline)
 }
 
-// writeSSE 原样写出一帧并 flush。
+// writeSSE 原样写出一帧 data: 并 flush；所有 data 帧（含 [DONE]、修复展开帧、
+// 合成帧和兜底 error 帧）都必须经过这里，才能共享响应整形。
 func (s *streamWriter) writeSSE(payload string) error {
+	s.paceFrame()
+
+	if s.paceCanceled {
+		return fmt.Errorf("%w: request canceled while pacing", errClientWrite)
+	}
+
 	return s.writeSegments("data: ", payload, "\n\n")
 }
 
 // writeSSEBytes 写出一帧已是 JSON 字节的载荷：直接写 []byte，省去
 // []byte→string 的整帧拷贝（流式高频路径每帧都会产生一份 json.Marshal 结果）。
 func (s *streamWriter) writeSSEBytes(payload []byte) error {
+	s.paceFrame()
+
+	if s.paceCanceled {
+		return fmt.Errorf("%w: request canceled while pacing", errClientWrite)
+	}
+
 	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
 
 	if _, err := io.WriteString(s.w, "data: "); err != nil {
@@ -1359,6 +1411,39 @@ func (s *streamWriter) expandMarkupCalls(obj map[string]any, calls []MarkupCall)
 	s.toolFinishSent = str == "tool_calls"
 
 	return out
+}
+
+// paceFrame 帧写出前的整形等待（issue #448）。首帧不等待（TTFT 等于上游自己的
+// TTFT）；后续帧（含结束标记与流尾兜底帧）按 pacer 返回的时长睡眠。
+// pacer 为 nil 或返回 0 时零开销——未配限速的密钥走的就是这条路径，
+// 逐字节与时序同改造前。
+func (s *streamWriter) paceFrame() {
+	if s.pacer == nil || s.framesWritten == 0 {
+		if s.framesWritten == 0 {
+			s.framesWritten++ // 首帧记账（不等候）
+		}
+
+		return
+	}
+
+	s.framesWritten++
+
+	if wait := s.pacer.WaitBeforeWrite(); wait > 0 {
+		if cancelable, ok := s.pacer.(cancelableResponsePacer); ok {
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+
+			select {
+			case <-cancelable.Done():
+				s.paceCanceled = true
+			case <-timer.C:
+			}
+
+			return
+		}
+
+		time.Sleep(wait)
+	}
 }
 
 // writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
@@ -1690,13 +1775,7 @@ func (s *streamWriter) flushData() (int, error) {
 func (s *streamWriter) finishSizeLimit() {
 	_ = s.writeRaw(`{"error":{"message":"upstream sse line exceeded size limit",` +
 		`"type":"upstream_error","code":"upstream_parse"}}`)
-	if _, err := io.WriteString(s.w, "data: [DONE]\n\n"); err != nil {
-		return
-	}
-
-	if s.fl != nil {
-		s.fl.Flush()
-	}
+	_ = s.writeSSE("[DONE]")
 }
 
 // finish 收尾：标记修复尾部回吐 + 空流兜底 error 帧 + 保证恰好一个 [DONE]。
@@ -1713,8 +1792,8 @@ func (s *streamWriter) finish(validFrames *int) error {
 	}
 
 	s.writeFinishFallback(*validFrames)
-	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if err := s.writeAll("data: [DONE]\n\n"); err != nil {
+	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）；与普通 data 帧共享整形预算。
+	if err := s.writeSSE("[DONE]"); err != nil {
 		return err
 	}
 

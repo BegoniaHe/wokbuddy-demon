@@ -16,6 +16,9 @@ type keyUsage struct {
 	id                        string
 	realm                     string
 	prompt, completion, total int64
+	// keys 该密钥所属存储（整形账本宿主）。nil = 不做响应整形
+	// （默认密钥/未启用命名密钥；issue #448）。
+	keys *apikey.Store
 }
 
 // keyUsageKey context 键类型（私有，避免跨包误用）。
@@ -31,7 +34,10 @@ func keyUsageFrom(ctx context.Context) *keyUsage {
 //   - 过期：401 泛化错误（与不存在/已撤销同口径）；
 //   - IP 未命中：403 ip_not_allowed，不回显来源 IP；
 //   - 配额耗尽：429 insufficient_quota，不带 Retry-After（生命周期配额不自动恢复）；
-//   - RPM/TPM/并发：沿用 429 + Retry-After。
+//   - 并发：429 concurrency_limit_exceeded + Retry-After（与 RPM/TPM 分开：
+//     并发是监管不是整形，客户把并发开太高时能自判降配，issue #448）；
+//   - RPM/TPM：保留 429 rate_limit_exceeded 出口（准入不再因它们拒绝，
+//     见 apikey.Acquire；该枚举值仍由未来可能的准入拒绝复用）。
 func writeKeyRejection(
 	w http.ResponseWriter, r *http.Request, reason apikey.RejectReason, retryAfter time.Duration,
 ) {
@@ -44,6 +50,9 @@ func writeKeyRejection(
 	case apikey.RejectQuotaExhausted:
 		writeKeyScopedError(w, r, http.StatusTooManyRequests,
 			"insufficient_quota", "rate_limit_error", "insufficient quota")
+	case apikey.RejectConcurrency:
+		writeLimitError(w, r, retryAfter,
+			"concurrency_limit_exceeded", "api key concurrency limit exceeded")
 	default:
 		writeKeyLimitError(w, r, retryAfter)
 	}
@@ -76,6 +85,8 @@ func writeKeyLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.
 }
 
 // writeLimitError 429 限流响应：Retry-After + 按入站协议编码错误体。
+// code 只进 OpenAI 错误体的 code 字段；Anthropic 信封没有 code 位，把 code 编进
+// message（客户端靠 message 区分拒绝类别，issue #448 并发/RPM 分离即靠此）。
 func writeLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.Duration, code, msg string) {
 	seconds := max(int((retryAfter+time.Second-1)/time.Second), 1)
 	w.Header().Set("Retry-After", strconv.Itoa(seconds))
@@ -88,7 +99,7 @@ func writeLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.Dur
 
 	if wantsAnthropicErrorBody(r) {
 		setAnthropicRequestID(w, r)
-		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", msg, "")
+		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", code+": "+msg, "")
 
 		return
 	}

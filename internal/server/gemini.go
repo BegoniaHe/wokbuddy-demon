@@ -874,7 +874,12 @@ type geminiResponder struct {
 	w         http.ResponseWriter
 	model     string
 	keepalive time.Duration
+	// pacer 响应整形器（issue #448；nil = 关闭）。
+	pacer upstream.ResponsePacer
 }
+
+// setStreamPacer 挂响应整形器（issue #448；见 streamPacerSetter）。
+func (g *geminiResponder) setStreamPacer(p upstream.ResponsePacer) { g.pacer = p }
 
 func (g *geminiResponder) JSON(status int, body any) {
 	writeJSON(g.w, status, geminiResponseFromOpenAI(body, g.model))
@@ -891,7 +896,7 @@ func (g *geminiResponder) Stream(
 ) error {
 	writer := newGeminiStreamWriter(g.w, g.model)
 
-	opts := streamHintOptions(g.keepalive, repair, onErrFrame)
+	opts := streamHintOptions(g.keepalive, g.pacer, repair, onErrFrame)
 	if err := upstream.StreamHint(writer, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}

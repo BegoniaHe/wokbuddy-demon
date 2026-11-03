@@ -1755,7 +1755,12 @@ type anthropicResponder struct {
 	options   anthropicResponseOptions
 	// prelude 响应前部的服务端工具块（server_tool_use / web_search_tool_result）。
 	prelude []any
+	// pacer 响应整形器（issue #448；nil = 关闭）。
+	pacer upstream.ResponsePacer
 }
+
+// setStreamPacer 挂响应整形器（issue #448；见 streamPacerSetter）。
+func (r *anthropicResponder) setStreamPacer(p upstream.ResponsePacer) { r.pacer = p }
 
 // JSON 写出非流式 Anthropic Message。
 func (r *anthropicResponder) JSON(status int, body any) {
@@ -1785,7 +1790,7 @@ func (r *anthropicResponder) Stream(
 	anthropicStreamWriter2 := newAnthropicStreamWriterWithOptions(r.w, r.model, r.options)
 	anthropicStreamWriter2.prelude = r.prelude
 
-	opts := streamHintOptions(r.keepalive, repair, onErrFrame)
+	opts := streamHintOptions(r.keepalive, r.pacer, repair, onErrFrame)
 	if err := upstream.StreamHint(anthropicStreamWriter2, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}
