@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,15 +22,23 @@ import (
 func TestChatStreamCloseDrainsTailSoConnIsReused(t *testing.T) {
 	t.Parallel()
 
-	// 结束块的延迟要小于收尾预算（100ms），又足以让客户端在它到达前停读。
-	const tailDelay = 20 * time.Millisecond
+	// [DONE] 之后的 chunked 结束块由测试放行：让它落在 Close 开始收尾之后
+	// （真机形态），而不是「停读前已缓冲」的巧合。
+	releaseTail := make(chan struct{})
+
+	var releaseOnce sync.Once
+
+	release := func() { releaseOnce.Do(func() { close(releaseTail) }) }
+
+	// defer 先于 t.Cleanup 执行：断言失败时也要放行 handler，否则 server.Close 会卡住。
+	defer release()
 
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, "data: {\"id\":\"x\"}\n\ndata: [DONE]\n\n")
 		w.(http.Flusher).Flush()
 		// [DONE] 之后上游才发 chunked 结束块（真机实测为十几毫秒）。
-		time.Sleep(tailDelay)
+		<-releaseTail
 	}))
 	server.Start()
 	t.Cleanup(server.Close)
@@ -55,6 +64,13 @@ func TestChatStreamCloseDrainsTailSoConnIsReused(t *testing.T) {
 		if serr := StreamHint(httptest.NewRecorder(), rc, nil); serr != nil {
 			t.Fatalf("request %d: stream: %v", i, serr)
 		}
+
+		// 读循环已停在 [DONE]：结束块稍后在 Close 收尾期间才到达（真机形态）。
+		// 1ms 对 100ms 收尾预算留了两个数量级余量，也不靠精确睡眠。
+		go func() {
+			time.Sleep(time.Millisecond)
+			release()
+		}()
 
 		if cerr := rc.Close(); cerr != nil {
 			t.Fatalf("request %d: close: %v", i, cerr)
@@ -99,6 +115,31 @@ func TestMonitorBodyCloseIsIdempotent(t *testing.T) {
 
 	if got := rc.closes.Load(); got != 1 {
 		t.Fatalf("underlying close called %d times, want 1", got)
+	}
+}
+
+// TestMonitorBodyCloseDoesNotReadConcurrently keepalive 收尾（streamWithKeepalive）
+// 是「先 Close 解阻塞、再等 goroutine 退出」：Close 时读 goroutine 仍停在底流上。
+// 读尾不得再并发读同一个 body——http 响应体不支持并发 Read。
+func TestMonitorBodyCloseDoesNotReadConcurrently(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	rc := &blockingBody{ctx: ctx, started: make(chan struct{})}
+	body := monitorBody(rc, time.Minute, cancel)
+
+	go func() { _, _ = body.Read(make([]byte, 8)) }()
+	// 等第一个 Read 真正停在底流上再收尾。
+	<-rc.started
+
+	if err := body.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if got := rc.reads.Load(); got != 1 {
+		t.Fatalf("underlying reads=%d want 1（读尾与在途 Read 并发）", got)
 	}
 }
 
@@ -202,3 +243,22 @@ func (b *closeCountingBody) Close() error {
 
 	return nil
 }
+
+// blockingBody 首次 Read 停住并放出 started，直到 ctx 取消；统计底流被读了几次。
+type blockingBody struct {
+	ctx     context.Context
+	started chan struct{}
+	reads   atomic.Int64
+}
+
+func (b *blockingBody) Read([]byte) (int, error) {
+	if b.reads.Add(1) == 1 {
+		close(b.started)
+	}
+
+	<-b.ctx.Done()
+
+	return 0, b.ctx.Err()
+}
+
+func (b *blockingBody) Close() error { return nil }

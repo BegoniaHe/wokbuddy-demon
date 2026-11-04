@@ -16,6 +16,9 @@ type idleMonitoringBody struct {
 	rc       io.ReadCloser
 	mu       sync.Mutex
 	lastRead time.Time
+	// readMu 串行化对底流的 Read：http 响应体不支持并发读，Close 的读尾与
+	// keepalive 收尾时仍停在底流上的读 goroutine 必须互斥。
+	readMu   sync.Mutex
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	cancel   context.CancelFunc
@@ -25,7 +28,10 @@ type idleMonitoringBody struct {
 }
 
 func (b *idleMonitoringBody) Read(p []byte) (int, error) {
+	b.readMu.Lock()
 	n, err := b.rc.Read(p)
+	b.readMu.Unlock()
+
 	if n > 0 {
 		b.mu.Lock()
 		b.lastRead = time.Now()
@@ -67,17 +73,27 @@ const (
 // drainTailThenClose 限时读掉流尾：读到 EOF 才 cancel + Close，让连接回池。
 // 超时说明流还没结束（客户端中途断开/换号），取消 context 并关闭底流以解除
 // 阻塞中的 Read，读尾 goroutine 随之退出。
+//
+// 读尾不能与在途 Read 并发：keepalive 收尾（streamWithKeepalive）会先 Close
+// 解阻塞，此刻它的读 goroutine 仍停在同一个底流上，而 http 响应体不支持并发
+// Read。争不到读锁就按旧路径立即取消/关闭，让那个 Read 返回。
 func (b *idleMonitoringBody) drainTailThenClose() error {
+	if !b.readMu.TryLock() {
+		b.cancel()
+
+		return b.rc.Close()
+	}
+
 	done := make(chan struct{})
 	stop := make(chan struct{})
 
 	go func() {
 		defer close(done)
+		defer b.readMu.Unlock()
 
 		buf := make([]byte, closeDrainLimit)
-		remaining := closeDrainLimit
 
-		for remaining > 0 {
+		for remaining := closeDrainLimit; remaining > 0; {
 			// 直接读底流：不经过 b.Read，避免把流尾计入活跃时间。
 			n, err := b.rc.Read(buf[:remaining])
 			remaining -= n
@@ -85,8 +101,8 @@ func (b *idleMonitoringBody) drainTailThenClose() error {
 			if err != nil {
 				return
 			}
-			// 收尾失败（超时）后不再继续读：不假设底流的 Read 会被定时器打断，
-			// 靠每次读返回后的 stop 让 goroutine 落到出口。
+			// 超时后不再继续读：底流的 Read 不保证能被 cancel/Close 打断
+			// （非 http body），只能在每次读返回后从出口退出。
 			select {
 			case <-stop:
 				return
@@ -100,18 +116,15 @@ func (b *idleMonitoringBody) drainTailThenClose() error {
 
 	select {
 	case <-done:
-		close(stop)
-		b.cancel()
-
-		return b.rc.Close()
 	case <-timer.C:
-		b.cancel()
-		err := b.rc.Close()
-
 		close(stop)
-
-		return err
 	}
+
+	// 读到 EOF 时 Transport 已把连接放回空闲池；超时则取消 context 让阻塞中的
+	// Read 返回，读尾 goroutine 随之落到出口。两种情况都要关底流。
+	b.cancel()
+
+	return b.rc.Close()
 }
 
 func (b *idleMonitoringBody) idleFor() time.Duration {
