@@ -7,9 +7,7 @@
 package upstream
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/url"
@@ -268,28 +266,6 @@ func (c *Client) checkinHeaders(a *auth.Auth) map[string]string {
 	}
 
 	return nil
-}
-
-// UUID version/variant 位掩码（RFC 4122）。
-const (
-	uuidVersionMask  = 0x0f
-	uuidVariantMask  = 0x3f
-	uuidVariantBits  = 0x80
-	uuidVersion4Bits = 0x40
-)
-
-// deriveUUIDv4 从任意种子稳定派生 UUIDv4 形态字符串（8-4-4-4-12，version=4、
-// variant=10xx）。用于设备/会话等需要跨重启稳定、但输出必须符合官方 UUID
-// 字符集与版本位的标识；种子相同则输出恒同。
-func deriveUUIDv4(seed string) string {
-	sum := sha256.Sum256([]byte(seed))
-	b := sum[:16]
-	b[6] = b[6]&uuidVersionMask | uuidVersion4Bits
-	b[8] = b[8]&uuidVariantMask | uuidVariantBits
-
-	h := hex.EncodeToString(b)
-
-	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
 // applyHeaders 出站头族唯一构造入口：按 surface 分发到 chat 头族或轻头族。
@@ -788,10 +764,8 @@ func (*Client) injectConversationHeaders(req *http.Request, uid string, meta Cha
 	// 上游渠道校验要求 X-Conversation-ID 恒在（官方客户端每次请求都发）。
 	// 客户端未声明会话时，用 uid 隔离的 CacheKeyID 稳定派生 UUIDv4：该头在部分
 	// 后端就是前缀缓存槽，逐请求随机等于每轮全冷；uid 入种子保证跨账号不共槽。
-	if convID == "" {
-		if src := cacheKeySource(meta.ConversationID, meta.CacheKeyID); src != "" {
-			convID = session.UUIDv4For(uid + "|" + src)
-		}
+	if convID == "" && meta.CacheKeyID != "" {
+		convID = session.UUIDv4For(uid + "|" + meta.CacheKeyID)
 	}
 	// 无任何会话标识：保持「新会话」语义，每次生成新 UUIDv4（官方 session.id 同形态）。
 	if convID == "" {

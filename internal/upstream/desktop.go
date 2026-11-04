@@ -134,7 +134,7 @@ func (c *Client) desktopDomain(a *auth.Auth) string {
 // deriveID 由 uid 稳定派生一个 UUIDv4 形态设备标识（machineId/sessionId 等复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
 func deriveID(a *auth.Auth, salt string) string {
-	return deriveUUIDv4(salt + ":" + a.UID)
+	return session.UUIDv4For(salt + ":" + a.UID)
 }
 
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。

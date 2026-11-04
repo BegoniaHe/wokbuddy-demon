@@ -12,6 +12,7 @@ package upstream
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"strings"
 )
@@ -99,7 +100,7 @@ var chatHeaderTailOrder = []string{
 }
 
 // chatHeaderCasing 小写头名 → 官方线上大小写。未列出的头保持原始大小写。
-func chatHeaderCasing() map[string]string {
+var chatHeaderCasingMap = func() map[string]string {
 	casing := make(map[string]string, len(chatHeaderOrder)+len(chatHeaderOptionalOrder)+len(chatHeaderTailOrder))
 	for _, name := range chatHeaderOrder {
 		casing[strings.ToLower(name)] = name
@@ -114,7 +115,17 @@ func chatHeaderCasing() map[string]string {
 	}
 
 	return casing
-}
+}()
+
+// chatHeaderKnownSet 已捕获 + 本仓可选的头名（小写）；尾部四头由 isTailHeader 处理。
+var chatHeaderKnownSet = func() map[string]bool {
+	known := make(map[string]bool, len(chatHeaderCasingMap))
+	for key := range chatHeaderCasingMap {
+		known[key] = true
+	}
+
+	return known
+}()
 
 // headerLine 头块里的一行：original 保留原始头名，value 为冒号后的值（去前导空格）。
 type headerLine struct {
@@ -132,6 +143,12 @@ type parsedChatHeader struct {
 // parseChatHeaderBlock 解析完整头块（含结尾空行）；ok=false 表示不是 CLI chat
 // 或无法解析，调用方必须回写原始字节。
 func parseChatHeaderBlock(block []byte) (parsedChatHeader, bool) {
+	// 完整头块也走同一上限：超过 chatHeaderBlockLimit 一律按解析失败 fail-open，
+	// 避免异常连接把内存拖大。
+	if len(block) > chatHeaderBlockLimit {
+		return parsedChatHeader{}, false
+	}
+
 	if !bytes.HasPrefix(block, []byte(chatRequestLine)) || !bytes.HasSuffix(block, []byte("\r\n\r\n")) {
 		return parsedChatHeader{}, false
 	}
@@ -210,8 +227,8 @@ func rewriteChatHeaderBlock(block []byte) ([]byte, bool) {
 		return nil, false
 	}
 
-	casing := chatHeaderCasing()
-	known := chatHeaderKeySet()
+	casing := chatHeaderCasingMap
+	known := chatHeaderKnownSet
 	emitted := make(map[string]bool, len(parsed.headers))
 
 	var out strings.Builder
@@ -248,18 +265,6 @@ func rewriteChatHeaderBlock(block []byte) ([]byte, bool) {
 	}
 
 	return []byte(out.String()), true
-}
-
-// chatHeaderKeySet 已捕获 + 本仓可选的头名（小写）；尾部四头由 isTailHeader 处理。
-func chatHeaderKeySet() map[string]bool {
-	casing := chatHeaderCasing()
-
-	known := make(map[string]bool, len(casing))
-	for key := range casing {
-		known[key] = true
-	}
-
-	return known
 }
 
 func isTailHeader(key string) bool {
@@ -362,6 +367,10 @@ func writeAll(conn net.Conn, data []byte) error {
 		written, err := conn.Write(data)
 		if err != nil {
 			return err
+		}
+		// net.Conn 允许短写，但不允许零写成功；零写继续循环会无限自旋。
+		if written <= 0 {
+			return io.ErrShortWrite
 		}
 
 		data = data[written:]

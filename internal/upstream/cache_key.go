@@ -28,7 +28,8 @@ import (
 //   - 跨账号复用同一 cache key 会让上游命中错账号的前缀缓存、泄露对方对话，故 uid 是硬隔离因子
 //
 // 入参 uid 为账号 UID（空则用 "-"，但仍会注入键；调用方应保证传真实 UID）。
-// 入参 conversationID 为网关解析出的会话标识（body 里没有 conversation_id 时用它做哈希源）。
+// 入参 conversationID 是缓存槽的会话段来源（见 cacheKeySource：客户端声明的会话 →
+// 网关派生的 CacheKeyID），body 里没有 conversation_id 时用它做哈希源。
 // 两源都空时 convHex 为定值（每次新会话不复用前缀，但仍保留账号隔离段）。
 func injectPromptCacheKeyObj(obj map[string]any, uid, conversationID string) {
 	// 优先级 1：客户端已显式带 key → 绝不覆盖。

@@ -431,7 +431,10 @@ func validateEmitValues(emit *Emit) error {
 // validateStainless x-stainless-* 七值全部必填（#456）：官方 CLI chat 恒发，
 // 缺任一项都无法复刻。
 func validateStainless(stainless *Stainless) error {
-	for key, value := range stainlessValues(stainless) {
+	values := stainlessValues(stainless)
+	// 按固定字段顺序校验：map 迭代顺序随机会让同一份坏 profile 报不同的字段。
+	for _, key := range stainlessFieldOrder {
+		value := values[key]
 		if strings.TrimSpace(value) == "" {
 			return fmt.Errorf("emit.stainless.%s 不能为空: %w", key, errInvalidProfile)
 		}
@@ -442,6 +445,11 @@ func validateStainless(stainless *Stainless) error {
 	}
 
 	return nil
+}
+
+// stainlessFieldOrder stainless 七个 JSON 键的稳定顺序（错误信息与测试断言用）。
+var stainlessFieldOrder = []string{
+	"arch", "lang", "os", "packageVersion", "retryCount", "runtime", "runtimeVersion",
 }
 
 // stainlessValues 把结构体字段映射回 JSON 键，供必填与安全边界校验共用。

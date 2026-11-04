@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -261,6 +262,34 @@ func TestHeaderOrderConnFailOpenUnparseable(t *testing.T) {
 
 	if strings.Contains(raw.written.String(), "Connection: keep-alive") {
 		t.Error("解析失败后不应继续重写该连接")
+	}
+}
+
+// TestRewriteChatHeaderBlockOverLimitFailsOpen 完整但超过上限的头块必须原样透传
+// （解析器自己也要守上限，不能只靠跨写缓冲那条路径）。
+func TestRewriteChatHeaderBlockOverLimitFailsOpen(t *testing.T) {
+	t.Parallel()
+
+	huge := chatRequestLine + "X-Huge: " + strings.Repeat("a", chatHeaderBlockLimit) + "\r\n\r\n"
+
+	if _, ok := rewriteChatHeaderBlock([]byte(huge)); ok {
+		t.Fatal("超限头块不应重写")
+	}
+}
+
+// zeroWriteConn 模拟违反 net.Conn 契约、写成功但返回 0 字节的连接。
+type zeroWriteConn struct {
+	net.Conn
+}
+
+func (zeroWriteConn) Write([]byte) (int, error) { return 0, nil }
+
+// TestWriteAllRejectsZeroWrite 零写不得让 writeAll 无限自旋。
+func TestWriteAllRejectsZeroWrite(t *testing.T) {
+	t.Parallel()
+
+	if err := writeAll(zeroWriteConn{}, []byte("x")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("writeAll=%v want io.ErrShortWrite", err)
 	}
 }
 

@@ -103,7 +103,7 @@
 | `loginPlatform` | 否 | OAuth `platform=` 参数 | `plugin/auth/state` 调用处 |
 | `loginUA` | 否 | 登录流 UA | 与 `desktopUA` 同源（`restOperations` 拦截器） |
 | `stainless` | 是（schema 2） | `x-stainless-*` 七个头（`arch` / `lang` / `os` / `packageVersion` / `retryCount` / `runtime` / `runtimeVersion`） | 打包进 CLI 的 OpenAI SDK bundle（`cli/dist/lazy-lite-wb/<hash>.mjs` 的 `buildHeaders`）；`runtimeVersion` 取自 Electron 内置 Node 版本串；需一条 `evidence.stainless` |
-| `tls` | 否（`upstream.tls_fingerprint=node` 时必需） | 出站 ClientHello 数值段 | 2026-11-04 官方 Win32 抓包（`.tmp/workbuddy-diff/2026-11-04-clienthello-capture.md`）；数值段来源是抓包而非包内字面量，schema 不强制 `evidence.tls` |
+| `tls` | 否（`upstream.tls_fingerprint=node` 时必需） | 出站 ClientHello 数值段 | 2026-11-04 官方 Win32 抓包；数值段来源是抓包而非包内字面量，schema 不强制 `evidence.tls` |
 
 `chatUA` 的 chat 实际由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
 `UserAgentHttpInterceptor.buildUserAgent` 构造；三段依次是
