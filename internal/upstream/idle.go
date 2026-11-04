@@ -19,6 +19,9 @@ type idleMonitoringBody struct {
 	stopOnce sync.Once
 	stopCh   chan struct{}
 	cancel   context.CancelFunc
+	// closeOnce/closeErr 让 Close 幂等：透传链上多层收尾可能重复关同一个 body。
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (b *idleMonitoringBody) Read(p []byte) (int, error) {
@@ -36,12 +39,79 @@ func (b *idleMonitoringBody) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Close 停掉后台 goroutine、取消请求 context、关闭底流，保证无泄漏。
+// Close 停掉后台 goroutine，先限时读掉流尾再取消请求 context、关闭底流。
+//
+// 上游是 chunked 响应：`[DONE]` 之后还有结束块，而读循环在 `[DONE]` 处就停了。
+// Go 的 Transport 只在 body 读到 EOF 时才把连接放回空闲池；先 cancel/Close 会
+// 走 earlyClose 丢掉 persistConn，每个流式请求都要重新 TCP+TLS（经代理还要
+// 重建隧道）。所以先 drain：读到 EOF 才 cancel + Close。
+//
+// 幂等：只执行一次并缓存首次结果。
 func (b *idleMonitoringBody) Close() error {
-	b.stopOnce.Do(func() { close(b.stopCh) })
-	b.cancel()
+	b.closeOnce.Do(func() {
+		b.stopOnce.Do(func() { close(b.stopCh) })
+		b.closeErr = b.drainTailThenClose()
+	})
 
-	return b.rc.Close()
+	return b.closeErr
+}
+
+const (
+	// closeDrainLimit Close 前最多读掉的流尾字节数：只覆盖 chunked 结束块等收尾
+	// 字节，不把一个还没结束的流读成完整响应。
+	closeDrainLimit = 4 << 10
+	// closeDrainTimeout 等待流尾 EOF 的上限。
+	closeDrainTimeout = 100 * time.Millisecond
+)
+
+// drainTailThenClose 限时读掉流尾：读到 EOF 才 cancel + Close，让连接回池。
+// 超时说明流还没结束（客户端中途断开/换号），取消 context 并关闭底流以解除
+// 阻塞中的 Read，读尾 goroutine 随之退出。
+func (b *idleMonitoringBody) drainTailThenClose() error {
+	done := make(chan struct{})
+	stop := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		buf := make([]byte, closeDrainLimit)
+		remaining := closeDrainLimit
+
+		for remaining > 0 {
+			// 直接读底流：不经过 b.Read，避免把流尾计入活跃时间。
+			n, err := b.rc.Read(buf[:remaining])
+			remaining -= n
+
+			if err != nil {
+				return
+			}
+			// 收尾失败（超时）后不再继续读：不假设底流的 Read 会被定时器打断，
+			// 靠每次读返回后的 stop 让 goroutine 落到出口。
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+
+	timer := time.NewTimer(closeDrainTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		close(stop)
+		b.cancel()
+
+		return b.rc.Close()
+	case <-timer.C:
+		b.cancel()
+		err := b.rc.Close()
+
+		close(stop)
+
+		return err
+	}
 }
 
 func (b *idleMonitoringBody) idleFor() time.Duration {
