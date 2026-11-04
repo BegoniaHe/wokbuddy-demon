@@ -9,6 +9,9 @@ ARG VERSION=dev
 # 不把发布的构建绑到第三方镜像的可用性上。
 ARG GOPROXY=""
 COPY go.mod ./
+# go.mod 用 replace 把 uTLS 指向仓库内的 internal/vendor/utls；解析模块图必须先有
+# 被替换模块的 go.mod，否则下面的 go mod download 会因该目录缺失而失败。
+COPY internal/vendor/utls/go.mod ./internal/vendor/utls/
 RUN if [ -n "$GOPROXY" ]; then go env -w GOPROXY="$GOPROXY"; fi && go mod download
 COPY . .
 # 一次编译全部二进制（工具进镜像，容器内可直接跑脚本）。全部 -trimpath -s -w。
