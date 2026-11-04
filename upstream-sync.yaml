@@ -14,28 +14,30 @@ upstream:
   branch: main
 
 last_audited:
-  commit: f6c4a45197e23d034881deaeaa33c43ac9c9724f
-  audited_at_utc: 2026-11-03T09:14:14Z
+  commit: 77d4762f88c87b3235c0d0467cae3bdf7a4e6d4f
+  audited_at_utc: 2026-11-04T08:23:16Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
     from: 2026-11-02
-    to: 2026-11-03
-    non_merge_commits: 4
+    to: 2026-11-04
+    non_merge_commits: 12
+    merge_commits: 5
   dispositions:
-    issue: 4
-    revisit: 0
-    skip: 2
+    issue: 1
+    revisit: 1
+    skip: 15
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/446
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/447
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/454
   note: >-
-    2026-11-03 审计 edcfdf80..f6c4a451（6 条提交，含两条 PR squash 合入，实际内容
-    4 项）。官方版本未变（cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901），
-    沿用本地已解包 Win32 app-asar。新开 #446：cockpit 导入丢 enterprise_id 且
-    importCheckin 无企业门控（静态 Key 判据扩大标 live 证据并入附注）。新开 #447：
-    effort 降级把 off 当可选档可静默关思考，官方 deriveReasoningCapabilities 明确
-    filter 掉 off。autobot workflow 停定时按 skip（参考 fork 专属基础设施）。
-    审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
+    2026-11-04 审计 f6c4a451..77d4762f（17 条提交：12 条内容 + 5 条 PR 合入）。
+    官方版本未变（cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901），
+    沿用本地已解包 Win32 app-asar 并重跑 protocol_sweep。新开 #454：流式读取在
+    [DONE] 处停读、关闭时先 cancel context 且不读流尾，上游连接始终无法回池复用
+    （本仓无参考提交里的 proxypool，该部分不适用）。到期加权窗口默认 168h 记
+    revisit：本仓权重是 weightOf×虚拟实例数、不存在参考提交的反降权，窗口是否过窄
+    需本仓真实批次分布。reqlog 超长行、心跳帧粘连、客户端断开归因、面板特性等按
+    skip：触发形态在本仓架构下不可达或已有同口径实现。审计不产生实现提交，游标
+    推进是独立的 chore(sync) 元数据提交。

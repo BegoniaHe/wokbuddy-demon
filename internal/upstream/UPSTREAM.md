@@ -49,7 +49,12 @@ global 5.9.4），确认 2 个缺口并开 Issue #432（续写 usage 把 prompt 
 `revisit`。2026-11-02 续审 `4d7d1e67..edcfdf80`（22 条非 merge + 2 条 merge；官方
 Win32 仍是 cn 5.9.3 / global 5.9.4），新开 #438（`/v3/config` 缺 `Connection: close`）、
 #439（积分保底不能按域覆盖）；别名通配与面板默认拒绝分别链到既有 #436、#437。
-后续审计从 `edcfdf80` 之后开始。
+2026-11-03 续审 `edcfdf80..f6c4a451`（4 项内容；官方 Win32 未变），新开 #446（cockpit
+导入丢 `enterprise_id` 且 importCheckin 无企业门控）、#447（effort 降级把 `off` 当可选档）。
+2026-11-04 续审 `f6c4a451..77d4762f`（12 条内容 + 5 条 PR 合入；官方 Win32 未变），
+新开 #454：流式读取在 `[DONE]` 处停读、关闭时先取消 context 且不读流尾，上游连接
+无法回池复用；到期加权窗口默认值记 `revisit`（本仓权重模型与参考 fork 不同，需本仓
+真实批次分布），其余按 `skip` 落账。后续审计从 `77d4762f` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -217,7 +222,7 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 - 上游远端：`upstream` → `https://github.com/misakano7545/workbuddy2api-panel.git`
   （branch `main`）。首次使用执行 `git fetch --prune upstream`。
 - 审计游标（逻辑基线，位于参考 fork 历史中，非本仓库祖先）：
-  `33ce2f15025c59e38b71da5b92cde403a2ca35d1`（2026-10-26 建立）。
+  `77d4762f88c87b3235c0d0467cae3bdf7a4e6d4f`（2026-11-04 推进）。
 - 正式审计前先刷新官方 Win32 包并跑 `reverse-workbuddy` 的
   `download_latest.mjs` / `protocol_sweep.mjs`；官方静态包缺失时停止审计。
 - 常用命令：
@@ -232,4 +237,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-10-26（参考 fork 审计基线 `33ce2f1`；窗口 `4662949..33ce2f1` 开 Issue #293–#297；不直接吸收）。_
+_最近更新：2026-11-04（参考 fork 审计基线 `77d4762f`；窗口 `f6c4a451..77d4762f` 开 Issue #454；不直接吸收）。_
