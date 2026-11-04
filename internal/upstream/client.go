@@ -2500,7 +2500,11 @@ func (c *Client) chatStreamAt(
 
 		log.Printf("ERR: [upstream] chat_stream acct=%s origin=%s: transport error: %v",
 			logfmt.Label(out.Account.UID, out.Account.NicknameValue()), base, err)
-		roundTripCloseIdle(chatHTTP.Transport)
+		// 调用方自己取消（客户端断连/超时）不说明连接坏了：这时清空闲池会把
+		// 其他请求可复用的连接一并丢掉。真正的传输错误才清。
+		if ctx.Err() == nil {
+			roundTripCloseIdle(chatHTTP.Transport)
+		}
 
 		return chatAttempt{err: fmt.Errorf("ChatStreamContext: %w", err), replay: true}
 	}
