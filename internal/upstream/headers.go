@@ -368,7 +368,7 @@ func (c *Client) chatFamilyHeaders(
 	// X-Device-Token：chat 面注入（见 chatSurfaceOverrides），agenttool 四路与
 	// 其余面不注入（真机口径见 #376）；签到路径的注入见 Client.checkinHeaders。
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
-	c.injectConversationHeaders(req, meta)
+	c.injectConversationHeaders(req, account.UID, meta)
 
 	c.chatSurfaceOverrides(srf, req, account)
 }
@@ -624,8 +624,11 @@ func billingAcceptLanguage(a *auth.Auth) string {
 // conversationRequestID——真机两者形态与取值都不同）。
 // messageID（消息级，每条独立）由 ChatHeaders 内部生成，无需外部可见。
 type ChatMeta struct {
-	ConversationID        string // X-Conversation-ID：入站头/body 提取值，非空时优先
-	ConversationHeaderID  string // X-Conversation-ID 出站兜底：handler 合成；仅进出站头，不进 prompt cache key。为空时最终生成 UUIDv4
+	ConversationID string // X-Conversation-ID：客户端声明的会话 ID（入站头/body），非空时原值透传
+	// CacheKeyID 网关派生的会话键（sessKey 或内容派生键）：无客户端会话 ID 时，
+	// prompt_cache_key 的会话段与出站 X-Conversation-ID 都由它 + 账号 uid 稳定派生。
+	// 与 ConversationID 分开：头是「客户端声明的会话」，缓存槽是「网关认的同一会话」。
+	CacheKeyID            string
 	ConversationRequestID string // X-Conversation-Request-ID：聚合主键，必发
 	RootRequestID         string // X-Root-Request-ID：入站透传值，空则回落 conversationRequestID
 	ParentConversationID  string // X-Parent-Conversation-ID：入站透传值，空则不发
@@ -711,9 +714,10 @@ func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
 // 头族分四层，各司其职：
-//   - X-Conversation-ID：会话级，多轮稳定（body 的 conversationId）。透传客户端
-//     原值优先；handler 未给会话 ID 时用 ConversationHeaderID 兜底，再空则生成
-//     UUIDv4（官方 session.id = crypto.randomUUID()）——上游渠道校验要求该头恒在。
+//   - X-Conversation-ID：会话级，多轮稳定。客户端声明（body conversationId）→
+//     原值透传；客户端没声明 → 由 uid + CacheKeyID 稳定派生 UUIDv4（部分上游后端
+//     以该头作为前缀缓存槽，逐请求随机会让缓存永不命中；形态仍是官方 UUIDv4）；
+//     两者皆空 → 生成新 UUIDv4（新会话语义）。上游渠道校验要求该头恒在。
 //   - X-Conversation-Request-ID：**对话轮级聚合主键**，必发。一次 user send 内的
 //     所有 tool call/重试/换号/降级复用同一个 → 后台按它聚合成一条（不再碎片化）。
 //   - X-Conversation-Message-ID = X-Request-ID：消息级，每条独立（UUIDv7 32 hex）。
@@ -728,7 +732,7 @@ func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 //     本网关按实际出站 conversationId（含 UUIDv4 兜底）稳定派生 v7 形态 UUID。
 //
 //nolint:gocritic // ChatMeta 值传递保持公开 API 简单；头族注入线性展开。
-func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
+func (*Client) injectConversationHeaders(req *http.Request, uid string, meta ChatMeta) {
 	convReqID := meta.ConversationRequestID
 	if convReqID == "" {
 		// 零值 meta（直接调 ChatHeaders 的调用方/测试）也要保证聚合主键必发：
@@ -739,12 +743,15 @@ func (*Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	messageID := session.NewUUIDv7Hex()
 
 	convID := meta.ConversationID
-	if convID == "" {
-		convID = meta.ConversationHeaderID
-	}
 	// 上游渠道校验要求 X-Conversation-ID 恒在（官方客户端每次请求都发）。
-	// 客户端未给会话 ID 时用 UUIDv4 兜底（官方 session.id = crypto.randomUUID()）；
-	// 只影响出站头，不覆盖 ConversationID（prompt cache key 的源）。
+	// 客户端未声明会话时，用 uid 隔离的 CacheKeyID 稳定派生 UUIDv4：该头在部分
+	// 后端就是前缀缓存槽，逐请求随机等于每轮全冷；uid 入种子保证跨账号不共槽。
+	if convID == "" {
+		if src := cacheKeySource(meta.ConversationID, meta.CacheKeyID); src != "" {
+			convID = session.UUIDv4For(uid + "|" + src)
+		}
+	}
+	// 无任何会话标识：保持「新会话」语义，每次生成新 UUIDv4（官方 session.id 同形态）。
 	if convID == "" {
 		convID = session.NewUUIDv4()
 	}

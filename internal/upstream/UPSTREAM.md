@@ -96,7 +96,10 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 - 官方 CLI chat 拦截器与 daemon 网关都不发 `Origin` / `Referer` / `X-Machine-Id` / `X-Session-Id`；本仓库的 `CommonHeaders` 同样不注入，只有 web 端点按自身契约构造 `Origin` / `Referer`。
 - chat UA 由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 构造；第二段是 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`），显式 `client_version` / `cli_version` 覆盖时同样按 realm 取品牌；`/v2/report` 的 UA 是 desktop surface，两者不可混用。
 - 401 同号 refresh + replay；refresh 401/403 映射会话失效；同账号/同 RT refresh 单飞（60s 按需复用）。
-- 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端没给会话 ID 时生成 UUIDv4（不影响 prompt cache key）。
+- 出站 `X-Conversation-ID` / `acp-connection-id` 恒发：客户端声明会话时原值透传；未声明时由
+  `uid + CacheKeyID`（粘性会话键，或 content 派生的会话键）确定性生成 UUIDv4——同一账号同一会话
+  跨轮稳定。部分上游后端以该头作为前缀缓存槽，逐请求随机会让缓存永不命中；`prompt_cache_key`
+  的会话段与出站头共用同一来源。客户端完全无会话标识时每次生成新 UUIDv4（新会话语义）。
   `acp-connection-id` 是会话级**带连字符 UUIDv7**（真机主/辅助请求同值、version=7、时间戳前缀可解），
   按 conversationId 稳定派生、前缀取进程启动时刻前 1 小时内的确定性偏移；主请求的 `X-Conversation-ID`
   真机实测是 v4（辅助请求才是 v7），故该头兜底**保持 v4**（#372）。

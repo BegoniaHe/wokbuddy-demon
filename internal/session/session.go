@@ -776,6 +776,27 @@ func rawJSONString(raw []byte) string {
 // 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
 const derivedKeyPrefix = "d-"
 
+// DeriveCacheKey 仅供 prompt_cache_key / 出站 X-Conversation-ID 的会话段使用：
+// 与 ExtractSession 的第 6 项同源（system + 首条 user 的哈希），但**不设 user_id 闸**。
+//
+// 为什么需要它：ExtractSession 对带 user_id 的请求返回空串，那是「不把 user 钉到某个
+// 账号」的粘性契约；空串会让 prompt_cache_key 退化成每账号一个常量槽
+// （buildCacheKey(uid, "")），同账号上多段对话互相覆盖前缀缓存，出站会话头也只能逐
+// 请求随机。缓存槽按对话隔离与账号绑定是两件事：本函数只影响前者，粘性仍看
+// ExtractSession。
+func DeriveCacheKey(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+
+	var probe sessionProbe
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return ""
+	}
+
+	return deriveKey(probe.Messages)
+}
+
 // deriveKey 从 messages 原始 JSON 派生稳定会话键：SHA-256(system 文本 + 首条 user
 // 文本) 前 16 字节。
 //

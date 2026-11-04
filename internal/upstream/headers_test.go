@@ -19,29 +19,42 @@ var (
 	uuidV432HeaderPattern = regexp.MustCompile(`^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 )
 
-// TestConversationHeaderFallback 无客户端 conversationId 时，出站头使用
-// ConversationHeaderID 兜底，并同步派生 Acp-Connection-Id。
+// TestConversationHeaderFallback 无客户端 conversationId 时，出站头由
+// CacheKeyID + 账号 uid 稳定派生 UUIDv4，并同步派生 Acp-Connection-Id。
 func TestConversationHeaderFallback(t *testing.T) {
 	t.Parallel()
 
 	client := New()
 
-	req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
-	if err != nil {
-		t.Fatal(err)
+	header := func(uid string) string {
+		req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		client.ChatHeaders(req, &auth.Auth{UID: uid, AccessToken: "at"}, "", ChatMeta{
+			CacheKeyID:            "sess-abc",
+			ConversationRequestID: "turn-id",
+		})
+
+		if got := req.Header.Get("Acp-Connection-Id"); got == "" {
+			t.Fatal("Acp-Connection-Id missing")
+		}
+
+		return req.Header.Get("X-Conversation-Id")
 	}
 
-	client.ChatHeaders(req, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{
-		ConversationHeaderID:  "turn-id",
-		ConversationRequestID: "turn-id",
-	})
-
-	if got := req.Header.Get("X-Conversation-Id"); got != "turn-id" {
-		t.Fatalf("X-Conversation-Id=%q want turn-id", got)
+	first := header("u1")
+	if !uuidV4HeaderPattern.MatchString(first) {
+		t.Fatalf("X-Conversation-Id=%q want UUIDv4", first)
 	}
 
-	if got := req.Header.Get("Acp-Connection-Id"); got == "" {
-		t.Fatal("Acp-Connection-Id missing")
+	if second := header("u1"); second != first {
+		t.Fatalf("同账号同会话必须稳定：%q vs %q", first, second)
+	}
+
+	if other := header("u2"); other == first {
+		t.Fatalf("跨账号缓存槽必须隔离：both=%q", first)
 	}
 }
 
@@ -180,8 +193,8 @@ func TestConversationHeaderPrefersInbound(t *testing.T) {
 	}
 
 	client.ChatHeaders(req, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{
-		ConversationID:       "client-conv",
-		ConversationHeaderID: "fallback",
+		ConversationID: "client-conv",
+		CacheKeyID:     "fallback",
 	})
 
 	if got := req.Header.Get("X-Conversation-Id"); got != "client-conv" {
@@ -564,5 +577,33 @@ func TestAgentRuntimeHeaderAllSurfaces(t *testing.T) {
 				t.Fatalf("X-Agent-Runtime=%q want %q", got, headerCase.want)
 			}
 		})
+	}
+}
+
+// TestConversationHeaderRandomWithoutSession 无任何会话标识时保持「新会话」语义：
+// 两次请求生成不同 UUIDv4，而不是复用同一个空会话槽。
+func TestConversationHeaderRandomWithoutSession(t *testing.T) {
+	t.Parallel()
+
+	client := New()
+
+	header := func() string {
+		req, err := http.NewRequest(http.MethodPost, "https://example.invalid/v2/chat/completions", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		client.ChatHeaders(req, &auth.Auth{UID: "u1", AccessToken: "at"}, "", ChatMeta{})
+
+		return req.Header.Get("X-Conversation-Id")
+	}
+
+	first := header()
+	if !uuidV4HeaderPattern.MatchString(first) {
+		t.Fatalf("X-Conversation-Id=%q want UUIDv4", first)
+	}
+
+	if second := header(); second == first {
+		t.Fatalf("无会话标识时不应复用同一缓存槽：both=%q", first)
 	}
 }

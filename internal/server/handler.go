@@ -1423,9 +1423,12 @@ type chatFlow struct {
 	// 会话标识
 	sessKey        string
 	explicitConvID string
-	turnKey        string
-	turnKeyBody    []byte // prompt.Rewrite 之前的 body（轮级键按它派生）
-	stickyUID      string
+	// cacheKeyID 缓存槽用的会话键：sessKey 优先，为空时用内容派生键。它与
+	// sessKey 分开——带 user_id 的客户端不参与粘性，但仍要按对话隔离缓存槽。
+	cacheKeyID  string
+	turnKey     string
+	turnKeyBody []byte // prompt.Rewrite 之前的 body（轮级键按它派生）
+	stickyUID   string
 
 	// 轮转状态
 	tried map[string]bool
@@ -1790,6 +1793,15 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 	// 粘性开关解耦：关闭粘性时会话头族的聚合主键仍按会话级
 	// （RequestIDForKey(sessKey)），不悄悄退化成轮级。
 	chatFlow2.sessKey, chatFlow2.explicitConvID = session.ExtractSession(chatInput2.body)
+	// 缓存槽会话段：sessKey 优先；sessKey 为空（典型是带 user_id 的客户端，见
+	// ExtractSession 的 anti-monopoly 闸）时用内容派生键——否则 prompt_cache_key
+	// 退化成每账号一个常量槽，同账号上多段对话互相覆盖前缀缓存，出站会话头也只能
+	// 逐请求随机。只供缓存槽/出站头使用：账号绑定仍只认 sessKey，不复活 user 维度粘性。
+	chatFlow2.cacheKeyID = chatFlow2.sessKey
+	if chatFlow2.cacheKeyID == "" {
+		chatFlow2.cacheKeyID = session.DeriveCacheKey(chatInput2.body)
+	}
+
 	if h.cfg.Session != nil && chatFlow2.sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
@@ -1840,7 +1852,9 @@ func (f *chatFlow) canDegrade() bool {
 }
 
 // buildChatMeta 组装会话头族（对话轮级聚合 ID + 透传 ID），轮转循环外生成一次：
-//   - conversationID：body 提取（透传客户端原值，缺省空串——不伪造）；无则回落会话键；
+//   - conversationID：客户端声明的会话 ID（透传原值，缺省空串——不伪造）；
+//   - cacheKeyID：缓存槽会话键（sessKey 或内容派生键），无客户端会话 ID 时供
+//     prompt_cache_key / X-Conversation-ID 稳定派生；
 //   - conversationRequestID：入站 X-Conversation-Request-Id 透传优先，否则按粘性 key
 //     进程内稳定生成；粘性 key 也空时走轮级兜底（TurnKey/TurnRequestID）。
 func (f *chatFlow) buildChatMeta() {
@@ -1853,6 +1867,7 @@ func (f *chatFlow) buildChatMeta() {
 
 	f.chatMeta = upstream.ChatMeta{
 		ConversationID:        f.conversationID(),
+		CacheKeyID:            f.cacheKeyID,
 		RootRequestID:         f.inboundSession.rootRequestID,
 		ParentConversationID:  f.inboundSession.parentConversationID,
 		AgentIntent:           f.inboundSession.agentIntent,
@@ -1863,28 +1878,18 @@ func (f *chatFlow) buildChatMeta() {
 		ConversationRequestID: f.conversationRequestID(),
 	}
 
-	if f.chatMeta.ConversationID == "" {
-		// 上游渠道校验要求 X-Conversation-ID 恒在；客户端没给会话 ID 时用
-		// UUIDv4 兜底（官方 session.id = crypto.randomUUID()）。只进出站头，
-		// 不覆盖 ConversationID（prompt cache key 的源）。
-		f.chatMeta.ConversationHeaderID = session.NewUUIDv4()
-	}
-
 	f.chatMeta.TraceID = f.traceID
 }
 
-// conversationID 会话 ID 取值顺序：入站官方会话元数据 → body 提取的显式会话 ID
-// → 粘性会话键。全空返回空串（不伪造）。
+// conversationID 客户端声明的会话 ID：入站官方会话元数据 → body 提取的显式会话 ID。
+// 全空返回空串（不伪造）：网关派生的会话键只走 CacheKeyID，不能当客户端会话 ID
+// 透传成 X-Conversation-ID（会把内部 d- 键发给上游，破坏 #239 的 UUIDv4 形态）。
 func (f *chatFlow) conversationID() string {
 	if id := f.inboundSession.conversationID; id != "" {
 		return id
 	}
 
-	if f.explicitConvID != "" {
-		return f.explicitConvID
-	}
-
-	return f.sessKey
+	return f.explicitConvID
 }
 
 // conversationRequestID 对话轮级聚合 ID：入站透传优先，否则按「轮级复合 →
