@@ -16,11 +16,11 @@
   端点/头族/`product.json` 走 `scripts/protocol_sweep.mjs`，需要理解打包结构的
   字面量由 agent 判定。
 
-## Schema（`schema: 1`）
+## Schema（`schema: 2`）
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "source": {
     "realm": "cn",
     "packageUrl": "https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.8.3.41334564-db0e9b51.exe",
@@ -41,7 +41,26 @@
     "desktopIdeVersion": "…",
     "desktopExtVersion": "…",
     "loginPlatform": "workbuddy",
-    "loginUA": "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+    "loginUA": "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0",
+    "stainless": {
+      "arch": "x64",
+      "lang": "js",
+      "os": "Windows",
+      "packageVersion": "6.25.0",
+      "retryCount": "0",
+      "runtime": "node",
+      "runtimeVersion": "v22.21.1"
+    }
+  },
+  "tls": {
+    "versions": [772, 771],
+    "cipherSuites": [4865, 4866, 4867, 49199, 49195, 49200, 49196, 49191, 52393, 52392,
+                     49161, 49171, 49162, 49172, 156, 157, 47, 53],
+    "extensions": [0, 23, 65281, 10, 11, 35, 13, 51, 45, 43, 21],
+    "groups": [29, 23, 24],
+    "pointFormats": [0],
+    "signatureAlgorithms": [1027, 2052, 1025, 1283, 2053, 1281, 2054, 1537, 513],
+    "pskModes": [1]
   },
   "missing": [],
   "evidence": {
@@ -52,7 +71,8 @@
     "desktopIdeVersion": {"source": "package", "file": "main/module-base.js", "snippet": "…"},
     "desktopExtVersion": {"source": "package", "file": "main/module-base.js", "snippet": "…"},
     "loginPlatform": {"source": "package", "file": "cli/product.json", "snippet": "…"},
-    "loginUA": {"source": "package", "file": "main/module-base.js", "snippet": "…"}
+    "loginUA": {"source": "package", "file": "main/module-base.js", "snippet": "…"},
+    "stainless": {"source": "package", "file": "cli/dist/lazy-lite-wb/3043.50ee4dca.mjs", "snippet": "X-Stainless-Lang"}
   }
 }
 ```
@@ -82,6 +102,8 @@
 | `billingMeterUA` | 否 | billing meter 族（`/billing/meter/*`）的出站 UA。官方该面没有桌面 UA 拦截器，UA 是 axios 库自身默认串，只能从抓包取值；缺省回落 `desktopUA` | 2026-10-28 mitmproxy 抓包（`/billing/meter/get-user-resource-*`）→ `evidence.source = "traffic"` |
 | `loginPlatform` | 否 | OAuth `platform=` 参数 | `plugin/auth/state` 调用处 |
 | `loginUA` | 否 | 登录流 UA | 与 `desktopUA` 同源（`restOperations` 拦截器） |
+| `stainless` | 是（schema 2） | `x-stainless-*` 七个头（`arch` / `lang` / `os` / `packageVersion` / `retryCount` / `runtime` / `runtimeVersion`） | 打包进 CLI 的 OpenAI SDK bundle（`cli/dist/lazy-lite-wb/<hash>.mjs` 的 `buildHeaders`）；`runtimeVersion` 取自 Electron 内置 Node 版本串；需一条 `evidence.stainless` |
+| `tls` | 否（`upstream.tls_fingerprint=node` 时必需） | 出站 ClientHello 数值段 | 2026-11-04 官方 Win32 抓包（`.tmp/workbuddy-diff/2026-11-04-clienthello-capture.md`）；数值段来源是抓包而非包内字面量，schema 不强制 `evidence.tls` |
 
 `chatUA` 的 chat 实际由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
 `UserAgentHttpInterceptor.buildUserAgent` 构造；三段依次是
@@ -106,7 +128,7 @@ global `workbuddy-ai`），`userAgentExtension` 为 `CLI/<cli>`。
 
 ## 校验规则（Go validator，启动期与测试共用）
 
-1. `schema == 1`；拒绝未知字段（`DisallowUnknownFields`）。
+1. `schema == 2`；拒绝未知字段（`DisallowUnknownFields`）。schema 1 的旧文件会被拒绝启动，需整体重新生成。
 2. `source.realm ∈ {cn, global}`；`packageUrl` 必须是 Win32 安装包：
    cn → `download.codebuddy.cn/workbuddy/saas/win32-x64-user/…`，
    global → `download.codebuddy.ai/workbuddy/saas/win32-x64-user/…`。
@@ -119,14 +141,23 @@ global `workbuddy-ai`），`userAgentExtension` 为 `CLI/<cli>`。
    `desktopUA` 中。`loginUA` 不参与（CLI 段可能不同）。
 5. 必需 surface 非空；`null` 的 key 集合必须与 `missing` 完全一致。
 6. 所有 `emit` 值：无 `\r` / `\n` / 其它控制字符，长度 ≤ 1024 字节，无首尾空白。
-   值会进 HTTP header，这条是硬性安全约束。
-7. `evidence` 覆盖每个非 `null` 的 `emit` key；`file` 必须是相对路径（拒绝绝对
-   路径与 `..`）。路径存在性与 `snippet` 逐字命中由生成方在落盘前校验（Go 运行期
-   不读解包树）。
+   值会进 HTTP header，这条是硬性安全约束。`emit.stainless` 七个值全部必填，同样
+   走这条边界校验。
+7. `evidence` 覆盖每个非 `null` 的 `emit` key；schema 2 额外要求 `evidence.stainless`。
+   `file` 必须是相对路径（拒绝绝对路径与 `..`）。路径存在性与 `snippet` 逐字命中由
+   生成方在落盘前校验（Go 运行期不读解包树）。
 8. 生成方还需核对同一 profile 内 `source.realm` 与所有 `evidence.file` 所属 realm
    目录一致（包内不允许混用另一 realm 的文件）。
 9. `evidence.file` 必须来自 Win32 解包树（`app-asar/`）；来自
    `app-asar-macos/` 的证据无效。以上两条同样是生成期检查，不进入运行期校验器。
+10. `tls` 段（可选）：`versions` / `cipherSuites` / `extensions` / `groups` /
+    `pointFormats` / `signatureAlgorithms` / `pskModes` 均非空；扩展只接受
+    `0,10,11,13,21,23,35,43,45,51,65281`，不得含 ALPN(16)、证书压缩(27)、
+    pre_shared_key(41)；padding(21) 必须是最后一个；必须含 server_name(0)；
+    任何列表不得含 GREASE。已加载的 cn / global 两个 profile 的 `tls` 段必须逐字段
+    相等（共享 Transport 无法按 realm 切换）。
+11. `upstream.tls_fingerprint=node` 时 profile 必须带 `tls` 段，缺失拒绝启动；
+    默认 `off`。
 
 ## 反伪造硬规则
 

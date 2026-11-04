@@ -337,22 +337,20 @@ func (c *Client) chatFamilyHeaders(
 	// local-agent（agenttool 四路无真机证据，维持 other，#373）。
 	req.Header.Set("X-Agent-Runtime", "other")
 	// AccessToken 加锁快照：keepalive 定时刷新会在 a.mu 内改写它，锁外直读构成数据竞争
-	// （见 auth.AccessTokenValue 注释）。
+	// （见 auth.AccessTokenValue 注释）。取不到就不发：官方 chat 链路从不构造
+	// X-No-Authorization（#455）。
 	if at := account.AccessTokenValue(); at != "" {
 		req.Header.Set("Authorization", "Bearer "+at)
-	} else {
-		req.Header.Set("X-No-Authorization", "1")
 	}
 
+	// 同上：个人号缺 UID 时官方不发 X-No-User-Id，直接省略。
 	if account.UID != "" {
 		req.Header.Set("X-User-Id", account.UID)
-	} else {
-		req.Header.Set("X-No-User-Id", "1")
 	}
 	// 安全红线：绝不在 chat 请求里携带 X-Refresh-Token。
-	// 企业与域头按 realm 分发：CN 走既有分支（EnterpriseID/Domain 原样透传，缺省 X-No-*）；
+	// 企业与域头按 realm 分发：CN 走既有分支（EnterpriseID/Domain 原样透传）；
 	// global 账号由 injectGlobalChatHeaders 统一注入国际客户端形态
-	// （企业：X-Enterprise-Id + X-Tenant-Id；个人：X-No-Enterprise-Id=1；
+	// （企业：X-Enterprise-Id + X-Tenant-Id；个人：不发企业声明头；
 	// X-Domain 账号 domain 优先，缺省 www.workbuddy.ai）。
 	if account != nil && !account.IsGlobal() {
 		injectCNChatHeaders(req, account)
@@ -400,6 +398,7 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 		// 兜底分支）；桌面本地会话恒为 local-agent，真机 other 0 次。网关模拟的是
 		// 本地会话，故发 local-agent。
 		req.Header.Set("X-Agent-Runtime", "local-agent")
+		c.injectStainlessHeaders(req, account)
 		// X-Device-Token：真机 chat（主请求与辅助请求）**都带**该头，与产品面公共头
 		// 同层出现，不在会话头族里（#376）。取值沿用 resolveDeviceToken 的既有优先级；
 		// 取不到就不发（不伪造）。其余面（summary / packages / report / busy /
@@ -413,6 +412,48 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 		))
 	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth:
 		// 轻头族各面已在 applyHeaders 分流。
+	}
+}
+
+// stainlessHeaderNames OpenAI SDK 头族的七个线上头名。真机这些头名全为小写
+// （fetch Headers 的 sort-and-combine 输出），故不能用 Header.Set——那会规范成
+// X-Stainless-*，与官方字节不一致。
+var stainlessHeaderNames = [...]string{
+	"x-stainless-arch",
+	"x-stainless-lang",
+	"x-stainless-os",
+	"x-stainless-package-version",
+	"x-stainless-retry-count",
+	"x-stainless-runtime",
+	"x-stainless-runtime-version",
+}
+
+// injectStainlessHeaders 在 CLI chat 面注入 OpenAI SDK 的 x-stainless-* 头族
+// （#456）。值整组来自 profile（schema 2 必填），代码不保留任何版本字面量；
+// profile 缺失时整族不发（不伪造）。只作用于 surfaceChat：agenttool 四路与
+// 桌面 chat 都不带这组头。
+func (c *Client) injectStainlessHeaders(req *http.Request, account *auth.Auth) {
+	profile := c.profileFor(account)
+	if profile == nil {
+		return
+	}
+
+	values := [...]string{
+		profile.Emit.Stainless.Arch,
+		profile.Emit.Stainless.Lang,
+		profile.Emit.Stainless.OS,
+		profile.Emit.Stainless.PackageVersion,
+		profile.Emit.Stainless.RetryCount,
+		profile.Emit.Stainless.Runtime,
+		profile.Emit.Stainless.RuntimeVersion,
+	}
+
+	for i, name := range stainlessHeaderNames {
+		if values[i] == "" {
+			continue
+		}
+		// 直接写原始小写键：Header.Set 会把头名规范化成 X-Stainless-*。
+		req.Header[name] = []string{values[i]}
 	}
 }
 
@@ -519,26 +560,26 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 		req.Header.Set("Accept-Language", "*")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 
-		injectLightEnterpriseHeaders(req, account)
+		injectEnterpriseIDHeaders(req, account)
 	case surfaceReport:
 		// /v2/report 与桌面 report 是同一端点：真机同头集，含 X-Product: SaaS
 		// （见 desktop.go 的 ReportDesktopEvent）。billing meter 面不发该头，故
 		// 两者在此分开。
 		req.Header.Set("X-Product", "SaaS")
 
-		injectLightEnterpriseHeaders(req, account)
+		injectEnterpriseIDHeaders(req, account)
 	case surfaceBilling:
 		// billing 域面（meter）：企业头只在真有值时发，个人号不发声明头。
-		injectLightEnterpriseHeaders(req, account)
+		injectEnterpriseIDHeaders(req, account)
 	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
 		// 不走轻头族（chatFamily() 已在 applyHeaders 分流）。
 	}
 }
 
-// injectLightEnterpriseHeaders 轻头族的条件企业头：企业 ID 非空才发
-// X-Enterprise-Id / X-Tenant-Id；个人号**不发**声明头（与 chat 族的
-// X-No-Enterprise-Id 相反，真机 billing / report / busy / growth 都不带，#298）。
-func injectLightEnterpriseHeaders(req *http.Request, account *auth.Auth) {
+// injectEnterpriseIDHeaders 条件企业头：企业 ID 非空才发 X-Enterprise-Id /
+// X-Tenant-Id；个人号**不发**声明头（真机 billing / report / busy / growth 都不带，
+// #298；官方 chat 与模型目录探测同样不发 X-No-*，#455）。
+func injectEnterpriseIDHeaders(req *http.Request, account *auth.Auth) {
 	if account == nil || account.EnterpriseID == "" {
 		return
 	}
@@ -655,15 +696,18 @@ func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP s
 }
 
 // injectCNChatHeaders CN 账号的 chat 域头：企业 ID / 租户 ID 与 Domain 原样透传
-// （缺省 X-No-*）。
+// （个人号不发企业声明头，官方 chat 链路从不构造 X-No-Enterprise-Id，#455）。
 func injectCNChatHeaders(req *http.Request, account *auth.Auth) {
-	injectEnterpriseHeaders(req, account)
+	injectEnterpriseIDHeaders(req, account)
 	injectChatDomain(req, account)
 }
 
 // injectEnterpriseHeaders 按账号企业身份注入企业/租户头。
 // 官方桌面端企业账号同时发 X-Enterprise-Id 与 X-Tenant-Id；个人账号显式声明
 // X-No-Enterprise-Id=1，避免上游按缺失头做可疑判定。
+//
+// 只用于 refresh / v3-config / 桌面等非 chat 面；chat 与模型目录走
+// injectEnterpriseIDHeaders（官方 chat 不发 X-No-*，#455）。
 func injectEnterpriseHeaders(req *http.Request, account *auth.Auth) {
 	if account != nil && account.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
@@ -676,36 +720,34 @@ func injectEnterpriseHeaders(req *http.Request, account *auth.Auth) {
 }
 
 // injectChatDomain 注入 chat 域头：账号 domain 优先；global 无 domain 时回落
-// 国际版域 www.workbuddy.ai；CN 无 domain 保持既有 X-No-Department-Info 声明。
+// 国际版域 www.workbuddy.ai；CN 无 domain 时不发域头。
+//
+// 官方 chat 对 CN 个人号不发 X-No-Department-Info（#455）：缺少部门上下文时就是
+// 省略，不做「显式声明无」。
 func injectChatDomain(req *http.Request, account *auth.Auth) {
-	if d := account.DomainValue(); d != "" {
-		req.Header.Set("X-Domain", d)
+	if account != nil {
+		if d := account.DomainValue(); d != "" {
+			req.Header.Set("X-Domain", d)
 
-		return
+			return
+		}
 	}
 
 	if account != nil && account.IsGlobal() {
 		req.Header.Set("X-Domain", "www.workbuddy.ai")
-
-		return
 	}
-
-	// 有部门信息时由 injectIdentityHeaders 发 X-Department-Info 并删掉本声明
-	// （两者互斥）。这里仍先写 X-No-Department-Info：只调 injectChatDomain 的
-	// 端点（FetchModels 等）保持原有的「无部门」声明。
-	req.Header.Set("X-No-Department-Info", "1")
 }
 
 // injectGlobalChatHeaders global 账号的 chat 专属声明头，对齐官方国际客户端：
 //   - 企业账号：X-Enterprise-Id + X-Tenant-Id
-//   - 个人账号：X-No-Enterprise-Id: 1
+//   - 个人账号：不发企业声明头（官方 chat 无 X-No-*，#455）
 //   - X-Domain：账号 domain 优先，缺省 www.workbuddy.ai
 func (*Client) injectGlobalChatHeaders(req *http.Request, account *auth.Auth) {
 	if account == nil || !account.IsGlobal() {
 		return
 	}
 
-	injectEnterpriseHeaders(req, account)
+	injectEnterpriseIDHeaders(req, account)
 	injectChatDomain(req, account)
 }
 
@@ -945,7 +987,6 @@ func (*Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 	}
 
 	if department := strings.TrimSpace(account.DepartmentFullName); department != "" {
-		req.Header.Del("X-No-Department-Info")
 		req.Header.Set("X-Department-Info", department)
 	}
 

@@ -43,6 +43,7 @@ var (
 	errNormalizeLoggingFailed           = errors.New("normalizeLogging failed")
 	errNormalizeProxiesFailed           = errors.New("normalizeProxies failed")
 	errNormalizeDNSServersFailed        = errors.New("normalizeDNSServers failed")
+	errNormalizeUpstreamFingerprint     = errors.New("normalizeUpstreamFingerprint failed")
 	errValidateBackoffOrderFailed       = errors.New("validateBackoffOrder failed")
 	errValidateServerRangesFailed       = errors.New("validateServerRanges failed")
 	errValidateRangesFailed             = errors.New("validateRanges failed")
@@ -325,6 +326,13 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// HeaderOrder 是否把 CLI chat 明文头块重排为官方客户端顺序/大小写（#457）。
+		// 缺省 true；显式 false 且 tls_fingerprint=off 时完全回到 Go 标准 TLS 路径。
+		// 改动需重启（DialTLSContext 在启动期安装）。
+		HeaderOrder *bool `json:"header_order"`
+		// TLSFingerprint 出站 TLS ClientHello 指纹：off（默认）| node（复刻官方
+		// Node/BoringSSL 形状，#458）。node 需要 profile 的 tls 段；改动需重启。
+		TLSFingerprint string `json:"tls_fingerprint"`
 		// RotateMax 单请求最多换号次数，默认 3（issue #17）。
 		RotateMax int `json:"rotate_max"`
 		// RotateBudget 轮换总时长预算（如 "90s"）；"0"/空 = 不限（默认）。与
@@ -623,6 +631,9 @@ func applyUpstreamDefaults(config7 *Config) {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	config7.Upstream.HeaderTimeoutSeconds = 0
 	config7.Upstream.IdleTimeoutSeconds = 0
+	headerOrder := true
+	config7.Upstream.HeaderOrder = &headerOrder
+	config7.Upstream.TLSFingerprint = upstreamTLSFingerprintOff
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	config7.Global.Enabled = true
@@ -1033,7 +1044,7 @@ func (c *Config) normalize() error {
 		c.normalizeHiddenModels, c.normalizeAllowedModels, c.normalizeScheduling,
 		c.normalizeNotify, c.normalizeCheckinDelay, c.normalizeTimingShape, c.normalizeLogging,
 		c.normalizeSchedule, c.normalizePrompt, c.normalizeProxies,
-		c.normalizeDNSServers,
+		c.normalizeUpstreamFingerprint, c.normalizeDNSServers,
 	}
 	for _, step := range steps {
 		if err := step(); err != nil {
@@ -1856,6 +1867,34 @@ func (c *Config) normalizeUpstreamDefaults() {
 
 	if c.Upstream.KeepaliveInterval == "" {
 		c.Upstream.KeepaliveInterval = "0"
+	}
+
+	if c.Upstream.HeaderOrder == nil {
+		headerOrder := true
+		c.Upstream.HeaderOrder = &headerOrder
+	}
+
+	if c.Upstream.TLSFingerprint == "" {
+		c.Upstream.TLSFingerprint = upstreamTLSFingerprintOff
+	}
+}
+
+// 出站 TLS 指纹模式（与 internal/upstream 的常量同值；config 层不依赖 upstream 常量
+// 以免形成配置包反向依赖，测试保证两处一致）。
+const (
+	upstreamTLSFingerprintOff  = "off"
+	upstreamTLSFingerprintNode = "node"
+)
+
+// normalizeUpstreamFingerprint 校验 tls_fingerprint 只有 off / node 两个取值。
+// header_order 缺省在 normalizeUpstreamDefaults 补 true。
+func (c *Config) normalizeUpstreamFingerprint() error {
+	switch c.Upstream.TLSFingerprint {
+	case upstreamTLSFingerprintOff, upstreamTLSFingerprintNode:
+		return nil
+	default:
+		return fmt.Errorf("%w（upstream.tls_fingerprint=%q，只接受 off / node）",
+			errNormalizeUpstreamFingerprint, c.Upstream.TLSFingerprint)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 )
 
 const fakeCNProfile = `{
-  "schema": 1,
+  "schema": 2,
   "source": {
     "realm": "cn",
     "packageUrl": "https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-9.9.9-cccc.exe",
@@ -32,7 +32,16 @@ const fakeCNProfile = `{
     "desktopIdeVersion": "9.9.9",
     "desktopExtVersion": "9.9.9",
     "loginPlatform": "workbuddy",
-    "loginUA": null
+    "loginUA": null,
+    "stainless": {
+      "arch": "x64",
+      "lang": "js",
+      "os": "Windows",
+      "packageVersion": "6.9.9",
+      "retryCount": "0",
+      "runtime": "node",
+      "runtimeVersion": "v22.9.9"
+    }
   },
   "missing": ["loginUA"],
   "evidence": {
@@ -42,7 +51,8 @@ const fakeCNProfile = `{
     "xIdeVersion": {"source": "package", "file": "main/server.js", "snippet": "x"},
     "desktopIdeVersion": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
     "desktopExtVersion": {"source": "package", "file": "main/module-base.js", "snippet": "x"},
-    "loginPlatform": {"source": "package", "file": "cli/product.json", "snippet": "x"}
+    "loginPlatform": {"source": "package", "file": "cli/product.json", "snippet": "x"},
+    "stainless": {"source": "package", "file": "cli/dist/lazy-lite-wb/x.mjs", "snippet": "x-stainless-lang"}
   }
 }`
 

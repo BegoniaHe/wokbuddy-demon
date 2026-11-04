@@ -95,6 +95,14 @@ describe('collectConfig', () => {
   it('checkbox 转布尔', () => {
     expect(collectConfig({ prefer_expiring: true })).toEqual({ pool: { prefer_expiring: true } });
   });
+  it('出站指纹开关往返', () => {
+    expect(collectConfig({ header_order: false, tls_fingerprint: 'node' })).toEqual({
+      upstream: { header_order: false, tls_fingerprint: 'node' },
+    });
+    expect(
+      configToValues({ upstream: { header_order: false, tls_fingerprint: 'node' } }),
+    ).toMatchObject({ header_order: false, tls_fingerprint: 'node' });
+  });
   it('api_key 空不下发（避免误关鉴权）', () => {
     expect('api_key' in collectConfig({ api_key: '' })).toBe(false);
   });

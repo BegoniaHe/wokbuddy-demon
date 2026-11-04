@@ -21,7 +21,7 @@ func writeClientProfile(t *testing.T, dir, realm string) {
 	}
 
 	profile := map[string]any{
-		"schema": 1,
+		"schema": 2,
 		"source": map[string]any{
 			"realm":          realm,
 			"packageUrl":     "https://" + host + "/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-9.9.9" + ext,
@@ -43,6 +43,10 @@ func writeClientProfile(t *testing.T, dir, realm string) {
 			"desktopExtVersion": "9.9.9",
 			"loginPlatform":     "workbuddy",
 			"loginUA":           "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+			"stainless": map[string]any{
+				"arch": "x64", "lang": "js", "os": "Windows", "packageVersion": "6.9.9",
+				"retryCount": "0", "runtime": "node", "runtimeVersion": "v22.9.9",
+			},
 		},
 		"missing": []string{},
 		"evidence": map[string]any{
@@ -54,6 +58,7 @@ func writeClientProfile(t *testing.T, dir, realm string) {
 			"desktopExtVersion": map[string]any{"source": "package", "file": "main/module-base.js", "snippet": "x"},
 			"loginPlatform":     map[string]any{"source": "package", "file": "cli/product.json", "snippet": "x"},
 			"loginUA":           map[string]any{"source": "package", "file": "main/module-base.js", "snippet": "x"},
+			"stainless":         map[string]any{"source": "package", "file": "cli/dist/lazy-lite-wb/x.mjs", "snippet": "x"},
 		},
 	}
 

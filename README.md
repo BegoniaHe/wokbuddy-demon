@@ -94,8 +94,9 @@ cp config.example.json config.json
 
 # 客户端指纹快照：data/client-profiles/cn.json 必需；config.example.json 的
 # global.enabled 默认为 true，因此 global.json 也必需（纯 CN 部署可把
-# global.enabled 设为 false 后只提供 cn.json）。用 reverse-workbuddy 技能从
-# 官方 Win32 分发包生成，缺失会拒绝启动
+# global.enabled 设为 false 后只提供 cn.json）。schema 2 要求 emit.stainless
+# 七个值；用 reverse-workbuddy 技能从官方 Win32 分发包生成，缺失或 schema 1
+# 会拒绝启动
 docker compose up -d --build
 ```
 
@@ -144,6 +145,24 @@ docker compose up -d --build
 **覆盖范围**：账号作用域内的全部出站请求——对话、token 刷新、余额/积分包、签到、保活、旅行、成长任务、活跃上报、搜索 / 抓取、图像、模型目录探测，以及带账号 token 的国际版注册激活 / 补地区链路。无账号的调用（面板 / `cmd/login` 的 OAuth 设备授权）不进这三组配置——那条链路用独立的短超时 client，出口只受进程环境 `HTTP_PROXY` / `HTTPS_PROXY` 影响（Go 默认 Transport 的行为）；上游出站 transport 不设 `Proxy`，只认上面这套槽与全局池，不读环境变量。
 
 三个字段都**热生效**：面板保存后立即换出口，不需要重启（改动会重建出口注册表并原子替换拨号器，在途请求不受影响）。
+
+## 🪞 出站指纹（`upstream.header_order` / `upstream.tls_fingerprint`）
+
+网关默认尽量贴近官方 WorkBuddy CLI 的出站形状，两个开关都在「配置」页「上游与高级」里，**改动需重启**：
+
+- `upstream.header_order`（默认 `true`）：把 CLI chat（`POST /v2/chat/completions`，带 `x-stainless-lang` 标记）的明文请求头块重排为官方 42 头顺序与大小写，并补 `Connection: keep-alive`。Go 的 `net/http` 固定先写 `Host`/`User-Agent`/`Content-Length`、其余按字典序，无法用 `Header.Set` 模拟，所以在 TLS 之上做了连接层重写。只作用于 CLI chat，其他 surface 原样透传；解析失败会回写原始字节并关闭该连接的重写（不破坏请求）。显式设为 `false` 且 `tls_fingerprint=off` 时完全不安装自定义 TLS 拨号，回到 Go 标准路径。
+- `upstream.tls_fingerprint`（默认 `off`）：`off` = Go 标准库 TLS；`node` = 用 vendored uTLS 复刻官方 Node/BoringSSL 的首连 ClientHello（18 cipher、固定扩展序、无 ALPN/GREASE、会话恢复 PSK + padding、正常握手不发 dummy CCS）。`node` **要求** profile 带 `tls` 段，缺失即拒绝启动；TLS 握手失败直接报错，不会回落到标准库（回落会暴露调用方想隐藏的指纹）。
+
+两个开关都保留既有出站路由：代理、按槽拨号、证书校验、SSE、连接复用与 `writeDeadlineConn` 写超时不变。
+
+### profile schema 2
+
+`data/client-profiles/<realm>.json` 升到 `schema: 2`：
+
+- `emit.stainless`：七个必填值（`arch` / `lang` / `os` / `packageVersion` / `retryCount` / `runtime` / `runtimeVersion`），对应官方 CLI chat 的 `x-stainless-*` 头族；必须附 `evidence.stainless`。
+- `tls`（可选，`tls_fingerprint=node` 时必需）：`versions` / `cipherSuites` / `extensions` / `groups` / `pointFormats` / `signatureAlgorithms` / `pskModes` 数值段。两个已加载 realm 的 `tls` 段必须逐字段相等（共享 Transport 无法按 realm 切换）。
+
+旧 `schema: 1` profile 会被拒绝启动。用 `reverse-workbuddy` 技能从同一份官方 Win32 分发包重新生成 cn / global 两份 profile，再启动即可；生成过程与校验规则见 `.agents/skills/reverse-workbuddy/references/client-profile.md`。仓库不内置任何版本 / commit / releaseDate / 指纹兜底字面量。
 
 ## 🐾 适合谁
 

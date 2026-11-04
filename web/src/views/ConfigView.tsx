@@ -42,6 +42,12 @@ const STRATEGY_OPTIONS = [
   { value: 'sequential_exhaust', label: 'sequential_exhaust — 用完一个号再下一个' },
 ] as const satisfies readonly SelectOption[];
 
+// 出站 TLS 指纹模式（#458）。
+const TLS_FINGERPRINT_OPTIONS = [
+  { value: 'off', label: 'off — 标准库 TLS（默认）' },
+  { value: 'node', label: 'node — 复刻官方 Node/BoringSSL ClientHello' },
+] as const satisfies readonly SelectOption[];
+
 // 系统提示词注入模式。
 const PROMPT_MODE_OPTIONS = [
   { value: 'custom', label: 'custom — 网关自有提示词（避免指纹误报）' },
@@ -605,6 +611,26 @@ export function ConfigView() {
             </Field>
           </div>
           {check('passthrough_ip', '向上游透传客户端 IP', '默认关闭；开启前确认反代信任边界，需重启')}
+          {check('header_order', '重排 CLI chat 头序', '按官方客户端 42 头顺序与大小写重写 chat 请求头；默认开启；需重启')}
+          <div className="grid max-w-md gap-x-5">
+            <Field>
+              <FieldLabel>出站 TLS 指纹</FieldLabel>
+              <Select
+                items={selectOptionItems(TLS_FINGERPRINT_OPTIONS)}
+                value={String(values.tls_fingerprint ?? 'off')}
+                onValueChange={(v) => set('tls_fingerprint', v ?? 'off')}>
+                <SelectTrigger aria-label="出站 TLS 指纹">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectOptions options={TLS_FINGERPRINT_OPTIONS} />
+                </SelectContent>
+              </Select>
+              <FieldDescription>
+                node 需要 data/client-profiles 的 tls 段（schema 2）；默认 off；需重启
+              </FieldDescription>
+            </Field>
+          </div>
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-3">
             <Field>

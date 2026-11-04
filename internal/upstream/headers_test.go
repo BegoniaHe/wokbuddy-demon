@@ -130,8 +130,8 @@ func TestDesktopFingerprintHeadersAbsent(t *testing.T) {
 }
 
 // TestChatHeadersDepartmentInfoExcludesNoDepartment 有 departmentFullName 时
-// ChatHeaders 发 X-Department-Info 并移除 X-No-Department-Info；只调
-// injectChatDomain 的 FetchModels 类端点仍保留「无部门」声明。
+// ChatHeaders 发 X-Department-Info；chat 与模型目录端点都不发任何 X-No-* 声明头
+// （官方 chat 链路从不构造它们，#455）。
 func TestChatHeadersDepartmentInfoExcludesNoDepartment(t *testing.T) {
 	t.Parallel()
 
@@ -149,7 +149,7 @@ func TestChatHeadersDepartmentInfoExcludesNoDepartment(t *testing.T) {
 	}
 
 	if got := req.Header.Get("X-No-Department-Info"); got != "" {
-		t.Errorf("X-No-Department-Info=%q should be removed", got)
+		t.Errorf("X-No-Department-Info=%q want empty", got)
 	}
 
 	modelsReq, err := http.NewRequest(http.MethodPost, "https://example.invalid/v3/config", http.NoBody)
@@ -159,12 +159,12 @@ func TestChatHeadersDepartmentInfoExcludesNoDepartment(t *testing.T) {
 
 	injectChatDomain(modelsReq, account)
 
-	if got := modelsReq.Header.Get("X-No-Department-Info"); got != "1" {
-		t.Errorf("non-chat X-No-Department-Info=%q want 1", got)
+	if got := modelsReq.Header.Get("X-No-Department-Info"); got != "" {
+		t.Errorf("models X-No-Department-Info=%q want empty", got)
 	}
 
 	if got := modelsReq.Header.Get("X-Department-Info"); got != "" {
-		t.Errorf("non-chat X-Department-Info=%q want empty", got)
+		t.Errorf("models X-Department-Info=%q want empty", got)
 	}
 }
 

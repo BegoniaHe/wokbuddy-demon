@@ -100,6 +100,10 @@ linters:
     - wsl_v5
 
   settings:
+    # TLS 指纹复刻使用本地 vendored uTLS（仓库内副本，非 GitHub fork）；
+    # 见 go.mod 的 replace 与 internal/vendor/utls/README.md。
+    gomoddirectives:
+      replace-local: true
     errcheck:
       check-type-assertions: true
       check-blank: false

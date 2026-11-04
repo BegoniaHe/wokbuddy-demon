@@ -592,7 +592,7 @@ func (c *Client) globalModelsOnce(
 	}
 
 	c.CommonHeaders(req, account3) // 共享请求头（UA/Accept/Content-Type），与 FetchModels 同款
-	injectEnterpriseHeaders(req, account3)
+	injectEnterpriseIDHeaders(req, account3)
 	injectChatDomain(req, account3)
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account3.AccessTokenValue())

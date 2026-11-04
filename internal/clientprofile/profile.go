@@ -22,7 +22,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 var (
 	errInvalidProfile    = errors.New("client profile invalid")
@@ -31,6 +31,15 @@ var (
 	requiredEmitSurfaces = []string{
 		"chatUA", "desktopUA", "billingUA", "xIdeVersion", "desktopIdeVersion", "desktopExtVersion",
 	}
+)
+
+// TLS 扩展 ID；只用于校验 switch，避免魔数（#458）。
+const (
+	tlsExtServerName             uint16 = 0
+	tlsExtALPN                   uint16 = 16
+	tlsExtPadding                uint16 = 21
+	tlsExtCertificateCompression uint16 = 27
+	tlsExtPreSharedKey           uint16 = 41
 )
 
 // Source 快照来源：必须是官方 Win32 安装包。
@@ -61,6 +70,20 @@ type Emit struct {
 	// 官方该面没有桌面 UA 拦截器，UA 由 axios 自身默认值补上。**可选**字段——
 	// 旧 profile 没有它时为空，出站回落 desktopUA（不自造值、不按版本拼接）。
 	BillingMeterUA string `json:"billingMeterUA"`
+	// Stainless OpenAI SDK 头族七个值（schema 2 必填，#456）。
+	Stainless Stainless `json:"stainless"`
+}
+
+// Stainless OpenAI SDK 的 x-stainless-* 头族取值（#456）。官方 CLI chat 全部注入，
+// 值来自打包进客户端的 SDK 与运行时，故按构建冻结进 profile。
+type Stainless struct {
+	Arch           string `json:"arch"`
+	Lang           string `json:"lang"`
+	OS             string `json:"os"`
+	PackageVersion string `json:"packageVersion"`
+	RetryCount     string `json:"retryCount"`
+	Runtime        string `json:"runtime"`
+	RuntimeVersion string `json:"runtimeVersion"`
 }
 
 // Evidence 单个 surface 的来源证据。
@@ -78,6 +101,36 @@ type Profile struct {
 	Emit     Emit                `json:"emit"`
 	Missing  []string            `json:"missing"`
 	Evidence map[string]Evidence `json:"evidence"`
+	// TLS 官方 ClientHello 参数（可选）。只有 upstream.tls_fingerprint=node 时必需；
+	// 两个已加载 realm 的该段必须逐字段相等（共享 Transport 无法按 realm 分流）。
+	TLS *TLS `json:"tls,omitempty"`
+}
+
+// TLS 官方 Node/BoringSSL ClientHello 的数值参数（#458）。顺序即线上顺序：
+// Extensions 的顺序就是 ClientHello 里扩展的出现顺序。
+type TLS struct {
+	Versions            []uint16 `json:"versions"`
+	CipherSuites        []uint16 `json:"cipherSuites"`
+	Extensions          []uint16 `json:"extensions"`
+	Groups              []uint16 `json:"groups"`
+	PointFormats        []uint8  `json:"pointFormats"`
+	SignatureAlgorithms []uint16 `json:"signatureAlgorithms"`
+	PSKModes            []uint8  `json:"pskModes"`
+}
+
+// Equal 判断两个 tls 段是否逐字段相等；nil 与 nil 相等。
+func (t *TLS) Equal(other *TLS) bool {
+	if t == nil || other == nil {
+		return t == nil && other == nil
+	}
+
+	return slices.Equal(t.Versions, other.Versions) &&
+		slices.Equal(t.CipherSuites, other.CipherSuites) &&
+		slices.Equal(t.Extensions, other.Extensions) &&
+		slices.Equal(t.Groups, other.Groups) &&
+		slices.Equal(t.PointFormats, other.PointFormats) &&
+		slices.Equal(t.SignatureAlgorithms, other.SignatureAlgorithms) &&
+		slices.Equal(t.PSKModes, other.PSKModes)
 }
 
 // Set 两个 realm 的 profile 集合；缺失的 realm 返回 nil（不回落到任何内置指纹）。
@@ -127,7 +180,37 @@ func LoadDir(dir string) (*Set, error) {
 		set.profiles[realm] = profile
 	}
 
+	if err := validateRealmTLSEquality(set.profiles); err != nil {
+		return nil, err
+	}
+
 	return set, nil
+}
+
+// validateRealmTLSEquality 已加载 realm 的 tls 段必须逐字段相等：出站 Transport
+// 是共享的，无法按 realm 切换 ClientHello；不一致时只能拒绝启动，而不是悄悄挑一个。
+func validateRealmTLSEquality(profiles map[string]*Profile) error {
+	var first *Profile
+
+	for _, realm := range []string{"cn", "global"} {
+		profile := profiles[realm]
+		if profile == nil {
+			continue
+		}
+
+		if first == nil {
+			first = profile
+
+			continue
+		}
+
+		if !first.TLS.Equal(profile.TLS) {
+			return fmt.Errorf("client profile cn/global 的 tls 段不一致（共享 Transport 无法按 realm 分流）: %w",
+				errInvalidProfile)
+		}
+	}
+
+	return nil
 }
 
 // loadRealmFile 读取并校验单个 realm 文件，返回文件名推导出的 realm。
@@ -220,7 +303,11 @@ func (p *Profile) Validate() error {
 		return err
 	}
 
-	return validateEvidence(p)
+	if err := validateEvidence(p); err != nil {
+		return err
+	}
+
+	return validateTLS(p.TLS)
 }
 
 func validateSource(src *Source) error {
@@ -294,12 +381,34 @@ func validatePackageURL(realm, raw string) error {
 }
 
 func validateEmit(emit *Emit) error {
+	if err := validateRequiredEmit(emit); err != nil {
+		return err
+	}
+
+	if err := validateEmitValues(emit); err != nil {
+		return err
+	}
+
+	return validateStainless(&emit.Stainless)
+}
+
+func validateRequiredEmit(emit *Emit) error {
 	for _, key := range requiredEmitSurfaces {
 		if strings.TrimSpace(valueOf(emit, key)) == "" {
 			return fmt.Errorf("emit.%s 不能为空: %w", key, errInvalidProfile)
 		}
 	}
 
+	// loginUA 非 null 即代表"已取到"：空串会让登录链路当成未配置而拒绝，
+	// 与 missing 语义冲突，直接按无效 profile 处理。
+	if emit.LoginUA != nil && *emit.LoginUA == "" {
+		return fmt.Errorf("emit.loginUA 非 null 时不能为空（取不到请写 null 并列入 missing）: %w", errInvalidProfile)
+	}
+
+	return nil
+}
+
+func validateEmitValues(emit *Emit) error {
 	values := map[string]string{
 		"chatUA": emit.ChatUA, "desktopUA": emit.DesktopUA, "billingUA": emit.BillingUA,
 		"xIdeVersion": emit.XIdeVersion, "desktopIdeVersion": emit.DesktopIdeVersion,
@@ -316,13 +425,32 @@ func validateEmit(emit *Emit) error {
 		}
 	}
 
-	// loginUA 非 null 即代表"已取到"：空串会让登录链路当成未配置而拒绝，
-	// 与 missing 语义冲突，直接按无效 profile 处理。
-	if emit.LoginUA != nil && *emit.LoginUA == "" {
-		return fmt.Errorf("emit.loginUA 非 null 时不能为空（取不到请写 null 并列入 missing）: %w", errInvalidProfile)
+	return nil
+}
+
+// validateStainless x-stainless-* 七值全部必填（#456）：官方 CLI chat 恒发，
+// 缺任一项都无法复刻。
+func validateStainless(stainless *Stainless) error {
+	for key, value := range stainlessValues(stainless) {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("emit.stainless.%s 不能为空: %w", key, errInvalidProfile)
+		}
+
+		if err := validateEmitValue("stainless."+key, value); err != nil {
+			return err
+		}
 	}
 
 	return nil
+}
+
+// stainlessValues 把结构体字段映射回 JSON 键，供必填与安全边界校验共用。
+func stainlessValues(s *Stainless) map[string]string {
+	return map[string]string{
+		"arch": s.Arch, "lang": s.Lang, "os": s.OS,
+		"packageVersion": s.PackageVersion, "retryCount": s.RetryCount,
+		"runtime": s.Runtime, "runtimeVersion": s.RuntimeVersion,
+	}
 }
 
 func validateEmitValue(key, value string) error {
@@ -416,6 +544,9 @@ func validateEvidence(profile *Profile) error {
 func requiredEvidenceKeys(emit *Emit) []string {
 	keys := slices.Clone(requiredEmitSurfaces)
 
+	// stainless 是 schema 2 的必填组，七个值共用一条证据（SDK bundle / 抓包）。
+	keys = append(keys, "stainless")
+
 	if emit.LoginPlatform != "" {
 		keys = append(keys, "loginPlatform")
 	}
@@ -430,6 +561,110 @@ func requiredEvidenceKeys(emit *Emit) []string {
 	}
 
 	return keys
+}
+
+// tlsExtensionAllowed 允许出现在 profile tls.extensions 里的扩展 ID。
+// 16 (ALPN)、27 (certificate_compression)、41 (pre_shared_key) 被刻意排除：
+// 官方首连不带它们，PSK 由会话恢复在运行时追加。
+var tlsExtensionAllowed = map[uint16]bool{
+	0: true, 10: true, 11: true, 13: true, 21: true, 23: true,
+	35: true, 43: true, 45: true, 51: true, 65281: true,
+}
+
+// validateTLS 校验可选的 tls 段结构：只接受已知扩展、无 GREASE、无 ALPN/证书
+// 压缩/显式 PSK，padding 若存在必须是最后一个，且各数值列表非空。
+func validateTLS(spec *TLS) error {
+	if spec == nil {
+		return nil
+	}
+
+	if err := validateTLSShape(spec); err != nil {
+		return err
+	}
+
+	return validateTLSExtensions(spec.Extensions)
+}
+
+// validateTLSShape 校验非空与 GREASE：五个 uint16 列表共用同一检查。
+func validateTLSShape(spec *TLS) error {
+	if len(spec.Versions) == 0 || len(spec.CipherSuites) == 0 || len(spec.Extensions) == 0 ||
+		len(spec.Groups) == 0 || len(spec.PointFormats) == 0 ||
+		len(spec.SignatureAlgorithms) == 0 || len(spec.PSKModes) == 0 {
+		return fmt.Errorf("tls 段的 versions/cipherSuites/extensions/groups/pointFormats/"+
+			"signatureAlgorithms/pskModes 均不能为空: %w", errInvalidProfile)
+	}
+
+	checks := []struct {
+		field  string
+		values []uint16
+	}{
+		{"tls.versions", spec.Versions},
+		{"tls.cipherSuites", spec.CipherSuites},
+		{"tls.groups", spec.Groups},
+		{"tls.signatureAlgorithms", spec.SignatureAlgorithms},
+		{"tls.extensions", spec.Extensions},
+	}
+
+	for _, check := range checks {
+		if err := rejectGREASE(check.field, check.values); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+//nolint:gocyclo,cyclop // 扩展 ID 校验是线性 switch。
+func validateTLSExtensions(extensions []uint16) error {
+	seen := make(map[uint16]bool, len(extensions))
+	sni := false
+
+	for i, id := range extensions {
+		switch id {
+		case tlsExtALPN:
+			return fmt.Errorf("tls.extensions 不得包含 ALPN(16): %w", errInvalidProfile)
+		case tlsExtCertificateCompression:
+			return fmt.Errorf("tls.extensions 不得包含 certificate_compression(27): %w", errInvalidProfile)
+		case tlsExtPreSharedKey:
+			return fmt.Errorf("tls.extensions 不得包含 pre_shared_key(41)（PSK 由会话恢复追加）: %w", errInvalidProfile)
+		}
+
+		if !tlsExtensionAllowed[id] {
+			return fmt.Errorf("tls.extensions 含未知扩展 ID %d: %w", id, errInvalidProfile)
+		}
+
+		if seen[id] {
+			return fmt.Errorf("tls.extensions 含重复扩展 ID %d: %w", id, errInvalidProfile)
+		}
+
+		seen[id] = true
+
+		if id == tlsExtServerName {
+			sni = true
+		}
+
+		if id == tlsExtPadding && i != len(extensions)-1 {
+			return fmt.Errorf("tls.extensions 的 padding(21) 必须是最后一个（位置 %d/%d）: %w",
+				i, len(extensions), errInvalidProfile)
+		}
+	}
+
+	if !sni {
+		return fmt.Errorf("tls.extensions 必须包含 server_name(0): %w", errInvalidProfile)
+	}
+
+	return nil
+}
+
+// rejectGREASE 拒绝 GREASE 值（形如 0x0a0a / 0x1a1a）：官方 Node 从不启用 GREASE。
+func rejectGREASE(field string, values []uint16) error {
+	for _, value := range values {
+		if value&0x0f0f == 0x0a0a && value>>8 == value&0xff {
+			return fmt.Errorf("%s 含 GREASE 值 0x%04x: %w", field, value, errInvalidProfile)
+		}
+	}
+
+	return nil
 }
 
 func validateEvidenceEntry(key string, evidence Evidence) error {
