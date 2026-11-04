@@ -624,7 +624,7 @@ func setupSessionRouter(
 // configureUpstream 把 config 的 HTTP 超时、脱敏开关、UA / 归属头、global 路由与
 // model.json 缓存路径注入出站客户端。装配期一次性捕获，改动需重启。
 //
-//nolint:funlen,maintidx // 装配字段多，线性赋值更易核对。
+//nolint:funlen,gocyclo,cyclop,maintidx // 装配字段多，线性赋值更易核对。
 func configureUpstream(cfg *Config, client *upstream.Client) error {
 	// 短 RPC 总时长上限（refresh/checkin/balance/FetchModels），语义不变。
 	client.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -660,6 +660,12 @@ func configureUpstream(cfg *Config, client *upstream.Client) error {
 
 	if err := loadClientProfile(cfg, client); err != nil {
 		return err
+	}
+	// 出站指纹开关（#457/#458）：启动期一次性安装 TLS 拨号与头序重写，改后需重启。
+	client.SetHeaderOrder(cfg.Upstream.HeaderOrder == nil || *cfg.Upstream.HeaderOrder)
+
+	if err := client.SetTLSFingerprint(cfg.Upstream.TLSFingerprint); err != nil {
+		return fmt.Errorf("安装出站 TLS 指纹: %w", err)
 	}
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
@@ -1132,6 +1138,7 @@ var restartFieldPaths = []string{
 	// HTTP client / 出站身份 / 代理在 configureUpstream 一次性注入。
 	"upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds",
 	"upstream.keepalive_interval", "upstream.model_timeouts", "upstream.user_agent",
+	"upstream.header_order", "upstream.tls_fingerprint",
 	"upstream.client_version", "upstream.cli_version", "upstream.client_name",
 	"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip",
 	"upstream.rotate_max", "upstream.rotate_budget", "upstream.rotate_status_codes",

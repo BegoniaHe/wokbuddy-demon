@@ -14,7 +14,8 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// TestChatHeadersEnterpriseTenant 企业账号同时发企业/租户头；个人 global 发 X-No-Enterprise-Id。
+// TestChatHeadersEnterpriseTenant 企业账号同时发企业/租户头；个人 global 不发企业
+// 声明头（官方 chat 无 X-No-*，#455）。
 func TestChatHeadersEnterpriseTenant(t *testing.T) {
 	t.Parallel()
 
@@ -39,7 +40,7 @@ func TestChatHeadersEnterpriseTenant(t *testing.T) {
 			name:   "global-personal",
 			auth:   &auth.Auth{AccessToken: "at", UID: "u1", Domain: "www.workbuddy.ai"},
 			global: true,
-			want:   map[string]string{"X-No-Enterprise-Id": "1", "X-Domain": "www.workbuddy.ai"},
+			want:   map[string]string{"X-Domain": "www.workbuddy.ai"},
 		},
 	}
 

@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"compress/gzip"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1285,6 +1286,17 @@ type Client struct {
 	// registry 当前生效的出站注册表（issue #39）：槽 -> 池 / realm 默认槽。
 	// 整体替换（*outbound.Registry 构造后不可变）；nil = 未装配。
 	registry atomic.Pointer[outbound.Registry]
+
+	// headerOrder / tlsFingerprint 出站指纹开关（#457/#458）。只在启动期由
+	// SetHeaderOrder / SetTLSFingerprint 写入（改动需重启），运行期只读。
+	headerOrder    atomic.Bool
+	tlsFingerprint atomic.Pointer[tlsFingerprintConfig]
+	// tlsStateMu/tlsState TLS 会话缓存（Go 与 uTLS 各一份，惰性创建）。
+	tlsStateMu sync.Mutex
+	tlsState   *tlsHandshakeState
+
+	// tlsRootCAs 测试注入的自签根证书池；nil = 系统根（生产默认）。
+	tlsRootCAs *x509.CertPool
 
 	// desktopSessionMu/desktopSessionIDs 桌面 /v2/report 的进程内 sessionId 缓存。
 	// 官方 sessionId 跟随客户端进程生命周期：同一账号在进程内保持稳定，重启后刷新，
@@ -2614,6 +2626,20 @@ func (c *Client) chatHTTPForAccount(account5 *auth.Auth, duration2 time.Duration
 	return c.slotClient(account5, c.chatHTTPForHeader(duration2), "chat|"+duration2.String()+"|")
 }
 
+// writeDeadlineDialer 给拨号器返回的连接补写方向 deadline；按槽与全局出口同口径。
+func writeDeadlineDialer(
+	dial func(context.Context, string, string) (net.Conn, error),
+) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		return &writeDeadlineConn{Conn: conn, writeTimeout: writeTimeout}, nil
+	}
+}
+
 // slotClient 按「槽 + base client」返回账号出口专用 client（issue #96/#39）：
 // 未配置路由、无绑定槽或槽拨号器为 nil 时回落 base。
 //
@@ -2638,21 +2664,22 @@ func (c *Client) slotClient(a *auth.Auth, base *http.Client, prefix string) *htt
 		return client
 	}
 
-	tr, ok := base.Transport.(*http.Transport)
+	transport, ok := base.Transport.(*http.Transport)
 	if !ok {
 		return base
 	}
 
-	cloned := tr.Clone()
-	duration := writeTimeout
-	cloned.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		conn, err := dial(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
+	cloned := transport.Clone()
+	slotDial := writeDeadlineDialer(dial)
 
-		return &writeDeadlineConn{Conn: conn, writeTimeout: duration}, nil
+	cloned.DialContext = slotDial
+	// 自定义 TLS 拨号必须同样走槽拨号器，否则槽绑定账号会绕过代理换用全局出口。
+	if transport.DialTLSContext != nil {
+		cloned.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return c.dialTLSWith(ctx, network, addr, slotDial)
+		}
 	}
+
 	client := &http.Client{Transport: cloned, Timeout: base.Timeout}
 
 	// 构建期间出口被换掉（代数已推进）：本次照用这条连接，但不得写进新出口的
@@ -3020,7 +3047,7 @@ func (c *Client) fetchEnterpriseModelsPath(
 	}
 
 	c.CommonHeaders(req, account7) // 复用共享请求头（UA/Accept/Content-Type）
-	injectEnterpriseHeaders(req, account7)
+	injectEnterpriseIDHeaders(req, account7)
 	injectChatDomain(req, account7)
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account7.AccessTokenValue())

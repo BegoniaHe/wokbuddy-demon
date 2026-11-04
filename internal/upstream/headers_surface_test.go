@@ -40,8 +40,8 @@ func assertHeaderKeys(t *testing.T, req *http.Request, want ...string) {
 	}
 }
 
-// surfaceGoldenAccount 黄金头集用例的固定账号：CN 个人号（有 domain，避免
-// X-No-* 声明头干扰键集比对）；带 device token，用于钉住「只有 chat 面发该头」。
+// surfaceGoldenAccount 黄金头集用例的固定账号：CN 个人号（有 domain）；带 device
+// token，用于钉住「只有 chat 面发该头」。
 func surfaceGoldenAccount() *auth.Auth {
 	return &auth.Auth{
 		UID: "u1", AccessToken: "at", RefreshToken: "rt",
@@ -562,9 +562,12 @@ func TestChatGoldenHeaderSet(t *testing.T) {
 		"X-Agent-Type", "X-B3-Parentspanid", "X-B3-Sampled", "X-B3-Spanid", "X-B3-Traceid",
 		"X-Codebuddy-Request", "X-Conversation-Id", "X-Conversation-Message-Id",
 		"X-Conversation-Request-Id", "X-Domain", "X-Ide-Name", "X-Ide-Type", "X-Ide-Version",
-		"X-No-Enterprise-Id", "X-Private-Data", "X-Product", "X-Request-Id",
+		"X-Private-Data", "X-Product", "X-Request-Id",
 		"X-Requested-With", "X-Root-Request-Id", "X-Trace-Id", "X-User-Id",
 		"X-Device-Token",
+		"x-stainless-arch", "x-stainless-lang", "x-stainless-os",
+		"x-stainless-package-version", "x-stainless-retry-count",
+		"x-stainless-runtime", "x-stainless-runtime-version",
 	)
 
 	if got := req.Header.Get("Accept"); got != "application/json" {

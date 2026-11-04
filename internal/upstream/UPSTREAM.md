@@ -92,7 +92,8 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 采用的桌面端 / CLI 行为：
 
 - CN origin 主域 `www.workbuddy.cn`，首 token 前可回落 `copilot.tencent.com` / `wb.tencentbuddy.com`。
-- 企业账号 chat 同时发 `X-Enterprise-Id` / `X-Tenant-Id`；个人 global 发 `X-No-Enterprise-Id: 1`。
+- 企业账号 chat 同时发 `X-Enterprise-Id` / `X-Tenant-Id`；CLI chat 的个人号不发任何
+  `X-No-*`（桌面专家 chat 仍发 `X-No-Enterprise-Id: 1`，见 #455）。
 - 官方 CLI chat 拦截器与 daemon 网关都不发 `Origin` / `Referer` / `X-Machine-Id` / `X-Session-Id`；本仓库的 `CommonHeaders` 同样不注入，只有 web 端点按自身契约构造 `Origin` / `Referer`。
 - chat UA 由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 构造；第二段是 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`），显式 `client_version` / `cli_version` 覆盖时同样按 realm 取品牌；`/v2/report` 的 UA 是 desktop surface，两者不可混用。
 - 401 同号 refresh + replay；refresh 401/403 映射会话失效；同账号/同 RT refresh 单飞（60s 按需复用）。
@@ -151,14 +152,56 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | refresh 头集与 body | 已对齐 | 真机 11 头 + body `{}`（`Content-Length: 2`）：`Accept: application/json, text/plain, */*`（宽松值，不沿用轻头族默认）、`Authorization`（与 `X-Refresh-Token` **双发**，与 chat 相反）、`X-User-Id`、`X-Request-ID`（32 hex）、`X-Product: SaaS`、`X-Requested-With`、三段式 UA、`X-Domain`（endpoint authority）、`X-Auth-Refresh-Source: plugin`（#370） |
 | 轻头族 `X-Domain` | 已对齐 | 官方 `enterpriseHeaders()` 无 domain 时回落 **endpoint authority**；轻头族各面（refresh / v3-config / billing / report / busy / growth）统一按本次请求 URL 的 host 取值，不回落 chat base——billing 面走 `billing_base`，取 chat host 会把别的域发给 billing。`cn.chat_base` / `cn.billing_base` 覆盖时各自跟随 |
 | 非 chat 业务面的 `X-Request-ID` | 已对齐（refresh / v3-config / billing / busy / report） | 官方 HTTP 层 `applyRequestId` 对每条业务请求补 32 hex（UUIDv7 形态）；`/v2/activity/growth/*` 是 Node 裸 fetch 面，真机**不带**该头，故 growth 不在覆盖范围（#369 / #375） |
-| `X-Stainless-*` | 不补 | 由 OpenAI Node SDK 自动生成；本仓出站不是 Node SDK，补等于伪造 SDK 运行时版本 |
+| `X-Stainless-*` | 已补（仅 CLI chat） | 2026-11-04 官方 5.9.3 抓包：`POST /v2/chat/completions` 恒带 7 个小写头（`arch` / `lang` / `os` / `package-version` / `retry-count` / `runtime` / `runtime-version`），值来自打包的 OpenAI SDK 6.25.0 + Node v22.21.1。值整组冻结在 profile `emit.stainless`（schema 2 必填），Go 源码不保留版本字面量；agenttool 四路与桌面 chat 不发（#456） |
 | `X-Codebuddy-Request: 1` | 仅 chat 族（chat + agenttool 四路） | 2026-10-28 真机抓包：7 条 chat 全带；refresh / busy / report / v3-config / billing / growth 共 14 条业务请求 0 命中（#368）。agenttool 四路无真机证据，沿 chat 头族一起发 |
-| 个人号 `X-No-Enterprise-Id` | 刻意保留 | chat 族（`injectCNChatHeaders`）与轻头族的 refresh / v3-config（`injectEnterpriseHeaders`）都发；billing / report / busy / growth 真机不带企业头，仅在企业 ID 非空时发 `X-Enterprise-Id` / `X-Tenant-Id`（#298） |
-| 个人号 `X-No-Department-Info` | 仅 chat 族与模型目录系 | 只由 `injectChatDomain` 注入（chat 族 + `FetchModels` / `globalModelsOnce`）；轻头族各面不发——#298 的原始修复点在这两条路径，不在 billing / report |
+| 个人号 `X-No-Enterprise-Id` | chat / 模型目录已删，refresh / v3-config 保留 | 2026-11-04 官方 5.9.3 静态+抓包：chat 链路构造点为 0，个人号缺企业上下文时就是不发；本仓 chat 与 `FetchModels` / `globalModelsOnce` 改用 `injectEnterpriseIDHeaders`（仅企业 ID 非空时发 `X-Enterprise-Id` / `X-Tenant-Id`）。`injectEnterpriseHeaders` 的 `X-No-Enterprise-Id=1` 只留给 refresh / v3-config / 桌面面（#455） |
+| 个人号 `X-No-Department-Info` | 已删除（chat 与模型目录） | 它原先只由 `injectChatDomain` 注入；官方 chat 从不发 `X-No-*`，缺少部门上下文时省略。refresh / v3-config 本来就不发该头，行为不变（#455） |
+| 个人号 `X-No-Authorization` / `X-No-User-Id` | 已删除（chat） | chat 头族不再在缺 token / UID 时补声明头；`true` 形态只属于登录端点（`auth/state`、`auth/token`、`login/account`、`auth/logout`），不在 `internal/upstream` 的 chat 路径（#455） |
 | W3C `baggage`（chat） | 已对齐（4 条） | 真机逐字 `buddyId=,buddyName=,codebuddy.session_id=<会话 id>,codebuddy.conversation_request_id=<请求 id>`；两个 buddy 键是官方无 buddy 上下文时的空值形态，两个 codebuddy 键与同请求 `X-Conversation-Id` / `X-Conversation-Request-Id` 同值。包内还有 `conversation_message_id` / `root_request_id` 两个键常量，但 chat 真机**没发**，多发反而更明显；`tracestate` 仅跨进程 span 携带时下发，网关不伪造（#364） |
 | `X-Private-Data`（CLI chat） | 已对齐（按账号身份 + realm） | 该值是 `productFeatures.DefaultModelOptimizationOff` 的取反派生（`ModelProvider.getCustomHeaders` 读本地 `cli/product.json`，经 `resolveModelOptimizationEnabled` 折算成模型优化开关，header 取其反值）：CN=false → 个人号发 `false`；global=true → 个人号发 `true`；企业版（`isEnterpriseEditionAccount`：enterpriseId 非空或 type 为 ultimate/exclusive）恒发 `true`。该值随客户端产品配置漂移，每轮基线审计需复核。#400 曾把判据收成「只按企业身份、与域无关」并让 global 个人号发 `false`，已由 #411 修正；global 5.8.4 时代按 `DisableYuanbaoChannel=true` 一律发 `true` 的旧理由同样作废。远端 abTest / `executionConfiguration` 与会话 meta `privateDataSticky` 不在网关范围 |
 | `X-Private-Data`（桌面专家路径） | 已对齐（固定 `true`） | 官方桌面主进程 chat 走 `applyGatewayHeaders`，兜底表 `VF` 里该头硬编码 `true`；`buildVlmGatewayHeaders` 同样硬编码。与 CLI chat 分属两条 surface，不能共用阈值；CN / global 5.9.3 同形 |
 | custom model 的 `X-Private-Data` | 不适用 | 本仓没有 custom 模型上游路由（`isCustomModel` 仅用于模型目录可见性），无触达路径 |
+
+### 头序（`upstream.header_order`）
+
+官方 CLI chat 的头序不是 Go 的字典序：OpenAI SDK 的 fetch `Headers` 先按名字排序，
+axios 适配器/拦截器再按插入序追加会话与身份头，Node `http` 最后补
+`Content-Length` / `Accept-Encoding` / `Host` / `Connection: keep-alive`。Go
+`net/http` 固定先写 `Host` / `User-Agent` / `Content-Length`，其余按字典序，`Header.Set`
+的调用顺序无法改变线上字节；因此本仓在 TLS 之上用 `headerOrderConn`
+（`internal/upstream/header_order.go`）重写整个明文头块。
+
+- 作用域：仅 `POST /v2/chat/completions` 且头块带 `x-stainless-lang` 标记的 CLI chat；
+  其他 surface、其他路径原样透传。
+- 顺序与大小写：2026-11-04 抓包的 42 头（`Accept` 首、7 个 `x-stainless-*` 紧随、
+  `X-Conversation-ID` / `X-Request-ID` / `acp-connection-id` / `baggage` /
+  `traceparent` / `b3` 按官方大小写、尾部 `Content-Length` → `Accept-Encoding` →
+  `Host` → `Connection: keep-alive`）。抓包未覆盖的可选头（`X-Parent-Conversation-ID`、
+  `X-Compaction`、`X-Context-Compacted`、`X-Wb-Uid`、`X-Expert-Id`、企业/身份头、
+  `X-Forwarded-For`、`X-Real-IP`）放在已捕获 40 头之后、尾部之前，保持原有相对顺序；
+  未知头同样插在尾部之前。
+- fail-open：头块无法解析或超过 64 KiB 时原样回写并关闭该连接的重写；body 与后续
+  keep-alive 请求不受影响。
+- `Accept-Encoding` 仍由 Go transport 发 `gzip`（透明解压），不手工改成官方
+  `gzip, compress, deflate, br`——这是刻意偏离，见上文 billing 条目。
+
+### TLS 指纹（`upstream.tls_fingerprint`）
+
+`off`（默认）走 Go `crypto/tls`；`node` 用 vendored uTLS
+（`internal/vendor/utls`，`require` + `replace`）按 profile `tls` 段构造 ClientHello，
+复刻官方 Electron 37 / Node v22.21.1 / BoringSSL 的首连形状：
+
+- 18 个 cipher（BoringSSL 默认 TLS1.3 序 + Node `DEFAULT_CIPHERS` 的 TLS1.2 段）、
+  扩展序 `0,23,65281,10,11,35,13,51,45,43`、groups `29,23,24`、sigalgs
+  `1027,2052,1025,1283,2053,1281,2054,1537,513`、无 ALPN / GREASE / 证书压缩。
+- 会话恢复：第二次连接追加 `pre_shared_key`，BoringSSL 式 padding 就位后顺序为
+  `...,43,21,41`，ClientHello 512 字节；动态记录分片关闭。
+- 本地补丁：正常 TLS 1.3 握手不发 dummy `change_cipher_spec`（官方只在 HRR 分支发），
+  补丁说明与升级流程在 `internal/vendor/utls/README.md`。
+- 失败不回落：指纹握手失败直接返回错误，不静默改走标准库 TLS。
+- 能力边界：L1（ClientHello 形状）+ L1.5（PSK/padding）+ L2（记录层不发 dummy CCS）；
+  0-RTT、证书压缩、ECH、完整 BoringSSL 行为（L3）不在范围。上游是否按 JA3/JA4
+  判定仍无证据，故默认 `off`。
 
 无桌面包证端点（**实现依据 ≠ 已对齐官方客户端**；检索范围：截至 CN 5.9.3、CN 5.8.3、global 5.9.3、global 5.8.4 四包 `app-asar` 内 `*.js` / `*.mjs` 均为 0 命中，路径字面量不出现）：
 

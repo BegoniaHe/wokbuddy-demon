@@ -85,6 +85,8 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'device_token', path: ['upstream', 'device_token'], kind: 'password', secret: true },
   { name: 'device_token_file', path: ['upstream', 'device_token_file'], kind: 'text' },
   { name: 'passthrough_ip', path: ['upstream', 'passthrough_ip'], kind: 'checkbox' },
+  { name: 'header_order', path: ['upstream', 'header_order'], kind: 'checkbox' },
+  { name: 'tls_fingerprint', path: ['upstream', 'tls_fingerprint'], kind: 'select' },
   { name: 'rotate_max', path: ['upstream', 'rotate_max'], kind: 'number' },
   { name: 'rotate_budget', path: ['upstream', 'rotate_budget'], kind: 'text' },
   { name: 'rotate_status_codes', path: ['upstream', 'rotate_status_codes'], kind: 'hours' },

@@ -48,6 +48,11 @@ func TestRestartRequiredFieldsAssemblyChanges(t *testing.T) {
 		{"upstream.client_version", func(c *Config) { c.Upstream.ClientVersion = "9.9.9" }},
 		{"upstream.device_token", func(c *Config) { c.Upstream.DeviceToken = "tok" }},
 		{"upstream.passthrough_ip", func(c *Config) { c.Upstream.PassthroughIP = true }},
+		{"upstream.header_order", func(c *Config) {
+			disabled := false
+			c.Upstream.HeaderOrder = &disabled
+		}},
+		{"upstream.tls_fingerprint", func(c *Config) { c.Upstream.TLSFingerprint = upstreamTLSFingerprintNode }},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.field, func(t *testing.T) {

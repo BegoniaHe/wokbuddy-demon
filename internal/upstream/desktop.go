@@ -481,7 +481,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	req.Header.Set("X-Domain", c.desktopDomain(account2))
 	req.Header.Set("X-Product", "SaaS")
 	// 与 surfaceReport 同口径：个人号不发 X-No-Enterprise-Id 声明头（#298）。
-	injectLightEnterpriseHeaders(req, account2)
+	injectEnterpriseIDHeaders(req, account2)
 	req.Header.Set("X-Request-ID", session.NewUUIDv7Hex())
 
 	if account2.UID != "" {

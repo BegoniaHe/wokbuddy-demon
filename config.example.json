@@ -104,6 +104,8 @@
     "device_token": "",
     "device_token_file": "",
     "passthrough_ip": false,
+    "header_order": true,
+    "tls_fingerprint": "off",
     "rotate_max": 3,
     "rotate_budget": "0",
     "rotate_status_codes": [],

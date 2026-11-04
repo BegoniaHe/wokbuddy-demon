@@ -35,6 +35,10 @@ func validProfile(realm string) *Profile {
 			DesktopIdeVersion: "0.0.0",
 			DesktopExtVersion: "0.0.0",
 			LoginPlatform:     login,
+			Stainless: Stainless{
+				Arch: "x64", Lang: "js", OS: "Windows", PackageVersion: "0.0.0",
+				RetryCount: "0", Runtime: "node", RuntimeVersion: "v0.0.0",
+			},
 		},
 		Missing: []string{"loginUA"},
 		Evidence: map[string]Evidence{
@@ -45,6 +49,7 @@ func validProfile(realm string) *Profile {
 			"desktopIdeVersion": {Source: "package", File: "main/module-base.js", Snippet: "ide"},
 			"desktopExtVersion": {Source: "package", File: "main/module-base.js", Snippet: "ext"},
 			"loginPlatform":     {Source: "package", File: "cli/product.json", Snippet: "platform"},
+			"stainless":         {Source: "package", File: "cli/dist/lazy-lite-wb/x.mjs", Snippet: "x-stainless-lang"},
 		},
 	}
 }
@@ -135,6 +140,10 @@ func TestValidateRejectsUnsafeValues(t *testing.T) {
 			p.Emit.LoginUA = &ua
 		}},
 		{"extVersion 同前缀但不同值", func(p *Profile) { p.Emit.DesktopExtVersion = "0.0.0.1" }},
+		{"stainless 空值", func(p *Profile) { p.Emit.Stainless.Lang = "" }},
+		{"stainless 控制字符", func(p *Profile) { p.Emit.Stainless.OS = "Windows\nX-Injected: 1" }},
+		{"stainless 首尾空白", func(p *Profile) { p.Emit.Stainless.Arch = " x64" }},
+		{"schema 1 拒绝", func(p *Profile) { p.Schema = 1 }},
 		{"macOS 包", func(p *Profile) {
 			p.Source.PackageURL = "https://download.codebuddy.cn/workbuddy/saas/darwin-arm64/x.dmg"
 		}},
@@ -219,7 +228,7 @@ func TestLoadFileRejectsUnknownField(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	raw = []byte(strings.Replace(string(raw), `"schema":1`, `"schema":1,"extra":1`, 1))
+	raw = []byte(strings.Replace(string(raw), `"schema":2`, `"schema":2,"extra":1`, 1))
 
 	path := filepath.Join(t.TempDir(), "cn.json")
 	if err := os.WriteFile(path, raw, 0o644); err != nil {
@@ -282,5 +291,101 @@ func TestLoadFileRejectsSemanticInvalidEvenWithBak(t *testing.T) {
 
 	if _, err := LoadFile(filepath.Join(dir, "cn.json")); err == nil {
 		t.Fatal("语义无效的正文不得回退 .bak，应直接报错")
+	}
+}
+
+// TestValidateSchemaOneRejected schema 1 必须被拒，且错误信息点明目标 schema 2，
+// 让运维知道要按新 schema 重新生成 profile（#456）。
+func TestValidateSchemaOneRejected(t *testing.T) {
+	t.Parallel()
+
+	profile := validProfile("cn")
+	profile.Schema = 1
+
+	err := profile.Validate()
+	if err == nil {
+		t.Fatal("schema 1 应校验失败")
+	}
+
+	if !strings.Contains(err.Error(), "want 2") {
+		t.Fatalf("错误信息应点明目标 schema 2: %v", err)
+	}
+}
+
+// validTLS 返回一份结构合法的 tls 段（数值仅用于校验测试）。
+func validTLS() *TLS {
+	return &TLS{
+		Versions:            []uint16{772, 771},
+		CipherSuites:        []uint16{4865, 4866, 4867},
+		Extensions:          []uint16{0, 23, 65281, 10, 11, 35, 13, 51, 45, 43, 21},
+		Groups:              []uint16{29, 23, 24},
+		PointFormats:        []uint8{0},
+		SignatureAlgorithms: []uint16{1027, 2052},
+		PSKModes:            []uint8{1},
+	}
+}
+
+// TestValidateTLSRejectsStructuralDrift tls 段必须是可复刻的官方形状：拒绝
+// ALPN/GREASE/证书压缩/显式 PSK、未知或重复扩展、padding 不在最后、缺 SNI。
+func TestValidateTLSRejectsStructuralDrift(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		edit func(*TLS)
+	}{
+		{"ALPN", func(spec *TLS) { spec.Extensions = []uint16{0, 16, 43} }},
+		{"证书压缩", func(spec *TLS) { spec.Extensions = []uint16{0, 27, 43} }},
+		{"显式 PSK", func(spec *TLS) { spec.Extensions = []uint16{0, 43, 41} }},
+		{"未知扩展", func(spec *TLS) { spec.Extensions = []uint16{0, 99, 43} }},
+		{"重复扩展", func(spec *TLS) { spec.Extensions = []uint16{0, 43, 43} }},
+		{"padding 不在最后", func(spec *TLS) { spec.Extensions = []uint16{0, 21, 43} }},
+		{"缺 SNI", func(spec *TLS) { spec.Extensions = []uint16{23, 43} }},
+		{"GREASE 扩展", func(spec *TLS) { spec.Extensions = []uint16{0, 0x1a1a, 43} }},
+		{"GREASE cipher", func(spec *TLS) { spec.CipherSuites = []uint16{4865, 0x0a0a} }},
+		{"空 groups", func(spec *TLS) { spec.Groups = nil }},
+		{"空 sigalgs", func(spec *TLS) { spec.SignatureAlgorithms = nil }},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			profile := validProfile("cn")
+			profile.TLS = validTLS()
+			testCase.edit(profile.TLS)
+
+			if err := profile.Validate(); err == nil {
+				t.Fatal("应校验失败")
+			}
+		})
+	}
+}
+
+// TestLoadDirRejectsRealmTLSDiff 两个 realm 的 tls 段必须一致：共享 Transport
+// 无法按 realm 切换 ClientHello。
+func TestLoadDirRejectsRealmTLSDiff(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	cnProfile := validProfile("cn")
+	cnProfile.TLS = validTLS()
+	global := validProfile("global")
+	global.TLS = validTLS()
+	global.TLS.Groups = []uint16{29}
+
+	writeProfile(t, dir, "cn.json", cnProfile)
+	writeProfile(t, dir, "global.json", global)
+
+	if _, err := LoadDir(dir); err == nil {
+		t.Fatal("realm tls 段不一致应报错")
+	}
+
+	// 相同段必须通过。
+	global.TLS = validTLS()
+	writeProfile(t, dir, "global.json", global)
+
+	if _, err := LoadDir(dir); err != nil {
+		t.Fatalf("相同 tls 段应合法: %v", err)
 	}
 }
