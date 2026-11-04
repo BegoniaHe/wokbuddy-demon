@@ -253,8 +253,9 @@ func assertNoForbiddenExtensions(t *testing.T, extensions []uint16) {
 			t.Errorf("出现 GREASE 扩展 0x%04x", id)
 		}
 	}
-} // TestClientHelloFingerprint 首连 JA3/JA4 必须与 2026-11-04 抓包逐字一致。
+}
 
+// TestClientHelloFingerprint 首连 JA3/JA4 必须与 2026-11-04 抓包逐字一致。
 func TestClientHelloFingerprint(t *testing.T) {
 	t.Parallel()
 

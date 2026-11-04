@@ -1,6 +1,24 @@
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+)
+
+// TestUpstreamTLSFingerprintConstantsMatch upstream 的指纹模式常量与 config 层的
+// 副本必须同值：config.go 为避免反向依赖没有直接引用它们，这里守住漂移。
+func TestUpstreamTLSFingerprintConstantsMatch(t *testing.T) {
+	t.Parallel()
+
+	if upstreamTLSFingerprintOff != upstream.TLSFingerprintOff {
+		t.Errorf("off 常量不一致：config=%q upstream=%q", upstreamTLSFingerprintOff, upstream.TLSFingerprintOff)
+	}
+
+	if upstreamTLSFingerprintNode != upstream.TLSFingerprintNode {
+		t.Errorf("node 常量不一致：config=%q upstream=%q", upstreamTLSFingerprintNode, upstream.TLSFingerprintNode)
+	}
+}
 
 // TestUpstreamFingerprintConfig 出站指纹两个开关的缺省值与取值域：
 // header_order 缺省 true（显式 false 保留），tls_fingerprint 缺省 off，只接受 off/node。

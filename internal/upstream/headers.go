@@ -706,8 +706,8 @@ func injectCNChatHeaders(req *http.Request, account *auth.Auth) {
 // 官方桌面端企业账号同时发 X-Enterprise-Id 与 X-Tenant-Id；个人账号显式声明
 // X-No-Enterprise-Id=1，避免上游按缺失头做可疑判定。
 //
-// 只用于 refresh / v3-config / 桌面等非 chat 面；chat 与模型目录走
-// injectEnterpriseIDHeaders（官方 chat 不发 X-No-*，#455）。
+// 只用于 refresh / v3-config 与桌面专家 chat；CLI chat 与模型目录走
+// injectEnterpriseIDHeaders（官方 CLI chat 不发 X-No-*，#455）。
 func injectEnterpriseHeaders(req *http.Request, account *auth.Auth) {
 	if account != nil && account.EnterpriseID != "" {
 		req.Header.Set("X-Enterprise-Id", account.EnterpriseID)
