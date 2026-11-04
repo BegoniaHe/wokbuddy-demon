@@ -137,17 +137,25 @@ func (g *GREASEEncryptedClientHelloExtension) init() error {
 				return
 			}
 
+			// [LOCAL PATCH] 上游在 kdf/aead 创建失败后没有 return，会带着
+			// nil kdf/aead 继续调用 hpke.NewSender；这里补齐错误返回。
 			kdf, err := hpke.NewKDF(defaultHpkeKdf)
 			if err != nil {
 				initErr = fmt.Errorf("tls: grease ech: failed to create kdf: %w", err)
+				return
 			}
 
 			aead, err := hpke.NewAEAD(defaultHpkeAead)
 			if err != nil {
 				initErr = fmt.Errorf("tls: grease ech: failed to create aead: %w", err)
+				return
 			}
 
 			g.EncapsulatedKey, _, err = hpke.NewSender(publicKey, kdf, aead, []byte{})
+			if err != nil {
+				initErr = fmt.Errorf("tls: grease ech: failed to create sender: %w", err)
+				return
+			}
 
 		}
 

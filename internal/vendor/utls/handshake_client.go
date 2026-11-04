@@ -730,18 +730,18 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 		}
 	}
 
-	keyAgreement := hs.suite.ka(c.vers)
+	ka := hs.suite.ka(c.vers)
 
 	skx, ok := msg.(*serverKeyExchangeMsg)
 	if ok {
-		err = keyAgreement.processServerKeyExchange(c.config, hs.hello, hs.serverHello, c.peerCertificates[0], skx)
+		err = ka.processServerKeyExchange(c.config, hs.hello, hs.serverHello, c.peerCertificates[0], skx)
 		if err != nil {
 			c.sendAlert(alertIllegalParameter)
 			return err
 		}
-		if keyAgreement, ok := keyAgreement.(*ecdheKeyAgreement); ok {
-			c.curveID = keyAgreement.curveID
-			c.peerSigAlg = keyAgreement.signatureAlgorithm
+		if ecdhe, isECDHE := ka.(*ecdheKeyAgreement); isECDHE {
+			c.curveID = ecdhe.curveID
+			c.peerSigAlg = ecdhe.signatureAlgorithm
 		}
 
 		msg, err = c.readHandshake(&hs.finishedHash)
@@ -789,7 +789,7 @@ func (hs *clientHandshakeState) doFullHandshake() error {
 		}
 	}
 
-	preMasterSecret, ckx, err := keyAgreement.generateClientKeyExchange(c.config, hs.hello, c.peerCertificates[0])
+	preMasterSecret, ckx, err := ka.generateClientKeyExchange(c.config, hs.hello, c.peerCertificates[0])
 	if err != nil {
 		c.sendAlert(alertInternalError)
 		return err

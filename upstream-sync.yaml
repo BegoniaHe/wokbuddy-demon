@@ -14,30 +14,29 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 77d4762f88c87b3235c0d0467cae3bdf7a4e6d4f
-  audited_at_utc: 2026-11-04T08:23:16Z
+  commit: dd01a5262379d1f63065165c16c1af902cf0ea6f
+  audited_at_utc: 2026-11-04T18:22:29Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
-    from: 2026-11-02
+    from: 2026-11-04
     to: 2026-11-04
-    non_merge_commits: 12
-    merge_commits: 5
+    non_merge_commits: 1
+    merge_commits: 0
   dispositions:
-    issue: 1
+    issue: 0
     revisit: 1
-    skip: 15
-  issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/454
+    skip: 0
+  issues: []
   note: >-
-    2026-11-04 审计 f6c4a451..77d4762f（17 条提交：12 条内容 + 5 条 PR 合入）。
-    官方版本未变（cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901），
-    沿用本地已解包 Win32 app-asar 并重跑 protocol_sweep。新开 #454：流式读取在
-    [DONE] 处停读、关闭时先 cancel context 且不读流尾，上游连接始终无法回池复用
-    （本仓无参考提交里的 proxypool，该部分不适用）。到期加权窗口默认 168h 记
-    revisit：本仓权重是 weightOf×虚拟实例数、不存在参考提交的反降权，窗口是否过窄
-    需本仓真实批次分布。reqlog 超长行、心跳帧粘连、客户端断开归因、面板特性等按
-    skip：触发形态在本仓架构下不可达或已有同口径实现。审计不产生实现提交，游标
-    推进是独立的 chore(sync) 元数据提交。
+    2026-11-04 二次审计 77d4762f..dd01a526（1 条提交，三块内容）。官方版本未变
+    （cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901），重跑
+    download_latest --dry-run 与 protocol_sweep 复核。① tools 脱敏：代码事实成立
+    （payload.go:138-142 只洗 messages，tools 子树无净化），官方包也证 tools[].function
+    .description 是真实出站面，但「上游对工具描述里的模板句同样逐字拦截」无包内证据，
+    出处 ithtelab/workbuddy-manager#395 自述未做对照实测，记 revisit 等本仓实测样本。
+    ② 轮询指纹跳过：本仓面板是 React（useQuery refetchInterval + 按 uid keyed），
+    不存在 innerHTML 重建打断焦点/悬停的形态。③ AutoBot.yml 属参考侧自动化，本仓无此
+    文件。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。

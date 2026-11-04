@@ -1,0 +1,85 @@
+# vendored uTLS 的静态检查配置。
+#
+# 本目录是上游 uTLS 的原样副本（仅保留少量本地补丁，见 go.mod 与
+# internal/upstream/UPSTREAM.md），不是本仓库的第一方代码。因此这里不套用仓库
+# 根目录 .golangci.yml 的风格/复杂度规则（wsl、revive、err113、lll、varnamelen
+# 等）：那会在 3 万行上游代码里制造数千处纯格式 diff，使「与上游逐文件比对」
+# 这一升级手段失效。
+#
+# 只保留能发现真实缺陷的分析器；已被上游刻意采用、改了就偏离语义的模式在下方
+# 逐条豁免并写明原因。新增规则前先确认它不会把上游风格当成缺陷。
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - gosec
+    - govet
+    - ineffassign
+    - nilerr
+    - nilnesserr
+    - staticcheck
+    - wastedassign
+
+  # 未启用 errcheck / errorlint / unused：
+  #   errcheck   上游对 sendAlert、SetDeadline 等内部错误普遍刻意忽略，逐函数豁免
+  #              等价于关闭该检查；
+  #   errorlint  crypto/tls 用 err.(alert) 与 err == errNoCertificates 直接判定，
+  #              改为 errors.Is/As 会偏离上游语义；
+  #   unused     完整上游 API 面与 build tag 条件使用的符号会被误判为死代码。
+  settings:
+    # enable-all 与根配置同口径，含 shadow（变量遮蔽）等官方分析器。
+    govet:
+      enable-all: true
+      disable:
+        # 内存布局建议与 TLS 结构体字段顺序无关。
+        - fieldalignment
+        # 仅提示可内联的调用点，不是缺陷。
+        - inline
+    # 上游仍使用 net.Error.Temporary、x509.CertPool.Subjects、
+    # rsa.EncryptPKCS1v15 等已弃用 API：它们对应 TLS 1.2 语义，替换会改变行为。
+    # 只保留 SA*（correctness）检查：S1*/ST1*/QF* 是简化与风格建议（含 IANA
+    # cipher suite 常量名），按 vendored 政策不在此处重写。
+    staticcheck:
+      checks:
+        - SA*
+        - -SA1019
+    # 豁免项均为 TLS 实现固有模式：
+    #   G103  unsafe 用法是 crypto/tls 的既定实现；
+    #   G104  未处理错误与 crypto/tls 的 sendAlert 模式重复，属上游设计；
+    #   G115  协议字段转换的整数截断，由上层长度校验兜底；
+    #   G304  keylog 文件路径来自调用方；
+    #   G401/G405/G501/G502/G503/G505  弱算法/固定 IV 是 TLS 兼容性所需；
+    #   G404  uTLS 随机化指纹刻意使用 math/rand（不用于生成密钥）；
+    #   G602  切片越界告警来自 cryptobyte 的既有边界检查。
+    gosec:
+      excludes:
+        - G103
+        - G104
+        - G115
+        - G304
+        - G401
+        - G404
+        - G405
+        - G501
+        - G502
+        - G503
+        - G505
+        - G602
+
+  exclusions:
+    rules:
+      # 上游在握手函数中大量使用 `if err := ...; err != nil` 遮蔽外层 err，
+      # 属 crypto/tls 既有写法；其余遮蔽（类型名、函数名、非 err 变量）仍会报出。
+      - linters:
+          - govet
+        text: 'shadow: declaration of "err" shadows declaration'
+      # 无法解密的 session ticket 按设计丢弃并返回 (nil, nil)，不是错误吞掉。
+      - linters:
+          - nilerr
+        path: ^(handshake_server|ticket)\.go$

@@ -17,7 +17,7 @@ VERSION  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 LDFLAGS  := -s -w -X main.appVersion=$(VERSION)
 
 .PHONY: all build build-all build-tools run dev restart stop status logs config \
-	test test-short test-race bench cover lint fmt fmt-check vet escape tidy clean ci \
+	test test-short test-race bench cover lint lint-vendor fmt fmt-check vet escape tidy clean ci \
 	web web-install web-dev web-check web-check-dist \
 	docker-build docker-up docker-down docker-logs help
 
@@ -139,8 +139,13 @@ cover:
 	go tool cover -func=coverage.out
 
 # 静态检查（严格规则集见 .golangci.yml）。
-lint:
+lint: lint-vendor
 	$(GOLANGCI) run $(PKG)
+
+# vendored uTLS 是独立 module（require + replace），根 ./... 不会包含它。
+# 用该目录内自己的 .golangci.yml，只跑 correctness/安全类规则。
+lint-vendor:
+	cd internal/vendor/utls && $(GOLANGCI) run ./...
 
 # 格式化：gofumpt（含 extra.group-params）+ gci（import 分组）。
 fmt:

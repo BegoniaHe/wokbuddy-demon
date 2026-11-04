@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `edcfdf80d93c69b0e24353ebc09281700fa8a311`（2026-11-02）。该基线与本仓库无共同祖先，
+  `dd01a5262379d1f63065165c16c1af902cf0ea6f`（2026-11-04）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -54,7 +54,12 @@ Win32 仍是 cn 5.9.3 / global 5.9.4），新开 #438（`/v3/config` 缺 `Connec
 2026-11-04 续审 `f6c4a451..77d4762f`（12 条内容 + 5 条 PR 合入；官方 Win32 未变），
 新开 #454：流式读取在 `[DONE]` 处停读、关闭时先取消 context 且不读流尾，上游连接
 无法回池复用；到期加权窗口默认值记 `revisit`（本仓权重模型与参考 fork 不同，需本仓
-真实批次分布），其余按 `skip` 落账。后续审计从 `77d4762f` 之后开始。
+真实批次分布），其余按 `skip` 落账。
+2026-11-04 再续审 `77d4762f..dd01a526`（1 条提交，三块内容；官方 Win32 未变），
+全部记 `revisit` / 不适用：tools 子树脱敏的代码事实成立（`payload.go` 只洗 messages），
+但上游是否会拦工具描述里的模板句无证据、出处自述未实测；轮询指纹跳过对应参考 fork 的
+`innerHTML` 重建形态，本仓面板是 React 渲染；`AutoBot.yml` 属参考侧自动化。后续审计从
+`dd01a526` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -200,7 +205,8 @@ axios 适配器/拦截器再按插入序追加会话与身份头，Node `http` �
 - 会话恢复：第二次连接追加 `pre_shared_key`，BoringSSL 式 padding 就位后顺序为
   `...,43,21,41`，ClientHello 512 字节；动态记录分片关闭。
 - 本地补丁：正常 TLS 1.3 握手不发 dummy `change_cipher_spec`（官方只在 HRR 分支发），
-  补丁说明与升级流程在 `internal/vendor/utls/README.md`。
+  以及 GREASE ECH 初始化的错误返回；补丁清单与升级流程在
+  `internal/vendor/utls/README.md`。
 - 失败不回落：指纹握手失败直接返回错误，不静默改走标准库 TLS。
 - 能力边界：L1（ClientHello 形状）+ L1.5（PSK/padding）+ L2（记录层不发 dummy CCS）；
   0-RTT、证书压缩、ECH、完整 BoringSSL 行为（L3）不在范围。上游是否按 JA3/JA4
@@ -268,7 +274,7 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 - 上游远端：`upstream` → `https://github.com/misakano7545/workbuddy2api-panel.git`
   （branch `main`）。首次使用执行 `git fetch --prune upstream`。
 - 审计游标（逻辑基线，位于参考 fork 历史中，非本仓库祖先）：
-  `77d4762f88c87b3235c0d0467cae3bdf7a4e6d4f`（2026-11-04 推进）。
+  `dd01a5262379d1f63065165c16c1af902cf0ea6f`（2026-11-04 推进）。
 - 正式审计前先刷新官方 Win32 包并跑 `reverse-workbuddy` 的
   `download_latest.mjs` / `protocol_sweep.mjs`；官方静态包缺失时停止审计。
 - 常用命令：
@@ -283,4 +289,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-04（参考 fork 审计基线 `77d4762f`；窗口 `f6c4a451..77d4762f` 开 Issue #454；不直接吸收）。_
+_最近更新：2026-11-04（参考 fork 审计基线 `dd01a526`；窗口 `77d4762f..dd01a526` 全部记 revisit/不适用，未开 Issue；不直接吸收）。_

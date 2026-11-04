@@ -339,14 +339,28 @@ The initial development of uTLS was completed during an internship at [Google Ji
 
 ## 本地补丁
 
-只有一处语义改动：
+两处语义改动：
 
 - `handshake_client_tls13.go`：删除 `processServerHello` 之后**无条件**发送 dummy
   `change_cipher_spec` 的调用。官方 Node/BoringSSL 只在 HelloRetryRequest 分支发送
   该记录；保留上游行为会在正常 TLS 1.3 握手中多出一条 record type 20，与官方报文
   不一致。HRR 分支的调用保持不变。
+- `u_ech.go`：GREASE ECH 初始化在 kdf/aead 创建失败后补 `return`，并检查
+  `hpke.NewSender` 的错误。上游缺这几个分支会带着 nil kdf/aead 继续调用
+  `NewSender`，属于错误路径缺陷（不影响正常握手与指纹）。
 
-补丁位置在源码里以 `[LOCAL PATCH]` 标注。除此之外的差异应当只有被删除的测试文件。
+补丁位置在源码里以 `[LOCAL PATCH]` 标注。另有四处非语义重命名（`maxSupportedVersion`
+的局部变量、两处 `keyAgreement` 局部变量、ALPS 分支的 PRNG），用于消除 `go vet`
+的变量遮蔽告警；它们不改变行为。除此之外的差异应当只有被删除的测试文件。
+
+## 静态检查
+
+本目录是独立 module，根目录的 `golangci-lint run ./...` 不会包含它，因此
+`make lint` 会额外在 `internal/vendor/utls/` 内再跑一次。这里只套用能发现真实缺陷的
+分析器（`govet` 全量含 shadow、`staticcheck` 的 SA*、`ineffassign`、`nilerr`、
+`nilnesserr`、`wastedassign`、`gosec`），不套用仓库第一方代码的风格/复杂度规则：
+对上游代码做格式化与风格重写会产生数千行无意义 diff，破坏与上游的逐文件比对。
+完整豁免清单与原因见同目录 `.golangci.yml`。
 
 ## 升级步骤
 

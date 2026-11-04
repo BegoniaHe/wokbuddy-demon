@@ -3530,11 +3530,11 @@ func generateRandomizedSpec(
 			// seed to create a new, independent PRNG, so that a seed used
 			// with the previous version of generateRandomizedSpec will
 			// produce the exact same spec as long as ALPS isn't selected.
-			r, err := newPRNGWithSaltedSeed(id.Seed, "ALPS")
+			alpsPRNG, err := newPRNGWithSaltedSeed(id.Seed, "ALPS")
 			if err != nil {
 				return p, err
 			}
-			if r.FlipWeightedCoin(id.Weights.Extensions_Append_ALPS) {
+			if alpsPRNG.FlipWeightedCoin(id.Weights.Extensions_Append_ALPS) {
 				// As with the ALPN case above, default to something popular
 				// (unlike ALPN, ALPS can't yet be specified in uconn.config).
 				alps := &ApplicationSettingsExtension{SupportedProtocols: []string{"h2"}}

@@ -12,6 +12,7 @@ on:
       - "go.mod"
       - "go.sum"
       - ".golangci.yml"
+      - "internal/vendor/utls/.golangci.yml"
       - ".github/workflows/lint.yml"
   workflow_dispatch:
 
@@ -34,5 +35,9 @@ jobs:
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
       - name: Lint
         run: golangci-lint run --timeout=5m ./...
+      # vendored uTLS 是独立 module，根 ./... 不包含它；用其目录内的配置只跑
+      # correctness/安全类规则（见 internal/vendor/utls/.golangci.yml 顶部说明）。
+      - name: Lint vendored uTLS
+        run: cd internal/vendor/utls && golangci-lint run --timeout=5m ./...
       - name: Format check (gofumpt + gci)
         run: golangci-lint fmt --diff ./...
