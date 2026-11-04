@@ -205,7 +205,8 @@ axios 适配器/拦截器再按插入序追加会话与身份头，Node `http` �
 - 会话恢复：第二次连接追加 `pre_shared_key`，BoringSSL 式 padding 就位后顺序为
   `...,43,21,41`，ClientHello 512 字节；动态记录分片关闭。
 - 本地补丁：正常 TLS 1.3 握手不发 dummy `change_cipher_spec`（官方只在 HRR 分支发），
-  补丁说明与升级流程在 `internal/vendor/utls/README.md`。
+  以及 GREASE ECH 初始化的错误返回；补丁清单与升级流程在
+  `internal/vendor/utls/README.md`。
 - 失败不回落：指纹握手失败直接返回错误，不静默改走标准库 TLS。
 - 能力边界：L1（ClientHello 形状）+ L1.5（PSK/padding）+ L2（记录层不发 dummy CCS）；
   0-RTT、证书压缩、ECH、完整 BoringSSL 行为（L3）不在范围。上游是否按 JA3/JA4

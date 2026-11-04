@@ -1331,11 +1331,11 @@ func (c *Config) supportedVersions(isClient, isQUIC bool) []uint16 {
 }
 
 func (c *Config) maxSupportedVersion(isClient, isQUIC bool) uint16 {
-	supportedVersions := c.supportedVersions(isClient, isQUIC)
-	if len(supportedVersions) == 0 {
+	versions := c.supportedVersions(isClient, isQUIC)
+	if len(versions) == 0 {
 		return 0
 	}
-	return supportedVersions[0]
+	return versions[0]
 }
 
 // supportedVersionsFromMax returns a list of supported versions derived from a
