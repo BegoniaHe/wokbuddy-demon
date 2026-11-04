@@ -182,3 +182,51 @@ func TestPrepareBodyOptNoCacheKeyInjection(t *testing.T) {
 		t.Fatalf("PrepareBodyOpt must NOT inject prompt_cache_key, but got: %v", obj["prompt_cache_key"])
 	}
 }
+
+// TestCacheKeySource 缓存槽来源优先级：客户端声明的会话 ID 优先，其次网关派生的
+// CacheKeyID；两者皆空才落到每账号常量槽。
+func TestCacheKeySource(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name           string
+		conversationID string
+		cacheKeyID     string
+		want           string
+	}{
+		{"客户端会话优先", "conv-1", "sess-abc", "conv-1"},
+		{"仅派生键", "", "sess-abc", "sess-abc"},
+		{"两源皆空", "", "", ""},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := cacheKeySource(testCase.conversationID, testCase.cacheKeyID); got != testCase.want {
+				t.Fatalf("cacheKeySource(%q, %q) = %q want %q",
+					testCase.conversationID, testCase.cacheKeyID, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestInjectPromptCacheKeyFromCacheKeyID 带 user_id 的客户端 sessKey 为空，但
+// CacheKeyID 由内容派生：不同对话必须得到不同 prompt_cache_key，同对话跨轮稳定。
+func TestInjectPromptCacheKeyFromCacheKeyID(t *testing.T) {
+	t.Parallel()
+
+	uid := "user-abc-123"
+	body := `{"model":"glm-5.2","messages":[]}`
+
+	first := extractCacheKey(t, injectPromptCacheKey([]byte(body), uid, "d-conv-a"))
+	again := extractCacheKey(t, injectPromptCacheKey([]byte(body), uid, "d-conv-a"))
+	other := extractCacheKey(t, injectPromptCacheKey([]byte(body), uid, "d-conv-b"))
+
+	if first != again {
+		t.Fatalf("同会话缓存键必须稳定：%q vs %q", first, again)
+	}
+
+	if first == other {
+		t.Fatalf("不同会话缓存键必须不同：%q", first)
+	}
+}

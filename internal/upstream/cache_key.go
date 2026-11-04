@@ -46,6 +46,17 @@ func injectPromptCacheKeyObj(obj map[string]any, uid, conversationID string) {
 	obj["prompt_cache_key"] = buildCacheKey(uid, conv)
 }
 
+// cacheKeySource prompt_cache_key 的会话段来源：客户端声明的会话（ConversationID）
+// 优先，否则用网关派生的会话键（CacheKeyID，见 ChatMeta）。两者都空 → 空串，
+// 沿用每账号常量槽（没有会话可归属，不复用前缀）。
+func cacheKeySource(conversationID, cacheKeyID string) string {
+	if conversationID != "" {
+		return conversationID
+	}
+
+	return cacheKeyID
+}
+
 // buildCacheKey 生成 `<uid8>-<convHex>` 格式的稳定 cache key。
 //
 // uid8 提供账号隔离段；convHex = sha256(uid + conversationID)[:16] 的 hex 提供会话段

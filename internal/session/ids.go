@@ -99,6 +99,20 @@ func NewUUIDv4() string {
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
+// UUIDv4For 由种子稳定派生带连字符 UUIDv4（8-4-4-4-12，version=4、variant=10xx）。
+// 同种子恒同值，不同种子互异；用于客户端未声明会话时稳定复用出站
+// X-Conversation-ID（部分上游后端以该头作为前缀缓存槽，逐请求随机会让缓存永不
+// 命中），同时保持 issue #239 要求的官方 UUIDv4 形态与无品牌字面量。
+func UUIDv4For(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	b := sum[:16]
+	b[6] = b[6]&uuidVersionMask | uuidVersion4Bits
+	b[8] = b[8]&uuidVariantMask | uuidVariantBits
+	h := hex.EncodeToString(b)
+
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
 // NewTraceID 生成 32 位小写 hex 的随机 trace id（UUIDv4 形态：第 13 位为 4、
 // 变体位 10xx，**无** UUIDv7 时间戳前缀）。
 // 官方 chat 的 X-Trace-Id / X-B3-TraceId / traceparent trace-id 三处同值、形态为

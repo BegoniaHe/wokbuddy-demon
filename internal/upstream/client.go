@@ -2398,7 +2398,8 @@ func (c *Client) ChatStreamContext(
 		conversationRequestID = meta.ConversationRequestID
 	}
 
-	prepared := c.prepareBody(body, account3.Realm(), account3.UID, meta.ConversationID, conversationRequestID)
+	prepared := c.prepareBody(body, account3.Realm(), account3.UID,
+		cacheKeySource(meta.ConversationID, meta.CacheKeyID), conversationRequestID)
 
 	payload, contentEncoding, payloadErr := c.chatPayload(account3, prepared)
 	if payloadErr != nil {

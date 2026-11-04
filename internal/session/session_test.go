@@ -580,3 +580,43 @@ func TestUnbindCannotBeOverwrittenByStaleMirror(t *testing.T) {
 		t.Fatal("Unbind 后 Store 不得残留绑定（陈旧镜像把解绑写回）")
 	}
 }
+
+// TestDeriveCacheKeyIgnoresUserIDGate 带 user_id 的请求不参与粘性（ExtractSession
+// 返回空串），但缓存槽仍必须按对话隔离：DeriveCacheKey 不得套用 user_id 闸，
+// 同一会话尾轮变化保持稳定、不同首条 user 必须换键。
+func TestDeriveCacheKeyIgnoresUserIDGate(t *testing.T) {
+	t.Parallel()
+
+	body := `{"metadata":{"user_id":"u1"},"messages":[
+		{"role":"system","content":"sys"},
+		{"role":"user","content":"first"},
+		{"role":"assistant","content":"ok"},
+		{"role":"user","content":"second"}]}`
+
+	if key, _ := ExtractSession([]byte(body)); key != "" {
+		t.Fatalf("ExtractSession 对 user_id 客户端仍应返回空键，got %q", key)
+	}
+
+	key := DeriveCacheKey([]byte(body))
+	if key == "" {
+		t.Fatal("DeriveCacheKey 不得套用 user_id 闸：空键会退化成每账号一个常量槽")
+	}
+
+	nextTurn := strings.Replace(body, `"second"`, `"third"`, 1)
+	if got := DeriveCacheKey([]byte(nextTurn)); got != key {
+		t.Fatalf("同一会话尾轮变化后缓存键必须稳定：%q vs %q", key, got)
+	}
+
+	otherConversation := strings.Replace(body, `"first"`, `"another"`, 1)
+	if got := DeriveCacheKey([]byte(otherConversation)); got == key {
+		t.Fatalf("不同对话必须落在不同缓存槽：%q", key)
+	}
+
+	if got := DeriveCacheKey(nil); got != "" {
+		t.Fatalf("空 body 应返回空键，got %q", got)
+	}
+
+	if got := DeriveCacheKey([]byte(`{broken`)); got != "" {
+		t.Fatalf("坏 body 应返回空键，got %q", got)
+	}
+}

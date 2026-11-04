@@ -280,3 +280,27 @@ func uuidTimestampMillis(t *testing.T, id string) int64 {
 
 	return int64(binary.BigEndian.Uint64(high[:]))
 }
+
+// TestUUIDv4For UUIDv4For 是稳定派生的标准 UUIDv4：同种子恒同值，不同种子互异，
+// 且形态满足官方 X-Conversation-ID 的 UUIDv4 正则（issue #239）。
+func TestUUIDv4For(t *testing.T) {
+	t.Parallel()
+
+	first := UUIDv4For("uid|session-a")
+	second := UUIDv4For("uid|session-a")
+	other := UUIDv4For("uid|session-b")
+
+	for _, got := range []string{first, second, other} {
+		if !uuidV4Pattern.MatchString(got) {
+			t.Fatalf("UUIDv4For() = %q 不匹配标准 UUIDv4", got)
+		}
+	}
+
+	if first != second {
+		t.Fatalf("同种子必须稳定：%q vs %q", first, second)
+	}
+
+	if first == other {
+		t.Fatalf("不同种子必须互异：%q", first)
+	}
+}
