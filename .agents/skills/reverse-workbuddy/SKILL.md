@@ -183,8 +183,10 @@ node .agents/skills/reverse-workbuddy/scripts/runtime_probe.mjs --realm cn --cap
 
 规则：
 
-- 默认复用现有 `WINEPREFIX` 的登录态；`--isolated-user-data` 只验证启动/公开端点，
-  不能验证 chat（未登录）。
+- 默认复用现有 `WINEPREFIX` 的登录态；`--isolated-user-data` 只隔离 Electron
+  userData，auth 仍在 `%LOCALAPPDATA%/<app>/Data/Public/auth`，不会变成未登录。
+  要未登录用干净的 `--wineprefix`，或用 `wine_login.py --logged-out`。
+  未登录态也无法验证 chat。
 - 产物隔离在 `.tmp/workbuddy-runtime/<realm>-<ts>/`：`requests.jsonl`（URL 去
   query、白名单头、会话/请求 ID 打码）、`summary.json`（端点/模型/事件）、可选
   `traffic.pcap`（600，归当前用户）。原始 `netlog.json` / `runtime.log` 默认删除；
@@ -206,6 +208,7 @@ python3 .agents/skills/reverse-workbuddy/scripts/wine_login.py \
   --auth auths/<uid>.json            # 注入会话 → 启动客户端
 python3 …/wine_login.py --auth auths/<uid>.json --dry-run   # 只打印计划，不写不启动
 python3 …/wine_login.py --auth auths/<uid>.json --no-launch # 只注入
+python3 …/wine_login.py --logged-out                       # 写登出标记后启动（未登录）
 python3 …/wine_login.py                                    # 不注入，纯启动
 # 国际版 / 自定义 prefix / 指定 exe
 python3 …/wine_login.py --realm global --prefix ~/.wine
@@ -217,6 +220,9 @@ python3 …/wine_login.py --realm global --prefix ~/.wine
   登录的账号（旧会话自动备份为 `workbuddy-desktop.info.bak-<ts>`）。
 - 默认拒绝在客户端运行时写入（运行中切换会与内存态打架）；`--force` 才允许，
   此时依赖客户端自身的 auth 文件 watcher 热加载。
+- `--logged-out` 只写 `<auth>/<id>.info.logged-out` 标记（不删除已存会话），客户端
+  启动时据此忽略会话；客户端退出后脚本清除本次写入的标记。标记只保证启动期不恢复
+  会话，登出后若客户端再次完成登录流程，最终状态仍是已登录。
 - 注入的 token 来自网关凭证，会和网关争同一个 refreshToken 的刷新节奏；服务端
   不撤销旧 RT（见 `internal/upstream/client.go` 的 rotate 注释），但同一账号不要
   长期两边同时跑。

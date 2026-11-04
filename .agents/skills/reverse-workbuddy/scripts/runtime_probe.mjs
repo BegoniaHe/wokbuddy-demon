@@ -12,7 +12,9 @@
 //   - 默认不复制 auth 文件、不读取凭证、不记录 Authorization/Cookie/X-Userinfo
 //   - 默认不发消息；--send 必须同时给 --confirm-spend
 //   - 默认使用现有 WINEPREFIX；--wineprefix 可指定隔离 prefix
-//   - --isolated-user-data 用临时 --user-data-dir（未登录，只验证启动/公开端点）
+//   - --isolated-user-data 用临时 --user-data-dir；它只隔离 Electron userData，
+//     auth 仍走 %LOCALAPPDATA%/<app>/Data/Public/auth，不会变成未登录
+//     （要未登录用干净 --wineprefix，或用 wine_login.py --logged-out）
 //
 // 不依赖第三方包；Node >= 22（全局 WebSocket、fetch）。
 
@@ -47,7 +49,7 @@ const HELP = `用法：
   --package-dir <dir>        直接指定 win32-app 目录（内含 WorkBuddy.exe）
   --out <dir>                产物目录；默认 .tmp/workbuddy-runtime/<realm>-<ts>
   --wineprefix <dir>         指定 WINEPREFIX；缺省沿用当前环境或 ~/.wine
-  --isolated-user-data       使用临时 --user-data-dir（不读取现有登录态）
+  --isolated-user-data       临时 --user-data-dir（只隔离 userData，不隔离 auth）
   --capture                  通过 pkexec 启动 tcpdump（会弹出提权授权）
   --capture-seconds <n>      抓包时长，默认 30
   --send <text>              通过 CDP 发送一条消息（需 --confirm-spend）
@@ -409,7 +411,7 @@ async function main() {
     throw new Error('--send 会消耗测试账号额度，必须同时加 --confirm-spend');
   }
   if (sendText && isolatedUserData) {
-    throw new Error('--send 需要已登录界面；--isolated-user-data 下无法发送');
+    throw new Error('--send 与 --isolated-user-data 不组合使用；采集与发言请分开跑');
   }
 
   const port = await freePort();

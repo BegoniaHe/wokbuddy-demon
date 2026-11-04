@@ -13,6 +13,7 @@
   python3 scripts/wine_login.py --auth auths/<uid>.json    # 注入后启动客户端
   python3 scripts/wine_login.py --auth auths/<uid>.json --dry-run   # 只打印计划，不落盘
   python3 scripts/wine_login.py --auth auths/<uid>.json --no-launch # 只落盘，不启动
+  python3 scripts/wine_login.py --logged-out                 # 写登出标记后启动（未登录）
   python3 scripts/wine_login.py                             # 不注入，直接启动
 
 约束：
@@ -107,6 +108,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--base", help="覆盖上游 base（默认按 realm：workbuddy.cn / workbuddy.ai）")
     p.add_argument("--dry-run", action="store_true", help="只打印计划，不写文件、不启动")
     p.add_argument("--no-launch", action="store_true", help="只注入，不启动客户端")
+    p.add_argument(
+        "--logged-out",
+        action="store_true",
+        help="启动前写登出标记，忽略已有会话；客户端退出后清除本次写入的标记",
+    )
     p.add_argument("--force", action="store_true", help="客户端在运行也照样写入")
     p.add_argument("--print-json", action="store_true", help="打印将要写入的会话 JSON（token 打码）")
     return p.parse_args(argv)
@@ -147,11 +153,14 @@ def find_session_file(prefix: Path) -> Path:
 
 def detect_exe(root: Path, realm: str) -> Path:
     base = root / ".tmp/workbuddy" / realm
-    candidates = sorted(base.glob("*/payload/WorkBuddy*.exe"), key=lambda p: p.stat().st_mtime)
-    candidates = [p for p in candidates if p.name.lower() not in ("repairapp.exe",)]
+    # NSIS 解包布局随版本变化：payload/、app/、win32-app/ 都出现过。
+    candidates = []
+    for layout in ("payload", "app", "win32-app"):
+        candidates.extend(base.glob(f"*/{layout}/WorkBuddy*.exe"))
+    candidates = [p for p in candidates if p.name.lower() != "repairapp.exe"]
     if not candidates:
         die(f"{base} 下找不到 WorkBuddy*.exe，请用 --exe 指定")
-    return candidates[-1]
+    return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
 def client_running() -> bool:
@@ -260,6 +269,8 @@ def redacted(doc: dict) -> dict:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.logged_out and args.auth:
+        die("--logged-out 与 --auth 互斥：前者忽略已有会话，后者注入会话")
     root = repo_root()
     prefix = pick_prefix(args.prefix)
 
@@ -278,6 +289,7 @@ def main(argv: list[str]) -> int:
     info(f"客户端: {exe}")
     info(f"WINEPREFIX: {prefix}")
     info(f"会话文件: {session_path}")
+    marker = session_path.with_name(f"{session_path.name}.logged-out")
 
     doc = None
     if cred:
@@ -320,7 +332,6 @@ def main(argv: list[str]) -> int:
             info(f"已备份旧会话: {backup}")
             backup.chmod(0o600)
 
-        marker = session_path.with_name(f"{session_path.name}.logged-out")
         if marker.exists():
             marker.unlink()
             info("已清除旧登出标记")
@@ -331,6 +342,22 @@ def main(argv: list[str]) -> int:
         os.replace(tmp, session_path)
         info(f"已写入会话（明文 token，客户端启动后会自动重新加密）")
 
+    created_marker = False
+    if args.logged_out:
+        if args.dry_run:
+            info(f"dry-run：将写登出标记 {marker}")
+            return 0
+        if client_running() and not args.force:
+            die("检测到客户端进程在运行；请先退出，或加 --force（会触发客户端热加载）")
+        existed = marker.exists()
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), encoding="utf-8")
+        created_marker = not existed
+        if existed:
+            info(f"已有登出标记，退出后保留: {marker}")
+        else:
+            info(f"已写登出标记: {marker}")
+
     if args.no_launch:
         info("--no-launch：不启动客户端")
         return 0
@@ -340,7 +367,12 @@ def main(argv: list[str]) -> int:
 
     env = dict(os.environ, WINEPREFIX=str(prefix))
     info(f"启动: wine {exe.name}")
-    return subprocess.call(["wine", str(exe)], cwd=str(exe.parent), env=env)
+    try:
+        return subprocess.call(["wine", str(exe)], cwd=str(exe.parent), env=env)
+    finally:
+        if created_marker and marker.exists():
+            marker.unlink()
+            info("已清除本次启动写入的登出标记")
 
 
 if __name__ == "__main__":
