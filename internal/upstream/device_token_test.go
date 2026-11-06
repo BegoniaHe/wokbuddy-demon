@@ -134,6 +134,29 @@ func TestDeviceTokenNotInjected_WhenEmpty(t *testing.T) {
 	}
 }
 
+// TestChatDeviceTokenOmittedWithoutSource chat 面 `X-Device-Token` 的注入条件是
+// 「取到值才发」：auth 的 `device_token`、`upstream.device_token`、
+// `upstream.device_token_file` 三个来源皆空时不带该头。官方主进程每轮都注入 Turing
+// token，所以默认部署（cockpit 导入不保留 device_token、配置项留空）的运行态比官方
+// 少这一个头（#464）——这条钉住当前口径，改注入策略时先读该 Issue 的 trade-off。
+func TestChatDeviceTokenOmittedWithoutSource(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{}
+	account := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ChatHeaders(req, account, "", ChatMeta{})
+
+	if got := req.Header.Get("X-Device-Token"); got != "" {
+		t.Errorf("X-Device-Token = %q want empty（无 token 来源时不发）", got)
+	}
+}
+
 // TestDeviceTokenFromConfigOrFile_Overrides 优先级：auth > config > 文件（签到注入面）。
 // auth 有值时覆盖 config；auth 空时 config 兜底；auth 与 config 皆空时读文件。
 func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
