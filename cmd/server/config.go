@@ -376,6 +376,10 @@ type Config struct {
 		// （issue #253 出图、issue #357 图生图，共用同一开关）。
 		// 默认 false：图像端点尚未在真实账号验证鉴权/计费，与 search_endpoint 同口径。
 		ImagesEndpoint bool `json:"images_endpoint"`
+		// VideosEndpoint 是否开放 POST /v1/videos/generations（提交任务）与
+		// GET /v1/videos/{task_id}（查询任务，issue #467）。
+		// 默认 false：视频端点同样未在真实账号验证鉴权/计费。
+		VideosEndpoint bool `json:"videos_endpoint"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`

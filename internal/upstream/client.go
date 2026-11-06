@@ -2746,6 +2746,12 @@ type ModelInfo struct {
 	// ChatVisible 官方默认会话 agent 白名单判定（issue #319）：nil = 该来源没有
 	// 判定；false = 不出现在 /v1/models 发现列表。内部字段，不参与 JSON 序列化。
 	ChatVisible *bool `json:"-"`
+
+	// Capability 视频生成能力标签（text-to-video / image-to-video，issue #467）：
+	// 空 = 非视频生成模型。视频模型保留在目录里供 /v1/models 以能力标记展示，
+	// 但 ChatVisible 恒为 false —— 它们不是对话模型，不进 chat 可见集合。
+	// 内部字段，/v1/models 侧由 applyModelInfoFields 显式透出 capabilities。
+	Capability string `json:"-"`
 }
 
 // dynModelEntry 上游模型目录（CN /console 与 global /v2 同构）的单条模型解析形态，
@@ -2790,10 +2796,22 @@ type dynModelEntry struct {
 
 // modelInfo 按解析条目构造 ModelInfo（dynEntry→ModelInfo 映射的单一事实来源）。
 // defaultEffort 新老双键兼容：defaultEffort 优先，缺省回落 effort。
+//
+// 视频生成模型（issue #467）在这里统一打 Capability 并钉住 ChatVisible=false：
+// 上游三处目录装配都经本函数，能力标记与「非对话」判定不会在各调用点漂移。
 func (m *dynModelEntry) modelInfo() ModelInfo {
 	def := m.Reasoning.DefaultEffort
 	if def == "" {
 		def = m.Reasoning.Effort
+	}
+
+	capability := videoModelCapability(m.Tags)
+
+	var chatVisible *bool
+
+	if capability != "" {
+		hidden := false
+		chatVisible = &hidden
 	}
 
 	return ModelInfo{
@@ -2818,6 +2836,8 @@ func (m *dynModelEntry) modelInfo() ModelInfo {
 		ReasoningEffort:    m.Reasoning.Effort,
 		ReasoningSummary:   m.Reasoning.Summary,
 		Aliases:            m.Aliases,
+		ChatVisible:        chatVisible,
+		Capability:         capability,
 	}
 }
 
@@ -2852,6 +2872,36 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 	}
 
 	return false
+}
+
+// videoModelCapability 返回视频生成能力标签（issue #467）：text-to-video 优先，
+// 其次 image-to-video；空 = 非视频生成模型。官方 CLI 的 `/model:text-to-video`
+// 与 `/model:image-to-video` 按同一组 tags 过滤产品配置。
+func videoModelCapability(tags []string) string {
+	hasImageToVideo := false
+
+	for _, t := range tags {
+		switch t {
+		case "text-to-video":
+			return "text-to-video"
+		case "image-to-video":
+			hasImageToVideo = true
+		}
+	}
+
+	if hasImageToVideo {
+		return "image-to-video"
+	}
+
+	return ""
+}
+
+// dropFromCatalog 报告模型是否整条不进目录（/v1/models、面板与模态路由的数据源）。
+// nonChatModel 的规则照旧：图片生成 / tiny 输出 / 专用前缀一律丢弃；唯一的例外是
+// 视频生成模型——它们保留在目录里供 /v1/models 以能力标记展示（issue #467），
+// 但 modelInfo() 已把 ChatVisible 钉为 false，不进入 chat 可见集合。
+func dropFromCatalog(id string, maxOutputTokens int64, tags []string) bool {
+	return nonChatModel(id, maxOutputTokens, tags) && videoModelCapability(tags) == ""
 }
 
 // codeBuddyIDEUA /v3/config 要求能解析出 CodeBuddy 版本号的 UA。
@@ -3138,13 +3188,14 @@ func parseEnterpriseModels(
 	}
 
 	agentModels = filterModelIDsByAvailable(agentModels, env.Data.AvailableModels)
-	// dynMap 收集模型字段；nonChatModel 过滤在写入 dynMap 前执行，
+	// dynMap 收集模型字段；dropFromCatalog 过滤在写入 dynMap 前执行，
 	// 确保非对话条目（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
 	// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
+	// 视频生成模型是唯一例外：保留并标记 Capability（issue #467）。
 	dynMap := make(map[string]dynModelEntry, len(env.Data.Models))
 	for i := range env.Data.Models {
 		m := &env.Data.Models[i]
-		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
+		if dropFromCatalog(m.ID, m.MaxOutputTokens, m.Tags) {
 			continue
 		}
 
@@ -3186,7 +3237,8 @@ func collectEnterpriseModels(agentModels []string, dynMap map[string]dynModelEnt
 
 // fetchV3Models 并发探测 /v3/config（桌面端 UA 为主 + IDE UA 补缺，见 codeBuddyIDEUA）。
 // v3 面取全量 models（不按 agents[cli] 过滤，与 global 探测口径一致），按同一
-// nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
+// dropFromCatalog 规则剔除非对话条目（selected 会选模型报 code=11102）；
+// 视频生成模型保留并标记 Capability（issue #467）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(account *auth.Auth) ([]ModelInfo, error) {
 	// CN 官方客户端同时用桌面端 UA 与 IDE UA 探测 /v3/config：两路模型集合不同，
@@ -3238,7 +3290,7 @@ func (c *Client) v3ModelsForUA(a *auth.Auth, ua string) (models []ModelInfo, err
 	ids := make([]string, 0, len(byID))
 	for id := range byID {
 		mi := byID[id]
-		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
+		if dropFromCatalog(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
 

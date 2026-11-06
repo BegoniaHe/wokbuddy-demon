@@ -28,6 +28,7 @@ const (
 	surfaceWebFetch
 	surfaceAgenticSearch
 	surfaceImages
+	surfaceVideos
 	surfaceModelBusy
 	surfaceBilling
 	surfaceReport
@@ -43,7 +44,7 @@ const (
 // （见 internal/upstream/UPSTREAM.md §六）。
 func (s surface) chatFamily() bool {
 	switch s {
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
 		return true
 	default:
 		return false
@@ -216,7 +217,7 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 		// refresh / v3-config：与 chat 同源的客户端 UA（v3-config 由调用方按
 		// 探测目标换成 IDE / CLI UA，见 V3ConfigHeaders）。
 		return c.userAgent(account)
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
 		// 走 chat 头族，不经轻头族。
 		return ""
 	}
@@ -365,8 +366,10 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 		if srf == surfaceWebFetch && account != nil && account.UID != "" {
 			req.Header.Set("X-Wb-Uid", account.UID)
 		}
-	case surfaceImages:
-		// 出图是非流式 JSON：Accept 改回 JSON，Content-Type 保持 chat 形态。
+	case surfaceImages, surfaceVideos:
+		// 出图 / 出视频都是非流式 JSON：Accept 改回 JSON，Content-Type 保持 chat 形态。
+		// 官方 CLI `VideoService` 与 `ImageService` 同源（prepareRequest +
+		// buildConversationHeaders），故共用本分支。
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("Content-Type", "application/json")
 	case surfaceChat:
@@ -448,7 +451,7 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 		// /v2/report 真机：Accept 宽松值 + Content-Type 带 charset（与 meter 面不同）。
 		accept = "application/json, text/plain, */*"
 		contentType = "application/json;charset=UTF-8"
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages,
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
 		surfaceBilling, surfaceRefresh, surfaceV3Config, surfaceGrowth:
 	}
 
@@ -547,7 +550,7 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 	case surfaceBilling:
 		// billing 域面（meter）：企业头只在真有值时发，个人号不发声明头。
 		injectEnterpriseIDHeaders(req, account)
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
 		// 不走轻头族（chatFamily() 已在 applyHeaders 分流）。
 	}
 }
@@ -672,6 +675,16 @@ func (c *Client) ChatHeaders(req *http.Request, account3 *auth.Auth, clientIP st
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
 func (c *Client) ImagesHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {
 	c.applyHeaders(surfaceImages, req, account, clientIP, meta)
+}
+
+// VideosHeaders 视频面（/v2/videos/generations 与 /v2/videos/tasks）请求头。
+// 官方 `VideoService` 与图像面同源（同一 conversation / identity 头族），
+// 故复用 chatFamily 头族；单独建 surface 保留「视频面」这一维度，便于日后
+// 与图像面分化时不改调用点。
+//
+//nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
+func (c *Client) VideosHeaders(req *http.Request, account *auth.Auth, clientIP string, meta ChatMeta) {
+	c.applyHeaders(surfaceVideos, req, account, clientIP, meta)
 }
 
 // injectCNChatHeaders CN 账号的 chat 域头：企业 ID / 租户 ID 与 Domain 原样透传
