@@ -14,7 +14,7 @@ replace github.com/refraction-networking/utls => ./internal/vendor/utls
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/molecule-man/go-brrr v1.2.0 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
