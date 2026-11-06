@@ -381,6 +381,98 @@ func TestLightSurfaceXDomainFollowsEndpoint(t *testing.T) {
 	}
 }
 
+// TestChatXDomainSurfaceForms chat 面 X-Domain 只认账号 auth.domain，没有 endpoint
+// 回落：官方 CLI 全局 auth 拦截器是 `!headers[X-Domain] && auth.domain &&
+// (headers[X-Domain] = auth.domain)`，账号没自报域就不带该头。三种账号形态各钉一条，
+// 避免 golden 用例的「有 domain 账号」掩盖真实形态（issue #465）。
+func TestChatXDomainSurfaceForms(t *testing.T) {
+	t.Parallel()
+
+	globalNoDomain := &auth.Auth{UID: "u-global", AccessToken: "at"}
+	if _, err := auth.BackfillRealmFor(globalNoDomain, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		account *auth.Auth
+		want    string
+	}{
+		{
+			name:    "CN 无 domain 不发域头",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at"},
+			want:    "",
+		},
+		{
+			name:    "global 无 domain 补国际版缺省域",
+			account: globalNoDomain,
+			want:    "www.workbuddy.ai",
+		},
+		{
+			name:    "旧域按账号自报值原样发",
+			account: &auth.Auth{UID: "u-cn", AccessToken: "at", Domain: "www.codebuddy.cn"},
+			want:    "www.codebuddy.cn",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newProfileClient(t)
+
+			req, err := http.NewRequest(http.MethodPost,
+				"https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			client.ChatHeaders(req, testCase.account, "", ChatMeta{})
+
+			if got := req.Header.Get("X-Domain"); got != testCase.want {
+				t.Errorf("chat X-Domain=%q want %q", got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestXDomainChatAndBillingDivergeOnMissingDomain 同一个 CN 无 domain 账号，chat 面
+// 不带 X-Domain，轻头族回落到本次请求的 endpoint host。两条表面共用同一个头名但
+// 取值口径不同（官方 chat 走全局 auth 拦截器，轻/认证面走 enterpriseHeaders()），
+// 必须同时钉住，否则任一面的「已对齐」会掩盖另一面（issue #465）。
+func TestXDomainChatAndBillingDivergeOnMissingDomain(t *testing.T) {
+	t.Parallel()
+
+	client := newProfileClient(t)
+	client.ChatBaseCN = "https://www.workbuddy.cn"
+	client.BillingBaseCN = "https://www.codebuddy.cn"
+
+	account := &auth.Auth{UID: "u-cn", AccessToken: "at"}
+
+	chatReq, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.ChatHeaders(chatReq, account, "", ChatMeta{})
+
+	if got := chatReq.Header.Get("X-Domain"); got != "" {
+		t.Errorf("chat X-Domain=%q want 空（无 auth.domain 不发）", got)
+	}
+
+	billingReq, err := http.NewRequest(http.MethodPost,
+		"https://www.codebuddy.cn/billing/meter/get-user-resource-summary", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.BillingHeaders(billingReq, account)
+
+	if got := billingReq.Header.Get("X-Domain"); got != "www.codebuddy.cn" {
+		t.Errorf("billing X-Domain=%q want www.codebuddy.cn（endpoint authority）", got)
+	}
+}
+
 // TestGrowthPathsUseNodeFingerprint 三条已实测/已用路径（buddy/info、travel/status、
 // streak）走同一 growth 头族；其余 /activity/growth/* 路径（tasks、heatmap、
 // lottery、makeup-cards 等）是**同面假设**，无逐路径抓包证据，注释见 UPSTREAM.md。
