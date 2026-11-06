@@ -67,7 +67,7 @@ func (h *Handler) serveImages(w http.ResponseWriter, r *http.Request, upstreamPa
 	}
 	defer h.cfg.Pool.Release(acct.UID)
 
-	if !h.ensureImagesToken(w, acct) {
+	if !h.ensureMediaToken(w, acct, "images") {
 		return
 	}
 
@@ -97,7 +97,7 @@ func (h *Handler) readImagesRequest(
 		return nil, "", "", false, false
 	}
 
-	rawModel, ok := imageRequestModel(w, body)
+	rawModel, ok := requestBodyModel(w, body)
 	if !ok {
 		return nil, "", "", false, false
 	}
@@ -113,7 +113,7 @@ func (h *Handler) readImagesRequest(
 
 	// 与 chat/Anthropic 同口径：models.hidden 与命名密钥白名单必须在出站前判定，
 	// 否则开启图像端点后可以绕过模型限制。
-	if !h.imageModelVisible(w, realm, bareModel) {
+	if !h.mediaModelVisible(w, realm, bareModel) {
 		return nil, "", "", false, false
 	}
 
@@ -178,9 +178,9 @@ func writeMultipartUnsupported(w http.ResponseWriter, upstreamPath string) {
 		"multipart/form-data is not supported; send a JSON body instead", hint)
 }
 
-// imageRequestModel 从入站 JSON body 取 model；字段缺失或不是 JSON 时写出 400。
-// multipart 已由调用方在读 body 前拒绝（见 readImagesRequest）。
-func imageRequestModel(w http.ResponseWriter, body []byte) (string, bool) {
+// requestBodyModel 从入站 JSON body 取 model；字段缺失或不是 JSON 时写出 400。
+// 出图与出视频共用（multipart 已由调用方在读 body 前拒绝，见 readImagesRequest）。
+func requestBodyModel(w http.ResponseWriter, body []byte) (string, bool) {
 	var peek struct {
 		Model string `json:"model"`
 	}
@@ -193,9 +193,10 @@ func imageRequestModel(w http.ResponseWriter, body []byte) (string, bool) {
 	return strings.TrimSpace(peek.Model), true
 }
 
-// imageModelVisible 出图前的模型可见性：models.hidden 与 models.allowed 同口径，
-// 任一拒绝即 400 model_unavailable（不打上游、不占号），且先于命名密钥白名单。
-func (h *Handler) imageModelVisible(w http.ResponseWriter, realm, bareModel string) bool {
+// mediaModelVisible 媒体端点（出图 / 出视频）前的模型可见性：models.hidden 与
+// models.allowed 同口径，任一拒绝即 400 model_unavailable（不打上游、不占号），
+// 且先于命名密钥白名单。
+func (h *Handler) mediaModelVisible(w http.ResponseWriter, realm, bareModel string) bool {
 	if h.modelHidden(realm, bareModel) {
 		writeOpenAIError(w, http.StatusBadRequest, "model_unavailable",
 			"model is hidden by gateway config (models.hidden); pick another model")
@@ -213,8 +214,9 @@ func (h *Handler) imageModelVisible(w http.ResponseWriter, realm, bareModel stri
 	return true
 }
 
-// ensureImagesToken 临近过期先刷新；失败写出 502。
-func (h *Handler) ensureImagesToken(w http.ResponseWriter, acct *auth.Auth) bool {
+// ensureMediaToken 临近过期先刷新；失败写出 502。surface 只用于失败归因标签
+// （images / videos），不影响刷新口径。
+func (h *Handler) ensureMediaToken(w http.ResponseWriter, acct *auth.Auth, surface string) bool {
 	if !acct.NeedsRefresh(h.cfg.RefreshSkew) {
 		return true
 	}
@@ -222,7 +224,7 @@ func (h *Handler) ensureImagesToken(w http.ResponseWriter, acct *auth.Auth) bool
 	if refreshErr := h.cfg.Upstream.RefreshToken(acct); refreshErr != nil {
 		// 与 chat 同口径：凭证失效连续达阈才禁用，其余只喂熔断，避免健康号被一次
 		// 瞬时刷新失败踢出池。
-		h.noteRefreshFailure(acct, refreshErr, "images")
+		h.noteRefreshFailure(acct, refreshErr, surface)
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream token refresh failed")
 
 		return false
@@ -251,37 +253,19 @@ func (h *Handler) forwardImages(
 	call := h.imageCaller(upstreamPath)
 
 	firstStart := time.Now()
-	first := imagesAttempt{}
+	first := mediaAttempt{}
 	first.status, first.raw, first.err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 	first.latencyMs = attemptLatencyMs(firstStart)
 
-	final, retried, refreshFail := h.retryImagesAfterRefresh(r, acct, body, meta, call, first)
+	final, retried, refreshFail := h.retryMediaAfterRefresh(r, acct, body, meta, call, first)
 	if retried {
 		// 首跳（401）单独留痕：与 chat 每次尝试都记一次用量同口径（issue #424）。
-		h.recordImagesAttempt(acct, realm, bareModel, first, r)
+		h.recordMediaAttempt(acct, realm, bareModel, first, r)
 	}
 
-	h.recordImagesAttempt(acct, realm, bareModel, final, r)
+	h.recordMediaAttempt(acct, realm, bareModel, final, r)
 
-	if final.err != nil {
-		if refreshFail != nil && !upstream.IsCredentialDead(refreshFail) {
-			// 与 chat 的 penalizeRefreshFailure 非会话失效分支同口径：只喂熔断计数，
-			// 不累计 session dead。
-			h.cfg.Pool.NoteError(acct.UID)
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream token refresh failed")
-
-			return
-		}
-
-		var uerr *upstream.Error
-		if !errors.As(final.err, &uerr) {
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "image request failed at transport layer")
-
-			return
-		}
-
-		h.handleImagesError(w, acct, bareModel, final.status, final.raw, uerr)
-
+	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "image") {
 		return
 	}
 
@@ -294,17 +278,47 @@ func (h *Handler) forwardImages(
 	_, _ = w.Write(final.raw)
 }
 
-// imagesAttempt 一次出图上游尝试的结果与本跳耗时。
+// handleMediaFailure 记账后的错误处置（出图 / 出视频共用）；返回 true 表示已写出
+// 响应。refreshFail 非空且非凭证失效时只喂熔断计数，不累计 session dead。
+func (h *Handler) handleMediaFailure(
+	w http.ResponseWriter, acct *auth.Auth, bareModel string, final mediaAttempt, refreshFail error, noun string,
+) bool {
+	if final.err == nil {
+		return false
+	}
+
+	if refreshFail != nil && !upstream.IsCredentialDead(refreshFail) {
+		// 与 chat 的 penalizeRefreshFailure 非会话失效分支同口径：只喂熔断计数，
+		// 不累计 session dead。
+		h.cfg.Pool.NoteError(acct.UID)
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream token refresh failed")
+
+		return true
+	}
+
+	var uerr *upstream.Error
+	if !errors.As(final.err, &uerr) {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", noun+" request failed at transport layer")
+
+		return true
+	}
+
+	h.handleMediaError(w, acct, bareModel, final.status, final.raw, uerr, noun)
+
+	return true
+}
+
+// mediaAttempt 一次媒体（出图 / 出视频）上游尝试的结果与本跳耗时。
 // 耗时必须在**该跳返回时**采样：首跳的记账发生在 refresh + 重放之后，
 // 若此时才用起始时刻计算，会把刷新与重放耗时重复算进首跳（issue #424）。
-type imagesAttempt struct {
+type mediaAttempt struct {
 	status    int
 	raw       []byte
 	err       error
 	latencyMs int64
 }
 
-// retryImagesAfterRefresh 上游 401 时同号 refresh 后重放一次。
+// retryMediaAfterRefresh 上游 401 时同号 refresh 后重放一次（出图 / 出视频共用）。
 //
 // 返回 (最终结果, 是否发生过重放, refresh 错误)：refresh 失败时保持原始 401 结果
 // 且不算重放（首跳即终态，只记一次）。调用方据此给首跳单独留痕（issue #424）。
@@ -313,9 +327,9 @@ type imagesAttempt struct {
 // 三次失败误禁用。非 401 或非 *upstream.Error 原样返回。
 //
 //nolint:gocritic // ChatMeta 值传递与 upstream.ChatHeaders 同一 API。
-func (h *Handler) retryImagesAfterRefresh(
-	r *http.Request, acct *auth.Auth, body []byte, meta upstream.ChatMeta, call imagesCall, first imagesAttempt,
-) (imagesAttempt, bool, error) {
+func (h *Handler) retryMediaAfterRefresh(
+	r *http.Request, acct *auth.Auth, body []byte, meta upstream.ChatMeta, call mediaCall, first mediaAttempt,
+) (mediaAttempt, bool, error) {
 	var uerr *upstream.Error
 	if !errors.As(first.err, &uerr) || first.status != http.StatusUnauthorized {
 		return first, false, nil
@@ -329,18 +343,18 @@ func (h *Handler) retryImagesAfterRefresh(
 	_ = acct.SaveAtomicRetry()
 
 	secondStart := time.Now()
-	second := imagesAttempt{}
+	second := mediaAttempt{}
 	second.status, second.raw, second.err = call(r.Context(), acct, body, httpauthClientIP(r, h), meta)
 	second.latencyMs = attemptLatencyMs(secondStart)
 
 	return second, true, nil
 }
 
-// imagesCall 一次图像上游尝试的签名（出图与图生图一致）。
-type imagesCall func(context.Context, *auth.Auth, []byte, string, upstream.ChatMeta) (int, []byte, error)
+// mediaCall 一次媒体上游尝试的签名（出图 / 图生图 / 出视频一致）。
+type mediaCall func(context.Context, *auth.Auth, []byte, string, upstream.ChatMeta) (int, []byte, error)
 
 // imageCaller 按上游路径选出图 / 图生图入口：两者签名相同，只有上游路径不同。
-func (h *Handler) imageCaller(upstreamPath string) imagesCall {
+func (h *Handler) imageCaller(upstreamPath string) mediaCall {
 	if upstreamPath == upstream.ImageEditsPath {
 		return h.cfg.Upstream.EditImage
 	}
@@ -348,14 +362,15 @@ func (h *Handler) imageCaller(upstreamPath string) imagesCall {
 	return h.cfg.Upstream.GenerateImage
 }
 
-// handleImagesError 出图错误处置：请求级错误直接透传；账号级错误按统一策略冷却，
-// 但不换号（单次尝试）。
-func (h *Handler) handleImagesError(
-	w http.ResponseWriter, acct *auth.Auth, model string, status int, raw []byte, uerr *upstream.Error,
+// handleMediaError 媒体端点错误处置：请求级错误直接透传；账号级错误按统一策略冷却，
+// 但不换号（单次尝试）。noun 只用于空消息兜底文案（image / video）。
+func (h *Handler) handleMediaError(
+	w http.ResponseWriter, acct *auth.Auth, model string, status int, raw []byte,
+	uerr *upstream.Error, noun string,
 ) {
 	kind := uerr.Kind
 
-	// 尝试与延迟已由 recordImagesAttempt 记账；这里不再补空 delta，避免同一次失败
+	// 尝试与延迟已由 recordMediaAttempt 记账；这里不再补空 delta，避免同一次失败
 	// 被记成两次请求。
 	if kind == upstream.ErrSessionDead {
 		// 与 chat 同口径：连续阈值才禁用，401 本身只进入待重登计数。
@@ -389,19 +404,21 @@ func (h *Handler) handleImagesError(
 	}
 
 	if msg == "" {
-		msg = "upstream image request failed"
+		msg = "upstream " + noun + " request failed"
 	}
 
 	writeOpenAIErrorHint(w, outStatus, code, msg, h.hintOf(kind, string(raw), model, true, false, uerr))
 }
 
-// recordImagesAttempt 记一次上游尝试的账：reqlog 结果 + usage（响应 usage 缺失时
+// recordMediaAttempt 记一次媒体上游尝试的账：reqlog 结果 + usage（响应 usage 缺失时
 // 仍记一次请求，与 chat 的失败尝试同口径）。多次尝试（401 重放）各自调用一次，
 // 延迟各跳独立（issue #424）。
 //
-//nolint:funlen // 记账分支按结果形态线性展开。
-func (h *Handler) recordImagesAttempt(
-	acct *auth.Auth, realm, model string, attempt imagesAttempt, r *http.Request,
+// credit 取值与图像端点一致（issue #467）：出图响应的 usage 在顶层；视频任务查询
+// 的 usage 在 `data.usage` 里，故 Data 先用 RawMessage 收着（出图的 data 是数组，
+// 直接解成结构体会破坏既有解析），缺顶层 credit 时再看 `data.usage.credit`。
+func (h *Handler) recordMediaAttempt(
+	acct *auth.Auth, realm, model string, attempt mediaAttempt, r *http.Request,
 ) {
 	outcome := reqlog.OutcomeSuccess
 	if attempt.err != nil {
@@ -418,21 +435,7 @@ func (h *Handler) recordImagesAttempt(
 	ok := attempt.err == nil
 
 	if ok {
-		var payload struct {
-			Usage struct {
-				PromptTokens     int64   `json:"prompt_tokens"`
-				CompletionTokens int64   `json:"completion_tokens"`
-				TotalTokens      int64   `json:"total_tokens"`
-				Credit           float64 `json:"credit"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal(attempt.raw, &payload) == nil {
-			delta.PromptTokens, delta.HasPromptTokens = payload.Usage.PromptTokens, payload.Usage.PromptTokens > 0
-			delta.CompletionTokens, delta.HasCompletion =
-				payload.Usage.CompletionTokens, payload.Usage.CompletionTokens > 0
-			delta.TotalTokens, delta.HasTotal = payload.Usage.TotalTokens, payload.Usage.TotalTokens > 0
-			delta.Credit, delta.HasCredit = payload.Usage.Credit, payload.Usage.Credit > 0
-		}
+		fillMediaUsage(delta, attempt.raw)
 	}
 
 	// 命名密钥用量回填：与 chat / anthropic / gemini / responses 同口径，
@@ -454,6 +457,44 @@ func (h *Handler) recordImagesAttempt(
 		TotalTokens: delta.TotalTokens, HasTotalTokens: delta.HasTotal,
 		LatencyMs: delta.LatencyMs, HasLatencyMs: delta.HasLatency,
 	})
+}
+
+// fillMediaUsage 从上游响应原文填充 token / credit 用量（出图与视频共用）。
+// 出图响应 usage 在顶层；视频任务查询的 usage 在 `data.usage` 里，故 data 先用
+// RawMessage 收着（出图的 data 是数组，直接解成结构体会破坏既有解析），
+// 缺顶层 credit 时再看 `data.usage.credit`。
+func fillMediaUsage(delta *usage.Delta, raw []byte) {
+	var payload struct {
+		Usage struct {
+			PromptTokens     int64   `json:"prompt_tokens"`
+			CompletionTokens int64   `json:"completion_tokens"`
+			TotalTokens      int64   `json:"total_tokens"`
+			Credit           float64 `json:"credit"`
+		} `json:"usage"`
+		Data json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return
+	}
+
+	delta.PromptTokens, delta.HasPromptTokens = payload.Usage.PromptTokens, payload.Usage.PromptTokens > 0
+	delta.CompletionTokens, delta.HasCompletion =
+		payload.Usage.CompletionTokens, payload.Usage.CompletionTokens > 0
+	delta.TotalTokens, delta.HasTotal = payload.Usage.TotalTokens, payload.Usage.TotalTokens > 0
+	delta.Credit, delta.HasCredit = payload.Usage.Credit, payload.Usage.Credit > 0
+
+	// 视频任务信封：data 是对象，credit 在 data.usage 里；出图的 data 是数组，
+	// 首个字节判形态，不重复解数组。
+	if !delta.HasCredit && len(payload.Data) > 0 && payload.Data[0] == '{' {
+		var task struct {
+			Usage struct {
+				Credit float64 `json:"credit"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(payload.Data, &task) == nil && task.Usage.Credit > 0 {
+			delta.Credit, delta.HasCredit = task.Usage.Credit, true
+		}
+	}
 }
 
 // httpauthClientIP 出图路径的来源 IP（与 chat 同口径）。

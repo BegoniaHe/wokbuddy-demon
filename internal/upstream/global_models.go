@@ -285,6 +285,7 @@ func (c *Client) probeGlobalModels(
 
 // probeV3Route 单次 /v3/config 探测（UA 参数化）并过滤非对话模型，返回该路结果。
 // 该端点对不同 UA 下发**不同模型集合**：桌面端 / IDE / CLI 三路各有独有模型，故并发取并集。
+// 视频生成模型保留在目录里并标记 Capability（issue #467，见 dropFromCatalog）。
 func (c *Client) probeV3Route(a *auth.Auth, ua string) probeResult {
 	// chatBase 已按 realm 切 global base。
 	byID, perr := c.fetchV3ConfigModelMap(a, ua)
@@ -297,7 +298,7 @@ func (c *Client) probeV3Route(a *auth.Auth, ua string) probeResult {
 	outInfos := make([]ModelInfo, 0, len(byID))
 	for id := range byID {
 		modelInfo := byID[id]
-		if nonChatModel(modelInfo.ID, modelInfo.MaxTokens, modelInfo.Tags) {
+		if dropFromCatalog(modelInfo.ID, modelInfo.MaxTokens, modelInfo.Tags) {
 			continue
 		}
 

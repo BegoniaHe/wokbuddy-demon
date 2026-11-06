@@ -65,6 +65,7 @@
 - **本地状态持久化**：重启后还记得昨天干到哪，不会一键失忆。
 - **登录与搬家**：面板里完成授权登录；需要换机器时，可以加密导出再导入账号。
 - **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态，单批最多 50 个模型）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations` 与 `POST /v1/images/edits` 提供官方出图 / 图生图（`features.images_endpoint`，默认关，两者共用同一开关）。
+- **视频生成**：`POST /v1/videos/generations` 提交任务，JSON 形态原样透传官方 `VideoService` 的字段（`prompt` / `model` / `watermark`，可选 `seconds` / `image_url` / `last_image_url` / `reference_images` / `reference_videos` / `reference_audios` / `extra_parameters`），返回上游 `{code,msg,requestId,data:{id}}`，`data.id` 即任务 id；`GET /v1/videos/{task_id}` 查询任务（可选 `?model=` 决定选号域，跨域任务必须带），`data.status=completed` 时原样透出 `data[].url` 与 `data.usage.credit`，`failed` 归一为 502 通用文案。由 `features.videos_endpoint` 控制（默认关）。网关只做无状态透传，**不轮询**，轮询节奏由客户端决定；带 `text-to-video` / `image-to-video` 标签的模型在 `/v1/models` 以 `capabilities` 数组可见。
 - **官方档位徽章**：解析 `/v3/config` 的 `modelTiers`，在模型页与试聊选择器显示档位与升级提示，不改变选号或模型过滤。
 - **按密钥裁剪模型列表**：命名密钥的 `/v1/models` 只展示其 realm 绑定与模型白名单允许的条目，复用同一份缓存，不额外请求上游。
 

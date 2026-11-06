@@ -68,7 +68,7 @@ func (c *Client) EditImage(
 
 // postImage 图像端点共用请求装配与响应读取；path 为上游绝对路径，body 原样透传。
 //
-//nolint:funlen,gocritic // 请求装配/解析线性展开，与 chat 的 doJSON 保持同一可读风格；ChatMeta 值传递同 ChatHeaders。
+//nolint:funlen,gocritic,dupl // 请求装配/解析线性展开，与 chat 的 doJSON 保持同一可读风格；ChatMeta 值传递同 ChatHeaders。
 func (c *Client) postImage(
 	ctx context.Context, account *auth.Auth, path string, body []byte, clientIP string, meta ChatMeta,
 ) (int, []byte, error) {
