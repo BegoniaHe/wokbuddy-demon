@@ -351,7 +351,10 @@ func SummarizeCompensation(rows []CompensationRow) CompensationSummary {
 }
 
 // ClaimCompensationNow 全量「先查后领」（面板批量入口）。返回逐账号结果与汇总。
-func (s *Scheduler) ClaimCompensationNow() ([]CompensationRow, CompensationSummary) {
+//
+// ctx 取消后不再派发新的领取（已派发的等其完成），与 CompensationStatusAll 同口径：
+// 面板请求断开或停机时不该继续对剩余账号打上游。
+func (s *Scheduler) ClaimCompensationNow(ctx context.Context) ([]CompensationRow, CompensationSummary) {
 	list := s.cfg.Pool.List()
 	rows := make([]CompensationRow, len(list))
 
@@ -360,9 +363,25 @@ func (s *Scheduler) ClaimCompensationNow() ([]CompensationRow, CompensationSumma
 	var wg sync.WaitGroup
 
 	for i := range list {
-		wg.Add(1)
+		if ctx.Err() != nil {
+			continue
+		}
 
-		sem <- struct{}{}
+		// 先取名额再起 goroutine；sem 满且已取消时不阻塞主 goroutine。
+		select {
+		case sem <- struct{}{}:
+			// select 同时就绪会随机选：拿到名额后二次确认，覆盖「检查后、
+			// 取名额前」刚好取消的窗口；已取消则归还名额并跳过派发。
+			if ctx.Err() != nil {
+				<-sem
+
+				continue
+			}
+		case <-ctx.Done():
+			continue
+		}
+
+		wg.Add(1)
 
 		go func(idx int, uid string) {
 			defer wg.Done()

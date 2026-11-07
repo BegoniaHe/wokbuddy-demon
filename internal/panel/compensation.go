@@ -52,6 +52,6 @@ func (p *Panel) compensationAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, summary := p.cfg.Scheduler.ClaimCompensationNow()
+	rows, summary := p.cfg.Scheduler.ClaimCompensationNow(r.Context())
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": rows, "summary": summary})
 }
