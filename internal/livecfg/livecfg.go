@@ -38,6 +38,10 @@ type Snapshot struct {
 	// （features.images_endpoint，默认 false）。未在真实账号验证前不默认开启
 	// （issue #253 出图、issue #357 图生图，两端点共用本开关）。
 	ImagesEndpoint bool
+	// VideosEndpoint 是否开放 POST /v1/videos/generations 与 GET /v1/videos/{task_id}
+	// （features.videos_endpoint，默认 false，issue #467）。与 images_endpoint
+	// 同口径：未在真实账号验证计费前不默认开启。
+	VideosEndpoint bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
 	// BackgroundNames 后台模型改写名单（小写；issue #103）。空 = 关闭。

@@ -350,6 +350,16 @@ func (h *Handler) registerRoutes() {
 		"POST /v1/images/edits",
 		h.withRecovery(h.withClientAuth(h.imagesEndpointHandler(upstream.ImageEditsPath))),
 	)
+	// 视频端点（issue #467）：默认关闭，开启后独立透传 /v2/videos/generations
+	// 提交任务与 /v2/videos/tasks 查询任务（网关不做轮询）。
+	h.mux.HandleFunc(
+		"POST /v1/videos/generations",
+		h.withRecovery(h.withClientAuth(h.videoGenerateHandler)),
+	)
+	h.mux.HandleFunc(
+		"GET /v1/videos/{task_id}",
+		h.withRecovery(h.withClientAuth(h.videoTaskHandler)),
+	)
 	// 官方客户端模型忙预检（issue #273）：只读本地池状态，不产生上游请求。
 	h.mux.HandleFunc("POST /v2/chat/busy", h.withRecovery(h.withClientAuth(h.busyHandler)))
 	// 官方 webfetch 的 DSH 形态出口（issue #276）：默认关闭，/v1/fetch 为同义别名。
@@ -926,6 +936,12 @@ func applyModelInfoFields(entry map[string]any, modelInfo *upstream.ModelInfo) m
 		entry["tier"] = modelInfo.Tier
 	}
 
+	// 视频生成能力（issue #467）：OpenAI 形状没有视频字段，用 capabilities 数组
+	// 透出 text-to-video / image-to-video，客户端可据此区分对话模型与视频模型。
+	if modelInfo.Capability != "" {
+		entry["capabilities"] = []string{modelInfo.Capability}
+	}
+
 	applyModelInfoCapabilities(entry, modelInfo)
 
 	return entry
@@ -999,8 +1015,14 @@ func (h *Handler) modelList() []map[string]any {
 		}
 
 		if visible := models[i].ChatVisible; visible != nil && !*visible {
+			// 视频生成模型也钉了 ChatVisible=false（不是对话模型），但目录要保留
+			// 下来给 /v1/models 以能力标记展示（issue #467）；别名仍按隐藏处理，
+			// 避免 chat 客户端通过别名把视频模型当对话模型点名。
 			chatHidden["cn:"+models[i].ID] = true
-			continue
+
+			if models[i].Capability == "" {
+				continue
+			}
 		}
 
 		out = append(out, h.cnModelEntry(&models[i]))
@@ -1032,7 +1054,11 @@ func (h *Handler) appendGlobalModelEntries(
 		}
 
 		if ok && hidden[id] {
-			continue
+			// 视频生成模型（issue #467）不被 chat 可见性过滤掉：它以 capabilities
+			// 标记出现在列表里，但别名仍按隐藏处理（见 modelList 的 chatHidden）。
+			if _, video := entry["capabilities"]; !video {
+				continue
+			}
 		}
 
 		out = append(out, entry)
@@ -2866,7 +2892,13 @@ func (*Handler) tracedPath(r *http.Request) bool {
 	switch r.URL.Path {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
 		"/v1/responses", "/v1/search/messages", "/v1/images/generations", "/v1/images/edits",
+		"/v1/videos/generations",
 		"/v1/tools/fetch", "/v1/fetch":
+		return true
+	}
+
+	// 视频任务查询的 task_id 在路径段里，只能按前缀判定。
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/videos/") {
 		return true
 	}
 

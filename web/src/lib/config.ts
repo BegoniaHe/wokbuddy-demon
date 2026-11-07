@@ -109,6 +109,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'search_deep', path: ['features', 'search_deep'], kind: 'checkbox' },
   { name: 'web_fetch_endpoint', path: ['features', 'web_fetch_endpoint'], kind: 'checkbox' },
   { name: 'images_endpoint', path: ['features', 'images_endpoint'], kind: 'checkbox' },
+  { name: 'videos_endpoint', path: ['features', 'videos_endpoint'], kind: 'checkbox' },
   { name: 'session_sticky_enabled', path: ['session_sticky', 'enabled'], kind: 'checkbox' },
   { name: 'request_client_info', path: ['logging', 'request_client_info'], kind: 'checkbox' },
 ];
