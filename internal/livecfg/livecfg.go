@@ -4,11 +4,17 @@
 // 于是少量"可热生效"的字段需要有并发安全的读写点。此处用不可变快照 + atomic 指针：
 // 读方 Load 拿到一致视图，写方 Store 整体替换，无锁无数据竞争。
 //
+// 快照里的三个名单 map 由 Store 深拷贝后归 Holder 独占：调用方在 Store 之后改写
+// 自己那份 map 不会污染已发布的快照（浅拷贝会让 map 底层数组跨读者共享，任一写
+// 入都污染所有并发读者）。Load 返回的是只读视图（struct 浅拷贝，map 仍共享于
+// Holder），调用方**不得**写入其中的 map，否则仍会污染其它读者。
+//
 // 只承载**读路径深、热改需求强**的少数字段；池参数/排程参数等各有既有 setter
 // （pool.SetBreaker、scheduler.Reconfigure 等），不重复收编到这里。
 package livecfg
 
 import (
+	"maps"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -145,7 +151,14 @@ func (h *Holder) Load() Snapshot {
 	return Snapshot{}
 }
 
-// Store 整体替换快照。
+// Store 整体替换快照；三个名单 map 深拷贝后归 Holder 独占，调用方随后改写
+// 自己的 map 不会污染已发布的快照。
 //
 //nolint:gocritic // 同 New：快照按值传入再取地址，调用方无需关心生命周期。
-func (h *Holder) Store(s Snapshot) { h.p.Store(&s) }
+func (h *Holder) Store(s Snapshot) {
+	s.BackgroundNames = maps.Clone(s.BackgroundNames)
+	s.HiddenModels = maps.Clone(s.HiddenModels)
+	s.AllowedModels = maps.Clone(s.AllowedModels)
+
+	h.p.Store(&s)
+}
