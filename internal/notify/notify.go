@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
@@ -125,10 +126,11 @@ type Notifier struct {
 	now     func() time.Time
 	window  time.Duration
 
-	queue chan payload
-	done  chan struct{}
-	wg    sync.WaitGroup
-	once  sync.Once
+	queue  chan payload
+	done   chan struct{}
+	wg     sync.WaitGroup
+	once   sync.Once
+	closed atomic.Bool // Close 后置位，拒绝新事件入队
 
 	mu   sync.Mutex
 	last map[string]time.Time
@@ -205,7 +207,7 @@ func (n *Notifier) applyClientConfig(cfg Config) {
 
 // Notify 投递一条事件：未订阅/去重窗口内重复时丢弃；队列满时丢新事件并计数。
 func (n *Notifier) Notify(event *Event) {
-	if n == nil || n.url == "" || !n.events[event.Event] {
+	if n == nil || n.url == "" || n.closed.Load() || !n.events[event.Event] {
 		return
 	}
 
@@ -257,7 +259,16 @@ func (n *Notifier) run() {
 		case p := <-n.queue:
 			n.send(&p)
 		case <-n.done:
-			return
+			// 关停时排空已入队事件再退出：select 同时就绪会随机选，直接 return
+			// 会静默丢掉队列里尚未发送的通知（Close 与 Notify 并发下的竞态）。
+			for {
+				select {
+				case p := <-n.queue:
+					n.send(&p)
+				default:
+					return
+				}
+			}
 		}
 	}
 }
@@ -293,13 +304,14 @@ func (n *Notifier) send(payload2 *payload) {
 	}
 }
 
-// Close 停止 worker（幂等）；未发送的队列事件被丢弃。
+// Close 停止 worker（幂等）：先拒绝新事件，再让 worker 排空已入队事件后退出。
 func (n *Notifier) Close() {
 	if n == nil || n.done == nil {
 		return
 	}
 
 	n.once.Do(func() {
+		n.closed.Store(true)
 		close(n.done)
 		n.wg.Wait()
 	})

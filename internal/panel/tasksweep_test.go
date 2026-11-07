@@ -325,7 +325,7 @@ func TestClaimableTasksPrefersClaimableDuplicate(t *testing.T) {
 // （直接 claim 会被上游 task not accepted 拒绝）。mp 列表独有的任务（且不在
 // mpTaskCodes 硬编码表里）accept/claim 都必须带 mp 头走 mp 端点。
 //
-//nolint:cyclop,gocognit,wsl_v5 // 假上游在同一个 handler 里覆盖 list/accept/claim 三端点。
+//nolint:cyclop,wsl_v5 // 假上游在同一个 handler 里覆盖 list/accept/claim 三端点。
 func TestTaskSweepAcceptsBeforeClaim(t *testing.T) {
 	t.Parallel()
 

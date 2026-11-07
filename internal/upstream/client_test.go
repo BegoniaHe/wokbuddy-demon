@@ -294,18 +294,22 @@ func TestParseSoftRateReset(t *testing.T) {
 				t.Fatalf("ok=%v want %v (body=%s)", ok, item.ok, item.body)
 			}
 
-			if ok {
-				// 解析结果 = ts 在 UTC+8 解释下的墙钟（截断到分钟），应与 future 相差 ±2 分钟。
-				if d := got.Sub(future); d < -2*time.Minute || d > 2*time.Minute {
-					t.Errorf("parsed=%v want ~%v (diff %v)", got, future, d)
-				}
+			if !ok {
+				return
+			}
 
-				if got.Location() != time.UTC {
-					// 不同指针的 FixedZone 实例相等性按 offset 判，这里只断言 offset。
-					if _, off := got.Zone(); off != 8*60*60 {
-						t.Errorf("zone offset=%d want +08:00", off)
-					}
-				}
+			// 解析结果 = ts 在 UTC+8 解释下的墙钟（截断到分钟），应与 future 相差 ±2 分钟。
+			if d := got.Sub(future); d < -2*time.Minute || d > 2*time.Minute {
+				t.Errorf("parsed=%v want ~%v (diff %v)", got, future, d)
+			}
+
+			// 不同指针的 FixedZone 实例相等性按 offset 判，这里只断言 offset。
+			if got.Location() == time.UTC {
+				return
+			}
+
+			if _, off := got.Zone(); off != 8*60*60 {
+				t.Errorf("zone offset=%d want +08:00", off)
 			}
 		})
 	}
@@ -398,13 +402,13 @@ func TestRefreshSessionDead(t *testing.T) {
 		t.Fatal("want error")
 	}
 
-	var error *Error
-	if !errors.As(err, &error) {
+	var parseErr *Error
+	if !errors.As(err, &parseErr) {
 		t.Fatalf("want *Error, got %T %v", err, err)
 	}
 
-	if error.Kind != ErrSessionDead {
-		t.Errorf("kind=%v want ErrSessionDead", error.Kind)
+	if parseErr.Kind != ErrSessionDead {
+		t.Errorf("kind=%v want ErrSessionDead", parseErr.Kind)
 	}
 }
 
@@ -630,7 +634,7 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 			t.Fatalf("read %d: %v (real transport body must not be cut)", i, err)
 		}
 
-		gotSb391.WriteString(string(buf))
+		gotSb391.Write(buf)
 	}
 
 	got += gotSb391.String()

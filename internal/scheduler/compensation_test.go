@@ -109,7 +109,7 @@ func TestCompensationGateSkipsGlobalAndEnterprise(t *testing.T) {
 	}
 	sched := fixture.scheduler(t, global, enterprise, cnAcct)
 
-	rows, _ := sched.ClaimCompensationNow()
+	rows, _ := sched.ClaimCompensationNow(context.Background())
 
 	if got := fixture.statusCalls.Load(); got != 1 {
 		t.Errorf("只有 CN 账号应查询状态，calls=%d", got)

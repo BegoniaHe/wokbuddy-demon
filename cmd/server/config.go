@@ -771,11 +771,14 @@ func WriteDefault(path string) (string, error) {
 		return "", err
 	}
 
-	c := Default()
-	c.APIKey = key
-	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
+	config := Default()
+	config.APIKey = key
 
-	out, err := json.MarshalIndent(c, "", "  ") //nolint:gosec // config 本就是凭据载体，落盘为设计行为
+	if normErr := config.normalize(); normErr != nil {
+		return "", fmt.Errorf("normalize default config: %w", normErr)
+	}
+
+	out, err := json.MarshalIndent(config, "", "  ") //nolint:gosec // config 本就是凭据载体，落盘为设计行为
 	if err != nil {
 		return "", fmt.Errorf("marshal config: %w", err)
 	}

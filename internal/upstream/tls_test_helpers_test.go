@@ -266,7 +266,7 @@ func startRawTLSServer(t *testing.T) (string, tls.Certificate, *captureStore) {
 
 	t.Cleanup(func() {
 		for _, conn := range store.snapshot() {
-			_ = conn.Conn.Close()
+			_ = conn.Close()
 		}
 
 		_ = base.Close()
