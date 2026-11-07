@@ -5,6 +5,12 @@ run:
   tests: true
   modules-download-mode: readonly
 
+# 取消默认诊断截断（每 linter 50 条 / 同类 3 条）：截断会让真实命中被静默吞掉，
+# 与「严格规则集」的意图相悖。当前基线 0 issues，收紧不改动既有结果。
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
 linters:
   default: none
   enable:
