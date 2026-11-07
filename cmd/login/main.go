@@ -195,7 +195,8 @@ func doJSON(
 
 	headers(req)
 
-	resp, err := client.Do(req) //nolint:gosec,nolintlint // URL 由固定 realm 端点拼接；绕过 gosec 增量分析抖动
+	//nolint:gosec,nolintlint // G704 在 v2.14.0 报、v2.15.0 不报；URL 由固定端点拼接
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}

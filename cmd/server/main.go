@@ -159,6 +159,9 @@ func main() {
 	defer obs.usage.Stop()
 	defer obs.keys.Stop()
 	defer obs.reqlog.Close()
+	// LIFO：quotaWorker 最先关停（排空队列时 usage.Recorder 仍可用），
+	// 早于 usage.Stop / cleanupRuntime 里的 pool.Close。
+	defer obs.quotaWorker.Close()
 
 	// 管理与运维面共用同一份失败预算；/v1/* 的 clientAuthLimiter 仍独立。
 	authLimiter := httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow)
@@ -322,13 +325,14 @@ func setupUpstream(
 
 // observability 运行期可观测组件（日志镜像、用量、密钥、请求归档、定价与智能体配置）。
 type observability struct {
-	live    *livecfg.Holder
-	usage   *usage.Recorder
-	quota   *quota.Store
-	keys    *apikey.Store
-	reqlog  *reqlog.Recorder
-	pricing *pricing.Catalog
-	agents  *agentcfg.Manager
+	live        *livecfg.Holder
+	usage       *usage.Recorder
+	quota       *quota.Store
+	quotaWorker *quotaWorker
+	keys        *apikey.Store
+	reqlog      *reqlog.Recorder
+	pricing     *pricing.Catalog
+	agents      *agentcfg.Manager
 }
 
 // newPanel 构造管理面板：所有可改字段经 live 快照读取，重启项由 cfg 静态持有。
@@ -403,7 +407,7 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 	rec := usage.New(usagePath)
 	rec.Start()
 	setDailyUsageProvider(state8, rec)
-	quotaStore := setupQuota(state8, rec, cfg)
+	quotaStore, quotaWk := setupQuota(state8, rec, cfg)
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
 	// 命名密钥库：与 state 文件同目录（data/api_keys.json）。面板签发/撤销，
@@ -433,13 +437,14 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 	agents := agentcfg.New(home, stateSibling(cfg.StateFile, "agent-backups"))
 
 	return &observability{
-		live:    live,
-		usage:   rec,
-		quota:   quotaStore,
-		keys:    keyStore,
-		reqlog:  requestLog,
-		pricing: priceCat,
-		agents:  agents,
+		live:        live,
+		usage:       rec,
+		quota:       quotaStore,
+		quotaWorker: quotaWk,
+		keys:        keyStore,
+		reqlog:      requestLog,
+		pricing:     priceCat,
+		agents:      agents,
 	}
 }
 

@@ -105,9 +105,15 @@ func (s *Scheduler) CompensationStatusAll(ctx context.Context) []CompensationRow
 			continue
 		}
 
-		wg.Add(1)
+		// 先取名额再起 goroutine；sem 满且已取消时不阻塞主 goroutine
+		// （与 RunBalanceRefreshNowCtx 同口径）。
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			continue
+		}
 
-		sem <- struct{}{}
+		wg.Add(1)
 
 		go func(idx int, acct *auth.Auth) {
 			defer wg.Done()

@@ -718,6 +718,16 @@ type modelsCache struct {
 	ids      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
+	// inFlight 非空表示已有一次上游探测在进行。等待者复用其结果，避免缓存过期
+	// 瞬间 N 个并发请求同时穿透上游（惊群），也杜绝慢结果覆盖快结果。
+	inFlight *modelFetch
+}
+
+// modelFetch 一次进行中的单飞拉取；done 关闭后 infos 即为本次提交的结果，
+// 等待者直接复用（不各自重打上游，也不会用慢结果覆盖快结果）。
+type modelFetch struct {
+	done  chan struct{}
+	infos []upstream.ModelInfo
 }
 
 // dynamicModelsCache 生产默认缓存（NewHandler 未注入 modelsCache 时使用）。
@@ -1319,60 +1329,84 @@ func (h *Handler) fetchGlobalModels() ([]string, *auth.Auth) {
 // 无冷却窗口，客户端重试即放大请求量——负缓存正是为此设计（见 handler_test 吸收
 // 上游 9832283 的注释）；且 cachedModelsSnapshot（gateway_hint 判定）依赖缓存写入。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	h.modelsCache.RLock()
+	h.modelsCache.Lock()
 
 	if len(h.modelsCache.ids) > 0 && time.Since(h.modelsCache.fetched) < dynamicModelsTTL {
 		out := h.modelsCache.ids
-		h.modelsCache.RUnlock()
+		h.modelsCache.Unlock()
 
 		return out
 	}
+
 	// 失败负缓存：冷却期内不再请求上游。
 	if !h.modelsCache.lastFail.IsZero() && time.Since(h.modelsCache.lastFail) < modelsFetchFailCooldown {
-		h.modelsCache.RUnlock()
+		h.modelsCache.Unlock()
+
 		return nil
 	}
 
-	h.modelsCache.RUnlock()
+	// 单飞：已有探测在飞时复用其结果，避免缓存过期瞬间的惊群，也杜绝慢结果
+	// 覆盖快结果（检查与提交原分两把锁、中间隔两次上游 I/O）。
+	if flight := h.modelsCache.inFlight; flight != nil {
+		h.modelsCache.Unlock()
+		<-flight.done
 
+		return flight.infos
+	}
+
+	flight := &modelFetch{done: make(chan struct{})}
+	h.modelsCache.inFlight = flight
+	h.modelsCache.Unlock()
+
+	infos, failed := h.probeDynamicModels()
+
+	h.modelsCache.Lock()
+	flight.infos = infos
+
+	if len(infos) > 0 {
+		h.modelsCache.ids = infos
+		h.modelsCache.fetched = time.Now()
+		h.modelsCache.lastFail = time.Time{} // 成功则清空负缓存
+	} else if failed {
+		h.modelsCache.lastFail = time.Now()
+	}
+
+	// 无 CN 账号（failed=false 且 infos=nil）不动缓存状态，账号上线后下次请求立即重试。
+	h.modelsCache.inFlight = nil
+	h.modelsCache.Unlock()
+	close(flight.done)
+
+	return infos
+}
+
+// probeDynamicModels 选号并拉取 CN 模型目录；失败（含空列表）返回 failed=true 并留
+// 一条 WARN。无 CN 账号/凭证返回 failed=false：暂时状态，不进 5min 负缓存。
+func (h *Handler) probeDynamicModels() (infos []upstream.ModelInfo, failed bool) {
 	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
 	if len(uids) == 0 {
-		return nil
+		return nil, false
 	}
 
 	acct := h.cfg.Pool.AuthByUID(uids[0])
 	if acct == nil {
-		return nil
+		return nil, false
 	}
 
 	infos, err := h.cfg.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
-		// 拉取失败只进负缓存（5min lastFail），不 NoteError：NoteError 喂的是 chat
-		// 熔断器，models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号；
-		// models 拉取失败 ≠ 账号 chat 不可用。
-		//
-		// 但必须留一条 WARN：静默返回会让上游接口变更、账号不可用、网络问题全都
-		// 无法从日志发现。负缓存期内不再重试，所以这条路每 5min 最多 1 行，不刷屏。
-		h.modelsCache.Lock()
-		h.modelsCache.lastFail = time.Now()
-		h.modelsCache.Unlock()
-
+		// 拉取失败只进负缓存，不 NoteError：NoteError 喂的是 chat 熔断器，
+		// models 端点偶发 5xx 跨界惩罚 chat 通道健康的账号。
+		// 但必须留一条 WARN：静默返回会让上游接口变更、网络问题无法从日志发现。
 		if err != nil {
 			log.Printf("WARN: [server] /v1/models: CN 模型目录拉取失败: %v", err)
 		} else {
 			log.Printf("WARN: [server] /v1/models: CN 模型目录返回空列表（按失败处理，回落内置种子）")
 		}
 
-		return nil
+		return nil, true
 	}
 
-	h.modelsCache.Lock()
-	h.modelsCache.ids = infos
-	h.modelsCache.fetched = time.Now()
-	h.modelsCache.lastFail = time.Time{} // 成功则清空负缓存
-	h.modelsCache.Unlock()
-
-	return infos
+	return infos, false
 }
 
 // cachedModelsSnapshot 只读模型目录缓存（TTL 内快照）；缓存冷/空 → nil。

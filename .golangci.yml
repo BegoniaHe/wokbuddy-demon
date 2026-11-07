@@ -72,6 +72,7 @@ linters:
     - nilnil
     - noctx
     - nolintlint
+    - nosprintfhostport
     - paralleltest
     - perfsprint
     - prealloc

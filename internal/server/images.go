@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -230,7 +231,10 @@ func (h *Handler) ensureMediaToken(w http.ResponseWriter, acct *auth.Auth, surfa
 		return false
 	}
 
-	_ = acct.SaveAtomicRetry()
+	if err := acct.SaveAtomicRetry(); err != nil {
+		log.Printf("ERR: [server] %s refresh acct=%s: save auth failed: %v",
+			surface, logfmt.Label(acct.UID, acct.NicknameValue()), err)
+	}
 
 	return true
 }
@@ -340,7 +344,10 @@ func (h *Handler) retryMediaAfterRefresh(
 		return first, false, fmt.Errorf("refresh token: %w", refreshFail)
 	}
 
-	_ = acct.SaveAtomicRetry()
+	if err := acct.SaveAtomicRetry(); err != nil {
+		log.Printf("ERR: [server] media 401 refresh acct=%s: save auth failed: %v",
+			logfmt.Label(acct.UID, acct.NicknameValue()), err)
+	}
 
 	secondStart := time.Now()
 	second := mediaAttempt{}

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -156,31 +157,100 @@ type quotaEvent struct {
 	resetAt time.Time
 }
 
-// setupQuota 创建撞线事件存储并接到 pool（issue #101）。
-func setupQuota(poolRef *pool.Pool, rec *usage.Recorder, cfg *Config) *quota.Store {
-	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
+// quotaWorker 串行处理撞线事件；单个常驻 goroutine，关停时排空剩余事件后退出。
+// 用独立的 stop channel 而非关闭 queue：pool 的 hook 可能在关停后仍被触发，
+// 向已关闭的 channel 发送会 panic，故 enqueue 永远向未关闭的 queue 做非阻塞发送。
+type quotaWorker struct {
+	queue chan quotaEvent
+	stop  chan struct{}
+	done  chan struct{}
+	once  sync.Once
 
-	queue := make(chan quotaEvent, quotaQueueSize)
-	go func() {
-		for ev := range queue {
-			used := rec.TokensSince(ev.realm, ev.uid, ev.model, ev.resetAt.Add(-24*time.Hour))
-			store.Add(&quota.Event{
-				UID: ev.uid, Realm: ev.realm, Model: ev.model,
-				ResetAt: ev.resetAt, Used: used, At: time.Time{},
-			})
+	rec   *usage.Recorder
+	store *quota.Store
+}
+
+func newQuotaWorker(rec *usage.Recorder, store *quota.Store) *quotaWorker {
+	w := &quotaWorker{
+		queue: make(chan quotaEvent, quotaQueueSize),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+		rec:   rec,
+		store: store,
+	}
+
+	go w.run()
+
+	return w
+}
+
+// enqueue 非阻塞入队（在 pool 写锁内调用，绝不能阻塞或拿锁等待）。
+func (w *quotaWorker) enqueue(uid, model, realm string, resetAt time.Time) {
+	select {
+	case <-w.stop:
+		return // 已关停：丢弃，不再向队列写入
+	default:
+	}
+
+	select {
+	case w.queue <- quotaEvent{uid: uid, model: model, realm: realm, resetAt: resetAt}:
+	default:
+		log.Printf("WARN: [quota] 撞线事件队列已满，丢弃 uid=%s model=%s", uid, model)
+	}
+}
+
+func (w *quotaWorker) run() {
+	defer close(w.done)
+
+	for {
+		select {
+		case ev := <-w.queue:
+			w.handle(ev)
+		case <-w.stop:
+			// 排空已入队但未处理的事件，再退出，避免停机丢撞线样本。
+			for {
+				select {
+				case ev := <-w.queue:
+					w.handle(ev)
+				default:
+					return
+				}
+			}
 		}
-	}()
+	}
+}
+
+func (w *quotaWorker) handle(ev quotaEvent) {
+	used := w.rec.TokensSince(ev.realm, ev.uid, ev.model, ev.resetAt.Add(-24*time.Hour))
+	w.store.Add(&quota.Event{
+		UID: ev.uid, Realm: ev.realm, Model: ev.model,
+		ResetAt: ev.resetAt, Used: used, At: time.Time{},
+	})
+}
+
+// Close 幂等关停：通知 worker 退出并等待其排空完成。
+func (w *quotaWorker) Close() {
+	if w == nil {
+		return
+	}
+
+	w.once.Do(func() {
+		close(w.stop)
+		<-w.done
+	})
+}
+
+// setupQuota 创建撞线事件存储、常驻 worker 并接到 pool（issue #101）。
+func setupQuota(poolRef *pool.Pool, rec *usage.Recorder, cfg *Config) (*quota.Store, *quotaWorker) {
+	store := quota.New(stateSibling(cfg.StateFile, "quota_events.jsonl"))
+	worker := newQuotaWorker(rec, store)
 
 	poolRef.SetModelRateLimitHook(func(uid, model, realm string, resetAt time.Time) {
 		// 回调在 pool 写锁内触发：只做非阻塞入队，扫描 usage 与写 JSONL 由 worker 串行处理。
-		select {
-		case queue <- quotaEvent{uid: uid, model: model, realm: realm, resetAt: resetAt}:
-		default:
-			log.Printf("WARN: [quota] 撞线事件队列已满，丢弃 uid=%s model=%s", uid, model)
-		}
+		worker.enqueue(uid, model, realm, resetAt)
 	})
 
-	return store
+	return store, worker
 }
 
 // handlerDeps 是构建 HTTP handler 所需的装配期依赖。

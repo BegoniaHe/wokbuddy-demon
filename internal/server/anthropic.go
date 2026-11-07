@@ -32,6 +32,7 @@ var (
 	errTopPOutOfRange         = errors.New("top_p must be in [0,1]")
 	errTopKNegative           = errors.New("top_k must be >= 0")
 	errMetadataUserIDTooLong  = errors.New("metadata.user_id is too long")
+	errThinkingInvalid        = errors.New("thinking must be a valid object")
 	errThinkingBudgetTooSmall = errors.New("thinking.budget_tokens must be >= 1024")
 	errThinkingBudgetTooLarge = errors.New("thinking.budget_tokens must be less than max_tokens")
 	errToolNameTooLong        = errors.New("tool name is too long")
@@ -444,7 +445,7 @@ func validateAnthropicThinking(req *anthropicRequest) error {
 		BudgetTokens int    `json:"budget_tokens"`
 	}
 	if json.Unmarshal(req.Thinking, &thinking) != nil {
-		return nil //nolint:nilerr // 非对象 thinking 交由后续映射忽略
+		return errThinkingInvalid
 	}
 
 	if thinking.Type != "enabled" || thinking.BudgetTokens == 0 {
