@@ -152,7 +152,6 @@ type activityStreakStub struct {
 	reportCalls atomic.Int32
 	days        int  // streak 返回的连登天数
 	streakErr   bool // 让 streak 返回 500
-	noUserId    bool // 待测：上报不带 userId（服务端 200 但静默丢弃）
 	streakHits  atomic.Int32
 }
 

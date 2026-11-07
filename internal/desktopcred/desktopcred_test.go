@@ -218,7 +218,6 @@ func TestDiscoverRoot(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
 func TestRootsIncludeWorkbuddyBase(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

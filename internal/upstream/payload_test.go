@@ -543,7 +543,7 @@ func TestNormalizeToolPatterns(t *testing.T) {
 const str = `\`
 
 func testAgentRunPatternNormalized(t *testing.T) {
-	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"agent_run","parameters":{"type":"object","properties":{"runId":{"type":"string","pattern":"^agent` + str + str + `_run` + str + str + `_"}` + `,"query":{"type":"string"}},"required":["query"]}}}]}` //nolint:lll // 实案 body 原样
+	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"agent_run","parameters":{"type":"object","properties":{"runId":{"type":"string","pattern":"^agent` + str + str + `_run` + str + str + `_"}` + `,"query":{"type":"string"}},"required":["query"]}}}]}`
 
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "runId", "pattern"); got != `^agent_run_` {
@@ -556,7 +556,7 @@ func testAgentRunPatternNormalized(t *testing.T) {
 }
 
 func testNestedAnyOfPatternNormalized(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"anyOf":[{"properties":{"code":{"pattern":"x` + str + str + `_y"}}},{"type":"string"}]}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"anyOf":[{"properties":{"code":{"pattern":"x` + str + str + `_y"}}},{"type":"string"}]}}}]}`
 
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "anyOf", 0, "properties", "code", "pattern"); got != "x_y" {
@@ -574,7 +574,7 @@ func testBareToolParametersNormalized(t *testing.T) {
 }
 
 func testPatternPropertiesKeyNormalized(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"patternProperties":{"^a` + str + str + `_b` + str + str + `_":{"type":"string"}}}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"patternProperties":{"^a` + str + str + `_b` + str + str + `_":{"type":"string"}}}}}]}`
 
 	var obj map[string]any
 
@@ -598,7 +598,7 @@ func testPatternPropertiesKeyNormalized(t *testing.T) {
 }
 
 func testMessageContentBackslashUntouched(t *testing.T) {
-	raw := `{"messages":[{"role":"user","content":"path C:` + str + str + `_dir and regex a` + str + str + `_b"}],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"q` + str + str + `_r"}}}}}]}` //nolint:lll
+	raw := `{"messages":[{"role":"user","content":"path C:` + str + str + `_dir and regex a` + str + str + `_b"}],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"q` + str + str + `_r"}}}}}]}`
 	out := string(PrepareBodyOptWithEfforts([]byte(raw), false, nil))
 
 	var obj map[string]any
@@ -613,7 +613,7 @@ func testMessageContentBackslashUntouched(t *testing.T) {
 }
 
 func testCleanPatternUntouched(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"^[a-z]+` + str + str + `d_$"}}}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"^[a-z]+` + str + str + `d_$"}}}}}]}`
 
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != `^[a-z]+\d_$` {
@@ -647,7 +647,7 @@ func testNoToolsNoop(t *testing.T) {
 }
 
 func testSanitizeOnOffSame(t *testing.T) {
-	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"a` + str + str + `_b"}}}}}]}` //nolint:lll
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":{"properties":{"p":{"pattern":"a` + str + str + `_b"}}}}}]}`
 	for _, sanitize := range []bool{false, true} {
 		out := string(PrepareBodyOptWithEfforts([]byte(body), sanitize, nil))
 		if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "p", "pattern"); got != "a_b" {

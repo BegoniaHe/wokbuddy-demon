@@ -108,7 +108,6 @@ func TestLoadFile(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
 func TestEnvOverride(t *testing.T) {
 	t.Setenv("WB2A_LISTEN", ":7777")
 	t.Setenv("WB2A_API_KEY", "envkey")
@@ -359,7 +358,6 @@ func TestUpstreamExplicitHeaderIdle(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
 func TestUpstreamEnvOverride(t *testing.T) {
 	t.Setenv("WB2A_HEADER_TIMEOUT_SECONDS", "45")
 	t.Setenv("WB2A_IDLE_TIMEOUT_SECONDS", "900")
@@ -1000,8 +998,6 @@ func TestPromptFileOverride(t *testing.T) {
 }
 
 // TestPromptEnvOverride env 覆盖 prompt.mode 与 prompt.file。
-//
-//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
 func TestPromptEnvOverride(t *testing.T) {
 	t.Setenv("WB2A_PROMPT_MODE", "passthrough")
 
@@ -1038,8 +1034,6 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 
 // TestUpstreamUserAgentConfig 配置 upstream.user_agent 与 env WB2A_USER_AGENT 均生效，
 // 缺省空串保持现状（headers 层回落到 profile.chatUA）。
-//
-//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
 func TestUpstreamUserAgentConfig(t *testing.T) {
 	// JSON 配置
 	dir := t.TempDir()

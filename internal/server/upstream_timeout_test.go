@@ -13,11 +13,11 @@ import (
 
 var errBoom = errors.New("boom")
 
-type timeoutErr struct{ timeout bool }
+type timeoutError struct{ timeout bool }
 
-func (e timeoutErr) Error() string   { return "stub" }
-func (e timeoutErr) Timeout() bool   { return e.timeout }
-func (e timeoutErr) Temporary() bool { return e.timeout }
+func (e timeoutError) Error() string   { return "stub" }
+func (e timeoutError) Timeout() bool   { return e.timeout }
+func (e timeoutError) Temporary() bool { return e.timeout }
 
 func TestIsUpstreamTimeout(t *testing.T) {
 	t.Parallel()
@@ -28,8 +28,8 @@ func TestIsUpstreamTimeout(t *testing.T) {
 		clientGone bool
 		want       bool
 	}{
-		{"net.Error 超时", timeoutErr{true}, false, true},
-		{"net.Error 非超时（连接被拒）", timeoutErr{false}, false, false},
+		{"net.Error 超时", timeoutError{true}, false, true},
+		{"net.Error 非超时（连接被拒）", timeoutError{false}, false, false},
 		{"显式 deadline", fmt.Errorf("read: %w", context.DeadlineExceeded), false, true},
 		{"客户端断连（ctx 已取消）", context.Canceled, true, false},
 		{"空闲看门狗掐流（客户端仍在）", context.Canceled, false, true},
@@ -47,7 +47,7 @@ func TestIsUpstreamTimeout(t *testing.T) {
 	}
 
 	// 保证 stub 真的实现了 net.Error（否则上面的用例会静默走不到 Timeout 分支）
-	var ne net.Error = timeoutErr{true}
+	var ne net.Error = timeoutError{true}
 
 	_ = ne
 }

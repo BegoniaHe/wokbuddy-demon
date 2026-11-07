@@ -73,13 +73,13 @@ func TestTravelStatusBusinessError(t *testing.T) {
 	})
 	_, err := c.TravelStatus(&auth.Auth{AccessToken: "at", UID: "u1"})
 
-	var error *Error
-	if !errors.As(err, &error) {
+	var parseErr *Error
+	if !errors.As(err, &parseErr) {
 		t.Fatalf("want *Error, got %T %v", err, err)
 	}
 
-	if error.Status != 400 || error.Kind != ErrClient {
-		t.Errorf("status=%d kind=%v", error.Status, error.Kind)
+	if parseErr.Status != 400 || parseErr.Kind != ErrClient {
+		t.Errorf("status=%d kind=%v", parseErr.Status, parseErr.Kind)
 	}
 }
 

@@ -125,6 +125,35 @@ linters:
               desc: 使用 math/rand/v2
             - pkg: golang.org/x/exp
               desc: 使用标准库
+        # 包依赖方向护栏：internal/* 单向分层，禁止回流到装配层与 UI 层。
+        # 与 AGENTS.md「cmd/* 负责装配，不反向依赖」一致；实测当前 0 命中，
+        # 仅作回归拦截（depguard 的 files/deny 按路径匹配，含 _test.go）。
+        internal-no-cmd:
+          files:
+            - '**/internal/**'
+          deny:
+            - pkg: github.com/BegoniaHe/wokbuddy-demon/cmd
+              desc: internal/* 不得反向依赖 cmd/* 装配层
+        core-no-ui:
+          files:
+            - '**/internal/pool/**'
+            - '**/internal/upstream/**'
+            - '**/internal/session/**'
+            - '**/internal/scheduler/**'
+          deny:
+            - pkg: github.com/BegoniaHe/wokbuddy-demon/internal/panel
+              desc: 核心业务层不得依赖面板 UI
+            - pkg: github.com/BegoniaHe/wokbuddy-demon/internal/server
+              desc: 核心业务层不得依赖 HTTP 服务层
+        pool-no-upstream:
+          files:
+            - '**/internal/pool/**'
+            - '**/internal/session/**'
+          deny:
+            - pkg: github.com/BegoniaHe/wokbuddy-demon/internal/upstream
+              desc: 账号池/会话层不得依赖出站协议层
+            - pkg: github.com/BegoniaHe/wokbuddy-demon/internal/scheduler
+              desc: 账号池/会话层不得依赖调度层
     gocritic:
       enable-all: true
       disabled-checks:
@@ -337,30 +366,26 @@ linters:
           - gocognit
           - dupl
           - maintidx
-          - nestif
           - gosec
           - unparam
           - gocritic
-          - prealloc
           - errchkjson
           # 测试惯用：httptest.NewRequest / exec.Command 不带 context；
           # UA 三段式等常量含合法重复词；表驱动 helper 命名自由。
           - noctx
           - dupword
-          - nolintlint
           - dogsled
-          - unused
-          - errname
-          - mirror
           - thelper
-          - staticcheck
           - revive
-          - predeclared
           - usetesting
           # 测试 helper 常把 ctx 收进结构体模拟真实 reader/客户端，非生产代码的 ctx 反模式。
           - containedctx
           # 测试内的长 JSON / SSE 字面量无法合理折行，豁免行宽检查。
           - lll
+          # 保留项均为测试高频惯用写法或高假阳性规则。刻意不豁免
+          # predeclared / staticcheck / nolintlint / unused / errname / mirror /
+          # prealloc / nestif：这些规则低命中、低假阳性，放开后抓出过遮蔽预声明
+          # 标识符、恒等表达式与过期 nolint，属真实收紧（对应代码已同步修正）。
       # CLI 工具（cmd/*）向终端打印是其正常输出，非库内调试残留。
       - path: ^cmd/
         linters:

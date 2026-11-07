@@ -115,7 +115,7 @@ func TestDesktopOSVersionCPUYearGate(t *testing.T) {
 
 	for _, year := range []int{2017, 2018, 2021, 2022, 2024} {
 		for seed := range uint64(64) {
-			rng := rand.New(rand.NewPCG(seed, seed+1)) //nolint:gosec // 测试固定种子
+			rng := rand.New(rand.NewPCG(seed, seed+1))
 			build := desktopOSVersionFor(rng, year)
 
 			if minYears[build] > year {
@@ -139,7 +139,7 @@ func TestDesktopMemoryBandsFollowCPU(t *testing.T) {
 
 	for _, cpu := range cpupool.Models {
 		for seed := range uint64(16) {
-			rng := rand.New(rand.NewPCG(seed, seed+7)) //nolint:gosec // 测试固定种子
+			rng := rand.New(rand.NewPCG(seed, seed+7))
 			memorySize := desktopMemoryFor(rng, cpu)
 
 			if cpu.Segment == cpupool.Mobile && memorySize > 32 {
