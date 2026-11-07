@@ -17,6 +17,6 @@ require (
 	github.com/klauspost/compress v1.20.2 // indirect
 	github.com/molecule-man/go-brrr v1.2.0 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
+	golang.org/x/crypto v0.58.1-0.20261009181718-2f1f834330b2 // indirect
 	golang.org/x/sys v0.49.0 // indirect
 )
