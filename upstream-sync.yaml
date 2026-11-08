@@ -14,29 +14,37 @@ upstream:
   branch: main
 
 last_audited:
-  commit: dd01a5262379d1f63065165c16c1af902cf0ea6f
-  audited_at_utc: 2026-11-04T18:22:29Z
+  commit: 29db87862ceac3c2d6ba4ea2c2c9d49486b292bf
+  audited_at_utc: 2026-11-08T04:29:28Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
     from: 2026-11-04
-    to: 2026-11-04
-    non_merge_commits: 1
-    merge_commits: 0
+    to: 2026-11-08
+    non_merge_commits: 48
+    merge_commits: 15
   dispositions:
-    issue: 0
-    revisit: 1
-    skip: 0
-  issues: []
+    issue: 2
+    revisit: 2
+    skip: 59
+  issues:
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/467
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/476
   note: >-
-    2026-11-04 二次审计 77d4762f..dd01a526（1 条提交，三块内容）。官方版本未变
-    （cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901），重跑
-    download_latest --dry-run 与 protocol_sweep 复核。① tools 脱敏：代码事实成立
-    （payload.go:138-142 只洗 messages，tools 子树无净化），官方包也证 tools[].function
-    .description 是真实出站面，但「上游对工具描述里的模板句同样逐字拦截」无包内证据，
-    出处 ithtelab/workbuddy-manager#395 自述未做对照实测，记 revisit 等本仓实测样本。
-    ② 轮询指纹跳过：本仓面板是 React（useQuery refetchInterval + 按 uid keyed），
-    不存在 innerHTML 重建打断焦点/悬停的形态。③ AutoBot.yml 属参考侧自动化，本仓无此
-    文件。审计不产生实现提交，游标推进是独立的 chore(sync) 元数据提交。
+    2026-11-08 续审 dd01a526..29db8786（48 条非 merge + 15 条纯 merge，63 项）。官方 Win32
+    版本未变（cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901），重跑
+    download_latest --dry-run / download_latest / protocol_sweep 复核。区间前段
+    dd01a526..dab1b08c 的 24 项由未合入 main 的审计提交 4766f469（fix/stream-close-drain-tail
+    分支）审过：其账本前 264 行与 main 同源、追加后 validate 通过，逐条复核有效并复用，
+    其中 #467（/v2/videos/* 视频端点）已由 c7d82b43 实现、图片 b64_json/n>1 记 revisit。
+    后段 dab1b08c..29db8786 的 39 项新审：官方包确认业务码 11134 是「模型服务不可用，
+    请切换模型重试」、CLI classifyErrorDetail 不归账号级 quota/auth，本仓 Classify 却无分流
+    → 5xx 罚号 / 200 信封换号并 Unbind 粘性，开 #476（retry_policy.retry_after 与末端状态码
+    无包内证据，列证据边界等实测）；4fb7cb42 的盲盒消费 + 10105 自救端点 0 命中、依赖第三方
+    脚本实测且本仓 scheduler 无网页活跃腿，记 revisit；其余按 skip 落账（$wbEncrypted 本仓已
+    由 internal/desktopcred 覆盖、断流终态 errTruncatedStream 已覆盖、兜底 system 用官方字节、
+    入站体上限 / 11140 连坐已覆盖，面板 / AutoBot / 续写预算 / model_eff 属参考侧产品），
+    6 个纯 merge 按 merge-bubble skip。审计不产生实现提交，游标推进是独立的 chore(sync)
+    元数据提交。

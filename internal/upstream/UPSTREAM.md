@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `dd01a5262379d1f63065165c16c1af902cf0ea6f`（2026-11-04）。该基线与本仓库无共同祖先，
+  `29db87862ceac3c2d6ba4ea2c2c9d49486b292bf`（2026-11-08）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -58,8 +58,27 @@ Win32 仍是 cn 5.9.3 / global 5.9.4），新开 #438（`/v3/config` 缺 `Connec
 2026-11-04 再续审 `77d4762f..dd01a526`（1 条提交，三块内容；官方 Win32 未变），
 全部记 `revisit` / 不适用：tools 子树脱敏的代码事实成立（`payload.go` 只洗 messages），
 但上游是否会拦工具描述里的模板句无证据、出处自述未实测；轮询指纹跳过对应参考 fork 的
-`innerHTML` 重建形态，本仓面板是 React 渲染；`AutoBot.yml` 属参考侧自动化。后续审计从
-`dd01a526` 之后开始。
+`innerHTML` 重建形态，本仓面板是 React 渲染；`AutoBot.yml` 属参考侧自动化。
+2026-11-06 续审 `dd01a526..dab1b08c`（15 条非 merge + 9 条纯 merge；官方 Win32 未变），
+整批是参考 fork 自建的一整套「视频生成」产品簇（出视频端点 / MCP / 水印裁切 / 任务台账 /
+OpenAI Video 资源形状 / Responses 托管 `image_generation` 工具）。官方两 realm 静态包确认
+`cli/dist/codebuddy-lite-wb.mjs` 的 `VideoService` 有 `/v2/videos/generations` +
+`/v2/videos/tasks`，且按 `text-to-video` / `image-to-video` 标签给模型分类，本仓无视频端点、
+`nonChatModel` 又把视频模型从 `/v1/models` 剔除，确认一个缺口并开 #467（已实现）；图片
+`b64_json` / `n>1` 只靠参考 fork 真机实测、官方包无证据，记 `revisit`；9 个纯 merge 及本仓
+已覆盖（`clientGone` 只看请求 ctx）、形态不存在（reqlog `purgeCh`、面板分域 tab、水印/台账）、
+或属参考侧产品包装的提交一律 `skip`。该段审计记录最初落在 `fix/stream-close-drain-tail`
+分支的 `4766f469`（未合入 `main`），2026-11-08 复核其账本前 264 行与 `main` 同源后并入本轮。
+2026-11-08 续审 `dab1b08c..29db8786`（33 条非 merge + 6 条纯 merge，共 39 项；官方 Win32
+仍是 cn 5.9.3 / global 5.9.4），确认一个协议缺口并开 #476：业务码 `11134` 官方文案为「模型
+服务不可用，请切换模型重试」、CLI `classifyErrorDetail` 的账号级 quota/auth 子分类不含它，
+本仓 `Classify` 却无分流 → 5xx 落 `ErrServer` 罚号、200 信封 / 4xx 落 `ErrClient` 换号并
+Unbind 粘性；`retry_policy.retry_after` 字段与末端状态码无包内证据，列 #476 证据边界等实测。
+`4fb7cb42` 的盲盒消费 + `10105` 自救（端点 0 命中、依赖第三方脚本实测；本仓 scheduler 无
+网页活跃腿形态）记 `revisit`；其余（`$wbEncrypted` 本仓已由 `internal/desktopcred` 覆盖、
+断流终态 `errTruncatedStream` 已覆盖、兜底 system 本仓用官方字节、入站体上限 / 11140 连坐
+已覆盖、面板 / AutoBot / 续写预算 / `model_eff` 属参考侧产品）按 `skip` 落账，6 个纯 merge
+按 `merge-bubble` skip。后续审计从 `29db8786` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -277,7 +296,7 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 - 上游远端：`upstream` → `https://github.com/misakano7545/workbuddy2api-panel.git`
   （branch `main`）。首次使用执行 `git fetch --prune upstream`。
 - 审计游标（逻辑基线，位于参考 fork 历史中，非本仓库祖先）：
-  `dd01a5262379d1f63065165c16c1af902cf0ea6f`（2026-11-04 推进）。
+  `29db87862ceac3c2d6ba4ea2c2c9d49486b292bf`（2026-11-08 推进）。
 - 正式审计前先刷新官方 Win32 包并跑 `reverse-workbuddy` 的
   `download_latest.mjs` / `protocol_sweep.mjs`；官方静态包缺失时停止审计。
 - 常用命令：
@@ -292,4 +311,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-04（参考 fork 审计基线 `dd01a526`；窗口 `77d4762f..dd01a526` 全部记 revisit/不适用，未开 Issue；不直接吸收）。_
+_最近更新：2026-11-08（参考 fork 审计基线 `29db8786`；窗口 `dd01a526..29db8786` 共 63 项，复用 `4766f469` 的 24 条处置并新审 39 条，确认 `11134` 缺口开 #476、盲盒/10105 记 revisit、其余 skip；不直接吸收）。_
