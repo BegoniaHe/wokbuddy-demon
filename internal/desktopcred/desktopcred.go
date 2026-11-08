@@ -47,6 +47,7 @@ var (
 	errInvalidEnvelopeCiphertext            = errors.New("invalid envelope ciphertext")
 	errDecryptFailedWrongKeyOrCorrupted     = errors.New("decrypt failed: wrong key or corrupted credential")
 	errNotCanonicalBase64                   = errors.New("not canonical base64")
+	errAADComponentTooLong                  = errors.New("aad component too long")
 )
 
 type Account struct {
@@ -390,7 +391,12 @@ func openWrapper(m map[string]any, key keyMaterial) (string, error) {
 		return "", errAtRestSecretDoesNotMatch
 	}
 
-	return decryptAESGCM(key.key, nonce, tag, nums, fieldAAD(key.keyID))
+	aad, err := fieldAAD(key.keyID)
+	if err != nil {
+		return "", err
+	}
+
+	return decryptAESGCM(key.key, nonce, tag, nums, aad)
 }
 
 // parseEnvelope 校验 wrapper envelope 的 canonical base64 与固定长度字段。
@@ -458,7 +464,11 @@ func decodeCanonical(s string) ([]byte, error) {
 
 // fieldAAD 复刻客户端 buildAuthenticatedContextAad（sym-v1, framing=field）：
 // WB-AAD\0 | version=1 | "WBEV1" | "sym-v1" | suite=1 | keyId | framing=2 | no-seq | final=0。
-func fieldAAD(keyID string) []byte {
+func fieldAAD(keyID string) ([]byte, error) {
+	if uint64(len(keyID)) > uint64(^uint32(0)) {
+		return nil, errAADComponentTooLong
+	}
+
 	var buffer bytes.Buffer
 	buffer.WriteString("WB-AAD\x00")
 	buffer.WriteByte(1)
@@ -470,7 +480,7 @@ func fieldAAD(keyID string) []byte {
 	buffer.WriteByte(0)
 	buffer.WriteByte(0)
 
-	return buffer.Bytes()
+	return buffer.Bytes(), nil
 }
 
 func writeU32(b *bytes.Buffer, v uint32) {
@@ -480,11 +490,8 @@ func writeU32(b *bytes.Buffer, v uint32) {
 }
 
 func writeLP(buffer *bytes.Buffer, str string) {
-	if uint64(len(str)) > uint64(^uint32(0)) {
-		panic("aad component too long")
-	}
-
-	writeU32(buffer, uint32(len(str))) //nolint:gosec // 长度已在上方校验
+	// str 恒为固定常量或经 fieldAAD 校验的 keyID，长度必在 uint32 范围内。
+	writeU32(buffer, uint32(len(str))) //nolint:gosec // 长度约束见 fieldAAD
 	buffer.WriteString(str)
 }
 

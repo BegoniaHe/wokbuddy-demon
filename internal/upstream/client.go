@@ -2478,7 +2478,7 @@ func (c *Client) chatStreamAt(
 	endpoint := base + out.Path
 
 	req, err := http.NewRequestWithContext(
-		context.Background(), http.MethodPost, endpoint, bytes.NewReader(out.Payload),
+		ctx, http.MethodPost, endpoint, bytes.NewReader(out.Payload),
 	)
 	if err != nil {
 		return chatAttempt{err: fmt.Errorf("ChatStreamContext: %w", err)}

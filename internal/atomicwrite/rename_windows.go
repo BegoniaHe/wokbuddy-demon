@@ -15,7 +15,7 @@ const (
 	errLockViolation    syscall.Errno = 33 // ERROR_LOCK_VIOLATION
 )
 
-func rename(oldpath, newpath string) error {
+func renamePlatform(oldpath, newpath string) error {
 	return renameWithRetry(oldpath, newpath, os.Rename, retryableRenameErr)
 }
 

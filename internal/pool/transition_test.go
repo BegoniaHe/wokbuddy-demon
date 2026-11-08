@@ -130,7 +130,11 @@ func TestTransitionSessionDeadDisableClearsCooling(t *testing.T) {
 		t.Fatal("precondition: 应处于软冷却")
 	}
 
-	if pool.NoteSessionDead("u1") || pool.NoteSessionDead("u1") || !pool.NoteSessionDead("u1") {
+	// 连续两次未达阈值，第 3 次达阈值并完成禁用（状态机带副作用，逐次调用）。
+	pool.NoteSessionDead("u1")
+	pool.NoteSessionDead("u1")
+
+	if !pool.NoteSessionDead("u1") {
 		t.Fatal("第 3 次 NoteSessionDead 应达阈值禁用")
 	}
 

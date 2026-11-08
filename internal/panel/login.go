@@ -558,7 +558,10 @@ func requestLoginToken(endpoint *loginEndpoint, state string) (loginToken, login
 
 	var tok loginToken
 
-	_ = json.Unmarshal(tokRaw, &tok)
+	if err := json.Unmarshal(tokRaw, &tok); err != nil {
+		log.Printf("WARN: [panel] 登录 token 响应解析失败（按未完成继续轮询）: %v", err)
+	}
+
 	if tok.AccessToken == "" {
 		return loginToken{}, loginPendingInfo{}, true, status, nil
 	}

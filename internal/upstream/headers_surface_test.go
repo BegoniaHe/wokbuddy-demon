@@ -117,9 +117,6 @@ func TestCodebuddyRequestOnlyOnChatFamily(t *testing.T) {
 	}
 }
 
-// hex32 32 位小写 hex（无版本位约束的随机 ID 形态断言用）。
-var hex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
-
 // uuidV7Hex32 UUIDv7 形态的 32 hex（第 13 位为 7、变体位 10xx）。
 var uuidV7Hex32 = regexp.MustCompile(`^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$`)
 

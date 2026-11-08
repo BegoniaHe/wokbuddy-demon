@@ -49,7 +49,12 @@ func sealField(t *testing.T, secret, plaintext string) map[string]any {
 		t.Fatal(err)
 	}
 
-	nums := gcm.Seal(nil, nonce, []byte(plaintext), fieldAAD(keyMaterial2.keyID))
+	aad, err := fieldAAD(keyMaterial2.keyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nums := gcm.Seal(nil, nonce, []byte(plaintext), aad)
 	tag := nums[len(nums)-16:]
 	nums = nums[:len(nums)-16]
 	env, _ := json.Marshal(map[string]any{
@@ -218,7 +223,6 @@ func TestDiscoverRoot(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // 该用例改写进程级状态，必须串行执行
 func TestRootsIncludeWorkbuddyBase(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

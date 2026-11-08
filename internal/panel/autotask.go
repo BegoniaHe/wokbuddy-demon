@@ -298,7 +298,8 @@ func (p *Panel) taskByCodeWaiting(account9 *auth.Auth, code string) (*upstream.T
 
 		task, err2 := p.taskByCode(account9, code)
 		if err2 != nil {
-			return t, nil //nolint:nilerr // 轮询期间的查询失败不覆盖已拿到的结果
+			// 瞬时查询失败：保留已有快照，继续消耗剩余轮询预算，不提前返回旧 t。
+			continue
 		}
 
 		if task != nil {
@@ -1113,7 +1114,7 @@ func runModelChat(panel9 *Panel, account18 *auth.Auth) (string, error) {
 	if err := panel9.cfg.Upstream.ReportChatActivityModel(
 		account18, cid, session.NewUUIDv7Hex(), modelID, modelName,
 	); err != nil {
-		return "对话已完成，但进度上报失败：" + err.Error(), nil //nolint:nilerr // 对话已完成，上报失败仅提示不算请求错误
+		return "", fmt.Errorf("runModelChat: 模型进度上报失败: %w: %w", errRunModelChatFailed, err)
 	}
 
 	return "已完成 glm-5.2 对话并上报", nil
