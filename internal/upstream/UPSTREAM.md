@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `29db87862ceac3c2d6ba4ea2c2c9d49486b292bf`（2026-11-08）。该基线与本仓库无共同祖先，
+  `771c887fb326b579026966d5540d5cf413b1c577`（2026-11-08）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -78,7 +78,17 @@ Unbind 粘性；`retry_policy.retry_after` 字段与末端状态码无包内证�
 网页活跃腿形态）记 `revisit`；其余（`$wbEncrypted` 本仓已由 `internal/desktopcred` 覆盖、
 断流终态 `errTruncatedStream` 已覆盖、兜底 system 本仓用官方字节、入站体上限 / 11140 连坐
 已覆盖、面板 / AutoBot / 续写预算 / `model_eff` 属参考侧产品）按 `skip` 落账，6 个纯 merge
-按 `merge-bubble` skip。后续审计从 `29db8786` 之后开始。
+按 `merge-bubble` skip。
+2026-11-08 再续审 `29db8786..771c887f`（4 条非 merge + 0 条 merge，均 2026-11-08；官方
+Win32 版本未变，仍是 cn 5.9.3 / global 5.9.4）。整批是参考 fork 网关内部工程、无官方协议
+缺口，0 开单：`WB2API_PPROF` 独立 pprof 监听本仓已由带运维鉴权的 `/debug/pprof/*`
+（`internal/server/handler.go:392-397`）覆盖，记 `skip`；sanitize 指纹预检去 RE2 折叠、
+新增 `internal/jsonscan` 让请求体只解析一次两条纯 CPU 优化（线上数字来自参考 fork 自身部署、
+官方静态包 0 证据）记 `revisit`，等本仓自身负载 profile；`<think:SUF>` 拆回 thinking 块是上游
+vLLM parser 偶发 + 真机实测（官方 Win32 全树 `think:SUF` 0 命中），其 messages 流式 handleChunk
+认整条 `message` 的 parity 与本仓形态不符（官方 `streamPaths=choices.delta.*` /
+`responsePaths=choices.message.*`，本仓非流式认 `message`、流式 `normalizeChoice` 白名单只
+重建 `delta`），整体记 `revisit`。后续审计从 `771c887f` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -296,7 +306,7 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 - 上游远端：`upstream` → `https://github.com/misakano7545/workbuddy2api-panel.git`
   （branch `main`）。首次使用执行 `git fetch --prune upstream`。
 - 审计游标（逻辑基线，位于参考 fork 历史中，非本仓库祖先）：
-  `29db87862ceac3c2d6ba4ea2c2c9d49486b292bf`（2026-11-08 推进）。
+  `771c887fb326b579026966d5540d5cf413b1c577`（2026-11-08 推进）。
 - 正式审计前先刷新官方 Win32 包并跑 `reverse-workbuddy` 的
   `download_latest.mjs` / `protocol_sweep.mjs`；官方静态包缺失时停止审计。
 - 常用命令：
@@ -311,4 +321,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-08（参考 fork 审计基线 `29db8786`；窗口 `dd01a526..29db8786` 共 63 项，复用 `4766f469` 的 24 条处置并新审 39 条，确认 `11134` 缺口开 #476、盲盒/10105 记 revisit、其余 skip；不直接吸收）。_
+_最近更新：2026-11-08（参考 fork 审计基线 `771c887f`；窗口 `29db8786..771c887f` 共 4 项，全是参考 fork 网关内部工程、官方 Win32 无协议缺口，0 开单：pprof 独立监听本仓已覆盖记 skip，两条纯 CPU 性能优化与 `<think:SUF>` 容错记 revisit；不直接吸收）。_

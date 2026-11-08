@@ -14,37 +14,33 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 29db87862ceac3c2d6ba4ea2c2c9d49486b292bf
-  audited_at_utc: 2026-11-08T04:29:28Z
+  commit: 771c887fb326b579026966d5540d5cf413b1c577
+  audited_at_utc: 2026-11-08T11:00:11Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
-    from: 2026-11-04
+    from: 2026-11-08
     to: 2026-11-08
-    non_merge_commits: 48
-    merge_commits: 15
+    non_merge_commits: 4
+    merge_commits: 0
   dispositions:
-    issue: 2
-    revisit: 2
-    skip: 59
-  issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/467
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/476
+    issue: 0
+    revisit: 3
+    skip: 1
+  issues: []
   note: >-
-    2026-11-08 续审 dd01a526..29db8786（48 条非 merge + 15 条纯 merge，63 项）。官方 Win32
-    版本未变（cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901），重跑
-    download_latest --dry-run / download_latest / protocol_sweep 复核。区间前段
-    dd01a526..dab1b08c 的 24 项由未合入 main 的审计提交 4766f469（fix/stream-close-drain-tail
-    分支）审过：其账本前 264 行与 main 同源、追加后 validate 通过，逐条复核有效并复用，
-    其中 #467（/v2/videos/* 视频端点）已由 c7d82b43 实现、图片 b64_json/n>1 记 revisit。
-    后段 dab1b08c..29db8786 的 39 项新审：官方包确认业务码 11134 是「模型服务不可用，
-    请切换模型重试」、CLI classifyErrorDetail 不归账号级 quota/auth，本仓 Classify 却无分流
-    → 5xx 罚号 / 200 信封换号并 Unbind 粘性，开 #476（retry_policy.retry_after 与末端状态码
-    无包内证据，列证据边界等实测）；4fb7cb42 的盲盒消费 + 10105 自救端点 0 命中、依赖第三方
-    脚本实测且本仓 scheduler 无网页活跃腿，记 revisit；其余按 skip 落账（$wbEncrypted 本仓已
-    由 internal/desktopcred 覆盖、断流终态 errTruncatedStream 已覆盖、兜底 system 用官方字节、
-    入站体上限 / 11140 连坐已覆盖，面板 / AutoBot / 续写预算 / model_eff 属参考侧产品），
-    6 个纯 merge 按 merge-bubble skip。审计不产生实现提交，游标推进是独立的 chore(sync)
-    元数据提交。
+    2026-11-08 续审 29db8786..771c887f（4 条非 merge + 0 条 merge，均 2026-11-08；
+    官方 Win32 版本未变 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，
+    重跑 download_latest --dry-run / download_latest / protocol_sweep 复核）。整批是参考
+    fork 网关内部工程：b42712c5 的 WB2API_PPROF 独立 pprof 监听本仓已由
+    internal/server/handler.go:392-397 带运维鉴权的 /debug/pprof/* 覆盖，记 skip；
+    fe51fd66（sanitize 指纹预检去 RE2 折叠）与 4b0a3b46（新增 internal/jsonscan 让请求体
+    只解析一次）是纯 CPU 性能优化，线上数字来自参考 fork 自己的 7863/7900 请求部署、
+    官方静态包 0 证据、非协议缺口，记 revisit 等本仓自身负载 profile；771c887f 的
+    <think:SUF> 拆回 thinking 块是上游 vLLM parser 偶发 + 参考 fork 真机实测（官方 Win32
+    全树 think:SUF 0 命中），其 messages 流式 handleChunk 认整条 message 的 parity 与本仓
+    形态不符（官方 streamPaths=choices.delta.* / responsePaths=choices.message.*，本仓非流式
+    认 message、流式 normalizeChoice 白名单只重建 delta），整体记 revisit。本轮 0 开单、
+    不产生实现提交；游标推进是独立的 chore(sync) 元数据提交。
