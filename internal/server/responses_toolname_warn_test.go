@@ -64,3 +64,22 @@ func TestResponsesCustomToolDeclarationWithoutNameWarns(t *testing.T) {
 
 	wantLogFragments(t, logs.String(), "custom tool without name")
 }
+
+// TestResponsesToolCallWarnKeepsFullCallID WARN 里的 call_id 必须完整，不能被账号
+// 标签的 8 位 UID8 截断——否则「便于归因」拿到的是残缺 id（issue #489 追评）。
+//
+//nolint:paralleltest // 该用例改写进程级日志出口，必须串行执行
+func TestResponsesToolCallWarnKeepsFullCallID(t *testing.T) {
+	logs := captureLog(t)
+
+	const fullCallID = "call_abcdef0123456789abcdef0123456789"
+
+	body := []byte(`{"model":"glm-5.2","input":[{"type":"function_call","call_id":"` +
+		fullCallID + `","arguments":"{}"}]}`)
+
+	if _, _, _, _, err := responsesToOpenAIWithClient(body, nil, nil); err == nil {
+		t.Fatal("缺函数名的 function_call 必须保持 400 语义")
+	}
+
+	wantLogFragments(t, logs.String(), fullCallID)
+}

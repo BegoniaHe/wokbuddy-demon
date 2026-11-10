@@ -440,7 +440,7 @@ func warnToolCallMissingName(model string, index int, item map[string]any, err e
 
 	log.Printf("WARN: [server] responses tool call missing function name model=%s index=%d "+
 		"type=%s call=%s err=%v (request rejected with 400)",
-		model, index, stringValue(item["type"]), logfmt.Label(callID, ""), err)
+		model, index, stringValue(item["type"]), logfmt.Truncate(callID, 64), err)
 
 	return err
 }
