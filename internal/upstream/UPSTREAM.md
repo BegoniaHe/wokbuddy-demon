@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `771c887fb326b579026966d5540d5cf413b1c577`（2026-11-08）。该基线与本仓库无共同祖先，
+  `592fb01af53dcaf25cc45ba3496730850b207830`（2026-11-10）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -88,7 +88,29 @@ Win32 版本未变，仍是 cn 5.9.3 / global 5.9.4）。整批是参考 fork �
 vLLM parser 偶发 + 真机实测（官方 Win32 全树 `think:SUF` 0 命中），其 messages 流式 handleChunk
 认整条 `message` 的 parity 与本仓形态不符（官方 `streamPaths=choices.delta.*` /
 `responsePaths=choices.message.*`，本仓非流式认 `message`、流式 `normalizeChoice` 白名单只
-重建 `delta`），整体记 `revisit`。后续审计从 `771c887f` 之后开始。
+重建 `delta`），整体记 `revisit`。
+
+2026-11-10 续审 `771c887f..592fb01a`（20 条非 merge + 3 条纯 merge；官方 Win32 版本未变，
+仍是 cn 5.9.3 / global 5.9.4；重跑 `download_latest --dry-run` / `download_latest` /
+`protocol_sweep` 复核）。整批是参考 fork 网关自身工程与产品能力，纯协议缺口少，确认一个
+缺口并开 **#477**：`585ae7f2` / `cd884503` 的 cockpit 导入——本仓 `internal/panel/import.go`
+只接受扁平 `[]cockpitAccount`（无嵌套/驼峰/字典/信封归一，`.go:129-133`），`expires_at`
+无条件 `/1000`（`.go:246`），且落盘前不 `MkdirAll(AuthDir)`（`.go:270-287`）；启动期
+`LoadDir` 用 `filepath.Glob` 不建目录、`SaveAtomic`→`CreateTemp(父目录)` 缺失即 ENOENT，
+全新部署首次导入必失败。4 条记 `revisit`：`89c9b7d9`（流式只在缓冲读空时 flush，纯 CPU/
+系统调用优化、参考 fork 自身部署数字、官方 0 证据，等本仓负载 profile）；`f987bacc`（出站
+空 text 段补位与 Kimi/GLM `reasoning` 镜像为参考 fork/hub 真机实测；`11151` 归请求级本仓
+`client.go:974` 已覆盖，`client_test.go:138` 断言 `400+11151→ErrBadParams`，官方包
+`errorCode.11151`=「Empty messages found」确认语义）；`d78131ba`（`/console/account` 平铺
+形态与空昵称语义为真机/假设证据，本仓 `profile.go` 只按信封解，需实测）；`bfdba519`
+（本仓 `handler.go:2705-2711` 传输层失败对当前被选号 `NoteFailures`+rotate，参考 fork 论证
+直连出口全域共用、逐号记连败可整池降权，属网关内部记账、需本仓真实负载观察）。其余 17 条
+按 `skip` 落账：`d165e6e1` 缓存槽派生本仓 `handler.go:1860-1863` 已覆盖、账号绑定保持
+sessKey-only 是既定 anti-monopoly 取舍；续写/救援簇（`6e7fe628`/`07f8ae03`/`c2003af1`/
+`1037397c` 及依赖它的 `478d2aa8`/`4bdbd607`）本仓 `internal/server` 无对应机械；面板能力
+（`c5ce29b1` 多文件预览、`18a67761` 日志落盘/滑窗告警/选号策略——本仓已有
+`internal/pool/strategy.go`）与代理订阅/号池分区/额度窗口探针（`592fb01a`）属参考侧产品、
+官方 0 证据；3 条纯 merge 按 `merge-bubble`。后续审计从 `592fb01a` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -321,4 +343,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-08（参考 fork 审计基线 `771c887f`；窗口 `29db8786..771c887f` 共 4 项，全是参考 fork 网关内部工程、官方 Win32 无协议缺口，0 开单：pprof 独立监听本仓已覆盖记 skip，两条纯 CPU 性能优化与 `<think:SUF>` 容错记 revisit；不直接吸收）。_
+_最近更新：2026-11-10（参考 fork 审计基线 `592fb01a`；窗口 `771c887f..592fb01a` 共 23 项=20 非 merge + 3 纯 merge，官方 Win32 无新协议缺口：cockpit 导入缺口开 #477，流式 flush/空 text 段与 reasoning 镜像/资料接口平铺/传输层归因四条记 revisit，其余按 skip；不直接吸收）。_

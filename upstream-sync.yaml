@@ -14,33 +14,38 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 771c887fb326b579026966d5540d5cf413b1c577
-  audited_at_utc: 2026-11-08T11:00:11Z
+  commit: 592fb01af53dcaf25cc45ba3496730850b207830
+  audited_at_utc: 2026-11-10T06:01:48Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
     from: 2026-11-08
-    to: 2026-11-08
-    non_merge_commits: 4
-    merge_commits: 0
+    to: 2026-11-10
+    non_merge_commits: 20
+    merge_commits: 3
   dispositions:
-    issue: 0
-    revisit: 3
-    skip: 1
-  issues: []
+    issue: 2
+    revisit: 4
+    skip: 17
+  issues:
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/477
   note: >-
-    2026-11-08 续审 29db8786..771c887f（4 条非 merge + 0 条 merge，均 2026-11-08；
+    2026-11-10 续审 771c887f..592fb01a（20 条非 merge + 3 条纯 merge；
     官方 Win32 版本未变 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，
     重跑 download_latest --dry-run / download_latest / protocol_sweep 复核）。整批是参考
-    fork 网关内部工程：b42712c5 的 WB2API_PPROF 独立 pprof 监听本仓已由
-    internal/server/handler.go:392-397 带运维鉴权的 /debug/pprof/* 覆盖，记 skip；
-    fe51fd66（sanitize 指纹预检去 RE2 折叠）与 4b0a3b46（新增 internal/jsonscan 让请求体
-    只解析一次）是纯 CPU 性能优化，线上数字来自参考 fork 自己的 7863/7900 请求部署、
-    官方静态包 0 证据、非协议缺口，记 revisit 等本仓自身负载 profile；771c887f 的
-    <think:SUF> 拆回 thinking 块是上游 vLLM parser 偶发 + 参考 fork 真机实测（官方 Win32
-    全树 think:SUF 0 命中），其 messages 流式 handleChunk 认整条 message 的 parity 与本仓
-    形态不符（官方 streamPaths=choices.delta.* / responsePaths=choices.message.*，本仓非流式
-    认 message、流式 normalizeChoice 白名单只重建 delta），整体记 revisit。本轮 0 开单、
-    不产生实现提交；游标推进是独立的 chore(sync) 元数据提交。
+    fork 网关自身工程与产品能力，纯协议缺口少。唯一确认并开 #477：585ae7f2/cd884503 的
+    cockpit 导入——本仓 import.go:129-133 只接受 []cockpitAccount（无嵌套/驼峰/字典/信封
+    归一），import.go:246 无条件 /1000，import.go:270-287 不 MkdirAll(AuthDir)，启动期
+    LoadDir 用 Glob 不建目录、SaveAtomic→CreateTemp 父目录缺失即 ENOENT，全新部署首次
+    导入必失败。记 revisit 四条：89c9b7d9（流式 flush 批处理，纯 CPU 优化、参考部署数字、
+    官方 0 证据）、f987bacc（空 text 段补位与 Kimi/GLM reasoning 镜像为真机实测，11151
+    归请求级本仓 client.go:974 已覆盖）、d78131ba（/console/account 平铺与空昵称语义需
+    实测）、bfdba519（传输层失败逐号记连败 vs 记出口，本仓 handler.go:2705-2711 现状，
+    需真实负载观察）。其余 17 条按 skip 落账：d165e6e1 的缓存槽派生本仓 handler.go:1860-1863
+    已覆盖、账号绑定保持 sessKey-only 是既定取舍；续写/救援簇（6e7fe628/07f8ae03/c2003af1/
+    1037397c 及依赖它的 478d2aa8/4bdbd607）本仓无对应机械；面板能力（c5ce29b1 多文件预览、
+    18a67761 日志落盘/滑窗告警、选号策略可配——本仓已有 strategy.go）与代理订阅/号池分区/
+    额度窗口探针（592fb01a）属参考侧产品、官方 0 证据；3 条纯 merge 按 merge-bubble。本轮
+    只开 #477、不改实现；游标推进是独立的 chore(sync) 元数据提交。
