@@ -797,6 +797,25 @@ func DeriveCacheKey(body []byte) string {
 	return deriveKey(probe.Messages)
 }
 
+// contentStickyPrefix 内容派生粘性键前缀：与 sessKey 命名空间隔离，避免某个恰好
+// 形如 "c-<hex>" 的显式 conversation_id 与内容派生绑定互相串台。
+const contentStickyPrefix = "c-"
+
+// StickyKeyFromContent 把 DeriveCacheKey 的结果包装成「内容派生」账号粘性键。
+//
+// 只发 user_id 的客户端（ExtractSession 的 anti-monopoly 闸返回空 sessKey）此前完全
+// 没有账号粘性：每轮可能换号 → 账号级前缀缓存全量 miss。用内容派生键（system +
+// 首条 user 的哈希）做绑定主键既能让同一段对话跨轮稳定绑同一号，又不会退化成
+// user_id 单键——后者会把同一用户的多段对话钉死在一个号上，正是 anti-monopoly
+// 闸要挡的形态。取不到用户文本（纯图片等）时返回空串，退回普通轮换。
+func StickyKeyFromContent(derived string) string {
+	if derived == "" {
+		return ""
+	}
+
+	return contentStickyPrefix + derived
+}
+
 // deriveKey 从 messages 原始 JSON 派生稳定会话键：SHA-256(system 文本 + 首条 user
 // 文本) 前 16 字节。
 //

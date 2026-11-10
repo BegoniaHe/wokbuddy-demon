@@ -63,6 +63,9 @@ type Config struct {
 	Keys *apikey.Store
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
+	// StickyDeriveBinding 给「只发 user_id、不带会话标识」的客户端用内容派生键做
+	// 账号粘性（session_sticky.derive_binding，issue #481）。仅 Session 非 nil 时生效。
+	StickyDeriveBinding bool
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
 	StickyCount func() int
 	// RedisMode 观测字段（"upstash" / "noop"），供 /status 透出。
@@ -1483,9 +1486,13 @@ type chatFlow struct {
 	// 会话标识
 	sessKey        string
 	explicitConvID string
-	// cacheKeyID 缓存槽用的会话键：sessKey 优先，为空时用内容派生键。它与
-	// sessKey 分开——带 user_id 的客户端不参与粘性，但仍要按对话隔离缓存槽。
-	cacheKeyID  string
+	// cacheKeyID 缓存槽用的会话键：sessKey 优先，为空时用内容派生键。
+	cacheKeyID string
+	// stickyKey 账号粘性绑定键：sessKey 优先；只发 user_id 的客户端用内容派生键
+	// （session.StickyKeyFromContent 加命名空间前缀），未开启 derive_binding 时为空
+	// （不粘性）。与 cacheKeyID 同源不同用途：前者决定绑定哪个号，后者决定缓存槽
+	// 与出站会话头。
+	stickyKey   string
 	turnKey     string
 	turnKeyBody []byte // prompt.Rewrite 之前的 body（轮级键按它派生）
 	stickyUID   string
@@ -1848,28 +1855,7 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		turnKeyBody:    chatInput2.body, // 轮级键按改写前的 body 派生
 	}
 
-	// 会话粘性：从请求体一次解析会话键与显式 conversationId（后者供出站会话头族），
-	// 再解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。ExtractSession 与
-	// 粘性开关解耦：关闭粘性时会话头族的聚合主键仍按会话级
-	// （RequestIDForKey(sessKey)），不悄悄退化成轮级。
-	chatFlow2.sessKey, chatFlow2.explicitConvID = session.ExtractSession(chatInput2.body)
-	// 缓存槽会话段：sessKey 优先；sessKey 为空（典型是带 user_id 的客户端，见
-	// ExtractSession 的 anti-monopoly 闸）时用内容派生键——否则 prompt_cache_key
-	// 退化成每账号一个常量槽，同账号上多段对话互相覆盖前缀缓存，出站会话头也只能
-	// 逐请求随机。只供缓存槽/出站头使用：账号绑定仍只认 sessKey，不复活 user 维度粘性。
-	chatFlow2.cacheKeyID = chatFlow2.sessKey
-	if chatFlow2.cacheKeyID == "" {
-		chatFlow2.cacheKeyID = session.DeriveCacheKey(chatInput2.body)
-	}
-
-	if h.cfg.Session != nil && chatFlow2.sessKey != "" {
-		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
-		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		// 必须带 realm 前缀：粘性可用性闭包按 realm 过滤账号，只传裸名会回落 cn，
-		// 让 global 请求把会话绑到 cn 号（或每轮重新分配，粘性形同失效）。
-		// 别名目标省略 realm 时，f.realm 已是继承请求侧后的结果。
-		chatFlow2.stickyUID = h.resolveStickyForStrategy(chatFlow2)
-	}
+	chatFlow2.initSessionKeys(chatInput2.body)
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
 	chatFlow2.applyPromptRewrite()
@@ -1904,6 +1890,37 @@ func (f *chatFlow) applyPromptRewrite() {
 		// 渠道指纹）；与 upstream.ensureLeadingSystem 共用同一常量。
 		f.body = prompt.EnsureSystemFirst(f.body, upstream.LeadingSystemFallback)
 	}
+}
+
+// initSessionKeys 解析会话键族并从既有绑定恢复账号粘性（找不到/无效则 stickyUID
+// 为空，走普通轮换）。ExtractSession 与粘性开关解耦：关闭粘性时会话头族的聚合主键
+// 仍按会话级（RequestIDForKey(sessKey)），不悄悄退化成轮级。
+func (f *chatFlow) initSessionKeys(body []byte) {
+	f.sessKey, f.explicitConvID = session.ExtractSession(body)
+	// 缓存槽会话段：sessKey 优先；sessKey 为空（典型是带 user_id 的客户端，见
+	// ExtractSession 的 anti-monopoly 闸）时用内容派生键——否则 prompt_cache_key
+	// 退化成每账号一个常量槽，同账号上多段对话互相覆盖前缀缓存，出站会话头也只能
+	// 逐请求随机。同一派生键也是下面账号绑定键的来源。
+	f.cacheKeyID = f.sessKey
+	if f.cacheKeyID == "" {
+		f.cacheKeyID = session.DeriveCacheKey(body)
+	}
+	// 账号绑定键：sessKey 优先；只发 user_id 的客户端用内容派生键补上粘性——键来自
+	// 请求内容而非 user_id，同一段对话跨轮稳定、不同对话不碰撞，不复活 user 维度
+	// 粘性（issue #481）。
+	f.stickyKey = f.sessKey
+	if f.stickyKey == "" && f.h.cfg.Session != nil && f.h.cfg.StickyDeriveBinding {
+		f.stickyKey = session.StickyKeyFromContent(f.cacheKeyID)
+	}
+
+	if f.h.cfg.Session == nil || f.stickyKey == "" {
+		return
+	}
+	// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，而不是钉在
+	// 限额号上反复失败（"限额后换不动号"的正解）。必须带 realm 前缀：粘性可用性闭包
+	// 按 realm 过滤账号，只传裸名会回落 cn，让 global 请求把会话绑到 cn 号（或每轮
+	// 重新分配，粘性形同失效）。别名目标省略 realm 时，f.realm 已继承请求侧结果。
+	f.stickyUID = f.h.resolveStickyForStrategy(f)
 }
 
 // canDegrade 报告当前 PromptMode 是否支持降级重试（passthrough / append）。
@@ -1996,7 +2013,7 @@ func (f *chatFlow) releaseReservation() {
 // 不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 func (f *chatFlow) unbindSticky() {
 	if f.stickyUID != "" {
-		f.h.cfg.Session.Unbind(f.sessKey)
+		f.h.cfg.Session.Unbind(f.stickyKey)
 		f.stickyUID = ""
 	}
 }
@@ -2218,7 +2235,7 @@ func maxOutputTokensFromBody(body []byte) int {
 func (f *chatFlow) degradeSticky() string {
 	uid := f.stickyUID
 	if f.h.cfg.Session != nil {
-		f.h.cfg.Session.Degrade(f.sessKey, uid, pool.StickyDegradeWindow)
+		f.h.cfg.Session.Degrade(f.stickyKey, uid, pool.StickyDegradeWindow)
 	}
 
 	log.Printf("INFO: [server] sticky soft escape acct=%s model=%s: degrade %s",
@@ -2236,14 +2253,14 @@ func (h *Handler) resolveStickyForStrategy(flow *chatFlow) string {
 	model := flow.realm + ":" + flow.bareModel
 
 	if h.cfg.Pool != nil && h.cfg.Pool.StrategyForRealm(flow.realm) != "weighted_random" {
-		if uid, ok := h.cfg.Session.ResolveExisting(flow.sessKey, model); ok {
+		if uid, ok := h.cfg.Session.ResolveExisting(flow.stickyKey, model); ok {
 			return uid
 		}
 
 		return ""
 	}
 
-	if uid, ok := h.cfg.Session.ResolveForModel(flow.sessKey, model); ok {
+	if uid, ok := h.cfg.Session.ResolveForModel(flow.stickyKey, model); ok {
 		return uid
 	}
 
@@ -3510,8 +3527,8 @@ func (f *chatFlow) noteSuccessAndBind(acct *auth.Auth) {
 	// BlockModelClear 按 reason 前缀识别两族，不碰 6004 独立冷却。
 	f.h.cfg.Pool.BlockModelClear(acct.UID, f.bareModel)
 
-	if f.sessKey != "" && f.h.cfg.Session != nil {
-		f.h.cfg.Session.Bind(f.sessKey, acct.UID)
+	if f.stickyKey != "" && f.h.cfg.Session != nil {
+		f.h.cfg.Session.Bind(f.stickyKey, acct.UID)
 	}
 }
 

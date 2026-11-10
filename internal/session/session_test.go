@@ -620,3 +620,31 @@ func TestDeriveCacheKeyIgnoresUserIDGate(t *testing.T) {
 		t.Fatalf("坏 body 应返回空键，got %q", got)
 	}
 }
+
+// TestStickyKeyFromContentNamespace 内容派生粘性键必须与 sessKey 命名空间隔离，
+// 空派生键不产生绑定键（issue #481）。
+func TestStickyKeyFromContentNamespace(t *testing.T) {
+	t.Parallel()
+
+	if got := StickyKeyFromContent(""); got != "" {
+		t.Errorf("StickyKeyFromContent(\"\")=%q want empty（无内容不粘性）", got)
+	}
+
+	derived := DeriveCacheKey([]byte(`{"messages":[{"role":"user","content":"hi"}]}`))
+	if derived == "" {
+		t.Fatal("DeriveCacheKey returned empty for a plain user message")
+	}
+
+	got := StickyKeyFromContent(derived)
+	if got == derived {
+		t.Errorf("sticky key=%q must be namespaced, not the bare derived key", got)
+	}
+
+	if !strings.HasPrefix(got, "c-") {
+		t.Errorf("sticky key=%q want \"c-\" prefix", got)
+	}
+
+	if got2 := StickyKeyFromContent(derived); got2 != got {
+		t.Errorf("sticky key must be stable: %q vs %q", got, got2)
+	}
+}
