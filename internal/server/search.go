@@ -471,6 +471,8 @@ func searchTerminalStatus(upErr *upstream.Error) (int, string) {
 		return http.StatusTooManyRequests, "queue_waiting"
 	case upstream.ErrQueueFull:
 		return http.StatusServiceUnavailable, "queue_full"
+	case upstream.ErrUpstreamOverload:
+		return http.StatusServiceUnavailable, "upstream_overload"
 	default:
 		return 0, ""
 	}

@@ -2962,7 +2962,8 @@ func (f *chatFlow) rotateAllowedForStatus(status int) bool {
 func failFastKind(kind upstream.ErrKind) bool {
 	return kind == upstream.ErrContentBlocked || kind == upstream.ErrPromptTooLong ||
 		kind == upstream.ErrImageInvalid || kind == upstream.ErrBadParams ||
-		kind == upstream.ErrModelAccess || kind == upstream.ErrModelNotFound
+		kind == upstream.ErrModelAccess || kind == upstream.ErrModelNotFound ||
+		kind == upstream.ErrUpstreamOverload
 }
 
 // handleQueueError 处置官方客户端的队列/并发业务码：
@@ -3001,6 +3002,28 @@ func (f *chatFlow) handleQueueError(kind upstream.ErrKind, respBody []byte, uerr
 	f.lastErr = &upstream.Error{Kind: kind, Status: f.st.status, Msg: msg}
 }
 
+// handleUpstreamOverloadError 11134 供应商侧过载的可重试收尾：503 + Retry-After，
+// 上游原文透传，零账号动作。
+//
+// 为什么不是 502/400：这不是网关或请求体错误，重试同一模型可能很快恢复，客户端需要
+// 看到「可重试」而非「请求有错」。为什么不换号：同一模型的供应商过载跨账号同时发生，
+// 换号只是再撞一次，还额外拆掉会话粘性（账号级前缀缓存从零重建）。
+func (f *chatFlow) handleUpstreamOverloadError(respBody []byte, uerr *upstream.Error) {
+	msg := strings.TrimSpace(string(respBody))
+	if msg == "" && uerr != nil {
+		msg = uerr.Msg
+	}
+
+	f.st.outcome = reqlog.OutcomeHTTPError
+	f.st.status = http.StatusServiceUnavailable
+	// 等待口径复用语门口径（上游响应头优先、兜底保守值）：11134 是否携带独立等待字段
+	// 尚无本仓实测样本，先不臆造一个新口径。
+	f.out.Header("Retry-After", strconv.Itoa(queueRetryAfterSeconds(uerr)))
+	f.out.Error(http.StatusServiceUnavailable, "upstream_overload", msg,
+		"模型供应商侧过载（与账号无关）；按 Retry-After 稍后重试或切换模型")
+	f.lastErr = &upstream.Error{Kind: upstream.ErrUpstreamOverload, Status: f.st.status, Msg: msg}
+}
+
 // queueRetryAfterSeconds 队列/容量类响应的 Retry-After 秒数：优先采信上游响应头
 // （`Retry-After` / `Retry-After-Ms` / `X-Ratelimit-Reset`，见 upstream.ParseRetryAfter）
 // 明示的重置时间，缺失或非正数时给保守 5s（6020/6021 共用同一兜底）。
@@ -3031,6 +3054,13 @@ func queueRetryAfterSeconds(uerr *upstream.Error) int {
 func (f *chatFlow) handleRequestLevelError(
 	acct *auth.Auth, kind upstream.ErrKind, respBody []byte, uerr *upstream.Error,
 ) {
+	// 11134 供应商侧过载：请求级可重试，但**不**走 f.fail（f.fail 会解绑会话粘性）——
+	// 过载与账号无关，粘性绑定必须保住，重试才可能命中同号前缀缓存。
+	if kind == upstream.ErrUpstreamOverload {
+		f.handleUpstreamOverloadError(respBody, uerr)
+		return
+	}
+
 	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
 	f.fail(acct.UID)
 
@@ -4575,6 +4605,8 @@ func isUpstreamTimeout(err error, clientGone bool) bool {
 //     不罚账号、不轮转、不写 (账号,模型) 负缓存与路由熔断。
 //   - ErrModelAccess → BlockModelBackoff + NoteRouteFailure：11141 模型级
 //     避让；请求级 fail-fast 已在 handleRequestLevelError 提前返回，不罚账号。
+//   - ErrUpstreamOverload → 11134 供应商侧过载：零动作（不冷却/不熔断/不 NoteError/
+//     不喂连败/不解绑会话粘性），handleRequestLevelError 已按 503 + Retry-After 收尾。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断；ErrClient
@@ -4595,7 +4627,12 @@ func (h *Handler) applyErrorPolicy(
 		h.applyAccountFaultPolicy(uid, body)
 	case upstream.ErrHardCredit, upstream.ErrSessionDead, upstream.ErrNotFound, upstream.ErrServer:
 		h.applyLifecyclePolicy(uid, kind)
-	case upstream.ErrChannelRefused:
+	case upstream.ErrUpstreamOverload, upstream.ErrChannelRefused:
+		// 两者都是「账号健康、换号无意义」的零动作类：
+		//   - ErrUpstreamOverload（11134 供应商侧过载）：不冷却/不熔断/不 NoteError/
+		//     不喂连败/不解绑会话粘性；handleRequestLevelError 已在 fail-fast 分支收尾，
+		//     这里保留显式分支，防止新增调用路径落进 default 造成语义漂移。
+		//   - ErrChannelRefused：
 		// 11-128 + request illegal 是**通道校验失败**（UA/头/中间代理/入站形态），
 		// 账号本身健康：零动作（不冷却/不熔断/不 NoteError/不喂连败），只换号继续轮转。
 		// 与 ErrContentBlocked 的区别：后者是同账号降级重试，前者换号即可。

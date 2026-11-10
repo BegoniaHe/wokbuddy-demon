@@ -2457,7 +2457,7 @@ func anthropicStreamErrorType(payload string, errObj map[string]any) string {
 	switch upstream.FrameKind(payload) {
 	case upstream.ErrSoftRate, upstream.ErrQueueWaiting:
 		return "rate_limit_error"
-	case upstream.ErrQueueFull, upstream.ErrServer:
+	case upstream.ErrQueueFull, upstream.ErrServer, upstream.ErrUpstreamOverload:
 		return errorTypeOverloaded
 	case upstream.ErrHardCredit:
 		return "billing_error"

@@ -84,6 +84,9 @@ var gatewayHintByKind = map[ErrKind]string{
 	ErrContentBlocked: "request content was rejected by content policy; adjust the prompt and retry",
 	// 11-128 通道校验失败：不是账号问题、也不是内容问题——排查客户端/通道形态
 	// （UA、必需头、中间代理改写）。换号与改提示词都无效。
+	// 供应商侧过载：与账号、网关都无关，动作只有「等窗口过去」或「换模型」。
+	ErrUpstreamOverload: "model provider is overloaded (11134, provider-side, not an account problem); " +
+		"retry after the Retry-After window or switch to another model",
 	ErrChannelRefused: "request rejected by channel validation (11-128); " +
 		"check client user-agent, required headers and any intermediate proxy",
 }
