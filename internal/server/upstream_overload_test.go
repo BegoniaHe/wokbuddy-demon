@@ -3,13 +3,16 @@ package server
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // TestChatUpstreamOverloadKeepsAccountAndSticky 11134 供应商过载（issue #476）：
@@ -122,5 +125,45 @@ func assertOverloadCleanAccount(t *testing.T, state *pool.Pool, uid string) {
 	st := statusOf(t, state, uid)
 	if st.Cooling || st.ConsecutiveFails != 0 {
 		t.Errorf("account %s must stay clean: cooling=%v fails=%d", uid, st.Cooling, st.ConsecutiveFails)
+	}
+}
+
+// TestImagesUpstreamOverloadIsRetryable 11134 供应商过载在出图/出视频端点同样是
+// 可重试的 503，不能因复用 failFastKind 被渲染成 400 invalid_request（issue #476）。
+// 出图端点单次尝试不换号，但客户端必须看到可重试语义而非「请求非法」。
+func TestImagesUpstreamOverloadIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusInternalServerError,
+			`{"code":11134,"msg":"模型服务不可用，请切换模型重试"}`, false
+	})
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{ImagesEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/images/generations",
+		strings.NewReader(`{"model":"text-to-image","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d body=%s want 503 (provider overload is retryable)", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), "upstream_overload") {
+		t.Errorf("body=%s want error.code=upstream_overload", rec.Body)
+	}
+}
+
+// TestGeminiStreamUpstreamOverloadIsRetryable 供应商过载在 Gemini 流式错误帧里是
+// 可重试的 UNAVAILABLE，不能被 failFastKind 归成 400 INVALID_ARGUMENT（issue #476）。
+func TestGeminiStreamUpstreamOverloadIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	if got := geminiStreamErrorStatus(upstream.ErrUpstreamOverload); got != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want 503 UNAVAILABLE (provider overload is retryable)", got)
 	}
 }

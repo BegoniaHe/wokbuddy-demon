@@ -393,6 +393,12 @@ func (h *Handler) handleMediaError(
 	msg := strings.TrimSpace(uerr.Msg)
 
 	switch {
+	case kind == upstream.ErrUpstreamOverload:
+		// 11134 供应商侧过载：可重试的 503 + upstream_overload，与 chat / search /
+		// anthropic 末端同口径（issue #476）。必须先于 failFastKind 判定——后者把
+		// 该 kind 当「请求级」渲染成 400，会让客户端把可重试的过载当请求非法。
+		outStatus = http.StatusServiceUnavailable
+		code = "upstream_overload"
 	case failFastKind(kind):
 		outStatus = http.StatusBadRequest
 		code = "invalid_request"
