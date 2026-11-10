@@ -92,25 +92,38 @@ vLLM parser 偶发 + 真机实测（官方 Win32 全树 `think:SUF` 0 命中）�
 
 2026-11-10 续审 `771c887f..592fb01a`（20 条非 merge + 3 条纯 merge；官方 Win32 版本未变，
 仍是 cn 5.9.3 / global 5.9.4；重跑 `download_latest --dry-run` / `download_latest` /
-`protocol_sweep` 复核）。整批是参考 fork 网关自身工程与产品能力，纯协议缺口少，确认一个
-缺口并开 **#477**：`585ae7f2` / `cd884503` 的 cockpit 导入——本仓 `internal/panel/import.go`
-只接受扁平 `[]cockpitAccount`（无嵌套/驼峰/字典/信封归一，`.go:129-133`），`expires_at`
-无条件 `/1000`（`.go:246`），且落盘前不 `MkdirAll(AuthDir)`（`.go:270-287`）；启动期
-`LoadDir` 用 `filepath.Glob` 不建目录、`SaveAtomic`→`CreateTemp(父目录)` 缺失即 ENOENT，
-全新部署首次导入必失败。4 条记 `revisit`：`89c9b7d9`（流式只在缓冲读空时 flush，纯 CPU/
-系统调用优化、参考 fork 自身部署数字、官方 0 证据，等本仓负载 profile）；`f987bacc`（出站
-空 text 段补位与 Kimi/GLM `reasoning` 镜像为参考 fork/hub 真机实测；`11151` 归请求级本仓
-`client.go:974` 已覆盖，`client_test.go:138` 断言 `400+11151→ErrBadParams`，官方包
-`errorCode.11151`=「Empty messages found」确认语义）；`d78131ba`（`/console/account` 平铺
-形态与空昵称语义为真机/假设证据，本仓 `profile.go` 只按信封解，需实测）；`bfdba519`
-（本仓 `handler.go:2705-2711` 传输层失败对当前被选号 `NoteFailures`+rotate，参考 fork 论证
-直连出口全域共用、逐号记连败可整池降权，属网关内部记账、需本仓真实负载观察）。其余 17 条
-按 `skip` 落账：`d165e6e1` 缓存槽派生本仓 `handler.go:1860-1863` 已覆盖、账号绑定保持
-sessKey-only 是既定 anti-monopoly 取舍；续写/救援簇（`6e7fe628`/`07f8ae03`/`c2003af1`/
-`1037397c` 及依赖它的 `478d2aa8`/`4bdbd607`）本仓 `internal/server` 无对应机械；面板能力
-（`c5ce29b1` 多文件预览、`18a67761` 日志落盘/滑窗告警/选号策略——本仓已有
-`internal/pool/strategy.go`）与代理订阅/号池分区/额度窗口探针（`592fb01a`）属参考侧产品、
-官方 0 证据；3 条纯 merge 按 `merge-bubble`。后续审计从 `592fb01a` 之后开始。
+`protocol_sweep` 复核）。按新政策（后端上游功能尽量适配，商业化/面板技术栈/计费除外）本轮
+共开 5 个功能簇 Issue，另有 1 个独立面板导入缺口：
+
+- **#477**（面板导入）：`585ae7f2` / `cd884503` 的 cockpit 导入——本仓
+  `internal/panel/import.go` 只接受扁平 `[]cockpitAccount`（无嵌套/驼峰/字典/信封归一，
+  `.go:129-133`），`expires_at` 无条件 `/1000`（`.go:246`），落盘前不 `MkdirAll(AuthDir)`
+  （`.go:270-287`）；启动期 `LoadDir` 用 `filepath.Glob` 不建目录、`SaveAtomic`→`CreateTemp`
+  父目录缺失即 ENOENT，全新部署首次导入必失败。
+- **#478**（续写/救援机制）：`6e7fe628` 长文续接、`07f8ae03` reasoning-only 救援、
+  `c2003af1` 预告句续写、`1037397c` 工具轮续写、`478d2aa8` debugcap 取证、`4bdbd607`
+  续写诊断日志。本仓 `internal/server` 无 `continue.go`/`starved.go`/`narration.go`/
+  `toolonly.go`，零输出兜底只认 `finish_reason=length`（`handler.go:3179-3199`），
+  「声明工具却 stop」仅 WARN（`handler.go:3174-3177`）。
+- **#479**（号池治理 + 代理完整适配）：`592fb01a` 代理订阅导入 / 号池分区 / 额度窗口探针，
+  `bfdba519` 传输层失败归因到出口。本仓已有 `internal/outbound/{pool,proxy,registry}.go`、
+  `upstream.proxies`/`proxy_slots`/`realm_proxy_slots`（`cmd/server/config.go:344-353`），
+  但 `proxies` 只收 URL 字面量；无 `scope.go`/`window.go`/`proxypool`；
+  `CooldownSoftForModel` 只被动冷却（`cooldown.go:239-278`）；传输层失败仍对当前被选号
+  `NoteFailures`（`handler.go:2712-2726`），`ErrProxyDial` 分支已不罚号（`2697-2706`）。
+- **#480**（运维可观测性）：`18a67761` 日志落盘+ZIP 导出、上游劣化滑窗告警（选号策略本仓
+  已有 `internal/pool/strategy.go`，不重复实现），`44bc0595` 工具调用缺名 WARN。
+- **#481**（会话粘性）：`d165e6e1` 只发 `user_id` 的客户端按内容派生键粘账号。本仓
+  `handler.go:1855-1873` 缓存槽已用 `session.DeriveCacheKey`，账号绑定仍只认 sessKey。
+- **#482**（出站修补 + 配置收敛）：`f987bacc` 空 text 段补位 / Kimi·GLM reasoning 镜像、
+  `d78131ba` `/console/account` 平铺响应与空昵称不静默成功、`89c9b7d9` 流式 flush 收敛、
+  `877324fe` `thinking.default_effort` 统一到 `DefaultGatewayEffort`。`11151` 归请求级本仓
+  已覆盖（`client.go:974`，`client_test.go:138` 断言 `400+11151→ErrBadParams`），官方包
+  `errorCode.11151`=「Empty messages found」确认语义；`profile.go:47-65` 只按信封解。
+
+其余 6 条按 `skip` 落账：`c5ce29b1` 多文件预览 UI（面板技术栈）、`7028676c` `.gitignore`、
+`24d0b61b` `cache_audit.py`（参考侧脚本），以及 3 条纯 merge（`1aa917d4`/`5702ab65`/
+`cffb0389`）按 `merge-bubble`。后续审计从 `592fb01a` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -123,11 +136,15 @@ sessKey-only 是既定 anti-monopoly 取舍；续写/救援簇（`6e7fe628`/`07f
 
 1. **官方客户端是协议权威**：参考 fork 的提交只是线索；先对照最新 WorkBuddy Win32
    包确认行为，再判断本仓库是否有缺口。包内无证据的结论按 `revisit`，不当事实。
-2. **只审计、不吸收**：不做 `git merge` / `rebase` / `cherry-pick`，不改实现代码；
+2. **后端上游功能尽量适配**：除**商业化**、**面板技术栈**、**计费**三类外，参考 fork /
+   hub 启发的后端能力（出站协议修补、号池治理、代理、续写救援、会话粘性、运维可观测性、
+   配置收敛）默认按「应适配」开 Issue，而不是以「官方静态包无字面量证据」为由跳过。
+   官方包证据只决定该能力的**协议口径**，不再决定是否适配。
+3. **只审计、不吸收**：不做 `git merge` / `rebase` / `cherry-pick`，不改实现代码；
    确认缺口后只开 Issue。实现走独立的 issue-driven PR，由人类维护者评审。
-3. **接口变更自行适配**：官方行为（CodeBuddy / WorkBuddy 接口）变更时，由本仓库在
+4. **接口变更自行适配**：官方行为（CodeBuddy / WorkBuddy 接口）变更时，由本仓库在
    `internal/upstream/` 内自行适配，不依赖参考 fork 修复。
-4. **溯源完整性**：本文件与 `LICENSE` 共同保留原始作者与各 fork 的署名；每次审计的
+5. **溯源完整性**：本文件与 `LICENSE` 共同保留原始作者与各 fork 的署名；每次审计的
    逐提交处置记录于 `upstream-decisions.jsonl`（决策账本），游标见 `upstream-sync.yaml`。
    新处置使用 `issue` / `skip` / `revisit`；历史 `adapt` / `cherry-pick` 记录保留可读。
 
@@ -343,4 +360,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-10（参考 fork 审计基线 `592fb01a`；窗口 `771c887f..592fb01a` 共 23 项=20 非 merge + 3 纯 merge，官方 Win32 无新协议缺口：cockpit 导入缺口开 #477，流式 flush/空 text 段与 reasoning 镜像/资料接口平铺/传输层归因四条记 revisit，其余按 skip；不直接吸收）。_
+_最近更新：2026-11-10（参考 fork 审计基线 `592fb01a`；窗口 `771c887f..592fb01a` 共 23 项=20 非 merge + 3 纯 merge，官方 Win32 无新协议缺口；按新政策「后端上游功能尽量适配，商业化/面板技术栈/计费除外」开 6 单：#477 面板导入、#478 续写/救援、#479 号池+代理完整适配、#480 运维可观测、#481 会话粘性、#482 出站修补+配置收敛；6 条按 skip；不直接吸收）。_

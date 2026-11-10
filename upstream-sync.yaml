@@ -26,26 +26,28 @@ last_audited:
     non_merge_commits: 20
     merge_commits: 3
   dispositions:
-    issue: 2
-    revisit: 4
-    skip: 17
+    issue: 17
+    revisit: 0
+    skip: 6
   issues:
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/477
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/478
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/479
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/480
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/481
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/482
   note: >-
     2026-11-10 续审 771c887f..592fb01a（20 条非 merge + 3 条纯 merge；
     官方 Win32 版本未变 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，
-    重跑 download_latest --dry-run / download_latest / protocol_sweep 复核）。整批是参考
-    fork 网关自身工程与产品能力，纯协议缺口少。唯一确认并开 #477：585ae7f2/cd884503 的
-    cockpit 导入——本仓 import.go:129-133 只接受 []cockpitAccount（无嵌套/驼峰/字典/信封
-    归一），import.go:246 无条件 /1000，import.go:270-287 不 MkdirAll(AuthDir)，启动期
-    LoadDir 用 Glob 不建目录、SaveAtomic→CreateTemp 父目录缺失即 ENOENT，全新部署首次
-    导入必失败。记 revisit 四条：89c9b7d9（流式 flush 批处理，纯 CPU 优化、参考部署数字、
-    官方 0 证据）、f987bacc（空 text 段补位与 Kimi/GLM reasoning 镜像为真机实测，11151
-    归请求级本仓 client.go:974 已覆盖）、d78131ba（/console/account 平铺与空昵称语义需
-    实测）、bfdba519（传输层失败逐号记连败 vs 记出口，本仓 handler.go:2705-2711 现状，
-    需真实负载观察）。其余 17 条按 skip 落账：d165e6e1 的缓存槽派生本仓 handler.go:1860-1863
-    已覆盖、账号绑定保持 sessKey-only 是既定取舍；续写/救援簇（6e7fe628/07f8ae03/c2003af1/
-    1037397c 及依赖它的 478d2aa8/4bdbd607）本仓无对应机械；面板能力（c5ce29b1 多文件预览、
-    18a67761 日志落盘/滑窗告警、选号策略可配——本仓已有 strategy.go）与代理订阅/号池分区/
-    额度窗口探针（592fb01a）属参考侧产品、官方 0 证据；3 条纯 merge 按 merge-bubble。本轮
-    只开 #477、不改实现；游标推进是独立的 chore(sync) 元数据提交。
+    重跑 download_latest --dry-run / download_latest / protocol_sweep 复核）。处置政策
+    本轮扩为「后端上游功能尽量适配」（例外：商业化 / 面板技术栈 / 计费），故 17 项为
+    issue、6 项 skip。功能簇：#477 面板 cockpit 导入（585ae7f2/cd884503，全新部署
+    ENOENT + 形态/expires 归一）；#478 续写/救援机制（6e7fe628、07f8ae03、c2003af1、
+    1037397c、478d2aa8、4bdbd607）；#479 号池治理 + 代理完整适配（592fb01a 订阅导入/
+    号池分区/额度窗口探针、bfdba519 传输层归因）；#480 运维可观测（18a67761 日志落盘
+    导出与劣化滑窗告警、44bc0595 工具调用缺名 WARN；选号策略本仓 strategy.go 已有）；
+    #481 会话粘性（d165e6e1 内容派生键粘账号）；#482 出站修补 + 配置收敛（f987bacc
+    空 text 段/reasoning 镜像、d78131ba 资料接口平铺、89c9b7d9 flush 收敛、877324fe
+    缺省档统一）。保持 skip：c5ce29b1 多文件预览 UI（面板技术栈）、7028676c .gitignore、
+    24d0b61b cache_audit.py，以及 1aa917d4/5702ab65/cffb0389 三条纯 merge（merge-bubble）。
+    本轮不改实现；游标推进是独立的 chore(sync) 元数据提交。
