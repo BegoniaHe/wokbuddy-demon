@@ -12,12 +12,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -196,6 +198,11 @@ func responsesCustomToolSet(tools []map[string]any) map[string]bool {
 		case "custom":
 			name := stringValue(tool["name"])
 			if name == "" {
+				// 无名的 custom 工具声明在本层无法降级成 function（上游按名字分发），
+				// 丢弃后模型看不到该工具；留一条 WARN 让「工具没生效」可归因（issue #489）。
+				log.Printf("WARN: [server] responses tool declaration dropped: custom tool without name "+
+					"(declared tools=%d)", len(tools))
+
 				return
 			}
 
@@ -330,10 +337,10 @@ func responsesMessages(req *responsesRequest, refs map[string]responsesToolRef) 
 	convertedItems := 0
 	builder := &responsesInputMessages{msgs: msgs}
 
-	for _, item := range items {
+	for index, item := range items {
 		converted, images, ok, err := responsesInputItem(item, refs)
 		if err != nil {
-			return nil, err
+			return nil, warnToolCallMissingName(req.Model, index, item, err)
 		}
 
 		if !ok {
@@ -416,6 +423,26 @@ func responsesIsToolMessage(msgs []any) bool {
 // responsesToolImageMessage 把工具结果里不能放进 role=tool 的图片包成 user 消息。
 func responsesToolImageMessage(images []any) map[string]any {
 	return map[string]any{"role": "user", "content": images}
+}
+
+// warnToolCallMissingName 工具调用缺函数名的可观测告警（issue #489）：本层按名字
+// 映射 function_call → chat tool_calls，缺名字只能整请求 400；日志带上定位字段
+// （模型、input 下标、call_id），错误语义不变（原样返回 err 供调用方直接上抛）。
+func warnToolCallMissingName(model string, index int, item map[string]any, err error) error {
+	if !errors.Is(err, errFunctionCallNameIsRequired) && !errors.Is(err, errCustomToolCallNameIs) {
+		return err
+	}
+
+	callID := stringValue(item["call_id"])
+	if callID == "" {
+		callID = stringValue(item["id"])
+	}
+
+	log.Printf("WARN: [server] responses tool call missing function name model=%s index=%d "+
+		"type=%s call=%s err=%v (request rejected with 400)",
+		model, index, stringValue(item["type"]), logfmt.Truncate(callID, 64), err)
+
+	return err
 }
 
 // responsesInputItem 转换单条 input item，返回消息与需要单独回传的图片。

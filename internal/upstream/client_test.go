@@ -86,6 +86,19 @@ func TestClassify(t *testing.T) {
 		{401, `<html><body>invalid_token</body></html>`, ErrSessionDead},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
+		// 11134 模型供应商侧过载（issue #476）：结构化 code 独立成类，无论挂在 5xx、
+		// 200 业务信封还是 429 上都不落 ErrServer/ErrClient/ErrSoftRate——供应商过载
+		// 跨账号同时发生，罚号/换号/冷却账号都改变不了结果。
+		{500, `{"code":11134,"msg":"模型服务不可用，请切换模型重试"}`, ErrUpstreamOverload},
+		{503, `{"error":{"data":{"code":"11134"}}}`, ErrUpstreamOverload},
+		{200, `{"code":11134,"msg":"model service unavailable"}`, ErrUpstreamOverload},
+		{429, `{"code":11134,"msg":"模型服务不可用"}`, ErrUpstreamOverload},
+		// 不回归：无 code 的 5xx 仍是 ErrServer，裸 429 仍是软限流，
+		// 10105/15001 仍是账号级软限流。
+		{500, `{"code":500,"msg":"internal error"}`, ErrServer},
+		{429, `{"code":1,"msg":"rate limit"}`, ErrSoftRate},
+		{400, `{"code":10105,"msg":"session limit"}`, ErrSoftRate},
+		{400, `{"code":15001,"msg":"search limit"}`, ErrSoftRate},
 		{200, ``, ErrNone},
 		// 11102「该模型未接入或缺配置」：确定性答复，归 ErrModelNotFound 请求级 fail-fast。
 		{404, `{"code":11102,"msg":"model [deepseek-v3-2-volc] service info not found"}`, ErrModelNotFound},

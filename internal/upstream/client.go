@@ -75,29 +75,35 @@ const (
 	// 客户端/通道一侧（UA、头、中间代理或入站形态），账号本身健康 → 不罚号、
 	// 不降级重试，按通道级处理并继续轮转。追加在末尾以保持既有枚举值稳定。
 	ErrChannelRefused
+	// ErrUpstreamOverload 11134 模型供应商侧过载（官方文案「模型服务不可用，请切换
+	// 模型重试」）：与账号健康/额度/会话无关的供应商高峰现象。末端给可重试语义，
+	// 零账号动作（不罚号、不冷却、不轮转、不解绑会话粘性）。追加在末尾以保持既有
+	// 枚举值稳定。
+	ErrUpstreamOverload
 )
 
 // errKindNames 错误类别的字符串名（未知类别回落 "none"）。
 var errKindNames = map[ErrKind]string{
-	ErrNone:           "none",
-	ErrHardCredit:     "hard_credit",
-	ErrSoftRate:       "soft_rate",
-	ErrSessionDead:    "session_dead",
-	ErrNotFound:       "not_found",
-	ErrServer:         "server",
-	ErrContentBlocked: "content_blocked",
-	ErrBadParams:      "bad_params",
-	ErrModelBlocked:   "model_blocked",
-	ErrModelNotFound:  "model_not_found",
-	ErrModelAccess:    "model_access",
-	ErrWafBlock:       "waf_block",
-	ErrPromptTooLong:  "prompt_too_long",
-	ErrImageInvalid:   "image_invalid",
-	ErrAccountFault:   "account_fault",
-	ErrQueueWaiting:   "queue_waiting",
-	ErrQueueFull:      "queue_full",
-	ErrClient:         "client",
-	ErrChannelRefused: "channel_refused",
+	ErrNone:             "none",
+	ErrHardCredit:       "hard_credit",
+	ErrSoftRate:         "soft_rate",
+	ErrSessionDead:      "session_dead",
+	ErrNotFound:         "not_found",
+	ErrServer:           "server",
+	ErrContentBlocked:   "content_blocked",
+	ErrBadParams:        "bad_params",
+	ErrModelBlocked:     "model_blocked",
+	ErrModelNotFound:    "model_not_found",
+	ErrModelAccess:      "model_access",
+	ErrWafBlock:         "waf_block",
+	ErrPromptTooLong:    "prompt_too_long",
+	ErrImageInvalid:     "image_invalid",
+	ErrAccountFault:     "account_fault",
+	ErrQueueWaiting:     "queue_waiting",
+	ErrQueueFull:        "queue_full",
+	ErrClient:           "client",
+	ErrChannelRefused:   "channel_refused",
+	ErrUpstreamOverload: "upstream_overload",
 }
 
 func (k ErrKind) String() string {
@@ -731,6 +737,11 @@ func ParseRateReset(body string) (time.Time, bool) {
 //
 //nolint:cyclop,gocyclo // 分类优先级线性展开。
 func classifyEarly(status int, body string) (ErrKind, bool) {
+	// 11134 供应商侧过载最先判：它既不是账号状态（不能落 ErrServer/ErrClient 的
+	// 账号惩罚路径），也不该被 429 限流层吃掉（换号/冷却账号都改变不了供应商过载）。
+	if hasAnyBusinessCode(body, upstreamOverloadCodes...) {
+		return ErrUpstreamOverload, true
+	}
 	// 11136/11158 是账号级模型权限缺失：换一个账号可能就有权限，先判（与 11102 的
 	// 平台级「目录无此模型」分开）。11158 另留文案外卡：上游丢 code 时仍按账号类型
 	// 级权限拒绝处理，不落 ErrClient 逐号连败。
@@ -1000,6 +1011,15 @@ var accountLimitCodes = []string{"10105", "15001"}
 // rateLimitCodes 客户端限流/窗口用量族。6004 的模型级语义由
 // IsModelRateLimit 单独判定，这里统一先归 ErrSoftRate。
 var rateLimitCodes = []string{"6000", "6001", "6002", "6003", "6004", "6005", "6006", "6007", "6008"}
+
+// upstreamOverloadCodes 模型供应商侧过载族。11134「模型服务不可用，请切换模型重试」
+// （官方 errorCode.11134.desc：「模型超时或返回异常，与你的网络无关」）是供应商高峰
+// 现象：同一模型跨账号同时发生，与账号健康/额度/会话都无关。按账号状态码兜底
+// （5xx → ErrServer、业务信封 → ErrClient）会把健康号成片打进熔断/降级，且换号打断
+// 会话粘性、账号级前缀缓存从零重建。
+//
+// 只认结构化 code，不靠文案（文案会被聚合器改写）；无 code 的 5xx 仍是 ErrServer。
+var upstreamOverloadCodes = []string{"11134"}
 
 // classifyRequestLevel 判定客户端明确的请求级业务码，归 ErrBadParams
 // （不罚号、不轮转、透传原文）。11136/11158/11141 已在 classifyEarly 分流。
@@ -1906,32 +1926,9 @@ func (c *Client) doJSONLimitFor(
 // maxBytes <= 0 时按默认上限；超限返回明确错误而不是把半截 body 交给
 // json.Unmarshal（后者只会报 "unexpected end of JSON input"）。
 func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (json.RawMessage, error) {
-	if maxBytes <= 0 {
-		maxBytes = defaultJSONBodyLimit
-	}
-
-	resp, err := hc.Do(req)
+	raw, status, err := doRawAt(hc, req, maxBytes)
 	if err != nil {
-		return nil, fmt.Errorf("doJSONAt: %w", err)
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-
-	if int64(len(raw)) > maxBytes {
-		return nil, fmt.Errorf("response body exceeds %d bytes: %w", maxBytes, errDoJSONLimitFailed)
-	}
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		kind := Classify(resp.StatusCode, string(raw))
-
-		return nil, &Error{
-			Kind: kind, Status: resp.StatusCode,
-			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
-		}
+		return nil, err
 	}
 
 	var env apiEnvelope
@@ -1942,18 +1939,54 @@ func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (jso
 	if env.Code != 0 {
 		// 保留原始结构化信封交给 Classify：额度/限流/请求级码都依赖 code 字段，
 		// 拼成 `code=N msg=...` 纯文本会让后续分类只能看文案。
-		kind := Classify(resp.StatusCode, string(raw))
+		kind := Classify(status, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient
 		}
 
 		return nil, &Error{
-			Kind: kind, Status: resp.StatusCode,
+			Kind: kind, Status: status,
 			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
 		}
 	}
 
 	return env.Data, nil
+}
+
+// doRawAt 发出请求并返回原始 body：只做大小上限与非 2xx 分类，不解信封。
+// 调用方需要「信封 / 顶层平铺」双解时用它（如 FetchAccountProfile），其余一律走
+// doJSONAt。
+func doRawAt(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultJSONBodyLimit
+	}
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("doJSONAt: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
+
+	if int64(len(raw)) > maxBytes {
+		return nil, resp.StatusCode, fmt.Errorf("response body exceeds %d bytes: %w",
+			maxBytes, errDoJSONLimitFailed)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		kind := Classify(resp.StatusCode, string(raw))
+
+		return nil, resp.StatusCode, &Error{
+			Kind: kind, Status: resp.StatusCode,
+			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
+		}
+	}
+
+	return raw, resp.StatusCode, nil
 }
 
 // refreshIOTimeout 刷新端点网络 I/O 上限（两段式锁外执行，防上游 hang 长占锁）。

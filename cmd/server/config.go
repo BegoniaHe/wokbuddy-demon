@@ -498,6 +498,11 @@ type Config struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+		// DeriveBinding 给「只发 user_id、不带会话标识」的客户端用内容派生键做账号
+		// 粘性（issue #481）。默认 true：派生键来自 system + 首条 user 的哈希，同一段
+		// 对话跨轮稳定、不同对话不碰撞，因此不会退化成 user_id 单键粘性——那才是
+		// anti-monopoly 闸要挡的形态。关闭后回退「无会话键即不粘性」的旧行为。
+		DeriveBinding bool `json:"derive_binding"`
 	} `json:"session_sticky"`
 
 	// 解析后
@@ -667,6 +672,7 @@ func applyPoolDefaults(config4 *Config) {
 	config4.SessionSticky.Enabled = true
 	config4.SessionSticky.TTL = "30m"
 	config4.SessionSticky.GCInterval = "5m"
+	config4.SessionSticky.DeriveBinding = true
 }
 
 // Load 从文件读，再用 WB2A_* env 覆盖。

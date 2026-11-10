@@ -171,20 +171,99 @@ func TestBackfillReasoningContentNoTrace(t *testing.T) {
 	}
 }
 
-// TestBackfillReasoningContentNonDeepSeek 非 deepseek 模型零改动：
-// reasoning 字段保持原样，不新增 reasoning_content。
+// TestBackfillReasoningContentNonDeepSeek 既非 deepseek、也不在镜像族（kimi/glm/
+// minimax）的模型零改动：reasoning 字段保持原样，不新增 reasoning_content。
+// glm 已归入镜像族（issue #482），这里改用 hy3 钉住「其它模型不动」的口径。
 func TestBackfillReasoningContentNonDeepSeek(t *testing.T) {
 	t.Parallel()
 
-	body := `{"model":"glm-5.2","messages":[
+	body := `{"model":"hy3","messages":[
 		{"role":"assistant","content":"a","reasoning":"thought"}]}`
 
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 	for _, rc := range assistantRC(t, out) {
 		if rc != "<absent>" {
-			t.Errorf("非 deepseek 不应 backfill, got reasoning_content=%q (out=%s)", rc, out)
+			t.Errorf("非 deepseek 且非镜像族不应 backfill, got reasoning_content=%q (out=%s)", rc, out)
 		}
 	}
+}
+
+// TestMirrorReasoningFields kimi/glm/minimax 的 assistant 消息出站双向镜像
+// reasoning 与 reasoning_content（issue #482）：只复制非空值，不补占位。
+func TestMirrorReasoningFields(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		body     string
+		wantRC   string
+		wantReas string
+	}{
+		{
+			name:     "reasoning→reasoning_content",
+			body:     `{"model":"glm-5.2","messages":[{"role":"assistant","content":"a","reasoning":"thought"}]}`,
+			wantRC:   "thought",
+			wantReas: "thought",
+		},
+		{
+			name:     "reasoning_content→reasoning",
+			body:     `{"model":"kimi-k2.7","messages":[{"role":"assistant","content":"a","reasoning_content":"trace"}]}`,
+			wantRC:   "trace",
+			wantReas: "trace",
+		},
+		{
+			name:     "minimax 同样镜像",
+			body:     `{"model":"minimax-m3","messages":[{"role":"assistant","content":"a","reasoning":"r"}]}`,
+			wantRC:   "r",
+			wantReas: "r",
+		},
+		{
+			name:     "两者皆无则不补占位",
+			body:     `{"model":"glm-5.2","messages":[{"role":"assistant","content":"a"}]}`,
+			wantRC:   "<absent>",
+			wantReas: "<absent>",
+		},
+		{
+			// 非 assistant 不镜像：原字段原样保留，但不新增 reasoning_content。
+			name:     "非 assistant 不镜像",
+			body:     `{"model":"glm-5.2","messages":[{"role":"user","content":"a","reasoning":"x"}]}`,
+			wantRC:   "<absent>",
+			wantReas: "x",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := PrepareBodyOptWithEfforts([]byte(testCase.body), false, nil)
+
+			var doc map[string]any
+			if err := json.Unmarshal(out, &doc); err != nil {
+				t.Fatal(err)
+			}
+
+			msgs, _ := doc["messages"].([]any)
+			first, _ := msgs[0].(map[string]any)
+
+			if got := stringFieldOrAbsent(first, "reasoning_content"); got != testCase.wantRC {
+				t.Errorf("reasoning_content=%q want %q (out=%s)", got, testCase.wantRC, out)
+			}
+
+			if got := stringFieldOrAbsent(first, "reasoning"); got != testCase.wantReas {
+				t.Errorf("reasoning=%q want %q (out=%s)", got, testCase.wantReas, out)
+			}
+		})
+	}
+}
+
+// stringFieldOrAbsent 取字符串字段值，缺失返回 "<absent>"（便于与「空串」区分）。
+func stringFieldOrAbsent(msg map[string]any, key string) string {
+	if v, ok := msg[key].(string); ok {
+		return v
+	}
+
+	return "<absent>"
 }
 
 // TestBackfillReasoningContentBothFields 同时带 reasoning 与 reasoning_content：

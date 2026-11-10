@@ -1165,6 +1165,7 @@ var restartFieldPaths = []string{
 	"models.aliases", "notify.webhook_url", "notify.events",
 	// 粘性路由器是否创建在装配期决定；TTL 类同样在启动期读取。
 	"session_sticky.enabled", "session_sticky.ttl", "session_sticky.gc_interval",
+	"session_sticky.derive_binding",
 	"logging.request_archive_enabled", "logging.request_retention_days",
 	"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
 }

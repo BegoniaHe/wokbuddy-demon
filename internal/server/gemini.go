@@ -1267,6 +1267,11 @@ func geminiStreamErrorStatus(kind upstream.ErrKind) int {
 	switch {
 	case kind == upstream.ErrModelNotFound:
 		return http.StatusNotFound
+	case kind == upstream.ErrUpstreamOverload:
+		// 11134 供应商侧过载：可重试的 UNAVAILABLE（issue #476）。必须先于
+		// failFastKind 判定——后者把该 kind 当「请求级」返回 400 INVALID_ARGUMENT，
+		// 会让客户端把可重试的过载当请求非法，与 chat / search / anthropic 末端矛盾。
+		return http.StatusServiceUnavailable
 	case failFastKind(kind), kind == upstream.ErrModelBlocked:
 		return http.StatusBadRequest
 	case kind == upstream.ErrSoftRate:

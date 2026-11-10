@@ -405,3 +405,126 @@ func newEnterpriseAwareCockpitPanel(t *testing.T) (*Panel, *pool.Pool, *int64, *
 
 	return pn, p, &checkinHits, &enterpriseHits
 }
+
+// TestCockpitImportCreatesAuthDir 全新部署（auths/ 不存在）直接导入必须成功：
+// SaveAtomic 在 auth_dir 内建临时文件，父目录缺失会 ENOENT，整批导入报错。
+func TestCockpitImportCreatesAuthDir(t *testing.T) {
+	t.Parallel()
+
+	panel, _, _, _ := newCockpitPanel(t)
+	panel.cfg.AuthDir = filepath.Join(t.TempDir(), "auths") // 故意不预建
+
+	resp := decodeCockpitResp(t, doCockpitImport(t, panel, cockpitAccountsJSON(t, 1)))
+	if resp.Imported != 1 {
+		t.Fatalf("resp=%+v want imported=1 (fresh deployment)", resp)
+	}
+
+	if _, err := os.Stat(filepath.Join(panel.cfg.AuthDir, "workbuddy-u0.json")); err != nil {
+		t.Fatalf("auth file missing after fresh-deployment import: %v", err)
+	}
+}
+
+// TestCockpitImportExportShapes 四种导出形态都要能导入：顶层数组、顶层单对象、
+// {account,auth} 信封、{"<uid>":{…}} 字典；驼峰凭证键同样归一。
+func TestCockpitImportExportShapes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		payload string
+		wantUID string
+	}{
+		{
+			name:    "array",
+			payload: `[{"uid":"u-arr","access_token":"at","refresh_token":"rt","domain":"workbuddy.cn"}]`,
+			wantUID: "u-arr",
+		},
+		{
+			name:    "single_object",
+			payload: `{"uid":"u-single","access_token":"at","refresh_token":"rt","domain":"workbuddy.cn"}`,
+			wantUID: "u-single",
+		},
+		{
+			// 信封键名不是 uid：凭证在 auth 段，元数据在 account 段。
+			name: "envelope",
+			payload: `{"account":{"uid":"u-env","nickname":"nick","domain":"workbuddy.cn"},
+				"auth":{"access_token":"at","refresh_token":"rt"}}`,
+			wantUID: "u-env",
+		},
+		{
+			// 字典键即 uid：值里缺 uid 时用键补齐。
+			name:    "dictionary",
+			payload: `{"u-dict":{"access_token":"at","refresh_token":"rt","domain":"workbuddy.cn"}}`,
+			wantUID: "u-dict",
+		},
+		{
+			name:    "camel_case",
+			payload: `{"uid":"u-camel","accessToken":"at","refreshToken":"rt","domain":"workbuddy.cn"}`,
+			wantUID: "u-camel",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+			panel, state, _, _ := newCockpitPanel(t)
+
+			resp := decodeCockpitResp(t, doCockpitImport(t, panel, []byte(testCase.payload)))
+			if resp.Imported != 1 || resp.Skipped != 0 {
+				t.Fatalf("resp=%+v want imported=1 skipped=0", resp)
+			}
+
+			if state.AuthByUID(testCase.wantUID) == nil {
+				t.Fatalf("pool missing %s (shape not normalized)", testCase.wantUID)
+			}
+		})
+	}
+}
+
+// TestCockpitImportExpiresAtUnit 秒/毫秒归一：秒级值不能再被 /1000 打成 1970。
+func TestCockpitImportExpiresAtUnit(t *testing.T) {
+	t.Parallel()
+
+	const seconds = 4102444800 // 2100-01-01，与毫秒写法 4102444800000 同义
+
+	for name, payload := range map[string]string{
+		"seconds": fmt.Sprintf(
+			`[{"uid":"u-sec","access_token":"at","refresh_token":"rt","expires_at":%d}]`, seconds),
+		"milliseconds": fmt.Sprintf(
+			`[{"uid":"u-sec","access_token":"at","refresh_token":"rt","expires_at":%d}]`, seconds*1000),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			panel, state, _, _ := newCockpitPanel(t)
+
+			resp := decodeCockpitResp(t, doCockpitImport(t, panel, []byte(payload)))
+			if resp.Imported != 1 {
+				t.Fatalf("resp=%+v want imported=1", resp)
+			}
+
+			imported := state.AuthByUID("u-sec")
+			if imported == nil {
+				t.Fatal("pool missing imported account")
+			}
+
+			if imported.ExpiresAt != seconds {
+				t.Errorf("ExpiresAt=%d want %d", imported.ExpiresAt, seconds)
+			}
+		})
+	}
+}
+
+// TestCockpitImportRejectsUnknownRoot 无法识别的根值仍然 400，不静默成功。
+func TestCockpitImportRejectsUnknownRoot(t *testing.T) {
+	t.Parallel()
+	panel, state, _, _ := newCockpitPanel(t)
+
+	rec := doCockpitImport(t, panel, []byte(`"not-a-cockpit-export"`))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400 body=%s", rec.Code, rec.Body)
+	}
+
+	if len(state.List()) != 0 {
+		t.Errorf("rejected import must not add accounts")
+	}
+}

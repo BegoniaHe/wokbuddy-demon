@@ -101,10 +101,8 @@ func normalizeChatBody(obj map[string]any, rewrite *chatBodyRewrite) {
 	normalizeToolSchemas(obj)
 	normalizeRoles(obj)
 	normalizeImageURL(obj)
-	// 防御层：第三方把 reasoning_text / reasoning 当成 content part 回放时，上游 content
-	// 类型白名单不含它们 → 400 code=11101。本仓库自带 responses→chat 转换器（responses.go
-	// 里 reasoning item 走 default 丢弃），主链路不会产生该形态；这里只兜第三方客户端。
-	dropReasoningContentParts(obj)
+	// 出站形态修补（issue #482）：reasoning 片段剔除 + "[" 开头字符串补位。
+	applyOutboundShapePatches(obj)
 	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
 	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
 	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
@@ -128,18 +126,40 @@ func normalizeChatBody(obj map[string]any, rewrite *chatBodyRewrite) {
 	// DeepSeek 思维链开关（见 thinking.go）：注入 thinking.type=enabled + 缺档补默认档。
 	// 先于 normalizeReasoningEffort 执行：补入的默认档也要走既有降级管线，
 	// 模型不支持默认档时自动落到 ≤ 默认档的最高支持档（不出站不合规档位）。
-	modelName, _ := obj["model"].(string)
-	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
-	normalizeReasoningEffort(obj, efforts)
-	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
-	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
-	backfillReasoningContent(obj)
+	applyReasoningPatches(obj, defaultEfforts, efforts)
 
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
 		}
 	}
+}
+
+// applyOutboundShapePatches 出站 content 形态修补：
+//   - 剔除 reasoning_text / reasoning 片段：第三方把它们当 content part 回放时上游
+//     content 类型白名单不含它们 → 400 code=11101（本仓库自带 responses→chat 转换器
+//     不会产生该形态，这里只兜第三方客户端）；
+//   - 字符串 content 以 "[" 开头会被上游嗅探成 parts 数组 → 空消息 11151，改写为单段
+//     text parts，原文不裁剪（issue #482）。
+func applyOutboundShapePatches(obj map[string]any) {
+	dropReasoningContentParts(obj)
+	padBracketStringContent(obj)
+}
+
+// applyReasoningPatches 思维链相关的出站改写（顺序即语义）：
+//   - DeepSeek 开关：注入 thinking.type=enabled + 缺档补默认档，先于降级管线执行，
+//     补入的默认档也要走 normalizeReasoningEffort；
+//   - 档位降级：模型不支持的档位落到 ≤ 默认档的最高支持档；
+//   - DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content；
+//   - kimi/glm/minimax 双向镜像（issue #482），仍排在脱敏之前。
+func applyReasoningPatches(
+	obj map[string]any, defaultEfforts map[string]string, efforts map[string][]string,
+) {
+	modelName, _ := obj["model"].(string)
+	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
+	normalizeReasoningEffort(obj, efforts)
+	backfillReasoningContent(obj)
+	mirrorReasoningFields(obj)
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
@@ -508,6 +528,32 @@ func normalizeImageURL(obj map[string]any) {
 
 			part["image_url"] = map[string]any{"url": imageURL}
 		}
+	}
+}
+
+// padBracketStringContent 空 text 段补位（出站防御层，issue #482）：字符串 content
+// 以 "[" 开头时，上游会把它嗅探成 content parts 数组，解析出空消息并回
+// errorCode.11151「Empty messages found. Add content and retry」。改写成单段
+// `[{type:text,text:<原串>}]` 后语义完全等价（原文不裁剪、不 trim），只是消掉这种
+// 被误判的形态；其余字符串 content 原样通过（不臆造改写，与相邻转换器同规则）。
+func padBracketStringContent(obj map[string]any) {
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		content, ok := msg["content"].(string)
+		if !ok || !strings.HasPrefix(strings.TrimSpace(content), "[") {
+			continue
+		}
+
+		msg["content"] = []any{map[string]any{"type": "text", "text": content}}
 	}
 }
 

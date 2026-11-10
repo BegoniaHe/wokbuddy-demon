@@ -10,11 +10,13 @@
 package upstream
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -44,23 +46,57 @@ func (c *Client) FetchAccountProfile(account *auth.Auth) (string, error) {
 		req.Header.Set("User-Agent", ua)
 	}
 
-	data, err := c.doJSONFor(account, req)
+	// 取原始 body 自行解信封：上游两种形态并存（信封 {code,data:{uid,nickname}} 与
+	// 顶层平铺 {uid,nickname}），doJSONFor 只返回 data，平铺形态会解出零值且不报错，
+	// 调用方拿不到「解析落空」信号（issue #482）。
+	raw, _, err := doRawAt(c.HTTPForAccount(account), req, defaultJSONBodyLimit)
 	if err != nil {
 		return "", err
 	}
-	// 只取两个字段：敏感信息（手机号等）在这里就被丢弃，不进入任何后续路径。
-	var resp struct {
+
+	uid, nickname, err := parseAccountProfile(raw)
+	if err != nil {
+		return "", err
+	}
+
+	if uid != "" && account.UID != "" && uid != account.UID {
+		return "", fmt.Errorf("profile uid mismatch: resp=%s auth=%s: %w",
+			uid, account.UID, errFetchAccountProfileFailed)
+	}
+
+	return nickname, nil
+}
+
+// parseAccountProfile 解析 /console/account 的两种已见形态，只取 uid 与 nickname
+// （手机号等敏感字段在这里就被丢弃，不进入任何后续路径）。昵称为空返回错误而不是
+// 静默成功——空昵称多半意味着形态没解出来，静默成功会让调用方把账号昵称覆盖成空串。
+func parseAccountProfile(raw []byte) (string, string, error) {
+	var profile struct {
 		UID      string `json:"uid"`
 		Nickname string `json:"nickname"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return "", fmt.Errorf("profile parse: %w", err)
+
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
 	}
 
-	if resp.UID != "" && account.UID != "" && resp.UID != account.UID {
-		return "", fmt.Errorf("profile uid mismatch: resp=%s auth=%s: %w",
-			resp.UID, account.UID, errFetchAccountProfileFailed)
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return "", "", fmt.Errorf("profile parse: %w", err)
 	}
 
-	return resp.Nickname, nil
+	trimmed := bytes.TrimSpace(envelope.Data)
+	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
+		if err := json.Unmarshal(trimmed, &profile); err != nil {
+			return "", "", fmt.Errorf("profile parse: %w", err)
+		}
+	} else if err := json.Unmarshal(raw, &profile); err != nil {
+		return "", "", fmt.Errorf("profile parse: %w", err)
+	}
+
+	if strings.TrimSpace(profile.Nickname) == "" {
+		return profile.UID, "", fmt.Errorf("profile parse: empty nickname: %w",
+			errFetchAccountProfileFailed)
+	}
+
+	return profile.UID, profile.Nickname, nil
 }

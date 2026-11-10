@@ -187,6 +187,7 @@
   "session_sticky": {
     "enabled": true,
     "ttl": "30m",
-    "gc_interval": "5m"
+    "gc_interval": "5m",
+    "derive_binding": true
   }
 }
