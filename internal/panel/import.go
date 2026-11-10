@@ -1,13 +1,17 @@
 package panel
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +58,12 @@ type cockpitAccount struct {
 	EnterpriseID string `json:"enterprise_id"`
 	// EnterpriseIDCamel enterpriseId 驼峰写法的落点。
 	EnterpriseIDCamel string `json:"enterpriseId"`
+	// 以下驼峰写法与上面的 snake_case 并存（部分 cockpit 导出/第三方工具给的是
+	// camelCase）：token/过期时间缺一个就整条落成「missing required fields」或
+	// 静默过期，由 accessTokenValue()/refreshTokenValue()/expiresAtValue() 归一。
+	AccessTokenCamel  string `json:"accessToken"`
+	RefreshTokenCamel string `json:"refreshToken"`
+	ExpiresAtCamel    int64  `json:"expiresAt"`
 }
 
 // enterpriseID 归一后的企业标识：两种 cockpit 导出写法取非空的那个（都不填 = 个人号）。
@@ -63,6 +73,55 @@ func (acc *cockpitAccount) enterpriseID() string {
 	}
 
 	return strings.TrimSpace(acc.EnterpriseID)
+}
+
+// accessTokenValue / refreshTokenValue 取 snake_case 优先、驼峰回退的凭证字面量。
+func (acc *cockpitAccount) accessTokenValue() string {
+	if at := strings.TrimSpace(acc.AccessToken); at != "" {
+		return at
+	}
+
+	return strings.TrimSpace(acc.AccessTokenCamel)
+}
+
+func (acc *cockpitAccount) refreshTokenValue() string {
+	if rt := strings.TrimSpace(acc.RefreshToken); rt != "" {
+		return rt
+	}
+
+	return strings.TrimSpace(acc.RefreshTokenCamel)
+}
+
+// expiresAtValue 取非零的过期时间字面量（两种写法只有一种会出现）。
+func (acc *cockpitAccount) expiresAtValue() int64 {
+	if acc.ExpiresAt > 0 {
+		return acc.ExpiresAt
+	}
+
+	return acc.ExpiresAtCamel
+}
+
+// fillMissing 用 other 的非空字段补齐自身（{account,auth} 信封形态：账号元数据在
+// account 段、凭证在 auth 段，两段都要消费）。
+func (acc *cockpitAccount) fillMissing(other *cockpitAccount) {
+	fill := func(dst *string, src string) {
+		if strings.TrimSpace(*dst) == "" {
+			*dst = src
+		}
+	}
+
+	fill(&acc.ID, other.ID)
+	fill(&acc.Email, other.Email)
+	fill(&acc.UID, other.UID)
+	fill(&acc.Nickname, other.Nickname)
+	fill(&acc.AccessToken, other.accessTokenValue())
+	fill(&acc.RefreshToken, other.refreshTokenValue())
+	fill(&acc.Domain, other.Domain)
+	fill(&acc.EnterpriseID, other.enterpriseID())
+
+	if acc.expiresAtValue() <= 0 {
+		acc.ExpiresAt = other.expiresAtValue()
+	}
 }
 
 // importCockpit 接收 cockpit tools 导出的 JSON 文件，批量导入账号到池中。
@@ -127,7 +186,7 @@ func readCockpitAccounts(w http.ResponseWriter, r *http.Request) ([]cockpitAccou
 	}
 
 	var accounts []cockpitAccount
-	if err := json.Unmarshal(raw, &accounts); err != nil {
+	if accounts, err = decodeCockpitAccounts(raw); err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
 		return nil, false
 	}
@@ -146,6 +205,141 @@ func readCockpitAccounts(w http.ResponseWriter, r *http.Request) ([]cockpitAccou
 	}
 
 	return accounts, true
+}
+
+// cockpitExpiresAtMillisThreshold 秒/毫秒分界：秒级时间戳到 5138 年也不会达到
+// 1e11，毫秒级（1.7e12 量级）必然超过，单侧阈值足够判别。
+const cockpitExpiresAtMillisThreshold = 1e11
+
+// cockpit 导出形态归一失败的静态错误（err113：错误值不就地新建）。
+var (
+	errCockpitEmptyDocument = errors.New("empty document")
+	errCockpitRootValue     = errors.New("root value must be a JSON array or object")
+	errCockpitDictValue     = errors.New("dictionary entry is not an object")
+)
+
+// decodeCockpitAccounts 把 cockpit 导出归一成账号数组。cockpit tools 原生导出的
+// 顶层数组之外，实际还会碰到单账号详情导出与其他工具产出的三种形态：
+//
+//   - 顶层单对象：`{id,uid,access_token,…}`；
+//   - `{account,auth}` 信封：元数据在 account 段、凭证在 auth 段（两段都要消费，
+//     信封键名不是 uid）；
+//   - `{"<uid>":{…}}` 字典：值缺 uid 时用键补齐。
+//
+// 无法识别的形状返回错误（由调用方转 400），不做静默丢弃。
+func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil, errCockpitEmptyDocument
+	}
+
+	switch trimmed[0] {
+	case '[':
+		var accounts []cockpitAccount
+		if err := json.Unmarshal(trimmed, &accounts); err != nil {
+			return nil, fmt.Errorf("accounts array: %w", err)
+		}
+
+		return accounts, nil
+	case '{':
+	default:
+		return nil, errCockpitRootValue
+	}
+
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &obj); err != nil {
+		return nil, fmt.Errorf("root object: %w", err)
+	}
+
+	if acctRaw, ok := obj["account"]; ok {
+		return decodeCockpitEnvelope(acctRaw, obj["auth"])
+	}
+
+	// 单账号对象：出现凭证/账号键就当一条账号解。若按字典处理，凭证值会被
+	// 当成 uid 键，报出与真实原因无关的错误。
+	if isCockpitAccountObject(obj) {
+		var acc cockpitAccount
+		if err := json.Unmarshal(trimmed, &acc); err != nil {
+			return nil, fmt.Errorf("single account: %w", err)
+		}
+
+		return []cockpitAccount{acc}, nil
+	}
+
+	return decodeCockpitDict(obj)
+}
+
+// isCockpitAccountObject 判定对象是否为单条账号（任一账号键存在即算）。
+func isCockpitAccountObject(obj map[string]json.RawMessage) bool {
+	for _, key := range []string{"uid", "access_token", "accessToken"} {
+		if _, ok := obj[key]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// decodeCockpitEnvelope 解 {account,auth} 信封：account 段可为单对象或数组，
+// 凭证段 auth 的非空字段补齐到每个账号上。
+func decodeCockpitEnvelope(accountRaw, authRaw json.RawMessage) ([]cockpitAccount, error) {
+	var authPart cockpitAccount
+
+	if len(bytes.TrimSpace(authRaw)) > 0 {
+		if err := json.Unmarshal(authRaw, &authPart); err != nil {
+			return nil, fmt.Errorf("auth segment: %w", err)
+		}
+	}
+
+	var accounts []cockpitAccount
+	if err := json.Unmarshal(accountRaw, &accounts); err == nil {
+		for i := range accounts {
+			accounts[i].fillMissing(&authPart)
+		}
+
+		return accounts, nil
+	}
+
+	var single cockpitAccount
+	if err := json.Unmarshal(accountRaw, &single); err != nil {
+		return nil, fmt.Errorf("account segment: %w", err)
+	}
+
+	single.fillMissing(&authPart)
+
+	return []cockpitAccount{single}, nil
+}
+
+// decodeCockpitDict 解 `{"<uid>":{…}}` 字典；排序保证错误顺序与导入顺序可复现。
+func decodeCockpitDict(obj map[string]json.RawMessage) ([]cockpitAccount, error) {
+	keys := make([]string, 0, len(obj))
+	for key := range obj {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	accounts := make([]cockpitAccount, 0, len(obj))
+
+	for _, key := range keys {
+		val := bytes.TrimSpace(obj[key])
+		if len(val) == 0 || val[0] != '{' {
+			return nil, fmt.Errorf("dictionary entry %q: %w", key, errCockpitDictValue)
+		}
+
+		var acc cockpitAccount
+		if err := json.Unmarshal(val, &acc); err != nil {
+			return nil, fmt.Errorf("dictionary entry %q: %w", key, err)
+		}
+
+		if strings.TrimSpace(acc.UID) == "" {
+			acc.UID = key
+		}
+
+		accounts = append(accounts, acc)
+	}
+
+	return accounts, nil
 }
 
 // persistCockpitAccounts 串行落盘并热加载；失败项逐条返回原因。
@@ -187,9 +381,9 @@ func persistAccounts[T any](
 // 失败原因与旧实现逐字一致。上游调用（签到/余额）不在此处，见阶段 2。
 func (p *Panel) persistCockpitAccount(acc *cockpitAccount) (*auth.Auth, string) {
 	uid := strings.TrimSpace(acc.UID)
-	at := strings.TrimSpace(acc.AccessToken)
+	at := acc.accessTokenValue()
 
-	str := strings.TrimSpace(acc.RefreshToken)
+	str := acc.refreshTokenValue()
 	if uid == "" || at == "" || str == "" {
 		return nil, fmt.Sprintf("missing required fields (id=%s)", acc.ID)
 	}
@@ -239,11 +433,25 @@ func (p *Panel) postImportAccounts(ctx context.Context, accounts []*auth.Auth) {
 	wg.Wait()
 }
 
+// normalizeCockpitExpiresAt 秒/毫秒归一：原生 cockpit 导出给毫秒，部分导出给秒。
+// 非正值返回 0，由调用方回落到默认有效期。
+func normalizeCockpitExpiresAt(value int64) int64 {
+	switch {
+	case value <= 0:
+		return 0
+	case value >= cockpitExpiresAtMillisThreshold:
+		return value / 1000
+	default:
+		return value
+	}
+}
+
 // buildImportedAuth 由 cockpit 账号构造 auth：expires_at 毫秒转秒（缺省 +365 天），
 // nickname 缺失时回落 email，企业标识透传（issue #446）。
 func buildImportedAuth(acc *cockpitAccount, strVal, at, str2, authDir string) *auth.Auth {
-	// cockpit tools 的 expires_at 为毫秒时间戳，转为秒。
-	expiresAt := acc.ExpiresAt / 1000
+	// cockpit tools 的 expires_at 原生是毫秒，但部分导出给秒；归一后再判缺省，
+	// 否则秒级值被再除 1000 会落到 1970（账号一导入即过期）。
+	expiresAt := normalizeCockpitExpiresAt(acc.expiresAtValue())
 	if expiresAt <= 0 {
 		expiresAt = time.Now().Add(365 * 24 * time.Hour).Unix()
 	}
@@ -274,6 +482,14 @@ func (p *Panel) persistImportedAuth(account *auth.Auth, realm, uid string) error
 		}
 	} else {
 		_, _ = account.BackfillRealm()
+	}
+
+	// SaveAtomic 在 auth_dir 内建临时文件，父目录不存在直接 ENOENT；全新部署
+	// （未走过 OAuth 登录）首次导入必踩。与 login.go 的落盘前建目录同口径。
+	if dir := p.cfg.AuthDir; dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("uid=%s: mkdir auth dir: %w", uid, err)
+		}
 	}
 
 	if err := account.SaveAtomic(); err != nil {
