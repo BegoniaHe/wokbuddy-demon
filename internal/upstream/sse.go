@@ -1090,6 +1090,11 @@ type streamWriter struct {
 	// 上游持续发 data 行且不发空行时会无限累积（单行上限只约束一行）。
 	dataBytes int
 
+	// dirtyBytes 自上次 Flush 起累计写出的字节数与写次数：用于合并小帧
+	// （issue #482）。首帧立即 Flush 保 TTFT，之后累计到 streamFlushBytes 才下发。
+	dirtyBytes int
+	writes     int
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen map[int]bool
@@ -1166,12 +1171,13 @@ func newStreamWriter(w http.ResponseWriter, hintFn func(string) string, opts ...
 // 写失败统一包 errClientWrite（issue #105）：调用方据此把「客户端已走」与
 // 「上游读失败」分开处置。
 func (s *streamWriter) writeAll(payload string) error {
-	return s.writeSegments("", payload, "")
+	// 非 data 行（注释心跳 / event: / id:）是控制帧：必须立即下发，不能等批量阈值。
+	return s.writeSegments("", payload, "", true)
 }
 
 // writeSegments 分段写出 prefix/payload/suffix 后 flush：SSE 帧头尾是常量，
 // 分段写避免每帧为 "data: "+payload+"\n\n" 复制一次完整载荷。
-func (s *streamWriter) writeSegments(prefix, payload, suffix string) error {
+func (s *streamWriter) writeSegments(prefix, payload, suffix string, force bool) error {
 	s.setWriteDeadline(time.Now().Add(s.writeTimeout))
 
 	for _, part := range [3]string{prefix, payload, suffix} {
@@ -1180,11 +1186,32 @@ func (s *streamWriter) writeSegments(prefix, payload, suffix string) error {
 		}
 	}
 
-	if s.fl != nil {
-		s.fl.Flush()
-	}
+	s.afterWrite(len(prefix)+len(payload)+len(suffix), force)
 
 	return nil
+}
+
+// streamFlushBytes 逐帧 Flush 的合并阈值（issue #482）：写出字节累计到该值才主动
+// Flush，让底层 bufio 一次下发多个小帧，长回答下把每帧一次系统调用压到每 2KB 一次。
+// 首帧与末尾收尾仍立即 Flush（TTFT 与收尾时延不变）。
+const streamFlushBytes = 2 << 10
+
+// afterWrite 记账本次写出的字节并按阈值决定是否 Flush。
+// force（控制帧/收尾）与首帧无条件 Flush。
+func (s *streamWriter) afterWrite(n int, force bool) {
+	s.writes++
+	s.dirtyBytes += n
+
+	if s.fl == nil {
+		return
+	}
+
+	if !force && s.writes > 1 && s.dirtyBytes < streamFlushBytes {
+		return
+	}
+
+	s.fl.Flush()
+	s.dirtyBytes = 0
 }
 
 // setWriteDeadline 设置/清空底层连接的写截止；writeTimeout<=0 时不设置。
@@ -1207,7 +1234,7 @@ func (s *streamWriter) writeSSE(payload string) error {
 		return fmt.Errorf("%w: request canceled while pacing", errClientWrite)
 	}
 
-	return s.writeSegments("data: ", payload, "\n\n")
+	return s.writeSegments("data: ", payload, "\n\n", false)
 }
 
 // writeSSEBytes 写出一帧已是 JSON 字节的载荷：直接写 []byte，省去
@@ -1233,9 +1260,7 @@ func (s *streamWriter) writeSSEBytes(payload []byte) error {
 		return fmt.Errorf("%w: %w", errClientWrite, err)
 	}
 
-	if s.fl != nil {
-		s.fl.Flush()
-	}
+	s.afterWrite(len(payload)+8, false) // "data: " + payload + "\n\n"
 
 	return nil
 }
@@ -1776,6 +1801,17 @@ func (s *streamWriter) finishSizeLimit() {
 	_ = s.writeRaw(`{"error":{"message":"upstream sse line exceeded size limit",` +
 		`"type":"upstream_error","code":"upstream_parse"}}`)
 	_ = s.writeSSE("[DONE]")
+	s.flushNow()
+}
+
+// flushNow 立即下发缓冲帧（收尾路径用：批量化只影响中途帧节奏，不影响收尾完整性）。
+func (s *streamWriter) flushNow() {
+	if s.fl == nil {
+		return
+	}
+
+	s.fl.Flush()
+	s.dirtyBytes = 0
 }
 
 // finish 收尾：标记修复尾部回吐 + 空流兜底 error 帧 + 保证恰好一个 [DONE]。
@@ -1796,6 +1832,8 @@ func (s *streamWriter) finish(validFrames *int) error {
 	if err := s.writeSSE("[DONE]"); err != nil {
 		return err
 	}
+
+	s.flushNow()
 
 	return s.finishResult(*validFrames)
 }

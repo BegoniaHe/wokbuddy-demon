@@ -12,7 +12,8 @@
 //	仍然按不思考应答（reasoning_content 长度 0），带 reasoning_effort:high 才有思维链。
 //	逆向 codebuddy.js 证实：isThinkingEnabled = !!(reasoning_summary || reasoning_effort || reasoning?.effort)，
 //	case "deepseek" 的 enabled 分支在实际出站里同时保留 reasoning_effort，官方「开思考」= thinking.type:enabled
-//	+ 某档 effort；默认档来自 reasoning.defaultEffort ?? 兜底 "high"（configure thinking 无来源时 warn fallback to 'high'）。
+//	+ 某档 effort；默认档来自 reasoning.defaultEffort ?? 兜底 DefaultGatewayEffort
+//	  （configure thinking 无来源时官方 warn fallback to 'high'）。
 //
 // 行为对齐官方客户端（两路组合）：
 //   - thinking.type 已显式 enabled / disabled → 客户端显式控制，绝不覆盖；disabled 时照抄 case 行为
@@ -26,10 +27,12 @@ import (
 	"strings"
 )
 
-// defaultDeepSeekEffort 官方客户端默认档兜底（configure thinking 无来源时 warn fallback to 'high'，
-// REASONING_SUPPLEMENTS.defaultEffort 亦为 "high"）。补入后走 normalizeReasoningEffort 降级管线，
-// 模型不支持 high 时自动落到 ≤high 的最高支持档。
-const defaultDeepSeekEffort = "high"
+// DefaultGatewayEffort 网关侧思考默认档的唯一来源（官方 configure thinking 无来源时
+// warn fallback to 'high'，REASONING_SUPPLEMENTS.defaultEffort 亦为 "high"）。
+// payload.go 的出站注入与 thinking.go 的缺省回落共用该常量，避免两处默认值分叉
+// （issue #482）。补入后仍走 normalizeReasoningEffort 降级管线，模型不支持时自动
+// 落到 ≤ 该档的最高支持档。
+const DefaultGatewayEffort = "high"
 
 // lookupDefaultEffort 从 FetchModels 缓存的 defaultEfforts 表按模型名查默认档。
 // nil map 或模型未缓存 → 空串（thinking.go 回退硬编码 high）。
@@ -101,6 +104,72 @@ func backfillReasoningContent(obj map[string]any) {
 		if role, _ := msg["role"].(string); role == "assistant" {
 			backfillAssistantReasoning(msg)
 		}
+	}
+}
+
+// reasoningMirrorPrefixes 思维链字段双向镜像的模型族前缀：kimi（Moonshot）、
+// glm（智谱）、minimax。这三个上游读的字段名不同（reasoning / reasoning_content），
+// assistant 历史里只带一个时，另一族上游读不到思维链上下文。DeepSeek 的等价处理
+// 在 backfillReasoningContent（它反过来要求每条 assistant 都有 reasoning_content）。
+// 前缀匹配与 isDeepSeekModel 同口径，与 model.json 目录里的模型名族一致。
+var reasoningMirrorPrefixes = []string{"kimi", "glm", "minimax"}
+
+// isReasoningMirrorModel 判定模型是否属于需要 reasoning/reasoning_content 镜像的族。
+func isReasoningMirrorModel(model string) bool {
+	name := strings.ToLower(strings.TrimSpace(model))
+
+	for _, prefix := range reasoningMirrorPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// mirrorReasoningFields 出站镜像 reasoning 与 reasoning_content（issue #482）：
+// 只做非空值的双向复制，不补占位——占位注入是 DeepSeek 的校验需求
+// （backfillReasoningContent 的 len>0 闸），不属于镜像语义，对 kimi/glm/minimax
+// 凭空加字段只会污染上下文。
+//
+// 必须在 sanitizeMessages 之前执行（payload.go 管线顺序），镜像出来的值同样过脱敏。
+func mirrorReasoningFields(obj map[string]any) {
+	model, _ := obj["model"].(string)
+	if !isReasoningMirrorModel(model) {
+		return
+	}
+
+	msgs, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, mm := range msgs {
+		msg, ok := mm.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if role, _ := msg["role"].(string); role != "assistant" {
+			continue
+		}
+
+		mirrorAssistantReasoning(msg)
+	}
+}
+
+// mirrorAssistantReasoning 单条 assistant 消息的两字段互镜像（只复制非空值）。
+func mirrorAssistantReasoning(msg map[string]any) {
+	rc, rcOK := msg["reasoning_content"].(string)
+	reasoning, rOK := msg["reasoning"].(string)
+
+	switch {
+	case !rOK || strings.TrimSpace(reasoning) == "":
+		if rcOK && rc != "" {
+			msg["reasoning"] = rc
+		}
+	case !rcOK || rc == "":
+		msg["reasoning_content"] = reasoning
 	}
 }
 
@@ -193,7 +262,7 @@ func effortValueOff(obj map[string]any) bool {
 //   - 无 thinking / type 空 / 已有 effort → 注入 enabled 并补默认档（已有 effort 不覆盖）。
 //
 // defaultEffort 为该模型声明的默认档（来自 FetchModels 缓存 reasoning.defaultEffort）；
-// 空串时回退硬编码 defaultDeepSeekEffort（向后兼容）。
+// 空串时回退 DefaultGatewayEffort（单一来源，见该常量注释）。
 func injectThinking(obj map[string]any, defaultEffort string) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {
@@ -249,7 +318,7 @@ func injectThinking(obj map[string]any, defaultEffort string) {
 
 // ensureDeepSeekEffort 缺 effort 档位时补默认档（snake 优先，camel 兜底）。
 // 已有任一 effort → 不覆盖（显式档位不做任何改写，降级交给 normalizeReasoningEffort）。
-// defaultEffort 空串 → 回退 defaultDeepSeekEffort（硬编码 "high"）。
+// defaultEffort 空串 → 回退 DefaultGatewayEffort。
 func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
 	_, hasSnake := obj["reasoning_effort"]
 	if hasSnake {
@@ -262,7 +331,7 @@ func ensureDeepSeekEffort(obj map[string]any, defaultEffort string) {
 	}
 
 	if defaultEffort == "" {
-		defaultEffort = defaultDeepSeekEffort
+		defaultEffort = DefaultGatewayEffort
 	}
 
 	obj["reasoning_effort"] = defaultEffort

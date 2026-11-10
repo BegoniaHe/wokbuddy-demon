@@ -1926,32 +1926,9 @@ func (c *Client) doJSONLimitFor(
 // maxBytes <= 0 时按默认上限；超限返回明确错误而不是把半截 body 交给
 // json.Unmarshal（后者只会报 "unexpected end of JSON input"）。
 func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (json.RawMessage, error) {
-	if maxBytes <= 0 {
-		maxBytes = defaultJSONBodyLimit
-	}
-
-	resp, err := hc.Do(req)
+	raw, status, err := doRawAt(hc, req, maxBytes)
 	if err != nil {
-		return nil, fmt.Errorf("doJSONAt: %w", err)
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-
-	if int64(len(raw)) > maxBytes {
-		return nil, fmt.Errorf("response body exceeds %d bytes: %w", maxBytes, errDoJSONLimitFailed)
-	}
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		kind := Classify(resp.StatusCode, string(raw))
-
-		return nil, &Error{
-			Kind: kind, Status: resp.StatusCode,
-			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
-		}
+		return nil, err
 	}
 
 	var env apiEnvelope
@@ -1962,18 +1939,54 @@ func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (jso
 	if env.Code != 0 {
 		// 保留原始结构化信封交给 Classify：额度/限流/请求级码都依赖 code 字段，
 		// 拼成 `code=N msg=...` 纯文本会让后续分类只能看文案。
-		kind := Classify(resp.StatusCode, string(raw))
+		kind := Classify(status, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient
 		}
 
 		return nil, &Error{
-			Kind: kind, Status: resp.StatusCode,
+			Kind: kind, Status: status,
 			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
 		}
 	}
 
 	return env.Data, nil
+}
+
+// doRawAt 发出请求并返回原始 body：只做大小上限与非 2xx 分类，不解信封。
+// 调用方需要「信封 / 顶层平铺」双解时用它（如 FetchAccountProfile），其余一律走
+// doJSONAt。
+func doRawAt(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, error) {
+	if maxBytes <= 0 {
+		maxBytes = defaultJSONBodyLimit
+	}
+
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("doJSONAt: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+	}
+
+	if int64(len(raw)) > maxBytes {
+		return nil, resp.StatusCode, fmt.Errorf("response body exceeds %d bytes: %w",
+			maxBytes, errDoJSONLimitFailed)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		kind := Classify(resp.StatusCode, string(raw))
+
+		return nil, resp.StatusCode, &Error{
+			Kind: kind, Status: resp.StatusCode,
+			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
+		}
+	}
+
+	return raw, resp.StatusCode, nil
 }
 
 // refreshIOTimeout 刷新端点网络 I/O 上限（两段式锁外执行，防上游 hang 长占锁）。
