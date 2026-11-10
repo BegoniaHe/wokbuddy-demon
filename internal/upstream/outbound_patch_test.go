@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -172,5 +173,36 @@ func TestStreamFlushCoalesced(t *testing.T) {
 
 	if counter.flushes < 1 {
 		t.Errorf("first frame must flush immediately, flushes=0")
+	}
+}
+
+// TestStreamFlushMaxDelay 滞留超过上限的小帧必须强制下发（issue #482 追评）：
+// 只按 2KB 字节合并会让逐 token 慢速流的中间帧一直卡到 finish() 才吐出，
+// 用户看到的是「首字后卡住直到整段结束」。密集突发帧仍按字节合并。
+func TestStreamFlushMaxDelay(t *testing.T) {
+	t.Parallel()
+
+	counter := &flushCounter{ResponseRecorder: httptest.NewRecorder()}
+	writer := newStreamWriter(counter, nil)
+
+	if err := writer.writeSSE(`{"choices":[]}`); err != nil {
+		t.Fatalf("first frame: %v", err)
+	}
+
+	firstFlushes := counter.flushes
+	if firstFlushes == 0 {
+		t.Fatal("首帧必须立即 Flush")
+	}
+
+	// 模拟上游生成停顿：距上次 Flush 已超上限，累计字节仍远不足 2KB。
+	writer.lastFlush = time.Now().Add(-streamFlushMaxDelay - time.Millisecond)
+
+	if err := writer.writeSSE(`{"choices":[]}`); err != nil {
+		t.Fatalf("late frame: %v", err)
+	}
+
+	if counter.flushes <= firstFlushes {
+		t.Errorf("滞留超过 %s 的帧必须下发: flushes=%d want >%d",
+			streamFlushMaxDelay, counter.flushes, firstFlushes)
 	}
 }

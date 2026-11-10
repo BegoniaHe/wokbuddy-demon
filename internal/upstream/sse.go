@@ -1090,10 +1090,12 @@ type streamWriter struct {
 	// 上游持续发 data 行且不发空行时会无限累积（单行上限只约束一行）。
 	dataBytes int
 
-	// dirtyBytes 自上次 Flush 起累计写出的字节数与写次数：用于合并小帧
-	// （issue #482）。首帧立即 Flush 保 TTFT，之后累计到 streamFlushBytes 才下发。
+	// dirtyBytes / lastFlush 分别记录自上次 Flush 起累计写出的字节数与 Flush 时刻，
+	// 用于合并小帧（issue #482）：首帧立即 Flush 保 TTFT，之后攒到 streamFlushBytes
+	// 或滞留超过 streamFlushMaxDelay 才下发，兼顾系统调用与中间帧实时性。
 	dirtyBytes int
 	writes     int
+	lastFlush  time.Time
 
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
@@ -1191,12 +1193,18 @@ func (s *streamWriter) writeSegments(prefix, payload, suffix string, force bool)
 	return nil
 }
 
-// streamFlushBytes 逐帧 Flush 的合并阈值（issue #482）：写出字节累计到该值才主动
-// Flush，让底层 bufio 一次下发多个小帧，长回答下把每帧一次系统调用压到每 2KB 一次。
-// 首帧与末尾收尾仍立即 Flush（TTFT 与收尾时延不变）。
+// streamFlushBytes 逐帧 Flush 的字节合并阈值（issue #482）：写出字节累计到该值
+// 才主动 Flush，让底层 bufio 一次下发多个小帧，长回答下把每帧一次系统调用压到
+// 每 2KB 一次。首帧与末尾收尾仍立即 Flush（TTFT 与收尾时延不变）。
 const streamFlushBytes = 2 << 10
 
-// afterWrite 记账本次写出的字节并按阈值决定是否 Flush。
+// streamFlushMaxDelay 缓冲帧的最长滞留时间：距上次 Flush 超过该时长，即使字节数
+// 没到 streamFlushBytes 也强制下发。逐 token 慢速流每帧很小，若只按字节合并，
+// 中间帧会一直卡在 net/http 的写缓冲里直到 finish() 才吐出（短回答退化成
+// 「首帧 + 结尾一次性」）；密集突发帧仍按字节合并，系统调用收益不变。
+const streamFlushMaxDelay = 100 * time.Millisecond
+
+// afterWrite 记账本次写出的字节并按「字节阈值 / 滞留时长 / force」决定是否 Flush。
 // force（控制帧/收尾）与首帧无条件 Flush。
 func (s *streamWriter) afterWrite(n int, force bool) {
 	s.writes++
@@ -1206,12 +1214,12 @@ func (s *streamWriter) afterWrite(n int, force bool) {
 		return
 	}
 
-	if !force && s.writes > 1 && s.dirtyBytes < streamFlushBytes {
+	if !force && s.writes > 1 && s.dirtyBytes < streamFlushBytes &&
+		time.Since(s.lastFlush) < streamFlushMaxDelay {
 		return
 	}
 
-	s.fl.Flush()
-	s.dirtyBytes = 0
+	s.flushNow()
 }
 
 // setWriteDeadline 设置/清空底层连接的写截止；writeTimeout<=0 时不设置。
@@ -1812,6 +1820,7 @@ func (s *streamWriter) flushNow() {
 
 	s.fl.Flush()
 	s.dirtyBytes = 0
+	s.lastFlush = time.Now()
 }
 
 // finish 收尾：标记修复尾部回吐 + 空流兜底 error 帧 + 保证恰好一个 [DONE]。
