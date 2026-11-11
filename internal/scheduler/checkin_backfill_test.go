@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,4 +199,46 @@ func TestCheckinNonTransientSkipsBackfill(t *testing.T) {
 	if got := calls.Load(); got != 1 {
 		t.Errorf("非瞬时错误不应补签，签到调用=%d want 1", got)
 	}
+}
+
+// TestCheckinBackfillWorkerStartConcurrentWithEnqueue 钉住生产路径的并发安全：
+// main.go 的 go sch.Run(ctx) 启动 worker 与面板手动签到任务的入队可能并发。
+// backfillCh 必须在 New 构造期创建、worker 启动路径只置原子哨兵，不能再对字段
+// 赋值——否则启动写与入队读形成 data race（-race 必报）。空账号池 + 不存在的
+// uid 保证 worker 即便消费到该批也直接跳过，不触网上游、不留悬挂 goroutine。
+func TestCheckinBackfillWorkerStartConcurrentWithEnqueue(t *testing.T) {
+	t.Parallel()
+
+	scheduler := New(&Config{Pool: pool.New("")})
+	scheduler.backfillDelays = []time.Duration{time.Millisecond}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	t.Cleanup(func() {
+		cancel()
+		scheduler.backfillWG.Wait()
+	})
+
+	start := make(chan struct{})
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+		scheduler.startBackfillWorker(ctx)
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		<-start
+		scheduler.enqueueCheckinBackfill([]checkinBackfillTarget{{uid: "ghost"}})
+	}()
+
+	close(start)
+	wg.Wait()
 }

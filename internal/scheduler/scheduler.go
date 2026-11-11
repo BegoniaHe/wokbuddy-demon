@@ -141,8 +141,12 @@ type Scheduler struct {
 	// backfillDelays 签到瞬时失败后的分钟级补签窗口（issue #501）；空 = 默认
 	// 10/40 分钟。仅测试注入更短窗口。
 	backfillDelays []time.Duration
-	// backfillCh 补签任务队列（Run 启动 worker 时创建；nil = 无 worker，不排补签）。
+	// backfillCh 补签任务队列，构造期一次性创建后只读：Run 的 worker 启动与面板
+	// 任务的入队可能并发，若由 worker 启动路径赋值会与入队读形成 data race。
 	backfillCh chan []checkinBackfillTarget
+	// backfillWorkerStarted worker 是否已启动（原子）：未启动时不排补签——只有 Run
+	// 在跑的部署才需要后台补签，也让不调 Run 的测试不产生悬挂 goroutine。
+	backfillWorkerStarted atomic.Bool
 	// backfillWG 补签 worker 计数：退出时等待，测试（goleak）据此确认无泄漏。
 	backfillWG sync.WaitGroup
 }
@@ -184,6 +188,7 @@ func New(cfg *Config) *Scheduler {
 		rearmSchedule:  make(chan struct{}, 1),
 		rearmBalance:   make(chan struct{}, 1),
 		rearmTaskSweep: make(chan struct{}, 1),
+		backfillCh:     make(chan []checkinBackfillTarget, 1),
 	}
 }
 
@@ -823,10 +828,11 @@ func (s *Scheduler) checkinBackfillDelaysOrDefault() []time.Duration {
 }
 
 // startBackfillWorker 启动补签 worker（Run 与测试共用）：单 goroutine 随调度器生命周期
-// 存活，ctx 取消即退。worker 未启动（backfillCh 为 nil）时不排补签——只有 Run 在跑的
-// 部署才需要后台补签，也让不调 Run 的测试不产生悬挂 goroutine。
+// 存活，ctx 取消即退。worker 未启动（backfillWorkerStarted 为 false）时不排补签——
+// 只有 Run 在跑的部署才需要后台补签，也让不调 Run 的测试不产生悬挂 goroutine。
+// backfillCh 在 New 构造期已创建，此处只读，避免与并发入队形成 data race。
 func (s *Scheduler) startBackfillWorker(ctx context.Context) {
-	s.backfillCh = make(chan []checkinBackfillTarget, 1)
+	s.backfillWorkerStarted.Store(true)
 
 	s.backfillWG.Go(func() {
 		for {
@@ -847,7 +853,7 @@ func (s *Scheduler) startBackfillWorker(ctx context.Context) {
 // enqueueCheckinBackfill 把瞬时失败账号交给 worker（不阻塞 checkinAll 返回——spreadRunning
 // 要等它返回才清）。队列满则丢弃这一批：下一轮排程还会重新签到，阻塞更糟。
 func (s *Scheduler) enqueueCheckinBackfill(targets []checkinBackfillTarget) {
-	if len(targets) == 0 || s.backfillCh == nil {
+	if len(targets) == 0 || !s.backfillWorkerStarted.Load() {
 		return
 	}
 
