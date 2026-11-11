@@ -59,6 +59,7 @@ var (
 	errParseOptionalDurationFailed      = errors.New("parseOptionalDuration failed")
 	errNormalizeUpstreamRotateFailed    = errors.New("normalizeUpstreamRotate failed")
 	errNormalizeUpstreamKeepaliveFailed = errors.New("normalizeUpstreamKeepalive failed")
+	errNormalizeUpstreamTTFBKeepalive   = errors.New("normalizeUpstreamTTFBKeepalive failed")
 	errNormalizeServerDurationFailed    = errors.New("normalizeServerDuration failed")
 	errNormalizeCheckinDelayFailed      = errors.New("normalizeCheckinDelay failed")
 	errNormalizeKeepaliveWindowFailed   = errors.New("normalizeKeepaliveWindow failed")
@@ -302,6 +303,10 @@ type Config struct {
 		// KeepaliveInterval 入站 SSE 主动心跳间隔（issue #54）：上游静默超过该时长
 		// 时向客户端写 ": keepalive" 注释帧，防反代空闲超时断流。"0"/空 = 关闭。
 		KeepaliveInterval string `json:"keepalive_interval"`
+		// TTFBKeepaliveInterval 首帧等待期注释帧间隔（issue #500）：上游第一帧到达前
+		// 的否决窗口内按该间隔写 ": keepalive"，覆盖客户端零字节干等的 TTFB 空窗。
+		// 空 = 默认 1500ms；"0" = 关闭（逐字节保持旧行为）。
+		TTFBKeepaliveInterval string `json:"ttfb_keepalive_interval"`
 		// ModelTimeouts 按模型覆盖聊天首字节/流中空闲超时（issue #58）：
 		// {"cn:glm-5.2": {"header": "300s", "idle": "600s"}}。键可带 realm 前缀，
 		// 未命中回落全局 header_timeout_seconds / idle_timeout_seconds。
@@ -532,6 +537,8 @@ type Config struct {
 	RotateBudgetDur time.Duration `json:"-"`
 	// KeepaliveIntervalDur 解析后的入站 SSE 心跳间隔（issue #54）；0 = 关闭。
 	KeepaliveIntervalDur time.Duration `json:"-"`
+	// TTFBKeepaliveIntervalDur 解析后的首帧等待期注释帧间隔（issue #500）；0 = 关闭。
+	TTFBKeepaliveIntervalDur time.Duration `json:"-"`
 }
 
 // LimitRule 每日护栏的一组取值（cn/global 覆盖用）。
@@ -1882,6 +1889,11 @@ func (c *Config) normalizeUpstreamDefaults() {
 		c.Upstream.KeepaliveInterval = "0"
 	}
 
+	// 首帧等待期注释帧（issue #500）默认开启：空串按 1500ms，显式 "0" 才关闭。
+	if c.Upstream.TTFBKeepaliveInterval == "" {
+		c.Upstream.TTFBKeepaliveInterval = "1500ms"
+	}
+
 	if c.Upstream.HeaderOrder == nil {
 		headerOrder := true
 		c.Upstream.HeaderOrder = &headerOrder
@@ -1935,6 +1947,10 @@ func (c *Config) normalizeDurations() error {
 	}
 
 	if err := c.normalizeUpstreamKeepalive(); err != nil {
+		return err
+	}
+
+	if err := c.normalizeUpstreamTTFBKeepalive(); err != nil {
 		return err
 	}
 
@@ -2045,6 +2061,26 @@ func (c *Config) normalizeUpstreamKeepalive() error {
 	}
 
 	c.KeepaliveIntervalDur = duration
+
+	return nil
+}
+
+// normalizeUpstreamTTFBKeepalive 解析首帧等待期注释帧间隔（issue #500）：空 = 1500ms
+// （默认开启）；"0" = 关闭；负时长无意义 fail fast。
+func (c *Config) normalizeUpstreamTTFBKeepalive() error {
+	raw := c.Upstream.TTFBKeepaliveInterval
+	if raw == "" {
+		raw = "1500ms"
+	}
+
+	duration, err := normalizeConfigDuration(
+		raw, "upstream.ttfb_keepalive_interval", errNormalizeUpstreamTTFBKeepalive,
+	)
+	if err != nil {
+		return err
+	}
+
+	c.TTFBKeepaliveIntervalDur = duration
 
 	return nil
 }

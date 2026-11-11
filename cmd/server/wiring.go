@@ -316,6 +316,8 @@ func buildHandler(handlerDeps2 *handlerDeps) *server.Handler {
 		RotateStatuses: rotateStatusSet(handlerDeps2.cfg.Upstream.RotateStatusCodes),
 		// 入站 SSE 心跳（issue #54）：0 = 关闭；改后需重启。
 		KeepaliveInterval: handlerDeps2.cfg.KeepaliveIntervalDur,
+		// 首帧等待期注释帧（issue #500）：默认 1500ms；改后需重启。
+		TTFBKeepaliveInterval: handlerDeps2.cfg.TTFBKeepaliveIntervalDur,
 		// CORS 允许源（issue #91）：空 = 关闭。
 		CORSOrigins: handlerDeps2.cfg.Server.CORSOrigins,
 		// 可信反代网段：仅当 TCP 对端命中时才采信转发头。

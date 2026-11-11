@@ -97,6 +97,9 @@ type Config struct {
 	// KeepaliveInterval 入站 SSE 主动心跳间隔（config upstream.keepalive_interval，
 	// issue #54）；0 = 关闭（保持逐字节行为）。
 	KeepaliveInterval time.Duration
+	// TTFBKeepaliveInterval 首帧等待期注释帧间隔（config upstream.ttfb_keepalive_interval，
+	// issue #500）；0 = 关闭（保持逐字节行为）。
+	TTFBKeepaliveInterval time.Duration
 
 	// Notifier webhook 告警出口（可选；nil = 关闭）。发送失败不影响主路径。
 	Notifier notify.Sender
@@ -3129,8 +3132,9 @@ func (f *chatFlow) handleStreamSuccess(
 	ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int,
 ) rotationAction {
 	// 首帧否决窗口（issue #244）：在写出任何字节前预览首段，error/顶层业务码/零输出
-	// 都还能换号或关闭思考重发，不再出现「200 + error 帧」。
-	probe := upstream.ProbeStream(rc)
+	// 都还能换号或关闭思考重发，不再出现「200 + error 帧」。等待期按 TTFB 间隔补
+	// SSE 注释帧（issue #500），见 probeWithHeartbeat。
+	probe := f.probeWithHeartbeat(rc)
 	// 预览行缓冲来自全局池：必须在流结束后归还——Close 时点太早，见
 	// upstream.StreamProbe.Release。defer 与返回值顺序无关，veto/正常/错误路径都覆盖。
 	defer probe.Release()
@@ -3347,6 +3351,20 @@ func (f *chatFlow) handlePreStreamErrorFrame(
 	f.rotateReason = kind.String()
 
 	return rotContinue
+}
+
+// probeWithHeartbeat 在首帧等待期补 SSE 注释帧并预览首段（issue #500）。
+// 首帧否决窗口为了能静默换号而一个字节都不写，客户端从建连起零字节干等到 TTFB；
+// 大上下文把这个空窗拉到秒级。这里按 TTFB 间隔写注释帧，首帧一到立即 join 心跳
+// 协程——注释帧与紧随其后的真实帧因此不会交错（串行化靠 join，不需要写锁）。
+func (f *chatFlow) probeWithHeartbeat(rc io.ReadCloser) *upstream.StreamProbe {
+	stopHeartbeat := startFirstByteHeartbeat(f.out, f.h.cfg.TTFBKeepaliveInterval)
+
+	probe := upstream.ProbeStream(rc)
+
+	stopHeartbeat()
+
+	return probe
 }
 
 // probeVeto 首帧否决窗口的处置分派：命中即关闭上游 body 并给出轮转动作。
@@ -4840,23 +4858,26 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 // 滑过。抖动复用 backoff.go jitterDur（单一来源）。
 const wafCooldownBase = 60 * time.Second
 
+// openAIErrorEnvelope 构造 OpenAI 错误信封（hint 为空时省略 gateway_hint 字段）。
+// JSON 错误响应与已提交 SSE 流里的 error 帧共用同一形状（issue #500）。
+func openAIErrorEnvelope(code, msg, hint string) map[string]any {
+	errorObj := map[string]any{
+		"message": msg,
+		"type":    "api_error",
+		"code":    code,
+	}
+	if hint != "" {
+		errorObj["gateway_hint"] = hint
+	}
+
+	return map[string]any{"error": errorObj}
+}
+
 // writeOpenAIErrorHint 同 writeOpenAIError，另在 error 对象上附加
 // error.gateway_hint（hint 为空串时不带字段——未覆盖形态不编造）。
 // message 仍是上游原文透传（hint 只做并列补充，绝不替换/包装 message）。
 func writeOpenAIErrorHint(w http.ResponseWriter, status int, code, msg, hint string) {
-	if hint == "" {
-		writeOpenAIError(w, status, code, msg)
-		return
-	}
-
-	writeJSON(w, status, map[string]any{
-		"error": map[string]any{
-			"message":      msg,
-			"type":         "api_error",
-			"code":         code,
-			"gateway_hint": hint,
-		},
-	})
+	writeJSON(w, status, openAIErrorEnvelope(code, msg, hint))
 }
 
 // hintContext 组装 chatCompletions 的 gateway_hint 判定上下文：请求裸模型名 +

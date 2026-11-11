@@ -165,6 +165,15 @@ docker compose up -d --build
 
 旧 `schema: 1` profile 会被拒绝启动。用 `reverse-workbuddy` 技能从同一份官方 Win32 分发包重新生成 cn / global 两份 profile，再启动即可；生成过程与校验规则见 `.agents/skills/reverse-workbuddy/references/client-profile.md`。仓库不内置任何版本 / commit / releaseDate / 指纹兜底字面量。
 
+## 🌊 流式等待（`upstream.keepalive_interval` / `upstream.ttfb_keepalive_interval`）
+
+网关有两条 SSE 心跳口径，都只写注释帧（`: keepalive`，客户端按 SSE 规范忽略），不改任何真实帧；都在「配置」页「上游与高级」里，**改动需重启**：
+
+- `upstream.keepalive_interval`（默认 `0` = 关闭）：上游静默超过该时长后向客户端写注释帧，防止反代 / Cloudflare 把长时间无帧的合法流当空闲连接切断。
+- `upstream.ttfb_keepalive_interval`（默认 `1500ms`）：**首帧等待期**专用间隔。网关为了「首帧即错误时能静默换号」，在上游第一帧到达前不写任何内容；大上下文下这段空窗可达秒级，客户端会按空闲超时断开。开启后按该间隔补注释帧，首帧一到立即停手（正常流不多写）。设为 `0` 关闭，回落逐字节旧行为。
+
+若等首帧期间已经写出过注释帧（响应头已提交）而轮转全部失败，网关降级为 `200` + SSE error 帧 + `[DONE]`，不会把 JSON 错误塞进已提交的流里；未提交时仍是原来的 JSON 错误码。
+
 ## 🐾 适合谁
 
 - 手上有多个 CodeBuddy 账号，但不想每天挨个打卡；
