@@ -159,7 +159,7 @@ func (c *Client) retryDelay() time.Duration {
 // 否则会造成漏签（issue #250）。
 var billingProcessingMarkers = []string{"请求处理中", "processing"}
 
-// isTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
+// IsTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
 // 上游 5xx（ErrServer，实测偶发 "code 10000 / API request failed with status
 // code: 500"）、网络层错误，以及 429「请求处理中」这类瞬时状态。其余业务错误
 // （已签到/参数错/余额耗尽）与本地确定性错误不重试。
@@ -170,7 +170,7 @@ var billingProcessingMarkers = []string{"请求处理中", "processing"}
 //
 // 非 *Error 的错误只放行明确的传输层错误（*url.Error / net.Error）；解码失败、
 // 参数校验等本地确定性错误一律不重试。
-func isTransientBillingErr(err error) bool {
+func IsTransientBillingErr(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -203,7 +203,7 @@ func isTransientBillingErr(err error) bool {
 // ctx 传入调用方的请求/任务上下文：等待被取消时立即返回 ctx.Err()，不再补打上游。
 func (c *Client) retryBillingTransient(ctx context.Context, fn func() error) error {
 	err := fn()
-	if err == nil || !isTransientBillingErr(err) {
+	if err == nil || !IsTransientBillingErr(err) {
 		return err
 	}
 
@@ -213,7 +213,7 @@ func (c *Client) retryBillingTransient(ctx context.Context, fn func() error) err
 			return ctx.Err()
 		}
 
-		if err = fn(); err == nil || !isTransientBillingErr(err) {
+		if err = fn(); err == nil || !IsTransientBillingErr(err) {
 			return err
 		}
 	}
