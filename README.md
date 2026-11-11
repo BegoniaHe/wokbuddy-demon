@@ -167,7 +167,7 @@ docker compose up -d --build
 
 ## 🌊 流式等待（`upstream.keepalive_interval` / `upstream.ttfb_keepalive_interval`）
 
-网关有两条 SSE 心跳口径，都只写注释帧（`: keepalive`，客户端按 SSE 规范忽略），不改任何真实帧；都在「配置」页「上游与高级」里，**改动需重启**：
+网关有两条 SSE 心跳口径，都只写注释帧（`: keepalive`，客户端按 SSE 规范忽略），不改任何真实帧；两项都是 `config.json` 的 `upstream` 段配置项（面板配置页未提供输入框），**改动需重启**：
 
 - `upstream.keepalive_interval`（默认 `0` = 关闭）：上游静默超过该时长后向客户端写注释帧，防止反代 / Cloudflare 把长时间无帧的合法流当空闲连接切断。
 - `upstream.ttfb_keepalive_interval`（默认 `1500ms`）：**首帧等待期**专用间隔。网关为了「首帧即错误时能静默换号」，在上游第一帧到达前不写任何内容；大上下文下这段空窗可达秒级，客户端会按空闲超时断开。开启后按该间隔补注释帧，首帧一到立即停手（正常流不多写）。设为 `0` 关闭，回落逐字节旧行为。
