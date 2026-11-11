@@ -1510,8 +1510,6 @@ func TestModelsPromoFields(t *testing.T) {
 	assertNoPromo(t, byID["cn:promo-none"])
 }
 
-// modelEntriesByID 复用 videos_test.go 的同名辅助（/v1/models 响应按 id 索引）。
-
 // assertPromoFree 断言有折扣系数的优惠：factor=0（限时免费）、折扣价原文与标签都
 // 透出，credits 仍保留牌价。
 func assertPromoFree(t *testing.T, entry map[string]any) {
