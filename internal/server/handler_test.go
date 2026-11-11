@@ -1044,7 +1044,6 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	}
 }
 
-// TestChatStickySuccessKeepsBinding 粘性号直接成功 → 绑定不变（仍为该号）。
 // TestChatRequestLevelErrorKeepsStickyBinding 请求级错误与账号无关，解绑只会让客户端
 // 重试落到别的号、上游前缀缓存全量 miss（issue #502）。流式（首帧否决入口）与非流式
 // 两条入口都必须保住绑定，且仍然释放本次在途租约。
@@ -1136,6 +1135,7 @@ func TestChatAccountLevelErrorUnbindsStickyBinding(t *testing.T) {
 	}
 }
 
+// TestChatStickySuccessKeepsBinding 粘性号直接成功 → 绑定不变（仍为该号）。
 func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	t.Parallel()
 
