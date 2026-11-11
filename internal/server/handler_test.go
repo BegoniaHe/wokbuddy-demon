@@ -1045,6 +1045,97 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 }
 
 // TestChatStickySuccessKeepsBinding 粘性号直接成功 → 绑定不变（仍为该号）。
+// TestChatRequestLevelErrorKeepsStickyBinding 请求级错误与账号无关，解绑只会让客户端
+// 重试落到别的号、上游前缀缓存全量 miss（issue #502）。流式（首帧否决入口）与非流式
+// 两条入口都必须保住绑定，且仍然释放本次在途租约。
+func TestChatRequestLevelErrorKeepsStickyBinding(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		stream   bool
+		status   int
+		response string
+	}{
+		{
+			name:     "nonstream bad_params",
+			status:   http.StatusBadRequest,
+			response: `{"code":11101,"msg":"Unmarshal chat params failed"}`,
+		},
+		{
+			name:     "stream bad_params",
+			stream:   true,
+			status:   http.StatusOK,
+			response: "data: {\"error\":{\"code\":\"11101\",\"message\":\"Unmarshal chat params failed\"}}\n\n",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			bindStore2 := newBindStore()
+			sess := session.New(session.Config{
+				TTL:       time.Minute,
+				Store:     bindStore2,
+				Available: func() []string { return []string{"only"} },
+			})
+			state := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+			up := newFakeUpstream(t, func(string) (int, string, bool) {
+				return testCase.status, testCase.response, testCase.stream
+			})
+			handler := NewHandler(&Config{Pool: state, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+			sess.Bind("conv-1", "only")
+
+			body := `{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`
+			if testCase.stream {
+				body = `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`
+			}
+
+			rec := postChat(t, handler, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code=%d body=%s want 400 bad_params", rec.Code, rec.Body)
+			}
+
+			if uid, ok := bindStore2.lastUID("conv-1"); !ok || uid != "only" {
+				t.Errorf("请求级错误必须保留粘性绑定，got uid=%s ok=%v (delCnt=%d)", uid, ok, bindStore2.delCnt)
+			}
+
+			// 请求结束后名额必须已归还：能再次占用成功即证明在途租约已释放。
+			if !state.Acquire("only") {
+				t.Error("请求级错误后在途租约未释放")
+			}
+
+			state.Release("only")
+		})
+	}
+}
+
+// TestChatAccountLevelErrorUnbindsStickyBinding 账号级故障（429 冷却）该换号：绑定
+// 必须解掉，与请求级错误的分流相反（issue #502 的反向保护）。
+func TestChatAccountLevelErrorUnbindsStickyBinding(t *testing.T) {
+	t.Parallel()
+
+	bindStore2 := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     bindStore2,
+		Available: func() []string { return []string{"only"} },
+	})
+	state := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusTooManyRequests, `{"code":"6004","msg":"rate limited"}`, false
+	})
+	handler := NewHandler(&Config{Pool: state, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-1", "only")
+
+	postChat(t, handler, `{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`)
+
+	if _, ok := bindStore2.lastUID("conv-1"); ok {
+		t.Error("账号级 429 必须解绑会话粘性（该换号）")
+	}
+}
+
 func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	t.Parallel()
 
