@@ -1474,6 +1474,93 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+// TestModelsPromoFields 钉住 /v1/models 的限时优惠透出（issue #499）：
+// promo_factor 用非 nil 判定（0 = 限时免费，最该被客户端看到），只有 badge 的
+// 优惠透出 promo_label，无优惠时三个键都不出现；credits 仍透出牌价原文。
+func TestModelsPromoFields(t *testing.T) {
+	t.Parallel()
+
+	upstreamClient := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[` +
+			`{"id":"promo-free","credits":"x0.29"},` +
+			`{"id":"promo-badge","credits":"x0.79"},` +
+			`{"id":"promo-none","credits":"x0.50"}],` +
+			`"modelPromotions":[` +
+			`{"enabled":true,"priority":100,"modelIds":["promo-free"],` +
+			`"badge":{"label":"限时免费"},"discount":{"discountedCredits":"0x","factor":0}},` +
+			`{"enabled":true,"priority":50,"modelIds":["promo-badge"],` +
+			`"badge":{"label":"错峰使用"},"hover":{"textZh":"23:00-07:50 五折"}}]}}`, false
+	})
+	handler := NewHandler(&Config{
+		Pool:        testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:    upstreamClient,
+		modelsCache: &modelsCache{},
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	byID := modelEntriesByID(t, rec.Body.Bytes())
+
+	assertPromoFree(t, byID["cn:promo-free"])
+	assertPromoBadgeOnly(t, byID["cn:promo-badge"])
+	assertNoPromo(t, byID["cn:promo-none"])
+}
+
+// modelEntriesByID 复用 videos_test.go 的同名辅助（/v1/models 响应按 id 索引）。
+
+// assertPromoFree 断言有折扣系数的优惠：factor=0（限时免费）、折扣价原文与标签都
+// 透出，credits 仍保留牌价。
+func assertPromoFree(t *testing.T, entry map[string]any) {
+	t.Helper()
+
+	if factor, ok := entry["promo_factor"].(float64); !ok || factor != 0 {
+		t.Errorf("promo-free promo_factor=%#v want 0（限时免费必须可见）", entry["promo_factor"])
+	}
+
+	if entry["promo_credits"] != "0x" {
+		t.Errorf("promo-free promo_credits=%v want 0x", entry["promo_credits"])
+	}
+
+	if entry["promo_label"] != "限时免费" {
+		t.Errorf("promo-free promo_label=%v want 限时免费", entry["promo_label"])
+	}
+
+	if entry["credits"] != "x0.29" {
+		t.Errorf("promo-free credits=%v want 牌价 x0.29", entry["credits"])
+	}
+}
+
+// assertPromoBadgeOnly 断言只有标签的优惠：promo_label 照常透出，没有 factor 就
+// 不写 promo_factor / promo_credits（不编造折扣系数）。
+func assertPromoBadgeOnly(t *testing.T, entry map[string]any) {
+	t.Helper()
+
+	if entry["promo_label"] != "错峰使用" {
+		t.Errorf("promo-badge promo_label=%v want 错峰使用", entry["promo_label"])
+	}
+
+	for _, key := range []string{"promo_factor", "promo_credits"} {
+		if value, ok := entry[key]; ok {
+			t.Errorf("promo-badge 无机器可读折扣，不应写 %s: %v", key, value)
+		}
+	}
+}
+
+// assertNoPromo 断言无优惠：三个 promo 键一个都不出现。
+func assertNoPromo(t *testing.T, entry map[string]any) {
+	t.Helper()
+
+	for _, key := range []string{"promo_factor", "promo_credits", "promo_label"} {
+		if value, ok := entry[key]; ok {
+			t.Errorf("promo-none 无优惠，不应写 %s: %v", key, value)
+		}
+	}
+}
+
 func TestModelsDynamic(t *testing.T) {
 	t.Parallel()
 

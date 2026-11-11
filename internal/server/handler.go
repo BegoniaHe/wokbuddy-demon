@@ -911,8 +911,8 @@ func fmtCreditsPrefix(raw string) string {
 
 // applyModelInfoFields 把上游模型对象全字段（ModelInfo）按「空值省略」写出规则
 // 合入 /v1/models 条目：name/description/credits/tags/vendor/能力旗标/
-// max_allowed_size/reasoning_effort/reasoning_summary。CN 动态分支与 global
-// 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
+// max_allowed_size/reasoning_effort/reasoning_summary/限时优惠（promo_*）。CN
+// 动态分支与 global 探测命中分支共用（两域模型对象同构），保证输出字段集一致。
 // 不覆盖 id/object/created/owned_by 及调用方先前写好的基础字段；上游未下发的
 // 字段（零值）整体省略——不编造。
 func applyModelInfoFields(entry map[string]any, modelInfo *upstream.ModelInfo) map[string]any {
@@ -949,6 +949,10 @@ func applyModelInfoFields(entry map[string]any, modelInfo *upstream.ModelInfo) m
 		entry["tier"] = modelInfo.Tier
 	}
 
+	// 当前生效的限时优惠（issue #499）：口径与面板 /panel/api/models 一致，
+	// 见 applyModelInfoPromo。
+	applyModelInfoPromo(entry, modelInfo)
+
 	// 视频生成能力（issue #467）：OpenAI 形状没有视频字段，用 capabilities 数组
 	// 透出 text-to-video / image-to-video，客户端可据此区分对话模型与视频模型。
 	if modelInfo.Capability != "" {
@@ -958,6 +962,21 @@ func applyModelInfoFields(entry map[string]any, modelInfo *upstream.ModelInfo) m
 	applyModelInfoCapabilities(entry, modelInfo)
 
 	return entry
+}
+
+// applyModelInfoPromo 把当前生效的限时优惠按「空值省略」写入 /v1/models 条目：
+// credits 仍是牌价原文，PromoFactor 用**非 nil** 判定——0 正是「限时免费」最该
+// 被客户端看到的取值；只有 badge 没有折扣系数的形态只透出标签。口径与面板
+// /panel/api/models 一致（两处字段名与语义必须同源）。
+func applyModelInfoPromo(entry map[string]any, modelInfo *upstream.ModelInfo) {
+	if modelInfo.PromoFactor != nil {
+		entry["promo_factor"] = *modelInfo.PromoFactor
+		entry["promo_credits"] = modelInfo.PromoCredits
+	}
+
+	if modelInfo.PromoLabel != "" {
+		entry["promo_label"] = modelInfo.PromoLabel
+	}
 }
 
 // modelDescription 拼接积分倍率前缀与描述文本。倍率前缀：从 "x0.05 credits" /
