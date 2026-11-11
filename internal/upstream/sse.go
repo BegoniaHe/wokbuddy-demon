@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"net/http"
 	"slices"
@@ -1479,19 +1480,121 @@ func (s *streamWriter) paceFrame() {
 	}
 }
 
+// splitConcatenatedJSON 把「多个首尾相接的 JSON 对象/数组」拆成独立段（issue #498）。
+// 上游偶发把一个事件的 data 行写成 `{a} {b}`；SSE 规范里 data 值是一个整体，客户端
+// 只能当单个 JSON 解析，于是必然在第二段上报错、整轮作废。
+//
+// 判定规则：按字节扫描，跟踪字符串状态与 {} / [] 深度（字符串内的花括号与转义引号
+// 不算结构）；只有「恰好 2 段以上、括号配平、且每段 json.Valid」才返回拆分段，否则
+// 返回 nil 交给调用方原样透传——宁可少切，不产出半截对象。
+func splitConcatenatedJSON(payload string) []string {
+	scanner := &jsonSegmentScanner{payload: payload, start: -1}
+
+	for i := range len(payload) {
+		if !scanner.consume(i) {
+			return nil
+		}
+	}
+
+	if scanner.depth != 0 || scanner.inString || len(scanner.segments) < 2 {
+		return nil
+	}
+
+	for _, segment := range scanner.segments {
+		if !json.Valid([]byte(segment)) {
+			return nil
+		}
+	}
+
+	return scanner.segments
+}
+
+// jsonSegmentScanner 拼接 JSON 段的扫描状态：记录当前段的起点与括号/字符串状态。
+type jsonSegmentScanner struct {
+	payload  string
+	segments []string
+	start    int
+	depth    int
+	inString bool
+	escaped  bool
+}
+
+// consume 处理第 i 个字节；返回 false 表示这份载荷不是「纯拼接」，调用方应放弃拆分。
+func (sc *jsonSegmentScanner) consume(i int) bool {
+	char := sc.payload[i]
+
+	if sc.inString {
+		sc.consumeStringByte(char)
+		return true
+	}
+
+	switch char {
+	case ' ', '\t', '\r', '\n':
+		// 段间空白（含多行 data 的换行）不是结构。
+	case '{', '[':
+		if sc.depth == 0 {
+			sc.start = i
+		}
+
+		sc.depth++
+	case '}', ']':
+		return sc.closeSegment(i)
+	case '"':
+		if sc.depth == 0 {
+			return false // 结构外出现字符串：不是纯拼接
+		}
+
+		sc.inString = true
+	default:
+		if sc.depth == 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+// closeSegment 处理一个闭合括号：深度归零时收下当前段；括号不配平即放弃拆分。
+func (sc *jsonSegmentScanner) closeSegment(i int) bool {
+	sc.depth--
+	if sc.depth < 0 {
+		return false
+	}
+
+	if sc.depth == 0 {
+		sc.segments = append(sc.segments, sc.payload[sc.start:i+1])
+	}
+
+	return true
+}
+
+// consumeStringByte 处理字符串内的一个字节：转义符与转义引号不结束字符串。
+func (sc *jsonSegmentScanner) consumeStringByte(char byte) {
+	switch {
+	case sc.escaped:
+		sc.escaped = false
+	case char == '\\':
+		sc.escaped = true
+	case char == '"':
+		sc.inString = false
+	}
+}
+
+// startsLikeJSON 报告载荷是否以 JSON 结构（对象/数组）起始：这类帧解析失败值得一行
+// WARN（纯文本心跳不刷屏）。
+func startsLikeJSON(payload string) bool {
+	trimmed := strings.TrimSpace(payload)
+
+	return strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")
+}
+
 // writeFrame 把 payload 按规范白名单重建后以 data: 帧写出并 flush。
 // 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
 // 降级原样写出，但不计数）。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
 	var obj map[string]any
 	if json.Unmarshal([]byte(payload), &obj) != nil || obj == nil {
-		// 非 JSON 帧或顶层 null（nil map 没有可透传字段，后续写 id 会 panic）：
-		// 原样降级写出，不计数（与修复前一致）。
-		if werr := s.writeSSE(payload); werr != nil {
-			return 0, werr
-		}
-
-		return 0, nil
+		return s.writeUnparsedFrame(payload)
 	}
 	// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
 	// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
@@ -1522,6 +1625,48 @@ func (s *streamWriter) writeFrame(payload string) (int, error) {
 	}
 
 	return 1, nil
+}
+
+// writeUnparsedFrame 处置无法解析成对象的 data 帧：先尝试拆分粘帧（issue #498），
+// 拆不动则原样透传，并给「以 JSON 结构起始」的异常帧留一行 WARN。
+func (s *streamWriter) writeUnparsedFrame(payload string) (int, error) {
+	if segments := splitConcatenatedJSON(payload); segments != nil {
+		log.Printf("WARN: [upstream] sse: data 帧含 %d 个首尾相接的 JSON 对象，已拆分透传 first=%s",
+			len(segments), RedactForLog(segments[0], 120))
+
+		return s.writeSplitFrames(segments)
+	}
+
+	// 以 JSON 结构起始却解析失败：留一行 WARN 便于归因（纯文本心跳不刷屏）。
+	if startsLikeJSON(payload) {
+		log.Printf("WARN: [upstream] sse: data 帧以 JSON 结构起始但解析失败，原样透传 payload=%s",
+			RedactForLog(payload, 200))
+	}
+
+	// 非 JSON 帧或顶层 null（nil map 没有可透传字段，后续写 id 会 panic）：
+	// 原样降级写出，不计数（与修复前一致）。
+	if werr := s.writeSSE(payload); werr != nil {
+		return 0, werr
+	}
+
+	return 0, nil
+}
+
+// writeSplitFrames 复用 writeFrame 逐段透传粘帧拆出的每段，保证与单帧路径完全一致
+// （错误帧透传 / 业务错误帧 / 标记修复 / 白名单）。任一段写失败即中止。
+func (s *streamWriter) writeSplitFrames(segments []string) (int, error) {
+	total := 0
+
+	for _, segment := range segments {
+		n, werr := s.writeFrame(segment)
+		total += n
+
+		if werr != nil {
+			return 0, werr
+		}
+	}
+
+	return total, nil
 }
 
 // emitErrorFrame 写出一个错误帧并计一次有效转发：观察者（账号处置用）拿到的
