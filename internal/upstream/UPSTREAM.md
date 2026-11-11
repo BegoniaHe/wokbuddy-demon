@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `592fb01af53dcaf25cc45ba3496730850b207830`（2026-11-10）。该基线与本仓库无共同祖先，
+  `79ba3d62aabf60563450fe2516feed7afc91881a`（2026-11-11）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -124,6 +124,44 @@ vLLM parser 偶发 + 真机实测（官方 Win32 全树 `think:SUF` 0 命中）�
 其余 6 条按 `skip` 落账：`c5ce29b1` 多文件预览 UI（面板技术栈）、`7028676c` `.gitignore`、
 `24d0b61b` `cache_audit.py`（参考侧脚本），以及 3 条纯 merge（`1aa917d4`/`5702ab65`/
 `cffb0389`）按 `merge-bubble`。后续审计从 `592fb01a` 之后开始。
+
+2026-11-11 续审 `592fb01a..79ba3d62`（22 条非 merge + 3 条纯 merge，共 25 项；官方
+Win32 版本未变，仍是 cn 5.9.3 / global 5.9.4）。6 项 issue、1 项 revisit、18 项 skip：
+
+- **#498**（上游粘帧）：`afb5f224` — 本仓 `sse.go:1486-1498` 在 `json.Unmarshal` 失败时
+  原样透传，全仓无多对象拆分；客户端按 SSE 规范把一份 data 当单个 JSON 解析，第二个对象
+  必致整轮失败且网关侧无日志。
+- **#499**（`/v1/models` 优惠字段）：`b64773e8` — 本仓已解析 `PromoFactor/PromoCredits/
+  PromoLabel`（`client.go:2768-2772`、`3537-3593`）并在面板透出（`panel.go:820-828`），
+  但 `applyModelInfoFields`（`handler.go:918-959`）不写这三个键，CN/global 两域都缺。
+- **#500**（首帧 keepalive）：`8df99ac3` — 本仓首帧否决期间零字节（`handler.go:3131-3143`），
+  而 keepalive 只在 `StreamHint` 内生效（`sse.go:1610-1656`），缺省
+  `upstream.keepalive_interval=0`；`writeOpenAIError`（`handler.go:4826-4838`）也无
+  「响应头已提交」分支。
+- **#501**（签到分钟级补签）：`1adfa520` — 本仓只做批内 2s/4s 两次重试
+  （`report.go:199-219`），失败后 `checkinOne`（`scheduler.go:828-861`）只记一行，缺省排程
+  9/21 点（`config.example.json:37-40`）等于要等约 12 小时。
+- **#502**（请求级错误解绑粘性）：`2b210e92` — `fail()`（`handler.go:2022-2029`）把释放
+  租约与解绑绑在一起，`failFastKind`（`2979-2984`）里的内容拦截 / prompt 超长 / 图片无效 /
+  坏参数都经 `handleRequestLevelError`（`3071-3082`）走 `fail()`；只有
+  `ErrUpstreamOverload` 例外。
+- **#503**（buddyapp `isFirstPage`）：`8818458b` — 本仓 `desktop.go:684` 发字符串 `"1"`，
+  官方 Win32 包按布尔消费（cn 5.9.3 / global 5.9.4 的 `beacon-report-*.js`
+  `resolveIsFirstPage` 判 `typeof isFirstPage === "boolean"`，`im-channels` 为
+  `isFirstPage: nextSeq === "0"`）；上游 `/v2/report` 丢弃该事件属参考 fork 真机样本。
+
+`d7ffe424` 记 `revisit`：参考侧修的是其 responses 写入器重复告警的误报；本仓
+`responsesStreamWriter.toolState`（`responses.go:1806-1815`）在首个分片缺 name 时静默丢弃，
+既无误报也无 WARN，需真机确认上游是否会发无 name 分片。
+
+18 项 `skip` 分四类：① 续写/救援机制的参数与闸门漂移（`910d8517`、`2e30d7d3`、
+`e8df35b6`、`baf9155d`、`92dadae3`、`79ba3d62`）归 #478 落地时一并采纳；② 参考侧面板/
+更新链形态（`9e5c2cda` 目录热重载 + `internal/updater`、`c54c5176`、`4f6adc0e`、
+`a439202a`，以及 `cfac3703` 内嵌 CSS 单选框）；③ 本仓已覆盖或形态不存在（`cfef70da`
+逐行到期聚合本仓 `client.go:4870-4888` / `5062-5104` 已实现、`849d3381` compress 已是
+v1.20.2、`73667400` 无 `internal/proxypool`、`cf2b80f9`/`d011fc84` 是参考侧用例时区修复）；
+④ 纯 merge 与撤销（`65e644eb` 参考 fork 撤销号池分区 → #491 的分区线索撤回，同批保留
+#490 订阅导入与 #492 额度窗口探针；`cf16478d`）。后续审计从 `79ba3d62` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 

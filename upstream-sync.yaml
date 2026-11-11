@@ -14,40 +14,45 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 592fb01af53dcaf25cc45ba3496730850b207830
-  audited_at_utc: 2026-11-10T06:01:48Z
+  commit: 79ba3d62aabf60563450fe2516feed7afc91881a
+  audited_at_utc: 2026-11-11T21:54:37Z
   sync_method: audit
   official_baseline:
     cn: 5.9.3.42398134-d4692421 (commit d46924219e79332f49c37ccebf27292f87001b19)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
-    from: 2026-11-08
-    to: 2026-11-10
-    non_merge_commits: 20
+    from: 2026-11-10
+    to: 2026-11-11
+    non_merge_commits: 22
     merge_commits: 3
   dispositions:
-    issue: 17
-    revisit: 0
-    skip: 6
+    issue: 6
+    revisit: 1
+    skip: 18
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/477
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/478
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/479
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/480
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/481
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/482
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/498
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/499
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/500
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/501
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/502
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/503
   note: >-
-    2026-11-10 续审 771c887f..592fb01a（20 条非 merge + 3 条纯 merge；
+    2026-11-11 续审 592fb01a..79ba3d62（22 条非 merge + 3 条纯 merge，共 25 项；
     官方 Win32 版本未变 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，
-    重跑 download_latest --dry-run / download_latest / protocol_sweep 复核）。处置政策
-    本轮扩为「后端上游功能尽量适配」（例外：商业化 / 面板技术栈 / 计费），故 17 项为
-    issue、6 项 skip。功能簇：#477 面板 cockpit 导入（585ae7f2/cd884503，全新部署
-    ENOENT + 形态/expires 归一）；#478 续写/救援机制（6e7fe628、07f8ae03、c2003af1、
-    1037397c、478d2aa8、4bdbd607）；#479 号池治理 + 代理完整适配（592fb01a 订阅导入/
-    号池分区/额度窗口探针、bfdba519 传输层归因）；#480 运维可观测（18a67761 日志落盘
-    导出与劣化滑窗告警、44bc0595 工具调用缺名 WARN；选号策略本仓 strategy.go 已有）；
-    #481 会话粘性（d165e6e1 内容派生键粘账号）；#482 出站修补 + 配置收敛（f987bacc
-    空 text 段/reasoning 镜像、d78131ba 资料接口平铺、89c9b7d9 flush 收敛、877324fe
-    缺省档统一）。保持 skip：c5ce29b1 多文件预览 UI（面板技术栈）、7028676c .gitignore、
-    24d0b61b cache_audit.py，以及 1aa917d4/5702ab65/cffb0389 三条纯 merge（merge-bubble）。
+    重跑 download_latest --dry-run / download_latest 复核，两包均已存在）。6 项 issue、
+    1 项 revisit、18 项 skip。新增 6 个独立缺口：#498 上游粘帧（一个 data 行两个 JSON）
+    未拆分，客户端整轮解析失败；#499 /v1/models 缺 promo_factor/promo_credits/
+    promo_label（面板已有，两域共用 applyModelInfoFields）；#500 首帧否决窗口零字节、
+    keepalive 只在 StreamHint 内生效且 writeOpenAIError 无「已提交」分支；#501 签到瞬时
+    失败只做 2s/4s 批内重试、当天漏签；#502 请求级错误（11151/11115/图片无效/坏参数）
+    仍走 fail() 解绑会话粘性（ErrUpstreamOverload 已例外）；#503 buddyapp_enter_click 的
+    isFirstPage 发字符串 \"1\"，官方包按布尔消费（beacon-report resolveIsFirstPage /
+    im-channels nextSeq === \"0\"）。revisit：d7ffe424 属参考侧 responses 写入器重复告警
+    修复，本仓 toolState 缺 name 静默丢弃、无告警，需真机确认上游是否发无 name 分片。
+    18 项 skip 分四类：续写/救援机制的参数与闸门漂移（910d8517、2e30d7d3、e8df35b6、
+    baf9155d、92dadae3、79ba3d62，均归 #478 落地时一并采纳）；参考侧面板/更新链形态
+    （9e5c2cda 热重载 + updater、c54c5176、4f6adc0e、a439202a、cfac3703 内嵌 CSS 单选框）；
+    本仓已覆盖或形态不存在（cfef70da 逐行到期聚合已实现、849d3381 compress 已是 v1.20.2、
+    73667400 无 proxypool、cf2b80f9/d011fc84 参考侧用例时区修复）；纯 merge 与撤销
+    （65e644eb 参考 fork 撤销号池分区 → #491 分区线索撤回，保留 #490/#492；cf16478d）。
     本轮不改实现；游标推进是独立的 chore(sync) 元数据提交。
