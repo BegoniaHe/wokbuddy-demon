@@ -1044,6 +1044,97 @@ func TestChatStickyFollowsFinalSuccess(t *testing.T) {
 	}
 }
 
+// TestChatRequestLevelErrorKeepsStickyBinding 请求级错误与账号无关，解绑只会让客户端
+// 重试落到别的号、上游前缀缓存全量 miss（issue #502）。流式（首帧否决入口）与非流式
+// 两条入口都必须保住绑定，且仍然释放本次在途租约。
+func TestChatRequestLevelErrorKeepsStickyBinding(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		stream   bool
+		status   int
+		response string
+	}{
+		{
+			name:     "nonstream bad_params",
+			status:   http.StatusBadRequest,
+			response: `{"code":11101,"msg":"Unmarshal chat params failed"}`,
+		},
+		{
+			name:     "stream bad_params",
+			stream:   true,
+			status:   http.StatusOK,
+			response: "data: {\"error\":{\"code\":\"11101\",\"message\":\"Unmarshal chat params failed\"}}\n\n",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			bindStore2 := newBindStore()
+			sess := session.New(session.Config{
+				TTL:       time.Minute,
+				Store:     bindStore2,
+				Available: func() []string { return []string{"only"} },
+			})
+			state := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+			up := newFakeUpstream(t, func(string) (int, string, bool) {
+				return testCase.status, testCase.response, testCase.stream
+			})
+			handler := NewHandler(&Config{Pool: state, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+			sess.Bind("conv-1", "only")
+
+			body := `{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`
+			if testCase.stream {
+				body = `{"model":"glm-5.2","messages":[],"stream":true,"metadata":{"conversation_id":"conv-1"}}`
+			}
+
+			rec := postChat(t, handler, body)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("code=%d body=%s want 400 bad_params", rec.Code, rec.Body)
+			}
+
+			if uid, ok := bindStore2.lastUID("conv-1"); !ok || uid != "only" {
+				t.Errorf("请求级错误必须保留粘性绑定，got uid=%s ok=%v (delCnt=%d)", uid, ok, bindStore2.delCnt)
+			}
+
+			// 请求结束后名额必须已归还：能再次占用成功即证明在途租约已释放。
+			if !state.Acquire("only") {
+				t.Error("请求级错误后在途租约未释放")
+			}
+
+			state.Release("only")
+		})
+	}
+}
+
+// TestChatAccountLevelErrorUnbindsStickyBinding 账号级故障（429 冷却）该换号：绑定
+// 必须解掉，与请求级错误的分流相反（issue #502 的反向保护）。
+func TestChatAccountLevelErrorUnbindsStickyBinding(t *testing.T) {
+	t.Parallel()
+
+	bindStore2 := newBindStore()
+	sess := session.New(session.Config{
+		TTL:       time.Minute,
+		Store:     bindStore2,
+		Available: func() []string { return []string{"only"} },
+	})
+	state := testPoolWith(&auth.Auth{UID: "only", AccessToken: "at-only", ExpiresAt: 9999999999})
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusTooManyRequests, `{"code":"6004","msg":"rate limited"}`, false
+	})
+	handler := NewHandler(&Config{Pool: state, Upstream: up, Session: sess, SoftCooldown: time.Minute})
+	sess.Bind("conv-1", "only")
+
+	postChat(t, handler, `{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`)
+
+	if _, ok := bindStore2.lastUID("conv-1"); ok {
+		t.Error("账号级 429 必须解绑会话粘性（该换号）")
+	}
+}
+
 // TestChatStickySuccessKeepsBinding 粘性号直接成功 → 绑定不变（仍为该号）。
 func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	t.Parallel()
@@ -1471,6 +1562,91 @@ func TestModelsEndpoint(t *testing.T) {
 
 	if !found {
 		t.Error("cn:glm-5.2 missing")
+	}
+}
+
+// TestModelsPromoFields 钉住 /v1/models 的限时优惠透出（issue #499）：
+// promo_factor 用非 nil 判定（0 = 限时免费，最该被客户端看到），只有 badge 的
+// 优惠透出 promo_label，无优惠时三个键都不出现；credits 仍透出牌价原文。
+func TestModelsPromoFields(t *testing.T) {
+	t.Parallel()
+
+	upstreamClient := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[` +
+			`{"id":"promo-free","credits":"x0.29"},` +
+			`{"id":"promo-badge","credits":"x0.79"},` +
+			`{"id":"promo-none","credits":"x0.50"}],` +
+			`"modelPromotions":[` +
+			`{"enabled":true,"priority":100,"modelIds":["promo-free"],` +
+			`"badge":{"label":"限时免费"},"discount":{"discountedCredits":"0x","factor":0}},` +
+			`{"enabled":true,"priority":50,"modelIds":["promo-badge"],` +
+			`"badge":{"label":"错峰使用"},"hover":{"textZh":"23:00-07:50 五折"}}]}}`, false
+	})
+	handler := NewHandler(&Config{
+		Pool:        testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:    upstreamClient,
+		modelsCache: &modelsCache{},
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	byID := modelEntriesByID(t, rec.Body.Bytes())
+
+	assertPromoFree(t, byID["cn:promo-free"])
+	assertPromoBadgeOnly(t, byID["cn:promo-badge"])
+	assertNoPromo(t, byID["cn:promo-none"])
+}
+
+// assertPromoFree 断言有折扣系数的优惠：factor=0（限时免费）、折扣价原文与标签都
+// 透出，credits 仍保留牌价。
+func assertPromoFree(t *testing.T, entry map[string]any) {
+	t.Helper()
+
+	if factor, ok := entry["promo_factor"].(float64); !ok || factor != 0 {
+		t.Errorf("promo-free promo_factor=%#v want 0（限时免费必须可见）", entry["promo_factor"])
+	}
+
+	if entry["promo_credits"] != "0x" {
+		t.Errorf("promo-free promo_credits=%v want 0x", entry["promo_credits"])
+	}
+
+	if entry["promo_label"] != "限时免费" {
+		t.Errorf("promo-free promo_label=%v want 限时免费", entry["promo_label"])
+	}
+
+	if entry["credits"] != "x0.29" {
+		t.Errorf("promo-free credits=%v want 牌价 x0.29", entry["credits"])
+	}
+}
+
+// assertPromoBadgeOnly 断言只有标签的优惠：promo_label 照常透出，没有 factor 就
+// 不写 promo_factor / promo_credits（不编造折扣系数）。
+func assertPromoBadgeOnly(t *testing.T, entry map[string]any) {
+	t.Helper()
+
+	if entry["promo_label"] != "错峰使用" {
+		t.Errorf("promo-badge promo_label=%v want 错峰使用", entry["promo_label"])
+	}
+
+	for _, key := range []string{"promo_factor", "promo_credits"} {
+		if value, ok := entry[key]; ok {
+			t.Errorf("promo-badge 无机器可读折扣，不应写 %s: %v", key, value)
+		}
+	}
+}
+
+// assertNoPromo 断言无优惠：三个 promo 键一个都不出现。
+func assertNoPromo(t *testing.T, entry map[string]any) {
+	t.Helper()
+
+	for _, key := range []string{"promo_factor", "promo_credits", "promo_label"} {
+		if value, ok := entry[key]; ok {
+			t.Errorf("promo-none 无优惠，不应写 %s: %v", key, value)
+		}
 	}
 }
 

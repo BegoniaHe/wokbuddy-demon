@@ -41,11 +41,11 @@ func TestRetryBillingTransientCanceledStops(t *testing.T) {
 func TestRetryBillingTransientDeadlineExceededNotTransient(t *testing.T) {
 	t.Parallel()
 
-	if isTransientBillingErr(context.DeadlineExceeded) {
+	if IsTransientBillingErr(context.DeadlineExceeded) {
 		t.Fatal("context.DeadlineExceeded 不应被判为瞬时错误")
 	}
 
-	if isTransientBillingErr(fmt.Errorf("wrap: %w", context.Canceled)) {
+	if IsTransientBillingErr(fmt.Errorf("wrap: %w", context.Canceled)) {
 		t.Fatal("包装的 context.Canceled 不应被判为瞬时错误")
 	}
 }
@@ -56,7 +56,7 @@ func TestRetryBillingTransientLocalErrorNoRetry(t *testing.T) {
 	t.Parallel()
 
 	localErr := fmt.Errorf("resource summary parse: %w", &json.SyntaxError{Offset: 1})
-	if isTransientBillingErr(localErr) {
+	if IsTransientBillingErr(localErr) {
 		t.Fatal("本地解析错误不应被判为瞬时错误")
 	}
 
@@ -83,7 +83,7 @@ func TestRetryBillingTransientNetworkRetried(t *testing.T) {
 	var calls atomic.Int32
 
 	netErr := &url.Error{Op: "Post", URL: "https://billing.example/v2/report", Err: errBillingConnectionReset}
-	if !isTransientBillingErr(netErr) {
+	if !IsTransientBillingErr(netErr) {
 		t.Fatal("*url.Error 应被判为瞬时错误")
 	}
 

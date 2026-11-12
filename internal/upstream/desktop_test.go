@@ -11,6 +11,48 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
+// TestDesktopBuddyAppSequenceIsFirstPageBool 钉住 buddyapp_enter_click 的字段类型
+// （issue #503）：官方客户端按布尔消费 isFirstPage，上游 /v2/report 的格式校验会
+// 丢弃字符串形态的整条事件，Buddy_App 任务于是永远停在 0/1。其余字段逐字段断言，
+// 保证这次只改类型、不动值。
+func TestDesktopBuddyAppSequenceIsFirstPageBool(t *testing.T) {
+	t.Parallel()
+
+	const buddyID, buddyName = "cb_y5Dy46tPQGGWtueMxXbe", "企鹅教师助手"
+
+	events := DesktopBuddyAppSequence(buddyID, buddyName)
+	if len(events) != 5 {
+		t.Fatalf("事件数=%d want 5（discover→show→enter→auth→bind）", len(events))
+	}
+
+	enter := events[2]
+
+	want := map[string]any{
+		"eventCode":    "buddyapp_enter_click",
+		"mode":         desktopLocal,
+		"buddyId":      buddyID,
+		"buddyName":    buddyName,
+		"elementId":    buddyID,
+		keyElementName: buddyName,
+		"position":     2,
+		"isFirstPage":  true,
+	}
+	if len(enter) != len(want) {
+		t.Errorf("enter_click 字段数=%d want %d: %v", len(enter), len(want), enter)
+	}
+
+	for key, wantVal := range want {
+		if got := enter[key]; got != wantVal {
+			t.Errorf("enter_click[%q]=%#v want %#v", key, got, wantVal)
+		}
+	}
+
+	// 负例锚点：字符串 "1" 是本次修复前的形态，必须是不同取值。
+	if got, ok := enter["isFirstPage"].(bool); !ok || !got {
+		t.Errorf("isFirstPage=%#v want bool true（字符串形态会被上游格式校验丢弃）", enter["isFirstPage"])
+	}
+}
+
 // TestReportDesktopEventFingerprint 断言桌面指纹上报：走 chatBase、UA 为桌面形状、
 // 事件数组自动注入 workbuddy-desktop 公共指纹（覆盖同名业务键）。
 func TestReportDesktopEventFingerprint(t *testing.T) {
