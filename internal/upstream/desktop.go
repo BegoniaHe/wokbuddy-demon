@@ -681,7 +681,7 @@ func DesktopBuddyAppSequence(buddyID, buddyName string) []DesktopEvent {
 		callback("buddyapp_discover_click", nil),
 		callback("buddyapp_show", map[string]any{"elementId": buddyID, keyElementName: buddyName, "position": 2}),
 		callback("buddyapp_enter_click", map[string]any{
-			"elementId": buddyID, keyElementName: buddyName, "position": 2, "isFirstPage": "1",
+			"elementId": buddyID, keyElementName: buddyName, "position": 2, "isFirstPage": true,
 		}),
 		callback("buddyapp_auth_confirm_click", map[string]any{"elementId": buddyID, keyElementName: buddyName}),
 		callback("buddyapp_bindaccount_skip_click", map[string]any{"elementId": buddyID, keyElementName: buddyName}),
