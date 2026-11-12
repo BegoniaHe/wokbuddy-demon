@@ -222,6 +222,13 @@ func TestIsTransientBillingErrProcessing(t *testing.T) {
 		{"429 普通限流", &Error{Kind: ErrSoftRate, Status: 429, Msg: "rate limit"}, false},
 		{"业务错误", &Error{Kind: ErrClient, Status: 400, Msg: "请求处理中"}, false},
 		{"5xx", &Error{Kind: ErrServer, Status: 500}, true},
+		{"500 code 10000", &Error{
+			Kind: ErrServer, Status: 500,
+			Msg: `{"code":10000,"msg":"API request failed with status code: 500"}`,
+		}, true},
+		// 请求级业务拒绝：排进分钟级补签队列只会每天多打几轮注定失败的请求。
+		{"400 参数错", &Error{Kind: ErrBadParams, Status: 400, Msg: "Unmarshal chat params failed"}, false},
+		{"400 企业号不支持", &Error{Kind: ErrClient, Status: 400, Msg: "企业号不支持该操作"}, false},
 		// 传输层错误（*url.Error）重试；io.ErrUnexpectedEOF 这类读取截断属于
 		// 本地确定性失败，按 issue #423 不再重试。
 		{"网络错误", &url.Error{Op: "Post", URL: "https://billing.example", Err: io.ErrUnexpectedEOF}, true},
@@ -232,8 +239,8 @@ func TestIsTransientBillingErrProcessing(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := isTransientBillingErr(testCase.err); got != testCase.want {
-				t.Fatalf("isTransientBillingErr(%v)=%v want %v", testCase.err, got, testCase.want)
+			if got := IsTransientBillingErr(testCase.err); got != testCase.want {
+				t.Fatalf("IsTransientBillingErr(%v)=%v want %v", testCase.err, got, testCase.want)
 			}
 		})
 	}
