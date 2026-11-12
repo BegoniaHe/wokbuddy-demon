@@ -3098,7 +3098,10 @@ func (f *chatFlow) handleRequestLevelError(
 	}
 
 	f.h.applyErrorPolicy(acct.UID, kind, string(respBody), f.realm, f.bareModel, uerr)
-	f.fail(acct.UID)
+	// 请求级错误与账号无关：只释放本次在途租约与预扣，**不**解绑会话粘性
+	// （issue #502）。fail 会解绑，客户端重试于是落到别的号——上游前缀缓存按账号
+	// 隔离，换号就是全量 miss；内容拦截成片时还会逐号轮换，每一跳都从头重算。
+	f.releaseHeld()
 
 	raw := string(respBody)
 	code, fallback := requestLevelErrorCode(kind)
