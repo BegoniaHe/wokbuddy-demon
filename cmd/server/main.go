@@ -1143,7 +1143,8 @@ var restartFieldPaths = []string{
 	"pricing.enabled", "pricing.refresh_minutes", "pricing.exchange_rate",
 	// HTTP client / 出站身份 / 代理在 configureUpstream 一次性注入。
 	"upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds",
-	"upstream.keepalive_interval", "upstream.model_timeouts", "upstream.user_agent",
+	"upstream.keepalive_interval", "upstream.ttfb_keepalive_interval",
+	"upstream.model_timeouts", "upstream.user_agent",
 	"upstream.header_order", "upstream.tls_fingerprint",
 	"upstream.client_version", "upstream.cli_version", "upstream.client_name",
 	"upstream.device_token", "upstream.device_token_file", "upstream.passthrough_ip",

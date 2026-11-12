@@ -94,6 +94,9 @@ type httpResponder struct {
 	// pacer 响应整形器（issue #448；nil = 关闭）。由核心在写出前挂上，只影响
 	// 流式帧的写出节奏，不改任何字节。
 	pacer upstream.ResponsePacer
+	// committed 响应头是否已提交（issue #500）：首帧等待期的注释帧一写出即已提交，
+	// 之后状态码与 JSON 错误都改不了，只能在这条 200 SSE 流里收尾。
+	committed bool
 }
 
 // setStreamPacer 挂响应整形器（issue #448；见 streamPacerSetter）。
@@ -105,7 +108,15 @@ func (r *httpResponder) JSON(status int, body any) {
 }
 
 // Error 写出 OpenAI 错误信封（hint 为空时省略 gateway_hint 字段）。
+// 响应头已提交（首帧等待期写过注释帧，issue #500）时无法再改状态码，降级为
+// 这条 200 SSE 流里的 error 帧 + [DONE]——客户端拿到的仍是可解析的错误，
+// 而不是「200 + 半截流里塞 JSON」。
 func (r *httpResponder) Error(status int, code, msg, hint string) {
+	if r.committed {
+		r.writeErrorFrame(code, msg, hint)
+		return
+	}
+
 	writeOpenAIErrorHint(r.w, status, code, msg, hint)
 }
 
@@ -119,12 +130,112 @@ func (r *httpResponder) Header(name, value string) {
 func (r *httpResponder) Stream(
 	rc io.Reader, hint func(string) string, repair *upstream.MarkupRepair, onErrFrame func(string),
 ) error {
+	r.committed = true
+
 	opts := streamHintOptions(r.keepalive, r.pacer, repair, onErrFrame)
 	if err := upstream.StreamHint(r.w, rc, hint, opts...); err != nil {
 		return fmt.Errorf("stream hint: %w", err)
 	}
 
 	return nil
+}
+
+// setSSEHeaders 补齐 SSE 响应头（issue #500）：首帧等待期的注释帧由本类型自己写，
+// 必须与 upstream.StreamHint 的头逐项对齐，否则内容类型为空、反代会缓冲。
+func (r *httpResponder) setSSEHeaders() {
+	h := r.w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+}
+
+// writeHeartbeat 写一帧 SSE 注释并 flush（issue #500）。返回错误表示客户端已走：
+// 心跳协程据此退出，后续真实帧会拿到同一个写错误。
+func (r *httpResponder) writeHeartbeat() error {
+	r.setSSEHeaders()
+
+	// 先置位：即使写只发出半帧，响应头也已提交，之后的错误只能走 SSE 帧收尾。
+	r.committed = true
+
+	if _, err := io.WriteString(r.w, ": keepalive\n\n"); err != nil {
+		return fmt.Errorf("heartbeat write: %w", err)
+	}
+
+	r.flush()
+
+	return nil
+}
+
+// writeErrorFrame 在已提交的 200 SSE 流里补一帧 error + [DONE]（issue #500）。
+func (r *httpResponder) writeErrorFrame(code, msg, hint string) {
+	r.setSSEHeaders()
+
+	raw, err := json.Marshal(openAIErrorEnvelope(code, msg, hint))
+	if err != nil {
+		return // map 只含 string，编码不会失败；真失败也不能改写已提交的响应头
+	}
+
+	for _, part := range []string{"data: ", string(raw), "\n\n", "data: [DONE]\n\n"} {
+		if _, werr := io.WriteString(r.w, part); werr != nil {
+			return
+		}
+	}
+
+	r.flush()
+}
+
+// flush 尽力刷新（非 Flusher 的测试替身忽略）。
+func (r *httpResponder) flush() {
+	if fl, ok := r.w.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+// heartbeatWriter 可选实现的响应编码器：首帧等待期的 SSE 注释帧出口（issue #500）。
+// 不是 chatResponder 的一部分——测试替身与其他协议出口不需要心跳。
+type heartbeatWriter interface {
+	writeHeartbeat() error
+}
+
+// startFirstByteHeartbeat 在等上游首帧期间按 interval 写 SSE 注释帧（issue #500）。
+// 首帧否决窗口为了能静默换号而一个字节都不写，客户端从建连起零字节干等到 TTFB；
+// 大上下文把这个空窗拉到秒级，客户端会按空闲超时断开。
+//
+// 返回的 stop 必须调用：它关闭 ticker 并等待在途写完成，之后才开始透传真实帧——
+// 注释帧与真实帧因此不会写交错（串行化靠 join，不需要额外的写锁）。
+// interval<=0 或出口不支持注释帧时返回 no-op（0 = 逐字节保持旧行为）。
+func startFirstByteHeartbeat(out chatResponder, interval time.Duration) func() {
+	writer, ok := out.(heartbeatWriter)
+	if !ok || interval <= 0 {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+
+	go func() {
+		defer close(stopped)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if writer.writeHeartbeat() != nil {
+					return // 客户端已走：不再写注释，真实帧会拿到写错误
+				}
+			}
+		}
+	}()
+
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // streamHintOptions 组装 StreamHint 的旁路选项（error 帧观察 → 标记修复 → 保活

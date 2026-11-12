@@ -96,6 +96,7 @@
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
     "keepalive_interval": "0",
+    "ttfb_keepalive_interval": "1500ms",
     "model_timeouts": {},
     "user_agent": "",
     "client_version": "",
