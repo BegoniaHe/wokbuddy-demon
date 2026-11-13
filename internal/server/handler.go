@@ -165,6 +165,9 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// exitFail 出口维度传输层失败台账（issue #493）：拨号/TLS/EOF 归因到直连/代理池/
+	// 代理槽，不按当前被选号记连败。进程内状态、重启清零。
+	exitFail exitFailureGate
 	// streams 在途 SSE 流注册表（issue #19）：关闭时显式等待排空并记录未排空数。
 	streams *streamTracker
 	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
@@ -2741,12 +2744,14 @@ func (f *chatFlow) handleTransportError(
 
 		return rotBreak
 	}
-	// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
-	// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」。
-	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	// 网络层抖动：只换号，不罚账号（传输层错误对连续失败连坐熔断过于严苛）。
+	// 归因到出口维度（issue #493）：拨号/TLS/EOF 与「当前选中的账号」无关——一次
+	// 网络抖动会让轮转到的每个号都失败，按号记连败（NoteFailures）会把整池连败
+	// 计数拉高、误触发降权。与 ErrProxyDial 分支统一口径：响应从未开始，不算一次
+	// 上游尝试（不 recordAttempt），只记出口台账。换号继续的行为保持不变。
 	f.st.status = http.StatusServiceUnavailable
 	f.lastErr = terr
-	f.h.cfg.Pool.NoteFailures(acct.UID)
+	f.h.exitFail.note(f.h.exitLabel(acct), acct.UID)
 	f.fail(acct.UID)
 
 	if !rotateBackoff(ctx, i) {
