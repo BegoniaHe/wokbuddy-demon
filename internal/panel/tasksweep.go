@@ -92,12 +92,12 @@ loop:
 
 		wg.Add(1)
 
-		go func(acct *auth.Auth) {
+		p.goGuarded("tasks-sweep-account", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			accum.add(p.sweepAccount(ctx, acct))
-		}(account)
+			accum.add(p.sweepAccount(ctx, account))
+		})
 	}
 
 	wg.Wait()

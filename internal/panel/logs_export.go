@@ -54,7 +54,10 @@ func (p *Panel) logsExport(w http.ResponseWriter, r *http.Request) {
 
 	files, err := p.cfg.RuntimeLog.Files()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		// scopeRead 端点：os.ReadDir 的错误串带日志目录绝对路径，不回给调用方。
+		log.Printf("WARN: [panel] 运行日志目录不可读: %v", err)
+		writeErr(w, http.StatusInternalServerError, "运行日志目录不可读")
+
 		return
 	}
 
@@ -130,13 +133,41 @@ func selectLogFiles(files []logrotate.File, from, to time.Time) ([]logrotate.Fil
 	return selected, total
 }
 
-// writeLogZip 把选中文件逐个写入 ZIP；单文件失败只记日志并跳过，不中断其余文件。
+// writeLogZip 把选中文件逐个写入 ZIP。
+//
+// 区分两类失败：本地文件打不开 → 跳过该文件（不影响其余）；写侧失败（客户端断开、
+// 连接 reset 是最常见的）→ 立即中止。响应头已随首个字节发出，继续压剩余文件只会
+// 让下载方拿到「中央目录缺失但看起来完整」的坏包。
 func writeLogZip(w http.ResponseWriter, files []logrotate.File) {
 	zipWriter := zip.NewWriter(w)
+	// 预算随已写字节递减：单条上限必须是「剩余预算」而不是整次导出的上限。
+	// 原先 file.Size<=0（stat 失败 / 正在写入的当天文件）会退化为 logsExportMaxBytes，
+	// 单个条目就能吃掉全部预算。
+	remaining := logsExportMaxBytes
 
 	for index := range files {
-		if err := writeZipEntry(zipWriter, &files[index]); err != nil {
-			log.Printf("WARN: [panel] 运行日志导出跳过 %s: %v", files[index].Name, err)
+		file := &files[index]
+
+		if remaining <= 0 {
+			break
+		}
+
+		src, err := os.Open(file.Path)
+		if err != nil {
+			log.Printf("WARN: [panel] 运行日志导出跳过 %s: %v", file.Name, err)
+
+			continue
+		}
+
+		written, err := writeZipEntry(zipWriter, file, src, remaining)
+		remaining -= written
+
+		src.Close()
+
+		if err != nil {
+			log.Printf("WARN: [panel] 运行日志 ZIP 写入中止: %v", err)
+
+			return
 		}
 	}
 
@@ -145,28 +176,30 @@ func writeLogZip(w http.ResponseWriter, files []logrotate.File) {
 	}
 }
 
-// writeZipEntry 把单个日志文件压入 ZIP。
-func writeZipEntry(zipWriter *zip.Writer, file *logrotate.File) error {
+// writeZipEntry 把已打开的文件压入 ZIP（调用方负责关闭 src）。
+func writeZipEntry(zipWriter *zip.Writer, file *logrotate.File, src io.Reader, budget int64) (int64, error) {
 	entry, err := zipWriter.CreateHeader(&zip.FileHeader{
 		Name:     file.Name,
 		Method:   zip.Deflate,
 		Modified: file.ModTime,
 	})
 	if err != nil {
-		return fmt.Errorf("创建 ZIP 条目: %w", err)
+		return 0, fmt.Errorf("创建 ZIP 条目: %w", err)
 	}
 
-	src, err := os.Open(file.Path)
+	// 单条上限 = min(stat 时的大小, 剩余预算)：当天文件仍在写入，容量上限是在流式
+	// 前算的，不限读会让单条目越过总预算。
+	limit := budget
+	if file.Size > 0 && file.Size < limit {
+		limit = file.Size
+	}
+
+	written, err := io.Copy(entry, io.LimitReader(src, limit))
 	if err != nil {
-		return fmt.Errorf("打开日志文件: %w", err)
-	}
-	defer src.Close()
-
-	if _, err := io.Copy(entry, src); err != nil {
-		return fmt.Errorf("写入 ZIP 条目: %w", err)
+		return written, fmt.Errorf("写入 ZIP 条目: %w", err)
 	}
 
-	return nil
+	return written, nil
 }
 
 // parseLogsRangeParam 解析导出区间参数：在 parseTimeParam 基础上补 "2006-01-02"。

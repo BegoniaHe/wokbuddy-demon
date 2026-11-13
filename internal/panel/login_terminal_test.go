@@ -78,7 +78,7 @@ func TestPollLoginTokenPendingAndTerminal(t *testing.T) {
 
 			panel := loginTestPanel(t)
 
-			_, _, pending, _, err := panel.pollLoginToken("cn", "", "state-1")
+			_, _, pending, _, err := panel.pollLoginToken(t.Context(), "cn", "", "state-1")
 			if item.wantPending {
 				if err != nil || !pending {
 					t.Fatalf("pending=%v err=%v want pending", pending, err)

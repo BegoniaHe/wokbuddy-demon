@@ -10,7 +10,9 @@ import (
 	"bufio"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"slices"
 	"strings"
@@ -18,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logrotate"
 )
 
@@ -170,8 +173,13 @@ type Recorder struct {
 	succeeded   int64
 	httpSuccess int64
 	durationSum int64
-	recent      []Event
-	archive     *archiveWriter
+	// recent 是固定容量的环形缓冲：新事件写 recentPos，recentLen 为有效条数。
+	// 原先每次 Record 都 `append([]Event{*e}, r.recent...)` —— Event 有 40 余字段，
+	// 高 QPS 下每请求新分配并搬移 100 条（数十 KB 垃圾），全程持 r.mu 与 Snapshot 争锁。
+	recent    []Event
+	recentPos int
+	recentLen int
+	archive   *archiveWriter
 }
 
 // New 创建记录器；Dir 为空或 Enabled=false 时只启用内存指标。
@@ -184,7 +192,7 @@ func New(cfg Config) *Recorder {
 		cfg.QueueSize = defaultQueue
 	}
 
-	r := &Recorder{started: time.Now(), recent: make([]Event, 0, recentLimit)}
+	r := &Recorder{started: time.Now(), recent: make([]Event, recentLimit)}
 	r.archive = newArchiveWriter(cfg)
 
 	return r
@@ -253,10 +261,25 @@ func (r *Recorder) observe(event3 *Event) {
 
 	r.durationSum += event3.DurationMs
 
-	r.recent = append([]Event{*event3}, r.recent...)
-	if len(r.recent) > recentLimit {
-		r.recent = r.recent[:recentLimit]
+	// 环形写：O(1) 覆盖最旧一条，不搬移其余事件。
+	r.recent[r.recentPos] = *event3
+
+	r.recentPos = (r.recentPos + 1) % recentLimit
+	if r.recentLen < recentLimit {
+		r.recentLen++
 	}
+}
+
+// recentSnapshotLocked 按「最新在前」展开环形缓冲（调用方持 r.mu）。
+func (r *Recorder) recentSnapshotLocked() []Event {
+	out := make([]Event, 0, r.recentLen)
+
+	for offset := 1; offset <= r.recentLen; offset++ {
+		index := (r.recentPos - offset + recentLimit) % recentLimit
+		out = append(out, r.recent[index])
+	}
+
+	return out
 }
 
 // Snapshot 返回进程内指标和归档状态。
@@ -272,7 +295,7 @@ func (r *Recorder) Snapshot() Snapshot {
 		Completed: r.completed,
 		InFlight:  r.inFlight,
 		Succeeded: r.succeeded,
-		Recent:    append([]Event(nil), r.recent...),
+		Recent:    r.recentSnapshotLocked(),
 	}
 	if r.completed > 0 {
 		snapshot.Failed = r.completed - r.succeeded
@@ -318,6 +341,9 @@ type archiveWriter struct {
 	done      chan struct{}
 	closeOnce sync.Once
 	dropped   atomic.Uint64
+	// closed 写者已退出：此后入队的事件既不会被写入也无法计入「阻塞丢弃」，
+	// 单独计数（停机窗口内的最后一批归档不能静默消失）。
+	closed    atomic.Bool
 	lastErrMu sync.Mutex
 	lastErr   string
 
@@ -381,7 +407,25 @@ func (w *archiveWriter) enabled() bool {
 }
 
 func (w *archiveWriter) enqueue(event *Event) {
+	if w == nil {
+		return
+	}
+
 	if !w.enabled() {
+		// 构造失败（logrotate.New 报错 / 目录不可用）时 cfg.Enabled 被置 false，
+		// 此后每条事件都在这里静默返回。计入 dropped，否则面板只能看到
+		// enabled=false + dropped_writes=0，无法判断到底丢了多少条。
+		if w.cfg.Enabled || w.cfg.Dir != "" {
+			w.dropped.Add(1)
+		}
+
+		return
+	}
+
+	// 写者已退出：入队只会躺在缓冲里永远不落盘，也不会计入 dropped。
+	if w.closed.Load() {
+		w.dropped.Add(1)
+
 		return
 	}
 
@@ -398,25 +442,71 @@ func (w *archiveWriter) run() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	// 裁剪（读取归档目录 + 逐个 stat）与刷新不同频：flush 每秒做（失电窗口 1s），
+	// prune 只是旁路维护，每秒一次 ReadDir 在归档文件多时会持续占用磁盘。
+	const pruneEvery = 60
+
+	ticks := 0
+
 	for {
 		select {
 		case e := <-w.ch:
 			w.writeEvent(&e)
 		case <-ticker.C:
 			w.flush()
-			w.prune()
-		case <-w.stop:
-			for {
-				select {
-				case e := <-w.ch:
-					w.writeEvent(&e)
-				default:
-					w.flush()
-					_ = w.out.Close()
 
-					return
-				}
+			ticks++
+			if ticks%pruneEvery == 0 {
+				w.prune()
 			}
+		case <-w.stop:
+			w.drain()
+
+			return
+		}
+	}
+}
+
+// maxEventFieldLen 归档里客户端可控字符串字段的字节上限。
+//
+// Model / Path 直接来自请求（模型名是客户端任意字符串），JSON 转义对控制字符是
+// 6 倍膨胀：~200 KB 的模型名就能产出超过 1 MiB 的单行，撞上读者 bufio 的
+// maxScanToken 上限，此后整个归档「运行日志」查询对该文件持续报错直到过保留期。
+// UserAgent 早已按同口径截断（server 侧 maxUserAgentLen），这里补上其余两个。
+const maxEventFieldLen = 200
+
+// clampEventFields 截断归档里的客户端可控字符串字段（就地改写入参副本）。
+func clampEventFields(event *Event) {
+	event.Model = truncateField(event.Model)
+	event.Path = truncateField(event.Path)
+}
+
+// truncateField 按字节上限截断并回退到 rune 边界。
+func truncateField(value string) string {
+	if len(value) <= maxEventFieldLen {
+		return value
+	}
+
+	return logfmt.TruncateEllipsis(value, maxEventFieldLen)
+}
+
+// drain 关停时排空队列并关闭写入器。
+//
+// 最后一次刷盘/关闭失败必须留痕：目录只读、磁盘满都会走到这里，静默吞掉后
+// 「关停丢了最后一批事件」就无从追查。
+func (w *archiveWriter) drain() {
+	for {
+		select {
+		case e := <-w.ch:
+			w.writeEvent(&e)
+		default:
+			w.flush()
+
+			if err := w.out.Close(); err != nil {
+				w.setErr(err)
+			}
+
+			return
 		}
 	}
 }
@@ -425,6 +515,8 @@ func (w *archiveWriter) writeEvent(event2 *Event) {
 	if w.out == nil {
 		return
 	}
+
+	clampEventFields(event2)
 
 	raw, err := json.Marshal(event2)
 	if err != nil {
@@ -472,13 +564,30 @@ func (w *archiveWriter) read(limit int, filter *Filter) ([]Event, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
-	// 文件读取顺序无关紧要：结果一律按事件时间排序。不能依赖归档文件的 mtime 还原时间
-	// 顺序——同一秒内连续轮转写出的多个文件 mtime 经常完全相同（Linux 文件时间戳粒度粗）；
-	// 目录被整体拷贝 / 恢复备份后 mtime 更不可信。
-	var out []Event
+	// 从最新文件倒序读、凑够 limit 即停。Files() 已按 (day, index) 升序排列，倒序即
+	// 时间倒序；不能依赖文件 mtime 还原时间顺序（同秒轮转 mtime 常相同，拷贝/恢复
+	// 备份后更不可信）——这也是这里用「文件名序」而非 mtime 排序的原因。
+	//
+	// 早停是必要的：保留目录默认 100 MiB，全量读入再截断会让一次面板请求瞬时吃掉
+	// 几百 MiB，而契约只要能返回最近 limit 条。
+	var (
+		out     []Event
+		scanned int64
+	)
 
-	for _, file := range files {
-		rows, err := readFile(file.Path, filter)
+	for i := len(files) - 1; i >= 0 && len(out) < limit; i-- {
+		// 扫描字节预算：过滤条件全不命中时 out 永不增长，早停条件失效，会读遍整个
+		// 保留目录（默认 100 MiB）——每行一次反序列化，全部在面板 handler 内同步
+		// 完成。超过预算即停（返回的是「最近窗口内」的匹配，属可接受的降级）。
+		if scanned > maxArchiveScanBytes {
+			break
+		}
+
+		if info, statErr := os.Stat(files[i].Path); statErr == nil {
+			scanned += info.Size()
+		}
+
+		rows, err := readFileTolerant(files[i].Path, filter)
 		if err != nil {
 			return out, err
 		}
@@ -495,6 +604,9 @@ func (w *archiveWriter) read(limit int, filter *Filter) ([]Event, error) {
 	return out, nil
 }
 
+// maxArchiveScanBytes 单次归档读取的扫描上限（32 MiB）：过滤全不命中时的 I/O 护栏。
+const maxArchiveScanBytes = 32 << 20
+
 // clampReadLimit 归一化读取条数：<=0 回落 200，上限 1000。
 func clampReadLimit(limit int) int {
 	if limit <= 0 {
@@ -506,6 +618,17 @@ func clampReadLimit(limit int) int {
 	}
 
 	return limit
+}
+
+// readFileTolerant 读单个归档文件；文件在 Files() 与本次读取之间被裁剪/轮转
+// （fs.ErrNotExist）时视为空文件，不让整次查询因为一个消失的文件失败。
+func readFileTolerant(path string, filter *Filter) ([]Event, error) {
+	rows, err := readFile(path, filter)
+	if err != nil && errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+
+	return rows, err
 }
 
 func readFile(path string, filter *Filter) ([]Event, error) {
@@ -530,6 +653,12 @@ func readFile(path string, filter *Filter) ([]Event, error) {
 	}
 
 	if err := scanner.Err(); err != nil {
+		// 单行超限（历史遗留的超长记录 / 手工改坏的文件）只影响该行之后的内容，
+		// 不能把整个文件的查询判成失败——否则整页「运行日志」持续报错到过保留期。
+		if errors.Is(err, bufio.ErrTooLong) {
+			return out, nil
+		}
+
 		return nil, fmt.Errorf("read archive: %w", err)
 	}
 
@@ -610,6 +739,7 @@ func (w *archiveWriter) close() {
 	}
 
 	w.closeOnce.Do(func() {
+		w.closed.Store(true)
 		close(w.stop)
 		<-w.done
 	})

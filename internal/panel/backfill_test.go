@@ -3,6 +3,7 @@ package panel
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -150,7 +151,8 @@ func TestFetchBackfillRecordsSplitsCappedWindow(t *testing.T) {
 	p := &Panel{cfg: Config{Upstream: &upstream.Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}}}
 	start := time.Date(2026, 10, 17, 0, 0, 0, 0, loc)
 
-	recs, err := p.fetchBackfillRecords(&auth.Auth{AccessToken: "at"}, start, start.Add(4*time.Hour))
+	recs, err := p.fetchBackfillRecords(context.Background(),
+		&auth.Auth{AccessToken: "at"}, start, start.Add(4*time.Hour))
 	if err != nil {
 		t.Fatalf("fetchBackfillRecords: %v", err)
 	}
@@ -182,7 +184,7 @@ func TestFetchBackfillPagesRejectsTruncation(t *testing.T) {
 		NextPage: 2,
 	}
 
-	_, err := panel.fetchBackfillPages(
+	_, err := panel.fetchBackfillPages(context.Background(),
 		&auth.Auth{AccessToken: "at"}, time.Now().Add(-time.Hour), time.Now(), first)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("err=%v want page-cap error", err)

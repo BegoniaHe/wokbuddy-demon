@@ -30,8 +30,8 @@ func TestAuthenticateDefaultKey(t *testing.T) {
 		{"错误 key", "sk-abc123", "Bearer sk-wrong", false},
 		{"缺 Authorization 头", "sk-abc123", "", false},
 		{"缺 Bearer 前缀", "sk-abc123", "sk-abc123", false},
-		{"前缀大小写不符（规范要求精确）", "sk-abc123", "bearer sk-abc123", false},
-		{"多余空格", "sk-abc123", "Bearer  sk-abc123", false},
+		{"scheme 大小写不敏感（RFC 7235 §2.1）", "sk-abc123", "bearer sk-abc123", true},
+		{"scheme 与凭据间允许多个空格（1*SP）", "sk-abc123", "Bearer  sk-abc123", true},
 		{"前缀相同但内容短", "sk-abc123", "Bearer sk-abc12", false},
 		{"前缀相同但内容长", "sk-abc123", "Bearer sk-abc1234", false},
 		{"key 恰好是前缀", "sk-abc", "Bearer sk-abcdef", false},
@@ -190,5 +190,54 @@ func TestAuthenticateManagement(t *testing.T) {
 					got, item.wantOK, item.wantScope, item.wantDef)
 			}
 		})
+	}
+}
+
+// TestAuthenticateBearerSchemeIsCaseInsensitiveAndTolerantOfSpaces RFC 7235 §2.1：
+// scheme 名大小写不敏感，credentials 语法是 `auth-scheme [ 1*SP ... ]`。
+// 原先按 "Bearer " 精确前缀匹配，`bearer xxx` 判成未提供凭据、`Bearer  xxx`
+// （两个空格）把前导空格算进 token 摘要——两者都是合法请求却必然 401。
+func TestAuthenticateBearerSchemeIsCaseInsensitiveAndTolerantOfSpaces(t *testing.T) {
+	t.Parallel()
+
+	headers := map[string]string{
+		"标准写法":       "Bearer sk-key",
+		"全小写 scheme": "bearer sk-key",
+		"全大写 scheme": "BEARER sk-key",
+		"混合大小写":      "BeArEr sk-key",
+		"两个空格":       "Bearer  sk-key",
+		"多个空格":       "Bearer    sk-key",
+		"尾部空格":       "Bearer sk-key ",
+	}
+
+	for name, value := range headers {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			r.Header.Set("Authorization", value)
+
+			if !Authenticate(r, "sk-key", nil).OK {
+				t.Fatalf("Authorization=%q 应通过鉴权", value)
+			}
+		})
+	}
+
+	// 非 Bearer 方案不参与比较，回退到 x-api-key。
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r.Header.Set("Authorization", "Basic c2stb3RoZXI=")
+	r.Header.Set("X-Api-Key", "sk-key")
+
+	if !Authenticate(r, "sk-key", nil).OK {
+		t.Error("非 Bearer 方案应回退到 x-api-key")
+	}
+
+	// 空 token 同样回退。
+	blank := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	blank.Header.Set("Authorization", "Bearer   ")
+	blank.Header.Set("X-Api-Key", "sk-key")
+
+	if !Authenticate(blank, "sk-key", nil).OK {
+		t.Error("Bearer 后无有效 token 时应回退到 x-api-key")
 	}
 }

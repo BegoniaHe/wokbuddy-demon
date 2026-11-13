@@ -101,11 +101,11 @@ func driveLoginProduct(t *testing.T, panel *Panel, realm, wantUA string, item lo
 
 	switch item.wantPath {
 	case "/v2/plugin/auth/state":
-		if _, _, _, err := panel.loginStartState(realm); err != nil {
+		if _, _, _, err := panel.loginStartState(t.Context(), realm); err != nil {
 			t.Fatalf("loginStartState: %v", err)
 		}
 	case "/v2/plugin/auth/token":
-		if _, _, pending, _, err := panel.pollLoginToken(realm, "", "s-1"); err != nil || pending {
+		if _, _, pending, _, err := panel.pollLoginToken(t.Context(), realm, "", "s-1"); err != nil || pending {
 			t.Fatalf("pollLoginToken pending=%v err=%v", pending, err)
 		}
 	default:
@@ -114,7 +114,7 @@ func driveLoginProduct(t *testing.T, panel *Panel, realm, wantUA string, item lo
 			t.Fatalf("ua=%q want %q", endpoint.userAgent, wantUA)
 		}
 
-		if _, err := panel.fetchLoginAccount(&endpoint, "s-1", "access-token"); err != nil {
+		if _, err := panel.fetchLoginAccount(t.Context(), &endpoint, "s-1", "access-token"); err != nil {
 			t.Fatalf("fetchLoginAccount: %v", err)
 		}
 	}

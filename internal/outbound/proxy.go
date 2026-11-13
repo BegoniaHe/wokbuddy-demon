@@ -73,7 +73,6 @@ var (
 
 // Proxy 单个出站代理（HTTP/HTTPS CONNECT 或 SOCKS5）。
 type Proxy struct {
-	raw              string
 	scheme           string // http / https / socks5 / socks5h
 	host             string
 	addr             string // host:port
@@ -121,9 +120,14 @@ func ParseProxy(raw string) (*Proxy, error) {
 	if port == "" {
 		port = defaultProxyPort(scheme)
 	}
+	// net/url 的端口校验只要求「全是数字」，不校验范围：70000 能解析成功，
+	// 之后每次拨号都在 net.Dialer 层报 invalid port。四段式写法有 1..65535 校验，
+	// 两种写法必须同口径。
+	if portNum, perr := strconv.Atoi(port); perr != nil || portNum < 1 || portNum > 65535 {
+		return nil, fmt.Errorf("proxy: 端口必须是 1..65535 的整数: %w", errParseProxyFailed)
+	}
 
 	proxy := &Proxy{
-		raw:              raw,
 		scheme:           scheme,
 		host:             host,
 		addr:             net.JoinHostPort(host, port),
@@ -162,6 +166,12 @@ func defaultProxyPort(scheme string) string {
 	}
 }
 
+// minRedactSecretLen 裸用户名/口令参与全文替换的最短长度。
+//
+// 低于该长度时只替换 user:pass 组合：短串到处命中，会把错误串里的 IP、端口、
+// 主机名打成乱码，代价大于收益（真实凭据不会这么短）。
+const minRedactSecretLen = 6
+
 // Masked 脱敏后的代理地址 scheme://host:port：**永不**包含 user/pass，面板展示
 // 与日志一律用它（issue #39）。
 func (p *Proxy) Masked() string {
@@ -171,11 +181,19 @@ func (p *Proxy) Masked() string {
 // redact 把本代理的口令/用户名从任意字符串里抹掉，并截断到 limit 字符。
 // 用于把底层错误串落到健康快照（错误可能回显 URL）。
 func (p *Proxy) redact(text string, limit int) string {
-	if p.pass != "" {
+	// 只替换 user:pass 组合与完整 URL 的 userinfo 段，不对裸用户名/口令做全文替换：
+	// 短串（"a" / "u1" / "pwd"）会把 "dial tcp 1.2.3.4:8080" 打成 "1.***.3.4"，
+	// 健康快照与面板的 last_error 直接变成不可读乱码，诊断信息全丢。
+	// 现实口令长度都远超该阈值，裸形态只在短串时放弃替换。
+	if p.user != "" && p.pass != "" {
+		text = strings.ReplaceAll(text, p.user+":"+p.pass, "***")
+	}
+
+	if len(p.pass) >= minRedactSecretLen {
 		text = strings.ReplaceAll(text, p.pass, "***")
 	}
 
-	if p.user != "" {
+	if len(p.user) >= minRedactSecretLen {
 		text = strings.ReplaceAll(text, p.user, "***")
 	}
 
@@ -208,7 +226,6 @@ func parseFourPartProxy(raw string) (*Proxy, error) {
 	}
 
 	return &Proxy{
-		raw:              raw,
 		scheme:           "socks5",
 		host:             host,
 		addr:             net.JoinHostPort(host, strconv.Itoa(port)),
@@ -415,7 +432,7 @@ func (*Proxy) socks5Connect(conn net.Conn, addr string) error {
 	}
 
 	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 0 || port > 65535 {
+	if err != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("socks5: 非法端口 %q: %w", portStr, errSocks5ConnectFailed)
 	}
 
