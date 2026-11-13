@@ -5,7 +5,11 @@
 // 续写）仍复用既有收尾路径，不新增第二套写出逻辑。
 package server
 
-import "github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+import (
+	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
+)
 
 // responseShape 上游响应的异常形态。
 type responseShape int
@@ -17,6 +21,10 @@ const (
 	shapeReasoningOnly
 	// shapeLongFormTruncated 客户端要了长文（≥32k 输出上限），模型却以 stop 提前收尾。
 	shapeLongFormTruncated
+	// shapeNarrationTail 正文停在预告句（结尾为冒号/省略号/未闭合代码块）。
+	shapeNarrationTail
+	// shapeToolDeclaredNoCall 声明了工具、预告句收尾却零工具调用（工具轮「说一句就停」）。
+	shapeToolDeclaredNoCall
 )
 
 // longFormContinuationMinTokens 长文续接的请求侧门槛：客户端自己把输出上限要到
@@ -47,6 +55,8 @@ func streamShape(probe *upstream.StreamProbe) responseShape {
 }
 
 // aggregateShape 非流式聚合响应的形态判定。
+//
+//nolint:cyclop,gocyclo // 形态按优先级线性判定，拆散会打乱「先零输出、后预告句、再长文」的次序。
 func (f *chatFlow) aggregateShape(resp map[string]any) responseShape {
 	choice := firstChoice(resp)
 	if choice == nil {
@@ -67,6 +77,15 @@ func (f *chatFlow) aggregateShape(resp map[string]any) responseShape {
 	}
 
 	finishReason, _ := choice["finish_reason"].(string)
+	if finishReason == "stop" && tools == 0 && narrationTail(content) {
+		// 声明了工具却只说不做（issue #495）：工具轮触发，续写只采纳工具调用。
+		if f.declaredToolCount > 0 {
+			return shapeToolDeclaredNoCall
+		}
+
+		return shapeNarrationTail
+	}
+
 	if finishReason == "stop" && tools == 0 && f.longFormRequested() &&
 		len([]rune(content)) >= longFormContinuationMinChars {
 		return shapeLongFormTruncated
@@ -75,14 +94,48 @@ func (f *chatFlow) aggregateShape(resp map[string]any) responseShape {
 	return shapeNormal
 }
 
-// nonStreamContinueWanted 报告非流式聚合响应是否值得续写一次：length 截断，
-// 或「客户端要长文且模型在成篇内容后 stop」。
-func (f *chatFlow) nonStreamContinueWanted(resp, choice map[string]any) bool {
+// nonStreamContinuePlan 报告非流式聚合响应是否值得续写一次，以及是否只采纳工具
+// 调用（issue #494 / #495）：length 截断与长文 stop 续正文；预告句续正文；声明了
+// 工具却零调用的工具轮只采纳续写里的 tool_calls。
+func (f *chatFlow) nonStreamContinuePlan(resp, choice map[string]any) (wanted, toolsOnly bool) {
 	if finishReason, _ := choice["finish_reason"].(string); finishReason == "length" {
+		return true, false
+	}
+
+	switch f.aggregateShape(resp) {
+	case shapeLongFormTruncated, shapeNarrationTail:
+		return true, false
+	case shapeToolDeclaredNoCall:
+		return true, true
+	case shapeNormal, shapeReasoningOnly:
+	}
+
+	return false, false
+}
+
+// narrationTail 报告正文是否停在预告句：结尾是冒号、省略号，或代码块未闭合。
+// 只用于「模型自己 stop」的收尾判定；length 截断由既有口径处理。
+//
+// 门槛取得窄：完整回答极少以冒号/省略号收尾，而这三类形态正是「后面还有内容」
+// 的信号。宁可漏（交回原样下发）也不误续——续写会多打一次上游。
+func narrationTail(text string) bool {
+	trimmed := strings.TrimRight(text, " \t\r\n")
+	if trimmed == "" {
+		return false
+	}
+
+	// 未闭合代码块：围栏数量为奇数说明还缺收尾 ```。
+	if strings.Count(trimmed, "```")%2 == 1 {
 		return true
 	}
 
-	return f.aggregateShape(resp) == shapeLongFormTruncated
+	for _, suffix := range []string{":", "：", "...", "…"} {
+		if strings.HasSuffix(trimmed, suffix) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // reasoningOnly 报告聚合消息是否「只有思维链」：无正文、无工具调用，但有思维链。
