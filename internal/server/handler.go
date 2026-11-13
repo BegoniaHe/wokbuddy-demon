@@ -126,6 +126,14 @@ type Config struct {
 	DecisionTrace       bool
 	DecisionTraceSample float64
 
+	// UpstreamHealthWindow 上游劣化滑窗宽度（issue #488）；<=0 = 关闭。
+	// UpstreamHealthTTFB/5xxRatio/MinSamples 是 TTFB 均值与 5xx 比例的告警阈值与
+	// 最小样本数，样本不足不告警。只观测，不改选号。
+	UpstreamHealthWindow     time.Duration
+	UpstreamHealthTTFB       time.Duration
+	UpstreamHealth5xxRatio   float64
+	UpstreamHealthMinSamples int
+
 	// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin（已规范化）；空 = 关闭。
 	CORSOrigins []string
 	// TrustedProxies 可信反向代理网段。只有 TCP 对端落在这些网段内时，才采信
@@ -165,6 +173,12 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// exitFail 出口维度传输层失败台账（issue #493）：拨号/TLS/EOF 归因到直连/代理池/
+	// 代理槽，不按当前被选号记连败。进程内状态、重启清零。
+	exitFail exitFailureGate
+	// upstreamHealth 上游劣化滑窗（issue #488）：按 (域, 模型) 与全局统计 TTFB / 5xx
+	// 比例，超阈值打 WARN。只观测，不参与选号。window<=0 时关闭。
+	upstreamHealth *upstreamHealth
 	// streams 在途 SSE 流注册表（issue #19）：关闭时显式等待排空并记录未排空数。
 	streams *streamTracker
 	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
@@ -248,6 +262,8 @@ func NewHandler(cfg *Config) *Handler {
 	if config.RefreshSkew <= 0 {
 		config.RefreshSkew = 10 * time.Minute
 	}
+	// 上游劣化滑窗（issue #488）：window<=0 = 关闭；阈值缺省保守（5s / 25% / 10 样本）。
+	applyUpstreamHealthDefaults(&config)
 
 	if config.PromptMode == "" {
 		config.PromptMode = "custom" // 缺省 custom：网关自有提示词
@@ -265,6 +281,7 @@ func NewHandler(cfg *Config) *Handler {
 
 	handler := &Handler{
 		cfg: config, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
+		upstreamHealth:    newUpstreamHealthFromConfig(&config),
 		authLimiter:       authLimiter,
 		clientAuthLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit*3, httpauth.DefaultFailWindow),
 		cors:              make(map[string]bool, len(config.CORSOrigins)),
@@ -1543,6 +1560,9 @@ type chatFlow struct {
 	busyWaited bool
 	// zeroRetried 是否已因「length + 零输出」关闭思考重发过（只重发一次，issue #244）。
 	zeroRetried bool
+	// reasoningRetried 是否已因「只有思维链、没有正文」关闭思考重发过（只重发一次，
+	// issue #494）。与 zeroRetried 分开记账：两种形态各自值得一次救援。
+	reasoningRetried bool
 	// nonstreamContinued 非流式截断续写是否已执行（只续写一次，issue #247）。
 	nonstreamContinued bool
 
@@ -2741,12 +2761,14 @@ func (f *chatFlow) handleTransportError(
 
 		return rotBreak
 	}
-	// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
-	// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」。
-	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	// 网络层抖动：只换号，不罚账号（传输层错误对连续失败连坐熔断过于严苛）。
+	// 归因到出口维度（issue #493）：拨号/TLS/EOF 与「当前选中的账号」无关——一次
+	// 网络抖动会让轮转到的每个号都失败，按号记连败（NoteFailures）会把整池连败
+	// 计数拉高、误触发降权。与 ErrProxyDial 分支统一口径：响应从未开始，不算一次
+	// 上游尝试（不 recordAttempt），只记出口台账。换号继续的行为保持不变。
 	f.st.status = http.StatusServiceUnavailable
 	f.lastErr = terr
-	f.h.cfg.Pool.NoteFailures(acct.UID)
+	f.h.exitFail.note(f.h.exitLabel(acct), acct.UID)
 	f.fail(acct.UID)
 
 	if !rotateBackoff(ctx, i) {
@@ -2831,13 +2853,17 @@ func fingerprintBlocked(kind upstream.ErrKind, respBody []byte) bool {
 
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
 //
-//nolint:cyclop,gocyclo,maintidx // 错误类别按优先级线性展开，拆散会掩盖处置顺序。
+//nolint:cyclop,gocyclo,maintidx,funlen // 错误类别按优先级线性展开，拆散会掩盖处置顺序。
 func (f *chatFlow) handleHTTPError(
 	ctx context.Context, acct *auth.Auth, status int, respBody []byte,
 	uerr *upstream.Error, attemptStarted time.Time, i int,
 ) rotationAction {
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	f.st.status = status
+
+	if status >= http.StatusInternalServerError {
+		f.h.upstreamHealth.markServer5xx(f.realm, f.bareModel)
+	}
 
 	var kind upstream.ErrKind
 	if uerr != nil {
@@ -3150,6 +3176,8 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 }
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
+//
+//nolint:funlen,maintidx // 收尾顺序即语义（预览否决 → 挂续写层 → 透传 → 记账 → 观测）。
 func (f *chatFlow) handleStreamSuccess(
 	ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int,
 ) rotationAction {
@@ -3180,6 +3208,25 @@ func (f *chatFlow) handleStreamSuccess(
 		cont = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
 			return f.continueUpstream(ctx, acct, partial)
 		})
+		// 长文续接（issue #494）：客户端把输出上限要到 32k+ 时，stopped 的长文也按
+		// 可续写处理；短答 stop 由响应侧门槛挡掉（见 longFormContinuationMinChars）。
+		if f.longFormRequested() {
+			cont.ContinueOnStop(longFormContinuationMinChars)
+		}
+		// 预告句与工具轮（issue #495）：尾部是冒号/省略号/未闭合代码块时续写一次；
+		// 本轮声明了工具就只采纳续写里的 tool_calls，丢弃续写正文。
+		cont.ContinueOnStopTail(narrationTail, f.declaredToolCount > 0,
+			func(tail string) {
+				log.Printf("INFO: [server] stream acct=%s model=%s: narration tail %q, "+
+					"continuing once (declared_tools=%d)",
+					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel,
+					upstream.RedactForLog(tail, 160), f.declaredToolCount)
+				captureSample("narration_tail", f.bareModel, true, tail, map[string]any{
+					captureKeyDeclaredTools: f.declaredToolCount,
+					"tools_only":            f.declaredToolCount > 0,
+				})
+			})
+
 		stream = cont
 		// 惰性 defer：Release 自带 nil 判定，normal 路径与提前返回路径都不会漏还。
 		defer cont.Release()
@@ -3208,6 +3255,12 @@ func (f *chatFlow) handleStreamSuccess(
 	// 观测（issue #44）：必须在 finishStreamStats 之后——f.st.toolsDeclared /
 	// toolCalls 在那里才写入。
 	f.warnStopWithoutToolCalls(stats.FinishReason())
+
+	if cont != nil && cont.ContinuationToolCall() {
+		log.Printf("INFO: [server] stream acct=%s model=%s: continuation produced tool calls (adopted)",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+	}
+
 	stream.Close()
 
 	return rotDone
@@ -3247,6 +3300,58 @@ func (f *chatFlow) warnStopWithoutToolCalls(finishReason string) {
 	log.Printf("WARN: [server] %s acct=%s model=%s: finish_reason=stop without tool_calls "+
 		"despite %d tool(s) declared (client will treat the turn as completed; tools never ran)",
 		f.st.mode, logfmt.Label(f.st.uid, f.st.nick), f.bareModel, f.st.toolsDeclared)
+
+	captureSample("stop_without_tool_calls", f.bareModel, f.stream, "", map[string]any{
+		captureKeyDeclaredTools: f.st.toolsDeclared,
+		captureKeyToolCalls:     f.st.toolCalls,
+		"finish_reason":         finishReason,
+	})
+}
+
+// retryOnceWithoutThinking 关思考同额度重发一次：返回 true 表示已重发（调用方直接
+// 返回该动作），false 表示本次请求同类形态已经救援过，由调用方自行收尾。
+// 救援不是账号故障：调用方只记一次零用量尝试，不 NoteFailures、不冷却。
+func (f *chatFlow) retryOnceWithoutThinking(
+	ctx context.Context, acct *auth.Auth, retried *bool, mode, reason string, i int,
+) (rotationAction, bool) {
+	if *retried {
+		return rotDone, false
+	}
+
+	*retried = true
+	f.body = upstream.DisableThinking(f.body)
+	log.Printf("INFO: [server] %s acct=%s model=%s: %s, retrying once with thinking disabled",
+		mode, logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, reason)
+
+	return f.dispatch(ctx, acct, i), true
+}
+
+// retryReasoningOnly 处置「只思考、没正文」的零输出流（issue #494）：关思考、同额度
+// 重发一次；仍只有思维链才回落到既有空流口径（换号 → 轮转耗尽 502）。
+func (f *chatFlow) retryReasoningOnly(
+	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
+) rotationAction {
+	captureSample("reasoning_only", f.bareModel, true, "", map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+	})
+
+	// 已救援过一次时不再记这次尝试：handlePreStreamEmpty 自己也写一次 recordAttempt，
+	// 两处都记会把同一次上游调用算成两次尝试（reqlib attempts 直接翻倍）。
+	if !f.reasoningRetried {
+		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+		if action, retried := f.retryOnceWithoutThinking(
+			ctx, acct, &f.reasoningRetried, "stream", "reasoning-only output", i,
+		); retried {
+			return action
+		}
+	}
+
+	log.Printf("WARN: [server] stream acct=%s model=%s: reasoning-only output again "+
+		"after thinking disabled (rotating)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+	return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i)
 }
 
 // retryZeroOutputLength 处理 finish_reason=length 且零输出：同额度关闭 thinking
@@ -3256,14 +3361,10 @@ func (f *chatFlow) retryZeroOutputLength(
 ) rotationAction {
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
-	if !f.zeroRetried {
-		f.zeroRetried = true
-		f.body = upstream.DisableThinking(f.body)
-		log.Printf("INFO: [server] stream acct=%s model=%s: length with zero output, "+
-			"retrying once with thinking disabled",
-			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
-
-		return f.dispatch(ctx, acct, i)
+	if action, retried := f.retryOnceWithoutThinking(
+		ctx, acct, &f.zeroRetried, "stream", "length with zero output", i,
+	); retried {
+		return action
 	}
 
 	f.zeroOutputLengthError(true)
@@ -3282,19 +3383,46 @@ func (f *chatFlow) retryNonStreamZeroOutput(
 
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
-	if !f.zeroRetried {
-		f.zeroRetried = true
-		f.body = upstream.DisableThinking(f.body)
-		log.Printf("INFO: [server] non-stream acct=%s model=%s: length with zero output, "+
-			"retrying once with thinking disabled",
-			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
-
-		return f.dispatch(ctx, acct, i), true
+	if action, retried := f.retryOnceWithoutThinking(
+		ctx, acct, &f.zeroRetried, "non-stream", "length with zero output", i,
+	); retried {
+		return action, true
 	}
 
 	f.zeroOutputLengthError(false)
 
 	return rotDone, true
+}
+
+// retryNonStreamReasoningOnly 非流式「只有思维链、没有正文」（issue #494）：
+// 关思考重发一次。仍只有思维链时保持既有行为原样下发——非流式此前没有 502 错误面，
+// 这里不新造一个；流式侧才回落到空流口径（见 retryReasoningOnly）。
+func (f *chatFlow) retryNonStreamReasoningOnly(
+	ctx context.Context, acct *auth.Auth, resp map[string]any, attemptStarted time.Time, i int,
+) (rotationAction, bool) {
+	if f.aggregateShape(resp) != shapeReasoningOnly {
+		return rotDone, false
+	}
+
+	captureSample("reasoning_only", f.bareModel, false, "", map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+	})
+
+	// 已救援过一次：这条响应会原样下发，它的账由 handleNonStreamSuccess 末尾那次
+	// recordAttempt 统一写；这里再记一次会让同一次上游调用算成两次尝试。
+	if f.reasoningRetried {
+		log.Printf("WARN: [server] non-stream acct=%s model=%s: reasoning-only output again "+
+			"after thinking disabled (delivering as-is)",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return rotDone, false
+	}
+
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	return f.retryOnceWithoutThinking(
+		ctx, acct, &f.reasoningRetried, "non-stream", "reasoning-only output", i,
+	)
 }
 
 // zeroOutputLengthResponse 报告聚合响应是否为 finish_reason=length 且无正文/
@@ -3410,6 +3538,11 @@ func (f *chatFlow) probeVeto(
 		return f.handlePreStreamErrorFrame(ctx, acct, probe, attemptStarted, i), true
 	case probe.Empty:
 		rc.Close()
+
+		// 只有思维链没有正文（issue #494）：先关思考同额度重发一次，别急着换号。
+		if streamShape(probe) == shapeReasoningOnly {
+			return f.retryReasoningOnly(ctx, acct, attemptStarted, i), true
+		}
 
 		return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i), true
 	default:
@@ -3643,6 +3776,10 @@ func (f *chatFlow) handleNonStreamSuccess(
 		return action
 	}
 
+	if action, handled := f.retryNonStreamReasoningOnly(ctx, acct, resp, attemptStarted, i); handled {
+		return action
+	}
+
 	resp = f.continueNonStream(ctx, acct, resp)
 
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
@@ -3702,8 +3839,10 @@ func (f *chatFlow) handleNonStreamSuccess(
 	return rotDone
 }
 
-// continueNonStream 非流式 finish_reason=length 且有正文时续写一次，把第二段
-// 正文拼进同一响应（issue #247）。工具调用不续写；失败保留首段 length 终态。
+// continueNonStream 非流式 finish_reason=length（或长文请求的 stop）且有正文时续写
+// 一次，把第二段正文拼进同一响应（issue #247 / #494）。工具调用不续写；失败保留首段终态。
+//
+//nolint:cyclop,funlen,gocyclo // 续写前置条件线性校验（形态、已有调用、正文、只做一次），拆散更难读。
 func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp map[string]any) map[string]any {
 	if f.nonstreamContinued || len(resp) == 0 {
 		return resp
@@ -3719,7 +3858,8 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		return resp
 	}
 
-	if fr, _ := choice["finish_reason"].(string); fr != "length" {
+	wanted, toolsOnly := f.nonStreamContinuePlan(resp, choice)
+	if !wanted {
 		return resp
 	}
 
@@ -3731,6 +3871,12 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 	if partial == "" {
 		return resp
 	}
+
+	captureSample("nonstream_continuation", f.bareModel, false, partial, map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+		"tools_only":            toolsOnly,
+		"shape":                 f.aggregateShape(resp),
+	})
 
 	f.nonstreamContinued = true
 
@@ -3746,7 +3892,55 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		return resp
 	}
 
+	if toolsOnly {
+		merged := mergeNonStreamToolCalls(resp, second)
+		if responseToolCallCount(merged) > 0 {
+			log.Printf("INFO: [server] non-stream model=%s: continuation produced tool calls (adopted)",
+				f.bareModel)
+		}
+
+		return merged
+	}
+
 	return mergeNonStreamContinuation(resp, second)
+}
+
+// mergeNonStreamToolCalls 工具轮续写只采纳工具调用（issue #495）：首段正文（预告句）
+// 保留，续写的纯文本丢弃；续写没带回调用时原样返回首段。
+func mergeNonStreamToolCalls(first, second map[string]any) map[string]any {
+	if responseToolCallCount(second) == 0 {
+		return first
+	}
+
+	firstChoiceItem, secondChoiceItem := firstChoice(first), firstChoice(second)
+	if firstChoiceItem == nil || secondChoiceItem == nil {
+		return first
+	}
+
+	firstMessage, _ := firstChoiceItem["message"].(map[string]any)
+	secondMessage, _ := secondChoiceItem["message"].(map[string]any)
+
+	if firstMessage == nil || secondMessage == nil {
+		return first
+	}
+
+	if _, has := firstMessage["tool_calls"]; !has {
+		if calls, ok := secondMessage["tool_calls"]; ok {
+			firstMessage["tool_calls"] = calls
+		}
+	}
+
+	if _, has := firstMessage["function_call"]; !has {
+		if call, ok := secondMessage["function_call"]; ok {
+			firstMessage["function_call"] = call
+		}
+	}
+
+	firstChoiceItem["finish_reason"] = secondChoiceItem["finish_reason"]
+
+	mergeUsageTotals(first, second)
+
+	return first
 }
 
 // firstChoice 取 choices[0]。
@@ -4120,6 +4314,9 @@ func (f *chatFlow) recordAttempt(
 			delta.TokensPerSecond = tps
 		}
 	}
+
+	// 上游劣化滑窗（issue #488）：每次上游尝试计一次，TTFB 仅在有观测时计入。
+	f.h.upstreamHealth.observe(f.realm, f.bareModel, ttfb, false)
 
 	f.h.cfg.Pool.RecordTokenUsage(uid, delta)
 	// 健康台账（issue #16）：成功口径同 usage（deltaHasUsage），TTFT 有观测才并入。

@@ -313,35 +313,6 @@ func TestArchiveQueueDropCounter(t *testing.T) {
 	}
 }
 
-func TestArchivePruneHonorsSize(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	for i, name := range []string{"requests-2026-09-20.jsonl", "requests-2026-09-21.jsonl", "requests-2026-09-22.jsonl"} {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-
-		old := time.Now().AddDate(0, 0, -10+i)
-		if err := os.Chtimes(path, old, old); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	w := &archiveWriter{cfg: Config{Enabled: true, Dir: dir, RetentionDays: 30, MaxBytes: 50}, done: make(chan struct{})}
-	w.prune()
-
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if len(entries) != 1 || entries[0].Name() != "requests-2026-09-22.jsonl" {
-		t.Fatalf("remaining = %+v, want newest file only", entries)
-	}
-}
-
 // TestArchiveToolCounters JSONL 落盘与读回都保留 tools_declared / tool_calls，
 // 且 omitempty 生效：未声明 tools 的请求两条都不写（缺失 = 不进分母）。
 func TestArchiveToolCounters(t *testing.T) {

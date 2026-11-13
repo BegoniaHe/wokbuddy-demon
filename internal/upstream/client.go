@@ -287,20 +287,7 @@ func isPromptTooLongStatus(status int) bool {
 		status == http.StatusRequestEntityTooLarge
 }
 
-// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
-// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
-// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
-var (
-	alreadyCheckinMarkers = []string{"已签到", "already"}
-	// inactiveCheckinMarkers "活动未开启/未开放/已结束"等非错误态关键词（上游对未开放
-	// 的签到活动返回 code!=0 + 明确文案）。保守取带「活动」上下文的显式短语：未命中即判
-	// 真失败，避免把真失败误当 inactive 而漏报；也不误伤凭证类文案（如「登录态已过期」
-	// 含「已过期」但非活动态）。文案按实测补充（见 issue #27）。
-	inactiveCheckinMarkers = []string{
-		"活动未开启", "活动未开放", "活动已结束", "活动已过期",
-	}
-	badParamsMarkerCode = `"code":11101`
-)
+var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -1957,6 +1944,27 @@ func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (jso
 // 调用方需要「信封 / 顶层平铺」双解时用它（如 FetchAccountProfile），其余一律走
 // doJSONAt。
 func doRawAt(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, error) {
+	raw, status, err := doRawResponse(hc, req, maxBytes)
+	if err != nil {
+		return nil, status, err
+	}
+
+	if status >= http.StatusBadRequest {
+		kind := Classify(status, string(raw))
+
+		return nil, status, &Error{
+			Kind: kind, Status: status,
+			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
+		}
+	}
+
+	return raw, status, nil
+}
+
+// doRawResponse 发出请求并返回原始 body 与状态码：只做大小上限与传输层错误，
+// 不按状态码分类、不解信封。调用方要自己看 status 与 body 形态时用它
+// （签到回执：成功平铺 / 失败 400 信封都只能从原始 body 读）。
+func doRawResponse(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultJSONBodyLimit
 	}
@@ -1975,15 +1983,6 @@ func doRawAt(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, e
 	if int64(len(raw)) > maxBytes {
 		return nil, resp.StatusCode, fmt.Errorf("response body exceeds %d bytes: %w",
 			maxBytes, errDoJSONLimitFailed)
-	}
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		kind := Classify(resp.StatusCode, string(raw))
-
-		return nil, resp.StatusCode, &Error{
-			Kind: kind, Status: resp.StatusCode,
-			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
-		}
 	}
 
 	return raw, resp.StatusCode, nil
@@ -2201,6 +2200,61 @@ func (c *Client) refreshAt(ctx context.Context, base string, hdr *auth.Auth) (js
 	c.RefreshHeaders(req, hdr)
 
 	return c.doJSONFor(hdr, req)
+}
+
+// logoutBody 官方 logout 请求体：空 JSON 对象（与 refresh 同形态）。
+const logoutBody = "{}"
+
+// Logout 撤销账号在上游的登录会话（POST {realm base}/v2/plugin/auth/logout）。
+//
+// 官方客户端退登时确实会撤销服务端会话（main/common2.js ExternalLinkAuth.removeSession，
+// 带 X-No-Authorization: true 的三件套）；本仓此前只有 refresh，没有撤销路径——面板
+// 移除账号只删本地凭证，上游 refreshToken 仍然有效（issue #513）。
+//
+// 语义边界：撤销的是「这条 refreshToken 对应的会话」，不保证覆盖该账号在别处新登录的
+// 会话。无 refreshToken 时直接返回 errNoRefreshToken（已无可撤销对象）。
+func (c *Client) Logout(ctx context.Context, account *auth.Auth) error {
+	if account.RefreshTokenValue() == "" {
+		return errNoRefreshToken
+	}
+
+	origins := c.chatOrigins(account)
+
+	var lastErr error
+
+	for _, base := range origins {
+		err := c.logoutAt(ctx, base, account)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		// 只有「该域没有这个路径」才换下一个候选域；业务拒绝 / 401 / 5xx 直接返回，
+		// 不在别的域重复发撤销请求。
+		var ue *Error
+		if !errors.As(err, &ue) || ue.Kind != ErrNotFound {
+			break
+		}
+	}
+
+	return lastErr
+}
+
+// logoutAt 向单个 origin 发一次 logout 请求并解信封。
+func (c *Client) logoutAt(ctx context.Context, base string, account *auth.Auth) error {
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, base+"/v2/plugin/auth/logout", strings.NewReader(logoutBody),
+	)
+	if err != nil {
+		return fmt.Errorf("Logout: %w", err)
+	}
+
+	c.LogoutHeaders(req, account)
+
+	_, err = c.doJSONFor(account, req)
+
+	return err
 }
 
 // commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
@@ -5320,126 +5374,6 @@ func cyclePackageAmounts(account respAccount) (remain, used, size int64) {
 	}
 
 	return remain, used, size
-}
-
-// DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
-// 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
-// 让该账号整天漏签；「已签到」等业务错误不重试。
-// 签到是 X-Device-Token 的消费面之一（另一处是 chat，见 chatSurfaceOverrides；
-// auth/state 是面板登录面，不经本包），见 checkinHeaders。
-func (c *Client) DailyCheckin(ctx context.Context, a *auth.Auth) error {
-	return c.retryBillingTransient(ctx, func() error {
-		_, err := c.billingMeterJSONHeaders(a, checkinMeterPaths(), map[string]any{}, c.checkinHeaders(a))
-		return err
-	})
-}
-
-// CheckinActivityStatus 查询签到活动状态（官方桌面端 checkin-activity-status）。
-// 返回 today_checked_in；请求失败时调用方回落直接签到路径。
-func (c *Client) CheckinActivityStatus(a *auth.Auth) (todayChecked bool, err error) {
-	data, err := c.billingMeterJSONHeaders(
-		a, []string{checkinActivityStatusPath}, map[string]any{}, c.checkinHeaders(a),
-	)
-	if err != nil {
-		return false, err
-	}
-
-	var status struct {
-		TodayCheckedIn bool `json:"today_checked_in"`
-	}
-	if err := json.Unmarshal(data, &status); err != nil {
-		return false, fmt.Errorf("checkin status parse: %w", err)
-	}
-
-	return status.TodayCheckedIn, nil
-}
-
-// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
-// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
-// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
-func IsAlreadyCheckin(err error) bool {
-	return matchCheckinMarker(err, alreadyCheckinMarkers)
-}
-
-// IsCheckinInactive 报告 err 是否表示"签到活动未开启/未开放/已结束"等非错误态。
-// 与 IsAlreadyCheckin 同口径：只认 *Error.Msg，网络层/解析层错误不在此识别；
-// 保守策略——未命中显式 inactive 关键词即返回 false（真失败不误判为 inactive）。
-func IsCheckinInactive(err error) bool {
-	return matchCheckinMarker(err, inactiveCheckinMarkers)
-}
-
-// matchCheckinMarker 对 *Error.Msg 做大小写不敏感的关键词包含匹配。
-func matchCheckinMarker(err error, markers []string) bool {
-	var upErr *Error
-	if !errors.As(err, &upErr) {
-		return false
-	}
-
-	lower := strings.ToLower(upErr.Msg)
-	for _, m := range markers {
-		if strings.Contains(upErr.Msg, m) || strings.Contains(lower, strings.ToLower(m)) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// CheckinResult 签到结果分类：inactive（活动未开启）与 already（幂等）从真失败中分离，
-// 供调度日志与面板按类呈现，避免把非错误态刷成 error 行。
-type CheckinResult int
-
-const (
-	// CheckinOK 签到成功（err == nil）。
-	CheckinOK CheckinResult = iota
-	// CheckinAlready 上游幂等拒绝重复签到（"今天已签到"）。
-	CheckinAlready
-	// CheckinInactive 活动未开启/未开放/已结束等非错误态。
-	CheckinInactive
-	// CheckinFailed 其余业务/HTTP 错误（真失败）。
-	CheckinFailed
-)
-
-// ClassifyCheckin 归类签到结果。分类只描述「结果语义」，不改变重试与幂等判定。
-func ClassifyCheckin(err error) CheckinResult {
-	code := checkinBusinessCode(err)
-	switch {
-	case err == nil:
-		return CheckinOK
-	case code == "1001":
-		return CheckinAlready
-	case code == "1002" || code == "1003":
-		return CheckinInactive
-	case IsAlreadyCheckin(err):
-		return CheckinAlready
-	case IsCheckinInactive(err):
-		return CheckinInactive
-	default:
-		return CheckinFailed
-	}
-}
-
-// checkinBusinessCode 从 *Error 提取签到业务码：优先结构化 Code（Msg 截断不影响），
-// 再回落 Msg 文本匹配。非 *Error 返回空串。
-func checkinBusinessCode(err error) string {
-	var upstreamErr *Error
-	if !errors.As(err, &upstreamErr) {
-		return ""
-	}
-
-	for _, code := range []string{"1001", "1002", "1003"} {
-		if upstreamErr.Code == code || matchBusinessCode(upstreamErr.Msg, code) {
-			return code
-		}
-	}
-
-	return ""
-}
-
-// matchBusinessCode 匹配结构化业务码（顶层/嵌套 code、字符串或数字），
-// 完整比对避免 10012 被前缀匹配成 1001。
-func matchBusinessCode(msg, code string) bool {
-	return hasBusinessCode(msg, code)
 }
 
 func truncate(s string, n int) string {

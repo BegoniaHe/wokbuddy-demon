@@ -274,6 +274,9 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 		ResetAt: resetAt,
 		Reason:  reason,
 	}
+	// 额度窗口探针（issue #492）：到点后由调度器发一次最小请求钉住新窗口起点。
+	p.registerWindowProbeLocked(uid, model, entry2.a.Realm(), resetAt)
+
 	if p.onModelRateLimit != nil {
 		p.onModelRateLimit(uid, model, entry2.a.Realm(), resetAt)
 	}

@@ -707,6 +707,17 @@ function AccountRow({
     )
       return;
     if (
+      a === 'logout' &&
+      !(await confirm({
+        title: '撤销登录会话？',
+        description:
+          '将调用上游撤销这条 refreshToken 对应的登录会话（令牌立即失效），随后把账号出池并删除本地凭证。撤销范围不含该账号在别处新登录的会话；失败时本地凭证保持原样。',
+        confirmText: '撤销会话',
+        destructive: true,
+      }))
+    )
+      return;
+    if (
       a === 'disable' &&
       !(await confirm({
         title: '禁用账号？',
@@ -718,18 +729,32 @@ function AccountRow({
     )
       return;
     try {
-      if (a === 'checkin') {
-        const r = await postJSON<{ credits?: number; credits_total?: number; checkin_message?: string }>(
-          'accounts/' + encodeURIComponent(u) + '/checkin',
-        );
-        toast(
-          '签到完成' +
-            (r.credits != null
-              ? '，积分 ' + r.credits + (r.credits_total && r.credits_total > 0 ? '/' + r.credits_total : '')
-              : '') +
-            (r.checkin_message ? '（' + r.checkin_message + '）' : ''),
-          'ok',
-        );
+      if (a === 'logout') {
+        const r = await postJSON<{ file_error?: string }>('accounts/' + encodeURIComponent(u) + '/logout');
+        toast(r.file_error ? '会话已撤销（凭证文件删除失败：' + r.file_error + '）' : '已撤销登录会话', 'ok');
+      } else if (a === 'checkin') {
+        const r = await postJSON<{
+          checkin_state?: 'checked' | 'already' | 'inactive' | 'failed';
+          checkin_credit?: number;
+          checkin_message?: string;
+          skipped?: boolean;
+          reason?: string;
+        }>('accounts/' + encodeURIComponent(u) + '/checkin');
+        // 四态分开出文案（issue #511）：重复签到不再报成「签到完成」并显示余额当增量。
+        if (r.skipped) {
+          toast('未签到：' + (r.reason || '该账号无个人签到体系'), 'ok');
+        } else if (r.checkin_state === 'already') {
+          toast('今天已签到，无需重复', 'ok');
+        } else if (r.checkin_state === 'inactive') {
+          toast('签到活动未开启（非失败）' + (r.checkin_message ? '：' + r.checkin_message : ''), 'ok');
+        } else if (r.checkin_state === 'failed') {
+          toast('签到失败' + (r.checkin_message ? '：' + r.checkin_message : ''), 'err');
+        } else {
+          toast(
+            '签到成功' + (r.checkin_credit != null ? '，+' + r.checkin_credit + ' 积分' : ''),
+            'ok',
+          );
+        }
       } else if (a === 'travel') {
         const r = await postJSON<{ ran?: boolean; ok?: boolean; skip_reason?: string }>(
           'accounts/' + encodeURIComponent(u) + '/travel',
@@ -907,6 +932,13 @@ function AccountRow({
                 <DropdownMenuItem onClick={() => void act('disable')}>禁用</DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
+              <DropdownMenuItem
+                variant="destructive"
+                onClick={() => void act('logout')}
+                title="调用上游撤销这条 refreshToken 对应的会话，再删除本地凭证"
+              >
+                撤销登录会话
+              </DropdownMenuItem>
               <DropdownMenuItem variant="destructive" onClick={() => void act('remove')}>
                 移除
               </DropdownMenuItem>

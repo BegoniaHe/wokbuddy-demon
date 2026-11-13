@@ -12,6 +12,10 @@
     "request_accept_grace_seconds": 0,
     "shutdown_grace_seconds": 30,
     "cors_origins": [],
+    "upstream_health_window": "5m",
+    "upstream_health_ttfb_ms": 5000,
+    "upstream_health_5xx_ratio": 0.25,
+    "upstream_health_min_samples": 10,
     "trusted_proxies": ["127.0.0.1/32", "::1/128"]
   },
   "panel": {
@@ -21,6 +25,9 @@
     "request_archive_enabled": true,
     "request_retention_days": 7,
     "request_archive_max_mb": 100,
+    "runtime_log_enabled": false,
+    "runtime_log_retention_days": 7,
+    "runtime_log_max_mb": 100,
     "request_client_info": true,
     "decision_trace": false,
     "decision_trace_sample": 0.1
@@ -65,6 +72,8 @@
     "balance_refresh_minutes": 5,
     "task_sweep_enabled": true,
     "task_sweep_minutes": 15,
+    "window_probe_enabled": true,
+    "window_probe_minutes": 5,
     "makeup_cards_per_round": 0,
     "checkin_account_delay": "800ms",
     "slot_jitter": "20m",
@@ -111,6 +120,7 @@
     "rotate_budget": "0",
     "rotate_status_codes": [],
     "proxies": [],
+    "proxy_subscriptions": [],
     "proxy_slots": [],
     "realm_proxy_slots": {}
   },
@@ -175,6 +185,8 @@
       "cn": [],
       "global": []
     },
+    "media_partition": false,
+    "media_accounts": [],
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",

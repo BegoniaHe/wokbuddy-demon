@@ -67,12 +67,46 @@ func buildProxyRegistry(cfg *Config) (*outbound.Registry, error) {
 		})
 	}
 
-	reg, err := outbound.NewRegistry(cfg.Upstream.Proxies, slots, cfg.Upstream.RealmProxySlots)
+	proxies := cfg.Upstream.Proxies
+	// 订阅导入（issue #490）：解析结果并入同一份全局池；单个订阅失败保留上次成功
+	// 结果，不清空已有代理。
+	if len(cfg.Upstream.ProxySubscriptions) > 0 {
+		proxies = append(append([]string(nil), proxies...),
+			resolveProxySubscriptions(cfg.Upstream.ProxySubscriptions)...)
+	}
+
+	reg, err := outbound.NewRegistry(proxies, slots, cfg.Upstream.RealmProxySlots)
 	if err != nil {
 		return nil, fmt.Errorf("build proxy registry: %w", err)
 	}
 
 	return reg, nil
+}
+
+// refreshProxySubscriptions 手动刷新代理订阅（issue #490）：按当前落盘配置重新拉取
+// 订阅并重装注册表，返回生效的全局池代理数。构造失败保留旧出口（不清空现有代理）。
+func refreshProxySubscriptions(
+	cfgPath string, state *pool.Pool, client4 *upstream.Client,
+) (int, error) {
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		return 0, fmt.Errorf("读取配置失败: %w", err)
+	}
+
+	reg, err := buildProxyRegistry(cfg)
+	if err != nil {
+		return 0, err
+	}
+
+	client4.SetProxyRegistry(reg)
+	configureAccountRouting(state, client4, reg)
+	publishProxySlots(cfg)
+
+	if proxyPool := reg.Global(); proxyPool != nil {
+		return proxyPool.Len(), nil
+	}
+
+	return 0, nil
 }
 
 // failClosedDial 槽不可用时的拨号器：直接失败，绝不静默回落直连（issue #39）。

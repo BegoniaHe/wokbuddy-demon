@@ -36,6 +36,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/redisstore"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/runlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/server"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
@@ -159,6 +160,7 @@ func main() {
 	defer obs.usage.Stop()
 	defer obs.keys.Stop()
 	defer obs.reqlog.Close()
+	defer obs.runlog.Close()
 	// LIFO：quotaWorker 最先关停（排空队列时 usage.Recorder 仍可用），
 	// 早于 usage.Stop / cleanupRuntime 里的 pool.Close。
 	defer obs.quotaWorker.Close()
@@ -174,7 +176,13 @@ func main() {
 	// 任务补领清扫（上游同步窗口 issue #196）：周期幂等补领「已达标未领」的奖励，
 	// 与「一键完成」共用 claim 口径；默认 15 分钟、开关与间隔均热生效。
 	sch.SetTaskSweepHook(func(ctx context.Context) { panel2.RunTaskSweep(ctx) })
-	log.SetOutput(io.MultiWriter(os.Stderr, panel2.Logs()))
+	// 运行日志落盘出口追加为第三路：启用时 log.Printf 同时写磁盘（写入前脱敏）。
+	logSinks := []io.Writer{os.Stderr, panel2.Logs()}
+	if obs.runlog.Enabled() {
+		logSinks = append(logSinks, obs.runlog)
+	}
+
+	log.SetOutput(io.MultiWriter(logSinks...))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, panel2.Logs()))
 
 	handler := buildHandler(&handlerDeps{
@@ -193,6 +201,8 @@ func main() {
 		trustedProxies: trustedProxies,
 		authLimiter:    authLimiter,
 	})
+	// 上游劣化滑窗快照（issue #488）：panel 先于 handler 构造，这里注入只读来源。
+	panel2.SetUpstreamHealth(func() any { return handler.UpstreamHealthSnapshot() })
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -331,13 +341,14 @@ type observability struct {
 	quotaWorker *quotaWorker
 	keys        *apikey.Store
 	reqlog      *reqlog.Recorder
+	runlog      *runlog.Sink
 	pricing     *pricing.Catalog
 	agents      *agentcfg.Manager
 }
 
 // newPanel 构造管理面板：所有可改字段经 live 快照读取，重启项由 cfg 静态持有。
 //
-//nolint:revive // 装配参数多，拆 struct 只会把构造噪音转移到调用点。
+//nolint:funlen,revive // 装配参数多，拆 struct 只会把构造噪音转移到调用点。
 func newPanel(
 	cfg *Config, cfgPath string, state *pool.Pool, client4 *upstream.Client, sch *scheduler.Scheduler,
 	redisMode string, sessCount func() int, obs *observability, trustedProxies []*net.IPNet,
@@ -358,6 +369,7 @@ func newPanel(
 		Pool:           state,
 		Usage:          obs.usage,
 		RequestLog:     obs.reqlog,
+		RuntimeLog:     obs.runlog,
 		Keys:           obs.keys,
 		Upstream:       client4,
 		Scheduler:      sch,
@@ -378,11 +390,14 @@ func newPanel(
 		ProbeStateFile: stateSibling(cfg.StateFile, "model_probes.json"),
 		ConfigPath:     cfgPath,
 		ProxySlots:     currentProxySlotViews,
-		Pricing:        obs.pricing,
-		PricingRate:    cfg.Pricing.ExchangeRate,
-		Quota:          obs.quota,
-		Agents:         obs.agents,
-		CreditHistory:  creditLedger,
+		RefreshProxies: func() (int, error) {
+			return refreshProxySubscriptions(cfgPath, state, client4)
+		},
+		Pricing:       obs.pricing,
+		PricingRate:   cfg.Pricing.ExchangeRate,
+		Quota:         obs.quota,
+		Agents:        obs.agents,
+		CreditHistory: creditLedger,
 		LoadConfig: func() (any, error) {
 			return Load(cfgPath)
 		},
@@ -432,6 +447,8 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 		log.Printf("[reqlog] 请求指标已启用；JSONL 归档已关闭")
 	}
 
+	runtimeLog := setupRuntimeLog(cfg)
+
 	priceCat := newPricingCatalog(cfg)
 	home, _ := os.UserHomeDir()
 	agents := agentcfg.New(home, stateSibling(cfg.StateFile, "agent-backups"))
@@ -443,9 +460,33 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 		quotaWorker: quotaWk,
 		keys:        keyStore,
 		reqlog:      requestLog,
+		runlog:      runtimeLog,
 		pricing:     priceCat,
 		agents:      agents,
 	}
+}
+
+// setupRuntimeLog 构造运行日志落盘出口（issue #487）。未启用时返回 nil，多路写入器
+// 直接跳过，与既有「只写 stdout/stderr + 面板环形缓冲」逐字一致。
+func setupRuntimeLog(cfg *Config) *runlog.Sink {
+	sink, err := runlog.New(runlog.Config{
+		Dir:           stateSibling(cfg.StateFile, "runtime-logs"),
+		Enabled:       cfg.Logging.RuntimeLogEnabled,
+		RetentionDays: cfg.Logging.RuntimeLogRetentionDays,
+		MaxBytes:      int64(cfg.Logging.RuntimeLogMaxMB) << 20,
+	})
+	if err != nil {
+		log.Printf("WARN: [runlog] 运行日志落盘不可用: %v", err)
+
+		return nil
+	}
+
+	if sink.Enabled() {
+		log.Printf("[runlog] 运行日志已落盘 %s（保留 %d 天，上限 %d MiB）",
+			sink.Dir(), cfg.Logging.RuntimeLogRetentionDays, cfg.Logging.RuntimeLogMaxMB)
+	}
+
+	return sink
 }
 
 // serve 启动定时任务与 HTTP 监听，并在收到退出信号后等待在途流排空。
@@ -464,6 +505,8 @@ func serve(
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	// 任务补领清扫循环：0 = 暂停（task_sweep_enabled=false），运行期可热改间隔。
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 额度窗口探针循环（issue #492）：0 = 暂停（window_probe_enabled=false）。
+	sch.StartWindowProbe(ctx, cfg.WindowProbeInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -985,6 +1028,8 @@ func applyPoolConfig(state *pool.Pool, cfg *Config) {
 	state.SetCreditFloor(cfg.Pool.CreditFloor, cfg.Pool.CreditFloorByRealm)
 	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	// 号池分区（issue #491）：开关与媒体号列表随配置热生效。
+	state.SetMediaPartition(cfg.Pool.MediaPartition, cfg.Pool.MediaAccounts)
 	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)
 	state.SetScheduling(pool.Scheduling{
 		Strategy: map[string]pool.Strategy{
@@ -1050,6 +1095,7 @@ func applyRuntimeConfig(
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
+	sch.SetWindowProbeInterval(newCfg.WindowProbeInterval)
 	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
@@ -1135,6 +1181,9 @@ var restartFieldPaths = []string{
 	"listen", "auth_dir", "state_file",
 	"server.read_timeout", "server.max_body_bytes",
 	"server.request_accept_grace_seconds", "server.shutdown_grace_seconds",
+	// 上游劣化滑窗在 handler 构造期定型（window<=0 即关闭）。
+	"server.upstream_health_window", "server.upstream_health_ttfb_ms",
+	"server.upstream_health_5xx_ratio", "server.upstream_health_min_samples",
 	// CORS 允许列表在 handler 构造期复制，运行期无热更新。
 	"server.cors_origins",
 	// 可信反代网段在启动期解析为 *net.IPNet，运行期无热更新。
@@ -1169,6 +1218,8 @@ var restartFieldPaths = []string{
 	"session_sticky.derive_binding",
 	"logging.request_archive_enabled", "logging.request_retention_days",
 	"logging.request_archive_max_mb", "logging.decision_trace", "logging.decision_trace_sample",
+	// 运行日志落盘出口在启动期按目录构造。
+	"logging.runtime_log_enabled", "logging.runtime_log_retention_days", "logging.runtime_log_max_mb",
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段路径。

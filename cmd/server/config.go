@@ -105,6 +105,15 @@ type Config struct {
 		RequestRetentionDays int `json:"request_retention_days"`
 		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
 		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+		// RuntimeLogEnabled 运行日志按天落盘开关，缺省 false（只走 stdout/stderr
+		// 与面板环形缓冲，行为与之前完全一致）。开启后 log.Printf 的输出按天写入
+		// data/runtime-logs/server-<day>.log（写入前脱敏、按大小轮转），并供面板
+		// GET /panel/api/logs/export 按日期区间导出 ZIP。目录固定随 state_file。
+		RuntimeLogEnabled bool `json:"runtime_log_enabled"`
+		// RuntimeLogRetentionDays 运行日志保留天数，缺省 7；<=0 回落默认。
+		RuntimeLogRetentionDays int `json:"runtime_log_retention_days"`
+		// RuntimeLogMaxMB 运行日志总上限（MiB），缺省 100；<=0 回落默认。
+		RuntimeLogMaxMB int `json:"runtime_log_max_mb"`
 		// RequestClientInfo 是否在请求日志（归档事件 + stdout 流水行 + 面板运行
 		// 日志）里记录调用来源：客户端 IP 与 User-Agent。缺省 true。
 		//
@@ -154,6 +163,17 @@ type Config struct {
 		// 一律使用 RemoteAddr。缺省只信任本机回环，供同机反代使用。
 		// 改动需重启进程。
 		TrustedProxies []string `json:"trusted_proxies"`
+		// UpstreamHealthWindow 上游劣化滑窗宽度（issue #488），如 "5m"；"0" = 关闭。
+		// 窗口内按 (域, 模型) 与全局统计 TTFB 均值与 5xx 比例，超阈值打 WARN 并
+		// 暴露到面板 overview。只观测，不改变选号。改动需重启进程。
+		UpstreamHealthWindow string `json:"upstream_health_window"`
+		// UpstreamHealthTTFBMs TTFB 均值告警阈值（毫秒），缺省 5000。
+		UpstreamHealthTTFBMs int `json:"upstream_health_ttfb_ms"`
+		// UpstreamHealth5xxRatio 5xx 比例告警阈值（0~1），缺省 0.25。
+		UpstreamHealth5xxRatio float64 `json:"upstream_health_5xx_ratio"`
+		// UpstreamHealthMinSamples 触发评估的最小样本数，缺省 10；样本不足不告警
+		// （默认保守，避免低流量下误报）。
+		UpstreamHealthMinSamples int `json:"upstream_health_min_samples"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -217,6 +237,11 @@ type Config struct {
 		// 「已达标未领」的成长任务奖励（只补领、不代做任务）。默认开启。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+		// WindowProbeEnabled 额度窗口探针（issue #492）：6004 模型级限流带上游重置
+		// 墙钟时，到点后发一条 max_tokens=1 的最小请求，把新窗口起点钉住。缺省 true；
+		// 探针失败不罚号（不冷却/不喂连败），每个窗口最多重试 2 次。
+		WindowProbeEnabled bool `json:"window_probe_enabled"`
+		WindowProbeMinutes int  `json:"window_probe_minutes"` // 缺省 5；<=0 回落 5
 		// MakeupCardsPerRound 连登补签每轮成功上限：0 = 不限（保持既有行为），
 		// >0 = 每轮最多成功补签 N 天，剩余漏签留待下一轮。负数启动报错。
 		MakeupCardsPerRound int `json:"makeup_cards_per_round"`
@@ -356,6 +381,10 @@ type Config struct {
 		// Proxies 出站代理列表（issue #15）：支持 http://、https://、socks5://
 		// （可选 user:pass）；非空时出站按健康轮换，失败代理进入冷却。空 = 直连（默认）。
 		Proxies []string `json:"proxies"`
+		// ProxySubscriptions 代理订阅 URL 列表（issue #490）：http(s) 地址，内容支持
+		// base64 订阅文本 / Clash(KM) YAML `proxies:` 段 / 纯 URL 列表。解析结果并入
+		// Proxies 的同一份注册表；单个订阅失败保留上一次成功结果。热生效。
+		ProxySubscriptions []string `json:"proxy_subscriptions"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -465,6 +494,12 @@ type Config struct {
 			CN     []string `json:"cn"`
 			Global []string `json:"global"`
 		} `json:"account_order"`
+		// MediaPartition 号池分区（issue #491）：开启后图片/视频请求只从
+		// MediaAccounts 选号，文本请求只从其余账号选号，避免画图侧风控连坐文本号。
+		// 媒体号耗尽时选号明确失败（503 no_healthy_account），不跨区回落。默认关闭。
+		MediaPartition bool `json:"media_partition"`
+		// MediaAccounts 媒体号 uid 列表（仅 MediaPartition 开启时生效）。
+		MediaAccounts []string `json:"media_accounts"`
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
@@ -522,7 +557,9 @@ type Config struct {
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	// TaskSweepInterval 任务补领清扫周期（0 = 不启动，task_sweep_enabled=false）。
 	TaskSweepInterval time.Duration `json:"-"`
-	ExpiringSoonDur   time.Duration `json:"-"`
+	// WindowProbeInterval 额度窗口探针周期（0 = 不启动，window_probe_enabled=false）。
+	WindowProbeInterval time.Duration `json:"-"`
+	ExpiringSoonDur     time.Duration `json:"-"`
 	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
 	CheckinAccountDelayDur time.Duration `json:"-"`
 	// KeepaliveRefreshWindowDur 解析后的定时保活临期窗口（默认 24h）。
@@ -533,6 +570,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// UpstreamHealthWindowDur 上游劣化滑窗宽度（issue #488）；0 = 关闭。
+	UpstreamHealthWindowDur time.Duration `json:"-"`
 	// RotateBudgetDur 解析后的轮换总时长预算（issue #17）；0 = 不限。
 	RotateBudgetDur time.Duration `json:"-"`
 	// KeepaliveIntervalDur 解析后的入站 SSE 心跳间隔（issue #54）；0 = 关闭。
@@ -589,6 +628,10 @@ func baseDefaults() *Config {
 	config.Cooldown.SoftRateMax = "2h"
 	config.Server.ReadTimeout = "300s"
 	config.Server.MaxBodyBytes = defaultMaxBodyBytes
+	config.Server.UpstreamHealthWindow = "5m"
+	config.Server.UpstreamHealthTTFBMs = 5000
+	config.Server.UpstreamHealth5xxRatio = 0.25
+	config.Server.UpstreamHealthMinSamples = 10
 	// 缺省只信任本机回环：同机 nginx / Caddy 反代可直接拿到真实客户端 IP。
 	// 反代在另一台机器时必须显式配置，否则来源一律是反代地址。
 	config.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128"}
@@ -599,6 +642,8 @@ func baseDefaults() *Config {
 	config.Logging.RequestArchiveEnabled = true
 	config.Logging.RequestRetentionDays = 7
 	config.Logging.RequestArchiveMaxMB = 100
+	config.Logging.RuntimeLogRetentionDays = 7
+	config.Logging.RuntimeLogMaxMB = 100
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	config.Logging.RequestClientInfo = true
@@ -629,6 +674,9 @@ func applyScheduleDefaults(config2 *Config) {
 	// 任务补领清扫默认开启、15 分钟一轮：只补领「已达标未领」的奖励，幂等且零副作用。
 	config2.Schedule.TaskSweepEnabled = true
 	config2.Schedule.TaskSweepMinutes = 15
+	// 额度窗口探针默认开启、5 分钟一轮：只在 6004 带重置墙钟后产生一次最小请求。
+	config2.Schedule.WindowProbeEnabled = true
+	config2.Schedule.WindowProbeMinutes = 5
 	config2.Schedule.MakeupCardsPerRound = 0
 	config2.Schedule.CheckinAccountDelay = "800ms"
 	config2.Schedule.SlotJitter = "20m"
@@ -797,11 +845,13 @@ func WriteDefault(path string) (string, error) {
 	}
 
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		//nolint:gosec // 目录来自本地配置路径，属部署侧显式选择。
 		if merr := os.MkdirAll(dir, 0o755); merr != nil {
 			return "", fmt.Errorf("mkdir config dir: %w", merr)
 		}
 	}
 	// O_EXCL 原子拒绝覆盖：即使调用方漏判"不存在"，也绝不悄悄改写用户已有配置。
+	//nolint:gosec // 同上：配置路径由部署侧给出，落盘为设计行为。
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("write config: %w", err)
@@ -1483,11 +1533,16 @@ func (c *Config) normalizeLogging() error {
 }
 
 // normalizeProxies 校验出站代理 URL（issue #15）：任一非法即拒绝（避免运行时才暴露）。
+// 订阅 URL 只校验 scheme/host（内容在拉取时逐条校验，issue #490）。
 func (c *Config) normalizeProxies() error {
 	for _, raw := range c.Upstream.Proxies {
 		if _, err := outbound.ParseProxy(raw); err != nil {
 			return fmt.Errorf("upstream.proxies: %w", err)
 		}
+	}
+
+	if err := c.normalizeProxySubscriptions(); err != nil {
+		return err
 	}
 
 	seen := make(map[string]bool, len(c.Upstream.ProxySlots))
@@ -1517,6 +1572,31 @@ func (c *Config) normalizeProxies() error {
 	}
 
 	return c.normalizeRealmProxySlots(enabled)
+}
+
+// normalizeProxySubscriptions 归一订阅 URL（issue #490）：trim 后只允许 http/https
+// 且必须有 host；空串直接丢弃。
+func (c *Config) normalizeProxySubscriptions() error {
+	subs := make([]string, 0, len(c.Upstream.ProxySubscriptions))
+
+	for i, raw := range c.Upstream.ProxySubscriptions {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+
+		u, err := url.Parse(trimmed)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("upstream.proxy_subscriptions[%d]: 需要 http(s) 订阅 URL: %w",
+				i, errNormalizeProxiesFailed)
+		}
+
+		subs = append(subs, trimmed)
+	}
+
+	c.Upstream.ProxySubscriptions = subs
+
+	return nil
 }
 
 // normalizeRealmProxySlots 归一 realm 默认出口（issue #39）：键 trim+小写后只允许
@@ -1695,6 +1775,14 @@ func (c *Config) normalizeStaticDefaults() {
 
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+	}
+
+	if c.Logging.RuntimeLogRetentionDays <= 0 {
+		c.Logging.RuntimeLogRetentionDays = 7
+	}
+
+	if c.Logging.RuntimeLogMaxMB <= 0 {
+		c.Logging.RuntimeLogMaxMB = 100
 	}
 	// 停机排空窗口 0/负数视为未设置：缺省 30s，避免配置笔误把在途 SSE 直接掐断。
 	if c.Server.ShutdownGraceSeconds == 0 {
@@ -2122,6 +2210,38 @@ func (c *Config) normalizeServerDuration() error {
 			c.Server.ReadTimeout, errNormalizeServerDurationFailed)
 	}
 
+	return c.normalizeUpstreamHealth()
+}
+
+// normalizeUpstreamHealth 解析劣化滑窗宽度并校验阈值（issue #488）。
+func (c *Config) normalizeUpstreamHealth() error {
+	if c.Server.UpstreamHealthWindow == "" {
+		c.Server.UpstreamHealthWindow = "5m"
+	}
+
+	var err error
+	if c.UpstreamHealthWindowDur, err = time.ParseDuration(c.Server.UpstreamHealthWindow); err != nil {
+		return fmt.Errorf("server.upstream_health_window: %w", err)
+	}
+
+	if c.UpstreamHealthWindowDur < 0 {
+		return fmt.Errorf("server.upstream_health_window: 负时长 %q 无意义: %w",
+			c.Server.UpstreamHealthWindow, errNormalizeServerDurationFailed)
+	}
+
+	if c.Server.UpstreamHealth5xxRatio < 0 || c.Server.UpstreamHealth5xxRatio > 1 {
+		return fmt.Errorf("server.upstream_health_5xx_ratio: 必须在 [0,1]，当前 %v: %w",
+			c.Server.UpstreamHealth5xxRatio, errNormalizeServerDurationFailed)
+	}
+
+	if c.Server.UpstreamHealthTTFBMs <= 0 {
+		c.Server.UpstreamHealthTTFBMs = 5000
+	}
+
+	if c.Server.UpstreamHealthMinSamples <= 0 {
+		c.Server.UpstreamHealthMinSamples = 10
+	}
+
 	return nil
 }
 
@@ -2420,6 +2540,7 @@ func (c *Config) normalizeSchedule() error {
 	c.normalizeListenAndHours()
 	c.normalizeBalanceRefresh()
 	c.normalizeTaskSweep()
+	c.normalizeWindowProbe()
 
 	if err := c.normalizeMakeupCardsPerRound(); err != nil {
 		return err
@@ -2515,6 +2636,13 @@ func (c *Config) normalizeBalanceRefresh() {
 func (c *Config) normalizeTaskSweep() {
 	c.TaskSweepInterval = normalizeScheduleInterval(
 		c.Schedule.TaskSweepEnabled, &c.Schedule.TaskSweepMinutes, 15,
+	)
+}
+
+// normalizeWindowProbe 计算额度窗口探针周期：启用时 minutes<=0 回落 5；关闭时 0。
+func (c *Config) normalizeWindowProbe() {
+	c.WindowProbeInterval = normalizeScheduleInterval(
+		c.Schedule.WindowProbeEnabled, &c.Schedule.WindowProbeMinutes, 5,
 	)
 }
 

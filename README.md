@@ -109,6 +109,15 @@ docker compose up -d --build
 
 > 本项目滚动更新，没有版本号，只有 nightly。不用等 `v1.0`，它不会来。
 
+## 🗝️ 移除账号与撤销登录会话
+
+账号行右侧「更多操作」里有两个相近但**不同**的动作：
+
+- **移除**：只清本机。账号出池，删除 `auths/<uid>.json` 与其 `.bak`。上游那条 refreshToken **仍然有效**——适合只是不想再用这个号、但凭据还在自己手上。
+- **撤销登录会话**：先调上游 `POST /v2/plugin/auth/logout` 让这条 refreshToken 失效，成功后再走「移除」的本地收尾。适合怀疑凭据外泄、或想把该会话真正作废。
+
+撤销的范围是**这条 refreshToken 对应的会话**，不保证覆盖该账号在别处新登录的会话（官方客户端也没有设备清单 / 踢设备接口）。上游调用失败时不会删除本地凭证——撤销不成就把凭据弄丢，等于放弃唯一能撤销它的东西；唯一例外是凭证已被判定失效（401 / 会话失效），此时已无可撤销对象，直接清本地。
+
 ## 🎛️ 模型筛选（`models`）
 
 `config.json` 的 `models` 段决定哪些模型对调用方可见。三组配置互相独立、可叠加：
@@ -118,6 +127,26 @@ docker compose up -d --build
 - `models.aliases`：别名 → 上游模型。键可用 `*` / `?`（`path` 通配：`*` 任意长度含空、`?` 单字符）；精确键优先，多个通配同时命中时模式更长优先、同长取字典序较小的模式，未命中则原样透传。点名调用按解析后的**目标模型**受上面两套名单约束（目标被隐藏或不在白名单 → `400 model_unavailable`）；`/v1/models` 只列精确别名（通配键不出现），且要求别名名字本身也在白名单内，否则该别名不列出（别名可用但不可见）。改别名需重启。
 
 命名密钥自带的模型白名单（`/panel/` 密钥管理里的 glob）语义不变，与 `models.allowed` 取交集：两边都放行才可用。
+
+## 🖼️ 号池分区（`pool.media_partition` / `pool.media_accounts`）
+
+图片 / 视频请求比文本更容易触发上游按账号的风控与限额，一次画图被判异常可能连坐同一个账号上的文本请求。开启分区后两类请求各用各的号：
+
+- `pool.media_partition`：默认 `false`（不分区，行为与之前完全一致）。
+- `pool.media_accounts`：媒体号 uid 列表。开启分区后，`/v1/images/*` 与 `/v1/videos/generations` 只从这些账号选号；文本请求只从**其余**账号选号。
+- 媒体号耗尽时选号明确失败（`503 no_healthy_account`），**不跨区回落**——跨区回落等于绕过分区，与动机相反；全冷却兜底同样遵守分区。
+- 只影响选号池，不改账号归属、健康台账与 `state.json`；与 `pool.strategy` 等既有选号策略叠加，不是另一套框架。热生效。
+
+## ⏳ 额度窗口探针（`schedule.window_probe_enabled` / `window_probe_minutes`）
+
+上游对 6004 模型级限流会给出「将在 … 重置」的墙钟。重置之后，新的额度窗口要等**第一条请求**才开始计时；如果一直没请求，窗口起点就跟着漂到下一次真实流量上。开启探针后，网关在重置时刻到点主动发一条最小请求，把新窗口起点钉住：
+
+- `schedule.window_probe_enabled`：默认 `true`；`false` 关闭。
+- `schedule.window_probe_minutes`：探针轮询周期，默认 5 分钟（`<=0` 回落 5）。
+- 探针是一条 `max_tokens=1`、正文 `hi` 的最小 chat 请求。它会真实产生一次模型调用，但只有在该 (账号, 模型) **刚被 6004 限流并带重置时间**后、且重置时刻已到才会触发。
+- 同一个窗口最多试 2 次，两次间隔至少 10 分钟；成功即出账，不重复触发。
+- **失败不罚号**：探针失败不改账号健康、不计连败、不冷却、不喂熔断，只记一条 WARN（错误已脱敏）。
+- 台账是运行态、不落盘；重启后由下一次 6004 重新登记。热生效：面板保存配置即改周期。
 
 ## ✂️ 历史裁剪（`prompt.history_keep_turns`）
 
@@ -136,6 +165,7 @@ docker compose up -d --build
 - `upstream.proxies`：全局代理池。非空时按健康轮换，失败代理指数冷却（30s 起、10min 封顶），全部冷却后半开探测。空 = 直连（默认）。
 - `upstream.proxy_slots`：命名代理槽（`{id, name, url, enabled}`）。在面板「账号」页把某个账号绑定到槽，该账号即固定走这个出口。
 - `upstream.realm_proxy_slots`：`realm → 槽 id` 默认出口，键只允许 `cn` / `global`。账号自身未绑定槽时按账号 realm 选出口；值为空串等于未设置，指向不存在或已禁用的槽会在保存时被拒绝。
+- `upstream.proxy_subscriptions`：代理订阅 URL 列表（`http(s)` 地址）。拉取到的内容可以是纯 URL 列表、base64 包裹的同类列表，或 Clash/KM YAML 的 `proxies:` 段；解析结果并入 `proxies` 的同一份全局池，非法条目单独跳过且不整批失败。拉取失败时保留上一次成功结果，不清空现有代理。`POST /panel/api/proxy_subscriptions/refresh`（需 admin key）可手动刷新。
 
 **代理写法**：`http://host:port`、`https://host:port`、`socks5://host:port`、`socks5h://host:port`（均可带 `user:pass@`），以及机场常见的四段式 `host:port:user:pass`（按 **socks5** 处理，端口必须 1..65535）。面板与日志只展示脱敏形态（`scheme://host:port`），口令不进日志、不进健康快照。
 
@@ -173,6 +203,42 @@ docker compose up -d --build
 - `upstream.ttfb_keepalive_interval`（默认 `1500ms`）：**首帧等待期**专用间隔。网关为了「首帧即错误时能静默换号」，在上游第一帧到达前不写任何内容；大上下文下这段空窗可达秒级，客户端会按空闲超时断开。开启后按该间隔补注释帧，首帧一到立即停手（正常流不多写）。设为 `0` 关闭，回落逐字节旧行为。
 
 若等首帧期间已经写出过注释帧（响应头已提交）而轮转全部失败，网关降级为 `200` + SSE error 帧 + `[DONE]`，不会把 JSON 错误塞进已提交的流里；未提交时仍是原来的 JSON 错误码。
+
+## 🧾 运行日志落盘与导出（`logging.runtime_log_enabled` / `runtime_log_retention_days` / `runtime_log_max_mb`）
+
+默认只把运行日志写到 stdout/stderr 与面板的 500 条环形缓冲，重启即丢。开启落盘后追加一份按天归档：
+
+- `logging.runtime_log_enabled`：默认 `false`（不落盘，行为与之前一致）。开启后 `log.Printf` 的输出按天写入 `data/runtime-logs/server-<day>.log`。
+- `logging.runtime_log_retention_days`：保留天数，默认 7；`<=0` 回落默认。
+- `logging.runtime_log_max_mb`：目录总上限（MiB），默认 100；`<=0` 回落默认。单文件超过 16 MiB 时写成 `server-<day>.1.log` 等序号文件；总量与保留期按文件时间从旧到新裁剪。
+- 落盘前统一脱敏（`Authorization`、token 键值、URL 查询参数、长高熵串），磁盘与导出内容都是打码后的文本。
+- 以上三项**改动需重启**（出口在启动期按目录构造）。
+
+导出走只读接口 `GET /panel/api/logs/export`（`scopeRead`）：`from` / `to` 支持 unix 秒或毫秒、RFC3339、`2006-01-02T15:04` 与 `2006-01-02`，缺省导出当天；区间最长 31 天、未压缩总量上限 64 MiB、区间内无文件返回 404。未启用落盘时接口返回 501。面板前端暂无下载按钮，可直接用 `curl -H "Authorization: Bearer <key>" -o logs.zip "<网关>/panel/api/logs/export?from=2026-11-01&to=2026-11-13"`。
+
+## 📉 上游劣化滑窗（`server.upstream_health_*`）
+
+上游变慢或连续 5xx 时，网关默认只在单次请求里换号/冷却账号，没有一个「最近这段时间整体在变差」的信号。开启劣化滑窗后按 (域, 模型) 与全局统计固定窗口内的 TTFB 与 5xx 比例：
+
+- `server.upstream_health_window`：滑窗宽度，默认 `5m`；`"0"` 关闭。
+- `server.upstream_health_ttfb_ms`：TTFB 均值告警阈值，默认 `5000`。
+- `server.upstream_health_5xx_ratio`：5xx 比例告警阈值（0~1），默认 `0.25`。
+- `server.upstream_health_min_samples`：最小样本数，默认 `10`；样本不足不告警（默认保守，低流量不误报）。
+
+实现为 20 个环形桶、写入时惰性推进，**没有后台 goroutine**。超阈值时打一条 `WARN: [server] 上游劣化 ...`，同键同窗口只告警一次；当前窗口指标随 `GET /panel/api/overview` 的 `upstream_health` 字段输出（`rows` 含每 (域, 模型) 与全局的样本数、平均 TTFB、5xx 比例与是否越线）。**只观测与告警**：不冷却账号、不改选号、不喂熔断/连败。四项均**改动需重启**。
+
+## 🔬 取证采样（`WB2API_CAPTURE_DIR`）
+
+排查「上游说到一半就停」「声明了工具却只说一句」这类形态问题时，可以打开取证采样：
+
+```bash
+WB2API_CAPTURE_DIR=./data/capture ./wokbuddy-demon
+```
+
+- **默认关闭**：不设置该环境变量时不建目录、不写文件，请求行为与不开启时完全一致。
+- 开启后每次命中异常形态（预告句续写、工具轮续写、reasoning-only 救援、非流式续写、stop 无 tool_calls）落一份样本：`capture-<UTC 时间戳>-<形态>.json`。
+- 样本只含**请求形状**（模型、是否流式、声明工具数）、**脱敏后的响应尾部**（≤400 字）与**判定结果**；`Authorization` / token / Cookie / `uid=` 一律替换为 `[REDACTED]`。
+- 目录不可写只告警一次并降级，不影响请求。样本属于本机诊断材料，不要提交进仓库（`data/` 已 gitignore）。
 
 ## 🐾 适合谁
 

@@ -40,6 +40,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/runlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
@@ -75,6 +76,9 @@ type Config struct {
 	// ProxySlots 可供账号绑定的出站代理槽（issue #96）。provider 形态（issue #39）：
 	// 槽配置热生效，闭包每次读当前生效配置，不捕获装配期快照；nil 安全（= 无槽）。
 	ProxySlots func() []ProxySlotInfo
+	// RefreshProxies 手动刷新代理订阅并重装出站注册表（issue #490），返回生效的
+	// 全局池代理数；nil 时刷新接口返回 501。失败保留旧出口。
+	RefreshProxies func() (int, error)
 	// Pricing 等价价格缓存（issue #99）；nil = 关闭或未初始化。
 	Pricing     *pricing.Catalog
 	PricingRate float64
@@ -98,6 +102,11 @@ type Config struct {
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
+	// RuntimeLog 运行日志落盘出口（issue #487，nil = 未启用，导出接口返回 501）。
+	RuntimeLog *runlog.Sink
+	// UpstreamHealth 上游劣化滑窗快照来源（issue #488）；nil = 未挂载，overview
+	// 不输出该字段。main 在 handler 构造后注入。
+	UpstreamHealth func() any
 	// Keys 命名密钥存储（nil = 密钥接口返回 501）。仅面板管理；面板自身鉴权
 	// 仍只认默认 api_key（命名密钥是给网关客户端的，不应获得管理权限）。
 	Keys *apikey.Store
@@ -244,6 +253,12 @@ func New(cfg *Config) *Panel {
 // Logs 返回日志环形缓冲（main 经 MultiWriter 镜像 log 与 chat 表格日志进来）。
 func (p *Panel) Logs() *Ring { return p.logs }
 
+// SetUpstreamHealth 注入上游劣化滑窗快照来源（issue #488）。装配期调用一次，
+// 运行期只读。
+func (p *Panel) SetUpstreamHealth(provider func() any) {
+	p.cfg.UpstreamHealth = provider
+}
+
 func (p *Panel) routes() {
 	p.routesPages()
 	p.routesAccounts()
@@ -260,6 +275,7 @@ func (p *Panel) routesPages() {
 	p.route("GET /panel/{path...}", scopePublic, p.asset)
 	p.route("GET /panel/api/overview", scopeRead, p.overview)
 	p.route("GET /panel/api/logs", scopeRead, p.logsHandler)
+	p.route("GET /panel/api/logs/export", scopeRead, p.logsExport)
 	p.route("GET /panel/api/error_summary", scopeRead, p.errorSummaryHandler)
 	p.route("GET /panel/api/request_metrics", scopeRead, p.requestMetrics)
 	p.route("GET /panel/api/request_logs", scopeRead, p.requestLogs)
@@ -269,7 +285,6 @@ func (p *Panel) routesPages() {
 	p.route("POST /panel/api/agents/{client}/restore", scopeAdmin, p.agentsRestore)
 }
 
-//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesAccounts() {
 	p.route("POST /panel/api/accounts/{uid}/revive", scopeAdmin, p.accountRevive)
 	p.route("POST /panel/api/accounts/{uid}/disable", scopeAdmin, p.accountDisable)
@@ -280,6 +295,7 @@ func (p *Panel) routesAccounts() {
 	p.route("POST /panel/api/accounts/{uid}/balance", scopeAdmin, p.accountBalance)
 	p.route("POST /panel/api/accounts/{uid}/travel", scopeAdmin, p.accountTravel)
 	p.route("POST /panel/api/accounts/{uid}/remove", scopeAdmin, p.accountRemove)
+	p.route("POST /panel/api/accounts/{uid}/logout", scopeAdmin, p.accountLogout)
 }
 
 func (p *Panel) routesTasks() {
@@ -313,7 +329,6 @@ func (p *Panel) routesImport() {
 	p.route("POST /panel/api/import/encrypted", scopeAdmin, p.importEncrypted)
 }
 
-//nolint:dupl // 同 routesAccounts：逐条平铺比抽象注册表更易检索。
 func (p *Panel) routesUsage() {
 	p.route("GET /panel/api/packages", scopeRead, p.packages)
 	p.route("GET /panel/api/credit_history", scopeRead, p.creditHistoryHandler)
@@ -337,6 +352,7 @@ func (p *Panel) routesKeys() {
 	p.route("POST /panel/api/keys/{id}/realm", scopeAdmin, p.keysUpdateRealm)
 }
 
+//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesModels() {
 	p.route("GET /panel/api/models", scopeRead, p.models)
 	p.route("GET /panel/api/model_probes", scopeRead, p.modelProbes)
@@ -344,10 +360,12 @@ func (p *Panel) routesModels() {
 	p.route("GET /panel/api/model_health", scopeRead, p.modelHealth)
 }
 
+//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesConfig() {
 	p.route("GET /panel/api/config", scopeAdmin, p.getConfig)
 	p.route("POST /panel/api/config", scopeAdmin, p.saveConfig)
 	p.route("POST /panel/api/config/restore", scopeAdmin, p.restoreConfig)
+	p.route("POST /panel/api/proxy_subscriptions/refresh", scopeAdmin, p.refreshProxySubscriptions)
 }
 
 // route 把 pattern 同时写入 mux 与作用域表。重复 pattern 直接 panic：
@@ -568,7 +586,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 「每 N 分钟后台刷新、x 分钟前更新」。未刷新过时时间为零值（前端按 — 渲染）。
 	balanceRefreshSec, balanceRefreshedAt := p.cfg.Pool.BalanceRefreshMeta()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"version":              p.cfg.Version,
 		"balance_refresh_sec":  balanceRefreshSec,
 		"balance_refreshed_at": balanceRefreshedAt,
@@ -591,7 +609,13 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
-	})
+	}
+	// 上游劣化滑窗（issue #488）：只在 main 注入 provider 时输出。
+	if p.cfg.UpstreamHealth != nil {
+		response["upstream_health"] = p.cfg.UpstreamHealth()
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
@@ -1015,36 +1039,91 @@ func (*Panel) accountToggle(
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// runCheckin 执行单号签到并返回 (跳过原因, 是否已签, 说明文案)。
-// 跳过原因非空表示企业版无个人签到体系（issue #108）：不发起上游调用。
-// global 账号与调度器同口径正常签到（upstream.DailyCheckin 按 realm 分流）。
-// 其余情况按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游
-// 非错误态，不标记已签、给出可区分文案（issue #27）；其余才是真失败。
-func (p *Panel) runCheckin(
-	ctx context.Context, account *auth.Auth, uid string,
-) (denyReason string, done bool, msg string) {
-	if denyReason = checkinDenyReason(account); denyReason != "" {
-		return denyReason, false, denyReason
+// refreshProxySubscriptions 手动刷新代理订阅（issue #490）：重新拉取订阅并重装
+// 出站注册表。失败时返回错误、保留旧出口，不清空现有代理。
+func (p *Panel) refreshProxySubscriptions(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RefreshProxies == nil {
+		writeErr(w, http.StatusNotImplemented, "proxy subscriptions are not wired")
+		return
 	}
 
-	if err := p.cfg.Upstream.DailyCheckin(ctx, account); err != nil {
-		switch upstream.ClassifyCheckin(err) {
-		case upstream.CheckinAlready:
-			p.cfg.Pool.NoteCheckinDone(uid)
-			return "", true, "今天已签到"
-		case upstream.CheckinInactive:
-			return "", false, "签到活动未开启（非失败）"
-		default:
-			return "", false, err.Error() // 业务错误照常查余额
-		}
+	count, err := p.cfg.RefreshProxies()
+	if err != nil {
+		log.Printf("panel: 代理订阅刷新失败（保留旧出口）: %v", err)
+		writeErr(w, http.StatusBadGateway, "刷新代理订阅失败："+err.Error())
+
+		return
 	}
 
-	p.cfg.Pool.NoteCheckinDone(uid)
-
-	return "", true, ""
+	log.Printf("panel: 代理订阅已刷新（全局池 %d 个代理）", count)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxies": count})
 }
 
-// accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
+// runCheckin 执行单号签到并返回 (跳过原因, 回执)。
+// 跳过原因非空表示企业版无个人签到体系（issue #108）：不发起上游调用。
+// global 账号与调度器同口径正常签到（upstream.DailyCheckinReceipt 按 realm 分流）。
+// 回执带状态（新签到 / 今日已签 / 活动未开启 / 失败）与上游返回的签到积分，调用方
+// 据此分别出文案，不再靠「有没有 error」猜（issue #511）。
+func (p *Panel) runCheckin(
+	ctx context.Context, account *auth.Auth, uid string,
+) (denyReason string, receipt upstream.CheckinReceipt) {
+	if denyReason = checkinDenyReason(account); denyReason != "" {
+		return denyReason, upstream.CheckinReceipt{State: upstream.CheckinStateInactive}
+	}
+
+	receipt, err := p.cfg.Upstream.DailyCheckinReceipt(ctx, account)
+	if err != nil {
+		// 传输层/5xx 重试耗尽：回执已是 failed，日志留一行原因，文案仍用回执的通用描述。
+		log.Printf("panel: checkin uid=%s receipt error: %v", uid, err)
+	}
+
+	switch receipt.State {
+	case upstream.CheckinStateChecked, upstream.CheckinStateAlready:
+		// 今日已签到同样是幂等成功：标记当日已签，避免面板反复提示。
+		p.cfg.Pool.NoteCheckinDone(uid)
+	case upstream.CheckinStateInactive, upstream.CheckinStateFailed:
+		// 非成功态不标记已签。
+	}
+
+	return "", receipt
+}
+
+// checkinResponse 组装单号签到回执的可见字段：状态、是否算已签、可读文案与本次
+// 签到积分（只在新签到且上游带回数字时给增量）。
+func checkinResponse(
+	account *auth.Auth, denyReason string, checkin upstream.CheckinReceipt,
+) map[string]any {
+	done := checkin.State == upstream.CheckinStateChecked ||
+		checkin.State == upstream.CheckinStateAlready
+
+	resp := map[string]any{
+		"ok":            true,
+		"checkin_done":  done,
+		"checkin_state": string(checkin.State),
+	}
+	if denyReason != "" {
+		// 明确「跳过」而非「签到成功」：checkin_done 保持 false，reason 可读。
+		resp["skipped"] = true
+		resp["reason"] = denyReason
+	}
+
+	if account.IsEnterprise() {
+		resp["enterprise"] = true
+	}
+
+	if checkin.Message != "" {
+		resp["checkin_message"] = checkin.Message
+	}
+
+	// 只在新签到且回执带回数字时才给积分增量：重复签到没有增量，缺失时也不显示 0。
+	if checkin.State == upstream.CheckinStateChecked && checkin.CreditKnown {
+		resp["checkin_credit"] = checkin.Credit
+	}
+
+	return resp
+}
+
+// accountCheckin 单号签到：签到 + 余额查询解冻（已签到等业务拒绝不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
@@ -1059,22 +1138,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 额度查询按 realm/企业口径分流（upstream.UserResourceSnapshot）。
 	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
-	denyReason, checkinDone, checkinMsg := p.runCheckin(r.Context(), account, uid)
+	denyReason, checkin := p.runCheckin(r.Context(), account, uid)
 
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
-	if denyReason != "" {
-		// 明确「跳过」而非「签到成功」：checkin_done 保持 false，reason 可读。
-		resp["skipped"] = true
-		resp["reason"] = denyReason
-	}
-
-	if account.IsEnterprise() {
-		resp["enterprise"] = true
-	}
-
-	if checkinMsg != "" {
-		resp["checkin_message"] = checkinMsg
-	}
+	resp := checkinResponse(account, denyReason, checkin)
 
 	// 用含逐日到期批次的快照写入：单号签到同样保留完整批次，而不是把后台刷新
 	// 刚写入的批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
@@ -1090,7 +1156,8 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
 	resp["credits"] = snap.Remain
 	resp["credits_total"] = snap.Total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, snap.Remain, snap.Total)
+	log.Printf("panel: checkin uid=%s state=%s msg=%q credit=%d/%v credits=%d/%d",
+		uid, checkin.State, checkin.Message, checkin.Credit, checkin.CreditKnown, snap.Remain, snap.Total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1139,19 +1206,7 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileMsg := ""
-
-	if account.FilePath != "" {
-		if err := os.Remove(account.FilePath); err != nil && !os.IsNotExist(err) {
-			fileMsg = err.Error()
-		}
-		// safefile.WriteKeep 会留一份上一版凭证（含仍可能有效的 access token）；
-		// 删除账号时一并清掉，否则凭证残留在 auth 目录。
-		if err := os.Remove(account.FilePath + ".bak"); err != nil && !os.IsNotExist(err) && fileMsg == "" {
-			fileMsg = err.Error()
-		}
-	}
-
+	fileMsg := removeAccountCredentialFiles(account)
 	if fileMsg != "" {
 		log.Printf("panel: remove uid=%s（auth 文件删除失败: %s）", uid, fileMsg)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file_error": fileMsg})
@@ -1161,6 +1216,71 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountLogout 撤销账号在上游的登录会话（使 refreshToken 失效），再走与移除相同的
+// 本地收尾（出池 + 删凭证文件）。与 remove 的区别：移除只清本地，上游 RT 仍然有效。
+//
+// 失败路径不动本地凭证：撤销不成说明会话可能还活着，此时删掉本地凭证等于放弃唯一
+// 能撤销它的凭据。唯一的例外是凭证已失效（IsCredentialDead）——已无可撤销会话，
+// 照常删干净。
+func (p *Panel) accountLogout(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+
+	account := p.cfg.Pool.AuthByUID(uid)
+	if account == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+
+	if err := p.cfg.Upstream.Logout(r.Context(), account); err != nil {
+		if !upstream.IsCredentialDead(err) {
+			log.Printf("panel: logout uid=%s 上游撤销失败: %v", uid, err)
+			writeErr(w, http.StatusBadGateway, "撤销登录会话失败："+err.Error())
+
+			return
+		}
+
+		log.Printf("panel: logout uid=%s 凭证已失效，直接清理本地: %v", uid, err)
+	}
+
+	retired := p.cfg.Pool.Remove(uid)
+	if retired == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+
+	fileMsg := removeAccountCredentialFiles(retired)
+	if fileMsg != "" {
+		log.Printf("panel: logout uid=%s（会话已撤销，auth 文件删除失败: %s）", uid, fileMsg)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file_error": fileMsg})
+
+		return
+	}
+
+	log.Printf("panel: logout uid=%s（已撤销上游会话并删除凭证文件）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// removeAccountCredentialFiles 删除账号凭证文件与 .bak 备份，返回首次失败文案。
+// safefile.WriteKeep 会留一份上一版凭证（含仍可能有效的 access token）；删账号时
+// 一并清掉，否则凭证残留在 auth 目录。
+func removeAccountCredentialFiles(account *auth.Auth) string {
+	if account.FilePath == "" {
+		return ""
+	}
+
+	fileMsg := ""
+
+	if err := os.Remove(account.FilePath); err != nil && !os.IsNotExist(err) {
+		fileMsg = err.Error()
+	}
+
+	if err := os.Remove(account.FilePath + ".bak"); err != nil && !os.IsNotExist(err) && fileMsg == "" {
+		fileMsg = err.Error()
+	}
+
+	return fileMsg
 }
 
 // ---------------------------------------------------------------------------
