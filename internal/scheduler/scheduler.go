@@ -136,12 +136,25 @@ type Scheduler struct {
 	balanceSemOnce sync.Once
 	balanceSem     chan struct{}
 
+	// creditLowFired 已发出 credit_low 告警的账号（uid 集合）。
+	//
+	// 告警条件本身是电平：余额长期低于保底时，每轮余额刷新（默认 5 分钟一次）
+	// 都会满足 remain < floor。只靠 notify 的 10 分钟去重窗口抑制，等于把一个
+	// 持续状态变成无限期每 10 分钟一条的推送，而且永远没有恢复事件。这里做成
+	// 跨阈值触发：进入低余额时告警一次，回到保底以上时重新武装。
+	creditLowFired sync.Map
+
 	// nowFn 窗口判定时钟（测试注入固定时刻；nil 回退 time.Now）。
 	nowFn func() time.Time
 	// logger 调度日志出口（测试可注入本地 buffer；nil 回退 log.Default()）。
 	logger *log.Logger
 	// rndFn 账号间隔采样随机源（测试注入；nil 回退 math/rand/v2）。
 	rndFn func() float64
+
+	// bgWG 本调度器派生的后台 goroutine（周期循环 + 面板手动触发的批量任务）。
+	// 停机时必须先等它们退出，再关账号池：否则已派发任务在 pool.Close() 之后还在
+	// 改状态，最后一次 dirty 不会落盘（进程随即退出）。见 Wait。
+	bgWG sync.WaitGroup
 
 	// backfillDelays 签到瞬时失败后的分钟级补签窗口（issue #501）；空 = 默认
 	// 10/40 分钟。仅测试注入更短窗口。
@@ -526,6 +539,9 @@ func (s *Scheduler) nextWakeDetail(now time.Time) (time.Time, []taskKind, time.D
 // travelAccountDelay「测试可置 0」同口径）。
 var wakeupGraceDelay = 5 * time.Second
 
+// backfillCheckinDelay 补签批的账号间限速（与主批同量级；测试可置 0）。
+var backfillCheckinDelay = 800 * time.Millisecond
+
 // wakeupLateThreshold 迟到判定阈值：now 晚于槽位计划时刻超过 1s 才算迟到补跑。
 // 毫秒级抖动（timer 正常触发的偏移量级）不算，避免准点触发被误宽限。
 const wakeupLateThreshold = 1 * time.Second
@@ -725,13 +741,25 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 				s.schedMu.Unlock()
 
 				if hook != nil {
-					hook()
+					s.runHookGuarded(hook)
 				}
 			}
 		}(k)
 	}
 
 	wg.Wait()
+}
+
+// runHookGuarded 执行外部注入的回调（成长队列等）并隔离 panic：回调体在
+// panel 包内，任何 panic 都不应顺着调度器 goroutine 带崩进程。
+func (*Scheduler) runHookGuarded(hook func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERR: [scheduler] 回调 panic（已隔离）: %v", r)
+		}
+	}()
+
+	hook()
 }
 
 // sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
@@ -936,8 +964,15 @@ func (s *Scheduler) checkinBackfillWindows(ctx context.Context, targets []checki
 // 上一窗口也可能已成功），再复用 checkinOne（活动状态查询 / 已签记账 / 幂等拒绝
 // 三处判定与主批同一份）。
 func (s *Scheduler) backfillCheckins(ctx context.Context, targets []checkinBackfillTarget) {
-	for _, target := range targets {
+	for i, target := range targets {
 		if ctx.Err() != nil {
+			return
+		}
+
+		// 账号间隔与主批同口径（主批走 runPacedBatch + 相位错峰，补签批原先直接
+		// 顺序打上游）：上游 5xx 把整池塞进补签队列时，两个窗口各会以最大速度
+		// 连发 2N 个请求。
+		if i > 0 && !sleepCtx(ctx, backfillCheckinDelay) {
 			return
 		}
 
@@ -1254,7 +1289,19 @@ func (s *Scheduler) notifyCreditLow(account3 *auth.Auth, remain int64) {
 	}
 
 	floor := s.cfg.Pool.CreditFloorByRealm()[account3.Realm()]
-	if floor <= 0 || remain >= floor {
+	if floor <= 0 {
+		return
+	}
+
+	if remain >= floor {
+		// 已恢复：撤销「已告警」标记，下一次跌破时重新告警。
+		s.creditLowFired.Delete(account3.UID)
+
+		return
+	}
+
+	// 跨阈值触发：持续低于保底只在首次推送一次，避免按刷新周期反复告警。
+	if _, fired := s.creditLowFired.LoadOrStore(account3.UID, struct{}{}); fired {
 		return
 	}
 
@@ -1337,7 +1384,7 @@ loop:
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			s.refreshBalanceAccount(ctx, account4, uid, expiringSoon)
+			s.refreshBalanceGuarded(ctx, account4, uid, expiringSoon)
 		}(account, status.UID)
 	}
 
@@ -1345,6 +1392,20 @@ loop:
 
 	// 记录本轮完成时刻与周期，供面板展示「数据新鲜度」（issue #200）。
 	s.cfg.Pool.SetBalanceRefreshMeta(s.balanceRefreshSeconds(), time.Now())
+}
+
+// refreshBalanceGuarded 带 panic 隔离的单账号余额刷新：与批量任务同口径，
+// 单个账号的解析/越界 panic 不能带崩整个网关。
+func (s *Scheduler) refreshBalanceGuarded(
+	ctx context.Context, account *auth.Auth, uid string, expiringSoon time.Duration,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERR: [scheduler] 余额刷新 panic（已隔离账号 %s）: %v", logfmt.UID8(uid), r)
+		}
+	}()
+
+	s.refreshBalanceAccount(ctx, account, uid, expiringSoon)
 }
 
 // refreshBalanceAccount 单账号余额刷新：401 先 refresh 求证（issue #245），
@@ -1444,7 +1505,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 
 	s.balanceInterval.Store(int64(interval))
 
-	runIntervalLoop(ctx, &s.balanceInterval, s.rearmBalance, "余额后台刷新", s.runBalanceRefreshFirstRound,
+	runIntervalLoop(ctx, &s.bgWG, &s.balanceInterval, s.rearmBalance, "余额后台刷新", s.runBalanceRefreshFirstRound,
 		func(ctx context.Context) { s.RunBalanceRefreshNowCtx(ctx) })
 }
 
@@ -1452,10 +1513,10 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 //
 //nolint:gocognit // 暂停/重排/退出三路 select 交织，顺序即语义。
 func runIntervalLoop(
-	ctx context.Context, interval *atomic.Int64, rearm <-chan struct{}, label string,
+	ctx context.Context, wg *sync.WaitGroup, interval *atomic.Int64, rearm <-chan struct{}, label string,
 	first, tick func(context.Context),
 ) {
-	go func() {
+	wg.Go(func() {
 		var logged time.Duration
 
 		if first != nil {
@@ -1489,7 +1550,7 @@ func runIntervalLoop(
 				tick(ctx)
 			}
 		}
-	}()
+	})
 }
 
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
@@ -1531,7 +1592,7 @@ func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) 
 
 	s.taskSweepInterval.Store(int64(interval))
 
-	runIntervalLoop(ctx, &s.taskSweepInterval, s.rearmTaskSweep, "任务补领清扫", nil, s.runTaskSweepOnce)
+	runIntervalLoop(ctx, &s.bgWG, &s.taskSweepInterval, s.rearmTaskSweep, "任务补领清扫", nil, s.runTaskSweepOnce)
 }
 
 // runTaskSweepOnce 执行一轮补领清扫（hook 未挂载时跳过）。
