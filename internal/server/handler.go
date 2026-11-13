@@ -3198,6 +3198,10 @@ func (f *chatFlow) handleStreamSuccess(
 					"continuing once (declared_tools=%d)",
 					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel,
 					upstream.RedactForLog(tail, 160), f.declaredToolCount)
+				captureSample("narration_tail", f.bareModel, true, tail, map[string]any{
+					captureKeyDeclaredTools: f.declaredToolCount,
+					"tools_only":            f.declaredToolCount > 0,
+				})
 			})
 
 		stream = cont
@@ -3273,6 +3277,12 @@ func (f *chatFlow) warnStopWithoutToolCalls(finishReason string) {
 	log.Printf("WARN: [server] %s acct=%s model=%s: finish_reason=stop without tool_calls "+
 		"despite %d tool(s) declared (client will treat the turn as completed; tools never ran)",
 		f.st.mode, logfmt.Label(f.st.uid, f.st.nick), f.bareModel, f.st.toolsDeclared)
+
+	captureSample("stop_without_tool_calls", f.bareModel, f.stream, "", map[string]any{
+		captureKeyDeclaredTools: f.st.toolsDeclared,
+		captureKeyToolCalls:     f.st.toolCalls,
+		"finish_reason":         finishReason,
+	})
 }
 
 // retryOnceWithoutThinking 关思考同额度重发一次：返回 true 表示已重发（调用方直接
@@ -3299,6 +3309,10 @@ func (f *chatFlow) retryReasoningOnly(
 	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
 ) rotationAction {
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	captureSample("reasoning_only", f.bareModel, true, "", map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+	})
 
 	if action, retried := f.retryOnceWithoutThinking(
 		ctx, acct, &f.reasoningRetried, "stream", "reasoning-only output", i,
@@ -3364,6 +3378,10 @@ func (f *chatFlow) retryNonStreamReasoningOnly(
 	}
 
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	captureSample("reasoning_only", f.bareModel, false, "", map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+	})
 
 	if f.reasoningRetried {
 		log.Printf("WARN: [server] non-stream acct=%s model=%s: reasoning-only output again "+
@@ -3824,6 +3842,12 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 	if partial == "" {
 		return resp
 	}
+
+	captureSample("nonstream_continuation", f.bareModel, false, partial, map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+		"tools_only":            toolsOnly,
+		"shape":                 f.aggregateShape(resp),
+	})
 
 	f.nonstreamContinued = true
 

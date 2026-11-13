@@ -174,6 +174,19 @@ docker compose up -d --build
 
 若等首帧期间已经写出过注释帧（响应头已提交）而轮转全部失败，网关降级为 `200` + SSE error 帧 + `[DONE]`，不会把 JSON 错误塞进已提交的流里；未提交时仍是原来的 JSON 错误码。
 
+## 🔬 取证采样（`WB2API_CAPTURE_DIR`）
+
+排查「上游说到一半就停」「声明了工具却只说一句」这类形态问题时，可以打开取证采样：
+
+```bash
+WB2API_CAPTURE_DIR=./data/capture ./wokbuddy-demon
+```
+
+- **默认关闭**：不设置该环境变量时不建目录、不写文件，请求行为与不开启时完全一致。
+- 开启后每次命中异常形态（预告句续写、工具轮续写、reasoning-only 救援、非流式续写、stop 无 tool_calls）落一份样本：`capture-<UTC 时间戳>-<形态>.json`。
+- 样本只含**请求形状**（模型、是否流式、声明工具数）、**脱敏后的响应尾部**（≤400 字）与**判定结果**；`Authorization` / token / Cookie / `uid=` 一律替换为 `[REDACTED]`。
+- 目录不可写只告警一次并降级，不影响请求。样本属于本机诊断材料，不要提交进仓库（`data/` 已 gitignore）。
+
 ## 🐾 适合谁
 
 - 手上有多个 CodeBuddy 账号，但不想每天挨个打卡；
