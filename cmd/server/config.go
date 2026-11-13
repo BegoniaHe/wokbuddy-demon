@@ -469,6 +469,12 @@ type Config struct {
 			CN     []string `json:"cn"`
 			Global []string `json:"global"`
 		} `json:"account_order"`
+		// MediaPartition 号池分区（issue #491）：开启后图片/视频请求只从
+		// MediaAccounts 选号，文本请求只从其余账号选号，避免画图侧风控连坐文本号。
+		// 媒体号耗尽时选号明确失败（503 no_healthy_account），不跨区回落。默认关闭。
+		MediaPartition bool `json:"media_partition"`
+		// MediaAccounts 媒体号 uid 列表（仅 MediaPartition 开启时生效）。
+		MediaAccounts []string `json:"media_accounts"`
 		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
 		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
 		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。

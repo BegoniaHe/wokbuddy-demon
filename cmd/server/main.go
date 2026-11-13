@@ -988,6 +988,8 @@ func applyPoolConfig(state *pool.Pool, cfg *Config) {
 	state.SetCreditFloor(cfg.Pool.CreditFloor, cfg.Pool.CreditFloorByRealm)
 	state.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	state.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	// 号池分区（issue #491）：开关与媒体号列表随配置热生效。
+	state.SetMediaPartition(cfg.Pool.MediaPartition, cfg.Pool.MediaAccounts)
 	state.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback)
 	state.SetScheduling(pool.Scheduling{
 		Strategy: map[string]pool.Strategy{

@@ -157,7 +157,7 @@ func (p *Pool) ServableForModelRealm(model, realm string) bool {
 	}
 
 	for _, item := range p.byUID {
-		if p.excludeReason(item, model, realm, now) == "" {
+		if p.excludeReason(item, model, realm, false, now) == "" {
 			return true
 		}
 	}

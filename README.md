@@ -128,6 +128,15 @@ docker compose up -d --build
 
 命名密钥自带的模型白名单（`/panel/` 密钥管理里的 glob）语义不变，与 `models.allowed` 取交集：两边都放行才可用。
 
+## 🖼️ 号池分区（`pool.media_partition` / `pool.media_accounts`）
+
+图片 / 视频请求比文本更容易触发上游按账号的风控与限额，一次画图被判异常可能连坐同一个账号上的文本请求。开启分区后两类请求各用各的号：
+
+- `pool.media_partition`：默认 `false`（不分区，行为与之前完全一致）。
+- `pool.media_accounts`：媒体号 uid 列表。开启分区后，`/v1/images/*` 与 `/v1/videos/generations` 只从这些账号选号；文本请求只从**其余**账号选号。
+- 媒体号耗尽时选号明确失败（`503 no_healthy_account`），**不跨区回落**——跨区回落等于绕过分区，与动机相反；全冷却兜底同样遵守分区。
+- 只影响选号池，不改账号归属、健康台账与 `state.json`；与 `pool.strategy` 等既有选号策略叠加，不是另一套框架。热生效。
+
 ## ✂️ 历史裁剪（`prompt.history_keep_turns`）
 
 网关在**发往上游之前**丢弃过老的多轮历史，避免长会话把上下文与额度耗在已经无关的旧轮次上。
