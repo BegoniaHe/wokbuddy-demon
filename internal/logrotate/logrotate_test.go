@@ -291,3 +291,78 @@ func TestNewEmptyDirDisabled(t *testing.T) {
 		t.Fatalf("New=%v,%v want nil,nil", writer, err)
 	}
 }
+
+// Close 之后写入必须被丢弃且不重开文件。
+//
+// 停机顺序是 LIFO：runlog 先于 pool.Close 关闭，而 pool.Close 会打停机日志。
+// 若 Close 后还能重开文件，这些尾行既不会被 flush 也不会被 close，文件里留下
+// 半截缓冲、句柄泄漏到进程退出。
+func TestWriteAfterCloseIsDropped(t *testing.T) {
+	t.Parallel()
+
+	writer := newTestWriter(t, Config{})
+
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	mustWrite(t, writer, now, "before-close\n")
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Close 之后再写：不报错、不落盘、不重开文件。
+	if n, err := writer.WriteAt(now, []byte("after-close\n")); err != nil || n != len("after-close\n") {
+		t.Fatalf("Close 后写入 n=%d err=%v（应静默丢弃）", n, err)
+	}
+
+	if err := writer.Flush(); err != nil {
+		t.Fatalf("Close 后 Flush: %v", err)
+	}
+
+	files, err := writer.Files()
+	if err != nil {
+		t.Fatalf("Files: %v", err)
+	}
+
+	if len(files) != 1 {
+		t.Fatalf("files=%v want 1", files)
+	}
+
+	raw, err := os.ReadFile(files[0].Path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	if got := string(raw); got != "before-close\n" {
+		t.Fatalf("落盘内容=%q want %q", got, "before-close\n")
+	}
+}
+
+// TestNextPathDoesNotReusePrunedIndex 裁剪腾出的低序号不得被复用。
+//
+// 复用会破坏「文件名序 = 时间序」：pruneLocked 删的永远是最旧的（基准名 index 0），
+// 新内容再占用 index 0 后就比 .1/.2 更新，而 reqlog 的读路径依赖升序后倒序取最近 N 条。
+func TestNextPathDoesNotReusePrunedIndex(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// 模拟「基准名已被裁剪、只剩 .1」的当天目录。
+	if err := os.WriteFile(filepath.Join(dir, "server-2026-11-13.1.log"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err := New(&Config{
+		Dir: dir, Prefix: "server", Ext: ".log", FileMaxBytes: 1 << 20, MaxBytes: 1 << 20, RetentionDays: 7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = writer.Close() })
+
+	got := writer.nextPathLocked("2026-11-13")
+	want := filepath.Join(dir, "server-2026-11-13.2.log")
+
+	if got != want {
+		t.Fatalf("nextPath=%s want %s（不得复用被裁剪的序号）", got, want)
+	}
+}

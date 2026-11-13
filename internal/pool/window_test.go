@@ -136,3 +136,24 @@ func TestWindowProbeDropsStaleAndRemoved(t *testing.T) {
 		t.Errorf("账号移除后台账应一并清理, count=%d", testPool.WindowProbeCount())
 	}
 }
+
+// TestWindowProbeDropsOnSyncToDir 目录重扫剔除账号时与 Remove 同口径清台账。
+// 漏清会让 (uid, 模型) 探针留到 windowProbeMaxAge/尝试耗尽，期间占掉每轮额度。
+func TestWindowProbeDropsOnSyncToDir(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	testPool := windowProbePool(t, &now)
+
+	testPool.CooldownSoftForModel("u1", time.Minute, now.Add(30*time.Minute), "m1", "6004")
+
+	if testPool.WindowProbeCount() == 0 {
+		t.Fatal("前置：应已登记探针")
+	}
+
+	testPool.SyncToDir(nil) // 目录里已无该账号
+
+	if testPool.WindowProbeCount() != 0 {
+		t.Errorf("SyncToDir 剔除账号后台账应一并清理, count=%d", testPool.WindowProbeCount())
+	}
+}

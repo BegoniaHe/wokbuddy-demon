@@ -38,8 +38,52 @@ func TestApplyBackupRestoreCreated(t *testing.T) {
 	}
 }
 
+// TestApplyKeepsOriginalBackupWhenMetaMissing 原件备份是不可变事实：meta.json 丢失/
+// 损坏后再次 Apply，不能把「已被网关改写的当前内容」当成原件覆盖 original，
+// 否则用户的原始配置永久不可恢复。
+func TestApplyKeepsOriginalBackupWhenMetaMissing(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	m := New(home, filepath.Join(home, "backups"))
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk-test", Model: "glm-5.2"}
+
+	userPath := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(userPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	original := `{"user":"original-setting"}`
+	if err := os.WriteFile(userPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Apply("claude", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	// 模拟 writeMeta 失败/文件被删：此时 readMeta 失败会被当作「首次写入」。
+	if err := os.Remove(m.metaPath("claude")); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Apply("claude", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(m.originalPath("claude"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != original {
+		t.Fatalf("原件备份被覆写: %s", got)
+	}
+}
+
 func TestRestoreExistingBytes(t *testing.T) {
 	t.Parallel()
+
 	home := t.TempDir()
 
 	path := filepath.Join(home, ".claude", "settings.json")
@@ -468,5 +512,59 @@ func TestApplyCodexKeySurvivesTOMLRoundTrip(t *testing.T) {
 	// Go 的 %q 只会对这种字符写 \xNN，而 toml crate 不认该转义。
 	if strings.Contains(text, `\x`) {
 		t.Fatalf("config.toml 含 TOML 不认的 \\xNN 转义:\n%s", text)
+	}
+}
+
+// TestRestoreReleasesOriginalBackup 恢复后必须释放原件备份。
+//
+// 否则「恢复 → 用户手改 → 再 Apply」时 saveOriginal 因原件仍在而跳过备份，
+// 手改的内容没有入库，再 Restore 会写回最早那份原件，手改永久丢失。
+func TestRestoreReleasesOriginalBackup(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+
+	path := filepath.Join(home, ".claude", "settings.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	first := []byte("{\n  \"env\": {\"KEEP\": \"1\"}\n}\n")
+	if err := os.WriteFile(path, first, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New(home, filepath.Join(home, "backups"))
+	opts := Options{BaseURL: "http://127.0.0.1:7863", APIKey: "sk"}
+
+	if _, err := m.Apply("claude", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Restore("claude", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// 恢复后用户手改配置。
+	edited := []byte("{\n  \"env\": {\"KEEP\": \"2\"}\n}\n")
+	if err := os.WriteFile(path, edited, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := m.Apply("claude", opts); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := m.Restore("claude", false); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(got) != string(edited) {
+		t.Fatalf("恢复后应是手改内容:\n got=%s\nwant=%s", got, edited)
 	}
 }

@@ -38,6 +38,7 @@ import (
 	auth2 "github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
 // 上游常量：CN → www.workbuddy.cn（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
@@ -202,7 +203,12 @@ func doJSON(
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(resp.Body)
+	// 读错误必须上报：连接中断时半截 body 会让 Unmarshal 失败，最终报成
+	// 「parse failed」把网络问题误报成格式问题。与 internal/upstream 同口径加上限。
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("doJSON: read body: %w", readErr)
+	}
 
 	// 先解信封：业务错误可能随任意 HTTP 状态返回（含 4xx），code 比状态码更权威。
 	var env apiEnvelope
@@ -409,7 +415,10 @@ func runURL(base, origin, realm, statePath string, identity loginIdentity, clien
 		fatalf("marshal state: %v", merr)
 	}
 
-	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+	// 走 safefile（唯一临时名 + rename）：os.WriteFile 会跟随并截断预先放置的
+	// 符号链接，共享临时目录在多用户主机上可被用来覆盖他人文件；rename 替换的
+	// 是链接本身，不会落到目标路径。
+	if err := safefile.Write(statePath, raw, 0o600); err != nil {
 		fatalf("write state: %v", err)
 	}
 
@@ -447,11 +456,15 @@ func runPoll(
 }
 
 // failOnPollAccountError 处理 login/account 失败：12151 提示 pending 后退出，
-// 许可终态立即 fatal；其他错误保持忽略（与旧行为一致）。
+// 许可终态立即 fatal；信封内的其他业务码保持忽略（与旧行为一致）。
+//
+// 非信封错误（传输中断、JSON 解析失败）同样 fatal：此前这条路径静默通过，于是
+// stdout 打出 uid 为空的 token、state 文件被删、退出码 0——用户既拿不到账号信息，
+// 也无法用原 state 重试 poll，只能重跑整个 login url。
 func failOnPollAccountError(err error) {
 	codeErr, ok := errors.AsType[*logincode.Error](err)
 	if !ok {
-		return
+		fatalf("拉取登录账号信息失败: %v", err)
 	}
 
 	if logincode.IsPending(codeErr.Code) {
@@ -544,7 +557,7 @@ func pollTokenOnce(
 	base, state string, headers func(*http.Request), client *http.Client,
 ) (tokenBundle, int, error) {
 	tokRaw, status, errTok := doJSON(
-		client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil,
+		client, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(state), headers, nil,
 	)
 	if errTok != nil {
 		return tokenBundle{}, status, wrapTokenPollError(status, errTok)
@@ -612,7 +625,7 @@ func pollAccount(
 	acctRaw, _, errAcct := doJSON(
 		client,
 		http.MethodGet,
-		base+"/v2/plugin/login/account?state="+state,
+		base+"/v2/plugin/login/account?state="+url.QueryEscape(state),
 		acctHeaders,
 		nil,
 	)

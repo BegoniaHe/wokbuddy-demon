@@ -70,6 +70,14 @@ func main() {
 	}
 
 	fmt.Printf("\ntotal=%d ok=%d already=%d inactive=%d fail=%d\n", len(rows), okN, alreadyN, inactiveN, failN)
+
+	// 全部失败必须以非零码退出：cron/CI 包装器看到的是「成功」，
+	// 而 AUTH_INVALID 这类需要人工重新登录的状态没有其他机器信号。
+	// 只覆盖「所有账号都失败」——already/inactive 是正常结果，部分失败也不该
+	// 让整轮判负（避免破坏既有脚本语义）。
+	if failN > 0 && failN == len(rows) {
+		os.Exit(1)
+	}
 }
 
 // processAccounts 逐个账号签到并计数：OK / ALREADY 分别计数，其余状态一律计入 fail。
@@ -181,12 +189,20 @@ func classifyRefreshFailure(err error) string {
 
 // refreshIfNeeded 在 token 临近过期（2h 内）时刷新并原子落盘；
 // 落盘失败仅记日志（与旧行为一致），刷新错误原样上抛供调用方分类。
-func refreshIfNeeded(account *auth.Auth, up *upstream.Client) error {
+func refreshIfNeeded(account *auth.Auth, client *upstream.Client) error {
+	// 没有 refresh token 时跳过刷新：手写扁平 auth 常只带 accessToken、没有
+	// expiresAt，而 NeedsRefresh 会把「无过期时间」视为需要刷新。直接调用
+	// RefreshTokenIfNeeded 会以 no refresh token 失败，并经 IsCredentialDead 判成
+	// AUTH_INVALID——一个 AT 完全可用的账号被报「需要重新登录」，整轮还会退出 1。
+	if account.RefreshTokenValue() == "" {
+		return nil
+	}
+
 	if !account.NeedsRefresh(2 * time.Hour) {
 		return nil
 	}
 
-	if err := up.RefreshTokenIfNeeded(account, 2*time.Hour); err != nil {
+	if err := client.RefreshTokenIfNeeded(account, 2*time.Hour); err != nil {
 		return fmt.Errorf("refreshIfNeeded: %w", err)
 	}
 

@@ -8,10 +8,15 @@
 package prompt
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strings"
+	"unicode/utf8"
 )
 
 //go:embed defaultprompt.md
@@ -40,6 +45,12 @@ func Load(mode, file string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("prompt file %s: %w", file, err)
 	}
+	// 空文件必须报错：custom/append 模式下 systemPrompt 为空时 Rewrite/Append 直接
+	// 原样返回 body，等于「配了提示词文件、实际一行都没生效」，又把指纹误杀放回来，
+	// 而配置层只看得到「读取成功」。
+	if strings.TrimSpace(string(raw)) == "" {
+		return "", fmt.Errorf("prompt file %s（删除该配置项以使用内置默认提示词）: %w", file, errEmptyPromptFile)
+	}
 
 	return string(raw), nil
 }
@@ -57,9 +68,15 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 		return body
 	}
 
-	msgs, ok := obj["messages"].([]any)
+	msgs, ok := promptMessages(obj)
 	if !ok {
-		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
+		// messages 键存在但不是数组（字符串/对象/null）：改写只能靠覆盖，等于丢掉
+		// 客户端内容，故原样返回，交给上游按其原始语义处理。
+		return body
+	}
+
+	if msgs == nil {
+		// 键不存在 → 插入单条 system 后原样保留其余字段。
 		obj["messages"] = []any{systemMsg(systemPrompt)}
 		return marshalOr(obj, body)
 	}
@@ -76,6 +93,21 @@ func Rewrite(body []byte, systemPrompt string) []byte {
 	obj["messages"] = append([]any{systemMsg(systemPrompt)}, kept...)
 
 	return marshalOr(obj, body)
+}
+
+// promptMessages 取 body 的 messages 字段：
+//   - 键不存在 → (nil, true)，调用方插入单条 system；
+//   - 键存在且是数组 → (msgs, true)；
+//   - 键存在但类型不符（字符串/对象/null）→ (nil, false)，调用方放弃改写。
+func promptMessages(obj map[string]any) ([]any, bool) {
+	raw, exists := obj["messages"]
+	if !exists {
+		return nil, true
+	}
+
+	msgs, ok := raw.([]any)
+
+	return msgs, ok
 }
 
 // Append 解析 OpenAI 请求体并在"开头连续 system/developer 块"之后插入一条
@@ -100,9 +132,14 @@ func Append(body []byte, systemPrompt string) []byte {
 		return body
 	}
 
-	msgs, ok := obj["messages"].([]any)
+	msgs, ok := promptMessages(obj)
 	if !ok {
-		// 无 messages 字段或类型不符 → 插入单条 system 后原样保留其余字段。
+		// 同 Rewrite：键存在而类型不符时放弃改写，不覆盖客户端内容。
+		return body
+	}
+
+	if msgs == nil {
+		// 键不存在 → 插入单条 system 后原样保留其余字段。
 		obj["messages"] = []any{systemMsg(systemPrompt)}
 		return marshalOr(obj, body)
 	}
@@ -129,18 +166,58 @@ func Append(body []byte, systemPrompt string) []byte {
 // decodeBody 解析 OpenAI 请求体，供 Rewrite/Append 共用：
 // 空 body 或空 systemPrompt 直接判否（调用方原样返回，绝不失败）；
 // JSON 解析失败或顶层为 null 同样判否（nil map 不可写入，否则后续赋值 panic）。
+//
+// UseNumber：改写只是动 messages，不能顺手改掉客户端的数值字面量。默认解码会把
+// 一切数字变 float64 —— seed 9007199254740993 变成 ...992、1.0 变成 1、1e21 变成
+// 1e+21（与 split.go / internal/server/logging.go 的 rewriteModel 同口径）。
 func decodeBody(body []byte, systemPrompt string) (map[string]any, bool) {
 	if len(body) == 0 || systemPrompt == "" {
 		return nil, false
 	}
 
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+	obj, err := decodeJSONObject(body)
+	if err != nil || obj == nil {
 		return nil, false
 	}
 
 	return obj, true
 }
+
+// decodeJSONObject 以 UseNumber 语义解析顶层 JSON 对象（数值按字面量保留）。
+func decodeJSONObject(body []byte) (map[string]any, error) {
+	// 非法 UTF-8 一律不改写：json.Unmarshal 会把坏字节替换成 U+FFFD，回写后 body
+	// 与客户端发出的内容不再逐字节相同，而不改写时它是原样转发的。改写只该动
+	// messages 的形状，不该顺手改写内容编码。
+	if !utf8.Valid(body) {
+		return nil, errInvalidUTF8Body
+	}
+
+	var obj map[string]any
+
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+
+	if err := dec.Decode(&obj); err != nil {
+		return nil, fmt.Errorf("decode json object: %w", err)
+	}
+
+	// 尾随内容必须拒绝：{}{} 或 {}garbage 会被改写成只剩第一个对象再发出去，
+	// 「改写绝不失败」就变成了「悄悄丢数据」。与 clientprofile 的 ensureEOF 同口径。
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, errTrailingJSON
+	}
+
+	return obj, nil
+}
+
+// errTrailingJSON 请求体在第一个 JSON 对象之后还有内容：不做改写，原样转发。
+var errTrailingJSON = errors.New("request body has trailing content after JSON object")
+
+// errInvalidUTF8Body 请求体含非法 UTF-8：调用方原样转发（见 decodeBody）。
+var errInvalidUTF8Body = errors.New("request body is not valid UTF-8")
+
+// errEmptyPromptFile 提示词文件内容为空：custom/append 模式会静默退化成 passthrough。
+var errEmptyPromptFile = errors.New("prompt file is empty")
 
 // systemMsg 构造一条网关自有 system 消息（角色固定 system，理由见 Append 注释）。
 func systemMsg(content string) map[string]any {
@@ -185,8 +262,9 @@ func EnsureSystemFirst(body []byte, fallback string) []byte {
 		return body
 	}
 
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	// UseNumber：只改首条消息的 role，其余字段（含 seed 等大整数）必须逐字保留。
+	obj, err := decodeJSONObject(body)
+	if err != nil {
 		return body
 	}
 
@@ -209,10 +287,6 @@ func EnsureSystemFirst(body []byte, fallback string) []byte {
 
 	if fallback == "" {
 		fallback = Degraded
-	}
-
-	if fallback == "" {
-		return body
 	}
 
 	rewritten := make([]any, 0, len(msgs)+1)

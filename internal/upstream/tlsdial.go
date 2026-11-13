@@ -39,6 +39,13 @@ type tlsFingerprintConfig struct {
 
 // tlsHandshakeState 会话恢复缓存（首次握手时惰性创建）。两种 TLS 实现各有自己的
 // 接口类型，不能共用；缓存本身是并发安全的。
+//
+// 作用域：一份缓存只能被「同一个连接池」使用。默认出口（c.HTTP）一份；每个按槽
+// Transport 各一份（见 slotTLSState）。跨账号、跨槽共用一份会让账号 A 在出口 X 上
+// 建下的 ticket/SessionID 被账号 B（或另一个出口 IP）在对同一 host 握手时恢复——
+// 恢复出的 ClientHello 带 pre_shared_key，上游看到的「同一设备会话」横跨了本应
+// 隔离的账号与出口，直接抵消 client.go 里「每个槽独立 Transport，连接池不跨账号
+// 共享」的隔离意图。
 type tlsHandshakeState struct {
 	goCache   tls.ClientSessionCache
 	utlsCache utls.ClientSessionCache
@@ -140,7 +147,8 @@ func (c *Client) forEachTransport(apply func(*http.Transport)) {
 // dialTLSContext 共享 Transport 的稳定 TLS 拨号包装：每次握手读取当前代理拨号器与
 // 指纹开关，与 c.dialContext 同口径（热改代理对新连接立即生效）。
 func (c *Client) dialTLSContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return c.dialTLSWith(ctx, network, addr, c.dialContext)
+	// 共享 Transport：作用域键为空，用 Client 级缓存（与共享连接池同粒度）。
+	return c.dialTLSWith(ctx, network, addr, c.dialContext, "")
 }
 
 // dialTLSWith 用给定底层拨号器建连并完成 TLS 握手。dial 负责返回已包装
@@ -148,6 +156,7 @@ func (c *Client) dialTLSContext(ctx context.Context, network, addr string) (net.
 func (c *Client) dialTLSWith(
 	ctx context.Context, network, addr string,
 	dial func(ctx context.Context, network, addr string) (net.Conn, error),
+	stateKey string,
 ) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -159,7 +168,7 @@ func (c *Client) dialTLSWith(
 		return nil, err
 	}
 
-	conn, err := c.handshakeTLS(ctx, raw, host)
+	conn, err := c.handshakeTLS(ctx, raw, host, stateKey)
 	if err != nil {
 		_ = raw.Close()
 
@@ -171,7 +180,9 @@ func (c *Client) dialTLSWith(
 
 // handshakeTLS 完成握手并在需要时套上明文头序重写。失败直接返回错误，不回落标准库
 // TLS（回落会泄漏调用方明确要求隐藏的指纹）。
-func (c *Client) handshakeTLS(ctx context.Context, raw net.Conn, host string) (net.Conn, error) {
+func (c *Client) handshakeTLS(
+	ctx context.Context, raw net.Conn, host, stateKey string,
+) (net.Conn, error) {
 	handshakeCtx, cancel := context.WithTimeout(ctx, tlsHandshakeTimeout)
 	defer cancel()
 
@@ -181,9 +192,9 @@ func (c *Client) handshakeTLS(ctx context.Context, raw net.Conn, host string) (n
 	)
 
 	if config := c.tlsFingerprint.Load(); config != nil {
-		conn, err = c.handshakeUTLS(handshakeCtx, raw, host, config.spec)
+		conn, err = c.handshakeUTLS(handshakeCtx, raw, host, config.spec, stateKey)
 	} else {
-		conn, err = c.handshakeGoTLS(handshakeCtx, raw, host)
+		conn, err = c.handshakeGoTLS(handshakeCtx, raw, host, stateKey)
 	}
 
 	if err != nil {
@@ -198,8 +209,10 @@ func (c *Client) handshakeTLS(ctx context.Context, raw net.Conn, host string) (n
 }
 
 // handshakeGoTLS 标准库 TLS 握手：保留系统根证书、SNI、TLS1.2+ 与会话恢复。
-func (c *Client) handshakeGoTLS(ctx context.Context, raw net.Conn, host string) (net.Conn, error) {
-	state := c.tlsHandshakeState()
+func (c *Client) handshakeGoTLS(
+	ctx context.Context, raw net.Conn, host, stateKey string,
+) (net.Conn, error) {
+	state := c.tlsHandshakeStateFor(stateKey)
 
 	conn := tls.Client(raw, &tls.Config{
 		ServerName:         host,
@@ -218,14 +231,14 @@ func (c *Client) handshakeGoTLS(ctx context.Context, raw net.Conn, host string) 
 // handshakeUTLS 用 profile 的 ClientHelloSpec 完成真实握手。配置层同时禁用动态记录
 // 分片，并打开会话恢复（第二次连接走 PSK + padding）。
 func (c *Client) handshakeUTLS(
-	ctx context.Context, raw net.Conn, host string, spec *clientprofile.TLS,
+	ctx context.Context, raw net.Conn, host string, spec *clientprofile.TLS, stateKey string,
 ) (net.Conn, error) {
 	helloSpec, err := clientHelloSpec(spec, host)
 	if err != nil {
 		return nil, fmt.Errorf("构造 ClientHello: %w", err)
 	}
 
-	state := c.tlsHandshakeState()
+	state := c.tlsHandshakeStateFor(stateKey)
 
 	uconn := utls.UClient(raw, &utls.Config{
 		ServerName:                  host,
@@ -248,19 +261,44 @@ func (c *Client) handshakeUTLS(
 	return uconn, nil
 }
 
-// tlsHandshakeState 惰性创建两种 TLS 实现的会话缓存（每 Client 一份，跨连接/跨槽共享）。
-func (c *Client) tlsHandshakeState() *tlsHandshakeState {
+// tlsHandshakeStateFor 取指定作用域的会话缓存。空键 = 共享 Transport 的 Client 级
+// 缓存；非空键 = 按槽 Transport 专属缓存（键与 slotClients 同构，故生命周期与
+// 该槽的 Transport 一致，出口热改时随 invalidateSlotClients 一起丢弃）。
+func (c *Client) tlsHandshakeStateFor(key string) *tlsHandshakeState {
+	if key != "" {
+		c.slotMu.Lock()
+
+		state := c.slotTLSState[key]
+		if state == nil {
+			state = newTLSHandshakeState()
+
+			if c.slotTLSState == nil {
+				c.slotTLSState = map[string]*tlsHandshakeState{}
+			}
+
+			c.slotTLSState[key] = state
+		}
+		c.slotMu.Unlock()
+
+		return state
+	}
+
 	c.tlsStateMu.Lock()
 	defer c.tlsStateMu.Unlock()
 
 	if c.tlsState == nil {
-		c.tlsState = &tlsHandshakeState{
-			goCache:   tls.NewLRUClientSessionCache(64),
-			utlsCache: utls.NewLRUClientSessionCache(64),
-		}
+		c.tlsState = newTLSHandshakeState()
 	}
 
 	return c.tlsState
+}
+
+// newTLSHandshakeState 建一份空缓存（两种 TLS 实现的接口类型不同，各建一份）。
+func newTLSHandshakeState() *tlsHandshakeState {
+	return &tlsHandshakeState{
+		goCache:   tls.NewLRUClientSessionCache(64),
+		utlsCache: utls.NewLRUClientSessionCache(64),
+	}
 }
 
 // FingerprintMode 返回当前生效的 TLS 指纹模式（面板/测试只读）。

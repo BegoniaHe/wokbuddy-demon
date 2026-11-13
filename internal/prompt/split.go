@@ -11,11 +11,11 @@
 package prompt
 
 import (
-	"bytes"
 	"encoding/json"
 	"maps"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // minSentencesPerSplit 拆出的一条 system 至少要包含的句数（另一条同样要满足）。
@@ -30,19 +30,17 @@ const minSentencesPerSplit = 2
 // 含 ≥2×minSentencesPerSplit 句、且拆出的两条都非空时才拆；否则原样返回 false，
 // 调用方回落到既有兜底。content 非字符串（多模态数组）不动——拆 part 不属于本形态。
 func SplitSystemBySentences(body []byte) ([]byte, bool) {
-	if len(body) == 0 {
+	// 非法 UTF-8 不改写：json 解码会把坏字节换成 U+FFFD，回写后与客户端原文不再
+	// 逐字节相同（不改写时 body 是原样转发的）。
+	if len(body) == 0 || !utf8.Valid(body) {
 		return body, false
 	}
 
-	// UseNumber：seed / 大整数 id 这类字段按字面量保留。走 float64 会把
-	// 9007199254740993 变成 ...992——拆句只是改消息边界，不能顺手改掉客户端的数据
-	// （与 internal/server/logging.go 的 rewriteModel 同口径）。
-	var obj map[string]any
-
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-
-	if err := dec.Decode(&obj); err != nil || obj == nil {
+	// 走 decodeJSONObject：UTF-8 校验、UseNumber（seed / 大整数 id 按字面量保留）与
+	// 「第一个 JSON 值之后不得有尾随内容」的守卫只此一份——先前这里复制了同一段
+	// 解码逻辑，改一处忘另一处就会让两条改写路径对同一份 body 得出不同结论。
+	obj, err := decodeJSONObject(body)
+	if err != nil || obj == nil {
 		return body, false
 	}
 
@@ -51,21 +49,7 @@ func SplitSystemBySentences(body []byte) ([]byte, bool) {
 		return body, false
 	}
 
-	out := make([]any, 0, len(msgs)+1)
-	split := false
-
-	for _, raw := range msgs {
-		halves, ok := splitSystemMessage(raw)
-		if !ok {
-			out = append(out, raw)
-
-			continue
-		}
-
-		out = append(out, halves...)
-		split = true
-	}
-
+	out, split := splitFirstLongSystem(msgs)
 	if !split {
 		return body, false
 	}
@@ -78,6 +62,38 @@ func SplitSystemBySentences(body []byte) ([]byte, bool) {
 	}
 
 	return rewritten, true
+}
+
+// splitFirstLongSystem 只拆第一条命中的长 system，其余消息原样保留。
+//
+// 判据（「只有一条 system 含 ≥2×minSentencesPerSplit 句」）与实现必须一致：每条都
+// 拆会把 Claude Code 常见的多段 system 全部翻倍，改写面远超该变体声明的范围。
+func splitFirstLongSystem(msgs []any) ([]any, bool) {
+	out := make([]any, 0, len(msgs)+1)
+	split := false
+
+	for _, raw := range msgs {
+		// 已拆过一条就只搬运：splitSystemMessage 会为每条消息重建 rune 数组并
+		// 全串切句，而它判据里还有「只拆第一条」——先做重活再判早退等于给
+		// 长对话里剩下的每条消息（Claude Code 常见几十条）白付一次切句成本。
+		if split {
+			out = append(out, raw)
+
+			continue
+		}
+
+		halves, ok := splitSystemMessage(raw)
+		if !ok {
+			out = append(out, raw)
+
+			continue
+		}
+
+		out = append(out, halves...)
+		split = true
+	}
+
+	return out, split
 }
 
 // splitSystemMessage 尝试把一条 system/developer 消息拆成两条；不适用时 ok=false。

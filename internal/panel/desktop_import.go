@@ -26,7 +26,15 @@ var (
 )
 
 // desktopScan 扫描本机桌面客户端凭据目录，只返回元数据（不含 token）。
-func (*Panel) desktopScan(w http.ResponseWriter, _ *http.Request) {
+//
+// 与 agents* 同口径的回环护栏：扫描结果含本机绝对路径（家目录/用户名），导入
+// 又会读本机文件，不该对远端凭据持有者开放。
+func (p *Panel) desktopScan(w http.ResponseWriter, r *http.Request) {
+	if !p.loopbackRequest(r) {
+		writeErr(w, http.StatusForbidden, "仅限本机访问")
+		return
+	}
+
 	accounts := desktopcred.Scan()
 	if accounts == nil {
 		accounts = []desktopcred.Account{}
@@ -38,6 +46,11 @@ func (*Panel) desktopScan(w http.ResponseWriter, _ *http.Request) {
 // desktopImport 用一次性 at-rest secret 解密并导入选中的凭据文件。
 // 请求：{"key":"<base64>","paths":["..."]}；paths 为空 = 扫描到的全部文件。
 func (p *Panel) desktopImport(w http.ResponseWriter, r *http.Request) {
+	if !p.loopbackRequest(r) {
+		writeErr(w, http.StatusForbidden, "仅限本机访问")
+		return
+	}
+
 	req, err := parseDesktopImport(r)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())

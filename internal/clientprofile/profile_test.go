@@ -389,3 +389,27 @@ func TestLoadDirRejectsRealmTLSDiff(t *testing.T) {
 		t.Fatalf("相同 tls 段应合法: %v", err)
 	}
 }
+
+// TestLoadDirSkipsUnknownJSON 目录里的无关 json（macOS 资源叉、手工说明、缓存）
+// 不该让进程拒绝启动；只有 cn.json / global.json 解析失败才 fail fast。
+func TestLoadDirSkipsUnknownJSON(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeProfile(t, dir, "cn.json", validProfile("cn"))
+
+	for _, name := range []string{"._cn.json", "readme.json", "models-cache.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("not a profile"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	set, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("无关 json 不应导致启动失败: %v", err)
+	}
+
+	if set.ForRealm("cn") == nil {
+		t.Fatal("cn profile 应正常加载")
+	}
+}

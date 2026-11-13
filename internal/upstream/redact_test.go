@@ -79,3 +79,23 @@ func TestRedactForLogBasicAndJSONAuthorization(t *testing.T) {
 		t.Fatalf("basic credential leaked: %s", out)
 	}
 }
+
+// TestErrorStringRedactsSecrets 上游 *Error 的 Error() 是日志与面板回显出口：
+// Msg 保留原文供分类，但字符串形态必须先脱敏。
+func TestErrorStringRedactsSecrets(t *testing.T) {
+	t.Parallel()
+
+	err := &Error{
+		Kind:   ErrClient,
+		Status: 400,
+		Msg:    `{"code":400,"msg":"bad","access_token":"tok-1234567890"}`,
+	}
+
+	if got := err.Error(); strings.Contains(got, "tok-1234567890") {
+		t.Fatalf("access token leaked into Error(): %s", got)
+	}
+	// 分类仍要看到原始关键词。
+	if err.Msg == "" || strings.Contains(err.Msg, "[REDACTED]") {
+		t.Fatalf("Msg 应保留原文供分类: %q", err.Msg)
+	}
+}

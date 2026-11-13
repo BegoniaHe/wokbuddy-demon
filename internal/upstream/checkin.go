@@ -362,6 +362,28 @@ func checkinTextOnlyReceipt(msg string) (CheckinReceipt, bool) {
 	return CheckinReceipt{}, false
 }
 
+// checkinReceiptHasCriteria 报告回执里是否至少命中一个签到判据字段
+// （credit / streak_days / is_streak_day）。
+//
+// `{"code":0,"msg":"OK","data":null}` 这类空信封是合法 JSON 对象，却没有任何签到
+// 证据；当成成功会标记当日已签、面板报「签到成功」，而账号实际没签（#511 静默漏签）。
+func checkinReceiptHasCriteria(body []byte, credit *json.Number) bool {
+	var presence map[string]json.RawMessage
+	if json.Unmarshal(body, &presence) != nil {
+		return false
+	}
+
+	if _, hasStreak := presence["streak_days"]; hasStreak {
+		return true
+	}
+
+	if _, hasStreakDay := presence["is_streak_day"]; hasStreakDay {
+		return true
+	}
+
+	return credit != nil
+}
+
 // checkinSuccessReceipt 读成功回执：官方是平铺 {credit, streak_days, is_streak_day}；
 // 若上游把回执包在 data 信封里也照读。积分缺失只置 CreditKnown=false，不补 0。
 // 第二个返回值报告回执是否真的读成了 JSON 对象：读不成时由调用方判失败，
@@ -383,6 +405,10 @@ func checkinSuccessReceipt(raw, data json.RawMessage) (CheckinReceipt, bool) {
 	}
 
 	if json.Unmarshal(body, &flat) != nil {
+		return CheckinReceipt{}, false
+	}
+
+	if !checkinReceiptHasCriteria(body, flat.Credit) {
 		return CheckinReceipt{}, false
 	}
 

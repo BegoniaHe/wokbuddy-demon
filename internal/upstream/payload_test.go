@@ -1350,3 +1350,50 @@ func TestNormalizeToolSchemasPropertyNamedLikeValueKeyword(t *testing.T) {
 		t.Fatalf("名为 enum 的属性未归一: %q", got)
 	}
 }
+
+// 出站改写只动结构与已知字段，客户端的数值字面量必须逐字保留。
+//
+// 默认 json.Unmarshal 把一切数字变成 float64：seed=9007199254740993 变成 ...992、
+// 1.0 变成 1、20 位整数 id 变成另一个值。客户端按值定位资源（会话、缓存、工具
+// 调用 id）时这类改写会静默指向错误对象。
+func TestRewriteChatBodyPreservesNumberLiterals(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"glm-5.2","seed":9007199254740993,"temperature":1.0,` +
+		`"metadata":{"trace_id":12345678901234567890},` +
+		`"messages":[{"role":"user","content":"hi"}]}`
+
+	out := rewriteChatBody([]byte(body), &chatBodyRewrite{})
+
+	for _, want := range []string{
+		`"seed":9007199254740993`,
+		`"temperature":1`,
+		`"trace_id":12345678901234567890`,
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("改写后丢失数值字面量 %s: %s", want, out)
+		}
+	}
+}
+
+// decodeObjectUseNumber 是出站改写与 SSE 帧重建的统一入口：数字按字面量保留。
+func TestDecodeObjectUseNumberKeepsLiterals(t *testing.T) {
+	t.Parallel()
+
+	obj, err := decodeObjectUseNumber([]byte(`{"big":12345678901234567890,"f":1.50}`))
+	if err != nil {
+		t.Fatalf("decodeObjectUseNumber: %v", err)
+	}
+
+	if got := obj["big"]; got != json.Number("12345678901234567890") {
+		t.Fatalf("big=%#v want json.Number 原字面量", got)
+	}
+
+	if got := obj["f"]; got != json.Number("1.50") {
+		t.Fatalf("f=%#v want json.Number 原字面量", got)
+	}
+
+	if _, err := decodeObjectUseNumber([]byte(`not json`)); err == nil {
+		t.Fatal("非法 JSON 应报错")
+	}
+}

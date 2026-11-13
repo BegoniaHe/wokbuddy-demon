@@ -684,7 +684,9 @@ func TestCheckinGlobalUsesDailyReward(t *testing.T) {
 			checkinHits.Add(1)
 		}
 
-		w.Write([]byte(`{"code":0,"data":{}}`))
+		// 成功回执按官方平铺形态（UPSTREAM.md）：带判据字段，空 data 信封会被
+		// checkinReceipt 判失败（读不出签到证据）。
+		w.Write([]byte(`{"credit":100,"streak_days":1,"is_streak_day":true}`))
 	}))
 	defer srv.Close()
 

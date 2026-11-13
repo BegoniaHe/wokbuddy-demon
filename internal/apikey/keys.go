@@ -24,6 +24,7 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -51,6 +52,8 @@ var (
 	errSetRealmFailed = errors.New("SetRealm failed")
 	// ErrInvalidLimits 表示 Limits 校验失败（调用方应映射为 400，而不是落盘/500）。
 	ErrInvalidLimits = errors.New("invalid limits")
+	// ErrUnsupportedVersion 表示落盘文件的格式版本高于本程序支持的版本。
+	ErrUnsupportedVersion = errors.New("unsupported keys file version")
 )
 
 // Record 一把命名密钥的持久化记录。Hash 为 SHA-256 十六进制串，绝不回显。
@@ -107,14 +110,26 @@ type Store struct {
 	// keys 校验快照（仅未撤销），随 records 变更重建；Authenticate 直接消费。
 	keys  []httpauth.Key
 	dirty bool
+	// seq 记录变更序号（每次 records 变化递增），flush 据此判断快照是否仍然最新。
+	seq uint64
+	// writeMu 串行化写盘；flushedSeq 是已落盘序号，防旧快照覆盖新状态。
+	writeMu    sync.Mutex
+	flushedSeq uint64
 
 	limMu  sync.Mutex
 	limits map[string]*limitRuntime
-	// pace 响应整形账本（issue #448）：RPM/TPM 的 GCRA 虚拟调度。与 limits
-	// 同锁保护（limMu 经各 Pace* 方法间接持有），密钥增删不触碰它——
+	// pace 响应整形账本（issue #448）：RPM/TPM 的 GCRA 虚拟调度。自带锁
+	// （paceLedger.mu），与 limMu 无包含关系：并发准入（Acquire 持 limMu）与
+	// 整形拨账（Pace*/NoteEmitted 持 pace.mu）互不阻塞。密钥增删不触碰它——
 	// Delete/Revoke 后下一次 Pace* 会因 stateOf 未命中而空操作，
 	// 残留条目由 DropPacing 显式清理（客户端断开路径）。
 	pace *paceLedger
+
+	// loadErr 首次加载失败（除 fs.ErrNotExist 外的任何原因）。一旦置位就拒绝写盘：
+	// 内存里的记录集合是空/不全的，整份写出会把磁盘上的真实密钥表覆盖成「只剩
+	// 新建的那几把」——所有命名密钥客户端静默 401，面板显示 0 把，唯一线索是启动
+	// 日志。读失败要么是暂时性 I/O 错误、要么是文件损坏，两种都不该用空集合替代。
+	loadErr error
 
 	started  atomic.Bool
 	stopOnce sync.Once
@@ -133,7 +148,10 @@ func New(path string) *Store {
 	}
 	if path != "" {
 		if err := store.load(); err != nil {
-			log.Printf("[apikey] 读取 %s 失败（从零开始）: %v", path, err)
+			// 记录并留痕但不致命：启动仍可用默认 api_key，命名密钥面转为只读
+			// （见 persistLocked 的 loadErr 守卫）。
+			store.loadErr = err
+			log.Printf("WARN: [apikey] 读取 %s 失败，命名密钥转为只读（不落盘、不覆盖原文件）: %v", path, err)
 		}
 	}
 
@@ -156,12 +174,41 @@ func (s *Store) load() error {
 		return fmt.Errorf("load: %w", err)
 	}
 
+	// 更高版本的文件可能换了哈希算法/字段语义：按当前二进制解释会把「不认识」当成
+	// 「没配置」（哈希解不出来 → 密钥静默失效），故拒绝加载并让上层转只读。
+	if file2.Version > fileVersion {
+		return fmt.Errorf("load: 文件格式版本 %d 高于本程序支持的 %d（请升级后再启动）: %w",
+			file2.Version, fileVersion, ErrUnsupportedVersion)
+	}
+
+	// 落盘记录要重跑一遍 Limits 归一化：Create/UpdateLimits 的全部约束（RPM/TPM
+	// 上界、UTC 过期时间、IP 白名单与模型模式归一）此前只在写入路径执行，重启后
+	// 手改或旧版本写出的值会原样进入内存——例如 rpm 超过 maxPacingRate 时
+	// time.Minute/rpm 归零，限速静默消失。
+	kept := make([]Record, 0, len(file2.Keys))
+
+	for i := range file2.Keys {
+		normalized, err := NormalizeLimits(file2.Keys[i].Limits)
+		if err != nil {
+			// 不能「保持原值」继续用：rpm/tpm 超上界时 time.Minute/rpm 归零、
+			// 限速静默消失，与「配了限速」的预期相反。整条记录丢弃并留可操作的
+			// WARN——与非法 hash 同口径：不放一个「看起来生效、实际不生效」的密钥。
+			log.Printf("WARN: [apikey] 密钥 %s 的 limits 非法，已丢弃该记录（修正或删除后可恢复）: %v",
+				file2.Keys[i].ID, err)
+
+			continue
+		}
+
+		file2.Keys[i].Limits = normalized
+		kept = append(kept, file2.Keys[i])
+	}
+
 	s.mu.Lock()
-	s.records = file2.Keys
+	s.records = kept
 	s.rebuildKeysLocked()
 	s.mu.Unlock()
 
-	if n := len(file2.Keys); n > 0 {
+	if n := len(kept); n > 0 {
 		log.Printf("[apikey] 已恢复 %d 把命名密钥（%s）", n, s.path)
 	}
 
@@ -185,10 +232,24 @@ func (s *Store) Start() {
 				s.flush()
 				return
 			case <-t.C:
-				s.flush()
+				s.flushGuarded()
 			}
 		}
 	}()
+}
+
+// flushGuarded 定时落盘，panic 就地隔离。
+//
+// 循环里跑的是 JSON 编码与原子写盘；一次 panic 会终结整个协程（进而整进程），
+// 命名密钥的计数与撤销状态就此停止落盘，只能靠重启发现。
+func (s *Store) flushGuarded() {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("ERR: [apikey] 落盘循环 panic（已隔离）: %v\n%s", rec, debug.Stack())
+		}
+	}()
+
+	s.flush()
 }
 
 // Stop 停止后台循环并做最后一次落盘（未 Start 时只做一次落盘）。
@@ -314,6 +375,11 @@ func (s *Store) Delete(id string) (bool, error) {
 		}
 
 		s.rebuildKeysLocked()
+		// 运行时账本随记录一起回收：limits 只在 runtimeLocked 里增，原先全包无
+		// 任何 delete，删掉的密钥其并发计数/窗口状态会永久留在 map 里。
+		s.limMu.Lock()
+		delete(s.limits, id)
+		s.limMu.Unlock()
 
 		return true, nil
 	}
@@ -359,6 +425,9 @@ func (s *Store) RecordUsage(id string, prompt, completion, total int64) {
 		now := time.Now()
 		r.LastUsedAt = &now
 		s.dirty = true
+		// seq 必须一起递增：flush 靠「写盘期间 seq 有没有变」决定能不能清 dirty，
+		// 计数变动若不动 seq，flush 会在写盘后把这次计数当成已落盘而丢掉。
+		s.seq++
 
 		return
 	}
@@ -378,9 +447,14 @@ func (s *Store) Flush() {
 	}
 }
 
-// flush 防抖落盘：持锁写盘，与 Create/Revoke/Delete 的落盘同序。若先快照再释放
-// 锁写盘，旧快照会覆盖期间并发变更（内存有、磁盘无），且两个写共用 path+".tmp"
-// 会相互截断导致文件损坏。落盘失败时保持 dirty，下次 tick 重试。
+// flush 防抖落盘：锁内只取记录快照，序列化与写盘（含 fsync）在锁外进行。
+//
+// 原先持 s.mu 全程写盘，而鉴权路径（Keys/Authenticate）也要拿同一把锁——一次
+// fsync 抖动就会让全部在线请求排在锁上。快照落盘的代价是要防「旧快照覆盖新状态」：
+//   - writeMu 串行化写入，避免两次 rename 乱序；
+//   - flushedSeq 记录已落盘序号，snapshot 序号不大于它时直接丢弃，保证磁盘状态
+//     单调前进（提交期并发 Delete 写出的新状态不会被旧快照盖回去）；
+//   - dirty 只在「写盘期间没有新变更」时清零，否则下一 tick 重试。
 //
 //nolint:revive // flush/Flush 为公开与内部变体，命名有意成对。
 func (s *Store) flush() {
@@ -389,25 +463,71 @@ func (s *Store) flush() {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.path == "" || !s.dirty {
+		s.mu.Unlock()
 		return
 	}
 
-	if err := s.persistLocked(); err != nil {
+	snapshot := append([]Record(nil), s.records...)
+	seq := s.seq
+	s.mu.Unlock()
+
+	if err := s.persistSnapshot(snapshot, seq); err != nil {
 		log.Printf("[apikey] 落盘失败: %v", err)
+
+		return
 	}
+
+	s.mu.Lock()
+	if s.seq == seq {
+		s.dirty = false
+	}
+	s.mu.Unlock()
+}
+
+// persistSnapshot 写入一份记录快照（锁外调用，writeMu 串行化）。
+// 快照序号不大于已落盘序号时直接丢弃：说明期间已有更新的状态落盘。
+func (s *Store) persistSnapshot(records []Record, seq uint64) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	if seq <= s.flushedSeq {
+		return nil
+	}
+
+	if err := writeRecords(s.path, records); err != nil {
+		return err
+	}
+
+	s.flushedSeq = seq
+
+	return nil
 }
 
 // persistLocked 在持锁状态下原子写盘当前记录；成功清 dirty，失败由调用方决定回滚。
+// persistLocked 在持锁状态下把当前记录落盘；失败由调用方回滚内存变更。
+//
+// 这里仍在 s.mu 内完成写入（含 fsync）：Create/Revoke/Delete/updateRecord 需要
+// 「写盘结果 → 回滚」的同步语义。它们是面板单次操作，不在请求热路径上；热路径的
+// 定期计数落盘走 flush，锁外写盘。
+//
+// 序号递增 + writeMu 串行化：与并发 flush 的旧快照竞争时，快照序号比较保证磁盘
+// 状态单调前进，本次（较新）写入不会被旧快照覆盖，反之亦然。
 func (s *Store) persistLocked() error {
 	if s.path == "" {
 		s.dirty = false
 		return nil
 	}
 
-	if err := writeRecords(s.path, s.records); err != nil {
+	if s.loadErr != nil {
+		return fmt.Errorf("apikey: 状态文件加载失败，拒绝覆盖（修复或删除 %s 后重启）: %w", s.path, s.loadErr)
+	}
+
+	s.seq++
+	seq := s.seq
+	records := append([]Record(nil), s.records...)
+
+	if err := s.persistSnapshot(records, seq); err != nil {
 		return err
 	}
 
@@ -444,12 +564,17 @@ func (s *Store) rebuildKeysLocked() {
 			continue
 		}
 
-		h, err := hex.DecodeString(s.records[i].Hash)
-		if err != nil || len(h) != 32 {
+		hash, err := hex.DecodeString(s.records[i].Hash)
+		if err != nil || len(hash) != 32 {
+			// 静默跳过会让该密钥的客户端恒 401、面板却仍显示生效：留一条可定位的
+			// WARN（只打 ID 与长度，不打哈希本身）。
+			log.Printf("WARN: [apikey] 密钥 %s 的 hash 非法（长度 %d，期望 64 hex），该密钥不参与鉴权",
+				s.records[i].ID, len(s.records[i].Hash))
+
 			continue
 		}
 
-		keys = append(keys, httpauth.Key{ID: s.records[i].ID, Hash: h})
+		keys = append(keys, httpauth.Key{ID: s.records[i].ID, Hash: hash})
 	}
 
 	s.keys = keys
@@ -652,6 +777,7 @@ func (s *Store) RecordRejected(id string) {
 		if s.records[i].ID == id {
 			s.records[i].Rejected++
 			s.dirty = true
+			s.seq++
 
 			return
 		}
@@ -694,6 +820,9 @@ func (s *Store) stateOf(id string) (Limits, int64, bool) {
 	return Limits{}, 0, false
 }
 
+// maxPacingRate RPM/TPM 的允许上界（间隔 ≥1µs）。
+const maxPacingRate = 60_000_000
+
 // NormalizeLimits 校验并归一化一把密钥的限制；零值保持「不限」：
 //   - expires_at 转 UTC；
 //   - quota_tokens 负数拒绝；
@@ -704,6 +833,13 @@ func (s *Store) stateOf(id string) (Limits, int64, bool) {
 func NormalizeLimits(limits Limits) (Limits, error) {
 	if limits.RPM < 0 || limits.TPM < 0 || limits.MaxConcurrent < 0 {
 		return Limits{}, fmt.Errorf("rpm/tpm/max_concurrent 不能为负: %w", ErrInvalidLimits)
+	}
+	// 上界：GCRA 的间隔是 time.Minute / rpm，取值过大时整除得 0，TAT 永不前进，
+	// 限速静默失效（用户以为配了限速，实际完全不生效）。1e6/分钟 已是任何真实
+	// 客户端都到不了的水位，超过按非法拒绝而不是悄悄关掉整形。
+	if limits.RPM > maxPacingRate || limits.TPM > maxPacingRate {
+		return Limits{}, fmt.Errorf("rpm/tpm 不能超过 %d（间隔会归零、限速失效）: %w",
+			maxPacingRate, ErrInvalidLimits)
 	}
 
 	if limits.QuotaTokens < 0 {

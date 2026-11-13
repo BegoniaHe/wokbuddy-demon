@@ -355,6 +355,41 @@ func (e *entry) modelExempt() bool {
 	return false
 }
 
+// applyUntilLocked 写入冷却截止与类型：同族覆盖，跨族只延长。
+//
+// until 同时承载 CoolHard（余额耗尽，到次日签到）与 CoolSoft（429/WAF，秒级到
+// soft_rate_max）。原实现无条件覆盖：硬冷却期间来一次 429，一分钟的软冷却就把
+// until 拉短并改 coolKind，hardCoolingActive 随之失效，兜底选号会把零余额账号
+// 放出去再撞 402（多打一次上游并重写一次硬冷却）。截止相同时保留原类型，避免
+// 状态在两族之间抖动。
+func (e *entry) applyUntilLocked(until time.Time, kind CoolKind, reason string) {
+	// 同族冷却允许用新截止覆盖（上游给的重置时间比本地估算更准，可长可短）；
+	// 跨族只允许延长——这才是不变量本身。
+	if e.coolKind != kind && !e.until.IsZero() && !until.After(e.until) {
+		return
+	}
+
+	e.until = until
+	e.coolKind = kind
+	e.reason = reason
+}
+
+// coolingActive 报告账号是否处于任一「非禁用类」冷却：冷却截止 / 熔断 / 连败降权。
+//
+// 与 healthy 的差别是不把 disabled/paused 算成冷却（那是另一种状态，面板分开展示）。
+// 三者并列取或：任一未到期即不可选（与 healthy 同口径）。
+func (e *entry) coolingActive(now time.Time) bool {
+	if !e.until.IsZero() && now.Before(e.until) {
+		return true
+	}
+
+	if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {
+		return true
+	}
+
+	return !e.degradeUntil.IsZero() && now.Before(e.degradeUntil)
+}
+
 // hardCoolingActive 报告账号是否处于有效的余额耗尽硬冷却期（CoolHard 且 until 未到期）。
 // 该形态下调了必 402，兜底选号需排除，等签到恢复。
 func (e *entry) hardCoolingActive(now time.Time) bool {
@@ -415,29 +450,63 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 // "历史服务过的模型名"限制——不是无界泄漏，但同样是"只增不减"的无回收表。
 // 调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelCosts(now time.Time) {
-	if len(e.modelCost) == 0 {
-		return
-	}
-
-	for m, mc := range e.modelCost {
-		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
-			delete(e.modelCost, m)
+	pruneModelLedger(e.modelCost, func(mc modelCostEntry) time.Time {
+		if mc.LastSeen.IsZero() {
+			return time.Time{}
 		}
-	}
+
+		return mc.LastSeen.Add(modelCostTTL)
+	}, now)
 }
 
 // pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
 // pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
 // 无需清理。调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
-	if len(e.modelCooldowns) == 0 {
+	pruneModelLedger(e.modelCooldowns, func(mc modelCooldown) time.Time { return mc.Until }, now)
+}
+
+// maxModelKeysPerAccount 每账号按模型记账的条目上限（modelCost / modelCooldowns /
+// health 三类台账共用）。
+//
+// 三类台账的键都是**客户端请求体里的模型名**：网关默认不校验模型是否在目录内
+// （模型门禁是 opt-in 的 models.hidden / models.allowed），伪造互不相同的模型名即可
+// 让每账号多一条常驻记录。危害不止内存——惰性清理在 pick 写锁路径上对每账号整表
+// 扫描一次，表一大就把每次选号变成 O(N)（全程持 p.mu 写锁）。route.go 的
+// routeLedgerMax 是同一风险的既有先例。超限只影响新模型的学习速度，不改变已记录
+// 模型的判定语义。
+const maxModelKeysPerAccount = 512
+
+// pruneModelLedger 惰性清理一张 (账号, 模型) 台账：先删已失效条目，再把条目数压到
+// maxModelKeysPerAccount 以内（从最早失效者开始删）。
+//
+// expiry 返回该条目「变得无用」的时刻（成本/健康 = 观测时刻 + TTL，模型级冷却 =
+// 冷却截止）；零值即已失效。保持与原三处实现同口径：截止不晚于 now 即删。
+// 调用方必须已持有 p.mu 写锁。
+func pruneModelLedger[V any](m map[string]V, expiry func(V) time.Time, now time.Time) {
+	if len(m) == 0 {
 		return
 	}
 
-	for m, mc := range e.modelCooldowns {
-		if mc.Until.IsZero() || !now.Before(mc.Until) {
-			delete(e.modelCooldowns, m)
+	for key, value := range m {
+		if !expiry(value).After(now) {
+			delete(m, key)
 		}
+	}
+
+	for len(m) > maxModelKeysPerAccount {
+		oldestKey := ""
+		oldest := time.Time{}
+
+		first := true
+
+		for key, value := range m {
+			if at := expiry(value); first || at.Before(oldest) {
+				oldestKey, oldest, first = key, at, false
+			}
+		}
+
+		delete(m, oldestKey)
 	}
 }
 

@@ -287,3 +287,111 @@ func TestLoadFileMissingFailsFast(t *testing.T) {
 		t.Fatal("missing file should return error (fail fast)")
 	}
 }
+
+// TestRewritePreservesNumberLiterals 改写 messages 不能改掉客户端的数值字面量。
+// 默认 json.Unmarshal 把一切数字变 float64：seed 9007199254740993 会变成 ...992、
+// 1.0 变成 1（与 split.go 的 UseNumber 同口径，split_test 已钉住同一断言）。
+func TestRewritePreservesNumberLiterals(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"x","seed":9007199254740993,"temperature":1.0,` +
+		`"messages":[{"role":"user","content":"hi"}]}`)
+
+	for name, out := range map[string][]byte{
+		"Rewrite":           Rewrite(body, "人格"),
+		"Append":            Append(body, "人格"),
+		"EnsureSystemFirst": EnsureSystemFirst(body, "人格"),
+	} {
+		got := string(out)
+
+		if !strings.Contains(got, "9007199254740993") {
+			t.Fatalf("%s: seed 被改写: %s", name, got)
+		}
+
+		if !strings.Contains(got, `"temperature":1.0`) {
+			t.Fatalf("%s: temperature 字面量被改写: %s", name, got)
+		}
+	}
+}
+
+// TestLoadRejectsEmptyFile 空提示词文件必须报错：custom/append 模式下 systemPrompt
+// 为空时 Rewrite/Append 原样返回 body，等于「配了文件、一行都没生效」。
+func TestLoadRejectsEmptyFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "system.md")
+	if err := os.WriteFile(path, []byte(" \n\t\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load("custom", path); err == nil {
+		t.Fatal("空白提示词文件应报错")
+	}
+}
+
+// TestRewriteLeavesInvalidUTF8BodyUntouched 非法 UTF-8 请求体不改写：
+// json 往返会把坏字节换成 U+FFFD，改写后与客户端原文不再逐字节相同。
+func TestRewriteLeavesInvalidUTF8BodyUntouched(t *testing.T) {
+	t.Parallel()
+
+	body := []byte("{\"messages\":[{\"role\":\"user\",\"content\":\"a\xffb\"}]}")
+
+	if out := Rewrite(body, "sys"); string(out) != string(body) {
+		t.Fatalf("body 被改写:\n got=%q\nwant=%q", out, body)
+	}
+
+	if out := Append(body, "sys"); string(out) != string(body) {
+		t.Fatalf("Append 改写了非法 UTF-8 body: %q", out)
+	}
+
+	if out, ok := SplitSystemBySentences(body); ok || string(out) != string(body) {
+		t.Fatalf("Split 改写了非法 UTF-8 body: ok=%v out=%q", ok, out)
+	}
+}
+
+// TestDecodeJSONObjectRejectsTrailingContent 尾随内容（{}{} 或 {}garbage）必须解析
+// 失败并原样转发：原实现只解第一个对象，改写信道会把它重写成只剩第一个对象。
+func TestDecodeJSONObjectRejectsTrailingContent(t *testing.T) {
+	t.Parallel()
+
+	cases := []string{
+		`{"messages":[]}{"messages":[{"role":"user","content":"x"}]}`,
+		`{"messages":[]}garbage`,
+	}
+
+	for _, body := range cases {
+		if _, err := decodeJSONObject([]byte(body)); err == nil {
+			t.Fatalf("尾随内容应解析失败: %s", body)
+		}
+	}
+
+	if _, err := decodeJSONObject([]byte(`{"messages":[]}`)); err != nil {
+		t.Fatalf("正常对象不应失败: %v", err)
+	}
+}
+
+// TestRewriteKeepsBodyWhenMessagesWrongType messages 键存在但不是数组时不能覆盖：
+// 覆盖等于丢掉客户端内容（字符串/对象/null 都属此形态）。
+func TestRewriteKeepsBodyWhenMessagesWrongType(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		`{"messages":"hello","model":"m"}`,
+		`{"messages":{"a":1},"model":"m"}`,
+		`{"messages":null,"model":"m"}`,
+	} {
+		if got := Rewrite([]byte(body), "SYS"); string(got) != body {
+			t.Errorf("Rewrite(%s)=%s want 原样返回", body, got)
+		}
+
+		if got := Append([]byte(body), "SYS"); string(got) != body {
+			t.Errorf("Append(%s)=%s want 原样返回", body, got)
+		}
+	}
+
+	// 键不存在时仍按既有语义补一条 system。
+	got := Rewrite([]byte(`{"model":"m"}`), "SYS")
+	if !strings.Contains(string(got), `"role":"system"`) {
+		t.Fatalf("无 messages 键应插入 system: %s", got)
+	}
+}

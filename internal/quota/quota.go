@@ -6,13 +6,16 @@ package quota
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
 // Event 一次撞线样本。
@@ -35,7 +38,9 @@ type Budget struct {
 type Store struct {
 	mu     sync.Mutex
 	path   string
-	events map[string]Event // key: uid|model|resetAt
+	events map[string]Event // key: realm|uid|model|resetAt
+	// persistWarned 落盘失败日志节流（首次失败打一条，恢复后重置）。
+	persistWarned bool
 }
 
 const (
@@ -54,8 +59,17 @@ func New(path string) *Store {
 }
 
 func (s *Store) load() {
+	// 读失败必须留痕：撞线样本是预算估算的唯一输入，静默按空集合启动会让面板
+	// 从「有样本」跳到「无样本」而没有任何线索。
+	//
+	// 用 os.ReadFile 而不是 safefile.Read：本文件是 JSONL（每行一个对象），整份
+	// 内容通不过 json.Valid，safefile 的完整性判定不适用。
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("WARN: [quota] 撞线样本不可用（按空集合启动）: %v", err)
+		}
+
 		return
 	}
 
@@ -93,7 +107,9 @@ func (s *Store) Add(e *Event) bool {
 	}
 
 	s.events[key] = event
-	s.pruneLocked(event.At)
+	// 裁剪基准用真实当前时间：At 由调用方给出（上游 reset 时刻），偏未来会一次性
+	// 清空全部历史样本，偏旧则保留期失效。At 只作事件字段参与聚合。
+	s.pruneLocked(time.Now())
 	s.persistLocked()
 
 	return true
@@ -186,7 +202,11 @@ func (s *Store) persistLocked() {
 		return
 	}
 
+	// safefile.Write 走 os.CreateTemp(同目录)，父目录不存在即失败：data/ 由 pool
+	// 首次落盘时才创建，撞线样本可能先于它出现，不能依赖别处建目录。
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+		s.notePersistFail(err)
+
 		return
 	}
 
@@ -201,14 +221,34 @@ func (s *Store) persistLocked() {
 		raw = append(raw, '\n')
 	}
 
-	tmp := s.path + ".tmp"
-	if os.WriteFile(tmp, raw, 0o600) == nil {
-		_ = atomicwrite.Rename(tmp, s.path)
+	// safefile.Write：唯一临时名（多进程不会互相截断）+ 写后 fsync + rename 后
+	// 目录 fsync。原先自实现 tmp+rename 不 fsync，掉电会留下长度正确但内容为 0 的
+	// 文件，load 再按空集合启动。
+	if err := safefile.Write(s.path, raw, 0o600); err != nil {
+		s.notePersistFail(err)
+
+		return
 	}
+
+	s.persistWarned = false
 }
 
+// notePersistFail 落盘失败留痕（节流：连续失败只打第一条）。撞线样本静默不落盘
+// 会让重启后 Budgets() 归零，运维却看不到任何信号。
+func (s *Store) notePersistFail(err error) {
+	if s.persistWarned {
+		return
+	}
+
+	s.persistWarned = true
+
+	log.Printf("WARN: [quota] 撞线样本落盘失败（本轮后续失败不再重复）: %v", err)
+}
+
+// eventKey 事件去重键。必须含 realm：Budgets() 按 realm|model 聚合，同一 uid
+// 在两域都存在时缺 realm 会互相覆盖，第二域的样本被静默丢弃。
 func eventKey(e *Event) string {
-	return e.UID + "|" + e.Model + "|" + e.ResetAt.UTC().Format(time.RFC3339)
+	return e.Realm + "|" + e.UID + "|" + e.Model + "|" + e.ResetAt.UTC().Format(time.RFC3339)
 }
 
 func splitLines(raw []byte) [][]byte {

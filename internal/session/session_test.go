@@ -648,3 +648,141 @@ func TestStickyKeyFromContentNamespace(t *testing.T) {
 		t.Errorf("sticky key must be stable: %q vs %q", got, got2)
 	}
 }
+
+// TestSanitizeSessionKey 客户端会话键必须做长度/字符校验：键会进内存 map、Redis
+// 键与日志，换行可伪造日志行，超长键能把一行日志撑到 MB 级。
+func TestSanitizeSessionKey(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		key  string
+		want string
+	}{
+		{"正常", "conv-123", "conv-123"},
+		{"空", "", ""},
+		{"含换行", "conv\ninjected", ""},
+		{"含控制字符", "conv\x00", ""},
+		{"超长", strings.Repeat("x", maxSessionKeyLen+1), ""},
+		{"边界长度", strings.Repeat("x", maxSessionKeyLen), strings.Repeat("x", maxSessionKeyLen)},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := sanitizeSessionKey(c.key); got != c.want {
+				t.Fatalf("sanitizeSessionKey=%q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestExtractSessionRejectsOverlongKey 超长会话键视为「没有会话标识」：回落派生键
+// 或加权轮换，而不是把无界字符串塞进绑定表。
+func TestExtractSessionRejectsOverlongKey(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"conversation_id":"` + strings.Repeat("a", maxSessionKeyLen+10) + `",
+		"messages":[{"role":"user","content":"hi"}]}`)
+
+	key, convID := ExtractSession(body)
+	if key == strings.Repeat("a", maxSessionKeyLen+10) {
+		t.Fatal("超长会话键不得原样返回")
+	}
+
+	if convID != "" {
+		t.Fatalf("convID=%q want 空（超长键视为未提供）", convID)
+	}
+}
+
+// TestBoundUIDsIndexTracksEntries 反向索引 boundUIDs 必须与 entries 始终一致。
+//
+// pickUID 的「空闲账号优先」直接读这个索引：漂移会让真正空闲的号永远分不到新会话
+// （或把已占满的号当成空闲，粘性被打散）。本用例覆盖 entries 的全部变更入口——
+// Bind / 换绑 / Degrade / Unbind / GC / Redis 恢复 / 慢路径分配。
+func TestBoundUIDsIndexTracksEntries(t *testing.T) {
+	t.Parallel()
+
+	store := newCountingStore()
+	r := routerWith(store, []string{"a1", "a2"}, time.Minute)
+
+	r.Bind("k1", "a1")
+	r.Bind("k2", "a1")
+	r.Bind("k3", "a2")
+	assertBoundIndex(t, r)
+
+	// 换绑：同一 key 换到别的号，旧号计数必须递减。
+	r.Bind("k2", "a2")
+	assertBoundIndex(t, r)
+
+	// 降级不改绑定号，索引不变但必须仍然一致。
+	r.Degrade("k1", "a1", time.Minute)
+	assertBoundIndex(t, r)
+
+	if !r.Unbind("k3") {
+		t.Fatal("Unbind 应返回 true")
+	}
+
+	if !r.Unbind("k1") {
+		t.Fatal("Unbind 应返回 true")
+	}
+
+	assertBoundIndex(t, r)
+
+	// 慢路径分配（新键）：a1 已无任何绑定，必须作为「空闲账号」优先入选。
+	if uid, ok := r.Resolve("fresh-key"); !ok || uid != "a1" {
+		t.Fatalf("慢路径应选空闲号 a1，得到 %q ok=%v", uid, ok)
+	}
+
+	assertBoundIndex(t, r)
+
+	// GC：把所有绑定拨到 TTL 之外，清理后索引必须为空。
+	r.mu.Lock()
+	for key, e := range r.entries {
+		e.lastActive = time.Now().Add(-2 * r.cfg.TTL)
+		r.entries[key] = e
+	}
+	r.mu.Unlock()
+
+	r.gcOnce(time.Now())
+	assertBoundIndex(t, r)
+
+	if len(r.boundUIDs) != 0 {
+		t.Fatalf("GC 后索引应为空，实际 %v", r.boundUIDs)
+	}
+
+	// Redis 恢复同样走索引。
+	store.binds["r1"] = "a2"
+	store.binds["r2"] = "a2"
+
+	r.LoadFromStore()
+	assertBoundIndex(t, r)
+
+	if r.boundUIDs["a2"] != 2 {
+		t.Fatalf("恢复后 a2 计数=%d want 2", r.boundUIDs["a2"])
+	}
+}
+
+// assertBoundIndex 校验反向索引与 entries 完全一致（TestBoundUIDsIndexTracksEntries 用）。
+func assertBoundIndex(t *testing.T, r *Router) {
+	t.Helper()
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	want := map[string]int{}
+	for _, e := range r.entries {
+		want[e.uid]++
+	}
+
+	if len(want) != len(r.boundUIDs) {
+		t.Fatalf("boundUIDs=%v want %v", r.boundUIDs, want)
+	}
+
+	for uid, n := range want {
+		if r.boundUIDs[uid] != n {
+			t.Fatalf("boundUIDs[%q]=%d want %d (all=%v)", uid, r.boundUIDs[uid], n, r.boundUIDs)
+		}
+	}
+}

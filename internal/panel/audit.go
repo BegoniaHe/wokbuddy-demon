@@ -137,15 +137,30 @@ func (a *auditLog) appendLocked(line []byte) {
 
 	if err != nil {
 		log.Printf("panel: 审计写入失败: %v", err)
+
+		return
+	}
+
+	// 审计的保留价值在于崩溃后可追溯：不 fsync 时掉电会丢掉最近的写操作记录，
+	// 恰恰是最需要的那几条。
+	if err := file.Sync(); err != nil {
+		log.Printf("panel: 审计 fsync 失败: %v", err)
 	}
 }
 
 // rotateLocked 当前文件 → .1，旧的依次后移，最老的丢弃。
 func (a *auditLog) rotateLocked() {
-	_ = os.Remove(a.path + "." + strconv.Itoa(a.backups))
+	// 删除/后移失败都留痕：最老备份删不掉（权限、占位）会让后续 rename 覆盖失败，
+	// 结果是最旧的归档一直占着位、新记录写满后轮转静默停摆。
+	if err := os.Remove(a.path + "." + strconv.Itoa(a.backups)); err != nil && !os.IsNotExist(err) {
+		log.Printf("panel: 审计备份删除失败: %v", err)
+	}
 
 	for i := a.backups - 1; i >= 1; i-- {
-		_ = os.Rename(a.path+"."+strconv.Itoa(i), a.path+"."+strconv.Itoa(i+1))
+		from, to := a.path+"."+strconv.Itoa(i), a.path+"."+strconv.Itoa(i+1)
+		if err := os.Rename(from, to); err != nil && !os.IsNotExist(err) {
+			log.Printf("panel: 审计备份后移失败（.%d → .%d）: %v", i, i+1, err)
+		}
 	}
 
 	if err := os.Rename(a.path, a.path+".1"); err != nil && !os.IsNotExist(err) {
@@ -156,6 +171,10 @@ func (a *auditLog) rotateLocked() {
 }
 
 // Recent 返回最多 limit 条记录，按时间倒序（最新在前）。
+//
+// 锁只用于取路径快照：读盘（最多 backups+1 个文件、单个上限 8 MiB）放在锁外。
+// 文件只追加、轮转只用 os.Rename，读到的是某个一致的「已落盘前缀」，最多比内存
+// 计数少几条，不影响审计语义；而把读盘放在锁内会让每次面板查询都阻塞所有写审计。
 func (a *auditLog) Recent(limit int) []auditEntry {
 	if a == nil || limit <= 0 {
 		return []auditEntry{}
@@ -166,47 +185,66 @@ func (a *auditLog) Recent(limit int) []auditEntry {
 	}
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	paths := make([]string, 0, a.backups+1)
+	paths = append(paths, a.path)
 
-	paths := []string{a.path}
 	for i := 1; i <= a.backups; i++ {
 		paths = append(paths, a.path+"."+strconv.Itoa(i))
 	}
+	a.mu.Unlock()
 
 	out := make([]auditEntry, 0, limit)
 
 	for _, path := range paths {
-		entries := readAuditFile(path)
-		for i := len(entries) - 1; i >= 0 && len(out) < limit; i-- {
-			out = append(out, entries[i])
+		remaining := limit - len(out)
+		if remaining <= 0 {
+			break
 		}
 
-		if len(out) >= limit {
-			break
+		// 只读尾部 remaining 条：/panel/api/audit 是 scopeRead 且无缓存，全量解析
+		// 未裁剪的 5 个文件（合计约 40 MiB）对 readonly 轮询是纯浪费。
+		entries := readAuditTail(path, remaining)
+		for i := len(entries) - 1; i >= 0 && len(out) < limit; i-- {
+			out = append(out, entries[i])
 		}
 	}
 
 	return out
 }
 
-// readAuditFile 读取单个文件；坏行跳过，不影响其余记录。
-func readAuditFile(path string) []auditEntry {
+// readAuditTail 读取单个文件并只保留最后 want 条（环形缓冲），坏行跳过。
+func readAuditTail(path string, want int) []auditEntry {
+	if want <= 0 {
+		return nil
+	}
+
 	file, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
 	defer file.Close()
 
-	var out []auditEntry
+	ring := make([]auditEntry, want)
+	count := 0
 
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64<<10), auditMaxLineBytes)
 
 	for scanner.Scan() {
 		var entry auditEntry
-		if json.Unmarshal(scanner.Bytes(), &entry) == nil {
-			out = append(out, entry)
+		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
+			continue
 		}
+
+		ring[count%want] = entry
+		count++
+	}
+
+	n := min(count, want)
+	out := make([]auditEntry, 0, n)
+
+	for i := count - n; i < count; i++ {
+		out = append(out, ring[i%want])
 	}
 
 	return out
@@ -260,10 +298,13 @@ type auditResponseWriter struct {
 func (w *auditResponseWriter) Header() http.Header { return w.w.Header() }
 
 func (w *auditResponseWriter) WriteHeader(code int) {
-	if w.status == 0 {
-		w.status = code
+	// 只转发第一次：重复调用会被 net/http 记为 "superfluous response.WriteHeader
+	// call"，且第二次的码与客户端实际收到的语义不一致（审计里记的是第一次）。
+	if w.status != 0 {
+		return
 	}
 
+	w.status = code
 	w.w.WriteHeader(code)
 }
 

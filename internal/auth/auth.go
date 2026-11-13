@@ -3,14 +3,17 @@
 package auth
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,6 +34,7 @@ var (
 	errBackfillRealmForFailed       = errors.New("BackfillRealmFor failed")
 	errEmptyAuthStorage             = errors.New("empty auth storage")
 	errParseErrorMissingAccessToken = errors.New("parse_error: missing accessToken")
+	errParseErrorMissingUID         = errors.New("parse_error: missing uid")
 	errSaveAtomicFailed             = errors.New("SaveAtomic failed")
 	errNoFilePathSet                = errors.New("no FilePath set")
 )
@@ -75,6 +79,17 @@ type Auth struct {
 	// retired 标记该凭证已从账号池删除：SaveAtomic 在此后拒绝写回，防止
 	// 删除时仍在途的 token refresh 把 auth 文件重新创建出来。
 	retired bool
+
+	// rawDoc 首次解析到的原始文件内容（nil = 由调用方构造的新账号）。
+	//
+	// SaveAtomic 以它为基底合并已知键：本包只建模了固定字段集，而插件与桌面端
+	// 会额外写 account.email、token_source、openId、expiresIn 等键。若无基底、
+	// 从零重建文档，第一次 token 刷新就会把这些键全部抹掉——account.email 被抹
+	// 掉后 desktopcred 的昵称回退随即失效。
+	rawDoc []byte
+	// flat 记录来源是扁平形（手写文件），决定未建模键合并到顶层还是 auth/account
+	// 子对象内部。
+	flat bool
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -229,7 +244,7 @@ func (a *Auth) realmLocked() string {
 		return realmCN
 	}
 
-	if strings.TrimSpace(a.realm) == realmGlobal || isGlobalDomain(a.Domain) {
+	if NormalizeRealm(a.realm) == realmGlobal || isGlobalDomain(a.Domain) {
 		return realmGlobal
 	}
 	// 兜底：realm 与 domain 均缺失时，从 access token 的 iss claim 反推
@@ -242,11 +257,31 @@ func (a *Auth) realmLocked() string {
 	return realmCN
 }
 
+// NormalizeRealm 把显式 realm 归一成 cn/global（去空格 + 小写）；其它取值返回空串，
+// 表示「未指定」，由调用方回落 domain 推断。
+//
+// 归一化必须发生在解析/写入两处：realmLocked 用精确比较判定域，文件里写
+// "Global"（大小写/空格偏差）会失配 → 回落到 cn，把 global 凭证按 cn 头族发出。
+func NormalizeRealm(explicit string) string {
+	switch strings.ToLower(strings.TrimSpace(explicit)) {
+	case realmCN:
+		return realmCN
+	case realmGlobal:
+		return realmGlobal
+	default:
+		return ""
+	}
+}
+
 // ResolveRealm 归一化 realm（cn/global）：显式非空优先，否则按原始 domain 推断
 // （isGlobalDomain）。不受逃生门影响（逃生门是路由锁，不应影响标识判定）；
 // domain 也为空 → "cn"（老 CN 凭证零回归）。
 func ResolveRealm(explicit, domain string) string {
-	if r := strings.TrimSpace(explicit); r != "" {
+	// 显式值先归一化再校验：来源可能是手写/插件生成的 auth 文件（"Global"、
+	// "global "）或 CLI 参数。原样返回会让 realmLocked 的精确比较失配，进而回落
+	// domain 推断——无 domain 时判成 cn，把 global 域凭证按 cn 头族发出（凭据
+	// 送错域）。非法值一律按「未指定」处理，交给下面的 domain 推断。
+	if r := NormalizeRealm(explicit); r != "" {
 		return r
 	}
 
@@ -491,12 +526,23 @@ func Parse(raw []byte) (*Auth, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 保留原始文档作写回基底（见 Auth.rawDoc）；克隆一份，调用方复用入参切片
+	// 也不会污染已解析的账号。
+	auth.rawDoc = bytes.Clone(raw)
+	_, nested := probe["auth"]
+	auth.flat = !nested
 	// 官方 CLI 写入 Unix 毫秒，本仓库内部统一按秒。阈值 1e11 落在当前秒/毫秒值之间：
 	// 两侧都不会误判。写回 SaveAtomic 仍按秒。
 	auth.ExpiresAt = NormalizeExpiresAt(auth.ExpiresAt)
 
 	if strings.TrimSpace(auth.AccessToken) == "" {
 		return nil, errParseErrorMissingAccessToken
+	}
+	// 空 uid 必须拦在加载期：池按 UID 建索引（Pool.upsertLocked / SyncToDir 的
+	// seen[a.UID]），两个缺 uid 的文件会互相覆盖，磁盘上有两份、池里只有一个，
+	// 且状态持久化串台。这里报错比在池内静默合并可诊断得多。
+	if strings.TrimSpace(auth.UID) == "" {
+		return nil, errParseErrorMissingUID
 	}
 
 	return &auth, nil
@@ -526,79 +572,283 @@ func parseAuthDoc(raw []byte, probe map[string]json.RawMessage) (Auth, error) {
 
 // parseNestedAuth 解析插件 OAuth 输出的嵌套形 {"auth":{...},"account":{...}}。
 func parseNestedAuth(raw []byte) (Auth, error) {
-	var n struct {
-		Auth struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresAt    int64  `json:"expiresAt"`
-			Domain       string `json:"domain"`
-			Realm        string `json:"realm"`
-		} `json:"auth"`
-		Account struct {
-			UID                string `json:"uid"`
-			EnterpriseID       string `json:"enterpriseId"`
-			EditionType        string `json:"type"`
-			IDSource           string `json:"idSource"`
-			DepartmentFullName string `json:"departmentFullName"`
-			Nickname           string `json:"nickname"`
-		} `json:"account"`
-		// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
-		DeviceToken string `json:"device_token"`
-	}
-	if err := json.Unmarshal(raw, &n); err != nil {
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
 		return Auth{}, fmt.Errorf("storage_parse_error: %w", err)
 	}
 
+	authDoc := rawObject(doc["auth"])
+	accountDoc := rawObject(doc["account"])
+
+	accessToken, err := strictAuthString(authDoc["accessToken"], "auth.accessToken")
+	if err != nil {
+		return Auth{}, err
+	}
+
+	refreshToken, err := strictAuthString(authDoc["refreshToken"], "auth.refreshToken")
+	if err != nil {
+		return Auth{}, err
+	}
+
 	return Auth{
-		AccessToken:        n.Auth.AccessToken,
-		RefreshToken:       n.Auth.RefreshToken,
-		ExpiresAt:          n.Auth.ExpiresAt,
-		Domain:             n.Auth.Domain,
-		realm:              n.Auth.Realm,
-		UID:                n.Account.UID,
-		EnterpriseID:       n.Account.EnterpriseID,
-		EditionType:        n.Account.EditionType,
-		IDSource:           n.Account.IDSource,
-		DepartmentFullName: n.Account.DepartmentFullName,
-		Nickname:           n.Account.Nickname,
-		DeviceToken:        n.DeviceToken,
+		AccessToken:        accessToken,
+		RefreshToken:       refreshToken,
+		ExpiresAt:          looseInt64(authDoc["expiresAt"]),
+		Domain:             looseString(authDoc["domain"]),
+		realm:              NormalizeRealm(looseString(authDoc["realm"])),
+		UID:                firstNonEmpty(looseString(accountDoc["uid"]), looseString(doc["uid"])),
+		EnterpriseID:       looseString(accountDoc["enterpriseId"]),
+		EditionType:        looseString(accountDoc["type"]),
+		IDSource:           looseString(accountDoc["idSource"]),
+		DepartmentFullName: looseString(accountDoc["departmentFullName"]),
+		Nickname:           looseString(accountDoc["nickname"]),
+		DeviceToken:        looseString(doc["device_token"]),
 	}, nil
 }
 
 // parseFlatAuth 解析手写/旧版扁平形 {"accessToken":...,"uid":...}。
 func parseFlatAuth(raw []byte) (Auth, error) {
-	var item struct {
-		AccessToken        string `json:"accessToken"`
-		RefreshToken       string `json:"refreshToken"`
-		ExpiresAt          int64  `json:"expiresAt"`
-		Domain             string `json:"domain"`
-		Realm              string `json:"realm"`
-		UID                string `json:"uid"`
-		EnterpriseID       string `json:"enterpriseId"`
-		EditionType        string `json:"type"`
-		IDSource           string `json:"idSource"`
-		DepartmentFullName string `json:"departmentFullName"`
-		Nickname           string `json:"nickname"`
-		DeviceToken        string `json:"device_token"`
+	item := rawObject(raw)
+	if item == nil {
+		return Auth{}, fmt.Errorf("storage_parse_error: %w", errAuthDocNotObject)
 	}
-	if err := json.Unmarshal(raw, &item); err != nil {
-		return Auth{}, fmt.Errorf("storage_parse_error: %w", err)
+
+	accessToken, err := strictAuthString(item["accessToken"], "accessToken")
+	if err != nil {
+		return Auth{}, err
+	}
+
+	refreshToken, err := strictAuthString(item["refreshToken"], "refreshToken")
+	if err != nil {
+		return Auth{}, err
 	}
 
 	return Auth{
-		AccessToken:        item.AccessToken,
-		RefreshToken:       item.RefreshToken,
-		ExpiresAt:          item.ExpiresAt,
-		Domain:             item.Domain,
-		realm:              item.Realm,
-		UID:                item.UID,
-		EnterpriseID:       item.EnterpriseID,
-		EditionType:        item.EditionType,
-		IDSource:           item.IDSource,
-		DepartmentFullName: item.DepartmentFullName,
-		Nickname:           item.Nickname,
-		DeviceToken:        item.DeviceToken,
+		AccessToken:        accessToken,
+		RefreshToken:       refreshToken,
+		ExpiresAt:          looseInt64(item["expiresAt"]),
+		Domain:             looseString(item["domain"]),
+		realm:              NormalizeRealm(looseString(item["realm"])),
+		UID:                looseString(item["uid"]),
+		EnterpriseID:       looseString(item["enterpriseId"]),
+		EditionType:        looseString(item["type"]),
+		IDSource:           looseString(item["idSource"]),
+		DepartmentFullName: looseString(item["departmentFullName"]),
+		Nickname:           looseString(item["nickname"]),
+		DeviceToken:        looseString(item["device_token"]),
 	}, nil
+}
+
+// errAuthDocNotObject 顶层不是 JSON 对象（凭证文件的最小结构约束）。
+var errAuthDocNotObject = errors.New("auth document is not a JSON object")
+
+// rawObject 把 JSON 对象解成键值表；缺失或非对象返回 nil（调用方按空对象处理）。
+func rawObject(raw json.RawMessage) map[string]json.RawMessage {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil
+	}
+
+	return obj
+}
+
+// strictAuthString 取凭证关键字符串字段：存在但类型不是字符串时返回带键名的错误。
+//
+// 令牌三件套（accessToken/refreshToken）必须严格，否则数字/对象会被宽松转成
+// 垃圾令牌，直到 401 才发现。
+func strictAuthString(raw json.RawMessage, key string) (string, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", nil
+	}
+
+	var str string
+	if err := json.Unmarshal(trimmed, &str); err != nil {
+		return "", fmt.Errorf("storage_parse_error: %s: %w", key, err)
+	}
+
+	return str, nil
+}
+
+// looseString 宽松取字符串字段：接受字符串以及数字/布尔（取字面量），其它形态返回空串。
+//
+// 身份类字段（uid/type/idSource/departmentFullName/nickname 等）与 domain 不是凭证
+// 关键项：插件某天写成 12345、true，或手写文件少写引号时，强类型整份解码会让整个
+// 文件解析失败、账号在池里静默消失（只有一行 WARN）。这类字段降级为空值即可。
+func looseString(raw json.RawMessage) string {
+	str, ok := looseScalar(raw)
+	if ok {
+		return str
+	}
+
+	return ""
+}
+
+// looseScalar 把 JSON 标量转成字面量字符串。
+func looseScalar(raw json.RawMessage) (string, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return "", false
+	}
+
+	var str string
+	if json.Unmarshal(trimmed, &str) == nil {
+		return str, true
+	}
+
+	var number json.Number
+	if json.Unmarshal(trimmed, &number) == nil {
+		return number.String(), true
+	}
+
+	var boolean bool
+	if json.Unmarshal(trimmed, &boolean) == nil {
+		return strconv.FormatBool(boolean), true
+	}
+
+	return "", false
+}
+
+// looseInt64 宽松取整数字段：接受数字与数字字符串，其它形态返回 0（未设置）。
+func looseInt64(raw json.RawMessage) int64 {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return 0
+	}
+
+	var number json.Number
+	if json.Unmarshal(trimmed, &number) == nil {
+		if value, err := number.Int64(); err == nil {
+			return value
+		}
+
+		if value, err := number.Float64(); err == nil {
+			return int64(value)
+		}
+	}
+
+	// 数字字符串形态（"1760000000"）：插件把数值序列化成字符串。
+	var str string
+	if json.Unmarshal(trimmed, &str) == nil {
+		if value, err := strconv.ParseInt(strings.TrimSpace(str), 10, 64); err == nil {
+			return value
+		}
+	}
+
+	return 0
+}
+
+// firstNonEmpty 取首个非空值（嵌套形身份字段的顶层兜底）。
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+// mergeDeviceToken 把 device_token 写入待保存文档：非空覆盖；为空时保留原文件里
+// 的值（任何把内存字段清空的路径都不该把这个设备风控 token 从凭据里删掉）；原文件
+// 也没有时不引入空键。
+func mergeDeviceToken(doc map[string]any, token string, rawDoc []byte) {
+	if token != "" {
+		doc["device_token"] = token
+
+		return
+	}
+
+	if original := rawDeviceToken(rawDoc); original != "" {
+		doc["device_token"] = original
+	}
+}
+
+// rawDeviceToken 从原始文档取顶层 device_token（写回时为空值的兜底）。
+func rawDeviceToken(rawDoc []byte) string {
+	if len(rawDoc) == 0 {
+		return ""
+	}
+
+	return looseString(rawObject(rawDoc)["device_token"])
+}
+
+// authLegacyFlatKeys 扁平形里本包已建模的顶层键；其余键在写回时原样保留。
+var authLegacyFlatKeys = map[string]bool{
+	"accessToken": true, "refreshToken": true, "expiresAt": true, "domain": true,
+	"realm": true, "uid": true, "enterpriseId": true, "type": true, "idSource": true,
+	"departmentFullName": true, "nickname": true, "device_token": true,
+}
+
+// preserveUnknownAuthKeys 把原始文档里本包未建模的键合并进待写 doc。
+//
+// 只读原始字节、按 json.RawMessage 搬运：map[string]any 往返会把 openId 这类
+// 大整数改成另一个值，而未知键必须逐字保留。
+func preserveUnknownAuthKeys(doc map[string]any, rawDoc []byte, flat bool) {
+	if len(rawDoc) == 0 {
+		return
+	}
+
+	var top map[string]json.RawMessage
+	if json.Unmarshal(rawDoc, &top) != nil {
+		return
+	}
+
+	if flat {
+		preserveFlatUnknownKeys(doc, top)
+
+		return
+	}
+
+	for key, value := range top {
+		if key == "auth" || key == "account" || key == "device_token" {
+			continue
+		}
+
+		if _, known := doc[key]; !known {
+			doc[key] = value
+		}
+	}
+
+	// 嵌套形的未建模键落在 auth / account 子对象内部（如 account.email）。
+	doc["auth"] = mergeUnknownObject(top["auth"], doc["auth"])
+	doc["account"] = mergeUnknownObject(top["account"], doc["account"])
+}
+
+// preserveFlatUnknownKeys 扁平形写回统一落成嵌套形（既有行为）：原顶层未建模键
+// 抬到新文档顶层。
+func preserveFlatUnknownKeys(doc map[string]any, top map[string]json.RawMessage) {
+	for key, value := range top {
+		if !authLegacyFlatKeys[key] {
+			doc[key] = value
+		}
+	}
+}
+
+// mergeUnknownObject 以原始子对象为基底写入已知键；known 必须是 map[string]any。
+func mergeUnknownObject(raw json.RawMessage, known any) map[string]any {
+	out := map[string]any{}
+
+	if len(raw) > 0 {
+		var src map[string]json.RawMessage
+		if json.Unmarshal(raw, &src) == nil {
+			// 不能 maps.Copy：out 是 map[string]any，RawMessage 值必须原样搬运
+			// （解码成 any 会把 openId 这类大整数改成 float64）。
+			for key, value := range src {
+				out[key] = value
+			}
+		}
+	}
+
+	if m, ok := known.(map[string]any); ok {
+		maps.Copy(out, m)
+	}
+
+	return out
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
@@ -649,11 +899,13 @@ func (a *Auth) SaveAtomic() error {
 		},
 		"account": accountDoc,
 	}
-	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
-	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
-	if a.DeviceToken != "" {
-		doc["device_token"] = a.DeviceToken
-	}
+
+	preserveUnknownAuthKeys(doc, a.rawDoc, a.flat)
+	// device_token：非空才覆盖；为空时保留原文件里的值（原实现只在非空时写入，
+	// 于是任何把内存字段清空的路径都会在下一次保盘时把它从凭据里删掉，设备风控
+	// token 丢失后只能重新从桌面端导入）。原文件也没有时不引入空键，保持与插件
+	// OAuth 输出形状一致。
+	mergeDeviceToken(doc, a.DeviceToken, a.rawDoc)
 
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -704,6 +956,35 @@ func validAuthFile(b []byte) bool {
 	return err == nil
 }
 
+// loadAuthFile 读取并解析单个 auth 文件；不可读/解析失败已打 WARN 并返回 nil。
+//
+// 读取走 ReadWithFallback：正文损坏回退 .bak 时内容可能是已被上游轮换掉的旧
+// refresh token，照常加载（总比丢账号好）但必须留痕——后续 SaveAtomic 会把这份
+// 旧内容写回正文。
+func loadAuthFile(item string) *Auth {
+	raw, restored, err := safefile.ReadWithFallback(item, validAuthFile)
+	if err != nil {
+		log.Printf("WARN: auth 文件不可用（%v），跳过: %s", err, item)
+
+		return nil
+	}
+
+	if restored {
+		log.Printf("WARN: auth 文件正文损坏，已回退 %s.bak（凭据可能已过期）: %s", item, item)
+	}
+
+	parsed, err := Parse(raw)
+	if err != nil {
+		log.Printf("WARN: auth 解析失败（%v），跳过: %s", err, item)
+
+		return nil
+	}
+
+	parsed.FilePath = item
+
+	return parsed
+}
+
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；不可读/解析失败的文件跳过并打 WARN
 // （损坏时 safefile.Read 先回落 .bak）。
 // 顺带做 realm 标识存量迁移：对空 realm 的 auth 自动 backfill（原始 domain 推断）并 SaveAtomic
@@ -723,19 +1004,11 @@ func LoadDir(dir string) ([]*Auth, error) {
 	var out []*Auth
 
 	for _, item := range files {
-		raw, err := safefile.Read(item, validAuthFile)
-		if err != nil {
-			log.Printf("WARN: auth 文件不可用（%v），跳过: %s", err, item)
+		auth := loadAuthFile(item)
+		if auth == nil {
 			continue
 		}
 
-		auth, err := Parse(raw)
-		if err != nil {
-			log.Printf("WARN: auth 解析失败（%v），跳过: %s", err, item)
-			continue
-		}
-
-		auth.FilePath = item
 		if prev, ok := seenUID[auth.UID]; ok {
 			log.Printf("WARN: uid %s duplicated across %s and %s — 后者覆盖（不同 realm 同名 UID？）",
 				logfmt.Label(auth.UID, auth.Nickname), prev, item)

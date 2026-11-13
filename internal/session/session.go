@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -66,13 +67,25 @@ type Config struct {
 type Router struct {
 	mu      sync.RWMutex
 	entries map[string]entry
-	avoid   map[string][]avoidance
-	cfg     Config
-	stop    chan struct{}
+	// boundUIDs 反向索引：uid → 当前绑定到它的会话数（只统计 entries，不与 avoid
+	// 混用）。pickUID 的「空闲账号优先」只要知道某账号是否已被任何会话占用；直接
+	// 遍历 entries（上限 5 万条）就是每个新会话 O(全表) 次 map 插入，且整段在写锁
+	// 内——伪造唯一会话键即可把所有粘性查询（RLock 快路径）挤在这把排他锁后面。
+	// 索引随每次绑定变更同步维护（set/removeBindingLocked），扫描降到 O(账号数)。
+	boundUIDs map[string]int
+	avoid     map[string][]avoidance
+	cfg       Config
+	stop      chan struct{}
 }
 
 // defaultSessionTTL 默认会话粘性 TTL。
 const defaultSessionTTL = 30 * time.Minute
+
+// maxSessionEntries 绑定表上限。键完全由客户端控制，按 QPS 发唯一 ID 即可让
+// entries/avoid 与 Redis 写队列同步膨胀，副作用不止内存：「空闲账号优先」会失效
+// （每个键各占一个号），所有会话退化为全池哈希，粘性与缓存收益一起消失。
+// 到达上限后新键不再绑定（回落加权轮换），已有绑定照常生效。
+const maxSessionEntries = 50000
 
 // New 构建路由器。若 cfg.Store 为 nil 则用 Noop（纯内存）；cfg.Available 为 nil 视为空池。
 // TTL/GCInterval 非正取默认（30m / 5m）——main 从 config 解析后传入，这里兜底。
@@ -89,7 +102,12 @@ func New(cfg Config) *Router {
 		cfg.GCInterval = 5 * time.Minute
 	}
 
-	return &Router{entries: map[string]entry{}, avoid: map[string][]avoidance{}, cfg: cfg}
+	return &Router{
+		entries:   map[string]entry{},
+		boundUIDs: map[string]int{},
+		avoid:     map[string][]avoidance{},
+		cfg:       cfg,
+	}
 }
 
 // StartGC 启动后台 GC goroutine（幂等）。进程退出时调 StopGC。
@@ -120,10 +138,23 @@ func (r *Router) StartGC() {
 			case <-stop:
 				return
 			case <-t.C:
-				r.gcOnce(time.Now())
+				r.gcTick(time.Now())
 			}
 		}
 	}()
+}
+
+// gcTick 一次定时 GC，panic 就地隔离。
+//
+// 绑定表会随 panic 停在半清理状态；更要紧的是 panic 会终结 GC 协程乃至整进程。
+func (r *Router) gcTick(now time.Time) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("ERR: [session] GC 循环 panic（已隔离）: %v\n%s", rec, debug.Stack())
+		}
+	}()
+
+	r.gcOnce(now)
 }
 
 // StopGC 停止后台 GC（幂等）。
@@ -154,8 +185,14 @@ func (r *Router) LoadFromStore() {
 		if _, exists := r.entries[key]; exists {
 			continue
 		}
+		// 与 trackBindingLocked/Bind 同口径的表上限：Redis 里的绑定可以来自另一份
+		// 配置（或伪造的镜像），恢复时同样不得突破 maxSessionEntries。
+		if len(r.entries) >= maxSessionEntries {
+			break
+		}
 
-		r.entries[key] = entry{uid: uid, lastActive: now}
+		r.setBindingLocked(key, uid, now)
+
 		loaded++
 	}
 	r.mu.Unlock()
@@ -218,7 +255,11 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// 命中只判定绑定账号本身，不构建全池可用集合（每请求 O(N log N) + map 分配）。
 	if found && !expired(entry2, now, r.cfg.TTL) && r.availableOne(model, entry2.uid) && !avoid {
+		// touch 必须每个命中都做：它同时承担镜像 TTL 续期与 avoid 窗口清理
+		// （TestUnbindCannotBeOverwrittenByStaleMirror / TestTouchClearsExpiredAvoid
+		// 钉住这两条语义），节流会让已解绑绑定在镜像里复活、失效窗口不再回收。
 		r.touch(key, entry2.uid, model, now)
+
 		return entry2.uid, true
 	}
 	// 未命中/失效，或绑定号已冷却/占满 → 落入慢路径重分配。
@@ -249,12 +290,12 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 
 		avoid := r.avoidActive(a, hasAvoid, entry2, model, now)
 		if available[entry2.uid] && !avoid {
-			r.entries[key] = entry{uid: entry2.uid, lastActive: now}
+			r.setBindingLocked(key, entry2.uid, now)
 			return entry2.uid, true
 		}
 
 		if !avoid {
-			delete(r.entries, key) // 失效：清掉再分配
+			r.removeBindingLocked(key) // 失效：清掉再分配
 		}
 		// 降级抑制中：保留原条目，让 pickUID 读取 avoid 记录后避开原账号。
 	}
@@ -265,9 +306,66 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 	}
 
 	uid := r.pickUID(key, uids, model, now)
+	r.trackBindingLocked(key, uid, now)
+
+	return uid, true
+}
+
+// setBindingLocked 写入/更新一条绑定并同步反向索引（调用方已持写锁）。
+// 所有 entries 写入都必须经本函数，否则 boundUIDs 会与 entries 漂移。
+func (r *Router) setBindingLocked(key, uid string, now time.Time) {
 	prev, existed := r.entries[key]
+	if existed && prev.uid != uid {
+		r.decBoundLocked(prev.uid)
+	}
+
+	if !existed || prev.uid != uid {
+		r.boundUIDs[uid]++
+	}
 
 	r.entries[key] = entry{uid: uid, lastActive: now}
+}
+
+// removeBindingLocked 删除一条绑定并同步反向索引（调用方已持写锁）。不存在的键是
+// 无操作——调用方都在删除前自判存在性，返回值没有消费方。
+func (r *Router) removeBindingLocked(key string) {
+	prev, existed := r.entries[key]
+	if !existed {
+		return
+	}
+
+	delete(r.entries, key)
+	r.decBoundLocked(prev.uid)
+}
+
+// decBoundLocked 递减反向索引，计数归零即删键（调用方已持写锁）。
+func (r *Router) decBoundLocked(uid string) {
+	if uid == "" {
+		return
+	}
+
+	if count := r.boundUIDs[uid]; count > 1 {
+		r.boundUIDs[uid] = count - 1
+
+		return
+	}
+
+	delete(r.boundUIDs, uid)
+}
+
+// trackBindingLocked 提交一条绑定并镜像到 redisstore（调用方已持写锁）。
+//
+// 表满时新键不再录入（回落加权轮换）：键完全由客户端控制，不设上限等于把内存与
+// Redis 写队列交给调用方决定。已有键照常更新。
+func (r *Router) trackBindingLocked(key, uid string, now time.Time) {
+	prev, existed := r.entries[key]
+
+	if !existed && len(r.entries) >= maxSessionEntries {
+		return
+	}
+
+	r.setBindingLocked(key, uid, now)
+
 	if existed && prev.uid != uid {
 		r.cfg.Store.DelBind(key)
 	}
@@ -275,17 +373,14 @@ func (r *Router) resolveSlowLocked(key, model string, now time.Time, available m
 	// 镜像写必须与内存状态在同一把锁内提交：否则 Unbind 的删条目 + DelBind 可以
 	// 插进「解锁 → SetBind」之间，让已解绑的绑定在 Redis 里复活（issue #417）。
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
-
-	return uid, true
 }
 
 // pickUID 双段分配：优先"空闲账号"（未被任何会话绑定的可用号），其次全池。
+//
+// 「是否被绑定」读反向索引 boundUIDs（每次绑定变更同步维护），不再遍历 entries：
+// 伪造唯一会话键会让每个请求都走慢路径，而旧实现在写锁内做 O(全表) 次 map 插入，
+// 把整张粘性表（上限 5 万条）的扫描成本压到每一个新会话上，同时阻塞所有 RLock 快查。
 func (r *Router) pickUID(key string, uids []string, model string, now time.Time) string {
-	bound := map[string]bool{}
-	for _, v := range r.entries {
-		bound[v.uid] = true
-	}
-
 	avoided := r.avoidedUIDs(key, model, now)
 
 	var idle []string
@@ -295,7 +390,7 @@ func (r *Router) pickUID(key string, uids []string, model string, now time.Time)
 			continue
 		}
 
-		if !bound[item] {
+		if r.boundUIDs[item] == 0 {
 			idle = append(idle, item)
 		}
 	}
@@ -366,8 +461,7 @@ func (r *Router) touch(key, uid, model string, now time.Time) {
 	// 降级窗口内不得把刚被 Degrade 删除的镜像写回；已过期且不再抑制的窗口顺手清掉。
 	suppressed := r.pruneAvoidLocked(key, uid, model, now)
 
-	entry2.lastActive = now
-	r.entries[key] = entry2
+	r.setBindingLocked(key, uid, now)
 	// 镜像写留在锁内：与 Unbind/Degrade 的删除同序，避免已解绑的绑定复活。
 	if !suppressed {
 		r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
@@ -425,7 +519,16 @@ func (r *Router) Bind(key, uid string) {
 	now := time.Now()
 
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
+
+	// 新键在表满时不再录入（与 resolveSlowLocked 同口径）：键由客户端控制，
+	// 不设上限等于把内存与 Redis 写队列交给调用方决定。
+	if _, exists := r.entries[key]; !exists && len(r.entries) >= maxSessionEntries {
+		r.mu.Unlock()
+
+		return
+	}
+
+	r.setBindingLocked(key, uid, now)
 	// 绑定成功即回纳证据：只清除该账号的抑制；换绑到其他账号时保留其余窗口
 	// （含已过期但 LowLoad 仍未回落的），防止旧账号立刻又被重新绑定。
 	if list, ok := r.avoid[key]; ok {
@@ -517,8 +620,7 @@ func (r *Router) Degrade(key, uid string, duration time.Duration) {
 	}
 
 	r.avoid[key] = list
-	entry2.lastActive = now
-	r.entries[key] = entry2
+	r.setBindingLocked(key, uid, now)
 	r.cfg.Store.DelBind(key) // 与内存状态同锁提交，避免后续 SetBind 与删除乱序
 	r.mu.Unlock()
 }
@@ -529,7 +631,7 @@ func (r *Router) Unbind(key string) bool {
 
 	_, found := r.entries[key]
 	if found {
-		delete(r.entries, key)
+		r.removeBindingLocked(key)
 		r.cfg.Store.DelBind(key) // 同锁提交删除，防止并发 SetBind 把绑定写回
 	}
 	r.mu.Unlock()
@@ -560,7 +662,7 @@ func (r *Router) gcOnce(now time.Time) int {
 	}
 
 	for _, key := range expiredKeys {
-		delete(r.entries, key)
+		r.removeBindingLocked(key)
 		delete(r.avoid, key)
 		r.cfg.Store.DelBind(key) // 同锁提交删除，避免与并发 SetBind 乱序
 	}
@@ -712,13 +814,13 @@ func ExtractSession(body []byte) (key, conversationID string) {
 
 	meta := parseMetadata(probe.Metadata)
 
-	conversationID = explicitConversationID(&probe, meta)
+	conversationID = sanitizeSessionKey(explicitConversationID(&probe, meta))
 	if conversationID != "" {
 		return conversationID, conversationID
 	}
 	// 5. prompt_cache_key：OpenAI 系的会话级前缀缓存键，语义就是"同一会话复用同一
 	//    前缀"，与粘性诉求同源。放显式会话键之后、派生键之前，不抢占优先级。
-	if v := rawJSONString(probe.PromptCacheKey); v != "" {
+	if v := sanitizeSessionKey(rawJSONString(probe.PromptCacheKey)); v != "" {
 		return v, ""
 	}
 	// 派生回退闸：带 user 维度标识的请求不派生（契约见上）。
@@ -770,6 +872,27 @@ func rawJSONString(raw []byte) string {
 	}
 
 	return s
+}
+
+// maxSessionKeyLen 会话键长度上限（字节）。键完全来自客户端请求体
+// （conversation_id / conversationId / prompt_cache_key），会进内存 map、Redis 键与
+// 日志：无上限时单行日志可被撑到 MB 级，且每个唯一键都占一条绑定记录。
+const maxSessionKeyLen = 256
+
+// sanitizeSessionKey 校验客户端给的会话键：超长或含控制字符（换行可伪造日志行）
+// 时视为「未提供会话标识」，让该请求回落到派生键 / 加权轮换。
+func sanitizeSessionKey(key string) string {
+	if key == "" || len(key) > maxSessionKeyLen {
+		return ""
+	}
+
+	for _, r := range key {
+		if r < 0x20 || r == 0x7f {
+			return ""
+		}
+	}
+
+	return key
 }
 
 // derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：

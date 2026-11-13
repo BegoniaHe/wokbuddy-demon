@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -106,5 +108,74 @@ func TestClaimRewardNotCompleted(t *testing.T) {
 	c := &Client{HTTP: srv.Client(), WebBaseCN: srv.URL}
 	if _, _, err := c.ClaimReward(&auth.Auth{AccessToken: "at", UID: "u1"}, "chat_5"); err == nil {
 		t.Fatal("want error for not-completed task")
+	}
+}
+
+// TestClaimRewardMPNoWebReplayOnServerError chat 域 5xx 不应降级 Web 域重放：
+// 同一份上游状态，重放只会白打一次并可能在原错误（限流）已生效时放大压力。
+// 只有 400（部分任务/租户形态）才走降级路径。
+func TestClaimRewardMPNoWebReplayOnServerError(t *testing.T) {
+	t.Parallel()
+
+	var webCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "claim") && r.Header.Get("X-Client-Platform") == "web" {
+			webCalls.Add(1)
+			w.Write([]byte(`{"code":0,"msg":"OK","data":{"credit":100,"energy":5}}`))
+
+			return
+		}
+
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"code":500,"msg":"boom"}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL}
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	if _, _, err := c.ClaimRewardMP(a, "Model_chat_GLM5.2"); err == nil {
+		t.Fatal("500 应原样上抛")
+	}
+
+	if got := webCalls.Load(); got != 0 {
+		t.Fatalf("web 域重放 %d 次 want 0（只有 400 才降级）", got)
+	}
+}
+
+// TestClaimRewardMPWebReplayOnBadRequest chat 域 400 仍按既有契约降级 Web 域。
+func TestClaimRewardMPWebReplayOnBadRequest(t *testing.T) {
+	t.Parallel()
+
+	var webCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "claim") && r.Header.Get("X-Client-Platform") == "web" {
+			webCalls.Add(1)
+			w.Write([]byte(`{"code":0,"msg":"OK","data":{"credit":100,"energy":5}}`))
+
+			return
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"code":400,"msg":"bad"}`))
+	}))
+	defer srv.Close()
+
+	c := &Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL, WebBaseCN: srv.URL}
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	credit, energy, err := c.ClaimRewardMP(a, "Model_chat_GLM5.2")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	if credit != 100 || energy != 5 {
+		t.Errorf("credit/energy=%d/%d want 100/5", credit, energy)
+	}
+
+	if got := webCalls.Load(); got != 1 {
+		t.Fatalf("web 域重放 %d 次 want 1", got)
 	}
 }

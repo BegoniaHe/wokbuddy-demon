@@ -60,6 +60,9 @@ var (
 	errProxyHost             = errors.New("proxy 地址缺少 host")
 	errDialFailed            = errors.New("dial failed")
 	errDialHTTPConnectFailed = errors.New("dialHTTPConnect failed")
+	// errProxyAuthRequired 代理自身拒绝鉴权（CONNECT 407/401）：凭据问题，不是
+	// 目标域不可达，必须冷却整条出口，否则错误口令的代理会被无限重试。
+	errProxyAuthRequired     = errors.New("proxy authentication required")
 	errSocks5                = errors.New("socks5: 版本不符")
 	errSocks52               = errors.New("socks5: 无可接受认证方式")
 	errSocks5NegotiateFailed = errors.New("socks5Negotiate failed")
@@ -73,7 +76,6 @@ var (
 
 // Proxy 单个出站代理（HTTP/HTTPS CONNECT 或 SOCKS5）。
 type Proxy struct {
-	raw              string
 	scheme           string // http / https / socks5 / socks5h
 	host             string
 	addr             string // host:port
@@ -121,9 +123,14 @@ func ParseProxy(raw string) (*Proxy, error) {
 	if port == "" {
 		port = defaultProxyPort(scheme)
 	}
+	// net/url 的端口校验只要求「全是数字」，不校验范围：70000 能解析成功，
+	// 之后每次拨号都在 net.Dialer 层报 invalid port。四段式写法有 1..65535 校验，
+	// 两种写法必须同口径。
+	if portNum, perr := strconv.Atoi(port); perr != nil || portNum < 1 || portNum > 65535 {
+		return nil, fmt.Errorf("proxy: 端口必须是 1..65535 的整数: %w", errParseProxyFailed)
+	}
 
 	proxy := &Proxy{
-		raw:              raw,
 		scheme:           scheme,
 		host:             host,
 		addr:             net.JoinHostPort(host, port),
@@ -162,6 +169,12 @@ func defaultProxyPort(scheme string) string {
 	}
 }
 
+// minRedactSecretLen 裸用户名/口令参与全文替换的最短长度。
+//
+// 低于该长度时只替换 user:pass 组合：短串到处命中，会把错误串里的 IP、端口、
+// 主机名打成乱码，代价大于收益（真实凭据不会这么短）。
+const minRedactSecretLen = 6
+
 // Masked 脱敏后的代理地址 scheme://host:port：**永不**包含 user/pass，面板展示
 // 与日志一律用它（issue #39）。
 func (p *Proxy) Masked() string {
@@ -171,11 +184,19 @@ func (p *Proxy) Masked() string {
 // redact 把本代理的口令/用户名从任意字符串里抹掉，并截断到 limit 字符。
 // 用于把底层错误串落到健康快照（错误可能回显 URL）。
 func (p *Proxy) redact(text string, limit int) string {
-	if p.pass != "" {
+	// 只替换 user:pass 组合与完整 URL 的 userinfo 段，不对裸用户名/口令做全文替换：
+	// 短串（"a" / "u1" / "pwd"）会把 "dial tcp 1.2.3.4:8080" 打成 "1.***.3.4"，
+	// 健康快照与面板的 last_error 直接变成不可读乱码，诊断信息全丢。
+	// 现实口令长度都远超该阈值，裸形态只在短串时放弃替换。
+	if p.user != "" && p.pass != "" {
+		text = strings.ReplaceAll(text, p.user+":"+p.pass, "***")
+	}
+
+	if len(p.pass) >= minRedactSecretLen {
 		text = strings.ReplaceAll(text, p.pass, "***")
 	}
 
-	if p.user != "" {
+	if len(p.user) >= minRedactSecretLen {
 		text = strings.ReplaceAll(text, p.user, "***")
 	}
 
@@ -208,7 +229,6 @@ func parseFourPartProxy(raw string) (*Proxy, error) {
 	}
 
 	return &Proxy{
-		raw:              raw,
 		scheme:           "socks5",
 		host:             host,
 		addr:             net.JoinHostPort(host, strconv.Itoa(port)),
@@ -278,6 +298,17 @@ func endHandshake(clearDeadline, stop func(), ok bool) {
 }
 
 // dialHTTPConnect 经 HTTP/HTTPS 代理的 CONNECT 隧道建立连接。
+// connectStatusError 把 CONNECT 非 200 分类：代理自身鉴权拒绝（407/401）标记成
+// 出口故障，其余仍按「目标侧拒绝」处置（可达但到不了该上游域）。
+func connectStatusError(addr string, code int, status string) error {
+	if code == http.StatusProxyAuthRequired || code == http.StatusUnauthorized {
+		return fmt.Errorf("proxy CONNECT %s: %s: %w: %w", addr, status,
+			errDialHTTPConnectFailed, errProxyAuthRequired)
+	}
+
+	return fmt.Errorf("proxy CONNECT %s: %s: %w", addr, status, errDialHTTPConnectFailed)
+}
+
 func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, error) {
 	conn, err := p.dialer().DialContext(ctx, "tcp", p.addr)
 	if err != nil {
@@ -315,6 +346,7 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 	}
 
 	reader := bufio.NewReader(conn)
+
 	// CONNECT 的 200 响应无 body；不读 resp.Body（它即隧道本体），仅取状态码。
 	//nolint:bodyclose // CONNECT 200 的 resp.Body 即隧道本体，不可关闭
 	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
@@ -325,7 +357,8 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 
 	if resp.StatusCode != http.StatusOK {
 		conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT %s: %s: %w", addr, resp.Status, errDialHTTPConnectFailed)
+
+		return nil, connectStatusError(addr, resp.StatusCode, resp.Status)
 	}
 	// 握手成功：清掉一次性 deadline（长流从此只受上游 idle/写 deadline 约束），
 	// 并显式停 watcher（defer 的 endHandshake(…, false) 不会重复清 deadline）。
@@ -415,7 +448,7 @@ func (*Proxy) socks5Connect(conn net.Conn, addr string) error {
 	}
 
 	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 0 || port > 65535 {
+	if err != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("socks5: 非法端口 %q: %w", portStr, errSocks5ConnectFailed)
 	}
 

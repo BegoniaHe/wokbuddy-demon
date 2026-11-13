@@ -22,12 +22,11 @@ import (
 
 // Snapshot 一次读取的不可变配置视图。
 type Snapshot struct {
-	APIKey               string        // 网关数据面鉴权密钥；空 = 不鉴权
-	AdminAPIKey          string        // 管理面完整权限密钥；空 = 未配置
-	ReadonlyAPIKey       string        // 管理面只读密钥；空 = 未配置
-	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
-	SanitizeFingerprints bool          // 出站请求体指纹脱敏
-	RecordClientInfo     bool          // 请求日志是否记录调用来源（客户端 IP / UA）
+	APIKey           string        // 网关数据面鉴权密钥；空 = 不鉴权
+	AdminAPIKey      string        // 管理面完整权限密钥；空 = 未配置
+	ReadonlyAPIKey   string        // 管理面只读密钥；空 = 未配置
+	SoftCooldown     time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
+	RecordClientInfo bool          // 请求日志是否记录调用来源（客户端 IP / UA）
 	// MultimodalRouting 请求模态不匹配时在目录内改选支持该模态的模型
 	// （features.multimodal_routing，默认 false = 明确 400，issue #109）。
 	MultimodalRouting bool
@@ -155,10 +154,14 @@ func (h *Holder) Load() Snapshot {
 // 自己的 map 不会污染已发布的快照。
 //
 //nolint:gocritic // 同 New：快照按值传入再取地址，调用方无需关心生命周期。
-func (h *Holder) Store(s Snapshot) {
-	s.BackgroundNames = maps.Clone(s.BackgroundNames)
-	s.HiddenModels = maps.Clone(s.HiddenModels)
-	s.AllowedModels = maps.Clone(s.AllowedModels)
+func (h *Holder) Store(snapshot Snapshot) {
+	if h == nil {
+		return
+	}
 
-	h.p.Store(&s)
+	snapshot.BackgroundNames = maps.Clone(snapshot.BackgroundNames)
+	snapshot.HiddenModels = maps.Clone(snapshot.HiddenModels)
+	snapshot.AllowedModels = maps.Clone(snapshot.AllowedModels)
+
+	h.p.Store(&snapshot)
 }

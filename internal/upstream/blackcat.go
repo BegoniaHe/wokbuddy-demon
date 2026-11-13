@@ -7,6 +7,7 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,44 +48,78 @@ func (c *Client) BlackcatNeed(a *auth.Auth) (int64, error) {
 	return 0, nil
 }
 
+// nightChatGap 两次夜间对话之间的间隔（对齐脚本实测口径）。
+const nightChatGap = 4 * time.Second
+
 // RunNightChats 夜猫子：发 need 次 glm-5.2 真实对话（读干流）并上报事件链。
 // 返回成功次数。每次从内置短问句池抽一条，避免固定 user 内容形成指纹。
-func (c *Client) RunNightChats(account *auth.Auth, need int) (int64, error) {
+//
+// ctx 贯穿整条链路：一次补足可能跨越数十秒（每次对话 + 4s 间隔），停机时必须能
+// 立刻放弃剩余次数，而不是让进程干等。
+func (c *Client) RunNightChats(ctx context.Context, account *auth.Auth, need int) (int64, error) {
 	var ok int64
 
 	for i := range need {
-		body, merr := json.Marshal(map[string]any{
-			"model":    "glm-5.2",
-			"messages": []map[string]any{{"role": "user", "content": pickChatQuestion()}},
-			"stream":   true,
-		})
-		if merr != nil {
-			return ok, fmt.Errorf("RunNightChats: %w", merr)
-		}
-
-		rc, status, respBody, err := c.ChatStream(account, body, "", ChatMeta{})
-		if err != nil || status >= 400 {
-			if rc != nil {
-				rc.Close()
-			}
-
-			return ok, fmt.Errorf("第 %d 次对话失败: http=%d err=%w body=%.120s", i+1, status, err, respBody)
-		}
-
-		_, _ = io.Copy(io.Discard, io.LimitReader(rc, 1<<20))
-		rc.Close()
-
-		cid := session.NewUUIDv4()
-		if err := c.ReportChatActivityModel(account, cid, session.NewUUIDv7Hex(), "glm-5.2", "GLM-5.2"); err != nil {
-			return ok, fmt.Errorf("第 %d 次上报失败: %w", i+1, err)
+		if err := c.runNightChatOnce(ctx, account, i); err != nil {
+			return ok, err
 		}
 
 		ok++
 
-		time.Sleep(4 * time.Second)
+		if !sleepChatGap(ctx) {
+			return ok, fmt.Errorf("RunNightChats: %w", ctx.Err())
+		}
 	}
 
 	return ok, nil
+}
+
+// sleepChatGap 等待两次对话之间的间隔；ctx 取消返回 false（不干等停机）。
+func sleepChatGap(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(nightChatGap):
+		return true
+	}
+}
+
+// runNightChatOnce 单次夜间对话 + 事件上报（i 从 0 起，仅用于错误文案）。
+func (c *Client) runNightChatOnce(ctx context.Context, account *auth.Auth, i int) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("RunNightChats: %w", err)
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"model":    "glm-5.2",
+		"messages": []map[string]any{{"role": "user", "content": pickChatQuestion()}},
+		"stream":   true,
+	})
+	if err != nil {
+		return fmt.Errorf("RunNightChats: %w", err)
+	}
+
+	rc, status, respBody, err := c.ChatStreamContext(ctx, account, body, "", ChatMeta{})
+	if err != nil || status >= 400 {
+		if rc != nil {
+			rc.Close()
+		}
+
+		return fmt.Errorf("第 %d 次对话失败: http=%d err=%w body=%.120s", i+1, status, err, respBody)
+	}
+
+	// 读到 EOF 才能把连接放回空闲池（读到上限就关会让每个请求重建 TCP+TLS）。
+	_, _ = io.Copy(io.Discard, io.LimitReader(rc, 8<<20))
+	rc.Close()
+
+	cid := session.NewUUIDv4()
+	rid := session.NewUUIDv7Hex()
+
+	if err := c.ReportChatActivityModel(account, cid, rid, "glm-5.2", "GLM-5.2"); err != nil {
+		return fmt.Errorf("第 %d 次上报失败: %w", i+1, err)
+	}
+
+	return nil
 }
 
 // ClaimGift 领取新手礼包（每号一次，已领返回业务错误）。
@@ -108,7 +143,13 @@ func (c *Client) claimCredit(a *auth.Auth, path string) (int64, error) {
 		Credit int64 `json:"credit"`
 	}
 
-	_ = json.Unmarshal(data, &resp)
+	// 解包失败不能当成「领到 0」：调用方据此判断补偿/签到是否到账，静默返回
+	// (0, nil) 会让真实到账被记成没领到。空 body 属上游回空，按 0 处理。
+	if len(data) > 0 {
+		if uerr := json.Unmarshal(data, &resp); uerr != nil {
+			return 0, fmt.Errorf("claimCredit: %w", uerr)
+		}
+	}
 
 	return resp.Credit, nil
 }

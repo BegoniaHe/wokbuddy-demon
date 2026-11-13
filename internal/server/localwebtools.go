@@ -35,6 +35,10 @@ import (
 const (
 	defaultLocalWebToolRounds = 3
 	maxLocalWebToolRounds     = 8
+	// maxLocalToolCallsPerRound 单轮工具调用上限：轮数已有封顶，但一轮里的 calls
+	// 由模型输出决定。每个 web_fetch 一次出站请求、单次超时 15s 且串行——
+	// 一次返回 100 个并行调用就是 100 次抓取、最长 25 分钟挂住一个入站请求。
+	maxLocalToolCallsPerRound = 8
 	webToolMaxResponseBytes   = 2 << 20
 	webToolMaxTextBytes       = 32 << 10
 	webFetchTimeout           = 15 * time.Second
@@ -122,10 +126,10 @@ func (h *Handler) serveResponsesWithLocalTools(
 		return
 	}
 
-	ensureLocalToolDeclarations(req, wanted)
+	localTools := ensureLocalToolDeclarations(req, wanted)
 	msgs, _ := req["messages"].([]any)
 
-	final, err := h.runLocalWebToolLoop(r, req, msgs, model)
+	final, err := h.runLocalWebToolLoop(r, req, msgs, model, localTools)
 	if err != nil {
 		// 调用方已断开：同 #404 口径，不写响应体、不压成 502 污染上游故障样本。
 		if localToolCallerGone(r) {
@@ -174,7 +178,7 @@ func localToolCallerGone(r *http.Request) bool {
 
 // runLocalWebToolLoop 反复执行模型请求与本地工具，返回最终 chat 响应。
 func (h *Handler) runLocalWebToolLoop(
-	r *http.Request, req map[string]any, msgs []any, model string,
+	r *http.Request, req map[string]any, msgs []any, model string, localTools map[string]bool,
 ) (map[string]any, error) {
 	ctx := r.Context()
 	maxRounds := h.localWebToolRounds()
@@ -195,12 +199,17 @@ func (h *Handler) runLocalWebToolLoop(
 			return nil, err
 		}
 
-		calls, ok := localToolCalls(obj)
+		calls, ok := localToolCalls(obj, localTools)
 		if !ok || len(calls) == 0 || round == maxRounds {
 			return obj, nil
 		}
 
-		msgs = append(msgs, assistantToolMessage(obj))
+		// 声明与执行必须同口径：assistant 消息里保留几个 tool_calls，就必须有
+		// 同样多个 role=tool 结果。多声明的调用没有对应结果，上游会以「未回应
+		// 的 tool_call」拒掉整轮。
+		calls = calls[:min(len(calls), maxLocalToolCallsPerRound)]
+
+		msgs = append(msgs, assistantToolMessage(obj, len(calls)))
 
 		msgs, err = h.appendLocalToolResults(ctx, msgs, calls)
 		if err != nil {
@@ -245,6 +254,8 @@ func (h *Handler) runLocalWebToolRound(
 }
 
 // appendLocalToolResults 执行本轮工具调用；每次调用前确认入站请求仍在（#415）。
+// 调用数已由调用方按 maxLocalToolCallsPerRound 截断，与 assistant 消息里的
+// tool_calls 一一对应。
 func (h *Handler) appendLocalToolResults(
 	ctx context.Context, msgs []any, calls []localToolCall,
 ) ([]any, error) {
@@ -275,7 +286,11 @@ func (e *localWebToolLoopError) Error() string {
 
 // localToolCalls 提取仅由网关执行的工具调用；出现客户端 function 调用时返回
 // ok=false，让最终响应交回客户端处理，避免吞掉它。
-func localToolCalls(obj map[string]any) ([]localToolCall, bool) {
+//
+// localTools 是网关本轮**实际注入**声明的工具名集合。只按名字白名单判定会把
+// 「客户端自己声明了同名 web_search 函数」的调用也劫持成网关工具执行，客户端
+// 永远收不到这次调用（ensureLocalToolDeclarations 见名字已存在就跳过注入）。
+func localToolCalls(obj map[string]any, localTools map[string]bool) ([]localToolCall, bool) {
 	choice := firstOpenAIChoice(obj)
 	if choice == nil {
 		return nil, true
@@ -300,7 +315,7 @@ func localToolCalls(obj map[string]any) ([]localToolCall, bool) {
 		fn, _ := call["function"].(map[string]any)
 
 		name := stringValue(fn["name"])
-		if name != webSearchTool && name != "web_fetch" {
+		if !localTools[name] {
 			return nil, false
 		}
 
@@ -319,12 +334,26 @@ type localToolCall struct {
 }
 
 // assistantToolMessage 把模型返回的工具调用作为 assistant 消息追加。
-func assistantToolMessage(obj map[string]any) map[string]any {
+// limit 是本轮真正要执行的调用数：多出的调用不能留在消息里，否则历史里声明了
+// 没有结果的 tool_call。
+func assistantToolMessage(obj map[string]any, limit int) map[string]any {
 	choice := firstOpenAIChoice(obj)
 	msg, _ := choice["message"].(map[string]any)
 
 	out := map[string]any{"role": "assistant", "content": stringValue(msg["content"])}
-	if calls, ok := msg["tool_calls"]; ok {
+
+	switch calls := msg["tool_calls"].(type) {
+	case []any:
+		if limit < len(calls) {
+			calls = calls[:limit]
+		}
+
+		out["tool_calls"] = calls
+	case []map[string]any:
+		if limit < len(calls) {
+			calls = calls[:limit]
+		}
+
 		out["tool_calls"] = calls
 	}
 
@@ -365,8 +394,9 @@ func (h *Handler) executeLocalTool(ctx context.Context, call localToolCall) stri
 	}
 }
 
-// ensureLocalToolDeclarations 把服务端工具替换成网关 function 声明。
-func ensureLocalToolDeclarations(req map[string]any, wanted map[string]bool) {
+// ensureLocalToolDeclarations 把服务端工具替换成网关 function 声明，返回本轮
+// **实际注入**的工具名集合（客户端已声明同名 function 的不算，见 localToolCalls）。
+func ensureLocalToolDeclarations(req map[string]any, wanted map[string]bool) map[string]bool {
 	tools, _ := req["tools"].([]any)
 	seen := map[string]bool{}
 
@@ -379,17 +409,22 @@ func ensureLocalToolDeclarations(req map[string]any, wanted map[string]bool) {
 		}
 	}
 
+	injected := make(map[string]bool, len(wanted))
+
 	for name := range wanted {
 		if seen[name] {
 			continue
 		}
 
+		injected[name] = true
 		tools = append(tools, map[string]any{"type": "function", "function": localToolSpec(name)})
 	}
 
 	if len(tools) > 0 {
 		req["tools"] = tools
 	}
+
+	return injected
 }
 
 func localToolSpec(name string) map[string]any {
@@ -429,32 +464,71 @@ func (*bufferResponder) Stream(io.Reader, func(string) string, *upstream.MarkupR
 	return errLocalWebToolLoopRequiresNon
 }
 
+// sseEventStream 顺序写 Responses SSE 事件（自带序列号与 flush）。
+//
+// 写失败后静默丢弃后续事件：客户端已走时继续生成既无意义，也会把后续写入的错误
+// 吞掉（原实现丢弃 Fprintf 返回值）。
+type sseEventStream struct {
+	w        http.ResponseWriter
+	flusher  http.Flusher
+	seq      int
+	writeErr error
+}
+
+// newSSEEventStream 设置 SSE 响应头（与 httpResponder.setSSEHeaders 同口径）：
+// 缺 X-Accel-Buffering 时反代（nginx 默认）会缓冲整个响应，本地工具跑完前客户端
+// 一个事件都收不到。
+func newSSEEventStream(w http.ResponseWriter) *sseEventStream {
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+
+	flusher, _ := w.(http.Flusher)
+
+	return &sseEventStream{w: w, flusher: flusher}
+}
+
+// event 写一个事件帧（失败后所有后续调用变为 no-op）。
+func (s *sseEventStream) event(name string, payload map[string]any) {
+	if s.writeErr != nil {
+		return
+	}
+
+	payload["sequence_number"] = s.seq
+	s.seq++
+
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+
+	if _, werr := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", name, raw); werr != nil {
+		s.writeErr = werr
+
+		return
+	}
+
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
 // writeResponsesObjectSSE 把已聚合的 Responses 对象写成 SSE 事件（本地工具模式）。
 func writeResponsesObjectSSE(w http.ResponseWriter, resp map[string]any) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	flusher, _ := w.(http.Flusher)
-	seq := 0
-	event := func(name string, payload map[string]any) {
-		payload["sequence_number"] = seq
-		seq++
+	stream := newSSEEventStream(w)
+	event := stream.event
 
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			return
-		}
-
-		_, _ = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", name, raw)
-
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
 	created := map[string]any{}
 	maps.Copy(created, resp)
 	created["status"] = "in_progress"
 	created["output"] = []any{}
 	event("response.created", map[string]any{"type": "response.created", "response": created})
+	// 与响应写出器的统一序列对齐（responses.go 的 ensureStart 在 created 之后固定
+	// 补 in_progress）：同一个请求走不走本地工具必须是同一套事件序列，按 SSE 事件
+	// 严格校验的客户端会等这一条。
+	event("response.in_progress", map[string]any{"type": "response.in_progress", "response": created})
 
 	output, _ := resp["output"].([]any)
 	for index, item := range output {
@@ -464,7 +538,7 @@ func writeResponsesObjectSSE(w http.ResponseWriter, resp map[string]any) {
 		})
 
 		if obj["type"] == "message" {
-			emitBufferedMessage(event, obj, index)
+			emitBufferedMessage(stream, obj, index)
 		}
 
 		event("response.output_item.done", map[string]any{
@@ -475,7 +549,9 @@ func writeResponsesObjectSSE(w http.ResponseWriter, resp map[string]any) {
 	event("response.completed", map[string]any{"type": "response.completed", "response": resp})
 }
 
-func emitBufferedMessage(event func(string, map[string]any), item map[string]any, index int) {
+func emitBufferedMessage(stream *sseEventStream, item map[string]any, index int) {
+	event := stream.event
+
 	content, _ := item["content"].([]any)
 	for partIndex, part := range content {
 		m, _ := part.(map[string]any)
@@ -496,6 +572,12 @@ func emitBufferedMessage(event func(string, map[string]any), item map[string]any
 		event("response.output_text.done", map[string]any{
 			"type": "response.output_text.done", "item_id": item["id"], keyOutputIndex: index,
 			keyContentIndex: partIndex, "text": text, "logprobs": []any{},
+		})
+		// 与流式响应写出器同口径补 part 终态：只发 added/delta/done 而缺
+		// content_part.done 时，严格按事件序列校验的客户端会等不到 part 结束。
+		event("response.content_part.done", map[string]any{
+			"type": "response.content_part.done", "item_id": item["id"], keyOutputIndex: index,
+			keyContentIndex: partIndex, "part": responsesOutputText(text),
 		})
 	}
 }
@@ -606,25 +688,41 @@ func isTextContentType(ct string) bool {
 		ct == "application/xml" || ct == "application/xhtml+xml"
 }
 
+// webFetchTransport 本地 web 工具的共享 transport。
+//
+// 必须是单例：此前每次 fetchRaw 都新建 http.Transport，而零值 Transport 的
+// IdleConnTimeout/TLSHandshakeTimeout 都为 0（永不回收）。body 读到 EOF 后连接会
+// 进入这个随即被丢弃的 transport 的空闲池，连接与它的读写协程要等对端关闭才退出；
+// 模型每次调用 web 工具都要重建一次 TCP+TLS，同 URL 也无法复用连接。
+//
+// 仍然显式不用 HTTP(S)_PROXY：代理会在网关之外解析目标，让 validateWebURL 与
+// dialWebFetch 的 IP 校验失效。
+var webFetchTransport = &http.Transport{
+	DialContext:           dialWebFetch,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ResponseHeaderTimeout: webFetchTimeout,
+	IdleConnTimeout:       30 * time.Second,
+	MaxIdleConns:          8,
+	MaxIdleConnsPerHost:   2,
+}
+
+// webFetchClient 与 webFetchTransport 配套的共享 client；重定向逐跳校验。
+// ctx 由调用方按 webSearchTimeout/webFetchTimeout 控制总时长。
+var webFetchClient = &http.Client{
+	Transport: webFetchTransport,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 {
+			return errStatic
+		}
+
+		return validateWebURL(req.Context(), req.URL.String())
+	},
+}
+
 // fetchRaw 校验目标、执行请求并读取有界响应；重定向逐跳校验。
 func fetchRaw(ctx context.Context, rawURL string, maxBytes int64) ([]byte, string, error) {
 	if err := validateWebURL(ctx, rawURL); err != nil {
 		return nil, "", err
-	}
-
-	client := &http.Client{
-		Timeout: webFetchTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return errStatic
-			}
-
-			return validateWebURL(req.Context(), req.URL.String())
-		},
-		// 用实际拨号地址兜底校验，关闭 validateWebURL 解析与 http.Client 再解析之间
-		// 的 DNS rebinding 窗口。显式不用 HTTP(S)_PROXY：代理会在网关之外解析目标，
-		// 使这里的 IP 校验失效。
-		Transport: &http.Transport{DialContext: dialWebFetch},
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, http.NoBody)
@@ -634,7 +732,7 @@ func fetchRaw(ctx context.Context, rawURL string, maxBytes int64) ([]byte, strin
 
 	req.Header.Set("User-Agent", "wokbuddy-demon/local-web-tools")
 
-	resp, err := client.Do(req)
+	resp, err := webFetchClient.Do(req)
 	if err != nil {
 		return nil, "", fmt.Errorf("请求失败: %w", err)
 	}

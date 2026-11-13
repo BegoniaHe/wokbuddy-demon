@@ -144,6 +144,14 @@ type Config struct {
 	LocalWebTools bool
 	// LocalWebToolRounds 本地工具代跑轮数（0 回落默认 3，封顶 8）。
 	LocalWebToolRounds int
+	// 以下四个出站能力开关（features.*）与 LocalWebTools 同口径：Live 快照优先，
+	// 这里的静态值只服务 Live 为 nil 的裸用/测试路径。缺了它们，该路径下这些端点
+	// 恒为关闭，与配置了 features.search_endpoint 等项的部署不同构。
+	SearchEndpoint   bool // POST /v1/search/messages（默认关）
+	SearchDeep       bool // 允许 /v1/search/messages 的 deep=true
+	WebFetchEndpoint bool // POST /v1/tools/fetch
+	ImagesEndpoint   bool // POST /v1/images/{generations,edits}
+	VideosEndpoint   bool // POST /v1/videos/generations 与 GET /v1/videos/{task_id}
 	// HiddenModels 模型黑名单（"cn:x"/"global:x" 归一形式）；空 = 关闭。
 	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
 	HiddenModels map[string]struct{}
@@ -214,6 +222,11 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		MultimodalRouting:  h.cfg.MultimodalRouting,
 		LocalWebTools:      h.cfg.LocalWebTools,
 		LocalWebToolRounds: h.cfg.LocalWebToolRounds,
+		SearchEndpoint:     h.cfg.SearchEndpoint,
+		SearchDeep:         h.cfg.SearchDeep,
+		WebFetchEndpoint:   h.cfg.WebFetchEndpoint,
+		ImagesEndpoint:     h.cfg.ImagesEndpoint,
+		VideosEndpoint:     h.cfg.VideosEndpoint,
 		BackgroundNames:    h.cfg.BackgroundNames,
 		BackgroundTarget:   h.cfg.BackgroundTarget,
 		HiddenModels:       h.cfg.HiddenModels,
@@ -550,11 +563,18 @@ func (h *Handler) withManagementAuth(next http.HandlerFunc, requireAdmin bool) h
 			return
 		}
 
-		h.authLimiter.Reset(ip)
-
 		if requireAdmin && res.Scope != httpauth.ScopeAdmin {
+			// 403 不清失败预算：否则「猜 admin key（记一次失败）→ 用 readonly key
+			// 打任意接口（清零）」可以无限试探，限速形同失效。
 			writeOpenAIError(w, http.StatusForbidden, "forbidden", "forbidden")
+
 			return
+		}
+
+		// 只有最高权限凭据的成功才是「合法访问」的证据：readonly 打读接口
+		// 同样会走到这里，若一并清零，攻击者用 readonly key 即可洗白自己的猜测预算。
+		if res.Scope == httpauth.ScopeAdmin {
+			h.authLimiter.Reset(ip)
 		}
 
 		next(w, r)
@@ -639,12 +659,25 @@ func (h *Handler) withClientAuth(next http.HandlerFunc) http.HandlerFunc {
 			keys:  h.cfg.Keys,
 		}
 
-		ctx := context.WithValue(r.Context(), keyUsageKey{}, keyUsage2)
-
-		next(w, r.WithContext(ctx))
-		h.cfg.Keys.RecordUsage(keyUsage2.id, keyUsage2.prompt, keyUsage2.completion, keyUsage2.total)
-		h.dropKeyPacing(ctx, keyUsage2.id)
+		h.serveWithKeyUsage(r.Context(), keyUsage2, next, w, r)
 	}
+}
+
+// serveWithKeyUsage 带命名密钥用量落账地执行下游处理。
+//
+// 落账放 defer 而非顺序调用：下游 panic 时用量仍要写入、整形债务仍要清理，否则该
+// key 的 RPM/TPM 计数与配额会永久少记（recover 在更外层，不会到这里）。
+func (h *Handler) serveWithKeyUsage(
+	parent context.Context, usageAcc *keyUsage, next http.HandlerFunc, w http.ResponseWriter, r *http.Request,
+) {
+	ctx := context.WithValue(parent, keyUsageKey{}, usageAcc)
+
+	defer func() {
+		h.cfg.Keys.RecordUsage(usageAcc.id, usageAcc.prompt, usageAcc.completion, usageAcc.total)
+		h.dropKeyPacing(ctx, usageAcc.id)
+	}()
+
+	next(w, r.WithContext(ctx))
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -1565,6 +1598,11 @@ type chatFlow struct {
 	reasoningRetried bool
 	// nonstreamContinued 非流式截断续写是否已执行（只续写一次，issue #247）。
 	nonstreamContinued bool
+	// callerGone 调用方已主动断开（ctx 取消 / 客户端写失败）。置位后本次请求的
+	// 用量归因按「非上游失败」计：deltaHasUsage 对中断请求天然为 false（上游还没
+	// 发 usage，或 usage 帧已随连接丢失），照原口径会把客户端停止记成上游错误，
+	// 污染面板错误率与 wokbuddy_requests_total{result="error"}。
+	callerGone bool
 
 	chatMeta upstream.ChatMeta
 }
@@ -1824,6 +1862,31 @@ func (h *Handler) requestModelAliases(model, keyRealm string) map[string]string 
 	return merged
 }
 
+// aliasResolver 返回一个按「出口 realm」懒构建的别名表查询函数。
+//
+// /v2/chat/busy 一次轮询要解析数十个模型名，而 requestModelAliases 每次都新建整张
+// 表（上游表本身已是一份拷贝）；逐模型重建是纯浪费。合并结果只依赖出口 realm，
+// 因此按 realm 缓存即可（同一次调用内上游别名/配置别名不会变）。
+func (h *Handler) aliasResolver(keyRealm string) func(model string) map[string]string {
+	cache := map[string]map[string]string{}
+
+	return func(model string) map[string]string {
+		realm, _, prefixed := splitRealm(model)
+		if !prefixed && keyRealm != "" {
+			realm = keyRealm
+		}
+
+		if merged, ok := cache[realm]; ok {
+			return merged
+		}
+
+		merged := h.requestModelAliases(model, keyRealm)
+		cache[realm] = merged
+
+		return merged
+	}
+}
+
 // resolveFlowModel 解析请求模型 → (realm, bareModel)：别名按最终出口 realm 选取。
 func (h *Handler) resolveFlowModel(in *chatInput) (realm, bareModel string, err error) {
 	return resolveKeyModel(in.model, h.requestModelAliases(in.model, in.keyRealm), in.keyRealm)
@@ -2076,6 +2139,8 @@ func (f *chatFlow) runRotation(ctx context.Context) bool {
 	// 请求做选号、粘性与轮换。并发竞态仍由 Acquire 的 CAS 兜底。
 	if f.h.cfg.Pool.GlobalInFlightFull() {
 		f.st.status = http.StatusServiceUnavailable
+		f.lastErr = errGatewaySaturated
+
 		return false
 	}
 
@@ -2186,6 +2251,8 @@ func (f *chatFlow) attempt(ctx context.Context, i int) rotationAction {
 		// 全局名额被并发抢走：直接终止，不再换号空转。
 		if f.h.cfg.Pool.GlobalInFlightFull() {
 			f.st.status = http.StatusServiceUnavailable
+			f.lastErr = errGatewaySaturated
+
 			return rotBreak
 		}
 
@@ -2235,7 +2302,7 @@ func (f *chatFlow) reserveCredits(acct *auth.Auth) bool {
 	// maxOutputTokensFromBody 整解一遍 JSON）。几十 KB 的请求每轮白付约 0.5ms，
 	// 且换号重试时每个账号再付一次。按域判断：另一域开着保底不能让本域白付扫描，
 	// 也不能让本域开着保底却被全局 0 短路。
-	if f.h.cfg.Pool.CreditFloorByRealm()[acct.Realm()] <= 0 {
+	if f.h.cfg.Pool.CreditFloorForRealm(acct.Realm()) <= 0 {
 		return true
 	}
 
@@ -2761,6 +2828,26 @@ func (f *chatFlow) handleTransportError(
 
 		return rotBreak
 	}
+	// 客户端主动断开（点停止 / 关页面）：ctx 已取消时 isUpstreamTimeout 对
+	// context.Canceled 返回 false，会落到下面的传输层分支——误记出口台账
+	// （两次即触发 exit fail WARN），并经 f.fail 解绑健康账号的粘性绑定。
+	// 与 nonStreamCallerGone 同口径：账号照常记成功，请求记 interrupted + 499。
+	if ctx.Err() != nil {
+		f.callerGone = true
+		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+		f.noteSuccessAndBind(acct)
+
+		f.st.status = clientClosedRequestStatus
+		f.st.outcome = reqlog.OutcomeInterrupted
+		f.lastErr = terr
+
+		log.Printf("INFO: [server] acct=%s model=%s: caller gone during upstream request: %v",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, terr)
+
+		// rotDone 而非 rotBreak：rotBreak 会让调用方继续走 writeFinalError，
+		// 把这里的 499/interrupted 覆盖成 503/HTTPError（正是本分支要消除的污染）。
+		return rotDone
+	}
 	// 网络层抖动：只换号，不罚账号（传输层错误对连续失败连坐熔断过于严苛）。
 	// 归因到出口维度（issue #493）：拨号/TLS/EOF 与「当前选中的账号」无关——一次
 	// 网络抖动会让轮转到的每个号都失败，按号记连败（NoteFailures）会把整池连败
@@ -3184,6 +3271,11 @@ func (f *chatFlow) handleStreamSuccess(
 	// 首帧否决窗口（issue #244）：在写出任何字节前预览首段，error/顶层业务码/零输出
 	// 都还能换号或关闭思考重发，不再出现「200 + error 帧」。等待期按 TTFB 间隔补
 	// SSE 注释帧（issue #500），见 probeWithHeartbeat。
+	// 在途流注册（issue #19）：从首帧等待期就开始计入——原实现放在首帧否决之后，
+	// 大上下文下这段空窗可达秒级，优雅关闭看不到它，会直接切断正在等首帧的流。
+	f.h.streams.enter()
+	defer f.h.streams.leave()
+
 	probe := f.probeWithHeartbeat(rc)
 	// 预览行缓冲来自全局池：必须在流结束后归还——Close 时点太早，见
 	// upstream.StreamProbe.Release。defer 与返回值顺序无关，veto/正常/错误路径都覆盖。
@@ -3193,9 +3285,6 @@ func (f *chatFlow) handleStreamSuccess(
 		return action
 	}
 
-	// 在途流注册（issue #19）：整个透传期间计入，关闭时据此等待排空。
-	f.h.streams.enter()
-	defer f.h.streams.leave()
 	// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
 	f.st.status = http.StatusOK
 
@@ -3509,12 +3598,11 @@ func (f *chatFlow) handlePreStreamErrorFrame(
 // 协程——注释帧与紧随其后的真实帧因此不会交错（串行化靠 join，不需要写锁）。
 func (f *chatFlow) probeWithHeartbeat(rc io.ReadCloser) *upstream.StreamProbe {
 	stopHeartbeat := startFirstByteHeartbeat(f.out, f.h.cfg.TTFBKeepaliveInterval)
+	// defer 而非顺序调用：ProbeStream 一旦 panic，顺序调用会跳过 stop，心跳协程
+	// 永久存活并继续写已被回收的响应对象。
+	defer stopHeartbeat()
 
-	probe := upstream.ProbeStream(rc)
-
-	stopHeartbeat()
-
-	return probe
+	return upstream.ProbeStream(rc)
 }
 
 // probeVeto 首帧否决窗口的处置分派：命中即关闭上游 body 并给出轮转动作。
@@ -3650,6 +3738,8 @@ func (f *chatFlow) applyStreamOutcome(
 		// ——账号侧照常记成功（与 default 同语义），请求日志归为 Interrupted
 		// （人已走，未完成）。ctx 取消可能是客户端断开导致的上游读中断，不能
 		// 误判成上游失败（issue #105 non-goal）。
+		// finishStreamStats 紧随其后按 callerGone 记 ok，避免中断被计成上游错误。
+		f.callerGone = true
 		f.st.outcome = reqlog.OutcomeInterrupted
 		f.noteSuccessAndBind(acct)
 	case sErr != nil:
@@ -4062,7 +4152,7 @@ func mergeUsageTotals(first, second map[string]any) {
 
 	if !recomputeUsageTotal(firstUsage) {
 		// 末段没有 prompt_tokens 时不能重算，保留末段自己的 total，不要用首段的。
-		if total, ok := secondUsage["total_tokens"].(float64); ok {
+		if total, ok := upstream.UsageNumber(secondUsage, "total_tokens"); ok {
 			firstUsage["total_tokens"] = total
 		}
 	}
@@ -4099,19 +4189,19 @@ func applyUsageLeaf(dst map[string]any, key string, value any) {
 		return
 	}
 
-	switch typed := value.(type) {
-	case map[string]any:
+	if typed, ok := value.(map[string]any); ok {
 		if target, ok := dst[key].(map[string]any); ok {
 			addUsageNumbers(target, typed)
 
 			return
 		}
-	case float64:
-		if target, ok := dst[key].(float64); ok {
-			dst[key] = target + typed
+	}
+	// 数值叶子按数值相加：帧解码走 UseNumber 后取值是 json.Number，只认 float64
+	// 会让累计值被末段覆盖（多轮 completion 少算）。
+	if sum, ok := upstream.UsageSumLeaves(dst[key], value); ok {
+		dst[key] = sum
 
-			return
-		}
+		return
 	}
 
 	dst[key] = value
@@ -4120,13 +4210,21 @@ func applyUsageLeaf(dst map[string]any, key string, value any) {
 // recomputeUsageTotal 在末段带 prompt_tokens 时按「末段 prompt + 累计 completion」
 // 重写 total_tokens。没有该字段返回 false，调用方保留末段原 total。
 func recomputeUsageTotal(usageMap map[string]any) bool {
-	promptTokens, ok := usageMap["prompt_tokens"].(float64)
+	promptTokens, ok := upstream.UsageNumber(usageMap, "prompt_tokens")
 	if !ok {
 		return false
 	}
 
-	completion, _ := usageMap["completion_tokens"].(float64)
-	usageMap["total_tokens"] = promptTokens + completion
+	completion, _ := upstream.UsageNumber(usageMap, "completion_tokens")
+
+	total := promptTokens + completion
+	// 上游数值不可信（溢出成 +Inf / NaN、负值）时不写 total：调用方保留末段原值。
+	// 把 +Inf 塞进响应体时 encoding/json 直接失败，整个非流式响应变成 500。
+	if math.IsInf(total, 0) || math.IsNaN(total) || total < 0 {
+		return false
+	}
+
+	usageMap["total_tokens"] = total
 
 	return true
 }
@@ -4183,6 +4281,7 @@ const clientClosedRequestStatus = 499
 // 处置与流式同名分支一致：账号照常记成功（不冷却、不喂连败、不轮换），请求日志记
 // interrupted + 499，不写响应体。返回 rotDone 表示「请求到此为止，不要再写响应」。
 func (f *chatFlow) nonStreamCallerGone(acct *auth.Auth, err error, attemptStarted time.Time) rotationAction {
+	f.callerGone = true
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	f.noteSuccessAndBind(acct)
 
@@ -4305,7 +4404,9 @@ func (f *chatFlow) recordAttempt(
 	}
 	// 耗时 histogram（issue #13）：每次上游尝试观测一次，与用量同源；按是否拿到
 	// usage 分成功/失败（与 recordUsage 的 ok 同口径），失败不再混入整体分位。
-	f.h.metrics.observeRequestDuration(float64(latencyMs)/1000, deltaHasUsage(delta))
+	// callerGone：调用方主动断开不是上游故障，即使没有 usage 也按成功口径计。
+	attemptOK := deltaHasUsage(delta) || f.callerGone
+	f.h.metrics.observeRequestDuration(float64(latencyMs)/1000, attemptOK)
 	// HasCompletionTokens 是「本次有没有 token 观测」的独立判断，与速率怎么算无关；
 	// 速率本身的边界（TTFB 缺失/超界）收在 tokensPerSecond。
 	if delta.HasCompletionTokens {
@@ -4321,10 +4422,11 @@ func (f *chatFlow) recordAttempt(
 	f.h.cfg.Pool.RecordTokenUsage(uid, delta)
 	// 健康台账（issue #16）：成功口径同 usage（deltaHasUsage），TTFT 有观测才并入。
 	// 只供选号降权，不改判定语义。
-	f.h.cfg.Pool.RecordModelHealth(uid, delta.Model, delta.TTFTMs, delta.HasTTFTMs, deltaHasUsage(delta))
+	f.h.cfg.Pool.RecordModelHealth(uid, delta.Model, delta.TTFTMs, delta.HasTTFTMs, attemptOK)
 	// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试没拿到
 	// 任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。失败也计入请求数。
-	f.recordUsage(uid, delta, credit, hasCredit)
+	// 调用方中断（callerGone）例外：那不是上游失败。
+	f.recordUsage(uid, delta, credit, hasCredit, attemptOK)
 }
 
 // applyDeltaToStat 把本次 delta 的 token 观测写入请求统计。
@@ -4363,14 +4465,16 @@ func (f *chatFlow) modelName() string {
 }
 
 // recordUsage 写入逐请求用量记录（含缓存/速率/倍率维度）。
-func (f *chatFlow) recordUsage(uid string, delta *pool.TokenUsageDelta, credit float64, hasCredit bool) {
+func (f *chatFlow) recordUsage(
+	uid string, delta *pool.TokenUsageDelta, credit float64, hasCredit, ok bool,
+) {
 	if f.h.cfg.Usage == nil {
 		return
 	}
 
-	realm := "cn"
-	if a, ok := f.h.cfg.Pool.Status(uid); ok && a.Realm != "" {
-		realm = a.Realm
+	realm := f.h.cfg.Pool.RealmOf(uid)
+	if realm == "" {
+		realm = "cn"
 	}
 
 	f.h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, &usage.Delta{
@@ -4392,7 +4496,7 @@ func (f *chatFlow) recordUsage(uid string, delta *pool.TokenUsageDelta, credit f
 		HasTTFT:          delta.HasTTFTMs,
 		TokensPerSecond:  delta.TokensPerSecond,
 		HasTPS:           delta.HasTokensPerSecond,
-	}, deltaHasUsage(delta))
+	}, ok)
 }
 
 // deltaHasUsage 报告本次尝试是否拿到上游 usage（成功口径，与 recordUsage 的 ok 一致）。
@@ -4570,6 +4674,11 @@ func localErrorEnvelope(
 				"the request was not routed to a direct connection; check upstream.proxy_slots / " +
 				"realm_proxy_slots",
 			true
+	case errors.Is(err, errGatewaySaturated):
+		// 本地容量闸门：503 + gateway_busy。客户端应退避重试（不是换模型、也不是
+		// 账号故障），与 no_healthy_account 的排查方向完全不同。
+		return fallbackStatus, "gateway_busy",
+			"gateway at capacity: all in-flight slots are taken, please retry shortly", true
 	default:
 		return fallbackStatus, fallbackCode, fallbackMsg, false
 	}
@@ -4766,9 +4875,9 @@ func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) 
 		return 0, 0, false
 	}
 
-	num, _ := usageMap["credit"].(float64)
+	num, _ := upstream.UsageNumber(usageMap, "credit")
 
-	t, _ := usageMap["total_tokens"].(float64)
+	t, _ := upstream.UsageNumber(usageMap, "total_tokens")
 	if t <= 0 {
 		return 0, 0, false
 	}
@@ -4797,6 +4906,11 @@ func rotateBackoff(ctx context.Context, i int) bool {
 
 // errUpstreamTimeout 上游超时的哨兵：末端出口据此给出与「没号可用」可区分的文案。
 var errUpstreamTimeout = errors.New("upstream timeout")
+
+// errGatewaySaturated 网关自身在途名额已满（全局并发闸门）。与「号池无健康账号」
+// 是两回事：前者是本地容量问题（扩容 / 调 concurrent），后者是上游账号问题。
+// 分开表达，客户端与面板才不会把本地过载当成上游故障去排查。
+var errGatewaySaturated = errors.New("gateway at capacity")
 
 // errZeroOutputLength / errContinuationFailed 流恢复路径的哨兵（issue #244/#247）。
 var (

@@ -88,6 +88,11 @@ type Writer struct {
 	path string
 	day  string
 	size int64
+	// closed Close 之后置位：终态写者不再重开文件。
+	//
+	// 停机时 runlog 先于 pool.Close 关闭（defer LIFO），而 pool.Close 会打停机日志；
+	// 若不置终态，ensureFileLocked 会把文件重新打开、再无人 flush/close。
+	closed bool
 }
 
 // New 构造写入器：创建目录并补齐缺省参数，文件在首次写入时惰性打开。
@@ -123,6 +128,10 @@ func (w *Writer) WriteAt(now time.Time, data []byte) (int, error) {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.closed {
+		return len(data), nil
+	}
 
 	if err := w.ensureFileLocked(now, len(data)); err != nil {
 		return 0, err
@@ -166,6 +175,8 @@ func (w *Writer) Close() error {
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	w.closed = true
 
 	var flushErr error
 
@@ -379,16 +390,29 @@ func (w *Writer) latestNameLocked(day string) string {
 	return best
 }
 
-// nextPathLocked 返回当天第一个不存在的序号路径。
+// nextPathLocked 返回当天下一个可写路径：已存在最大序号 + 1，绝不复用空档。
+//
+// 复用会破坏「文件名序 = 时间序」：pruneLocked 按 mtime 升序删最旧的（最旧的一直是
+// 基准名 index 0），之后再写入若占用 index 0，它的内容反而比 .1/.2 更新。依赖该
+// 不变式的两条路径都会失效：reqlog 的读路径（Files 升序后倒序取最近 N 条）会从
+// 最旧的 .1 开始读、把最新归档排除在外；重启时 latestNameLocked 也会把新内容追加
+// 到含旧数据的文件里。
 func (w *Writer) nextPathLocked(day string) string {
 	base := filepath.Join(w.cfg.Dir, w.cfg.Prefix+"-"+day)
 
-	path := base + w.cfg.Ext
-	for index := 1; fileExists(path); index++ {
-		path = base + "." + strconv.Itoa(index) + w.cfg.Ext
+	next := 0
+
+	if latest := w.latestNameLocked(day); latest != "" {
+		if _, index, ok := parseName(w.cfg.Prefix, w.cfg.Ext, latest); ok {
+			next = index + 1
+		}
 	}
 
-	return path
+	if next == 0 {
+		return base + w.cfg.Ext
+	}
+
+	return base + "." + strconv.Itoa(next) + w.cfg.Ext
 }
 
 // pruneLocked 按 mtime 从旧到新删除过期文件与超额文件（调用方已持锁）。
@@ -452,11 +476,4 @@ func parseName(prefix, ext, name string) (time.Time, int, bool) {
 	}
 
 	return day, index, true
-}
-
-// fileExists 报告普通文件是否存在。
-func fileExists(path string) bool {
-	info, err := os.Stat(path)
-
-	return err == nil && !info.IsDir()
 }

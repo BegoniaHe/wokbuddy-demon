@@ -36,7 +36,9 @@ func backfillTestServer(t *testing.T, failFirst int32) (*httptest.Server, *atomi
 				return
 			}
 
-			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
+			// 成功回执按官方平铺形态（UPSTREAM.md）：空 data 信封没有判据字段，
+			// 会被 checkinReceipt 判失败，补签路径就永远等不到 CheckinDone。
+			w.Write([]byte(`{"credit":100,"streak_days":1,"is_streak_day":true}`))
 		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
 			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[` +
 				`{"CycleCapacitySize":1000,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))

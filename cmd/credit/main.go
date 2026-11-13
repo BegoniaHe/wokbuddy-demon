@@ -145,13 +145,15 @@ func userResourcePaths() []string {
 }
 
 func fetchUserResource(
-	client *upstream.Client, account *auth.Auth,
+	client *upstream.Client, httpClient *http.Client, account *auth.Auth,
 ) (remain, used, size int64, packs int, err error) {
 	// UA 与服务端 billing meter 面同源：CLI 用 Go 默认 UA 打同一端点，是明显的
 	// 非官方指纹（且与 chat 面不一致）。
 	agent := client.BillingMeterUserAgent(account)
 
-	return fetchUserResourceAt(&http.Client{Timeout: 20 * time.Second}, billingBaseFor(account), account, agent)
+	// httpClient 由调用方复用：192 号批量时每账号新建 Transport 等于每次重新
+	// TCP+TLS 握手，而 404 回落链路的「同一连接接着用」注释也就永远无效。
+	return fetchUserResourceAt(httpClient, billingBaseFor(account), account, agent)
 }
 
 // fetchUserResourceAt 在指定计费域上按 userResourcePaths 依序请求：仅 404 换下一候选，
@@ -297,7 +299,21 @@ func main() {
 		authDir = v
 	}
 
-	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
+	files, gerr := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
+	if gerr != nil {
+		// 路径含 glob 元字符（`[`、`*`）时 Glob 报 ErrBadPattern；丢弃错误会
+		// 「成功」输出 0 账号报表并退出 0，把配置写错伪装成没有账号。
+		fmt.Fprintln(os.Stderr, "glob auths:", gerr)
+		os.Exit(1)
+	}
+
+	// 目录写错/挂载丢失时 Glob 返回 (nil, nil)：0 账号必须像 signin/trial 一样
+	// 非零退出，否则 cron 会把「什么都没查到」当成正常日报。
+	if len(files) == 0 {
+		fmt.Fprintf(os.Stderr, "no auth files under %s\n", authDir)
+		os.Exit(1)
+	}
+
 	slices.Sort(files)
 
 	// refresh 与主程序/CLI 出站同源：加载部署 profile，避免刷新请求使用
@@ -315,9 +331,22 @@ func main() {
 
 	if pretty {
 		printPretty(accounts, totalRemain, totalUsed, totalSize, okCount)
-		return
+	} else if err := writeJSONReport(accounts, totalRemain, totalUsed, totalSize, okCount); err != nil {
+		fmt.Fprintln(os.Stderr, "marshal output:", err)
+		os.Exit(1)
 	}
 
+	// 全部账号失败 → 非零退出（脚本/cron 需要机器信号）；部分失败仍返回 0，
+	// 单号故障不该让整轮判负。
+	if len(accounts) > 0 && okCount == 0 {
+		os.Exit(1)
+	}
+}
+
+// writeJSONReport 输出 JSON 报表（默认格式）。
+func writeJSONReport(
+	accounts []accountResult, totalRemain, totalUsed, totalSize int64, okCount int,
+) error {
 	out := map[string]any{
 		"service": "workbuddy",
 		"ts":      time.Now().Unix(),
@@ -334,11 +363,12 @@ func main() {
 
 	raw, err := json.Marshal(out)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "marshal output:", err)
-		os.Exit(1)
+		return fmt.Errorf("marshal output: %w", err)
 	}
 
 	fmt.Println(string(raw))
+
+	return nil
 }
 
 // collectAccounts 逐个账号拉取余额：读取/解析失败也追加一条错误结果，保证
@@ -347,6 +377,8 @@ func main() {
 //nolint:funlen // 逐文件读取/刷新/查询线性展开。
 func collectAccounts(files []string, client *upstream.Client) []accountResult {
 	accounts := make([]accountResult, 0, len(files))
+	// 单号批量共用一个 client：连接与 TLS 会话在账号之间复用（见 fetchUserResource）。
+	httpClient := &http.Client{Timeout: 20 * time.Second}
 
 	for _, filePath := range files {
 		raw, err := os.ReadFile(filePath) //nolint:gosec // 路径来自本机 CLI 参数，非远程输入
@@ -382,7 +414,7 @@ func collectAccounts(files []string, client *upstream.Client) []accountResult {
 			continue
 		}
 
-		remain, used, size, packs, err := fetchUserResource(client, account)
+		remain, used, size, packs, err := fetchUserResource(client, httpClient, account)
 		if err != nil {
 			res.Error = err.Error()
 		} else {

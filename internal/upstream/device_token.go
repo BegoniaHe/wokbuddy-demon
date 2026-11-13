@@ -13,6 +13,7 @@ package upstream
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -62,6 +63,12 @@ func readDeviceTokenFile(path string) string {
 	tok, err := readTrimmedFile(path, deviceTokenFileMaxLen)
 	if err != nil {
 		// 读失败：清空缓存 token，避免注入过期/错误的值。
+		// 只记一次 WARN（同一错误不重复刷）：文件存在但内容异常/无权限时，
+		// 静默降级会让排障看不出「配置了但被忽略」。
+		if dtFileCache.lastErr == nil || !errors.Is(err, dtFileCache.lastErr) {
+			log.Printf("WARN: [upstream] device token 文件 %s 不可用（前 5 分钟不注入）: %v", path, err)
+		}
+
 		dtFileCache.token = ""
 		dtFileCache.lastErr = err
 		dtFileCache.readAt = time.Now()

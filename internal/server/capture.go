@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,10 @@ const (
 	captureDirEnv = "WB2API_CAPTURE_DIR"
 	// captureTailChars 样本里响应尾部的字符上限（截断后仍能看出收尾形态）。
 	captureTailChars = 400
+	// captureMaxFiles 目录内样本文件上限：每个样本一个文件，长期开启会把磁盘写满。
+	// 超限后滚动删除最旧的样本（只碰本包生成、capture- 前缀 + .json 后缀的文件），
+	// 保留最近一段时间的取证窗口。
+	captureMaxFiles = 500
 
 	// Detail 键名：调用点与样本读取方共用，避免同一字面量散落各处。
 	captureKeyDeclaredTools = "declared_tools"
@@ -87,10 +92,48 @@ func captureSample(shape, model string, stream bool, tail string, detail map[str
 		return
 	}
 
+	rotateCaptureDir(dir)
+
 	name := "capture-" + now.Format("20060102T150405.000000000") + "-" + captureSlug(shape) + ".json"
 	//nolint:gosec // 同上：写盘路径 = 运维指定目录 + 内置形态名 + 时间戳，无外部输入。
 	if err := os.WriteFile(filepath.Join(dir, name), append(raw, '\n'), 0o600); err != nil {
 		captureWarn(err)
+	}
+}
+
+// rotateCaptureDir 在写新样本前把目录里的样本数压到上限以下。
+// 文件名带纳秒时间戳，字典序即时间序，因此按名字排序删最旧即可。
+func rotateCaptureDir(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) <= captureMaxFiles {
+		return
+	}
+
+	names := make([]string, 0, len(entries))
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "capture-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+
+		names = append(names, name)
+	}
+
+	// 未达上限时不删：样本数恰好等于上限也要先腾出一格，否则加上本次写入就超限。
+	if len(names) < captureMaxFiles {
+		return
+	}
+
+	slices.Sort(names)
+
+	for _, name := range names[:len(names)-captureMaxFiles+1] {
+		//nolint:gosec // 路径 = 运维指定目录 + 本函数上一步筛出的本包样本名。
+		if rmErr := os.Remove(filepath.Join(dir, name)); rmErr != nil {
+			captureWarn(rmErr)
+
+			return
+		}
 	}
 }
 

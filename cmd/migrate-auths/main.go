@@ -39,10 +39,9 @@ const (
 )
 
 var (
-	errWriteBackupFailed   = errors.New("writeBackup failed")
-	errMissingUID          = errors.New("missing uid")
-	errMissingAccessToken  = errors.New("missing access_token")
-	errMissingRefreshToken = errors.New("missing refresh_token")
+	errWriteBackupFailed  = errors.New("writeBackup failed")
+	errMissingUID         = errors.New("missing uid")
+	errMissingAccessToken = errors.New("missing access_token")
 )
 
 type row struct {
@@ -244,9 +243,10 @@ func convertLegacy(raw []byte) (*auth.Auth, error) {
 		return nil, errMissingUID
 	case strings.TrimSpace(item.AccessToken) == "":
 		return nil, errMissingAccessToken
-	case strings.TrimSpace(item.RefreshToken) == "":
-		return nil, errMissingRefreshToken
 	}
+	// refreshToken 不是必填：加载器（auth.Parse）接受只有 accessToken 的文件，
+	// cmd/signin 也为这类账号专门跳过刷新。要求 RT 会把「手写旧版只带 access_token」
+	// 的凭证判成 INVALID 并让整轮迁移以退出码 1 结束。
 
 	account := &auth.Auth{
 		AccessToken:  item.AccessToken,

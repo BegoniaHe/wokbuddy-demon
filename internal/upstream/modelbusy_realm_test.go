@@ -48,8 +48,10 @@ func TestModelBusyRemembersMissingRealm(t *testing.T) {
 		t.Fatalf("calls=%d want 1（第二次应短路，不再打上游）", calls)
 	}
 
-	if !client.modelBusyRealmMissing("global") {
-		t.Fatal("记忆未落到 global 桶")
+	// 记忆键按实际出站主机分桶（见 Client.modelBusyScope）：同一 global realm 的
+	// 两套国际主机互不牵连，一次 404 不该把另一套的观测永久关掉。
+	if !client.modelBusyRealmMissing(client.modelBusyScope(globalBusyAccount())) {
+		t.Fatal("记忆未落到探测账号的作用域桶")
 	}
 }
 
@@ -130,7 +132,7 @@ func TestModelBusyTransientErrorNotRemembered(t *testing.T) {
 		t.Fatalf("calls=%d want 2（偶发失败不记忆）", calls)
 	}
 
-	if client.modelBusyRealmMissing("global") {
+	if client.modelBusyRealmMissing(client.modelBusyScope(globalBusyAccount())) {
 		t.Fatal("5xx 不应置位记忆")
 	}
 }
@@ -139,13 +141,13 @@ func TestModelBusyTransientErrorNotRemembered(t *testing.T) {
 func TestModelBusyRealmKey(t *testing.T) {
 	t.Parallel()
 
-	if realm := modelBusyRealm(nil); realm != "" {
-		t.Fatalf("nil 账号 realm=%q want 空串", realm)
-	}
-
 	client := testClient(func(*http.Request) (*http.Response, error) {
 		return jsonResp(http.StatusNotFound, `{"error_msg":"404 Route Not Found"}`), nil
 	})
+
+	if scope := client.modelBusyScope(nil); scope != "" {
+		t.Fatalf("nil 账号 scope=%q want 空串", scope)
+	}
 
 	if client.modelBusyRealmMissing("") {
 		t.Fatal("空 realm 不应命中记忆")

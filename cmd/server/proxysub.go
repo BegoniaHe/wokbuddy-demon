@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 )
 
 // errProxySubFailed 订阅拉取失败的静态哨兵（err113：错误串里含脱敏 URL 等动态内容）。
@@ -44,7 +45,7 @@ var proxySubFetcher = fetchProxySubscriptionText
 // fetchProxySubscriptionText 拉取订阅原文。错误信息只用脱敏后的 URL：订阅 URL 常
 // 带 token（路径或 query），不能进日志。
 func fetchProxySubscriptionText(rawURL string) (string, error) {
-	masked := maskProxySubURL(rawURL)
+	masked := panel.MaskProxySubURL(rawURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), proxySubFetchTimeout)
 	defer cancel()
@@ -86,30 +87,8 @@ func maskedHTTPError(err error) string {
 	return "请求失败"
 }
 
-// maskProxySubURL 订阅 URL 的打码口径：只留 scheme://host，丢掉可能带 token 的
-// 路径与 query（与 outbound.Proxy.Masked 同一思路）。
-func maskProxySubURL(raw string) string {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "[invalid proxy subscription url]"
-	}
-
-	return u.Scheme + "://" + u.Host
-}
-
-// maskProxyEntry 单个代理条目的打码口径：同样只留 scheme://host[:port]。
-func maskProxyEntry(raw string) string {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme == "" {
-		return "[unparsable proxy entry]"
-	}
-
-	if parsed.Host == "" {
-		return parsed.Scheme + "://"
-	}
-
-	return parsed.Scheme + "://" + parsed.Host
-}
+// 订阅 URL 与代理条目的打码口径统一由 internal/panel 提供：面板回显与保存侧还原
+// 必须是同一实现，否则「没改动」会被判成「改成了掩码值」（见 panel.MaskProxyEntry）。
 
 // proxySubscriptionCache 上一次成功解析结果（按订阅 URL）。刷新失败时沿用它，
 // 保证「拉不到 ≠ 清空现有代理」。
@@ -151,7 +130,7 @@ func resolveProxySubscriptions(subs []string) []string {
 		if len(proxies) == 0 {
 			cached := cachedProxySubscription(sub)
 			log.Printf("WARN: [server] 代理订阅未解析出可用代理（沿用上次结果 %d 条）: %s（跳过 %d 条）",
-				len(cached), maskProxySubURL(sub), len(skipped))
+				len(cached), panel.MaskProxySubURL(sub), len(skipped))
 			out = append(out, cached...)
 
 			continue
@@ -163,7 +142,7 @@ func resolveProxySubscriptions(subs []string) []string {
 
 		storeProxySubscription(sub, proxies)
 		log.Printf("INFO: [server] 代理订阅已解析: %s（%d 个代理，跳过 %d 条）",
-			maskProxySubURL(sub), len(proxies), len(skipped))
+			panel.MaskProxySubURL(sub), len(proxies), len(skipped))
 		out = append(out, proxies...)
 	}
 
@@ -230,7 +209,7 @@ func parseProxyList(text string) (proxies, skipped []string) {
 		}
 
 		if _, err := outbound.ParseProxy(entry); err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s: %v", maskProxyEntry(entry), err))
+			skipped = append(skipped, fmt.Sprintf("%s: %v", panel.MaskProxyEntry(entry), err))
 
 			continue
 		}
@@ -253,7 +232,7 @@ func parseClashProxies(text string) (proxies, skipped []string) {
 		}
 
 		if _, err := outbound.ParseProxy(entry); err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s: %v", maskProxyEntry(entry), err))
+			skipped = append(skipped, fmt.Sprintf("%s: %v", panel.MaskProxyEntry(entry), err))
 
 			continue
 		}
