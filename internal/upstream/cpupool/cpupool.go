@@ -406,6 +406,9 @@ func SnapThreads(threads int) int {
 }
 
 // ModelsForThreads 返回逻辑线程数 threads 对应的型号池；超出最大档时取最大档。
+//
+// 返回副本：band 内部切片来自可导出的 Models 表，调用方原地排序/改写会污染全局
+// 指纹数据（抽取逻辑按权重随机取样，改写后权重与型号不再对应）。
 func ModelsForThreads(threads int) []CPUModel {
-	return pickBand(threadBands, threads)
+	return slices.Clone(pickBand(threadBands, threads))
 }

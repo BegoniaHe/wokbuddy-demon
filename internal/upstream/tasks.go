@@ -133,9 +133,11 @@ func (c *Client) ClaimRewardMP(account *auth.Auth, taskCode string) (credit, ene
 
 	data, err := c.doJSONFor(account, req)
 	if err != nil {
-		// chat 域对该路径 400（部分任务/租户形态）→ Web 域降级（已实测可领）。
+		// 只有 chat 域对该路径返回 400（部分任务/租户形态）才降级 Web 域（已实测
+		// 可领）。其它错误（5xx / 429 / 鉴权终态 / 网络）在 Web 域上是同一份上游
+		// 状态：重放只会白打一次上游，还可能在原错误已生效（限流）时放大压力。
 		ue := &Error{}
-		if errors.As(err, &ue) {
+		if errors.As(err, &ue) && ue.Status == http.StatusBadRequest {
 			return c.ClaimReward(account, taskCode)
 		}
 

@@ -126,6 +126,34 @@ func TestAggregateTotalTooLong(t *testing.T) {
 	}
 }
 
+// TestAggregateRefusalTotalTooLong refusal 与 content/reasoning/tool_call
+// arguments 同属可无限追加的聚合字段，必须共用 32 MiB 上限：漏记它就是一条
+// 绕过 issue #113 的无界内存通道（异常上游持续发 delta.refusal）。
+func TestAggregateRefusalTotalTooLong(t *testing.T) {
+	t.Parallel()
+	// 每帧 1 MiB refusal：单行不超限，累计 33 帧超过 32 MiB。
+	const frame = 1 << 20
+
+	var builder strings.Builder
+	for range 40 {
+		builder.WriteString(`data: {"choices":[{"index":0,"delta":{"refusal":"`)
+		builder.WriteString(strings.Repeat("y", frame))
+		builder.WriteString(`"}}]}`)
+		builder.WriteString("\n\n")
+	}
+
+	builder.WriteString("data: [DONE]\n\n")
+
+	resp, err := Aggregate(strings.NewReader(builder.String()))
+	if !errors.Is(err, ErrSSEAggregateTooLong) {
+		t.Fatalf("err=%v want aggregate too long (resp!=nil: %v)", err, resp != nil)
+	}
+
+	if resp != nil {
+		t.Errorf("聚合超限不得返回响应体")
+	}
+}
+
 // TestStreamLineTooLong 流式：单行超限时写明确 error 帧 + 恰好一个 [DONE]，
 // 返回 ErrSSELineTooLong（issue #113）；已写的正常帧不撤回。
 func TestStreamLineTooLong(t *testing.T) {

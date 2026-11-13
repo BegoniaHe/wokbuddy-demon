@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -293,7 +294,7 @@ func (c *Client) doSearch(account *auth.Auth, req *http.Request) (*SearchOutcome
 		Msg  string `json:"msg"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, RedactForLog(string(raw), 120))
 	}
 
 	if parsed.Code != 0 {
@@ -305,7 +306,7 @@ func (c *Client) doSearch(account *auth.Auth, req *http.Request) (*SearchOutcome
 		}
 
 		return nil, &Error{
-			Kind: kind, Status: resp.StatusCode,
+			Kind: kind, Status: resp.StatusCode, Code: strconv.Itoa(parsed.Code),
 			Msg: fmt.Sprintf("code=%d msg=%s", parsed.Code, truncate(parsed.Msg, 160)),
 		}
 	}

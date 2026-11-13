@@ -47,6 +47,10 @@ const schoolOpenDayActivityID = "school_open_day_2026"
 // machineId 按 uid 稳定派生，与桌面/web 域同思路：每账号一台固定虚拟设备，
 // 账号间互异，避免全部账号共用同一硬编码设备标识。
 func mpEventBase(account2 *auth.Auth) map[string]any {
+	if account2 == nil {
+		return map[string]any{}
+	}
+
 	return map[string]any{
 		"timestamp":    time.Now().UnixMilli(),
 		"ideType":      "WorkBuddy_MP",

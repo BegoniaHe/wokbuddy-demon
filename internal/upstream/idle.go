@@ -3,6 +3,7 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -39,6 +40,13 @@ func (b *idleMonitoringBody) Read(p []byte) (int, error) {
 	}
 
 	if err != nil {
+		// io.EOF 必须原样返回：io.ReadAll / bufio 及本包的聚合路径都以
+		// err == io.EOF 判正常流尾，包装后正常结束会被当成读失败（非流式聚合成
+		// 502 upstream_parse）。其它错误才加前缀便于定位。
+		if errors.Is(err, io.EOF) {
+			return n, io.EOF
+		}
+
 		return n, fmt.Errorf("Read: %w", err)
 	}
 
@@ -137,6 +145,9 @@ func (b *idleMonitoringBody) idleFor() time.Duration {
 // monitorBody 若 idle<=0 直接返回原底流（禁用空闲监控）；
 // 否则包上流中空闲监控。计时从返回 body 之后开始——首字节阶段由
 // Transport.ResponseHeaderTimeout 管，这里不抢跑。
+//
+// 注意所有权：idle>0 时 cancel 归返回的 body（Close 时调用）；idle<=0 时不接管
+// cancel，调用方必须自己保证它被调用（见 chatStreamAt 的派生条件）。
 func monitorBody(rc io.ReadCloser, idle time.Duration, cancel context.CancelFunc) io.ReadCloser {
 	if idle <= 0 {
 		return rc

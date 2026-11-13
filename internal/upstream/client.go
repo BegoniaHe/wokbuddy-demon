@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
@@ -131,7 +132,9 @@ type Error struct {
 }
 
 func (e *Error) Error() string {
-	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
+	// Msg 保留上游原文（分类/排障要看关键词），但 Error() 是日志与面板回显的出
+	// 口，必须先脱敏：错误 body 可能夹带上游回显的 token/URL 查询参数。
+	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, RedactForLog(e.Msg, 200))
 }
 
 // hardMarkers 余额不足关键词（小写比较 + 中文原文比较双通道）。
@@ -1298,9 +1301,12 @@ type Client struct {
 	// SetHeaderOrder / SetTLSFingerprint 写入（改动需重启），运行期只读。
 	headerOrder    atomic.Bool
 	tlsFingerprint atomic.Pointer[tlsFingerprintConfig]
-	// tlsStateMu/tlsState TLS 会话缓存（Go 与 uTLS 各一份，惰性创建）。
-	tlsStateMu sync.Mutex
-	tlsState   *tlsHandshakeState
+	// tlsStateMu/tlsState 共享 Transport 的 TLS 会话缓存（Go 与 uTLS 各一份，
+	// 惰性创建）；slotTLSState 按槽各一份（slotMu 保护），出口热改时随
+	// slotClients 一起丢弃。
+	tlsStateMu   sync.Mutex
+	tlsState     *tlsHandshakeState
+	slotTLSState map[string]*tlsHandshakeState
 
 	// tlsRootCAs 测试注入的自签根证书池；nil = 系统根（生产默认）。
 	tlsRootCAs *x509.CertPool
@@ -1524,6 +1530,8 @@ func (c *Client) invalidateSlotClients() {
 	}
 
 	clear(c.slotClients)
+	// TLS 会话缓存与 Transport 同生命周期：旧出口的 ticket 不能被新出口复用。
+	clear(c.slotTLSState)
 	c.slotMu.Unlock()
 }
 
@@ -1763,14 +1771,16 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-// realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
+// scope 为模型目录快照作用域键（见 modelScope）：CN 恒为 "cn"，global 为
+// "global|<实际出站主机>"。同 realm 下 codebuddy.ai / workbuddy.ai 是两套上游，
+// 只按 realm 分桶会让 A 域的档位表降级 B 域请求（上游不认该 effort → 400）。
 //
 // 全部改写（规范化 / 补首条 system / prompt_cache_key / conversationRequestId /
 // max_tokens / agent）在同一次解码内完成：每步单独整解整编会让几十 KB 的体每请求
 // 编解码 3~4 轮。
-func (c *Client) prepareBody(body []byte, realm, uid, conversationID, conversationRequestID string) []byte {
-	efforts, defs, maxOut := c.chatBodySnapshots(realm)
-	if realmKey(realm) == "global" {
+func (c *Client) prepareBody(body []byte, scope, uid, conversationID, conversationRequestID string) []byte {
+	efforts, defs, maxOut := c.chatBodySnapshots(scope)
+	if isGlobalScope(scope) {
 		// global 域降级源 = 远端探测桶（权威）∪ 产品静态兜底表（全局 21 名内档位如
 		// deepseek-v4.1-flash ['high']）。当前探测桶为空时也按静态表降级，不全程透传
 		// （issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
@@ -1797,41 +1807,56 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID, conversati
 // chatBodySnapshots 一次读锁取出出站改写需要的三类目录快照：effort 档位、
 // 模型声明默认档、输出上限。任一桶为空都返回 nil（调用方按「未知」处理）。
 // 与 effortsSnapshot 同契约：写入时克隆/新建、发布后不可变，读路径零拷贝。
-func (c *Client) chatBodySnapshots(realm string) (map[string][]string, map[string]string, map[string]int64) {
-	k := realmKey(realm)
+func (c *Client) chatBodySnapshots(scope string) (map[string][]string, map[string]string, map[string]int64) {
+	k := realmKey(scope)
 
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
 
-	efforts := c.efforts[k]
-	if len(efforts) == 0 {
-		efforts = nil
-	}
-
-	defs := c.defaultEfforts[k]
-	if len(defs) == 0 {
-		defs = nil
-	}
-
-	maxOut := c.modelMaxOut[k]
-	if len(maxOut) == 0 {
-		maxOut = nil
-	}
+	// 本主机尚未探测过（例如同为 global 的另一个域先跑过）：回落到任一 global 桶，
+	// 总比完全透传（不降级）安全。作用域外（cn）不做回落——见 snapshotBucket。
+	efforts, _ := snapshotBucket(c.efforts, k, nonEmptyMap)
+	defs, _ := snapshotBucket(c.defaultEfforts, k, nonEmptyMap)
+	maxOut, _ := snapshotBucket(c.modelMaxOut, k, nonEmptyMap)
 
 	return efforts, defs, maxOut
 }
 
+// snapshotBucket 取作用域桶：精确键优先；global 作用域键未命中时按字典序回落到
+// 任一非空兄弟桶（同 realm 的另一套国际主机）。调用方需持对应锁。
+func snapshotBucket[T any](buckets map[string]T, key string, nonEmpty func(T) bool) (T, bool) {
+	if bucket, ok := buckets[key]; ok && nonEmpty(bucket) {
+		return bucket, true
+	}
+
+	if isGlobalScope(key) {
+		for _, sibling := range sortedGlobalScopes(buckets) {
+			if sibling == key {
+				continue
+			}
+
+			if bucket, ok := buckets[sibling]; ok && nonEmpty(bucket) {
+				return bucket, true
+			}
+		}
+	}
+
+	var zero T
+
+	return zero, false
+}
+
+// nonEmptyMap 判断 map 桶是否非空（snapshotBucket 的空值判定）。
+func nonEmptyMap[K comparable, V any](m map[K]V) bool { return len(m) > 0 }
+
 // effortsSnapshot 返回 effort 能力缓存的只读快照；nil 表示未知（透传不降级）。
 // storeEfforts 在写入时已克隆输入并整体替换桶，快照发布后不可变，读路径零拷贝。
 // 调用方只读，不得修改返回的 map/slice。
-func (c *Client) effortsSnapshot(realm string) map[string][]string {
+func (c *Client) effortsSnapshot(scope string) map[string][]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
 
-	bucket := c.efforts[realmKey(realm)]
-	if len(bucket) == 0 {
-		return nil
-	}
+	bucket, _ := snapshotBucket(c.efforts, realmKey(scope), nonEmptyMap)
 
 	return bucket
 }
@@ -1839,25 +1864,60 @@ func (c *Client) effortsSnapshot(realm string) map[string][]string {
 // defaultEffortsSnapshot 返回指定 realm 的模型 defaultEffort 只读快照；
 // 该域无探测或无声明默认档 → nil（thinking.go 回退硬编码 high）。
 // 与 effortsSnapshot 同契约：写入时克隆，快照不可变，调用方只读。
-func (c *Client) defaultEffortsSnapshot(realm string) map[string]string {
+func (c *Client) defaultEffortsSnapshot(scope string) map[string]string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
 
-	bucket := c.defaultEfforts[realmKey(realm)]
-	if len(bucket) == 0 {
-		return nil
-	}
+	bucket, _ := snapshotBucket(c.defaultEfforts, realmKey(scope), nonEmptyMap)
 
 	return bucket
 }
 
-// realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
+// realmKey 归一化缓存键：空串视为 cn（老调用/无前缀模型名）。
 func realmKey(realm string) string {
 	if realm == "" {
 		return "cn"
 	}
 
 	return realm
+}
+
+// modelScope 模型目录快照的作用域键：CN 恒为 "cn"，global 为
+// "global|<实际出站主机>"。global 上游在国际站有两套主机（codebuddy.ai /
+// workbuddy.ai，见 globalBaseForDomain），模型目录与 effort 档位随主机不同；
+// 只按 realm 分桶会用 A 域目录当成 B 域权威目录，并让 A 域档位表降级 B 域请求。
+func (c *Client) modelScope(a *auth.Auth) string {
+	if a == nil || a.Realm() != "global" {
+		return "cn"
+	}
+
+	base := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(c.chatBase(a), "https://"), "http://"), "/")
+	if host, _, found := strings.Cut(base, "/"); found {
+		base = host
+	}
+
+	return "global|" + base
+}
+
+// isGlobalScope 判断键是否属于 global 作用域（含只按 realm 的旧口径键）。
+func isGlobalScope(scope string) bool {
+	return scope == "global" || strings.HasPrefix(scope, "global|")
+}
+
+// sortedGlobalScopes 返回 map 中所有 global 作用域键（字典序，保证读路径稳定）。
+// 调用方需持对应锁。
+func sortedGlobalScopes[T any](buckets map[string]T) []string {
+	keys := make([]string, 0, len(buckets))
+
+	for key := range buckets {
+		if isGlobalScope(key) {
+			keys = append(keys, key)
+		}
+	}
+
+	slices.Sort(keys)
+
+	return keys
 }
 
 func (c *Client) billingBase(a *auth.Auth) string {
@@ -1920,7 +1980,8 @@ func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (jso
 
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+		// body 片段可能夹带上游回显的凭证（截断/非 JSON 时尤甚），入错误串前先脱敏。
+		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, RedactForLog(string(raw), 120))
 	}
 
 	if env.Code != 0 {
@@ -1971,17 +2032,19 @@ func doRawResponse(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, 
 
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("doJSONAt: %w", err)
+		// 前缀用本函数名：写成 doJSONAt 会让日志把「不经信封的原始请求」误指到
+		// 解析路径，排障时看错层。
+		return nil, 0, fmt.Errorf("doRawResponse: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("read body: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("doRawResponse: read body: %w", err)
 	}
 
 	if int64(len(raw)) > maxBytes {
-		return nil, resp.StatusCode, fmt.Errorf("response body exceeds %d bytes: %w",
+		return nil, resp.StatusCode, fmt.Errorf("doRawResponse: response body exceeds %d bytes: %w",
 			maxBytes, errDoJSONLimitFailed)
 	}
 
@@ -2485,7 +2548,7 @@ func (c *Client) ChatStreamContext(
 		conversationRequestID = meta.ConversationRequestID
 	}
 
-	prepared := c.prepareBody(body, account3.Realm(), account3.UID,
+	prepared := c.prepareBody(body, c.modelScope(account3), account3.UID,
 		cacheKeySource(meta.ConversationID, meta.CacheKeyID), conversationRequestID)
 
 	payload, contentEncoding, payloadErr := c.chatPayload(account3, prepared)
@@ -2558,7 +2621,7 @@ type chatAttempt struct {
 
 // chatStreamAt 向单个 origin 发起 chat 请求。replay 表示首 token 前可换 origin 重放。
 //
-//nolint:funlen,gocritic,maintidx // 请求装配与错误分类线性展开，拆开反而更难对照。
+//nolint:gocritic // chatOutbound 值传递：与 chatStreamWithReplay 同口径，字段只读。
 func (c *Client) chatStreamAt(
 	ctx context.Context, out chatOutbound, base string, chatHTTP *http.Client, idleTimeout time.Duration,
 ) chatAttempt {
@@ -2578,7 +2641,14 @@ func (c *Client) chatStreamAt(
 	}
 	// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 	// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
-	reqCtx, cancel := context.WithCancel(ctx)
+	// 禁用空闲监控（idleTimeout<=0）时 monitorBody 原样返回底流、不接管 cancel，
+	// 派生节点会一直挂在父 ctx 上无入释放——此时直接用调用方 ctx，cancel 退化为
+	// no-op（下方各收尾路径因此无需分支）。
+	reqCtx, cancel := ctx, context.CancelFunc(func() {})
+	if idleTimeout > 0 {
+		reqCtx, cancel = context.WithCancel(ctx)
+	}
+
 	req = req.WithContext(reqCtx)
 
 	resp, err := chatHTTP.Do(req)
@@ -2601,21 +2671,41 @@ func (c *Client) chatStreamAt(
 		return chatAttempt{rc: monitorBody(resp.Body, idleTimeout, cancel), status: resp.StatusCode}
 	}
 
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return c.chatErrorAttempt(resp, base, out, cancel)
+}
+
+// chatErrorAttempt 读取上游错误体并分类（4xx/5xx 分支）。
+//
+// 错误体多读 1 字节用于判定截断：静默截断会让末尾的业务码/关键词消失，
+// Classify 与 businessCode 结果与真实原因不一致（同文件 doRawResponse 口径）。
+//
+//nolint:gocritic // chatOutbound 值传递：与 chatStreamAt 同口径，字段只读。
+func (*Client) chatErrorAttempt(
+	resp *http.Response, base string, out chatOutbound, cancel context.CancelFunc,
+) chatAttempt {
+	const errBodyLimit = 1 << 20
+
+	label := logfmt.Label(out.Account.UID, out.Account.NicknameValue())
+
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, errBodyLimit+1))
 	resp.Body.Close()
 	cancel()
 
+	if len(raw) > errBodyLimit {
+		log.Printf("WARN: [upstream] chat_stream acct=%s: 错误体超过 %d 字节，按截断分类", label, errBodyLimit)
+
+		raw = raw[:errBodyLimit]
+	}
+
 	if readErr != nil {
-		log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v",
-			logfmt.Label(out.Account.UID, out.Account.NicknameValue()), readErr)
+		log.Printf("ERR: [upstream] chat_stream acct=%s: read body: %v", label, readErr)
 
 		return chatAttempt{err: fmt.Errorf("read body: %w", readErr), replay: true}
 	}
 
 	kind := Classify(resp.StatusCode, string(raw))
 	log.Printf("WARN: [upstream] chat_stream acct=%s origin=%s: upstream %d %s body=%s",
-		logfmt.Label(out.Account.UID, out.Account.NicknameValue()), base, resp.StatusCode, kind,
-		RedactForLog(string(raw), 200))
+		label, base, resp.StatusCode, kind, RedactForLog(string(raw), 200))
 
 	if kind == ErrNone {
 		return chatAttempt{status: resp.StatusCode, body: raw}
@@ -2767,8 +2857,10 @@ func (c *Client) slotClient(a *auth.Auth, base *http.Client, prefix string) *htt
 	cloned.DialContext = slotDial
 	// 自定义 TLS 拨号必须同样走槽拨号器，否则槽绑定账号会绕过代理换用全局出口。
 	if transport.DialTLSContext != nil {
+		// 作用域键与 slotClients 键同构：该槽的 TLS 会话缓存不跨槽、不跨账号，
+		// 与「每个槽独立 Transport」的连接池隔离同粒度。
 		cloned.DialTLSContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return c.dialTLSWith(ctx, network, addr, slotDial)
+			return c.dialTLSWith(ctx, network, addr, slotDial, key)
 		}
 	}
 
@@ -3027,14 +3119,16 @@ func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 	enterpriseCh := make(chan probeResult, 1)
 	v3Ch := make(chan probeResult, 1)
 
-	go func() {
+	// 两路探测都在后台协程里跑上游响应解析与类型断言：一次 panic 就是进程级
+	// 终止，连带所有账号的 /v1/* 一起中断。mission 失败用 err 通道回传。
+	go guardProbe("fetch-models-enterprise", func() {
 		infos, chat, err := c.fetchEnterpriseModels(account9)
 		enterpriseCh <- probeResult{infos: infos, chat: chat, err: err}
-	}()
-	go func() {
+	})
+	go guardProbe("fetch-models-v3", func() {
 		infos, err := c.fetchV3Models(account9)
 		v3Ch <- probeResult{infos: infos, err: err}
-	}()
+	})
 
 	enterprise, probeResult2 := <-enterpriseCh, <-v3Ch
 	if enterprise.err != nil && probeResult2.err != nil {
@@ -3060,9 +3154,8 @@ func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 		return nil, errModelsAPIReturnedEmptyList
 	}
 
-	c.storeModelRates(account9.Realm(), out)
-	c.storeModelMaxOut(account9.Realm(), out)
-	c.storeModelAliases(account9.Realm(), out)
+	scope := c.modelScope(account9)
+	c.storeModelCatalog(scope, out)
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入桶）。
 	// 空桶时跳过写：避免「某探测无档位数据」清掉既有桶。
 	cache, defCache := buildEffortCaches(out)
@@ -3070,7 +3163,7 @@ func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 		return out, nil
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
-	c.storeEfforts(account9.Realm(), cache, defCache)
+	c.storeEfforts(scope, cache, defCache)
 
 	return out, nil
 }
@@ -3207,8 +3300,9 @@ func (c *Client) fetchEnterpriseModelsPath(
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// body 回显前必须脱敏：探测错误会进面板/日志，上游 body 可能夹带 token。
 		return nil, modelChatWhitelist{}, fmt.Errorf("models api status %d: %s: %w",
-			resp.StatusCode, truncate(string(raw), 120), errFetchEnterpriseModelsFailed)
+			resp.StatusCode, RedactForLog(string(raw), 120), errFetchEnterpriseModelsFailed)
 	}
 
 	cliIDs, dynMap, agents, err := parseEnterpriseModels(raw, allowFull)
@@ -3338,14 +3432,14 @@ func (c *Client) fetchV3Models(account *auth.Auth) ([]ModelInfo, error) {
 	desktopCh := make(chan result, 1)
 	ideCh := make(chan result, 1)
 
-	go func() {
+	go guardProbe("v3-models-desktop", func() {
 		models, err := c.v3ModelsForUA(account, c.defaultWorkBuddyUAFor(account))
 		desktopCh <- result{models: models, err: err}
-	}()
-	go func() {
+	})
+	go guardProbe("v3-models-ide", func() {
 		models, err := c.v3ModelsForUA(account, codeBuddyIDEUA)
 		ideCh <- result{models: models, err: err}
-	}()
+	})
 
 	desktop := <-desktopCh
 	ide := <-ideCh
@@ -3653,7 +3747,7 @@ func applyPromo(modelInfo *ModelInfo, v3ModelPromotion2 *v3ModelPromotion) {
 // 供 CN FetchModels 与 global 探测共用：拉取到的模型档位落桶后，出站请求体
 // normalizeReasoningEffort 才能按域降级。efforts 与 defs 均空时删除该 realm 桶
 // （等价「该域无可降级档位」）。调用方负责在「无新数据」时跳过写。
-func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs map[string]string) {
+func (c *Client) storeEfforts(scope string, efforts map[string][]string, defs map[string]string) {
 	c.effortsMu.Lock()
 	defer c.effortsMu.Unlock()
 
@@ -3665,7 +3759,7 @@ func (c *Client) storeEfforts(realm string, efforts map[string][]string, defs ma
 		c.defaultEfforts = make(map[string]map[string]string)
 	}
 
-	k := realmKey(realm)
+	k := realmKey(scope)
 	if len(efforts) == 0 && len(defs) == 0 {
 		delete(c.efforts, k)
 		delete(c.defaultEfforts, k)
@@ -3742,9 +3836,17 @@ func effectiveModelRate(mi *ModelInfo) string {
 	return normalizeModelRate(mi.Credits)
 }
 
-// storeModelRates 按 realm 整体替换模型倍率快照。目录成功刷新但没有可解析
+// storeModelCatalog 一次性写入目录派生的三份快照（倍率 / 输出上限 / 别名）：
+// 三者恒同源刷新，分开调用容易漏一个而留下跨版本混搭的目录。
+func (c *Client) storeModelCatalog(scope string, infos []ModelInfo) {
+	c.storeModelRates(scope, infos)
+	c.storeModelMaxOut(scope, infos)
+	c.storeModelAliases(scope, infos)
+}
+
+// storeModelRates 按作用域整体替换模型倍率快照。目录成功刷新但没有可解析
 // 倍率时写入空桶，使旧倍率不会继续冒充当前价。
-func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
+func (c *Client) storeModelRates(scope string, infos []ModelInfo) {
 	rates := make(map[string]string, len(infos))
 	for i := range infos {
 		modelInfo := &infos[i]
@@ -3764,7 +3866,7 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 		c.modelRates = make(map[string]map[string]string)
 	}
 
-	c.modelRates[realmKey(realm)] = rates
+	c.modelRates[realmKey(scope)] = rates
 }
 
 // storeModelMaxOut 按 realm 整体替换模型输出上限快照（maxOutputTokens）。
@@ -3773,7 +3875,7 @@ func (c *Client) storeModelRates(realm string, infos []ModelInfo) {
 // 与 modelRates 同口径：目录刷新即整体替换，空快照 = 该域无可用上限（不补默认）。
 // 别名与规范 ID 同值入桶：客户端可直接用目录别名请求（与 storeModelAliases
 // 的 last-wins 一致），否则带别名的请求会漏补、回落上游保守默认。
-func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
+func (c *Client) storeModelMaxOut(scope string, infos []ModelInfo) {
 	out := make(map[string]int64, len(infos))
 	for i := range infos {
 		info := &infos[i]
@@ -3799,11 +3901,11 @@ func (c *Client) storeModelMaxOut(realm string, infos []ModelInfo) {
 		c.modelMaxOut = make(map[string]map[string]int64)
 	}
 
-	c.modelMaxOut[realmKey(realm)] = out
+	c.modelMaxOut[realmKey(scope)] = out
 }
 
 // storeModelAliases 用最新目录整体替换指定 realm 的别名映射。
-func (c *Client) storeModelAliases(realm string, infos []ModelInfo) {
+func (c *Client) storeModelAliases(scope string, infos []ModelInfo) {
 	aliases := make(map[string]string)
 
 	for i := range infos {
@@ -3823,7 +3925,7 @@ func (c *Client) storeModelAliases(realm string, infos []ModelInfo) {
 		c.aliases = map[string]map[string]string{}
 	}
 
-	c.aliases[realmKey(realm)] = aliases
+	c.aliases[realmKey(scope)] = aliases
 	c.aliasMu.Unlock()
 }
 
@@ -3833,6 +3935,18 @@ func (c *Client) UpstreamAliases(realm string) map[string]string {
 	defer c.aliasMu.RUnlock()
 
 	src := c.aliases[realmKey(realm)]
+
+	// global 两域各自一份别名表：本域未探测时回落到任一 global 桶（只读展示用）。
+	if len(src) == 0 && isGlobalScope(realmKey(realm)) {
+		for _, sibling := range sortedGlobalScopes(c.aliases) {
+			if len(c.aliases[sibling]) > 0 {
+				src = c.aliases[sibling]
+
+				break
+			}
+		}
+	}
+
 	if len(src) == 0 {
 		return nil
 	}
@@ -3848,7 +3962,22 @@ func (c *Client) ResolveUpstreamAlias(realm, model string) (string, bool) {
 	c.aliasMu.RLock()
 	defer c.aliasMu.RUnlock()
 
-	canonical, ok := c.aliases[realmKey(realm)][model]
+	key := realmKey(realm)
+
+	canonical, ok := c.aliases[key][model]
+	if !ok && isGlobalScope(key) {
+		for _, sibling := range sortedGlobalScopes(c.aliases) {
+			if sibling == key {
+				continue
+			}
+
+			if value, hit := c.aliases[sibling][model]; hit {
+				canonical, ok = value, true
+
+				break
+			}
+		}
+	}
 
 	return canonical, ok && canonical != ""
 }
@@ -3862,14 +3991,65 @@ func (c *Client) ModelRate(realm, model string) string {
 	c.effortsMu.RLock()
 	defer c.effortsMu.RUnlock()
 
-	return c.modelRates[realmKey(realm)][model]
+	key := realmKey(realm)
+
+	if rate := c.modelRates[key][model]; rate != "" {
+		return rate
+	}
+
+	// 本域未探测/未收录时回落任一 global 桶：倍率只用于费用展示与保底判档，
+	// 拿兄弟域的价目比拿空值更接近真实（两域产品价目同源）。
+	if isGlobalScope(key) {
+		for _, sibling := range sortedGlobalScopes(c.modelRates) {
+			if sibling == key {
+				continue
+			}
+
+			if rate := c.modelRates[sibling][model]; rate != "" {
+				return rate
+			}
+		}
+	}
+
+	return ""
 }
 
 // GlobalEffortSnapshot 导出 global 域 effort 能力缓存，供 /v1/models 输出
 // reasoning_supported_efforts / reasoning_default_effort。返回只读快照（调用方
 // 不得修改）；桶未填充（无 global 账号或从未探测）→ nil（调用方回落静态兜底表）。
 func (c *Client) GlobalEffortSnapshot() (efforts map[string][]string, defaults map[string]string) {
-	return c.effortsSnapshot("global"), c.defaultEffortsSnapshot("global")
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+
+	keys := sortedGlobalScopes(c.efforts)
+	if len(keys) == 0 {
+		return nil, nil
+	}
+
+	if len(keys) == 1 {
+		return c.efforts[keys[0]], c.defaultEfforts[keys[0]]
+	}
+
+	// 两套国际主机各有一份桶：展示面取并集（先出现的键权威，后来者只补缺失），
+	// 运行期的降级仍走请求账号自己的作用域（见 chatBodySnapshots）。
+	efforts = make(map[string][]string)
+	defaults = make(map[string]string)
+
+	for _, key := range keys {
+		for id, value := range c.efforts[key] {
+			if _, exists := efforts[id]; !exists {
+				efforts[id] = value
+			}
+		}
+
+		for id, value := range c.defaultEfforts[key] {
+			if _, exists := defaults[id]; !exists {
+				defaults[id] = value
+			}
+		}
+	}
+
+	return efforts, defaults
 }
 
 // fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
@@ -3895,8 +4075,9 @@ func (c *Client) fetchV3ConfigModelMap(account *auth.Auth, ua string) (map[strin
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// 同上：探测错误 body 脱敏后再进错误串。
 		return nil, fmt.Errorf("v3/config status %d: %s: %w",
-			resp.StatusCode, truncate(string(raw), 120), errFetchV3ConfigModelMapFailed)
+			resp.StatusCode, RedactForLog(string(raw), 120), errFetchV3ConfigModelMapFailed)
 	}
 
 	env, err := parseV3ConfigEnv(raw)
@@ -4139,13 +4320,17 @@ type CreditPackage struct {
 // 周期字段算，否则按 Capacity 字段算——两条路径不能混，否则同一个包会被算两次。
 func (c *Client) CreditPackages(account2 *auth.Auth) ([]CreditPackage, int64, int64, error) {
 	now := time.Now()
+	// 窗口按上游 UTC+8 墙钟计算（解析侧同样是 ParseInLocation(softRateResetLoc)）：
+	// 用部署机本地时区会在非 UTC+8 环境把「今天」算错，方向不利时会把几小时内到期
+	// 的包排除在结果外 → 余额低估 → 影响解冻与积分保底判定。
+	nowCST := now.In(softRateResetLoc)
 	body := map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
 		"ProductCode":              "p_tcaca",
 		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
+		"PackageEndTimeRangeBegin": nowCST.Format(packageEndLayout),
+		"PackageEndTimeRangeEnd":   nowCST.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
 
 	data, err := c.billingMeterJSON(account2, billingMeterPaths(), body)
@@ -4451,6 +4636,19 @@ func (c *Client) UserResourceDetailed(
 	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(ctx, a, soon)
 
 	return remain, total, expiring, err
+}
+
+// guardProbe 在探测扇出的后台协程里隔离 panic：协程内跑上游响应解析，一次
+// panic 就是进程级终止。隔离后该路按「本轮无结果」处理（err 由 fn 自行写入通道；
+// panic 路径下通道不写，调用方由 ctx/超时兜底），其余路继续。
+func guardProbe(name string, fn func()) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			log.Printf("ERR: [upstream] %s panic（已隔离）: %v\n%s", name, recovered, debug.Stack())
+		}
+	}()
+
+	fn()
 }
 
 // notifyBalance 触发余额观测回调（装配期注入，缺省 nil = 关闭）。panic 隔离：
@@ -5016,13 +5214,15 @@ func (c *Client) personalResource(
 		log.Printf("WARN: [upstream] resource summary failed: %v (fallback get-user-resource)", serr)
 	}
 
+	// 同 CreditPackages：窗口按上游 UTC+8 墙钟拼，不用部署机本地时区。
+	nowCST := now.In(softRateResetLoc)
 	body := map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
 		"ProductCode":              "p_tcaca",
 		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
+		"PackageEndTimeRangeBegin": nowCST.Format(packageEndLayout),
+		"PackageEndTimeRangeEnd":   nowCST.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
 	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。

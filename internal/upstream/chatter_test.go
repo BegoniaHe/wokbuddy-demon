@@ -88,7 +88,7 @@ func TestRunNightChatsUsesQuestionPool(t *testing.T) {
 	client.ChatBaseCN = srv.URL
 	client.BillingBaseCN = srv.URL
 
-	if _, err := client.RunNightChats(&auth.Auth{UID: "u-night", AccessToken: "at"}, 2); err != nil {
+	if _, err := client.RunNightChats(t.Context(), &auth.Auth{UID: "u-night", AccessToken: "at"}, 2); err != nil {
 		t.Fatalf("RunNightChats: %v", err)
 	}
 

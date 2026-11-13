@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -703,5 +704,48 @@ func TestDesktopExpertHeadersPrivateDataAlwaysTrue(t *testing.T) {
 				t.Fatalf("X-Private-Data=%q want %q", got, testCase.want)
 			}
 		})
+	}
+}
+
+// TestDesktopDesignCanvasSequenceShortRequestID 导出 API 不约束 requestID 长度：
+// 直接 requestID[len-8:] 会 panic，必须原样返回短串。
+func TestDesktopDesignCanvasSequenceShortRequestID(t *testing.T) {
+	t.Parallel()
+
+	events := DesktopDesignCanvasSequence("conv", "abc")
+	if len(events) == 0 {
+		t.Fatal("events empty")
+	}
+
+	for _, ev := range events {
+		if ev["eventCode"] == "wbx_design_canvas_open" {
+			if got := ev["id"]; got != "ardot-file-abc" {
+				t.Fatalf("id=%v", got)
+			}
+
+			return
+		}
+	}
+
+	t.Fatal("missing wbx_design_canvas_open event")
+}
+
+// TestDesktopSessionIDCacheBounded sessionId 缓存按账号累积且不落盘，账号池长期
+// 换血时 map 会无界增长：达到上限必须重置（等价于官方客户端进程重启）。
+func TestDesktopSessionIDCacheBounded(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{}
+
+	for i := range desktopSessionMaxAccounts + 10 {
+		client.desktopSessionID(&auth.Auth{UID: fmt.Sprintf("u%d", i)})
+	}
+
+	client.desktopSessionMu.Lock()
+	size := len(client.desktopSessionIDs)
+	client.desktopSessionMu.Unlock()
+
+	if size > desktopSessionMaxAccounts {
+		t.Fatalf("cache size=%d want <= %d", size, desktopSessionMaxAccounts)
 	}
 }

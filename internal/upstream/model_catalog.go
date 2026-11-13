@@ -55,7 +55,16 @@ type modelCatalog struct {
 	path    string // 落盘路径（空 = 禁用持久化：纯内存 + 种子）
 	entries map[string]ModelCapEntry
 	loaded  bool // entries 已初始化（含损坏降级形态）
+	// dirty 上次落盘之后又有写入（节流窗口内被合并掉的写）。
+	dirty bool
+	// lastSave 上次落盘时刻：写入节流的基准（见 saveSoonLocked）。
+	lastSave time.Time
 }
+
+// modelCatalogSaveInterval 写入节流窗口：/v1/models 一次列目录会逐模型 put，全表
+// 序列化 + fsync 每条一次会让列表首屏吃满磁盘同步（且全程持 c.mu）。窗口内的写
+// 合并成一次落盘；进程退出时由 FlushModelCatalog 兜底写一次。
+const modelCatalogSaveInterval = 2 * time.Second
 
 // catalogState 包级单例：全进程一份 model.json 状态。
 var catalogState = &modelCatalog{}
@@ -138,17 +147,41 @@ func (c *modelCatalog) get(model string) (ModelCapEntry, bool) {
 
 	c.initLocked()
 
-	e, ok := c.entries[model]
-	if !ok || !validCapEntry(e) {
+	entry, ok := c.entries[model]
+	if !ok || !validCapEntry(entry) {
 		return ModelCapEntry{ContextLength: 0, MaxOutputTokens: 0, FetchedAt: "", Source: ""}, false
 	}
 
-	return e, true
+	// source=modelsdev 的条目过期即视为未命中：调用方回落到第 4 级重拉后写回。
+	// FetchedAt 此前只写不读，旧值在 model.json 里长期冒充当前值且无从判断过期。
+	// seed/manual 条目不过期（它们不是拉取的产物，刷新与否由用户决定）。
+	if entry.Source == "modelsdev" && modelsDevEntryStale(entry.FetchedAt) {
+		return ModelCapEntry{ContextLength: 0, MaxOutputTokens: 0, FetchedAt: "", Source: ""}, false
+	}
+
+	return entry, true
+}
+
+// modelsDevEntryStale 判断 modelsdev 来源条目的抓取时间是否已超保鲜期。
+// 时间戳缺失/不可解析按「陈旧」处理：宁可多拉一次，也不让无来源时间的值长期冒充。
+func modelsDevEntryStale(fetchedAt string) bool {
+	if fetchedAt == "" {
+		return true
+	}
+
+	at, err := time.Parse(time.RFC3339, fetchedAt)
+	if err != nil {
+		return true
+	}
+
+	return time.Since(at) > modelsDevEntryMaxAge
 }
 
 // put 写一条缓存（第 4 级拉取成功后调用）并落盘。同模型已存在（用户手动维护过）
 // 仍覆盖——运行时拉取值采信 models.dev 官方源优先口径，比手编更可信；
 // 若不希望覆盖，删掉 model.json 里对应条目即可（加载后手编值只在本次进程生效）。
+//
+// 落盘走 saveSoonLocked 节流：批量列出目录时会逐模型调用本方法。
 func (c *modelCatalog) put(model string, modelCapEntry ModelCapEntry) {
 	if model == "" || !validCapEntry(modelCapEntry) {
 		return
@@ -159,19 +192,78 @@ func (c *modelCatalog) put(model string, modelCapEntry ModelCapEntry) {
 
 	c.initLocked()
 	c.entries[model] = modelCapEntry
-	c.saveLocked()
+	c.saveSoonLocked()
 }
 
-// saveLocked 原子落盘（tmp + rename，pool state.json 同模式）。持锁调用。
-// path 为空 / 目录不可写 / 序列化失败 → 静默（内存缓存仍生效，下次进程重拉）。
-func (c *modelCatalog) saveLocked() {
-	if c.path == "" {
+// putAll 批量写入并只落盘一次（回流路径用：一次 fetchDoc 可能补几十个模型）。
+func (c *modelCatalog) putAll(entries map[string]ModelCapEntry) {
+	if len(entries) == 0 {
 		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.initLocked()
+
+	changed := false
+
+	for model, modelCapEntry := range entries {
+		if model == "" || !validCapEntry(modelCapEntry) {
+			continue
+		}
+
+		c.entries[model] = modelCapEntry
+		changed = true
+	}
+
+	if changed {
+		c.dirty = true
+	}
+}
+
+// saveSoonLocked 节流落盘：距上次落盘超过 modelCatalogSaveInterval 才写，否则只置
+// dirty 由下一次写或进程退出的 flushLocked 合并。持锁调用。
+func (c *modelCatalog) saveSoonLocked() {
+	if time.Since(c.lastSave) < modelCatalogSaveInterval {
+		c.dirty = true
+
+		return
+	}
+
+	c.saveNowLocked()
+}
+
+// saveNowLocked 立即落盘；只有写盘成功才清 dirty。持锁调用。
+//
+// 先清 dirty 再写：写失败（磁盘满/权限）后 flushLocked 直接 no-op，进程退出时的
+// FlushModelCatalog 也救不回来——这一批 models.dev 回流值只活在内存里，重启后重拉。
+func (c *modelCatalog) saveNowLocked() {
+	c.lastSave = time.Now()
+	if c.saveLocked() {
+		c.dirty = false
+	}
+}
+
+// flushLocked 把节流窗口内合并掉的写落盘（无脏数据时是空操作）。持锁调用。
+func (c *modelCatalog) flushLocked() {
+	if !c.dirty {
+		return
+	}
+
+	c.saveNowLocked()
+}
+
+// saveLocked 原子落盘（tmp + rename，pool state.json 同模式），返回是否写成功。
+// path 为空 / 目录不可写 / 序列化失败 → false（内存缓存仍生效，下次进程重拉）。
+func (c *modelCatalog) saveLocked() bool {
+	if c.path == "" {
+		return false
 	}
 
 	raw, err := json.MarshalIndent(c.entries, "", "  ")
 	if err != nil {
-		return
+		return false
 	}
 
 	if dir := filepath.Dir(c.path); dir != "" {
@@ -180,7 +272,11 @@ func (c *modelCatalog) saveLocked() {
 
 	if err := safefile.Write(c.path, raw, 0o600); err != nil {
 		log.Printf("WARN: [upstream] model.json 落盘失败（内存缓存仍生效）: path=%s err=%v", c.path, err)
+
+		return false
 	}
+
+	return true
 }
 
 // ---- 包级 API（查找链 3/4 级 + 接线）----
@@ -196,10 +292,26 @@ func SetModelCatalogPath(path string) {
 	c.path = path
 }
 
+// FlushModelCatalog 把节流窗口内合并的写入立即落盘（进程退出前调用；无脏数据时
+// 是空操作）。节流窗口内被合并的条目只活在内存里，不 flush 就随进程退出丢失。
+func FlushModelCatalog() {
+	c := catalogState
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.flushLocked()
+}
+
 // modelCatalogGet 第 3 级：model.json 缓存命中（内含种子初值与损坏降级）。
 func modelCatalogGet(model string) (ModelCapEntry, bool) {
 	return catalogState.get(model)
 }
+
+// modelsDevEntryMaxAge model.json 里 source=modelsdev 条目的保鲜期：过期后视为
+// 未命中，让第 4 级重新拉取。models.dev 会调整新模型的上下文/输出上限，而缓存
+// 一旦写入就永不刷新（FetchedAt 此前只写不读），旧值会在 model.json 里长期冒充
+// 当前值，且用户无法从文件本身判断该值已过期。
+const modelsDevEntryMaxAge = 30 * 24 * time.Hour
 
 // modelCatalogPut 第 4 级写入：models.dev 拉到的值落缓存（含落盘）。
 func modelCatalogPut(model string, context, maxOutput int64) {
@@ -307,17 +419,28 @@ func (f *modelsDevFetcher) backfillMisses() {
 		return
 	}
 
-	for _, m := range missed {
-		e, ok := doc[m]
+	// 批量：一次 fetchDoc 可能补几十个模型，逐条 put 会逐条全表序列化 + fsync。
+	backfill := make(map[string]ModelCapEntry, len(missed))
+
+	for _, model := range missed {
+		entry, ok := doc[model]
 		if !ok {
 			continue // 仍查不到：负缓存 24h 生效，不写
 		}
 
-		modelCatalogPut(m, e.Context, e.Output)
+		backfill[model] = ModelCapEntry{
+			ContextLength:   entry.Context,
+			MaxOutputTokens: entry.Output,
+			FetchedAt:       time.Now().UTC().Format(time.RFC3339),
+			Source:          "modelsdev",
+		}
 		// 回流成功：清除负缓存条目（该模型已有值，后续走第 3 级缓存，
 		// 不再进本清单）。
 		f.mu.Lock()
-		delete(f.negatives, m)
+		delete(f.negatives, model)
 		f.mu.Unlock()
 	}
+
+	catalogState.putAll(backfill)
+	FlushModelCatalog()
 }

@@ -39,6 +39,7 @@ var (
 	errSubmitRegionOnlyGlobalAccounts   = errors.New("submit region: only global accounts")
 	errGlobalSubmitRegionFailed         = errors.New("GlobalSubmitRegion failed")
 	errGlobalCompleteRegistrationFailed = errors.New("GlobalCompleteRegistration failed")
+	errGlobalRegisterStatus             = errors.New("global register: non-2xx HTTP status")
 	errNoCountriesAvailable             = errors.New("no countries available")
 )
 
@@ -103,7 +104,19 @@ func (c *Client) globalRegisterJSON(
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		// 读错误必须上报：连接中断留下半截 body，否则会被报成
+		// "global register parse: unexpected end of JSON input"，真实 I/O 原因消失。
+		return 0, "", nil, fmt.Errorf("global register read: %w", readErr)
+	}
+
+	// HTTP 状态码必须先判：网关/WAF 的 403、token 失效的 401 通常回 HTML 或 {}，
+	// 解出来的 Code 是 0，会被上游代码当成「注册成功/已激活」写进账号状态。
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, "", nil, fmt.Errorf("global register status %d: %s: %w",
+			resp.StatusCode, truncate(string(data), 200), errGlobalRegisterStatus)
+	}
 
 	var env struct {
 		Code int             `json:"code"`
@@ -240,6 +253,11 @@ func (c *Client) GlobalRegisterStatus(account *auth.Auth) (activated, needsRegio
 func (c *Client) GlobalSubmitRegion(account3 *auth.Auth, country *GlobalCountry) error {
 	if account3 == nil || account3.Realm() != "global" {
 		return errSubmitRegionOnlyGlobalAccounts
+	}
+
+	if country == nil {
+		// 导出 API：调用方传 nil 会在下面取 Code 时 panic。
+		return errNoCountriesAvailable
 	}
 
 	attrs := map[string]any{

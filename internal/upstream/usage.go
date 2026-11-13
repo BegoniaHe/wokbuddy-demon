@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"maps"
+	"math"
 )
 
 // normalizeUsageCacheAliases keeps cache-hit aliases consistent before the
@@ -64,8 +65,15 @@ func bestUsageCacheHitTokens(usage map[string]any) (float64, bool) {
 	return 0, false
 }
 
+//nolint:cyclop,gocyclo // 上游数值可能是任意 JSON 数值类型，集中分支比反射更直白。
 func positiveUsageNumber(value any) (float64, bool) {
 	switch n := value.(type) {
+	case json.Number:
+		// 聚合帧解码走 UseNumber，usage 里的数字是 json.Number，只认 float64
+		// 会让缓存命中观测恒为 0。
+		parsed, err := n.Float64()
+
+		return parsed, err == nil && parsed > 0
 	case float64:
 		return n, n > 0
 	case float32:
@@ -122,11 +130,13 @@ func UsageCacheMissTokens(usage map[string]any) (float64, bool) {
 		return 0, false
 	}
 
-	if miss, ok := usageNumber(usage, "prompt_cache_miss_tokens"); ok {
+	// 显式 miss 必须是正数才采信：上游常把该字段置 0 表示「未统计/未知」，
+	// 采信 0 会让 hit/(hit+miss) 的命中率恒为 100%。hit 侧早已只取正数，这里对齐。
+	if miss, ok := positiveUsageNumber(usage["prompt_cache_miss_tokens"]); ok {
 		return miss, true
 	}
 
-	prompt, okP := usageNumber(usage, "prompt_tokens")
+	prompt, okP := UsageNumber(usage, "prompt_tokens")
 
 	hit, okH := UsageCacheHitTokens(usage)
 	if okP && okH && prompt-hit >= 0 {
@@ -145,7 +155,7 @@ func UsagePromptTokens(usage map[string]any) (float64, bool) {
 	}
 
 	for _, key := range []string{"prompt_tokens", "input_tokens"} {
-		if value, ok := usageNumber(usage, key); ok {
+		if value, ok := UsageNumber(usage, key); ok {
 			return value, true
 		}
 	}
@@ -153,8 +163,52 @@ func UsagePromptTokens(usage map[string]any) (float64, bool) {
 	return 0, false
 }
 
-// usageNumber 从 usage 顶层取数值字段（JSON 数字可能是 float64 / json.Number 形态）。
-func usageNumber(usage map[string]any, key string) (float64, bool) {
+// UsageLeafFloat 取任意 usage 叶子的有限数值（float64 / int / int64 / json.Number）。
+// 非数值或 NaN 返回 false。
+func UsageLeafFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, !math.IsNaN(n)
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+
+		return f, err == nil && !math.IsNaN(f)
+	default:
+		return 0, false
+	}
+}
+
+// UsageSumLeaves 两个 usage 数值叶子相加；任一不是有限数值、或和溢出返回 false
+// （调用方直接覆盖，不写不可信结果）。
+func UsageSumLeaves(dst, src any) (float64, bool) {
+	srcNum, ok := UsageLeafFloat(src)
+	if !ok {
+		return 0, false
+	}
+
+	dstNum, ok := UsageLeafFloat(dst)
+	if !ok {
+		return 0, false
+	}
+
+	sum := dstNum + srcNum
+	if math.IsInf(sum, 0) || math.IsNaN(sum) {
+		return 0, false
+	}
+
+	return sum, true
+}
+
+// UsageNumber 从 usage 顶层取数值字段（JSON 数字可能是 float64 / json.Number 形态）。
+//
+// 网关的聚合路径改用 UseNumber 解码 SSE 帧后，usage 里的数字是 json.Number：
+// 直接断言 float64 会静默失败（token 数变 0、total 不再重算）。所有读 usage 数值
+// 的地方都走这里，两形态同口径。
+func UsageNumber(usage map[string]any, key string) (float64, bool) {
 	v, ok := usage[key]
 	if !ok {
 		return 0, false
