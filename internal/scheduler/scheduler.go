@@ -124,8 +124,13 @@ type Scheduler struct {
 	taskSweepInterval atomic.Int64
 	// makeupPerRound 连登补签每轮成功上限（0=不限），热生效。
 	makeupPerRound atomic.Int64
+	// windowProbeInterval 额度窗口探针周期（纳秒，0=暂停），语义同 balanceInterval
+	// （issue #492）。
+	windowProbeInterval atomic.Int64
 	// rearmTaskSweep 任务补领清扫的「排程已变」通知（与余额刷新分开，避免丢信号）。
 	rearmTaskSweep chan struct{}
+	// rearmWindowProbe 额度窗口探针的「排程已变」通知（独立 channel，同上）。
+	rearmWindowProbe chan struct{}
 	// balanceSem/balanceSemOnce 余额刷新逐号上游调用的全局并发上限：后台周期与
 	// 面板手动刷新会并发触发，各持一个信号量会把总在途请求放大到 2 倍以上。
 	balanceSemOnce sync.Once
@@ -179,16 +184,17 @@ func New(cfg *Config) *Scheduler {
 	}
 
 	return &Scheduler{
-		cfg:            config,
-		nowFn:          time.Now,
-		logger:         log.Default(),
-		adoptTried:     make(map[string]string),
-		claimedKeys:    make(map[string]string),
-		claimingKeys:   make(map[string]bool),
-		rearmSchedule:  make(chan struct{}, 1),
-		rearmBalance:   make(chan struct{}, 1),
-		rearmTaskSweep: make(chan struct{}, 1),
-		backfillCh:     make(chan []checkinBackfillTarget, 1),
+		cfg:              config,
+		nowFn:            time.Now,
+		logger:           log.Default(),
+		adoptTried:       make(map[string]string),
+		claimedKeys:      make(map[string]string),
+		claimingKeys:     make(map[string]bool),
+		rearmSchedule:    make(chan struct{}, 1),
+		rearmBalance:     make(chan struct{}, 1),
+		rearmTaskSweep:   make(chan struct{}, 1),
+		rearmWindowProbe: make(chan struct{}, 1),
+		backfillCh:       make(chan []checkinBackfillTarget, 1),
 	}
 }
 
@@ -1459,6 +1465,8 @@ func (s *Scheduler) taskSweepContext() func(ctx context.Context) {
 // goroutine，ctx 取消即停）。interval<=0 以暂停状态启动并等待 SetTaskSweepInterval
 // 唤醒：启动时关闭 schedule.task_sweep_enabled、运行期再热开也能生效（无需重启）。
 // 运行期可用 SetTaskSweepInterval 热改间隔（下一轮生效）。
+//
+//nolint:dupl // 与其余周期循环同形：各自的 atomic 间隔与 rearm channel 不可合并。
 func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) {
 	if interval < 0 {
 		interval = 0

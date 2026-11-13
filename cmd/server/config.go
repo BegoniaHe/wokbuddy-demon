@@ -217,6 +217,11 @@ type Config struct {
 		// 「已达标未领」的成长任务奖励（只补领、不代做任务）。默认开启。
 		TaskSweepEnabled bool `json:"task_sweep_enabled"` // 缺省 true；false = 关闭
 		TaskSweepMinutes int  `json:"task_sweep_minutes"` // 缺省 15；<=0 回落 15
+		// WindowProbeEnabled 额度窗口探针（issue #492）：6004 模型级限流带上游重置
+		// 墙钟时，到点后发一条 max_tokens=1 的最小请求，把新窗口起点钉住。缺省 true；
+		// 探针失败不罚号（不冷却/不喂连败），每个窗口最多重试 2 次。
+		WindowProbeEnabled bool `json:"window_probe_enabled"`
+		WindowProbeMinutes int  `json:"window_probe_minutes"` // 缺省 5；<=0 回落 5
 		// MakeupCardsPerRound 连登补签每轮成功上限：0 = 不限（保持既有行为），
 		// >0 = 每轮最多成功补签 N 天，剩余漏签留待下一轮。负数启动报错。
 		MakeupCardsPerRound int `json:"makeup_cards_per_round"`
@@ -528,7 +533,9 @@ type Config struct {
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	// TaskSweepInterval 任务补领清扫周期（0 = 不启动，task_sweep_enabled=false）。
 	TaskSweepInterval time.Duration `json:"-"`
-	ExpiringSoonDur   time.Duration `json:"-"`
+	// WindowProbeInterval 额度窗口探针周期（0 = 不启动，window_probe_enabled=false）。
+	WindowProbeInterval time.Duration `json:"-"`
+	ExpiringSoonDur     time.Duration `json:"-"`
 	// CheckinAccountDelayDur 解析后的签到账号间等待（issue #59）；0 = 不限。
 	CheckinAccountDelayDur time.Duration `json:"-"`
 	// KeepaliveRefreshWindowDur 解析后的定时保活临期窗口（默认 24h）。
@@ -635,6 +642,9 @@ func applyScheduleDefaults(config2 *Config) {
 	// 任务补领清扫默认开启、15 分钟一轮：只补领「已达标未领」的奖励，幂等且零副作用。
 	config2.Schedule.TaskSweepEnabled = true
 	config2.Schedule.TaskSweepMinutes = 15
+	// 额度窗口探针默认开启、5 分钟一轮：只在 6004 带重置墙钟后产生一次最小请求。
+	config2.Schedule.WindowProbeEnabled = true
+	config2.Schedule.WindowProbeMinutes = 5
 	config2.Schedule.MakeupCardsPerRound = 0
 	config2.Schedule.CheckinAccountDelay = "800ms"
 	config2.Schedule.SlotJitter = "20m"
@@ -2426,6 +2436,7 @@ func (c *Config) normalizeSchedule() error {
 	c.normalizeListenAndHours()
 	c.normalizeBalanceRefresh()
 	c.normalizeTaskSweep()
+	c.normalizeWindowProbe()
 
 	if err := c.normalizeMakeupCardsPerRound(); err != nil {
 		return err
@@ -2521,6 +2532,13 @@ func (c *Config) normalizeBalanceRefresh() {
 func (c *Config) normalizeTaskSweep() {
 	c.TaskSweepInterval = normalizeScheduleInterval(
 		c.Schedule.TaskSweepEnabled, &c.Schedule.TaskSweepMinutes, 15,
+	)
+}
+
+// normalizeWindowProbe 计算额度窗口探针周期：启用时 minutes<=0 回落 5；关闭时 0。
+func (c *Config) normalizeWindowProbe() {
+	c.WindowProbeInterval = normalizeScheduleInterval(
+		c.Schedule.WindowProbeEnabled, &c.Schedule.WindowProbeMinutes, 5,
 	)
 }
 

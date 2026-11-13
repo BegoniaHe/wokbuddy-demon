@@ -41,6 +41,9 @@ type Pool struct {
 	// 默认关闭；关闭时 partitionReason 短路，选号路径与之前逐字一致。
 	mediaPartition bool
 	mediaUIDs      map[string]bool
+	// windowProbes 额度窗口探针台账（issue #492）：(账号,模型) → 上游重置墙钟与尝试
+	// 计数。运行态、不持久化；详情见 window.go。
+	windowProbes map[string]*windowProbeState
 	// pickGap 防并发撞号窗口（默认 minPickGap；测试可注入 0/超大值）。
 	pickGap time.Duration
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
@@ -160,6 +163,7 @@ func New(stateFp string) *Pool {
 		// config 显式 "0" 关停（SetCostExploreInterval(0)）。
 		costExploreInterval: defaultCostExploreInterval,
 		exploreLast:         map[string]time.Time{},
+		windowProbes:        map[string]*windowProbeState{},
 		pickGap:             minPickGap,
 	}
 	if stateFp != "" {
@@ -769,6 +773,7 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	}
 
 	delete(p.byUID, uid)
+	p.dropWindowProbesLocked(uid)
 
 	if n := entry2.inFlight.Swap(0); n > 0 {
 		p.inFlightTotal.Add(-n)
