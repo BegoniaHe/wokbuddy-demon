@@ -75,6 +75,9 @@ type Config struct {
 	// ProxySlots 可供账号绑定的出站代理槽（issue #96）。provider 形态（issue #39）：
 	// 槽配置热生效，闭包每次读当前生效配置，不捕获装配期快照；nil 安全（= 无槽）。
 	ProxySlots func() []ProxySlotInfo
+	// RefreshProxies 手动刷新代理订阅并重装出站注册表（issue #490），返回生效的
+	// 全局池代理数；nil 时刷新接口返回 501。失败保留旧出口。
+	RefreshProxies func() (int, error)
 	// Pricing 等价价格缓存（issue #99）；nil = 关闭或未初始化。
 	Pricing     *pricing.Catalog
 	PricingRate float64
@@ -337,6 +340,7 @@ func (p *Panel) routesKeys() {
 	p.route("POST /panel/api/keys/{id}/realm", scopeAdmin, p.keysUpdateRealm)
 }
 
+//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesModels() {
 	p.route("GET /panel/api/models", scopeRead, p.models)
 	p.route("GET /panel/api/model_probes", scopeRead, p.modelProbes)
@@ -344,10 +348,12 @@ func (p *Panel) routesModels() {
 	p.route("GET /panel/api/model_health", scopeRead, p.modelHealth)
 }
 
+//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesConfig() {
 	p.route("GET /panel/api/config", scopeAdmin, p.getConfig)
 	p.route("POST /panel/api/config", scopeAdmin, p.saveConfig)
 	p.route("POST /panel/api/config/restore", scopeAdmin, p.restoreConfig)
+	p.route("POST /panel/api/proxy_subscriptions/refresh", scopeAdmin, p.refreshProxySubscriptions)
 }
 
 // route 把 pattern 同时写入 mux 与作用域表。重复 pattern 直接 panic：
@@ -1013,6 +1019,26 @@ func (*Panel) accountToggle(
 
 	log.Printf("panel: "+logFormat, uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// refreshProxySubscriptions 手动刷新代理订阅（issue #490）：重新拉取订阅并重装
+// 出站注册表。失败时返回错误、保留旧出口，不清空现有代理。
+func (p *Panel) refreshProxySubscriptions(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RefreshProxies == nil {
+		writeErr(w, http.StatusNotImplemented, "proxy subscriptions are not wired")
+		return
+	}
+
+	count, err := p.cfg.RefreshProxies()
+	if err != nil {
+		log.Printf("panel: 代理订阅刷新失败（保留旧出口）: %v", err)
+		writeErr(w, http.StatusBadGateway, "刷新代理订阅失败："+err.Error())
+
+		return
+	}
+
+	log.Printf("panel: 代理订阅已刷新（全局池 %d 个代理）", count)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "proxies": count})
 }
 
 // runCheckin 执行单号签到并返回 (跳过原因, 是否已签, 说明文案)。
