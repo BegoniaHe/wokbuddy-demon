@@ -104,6 +104,9 @@ type Config struct {
 	RequestLog *reqlog.Recorder
 	// RuntimeLog 运行日志落盘出口（issue #487，nil = 未启用，导出接口返回 501）。
 	RuntimeLog *runlog.Sink
+	// UpstreamHealth 上游劣化滑窗快照来源（issue #488）；nil = 未挂载，overview
+	// 不输出该字段。main 在 handler 构造后注入。
+	UpstreamHealth func() any
 	// Keys 命名密钥存储（nil = 密钥接口返回 501）。仅面板管理；面板自身鉴权
 	// 仍只认默认 api_key（命名密钥是给网关客户端的，不应获得管理权限）。
 	Keys *apikey.Store
@@ -249,6 +252,12 @@ func New(cfg *Config) *Panel {
 
 // Logs 返回日志环形缓冲（main 经 MultiWriter 镜像 log 与 chat 表格日志进来）。
 func (p *Panel) Logs() *Ring { return p.logs }
+
+// SetUpstreamHealth 注入上游劣化滑窗快照来源（issue #488）。装配期调用一次，
+// 运行期只读。
+func (p *Panel) SetUpstreamHealth(provider func() any) {
+	p.cfg.UpstreamHealth = provider
+}
 
 func (p *Panel) routes() {
 	p.routesPages()
@@ -577,7 +586,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	// 「每 N 分钟后台刷新、x 分钟前更新」。未刷新过时时间为零值（前端按 — 渲染）。
 	balanceRefreshSec, balanceRefreshedAt := p.cfg.Pool.BalanceRefreshMeta()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	response := map[string]any{
 		"version":              p.cfg.Version,
 		"balance_refresh_sec":  balanceRefreshSec,
 		"balance_refreshed_at": balanceRefreshedAt,
@@ -600,7 +609,13 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
-	})
+	}
+	// 上游劣化滑窗（issue #488）：只在 main 注入 provider 时输出。
+	if p.cfg.UpstreamHealth != nil {
+		response["upstream_health"] = p.cfg.UpstreamHealth()
+	}
+
+	writeJSON(w, http.StatusOK, response)
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。

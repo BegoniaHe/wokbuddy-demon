@@ -201,6 +201,8 @@ func main() {
 		trustedProxies: trustedProxies,
 		authLimiter:    authLimiter,
 	})
+	// 上游劣化滑窗快照（issue #488）：panel 先于 handler 构造，这里注入只读来源。
+	panel2.SetUpstreamHealth(func() any { return handler.UpstreamHealthSnapshot() })
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1179,6 +1181,9 @@ var restartFieldPaths = []string{
 	"listen", "auth_dir", "state_file",
 	"server.read_timeout", "server.max_body_bytes",
 	"server.request_accept_grace_seconds", "server.shutdown_grace_seconds",
+	// 上游劣化滑窗在 handler 构造期定型（window<=0 即关闭）。
+	"server.upstream_health_window", "server.upstream_health_ttfb_ms",
+	"server.upstream_health_5xx_ratio", "server.upstream_health_min_samples",
 	// CORS 允许列表在 handler 构造期复制，运行期无热更新。
 	"server.cors_origins",
 	// 可信反代网段在启动期解析为 *net.IPNet，运行期无热更新。

@@ -216,6 +216,17 @@ docker compose up -d --build
 
 导出走只读接口 `GET /panel/api/logs/export`（`scopeRead`）：`from` / `to` 支持 unix 秒或毫秒、RFC3339、`2006-01-02T15:04` 与 `2006-01-02`，缺省导出当天；区间最长 31 天、未压缩总量上限 64 MiB、区间内无文件返回 404。未启用落盘时接口返回 501。面板前端暂无下载按钮，可直接用 `curl -H "Authorization: Bearer <key>" -o logs.zip "<网关>/panel/api/logs/export?from=2026-11-01&to=2026-11-13"`。
 
+## 📉 上游劣化滑窗（`server.upstream_health_*`）
+
+上游变慢或连续 5xx 时，网关默认只在单次请求里换号/冷却账号，没有一个「最近这段时间整体在变差」的信号。开启劣化滑窗后按 (域, 模型) 与全局统计固定窗口内的 TTFB 与 5xx 比例：
+
+- `server.upstream_health_window`：滑窗宽度，默认 `5m`；`"0"` 关闭。
+- `server.upstream_health_ttfb_ms`：TTFB 均值告警阈值，默认 `5000`。
+- `server.upstream_health_5xx_ratio`：5xx 比例告警阈值（0~1），默认 `0.25`。
+- `server.upstream_health_min_samples`：最小样本数，默认 `10`；样本不足不告警（默认保守，低流量不误报）。
+
+实现为 20 个环形桶、写入时惰性推进，**没有后台 goroutine**。超阈值时打一条 `WARN: [server] 上游劣化 ...`，同键同窗口只告警一次；当前窗口指标随 `GET /panel/api/overview` 的 `upstream_health` 字段输出（`rows` 含每 (域, 模型) 与全局的样本数、平均 TTFB、5xx 比例与是否越线）。**只观测与告警**：不冷却账号、不改选号、不喂熔断/连败。四项均**改动需重启**。
+
 ## 🐾 适合谁
 
 - 手上有多个 CodeBuddy 账号，但不想每天挨个打卡；
