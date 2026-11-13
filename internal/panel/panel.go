@@ -269,7 +269,6 @@ func (p *Panel) routesPages() {
 	p.route("POST /panel/api/agents/{client}/restore", scopeAdmin, p.agentsRestore)
 }
 
-//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesAccounts() {
 	p.route("POST /panel/api/accounts/{uid}/revive", scopeAdmin, p.accountRevive)
 	p.route("POST /panel/api/accounts/{uid}/disable", scopeAdmin, p.accountDisable)
@@ -280,6 +279,7 @@ func (p *Panel) routesAccounts() {
 	p.route("POST /panel/api/accounts/{uid}/balance", scopeAdmin, p.accountBalance)
 	p.route("POST /panel/api/accounts/{uid}/travel", scopeAdmin, p.accountTravel)
 	p.route("POST /panel/api/accounts/{uid}/remove", scopeAdmin, p.accountRemove)
+	p.route("POST /panel/api/accounts/{uid}/logout", scopeAdmin, p.accountLogout)
 }
 
 func (p *Panel) routesTasks() {
@@ -313,7 +313,6 @@ func (p *Panel) routesImport() {
 	p.route("POST /panel/api/import/encrypted", scopeAdmin, p.importEncrypted)
 }
 
-//nolint:dupl // 同 routesAccounts：逐条平铺比抽象注册表更易检索。
 func (p *Panel) routesUsage() {
 	p.route("GET /panel/api/packages", scopeRead, p.packages)
 	p.route("GET /panel/api/credit_history", scopeRead, p.creditHistoryHandler)
@@ -1139,19 +1138,7 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fileMsg := ""
-
-	if account.FilePath != "" {
-		if err := os.Remove(account.FilePath); err != nil && !os.IsNotExist(err) {
-			fileMsg = err.Error()
-		}
-		// safefile.WriteKeep 会留一份上一版凭证（含仍可能有效的 access token）；
-		// 删除账号时一并清掉，否则凭证残留在 auth 目录。
-		if err := os.Remove(account.FilePath + ".bak"); err != nil && !os.IsNotExist(err) && fileMsg == "" {
-			fileMsg = err.Error()
-		}
-	}
-
+	fileMsg := removeAccountCredentialFiles(account)
 	if fileMsg != "" {
 		log.Printf("panel: remove uid=%s（auth 文件删除失败: %s）", uid, fileMsg)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file_error": fileMsg})
@@ -1161,6 +1148,71 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountLogout 撤销账号在上游的登录会话（使 refreshToken 失效），再走与移除相同的
+// 本地收尾（出池 + 删凭证文件）。与 remove 的区别：移除只清本地，上游 RT 仍然有效。
+//
+// 失败路径不动本地凭证：撤销不成说明会话可能还活着，此时删掉本地凭证等于放弃唯一
+// 能撤销它的凭据。唯一的例外是凭证已失效（IsCredentialDead）——已无可撤销会话，
+// 照常删干净。
+func (p *Panel) accountLogout(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+
+	account := p.cfg.Pool.AuthByUID(uid)
+	if account == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+
+	if err := p.cfg.Upstream.Logout(r.Context(), account); err != nil {
+		if !upstream.IsCredentialDead(err) {
+			log.Printf("panel: logout uid=%s 上游撤销失败: %v", uid, err)
+			writeErr(w, http.StatusBadGateway, "撤销登录会话失败："+err.Error())
+
+			return
+		}
+
+		log.Printf("panel: logout uid=%s 凭证已失效，直接清理本地: %v", uid, err)
+	}
+
+	retired := p.cfg.Pool.Remove(uid)
+	if retired == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+
+	fileMsg := removeAccountCredentialFiles(retired)
+	if fileMsg != "" {
+		log.Printf("panel: logout uid=%s（会话已撤销，auth 文件删除失败: %s）", uid, fileMsg)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "file_error": fileMsg})
+
+		return
+	}
+
+	log.Printf("panel: logout uid=%s（已撤销上游会话并删除凭证文件）", uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// removeAccountCredentialFiles 删除账号凭证文件与 .bak 备份，返回首次失败文案。
+// safefile.WriteKeep 会留一份上一版凭证（含仍可能有效的 access token）；删账号时
+// 一并清掉，否则凭证残留在 auth 目录。
+func removeAccountCredentialFiles(account *auth.Auth) string {
+	if account.FilePath == "" {
+		return ""
+	}
+
+	fileMsg := ""
+
+	if err := os.Remove(account.FilePath); err != nil && !os.IsNotExist(err) {
+		fileMsg = err.Error()
+	}
+
+	if err := os.Remove(account.FilePath + ".bak"); err != nil && !os.IsNotExist(err) && fileMsg == "" {
+		fileMsg = err.Error()
+	}
+
+	return fileMsg
 }
 
 // ---------------------------------------------------------------------------

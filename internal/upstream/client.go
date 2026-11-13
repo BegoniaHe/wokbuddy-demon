@@ -2203,6 +2203,61 @@ func (c *Client) refreshAt(ctx context.Context, base string, hdr *auth.Auth) (js
 	return c.doJSONFor(hdr, req)
 }
 
+// logoutBody 官方 logout 请求体：空 JSON 对象（与 refresh 同形态）。
+const logoutBody = "{}"
+
+// Logout 撤销账号在上游的登录会话（POST {realm base}/v2/plugin/auth/logout）。
+//
+// 官方客户端退登时确实会撤销服务端会话（main/common2.js ExternalLinkAuth.removeSession，
+// 带 X-No-Authorization: true 的三件套）；本仓此前只有 refresh，没有撤销路径——面板
+// 移除账号只删本地凭证，上游 refreshToken 仍然有效（issue #513）。
+//
+// 语义边界：撤销的是「这条 refreshToken 对应的会话」，不保证覆盖该账号在别处新登录的
+// 会话。无 refreshToken 时直接返回 errNoRefreshToken（已无可撤销对象）。
+func (c *Client) Logout(ctx context.Context, account *auth.Auth) error {
+	if account.RefreshTokenValue() == "" {
+		return errNoRefreshToken
+	}
+
+	origins := c.chatOrigins(account)
+
+	var lastErr error
+
+	for _, base := range origins {
+		err := c.logoutAt(ctx, base, account)
+		if err == nil {
+			return nil
+		}
+
+		lastErr = err
+
+		// 只有「该域没有这个路径」才换下一个候选域；业务拒绝 / 401 / 5xx 直接返回，
+		// 不在别的域重复发撤销请求。
+		var ue *Error
+		if !errors.As(err, &ue) || ue.Kind != ErrNotFound {
+			break
+		}
+	}
+
+	return lastErr
+}
+
+// logoutAt 向单个 origin 发一次 logout 请求并解信封。
+func (c *Client) logoutAt(ctx context.Context, base string, account *auth.Auth) error {
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, base+"/v2/plugin/auth/logout", strings.NewReader(logoutBody),
+	)
+	if err != nil {
+		return fmt.Errorf("Logout: %w", err)
+	}
+
+	c.LogoutHeaders(req, account)
+
+	_, err = c.doJSONFor(account, req)
+
+	return err
+}
+
 // commitRefreshedToken 锁内校验快照一致后写回新 token 字段。
 func commitRefreshedToken(account4 *auth.Auth, tok refreshTokenResponse, atBefore, rtSnapshot string) {
 	account4.Lock()

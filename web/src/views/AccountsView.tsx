@@ -707,6 +707,17 @@ function AccountRow({
     )
       return;
     if (
+      a === 'logout' &&
+      !(await confirm({
+        title: '撤销登录会话？',
+        description:
+          '将调用上游撤销这条 refreshToken 对应的登录会话（令牌立即失效），随后把账号出池并删除本地凭证。撤销范围不含该账号在别处新登录的会话；失败时本地凭证保持原样。',
+        confirmText: '撤销会话',
+        destructive: true,
+      }))
+    )
+      return;
+    if (
       a === 'disable' &&
       !(await confirm({
         title: '禁用账号？',
@@ -718,7 +729,10 @@ function AccountRow({
     )
       return;
     try {
-      if (a === 'checkin') {
+      if (a === 'logout') {
+        const r = await postJSON<{ file_error?: string }>('accounts/' + encodeURIComponent(u) + '/logout');
+        toast(r.file_error ? '会话已撤销（凭证文件删除失败：' + r.file_error + '）' : '已撤销登录会话', 'ok');
+      } else if (a === 'checkin') {
         const r = await postJSON<{ credits?: number; credits_total?: number; checkin_message?: string }>(
           'accounts/' + encodeURIComponent(u) + '/checkin',
         );
@@ -907,6 +921,13 @@ function AccountRow({
                 <DropdownMenuItem onClick={() => void act('disable')}>禁用</DropdownMenuItem>
               )}
               <DropdownMenuSeparator />
+              <DropdownMenuItem
+                variant="destructive"
+                onClick={() => void act('logout')}
+                title="调用上游撤销这条 refreshToken 对应的会话，再删除本地凭证"
+              >
+                撤销登录会话
+              </DropdownMenuItem>
               <DropdownMenuItem variant="destructive" onClick={() => void act('remove')}>
                 移除
               </DropdownMenuItem>
