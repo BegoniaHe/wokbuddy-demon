@@ -383,6 +383,66 @@ func TestTextContinueReaderPreservesLengthWithSeparateUsage(t *testing.T) {
 	}
 }
 
+// TestTextContinueReaderKeepsStopInUsageFrame 上游把 stop 与 usage 放同一帧：工具轮
+// 续写没带回调用时，首段 stop 必须补发（#495），否则整条响应没有任何 finish_reason。
+func TestTextContinueReaderKeepsStopInUsageFrame(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"先看一下："}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}` + "\n\n" +
+		"data: [DONE]\n\n"
+	second := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"没有可调用的工具。"}}]}` + "\n\n" +
+		`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+		return closeString{strings.NewReader(second)}, nil
+	})
+	r.ContinueOnStopTail(func(string) bool { return true }, true, nil)
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(out), `"finish_reason":"stop"`) {
+		t.Fatalf("工具轮续写后首段 stop 丢失（客户端收不到终态）: %s", out)
+	}
+
+	// 契约：工具轮只采纳续写段的 tool_calls，正文丢弃。
+	if strings.Contains(string(out), "没有可调用的工具。") {
+		t.Fatalf("工具轮续写不应下发正文: %s", out)
+	}
+}
+
+// TestTextContinueReaderRestoresStopWhenContinueFails 续写发起失败时首段 stop 按原值
+// 补发，不被改写成 length、也不退化成 finish_reason:null。
+func TestTextContinueReaderRestoresStopWhenContinueFails(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"先看一下："}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+		return nil, io.ErrUnexpectedEOF
+	})
+	r.ContinueOnStopTail(func(string) bool { return true }, false, nil)
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(out), `"finish_reason":"stop"`) {
+		t.Fatalf("续写失败后首段 stop 丢失: %s", out)
+	}
+
+	if strings.Contains(string(out), `"finish_reason":"length"`) {
+		t.Fatalf("stop 不应被改写成 length: %s", out)
+	}
+}
+
 // TestTextContinueReaderMergesFirstUsage 续写成功时末帧 usage 与非流式同口径：
 // prompt/cache 取末段，completion/credit 累加首段，total 重算（issue #247 / #432）。
 func TestTextContinueReaderMergesFirstUsage(t *testing.T) {
