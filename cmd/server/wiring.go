@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -92,16 +93,38 @@ func applyDailyLimits(state *pool.Pool, cfg *Config) {
 }
 
 // setDailyUsageProvider 把 usage 当日聚合接到 pool（issue #95）。
-func setDailyUsageProvider(p *pool.Pool, rec *usage.Recorder) {
-	p.SetDailyUsageProvider(func() map[string]pool.DailyUsage {
-		src := rec.DailyTotalsCached(time.Now())
+//
+// 转换结果必须缓存：池子对每个候选账号都会调一次 provider（选号持写锁），而
+// usage 只缓存「聚合」不缓存「转换」。不缓存时一次选号在锁内做 N 次
+// make(map, N) + N×N 次赋值（100 号池 ≈ 1 万次写入/选号）。返回的 map 只被
+// 调用方读，缓存 1 秒与 usage.DailyTotalsCached 同窗口。
+func setDailyUsageProvider(state *pool.Pool, rec *usage.Recorder) {
+	var (
+		mu   sync.Mutex
+		at   time.Time
+		snap map[string]pool.DailyUsage
+	)
+
+	state.SetDailyUsageProvider(func() map[string]pool.DailyUsage {
+		now := time.Now()
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if snap != nil && now.Sub(at) < time.Second {
+			return snap
+		}
+
+		src := rec.DailyTotalsCached(now)
 
 		out := make(map[string]pool.DailyUsage, len(src))
 		for uid, u := range src {
 			out[uid] = pool.DailyUsage{Tokens: u.Tokens, Credits: u.Credits, Models: u.Models}
 		}
 
-		return out
+		snap, at = out, now
+
+		return snap
 	})
 }
 
@@ -122,6 +145,14 @@ func startPricingRefresh(ctx context.Context, cfg *Config, cat *pricing.Catalog)
 	}
 
 	refresh := func() {
+		// 拉取（HTTP + 解码 + 原子写盘）在独立协程里跑：一次 panic 会带走整个
+		// 进程。隔离后失败只影响本轮价格快照，旧快照继续服务。
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("ERR: [pricing] 价格刷新 panic（已隔离）: %v\n%s", rec, debug.Stack())
+			}
+		}()
+
 		if err := cat.Refresh(ctx); err != nil {
 			log.Printf("WARN: [pricing] 拉取 OpenRouter 价格失败（保留上次快照）: %v", err)
 		}
@@ -273,60 +304,78 @@ type handlerDeps struct {
 
 // buildHandler 把装配期依赖映射为 server.Config；这些字段改动需重启。
 func buildHandler(handlerDeps2 *handlerDeps) *server.Handler {
-	return server.NewHandler(&server.Config{
+	cfg := handlerDeps2.cfg
+
+	conf := &server.Config{
 		Pool:                handlerDeps2.pool,
 		Upstream:            handlerDeps2.up,
-		APIKey:              handlerDeps2.cfg.APIKey,
-		AdminAPIKey:         handlerDeps2.cfg.AdminAPIKey,
-		ReadonlyAPIKey:      handlerDeps2.cfg.ReadonlyAPIKey,
+		APIKey:              cfg.APIKey,
+		AdminAPIKey:         cfg.AdminAPIKey,
+		ReadonlyAPIKey:      cfg.ReadonlyAPIKey,
 		AuthLimiter:         handlerDeps2.authLimiter,
 		Keys:                handlerDeps2.keys,
 		Session:             handlerDeps2.session,
-		StickyDeriveBinding: handlerDeps2.cfg.SessionSticky.DeriveBinding,
+		StickyDeriveBinding: cfg.SessionSticky.DeriveBinding,
 		StickyCount:         handlerDeps2.stickyCount,
 		RedisMode:           handlerDeps2.redisMode,
-		SoftCooldown:        handlerDeps2.cfg.SoftRateDur,
+		SoftCooldown:        cfg.SoftRateDur,
 		Panel:               handlerDeps2.panel,
 		Live:                handlerDeps2.live,
 		Usage:               handlerDeps2.usage,
 		RequestLog:          handlerDeps2.requestLog,
-		PromptMode:          handlerDeps2.cfg.Prompt.Mode,
-		PromptText:          handlerDeps2.cfg.PromptText,
-		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
-		// 裸用/测试路径拿到同一缺省值。
-		RecordClientInfo:    handlerDeps2.cfg.Logging.RequestClientInfo,
-		DecisionTrace:       handlerDeps2.cfg.Logging.DecisionTrace,
-		DecisionTraceSample: handlerDeps2.cfg.Logging.DecisionTraceSample,
-		LocalWebTools:       handlerDeps2.cfg.Features.LocalWebTools,
-		LocalWebToolRounds:  handlerDeps2.cfg.Features.LocalWebToolRounds,
-		// 后台模型重定向（issue #103）：Live 快照优先，这里填静态回落值。
-		BackgroundNames:  backgroundNameSet(handlerDeps2.cfg.Models.BackgroundNames),
-		BackgroundTarget: handlerDeps2.cfg.Models.BackgroundTarget,
-		// 模型黑名单（models.hidden）：Live 快照优先，这里填静态回落值（热生效）。
-		HiddenModels: livecfg.NormalizeHiddenModels(handlerDeps2.cfg.Models.Hidden),
-		// 模型白名单（models.allowed）：同上，Live 快照优先。
-		AllowedModels: livecfg.NormalizeAllowedModels(handlerDeps2.cfg.Models.Allowed),
+		PromptMode:          cfg.Prompt.Mode,
+		PromptText:          cfg.PromptText,
+		DecisionTrace:       cfg.Logging.DecisionTrace,
+		DecisionTraceSample: cfg.Logging.DecisionTraceSample,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
-		GlobalEnabled: handlerDeps2.cfg.Global.Enabled,
+		GlobalEnabled: cfg.Global.Enabled,
 		// 客户端模型别名（issue #52）：请求解析阶段一次性生效，改后需重启。
-		ModelAliases: handlerDeps2.cfg.Models.Aliases,
+		ModelAliases: cfg.Models.Aliases,
 		// 轮换策略（issue #17）：次数上限 + 总时长预算 + 可选状态码换号闸。
-		MaxRotate:      handlerDeps2.cfg.Upstream.RotateMax,
-		RotateBudget:   handlerDeps2.cfg.RotateBudgetDur,
-		RotateStatuses: rotateStatusSet(handlerDeps2.cfg.Upstream.RotateStatusCodes),
+		MaxRotate:      cfg.Upstream.RotateMax,
+		RotateBudget:   cfg.RotateBudgetDur,
+		RotateStatuses: rotateStatusSet(cfg.Upstream.RotateStatusCodes),
 		// 入站 SSE 心跳（issue #54）：0 = 关闭；改后需重启。
-		KeepaliveInterval: handlerDeps2.cfg.KeepaliveIntervalDur,
+		KeepaliveInterval: cfg.KeepaliveIntervalDur,
 		// 首帧等待期注释帧（issue #500）：默认 1500ms；改后需重启。
-		TTFBKeepaliveInterval: handlerDeps2.cfg.TTFBKeepaliveIntervalDur,
+		TTFBKeepaliveInterval: cfg.TTFBKeepaliveIntervalDur,
 		// 上游劣化滑窗（issue #488）：窗口 <=0 = 关闭；改后需重启。
-		UpstreamHealthWindow:     handlerDeps2.cfg.UpstreamHealthWindowDur,
-		UpstreamHealthTTFB:       time.Duration(handlerDeps2.cfg.Server.UpstreamHealthTTFBMs) * time.Millisecond,
-		UpstreamHealth5xxRatio:   handlerDeps2.cfg.Server.UpstreamHealth5xxRatio,
-		UpstreamHealthMinSamples: handlerDeps2.cfg.Server.UpstreamHealthMinSamples,
+		UpstreamHealthWindow:     cfg.UpstreamHealthWindowDur,
+		UpstreamHealthTTFB:       time.Duration(cfg.Server.UpstreamHealthTTFBMs) * time.Millisecond,
+		UpstreamHealth5xxRatio:   cfg.Server.UpstreamHealth5xxRatio,
+		UpstreamHealthMinSamples: cfg.Server.UpstreamHealthMinSamples,
 		// CORS 允许源（issue #91）：空 = 关闭。
-		CORSOrigins: handlerDeps2.cfg.Server.CORSOrigins,
+		CORSOrigins: cfg.Server.CORSOrigins,
+		// 入站请求体上限（issue #86）：漏配即 0 = 不限制，整个 body 直接读进内存，
+		// 32 MiB 的 413 保护形同虚设（且 restartFieldPaths 还提示「重启生效」）。
+		MaxBodyBytes: cfg.Server.MaxBodyBytes,
 		// 可信反代网段：仅当 TCP 对端命中时才采信转发头。
 		TrustedProxies: handlerDeps2.trustedProxies,
 		Notifier:       handlerDeps2.notifier,
-	})
+	}
+
+	applyStaticLiveFallbacks(conf, cfg)
+
+	return server.NewHandler(conf)
+}
+
+// applyStaticLiveFallbacks 填「Live 快照优先」字段的静态回落值。
+//
+// 这些字段热改后由 livecfg 快照决定；静态值只服务 Live 为 nil 的裸用/测试路径。
+// 两个来源必须同构，否则测试与生产行为分叉（例如 Live 为 nil 时出站能力开关
+// 恒为关闭，而部署里是开启的）。
+func applyStaticLiveFallbacks(conf *server.Config, cfg *Config) {
+	conf.RecordClientInfo = cfg.Logging.RequestClientInfo
+	conf.LocalWebTools = cfg.Features.LocalWebTools
+	conf.LocalWebToolRounds = cfg.Features.LocalWebToolRounds
+	conf.SearchEndpoint = cfg.Features.SearchEndpoint
+	conf.SearchDeep = cfg.Features.SearchDeep
+	conf.MultimodalRouting = cfg.Features.MultimodalRouting
+	conf.WebFetchEndpoint = cfg.Features.WebFetchEndpoint
+	conf.ImagesEndpoint = cfg.Features.ImagesEndpoint
+	conf.VideosEndpoint = cfg.Features.VideosEndpoint
+	conf.BackgroundNames = backgroundNameSet(cfg.Models.BackgroundNames)
+	conf.BackgroundTarget = cfg.Models.BackgroundTarget
+	conf.HiddenModels = livecfg.NormalizeHiddenModels(cfg.Models.Hidden)
+	conf.AllowedModels = livecfg.NormalizeAllowedModels(cfg.Models.Allowed)
 }

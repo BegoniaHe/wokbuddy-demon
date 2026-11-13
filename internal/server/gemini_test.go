@@ -373,3 +373,23 @@ func TestGeminiArgsObjectNull(t *testing.T) {
 		t.Fatalf("args=%v want empty object", args)
 	}
 }
+
+// TestGeminiLegacyFunctionCallParts 旧式 function_call 由上游刻意保留
+// （upstream/sse.go 的 keepFunctionCall），只读 tool_calls 会让这类响应在 Gemini 面
+// 变成「正常结束、没有工具调用」。
+func TestGeminiLegacyFunctionCallParts(t *testing.T) {
+	t.Parallel()
+
+	parts := geminiFunctionParts(toolCallsWithLegacy(nil, map[string]any{
+		"name": "lookup", "arguments": `{"q":1}`,
+	}))
+
+	if len(parts) != 1 {
+		t.Fatalf("parts=%v want 1（旧式 function_call 应转成 functionCall）", parts)
+	}
+
+	call := parts[0].(map[string]any)["functionCall"].(map[string]any)
+	if call["name"] != "lookup" {
+		t.Errorf("call=%v", call)
+	}
+}

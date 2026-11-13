@@ -12,6 +12,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // TestStreamFirstFrameErrorVeto 首帧可换号失败不写 200：直接换号后成功（issue #244）。
@@ -430,5 +431,61 @@ func TestWaitForModelBusyRespectsCancel(t *testing.T) {
 
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("canceled wait took %v", elapsed)
+	}
+}
+
+// 聚合路径改用 UseNumber 解码 SSE 帧后，usage 里的数字是 json.Number。
+// 只认 float64 会让累计 completion 被末段覆盖（多轮少算），total 也不再重算。
+func TestMergeUsageTotalsWithJSONNumbers(t *testing.T) {
+	t.Parallel()
+
+	first := map[string]any{"usage": map[string]any{
+		"prompt_tokens": json.Number("10"), "completion_tokens": json.Number("2"),
+		"credit": json.Number("1.5"), "total_tokens": json.Number("12"),
+	}}
+	mergeUsageTotals(first, map[string]any{"usage": map[string]any{
+		"prompt_tokens": json.Number("20"), "completion_tokens": json.Number("4"),
+		"credit": json.Number("2"), "total_tokens": json.Number("24"),
+	}})
+
+	usage, _ := first["usage"].(map[string]any)
+
+	if got, _ := upstream.UsageNumber(usage, "prompt_tokens"); got != 20 {
+		t.Errorf("prompt_tokens=%v want 20（末段覆盖）", usage["prompt_tokens"])
+	}
+
+	if got, _ := upstream.UsageNumber(usage, "completion_tokens"); got != 6 {
+		t.Errorf("completion_tokens=%v want 6（跨段累计）", usage["completion_tokens"])
+	}
+
+	if got, _ := upstream.UsageNumber(usage, "credit"); got != 3.5 {
+		t.Errorf("credit=%v want 3.5（跨段累计）", usage["credit"])
+	}
+
+	if got, _ := upstream.UsageNumber(usage, "total_tokens"); got != 26 {
+		t.Errorf("total_tokens=%v want 26（末段 prompt + 累计 completion）", usage["total_tokens"])
+	}
+}
+
+// total 溢出/为负时不写回：+Inf 会让 encoding/json 直接失败，整个非流式响应变 500。
+func TestRecomputeUsageTotalRejectsUnusableSum(t *testing.T) {
+	t.Parallel()
+
+	for _, usage := range []map[string]any{
+		{"prompt_tokens": 1e308, "completion_tokens": 1e308},
+		{"prompt_tokens": -5.0, "completion_tokens": 1.0},
+	} {
+		if recomputeUsageTotal(usage) {
+			t.Fatalf("不可信求和 %v 不应触发 total 重算", usage)
+		}
+
+		if _, has := usage["total_tokens"]; has {
+			t.Fatalf("不可信求和 %v 不应写入 total_tokens", usage)
+		}
+	}
+
+	ok := map[string]any{"prompt_tokens": 10.0, "completion_tokens": 5.0}
+	if !recomputeUsageTotal(ok) || ok["total_tokens"] != 15.0 {
+		t.Fatalf("正常求和应写入 total=%v", ok["total_tokens"])
 	}
 }

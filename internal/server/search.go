@@ -18,6 +18,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
@@ -126,6 +127,21 @@ func (h *Handler) recordSearchUsage(
 	h.cfg.Usage.Add(time.Now(), searchRealm, uid, model, delta, ok)
 }
 
+// noteSearchTrace 把搜索类请求的结果写进请求日志（搜索路径没有 chatStat，账号/
+// 模型与结论显式写进 trace）。
+func noteSearchTrace(r *http.Request, h *Handler, uid, model, outcome string) {
+	requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), model, outcome)
+}
+
+// searchTraceOutcome 搜索类请求的 trace 结论：没有失败即成功。
+func searchTraceOutcome(fail *searchFailure) string {
+	if fail == nil {
+		return reqlog.OutcomeSuccess
+	}
+
+	return reqlog.OutcomeHTTPError
+}
+
 // runAgentTool 是搜索 / webfetch / agentic 搜索共用的账号执行器：选号、在途租约、
 // 预刷新、401 同号 refresh 重放一次、错误处置与有界轮转。
 //
@@ -135,7 +151,7 @@ func (h *Handler) recordSearchUsage(
 // 不接收 model：snippet/深检索请求体不含 model，webfetch 的 model_name 也不是
 // 网关池里的聊天模型；把客户端模型名交给 applyErrorPolicy 会误写模型级冷却/路由熔断。
 //
-//nolint:funlen,gocognit // 轮转/租约/错误处置线性展开。
+//nolint:funlen // 轮转/租约/错误处置线性展开。
 func runAgentTool[T any](
 	ctx context.Context, handler *Handler, stage string, attempts int, rotateTransport bool,
 	call func(context.Context, *auth.Auth) (T, error),
@@ -148,33 +164,43 @@ func runAgentTool[T any](
 
 	tried := map[string]bool{}
 
-	var lastFail *searchFailure
+	var (
+		lastFail *searchFailure
+		lastUID  string
+	)
 
 	for i := range attempts {
 		acct := handler.cfg.Pool.PickExcludingForRealm(tried, "", searchRealm)
 		if acct == nil {
-			if lastFail != nil {
-				return zero, "", lastFail
-			}
+			uid, fail := exhaustedFailure(lastFail, lastUID)
 
-			return zero, "", noHealthyAccountFailure()
+			return zero, uid, fail
 		}
 
 		tried[acct.UID] = true
 
 		// 在途租约：搜索/抓取同样占账号名额（与 chat 共用，避免把池打满）。
 		if !handler.cfg.Pool.Acquire(acct.UID) {
+			// 满载不是账号故障：记一笔 lastFail（uid 非空）让面板看得到这次失败与
+			// 延迟，然后继续换号；code 留空 = 允许轮转。
+			lastFail = &searchFailure{
+				status: http.StatusServiceUnavailable, msg: "account at concurrency limit",
+			}
+			lastUID = acct.UID
+
 			continue
 		}
 
-		out, fail := handler.agentToolOnAccount(ctx, stage, acct, rotateTransport, call)
-		handler.cfg.Pool.Release(acct.UID)
+		out, fail := runWithAccountLease(handler, acct.UID, func() (T, *searchFailure) {
+			return handler.agentToolOnAccount(ctx, stage, acct, rotateTransport, call)
+		})
 
 		if fail == nil {
 			return out, acct.UID, nil
 		}
 
 		lastFail = fail
+		lastUID = acct.UID
 		// 请求级错误/内容拦截/队列满/鉴权终态：换号无意义，直接返回。
 		if fail.code != "" {
 			return zero, acct.UID, fail
@@ -186,11 +212,35 @@ func runAgentTool[T any](
 		}
 	}
 
+	uid, fail := exhaustedFailure(lastFail, lastUID)
+
+	return zero, uid, fail
+}
+
+// exhaustedFailure 池耗尽/全部满载时的终态：有 lastFail 就带出最后一次尝试的账号。
+//
+// 为什么带出 uid：调用方的用量记录在 uid 为空时直接 return，失败请求就既不计
+// 请求数也不计延迟，失败率在面板上完全不可见。
+func exhaustedFailure(lastFail *searchFailure, lastUID string) (string, *searchFailure) {
 	if lastFail != nil {
-		return zero, "", lastFail
+		return lastUID, lastFail
 	}
 
-	return zero, "", noHealthyAccountFailure()
+	return "", noHealthyAccountFailure()
+}
+
+// runWithAccountLease 在账号在途租约下执行一次工具调用，无论正常返回还是 panic
+// 都归还名额。
+//
+// 为什么必须 defer：agentToolOnAccount 内部跑上游响应解析，panic 时 withRecovery
+// 只在最外层兜底，若不 defer 归还在途计数会永久 +1，泄漏 N 次后该账号彻底不可用，
+// 只能重启进程。
+func runWithAccountLease[T any](
+	handler *Handler, uid string, call func() (T, *searchFailure),
+) (T, *searchFailure) {
+	defer handler.cfg.Pool.Release(uid)
+
+	return call()
 }
 
 // rotateAfterFailure 在第 i 次尝试失败后等待下一次尝试；已是最后一次时直接
@@ -255,16 +305,25 @@ func (h *Handler) agentToolOnAccount[T any](
 		return h.agentToolReplayAfterRefresh(ctx, stage, acct, rotateTransport, call)
 	}
 
-	return zero, h.agentToolErrorFailure(stage, acct.UID, rotateTransport, err)
+	return zero, h.agentToolErrorFailure(ctx, stage, acct.UID, rotateTransport, err)
 }
 
 // agentToolErrorFailure 统一处置调用后的错误（确定性失败 / 传输层 / 上游分类）。
 func (h *Handler) agentToolErrorFailure(
-	stage, uid string, rotateTransport bool, err error,
+	ctx context.Context, stage, uid string, rotateTransport bool, err error,
 ) *searchFailure {
 	// 确定性上游结果（缺正文/非文本/超限/无综述）：换号不会改变，直接终态。
 	if agentToolDeterministicError(err) {
 		return deterministicAgentToolFailure(stage)
+	}
+
+	// 客户端已断开：这不是上游故障。按 499 终态返回（调用方按 client_closed
+	// 记账为中断），否则一次用户取消会写成 502 + OutcomeHTTPError 污染错误率，
+	// 且 webfetch 的 rotateTransport 还会继续换号、继续打上游。
+	if ctx.Err() != nil {
+		return &searchFailure{
+			status: clientClosedRequestStatus, code: "client_closed", msg: "client closed request",
+		}
 	}
 
 	var upErr *upstream.Error

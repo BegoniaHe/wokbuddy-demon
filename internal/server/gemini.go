@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -402,7 +403,15 @@ func geminiInlineImage(part map[string]any) map[string]any {
 	}
 
 	data := stringValue(inline["data"])
-	if mime == "" || data == "" || !strings.HasPrefix(mime, "image/") {
+	if mime == "" || data == "" {
+		return nil
+	}
+
+	if !strings.HasPrefix(mime, "image/") {
+		// 上游 chat/completions 面没有文档/音频输入形态：静默丢会让模型只收到文本，
+		// 客户端与日志都没有线索。
+		log.Printf("WARN: [server] gemini: 丢弃不支持的 inlineData mime=%s", mime)
+
 		return nil
 	}
 
@@ -954,7 +963,10 @@ func geminiResponseParts(choice map[string]any) []any {
 		parts = append(parts, map[string]any{"text": text})
 	}
 
-	parts = append(parts, geminiFunctionParts(msg["tool_calls"])...)
+	// 旧式 function_call 由上游刻意保留（upstream/sse.go 的 keepFunctionCall），
+	// 只读 tool_calls 会让这类响应在 Gemini 面变成「正常结束、没有工具调用」。
+	parts = append(parts, geminiFunctionParts(
+		toolCallsWithLegacy(msg["tool_calls"], msg["function_call"]))...)
 
 	return parts
 }
@@ -1193,7 +1205,7 @@ func (g *geminiStreamWriter) applyDelta(delta map[string]any) error {
 		}
 	}
 
-	return g.collectToolCalls(delta["tool_calls"])
+	return g.collectToolCalls(toolCallsWithLegacy(delta["tool_calls"], delta["function_call"]))
 }
 
 func (g *geminiStreamWriter) emitText(text string, thought bool) error {

@@ -113,6 +113,9 @@ type upstreamHealth struct {
 	warned   map[string]time.Time
 	nowFn    func() time.Time
 	logger   *log.Logger
+	// overflowOnce 键满（healthMaxKeys）告警只打一次：滑窗是有界观测，键溢出
+	// 需要运维知道，但不该每个请求刷一行日志。
+	overflowOnce sync.Once
 }
 
 // newUpstreamHealth 构造滑窗；window<=0 表示关闭（零行为差异）。
@@ -204,6 +207,13 @@ func (u *upstreamHealth) withBucketLocked(key string, now time.Time, update func
 	series := u.series[key]
 	if series == nil {
 		if len(u.series) >= healthMaxKeys {
+			// 键（realm|model）满额：此前静默 return，劣化观测对后来的模型完全失效
+			// 而运维毫无线索。只告警一次，行为仍保持有界（不扩容 map）。
+			u.overflowOnce.Do(func() {
+				log.Printf("WARN: [server] upstream health: 观测键已达上限 %d，"+
+					"新模型不再计入劣化滑窗（缩小模型数或调大 healthMaxKeys）", healthMaxKeys)
+			})
+
 			return
 		}
 

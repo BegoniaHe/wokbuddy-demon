@@ -322,11 +322,14 @@ func labelPair(strs ...string) string {
 	return builder.String()
 }
 
+// labelValueEscaper 标签值转义器：Replacer 构建有预处理成本，提到包级复用。
+var labelValueEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+
 // escapeLabelValue 转义标签值中的反斜杠、双引号与换行（Prometheus 文本格式）。
 func escapeLabelValue(s string) string {
 	if !strings.ContainsAny(s, "\\\"\n") {
 		return s
 	}
 
-	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(s)
+	return labelValueEscaper.Replace(s)
 }

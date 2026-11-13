@@ -23,7 +23,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -74,11 +73,14 @@ func (h *Handler) anthropicSearchHandler(w http.ResponseWriter, r *http.Request)
 	h.recordSearchUsage(r, uid, req.model, started, nil, fail == nil)
 	// 请求日志记账：搜索路径没有 chatStat，账号/模型/结果显式写进 trace
 	// （trace 由 ServeHTTP 在 /v1/search/messages 上创建，开关与其它 POST 接口一致）。
-	if fail == nil {
-		requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeSuccess)
-	} else {
-		requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeHTTPError)
+	// 调用方已断开：不写响应体，也不记成上游失败。
+	if fail != nil && fail.status == clientClosedRequestStatus {
+		noteSearchTrace(r, h, uid, req.model, reqlog.OutcomeInterrupted)
+
+		return
 	}
+
+	noteSearchTrace(r, h, uid, req.model, searchTraceOutcome(fail))
 
 	if fail != nil {
 		writeAnthropicError(w, fail.status, searchErrorType(fail.status), fail.msg, searchHint(fail))
@@ -227,15 +229,17 @@ func stringList(v any) []string {
 
 // validateSearchOptions 在入口校验域名与时间范围：非法值 400，不烧账号。
 func validateSearchOptions(opts upstream.SearchOptions, deep bool) error {
+	// 数量上限先判：逐条校验是正则匹配，几 MB 的域名数组会先烧掉十万级匹配才被
+	// 400 拒掉（请求体上限由 server.max_body_bytes 兜，仍可能很大）。
+	if len(opts.AllowedDomains) > upstream.SearchMaxDomains ||
+		len(opts.BlockedDomains) > upstream.SearchMaxDomains {
+		return fmt.Errorf("%w（每类最多 %d 个）", errSearchTooManyDomains, upstream.SearchMaxDomains)
+	}
+
 	for _, domain := range append(append([]string{}, opts.AllowedDomains...), opts.BlockedDomains...) {
 		if !upstream.ValidSearchDomain(domain) {
 			return fmt.Errorf("%w: %q", errSearchInvalidDomain, domain)
 		}
-	}
-
-	if len(opts.AllowedDomains) > upstream.SearchMaxDomains ||
-		len(opts.BlockedDomains) > upstream.SearchMaxDomains {
-		return fmt.Errorf("%w（每类最多 %d 个）", errSearchTooManyDomains, upstream.SearchMaxDomains)
 	}
 
 	if !upstream.ValidSearchFreshness(opts.Freshness) {
@@ -445,13 +449,20 @@ func (h *Handler) anthropicDeepSearch(w http.ResponseWriter, r *http.Request, re
 	h.recordSearchUsage(r, uid, req.model, started, agenticUsage, fail == nil)
 
 	if fail != nil {
-		requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeHTTPError)
+		// 调用方已断开：不写响应体，也不记成上游失败。
+		if fail.status == clientClosedRequestStatus {
+			noteSearchTrace(r, h, uid, req.model, reqlog.OutcomeInterrupted)
+
+			return
+		}
+
+		noteSearchTrace(r, h, uid, req.model, reqlog.OutcomeHTTPError)
 		writeAnthropicError(w, fail.status, searchErrorType(fail.status), fail.msg, searchHint(fail))
 
 		return
 	}
 
-	requestTraceFrom(r).noteResult(logfmt.Label(uid, accountNickname(h, uid)), req.model, reqlog.OutcomeSuccess)
+	noteSearchTrace(r, h, uid, req.model, reqlog.OutcomeSuccess)
 
 	writeJSON(w, http.StatusOK, buildAgenticSearchMessage(req.model, outcome))
 }

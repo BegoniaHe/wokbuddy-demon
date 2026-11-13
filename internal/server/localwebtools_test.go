@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -429,5 +431,145 @@ func TestLocalWebToolLoopPreservesRequestLevelError(t *testing.T) {
 				t.Errorf("message 透传了完整上游 body 尾部: %q", env.Error.Message)
 			}
 		})
+	}
+}
+
+// TestLocalToolCallsOnlyInjectedNames 只执行网关本轮**实际注入**声明的工具名。
+// 客户端自己声明的同名 function 不能被劫持成网关工具执行。
+func TestLocalToolCallsOnlyInjectedNames(t *testing.T) {
+	t.Parallel()
+
+	obj := map[string]any{
+		"choices": []any{map[string]any{
+			"message": map[string]any{
+				"tool_calls": []any{map[string]any{
+					"id":   "call_1",
+					"type": "function",
+					"function": map[string]any{
+						"name": "web_search", "arguments": `{"query":"x"}`,
+					},
+				}},
+			},
+		}},
+	}
+
+	// 注入过 web_search → 本地执行。
+	calls, ok := localToolCalls(obj, map[string]bool{"web_search": true})
+	if !ok || len(calls) != 1 {
+		t.Fatalf("calls=%v ok=%v want 1/true", calls, ok)
+	}
+
+	// 未注入（客户端自己的同名 function）→ 交回客户端。
+	if _, ok := localToolCalls(obj, map[string]bool{"web_fetch": true}); ok {
+		t.Fatal("客户端同名 function 不应被本地执行")
+	}
+}
+
+// TestEnsureDeclarationsSkipsClientOwnedNames 客户端已声明的名字不计入注入集合，
+// 否则 localToolCalls 仍会把它当成本地工具。
+func TestEnsureDeclarationsSkipsClientOwnedNames(t *testing.T) {
+	t.Parallel()
+
+	req := map[string]any{
+		"tools": []any{map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": "web_search"},
+		}},
+	}
+
+	injected := ensureLocalToolDeclarations(req, map[string]bool{"web_search": true, "web_fetch": true})
+	if injected["web_search"] {
+		t.Fatal("客户端已声明的 web_search 不应算作网关注入")
+	}
+
+	if !injected["web_fetch"] {
+		t.Fatal("web_fetch 应被注入")
+	}
+}
+
+// TestResponsesObjectSSEEmitsInProgress 本地工具模式的 SSE 序列要与统一写出器一致
+// （created 之后固定补 in_progress）。
+func TestResponsesObjectSSEEmitsInProgress(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	writeResponsesObjectSSE(rec, map[string]any{
+		"id": "resp_1", "object": "response", "status": "completed", "output": []any{},
+	})
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "event: response.created") {
+		t.Fatalf("缺 response.created: %s", body)
+	}
+
+	if !strings.Contains(body, "event: response.in_progress") {
+		t.Fatalf("缺 response.in_progress: %s", body)
+	}
+}
+
+// TestAgentToolErrorFailureClientClosed 客户端断开不能记成上游故障：否则一次取消
+// 就写成 502 + OutcomeHTTPError 污染错误率，webfetch 还会继续换号打上游。
+// errTestTransport 测试用的传输层错误哨兵（err113 要求静态错误）。
+var errTestTransport = errors.New("connection reset by peer")
+
+func TestAgentToolErrorFailureClientClosed(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(&Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	fail := h.agentToolErrorFailure(ctx, "webfetch", "u1", true, errTestTransport)
+	if fail == nil {
+		t.Fatal("应返回失败信封")
+	}
+
+	if fail.status != clientClosedRequestStatus || fail.code != "client_closed" {
+		t.Fatalf("status=%d code=%q want %d/client_closed",
+			fail.status, fail.code, clientClosedRequestStatus)
+	}
+}
+
+// TestValidateSearchOptionsCountBeforeShape 域名数量上限先判：超量请求不该先跑完
+// 每条的正则校验。
+func TestValidateSearchOptionsCountBeforeShape(t *testing.T) {
+	t.Parallel()
+
+	domains := make([]string, 0, upstream.SearchMaxDomains+1)
+	for i := range upstream.SearchMaxDomains + 1 {
+		// 全部合法，只有数量超限。
+		domains = append(domains, "example"+strconv.Itoa(i)+".com")
+	}
+
+	err := validateSearchOptions(upstream.SearchOptions{AllowedDomains: domains}, false)
+	if !errors.Is(err, errSearchTooManyDomains) {
+		t.Fatalf("err=%v want errSearchTooManyDomains", err)
+	}
+}
+
+// TestAssistantToolMessageTrimsToExecuted 单轮调用数超过上限时，assistant 消息里
+// 的 tool_calls 必须与真正执行的调用数一致：多声明的调用没有对应 role=tool 结果，
+// 上游会以「未回应的 tool_call」拒掉下一轮整段请求。
+func TestAssistantToolMessageTrimsToExecuted(t *testing.T) {
+	t.Parallel()
+
+	calls := make([]any, maxLocalToolCallsPerRound+1)
+	for i := range calls {
+		calls[i] = map[string]any{
+			"id": "call_" + strconv.Itoa(i), "type": "function",
+			"function": map[string]any{"name": "web_search", "arguments": "{}"},
+		}
+	}
+
+	obj := map[string]any{"choices": []any{map[string]any{
+		"message": map[string]any{"role": "assistant", "content": "", "tool_calls": calls},
+	}}}
+
+	msg := assistantToolMessage(obj, maxLocalToolCallsPerRound)
+
+	got, _ := msg["tool_calls"].([]any)
+	if len(got) != maxLocalToolCallsPerRound {
+		t.Fatalf("tool_calls=%d want %d（声明与执行数不一致）", len(got), maxLocalToolCallsPerRound)
 	}
 }

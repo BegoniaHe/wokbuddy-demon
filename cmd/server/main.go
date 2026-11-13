@@ -10,12 +10,14 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -92,6 +94,21 @@ func preflightAPIKey(path string) (memoryKey string) {
 	return key
 }
 
+// temporaryAPIKey 取本次进程可用的临时 api_key：优先复用 preflight 已生成的，
+// 否则现生成。两次都失败时返回空串（只剩「无法生成随机数」这一极端情形）。
+func temporaryAPIKey(preferred string) string {
+	if preferred != "" {
+		return preferred
+	}
+
+	key, err := randomAPIKey()
+	if err != nil {
+		return ""
+	}
+
+	return key
+}
+
 // loadConfig 加载配置，处理首次运行自动生成推荐配置的兜底：
 //   - 文件不存在 → 落一份推荐配置（含随机 api_key）再加载；
 //   - 生成失败（目录只读等）→ 退回纯默认 + env（旧行为兜底），不阻塞启动。
@@ -114,34 +131,81 @@ func loadConfig(path string) (*Config, error) {
 	}
 	// 首次运行：目录下没有配置 → 自动落一份推荐配置再加载。
 	// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
-	if _, werr := WriteDefault(path); werr == nil {
-		log.Printf("config %s 不存在，已生成推荐配置（api_key 记录在该文件里，可自行修改）", path)
-
-		if cfg, err = Load(path); err == nil {
-			return cfg, nil
-		}
+	if _, werr := WriteDefault(path); werr != nil {
+		return loadConfigAfterGenerateFailure(path, memoryKey, werr)
 	}
-	// 生成失败：退回纯默认 + env（旧行为兜底），不阻塞启动。
-	log.Printf("config %s not found (auto-generate failed), using defaults+env: %v", path, err)
 
-	return Load("")
+	log.Printf("config %s 不存在，已生成推荐配置（api_key 记录在该文件里，可自行修改）", path)
+
+	loaded, err := Load(path)
+	if err != nil {
+		// 生成成功但立即加载失败（磁盘满留下半截文件 / 权限突变）：不能退回默认值裸跑。
+		// 默认 api_key 为空 = 不鉴权直接放行，而磁盘上那个坏文件会让下次启动直接失败，
+		// 形成「本次无鉴权可用、下次起不来」的组合状态。这里直接报错交给调用方。
+		return nil, fmt.Errorf("generated config %s is unusable: %w", path, err)
+	}
+
+	return loaded, nil
 }
 
-//nolint:funlen,maintidx // CLI 入口装配线性展开。
+// loadConfigAfterGenerateFailure 处理「自动生成推荐配置失败」的两种收场：
+//   - 另一实例抢先写好了（O_EXCL 的 ErrExist）→ 赢家落盘的就是完整配置，直接加载；
+//   - 真的写不出去（目录只读 / 磁盘满）→ 退回默认 + env，但必须带随机 api_key。
+//
+// 后者是安全底线：Default() 的 api_key 为空等于「不鉴权放行」，把「写不出配置」
+// 放大成「无鉴权上线」。宁可本次进程用临时 key（重启后需重设），也不裸奔。
+func loadConfigAfterGenerateFailure(path, memoryKey string, genErr error) (*Config, error) {
+	if errors.Is(genErr, fs.ErrExist) {
+		cfg, err := Load(path)
+		if err != nil {
+			return nil, fmt.Errorf("config %s appeared but is unusable: %w", path, err)
+		}
+
+		return cfg, nil
+	}
+
+	log.Printf("WARN: config %s auto-generate failed, using defaults+env with a temporary api_key: %v",
+		path, genErr)
+
+	cfg, err := Load("")
+	if err != nil {
+		return nil, err
+	}
+
+	if cfg.APIKey == "" {
+		cfg.APIKey = temporaryAPIKey(memoryKey)
+	}
+
+	return cfg, nil
+}
+
+// main 只做进程级退出：配置加载/装配/服务生命周期都在 run 里，run 返回错误时
+// 由这里决定退出码。这样 run 的 defer（pool.Close → 最后一次 Flush/SaveState、
+// store.Close 排空异步写）一定先执行完，进程再退出。
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
 
 	flag.Parse()
 
-	cfg, auths, err := loadConfigAndAuths(*cfgPath)
+	if err := run(*cfgPath); err != nil {
+		log.Printf("ERR: %v", err)
+		os.Exit(1)
+	}
+}
+
+// run 执行完整生命周期；返回非 nil 表示启动/运行致命失败。
+//
+//nolint:funlen,maintidx // CLI 入口装配线性展开。
+func run(cfgPath string) error {
+	cfg, auths, err := loadConfigAndAuths(cfgPath)
 	if err != nil {
-		log.Fatalf("%v", err)
+		return err
 	}
 
 	// 可信反代网段：解析一次，供网关与面板共用。配置已在 Load 阶段校验。
 	trustedProxies, err := httpauth.ParseTrustedProxies(cfg.Server.TrustedProxies)
 	if err != nil {
-		log.Fatalf("parse trusted_proxies: %v", err)
+		return fmt.Errorf("parse trusted_proxies: %w", err)
 	}
 
 	state, store, sessRouter, redisMode, sessCount := setupPool(cfg, auths)
@@ -149,7 +213,8 @@ func main() {
 	client, notifier, sch, err := setupUpstream(cfg, state)
 	if err != nil {
 		cleanupRuntime(state, store, sessRouter, nil)
-		log.Fatalf("%v", err)
+
+		return err
 	}
 
 	// 停机序：先 pool.Close()（最后一次 Flush → SaveState 已提交到 store），
@@ -168,7 +233,7 @@ func main() {
 	// 管理与运维面共用同一份失败预算；/v1/* 的 clientAuthLimiter 仍独立。
 	authLimiter := httpauth.NewLimiter(httpauth.DefaultFailLimit, httpauth.DefaultFailWindow)
 	panel2 := newPanel(
-		cfg, *cfgPath, state, client, sch, redisMode, sessCount, obs, trustedProxies, authLimiter,
+		cfg, cfgPath, state, client, sch, redisMode, sessCount, obs, trustedProxies, authLimiter,
 	)
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
@@ -208,7 +273,8 @@ func main() {
 	defer stop()
 
 	startPricingRefresh(ctx, cfg, obs.pricing)
-	serve(ctx, cfg, handler, state, client, sch)
+
+	return serve(ctx, stop, cfg, handler, state, client, sch)
 }
 
 // loadConfigAndAuths 加载配置与账号目录；任一失败都带上可定位的上下文。
@@ -244,6 +310,10 @@ func cleanupRuntime(
 	if notifier != nil {
 		notifier.Close()
 	}
+
+	// model.json 的写入是节流的（/v1/models 逐模型 put）：退出前把窗口内合并掉的
+	// 条目落盘，否则这段时间补到的 context/max_output 只活在内存里。
+	upstream.FlushModelCatalog()
 }
 
 // setupPool 装配账号池、Redis 镜像与会话粘性路由。
@@ -450,8 +520,7 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 	runtimeLog := setupRuntimeLog(cfg)
 
 	priceCat := newPricingCatalog(cfg)
-	home, _ := os.UserHomeDir()
-	agents := agentcfg.New(home, stateSibling(cfg.StateFile, "agent-backups"))
+	agents := newAgentManager(cfg)
 
 	return &observability{
 		live:        live,
@@ -464,6 +533,22 @@ func setupObservability(cfg *Config, state8 *pool.Pool) *observability {
 		pricing:     priceCat,
 		agents:      agents,
 	}
+}
+
+// newAgentManager 装配本机智能体配置管理器。
+//
+// home 取不到时返回 nil（面板对应接口走 501）：空 home 会让 filepath.Join 产出相对
+// 路径，~/.claude/settings.json 变成相对进程 CWD 的 .claude/settings.json，面板
+// 「应用配置」会「成功」写进服务目录。宁可不提供该功能。
+func newAgentManager(cfg *Config) *agentcfg.Manager {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		log.Printf("WARN: [agents] 取不到用户主目录，本机配置管理不可用: %v", err)
+
+		return nil
+	}
+
+	return agentcfg.New(home, stateSibling(cfg.StateFile, "agent-backups"))
 }
 
 // setupRuntimeLog 构造运行日志落盘出口（issue #487）。未启用时返回 nil，多路写入器
@@ -490,17 +575,25 @@ func setupRuntimeLog(cfg *Config) *runlog.Sink {
 }
 
 // serve 启动定时任务与 HTTP 监听，并在收到退出信号后等待在途流排空。
+// 返回非 nil 表示致命启动/运行错误（调用方据此决定退出码）。
 //
 //nolint:funlen,maintidx // 启动/监听/优雅退出线性装配。
 func serve(
 	ctx context.Context,
+	stop func(),
 	cfg *Config,
 	handler *server.Handler,
 	state *pool.Pool,
 	upClient *upstream.Client,
 	sch *scheduler.Scheduler,
-) {
-	go sch.Run(ctx)
+) error {
+	runDone := make(chan struct{})
+
+	go func() {
+		defer close(runDone)
+
+		sch.Run(ctx)
+	}()
 
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	// 任务补领清扫循环：0 = 暂停（task_sweep_enabled=false），运行期可热改间隔。
@@ -520,6 +613,9 @@ func serve(
 		Addr:              cfg.Listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 30 * time.Second,
+		// MaxHeaderBytes 显式钉住请求头上限（1 MiB，与 Go 缺省同值）：公网入口的
+		// header 洪泛防护属于部署契约，不应依赖标准库缺省值随版本变化。
+		MaxHeaderBytes: 1 << 20,
 		// ReadTimeout 覆盖整个请求读取（含 body 上传）：防慢速 body 拖死连接。
 		// 请求体上限由 server.max_body_bytes 约束（缺省 32MiB）。缺省 300s（issue #100：旧固定
 		// 60s 会掐掉大上下文/文件块经反代链的慢速上传，客户端收到
@@ -537,6 +633,10 @@ func serve(
 		defer close(shutdownDone)
 
 		<-ctx.Done()
+		// 首个信号已触发优雅停机，立刻注销信号处理让后续 SIGINT/SIGTERM 走默认
+		// 处置（直接终止进程）。否则第二次 Ctrl-C 只会投递到一个无人再读的
+		// channel 被丢弃，必须等满 accept grace + shutdown grace 才能退出。
+		stop()
 		// 两阶段停机（issue #147）：先把 /healthz 置 503 让反代/LB 摘流，
 		// 宽限期内 listener 仍受理请求；之后再 Shutdown 等待在途 SSE 排空。
 		handler.BeginShutdown()
@@ -562,6 +662,15 @@ func serve(
 		}
 	}()
 
+	// 先 bind 再打「listening on」：bind 失败时日志里不该先出现成功提示。
+	// ListenConfig 而非 net.Listen：noctx 规则要求绑定路径带上可取消上下文。
+	var listenCfg net.ListenConfig
+
+	listener, err := listenCfg.Listen(ctx, "tcp", cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("监听 %s 失败: %w", cfg.Listen, err)
+	}
+
 	log.Printf("wokbuddy-demon listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/",
 		cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 
@@ -569,13 +678,40 @@ func serve(
 		log.Print(warning)
 	}
 
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Printf("http: %v", err)
-		return
+	if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("http serve: %w", err)
 	}
 	// ErrServerClosed 由 Shutdown 触发：等排空 goroutine 收尾后再退出。
 	<-shutdownDone
+	// 调度器必须先停再返回：main 的 defer cleanupRuntime 会 pool.Close()，
+	// 之后任何状态变更都不会再落盘。
+	waitSchedulerExit(sch, runDone)
 	log.Printf("bye")
+
+	return nil
+}
+
+// schedulerExitWait 停机等待调度器 goroutine 的上限：卡住的任务不该阻塞进程退出，
+// 但超时必须留痕（此时最后一次状态变更可能未落盘）。
+const schedulerExitWait = 5 * time.Second
+
+// waitSchedulerExit 有界等待调度器退出（Run + 周期循环 + 面板手动批量任务）。
+func waitSchedulerExit(sch *scheduler.Scheduler, runDone <-chan struct{}) {
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		<-runDone
+
+		sch.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(schedulerExitWait):
+		log.Printf("WARN: [scheduler] 停机等待任务退出超时（%s），最后一次状态变更可能未落盘", schedulerExitWait)
+	}
 }
 
 // warmModelRates 启动预热各域模型积分倍率表（供积分保底的目录兜底判定）。
@@ -970,7 +1106,7 @@ func saveConfigInternal(
 	}
 
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil { //nolint:gosec // 配置路径来自本机启动参数 / 环境变量
+	if err := writeFileSync(tmp, out); err != nil {
 		return nil, fmt.Errorf("write config: %w", err)
 	}
 
@@ -978,13 +1114,17 @@ func saveConfigInternal(
 		return nil, err
 	}
 
-	applyRuntimeConfig(newCfg, live, state3, client2, sch)
+	applyRuntimeConfig(newCfg, oldCfg, live, state3, client2, sch)
+
+	if oldCfg == nil {
+		return nil, nil
+	}
 
 	return restartRequiredFields(oldCfg, newCfg), nil
 }
 
 // prepareConfigMerge 解析旧配置与提交内容，产出待落盘 map、旧配置与新配置。
-// 旧配置用于重启字段 diff；文件损坏时回落默认，最多多报重启项。
+// 旧配置用于重启字段 diff；文件损坏时 oldCfg 返回 nil（基线不可信，调用方跳过 diff）。
 func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config, *Config, error) {
 	var incoming map[string]any
 	if err := json.Unmarshal(raw, &incoming); err != nil {
@@ -997,7 +1137,12 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 
 	oldCfg, oldErr := parseConfigWithEnv(oldRaw)
 	if oldErr != nil {
-		oldCfg = Default()
+		// 旧配置损坏：拿不到可信的 diff 基线。若用 Default() 当基线，用户配过的
+		// 几乎所有字段都会被报成「需重启」，把「配置文件本身坏了」这个真实问题
+		// 掩盖成一张重启清单，所以这里放弃 diff（返回 nil 基线）。
+		log.Printf("WARN: [config] 现有配置无法解析，本次保存不返回需重启字段: %v", oldErr)
+
+		oldCfg = nil
 	}
 
 	merged := incoming
@@ -1009,6 +1154,11 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 			cur = map[string]any{}
 		}
 
+		// 面板回显的代理项只有 scheme://host（凭据不外显）。用户未改动这些项时
+		// 提交回来的就是掩码值：先还原成原文，否则一次「保存配置」就把所有代理
+		// 口令与订阅 token 抹成空——比回显泄露更难察觉。
+		restoreMaskedProxySecrets(incoming, cur)
+
 		merged = mergeConfigMaps(cur, incoming)
 	}
 
@@ -1018,6 +1168,102 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 	}
 
 	return merged, oldCfg, newCfg, nil
+}
+
+// restoreMaskedProxySecrets 把面板回显的掩码代理项还原成配置文件里的原文。
+//
+// 比对口径必须与回显完全一致（maskProxyEntry / maskProxySubURL），否则「没改动」
+// 会被判成「改成了掩码值」而丢掉凭据。
+func restoreMaskedProxySecrets(incoming, current map[string]any) {
+	inUpstream, ok := incoming["upstream"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	curUpstream, ok := current["upstream"].(map[string]any)
+	if !ok {
+		return
+	}
+
+	restoreMaskedProxyList(inUpstream, curUpstream, "proxies", maskProxyEntry)
+	restoreMaskedProxyList(inUpstream, curUpstream, "proxy_subscriptions", maskProxySubURL)
+
+	restoreMaskedProxySlots(inUpstream, curUpstream)
+}
+
+// restoreMaskedProxyList 还原字符串数组里的掩码项。
+//
+// 按「掩码值 → 原文」查表，不按下标对位：面板允许增删/重排代理条目，一旦下标错开，
+// 后续每一项的 mask(cur[i]) 都不再相等，提交回来的掩码串会被当成真实配置落盘，
+// 所有 user:pass 与订阅 URL 里的 token 一次保存就被抹空。
+func restoreMaskedProxyList(inUpstream, curUpstream map[string]any, key string, mask func(string) string) {
+	inList, ok := inUpstream[key].([]any)
+	if !ok {
+		return
+	}
+
+	curList, _ := curUpstream[key].([]any)
+	byMask := make(map[string]string, len(curList))
+
+	for _, item := range curList {
+		if existing, isStr := item.(string); isStr && existing != "" {
+			byMask[mask(existing)] = existing
+		}
+	}
+
+	for i, item := range inList {
+		submitted, isStr := item.(string)
+		if !isStr {
+			continue
+		}
+
+		if raw, hit := byMask[submitted]; hit {
+			inList[i] = raw
+		}
+	}
+}
+
+// restoreMaskedProxySlots 按槽 id 还原 url（槽可能被增删，不能按下标对位）。
+func restoreMaskedProxySlots(inUpstream, curUpstream map[string]any) {
+	inSlots, ok := inUpstream["proxy_slots"].([]any)
+	if !ok {
+		return
+	}
+
+	curSlots, _ := curUpstream["proxy_slots"].([]any)
+
+	byID := make(map[string]string, len(curSlots))
+
+	for _, item := range curSlots {
+		slot, isMap := item.(map[string]any)
+		if !isMap {
+			continue
+		}
+
+		id, _ := slot["id"].(string)
+		if id == "" {
+			continue
+		}
+
+		if raw, isStr := slot["url"].(string); isStr {
+			byID[id] = raw
+		}
+	}
+
+	for _, item := range inSlots {
+		slot, isMap := item.(map[string]any)
+		if !isMap {
+			continue
+		}
+
+		id, _ := slot["id"].(string)
+		submitted, _ := slot["url"].(string)
+
+		existing, seen := byID[id]
+		if seen && submitted == maskProxyEntry(existing) {
+			slot["url"] = existing
+		}
+	}
 }
 
 // applyPoolConfig 应用池的软冷却/成本探索/保底/权重/排程参数。
@@ -1046,30 +1292,30 @@ func applyPoolConfig(state *pool.Pool, cfg *Config) {
 // liveSnapshot 把配置中可热改字段投影为 livecfg 快照。
 func liveSnapshot(cfg *Config) livecfg.Snapshot {
 	return livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		AdminAPIKey:          cfg.AdminAPIKey,
-		ReadonlyAPIKey:       cfg.ReadonlyAPIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
-		MultimodalRouting:    cfg.Features.MultimodalRouting,
-		SearchEndpoint:       cfg.Features.SearchEndpoint,
-		SearchDeep:           cfg.Features.SearchDeep,
-		WebFetchEndpoint:     cfg.Features.WebFetchEndpoint,
-		ImagesEndpoint:       cfg.Features.ImagesEndpoint,
-		VideosEndpoint:       cfg.Features.VideosEndpoint,
-		LocalWebTools:        cfg.Features.LocalWebTools,
-		LocalWebToolRounds:   cfg.Features.LocalWebToolRounds,
-		BackgroundNames:      backgroundNameSet(cfg.Models.BackgroundNames),
-		BackgroundTarget:     cfg.Models.BackgroundTarget,
-		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
-		AllowedModels:        livecfg.NormalizeAllowedModels(cfg.Models.Allowed),
+		APIKey:             cfg.APIKey,
+		AdminAPIKey:        cfg.AdminAPIKey,
+		ReadonlyAPIKey:     cfg.ReadonlyAPIKey,
+		SoftCooldown:       cfg.SoftRateDur,
+		RecordClientInfo:   cfg.Logging.RequestClientInfo,
+		MultimodalRouting:  cfg.Features.MultimodalRouting,
+		SearchEndpoint:     cfg.Features.SearchEndpoint,
+		SearchDeep:         cfg.Features.SearchDeep,
+		WebFetchEndpoint:   cfg.Features.WebFetchEndpoint,
+		ImagesEndpoint:     cfg.Features.ImagesEndpoint,
+		VideosEndpoint:     cfg.Features.VideosEndpoint,
+		LocalWebTools:      cfg.Features.LocalWebTools,
+		LocalWebToolRounds: cfg.Features.LocalWebToolRounds,
+		BackgroundNames:    backgroundNameSet(cfg.Models.BackgroundNames),
+		BackgroundTarget:   cfg.Models.BackgroundTarget,
+		HiddenModels:       livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
+		AllowedModels:      livecfg.NormalizeAllowedModels(cfg.Models.Allowed),
 	}
 }
 
 // applyRuntimeConfig 应用可热生效字段（池参数 / 排程 / 密钥 / 脱敏）。
 func applyRuntimeConfig(
-	newCfg *Config, live *livecfg.Holder, state9 *pool.Pool, client3 *upstream.Client, sch *scheduler.Scheduler,
+	newCfg, oldCfg *Config, live *livecfg.Holder,
+	state9 *pool.Pool, client3 *upstream.Client, sch *scheduler.Scheduler,
 ) {
 	live.Store(liveSnapshot(newCfg))
 	client3.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
@@ -1102,7 +1348,25 @@ func applyRuntimeConfig(
 	sch.SetTimingShape(newCfg.Timing)
 	// 代理出口热生效（issue #39）：重建注册表 → 原子替换拨号器 + 重接账号选路 +
 	// 刷新面板槽视图。构造失败保留旧出口（非法配置已在落盘前拒绝）。
-	applyProxyRegistry(newCfg, state9, client3)
+	//
+	// 只在代理相关字段实际变化时重建：重建会同步拉取全部代理订阅（每个最长 10s，
+	// 串行），而本函数在 configWriteMu 内、配置已落盘之后执行——改一个无关字段
+	// （比如签到小时）也会让面板「保存中」卡住 N×10s，并挡住第二次保存。
+	if oldCfg == nil || proxyConfigChanged(oldCfg, newCfg) {
+		applyProxyRegistry(newCfg, state9, client3)
+	}
+}
+
+// proxyConfigChanged 报告影响出站出口的字段是否变化（nil 安全）。
+func proxyConfigChanged(oldCfg, newCfg *Config) bool {
+	if oldCfg == nil || newCfg == nil {
+		return true
+	}
+
+	return !slices.Equal(oldCfg.Upstream.Proxies, newCfg.Upstream.Proxies) ||
+		!slices.Equal(oldCfg.Upstream.ProxySubscriptions, newCfg.Upstream.ProxySubscriptions) ||
+		!slices.Equal(oldCfg.Upstream.ProxySlots, newCfg.Upstream.ProxySlots) ||
+		!maps.Equal(oldCfg.Upstream.RealmProxySlots, newCfg.Upstream.RealmProxySlots)
 }
 
 // configBackupPath 单代配置备份路径（只留上一版，KISS）。
@@ -1125,6 +1389,35 @@ func backupConfigFile(path string, raw []byte) error {
 	return nil
 }
 
+// writeFileSync 写临时文件并 fsync。
+//
+// 只 WriteFile 不 fsync 时，rename 可能先落盘而数据未落盘，掉电后留下零长/半截
+// 配置（bind-mount 回退路径反而做了 Sync，主路径不该更弱）。
+func writeFileSync(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+
+	if _, werr := file.Write(data); werr != nil {
+		_ = file.Close()
+
+		return fmt.Errorf("write %s: %w", path, werr)
+	}
+
+	if serr := file.Sync(); serr != nil {
+		_ = file.Close()
+
+		return fmt.Errorf("sync %s: %w", path, serr)
+	}
+
+	if cerr := file.Close(); cerr != nil {
+		return fmt.Errorf("close %s: %w", path, cerr)
+	}
+
+	return nil
+}
+
 // replaceConfigFile 用 tmp 原子替换 path；单文件 Docker bind mount 无法被 rename
 // 覆盖（Linux 返回 EBUSY / "device or resource busy"）时回退为就地写入挂载文件。
 func replaceConfigFile(tmp, path string, out []byte) error {
@@ -1134,6 +1427,10 @@ func replaceConfigFile(tmp, path string, out []byte) error {
 		// atomic path for regular files, but update the mounted file in place
 		// for this specific deployment shape.
 		if !errors.Is(err, syscall.EBUSY) {
+			// 其它失败原样返回会留下 0600 的 config.json.tmp（内含完整 api_key），
+			// 下次写入前无人清理。
+			_ = os.Remove(tmp)
+
 			return fmt.Errorf("replace config: %w", err)
 		}
 
@@ -1274,6 +1571,17 @@ func digJSONPath(doc map[string]any, path string) any {
 // 未提交的兄弟键（含用户手写的未知键）保持原样。
 func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
 	for strVal, iface := range incoming {
+		if iface == nil {
+			// 分段对象写成 null：parseConfigWithEnv 会静默忽略（Go 对非指针结构体
+			// 忽略 null），整段回落默认值并永久落盘，用户只看到「保存成功」。
+			// 保留现有值并留痕，避免代理/超时/订阅被静默清空。
+			if _, isMap := cur[strVal].(map[string]any); isMap {
+				log.Printf("WARN: [config] 忽略 %s: null（分段对象不支持置空，已保留原值）", strVal)
+
+				continue
+			}
+		}
+
 		if inMap, ok := iface.(map[string]any); ok {
 			if curMap, ok := cur[strVal].(map[string]any); ok {
 				cur[strVal] = mergeConfigMaps(curMap, inMap)

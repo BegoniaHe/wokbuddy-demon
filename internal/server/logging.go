@@ -903,7 +903,7 @@ func completionTokens(resp map[string]any) int {
 		return -1
 	}
 
-	v, ok := u["completion_tokens"].(float64)
+	v, ok := upstream.UsageNumber(u, "completion_tokens")
 	if !ok {
 		return -1
 	}
@@ -1314,6 +1314,14 @@ type cacheMissSignal struct {
 	last    map[string]time.Time
 }
 
+const (
+	// cacheSignalMaxModels 告警状态表的模型数上限。模型名来自上游目录与客户端
+	// 请求（含别名/双域变体），长跑进程按「历史上出现过的不同模型 id」单调增长。
+	cacheSignalMaxModels = 1024
+	// cacheSignalSweepFactor last 表的过期倍数：超过 every 这么多倍没再观测即删。
+	cacheSignalSweepFactor = 6
+)
+
 // newCacheMissSignal 构造告警信号；every 为同模型的 WARN 冷却间隔。
 func newCacheMissSignal(every time.Duration) *cacheMissSignal {
 	return &cacheMissSignal{
@@ -1324,6 +1332,27 @@ func newCacheMissSignal(every time.Duration) *cacheMissSignal {
 }
 
 var cacheMissWarn = newCacheMissSignal(10 * time.Minute)
+
+// pruneLocked 清理过期与超限状态（调用方已持锁）。仅在表规模超限时触发，
+// 因此平均开销是 O(1)——不是每次观测都扫全表。
+func (c *cacheMissSignal) pruneLocked(now time.Time) {
+	if len(c.everHit)+len(c.last) <= cacheSignalMaxModels {
+		return
+	}
+
+	cutoff := now.Add(-c.every * cacheSignalSweepFactor)
+
+	for model, at := range c.last {
+		if at.Before(cutoff) {
+			delete(c.last, model)
+		}
+	}
+	// 仍超限（大量模型在冷却窗口内）：整体重建。丢掉的只是「该模型曾命中」的
+	// 历史，下一次命中观测会重新建立，代价远小于无界增长。
+	if len(c.everHit) > cacheSignalMaxModels {
+		c.everHit = map[string]bool{}
+	}
+}
 
 // noteCacheTokens 记录一次观测：有命中 → 标记该模型可命中；整段未命中且此前
 // 命中过 → 触发 WARN（冷却内不重复）。
@@ -1340,7 +1369,11 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	defer c.mu.Unlock()
 
 	if hit > 0 {
+		// 命中路径同样要压上限：只在 miss 路径裁剪会让 everHit 随（客户端可决定
+		// 的）模型名持续增长，纯命中流量永远走不到这里。
+		c.pruneLocked(time.Now())
 		c.everHit[model] = true
+
 		return
 	}
 	// hit==0 才可能是整段重算。小前缀（<1000 tok）无告警价值；miss<=0 是显式 0
@@ -1354,6 +1387,9 @@ func (c *cacheMissSignal) noteCacheTokens(model string, prompt, hit, miss int64)
 	}
 
 	now := time.Now()
+
+	c.pruneLocked(now)
+
 	if t, ok := c.last[model]; ok && now.Sub(t) < c.every {
 		return
 	}

@@ -209,7 +209,7 @@ func TestBusyKeyRealmMismatchUnknown(t *testing.T) {
 
 	handler, _ := newBusyTestHandler(t)
 
-	level := handler.modelBusyLevel("cn:glm-5.2", nil, "global")
+	level := handler.modelBusyLevel("cn:glm-5.2", nil, "global", handler.aliasResolver("global"), handler.modelKnownSet())
 	if level != "unknown" {
 		t.Fatalf("level=%q want unknown", level)
 	}

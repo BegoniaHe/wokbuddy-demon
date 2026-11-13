@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"slices"
 	"strings"
@@ -990,6 +991,11 @@ func anthropicAssistantBlock(block map[string]any) (anthropicAssistantPart, erro
 		// 加密块对非 Anthropic 上游没有可验证语义，但也没有可见内容；
 		// 跳过即可让会话继续，避免整轮请求因签名块 400。
 		return anthropicAssistantPart{}, nil
+	case "server_tool_use", "web_search_tool_result":
+		// 网关自己在上一轮写进 assistant 内容的服务端检索块（见 anthropicSearchPrelude）。
+		// 客户端按 Anthropic 协议会把完整历史回传，这些块没有上游语义、也不需要转换；
+		// 落进 default 会让「第二轮」直接 400，把 web_search 功能打断在多轮场景。
+		return anthropicAssistantPart{}, nil
 	case "tool_use":
 		call, err := anthropicToolUseCall(block)
 		if err != nil {
@@ -1838,7 +1844,7 @@ func anthropicMessageFromOpenAIWithOptions(
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
 
-		tools := anthropicToolUseBlocks(msg["tool_calls"])
+		tools := anthropicToolUseBlocks(toolCallsWithLegacy(msg["tool_calls"], msg["function_call"]))
 		content = append(content, tools...)
 		finishReason = stringValue(choice["finish_reason"])
 		stopReason, stopSequence = anthropicStop(finishReason, text, options.stopSequences, len(tools) > 0)
@@ -1884,6 +1890,10 @@ func anthropicToolUseBlocks(raw any) []any {
 
 		name, _ := fn["name"].(string)
 		if name == "" {
+			// 流式面（validateToolBlock）对缺 name 会 WARN；非流式此前完全静默，
+			// 客户端只看到「stop_reason=tool_use 却少一个块」。
+			log.Printf("WARN: [anthropic] 工具调用缺 name，已丢弃（index=%d）", i)
+
 			continue
 		}
 
@@ -1894,7 +1904,12 @@ func anthropicToolUseBlocks(raw any) []any {
 
 		input := map[string]any{}
 		if args, _ := fn["arguments"].(string); args != "" {
-			_ = json.Unmarshal([]byte(args), &input)
+			if err := json.Unmarshal([]byte(args), &input); err != nil {
+				// 上游截断参数：不输出原文（可能含用户数据），只留可定位元信息。
+				log.Printf("WARN: [anthropic] tool_use 参数不是合法 JSON，已按空对象下发（name=%s, %d bytes）",
+					name, len(args))
+			}
+
 			if input == nil {
 				// arguments="null" 等合法 JSON 非对象值：tool_use.input 必须是对象。
 				input = map[string]any{}
@@ -2285,7 +2300,7 @@ func (a *anthropicStreamWriter) applyDelta(delta map[string]any) error {
 		}
 	}
 
-	return a.bufferToolCalls(delta["tool_calls"])
+	return a.bufferToolCalls(toolCallsWithLegacy(delta["tool_calls"], delta["function_call"]))
 }
 
 // emitOrDefer 工具调用缓冲期间先暂存文本/思考，收尾时在 tool_use 之后补发。
@@ -2391,34 +2406,38 @@ func (a *anthropicStreamWriter) emitPrelude() error {
 
 // captureUsage 记录 chunk.usage 的 token 数（末帧通常带 usage）。
 func (a *anthropicStreamWriter) captureUsage(chunk map[string]any) {
+	applyTokenUsage(chunk, &a.inputTokens, &a.outputTokens, &a.cachedTokens, &a.cacheWrite, &a.reasoningTokens)
+}
+
+// applyTokenUsage 把一帧 usage 写入目标计数（两个适配面共用同一口径）：
+// 只接受正向值，避免上游尾帧的显式 0 覆盖已收到的累计值；cached 与 cacheWrite
+// 独立更新，末帧可能只补其中一项。
+func applyTokenUsage(chunk map[string]any, input, output, cached, cacheWrite, reasoning *int) {
 	usage, _ := chunk["usage"].(map[string]any)
 	if usage == nil {
 		return
 	}
 
-	// 与 responses 流式同口径：只接受正向值，避免上游尾帧的显式 0 覆盖已
-	// 收到的累计值。
 	if n := intValue(usage["prompt_tokens"]); n > 0 {
-		a.inputTokens = n
+		*input = n
 	}
 
 	if n := intValue(usage["completion_tokens"]); n > 0 {
-		a.outputTokens = n
+		*output = n
 	}
 
-	// 两个计数独立更新：末帧可能只补其中一项，不能把另一项覆盖回 0。
-	if cached, cacheWrite := responsesCachedTokens(usage); cached > 0 || cacheWrite > 0 {
-		if cached > 0 {
-			a.cachedTokens = cached
+	if cacheHit, cacheTokens := responsesCachedTokens(usage); cacheHit > 0 || cacheTokens > 0 {
+		if cacheHit > 0 {
+			*cached = cacheHit
 		}
 
-		if cacheWrite > 0 {
-			a.cacheWrite = cacheWrite
+		if cacheTokens > 0 {
+			*cacheWrite = cacheTokens
 		}
 	}
 
 	if n := responsesReasoningTokens(usage); n > 0 {
-		a.reasoningTokens = n
+		*reasoning = n
 	}
 }
 
@@ -2875,6 +2894,31 @@ func (a *anthropicStreamWriter) event(name string, payload map[string]any) error
 	return nil
 }
 
+// toolCallsWithLegacy 读取 tool_calls，并把旧式 function_call（functions API）
+// 合成为单条 tool_call。
+//
+// 上游是**故意保留**这条旧路径的：internal/upstream/sse.go 聚合时会把
+// delta.function_call 写回 message.function_call，internal/server/logging.go 也把
+// 它计入「实质输出」。适配层若不翻译，Anthropic 面会出现「stop_reason=tool_use
+// 却零 tool_use 块」的回合（客户端按 stop_reason 判定后拿不到任何工具调用），
+// Responses 面则完成一个空 message。
+func toolCallsWithLegacy(raw, legacy any) []map[string]any {
+	calls := mapItems(raw)
+
+	fn, _ := legacy.(map[string]any)
+	if len(fn) == 0 {
+		return calls
+	}
+
+	return append(calls, map[string]any{
+		"index": 0,
+		"function": map[string]any{
+			"name":      stringValue(fn["name"]),
+			"arguments": stringValue(fn["arguments"]),
+		},
+	})
+}
+
 // toolCallIdentity 取工具调用的 name/id（可能只在首片出现）。
 func toolCallIdentity(call map[string]any) (name, id string) {
 	id, _ = call["id"].(string)
@@ -2892,6 +2936,23 @@ func toolCallArguments(call map[string]any) string {
 	return args
 }
 
+// floatToInt 把 JSON 数值钳制到 int 范围（NaN/Inf 视作 0）。
+func floatToInt(n float64) int {
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0
+	}
+
+	if n >= math.MaxInt64 {
+		return math.MaxInt64
+	}
+
+	if n <= math.MinInt64 {
+		return math.MinInt64
+	}
+
+	return int(n)
+}
+
 // stringValue 读取 map 里的字符串值。
 func stringValue(v any) string {
 	s, _ := v.(string)
@@ -2900,10 +2961,14 @@ func stringValue(v any) string {
 
 // intValue 读取 JSON/内部数值并转 int。内部聚合层会把 created 与模型目录字段
 // 构造成 int64，不能只认 JSON 解码的 float64。
+//
+// float64 分支必须钳制范围：JSON 允许 1e300 这类合法数字，而 Go 的超范围
+// float→int 转换是平台相关的（amd64 上取 MinInt64），上游一条荒谬 usage
+// 就会产出巨大负数的 token 计数。
 func intValue(v any) int {
 	switch n := v.(type) {
 	case float64:
-		return int(n)
+		return floatToInt(n)
 	case int:
 		return n
 	case int64:
