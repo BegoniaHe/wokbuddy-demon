@@ -3283,12 +3283,16 @@ func (f *chatFlow) retryOnceWithoutThinking(
 func (f *chatFlow) retryReasoningOnly(
 	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
 ) rotationAction {
-	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+	// 已救援过一次时不再记这次尝试：handlePreStreamEmpty 自己也写一次 recordAttempt，
+	// 两处都记会把同一次上游调用算成两次尝试（reqlib attempts 直接翻倍）。
+	if !f.reasoningRetried {
+		f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
-	if action, retried := f.retryOnceWithoutThinking(
-		ctx, acct, &f.reasoningRetried, "stream", "reasoning-only output", i,
-	); retried {
-		return action
+		if action, retried := f.retryOnceWithoutThinking(
+			ctx, acct, &f.reasoningRetried, "stream", "reasoning-only output", i,
+		); retried {
+			return action
+		}
 	}
 
 	log.Printf("WARN: [server] stream acct=%s model=%s: reasoning-only output again "+
@@ -3348,8 +3352,8 @@ func (f *chatFlow) retryNonStreamReasoningOnly(
 		return rotDone, false
 	}
 
-	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
-
+	// 已救援过一次：这条响应会原样下发，它的账由 handleNonStreamSuccess 末尾那次
+	// recordAttempt 统一写；这里再记一次会让同一次上游调用算成两次尝试。
 	if f.reasoningRetried {
 		log.Printf("WARN: [server] non-stream acct=%s model=%s: reasoning-only output again "+
 			"after thinking disabled (delivering as-is)",
@@ -3357,6 +3361,8 @@ func (f *chatFlow) retryNonStreamReasoningOnly(
 
 		return rotDone, false
 	}
+
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
 	return f.retryOnceWithoutThinking(
 		ctx, acct, &f.reasoningRetried, "non-stream", "reasoning-only output", i,
