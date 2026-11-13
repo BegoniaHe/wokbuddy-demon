@@ -319,7 +319,16 @@ func checkinReceipt(status int, raw []byte) CheckinReceipt {
 			return receipt
 		}
 
-		return checkinSuccessReceipt(raw, env.Data)
+		if receipt, ok := checkinSuccessReceipt(raw, env.Data); ok {
+			return receipt
+		}
+
+		// 2xx 但回执读不出来（空 body / 反代与 WAF 的 HTML 页 / 半截 JSON）：不能
+		// 当成新签到成功——否则会标记当日已签、面板报「签到成功」，账号实际没签。
+		return CheckinReceipt{
+			State:   CheckinStateFailed,
+			Message: fmt.Sprintf("签到回执无法解析（HTTP %d）", status),
+		}
 	}
 
 	state := checkinState(classifyCheckinResult(code, msg))
@@ -352,10 +361,16 @@ func checkinTextOnlyReceipt(msg string) (CheckinReceipt, bool) {
 
 // checkinSuccessReceipt 读成功回执：官方是平铺 {credit, streak_days, is_streak_day}；
 // 若上游把回执包在 data 信封里也照读。积分缺失只置 CreditKnown=false，不补 0。
-func checkinSuccessReceipt(raw, data json.RawMessage) CheckinReceipt {
+// 第二个返回值报告回执是否真的读成了 JSON 对象：读不成时由调用方判失败，
+// 不能当成新签到（空 body / HTML 页 / 半截 JSON 都会落到这里）。
+func checkinSuccessReceipt(raw, data json.RawMessage) (CheckinReceipt, bool) {
 	body := raw
 	if len(data) > 0 && data[0] == '{' {
 		body = data
+	}
+
+	if !strings.HasPrefix(strings.TrimSpace(string(body)), "{") {
+		return CheckinReceipt{}, false
 	}
 
 	var flat struct {
@@ -364,11 +379,11 @@ func checkinSuccessReceipt(raw, data json.RawMessage) CheckinReceipt {
 		IsStreakDay bool         `json:"is_streak_day"`
 	}
 
-	receipt := CheckinReceipt{State: CheckinStateChecked}
 	if json.Unmarshal(body, &flat) != nil {
-		return receipt
+		return CheckinReceipt{}, false
 	}
 
+	receipt := CheckinReceipt{State: CheckinStateChecked}
 	receipt.StreakDays = flat.StreakDays
 	receipt.IsStreakDay = flat.IsStreakDay
 
@@ -379,7 +394,7 @@ func checkinSuccessReceipt(raw, data json.RawMessage) CheckinReceipt {
 		}
 	}
 
-	return receipt
+	return receipt, true
 }
 
 // checkinState 把分类映射到回执状态（CheckinOK 归为 checked）。
