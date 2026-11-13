@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -163,6 +164,30 @@ func TestClassifyCheckinFailureBeatsAlready(t *testing.T) {
 
 	if got := ClassifyCheckin(&Error{Kind: ErrClient, Status: 400, Msg: `{"code":10001}`}); got != CheckinAlready {
 		t.Errorf("code=10001 应判 already, got %v", got)
+	}
+}
+
+// TestDailyCheckinReceipt429IsTransient 429「请求处理中」是瞬时态（issue #250）：
+// 回执必须带 transient error，调度器才会把账号排进 10m/40m 补签；否则当天直接漏签。
+func TestDailyCheckinReceipt429IsTransient(t *testing.T) {
+	t.Parallel()
+
+	up := testClient(func(*http.Request) (*http.Response, error) {
+		return jsonResp(http.StatusTooManyRequests, `{"code":6004,"msg":"请求处理中，请稍后再试"}`), nil
+	})
+	up.RetryDelay = time.Millisecond
+
+	got, err := up.DailyCheckinReceipt(context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"})
+	if err == nil {
+		t.Fatalf("429 应带 transient error，receipt=%+v", got)
+	}
+
+	if !IsTransientBillingErr(err) {
+		t.Errorf("429 应判瞬时（可补签）: %v", err)
+	}
+
+	if got.State != CheckinStateFailed {
+		t.Errorf("state=%q want failed", got.State)
 	}
 }
 

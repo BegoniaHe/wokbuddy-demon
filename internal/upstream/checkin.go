@@ -237,10 +237,13 @@ func (c *Client) DailyCheckinReceipt(ctx context.Context, account *auth.Auth) (C
 			return reqErr
 		}
 
-		if status >= http.StatusInternalServerError {
-			// 5xx 是瞬时态：转成 ErrServer 交给有界重试；耗尽后按失败回执收尾。
+		if status >= http.StatusInternalServerError || status == http.StatusTooManyRequests {
+			// 5xx 与 429「请求处理中」都是瞬时态（上一笔签到仍在校验，issue #250）：
+			// 转成带分类的 *Error 交给有界重试；耗尽后按失败回执收尾，失败仍带 transient
+			// error，调度器才会把它排进 10m/40m 补签而不是当天直接漏签。
+			// Kind 走 Classify：429 上的账号级终态码（14017 等）仍归 accountFault，不重试。
 			return &Error{
-				Kind: ErrServer, Status: status,
+				Kind: Classify(status, string(raw)), Status: status,
 				Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
 			}
 		}
