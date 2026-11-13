@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `79ba3d62aabf60563450fe2516feed7afc91881a`（2026-11-11）。该基线与本仓库无共同祖先，
+  `1c007bb0933d58c7b58bb01475adc534ee2a9880`（2026-11-13）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -162,6 +162,39 @@ Win32 版本未变，仍是 cn 5.9.3 / global 5.9.4）。6 项 issue、1 项 rev
 v1.20.2、`73667400` 无 `internal/proxypool`、`cf2b80f9`/`d011fc84` 是参考侧用例时区修复）；
 ④ 纯 merge 与撤销（`65e644eb` 参考 fork 撤销号池分区 → #491 的分区线索撤回，同批保留
 #490 订阅导入与 #492 额度窗口探针；`cf16478d`）。后续审计从 `79ba3d62` 之后开始。
+
+2026-11-13 续审 `79ba3d62..1c007bb0`（4 条非 merge、0 条纯 merge，均 2026-11-12；官方
+Win32 版本未变，仍是 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-fa0a0901，重跑
+`download_latest --dry-run` / `download_latest` / `protocol_sweep` 复核）。2 项 issue、2 项 skip：
+
+- **#512**（出站脱敏）：`8f9fa3c5` — 本仓 `sanitize.go:16-25` 的 `sanitizeFeatures` 没有
+  `identify yourself as` / `model_identity` 探针（`hasFingerprint` 早退，`sanitizeText:112-115`
+  规则不执行），`sanitizeRewrites:55-77` 只认陈述句身份句。上游注入的是祈使句
+  `When asked about your … identity, identify yourself as …`，经模型复述进 `reasoning_content`
+  后随历史回流。`sanitizeMessages:303-345` 覆盖 content / reasoning_content / reasoning 且不限
+  角色，故本仓不存在参考 fork 的「identity 门控挂错」问题；清洗顺序也不用改
+  （`payload.go:162` 镜像先于 `payload.go:133` 脱敏）。规则必须收紧到整句：官方
+  `app-asar/resources/templates/workbuddy-craft-design-prompt.tpl:15` 有合法的
+  「identify yourself as {{ productName }}'s Intelligent Design Assistant」，两 realm 各 2 处，
+  是误伤负例基线。注入句本身来自参考 fork 报告者 dump（线上证据，本仓未复核；两包 `model_identity`
+  0 命中与服务端注入相容）。hint 改动不采纳：本仓 global 与 CN 同走 `/billing/meter/daily-checkin`
+  （`scheduler.go:783-785`、`activity_test.go:673-708` 实测 global 签到有效），「等签到恢复」
+  在本仓不是空承诺。
+- **#511**（签到回执）：`8125831d` — `DailyCheckin`（`client.go:5330-5335`）丢弃回执体，
+  `alreadyCheckinMarkers`（`client.go:294`）无上下文匹配，`ClassifyCheckin`（`5404-5420`）
+  在结构化码未命中时回落到它，真失败文案里出现「已签到」就会被当幂等成功；panel
+  `runCheckin`（`panel.go:1023-1045`）把 already/checked 都归 `done=true`、失败文案直接
+  `err.Error()`，响应（`1062-1077`）无状态区分，前端 `AccountsView.tsx:721-733` 恒弹
+  「签到完成，积分 N」（N 是余额）。官方 `main/account.js`：`mapCheckinStatus`
+  （cn@414110 / global@414147）给 1001=already_claimed、1002=not_eligible、1003=event_ended；
+  成功回执平铺（cn@420765 / global@420802）为 `{status:Claimed, credit, streak_days, is_streak_day}`，
+  `credit` 只来自回执。
+
+2 项 `skip` 是同一功能簇：`0fadf989` 星巴克限时品牌活动（2026-11-12~16）批量读进度 + 一键领奖，
+`1c007bb0` 是其路径修正（module 段可选）。属商业化运营活动，接口只在 mp/H5 面（官方桌面包
+`/portal/activity` 0 命中），参考 fork 自己也证伪了「服务端能造任务进度」的六条路径，可自动化的
+只剩对已达标任务点领取；本仓任务中心已有 mp 口径任务与领奖，不为单一限时品牌活动新增产品面。
+后续审计从 `1c007bb0` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
@@ -383,7 +416,7 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 - 上游远端：`upstream` → `https://github.com/misakano7545/workbuddy2api-panel.git`
   （branch `main`）。首次使用执行 `git fetch --prune upstream`。
 - 审计游标（逻辑基线，位于参考 fork 历史中，非本仓库祖先）：
-  `771c887fb326b579026966d5540d5cf413b1c577`（2026-11-08 推进）。
+  `1c007bb0933d58c7b58bb01475adc534ee2a9880`（2026-11-13 推进）。
 - 正式审计前先刷新官方 Win32 包并跑 `reverse-workbuddy` 的
   `download_latest.mjs` / `protocol_sweep.mjs`；官方静态包缺失时停止审计。
 - 常用命令：
@@ -398,4 +431,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-10（参考 fork 审计基线 `592fb01a`；窗口 `771c887f..592fb01a` 共 23 项=20 非 merge + 3 纯 merge，官方 Win32 无新协议缺口；按新政策「后端上游功能尽量适配，商业化/面板技术栈/计费除外」开 6 单：#477 面板导入、#478 续写/救援、#479 号池+代理完整适配、#480 运维可观测、#481 会话粘性、#482 出站修补+配置收敛；6 条按 skip；不直接吸收）。_
+_最近更新：2026-11-13（参考 fork 审计基线 `1c007bb0`；窗口 `79ba3d62..1c007bb0` 共 4 项=4 非 merge + 0 纯 merge，官方 Win32 版本未变；新开 #511 签到回执四态、#512 上游注入身份指令脱敏，星巴克限时活动领奖 2 条按 skip；不直接吸收）。_
