@@ -175,6 +175,8 @@
       "cn": [],
       "global": []
     },
+    "media_partition": false,
+    "media_accounts": [],
     "prefer_expiring": true,
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",

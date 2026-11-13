@@ -46,7 +46,7 @@ func TestRankCandidatesTieNotStarvedByUID(t *testing.T) {
 		pool.Add(&auth.Auth{UID: uid})
 	}
 
-	cands := pool.pickCandidates(nil, "", "", pool.now(), nil)
+	cands := pool.pickCandidates(nil, "", "", false, pool.now(), nil)
 	if len(cands) != 6 {
 		t.Fatalf("candidates=%d want 6", len(cands))
 	}

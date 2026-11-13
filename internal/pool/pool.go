@@ -37,6 +37,10 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// mediaPartition / mediaUIDs 号池分区（issue #491，SetMediaPartition 注入）。
+	// 默认关闭；关闭时 partitionReason 短路，选号路径与之前逐字一致。
+	mediaPartition bool
+	mediaUIDs      map[string]bool
 	// pickGap 防并发撞号窗口（默认 minPickGap；测试可注入 0/超大值）。
 	pickGap time.Duration
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数

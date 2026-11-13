@@ -39,6 +39,14 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 	return p.pick(tried, reqModel, realm)
 }
 
+// PickExcludingForRealmMedia 在 PickExcludingForRealm 之上叠加号池分区（issue #491）：
+// media=true 时只从媒体号选，false 时只从文本号选；分区关闭时与前者完全等价。
+func (p *Pool) PickExcludingForRealmMedia(
+	tried map[string]bool, reqModel, realm string, media bool,
+) *auth.Auth {
+	return p.pickTraceWith(tried, reqModel, realm, media, nil)
+}
+
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
@@ -46,7 +54,7 @@ func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm stri
 //
 //nolint:revive // pick/Pick 为内部与公开变体，命名有意成对。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
-	return p.pickTraceWith(tried, reqModel, realm, nil)
+	return p.pickTraceWith(tried, reqModel, realm, false, nil)
 }
 
 // PickTrace 一次选号的决策快照（issue #63）：字段有界，不含凭证/提示词。
@@ -73,7 +81,7 @@ func (p *Pool) PickExcludingForRealmTrace(
 	tried map[string]bool, reqModel, realm string,
 ) (*auth.Auth, PickTrace) {
 	trace := PickTrace{Excluded: map[string]int{}}
-	acct := p.pickTraceWith(tried, reqModel, realm, &trace)
+	acct := p.pickTraceWith(tried, reqModel, realm, false, &trace)
 
 	return acct, trace
 }
@@ -81,7 +89,9 @@ func (p *Pool) PickExcludingForRealmTrace(
 // pickTraceWith 选号并收集决策链；trace=nil 时不分配排除原因 map（常规热路径）。
 //
 //nolint:funlen,maintidx // 选号/排除原因/成本层/排序线性展开。
-func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trace *PickTrace) *auth.Auth {
+func (p *Pool) pickTraceWith(
+	tried map[string]bool, reqModel, realm string, media bool, trace *PickTrace,
+) *auth.Auth {
 	var local PickTrace
 
 	collect := trace != nil
@@ -104,16 +114,16 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 	// **该层内**按账号顺序滚动——否则有序策略会把已实测收费的号排在免费号前面
 	// （PR #205 的「不改成本分层」承诺）。
 	if strategy := p.strategyForLocked(realm); strategy != StrategyWeightedRandom {
-		return p.pickOrderedPathLocked(tried, reqModel, realm, now, trace, strategy)
+		return p.pickOrderedPathLocked(tried, reqModel, realm, media, now, trace, strategy)
 	}
 
-	cands := p.pickCandidates(tried, reqModel, realm, now, trace)
+	cands := p.pickCandidates(tried, reqModel, realm, media, now, trace)
 
 	trace.Candidates = len(cands)
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
-		acct := p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
+		acct := p.pickEarliestExpiryLocked(tried, now, realm, reqModel, media)
 		if acct != nil {
 			trace.FinalUID = logfmt.UID8(acct.UID)
 		}
@@ -151,11 +161,12 @@ func (p *Pool) pickTraceWith(tried map[string]bool, reqModel, realm string, trac
 // pickOrderedPathLocked 有序策略的选号路径：收集候选 → 定成本层 → 层内按顺序选号。
 // 调用方已持有 p.mu；与加权随机共享 pickCandidates/resolveCostTier 的分层口径。
 func (p *Pool) pickOrderedPathLocked(
-	tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace, strategy Strategy,
+	tried map[string]bool, reqModel, realm string, media bool, now time.Time,
+	trace *PickTrace, strategy Strategy,
 ) *auth.Auth {
 	trace.Strategy = string(strategy)
 
-	cands := p.pickCandidates(tried, reqModel, realm, now, trace)
+	cands := p.pickCandidates(tried, reqModel, realm, media, now, trace)
 	trace.Candidates = len(cands)
 
 	if len(cands) == 0 {
@@ -198,7 +209,7 @@ func topTrace(top []*entry, model string, now time.Time, pool *Pool, maxCredits 
 // 冷却/成本台账、按模型与域判定健康、应用积分保底拦截与在途占满过滤。
 // 调用方必须已持有 p.mu 写锁。
 func (p *Pool) pickCandidates(
-	tried map[string]bool, reqModel, realm string, now time.Time, trace *PickTrace,
+	tried map[string]bool, reqModel, realm string, media bool, now time.Time, trace *PickTrace,
 ) []*entry {
 	cands := p.pickCands[:0]
 
@@ -213,7 +224,7 @@ func (p *Pool) pickCandidates(
 		entry2.pruneExpiredModelCosts(now)
 		entry2.pruneExpiredHealth(now)
 
-		if reason := p.excludeReason(entry2, reqModel, realm, now); reason != "" {
+		if reason := p.excludeReason(entry2, reqModel, realm, media, now); reason != "" {
 			trace.addExcluded(reason)
 			continue
 		}
@@ -227,9 +238,15 @@ func (p *Pool) pickCandidates(
 }
 
 // excludeReason 返回账号被排除的原因（空 = 入选）；供决策链统计。
-func (p *Pool) excludeReason(entry5 *entry, reqModel, realm string, now time.Time) string {
+func (p *Pool) excludeReason(
+	entry5 *entry, reqModel, realm string, media bool, now time.Time,
+) string {
 	if realm != "" && entry5.a.Realm() != realm {
 		return "realm"
+	}
+
+	if reason := p.partitionReason(entry5, media); reason != "" {
+		return reason
 	}
 
 	if reqModel != "" && entry5.modelCooled(now, reqModel) {
@@ -728,11 +745,13 @@ func dailyLimitHit(lim DailyLimits, dailyUsage DailyUsage) bool {
 // 这里，若兜底不看保底，触底号会被「捞回来」继续接收费模型——表现为同一条
 // floor WARN 反复刷同一个号（实测：credits=1 < floor=150 仍持续中选）。
 // 兜底是**最后一道**选号路径，保底在它之前挡不住就等于没挡。
-func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, realm, model string) *auth.Auth {
+func (p *Pool) pickEarliestExpiryLocked(
+	tried map[string]bool, now time.Time, realm, model string, media bool,
+) *auth.Auth {
 	var best *entry
 
 	for strVal, entry2 := range p.byUID {
-		if !p.fallbackEligible(entry2, strVal, tried, realm, model, now) {
+		if !p.fallbackEligible(entry2, strVal, tried, realm, model, media, now) {
 			continue
 		}
 
@@ -767,14 +786,20 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	return best.a
 }
 
-// fallbackEligible 判定账号是否可参与全冷却兜底：排除 tried/跨域/禁用暂停/
-// 有效 hard 冷却（调了必 402）/请求模型的模型级冷却/积分保底拦截/在途占满。
+// fallbackEligible 判定账号是否可参与全冷却兜底：排除 tried/跨域/号池分区/禁用
+// 暂停/有效 hard 冷却（调了必 402）/请求模型的模型级冷却/积分保底拦截/在途占满。
 // 调用方需已持 p.mu。
+//
+//nolint:cyclop,gocyclo // 准入条件按优先级线性展开，拆散会打乱「先分区、后健康」的次序。
 func (p *Pool) fallbackEligible(
-	entry2 *entry, uid string, tried map[string]bool, realm, model string, now time.Time,
+	entry2 *entry, uid string, tried map[string]bool, realm, model string, media bool, now time.Time,
 ) bool {
 	if tried != nil && tried[uid] {
 		return false
+	}
+
+	if p.partitionReason(entry2, media) != "" {
+		return false // 号池分区（issue #491）：兜底同样不跨区
 	}
 
 	if realm != "" && entry2.a.Realm() != realm {

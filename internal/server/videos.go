@@ -186,7 +186,8 @@ func (h *Handler) videoTaskModel(w http.ResponseWriter, r *http.Request) (string
 func (h *Handler) acquireVideoAccount(
 	w http.ResponseWriter, realm, bareModel string,
 ) (*auth.Auth, bool) {
-	acct := h.cfg.Pool.PickExcludingForRealm(map[string]bool{}, bareModel, realm)
+	// 号池分区（issue #491）：媒体请求只从媒体号选；分区关闭时与普通选号等价。
+	acct := h.cfg.Pool.PickExcludingForRealmMedia(map[string]bool{}, bareModel, realm, true)
 	if acct == nil {
 		writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "no_healthy_account",
 			"all accounts are temporarily unavailable, please retry later", upstream.NoHealthyAccountHint())
