@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 )
 
 const sseReasoningOnly = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}\n\n" +
@@ -236,5 +237,68 @@ func TestChatNonStreamReasoningOnlyRescued(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), "你好") {
 		t.Errorf("救援后的正文未下发: %s", rec.Body.String())
+	}
+}
+
+// TestNonStreamReasoningOnlyAttemptsOncePerCall 非流式救援用尽后原样下发，同样每次
+// 上游调用只记一次尝试（重复记账会让 reqlog 的 attempts 偏大）。
+func TestNonStreamReasoningOnlyAttemptsOncePerCall(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+
+	fake := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls.Add(1)
+
+		return http.StatusOK, sseReasoningOnly, true
+	})
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(&Config{Pool: state, Upstream: fake, RequestLog: reqLog})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	recent := reqLog.Snapshot().Recent
+	if len(recent) != 1 {
+		t.Fatalf("归档条数=%d want 1", len(recent))
+	}
+
+	if got := recent[0].Attempts; got != int(calls.Load()) {
+		t.Errorf("attempts=%d want %d（每次上游调用记一次）", got, calls.Load())
+	}
+}
+
+// TestReasoningOnlyGiveUpAttemptsOncePerCall 救援用尽回落到空流口径时，每次上游调用
+// 只记一次尝试：handlePreStreamEmpty 自己也写一次 recordAttempt，重复记会让 reqlog
+// 的 attempts 比真实上游调用数多一。
+func TestReasoningOnlyGiveUpAttemptsOncePerCall(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+
+	fake := newFakeUpstream(t, func(string) (int, string, bool) {
+		calls.Add(1)
+
+		return http.StatusOK, sseReasoningOnly, true
+	})
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(&Config{Pool: state, Upstream: fake, RequestLog: reqLog})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d want 502, body=%s", rec.Code, rec.Body.String())
+	}
+
+	recent := reqLog.Snapshot().Recent
+	if len(recent) != 1 {
+		t.Fatalf("归档条数=%d want 1", len(recent))
+	}
+
+	if got := recent[0].Attempts; got != int(calls.Load()) {
+		t.Errorf("attempts=%d want %d（每次上游调用记一次）", got, calls.Load())
 	}
 }
