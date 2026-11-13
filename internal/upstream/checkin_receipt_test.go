@@ -126,6 +126,28 @@ func TestCheckinReceiptServerErrorFallsBack(t *testing.T) {
 	}
 }
 
+// TestCheckinReceiptUnparsableSuccessBody 2xx 但回执读不出来（空 body / WAF 或反代
+// 的 HTML 页 / 半截 JSON / null）：必须判失败，不能当成新签到——否则会标记当日
+// 已签、面板报「签到成功」，账号实际没签（issue #511）。
+func TestCheckinReceiptUnparsableSuccessBody(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{"", "<html><body>blocked</body></html>", `{"credit":100`, "null", "[]"} {
+		got := checkinReceiptFromBody(200, body)
+		if got.State != CheckinStateFailed {
+			t.Errorf("body=%q state=%q want failed", body, got.State)
+		}
+
+		if got.Message == "" {
+			t.Errorf("body=%q 失败回执应带可读文案", body)
+		}
+
+		if got.CreditKnown {
+			t.Errorf("body=%q 不应带积分", body)
+		}
+	}
+}
+
 // TestClassifyCheckinFailureBeatsAlready 分类序：失败硬词压过 already 关键词。
 func TestClassifyCheckinFailureBeatsAlready(t *testing.T) {
 	t.Parallel()
