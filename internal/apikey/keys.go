@@ -185,24 +185,30 @@ func (s *Store) load() error {
 	// 上界、UTC 过期时间、IP 白名单与模型模式归一）此前只在写入路径执行，重启后
 	// 手改或旧版本写出的值会原样进入内存——例如 rpm 超过 maxPacingRate 时
 	// time.Minute/rpm 归零，限速静默消失。
+	kept := make([]Record, 0, len(file2.Keys))
+
 	for i := range file2.Keys {
 		normalized, err := NormalizeLimits(file2.Keys[i].Limits)
 		if err != nil {
-			log.Printf("WARN: [apikey] 密钥 %s 的 limits 非法（保持原值，限速/配额可能不生效）: %v",
+			// 不能「保持原值」继续用：rpm/tpm 超上界时 time.Minute/rpm 归零、
+			// 限速静默消失，与「配了限速」的预期相反。整条记录丢弃并留可操作的
+			// WARN——与非法 hash 同口径：不放一个「看起来生效、实际不生效」的密钥。
+			log.Printf("WARN: [apikey] 密钥 %s 的 limits 非法，已丢弃该记录（修正或删除后可恢复）: %v",
 				file2.Keys[i].ID, err)
 
 			continue
 		}
 
 		file2.Keys[i].Limits = normalized
+		kept = append(kept, file2.Keys[i])
 	}
 
 	s.mu.Lock()
-	s.records = file2.Keys
+	s.records = kept
 	s.rebuildKeysLocked()
 	s.mu.Unlock()
 
-	if n := len(file2.Keys); n > 0 {
+	if n := len(kept); n > 0 {
 		log.Printf("[apikey] 已恢复 %d 把命名密钥（%s）", n, s.path)
 	}
 

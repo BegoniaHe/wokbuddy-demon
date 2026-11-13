@@ -1172,7 +1172,7 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 
 // restoreMaskedProxySecrets 把面板回显的掩码代理项还原成配置文件里的原文。
 //
-// 比对口径必须与回显完全一致（maskProxyEntry / maskProxySubURL），否则「没改动」
+// 比对口径必须与回显完全一致（panel.MaskProxyEntry / panel.MaskProxySubURL），否则「没改动」
 // 会被判成「改成了掩码值」而丢掉凭据。
 func restoreMaskedProxySecrets(incoming, current map[string]any) {
 	inUpstream, ok := incoming["upstream"].(map[string]any)
@@ -1185,8 +1185,8 @@ func restoreMaskedProxySecrets(incoming, current map[string]any) {
 		return
 	}
 
-	restoreMaskedProxyList(inUpstream, curUpstream, "proxies", maskProxyEntry)
-	restoreMaskedProxyList(inUpstream, curUpstream, "proxy_subscriptions", maskProxySubURL)
+	restoreMaskedProxyList(inUpstream, curUpstream, "proxies", panel.MaskProxyEntry)
+	restoreMaskedProxyList(inUpstream, curUpstream, "proxy_subscriptions", panel.MaskProxySubURL)
 
 	restoreMaskedProxySlots(inUpstream, curUpstream)
 }
@@ -1260,7 +1260,7 @@ func restoreMaskedProxySlots(inUpstream, curUpstream map[string]any) {
 		submitted, _ := slot["url"].(string)
 
 		existing, seen := byID[id]
-		if seen && submitted == maskProxyEntry(existing) {
+		if seen && submitted == panel.MaskProxyEntry(existing) {
 			slot["url"] = existing
 		}
 	}

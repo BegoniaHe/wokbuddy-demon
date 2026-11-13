@@ -343,7 +343,10 @@ type archiveWriter struct {
 	dropped   atomic.Uint64
 	// closed 写者已退出：此后入队的事件既不会被写入也无法计入「阻塞丢弃」，
 	// 单独计数（停机窗口内的最后一批归档不能静默消失）。
-	closed    atomic.Bool
+	closed atomic.Bool
+	// failed 构造失败（目录不可用 / logrotate.New 报错）：与「用户主动关闭归档」
+	// 区分开，只有前者才该计入 dropped。
+	failed    atomic.Bool
 	lastErrMu sync.Mutex
 	lastErr   string
 
@@ -388,9 +391,7 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 		RetentionDays: cfg.RetentionDays,
 	})
 	if err != nil {
-		w.setErr(err)
-		w.cfg.Enabled = false
-		close(w.done)
+		w.fail(err)
 
 		return w
 	}
@@ -400,6 +401,15 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 	go w.run()
 
 	return w
+}
+
+// fail 记录构造失败并关停写者：failed 置位让后续入队计入 dropped（与「配置主动
+// 关闭归档」区分——关闭本来就不写盘，计 dropped 会被误读成持续丢盘）。
+func (w *archiveWriter) fail(err error) {
+	w.setErr(err)
+	w.cfg.Enabled = false
+	w.failed.Store(true)
+	close(w.done)
 }
 
 func (w *archiveWriter) enabled() bool {
@@ -412,10 +422,9 @@ func (w *archiveWriter) enqueue(event *Event) {
 	}
 
 	if !w.enabled() {
-		// 构造失败（logrotate.New 报错 / 目录不可用）时 cfg.Enabled 被置 false，
-		// 此后每条事件都在这里静默返回。计入 dropped，否则面板只能看到
-		// enabled=false + dropped_writes=0，无法判断到底丢了多少条。
-		if w.cfg.Enabled || w.cfg.Dir != "" {
+		// 只有构造失败才算「丢」：归档被配置主动关闭时本来就不写盘，计入 dropped
+		// 会让面板把「关闭」误报成持续丢盘。
+		if w.failed.Load() {
 			w.dropped.Add(1)
 		}
 

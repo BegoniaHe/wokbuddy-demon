@@ -533,3 +533,18 @@ func TestRecentRingBufferOrder(t *testing.T) {
 		want--
 	}
 }
+
+// TestArchiveDisabledDoesNotCountDropped 归档被配置主动关闭时本来就不写盘：
+// 计入 dropped 会让面板把「关闭」误报成持续丢盘（构造失败的计数语义不变）。
+func TestArchiveDisabledDoesNotCountDropped(t *testing.T) {
+	t.Parallel()
+
+	r := New(Config{Dir: t.TempDir(), Enabled: false})
+	t.Cleanup(r.Close)
+
+	r.Record(&Event{RequestID: "kept", Model: "m"})
+
+	if got := r.Snapshot().Archive.DroppedWrites; got != 0 {
+		t.Fatalf("dropped=%d want 0（归档关闭不是丢盘）", got)
+	}
+}

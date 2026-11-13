@@ -29,18 +29,31 @@ var redactedConfigPaths = [][]string{
 	{"notify", "webhook_url"},
 }
 
-// maskProxyURL 只保留 scheme://host[:port]：userinfo、路径、query 全部丢弃。
+// MaskProxyEntry 单个代理条目的打码口径：只留 scheme://host[:port]，userinfo、
+// 路径、query 全部丢弃；无法解析时返回固定占位串。
 //
-// 代理 URL 按协议支持 user:pass（outbound.ParseProxy 专门解析 url.User），订阅
-// URL 则常把 token 放在 path/query 里。与 outbound.Proxy.Masked 同一口径。
-func maskProxyURL(raw string) string {
+// 面板回显与保存侧还原（cmd/server 的 restoreMaskedProxySecrets）必须用同一实现：
+// 口径不一致时「没改动」会被判成「改成了掩码值」，把掩码字面量写进配置，代理凭据
+// 一次保存就被抹空。四段式 host:port:user:pass 走不了 url.Parse，两侧都落到占位串。
+func MaskProxyEntry(raw string) string {
 	parsed, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || parsed.Scheme == "" {
-		return "[masked]"
+		return "[unparsable proxy entry]"
 	}
 
 	if parsed.Host == "" {
 		return parsed.Scheme + "://"
+	}
+
+	return parsed.Scheme + "://" + parsed.Host
+}
+
+// MaskProxySubURL 订阅 URL 的打码口径：只留 scheme://host（host 缺失即视为非法，
+// 订阅 URL 没有 host 就无从请求）。同样必须与保存侧还原口径一致。
+func MaskProxySubURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "[invalid proxy subscription url]"
 	}
 
 	return parsed.Scheme + "://" + parsed.Host
@@ -57,13 +70,13 @@ func redactProxyFields(doc map[string]any) {
 		return
 	}
 
-	redactProxyStringList(upstream, "proxies")
-	redactProxyStringList(upstream, "proxy_subscriptions")
+	redactProxyStringList(upstream, "proxies", MaskProxyEntry)
+	redactProxyStringList(upstream, "proxy_subscriptions", MaskProxySubURL)
 	redactProxySlotURLs(upstream)
 }
 
 // redactProxyStringList 把 upstream[key] 里的每个字符串换成掩码形态。
-func redactProxyStringList(upstream map[string]any, key string) {
+func redactProxyStringList(upstream map[string]any, key string, mask func(string) string) {
 	list, isList := upstream[key].([]any)
 	if !isList {
 		return
@@ -71,7 +84,7 @@ func redactProxyStringList(upstream map[string]any, key string) {
 
 	for i, item := range list {
 		if raw, isStr := item.(string); isStr {
-			list[i] = maskProxyURL(raw)
+			list[i] = mask(raw)
 		}
 	}
 }
@@ -86,7 +99,7 @@ func redactProxySlotURLs(upstream map[string]any) {
 	for _, item := range slots {
 		if slot, isMap := item.(map[string]any); isMap {
 			if raw, isStr := slot["url"].(string); isStr {
-				slot["url"] = maskProxyURL(raw)
+				slot["url"] = MaskProxyEntry(raw)
 			}
 		}
 	}

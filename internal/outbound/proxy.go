@@ -60,6 +60,9 @@ var (
 	errProxyHost             = errors.New("proxy 地址缺少 host")
 	errDialFailed            = errors.New("dial failed")
 	errDialHTTPConnectFailed = errors.New("dialHTTPConnect failed")
+	// errProxyAuthRequired 代理自身拒绝鉴权（CONNECT 407/401）：凭据问题，不是
+	// 目标域不可达，必须冷却整条出口，否则错误口令的代理会被无限重试。
+	errProxyAuthRequired     = errors.New("proxy authentication required")
 	errSocks5                = errors.New("socks5: 版本不符")
 	errSocks52               = errors.New("socks5: 无可接受认证方式")
 	errSocks5NegotiateFailed = errors.New("socks5Negotiate failed")
@@ -295,6 +298,17 @@ func endHandshake(clearDeadline, stop func(), ok bool) {
 }
 
 // dialHTTPConnect 经 HTTP/HTTPS 代理的 CONNECT 隧道建立连接。
+// connectStatusError 把 CONNECT 非 200 分类：代理自身鉴权拒绝（407/401）标记成
+// 出口故障，其余仍按「目标侧拒绝」处置（可达但到不了该上游域）。
+func connectStatusError(addr string, code int, status string) error {
+	if code == http.StatusProxyAuthRequired || code == http.StatusUnauthorized {
+		return fmt.Errorf("proxy CONNECT %s: %s: %w: %w", addr, status,
+			errDialHTTPConnectFailed, errProxyAuthRequired)
+	}
+
+	return fmt.Errorf("proxy CONNECT %s: %s: %w", addr, status, errDialHTTPConnectFailed)
+}
+
 func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, error) {
 	conn, err := p.dialer().DialContext(ctx, "tcp", p.addr)
 	if err != nil {
@@ -332,6 +346,7 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 	}
 
 	reader := bufio.NewReader(conn)
+
 	// CONNECT 的 200 响应无 body；不读 resp.Body（它即隧道本体），仅取状态码。
 	//nolint:bodyclose // CONNECT 200 的 resp.Body 即隧道本体，不可关闭
 	resp, err := http.ReadResponse(reader, &http.Request{Method: http.MethodConnect})
@@ -342,7 +357,8 @@ func (p *Proxy) dialHTTPConnect(ctx context.Context, addr string) (net.Conn, err
 
 	if resp.StatusCode != http.StatusOK {
 		conn.Close()
-		return nil, fmt.Errorf("proxy CONNECT %s: %s: %w", addr, resp.Status, errDialHTTPConnectFailed)
+
+		return nil, connectStatusError(addr, resp.StatusCode, resp.Status)
 	}
 	// 握手成功：清掉一次性 deadline（长流从此只受上游 idle/写 deadline 约束），
 	// 并显式停 watcher（defer 的 endHandshake(…, false) 不会重复清 deadline）。

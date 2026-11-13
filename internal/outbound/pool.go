@@ -218,14 +218,15 @@ func (pool *Pool) dialProxy(
 // noteDialFailure 按失败来源更新健康记账：调用方取消/超时不算代理不健康。
 //
 // 目标侧拒绝（CONNECT 非 200）说明代理本身可达，只是到不了这个上游域：记错误文本
-// 但不计失败。否则单域故障会冷却整条出口、连累所有账号。
+// 但不计失败。否则单域故障会冷却整条出口、连累所有账号。代理自身的鉴权拒绝
+// （407/401）例外：那是凭据问题，冷却出口才能停止无限重试。
 func (pool *Pool) noteDialFailure(ctx context.Context, state *proxyState, now time.Time, err error) {
 	if ctx.Err() != nil {
 		return
 	}
 
 	reason := state.proxy.redact(err.Error(), healthErrLimit)
-	if errors.Is(err, errDialHTTPConnectFailed) {
+	if errors.Is(err, errDialHTTPConnectFailed) && !errors.Is(err, errProxyAuthRequired) {
 		pool.recordTargetError(state, now, reason)
 
 		return

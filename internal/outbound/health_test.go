@@ -5,6 +5,8 @@
 package outbound
 
 import (
+	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -130,5 +132,23 @@ func TestTargetErrorDoesNotExtendFailureDecay(t *testing.T) {
 
 	if got := state.cooldownTill.Sub(now); got != proxyCooldownBase {
 		t.Fatalf("冷却=%v want %v（不按历史失败数指数放大）", got, proxyCooldownBase)
+	}
+}
+
+// TestProxyAuthErrorTripsCooldown 代理自身拒绝鉴权（CONNECT 407/401）不是目标侧
+// 故障：不冷却出口就会拿着错误凭据无限重试。
+func TestProxyAuthErrorTripsCooldown(t *testing.T) {
+	t.Parallel()
+
+	pool := newHealthPool(t)
+	state := pool.states[0]
+
+	err := fmt.Errorf("proxy CONNECT api.example: 407 Proxy Authentication Required: %w: %w",
+		errDialHTTPConnectFailed, errProxyAuthRequired)
+
+	pool.noteDialFailure(context.Background(), state, time.Now(), err)
+
+	if state.failures == 0 {
+		t.Fatal("failures=0（代理鉴权失败必须计入出口健康）")
 	}
 }

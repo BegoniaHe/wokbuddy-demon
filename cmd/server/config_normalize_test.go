@@ -4,7 +4,11 @@
 //   - mergeConfigMaps 忽略分段对象的 null（否则整段静默回落默认值并落盘）。
 package main
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
+)
 
 // TestNormalizeListenOnlyAddsColonToBarePort 只有纯数字 listen 补冒号；
 // 带 host 但漏端口的值原样交给 net.Listen 报「unknown port」，不伪造 ":" 前缀。
@@ -93,10 +97,10 @@ func TestRestoreMaskedProxySecrets(t *testing.T) {
 
 	incoming := map[string]any{
 		"upstream": map[string]any{
-			"proxies":             []any{maskProxyEntry("socks5://alice:s3cret@10.0.0.1:1080")},
-			"proxy_subscriptions": []any{maskProxySubURL("https://sub.example/api?token=tok")},
+			"proxies":             []any{panel.MaskProxyEntry("socks5://alice:s3cret@10.0.0.1:1080")},
+			"proxy_subscriptions": []any{panel.MaskProxySubURL("https://sub.example/api?token=tok")},
 			"proxy_slots": []any{
-				map[string]any{"id": "cn", "url": maskProxyEntry("http://bob:hunter2@10.0.0.2:8080")},
+				map[string]any{"id": "cn", "url": panel.MaskProxyEntry("http://bob:hunter2@10.0.0.2:8080")},
 			},
 		},
 	}
@@ -115,5 +119,33 @@ func TestRestoreMaskedProxySecrets(t *testing.T) {
 	slot := upstream["proxy_slots"].([]any)[0].(map[string]any)
 	if got := slot["url"]; got != "http://bob:hunter2@10.0.0.2:8080" {
 		t.Errorf("槽 url 未还原: %v", got)
+	}
+}
+
+// TestMaskProxyRoundTrip 回显口径与还原口径必须完全一致：面板回显用的
+// panel.MaskProxyEntry 就是还原时比对的掩码，任何一侧单独改动都会让「没改动」
+// 变成「写回掩码字面量」，代理凭据一次保存就被抹空。
+func TestMaskProxyRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	raws := []string{
+		"socks5://alice:s3cret@10.0.0.1:1080",
+		"1.2.3.4:1080:user:pass", // 四段式：url.Parse 报错，两侧都落到占位串
+		"not a url",
+		"http://",
+	}
+
+	for _, raw := range raws {
+		current := map[string]any{"upstream": map[string]any{"proxies": []any{raw}}}
+		incoming := map[string]any{"upstream": map[string]any{
+			"proxies": []any{panel.MaskProxyEntry(raw)},
+		}}
+
+		restoreMaskedProxySecrets(incoming, current)
+
+		got := incoming["upstream"].(map[string]any)["proxies"].([]any)[0]
+		if got != raw {
+			t.Errorf("raw=%q 还原成 %v（掩码口径不一致，字面量会被写进配置）", raw, got)
+		}
 	}
 }

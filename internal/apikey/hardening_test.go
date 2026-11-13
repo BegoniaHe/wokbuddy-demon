@@ -140,3 +140,31 @@ func TestLoadNormalizesLimits(t *testing.T) {
 		t.Fatalf("expires_at=%v want UTC 归一化", exp)
 	}
 }
+
+// TestLoadDropsInvalidLimitsRecord limits 非法（例如 rpm 超过上界会让时间间隔
+// 归零、限速静默失效）的记录不能继续生效：与非法 hash 同口径整条丢弃，合法记录
+// 照常加载。
+func TestLoadDropsInvalidLimitsRecord(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "api_keys.json")
+	raw := []byte(`{"version":1,"keys":[` +
+		`{"id":"bad","name":"n","hash":"` + strings.Repeat("ab", 32) + `","limits":{"rpm":60000001}},` +
+		`{"id":"good","name":"n","hash":"` + strings.Repeat("cd", 32) + `","limits":{"rpm":60}}]}`)
+
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := New(path)
+	if store.loadErr != nil {
+		t.Fatalf("loadErr=%v", store.loadErr)
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if len(store.records) != 1 || store.records[0].ID != "good" {
+		t.Fatalf("records=%+v want 仅 good", store.records)
+	}
+}
