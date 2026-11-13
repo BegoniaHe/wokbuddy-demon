@@ -1560,6 +1560,9 @@ type chatFlow struct {
 	busyWaited bool
 	// zeroRetried 是否已因「length + 零输出」关闭思考重发过（只重发一次，issue #244）。
 	zeroRetried bool
+	// reasoningRetried 是否已因「只有思维链、没有正文」关闭思考重发过（只重发一次，
+	// issue #494）。与 zeroRetried 分开记账：两种形态各自值得一次救援。
+	reasoningRetried bool
 	// nonstreamContinued 非流式截断续写是否已执行（只续写一次，issue #247）。
 	nonstreamContinued bool
 
@@ -3173,6 +3176,8 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 }
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
+//
+//nolint:maintidx // 收尾顺序即语义（预览否决 → 挂续写层 → 透传 → 记账 → 观测）。
 func (f *chatFlow) handleStreamSuccess(
 	ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int,
 ) rotationAction {
@@ -3203,6 +3208,12 @@ func (f *chatFlow) handleStreamSuccess(
 		cont = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
 			return f.continueUpstream(ctx, acct, partial)
 		})
+		// 长文续接（issue #494）：客户端把输出上限要到 32k+ 时，stopped 的长文也按
+		// 可续写处理；短答 stop 由响应侧门槛挡掉（见 longFormContinuationMinChars）。
+		if f.longFormRequested() {
+			cont.ContinueOnStop(longFormContinuationMinChars)
+		}
+
 		stream = cont
 		// 惰性 defer：Release 自带 nil 判定，normal 路径与提前返回路径都不会漏还。
 		defer cont.Release()
@@ -3272,6 +3283,44 @@ func (f *chatFlow) warnStopWithoutToolCalls(finishReason string) {
 		f.st.mode, logfmt.Label(f.st.uid, f.st.nick), f.bareModel, f.st.toolsDeclared)
 }
 
+// retryOnceWithoutThinking 关思考同额度重发一次：返回 true 表示已重发（调用方直接
+// 返回该动作），false 表示本次请求同类形态已经救援过，由调用方自行收尾。
+// 救援不是账号故障：调用方只记一次零用量尝试，不 NoteFailures、不冷却。
+func (f *chatFlow) retryOnceWithoutThinking(
+	ctx context.Context, acct *auth.Auth, retried *bool, mode, reason string, i int,
+) (rotationAction, bool) {
+	if *retried {
+		return rotDone, false
+	}
+
+	*retried = true
+	f.body = upstream.DisableThinking(f.body)
+	log.Printf("INFO: [server] %s acct=%s model=%s: %s, retrying once with thinking disabled",
+		mode, logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, reason)
+
+	return f.dispatch(ctx, acct, i), true
+}
+
+// retryReasoningOnly 处置「只思考、没正文」的零输出流（issue #494）：关思考、同额度
+// 重发一次；仍只有思维链才回落到既有空流口径（换号 → 轮转耗尽 502）。
+func (f *chatFlow) retryReasoningOnly(
+	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
+) rotationAction {
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	if action, retried := f.retryOnceWithoutThinking(
+		ctx, acct, &f.reasoningRetried, "stream", "reasoning-only output", i,
+	); retried {
+		return action
+	}
+
+	log.Printf("WARN: [server] stream acct=%s model=%s: reasoning-only output again "+
+		"after thinking disabled (rotating)",
+		logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+	return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i)
+}
+
 // retryZeroOutputLength 处理 finish_reason=length 且零输出：同额度关闭 thinking
 // 重发一次；仍零输出返回 502 zero_output_length，不罚号、不冷却（issue #244）。
 func (f *chatFlow) retryZeroOutputLength(
@@ -3279,14 +3328,10 @@ func (f *chatFlow) retryZeroOutputLength(
 ) rotationAction {
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
-	if !f.zeroRetried {
-		f.zeroRetried = true
-		f.body = upstream.DisableThinking(f.body)
-		log.Printf("INFO: [server] stream acct=%s model=%s: length with zero output, "+
-			"retrying once with thinking disabled",
-			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
-
-		return f.dispatch(ctx, acct, i)
+	if action, retried := f.retryOnceWithoutThinking(
+		ctx, acct, &f.zeroRetried, "stream", "length with zero output", i,
+	); retried {
+		return action
 	}
 
 	f.zeroOutputLengthError(true)
@@ -3305,19 +3350,40 @@ func (f *chatFlow) retryNonStreamZeroOutput(
 
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 
-	if !f.zeroRetried {
-		f.zeroRetried = true
-		f.body = upstream.DisableThinking(f.body)
-		log.Printf("INFO: [server] non-stream acct=%s model=%s: length with zero output, "+
-			"retrying once with thinking disabled",
-			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
-
-		return f.dispatch(ctx, acct, i), true
+	if action, retried := f.retryOnceWithoutThinking(
+		ctx, acct, &f.zeroRetried, "non-stream", "length with zero output", i,
+	); retried {
+		return action, true
 	}
 
 	f.zeroOutputLengthError(false)
 
 	return rotDone, true
+}
+
+// retryNonStreamReasoningOnly 非流式「只有思维链、没有正文」（issue #494）：
+// 关思考重发一次。仍只有思维链时保持既有行为原样下发——非流式此前没有 502 错误面，
+// 这里不新造一个；流式侧才回落到空流口径（见 retryReasoningOnly）。
+func (f *chatFlow) retryNonStreamReasoningOnly(
+	ctx context.Context, acct *auth.Auth, resp map[string]any, attemptStarted time.Time, i int,
+) (rotationAction, bool) {
+	if f.aggregateShape(resp) != shapeReasoningOnly {
+		return rotDone, false
+	}
+
+	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
+
+	if f.reasoningRetried {
+		log.Printf("WARN: [server] non-stream acct=%s model=%s: reasoning-only output again "+
+			"after thinking disabled (delivering as-is)",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+
+		return rotDone, false
+	}
+
+	return f.retryOnceWithoutThinking(
+		ctx, acct, &f.reasoningRetried, "non-stream", "reasoning-only output", i,
+	)
 }
 
 // zeroOutputLengthResponse 报告聚合响应是否为 finish_reason=length 且无正文/
@@ -3433,6 +3499,11 @@ func (f *chatFlow) probeVeto(
 		return f.handlePreStreamErrorFrame(ctx, acct, probe, attemptStarted, i), true
 	case probe.Empty:
 		rc.Close()
+
+		// 只有思维链没有正文（issue #494）：先关思考同额度重发一次，别急着换号。
+		if streamShape(probe) == shapeReasoningOnly {
+			return f.retryReasoningOnly(ctx, acct, attemptStarted, i), true
+		}
 
 		return f.handlePreStreamEmpty(ctx, acct, attemptStarted, i), true
 	default:
@@ -3666,6 +3737,10 @@ func (f *chatFlow) handleNonStreamSuccess(
 		return action
 	}
 
+	if action, handled := f.retryNonStreamReasoningOnly(ctx, acct, resp, attemptStarted, i); handled {
+		return action
+	}
+
 	resp = f.continueNonStream(ctx, acct, resp)
 
 	// 标记修复（非流式）：把正文里的原生工具调用标记还原成 message.tool_calls。
@@ -3725,8 +3800,8 @@ func (f *chatFlow) handleNonStreamSuccess(
 	return rotDone
 }
 
-// continueNonStream 非流式 finish_reason=length 且有正文时续写一次，把第二段
-// 正文拼进同一响应（issue #247）。工具调用不续写；失败保留首段 length 终态。
+// continueNonStream 非流式 finish_reason=length（或长文请求的 stop）且有正文时续写
+// 一次，把第二段正文拼进同一响应（issue #247 / #494）。工具调用不续写；失败保留首段终态。
 func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp map[string]any) map[string]any {
 	if f.nonstreamContinued || len(resp) == 0 {
 		return resp
@@ -3742,7 +3817,7 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		return resp
 	}
 
-	if fr, _ := choice["finish_reason"].(string); fr != "length" {
+	if !f.nonStreamContinueWanted(resp, choice) {
 		return resp
 	}
 

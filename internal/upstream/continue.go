@@ -17,6 +17,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // ContinueOpener 发起一次续写请求；partial 是已输出的正文。
@@ -35,7 +36,13 @@ type TextContinueReader struct {
 	firstMdl   string
 	firstUsage map[string]any
 
-	finishLength  bool
+	finishLength bool
+	// stopTriggers 把 finish_reason=stop 也当作可续写终态（长文续接，见 ContinueOnStop）。
+	stopTriggers bool
+	// stopMinChars stop 触发续写所需的已输出字符数（短答不续写）。
+	stopMinChars int
+	// finishStop 本次终态是 stop（且已开启 stopTriggers）：与 finishLength 同处置。
+	finishStop    bool
 	continueTried bool
 	continued     bool
 	continuation  bool
@@ -90,6 +97,18 @@ func NewTextContinueReader(
 	r.text.WriteString(initialText)
 
 	return r
+}
+
+// ContinueOnStop 让 finish_reason=stop 也触发一次续写（issue #494 长文续接）。
+// 只在调用方已判定「客户端要的是长文」时开启；minChars 是响应侧门槛——已写出成篇
+// 内容却停在 stop 才续写，短答 stop 仍按原样下发。
+func (c *TextContinueReader) ContinueOnStop(minChars int) *TextContinueReader {
+	if c != nil {
+		c.stopTriggers = true
+		c.stopMinChars = minChars
+	}
+
+	return c
 }
 
 // Release 归还行缓冲（幂等）。只能在整个流确实读完之后调用：调用方在 Stream
@@ -200,7 +219,7 @@ func (c *TextContinueReader) handleLine(line string) {
 // handleDone 处理 [DONE]：首段因 length 截断且尚未续写时，先换流续写并吞掉本行；
 // 否则原行透传。
 func (c *TextContinueReader) handleDone(line string) {
-	if c.finishLength && !c.continued && c.tryContinue() {
+	if c.continueTriggered() && !c.continued && c.tryContinue() {
 		return
 	}
 
@@ -225,7 +244,7 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 
 	c.inspectFrame(frame)
 
-	if c.finishLength && !c.continued {
+	if c.continueTriggered() && !c.continued {
 		c.holdLengthFrame(line, frame)
 
 		return
@@ -407,8 +426,15 @@ func (c *TextContinueReader) inspectFrame(frame map[string]any) {
 	}
 
 	walkChoiceDeltas(frame, func(fr string) {
-		if fr == "length" {
+		switch fr {
+		case "length":
 			c.finishLength = true
+		case "stop":
+			// 长文续接：客户端把输出上限要到 32k 以上时，stop 不再当作「用户只要
+			// 这么短」（issue #494）。未开启时保持既有行为。
+			if c.stopTriggers {
+				c.finishStop = true
+			}
 		}
 	}, c.inspectDelta)
 }
@@ -493,9 +519,14 @@ func (c *TextContinueReader) rewriteContinuationFrame(frame map[string]any) {
 	}
 }
 
-// handleEOF 流结束：有暂存 length 时尝试续写；否则收尾。
+// continueTriggered 报告本次终态是否已判定为可续写（length，或开启后的 stop）。
+func (c *TextContinueReader) continueTriggered() bool {
+	return c.finishLength || c.finishStop
+}
+
+// handleEOF 流结束：有暂存终态时尝试续写；否则收尾。
 func (c *TextContinueReader) handleEOF() {
-	if c.finishLength && !c.continued {
+	if c.continueTriggered() && !c.continued {
 		if c.tryContinue() {
 			return
 		}
@@ -526,6 +557,13 @@ func (c *TextContinueReader) tryContinue() bool {
 		return false
 	}
 
+	// 只因 stop 触发时（非 length 截断）还要求已输出成篇内容：短答是正常收尾。
+	if c.finishStop && !c.finishLength && utf8.RuneCountInString(c.text.String()) < c.stopMinChars {
+		c.flushHeld()
+
+		return false
+	}
+
 	next, err := c.open(c.text.String())
 	if err != nil || next == nil {
 		c.flushHeld()
@@ -543,6 +581,7 @@ func (c *TextContinueReader) tryContinue() bool {
 	c.continued = true
 	c.continuation = true
 	c.finishLength = false
+	c.finishStop = false
 	c.held = nil
 
 	return true

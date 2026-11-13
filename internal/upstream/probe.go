@@ -27,6 +27,9 @@ type StreamProbe struct {
 	ZeroOutputLength bool
 	// Empty 流在出现实质输出前结束（空流/只有思考/只有 [DONE]）。
 	Empty bool
+	// SawReasoning 预览阶段是否出现思维链（reasoning_content / reasoning）。
+	// 与 Empty 同时成立即「只思考没正文」，由 handler 关思考重发一次（issue #494）。
+	SawReasoning bool
 	// FinishReason 预览到的非空 finish_reason（零输出判定用）。
 	FinishReason string
 	// Text 预览阶段累计的正文（续写起点）。
@@ -238,6 +241,13 @@ func (p *StreamProbe) inspectDelta(delta map[string]any) {
 
 	if refusal, ok := delta["refusal"].(string); ok && refusal != "" {
 		p.Text += refusal
+	}
+
+	// 思维链不算实质输出（Empty 判据不变），但决定「零输出」是否值得关思考重发一次。
+	for _, key := range []string{"reasoning_content", "reasoning"} {
+		if reasoning, ok := delta[key].(string); ok && reasoning != "" {
+			p.SawReasoning = true
+		}
 	}
 
 	if tools, ok := delta["tool_calls"].([]any); ok && len(tools) > 0 {
