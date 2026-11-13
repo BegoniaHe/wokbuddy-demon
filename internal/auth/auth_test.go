@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"os"
@@ -500,5 +501,217 @@ func TestBackfillRealmForTrimsRealm(t *testing.T) {
 
 	if got := account.RealmStored(); got != "global" {
 		t.Fatalf("RealmStored=%q want global", got)
+	}
+}
+
+// SaveAtomic 必须保留文件里本包未建模的键：插件与桌面端会额外写
+// account.email、token_source 等，从零重建文档会让第一次 token 刷新把它们全抹掉
+// （account.email 被抹掉后 desktopcred 的昵称回退随即失效）。
+func TestSaveAtomicPreservesUnknownKeys(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "workbuddy-u1.json")
+
+	original := `{
+  "auth": {"accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 100, "domain": "x.cn", "realm": "cn", "tokenSource": "oauth"},
+  "account": {"uid": "u1", "enterpriseId": "", "nickname": "甲", "email": "a@b.c"},
+  "device_token": "dt",
+  "openId": "12345678901234567890"
+}`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	account, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	account.FilePath = path
+	account.AccessToken = "at-new"
+
+	if err := account.SaveAtomic(); err != nil {
+		t.Fatalf("SaveAtomic: %v", err)
+	}
+
+	saved, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read back: %v", readErr)
+	}
+
+	for _, want := range []string{`"email": "a@b.c"`, `"tokenSource": "oauth"`, `"openId": "12345678901234567890"`} {
+		if !strings.Contains(string(saved), want) {
+			t.Fatalf("写回丢失未建模键 %s:\n%s", want, saved)
+		}
+	}
+
+	if !strings.Contains(string(saved), `"accessToken": "at-new"`) {
+		t.Fatalf("写回未更新 accessToken:\n%s", saved)
+	}
+}
+
+// 扁平形写回统一落成嵌套形，原顶层未建模键一并保留。
+func TestSaveAtomicPreservesFlatUnknownKeys(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "workbuddy-u2.json")
+
+	original := `{"accessToken":"at-old","uid":"u2","realm":"global","nickname":"乙","expiresIn":3600}`
+	if err := os.WriteFile(path, []byte(original), 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	account, err := Parse([]byte(original))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	account.FilePath = path
+	account.AccessToken = "at-new"
+
+	if err := account.SaveAtomic(); err != nil {
+		t.Fatalf("SaveAtomic: %v", err)
+	}
+
+	saved, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("read back: %v", readErr)
+	}
+
+	if !strings.Contains(string(saved), `"expiresIn": 3600`) {
+		t.Fatalf("扁平形未建模键丢失:\n%s", saved)
+	}
+
+	var doc map[string]any
+	if err := json.Unmarshal(saved, &doc); err != nil {
+		t.Fatalf("写回不是合法 JSON: %v", err)
+	}
+
+	if _, nested := doc["auth"]; !nested {
+		t.Fatalf("写回应为嵌套形: %s", saved)
+	}
+}
+
+// TestResolveRealmNormalizesExplicit 显式 realm 必须归一化（大小写/空格）并校验：
+// 原样返回会让 realmLocked 精确比较失配、回落 domain 推断，无 domain 时把 global
+// 凭证判成 cn 并按 cn 头族发出（凭据送错域）。非法值按未指定处理。
+func TestResolveRealmNormalizesExplicit(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		explicit string
+		domain   string
+		want     string
+	}{
+		{"大写归一", "Global", "", "global"},
+		{"尾随空格", "global ", "", "global"},
+		{"前后空格大写", "  CN  ", "", "cn"},
+		{"非法值回落 domain", "eu", "codebuddy.ai", "global"},
+		{"非法值无 domain", "eu", "", "cn"},
+		{"空值按 domain", "", "workbuddy.ai", "global"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := ResolveRealm(c.explicit, c.domain); got != c.want {
+				t.Fatalf("ResolveRealm(%q, %q)=%q want %q", c.explicit, c.domain, got, c.want)
+			}
+		})
+	}
+}
+
+// TestParseLenientIdentityFields 身份类字段类型不符不再让整份凭据解析失败：
+// 插件/手写文件写成数字或布尔时，账号此前会静默从池里消失（只有一行 WARN）。
+func TestParseLenientIdentityFields(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"auth": {"accessToken": "at", "refreshToken": "rt", "expiresAt": "1760000000", "realm": "Global"},
+		"account": {"uid": 12345, "type": 3, "nickname": true}
+	}`)
+
+	account, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	if account.UID != "12345" {
+		t.Errorf("uid=%q want 12345（数字按字面量取）", account.UID)
+	}
+
+	if account.ExpiresAt != 1760000000 {
+		t.Errorf("expiresAt=%d want 1760000000（数字字符串也要认）", account.ExpiresAt)
+	}
+
+	if got := account.Realm(); got != "global" {
+		t.Errorf("realm=%q want global（显式 realm 必须归一化）", got)
+	}
+}
+
+// TestParseRejectsNonStringToken 令牌字段类型不对时必须报错并带键名：
+// 宽松转换会把数字/对象变成垃圾令牌，直到 401 才暴露。
+func TestParseRejectsNonStringToken(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse([]byte(`{"accessToken": 123, "uid": "u1"}`))
+	if err == nil {
+		t.Fatal("数值 accessToken 应解析失败")
+	}
+
+	if !strings.Contains(err.Error(), "accessToken") {
+		t.Fatalf("err=%v want 含键名 accessToken", err)
+	}
+}
+
+// TestParseRequiresUID 缺 uid 的文件必须在加载期被拒：池按 UID 建索引，两个缺
+// uid 的文件会互相覆盖（磁盘两份、池里一份）。
+func TestParseRequiresUID(t *testing.T) {
+	t.Parallel()
+
+	_, err := Parse([]byte(`{"auth": {"accessToken": "at"}, "account": {}}`))
+	if err == nil {
+		t.Fatal("缺 uid 应解析失败")
+	}
+
+	if !errors.Is(err, errParseErrorMissingUID) {
+		t.Fatalf("err=%v want errParseErrorMissingUID", err)
+	}
+}
+
+// TestSaveAtomicPreservesDeviceTokenWhenCleared device_token 在内存中被清空时，
+// 保盘必须保留原文件里的值：否则设备风控 token 会静默丢失，只能重新导入。
+func TestSaveAtomicPreservesDeviceTokenWhenCleared(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "a.json")
+	raw := []byte(`{"auth":{"accessToken":"at","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"u1"},"device_token":"dev-tok"}`)
+
+	account, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	account.FilePath = path
+	if account.DeviceToken != "dev-tok" {
+		t.Fatalf("device_token=%q", account.DeviceToken)
+	}
+
+	account.DeviceToken = "" // 模拟某条清空路径
+	if saveErr := account.SaveAtomic(); saveErr != nil {
+		t.Fatalf("save: %v", saveErr)
+	}
+
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(string(saved), `"device_token": "dev-tok"`) {
+		t.Fatalf("device_token 丢失: %s", saved)
 	}
 }
