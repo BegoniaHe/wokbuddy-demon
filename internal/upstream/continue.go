@@ -37,10 +37,23 @@ type TextContinueReader struct {
 	firstUsage map[string]any
 
 	finishLength bool
-	// stopTriggers 把 finish_reason=stop 也当作可续写终态（长文续接，见 ContinueOnStop）。
+	// stopTriggers 把 finish_reason=stop 也当作可续写终态（长文续接 / 预告句，见
+	// ContinueOnStop 与 ContinueOnStopTail）。
 	stopTriggers bool
-	// stopMinChars stop 触发续写所需的已输出字符数（短答不续写）。
+	// stopMinChars stop 触发续写所需的已输出字符数（长文口径的短答门槛）。
 	stopMinChars int
+	// stopTail 尾部探针：非 nil 时 stop 是否可续写由它判定（预告句 / 工具轮，#495）。
+	stopTail func(string) bool
+	// stopByTail 本次 stop 是尾部探针授权的：跳过 stopMinChars 的字符门槛。
+	stopByTail bool
+	// toolsOnly 工具轮续写：只采纳续写段的 tool_calls，丢弃正文。
+	toolsOnly bool
+	// continuationToolsOnly 本次实际生效的「只采纳调用」（length 触发的仍续正文）。
+	continuationToolsOnly bool
+	// continuationHasTool 续写段是否已带回工具调用。
+	continuationHasTool bool
+	// onContinue 真正发起续写时的诊断回调（收到已输出正文的尾部片段）。
+	onContinue func(tail string)
 	// finishStop 本次终态是 stop（且已开启 stopTriggers）：与 finishLength 同处置。
 	finishStop    bool
 	continueTried bool
@@ -109,6 +122,33 @@ func (c *TextContinueReader) ContinueOnStop(minChars int) *TextContinueReader {
 	}
 
 	return c
+}
+
+// ContinueOnStopTail 让「正文停在预告句」的 stop 触发一次续写（issue #495）。
+// tail 判据作用于已输出正文；toolsOnly 为真表示本轮声明了工具——只采纳续写段里
+// 的 tool_calls，丢弃续写正文（工具轮「说一句就停」的补救）。onTrigger 在真正
+// 发起续写时收到已输出正文的尾部片段，供调用方落诊断日志（可能为 nil）。
+func (c *TextContinueReader) ContinueOnStopTail(
+	tail func(string) bool, toolsOnly bool, onTrigger func(tail string),
+) *TextContinueReader {
+	if c != nil {
+		c.stopTriggers = true
+		c.stopTail = tail
+		c.toolsOnly = toolsOnly
+		c.onContinue = onTrigger
+	}
+
+	return c
+}
+
+// Continued 报告本流是否发生过续写（诊断日志用）。
+func (c *TextContinueReader) Continued() bool {
+	return c != nil && c.continued
+}
+
+// ContinuationToolCall 报告续写段是否带回工具调用（工具轮诊断用）。
+func (c *TextContinueReader) ContinuationToolCall() bool {
+	return c != nil && c.continuationHasTool
 }
 
 // Release 归还行缓冲（幂等）。只能在整个流确实读完之后调用：调用方在 Stream
@@ -223,10 +263,17 @@ func (c *TextContinueReader) handleDone(line string) {
 		return
 	}
 
+	// 工具轮续写没带回任何调用时，首段终态必须补在 [DONE] 之前（#495）。
+	if c.continued && c.continuationToolsOnly && !c.continuationHasTool {
+		c.flushHeld()
+	}
+
 	c.out.WriteString(line)
 }
 
 // handleFrame 处理 JSON 帧：错误帧原样重编码，正常帧按是否需要改写决定透传方式。
+//
+//nolint:cyclop,gocyclo // 帧分派按优先级线性展开（错误帧 → 终态暂存 → 工具轮过滤 → 透传）。
 func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 	c.captureMeta(frame)
 
@@ -258,6 +305,23 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 		return
 	}
 
+	// 工具轮续写只采纳调用（issue #495）：正文/思考帧丢弃；终态帧只在已采纳调用后
+	// 才写出，否则由首段 stop（held）保底。用量仍要记账，剥掉终态后写出。
+	if c.continuationToolsOnly {
+		switch {
+		case frameHasToolCalls(frame):
+			c.continuationHasTool = true
+		case !c.continuationHasTool:
+			if frameHasUsage(frame) {
+				c.writeFrameJSON(stripFinishReason(frame))
+			}
+
+			return
+		case !frameHasFinish(frame):
+			return
+		}
+	}
+
 	c.writeFrameJSON(frame)
 }
 
@@ -287,38 +351,55 @@ func (c *TextContinueReader) holdLengthFrame(line string, frame map[string]any) 
 }
 
 // frameHasSubstantive 报告帧是否携带正文/拒答/工具调用。
-//
-//nolint:gocognit // 正文/拒答/工具调用判定按优先级线性展开。
 func frameHasSubstantive(frame map[string]any) bool {
-	choices, _ := frame["choices"].([]any)
-
-	for _, raw := range choices {
-		choice, _ := raw.(map[string]any)
-		if choice == nil {
-			continue
+	return frameChoiceNodeHas(frame, func(node map[string]any) bool {
+		if text, _ := node["content"].(string); text != "" {
+			return true
 		}
 
+		if text, _ := node["refusal"].(string); text != "" {
+			return true
+		}
+
+		return nodeHasToolCalls(node)
+	})
+}
+
+// frameHasToolCalls 报告帧是否携带工具调用（delta 或 message）。
+func frameHasToolCalls(frame map[string]any) bool {
+	return frameChoiceNodeHas(frame, nodeHasToolCalls)
+}
+
+// nodeHasToolCalls 报告 delta/message 节点是否带工具调用。
+func nodeHasToolCalls(node map[string]any) bool {
+	tools, _ := node["tool_calls"].([]any)
+
+	return len(tools) > 0
+}
+
+// frameChoiceNodeHas 报告任一 choice 的 delta/message 是否满足 ok。
+func frameChoiceNodeHas(frame map[string]any, ok func(node map[string]any) bool) bool {
+	found := false
+
+	forEachChoice(frame, func(choice map[string]any) {
 		for _, key := range []string{"delta", "message"} {
 			node, _ := choice[key].(map[string]any)
 			if node == nil {
 				continue
 			}
 
-			if text, _ := node["content"].(string); text != "" {
-				return true
-			}
-
-			if text, _ := node["refusal"].(string); text != "" {
-				return true
-			}
-
-			if tools, _ := node["tool_calls"].([]any); len(tools) > 0 {
-				return true
+			if ok(node) {
+				found = true
 			}
 		}
-	}
+	})
 
-	return false
+	return found
+}
+
+// frameHasFinish 报告帧是否带非空 finish_reason。
+func frameHasFinish(frame map[string]any) bool {
+	return frameHasFinishReason(frame, "")
 }
 
 // frameHasUsage 报告帧是否携带非空 usage 对象。
@@ -330,6 +411,11 @@ func frameHasUsage(frame map[string]any) bool {
 
 // frameFinishReasonIsLength 报告帧是否带 finish_reason=length。
 func frameFinishReasonIsLength(frame map[string]any) bool {
+	return frameHasFinishReason(frame, "length")
+}
+
+// frameHasFinishReason 报告帧是否带终态；want 为空表示任意非空终态。
+func frameHasFinishReason(frame map[string]any, want string) bool {
 	choices, _ := frame["choices"].([]any)
 
 	for _, raw := range choices {
@@ -338,9 +424,12 @@ func frameFinishReasonIsLength(frame map[string]any) bool {
 			continue
 		}
 
-		if fr, _ := choice["finish_reason"].(string); fr == "length" {
-			return true
+		fr, _ := choice["finish_reason"].(string)
+		if fr == "" || (want != "" && fr != want) {
+			continue
 		}
+
+		return true
 	}
 
 	return false
@@ -416,6 +505,8 @@ func (c *TextContinueReader) captureMeta(frame map[string]any) {
 }
 
 // inspectFrame 累计正文/工具调用并读取 finish_reason。
+//
+//nolint:cyclop,gocyclo // stop 可续写判定按「尾部探针 → 长文门槛」两段线性展开。
 func (c *TextContinueReader) inspectFrame(frame map[string]any) {
 	if !c.continuation {
 		// 首段 usage 在续写成功后仍是独立一次上游调用，不能随 length 帧一起丢弃；
@@ -425,18 +516,42 @@ func (c *TextContinueReader) inspectFrame(frame map[string]any) {
 		}
 	}
 
+	sawStop := false
+
 	walkChoiceDeltas(frame, func(fr string) {
 		switch fr {
 		case "length":
 			c.finishLength = true
 		case "stop":
-			// 长文续接：客户端把输出上限要到 32k 以上时，stop 不再当作「用户只要
-			// 这么短」（issue #494）。未开启时保持既有行为。
-			if c.stopTriggers {
-				c.finishStop = true
-			}
+			sawStop = true
 		}
 	}, c.inspectDelta)
+
+	if !sawStop || !c.stopTriggers || c.continued {
+		return
+	}
+
+	// 给了尾部探针就按它判（预告句 / 工具轮，#495）；否则沿用长文口径——stop 一律
+	// 可续写，短答由 tryContinue 的字符门槛挡掉（#494）。
+	if c.stopTail == nil {
+		c.finishStop = true
+
+		return
+	}
+
+	if c.stopTail(c.text.String()) {
+		c.finishStop = true
+		c.stopByTail = true
+
+		return
+	}
+
+	// 两个策略共存：尾部探针不命中时，非工具轮仍按长文门槛续写（stopMinChars=0
+	// 表示未开启长文续接，不在此放行）。
+	if !c.toolsOnly && c.stopMinChars > 0 &&
+		utf8.RuneCountInString(c.text.String()) >= c.stopMinChars {
+		c.finishStop = true
+	}
 }
 
 // forEachChoice 遍历帧内非空 choices。
@@ -537,10 +652,17 @@ func (c *TextContinueReader) handleEOF() {
 		}
 	}
 
+	// 工具轮续写没带回调用：流尾补发首段 stop（[DONE] 路径已在 handleDone 处理）。
+	if c.continued && c.continuationToolsOnly && !c.continuationHasTool {
+		c.flushHeld()
+	}
+
 	c.done = true
 }
 
 // tryContinue 发起一次续写。成功则切换 reader；失败则补发暂存的 length 帧。
+//
+//nolint:cyclop,gocyclo // 续写前置条件线性校验（只做一次 → 无工具 → 正文非空 → 门槛）。
 func (c *TextContinueReader) tryContinue() bool {
 	// 只尝试一次：失败后 held 里的 length 终态已经补发，若在 EOF 处再试会把
 	// 续写帧写到已经发出的 [DONE] 之后，并重复打上游。工具调用不盲重试：参数
@@ -558,7 +680,9 @@ func (c *TextContinueReader) tryContinue() bool {
 	}
 
 	// 只因 stop 触发时（非 length 截断）还要求已输出成篇内容：短答是正常收尾。
-	if c.finishStop && !c.finishLength && utf8.RuneCountInString(c.text.String()) < c.stopMinChars {
+	// 尾部探针授权的 stop（预告句 / 工具轮）不受该门槛约束。
+	if c.finishStop && !c.finishLength && !c.stopByTail &&
+		utf8.RuneCountInString(c.text.String()) < c.stopMinChars {
 		c.flushHeld()
 
 		return false
@@ -580,11 +704,36 @@ func (c *TextContinueReader) tryContinue() bool {
 	c.streamGen++
 	c.continued = true
 	c.continuation = true
+	// 只有尾部探针授权的 stop 才走「只采纳调用」；length 截断照旧续正文。
+	c.continuationToolsOnly = c.toolsOnly && c.stopByTail
+
+	if c.onContinue != nil {
+		c.onContinue(tailSnippet(c.text.String(), continuationTailLogChars))
+	}
+
 	c.finishLength = false
 	c.finishStop = false
-	c.held = nil
+	c.stopByTail = false
+
+	// 工具轮保留首段终态作为「续写没带回调用」时的兜底，其余情况丢弃。
+	if !c.continuationToolsOnly {
+		c.held = nil
+	}
 
 	return true
+}
+
+// continuationTailLogChars 续写触发日志里尾部片段的字符上限。
+const continuationTailLogChars = 80
+
+// tailSnippet 取正文末尾至多 n 个字符（避免整段正文进日志）。
+func tailSnippet(text string, n int) string {
+	runes := []rune(text)
+	if len(runes) <= n {
+		return string(runes)
+	}
+
+	return string(runes[len(runes)-n:])
 }
 
 // flushHeld 把暂存的 length 终态帧补发出去（续写失败时保留真实终态）。

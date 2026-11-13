@@ -3177,7 +3177,7 @@ func requestLevelErrorCode(kind upstream.ErrKind) (code, fallback string) {
 
 // handleStreamSuccess 流式收尾：透传 SSE、按流尾形态处置账号、记录用量。
 //
-//nolint:maintidx // 收尾顺序即语义（预览否决 → 挂续写层 → 透传 → 记账 → 观测）。
+//nolint:funlen,maintidx // 收尾顺序即语义（预览否决 → 挂续写层 → 透传 → 记账 → 观测）。
 func (f *chatFlow) handleStreamSuccess(
 	ctx context.Context, acct *auth.Auth, rc io.ReadCloser, attemptStarted time.Time, i int,
 ) rotationAction {
@@ -3213,6 +3213,15 @@ func (f *chatFlow) handleStreamSuccess(
 		if f.longFormRequested() {
 			cont.ContinueOnStop(longFormContinuationMinChars)
 		}
+		// 预告句与工具轮（issue #495）：尾部是冒号/省略号/未闭合代码块时续写一次；
+		// 本轮声明了工具就只采纳续写里的 tool_calls，丢弃续写正文。
+		cont.ContinueOnStopTail(narrationTail, f.declaredToolCount > 0,
+			func(tail string) {
+				log.Printf("INFO: [server] stream acct=%s model=%s: narration tail %q, "+
+					"continuing once (declared_tools=%d)",
+					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel,
+					upstream.RedactForLog(tail, 160), f.declaredToolCount)
+			})
 
 		stream = cont
 		// 惰性 defer：Release 自带 nil 判定，normal 路径与提前返回路径都不会漏还。
@@ -3242,6 +3251,12 @@ func (f *chatFlow) handleStreamSuccess(
 	// 观测（issue #44）：必须在 finishStreamStats 之后——f.st.toolsDeclared /
 	// toolCalls 在那里才写入。
 	f.warnStopWithoutToolCalls(stats.FinishReason())
+
+	if cont != nil && cont.ContinuationToolCall() {
+		log.Printf("INFO: [server] stream acct=%s model=%s: continuation produced tool calls (adopted)",
+			logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel)
+	}
+
 	stream.Close()
 
 	return rotDone
@@ -3808,6 +3823,8 @@ func (f *chatFlow) handleNonStreamSuccess(
 
 // continueNonStream 非流式 finish_reason=length（或长文请求的 stop）且有正文时续写
 // 一次，把第二段正文拼进同一响应（issue #247 / #494）。工具调用不续写；失败保留首段终态。
+//
+//nolint:cyclop,funlen,gocyclo // 续写前置条件线性校验（形态、已有调用、正文、只做一次），拆散更难读。
 func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp map[string]any) map[string]any {
 	if f.nonstreamContinued || len(resp) == 0 {
 		return resp
@@ -3823,7 +3840,8 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		return resp
 	}
 
-	if !f.nonStreamContinueWanted(resp, choice) {
+	wanted, toolsOnly := f.nonStreamContinuePlan(resp, choice)
+	if !wanted {
 		return resp
 	}
 
@@ -3850,7 +3868,55 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		return resp
 	}
 
+	if toolsOnly {
+		merged := mergeNonStreamToolCalls(resp, second)
+		if responseToolCallCount(merged) > 0 {
+			log.Printf("INFO: [server] non-stream model=%s: continuation produced tool calls (adopted)",
+				f.bareModel)
+		}
+
+		return merged
+	}
+
 	return mergeNonStreamContinuation(resp, second)
+}
+
+// mergeNonStreamToolCalls 工具轮续写只采纳工具调用（issue #495）：首段正文（预告句）
+// 保留，续写的纯文本丢弃；续写没带回调用时原样返回首段。
+func mergeNonStreamToolCalls(first, second map[string]any) map[string]any {
+	if responseToolCallCount(second) == 0 {
+		return first
+	}
+
+	firstChoiceItem, secondChoiceItem := firstChoice(first), firstChoice(second)
+	if firstChoiceItem == nil || secondChoiceItem == nil {
+		return first
+	}
+
+	firstMessage, _ := firstChoiceItem["message"].(map[string]any)
+	secondMessage, _ := secondChoiceItem["message"].(map[string]any)
+
+	if firstMessage == nil || secondMessage == nil {
+		return first
+	}
+
+	if _, has := firstMessage["tool_calls"]; !has {
+		if calls, ok := secondMessage["tool_calls"]; ok {
+			firstMessage["tool_calls"] = calls
+		}
+	}
+
+	if _, has := firstMessage["function_call"]; !has {
+		if call, ok := secondMessage["function_call"]; ok {
+			firstMessage["function_call"] = call
+		}
+	}
+
+	firstChoiceItem["finish_reason"] = secondChoiceItem["finish_reason"]
+
+	mergeUsageTotals(first, second)
+
+	return first
 }
 
 // firstChoice 取 choices[0]。
