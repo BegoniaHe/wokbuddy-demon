@@ -467,6 +467,8 @@ func serve(
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 	// 任务补领清扫循环：0 = 暂停（task_sweep_enabled=false），运行期可热改间隔。
 	sch.StartTaskSweep(ctx, cfg.TaskSweepInterval)
+	// 额度窗口探针循环（issue #492）：0 = 暂停（window_probe_enabled=false）。
+	sch.StartWindowProbe(ctx, cfg.WindowProbeInterval)
 
 	// 启动即预热模型积分倍率表：倍率只在 FetchModels/FetchGlobalModelInfos 成功时
 	// 填充（两者均懒触发），重启后到首次 /v1/models 或面板模型页被访问之前，
@@ -1055,6 +1057,7 @@ func applyRuntimeConfig(
 	)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
+	sch.SetWindowProbeInterval(newCfg.WindowProbeInterval)
 	sch.SetMakeupCardsPerRound(newCfg.Schedule.MakeupCardsPerRound)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 	sch.SetCheckinAccountDelay(newCfg.CheckinAccountDelayDur)
