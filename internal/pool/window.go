@@ -27,6 +27,8 @@ const (
 	// windowProbeMaxAge 重置时刻早于该年龄仍没探成说明进程久停/上游窗口已漂移，
 	// 直接丢弃，避免重启后补发一堆过期探测。
 	windowProbeMaxAge = 6 * time.Hour
+	// maxWindowProbes 待探台账条目上限：键含客户端可任填的模型名，满额不再登记新窗口。
+	maxWindowProbes = 1024
 )
 
 // WindowProbe 一个到点待执行的额度窗口探针：把上游重置后的新窗口起点钉住。
@@ -52,6 +54,9 @@ func windowProbeKey(uid, model string) string {
 
 // registerWindowProbeLocked 登记一个到点窗口。同一 (账号, 模型) 同一 ResetAt 只登记
 // 一次（重复的 6004 不重置尝试计数）。调用方必须已持有 p.mu。
+//
+// 表有硬上限：键含客户端可任填的模型名（与 route.go 的 routeLedgerMax 同一类风险），
+// 满额时不再登记新窗口——只是这一轮不把新窗口起点钉住，不影响账号可用性与冷却。
 func (p *Pool) registerWindowProbeLocked(uid, model, realm string, resetAt time.Time) {
 	if resetAt.IsZero() || model == "" {
 		return
@@ -59,6 +64,10 @@ func (p *Pool) registerWindowProbeLocked(uid, model, realm string, resetAt time.
 
 	key := windowProbeKey(uid, model)
 	if st, ok := p.windowProbes[key]; ok && st.resetAt.Equal(resetAt) {
+		return
+	}
+
+	if _, exists := p.windowProbes[key]; !exists && len(p.windowProbes) >= maxWindowProbes {
 		return
 	}
 

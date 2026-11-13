@@ -97,6 +97,21 @@ func (p *Pool) SetScheduling(sched Scheduling) {
 	}
 }
 
+// maxSchedulingCursors 游标台账条目上限。键 = realm + ":" + 模型名，模型名直接来自
+// 客户端请求体，且游标随 state.json 落盘：不设上限时伪造模型名可同时撑内存与
+// state.json。丢一条游标只让该 (域, 模型) 的顺序从 0 重新开始，不改变选号正确性。
+const maxSchedulingCursors = 512
+
+// dropOneCursor 丢一条游标给新键腾位（调用方已持锁）。丢哪条无所谓：游标只影响
+// 有序策略的起点。
+func dropOneCursor(cursors map[string]int) {
+	for key := range cursors {
+		delete(cursors, key)
+
+		return
+	}
+}
+
 // clearCursorsForRealmLocked 清掉某域全部 (realm, model) 游标（调用方已持锁）。
 func (p *Pool) clearCursorsForRealmLocked(realm string) {
 	prefix := realm + ":"
@@ -235,6 +250,10 @@ func (p *Pool) pickOrderedLocked(
 
 	if p.schedulingCursors == nil {
 		p.schedulingCursors = map[string]int{}
+	}
+	// 游标键含客户端可任填的模型名，且随 state.json 落盘（见 maxSchedulingCursors）。
+	if _, seen := p.schedulingCursors[key]; !seen && len(p.schedulingCursors) >= maxSchedulingCursors {
+		dropOneCursor(p.schedulingCursors)
 	}
 
 	if strategy == StrategyRoundRobin {

@@ -958,12 +958,38 @@ func TestCooldownHardDoesNotAdvanceSoftStreak(t *testing.T) {
 	pool.Add(&auth.Auth{UID: "u1"})
 	pool.CooldownUntilTomorrow4AM("u1", "余额不足")
 
-	if st, _ := pool.Status("u1"); st.SoftStreak != 0 {
-		t.Fatalf("hard cooldown must not touch soft_streak, got %d", st.SoftStreak)
+	before, _ := pool.Status("u1")
+	if before.SoftStreak != 0 {
+		t.Fatalf("hard cooldown must not touch soft_streak, got %d", before.SoftStreak)
 	}
 
+	// 并发在途请求撞上 429：短软冷却不得覆盖更长的硬冷却（否则零余额账号会在
+	// 10 分钟后被放出、撞 402 并重写一次硬冷却，hardCoolingActive 也失效）。
 	pool.CooldownSoftRate("u1", 600*time.Second, time.Time{}, "x")
-	wantCoolSec(t, pool, "u1", 600, 3)
+
+	after, _ := pool.Status("u1")
+	if after.CoolKind != "hard_credit" {
+		t.Fatalf("cool_kind=%q want hard_credit（跨族只允许延长）", after.CoolKind)
+	}
+
+	if after.CoolRemaining < before.CoolRemaining-2 {
+		t.Fatalf("hard cooldown shortened: %d -> %d", before.CoolRemaining, after.CoolRemaining)
+	}
+}
+
+// TestSoftCooldownFamilyOverwrite 同族冷却允许用新截止覆盖：上游给的重置时间比
+// 本地估算更准，同族内缩短/延长都应生效（与跨族的「只延长」区分）。
+func TestSoftCooldownFamilyOverwrite(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Cooldown("u1", CoolSoft, time.Hour, "429 rate limit")
+	pool.Cooldown("u1", CoolSoft, -time.Minute, "429 rate limit")
+
+	if st, _ := pool.Status("u1"); st.Cooling {
+		t.Fatalf("同族软冷却应被新截止覆盖: %+v", st)
+	}
 }
 
 func TestSoftStreakPersistsAcrossReload(t *testing.T) {
@@ -2675,6 +2701,28 @@ func TestAllDailyBlockedMixedModelCooldownBeforeMidnight(t *testing.T) {
 
 	if pool.AllDailyBlocked("m", "cn") {
 		t.Fatal("模型级冷却早于 0 点恢复时不应报日限")
+	}
+}
+
+// TestAllDailyBlockedAccountCoolingBeforeCSTMidnight 日限的「次日 0 点」必须是
+// 上游自然日（CST），不是宿主本地 0 点：部署在 UTC / 海外 VPS 上时，账号级冷却
+// 明明在 CST 当日 24 点前恢复，本地零点却已过，会误报 daily_limited。
+//
+// now 显式给 UTC（= CST 次日 04:00），冷却 14h 后恢复（= CST 18:00，仍在本 CST 日内）：
+// CST 口径下应在 0 点前恢复（不是日限）；用宿主/UTC 零点取界则判成跨日。
+func TestAllDailyBlockedAccountCoolingBeforeCSTMidnight(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	now := time.Date(2026, 1, 1, 20, 0, 0, 0, time.UTC)
+
+	pool.SetClock(func() time.Time { return now })
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.SetDailyUsageProvider(func() map[string]DailyUsage { return map[string]DailyUsage{} })
+	pool.Cooldown("u1", CoolSoft, 14*time.Hour, "429 rate limit")
+
+	if pool.AllDailyBlocked("m", "cn") {
+		t.Fatal("冷却在 CST 当日 0 点前恢复，不应判为日限")
 	}
 }
 

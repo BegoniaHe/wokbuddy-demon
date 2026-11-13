@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -102,33 +103,58 @@ func (p *Pool) startFlusher() {
 	// stopCh 同步登记，Close 才能可靠停止（New 与 startFlusher 之间无并发窗口）。
 	p.stopCh = stopCh
 
+	p.flusherDone = make(chan struct{})
+
 	interval := flushInterval
+
 	go func() {
+		defer close(p.flusherDone)
+
 		t := time.NewTicker(interval)
 		defer t.Stop()
 
 		for {
 			select {
 			case <-t.C:
-				p.mu.Lock()
-				pending := p.dirty.Swap(false)
-
-				var seq uint64
-
-				var stateSnap stateFile
-				if pending {
-					seq, stateSnap = p.snapshotStateLocked()
-				}
-				p.mu.Unlock()
-
-				if pending {
-					p.persistState(seq, stateSnap)
-				}
+				p.persistTick()
 			case <-stopCh:
 				return
 			}
 		}
 	}()
+}
+
+// persistTick 一次定时落盘，panic 就地隔离。
+//
+// flusher 协程里是状态快照 + 文件/Redis 写入；一次 panic 会带走整个协程，
+// 之后账号池状态再也不会落盘（进程还在跑，看起来一切正常）。
+func (p *Pool) persistTick() {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("ERR: [pool] 落盘循环 panic（已隔离）: %v\n%s", rec, debug.Stack())
+		}
+	}()
+
+	seq, stateSnap, pending := func() (uint64, stateFile, bool) {
+		p.mu.Lock()
+		// 必须 defer 解锁：上面的 recover 会把 snapshotStateLocked 里的 panic
+		// 就地隔离，显式 Unlock 不会执行，整个池（选号/status/落盘）会死锁在
+		// 一把永不释放的写锁上。
+		defer p.mu.Unlock()
+
+		pending := p.dirty.Swap(false)
+		if !pending {
+			return 0, stateFile{}, false
+		}
+
+		seq, snap := p.snapshotStateLocked()
+
+		return seq, snap, true
+	}()
+
+	if pending {
+		p.persistState(seq, stateSnap)
+	}
 }
 
 // Flush 同步把内存状态落盘（幂等：无变更且无在途快照时不写盘）。供进程退出前调用。
@@ -156,13 +182,17 @@ func (p *Pool) Flush() {
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) load() {
-	raw, err := safefile.Read(p.stateFp, nil)
+	raw, restored, err := safefile.ReadWithFallback(p.stateFp, nil)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			log.Printf("WARN: pool: state.json 不可用（%v），跳过本地状态恢复: %s", err, p.stateFp)
 		}
 
 		return
+	}
+
+	if restored {
+		log.Printf("WARN: pool: state.json 正文损坏，已回退 .bak（账号状态为上一版）: %s", p.stateFp)
 	}
 
 	var stateSnapshot stateFile
@@ -188,6 +218,11 @@ func (p *Pool) applySchedulingCursorsLocked(cursors map[string]int) {
 
 	for key, pos := range cursors {
 		if key == "" || pos < 0 {
+			continue
+		}
+		// 与 pickOrderedLocked 写入侧同口径的上限：state.json 可以人工编辑，也可能是
+		// 加限之前写下的旧文件，恢复时不得把台账重新撑到无界。
+		if _, seen := p.schedulingCursors[key]; !seen && len(p.schedulingCursors) >= maxSchedulingCursors {
 			continue
 		}
 
@@ -295,6 +330,8 @@ func restoreModelCooldowns(src map[string]stateModelCooldown, now time.Time) map
 
 		out[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 	}
+	// 恢复路径也要压到每账号上限（state.json 可人工编辑/来自加限前的旧版本）。
+	pruneModelLedger(out, func(mc modelCooldown) time.Time { return mc.Until }, now)
 
 	if len(out) == 0 {
 		return nil
@@ -319,6 +356,8 @@ func restoreModelCosts(src map[string]stateModelCost, now time.Time) map[string]
 
 		out[m] = modelCostEntry(mc)
 	}
+	// 同上：恢复不得突破每账号台账上限。
+	pruneModelLedger(out, func(mc modelCostEntry) time.Time { return mc.LastSeen.Add(modelCostTTL) }, now)
 
 	if len(out) == 0 {
 		return nil

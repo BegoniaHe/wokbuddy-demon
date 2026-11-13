@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
@@ -354,11 +355,39 @@ func (p *Pool) resolveCostTier(cands []*entry, reqModel, realm string, now time.
 	if now.Sub(p.exploreLast[key]) < p.costExploreInterval {
 		return bestTier, false
 	}
+	// 台账键含客户端可任填的模型名（与 route.go 的 routeLedgerMax 同一类风险）：
+	// 新键入账前先压到上限，丢最旧的探索时刻——代价只是该 (域, 模型) 下个窗口可
+	// 再探一次，不改变选号语义。
+	if _, seen := p.exploreLast[key]; !seen && len(p.exploreLast) >= maxExploreKeys {
+		pruneOldestTimeKeys(p.exploreLast, maxExploreKeys)
+	}
 
 	p.exploreLast[key] = now
 	p.costExploreEvents++
 
 	return 1, true
+}
+
+// maxExploreKeys exploreLast 条目上限。见 resolveCostTier 的淘汰注释。
+const maxExploreKeys = 1024
+
+// pruneOldestTimeKeys 把「键 → 时刻」台账压到 limit 以内，从最旧时刻开始丢（调用方
+// 已持 p.mu）。用于键含客户端可控成分的运行态台账。
+func pruneOldestTimeKeys(m map[string]time.Time, limit int) {
+	for len(m) >= limit {
+		oldestKey := ""
+		oldest := time.Time{}
+
+		first := true
+
+		for key, at := range m {
+			if first || at.Before(oldest) {
+				oldestKey, oldest, first = key, at, false
+			}
+		}
+
+		delete(m, oldestKey)
+	}
 }
 
 // anyTier1 报告候选中是否存在无观测（tier 1）账号。
@@ -527,7 +556,10 @@ func (p *Pool) floorBlockedForRealmModel(entry2 *entry, model, realm string, now
 		return false
 	}
 
-	return p.paidModel(entry2, model, realm, now)
+	// 判收费必须用与 floor 同源的域：裸模型名请求（无 realm 前缀）落到 global
+	// 账号时，upstream.ModelRate("") 会查 CN 倍率表，CN 未覆盖而 global 收费的
+	// 模型就被当成「未知」放行。
+	return p.paidModel(entry2, model, floorRealmOf(entry2, realm), now)
 }
 
 // floorRealmOf 取保底用的域：请求域优先；空则用账号所属域（粘性路径）。
@@ -599,7 +631,8 @@ func (p *Pool) dailyBlockedUsage(
 		return true
 	}
 
-	return lim.Credits > 0 && dailyUsage.Credits >= lim.Credits && p.paidModel(entry3, model, realm, now)
+	return lim.Credits > 0 && dailyUsage.Credits >= lim.Credits &&
+		p.paidModel(entry3, model, floorRealmOf(entry3, realm), now)
 }
 
 // enabled 报告是否配置了任一每日护栏。
@@ -696,7 +729,9 @@ func (p *Pool) DailyLimitedUIDs() []string {
 	return out
 }
 
-// resumesBeforeMidnight 报告账号/模型冷却是否早于本地次日 0 点恢复。
+// resumesBeforeMidnight 报告账号/模型冷却是否早于上游次个自然日 0 点（CST）恢复。
+// 日界必须与用量统计/限额同源（cst.Loc）：用宿主本地零点会让部署在 UTC/海外 VPS
+// 上的实例把「几小时后恢复」误判成「日限到次日」（或反之），进而把 503 退化成 429。
 func resumesBeforeMidnight(e *entry, now time.Time, model string) bool {
 	resume := e.until
 	if mc, ok := e.modelCooldowns[model]; ok && mc.Until.After(resume) {
@@ -707,7 +742,8 @@ func resumesBeforeMidnight(e *entry, now time.Time, model string) bool {
 		resume = now
 	}
 
-	midnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+	local := now.In(cst.Loc)
+	midnight := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, cst.Loc)
 
 	return resume.Before(midnight)
 }
@@ -772,7 +808,9 @@ func (p *Pool) pickEarliestExpiryLocked(
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s",
 		logfmt.Label(best.a.UID, best.a.NicknameValue()), best.expiry(now).Format(time.RFC3339),
 		best.fallbackKind(now))
-	best.lastUsed = p.now()
+	// 用入参 now 而不是再取一次时钟：注入了确定性时钟的调用方（测试/回放）看到的是
+	// 同一次选号的同一个时刻，避免 lastUsed 与 probeUntil 落在不同时基。
+	best.lastUsed = now
 	// 单飞探针（issue #116 P0-3）：刚解封账号只允许一个兜底请求先试探，其余并发
 	// 在 probeWindow 内直接失败，避免二次踩爆。
 	best.probeUntil = now.Add(probeWindow)
