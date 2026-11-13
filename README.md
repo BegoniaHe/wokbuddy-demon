@@ -194,6 +194,18 @@ docker compose up -d --build
 
 若等首帧期间已经写出过注释帧（响应头已提交）而轮转全部失败，网关降级为 `200` + SSE error 帧 + `[DONE]`，不会把 JSON 错误塞进已提交的流里；未提交时仍是原来的 JSON 错误码。
 
+## 🧾 运行日志落盘与导出（`logging.runtime_log_enabled` / `runtime_log_retention_days` / `runtime_log_max_mb`）
+
+默认只把运行日志写到 stdout/stderr 与面板的 500 条环形缓冲，重启即丢。开启落盘后追加一份按天归档：
+
+- `logging.runtime_log_enabled`：默认 `false`（不落盘，行为与之前一致）。开启后 `log.Printf` 的输出按天写入 `data/runtime-logs/server-<day>.log`。
+- `logging.runtime_log_retention_days`：保留天数，默认 7；`<=0` 回落默认。
+- `logging.runtime_log_max_mb`：目录总上限（MiB），默认 100；`<=0` 回落默认。单文件超过 16 MiB 时写成 `server-<day>.1.log` 等序号文件；总量与保留期按文件时间从旧到新裁剪。
+- 落盘前统一脱敏（`Authorization`、token 键值、URL 查询参数、长高熵串），磁盘与导出内容都是打码后的文本。
+- 以上三项**改动需重启**（出口在启动期按目录构造）。
+
+导出走只读接口 `GET /panel/api/logs/export`（`scopeRead`）：`from` / `to` 支持 unix 秒或毫秒、RFC3339、`2006-01-02T15:04` 与 `2006-01-02`，缺省导出当天；区间最长 31 天、未压缩总量上限 64 MiB、区间内无文件返回 404。未启用落盘时接口返回 501。面板前端暂无下载按钮，可直接用 `curl -H "Authorization: Bearer <key>" -o logs.zip "<网关>/panel/api/logs/export?from=2026-11-01&to=2026-11-13"`。
+
 ## 🐾 适合谁
 
 - 手上有多个 CodeBuddy 账号，但不想每天挨个打卡；

@@ -40,6 +40,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/quota"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/runlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
@@ -98,6 +99,8 @@ type Config struct {
 	Usage *usage.Recorder
 	// RequestLog 请求指标与归档（nil = 对应接口返回 501）。
 	RequestLog *reqlog.Recorder
+	// RuntimeLog 运行日志落盘出口（issue #487，nil = 未启用，导出接口返回 501）。
+	RuntimeLog *runlog.Sink
 	// Keys 命名密钥存储（nil = 密钥接口返回 501）。仅面板管理；面板自身鉴权
 	// 仍只认默认 api_key（命名密钥是给网关客户端的，不应获得管理权限）。
 	Keys *apikey.Store
@@ -260,6 +263,7 @@ func (p *Panel) routesPages() {
 	p.route("GET /panel/{path...}", scopePublic, p.asset)
 	p.route("GET /panel/api/overview", scopeRead, p.overview)
 	p.route("GET /panel/api/logs", scopeRead, p.logsHandler)
+	p.route("GET /panel/api/logs/export", scopeRead, p.logsExport)
 	p.route("GET /panel/api/error_summary", scopeRead, p.errorSummaryHandler)
 	p.route("GET /panel/api/request_metrics", scopeRead, p.requestMetrics)
 	p.route("GET /panel/api/request_logs", scopeRead, p.requestLogs)
