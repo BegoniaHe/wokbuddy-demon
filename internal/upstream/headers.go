@@ -35,6 +35,7 @@ const (
 	surfaceRefresh
 	surfaceV3Config
 	surfaceGrowth
+	surfaceLogout
 )
 
 // chatFamily 是否复用 chat 头族。
@@ -217,8 +218,9 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 		// refresh / v3-config：与 chat 同源的客户端 UA（v3-config 由调用方按
 		// 探测目标换成 IDE / CLI UA，见 V3ConfigHeaders）。
 		return c.userAgent(account)
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
-		// 走 chat 头族，不经轻头族。
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
+		surfaceLogout:
+		// 走 chat 头族或另用专属头集（logout 见 LogoutHeaders），不经轻头族默认 UA。
 		return ""
 	}
 
@@ -389,7 +391,8 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 		req.Header.Set("Baggage", baggageValue(
 			req.Header.Get("X-Conversation-Id"), req.Header.Get("X-Conversation-Request-Id"),
 		))
-	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth:
+	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth,
+		surfaceLogout:
 		// 轻头族各面已在 applyHeaders 分流。
 	}
 }
@@ -452,7 +455,7 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 		accept = "application/json, text/plain, */*"
 		contentType = "application/json;charset=UTF-8"
 	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
-		surfaceBilling, surfaceRefresh, surfaceV3Config, surfaceGrowth:
+		surfaceBilling, surfaceRefresh, surfaceV3Config, surfaceGrowth, surfaceLogout:
 	}
 
 	req.Header.Set("Accept", accept)
@@ -490,7 +493,7 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 
 // lightSurfaceOverrides 轻头族各面的差异项。
 //
-//nolint:cyclop,gocyclo // 头族按 surface 线性展开；拆得更碎反而更难对照真机表。
+//nolint:cyclop,gocyclo,maintidx // 头族按 surface 线性展开；拆得更碎反而更难对照真机表。
 func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *auth.Auth) {
 	switch srf {
 	case surfaceModelBusy:
@@ -531,6 +534,10 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 		// 这里删掉（重构前 newV3ConfigRequest 也没有该头）。
 		req.Header.Del("Content-Type")
 		injectEnterpriseHeaders(req, account)
+	case surfaceLogout:
+		// 官方 ExternalLinkAuth.removeSession 撤销会话时只认 refreshToken
+		// （X-No-Authorization: true），轻头族 base 注入的 Authorization 必须删掉。
+		req.Header.Del("Authorization")
 	case surfaceGrowth:
 		// 官方 growth 面是 Node fetch：UA=node、accept-language=*、sec-fetch-mode=cors，
 		// 且**没有** X-Request-ID / X-Product / X-Requested-With / X-Codebuddy-Request。
@@ -1040,7 +1047,8 @@ func (c *Client) GrowthHeaders(req *http.Request, account *auth.Auth) {
 	c.applyHeaders(surfaceGrowth, req, account, "", ChatMeta{})
 }
 
-// RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在这里）。
+// RefreshHeaders refresh 端点专属头（X-Refresh-Token 只允许出现在 refresh 与
+// logout 两个面上，见 LogoutHeaders）。
 func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 	c.applyHeaders(surfaceRefresh, req, account, "", ChatMeta{})
 	req.Header.Set("X-Refresh-Token", account.RefreshToken)
@@ -1049,6 +1057,20 @@ func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 
 	// 官方 refresh 复用当前 trace span；网关侧无活动 span，故生成一组自洽的新链路 id。
 	injectTraceHeaders(req, "", session.NewMessageID())
+}
+
+// LogoutHeaders 撤销登录会话（POST /v2/plugin/auth/logout）请求头。
+//
+// 官方 ExternalLinkAuth.removeSession 在 logout({revokeServerSession:true}) 时只认
+// refreshToken 三件套（cn 5.9.3 / global 5.9.4 同形）：X-Refresh-Token、
+// X-Auth-Refresh-Source: plugin、X-No-Authorization: true。轻头族 base 注入的
+// Authorization 已由 surfaceLogout 覆盖删掉。统一拦截器是否还补 X-Product /
+// X-Request-ID 等头无包内证据，按「不猜测」保持轻头族默认，等实测再补。
+func (c *Client) LogoutHeaders(req *http.Request, account *auth.Auth) {
+	c.applyHeaders(surfaceLogout, req, account, "", ChatMeta{})
+	req.Header.Set("X-Refresh-Token", account.RefreshTokenValue())
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
+	req.Header.Set("X-No-Authorization", "true")
 }
 
 // V3ConfigHeaders /v3/config 头族。该端点对 UA 敏感（必须带 CodeBuddy/CodeBuddyIDE
