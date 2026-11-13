@@ -105,6 +105,15 @@ type Config struct {
 		RequestRetentionDays int `json:"request_retention_days"`
 		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
 		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+		// RuntimeLogEnabled 运行日志按天落盘开关，缺省 false（只走 stdout/stderr
+		// 与面板环形缓冲，行为与之前完全一致）。开启后 log.Printf 的输出按天写入
+		// data/runtime-logs/server-<day>.log（写入前脱敏、按大小轮转），并供面板
+		// GET /panel/api/logs/export 按日期区间导出 ZIP。目录固定随 state_file。
+		RuntimeLogEnabled bool `json:"runtime_log_enabled"`
+		// RuntimeLogRetentionDays 运行日志保留天数，缺省 7；<=0 回落默认。
+		RuntimeLogRetentionDays int `json:"runtime_log_retention_days"`
+		// RuntimeLogMaxMB 运行日志总上限（MiB），缺省 100；<=0 回落默认。
+		RuntimeLogMaxMB int `json:"runtime_log_max_mb"`
 		// RequestClientInfo 是否在请求日志（归档事件 + stdout 流水行 + 面板运行
 		// 日志）里记录调用来源：客户端 IP 与 User-Agent。缺省 true。
 		//
@@ -616,6 +625,8 @@ func baseDefaults() *Config {
 	config.Logging.RequestArchiveEnabled = true
 	config.Logging.RequestRetentionDays = 7
 	config.Logging.RequestArchiveMaxMB = 100
+	config.Logging.RuntimeLogRetentionDays = 7
+	config.Logging.RuntimeLogMaxMB = 100
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	config.Logging.RequestClientInfo = true
@@ -1747,6 +1758,14 @@ func (c *Config) normalizeStaticDefaults() {
 
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+	}
+
+	if c.Logging.RuntimeLogRetentionDays <= 0 {
+		c.Logging.RuntimeLogRetentionDays = 7
+	}
+
+	if c.Logging.RuntimeLogMaxMB <= 0 {
+		c.Logging.RuntimeLogMaxMB = 100
 	}
 	// 停机排空窗口 0/负数视为未设置：缺省 30s，避免配置笔误把在途 SSE 直接掐断。
 	if c.Server.ShutdownGraceSeconds == 0 {

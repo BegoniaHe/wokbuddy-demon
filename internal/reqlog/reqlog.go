@@ -8,27 +8,29 @@ package reqlog
 
 import (
 	"bufio"
-	"cmp"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logrotate"
 )
 
 const (
 	recentLimit         = 100
-	defaultFileMax      = int64(16 << 20)
+	defaultFileMax      = logrotate.DefaultFileMaxBytes
 	defaultQueue        = 1024
 	defaultReadMax      = 1000
 	defaultReadFallback = 200
-	defaultMaxBytes     = 100 << 20
+	defaultMaxBytes     = logrotate.DefaultMaxBytes
+	// archivePrefix/archiveExt 归档文件命名：requests-<day>[.N].jsonl。
+	archivePrefix = "requests"
+	archiveExt    = ".jsonl"
 )
 
 // NewRequestID 生成不含用户信息的本地请求 ID。
@@ -319,11 +321,8 @@ type archiveWriter struct {
 	lastErrMu sync.Mutex
 	lastErr   string
 
-	file *os.File
-	buf  *bufio.Writer
-	path string
-	day  string
-	size int64
+	// out 按天/按大小轮转的共用写入器（internal/logrotate）；nil = 未启用。
+	out *logrotate.Writer
 }
 
 func newArchiveWriter(cfg Config) *archiveWriter {
@@ -353,13 +352,24 @@ func newArchiveWriter(cfg Config) *archiveWriter {
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 	}
-	if err := os.MkdirAll(cfg.Dir, 0o700); err != nil {
+
+	out, err := logrotate.New(&logrotate.Config{
+		Dir:           cfg.Dir,
+		Prefix:        archivePrefix,
+		Ext:           archiveExt,
+		FileMaxBytes:  cfg.FileMaxBytes,
+		MaxBytes:      cfg.MaxBytes,
+		RetentionDays: cfg.RetentionDays,
+	})
+	if err != nil {
 		w.setErr(err)
 		w.cfg.Enabled = false
 		close(w.done)
 
 		return w
 	}
+
+	w.out = out
 
 	go w.run()
 
@@ -402,7 +412,7 @@ func (w *archiveWriter) run() {
 					w.writeEvent(&e)
 				default:
 					w.flush()
-					w.closeFile()
+					_ = w.out.Close()
 
 					return
 				}
@@ -412,6 +422,10 @@ func (w *archiveWriter) run() {
 }
 
 func (w *archiveWriter) writeEvent(event2 *Event) {
+	if w.out == nil {
+		return
+	}
+
 	raw, err := json.Marshal(event2)
 	if err != nil {
 		w.setErr(err)
@@ -423,273 +437,48 @@ func (w *archiveWriter) writeEvent(event2 *Event) {
 		now = time.Now()
 	}
 
-	if err := w.ensureFile(now, len(raw)); err != nil {
+	if _, err := w.out.WriteAt(now, append(raw, '\n')); err != nil {
 		w.setErr(err)
-		return
 	}
-
-	if _, err := w.buf.Write(raw); err != nil {
-		w.setErr(err)
-		return
-	}
-
-	if err := w.buf.WriteByte('\n'); err != nil {
-		w.setErr(err)
-		return
-	}
-
-	w.size += int64(len(raw)) + 1
-}
-
-// ensureFile 保证当前写入文件存在且未越过单文件上限，必要时按天切换或轮转。
-func (w *archiveWriter) ensureFile(now time.Time, rawLen int) error {
-	day := now.Format("2006-01-02")
-	if w.file == nil || w.day != day {
-		if err := w.openFile(now, false); err != nil {
-			return err
-		}
-	}
-
-	if w.size > 0 && w.size+int64(rawLen)+1 > w.cfg.FileMaxBytes {
-		if err := w.openFile(now, true); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (w *archiveWriter) openFile(now time.Time, rotate bool) error {
-	w.closeFile()
-
-	day := now.Format("2006-01-02")
-
-	if err := os.MkdirAll(w.cfg.Dir, 0o700); err != nil {
-		return fmt.Errorf("openFile: %w", err)
-	}
-
-	path := filepath.Join(w.cfg.Dir, "requests-"+day+".jsonl")
-	if rotate {
-		path = nextArchivePath(w.cfg.Dir, day)
-	} else if latest := latestArchiveForDay(w.cfg.Dir, day); latest != "" {
-		path = filepath.Join(w.cfg.Dir, latest)
-	}
-
-	file2, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return fmt.Errorf("openFile: %w", err)
-	}
-
-	info, err := file2.Stat()
-	if err != nil {
-		_ = file2.Close()
-		return fmt.Errorf("openFile: %w", err)
-	}
-
-	w.file = file2
-	w.buf = bufio.NewWriterSize(file2, 64<<10)
-	w.path = path
-	w.day = day
-	w.size = info.Size()
-
-	return nil
-}
-
-//nolint:gocognit // 目录扫描/日期匹配/兜底选择线性展开。
-func latestArchiveForDay(dir, day string) string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-
-	prefix := "requests-" + day
-	best := ""
-	bestIndex := -1
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".jsonl") {
-			continue
-		}
-
-		idx := 0
-
-		if name[len(prefix):len(name)-len(".jsonl")] != "" {
-			part := strings.TrimSuffix(strings.TrimPrefix(name[len(prefix):], "."), ".jsonl")
-
-			n, err := strconv.Atoi(part)
-			if err != nil {
-				continue
-			}
-
-			idx = n
-		}
-
-		if idx > bestIndex {
-			bestIndex = idx
-			best = name
-		}
-	}
-
-	if best == "" {
-		return ""
-	}
-
-	return best
-}
-
-func nextArchivePath(dir, day string) string {
-	base := filepath.Join(dir, "requests-"+day)
-
-	path := base + ".jsonl"
-	for i := 1; fileExists(path); i++ {
-		path = fmt.Sprintf("%s.%d.jsonl", base, i)
-	}
-
-	return path
-}
-
-func fileExists(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && !st.IsDir()
 }
 
 func (w *archiveWriter) flush() {
-	if w.buf == nil {
+	if w.out == nil {
 		return
 	}
 
-	if err := w.buf.Flush(); err != nil {
+	if err := w.out.Flush(); err != nil {
 		w.setErr(err)
 	}
 }
 
-func (w *archiveWriter) closeFile() {
-	if w.buf != nil {
-		_ = w.buf.Flush()
-	}
-
-	if w.file != nil {
-		_ = w.file.Close()
-	}
-
-	w.file = nil
-	w.buf = nil
-	w.path = ""
-	w.day = ""
-	w.size = 0
-}
-
-// archiveItem 是一个归档文件的裁剪元数据。
-type archiveItem struct {
-	path  string
-	size  int64
-	mtime time.Time
-}
-
-// isArchiveFile 判断目录项是否为归档文件（requests-*.jsonl）。
-func isArchiveFile(entry os.DirEntry) bool {
-	if entry.IsDir() {
-		return false
-	}
-
-	name := entry.Name()
-
-	return strings.HasPrefix(name, "requests-") && strings.HasSuffix(name, ".jsonl")
-}
-
-// scanArchiveItems 收集归档目录下所有归档文件的元数据与总字节数。
-func scanArchiveItems(dir string) ([]archiveItem, int64, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, 0, fmt.Errorf("scanArchiveItems: %w", err)
-	}
-
-	items := make([]archiveItem, 0, len(entries))
-
-	var total int64
-
-	for _, entry := range entries {
-		if !isArchiveFile(entry) {
-			continue
-		}
-
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-
-		items = append(items, archiveItem{
-			path: filepath.Join(dir, entry.Name()), size: info.Size(), mtime: info.ModTime(),
-		})
-		total += info.Size()
-	}
-
-	return items, total, nil
-}
-
+// prune 按保留期/总容量裁剪旧归档（共用 logrotate 的裁剪口径）。
 func (w *archiveWriter) prune() {
-	if !w.enabled() {
+	if !w.enabled() || w.out == nil {
 		return
 	}
 
-	items, total, err := scanArchiveItems(w.cfg.Dir)
-	if err != nil {
-		w.setErr(err)
-		return
-	}
-
-	slices.SortFunc(items, func(a, b archiveItem) int {
-		if a.mtime.Equal(b.mtime) {
-			return cmp.Compare(a.path, b.path)
-		}
-
-		return a.mtime.Compare(b.mtime)
-	})
-	w.removeExpired(items, total)
-}
-
-// removeExpired 按「最早优先」删除过期或超额的归档文件，跳过当前写入文件。
-func (w *archiveWriter) removeExpired(items []archiveItem, total int64) {
-	cutoff := time.Now().AddDate(0, 0, -w.cfg.RetentionDays)
-	for _, item := range items {
-		if item.path == w.path || (!item.mtime.Before(cutoff) && total <= w.cfg.MaxBytes) {
-			continue
-		}
-
-		if err := os.Remove(item.path); err == nil {
-			total -= item.size
-		}
-	}
+	w.out.Prune(time.Now())
 }
 
 func (w *archiveWriter) read(limit int, filter *Filter) ([]Event, error) {
-	if !w.enabled() {
+	if !w.enabled() || w.out == nil {
 		return nil, nil
 	}
 
 	limit = clampReadLimit(limit)
 
-	entries, err := os.ReadDir(w.cfg.Dir)
+	files, err := w.out.Files()
 	if err != nil {
 		return nil, fmt.Errorf("read: %w", err)
 	}
 	// 文件读取顺序无关紧要：结果一律按事件时间排序。不能依赖归档文件的 mtime 还原时间
-	// 顺序——同一秒内连续轮转写出的多个文件 mtime 经常完全相同（Linux 文件时间戳粒度粗），
-	// os.ReadDir 的字典序又会把装着最早事件的基准文件 requests-<day>.jsonl 排在
-	// requests-<day>.N.jsonl 之后；目录被整体拷贝 / 恢复备份后 mtime 更不可信。
+	// 顺序——同一秒内连续轮转写出的多个文件 mtime 经常完全相同（Linux 文件时间戳粒度粗）；
+	// 目录被整体拷贝 / 恢复备份后 mtime 更不可信。
 	var out []Event
 
-	for _, entry := range entries {
-		if !isArchiveFile(entry) {
-			continue
-		}
-
-		rows, err := readFile(filepath.Join(w.cfg.Dir, entry.Name()), filter)
+	for _, file := range files {
+		rows, err := readFile(file.Path, filter)
 		if err != nil {
 			return out, err
 		}
@@ -799,26 +588,18 @@ func (w *archiveWriter) stats() ArchiveStats {
 		Files:         0,
 		Bytes:         0,
 	}
-	if !archiveStats.Enabled {
+	if !archiveStats.Enabled || w.out == nil {
 		return archiveStats
 	}
 
-	entries, err := os.ReadDir(w.cfg.Dir)
+	fileCount, bytes, err := w.out.Stats()
 	if err != nil {
 		archiveStats.LastError = err.Error()
 		return archiveStats
 	}
 
-	for _, entry := range entries {
-		if !isArchiveFile(entry) {
-			continue
-		}
-
-		if info, err := entry.Info(); err == nil {
-			archiveStats.Files++
-			archiveStats.Bytes += info.Size()
-		}
-	}
+	archiveStats.Files = fileCount
+	archiveStats.Bytes = bytes
 
 	return archiveStats
 }
