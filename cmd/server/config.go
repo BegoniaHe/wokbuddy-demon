@@ -163,6 +163,17 @@ type Config struct {
 		// 一律使用 RemoteAddr。缺省只信任本机回环，供同机反代使用。
 		// 改动需重启进程。
 		TrustedProxies []string `json:"trusted_proxies"`
+		// UpstreamHealthWindow 上游劣化滑窗宽度（issue #488），如 "5m"；"0" = 关闭。
+		// 窗口内按 (域, 模型) 与全局统计 TTFB 均值与 5xx 比例，超阈值打 WARN 并
+		// 暴露到面板 overview。只观测，不改变选号。改动需重启进程。
+		UpstreamHealthWindow string `json:"upstream_health_window"`
+		// UpstreamHealthTTFBMs TTFB 均值告警阈值（毫秒），缺省 5000。
+		UpstreamHealthTTFBMs int `json:"upstream_health_ttfb_ms"`
+		// UpstreamHealth5xxRatio 5xx 比例告警阈值（0~1），缺省 0.25。
+		UpstreamHealth5xxRatio float64 `json:"upstream_health_5xx_ratio"`
+		// UpstreamHealthMinSamples 触发评估的最小样本数，缺省 10；样本不足不告警
+		// （默认保守，避免低流量下误报）。
+		UpstreamHealthMinSamples int `json:"upstream_health_min_samples"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -555,6 +566,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// UpstreamHealthWindowDur 上游劣化滑窗宽度（issue #488）；0 = 关闭。
+	UpstreamHealthWindowDur time.Duration `json:"-"`
 	// RotateBudgetDur 解析后的轮换总时长预算（issue #17）；0 = 不限。
 	RotateBudgetDur time.Duration `json:"-"`
 	// KeepaliveIntervalDur 解析后的入站 SSE 心跳间隔（issue #54）；0 = 关闭。
@@ -611,6 +624,10 @@ func baseDefaults() *Config {
 	config.Cooldown.SoftRateMax = "2h"
 	config.Server.ReadTimeout = "300s"
 	config.Server.MaxBodyBytes = defaultMaxBodyBytes
+	config.Server.UpstreamHealthWindow = "5m"
+	config.Server.UpstreamHealthTTFBMs = 5000
+	config.Server.UpstreamHealth5xxRatio = 0.25
+	config.Server.UpstreamHealthMinSamples = 10
 	// 缺省只信任本机回环：同机 nginx / Caddy 反代可直接拿到真实客户端 IP。
 	// 反代在另一台机器时必须显式配置，否则来源一律是反代地址。
 	config.Server.TrustedProxies = []string{"127.0.0.1/32", "::1/128"}
@@ -2155,6 +2172,38 @@ func (c *Config) normalizeServerDuration() error {
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义: %w",
 			c.Server.ReadTimeout, errNormalizeServerDurationFailed)
+	}
+
+	return c.normalizeUpstreamHealth()
+}
+
+// normalizeUpstreamHealth 解析劣化滑窗宽度并校验阈值（issue #488）。
+func (c *Config) normalizeUpstreamHealth() error {
+	if c.Server.UpstreamHealthWindow == "" {
+		c.Server.UpstreamHealthWindow = "5m"
+	}
+
+	var err error
+	if c.UpstreamHealthWindowDur, err = time.ParseDuration(c.Server.UpstreamHealthWindow); err != nil {
+		return fmt.Errorf("server.upstream_health_window: %w", err)
+	}
+
+	if c.UpstreamHealthWindowDur < 0 {
+		return fmt.Errorf("server.upstream_health_window: 负时长 %q 无意义: %w",
+			c.Server.UpstreamHealthWindow, errNormalizeServerDurationFailed)
+	}
+
+	if c.Server.UpstreamHealth5xxRatio < 0 || c.Server.UpstreamHealth5xxRatio > 1 {
+		return fmt.Errorf("server.upstream_health_5xx_ratio: 必须在 [0,1]，当前 %v: %w",
+			c.Server.UpstreamHealth5xxRatio, errNormalizeServerDurationFailed)
+	}
+
+	if c.Server.UpstreamHealthTTFBMs <= 0 {
+		c.Server.UpstreamHealthTTFBMs = 5000
+	}
+
+	if c.Server.UpstreamHealthMinSamples <= 0 {
+		c.Server.UpstreamHealthMinSamples = 10
 	}
 
 	return nil

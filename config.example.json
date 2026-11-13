@@ -12,6 +12,10 @@
     "request_accept_grace_seconds": 0,
     "shutdown_grace_seconds": 30,
     "cors_origins": [],
+    "upstream_health_window": "5m",
+    "upstream_health_ttfb_ms": 5000,
+    "upstream_health_5xx_ratio": 0.25,
+    "upstream_health_min_samples": 10,
     "trusted_proxies": ["127.0.0.1/32", "::1/128"]
   },
   "panel": {

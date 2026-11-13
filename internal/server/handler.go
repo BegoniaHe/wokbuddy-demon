@@ -126,6 +126,14 @@ type Config struct {
 	DecisionTrace       bool
 	DecisionTraceSample float64
 
+	// UpstreamHealthWindow 上游劣化滑窗宽度（issue #488）；<=0 = 关闭。
+	// UpstreamHealthTTFB/5xxRatio/MinSamples 是 TTFB 均值与 5xx 比例的告警阈值与
+	// 最小样本数，样本不足不告警。只观测，不改选号。
+	UpstreamHealthWindow     time.Duration
+	UpstreamHealthTTFB       time.Duration
+	UpstreamHealth5xxRatio   float64
+	UpstreamHealthMinSamples int
+
 	// CORSOrigins 允许跨域访问 `/v1/*` 的 Origin（已规范化）；空 = 关闭。
 	CORSOrigins []string
 	// TrustedProxies 可信反向代理网段。只有 TCP 对端落在这些网段内时，才采信
@@ -168,6 +176,9 @@ type Handler struct {
 	// exitFail 出口维度传输层失败台账（issue #493）：拨号/TLS/EOF 归因到直连/代理池/
 	// 代理槽，不按当前被选号记连败。进程内状态、重启清零。
 	exitFail exitFailureGate
+	// upstreamHealth 上游劣化滑窗（issue #488）：按 (域, 模型) 与全局统计 TTFB / 5xx
+	// 比例，超阈值打 WARN。只观测，不参与选号。window<=0 时关闭。
+	upstreamHealth *upstreamHealth
 	// streams 在途 SSE 流注册表（issue #19）：关闭时显式等待排空并记录未排空数。
 	streams *streamTracker
 	// authLimiter 运维面鉴权失败按 IP 限速（issue #61）。
@@ -251,6 +262,8 @@ func NewHandler(cfg *Config) *Handler {
 	if config.RefreshSkew <= 0 {
 		config.RefreshSkew = 10 * time.Minute
 	}
+	// 上游劣化滑窗（issue #488）：window<=0 = 关闭；阈值缺省保守（5s / 25% / 10 样本）。
+	applyUpstreamHealthDefaults(&config)
 
 	if config.PromptMode == "" {
 		config.PromptMode = "custom" // 缺省 custom：网关自有提示词
@@ -268,6 +281,7 @@ func NewHandler(cfg *Config) *Handler {
 
 	handler := &Handler{
 		cfg: config, mux: http.NewServeMux(), metrics: newMetricsRegistry(), streams: newStreamTracker(),
+		upstreamHealth:    newUpstreamHealthFromConfig(&config),
 		authLimiter:       authLimiter,
 		clientAuthLimiter: httpauth.NewLimiter(httpauth.DefaultFailLimit*3, httpauth.DefaultFailWindow),
 		cors:              make(map[string]bool, len(config.CORSOrigins)),
@@ -2836,13 +2850,17 @@ func fingerprintBlocked(kind upstream.ErrKind, respBody []byte) bool {
 
 // handleHTTPError 处置上游 >=400 响应：分类 → 降级重试 / 请求级 fail-fast / 冷却换号。
 //
-//nolint:cyclop,gocyclo,maintidx // 错误类别按优先级线性展开，拆散会掩盖处置顺序。
+//nolint:cyclop,gocyclo,maintidx,funlen // 错误类别按优先级线性展开，拆散会掩盖处置顺序。
 func (f *chatFlow) handleHTTPError(
 	ctx context.Context, acct *auth.Auth, status int, respBody []byte,
 	uerr *upstream.Error, attemptStarted time.Time, i int,
 ) rotationAction {
 	f.recordAttempt(acct.UID, &pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 	f.st.status = status
+
+	if status >= http.StatusInternalServerError {
+		f.h.upstreamHealth.markServer5xx(f.realm, f.bareModel)
+	}
 
 	var kind upstream.ErrKind
 	if uerr != nil {
@@ -4125,6 +4143,9 @@ func (f *chatFlow) recordAttempt(
 			delta.TokensPerSecond = tps
 		}
 	}
+
+	// 上游劣化滑窗（issue #488）：每次上游尝试计一次，TTFB 仅在有观测时计入。
+	f.h.upstreamHealth.observe(f.realm, f.bareModel, ttfb, false)
 
 	f.h.cfg.Pool.RecordTokenUsage(uid, delta)
 	// 健康台账（issue #16）：成功口径同 usage（deltaHasUsage），TTFT 有观测才并入。
