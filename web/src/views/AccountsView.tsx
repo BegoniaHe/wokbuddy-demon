@@ -719,17 +719,28 @@ function AccountRow({
       return;
     try {
       if (a === 'checkin') {
-        const r = await postJSON<{ credits?: number; credits_total?: number; checkin_message?: string }>(
-          'accounts/' + encodeURIComponent(u) + '/checkin',
-        );
-        toast(
-          '签到完成' +
-            (r.credits != null
-              ? '，积分 ' + r.credits + (r.credits_total && r.credits_total > 0 ? '/' + r.credits_total : '')
-              : '') +
-            (r.checkin_message ? '（' + r.checkin_message + '）' : ''),
-          'ok',
-        );
+        const r = await postJSON<{
+          checkin_state?: 'checked' | 'already' | 'inactive' | 'failed';
+          checkin_credit?: number;
+          checkin_message?: string;
+          skipped?: boolean;
+          reason?: string;
+        }>('accounts/' + encodeURIComponent(u) + '/checkin');
+        // 四态分开出文案（issue #511）：重复签到不再报成「签到完成」并显示余额当增量。
+        if (r.skipped) {
+          toast('未签到：' + (r.reason || '该账号无个人签到体系'), 'ok');
+        } else if (r.checkin_state === 'already') {
+          toast('今天已签到，无需重复', 'ok');
+        } else if (r.checkin_state === 'inactive') {
+          toast('签到活动未开启（非失败）' + (r.checkin_message ? '：' + r.checkin_message : ''), 'ok');
+        } else if (r.checkin_state === 'failed') {
+          toast('签到失败' + (r.checkin_message ? '：' + r.checkin_message : ''), 'err');
+        } else {
+          toast(
+            '签到成功' + (r.checkin_credit != null ? '，+' + r.checkin_credit + ' 积分' : ''),
+            'ok',
+          );
+        }
       } else if (a === 'travel') {
         const r = await postJSON<{ ran?: boolean; ok?: boolean; skip_reason?: string }>(
           'accounts/' + encodeURIComponent(u) + '/travel',

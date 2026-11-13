@@ -287,20 +287,7 @@ func isPromptTooLongStatus(status int) bool {
 		status == http.StatusRequestEntityTooLarge
 }
 
-// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
-// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
-// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
-var (
-	alreadyCheckinMarkers = []string{"已签到", "already"}
-	// inactiveCheckinMarkers "活动未开启/未开放/已结束"等非错误态关键词（上游对未开放
-	// 的签到活动返回 code!=0 + 明确文案）。保守取带「活动」上下文的显式短语：未命中即判
-	// 真失败，避免把真失败误当 inactive 而漏报；也不误伤凭证类文案（如「登录态已过期」
-	// 含「已过期」但非活动态）。文案按实测补充（见 issue #27）。
-	inactiveCheckinMarkers = []string{
-		"活动未开启", "活动未开放", "活动已结束", "活动已过期",
-	}
-	badParamsMarkerCode = `"code":11101`
-)
+var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -1957,6 +1944,27 @@ func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (jso
 // 调用方需要「信封 / 顶层平铺」双解时用它（如 FetchAccountProfile），其余一律走
 // doJSONAt。
 func doRawAt(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, error) {
+	raw, status, err := doRawResponse(hc, req, maxBytes)
+	if err != nil {
+		return nil, status, err
+	}
+
+	if status >= http.StatusBadRequest {
+		kind := Classify(status, string(raw))
+
+		return nil, status, &Error{
+			Kind: kind, Status: status,
+			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
+		}
+	}
+
+	return raw, status, nil
+}
+
+// doRawResponse 发出请求并返回原始 body 与状态码：只做大小上限与传输层错误，
+// 不按状态码分类、不解信封。调用方要自己看 status 与 body 形态时用它
+// （签到回执：成功平铺 / 失败 400 信封都只能从原始 body 读）。
+func doRawResponse(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultJSONBodyLimit
 	}
@@ -1975,15 +1983,6 @@ func doRawAt(hc *http.Client, req *http.Request, maxBytes int64) ([]byte, int, e
 	if int64(len(raw)) > maxBytes {
 		return nil, resp.StatusCode, fmt.Errorf("response body exceeds %d bytes: %w",
 			maxBytes, errDoJSONLimitFailed)
-	}
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		kind := Classify(resp.StatusCode, string(raw))
-
-		return nil, resp.StatusCode, &Error{
-			Kind: kind, Status: resp.StatusCode,
-			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
-		}
 	}
 
 	return raw, resp.StatusCode, nil

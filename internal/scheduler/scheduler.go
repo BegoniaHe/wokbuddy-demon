@@ -769,8 +769,13 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 	all := s.cfg.Pool.List()
 	targets := make([]batchTarget, 0, len(all))
 	// transient：主批「瞬时失败」账号，批后进入分钟级补签队列（issue #501）。
-	// runPacedBatch 顺序执行 run，收进本地切片不需要锁。
-	var transient []checkinBackfillTarget
+	// tally：按签到回执状态分别计数（新签到 / 今日已签 / 活动未开启 / 失败），
+	// 不再只看 HTTP 成败（issue #511）。
+	// runPacedBatch 顺序执行 run，收进本地切片与计数不需要锁。
+	var (
+		transient []checkinBackfillTarget
+		tally     checkinTally
+	)
 
 	for i := range all {
 		status := &all[i]
@@ -783,10 +788,12 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 		targets = append(targets, batchTarget{
 			uid: account.UID,
 			run: func() bool {
-				ok, checkinErr := s.runCheckinAccount(ctx, status, account, expiringSoon)
+				ok, state, checkinErr := s.runCheckinAccount(ctx, status, account, expiringSoon)
 				if checkinErr != nil && upstream.IsTransientBillingErr(checkinErr) {
 					transient = append(transient, checkinBackfillTarget{uid: account.UID, nickname: status.Nickname})
 				}
+
+				tally.record(state)
 
 				return ok
 			},
@@ -794,6 +801,9 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 	}
 
 	total, success, failure = s.runPacedBatch(ctx, taskCheckin, delay, targets)
+	s.logger.Printf("checkin 汇总: 尝试 %d 新签到 %d 今日已签 %d 活动未开启 %d 失败 %d",
+		total, tally.fresh, tally.already, tally.inactive, tally.failed)
+
 	if ctx.Err() != nil {
 		return total, success, failure
 	}
@@ -812,6 +822,33 @@ func (s *Scheduler) checkinAll(ctx context.Context) (total, success, failure int
 type checkinBackfillTarget struct {
 	uid      string
 	nickname string
+}
+
+// errCheckinRejected 签到被上游业务拒绝（失败回执）。用静态哨兵包装上游文案，
+// 让日志可读又不产生动态 error（err113）。
+var errCheckinRejected = errors.New("签到失败")
+
+// checkinTally 批量签到的按状态计数（issue #511）：新签到 / 今日已签 / 活动未开启 /
+// 失败分别统计，不再只看 HTTP 成败。
+type checkinTally struct {
+	fresh    int
+	already  int
+	inactive int
+	failed   int
+}
+
+// record 累加一次回执状态。
+func (t *checkinTally) record(state upstream.CheckinState) {
+	switch state {
+	case upstream.CheckinStateChecked:
+		t.fresh++
+	case upstream.CheckinStateAlready:
+		t.already++
+	case upstream.CheckinStateInactive:
+		t.inactive++
+	case upstream.CheckinStateFailed:
+		t.failed++
+	}
 }
 
 // defaultCheckinBackfillDelays 主批结束后的补签窗口（issue #501）：上游
@@ -907,7 +944,7 @@ func (s *Scheduler) backfillCheckins(ctx context.Context, targets []checkinBackf
 			continue
 		}
 
-		if ok, _ := s.checkinOne(ctx, target.uid, target.nickname, account); ok {
+		if ok, _, _ := s.checkinOne(ctx, target.uid, target.nickname, account); ok {
 			s.logger.Printf("checkin %s: 补签成功", logfmt.Label(target.uid, target.nickname))
 		}
 	}
@@ -931,18 +968,22 @@ func (s *Scheduler) checkinAuth(st *pool.Status, includeDisabled bool) (*auth.Au
 }
 
 // runCheckinAccount 执行单账号签到（企业版跳过）+ 余额刷新。
-// 返回该账号本轮是否成功（签到失败或余额查询失败均记失败），以及签到本身的错误
-// （余额失败不入 checkinErr：补签队列只关心签到瞬时失败）。
+// 返回该账号本轮是否成功（签到失败或余额查询失败均记失败）、签到回执状态（批量汇总
+// 按状态分别计数；企业版跳过时为空串），以及签到本身的错误（余额失败不入
+// checkinErr：补签队列只关心签到瞬时失败）。
 func (s *Scheduler) runCheckinAccount(
 	ctx context.Context, status *pool.Status, account *auth.Auth, expiringSoon time.Duration,
-) (bool, error) {
+) (bool, upstream.CheckinState, error) {
 	ok := true
 
-	var checkinErr error
+	var (
+		state      upstream.CheckinState
+		checkinErr error
+	)
 	// 企业版无签到体系：上游直接 400；跳过签到，但余额查询照常跑
 	// （企业额度是 credit_floor 判定与面板额度展示的唯一数据源）。
 	if !account.IsEnterprise() {
-		ok, checkinErr = s.checkinOne(ctx, status.UID, status.Nickname, account)
+		ok, state, checkinErr = s.checkinOne(ctx, status.UID, status.Nickname, account)
 	}
 
 	// 用含逐日到期批次的快照写入：签到链路也保留完整批次，避免把后台刷新刚写入的
@@ -950,7 +991,7 @@ func (s *Scheduler) runCheckinAccount(
 	snap, err := s.cfg.Upstream.UserResourceSnapshot(ctx, account, expiringSoon)
 	if err != nil {
 		log.Printf("user-resource %s: %v", logfmt.Label(status.UID, status.Nickname), err)
-		return false, checkinErr
+		return false, state, checkinErr
 	}
 
 	s.cfg.Pool.ReenableIfCredits(status.UID, snap.Remain, snap.Total)
@@ -959,47 +1000,63 @@ func (s *Scheduler) runCheckinAccount(
 	)
 	s.notifyCreditLow(account, snap.Remain)
 
-	return ok, checkinErr
+	return ok, state, checkinErr
 }
 
-// checkinOne 单账号签到并落一行结果日志：按 CheckinResult 分类呈现——成功/幂等/
-// 活动未开启（非错误态）分开表述，只有真失败记 error 行；均不阻断后续余额查询。
-// 返回是否算成功，以及签到请求本身的错误（成功/幂等/未开启均为 nil）：调度侧据
-// 后者判定是否进分钟级补签队列（issue #501）。
-func (s *Scheduler) checkinOne(ctx context.Context, uid, nickname string, account *auth.Auth) (bool, error) {
+// checkinOne 单账号签到并落一行结果日志：按回执状态呈现——成功/幂等/活动未开启
+// （非错误态）分开表述，只有真失败记 error 行；均不阻断后续余额查询。
+// 返回是否算成功、回执状态（批量汇总按状态分别计数）以及签到请求本身的错误
+// （成功/幂等/未开启均为 nil）：调度侧据后者判定是否进分钟级补签队列（issue #501）。
+func (s *Scheduler) checkinOne(
+	ctx context.Context, uid, nickname string, account *auth.Auth,
+) (bool, upstream.CheckinState, error) {
 	// 先查签到活动状态：今日已签则跳过重复请求；状态查询失败时回落直接签到。
 	if checked, err := s.cfg.Upstream.CheckinActivityStatus(account); err == nil && checked {
 		s.cfg.Pool.NoteCheckinDone(uid)
 		s.logger.Printf("checkin %s: 今天已签到（状态预检）", logfmt.Label(uid, nickname))
 
-		return true, nil
+		return true, upstream.CheckinStateAlready, nil
 	}
 
-	err := s.cfg.Upstream.DailyCheckin(ctx, account)
-	switch upstream.ClassifyCheckin(err) {
-	case upstream.CheckinOK:
+	receipt, checkinErr := s.cfg.Upstream.DailyCheckinReceipt(ctx, account)
+
+	switch receipt.State {
+	case upstream.CheckinStateChecked:
 		// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
 		// 重复触发时出现），成功也落一行。
 		s.cfg.Pool.NoteCheckinDone(uid)
 		s.logger.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
 
-		return true, nil
-	case upstream.CheckinAlready:
+		return true, receipt.State, nil
+	case upstream.CheckinStateAlready:
 		// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不当失败打 error 行。
 		s.cfg.Pool.NoteCheckinDone(uid)
 		s.logger.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, nickname))
 
-		return true, nil
-	case upstream.CheckinInactive:
+		return true, receipt.State, nil
+	case upstream.CheckinStateInactive:
 		// 活动未开启/已结束是上游非错误态：不标记已签、不打 error 行（issue #27）。
 		s.logger.Printf("checkin %s: 签到活动未开启（跳过，非失败）", logfmt.Label(uid, nickname))
-		return true, nil
-	default:
-		s.logger.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
-		s.notifyTaskFailed("checkin", uid, nickname, account.Realm())
-
-		return false, fmt.Errorf("daily checkin %s: %w", logfmt.Label(uid, nickname), err)
+		return true, receipt.State, nil
+	case upstream.CheckinStateFailed:
 	}
+
+	// 失败文案用回执里的上游 msg（已去信封）；传输层/5xx 用原始 error 保留瞬时判定，
+	// 补签队列照常接住（issue #501）。
+	err := checkinErr
+	if err == nil {
+		msg := receipt.Message
+		if msg == "" {
+			msg = "上游未返回可读失败文案"
+		}
+
+		err = fmt.Errorf("%w: %s", errCheckinRejected, msg)
+	}
+
+	s.logger.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
+	s.notifyTaskFailed("checkin", uid, nickname, account.Realm())
+
+	return false, receipt.State, fmt.Errorf("daily checkin %s: %w", logfmt.Label(uid, nickname), err)
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。

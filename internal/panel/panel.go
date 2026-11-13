@@ -1015,36 +1015,71 @@ func (*Panel) accountToggle(
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// runCheckin 执行单号签到并返回 (跳过原因, 是否已签, 说明文案)。
+// runCheckin 执行单号签到并返回 (跳过原因, 回执)。
 // 跳过原因非空表示企业版无个人签到体系（issue #108）：不发起上游调用。
-// global 账号与调度器同口径正常签到（upstream.DailyCheckin 按 realm 分流）。
-// 其余情况按签到结果分类呈现：幂等拒绝同样是「今日已签」；活动未开启是上游
-// 非错误态，不标记已签、给出可区分文案（issue #27）；其余才是真失败。
+// global 账号与调度器同口径正常签到（upstream.DailyCheckinReceipt 按 realm 分流）。
+// 回执带状态（新签到 / 今日已签 / 活动未开启 / 失败）与上游返回的签到积分，调用方
+// 据此分别出文案，不再靠「有没有 error」猜（issue #511）。
 func (p *Panel) runCheckin(
 	ctx context.Context, account *auth.Auth, uid string,
-) (denyReason string, done bool, msg string) {
+) (denyReason string, receipt upstream.CheckinReceipt) {
 	if denyReason = checkinDenyReason(account); denyReason != "" {
-		return denyReason, false, denyReason
+		return denyReason, upstream.CheckinReceipt{State: upstream.CheckinStateInactive}
 	}
 
-	if err := p.cfg.Upstream.DailyCheckin(ctx, account); err != nil {
-		switch upstream.ClassifyCheckin(err) {
-		case upstream.CheckinAlready:
-			p.cfg.Pool.NoteCheckinDone(uid)
-			return "", true, "今天已签到"
-		case upstream.CheckinInactive:
-			return "", false, "签到活动未开启（非失败）"
-		default:
-			return "", false, err.Error() // 业务错误照常查余额
-		}
+	receipt, err := p.cfg.Upstream.DailyCheckinReceipt(ctx, account)
+	if err != nil {
+		// 传输层/5xx 重试耗尽：回执已是 failed，日志留一行原因，文案仍用回执的通用描述。
+		log.Printf("panel: checkin uid=%s receipt error: %v", uid, err)
 	}
 
-	p.cfg.Pool.NoteCheckinDone(uid)
+	switch receipt.State {
+	case upstream.CheckinStateChecked, upstream.CheckinStateAlready:
+		// 今日已签到同样是幂等成功：标记当日已签，避免面板反复提示。
+		p.cfg.Pool.NoteCheckinDone(uid)
+	case upstream.CheckinStateInactive, upstream.CheckinStateFailed:
+		// 非成功态不标记已签。
+	}
 
-	return "", true, ""
+	return "", receipt
 }
 
-// accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
+// checkinResponse 组装单号签到回执的可见字段：状态、是否算已签、可读文案与本次
+// 签到积分（只在新签到且上游带回数字时给增量）。
+func checkinResponse(
+	account *auth.Auth, denyReason string, checkin upstream.CheckinReceipt,
+) map[string]any {
+	done := checkin.State == upstream.CheckinStateChecked ||
+		checkin.State == upstream.CheckinStateAlready
+
+	resp := map[string]any{
+		"ok":            true,
+		"checkin_done":  done,
+		"checkin_state": string(checkin.State),
+	}
+	if denyReason != "" {
+		// 明确「跳过」而非「签到成功」：checkin_done 保持 false，reason 可读。
+		resp["skipped"] = true
+		resp["reason"] = denyReason
+	}
+
+	if account.IsEnterprise() {
+		resp["enterprise"] = true
+	}
+
+	if checkin.Message != "" {
+		resp["checkin_message"] = checkin.Message
+	}
+
+	// 只在新签到且回执带回数字时才给积分增量：重复签到没有增量，缺失时也不显示 0。
+	if checkin.State == upstream.CheckinStateChecked && checkin.CreditKnown {
+		resp["checkin_credit"] = checkin.Credit
+	}
+
+	return resp
+}
+
+// accountCheckin 单号签到：签到 + 余额查询解冻（已签到等业务拒绝不阻塞余额刷新），
 // 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
@@ -1059,22 +1094,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 额度查询按 realm/企业口径分流（upstream.UserResourceSnapshot）。
 	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
-	denyReason, checkinDone, checkinMsg := p.runCheckin(r.Context(), account, uid)
+	denyReason, checkin := p.runCheckin(r.Context(), account, uid)
 
-	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
-	if denyReason != "" {
-		// 明确「跳过」而非「签到成功」：checkin_done 保持 false，reason 可读。
-		resp["skipped"] = true
-		resp["reason"] = denyReason
-	}
-
-	if account.IsEnterprise() {
-		resp["enterprise"] = true
-	}
-
-	if checkinMsg != "" {
-		resp["checkin_message"] = checkinMsg
-	}
+	resp := checkinResponse(account, denyReason, checkin)
 
 	// 用含逐日到期批次的快照写入：单号签到同样保留完整批次，而不是把后台刷新
 	// 刚写入的批次清单清空（SetCreditsDetailed 无批次信息，会清旧批次）。
@@ -1090,7 +1112,8 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
 	resp["credits"] = snap.Remain
 	resp["credits_total"] = snap.Total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, snap.Remain, snap.Total)
+	log.Printf("panel: checkin uid=%s state=%s msg=%q credit=%d/%v credits=%d/%d",
+		uid, checkin.State, checkin.Message, checkin.Credit, checkin.CreditKnown, snap.Remain, snap.Total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
