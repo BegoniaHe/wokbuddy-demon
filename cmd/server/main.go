@@ -337,7 +337,7 @@ type observability struct {
 
 // newPanel 构造管理面板：所有可改字段经 live 快照读取，重启项由 cfg 静态持有。
 //
-//nolint:revive // 装配参数多，拆 struct 只会把构造噪音转移到调用点。
+//nolint:funlen,revive // 装配参数多，拆 struct 只会把构造噪音转移到调用点。
 func newPanel(
 	cfg *Config, cfgPath string, state *pool.Pool, client4 *upstream.Client, sch *scheduler.Scheduler,
 	redisMode string, sessCount func() int, obs *observability, trustedProxies []*net.IPNet,
@@ -378,11 +378,14 @@ func newPanel(
 		ProbeStateFile: stateSibling(cfg.StateFile, "model_probes.json"),
 		ConfigPath:     cfgPath,
 		ProxySlots:     currentProxySlotViews,
-		Pricing:        obs.pricing,
-		PricingRate:    cfg.Pricing.ExchangeRate,
-		Quota:          obs.quota,
-		Agents:         obs.agents,
-		CreditHistory:  creditLedger,
+		RefreshProxies: func() (int, error) {
+			return refreshProxySubscriptions(cfgPath, state, client4)
+		},
+		Pricing:       obs.pricing,
+		PricingRate:   cfg.Pricing.ExchangeRate,
+		Quota:         obs.quota,
+		Agents:        obs.agents,
+		CreditHistory: creditLedger,
 		LoadConfig: func() (any, error) {
 			return Load(cfgPath)
 		},

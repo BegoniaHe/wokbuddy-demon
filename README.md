@@ -145,6 +145,7 @@ docker compose up -d --build
 - `upstream.proxies`：全局代理池。非空时按健康轮换，失败代理指数冷却（30s 起、10min 封顶），全部冷却后半开探测。空 = 直连（默认）。
 - `upstream.proxy_slots`：命名代理槽（`{id, name, url, enabled}`）。在面板「账号」页把某个账号绑定到槽，该账号即固定走这个出口。
 - `upstream.realm_proxy_slots`：`realm → 槽 id` 默认出口，键只允许 `cn` / `global`。账号自身未绑定槽时按账号 realm 选出口；值为空串等于未设置，指向不存在或已禁用的槽会在保存时被拒绝。
+- `upstream.proxy_subscriptions`：代理订阅 URL 列表（`http(s)` 地址）。拉取到的内容可以是纯 URL 列表、base64 包裹的同类列表，或 Clash/KM YAML 的 `proxies:` 段；解析结果并入 `proxies` 的同一份全局池，非法条目单独跳过且不整批失败。拉取失败时保留上一次成功结果，不清空现有代理。`POST /panel/api/proxy_subscriptions/refresh`（需 admin key）可手动刷新。
 
 **代理写法**：`http://host:port`、`https://host:port`、`socks5://host:port`、`socks5h://host:port`（均可带 `user:pass@`），以及机场常见的四段式 `host:port:user:pass`（按 **socks5** 处理，端口必须 1..65535）。面板与日志只展示脱敏形态（`scheme://host:port`），口令不进日志、不进健康快照。
 

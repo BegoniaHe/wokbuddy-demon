@@ -356,6 +356,10 @@ type Config struct {
 		// Proxies 出站代理列表（issue #15）：支持 http://、https://、socks5://
 		// （可选 user:pass）；非空时出站按健康轮换，失败代理进入冷却。空 = 直连（默认）。
 		Proxies []string `json:"proxies"`
+		// ProxySubscriptions 代理订阅 URL 列表（issue #490）：http(s) 地址，内容支持
+		// base64 订阅文本 / Clash(KM) YAML `proxies:` 段 / 纯 URL 列表。解析结果并入
+		// Proxies 的同一份注册表；单个订阅失败保留上一次成功结果。热生效。
+		ProxySubscriptions []string `json:"proxy_subscriptions"`
 	} `json:"upstream"`
 
 	Features struct {
@@ -797,11 +801,13 @@ func WriteDefault(path string) (string, error) {
 	}
 
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		//nolint:gosec // 目录来自本地配置路径，属部署侧显式选择。
 		if merr := os.MkdirAll(dir, 0o755); merr != nil {
 			return "", fmt.Errorf("mkdir config dir: %w", merr)
 		}
 	}
 	// O_EXCL 原子拒绝覆盖：即使调用方漏判"不存在"，也绝不悄悄改写用户已有配置。
+	//nolint:gosec // 同上：配置路径由部署侧给出，落盘为设计行为。
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("write config: %w", err)
@@ -1483,11 +1489,16 @@ func (c *Config) normalizeLogging() error {
 }
 
 // normalizeProxies 校验出站代理 URL（issue #15）：任一非法即拒绝（避免运行时才暴露）。
+// 订阅 URL 只校验 scheme/host（内容在拉取时逐条校验，issue #490）。
 func (c *Config) normalizeProxies() error {
 	for _, raw := range c.Upstream.Proxies {
 		if _, err := outbound.ParseProxy(raw); err != nil {
 			return fmt.Errorf("upstream.proxies: %w", err)
 		}
+	}
+
+	if err := c.normalizeProxySubscriptions(); err != nil {
+		return err
 	}
 
 	seen := make(map[string]bool, len(c.Upstream.ProxySlots))
@@ -1517,6 +1528,31 @@ func (c *Config) normalizeProxies() error {
 	}
 
 	return c.normalizeRealmProxySlots(enabled)
+}
+
+// normalizeProxySubscriptions 归一订阅 URL（issue #490）：trim 后只允许 http/https
+// 且必须有 host；空串直接丢弃。
+func (c *Config) normalizeProxySubscriptions() error {
+	subs := make([]string, 0, len(c.Upstream.ProxySubscriptions))
+
+	for i, raw := range c.Upstream.ProxySubscriptions {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+
+		u, err := url.Parse(trimmed)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return fmt.Errorf("upstream.proxy_subscriptions[%d]: 需要 http(s) 订阅 URL: %w",
+				i, errNormalizeProxiesFailed)
+		}
+
+		subs = append(subs, trimmed)
+	}
+
+	c.Upstream.ProxySubscriptions = subs
+
+	return nil
 }
 
 // normalizeRealmProxySlots 归一 realm 默认出口（issue #39）：键 trim+小写后只允许
