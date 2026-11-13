@@ -325,14 +325,18 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 	c.writeFrameJSON(frame)
 }
 
-// holdLengthFrame 在续写前暂存 length 终态：续写成功则丢弃，失败则补发。
+// holdLengthFrame 在续写前暂存终态：续写成功则丢弃，失败则补发。
 // usage 帧立即写出并剥掉 finish_reason——hold 会被后续帧覆盖或在续写成功时
-// 丢弃（用量/积分漏记），直接写出 length 则会让客户端提前结束响应。
+// 丢弃（用量/积分漏记），直接写出终态则会让客户端提前结束响应。
+//
+// 与 usage / 正文同帧的终态必须按原值暂存（length 与 stop 都算）：上游实测会把
+// usage 与终态放同一帧，漏存 stop 后若续写段又没带回工具调用，整条响应就再也
+// 没有 finish_reason（工具轮兜底依赖这里补发，见 flushHeld）。
 func (c *TextContinueReader) holdLengthFrame(line string, frame map[string]any) {
 	if frameHasUsage(frame) {
 		c.writeFrameJSON(stripFinishReason(frame))
 
-		if frameFinishReasonIsLength(frame) {
+		if frameHasFinish(frame) {
 			c.held = append(c.held, finishOnlyFrameLine(frame)...)
 		}
 
@@ -342,7 +346,10 @@ func (c *TextContinueReader) holdLengthFrame(line string, frame map[string]any) 
 	if frameHasSubstantive(frame) {
 		// 终态帧同时带正文（少见）：正文先按普通内容写出，再暂存 finish-only 帧。
 		c.writeFrameJSON(stripFinishReason(frame))
-		c.held = append(c.held, finishOnlyFrameLine(frame)...)
+
+		if frameHasFinish(frame) {
+			c.held = append(c.held, finishOnlyFrameLine(frame)...)
+		}
 
 		return
 	}
@@ -409,11 +416,6 @@ func frameHasUsage(frame map[string]any) bool {
 	return ok && len(usage) > 0
 }
 
-// frameFinishReasonIsLength 报告帧是否带 finish_reason=length。
-func frameFinishReasonIsLength(frame map[string]any) bool {
-	return frameHasFinishReason(frame, "length")
-}
-
 // frameHasFinishReason 报告帧是否带终态；want 为空表示任意非空终态。
 func frameHasFinishReason(frame map[string]any, want string) bool {
 	choices, _ := frame["choices"].([]any)
@@ -450,7 +452,8 @@ func stripFinishReason(frame map[string]any) map[string]any {
 	return out
 }
 
-// finishOnlyFrameLine 构造仅含 finish_reason=length 的 data 行。
+// finishOnlyFrameLine 构造只保留终态（delta 置空）的 data 行：finish_reason 沿用
+// 原帧的值——length 仍是 length，stop 仍是 stop。
 func finishOnlyFrameLine(frame map[string]any) []byte {
 	out, _ := deepCopyMap(frame)
 	choices, _ := out["choices"].([]any)
@@ -463,7 +466,6 @@ func finishOnlyFrameLine(frame map[string]any) []byte {
 
 		choice["delta"] = map[string]any{}
 		delete(choice, "message")
-		choice["finish_reason"] = "length"
 	}
 
 	raw, err := json.Marshal(out)
