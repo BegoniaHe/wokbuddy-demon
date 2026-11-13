@@ -22,6 +22,8 @@ var sanitizeFeatures = []string{
 	"DeepSeek Harness",                                // DSH 身份句品牌词：上游按非官方渠道整单拦
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+	sanitizeInjectedIdentityProbe,                     // 上游注入的祈使式身份指令
+	sanitizeModelIdentityProbe,                        // 注入句的 <model_identity> 包裹标签
 }
 
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
@@ -108,6 +110,33 @@ const sanitizeDshPathsReplacement = "Paths beginning with @ refer to files the u
 	"and never claim to have inspected it before reading. The @\"...\" form only quotes a path " +
 	"that contains spaces."
 
+// sanitizeInjectedIdentityProbe 上游注入的祈使式身份指令的探针。
+// 与 sanitizeModelIdentityProbe 一样只用作预检（sanitizeFeatures）与门控，避免两处漂移。
+const sanitizeInjectedIdentityProbe = "identify yourself as"
+
+// sanitizeModelIdentityProbe 注入句常被 <model_identity> 标签包裹：标签本身会让模型
+// 把它当成「有个身份块」反复提及，剥标签、留内部文本。
+const sanitizeModelIdentityProbe = "model_identity"
+
+// sanitizeInjectedIdentityRe 上游服务端拼进模型的祈使句
+// （"When asked about your … identity, identify yourself as <名字>."）：模型复述进
+// reasoning_content，客户端把思维链带回历史，下一轮原样出站 → 声明→回流→再声明滚雪球。
+//
+// 必须整句匹配，不能只认 "identify yourself as"：合法指令
+// "Do not identify yourself as an AI." 与官方模板
+// "When the user asks who you are, … identify yourself as {{ productName }}'s …"
+// 都含该短语，误伤会改掉正常提示词（#512）。
+var sanitizeInjectedIdentityRe = regexp.MustCompile(
+	`(?i)when asked about your[^.\n]{0,60}?identity[^.\n]{0,60}?,?\s*identify yourself as\s+[^.\n]{1,80}\.`)
+
+// sanitizeInjectedIdentityReplacement 中性改写：不声明任何身份，也不删掉上下文里
+// 真实可用的信息（只把「自称某模型」换成「描述能力」）。
+const sanitizeInjectedIdentityReplacement = "When asked about your model identity, " +
+	"describe your capabilities without naming a specific model or vendor."
+
+// sanitizeModelIdentityTagRe 只删 <model_identity> / </model_identity> 标签，保留内部文本。
+var sanitizeModelIdentityTagRe = regexp.MustCompile(`(?i)</?model_identity>`)
+
 // sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
 func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
@@ -121,6 +150,15 @@ func sanitizeText(text string) string {
 	// @ 路径说明段：预检已是该段字面量，这里再挡一次，无关文本不跑跨行正则。
 	if strings.Contains(text, sanitizeDshPathsProbe) {
 		text = sanitizeDshPathsRe.ReplaceAllString(text, sanitizeDshPathsReplacement)
+	}
+
+	// 上游注入的祈使式身份指令与它的包裹标签（#512）：标签只剥不删内部文本。
+	if strings.Contains(text, sanitizeModelIdentityProbe) {
+		text = sanitizeModelIdentityTagRe.ReplaceAllString(text, "")
+	}
+
+	if strings.Contains(text, sanitizeInjectedIdentityProbe) {
+		text = sanitizeInjectedIdentityRe.ReplaceAllString(text, sanitizeInjectedIdentityReplacement)
 	}
 
 	if sanitizeHdrRe.MatchString(text) {
