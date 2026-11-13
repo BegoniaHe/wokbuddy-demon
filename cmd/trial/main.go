@@ -22,9 +22,11 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
@@ -92,7 +94,14 @@ func main() {
 	client.GlobalEnabled = true
 
 	rows := collectTrialRows(files, client)
+	if failedAll(printTrialReport(rows), len(rows)) {
+		// 全部账号失败 → 非零退出（与 signin 同口径）；already/na 属正常结果。
+		os.Exit(1)
+	}
+}
 
+// printTrialReport 打印逐账号表格与汇总，返回失败账号数。
+func printTrialReport(rows []trialRow) int {
 	var okN, alreadyN, notAppN, failN int
 
 	fmt.Printf("uid                                  | nick        | status  | detail\n")
@@ -116,6 +125,13 @@ func main() {
 
 	fmt.Printf("\ntotal=%d ok=%d already=%d na=%d fail=%d\n",
 		len(rows), okN, alreadyN, notAppN, failN)
+
+	return failN
+}
+
+// failedAll 报告是否所有账号都失败（空集不算失败）。
+func failedAll(failN, total int) bool {
+	return failN > 0 && failN == total
 }
 
 // loadProfiles 加载部署 profile。global 缺失不在启动期硬失败：CN 账号仍应
@@ -168,6 +184,22 @@ func trialForFile(str string, client *upstream.Client) trialRow {
 	if client.Profile == nil || client.Profile.ForRealm("global") == nil {
 		r.status, r.detail = trialFailed, errGlobalProfileMissing.Error()
 		return r
+	}
+
+	// 与 signin 同口径：AT 临期/过期且带 refresh token 时先刷新再领，否则过期
+	// 账号每轮都只能 FAIL。没有 refresh token 的手写扁平 auth 跳过刷新
+	// （NeedsRefresh 会把「无过期时间」视为需要刷新，直接调用会以
+	// no refresh token 失败）。
+	if account.RefreshTokenValue() != "" && account.NeedsRefresh(2*time.Hour) {
+		if err := client.RefreshTokenIfNeeded(account, 2*time.Hour); err != nil {
+			r.status, r.detail = trialFailed, "refresh: "+err.Error()
+
+			return r
+		}
+		// 落盘失败只记日志：内存里的新 token 本次仍可用，下轮会再刷新。
+		if err := account.SaveAtomicRetry(); err != nil {
+			log.Printf("trial %q save: %q", logfmt.UID8(account.UID), err.Error()) //nolint:gosec // 参数经 %q 转义，无注入面
+		}
 	}
 
 	r.status, r.detail = classifyTrial(client.ClaimTrial(account))
