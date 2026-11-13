@@ -74,7 +74,8 @@ func (p *Panel) logsExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(
 		`attachment; filename="runtime-logs-%s_%s.zip"`,
-		startOfDay(from).Format("2006-01-02"), startOfDay(to).Format("2006-01-02"),
+		startOfDay(from.In(time.Local)).Format("2006-01-02"),
+		startOfDay(to.In(time.Local)).Format("2006-01-02"),
 	))
 
 	writeLogZip(w, selected)
@@ -106,9 +107,12 @@ func parseLogsExportRange(values url.Values) (time.Time, time.Time, error) {
 }
 
 // selectLogFiles 按文件所属日筛选区间内的文件，返回选中文件与未压缩总量。
+// 日归属按**本机时区的自然日**判定：文件名里的日期是写入时的本地日期，参数若是
+// 带偏移的 RFC3339（如末尾 Z），必须先换到本地时区再取当日零点——否则时区换算
+// 会把当天文件判到区间外（UTC+ 时区的本地零点落在前一天 UTC）。
 func selectLogFiles(files []logrotate.File, from, to time.Time) ([]logrotate.File, int64) {
-	fromDay := startOfDay(from)
-	toDay := startOfDay(to)
+	fromDay := startOfDay(from.In(time.Local))
+	toDay := startOfDay(to.In(time.Local))
 
 	selected := make([]logrotate.File, 0, len(files))
 

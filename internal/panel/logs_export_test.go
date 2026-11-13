@@ -165,6 +165,29 @@ func TestLogsExportRangeOnly(t *testing.T) {
 	}
 }
 
+// TestLogsExportRangeOnlyRFC3339UTC 参数用带偏移的 RFC3339（末尾 Z）时，仍按本机
+// 时区的自然日筛文件：文件名里的日期是本地日期，直接拿 UTC 零点比较会把当天
+// 文件判到区间外（非 UTC 服务器上表现为 404）。
+func TestLogsExportRangeOnlyRFC3339UTC(t *testing.T) {
+	t.Parallel()
+
+	panel, sink := exportTestSink(t)
+
+	path := filepath.Join(sink.Dir(), "server-2026-09-01.log")
+	if err := os.WriteFile(path, []byte("sep first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := getExport(panel, "?from=2026-09-01T00:00:00Z&to=2026-09-01T23:59:59Z")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s（本地日应为 2026-09-01）", rec.Code, rec.Body)
+	}
+
+	if entries := zipEntries(t, rec.Body.Bytes()); len(entries) != 1 {
+		t.Fatalf("entries=%v want 1", entries)
+	}
+}
+
 // TestLogsExportDisabled 未启用落盘时返回 501。
 func TestLogsExportDisabled(t *testing.T) {
 	t.Parallel()
