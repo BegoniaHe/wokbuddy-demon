@@ -3221,6 +3221,10 @@ func (f *chatFlow) handleStreamSuccess(
 					"continuing once (declared_tools=%d)",
 					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel,
 					upstream.RedactForLog(tail, 160), f.declaredToolCount)
+				captureSample("narration_tail", f.bareModel, true, tail, map[string]any{
+					captureKeyDeclaredTools: f.declaredToolCount,
+					"tools_only":            f.declaredToolCount > 0,
+				})
 			})
 
 		stream = cont
@@ -3296,6 +3300,12 @@ func (f *chatFlow) warnStopWithoutToolCalls(finishReason string) {
 	log.Printf("WARN: [server] %s acct=%s model=%s: finish_reason=stop without tool_calls "+
 		"despite %d tool(s) declared (client will treat the turn as completed; tools never ran)",
 		f.st.mode, logfmt.Label(f.st.uid, f.st.nick), f.bareModel, f.st.toolsDeclared)
+
+	captureSample("stop_without_tool_calls", f.bareModel, f.stream, "", map[string]any{
+		captureKeyDeclaredTools: f.st.toolsDeclared,
+		captureKeyToolCalls:     f.st.toolCalls,
+		"finish_reason":         finishReason,
+	})
 }
 
 // retryOnceWithoutThinking 关思考同额度重发一次：返回 true 表示已重发（调用方直接
@@ -3321,6 +3331,10 @@ func (f *chatFlow) retryOnceWithoutThinking(
 func (f *chatFlow) retryReasoningOnly(
 	ctx context.Context, acct *auth.Auth, attemptStarted time.Time, i int,
 ) rotationAction {
+	captureSample("reasoning_only", f.bareModel, true, "", map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+	})
+
 	// 已救援过一次时不再记这次尝试：handlePreStreamEmpty 自己也写一次 recordAttempt，
 	// 两处都记会把同一次上游调用算成两次尝试（reqlib attempts 直接翻倍）。
 	if !f.reasoningRetried {
@@ -3389,6 +3403,10 @@ func (f *chatFlow) retryNonStreamReasoningOnly(
 	if f.aggregateShape(resp) != shapeReasoningOnly {
 		return rotDone, false
 	}
+
+	captureSample("reasoning_only", f.bareModel, false, "", map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+	})
 
 	// 已救援过一次：这条响应会原样下发，它的账由 handleNonStreamSuccess 末尾那次
 	// recordAttempt 统一写；这里再记一次会让同一次上游调用算成两次尝试。
@@ -3853,6 +3871,12 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 	if partial == "" {
 		return resp
 	}
+
+	captureSample("nonstream_continuation", f.bareModel, false, partial, map[string]any{
+		captureKeyDeclaredTools: f.declaredToolCount,
+		"tools_only":            toolsOnly,
+		"shape":                 f.aggregateShape(resp),
+	})
 
 	f.nonstreamContinued = true
 

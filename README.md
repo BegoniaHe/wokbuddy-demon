@@ -227,6 +227,19 @@ docker compose up -d --build
 
 实现为 20 个环形桶、写入时惰性推进，**没有后台 goroutine**。超阈值时打一条 `WARN: [server] 上游劣化 ...`，同键同窗口只告警一次；当前窗口指标随 `GET /panel/api/overview` 的 `upstream_health` 字段输出（`rows` 含每 (域, 模型) 与全局的样本数、平均 TTFB、5xx 比例与是否越线）。**只观测与告警**：不冷却账号、不改选号、不喂熔断/连败。四项均**改动需重启**。
 
+## 🔬 取证采样（`WB2API_CAPTURE_DIR`）
+
+排查「上游说到一半就停」「声明了工具却只说一句」这类形态问题时，可以打开取证采样：
+
+```bash
+WB2API_CAPTURE_DIR=./data/capture ./wokbuddy-demon
+```
+
+- **默认关闭**：不设置该环境变量时不建目录、不写文件，请求行为与不开启时完全一致。
+- 开启后每次命中异常形态（预告句续写、工具轮续写、reasoning-only 救援、非流式续写、stop 无 tool_calls）落一份样本：`capture-<UTC 时间戳>-<形态>.json`。
+- 样本只含**请求形状**（模型、是否流式、声明工具数）、**脱敏后的响应尾部**（≤400 字）与**判定结果**；`Authorization` / token / Cookie / `uid=` 一律替换为 `[REDACTED]`。
+- 目录不可写只告警一次并降级，不影响请求。样本属于本机诊断材料，不要提交进仓库（`data/` 已 gitignore）。
+
 ## 🐾 适合谁
 
 - 手上有多个 CodeBuddy 账号，但不想每天挨个打卡；
