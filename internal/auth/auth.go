@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -658,18 +659,36 @@ func (a *Auth) SaveAtomic() error {
 
 // readAuthDoc 读取 FilePath 现有的 JSON 文档作为保守写回的底稿。文件不存在、
 // 不可读或不是 JSON 对象时返回 nil（按全量重建处理，与引入底稿前一致）。
-func readAuthDoc(path string) map[string]any {
+//
+// 值按 json.RawMessage 保存原始字节，不经 map[string]any 往返：解码成 any 会把
+// 整数换成 float64，openId / uin 这类大整数写回后最低位就变了（issue #540）。
+func readAuthDoc(path string) map[string]json.RawMessage {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
 
-	var doc map[string]any
+	var doc map[string]json.RawMessage
 	if json.Unmarshal(raw, &doc) != nil {
 		return nil
 	}
 
 	return doc
+}
+
+// rawChild 取 doc[key] 的对象形态（值同样是原始字节）；缺失或不是对象时返回 nil。
+func rawChild(doc map[string]json.RawMessage, key string) map[string]json.RawMessage {
+	raw, ok := doc[key]
+	if !ok {
+		return nil
+	}
+
+	var child map[string]json.RawMessage
+	if json.Unmarshal(raw, &child) != nil {
+		return nil
+	}
+
+	return child
 }
 
 // flatAuthKeys 扁平形底稿里已建模的顶层键：迁入嵌套形后不能在顶层重名留旧值。
@@ -682,41 +701,26 @@ var flatAuthKeys = []string{
 // mergeDoc 在底稿上覆盖本仓库建模的键（issue #540）：auth/account 对象里未建模
 // 的键（account.phoneNumber / uin / email 等）与顶层扩展键原样保留，嵌套层级不
 // 重排。扁平形底稿的已知顶层键删除后迁入嵌套形，避免同一字段留两份旧值与新值。
-func (a *Auth) mergeDoc(base map[string]any) map[string]any {
-	doc := base
-	if doc == nil {
-		doc = map[string]any{}
-	} else if _, nested := doc["auth"]; !nested {
+func (a *Auth) mergeDoc(base map[string]json.RawMessage) map[string]any {
+	doc := make(map[string]any, len(base)+3)
+	for key, value := range base {
+		doc[key] = value // 原始字节：未建模键逐字保留（大整数不吃 float64 精度）
+	}
+
+	if _, nested := doc["auth"]; !nested {
 		for _, key := range flatAuthKeys {
 			delete(doc, key)
 		}
 	}
 
-	authDoc := childObject(doc, "auth")
-	authDoc["accessToken"] = a.AccessToken
-	authDoc["refreshToken"] = a.RefreshToken
-	authDoc["expiresAt"] = a.expiresAtOnDisk()
-	authDoc["domain"] = a.Domain
-	authDoc["realm"] = a.realm
-	doc["auth"] = authDoc
-
-	accountDoc := childObject(doc, "account")
-	accountDoc["uid"] = a.UID
-	accountDoc["enterpriseId"] = a.EnterpriseID
-	accountDoc["nickname"] = a.Nickname
-	// 可选身份字段只在有值时写回：手写账号通常没有这些键，写空键会让插件侧
-	// 读到「已填但为空」的版本 / 来源（type 尤其：空串不等于 personal）。
-	for key, value := range map[string]string{
-		"type":               a.EditionType,
-		"idSource":           a.IDSource,
-		"departmentFullName": a.DepartmentFullName,
-	} {
-		if value != "" {
-			accountDoc[key] = value
-		}
-	}
-
-	doc["account"] = accountDoc
+	doc["auth"] = mergeKnownKeys(rawChild(base, "auth"), map[string]any{
+		"accessToken":  a.AccessToken,
+		"refreshToken": a.RefreshToken,
+		"expiresAt":    a.expiresAtOnDisk(),
+		"domain":       a.Domain,
+		"realm":        a.realm,
+	})
+	doc["account"] = mergeKnownKeys(rawChild(base, "account"), a.accountDoc())
 
 	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
@@ -727,14 +731,39 @@ func (a *Auth) mergeDoc(base map[string]any) map[string]any {
 	return doc
 }
 
-// childObject 取 doc[key] 的对象形态；缺失或不是对象时新建。
-func childObject(doc map[string]any, key string) map[string]any {
-	child, _ := doc[key].(map[string]any)
-	if child == nil {
-		child = map[string]any{}
+// accountDoc 本仓库建模的 account 字段。
+func (a *Auth) accountDoc() map[string]any {
+	doc := map[string]any{
+		"uid":          a.UID,
+		"enterpriseId": a.EnterpriseID,
+		"nickname":     a.Nickname,
+	}
+	// 可选身份字段只在有值时写回：手写账号通常没有这些键，写空键会让插件侧
+	// 读到「已填但为空」的版本 / 来源（type 尤其：空串不等于 personal）。
+	for key, value := range map[string]string{
+		"type":               a.EditionType,
+		"idSource":           a.IDSource,
+		"departmentFullName": a.DepartmentFullName,
+	} {
+		if value != "" {
+			doc[key] = value
+		}
 	}
 
-	return child
+	return doc
+}
+
+// mergeKnownKeys 以原始子对象为基底覆盖本仓库建模的键；基底缺失时即全量重建。
+func mergeKnownKeys(base map[string]json.RawMessage, known map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(known))
+
+	for key, value := range base {
+		out[key] = value
+	}
+
+	maps.Copy(out, known)
+
+	return out
 }
 
 // expiresAtOnDisk 按来源文件的单位写回 expiresAt（秒或毫秒）。网关目录可能同时

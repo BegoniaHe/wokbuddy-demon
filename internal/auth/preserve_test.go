@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -256,5 +257,40 @@ func TestSaveAtomicWithoutSourceFileStillWritesNested(t *testing.T) {
 
 	if _, ok := doc["account"].(map[string]any); !ok {
 		t.Fatalf("首次落盘应写 account: %v", doc)
+	}
+}
+
+// TestSaveAtomicPreservesBigIntUnknownKeys 未建模键必须按原始字节保留：经
+// map[string]any 往返会把整数换成 float64，openId / uin 这类大整数最低位就变了。
+func TestSaveAtomicPreservesBigIntUnknownKeys(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "workbuddy-u6.json")
+	source := `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1753600000},` +
+		`"account":{"uid":"u6","openId":1234567890123456789}}`
+
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	account, err := Parse([]byte(source))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	account.FilePath = path
+	account.AccessToken = "new"
+
+	if saveErr := account.SaveAtomic(); saveErr != nil {
+		t.Fatalf("save: %v", saveErr)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+
+	if !strings.Contains(string(raw), "1234567890123456789") {
+		t.Fatalf("未建模大整数被改写: %s", raw)
 	}
 }
