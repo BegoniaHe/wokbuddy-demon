@@ -777,8 +777,10 @@ func anthropicSystemContent(raw jsontext.Value) (any, error) {
 	}
 
 	var blocks []map[string]any
-	if jsonx.Unmarshal(raw, &blocks) != nil {
-		return nil, fmt.Errorf("invalid system content: %w", errAnthropicMessageFailed)
+	if err := jsonx.Unmarshal(raw, &blocks); err != nil {
+		// 保留底层解析原因：畸形 system 块排障时只有「解析失败」这一个信息，
+		// 与 400 的通用哨兵合在一起才能定位是哪种畸形（issue 现场靠它区分）。
+		return nil, fmt.Errorf("invalid system content: %w: %w", errAnthropicMessageFailed, err)
 	}
 
 	parts := make([]any, 0, len(blocks))
