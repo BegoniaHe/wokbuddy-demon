@@ -100,8 +100,10 @@ func TestClaimRewardNotCompleted(t *testing.T) {
 	t.Parallel()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := jsonx.Marshal(map[string]any{"code": 400, "msg": "task not completed"})
+
 		w.WriteHeader(http.StatusBadRequest)
-		jsonx.MarshalWrite(w, map[string]any{"code": 400, "msg": "task not completed"})
+		_, _ = w.Write(body)
 	}))
 	defer srv.Close()
 

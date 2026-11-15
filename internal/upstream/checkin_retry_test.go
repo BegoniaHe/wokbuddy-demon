@@ -81,7 +81,7 @@ func TestDailyCheckinNoRetryOnBusinessError(t *testing.T) {
 	})
 
 	err := client.DailyCheckin(context.Background(), &auth.Auth{AccessToken: "at"})
-	if err == nil || !IsAlreadyCheckin(err) {
+	if err == nil || ClassifyCheckin(err) != CheckinAlready {
 		t.Fatalf("err=%v want already-checkin business error", err)
 	}
 

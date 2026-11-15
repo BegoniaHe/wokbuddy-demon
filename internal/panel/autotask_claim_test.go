@@ -177,7 +177,7 @@ func TestAutoRunActionRunsUnfinishedTask(t *testing.T) {
 	}
 }
 
-// runActionForTest 调 autoRunAction（不改全局节流变量：并行用例共享进程级状态，
+// runActionForTest 调 autoRunActionWithSnapshot（不改全局节流变量：并行用例共享进程级状态，
 // 改写会引入数据竞争；单项 1s 节流对本测试可接受）。
 func (p *Panel) runActionForTest(t *testing.T, act autoAction) map[string]any {
 	t.Helper()
@@ -189,5 +189,5 @@ func (p *Panel) runActionForTest(t *testing.T, act autoAction) map[string]any {
 		t.Fatal("account missing")
 	}
 
-	return p.autoRunAction(acct, act)
+	return p.autoRunActionWithSnapshot(acct, act, nil)
 }

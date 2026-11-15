@@ -1,7 +1,6 @@
 package jsonx
 
 import (
-	"bytes"
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"errors"
@@ -119,13 +118,12 @@ func TestDecodeAnyKeepsNumberLiterals(t *testing.T) {
 		t.Fatalf("value=%T want map[string]any", value)
 	}
 
-	big, ok := Number(obj["big"])
-	if !ok || string(big) != "12345678901234567890" {
-		t.Fatalf("big=%#v want 原字面量", obj["big"])
+	if got, want := jsonLiteral(obj["big"]), "12345678901234567890"; got != want {
+		t.Fatalf("big=%q want %s", got, want)
 	}
 
-	if frac, _ := Number(obj["frac"]); string(frac) != "1.50" {
-		t.Fatalf("frac=%#v want 1.50", obj["frac"])
+	if got, want := jsonLiteral(obj["frac"]), "1.50"; got != want {
+		t.Fatalf("frac=%q want %s", got, want)
 	}
 
 	arr, ok := obj["arr"].([]any)
@@ -136,6 +134,16 @@ func TestDecodeAnyKeepsNumberLiterals(t *testing.T) {
 	if got, ok := Int64(arr[1]); !ok || got != -2 {
 		t.Fatalf("arr[1]=%#v want -2", arr[1])
 	}
+}
+
+// jsonLiteral 取通用值里的 JSON 数字字面量文本；非字面量返回空串。
+func jsonLiteral(v any) string {
+	raw, ok := v.(jsontext.Value)
+	if !ok {
+		return ""
+	}
+
+	return string(raw)
 }
 
 // TestDecodeAnyRejectsTrailingData 粘帧不由通用值解码吞掉。
@@ -184,20 +192,6 @@ func TestUnmarshalReadRejectsTrailingData(t *testing.T) {
 	}
 }
 
-// TestMarshalWriteNoNewline 写流不追加换行，写入内容与 Marshal 一致。
-func TestMarshalWriteNoNewline(t *testing.T) {
-	t.Parallel()
-
-	var buf bytes.Buffer
-	if err := MarshalWrite(&buf, map[string]int{"a": 1}); err != nil {
-		t.Fatalf("MarshalWrite: %v", err)
-	}
-
-	if got, want := buf.String(), `{"a":1}`; got != want {
-		t.Fatalf("MarshalWrite=%q want %q", got, want)
-	}
-}
-
 // TestUnmarshalRejectUnknownMembers 严格模式：未知字段报错（clientprofile 使用）。
 func TestUnmarshalRejectUnknownMembers(t *testing.T) {
 	t.Parallel()
@@ -208,18 +202,5 @@ func TestUnmarshalRejectUnknownMembers(t *testing.T) {
 
 	if err := Unmarshal([]byte(`{"a":1,"b":2}`), &got, jsonv2.RejectUnknownMembers(true)); err == nil {
 		t.Fatal("未知字段应报错")
-	}
-}
-
-// TestNumberRejectsNonNumber Number 只认数字字面量。
-func TestNumberRejectsNonNumber(t *testing.T) {
-	t.Parallel()
-
-	if _, ok := Number(jsontext.Value(`"1"`)); ok {
-		t.Fatal("字符串不该被当成数字")
-	}
-
-	if _, ok := Number("1"); ok {
-		t.Fatal("Go 字符串不该被当成数字字面量")
 	}
 }

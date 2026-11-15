@@ -58,13 +58,6 @@ func MarshalIndent(in any, opts ...jsonv2.Options) ([]byte, error) {
 	return jsonv2.Marshal(in, withBase(encodeOpts, append(opts, jsontext.WithIndent("  ")))...)
 }
 
-// MarshalWrite 序列化到 io.Writer，不追加换行。
-//
-//nolint:wrapcheck // 薄封装：错误原样透出（含 io.Writer 的写入错误）。
-func MarshalWrite(out io.Writer, in any, opts ...jsonv2.Options) error {
-	return jsonv2.MarshalWrite(out, in, withBase(encodeOpts, opts)...)
-}
-
 // Unmarshal 反序列化单个 JSON 值：容忍重复键与字段名大小写差异。
 //
 //nolint:wrapcheck // 薄封装：错误原样透出。
@@ -130,16 +123,6 @@ var errNotObject = errors.New("顶层值不是 JSON 对象")
 
 // errInvalidValue 解码遇到非法 JSON 值。
 var errInvalidValue = errors.New("非法 JSON 值")
-
-// Number 判断 v 是否为 JSON 数字并返回其原始字面量。
-func Number(v any) (jsontext.Value, bool) {
-	raw, ok := v.(jsontext.Value)
-	if !ok || raw.Kind() != '0' {
-		return nil, false
-	}
-
-	return raw, true
-}
 
 // Int64 把 JSON 数值形态（原始字面量 / float64 / 整数）转 int64。
 func Int64(v any) (int64, bool) {

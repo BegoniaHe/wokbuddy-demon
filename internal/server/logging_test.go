@@ -1105,3 +1105,19 @@ func TestRequestMetricsToolCounters(t *testing.T) {
 		})
 	}
 }
+
+// paceTextTokens 估算一段正文的 token 数：ASCII ≈ 4 字符/token，CJK ≈ 1.5 字符/token。
+// 只用作出站整形节奏的测试 oracle；生产侧走 notePaceChars 累计后调 pacedTextTokens。
+func paceTextTokens(text string) int64 {
+	ascii, cjk := 0, 0
+
+	for _, r := range text {
+		if r >= paceCJKStart {
+			cjk++
+		} else {
+			ascii++
+		}
+	}
+
+	return pacedTextTokens(int64(ascii), int64(cjk))
+}

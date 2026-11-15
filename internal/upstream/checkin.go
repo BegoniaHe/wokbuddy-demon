@@ -51,37 +51,6 @@ func (c *Client) CheckinActivityStatus(a *auth.Auth) (todayChecked bool, err err
 	return status.TodayCheckedIn, nil
 }
 
-// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
-// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
-// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
-func IsAlreadyCheckin(err error) bool {
-	return matchCheckinMarker(err, alreadyCheckinMarkers)
-}
-
-// IsCheckinInactive 报告 err 是否表示"签到活动未开启/未开放/已结束"等非错误态。
-// 与 IsAlreadyCheckin 同口径：只认 *Error.Msg，网络层/解析层错误不在此识别；
-// 保守策略——未命中显式 inactive 关键词即返回 false（真失败不误判为 inactive）。
-func IsCheckinInactive(err error) bool {
-	return matchCheckinMarker(err, inactiveCheckinMarkers)
-}
-
-// matchCheckinMarker 对 *Error.Msg 做大小写不敏感的关键词包含匹配。
-func matchCheckinMarker(err error, markers []string) bool {
-	var upErr *Error
-	if !errors.As(err, &upErr) {
-		return false
-	}
-
-	lower := strings.ToLower(upErr.Msg)
-	for _, m := range markers {
-		if strings.Contains(upErr.Msg, m) || strings.Contains(lower, strings.ToLower(m)) {
-			return true
-		}
-	}
-
-	return false
-}
-
 // CheckinResult 签到结果分类：inactive（活动未开启）与 already（幂等）从真失败中分离，
 // 供调度日志与面板按类呈现，避免把非错误态刷成 error 行。
 type CheckinResult int
