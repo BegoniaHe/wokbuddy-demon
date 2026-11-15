@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRetireBlocksSaveAtomic 删除账号后 Retire 必须让在途 refresh 的写回失败，
@@ -458,6 +459,105 @@ func TestLoadDirDuplicateUIDWarning(t *testing.T) {
 		!strings.Contains(string(raw), "workbuddy-a-cn.json") ||
 		!strings.Contains(string(raw), "workbuddy-z-global.json") {
 		t.Errorf("expected WARN with both paths, got output: %s", string(raw))
+	}
+}
+
+// TestLoadDirBackfillsRealmOnlyForWinner 同 UID 多份凭证文件时只给胜出文件补 realm：
+// 落败副本不得被重写——回写会刷新 mtime，而加载顺序与「后载入者胜出」的口径耦合，
+// 给落败文件写盘会让胜负在下次启动时漂移（issue #530）。
+func TestLoadDirBackfillsRealmOnlyForWinner(t *testing.T) {
+	t.Parallel()
+
+	dir, stalePath, currentPath, staleBody, past := winnerBackfillFixture(t)
+
+	list, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	if len(list) != 2 {
+		t.Fatalf("want 2 accounts loaded (dedup later in pool), got %d", len(list))
+	}
+
+	assertStaleCopyUntouched(t, stalePath, staleBody, past)
+	assertWinnerRealmBackfilled(t, currentPath)
+
+	// 连续两次 LoadDir 的胜出者一致（都是 lexically 在后的那份）。
+	again, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("load again: %v", err)
+	}
+
+	if got := again[len(again)-1].FilePath; got != currentPath {
+		t.Errorf("second LoadDir winner=%q want %q", got, currentPath)
+	}
+}
+
+// winnerBackfillFixture 造同 UID 双文件：a-stale 是陈旧副本，z-current 是当前令牌
+// （按文件名排序在后，LoadDir 与 pool.SyncToDir 都是后载入者胜出），两份都缺 realm。
+// 陈旧副本的 mtime 钉在过去一小时：被回写就会刷新成当前时间。
+func winnerBackfillFixture(t *testing.T) (dir, stalePath, currentPath, staleBody string, past time.Time) {
+	t.Helper()
+
+	dir = t.TempDir()
+	stalePath = filepath.Join(dir, "workbuddy-a-stale.json")
+	currentPath = filepath.Join(dir, "workbuddy-z-current.json")
+	staleBody = `{"auth":{"accessToken":"at-old","refreshToken":"r","expiresAt":1,"domain":"www.codebuddy.cn"},"account":{"uid":"u1"}}`
+	currentBody := `{"auth":{"accessToken":"at-new","refreshToken":"r","expiresAt":9999999999,"domain":"www.codebuddy.cn"},"account":{"uid":"u1"}}`
+
+	for path, body := range map[string]string{stalePath: staleBody, currentPath: currentBody} {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	past = time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(stalePath, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	return dir, stalePath, currentPath, staleBody, past
+}
+
+// assertStaleCopyUntouched 断言落败副本的 mtime 与内容都没被回写改动。
+func assertStaleCopyUntouched(t *testing.T, path, wantBody string, wantMTime time.Time) {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !info.ModTime().Equal(wantMTime) {
+		t.Fatalf("落败副本 mtime=%v want 未被回写（%v）", info.ModTime(), wantMTime)
+	}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(raw) != wantBody {
+		t.Errorf("落败副本内容被改写：%s", raw)
+	}
+}
+
+// assertWinnerRealmBackfilled 断言胜出文件已补 realm=cn 并落盘。
+func assertWinnerRealmBackfilled(t *testing.T, path string) {
+	t.Helper()
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	winner, err := Parse(raw)
+	if err != nil {
+		t.Fatalf("reparse winner: %v", err)
+	}
+
+	if got := winner.RealmStored(); got != "cn" {
+		t.Errorf("胜出文件 realm=%q want cn", got)
 	}
 }
 
