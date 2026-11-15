@@ -56,6 +56,39 @@ func TestWindowProbeDueAfterReset(t *testing.T) {
 	}
 }
 
+// TestWindowProbeReturnRestoresAttempt 拿不到在途名额时归还尝试：不消耗 attempts
+// 上限，也不按「限流退避」等一个间隔，下一轮立刻还能探。
+func TestWindowProbeReturnRestoresAttempt(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	testPool := windowProbePool(t, &now)
+	resetAt := now.Add(time.Minute)
+
+	testPool.CooldownSoftForModel("u1", time.Minute, resetAt, "glm-5.2", "6004 model rate limit")
+	now = resetAt.Add(time.Second)
+
+	// 连续两轮「出账后立刻归还」，attempts 上限不得被白烧掉。
+	for i := range windowProbeMaxAttempts + 2 {
+		if got := testPool.DueWindowProbes(8); len(got) != 1 {
+			t.Fatalf("第 %d 轮应出账（归还后不消耗尝试）, got %+v", i+1, got)
+		}
+
+		testPool.ReturnWindowProbe("u1", "glm-5.2")
+	}
+
+	if got := testPool.WindowProbeCount(); got != 1 {
+		t.Fatalf("归还后台账应保留, count=%d", got)
+	}
+
+	// 归还清掉了重试间隔：同一时刻再取仍可出账。
+	now = now.Add(time.Nanosecond)
+
+	if got := testPool.DueWindowProbes(8); len(got) != 1 {
+		t.Fatalf("归还后应立刻可再探（不等退避）, got %+v", got)
+	}
+}
+
 // TestWindowProbeRetriesBounded 失败按间隔重试，用尽次数后出清。
 func TestWindowProbeRetriesBounded(t *testing.T) {
 	t.Parallel()

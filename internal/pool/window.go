@@ -150,6 +150,30 @@ func (p *Pool) WindowProbeDone(uid, model string, ok bool) {
 	}
 }
 
+// ReturnWindowProbe 归还一次「已出账但没真正发出去」的尝试（调度器拿不到在途名额时
+// 走这里）：撤回 DueWindowProbes 记下的尝试次数与重试间隔，让下一轮立刻还能探。
+//
+// 与 WindowProbeDone 的区别是语义：Done 回答「探过、结果如何」，Return 回答「压根
+// 没探」。混用会把「池子忙」记成「已钉住新窗口」或白烧掉一次 attempts 上限。
+func (p *Pool) ReturnWindowProbe(uid, model string) {
+	key := windowProbeKey(uid, model)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state, exists := p.windowProbes[key]
+	if !exists {
+		return
+	}
+
+	if state.attempts > 0 {
+		state.attempts--
+	}
+
+	// 清掉重试间隔：本轮没发请求，不该按「限流后退避」等一个 windowProbeRetryBackoff。
+	state.nextAt = time.Time{}
+}
+
 // dropWindowProbesLocked 清掉某账号的全部待探窗口（账号被移除时）。调用方必须已持有 p.mu。
 func (p *Pool) dropWindowProbesLocked(uid string) {
 	prefix := uid + "\x1f"

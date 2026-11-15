@@ -43,6 +43,41 @@ func TestLoadFailureBlocksPersist(t *testing.T) {
 	}
 }
 
+// TestLoadFailureBlocksFlush 定时落盘（flush）同样不得写盘：守卫必须在
+// persistSnapshot 这个唯一写盘入口，而不只是 persistLocked。
+func TestLoadFailureBlocksFlush(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "api_keys.json")
+	corrupt := []byte(`{"version":2,"keys":[{"id":"half"`)
+
+	if err := os.WriteFile(path, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := New(path)
+	if store.loadErr == nil {
+		t.Fatal("损坏的状态文件应记录 loadErr")
+	}
+
+	// 模拟「内存里有变更待落盘」：正常路径由 RecordUsage 置位，加载失败时没有
+	// 任何记录能匹配，这里直接置 dirty 以覆盖写盘入口本身。
+	store.mu.Lock()
+	store.dirty = true
+	store.mu.Unlock()
+
+	store.flush()
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(after) != string(corrupt) {
+		t.Fatalf("flush 覆盖了读不出来的原文件:\n got=%s\nwant=%s", after, corrupt)
+	}
+}
+
 // TestDeleteDropsRuntimeLimits Delete 后运行时账本不得残留。
 func TestDeleteDropsRuntimeLimits(t *testing.T) {
 	t.Parallel()

@@ -487,9 +487,16 @@ func (s *Store) flush() {
 
 // persistSnapshot 写入一份记录快照（锁外调用，writeMu 串行化）。
 // 快照序号不大于已落盘序号时直接丢弃：说明期间已有更新的状态落盘。
+//
+// 加载失败时一律拒绝：内存里的记录集合是空/不全的，任何一条写盘路径把整份写出
+// 都会覆盖磁盘上的真实密钥表（守卫放在这里而不是只放 persistLocked，见 loadErr）。
 func (s *Store) persistSnapshot(records []Record, seq uint64) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+
+	if s.loadErr != nil {
+		return fmt.Errorf("apikey: 状态文件加载失败，拒绝覆盖（修复或删除 %s 后重启）: %w", s.path, s.loadErr)
+	}
 
 	if seq <= s.flushedSeq {
 		return nil
@@ -516,10 +523,6 @@ func (s *Store) persistLocked() error {
 	if s.path == "" {
 		s.dirty = false
 		return nil
-	}
-
-	if s.loadErr != nil {
-		return fmt.Errorf("apikey: 状态文件加载失败，拒绝覆盖（修复或删除 %s 后重启）: %w", s.path, s.loadErr)
 	}
 
 	s.seq++

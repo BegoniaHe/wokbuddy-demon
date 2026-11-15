@@ -87,6 +87,9 @@ func (s *Scheduler) probeWindow(ctx context.Context, probe pool.WindowProbe) {
 	// 与网关流量共用单号在途名额（同 blackcatOne）：拿不到名额时本轮不探、也不
 	// 标记台账（否则会把「没探成功」记成「已钉住新窗口」）。
 	if !s.cfg.Pool.Acquire(account.UID) {
+		// DueWindowProbes 已把本次尝试记入台账，但请求压根没发：归还这次尝试，
+		// 否则「池子忙」会白烧掉 attempts 上限（默认 2 次）让窗口再也钉不住。
+		s.cfg.Pool.ReturnWindowProbe(probe.UID, probe.Model)
 		s.logger.Printf("额度窗口探针跳过 acct=%s model=%s：在途名额已满",
 			logfmt.Label(account.UID, account.NicknameValue()), probe.Model)
 
