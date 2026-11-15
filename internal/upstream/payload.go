@@ -24,13 +24,16 @@ type chatBodyRewrite struct {
 	maxOut           map[string]int64
 	historyKeepTurns int
 
-	// 以下六项仅供 chat 出站（基础规范化不管，零值 = 与旧入口同口径）：
+	// 以下七项仅供 chat 出站（基础规范化不管，零值 = 与旧入口同口径）：
 	leadingSystem  bool   // 首条非 system 时补官方 fallback system
 	injectCacheKey bool   // 注入 prompt_cache_key（按 uid 隔离）
 	uid            string // cache key 的账号隔离段
 	conversationID string // cache key 的会话哈希源
 	requestID      string // 非空 → 给当前轮最后一条 user 消息注入 conversationRequestId
 	agentCLI       bool   // 除首条 system 外每条消息补 agent:"cli"（官方 chat body 形态）
+	// cacheRetention 非空 → body 缺 cache_retention 时补该值（官方 CN 5.11.3 的
+	// 提示前缀缓存保留策略，见 injectCacheRetentionObj）。
+	cacheRetention string
 }
 
 // rewriteChatBody 解码一次、套用全部改写、再编码一次。
@@ -100,6 +103,9 @@ func normalizeChatBody(obj map[string]any, rewrite *chatBodyRewrite) {
 	if _, has := obj["stream_options"]; !has {
 		obj["stream_options"] = map[string]any{"include_usage": true}
 	}
+	// cache_retention 仅当 body 未显式带时补（CN 5.11.3 CLI 传输层形态，#550）；
+	// 显式值（含下游客户端自带）原样保留。
+	injectCacheRetentionObj(obj, rewrite.cacheRetention)
 
 	normalizeToolChoice(obj)
 	normalizeStop(obj)

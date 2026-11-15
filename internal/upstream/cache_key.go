@@ -58,6 +58,31 @@ func cacheKeySource(conversationID, cacheKeyID string) string {
 	return cacheKeyID
 }
 
+// cacheRetentionLong 官方 CN 5.11.3 的提示前缀缓存保留策略默认值。
+//
+// 客户端 `resolveCacheRetention` 的顺序是「会话级 cacheRetention → 环境变量
+// CODEBUDDY_DISABLE_PROMPT_CACHING_1H 为真则 short，否则 long」。网关不是客户端
+// 进程，没有会话级该字段也没有同类开关，只对齐官方默认分支（#550）。
+const cacheRetentionLong = "long"
+
+// injectCacheRetentionObj 在已解码的出站 chat body 上补 cache_retention。
+//
+// 官方 CLI 传输层（CN 5.11.3 `cli/dist/codebuddy-lite-wb.mjs` 的
+// axiosToFetchAdapter）对非自定义模型的请求在字段缺失时写入该值，显式值保留。
+// 本仓没有自定义模型上游路由，故 CN 一律按同一口径补；value 为空表示不注入
+// （global 5.9.4 官方不发该字段）。
+func injectCacheRetentionObj(obj map[string]any, value string) {
+	if value == "" {
+		return
+	}
+
+	if _, has := obj["cache_retention"]; has {
+		return
+	}
+
+	obj["cache_retention"] = value
+}
+
 // buildCacheKey 生成 `<uid8>-<convHex>` 格式的稳定 cache key。
 //
 // uid8 提供账号隔离段；convHex = sha256(uid + conversationID)[:16] 的 hex 提供会话段
