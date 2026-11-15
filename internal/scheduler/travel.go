@@ -73,7 +73,12 @@ func (s *Scheduler) RunTravelNowFor(uid string) TravelRunResult {
 		return result
 	}
 
-	okRun := s.travelOne(account)
+	// panic 隔离 + 保证 releaseRun 一定执行：travelOne 里是上游解析路径，panic
+	// 若逃出去，run 守卫永远停在 Running=true，此后旅行任务族的所有触发（排程
+	// 09/21 点、面板全量、面板按号）都会被静默跳过，直到重启。
+	okRun := false
+
+	s.guarded("travel-manual", func() { okRun = s.travelOne(account) })
 
 	success, failure := 0, 0
 	if okRun {
@@ -291,9 +296,20 @@ func (s *Scheduler) adoptTriedToday(uid string) bool {
 }
 
 // markAdoptTried 记录该账号当日已尝试领养且未过门槛。
+//
+// 顺带清掉旧日条目：map 无其它删除点，不清理会随「账号数 × 天数」永久增长。
+// 每次调用最多 O(账号数)，而它每个账号每日最多触发一次。
 func (s *Scheduler) markAdoptTried(uid string) {
+	day := travelDay(time.Now())
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.adoptTried[uid] = travelDay(time.Now())
+	for other, tried := range s.adoptTried {
+		if tried != day {
+			delete(s.adoptTried, other)
+		}
+	}
+
+	s.adoptTried[uid] = day
 }

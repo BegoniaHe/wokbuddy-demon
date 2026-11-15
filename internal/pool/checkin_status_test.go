@@ -136,3 +136,26 @@ func mustRead(t *testing.T, path string) []byte {
 
 	return raw
 }
+
+// TestSetNicknameRollsBackOnSaveFailure 写回失败必须回滚内存昵称：否则 status/面板
+// 显示新名字、磁盘凭证仍是旧名，重启后又「变回」旧名，而调用方只看到 false。
+func TestSetNicknameRollsBackOnSaveFailure(t *testing.T) {
+	t.Parallel()
+
+	pool := newTestPool(t, "")
+	// FilePath 为空 → SaveAtomic 直接报 errNoFilePathSet，模拟写盘失败。
+	pool.Add(&auth.Auth{UID: "u1", AccessToken: "at", Nickname: "old-name"})
+
+	if pool.SetNickname("u1", "new-name") {
+		t.Fatal("写盘失败时不应返回 true")
+	}
+
+	status, ok := pool.Status("u1")
+	if !ok {
+		t.Fatal("账号应仍在池内")
+	}
+
+	if status.Nickname != "old-name" {
+		t.Fatalf("写盘失败后内存昵称=%q want old-name（必须与磁盘一致）", status.Nickname)
+	}
+}

@@ -16,13 +16,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -60,24 +60,38 @@ type Account struct {
 	Encrypted bool   `json:"encrypted"`
 }
 
-// Roots 返回各平台桌面客户端的候选数据目录（只读扫描）。
-func Roots() []string {
-	home, _ := os.UserHomeDir()
-	bases := make([]string, 0, 1)
-
+// baseDirs 返回当前平台的基础数据目录（无匹配平台时为空）。
+func baseDirs(home string) []string {
 	switch runtime.GOOS {
 	case "darwin":
-		bases = []string{filepath.Join(home, "Library", "Application Support")}
+		return []string{filepath.Join(home, "Library", "Application Support")}
 	case "windows":
 		if local := os.Getenv("LOCALAPPDATA"); local != "" {
-			bases = []string{local}
+			return []string{local}
 		}
 	case "linux":
-		bases = []string{filepath.Join(home, ".local", "share"), filepath.Join(home, ".config")}
+		return []string{filepath.Join(home, ".local", "share"), filepath.Join(home, ".config")}
 	}
 
+	return nil
+}
+
+// Roots 返回各平台桌面客户端的候选数据目录（只读扫描）。
+func Roots() []string {
+	// home 取不到时不能继续：空串会让 filepath.Join 产出相对路径，glob 相对进程
+	// CWD 解析，可能扫到无关目录。
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return nil
+	}
+
+	bases := baseDirs(home)
+
 	names := []string{"WorkBuddy", "WorkBuddy AI"}
-	if v := strings.TrimSpace(os.Getenv("WORKBUDDY_APP_NAME")); v != "" {
+	// 只接受单段目录名：filepath.Join(base, "../..") 会经 Clean 逃出 base，扫到的
+	// 路径又会进入面板的可导入集合。需要控制进程环境才可利用，但仍按最小权限拒绝。
+	if v := strings.TrimSpace(os.Getenv("WORKBUDDY_APP_NAME")); v != "" &&
+		v != "." && v != ".." && !strings.ContainsAny(v, `/\`) {
 		names = append(names, v)
 	}
 
@@ -167,15 +181,11 @@ func InspectFile(path string) (Account, error) {
 	account := Account{Path: path, UID: "", Nickname: "", Domain: "", Realm: "", ExpiresAt: 0, Encrypted: false}
 	if m := object(doc["auth"]); m != nil {
 		account.Domain, _ = m["domain"].(string)
-		if n, ok := int64Value(m["expiresAt"]); ok {
-			account.ExpiresAt = n
-		}
-
-		if n, ok := int64Value(m["expires_at"]); ok {
-			account.ExpiresAt = n
-		}
-
-		account.ExpiresAt = auth.NormalizeExpiresAt(account.ExpiresAt)
+		// 与 ImportFile 同口径（authExpiry 内部先 expiresAt 后 expires_at，并做
+		// 秒/毫秒归一）：同一份文件在两个入口必须给出同一个过期时间。先前这里
+		// 顺序相反（expires_at 覆盖 expiresAt），两个键都存在时面板显示的是导入
+		// 拿不到的另一个时刻。
+		account.ExpiresAt = authExpiry(m)
 
 		if s, ok := m["realm"].(string); ok {
 			account.Realm = s
@@ -282,6 +292,11 @@ func buildAuth(doc, authObj, accountObj map[string]any, key keyMaterial) (*auth.
 	return account, nil
 }
 
+// authExpiry 取客户端文件里的过期时间；缺失返回 0（= 未知）。
+//
+// 曾返回「一年后」：客户端文件没写过期时间时，账号会被当成长期有效，
+// NeedsRefresh 恒 false，保活与调度器的主动刷新全部跳过；真实 AT 通常几天即失效，
+// 只能等请求 401 后的被动恢复。0 让 NeedsRefresh 视为需刷新，由上游 expiresIn 回填。
 func authExpiry(authObj map[string]any) int64 {
 	for _, k := range []string{"expiresAt", "expires_at"} {
 		if n, ok := int64Value(authObj[k]); ok {
@@ -289,7 +304,7 @@ func authExpiry(authObj map[string]any) int64 {
 		}
 	}
 
-	return time.Now().Add(365 * 24 * time.Hour).Unix()
+	return 0
 }
 
 func deviceToken(doc map[string]any, key keyMaterial) string {
@@ -495,10 +510,33 @@ func writeLP(buffer *bytes.Buffer, str string) {
 	buffer.WriteString(str)
 }
 
+// maxAuthFileBytes 单个桌面客户端 auth 文件的大小上限。
+//
+// 文件路径来自目录扫描，内容不由本进程控制：被替换成巨型文件时 os.ReadFile 会整份
+// 读进内存（面板导入路径会触发它），加一道上限把内存占用钉住。
+const maxAuthFileBytes = 32 << 20
+
+// errAuthFileTooLarge 单个 auth 文件超过读取上限。
+var errAuthFileTooLarge = errors.New("auth file too large")
+
+// errTrailingData auth 文件在合法 JSON 对象之后还有内容（被替换/损坏的形态）。
+var errTrailingData = errors.New("auth file has trailing data")
+
 func readDoc(path string) (map[string]any, error) {
-	raw, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("readDoc: %w", err)
+	}
+	defer file.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(file, maxAuthFileBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("readDoc: %w", err)
+	}
+
+	if len(raw) > maxAuthFileBytes {
+		return nil, fmt.Errorf("readDoc: %s 超过 %d 字节上限: %w",
+			filepath.Base(path), maxAuthFileBytes, errAuthFileTooLarge)
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(raw))
@@ -507,6 +545,10 @@ func readDoc(path string) (map[string]any, error) {
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil {
 		return nil, fmt.Errorf("parse auth file: %w", err)
+	}
+	// 尾随内容守卫：被替换成「合法对象 + 垃圾尾巴」的文件不能当成有效凭据。
+	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("parse auth file: 存在尾随内容: %w", errTrailingData)
 	}
 
 	return doc, nil

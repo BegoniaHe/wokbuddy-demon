@@ -95,11 +95,18 @@ type MarkupCall struct {
 type MarkupRepair struct {
 	allowed      map[string]bool
 	allowUnknown bool
-	hold         string // 已确认可能属于标记、但还不足以判定的尾部缓冲
-	inBlock      bool   // 已消费掉 markupOpen，正在块内部累积
-	seen         int    // 识别到的标记块数（含被拒绝的）
-	rejected     int    // 识别到但未转换的块数（观测/排障用）
-	converted    int    // 已还原的调用数（观测用）
+	hold         string // 块外：可能是标记起点、但还不足以判定的尾部缓冲
+	// block 块内累积缓冲。缓冲化而非「hold + text 每片整块重拼」：上游把一个大块
+	// 切成小片时，逐片重拼 + 从头重扫会退化成 O(片数 × 块长) 的搬运与扫描。
+	block strings.Builder
+	// blockScan block 中已确认不含 markupClose 的前缀长度：下一片只从这之后扫。
+	blockScan int
+	// pending 块闭合后剩余的正文（由 Feed 接着按块外规则处理，本轮结束时必为空）。
+	pending   string
+	inBlock   bool // 已消费掉 markupOpen，正在块内部累积
+	seen      int  // 识别到的标记块数（含被拒绝的）
+	rejected  int  // 识别到但未转换的块数（观测/排障用）
+	converted int  // 已还原的调用数（观测用）
 }
 
 // NewMarkupRepair 按客户端声明的工具名构造修复器。
@@ -156,28 +163,37 @@ func (r *MarkupRepair) Feed(text string) (string, []MarkupCall) {
 		return text, nil
 	}
 
-	str := r.hold + text
-	r.hold = ""
-
 	var (
 		emit  strings.Builder
 		calls []MarkupCall
 	)
 
+	rest := text
+
 	for {
-		var done bool
 		if r.inBlock {
-			done = r.consumeBlock(&str, &emit, &calls)
-		} else {
-			done = r.consumeOpen(&str, &emit)
+			// 块内：只把新片追加进缓冲，不做整块重拼。
+			r.block.WriteString(rest)
+			rest = ""
+
+			if r.consumeBlockBuffered(&emit, &calls) {
+				return emit.String(), calls // 块未闭合：本轮结束
+			}
+
+			rest = r.pending
+			r.pending = ""
+
+			continue
 		}
 
-		if done {
-			break
+		rest = r.hold + rest
+		r.hold = ""
+
+		if r.consumeOpen(&rest, &emit) {
+			return emit.String(), calls
 		}
+		// consumeOpen 已消费掉开始标记并置 inBlock：剩余正文下一轮进块缓冲。
 	}
-
-	return emit.String(), calls
 }
 
 // consumeOpen 处理块外正文：找到下一个标记起点并透出前文；返回 true 表示本轮结束。
@@ -203,29 +219,37 @@ func (r *MarkupRepair) consumeOpen(str3 *string, emit *strings.Builder) bool {
 	return false
 }
 
-// consumeBlock 处理块内正文：闭合则尝试还原调用，未闭合则留待下一片；
-// 返回 true 表示本轮结束。
-func (r *MarkupRepair) consumeBlock(str2 *string, emit *strings.Builder, calls *[]MarkupCall) bool {
-	k := strings.Index(*str2, markupClose)
-	if k < 0 {
-		if len(*str2) > markupMaxBlockBytes {
+// consumeBlockBuffered 处理块内缓冲：闭合则尝试还原调用，未闭合则留待下一片；
+// 返回 true 表示本轮结束（块仍未闭合）。
+//
+// 只从 blockScan 之后找闭合标记：此前每片都从头重扫，块被切碎时是 O(片数 × 块长)。
+func (r *MarkupRepair) consumeBlockBuffered(emit *strings.Builder, calls *[]MarkupCall) bool {
+	buffered := r.block.String()
+
+	idx := strings.Index(buffered[r.blockScan:], markupClose)
+	if idx < 0 {
+		if len(buffered) > markupMaxBlockBytes {
 			// 超长未闭合：不是标记，原文回吐并退出块态。
 			emit.WriteString(markupOpen)
-			emit.WriteString(*str2)
+			emit.WriteString(buffered)
 
-			r.inBlock = false
+			r.resetBlock()
 
 			return true
 		}
 
-		r.hold = *str2
+		// 已扫前缀不可能含闭合标记（留 len-1 覆盖跨片边界）。
+		r.blockScan = max(0, len(buffered)-len(markupClose)+1)
 
 		return true
 	}
 
-	inner := (*str2)[:k]
-	*str2 = (*str2)[k+len(markupClose):]
-	r.inBlock = false
+	k := r.blockScan + idx
+	inner := buffered[:k]
+	// pending 会活过 Reset，必须与 builder 内部缓冲解耦。
+	r.pending = strings.Clone(buffered[k+len(markupClose):])
+
+	r.resetBlock()
 
 	r.seen++
 	if got, ok := parseMarkupBlock(inner, r.allowed); ok {
@@ -244,6 +268,13 @@ func (r *MarkupRepair) consumeBlock(str2 *string, emit *strings.Builder, calls *
 	return false
 }
 
+// resetBlock 清空块缓冲与扫描位并退出块态（pending 是待处理正文，不在此清）。
+func (r *MarkupRepair) resetBlock() {
+	r.block.Reset()
+	r.blockScan = 0
+	r.inBlock = false
+}
+
 // Flush 在响应流结束时调用：把仍未判定的尾部缓冲原文交还。未闭合的块连同起始标记
 // 一起回吐——上游发了什么就透出什么。
 func (r *MarkupRepair) Flush() string {
@@ -251,13 +282,16 @@ func (r *MarkupRepair) Flush() string {
 		return ""
 	}
 
-	out := r.hold
+	var out string
 	if r.inBlock {
-		out = markupOpen + r.hold
+		out = markupOpen + r.block.String()
+	} else {
+		out = r.hold
 	}
 
 	r.hold = ""
-	r.inBlock = false
+	r.pending = ""
+	r.resetBlock()
 
 	return out
 }

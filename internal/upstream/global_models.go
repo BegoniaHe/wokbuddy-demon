@@ -41,7 +41,10 @@ type fetchGlobalModelsCache struct {
 	names    []string    // 成功缓存：并集模型名（已去重）；nil = 未探测/失败
 	infos    []ModelInfo // 成功缓存：对象形态的全字段条目（窄表/失败形态为 nil）
 	fetched  time.Time
+	scope    string // 成功缓存对应的作用域键（见 Client.modelScope）
 	lastFail time.Time
+	// failScope 负缓存对应的作用域键：A 域 404/500 不能连带把 B 域也关一小时。
+	failScope string
 
 	// probeDone 单飞标记：非 nil 表示已有一轮探测在跑，其余调用等待该通道关闭后
 	// 直接复用缓存（成功或负缓存）。锁只保护该字段，网络请求全程在锁外。
@@ -62,6 +65,24 @@ var globalModelsProbePaths = []string{
 	"/v2/enterprises/personal/models",
 	"/console/enterprises/personal/models",
 }
+
+// awaitGlobalModelsProbe 等一轮在飞探测结束后重查缓存（有界等待）。
+//
+// 探测本身受 HTTP 超时约束（单路 120s），无界等待会让 /v1/models 这类「顺带刷新
+// 目录」的调用阻塞数分钟。超时后按「本轮没有结果」返回，调用方回落到既有缓存/裸条目。
+func (c *Client) awaitGlobalModelsProbe(done <-chan struct{}, scope string) ([]string, []ModelInfo) {
+	select {
+	case <-done:
+	case <-time.After(globalModelsProbeWait):
+	}
+
+	cachedNames, cachedInfos, _ := c.globalModelsCacheHit(scope)
+
+	return cachedNames, cachedInfos
+}
+
+// globalModelsProbeWait 单飞等待方的最长等待时间（探测进行中时的上界）。
+const globalModelsProbeWait = 30 * time.Second
 
 // FetchGlobalModels 探测 global 账号的模型名目录并返回**模型名列表**（无元数据）。
 //
@@ -94,7 +115,9 @@ func (c *Client) fetchGlobalModelsOnce(account *auth.Auth) (names []string, info
 		return nil, nil
 	}
 
-	if cachedNames, cachedInfos, hit := c.globalModelsCacheHit(); hit {
+	scope := c.modelScope(account)
+
+	if cachedNames, cachedInfos, hit := c.globalModelsCacheHit(scope); hit {
 		return cachedNames, cachedInfos
 	}
 
@@ -110,11 +133,8 @@ func (c *Client) fetchGlobalModelsOnce(account *auth.Auth) (names []string, info
 
 	if done := c.globalModels.probeDone; done != nil {
 		c.globalModels.Unlock()
-		<-done
 
-		cachedNames, cachedInfos, _ := c.globalModelsCacheHit()
-
-		return cachedNames, cachedInfos
+		return c.awaitGlobalModelsProbe(done, scope)
 	}
 
 	done := make(chan struct{})
@@ -132,38 +152,44 @@ func (c *Client) fetchGlobalModelsOnce(account *auth.Auth) (names []string, info
 	names, infos, efforts, defaults, err := c.probeGlobalModels(account)
 	if err != nil || len(names) == 0 {
 		// 探测失败：负缓存 + 返回 nil（effort 桶不写，prepareBody 走 globalEffortMap 静态兜底）。
-		c.markGlobalModelsFail()
+		c.markGlobalModelsFail(scope)
 		return nil, nil
 	}
 	// global 域 effort 能力：探测下发的 supportedEfforts/defaultEffort 权威写入 global 桶
 	// （raw remote，不并入静态表——静态兜底在 prepareBody 的 globalEffortMap 与
 	// /v1/models 的 EffortListing 里按需 fallback）。空探测不写（防清既有桶）。
+	// 作用域取探测账号的实际出站主机：同 realm 下 codebuddy.ai / workbuddy.ai 是
+	// 两套上游，目录与 effort 档位必须分开落桶（见 Client.modelScope）。
 	if len(efforts) > 0 || len(defaults) > 0 {
-		c.storeEfforts("global", efforts, defaults)
+		c.storeEfforts(scope, efforts, defaults)
 	}
 
-	c.storeModelRates("global", infos)
-	c.storeModelMaxOut("global", infos)
-	c.storeModelAliases("global", infos)
+	c.storeModelRates(scope, infos)
+	c.storeModelMaxOut(scope, infos)
+	c.storeModelAliases(scope, infos)
 
 	// 成功：探测结果去重。names/infos 均落缓存；倍率等选号敏感字段只透出展示，
 	// 不注入 costTier。
 	merged := dedupeNames(names)
-	c.storeGlobalModels(merged, infos)
+	c.storeGlobalModels(scope, merged, infos)
 
 	return merged, infos
 }
 
 // globalModelsCacheHit 报告探测缓存/负缓存是否命中；命中时返回缓存的 (names, infos)。
-func (c *Client) globalModelsCacheHit() (names []string, infos []ModelInfo, hit bool) {
+// scope 为请求账号的模型目录作用域（见 Client.modelScope）：缓存只对同一主机生效，
+// 否则 A 域的模型名单会被 B 域账号当成权威目录使用（选到 B 域不存在的模型）。
+func (c *Client) globalModelsCacheHit(scope string) (names []string, infos []ModelInfo, hit bool) {
 	c.globalModels.Lock()
 	defer c.globalModels.Unlock()
 
-	if len(c.globalModels.names) > 0 && time.Since(c.globalModels.fetched) < globalModelsTTL {
+	if len(c.globalModels.names) > 0 && c.globalModels.scope == scope &&
+		time.Since(c.globalModels.fetched) < globalModelsTTL {
 		return c.globalModels.names, c.globalModels.infos, true
 	}
 
-	if !c.globalModels.lastFail.IsZero() && time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
+	if !c.globalModels.lastFail.IsZero() && c.globalModels.failScope == scope &&
+		time.Since(c.globalModels.lastFail) < globalModelsFailCooldown {
 		// 负缓存冷却期内：避免反复打上游，直接按失败处理（无静态回落）。
 		return nil, nil, true
 	}
@@ -171,22 +197,33 @@ func (c *Client) globalModelsCacheHit() (names []string, infos []ModelInfo, hit 
 	return nil, nil, false
 }
 
-// markGlobalModelsFail 记录一次探测失败（负缓存 + 清空成功缓存）。
-func (c *Client) markGlobalModelsFail() {
+// markGlobalModelsFail 记录一次探测失败（负缓存 + 清空同作用域的成功缓存）。
+func (c *Client) markGlobalModelsFail(scope string) {
 	c.globalModels.Lock()
 	c.globalModels.lastFail = time.Now()
-	c.globalModels.names = nil
-	c.globalModels.infos = nil
+	c.globalModels.failScope = scope
+
+	if c.globalModels.scope == scope {
+		c.globalModels.names = nil
+		c.globalModels.infos = nil
+	}
+
 	c.globalModels.Unlock()
 }
 
-// storeGlobalModels 写入成功探测缓存并清除负缓存。
-func (c *Client) storeGlobalModels(names []string, infos []ModelInfo) {
+// storeGlobalModels 写入成功探测缓存并清除同作用域的负缓存。
+func (c *Client) storeGlobalModels(scope string, names []string, infos []ModelInfo) {
 	c.globalModels.Lock()
 	c.globalModels.names = names
 	c.globalModels.infos = infos
 	c.globalModels.fetched = time.Now()
-	c.globalModels.lastFail = time.Time{}
+	c.globalModels.scope = scope
+
+	if c.globalModels.failScope == scope {
+		c.globalModels.lastFail = time.Time{}
+		c.globalModels.failScope = ""
+	}
+
 	c.globalModels.Unlock()
 }
 
@@ -229,22 +266,7 @@ func (c *Client) probeGlobalModels(
 	// 桌面端 UA（主路）：项目 chat 路径实际使用的 UA，与官方客户端看到的目录同源。
 	// 按账号 realm 生成（仅版本号分档），故必须传 a 而非用常量。
 	// 三路 v3 并发（桌面端 / IDE / CLI，各有独有模型，见上方 UA 注释）。
-	v3DesktopCh := make(chan probeResult, 1)
-	go func() { v3DesktopCh <- c.probeV3Route(account2, c.defaultWorkBuddyUAFor(account2)) }()
-
-	v3IDECh := make(chan probeResult, 1)
-	go func() { v3IDECh <- c.probeV3Route(account2, codeBuddyIDEUA) }()
-
-	v3CLICh := make(chan probeResult, 1)
-	go func() { v3CLICh <- c.probeV3Route(account2, codeBuddyCLIUA) }()
-
-	enterpriseCh := make(chan probeResult, 1)
-	go func() { enterpriseCh <- c.probeEnterpriseRoute(account2) }()
-
-	v3Desktop := <-v3DesktopCh
-	v3IDE := <-v3IDECh
-	v3CLI := <-v3CLICh
-	enterprise := <-enterpriseCh
+	v3Desktop, v3IDE, v3CLI, enterprise := c.probeGlobalRoutes(account2)
 	// probeResult2 三路自合并：桌面端路字段权威（主路），IDE/CLI 只补主路缺失的模型 id
 	// （只补 id，字段仍取自各自条目——主路没有该 id 时才轮到它们）。
 	// 逐路容错：全失败才带 err 进入下游降级判断，部分失败 warn 后继续。
@@ -620,6 +642,41 @@ func (c *Client) globalModelsOnce(
 	return catalog.names, catalog.infos, catalog.chat, err
 }
 
+// probeGlobalRoutes 四路并发探测并等齐结果：三路 v3（桌面端 / IDE / CLI）+
+// 企业端点家族。
+//
+// 四路都在后台协程里解析上游响应（JSON + 类型断言），必须隔离 panic：通道带
+// buf 1，panic 路径不写通道，这里的读取仍能返回（零值即「本轮无结果」）。
+func (c *Client) probeGlobalRoutes(
+	account2 *auth.Auth,
+) (v3Desktop, v3IDE, v3CLI, enterprise probeResult) {
+	v3DesktopCh := make(chan probeResult, 1)
+
+	go guardProbe("global-models-desktop", func() {
+		v3DesktopCh <- c.probeV3Route(account2, c.defaultWorkBuddyUAFor(account2))
+	})
+
+	v3IDECh := make(chan probeResult, 1)
+
+	go guardProbe("global-models-ide", func() {
+		v3IDECh <- c.probeV3Route(account2, codeBuddyIDEUA)
+	})
+
+	v3CLICh := make(chan probeResult, 1)
+
+	go guardProbe("global-models-cli", func() {
+		v3CLICh <- c.probeV3Route(account2, codeBuddyCLIUA)
+	})
+
+	enterpriseCh := make(chan probeResult, 1)
+
+	go guardProbe("global-models-enterprise", func() {
+		enterpriseCh <- c.probeEnterpriseRoute(account2)
+	})
+
+	return <-v3DesktopCh, <-v3IDECh, <-v3CLICh, <-enterpriseCh
+}
+
 // parseGlobalModelNames 多信封兼容解析模型目录（国际站曾在多种 envelope 间切换，
 // 只认单一形态会把登录成功的账号误判为"无模型"）：
 //   - 信封：code 存在且非 0 才拒（无 code 字段也放行）；payload = data（非空非
@@ -901,18 +958,32 @@ func parseGlobalModelLooseArray(
 func parseGlobalModelEntries(
 	arr json.RawMessage,
 ) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, ok bool) {
-	var entries []dynModelEntry
-	if json.Unmarshal(arr, &entries) != nil {
+	// 逐条 unmarshal：整数组一次解码时，任意一条字段类型异常（上游灰度下发的
+	// null/字符串错位）会让**整份**目录解码失败，调用方整体降级到宽松解析，
+	// 丢掉 Tags/InputModalities/Modalities/SupportsTool —— 这些正是 chat_agents
+	// 判定 ChatVisible 的依据，结果就是 global 模型菜单整体变空。
+	var raw []json.RawMessage
+	if json.Unmarshal(arr, &raw) != nil {
 		return nil, nil, nil, nil, false
 	}
 
-	names = make([]string, 0, len(entries))
+	names = make([]string, 0, len(raw))
 
-	infos = make([]ModelInfo, 0, len(entries))
-	for i := range entries {
-		m := &entries[i]
+	infos = make([]ModelInfo, 0, len(raw))
+	for i := range raw {
+		var m dynModelEntry
+		if json.Unmarshal(raw[i], &m) != nil {
+			// 单条坏条目：退到宽松解析（至少保住模型名与窗口），继续解析其余条目。
+			if mi, ok := parseGlobalModelLooseEntry(raw[i]); ok {
+				names = append(names, mi.ID)
+				infos = append(infos, mi)
+				efforts, defaults = addEffortBucket(&m, mi.ID, efforts, defaults)
+			}
 
-		id := modelEntryID(m)
+			continue
+		}
+
+		id := modelEntryID(&m)
 		if id == "" || m.Disabled {
 			continue
 		}
@@ -921,7 +992,7 @@ func parseGlobalModelEntries(
 		mi := m.modelInfo()
 		mi.ID = id // name 兜底形态下 id 取自 name，对齐 names 输出
 		infos = append(infos, mi)
-		efforts, defaults = addEffortBucket(m, id, efforts, defaults)
+		efforts, defaults = addEffortBucket(&m, id, efforts, defaults)
 	}
 
 	if len(names) == 0 {
@@ -929,6 +1000,16 @@ func parseGlobalModelEntries(
 	}
 
 	return names, infos, efforts, defaults, true
+}
+
+// parseGlobalModelLooseEntry 对单条坏条目做宽松解析（保住模型名/窗口/档位）。
+func parseGlobalModelLooseEntry(raw json.RawMessage) (ModelInfo, bool) {
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return ModelInfo{}, false
+	}
+
+	return parseGlobalModelLoose(obj)
 }
 
 // modelEntryID 按 id→modelId→model→name 回退链取模型 id。
@@ -1091,12 +1172,17 @@ func fillLooseReasoning(modelInfo *ModelInfo, obj map[string]any) {
 // 不触发上游探测**）。供聊天热路径的能力判定/按模态路由使用：缓存冷或探测失败
 // → nil，调用方跳过能力判定（宁缺勿滥，不为判定打上游）。
 func (c *Client) CachedGlobalModelInfos() []ModelInfo {
-	_, infos, hit := c.globalModelsCacheHit()
-	if !hit {
+	// 只读展示/能力判定路径拿不到具体账号，取「任一 global 主机」的快照即可：
+	// 这里要的是「该模型是否支持多模态」这类上界判断，跨域的并集比 nil 更准确；
+	// 选号与请求体降级走 modelScope 精确作用域（见 chatBodySnapshots）。
+	c.globalModels.Lock()
+	defer c.globalModels.Unlock()
+
+	if len(c.globalModels.infos) == 0 || time.Since(c.globalModels.fetched) >= globalModelsTTL {
 		return nil
 	}
 
-	return infos
+	return c.globalModels.infos
 }
 
 // CachedGlobalModelInfosAnyAge 返回最近一次 global 模型目录快照，忽略 TTL

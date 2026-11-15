@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -232,7 +233,7 @@ func TurnKey(body []byte) string {
 			return ""
 		}
 
-		return fmt.Sprintf("u%d:%s", i, sig)
+		return "u" + strconv.Itoa(i) + ":" + sig
 	}
 
 	return ""

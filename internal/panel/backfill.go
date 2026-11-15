@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -29,12 +30,9 @@ var (
 //
 //nolint:funlen // 请求解析/窗口拆分/逐号回填/汇总线性展开。
 func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		UID  string `json:"uid"`
-		Days int    `json:"days"`
-	}
-	if err := decodeJSONBody(io.LimitReader(r.Body, 1<<20), &req); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+	uid, days, perr := parseBackfillRequest(r)
+	if perr != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json: "+perr.Error())
 		return
 	}
 
@@ -43,25 +41,29 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Days <= 0 || req.Days > 90 {
-		req.Days = 7
-	}
-
-	uids := p.resolveBackfillUIDs(req.UID)
+	uids := p.resolveBackfillUIDs(uid)
 	if len(uids) == 0 {
 		writeErr(w, http.StatusBadRequest, "无可回填账号")
 		return
 	}
 
 	end := time.Now()
-	start := end.AddDate(0, 0, -req.Days)
+	start := end.AddDate(0, 0, -days)
 
 	var totalRecords, totalBuckets int
 
 	failures := map[string]string{}
 
 	for _, uid := range uids {
-		records, buckets, err := p.backfillOneUID(uid, start, end)
+		// 客户端断开后不再派发剩余账号：单号最多 50 页、每页一次上游调用，
+		// 误点一次就能长时间占用上游配额。
+		if r.Context().Err() != nil {
+			failures[""] = "客户端已断开，回填中止"
+
+			break
+		}
+
+		records, buckets, err := p.backfillOneUID(r.Context(), uid, start, end)
 		if err != nil {
 			failures[uid] = err.Error()
 			continue
@@ -83,14 +85,38 @@ func (p *Panel) usageBackfill(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// backfillRequestDays 回填窗口的缺省值与上限（天）。
+const (
+	defaultBackfillDays = 7
+	maxBackfillDays     = 90
+)
+
+// parseBackfillRequest 解析回填请求；days 缺省或越界回落默认窗口。
+func parseBackfillRequest(r *http.Request) (string, int, error) {
+	var req struct {
+		UID  string `json:"uid"`
+		Days int    `json:"days"`
+	}
+
+	if err := decodeJSONBody(io.LimitReader(r.Body, 1<<20), &req); err != nil {
+		return "", 0, err
+	}
+
+	if req.Days <= 0 || req.Days > maxBackfillDays {
+		req.Days = defaultBackfillDays
+	}
+
+	return req.UID, req.Days, nil
+}
+
 // backfillOneUID 回填单个账号，返回抓取记录数与覆盖桶数。
-func (p *Panel) backfillOneUID(uid string, start, end time.Time) (int, int, error) {
+func (p *Panel) backfillOneUID(ctx context.Context, uid string, start, end time.Time) (int, int, error) {
 	account := p.cfg.Pool.AuthByUID(uid)
 	if account == nil {
 		return 0, 0, errBackfillAccountNotFound
 	}
 
-	rows, records, err := p.backfillAccount(account, uid, start, end)
+	rows, records, err := p.backfillAccount(ctx, account, uid, start, end)
 	if err != nil {
 		log.Printf("WARN: [panel] usage backfill %s: %v", logfmt.Label(account.UID, account.NicknameValue()), err)
 
@@ -131,14 +157,14 @@ const (
 // backfillAccount 拉取单账号逐笔用量并按 (天, 模型) 聚合。requestId 跨页/跨窗口
 // 去重，避免上游分页重叠或时间窗边界重叠时重复计数。
 func (p *Panel) backfillAccount(
-	account4 *auth.Auth, uid string, start, end time.Time,
+	ctx context.Context, account4 *auth.Auth, uid string, start, end time.Time,
 ) ([]usage.BackfillRow, int, error) {
 	realm := account4.Realm()
 	rows := map[string]*usage.BackfillRow{}
 	seen := map[string]struct{}{}
 	fallbackDay := end.Local().Format("2006-01-02")
 
-	recs, err := p.fetchBackfillRecords(account4, start, end)
+	recs, err := p.fetchBackfillRecords(ctx, account4, start, end)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -164,7 +190,7 @@ func (p *Panel) backfillAccount(
 // 上游单次时间范围最多返回 3000 条（total 截到 3000，超出部分静默丢弃）；直接查
 // 7 天会把最新的今天记录挤掉。命中上限时二分时间窗，直到每个窗口都低于上限。
 func (p *Panel) fetchBackfillRecords(
-	account *auth.Auth, start, end time.Time,
+	ctx context.Context, account *auth.Auth, start, end time.Time,
 ) ([]upstream.RequestUsageRecord, error) {
 	first, err := p.cfg.Upstream.RequestUsage(account, start, end, 1, requestUsagePageSize)
 	if err != nil {
@@ -172,15 +198,15 @@ func (p *Panel) fetchBackfillRecords(
 	}
 
 	if first.Total >= requestUsageResultCap {
-		return p.splitBackfillWindow(account, start, end)
+		return p.splitBackfillWindow(ctx, account, start, end)
 	}
 
-	return p.fetchBackfillPages(account, start, end, first)
+	return p.fetchBackfillPages(ctx, account, start, end, first)
 }
 
 // splitBackfillWindow 把命中 3000 条上限的时间窗二分，左右窗口用秒级边界避免重叠。
 func (p *Panel) splitBackfillWindow(
-	account2 *auth.Auth, start, end time.Time,
+	ctx context.Context, account2 *auth.Auth, start, end time.Time,
 ) ([]upstream.RequestUsageRecord, error) {
 	if end.Sub(start) <= requestUsageMinWindow {
 		return nil, fmt.Errorf("window %v..%v exceeds %d-record cap: %w",
@@ -194,12 +220,12 @@ func (p *Panel) splitBackfillWindow(
 		return nil, fmt.Errorf("window %v..%v split failed: %w", start, end, errSplitBackfillWindowFailed)
 	}
 
-	left, err := p.fetchBackfillRecords(account2, start, leftEnd)
+	left, err := p.fetchBackfillRecords(ctx, account2, start, leftEnd)
 	if err != nil {
 		return nil, err
 	}
 
-	right, err := p.fetchBackfillRecords(account2, mid, end)
+	right, err := p.fetchBackfillRecords(ctx, account2, mid, end)
 	if err != nil {
 		return nil, err
 	}
@@ -209,7 +235,7 @@ func (p *Panel) splitBackfillWindow(
 
 // fetchBackfillPages 在确定 total < 3000 后翻完剩余页。
 func (p *Panel) fetchBackfillPages(
-	account3 *auth.Auth, start, end time.Time, first *upstream.RequestUsagePage,
+	ctx context.Context, account3 *auth.Auth, start, end time.Time, first *upstream.RequestUsagePage,
 ) ([]upstream.RequestUsageRecord, error) {
 	out := append([]upstream.RequestUsageRecord(nil), first.Records...)
 
@@ -217,6 +243,10 @@ func (p *Panel) fetchBackfillPages(
 	for page := 2; next != 0; page++ {
 		// 翻到硬上限仍有下一页：宁可失败也不返回截断数据（回填是覆盖写入，
 		// 截断会把本地当天桶替换成不完整计数）。
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("window %v..%v: 客户端已断开: %w", start, end, errFetchBackfillPagesFailed)
+		}
+
 		if page > requestUsageMaxPages {
 			return nil, fmt.Errorf("window %v..%v exceeds %d pages: %w",
 				start, end, requestUsageMaxPages, errFetchBackfillPagesFailed)

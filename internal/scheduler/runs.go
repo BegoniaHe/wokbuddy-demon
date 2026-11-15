@@ -14,6 +14,7 @@ package scheduler
 import (
 	"cmp"
 	"context"
+	"log"
 	"slices"
 	"time"
 )
@@ -139,12 +140,20 @@ func (s *Scheduler) StartTask(task, trigger string) bool {
 	if !s.acquireRun(task, trigger) {
 		return false
 	}
-	go func() {
-		total, success, failure := s.runTaskBody(context.Background(), task, trigger)
+	// 记入 bgWG：停机时要等这一轮收尾再关池。Add 与 Wait 不会并发——http.Server
+	// 的 Shutdown 先排空在途 handler 才返回，Wait 在其后调用。
+	s.bgWG.Go(func() {
+		total, success, failure := s.runTaskGuarded(context.Background(), task, trigger)
 		s.releaseRun(task, total, success, failure)
-	}()
+	})
 
 	return true
+}
+
+// Wait 等待本调度器派生的后台 goroutine（周期循环 + 面板手动批量任务）全部退出。
+// 停机序：ctx 取消 → 本方法 → pool.Close()，保证最后一次状态变更已提交落盘。
+func (s *Scheduler) Wait() {
+	s.bgWG.Wait()
 }
 
 // runTaskSync 同步执行一轮批量任务（调度器到点派发 + 既有同步调用方）。
@@ -155,10 +164,44 @@ func (s *Scheduler) runTaskSync(ctx context.Context, task, trigger string) bool 
 		return false
 	}
 
-	total, success, failure := s.runTaskBody(ctx, task, trigger)
+	total, success, failure := s.runTaskGuarded(ctx, task, trigger)
 	s.releaseRun(task, total, success, failure)
 
 	return true
+}
+
+// guarded 在批量/面板派生的后台协程里跑 fn，panic 就地隔离。
+//
+// net/http 的 recover 只覆盖 handler 自身协程：这些协程里跑的是上游响应解析与
+// 类型断言，一次 panic 就是进程级终止，连带所有账号的 /v1/* 一起中断。任务族级
+// 已有 runTaskGuarded，这里给「逐账号 fan-out」补同一口径。
+func (*Scheduler) guarded(name string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERR: [scheduler] %s panic（已隔离）: %v", name, r)
+		}
+	}()
+
+	fn()
+}
+
+// runTaskGuarded 执行一轮任务体并隔离 panic。
+//
+// 调度器派生的 goroutine 没有 net/http 那层 per-connection recover：签到/旅行/
+// 成长任务在解析上游响应时一次越界或 nil map 写就会带崩整个网关，而 HTTP 请求
+// 路径有兜底、日常任务这条路径原本没有。这里隔离本轮并把状态记成「0 尝试 1 失败」，
+// 保证 run 级守卫照样释放——否则该任务族会永久停在 Running=true，此后所有
+// 触发（含面板手动）恒被跳过。
+func (s *Scheduler) runTaskGuarded(ctx context.Context, task, trigger string) (total, success, failure int) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ERR: [scheduler] %s 任务 panic（已隔离本轮）: %v", task, r)
+
+			total, success, failure = 0, 0, 1
+		}
+	}()
+
+	return s.runTaskBody(ctx, task, trigger)
 }
 
 // runTaskBody 按任务族执行实体，返回 (Total, Success, Failure)。

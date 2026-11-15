@@ -133,8 +133,14 @@ func (c *Client) desktopDomain(a *auth.Auth) string {
 
 // deriveID 由 uid 稳定派生一个 UUIDv4 形态设备标识（machineId/sessionId 等复用），
 // 幂等：同一账号每次生成相同值，模拟固定设备。
-func deriveID(a *auth.Auth, salt string) string {
-	return session.UUIDv4For(salt + ":" + a.UID)
+func deriveID(account *auth.Auth, salt string) string {
+	// 同包其它取账号字段的路径都 nil 安全（AccessTokenValue 对 nil 返回 ""）；
+	// 这里是导出 API 的公共底座，不应因调用方传 nil 直接 panic。
+	if account == nil {
+		return ""
+	}
+
+	return session.UUIDv4For(salt + ":" + account.UID)
 }
 
 // DesktopEvent 桌面端事件：业务字段任意（map），公共指纹由 ReportDesktopEvent 注入。
@@ -299,6 +305,9 @@ func desktopTimezone(realm string) string {
 	return ""
 }
 
+// desktopSessionMaxAccounts desktop sessionId 缓存上限（账号数），见 desktopSessionID。
+const desktopSessionMaxAccounts = 1024
+
 // desktopSessionID 进程内按账号缓存一次随机 UUIDv4：官方 fallbackSessionId 跟随
 // 客户端进程，重启后刷新；这里不落盘，且不同账号各自独立。
 func (c *Client) desktopSessionID(a *auth.Auth) string {
@@ -313,6 +322,12 @@ func (c *Client) desktopSessionID(a *auth.Auth) string {
 
 	if id, ok := c.desktopSessionIDs[key]; ok {
 		return id
+	}
+
+	// 缓存按账号累积且不落盘：账号池长期换血时 map 无界增长。达到上限即整体重置
+	// ——官方 sessionId 本就跟随客户端进程重启刷新，重置只是等价于一次重启。
+	if len(c.desktopSessionIDs) >= desktopSessionMaxAccounts {
+		c.desktopSessionIDs = make(map[string]string)
 	}
 
 	id := session.NewUUIDv4()
@@ -811,10 +826,20 @@ func DesktopDesignCanvasSequence(conversationID, requestID string) []DesktopEven
 		},
 		DesktopEvent{
 			"eventCode": "wbx_design_canvas_open", keyConversationID: conversationID,
-			"requestId": requestID, "id": "ardot-file-" + requestID[len(requestID)-8:],
+			"requestId": requestID, "id": "ardot-file-" + desktopIDTail(requestID),
 			"source": "summon_keyword", "type": "page", "cost": 13000, "isSuccessful": true,
 		},
 	)
+}
+
+// desktopIDTail 取 requestID 末 8 位；短串原样返回（导出 API 不约束调用方长度，
+// 直接切片会 panic）。
+func desktopIDTail(requestID string) string {
+	if len(requestID) <= 8 {
+		return requestID
+	}
+
+	return requestID[len(requestID)-8:]
 }
 
 // MarketExpert 专家市场的单个专家（/portal/operation-platform/market/expert/list 响应子集）。
@@ -927,7 +952,11 @@ func (c *Client) DesktopChatWithExpert(
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		b, readErr := io.ReadAll(io.LimitReader(resp.Body, 200))
+		if readErr != nil {
+			return "", "", fmt.Errorf("chat http %d: read body: %w", resp.StatusCode, readErr)
+		}
+
 		return "", "", fmt.Errorf("chat http %d: %s: %w", resp.StatusCode, b, errDesktopChatWithExpertFailed)
 	}
 	// 从 SSE 流抓第一个 data.id 作为服务端 requestId（读干流避免残留连接）。

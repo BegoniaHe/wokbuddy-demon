@@ -40,7 +40,7 @@ func (c *Client) ModelBusy(
 		return map[string]string{}, nil
 	}
 
-	realm := modelBusyRealm(account)
+	realm := c.modelBusyScope(account)
 	if c.modelBusyRealmMissing(realm) {
 		return map[string]string{}, nil
 	}
@@ -106,7 +106,7 @@ func (c *Client) modelBusyBatch(
 	// 404 = 该域没有这条观测（global 服务端未部署），不是「这次查询失败」：
 	// 记住后返回空表，调用方既不填 busy 列也不产生错误条目（issue #401）。
 	if resp.StatusCode == http.StatusNotFound {
-		c.markModelBusyRealmMissing(modelBusyRealm(account), resp.StatusCode, string(body))
+		c.markModelBusyRealmMissing(c.modelBusyScope(account), resp.StatusCode, string(body))
 
 		return map[string]string{}, nil
 	}
@@ -121,13 +121,15 @@ func (c *Client) modelBusyBatch(
 	return parseModelBusy(body), nil
 }
 
-// modelBusyRealm 繁忙度记忆用的域键：无账号时不记忆（空串不落桶）。
-func modelBusyRealm(account *auth.Auth) string {
+// modelBusyScope 繁忙度记忆用的作用域键：与模型目录同口径（见 Client.modelScope）。
+// 只按 realm 记忆时，一次 A 域 404 就把整个 global 的 busy 观测永久关掉，即使
+// 另一套国际主机其实部署了该端点。
+func (c *Client) modelBusyScope(account *auth.Auth) string {
 	if account == nil {
 		return ""
 	}
 
-	return account.Realm()
+	return c.modelScope(account)
 }
 
 // modelBusyRealmMissing 报告该域是否已被判定为「没有 /v2/chat/busy」。
@@ -164,8 +166,8 @@ func (c *Client) markModelBusyRealmMissing(realm string, status int, body string
 
 	c.busyMissingRealm[realm] = true
 
-	log.Printf("INFO: [upstream] model busy realm=%s: %s not deployed upstream (http %d: %s); "+
-		"model busy observation disabled for this realm until restart", realm, modelBusyPath, status,
+	log.Printf("INFO: [upstream] model busy scope=%s: %s not deployed upstream (http %d: %s); "+
+		"model busy observation disabled for this scope until restart", realm, modelBusyPath, status,
 		RedactForLog(strings.TrimSpace(body), 120))
 }
 

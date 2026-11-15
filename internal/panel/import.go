@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // 批量导入（cockpit / 桌面端 / 加密备份）共用的资源上限（issue #107）。
@@ -417,17 +418,17 @@ func (p *Panel) postImportAccounts(ctx context.Context, accounts []*auth.Auth) {
 		sem <- struct{}{}
 
 		wg.Add(1)
-		go func(account3 *auth.Auth) {
+		p.goGuarded("import-account-checkin", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			uid := account3.UID
-			p.importCheckin(ctx, account3, uid)
+			uid := item.UID
+			p.importCheckin(ctx, item, uid)
 
-			if rm, tt, err := p.cfg.Upstream.UserResource(ctx, account3); err == nil {
+			if rm, tt, err := p.cfg.Upstream.UserResource(ctx, item); err == nil {
 				p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 			}
-		}(item)
+		})
 	}
 
 	wg.Wait()
@@ -492,12 +493,25 @@ func (p *Panel) persistImportedAuth(account *auth.Auth, realm, uid string) error
 		}
 	}
 
+	// 覆盖既有账号时先退役旧实例：否则旧实例在途 refresh 会把旧 token 写回同一
+	// 路径（锁按实例私有），内存是新凭证、磁盘是旧凭证，重启后旧凭证复活。
+	replacing := p.cfg.Pool.AuthByUID(uid) != nil
+
+	if replacing {
+		p.cfg.Pool.AuthByUID(uid).Retire()
+	}
+
 	if err := account.SaveAtomic(); err != nil {
 		return fmt.Errorf("uid=%s: save auth failed: %w", uid, err)
 	}
 
 	p.cfg.Pool.Add(account)
-	p.cfg.Pool.Revive(uid)
+
+	// 只有全新账号才按「人工恢复」口径清掉遗留状态。覆盖既有账号时调 Revive 会把
+	// 运维手动 disabled/paused 的号悄悄放回选号池，而响应里没有任何信号。
+	if !replacing {
+		p.cfg.Pool.Revive(uid)
+	}
 
 	return nil
 }
@@ -518,8 +532,11 @@ func (p *Panel) importCheckin(ctx context.Context, account4 *auth.Auth, uid stri
 		return
 	}
 
-	if err := p.cfg.Upstream.DailyCheckin(ctx, account4); err != nil {
+	// 回执口径：2xx 但回执读不出来（空 body / WAF HTML 页）不能算签到成功。
+	if receipt, err := p.cfg.Upstream.DailyCheckinReceipt(ctx, account4); err != nil {
 		log.Printf("panel: import checkin uid=%s: %v", uid, err)
+	} else if receipt.State == upstream.CheckinStateFailed {
+		log.Printf("panel: import checkin uid=%s: %s", uid, receipt.Message)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -233,4 +234,84 @@ func TestRootsIncludeWorkbuddyBase(t *testing.T) {
 	}
 
 	t.Fatalf("Roots() missing %s: %v", want, Roots())
+}
+
+// 客户端文件没写过期时间时必须返回 0（未知），不能伪造「一年后」：
+// 否则 NeedsRefresh 恒 false，保活与主动刷新全部跳过，只能等请求 401 被动恢复。
+func TestAuthExpiryMissingIsZero(t *testing.T) {
+	t.Parallel()
+
+	if got := authExpiry(map[string]any{}); got != 0 {
+		t.Fatalf("authExpiry(空)=%d want 0", got)
+	}
+
+	if got := authExpiry(map[string]any{"expires_at": int64(1700000000000)}); got != 1700000000 {
+		t.Fatalf("毫秒时间戳应归一为秒，got=%d", got)
+	}
+}
+
+// TestReadDocRejectsTrailingData 「合法对象 + 垃圾尾巴」不能当成有效凭据文件。
+func TestReadDocRejectsTrailingData(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "x.info")
+	if err := os.WriteFile(path, []byte(`{"a":1}{"b":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := readDoc(path); !errors.Is(err, errTrailingData) {
+		t.Fatalf("err=%v want errTrailingData", err)
+	}
+}
+
+// TestExpiryKeyPrecedenceMatchesImport 两个过期字段同时存在时，InspectFile 与
+// ImportFile 必须取同一个。
+//
+// 原先 InspectFile 的顺序是「expiresAt 先、expires_at 后覆盖」，而 ImportFile 走
+// authExpiry（先 expiresAt）。同一份文件因此得到两个不同的过期时刻：面板显示的是
+// 导入拿不到的那一个，NeedsRefresh 判定与展示对不上。
+func TestExpiryKeyPrecedenceMatchesImport(t *testing.T) {
+	t.Parallel()
+
+	dir := filepath.Join(t.TempDir(), "Data", "Public", "auth")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	doc := map[string]any{
+		"auth": map[string]any{
+			"accessToken": "access-token", "refreshToken": "refresh-token",
+			"expiresAt": 1893456000, "expires_at": 1993456000,
+		},
+		"account": map[string]any{"uid": "u1"},
+	}
+
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := filepath.Join(dir, "wb.info")
+	if werr := os.WriteFile(path, raw, 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+
+	meta, err := InspectFile(path)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+
+	imported, err := ImportFile(path, "")
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+
+	if meta.ExpiresAt != imported.ExpiresAt {
+		t.Fatalf("InspectFile 过期=%d 与 ImportFile 过期=%d 不一致（同一份文件必须同口径）",
+			meta.ExpiresAt, imported.ExpiresAt)
+	}
+
+	if meta.ExpiresAt != 1893456000 {
+		t.Fatalf("过期=%d want 1893456000（authExpiry 先取 expiresAt）", meta.ExpiresAt)
+	}
 }

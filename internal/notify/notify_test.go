@@ -134,3 +134,11 @@ func TestValidateURLRedactsCredentials(t *testing.T) {
 		}
 	}
 }
+
+// TestNotifyNilEventNoPanic nil 事件不得 panic（其余方法都已判空）。
+func TestNotifyNilEventNoPanic(t *testing.T) {
+	t.Parallel()
+
+	n := &Notifier{url: "https://example.invalid/hook", events: map[string]bool{"task_done": true}}
+	n.Notify(nil) // 不应 panic
+}

@@ -43,7 +43,7 @@ func (s *Scheduler) StartWindowProbe(ctx context.Context, interval time.Duration
 
 	s.windowProbeInterval.Store(int64(interval))
 
-	runIntervalLoop(ctx, &s.windowProbeInterval, s.rearmWindowProbe, "额度窗口探针", nil, s.runWindowProbeOnce)
+	runIntervalLoop(ctx, &s.bgWG, &s.windowProbeInterval, s.rearmWindowProbe, "额度窗口探针", nil, s.runWindowProbeOnce)
 }
 
 // SetWindowProbeInterval 热改额度窗口探针间隔；<=0 表示暂停循环。
@@ -83,7 +83,26 @@ func (s *Scheduler) probeWindow(ctx context.Context, probe pool.WindowProbe) {
 		return
 	}
 
-	result, err := s.sendWindowProbe(ctx, account, probe.Model)
+	// 与网关流量共用单号在途名额（同 blackcatOne）：拿不到名额时本轮不探、也不
+	// 标记台账（否则会把「没探成功」记成「已钉住新窗口」）。
+	if !s.cfg.Pool.Acquire(account.UID) {
+		// DueWindowProbes 已把本次尝试记入台账，但请求压根没发：归还这次尝试，
+		// 否则「池子忙」会白烧掉 attempts 上限（默认 2 次）让窗口再也钉不住。
+		s.cfg.Pool.ReturnWindowProbe(probe.UID, probe.Model)
+		s.logger.Printf("额度窗口探针跳过 acct=%s model=%s：在途名额已满",
+			logfmt.Label(account.UID, account.NicknameValue()), probe.Model)
+
+		return
+	}
+
+	// 租约用 defer 归还：sendWindowProbe 里跑的是上游响应解析，panic 时本循环
+	// （runIntervalLoop）没有针对租约的兜底，显式 Release 不会执行——该账号的在途
+	// 名额会永久 -1，泄漏 windowProbeMaxPerRound 轮后彻底不可用，只能重启进程。
+	result, err := func() (pool.WindowProbeResult, error) {
+		defer s.cfg.Pool.Release(account.UID)
+
+		return s.sendWindowProbe(ctx, account, probe.Model)
+	}()
 	s.cfg.Pool.WindowProbeDone(probe.UID, probe.Model, result)
 
 	label := logfmt.Label(account.UID, account.NicknameValue())

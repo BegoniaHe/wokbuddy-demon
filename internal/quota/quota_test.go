@@ -71,3 +71,45 @@ func TestLoadPrunesExpiredEvents(t *testing.T) {
 		t.Fatalf("budget=%+v want used 300 samples 1", b)
 	}
 }
+
+// TestAddPrunesWithWallClock 保留期裁剪必须用真实当前时间：事件自带 At 偏未来
+// 会一次性清空全部历史样本。
+func TestAddPrunesWithWallClock(t *testing.T) {
+	t.Parallel()
+
+	store := New("")
+	reset := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+
+	store.Add(&Event{UID: "u1", Realm: "cn", Model: "m", ResetAt: reset, Used: 10, At: time.Now()})
+	// 上游时钟漂移：At 落在很久以后。
+	store.Add(&Event{
+		UID: "u2", Realm: "cn", Model: "m", ResetAt: reset, Used: 20,
+		At: time.Now().Add(400 * 24 * time.Hour),
+	})
+
+	budgets := store.Budgets()
+	if b := budgets["cn|m"]; b.Samples != 2 {
+		t.Fatalf("samples=%d want 2（At 偏未来不该裁掉历史样本）", b.Samples)
+	}
+}
+
+// TestAddCreatesMissingDir 撞线样本可能早于 pool 首次落盘出现：data/ 目录尚不
+// 存在时 Add 必须自己建目录，否则 safefile 的 os.CreateTemp 必然失败，样本被
+// 静默丢弃（只在失败首条留一行 WARN）。
+func TestAddCreatesMissingDir(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "data", "quota_events.jsonl")
+	store := New(path)
+
+	if !store.Add(&Event{
+		UID: "u1", Realm: "cn", Model: "m",
+		ResetAt: time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC), Used: 1, At: time.Now(),
+	}) {
+		t.Fatal("add should succeed")
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("样本未落盘: %v", err)
+	}
+}

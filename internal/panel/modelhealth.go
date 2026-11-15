@@ -25,9 +25,10 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -36,6 +37,11 @@ const (
 	modelProbeMaxConcurrent = 2
 	// modelProbeMaxTokens 探测请求的 max_tokens：只验证「能出首字」，不测长输出。
 	modelProbeMaxTokens = 16
+	// modelProbeMaxModelLen 探测模型名长度上限（rune）。模型名会拼成
+	// "realm:model" 状态键写入 data/model_probes.json，而该文件每次探测都整份
+	// 重写、启动时整份读入：只限 key 数量（512）不限长度时，单次请求即可把文件
+	// 推到 GB 级，之后每次探测都是 O(文件大小)。
+	modelProbeMaxModelLen = 200
 	// modelProbeMaxReadBytes 探测读取上限：防异常上游在该请求上无限吐数据
 	// （与 SSE 上限同哲学，探测不需要完整回答）。
 	modelProbeMaxReadBytes = 256 << 10
@@ -94,19 +100,8 @@ func (p *Panel) modelProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := trimModelPrefix(req.Model)
-	if model == "" {
-		writeErr(w, http.StatusBadRequest, "model required")
-		return
-	}
-
-	realm := req.Realm
-	if realm == "" {
-		realm = modelRealm(req.Model)
-	}
-
-	if realm != "cn" && realm != "global" {
-		writeErr(w, http.StatusBadRequest, "realm must be cn or global")
+	realm, model, ok := p.probeTarget(w, req.Model, req.Realm)
+	if !ok {
 		return
 	}
 
@@ -124,8 +119,45 @@ func (p *Panel) modelProbe(w http.ResponseWriter, r *http.Request) {
 	defer p.releaseProbeSlot()
 
 	sample := p.runModelProbe(r.Context(), realm, model)
+
+	// 客户端已断开：这次探测是「用户取消」，不是上游失败。写进样本会让
+	// modelHealth 的成功率与 TTFT 分位数把取消算成上游故障。
+	if r.Context().Err() != nil {
+		return
+	}
+
 	p.recordProbeSample(key, &sample)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": sample.OK, "key": key, "sample": sample})
+}
+
+// probeTarget 校验探测目标：模型名（剥前缀、限长）与 realm（缺省按模型前缀推断）。
+// 校验失败时已写出 400，返回 ok=false。
+func (*Panel) probeTarget(w http.ResponseWriter, rawModel, rawRealm string) (string, string, bool) {
+	model := trimModelPrefix(rawModel)
+	if model == "" {
+		writeErr(w, http.StatusBadRequest, "model required")
+
+		return "", "", false
+	}
+
+	if utf8.RuneCountInString(model) > modelProbeMaxModelLen {
+		writeErr(w, http.StatusBadRequest, "model name too long")
+
+		return "", "", false
+	}
+
+	realm := rawRealm
+	if realm == "" {
+		realm = modelRealm(rawModel)
+	}
+
+	if realm != "cn" && realm != "global" {
+		writeErr(w, http.StatusBadRequest, "realm must be cn or global")
+
+		return "", "", false
+	}
+
+	return realm, model, true
 }
 
 // modelHealth 返回所有已探测模型的滚动健康聚合。
@@ -478,6 +510,12 @@ func (p *Panel) recordProbeSample(key string, sample *modelProbeSample) {
 	state := p.loadProbeState()
 	samples := state.Samples[key]
 
+	if _, exists := state.Samples[key]; !exists && len(state.Samples) >= modelProbeMaxModels {
+		// key 来自请求里的任意模型名（只校验非空），不同字符串刷 N 次就是 N 个
+		// 永久条目。超限时淘汰样本时间最早的那个，保持文件有界。
+		evictOldestProbeLocked(state)
+	}
+
 	samples = append(samples, *sample)
 	if len(samples) > modelProbeSamplesPerModel {
 		samples = samples[len(samples)-modelProbeSamplesPerModel:]
@@ -486,6 +524,33 @@ func (p *Panel) recordProbeSample(key string, sample *modelProbeSample) {
 	state.Samples[key] = samples
 	if err := p.saveProbeState(state); err != nil {
 		log.Printf("WARN: [panel] save model probe state failed: %v", err)
+	}
+}
+
+// modelProbeMaxModels 状态文件里保留的 key（realm:model）上限。
+const modelProbeMaxModels = 512
+
+// evictOldestProbeLocked 淘汰最近一次样本最早的那个 key（调用方已持 probeStateMu）。
+func evictOldestProbeLocked(state *modelProbeState) {
+	oldestKey := ""
+
+	var oldestAt time.Time
+
+	for k, samples := range state.Samples {
+		if len(samples) == 0 {
+			oldestKey = k
+
+			break
+		}
+
+		at := samples[len(samples)-1].At
+		if oldestKey == "" || at.Before(oldestAt) {
+			oldestKey, oldestAt = k, at
+		}
+	}
+
+	if oldestKey != "" {
+		delete(state.Samples, oldestKey)
 	}
 }
 
@@ -529,12 +594,10 @@ func (p *Panel) saveProbeState(state *modelProbeState) error {
 		return fmt.Errorf("saveProbeState: %w", err)
 	}
 
-	tmp := p.cfg.ProbeStateFile + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("saveProbeState: %w", err)
-	}
-
-	if err := atomicwrite.Rename(tmp, p.cfg.ProbeStateFile); err != nil {
+	// safefile.Write：唯一临时名 + 写后 fsync + rename 后目录 fsync + 损坏时 .bak
+	// 退路。原自实现 tmp+rename 不 fsync，掉电会留下长度正确但内容为 0 的文件，
+	// loadProbeState 随后按空历史继续、下一次保存把旧数据彻底抹掉。
+	if err := safefile.Write(p.cfg.ProbeStateFile, raw, 0o600); err != nil {
 		return fmt.Errorf("saveProbeState: %w", err)
 	}
 

@@ -59,6 +59,15 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 			return h.cfg.Upstream.WebFetch(ctx, acct, req, meta)
 		})
 	if fail != nil {
+		// 调用方已断开（runAgentTool 归成 499/client_closed）：连接已关，写响应体
+		// 没有意义，也不能记成上游失败——否则一次用户取消就变成 502 + HTTPError。
+		if fail.status == clientClosedRequestStatus {
+			h.recordSearchUsage(r, uid, usageModel, started, nil, false)
+			noteWebFetchTrace(r, h, uid, reqlog.OutcomeInterrupted)
+
+			return
+		}
+
 		h.recordSearchUsage(r, uid, usageModel, started, nil, false)
 		noteWebFetchTrace(r, h, uid, reqlog.OutcomeHTTPError)
 

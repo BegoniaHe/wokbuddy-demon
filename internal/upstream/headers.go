@@ -214,13 +214,14 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 	case surfaceModelBusy:
 		// 渲染层探针面：真机是与「桌面产品面」同源的三段式 UA。
 		return c.desktopUA(account)
-	case surfaceRefresh, surfaceV3Config:
-		// refresh / v3-config：与 chat 同源的客户端 UA（v3-config 由调用方按
-		// 探测目标换成 IDE / CLI UA，见 V3ConfigHeaders）。
+	case surfaceRefresh, surfaceV3Config, surfaceLogout:
+		// refresh / v3-config / logout：与 chat 同源的客户端 UA（v3-config 由调用方
+		// 按探测目标换成 IDE / CLI UA，见 V3ConfigHeaders）。logout 与 refresh 是同一
+		// 个 plugin 头族；此处此前返回空串，UA 键整条缺失，http.Transport 落回
+		// Go-http-client/1.1——与 refresh 同号相邻发出时是明显的非官方指纹。
 		return c.userAgent(account)
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
-		surfaceLogout:
-		// 走 chat 头族或另用专属头集（logout 见 LogoutHeaders），不经轻头族默认 UA。
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
+		// 走 chat 头族，不经轻头族默认 UA。
 		return ""
 	}
 
@@ -387,10 +388,8 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 		if token := c.deviceToken(account); token != "" {
 			req.Header.Set("X-Device-Token", token)
 		}
-		// chat 面补 W3C baggage（真机 4 条：buddy 两空值键 + 两个 codebuddy 键）。
-		req.Header.Set("Baggage", baggageValue(
-			req.Header.Get("X-Conversation-Id"), req.Header.Get("X-Conversation-Request-Id"),
-		))
+
+		injectChatBaggage(req)
 	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth,
 		surfaceLogout:
 		// 轻头族各面已在 applyHeaders 分流。
@@ -461,7 +460,11 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 	req.Header.Set("Accept", accept)
 	req.Header.Set("Content-Type", contentType)
 	// AccessToken 加锁快照（同 chatFamilyHeaders：keepalive 可在 a.mu 内改写）。
-	req.Header.Set("Authorization", "Bearer "+account.AccessTokenValue())
+	// 空凭证不写该头："Bearer " 加空值这种「键在值为空」的形态本身是非官方指纹，
+	// chat 族也只在有值时才注入。
+	if token := account.AccessTokenValue(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	// X-Request-ID：官方 HTTP 层给每条非 chat 业务请求补 32 hex 随机值（UUIDv7 形态）。
 	// growth 面是 Node 原生 fetch，真机不带该头；chat 面的同名头是消息级 ID
 	// （= X-Conversation-Message-ID），语义不同，见 injectConversationHeaders。
@@ -583,8 +586,55 @@ func injectEnterpriseIDHeaders(req *http.Request, account *auth.Auth) {
 // conversation_message_id / root_request_id 两个键常量，但 chat 真机没发——多发反而
 // 更明显（#364）。tracestate 仅在跨进程 span 携带时下发，网关无该状态，不伪造。
 func baggageValue(convID, convReqID string) string {
+	// baggage 以逗号分隔成员、分号分隔属性：id 里出现 , ; 空格 或其他分隔符会把
+	// 后面的成员整段解析成属性，上游读到的 session_id 也被截断。id 只可能来自
+	// 客户端透传（body conversationId / 入站头），故按「不合规就不发该头」处理
+	// ——发一条结构已坏的 baggage 比不发更明显。
+	if !validBaggageID(convID) || !validBaggageID(convReqID) {
+		return ""
+	}
+
 	return "buddyId=,buddyName=,codebuddy.session_id=" + convID +
 		",codebuddy.conversation_request_id=" + convReqID
+}
+
+// injectChatBaggage 注入 chat 面 W3C baggage（真机 4 条：buddy 两空值键 + 两个
+// codebuddy 键）。会话 id 不合规时整头不发（见 baggageValue）。
+func injectChatBaggage(req *http.Request) {
+	baggage := baggageValue(
+		req.Header.Get("X-Conversation-Id"), req.Header.Get("X-Conversation-Request-Id"),
+	)
+	if baggage == "" {
+		return
+	}
+
+	req.Header.Set("Baggage", baggage)
+}
+
+// validBaggageID 判断 id 能否安全嵌进 W3C baggage 成员值：仅允许 hex 与连字符
+// （官方 session_id / request_id 都是 UUID 形态）。
+func validBaggageID(id string) bool {
+	if id == "" || len(id) > 64 {
+		return false
+	}
+
+	return strings.IndexFunc(id, func(r rune) bool {
+		return !isHexOrDash(r)
+	}) < 0
+}
+
+// isHexOrDash 判断单个 rune 是否属于 baggage id 白名单（hex 与连字符）。
+func isHexOrDash(r rune) bool {
+	switch {
+	case r >= '0' && r <= '9':
+		return true
+	case r >= 'a' && r <= 'f':
+		return true
+	case r >= 'A' && r <= 'F':
+		return true
+	default:
+		return r == '-'
+	}
 }
 
 // domainHostFor 轻头族的 X-Domain：账号 domain（去 scheme 与尾斜杠）优先，
@@ -834,10 +884,19 @@ func injectTraceHeaders(req *http.Request, traceID, messageID string) {
 		b3Trace = messageID // 非法 B3 TraceId → 回落恒 32 hex 的消息级 ID
 	}
 
+	// W3C traceparent 的 trace-id 必须是 32 hex，而 B3 允许 16 hex。入站透传的
+	// 16 hex 值能通过 validTraceID 却被直接拼进 traceparent，产出上游视为非法的头
+	// （带 B3 但 traceparent 被丢弃，链路关联断在半路）。按 B3 规范把 64 位 trace
+	// id 视作 128 位的低 64 位：左补 16 个 0 后三处仍是同一条链路。
+	w3cTrace := b3Trace
+	if len(w3cTrace) == 16 {
+		w3cTrace = "0000000000000000" + w3cTrace
+	}
+
 	spanID := messageID[:16]
 	parentSpanID := session.NewMessageID()[:16]
 	// traceparent（W3C）：00-<32hex trace>-<16hex span>-01；b3（单头）：<trace>-<span>-1-<parent>。
-	req.Header.Set("Traceparent", "00-"+b3Trace+"-"+spanID+"-01")
+	req.Header.Set("Traceparent", "00-"+w3cTrace+"-"+spanID+"-01")
 	req.Header.Set("B3", b3Trace+"-"+spanID+"-1-"+parentSpanID)
 	req.Header.Set("X-B3-Traceid", b3Trace)
 	req.Header.Set("X-B3-Parentspanid", parentSpanID)
@@ -1051,7 +1110,8 @@ func (c *Client) GrowthHeaders(req *http.Request, account *auth.Auth) {
 // logout 两个面上，见 LogoutHeaders）。
 func (c *Client) RefreshHeaders(req *http.Request, account *auth.Auth) {
 	c.applyHeaders(surfaceRefresh, req, account, "", ChatMeta{})
-	req.Header.Set("X-Refresh-Token", account.RefreshToken)
+	// 加锁快照：keepalive 轮换在 a.mu 内改写 RefreshToken，直读是数据竞争。
+	req.Header.Set("X-Refresh-Token", account.RefreshTokenValue())
 	// X-Auth-Refresh-Source 对齐官方客户端 refresh 渠道标识 "plugin"（D3）。
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
 

@@ -12,13 +12,16 @@ package credithist
 
 import (
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
-	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
 // DefaultMaxEntries 单文件默认保留的流水条数（滚动裁剪）。
@@ -27,6 +30,14 @@ const DefaultMaxEntries = 5000
 // sanityDelta 单次变动绝对值上限：超过视为脏数据/单位错误，不记流水（只更新基线）。
 // 取 1e7：正常积分规模在万级，百万级跳变几乎必然是解析错误。
 const sanityDelta = 1e7
+
+// maxBalance 余额绝对值的合理上界，超过即视为脏数据/单位错误。
+//
+// 它同时是减法溢出的护栏：remain - prev 在两个 int64 量级极大、符号相反时会绕回
+// 小数值（MaxInt64 - MinInt64 得 -1），于是下面 |delta| ≤ sanityDelta 的判定反而
+// 通过，账本里多出一条金额荒谬的流水。取 2^53（float64 能精确表示的最大整数），
+// 远超任何真实积分规模。
+const maxBalance int64 = 1 << 53
 
 // Entry 一条余额变动流水。
 type Entry struct {
@@ -79,9 +90,17 @@ func (l *Ledger) load() {
 		return
 	}
 
-	raw, err := os.ReadFile(l.path)
+	// safefile.Read 在正文不可解析时回落 .bak：坏文件按空账本继续、下一次 Flush
+	// 又把它彻底覆盖，账本就永久丢了。首次运行/文件缺失仍是「从空账本开始」。
+	raw, err := safefile.Read(l.path, json.Valid)
 	if err != nil {
-		return // 首次运行/文件缺失：从空账本开始，不是错误。
+		// 最严重的「正文与 .bak 都坏」原先无声返回：账本随后从空开始、第一次
+		// Flush 就覆盖正文，用户既丢流水也无从知道原因。
+		if !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("WARN: [credithist] 账本不可用（按空账本继续）: %v", err)
+		}
+
+		return
 	}
 
 	var doc fileDoc
@@ -98,6 +117,9 @@ func (l *Ledger) load() {
 		l.entries = append(l.entries, entry)
 		l.last[entry.UID] = entry.Remain
 	}
+
+	// 载入即裁剪：旧配置（更小的上限）留下的超大文件会整份驻留到第一次 Observe。
+	l.trimLocked()
 }
 
 // Observe 记录一次余额观测：与上次比有变化才记流水。
@@ -107,26 +129,30 @@ func (l *Ledger) Observe(uid string, remain int64, note string) {
 		return
 	}
 
+	// 超出合理量级的余额是脏数据：不记流水，也不更新基线（等下一次合理值来比）。
+	if remain > maxBalance || remain < -maxBalance {
+		return
+	}
+
 	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	prev, seen := l.last[uid]
 	l.last[uid] = remain
 
-	if !seen {
-		l.mu.Unlock()
+	// 首次观测只建基线；上一次基线本身是脏数据（历史遗留/旧版本写入）时同理：
+	// 差值无意义，且与极端值相减会溢出。
+	if !seen || prev > maxBalance || prev < -maxBalance {
 		return
 	}
 
 	delta := remain - prev
 	if delta == 0 {
-		l.mu.Unlock()
 		return
 	}
 
 	if delta > sanityDelta || delta < -sanityDelta {
 		// 脏数据：不记流水（否则一条异常值会污染整本账），只更新基线。
-		l.mu.Unlock()
-
 		return
 	}
 
@@ -134,7 +160,6 @@ func (l *Ledger) Observe(uid string, remain int64, note string) {
 	l.seq++
 	l.trimLocked()
 	l.dirty = true
-	l.mu.Unlock()
 }
 
 // trimLocked 滚动裁剪到上限（保留最近 max 条；调用方已持锁）。
@@ -195,34 +220,34 @@ func (l *Ledger) Flush() {
 		return
 	}
 
-	raw, err := json.Marshal(fileDoc{Version: 1, Entries: l.entries})
-	// 记录本次快照对应的变更序号：**不在写盘前清脏**。写盘成功后才按序号决定
-	// 是否清脏——写盘期间新追加的流水（可能同时触发滚动裁剪，len 不变）必须
-	// 保持脏标记，否则这批流水会永久留在内存里。
+	// 锁内只克隆快照，序列化放锁外：json.Marshal 最多 5000 条，持锁做 CPU 工作会
+	// 让并发 Observe（余额刷新）排在整个序列化后面。必须深拷贝切片头——滚动裁剪
+	// 会重切底层数组，只拷切片头会让锁外读到被复用的元素。
+	entries := slices.Clone(l.entries)
 	flushedSeq := l.seq
 	l.mu.Unlock()
 
+	raw, err := json.Marshal(fileDoc{Version: 1, Entries: entries})
 	if err != nil {
 		log.Printf("WARN: [credithist] 序列化失败: %v", err)
 
 		return
 	}
 
-	tmp := l.path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
-		log.Printf("WARN: [credithist] 建目录失败: %v", err)
+	// 走 safefile：唯一临时名 + 文件 fsync + rename + 目录 fsync + 失败清理。
+	// 固定 ".tmp" 名在 server 与 cmd/credit 同时运行时会被互相覆盖，且无 fsync
+	// 时掉电可能发布零长账本。
+	//
+	// 账本目录此前只由池状态落盘顺带建出：首次余额观测早于首次状态落盘时，
+	// CreateTemp 因目录不存在而失败，这批流水只剩一条 WARN。
+	if err := os.MkdirAll(filepath.Dir(l.path), 0o700); err != nil {
+		log.Printf("WARN: [credithist] 创建目录失败: %v", err)
 
 		return
 	}
-
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("WARN: [credithist] 写临时文件失败: %v", err)
-
-		return
-	}
-
-	if err := atomicwrite.Rename(tmp, l.path); err != nil {
-		log.Printf("WARN: [credithist] 原子替换失败: %v", err)
+	// WriteKeep 保留上一份有效账本为 .bak（与 load 的回退口径配对）。
+	if err := safefile.WriteKeep(l.path, raw, 0o600, json.Valid); err != nil {
+		log.Printf("WARN: [credithist] 落盘失败: %v", err)
 
 		return
 	}

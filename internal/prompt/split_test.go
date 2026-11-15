@@ -221,3 +221,42 @@ func jsonString(t *testing.T, s string) string {
 
 	return string(raw)
 }
+
+// TestSplitOnlyFirstLongSystem 只拆第一条命中的长 system：判据声明「只有一条」，
+// 每条都拆会把 Claude Code 常见的多段 system 全部翻倍，改写面远超该变体范围。
+func TestSplitOnlyFirstLongSystem(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"messages":[` +
+		`{"role":"system","content":` + jsonString(t, longSystem) + `},` +
+		`{"role":"system","content":` + jsonString(t, longSystem) + `},` +
+		`{"role":"user","content":"hi"}],` +
+		`"seed":9007199254740993}`)
+
+	out, ok := SplitSystemBySentences(body)
+	if !ok {
+		t.Fatal("第一条长 system 应被拆分")
+	}
+
+	obj := decodeSplit(t, out)
+	if len(obj.Messages) != 4 {
+		t.Fatalf("messages=%d want 4（第一条拆 2 条 + 第二条原样 + user）", len(obj.Messages))
+	}
+
+	if got := obj.Messages[2].Content; got != longSystem {
+		t.Fatalf("第二条 system 不应被拆或被改动:\n got=%q", got)
+	}
+}
+
+// TestSplitSystemBySentencesRejectsTrailingContent 尾随第二个 JSON 值时放弃改写，
+// 否则回写第一个对象等于静默丢掉客户端发来的其余字节。
+func TestSplitSystemBySentencesRejectsTrailingContent(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("这是第一句描述。", 40) + "\n" + strings.Repeat("这是第二句描述。", 40)
+	body := `{"messages":[{"role":"system","content":"` + long + `"}]}{"extra":1}`
+
+	if _, ok := SplitSystemBySentences([]byte(body)); ok {
+		t.Fatal("带尾随内容的 body 不应改写")
+	}
+}

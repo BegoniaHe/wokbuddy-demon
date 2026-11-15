@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
@@ -216,6 +217,15 @@ func startFirstByteHeartbeat(out chatResponder, interval time.Duration) func() {
 
 	go func() {
 		defer close(stopped)
+
+		// 写注释帧走的是 response writer：封装层若 panic，这里是独立协程，
+		// 无人 recover 就是进程级终止（连带所有账号的 /v1/*）。隔离后按
+		// 「客户端已走」处理，真实帧会拿到写错误。
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("ERR: [server] first-byte heartbeat panic（已隔离）: %v", rec)
+			}
+		}()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

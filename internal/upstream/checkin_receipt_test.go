@@ -208,3 +208,35 @@ func TestDailyCheckinReceiptReadsFlatReceipt(t *testing.T) {
 		t.Fatalf("receipt=%+v want checked/credit 150", got)
 	}
 }
+
+// TestCheckinReceiptEmptyEnvelopeIsFailure 2xx + 空信封（合法 JSON 但没有判据字段）
+// 不得判成功：`{"code":0,"msg":"OK","data":null}` 是真失败形态，当成新签到会标记
+// 当日已签、面板报「签到成功」，而账号实际没签（静默漏签）。
+func TestCheckinReceiptEmptyEnvelopeIsFailure(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		`{"code":0,"msg":"OK","data":null}`,
+		`{"code":0,"msg":"","data":null}`,
+		`{}`,
+	} {
+		got := checkinReceiptFromBody(200, body)
+		if got.State != CheckinStateFailed {
+			t.Errorf("body=%s state=%q want failed", body, got.State)
+		}
+	}
+}
+
+// TestCheckinReceiptEnvelopeWithCriteria 信封里带判据字段仍按成功读。
+func TestCheckinReceiptEnvelopeWithCriteria(t *testing.T) {
+	t.Parallel()
+
+	got := checkinReceiptFromBody(200, `{"code":0,"msg":"OK","data":{"streak_days":2}}`)
+	if got.State != CheckinStateChecked {
+		t.Fatalf("state=%q want checked", got.State)
+	}
+
+	if got.StreakDays != 2 {
+		t.Errorf("streak=%d want 2", got.StreakDays)
+	}
+}

@@ -6,7 +6,11 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"regexp"
 	"strings"
 )
@@ -285,6 +289,34 @@ func sanitizeJSONString(raw string) (string, bool) {
 	}
 
 	return out, true
+}
+
+// errTrailingJSON 顶层对象之后还有内容（粘帧）。
+var errTrailingJSON = errors.New("trailing data after json object")
+
+// decodeObjectUseNumber 以 UseNumber 语义解析顶层 JSON 对象：数值按字面量保留。
+//
+// 出站改写与 SSE 帧重建都会「解码 → 改动 → 重新编码」，默认解码会把一切数字变
+// float64：seed 9007199254740993 变成 ...992、1.0 变成 1、20 位整数 id 变成
+// 另一个值。客户端看到的数值必须与它发出的一致。
+//
+// 与 json.Unmarshal 同口径：对象之后还有内容即视为解析失败。json.Decoder 只读
+// 首个值、忽略尾部，若照单全收，`{...} {...}` 这类粘帧会被当成单个合法帧并丢掉
+// 后一个对象的内容（粘帧本应走 splitConcatenatedJSON 拆分透传）。
+func decodeObjectUseNumber(raw []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+
+	var obj map[string]any
+	if err := decoder.Decode(&obj); err != nil {
+		return nil, fmt.Errorf("decode json object: %w", err)
+	}
+
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return nil, errTrailingJSON
+	}
+
+	return obj, nil
 }
 
 // sanitizeJSONValues 结构化净化：解析 JSON → 递归净化字符串值 → 重新编码。

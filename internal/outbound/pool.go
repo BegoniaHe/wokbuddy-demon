@@ -32,10 +32,23 @@ type proxyState struct {
 	proxy        *Proxy
 	failures     int
 	cooldownTill time.Time
+	// probing 该代理正被一次半开探测占用（受 Pool.mu 保护）。
+	//
+	// 全冷却时的探测必须 single-flight：并发突发里 N 个请求同时读到「全部冷却」
+	// 会一起打同一个死代理，N 次失败把 failures 从 1 顶到 N，冷却按指数立刻封顶
+	// 到 10 分钟——一次抖动被放大成整段出口不可用。
+	probing bool
 	// 健康快照（issue #39）：面板只读展示用，与冷却判定同源更新。
 	lastOK     time.Time
 	lastErr    string // 已脱敏，≤200 字符
 	lastFailAt time.Time
+	// lastPenaltyAt 最近一次真正计入退避的代理失败时刻（recordFailure 写）。
+	//
+	// 时间衰减必须只看它：recordTargetError（CONNECT 非 200，单域故障）不改
+	// failures，却会刷新 lastFailAt——若衰减也用 lastFailAt，频繁的目标侧错误就把
+	// 「连续故障」窗口无限续期，一个每天偶发失败一次的健康代理会被顶到满额冷却
+	// 并自我维持。lastFailAt 保留「最近一次错误（含目标侧）」的展示语义。
+	lastPenaltyAt time.Time
 }
 
 // Health 单个代理的健康快照（只读展示用）。
@@ -155,7 +168,7 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 
 	if !attempted {
 		// 全部冷却：半开探测冷却最早者，避免整段冷却期完全不可用。
-		conn, err := pool.dialProxy(ctx, pool.earliest(), now, network, addr)
+		conn, err := pool.dialHalfOpen(ctx, now, network, addr)
 		if err == nil {
 			return conn, nil
 		}
@@ -164,6 +177,22 @@ func (pool *Pool) DialContext(ctx context.Context, network, addr string) (net.Co
 	}
 
 	return nil, fmt.Errorf("%w: %w", ErrProxyDial, lastErr)
+}
+
+// dialHalfOpen 抢占探测名额后拨号（全部代理都在冷却时的兜底路径）。
+// 抢不到名额（已有探针在飞）返回 errNoProxyAvailable：调用方据此快速失败并轮转账号，
+// 不排队等一个可能很慢的探测。
+func (pool *Pool) dialHalfOpen(ctx context.Context, now time.Time, network, addr string) (net.Conn, error) {
+	probe := pool.tryHalfOpen()
+	if probe == nil {
+		return nil, errNoProxyAvailable
+	}
+	// 名额必须 defer 释放：dialProxy 里跑的是代理握手（读 CONNECT 应答 / SOCKS5
+	// 协商），panic 时显式 endProbe 不会执行，probing 永久为 true——此后全冷却的
+	// 池再也抢不到探测名额，出口整段不可用，只能重启进程。
+	defer pool.endProbe(probe)
+
+	return pool.dialProxy(ctx, probe, now, network, addr)
 }
 
 // dialProxy 对单个代理拨号并据此更新健康状态。
@@ -176,9 +205,7 @@ func (pool *Pool) dialProxy(
 ) (net.Conn, error) {
 	conn, err := proxyState2.proxy.dial(ctx, network, addr)
 	if err != nil {
-		if ctx.Err() == nil {
-			pool.recordFailure(proxyState2, now, proxyState2.proxy.redact(err.Error(), healthErrLimit))
-		}
+		pool.noteDialFailure(ctx, proxyState2, now, err)
 
 		return nil, err
 	}
@@ -186,6 +213,26 @@ func (pool *Pool) dialProxy(
 	pool.recordSuccess(proxyState2, now)
 
 	return conn, nil
+}
+
+// noteDialFailure 按失败来源更新健康记账：调用方取消/超时不算代理不健康。
+//
+// 目标侧拒绝（CONNECT 非 200）说明代理本身可达，只是到不了这个上游域：记错误文本
+// 但不计失败。否则单域故障会冷却整条出口、连累所有账号。代理自身的鉴权拒绝
+// （407/401）例外：那是凭据问题，冷却出口才能停止无限重试。
+func (pool *Pool) noteDialFailure(ctx context.Context, state *proxyState, now time.Time, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	reason := state.proxy.redact(err.Error(), healthErrLimit)
+	if errors.Is(err, errDialHTTPConnectFailed) && !errors.Is(err, errProxyAuthRequired) {
+		pool.recordTargetError(state, now, reason)
+
+		return
+	}
+
+	pool.recordFailure(state, now, reason)
 }
 
 // inCooldown 报告代理是否处于有效冷却期。内部加锁，可在未持 pool.mu 时调用
@@ -197,10 +244,14 @@ func (pool *Pool) inCooldown(st *proxyState, now time.Time) bool {
 	return now.Before(st.cooldownTill)
 }
 
-// earliest 返回冷却截止最早的代理（全部冷却时的半开探测目标）。内部加锁。
-func (pool *Pool) earliest() *proxyState {
+// tryHalfOpen 抢占冷却最早代理的探测名额；已有探针在飞时返回 nil。
+func (pool *Pool) tryHalfOpen() *proxyState {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+
+	if len(pool.states) == 0 {
+		return nil
+	}
 
 	best := pool.states[0]
 	for _, st := range pool.states[1:] {
@@ -209,13 +260,33 @@ func (pool *Pool) earliest() *proxyState {
 		}
 	}
 
+	if best.probing {
+		return nil
+	}
+
+	best.probing = true
+
 	return best
+}
+
+// endProbe 释放半开探测名额（无论探测成败都要释放）。
+func (pool *Pool) endProbe(st *proxyState) {
+	pool.mu.Lock()
+	st.probing = false
+	pool.mu.Unlock()
 }
 
 // recordFailure 记一次失败：failures++ 并按指数退避设置冷却截止。
 func (pool *Pool) recordFailure(proxyState2 *proxyState, now time.Time, reason string) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+
+	// 时间衰减：距上次**真失败**已超过最长冷却，说明不是连续故障（成功路径拿不到
+	// 清零机会——它一直在冷却里），重新起算。否则「每天偶发失败一次」的健康代理
+	// 会累积到满额 10 分钟冷却并自我维持。
+	if !proxyState2.lastPenaltyAt.IsZero() && now.Sub(proxyState2.lastPenaltyAt) > proxyCooldownMax {
+		proxyState2.failures = 0
+	}
 
 	proxyState2.failures++
 
@@ -230,7 +301,17 @@ func (pool *Pool) recordFailure(proxyState2 *proxyState, now time.Time, reason s
 
 	proxyState2.cooldownTill = now.Add(duration)
 	proxyState2.lastFailAt = now
+	proxyState2.lastPenaltyAt = now
 	proxyState2.lastErr = reason
+}
+
+// recordTargetError 记录目标侧失败：只更新展示用的错误快照，不动失败计数与冷却。
+func (pool *Pool) recordTargetError(proxyState2 *proxyState, now time.Time, reason string) {
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	proxyState2.lastErr = reason
+	proxyState2.lastFailAt = now
 }
 
 // recordSuccess 记一次成功：清零失败与冷却。

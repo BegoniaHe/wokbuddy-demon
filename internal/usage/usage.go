@@ -21,6 +21,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -38,6 +39,50 @@ const flushInterval = 30 * time.Second
 
 // maxBuckets 桶数硬上限。超过时立即触发一次折叠，避免异常流量把内存/文件撑爆。
 const maxBuckets = 400_000
+
+// rollupInterval 无条件折叠的间隔。
+//
+// 只靠「桶数超限」触发时，小部署（每天几十个桶）十年也到不了 maxBuckets：小时桶
+// 永久保留，flush 每 30 秒重写整份 map、SnapshotWindow 每次全量拷贝、DailyTotals
+// 在锁内遍历全部桶。保留策略退化成「仅受硬上限约束」。
+const rollupInterval = time.Hour
+
+// hourScopeCutoff 返回「首个不早于 t 的整点」的 scope 键前缀（"2006-01-02T15"）。
+//
+// 桶键是定宽零填充的本地时间串，字典序即时间序：用它替代循环内的
+// time.ParseInLocation 后，面板查询不再在 recorder 锁内做逐桶解析（在线记账
+// 写入要排在这些查询后面）。语义与「解析后比较」严格一致：整点边界上的桶
+// 只有在不早于 t 时才保留。
+func hourScopeCutoff(t time.Time) string {
+	hour := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, t.Location())
+	if hour.Before(t) {
+		hour = hour.Add(time.Hour)
+	}
+
+	return hour.Format(hourLayout)
+}
+
+// scopeCoversSince 报告桶的 scope 是否落在「since 起」的统计窗口内。
+//
+// 小时桶按整点字典序比较（与原实现一致）。日桶有两个来源：Rollup 折叠出的 90 天
+// 前历史，以及面板回填写入的**任意**日期（含今天）。读者原先只认 h: 前缀，于是
+// 回填覆盖近 24h 后撞线用量与「剩余用量」会掉到 0；日桶只能按「日与窗口重叠」
+// 纳入（含 since 当天），边界会多算当天窗口前的部分——保底方向（预算宁可高估），
+// 总比整体丢失强。
+func scopeCoversSince(scope, hourCutoff string) bool {
+	switch {
+	case strings.HasPrefix(scope, "h:"):
+		return scope[2:] >= hourCutoff
+	case strings.HasPrefix(scope, "d:"):
+		if len(hourCutoff) < len(dayLayout) {
+			return false
+		}
+
+		return scope[2:] >= hourCutoff[:len(dayLayout)]
+	default:
+		return false
+	}
+}
 
 // hourLayout / dayLayout 分片键的时间格式（本地时区，与用户直觉一致）。
 const (
@@ -98,6 +143,9 @@ type Recorder struct {
 	// 可并发，共用同名 tmp 会互相截断/残留尾部，最终把残缺 JSON 发布为 usage.json。
 	flushMu sync.Mutex
 
+	// lastRollup 上次无条件折叠的时刻（受 mu 保护），见 rollupInterval。
+	lastRollup time.Time
+
 	runStarted atomic.Bool
 	stopOnce   sync.Once
 	stop       chan struct{}
@@ -116,6 +164,7 @@ type DailyUsage struct {
 
 type dailyCacheEntry struct {
 	at   time.Time
+	day  string // 聚合所属的本地自然日（dayLayout）；跨零点必须失效
 	data map[string]DailyUsage
 }
 
@@ -158,12 +207,16 @@ func (r *Recorder) DailyTotalsCached(now time.Time) map[string]DailyUsage {
 		return nil
 	}
 
-	if c := r.dailyCache.Load(); c != nil && now.Sub(c.at) < time.Second {
+	day := now.Format(dayLayout)
+
+	// 缓存键必须含日期：零点附近 1 秒内复用会把**前一天**的聚合当成「今天」，
+	// 而这份数据直接参与日限额过滤（pool.SetDailyUsageProvider）。
+	if c := r.dailyCache.Load(); c != nil && c.day == day && now.Sub(c.at) < time.Second {
 		return c.data
 	}
 
 	data := r.DailyTotals(now)
-	r.dailyCache.Store(&dailyCacheEntry{at: now, data: data})
+	r.dailyCache.Store(&dailyCacheEntry{at: now, day: day, data: data})
 
 	return data
 }
@@ -203,18 +256,46 @@ func (r *Recorder) Start() {
 				r.flush(true)
 				return
 			case <-t.C:
-				r.mu.Lock()
-				n := len(r.buckets)
-				r.mu.Unlock()
-
-				if n > maxBuckets {
-					r.Rollup(time.Now())
-				}
-
-				r.flush(false)
+				r.tick(time.Now())
 			}
 		}
 	}()
+}
+
+// tick 一次定时落盘：桶数超限先折叠，再刷盘。
+//
+// 独立成方法并自带 panic 隔离：记账协程里跑的是 map 遍历与文件 IO，一次 panic
+// 就是整进程退出（所有账号的 /v1/* 一起中断）。隔离后单轮失败只丢这一轮，
+// 下一轮照常。
+func (r *Recorder) tick(now time.Time) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("ERR: [usage] 落盘循环 panic（已隔离）: %v\n%s", rec, debug.Stack())
+		}
+	}()
+
+	r.mu.Lock()
+	n := len(r.buckets)
+	due := now.Sub(r.lastRollup) >= rollupInterval
+	r.mu.Unlock()
+
+	if n > maxBuckets || due {
+		r.Rollup(now)
+
+		r.mu.Lock()
+		r.lastRollup = now
+		remaining := len(r.buckets)
+		r.mu.Unlock()
+
+		// Rollup 只折叠早于 hourlyKeep 的小时桶：超限桶若全落在保留期内（模型基数
+		// 大 / 面板回填 / 异常流量），折叠一条也删不掉，此后每 30 秒空跑一次
+		// Rollup 并对整份 map 做 Marshal —— 而日桶永久保留，一次超限就永久超限。
+		if remaining > maxBuckets {
+			r.trimOldest(remaining - maxBuckets)
+		}
+	}
+
+	r.flush(false)
 }
 
 // Stop 停止后台循环并做最后一次落盘（未 Start 时只做一次落盘，不阻塞）。
@@ -295,14 +376,10 @@ func (r *Recorder) TokensByAccountModel(since time.Time) map[string]map[string]i
 	defer r.mu.Unlock()
 
 	out := map[string]map[string]int64{}
+	cutoff := hourScopeCutoff(since)
 
 	for _, item := range r.buckets {
-		if !strings.HasPrefix(item.Scope, "h:") {
-			continue
-		}
-
-		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(item.Scope, "h:"), time.Local)
-		if err != nil || t.Before(since) {
+		if !scopeCoversSince(item.Scope, cutoff) {
 			continue
 		}
 
@@ -327,13 +404,11 @@ func (r *Recorder) TokensSince(realm, uid, model string, since time.Time) int64 
 
 	var total int64
 
-	for _, item := range r.buckets {
-		if item.Realm != realm || item.UID != uid || item.Model != model || !strings.HasPrefix(item.Scope, "h:") {
-			continue
-		}
+	cutoff := hourScopeCutoff(since)
 
-		t, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(item.Scope, "h:"), time.Local)
-		if err != nil || t.Before(since) {
+	for _, item := range r.buckets {
+		if item.Realm != realm || item.UID != uid || item.Model != model ||
+			!scopeCoversSince(item.Scope, cutoff) {
 			continue
 		}
 
@@ -341,6 +416,41 @@ func (r *Recorder) TokensSince(realm, uid, model string, since time.Time) int64 
 	}
 
 	return total
+}
+
+// TokensSinceByKey 一次遍历汇总多组「账号×模型 自 since 起」的成功 token。
+// key 形如 realm|uid|model（调用方自定义，但必须与桶字段唯一对应），value 为窗口起点。
+//
+// 面板剩余用量页要按撞线重置窗口逐行取数：逐行调 TokensSince 是 O(行数×桶数)，
+// 且每一行都要在 recorder 互斥锁内遍历全部桶，把在线记账写入一起挡住。
+func (r *Recorder) TokensSinceByKey(sinceByKey map[string]time.Time) map[string]int64 {
+	if r == nil || len(sinceByKey) == 0 {
+		return nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out := make(map[string]int64, len(sinceByKey))
+	// 每个 key 的窗口起点先折算成整点串，循环内只做字典序比较（不再逐桶解析）。
+	cutoffs := make(map[string]string, len(sinceByKey))
+
+	for key, since := range sinceByKey {
+		cutoffs[key] = hourScopeCutoff(since)
+	}
+
+	for _, item := range r.buckets {
+		key := item.Realm + "|" + item.UID + "|" + item.Model
+
+		cutoff, ok := cutoffs[key]
+		if !ok || !scopeCoversSince(item.Scope, cutoff) {
+			continue
+		}
+
+		out[key] += item.TT
+	}
+
+	return out
 }
 
 // BackfillRow 上游逐笔用量按天聚合的一行（issue #31）。
@@ -422,6 +532,7 @@ func (r *Recorder) applyBackfillLocked(row *BackfillRow) {
 		local.TPSN += bucket2.TPSN
 		local.CH += bucket2.CH
 		local.CM += bucket2.CM
+		local.Err += bucket2.Err
 
 		delete(r.buckets, strVal)
 	}
@@ -447,6 +558,7 @@ func backfilledBucket(row *BackfillRow, realm, model, dayScope string, local *bu
 		TPSN:   local.TPSN,
 		CH:     local.CH,
 		CM:     local.CM,
+		Err:    local.Err,
 		Synced: true,
 	}
 	if row.Credits != 0 {
@@ -533,17 +645,20 @@ func (r *Recorder) Rollup(now time.Time) {
 
 	var moves []move
 
+	cutoffHour := hourScopeCutoff(cutoff)
+
 	for strVal, bucket2 := range r.buckets {
 		if !strings.HasPrefix(bucket2.Scope, "h:") {
 			continue
 		}
 
-		ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(bucket2.Scope, "h:"), time.Local)
-		if err != nil || !ts.Before(cutoff) {
+		hourText := bucket2.Scope[2:]
+		// 长度保护：加载期已丢弃非法 scope，运行期仍兜一层（防御手工写入/旧版本残留）。
+		if len(hourText) < len(dayLayout) || hourText >= cutoffHour {
 			continue
 		}
 
-		day := "d:" + ts.Format(dayLayout)
+		day := "d:" + hourText[:len(dayLayout)]
 		moves = append(moves, move{
 			from: strVal,
 			to:   day + "|" + bucket2.Realm + "|" + bucket2.UID + "|" + bucket2.Model + "|" + bucket2.Rate,
@@ -559,6 +674,58 @@ func (r *Recorder) Rollup(now time.Time) {
 
 		log.Printf("[usage] 折叠 %d 个小时桶为日桶（保留 %v 细粒度）", len(moves), hourlyKeep)
 	}
+}
+
+// trimOldest 按 scope 从旧到新删除 excess 个桶（小时桶优先于日桶）。
+//
+// 只在桶数超过 maxBuckets 时调用：保留策略本就以「先只留 90 天细粒度、再折叠成
+// 日桶」为界，真正超限意味着内存/落盘都会无界增长，此时按最旧时间序裁剪是唯一
+// 能把「有界」兑现的做法。
+func (r *Recorder) trimOldest(excess int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if excess <= 0 || len(r.buckets) == 0 {
+		return
+	}
+
+	keys := make([]string, 0, len(r.buckets))
+	for key, bucket2 := range r.buckets {
+		// 排序主键取 scope 的**时间部分**，不能带 "d:"/"h:" 前缀：'d' < 'h'，
+		// 带前缀时所有日桶都排在任何小时桶之前，于是超限时先删掉最近的回填日桶
+		// （Backfill 会为最近的自然日写日桶），却留着几个月前的小时桶。
+		// 时间串等宽零填充，字典序即时间序；同日时短串（日桶）排在前。
+		keys = append(keys, bucketTimeKey(bucket2.Scope)+"\x00"+key)
+	}
+
+	slices.Sort(keys)
+
+	removed := 0
+
+	for _, entry := range keys {
+		if removed >= excess {
+			break
+		}
+
+		_, key, _ := strings.Cut(entry, "\x00")
+		delete(r.buckets, key)
+
+		removed++
+	}
+
+	r.dirty = true
+
+	log.Printf("[usage] 桶数超过上限 %d，按最旧时间序裁剪 %d 个桶", maxBuckets, removed)
+}
+
+// bucketTimeKey 取 scope 的时间部分（去掉 "h:"/"d:" 前缀）作为裁剪排序键。
+// 非法或过短的 scope 原样返回：裁剪只要求顺序确定性，不要求解析成功。
+func bucketTimeKey(scope string) string {
+	if len(scope) <= 2 {
+		return scope
+	}
+
+	return scope[2:]
 }
 
 //nolint:dupl // 桶字段与聚合字段逐项映射，字段名不同但赋值形状一致。
@@ -599,7 +766,7 @@ func (r *Recorder) mergeHourly(from, to string) {
 // ---------------------------------------------------------------- 持久化 ----
 
 func (r *Recorder) load() error {
-	raw, err := os.ReadFile(r.path)
+	raw, restored, err := safefile.ReadWithFallback(r.path, nil)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -608,19 +775,56 @@ func (r *Recorder) load() error {
 		return fmt.Errorf("load: %w", err)
 	}
 
+	if restored {
+		// 正文损坏时回退 .bak：usage.json 是唯一一份永久保留的长期数据（日桶不裁剪），
+		// 静默用旧副本至少比丢历史好，但必须留痕。
+		log.Printf("[usage] WARN: 正文损坏，已回退 %s.bak: %s", r.path, r.path)
+	}
+
 	var file2 file
 	if err := json.Unmarshal(raw, &file2); err != nil {
 		return fmt.Errorf("load: %w", err)
 	}
 
+	invalid := 0
+
 	for i := range file2.Buckets {
-		b := file2.Buckets[i]
-		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model+"|"+b.Rate] = &b
+		bucket2 := file2.Buckets[i]
+		// scope 是 Rollup 的切片假设（hourText[:len(dayLayout)]）：不合法的 scope
+		// 会让 Rollup 越界 panic，而 panic 被 tick 的 recover 吞掉后 due 恒真 →
+		// 每 30 秒 panic 一次、再也不会落盘。加载期直接丢弃坏桶。
+		if !validScope(bucket2.Scope) {
+			invalid++
+
+			continue
+		}
+
+		r.buckets[bucket2.Scope+"|"+bucket2.Realm+"|"+bucket2.UID+"|"+bucket2.Model+"|"+bucket2.Rate] = &bucket2
+	}
+
+	if invalid > 0 {
+		log.Printf("[usage] WARN: 丢弃 %d 个 scope 非法的用量桶: %s", invalid, r.path)
 	}
 
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
 
 	return nil
+}
+
+// validScope 校验分片键形态：h:<hourLayout> 或 d:<dayLayout>（本地时区）。
+func validScope(scope string) bool {
+	switch {
+	case strings.HasPrefix(scope, "h:"):
+		_, err := time.Parse(hourLayout, scope[2:])
+
+		return err == nil
+	case strings.HasPrefix(scope, "d:"):
+		_, err := time.Parse(dayLayout, scope[2:])
+
+		return err == nil
+	default:
+		return false
+	}
 }
 
 func (r *Recorder) flush(force bool) {
@@ -670,7 +874,9 @@ func (r *Recorder) flush(force bool) {
 		return
 	}
 
-	if err := safefile.Write(r.path, raw, 0o600); err != nil {
+	// WriteKeep 而非 Write：usage.json 是唯一永久保留的长期数据，落盘前把上一份
+	// 有效内容留成 .bak，正文被外部写坏时还能读回来（credithist 同口径）。
+	if err := safefile.WriteKeep(r.path, raw, 0o600, json.Valid); err != nil {
 		log.Printf("[usage] 原子替换失败: %v", err)
 		markDirty()
 	}

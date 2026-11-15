@@ -13,6 +13,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -22,6 +23,9 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
+
+// errSearchRealmNotCN 命名密钥绑定 global 域时不得使用 CN 检索额度。
+var errSearchRealmNotCN = errors.New("search only supports the cn realm for this API key")
 
 // anthropicConvertWithSearch 解码 → 可选执行 web_search → 转换。返回的 prelude 是
 // 响应前部要回发的 Anthropic 内容块；未声明搜索时 nil（零开销）。
@@ -39,18 +43,39 @@ func (h *Handler) anthropicConvertWithSearch(
 		return converted, nil, convErr
 	}
 
+	// 命名密钥绑定出口是运维侧的显式约束：本路径与 /v1/search/messages 一样
+	// 恒走 CN 域检索，绑定 global 的 key 不得消耗 CN 账号额度。
+	if keyRealm := keyRealmFrom(r.Context()); keyRealm != "" && keyRealm != searchRealm {
+		return anthropicConversion{}, nil, errSearchRealmNotCN
+	}
+
+	prelude, searchErr := h.runInlineWebSearch(ctx, r, req)
+	if searchErr != nil {
+		return anthropicConversion{}, nil, searchErr
+	}
+
+	converted, err := anthropicConvertRequest(req)
+
+	return converted, prelude, err
+}
+
+// runInlineWebSearch 执行 /v1/messages 内联的 web_search：检索 → 注入 system →
+// 剥离服务端工具声明，返回要回发的内容前部。req 被原地修改。
+func (h *Handler) runInlineWebSearch(
+	ctx context.Context, r *http.Request, req *anthropicRequest,
+) ([]any, error) {
 	query := anthropicLastUserText(req.Messages)
 	if query == "" {
 		// 没有可检索文本：保持既有「自定义工具」语义（网关无法凭空搜索）。
-		return anthropicConversion{}, nil, errSearchQueryEmpty
+		return nil, errSearchQueryEmpty
 	}
 
 	meta := searchMetaFromRequest(r)
 
 	options := toolSearchOptions(req.Tools)
 
-	if validationErr := validateSearchOptions(options, false); validationErr != nil {
-		return anthropicConversion{}, nil, validationErr
+	if err := validateSearchOptions(options, false); err != nil {
+		return nil, err
 	}
 
 	started := time.Now()
@@ -70,9 +95,7 @@ func (h *Handler) anthropicConvertWithSearch(
 		trace.noteResult(uid, "", outcomeName)
 	}
 
-	converted, err := anthropicConvertRequest(req)
-
-	return converted, prelude, err
+	return prelude, nil
 }
 
 // anthropicLastUserText 取最后一条 user 消息的文本（块数组只取 text 块）。

@@ -150,6 +150,8 @@ func (s *Scheduler) redeemUnlockedTiers(ctx context.Context, account *auth.Auth,
 		"14d": full.RedemptionStatus.Tier14dStatus,
 		"28d": full.RedemptionStatus.Tier28dStatus,
 	}
+	attempted := 0
+
 	for _, tier := range full.RedemptionStatus.Tiers {
 		if ctx.Err() != nil {
 			return
@@ -159,6 +161,16 @@ func (s *Scheduler) redeemUnlockedTiers(ctx context.Context, account *auth.Auth,
 		if status == "locked" || status == "claimed" {
 			continue
 		}
+		// Tiers 是上游 JSON 数组，每一项一次 POST：正常只有 7d/14d/28d 三档，
+		// 不得让上游数据决定本轮的出站请求次数。
+		if attempted >= maxRedeemTiersPerRound {
+			log.Printf("WARN: streak-bonus %s: 上游返回的兑换档位超过单轮上限 %d，本轮只处理前 %d 个",
+				logfmt.Label(account.UID, account.NicknameValue()), maxRedeemTiersPerRound, maxRedeemTiersPerRound)
+
+			return
+		}
+
+		attempted++
 
 		if err := s.cfg.Upstream.GrowthRedeemTier(account, tier.Tier); err != nil {
 			// 未解锁（403）属预期，静默；其余记日志。
@@ -169,12 +181,21 @@ func (s *Scheduler) redeemUnlockedTiers(ctx context.Context, account *auth.Auth,
 		}
 
 		log.Printf("streak-bonus %s: ★ 兑换 %s 档（+%dc +%de 卡×%d 抽奖×%d）",
-			account.UID, tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
+			logfmt.Label(account.UID, account.NicknameValue()), tier.Tier,
+			tier.Credit, tier.Energy, tier.Cards, tier.Chances)
 	}
 }
 
 // drawAllLottery 按当前抽奖次数全部抽完，遇错即停。
 func (s *Scheduler) drawAllLottery(ctx context.Context, account5 *auth.Auth, chances int) {
+	clamped, truncated := clampLotteryDraws(chances)
+	if truncated {
+		log.Printf("WARN: streak-bonus %s: 上游返回抽奖次数 %d 超过单轮上限 %d，本轮只抽 %d 次",
+			logfmt.Label(account5.UID, account5.NicknameValue()), chances, clamped, clamped)
+	}
+
+	chances = clamped
+
 	for i := range chances {
 		if ctx.Err() != nil {
 			return
@@ -193,6 +214,32 @@ func (s *Scheduler) drawAllLottery(ctx context.Context, account5 *auth.Auth, cha
 	if chances > 0 {
 		log.Printf("streak-bonus %s: 抽奖完成 %d 次", logfmt.Label(account5.UID, account5.NicknameValue()), chances)
 	}
+}
+
+// maxLotteryDrawsPerRound 单账号单轮抽奖上限（clampLotteryDraws）。
+// maxRedeemTiersPerRound 单账号单轮兑换档位上限（redeemUnlockedTiers）。
+//
+// 两者的输入都直接来自上游 JSON（chances 计数 / tiers 数组），而每一轮都是一条
+// POST：一次异常或被篡改的响应就足以让本进程对同一账号连打上万次上游请求（WAF
+// 风控、额度、账号安全都受影响）。正常玩法（兑换 7d/14d/28d 档位 + 礼包）远远
+// 到不了这个量级，超过即视为上游数据异常，处理后留痕。
+const (
+	maxLotteryDrawsPerRound = 100
+	maxRedeemTiersPerRound  = 8
+)
+
+// clampLotteryDraws 把上游返回的抽奖次数钳到 [0, maxLotteryDrawsPerRound]；
+// truncated=true 表示被钳制，调用方据此打一条 WARN。
+func clampLotteryDraws(chances int) (clamped int, truncated bool) {
+	if chances <= 0 {
+		return 0, false
+	}
+
+	if chances > maxLotteryDrawsPerRound {
+		return maxLotteryDrawsPerRound, true
+	}
+
+	return chances, false
 }
 
 // maxStreakPayloadLen 奖品载荷日志上限。

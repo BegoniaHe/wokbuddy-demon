@@ -368,6 +368,23 @@ func TestRunTravelAdoptTriedExpiresNextDay(t *testing.T) {
 	}
 }
 
+// TestMarkAdoptTriedPrunesOtherDays 领养台账只保留当日条目：map 无其它删除点，
+// 不清会随「账号数 × 天数」永久增长。
+func TestMarkAdoptTriedPrunesOtherDays(t *testing.T) {
+	t.Parallel()
+
+	scheduler := &Scheduler{adoptTried: map[string]string{"gone": "2000-01-01"}}
+	scheduler.markAdoptTried("u1")
+
+	if _, ok := scheduler.adoptTried["gone"]; ok {
+		t.Error("旧日条目应被清理")
+	}
+
+	if !scheduler.adoptTriedToday("u1") {
+		t.Error("当日条目应命中")
+	}
+}
+
 // travelSkipStubHandler 模拟三态：disabled 号 401 且计数、dead 号 401 且计数、
 // 正常号 info→有猫 / status→空闲 / depart→成功。
 func travelSkipStubHandler(deadCalls, okDepart, disabledCalls *atomic.Int32) http.Handler {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -779,6 +780,20 @@ func TestTokensByAccountModel(t *testing.T) {
 	if all := r.TokensSince("cn", "u1", "glm-5.2", now.Add(time.Hour)); all != 0 {
 		t.Fatalf("future since=%d want 0", all)
 	}
+
+	// 批量口径必须与逐行口径一致（面板剩余用量一次聚合替代逐行扫表）。
+	byKey := r.TokensSinceByKey(map[string]time.Time{
+		"cn|u1|glm-5.2": now.Add(-time.Hour),
+		"cn|u2|glm-5.2": now.Add(-time.Hour),
+		"cn|u2|hy4":     now.Add(-time.Hour), // 不存在的桶不应产生条目
+	})
+	if byKey["cn|u1|glm-5.2"] != 10 || byKey["cn|u2|glm-5.2"] != 20 {
+		t.Fatalf("tokens by key=%v", byKey)
+	}
+
+	if _, ok := byKey["cn|u2|hy4"]; ok {
+		t.Fatalf("未命中的 key 不应出现在结果里: %v", byKey)
+	}
 }
 
 func TestDailyTotals(t *testing.T) {
@@ -870,4 +885,218 @@ func TestStartIdempotent(t *testing.T) {
 	r.Start()
 	r.Start()
 	r.Stop()
+}
+
+// hourScopeCutoff 把窗口起点折算成整点串，查询侧因此只做字典序比较（不再在锁
+// 内逐桶解析）。语义必须与「解析后比较」严格一致：正好落在整点上的桶保留，
+// 早于整点的桶丢弃。
+func TestHourScopeCutoffBoundary(t *testing.T) {
+	t.Parallel()
+
+	loc := time.FixedZone("T", 8*3600)
+	base := time.Date(2026, 10, 18, 12, 0, 0, 0, loc)
+
+	if got, want := hourScopeCutoff(base), "2026-10-18T12"; got != want {
+		t.Fatalf("整点边界 cutoff=%q want %q（整点桶必须保留）", got, want)
+	}
+
+	if got, want := hourScopeCutoff(base.Add(time.Second)), "2026-10-18T13"; got != want {
+		t.Fatalf("非整点 cutoff=%q want %q（早于秒的桶应被排除）", got, want)
+	}
+
+	// 11:59:59.999 的第一个「不早于它」的整点仍是 12:00（11 点桶整点更早，被排除）。
+	if got, want := hourScopeCutoff(base.Add(-time.Nanosecond)), "2026-10-18T12"; got != want {
+		t.Fatalf("整点前一瞬间 cutoff=%q want %q", got, want)
+	}
+
+	// 与逐桶解析对比：跨日边界上字典序与时间序一致。
+	day := time.Date(2026, 12, 31, 23, 30, 0, 0, loc)
+	if got, want := hourScopeCutoff(day), "2027-01-01T00"; got != want {
+		t.Fatalf("跨年 cutoff=%q want %q", got, want)
+	}
+
+	if !sortCompareMatchesParse(t, base) {
+		t.Fatal("字典序与解析后比较在整点边界上分叉")
+	}
+}
+
+// sortCompareMatchesParse 对窗口前后各若干小时逐桶校验两条口径一致。
+func sortCompareMatchesParse(t *testing.T, since time.Time) bool {
+	t.Helper()
+
+	cutoff := hourScopeCutoff(since)
+
+	for offset := -3; offset <= 3; offset++ {
+		hour := since.Add(time.Duration(offset) * time.Hour).Truncate(time.Hour)
+		text := hour.Format(hourLayout)
+
+		byParse := !hour.Before(since)
+
+		byCompare := text >= cutoff
+		if byParse != byCompare {
+			t.Logf("offset=%d hour=%s 解析=%v 比较=%v", offset, text, byParse, byCompare)
+
+			return false
+		}
+	}
+
+	return true
+}
+
+// TestTokensSinceIncludesBackfillDayBuckets 面板回填写入的日桶必须被「自 since 起」
+// 的用量读者纳入：回填覆盖近 24h 后，原实现只认 h: 前缀，撞线用量与剩余用量直接
+// 掉到 0（预算/剩余用量整体偏高）。
+func TestTokensSinceIncludesBackfillDayBuckets(t *testing.T) {
+	t.Parallel()
+
+	r := New("")
+	now := time.Now()
+
+	// 今天的回填日桶（面板 backfill 的形态）。
+	day := "d:" + now.Format(dayLayout)
+	r.buckets[day+"|cn|u1|m|"] = &bucket{
+		Scope: day, Realm: "cn", UID: "u1", Model: "m", Req: 1, TT: 500,
+	}
+	// 90 天前的历史日桶：必须落在窗口外。
+	old := "d:" + now.AddDate(0, 0, -90).Format(dayLayout)
+	r.buckets[old+"|cn|u1|m2|"] = &bucket{
+		Scope: old, Realm: "cn", UID: "u1", Model: "m2", Req: 1, TT: 900,
+	}
+
+	if got := r.TokensSince("cn", "u1", "m", now.Add(-24*time.Hour)); got != 500 {
+		t.Fatalf("TokensSince=%d want 500（今日回填日桶须计入）", got)
+	}
+
+	if got := r.TokensSince("cn", "u1", "m2", now.Add(-24*time.Hour)); got != 0 {
+		t.Fatalf("TokensSince=%d want 0（90 天前的日桶在窗口外）", got)
+	}
+
+	byKey := r.TokensSinceByKey(map[string]time.Time{
+		"cn|u1|m":  now.Add(-24 * time.Hour),
+		"cn|u1|m2": now.Add(-24 * time.Hour),
+	})
+	if byKey["cn|u1|m"] != 500 || byKey["cn|u1|m2"] != 0 {
+		t.Fatalf("TokensSinceByKey=%v", byKey)
+	}
+}
+
+// TestLoadDropsInvalidScope load 必须丢弃 scope 非法的桶：Rollup 会对 h: scope 做
+// 定长切片，越界 panic 被 tick 的 recover 吞掉后 due 恒真，每 30 秒 panic 一次且
+// 再也不落盘（直到重启读到同一个坏文件）。
+func TestLoadDropsInvalidScope(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "usage.json")
+	// 桶字段用短标签（见 usage.bucket 的 json tag）。
+	raw := `{"version":1,"buckets":[
+		{"s":"h:2026-11-13T09","r":"cn","u":"u1","m":"m","q":1,"t":10},
+		{"s":"x:broken","r":"cn","u":"u2","m":"m","q":1,"t":10},
+		{"s":"h:short","r":"cn","u":"u3","m":"m","q":1,"t":10}
+	]}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := New(path)
+	if len(r.buckets) != 1 {
+		t.Fatalf("buckets=%d want 1（非法 scope 应被丢弃）", len(r.buckets))
+	}
+
+	// 不 panic 即通过。
+	r.Rollup(time.Now().AddDate(0, 0, 1))
+}
+
+// TestDailyTotalsCachedInvalidatesAcrossDay 日缓存必须带日期：零点前后 1 秒内
+// 复用会把前一天聚合当成「今天」，而这份数据直接参与日限额过滤。
+func TestDailyTotalsCachedInvalidatesAcrossDay(t *testing.T) {
+	t.Parallel()
+
+	r := New("")
+
+	day1 := time.Date(2026, 10, 17, 23, 59, 59, 0, time.Local)
+	r.Add(day1, "cn", "u1", "m", &Delta{TotalTokens: 100, HasTotal: true}, true)
+
+	if got := r.DailyTotalsCached(day1); got["u1"].Tokens != 100 {
+		t.Fatalf("day1 totals=%+v", got)
+	}
+
+	// 紧邻的下一天（间隔 <1s）：必须重算，而不是返回前一天的缓存。
+	day2 := day1.Add(2 * time.Second)
+	r.Add(day2, "cn", "u2", "m", &Delta{TotalTokens: 7, HasTotal: true}, true)
+
+	got := r.DailyTotalsCached(day2)
+	if _, ok := got["u1"]; ok {
+		t.Fatalf("跨零点仍复用了前一天缓存: %+v", got)
+	}
+
+	if got["u2"].Tokens != 7 {
+		t.Fatalf("day2 totals=%+v want u2=7", got)
+	}
+}
+
+// TestTrimOldestCutsToBudget maxBuckets 超限时按最旧 scope 裁剪，否则「有界」承诺
+// 不成立（Rollup 只折叠 90 天前的小时桶，保留期内的超限桶一条也删不掉）。
+func TestTrimOldestCutsToBudget(t *testing.T) {
+	t.Parallel()
+
+	r := New("")
+
+	base := time.Date(2026, 10, 17, 12, 0, 0, 0, time.Local)
+	for i := range 5 {
+		r.Add(base.Add(time.Duration(i)*time.Hour), "cn", "u1", "m", &Delta{TotalTokens: 1, HasTotal: true}, true)
+	}
+
+	r.trimOldest(2)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(r.buckets) != 3 {
+		t.Fatalf("buckets=%d want 3", len(r.buckets))
+	}
+	// 最旧的两小时应被删掉，最新的仍在。
+	for scope := range r.buckets {
+		if strings.Contains(scope, "T12") || strings.Contains(scope, "T13") {
+			t.Fatalf("最旧桶未被裁剪: %s", scope)
+		}
+	}
+}
+
+// TestTrimOldestByTimeNotScopePrefix 超限裁剪必须按时间序，不能被 "d:"/"h:" 前缀
+// 主导。'd' < 'h'，旧实现按完整 key 排序，所有日桶（含 Backfill 为最近自然日写出
+// 的日桶）都排在任何小时桶之前 —— 于是先删最新的回填日桶、保留几个月前的小时桶。
+func TestTrimOldestByTimeNotScopePrefix(t *testing.T) {
+	t.Parallel()
+
+	r := New("")
+	// 最近回填的日桶（时间上最新）与较早的小时桶。
+	r.buckets = map[string]*bucket{
+		"d:2026-11-12|cn|u1|m1|":    {Scope: "d:2026-11-12", Realm: "cn", UID: "u1", Model: "m1"},
+		"h:2026-01-05T03|cn|u2|m1|": {Scope: "h:2026-01-05T03", Realm: "cn", UID: "u2", Model: "m1"},
+		"h:2026-11-12T10|cn|u3|m1|": {Scope: "h:2026-11-12T10", Realm: "cn", UID: "u3", Model: "m1"},
+	}
+
+	r.trimOldest(1)
+
+	if _, ok := r.buckets["h:2026-01-05T03|cn|u2|m1|"]; ok {
+		t.Fatalf("应删掉时间最早的小时桶，实际留下了：%v", keysOfBuckets(r.buckets))
+	}
+
+	for _, keep := range []string{"d:2026-11-12|cn|u1|m1|", "h:2026-11-12T10|cn|u3|m1|"} {
+		if _, ok := r.buckets[keep]; !ok {
+			t.Fatalf("不应删除较新的桶 %q，当前：%v", keep, keysOfBuckets(r.buckets))
+		}
+	}
+}
+
+// keysOfBuckets 返回桶 key 列表（测试断言用，排序后便于打印）。
+func keysOfBuckets(buckets map[string]*bucket) []string {
+	keys := make([]string, 0, len(buckets))
+	for key := range buckets {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	return keys
 }

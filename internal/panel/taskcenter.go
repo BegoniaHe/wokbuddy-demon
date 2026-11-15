@@ -11,6 +11,7 @@ package panel
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -68,6 +69,35 @@ const scanWorkers = 5
 // 只读操作，并发拉取（受 scanWorkers 约束）；客户端断开后不再派发剩余账号。
 func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	items := p.scanAllAccounts(ctx)
+
+	if ctx.Err() != nil {
+		return // 客户端已断开：不必统计与写回执
+	}
+
+	pending := 0
+	// 禁用账号在派发阶段被跳过，items 里留的是零值：不过滤的话面板会渲染出
+	// 若干 {"uid":"","nickname":"","growth":null} 空行。
+	kept := items[:0]
+
+	for _, entry := range items {
+		if entry.UID == "" {
+			continue
+		}
+
+		pending += len(entry.Growth)
+		kept = append(kept, entry)
+	}
+
+	items = kept
+
+	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+}
+
+// scanAllAccounts 并发拉取全部启用账号的待办成长任务（受 scanWorkers 约束）；
+// 客户端断开后不再派发剩余账号。
+func (p *Panel) scanAllAccounts(ctx context.Context) []scanAccountItem {
 	states := p.cfg.Pool.List()
 	items := make([]scanAccountItem, len(states))
 
@@ -87,8 +117,10 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
+		uid := status.UID
+
 		wg.Add(1)
-		go func(i int, uid string) {
+		p.goGuarded("tasks-scan-account", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
@@ -99,22 +131,12 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 
 			items[i].UID, items[i].Nickname = uid, account.NicknameValue()
 			items[i].Growth, items[i].GrowthErr = p.scanAccountGrowth(account)
-		}(i, status.UID)
+		})
 	}
 
 	wg.Wait()
 
-	if ctx.Err() != nil {
-		return // 客户端已断开：不必统计与写回执
-	}
-
-	pending := 0
-	for _, it := range items {
-		pending += len(it.Growth)
-	}
-
-	log.Printf("panel: 队列扫描完成：全部账号待办 %d 项", pending)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": items, "pending_count": pending})
+	return items
 }
 
 // scanAccountGrowth 拉取单账号待办成长任务（默认口径 + mp 口径合并，不排序）。
@@ -201,8 +223,7 @@ func (p *Panel) queue() *queueState {
 // school 逐账号跑闭环），账号内串行、账号间受并发信号量约束。
 func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Concurrency int  `json:"concurrency"`
-		Growth      bool `json:"growth"`
+		Concurrency int `json:"concurrency"`
 	}
 
 	// 空 body 允许（全部走默认值）；畸形 JSON 必须拒绝，避免错误输入触发一次
@@ -210,10 +231,6 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	if err := decodeJSONBody(r.Body, &body); err != nil && !errors.Is(err, io.EOF) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
-	}
-
-	if !body.Growth {
-		body.Growth = true
 	}
 
 	if body.Concurrency < 1 {
@@ -224,7 +241,9 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 		body.Concurrency = 4
 	}
 
-	started, total, seq, msg := p.startGrowthQueue(body.Concurrency, body.Growth)
+	// growth 恒为 true：本入口只有成长任务一条队列路径（任务中心「执行全部待办」），
+	// 请求体里的 growth 字段此前被强制覆盖，属接口谎报，已从 body 结构删除。
+	started, total, seq, msg := p.startGrowthQueue(r.Context(), body.Concurrency, true)
 	switch {
 	case seq == -1:
 		writeErr(w, http.StatusConflict, msg)
@@ -241,7 +260,9 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 // [1,4]；growth 开关同 HTTP 入参语义。
 //
 //nolint:funlen // 扫描/冲突判定/入队/启动线性展开。
-func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, total, seq int, msg string) {
+func (p *Panel) startGrowthQueue(
+	ctx context.Context, concurrency int, growth bool,
+) (started bool, total, seq int, msg string) {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -262,27 +283,28 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	queueState2.startedAt = time.Now()
 	queueState2.mu.Unlock()
 
-	accts := p.collectQueueAccounts(growth)
+	// 占位必须由 defer 兜底复位：扫描（collectQueueAccounts 内含并发上游调用）与
+	// 组装期间的任何 panic / 提前返回若漏掉复位，队列会永久停在「正在执行中」，
+	// 此后 tasksRunQueue 与调度器 growth 回调恒 409。交接给 runQueueItems 后
+	// 由它自己的 defer 接管。
+	handedOff := false
 
-	// 组装队列（账号分组，保持顺序）。
-	var items []queueItem
-
-	for _, one := range accts {
-		for j := range one.grow {
-			items = append(items, queueItem{
-				UID: one.a.UID, Nickname: one.a.NicknameValue(),
-				Kind: "growth", Code: one.grow[j].TaskCode, Status: "pending",
-				Message: "",
-			})
+	defer func() {
+		if handedOff {
+			return
 		}
-	}
 
-	if len(items) == 0 {
-		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
 		queueState2.mu.Lock()
 		queueState2.running = false
 		queueState2.startedAt = time.Time{}
 		queueState2.mu.Unlock()
+	}()
+
+	accts := p.collectQueueAccounts(ctx, growth)
+	items := buildQueueItems(accts)
+
+	if len(items) == 0 {
+		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
 
 		return false, 0, 0, "全部账号没有待办任务"
 	}
@@ -294,7 +316,9 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	seq = queueState2.seq
 	queueState2.mu.Unlock()
 
-	go p.runQueueItems(accts, items, concurrency)
+	handedOff = true
+
+	p.goGuarded("tasks-run-queue", func() { p.runQueueItems(accts, items, concurrency) })
 
 	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v）", len(items), concurrency, growth)
 
@@ -303,7 +327,7 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 
 // collectQueueAccounts 并发拉取各账号待办成长任务（复用扫描逻辑的拉取部分），
 // 返回待办非空的账号（保持 Pool.List 的原顺序）。growth=false 时不做上游拉取。
-func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
+func (p *Panel) collectQueueAccounts(ctx context.Context, growth bool) []queueAccount {
 	states := p.cfg.Pool.List()
 
 	// 按下标写回：并发拉取完成顺序不确定，不能直接 append，否则队列账号
@@ -325,24 +349,20 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 			continue
 		}
 
-		// 先取名额再起 goroutine（同 tasksScanAll）：账号多时不在信号量上
-		// 堆积阻塞的 goroutine。
-		sem <- struct{}{}
+		// 先取名额再起 goroutine（同 tasksScanAll）：账号多时不在信号量上堆积阻塞
+		// 的 goroutine；取名额同样受 ctx 约束——本函数在 POST handler 里同步执行，
+		// 客户端断开后不该继续把全部账号 ×2 次列表调用跑完。
+		if !acquireSem(ctx, sem) {
+			break
+		}
 
 		wg.Add(1)
-		go func(idx int, queueAcct *auth.Auth) {
+		p.goGuarded("tasks-queue-scan-account", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			one := queueAccount{a: queueAcct}
-			if growth {
-				one.grow = p.queueAccountGrowth(queueAcct)
-			}
-
-			if len(one.grow) > 0 {
-				results[idx] = &one
-			}
-		}(i, account)
+			results[i] = p.queueAccountFor(account, growth)
+		})
 	}
 
 	wg.Wait()
@@ -356,6 +376,20 @@ func (p *Panel) collectQueueAccounts(growth bool) []queueAccount {
 	}
 
 	return accts
+}
+
+// queueAccountFor 拉取单个账号的待办成长任务；无待办返回 nil。
+func (p *Panel) queueAccountFor(account *auth.Auth, growth bool) *queueAccount {
+	one := queueAccount{a: account}
+	if growth {
+		one.grow = p.queueAccountGrowth(account)
+	}
+
+	if len(one.grow) == 0 {
+		return nil
+	}
+
+	return &one
 }
 
 // queueAccountGrowth 拉取账号待办成长任务并按 autoActions 顺序排序。global/企业版
@@ -395,7 +429,7 @@ func (p *Panel) queueAccountGrowth(account2 *auth.Auth) []upstream.Task {
 // 每日零点解锁一环，此前只能手动扫描推进；此回调让链条每天自动走一环。
 // 异步执行（startGrowthQueue 启动 goroutine 即返），已在跑/无待办安全跳过。
 func (p *Panel) RunGrowthQueueOnce() {
-	started, total, _, _ := p.startGrowthQueue(1, true)
+	started, total, _, _ := p.startGrowthQueue(context.Background(), 1, true)
 	if started {
 		log.Printf("panel: 定时成长任务队列已启动（%d 项）", total)
 	}
@@ -424,7 +458,8 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 		sem <- struct{}{}
 
 		wg.Add(1)
-		go func(one queueAccount) {
+
+		p.goGuarded("tasks-queue-run-account", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 			// per-account 互斥：与单任务/一键完成共用一把锁。
@@ -467,16 +502,34 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 
 				time.Sleep(reportGap) // 项间节流
 			}
-		}(one)
+		})
 	}
 
 	wg.Wait()
 }
 
-// queueAccount 队列执行的账号单元（runQueueItems 参数）。
+// queueAccount 队列执行的账号单元（runQueueItems 参数）——单账号的扫描结果，
+// 也是队列组装的最小输入。
 type queueAccount struct {
 	a    *auth.Auth
 	grow []upstream.Task
+}
+
+// buildQueueItems 把扫描结果摊平成待执行队列（账号分组，保持顺序）。
+func buildQueueItems(accts []queueAccount) []queueItem {
+	var items []queueItem
+
+	for _, one := range accts {
+		for j := range one.grow {
+			items = append(items, queueItem{
+				UID: one.a.UID, Nickname: one.a.NicknameValue(),
+				Kind: "growth", Code: one.grow[j].TaskCode, Status: "pending",
+				Message: "",
+			})
+		}
+	}
+
+	return items
 }
 
 // snapshotAt 锁内读条目三元组（避免锁外持有指针）。
@@ -583,17 +636,27 @@ func (p *Panel) autoClaimQueued(a *auth.Auth, code, msg string) string {
 func (p *Panel) tasksQueueStatus(w http.ResponseWriter, r *http.Request) {
 	queueState2 := p.queue()
 	queueState2.mu.Lock()
-	defer queueState2.mu.Unlock()
 
 	items := make([]queueItem, len(queueState2.items))
 	copy(items, queueState2.items)
+
+	running := queueState2.running
+	conc := queueState2.conc
+	startedAt := queueState2.startedAt
+	seq := queueState2.seq
+	queueState2.mu.Unlock()
+
+	// 响应必须在锁外写：服务端不设 WriteTimeout（见 cmd/server 的 http.Server），
+	// 一个只连不读的轮询客户端能让 writeJSON 无限期阻塞在 socket 上，而队列状态机
+	// （runQueueItems 收尾、markAt、snapshotAt）全部等这把锁 → 队列恒显示「执行中」，
+	// 之后的 run_queue 与调度器 growth 回调一律 409。
 	writeJSON(w, http.StatusOK, map[string]any{
-		"running":    queueState2.running,
+		"running":    running,
 		"total":      len(items),
-		"conc":       queueState2.conc,
-		"started":    !queueState2.startedAt.IsZero(),
-		"started_at": queueState2.startedAt,
-		"seq":        queueState2.seq,
+		"conc":       conc,
+		"started":    !startedAt.IsZero(),
+		"started_at": startedAt,
+		"seq":        seq,
 		"items":      items,
 	})
 }

@@ -72,3 +72,21 @@ func TestFinalErrorEnvelopeProxyDialFailed(t *testing.T) {
 		t.Errorf("本地代理错误不得标记为上游原文透传")
 	}
 }
+
+// TestFinalErrorEnvelopeGatewaySaturated 本地并发闸门满额必须回 gateway_busy，
+// 不能落回 no_healthy_account：后者把「网关自己满了」表述成「账号全挂」，
+// 客户端与运维会朝完全错误的方向排查（扩容 vs 换号）。
+func TestFinalErrorEnvelopeGatewaySaturated(t *testing.T) {
+	t.Parallel()
+
+	f := &chatFlow{lastErr: errGatewaySaturated}
+
+	status, code, msg, _, _ := f.finalErrorEnvelope()
+	if status != http.StatusServiceUnavailable || code != "gateway_busy" {
+		t.Fatalf("status=%d code=%q want 503 gateway_busy", status, code)
+	}
+
+	if strings.Contains(msg, "no healthy account") || strings.Contains(code, "no_healthy_account") {
+		t.Fatalf("msg=%q code=%q 不得表述为号池问题", msg, code)
+	}
+}

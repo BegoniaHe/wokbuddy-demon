@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
 )
@@ -36,6 +37,9 @@ var (
 	errModelList     = errors.New("模型 id 含非法项")
 	errApplyFailed   = errors.New("Apply failed")
 	errRestoreFailed = errors.New("Restore failed")
+	// ErrConfigShape 现有客户端配置的字段类型与预期不符（字符串/数组 vs 对象）。
+	// 此时放弃改写：静默覆盖会把用户既有配置整段丢掉。
+	ErrConfigShape = errors.New("现有客户端配置字段类型不符")
 )
 
 type Options struct {
@@ -206,9 +210,12 @@ func normalizeAPIKey(opts *Options) error {
 		return errAPIKey
 	}
 
-	if strings.ContainsFunc(opts.APIKey, isControlRune) {
+	// 非法 UTF-8 必须在这里拦：strings.ContainsFunc 把坏字节解成 U+FFFD（≥0x20，
+	// 通过 isControlRune），而 strconv.Quote 会把它输出成 `\xNN`——Rust toml crate
+	// 不认这种转义，整份 config.toml 解析失败。
+	if !utf8.ValidString(opts.APIKey) || strings.ContainsFunc(opts.APIKey, isControlRune) {
 		// 不回显密钥本体或片段：该错误会经面板 agentsApply 原样回给 HTTP 调用方。
-		return fmt.Errorf("api_key 含控制字符，无法写入客户端配置: %w", errAPIKey)
+		return fmt.Errorf("api_key 含控制字符或非法 UTF-8，无法写入客户端配置: %w", errAPIKey)
 	}
 
 	return nil
@@ -263,7 +270,8 @@ func normalizeModelID(raw string) (string, error) {
 		return "", nil
 	}
 
-	if strings.ContainsFunc(id, isControlRune) {
+	// 同 normalizeAPIKey：非法 UTF-8 会经 %q 写成 TOML 不认的 \xNN。
+	if !utf8.ValidString(id) || strings.ContainsFunc(id, isControlRune) {
 		return "", fmt.Errorf("%w: 含控制字符 %q 的模型 id 无法写入客户端配置", errModelList, id)
 	}
 
@@ -413,6 +421,13 @@ func (m *Manager) restoreOriginal(id, path string) error {
 		return fmt.Errorf("restoreOriginal: %w", err)
 	}
 
+	// 原件备份是「本次 Apply 之前的用户配置」，恢复后它已被写回现址，再留着会让
+	// 下一次 Apply 的 saveOriginal 直接跳过（它见原件存在就不再备份），把用户
+	// 恢复后手改的内容永久丢失。
+	if err := os.Remove(m.originalPath(id)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("restoreOriginal: %w", err)
+	}
+
 	return nil
 }
 
@@ -425,8 +440,37 @@ func (m *Manager) saveOriginal(id string, raw []byte, existed bool) error {
 		return nil
 	}
 
-	if err := os.WriteFile(m.originalPath(id), raw, 0o600); err != nil {
+	// 原件备份是不可变事实：写下一次就不再覆盖。
+	//
+	// prepareMeta 把 readMeta 的任何错误都当成「首次写入」，而 Apply 的顺序是
+	// writeFile → writeMeta：writeMeta 失败（磁盘满 / 掉电留下零长 meta.json）后
+	// 再 Apply，若这里无条件覆写，就会把网关已改写过的内容当原件存进 original，
+	// 用户原始配置从此不可恢复。
+	if _, err := os.Stat(m.originalPath(id)); err == nil {
+		return nil
+	}
+
+	// 原子写：original 是用户配置的唯一回滚副本，裸 os.WriteFile 写一半掉电会留下
+	// 截断文件；而上面的 Stat 守卫保证「写过就不再覆盖」，残缺内容会被当成不可变
+	// 事实永久保留，Restore 时写回用户配置。
+	if err := writeFileAtomic(m.originalPath(id), raw); err != nil {
 		return fmt.Errorf("saveOriginal: %w", err)
+	}
+
+	return nil
+}
+
+// writeFileAtomic 以 tmp + rename 原子写入（同 writeMeta 的路径，避免半截文件）。
+func writeFileAtomic(path string, raw []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+
+	if err := atomicwrite.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+
+		return fmt.Errorf("rename %s: %w", path, err)
 	}
 
 	return nil
@@ -458,14 +502,7 @@ func (m *Manager) writeMeta(id string, mt meta) error {
 		return fmt.Errorf("writeMeta: %w", err)
 	}
 
-	path := m.metaPath(id)
-
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("writeMeta: %w", err)
-	}
-
-	if err := atomicwrite.Rename(tmp, path); err != nil {
+	if err := writeFileAtomic(m.metaPath(id), raw); err != nil {
 		return fmt.Errorf("writeMeta: %w", err)
 	}
 
@@ -475,8 +512,14 @@ func (m *Manager) writeMeta(id string, mt meta) error {
 // loadConfigDoc 解析已有客户端配置；空内容按空对象处理。
 func loadConfigDoc(existing []byte, label string) (map[string]any, error) {
 	doc := map[string]any{}
+
 	if len(bytes.TrimSpace(existing)) > 0 {
-		if err := json.Unmarshal(existing, &doc); err != nil {
+		// UseNumber：写回的是用户的客户端配置，数字字面量（8192.0 / 大整数）不能被
+		// float64 往返改写。
+		dec := json.NewDecoder(bytes.NewReader(existing))
+		dec.UseNumber()
+
+		if err := dec.Decode(&doc); err != nil {
 			return nil, fmt.Errorf("现有 %s 配置不是合法 JSON: %w", label, err)
 		}
 
@@ -497,9 +540,9 @@ func applyClaude(existing []byte, opts Options) ([]byte, error) {
 		return nil, err
 	}
 
-	env, _ := doc["env"].(map[string]any)
-	if env == nil {
-		env = map[string]any{}
+	env, err := objectField(doc, "env", "Claude")
+	if err != nil {
+		return nil, err
 	}
 
 	env["ANTHROPIC_BASE_URL"] = gatewayRoot(opts.BaseURL)
@@ -711,15 +754,33 @@ func splitCodexRoot(text string) (root, tables string) {
 	return text, ""
 }
 
+// objectField 取 doc[key] 的对象值：缺失/null 返回空对象；存在但类型不符返回
+// 错误。原先的 `doc[key].(map[string]any)` + nil 兜底会把客户端的字符串/数组值
+// 整段替换成空对象，用户的既有配置在一次 Apply 后丢失且无提示。
+func objectField(doc map[string]any, key, clientName string) (map[string]any, error) {
+	raw, exists := doc[key]
+	if !exists || raw == nil {
+		return map[string]any{}, nil
+	}
+
+	value, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("现有 %s 配置的 %s（%T）已放弃改写以免覆盖用户内容: %w",
+			clientName, key, raw, ErrConfigShape)
+	}
+
+	return value, nil
+}
+
 func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 	doc, err := loadConfigDoc(existing, "OpenCode")
 	if err != nil {
 		return nil, err
 	}
 
-	provider, _ := doc["provider"].(map[string]any)
-	if provider == nil {
-		provider = map[string]any{}
+	provider, err := objectField(doc, "provider", "OpenCode")
+	if err != nil {
+		return nil, err
 	}
 
 	models := make(map[string]any, len(modelList(opts)))
@@ -782,6 +843,10 @@ func writeFile(path string, raw []byte) error {
 	}
 
 	if err := atomicwrite.Rename(tmp, path); err != nil {
+		// 固定名临时文件：失败后不清理会永久留在 ~/.claude、~/.codex 等用户目录，
+		// 且内容是本网关写出的完整配置（含 api_key）。
+		_ = os.Remove(tmp)
+
 		return fmt.Errorf("writeFile: %w", err)
 	}
 

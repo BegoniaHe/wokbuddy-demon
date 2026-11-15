@@ -69,10 +69,11 @@ var gatewayHintByKind = map[ErrKind]string{
 	// 队列满载是渠道级容量事件：不是账号问题，换号撞同一堵墙，只应退避重试。
 	ErrQueueFull: "upstream inference queue is full (channel-level capacity, not an account problem); " +
 		"switching accounts will not help, retry with backoff",
-	ErrAccountFault: "account-level fault at upstream (auth/quota state); " +
-		"the gateway will rotate or disable this account",
-	ErrSessionDead: "account session expired at upstream; the account is disabled until re-login",
-	ErrHardCredit:  "account credits exhausted at upstream; waiting for daily check-in to restore",
+	// 不描述网关内部的换号/停用动作：hint 是给客户端的，暴露调度语义等于告诉
+	// 调用方「换个号就绕过」，且把账号运维状态写进 API 响应。
+	ErrAccountFault: "account-level fault at upstream (auth/quota state); retry later or contact the operator",
+	ErrSessionDead:  "account session expired at upstream; the account is disabled until re-login",
+	ErrHardCredit:   "account credits exhausted at upstream; waiting for daily check-in to restore",
 	ErrModelBlocked: "this account lacks permission for the requested model; " +
 		"the gateway will retry on another account",
 	ErrModelNotFound: "the requested model is unavailable at upstream (not integrated or misconfigured); " +
@@ -103,7 +104,8 @@ type HintContext struct {
 
 // noHealthyHint 本地调度类错误（池中无健康号可用/传输层抖动，无上游原文可透传）
 // 的固定 hint。不进 GatewayHint：它没有 ErrKind，是网关自己的调度事实。
-const noHealthyHint = "no healthy account available in pool; check /status or retry later"
+// 不提 /status：那是管理面板的运维面，客户端无处访问，只会误导。
+const noHealthyHint = "no healthy account available in pool; retry later"
 
 // NoHealthyAccountHint 本地调度错误的 gateway_hint（与 no_healthy_account code 配套）。
 func NoHealthyAccountHint() string { return noHealthyHint }

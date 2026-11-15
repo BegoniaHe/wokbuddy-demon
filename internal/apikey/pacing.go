@@ -91,9 +91,15 @@ func (l *paceLedger) advanceReq(id string, now time.Time, rpm int) time.Duration
 	return max(state.reqTAT.Sub(now), 0)
 }
 
-// advanceTokens token 速率调度：TAT = max(now, TAT+tokens*60/tpm)。
-// 只按已吐出的 completion 计，不把 prompt 或 max_tokens 预算扣进来：TPS 衡量
-// Decode 阶段新增输出，输入上下文不应占用输出速率的时间线。
+// advanceTokens token 速率调度：TAT = max(now, TAT)+tokens*60/tpm，结果夹到
+// now+PaceMaxDelay。只按已吐出的 completion 计，不把 prompt 或 max_tokens 预算
+// 扣进来：TPS 衡量 Decode 阶段新增输出，输入上下文不应占用输出速率的时间线。
+//
+// 基准先归到 now 再累加（与 NoteEmitted 同口径）：tokTAT 的零值在 time.Time 的
+// 公元 1 年，直接 `零值 + 间隔` 仍远在过去，会被下面的 `now.After(tat)` 判成
+// 「时间线已过去」而整段丢弃——非流式路径（PaceBoth）的首发 TPM 债务就此白送，
+// 之后才从 now 起算。RPM 的「空闲后第一发零等待」不能套到 token 维度：TPM 限的
+// 是 token 数，每一个都必须占时间线。
 func (l *paceLedger) advanceTokens(id string, now time.Time, tpm int, tokens int64) time.Duration {
 	if tokens <= 0 {
 		return 0
@@ -106,8 +112,13 @@ func (l *paceLedger) advanceTokens(id string, now time.Time, tpm int, tokens int
 
 	state := l.stateLocked(id)
 
-	tat := state.tokTAT.Add(time.Duration(tokens) * per)
-	if now.After(tat) {
+	base := state.tokTAT
+	if now.After(base) {
+		base = now
+	}
+
+	tat := base.Add(paceSpan(tokens, per))
+	if tat.Before(now) {
 		tat = now
 	}
 
@@ -196,6 +207,31 @@ func (s *Store) PaceBoth(id string, now time.Time, tokens int64) time.Duration {
 	return min(max(reqWait, tokWait), PaceMaxDelay)
 }
 
+// paceSpan tokens 个 token 在 per 间隔下摊开的等待，两个方向都夹到 ±PaceMaxDelay
+// 以内；按 per<=0 或 tokens==0 给零。
+//
+// 为什么必须在乘法之前夹：time.Duration 是 int64 纳秒，tokens × per 会溢出成
+// 负值，随后「TAT 在过去 → 归到 now」的分支把本该最长 PaceMaxDelay 的债务抹成
+// 零等待——实测 tpm=1、tokens=1<<62 时等待为 0（限速整条时间线被白送）。tokens
+// 来自上游 usage.completion_tokens 或本地正文估算，不得让一次异常响应关掉限速。
+// 负方向同理：NoteEmitted 用负差额退回高估的债务，溢出后会变成「凭空增加」。
+func paceSpan(tokens int64, per time.Duration) time.Duration {
+	if per <= 0 || tokens == 0 {
+		return 0
+	}
+
+	limit := int64(PaceMaxDelay / per)
+	if tokens > limit {
+		return PaceMaxDelay
+	}
+
+	if tokens < -limit {
+		return -PaceMaxDelay
+	}
+
+	return time.Duration(tokens) * per
+}
+
 // minTime 返回较早的时刻。TAT 一律夹到 now+PaceMaxDelay：单次查询与长期账本
 // 都受同一上限约束，避免一次突发把后续请求永久推到未来。
 func minTime(a, b time.Time) time.Time {
@@ -235,7 +271,7 @@ func (s *Store) NoteEmitted(id string, now time.Time, tokens int64) {
 		base = now
 	}
 
-	tat := base.Add(time.Duration(tokens) * interval)
+	tat := base.Add(paceSpan(tokens, interval))
 	if tat.Before(now) {
 		tat = now
 	}

@@ -52,12 +52,14 @@ func (h *Handler) busyHandler(w http.ResponseWriter, r *http.Request) {
 
 	keyUse := keyUsageFrom(r.Context())
 	keyRealm := keyRealmFrom(r.Context())
+	aliasOf := h.aliasResolver(keyRealm)
+	known := h.modelKnownSet()
 	data := make([]map[string]any, 0, len(payload.Models))
 
 	for _, raw := range payload.Models {
 		data = append(data, map[string]any{
 			"model":      raw,
-			"busy_level": h.modelBusyLevel(raw, keyUse, keyRealm),
+			"busy_level": h.modelBusyLevel(raw, keyUse, keyRealm, aliasOf, known),
 		})
 	}
 
@@ -68,13 +70,19 @@ func (h *Handler) busyHandler(w http.ResponseWriter, r *http.Request) {
 //
 // 判定顺序：realm 开关 → 隐藏/密钥白名单 → 模型目录存在性 → 模型级冷却 → 可服务账号。
 // 目录缓存冷/未知模型一律 unknown，绝不把「不知道」报成 idle。
-func (h *Handler) modelBusyLevel(raw string, keyUse *keyUsage, keyRealm string) string {
+//
+// aliasOf / known 由调用方按整批请求预构建（别名表按 realm 合并一次、目录建成集合
+// 一次）：逐模型重建整表 + 线性扫目录在数十模型的轮询里是平方级浪费。
+func (h *Handler) modelBusyLevel(
+	raw string, keyUse *keyUsage, keyRealm string,
+	aliasOf func(string) map[string]string, known map[string]struct{},
+) string {
 	model := strings.TrimSpace(raw)
 	if model == "" {
 		return "unknown"
 	}
 
-	realm, bare, err := resolveKeyModel(model, h.requestModelAliases(model, keyRealm), keyRealm)
+	realm, bare, err := resolveKeyModel(model, aliasOf(model), keyRealm)
 	if err != nil || bare == "" {
 		return "unknown"
 	}
@@ -87,7 +95,7 @@ func (h *Handler) modelBusyLevel(raw string, keyUse *keyUsage, keyRealm string) 
 		return "unavailable"
 	}
 
-	if !h.modelKnown(realm, bare) {
+	if _, ok := known[realm+"\x00"+bare]; !ok {
 		return "unknown"
 	}
 
@@ -120,30 +128,27 @@ func (h *Handler) busyLevelFromPool(model, realm string) string {
 	}
 }
 
-// modelKnown 只读本地模型目录缓存判断模型是否存在；缓存未加载返回 false。
-// 这里刻意忽略目录 TTL：/v2/chat/busy 是只读预检，目录过期不代表模型消失，
-// 否则长时间运行的客户端（超过 10min 未再请求 /v1/models）会把已知模型全部
-// 报成 unknown。缓存为空（从未成功拉取）仍然按未知处理。
-func (h *Handler) modelKnown(realm, model string) bool {
-	if realm == realmGlobal {
-		infos := h.cfg.Upstream.CachedGlobalModelInfosAnyAge()
-		for i := range infos {
-			if infos[i].ID == model {
-				return true
-			}
-		}
+// modelKnownSet 一次性把两个域的模型目录建成集合（busy 端点批量预检用）。
+// 逐模型线性扫目录在数十模型的轮询里是平方级；每批只构建一次。
+// 目录缓存为空（从未成功拉取）时集合里没有条目，效果与「未加载即未知」一致。
+func (h *Handler) modelKnownSet() map[string]struct{} {
+	local := h.cachedModelInfosAnyAge()
+	known := make(map[string]struct{}, len(local))
 
-		return false
+	for i := range local {
+		known[realmCN+"\x00"+local[i].ID] = struct{}{}
 	}
 
-	infos := h.cachedModelInfosAnyAge()
-	for i := range infos {
-		if infos[i].ID == model {
-			return true
-		}
+	if h.cfg.Upstream == nil {
+		return known
 	}
 
-	return false
+	global := h.cfg.Upstream.CachedGlobalModelInfosAnyAge()
+	for i := range global {
+		known[realmGlobal+"\x00"+global[i].ID] = struct{}{}
+	}
+
+	return known
 }
 
 // writeBusyResponse 官方响应信封；data 恒为数组（空列表输出 []，不是 null）。

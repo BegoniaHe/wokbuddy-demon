@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -19,13 +21,24 @@ import (
 // DefaultURL OpenRouter 模型目录（公开，无需鉴权）。
 const DefaultURL = "https://openrouter.ai/api/v1/models"
 
-var errRefreshFailed = errors.New("Refresh failed")
+var (
+	errRefreshFailed = errors.New("Refresh failed")
+	// errEmptyCatalog 上游返回了可解析但没有可用条目的目录：与「拉取失败」同口径，
+	// 保留上一份成功快照（否则面板估算金额会瞬间归零）。
+	errEmptyCatalog = errors.New("catalog has no usable price entries")
+)
 
 // Price 单个模型的每 token 价格（USD）。
 type Price struct {
 	Prompt     float64 `json:"prompt"`
 	Completion float64 `json:"completion"`
 	CacheRead  float64 `json:"cache_read"`
+}
+
+// catalogModel 上游目录里的单条模型条目（只取价格相关字段）。
+type catalogModel struct {
+	ID      string            `json:"id"`
+	Pricing map[string]string `json:"pricing"`
 }
 
 // Snapshot 一次只读快照。
@@ -58,9 +71,10 @@ func New(url string, client *http.Client) *Catalog {
 	return &Catalog{url: url, client: client, prices: map[string]Price{}}
 }
 
+// maxCatalogBytes 价格目录响应体上限（正常响应约 1–2 MiB）。
+const maxCatalogBytes = 8 << 20
+
 // Refresh 拉取并替换价格快照；失败时保留旧快照并记录原因。
-//
-//nolint:funlen // 拉取/解析/合并/缓存替换线性展开。
 func (c *Catalog) Refresh(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.url, http.NoBody)
 	if err != nil {
@@ -83,27 +97,24 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	}
 
 	var body struct {
-		Data []struct {
-			ID      string            `json:"id"`
-			Pricing map[string]string `json:"pricing"`
-		} `json:"data"`
+		Data []catalogModel `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	// 限制响应体大小：默认 URL 是公网第三方（openrouter），pricing.New 也接受任意
+	// URL，上游异常时不应该让整份响应进内存。
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCatalogBytes)).Decode(&body); err != nil {
 		c.setError(err)
 		return fmt.Errorf("Refresh: %w", err)
 	}
 
-	prices := make(map[string]Price, len(body.Data))
-	for _, model := range body.Data {
-		prompt, err1 := strconv.ParseFloat(model.Pricing["prompt"], 64)
+	prices := parsePrices(body.Data)
+	// 空目录（200 + data:[] 或全部条目被 validPrice 丢弃）不覆盖旧快照：包注释承诺
+	// 「拉取失败保留上一份成功快照」，用空表覆盖会让面板所有估算金额瞬间归零且
+	// 没有任何提示。
+	if len(prices) == 0 {
+		err := errEmptyCatalog
+		c.setError(err)
 
-		completion, err2 := strconv.ParseFloat(model.Pricing["completion"], 64)
-		if model.ID == "" || err1 != nil || err2 != nil {
-			continue
-		}
-
-		cacheRead, _ := strconv.ParseFloat(model.Pricing["input_cache_read"], 64)
-		prices[model.ID] = Price{Prompt: prompt, Completion: completion, CacheRead: cacheRead}
+		return fmt.Errorf("Refresh: %w", err)
 	}
 
 	c.mu.Lock()
@@ -113,6 +124,48 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	c.mu.Unlock()
 
 	return nil
+}
+
+// parsePrices 把上游目录条目转为价格表，跳过 id 缺失或价格非法的条目。
+func parsePrices(models []catalogModel) map[string]Price {
+	prices := make(map[string]Price, len(models))
+
+	for _, model := range models {
+		if model.ID == "" {
+			continue
+		}
+
+		prompt, err := strconv.ParseFloat(model.Pricing["prompt"], 64)
+		if err != nil {
+			continue
+		}
+
+		completion, err := strconv.ParseFloat(model.Pricing["completion"], 64)
+		if err != nil {
+			continue
+		}
+
+		// ParseFloat 接受 NaN/Inf/负值：OpenRouter 的 openrouter/auto 就返回 -1，
+		// 而 NaN 会让面板 /panel/api/pricing 的 json.Marshal 直接 500（unsupported
+		// value: NaN），且在下一次成功刷新前一直坏着。这类条目按无效丢弃。
+		if !validPrice(prompt) || !validPrice(completion) {
+			continue
+		}
+
+		cacheRead, _ := strconv.ParseFloat(model.Pricing["input_cache_read"], 64)
+		if !validPrice(cacheRead) {
+			cacheRead = 0
+		}
+
+		prices[model.ID] = Price{Prompt: prompt, Completion: completion, CacheRead: cacheRead}
+	}
+
+	return prices
+}
+
+// validPrice 判定价格合法：有限且非负（NaN/Inf/负值一律视为无效条目）。
+func validPrice(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0
 }
 
 func (c *Catalog) setError(err error) {
@@ -159,7 +212,11 @@ func (c *Catalog) Estimate(
 
 	usd := float64(prompt) * price.Prompt
 	if cacheHit+cacheMiss > 0 {
-		usd = float64(cacheMiss)*price.Prompt + float64(cacheHit)*price.CacheRead
+		// 上游只回报部分缓存计数时，cacheHit+cacheMiss 可能小于 prompt：差额
+		// 按普通输入价计入，不能整段丢掉（否则少算钱）。
+		uncached := max(0, prompt-cacheHit-cacheMiss)
+
+		usd = float64(cacheMiss+uncached)*price.Prompt + float64(cacheHit)*price.CacheRead
 	}
 
 	usd += float64(completion) * price.Completion

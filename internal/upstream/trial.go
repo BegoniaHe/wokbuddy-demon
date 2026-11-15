@@ -17,12 +17,15 @@ var errClaimTrialOnlyGlobalAccounts = errors.New("claim trial: only global accou
 // ClaimTrial 领取一次性 trial 加油包。仅 global 账号可调（CN 无此端点）：
 // 非 global → 直接报错（工具层还会再拦一道，这里是客户端侧防线）。
 // 返回 claimed：true=成功新领；false=已领过（幂等，不算失败）。
-func (c *Client) ClaimTrial(a *auth.Auth) (claimed bool, err error) {
-	if a == nil || a.Realm() != "global" {
+func (c *Client) ClaimTrial(account *auth.Auth) (claimed bool, err error) {
+	// globalOn 是「GlobalEnabled 且 realm=global」的双闸：global.enabled=false 时
+	// global 账号会回落 CN 上游，此时再打 /billing/ide/trial 等于向 workbuddy.cn
+	// 发一个该域不存在的端点。
+	if account == nil || account.Realm() != "global" || !c.globalOn(account) {
 		return false, errClaimTrialOnlyGlobalAccounts
 	}
 
-	_, err = c.billingJSON(a, trialPath, nil)
+	_, err = c.billingJSON(account, trialPath, nil)
 	if err != nil {
 		var ue *Error
 		if errors.As(err, &ue) && trialAlreadyErr(ue) {

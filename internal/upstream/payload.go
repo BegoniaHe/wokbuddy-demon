@@ -41,8 +41,10 @@ func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 		return src
 	}
 
-	var obj map[string]any
-	if err := json.Unmarshal(src, &obj); err != nil || obj == nil {
+	// UseNumber：改写只动结构与已知字段，客户端的数值字面量（seed/大整数 id/1.0）
+	// 必须逐字保留。
+	obj, err := decodeObjectUseNumber(src)
+	if err != nil || obj == nil {
 		return src
 	}
 
@@ -165,8 +167,9 @@ func applyReasoningPatches(
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
 // 认的 max_tokens（吸收上游 PR #116）。规则：显式 max_tokens 优先（别名只删）；
 // 别名非正数值（0/null/负数）不翻译（0/null 语义是「未设置」，负数是非法值，
-// 翻译等于把垃圾搬进 max_tokens）；非数值别名（字符串等畸形）不翻译（原样
-// 透传由上游报 11101 参数错）。两域同口径：CN /v2 与 global /console 是同一套
+// 翻译等于把垃圾搬进 max_tokens）；非数值别名（字符串等畸形）同样不翻译，且与
+// 其它情形一样被删除（别名一律删，见下方 delete）。两域同口径：CN /v2 与
+// global /console 是同一套
 // API，翻译不分 realm。
 func translateMaxCompletionTokens(obj map[string]any) {
 	alias, has := obj["max_completion_tokens"]
@@ -181,22 +184,42 @@ func translateMaxCompletionTokens(obj map[string]any) {
 	if obj["max_tokens"] != nil {
 		return // 显式 max_tokens 优先：别名只删不译
 	}
-	// json.Unmarshal 数字 → float64（整数去整后回写，避免 1.28e5 科学计数法/小数
-	// 尾巴进上游 body）；其他数值类型防御性兼容（int 家族——手构造 map 的调用方）。
-	switch item := alias.(type) {
+
+	if n, ok := positiveInt64(alias); ok {
+		obj["max_tokens"] = n
+	}
+}
+
+// positiveInt64 把 JSON 数值取成正整数。
+//
+// 解码走 UseNumber，别名通常是 json.Number；统一取整后回写，避免 1.28e5 这类
+// 科学计数法/小数尾巴进上游 body。其余数值类型防御性兼容（手构造 map 的调用方）。
+// 0 / 负数（语义是「未设置」或非法值）、非整数、非数值一律判否。
+//
+//nolint:cyclop,gocyclo // 与 positiveUsageNumber 同口径：JSON 数值类型集中分支。
+func positiveInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case json.Number:
+		// UseNumber 解码下客户端的 4096.0 / 1e5 会以字面量到达：按整值浮点接受，
+		// 与本函数 float64 分支同口径（Int64 严格解析会把它们判成非法）。
+		if parsed, err := n.Int64(); err == nil {
+			return parsed, parsed > 0
+		}
+
+		if f, err := n.Float64(); err == nil && f > 0 && f == float64(int64(f)) {
+			return int64(f), true
+		}
 	case float64:
-		if item > 0 && item == float64(int64(item)) {
-			obj["max_tokens"] = int64(item)
+		if n > 0 && n == float64(int64(n)) {
+			return int64(n), true
 		}
 	case int64:
-		if item > 0 {
-			obj["max_tokens"] = item
-		}
+		return n, n > 0
 	case int:
-		if item > 0 {
-			obj["max_tokens"] = int64(item)
-		}
+		return int64(n), n > 0
 	}
+
+	return 0, false
 }
 
 // gptMinMaxTokens GPT 系上游接受的 max_tokens 下限。
@@ -220,6 +243,13 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 	switch n := obj["max_tokens"].(type) {
 	case float64:
 		num = int64(n)
+	case json.Number:
+		parsed, err := n.Int64()
+		if err != nil {
+			return
+		}
+
+		num = parsed
 	case int64:
 		num = n
 	case int:
@@ -879,6 +909,17 @@ func enumItemType(item any) (string, bool) {
 		return "integer", true
 	case int, int64:
 		return "integer", true
+	case json.Number:
+		// 出站改写走 UseNumber 解码，enum 里的数字是 json.Number 而非 float64。
+		if _, err := value.Int64(); err == nil {
+			return "integer", true
+		}
+
+		if _, err := value.Float64(); err == nil {
+			return "number", true
+		}
+
+		return "", false
 	default:
 		return "", false
 	}

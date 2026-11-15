@@ -53,3 +53,26 @@ func TestClockInjectionBreakerBackoff(t *testing.T) {
 		t.Fatal("熔断退避到期后应恢复")
 	}
 }
+
+// TestClockInjectionCoolingRemaining status 的剩余秒数必须以注入时钟为基准：
+// 用 time.Until（真实时钟）会让确定性时钟下 CoolRemaining 与 Cooling 互相矛盾。
+func TestClockInjectionCoolingRemaining(t *testing.T) {
+	t.Parallel()
+
+	pool := New("")
+	now := time.Now()
+
+	pool.SetClock(func() time.Time { return now })
+	pool.Add(&auth.Auth{UID: "u1"})
+	pool.Cooldown("u1", CoolSoft, 10*time.Minute, "429")
+
+	if st, _ := pool.Status("u1"); st.CoolRemaining != 600 {
+		t.Fatalf("cool_remaining_sec=%d want 600", st.CoolRemaining)
+	}
+
+	now = now.Add(5 * time.Minute) // 推进虚拟时间：剩余应减半
+
+	if st, _ := pool.Status("u1"); st.CoolRemaining != 300 {
+		t.Fatalf("推进 5min 后 cool_remaining_sec=%d want 300", st.CoolRemaining)
+	}
+}

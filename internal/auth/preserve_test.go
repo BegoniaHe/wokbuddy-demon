@@ -30,9 +30,9 @@ func readDoc(t *testing.T, path string) map[string]any {
 	return doc
 }
 
-// TestSaveAtomicPreservesUnknownKeys 嵌套形来源文件刷新一次后，未建模键与值仍在，
-// 已知键照常更新。
-func TestSaveAtomicPreservesUnknownKeys(t *testing.T) {
+// TestSaveAtomicPreservesUnknownKeysAndExtras 嵌套形来源文件刷新一次后，未建模键
+// （子对象内的与顶层扩展键）与值仍在，已知键照常更新。
+func TestSaveAtomicPreservesUnknownKeysAndExtras(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "workbuddy-u1.json")

@@ -385,6 +385,18 @@ var mpActionGap = 2 * time.Second
 // sleep gap + 0~10s 抖动；首条也等（上一轮残留进度被回滚后立即重报同样无效）。
 var mpChatEventGap = 45 * time.Second
 
+// maxRoundReportsPerRun 单轮补足的次数上限。
+//
+// target 完全由上游 JSON 决定（判据差额），每条上报前还要按真人节奏 sleep
+// mpChatEventGap（≈45-55s）。上游一旦下发 target=1000，该账号会被 per-account 锁
+// 占住十几个小时、期间其它面板动作全部跳过。超额部分留待下一轮。
+const maxRoundReportsPerRun = 10
+
+// clampRoundReports 把单轮补足次数夹到上限内。
+func clampRoundReports(need int64) int64 {
+	return min(need, maxRoundReportsPerRun)
+}
+
 // runMPMiniChatTask growth 域小程序限定任务通用闭环：
 // mp 查询 → accept（带登记回读验证）→ mini chat 事件上报（withActivityID 决定
 // 是否带开学季 activityId：school_season 必带，Sequential_Tasks_1 不带——服务端按
@@ -435,9 +447,10 @@ func (p *Panel) runMPMiniChatTaskFrom(
 	}
 	// 判据上报：按差额补 mini chat 事件。每条前 sleep mpChatEventGap+抖动——
 	// 连发会被上游反作弊判无效（见 mpChatEventGap 注释），宁可慢不可白报。
-	need := target - t.Current
+	need := clampRoundReports(target - t.Current)
 	if i, rerr := p.reportMiniChatEvents(account7, need, withActivityID); rerr != nil {
-		return fmt.Sprintf("完成 %d/%d 次上报后中断: %v", i, need, rerr), nil
+		// 不能返回 nil：调用方把 nil 当 done，本轮 0 项完成会被展示成成功。
+		return "", fmt.Errorf("完成 %d/%d 次上报后中断: %w", i, need, rerr)
 	}
 	// 回读（异步计分，有界轮询复用 claimPoll 预算的紧凑版：两轮各隔 3s）。
 	t, _ = p.pollTaskMPFrom(account7, code, target, t, nil)
@@ -673,12 +686,12 @@ func (p *Panel) runSequentialEventTaskFrom(
 	}
 
 	if err := primary(); err != nil {
-		return fmt.Sprintf("判据上报失败: %v", err), nil
+		return "", fmt.Errorf("判据上报失败: %w", err)
 	}
 	// 回读（两轮各隔 3s）；未点亮且有 fallback 时补报一轮再读。
 	t, perr := p.pollTaskMPFrom(account23, code, target, t, fallback)
 	if perr != nil {
-		return fmt.Sprintf("备选判据上报失败: %v", perr), nil
+		return "", fmt.Errorf("备选判据上报失败: %w", perr)
 	}
 
 	return p.finishMPTask(account23, code, target, t, "已上报但进度未点亮（判据形态待解锁后校正，下次重试）")
@@ -830,7 +843,7 @@ func runMiniExpertFrom(panel4 *Panel, account4 *auth.Auth, t *upstream.Task) (st
 	// 判据载体前置（accept 之前）：市场真实专家 id。
 	marketExpert, name, ok, merr := panel4.marketExpertForMini(account4)
 	if !ok {
-		return fmt.Sprintf("专家市场不可用（%v），跳过以防半程态", merr), nil
+		return "", fmt.Errorf("专家市场不可用（%w），跳过以防半程态", merr)
 	}
 
 	if !panel4.acceptMPTaskIfNeeded(account4, code, t.AcceptStatus) {
@@ -839,7 +852,7 @@ func runMiniExpertFrom(panel4 *Panel, account4 *auth.Auth, t *upstream.Task) (st
 
 	ev := upstream.MiniExpertUseEvent(marketExpert.ExpertID, name, marketExpert.ExpertType)
 	if err := panel4.cfg.Upstream.ReportMPEvent(account4, ev); err != nil {
-		return fmt.Sprintf("上报 expert_actual_use 失败: %v", err), nil
+		return "", fmt.Errorf("上报 expert_actual_use 失败: %w", err)
 	}
 	// 回读（异步计分，两轮各隔 3s——与 runMPMiniChatTask 同预算）。
 	t, _ = panel4.pollTaskMPFrom(account4, code, target, t, nil)
@@ -1029,7 +1042,9 @@ func runChat5WithTask(panel *Panel, account25 *auth.Auth, t *upstream.Task) (str
 		target = 5
 	}
 
-	need := target - t.Current
+	// 夹上限：target 来自上游，异常值（如 1000）会让该账号的 per-account 锁被占住
+	// 十几分钟，面板动作与 RunTaskSweep 全部排队。mp 路径已有同口径的 clamp。
+	need := clampRoundReports(target - t.Current)
 	if need <= 0 {
 		return "进度已达标，无需上报", nil
 	}
@@ -1037,7 +1052,7 @@ func runChat5WithTask(panel *Panel, account25 *auth.Auth, t *upstream.Task) (str
 	for i := range need {
 		cid := session.NewUUIDv4()
 		if err := panel.cfg.Upstream.ReportChatActivity(account25, cid, session.NewUUIDv7Hex()); err != nil {
-			return fmt.Sprintf("上报第 %d/%d 条失败: %v", i+1, need, err), nil
+			return "", fmt.Errorf("上报第 %d/%d 条失败: %w", i+1, need, err)
 		}
 
 		if i < need-1 {
@@ -1195,9 +1210,13 @@ func runBlackCat(panel6 *Panel, account13 *auth.Auth) (string, error) {
 		return "进度已达标，无需补足", nil
 	}
 
-	ok, err := panel6.cfg.Upstream.RunNightChats(account13, int(need))
+	// 面板手动路径没有 per-request ctx：整轮由 http.Server 的 Shutdown 兜底排空，
+	// 单次补足也有上限（need × 单次对话 + 间隔）。调度器路径传的是真实 ctx。
+	rounds := clampRoundReports(need)
+
+	ok, err := panel6.cfg.Upstream.RunNightChats(context.Background(), account13, int(rounds))
 	if err != nil {
-		return fmt.Sprintf("完成 %d/%d 次后中断: %v", ok, need, err), nil
+		return "", fmt.Errorf("完成 %d/%d 次后中断: %w", ok, rounds, err)
 	}
 
 	return fmt.Sprintf("已完成 %d 次夜间对话并上报", ok), nil
@@ -1361,7 +1380,7 @@ func runTemplateUse(panel5 *Panel, account17 *auth.Auth) (string, error) {
 
 		events := upstream.DesktopTemplateUseSequence(conv, req, tp[0], tp[1])
 		if err := panel5.cfg.Upstream.ReportDesktopEvent(account17, events...); err != nil {
-			return fmt.Sprintf("第 %d 组模板事件上报失败: %v", i+1, err), nil
+			return "", fmt.Errorf("第 %d 组模板事件上报失败: %w", i+1, err)
 		}
 
 		time.Sleep(300 * time.Millisecond)
@@ -1799,11 +1818,21 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 
 	done := make(chan []map[string]any, 1)
 
-	go func() {
+	p.goGuarded("auto-all-pipeline", func() {
 		defer p.unlockAccount(uid) // 流水线真正结束（而非 HTTP 超时返回）才放锁
 
-		done <- p.runAutoAll(account)
-	}()
+		var results []map[string]any
+
+		// panic 时也要通知 HTTP 侧：goGuarded 吞掉 panic 后若不发送，handler 只能空等
+		// ctx.Done() 的 5 分钟，且返回文案与实际状态（已崩溃）不符。
+		defer func() { done <- results }()
+
+		results = p.runAutoAll(account)
+
+		// 超时分支已在 HTTP 侧返回、无人再读 done（容量 1 不会阻塞）：先落一条
+		// 汇总日志，别让结果随 goroutine 结束静默消失。
+		log.Printf("panel: 一键完成流水线结束 uid=%s 共 %d 项", uid, len(results))
+	})
 
 	select {
 	case results := <-done:

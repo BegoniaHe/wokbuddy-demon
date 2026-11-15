@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -35,7 +36,7 @@ func TestCollectQueueAccountsPreservesPoolOrder(t *testing.T) {
 
 	panel := &Panel{cfg: Config{Pool: state, Upstream: client}}
 
-	accounts := panel.collectQueueAccounts(true)
+	accounts := panel.collectQueueAccounts(context.Background(), true)
 
 	got := make([]string, 0, len(accounts))
 	for i := range accounts {

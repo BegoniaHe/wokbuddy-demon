@@ -4,6 +4,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -162,5 +163,40 @@ func TestCaptureEndToEndNarration(t *testing.T) {
 
 	if strings.Contains(record.Tail, "u1") {
 		t.Errorf("样本不应含 UID: %+v", record)
+	}
+}
+
+// TestCaptureRotatesOldSamples 样本目录必须有上限：长期开启时每个样本一个文件，
+// 无上限会把磁盘写满。超限后删除最旧的样本，只碰本包生成的 capture-*.json。
+func TestCaptureRotatesOldSamples(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(captureDirEnv, dir)
+
+	// 预先铺满上限（含一个不属于本包的文件，必须留在原地）。
+	for i := range captureMaxFiles {
+		name := filepath.Join(dir, fmt.Sprintf("capture-20200101T000000.%09d-seed.json", i))
+		if err := os.WriteFile(name, []byte("{}\n"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+
+	keep := filepath.Join(dir, "unrelated.json")
+	if err := os.WriteFile(keep, []byte("{}\n"), 0o600); err != nil {
+		t.Fatalf("seed unrelated: %v", err)
+	}
+
+	captureSample("narration_tail", "glm-5.2", true, "tail", nil)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+
+	if got, want := len(entries), captureMaxFiles+1; got != want {
+		t.Fatalf("entries=%d want %d（样本保持有界，无关文件不受影响）", got, want)
+	}
+
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("非本包文件被删除: %v", err)
 	}
 }

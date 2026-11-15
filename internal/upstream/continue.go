@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -590,16 +591,31 @@ func walkChoiceDeltas(frame map[string]any, handleFinish func(string), inspect f
 // inspectDelta 累计正文与工具调用。
 func (c *TextContinueReader) inspectDelta(delta map[string]any) {
 	if text, ok := delta["content"].(string); ok {
-		c.text.WriteString(text)
+		c.appendText(text)
 	}
 
 	if refusal, ok := delta["refusal"].(string); ok {
-		c.text.WriteString(refusal)
+		c.appendText(refusal)
 	}
 
 	if tools, ok := delta["tool_calls"].([]any); ok && len(tools) > 0 {
 		c.hasTool = true
 	}
+}
+
+// appendText 累计正文并施加上限（与聚合路径的 maxSSEAggregateBytes 同口径）。
+//
+// 续写会把整段正文回灌给第二次上游调用：无界累积等于同一份内容在内存里翻倍。
+// 超限即停止累积并置 hasTool（语义为「不再续写」），只保留已经写出的帧——放弃
+// 续写是最小影响的降级，静默截断回灌内容反而会改坏回答。
+func (c *TextContinueReader) appendText(text string) {
+	if c.text.Len()+len(text) > maxSSEAggregateBytes {
+		c.hasTool = true
+
+		return
+	}
+
+	c.text.WriteString(text)
 }
 
 // writeFrameJSON 写回数据帧；续写段复用首段 id/model。
@@ -767,19 +783,19 @@ func applyMergedUsageLeaf(dst map[string]any, key string, value any) {
 		return
 	}
 
-	switch typed := value.(type) {
-	case map[string]any:
+	if typed, ok := value.(map[string]any); ok {
 		if target, ok := dst[key].(map[string]any); ok {
 			mergeUsageNumbers(target, typed)
 
 			return
 		}
-	case float64:
-		if target, ok := dst[key].(float64); ok {
-			dst[key] = target + typed
+	}
+	// 数值叶子按数值相加：帧解码走 UseNumber 后取值是 json.Number，只认 float64
+	// 会让多段 completion 被末段覆盖（少算）。
+	if sum, ok := UsageSumLeaves(dst[key], value); ok {
+		dst[key] = sum
 
-			return
-		}
+		return
 	}
 
 	if _, exists := dst[key]; !exists {
@@ -790,13 +806,20 @@ func applyMergedUsageLeaf(dst map[string]any, key string, value any) {
 // recomputeMergedUsageTotal 在末段带 prompt_tokens 时按「末段 prompt + 累计
 // completion」重写 total_tokens。没有该字段则保留末段原 total。
 func recomputeMergedUsageTotal(usageMap map[string]any) {
-	promptTokens, ok := usageMap["prompt_tokens"].(float64)
+	promptTokens, ok := UsageNumber(usageMap, "prompt_tokens")
 	if !ok {
 		return
 	}
 
-	completion, _ := usageMap["completion_tokens"].(float64)
-	usageMap["total_tokens"] = promptTokens + completion
+	completion, _ := UsageNumber(usageMap, "completion_tokens")
+
+	total := promptTokens + completion
+	// 溢出/负值不可信：保留末段原 total，别把 +Inf 写进请求体。
+	if math.IsInf(total, 0) || math.IsNaN(total) || total < 0 {
+		return
+	}
+
+	usageMap["total_tokens"] = total
 }
 
 // BuildContinuationBody 在原始请求体后追加 assistant 部分正文与续写指令。
@@ -809,8 +832,8 @@ const continuationInstruction = "Continue the previous response from exactly whe
 	"Do not repeat any text already produced. Do not add commentary."
 
 func BuildContinuationBody(src []byte, partial string) []byte {
-	var obj map[string]any
-	if json.Unmarshal(src, &obj) != nil || obj == nil {
+	obj, err := decodeObjectUseNumber(src)
+	if err != nil || obj == nil {
 		return src
 	}
 
@@ -833,8 +856,8 @@ func BuildContinuationBody(src []byte, partial string) []byte {
 // 用于「预算被思考吃光」的同额度重发。非 deepseek / 无 thinking 字段时也返回
 // 合法 body（无 thinking 时仅删 effort，不凭空加 thinking 以免触发上游校验）。
 func DisableThinking(body []byte) []byte {
-	var obj map[string]any
-	if json.Unmarshal(body, &obj) != nil || obj == nil {
+	obj, err := decodeObjectUseNumber(body)
+	if err != nil || obj == nil {
 		return body
 	}
 

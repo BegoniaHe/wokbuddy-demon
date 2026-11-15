@@ -249,3 +249,88 @@ func TestMarkFlushedClearsWhenSeqUnchanged(t *testing.T) {
 		t.Fatal("快照后无新流水，写盘成功后应清脏")
 	}
 }
+
+// 主文件损坏时必须回落到 .bak：否则「按空账本继续 → 下次 Flush 覆盖坏文件」会
+// 永久丢掉整本账。
+func TestLedgerFallsBackToBackup(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "credits.json")
+
+	good := `{"version":1,"entries":[{"time":"2026-10-18T12:00:00Z","uid":"u1","delta":-100,"remain":900}]}`
+	if err := writeFile(path+".bak", good); err != nil {
+		t.Fatalf(".bak: %v", err)
+	}
+
+	if err := writeFile(path, `{"version":1,"entr`); err != nil {
+		t.Fatalf("主文件: %v", err)
+	}
+
+	ledger := Open(path, 100)
+
+	got := ledger.Recent(0, "")
+	if len(got) != 1 || got[0].UID != "u1" || got[0].Remain != 900 {
+		t.Fatalf("未回落到 .bak：entries=%v", got)
+	}
+}
+
+// 载入即裁剪：旧配置（更小上限）留下的超大文件不该整份驻留到第一次 Observe。
+func TestLedgerTrimsOnLoad(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "credits.json")
+
+	entries := make([]Entry, 0, 50)
+	for i := range 50 {
+		entries = append(entries, Entry{UID: "u1", Delta: int64(i), Remain: int64(i)})
+	}
+
+	raw, err := json.Marshal(fileDoc{Version: 1, Entries: entries})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	if err := os.WriteFile(path, raw, 0o600); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	ledger := Open(path, 10)
+
+	if got := ledger.Recent(0, ""); len(got) != 10 {
+		t.Fatalf("载入后条数=%d want 10（裁剪到上限）", len(got))
+	}
+}
+
+// TestLedgerRejectsOverflowingBalance 极端余额不得靠减法溢出绕过 |delta| 上限。
+//
+// remain - prev 在两个 int64 量级极大、符号相反时会绕回小数值（MaxInt64 - MinInt64
+// 得 -1），于是「异常跳变丢弃」的判定反而通过，账本里多出一条金额荒谬的流水。
+// 余额来自上游 JSON，必须先把超出合理量级的观测挡在基线之外。
+func TestLedgerRejectsOverflowingBalance(t *testing.T) {
+	t.Parallel()
+
+	const (
+		maxInt64 = 1<<63 - 1
+		minInt64 = -1 << 63
+	)
+
+	ledger := Open("", 100)
+	// 两个极端观测都属脏数据：既不记流水，也不成为基线。
+	ledger.Observe("u1", minInt64, "")
+	ledger.Observe("u1", maxInt64, "")
+
+	if got := ledger.Recent(0, ""); len(got) != 0 {
+		t.Fatalf("极端余额不应产生流水，got %v", got)
+	}
+
+	// 脏数据未污染基线：随后的一次合理观测仍建基线，再变动照常记录。
+	ledger.Observe("u1", 100, "")
+	ledger.Observe("u1", 150, "")
+
+	got := ledger.Recent(0, "")
+	if len(got) != 1 || got[0].Delta != 50 || got[0].Remain != 150 {
+		t.Fatalf("entries=%v want 1 条 delta=50 remain=150（基线被脏数据污染）", got)
+	}
+}

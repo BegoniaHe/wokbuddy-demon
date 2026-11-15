@@ -3,6 +3,7 @@ package reqlog
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -313,6 +314,30 @@ func TestArchiveQueueDropCounter(t *testing.T) {
 	}
 }
 
+// TestArchiveEnqueueAfterCloseCountsDropped 关停后写者已退出：入队既不会落盘，
+// 也必须计入 dropped——停机窗口的最后一批归档不能静默消失。
+func TestArchiveEnqueueAfterCloseCountsDropped(t *testing.T) {
+	t.Parallel()
+
+	w := &archiveWriter{
+		cfg:  Config{Enabled: true, Dir: t.TempDir()},
+		ch:   make(chan Event, 8),
+		done: make(chan struct{}),
+	}
+	// 写者已退出的状态：closed 置位（close() 内部就是这么做的）。
+	w.closed.Store(true)
+
+	w.enqueue(&Event{RequestID: "after-close"})
+
+	if got := w.dropped.Load(); got != 1 {
+		t.Fatalf("dropped=%d want 1（关停后入队必须计数）", got)
+	}
+
+	if len(w.ch) != 0 {
+		t.Fatalf("关停后不应再入队, len(ch)=%d", len(w.ch))
+	}
+}
+
 // TestArchiveToolCounters JSONL 落盘与读回都保留 tools_declared / tool_calls，
 // 且 omitempty 生效：未声明 tools 的请求两条都不写（缺失 = 不进分母）。
 func TestArchiveToolCounters(t *testing.T) {
@@ -398,5 +423,128 @@ func assertToolCounterJSONL(t *testing.T, dir string) {
 		if strings.Contains(line, "declared-zero") && !strings.Contains(line, `"tools_declared":3`) {
 			t.Fatalf("声明 tools 的行应写 tools_declared=3: %s", line)
 		}
+	}
+}
+
+// TestWriteEventClampsClientFields 客户端可控字段（Model/Path）必须截断：JSON 转义
+// 对控制字符是 6 倍膨胀，超长模型名会产出 >1 MiB 单行并撞上读取侧扫描上限。
+func TestWriteEventClampsClientFields(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, FileMaxBytes: 1 << 20, MaxBytes: 32 << 20, RetentionDays: 7})
+
+	huge := strings.Repeat("\x01", 300<<10)
+	r.Record(&Event{
+		Time:      time.Now(),
+		RequestID: "long",
+		Model:     huge,
+		Path:      strings.Repeat("p", 100<<10),
+		Status:    200,
+		OK:        true,
+		Outcome:   OutcomeSuccess,
+	})
+	r.Close()
+
+	rows, err := r.ReadArchive(10, &Filter{})
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d want 1", len(rows))
+	}
+
+	// TruncateEllipsis 会在上限后追加一个省略号，允许这点额外字节。
+	budget := maxEventFieldLen + len("…")
+	if len(rows[0].Model) > budget || len(rows[0].Path) > budget {
+		t.Fatalf("未截断: model=%d path=%d budget=%d", len(rows[0].Model), len(rows[0].Path), budget)
+	}
+}
+
+// TestReadArchiveToleratesOverlongLine 历史遗留的超长行不能把整个文件判成读取失败。
+func TestReadArchiveToleratesOverlongLine(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, FileMaxBytes: 1 << 20, MaxBytes: 32 << 20, RetentionDays: 7})
+
+	r.Record(&Event{
+		Time: time.Now(), RequestID: "ok", Model: "m", Status: 200, OK: true,
+		Outcome: OutcomeSuccess,
+	})
+	// 关停排空队列并落盘，之后手工追加一条超过扫描上限的行。
+	r.Close()
+
+	files, err := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("归档文件未生成: %v %v", files, err)
+	}
+
+	file, err := os.OpenFile(files[0], os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, writeErr := file.WriteString(strings.Repeat("x", 2<<20) + "\n"); writeErr != nil {
+		t.Fatal(writeErr)
+	}
+
+	if closeErr := file.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	rows, err := r.ReadArchive(10, &Filter{})
+	if err != nil {
+		t.Fatalf("超长行不应让整次读取失败: %v", err)
+	}
+
+	if len(rows) == 0 {
+		t.Fatal("超长行之前的正常记录应仍可读")
+	}
+}
+
+// TestRecentRingBufferOrder 环形缓冲必须与原先「prepend + 截断」完全同序：
+// 最新在前、超过上限后覆盖最旧一条。
+func TestRecentRingBufferOrder(t *testing.T) {
+	t.Parallel()
+
+	r := New(Config{})
+
+	total := recentLimit + 7
+	for i := range total {
+		r.Record(&Event{RequestID: "r" + strconv.Itoa(i), Status: 200, OK: true, Outcome: OutcomeSuccess})
+	}
+
+	recent := r.Snapshot().Recent
+	if len(recent) != recentLimit {
+		t.Fatalf("recent=%d want %d", len(recent), recentLimit)
+	}
+
+	// 最新在前、写入序连续递减 1（覆盖环形回绕后的顺序）。
+	want := total - 1
+
+	for i := range recent {
+		got, err := strconv.Atoi(strings.TrimPrefix(recent[i].RequestID, "r"))
+		if err != nil || got != want {
+			t.Fatalf("recent[%d]=%q want r%d", i, recent[i].RequestID, want)
+		}
+
+		want--
+	}
+}
+
+// TestArchiveDisabledDoesNotCountDropped 归档被配置主动关闭时本来就不写盘：
+// 计入 dropped 会让面板把「关闭」误报成持续丢盘（构造失败的计数语义不变）。
+func TestArchiveDisabledDoesNotCountDropped(t *testing.T) {
+	t.Parallel()
+
+	r := New(Config{Dir: t.TempDir(), Enabled: false})
+	t.Cleanup(r.Close)
+
+	r.Record(&Event{RequestID: "kept", Model: "m"})
+
+	if got := r.Snapshot().Archive.DroppedWrites; got != 0 {
+		t.Fatalf("dropped=%d want 0（归档关闭不是丢盘）", got)
 	}
 }

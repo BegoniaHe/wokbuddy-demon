@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 )
 
 // errProxySubTestFailed 测试用静态错误（err113）。
@@ -233,7 +234,7 @@ func TestParseProxySubscriptionClashTrailingComment(t *testing.T) {
 func TestMaskProxySubURL(t *testing.T) {
 	t.Parallel()
 
-	got := maskProxySubURL("https://user:tok@sub.example.com/api/v1/x?token=secret")
+	got := panel.MaskProxySubURL("https://user:tok@sub.example.com/api/v1/x?token=secret")
 	if got != "https://sub.example.com" {
 		t.Errorf("mask=%q want scheme://host", got)
 	}
@@ -242,7 +243,7 @@ func TestMaskProxySubURL(t *testing.T) {
 		t.Errorf("mask 泄露 token: %q", got)
 	}
 
-	if got := maskProxySubURL("not a url"); !strings.Contains(got, "invalid") {
+	if got := panel.MaskProxySubURL("not a url"); !strings.Contains(got, "invalid") {
 		t.Errorf("非法 URL 应回落到占位: %q", got)
 	}
 }

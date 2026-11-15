@@ -10,7 +10,6 @@ import (
 	"log"
 	"maps"
 	"net/http"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -131,6 +130,12 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		}
 	}
 
+	// EOF 收尾时末尾事件可能没有空行（非规范上游）：与流式路径同口径先落帧，
+	// 否则最后一段 content 会被静默丢掉。
+	if ferr := streamAggregator2.flushData(); ferr != nil {
+		return nil, ferr
+	}
+
 	return streamAggregator2.result()
 }
 
@@ -155,9 +160,21 @@ type streamAggregator struct {
 	// tools 解析 tool_call 归属 index（兼容上游省略 index 的形态）；聚合与逐帧
 	// 透传路径共用同一套规则。
 	tools *toolIndex
-	// guard 聚合总量上限（issue #113）：content/reasoning/tool_call arguments
-	// 三条写入路径都经它。超限即失败，不返回残缺成功响应。
+	// guard 聚合总量上限（issue #113）：content/reasoning/refusal/tool_call
+	// arguments 四条写入路径都经它。超限即失败，不返回残缺成功响应。
 	guard aggregateGuard
+	// dataLines 当前 SSE 事件累积的 data: 行；规范允许一个事件拆成多行 data，
+	// 拼接后才是完整 JSON（流式路径 flushData 同口径）。逐行独立解析会把合法的
+	// 多行事件整条判成坏帧。
+	dataLines []string
+	// dataBytes 是 dataLines 的载荷总字节数：异常上游持续发 data 行且不发空行时
+	// 累积必须封顶（与流式路径 appendDataLine 同上限）。
+	dataBytes int
+	// toolArgs/legacyArgs 累积 arguments 分片：`prev + str` 逐片重拷是 O(n²)
+	// （8 MiB 级参数会产生数万次复制）。用 builder 增量追加，attach 时一次性
+	// 落成字符串，对客户端形态零改动。
+	toolArgs   map[int]*strings.Builder
+	legacyArgs *strings.Builder
 }
 
 // newStreamAggregator 初始化聚合状态（role/finish_reason 有默认值）。
@@ -188,31 +205,92 @@ func sseDone(payload string) bool {
 	return strings.TrimSpace(payload) == "[DONE]"
 }
 
-// handleLine 处理一行：data: 帧解析聚合，[DONE] 返回 true（调用方停止读取）。
-// 聚合总量超限时返回 ErrSSEAggregateTooLong（issue #113）。
+// handleLine 处理一行：data: 帧累积到当前事件，空行处落帧聚合；[DONE] 返回 true
+// （调用方停止读取）。
+//
+// 按 SSE 规范，一个事件的多行 data: 要用 "\n" 拼接后才是完整 JSON；逐行独立
+// 解析会把合法的多行事件整条判成坏帧，非流式请求因此拿不到内容（流式路径经
+// flushData 拼接，这里同口径）。
+//
+// 聚合总量超限时返回 ErrSSEAggregateTooLong（issue #113）；单个事件超过单行
+// 上限时返回 ErrSSELineTooLong。
 func (a *streamAggregator) handleLine(line string) (bool, error) {
 	payload, ok := sseDataPayload(line)
 	if !ok {
+		// 空行是事件边界（WHATWG EventSource 语义）；注释/event:/id: 等非 data 行
+		// 属于同一事件，不落帧。
+		if line == "" {
+			return false, a.flushData()
+		}
+
 		return false, nil
 	}
 
 	if sseDone(payload) {
-		// 上游显式结束：停止读取，DONE 之后的任何数据一律忽略。
+		// 上游显式结束：先吐出已累积的多行 data，再停止读取；DONE 之后一律忽略。
+		if err := a.flushData(); err != nil {
+			return false, err
+		}
+
 		a.sawDone = true
+
 		return true, nil
 	}
 
-	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) == nil && chunk != nil {
-		// 有效事件计数：仅 JSON 对象数据帧计入（解析失败、顶层 null 沿用静默 continue）。
-		// null 是合法 JSON 但解码成 nil map，没有可聚合字段，计入会掩盖空流。
-		a.validEvents++
-		if err := a.handleChunk(chunk); err != nil {
+	// 非规范上游可能用单个 \n 分隔事件：上一行本身已是完整 JSON 时先落帧，
+	// 避免把两个对象拼成一行（与流式路径同规则）。
+	if len(a.dataLines) == 1 && json.Valid([]byte(a.dataLines[0])) {
+		if err := a.flushData(); err != nil {
 			return false, err
 		}
 	}
 
+	if err := a.appendDataLine(payload); err != nil {
+		return false, err
+	}
+
 	return false, nil
+}
+
+// appendDataLine 把一行 data 追加到当前事件缓冲，并施加事件总量上限。
+// 单行上限只约束一行；异常上游持续发 data 行且不发空行时累积缓冲会无限增长。
+func (a *streamAggregator) appendDataLine(payload string) error {
+	add := len(payload)
+	if len(a.dataLines) > 0 {
+		add++ // 行间 "\n"
+	}
+
+	if a.dataBytes+add > MaxSSELineBytes {
+		return fmt.Errorf("%w: > %d bytes", ErrSSELineTooLong, MaxSSELineBytes)
+	}
+
+	a.dataLines = append(a.dataLines, payload)
+	a.dataBytes += add
+
+	return nil
+}
+
+// flushData 把当前事件的多行 data 拼接成一个载荷并聚合；无累积时是空操作。
+func (a *streamAggregator) flushData() error {
+	if len(a.dataLines) == 0 {
+		return nil
+	}
+
+	payload := strings.Join(a.dataLines, "\n")
+	a.dataLines = a.dataLines[:0]
+	a.dataBytes = 0
+
+	// UseNumber：聚合帧最终会整帧重新编码回客户端，数字字面量必须原样保留。
+	chunk, err := decodeObjectUseNumber([]byte(payload))
+	if err == nil && chunk != nil {
+		a.validEvents++
+
+		return a.handleChunk(chunk)
+	}
+
+	// 解析失败、顶层 null 沿用静默跳过：null 是合法 JSON 但解码成 nil map，
+	// 没有可聚合字段，计入会掩盖空流。
+	return nil
 }
 
 // handleChunk 并入一个数据帧的顶层字段与 choices。聚合超限返回错误（issue #113）。
@@ -266,8 +344,8 @@ func (a *streamAggregator) mergeChunkMeta(chunk map[string]any) {
 		a.model = v
 	}
 
-	if v, ok := chunk["created"].(float64); ok && a.created == 0 {
-		a.created = v
+	if v, ok := jsonInt(chunk["created"]); ok && a.created == 0 {
+		a.created = float64(v)
 	}
 
 	if u, ok := chunk["usage"].(map[string]any); ok {
@@ -341,8 +419,8 @@ func (a *streamAggregator) mergeFields(fields map[string]any) error {
 		return err
 	}
 
-	if refusal, ok := fields["refusal"].(string); ok {
-		a.refusal.WriteString(refusal)
+	if err := a.mergeRefusal(fields); err != nil {
+		return err
 	}
 
 	return a.mergeCalls(fields)
@@ -361,6 +439,26 @@ func (a *streamAggregator) mergeCalls(fields map[string]any) error {
 			return err
 		}
 	}
+
+	return nil
+}
+
+// mergeRefusal 并入 refusal（计入聚合总量上限）。
+//
+// refusal 与 content/reasoning/tool_call arguments 同属「上游可无限追加」的聚合
+// 字段，必须走同一个 guard：漏掉它，异常或恶意的上游只要持续发 delta.refusal
+// 就能绕过 32 MiB 聚合上限（issue #113 的缺口）。
+func (a *streamAggregator) mergeRefusal(fields map[string]any) error {
+	refusal, ok := fields["refusal"].(string)
+	if !ok {
+		return nil
+	}
+
+	if err := a.guard.add(len(refusal)); err != nil {
+		return err
+	}
+
+	a.refusal.WriteString(refusal)
 
 	return nil
 }
@@ -441,10 +539,36 @@ func (t *toolIndex) next() int {
 	}
 }
 
+// jsonInt 取 JSON 数值的整数形态（float64 / int / int64 / json.Number）。
+//
+// 帧解码改走 UseNumber 后，上游下发的 index 是 json.Number；只认 float64 会让
+// 带 index 的 tool_call 分片全部退回「按 id 推测」，并行调用因此互相覆盖。
+func jsonInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case json.Number:
+		if parsed, err := n.Int64(); err == nil {
+			return int(parsed), true
+		}
+
+		if f, err := n.Float64(); err == nil {
+			return int(f), true
+		}
+
+		return 0, false
+	default:
+		return 0, false
+	}
+}
+
 // resolve 返回单个 tool_call 的归属 index，并把 index/id 记入跨帧状态。
 func (t *toolIndex) resolve(call map[string]any) int {
-	if v, ok := call["index"].(float64); ok {
-		idx := int(v)
+	if idx, ok := jsonInt(call["index"]); ok {
 		t.occupy(idx)
 		t.remember(call, idx)
 
@@ -511,16 +635,48 @@ func (a *streamAggregator) mergeToolCallsChunk(tcs []any) error {
 
 		mergeToolCallDelta(merged, call)
 
-		if fn, _ := call["function"].(map[string]any); fn != nil {
-			if args, _ := fn["arguments"].(string); args != "" {
-				if err := a.guard.add(len(args)); err != nil {
-					return err
-				}
-			}
+		if err := a.mergeCallArgs(idx, call); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// mergeCallArgs 累计一片 tool_call 的 arguments（计入聚合总量上限）。
+func (a *streamAggregator) mergeCallArgs(idx int, call map[string]any) error {
+	fn, _ := call["function"].(map[string]any)
+	if fn == nil {
+		return nil
+	}
+
+	args, _ := fn["arguments"].(string)
+	if args == "" {
+		return nil
+	}
+
+	if err := a.guard.add(len(args)); err != nil {
+		return err
+	}
+
+	if a.toolArgs == nil {
+		a.toolArgs = map[int]*strings.Builder{}
+	}
+
+	a.toolArgs[idx] = appendArgs(a.toolArgs[idx], args)
+
+	return nil
+}
+
+// appendArgs 把一片 arguments 追加进累积器（首次出现时新建 builder）。
+func appendArgs(builder *strings.Builder, args string) *strings.Builder {
+	if builder == nil {
+		builder = &strings.Builder{}
+	}
+
+	builder.WriteString(args)
+
+	return builder
 }
 
 // mergeFunctionCallChunk 合并旧式 function_call 分片：name 覆盖、arguments 拼接。
@@ -541,9 +697,9 @@ func (a *streamAggregator) mergeFunctionCallChunk(chunk map[string]any) error {
 		if err := a.guard.add(len(args)); err != nil {
 			return err
 		}
-	}
 
-	appendStringIfNonEmpty(a.functionCall, chunk, "arguments")
+		a.legacyArgs = appendArgs(a.legacyArgs, args)
+	}
 
 	return nil
 }
@@ -622,7 +778,25 @@ func (a *streamAggregator) attachToolCalls(message map[string]any) {
 		return
 	}
 
-	slices.Sort(a.tools.order)
+	// 分片累积的 arguments 在这里一次性物化（累积期间只写 builder）。
+	for idx, builder := range a.toolArgs {
+		if builder == nil {
+			continue
+		}
+
+		call := a.toolCalls[idx]
+		if call == nil {
+			continue
+		}
+
+		fn, _ := call["function"].(map[string]any)
+		if fn == nil {
+			fn = map[string]any{}
+			call["function"] = fn
+		}
+
+		fn["arguments"] = builder.String()
+	}
 
 	calls := make([]map[string]any, 0, len(a.tools.order))
 	for _, idx := range a.tools.order {
@@ -648,6 +822,11 @@ func (a *streamAggregator) attachToolCalls(message map[string]any) {
 func (a *streamAggregator) attachFunctionCall(message map[string]any) {
 	if len(a.functionCall) == 0 {
 		return
+	}
+
+	// 分片累积的 arguments 在这里一次性物化（与 tool_calls 同口径）。
+	if a.legacyArgs != nil {
+		a.functionCall["arguments"] = a.legacyArgs.String()
 	}
 
 	truncatedStream := a.finishReason == "length" || !a.sawDone
@@ -686,6 +865,12 @@ func ensureUsageTotal(table map[string]any) map[string]any {
 // 整个请求），这边是聚合响应求和（非数字只跳过合成）。防后人合并两处。
 func num64(v any) (float64, bool) {
 	switch n := v.(type) {
+	case json.Number:
+		// 帧解码走 UseNumber，只认 float64/int64 会让 ensureUsageTotal 在
+		// 上游省略 total_tokens 时不再合成该字段。
+		parsed, err := n.Float64()
+
+		return parsed, err == nil
 	case float64:
 		return n, true
 	case int64:
@@ -698,7 +883,9 @@ func num64(v any) (float64, bool) {
 }
 
 // mergeToolCallDelta 把流式 tool_call 片段合并到累计对象：
-// id/type/function.name 直覆盖（后续分片通常缺省），function.arguments 拼接。
+// id/type/function.name 直覆盖（后续分片通常缺省）。arguments 不进这里——它以
+// 分片形式到达，累积在 streamAggregator.toolArgs 的 builder 里，attachToolCalls
+// 时一次性落成字符串（逐片 `prev + str` 是 O(n²)）。
 func mergeToolCallDelta(merged, delta map[string]any) {
 	setStringIfNonEmpty(merged, delta, "id")
 	setStringIfNonEmpty(merged, delta, "type")
@@ -715,27 +902,12 @@ func mergeToolCallDelta(merged, delta map[string]any) {
 	}
 
 	setStringIfNonEmpty(table, table2, "name")
-	appendStringIfNonEmpty(table, table2, "arguments")
 }
 
 // setStringIfNonEmpty 把 src[key] 的非空字符串覆盖写入 dst[key]（缺失/空串不动）。
 func setStringIfNonEmpty(dst, src map[string]any, key string) {
 	if v, ok := src[key].(string); ok && v != "" {
 		dst[key] = v
-	}
-}
-
-// appendStringIfNonEmpty 把 src[key] 的非空字符串拼接到 dst[key] 已有字符串之后。
-func appendStringIfNonEmpty(dst, src map[string]any, key string) {
-	str, ok := src[key].(string)
-	if !ok || str == "" {
-		return
-	}
-
-	if prev, _ := dst[key].(string); prev != "" {
-		dst[key] = prev + str
-	} else {
-		dst[key] = str
 	}
 }
 
@@ -1083,6 +1255,9 @@ type streamWriter struct {
 	// sawDone 上游是否显式发过 data: [DONE]（issue #105）。两条读取路径
 	// （普通 / keepalive）共用；收尾时据此区分「正常结束」与「EOF 截断」。
 	sawDone bool
+	// sawErrorFrame 已透传过上游错误帧：收尾不要再补「truncated before [DONE]」，
+	// 否则会把真实原因（如 6004 限流）覆盖成网关解析问题。
+	sawErrorFrame bool
 
 	// dataLines 当前 SSE 事件累积的 data: 行；按规范用 \n 拼接，遇空行/事件边界
 	// 才写出一帧。单行 data 也走这里，保证多行 data 不再被拆成多个坏帧。
@@ -1350,8 +1525,8 @@ func (s *streamWriter) trackMaxToolIdx(obj map[string]any) {
 				continue
 			}
 
-			if v, ok := tc["index"].(float64); ok && int(v) > s.maxToolIdx {
-				s.maxToolIdx = int(v)
+			if idx, ok := jsonInt(tc["index"]); ok && idx > s.maxToolIdx {
+				s.maxToolIdx = idx
 			}
 		}
 	}
@@ -1592,8 +1767,10 @@ func startsLikeJSON(payload string) bool {
 // 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
 // 降级原样写出，但不计数）。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
-	var obj map[string]any
-	if json.Unmarshal([]byte(payload), &obj) != nil || obj == nil {
+	// UseNumber：白名单重建后整帧重新编码，created/usage/logprobs 等数字不得被
+	// float64 往返改写。
+	obj, err := decodeObjectUseNumber([]byte(payload))
+	if err != nil || obj == nil {
 		return s.writeUnparsedFrame(payload)
 	}
 	// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
@@ -1680,6 +1857,11 @@ func (s *streamWriter) emitErrorFrame(original, out string) (int, error) {
 		return 0, werr
 	}
 
+	// 上游已经给出明确的错误帧：收尾时不要再补「truncated before [DONE]」，
+	// 那会把真实原因（如 6004 限流）覆盖成网关解析问题。仍按截断返错，供调用方
+	// 把本次请求记为上游失败。
+	s.sawErrorFrame = true
+
 	return 1, nil
 }
 
@@ -1712,6 +1894,10 @@ func (s *streamWriter) stream(r io.Reader) error {
 			// 不把超限行的已读部分当内容透传（也不回退——那正是 OOM 的成因）。
 			if errors.Is(err, ErrSSELineTooLong) {
 				s.finishSizeLimit()
+			} else {
+				// 连接重置 / idle 超时 / 代理中断：客户端已开始读流，必须收到收尾
+				// 标记，否则只能把断连当失败读半截（与 EOF 路径的 finish 同口径）。
+				s.finishInterrupted(validFrames)
 			}
 
 			return err
@@ -1854,7 +2040,10 @@ func (s *streamWriter) keepaliveIfIdle(lastWrite *time.Time) error {
 	}
 	// 复用逐行写路径：升级到带写截止的实现（如 issue #53）后，心跳同样受
 	// 单次写上限保护，不会在客户端不消费时无限阻塞。
-	if _, _, err := s.handleStreamLine(": keepalive\n\n"); err != nil {
+	// 只写单换行：注释行不得制造事件边界。传两个换行时 default 分支会把空行
+	// 原样透传，上游把一帧 JSON 拆成多条 data 行且静默超过 keepalive 间隔时，
+	// 客户端会先收到只含前半段 JSON 的事件。
+	if _, _, err := s.handleStreamLine(": keepalive\n"); err != nil {
 		return err
 	}
 
@@ -1946,6 +2135,13 @@ func (s *streamWriter) flushData() (int, error) {
 	return n, nil
 }
 
+// finishInterrupted 中途读错误的收尾：补截断提示 + [DONE]。
+func (s *streamWriter) finishInterrupted(validFrames int) {
+	s.writeFinishFallback(validFrames)
+	_ = s.writeSSE("[DONE]")
+	s.flushNow()
+}
+
 // finishSizeLimit 单行/总量超限的收尾（issue #113）：先写一帧明确 error
 // （绕过 normalizeFrame 保留 error 字段），再补 [DONE] 保证客户端能正常收尾。
 // 与空流兜底同形态：HTTP 头已发出只能 200，error 帧是客户端唯一能看到的失败信号。
@@ -2010,7 +2206,7 @@ func (s *streamWriter) writeFinishFallback(validFrames int) {
 	case validFrames == 0:
 		_ = s.writeRaw(`{"error":{"message":"empty upstream stream",` +
 			`"type":"upstream_error","code":"upstream_parse"}}`)
-	case !s.sawDone && !s.sawFinish:
+	case !s.sawDone && !s.sawFinish && !s.sawErrorFrame:
 		_ = s.writeRaw(`{"error":{"message":"upstream stream truncated before [DONE]",` +
 			`"type":"upstream_error","code":"upstream_parse"}}`)
 	}
@@ -2075,8 +2271,8 @@ func frameGatewayHint(hintFn func(string) string, payload string) string {
 // message/code/requestId 等既有键原样保留（只加不改）；非 JSON / 无 error 对象 →
 // payload 原样返回（宁可不加 hint 也不破坏原文透传）。
 func attachHintToErrorFrame(payload, hint string) string {
-	var obj map[string]any
-	if json.Unmarshal([]byte(payload), &obj) != nil {
+	obj, err := decodeObjectUseNumber([]byte(payload))
+	if err != nil || obj == nil {
 		return payload
 	}
 

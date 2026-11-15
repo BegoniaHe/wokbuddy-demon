@@ -111,7 +111,11 @@ type Pool struct {
 	randInt64N func(n int64) int64
 	// nowFn 仅供测试注入确定性时钟（退避 / EWMA / 冷却计算的时间来源）；
 	// nil 时用系统时钟 time.Now（生产默认）。见 SetClock 与 p.now。
-	nowFn func() time.Time
+	//
+	// 用 atomic 指针而非裸函数字段：p.now() 在锁外被调用（persistState 组快照、
+	// CooldownUntilTomorrow4AM 等），裸字段与 SetClock 的写入并发时是数据竞争
+	// （-race 会命中）。
+	nowFn atomic.Pointer[func() time.Time]
 	// persistFails 本地 state.json 连续落盘失败计数（由 persistMu 保护）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
@@ -137,6 +141,9 @@ type Pool struct {
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
+	// flusherDone 在 flusher 协程退出时关闭；Close 借此 join，保证「Close 返回后
+	// 不会再有落盘协程写 state.json」（测试删临时目录、进程收尾都依赖这一点）。
+	flusherDone chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
 }
@@ -185,6 +192,12 @@ func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
 		close(p.stopCh)
 	})
+	// join：等落盘协程真正退出再做最后一次落盘，避免它在 Flush 之后再写一次
+	// state.json（Close 语义是「此后不再有后台落盘」）。
+	if p.flusherDone != nil {
+		<-p.flusherDone
+	}
+
 	p.Flush()
 }
 
@@ -330,6 +343,8 @@ func (p *Pool) CreditFloor() int64 {
 
 // CreditFloorByRealm 透出 cn / global 回落后的生效保底（/status 用）。
 // 两个键都给出：未覆盖的域等于全局 creditFloor，显式 0 仍是 0。
+// CreditFloorByRealm 返回两域的生效保底（面板/状态展示用；每次分配一个 map，
+// 请求热路径请用 CreditFloorForRealm）。
 func (p *Pool) CreditFloorByRealm() map[string]int64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -338,6 +353,14 @@ func (p *Pool) CreditFloorByRealm() map[string]int64 {
 		"cn":     p.creditFloorFor("cn"),
 		"global": p.creditFloorFor("global"),
 	}
+}
+
+// CreditFloorForRealm 返回单域生效保底（请求热路径用，不分配 map）。
+func (p *Pool) CreditFloorForRealm(realm string) int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return p.creditFloorFor(realm)
 }
 
 // SetCreditFloor 注入积分保底线（main 从 config 解析后调用）。
@@ -679,17 +702,20 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 // SetClock 仅供测试注入确定性时钟；生产代码不应调用。注入后，退避 / EWMA /
 // 冷却 / 选号空闲补偿等所有时间计算改用注入源，使时序用例无需真实 sleep。
 func (p *Pool) SetClock(fn func() time.Time) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	if fn == nil {
+		p.nowFn.Store(nil)
 
-	p.nowFn = fn
+		return
+	}
+
+	p.nowFn.Store(&fn)
 }
 
 // now 返回当前时间：注入时钟优先，否则系统时钟。所有退避 / EWMA / 冷却 / 选号
 // 时间计算必须经此取值，避免直接 time.Now() 绕过注入（时序测试确定性）。
 func (p *Pool) now() time.Time {
-	if p.nowFn != nil {
-		return p.nowFn()
+	if fn := p.nowFn.Load(); fn != nil {
+		return (*fn)()
 	}
 
 	return time.Now()
@@ -728,17 +754,22 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	changed := false
 
 	for uid, entry2 := range p.byUID {
-		if !seen[uid] {
-			if n := entry2.inFlight.Swap(0); n > 0 {
-				p.inFlightTotal.Add(-n)
-			}
-
-			delete(p.byUID, uid)
-
-			retired = append(retired, entry2.a)
-
-			changed = true
+		if seen[uid] {
+			continue
 		}
+
+		if n := entry2.inFlight.Swap(0); n > 0 {
+			p.inFlightTotal.Add(-n)
+		}
+
+		delete(p.byUID, uid)
+		// 与 Remove 同口径清掉该账号的待探窗口：否则 (uid, 模型) 探针会留到
+		// windowProbeMaxAge/尝试耗尽才清，期间占掉每轮探针额度。
+		p.dropWindowProbesLocked(uid)
+
+		retired = append(retired, entry2.a)
+
+		changed = true
 	}
 
 	var seq uint64

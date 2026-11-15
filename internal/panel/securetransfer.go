@@ -30,8 +30,13 @@ const (
 	secureKDF             = "pbkdf2-sha256"
 	secureIterations      = 600_000
 	secureSaltLen         = 16
-	// secureMaxIter 解密侧上限：拒绝畸形文件声明的超大迭代（防 CPU DoS）。
-	secureMaxIter = 5_000_000
+	// secureMinIter / secureMaxIter 解密侧允许的迭代数区间（导出固定 secureIterations）。
+	//
+	// 只设「上限 500 万」不够：envelope 由用户上传，iter=5000000 会比正常导出贵 8 倍
+	// CPU，且在校验密码之前就烧掉（几个并发即饱和）。区间留 2× 余量以兼容未来的
+	// 参数上调，同时把 DoS 放大倍数钉在 2 以内。
+	secureMinIter = secureIterations / 2
+	secureMaxIter = secureIterations * 2
 	secureMinPass = 8
 	// secureMaxUploadBytes 加密导入请求体上限（防无界读；正常导出远小于此）。
 	// ParseMultipartForm 的 maxMemory 只决定内存/临时文件切分，不限制大小，
@@ -155,7 +160,12 @@ func parseSecureEnvelope(raw []byte) (secureEnvelope, error) {
 	}
 
 	if env.Version != secureEnvelopeVersion || env.KDF != secureKDF ||
-		env.Iter <= 0 || env.Iter > secureMaxIter {
+		env.Iter < secureMinIter || env.Iter > secureMaxIter {
+		return env, errSecureDecrypt
+	}
+
+	// salt 是 base64 文本：按编码后长度校验，避免解码出短盐（弱化 KDF 输入）。
+	if len(env.Salt) != base64.StdEncoding.EncodedLen(secureSaltLen) {
 		return env, errSecureDecrypt
 	}
 

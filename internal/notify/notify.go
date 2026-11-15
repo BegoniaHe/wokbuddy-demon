@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"strings"
@@ -86,13 +88,15 @@ type Event struct {
 
 // payload 线上 JSON 形态（uid 截断、时间 RFC3339）。
 type payload struct {
-	Event    string         `json:"event"`
-	Time     string         `json:"time"`
-	UID      string         `json:"uid,omitempty"`
-	Nickname string         `json:"nickname,omitempty"`
-	Realm    string         `json:"realm,omitempty"`
-	Summary  string         `json:"summary,omitempty"`
-	Detail   map[string]any `json:"detail,omitempty"`
+	// dedupeKey 去重键（event+uid）；不序列化，仅用于发送失败时释放去重窗口。
+	dedupeKey string
+	Event     string         `json:"event"`
+	Time      string         `json:"time"`
+	UID       string         `json:"uid,omitempty"`
+	Nickname  string         `json:"nickname,omitempty"`
+	Realm     string         `json:"realm,omitempty"`
+	Summary   string         `json:"summary,omitempty"`
+	Detail    map[string]any `json:"detail,omitempty"`
 }
 
 // Config 构造参数；零值 = 关闭。
@@ -110,6 +114,9 @@ const (
 	defaultTimeout      = 5 * time.Second
 	defaultDedupeWindow = 10 * time.Minute
 	queueSize           = 64
+	// closeDrainBudget 关停时排空队列的总预算：worker 串行发送、每条自带 timeout，
+	// 队列满时最坏 64×5s，不能让它阻塞进程退出。
+	closeDrainBudget = 2 * time.Second
 )
 
 // Sender 告警投递接口（测试可注入 fake）。
@@ -134,6 +141,11 @@ type Notifier struct {
 
 	mu   sync.Mutex
 	last map[string]time.Time
+
+	// dropped 队列满被丢弃的事件数；lastDropLog 上次打 WARN 的时刻（每分钟一次）。
+	// webhook 变慢时丢弃是必然事件，按事件数刷屏没有信息量，运维要的是「丢了多少」。
+	dropped     int64
+	lastDropLog time.Time
 }
 
 // New 构造并启动发送 worker；URL 为空返回禁用实例（不启动 goroutine）。
@@ -201,27 +213,38 @@ func (n *Notifier) applyClientConfig(cfg Config) {
 	}
 
 	if n.client == nil {
-		n.client = &http.Client{Timeout: n.timeout}
+		// 不跟随重定向：webhook 载荷（uid8/nickname/realm）不应被 307/308 转发到
+		// 第三方，也不应因重定向降到 http。
+		n.client = &http.Client{
+			Timeout: n.timeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
 	}
 }
 
 // Notify 投递一条事件：未订阅/去重窗口内重复时丢弃；队列满时丢新事件并计数。
 func (n *Notifier) Notify(event *Event) {
-	if n == nil || n.url == "" || n.closed.Load() || !n.events[event.Event] {
+	if n == nil || event == nil || n.url == "" || n.closed.Load() || !n.events[event.Event] {
 		return
 	}
 
-	if !n.allow(event) {
+	key := event.Event + "\x00" + event.UID
+	if !n.allow(key) {
 		return
 	}
 
 	payload2 := payload{
-		Event:    event.Event,
-		Time:     n.now().UTC().Format(time.RFC3339),
-		Nickname: event.Nickname,
-		Realm:    event.Realm,
-		Summary:  event.Summary,
-		Detail:   event.Detail,
+		dedupeKey: key,
+		Event:     event.Event,
+		Time:      n.now().UTC().Format(time.RFC3339),
+		Nickname:  event.Nickname,
+		Realm:     event.Realm,
+		Summary:   event.Summary,
+		// 深拷贝：序列化发生在 worker 协程，调用方（请求/调度协程）只要复用或事后
+		// 修改同一个 map 就是跨协程读写。三个调用点当前都传字面量，属潜伏缺陷。
+		Detail: maps.Clone(event.Detail),
 	}
 	if event.UID != "" {
 		payload2.UID = logfmt.UID8(event.UID)
@@ -230,13 +253,15 @@ func (n *Notifier) Notify(event *Event) {
 	select {
 	case n.queue <- payload2:
 	default:
-		log.Printf("WARN: [notify] event=%s dropped: queue full", payload2.Event)
+		// 被丢弃的事件不能占住去重窗口：否则同一事件 + 账号在 window 内再也不重试，
+		// 真实告警被静默压制（队列满在 webhook 变慢时必然发生）。
+		n.forget(key)
+		n.noteDrop(payload2.Event, payload2.UID)
 	}
 }
 
 // allow 做同事件 + 账号的窗口去重。
-func (n *Notifier) allow(e *Event) bool {
-	key := e.Event + "\x00" + e.UID
+func (n *Notifier) allow(key string) bool {
 	now := n.now()
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -250,6 +275,13 @@ func (n *Notifier) allow(e *Event) bool {
 	return true
 }
 
+// forget 撤销一次去重登记（入队失败时调用）。
+func (n *Notifier) forget(key string) {
+	n.mu.Lock()
+	delete(n.last, key)
+	n.mu.Unlock()
+}
+
 // run 串行发送（单 worker，天然限频；失败不影响下一事件）。
 func (n *Notifier) run() {
 	defer n.wg.Done()
@@ -257,14 +289,14 @@ func (n *Notifier) run() {
 	for {
 		select {
 		case p := <-n.queue:
-			n.send(&p)
+			n.deliver(&p)
 		case <-n.done:
 			// 关停时排空已入队事件再退出：select 同时就绪会随机选，直接 return
 			// 会静默丢掉队列里尚未发送的通知（Close 与 Notify 并发下的竞态）。
 			for {
 				select {
 				case p := <-n.queue:
-					n.send(&p)
+					n.deliver(&p)
 				default:
 					return
 				}
@@ -273,12 +305,34 @@ func (n *Notifier) run() {
 	}
 }
 
+// noteDrop 记录一次队列满丢弃：每分钟最多一条日志 + 累计数 + 账号标识。
+func (n *Notifier) noteDrop(event, uid string) {
+	n.mu.Lock()
+	n.dropped++
+
+	emit := time.Since(n.lastDropLog) >= time.Minute
+	if emit {
+		n.lastDropLog = time.Now()
+	}
+
+	dropped := n.dropped
+	n.mu.Unlock()
+
+	if emit {
+		log.Printf("WARN: [notify] event=%s uid=%s dropped: queue full（累计 %d 条）",
+			event, logfmt.UID8(uid), dropped)
+	}
+}
+
 // send POST JSON；失败只记事件名，不带 URL（URL 可能内嵌 token）。
-func (n *Notifier) send(payload2 *payload) {
+// 返回是否投递成功：失败时调用方要释放去重窗口，否则这条告警在窗口内既不会
+// 重试也不会再产生新事件（webhook 抖动会吃掉唯一一次机会）。
+func (n *Notifier) send(payload2 *payload) bool {
 	raw, err := json.Marshal(payload2)
 	if err != nil {
 		log.Printf("WARN: [notify] event=%s encode failed", payload2.Event)
-		return
+
+		return false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), n.timeout)
@@ -287,7 +341,8 @@ func (n *Notifier) send(payload2 *payload) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, n.url, bytes.NewReader(raw))
 	if err != nil {
 		log.Printf("WARN: [notify] event=%s request build failed", payload2.Event)
-		return
+
+		return false
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -295,12 +350,29 @@ func (n *Notifier) send(payload2 *payload) {
 	resp, err := n.client.Do(req)
 	if err != nil {
 		log.Printf("WARN: [notify] event=%s send failed", payload2.Event)
-		return
+
+		return false
 	}
 
+	// 读掉少量 body 再关：不排空会让 Transport 无法复用连接，每条告警都要重做
+	// TCP + TLS 握手。
+	_, _ = io.CopyN(io.Discard, resp.Body, 4<<10)
 	_ = resp.Body.Close()
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Printf("WARN: [notify] event=%s send failed: status=%d", payload2.Event, resp.StatusCode)
+
+		return false
+	}
+
+	return true
+}
+
+// deliver 发送并在失败时释放去重窗口：下一条同事件/同账号的事件可以立刻重发，
+// 而不是被窗口静默吃掉（webhook 抖动时 session_dead 这类终态告警只有一次机会）。
+func (n *Notifier) deliver(payload2 *payload) {
+	if !n.send(payload2) && payload2.dedupeKey != "" {
+		n.forget(payload2.dedupeKey)
 	}
 }
 
@@ -313,6 +385,20 @@ func (n *Notifier) Close() {
 	n.once.Do(func() {
 		n.closed.Store(true)
 		close(n.done)
-		n.wg.Wait()
+
+		// 排空要有总预算：worker 串行发送、每条自带 timeout（默认 5s），队列满时
+		// 最坏 64×5s = 320s，而 Close 在进程退出路径上。
+		drained := make(chan struct{})
+		go func() {
+			defer close(drained)
+
+			n.wg.Wait()
+		}()
+
+		select {
+		case <-drained:
+		case <-time.After(closeDrainBudget):
+			log.Printf("WARN: [notify] 关停排空超时（%s），放弃剩余通知", closeDrainBudget)
+		}
 	})
 }

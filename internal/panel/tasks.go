@@ -148,6 +148,11 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !p.lockAccountForTask(w, uid) {
+		return
+	}
+	defer p.unlockAccount(uid)
+
 	tasks, err := p.cfg.Upstream.ListTasks(account)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
@@ -188,6 +193,11 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_codes required")
 		return
 	}
+
+	if !p.lockAccountForTask(w, uid) {
+		return
+	}
+	defer p.unlockAccount(uid)
 
 	if err := p.cfg.Upstream.AcceptTasks(account, body.TaskCodes); err != nil {
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
@@ -295,6 +305,11 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	if account == nil {
 		return
 	}
+
+	if !p.lockAccountForTask(w, uid) {
+		return
+	}
+	defer p.unlockAccount(uid)
 
 	var body struct {
 		TaskCode string `json:"task_code"`

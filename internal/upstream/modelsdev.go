@@ -217,7 +217,17 @@ func (f *modelsDevFetcher) ensureDocAsync(client *http.Client, baseOverride stri
 	f.lastFetch = time.Now()
 	f.mu.Unlock()
 
-	go f.fetchDoc(client, baseOverride)
+	// fetchDoc 的契约是「任何失败只静默冷却，不上抛」，但 goroutine 内 panic 会直接
+	// 带走整个网关进程：解析路径的类型断言/切片一旦失手，必须是可观测的 WARN 而不是退出。
+	go func() {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("WARN: [upstream] models.dev fetch panic: %v", rec)
+			}
+		}()
+
+		f.fetchDoc(client, baseOverride)
+	}()
 }
 
 // fetchDoc 拉取并解析 models.dev 文档，建裸 id 索引（goroutine 内执行，永不 panic
@@ -225,8 +235,6 @@ func (f *modelsDevFetcher) ensureDocAsync(client *http.Client, baseOverride stri
 // 拒绝 nil client（不回落 http.DefaultClient）：生产调用方恒传非 nil，nil 只意味着
 // 测试疏漏——DefaultClient 无超时（挂起隐患）且会打真网（测试污染 + 不确定延迟），
 // 静默 WARN + 返回（与 fetch 失败同语义，降级 1M 兜底）让疏漏显式化。
-//
-//nolint:funlen // 请求/状态/解析/降级顺序线性展开。
 func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 	if client == nil {
 		log.Printf("WARN: [upstream] models.dev fetch: nil client rejected " +
@@ -240,30 +248,8 @@ func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 		url = baseOverride
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), modelsDevTimeout)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
-	if err != nil {
-		log.Printf("WARN: [upstream] models.dev fetch: build request: %v", err)
-		return
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("WARN: [upstream] models.dev fetch failed (silent fallback to 1M): %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("WARN: [upstream] models.dev fetch status %d (silent fallback to 1M)", resp.StatusCode)
-		return
-	}
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, modelsDevMaxBody))
-	if err != nil {
-		log.Printf("WARN: [upstream] models.dev fetch read: %v", err)
+	raw, ok := fetchModelsDevBody(client, url)
+	if !ok {
 		return
 	}
 
@@ -281,13 +267,70 @@ func (f *modelsDevFetcher) fetchDoc(client *http.Client, baseOverride string) {
 		mods = nil
 	}
 
+	if !f.publishDoc(doc, mods) {
+		return
+	}
+	// 文档就绪后把「曾 miss 过的模型」回流 model.json（第 4 级 → 第 3 级，
+	// 下次 /v1/models 直接命中缓存）。仍查不到的保持负缓存。
+	f.backfillMisses()
+}
+
+// fetchModelsDevBody 拉取 models.dev 原始文档；任何失败只 WARN 并返回 ok=false
+// （调用方回落到 1M 兜底，下一次冷却到期后重试）。
+func fetchModelsDevBody(client *http.Client, url string) ([]byte, bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), modelsDevTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
+	if err != nil {
+		log.Printf("WARN: [upstream] models.dev fetch: build request: %v", err)
+
+		return nil, false
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("WARN: [upstream] models.dev fetch failed (silent fallback to 1M): %v", err)
+
+		return nil, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("WARN: [upstream] models.dev fetch status %d (silent fallback to 1M)", resp.StatusCode)
+
+		return nil, false
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, modelsDevMaxBody))
+	if err != nil {
+		log.Printf("WARN: [upstream] models.dev fetch read: %v", err)
+
+		return nil, false
+	}
+
+	return raw, true
+}
+
+// publishDoc 发布解析好的文档索引与模态索引；空索引拒绝发布并返回 false。
+//
+// 「200 但解析出空索引」（上游回 {} / 只含无条件模型的骨架）不能当成成功：
+// ensureDocAsync 的短路条件是 f.doc != nil，把空 map 写进去会让第 4 级从此
+// 永久判定「文档已就绪」，此后既不重拉也无任何日志，所有未知模型静默退到 1M。
+func (f *modelsDevFetcher) publishDoc(doc map[string]modelsDevEntry, mods map[string][]string) bool {
+	if len(doc) == 0 {
+		log.Printf("WARN: [upstream] models.dev returned empty index (silent fallback to 1M; " +
+			"will retry after cooldown)")
+
+		return false
+	}
+
 	f.mu.Lock()
 	f.doc = doc
 	f.modalities = mods
 	f.mu.Unlock()
-	// 文档就绪后把「曾 miss 过的模型」回流 model.json（第 4 级 → 第 3 级，
-	// 下次 /v1/models 直接命中缓存）。仍查不到的保持负缓存。
-	f.backfillMisses()
+
+	return true
 }
 
 // parseModelsDevDoc 解析 models.dev api.json：{provider:{models:{id:{limit:{context,

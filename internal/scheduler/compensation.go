@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -49,6 +50,41 @@ func (r *CompensationRow) Pending() bool {
 	return !r.Skipped && r.Error == "" && r.Active && !r.Claimed && r.CreditNum > 0
 }
 
+// dispatchCompensation 取一个并发名额；ctx 已取消（或取名额期间取消）时返回
+// false 并归还名额。sem 满时不阻塞主 goroutine，与 RunBalanceRefreshNowCtx 同口径。
+//
+// select 同时就绪会随机选：所以拿到名额后必须二次确认，覆盖「检查后、取名额前」
+// 刚好取消的窗口——否则取消之后仍会派发一次上游请求。
+func dispatchCompensation(ctx context.Context, sem chan struct{}) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+
+	select {
+	case sem <- struct{}{}:
+		if ctx.Err() != nil {
+			<-sem
+
+			return false
+		}
+
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// markNotDispatched 标记「本轮未查询上游」的行。
+//
+// 未派发的行若保持零值，面板/汇总与「已查询、当前无活动」完全不可区分：
+// SummarizeCompensation 会把它算成三不靠（既非 claimed 也非 skipped/errored），
+// 批量结果看起来一切正常，实际有 N 个账号根本没查——与本文件「不要静默失败」的
+// 命题相反。ctx 取消不是上游故障，故记 Skipped + 原因而非 Error。
+func markNotDispatched(row *CompensationRow) {
+	row.Skipped = true
+	row.Reason = "请求已取消，未查询上游"
+}
+
 // compensationGate 门控：global / 企业版 / 禁用账号不发任何上游请求。
 func compensationGate(acct *auth.Auth, disabled bool) (string, bool) {
 	switch {
@@ -66,8 +102,6 @@ func compensationGate(acct *auth.Auth, disabled bool) (string, bool) {
 // CompensationStatusAll 并发查询全部账号的补偿状态，按池顺序返回。
 //
 // ctx 取消后不再派发新的请求（已派发的等其完成）。
-//
-//nolint:funlen // 并发拉取/汇总/排序线性展开。
 func (s *Scheduler) CompensationStatusAll(ctx context.Context) []CompensationRow {
 	list := s.cfg.Pool.List()
 	rows := make([]CompensationRow, len(list))
@@ -101,32 +135,45 @@ func (s *Scheduler) CompensationStatusAll(ctx context.Context) []CompensationRow
 			continue
 		}
 
-		if ctx.Err() != nil {
+		if !dispatchCompensation(ctx, sem) {
+			markNotDispatched(&rows[i])
+
 			continue
 		}
 
-		// 先取名额再起 goroutine；sem 满且已取消时不阻塞主 goroutine
-		// （与 RunBalanceRefreshNowCtx 同口径）。
-		select {
-		case sem <- struct{}{}:
-		case <-ctx.Done():
-			continue
-		}
-
-		wg.Add(1)
-
-		go func(idx int, acct *auth.Auth) {
-			defer wg.Done()
-			defer func() { <-sem }()
-
-			// 各写各自下标：不同下标是互不重叠的内存，无需锁（与 packages 接口同写法）。
-			s.fetchCompensationRow(acct, &rows[idx])
-		}(i, account)
+		s.startCompensationStatusFetch(&wg, sem, rows, i, account)
 	}
 
 	wg.Wait()
 
 	return rows
+}
+
+// startCompensationStatusFetch 派发单账号状态查询：panic 隔离 + 失败必显形。
+//
+// 独立成方法是为了让 CompensationStatusAll 保持「派发/等待」的主线可读。
+// 各写各自下标：不同下标是互不重叠的内存，无需锁。
+func (s *Scheduler) startCompensationStatusFetch(
+	wg *sync.WaitGroup, sem chan struct{}, rows []CompensationRow, index int, account *auth.Auth,
+) {
+	wg.Add(1)
+
+	// 必须真起协程：guarded 只做 panic 隔离，同步调用会把「并发查询」退化成
+	// 逐账号串行（sem 与 wg 也就形同虚设），面板批量入口按 N × 上游 RTT 阻塞。
+	go s.guarded("compensation-status", func() {
+		defer wg.Done()
+		defer func() { <-sem }()
+		// panic 已在 guarded 内隔离，但该行必须显形，不能留成空行（本文件的命题
+		// 是「不要静默失败」）。fetchCompensationRow 总会写 UID，仍为空即 panic。
+		defer func() {
+			if rows[index].UID == "" {
+				rows[index].UID = account.UID
+				rows[index].Error = "内部错误（已隔离）"
+			}
+		}()
+
+		s.fetchCompensationRow(account, &rows[index])
+	})
 }
 
 // fetchCompensationRow 查单账号状态并填行（失败写 Error，不 panic）。
@@ -253,7 +300,12 @@ func compensationClaimKey(uid string, status upstream.CompensationStatus) string
 
 // beginClaim 占用领取权：已领取或正在领取返回 false。首次调用惰性初始化 map
 // （零值 Scheduler 也可用）。
+//
+// claimedKeys 按 uid 只保留最近一次领取的周期 key：key 内含 EndTime，旧周期不会
+// 再次出现，因此无需保留历史；按 key 全量记账会让表随「账号数 × 周期数」无限增长。
 func (s *Scheduler) beginClaim(key string) bool {
+	uid, _, _ := strings.Cut(key, "|")
+
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
 
@@ -265,7 +317,7 @@ func (s *Scheduler) beginClaim(key string) bool {
 		s.claimingKeys = make(map[string]bool)
 	}
 
-	if _, done := s.claimedKeys[key]; done {
+	if done, ok := s.claimedKeys[uid]; ok && done == key {
 		return false
 	}
 
@@ -280,18 +332,22 @@ func (s *Scheduler) beginClaim(key string) bool {
 
 // finishClaim 释放领取权；成功则写入幂等标记。
 func (s *Scheduler) finishClaim(key string, ok bool) {
+	uid, _, _ := strings.Cut(key, "|")
+
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
 
 	delete(s.claimingKeys, key)
 
 	if ok {
-		s.claimedKeys[key] = "claimed"
+		s.claimedKeys[uid] = key
 	}
 }
 
 // recordClaimed 记录上游已领取状态（重启后首次查询命中 claimed 也走这里）。
 func (s *Scheduler) recordClaimed(key string) {
+	uid, _, _ := strings.Cut(key, "|")
+
 	s.claimMu.Lock()
 	defer s.claimMu.Unlock()
 
@@ -299,7 +355,7 @@ func (s *Scheduler) recordClaimed(key string) {
 		s.claimedKeys = make(map[string]string)
 	}
 
-	s.claimedKeys[key] = "claimed"
+	s.claimedKeys[uid] = key
 }
 
 // normalizeClaimCredit 统一「真实到账」归一：回执 credit<=0 时回落状态额度；
@@ -363,32 +419,27 @@ func (s *Scheduler) ClaimCompensationNow(ctx context.Context) ([]CompensationRow
 	var wg sync.WaitGroup
 
 	for i := range list {
-		if ctx.Err() != nil {
-			continue
-		}
+		if !dispatchCompensation(ctx, sem) {
+			markNotDispatched(&rows[i])
 
-		// 先取名额再起 goroutine；sem 满且已取消时不阻塞主 goroutine。
-		select {
-		case sem <- struct{}{}:
-			// select 同时就绪会随机选：拿到名额后二次确认，覆盖「检查后、
-			// 取名额前」刚好取消的窗口；已取消则归还名额并跳过派发。
-			if ctx.Err() != nil {
-				<-sem
-
-				continue
-			}
-		case <-ctx.Done():
 			continue
 		}
 
 		wg.Add(1)
 
-		go func(idx int, uid string) {
+		// 同上：guarded 是同步执行，缺 go 就把批量领取压成串行。
+		go s.guarded("compensation-claim", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if rows[i].UID == "" {
+					rows[i].UID = list[i].UID
+					rows[i].Error = "内部错误（已隔离）"
+				}
+			}()
 
-			rows[idx] = s.ClaimCompensationFor(uid)
-		}(i, list[i].UID)
+			rows[i] = s.ClaimCompensationFor(list[i].UID)
+		})
 	}
 
 	wg.Wait()

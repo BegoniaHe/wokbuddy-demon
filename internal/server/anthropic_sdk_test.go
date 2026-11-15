@@ -2244,3 +2244,34 @@ func TestAnthropicSDKPingThroughUpstream(t *testing.T) {
 
 	assertStreamInvariants(t, "ping through upstream", parseAnthropicSSE(t, out))
 }
+
+// TestAnthropicSDKServerToolUseEchoAccepted 网关自己写进 assistant 历史的服务端检索块
+// 必须能在下一轮被接受：Anthropic 协议要求客户端回传完整历史，落进 default 会让
+// 「第二轮」直接 400，把 web_search 打断在多轮场景。
+func TestAnthropicSDKServerToolUseEchoAccepted(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"m","messages":[
+		{"role":"assistant","content":[
+			{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{"query":"q"}},
+			{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[]}
+		]},
+		{"role":"user","content":"continue"}
+	]}`)
+
+	raw, _, _, err := anthropicToOpenAI(body)
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+
+	var got struct {
+		Messages []map[string]any `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got.Messages) != 2 {
+		t.Fatalf("messages=%d want 2（检索块应被跳过而不是转换）", len(got.Messages))
+	}
+}

@@ -29,6 +29,8 @@ const (
 	// windowProbeMaxAge 重置时刻早于该年龄仍没探成说明进程久停/上游窗口已漂移，
 	// 直接丢弃，避免重启后补发一堆过期探测。
 	windowProbeMaxAge = 6 * time.Hour
+	// maxWindowProbes 待探台账条目上限：键含客户端可任填的模型名，满额不再登记新窗口。
+	maxWindowProbes = 1024
 )
 
 // WindowProbe 一个到点待执行的额度窗口探针：把上游重置后的新窗口起点钉住。
@@ -66,6 +68,9 @@ func windowProbeKey(uid, model string) string {
 
 // registerWindowProbeLocked 登记一个到点窗口。同一 (账号, 模型) 同一 ResetAt 只登记
 // 一次（重复的 6004 不重置尝试计数）。调用方必须已持有 p.mu。
+//
+// 表有硬上限：键含客户端可任填的模型名（与 route.go 的 routeLedgerMax 同一类风险），
+// 满额时不再登记新窗口——只是这一轮不把新窗口起点钉住，不影响账号可用性与冷却。
 func (p *Pool) registerWindowProbeLocked(uid, model, realm string, resetAt time.Time) {
 	if resetAt.IsZero() || model == "" {
 		return
@@ -73,6 +78,10 @@ func (p *Pool) registerWindowProbeLocked(uid, model, realm string, resetAt time.
 
 	key := windowProbeKey(uid, model)
 	if st, ok := p.windowProbes[key]; ok && st.resetAt.Equal(resetAt) {
+		return
+	}
+
+	if _, exists := p.windowProbes[key]; !exists && len(p.windowProbes) >= maxWindowProbes {
 		return
 	}
 
@@ -201,6 +210,30 @@ func (p *Pool) windowProbeEligibleLocked(entry2 *entry, model, realm string, now
 	}
 
 	return !p.floorBlockedForRealmModel(entry2, model, realm, now)
+}
+
+// ReturnWindowProbe 归还一次「已出账但没真正发出去」的尝试（调度器拿不到在途名额时
+// 走这里）：撤回 DueWindowProbes 记下的尝试次数与重试间隔，让下一轮立刻还能探。
+//
+// 与 WindowProbeDone 的区别是语义：Done 回答「探过、结果如何」，Return 回答「压根
+// 没探」。混用会把「池子忙」记成「已钉住新窗口」或白烧掉一次 attempts 上限。
+func (p *Pool) ReturnWindowProbe(uid, model string) {
+	key := windowProbeKey(uid, model)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state, exists := p.windowProbes[key]
+	if !exists {
+		return
+	}
+
+	if state.attempts > 0 {
+		state.attempts--
+	}
+
+	// 清掉重试间隔：本轮没发请求，不该按「限流后退避」等一个 windowProbeRetryBackoff。
+	state.nextAt = time.Time{}
 }
 
 // dropWindowProbesLocked 清掉某账号的全部待探窗口（账号被移除时）。调用方必须已持有 p.mu。

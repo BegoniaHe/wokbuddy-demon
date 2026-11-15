@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -172,6 +173,10 @@ func LoadDir(dir string) (*Set, error) {
 			continue
 		}
 
+		if !isProfileFileName(entry.Name()) {
+			continue
+		}
+
 		realm, profile, lerr := loadRealmFile(dir, entry.Name())
 		if lerr != nil {
 			return nil, lerr
@@ -213,6 +218,22 @@ func validateRealmTLSEquality(profiles map[string]*Profile) error {
 	return nil
 }
 
+// isProfileFileName 判断目录项是否是约定的 profile 文件名（cn.json / global.json）。
+//
+// 只认这两个名字：目录里常有 macOS 资源叉（._cn.json）、手工放的说明文件或缓存
+// 文件，它们不该让进程拒绝启动；只有这两个名字解析失败才 fail fast。
+func isProfileFileName(name string) bool {
+	if name == "cn.json" || name == "global.json" {
+		return true
+	}
+
+	if filepath.Ext(name) == ".json" {
+		log.Printf("WARN: [clientprofile] 忽略非 profile 文件 %s（只认 cn.json / global.json）", name)
+	}
+
+	return false
+}
+
 // loadRealmFile 读取并校验单个 realm 文件，返回文件名推导出的 realm。
 func loadRealmFile(dir, name string) (string, *Profile, error) {
 	realm := strings.TrimSuffix(name, ".json")
@@ -237,10 +258,18 @@ func loadRealmFile(dir, name string) (string, *Profile, error) {
 // LoadFile 读取并严格解析单个 profile 文件（拒绝未知字段与多段 JSON）。
 // 读取走 safefile：正文不是合法 JSON 时回落 <path>.bak（与 auth / state 同口径），
 // 但语义校验失败不回退，由调用方拒绝启动。
+//
+// 回退必须留痕：.bak 是**上一版**快照，静默使用等于让整个进程跑在过期指纹上
+// （UA / 版本 / commit 全部失真），正是本包要防的形态。用 ReadWithFallback 拿到
+// 来源标记，与 auth 的 loadAuthFile 同口径。
 func LoadFile(path string) (*Profile, error) {
-	raw, err := safefile.Read(path, nil)
+	raw, restored, err := safefile.ReadWithFallback(path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("client profile %s: %w", path, err)
+	}
+
+	if restored {
+		log.Printf("WARN: client profile 正文损坏，已回退 %s.bak（指纹可能是上一版）: %s", path, path)
 	}
 
 	var profile Profile
@@ -409,18 +438,23 @@ func validateRequiredEmit(emit *Emit) error {
 }
 
 func validateEmitValues(emit *Emit) error {
-	values := map[string]string{
-		"chatUA": emit.ChatUA, "desktopUA": emit.DesktopUA, "billingUA": emit.BillingUA,
-		"xIdeVersion": emit.XIdeVersion, "desktopIdeVersion": emit.DesktopIdeVersion,
-		"desktopExtVersion": emit.DesktopExtVersion, "loginPlatform": emit.LoginPlatform,
-		"billingMeterUA": emit.BillingMeterUA,
+	// 按固定字段顺序校验：map 迭代顺序随机会让同一份坏 profile 每次报不同的字段。
+	values := []struct{ key, value string }{
+		{"chatUA", emit.ChatUA},
+		{"desktopUA", emit.DesktopUA},
+		{"billingUA", emit.BillingUA},
+		{"xIdeVersion", emit.XIdeVersion},
+		{"desktopIdeVersion", emit.DesktopIdeVersion},
+		{"desktopExtVersion", emit.DesktopExtVersion},
+		{"loginPlatform", emit.LoginPlatform},
+		{"billingMeterUA", emit.BillingMeterUA},
 	}
 	if emit.LoginUA != nil {
-		values["loginUA"] = *emit.LoginUA
+		values = append(values, struct{ key, value string }{"loginUA", *emit.LoginUA})
 	}
 
-	for key, value := range values {
-		if err := validateEmitValue(key, value); err != nil {
+	for _, item := range values {
+		if err := validateEmitValue(item.key, item.value); err != nil {
 			return err
 		}
 	}
