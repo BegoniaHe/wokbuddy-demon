@@ -240,6 +240,62 @@ WB2API_CAPTURE_DIR=./data/capture ./wokbuddy-demon
 - 样本只含**请求形状**（模型、是否流式、声明工具数）、**脱敏后的响应尾部**（≤400 字）与**判定结果**；`Authorization` / token / Cookie / `uid=` 一律替换为 `[REDACTED]`。
 - 目录不可写只告警一次并降级，不影响请求。样本属于本机诊断材料，不要提交进仓库（`data/` 已 gitignore）。
 
+## 🔧 环境变量（`WB2A_*`）
+
+除 `config.json` 外，进程还认一组 `WB2A_*` 环境变量。它们在**加载配置时覆盖同名配置项**，优先级高于文件——面板保存配置触发的重载也会再叠一次，所以「环境变量设了值，面板里改同名项却没生效」是这个机制在起作用，不是面板的 bug。
+
+解析口径：
+
+- 整型 / 布尔变量解析失败按**未设置**处理，既不报错也不回落到 `0` / `true`；字符串变量空串即未设置。
+- 环境变量只在进程启动时读入。运行中改不了，设了就得以环境变量为准——想交回配置文件，把变量去掉后重启。
+- `cmd/credit` 这类配套 CLI 同样认 `WB2A_AUTH_DIR`，口径与主程序一致。
+
+**监听与鉴权**
+
+| 环境变量 | 覆盖配置项 | 默认 / 说明 |
+|---|---|---|
+| `WB2A_LISTEN` | `listen` | `:7863`；默认只监听本机，公网部署请置于 HTTPS 反代之后 |
+| `WB2A_API_KEY` | `api_key` | **空 = 不鉴权直接放行**，公网部署必设 |
+| `WB2A_AUTH_DIR` | `auth_dir` | `./auths`；凭证目录，含明文 refreshToken |
+| `WB2A_STATE_FILE` | `state_file` | `./data/state.json` |
+| `WB2A_SOFT_RATE` | `cooldown.soft_rate` | `600s`；软冷却退避基数 |
+| `WB2A_SOFT_RATE_MAX` | `cooldown.soft_rate_max` | `2h`；软冷却退避上限 |
+
+**出站超时与身份**
+
+| 环境变量 | 覆盖配置项 | 默认 / 说明 |
+|---|---|---|
+| `WB2A_TIMEOUT_SECONDS` | `upstream.timeout_seconds` | `120`；短 RPC 总时长 |
+| `WB2A_HEADER_TIMEOUT_SECONDS` | `upstream.header_timeout_seconds` | `120`；首字节前等待 |
+| `WB2A_IDLE_TIMEOUT_SECONDS` | `upstream.idle_timeout_seconds` | `300`；流中空闲 |
+| `WB2A_USER_AGENT` | `upstream.user_agent` | 空 = 用内置快照值 |
+| `WB2A_CLIENT_VERSION` | `upstream.client_version` | 空 = 用内置快照值 |
+| `WB2A_CLI_VERSION` | `upstream.cli_version` | 空 = 用内置快照值 |
+| `WB2A_CLIENT_NAME` | `upstream.client_name` | 空 = 用内置快照值 |
+| `WB2A_DEVICE_TOKEN` | `upstream.device_token` | 空 = 不注入设备 token |
+| `WB2A_DEVICE_TOKEN_FILE` | `upstream.device_token_file` | 空 = 不读文件 |
+| `WB2A_PASSTHROUGH_IP` | `upstream.passthrough_ip` | `false`；开启前确认部署形态与信任边界 |
+
+**特性开关与提示词**
+
+| 环境变量 | 覆盖配置项 | 默认 / 说明 |
+|---|---|---|
+| `WB2A_SANITIZE_FINGERPRINTS` | `features.sanitize_blacklist_fingerprints` | `true`；出站脱敏，**不要关** |
+| `WB2A_MULTIMODAL_ROUTING` | `features.multimodal_routing` | `false`；多模态路由 |
+| `WB2A_PROMPT_MODE` | `prompt.mode` | `passthrough`；可选 `custom` / `append`，非法值启动报错 |
+| `WB2A_PROMPT_FILE` | `prompt.file` | 空 = 用内置提示词；仅 `custom` / `append` 模式读取，不可读即启动报错 |
+| `WB2A_EXPIRING_SOON` | `pool.expiring_soon` | `168h`；多久内算「即将过期」 |
+| `WB2A_PREFER_EXPIRING` | `pool.prefer_expiring` | `true`；优先选即将过期的账号 |
+| `WB2A_CROSS_DOMAIN_FALLBACK` | `pool.cross_domain_fallback` | `false`；跨域回落 |
+| `WB2A_DNS` | `dns_servers` | 逗号分隔，如 `1.1.1.1:53,8.8.8.8:53`；覆盖整个列表 |
+
+**诊断**
+
+| 环境变量 | 说明 |
+|---|---|
+| `WB2A_DEBUG_CHAT` | 非空即为 desktop chat 出站打印 `[dbg]` 行：URL 走 `Redacted()`，`Authorization` / Cookie / `x-device-token` 等敏感头整段隐藏，其余头截断 200 字节。**只用于排障**——不在敏感清单里的自定义头不做通用脱敏，别在共享终端里长期开启。 |
+| `WB2API_CAPTURE_DIR` | 异常形态取证采样，默认关闭；细节见上一节「取证采样」。 |
+
 ## 🐾 适合谁
 
 - 手上有多个 CodeBuddy 账号，但不想每天挨个打卡；
