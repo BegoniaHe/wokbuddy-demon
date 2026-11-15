@@ -161,3 +161,9 @@ func (l *Limiter) Reset(ip string) {
 	delete(l.byIP, ip)
 	l.mu.Unlock()
 }
+
+// RetryAfterSeconds 把建议等待时长换算成 Retry-After 头的整数秒：向上取整，
+// 下限 1 秒——0 或负数会写成 0，客户端会立即重试，等于没有限流。
+func RetryAfterSeconds(d time.Duration) int {
+	return max(int((d+time.Second-1)/time.Second), 1)
+}

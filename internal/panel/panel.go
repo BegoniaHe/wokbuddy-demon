@@ -498,8 +498,7 @@ func methodProbe(r *http.Request) *http.Request {
 func (p *Panel) allowScope(w http.ResponseWriter, r *http.Request, requireAdmin bool) bool {
 	ip := httpauth.ClientIP(r, p.cfg.TrustedProxies)
 	if ok, retry := p.authLimiter.Allow(ip); !ok {
-		seconds := max(int((retry+time.Second-1)/time.Second), 1)
-		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		w.Header().Set("Retry-After", strconv.Itoa(httpauth.RetryAfterSeconds(retry)))
 		writeErr(w, http.StatusTooManyRequests, "too_many_auth_failures")
 
 		return false
