@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -182,5 +183,53 @@ func TestCheckinKeepsV2First(t *testing.T) {
 
 	if !slices.Equal(statusPaths, []string{"/v2/billing/meter/checkin-activity-status"}) {
 		t.Errorf("checkin-activity-status paths=%v want 单条 /v2 路径", statusPaths)
+	}
+}
+
+// TestResourceSummaryPaidUserTriState summary 的 IsPaidUser 三态透出（issue #529）：
+// true / false 落成付费 / 免费，字段缺失保持未知，不得回落成免费。
+func TestResourceSummaryPaidUserTriState(t *testing.T) {
+	t.Parallel()
+
+	packages := `"Packages":[{"CycleRemainCapacity":900,"CycleTotalCapacity":1000}]`
+
+	cases := []struct {
+		name string
+		body string
+		want *bool
+	}{
+		{"paid", `{"code":0,"data":{` + packages + `,"IsPaidUser":true}}`, new(true)},
+		{"free", `{"code":0,"data":{` + packages + `,"IsPaidUser":false}}`, new(false)},
+		{"missing", `{"code":0,"data":{` + packages + `}}`, nil},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := testClient(func(r *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(r.URL.Path, "/billing/meter/get-user-resource-summary") {
+					return jsonResp(http.StatusOK, testCase.body), nil
+				}
+
+				return jsonResp(http.StatusOK, `{"code":0,"data":{"Accounts":[],"TotalCount":0}}`), nil
+			})
+
+			snap, err := client.UserResourceSnapshot(
+				context.Background(), &auth.Auth{AccessToken: "at", UID: "u1"}, time.Hour,
+			)
+			if err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
+
+			switch {
+			case testCase.want == nil && snap.PaidUser != nil:
+				t.Errorf("缺失 IsPaidUser 应保持未知, got %v", *snap.PaidUser)
+			case testCase.want != nil && snap.PaidUser == nil:
+				t.Errorf("PaidUser=nil want %v", *testCase.want)
+			case testCase.want != nil && *snap.PaidUser != *testCase.want:
+				t.Errorf("PaidUser=%v want %v", *snap.PaidUser, *testCase.want)
+			}
+		})
 	}
 }

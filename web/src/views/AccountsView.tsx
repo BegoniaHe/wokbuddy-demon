@@ -599,6 +599,32 @@ function CompensationBox({
   );
 }
 
+// paidBadge 付费状态三态徽标（issue #529）：true 付费 / false 免费 / null 未知。
+// 未知不等于免费——上游 summary 未下发 IsPaidUser 时不得按免费展示。
+function paidBadge(s: Account) {
+  const cls =
+    'flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground';
+  if (s.paid_user === true) {
+    return (
+      <span className={cls} title="上游 billing summary：付费账号">
+        付费
+      </span>
+    );
+  }
+  if (s.paid_user === false) {
+    return (
+      <span className={cls} title="上游 billing summary：免费账号">
+        免费
+      </span>
+    );
+  }
+  return (
+    <span className={cls} title="上游 billing summary 未下发 IsPaidUser（企业口径或尚未刷新）">
+      付费未知
+    </span>
+  );
+}
+
 function AccountRow({
   s,
   maxCred,
@@ -816,6 +842,7 @@ function AccountRow({
           </span>
           {s.realm === 'global' ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">国际版</span> : null}
           {s.enterprise ? <span className="flex-none rounded-md border border-border bg-secondary px-1.5 py-px text-2xs text-muted-foreground">企业版</span> : null}
+          {paidBadge(s)}
           {dailyLimited ? <Tag tone="warn" title="已达每日限额，本地 0 点恢复；积分日限仅对收费模型生效，免费模型仍可服务">日限</Tag> : null}
           {proxySlots.length ? (
             <select

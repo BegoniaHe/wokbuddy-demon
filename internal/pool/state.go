@@ -667,11 +667,34 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		InFlight:                 int(entry2.inFlight.Load()),
 		BreakerFails:             entry2.fails,
 		BreakerUntil:             entry2.breakerUntil,
+		PaidObserved:             entry2.paidObserved,
 	}
-	// Reason 只在「冷却中 / 已禁用」时透出：until/coolKind/reason 按设计不主动清理
-	// （NoteSuccess 注释：「不碰 until/coolKind，那些是即时冷却，各自到期」），无条件
-	// 透出会让面板把过期数天的「429 rate limit」与「可用」并排展示，运维无法判断
-	// 是历史残留还是当前限流。禁用原因另由 DisabledReason 透出（零回归）。
+
+	fillPaidStatus(&status, entry2)
+	fillStatusReason(&status, entry2)
+
+	if status.Cooling {
+		fillCoolingStatus(&status, entry2, now)
+	}
+
+	return status
+}
+
+// fillPaidStatus 复制付费状态指针，避免调用方改动 Status 反写池内观测（issue #529）。
+func fillPaidStatus(status *Status, entry2 *entry) {
+	if entry2.paidUser == nil {
+		return
+	}
+
+	paid := *entry2.paidUser
+	status.PaidUser = &paid
+}
+
+// fillStatusReason 按「冷却中 / 已禁用」决定是否透出 reason 与禁用原因：
+// until/coolKind/reason 按设计不主动清理（NoteSuccess 注释：「不碰 until/coolKind，
+// 那些是即时冷却，各自到期」），无条件透出会让面板把过期数天的「429 rate limit」
+// 与「可用」并排展示，运维无法判断是历史残留还是当前限流。
+func fillStatusReason(status *Status, entry2 *entry) {
 	if status.Cooling || status.Disabled {
 		status.Reason = entry2.reason
 	}
@@ -680,12 +703,6 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		status.DisabledReason = entry2.reason
 	}
-
-	if status.Cooling {
-		fillCoolingStatus(&status, entry2, now)
-	}
-
-	return status
 }
 
 // fillCoolingStatus 填充冷却剩余秒数（向上取整，避免 0 显示为已到期）与冷却类型。

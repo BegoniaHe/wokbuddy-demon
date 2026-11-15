@@ -235,6 +235,8 @@ func buildEntryFromState(uid string, stateAccount2 *stateAccount, now time.Time)
 		softStreak:               stateAccount2.SoftStreak,
 		sessionDeadFails:         stateAccount2.SessionDeadFails,
 		consecutiveFails:         stateAccount2.ConsecutiveFails,
+		paidUser:                 stateAccount2.PaidUser,
+		paidObserved:             stateAccount2.PaidObserved,
 	}
 	// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 	clampRestoredCredits(entry2, now)
@@ -459,6 +461,8 @@ func buildStateAccount(entry5 *entry, now time.Time) stateAccount {
 		CreditsEarliestExpiry:    entry5.creditsEarliestExpiry,
 		CreditsEarliestRemaining: entry5.creditsEarliestRemaining,
 		CreditsExpiryBuckets:     entry5.creditsExpiryBuckets,
+		PaidUser:                 entry5.paidUser,
+		PaidObserved:             entry5.paidObserved,
 	}
 	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 	if !entry5.breakerUntil.IsZero() && now.Before(entry5.breakerUntil) {
