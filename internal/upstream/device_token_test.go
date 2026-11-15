@@ -15,11 +15,12 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
 
-// TestDeviceTokenInjectedOnChatAndCheckin 真机 2026-10-28 抓包：X-Device-Token 出现在
-// chat（/v2/chat/completions）与签到（daily-checkin / checkin-activity-status）；
-// report / billing meter / busy / v3-config / refresh / growth / agenttool 都不带
-// （#342 的「只在 auth/state 与签到」对 chat 不成立，见 #376）。
-func TestDeviceTokenInjectedOnChatAndCheckin(t *testing.T) {
+// TestDeviceTokenOnCNMainProcessSurfaces CN 5.11.3 起主进程出站头提供者
+// （main/device-token.js）以产品 endpoint 为 origin 注册，凡经 RestOperations 的
+// 请求统一注入 X-Device-Token（#552）：chat / 签到 / report / billing meter /
+// v3-config / refresh 都带。growth 是 Node 裸 fetch、busy 是渲染层 wb.http.post、
+// agenttool 四路是 CLI 面，都不在主进程覆盖范围，仍然不带。
+func TestDeviceTokenOnCNMainProcessSurfaces(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth"}
@@ -83,11 +84,11 @@ func TestDeviceTokenInjectedOnChatAndCheckin(t *testing.T) {
 		"/v2/billing/meter/daily-checkin":           "tok-from-auth",
 		"/v2/billing/meter/checkin-activity-status": "tok-from-auth",
 		"/v2/chat/completions":                      "tok-from-auth",
-		"/v2/report":                                "",
-		"/billing/meter/get-user-resource":          "",
+		"/v2/report":                                "tok-from-auth",
+		"/billing/meter/get-user-resource":          "tok-from-auth",
+		"/v3/config":                                "tok-from-auth",
+		"/v2/plugin/auth/token/refresh":             "tok-from-auth",
 		"/v2/chat/busy":                             "",
-		"/v3/config":                                "",
-		"/v2/plugin/auth/token/refresh":             "",
 		"/v2/activity/growth/buddy/info":            "",
 		"/agenttool/v1/search":                      "",
 	}
@@ -98,6 +99,65 @@ func TestDeviceTokenInjectedOnChatAndCheckin(t *testing.T) {
 		} else if got != wantTok {
 			t.Errorf("%s: X-Device-Token = %q want %q", path, got, wantTok)
 		}
+	}
+}
+
+// TestDeviceTokenOmittedOnGlobalMainProcessSurfaces global 5.9.4 没有主进程出站头
+// 提供者，仍是 5.9.3 的两条显式形态：chat 与签到带该头，其余主进程面不带（#552）。
+func TestDeviceTokenOmittedOnGlobalMainProcessSurfaces(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{
+		AccessToken: "at", UID: "u1", DeviceToken: "tok-from-auth", Domain: "www.workbuddy.ai",
+	}
+
+	client := &Client{}
+	client.Profile = testProfileSet(t)
+
+	surfaces := []struct {
+		name string
+		call func(req *http.Request)
+	}{
+		{"report", func(req *http.Request) { client.ReportHeaders(req, account) }},
+		{"billing", func(req *http.Request) { client.BillingHeaders(req, account) }},
+		{"v3config", func(req *http.Request) { client.V3ConfigHeaders(req, account, "") }},
+		{"refresh", func(req *http.Request) { client.RefreshHeaders(req, account) }},
+		{"logout", func(req *http.Request) { client.LogoutHeaders(req, account) }},
+	}
+
+	for _, testCase := range surfaces {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.ai/v2/report", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			testCase.call(req)
+
+			if got := req.Header.Get("X-Device-Token"); got != "" {
+				t.Errorf("%s X-Device-Token=%q want empty（global 无出站头提供者）", testCase.name, got)
+			}
+		})
+	}
+}
+
+// TestCheckinHeadersGlobalOnly 签到面的显式注入只服务 global：CN 侧已由
+// surfaceBilling 的主进程提供者统一注入，两条路径并存会重复 Set 同一个头。
+func TestCheckinHeadersGlobalOnly(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{}
+
+	cn := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-cn"}
+	if got := client.checkinHeaders(cn); got != nil {
+		t.Errorf("CN checkinHeaders=%v want nil（CN 由主进程面统一注入）", got)
+	}
+
+	global := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-global", Domain: "www.workbuddy.ai"}
+	if got := client.checkinHeaders(global); got["X-Device-Token"] != "tok-global" {
+		t.Errorf("global checkinHeaders=%v want X-Device-Token=tok-global", got)
 	}
 }
 

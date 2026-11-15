@@ -142,7 +142,7 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 			keys: []string{
 				"Accept", "Authorization", "B3", "Content-Type", "Traceparent", "User-Agent",
 				"X-Auth-Refresh-Source", "X-B3-Parentspanid", "X-B3-Sampled", "X-B3-Spanid",
-				"X-B3-Traceid", "X-Domain", "X-No-Enterprise-Id", "X-Product",
+				"X-B3-Traceid", "X-Device-Token", "X-Domain", "X-No-Enterprise-Id", "X-Product",
 				"X-Refresh-Token", "X-Request-Id", "X-Requested-With", "X-Trace-Id", "X-User-Id",
 			},
 		},
@@ -151,7 +151,7 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 			url:  "https://www.workbuddy.cn/v3/config",
 			call: func(req *http.Request) { client.V3ConfigHeaders(req, account, "") },
 			keys: []string{
-				"Accept", "Authorization", "User-Agent", "X-Domain",
+				"Accept", "Authorization", "User-Agent", "X-Device-Token", "X-Domain",
 				"X-No-Enterprise-Id", "X-Product", "X-Request-Id", "X-Requested-With",
 				"X-User-Id",
 			},
@@ -161,7 +161,7 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 			url:  "https://www.workbuddy.cn/billing/meter/get-user-resource-summary",
 			call: func(req *http.Request) { client.BillingHeaders(req, account) },
 			keys: []string{
-				"Accept", "Authorization", "Content-Type", "User-Agent", "X-Domain",
+				"Accept", "Authorization", "Content-Type", "User-Agent", "X-Device-Token", "X-Domain",
 				"X-Request-Id", "X-User-Id",
 			},
 		},
@@ -788,7 +788,7 @@ func TestReportHeadersGoldenSet(t *testing.T) {
 	client.ReportHeaders(req, account)
 
 	assertHeaderKeys(t, req,
-		"Accept", "Authorization", "Content-Type", "User-Agent", "X-Domain",
+		"Accept", "Authorization", "Content-Type", "User-Agent", "X-Device-Token", "X-Domain",
 		"X-Product", "X-Request-Id", "X-User-Id",
 	)
 
