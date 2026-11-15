@@ -102,16 +102,22 @@ func (c *Client) profileVersion(account *auth.Auth, pick func(*clientprofile.Pro
 	return ""
 }
 
-// chatBrandFor 返回官方 CLI chat UA 的品牌段（`cli/product.json` 的
+// applicationNameFor 返回官方客户端的产品名（`cli/product.json` 的
 // `applicationName`）：global → `workbuddy-ai`，其余 → `WorkBuddy`。
+// chat UA 的品牌段与主进程 `X-Client-Product` 共用同一来源（#551）。
 // 只放品牌字面量，不放版本号；版本仍取 profile / 显式覆盖。
-func chatBrandFor(account *auth.Auth) string {
+func applicationNameFor(account *auth.Auth) string {
 	if account != nil && account.IsGlobal() {
 		return "workbuddy-ai"
 	}
 
 	return "WorkBuddy"
 }
+
+// clientPlatformWindows 主进程 X-Client-Platform 的取值：官方
+// `toWorkbuddyClientPlatform(process.platform)` 把平台归一成
+// macos / windows / linux，本仓基线只认 Win32 分发包，故恒为 windows。
+const clientPlatformWindows = "windows"
 
 // defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方 CLI chat 拦截器形状：
 // `WorkBuddy/<ver> <brand>/<ver> CLI/<cliVer>`，品牌段来自 `cli/product.json` 的
@@ -134,7 +140,7 @@ func (c *Client) defaultWorkBuddyUAFor(account *auth.Auth) string {
 
 	v := c.clientVersionFor(account)
 
-	return "WorkBuddy/" + v + " " + chatBrandFor(account) + "/" + v + " CLI/" + c.cliVersionFor(account)
+	return "WorkBuddy/" + v + " " + applicationNameFor(account) + "/" + v + " CLI/" + c.cliVersionFor(account)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
@@ -232,10 +238,17 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 // 优先级：auth.Auth.DeviceToken（每号）> Client.DeviceToken（config 全局）> 文件兜底。
 // 三者皆空/读失败则返回空串（调用方不注入该头，优雅降级）。
 //
-// 消费面（真机 2026-10-28 抓包）：chat（/v2/chat/completions，主请求与辅助请求都带）、
-// 签到（checkin-activity-status）、/v2/plugin/auth/state（面板登录面，不经本包）。
-// 其余面（summary / packages / report / busy / v3-config / refresh / growth）不带。
-// #342 的「官方只在 auth/state 与签到消费」对 chat 不成立（#376）。
+// 消费面按官方基线分两代：
+//   - CN 5.11.3 / global 5.9.4 起，主进程出站头提供者（main/device-token.js）在一方域
+//     上统一注入，凡经 RestOperations 发出的业务请求都带（billing / report / refresh /
+//     v3-config / logout / 模型目录 / 桌面 chat），见 surface.mainProcess 与
+//     injectMainProcessProviderHeaders（#552）；
+//   - 更早的 5.9.3 真机抓包只有 chat（主请求与辅助请求）与签到两条显式注入点，
+//     global 侧至今仍是这个形态。
+//
+// growth 是 Node 裸 fetch、busy 是渲染层 wb.http.post，都不经主进程拦截器，恒不带。
+// /v2/plugin/auth/state 是面板登录面，不经本包。#342 的「只在 auth/state 与签到消费」
+// 对 chat 不成立（#376）。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	if a != nil && a.DeviceToken != "" {
 		return a.DeviceToken
@@ -261,10 +274,67 @@ func (c *Client) deviceToken(account *auth.Auth) string {
 	return c.resolveDeviceToken(account)
 }
 
-// checkinHeaders 签到面请求头：X-Device-Token（取值为空时不注入）。
-// 签到是除 chat 之外的另一个消费面（见 resolveDeviceToken）：summary / packages /
-// report / busy / v3-config / refresh / growth 与 agenttool 四路都不带（真机口径）。
+// mainProcess 该轻头族面是否由官方**主进程** RestOperations 发出。
+//
+// CN 5.11.3 把设备 token 与客户端身份提升为「主进程出站头提供者」：以产品
+// endpoint 为 origin 注册后，凡经 RestOperations 拦截器的请求统一注入。因此这些
+// 面在 CN 5.11.3 上要带 X-Device-Token（#552）与 X-Client-*（#551）。
+//
+// growth 是主进程里的 Node 裸 fetch（`e.fetch(...)` 不经 RestOperations），
+// busy 是渲染层 `wb.http.post`，两者都不在主进程头覆盖范围——这是取舍不是遗漏。
+func (s surface) mainProcess() bool {
+	switch s {
+	case surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceLogout:
+		return true
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
+		surfaceModelBusy, surfaceGrowth:
+		return false
+	}
+
+	return false
+}
+
+// injectMainProcessProviderHeaders 注入官方**主进程出站头提供者**给出的头族。
+//
+// CN 5.11.3 起以产品 endpoint 为 origin 注册的出站头提供者替主进程统一注入这些头；
+// global 5.9.4 没有该提供者，保持各面原有的显式形态。调用点只该是主进程面
+// （surface.mainProcess、桌面 report / chat、CN 模型目录）。
+//
+// 覆盖两族：X-Device-Token（#552）与 X-Client-Version/Platform/Product（#551）。
+func (c *Client) injectMainProcessProviderHeaders(req *http.Request, account *auth.Auth) {
+	if account != nil && account.IsGlobal() {
+		return
+	}
+
+	// X-Device-Token：取不到值时不发，不自造 `X-Device-Token-Error`——网关没有
+	// Turing SDK 同源错误串，伪造取值等于自造指纹（见 UPSTREAM.md §六）。
+	if token := c.deviceToken(account); token != "" {
+		req.Header.Set("X-Device-Token", token)
+	}
+
+	// 客户端身份三头（#551，main/client-identity.js 的 buildClientIdentityHeaders）：
+	// 版本 = electron.app.getVersion()（桌面构建版本，取 profile 冻结值）；
+	// 平台 = Win32 归一值；产品 = cli/product.json 的 applicationName。
+	// 版本取不到就整条不发：空值头是比缺失更明显的非官方指纹。
+	if version := c.profileVersion(
+		account, func(p *clientprofile.Profile) string { return p.Emit.DesktopIdeVersion },
+	); version != "" {
+		req.Header.Set("X-Client-Version", version)
+	}
+
+	req.Header.Set("X-Client-Platform", clientPlatformWindows)
+	req.Header.Set("X-Client-Product", applicationNameFor(account))
+}
+
+// checkinHeaders 签到面显式注入的请求头：X-Device-Token（取值为空时不注入）。
+//
+// 签到走 surfaceBilling，CN 侧已由 mainProcess 统一注入覆盖；这里只服务 global
+// 5.9.x 的显式注入点（official authority-snapshot 的 buildHeadersWithTuringToken）。
 func (c *Client) checkinHeaders(a *auth.Auth) map[string]string {
+	if a == nil || !a.IsGlobal() {
+		return nil
+	}
+
 	if tok := c.resolveDeviceToken(a); tok != "" {
 		return map[string]string{"X-Device-Token": tok}
 	}
@@ -293,6 +363,13 @@ func (c *Client) applyHeaders(
 	}
 
 	c.lightHeaders(srf, req, account)
+
+	// 主进程面额外注入出站头提供者的头族（CN 5.11.3 起 X-Device-Token 覆盖全部
+	// RestOperations 面，#552）。growth / busy 不在 mainProcess 范围内，签到走
+	// surfaceBilling 一并覆盖。
+	if srf.mainProcess() {
+		c.injectMainProcessProviderHeaders(req, account)
+	}
 }
 
 // chatFamilyHeaders chat 与 agenttool 四路的头族：CommonHeaders 基础 +

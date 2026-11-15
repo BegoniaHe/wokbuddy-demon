@@ -1386,13 +1386,13 @@ type Client struct {
 	PassthroughIP bool
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：
-	// config upstream.device_token。消费面是 chat 与签到（真机口径，见
-	// resolveDeviceToken）；其余面不注入。
+	// config upstream.device_token。CN 5.11.3 起主进程出站头提供者把该头覆盖到
+	// 全部主进程业务面，global 与 chat/签到仍按显式注入面（见 resolveDeviceToken）。
 	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
 	DeviceToken string
 
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
-	// 与 DeviceToken 同口径：只用于 chat 与签到。
+	// 与 DeviceToken 同口径（见 resolveDeviceToken 的消费面说明）。
 	DeviceTokenFile string
 
 	// BalanceObserver 余额观测回调（可选）：每次成功查询余额后回调 (uid, remain, total)，
@@ -3285,6 +3285,8 @@ func (c *Client) fetchEnterpriseModelsPath(
 	c.CommonHeaders(req, account7) // 复用共享请求头（UA/Accept/Content-Type）
 	injectEnterpriseIDHeaders(req, account7)
 	injectChatDomain(req, account7)
+	// 模型目录是主进程面：CN 5.11.3 起随出站头提供者带 X-Device-Token（#552）。
+	c.injectMainProcessProviderHeaders(req, account7)
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+account7.AccessTokenValue())
 
