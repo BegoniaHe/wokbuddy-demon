@@ -679,6 +679,11 @@ func (s *chatStatsReader) FailedFinish() bool {
 func (s *chatStatsReader) FinishReason() string { return s.finishReason }
 
 // applyUsage 把末帧 usage 的非空字段写入统计（缺失字段不动，保留上一帧值）。
+//
+// 覆盖语义是刻意的：续写是第二次独立上游调用，但它的 usage 帧在写出前已被续写层
+// 按「prompt 取末段、completion/credit 累加」并入首段用量
+// （upstream.TextContinueReader.rewriteContinuationFrame，issue #247 / #432）。
+// 这里再累加会重复计数；跨段合计由续写层负责，统计侧只认末帧（issue #539）。
 func (s *chatStatsReader) applyUsage(sseUsageFrame2 *sseUsageFrame) {
 	if sseUsageFrame2.PromptTokens != nil {
 		s.hasPromptTokens = true
