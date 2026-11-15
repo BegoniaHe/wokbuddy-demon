@@ -3,7 +3,6 @@
 package pool
 
 import (
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"log"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -64,7 +64,7 @@ func (p *Pool) RestoreFromSnapshot() {
 	}
 
 	var snap snapshot
-	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
+	if jsonx.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
 		// 快照无 savedAt：无法比较新旧，本地优先。
 		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
@@ -196,7 +196,7 @@ func (p *Pool) load() {
 	}
 
 	var stateSnapshot stateFile
-	if err := json.Unmarshal(raw, &stateSnapshot); err != nil {
+	if err := jsonx.Unmarshal(raw, &stateSnapshot); err != nil {
 		log.Printf("WARN: pool: state.json 解析失败（%v），跳过本地状态恢复: %s", err, p.stateFp)
 		return
 	}
@@ -406,7 +406,7 @@ func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 		return
 	}
 
-	raw, err := json.MarshalIndent(stateFile2, "", "  ")
+	raw, err := jsonx.MarshalIndent(stateFile2)
 	if err != nil {
 		p.notePersistFail(err)
 		return
@@ -430,7 +430,7 @@ func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 	}
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
 	if p.store != nil {
-		snapRaw, err := json.Marshal(snapshot{stateFile: stateFile2, SavedAt: p.now()})
+		snapRaw, err := jsonx.Marshal(snapshot{stateFile: stateFile2, SavedAt: p.now()})
 		if err == nil {
 			p.store.SaveState(snapRaw)
 		}
@@ -503,7 +503,7 @@ func buildStateAccount(entry5 *entry, now time.Time) stateAccount {
 		PaidUser:                 entry5.paidUser,
 		PaidObserved:             entry5.paidObserved,
 	}
-	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
+	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitzero 真省略）。
 	if !entry5.breakerUntil.IsZero() && now.Before(entry5.breakerUntil) {
 		u := entry5.breakerUntil
 		stateAccount2.BreakerUntil = &u

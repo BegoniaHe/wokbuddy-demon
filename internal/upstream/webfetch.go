@@ -8,7 +8,7 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 const (
@@ -42,11 +43,11 @@ var (
 // WebFetchRequest 一次服务端抓取的可选参数。URL 必填；其余空值按官方默认。
 type WebFetchRequest struct {
 	URL       string `json:"url"`
-	Format    string `json:"format,omitempty"`
-	Prompt    string `json:"prompt,omitempty"`
-	Timeout   int    `json:"timeout,omitempty"` // 秒
-	MaxLength int    `json:"max_length,omitempty"`
-	ModelName string `json:"model_name,omitempty"`
+	Format    string `json:"format,omitempty,omitzero"`
+	Prompt    string `json:"prompt,omitempty,omitzero"`
+	Timeout   int    `json:"timeout,omitempty,omitzero"` // 秒
+	MaxLength int    `json:"max_length,omitempty,omitzero"`
+	ModelName string `json:"model_name,omitempty,omitzero"`
 }
 
 // WebFetchOutcome 抓取结果（只保留客户端需要的字段）。
@@ -63,7 +64,7 @@ type webFetchRequestBody struct {
 	Prompt    string `json:"prompt"`
 	Timeout   int    `json:"timeout"`
 	MaxLength int    `json:"max_length"`
-	ModelName string `json:"model_name,omitempty"`
+	ModelName string `json:"model_name,omitempty,omitzero"`
 }
 
 // WebFetch 对指定账号执行一次官方服务端抓取。只做单次上游调用。
@@ -137,7 +138,7 @@ func normalizeWebFetchRequest(req *WebFetchRequest) ([]byte, int, error) {
 		maxLength = webFetchMaxLengthCap
 	}
 
-	body, err := json.Marshal(webFetchRequestBody{
+	body, err := jsonx.Marshal(webFetchRequestBody{
 		URL: url, Format: format, Prompt: strings.TrimSpace(req.Prompt),
 		Timeout: timeout, MaxLength: maxLength, ModelName: strings.TrimSpace(req.ModelName),
 	})
@@ -158,13 +159,13 @@ func parseWebFetchResponse(status int, raw []byte, fallbackURL string) (*WebFetc
 	}
 
 	var parsed struct {
-		Code        int             `json:"code"`
-		Msg         string          `json:"msg"`
-		URL         string          `json:"url"`
-		ContentType string          `json:"content_type"`
-		Content     json.RawMessage `json:"content"`
+		Code        int            `json:"code"`
+		Msg         string         `json:"msg"`
+		URL         string         `json:"url"`
+		ContentType string         `json:"content_type"`
+		Content     jsontext.Value `json:"content"`
 	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := jsonx.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrWebFetchBadResponse, err)
 	}
 
@@ -186,7 +187,7 @@ func parseWebFetchResponse(status int, raw []byte, fallbackURL string) (*WebFetc
 	}
 
 	var content string
-	if err := json.Unmarshal(parsed.Content, &content); err != nil || strings.TrimSpace(content) == "" {
+	if err := jsonx.Unmarshal(parsed.Content, &content); err != nil || strings.TrimSpace(content) == "" {
 		return nil, ErrWebFetchEmptyContent
 	}
 

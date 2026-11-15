@@ -19,7 +19,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -28,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // ModelsDevURL models.dev 官方聚合 JSON 端点（唯一端点，见文件头逆向结论）。
@@ -350,7 +351,7 @@ func parseModelsDevDoc(raw []byte) (map[string]modelsDevEntry, error) {
 			} `json:"limit"`
 		} `json:"models"`
 	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("models.dev doc: %w", err)
 	}
 
@@ -486,7 +487,7 @@ func parseModelsDevModalities(raw []byte) (map[string][]string, error) {
 			} `json:"modalities"`
 		} `json:"models"`
 	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("models.dev doc: %w", err)
 	}
 

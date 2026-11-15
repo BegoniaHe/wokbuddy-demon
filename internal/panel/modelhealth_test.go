@@ -3,7 +3,6 @@ package panel
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -96,7 +96,7 @@ func decodeProbeResp(t *testing.T, rec *httptest.ResponseRecorder) (bool, string
 		Key    string            `json:"key"`
 		Sample *modelProbeSample `json:"sample"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -114,7 +114,7 @@ func decodeHealth(t *testing.T, rec *httptest.ResponseRecorder) map[string]model
 	var resp struct {
 		Models map[string]modelProbeHealth `json:"models"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 

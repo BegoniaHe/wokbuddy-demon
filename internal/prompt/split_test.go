@@ -1,9 +1,10 @@
 package prompt
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // longSystem 4 句（最少可拆形态）：拆成 2+2。
@@ -188,7 +189,7 @@ func decodeSplit(t *testing.T, out []byte) splitResult {
 	t.Helper()
 
 	var obj splitResult
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
 
@@ -214,7 +215,7 @@ func assertHalves(t *testing.T, messages []splitMessage) {
 func jsonString(t *testing.T, s string) string {
 	t.Helper()
 
-	raw, err := json.Marshal(s)
+	raw, err := jsonx.Marshal(s)
 	if err != nil {
 		t.Fatalf("marshal %q: %v", s, err)
 	}

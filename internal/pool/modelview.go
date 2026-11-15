@@ -38,10 +38,10 @@ type ModelLockRow struct {
 	// FullyUnlockAt 全部解锁时刻：最后一个被锁账号恢复的时刻。
 	FullyUnlockAt time.Time `json:"fully_unlock_at"`
 	// Reason 该模型被锁的原因（取最早解锁账号的上游原文）。
-	Reason string `json:"reason,omitempty"`
+	Reason string `json:"reason,omitempty,omitzero"`
 	// Scope 锁的范围（issue #29）：platform（>=2 个被锁账号共享同一非零上游重置
 	// 时刻，推断为平台级限流）/ account（账号级）。只读诊断。
-	Scope string `json:"scope,omitempty"`
+	Scope string `json:"scope,omitempty,omitzero"`
 }
 
 // ModelLockView 汇总当前所有「有未过期模型级限流」的 (域, 模型)，按不可用优先排序。

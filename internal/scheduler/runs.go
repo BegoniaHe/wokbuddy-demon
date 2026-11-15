@@ -41,7 +41,7 @@ const (
 // TaskRun 一轮批量任务的状态快照（当前轮或最近一轮）。
 type TaskRun struct {
 	Task       string    `json:"task"`
-	Trigger    string    `json:"trigger,omitempty"`
+	Trigger    string    `json:"trigger,omitempty,omitzero"`
 	Running    bool      `json:"running"`
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at,omitzero"`

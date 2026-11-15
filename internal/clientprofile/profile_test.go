@@ -1,12 +1,13 @@
 package clientprofile
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func validProfile(realm string) *Profile {
@@ -57,7 +58,7 @@ func validProfile(realm string) *Profile {
 func writeProfile(t *testing.T, dir, name string, profile *Profile) string {
 	t.Helper()
 
-	raw, err := json.Marshal(profile)
+	raw, err := jsonx.Marshal(profile)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -223,7 +224,7 @@ func TestValidateTrafficEvidenceByNote(t *testing.T) {
 func TestLoadFileRejectsUnknownField(t *testing.T) {
 	t.Parallel()
 
-	raw, err := json.Marshal(validProfile("cn"))
+	raw, err := jsonx.Marshal(validProfile("cn"))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -319,9 +320,9 @@ func validTLS() *TLS {
 		CipherSuites:        []uint16{4865, 4866, 4867},
 		Extensions:          []uint16{0, 23, 65281, 10, 11, 35, 13, 51, 45, 43, 21},
 		Groups:              []uint16{29, 23, 24},
-		PointFormats:        []uint8{0},
+		PointFormats:        byteList{0},
 		SignatureAlgorithms: []uint16{1027, 2052},
-		PSKModes:            []uint8{1},
+		PSKModes:            byteList{1},
 	}
 }
 

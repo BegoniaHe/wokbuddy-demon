@@ -10,7 +10,6 @@
 package server
 
 import (
-	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -47,7 +47,7 @@ type captureRecord struct {
 	Stream    bool           `json:"stream"`
 	TailChars int            `json:"tail_chars"`
 	Tail      string         `json:"tail"`
-	Detail    map[string]any `json:"detail,omitempty"`
+	Detail    map[string]any `json:"detail,omitempty,omitzero"`
 }
 
 // captureWarnOnce 目录/写盘失败只告警一次：取证是运维面，不能刷屏也不能阻断请求。
@@ -85,7 +85,7 @@ func captureSample(shape, model string, stream bool, tail string, detail map[str
 		Detail: detail,
 	}
 
-	raw, err := json.Marshal(record)
+	raw, err := jsonx.Marshal(record)
 	if err != nil {
 		captureWarn(err)
 

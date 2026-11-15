@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -22,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // ErrModified 当前文件与上次写入内容不一致（用户手改过），需显式 force。
@@ -59,7 +59,7 @@ type Status struct {
 	Detected  bool   `json:"detected"`
 	Applied   bool   `json:"applied"`
 	Modified  bool   `json:"modified"`
-	AppliedAt string `json:"applied_at,omitempty"`
+	AppliedAt string `json:"applied_at,omitempty,omitzero"`
 }
 
 // Manager 本机配置管理器。
@@ -484,7 +484,7 @@ func (m *Manager) readMeta(id string) (meta, error) {
 		return mt, fmt.Errorf("readMeta: %w", err)
 	}
 
-	err = json.Unmarshal(raw, &mt)
+	err = jsonx.Unmarshal(raw, &mt)
 	if err != nil {
 		return mt, fmt.Errorf("readMeta: %w", err)
 	}
@@ -493,7 +493,7 @@ func (m *Manager) readMeta(id string) (meta, error) {
 }
 
 func (m *Manager) writeMeta(id string, mt meta) error {
-	raw, err := json.MarshalIndent(mt, "", "  ")
+	raw, err := jsonx.MarshalIndent(mt)
 	if err != nil {
 		return fmt.Errorf("writeMeta: %w", err)
 	}
@@ -511,21 +511,19 @@ func (m *Manager) writeMeta(id string, mt meta) error {
 
 // loadConfigDoc 解析已有客户端配置；空内容按空对象处理。
 func loadConfigDoc(existing []byte, label string) (map[string]any, error) {
-	doc := map[string]any{}
+	if len(bytes.TrimSpace(existing)) == 0 {
+		return map[string]any{}, nil
+	}
 
-	if len(bytes.TrimSpace(existing)) > 0 {
-		// UseNumber：写回的是用户的客户端配置，数字字面量（8192.0 / 大整数）不能被
-		// float64 往返改写。
-		dec := json.NewDecoder(bytes.NewReader(existing))
-		dec.UseNumber()
+	// jsonx.DecodeObject：写回的是用户的客户端配置，数字字面量（8192.0 / 大整数）
+	// 不能被 float64 往返改写；尾随内容按非法配置处理。
+	doc, err := jsonx.DecodeObject(existing)
+	if err != nil {
+		return nil, fmt.Errorf("现有 %s 配置不是合法 JSON: %w", label, err)
+	}
 
-		if err := dec.Decode(&doc); err != nil {
-			return nil, fmt.Errorf("现有 %s 配置不是合法 JSON: %w", label, err)
-		}
-
-		if doc == nil {
-			doc = map[string]any{}
-		}
+	if doc == nil {
+		doc = map[string]any{}
 	}
 
 	return doc, nil
@@ -550,7 +548,7 @@ func applyClaude(existing []byte, opts Options) ([]byte, error) {
 	env["ANTHROPIC_MODEL"] = opts.Model
 	doc["env"] = env
 
-	raw, err := json.MarshalIndent(doc, "", "  ")
+	raw, err := jsonx.MarshalIndent(doc)
 	if err != nil {
 		return nil, fmt.Errorf("applyClaude: %w", err)
 	}
@@ -799,7 +797,7 @@ func applyOpenCode(existing []byte, opts Options) ([]byte, error) {
 	}
 	doc["provider"] = provider
 
-	raw, err := json.MarshalIndent(doc, "", "  ")
+	raw, err := jsonx.MarshalIndent(doc)
 	if err != nil {
 		return nil, fmt.Errorf("applyOpenCode: %w", err)
 	}

@@ -825,7 +825,7 @@ func (*Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimited
 				Reason:  modelCooldown2.Reason,
 				ResetAt: time.Time{},
 			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
+			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitzero），台账只显示真实恢复时刻。
 			if !modelCooldown2.ResetAt.IsZero() && !modelCooldown2.ResetAt.Equal(modelCooldown2.Until) {
 				row.ResetAt = modelCooldown2.ResetAt
 			}

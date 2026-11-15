@@ -61,13 +61,13 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 // PickTrace 一次选号的决策快照（issue #63）：字段有界，不含凭证/提示词。
 type PickTrace struct {
 	Candidates int             `json:"candidates"`
-	Excluded   map[string]int  `json:"excluded,omitempty"`
+	Excluded   map[string]int  `json:"excluded,omitempty,omitzero"`
 	CostTier   int             `json:"cost_tier"`
-	Explored   bool            `json:"explored,omitempty"`
-	Top        []PickCandidate `json:"top,omitempty"`
-	FinalUID   string          `json:"final_uid,omitempty"`
+	Explored   bool            `json:"explored,omitempty,omitzero"`
+	Top        []PickCandidate `json:"top,omitempty,omitzero"`
+	FinalUID   string          `json:"final_uid,omitempty,omitzero"`
 	// Strategy 生效的选号策略（weighted_random 时为空省略；有序策略便于排障）。
-	Strategy string `json:"strategy,omitempty"`
+	Strategy string `json:"strategy,omitempty,omitzero"`
 }
 
 // PickCandidate Top-N 候选的权重快照（uid8 + 权重 + 成本层）。

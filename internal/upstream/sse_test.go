@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var (
@@ -30,7 +30,7 @@ func TestPrepareBodyForcesStream(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"model":"glm-5.2","messages":[]}`), true)
 
 	var m map[string]any
-	json.Unmarshal(out, &m)
+	jsonx.Unmarshal(out, &m)
 
 	if m["stream"] != true {
 		t.Errorf("stream=%v", m["stream"])
@@ -43,7 +43,7 @@ func TestPrepareBodyToolChoiceFunctionObject(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"function","function":{"name":"get_weather"}},"tools":[{"type":"function"}]}`), true)
 
 	var m map[string]any
-	json.Unmarshal(out, &m)
+	jsonx.Unmarshal(out, &m)
 
 	if m["tool_choice"] != "get_weather" {
 		t.Errorf("tool_choice=%v", m["tool_choice"])
@@ -64,7 +64,7 @@ func TestPrepareBodyToolChoiceNone(t *testing.T) {
 		out := PrepareBodyOpt([]byte(str), true)
 
 		var m map[string]any
-		json.Unmarshal(out, &m)
+		jsonx.Unmarshal(out, &m)
 
 		if _, ok := m["tool_choice"]; ok {
 			t.Errorf("%s: tool_choice should be deleted", str)
@@ -86,7 +86,7 @@ func TestPrepareBodyToolChoiceAuto(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"auto"}}`), true)
 
 	var m map[string]any
-	json.Unmarshal(out, &m)
+	jsonx.Unmarshal(out, &m)
 
 	if m["tool_choice"] != "auto" {
 		t.Errorf("tool_choice=%v", m["tool_choice"])
@@ -140,7 +140,7 @@ func TestAggregate(t *testing.T) {
 		t.Errorf("finish_reason=%v", choices[0].(map[string]any)["finish_reason"])
 	}
 
-	// 聚合帧走 UseNumber 解码，usage 里是 json.Number；取值统一走 UsageNumber。
+	// 聚合帧保留原始字面量解码，usage 里是 jsontext.Value；取值统一走 UsageNumber。
 	usage := resp["usage"].(map[string]any)
 	if got, ok := UsageNumber(usage, "total_tokens"); !ok || got != 7 {
 		t.Errorf("usage=%v", usage)
@@ -774,7 +774,7 @@ func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount 
 
 		if strings.HasPrefix(str, "data: ") {
 			var obj map[string]any
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(str, "data: ")), &obj); err != nil {
+			if err := jsonx.Unmarshal([]byte(strings.TrimPrefix(str, "data: ")), &obj); err != nil {
 				t.Fatalf("bad frame %q: %v", str, err)
 			}
 
@@ -833,7 +833,7 @@ func TestNormalizeFrame(t *testing.T) {
 		t.Run(item.name, func(t *testing.T) {
 			t.Parallel()
 
-			raw, err := json.Marshal(normalizeFrame(item.in))
+			raw, err := jsonx.Marshal(normalizeFrame(item.in))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1137,7 +1137,7 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 			}
 
 			if u, ok := resp["usage"].(map[string]any); ok {
-				// 聚合帧走 UseNumber 解码，usage 里是 json.Number。
+				// 聚合帧保留原始字面量解码，usage 里是 jsontext.Value。
 				if got, ok := UsageNumber(u, "total_tokens"); !ok || got != item.wantUsage {
 					t.Errorf("usage=%v want %v", u["total_tokens"], item.wantUsage)
 				}
@@ -1210,7 +1210,7 @@ func findEmptyStreamError(body string) bool {
 		}
 
 		var e map[string]any
-		if json.Unmarshal([]byte(payload), &e) != nil {
+		if jsonx.Unmarshal([]byte(payload), &e) != nil {
 			continue
 		}
 
@@ -1477,7 +1477,7 @@ func upstreamSSEWithContent(chunks []string, finish string) string {
 	builder.WriteString(`data: {"id":"resp-1","object":"chat.completion.chunk","created":1,"model":"global:deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n")
 
 	for _, str := range chunks {
-		nums, _ := json.Marshal(map[string]any{
+		nums, _ := jsonx.Marshal(map[string]any{
 			"id": "resp-1", "object": "chat.completion.chunk", "created": 1,
 			"model": "global:deepseek-v4.1-flash",
 			"choices": []any{map[string]any{
@@ -1488,7 +1488,7 @@ func upstreamSSEWithContent(chunks []string, finish string) string {
 		builder.WriteString("data: " + string(nums) + "\n\n")
 	}
 
-	nums2, _ := json.Marshal(map[string]any{
+	nums2, _ := jsonx.Marshal(map[string]any{
 		"id": "resp-1", "object": "chat.completion.chunk", "created": 1,
 		"model": "global:deepseek-v4.1-flash",
 		"choices": []any{map[string]any{
@@ -1526,7 +1526,7 @@ func viewSSE(t *testing.T, body string) []sseFrameView {
 		}
 
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+		if err := jsonx.Unmarshal([]byte(payload), &obj); err != nil {
 			t.Fatalf("帧不是合法 JSON: %q (%v)", payload, err)
 		}
 
@@ -1616,7 +1616,7 @@ func TestStreamMarkupRepairIndexAfterRealToolCall(t *testing.T) {
 	var raw strings.Builder
 
 	writeFrame := func(payload map[string]any) {
-		encoded, err := json.Marshal(payload)
+		encoded, err := jsonx.Marshal(payload)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1726,7 +1726,7 @@ func assertMarkupRepairCall(t *testing.T, i int, testCase map[string]any, want s
 	argsJSON, _ := fn["arguments"].(string)
 
 	var args map[string]any
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+	if err := jsonx.Unmarshal([]byte(argsJSON), &args); err != nil {
 		t.Fatalf("第 %d 个 tool_call arguments 不是合法 JSON: %q", i, argsJSON)
 	}
 

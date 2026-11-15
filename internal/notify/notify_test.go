@@ -1,12 +1,13 @@
 package notify
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestNotifierSendsAndDeduplicates(t *testing.T) {
@@ -16,7 +17,7 @@ func TestNotifierSendsAndDeduplicates(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		if err := jsonx.UnmarshalRead(r.Body, &p); err != nil {
 			t.Errorf("decode: %v", err)
 		}
 
@@ -61,7 +62,7 @@ func TestNotifierEventFilter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
 
-		_ = json.NewDecoder(r.Body).Decode(&p)
+		_ = jsonx.UnmarshalRead(r.Body, &p)
 		got <- p
 	}))
 	defer srv.Close()

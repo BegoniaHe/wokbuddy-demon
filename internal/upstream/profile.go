@@ -12,13 +12,14 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var errFetchAccountProfileFailed = errors.New("FetchAccountProfile failed")
@@ -77,19 +78,19 @@ func parseAccountProfile(raw []byte) (string, string, error) {
 	}
 
 	var envelope struct {
-		Data json.RawMessage `json:"data"`
+		Data jsontext.Value `json:"data"`
 	}
 
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	if err := jsonx.Unmarshal(raw, &envelope); err != nil {
 		return "", "", fmt.Errorf("profile parse: %w", err)
 	}
 
 	trimmed := bytes.TrimSpace(envelope.Data)
 	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) {
-		if err := json.Unmarshal(trimmed, &profile); err != nil {
+		if err := jsonx.Unmarshal(trimmed, &profile); err != nil {
 			return "", "", fmt.Errorf("profile parse: %w", err)
 		}
-	} else if err := json.Unmarshal(raw, &profile); err != nil {
+	} else if err := jsonx.Unmarshal(raw, &profile); err != nil {
 		return "", "", fmt.Errorf("profile parse: %w", err)
 	}
 

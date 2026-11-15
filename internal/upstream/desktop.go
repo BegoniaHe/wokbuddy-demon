@@ -28,7 +28,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +42,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream/cpupool"
@@ -474,7 +474,7 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 
 	arr := desktopReportEvents(c.desktopFingerprint(account2), events, time.Now().UnixMilli())
 
-	raw, err := json.Marshal(arr)
+	raw, err := jsonx.Marshal(arr)
 	if err != nil {
 		return fmt.Errorf("ReportDesktopEvent: %w", err)
 	}
@@ -647,7 +647,7 @@ func desktopRequestResponse(
 func (c *Client) SetAppearanceTheme(account *auth.Auth, resourceKey string) error {
 	body := map[string]string{"kind": "theme", "resource_key": resourceKey}
 
-	raw, err := json.Marshal(body)
+	raw, err := jsonx.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("SetAppearanceTheme: %w", err)
 	}
@@ -728,7 +728,7 @@ func (c *Client) ReportWebEvent(account6 *auth.Auth, eventCode, pageURL, element
 		"userNickname": account6.NicknameValue(), "enterpriseId": account6.EnterpriseID,
 	}
 
-	raw, err := json.Marshal([]map[string]any{table})
+	raw, err := jsonx.Marshal([]map[string]any{table})
 	if err != nil {
 		return fmt.Errorf("ReportWebEvent: %w", err)
 	}
@@ -860,7 +860,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 		body["expert_type"] = expertType
 	}
 
-	raw, err := json.Marshal(body)
+	raw, err := jsonx.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("MarketExpertList: %w", err)
 	}
@@ -890,7 +890,7 @@ func (c *Client) MarketExpertList(account4 *auth.Auth, expertType string) ([]Mar
 		return nil, err
 	}
 
-	if err := json.Unmarshal(data, &out); err != nil {
+	if err := jsonx.Unmarshal(data, &out); err != nil {
 		return nil, fmt.Errorf("expert list parse: %w", err)
 	}
 
@@ -919,7 +919,7 @@ func (c *Client) DesktopChatWithExpert(
 		"stream_options": map[string]any{"include_usage": true},
 	}
 
-	raw, err := json.Marshal(body)
+	raw, err := jsonx.Marshal(body)
 	if err != nil {
 		return "", "", fmt.Errorf("DesktopChatWithExpert: %w", err)
 	}

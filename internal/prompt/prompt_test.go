@@ -1,11 +1,12 @@
 package prompt
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // systemRoles 提取 messages 中所有 role 值，用于断言改写后的角色序列。
@@ -13,7 +14,7 @@ func systemRoles(t *testing.T, body []byte) []string {
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonx.Unmarshal(body, &obj); err != nil {
 		t.Fatalf("unmarshal: %v body=%s", err, body)
 	}
 
@@ -63,7 +64,7 @@ func TestRewriteReplacesSystemAndDeveloper(t *testing.T) {
 	}
 	// 头部 system 内容恰为自有提示词，旧 system/developer 内容零残留。
 	var obj map[string]any
-	json.Unmarshal(out, &obj)
+	jsonx.Unmarshal(out, &obj)
 	msgs := obj["messages"].([]any)
 
 	first := msgs[0].(map[string]any)
@@ -89,7 +90,7 @@ func TestRewriteKeepsUserAssistantToolUntouched(t *testing.T) {
 	out := Rewrite(nums, "SYS")
 
 	var obj map[string]any
-	json.Unmarshal(out, &obj)
+	jsonx.Unmarshal(out, &obj)
 	msgs := obj["messages"].([]any)
 	// 预期：system(新) + user + assistant + tool，顺序保留。
 	if len(msgs) != 4 {
@@ -128,7 +129,7 @@ func TestRewriteKeepsMetadataAndOtherFields(t *testing.T) {
 	out := Rewrite(nums, "SYS")
 
 	var obj map[string]any
-	json.Unmarshal(out, &obj)
+	jsonx.Unmarshal(out, &obj)
 
 	if obj["model"] != "glm-5.2" {
 		t.Errorf("model changed: %v", obj["model"])
@@ -179,7 +180,7 @@ func TestRewriteMultimodalContentUntouched(t *testing.T) {
 	out := Rewrite(nums, "SYS")
 
 	var obj map[string]any
-	json.Unmarshal(out, &obj)
+	jsonx.Unmarshal(out, &obj)
 
 	msgs := obj["messages"].([]any)
 	if len(msgs) != 2 {
@@ -290,7 +291,7 @@ func TestLoadFileMissingFailsFast(t *testing.T) {
 
 // TestRewritePreservesNumberLiterals 改写 messages 不能改掉客户端的数值字面量。
 // 默认 json.Unmarshal 把一切数字变 float64：seed 9007199254740993 会变成 ...992、
-// 1.0 变成 1（与 split.go 的 UseNumber 同口径，split_test 已钉住同一断言）。
+// 1.0 变成 1（与 split.go 的原始字面量口径相同，split_test 已钉住同一断言）。
 func TestRewritePreservesNumberLiterals(t *testing.T) {
 	t.Parallel()
 

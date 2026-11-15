@@ -9,7 +9,6 @@ package reqlog
 import (
 	"bufio"
 	"crypto/rand"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -20,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logrotate"
 )
@@ -73,50 +73,50 @@ type Event struct {
 	Time      time.Time `json:"time"`
 	RequestID string    `json:"request_id"`
 	Path      string    `json:"path"`
-	Account   string    `json:"account,omitempty"`
+	Account   string    `json:"account,omitempty,omitzero"`
 	// KeyID 本次请求命中的命名密钥 ID（默认密钥 / 未鉴权为空）。只记 ID，
 	// 不记密钥前缀或明文；面板可用它把请求归到具体分发对象。
-	KeyID            string  `json:"key_id,omitempty"`
-	Model            string  `json:"model,omitempty"`
+	KeyID            string  `json:"key_id,omitempty,omitzero"`
+	Model            string  `json:"model,omitempty,omitzero"`
 	Status           int     `json:"status"`
 	OK               bool    `json:"ok"`
 	Outcome          string  `json:"outcome"`
 	DurationMs       int64   `json:"duration_ms"`
-	TTFBMs           int64   `json:"ttfb_ms,omitempty"`
-	Attempts         int     `json:"attempts,omitempty"`
-	PromptTokens     int64   `json:"prompt_tokens,omitempty"`
-	CompletionTokens int64   `json:"completion_tokens,omitempty"`
-	TotalTokens      int64   `json:"total_tokens,omitempty"`
-	Credit           float64 `json:"credit,omitempty"`
+	TTFBMs           int64   `json:"ttfb_ms,omitempty,omitzero"`
+	Attempts         int     `json:"attempts,omitempty,omitzero"`
+	PromptTokens     int64   `json:"prompt_tokens,omitempty,omitzero"`
+	CompletionTokens int64   `json:"completion_tokens,omitempty,omitzero"`
+	TotalTokens      int64   `json:"total_tokens,omitempty,omitzero"`
+	Credit           float64 `json:"credit,omitempty,omitzero"`
 	HasCredit        bool    `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
+	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty,omitzero"`
+	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty,omitzero"`
 	// ToolsDeclared / ToolCalls 工具面统计（issue #329）：声明数只数本请求
 	// tools/functions（不含会话历史），调用数只数实际产生的 tool_call 条数。
-	// 两者都 omitempty：ToolsDeclared 缺失 = 本请求没声明 tools（不进分母），
+	// 两者都 omitzero：ToolsDeclared 缺失 = 本请求没声明 tools（不进分母），
 	// ToolsDeclared 存在而 ToolCalls 缺失 = 声明了但零调用（这是要观察的形态）。
-	ToolsDeclared int    `json:"tools_declared,omitempty"`
-	ToolCalls     int    `json:"tool_calls,omitempty"`
-	ClientIP      string `json:"client_ip,omitempty"`
-	UserAgent     string `json:"user_agent,omitempty"`
+	ToolsDeclared int    `json:"tools_declared,omitempty,omitzero"`
+	ToolCalls     int    `json:"tool_calls,omitempty,omitzero"`
+	ClientIP      string `json:"client_ip,omitempty,omitzero"`
+	UserAgent     string `json:"user_agent,omitempty,omitzero"`
 	// Decision 可选选号决策链（logging.decision_trace，issue #63）；默认不记录。
-	Decision *DecisionTrace `json:"decision,omitempty"`
+	Decision *DecisionTrace `json:"decision,omitempty,omitzero"`
 }
 
 // DecisionTrace 一次请求的选号决策快照：固定字段 + 有界数组，不含提示词/正文/凭证。
 type DecisionTrace struct {
 	Candidates int                 `json:"candidates"`
-	Excluded   map[string]int      `json:"excluded,omitempty"`
+	Excluded   map[string]int      `json:"excluded,omitempty,omitzero"`
 	CostTier   int                 `json:"cost_tier"`
-	Explored   bool                `json:"explored,omitempty"`
-	StickyHit  bool                `json:"sticky_hit,omitempty"`
-	Rotations  []string            `json:"rotations,omitempty"`
-	Top        []DecisionCandidate `json:"top,omitempty"`
-	FinalUID   string              `json:"final_uid,omitempty"`
+	Explored   bool                `json:"explored,omitempty,omitzero"`
+	StickyHit  bool                `json:"sticky_hit,omitempty,omitzero"`
+	Rotations  []string            `json:"rotations,omitempty,omitzero"`
+	Top        []DecisionCandidate `json:"top,omitempty,omitzero"`
+	FinalUID   string              `json:"final_uid,omitempty,omitzero"`
 	// Strategy 实际生效的选号策略（weighted_random 时省略；有序策略便于排障）。
-	Strategy string `json:"strategy,omitempty"`
+	Strategy string `json:"strategy,omitempty,omitzero"`
 }
 
 // DecisionCandidate Top-N 候选（uid8 + 权重 + 成本层）。
@@ -143,11 +143,11 @@ type Filter struct {
 // ArchiveStats 归档存储状态。
 type ArchiveStats struct {
 	Enabled       bool   `json:"enabled"`
-	Dir           string `json:"dir,omitempty"`
+	Dir           string `json:"dir,omitempty,omitzero"`
 	Files         int    `json:"files"`
 	Bytes         int64  `json:"bytes"`
 	DroppedWrites uint64 `json:"dropped_writes"`
-	LastError     string `json:"last_error,omitempty"`
+	LastError     string `json:"last_error,omitempty,omitzero"`
 }
 
 // Snapshot 一次面板读取的完整指标快照。
@@ -527,7 +527,7 @@ func (w *archiveWriter) writeEvent(event2 *Event) {
 
 	clampEventFields(event2)
 
-	raw, err := json.Marshal(event2)
+	raw, err := jsonx.Marshal(event2)
 	if err != nil {
 		w.setErr(err)
 		return
@@ -654,7 +654,7 @@ func readFile(path string, filter *Filter) ([]Event, error) {
 
 	for scanner.Scan() {
 		var e Event
-		if json.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(&e) {
+		if jsonx.Unmarshal(scanner.Bytes(), &e) != nil || !filter.match(&e) {
 			continue
 		}
 

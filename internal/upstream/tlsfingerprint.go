@@ -92,7 +92,7 @@ func tlsExtensionFor(id uint16, spec *clientprofile.TLS, serverName string) (utl
 
 		return &utls.SupportedCurvesExtension{Curves: groups}, nil
 	case tlsExtPointFormats:
-		return &utls.SupportedPointsExtension{SupportedPoints: spec.PointFormats}, nil
+		return &utls.SupportedPointsExtension{SupportedPoints: []uint8(spec.PointFormats)}, nil
 	case tlsExtSignatureAlgorithms:
 		sigalgs := make([]utls.SignatureScheme, len(spec.SignatureAlgorithms))
 		for i, alg := range spec.SignatureAlgorithms {
@@ -109,7 +109,7 @@ func tlsExtensionFor(id uint16, spec *clientprofile.TLS, serverName string) (utl
 	case tlsExtSupportedVersions:
 		return &utls.SupportedVersionsExtension{Versions: spec.Versions}, nil
 	case tlsExtPSKModes:
-		return &utls.PSKKeyExchangeModesExtension{Modes: spec.PSKModes}, nil
+		return &utls.PSKKeyExchangeModesExtension{Modes: []uint8(spec.PSKModes)}, nil
 	case tlsExtKeyShare:
 		// BoringSSL 首连只带一个 X25519 key share；profile 的 groups 首个即其选择。
 		return &utls.KeyShareExtension{

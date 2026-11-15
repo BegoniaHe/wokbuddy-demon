@@ -4,7 +4,7 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"net/http"
 	"regexp"
 	"strings"
@@ -107,7 +107,7 @@ func TestLogoutHeadersCarryUserAgentAndNoEmptyBearer(t *testing.T) {
 func TestParseGlobalModelEntriesToleratesBadEntry(t *testing.T) {
 	t.Parallel()
 
-	arr := json.RawMessage(`[
+	arr := jsontext.Value(`[
 		{"id":"good-model","maxInputTokens":128000,"tags":["badge:paid"]},
 		{"id":"bad-model","maxInputTokens":"not-a-number"},
 		{"id":"another-good","maxOutputTokens":4096}
@@ -349,35 +349,35 @@ func TestGlobalRegisterStatusRejected(t *testing.T) {
 	}
 }
 
-// TestUsageNumbersAcceptJSONNumber 聚合帧与出站改写都走 UseNumber：数值叶子是
-// json.Number，只认 float64 会让缓存命中观测、total_tokens 合成、max_tokens
+// TestUsageNumbersAcceptJSONNumber 聚合帧与出站改写都保留原始字面量：数值叶子是
+// jsontext.Value，只认 float64 会让缓存命中观测、total_tokens 合成、max_tokens
 // 别名迁移全部静默失效。
 func TestUsageNumbersAcceptJSONNumber(t *testing.T) {
 	t.Parallel()
 
-	if got, ok := positiveUsageNumber(json.Number("123")); !ok || got != 123 {
-		t.Fatalf("positiveUsageNumber(json.Number)=%v,%v want 123,true", got, ok)
+	if got, ok := positiveUsageNumber(jsontext.Value("123")); !ok || got != 123 {
+		t.Fatalf("positiveUsageNumber(jsontext.Value)=%v,%v want 123,true", got, ok)
 	}
 
-	if got, ok := num64(json.Number("7")); !ok || got != 7 {
-		t.Fatalf("num64(json.Number)=%v,%v want 7,true", got, ok)
+	if got, ok := num64(jsontext.Value("7")); !ok || got != 7 {
+		t.Fatalf("num64(jsontext.Value)=%v,%v want 7,true", got, ok)
 	}
 
 	// 整值浮点字面量（Python 默认序列化、科学计数法）按整值接受。
 	for _, literal := range []string{"4096.0", "1e5"} {
-		if _, ok := positiveInt64(json.Number(literal)); !ok {
-			t.Errorf("positiveInt64(json.Number(%q)) 被判非法", literal)
+		if _, ok := positiveInt64(jsontext.Value(literal)); !ok {
+			t.Errorf("positiveInt64(jsontext.Value(%q)) 被判非法", literal)
 		}
 	}
 }
 
 // TestEnsureUsageTotalWithJSONNumber 上游省略 total_tokens 时要能合成：帧解码走
-// UseNumber 后 num64 必须认 json.Number。
+// 原始字面量后 num64 必须认 jsontext.Value。
 func TestEnsureUsageTotalWithJSONNumber(t *testing.T) {
 	t.Parallel()
 
 	usage := map[string]any{
-		"prompt_tokens": json.Number("3"), "completion_tokens": json.Number("2"),
+		"prompt_tokens": jsontext.Value("3"), "completion_tokens": jsontext.Value("2"),
 	}
 
 	out := ensureUsageTotal(usage)

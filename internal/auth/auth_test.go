@@ -2,7 +2,6 @@ package auth
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -11,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestRetireBlocksSaveAtomic 删除账号后 Retire 必须让在途 refresh 的写回失败，
@@ -171,7 +172,7 @@ func TestSaveAtomicWritesIdentityFields(t *testing.T) {
 	var doc struct {
 		Account map[string]any `json:"account"`
 	}
-	if err = json.Unmarshal(raw, &doc); err != nil {
+	if err = jsonx.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
@@ -212,7 +213,7 @@ func TestSaveAtomicOmitsEmptyIdentityFields(t *testing.T) {
 	var doc struct {
 		Account map[string]any `json:"account"`
 	}
-	if err = json.Unmarshal(raw, &doc); err != nil {
+	if err = jsonx.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
@@ -685,7 +686,7 @@ func TestSaveAtomicPreservesFlatUnknownKeys(t *testing.T) {
 	}
 
 	var doc map[string]any
-	if err := json.Unmarshal(saved, &doc); err != nil {
+	if err := jsonx.Unmarshal(saved, &doc); err != nil {
 		t.Fatalf("写回不是合法 JSON: %v", err)
 	}
 

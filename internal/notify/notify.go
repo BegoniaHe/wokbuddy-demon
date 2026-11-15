@@ -6,7 +6,6 @@ package notify
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
@@ -79,11 +79,11 @@ func ValidateURL(raw string) error {
 type Event struct {
 	Event    string         `json:"event"`
 	Time     time.Time      `json:"time"`
-	UID      string         `json:"uid,omitempty"`
-	Nickname string         `json:"nickname,omitempty"`
-	Realm    string         `json:"realm,omitempty"`
-	Summary  string         `json:"summary,omitempty"`
-	Detail   map[string]any `json:"detail,omitempty"`
+	UID      string         `json:"uid,omitempty,omitzero"`
+	Nickname string         `json:"nickname,omitempty,omitzero"`
+	Realm    string         `json:"realm,omitempty,omitzero"`
+	Summary  string         `json:"summary,omitempty,omitzero"`
+	Detail   map[string]any `json:"detail,omitempty,omitzero"`
 }
 
 // payload 线上 JSON 形态（uid 截断、时间 RFC3339）。
@@ -92,11 +92,11 @@ type payload struct {
 	dedupeKey string
 	Event     string         `json:"event"`
 	Time      string         `json:"time"`
-	UID       string         `json:"uid,omitempty"`
-	Nickname  string         `json:"nickname,omitempty"`
-	Realm     string         `json:"realm,omitempty"`
-	Summary   string         `json:"summary,omitempty"`
-	Detail    map[string]any `json:"detail,omitempty"`
+	UID       string         `json:"uid,omitempty,omitzero"`
+	Nickname  string         `json:"nickname,omitempty,omitzero"`
+	Realm     string         `json:"realm,omitempty,omitzero"`
+	Summary   string         `json:"summary,omitempty,omitzero"`
+	Detail    map[string]any `json:"detail,omitempty,omitzero"`
 }
 
 // Config 构造参数；零值 = 关闭。
@@ -328,7 +328,7 @@ func (n *Notifier) noteDrop(event, uid string) {
 // 返回是否投递成功：失败时调用方要释放去重窗口，否则这条告警在窗口内既不会
 // 重试也不会再产生新事件（webhook 抖动会吃掉唯一一次机会）。
 func (n *Notifier) send(payload2 *payload) bool {
-	raw, err := json.Marshal(payload2)
+	raw, err := jsonx.Marshal(payload2)
 	if err != nil {
 		log.Printf("WARN: [notify] event=%s encode failed", payload2.Event)
 

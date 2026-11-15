@@ -17,7 +17,6 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,6 +27,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 const (
@@ -64,7 +64,7 @@ const (
 type SearchResult struct {
 	Title   string `json:"title"`
 	URL     string `json:"url"`
-	Snippet string `json:"snippet,omitempty"`
+	Snippet string `json:"snippet,omitempty,omitzero"`
 }
 
 // SearchOutcome 一次搜索的完整结果，字段名与上游响应一致，便于直接透出。
@@ -72,8 +72,8 @@ type SearchOutcome struct {
 	Query          string         `json:"query"`
 	Results        []SearchResult `json:"results"`
 	TotalResults   int            `json:"total_results"`
-	Provider       string         `json:"provider,omitempty"`
-	ResponseTimeMs int64          `json:"response_time_ms,omitempty"`
+	Provider       string         `json:"provider,omitempty,omitzero"`
+	ResponseTimeMs int64          `json:"response_time_ms,omitempty,omitzero"`
 }
 
 // agenttool 四路的头族差异（Accept / Content-Type / X-Wb-Uid）在 headers.go 的
@@ -117,8 +117,8 @@ type searchRequestBody struct {
 	Query          string   `json:"query"`
 	Type           string   `json:"type"`
 	MaxResults     int      `json:"max_results"`
-	AllowedDomains []string `json:"allowed_domains,omitempty"`
-	Freshness      string   `json:"freshness,omitempty"`
+	AllowedDomains []string `json:"allowed_domains,omitempty,omitzero"`
+	Freshness      string   `json:"freshness,omitempty,omitzero"`
 }
 
 // searchFreshnessRE 官方工具 schema 的 freshness 正则（d1-d30 / m1-m12 / y1-y5）。
@@ -228,7 +228,7 @@ func (c *Client) Search(
 		return nil, &Error{Kind: ErrClient, Msg: "invalid search freshness"}
 	}
 
-	body, err := json.Marshal(normalizeSearchOptions(query, opts))
+	body, err := jsonx.Marshal(normalizeSearchOptions(query, opts))
 	if err != nil {
 		return nil, fmt.Errorf("search marshal: %w", err)
 	}
@@ -293,7 +293,7 @@ func (c *Client) doSearch(account *auth.Auth, req *http.Request) (*SearchOutcome
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
+	if err := jsonx.Unmarshal(raw, &parsed); err != nil {
 		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, RedactForLog(string(raw), 120))
 	}
 

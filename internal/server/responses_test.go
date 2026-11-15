@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestResponsesRequestMapping(t *testing.T) {
@@ -42,7 +42,7 @@ func TestResponsesRequestMapping(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,7 +73,7 @@ func TestResponsesRequestDefaultsMaxOutputTokens(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,7 +96,7 @@ func TestResponsesAliasDefaultMaxOutputTokens(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -117,7 +117,7 @@ func TestResponsesRequestUnknownModelNoDefaultMaxTokens(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -219,7 +219,7 @@ func TestResponsesRequestIgnoresUnknownItem(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -248,7 +248,7 @@ func TestResponsesRequestCustomToolRoundTrip(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -296,7 +296,7 @@ func TestResponsesAdditionalTools(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -342,7 +342,7 @@ func TestResponsesNamespaceTools(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -391,7 +391,7 @@ func TestResponsesNamespaceToolCollision(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -554,7 +554,7 @@ func TestResponsesAdditionalNamespaceTools(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -631,7 +631,7 @@ func TestResponsesAgentMessage(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -668,7 +668,7 @@ func TestResponsesFunctionOutputImage(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -718,7 +718,7 @@ func TestResponsesToolImagesStayWithToolRun(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -793,7 +793,7 @@ func TestResponsesRequestIgnoresReasoningItem(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -988,7 +988,7 @@ func TestResponsesEndpointNonStream(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 

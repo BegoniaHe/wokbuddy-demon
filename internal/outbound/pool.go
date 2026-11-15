@@ -57,9 +57,9 @@ type Health struct {
 	Proxy       string `json:"proxy"` // Masked()
 	Failures    int    `json:"failures"`
 	CooldownSec int    `json:"cooldown_sec"` // 剩余冷却秒数，0 = 健康
-	LastOK      string `json:"last_ok,omitempty"`
-	LastError   string `json:"last_error,omitempty"`
-	LastFailAt  string `json:"last_fail_at,omitempty"`
+	LastOK      string `json:"last_ok,omitempty,omitzero"`
+	LastError   string `json:"last_error,omitempty,omitzero"`
+	LastFailAt  string `json:"last_fail_at,omitempty,omitzero"`
 }
 
 // healthErrLimit lastErr 的截断长度：足够定位原因，又不会把长 URL/堆栈塞进快照。

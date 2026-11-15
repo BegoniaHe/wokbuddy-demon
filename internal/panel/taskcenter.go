@@ -35,8 +35,8 @@ var errRunGrowthQueuedFailed = errors.New("runGrowthQueued failed")
 type scanAccountItem struct {
 	UID       string          `json:"uid"`
 	Nickname  string          `json:"nickname"`
-	Growth    []upstream.Task `json:"growth,omitempty"`
-	GrowthErr string          `json:"growth_error,omitempty"`
+	Growth    []upstream.Task `json:"growth,omitempty,omitzero"`
+	GrowthErr string          `json:"growth_error,omitempty,omitzero"`
 }
 
 // growthPending 任务是否"未完成且可自动化"。
@@ -197,7 +197,7 @@ type queueItem struct {
 	Kind     string `json:"kind"` // growth
 	Code     string `json:"code"`
 	Status   string `json:"status"` // pending | running | done | skipped | error
-	Message  string `json:"message,omitempty"`
+	Message  string `json:"message,omitempty,omitzero"`
 }
 
 // queueState 队列运行状态。Seq 每次启动 +1——前端只渲染"自己启动的那一轮"，

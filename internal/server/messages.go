@@ -13,7 +13,7 @@
 package server
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +23,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -135,7 +136,7 @@ func parseSearchRequest(body []byte) (*searchRequest, error) {
 		Deep bool `json:"deep"`
 	}
 
-	if err := json.Unmarshal(body, &payload); err != nil {
+	if err := jsonx.Unmarshal(body, &payload); err != nil {
 		return nil, errSearchInvalidJSON
 	}
 
@@ -327,15 +328,15 @@ func declaresWebSearch(tools []map[string]any) bool {
 // content 是块数组，也允许是纯字符串（两种都是合法入站形态），用固定结构体会让
 // 字符串形态在解析阶段直接失败并被误报成「invalid JSON body」。
 type searchInboundMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+	Role    string         `json:"role"`
+	Content jsontext.Value `json:"content"`
 }
 
 // messageTextParts 取一条消息的文本部分：块数组只认 text 块（忽略 tool_result
 // 之类的历史块）；纯字符串整段即文本；无法识别的形态返回 nil（不参与搜索词）。
-func messageTextParts(content json.RawMessage) []string {
+func messageTextParts(content jsontext.Value) []string {
 	var blocks []map[string]any
-	if err := json.Unmarshal(content, &blocks); err == nil {
+	if err := jsonx.Unmarshal(content, &blocks); err == nil {
 		var parts []string
 
 		for _, block := range blocks {
@@ -353,7 +354,7 @@ func messageTextParts(content json.RawMessage) []string {
 	}
 
 	var text string
-	if err := json.Unmarshal(content, &text); err == nil {
+	if err := jsonx.Unmarshal(content, &text); err == nil {
 		if trimmed := strings.TrimSpace(text); trimmed != "" {
 			return []string{trimmed}
 		}

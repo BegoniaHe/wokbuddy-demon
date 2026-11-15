@@ -2,7 +2,6 @@
 package upstream
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestRequestUsageRequestContract 钉住 Web 实测契约：无 /v2 主路径、UTC+8 墙钟字符串
@@ -26,7 +26,7 @@ func TestRequestUsageRequestContract(t *testing.T) {
 
 	client := testClient(func(r *http.Request) (*http.Response, error) {
 		gotPath = r.URL.Path
-		decodeErr = json.NewDecoder(r.Body).Decode(&gotBody)
+		decodeErr = jsonx.UnmarshalRead(r.Body, &gotBody)
 
 		return jsonResp(200, `{"code":0,"data":{"total":1,"data":[
 			{"requestId":"r1","model":"m","credit":0,"requestTime":"2026-10-16 22:40:00"}]}}`), nil
@@ -200,7 +200,7 @@ func TestRequestUsageMissingTotalStillPaginates(t *testing.T) {
 		var body struct {
 			PageNum int `json:"pageNum"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := jsonx.UnmarshalRead(r.Body, &body); err != nil {
 			return nil, fmt.Errorf("TestRequestUsageMissingTotalStillPaginates: %w", err)
 		}
 

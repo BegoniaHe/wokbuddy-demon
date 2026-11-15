@@ -12,7 +12,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"html"
@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -72,9 +73,9 @@ var (
 func declaredLocalWebTools(body []byte) (map[string]bool, bool) {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
-		Input json.RawMessage  `json:"input"`
+		Input jsontext.Value   `json:"input"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if jsonx.Unmarshal(body, &req) != nil {
 		return nil, false
 	}
 
@@ -121,7 +122,7 @@ func (h *Handler) serveResponsesWithLocalTools(
 	}
 
 	var req map[string]any
-	if uerr := json.Unmarshal(openAI, &req); uerr != nil {
+	if uerr := jsonx.Unmarshal(openAI, &req); uerr != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid converted request")
 		return
 	}
@@ -226,7 +227,7 @@ func (h *Handler) runLocalWebToolLoop(
 func (h *Handler) runLocalWebToolRound(
 	r *http.Request, req map[string]any, model string,
 ) (map[string]any, error) {
-	raw, err := json.Marshal(req)
+	raw, err := jsonx.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
@@ -373,7 +374,7 @@ func (h *Handler) executeLocalTool(ctx context.Context, call localToolCall) stri
 		URL   string `json:"url"`
 	}
 
-	_ = json.Unmarshal([]byte(call.Arguments), &args)
+	_ = jsonx.Unmarshal([]byte(call.Arguments), &args)
 	switch call.Name {
 	case webSearchTool:
 		out, err := h.webSearch(ctx, args.Query)
@@ -499,7 +500,7 @@ func (s *sseEventStream) event(name string, payload map[string]any) {
 	payload["sequence_number"] = s.seq
 	s.seq++
 
-	raw, err := json.Marshal(payload)
+	raw, err := jsonx.Marshal(payload)
 	if err != nil {
 		return
 	}

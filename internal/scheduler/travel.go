@@ -51,7 +51,7 @@ type TravelRunResult struct {
 	UID        string `json:"uid"`
 	Ran        bool   `json:"ran"`
 	OK         bool   `json:"ok"`
-	SkipReason string `json:"skip_reason,omitempty"`
+	SkipReason string `json:"skip_reason,omitempty,omitzero"`
 }
 
 // RunTravelNowFor 对单个账号执行一趟旅行巡检（issue #257）。门控与全量版一致：

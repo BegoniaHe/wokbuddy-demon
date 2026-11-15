@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -30,6 +29,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
@@ -1092,7 +1092,7 @@ func saveConfigInternal(
 		return nil, err
 	}
 
-	out, err := json.MarshalIndent(merged, "", "  ")
+	out, err := jsonx.MarshalIndent(merged)
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
@@ -1127,7 +1127,7 @@ func saveConfigInternal(
 // 旧配置用于重启字段 diff；文件损坏时 oldCfg 返回 nil（基线不可信，调用方跳过 diff）。
 func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config, *Config, error) {
 	var incoming map[string]any
-	if err := json.Unmarshal(raw, &incoming); err != nil {
+	if err := jsonx.Unmarshal(raw, &incoming); err != nil {
 		return nil, nil, nil, fmt.Errorf("parse submitted config: %w", err)
 	}
 	// 顶层 null 解成 nil map：既不能当配置对象合并，也不能原样落盘（会把配置洗成 null）。
@@ -1149,7 +1149,7 @@ func prepareConfigMerge(oldRaw, raw []byte, merge bool) (map[string]any, *Config
 
 	if merge {
 		var cur map[string]any
-		if err := json.Unmarshal(oldRaw, &cur); err != nil || cur == nil {
+		if err := jsonx.Unmarshal(oldRaw, &cur); err != nil || cur == nil {
 			// 损坏或顶层 null 的现有配置按空对象处理，避免向 nil map 合并。
 			cur = map[string]any{}
 		}
@@ -1538,13 +1538,13 @@ func restartRequiredFields(oldCfg, newCfg *Config) []string {
 // configDoc 把配置序列化为按 JSON 路径取值的 map（解析后的 time.Duration
 // 字段带 json:"-"，不会参与比较）。
 func configDoc(c *Config) map[string]any {
-	raw, err := json.Marshal(c) //nolint:gosec // config 本就是凭据载体，落盘为设计行为
+	raw, err := jsonx.Marshal(c)
 	if err != nil {
 		return nil
 	}
 
 	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		return nil
 	}
 
@@ -1597,7 +1597,7 @@ func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
 
 // mergedJSON 把合并后的 map 序列化回 JSON（供 parseConfigWithEnv 校验）。
 func mergedJSON(m map[string]any) []byte {
-	b, err := json.Marshal(m)
+	b, err := jsonx.Marshal(m)
 	if err != nil {
 		return []byte("{}")
 	}

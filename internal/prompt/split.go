@@ -11,11 +11,12 @@
 package prompt
 
 import (
-	"encoding/json"
 	"maps"
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // minSentencesPerSplit 拆出的一条 system 至少要包含的句数（另一条同样要满足）。
@@ -36,7 +37,7 @@ func SplitSystemBySentences(body []byte) ([]byte, bool) {
 		return body, false
 	}
 
-	// 走 decodeJSONObject：UTF-8 校验、UseNumber（seed / 大整数 id 按字面量保留）与
+	// 走 decodeJSONObject：UTF-8 校验、数值按原始字面量保留（seed / 大整数 id）与
 	// 「第一个 JSON 值之后不得有尾随内容」的守卫只此一份——先前这里复制了同一段
 	// 解码逻辑，改一处忘另一处就会让两条改写路径对同一份 body 得出不同结论。
 	obj, err := decodeJSONObject(body)
@@ -56,7 +57,7 @@ func SplitSystemBySentences(body []byte) ([]byte, bool) {
 
 	obj["messages"] = out
 
-	rewritten, err := json.Marshal(obj)
+	rewritten, err := jsonx.Marshal(obj)
 	if err != nil {
 		return body, false
 	}

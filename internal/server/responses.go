@@ -8,7 +8,7 @@ package server
 import (
 	"bytes"
 	"cmp"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -38,10 +39,10 @@ var (
 // responsesRequest 只声明转换所需的字段；未知字段忽略，便于协议演进。
 type responsesRequest struct {
 	Model             string           `json:"model"`
-	Input             json.RawMessage  `json:"input"`
+	Input             jsontext.Value   `json:"input"`
 	Instructions      string           `json:"instructions"`
 	Tools             []map[string]any `json:"tools"`
-	ToolChoice        json.RawMessage  `json:"tool_choice"`
+	ToolChoice        jsontext.Value   `json:"tool_choice"`
 	MaxOutputTokens   int              `json:"max_output_tokens"`
 	Temperature       *float64         `json:"temperature"`
 	TopP              *float64         `json:"top_p"`
@@ -50,7 +51,7 @@ type responsesRequest struct {
 	Stream            bool             `json:"stream"`
 	ParallelToolCalls *bool            `json:"parallel_tool_calls"`
 	Reasoning         *responsesReason `json:"reasoning"`
-	Text              json.RawMessage  `json:"text"`
+	Text              jsontext.Value   `json:"text"`
 }
 
 type responsesReason struct {
@@ -130,14 +131,14 @@ func newResponsesChatInput(
 // responsesAdditionalTools 从 input 数组里的 additional_tools 条目收集工具。
 // 新版 Codex（0.162+）在 use_responses_lite 下把工具整份放进 input，顶层 tools
 // 为空；不合并就等于上游看不到任何工具。
-func responsesAdditionalTools(input json.RawMessage) []map[string]any {
+func responsesAdditionalTools(input jsontext.Value) []map[string]any {
 	trimmed := bytes.TrimSpace(input)
 	if len(trimmed) == 0 || trimmed[0] != '[' {
 		return nil
 	}
 
 	var items []map[string]any
-	if json.Unmarshal(trimmed, &items) != nil {
+	if jsonx.Unmarshal(trimmed, &items) != nil {
 		return nil
 	}
 
@@ -169,12 +170,12 @@ func responsesCustomTools(body []byte) map[string]bool {
 }
 
 // responsesToolInputs 解析原始请求的 tools 与 input。
-func responsesToolInputs(body []byte) ([]map[string]any, json.RawMessage) {
+func responsesToolInputs(body []byte) ([]map[string]any, jsontext.Value) {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
-		Input json.RawMessage  `json:"input"`
+		Input jsontext.Value   `json:"input"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if jsonx.Unmarshal(body, &req) != nil {
 		return nil, nil
 	}
 
@@ -251,7 +252,7 @@ func responsesToOpenAIWithClient(
 	applyResponsesParams(out, req, refs)
 	applyResponsesDefaultMaxTokens(out, req.Model, httpClient, aliases)
 
-	converted, err := json.Marshal(out)
+	converted, err := jsonx.Marshal(out)
 	if err != nil {
 		return nil, "", "", false, fmt.Errorf("encode request: %w", err)
 	}
@@ -299,7 +300,7 @@ func decodeResponsesRequest(body []byte) (*responsesRequest, error) {
 	}
 
 	var req responsesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := jsonx.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid JSON body: %w", err)
 	}
 
@@ -326,7 +327,7 @@ func responsesMessages(req *responsesRequest, refs map[string]responsesToolRef) 
 	}
 
 	var items []map[string]any
-	if err := json.Unmarshal(req.Input, &items); err != nil {
+	if err := jsonx.Unmarshal(req.Input, &items); err != nil {
 		return nil, fmt.Errorf("invalid input: %w", err)
 	}
 
@@ -395,14 +396,14 @@ func (b *responsesInputMessages) flushImages() {
 }
 
 // responsesStringInput 识别 Responses 的字符串 input；null 视为未提供。
-func responsesStringInput(raw json.RawMessage) (string, bool) {
+func responsesStringInput(raw jsontext.Value) (string, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || trimmed[0] != '"' {
 		return "", false
 	}
 
 	var text string
-	if json.Unmarshal(raw, &text) != nil {
+	if jsonx.Unmarshal(raw, &text) != nil {
 		return "", false
 	}
 
@@ -601,7 +602,7 @@ func responsesInputCustomToolCall(item map[string]any, refs map[string]responses
 		callID = stringValue(item["id"])
 	}
 
-	args, err := json.Marshal(map[string]any{"input": input})
+	args, err := jsonx.Marshal(map[string]any{"input": input})
 	if err != nil {
 		return nil, fmt.Errorf("custom_tool_call input: %w", err)
 	}
@@ -647,7 +648,7 @@ func responsesToolOutputParts(raw any) (string, []any) {
 			return "", nil
 		}
 
-		data, err := json.Marshal(raw)
+		data, err := jsonx.Marshal(raw)
 		if err != nil {
 			return "", nil
 		}
@@ -822,7 +823,7 @@ func applyResponsesSampling(out map[string]any, req *responsesRequest) {
 
 // responsesTextFormat 把 Responses text.format 映射为 chat/completions response_format。
 // 只映射上游认识的 text / json_object / json_schema；缺失或未知格式返回 nil。
-func responsesTextFormat(raw json.RawMessage) any {
+func responsesTextFormat(raw jsontext.Value) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -830,7 +831,7 @@ func responsesTextFormat(raw json.RawMessage) any {
 	var text struct {
 		Format map[string]any `json:"format"`
 	}
-	if json.Unmarshal(raw, &text) != nil || text.Format == nil {
+	if jsonx.Unmarshal(raw, &text) != nil || text.Format == nil {
 		return nil
 	}
 
@@ -1129,13 +1130,13 @@ func responsesCustomTool(tool map[string]any) map[string]any {
 }
 
 // responsesToolChoice 映射 Responses tool_choice 到 OpenAI tool_choice。
-func responsesToolChoice(raw json.RawMessage, refs map[string]responsesToolRef) any {
+func responsesToolChoice(raw jsontext.Value, refs map[string]responsesToolRef) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
 
 	var choice string
-	if json.Unmarshal(raw, &choice) == nil {
+	if jsonx.Unmarshal(raw, &choice) == nil {
 		switch choice {
 		case "auto", "none", "required":
 			return choice
@@ -1149,7 +1150,7 @@ func responsesToolChoice(raw json.RawMessage, refs map[string]responsesToolRef) 
 		Name string `json:"name"`
 		Mode string `json:"mode"`
 	}
-	if json.Unmarshal(raw, &obj) != nil {
+	if jsonx.Unmarshal(raw, &obj) != nil {
 		return nil
 	}
 
@@ -1448,8 +1449,8 @@ func responsesSetNamespace(item map[string]any, namespace string) {
 // 只接受约定包裹形态（对象 + input 字符串）；缺字段/类型不符/参数不完整返回 ok=false，
 // 由调用方标 incomplete，绝不把半截 JSON 或原文交给客户端执行（issue #259）。
 func responsesCustomToolInput(args string) (string, bool) {
-	var payload map[string]json.RawMessage
-	if json.Unmarshal([]byte(args), &payload) != nil {
+	var payload map[string]jsontext.Value
+	if jsonx.Unmarshal([]byte(args), &payload) != nil {
 		return "", false
 	}
 
@@ -1459,7 +1460,7 @@ func responsesCustomToolInput(args string) (string, bool) {
 	}
 
 	var input string
-	if json.Unmarshal(raw, &input) != nil {
+	if jsonx.Unmarshal(raw, &input) != nil {
 		return "", false
 	}
 
@@ -1631,7 +1632,7 @@ func (s *responsesStreamWriter) handleLine(line string) error {
 
 func (s *responsesStreamWriter) handleChunk(payload string) error {
 	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) != nil {
+	if jsonx.Unmarshal([]byte(payload), &chunk) != nil {
 		return nil //nolint:nilerr // 非 JSON 噪声帧丢弃
 	}
 
@@ -2170,7 +2171,7 @@ func (s *responsesStreamWriter) event(name string, payload map[string]any) error
 	payload["sequence_number"] = s.seq
 	s.seq++
 
-	raw, err := json.Marshal(payload)
+	raw, err := jsonx.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event: %w", err)
 	}

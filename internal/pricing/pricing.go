@@ -6,7 +6,6 @@ package pricing
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +15,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // DefaultURL OpenRouter 模型目录（公开，无需鉴权）。
@@ -101,7 +102,7 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	}
 	// 限制响应体大小：默认 URL 是公网第三方（openrouter），pricing.New 也接受任意
 	// URL，上游异常时不应该让整份响应进内存。
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxCatalogBytes)).Decode(&body); err != nil {
+	if err := jsonx.UnmarshalRead(io.LimitReader(resp.Body, maxCatalogBytes), &body); err != nil {
 		c.setError(err)
 		return fmt.Errorf("Refresh: %w", err)
 	}

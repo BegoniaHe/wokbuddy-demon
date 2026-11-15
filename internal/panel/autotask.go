@@ -23,7 +23,6 @@ package panel
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,6 +33,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -1098,7 +1098,7 @@ func runModelChat(panel9 *Panel, account18 *auth.Auth) (string, error) {
 
 	time.Sleep(reportGap)
 	// 2. 真实对话一次（判据的最直接证据）
-	body, merr := json.Marshal(map[string]any{
+	body, merr := jsonx.Marshal(map[string]any{
 		"model": modelID,
 		"messages": []map[string]any{
 			{"role": "user", "content": "hi，请回复一句话"},

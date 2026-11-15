@@ -12,13 +12,14 @@ package session
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"log"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/redisstore"
 )
 
@@ -731,14 +732,15 @@ func hashIndex(key string, n int) int {
 	return int(num % uint32(n)) //nolint:gosec // n 为账号池规模，恒远小于 2^32
 }
 
-// bodyRaw 是 json.RawMessage 的零拷贝变体：UnmarshalJSON 直接引用输入字节
-// （json.Unmarshal 的 data 是调用方 body 的子切片，且 Unmarshal 不修改输入）。
-// 只用于 ExtractSession 内即时消费、不跨 body 生命周期保存的字段——避免
-// RawMessage 对 messages 等大字段再复制一份。
+// bodyRaw 是 jsontext.Value 的轻量变体：UnmarshalJSON 复制一次原始字节。
+//
+// encoding/json/v2 的合同要求 UnmarshalJSON 自行复制（解码器的内部缓冲会被后续
+// 调用复用），因此这里不再直接引用输入切片。复制的是「字段整体一次」，不是
+// RawMessage 时代「messages 每条再复制一份」，派生键扫描仍只在原始字节上做。
 type bodyRaw []byte
 
 func (r *bodyRaw) UnmarshalJSON(data []byte) error {
-	*r = data
+	*r = append((*r)[:0], data...)
 
 	return nil
 }
@@ -808,7 +810,7 @@ func ExtractSession(body []byte) (key, conversationID string) {
 	}
 
 	var probe sessionProbe
-	if err := json.Unmarshal(body, &probe); err != nil {
+	if err := jsonx.Unmarshal(body, &probe); err != nil {
 		return "", ""
 	}
 
@@ -855,7 +857,7 @@ func explicitConversationID(probe *sessionProbe, meta metadataProbe) string {
 func parseMetadata(raw []byte) metadataProbe {
 	var meta metadataProbe
 	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &meta)
+		_ = jsonx.Unmarshal(raw, &meta)
 	}
 
 	return meta
@@ -868,7 +870,7 @@ func rawJSONString(raw []byte) string {
 	}
 
 	var s string
-	if json.Unmarshal(raw, &s) != nil {
+	if jsonx.Unmarshal(raw, &s) != nil {
 		return ""
 	}
 
@@ -920,7 +922,7 @@ func DeriveCacheKey(body []byte) string {
 	}
 
 	var probe sessionProbe
-	if err := json.Unmarshal(body, &probe); err != nil {
+	if err := jsonx.Unmarshal(body, &probe); err != nil {
 		return ""
 	}
 
@@ -996,7 +998,7 @@ func deriveKey(raw []byte, userID string) string {
 //nolint:gocognit // 原始字节逐条解析与字段提取线性展开。
 func scanDeriveTexts(raw []byte) (systemText, firstUserText string) {
 	var items []bodyRaw
-	if json.Unmarshal(raw, &items) != nil {
+	if jsonx.Unmarshal(raw, &items) != nil {
 		return "", ""
 	}
 
@@ -1005,7 +1007,7 @@ func scanDeriveTexts(raw []byte) (systemText, firstUserText string) {
 			Role    string  `json:"role"`
 			Content bodyRaw `json:"content"`
 		}
-		if json.Unmarshal(item, &msg) != nil {
+		if jsonx.Unmarshal(item, &msg) != nil {
 			continue
 		}
 
@@ -1039,14 +1041,14 @@ func messageTextRaw(raw []byte) string {
 	switch raw[0] {
 	case '"':
 		var text string
-		if json.Unmarshal(raw, &text) != nil {
+		if jsonx.Unmarshal(raw, &text) != nil {
 			return ""
 		}
 
 		return text
 	case '[':
 		var parts []bodyRaw
-		if json.Unmarshal(raw, &parts) != nil {
+		if jsonx.Unmarshal(raw, &parts) != nil {
 			return ""
 		}
 
@@ -1056,7 +1058,7 @@ func messageTextRaw(raw []byte) string {
 			var item struct {
 				Text string `json:"text"`
 			}
-			if json.Unmarshal(part, &item) == nil {
+			if jsonx.Unmarshal(part, &item) == nil {
 				builder.WriteString(item.Text)
 			}
 		}
@@ -1082,7 +1084,7 @@ func userContentSignatureRaw(raw []byte) string {
 	switch raw[0] {
 	case '"':
 		var text string
-		if json.Unmarshal(raw, &text) != nil {
+		if jsonx.Unmarshal(raw, &text) != nil {
 			return ""
 		}
 
@@ -1090,7 +1092,7 @@ func userContentSignatureRaw(raw []byte) string {
 	case '[':
 		// 非文本 part 只入 "[type]" 占位，不入内容摘要（保证派生键随图片 URL 变化
 		// 仍稳定——fork 既有契约）。
-		return partsSignature(json.RawMessage(raw), func(typeName string, _ json.RawMessage) string {
+		return partsSignature(jsontext.Value(raw), func(typeName string, _ jsontext.Value) string {
 			return "\n[" + typeName + "]\n"
 		})
 	default:

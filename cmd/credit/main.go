@@ -17,7 +17,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +30,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -85,9 +85,9 @@ type accountResult struct {
 	Remain   *int64 `json:"remain"`
 	Used     *int64 `json:"used"`
 	Size     *int64 `json:"size"`
-	Packages int    `json:"packages,omitempty"`
+	Packages int    `json:"packages,omitempty,omitzero"`
 	OK       bool   `json:"ok"`
-	Error    string `json:"error,omitempty"`
+	Error    string `json:"error,omitempty,omitzero"`
 }
 
 type resourcePackage struct {
@@ -202,7 +202,7 @@ func fetchUserResourceAt(
 func newUserResourceRequest(base, path string, account *auth.Auth, agent string) (*http.Request, error) {
 	now := time.Now()
 
-	body, err := json.Marshal(map[string]any{
+	body, err := jsonx.Marshal(map[string]any{
 		"PageNumber":               1,
 		"PageSize":                 100,
 		"ProductCode":              "p_tcaca",
@@ -258,7 +258,7 @@ func parseUserResource(body io.Reader) (remain, used, size int64, packs int, err
 			} `json:"Response"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(body).Decode(&env); err != nil {
+	if err := jsonx.UnmarshalRead(body, &env); err != nil {
 		return 0, 0, 0, 0, fmt.Errorf("parseUserResource: %w", err)
 	}
 
@@ -361,7 +361,7 @@ func writeJSONReport(
 		"accounts": accounts,
 	}
 
-	raw, err := json.Marshal(out)
+	raw, err := jsonx.Marshal(out)
 	if err != nil {
 		return fmt.Errorf("marshal output: %w", err)
 	}

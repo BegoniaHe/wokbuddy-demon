@@ -25,7 +25,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -39,6 +39,7 @@ import (
 
 	auth2 "github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
@@ -209,15 +210,15 @@ func noAuthHeaders(base func(*http.Request)) func(*http.Request) {
 
 // apiEnvelope 与 main.go:429-433 一致。
 type apiEnvelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
+	Code int            `json:"code"`
+	Msg  string         `json:"msg"`
+	Data jsontext.Value `json:"data"`
 }
 
 // doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error。
 func doJSON(
 	client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader,
-) (json.RawMessage, int, error) {
+) (jsontext.Value, int, error) {
 	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
@@ -246,7 +247,7 @@ func doJSON(
 	// 先解信封：业务错误可能随任意 HTTP 状态返回（含 4xx），code 比状态码更权威。
 	var env apiEnvelope
 
-	parseErr := json.Unmarshal(raw, &env)
+	parseErr := jsonx.Unmarshal(raw, &env)
 	if parseErr == nil && env.Code != 0 {
 		return nil, resp.StatusCode, &logincode.Error{Code: env.Code, Msg: env.Msg, Status: resp.StatusCode}
 	}
@@ -275,8 +276,8 @@ func fatalf(format string, args ...any) {
 
 type loginState struct {
 	State string `json:"state"`
-	Realm string `json:"realm,omitempty"` // url 落盘时写回的 realm，poll 读回校验防混域
-	Base  string `json:"base,omitempty"`  // url 命中 origin，poll 优先同源
+	Realm string `json:"realm,omitempty,omitzero"` // url 落盘时写回的 realm，poll 读回校验防混域
+	Base  string `json:"base,omitempty,omitzero"`  // url 命中 origin，poll 优先同源
 }
 
 // tokenBundle 是 auth/token 成功返回的凭证包。
@@ -439,11 +440,11 @@ func runURL(base, origin, realm, statePath string, identity loginIdentity, clien
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
-	if err := json.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
+	if err := jsonx.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
 		fatalf("auth state: missing state or authUrl")
 	}
 
-	raw, merr := json.Marshal(loginState{State: item.State, Realm: realm, Base: usedBase})
+	raw, merr := jsonx.Marshal(loginState{State: item.State, Realm: realm, Base: usedBase})
 	if merr != nil {
 		fatalf("marshal state: %v", merr)
 	}
@@ -479,7 +480,7 @@ func runPoll(
 		failOnPollAccountError(err)
 	}
 
-	oraw, oerr := json.Marshal(buildLoginOutput(tok, realm, acct))
+	oraw, oerr := jsonx.Marshal(buildLoginOutput(tok, realm, acct))
 	if oerr != nil {
 		fatalf("marshal output: %v", oerr)
 	}
@@ -574,7 +575,7 @@ func loadLoginState(statePath, realm string) loginState {
 	}
 
 	var loginState2 loginState
-	if err := json.Unmarshal(raw, &loginState2); err != nil {
+	if err := jsonx.Unmarshal(raw, &loginState2); err != nil {
 		fatalf("parse state: %v", err)
 	}
 
@@ -597,7 +598,7 @@ func pollTokenOnce(
 	}
 
 	var tok tokenBundle
-	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
+	if err := jsonx.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
 		return tokenBundle{}, status, errLoginPending
 	}
 
@@ -666,7 +667,7 @@ func pollAccount(
 		return accountInfo{}, errAcct
 	}
 
-	if err := json.Unmarshal(acctRaw, &acct); err != nil {
+	if err := jsonx.Unmarshal(acctRaw, &acct); err != nil {
 		return accountInfo{}, fmt.Errorf("parse account: %w", err)
 	}
 

@@ -8,7 +8,6 @@ package safefile
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,6 +16,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/atomicwrite"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // ErrCorrupt 正文损坏且 .bak 不可用。
@@ -32,7 +32,7 @@ func Write(path string, data []byte, perm fs.FileMode) error {
 // （避免用「合法 JSON 但调用方无法解析」的内容污染唯一退路）。
 func WriteKeep(path string, data []byte, perm fs.FileMode, valid func([]byte) bool) error {
 	if valid == nil {
-		valid = json.Valid
+		valid = jsonx.Valid
 	}
 
 	if err := keep(path, perm, valid); err != nil {
@@ -57,7 +57,7 @@ func Read(path string, valid func([]byte) bool) ([]byte, error) {
 // 而 Read 的 (data, nil) 让调用方无从分辨。
 func ReadWithFallback(path string, valid func([]byte) bool) ([]byte, bool, error) {
 	if valid == nil {
-		valid = json.Valid
+		valid = jsonx.Valid
 	}
 
 	data, err := os.ReadFile(path)

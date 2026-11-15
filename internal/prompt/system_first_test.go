@@ -1,16 +1,17 @@
 package prompt
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func firstRole(t *testing.T, body []byte) (string, string) {
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonx.Unmarshal(body, &obj); err != nil {
 		t.Fatalf("unmarshal: %v (%s)", err, body)
 	}
 

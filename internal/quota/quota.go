@@ -5,7 +5,6 @@
 package quota
 
 import (
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"log"
@@ -15,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -75,7 +75,7 @@ func (s *Store) load() {
 
 	for _, line := range splitLines(raw) {
 		var e Event
-		if json.Unmarshal(line, &e) != nil || e.UID == "" || e.Model == "" {
+		if jsonx.Unmarshal(line, &e) != nil || e.UID == "" || e.Model == "" {
 			continue
 		}
 
@@ -212,7 +212,7 @@ func (s *Store) persistLocked() {
 
 	raw := make([]byte, 0, len(s.events)*128)
 	for _, e := range s.events {
-		line, err := json.Marshal(e)
+		line, err := jsonx.Marshal(e)
 		if err != nil {
 			continue
 		}

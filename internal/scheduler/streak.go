@@ -8,7 +8,7 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"log"
 	"slices"
 	"time"
@@ -247,7 +247,7 @@ const maxStreakPayloadLen = 220
 
 // compactJSON 裁剪奖品载荷（日志单行可读）。截断点回退到 UTF-8 rune 边界：
 // 奖品名是中文，按字节切会打出半个字符。
-func compactJSON(raw json.RawMessage) string {
+func compactJSON(raw jsontext.Value) string {
 	return logfmt.TruncateEllipsis(string(raw), maxStreakPayloadLen)
 }
 

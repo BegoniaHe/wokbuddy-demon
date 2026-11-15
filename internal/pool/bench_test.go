@@ -1,12 +1,12 @@
 package pool
 
 import (
-	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // 本文件为 P 组性能审查的量化基准（go test -bench 可复现），结论见 REVIEW-conflicts-perf.md。
@@ -41,7 +41,7 @@ func BenchmarkStateSerialize46Accounts(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		if _, err := json.MarshalIndent(sf, "", "  "); err != nil {
+		if _, err := jsonx.MarshalIndent(sf); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -56,7 +56,7 @@ func BenchmarkStateSerializeCompact46(b *testing.B) {
 	b.ResetTimer()
 
 	for range b.N {
-		if _, err := json.Marshal(sf); err != nil {
+		if _, err := jsonx.Marshal(sf); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -72,7 +72,7 @@ func BenchmarkSnapshotMarshal46(b *testing.B) {
 
 	for range b.N {
 		now := time.Now()
-		if _, err := json.Marshal(snapshot{stateFile: stateFile2, SavedAt: now}); err != nil {
+		if _, err := jsonx.Marshal(snapshot{stateFile: stateFile2, SavedAt: now}); err != nil {
 			b.Fatal(err)
 		}
 	}

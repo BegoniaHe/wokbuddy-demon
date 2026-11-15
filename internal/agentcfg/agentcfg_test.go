@@ -1,13 +1,14 @@
 package agentcfg
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestApplyBackupRestoreCreated(t *testing.T) {
@@ -324,7 +325,7 @@ func TestApplyNullExistingConfig(t *testing.T) {
 	}
 
 	var claude map[string]any
-	if uerr := json.Unmarshal(claudeRaw, &claude); uerr != nil {
+	if uerr := jsonx.Unmarshal(claudeRaw, &claude); uerr != nil {
 		t.Fatalf("claude output: %v", uerr)
 	}
 
@@ -339,7 +340,7 @@ func TestApplyNullExistingConfig(t *testing.T) {
 	}
 
 	var opencode map[string]any
-	if uerr := json.Unmarshal(opencodeRaw, &opencode); uerr != nil {
+	if uerr := jsonx.Unmarshal(opencodeRaw, &opencode); uerr != nil {
 		t.Fatalf("opencode output: %v", uerr)
 	}
 

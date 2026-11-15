@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var (
@@ -46,7 +46,7 @@ func TestReportChatActivitySendsArrayWithUserID(t *testing.T) {
 		raw, _ = io.ReadAll(r.Body)
 
 		var arr []map[string]any
-		if err := json.Unmarshal(raw, &arr); err != nil {
+		if err := jsonx.Unmarshal(raw, &arr); err != nil {
 			t.Fatalf("body must be a JSON array: %v (body=%s)", err, raw)
 		}
 
@@ -257,13 +257,13 @@ func TestChatRequestEventShapeMatches593(t *testing.T) {
 	account := &auth.Auth{UID: "u-shape", AccessToken: "at"}
 	event := newChatRequestEvent(account, "conv-1", "01a17a9c4d2f7b3e8c5a6d4e2f1b0a93", "glm-5.2", "GLM 5.2")
 
-	raw, err := json.Marshal(event)
+	raw, err := jsonx.Marshal(event)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 

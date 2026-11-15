@@ -5,7 +5,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/desktopcred"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // desktopImportMaxBody 导入请求体上限；key 与路径列表都很小。
@@ -104,7 +104,7 @@ func parseDesktopImport(r *http.Request) (struct {
 		return req, errRequestBodyTooLarge
 	}
 
-	if err := json.Unmarshal(raw, &req); err != nil {
+	if err := jsonx.Unmarshal(raw, &req); err != nil {
 		return req, fmt.Errorf("invalid json: %w", err)
 	}
 

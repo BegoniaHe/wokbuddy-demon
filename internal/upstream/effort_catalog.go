@@ -17,7 +17,9 @@
 // 兜底值；远端 FetchModels 返回时以远端为准。修改本表必须先补官方/远端证据。
 package upstream
 
-import "slices"
+import (
+	"slices"
+)
 
 // effortCap 一个模型的档位能力（对齐产品兜底表条目 reasoningEfforts + defaultReasoningEffort）。
 type effortCap struct {

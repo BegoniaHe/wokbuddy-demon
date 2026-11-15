@@ -10,10 +10,12 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // GatewayHint 按错误形态返回网关视角的补充说明（error.gateway_hint 字段值）。
@@ -136,7 +138,7 @@ func FrameKind(payload string) ErrKind {
 
 	// 顶层 {code,msg} 业务错误帧（issue #244）：与 error 帧同口径分类。
 	if code, msg, ok := BusinessFrameError(payload); ok {
-		probe, err := json.Marshal(struct {
+		probe, err := jsonx.Marshal(struct {
 			Code string `json:"code"`
 			Msg  string `json:"msg"`
 		}{Code: code, Msg: msg})
@@ -151,24 +153,24 @@ func FrameKind(payload string) ErrKind {
 
 	var frame struct {
 		Data struct {
-			Code json.RawMessage `json:"code"`
+			Code jsontext.Value `json:"code"`
 		} `json:"data"`
 		Error struct {
-			Code    json.RawMessage `json:"code"`
-			Message string          `json:"message"`
+			Code    jsontext.Value `json:"code"`
+			Message string         `json:"message"`
 			Data    struct {
-				Code json.RawMessage `json:"code"`
+				Code jsontext.Value `json:"code"`
 			} `json:"data"`
 		} `json:"error"`
 	}
-	if json.Unmarshal([]byte(payload), &frame) != nil {
+	if jsonx.Unmarshal([]byte(payload), &frame) != nil {
 		return ErrNone
 	}
 
 	message := strings.TrimSpace(frame.Error.Message)
 	if code := firstJSONCode(frame.Error.Code, frame.Error.Data.Code, frame.Data.Code); code != "" {
 		// 合成信封保留 code 与 message：已知码按码分类，未知码仍可由文案兜底。
-		probe, err := json.Marshal(struct {
+		probe, err := jsonx.Marshal(struct {
 			Code string `json:"code"`
 			Msg  string `json:"msg"`
 		}{Code: code, Msg: message})
@@ -187,14 +189,14 @@ func FrameKind(payload string) ErrKind {
 }
 
 // firstJSONCode 返回首个非空的 JSON code 值（字符串或数字），空/非法返回空串。
-func firstJSONCode(raws ...json.RawMessage) string {
+func firstJSONCode(raws ...jsontext.Value) string {
 	for _, raw := range raws {
 		if len(raw) == 0 {
 			continue
 		}
 
 		var value any
-		if json.Unmarshal(raw, &value) != nil {
+		if jsonx.Unmarshal(raw, &value) != nil {
 			continue
 		}
 
@@ -280,7 +282,7 @@ func codeMarker(lower, code string) bool {
 // 只认同时具备非零 code 与 msg、且没有 choices/delta 的形态，避免误伤正常分片。
 func BusinessFrameError(payload string) (code, msg string, ok bool) {
 	var frame map[string]any
-	if json.Unmarshal([]byte(payload), &frame) != nil {
+	if jsonx.Unmarshal([]byte(payload), &frame) != nil {
 		return "", "", false
 	}
 
@@ -340,10 +342,10 @@ func stringValueAny(value any) string {
 
 // BusinessErrorFrame 把顶层业务错误包成 OpenAI error 帧（保留原始 code/msg）。
 func BusinessErrorFrame(payload, code, msg string) string {
-	out, err := json.Marshal(map[string]any{
+	out, err := jsonx.Marshal(map[string]any{
 		"error": map[string]any{
 			"message": msg, "type": "upstream_error", "code": code,
-			"upstream_payload": json.RawMessage(payload),
+			"upstream_payload": jsontext.Value(payload),
 		},
 	})
 	if err != nil {

@@ -6,12 +6,11 @@
 package clientprofile
 
 import (
-	"bytes"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"log"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -90,9 +90,9 @@ type Stainless struct {
 // Evidence 单个 surface 的来源证据。
 type Evidence struct {
 	Source  string `json:"source"`
-	File    string `json:"file,omitempty"`
-	Snippet string `json:"snippet,omitempty"`
-	Note    string `json:"note,omitempty"`
+	File    string `json:"file,omitempty,omitzero"`
+	Snippet string `json:"snippet,omitempty,omitzero"`
+	Note    string `json:"note,omitempty,omitzero"`
 }
 
 // Profile 一个 realm 的冻结快照。
@@ -104,7 +104,7 @@ type Profile struct {
 	Evidence map[string]Evidence `json:"evidence"`
 	// TLS 官方 ClientHello 参数（可选）。只有 upstream.tls_fingerprint=node 时必需；
 	// 两个已加载 realm 的该段必须逐字段相等（共享 Transport 无法按 realm 分流）。
-	TLS *TLS `json:"tls,omitempty"`
+	TLS *TLS `json:"tls,omitempty,omitzero"`
 }
 
 // TLS 官方 Node/BoringSSL ClientHello 的数值参数（#458）。顺序即线上顺序：
@@ -114,9 +114,52 @@ type TLS struct {
 	CipherSuites        []uint16 `json:"cipherSuites"`
 	Extensions          []uint16 `json:"extensions"`
 	Groups              []uint16 `json:"groups"`
-	PointFormats        []uint8  `json:"pointFormats"`
+	PointFormats        byteList `json:"pointFormats"`
 	SignatureAlgorithms []uint16 `json:"signatureAlgorithms"`
-	PSKModes            []uint8  `json:"pskModes"`
+	PSKModes            byteList `json:"pskModes"`
+}
+
+// byteList 是 JSON 数字数组形态的字节列表。
+//
+// encoding/json/v2 把 []byte 当作 base64 字符串，而官方 ClientHello 导出的是
+// 数字数组（[0]、[1]），故显式按数组语义编解码，避免把 TLS 参数读成 base64。
+type byteList []uint8
+
+// UnmarshalJSON 按数字数组解析，并校验落在 uint8 范围内。
+func (b *byteList) UnmarshalJSON(raw []byte) error {
+	var values []int
+	if err := jsonx.Unmarshal(raw, &values); err != nil {
+		return fmt.Errorf("byteList: %w", err)
+	}
+
+	out := make(byteList, len(values))
+
+	for i, value := range values {
+		if value < 0 || value > math.MaxUint8 {
+			return fmt.Errorf("byteList: 值 %d 超出 uint8 范围: %w", value, errInvalidProfile)
+		}
+
+		out[i] = uint8(value)
+	}
+
+	*b = out
+
+	return nil
+}
+
+// MarshalJSON 按数字数组输出（客户端指纹快照的既有格式）。
+func (b byteList) MarshalJSON() ([]byte, error) {
+	values := make([]int, len(b))
+	for i, value := range b {
+		values[i] = int(value)
+	}
+
+	out, err := jsonx.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("byteList: 编码数字数组: %w", err)
+	}
+
+	return out, nil
 }
 
 // Equal 判断两个 tls 段是否逐字段相等；nil 与 nil 相等。
@@ -274,14 +317,9 @@ func LoadFile(path string) (*Profile, error) {
 
 	var profile Profile
 
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&profile); err != nil {
-		return nil, fmt.Errorf("parse client profile %s: %w", path, err)
-	}
-
-	if err := ensureEOF(decoder); err != nil {
+	// 拒绝未知字段与多段 JSON：profile 是部署侧快照，字段漂移或拼接内容都不该
+	// 被静默接受（jsonx.Unmarshal 在首个值之后遇到非空白内容即报错）。
+	if err := jsonx.Unmarshal(raw, &profile, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return nil, fmt.Errorf("parse client profile %s: %w", path, err)
 	}
 
@@ -290,19 +328,6 @@ func LoadFile(path string) (*Profile, error) {
 	}
 
 	return &profile, nil
-}
-
-func ensureEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return fmt.Errorf("文件包含多段 JSON: %w", errInvalidProfile)
-		}
-
-		return fmt.Errorf("decode trailing JSON: %w", err)
-	}
-
-	return nil
 }
 
 // Validate 校验结构、Win32 来源与出站值安全边界。不读解包树，因此不校验

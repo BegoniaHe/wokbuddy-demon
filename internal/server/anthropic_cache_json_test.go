@@ -3,11 +3,12 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"log"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestAnthropicCacheControlPreserved system 与 user text block 的 cache_control
@@ -32,7 +33,7 @@ func TestAnthropicCacheControlPreserved(t *testing.T) {
 			Content any    `json:"content"`
 		} `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 

@@ -28,13 +28,13 @@ const compensationWorkers = 5
 // CompensationRow 单个账号的补偿状态行（面板表格与批量汇总共用）。
 type CompensationRow struct {
 	UID      string `json:"uid"`
-	Nickname string `json:"nickname,omitempty"`
-	Realm    string `json:"realm,omitempty"`
+	Nickname string `json:"nickname,omitempty,omitzero"`
+	Realm    string `json:"realm,omitempty,omitzero"`
 	// Skipped 门控跳过（global / 企业版 / 禁用）。
-	Skipped bool   `json:"skipped,omitempty"`
-	Reason  string `json:"reason,omitempty"`
+	Skipped bool   `json:"skipped,omitempty,omitzero"`
+	Reason  string `json:"reason,omitempty,omitzero"`
 	// Error 查询或领取失败（非空即必须显形——这正是本文件的命题）。
-	Error string `json:"error,omitempty"`
+	Error string `json:"error,omitempty,omitzero"`
 	// Active / Claimed / CreditNum / EndTime 来自上游状态。
 	Active  bool `json:"active"`
 	Claimed bool `json:"claimed"`
@@ -42,7 +42,7 @@ type CompensationRow struct {
 	// 不能写成 0，issue #251）。
 	CreditNum   int64  `json:"credit_num"`
 	CreditKnown bool   `json:"credit_known"`
-	EndTime     string `json:"end_time,omitempty"`
+	EndTime     string `json:"end_time,omitempty,omitzero"`
 }
 
 // Pending 该行是否存在「可领且未领」的补偿（与 upstream.Pending 同口径）。

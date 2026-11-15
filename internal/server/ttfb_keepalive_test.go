@@ -3,7 +3,6 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -62,7 +62,7 @@ func assertCompleteSSEFrames(t *testing.T, body string) {
 				continue
 			}
 
-			if !json.Valid([]byte(payload)) {
+			if !jsonx.Valid([]byte(payload)) {
 				t.Errorf("data 帧不是完整合法 JSON: %q", payload)
 			}
 		default:

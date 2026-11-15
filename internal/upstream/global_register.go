@@ -18,7 +18,7 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // globalWebUA 国际版 web 端 UA（注册完善页走 web 指纹，非桌面端 CLI 指纹）。
@@ -64,7 +65,7 @@ func (*Client) globalRegisterReq(base, method, url, token string, body any) (*ht
 	var rdr io.Reader
 
 	if body != nil {
-		raw, err := json.Marshal(body)
+		raw, err := jsonx.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("globalRegisterReq: %w", err)
 		}
@@ -97,7 +98,7 @@ func (*Client) globalRegisterReq(base, method, url, token string, body any) (*ht
 // → 全局池 → 直连）。走 c.HTTP 会让绑了槽的 global 账号在这里暴露宿主机 IP。
 func (c *Client) globalRegisterJSON(
 	account *auth.Auth, req *http.Request,
-) (code int, msg string, raw json.RawMessage, err error) {
+) (code int, msg string, raw jsontext.Value, err error) {
 	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return 0, "", nil, fmt.Errorf("globalRegisterJSON: %w", err)
@@ -119,11 +120,11 @@ func (c *Client) globalRegisterJSON(
 	}
 
 	var env struct {
-		Code int             `json:"code"`
-		Msg  string          `json:"msg"`
-		Data json.RawMessage `json:"data"`
+		Code int            `json:"code"`
+		Msg  string         `json:"msg"`
+		Data jsontext.Value `json:"data"`
 	}
-	if err := json.Unmarshal(data, &env); err != nil {
+	if err := jsonx.Unmarshal(data, &env); err != nil {
 		return 0, "", nil, fmt.Errorf("global register parse: %w", err)
 	}
 
@@ -165,7 +166,7 @@ func (c *Client) GlobalFetchCountries(account2 *auth.Auth, intlOnly bool) ([]Glo
 			List []GlobalCountry `json:"list"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &inner); err != nil {
+	if err := jsonx.Unmarshal(raw, &inner); err != nil {
 		return nil, fmt.Errorf("country list parse: %w", err)
 	}
 
@@ -178,14 +179,14 @@ func (c *Client) GlobalFetchCountries(account2 *auth.Auth, intlOnly bool) ([]Glo
 }
 
 // unwrapCountryData 解 data 的双层信封：data 是 JSON 字符串时二次解析，否则原样返回。
-func unwrapCountryData(raw json.RawMessage) (json.RawMessage, error) {
+func unwrapCountryData(raw jsontext.Value) (jsontext.Value, error) {
 	if s := strings.TrimSpace(string(raw)); strings.HasPrefix(s, "\"") {
 		var s2 string
-		if err := json.Unmarshal(raw, &s2); err != nil {
+		if err := jsonx.Unmarshal(raw, &s2); err != nil {
 			return nil, fmt.Errorf("country list unwrap: %w", err)
 		}
 
-		return json.RawMessage(s2), nil
+		return jsontext.Value(s2), nil
 	}
 
 	return raw, nil

@@ -11,7 +11,6 @@
 package credithist
 
 import (
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"log"
@@ -21,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -45,7 +45,7 @@ type Entry struct {
 	UID    string    `json:"uid"`
 	Delta  int64     `json:"delta"`
 	Remain int64     `json:"remain"`
-	Note   string    `json:"note,omitempty"`
+	Note   string    `json:"note,omitempty,omitzero"`
 }
 
 // Ledger 账本（并发安全）。
@@ -92,7 +92,7 @@ func (l *Ledger) load() {
 
 	// safefile.Read 在正文不可解析时回落 .bak：坏文件按空账本继续、下一次 Flush
 	// 又把它彻底覆盖，账本就永久丢了。首次运行/文件缺失仍是「从空账本开始」。
-	raw, err := safefile.Read(l.path, json.Valid)
+	raw, err := safefile.Read(l.path, jsonx.Valid)
 	if err != nil {
 		// 最严重的「正文与 .bak 都坏」原先无声返回：账本随后从空开始、第一次
 		// Flush 就覆盖正文，用户既丢流水也无从知道原因。
@@ -104,7 +104,7 @@ func (l *Ledger) load() {
 	}
 
 	var doc fileDoc
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		log.Printf("WARN: [credithist] 账本损坏，按空账本继续: %v", err)
 		return
 	}
@@ -227,7 +227,7 @@ func (l *Ledger) Flush() {
 	flushedSeq := l.seq
 	l.mu.Unlock()
 
-	raw, err := json.Marshal(fileDoc{Version: 1, Entries: entries})
+	raw, err := jsonx.Marshal(fileDoc{Version: 1, Entries: entries})
 	if err != nil {
 		log.Printf("WARN: [credithist] 序列化失败: %v", err)
 
@@ -246,7 +246,7 @@ func (l *Ledger) Flush() {
 		return
 	}
 	// WriteKeep 保留上一份有效账本为 .bak（与 load 的回退口径配对）。
-	if err := safefile.WriteKeep(l.path, raw, 0o600, json.Valid); err != nil {
+	if err := safefile.WriteKeep(l.path, raw, 0o600, jsonx.Valid); err != nil {
 		log.Printf("WARN: [credithist] 落盘失败: %v", err)
 
 		return

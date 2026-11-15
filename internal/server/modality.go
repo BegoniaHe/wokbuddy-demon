@@ -12,12 +12,12 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"log"
 	"net/http"
 	"slices"
 	"strings"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -28,7 +28,7 @@ import (
 var contentTypeMarker = []byte(`"type"`)
 
 // modalityContent 只保留 part 数组里的 type：字符串 content（纯文本，最常见）在
-// UnmarshalJSON 里直接跳过，不复制原文。此前用 json.RawMessage 会把每条消息的
+// UnmarshalJSON 里直接跳过，不复制原文。此前用 jsontext.Value 会把每条消息的
 // content 全文复制一份，长上下文下每请求几十 KB 的无谓分配。
 type modalityContent struct {
 	parts []struct {
@@ -48,7 +48,7 @@ func (c *modalityContent) UnmarshalJSON(raw []byte) error {
 	}
 	// 解析失败时整条消息按纯文本处理（与旧逐条 Unmarshal + continue 同义）；
 	// 不能保留半解析出的 parts，否则畸形 content 会误报出模态。
-	if err := json.Unmarshal(raw, &parts); err != nil {
+	if err := jsonx.Unmarshal(raw, &parts); err != nil {
 		return nil //nolint:nilerr // 畸形 content 按纯文本处理，不阻断整包请求解析
 	}
 
@@ -72,7 +72,7 @@ func requestModalities(body []byte) []string {
 			Content modalityContent `json:"content"`
 		} `json:"messages"`
 	}
-	if json.Unmarshal(body, &peek) != nil {
+	if jsonx.Unmarshal(body, &peek) != nil {
 		return nil
 	}
 

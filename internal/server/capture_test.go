@@ -3,7 +3,6 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // readOnlyCapture 读目录里唯一的样本文件并解成记录。
@@ -35,7 +35,7 @@ func readOnlyCapture(t *testing.T, dir string) captureRecord {
 	}
 
 	var record captureRecord
-	if err := json.Unmarshal(raw, &record); err != nil {
+	if err := jsonx.Unmarshal(raw, &record); err != nil {
 		t.Fatalf("decode sample: %v", err)
 	}
 

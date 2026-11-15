@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestClaimRewardWebEndpoint 领奖走 Web 域（workbuddy.cn）、任务码在路径里、无 body。
@@ -101,7 +101,7 @@ func TestClaimRewardNotCompleted(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]any{"code": 400, "msg": "task not completed"})
+		jsonx.MarshalWrite(w, map[string]any{"code": 400, "msg": "task not completed"})
 	}))
 	defer srv.Close()
 

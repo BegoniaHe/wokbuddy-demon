@@ -13,13 +13,13 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -270,5 +270,5 @@ func videoTaskFailed(raw []byte) bool {
 		} `json:"data"`
 	}
 
-	return json.Unmarshal(raw, &env) == nil && env.Data.Status == "failed"
+	return jsonx.Unmarshal(raw, &env) == nil && env.Data.Status == "failed"
 }

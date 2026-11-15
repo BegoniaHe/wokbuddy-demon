@@ -1,9 +1,10 @@
 package upstream
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // getThinkingType 从输出 body 提取 thinking.type（缺字段返回空串 + 是否存在）。
@@ -11,7 +12,7 @@ func getThinkingType(t *testing.T, out []byte) (typ string, present bool) {
 	t.Helper()
 
 	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
+	if err := jsonx.Unmarshal(out, &m); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
 
@@ -203,7 +204,7 @@ func objFieldString(t *testing.T, out []byte, key string) (string, bool) {
 	t.Helper()
 
 	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
+	if err := jsonx.Unmarshal(out, &m); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
@@ -330,7 +331,7 @@ func assertNonDeepSeekNoInjection(t *testing.T, body string) {
 	t.Helper()
 	// 记录输入是否已带 thinking 及值，输出必须逐字节语义不变。
 	var table map[string]any
-	if err := json.Unmarshal([]byte(body), &table); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &table); err != nil {
 		t.Fatalf("unmarshal input: %v", err)
 	}
 
@@ -338,7 +339,7 @@ func assertNonDeepSeekNoInjection(t *testing.T, body string) {
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 
 	var got map[string]any
-	if err := json.Unmarshal(out, &got); err != nil {
+	if err := jsonx.Unmarshal(out, &got); err != nil {
 		t.Fatalf("unmarshal out: %v (out=%s)", err, out)
 	}
 
@@ -350,9 +351,9 @@ func assertNonDeepSeekNoInjection(t *testing.T, body string) {
 
 	if inHadThink {
 		// 保留的 thinking 必须原值相等（JSON 语义级）。
-		inJSON, _ := json.Marshal(inTh)
+		inJSON, _ := jsonx.Marshal(inTh)
 
-		outJSON, _ := json.Marshal(outTh)
+		outJSON, _ := jsonx.Marshal(outTh)
 		if string(inJSON) != string(outJSON) {
 			t.Errorf("thinking 被改动: in=%s out=%s", inJSON, outJSON)
 		}
@@ -388,7 +389,7 @@ func TestInjectThinkingStringPreserved(t *testing.T) {
 	)
 
 	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
+	if err := jsonx.Unmarshal(out, &m); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 

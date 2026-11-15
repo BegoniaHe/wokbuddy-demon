@@ -1,11 +1,12 @@
 package quota
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestBudgetsAndDedup(t *testing.T) {
@@ -49,7 +50,7 @@ func TestLoadPrunesExpiredEvents(t *testing.T) {
 		{UID: "u1", Realm: "cn", Model: "m", ResetAt: old, Used: 100, At: old},
 		{UID: "u2", Realm: "cn", Model: "m", ResetAt: now, Used: 300, At: now},
 	} {
-		line, err := json.Marshal(event)
+		line, err := jsonx.Marshal(event)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}

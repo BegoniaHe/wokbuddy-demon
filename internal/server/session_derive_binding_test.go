@@ -3,13 +3,13 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
@@ -36,7 +36,7 @@ func userIDOnlyBodyFor(uid, first, last string) map[string]any {
 func marshalBody(t *testing.T, body map[string]any) string {
 	t.Helper()
 
-	raw, err := json.Marshal(body)
+	raw, err := jsonx.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -193,7 +193,7 @@ func decodeOpenAIModelIDs(t *testing.T, rec *httptest.ResponseRecorder) []string
 	var body struct {
 		Data []map[string]any `json:"data"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v body=%s", err, rec.Body)
 	}
 
@@ -338,7 +338,7 @@ func TestModelsByKeyAnthropicPagination(t *testing.T) {
 		LastID  string           `json:"last_id"`
 		HasMore bool             `json:"has_more"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 

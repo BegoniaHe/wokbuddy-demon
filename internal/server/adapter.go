@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +8,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -47,7 +47,7 @@ func newChatInput(
 		Model  string `json:"model"`
 	}
 
-	_ = json.Unmarshal(body, &peek)
+	_ = jsonx.Unmarshal(body, &peek)
 
 	chatInput2 := newChatInputFromRequest(r, body, peek.Stream, peek.Model)
 
@@ -172,7 +172,7 @@ func (r *httpResponder) writeHeartbeat() error {
 func (r *httpResponder) writeErrorFrame(code, msg, hint string) {
 	r.setSSEHeaders()
 
-	raw, err := json.Marshal(openAIErrorEnvelope(code, msg, hint))
+	raw, err := jsonx.Marshal(openAIErrorEnvelope(code, msg, hint))
 	if err != nil {
 		return // map 只含 string，编码不会失败；真失败也不能改写已提交的响应头
 	}

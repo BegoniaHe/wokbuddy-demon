@@ -3,7 +3,6 @@ package scheduler
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -46,7 +46,7 @@ func (s *travelStub) handler() http.Handler {
 				LocationID int `json:"location_id"`
 			}
 
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = jsonx.UnmarshalRead(r.Body, &body)
 			s.location.Store(int64(body.LocationID))
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case "/activity/growth/buddy/travel/claim":

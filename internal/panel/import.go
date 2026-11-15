@@ -3,7 +3,7 @@ package panel
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -237,7 +238,7 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 	switch trimmed[0] {
 	case '[':
 		var accounts []cockpitAccount
-		if err := json.Unmarshal(trimmed, &accounts); err != nil {
+		if err := jsonx.Unmarshal(trimmed, &accounts); err != nil {
 			return nil, fmt.Errorf("accounts array: %w", err)
 		}
 
@@ -247,8 +248,8 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 		return nil, errCockpitRootValue
 	}
 
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(trimmed, &obj); err != nil {
+	var obj map[string]jsontext.Value
+	if err := jsonx.Unmarshal(trimmed, &obj); err != nil {
 		return nil, fmt.Errorf("root object: %w", err)
 	}
 
@@ -260,7 +261,7 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 	// 当成 uid 键，报出与真实原因无关的错误。
 	if isCockpitAccountObject(obj) {
 		var acc cockpitAccount
-		if err := json.Unmarshal(trimmed, &acc); err != nil {
+		if err := jsonx.Unmarshal(trimmed, &acc); err != nil {
 			return nil, fmt.Errorf("single account: %w", err)
 		}
 
@@ -271,7 +272,7 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 }
 
 // isCockpitAccountObject 判定对象是否为单条账号（任一账号键存在即算）。
-func isCockpitAccountObject(obj map[string]json.RawMessage) bool {
+func isCockpitAccountObject(obj map[string]jsontext.Value) bool {
 	for _, key := range []string{"uid", "access_token", "accessToken"} {
 		if _, ok := obj[key]; ok {
 			return true
@@ -283,17 +284,17 @@ func isCockpitAccountObject(obj map[string]json.RawMessage) bool {
 
 // decodeCockpitEnvelope 解 {account,auth} 信封：account 段可为单对象或数组，
 // 凭证段 auth 的非空字段补齐到每个账号上。
-func decodeCockpitEnvelope(accountRaw, authRaw json.RawMessage) ([]cockpitAccount, error) {
+func decodeCockpitEnvelope(accountRaw, authRaw jsontext.Value) ([]cockpitAccount, error) {
 	var authPart cockpitAccount
 
 	if len(bytes.TrimSpace(authRaw)) > 0 {
-		if err := json.Unmarshal(authRaw, &authPart); err != nil {
+		if err := jsonx.Unmarshal(authRaw, &authPart); err != nil {
 			return nil, fmt.Errorf("auth segment: %w", err)
 		}
 	}
 
 	var accounts []cockpitAccount
-	if err := json.Unmarshal(accountRaw, &accounts); err == nil {
+	if err := jsonx.Unmarshal(accountRaw, &accounts); err == nil {
 		for i := range accounts {
 			accounts[i].fillMissing(&authPart)
 		}
@@ -302,7 +303,7 @@ func decodeCockpitEnvelope(accountRaw, authRaw json.RawMessage) ([]cockpitAccoun
 	}
 
 	var single cockpitAccount
-	if err := json.Unmarshal(accountRaw, &single); err != nil {
+	if err := jsonx.Unmarshal(accountRaw, &single); err != nil {
 		return nil, fmt.Errorf("account segment: %w", err)
 	}
 
@@ -312,7 +313,7 @@ func decodeCockpitEnvelope(accountRaw, authRaw json.RawMessage) ([]cockpitAccoun
 }
 
 // decodeCockpitDict 解 `{"<uid>":{…}}` 字典；排序保证错误顺序与导入顺序可复现。
-func decodeCockpitDict(obj map[string]json.RawMessage) ([]cockpitAccount, error) {
+func decodeCockpitDict(obj map[string]jsontext.Value) ([]cockpitAccount, error) {
 	keys := make([]string, 0, len(obj))
 	for key := range obj {
 		keys = append(keys, key)
@@ -329,7 +330,7 @@ func decodeCockpitDict(obj map[string]json.RawMessage) ([]cockpitAccount, error)
 		}
 
 		var acc cockpitAccount
-		if err := json.Unmarshal(val, &acc); err != nil {
+		if err := jsonx.Unmarshal(val, &acc); err != nil {
 			return nil, fmt.Errorf("dictionary entry %q: %w", key, err)
 		}
 

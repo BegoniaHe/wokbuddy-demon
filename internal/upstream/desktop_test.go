@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestDesktopBuddyAppSequenceIsFirstPageBool 钉住 buddyapp_enter_click 的字段类型
@@ -69,7 +69,7 @@ func TestReportDesktopEventFingerprint(t *testing.T) {
 		gotUA = r.Header.Get("User-Agent")
 
 		raw, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(raw, &got); err != nil {
+		if err := jsonx.Unmarshal(raw, &got); err != nil {
 			t.Fatalf("body must be array: %v", err)
 		}
 
@@ -252,7 +252,7 @@ func TestReportDesktopEventBusinessFieldsOverride(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
-		if err := json.Unmarshal(raw, &got); err != nil {
+		if err := jsonx.Unmarshal(raw, &got); err != nil {
 			t.Fatalf("body must be array: %v", err)
 		}
 
@@ -586,7 +586,7 @@ func TestSetAppearanceTheme(t *testing.T) {
 		}
 
 		raw, _ := io.ReadAll(r.Body)
-		json.Unmarshal(raw, &got)
+		jsonx.Unmarshal(raw, &got)
 		w.Write([]byte(`{"code":0,"msg":"OK"}`))
 	}))
 	defer srv.Close()
@@ -613,7 +613,7 @@ func TestDesktopReportHostDomainAndEnterprise(t *testing.T) {
 		header = r.Header.Clone()
 
 		raw, _ := io.ReadAll(r.Body)
-		_ = json.Unmarshal(raw, &got)
+		_ = jsonx.Unmarshal(raw, &got)
 
 		w.Write([]byte(`{"code":0,"msg":"OK"}`))
 	}))

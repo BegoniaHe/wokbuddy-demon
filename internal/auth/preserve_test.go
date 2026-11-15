@@ -4,13 +4,14 @@
 package auth
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // readDoc 把落盘文件解码成通用文档，用于断言未建模键。
@@ -23,7 +24,7 @@ func readDoc(t *testing.T, path string) map[string]any {
 	}
 
 	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal %s: %v", path, err)
 	}
 

@@ -295,11 +295,11 @@ type UpstreamHealthRow struct {
 // UpstreamHealthSnapshot 面板 overview 暴露的滑窗快照。
 type UpstreamHealthSnapshot struct {
 	Enabled bool   `json:"enabled"`
-	Window  string `json:"window,omitempty"`
+	Window  string `json:"window,omitempty,omitzero"`
 	// TTFBThresholdMs 与 ErrorRatioThreshold/MinSamples 是当前生效阈值。
-	TTFBThresholdMs     int64   `json:"ttfb_threshold_ms,omitempty"`
-	ErrorRatioThreshold float64 `json:"error_ratio_threshold,omitempty"`
-	MinSamples          int     `json:"min_samples,omitempty"`
+	TTFBThresholdMs     int64   `json:"ttfb_threshold_ms,omitempty,omitzero"`
+	ErrorRatioThreshold float64 `json:"error_ratio_threshold,omitempty,omitzero"`
+	MinSamples          int     `json:"min_samples,omitempty,omitzero"`
 	// Rows 全局行在前，其余按 (域, 模型) 排序。
 	Rows []UpstreamHealthRow `json:"rows"`
 }

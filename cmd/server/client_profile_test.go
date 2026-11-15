@@ -1,13 +1,13 @@
 package main
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -62,7 +62,7 @@ func writeClientProfile(t *testing.T, dir, realm string) {
 		},
 	}
 
-	raw, err := json.Marshal(profile)
+	raw, err := jsonx.Marshal(profile)
 	if err != nil {
 		t.Fatalf("marshal profile: %v", err)
 	}

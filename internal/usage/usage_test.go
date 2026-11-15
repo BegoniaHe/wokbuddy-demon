@@ -1,13 +1,14 @@
 package usage
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // 成功/失败尝试计数、total 的 pt+ct 兜底口径、按域/账号聚合。
@@ -98,7 +99,7 @@ func TestFlushLoadRoundtrip(t *testing.T) {
 	raw, _ := os.ReadFile(path)
 
 	var f file
-	if err := json.Unmarshal(raw, &f); err != nil || f.Version != fileVersion || len(f.Buckets) != 1 {
+	if err := jsonx.Unmarshal(raw, &f); err != nil || f.Version != fileVersion || len(f.Buckets) != 1 {
 		t.Fatalf("落盘文件异常: err=%v buckets=%d", err, len(f.Buckets))
 	}
 }

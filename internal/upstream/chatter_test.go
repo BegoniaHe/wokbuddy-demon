@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestChatQuestionPoolShape 断言内嵌题池已被过滤且可用于出站：
@@ -158,7 +158,7 @@ func assertPoolContents(t *testing.T, raws [][]byte) {
 				Content string `json:"content"`
 			} `json:"messages"`
 		}
-		if err := json.Unmarshal(raw, &body); err != nil {
+		if err := jsonx.Unmarshal(raw, &body); err != nil {
 			t.Fatalf("chat body 解析失败: %v", err)
 		}
 

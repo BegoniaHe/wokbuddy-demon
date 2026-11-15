@@ -11,7 +11,7 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var (
@@ -758,9 +759,9 @@ func parseGlobalModelNames(raw []byte) (globalCatalogParse, error) {
 // agents 两个提取口只差键名与元素类型，合并到这一处。
 //
 //nolint:gocognit // 递归遍历多信封，键/数组两类分支集中。
-func payloadFind[S ~[]E, E any](payload json.RawMessage, key string) S {
+func payloadFind[S ~[]E, E any](payload jsontext.Value, key string) S {
 	var root any
-	if json.Unmarshal(payload, &root) != nil {
+	if jsonx.Unmarshal(payload, &root) != nil {
 		return nil
 	}
 
@@ -772,10 +773,10 @@ func payloadFind[S ~[]E, E any](payload json.RawMessage, key string) S {
 		switch node := value.(type) {
 		case map[string]any:
 			if raw, ok := node[key]; ok {
-				encoded, err := json.Marshal(raw)
+				encoded, err := jsonx.Marshal(raw)
 				if err == nil {
 					var typed S
-					if json.Unmarshal(encoded, &typed) == nil && len(typed) > 0 {
+					if jsonx.Unmarshal(encoded, &typed) == nil && len(typed) > 0 {
 						found = typed
 						return true
 					}
@@ -801,13 +802,13 @@ func payloadFind[S ~[]E, E any](payload json.RawMessage, key string) S {
 
 // resolveAvailableModels 从 payload 任意层级提取 availableModels。
 // 支持字符串数组与对象数组（_meta["codebuddy.ai"].availableModels 为对象形态）。
-func resolveAvailableModels(payload json.RawMessage) []string {
+func resolveAvailableModels(payload jsontext.Value) []string {
 	return payloadFind[modelIDList](payload, "availableModels")
 }
 
 // resolveGlobalAgents 从 payload 任意层级提取 agents（global 多信封兜底）。
 // 找不到或结构不符返回 nil，调用方据此保持「无判定」。
-func resolveGlobalAgents(payload json.RawMessage) []modelAgent {
+func resolveGlobalAgents(payload jsontext.Value) []modelAgent {
 	return payloadFind[modelAgents](payload, "agents")
 }
 
@@ -843,15 +844,15 @@ func filterGlobalCatalog(names []string, infos []ModelInfo, available []string) 
 
 // resolveGlobalPayload 解信封：code 非 0 拒绝（字段缺失 = 放行，兼容无信封直出的目录
 // 端点）；payload = data（非空非 null 时）否则整包。
-func resolveGlobalPayload(raw []byte) (json.RawMessage, error) {
-	var envelope map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+func resolveGlobalPayload(raw []byte) (jsontext.Value, error) {
+	var envelope map[string]jsontext.Value
+	if err := jsonx.Unmarshal(raw, &envelope); err != nil {
 		return nil, fmt.Errorf("global models parse: %w", err)
 	}
 
 	if codeRaw, ok := envelope["code"]; ok {
 		var code int
-		if json.Unmarshal(codeRaw, &code) == nil && code != 0 {
+		if jsonx.Unmarshal(codeRaw, &code) == nil && code != 0 {
 			return nil, fmt.Errorf("global models code=%d: %w", code, errResolveGlobalPayloadFailed)
 		}
 	}
@@ -862,14 +863,14 @@ func resolveGlobalPayload(raw []byte) (json.RawMessage, error) {
 		}
 	}
 
-	return json.RawMessage(raw), nil
+	return jsontext.Value(raw), nil
 }
 
 // parseGlobalNarrowTable 窄表形态：字符串数组 → 仅 ID（去空白）。isStringArray=false
 // 表示不是字符串数组（调用方回落动态兜底）。
-func parseGlobalNarrowTable(arr json.RawMessage) (names []string, isStringArray bool) {
+func parseGlobalNarrowTable(arr jsontext.Value) (names []string, isStringArray bool) {
 	var strs []string
-	if json.Unmarshal(arr, &strs) != nil {
+	if jsonx.Unmarshal(arr, &strs) != nil {
 		return nil, false
 	}
 
@@ -921,10 +922,10 @@ func (lc *looseCatalog) addModel(modelInfo2 *ModelInfo) {
 
 // parseGlobalModelLooseArray 动态兜底：逐对象宽松解析（上游换键名时不至于整域空列表）。
 func parseGlobalModelLooseArray(
-	arr json.RawMessage,
+	arr jsontext.Value,
 ) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, err error) {
 	var items []any
-	if json.Unmarshal(arr, &items) != nil {
+	if jsonx.Unmarshal(arr, &items) != nil {
 		return nil, nil, nil, nil, errGlobalModelsParseUnsupportedPayloadShape
 	}
 
@@ -956,14 +957,14 @@ func parseGlobalModelLooseArray(
 // 共用解析，零口径漂移）：id 回退链 id→modelId→model→name，disabled 剔除；顺带产出
 // effort 能力桶。ok=false 表示该形态解析不出任何可用条目（键名对不上），调用方回落动态兜底。
 func parseGlobalModelEntries(
-	arr json.RawMessage,
+	arr jsontext.Value,
 ) (names []string, infos []ModelInfo, efforts map[string][]string, defaults map[string]string, ok bool) {
 	// 逐条 unmarshal：整数组一次解码时，任意一条字段类型异常（上游灰度下发的
 	// null/字符串错位）会让**整份**目录解码失败，调用方整体降级到宽松解析，
 	// 丢掉 Tags/InputModalities/Modalities/SupportsTool —— 这些正是 chat_agents
 	// 判定 ChatVisible 的依据，结果就是 global 模型菜单整体变空。
-	var raw []json.RawMessage
-	if json.Unmarshal(arr, &raw) != nil {
+	var raw []jsontext.Value
+	if jsonx.Unmarshal(arr, &raw) != nil {
 		return nil, nil, nil, nil, false
 	}
 
@@ -972,7 +973,7 @@ func parseGlobalModelEntries(
 	infos = make([]ModelInfo, 0, len(raw))
 	for i := range raw {
 		var m dynModelEntry
-		if json.Unmarshal(raw[i], &m) != nil {
+		if jsonx.Unmarshal(raw[i], &m) != nil {
 			// 单条坏条目：退到宽松解析（至少保住模型名与窗口），继续解析其余条目。
 			if mi, ok := parseGlobalModelLooseEntry(raw[i]); ok {
 				names = append(names, mi.ID)
@@ -1003,9 +1004,9 @@ func parseGlobalModelEntries(
 }
 
 // parseGlobalModelLooseEntry 对单条坏条目做宽松解析（保住模型名/窗口/档位）。
-func parseGlobalModelLooseEntry(raw json.RawMessage) (ModelInfo, bool) {
+func parseGlobalModelLooseEntry(raw jsontext.Value) (ModelInfo, bool) {
 	var obj map[string]any
-	if json.Unmarshal(raw, &obj) != nil {
+	if jsonx.Unmarshal(raw, &obj) != nil {
 		return ModelInfo{}, false
 	}
 
@@ -1058,14 +1059,14 @@ func addEffortBucket(
 // resolveGlobalModelsArray 从 payload 定位模型数组：payload 本身是数组直接用；
 // 是 map 则依次尝试 models/items/list/data/result 键（递归下钻，取第一个能解析出
 // 数组的分支）。找不到数组 → false。
-func resolveGlobalModelsArray(payload json.RawMessage) (json.RawMessage, bool) {
+func resolveGlobalModelsArray(payload jsontext.Value) (jsontext.Value, bool) {
 	trimmed := strings.TrimSpace(string(payload))
 	if strings.HasPrefix(trimmed, "[") {
 		return payload, true
 	}
 
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(payload, &obj) != nil {
+	var obj map[string]jsontext.Value
+	if jsonx.Unmarshal(payload, &obj) != nil {
 		return nil, false
 	}
 

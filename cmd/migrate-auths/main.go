@@ -16,7 +16,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // 行状态。
@@ -234,7 +234,7 @@ func convertLegacy(raw []byte) (*auth.Auth, error) {
 		Nickname     string `json:"nickname"`
 		DeviceToken  string `json:"device_token"`
 	}
-	if err := json.Unmarshal(raw, &item); err != nil {
+	if err := jsonx.Unmarshal(raw, &item); err != nil {
 		return nil, fmt.Errorf("legacy json: %w", err)
 	}
 

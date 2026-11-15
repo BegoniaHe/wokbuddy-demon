@@ -1,7 +1,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/scheduler"
@@ -49,7 +49,7 @@ func runsOf(t *testing.T, pn *Panel) []scheduler.TaskRun {
 	var resp struct {
 		Runs []scheduler.TaskRun `json:"runs"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -171,7 +171,7 @@ func assertConflictRunning(t *testing.T, rec *httptest.ResponseRecorder) {
 		Started bool `json:"started"`
 		Running bool `json:"running"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &conflict); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &conflict); err != nil {
 		t.Fatal(err)
 	}
 

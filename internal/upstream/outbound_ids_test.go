@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestChatOutboundHeadersBrandFree 用 httptest 捕获 chat 出站请求：头族无品牌
@@ -93,7 +93,7 @@ func TestMPReportOutboundIDsBrandFree(t *testing.T) {
 	}
 
 	var events []map[string]any
-	if err := json.Unmarshal(gotRaw, &events); err != nil {
+	if err := jsonx.Unmarshal(gotRaw, &events); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 

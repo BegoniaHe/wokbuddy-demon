@@ -1,13 +1,13 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -45,7 +45,7 @@ func TestGeminiToOpenAIRequest(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -227,7 +227,7 @@ func TestGeminiEndpointNonStream(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -296,7 +296,7 @@ func TestGeminiCountTokens(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 

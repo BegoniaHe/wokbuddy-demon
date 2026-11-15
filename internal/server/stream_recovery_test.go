@@ -2,7 +2,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"io"
 	"net/http"
 	"strings"
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -164,7 +165,7 @@ func TestNonStreamContinuation(t *testing.T) {
 			FinishReason string         `json:"finish_reason"`
 		} `json:"choices"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -208,7 +209,7 @@ func TestNonStreamContinuationKeepsLastPrompt(t *testing.T) {
 	var parsed struct {
 		Usage map[string]any `json:"usage"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -321,7 +322,7 @@ func TestStreamContinuationSumsUsage(t *testing.T) {
 		}
 
 		var chunk map[string]any
-		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
+		if jsonx.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk) != nil {
 			continue
 		}
 
@@ -434,18 +435,18 @@ func TestWaitForModelBusyRespectsCancel(t *testing.T) {
 	}
 }
 
-// 聚合路径改用 UseNumber 解码 SSE 帧后，usage 里的数字是 json.Number。
+// 聚合路径改用原始字面量解码 SSE 帧后，usage 里的数字是 jsontext.Value。
 // 只认 float64 会让累计 completion 被末段覆盖（多轮少算），total 也不再重算。
 func TestMergeUsageTotalsWithJSONNumbers(t *testing.T) {
 	t.Parallel()
 
 	first := map[string]any{"usage": map[string]any{
-		"prompt_tokens": json.Number("10"), "completion_tokens": json.Number("2"),
-		"credit": json.Number("1.5"), "total_tokens": json.Number("12"),
+		"prompt_tokens": jsontext.Value("10"), "completion_tokens": jsontext.Value("2"),
+		"credit": jsontext.Value("1.5"), "total_tokens": jsontext.Value("12"),
 	}}
 	mergeUsageTotals(first, map[string]any{"usage": map[string]any{
-		"prompt_tokens": json.Number("20"), "completion_tokens": json.Number("4"),
-		"credit": json.Number("2"), "total_tokens": json.Number("24"),
+		"prompt_tokens": jsontext.Value("20"), "completion_tokens": jsontext.Value("4"),
+		"credit": jsontext.Value("2"), "total_tokens": jsontext.Value("24"),
 	}})
 
 	usage, _ := first["usage"].(map[string]any)

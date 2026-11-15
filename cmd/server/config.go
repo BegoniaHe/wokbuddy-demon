@@ -4,7 +4,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -772,9 +773,9 @@ func Load(path string) (*Config, error) {
 // JSON 里显式写出的值（含与 median 矛盾的值）仍走校验报错。
 func markImplicitTimingClamp(raw []byte, config3 *Config) {
 	var doc struct {
-		Schedule map[string]json.RawMessage `json:"schedule"`
+		Schedule map[string]jsontext.Value `json:"schedule"`
 	}
-	if json.Unmarshal(raw, &doc) != nil {
+	if jsonx.Unmarshal(raw, &doc) != nil {
 		return
 	}
 
@@ -795,7 +796,7 @@ func ParseConfigInto(raw []byte, config3 *Config) (*Config, error) {
 	// 会在某些入口拿到「floor 不能大于 median」的假报错。
 	markImplicitTimingClamp(raw, config3)
 
-	if err := json.Unmarshal(raw, config3); err != nil {
+	if err := jsonx.Unmarshal(raw, config3); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -841,7 +842,7 @@ func WriteDefault(path string) (string, error) {
 		return "", fmt.Errorf("normalize default config: %w", normErr)
 	}
 
-	out, err := json.MarshalIndent(config, "", "  ") //nolint:gosec // config 本就是凭据载体，落盘为设计行为
+	out, err := jsonx.MarshalIndent(config)
 	if err != nil {
 		return "", fmt.Errorf("marshal config: %w", err)
 	}
@@ -895,7 +896,7 @@ func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
 		return "", false, err
 	}
 
-	encoded, err := json.Marshal(key)
+	encoded, err := jsonx.Marshal(key)
 	if err != nil {
 		return "", false, fmt.Errorf("marshal api_key: %w", err)
 	}
@@ -909,7 +910,7 @@ func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
 }
 
 // readConfigDoc 读取配置文件为可按顶层键修改的文档，并返回当前 api_key。
-func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
+func readConfigDoc(path string) (map[string]jsontext.Value, string, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return nil, "", fmt.Errorf("readConfigDoc: %w", err)
@@ -924,14 +925,14 @@ func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
 		return nil, "", fmt.Errorf("read config: %w", err)
 	}
 
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	var doc map[string]jsontext.Value
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		return nil, "", fmt.Errorf("parse config: %w", err)
 	}
 
 	var current string
 	if v, ok := doc["api_key"]; ok {
-		if err := json.Unmarshal(v, &current); err != nil {
+		if err := jsonx.Unmarshal(v, &current); err != nil {
 			return nil, "", fmt.Errorf("parse api_key: %w", err)
 		}
 	}
@@ -940,8 +941,8 @@ func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
 }
 
 // writeConfigDoc 原子写回配置文档（tmp + rename），保留所有未修改的顶层键。
-func writeConfigDoc(path string, doc map[string]json.RawMessage) error {
-	out, err := json.MarshalIndent(doc, "", "  ")
+func writeConfigDoc(path string, doc map[string]jsontext.Value) error {
+	out, err := jsonx.MarshalIndent(doc)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}

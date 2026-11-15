@@ -8,15 +8,14 @@
 package prompt
 
 import (
-	"bytes"
 	_ "embed"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 //go:embed defaultprompt.md
@@ -167,7 +166,7 @@ func Append(body []byte, systemPrompt string) []byte {
 // 空 body 或空 systemPrompt 直接判否（调用方原样返回，绝不失败）；
 // JSON 解析失败或顶层为 null 同样判否（nil map 不可写入，否则后续赋值 panic）。
 //
-// UseNumber：改写只是动 messages，不能顺手改掉客户端的数值字面量。默认解码会把
+// 数值按原始字面量保留：改写只是动 messages，不能顺手改掉客户端的数值。默认解码会把
 // 一切数字变 float64 —— seed 9007199254740993 变成 ...992、1.0 变成 1、1e21 变成
 // 1e+21（与 split.go / internal/server/logging.go 的 rewriteModel 同口径）。
 func decodeBody(body []byte, systemPrompt string) (map[string]any, bool) {
@@ -183,7 +182,7 @@ func decodeBody(body []byte, systemPrompt string) (map[string]any, bool) {
 	return obj, true
 }
 
-// decodeJSONObject 以 UseNumber 语义解析顶层 JSON 对象（数值按字面量保留）。
+// decodeJSONObject 解析顶层 JSON 对象（数值按原始字面量保留）。
 func decodeJSONObject(body []byte) (map[string]any, error) {
 	// 非法 UTF-8 一律不改写：json.Unmarshal 会把坏字节替换成 U+FFFD，回写后 body
 	// 与客户端发出的内容不再逐字节相同，而不改写时它是原样转发的。改写只该动
@@ -192,26 +191,15 @@ func decodeJSONObject(body []byte) (map[string]any, error) {
 		return nil, errInvalidUTF8Body
 	}
 
-	var obj map[string]any
-
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-
-	if err := dec.Decode(&obj); err != nil {
+	// jsonx.DecodeObject：数值按字面量保留，且拒绝首个 JSON 值之后的尾随内容
+	// （{}{} 或 {}garbage 不能改写成只剩第一个对象再发出去）。
+	obj, err := jsonx.DecodeObject(body)
+	if err != nil {
 		return nil, fmt.Errorf("decode json object: %w", err)
-	}
-
-	// 尾随内容必须拒绝：{}{} 或 {}garbage 会被改写成只剩第一个对象再发出去，
-	// 「改写绝不失败」就变成了「悄悄丢数据」。与 clientprofile 的 ensureEOF 同口径。
-	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return nil, errTrailingJSON
 	}
 
 	return obj, nil
 }
-
-// errTrailingJSON 请求体在第一个 JSON 对象之后还有内容：不做改写，原样转发。
-var errTrailingJSON = errors.New("request body has trailing content after JSON object")
 
 // errInvalidUTF8Body 请求体含非法 UTF-8：调用方原样转发（见 decodeBody）。
 var errInvalidUTF8Body = errors.New("request body is not valid UTF-8")
@@ -239,7 +227,7 @@ func isSystemMsg(m any) bool {
 
 // marshalOr 序列化 obj，失败时返回 fallback（原 body），保证改写路径绝不失败。
 func marshalOr(obj map[string]any, fallback []byte) []byte {
-	out, err := json.Marshal(obj)
+	out, err := jsonx.Marshal(obj)
 	if err != nil {
 		return fallback
 	}
@@ -262,7 +250,7 @@ func EnsureSystemFirst(body []byte, fallback string) []byte {
 		return body
 	}
 
-	// UseNumber：只改首条消息的 role，其余字段（含 seed 等大整数）必须逐字保留。
+	// 原始字面量：只改首条消息的 role，其余字段（含 seed 等大整数）必须逐字保留。
 	obj, err := decodeJSONObject(body)
 	if err != nil {
 		return body

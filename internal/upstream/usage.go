@@ -1,9 +1,11 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"maps"
 	"math"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // normalizeUsageCacheAliases keeps cache-hit aliases consistent before the
@@ -68,12 +70,11 @@ func bestUsageCacheHitTokens(usage map[string]any) (float64, bool) {
 //nolint:cyclop,gocyclo // 上游数值可能是任意 JSON 数值类型，集中分支比反射更直白。
 func positiveUsageNumber(value any) (float64, bool) {
 	switch n := value.(type) {
-	case json.Number:
-		// 聚合帧解码走 UseNumber，usage 里的数字是 json.Number，只认 float64
-		// 会让缓存命中观测恒为 0。
-		parsed, err := n.Float64()
+	case jsontext.Value:
+		// 聚合帧解码保留原始字面量，只认 float64 会让缓存命中观测恒为 0。
+		parsed, ok := jsonx.Float64(n)
 
-		return parsed, err == nil && parsed > 0
+		return parsed, ok && parsed > 0
 	case float64:
 		return n, n > 0
 	case float32:
@@ -163,7 +164,7 @@ func UsagePromptTokens(usage map[string]any) (float64, bool) {
 	return 0, false
 }
 
-// UsageLeafFloat 取任意 usage 叶子的有限数值（float64 / int / int64 / json.Number）。
+// UsageLeafFloat 取任意 usage 叶子的有限数值（float64 / int / int64 / jsontext.Value）。
 // 非数值或 NaN 返回 false。
 func UsageLeafFloat(v any) (float64, bool) {
 	switch n := v.(type) {
@@ -173,10 +174,10 @@ func UsageLeafFloat(v any) (float64, bool) {
 		return float64(n), true
 	case int64:
 		return float64(n), true
-	case json.Number:
-		f, err := n.Float64()
+	case jsontext.Value:
+		f, ok := jsonx.Float64(n)
 
-		return f, err == nil && !math.IsNaN(f)
+		return f, ok && !math.IsNaN(f)
 	default:
 		return 0, false
 	}
@@ -203,9 +204,9 @@ func UsageSumLeaves(dst, src any) (float64, bool) {
 	return sum, true
 }
 
-// UsageNumber 从 usage 顶层取数值字段（JSON 数字可能是 float64 / json.Number 形态）。
+// UsageNumber 从 usage 顶层取数值字段（JSON 数字可能是 float64 / 原始字面量形态）。
 //
-// 网关的聚合路径改用 UseNumber 解码 SSE 帧后，usage 里的数字是 json.Number：
+// 网关的聚合路径保留原始字面量解码 SSE 帧后，usage 里的数字是 jsontext.Value：
 // 直接断言 float64 会静默失败（token 数变 0、total 不再重算）。所有读 usage 数值
 // 的地方都走这里，两形态同口径。
 func UsageNumber(usage map[string]any, key string) (float64, bool) {
@@ -221,9 +222,8 @@ func UsageNumber(usage map[string]any, key string) (float64, bool) {
 		return float64(n), true
 	case int64:
 		return float64(n), true
-	case json.Number:
-		f, err := n.Float64()
-		return f, err == nil
+	case jsontext.Value:
+		return jsonx.Float64(n)
 	}
 
 	return 0, false

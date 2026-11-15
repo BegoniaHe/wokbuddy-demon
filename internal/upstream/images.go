@@ -10,13 +10,13 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // 官方图像端点路径（CN / global 共用 chatBase）。
@@ -109,7 +109,7 @@ func (c *Client) postImage(
 
 	// 200 + 业务错误信封（部分上游故障形态）。
 	var env apiEnvelope
-	if json.Unmarshal(raw, &env) == nil && env.Code != 0 {
+	if jsonx.Unmarshal(raw, &env) == nil && env.Code != 0 {
 		kind := Classify(resp.StatusCode, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient

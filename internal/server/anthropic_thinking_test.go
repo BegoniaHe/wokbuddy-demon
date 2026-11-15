@@ -1,7 +1,7 @@
 package server
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"testing"
 )
@@ -16,7 +16,7 @@ func TestValidateAnthropicThinkingRejectsMalformed(t *testing.T) {
 		`[]`,
 		`{`,
 	} {
-		req := &anthropicRequest{Model: "claude-sonnet-4-5", Thinking: json.RawMessage(raw)}
+		req := &anthropicRequest{Model: "claude-sonnet-4-5", Thinking: jsontext.Value(raw)}
 		if err := validateAnthropicThinking(req); !errors.Is(err, errThinkingInvalid) {
 			t.Errorf("thinking=%s: err=%v want errThinkingInvalid", raw, err)
 		}
@@ -40,7 +40,7 @@ func TestValidateAnthropicThinkingAllowsValid(t *testing.T) {
 	}
 
 	for _, item := range cases {
-		req := &anthropicRequest{Model: "claude-sonnet-4-5", Thinking: json.RawMessage(item.raw)}
+		req := &anthropicRequest{Model: "claude-sonnet-4-5", Thinking: jsontext.Value(item.raw)}
 		if err := validateAnthropicThinking(req); !errors.Is(err, item.want) {
 			t.Errorf("thinking=%s: err=%v want %v", item.raw, err, item.want)
 		}

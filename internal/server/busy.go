@@ -5,13 +5,13 @@
 package server
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 const (
@@ -40,7 +40,7 @@ func (h *Handler) busyHandler(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		Models []string `json:"models"`
 	}
-	if json.Unmarshal(body, &payload) != nil {
+	if jsonx.Unmarshal(body, &payload) != nil {
 		writeBusyResponse(w, http.StatusBadRequest, "invalid JSON body", nil)
 		return
 	}

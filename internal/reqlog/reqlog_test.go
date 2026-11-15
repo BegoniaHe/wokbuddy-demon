@@ -339,7 +339,7 @@ func TestArchiveEnqueueAfterCloseCountsDropped(t *testing.T) {
 }
 
 // TestArchiveToolCounters JSONL 落盘与读回都保留 tools_declared / tool_calls，
-// 且 omitempty 生效：未声明 tools 的请求两条都不写（缺失 = 不进分母）。
+// 且 omitzero 生效：未声明 tools 的请求两条都不写（缺失 = 不进分母）。
 func TestArchiveToolCounters(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -401,7 +401,7 @@ func assertToolCounters(t *testing.T, event2 Event, declared, calls int) {
 	}
 }
 
-// assertToolCounterJSONL 原始 JSONL：未声明 tools 的行不能出现这两个键（omitempty 是契约）。
+// assertToolCounterJSONL 原始 JSONL：未声明 tools 的行不能出现这两个键（omitzero 是契约）。
 func assertToolCounterJSONL(t *testing.T, dir string) {
 	t.Helper()
 

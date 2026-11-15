@@ -6,9 +6,10 @@
 package upstream
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // msgs 解析测试用的 messages JSON 数组。
@@ -16,7 +17,7 @@ func msgs(t *testing.T, s string) []any {
 	t.Helper()
 
 	var v []any
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
+	if err := jsonx.Unmarshal([]byte(s), &v); err != nil {
 		t.Fatalf("parse messages: %v", err)
 	}
 
@@ -259,7 +260,7 @@ func TestPrepareBodyMergesSplitParallelToolCalls(t *testing.T) {
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal 出站 body: %v", err)
 	}
 

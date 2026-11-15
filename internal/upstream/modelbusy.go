@@ -12,7 +12,6 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +21,7 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 const (
@@ -72,7 +72,7 @@ func (c *Client) ModelBusy(
 func (c *Client) modelBusyBatch(
 	ctx context.Context, account *auth.Auth, models []string,
 ) (map[string]string, error) {
-	raw, err := json.Marshal(map[string]any{"models": models})
+	raw, err := jsonx.Marshal(map[string]any{"models": models})
 	if err != nil {
 		return nil, fmt.Errorf("ModelBusy encode: %w", err)
 	}
@@ -174,7 +174,7 @@ func (c *Client) markModelBusyRealmMissing(realm string, status int, body string
 // parseModelBusy 兼容 {code,data} 信封与 map/数组响应。
 func parseModelBusy(body []byte) map[string]string {
 	var root any
-	if json.Unmarshal(body, &root) != nil {
+	if jsonx.Unmarshal(body, &root) != nil {
 		return map[string]string{}
 	}
 

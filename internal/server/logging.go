@@ -3,8 +3,7 @@ package server
 
 import (
 	"bufio"
-	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -113,7 +113,7 @@ type chatStat struct {
 	decision *reqlog.DecisionTrace
 
 	// toolsDeclared / toolCalls 工具面统计（issue #329）：仅在本请求声明了 tools 时
-	// 归档（未声明不进分母）；toolCalls > 0 才写 JSON（omitempty）。
+	// 归档（未声明不进分母）；toolCalls > 0 才写 JSON（omitzero）。
 	toolsDeclared int
 	toolCalls     int
 
@@ -318,12 +318,12 @@ type sseUsageFrame struct {
 
 // sseDeltaFrame 流式增量中与「是否产生实质输出」相关的字段。
 type sseDeltaFrame struct {
-	Content          *string         `json:"content"`
-	ReasoningContent *string         `json:"reasoning_content"`
-	Reasoning        *string         `json:"reasoning"`
-	Refusal          *string         `json:"refusal"`
-	ToolCalls        json.RawMessage `json:"tool_calls"`
-	FunctionCall     json.RawMessage `json:"function_call"`
+	Content          *string        `json:"content"`
+	ReasoningContent *string        `json:"reasoning_content"`
+	Reasoning        *string        `json:"reasoning"`
+	Refusal          *string        `json:"refusal"`
+	ToolCalls        jsontext.Value `json:"tool_calls"`
+	FunctionCall     jsontext.Value `json:"function_call"`
 }
 
 // sseChoiceFrame 单个 choice 的收尾与增量形态。
@@ -359,7 +359,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 
 	var chunk sseChunkFrame
-	if json.Unmarshal([]byte(payload), &chunk) != nil {
+	if jsonx.Unmarshal([]byte(payload), &chunk) != nil {
 		return
 	}
 
@@ -485,13 +485,13 @@ type toolCallPaceChunk struct {
 }
 
 // notePaceToolCalls 把 tool_calls 增量里的函数名与 arguments 计入 TPM 时间线。
-func (s *chatStatsReader) notePaceToolCalls(raw json.RawMessage) {
+func (s *chatStatsReader) notePaceToolCalls(raw jsontext.Value) {
 	if !rawPayloadPresent(raw) {
 		return
 	}
 
 	var calls []toolCallPaceChunk
-	if json.Unmarshal(raw, &calls) != nil {
+	if jsonx.Unmarshal(raw, &calls) != nil {
 		return
 	}
 
@@ -511,7 +511,7 @@ func (s *chatStatsReader) notePaceToolCalls(raw json.RawMessage) {
 }
 
 // notePaceFunctionCall 把旧式 function_call 的函数名与 arguments 计入 TPM 时间线。
-func (s *chatStatsReader) notePaceFunctionCall(raw json.RawMessage) {
+func (s *chatStatsReader) notePaceFunctionCall(raw jsontext.Value) {
 	if !rawPayloadPresent(raw) {
 		return
 	}
@@ -520,7 +520,7 @@ func (s *chatStatsReader) notePaceFunctionCall(raw json.RawMessage) {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}
-	if json.Unmarshal(raw, &call) != nil {
+	if jsonx.Unmarshal(raw, &call) != nil {
 		return
 	}
 
@@ -533,13 +533,13 @@ func (s *chatStatsReader) notePaceFunctionCall(raw json.RawMessage) {
 }
 
 // noteToolCalls 对流式 tool_calls 增量做去重计数（issue #329）。
-func (s *chatStatsReader) noteToolCalls(raw json.RawMessage) {
+func (s *chatStatsReader) noteToolCalls(raw jsontext.Value) {
 	var calls []struct {
 		Index *int   `json:"index"`
 		ID    string `json:"id"`
 	}
 
-	if json.Unmarshal(raw, &calls) != nil {
+	if jsonx.Unmarshal(raw, &calls) != nil {
 		return
 	}
 
@@ -635,7 +635,7 @@ func (s *chatStatsReader) ToolCallCount() int {
 }
 
 // rawPayloadPresent 报告 JSON 片段是否是有效负载（排除空值/空数组/空对象占位）。
-func rawPayloadPresent(raw json.RawMessage) bool {
+func rawPayloadPresent(raw jsontext.Value) bool {
 	value := strings.TrimSpace(string(raw))
 
 	return value != "" && value != "null" && value != "[]" && value != "{}"
@@ -643,13 +643,13 @@ func rawPayloadPresent(raw json.RawMessage) bool {
 
 // functionCallHasPayload 报告旧式 function_call 是否含实际负载：空占位
 // {"name":"","arguments":""} 不算一次调用；非对象形态保守按有负载处理。
-func functionCallHasPayload(raw json.RawMessage) bool {
+func functionCallHasPayload(raw jsontext.Value) bool {
 	if !rawPayloadPresent(raw) {
 		return false
 	}
 
 	var fc map[string]any
-	if json.Unmarshal(raw, &fc) != nil {
+	if jsonx.Unmarshal(raw, &fc) != nil {
 		return true
 	}
 
@@ -828,14 +828,10 @@ func rewriteModel(body []byte, bare string) []byte {
 		return body
 	}
 
-	// UseNumber：seed / 大整数 id 这类字段按字面量保留。走 float64 会把
-	// 9007199254740993 变成 ...992，出图 seed 就悄悄变了。
-	var obj map[string]any
-
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-
-	if err := dec.Decode(&obj); err != nil {
+	// 数字按字面量保留：走 float64 会把 9007199254740993 变成 ...992，
+	// 出图 seed 就悄悄变了。
+	obj, err := jsonx.DecodeObject(body)
+	if err != nil {
 		return body
 	}
 
@@ -845,7 +841,7 @@ func rewriteModel(body []byte, bare string) []byte {
 
 	obj["model"] = bare
 
-	out, err := json.Marshal(obj)
+	out, err := jsonx.Marshal(obj)
 	if err != nil {
 		return body
 	}
@@ -877,7 +873,7 @@ func usageDeltaFromResponse(resp map[string]any) *pool.TokenUsageDelta {
 	return delta
 }
 
-// readUsageInt 从 usage map 取一个整数字段，兼容 float/整型/json.Number 形态。
+// readUsageInt 从 usage map 取一个整数字段，兼容 float/整型/原始字面量形态。
 func readUsageInt(u map[string]any, key string) (int64, bool) {
 	v, ok := u[key]
 	if !ok {
@@ -893,9 +889,8 @@ func readUsageInt(u map[string]any, key string) (int64, bool) {
 		return int64(n), true
 	case int64:
 		return n, true
-	case json.Number:
-		i, err := n.Int64()
-		return i, err == nil
+	case jsontext.Value:
+		return jsonx.Int64(n)
 	default:
 		return 0, false
 	}
@@ -1150,7 +1145,7 @@ func applyChatStat(event *reqlog.Event, chatStat2 *chatStat) {
 	event.HasCredit = chatStat2.hasCredit
 	event.CacheHitTokens = chatStat2.cacheHit
 	event.CacheMissTokens = chatStat2.cacheMiss
-	// 工具面：只有声明了 tools 的请求才写，未声明保持零值 + omitempty（不进分母）。
+	// 工具面：只有声明了 tools 的请求才写，未声明保持零值 + omitzero（不进分母）。
 	if chatStat2.toolsDeclared > 0 {
 		event.ToolsDeclared = chatStat2.toolsDeclared
 		event.ToolCalls = chatStat2.toolCalls

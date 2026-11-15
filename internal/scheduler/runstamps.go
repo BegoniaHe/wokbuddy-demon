@@ -1,11 +1,11 @@
 package scheduler
 
 import (
-	"encoding/json"
 	"log"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -35,7 +35,7 @@ func (s *Scheduler) markRan(kinds []taskKind, now time.Time) {
 		stamps[kind.String()] = runDay(kind, now)
 	}
 
-	raw, err := json.Marshal(stamps)
+	raw, err := jsonx.Marshal(stamps)
 	if err == nil {
 		err = safefile.Write(s.cfg.RunStampFile, raw, 0o600)
 	}
@@ -73,7 +73,7 @@ func (s *Scheduler) loadStamps() map[string]string {
 	}
 
 	stamps := map[string]string{}
-	if json.Unmarshal(raw, &stamps) != nil {
+	if jsonx.Unmarshal(raw, &stamps) != nil {
 		return map[string]string{}
 	}
 

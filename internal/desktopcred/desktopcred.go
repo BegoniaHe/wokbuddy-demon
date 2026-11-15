@@ -13,7 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // Account 扫描结果：只含面板展示所需元数据，不含 token。
@@ -53,10 +54,10 @@ var (
 type Account struct {
 	Path      string `json:"path"`
 	UID       string `json:"uid"`
-	Nickname  string `json:"nickname,omitempty"`
-	Domain    string `json:"domain,omitempty"`
+	Nickname  string `json:"nickname,omitempty,omitzero"`
+	Domain    string `json:"domain,omitempty,omitzero"`
 	Realm     string `json:"realm"`
-	ExpiresAt int64  `json:"expires_at,omitempty"`
+	ExpiresAt int64  `json:"expires_at,omitempty,omitzero"`
 	Encrypted bool   `json:"encrypted"`
 }
 
@@ -423,7 +424,7 @@ func parseEnvelope(envB64 string) (encryptedEnvelope, []byte, []byte, []byte, er
 		return env, nil, nil, nil, errEnvelopeIsNotCanonicalBase64
 	}
 
-	if uerr := json.Unmarshal(envRaw, &env); uerr != nil {
+	if uerr := jsonx.Unmarshal(envRaw, &env); uerr != nil {
 		return env, nil, nil, nil, fmt.Errorf("invalid envelope: %w", uerr)
 	}
 
@@ -516,11 +517,11 @@ func writeLP(buffer *bytes.Buffer, str string) {
 // 读进内存（面板导入路径会触发它），加一道上限把内存占用钉住。
 const maxAuthFileBytes = 32 << 20
 
+// errTrailingData auth 文件在合法 JSON 对象之后还有内容（被替换/损坏的形态）。
+var errTrailingData = jsonx.ErrTrailingData
+
 // errAuthFileTooLarge 单个 auth 文件超过读取上限。
 var errAuthFileTooLarge = errors.New("auth file too large")
-
-// errTrailingData auth 文件在合法 JSON 对象之后还有内容（被替换/损坏的形态）。
-var errTrailingData = errors.New("auth file has trailing data")
 
 func readDoc(path string) (map[string]any, error) {
 	file, err := os.Open(path)
@@ -539,16 +540,11 @@ func readDoc(path string) (map[string]any, error) {
 			filepath.Base(path), maxAuthFileBytes, errAuthFileTooLarge)
 	}
 
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-
-	var doc map[string]any
-	if err := dec.Decode(&doc); err != nil {
+	// jsonx.DecodeObject：数字按字面量保留；尾随内容（合法对象 + 垃圾尾巴）直接
+	// 报错——被替换的文件不能当成有效凭据。
+	doc, err := jsonx.DecodeObject(raw)
+	if err != nil {
 		return nil, fmt.Errorf("parse auth file: %w", err)
-	}
-	// 尾随内容守卫：被替换成「合法对象 + 垃圾尾巴」的文件不能当成有效凭据。
-	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("parse auth file: 存在尾随内容: %w", errTrailingData)
 	}
 
 	return doc, nil
@@ -571,9 +567,8 @@ func stringField(m map[string]any, key string) string {
 
 func int64Value(raw any) (int64, bool) {
 	switch item := raw.(type) {
-	case json.Number:
-		n, err := item.Int64()
-		return n, err == nil
+	case jsontext.Value:
+		return jsonx.Int64(item)
 	case float64:
 		return int64(item), true
 	case int64:

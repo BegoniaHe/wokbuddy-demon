@@ -12,7 +12,7 @@ package panel
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -221,9 +222,9 @@ func validUID(uid string) bool {
 
 // apiEnvelope 与 upstream 同形：{code,msg,data}，code!=0 视为业务错误。
 type apiEnvelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
+	Code int            `json:"code"`
+	Msg  string         `json:"msg"`
+	Data jsontext.Value `json:"data"`
 }
 
 // doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
@@ -231,7 +232,7 @@ type apiEnvelope struct {
 // auth/state→token→account 链路在客户端关页面后仍会跑满全部候选 origin 与超时）。
 func doJSON(
 	ctx context.Context, method, fullURL, bearer string, body io.Reader, origin, userAgent string,
-) (json.RawMessage, int, error) {
+) (jsontext.Value, int, error) {
 	//nolint:gosec // URL 由固定 realm 端点拼接，非用户可控主机
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
@@ -265,7 +266,7 @@ func doJSON(
 	// 先解信封：业务错误可能随任意 HTTP 状态返回（含 4xx），code 比状态码更权威。
 	var env apiEnvelope
 
-	parseErr := json.Unmarshal(raw, &env)
+	parseErr := jsonx.Unmarshal(raw, &env)
 	if parseErr == nil && env.Code != 0 {
 		return nil, resp.StatusCode, &logincode.Error{Code: env.Code, Msg: env.Msg, Status: resp.StatusCode}
 	}
@@ -284,7 +285,7 @@ func doJSON(
 // loginStartState 按 origin 候选发起 auth/state，返回响应、命中的 endpoint 与最后状态。
 func (p *Panel) loginStartState(
 	ctx context.Context, realm string,
-) (json.RawMessage, loginEndpoint, int, error) {
+) (jsontext.Value, loginEndpoint, int, error) {
 	identity := p.loginIdentityFor(realm)
 	if identity.userAgent == "" {
 		return nil, loginEndpoint{}, 0, errLoginProfileMissing
@@ -322,7 +323,7 @@ func loginRealmFromBody(r *http.Request) string {
 		Realm string `json:"realm"`
 	}
 
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&reqBody); err != nil {
+	if err := jsonx.UnmarshalRead(io.LimitReader(r.Body, 1<<12), &reqBody); err != nil {
 		return "cn"
 	}
 
@@ -355,7 +356,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
-	if err := json.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
+	if err := jsonx.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
 		writeErr(w, http.StatusBadGateway, "auth state: missing state or authUrl")
 		return
 	}
@@ -649,7 +650,7 @@ func requestLoginToken(
 
 	var tok loginToken
 
-	if err := json.Unmarshal(tokRaw, &tok); err != nil {
+	if err := jsonx.Unmarshal(tokRaw, &tok); err != nil {
 		log.Printf("WARN: [panel] 登录 token 响应解析失败（按未完成继续轮询）: %v", err)
 	}
 
@@ -722,7 +723,7 @@ func (*Panel) fetchLoginAccount(
 		return loginAccount{}, err
 	}
 
-	if err := json.Unmarshal(acctRaw, &acct); err != nil {
+	if err := jsonx.Unmarshal(acctRaw, &acct); err != nil {
 		return loginAccount{}, fmt.Errorf("parse account: %w", err)
 	}
 

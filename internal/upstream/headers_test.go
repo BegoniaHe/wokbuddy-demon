@@ -2,12 +2,12 @@ package upstream
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"regexp"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var (
@@ -277,7 +277,7 @@ func TestIdentityHeaders(t *testing.T) {
 			}
 
 			var payload map[string]any
-			if err := json.Unmarshal(raw, &payload); err != nil {
+			if err := jsonx.Unmarshal(raw, &payload); err != nil {
 				t.Fatalf("X-Userinfo json: %v", err)
 			}
 

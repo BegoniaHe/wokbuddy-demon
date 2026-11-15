@@ -41,11 +41,12 @@ package upstream
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // markupPipe 是模型原生工具调用标记的分隔符：两个全角竖线 U+FF5C。
@@ -426,7 +427,7 @@ func parseMarkupParams(body string) (string, bool) {
 		}
 
 		var v any
-		if json.Unmarshal([]byte(strings.TrimSpace(raw)), &v) == nil {
+		if jsonx.Unmarshal([]byte(strings.TrimSpace(raw)), &v) == nil {
 			args[name] = v
 		} else {
 			args[name] = raw
@@ -437,7 +438,7 @@ func parseMarkupParams(body string) (string, bool) {
 		return "", false
 	}
 
-	out, err := json.Marshal(args)
+	out, err := jsonx.Marshal(args)
 	if err != nil {
 		return "", false
 	}
@@ -468,7 +469,7 @@ func ToolFacts(body []byte) (map[string]bool, int) {
 	}
 
 	var req toolNameRequest
-	if json.Unmarshal(body, &req) != nil {
+	if jsonx.Unmarshal(body, &req) != nil {
 		return nil, 0
 	}
 

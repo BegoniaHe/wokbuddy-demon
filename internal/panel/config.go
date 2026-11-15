@@ -6,12 +6,13 @@
 package panel
 
 import (
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // redactedConfigPaths 配置回显时必须抹掉的凭据字段（点分路径）。前端 secret 字段
@@ -147,14 +148,14 @@ func (p *Panel) getConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	raw, err := json.Marshal(cfg)
+	raw, err := jsonx.Marshal(cfg)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "encode config: "+err.Error())
 		return
 	}
 
 	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		writeErr(w, http.StatusInternalServerError, "encode config: "+err.Error())
 		return
 	}

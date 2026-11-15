@@ -5,7 +5,6 @@ package panel
 
 import (
 	"context"
-	"encoding/json"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -355,7 +355,7 @@ func TestTaskSweepAcceptsBeforeClaim(t *testing.T) {
 			var body struct {
 				TaskCodes []string `json:"task_codes"`
 			}
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = jsonx.UnmarshalRead(r.Body, &body)
 
 			for _, code := range body.TaskCodes {
 				if code == "mp_only_custom" && !isMP {

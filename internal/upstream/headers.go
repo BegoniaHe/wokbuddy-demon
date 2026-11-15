@@ -8,7 +8,6 @@ package upstream
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
@@ -1063,7 +1063,7 @@ func (*Client) injectIdentityHeaders(req *http.Request, account *auth.Auth) {
 		payload["token_source"] = method
 	}
 
-	raw, err := json.Marshal(payload)
+	raw, err := jsonx.Marshal(payload)
 	if err != nil {
 		return
 	}

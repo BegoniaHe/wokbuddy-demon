@@ -2,9 +2,10 @@ package upstream
 
 import (
 	"bytes"
-	"encoding/json"
 	"net/http"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // FuzzPrepareBodyOpt 请求体改写管线：合法 JSON 输入必须输出合法 JSON，且不 panic。
@@ -25,11 +26,11 @@ func FuzzPrepareBodyOpt(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		out := PrepareBodyOptWithEffortsAndDefault(data, true,
 			map[string][]string{"m": {"low", "high"}}, map[string]string{"m": "high"}, 0)
-		if !json.Valid(data) {
+		if !jsonx.Valid(data) {
 			return
 		}
 
-		if !json.Valid(out) {
+		if !jsonx.Valid(out) {
 			t.Fatalf("合法输入产出了非法 JSON: in=%q out=%q", data, out)
 		}
 	})
@@ -50,12 +51,12 @@ func FuzzNormalizeFrame(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		var obj map[string]any
-		if json.Unmarshal(raw, &obj) != nil {
+		if jsonx.Unmarshal(raw, &obj) != nil {
 			return
 		}
 
 		out := normalizeFrame(obj)
-		if _, err := json.Marshal(out); err != nil {
+		if _, err := jsonx.Marshal(out); err != nil {
 			t.Fatalf("normalizeFrame 输出不可 marshal: %v", err)
 		}
 	})

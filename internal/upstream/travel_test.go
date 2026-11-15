@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var (
@@ -106,7 +106,7 @@ func TestTravelDepartSendsLocationID(t *testing.T) {
 	}
 
 	var body map[string]any
-	if err := json.Unmarshal(got, &body); err != nil {
+	if err := jsonx.Unmarshal(got, &body); err != nil {
 		t.Fatalf("depart body: %v (%s)", err, got)
 	}
 

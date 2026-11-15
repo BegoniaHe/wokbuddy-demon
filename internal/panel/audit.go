@@ -7,7 +7,6 @@ package panel
 
 import (
 	"bufio"
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
 
@@ -36,16 +36,16 @@ type auditEntry struct {
 	Time       string `json:"time"`
 	Method     string `json:"method"`
 	Path       string `json:"path"`
-	Pattern    string `json:"pattern,omitempty"`
+	Pattern    string `json:"pattern,omitempty,omitzero"`
 	Status     int    `json:"status"`
 	OK         bool   `json:"ok"`
-	IP         string `json:"ip,omitempty"`
-	UserAgent  string `json:"user_agent,omitempty"`
-	AuthFailed bool   `json:"auth_failed,omitempty"`
+	IP         string `json:"ip,omitempty,omitzero"`
+	UserAgent  string `json:"user_agent,omitempty,omitzero"`
+	AuthFailed bool   `json:"auth_failed,omitempty,omitzero"`
 	// Panic 标记 handler 发生 panic（未写出响应头时 Status 记为 500；已写出
 	// 的响应仍按实际状态记录）。审计不能因为 panic 跳过：部分写操作可能已
 	// 生效，缺记录会留下无法追溯的变更。
-	Panic bool `json:"panic,omitempty"`
+	Panic bool `json:"panic,omitempty,omitzero"`
 }
 
 // auditLog 并发安全的追加写入器。零值不可用；用 newAuditLog 构造。
@@ -95,7 +95,7 @@ func (a *auditLog) encode(entry *auditEntry) ([]byte, bool) {
 		entry.Time = a.now().UTC().Format(time.RFC3339)
 	}
 
-	line, err := json.Marshal(entry)
+	line, err := jsonx.Marshal(entry)
 	if err != nil {
 		return nil, false
 	}
@@ -232,7 +232,7 @@ func readAuditTail(path string, want int) []auditEntry {
 
 	for scanner.Scan() {
 		var entry auditEntry
-		if json.Unmarshal(scanner.Bytes(), &entry) != nil {
+		if jsonx.Unmarshal(scanner.Bytes(), &entry) != nil {
 			continue
 		}
 

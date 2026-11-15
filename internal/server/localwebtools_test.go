@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -14,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -221,7 +221,7 @@ func TestLocalWebToolRoundLimit(t *testing.T) {
 	}
 
 	var finalReq map[string]any
-	if err := json.Unmarshal([]byte(seen[1]), &finalReq); err != nil {
+	if err := jsonx.Unmarshal([]byte(seen[1]), &finalReq); err != nil {
 		t.Fatal(err)
 	}
 	// tool_choice:"none" 会被出站归一化成「删除 tools + tool_choice」，
@@ -415,7 +415,7 @@ func TestLocalWebToolLoopPreservesRequestLevelError(t *testing.T) {
 					Message string `json:"message"`
 				} `json:"error"`
 			}
-			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			if err := jsonx.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 				t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body)
 			}
 

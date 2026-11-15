@@ -1,9 +1,11 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"slices"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // modelAgent 上游模型目录的会话 agent 定义（/v3/config data.agents 与企业端点
@@ -20,8 +22,8 @@ type modelAgent struct {
 type modelAgents []modelAgent
 
 func (a *modelAgents) UnmarshalJSON(data []byte) error {
-	var items []json.RawMessage
-	if err := json.Unmarshal(data, &items); err != nil {
+	var items []jsontext.Value
+	if err := jsonx.Unmarshal(data, &items); err != nil {
 		*a = nil
 
 		return nil //nolint:nilerr // 非数组 agents 等价于没有 agent（与官方客户端一致）
@@ -30,7 +32,7 @@ func (a *modelAgents) UnmarshalJSON(data []byte) error {
 	out := make(modelAgents, 0, len(items))
 	for _, item := range items {
 		var agent modelAgent
-		if json.Unmarshal(item, &agent) == nil {
+		if jsonx.Unmarshal(item, &agent) == nil {
 			out = append(out, agent)
 		}
 	}
@@ -44,11 +46,11 @@ func (a *modelAgents) UnmarshalJSON(data []byte) error {
 // 都按缺省处理，不让一个可选字段中断模型目录解析。
 func (a *modelAgent) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Name   json.RawMessage `json:"name"`
-		Models json.RawMessage `json:"models"`
-		Tags   json.RawMessage `json:"tags"`
+		Name   jsontext.Value `json:"name"`
+		Models jsontext.Value `json:"models"`
+		Tags   jsontext.Value `json:"tags"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := jsonx.Unmarshal(data, &raw); err != nil {
 		*a = modelAgent{}
 
 		return nil //nolint:nilerr // 非对象条目跳过，与官方客户端一致
@@ -63,25 +65,25 @@ func (a *modelAgent) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func agentString(raw json.RawMessage) string {
+func agentString(raw jsontext.Value) string {
 	var value string
-	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+	if len(raw) == 0 || jsonx.Unmarshal(raw, &value) != nil {
 		return ""
 	}
 
 	return value
 }
 
-func agentStrings(raw json.RawMessage) []string {
-	var items []json.RawMessage
-	if len(raw) == 0 || json.Unmarshal(raw, &items) != nil {
+func agentStrings(raw jsontext.Value) []string {
+	var items []jsontext.Value
+	if len(raw) == 0 || jsonx.Unmarshal(raw, &items) != nil {
 		return nil
 	}
 
 	out := make([]string, 0, len(items))
 	for _, item := range items {
 		var value string
-		if json.Unmarshal(item, &value) == nil {
+		if jsonx.Unmarshal(item, &value) == nil {
 			out = append(out, value)
 		}
 	}

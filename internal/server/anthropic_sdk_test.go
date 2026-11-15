@@ -1,12 +1,12 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -23,7 +23,7 @@ func parseAnthropicSSE(t *testing.T, body string) []map[string]any {
 		}
 
 		var event map[string]any
-		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		if err := jsonx.Unmarshal([]byte(payload), &event); err != nil {
 			t.Fatalf("bad SSE data %q: %v", payload, err)
 		}
 
@@ -164,7 +164,7 @@ func TestAnthropicSDKContentBlocks(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -182,7 +182,7 @@ func TestAnthropicSDKContentBlocks(t *testing.T) {
 	user := msgs[2].(map[string]any)
 	parts := user["content"].([]any)
 
-	joined, _ := json.Marshal(parts)
+	joined, _ := jsonx.Marshal(parts)
 	for _, want := range []string{"DOC", "BODY", "T (S)", "f1"} {
 		if !strings.Contains(string(joined), want) {
 			t.Errorf("user parts missing %q: %s", want, joined)
@@ -208,7 +208,7 @@ func TestAnthropicSDKThinkingOmitted(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(converted.openAI, &got); err != nil {
+	if err := jsonx.Unmarshal(converted.openAI, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -246,7 +246,7 @@ func TestAnthropicSDKMaxTokensZero(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -272,7 +272,7 @@ func TestAnthropicSDKSystemRoleMerged(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -535,7 +535,7 @@ func TestAnthropicSDKCacheControlImage(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -568,7 +568,7 @@ func TestAnthropicSDKRedactedThinkingSkipped(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -650,7 +650,7 @@ func TestAnthropicSDKCustomTool(t *testing.T) {
 	var got struct {
 		Tools []map[string]any `json:"tools"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -786,7 +786,7 @@ func TestAnthropicSDKCanonicalRequest(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(converted.openAI, &got); err != nil {
+	if err := jsonx.Unmarshal(converted.openAI, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1020,7 +1020,7 @@ func TestAnthropicSDKRequestIDNotOverwritten(t *testing.T) {
 	}
 
 	var body map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1206,7 +1206,7 @@ func TestAnthropicSDKCacheControlBlocks(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1244,7 +1244,7 @@ func TestAnthropicSDKNullCacheControl(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1598,7 +1598,7 @@ func TestAnthropicSDKNestedCacheControl(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1686,7 +1686,7 @@ func TestAnthropicSDKToolResultMedia(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1702,7 +1702,7 @@ func TestAnthropicSDKToolResultMedia(t *testing.T) {
 		t.Fatalf("tool content=%q want ok", toolContent)
 	}
 
-	joined, _ := json.Marshal(got.Messages)
+	joined, _ := jsonx.Marshal(got.Messages)
 	for _, want := range []string{"DOC", "BODY", "T (S)"} {
 		if !strings.Contains(string(joined), want) {
 			t.Errorf("missing %q in %s", want, joined)
@@ -1727,7 +1727,7 @@ func TestAnthropicSDKSystemCacheControl(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1812,7 +1812,7 @@ func TestAnthropicSDKNullInputSchema(t *testing.T) {
 	var got struct {
 		Tools []map[string]any `json:"tools"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2267,7 +2267,7 @@ func TestAnthropicSDKServerToolUseEchoAccepted(t *testing.T) {
 	var got struct {
 		Messages []map[string]any `json:"messages"`
 	}
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 

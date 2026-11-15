@@ -5,7 +5,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func testSecret(t *testing.T) string {
@@ -58,7 +58,7 @@ func sealField(t *testing.T, secret, plaintext string) map[string]any {
 	nums := gcm.Seal(nil, nonce, []byte(plaintext), aad)
 	tag := nums[len(nums)-16:]
 	nums = nums[:len(nums)-16]
-	env, _ := json.Marshal(map[string]any{
+	env, _ := jsonx.Marshal(map[string]any{
 		"suite": 1, "keyId": keyMaterial2.keyID,
 		"nonce":      base64.StdEncoding.EncodeToString(nonce),
 		"authTag":    base64.StdEncoding.EncodeToString(tag),
@@ -101,7 +101,7 @@ func writeAuthFileWithExpiry(t *testing.T, secret, domain string, encrypted bool
 			"type": "ultimate",
 		},
 	}
-	raw, _ := json.Marshal(doc)
+	raw, _ := jsonx.Marshal(doc)
 
 	path := filepath.Join(dir, "wb.info")
 	if err := os.WriteFile(path, raw, 0o600); err != nil {
@@ -286,7 +286,7 @@ func TestExpiryKeyPrecedenceMatchesImport(t *testing.T) {
 		"account": map[string]any{"uid": "u1"},
 	}
 
-	raw, err := json.Marshal(doc)
+	raw, err := jsonx.Marshal(doc)
 	if err != nil {
 		t.Fatal(err)
 	}

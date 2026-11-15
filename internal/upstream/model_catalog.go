@@ -19,7 +19,6 @@ package upstream
 
 import (
 	"embed"
-	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -43,8 +43,8 @@ var modelSeedFS embed.FS
 // Context 必须 >0（零/负条目校验拒绝）；MaxOutput 0 = 输出上限未知 → 省略字段。
 type ModelCapEntry struct {
 	ContextLength   int64  `json:"context_length"`
-	MaxOutputTokens int64  `json:"max_output_tokens,omitempty"`
-	FetchedAt       string `json:"fetched_at,omitempty"` // RFC3339；seed 条目为空
+	MaxOutputTokens int64  `json:"max_output_tokens,omitempty,omitzero"`
+	FetchedAt       string `json:"fetched_at,omitempty,omitzero"` // RFC3339；seed 条目为空
 	Source          string `json:"source"`
 }
 
@@ -95,7 +95,7 @@ func (c *modelCatalog) initLocked() {
 	}
 
 	var file map[string]ModelCapEntry
-	if err := json.Unmarshal(raw, &file); err != nil {
+	if err := jsonx.Unmarshal(raw, &file); err != nil {
 		// 整体损坏：降级种子 + WARN 不崩溃（任务书 §手动维护入口容错）。
 		log.Printf("WARN: [upstream] model.json 损坏（降级内置种子表）: path=%s err=%v", c.path, err)
 		c.loadSeedLocked()
@@ -123,7 +123,7 @@ func (c *modelCatalog) loadSeedLocked() {
 	}
 
 	var seed map[string]ModelCapEntry
-	if err := json.Unmarshal(raw, &seed); err != nil {
+	if err := jsonx.Unmarshal(raw, &seed); err != nil {
 		return
 	}
 
@@ -261,7 +261,7 @@ func (c *modelCatalog) saveLocked() bool {
 		return false
 	}
 
-	raw, err := json.MarshalIndent(c.entries, "", "  ")
+	raw, err := jsonx.MarshalIndent(c.entries)
 	if err != nil {
 		return false
 	}

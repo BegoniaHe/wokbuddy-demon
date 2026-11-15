@@ -1,7 +1,6 @@
 package pool
 
 import (
-	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // withNoPickGap 保留调用点语义：测试统一经 TestMain 关闭窗口（gap=0），
@@ -2064,7 +2064,7 @@ func TestRestoreUsesRedisWhenNewer(t *testing.T) {
 
 	ms := &memStore{loadOK: true}
 	snap := snapshot{Accounts: map[string]stateAccount{"u1": {Credits: 999}}, SavedAt: time.Now()}
-	ms.loadData, _ = json.Marshal(snap)
+	ms.loadData, _ = jsonx.Marshal(snap)
 	p := newTestPool(t, filePath)
 	p.SetStore(ms)
 	p.RestoreFromSnapshot()
@@ -2087,7 +2087,7 @@ func TestRestoreUsesLocalWhenNewer(t *testing.T) {
 
 	ms := &memStore{loadOK: true}
 	snap := snapshot{Accounts: map[string]stateAccount{"u1": {Credits: 999}}, SavedAt: time.Now().Add(-time.Hour)}
-	ms.loadData, _ = json.Marshal(snap)
+	ms.loadData, _ = jsonx.Marshal(snap)
 	p := newTestPool(t, filePath)
 	p.SetStore(ms)
 	p.RestoreFromSnapshot()

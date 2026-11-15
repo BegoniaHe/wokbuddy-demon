@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestGenerateVideoPostsToGenerationsPath 提交走 /v2/videos/generations，body 原样
@@ -202,7 +202,7 @@ func TestVideoModelCatalogCapability(t *testing.T) {
 func TestModelInfoCapabilityNotSerialized(t *testing.T) {
 	t.Parallel()
 
-	raw, err := json.Marshal(ModelInfo{ID: "m", Capability: "text-to-video"}) //nolint:musttag // 内部结构无 JSON 契约，此处只验证字段被排除
+	raw, err := jsonx.Marshal(ModelInfo{ID: "m", Capability: "text-to-video"})
 	if err != nil {
 		t.Fatal(err)
 	}

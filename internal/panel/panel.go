@@ -16,8 +16,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
-	"errors"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"log"
@@ -35,6 +34,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
@@ -919,7 +919,7 @@ func applyPanelModelTier(entry map[string]any, modelInfo *upstream.ModelInfo) {
 // 一致），网关自身不解析字段语义、不据此做任何路由或出站决策；上游改了限制后
 // 重跑一次工具、下次查询即刷新，无需重启网关。
 func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
-	out := map[string]any{"probes": map[string]json.RawMessage{}, "exists": false}
+	out := map[string]any{"probes": map[string]jsontext.Value{}, "exists": false}
 	if p.cfg.ProbeFile == "" {
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -938,16 +938,16 @@ func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var item struct {
-		Version int                        `json:"version"`
-		Probes  map[string]json.RawMessage `json:"probes"`
+		Version int                       `json:"version"`
+		Probes  map[string]jsontext.Value `json:"probes"`
 	}
-	if err := json.Unmarshal(raw, &item); err != nil {
+	if err := jsonx.Unmarshal(raw, &item); err != nil {
 		writeErr(w, http.StatusBadGateway, "parse probes: "+err.Error())
 		return
 	}
 
 	if item.Probes == nil {
-		item.Probes = map[string]json.RawMessage{}
+		item.Probes = map[string]jsontext.Value{}
 	}
 
 	out["probes"] = item.Probes
@@ -1705,7 +1705,7 @@ func (p *Panel) packageRowFor(status *pool.Status) packageAccountRow {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	raw, err := json.Marshal(v)
+	raw, err := jsonx.Marshal(v)
 	if err != nil {
 		http.Error(w, "internal encode error", http.StatusInternalServerError)
 		return
@@ -1720,18 +1720,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
 }
 
-var errTrailingJSON = errors.New("unexpected data after JSON body")
-
 // decodeJSONBody 解码请求体中的单个 JSON 值：首个值之后的非空数据同样视为
-// 畸形请求，避免 `{"force":true} garbage` 被静默接受并执行写操作。
+// 畸形请求，避免 `{"force":true} garbage` 被静默接受并执行写操作
+// （jsonx.UnmarshalRead 在首个值之后遇到非空白内容即报错）。
 func decodeJSONBody(body io.Reader, v any) error {
-	dec := json.NewDecoder(body)
-	if err := dec.Decode(v); err != nil {
+	if err := jsonx.UnmarshalRead(body, v); err != nil {
 		return fmt.Errorf("decode json body: %w", err)
-	}
-
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errTrailingJSON
 	}
 
 	return nil
@@ -1774,7 +1768,7 @@ type packageAccountRow struct {
 	Remain   int64                    `json:"remain"`
 	Size     int64                    `json:"size"`
 	Packages []upstream.CreditPackage `json:"packages"`
-	Error    string                   `json:"error,omitempty"`
+	Error    string                   `json:"error,omitempty,omitzero"`
 }
 
 // creditGrant 积分包获取历史的一行（issue #100，只读快照）。
@@ -1787,8 +1781,8 @@ type creditGrant struct {
 	Inferred  bool   `json:"inferred"`
 	Size      int64  `json:"size"`
 	Remain    int64  `json:"remain"`
-	CreatedAt string `json:"created_at,omitempty"`
-	ExpiresAt int64  `json:"expires_at,omitempty"`
+	CreatedAt string `json:"created_at,omitempty,omitzero"`
+	ExpiresAt int64  `json:"expires_at,omitempty,omitzero"`
 	Status    string `json:"status"`
 }
 
@@ -1874,7 +1868,7 @@ type remainingRow struct {
 	Used        int64   `json:"used"`
 	Budget      float64 `json:"budget"`
 	Remaining   float64 `json:"remaining"`
-	WindowStart string  `json:"window_start,omitempty"`
+	WindowStart string  `json:"window_start,omitempty,omitzero"`
 	Cooling     bool    `json:"cooling"`
 	Estimated   bool    `json:"estimated"`
 	Samples     int     `json:"samples"`
@@ -2048,7 +2042,7 @@ func (*Panel) remainingRow(
 
 // remainingETag 依据行与事件数生成弱 ETag。
 func remainingETag(rows []remainingRow, events int) string {
-	raw, err := json.Marshal(struct {
+	raw, err := jsonx.Marshal(struct {
 		Rows   []remainingRow `json:"rows"`
 		Events int            `json:"events"`
 	}{Rows: rows, Events: events})

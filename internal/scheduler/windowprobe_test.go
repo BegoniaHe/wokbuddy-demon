@@ -4,7 +4,6 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -31,7 +31,7 @@ func windowProbeUpstream(
 		raw, _ := io.ReadAll(r.Body)
 
 		var body map[string]any
-		if json.Unmarshal(raw, &body) == nil {
+		if jsonx.Unmarshal(raw, &body) == nil {
 			*bodies = append(*bodies, body)
 		}
 

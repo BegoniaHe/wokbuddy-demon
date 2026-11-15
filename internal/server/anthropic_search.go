@@ -12,7 +12,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net/http"
@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -99,13 +100,13 @@ func (h *Handler) runInlineWebSearch(
 }
 
 // anthropicLastUserText 取最后一条 user 消息的文本（块数组只取 text 块）。
-func anthropicLastUserText(messages []json.RawMessage) string {
+func anthropicLastUserText(messages []jsontext.Value) string {
 	for _, raw := range slices.Backward(messages) {
 		var msg struct {
-			Role    string          `json:"role"`
-			Content json.RawMessage `json:"content"`
+			Role    string         `json:"role"`
+			Content jsontext.Value `json:"content"`
 		}
-		if json.Unmarshal(raw, &msg) != nil || msg.Role != "user" {
+		if jsonx.Unmarshal(raw, &msg) != nil || msg.Role != "user" {
 			continue
 		}
 
@@ -202,10 +203,10 @@ func injectAnthropicSearchContext(
 		text.WriteString("\nUse these sources and cite their URLs when answering.")
 	}
 
-	raw, err := json.Marshal(map[string]any{"role": "system", "content": text.String()})
+	raw, err := jsonx.Marshal(map[string]any{"role": "system", "content": text.String()})
 	if err != nil {
 		return
 	}
 
-	req.Messages = append([]json.RawMessage{raw}, req.Messages...)
+	req.Messages = append([]jsontext.Value{raw}, req.Messages...)
 }

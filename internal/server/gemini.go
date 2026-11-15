@@ -7,7 +7,7 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -30,13 +31,13 @@ var (
 // geminiRequest 只声明转换所需字段；兼容 @google/genai 的 camelCase REST 形态。
 type geminiRequest struct {
 	Contents               []geminiContent  `json:"contents"`
-	SystemInstruction      json.RawMessage  `json:"systemInstruction"`
-	SystemInstructionSnake json.RawMessage  `json:"system_instruction"`
-	GenerationConfig       json.RawMessage  `json:"generationConfig"`
-	GenerationConfigSnake  json.RawMessage  `json:"generation_config"`
+	SystemInstruction      jsontext.Value   `json:"systemInstruction"`
+	SystemInstructionSnake jsontext.Value   `json:"system_instruction"`
+	GenerationConfig       jsontext.Value   `json:"generationConfig"`
+	GenerationConfigSnake  jsontext.Value   `json:"generation_config"`
 	Tools                  []map[string]any `json:"tools"`
-	ToolConfig             json.RawMessage  `json:"toolConfig"`
-	ToolConfigSnake        json.RawMessage  `json:"tool_config"`
+	ToolConfig             jsontext.Value   `json:"toolConfig"`
+	ToolConfigSnake        jsontext.Value   `json:"tool_config"`
 }
 
 type geminiContent struct {
@@ -151,7 +152,7 @@ func geminiToOpenAI(body []byte, model string, stream bool) ([]byte, error) {
 	geminiApplyGeneration(out, geminiGenerationRaw(req))
 	geminiApplyTools(out, req.Tools, geminiToolConfigRaw(req))
 
-	converted, err := json.Marshal(out)
+	converted, err := jsonx.Marshal(out)
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
@@ -165,7 +166,7 @@ func decodeGeminiRequest(body []byte) (*geminiRequest, error) {
 	}
 
 	var req geminiRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := jsonx.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid JSON body: %w", err)
 	}
 
@@ -176,7 +177,7 @@ func decodeGeminiRequest(body []byte) (*geminiRequest, error) {
 	return &req, nil
 }
 
-func geminiSystemRaw(req *geminiRequest) json.RawMessage {
+func geminiSystemRaw(req *geminiRequest) jsontext.Value {
 	if len(req.SystemInstruction) > 0 {
 		return req.SystemInstruction
 	}
@@ -184,7 +185,7 @@ func geminiSystemRaw(req *geminiRequest) json.RawMessage {
 	return req.SystemInstructionSnake
 }
 
-func geminiGenerationRaw(req *geminiRequest) json.RawMessage {
+func geminiGenerationRaw(req *geminiRequest) jsontext.Value {
 	if len(req.GenerationConfig) > 0 {
 		return req.GenerationConfig
 	}
@@ -192,7 +193,7 @@ func geminiGenerationRaw(req *geminiRequest) json.RawMessage {
 	return req.GenerationConfigSnake
 }
 
-func geminiToolConfigRaw(req *geminiRequest) json.RawMessage {
+func geminiToolConfigRaw(req *geminiRequest) jsontext.Value {
 	if len(req.ToolConfig) > 0 {
 		return req.ToolConfig
 	}
@@ -310,7 +311,7 @@ func geminiFunctionCall(part map[string]any) map[string]any {
 		args = map[string]any{}
 	}
 
-	raw, err := json.Marshal(args)
+	raw, err := jsonx.Marshal(args)
 	if err != nil {
 		raw = []byte("{}")
 	}
@@ -370,7 +371,7 @@ func geminiFunctionResponse(part map[string]any) map[string]any {
 	if response, ok := responsePart["response"]; ok {
 		if text, ok := response.(string); ok {
 			body = text
-		} else if raw, err := json.Marshal(response); err == nil {
+		} else if raw, err := jsonx.Marshal(response); err == nil {
 			body = string(raw)
 		}
 	}
@@ -460,8 +461,8 @@ type geminiGenerationConfig struct {
 	FrequencyPenalty   *float64              `json:"frequencyPenalty"`
 	Seed               *int                  `json:"seed"`
 	ResponseMimeType   string                `json:"responseMimeType"`
-	ResponseSchema     json.RawMessage       `json:"responseSchema"`
-	ResponseJSONSchema json.RawMessage       `json:"responseJsonSchema"`
+	ResponseSchema     jsontext.Value        `json:"responseSchema"`
+	ResponseJSONSchema jsontext.Value        `json:"responseJsonSchema"`
 	ThinkingConfig     *geminiThinkingConfig `json:"thinkingConfig"`
 }
 
@@ -472,13 +473,13 @@ type geminiThinkingConfig struct {
 	ThinkingLevel  string `json:"thinkingLevel"`
 }
 
-func geminiApplyGeneration(out map[string]any, raw json.RawMessage) {
+func geminiApplyGeneration(out map[string]any, raw jsontext.Value) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return
 	}
 
 	var cfg geminiGenerationConfig
-	if json.Unmarshal(raw, &cfg) != nil {
+	if jsonx.Unmarshal(raw, &cfg) != nil {
 		return
 	}
 
@@ -556,7 +557,7 @@ func geminiResponseSchema(cfg *geminiGenerationConfig) any {
 	}
 
 	var schema any
-	if json.Unmarshal(cfg.ResponseSchema, &schema) != nil {
+	if jsonx.Unmarshal(cfg.ResponseSchema, &schema) != nil {
 		return nil
 	}
 
@@ -675,7 +676,7 @@ func geminiThinkingEffort(cfg *geminiThinkingConfig) string {
 }
 
 // geminiApplyTools 转换 functionDeclarations 与 toolConfig。
-func geminiApplyTools(out map[string]any, tools []map[string]any, rawToolConfig json.RawMessage) {
+func geminiApplyTools(out map[string]any, tools []map[string]any, rawToolConfig jsontext.Value) {
 	if specs := geminiTools(tools); len(specs) > 0 {
 		out["tools"] = specs
 	}
@@ -751,7 +752,7 @@ func geminiToolParameters(decl map[string]any) any {
 	return decl["parameters_json_schema"]
 }
 
-func geminiToolChoice(raw json.RawMessage) any {
+func geminiToolChoice(raw jsontext.Value) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -762,7 +763,7 @@ func geminiToolChoice(raw json.RawMessage) any {
 			AllowedFunctionNames []string `json:"allowedFunctionNames"`
 		} `json:"functionCallingConfig"`
 	}
-	if json.Unmarshal(raw, &cfg) != nil {
+	if jsonx.Unmarshal(raw, &cfg) != nil {
 		return nil
 	}
 
@@ -784,20 +785,20 @@ func geminiToolChoice(raw json.RawMessage) any {
 }
 
 // geminiSystemText 提取 systemInstruction 的文本；支持字符串与 {parts:[...]}。
-func geminiSystemText(raw json.RawMessage) string {
+func geminiSystemText(raw jsontext.Value) string {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return ""
 	}
 
 	var text string
-	if json.Unmarshal(raw, &text) == nil {
+	if jsonx.Unmarshal(raw, &text) == nil {
 		return text
 	}
 
 	var obj struct {
 		Parts []map[string]any `json:"parts"`
 	}
-	if json.Unmarshal(raw, &obj) != nil {
+	if jsonx.Unmarshal(raw, &obj) != nil {
 		return ""
 	}
 
@@ -820,7 +821,7 @@ func (h *Handler) geminiCountTokens(w http.ResponseWriter, r *http.Request, mode
 	}
 
 	var iface any
-	if err := json.Unmarshal(body, &iface); err != nil {
+	if err := jsonx.Unmarshal(body, &iface); err != nil {
 		writeGeminiError(w, http.StatusBadRequest, "invalid JSON body", "")
 		return
 	}
@@ -1004,7 +1005,7 @@ func geminiArgsObject(raw string) map[string]any {
 
 	var args map[string]any
 	// 顶层 null 解成 nil map：Gemini 的 args 必须是对象，统一回落空对象。
-	if json.Unmarshal([]byte(raw), &args) == nil && args != nil {
+	if jsonx.Unmarshal([]byte(raw), &args) == nil && args != nil {
 		return args
 	}
 
@@ -1153,7 +1154,7 @@ func (g *geminiStreamWriter) handleLine(line string) error {
 
 func (g *geminiStreamWriter) handleChunk(payload string) error {
 	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) != nil {
+	if jsonx.Unmarshal([]byte(payload), &chunk) != nil {
 		return nil //nolint:nilerr // 非 JSON 噪声帧丢弃
 	}
 
@@ -1394,7 +1395,7 @@ func (g *geminiStreamWriter) captureUsage(chunk map[string]any) {
 }
 
 func (g *geminiStreamWriter) writeChunk(payload map[string]any) error {
-	raw, err := json.Marshal(payload)
+	raw, err := jsonx.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("gemini chunk: %w", err)
 	}

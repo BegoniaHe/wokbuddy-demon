@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -108,7 +108,7 @@ func TestUserIDClientKeepsStableCacheSlot(t *testing.T) {
 
 			var obj map[string]any
 
-			_ = json.Unmarshal(body, &obj)
+			_ = jsonx.Unmarshal(body, &obj)
 
 			cacheKey, _ := obj["prompt_cache_key"].(string)
 			got = append(got, outbound{convID: r.Header.Get("X-Conversation-Id"), cacheKey: cacheKey})
@@ -125,7 +125,7 @@ func TestUserIDClientKeepsStableCacheSlot(t *testing.T) {
 	handler := NewHandler(&Config{Pool: p, Upstream: client, PromptMode: "passthrough"})
 
 	send := func(body map[string]any) {
-		raw, err := json.Marshal(body)
+		raw, err := jsonx.Marshal(body)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}

@@ -16,7 +16,6 @@ package usage //nolint:revive // 公共聚合结构体较多，保持稳定 API�
 
 import (
 	"cmp"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -28,6 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -98,30 +98,30 @@ const fileVersion = 4
 // bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"`             // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`             // cn / global
-	UID   string  `json:"u"`             // 账号 uid
-	Model string  `json:"m"`             // 上游裸模型名
-	Rate  string  `json:"x,omitempty"`   // 请求时生效积分倍率（规范化数值；旧桶为空）
-	Req   int64   `json:"q"`             // 请求数（含失败）
-	Err   int64   `json:"e"`             // 失败数
-	PT    int64   `json:"p"`             // prompt tokens
-	CT    int64   `json:"c"`             // completion tokens
-	TT    int64   `json:"t"`             // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`             // 延迟累计（ms）
-	LatN  int64   `json:"ln"`            // 延迟样本数
-	TFMs  int64   `json:"tf,omitempty"`  // 首字节延迟（TTFT）累计（ms，仅流式观测）
-	TFN   int64   `json:"tfn,omitempty"` // TTFT 样本数
-	TPS   float64 `json:"v"`             // 吐字速率累计
-	TPSN  int64   `json:"vn"`            // 速率样本数
-	CR    float64 `json:"cr,omitempty"`  // usage.credit 累计（仅明确存在的观测）
-	CRN   int64   `json:"cn,omitempty"`  // usage.credit 样本数（区分缺字段与真实 0）
-	CRT   int64   `json:"ct,omitempty"`  // 同时具备 credit 与 token 的 Token 合计
-	CH    int64   `json:"ch,omitempty"`  // 前缀缓存命中 token 累计（上游回该维度才累计）
-	CM    int64   `json:"cm,omitempty"`  // 前缀缓存未命中 token 累计
+	Scope string  `json:"s"`                      // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string  `json:"r"`                      // cn / global
+	UID   string  `json:"u"`                      // 账号 uid
+	Model string  `json:"m"`                      // 上游裸模型名
+	Rate  string  `json:"x,omitempty,omitzero"`   // 请求时生效积分倍率（规范化数值；旧桶为空）
+	Req   int64   `json:"q"`                      // 请求数（含失败）
+	Err   int64   `json:"e"`                      // 失败数
+	PT    int64   `json:"p"`                      // prompt tokens
+	CT    int64   `json:"c"`                      // completion tokens
+	TT    int64   `json:"t"`                      // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`                      // 延迟累计（ms）
+	LatN  int64   `json:"ln"`                     // 延迟样本数
+	TFMs  int64   `json:"tf,omitempty,omitzero"`  // 首字节延迟（TTFT）累计（ms，仅流式观测）
+	TFN   int64   `json:"tfn,omitempty,omitzero"` // TTFT 样本数
+	TPS   float64 `json:"v"`                      // 吐字速率累计
+	TPSN  int64   `json:"vn"`                     // 速率样本数
+	CR    float64 `json:"cr,omitempty,omitzero"`  // usage.credit 累计（仅明确存在的观测）
+	CRN   int64   `json:"cn,omitempty,omitzero"`  // usage.credit 样本数（区分缺字段与真实 0）
+	CRT   int64   `json:"ct,omitempty,omitzero"`  // 同时具备 credit 与 token 的 Token 合计
+	CH    int64   `json:"ch,omitempty,omitzero"`  // 前缀缓存命中 token 累计（上游回该维度才累计）
+	CM    int64   `json:"cm,omitempty,omitzero"`  // 前缀缓存未命中 token 累计
 	// Synced 标记该桶来自上游逐笔用量回填（issue #31）：覆盖本地记录，供聚合与
 	// 面板区分「本地实时记录」与「上游权威对账」。
-	Synced bool `json:"syn,omitempty"`
+	Synced bool `json:"syn,omitempty,omitzero"`
 }
 
 // file 落盘结构。
@@ -782,7 +782,7 @@ func (r *Recorder) load() error {
 	}
 
 	var file2 file
-	if err := json.Unmarshal(raw, &file2); err != nil {
+	if err := jsonx.Unmarshal(raw, &file2); err != nil {
 		return fmt.Errorf("load: %w", err)
 	}
 
@@ -859,7 +859,7 @@ func (r *Recorder) flush(force bool) {
 		r.mu.Unlock()
 	}
 
-	raw, err := json.Marshal(snap)
+	raw, err := jsonx.Marshal(snap)
 	if err != nil {
 		log.Printf("[usage] 序列化失败: %v", err)
 		markDirty()
@@ -876,7 +876,7 @@ func (r *Recorder) flush(force bool) {
 
 	// WriteKeep 而非 Write：usage.json 是唯一永久保留的长期数据，落盘前把上一份
 	// 有效内容留成 .bak，正文被外部写坏时还能读回来（credithist 同口径）。
-	if err := safefile.WriteKeep(r.path, raw, 0o600, json.Valid); err != nil {
+	if err := safefile.WriteKeep(r.path, raw, 0o600, jsonx.Valid); err != nil {
 		log.Printf("[usage] 原子替换失败: %v", err)
 		markDirty()
 	}
@@ -898,11 +898,11 @@ type Agg struct {
 	CreditSamples      int64   `json:"credit_samples"`
 	CreditTokens       int64   `json:"credit_tokens"`
 	CreditsPer1MTokens float64 `json:"credits_per_1m_tokens"`
-	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
-	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
+	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty,omitzero"`
+	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty,omitzero"`
+	CacheHitRate       float64 `json:"cache_hit_rate,omitempty,omitzero"`
 	AvgLatencyMs       float64 `json:"avg_latency_ms"`
-	AvgTTFTMs          float64 `json:"avg_ttft_ms,omitempty"`
+	AvgTTFTMs          float64 `json:"avg_ttft_ms,omitempty,omitzero"`
 	AvgTPS             float64 `json:"avg_tokens_per_second"`
 }
 
@@ -972,8 +972,8 @@ type KeyedAgg struct {
 	Agg
 
 	Key   string `json:"key"`
-	Realm string `json:"realm,omitempty"`
-	Extra string `json:"extra,omitempty"` // 账号行放昵称
+	Realm string `json:"realm,omitempty,omitzero"`
+	Extra string `json:"extra,omitempty,omitzero"` // 账号行放昵称
 }
 
 // Point 时序上的一个点。
@@ -988,17 +988,17 @@ type Point struct {
 // Rate 仅模型维度使用；比例分母只统计与 credit 同时存在的 Token 样本。
 type CreditAgg struct {
 	Key                string  `json:"key"`
-	Realm              string  `json:"realm,omitempty"`
-	Nickname           string  `json:"nickname,omitempty"`
-	Rate               string  `json:"rate,omitempty"`
+	Realm              string  `json:"realm,omitempty,omitzero"`
+	Nickname           string  `json:"nickname,omitempty,omitzero"`
+	Rate               string  `json:"rate,omitempty,omitzero"`
 	Requests           int64   `json:"requests"`
 	Credits            float64 `json:"credits"`
 	CreditSamples      int64   `json:"credit_samples"`
 	CreditTokens       int64   `json:"credit_tokens"`
 	CreditsPer1MTokens float64 `json:"credits_per_1m_tokens"`
-	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty"`
-	CacheHitRate       float64 `json:"cache_hit_rate,omitempty"`
+	CacheHitTokens     int64   `json:"cache_hit_tokens,omitempty,omitzero"`
+	CacheMissTokens    int64   `json:"cache_miss_tokens,omitempty,omitzero"`
+	CacheHitRate       float64 `json:"cache_hit_rate,omitempty,omitzero"`
 }
 
 type creditAcc struct {
@@ -1038,12 +1038,12 @@ type Snapshot struct {
 	CreditByModel   []CreditAgg `json:"credit_by_model"`
 	Buckets         int         `json:"buckets"`
 	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	Since           string      `json:"since,omitempty,omitzero"`
 	// WindowFrom/WindowTo 本次实际生效的统计区间（本地时间，RFC3339），供面板
 	// 回显口径——「自定义」区间下用户必须能确认服务端到底按哪段算的。
 	// 空串 = 该侧不设界（全部历史 / 到今天为止）。
-	WindowFrom string `json:"window_from,omitempty"`
-	WindowTo   string `json:"window_to,omitempty"`
+	WindowFrom string `json:"window_from,omitempty,omitzero"`
+	WindowTo   string `json:"window_to,omitempty,omitzero"`
 	Generated  string `json:"generated"`
 }
 

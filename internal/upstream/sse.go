@@ -3,7 +3,7 @@ package upstream
 
 import (
 	"bufio"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // errEmptyStream 上游返回 200 但没有有效 SSE 数据帧（空流/只有注释/[DONE]）。
@@ -239,7 +241,7 @@ func (a *streamAggregator) handleLine(line string) (bool, error) {
 
 	// 非规范上游可能用单个 \n 分隔事件：上一行本身已是完整 JSON 时先落帧，
 	// 避免把两个对象拼成一行（与流式路径同规则）。
-	if len(a.dataLines) == 1 && json.Valid([]byte(a.dataLines[0])) {
+	if len(a.dataLines) == 1 && jsonx.Valid([]byte(a.dataLines[0])) {
 		if err := a.flushData(); err != nil {
 			return false, err
 		}
@@ -280,8 +282,8 @@ func (a *streamAggregator) flushData() error {
 	a.dataLines = a.dataLines[:0]
 	a.dataBytes = 0
 
-	// UseNumber：聚合帧最终会整帧重新编码回客户端，数字字面量必须原样保留。
-	chunk, err := decodeObjectUseNumber([]byte(payload))
+	// 原始字面量：聚合帧最终会整帧重新编码回客户端，数字必须原样保留。
+	chunk, err := decodeObjectRawNumbers([]byte(payload))
 	if err == nil && chunk != nil {
 		a.validEvents++
 
@@ -296,7 +298,7 @@ func (a *streamAggregator) flushData() error {
 // handleChunk 并入一个数据帧的顶层字段与 choices。聚合超限返回错误（issue #113）。
 func (a *streamAggregator) handleChunk(chunk map[string]any) error {
 	if errObj, ok := chunk["error"]; ok && errObj != nil {
-		payload, err := json.Marshal(chunk)
+		payload, err := jsonx.Marshal(chunk)
 		if err != nil {
 			return fmt.Errorf("marshal error frame: %w", err)
 		}
@@ -305,7 +307,7 @@ func (a *streamAggregator) handleChunk(chunk map[string]any) error {
 	}
 	// 顶层 {code,msg} 业务错误帧：与 error 帧同口径上抛，不能聚合成功（issue #244）。
 	if _, _, isErr := frameBusinessError(chunk); isErr {
-		payload, err := json.Marshal(chunk)
+		payload, err := jsonx.Marshal(chunk)
 		if err != nil {
 			return fmt.Errorf("marshal business error frame: %w", err)
 		}
@@ -539,9 +541,9 @@ func (t *toolIndex) next() int {
 	}
 }
 
-// jsonInt 取 JSON 数值的整数形态（float64 / int / int64 / json.Number）。
+// jsonInt 取 JSON 数值的整数形态（float64 / int / int64 / jsontext.Value）。
 //
-// 帧解码改走 UseNumber 后，上游下发的 index 是 json.Number；只认 float64 会让
+// 帧解码保留原始字面量后，上游下发的 index 是 jsontext.Value；只认 float64 会让
 // 带 index 的 tool_call 分片全部退回「按 id 推测」，并行调用因此互相覆盖。
 func jsonInt(v any) (int, bool) {
 	switch n := v.(type) {
@@ -551,13 +553,9 @@ func jsonInt(v any) (int, bool) {
 		return n, true
 	case int64:
 		return int(n), true
-	case json.Number:
-		if parsed, err := n.Int64(); err == nil {
+	case jsontext.Value:
+		if parsed, ok := jsonx.Int64(n); ok {
 			return int(parsed), true
-		}
-
-		if f, err := n.Float64(); err == nil {
-			return int(f), true
 		}
 
 		return 0, false
@@ -865,12 +863,10 @@ func ensureUsageTotal(table map[string]any) map[string]any {
 // 整个请求），这边是聚合响应求和（非数字只跳过合成）。防后人合并两处。
 func num64(v any) (float64, bool) {
 	switch n := v.(type) {
-	case json.Number:
-		// 帧解码走 UseNumber，只认 float64/int64 会让 ensureUsageTotal 在
+	case jsontext.Value:
+		// 帧解码保留原始字面量，只认 float64/int64 会让 ensureUsageTotal 在
 		// 上游省略 total_tokens 时不再合成该字段。
-		parsed, err := n.Float64()
-
-		return parsed, err == nil
+		return jsonx.Float64(n)
 	case float64:
 		return n, true
 	case int64:
@@ -1474,7 +1470,7 @@ func (s *streamWriter) writeChunk(obj map[string]any, fallback string) error {
 	s.continueMessageID(obj)
 	s.trackMaxToolIdx(obj)
 
-	raw, err := json.Marshal(normalizeFrame(obj))
+	raw, err := jsonx.Marshal(normalizeFrame(obj))
 	if err != nil {
 		return s.writeSSE(fallback)
 	}
@@ -1676,7 +1672,7 @@ func splitConcatenatedJSON(payload string) []string {
 	}
 
 	for _, segment := range scanner.segments {
-		if !json.Valid([]byte(segment)) {
+		if !jsonx.Valid([]byte(segment)) {
 			return nil
 		}
 	}
@@ -1767,9 +1763,9 @@ func startsLikeJSON(payload string) bool {
 // 仅 JSON 对象解析成功时计数记为一次有效转发（JSON 解析失败或顶层 null 照常
 // 降级原样写出，但不计数）。
 func (s *streamWriter) writeFrame(payload string) (int, error) {
-	// UseNumber：白名单重建后整帧重新编码，created/usage/logprobs 等数字不得被
+	// 原始字面量：白名单重建后整帧重新编码，created/usage/logprobs 等数字不得被
 	// float64 往返改写。
-	obj, err := decodeObjectUseNumber([]byte(payload))
+	obj, err := decodeObjectRawNumbers([]byte(payload))
 	if err != nil || obj == nil {
 		return s.writeUnparsedFrame(payload)
 	}
@@ -2072,7 +2068,7 @@ func (s *streamWriter) handleStreamLine(line string) (n int, done bool, err erro
 
 		// 非规范上游可能用单个 \n 分隔事件：上一行本身已是完整 JSON 时先落帧，
 		// 避免把两个对象拼成一行。只校验单行（O(line)），不对累积缓冲反复 join。
-		if len(s.dataLines) == 1 && json.Valid([]byte(s.dataLines[0])) {
+		if len(s.dataLines) == 1 && jsonx.Valid([]byte(s.dataLines[0])) {
 			n, werr := s.flushData()
 			if werr != nil {
 				return n, false, werr
@@ -2271,7 +2267,7 @@ func frameGatewayHint(hintFn func(string) string, payload string) string {
 // message/code/requestId 等既有键原样保留（只加不改）；非 JSON / 无 error 对象 →
 // payload 原样返回（宁可不加 hint 也不破坏原文透传）。
 func attachHintToErrorFrame(payload, hint string) string {
-	obj, err := decodeObjectUseNumber([]byte(payload))
+	obj, err := decodeObjectRawNumbers([]byte(payload))
 	if err != nil || obj == nil {
 		return payload
 	}
@@ -2283,7 +2279,7 @@ func attachHintToErrorFrame(payload, hint string) string {
 
 	e["gateway_hint"] = hint
 
-	out, err := json.Marshal(obj)
+	out, err := jsonx.Marshal(obj)
 	if err != nil {
 		return payload
 	}

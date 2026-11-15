@@ -10,7 +10,7 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
@@ -34,7 +35,7 @@ const reportPath = "/v2/report"
 // 与 travel.go 的 growthJSON 对称（growth 域走 chatBase + growth 头族；billing 域走 billingBase）。
 // checkin / balance 等 billing 端点共用：请求头统一 BillingHeaders，信封与错误语义同 doJSON。
 // 活跃上报走 reportJSON（surfaceReport 头族），不在此列。
-func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessage, error) {
+func (c *Client) billingJSON(a *auth.Auth, path string, body any) (jsontext.Value, error) {
 	return c.billingJSONLimit(a, path, body, defaultJSONBodyLimit)
 }
 
@@ -42,14 +43,14 @@ func (c *Client) billingJSON(a *auth.Auth, path string, body any) (json.RawMessa
 // 单页 1000 条可超过 1 MiB）。
 func (c *Client) billingJSONLimit(
 	a *auth.Auth, path string, body any, maxBytes int64,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	return c.billingJSONLimitHeaders(a, path, body, maxBytes, nil)
 }
 
 // billingJSONLimitHeaders 同 billingJSONLimit，额外注入调用方指定的请求头。
 func (c *Client) billingJSONLimitHeaders(
 	a *auth.Auth, path string, body any, maxBytes int64, headers map[string]string,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	return c.domainJSONLimitHeaders(
 		a, surfaceBilling, c.billingBase(a), http.MethodPost, path, body, maxBytes, headers,
 	)
@@ -57,7 +58,7 @@ func (c *Client) billingJSONLimitHeaders(
 
 // reportJSON 活跃上报面（POST {billingBase}/v2/report）请求：surfaceReport 头族 +
 // billing 域 base，body 为事件数组。
-func (c *Client) reportJSON(a *auth.Auth, body any) (json.RawMessage, error) {
+func (c *Client) reportJSON(a *auth.Auth, body any) (jsontext.Value, error) {
 	return c.domainJSONLimitHeaders(
 		a, surfaceReport, c.billingBase(a), http.MethodPost, reportPath, body, defaultJSONBodyLimit, nil,
 	)
@@ -68,11 +69,11 @@ func (c *Client) reportJSON(a *auth.Auth, body any) (json.RawMessage, error) {
 func (c *Client) domainJSONLimitHeaders(
 	account *auth.Auth, srf surface, base, method, path string, body any, maxBytes int64,
 	headers map[string]string,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	var rdr io.Reader
 
 	if body != nil {
-		raw, err := json.Marshal(body)
+		raw, err := jsonx.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("domainJSONLimit: %w", err)
 		}
@@ -98,7 +99,7 @@ func (c *Client) domainJSONLimitHeaders(
 // packages / daily-checkin）按候选序列做双路径 fallback：两 realm 都是无前缀优先
 // （官方 5.9.3 桌面端 resourcePrefix 为空串），ErrNotFound 时换 `/v2` 前缀。
 // 签到是例外：候选由 checkinMeterPaths 给出，仍是 `/v2` 优先。
-func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.RawMessage, error) {
+func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (jsontext.Value, error) {
 	return c.billingMeterJSONLimit(a, paths, body, defaultJSONBodyLimit)
 }
 
@@ -106,21 +107,21 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, body any) (json.
 // （summary / packages 的 Accept-Language、签到的 X-Device-Token）。
 func (c *Client) billingMeterJSONHeaders(
 	a *auth.Auth, paths []string, body any, headers map[string]string,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	return c.billingMeterJSONLimitHeaders(a, paths, body, defaultJSONBodyLimit, headers)
 }
 
 // billingMeterJSONLimit 同 billingMeterJSON，允许调用方指定响应体上限。
 func (c *Client) billingMeterJSONLimit(
 	a *auth.Auth, paths []string, body any, maxBytes int64,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	return c.billingMeterJSONLimitHeaders(a, paths, body, maxBytes, nil)
 }
 
 // billingMeterJSONLimitHeaders 同 billingMeterJSONLimit，额外注入调用方指定的请求头。
 func (c *Client) billingMeterJSONLimitHeaders(
 	a *auth.Auth, paths []string, body any, maxBytes int64, headers map[string]string,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	var lastErr error
 
 	for i, path := range paths {
@@ -327,12 +328,12 @@ func (c *Client) ReportChatActivityModel(
 		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
 
-	raw, err := json.Marshal([]map[string]any{event})
+	raw, err := jsonx.Marshal([]map[string]any{event})
 	if err != nil {
 		return fmt.Errorf("ReportChatActivityModel: %w", err)
 	}
 
-	_, err = c.reportJSON(account2, json.RawMessage(raw))
+	_, err = c.reportJSON(account2, jsontext.Value(raw))
 
 	return err
 }
@@ -348,13 +349,13 @@ func (c *Client) ReportChatActivityModel(
 // vcs* 也不补——网关没有工作区，四键缺席而 fileUri 保留空串，见 chatRequestEvent
 // 的条件字段说明。
 func (c *Client) chatRequestEventMap(account *auth.Auth, activity *chatRequestEvent) (map[string]any, error) {
-	raw, err := json.Marshal(activity)
+	raw, err := jsonx.Marshal(activity)
 	if err != nil {
 		return nil, fmt.Errorf("chatRequestEventMap: %w", err)
 	}
 
 	fields := make(map[string]any)
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	if err := jsonx.Unmarshal(raw, &fields); err != nil {
 		return nil, fmt.Errorf("chatRequestEventMap: %w", err)
 	}
 

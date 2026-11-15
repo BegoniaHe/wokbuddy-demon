@@ -3,7 +3,6 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +24,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
@@ -2327,7 +2327,7 @@ func maxOutputTokensFromBody(body []byte) int {
 		MaxCompletionTokens int `json:"max_completion_tokens"`
 		MaxOutputTokens     int `json:"max_output_tokens"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if jsonx.Unmarshal(body, &req) != nil {
 		return 0 // 由 pool 回落 reserveOutputTokens
 	}
 
@@ -4196,7 +4196,7 @@ func applyUsageLeaf(dst map[string]any, key string, value any) {
 			return
 		}
 	}
-	// 数值叶子按数值相加：帧解码走 UseNumber 后取值是 json.Number，只认 float64
+	// 数值叶子按数值相加：帧解码保留原始字面量后取值是 jsontext.Value，只认 float64
 	// 会让累计值被末段覆盖（多轮 completion 少算）。
 	if sum, ok := upstream.UsageSumLeaves(dst[key], value); ok {
 		dst[key] = sum
@@ -5163,7 +5163,7 @@ func (h *Handler) applyLifecyclePolicy(uid string, kind upstream.ErrKind) {
 // ---------------------------------------------------------------------------
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	raw, err := json.Marshal(v)
+	raw, err := jsonx.Marshal(v)
 	if err != nil {
 		http.Error(w, "internal encode error", http.StatusInternalServerError)
 		return

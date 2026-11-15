@@ -7,11 +7,12 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"net/http"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
@@ -57,7 +58,7 @@ func (c *Client) GrowthStreakFull(a *auth.Auth) (*StreakFull, error) {
 	}
 
 	out := &StreakFull{}
-	if err := json.Unmarshal(data, out); err != nil {
+	if err := jsonx.Unmarshal(data, out); err != nil {
 		return nil, fmt.Errorf("GrowthStreakFull: %w", err)
 	}
 
@@ -86,7 +87,7 @@ func (c *Client) LotteryChances(a *auth.Auth) (int, error) {
 			Enabled bool `json:"enabled"`
 		} `json:"module"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return 0, fmt.Errorf("LotteryChances: %w", err)
 	}
 
@@ -94,7 +95,7 @@ func (c *Client) LotteryChances(a *auth.Auth) (int, error) {
 }
 
 // LotteryDraw 抽奖一次，返回原始奖品载荷（prize 字段形状由活动期决定，透传给调用方）。
-func (c *Client) LotteryDraw(a *auth.Auth) (json.RawMessage, error) {
+func (c *Client) LotteryDraw(a *auth.Auth) (jsontext.Value, error) {
 	return c.growthJSON(a, http.MethodPost, lotteryDrawPath,
 		map[string]any{"client_token": clientToken()})
 }

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -38,7 +38,7 @@ func captureUpstream(t *testing.T) (*upstream.Client, *[]string, *int64) {
 				Model string `json:"model"`
 			}
 
-			_ = json.Unmarshal(raw, &body)
+			_ = jsonx.Unmarshal(raw, &body)
 			*models = append(*models, body.Model)
 
 			return &http.Response{
@@ -165,7 +165,7 @@ func TestChatRejectsUnsupportedModality(t *testing.T) {
 			GatewayHint string `json:"gateway_hint"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 

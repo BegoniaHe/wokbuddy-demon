@@ -3,7 +3,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -12,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -123,7 +123,7 @@ func (u *snapshotUpstream) handleAccept(r *http.Request) {
 	var body struct {
 		TaskCodes []string `json:"task_codes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := jsonx.UnmarshalRead(r.Body, &body); err != nil {
 		return
 	}
 

@@ -16,7 +16,6 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
@@ -86,7 +86,7 @@ func (c *Client) ReportMPEvent(account *auth.Auth, events ...map[string]any) err
 		arr = append(arr, m)
 	}
 
-	raw, err := json.Marshal(arr)
+	raw, err := jsonx.Marshal(arr)
 	if err != nil {
 		return fmt.Errorf("ReportMPEvent: %w", err)
 	}

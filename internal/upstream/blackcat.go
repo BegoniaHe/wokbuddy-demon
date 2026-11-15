@@ -8,7 +8,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
@@ -90,7 +90,7 @@ func (c *Client) runNightChatOnce(ctx context.Context, account *auth.Auth, i int
 		return fmt.Errorf("RunNightChats: %w", err)
 	}
 
-	body, err := json.Marshal(map[string]any{
+	body, err := jsonx.Marshal(map[string]any{
 		"model":    "glm-5.2",
 		"messages": []map[string]any{{"role": "user", "content": pickChatQuestion()}},
 		"stream":   true,
@@ -146,7 +146,7 @@ func (c *Client) claimCredit(a *auth.Auth, path string) (int64, error) {
 	// 解包失败不能当成「领到 0」：调用方据此判断补偿/签到是否到账，静默返回
 	// (0, nil) 会让真实到账被记成没领到。空 body 属上游回空，按 0 处理。
 	if len(data) > 0 {
-		if uerr := json.Unmarshal(data, &resp); uerr != nil {
+		if uerr := jsonx.Unmarshal(data, &resp); uerr != nil {
 			return 0, fmt.Errorf("claimCredit: %w", uerr)
 		}
 	}
@@ -169,7 +169,7 @@ func (c *Client) HeatmapYesterdayMissed(a *auth.Auth) (bool, error) {
 			Score int    `json:"score"`
 		} `json:"cells"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return false, fmt.Errorf("HeatmapYesterdayMissed: %w", err)
 	}
 
@@ -196,7 +196,7 @@ func (c *Client) HeatmapMissedDays(a *auth.Auth, startDay, endDay string) ([]str
 			Score int    `json:"score"`
 		} `json:"cells"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("HeatmapMissedDays: %w", err)
 	}
 

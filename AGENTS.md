@@ -135,6 +135,7 @@ WokBuddy Demon 是一个本地网关：接收 OpenAI 兼容的 `/v1/*` 请求，
 - `internal/httpauth/`：网关与面板共用的 Bearer 鉴权原语，常量时间比较（`subtle.ConstantTimeCompare`）。两处鉴权必须同口径。
 - `internal/panel/`：内嵌管理面板（前端 `web/` 的构建产物 `dist/` 经 `//go:embed` 打进二进制），与二进制同体部署。账号运维 / 用量积分 / 模型档位 / 在线改配置 / 运行日志 / 任务中心。
 - `internal/usage/`、`internal/reqlog/`、`internal/livecfg/`、`internal/logfmt/`：用量记录、请求归档（脱敏元数据）、热改配置快照、日志格式化。
+- `internal/jsonx/`：JSON 编解码口径（`encoding/json/v2` 的确定性 map 键序、nil 容器输出 null、字段名匹配宽容度、原始数字字面量）。新增 JSON 调用走这里，不直接引 `encoding/json`。
 
 ### 配置与状态
 

@@ -10,8 +10,9 @@
 package upstream
 
 import (
-	"encoding/json"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // isTruncatedArguments 判定工具参数字符串是否因分片丢失而残缺（区别于「该工具本就无参数」）。
@@ -26,7 +27,7 @@ func isTruncatedArguments(raw string) bool {
 
 	var v any
 
-	return json.Unmarshal([]byte(trimmed), &v) != nil
+	return jsonx.Unmarshal([]byte(trimmed), &v) != nil
 }
 
 // dropTruncatedToolCalls 过滤出 arguments 完整的 tool_call（返回新 slice）。

@@ -15,7 +15,7 @@ package panel
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -27,6 +27,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -60,11 +61,11 @@ var modelProbeTimeout = 30 * time.Second
 type modelProbeSample struct {
 	At           time.Time `json:"at"`
 	OK           bool      `json:"ok"`
-	TTFTMs       int64     `json:"ttft_ms,omitempty"`       // 首个内容帧耗时（首字延迟）
-	OutputTokens int64     `json:"output_tokens,omitempty"` // 上游 usage.completion_tokens
+	TTFTMs       int64     `json:"ttft_ms,omitempty,omitzero"`       // 首个内容帧耗时（首字延迟）
+	OutputTokens int64     `json:"output_tokens,omitempty,omitzero"` // 上游 usage.completion_tokens
 	DurationMs   int64     `json:"duration_ms"`
-	ErrorClass   string    `json:"error_class,omitempty"` // transport / upstream 分类 / no_account
-	Error        string    `json:"error,omitempty"`
+	ErrorClass   string    `json:"error_class,omitempty,omitzero"` // transport / upstream 分类 / no_account
+	Error        string    `json:"error,omitempty,omitzero"`
 }
 
 // modelProbeState 探测历史状态文件（data/model_probes.json）。
@@ -75,13 +76,13 @@ type modelProbeState struct {
 
 // modelProbeHealth 单模型的健康聚合（GET /panel/api/model_health）。
 type modelProbeHealth struct {
-	Last        *modelProbeSample `json:"last,omitempty"`
+	Last        *modelProbeSample `json:"last,omitempty,omitzero"`
 	Success     int               `json:"success"`
 	Failure     int               `json:"failure"`
-	AvgTTFTMs   int64             `json:"avg_ttft_ms,omitempty"`
-	P50TTFTMs   int64             `json:"p50_ttft_ms,omitempty"`
-	P95TTFTMs   int64             `json:"p95_ttft_ms,omitempty"`
-	LastProbeAt string            `json:"last_probe_at,omitempty"`
+	AvgTTFTMs   int64             `json:"avg_ttft_ms,omitempty,omitzero"`
+	P50TTFTMs   int64             `json:"p50_ttft_ms,omitempty,omitzero"`
+	P95TTFTMs   int64             `json:"p95_ttft_ms,omitempty,omitzero"`
+	LastProbeAt string            `json:"last_probe_at,omitempty,omitzero"`
 	Window      int               `json:"window"`
 }
 
@@ -281,7 +282,7 @@ func (p *Panel) runModelProbe(parent context.Context, realm, model string) model
 		return probeFailure(start, "no_account", "account not loaded")
 	}
 
-	body, err := json.Marshal(probeRequestBody(model))
+	body, err := jsonx.Marshal(probeRequestBody(model))
 	if err != nil {
 		return probeFailure(start, "internal", err.Error())
 	}
@@ -321,7 +322,7 @@ func probeFailure(start time.Time, class, msg string) modelProbeSample {
 
 // probeChunk 探测流的最小解析形态：error / usage / 首个内容帧。
 type probeChunk struct {
-	Error *json.RawMessage `json:"error"`
+	Error *jsontext.Value `json:"error"`
 	Usage *struct {
 		CompletionTokens *int64 `json:"completion_tokens"`
 	} `json:"usage"`
@@ -415,7 +416,7 @@ func handleProbeFrame(
 	}
 
 	var chunk probeChunk
-	if json.Unmarshal([]byte(payload), &chunk) != nil {
+	if jsonx.Unmarshal([]byte(payload), &chunk) != nil {
 		return false, ttft, tokens, "", "" // 非 JSON 帧：探测忽略
 	}
 
@@ -571,7 +572,7 @@ func (p *Panel) loadProbeState() *modelProbeState {
 	}
 
 	var loaded modelProbeState
-	if err := json.Unmarshal(raw, &loaded); err != nil {
+	if err := jsonx.Unmarshal(raw, &loaded); err != nil {
 		log.Printf("WARN: [panel] parse model probe state: %v", err)
 		return state
 	}
@@ -589,7 +590,7 @@ func (p *Panel) saveProbeState(state *modelProbeState) error {
 		return nil
 	}
 
-	raw, err := json.MarshalIndent(state, "", "  ")
+	raw, err := jsonx.MarshalIndent(state)
 	if err != nil {
 		return fmt.Errorf("saveProbeState: %w", err)
 	}

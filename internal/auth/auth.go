@@ -5,7 +5,7 @@ package auth
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
@@ -424,7 +425,7 @@ func (a *Auth) jwtTokenSource() string {
 		TokenSource string `json:"token_source"`
 	}
 
-	if uerr := json.Unmarshal(payload, &claims); uerr != nil {
+	if uerr := jsonx.Unmarshal(payload, &claims); uerr != nil {
 		return ""
 	}
 
@@ -486,7 +487,7 @@ func realmFromIssuer(accessToken string) string {
 	var claims struct {
 		Iss string `json:"iss"`
 	}
-	if uerr := json.Unmarshal(payload, &claims); uerr != nil {
+	if uerr := jsonx.Unmarshal(payload, &claims); uerr != nil {
 		return ""
 	}
 
@@ -523,8 +524,8 @@ func Parse(raw []byte) (*Auth, error) {
 		return nil, errEmptyAuthStorage
 	}
 
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &probe); err != nil {
+	var probe map[string]jsontext.Value
+	if err := jsonx.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
 
@@ -571,7 +572,7 @@ func NormalizeExpiresAt(expiresAt int64) int64 {
 const millisThreshold = 1e11
 
 // parseAuthDoc 按磁盘形态选择解析器：存在 "auth" 键即嵌套形，否则扁平形。
-func parseAuthDoc(raw []byte, probe map[string]json.RawMessage) (Auth, error) {
+func parseAuthDoc(raw []byte, probe map[string]jsontext.Value) (Auth, error) {
 	if _, nested := probe["auth"]; nested {
 		return parseNestedAuth(raw)
 	}
@@ -581,8 +582,8 @@ func parseAuthDoc(raw []byte, probe map[string]json.RawMessage) (Auth, error) {
 
 // parseNestedAuth 解析插件 OAuth 输出的嵌套形 {"auth":{...},"account":{...}}。
 func parseNestedAuth(raw []byte) (Auth, error) {
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	var doc map[string]jsontext.Value
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		return Auth{}, fmt.Errorf("storage_parse_error: %w", err)
 	}
 
@@ -652,13 +653,13 @@ func parseFlatAuth(raw []byte) (Auth, error) {
 var errAuthDocNotObject = errors.New("auth document is not a JSON object")
 
 // rawObject 把 JSON 对象解成键值表；缺失或非对象返回 nil（调用方按空对象处理）。
-func rawObject(raw json.RawMessage) map[string]json.RawMessage {
+func rawObject(raw jsontext.Value) map[string]jsontext.Value {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
 
-	var obj map[string]json.RawMessage
-	if json.Unmarshal(raw, &obj) != nil {
+	var obj map[string]jsontext.Value
+	if jsonx.Unmarshal(raw, &obj) != nil {
 		return nil
 	}
 
@@ -669,14 +670,14 @@ func rawObject(raw json.RawMessage) map[string]json.RawMessage {
 //
 // 令牌三件套（accessToken/refreshToken）必须严格，否则数字/对象会被宽松转成
 // 垃圾令牌，直到 401 才发现。
-func strictAuthString(raw json.RawMessage, key string) (string, error) {
+func strictAuthString(raw jsontext.Value, key string) (string, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return "", nil
 	}
 
 	var str string
-	if err := json.Unmarshal(trimmed, &str); err != nil {
+	if err := jsonx.Unmarshal(trimmed, &str); err != nil {
 		return "", fmt.Errorf("storage_parse_error: %s: %w", key, err)
 	}
 
@@ -688,7 +689,7 @@ func strictAuthString(raw json.RawMessage, key string) (string, error) {
 // 身份类字段（uid/type/idSource/departmentFullName/nickname 等）与 domain 不是凭证
 // 关键项：插件某天写成 12345、true，或手写文件少写引号时，强类型整份解码会让整个
 // 文件解析失败、账号在池里静默消失（只有一行 WARN）。这类字段降级为空值即可。
-func looseString(raw json.RawMessage) string {
+func looseString(raw jsontext.Value) string {
 	str, ok := looseScalar(raw)
 	if ok {
 		return str
@@ -698,24 +699,24 @@ func looseString(raw json.RawMessage) string {
 }
 
 // looseScalar 把 JSON 标量转成字面量字符串。
-func looseScalar(raw json.RawMessage) (string, bool) {
+func looseScalar(raw jsontext.Value) (string, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return "", false
 	}
 
 	var str string
-	if json.Unmarshal(trimmed, &str) == nil {
+	if jsonx.Unmarshal(trimmed, &str) == nil {
 		return str, true
 	}
 
-	var number json.Number
-	if json.Unmarshal(trimmed, &number) == nil {
-		return number.String(), true
+	var number jsontext.Value
+	if jsonx.Unmarshal(trimmed, &number) == nil && number.Kind() == '0' {
+		return string(number), true
 	}
 
 	var boolean bool
-	if json.Unmarshal(trimmed, &boolean) == nil {
+	if jsonx.Unmarshal(trimmed, &boolean) == nil {
 		return strconv.FormatBool(boolean), true
 	}
 
@@ -723,26 +724,22 @@ func looseScalar(raw json.RawMessage) (string, bool) {
 }
 
 // looseInt64 宽松取整数字段：接受数字与数字字符串，其它形态返回 0（未设置）。
-func looseInt64(raw json.RawMessage) int64 {
+func looseInt64(raw jsontext.Value) int64 {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return 0
 	}
 
-	var number json.Number
-	if json.Unmarshal(trimmed, &number) == nil {
-		if value, err := number.Int64(); err == nil {
+	var number jsontext.Value
+	if jsonx.Unmarshal(trimmed, &number) == nil && number.Kind() == '0' {
+		if value, ok := jsonx.Int64(number); ok {
 			return value
-		}
-
-		if value, err := number.Float64(); err == nil {
-			return int64(value)
 		}
 	}
 
 	// 数字字符串形态（"1760000000"）：插件把数值序列化成字符串。
 	var str string
-	if json.Unmarshal(trimmed, &str) == nil {
+	if jsonx.Unmarshal(trimmed, &str) == nil {
 		if value, err := strconv.ParseInt(strings.TrimSpace(str), 10, 64); err == nil {
 			return value
 		}
@@ -795,15 +792,15 @@ var authLegacyFlatKeys = map[string]bool{
 
 // preserveUnknownAuthKeys 把原始文档里本包未建模的键合并进待写 doc。
 //
-// 只读原始字节、按 json.RawMessage 搬运：map[string]any 往返会把 openId 这类
+// 只读原始字节、按 jsontext.Value 搬运：map[string]any 往返会把 openId 这类
 // 大整数改成另一个值，而未知键必须逐字保留。
 func preserveUnknownAuthKeys(doc map[string]any, rawDoc []byte, flat bool) {
 	if len(rawDoc) == 0 {
 		return
 	}
 
-	var top map[string]json.RawMessage
-	if json.Unmarshal(rawDoc, &top) != nil {
+	var top map[string]jsontext.Value
+	if jsonx.Unmarshal(rawDoc, &top) != nil {
 		return
 	}
 
@@ -830,7 +827,7 @@ func preserveUnknownAuthKeys(doc map[string]any, rawDoc []byte, flat bool) {
 
 // preserveFlatUnknownKeys 扁平形写回统一落成嵌套形（既有行为）：原顶层未建模键
 // 抬到新文档顶层。
-func preserveFlatUnknownKeys(doc map[string]any, top map[string]json.RawMessage) {
+func preserveFlatUnknownKeys(doc map[string]any, top map[string]jsontext.Value) {
 	for key, value := range top {
 		if !authLegacyFlatKeys[key] {
 			doc[key] = value
@@ -839,12 +836,12 @@ func preserveFlatUnknownKeys(doc map[string]any, top map[string]json.RawMessage)
 }
 
 // mergeUnknownObject 以原始子对象为基底写入已知键；known 必须是 map[string]any。
-func mergeUnknownObject(raw json.RawMessage, known any) map[string]any {
+func mergeUnknownObject(raw jsontext.Value, known any) map[string]any {
 	out := map[string]any{}
 
 	if len(raw) > 0 {
-		var src map[string]json.RawMessage
-		if json.Unmarshal(raw, &src) == nil {
+		var src map[string]jsontext.Value
+		if jsonx.Unmarshal(raw, &src) == nil {
 			// 不能 maps.Copy：out 是 map[string]any，RawMessage 值必须原样搬运
 			// （解码成 any 会把 openId 这类大整数改成 float64）。
 			for key, value := range src {
@@ -881,7 +878,7 @@ func (a *Auth) SaveAtomic() error {
 		return errNoFilePathSet
 	}
 
-	raw, err := json.MarshalIndent(a.saveDocLocked(), "", "  ")
+	raw, err := jsonx.MarshalIndent(a.saveDocLocked())
 	if err != nil {
 		return fmt.Errorf("SaveAtomic: %w", err)
 	}

@@ -15,7 +15,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -32,6 +31,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -61,33 +61,33 @@ type Record struct {
 	ID               string     `json:"id"`
 	Name             string     `json:"name"`
 	Prefix           string     `json:"prefix"`
-	Hash             string     `json:"hash,omitempty"`
+	Hash             string     `json:"hash,omitempty,omitzero"`
 	CreatedAt        time.Time  `json:"created_at"`
-	LastUsedAt       *time.Time `json:"last_used_at,omitempty"`
-	Revoked          bool       `json:"revoked,omitempty"`
+	LastUsedAt       *time.Time `json:"last_used_at,omitempty,omitzero"`
+	Revoked          bool       `json:"revoked,omitempty,omitzero"`
 	Requests         int64      `json:"requests"`
 	PromptTokens     int64      `json:"prompt_tokens"`
 	CompletionTokens int64      `json:"completion_tokens"`
 	TotalTokens      int64      `json:"total_tokens"`
-	Rejected         int64      `json:"rejected,omitempty"`
+	Rejected         int64      `json:"rejected,omitempty,omitzero"`
 	Limits           Limits     `json:"limits,omitzero"`
 	// Realm 出口绑定（issue #94）：空 = 不绑定（跟随模型前缀/全局），
 	// cn / global = 固定该域。只影响 /v1/* 路由，不改变鉴权与管理面可见性。
-	Realm string `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty,omitzero"`
 }
 
 // Limits 一把命名密钥的可选限制；零值 = 不限。进程内计数，单实例语义。
 type Limits struct {
-	RPM           int      `json:"rpm,omitempty"`            // 每分钟请求数
-	TPM           int      `json:"tpm,omitempty"`            // 每分钟 completion token 数（Decode/输出；不含 prompt）
-	MaxConcurrent int      `json:"max_concurrent,omitempty"` // 最大并发请求数
-	Models        []string `json:"models,omitempty"`         // 模型白名单（glob，可带 cn:/global: 前缀）
+	RPM           int      `json:"rpm,omitempty,omitzero"`            // 每分钟请求数
+	TPM           int      `json:"tpm,omitempty,omitzero"`            // 每分钟 completion token 数（不含 prompt）
+	MaxConcurrent int      `json:"max_concurrent,omitempty,omitzero"` // 最大并发数
+	Models        []string `json:"models,omitempty,omitzero"`         // 模型白名单（glob，可带 cn:/global: 前缀）
 	// ExpiresAt 到期时刻（UTC）；nil = 永不过期。now >= ExpiresAt 即拒绝。
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty,omitzero"`
 	// QuotaTokens 生命周期总 token 配额；0 = 不限。按 Record.TotalTokens 判定。
-	QuotaTokens int64 `json:"quota_tokens,omitempty"`
+	QuotaTokens int64 `json:"quota_tokens,omitempty,omitzero"`
 	// IPAllowlist 来源 IP 白名单（裸 IP 或 CIDR）；空 = 不限。保存时归一化。
-	IPAllowlist []string `json:"ip_allowlist,omitempty"`
+	IPAllowlist []string `json:"ip_allowlist,omitempty,omitzero"`
 }
 
 // limitRuntime 单把密钥的进程内在途计数（只跟踪并发；RPM/TPM 改由 pace.go 的
@@ -170,7 +170,7 @@ func (s *Store) load() error {
 	}
 
 	var file2 file
-	if err := json.Unmarshal(raw, &file2); err != nil {
+	if err := jsonx.Unmarshal(raw, &file2); err != nil {
 		return fmt.Errorf("load: %w", err)
 	}
 
@@ -540,7 +540,7 @@ func (s *Store) persistLocked() error {
 
 // writeRecords 原子写盘记录集合（tmp + rename，0600）。
 func writeRecords(path string, records []Record) error {
-	raw, err := json.MarshalIndent(file{Version: fileVersion, Keys: records}, "", "  ")
+	raw, err := jsonx.MarshalIndent(file{Version: fileVersion, Keys: records})
 	if err != nil {
 		return fmt.Errorf("writeRecords: %w", err)
 	}

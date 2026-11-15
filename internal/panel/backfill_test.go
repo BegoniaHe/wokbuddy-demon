@@ -4,7 +4,6 @@ package panel
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
@@ -44,7 +44,7 @@ func TestUsageBackfillEndpoint(t *testing.T) {
 	up := &upstream.Client{HTTP: srv.Client(), BillingBaseCN: srv.URL, ChatBaseCN: srv.URL}
 	pn := &Panel{cfg: Config{Pool: p, Upstream: up, Usage: rec}}
 
-	body, _ := json.Marshal(map[string]any{"uid": "u1", "days": 7})
+	body, _ := jsonx.Marshal(map[string]any{"uid": "u1", "days": 7})
 	req := httptest.NewRequest(http.MethodPost, "/panel/api/usage/backfill", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	pn.usageBackfill(w, req)
@@ -58,7 +58,7 @@ func TestUsageBackfillEndpoint(t *testing.T) {
 		Buckets  int `json:"buckets"`
 		Accounts int `json:"accounts"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+	if err := jsonx.Unmarshal(w.Body.Bytes(), &res); err != nil {
 		t.Fatalf("decode: %v body=%s", err, w.Body)
 	}
 
@@ -120,7 +120,7 @@ func TestFetchBackfillRecordsSplitsCappedWindow(t *testing.T) {
 			StartTime string `json:"startTime"`
 			EndTime   string `json:"endTime"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := jsonx.UnmarshalRead(r.Body, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

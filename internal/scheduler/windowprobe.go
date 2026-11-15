@@ -8,13 +8,13 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -139,7 +139,7 @@ const windowProbeRetryBackoffLog = "10m"
 func (s *Scheduler) sendWindowProbe(
 	ctx context.Context, account *auth.Auth, model string,
 ) (pool.WindowProbeResult, error) {
-	body, err := json.Marshal(map[string]any{
+	body, err := jsonx.Marshal(map[string]any{
 		"model":      model,
 		"stream":     true,
 		"max_tokens": 1,

@@ -1,12 +1,13 @@
 package credithist
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // writeFile 测试辅助：写文件（避免测试里到处 if err）。
@@ -192,7 +193,7 @@ func TestLedgerConcurrentFlushStaysValid(t *testing.T) {
 	}
 
 	var doc fileDoc
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("并发 Flush 写坏了账本文件: %v", err)
 	}
 
@@ -287,7 +288,7 @@ func TestLedgerTrimsOnLoad(t *testing.T) {
 		entries = append(entries, Entry{UID: "u1", Delta: int64(i), Remain: int64(i)})
 	}
 
-	raw, err := json.Marshal(fileDoc{Version: 1, Entries: entries})
+	raw, err := jsonx.Marshal(fileDoc{Version: 1, Entries: entries})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}

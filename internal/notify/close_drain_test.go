@@ -1,12 +1,13 @@
 package notify
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestNotifierCloseDrainsQueuedEvents Close 必须排空已入队但未发送的事件再退出。
@@ -20,7 +21,7 @@ func TestNotifierCloseDrainsQueuedEvents(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
 
-		_ = json.NewDecoder(r.Body).Decode(&p)
+		_ = jsonx.UnmarshalRead(r.Body, &p)
 
 		time.Sleep(5 * time.Millisecond)
 		delivered.Add(1)

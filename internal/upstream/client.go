@@ -8,7 +8,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/x509"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +30,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 )
@@ -392,7 +393,7 @@ func IsModelBlocked(status int, body string) bool {
 	}
 
 	var root map[string]any
-	if err := json.Unmarshal([]byte(body), &root); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &root); err != nil {
 		return false
 	}
 
@@ -472,7 +473,7 @@ var businessCodeFields = []string{"code", "bizCode"}
 // 供签到/trial 等消费方在 Msg 被截断后仍能按码判定。
 func businessCode(body string) string {
 	var root any
-	if err := json.Unmarshal([]byte(body), &root); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &root); err != nil {
 		return ""
 	}
 
@@ -529,7 +530,7 @@ func hasAnyBusinessCode(body string, wants ...string) bool {
 	}
 
 	var root any
-	if err := json.Unmarshal([]byte(body), &root); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &root); err != nil {
 		return false
 	}
 
@@ -802,7 +803,7 @@ func classifyModelParamInvalid(body string) ErrKind {
 //nolint:cyclop,gocognit,gocyclo // 深度有界的递归提取。
 func businessErrorParam(body string) string {
 	var root any
-	if json.Unmarshal([]byte(body), &root) != nil {
+	if jsonx.Unmarshal([]byte(body), &root) != nil {
 		return ""
 	}
 
@@ -1236,9 +1237,9 @@ func classifyGeneric4xx(status int, lower, body string) (ErrKind, bool) {
 
 // apiEnvelope 上游统一信封。
 type apiEnvelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
+	Code int            `json:"code"`
+	Msg  string         `json:"msg"`
+	Data jsontext.Value `json:"data"`
 }
 
 // Client 上游 HTTP 客户端。Base 字段可覆盖便于测试。
@@ -1953,14 +1954,14 @@ const defaultJSONBodyLimit int64 = 1 << 20
 
 // doJSONFor 经账号出口 client 发请求并解信封（issue #39）：账号绑定了槽或命中
 // realm 默认槽时必须用它。account 为 nil 时等价 c.HTTP（无账号作用域的调用）。
-func (c *Client) doJSONFor(account *auth.Auth, req *http.Request) (json.RawMessage, error) {
+func (c *Client) doJSONFor(account *auth.Auth, req *http.Request) (jsontext.Value, error) {
 	return c.doJSONAt(c.HTTPForAccount(account), req, defaultJSONBodyLimit)
 }
 
 // doJSONLimitFor 同 doJSONFor，但允许调用方指定响应体上限。
 func (c *Client) doJSONLimitFor(
 	account *auth.Auth, req *http.Request, maxBytes int64,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	return c.doJSONAt(c.HTTPForAccount(account), req, maxBytes)
 }
 
@@ -1972,14 +1973,14 @@ func (c *Client) doJSONLimitFor(
 // 掐流/截断）→ 普通错误（半截 body 不进 Classify，不参与账号惩罚）。
 // maxBytes <= 0 时按默认上限；超限返回明确错误而不是把半截 body 交给
 // json.Unmarshal（后者只会报 "unexpected end of JSON input"）。
-func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (json.RawMessage, error) {
+func (*Client) doJSONAt(hc *http.Client, req *http.Request, maxBytes int64) (jsontext.Value, error) {
 	raw, status, err := doRawAt(hc, req, maxBytes)
 	if err != nil {
 		return nil, err
 	}
 
 	var env apiEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := jsonx.Unmarshal(raw, &env); err != nil {
 		// body 片段可能夹带上游回显的凭证（截断/非 JSON 时尤甚），入错误串前先脱敏。
 		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, RedactForLog(string(raw), 120))
 	}
@@ -2216,7 +2217,7 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 	hdrSnapshot := account10.Snapshot()
 	hdrSnapshot.RefreshToken = rtSnapshot
 
-	var data json.RawMessage
+	var data jsontext.Value
 
 	origins := c.chatOrigins(account10)
 
@@ -2252,7 +2253,7 @@ func (c *Client) refreshTokenOnce(account10 *auth.Auth) (refreshTokenResponse, e
 const refreshBody = "{}"
 
 // refreshAt 向单个 origin 发一次 refresh 请求并解信封。
-func (c *Client) refreshAt(ctx context.Context, base string, hdr *auth.Auth) (json.RawMessage, error) {
+func (c *Client) refreshAt(ctx context.Context, base string, hdr *auth.Auth) (jsontext.Value, error) {
 	req, err := http.NewRequestWithContext(
 		ctx, http.MethodPost, base+"/v2/plugin/auth/token/refresh", strings.NewReader(refreshBody),
 	)
@@ -2381,7 +2382,7 @@ func refreshTokenSnapshot(account *auth.Auth) (rtSnapshot, atBefore string, err 
 // parseRefreshResponse 解析 refresh 响应；缺 accessToken 视为刷新失败（需重登）。
 func parseRefreshResponse(data []byte) (refreshTokenResponse, error) {
 	var tok refreshTokenResponse
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+	if err := jsonx.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
 		return refreshTokenResponse{}, errRefreshFailedNoAccessTokenIn
 	}
 
@@ -2466,7 +2467,7 @@ func modelFromBody(body []byte) string {
 		Model string `json:"model"`
 	}
 
-	_ = json.Unmarshal(body, &peek)
+	_ = jsonx.Unmarshal(body, &peek)
 
 	return peek.Model
 }
@@ -3337,7 +3338,7 @@ func parseEnterpriseModels(
 	raw []byte, allowFull bool,
 ) ([]string, map[string]dynModelEntry, []modelAgent, error) {
 	var env enterpriseModelsEnv
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := jsonx.Unmarshal(raw, &env); err != nil {
 		return nil, nil, nil, fmt.Errorf("models parse: %w", err)
 	}
 
@@ -4160,7 +4161,7 @@ type v3TrialBanner struct {
 // parseV3ConfigEnv 解析 /v3/config 响应并校验业务 code。
 func parseV3ConfigEnv(raw []byte) (v3ConfigEnv, error) {
 	var env v3ConfigEnv
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := jsonx.Unmarshal(raw, &env); err != nil {
 		return v3ConfigEnv{}, fmt.Errorf("v3/config parse: %w", err)
 	}
 
@@ -4298,20 +4299,20 @@ type CreditPackage struct {
 	// EndTime 该包的失效时刻：优先 DeductionEndTime（可抵扣窗口结束，真「用不完
 	// 就没了」），缺失依次回落 ExpiredTime / PackageEndTime / CycleEndTime（周期
 	// 边界，仅兜底）。RFC3339 或上游墙钟字符串，前端取日期部分展示。
-	EndTime string `json:"end_time,omitempty"`
+	EndTime string `json:"end_time,omitempty,omitzero"`
 	// ExpiresAt 与 EndTime 同源的 Unix 毫秒时间戳，供面板按精确剩余天数聚合。
-	ExpiresAt int64 `json:"expires_at,omitempty"`
+	ExpiresAt int64 `json:"expires_at,omitempty,omitzero"`
 	// CreatedAt 发放时刻，RFC3339。**这是区分「首登赠送」与「活动奖励」的唯一依据**：
 	// 两类包的 PackageName 与 PackageCode 完全相同（例如都是「国内运营裂变包」+
 	// TCACA_code_007_*），只看名字无法区分，只有时间能说明它是不是账号首次授权那刻发的。
-	CreatedAt string `json:"created_at,omitempty"`
+	CreatedAt string `json:"created_at,omitempty,omitzero"`
 	// PackageCode / SubProductCode 上游的包类型标识。同 Name 不同 Code 的包可能
 	// 是不同来源；同 Code 不同面额则是同来源分批发放（首登 1500 与活动 300 即如此）。
-	PackageCode    string `json:"package_code,omitempty"`
-	SubProductCode string `json:"sub_product_code,omitempty"`
-	SubProductName string `json:"sub_product_name,omitempty"`
+	PackageCode    string `json:"package_code,omitempty,omitzero"`
+	SubProductCode string `json:"sub_product_code,omitempty,omitzero"`
+	SubProductName string `json:"sub_product_name,omitempty,omitzero"`
 	// Cycle 为 true 表示按周期发放的包（读 Cycle* 字段），否则读 Capacity*。
-	Cycle bool `json:"cycle,omitempty"`
+	Cycle bool `json:"cycle,omitempty,omitzero"`
 }
 
 // CreditPackages 返回账号当前的逐包构成。remain/size 为各包求和。
@@ -4341,7 +4342,7 @@ func (c *Client) CreditPackages(account2 *auth.Auth) ([]CreditPackage, int64, in
 	// Response 开始解析——**不能**再套一层 Code/Data，否则 Accounts 恒为空，
 	// 表现为「每个号都 0 个包」（实测踩过）。
 	var resp billingPackagesResp
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return nil, 0, 0, fmt.Errorf("packages parse: %w", err)
 	}
 
@@ -4370,7 +4371,7 @@ type modelIDList []string
 //nolint:gocognit // 字符串数组/对象数组两种形态解析。
 func (m *modelIDList) UnmarshalJSON(raw []byte) error {
 	var values []any
-	if err := json.Unmarshal(raw, &values); err != nil {
+	if err := jsonx.Unmarshal(raw, &values); err != nil {
 		return fmt.Errorf("availableModels parse: %w", err)
 	}
 
@@ -4707,7 +4708,7 @@ func (c *Client) enterpriseResource(
 	ctx context.Context, account6 *auth.Auth, soon time.Duration,
 ) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	// 与个人口径一致：余额是签到后的紧邻调用，偶发 500 值得有界重试。
-	var data json.RawMessage
+	var data jsontext.Value
 
 	err = c.retryBillingTransient(ctx, func() error {
 		var e error
@@ -4756,10 +4757,10 @@ type enterpriseQuota struct {
 
 // parseEnterpriseQuota 解析企业额度响应，把两套字段命名归一到 limit/used。
 func parseEnterpriseQuota(
-	data json.RawMessage,
+	data jsontext.Value,
 ) (limit int64, used float64, cycleEnd, cycleReset string, err error) {
 	var resp enterpriseQuota
-	if uerr := json.Unmarshal(data, &resp); uerr != nil {
+	if uerr := jsonx.Unmarshal(data, &resp); uerr != nil {
 		return 0, 0, "", "", fmt.Errorf("enterprise resource parse: %w", uerr)
 	}
 
@@ -4854,7 +4855,7 @@ func flexNumberText(raw []byte) (string, error) {
 	text := strings.TrimSpace(string(raw))
 	if strings.HasPrefix(text, `"`) {
 		var decoded string
-		if err := json.Unmarshal(raw, &decoded); err != nil {
+		if err := jsonx.Unmarshal(raw, &decoded); err != nil {
 			return "", fmt.Errorf("%w: %w", errFlexInt64Invalid, err)
 		}
 
@@ -4885,7 +4886,7 @@ type resourceSummaryResp struct {
 // 官方 5.9.3 `resourcePrefix` 为空串：无前缀路径优先，404 回落 `/v2`。
 // Accept-Language 只在这类 summary / packages 请求上带（官方由调用方注入 zh/en）。
 func (c *Client) fetchResourceSummary(ctx context.Context, account *auth.Auth) (resourceSummaryResp, error) {
-	var data json.RawMessage
+	var data jsontext.Value
 
 	err := c.retryBillingTransient(ctx, func() error {
 		var fetchErr error
@@ -4905,7 +4906,7 @@ func (c *Client) fetchResourceSummary(ctx context.Context, account *auth.Auth) (
 	// 解码失败是确定性错误，不参与瞬时重试（否则每次余额刷新都要白等 2s+4s）；
 	// 与 enterpriseResource / UserResourceDetailedWithExpiry 的重试范围保持一致。
 	var out resourceSummaryResp
-	if err := json.Unmarshal(data, &out); err != nil {
+	if err := jsonx.Unmarshal(data, &out); err != nil {
 		return resourceSummaryResp{}, fmt.Errorf("resource summary parse: %w", err)
 	}
 
@@ -5114,7 +5115,7 @@ func (c *Client) fetchPackagePage(
 	}
 
 	var resp packagePageResp
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return packagePageResp{}, fmt.Errorf("packages parse: %w", err)
 	}
 
@@ -5235,7 +5236,7 @@ func (c *Client) personalResource(
 
 	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
-	var data json.RawMessage
+	var data jsontext.Value
 
 	err := c.retryBillingTransient(ctx, func() error {
 		var e error
@@ -5249,7 +5250,7 @@ func (c *Client) personalResource(
 	}
 
 	var resp resourceDetailedResp
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return resourceProbe{}, fmt.Errorf("resource parse: %w", err)
 	}
 
@@ -5332,10 +5333,10 @@ type ResourceSnapshot struct {
 	Remain   int64          `json:"remain"`
 	Total    int64          `json:"total"`
 	Expiring int64          `json:"expiring"`
-	Buckets  []ExpiryBucket `json:"buckets,omitempty"`
+	Buckets  []ExpiryBucket `json:"buckets,omitempty,omitzero"`
 	// PaidUser 上游 summary 的 IsPaidUser 观测（issue #529）：true 付费、false 免费、
 	// nil 未知（字段缺失 / 企业口径 / 旧端点回退）。只做观测与透出，不参与选号。
-	PaidUser *bool `json:"paid_user,omitempty"`
+	PaidUser *bool `json:"paid_user,omitempty,omitzero"`
 }
 
 // resourceTotals 个人资源聚合累加器。

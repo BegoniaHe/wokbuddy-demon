@@ -5,7 +5,9 @@
 // 失败。本包在 Windows 下做有界退避重试，非 Windows 保持单次 rename 语义（issue #26）。
 package atomicwrite
 
-import "time"
+import (
+	"time"
+)
 
 // 退避参数：有界（上限次数 + 延迟封顶），避免调用方（如 auth.SaveAtomic 全程持锁）
 // 因重试长时间阻塞。测试可临时调小。

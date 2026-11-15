@@ -5,11 +5,14 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"log"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // chatBodyRewrite 一次出站 chat body 改写的全部输入。零值 = 只做基础规范化
@@ -41,9 +44,9 @@ func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 		return src
 	}
 
-	// UseNumber：改写只动结构与已知字段，客户端的数值字面量（seed/大整数 id/1.0）
+	// 原始字面量：改写只动结构与已知字段，客户端的数值（seed/大整数 id/1.0）
 	// 必须逐字保留。
-	obj, err := decodeObjectUseNumber(src)
+	obj, err := decodeObjectRawNumbers(src)
 	if err != nil || obj == nil {
 		return src
 	}
@@ -64,7 +67,7 @@ func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 		injectAgentCLIObj(obj)
 	}
 
-	out, err := json.Marshal(obj)
+	out, err := jsonx.Marshal(obj)
 	if err != nil {
 		return src
 	}
@@ -192,23 +195,15 @@ func translateMaxCompletionTokens(obj map[string]any) {
 
 // positiveInt64 把 JSON 数值取成正整数。
 //
-// 解码走 UseNumber，别名通常是 json.Number；统一取整后回写，避免 1.28e5 这类
+// 解码保留原始字面量，别名通常是 jsontext.Value；统一取整后回写，避免 1.28e5 这类
 // 科学计数法/小数尾巴进上游 body。其余数值类型防御性兼容（手构造 map 的调用方）。
 // 0 / 负数（语义是「未设置」或非法值）、非整数、非数值一律判否。
-//
-//nolint:cyclop,gocyclo // 与 positiveUsageNumber 同口径：JSON 数值类型集中分支。
 func positiveInt64(v any) (int64, bool) {
 	switch n := v.(type) {
-	case json.Number:
-		// UseNumber 解码下客户端的 4096.0 / 1e5 会以字面量到达：按整值浮点接受，
-		// 与本函数 float64 分支同口径（Int64 严格解析会把它们判成非法）。
-		if parsed, err := n.Int64(); err == nil {
-			return parsed, parsed > 0
-		}
-
-		if f, err := n.Float64(); err == nil && f > 0 && f == float64(int64(f)) {
-			return int64(f), true
-		}
+	case jsontext.Value:
+		// 原始字面量解码下客户端的 4096.0 / 1e5 以字面量到达：按整值浮点接受，
+		// 与本函数 float64 分支同口径（严格 ParseInt 会把它们判成非法）。
+		return positiveLiteral(string(n))
 	case float64:
 		if n > 0 && n == float64(int64(n)) {
 			return int64(n), true
@@ -220,6 +215,20 @@ func positiveInt64(v any) (int64, bool) {
 	}
 
 	return 0, false
+}
+
+// positiveLiteral 把原始数字字面量转成正整数：0 / 负数 / 非整数 / 非数字一律判否。
+func positiveLiteral(literal string) (int64, bool) {
+	if parsed, err := strconv.ParseInt(literal, 10, 64); err == nil {
+		return parsed, parsed > 0
+	}
+
+	f, err := strconv.ParseFloat(literal, 64)
+	if err != nil || f <= 0 || f != float64(int64(f)) {
+		return 0, false
+	}
+
+	return int64(f), true
 }
 
 // gptMinMaxTokens GPT 系上游接受的 max_tokens 下限。
@@ -243,9 +252,9 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 	switch n := obj["max_tokens"].(type) {
 	case float64:
 		num = int64(n)
-	case json.Number:
-		parsed, err := n.Int64()
-		if err != nil {
+	case jsontext.Value:
+		parsed, ok := jsonx.Int64(n)
+		if !ok {
 			return
 		}
 
@@ -909,20 +918,30 @@ func enumItemType(item any) (string, bool) {
 		return "integer", true
 	case int, int64:
 		return "integer", true
-	case json.Number:
-		// 出站改写走 UseNumber 解码，enum 里的数字是 json.Number 而非 float64。
-		if _, err := value.Int64(); err == nil {
-			return "integer", true
-		}
-
-		if _, err := value.Float64(); err == nil {
-			return "number", true
-		}
-
-		return "", false
+	case jsontext.Value:
+		// 出站改写走原始字面量解码，enum 里的数字是 jsontext.Value 而非 float64。
+		return literalEnumType(value)
 	default:
 		return "", false
 	}
+}
+
+// literalEnumType 把数字字面量归类：整数值（含 1.0）算 integer，带小数算 number。
+func literalEnumType(value jsontext.Value) (string, bool) {
+	if value.Kind() != '0' {
+		return "", false
+	}
+
+	f, err := strconv.ParseFloat(string(value), 64)
+	if err != nil {
+		return "", false
+	}
+
+	if f != math.Trunc(f) {
+		return "number", true
+	}
+
+	return "integer", true
 }
 
 // mergeEnumType 合并两个已推断类型：同类型不变，整型与小数混合取 number（仍是唯一

@@ -2,7 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -46,7 +46,7 @@ func TestMakeupRecentNearToFar(t *testing.T) {
 				TargetDate string `json:"target_date"`
 			}
 
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = jsonx.UnmarshalRead(r.Body, &body)
 
 			mu.Lock()
 
@@ -116,7 +116,7 @@ func newMakeupFixture(t *testing.T, balance int, missed ...string) (*makeupFixtu
 				TargetDate string `json:"target_date"`
 			}
 
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := jsonx.UnmarshalRead(r.Body, &body); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}

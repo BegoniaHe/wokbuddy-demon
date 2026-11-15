@@ -3,12 +3,12 @@
 package panel
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 )
 
@@ -27,7 +27,7 @@ func getOverview(t *testing.T, panel *Panel) map[string]any {
 	}
 
 	var out map[string]any
-	if err := json.Unmarshal(recorder.Body.Bytes(), &out); err != nil {
+	if err := jsonx.Unmarshal(recorder.Body.Bytes(), &out); err != nil {
 		t.Fatalf("decode overview: %v", err)
 	}
 
