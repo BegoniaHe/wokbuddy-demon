@@ -6,7 +6,8 @@
 //
 // 安全头对"面板页面、静态资源与全部 /panel/api/* 响应"统一生效：CSP 限制脚本
 // 只能来自本服务，禁止被 iframe 嵌套（防点击劫持），禁 MIME 嗅探，并声明不泄露
-// Referer 出去。
+// Referer 出去。X-Robots-Tag 让搜索引擎与资产测绘不收录面板入口（CSP 只管资源
+// 加载，管不到抓取）。
 package panel
 
 import (
@@ -54,6 +55,7 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Referrer-Policy", "no-referrer")    // 不外泄面板地址给外部站点
 	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow") // 不被搜索引擎收录，也不追踪页面内链接
 }
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
