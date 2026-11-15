@@ -1,0 +1,9 @@
+interface:
+  display_name: "shadcn/ui"
+  short_description: "Add, fix, and style shadcn/ui components"
+  icon_small: "./assets/shadcn-small.png"
+  icon_large: "./assets/shadcn.png"
+  default_prompt: "Use $shadcn to add, fix, or restyle shadcn/ui components in this project with the correct package runner and project context."
+
+policy:
+  allow_implicit_invocation: true

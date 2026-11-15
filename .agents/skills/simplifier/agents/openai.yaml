@@ -2,3 +2,6 @@ interface:
   display_name: 'Simplifier'
   short_description: 'Ship the smallest current change that solves the task'
   default_prompt: 'Use $simplifier on this request: smallest current design, reuse what exists, name anything skipped and when to add it.'
+
+policy:
+  allow_implicit_invocation: true

@@ -9,6 +9,9 @@ description: >
   differences, re-verifying the current protocol baseline, or generating /
   validating a client fingerprint profile.
   不用于 git 历史形态的参考 fork 审计（那走 sync-upstream）。
+metadata:
+  author: BegoniaHe <163421589+BegoniaHe@users.noreply.github.com>
+  checkout: BegoniaHe/wokbuddy-demon
 ---
 
 # 逆向调研 WorkBuddy 客户端协议

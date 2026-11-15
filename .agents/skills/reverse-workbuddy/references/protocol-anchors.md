@@ -208,7 +208,7 @@ cn-saas`、`httpDns` 相关 IP、`routes["core-api"].fallbackAddresses.addresses
   目录在 `Library/Application Support/` 下）。`authentication.id` 取
   `cli/product.json`，**两 realm 不同**：CN `workbuddy-desktop`、
   global `workbuddy-desktop-ai`（见 REFERENCE.md 的形态表）。wine prefix 里实测落在
-  `drive_c/users/<u>/AppData/Local/CodeBuddyExtension/Data/Public/auth/`。
+  `drive_c\users\<账户>\AppData\Local\CodeBuddyExtension\Data\Public\auth\`。
 - 顶层结构：`{auth, account, accounts[], allAccounts[]}`；
   `auth` = `accessToken` / `refreshToken` / `tokenType` / `expiresAt`(ms) /
   `refreshExpiresAt`(ms) / `lastRefreshTime`(ms) / `expiresIn` / `refreshExpiresIn`
