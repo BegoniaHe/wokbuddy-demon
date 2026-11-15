@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -79,19 +78,19 @@ func (s *Scheduler) probeWindow(ctx context.Context, probe pool.WindowProbe) {
 	account := s.cfg.Pool.AuthByUID(probe.UID)
 	if account == nil {
 		// 账号已删除：台账一并出清，避免陈旧条目反复触发。
-		s.cfg.Pool.WindowProbeDone(probe.UID, probe.Model, true)
+		s.cfg.Pool.WindowProbeDone(probe.UID, probe.Model, pool.WindowProbeGiveUp)
 
 		return
 	}
 
-	err := s.sendWindowProbe(ctx, account, probe.Model)
-	s.cfg.Pool.WindowProbeDone(probe.UID, probe.Model, err == nil)
+	result, err := s.sendWindowProbe(ctx, account, probe.Model)
+	s.cfg.Pool.WindowProbeDone(probe.UID, probe.Model, result)
 
 	label := logfmt.Label(account.UID, account.NicknameValue())
 	if err != nil {
 		// 错误原文可能带上游 body / URL：与请求路径同口径脱敏后再落日志。
-		s.logger.Printf("额度窗口探针失败 acct=%s model=%s（不罚号，%s 后重试）: %s",
-			label, probe.Model, windowProbeRetryBackoffLog,
+		s.logger.Printf("额度窗口探针失败 acct=%s model=%s（%s）: %s",
+			label, probe.Model, windowProbeRetryHint(result),
 			upstream.RedactForLog(err.Error(), 160))
 
 		return
@@ -101,14 +100,26 @@ func (s *Scheduler) probeWindow(ctx context.Context, probe pool.WindowProbe) {
 		label, probe.Model, probe.ResetAt.Format(time.RFC3339))
 }
 
+// windowProbeRetryHint 失败后的处置文案（限流才按退避重试）。
+func windowProbeRetryHint(result pool.WindowProbeResult) string {
+	if result == pool.WindowProbeRetry {
+		return "限流，不罚号，" + windowProbeRetryBackoffLog + " 后重试"
+	}
+
+	return "非限流错误，不罚号，出账不再重试"
+}
+
 // windowProbeRetryBackoffLog 与 pool 侧的重试间隔同口径（日志可读文案）。
 const windowProbeRetryBackoffLog = "10m"
 
-// sendWindowProbe 发一条 max_tokens=1 的最小 chat。只判 HTTP 状态：拿到 2xx 即认为
-// 请求已被上游承认为新窗口的第一条，不必读完整个流。
+// sendWindowProbe 发一条 max_tokens=1 的最小 chat，并读到首个有效帧为止。
+//
+// 只按 HTTP 状态判成功会把 200 + 首帧 error（限流文书 / 额度耗尽）当成「打通」：
+// 上游还没真正重置窗口，下一次真实请求继续撞墙。这里用 upstream.ProbeStream 预览
+// 首帧，error 帧按失败处理；限流类失败保留台账按退避重试，其余失败快速出账。
 func (s *Scheduler) sendWindowProbe(
 	ctx context.Context, account *auth.Auth, model string,
-) error {
+) (pool.WindowProbeResult, error) {
 	body, err := json.Marshal(map[string]any{
 		"model":      model,
 		"stream":     true,
@@ -116,7 +127,7 @@ func (s *Scheduler) sendWindowProbe(
 		"messages":   []any{map[string]any{"role": "user", "content": "hi"}},
 	})
 	if err != nil {
-		return fmt.Errorf("构造探针请求失败: %w", err)
+		return pool.WindowProbeGiveUp, fmt.Errorf("构造探针请求失败: %w", err)
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, windowProbeTimeout)
@@ -126,19 +137,51 @@ func (s *Scheduler) sendWindowProbe(
 		probeCtx, account, body, "", upstream.ChatMeta{},
 	)
 	if rc != nil {
-		// 读一小段再关：部分实现要等首帧才真正把请求算作已受理。
-		_, _ = io.Copy(io.Discard, io.LimitReader(rc, 4<<10))
-		rc.Close()
+		defer rc.Close()
 	}
 
 	if err != nil {
-		return fmt.Errorf("探针请求失败: %w", err)
+		return pool.WindowProbeGiveUp, fmt.Errorf("探针请求失败: %w", err)
 	}
 
 	if status >= http.StatusBadRequest {
-		return fmt.Errorf("%w: status=%d body=%s", errWindowProbeRejected, status,
-			upstream.RedactForLog(string(respBody), 160))
+		kind := upstream.Classify(status, string(respBody))
+
+		return windowProbeResultFor(kind), fmt.Errorf("%w: status=%d kind=%s body=%s",
+			errWindowProbeRejected, status, kind, upstream.RedactForLog(string(respBody), 160))
 	}
 
-	return nil
+	if rc == nil {
+		return pool.WindowProbeGiveUp, fmt.Errorf("%w: 上游未返回流", errWindowProbeRejected)
+	}
+
+	streamProbe := upstream.ProbeStream(rc)
+	defer streamProbe.Release()
+
+	return windowProbeFrameResult(streamProbe)
+}
+
+// windowProbeFrameResult 把首帧预览结果映射成台账结论：error 帧按失败处理（限流类
+// 保留重试），首个有效帧即视为窗口已钉住。
+func windowProbeFrameResult(streamProbe *upstream.StreamProbe) (pool.WindowProbeResult, error) {
+	switch {
+	case streamProbe.Kind != upstream.ErrNone:
+		return windowProbeResultFor(streamProbe.Kind), fmt.Errorf("%w: 首帧错误帧 kind=%s frame=%s",
+			errWindowProbeRejected, streamProbe.Kind, upstream.RedactForLog(streamProbe.Frame, 160))
+	case streamProbe.SizeLimited:
+		return pool.WindowProbeGiveUp, fmt.Errorf("%w: 首帧前单行超长", errWindowProbeRejected)
+	case streamProbe.Empty && !streamProbe.SawReasoning:
+		return pool.WindowProbeGiveUp, fmt.Errorf("%w: 流在首个有效帧前结束", errWindowProbeRejected)
+	default:
+		return pool.WindowProbePinned, nil
+	}
+}
+
+// windowProbeResultFor 限流类失败按退避重试；其余（5xx / 余额 / 4xx）快速出账。
+func windowProbeResultFor(kind upstream.ErrKind) pool.WindowProbeResult {
+	if kind == upstream.ErrSoftRate {
+		return pool.WindowProbeRetry
+	}
+
+	return pool.WindowProbeGiveUp
 }

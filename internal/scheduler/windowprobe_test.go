@@ -110,7 +110,8 @@ func TestWindowProbeSendsMinimalRequest(t *testing.T) {
 	}
 }
 
-// TestWindowProbeFailureDoesNotPenalize 上游 5xx：只记日志、保留台账待重试、不罚号。
+// TestWindowProbeFailureDoesNotPenalize 上游 5xx 属非限流错误：快速出账、只记日志、
+// 不罚号，不再按固定节奏反复重试（issue #532）。
 func TestWindowProbeFailureDoesNotPenalize(t *testing.T) {
 	t.Parallel()
 
@@ -129,8 +130,8 @@ func TestWindowProbeFailureDoesNotPenalize(t *testing.T) {
 		t.Fatalf("calls=%d want 1", calls.Load())
 	}
 
-	if state.WindowProbeCount() != 1 {
-		t.Errorf("失败应保留台账待重试, count=%d", state.WindowProbeCount())
+	if state.WindowProbeCount() != 0 {
+		t.Errorf("非限流失败应立即出账, count=%d", state.WindowProbeCount())
 	}
 
 	st, _ := state.Status("u1")
@@ -144,6 +145,46 @@ func TestWindowProbeFailureDoesNotPenalize(t *testing.T) {
 
 	if strings.Contains(buf.String(), "sk-secret-value") {
 		t.Errorf("日志不应回显凭证, got %q", buf.String())
+	}
+}
+
+// windowProbeErrorFrameUpstream 返回 200 + 首帧 error 的假上游（限流文书形态）。
+func windowProbeErrorFrameUpstream(t *testing.T) *upstream.Client {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: {\"error\":{\"code\":6004,\"message\":\"model rate limit, will reset in 5 minutes\"}}\n\n"))
+		w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	return &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+}
+
+// TestWindowProbeErrorFrameIsNotPinned 200 + 首帧 error（限流文书）不得当成打通：
+// 窗口还没真正重置，台账保留待重试，也不记成功日志（issue #532）。
+func TestWindowProbeErrorFrameIsNotPinned(t *testing.T) {
+	t.Parallel()
+
+	sched, state, _ := windowProbeScheduler(t, windowProbeErrorFrameUpstream(t))
+
+	var buf strings.Builder
+
+	sched.logger = log.New(&buf, "", 0)
+
+	sched.runWindowProbeOnce(context.Background())
+
+	if state.WindowProbeCount() != 1 {
+		t.Errorf("200+error 帧应保留台账待重试, count=%d", state.WindowProbeCount())
+	}
+
+	if !strings.Contains(buf.String(), "额度窗口探针失败") {
+		t.Errorf("应记一条失败日志, got %q", buf.String())
+	}
+
+	if strings.Contains(buf.String(), "探针成功") {
+		t.Errorf("错误帧不得记成功日志, got %q", buf.String())
 	}
 }
 
