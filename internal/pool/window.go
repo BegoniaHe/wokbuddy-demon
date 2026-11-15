@@ -7,9 +7,11 @@
 //
 // 口径：
 //   - 只登记带非零 ResetAt 的模型级冷却，账号级冷却不登记；
+//   - 探针是真实计费请求：出账前先过选号闸门（停用 / 暂停 / 积分保底），被闸门排除
+//     的窗口跳过且不消耗尝试次数，等账号恢复后下一轮再探（issue #532）；
 //   - 失败不罚号：探针结果只影响本台账的尝试计数，不改账号健康/冷却/连败；
-//   - 有界重试：同一窗口最多 windowProbeMaxAttempts 次，两次之间至少
-//     windowProbeRetryBackoff；成功后立即出账，不重复触发；
+//   - 分流重试：限流类失败按 windowProbeRetryBackoff 再试（最多
+//     windowProbeMaxAttempts 次）；非限流失败快速出账，不再反复撞同一堵墙；
 //   - 运行态、不持久化：进程重启时的台账丢失无关紧要，下一次 6004 会重新登记。
 package pool
 
@@ -36,6 +38,18 @@ type WindowProbe struct {
 	Realm   string
 	ResetAt time.Time
 }
+
+// WindowProbeResult 一次探测的结论（决定台账出账还是保留重试）。
+type WindowProbeResult int
+
+const (
+	// WindowProbePinned 读到首个有效帧：窗口起点已钉住，出账。
+	WindowProbePinned WindowProbeResult = iota
+	// WindowProbeRetry 限流类失败：窗口可能还没真正重置，按重试间隔再试。
+	WindowProbeRetry
+	// WindowProbeGiveUp 非限流失败（5xx / 传输错误 / 4xx）：快速出账，不再反复重试。
+	WindowProbeGiveUp
+)
 
 // windowProbeState 单个 (账号, 模型) 窗口的探针台账（运行态）。
 type windowProbeState struct {
@@ -68,8 +82,6 @@ func (p *Pool) registerWindowProbeLocked(uid, model, realm string, resetAt time.
 // DueWindowProbes 取本轮可以探测的窗口（按 ResetAt 升序，最多 limit 条），并在同一
 // 临界区内把本次尝试记入台账：调用方执行后必须调 WindowProbeDone 交回结果，中途
 // 崩溃则这条窗口只损失一次尝试机会，不会无限重试。
-//
-//nolint:cyclop // 台账筛选按「过期 → 用尽 → 未到点 → 可探测」四档线性展开。
 func (p *Pool) DueWindowProbes(limit int) []WindowProbe {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -79,18 +91,30 @@ func (p *Pool) DueWindowProbes(limit int) []WindowProbe {
 	keys := make([]string, 0, len(p.windowProbes))
 
 	for key, state := range p.windowProbes {
-		switch {
-		case now.Sub(state.resetAt) > windowProbeMaxAge:
-			delete(p.windowProbes, key) // 过期台账：重启补跑无意义
-		case state.attempts >= windowProbeMaxAttempts:
-			delete(p.windowProbes, key) // 尝试用尽
-		case now.Before(state.resetAt), now.Before(state.nextAt):
-			// 未到点或仍在重试间隔内
-		default:
-			keys = append(keys, key)
+		uid, model, _ := strings.Cut(key, "\x1f")
+
+		entry2 := p.byUID[uid]
+
+		if !keepWindowProbeLocked(entry2, state, now) {
+			delete(p.windowProbes, key) // 账号已删 / 过期台账 / 尝试用尽
+			continue
 		}
+
+		// 选号闸门已排除的账号（停用 / 暂停 / 积分保底）不进本轮：真实计费请求不发，
+		// 也不计入尝试次数，账号恢复后下一轮再探（issue #532）。
+		if !p.windowProbeReadyLocked(entry2, state, model, now) {
+			continue
+		}
+
+		keys = append(keys, key)
 	}
 
+	return p.claimDueWindowProbes(keys, limit, now)
+}
+
+// claimDueWindowProbes 排序（ResetAt 升序，同时刻按键名）、截断上限，并把本次尝试
+// 记入台账。调用方必须已持有 p.mu。
+func (p *Pool) claimDueWindowProbes(keys []string, limit int, now time.Time) []WindowProbe {
 	if len(keys) == 0 {
 		return nil
 	}
@@ -123,9 +147,34 @@ func (p *Pool) DueWindowProbes(limit int) []WindowProbe {
 	return out
 }
 
-// WindowProbeDone 交回一次探测结果：成功即出账（窗口已钉住），失败保留台账到下次
-// 重试间隔（尝试次数用尽后一并清理）。只动本台账，不碰账号健康与冷却。
-func (p *Pool) WindowProbeDone(uid, model string, ok bool) {
+// keepWindowProbeLocked 报告台账是否保留：账号已删、重置时刻过老、尝试用尽都丢弃。
+func keepWindowProbeLocked(entry2 *entry, state *windowProbeState, now time.Time) bool {
+	if entry2 == nil {
+		return false
+	}
+
+	if now.Sub(state.resetAt) > windowProbeMaxAge {
+		return false
+	}
+
+	return state.attempts < windowProbeMaxAttempts
+}
+
+// windowProbeReadyLocked 报告窗口本轮是否可探测：到点、过了重试间隔，且账号仍在
+// 选号闸门内。调用方必须已持有 p.mu。
+func (p *Pool) windowProbeReadyLocked(
+	entry2 *entry, state *windowProbeState, model string, now time.Time,
+) bool {
+	if now.Before(state.resetAt) || now.Before(state.nextAt) {
+		return false
+	}
+
+	return p.windowProbeEligibleLocked(entry2, model, state.realm, now)
+}
+
+// WindowProbeDone 交回一次探测结果：成功或非限流失败立即出账；限流类失败保留台账
+// 到下次重试间隔（尝试次数用尽后一并清理）。只动本台账，不碰账号健康与冷却。
+func (p *Pool) WindowProbeDone(uid, model string, result WindowProbeResult) {
 	key := windowProbeKey(uid, model)
 
 	p.mu.Lock()
@@ -136,9 +185,22 @@ func (p *Pool) WindowProbeDone(uid, model string, ok bool) {
 		return
 	}
 
-	if ok || state.attempts >= windowProbeMaxAttempts {
+	if result != WindowProbeRetry || state.attempts >= windowProbeMaxAttempts {
 		delete(p.windowProbes, key)
 	}
+}
+
+// windowProbeEligibleLocked 报告窗口是否仍该探测：探针是真实计费请求，必须与选号
+// 闸门同口径。停用 / 暂停 / 触及积分保底（含请求级预扣）一律跳过。
+//
+// 「免费号碰订阅专属模型」在本仓没有对应闸门（#529 明确未实现 accessMode 分流），
+// 故没有可复用项。调用方必须已持有 p.mu。
+func (p *Pool) windowProbeEligibleLocked(entry2 *entry, model, realm string, now time.Time) bool {
+	if entry2.disabled || entry2.paused {
+		return false
+	}
+
+	return !p.floorBlockedForRealmModel(entry2, model, realm, now)
 }
 
 // dropWindowProbesLocked 清掉某账号的全部待探窗口（账号被移除时）。调用方必须已持有 p.mu。
