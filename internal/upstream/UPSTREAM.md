@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `1c007bb0933d58c7b58bb01475adc534ee2a9880`（2026-11-13）。该基线与本仓库无共同祖先，
+  `7dcae8ed9e66aabc1ac11015fa7028b40e394cb4`（2026-11-15）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -195,6 +195,51 @@ Win32 版本未变，仍是 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-f
 `/portal/activity` 0 命中），参考 fork 自己也证伪了「服务端能造任务进度」的六条路径，可自动化的
 只剩对已达标任务点领取；本仓任务中心已有 mp 口径任务与领奖，不为单一限时品牌活动新增产品面。
 后续审计从 `1c007bb0` 之后开始。
+
+2026-11-15 续审 `1c007bb0..7dcae8ed`（53 条非 merge + 15 条纯 merge，共 68 项，窗口
+2026-11-11..14）。**官方 CN 基线跳版**：`5.9.3.42398134-d4692421` →
+`5.11.3.43806934-ecace0f7`（commit `ecace0f7`），global 未变 `5.9.4.42593613-fa0a0901`；
+重跑 `download_latest --dry-run` / `download_latest` / 新 CN 包解包（7z → app-64.7z →
+`extract_asar`）/ `protocol_sweep`。8 项 issue（7 单）、14 项 revisit、46 项 skip：
+
+- **#528**（面板响应头）：`35228b36` — `internal/panel/index.go:50-57` `setSecurityHeaders`
+  缺 `X-Robots-Tag`，而该函数是页面 / 静态资源 / API 的统一出口；CSP 管不到抓取。
+- **#529**（billing 付费状态）：`6a3a58c0` — 官方 5.11.3 summary 解析为
+  `isPaidUser:!!e?.IsPaidUser`，本仓全包 `IsPaidUser` 0 命中，付费/免费状态不可见。
+  `7a48d72e` 的 `modelTiers.accessMode=exclusive` 闸门记 `revisit`：`accessMode` 在两包内
+  0 命中文档口径（3 处同名都是腾讯文档预览字段），协议证据只有参考侧。
+- **#530**（auth 回写顺序）：`1414e9f7` — `internal/auth/auth.go:746-757` 在 `LoadDir`
+  循环体内对每个缺 `realm` 的文件 `SaveAtomic`，落败副本 mtime 翻新后「后载入者胜出」翻转。
+- **#531**（Clash 订阅导入）：`5d04ad21` — `cmd/server/proxysub.go:368-388`
+  `clashProxyToURL` 不读 `tls`（`http`+`tls:true` 导出成明文 `http://`，代理口令明文出网）；
+  `:271-345` `splitClashProxyItems` 不记录条目字段缩进、嵌套层 `- ` 会拆出新条目、标量不去行尾注释。
+- **#532**（额度窗口探针）：`3bab4f8c` — `internal/scheduler/windowprobe.go:78-100`
+  `probeWindow` 只判 `AuthByUID` 非空，不经过选号闸门；`:109-160` 读 4 KiB 即关流、只按
+  `status>=400` 判失败，200 + error 帧被当成打通并清掉 6004 冷却。
+- **#533**（派生粘性键）：`d700ec56` — `internal/session/session.go:828-841` `deriveKey`
+  只哈希 system + 首条 user；`internal/server/handler.go:1948/1955` 在 `sessKey` 为空
+  （user_id 客户端正是这种）时用它当 `cacheKeyID` 与 `StickyKeyFromContent` 绑定键，
+  `derive_binding` 缺省 true → 不同下游用户开场白相同即撞同一账号。
+- **#534**（设备授权链接）：`320f5d4d` / `0e863d83` — `cmd/login/main.go:373` 与
+  `internal/panel/login.go:106` 只拼 `platform`；官方 `appendHostLoginJourneyParams` 只在
+  `platform==='workbuddy'` 时追加 `loginSessionId`，`version` 两站都带（取值须来自部署 profile）。
+
+14 项 `revisit` 集中在「无包内证据」或「需实测/需产品决策」：proxypool 出口画像
+（`3d0f293e`/`2603cbff`，第三方查询 + 部署边界）、3D 端点（`557b3d55`，`tcproxy` 两包 0 命中）、
+续写记账与截断终态（`def074c5`/`ab679742`/`084176e4`）、粘帧 error 首帧否决（`0befb2b0`）、
+`$wbEncrypted` 回写字段保留（`8622073e`，本仓 Parse 不接受加密形，形态不同）、面板 reqlog
+缺 realm（`e4f7edae`）、日志落盘持锁（`ee74f54c`）、search `total_results`（`3fd3680a`）、
+补签去重（`8a39572f`）、面板登录新号判定（`69b3a1e9`）。
+
+46 项 `skip` 分五类：① 纯 merge（15 项）；② 面板技术栈（参考侧手写 app.js/QR 编码器/色板/
+热重载，本仓为 React + 内嵌产物）；③ 本仓已覆盖（`fa4d62ce` output_config.format、
+`a7983640` 补位顺序、`2d03e4bd` 滑窗桶、`9ba108fb` 首帧心跳、`767056cc`/#512 脱敏探针、
+`03a50ce0`/#511 签到四态、`1f67b377`/#478 续写）；④ 形态不存在（无域级连坐暂停、无 webagent
+会话清理、无托管 image_generation、无 proxypool、无目录热重载、无 3D、无 campaign）；⑤ 本仓
+设计不同且不应照搬（`b957e32b`/`629390de` 6020 走 429 + Retry-After 不提前提交 200、
+`afda7e9c` 本仓游标是持久化状态故置脏正确、`a98ab36c` flush 走字节/滞留双阈值）。
+CN 5.9.3→5.11.3 的端点与头族漂移已记录在 `upstream-sync.yaml` 的本轮 note，逐表面指纹
+重对齐属独立议题，不在本轮范围。后续审计从 `7dcae8ed` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
