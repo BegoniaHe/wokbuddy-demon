@@ -710,7 +710,8 @@ func validAuthFile(b []byte) bool {
 // 落盘，一次性把旧文件补上 realm 键。单个文件写失败不阻断启动（log WARN 继续），
 // 避免历史 auth 目录个别文件不可写时整个服务起不来。
 //
-//nolint:gocognit,nestif // realm 存量迁移按空值逐层收口，保持覆盖顺序可见。
+// 迁移只写同 UID 的胜出文件：SaveAtomic 会刷新文件 mtime，而加载顺序与「后载入者
+// 胜出」的口径耦合，给落败副本写盘会让胜负在下次启动时漂移（issue #530）。
 func LoadDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
@@ -742,20 +743,34 @@ func LoadDir(dir string) ([]*Auth, error) {
 		}
 
 		seenUID[auth.UID] = item
-		if auth.RealmStored() == "" {
-			if changed, r := auth.BackfillRealm(); changed {
-				if err := auth.SaveAtomic(); err != nil {
-					log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(auth.UID, auth.Nickname), err)
-				} else if r == realmGlobal {
-					log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(auth.UID, auth.Nickname), auth.Domain)
-				}
-			}
-		}
-
 		out = append(out, auth)
 	}
 
+	// 全部解析完再回写：此时 seenUID 里已是每个 UID 的最终胜出文件。
+	backfillRealmForWinners(out, seenUID)
+
 	return out, nil
+}
+
+// backfillRealmForWinners 只给同 UID 胜出文件做 realm 存量迁移并落盘；
+// 落败副本保持磁盘原样（见 LoadDir 注释）。
+func backfillRealmForWinners(auths []*Auth, winnerByUID map[string]string) {
+	for _, auth := range auths {
+		if winnerByUID[auth.UID] != auth.FilePath || auth.RealmStored() != "" {
+			continue
+		}
+
+		changed, r := auth.BackfillRealm()
+		if !changed {
+			continue
+		}
+
+		if err := auth.SaveAtomic(); err != nil {
+			log.Printf("WARN: auth %s realm backfill save: %v", logfmt.Label(auth.UID, auth.Nickname), err)
+		} else if r == realmGlobal {
+			log.Printf("auth %s 存量迁移: 补 realm=global（domain=%s）", logfmt.Label(auth.UID, auth.Nickname), auth.Domain)
+		}
+	}
 }
 
 // TokenSource 从 AccessToken 的 JWT payload 读取 token_source 声明。
