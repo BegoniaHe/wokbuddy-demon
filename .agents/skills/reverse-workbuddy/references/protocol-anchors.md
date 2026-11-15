@@ -53,10 +53,18 @@
   - chat UA 模板（`cli/dist/codebuddy-lite-wb.mjs` 的
     `UserAgentHttpInterceptor.buildUserAgent`）：
     `WorkBuddy/<platformVersion> <applicationName>/<platformVersion> CLI/<cliVersion>`。
-    `platform` 由 sidecar 注入固定为 `WorkBuddy`；`applicationName` 取
-    `cli/product.json`（CN `WorkBuddy` / global `workbuddy-ai`）；extension 为
-    `CLI/<cli>`。服务端不注入 `CLIENT_INFO_APPLICATION_NAME`。`/v2/report` 的
-    desktop UA 是另一条 surface，不共用该模板。
+    三段由 `ClientInfoProvider.initClientInfo` 拼装（CN 5.11.3 核对）：
+    `platform: t?.platform || k0.Vo`、`platformVersion: t?.productVersion || k2.version`、
+    `applicationName: t?.applicationName || ""`，其中 `t` 是 product 配置、`i` 是
+    进程环境变量，且 `...i` 最后展开——**env 覆盖 product.json**。
+    sidecar（`main/client-info-env.js` 的 `getCachedBaseEnv`）注入 `CLIENT_INFO_PLATFORM=WorkBuddy`、
+    `CLIENT_INFO_PLATFORM_VERSION=<appVersion>`、`CLIENT_INFO_USER_AGENT_EXTENSION=CLI/<cli>`
+    （`resolveWorkbuddyCliUserAgent`），所以第一段是 `WorkBuddy`，**不是** `cli/product.json`
+    里 `platform:"CLI"` 那个值（该值只是 CLI 自身配置的默认，被 env 顶掉）。
+    `applicationName` 不来自 env，取 `cli/product.json`（CN `WorkBuddy` / global
+    `workbuddy-ai`）。`/v2/report` 的 desktop UA 是另一条 surface（`main/server.js`
+    `buildVlmGatewayHeaders` 直接拼 `` [`WorkBuddy/${n}`,`WorkBuddy/${n}`,...`CLI/${r}`] ``），
+    不共用该模板。
   - `X-Device-Token` 的注入面（真机 2026-10-28 抓包）：chat
     （`chatSurfaceOverrides` 的 `surfaceChat` 分支）与签到（`checkinHeaders()`，
     daily-checkin / checkin-activity-status）；官方另有 `/v2/plugin/auth/state`
@@ -84,17 +92,19 @@
   - chat 桌面头组：`setDesktopExpertHeaders()`（`X-Domain` / `X-Product=SaaS` /
     `X-User-Id` / `X-Agent-Intent|Purpose|Type` /
     `X-Private-Data`（**固定 `true`**：官方桌面主进程 `applyGatewayHeaders` 兜底表
-    `VF` 与 `buildVlmGatewayHeaders` 都硬编码 `true`，CN / global 5.9.3 同形；
+    与 `buildVlmGatewayHeaders` 都硬编码 `true`，CN 5.11.3 / global 5.9.4 同形；
     CLI chat 的 `privateDataHeaderValue()` 是另一条 surface：个人号 `false`、
-    企业号（含 `type=ultimate|exclusive` 无 enterpriseId）`true`，CN / global 5.9.3
-    同源同形，判据只有 `isEnterpriseEditionAccount`、与域无关）/ `X-Ide-Name|Type|Version` /
+    企业号（含 `type=ultimate|exclusive` 无 enterpriseId）`true`，CN / global 同源
+    同形，判据只有 `isEnterpriseEditionAccount`、与域无关）/ `X-Ide-Name|Type|Version` /
     `X-Codebuddy-Request` / traceparent + b3 单头 + `X-B3-*` 四件套）。
-  - `X-Agent-Runtime`：5.9.3 起官方在 chat / images / search / webfetch 全发；
+  - `X-Agent-Runtime`：5.9.3 起官方在 chat / images / search / webfetch 全发
+    （CN 5.11.3 仍单字面量 `AGENT_RUNTIME="X-Agent-Runtime"`，枚举
+    `local-agent|cloud-agent|agent-agent` 未变）；
     chat 面发 `local-agent`（真机恒为该值，`other` 只是取不到会话 runtime 时的
     not-in-enum 兜底），agenttool 四路无真机证据故维持兜底值 `other`
     （见 `chatFamilyHeaders` / `chatSurfaceOverrides`）。`X-Wb-Uid` 只在
-    `surfaceWebFetch` 发，取值与 `X-User-Id` 同值（官方仅 webfetch /
-    knowledge_search 发）。
+    `surfaceWebFetch` 发，取值与 `X-User-Id` 同值（官方 `fetchContentViaApi` 里与
+    `X-User-Id` 相邻赋值，`X-Department-Info` 同组；CN 5.11.3 仍只有这一处）。
 - 客户端侧对照：
   - `<app-asar>/main/*.js`：官方 UA、`X-IDE-*`、`X-Agent-*`、`X-Wb-Uid`、
     `X-Device-Token`。
@@ -116,10 +126,10 @@
   `get-user-resource-summary`（`fetchResourceSummary`）、
   `get-user-resource-{paid,free}-packages`（`fetchPackagePage`）；
   `checkin-status`（无 `-activity`）已定性为 IDE/CLI 面：它只出现在
-  `BackendProvider.getCheckinStatus`（CN 5.9.3 `main/account.js@399217` /
-  `renderer/assets/common-Cklb-JUT.js@443241`）与渲染层 IPC，桌面 daemon 自己走
+  `BackendProvider.getCheckinStatus`（CN 5.11.3 `main/account.js` /
+  `renderer/assets/common-*.js`）与渲染层 IPC，桌面 daemon 自己走
   `${endpoint}/v2/billing/meter/checkin-activity-status`
-  （`main/authority-snapshot.js@463251`，本仓 `CheckinActivityStatus` 已覆盖）。
+  （`main/authority-snapshot.js`，本仓 `CheckinActivityStatus` 已覆盖）。
   本仓无调用方，**刻意不实现**，不再当首查项；理由见
   `internal/upstream/UPSTREAM.md` §六「checkin 面有两个端点」那条。
 
@@ -138,7 +148,7 @@
   路径（一律 404；见 issue #401 的 live 证据）**，出站侧按域记住「无此观测」后
   不再重打。
 - `/v2/images/generations`、`/v2/images/edits`：官方 CLI 出图 / 图生图，
-  CN 5.8.3 / global 5.8.4 / 两域 5.9.3 同源；**两者均已覆盖**（`internal/upstream/images.go`
+  CN 5.8.3 / global 5.8.4 / 两域 5.9.3 / cn 5.11.3 同源；**两者均已覆盖**（`internal/upstream/images.go`
   的 `GenerateImage` / `EditImage`，入站 `features.images_endpoint` 门控）。
   `edits` 是 JSON 形态（`Content-Type: application/json`，非 multipart），
   body 为 `model` / `prompt` / `size` + 可选 `image`（data URL / http URL / 裸
@@ -149,15 +159,55 @@
 - `/v2/user-asset/*`：appearance/set 已覆盖，skill/assets 族未覆盖。
 - `/v2/service-proxy`、`/v3/group/*`、`/v2/spans`：客户端内部域，非网关目标。
 
+### cn 5.11.3 相对 cn 5.9.3 的面漂移（2026-11-15 静态核对）
+
+粗扫口径（`protocol_sweep.mjs`）：端点 220 → 234（+21 / −7），头名 144 → 151
+（+8 / −1）。global 5.9.3 → 5.9.4 差异集合为空。
+
+新增端点（均无网关消费方，判 `skip`，不要为实现而实现）：
+
+- `/v2/chat/decisions`（CLI `judge()`，30s 超时，`questions` / `safety_identifier`）。
+- `/v2/geoblock`（`main/account.js`，配 `api.ipify.org` 做 IP 探测）。
+- `/v2/security-log-report/v1/logs`（`main/server.js`，OTLP 安全审计上报，
+  scope `workbuddy.security-audit`）。
+- `/v2/user-asset/skill/get-list`（`main/skills-repo.js`，同面发
+  `X-Client-Platform` / `X-WB-UA`）。
+- `/v1/{relay-key,relay-key/consume,tunnels,web-bindings,shared,self/provision,me,
+  authorize,$}`（CLI 本地隧道 / 中继密钥）。
+- `/v1/customer/buddyone/*`、`/console/as/genie-baas/user/quota/check`、
+  `/v2/as/conversations`、`/v2/service-proxy`。
+
+消失端点：`/auth/{logout,refresh,status}`（职责已并入
+`/v2/plugin/auth/{state,token/refresh,logout}`，本仓消费的正是后者，不受影响）、
+`/console/agent-gateway/ima`、`/console/as/iom/getMemberPolicy`、
+`/v2/agent-gateway/ima-mcp-oa`、`/v2/as/genie-baas`（IMA / 企业管理面）。
+
+新增头族：`X-Client-Version` / `X-Client-Platform` / `X-Client-Product` 由
+`main/client-identity.js` 的 `buildClientIdentityHeaders` 作为 outbound header
+provider 注入（product 缺省 `workbuddy-desktop`，platform 归一为
+`macos|windows|linux`），CLI bundle 只有常量声明，chat 出站不设；
+`X-WB-UA` / `X-Client-Platform` 只出现在 skills-repo（connector-market）面；
+`X-No-Tenant-Id` / `X-CodeBuddy-Session-Id` 分别是认证拦截器控制头与本地 mod
+服务入站头，均不出网；`X-Qcloud-Env-Id` 只在泳道覆盖
+（`getProductLaneOverride().resolve()`）命中时注入；`X-RateLimit-Dimension` /
+`X-RateLimit-Layer` 是应答侧。消失 `X-Proxy-Error`（无消费方）。
+
+cn 侧新增 `productFeaturesConfig.NetworkFailover`（global 无此段）：`region:
+cn-saas`、`httpDns` 相关 IP、`routes["core-api"].fallbackAddresses.addresses =
+["162.14.3.241"]`、熔断参数（`failureWindowMs` 等）。这是客户端 HTTPDNS / 容灾
+能力，网关不模拟；只在解释「cn 客户端为何会直连 fallback IP」时引用。
+
 ## 客户端登录态落盘（auth session）
 
-写「用网关凭证登录客户端」或排查登录态时的事实锚点（Win32 5.9.3 核对）：
+写「用网关凭证登录客户端」或排查登录态时的事实锚点（Win32 CN 5.11.3 / global 5.9.4 核对）：
 
-- 路径：`<sharedDataPath>/auth/<authentication.id>.info`。
-  `<sharedDataPath>` = `<basePath>/Data/Public`，win32 `basePath` =
-  `%USERPROFILE%\AppData\Local\<产品目录>`（`main/module-base.js:FilePathServiceImpl`）；
-  `authentication.id` 取 `cli/product.json`（CN/global 均 `workbuddy-desktop`，见
-  REFERENCE.md 的形态表）。wine prefix 里实测落在
+- 路径：`<sharedAuthDirectory>/<authentication.id>.info`。
+  `getWorkbuddyAuthFilePath()` = `path.join(getSharedAuthDirectory(),`${id}.info`)`，
+  `getSharedAuthDirectory()` 按平台硬编码：win32
+  `%USERPROFILE%\AppData\Local\CodeBuddyExtension\Data\Public\auth`（darwin 同名
+  目录在 `Library/Application Support/` 下）。`authentication.id` 取
+  `cli/product.json`，**两 realm 不同**：CN `workbuddy-desktop`、
+  global `workbuddy-desktop-ai`（见 REFERENCE.md 的形态表）。wine prefix 里实测落在
   `drive_c/users/<u>/AppData/Local/CodeBuddyExtension/Data/Public/auth/`。
 - 顶层结构：`{auth, account, accounts[], allAccounts[]}`；
   `auth` = `accessToken` / `refreshToken` / `tokenType` / `expiresAt`(ms) /

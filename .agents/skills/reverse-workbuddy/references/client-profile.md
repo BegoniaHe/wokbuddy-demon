@@ -23,25 +23,25 @@
   "schema": 2,
   "source": {
     "realm": "cn",
-    "packageUrl": "https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.8.3.41334564-db0e9b51.exe",
+    "packageUrl": "https://download.codebuddy.cn/workbuddy/saas/win32-x64-user/WorkBuddy-win32-x64-user-5.11.3.43806934-ecace0f7.exe",
     "sha256": "<Win32 安装包的 64 位小写 hex>",
-    "packageVersion": "5.8.3.41334564",
-    "version": "5.8.3",
-    "cliVersion": "2.161.0",
+    "packageVersion": "5.11.3.43806934",
+    "version": "5.11.3",
+    "cliVersion": "2.176.0",
     "commit": "<Win32 product.json 的 40 位小写 hex>",
-    "releaseDate": 1792029492880,
-    "observedAt": "2026-10-22T10:00:00Z",
+    "releaseDate": "<毫秒时间戳：取 update 接口返回；product.json 无该键>",
+    "observedAt": "2026-11-15T10:00:00Z",
     "generatedBy": "reverse-workbuddy@<repo-sha>"
   },
   "emit": {
-    "chatUA": "…",
-    "desktopUA": "…",
+    "chatUA": "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0",
+    "desktopUA": "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0",
     "billingUA": "…",
-    "xIdeVersion": "…",
-    "desktopIdeVersion": "…",
-    "desktopExtVersion": "…",
+    "xIdeVersion": "5.11.3",
+    "desktopIdeVersion": "5.11.3",
+    "desktopExtVersion": "5.11.3",
     "loginPlatform": "workbuddy",
-    "loginUA": "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0",
+    "loginUA": "WorkBuddy/5.11.3 WorkBuddy/5.11.3 CLI/2.176.0",
     "stainless": {
       "arch": "x64",
       "lang": "js",
@@ -93,7 +93,7 @@
 
 | key | 必需 | 用途 | 典型来源 |
 | --- | --- | --- | --- |
-| `chatUA` | 是 | chat / refresh / FetchModels | CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 最终输出；第二段品牌取 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`） |
+| `chatUA` | 是 | chat / refresh / FetchModels | CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的 `UserAgentHttpInterceptor.buildUserAgent` 最终输出；第一段平台名与 `platformVersion` 来自 sidecar 注入的环境变量（`main/client-info-env.js` 的 `getCachedBaseEnv`：`CLIENT_INFO_PLATFORM=WorkBuddy`、`CLIENT_INFO_PLATFORM_VERSION=<appVersion>`、`CLIENT_INFO_USER_AGENT_EXTENSION=CLI/<cli>`），第二段品牌取 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`） |
 | `desktopUA` | 是 | `/v2/report`、白名单类上报 | Win32 `main/*.js`、桌面端构建串 |
 | `billingUA` | 是 | **已无消费方**（schema 保留位：删除字段会让既有 `data/client-profiles/*.json` 校验失败）。历史上服务 billing 域 report / banner 的单段 UA 面；2026-10-28 抓包确认该面不存在（`/v2/report` 走三段式 `desktopUA`），billing meter 的 UA 见下行 `billingMeterUA` | Win32 包内显式覆写 |
 | `xIdeVersion` | 是 | `X-Ide-Version` | 与 `chatUA` 同源的版本 |
@@ -107,11 +107,14 @@
 
 `chatUA` 的 chat 实际由 CLI 层 `cli/dist/codebuddy-lite-wb.mjs` 的
 `UserAgentHttpInterceptor.buildUserAgent` 构造；三段依次是
-`platform / applicationName / userAgentExtension`，其中 `platform` 由 sidecar 注入
-固定为 `WorkBuddy`，`applicationName` 取 `cli/product.json`（CN `WorkBuddy` /
-global `workbuddy-ai`），`userAgentExtension` 为 `CLI/<cli>`。
-因此 `evidence.chatUA.file` 必须是 `cli/dist/codebuddy-lite-wb.mjs`；
-`main/server.js` 是 daemon/VLM 面，其中的 UA 构造不能作为 `chatUA` 证据。
+`platform / applicationName / userAgentExtension`。其中 `platform` 与
+`platformVersion` 由 sidecar 注入的环境变量决定（`CLIENT_INFO_PLATFORM=WorkBuddy`
+覆盖 `cli/product.json` 的 `platform:"CLI"`），`applicationName` 取
+`cli/product.json`（CN `WorkBuddy` / global `workbuddy-ai`），
+`userAgentExtension` 为 `CLI/<cli>`。因此 `evidence.chatUA.file` 必须是
+`cli/dist/codebuddy-lite-wb.mjs`（可同时给 `main/client-info-env.js` 作注入来源旁证）；
+**不要**把 `cli/product.json` 的 `platform` 字段当成 UA 第一段，也不要
+`main/server.js`（daemon/VLM 面）的 UA 构造当作 `chatUA` 证据。
 `desktopUA`（`/v2/report`）与 `chatUA` 是两条不同 surface，不得互相顶替。
 
 ## 来源分级（`evidence.<key>.source`）
