@@ -3,6 +3,7 @@ package panel
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
@@ -35,8 +36,13 @@ func TestPanelAuthFailLimit(t *testing.T) {
 	}
 
 	limited := do("wrong", ip)
-	if limited.Code != http.StatusTooManyRequests || limited.Header().Get("Retry-After") == "" {
-		t.Fatalf("超限 code=%d retry=%q", limited.Code, limited.Header().Get("Retry-After"))
+
+	// Retry-After 必须是 1..60 秒：面板限流窗口是 1 分钟，换算向上取整且下限 1
+	// （0 会让客户端立即重试，等于没有限流）。
+	retryAfter, err := strconv.Atoi(limited.Header().Get("Retry-After"))
+	if limited.Code != http.StatusTooManyRequests || err != nil || retryAfter < 1 || retryAfter > 60 {
+		t.Fatalf("超限 code=%d retry=%q want 429 + 1..60 秒",
+			limited.Code, limited.Header().Get("Retry-After"))
 	}
 
 	if code := do("wrong", "203.0.113.5:1000").Code; code != http.StatusUnauthorized {

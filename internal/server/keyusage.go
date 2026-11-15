@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
 )
 
 // keyUsage 一次命名密钥请求的用量累加器：withClientAuth 创建并挂到 context，
@@ -88,8 +89,7 @@ func writeKeyLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.
 // code 只进 OpenAI 错误体的 code 字段；Anthropic 信封没有 code 位，把 code 编进
 // message（客户端靠 message 区分拒绝类别，issue #448 并发/RPM 分离即靠此）。
 func writeLimitError(w http.ResponseWriter, r *http.Request, retryAfter time.Duration, code, msg string) {
-	seconds := max(int((retryAfter+time.Second-1)/time.Second), 1)
-	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	w.Header().Set("Retry-After", strconv.Itoa(httpauth.RetryAfterSeconds(retryAfter)))
 
 	if requestsGemini(r) {
 		writeGeminiError(w, http.StatusTooManyRequests, msg, "")
