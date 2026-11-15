@@ -102,16 +102,22 @@ func (c *Client) profileVersion(account *auth.Auth, pick func(*clientprofile.Pro
 	return ""
 }
 
-// chatBrandFor 返回官方 CLI chat UA 的品牌段（`cli/product.json` 的
+// applicationNameFor 返回官方客户端的产品名（`cli/product.json` 的
 // `applicationName`）：global → `workbuddy-ai`，其余 → `WorkBuddy`。
+// chat UA 的品牌段与主进程 `X-Client-Product` 共用同一来源（#551）。
 // 只放品牌字面量，不放版本号；版本仍取 profile / 显式覆盖。
-func chatBrandFor(account *auth.Auth) string {
+func applicationNameFor(account *auth.Auth) string {
 	if account != nil && account.IsGlobal() {
 		return "workbuddy-ai"
 	}
 
 	return "WorkBuddy"
 }
+
+// clientPlatformWindows 主进程 X-Client-Platform 的取值：官方
+// `toWorkbuddyClientPlatform(process.platform)` 把平台归一成
+// macos / windows / linux，本仓基线只认 Win32 分发包，故恒为 windows。
+const clientPlatformWindows = "windows"
 
 // defaultWorkBuddyUAFor 返回 profile 冻结的客户端出站 UA（官方 CLI chat 拦截器形状：
 // `WorkBuddy/<ver> <brand>/<ver> CLI/<cliVer>`，品牌段来自 `cli/product.json` 的
@@ -134,7 +140,7 @@ func (c *Client) defaultWorkBuddyUAFor(account *auth.Auth) string {
 
 	v := c.clientVersionFor(account)
 
-	return "WorkBuddy/" + v + " " + chatBrandFor(account) + "/" + v + " CLI/" + c.cliVersionFor(account)
+	return "WorkBuddy/" + v + " " + applicationNameFor(account) + "/" + v + " CLI/" + c.cliVersionFor(account)
 }
 
 // userAgent 返回当前出站 UA（客户端出站路径：chat/refresh/FetchModels）。
@@ -294,7 +300,7 @@ func (s surface) mainProcess() bool {
 // global 5.9.4 没有该提供者，保持各面原有的显式形态。调用点只该是主进程面
 // （surface.mainProcess、桌面 report / chat、CN 模型目录）。
 //
-// 当前覆盖：X-Device-Token（#552）。X-Client-* 见 #551。
+// 覆盖两族：X-Device-Token（#552）与 X-Client-Version/Platform/Product（#551）。
 func (c *Client) injectMainProcessProviderHeaders(req *http.Request, account *auth.Auth) {
 	if account != nil && account.IsGlobal() {
 		return
@@ -305,6 +311,19 @@ func (c *Client) injectMainProcessProviderHeaders(req *http.Request, account *au
 	if token := c.deviceToken(account); token != "" {
 		req.Header.Set("X-Device-Token", token)
 	}
+
+	// 客户端身份三头（#551，main/client-identity.js 的 buildClientIdentityHeaders）：
+	// 版本 = electron.app.getVersion()（桌面构建版本，取 profile 冻结值）；
+	// 平台 = Win32 归一值；产品 = cli/product.json 的 applicationName。
+	// 版本取不到就整条不发：空值头是比缺失更明显的非官方指纹。
+	if version := c.profileVersion(
+		account, func(p *clientprofile.Profile) string { return p.Emit.DesktopIdeVersion },
+	); version != "" {
+		req.Header.Set("X-Client-Version", version)
+	}
+
+	req.Header.Set("X-Client-Platform", clientPlatformWindows)
+	req.Header.Set("X-Client-Product", applicationNameFor(account))
 }
 
 // checkinHeaders 签到面显式注入的请求头：X-Device-Token（取值为空时不注入）。
