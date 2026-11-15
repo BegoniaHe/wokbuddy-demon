@@ -61,3 +61,30 @@ last_audited:
     （accessMode 在两包内 0 命中）、3D 端点（tcproxy 0 命中）、续写记账与截断终态、
     粘帧 error 首帧否决、$wbEncrypted 回写字段保留、面板 reqlog 缺 realm 等。
     本轮不改实现；游标推进是独立的 chore(sync) 元数据提交。
+
+# 2026-11-15 复审：窗口内 14 项 revisit 逐项静态核完（不推进游标，不改实现）
+review_2026_11_15:
+  scope: 14 项 revisit 全集（7a48d72e / 557b3d55 / 0befb2b0 / 3d0f293e / 2603cbff / e4f7edae / ee74f54c / def074c5 / ab679742 / 084176e4 / 3fd3680a / 8a39572f / 69b3a1e9 / 8622073e）
+  official_baseline:
+    cn: 5.11.3.43806934-ecace0f7 (commit ecace0f7028166695994300182295329b8b95449)
+    global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
+  results:
+    issue: 4
+    skip: 6
+    revisit: 4
+  issues:
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/538
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/539
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/540
+  note: >-
+    复审结论：4 项转 issue。#538 粘帧判定层——probe.go:168-210、continue.go:245-256、
+    sse.go:193-216 三处只按单对象解析，splitConcatenatedJSON 仅在写出层（sse.go:1633）；
+    #539 流式续写段 usage 覆盖——logging.go:681-707 对 completion/total/credit 是覆盖语义，
+    非流式 mergeUsageTotals（handler.go:4045-4073）已按段合并；#540 SaveAtomic 重建文档丢
+    未建模键（auth.go:625-651），先记录产品问题。6 项转 skip：截断终态（sse.go:2003-2040
+    不写 finish_reason=length）、search total_results（无丢弃路径）、补签去重（worker 已签
+    跳过，手动不入队）、面板新号任务（能力不存在）、日志锁内写盘（ring.go:74-95 不落盘）、
+    reqlog 缺 realm（面板域维度走模型 id 前缀 models.ts:109，不读 reqlog）。4 项保持 revisit：
+    modelTiers accessMode（包内 0 命中口径，已在 #529 评论）、3D tcproxy（0 命中）、出口画像
+    两项（第三方明文查询属部署隐私决策，等维护者拍板）。
+
