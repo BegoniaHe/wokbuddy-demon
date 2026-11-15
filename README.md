@@ -75,6 +75,41 @@
 
 最后一个是 `Expert_Philanthropy`：它需要真实捐款，领奖时会校验捐赠回执。这种决定应该由你本人来做，所以小恶魔只负责提醒，不负责替你慷慨。
 
+## 🔌 端点一览
+
+网关对外只有两类面：**协议面**（客户端用，认 `api_key` 或命名密钥）与**运维面**（探活 / 监控 / 排障用，认 `api_key` 或 `admin_api_key`）。下表是完整清单；未列出的路径一律 404，错误体按客户端形态回 OpenAI / Anthropic / Gemini 三种信封。
+
+**协议面**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/v1/chat/completions` | OpenAI 兼容对话，流式 / 非流式 |
+| POST | `/v1/responses` | OpenAI Responses 兼容；`GET` 同路径回 `426`，那是 Codex 的 WebSocket 探测，让它立刻回落 POST |
+| GET | `/v1/models` | 模型列表，按 realm 绑定与命名密钥白名单裁剪 |
+| GET | `/v1/models/{model}` | 单个模型详情；按客户端形态返回 OpenAI 或 Anthropic 字段 |
+| POST | `/v1/messages` | Anthropic Messages 兼容；同义别名 `POST /messages` |
+| POST | `/v1/messages/count_tokens` | 输入 token 估算：本地按字节近似（4 字节 ≈ 1 token），**不作计费依据**；别名 `POST /messages/count_tokens` |
+| POST | `/v1/search/messages` | 联网搜索（`features.search_endpoint`，默认关）；`deep:true` 综述式另受 `features.search_deep` 约束 |
+| POST | `/v1beta/models/{model}:{action}` | Gemini CLI GATEWAY 模式，`action` 取 `generateContent` / `streamGenerateContent` / `countTokens`；`v1alpha`、`v1` 同义 |
+| POST | `/v2/chat/busy` | 官方客户端模型忙预检，只读本地池状态、不产生上游请求，单批最多 50 个模型 |
+| POST | `/v1/tools/fetch` | 官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；别名 `POST /v1/fetch` |
+| POST | `/v1/images/generations` | 出图（`features.images_endpoint`，默认关） |
+| POST | `/v1/images/edits` | 图生图（与出图共用同一开关） |
+| POST | `/v1/videos/generations` | 视频任务提交（`features.videos_endpoint`，默认关） |
+| GET | `/v1/videos/{task_id}` | 视频任务查询；跨域任务必须带 `?model=` 决定选号域 |
+
+**运维面**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/status` | 账号池状态与计数 |
+| GET | `/healthz` | 探活，**无鉴权**：可服务回 200；停机中或无可服务账号回 503。响应含 `realm_servable`，按域报告 CN / global 可达性 |
+| GET | `/metrics` | Prometheus 指标 |
+| GET | `/debug/pprof/*` | 运行时 profiling；GET / HEAD 只读即可，其余动作要求 admin |
+| GET | `/panel/` | 内嵌管理面板。页面与静态资源公开，数据接口 `/panel/api/*` 才鉴权 |
+
+鉴权口径：协议面接受默认 `api_key` 或任一命名密钥；运维面只认默认 `api_key`，设了 `admin_api_key` / `readonly_api_key` 后改为只认这两把（细节见「使用须知」）。`api_key` 为空时全部放行——公网部署必设。
+
 ## 🧭 小恶魔守则
 
 1. **数据不出门**：凭证与状态留在本机，不往云端兜一圈。
