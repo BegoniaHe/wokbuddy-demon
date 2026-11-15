@@ -131,7 +131,6 @@ func TestConvertLegacyInvalid(t *testing.T) {
 		{name: "非 JSON", raw: `not json`},
 		{name: "缺 uid", raw: `{"access_token":"at","refresh_token":"rt"}`},
 		{name: "缺 access_token", raw: `{"uid":"u1","refresh_token":"rt"}`},
-		{name: "缺 refresh_token", raw: `{"uid":"u1","access_token":"at"}`},
 		{name: "realm 非法", raw: `{"uid":"u1","access_token":"at","refresh_token":"rt","realm":"mars"}`},
 	}
 	for _, tc := range tests {
@@ -142,6 +141,22 @@ func TestConvertLegacyInvalid(t *testing.T) {
 				t.Fatal("want error, got nil")
 			}
 		})
+	}
+}
+
+// TestConvertLegacyAllowsMissingRefreshToken refresh_token 不是必填：加载器
+// （auth.Parse）接受只有 accessToken 的文件，cmd/signin 也为这类账号跳过刷新。
+// 把它判成 INVALID 会让整轮迁移以退出码 1 结束，且这批文件本可正常载入。
+func TestConvertLegacyAllowsMissingRefreshToken(t *testing.T) {
+	t.Parallel()
+
+	account, err := convertLegacy([]byte(`{"uid":"u1","access_token":"at"}`))
+	if err != nil {
+		t.Fatalf("convertLegacy: %v", err)
+	}
+
+	if account.AccessToken != "at" || account.RefreshToken != "" {
+		t.Errorf("tokens = %q/%q", account.AccessToken, account.RefreshToken)
 	}
 }
 

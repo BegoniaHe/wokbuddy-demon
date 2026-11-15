@@ -21,6 +21,12 @@ const (
 	routeFailureWindow = time.Minute
 	// routeCooldown 路由冷却时长；到期后自动恢复，不指数堆加。
 	routeCooldownDuration = 5 * time.Minute
+	// routeLedgerMax 路由台账条目上限。
+	//
+	// 键含 model，而 model 直接来自客户端请求体：任意模型名都曾能建一条永久条目
+	// （过期条目只在「同一条路由再次失败/成功」时清理），伪造模型名刷请求即可无界
+	// 增长。超限时在写锁内整体清扫已过期的冷却条目。
+	routeLedgerMax = 512
 )
 
 // routeState 单个 (realm, model) 的失败窗口与冷却截止。
@@ -47,6 +53,11 @@ func (p *Pool) NoteRouteFailure(realm, model string) {
 
 	routeState2 := p.routeCooldowns[key]
 	if routeState2 == nil {
+		// 只在真正新增条目时压缩台账：无条件先压缩会在台账满时把一条仍在冷却
+		// 的真实路由淘汰掉（即使本次 key 已存在、并不会新增条目），客户端用
+		// 伪造模型名就能把真实路由的短路保护冲掉。
+		p.boundRouteLedgerLocked(now)
+
 		routeState2 = &routeState{}
 		p.routeCooldowns[key] = routeState2
 	}
@@ -76,6 +87,59 @@ func (p *Pool) NoteRouteFailure(realm, model string) {
 	routeState2.until = now.Add(routeCooldownDuration)
 	log.Printf("WARN: [pool] route cooldown realm=%q model=%q for %s after %d failures",
 		realm, model, routeCooldownDuration, routeFailureThreshold)
+}
+
+// boundRouteLedgerLocked 把路由台账压到 routeLedgerMax 以内（调用方已持写锁）。
+func (p *Pool) boundRouteLedgerLocked(now time.Time) {
+	if len(p.routeCooldowns) < routeLedgerMax {
+		return
+	}
+
+	p.pruneRouteCooldownsLocked(now)
+	// 全部条目都在冷却中时上面的清扫删不掉任何东西（每个伪造模型名只要失败三次就
+	// 能进冷却），台账仍会随新模型名继续增长。再淘汰「最早解锁」的一条——它保护力
+	// 最弱，丢掉后重新计数即可——把规模硬顶在 routeLedgerMax。
+	for len(p.routeCooldowns) >= routeLedgerMax {
+		p.evictEarliestRouteLocked()
+	}
+}
+
+// evictEarliestRouteLocked 淘汰「最早解锁」的一条路由冷却（调用方已持写锁）。
+// 只在台账顶到 routeLedgerMax 且全部条目都在冷却中时使用（见 NoteRouteFailure）。
+func (p *Pool) evictEarliestRouteLocked() {
+	evictKey := ""
+	evictUntil := time.Time{}
+
+	first := true
+
+	for key, st := range p.routeCooldowns {
+		until := time.Time{}
+		if st != nil {
+			until = st.until
+		}
+
+		if first || until.Before(evictUntil) {
+			evictKey, evictUntil, first = key, until, false
+		}
+	}
+
+	delete(p.routeCooldowns, evictKey)
+}
+
+// pruneRouteCooldownsLocked 清扫不在冷却中的路由条目（调用方已持写锁）。
+//
+// 冷却中的条目全部保留——它们仍在短路请求，删掉就等于放行。其余条目承载的只有
+// 「窗口内的失败次数」，清掉等价于把这条路由的失败计数从头开始，比无界增长好。
+// 因此台账规模的上界是「同时处于冷却中的路由数」，与真实故障规模同量级，而不是
+// 与客户端能编出的模型名数量同量级。
+func (p *Pool) pruneRouteCooldownsLocked(now time.Time) {
+	for key, st := range p.routeCooldowns {
+		if st != nil && now.Before(st.until) {
+			continue
+		}
+
+		delete(p.routeCooldowns, key)
+	}
 }
 
 // NoteRouteSuccess 清空该路由的失败窗口与冷却：实测成功即恢复。

@@ -6,10 +6,11 @@
 package upstream
 
 import (
-	"encoding/json"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // --- 夹具构造 ---------------------------------------------------------------
@@ -67,7 +68,7 @@ func argsOf(t *testing.T, raw string) map[string]any {
 	t.Helper()
 
 	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+	if err := jsonx.Unmarshal([]byte(raw), &m); err != nil {
 		t.Fatalf("arguments 不是合法 JSON 对象: %q (%v)", raw, err)
 	}
 

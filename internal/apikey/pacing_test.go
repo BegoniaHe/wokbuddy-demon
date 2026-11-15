@@ -233,3 +233,63 @@ func TestNoteEmittedCanReconcileEstimate(t *testing.T) {
 		t.Fatalf("过度退回后等待=%v want 0", wait)
 	}
 }
+
+// TestPaceTokensNoOverflow 超大 token 数的等待必须夹到 PaceMaxDelay，而不是溢出成
+// 零等待（或负时间线）。
+//
+// 为什么：time.Duration 是 int64 纳秒，tokens × per 会溢出成负值，随后「TAT 在
+// 过去 → 归到 now」的分支把本该最长 60s 的债务抹平——实测 tpm=1、tokens=1<<62
+// 时 PaceWait 返回 0，整条 token 时间线被白送。tokens 来自上游
+// usage.completion_tokens 或本地正文估算，一次异常响应就能关掉按密钥的 TPM 限速。
+func TestPaceTokensNoOverflow(t *testing.T) {
+	t.Parallel()
+
+	store, id := newLimited(t, Limits{TPM: 1}) // 每个 token 占满 60s
+
+	base := time.Now()
+
+	store.NoteEmitted(id, base, 1<<62)
+
+	if wait := store.PaceWait(id, base); wait != PaceMaxDelay {
+		t.Fatalf("1<<62 token 的等待=%v want %v（溢出会把债务抹成零等待）", wait, PaceMaxDelay)
+	}
+
+	// PaceTokens 同一路径：clamp 后仍须给出上限等待。
+	store.DropPacing(id)
+
+	if wait := store.PaceTokens(id, base, 1<<62); wait != PaceMaxDelay {
+		t.Fatalf("PaceTokens(1<<62)=%v want %v", wait, PaceMaxDelay)
+	}
+}
+
+// TestPaceSpanClampsBothDirections paceSpan 是有符号夹逼：正负两个方向的溢出都
+// 必须落在 ±PaceMaxDelay 上，正常量级不受影响。
+func TestPaceSpanClampsBothDirections(t *testing.T) {
+	t.Parallel()
+
+	per := time.Millisecond
+
+	cases := []struct {
+		name   string
+		tokens int64
+		per    time.Duration
+		want   time.Duration
+	}{
+		{name: "零间隔不除零", tokens: 100, per: 0, want: 0},
+		{name: "零token", tokens: 0, per: per, want: 0},
+		{name: "正常量级", tokens: 3, per: per, want: 3 * time.Millisecond},
+		{name: "正向溢出夹上限", tokens: 1 << 62, per: per, want: PaceMaxDelay},
+		{name: "负向溢出夹下限", tokens: -(1 << 62), per: per, want: -PaceMaxDelay},
+		{name: "负向正常", tokens: -2, per: per, want: -2 * time.Millisecond},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := paceSpan(testCase.tokens, testCase.per); got != testCase.want {
+				t.Fatalf("paceSpan(%d, %v)=%v want %v", testCase.tokens, testCase.per, got, testCase.want)
+			}
+		})
+	}
+}

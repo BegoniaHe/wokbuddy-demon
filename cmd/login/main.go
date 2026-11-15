@@ -3,7 +3,9 @@
 // 两个子命令，由 login.sh 顺序驱动：
 //
 //	login [--realm=cn|global] url   → POST /v2/plugin/auth/state?platform=<workbuddy|workbuddy-ai>
-//	                                  拿 state+authUrl，state 落 /tmp/wb2api-login-state.json，
+//	                                  同时带部署 profile 的 version；CN 站另外现场生成 loginSessionId
+//	                                  （官方 appendHostLoginJourneyParams 只在 platform=workbuddy 时追加）
+//	                                  → 拿 state+authUrl，state 落 /tmp/wb2api-login-state.json，
 //	                                  stdout 打印授权 URL
 //	login [--realm=cn|global] poll  → 读 state，GET /v2/plugin/auth/token?state= 一次，
 //	                                  成功再 GET /v2/plugin/login/account?state= 拿 uid/nickname，
@@ -23,7 +25,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -37,8 +39,29 @@ import (
 
 	auth2 "github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
+
+// loginStateURL 拼 auth/state 地址：platform 恒有；version 来自部署 profile（空则不补）；
+// loginSessionId 只在 CN 站（platform=workbuddy）追加——与官方
+// appendHostLoginJourneyParams 的 platform!=='workbuddy' → return 同口径。
+func loginStateURL(base string, identity loginIdentity) string {
+	query := url.Values{}
+	query.Set("platform", identity.platform)
+
+	if identity.version != "" {
+		query.Set("version", identity.version)
+	}
+
+	if identity.platform == "workbuddy" && identity.sessionID != "" {
+		query.Set("loginSessionId", identity.sessionID)
+	}
+
+	return base + "/v2/plugin/auth/state?" + query.Encode()
+}
 
 // 上游常量：CN → www.workbuddy.cn（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
 // （base 与 Origin/Referer 同域）。端点 URL 由 realmConfig 按 realm 动态拼出，不再硬编码。
@@ -101,16 +124,25 @@ func authPlatform(realm string) string {
 	return "workbuddy"
 }
 
-// loginIdentity 设备授权链路的客户端身份：UA 与 auth/state 的 platform 参数。
+// loginIdentity 设备授权链路的客户端身份：UA、auth/state 的 platform、授权页读取的
+// 客户端版本与会话标识。
 type loginIdentity struct {
 	userAgent string
 	platform  string
+	// version 授权页读取的客户端版本，来自部署 profile（仓库不内置版本常量）；空则不补。
+	version string
+	// sessionID 授权页的 loginSessionId：官方只对 CN 站（platform=workbuddy）现场生成。
+	sessionID string
 }
 
-// loginIdentityFor 取部署 profile 的 loginUA / loginPlatform。profile 或 loginUA
-// 缺失时 userAgent 为空，由调用方拒绝登录（仓库不内置任何登录 UA）。
+// loginIdentityFor 取部署 profile 的 loginUA / loginPlatform / version。profile 或
+// loginUA 缺失时 userAgent 为空，由调用方拒绝登录（仓库不内置任何登录 UA）。
 func loginIdentityFor(profiles *clientprofile.Set, realm string) loginIdentity {
 	identity := loginIdentity{platform: authPlatform(realm)}
+	if identity.platform == "workbuddy" {
+		identity.sessionID = session.NewUUIDv4()
+	}
+
 	if profiles == nil {
 		return identity
 	}
@@ -127,6 +159,9 @@ func loginIdentityFor(profiles *clientprofile.Set, realm string) loginIdentity {
 	if profile.Emit.LoginPlatform != "" {
 		identity.platform = profile.Emit.LoginPlatform
 	}
+
+	// 授权页把 version 编进 console/auth/risk-context 与 signin-callback 的 redirect_uri。
+	identity.version = profile.Source.Version
 
 	return identity
 }
@@ -175,15 +210,15 @@ func noAuthHeaders(base func(*http.Request)) func(*http.Request) {
 
 // apiEnvelope 与 main.go:429-433 一致。
 type apiEnvelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
+	Code int            `json:"code"`
+	Msg  string         `json:"msg"`
+	Data jsontext.Value `json:"data"`
 }
 
 // doJSON 与 oauth.go:33-66 一致：{code,msg,data} 信封，code!=0 → error。
 func doJSON(
 	client *http.Client, method, fullURL string, headers func(*http.Request), body io.Reader,
-) (json.RawMessage, int, error) {
+) (jsontext.Value, int, error) {
 	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
@@ -202,12 +237,17 @@ func doJSON(
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(resp.Body)
+	// 读错误必须上报：连接中断时半截 body 会让 Unmarshal 失败，最终报成
+	// 「parse failed」把网络问题误报成格式问题。与 internal/upstream 同口径加上限。
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("doJSON: read body: %w", readErr)
+	}
 
 	// 先解信封：业务错误可能随任意 HTTP 状态返回（含 4xx），code 比状态码更权威。
 	var env apiEnvelope
 
-	parseErr := json.Unmarshal(raw, &env)
+	parseErr := jsonx.Unmarshal(raw, &env)
 	if parseErr == nil && env.Code != 0 {
 		return nil, resp.StatusCode, &logincode.Error{Code: env.Code, Msg: env.Msg, Status: resp.StatusCode}
 	}
@@ -236,8 +276,8 @@ func fatalf(format string, args ...any) {
 
 type loginState struct {
 	State string `json:"state"`
-	Realm string `json:"realm,omitempty"` // url 落盘时写回的 realm，poll 读回校验防混域
-	Base  string `json:"base,omitempty"`  // url 命中 origin，poll 优先同源
+	Realm string `json:"realm,omitempty,omitzero"` // url 落盘时写回的 realm，poll 读回校验防混域
+	Base  string `json:"base,omitempty,omitzero"`  // url 命中 origin，poll 优先同源
 }
 
 // tokenBundle 是 auth/token 成功返回的凭证包。
@@ -370,7 +410,7 @@ func runURL(base, origin, realm, statePath string, identity loginIdentity, clien
 	)
 
 	for _, candidate := range realmBases(realm, base) {
-		stateURL := candidate + "/v2/plugin/auth/state?platform=" + url.QueryEscape(identity.platform)
+		stateURL := loginStateURL(candidate, identity)
 
 		var (
 			status int
@@ -400,16 +440,19 @@ func runURL(base, origin, realm, statePath string, identity loginIdentity, clien
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
-	if err := json.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
+	if err := jsonx.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
 		fatalf("auth state: missing state or authUrl")
 	}
 
-	raw, merr := json.Marshal(loginState{State: item.State, Realm: realm, Base: usedBase})
+	raw, merr := jsonx.Marshal(loginState{State: item.State, Realm: realm, Base: usedBase})
 	if merr != nil {
 		fatalf("marshal state: %v", merr)
 	}
 
-	if err := os.WriteFile(statePath, raw, 0o600); err != nil {
+	// 走 safefile（唯一临时名 + rename）：os.WriteFile 会跟随并截断预先放置的
+	// 符号链接，共享临时目录在多用户主机上可被用来覆盖他人文件；rename 替换的
+	// 是链接本身，不会落到目标路径。
+	if err := safefile.Write(statePath, raw, 0o600); err != nil {
 		fatalf("write state: %v", err)
 	}
 
@@ -437,7 +480,7 @@ func runPoll(
 		failOnPollAccountError(err)
 	}
 
-	oraw, oerr := json.Marshal(buildLoginOutput(tok, realm, acct))
+	oraw, oerr := jsonx.Marshal(buildLoginOutput(tok, realm, acct))
 	if oerr != nil {
 		fatalf("marshal output: %v", oerr)
 	}
@@ -447,11 +490,15 @@ func runPoll(
 }
 
 // failOnPollAccountError 处理 login/account 失败：12151 提示 pending 后退出，
-// 许可终态立即 fatal；其他错误保持忽略（与旧行为一致）。
+// 许可终态立即 fatal；信封内的其他业务码保持忽略（与旧行为一致）。
+//
+// 非信封错误（传输中断、JSON 解析失败）同样 fatal：此前这条路径静默通过，于是
+// stdout 打出 uid 为空的 token、state 文件被删、退出码 0——用户既拿不到账号信息，
+// 也无法用原 state 重试 poll，只能重跑整个 login url。
 func failOnPollAccountError(err error) {
 	codeErr, ok := errors.AsType[*logincode.Error](err)
 	if !ok {
-		return
+		fatalf("拉取登录账号信息失败: %v", err)
 	}
 
 	if logincode.IsPending(codeErr.Code) {
@@ -528,7 +575,7 @@ func loadLoginState(statePath, realm string) loginState {
 	}
 
 	var loginState2 loginState
-	if err := json.Unmarshal(raw, &loginState2); err != nil {
+	if err := jsonx.Unmarshal(raw, &loginState2); err != nil {
 		fatalf("parse state: %v", err)
 	}
 
@@ -544,14 +591,14 @@ func pollTokenOnce(
 	base, state string, headers func(*http.Request), client *http.Client,
 ) (tokenBundle, int, error) {
 	tokRaw, status, errTok := doJSON(
-		client, http.MethodGet, base+"/v2/plugin/auth/token?state="+state, headers, nil,
+		client, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(state), headers, nil,
 	)
 	if errTok != nil {
 		return tokenBundle{}, status, wrapTokenPollError(status, errTok)
 	}
 
 	var tok tokenBundle
-	if err := json.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
+	if err := jsonx.Unmarshal(tokRaw, &tok); err != nil || tok.AccessToken == "" {
 		return tokenBundle{}, status, errLoginPending
 	}
 
@@ -612,7 +659,7 @@ func pollAccount(
 	acctRaw, _, errAcct := doJSON(
 		client,
 		http.MethodGet,
-		base+"/v2/plugin/login/account?state="+state,
+		base+"/v2/plugin/login/account?state="+url.QueryEscape(state),
 		acctHeaders,
 		nil,
 	)
@@ -620,7 +667,7 @@ func pollAccount(
 		return accountInfo{}, errAcct
 	}
 
-	if err := json.Unmarshal(acctRaw, &acct); err != nil {
+	if err := jsonx.Unmarshal(acctRaw, &acct); err != nil {
 		return accountInfo{}, fmt.Errorf("parse account: %w", err)
 	}
 

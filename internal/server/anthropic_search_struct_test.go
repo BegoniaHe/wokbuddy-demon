@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -212,7 +212,7 @@ func TestAnthropicWebSearchFailureDegrades(t *testing.T) {
 			Content any    `json:"content"`
 		} `json:"content"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
 		t.Fatal(err)
 	}
 

@@ -10,11 +10,12 @@ package upstream
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"strings"
 	"sync"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // StreamProbe 预览结果。
@@ -180,7 +181,7 @@ func (p *StreamProbe) inspectLine(line string) {
 	}
 
 	var frame map[string]any
-	if json.Unmarshal([]byte(payload), &frame) != nil {
+	if jsonx.Unmarshal([]byte(payload), &frame) != nil {
 		return
 	}
 

@@ -1,12 +1,13 @@
 package panel
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // modelsJSON 构造 fake 上游 JSON 响应。
@@ -35,7 +36,7 @@ func getModels(t *testing.T, p *Panel) (*httptest.ResponseRecorder, modelsResp) 
 
 	var resp modelsResp
 	if rec.Code == http.StatusOK {
-		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("decode models resp: %v", err)
 		}
 	}

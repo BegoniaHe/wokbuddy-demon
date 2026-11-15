@@ -1,7 +1,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -9,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
@@ -130,7 +130,7 @@ func usageGET(t *testing.T, panel *Panel, query string) map[string]any {
 	}
 
 	var out map[string]any
-	if err := json.Unmarshal(responseRecorder.Body.Bytes(), &out); err != nil {
+	if err := jsonx.Unmarshal(responseRecorder.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
 
@@ -192,7 +192,7 @@ func TestRequestLogsEmptyRangeReturnsArray(t *testing.T) {
 	var out struct {
 		Entries []reqlog.Event `json:"entries"`
 	}
-	if err := json.Unmarshal(responseRecorder.Body.Bytes(), &out); err != nil {
+	if err := jsonx.Unmarshal(responseRecorder.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
 	}
 

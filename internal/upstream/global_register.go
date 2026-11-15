@@ -18,7 +18,7 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // globalWebUA 国际版 web 端 UA（注册完善页走 web 指纹，非桌面端 CLI 指纹）。
@@ -39,6 +40,7 @@ var (
 	errSubmitRegionOnlyGlobalAccounts   = errors.New("submit region: only global accounts")
 	errGlobalSubmitRegionFailed         = errors.New("GlobalSubmitRegion failed")
 	errGlobalCompleteRegistrationFailed = errors.New("GlobalCompleteRegistration failed")
+	errGlobalRegisterStatus             = errors.New("global register: non-2xx HTTP status")
 	errNoCountriesAvailable             = errors.New("no countries available")
 )
 
@@ -63,7 +65,7 @@ func (*Client) globalRegisterReq(base, method, url, token string, body any) (*ht
 	var rdr io.Reader
 
 	if body != nil {
-		raw, err := json.Marshal(body)
+		raw, err := jsonx.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("globalRegisterReq: %w", err)
 		}
@@ -96,21 +98,33 @@ func (*Client) globalRegisterReq(base, method, url, token string, body any) (*ht
 // → 全局池 → 直连）。走 c.HTTP 会让绑了槽的 global 账号在这里暴露宿主机 IP。
 func (c *Client) globalRegisterJSON(
 	account *auth.Auth, req *http.Request,
-) (code int, msg string, raw json.RawMessage, err error) {
+) (code int, msg string, raw jsontext.Value, err error) {
 	resp, err := c.HTTPForAccount(account).Do(req)
 	if err != nil {
 		return 0, "", nil, fmt.Errorf("globalRegisterJSON: %w", err)
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		// 读错误必须上报：连接中断留下半截 body，否则会被报成
+		// "global register parse: unexpected end of JSON input"，真实 I/O 原因消失。
+		return 0, "", nil, fmt.Errorf("global register read: %w", readErr)
+	}
+
+	// HTTP 状态码必须先判：网关/WAF 的 403、token 失效的 401 通常回 HTML 或 {}，
+	// 解出来的 Code 是 0，会被上游代码当成「注册成功/已激活」写进账号状态。
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return 0, "", nil, fmt.Errorf("global register status %d: %s: %w",
+			resp.StatusCode, truncate(string(data), 200), errGlobalRegisterStatus)
+	}
 
 	var env struct {
-		Code int             `json:"code"`
-		Msg  string          `json:"msg"`
-		Data json.RawMessage `json:"data"`
+		Code int            `json:"code"`
+		Msg  string         `json:"msg"`
+		Data jsontext.Value `json:"data"`
 	}
-	if err := json.Unmarshal(data, &env); err != nil {
+	if err := jsonx.Unmarshal(data, &env); err != nil {
 		return 0, "", nil, fmt.Errorf("global register parse: %w", err)
 	}
 
@@ -152,7 +166,7 @@ func (c *Client) GlobalFetchCountries(account2 *auth.Auth, intlOnly bool) ([]Glo
 			List []GlobalCountry `json:"list"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(raw, &inner); err != nil {
+	if err := jsonx.Unmarshal(raw, &inner); err != nil {
 		return nil, fmt.Errorf("country list parse: %w", err)
 	}
 
@@ -165,14 +179,14 @@ func (c *Client) GlobalFetchCountries(account2 *auth.Auth, intlOnly bool) ([]Glo
 }
 
 // unwrapCountryData 解 data 的双层信封：data 是 JSON 字符串时二次解析，否则原样返回。
-func unwrapCountryData(raw json.RawMessage) (json.RawMessage, error) {
+func unwrapCountryData(raw jsontext.Value) (jsontext.Value, error) {
 	if s := strings.TrimSpace(string(raw)); strings.HasPrefix(s, "\"") {
 		var s2 string
-		if err := json.Unmarshal(raw, &s2); err != nil {
+		if err := jsonx.Unmarshal(raw, &s2); err != nil {
 			return nil, fmt.Errorf("country list unwrap: %w", err)
 		}
 
-		return json.RawMessage(s2), nil
+		return jsontext.Value(s2), nil
 	}
 
 	return raw, nil
@@ -240,6 +254,11 @@ func (c *Client) GlobalRegisterStatus(account *auth.Auth) (activated, needsRegio
 func (c *Client) GlobalSubmitRegion(account3 *auth.Auth, country *GlobalCountry) error {
 	if account3 == nil || account3.Realm() != "global" {
 		return errSubmitRegionOnlyGlobalAccounts
+	}
+
+	if country == nil {
+		// 导出 API：调用方传 nil 会在下面取 Code 时 panic。
+		return errNoCountriesAvailable
 	}
 
 	attrs := map[string]any{

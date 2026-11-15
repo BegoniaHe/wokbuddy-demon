@@ -6,17 +6,19 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -134,7 +136,7 @@ func (h *Handler) anthropicCountTokensHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	var iface any
-	if err := json.Unmarshal(body, &iface); err != nil {
+	if err := jsonx.Unmarshal(body, &iface); err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, errorTypeInvalidReq, "invalid JSON body", "")
 		return
 	}
@@ -336,26 +338,26 @@ func (h *Handler) newAnthropicChatInput(
 
 // anthropicRequest 只声明转换需要的字段；未知字段由客户端协议自行演进，忽略。
 type anthropicRequest struct {
-	Model         string            `json:"model"`
-	MaxTokens     *int              `json:"max_tokens"`
-	System        json.RawMessage   `json:"system"`
-	Messages      []json.RawMessage `json:"messages"`
-	CacheControl  json.RawMessage   `json:"cache_control"`
-	Tools         []map[string]any  `json:"tools"`
-	ToolChoice    json.RawMessage   `json:"tool_choice"`
-	Temperature   *float64          `json:"temperature"`
-	TopP          *float64          `json:"top_p"`
-	TopK          *float64          `json:"top_k"`
-	Metadata      json.RawMessage   `json:"metadata"`
-	ServiceTier   string            `json:"service_tier"`
-	Speed         string            `json:"speed"`
-	InferenceGeo  string            `json:"inference_geo"`
-	Container     json.RawMessage   `json:"container"`
-	Diagnostics   json.RawMessage   `json:"diagnostics"`
-	StopSequences []string          `json:"stop_sequences"`
-	Stream        bool              `json:"stream"`
-	Thinking      json.RawMessage   `json:"thinking"`
-	OutputConfig  json.RawMessage   `json:"output_config"`
+	Model         string           `json:"model"`
+	MaxTokens     *int             `json:"max_tokens"`
+	System        jsontext.Value   `json:"system"`
+	Messages      []jsontext.Value `json:"messages"`
+	CacheControl  jsontext.Value   `json:"cache_control"`
+	Tools         []map[string]any `json:"tools"`
+	ToolChoice    jsontext.Value   `json:"tool_choice"`
+	Temperature   *float64         `json:"temperature"`
+	TopP          *float64         `json:"top_p"`
+	TopK          *float64         `json:"top_k"`
+	Metadata      jsontext.Value   `json:"metadata"`
+	ServiceTier   string           `json:"service_tier"`
+	Speed         string           `json:"speed"`
+	InferenceGeo  string           `json:"inference_geo"`
+	Container     jsontext.Value   `json:"container"`
+	Diagnostics   jsontext.Value   `json:"diagnostics"`
+	StopSequences []string         `json:"stop_sequences"`
+	Stream        bool             `json:"stream"`
+	Thinking      jsontext.Value   `json:"thinking"`
+	OutputConfig  jsontext.Value   `json:"output_config"`
 }
 
 // anthropicResponseOptions 是请求侧决定响应编码的选项（不进入上游请求体）。
@@ -379,7 +381,7 @@ func anthropicConvertRequest(req *anthropicRequest) (anthropicConversion, error)
 		return anthropicConversion{}, err
 	}
 
-	encoded, err := json.Marshal(out)
+	encoded, err := jsonx.Marshal(out)
 	if err != nil {
 		return anthropicConversion{}, fmt.Errorf("encode request: %w", err)
 	}
@@ -402,7 +404,7 @@ func decodeAnthropicRequest(body []byte) (*anthropicRequest, error) {
 	}
 
 	var req anthropicRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := jsonx.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid JSON body: %w", err)
 	}
 
@@ -444,7 +446,7 @@ func validateAnthropicThinking(req *anthropicRequest) error {
 		Type         string `json:"type"`
 		BudgetTokens int    `json:"budget_tokens"`
 	}
-	if json.Unmarshal(req.Thinking, &thinking) != nil {
+	if jsonx.Unmarshal(req.Thinking, &thinking) != nil {
 		return errThinkingInvalid
 	}
 
@@ -635,9 +637,9 @@ func applyAnthropicExtensions(out map[string]any, req *anthropicRequest) error {
 
 	unsupported := []struct {
 		name string
-		raw  json.RawMessage
+		raw  jsontext.Value
 	}{
-		{"inference_geo", json.RawMessage(req.InferenceGeo)},
+		{"inference_geo", jsontext.Value(req.InferenceGeo)},
 		{"container", req.Container},
 		{"diagnostics", req.Diagnostics},
 	}
@@ -651,7 +653,7 @@ func applyAnthropicExtensions(out map[string]any, req *anthropicRequest) error {
 }
 
 // emptyJSONField 报告字段是否没有实际内容（缺失 / null / 空串 / 空对象 / 空数组）。
-func emptyJSONField(raw json.RawMessage) bool {
+func emptyJSONField(raw jsontext.Value) bool {
 	switch string(bytes.TrimSpace(raw)) {
 	case "", "null", `""`, "{}", "[]":
 		return true
@@ -661,9 +663,9 @@ func emptyJSONField(raw json.RawMessage) bool {
 }
 
 // decodeRawJSON 把已确认存在的 RawMessage 解码为通用 JSON 值。
-func decodeRawJSON(raw json.RawMessage) any {
+func decodeRawJSON(raw jsontext.Value) any {
 	var value any
-	if json.Unmarshal(raw, &value) != nil {
+	if jsonx.Unmarshal(raw, &value) != nil {
 		return nil
 	}
 
@@ -718,7 +720,7 @@ func applyAnthropicThinking(out map[string]any, req *anthropicRequest) {
 
 // anthropicOutputConfig 读取 output_config.effort / output_config.format。
 // format 是 Anthropic 的结构化输出扩展，映射到 chat/completions response_format。
-func anthropicOutputConfig(raw json.RawMessage) (string, any) {
+func anthropicOutputConfig(raw jsontext.Value) (string, any) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return "", nil
 	}
@@ -727,7 +729,7 @@ func anthropicOutputConfig(raw json.RawMessage) (string, any) {
 		Effort string         `json:"effort"`
 		Format map[string]any `json:"format"`
 	}
-	if json.Unmarshal(raw, &cfg) != nil {
+	if jsonx.Unmarshal(raw, &cfg) != nil {
 		return "", nil
 	}
 
@@ -760,13 +762,13 @@ func anthropicJSONOutputFormat(format map[string]any) any {
 // 非 text block 没有 OpenAI 对应形态，返回明确错误而不是静默丢弃。
 //
 //nolint:nilnil // nil content 表示无 system，是合法输入。
-func anthropicSystemContent(raw json.RawMessage) (any, error) {
+func anthropicSystemContent(raw jsontext.Value) (any, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
 
 	var text string
-	if json.Unmarshal(raw, &text) == nil {
+	if jsonx.Unmarshal(raw, &text) == nil {
 		if text == "" {
 			return nil, nil
 		}
@@ -775,7 +777,7 @@ func anthropicSystemContent(raw json.RawMessage) (any, error) {
 	}
 
 	var blocks []map[string]any
-	if json.Unmarshal(raw, &blocks) != nil {
+	if jsonx.Unmarshal(raw, &blocks) != nil {
 		return nil, fmt.Errorf("invalid system content: %w", errAnthropicMessageFailed)
 	}
 
@@ -844,9 +846,9 @@ func anthropicText(raw any) string {
 		return ""
 	case string:
 		return item
-	case json.RawMessage:
+	case jsontext.Value:
 		var decoded any
-		if json.Unmarshal(item, &decoded) != nil {
+		if jsonx.Unmarshal(item, &decoded) != nil {
 			return ""
 		}
 
@@ -878,12 +880,12 @@ func anthropicTextBlocks(blocks []any) string {
 }
 
 // decodeAnthropicMessage 解码消息的 role 与 content。
-func decodeAnthropicMessage(raw json.RawMessage) (string, json.RawMessage, error) {
+func decodeAnthropicMessage(raw jsontext.Value) (string, jsontext.Value, error) {
 	var msg struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role    string         `json:"role"`
+		Content jsontext.Value `json:"content"`
 	}
-	if err := json.Unmarshal(raw, &msg); err != nil {
+	if err := jsonx.Unmarshal(raw, &msg); err != nil {
 		return "", nil, fmt.Errorf("invalid message: %w", err)
 	}
 
@@ -898,13 +900,13 @@ func decodeAnthropicMessage(raw json.RawMessage) (string, json.RawMessage, error
 // anthropicMessageContent 把 user / assistant 消息内容转换为 OpenAI 消息。
 // user 里的 tool_result 拆成 role=tool，其余内容合并为一条 user；assistant 的
 // tool_use 转成 tool_calls，thinking 回填 reasoning_content。
-func anthropicMessageContent(role string, content json.RawMessage) ([]any, error) {
+func anthropicMessageContent(role string, content jsontext.Value) ([]any, error) {
 	if role != "user" && role != "assistant" {
 		return nil, fmt.Errorf("unsupported message role %q: %w", role, errAnthropicMessageFailed)
 	}
 
 	var text string
-	if json.Unmarshal(content, &text) == nil {
+	if jsonx.Unmarshal(content, &text) == nil {
 		if text == "" {
 			return nil, errMessageContentRequired
 		}
@@ -913,7 +915,7 @@ func anthropicMessageContent(role string, content json.RawMessage) ([]any, error
 	}
 
 	var blocks []map[string]any
-	if err := json.Unmarshal(content, &blocks); err != nil {
+	if err := jsonx.Unmarshal(content, &blocks); err != nil {
 		return nil, fmt.Errorf("invalid %s content: %w", role, err)
 	}
 
@@ -990,6 +992,11 @@ func anthropicAssistantBlock(block map[string]any) (anthropicAssistantPart, erro
 		// 加密块对非 Anthropic 上游没有可验证语义，但也没有可见内容；
 		// 跳过即可让会话继续，避免整轮请求因签名块 400。
 		return anthropicAssistantPart{}, nil
+	case "server_tool_use", "web_search_tool_result":
+		// 网关自己在上一轮写进 assistant 内容的服务端检索块（见 anthropicSearchPrelude）。
+		// 客户端按 Anthropic 协议会把完整历史回传，这些块没有上游语义、也不需要转换；
+		// 落进 default 会让「第二轮」直接 400，把 web_search 功能打断在多轮场景。
+		return anthropicAssistantPart{}, nil
 	case "tool_use":
 		call, err := anthropicToolUseCall(block)
 		if err != nil {
@@ -1029,7 +1036,7 @@ func anthropicToolUseCall(block map[string]any) (any, error) {
 		return nil, fmt.Errorf("%w: input must be an object", errAnthropicToolInput)
 	}
 
-	args, err := json.Marshal(input)
+	args, err := jsonx.Marshal(input)
 	if err != nil {
 		return nil, fmt.Errorf("tool_use input: %w", err)
 	}
@@ -1649,7 +1656,7 @@ func anthropicToolName(tool map[string]any) (string, error) {
 
 // anthropicToolChoice 把 Anthropic tool_choice 映射为 OpenAI tool_choice。
 // 未知 type 或缺失 name 的 tool 选择返回错误，避免客户端以为约束已生效。
-func anthropicToolChoice(raw json.RawMessage) (any, error) {
+func anthropicToolChoice(raw jsontext.Value) (any, error) {
 	if len(bytes.TrimSpace(raw)) == 0 || string(bytes.TrimSpace(raw)) == "null" {
 		//nolint:nilnil // nil choice 表示客户端未指定 tool_choice。
 		return nil, nil
@@ -1659,7 +1666,7 @@ func anthropicToolChoice(raw json.RawMessage) (any, error) {
 		Type string `json:"type"`
 		Name string `json:"name"`
 	}
-	if err := json.Unmarshal(raw, &choice); err != nil {
+	if err := jsonx.Unmarshal(raw, &choice); err != nil {
 		return nil, fmt.Errorf("invalid tool_choice: %w", errAnthropicMessageFailed)
 	}
 
@@ -1682,7 +1689,7 @@ func anthropicToolChoice(raw json.RawMessage) (any, error) {
 }
 
 // anthropicDisableParallel 读取 tool_choice.disable_parallel_tool_use。
-func anthropicDisableParallel(raw json.RawMessage) bool {
+func anthropicDisableParallel(raw jsontext.Value) bool {
 	if len(raw) == 0 {
 		return false
 	}
@@ -1690,7 +1697,7 @@ func anthropicDisableParallel(raw json.RawMessage) bool {
 	var choice struct {
 		DisableParallel bool `json:"disable_parallel_tool_use"`
 	}
-	if json.Unmarshal(raw, &choice) != nil {
+	if jsonx.Unmarshal(raw, &choice) != nil {
 		return false
 	}
 
@@ -1699,7 +1706,7 @@ func anthropicDisableParallel(raw json.RawMessage) bool {
 
 // anthropicThinking 把 Anthropic thinking 开关映射为上游 thinking 字段。
 // adaptive / between_tools 在上游没有独立形态，统一按启用处理。
-func anthropicThinking(raw json.RawMessage) map[string]any {
+func anthropicThinking(raw jsontext.Value) map[string]any {
 	if len(raw) == 0 {
 		return nil
 	}
@@ -1708,7 +1715,7 @@ func anthropicThinking(raw json.RawMessage) map[string]any {
 		Type         string `json:"type"`
 		BudgetTokens int    `json:"budget_tokens"`
 	}
-	if json.Unmarshal(raw, &item) != nil {
+	if jsonx.Unmarshal(raw, &item) != nil {
 		return nil
 	}
 
@@ -1733,7 +1740,7 @@ func anthropicThinking(raw json.RawMessage) map[string]any {
 
 // anthropicThinkingOmitted 读取 thinking.display=omitted：上游思维链仍可用于
 // 推理，但不得作为 thinking 块回传给客户端。
-func anthropicThinkingOmitted(raw json.RawMessage) bool {
+func anthropicThinkingOmitted(raw jsontext.Value) bool {
 	if len(raw) == 0 {
 		return false
 	}
@@ -1741,7 +1748,7 @@ func anthropicThinkingOmitted(raw json.RawMessage) bool {
 	var item struct {
 		Display string `json:"display"`
 	}
-	if json.Unmarshal(raw, &item) != nil {
+	if jsonx.Unmarshal(raw, &item) != nil {
 		return false
 	}
 
@@ -1838,7 +1845,7 @@ func anthropicMessageFromOpenAIWithOptions(
 			content = append(content, map[string]any{"type": "text", "text": text})
 		}
 
-		tools := anthropicToolUseBlocks(msg["tool_calls"])
+		tools := anthropicToolUseBlocks(toolCallsWithLegacy(msg["tool_calls"], msg["function_call"]))
 		content = append(content, tools...)
 		finishReason = stringValue(choice["finish_reason"])
 		stopReason, stopSequence = anthropicStop(finishReason, text, options.stopSequences, len(tools) > 0)
@@ -1884,6 +1891,10 @@ func anthropicToolUseBlocks(raw any) []any {
 
 		name, _ := fn["name"].(string)
 		if name == "" {
+			// 流式面（validateToolBlock）对缺 name 会 WARN；非流式此前完全静默，
+			// 客户端只看到「stop_reason=tool_use 却少一个块」。
+			log.Printf("WARN: [anthropic] 工具调用缺 name，已丢弃（index=%d）", i)
+
 			continue
 		}
 
@@ -1894,7 +1905,12 @@ func anthropicToolUseBlocks(raw any) []any {
 
 		input := map[string]any{}
 		if args, _ := fn["arguments"].(string); args != "" {
-			_ = json.Unmarshal([]byte(args), &input)
+			if err := jsonx.Unmarshal([]byte(args), &input); err != nil {
+				// 上游截断参数：不输出原文（可能含用户数据），只留可定位元信息。
+				log.Printf("WARN: [anthropic] tool_use 参数不是合法 JSON，已按空对象下发（name=%s, %d bytes）",
+					name, len(args))
+			}
+
 			if input == nil {
 				// arguments="null" 等合法 JSON 非对象值：tool_use.input 必须是对象。
 				input = map[string]any{}
@@ -2172,7 +2188,7 @@ func (a *anthropicStreamWriter) handleChunk(payload string) error {
 	}
 
 	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) != nil {
+	if jsonx.Unmarshal([]byte(payload), &chunk) != nil {
 		return nil //nolint:nilerr // 非 JSON 数据帧（上游噪声）直接丢弃
 	}
 
@@ -2285,7 +2301,7 @@ func (a *anthropicStreamWriter) applyDelta(delta map[string]any) error {
 		}
 	}
 
-	return a.bufferToolCalls(delta["tool_calls"])
+	return a.bufferToolCalls(toolCallsWithLegacy(delta["tool_calls"], delta["function_call"]))
 }
 
 // emitOrDefer 工具调用缓冲期间先暂存文本/思考，收尾时在 tool_use 之后补发。
@@ -2391,34 +2407,38 @@ func (a *anthropicStreamWriter) emitPrelude() error {
 
 // captureUsage 记录 chunk.usage 的 token 数（末帧通常带 usage）。
 func (a *anthropicStreamWriter) captureUsage(chunk map[string]any) {
+	applyTokenUsage(chunk, &a.inputTokens, &a.outputTokens, &a.cachedTokens, &a.cacheWrite, &a.reasoningTokens)
+}
+
+// applyTokenUsage 把一帧 usage 写入目标计数（两个适配面共用同一口径）：
+// 只接受正向值，避免上游尾帧的显式 0 覆盖已收到的累计值；cached 与 cacheWrite
+// 独立更新，末帧可能只补其中一项。
+func applyTokenUsage(chunk map[string]any, input, output, cached, cacheWrite, reasoning *int) {
 	usage, _ := chunk["usage"].(map[string]any)
 	if usage == nil {
 		return
 	}
 
-	// 与 responses 流式同口径：只接受正向值，避免上游尾帧的显式 0 覆盖已
-	// 收到的累计值。
 	if n := intValue(usage["prompt_tokens"]); n > 0 {
-		a.inputTokens = n
+		*input = n
 	}
 
 	if n := intValue(usage["completion_tokens"]); n > 0 {
-		a.outputTokens = n
+		*output = n
 	}
 
-	// 两个计数独立更新：末帧可能只补其中一项，不能把另一项覆盖回 0。
-	if cached, cacheWrite := responsesCachedTokens(usage); cached > 0 || cacheWrite > 0 {
-		if cached > 0 {
-			a.cachedTokens = cached
+	if cacheHit, cacheTokens := responsesCachedTokens(usage); cacheHit > 0 || cacheTokens > 0 {
+		if cacheHit > 0 {
+			*cached = cacheHit
 		}
 
-		if cacheWrite > 0 {
-			a.cacheWrite = cacheWrite
+		if cacheTokens > 0 {
+			*cacheWrite = cacheTokens
 		}
 	}
 
 	if n := responsesReasoningTokens(usage); n > 0 {
-		a.reasoningTokens = n
+		*reasoning = n
 	}
 }
 
@@ -2571,7 +2591,7 @@ func (a *anthropicStreamWriter) toolBatchComplete() bool {
 
 	for _, block := range a.toolBlocks {
 		args := strings.TrimSpace(block.args.String())
-		if block.name == "" || args == "" || !json.Valid([]byte(args)) {
+		if block.name == "" || args == "" || !jsonx.Valid([]byte(args)) {
 			return false
 		}
 	}
@@ -2745,7 +2765,7 @@ func (a *anthropicStreamWriter) toolDeltaArgs(block *anthropicToolBlock) string 
 		return ""
 	}
 
-	if json.Valid([]byte(trimmed)) && !strings.HasPrefix(trimmed, "{") {
+	if jsonx.Valid([]byte(trimmed)) && !strings.HasPrefix(trimmed, "{") {
 		a.logger.Printf("WARN: [anthropic] non-object tool arguments model=%s tool=%s id=%s bytes=%d",
 			logfmt.Truncate(a.model, 64), logfmt.Truncate(block.name, 64),
 			logfmt.Truncate(block.id, 64), len(trimmed))
@@ -2760,7 +2780,7 @@ func (a *anthropicStreamWriter) toolDeltaArgs(block *anthropicToolBlock) string 
 // 本期只观测，不改写分片：上游截断会在这里留下可检索的 WARN（不含参数原文）。
 func (a *anthropicStreamWriter) validateToolBlock(block *anthropicToolBlock) {
 	args := strings.TrimSpace(block.args.String())
-	if args == "" || json.Valid([]byte(args)) {
+	if args == "" || jsonx.Valid([]byte(args)) {
 		return
 	}
 
@@ -2861,7 +2881,7 @@ func (a *anthropicStreamWriter) finish() error {
 
 // event 写出一条命名 SSE 事件并 flush。
 func (a *anthropicStreamWriter) event(name string, payload map[string]any) error {
-	raw, err := json.Marshal(payload)
+	raw, err := jsonx.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event: %w", err)
 	}
@@ -2873,6 +2893,31 @@ func (a *anthropicStreamWriter) event(name string, payload map[string]any) error
 	a.Flush()
 
 	return nil
+}
+
+// toolCallsWithLegacy 读取 tool_calls，并把旧式 function_call（functions API）
+// 合成为单条 tool_call。
+//
+// 上游是**故意保留**这条旧路径的：internal/upstream/sse.go 聚合时会把
+// delta.function_call 写回 message.function_call，internal/server/logging.go 也把
+// 它计入「实质输出」。适配层若不翻译，Anthropic 面会出现「stop_reason=tool_use
+// 却零 tool_use 块」的回合（客户端按 stop_reason 判定后拿不到任何工具调用），
+// Responses 面则完成一个空 message。
+func toolCallsWithLegacy(raw, legacy any) []map[string]any {
+	calls := mapItems(raw)
+
+	fn, _ := legacy.(map[string]any)
+	if len(fn) == 0 {
+		return calls
+	}
+
+	return append(calls, map[string]any{
+		"index": 0,
+		"function": map[string]any{
+			"name":      stringValue(fn["name"]),
+			"arguments": stringValue(fn["arguments"]),
+		},
+	})
 }
 
 // toolCallIdentity 取工具调用的 name/id（可能只在首片出现）。
@@ -2892,6 +2937,23 @@ func toolCallArguments(call map[string]any) string {
 	return args
 }
 
+// floatToInt 把 JSON 数值钳制到 int 范围（NaN/Inf 视作 0）。
+func floatToInt(n float64) int {
+	if math.IsNaN(n) || math.IsInf(n, 0) {
+		return 0
+	}
+
+	if n >= math.MaxInt64 {
+		return math.MaxInt64
+	}
+
+	if n <= math.MinInt64 {
+		return math.MinInt64
+	}
+
+	return int(n)
+}
+
 // stringValue 读取 map 里的字符串值。
 func stringValue(v any) string {
 	s, _ := v.(string)
@@ -2900,17 +2962,21 @@ func stringValue(v any) string {
 
 // intValue 读取 JSON/内部数值并转 int。内部聚合层会把 created 与模型目录字段
 // 构造成 int64，不能只认 JSON 解码的 float64。
+//
+// float64 分支必须钳制范围：JSON 允许 1e300 这类合法数字，而 Go 的超范围
+// float→int 转换是平台相关的（amd64 上取 MinInt64），上游一条荒谬 usage
+// 就会产出巨大负数的 token 计数。
 func intValue(v any) int {
 	switch n := v.(type) {
 	case float64:
-		return int(n)
+		return floatToInt(n)
 	case int:
 		return n
 	case int64:
 		return int(n)
-	case json.Number:
-		parsed, err := n.Int64()
-		if err != nil {
+	case jsontext.Value:
+		parsed, ok := jsonx.Int64(n)
+		if !ok {
 			return 0
 		}
 

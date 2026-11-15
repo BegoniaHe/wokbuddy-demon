@@ -1,13 +1,13 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -39,7 +39,7 @@ func TestChatPassthroughAddsLeadingSystem(t *testing.T) {
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal(outbound, &obj); err != nil {
+	if err := jsonx.Unmarshal(outbound, &obj); err != nil {
 		t.Fatalf("outbound invalid: %v (%s)", err, outbound)
 	}
 

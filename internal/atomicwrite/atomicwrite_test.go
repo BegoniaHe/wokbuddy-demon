@@ -87,3 +87,32 @@ func TestRenameWithRetryNonRetryableStopsImmediately(t *testing.T) {
 		t.Fatalf("calls=%d want 1", calls)
 	}
 }
+
+// TestRenameRetryStopsAtBudget 累计退避预算为 0 时不得继续重试。
+//
+// 只有次数上限时，50 次 × 封顶 50ms ≈ 2.3s 睡眠；调用方（auth.SaveAtomic）全程持
+// 账号锁，Windows 上一条永久无效路径就会把该账号每次保存都堵这么久。
+func TestRenameRetryStopsAtBudget(t *testing.T) { //nolint:paralleltest // 改包级预算，须与其他用例串行
+	old := renameRetryBudget
+
+	renameRetryBudget = 0
+
+	t.Cleanup(func() { renameRetryBudget = old })
+
+	calls := 0
+
+	doRename := func(string, string) error {
+		calls++
+
+		return errTransient
+	}
+
+	err := renameWithRetry("a", "b", doRename, func(error) bool { return true })
+	if !errors.Is(err, errTransient) {
+		t.Fatalf("err=%v want errTransient", err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("calls=%d want 1（预算耗尽后不得再退避）", calls)
+	}
+}

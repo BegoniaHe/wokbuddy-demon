@@ -3,7 +3,6 @@
 package upstream
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestPadBracketStringContent 字符串 content 以 "[" 开头时必须改写成单段 text parts，
@@ -24,7 +24,7 @@ func TestPadBracketStringContent(t *testing.T) {
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 
 	var doc map[string]any
-	if err := json.Unmarshal(out, &doc); err != nil {
+	if err := jsonx.Unmarshal(out, &doc); err != nil {
 		t.Fatal(err)
 	}
 
@@ -55,7 +55,7 @@ func TestPadBracketStringContentLeavesOthers(t *testing.T) {
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
 
 	var doc map[string]any
-	if err := json.Unmarshal(out, &doc); err != nil {
+	if err := jsonx.Unmarshal(out, &doc); err != nil {
 		t.Fatal(err)
 	}
 

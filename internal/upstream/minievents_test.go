@@ -1,12 +1,12 @@
 package upstream
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestMPEventBase(t *testing.T) {
@@ -77,7 +77,7 @@ func TestSchoolChatTimesEvents(t *testing.T) {
 		t.Errorf("conversation join fields missing: %v", table)
 	}
 
-	b, _ := json.Marshal(table)
+	b, _ := jsonx.Marshal(table)
 	if !strings.Contains(string(b), "agentName") {
 		t.Error("agentName missing")
 	}

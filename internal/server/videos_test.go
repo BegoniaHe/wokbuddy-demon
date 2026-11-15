@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -264,7 +264,7 @@ func TestVideoTaskFailedReturns502(t *testing.T) {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
 		t.Fatal(err)
 	}
 
@@ -370,7 +370,7 @@ func modelEntriesByID(t *testing.T, body []byte) map[string]map[string]any {
 	var resp struct {
 		Data []map[string]any `json:"data"`
 	}
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := jsonx.Unmarshal(body, &resp); err != nil {
 		t.Fatal(err)
 	}
 

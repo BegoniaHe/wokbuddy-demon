@@ -3,7 +3,7 @@ package panel
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/usage"
@@ -43,7 +44,7 @@ func TestUsageBackfillEndpoint(t *testing.T) {
 	up := &upstream.Client{HTTP: srv.Client(), BillingBaseCN: srv.URL, ChatBaseCN: srv.URL}
 	pn := &Panel{cfg: Config{Pool: p, Upstream: up, Usage: rec}}
 
-	body, _ := json.Marshal(map[string]any{"uid": "u1", "days": 7})
+	body, _ := jsonx.Marshal(map[string]any{"uid": "u1", "days": 7})
 	req := httptest.NewRequest(http.MethodPost, "/panel/api/usage/backfill", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	pn.usageBackfill(w, req)
@@ -57,7 +58,7 @@ func TestUsageBackfillEndpoint(t *testing.T) {
 		Buckets  int `json:"buckets"`
 		Accounts int `json:"accounts"`
 	}
-	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+	if err := jsonx.Unmarshal(w.Body.Bytes(), &res); err != nil {
 		t.Fatalf("decode: %v body=%s", err, w.Body)
 	}
 
@@ -119,7 +120,7 @@ func TestFetchBackfillRecordsSplitsCappedWindow(t *testing.T) {
 			StartTime string `json:"startTime"`
 			EndTime   string `json:"endTime"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := jsonx.UnmarshalRead(r.Body, &body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -150,7 +151,8 @@ func TestFetchBackfillRecordsSplitsCappedWindow(t *testing.T) {
 	p := &Panel{cfg: Config{Upstream: &upstream.Client{HTTP: srv.Client(), BillingBaseCN: srv.URL}}}
 	start := time.Date(2026, 10, 17, 0, 0, 0, 0, loc)
 
-	recs, err := p.fetchBackfillRecords(&auth.Auth{AccessToken: "at"}, start, start.Add(4*time.Hour))
+	recs, err := p.fetchBackfillRecords(context.Background(),
+		&auth.Auth{AccessToken: "at"}, start, start.Add(4*time.Hour))
 	if err != nil {
 		t.Fatalf("fetchBackfillRecords: %v", err)
 	}
@@ -182,7 +184,7 @@ func TestFetchBackfillPagesRejectsTruncation(t *testing.T) {
 		NextPage: 2,
 	}
 
-	_, err := panel.fetchBackfillPages(
+	_, err := panel.fetchBackfillPages(context.Background(),
 		&auth.Auth{AccessToken: "at"}, time.Now().Add(-time.Hour), time.Now(), first)
 	if err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("err=%v want page-cap error", err)

@@ -3,6 +3,7 @@ package httpauth
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"slices"
@@ -26,6 +27,15 @@ func ParseTrustedProxies(cidrs []string) ([]*net.IPNet, error) {
 		}
 
 		if _, network, err := net.ParseCIDR(value); err == nil {
+			if ones, bits := network.Mask.Size(); ones == 0 && bits > 0 {
+				// 0 位前缀等于「信任任何 TCP 对端」：X-Forwarded-For 的每一跳都被
+				// 判为可信后，ClientIP 会落到最左侧——那是客户端自己写的值，可随
+				// 意伪造来源，进而绕过 IP 白名单与鉴权失败限速。仍然接受（有人用
+				// 它做全代理部署），但必须让运维在启动日志里看到这条风险。
+				log.Printf("WARN: [httpauth] trusted_proxies 含 %s（信任任何对端）："+
+					"转发头将完全可被客户端伪造，仅在全链路自控的正向代理后使用", value)
+			}
+
 			out = append(out, network)
 
 			continue
@@ -97,18 +107,40 @@ func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 	return peer
 }
 
-// splitForwarded 解析 X-Forwarded-For 的全部值（多次出现按顺序拼接），
-// 丢弃空项与非法 IP（如 "unknown"）。
-func splitForwarded(values []string) []string {
-	out := make([]string, 0, len(values))
+// maxForwardedHops X-Forwarded-For 参与解析的最大段数（取最右侧的这么多段）。
+//
+// 该头长度只受反向代理配置约束，客户端可以发任意多段；每段都要做一次
+// SplitHostPort + ParseIP，且整表进内存。取最右侧（最接近对端、最可信）的
+// 有限段即可决定「第一个非可信地址」，超出部分对结论没有贡献。
+const maxForwardedHops = 16
 
-	for _, value := range values {
-		for part := range strings.SplitSeq(value, ",") {
-			if ip := normalizeIP(part); ip != "" {
-				out = append(out, ip)
-			}
-		}
+// splitForwarded 解析 X-Forwarded-For 的全部值（多次出现按顺序拼接），
+// 丢弃空项与非法 IP（如 "unknown"），按从左到右的顺序返回。
+//
+// 从右往左切分并在取满 maxForwardedHops 个有效地址后停止：结论只需要最右侧
+// 那段连续可信链，左侧剩余段解析了也不会被读到。这样重放上万个伪造地址的请求
+// 头不会变成上万次 SplitHostPort + ParseIP。
+func splitForwarded(values []string) []string {
+	if len(values) == 0 {
+		return nil
 	}
+
+	// len(values)==1 时 strings.Join 直接返回原串，不额外分配。
+	joined := strings.Join(values, ",")
+	// 常见部署是单层反代（1~2 段），起始容量按小值给，避免每个请求都多付一份
+	// 16 段的底层数组。
+	out := make([]string, 0, min(4, maxForwardedHops))
+
+	for end := len(joined); end > 0 && len(out) < maxForwardedHops; {
+		start := strings.LastIndexByte(joined[:end], ',') + 1
+		if ip := normalizeIP(joined[start:end]); ip != "" {
+			out = append(out, ip)
+		}
+
+		end = start - 1
+	}
+
+	slices.Reverse(out)
 
 	return out
 }
@@ -129,6 +161,12 @@ func normalizeIP(raw string) string {
 		}
 	} else if host, _, err := net.SplitHostPort(value); err == nil {
 		value = host
+	}
+
+	// 去掉 IPv6 作用域后缀（fe80::1%eth0）：带 zone 的串 net.ParseIP 不认，
+	// 会让同一来源在「可信反代后面」被判成非法而回落到对端地址，限速归并失效。
+	if i := strings.IndexByte(value, '%'); i > 0 {
+		value = value[:i]
 	}
 
 	if ip := net.ParseIP(value); ip != nil {

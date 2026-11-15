@@ -5,11 +5,14 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"log"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // chatBodyRewrite 一次出站 chat body 改写的全部输入。零值 = 只做基础规范化
@@ -41,8 +44,10 @@ func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 		return src
 	}
 
-	var obj map[string]any
-	if err := json.Unmarshal(src, &obj); err != nil || obj == nil {
+	// 原始字面量：改写只动结构与已知字段，客户端的数值（seed/大整数 id/1.0）
+	// 必须逐字保留。
+	obj, err := decodeObjectRawNumbers(src)
+	if err != nil || obj == nil {
 		return src
 	}
 
@@ -62,7 +67,7 @@ func rewriteChatBody(src []byte, rewrite *chatBodyRewrite) []byte {
 		injectAgentCLIObj(obj)
 	}
 
-	out, err := json.Marshal(obj)
+	out, err := jsonx.Marshal(obj)
 	if err != nil {
 		return src
 	}
@@ -165,8 +170,9 @@ func applyReasoningPatches(
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
 // 认的 max_tokens（吸收上游 PR #116）。规则：显式 max_tokens 优先（别名只删）；
 // 别名非正数值（0/null/负数）不翻译（0/null 语义是「未设置」，负数是非法值，
-// 翻译等于把垃圾搬进 max_tokens）；非数值别名（字符串等畸形）不翻译（原样
-// 透传由上游报 11101 参数错）。两域同口径：CN /v2 与 global /console 是同一套
+// 翻译等于把垃圾搬进 max_tokens）；非数值别名（字符串等畸形）同样不翻译，且与
+// 其它情形一样被删除（别名一律删，见下方 delete）。两域同口径：CN /v2 与
+// global /console 是同一套
 // API，翻译不分 realm。
 func translateMaxCompletionTokens(obj map[string]any) {
 	alias, has := obj["max_completion_tokens"]
@@ -181,22 +187,48 @@ func translateMaxCompletionTokens(obj map[string]any) {
 	if obj["max_tokens"] != nil {
 		return // 显式 max_tokens 优先：别名只删不译
 	}
-	// json.Unmarshal 数字 → float64（整数去整后回写，避免 1.28e5 科学计数法/小数
-	// 尾巴进上游 body）；其他数值类型防御性兼容（int 家族——手构造 map 的调用方）。
-	switch item := alias.(type) {
+
+	if n, ok := positiveInt64(alias); ok {
+		obj["max_tokens"] = n
+	}
+}
+
+// positiveInt64 把 JSON 数值取成正整数。
+//
+// 解码保留原始字面量，别名通常是 jsontext.Value；统一取整后回写，避免 1.28e5 这类
+// 科学计数法/小数尾巴进上游 body。其余数值类型防御性兼容（手构造 map 的调用方）。
+// 0 / 负数（语义是「未设置」或非法值）、非整数、非数值一律判否。
+func positiveInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case jsontext.Value:
+		// 原始字面量解码下客户端的 4096.0 / 1e5 以字面量到达：按整值浮点接受，
+		// 与本函数 float64 分支同口径（严格 ParseInt 会把它们判成非法）。
+		return positiveLiteral(string(n))
 	case float64:
-		if item > 0 && item == float64(int64(item)) {
-			obj["max_tokens"] = int64(item)
+		if n > 0 && n == float64(int64(n)) {
+			return int64(n), true
 		}
 	case int64:
-		if item > 0 {
-			obj["max_tokens"] = item
-		}
+		return n, n > 0
 	case int:
-		if item > 0 {
-			obj["max_tokens"] = int64(item)
-		}
+		return int64(n), n > 0
 	}
+
+	return 0, false
+}
+
+// positiveLiteral 把原始数字字面量转成正整数：0 / 负数 / 非整数 / 非数字一律判否。
+func positiveLiteral(literal string) (int64, bool) {
+	if parsed, err := strconv.ParseInt(literal, 10, 64); err == nil {
+		return parsed, parsed > 0
+	}
+
+	f, err := strconv.ParseFloat(literal, 64)
+	if err != nil || f <= 0 || f != float64(int64(f)) {
+		return 0, false
+	}
+
+	return int64(f), true
 }
 
 // gptMinMaxTokens GPT 系上游接受的 max_tokens 下限。
@@ -220,6 +252,13 @@ func clampGPTMinMaxTokens(obj map[string]any) {
 	switch n := obj["max_tokens"].(type) {
 	case float64:
 		num = int64(n)
+	case jsontext.Value:
+		parsed, ok := jsonx.Int64(n)
+		if !ok {
+			return
+		}
+
+		num = parsed
 	case int64:
 		num = n
 	case int:
@@ -879,9 +918,30 @@ func enumItemType(item any) (string, bool) {
 		return "integer", true
 	case int, int64:
 		return "integer", true
+	case jsontext.Value:
+		// 出站改写走原始字面量解码，enum 里的数字是 jsontext.Value 而非 float64。
+		return literalEnumType(value)
 	default:
 		return "", false
 	}
+}
+
+// literalEnumType 把数字字面量归类：整数值（含 1.0）算 integer，带小数算 number。
+func literalEnumType(value jsontext.Value) (string, bool) {
+	if value.Kind() != '0' {
+		return "", false
+	}
+
+	f, err := strconv.ParseFloat(string(value), 64)
+	if err != nil {
+		return "", false
+	}
+
+	if f != math.Trunc(f) {
+		return "number", true
+	}
+
+	return "integer", true
 }
 
 // mergeEnumType 合并两个已推断类型：同类型不变，整型与小数混合取 number（仍是唯一

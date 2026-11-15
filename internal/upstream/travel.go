@@ -3,13 +3,14 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // growth 域路径（实测）。
@@ -43,7 +44,7 @@ type TravelState struct {
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // /v2 前缀优先（官方 Bearer 通道），仅 404 时回落无 /v2 旧路径。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
-func (c *Client) growthJSON(account *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+func (c *Client) growthJSON(account *auth.Auth, method, path string, body any) (jsontext.Value, error) {
 	// 已带 /v2 的路径（任务族）直接使用，避免拼成 /v2/v2/...；它们没有旧路径可回落。
 	if strings.HasPrefix(path, "/v2/") {
 		return c.growthJSONPath(account, method, path, body, nil)
@@ -65,7 +66,7 @@ func (c *Client) growthJSON(account *auth.Auth, method, path string, body any) (
 // growthJSONPath 单路径 growth 请求，可附加额外请求头。
 func (c *Client) growthJSONPath(
 	account *auth.Auth, method, path string, body any, headers map[string]string,
-) (json.RawMessage, error) {
+) (jsontext.Value, error) {
 	return c.domainJSONLimitHeaders(
 		account, surfaceGrowth, c.chatBase(account), method, path, body, defaultJSONBodyLimit, headers,
 	)
@@ -79,7 +80,7 @@ func (c *Client) TravelStatus(a *auth.Auth) (*TravelState, error) {
 	}
 
 	var st TravelState
-	if err := json.Unmarshal(data, &st); err != nil {
+	if err := jsonx.Unmarshal(data, &st); err != nil {
 		return nil, fmt.Errorf("TravelStatus: %w", err)
 	}
 
@@ -136,7 +137,7 @@ func (c *Client) TravelClaim(account *auth.Auth, recordID int64) (int64, error) 
 	}
 	if len(data) > 0 {
 		// 奖励字段缺失不视为失败：调用方按 0 记日志即可。
-		_ = json.Unmarshal(data, &resp)
+		_ = jsonx.Unmarshal(data, &resp)
 	}
 
 	return resp.RewardCredit, nil
@@ -150,9 +151,9 @@ func (c *Client) BuddyInfo(a *auth.Auth) (*Buddy, error) {
 	}
 
 	var resp struct {
-		Buddy json.RawMessage `json:"buddy"`
+		Buddy jsontext.Value `json:"buddy"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("BuddyInfo: %w", err)
 	}
 	// null / 缺字段 / 空对象都按无猫处理。
@@ -162,7 +163,7 @@ func (c *Client) BuddyInfo(a *auth.Auth) (*Buddy, error) {
 	}
 
 	var buddy Buddy
-	if err := json.Unmarshal(resp.Buddy, &buddy); err != nil {
+	if err := jsonx.Unmarshal(resp.Buddy, &buddy); err != nil {
 		return nil, fmt.Errorf("BuddyInfo: %w", err)
 	}
 	// 空对象（{}）等价于无猫：id=0 不是合法档案，继续当成有猫会让调度器
@@ -202,7 +203,7 @@ func (c *Client) GrowthStreak(a *auth.Auth) (int, error) {
 			Days int `json:"days"`
 		} `json:"streak"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return 0, fmt.Errorf("GrowthStreak: %w", err)
 	}
 

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -149,7 +149,7 @@ func TestChatFlowAppliesModelAlias(t *testing.T) {
 	}
 
 	var body map[string]any
-	if err := json.Unmarshal(chatFlow2.body, &body); err != nil {
+	if err := jsonx.Unmarshal(chatFlow2.body, &body); err != nil {
 		t.Fatalf("body not json: %v", err)
 	}
 
@@ -185,7 +185,7 @@ func TestModelsEndpointIncludesAliases(t *testing.T) {
 	var resp struct {
 		Data []map[string]any `json:"data"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 
@@ -248,7 +248,7 @@ func TestModelsRetrieveOpenAI(t *testing.T) {
 	}
 
 	var entry map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
 		t.Fatal(err)
 	}
 
@@ -267,7 +267,7 @@ func TestModelsRetrieveAnthropic(t *testing.T) {
 	}
 
 	var entry map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &entry); err != nil {
 		t.Fatal(err)
 	}
 
@@ -291,7 +291,7 @@ func TestModelsListAnthropic(t *testing.T) {
 		FirstID string           `json:"first_id"`
 		LastID  string           `json:"last_id"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &page); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &page); err != nil {
 		t.Fatal(err)
 	}
 
@@ -409,7 +409,7 @@ func modelsListIDs(t *testing.T, handler *Handler) map[string]bool {
 		Data []map[string]any `json:"data"`
 	}
 
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 

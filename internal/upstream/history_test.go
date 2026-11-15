@@ -1,9 +1,10 @@
 package upstream
 
 import (
-	"encoding/json"
 	"reflect"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // msg 构造一条测试消息：裁剪逻辑只看 role，tag 仅用于断言切片位置。
@@ -213,7 +214,7 @@ func TestPrepareBodyTrimsHistory(t *testing.T) {
 		},
 	}
 
-	raw, err := json.Marshal(body)
+	raw, err := jsonx.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -226,7 +227,7 @@ func TestPrepareBodyTrimsHistory(t *testing.T) {
 	}
 
 	out := PrepareBodyOptWithEffortsAndDefault(raw, false, nil, nil, 2)
-	if err := json.Unmarshal(out, &got); err != nil {
+	if err := jsonx.Unmarshal(out, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
@@ -244,7 +245,7 @@ func TestPrepareBodyTrimsHistory(t *testing.T) {
 
 	// keep=0 = 关闭：输出必须包含全部 6 条。
 	out = PrepareBodyOptWithEffortsAndDefault(raw, false, nil, nil, 0)
-	if err := json.Unmarshal(out, &got); err != nil {
+	if err := jsonx.Unmarshal(out, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 

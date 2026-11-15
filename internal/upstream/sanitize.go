@@ -6,9 +6,11 @@
 package upstream
 
 import (
-	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // sanitizeFeatures 特征预检：任一命中才进入净化（strings.Contains 快速路径，
@@ -278,7 +280,7 @@ func sanitizeJSONString(raw string) (string, bool) {
 		return raw, false
 	}
 
-	if !json.Valid([]byte(out)) && json.Valid([]byte(raw)) {
+	if !jsonx.Valid([]byte(out)) && jsonx.Valid([]byte(raw)) {
 		if structured, ok := sanitizeJSONValues(raw); ok {
 			out = structured
 		}
@@ -287,30 +289,41 @@ func sanitizeJSONString(raw string) (string, bool) {
 	return out, true
 }
 
+// decodeObjectRawNumbers 解析顶层 JSON 对象：数值按字面量保留。
+//
+// 出站改写与 SSE 帧重建都会「解码 → 改动 → 重新编码」，默认解码会把一切数字变
+// float64：seed 9007199254740993 变成 ...992、1.0 变成 1、20 位整数 id 变成
+// 另一个值。客户端看到的数值必须与它发出的一致。
+//
+// 与 json.Unmarshal 同口径：对象之后还有内容即视为解析失败。json.Decoder 只读
+// 首个值、忽略尾部，若照单全收，`{...} {...}` 这类粘帧会被当成单个合法帧并丢掉
+// 后一个对象的内容（粘帧本应走 splitConcatenatedJSON 拆分透传）。
+func decodeObjectRawNumbers(raw []byte) (map[string]any, error) {
+	obj, err := jsonx.DecodeObject(raw)
+	if err != nil {
+		return nil, fmt.Errorf("decode json object: %w", err)
+	}
+
+	return obj, nil
+}
+
 // sanitizeJSONValues 结构化净化：解析 JSON → 递归净化字符串值 → 重新编码。
 // 键名保持原样（指纹只落在值里）；解析/编码失败返回 false 由调用方保留文本结果。
 func sanitizeJSONValues(raw string) (string, bool) {
-	// UseNumber 保留数字原始字面量：默认 float64 会把 20 位整数截成
-	// 12345678901234567000，工具参数里的 id / 时间戳随之变成另一个值。
-	decoder := json.NewDecoder(strings.NewReader(raw))
-	decoder.UseNumber()
-
-	var value any
-	if err := decoder.Decode(&value); err != nil {
+	// 数字保留原始字面量：float64 会把 20 位整数截成 12345678901234567000，
+	// 工具参数里的 id / 时间戳随之变成另一个值。
+	value, err := jsonx.DecodeAny([]byte(raw))
+	if err != nil {
 		return "", false
 	}
 
-	var buf strings.Builder
-
-	encoder := json.NewEncoder(&buf)
-	// 工具参数按原样语义重新编码：不把 < > & 转成 \u003c 等 HTML 转义。
-	encoder.SetEscapeHTML(false)
-
-	if err := encoder.Encode(sanitizeJSONNode(value)); err != nil {
+	// 工具参数按原样语义重新编码：jsonx 不做 HTML 转义，< > & 原样保留。
+	out, err := jsonx.Marshal(sanitizeJSONNode(value))
+	if err != nil {
 		return "", false
 	}
 
-	return strings.TrimSuffix(buf.String(), "\n"), true
+	return string(out), true
 }
 
 // sanitizeJSONNode 递归净化 JSON 节点里的字符串值。

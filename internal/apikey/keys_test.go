@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
@@ -263,5 +264,71 @@ func TestLoadFallsBackToBackup(t *testing.T) {
 	reloaded := New(path)
 	if got := len(reloaded.List()); got != 1 {
 		t.Fatalf("records=%d want 1 (restored from .bak)", got)
+	}
+}
+
+// TestFlushSnapshotDiscardsStaleState 旧快照不能盖掉更新的落盘状态。
+// flush 现在锁外写盘：快照序号不大于已落盘序号时必须丢弃，否则并发 Delete/Create
+// 写出的新状态会被先取得快照的 flush 用旧内容覆盖（内存有、磁盘回退）。
+func TestFlushSnapshotDiscardsStaleState(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "keys.json")
+	store := New(path)
+
+	rec, _, err := store.Create("k")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	store.mu.Lock()
+	stale := append([]Record(nil), store.records...)
+	staleSeq := store.seq
+	store.mu.Unlock()
+
+	store.RecordUsage(rec.ID, 1, 2, 3)
+	store.Flush()
+
+	// 迟到的旧快照：此时磁盘上已是带计数的新状态。
+	if err := store.persistSnapshot(stale, staleSeq); err != nil {
+		t.Fatalf("persistSnapshot: %v", err)
+	}
+
+	if got := New(path).List(); len(got) != 1 || got[0].Requests != 1 {
+		t.Fatalf("旧快照覆盖了新状态: %+v", got)
+	}
+}
+
+// TestFlushPersistsConcurrentUsage flush 锁外写盘期间的新计数不能被当成已落盘丢掉。
+// 覆盖的是「写盘期间 seq 变化则保留 dirty」这条不变式。
+func TestFlushPersistsConcurrentUsage(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "keys.json")
+	store := New(path)
+
+	rec, _, err := store.Create("k")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	const workers, perWorker = 8, 50
+
+	var wg sync.WaitGroup
+
+	for range workers {
+		wg.Go(func() {
+			for range perWorker {
+				store.RecordUsage(rec.ID, 1, 1, 1)
+				store.flush()
+			}
+		})
+	}
+
+	wg.Wait()
+	store.Flush()
+
+	if got := New(path).List()[0].Requests; got != workers*perWorker {
+		t.Fatalf("requests=%d want %d（并发计数丢失）", got, workers*perWorker)
 	}
 }

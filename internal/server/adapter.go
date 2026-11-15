@@ -1,13 +1,14 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -46,7 +47,7 @@ func newChatInput(
 		Model  string `json:"model"`
 	}
 
-	_ = json.Unmarshal(body, &peek)
+	_ = jsonx.Unmarshal(body, &peek)
 
 	chatInput2 := newChatInputFromRequest(r, body, peek.Stream, peek.Model)
 
@@ -171,7 +172,7 @@ func (r *httpResponder) writeHeartbeat() error {
 func (r *httpResponder) writeErrorFrame(code, msg, hint string) {
 	r.setSSEHeaders()
 
-	raw, err := json.Marshal(openAIErrorEnvelope(code, msg, hint))
+	raw, err := jsonx.Marshal(openAIErrorEnvelope(code, msg, hint))
 	if err != nil {
 		return // map 只含 string，编码不会失败；真失败也不能改写已提交的响应头
 	}
@@ -216,6 +217,15 @@ func startFirstByteHeartbeat(out chatResponder, interval time.Duration) func() {
 
 	go func() {
 		defer close(stopped)
+
+		// 写注释帧走的是 response writer：封装层若 panic，这里是独立协程，
+		// 无人 recover 就是进程级终止（连带所有账号的 /v1/*）。隔离后按
+		// 「客户端已走」处理，真实帧会拿到写错误。
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("ERR: [server] first-byte heartbeat panic（已隔离）: %v", rec)
+			}
+		}()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()

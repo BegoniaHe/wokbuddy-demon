@@ -1,12 +1,13 @@
 package notify
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestNotifierSendsAndDeduplicates(t *testing.T) {
@@ -16,7 +17,7 @@ func TestNotifierSendsAndDeduplicates(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		if err := jsonx.UnmarshalRead(r.Body, &p); err != nil {
 			t.Errorf("decode: %v", err)
 		}
 
@@ -61,7 +62,7 @@ func TestNotifierEventFilter(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var p payload
 
-		_ = json.NewDecoder(r.Body).Decode(&p)
+		_ = jsonx.UnmarshalRead(r.Body, &p)
 		got <- p
 	}))
 	defer srv.Close()
@@ -133,4 +134,12 @@ func TestValidateURLRedactsCredentials(t *testing.T) {
 			t.Fatalf("错误回显了凭证: %v", err)
 		}
 	}
+}
+
+// TestNotifyNilEventNoPanic nil 事件不得 panic（其余方法都已判空）。
+func TestNotifyNilEventNoPanic(t *testing.T) {
+	t.Parallel()
+
+	n := &Notifier{url: "https://example.invalid/hook", events: map[string]bool{"task_done": true}}
+	n.Notify(nil) // 不应 panic
 }

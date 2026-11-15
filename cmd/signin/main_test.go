@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -86,5 +88,24 @@ func TestTruncKeepsValidUTF8(t *testing.T) {
 	// 60 字节切点落在第 20 个汉字中间时必须回退，不能输出半个字符。
 	if got := short("a" + strings.Repeat("错", 20)); !utf8.ValidString(got) {
 		t.Fatalf("short 结果不是合法 UTF-8: %q", got)
+	}
+}
+
+// 手写扁平 auth 常只带 accessToken、没有 refreshToken 与 expiresAt。此时
+// NeedsRefresh 恒 true，若直接调用 RefreshTokenIfNeeded 会以 no refresh token
+// 失败，并经 IsCredentialDead 判成 AUTH_INVALID——一个 AT 完全可用的账号被报
+// 「需要重新登录」，整轮还会退出 1。
+func TestRefreshIfNeededSkipsWithoutRefreshToken(t *testing.T) {
+	t.Parallel()
+
+	account := &auth.Auth{UID: "u1", AccessToken: "at-only", ExpiresAt: 0}
+
+	// 前置条件：该账号确实处于「需要刷新」状态，否则用例没有覆盖力。
+	if !account.NeedsRefresh(2 * time.Hour) {
+		t.Fatal("前置条件不成立：无过期时间的账号应被视为需要刷新")
+	}
+
+	if err := refreshIfNeeded(account, nil); err != nil {
+		t.Fatalf("无 refresh token 时应跳过刷新（返回 nil），err=%v", err)
 	}
 }

@@ -1,13 +1,13 @@
 package panel
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // panelWithKeys 构建一个仅启用密钥存储的面板（其余依赖 nil，密钥接口不触碰）。
@@ -46,7 +46,7 @@ func createKey(t *testing.T, p *Panel, name string) (string, apikey.Record) {
 	}
 
 	var created keysResp
-	if err := json.Unmarshal([]byte(body), &created); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &created); err != nil {
 		t.Fatalf("decode create: %v", err)
 	}
 
@@ -71,7 +71,7 @@ func listKeys(t *testing.T, p *Panel) []apikey.Record {
 	}
 
 	var listed keysResp
-	if err := json.Unmarshal([]byte(body), &listed); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &listed); err != nil {
 		t.Fatalf("decode list: %v", err)
 	}
 

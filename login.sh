@@ -162,9 +162,28 @@ auth = {
         "domain": os.environ["WB2A_LOGIN_DOMAIN"],
     },
 }
-with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
-    json.dump(auth, f, indent=1)
-print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
+# 凭证文件必须 0600：open(..., "w") 按 0o666 & ~umask 创建，常规 umask 022 下
+# 得到 0644（同机其他用户可读 accessToken/refreshToken）。Go 侧刷新写回走
+# safefile 的 0600，这里保持一致。O_CREAT 的 mode 会受 umask 削减，故再显式 chmod。
+auth_path = os.environ["WB2A_LOGIN_AUTH_FILE"]
+# 原子替换：open("w") 先截断既有（本来有效的）文件，中途 Ctrl-C/ENOSPC 会留下
+# 零长或半截凭证，且创建时按 umask 得到 0644。改成 tmp（O_EXCL + 0600）→ 写入
+# → fsync → os.replace，与 Go 侧 safefile 同口径。
+tmp_path = f"{auth_path}.tmp.{os.getpid()}"
+fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    with os.fdopen(fd, "w") as f:
+        json.dump(auth, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, auth_path)
+except BaseException:
+    try:
+        os.unlink(tmp_path)
+    except OSError:
+        pass
+    raise
+print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {auth_path}")
 PYEOF
 
 # ─── 重启服务 ────────────────────────────────────────────

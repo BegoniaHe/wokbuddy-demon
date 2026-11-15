@@ -12,7 +12,7 @@ package panel
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -24,7 +24,10 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 const (
@@ -55,20 +58,30 @@ type loginEndpoint struct {
 	userAgent string
 }
 
-// loginIdentity 设备授权链路的客户端身份：UA 与 auth/state 的 platform 参数。
+// loginIdentity 设备授权链路的客户端身份：UA、auth/state 的 platform、授权页读取的
+// 客户端版本与会话标识。
 type loginIdentity struct {
 	userAgent string
 	platform  string
+	// version 授权页读取的客户端版本，来自部署 profile（仓库不内置版本常量）；空则不补。
+	version string
+	// sessionID 授权页的 loginSessionId：官方只对 CN 站（platform=workbuddy）现场生成。
+	sessionID string
 }
 
-// defaultLoginIdentity 只提供 platform 缺省值；UA 必须来自部署 profile。
+// defaultLoginIdentity 只提供 platform 缺省值与 CN 站的 loginSessionId；UA 与 version
+// 必须来自部署 profile（仓库不内置客户端版本 / 登录 UA）。
 func defaultLoginIdentity(realm string) loginIdentity {
-	platform := "workbuddy"
+	identity := loginIdentity{platform: "workbuddy"}
 	if realm == "global" {
-		platform = "workbuddy-ai"
+		identity.platform = "workbuddy-ai"
 	}
 
-	return loginIdentity{platform: platform}
+	if identity.platform == "workbuddy" {
+		identity.sessionID = session.NewUUIDv4()
+	}
+
+	return identity
 }
 
 // loginIdentityFor 取部署 profile 的 loginUA / loginPlatform。profile 或 loginUA
@@ -92,6 +105,9 @@ func (p *Panel) loginIdentityFor(realm string) loginIdentity {
 		identity.platform = profile.Emit.LoginPlatform
 	}
 
+	// 授权页把 version 编进 console/auth/risk-context 与 signin-callback 的 redirect_uri。
+	identity.version = profile.Source.Version
+
 	return identity
 }
 
@@ -103,12 +119,30 @@ func loginEndpointForBaseWithIdentity(realm, base string, identity loginIdentity
 
 	return loginEndpoint{
 		base:      base,
-		state:     base + "/v2/plugin/auth/state?platform=" + url.QueryEscape(identity.platform),
+		state:     loginStateURL(base, identity),
 		token:     base + "/v2/plugin/auth/token?state=",
 		account:   base + "/v2/plugin/login/account?state=",
 		origin:    origin,
 		userAgent: identity.userAgent,
 	}
+}
+
+// loginStateURL 拼 auth/state 地址：platform 恒有；version 来自部署 profile（空则不补）；
+// loginSessionId 只在 CN 站（platform=workbuddy）追加——与官方
+// appendHostLoginJourneyParams 的 platform!=='workbuddy' → return 同口径。
+func loginStateURL(base string, identity loginIdentity) string {
+	query := url.Values{}
+	query.Set("platform", identity.platform)
+
+	if identity.version != "" {
+		query.Set("version", identity.version)
+	}
+
+	if identity.platform == "workbuddy" && identity.sessionID != "" {
+		query.Set("loginSessionId", identity.sessionID)
+	}
+
+	return base + "/v2/plugin/auth/state?" + query.Encode()
 }
 
 func loginCandidatesWithIdentity(realm string, identity loginIdentity) []loginEndpoint {
@@ -188,17 +222,19 @@ func validUID(uid string) bool {
 
 // apiEnvelope 与 upstream 同形：{code,msg,data}，code!=0 视为业务错误。
 type apiEnvelope struct {
-	Code int             `json:"code"`
-	Msg  string          `json:"msg"`
-	Data json.RawMessage `json:"data"`
+	Code int            `json:"code"`
+	Msg  string         `json:"msg"`
+	Data jsontext.Value `json:"data"`
 }
 
 // doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
+// ctx 来自 HTTP 请求：轮询客户端断开后应立即放弃（原先用 Background()，一次
+// auth/state→token→account 链路在客户端关页面后仍会跑满全部候选 origin 与超时）。
 func doJSON(
-	method, fullURL, bearer string, body io.Reader, origin, userAgent string,
-) (json.RawMessage, int, error) {
+	ctx context.Context, method, fullURL, bearer string, body io.Reader, origin, userAgent string,
+) (jsontext.Value, int, error) {
 	//nolint:gosec // URL 由固定 realm 端点拼接，非用户可控主机
-	req, err := http.NewRequestWithContext(context.Background(), method, fullURL, body)
+	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
@@ -222,12 +258,15 @@ func doJSON(
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return nil, resp.StatusCode, fmt.Errorf("doJSON: read body: %w", readErr)
+	}
 
 	// 先解信封：业务错误可能随任意 HTTP 状态返回（含 4xx），code 比状态码更权威。
 	var env apiEnvelope
 
-	parseErr := json.Unmarshal(raw, &env)
+	parseErr := jsonx.Unmarshal(raw, &env)
 	if parseErr == nil && env.Code != 0 {
 		return nil, resp.StatusCode, &logincode.Error{Code: env.Code, Msg: env.Msg, Status: resp.StatusCode}
 	}
@@ -244,7 +283,9 @@ func doJSON(
 }
 
 // loginStartState 按 origin 候选发起 auth/state，返回响应、命中的 endpoint 与最后状态。
-func (p *Panel) loginStartState(realm string) (json.RawMessage, loginEndpoint, int, error) {
+func (p *Panel) loginStartState(
+	ctx context.Context, realm string,
+) (jsontext.Value, loginEndpoint, int, error) {
 	identity := p.loginIdentityFor(realm)
 	if identity.userAgent == "" {
 		return nil, loginEndpoint{}, 0, errLoginProfileMissing
@@ -257,7 +298,7 @@ func (p *Panel) loginStartState(realm string) (json.RawMessage, loginEndpoint, i
 
 	for _, endpoint := range loginCandidatesWithIdentity(realm, identity) {
 		data, status, err := doJSON(
-			http.MethodPost, endpoint.state, "", bytes.NewReader([]byte("{}")), endpoint.origin, endpoint.userAgent,
+			ctx, http.MethodPost, endpoint.state, "", bytes.NewReader([]byte("{}")), endpoint.origin, endpoint.userAgent,
 		)
 		if err == nil {
 			return data, endpoint, status, nil
@@ -282,7 +323,7 @@ func loginRealmFromBody(r *http.Request) string {
 		Realm string `json:"realm"`
 	}
 
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<12)).Decode(&reqBody); err != nil {
+	if err := jsonx.UnmarshalRead(io.LimitReader(r.Body, 1<<12), &reqBody); err != nil {
 		return "cn"
 	}
 
@@ -298,7 +339,7 @@ func loginRealmFromBody(r *http.Request) string {
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	realm := loginRealmFromBody(r)
 
-	data, used, status, err := p.loginStartState(realm)
+	data, used, status, err := p.loginStartState(r.Context(), realm)
 	if err != nil {
 		if errors.Is(err, errLoginProfileMissing) {
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
@@ -315,7 +356,7 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		State   string `json:"state"`
 		AuthURL string `json:"authUrl"`
 	}
-	if err := json.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
+	if err := jsonx.Unmarshal(data, &item); err != nil || item.State == "" || item.AuthURL == "" {
 		writeErr(w, http.StatusBadGateway, "auth state: missing state or authUrl")
 		return
 	}
@@ -348,6 +389,24 @@ type loginToken struct {
 	RefreshToken string `json:"refreshToken"`
 	ExpiresIn    int64  `json:"expiresIn"`
 	Domain       string `json:"domain"`
+}
+
+// loginExpiry 把上游 expiresIn（秒）换成有效期。
+//
+// 上游字段是 int64：大于约 2.9e11 秒时 *time.Second 溢出成负 duration，新账号会
+// 以「已过期」落盘（或得到一个荒谬的未来时间，NeedsRefresh 永远 false）。异常值
+// 一律回落到官方默认有效期。
+func loginExpiry(expiresIn int64) time.Duration {
+	const (
+		defaultExpiry = time.Hour
+		maxExpiry     = 365 * 24 * time.Hour
+	)
+
+	if expiresIn <= 0 || expiresIn > int64(maxExpiry/time.Second) {
+		return defaultExpiry
+	}
+
+	return time.Duration(expiresIn) * time.Second
 }
 
 // lookupLoginSession 取登录会话并回收超时项；loginTTL 是授权 URL 的最长有效期，
@@ -390,7 +449,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, pendingInfo, pending, endpoint, err := p.pollLoginToken(sess.realm, sess.base, state)
+	tok, pendingInfo, pending, endpoint, err := p.pollLoginToken(r.Context(), sess.realm, sess.base, state)
 	if err != nil {
 		// 许可终态会让前端停止轮询；收敛会话，避免状态永久留在 p.logins。
 		if loginTokenTerminal(err) {
@@ -409,12 +468,28 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	acct, ok := p.pollLoginAccount(w, &endpoint, state, tok.AccessToken)
+	acct, ok := p.pollLoginAccount(r.Context(), w, &endpoint, state, tok.AccessToken)
 	if !ok {
 		return
 	}
 
-	account, status, msg := p.persistLoginAuth(sess.realm, tok, acct)
+	// 独占认领：lookupLoginSession 只读不占位，会话删除又发生在 postLoginTasks 之后，
+	// 并发 poll（双击、两个标签页、前端重试）会各自跑完落盘 + 签到/注册/领 trial。
+	// 这里把「取号成功」到「删除会话」之间收窄成单飞。
+	if !p.claimLoginSession(state) {
+		writeErr(w, http.StatusConflict, "登录结果已由其它请求处理，请刷新账号列表")
+
+		return
+	}
+
+	p.finishClaimedLogin(r.Context(), w, state, sess.realm, tok, acct)
+}
+
+// finishClaimedLogin 落盘凭证并跑登录后置任务（会话已被独占认领）。
+func (p *Panel) finishClaimedLogin(
+	ctx context.Context, w http.ResponseWriter, state, realm string, tok loginToken, acct loginAccount,
+) {
+	account, status, msg := p.persistLoginAuth(realm, tok, acct)
 	if status != 0 {
 		// 非 200 会让前端停止轮询；会话不清掉就得等 TTL 或下次 login/start 才回收。
 		p.dropLoginSession(state)
@@ -423,7 +498,22 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.finishLoginPoll(r.Context(), w, state, sess.realm, account, acct)
+	p.finishLoginPoll(ctx, w, state, realm, account, acct)
+}
+
+// claimLoginSession 独占认领一次已完成的登录（取号成功后、落盘前）。
+// 返回 false 表示会话已被另一并发请求认领或已回收。
+func (p *Panel) claimLoginSession(state string) bool {
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+
+	if _, known := p.logins[state]; !known {
+		return false
+	}
+
+	delete(p.logins, state)
+
+	return true
 }
 
 // dropLoginSession 移除登录会话（成功、终态失败共用）；幂等。
@@ -456,9 +546,9 @@ func (p *Panel) finishLoginPoll(
 // pollLoginAccount 取账号信息并回写 pending / 终态响应；返回值 ok=false 表示
 // 本轮轮询已处理完毕，调用方应直接返回。其他错误保持忽略（由 uid 校验兜底）。
 func (p *Panel) pollLoginAccount(
-	w http.ResponseWriter, endpoint *loginEndpoint, state, bearer string,
+	ctx context.Context, w http.ResponseWriter, endpoint *loginEndpoint, state, bearer string,
 ) (loginAccount, bool) {
-	acct, err := p.fetchLoginAccount(endpoint, state, bearer)
+	acct, err := p.fetchLoginAccount(ctx, endpoint, state, bearer)
 	if err == nil {
 		return acct, true
 	}
@@ -515,7 +605,7 @@ func writeLoginPollError(w http.ResponseWriter, err error) {
 // 就绪返回 pending=true 并带回上游 code/msg；成功返回解析后的凭证与命中的 origin
 // （account 端点同源）。
 func (p *Panel) pollLoginToken(
-	realm, preferredBase, state string,
+	ctx context.Context, realm, preferredBase, state string,
 ) (loginToken, loginPendingInfo, bool, loginEndpoint, error) {
 	identity := p.loginIdentityFor(realm)
 	if identity.userAgent == "" {
@@ -525,7 +615,7 @@ func (p *Panel) pollLoginToken(
 	var lastErr error
 
 	for _, endpoint := range loginCandidatesPreferWithIdentity(realm, preferredBase, identity) {
-		tok, pendingInfo, pending, status, err := requestLoginToken(&endpoint, state)
+		tok, pendingInfo, pending, status, err := requestLoginToken(ctx, &endpoint, state)
 		if err == nil {
 			return tok, pendingInfo, pending, endpoint, nil
 		}
@@ -544,9 +634,11 @@ func (p *Panel) pollLoginToken(
 // requestLoginToken 请求单个 origin 的 token 端点：pending 业务码与空 token 都归一为
 // pending=true 且 err=nil；pending 业务码同时带回 code/msg 供日志使用。许可终态与其他
 // 错误原样返回给调用方决定是否换 origin。
-func requestLoginToken(endpoint *loginEndpoint, state string) (loginToken, loginPendingInfo, bool, int, error) {
+func requestLoginToken(
+	ctx context.Context, endpoint *loginEndpoint, state string,
+) (loginToken, loginPendingInfo, bool, int, error) {
 	tokRaw, status, err := doJSON(
-		http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
+		ctx, http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
 	)
 	if err != nil {
 		if codeErr, ok := errors.AsType[*logincode.Error](err); ok && logincode.IsPending(codeErr.Code) {
@@ -558,7 +650,7 @@ func requestLoginToken(endpoint *loginEndpoint, state string) (loginToken, login
 
 	var tok loginToken
 
-	if err := json.Unmarshal(tokRaw, &tok); err != nil {
+	if err := jsonx.Unmarshal(tokRaw, &tok); err != nil {
 		log.Printf("WARN: [panel] 登录 token 响应解析失败（按未完成继续轮询）: %v", err)
 	}
 
@@ -619,17 +711,19 @@ func loginTokenTerminal(err error) bool {
 }
 
 // fetchLoginAccount 取 uid/nickname；失败返回错误，由 loginPoll 区分 pending / 终态 / 忽略。
-func (*Panel) fetchLoginAccount(endpoint *loginEndpoint, state, bearer string) (loginAccount, error) {
+func (*Panel) fetchLoginAccount(
+	ctx context.Context, endpoint *loginEndpoint, state, bearer string,
+) (loginAccount, error) {
 	var acct loginAccount
 
 	acctRaw, _, err := doJSON(
-		http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent,
+		ctx, http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent,
 	)
 	if err != nil {
 		return loginAccount{}, err
 	}
 
-	if err := json.Unmarshal(acctRaw, &acct); err != nil {
+	if err := jsonx.Unmarshal(acctRaw, &acct); err != nil {
 		return loginAccount{}, fmt.Errorf("parse account: %w", err)
 	}
 
@@ -657,7 +751,7 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 	account := &auth.Auth{
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
-		ExpiresAt:    time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix(),
+		ExpiresAt:    time.Now().Add(loginExpiry(tok.ExpiresIn)).Unix(),
 		Domain:       tok.Domain,
 		UID:          acct.UID,
 		EnterpriseID: acct.EnterpriseID,
@@ -673,6 +767,13 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 	} else {
 		// CN 也显式补 realm 键（幂等），让 auth 文件形态统一（与 LoadDir 存量迁移对齐）。
 		_, _ = account.BackfillRealm()
+	}
+
+	// 同一 uid 重新登录：先退役旧实例再落盘。锁是按实例私有的，旧实例此刻尚未被
+	// Pool.Add 替换，其进行中的 refresh 可以 SaveAtomic 把**旧** token 写回同一路径，
+	// 结果内存是新凭证、磁盘是旧凭证，重启后旧凭证复活。
+	if prev := p.cfg.Pool.AuthByUID(acct.UID); prev != nil {
+		prev.Retire()
 	}
 
 	if err := account.SaveAtomic(); err != nil {
@@ -698,8 +799,13 @@ func (p *Panel) postLoginTasks(
 		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
 		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
 		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
-		if err := p.cfg.Upstream.DailyCheckin(ctx, account2); err != nil {
+		//
+		// 走回执口径（而非旧的 DailyCheckin）：旧入口把「2xx 但回执读不出来」也算成功，
+		// 登录返回会显示「签到成功」而账号当天实际没签；回执把这类形态判 failed。
+		if receipt, err := p.cfg.Upstream.DailyCheckinReceipt(ctx, account2); err != nil {
 			checkinMsg = err.Error()
+		} else if receipt.State == upstream.CheckinStateFailed {
+			checkinMsg = receipt.Message
 		}
 	}
 

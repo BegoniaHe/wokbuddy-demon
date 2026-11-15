@@ -1,12 +1,12 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -86,7 +86,7 @@ func TestUnknownPathReturnsOpenAIError(t *testing.T) {
 				Type    string `json:"type"`
 			} `json:"error"`
 		}
-		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatalf("%s %s: not json: %v (body=%q)", testCase.method, testCase.path, err, rec.Body.String())
 		}
 

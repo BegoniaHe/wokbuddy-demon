@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 const (
@@ -248,7 +248,7 @@ func TestPrepareBodyOptSanitizesSystem(t *testing.T) {
 	out := PrepareBodyOpt(body, true)
 
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatal(err)
 	}
 
@@ -280,7 +280,7 @@ func TestPrepareBodyOptDisabledPreservesFingerprints(t *testing.T) {
 	// 但 stream 仍强制
 	var obj map[string]any
 
-	_ = json.Unmarshal(out, &obj)
+	_ = jsonx.Unmarshal(out, &obj)
 	if obj["stream"] != true {
 		t.Error("stream should still be forced")
 	}
@@ -332,7 +332,7 @@ func TestChatStreamWireBodySanitized(t *testing.T) {
 	}
 	// 上游收到的 body：stream 强制 + 指纹已净化
 	var obj map[string]any
-	if err := json.Unmarshal(gotBody, &obj); err != nil {
+	if err := jsonx.Unmarshal(gotBody, &obj); err != nil {
 		t.Fatalf("wire body not json: %v", err)
 	}
 
@@ -383,7 +383,7 @@ func TestChatStreamWireBodyCodexInstructionsSanitized(t *testing.T) {
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal(gotBody, &obj); err != nil {
+	if err := jsonx.Unmarshal(gotBody, &obj); err != nil {
 		t.Fatalf("wire body not json: %v", err)
 	}
 
@@ -592,7 +592,7 @@ func TestChatStreamWireBodyDshAtPathSegmentSanitized(t *testing.T) {
 	client.ChatBaseCN = server.URL
 	acct := &auth.Auth{AccessToken: "test-token", Domain: "copilot.tencent.com", UID: "u1"}
 
-	raw, err := json.Marshal(map[string]any{
+	raw, err := jsonx.Marshal(map[string]any{
 		"model": "hy3",
 		"messages": []any{
 			map[string]any{"role": "system", "content": dshAtPathNow},
@@ -630,7 +630,7 @@ func TestChatStreamWireBodyDshAtPathSegmentSanitized(t *testing.T) {
 func TestToolArgumentsJSONStaysValid(t *testing.T) {
 	t.Parallel()
 
-	args, err := json.Marshal(map[string]any{
+	args, err := jsonx.Marshal(map[string]any{
 		"curl": "-H \"" + ccHeader + "\"",
 		"cmd":  "cc_version=2.1.0 cc_entrypoint=cli",
 		"x":    1,
@@ -656,7 +656,7 @@ func TestToolArgumentsJSONStaysValid(t *testing.T) {
 	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	got := fn["arguments"].(string)
 
-	if !json.Valid([]byte(got)) {
+	if !jsonx.Valid([]byte(got)) {
 		t.Fatalf("净化后 arguments 不是合法 JSON: %q", got)
 	}
 
@@ -665,7 +665,7 @@ func TestToolArgumentsJSONStaysValid(t *testing.T) {
 	}
 	// 值被删空但键与尾部内容必须还在（旧实现会吞掉 `","x":1...`）。
 	var decoded map[string]any
-	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+	if err := jsonx.Unmarshal([]byte(got), &decoded); err != nil {
 		t.Fatalf("解码失败: %v", err)
 	}
 
@@ -680,7 +680,7 @@ func TestSanitizeJSONStringEscapedQuote(t *testing.T) {
 	t.Parallel()
 
 	raw := `{"curl":"-H \"` + ccHeader + `\"","x":1}`
-	if !json.Valid([]byte(raw)) {
+	if !jsonx.Valid([]byte(raw)) {
 		t.Fatalf("用例本身不是合法 JSON: %q", raw)
 	}
 
@@ -689,7 +689,7 @@ func TestSanitizeJSONStringEscapedQuote(t *testing.T) {
 		t.Fatal("未检测到指纹")
 	}
 
-	if !json.Valid([]byte(out)) {
+	if !jsonx.Valid([]byte(out)) {
 		t.Fatalf("产物不是合法 JSON: %q", out)
 	}
 
@@ -723,7 +723,7 @@ func TestSanitizeJSONStringFallbackPreservesValues(t *testing.T) {
 	raw := `{"text":"` + sanitizeDshPathsProbe + ` are paths the user explicitly referenced. ` +
 		`See path containing spaces.",` +
 		`"big":12345678901234567890,"html":"<b>&</b>","nested":{"id":12345678901234567890}}`
-	if !json.Valid([]byte(raw)) {
+	if !jsonx.Valid([]byte(raw)) {
 		t.Fatalf("用例本身不是合法 JSON: %q", raw)
 	}
 
@@ -732,7 +732,7 @@ func TestSanitizeJSONStringFallbackPreservesValues(t *testing.T) {
 		t.Fatal("未检测到指纹")
 	}
 
-	if !json.Valid([]byte(out)) {
+	if !jsonx.Valid([]byte(out)) {
 		t.Fatalf("产物不是合法 JSON: %q", out)
 	}
 

@@ -13,12 +13,15 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"math/rand/v2"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // UUID version/variant 位掩码（RFC 4122）。
@@ -216,7 +219,7 @@ func TurnKey(body []byte) string {
 	var obj struct {
 		Messages []turnMessage `json:"messages"`
 	}
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonx.Unmarshal(body, &obj); err != nil {
 		return ""
 	}
 
@@ -232,7 +235,7 @@ func TurnKey(body []byte) string {
 			return ""
 		}
 
-		return fmt.Sprintf("u%d:%s", i, sig)
+		return "u" + strconv.Itoa(i) + ":" + sig
 	}
 
 	return ""
@@ -258,7 +261,7 @@ func contentSignature(raw []byte) string {
 	// 字符串形态：纯文本路径签名 == contentText 结果（键值零漂移）。
 	if trimmed[0] == '"' {
 		var str string
-		if err := json.Unmarshal(trimmed, &str); err != nil {
+		if err := jsonx.Unmarshal(trimmed, &str); err != nil {
 			return ""
 		}
 
@@ -269,7 +272,7 @@ func contentSignature(raw []byte) string {
 		return ""
 	}
 	// 非文本 part：type + 原文 sha256 前 8 hex（超长 data: URL 只入短摘要）。
-	return partsSignature(json.RawMessage(trimmed), func(typeName string, rawPart json.RawMessage) string {
+	return partsSignature(jsontext.Value(trimmed), func(typeName string, rawPart jsontext.Value) string {
 		sum := sha256.Sum256(rawPart)
 		return "\n[" + typeName + ":" + hex.EncodeToString(sum[:4]) + "]\n"
 	})
@@ -281,10 +284,10 @@ func contentSignature(raw []byte) string {
 // 见 contentSignature / userContentSignatureRaw）。存在非文本 part 时对整体结果
 // TrimSpace。json 解析失败返回 ""（不伪造）。
 func partsSignature(
-	raw json.RawMessage, renderNonText func(typeName string, rawPart json.RawMessage) string,
+	raw jsontext.Value, renderNonText func(typeName string, rawPart jsontext.Value) string,
 ) string {
-	var parts []json.RawMessage
-	if err := json.Unmarshal(raw, &parts); err != nil {
+	var parts []jsontext.Value
+	if err := jsonx.Unmarshal(raw, &parts); err != nil {
 		return ""
 	}
 
@@ -297,7 +300,7 @@ func partsSignature(
 			Type string `json:"type"`
 			Text string `json:"text"`
 		}
-		if err := json.Unmarshal(item2, &item); err != nil {
+		if err := jsonx.Unmarshal(item2, &item); err != nil {
 			return ""
 		}
 

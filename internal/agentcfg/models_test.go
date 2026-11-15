@@ -1,13 +1,14 @@
 package agentcfg
 
 import (
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // applyBytes 直接跑单家客户端的 apply，便于断言生成文本（不经 Manager 的备份逻辑）。
@@ -52,7 +53,7 @@ func TestModelListEmptyKeepsSingleModel(t *testing.T) {
 		} `json:"provider"`
 	}
 
-	if err := json.Unmarshal(out, &doc); err != nil {
+	if err := jsonx.Unmarshal(out, &doc); err != nil {
 		t.Fatal(err)
 	}
 
@@ -242,7 +243,7 @@ func TestApplyOpenCodeWritesAllModels(t *testing.T) {
 		} `json:"provider"`
 	}
 
-	if err := json.Unmarshal(out, &doc); err != nil {
+	if err := jsonx.Unmarshal(out, &doc); err != nil {
 		t.Fatalf("输出不是合法 JSON: %v", err)
 	}
 
@@ -277,7 +278,7 @@ func TestApplyClaudeUsesFirstModel(t *testing.T) {
 		Env map[string]string `json:"env"`
 	}
 
-	if err := json.Unmarshal(out, &doc); err != nil {
+	if err := jsonx.Unmarshal(out, &doc); err != nil {
 		t.Fatal(err)
 	}
 

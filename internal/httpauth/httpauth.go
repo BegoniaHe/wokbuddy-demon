@@ -12,9 +12,6 @@ import (
 	"strings"
 )
 
-// bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
-const bearerPrefix = "Bearer "
-
 // Key 一把命名密钥的最小校验视图：ID 用于回执与计数，Hash 是密钥的 SHA-256
 // 摘要（定长 32 字节，多候选比较因此天然常量时间）。
 type Key struct {
@@ -161,10 +158,18 @@ func managementCredentials(defaultKey, adminKey, readonlyKey string) []managemen
 // bearerToken 从 Authorization 头提取 Bearer token；缺头或方案不符时回退到
 // Anthropic 客户端使用的 X-Api-Key 头。两者都缺失返回空串（调用方仍会摘要后
 // 参与比较，保持耗时形状一致）。
+//
+// scheme 大小写不敏感，且 scheme 与凭据之间允许一个或多个空格（RFC 7235 §2.1
+// 明确规定 scheme 名大小写不敏感，credentials 语法是 `auth-scheme [ 1*SP ... ]`）。
+// 原先按 "Bearer " 精确前缀匹配：`bearer xxx` 直接判成未提供凭据，`Bearer  xxx`
+// （两个空格）会把前导空格算进 token 里摘要，两者都是合法请求却必然 401。
 func bearerToken(r *http.Request) string {
-	authz := r.Header.Get("Authorization")
-	if strings.HasPrefix(authz, bearerPrefix) {
-		return authz[len(bearerPrefix):]
+	if authz := r.Header.Get("Authorization"); authz != "" {
+		if scheme, rest, ok := strings.Cut(authz, " "); ok && strings.EqualFold(scheme, "Bearer") {
+			if token := strings.TrimSpace(rest); token != "" {
+				return token
+			}
+		}
 	}
 
 	// Anthropic SDK 在 api_key 模式下只发 x-api-key；Gemini CLI/SDK 发

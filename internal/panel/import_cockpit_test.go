@@ -2,7 +2,6 @@ package panel
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -59,7 +59,7 @@ func cockpitAccountsJSON(t *testing.T, n int) []byte {
 		})
 	}
 
-	raw, err := json.Marshal(accounts)
+	raw, err := jsonx.Marshal(accounts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func decodeCockpitResp(t *testing.T, rec *httptest.ResponseRecorder) cockpitImpo
 	}
 
 	var resp cockpitImportResp
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -274,7 +274,7 @@ func TestCockpitImportBoundedConcurrency(t *testing.T) {
 func enterprisePayload(t *testing.T, enterpriseIDKey string) []byte {
 	t.Helper()
 
-	raw, err := json.Marshal([]map[string]any{{
+	raw, err := jsonx.Marshal([]map[string]any{{
 		"id":            "ent",
 		"uid":           "u-ent",
 		"access_token":  "at-ent",

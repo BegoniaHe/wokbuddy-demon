@@ -35,6 +35,10 @@ export interface Account {
   reason?: string;
   credits?: number;
   credits_total?: number;
+  // paid_user 上游 summary 的 IsPaidUser 观测（issue #529）：true 付费、false 免费、
+  // null / 缺省 = 未知（字段缺失 / 企业口径 / 尚未刷新）。
+  paid_user?: boolean | null;
+  paid_observed?: string;
   success_count?: number;
   err_total?: number;
   session_dead_fails?: number;

@@ -1,9 +1,10 @@
 package upstream
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // extractCacheKey 从改写后的 body 里取出 prompt_cache_key 字段值。
@@ -11,7 +12,7 @@ func extractCacheKey(t *testing.T, body []byte) string {
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
+	if err := jsonx.Unmarshal(body, &obj); err != nil {
 		t.Fatalf("unmarshal body: %v", err)
 	}
 
@@ -174,7 +175,7 @@ func TestPrepareBodyOptNoCacheKeyInjection(t *testing.T) {
 	out := PrepareBodyOpt([]byte(in), false)
 
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 

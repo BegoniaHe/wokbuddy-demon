@@ -1,9 +1,10 @@
 package upstream
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // buildLargeBody 构造接近真实量级的 chat body（约 124KB：tools + 长 system + 20 轮消息）。
@@ -34,7 +35,7 @@ func buildLargeBody(b *testing.B) []byte {
 		})
 	}
 
-	raw, err := json.Marshal(map[string]any{"model": "glm-5.2", "messages": msgs, "tools": tools})
+	raw, err := jsonx.Marshal(map[string]any{"model": "glm-5.2", "messages": msgs, "tools": tools})
 	if err != nil {
 		b.Fatal(err)
 	}

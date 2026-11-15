@@ -1,7 +1,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -9,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestAuditAppendAndRecent(t *testing.T) {
@@ -41,14 +42,14 @@ func TestAuditAppendAndRecent(t *testing.T) {
 func TestAuditMaxLineIsReadable(t *testing.T) {
 	t.Parallel()
 
-	base, err := json.Marshal(&auditEntry{Method: "POST", Path: "/panel/api/x", Time: time.Unix(0, 0).UTC().Format(time.RFC3339)})
+	base, err := jsonx.Marshal(&auditEntry{Method: "POST", Path: "/panel/api/x", Time: time.Unix(0, 0).UTC().Format(time.RFC3339)})
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	path := "/panel/api/" + strings.Repeat("a", auditMaxLineBytes-len(base))
 
-	line, err := json.Marshal(&auditEntry{Method: "POST", Path: path, Time: time.Unix(0, 0).UTC().Format(time.RFC3339)})
+	line, err := jsonx.Marshal(&auditEntry{Method: "POST", Path: path, Time: time.Unix(0, 0).UTC().Format(time.RFC3339)})
 	if err != nil {
 		t.Fatal(err)
 	}

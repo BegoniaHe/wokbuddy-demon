@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -52,7 +52,7 @@ func decodeBusy(t *testing.T, rec *httptest.ResponseRecorder) busyTestResponse {
 	t.Helper()
 
 	var out busyTestResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("parse %s: %v", rec.Body, err)
 	}
 
@@ -93,7 +93,7 @@ func TestBusyModelLimit(t *testing.T) {
 		models[i] = "glm-5.2"
 	}
 
-	body, err := json.Marshal(map[string]any{"models": models})
+	body, err := jsonx.Marshal(map[string]any{"models": models})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -111,7 +111,7 @@ func TestBusyModelLimit(t *testing.T) {
 	over = append(over, models...)
 	over = append(over, "glm-5.2")
 
-	body, err = json.Marshal(map[string]any{"models": over})
+	body, err = jsonx.Marshal(map[string]any{"models": over})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestBusyKeyRealmMismatchUnknown(t *testing.T) {
 
 	handler, _ := newBusyTestHandler(t)
 
-	level := handler.modelBusyLevel("cn:glm-5.2", nil, "global")
+	level := handler.modelBusyLevel("cn:glm-5.2", nil, "global", handler.aliasResolver("global"), handler.modelKnownSet())
 	if level != "unknown" {
 		t.Fatalf("level=%q want unknown", level)
 	}

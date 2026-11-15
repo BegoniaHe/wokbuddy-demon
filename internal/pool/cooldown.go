@@ -44,7 +44,9 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 	auth := entry2.a
 	auth.Lock()
 
-	changed := auth.Nickname != nickname
+	prevName := auth.Nickname
+
+	changed := prevName != nickname
 	if changed {
 		auth.Nickname = nickname
 	}
@@ -55,7 +57,17 @@ func (p *Pool) SetNickname(uid, nickname string) bool {
 	}
 
 	if err := auth.SaveAtomic(); err != nil {
+		// 写回失败要回滚内存昵称：否则面板/status 显示新名字、磁盘凭证仍是旧名，
+		// 重启后又「变回」旧名，而调用方只看到 false。回滚前再确认一次当前值仍是
+		// 本次写入的名字，避免覆盖并发写入的另一轮改名。
+		auth.Lock()
+		if auth.Nickname == nickname {
+			auth.Nickname = prevName
+		}
+		auth.Unlock()
+
 		log.Printf("WARN: [pool] nickname save %s: %v", uid, err)
+
 		return false
 	}
 
@@ -104,6 +116,29 @@ func (p *Pool) SetCreditsDetailed(
 	// 留下的批次，否则面板会把新余额/新最早批次与旧批次并排展示（快照与「检查」口径分裂）。
 	// 生产路径（签到 / 单号刷新 / 后台刷新）统一走 SetCreditsSnapshot 保留完整批次。
 	entry2.creditsExpiryBuckets = nil
+
+	p.dirty.Store(true)
+}
+
+// SetPaidStatus 记录一次上游 summary 的付费状态观测（issue #529）：true 付费、
+// false 免费、nil 未知（字段缺失 / 企业口径）。观测时刻随写，nil 不回落成免费。
+func (p *Pool) SetPaidStatus(uid string, paid *bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entry2, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+
+	if paid == nil {
+		entry2.paidUser = nil
+	} else {
+		v := *paid
+		entry2.paidUser = &v
+	}
+
+	entry2.paidObserved = p.now()
 
 	p.dirty.Store(true)
 }
@@ -226,9 +261,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 	defer p.mu.Unlock()
 
 	if entry2, ok := p.byUID[uid]; ok {
-		entry2.until = p.now().Add(d)
-		entry2.coolKind = kind
-		entry2.reason = reason
+		entry2.applyUntilLocked(p.now().Add(d), kind, reason)
 		// 非模型级冷却入口：清空会参与路由的模型级冷却，避免上一次
 		// 模型豁免泄漏到账号级冷却上；AuditOnly 条目不影响路由，保留展示。
 		clearRoutingModelCooldownsLocked(entry2)
@@ -592,8 +625,10 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 		return ModelBlockStatus{}
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// 只读遍历：函数体不改 entry、不改 map（mergeModelCooldown 只写局部 status）。
+	// 这里此前用独占锁，落在每个请求失败后的热路径上，与 pick 的写锁正面争抢。
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
 	now := p.now()
 
@@ -698,17 +733,22 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 func (p *Pool) cooldownSoftRateLocked(
 	entry2 *entry, now time.Time, base time.Duration, resetAt time.Time, reason string,
 ) {
+	until := time.Time{}
 	if !resetAt.IsZero() {
-		entry2.until = p.cappedSoftUntilLocked(now, resetAt)
+		until = p.cappedSoftUntilLocked(now, resetAt)
 	} else if entry2.coolKind != CoolSoft || !now.Before(entry2.until) {
 		// 新限流（不在有效软冷却中）：推进有界退避；兜底探测（仍在软冷却中）不翻倍。
 		d := p.jitterSoftDurationLocked(base, entry2.softStreak+1)
 		entry2.softStreak++
-		entry2.until = now.Add(d)
+		until = now.Add(d)
 	}
 
-	entry2.coolKind = CoolSoft
-	entry2.reason = reason
+	// 短软冷却不得覆盖更长的硬冷却（见 entry.applyUntilLocked）：只有更晚的截止
+	// 才改 until/coolKind，否则 hardCoolingActive 会失效、兜底选号会放出零余额账号。
+	if !until.IsZero() {
+		entry2.applyUntilLocked(until, CoolSoft, reason)
+	}
+
 	clearRoutingModelCooldownsLocked(entry2) // 账号级软冷却：清路由豁免，保留审计台账
 }
 

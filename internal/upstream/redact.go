@@ -52,15 +52,11 @@ func RedactForLog(s string, limit int) string {
 	return clean
 }
 
-// sanitizeLogLine 把换行/制表符与其他控制字符压成空格，避免日志注入与多行伪造。
+// sanitizeLogLine 把换行/制表符/控制字符/Unicode 行分隔符压成空格，避免日志注入
+// 与多行伪造。判定口径与 logfmt.Label 共用 logfmt.SanitizeLine：两处各写一份时
+// 总会有一处漏掉新的绕过字符（如 ANSI 的 ESC 与 U+2028）。
 func sanitizeLogLine(str2 string) string {
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return ' '
-		}
-
-		return r
-	}, str2)
+	return logfmt.SanitizeLine(str2)
 }
 
 // redactHighEntropy 只替换明显像 token 的长串：同时含大小写与数字，或含

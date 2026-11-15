@@ -113,6 +113,9 @@ type upstreamHealth struct {
 	warned   map[string]time.Time
 	nowFn    func() time.Time
 	logger   *log.Logger
+	// overflowOnce 键满（healthMaxKeys）告警只打一次：滑窗是有界观测，键溢出
+	// 需要运维知道，但不该每个请求刷一行日志。
+	overflowOnce sync.Once
 }
 
 // newUpstreamHealth 构造滑窗；window<=0 表示关闭（零行为差异）。
@@ -204,6 +207,13 @@ func (u *upstreamHealth) withBucketLocked(key string, now time.Time, update func
 	series := u.series[key]
 	if series == nil {
 		if len(u.series) >= healthMaxKeys {
+			// 键（realm|model）满额：此前静默 return，劣化观测对后来的模型完全失效
+			// 而运维毫无线索。只告警一次，行为仍保持有界（不扩容 map）。
+			u.overflowOnce.Do(func() {
+				log.Printf("WARN: [server] upstream health: 观测键已达上限 %d，"+
+					"新模型不再计入劣化滑窗（缩小模型数或调大 healthMaxKeys）", healthMaxKeys)
+			})
+
 			return
 		}
 
@@ -285,11 +295,11 @@ type UpstreamHealthRow struct {
 // UpstreamHealthSnapshot 面板 overview 暴露的滑窗快照。
 type UpstreamHealthSnapshot struct {
 	Enabled bool   `json:"enabled"`
-	Window  string `json:"window,omitempty"`
+	Window  string `json:"window,omitempty,omitzero"`
 	// TTFBThresholdMs 与 ErrorRatioThreshold/MinSamples 是当前生效阈值。
-	TTFBThresholdMs     int64   `json:"ttfb_threshold_ms,omitempty"`
-	ErrorRatioThreshold float64 `json:"error_ratio_threshold,omitempty"`
-	MinSamples          int     `json:"min_samples,omitempty"`
+	TTFBThresholdMs     int64   `json:"ttfb_threshold_ms,omitempty,omitzero"`
+	ErrorRatioThreshold float64 `json:"error_ratio_threshold,omitempty,omitzero"`
+	MinSamples          int     `json:"min_samples,omitempty,omitzero"`
 	// Rows 全局行在前，其余按 (域, 模型) 排序。
 	Rows []UpstreamHealthRow `json:"rows"`
 }

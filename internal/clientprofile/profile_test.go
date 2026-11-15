@@ -1,12 +1,13 @@
 package clientprofile
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func validProfile(realm string) *Profile {
@@ -57,7 +58,7 @@ func validProfile(realm string) *Profile {
 func writeProfile(t *testing.T, dir, name string, profile *Profile) string {
 	t.Helper()
 
-	raw, err := json.Marshal(profile)
+	raw, err := jsonx.Marshal(profile)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -223,7 +224,7 @@ func TestValidateTrafficEvidenceByNote(t *testing.T) {
 func TestLoadFileRejectsUnknownField(t *testing.T) {
 	t.Parallel()
 
-	raw, err := json.Marshal(validProfile("cn"))
+	raw, err := jsonx.Marshal(validProfile("cn"))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -319,9 +320,9 @@ func validTLS() *TLS {
 		CipherSuites:        []uint16{4865, 4866, 4867},
 		Extensions:          []uint16{0, 23, 65281, 10, 11, 35, 13, 51, 45, 43, 21},
 		Groups:              []uint16{29, 23, 24},
-		PointFormats:        []uint8{0},
+		PointFormats:        byteList{0},
 		SignatureAlgorithms: []uint16{1027, 2052},
-		PSKModes:            []uint8{1},
+		PSKModes:            byteList{1},
 	}
 }
 
@@ -387,5 +388,29 @@ func TestLoadDirRejectsRealmTLSDiff(t *testing.T) {
 
 	if _, err := LoadDir(dir); err != nil {
 		t.Fatalf("相同 tls 段应合法: %v", err)
+	}
+}
+
+// TestLoadDirSkipsUnknownJSON 目录里的无关 json（macOS 资源叉、手工说明、缓存）
+// 不该让进程拒绝启动；只有 cn.json / global.json 解析失败才 fail fast。
+func TestLoadDirSkipsUnknownJSON(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeProfile(t, dir, "cn.json", validProfile("cn"))
+
+	for _, name := range []string{"._cn.json", "readme.json", "models-cache.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("not a profile"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	set, err := LoadDir(dir)
+	if err != nil {
+		t.Fatalf("无关 json 不应导致启动失败: %v", err)
+	}
+
+	if set.ForRealm("cn") == nil {
+		t.Fatal("cn profile 应正常加载")
 	}
 }

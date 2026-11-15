@@ -404,6 +404,20 @@ func (p *Pool) AuthByUID(uid string) *auth.Auth {
 	return nil
 }
 
+// RealmOf 只返回账号的归一化域（cn/global），不构建 Status。
+// 请求热路径（逐 attempt 记账）只需要域一个字段，Status 会额外分配
+// 限流模型切片与成本状态切片，并构造整份结构。
+func (p *Pool) RealmOf(uid string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if e, ok := p.byUID[uid]; ok {
+		return e.a.Realm()
+	}
+
+	return ""
+}
+
 // AvailableUIDs 返回当前 healthy 且未占满在途名额的账号 UID 列表（按 UID 排序，稳定输出）。
 // 供会话粘性路由（internal/session）做快路径命中校验 + 双段分配；无可用返回空切片。
 func (p *Pool) AvailableUIDs() []string {
@@ -648,38 +662,32 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		CreditsEarliestExpiry:    entry2.creditsEarliestExpiry,
 		CreditsEarliestRemaining: entry2.creditsEarliestRemaining,
 		CreditsExpiryBuckets:     entry2.creditsExpiryBuckets,
-		Cooling:                  now.Before(entry2.until) || now.Before(entry2.breakerUntil),
-		Disabled:                 entry2.disabled,
-		Paused:                   entry2.paused,
-		SuccessCount:             entry2.successCount,
-		ErrTotal:                 entry2.errTotal,
-		CheckinDone:              entry2.lastCheckinDay == cst.Day(now),
-		TokenUsage:               entry2.tokenUsage,
-		LastSuccessTime:          entry2.lastSuccess,
-		LastErrTime:              entry2.lastErr,
-		Until:                    entry2.until,
-		SoftStreak:               entry2.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(entry2, now),
-		ConsecutiveFails:         entry2.consecutiveFails,
-		DegradeUntil:             entry2.degradeUntil,
-		SessionDeadFails:         entry2.sessionDeadFails,
-		SessionDeadSuspect:       entry2.sessionDeadFails > 0 && !entry2.disabled,
-		InFlight:                 int(entry2.inFlight.Load()),
-		BreakerFails:             entry2.fails,
-		BreakerUntil:             entry2.breakerUntil,
-	}
-	// Reason 只在「冷却中 / 已禁用」时透出：until/coolKind/reason 按设计不主动清理
-	// （NoteSuccess 注释：「不碰 until/coolKind，那些是即时冷却，各自到期」），无条件
-	// 透出会让面板把过期数天的「429 rate limit」与「可用」并排展示，运维无法判断
-	// 是历史残留还是当前限流。禁用原因另由 DisabledReason 透出（零回归）。
-	if status.Cooling || status.Disabled {
-		status.Reason = entry2.reason
+		// 与 entry.healthy 同口径（含连败降权 degradeUntil）：否则降权中的账号在
+		// /status 显示「不冷却、可选中」，却被计进 cooling 且不参与选号。
+		Cooling:            entry2.coolingActive(now),
+		Disabled:           entry2.disabled,
+		Paused:             entry2.paused,
+		SuccessCount:       entry2.successCount,
+		ErrTotal:           entry2.errTotal,
+		CheckinDone:        entry2.lastCheckinDay == cst.Day(now),
+		TokenUsage:         entry2.tokenUsage,
+		LastSuccessTime:    entry2.lastSuccess,
+		LastErrTime:        entry2.lastErr,
+		Until:              entry2.until,
+		SoftStreak:         entry2.softStreak,
+		ModelCosts:         p.modelCostsStatusLocked(entry2, now),
+		ConsecutiveFails:   entry2.consecutiveFails,
+		DegradeUntil:       entry2.degradeUntil,
+		SessionDeadFails:   entry2.sessionDeadFails,
+		SessionDeadSuspect: entry2.sessionDeadFails > 0 && !entry2.disabled,
+		InFlight:           int(entry2.inFlight.Load()),
+		BreakerFails:       entry2.fails,
+		BreakerUntil:       entry2.breakerUntil,
+		PaidObserved:       entry2.paidObserved,
 	}
 
-	if status.Disabled {
-		// 禁用账号透出禁用原因（运维看不到为什么死）。
-		status.DisabledReason = entry2.reason
-	}
+	fillPaidStatus(&status, entry2)
+	fillStatusReason(&status, entry2)
 
 	if status.Cooling {
 		fillCoolingStatus(&status, entry2, now)
@@ -688,21 +696,54 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 	return status
 }
 
+// fillPaidStatus 复制付费状态指针，避免调用方改动 Status 反写池内观测（issue #529）。
+func fillPaidStatus(status *Status, entry2 *entry) {
+	if entry2.paidUser == nil {
+		return
+	}
+
+	paid := *entry2.paidUser
+	status.PaidUser = &paid
+}
+
+// fillStatusReason 按「冷却中 / 已禁用」决定是否透出 reason 与禁用原因：
+// until/coolKind/reason 按设计不主动清理（NoteSuccess 注释：「不碰 until/coolKind，
+// 那些是即时冷却，各自到期」），无条件透出会让面板把过期数天的「429 rate limit」
+// 与「可用」并排展示，运维无法判断是历史残留还是当前限流。
+func fillStatusReason(status *Status, entry2 *entry) {
+	if status.Cooling || status.Disabled {
+		status.Reason = entry2.reason
+	}
+
+	if status.Disabled {
+		// 禁用账号透出禁用原因（运维看不到为什么死）。
+		status.DisabledReason = entry2.reason
+	}
+}
+
 // fillCoolingStatus 填充冷却剩余秒数（向上取整，避免 0 显示为已到期）与冷却类型。
 // 常规冷却（until）与熔断期（breakerUntil）可能只有其一在生效，取仍在未来且更晚
 // 截止的那个，避免仅熔断期时误报 0 / unknown。
 func fillCoolingStatus(status *Status, entry2 *entry, now time.Time) {
 	var remaining int64
 	if now.Before(entry2.until) {
-		if r := int64(time.Until(entry2.until).Seconds() + 0.999); r > remaining {
+		if r := int64(entry2.until.Sub(now).Seconds() + 0.999); r > remaining {
 			remaining = r
 		}
 	}
 
 	if now.Before(entry2.breakerUntil) {
-		if r := int64(time.Until(entry2.breakerUntil).Seconds() + 0.999); r > remaining {
+		if r := int64(entry2.breakerUntil.Sub(now).Seconds() + 0.999); r > remaining {
 			remaining = r
 			status.CoolKind = "breaker"
+		}
+	}
+
+	// 连败降权与冷却/熔断并列（见 entry.healthy）：取更晚者做剩余时长与类型。
+	if now.Before(entry2.degradeUntil) {
+		if r := int64(entry2.degradeUntil.Sub(now).Seconds() + 0.999); r > remaining {
+			remaining = r
+			status.CoolKind = "degrade"
 		}
 	}
 
@@ -784,7 +825,7 @@ func (*Pool) rateLimitedModelsLocked(entry4 *entry, now time.Time) []RateLimited
 				Reason:  modelCooldown2.Reason,
 				ResetAt: time.Time{},
 			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
+			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitzero），台账只显示真实恢复时刻。
 			if !modelCooldown2.ResetAt.IsZero() && !modelCooldown2.ResetAt.Equal(modelCooldown2.Until) {
 				row.ResetAt = modelCooldown2.ResetAt
 			}

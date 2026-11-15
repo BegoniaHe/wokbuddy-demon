@@ -18,10 +18,10 @@
 package upstream
 
 import (
-	"encoding/json"
 	"fmt"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // compensationStatusPath 补偿状态查询路径（与 ClaimCompensation 同域同头）。
@@ -58,7 +58,7 @@ func (c *Client) GetCompensationStatus(account *auth.Auth) (CompensationStatus, 
 	}
 
 	var status CompensationStatus
-	if err := json.Unmarshal(data, &status); err != nil {
+	if err := jsonx.Unmarshal(data, &status); err != nil {
 		return CompensationStatus{}, fmt.Errorf("compensation status parse: %w", err)
 	}
 

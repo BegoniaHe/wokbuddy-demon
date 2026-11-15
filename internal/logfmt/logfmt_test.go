@@ -107,3 +107,57 @@ func TestUID8(t *testing.T) {
 		}
 	}
 }
+
+// 昵称来自上游 JSON（不可信）：含换行就能在运行日志里伪造整行，过长会把一条
+// 日志撑成多行。Label 必须折叠控制字符并截断。
+func TestLabelSanitizesNickname(t *testing.T) {
+	t.Parallel()
+
+	got := Label("abcdef1234567890", "坏\r\n昵称\tX")
+	if strings.ContainsAny(got, "\r\n\t") {
+		t.Fatalf("Label=%q 仍含控制字符", got)
+	}
+
+	// \r 与 \n 各自折叠成一个空格。
+	if got != "坏  昵称 X(abcdef12)" {
+		t.Fatalf("Label=%q want %q", got, "坏  昵称 X(abcdef12)")
+	}
+
+	long := strings.Repeat("长", 100)
+	if got := Label("abcdef1234567890", long); len(got) > nickLabelMaxWidth+len("(abcdef12)") {
+		t.Fatalf("Label 未截断，len=%d", len(got))
+	}
+}
+
+// TestSanitizeLineDropsEscapes 行净化必须覆盖 ANSI 转义与 Unicode 行分隔符：
+// 只折叠 \r\n\t 时，昵称里的 ESC 序列可以清屏/伪造提示，U+2028 在部分查看器里
+// 同样按换行渲染。
+func TestSanitizeLineDropsEscapes(t *testing.T) {
+	t.Parallel()
+
+	got := SanitizeLine("a\x1b[2Jb\x07c\u2028d\u2029e\x7ff")
+
+	for _, bad := range []string{"\x1b", "\x07", "\u2028", "\u2029", "\x7f"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("净化后仍含 %q: %q", bad, got)
+		}
+	}
+
+	if !strings.HasPrefix(got, "a [2Jb c d e f") {
+		t.Fatalf("净化结果=%q", got)
+	}
+}
+
+// TestUID8RuneSafe 非 ASCII uid 不得切碎多字节 rune（日志行出现非法 UTF-8）。
+func TestUID8RuneSafe(t *testing.T) {
+	t.Parallel()
+
+	got := UID8("用户标识超过八字节")
+	if !utf8.ValidString(got) {
+		t.Fatalf("UID8=%q 不是合法 UTF-8", got)
+	}
+
+	if strings.ContainsRune(got, utf8.RuneError) {
+		t.Fatalf("UID8=%q 含替换字符", got)
+	}
+}

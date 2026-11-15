@@ -3,7 +3,6 @@ package scheduler
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -46,7 +46,7 @@ func (s *travelStub) handler() http.Handler {
 				LocationID int `json:"location_id"`
 			}
 
-			_ = json.NewDecoder(r.Body).Decode(&body)
+			_ = jsonx.UnmarshalRead(r.Body, &body)
 			s.location.Store(int64(body.LocationID))
 			w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
 		case "/activity/growth/buddy/travel/claim":
@@ -365,6 +365,23 @@ func TestRunTravelAdoptTriedExpiresNextDay(t *testing.T) {
 
 	if n := stub.firstCalls.Load(); n != 1 {
 		t.Errorf("first calls=%d want 1（跨日应重试）", n)
+	}
+}
+
+// TestMarkAdoptTriedPrunesOtherDays 领养台账只保留当日条目：map 无其它删除点，
+// 不清会随「账号数 × 天数」永久增长。
+func TestMarkAdoptTriedPrunesOtherDays(t *testing.T) {
+	t.Parallel()
+
+	scheduler := &Scheduler{adoptTried: map[string]string{"gone": "2000-01-01"}}
+	scheduler.markAdoptTried("u1")
+
+	if _, ok := scheduler.adoptTried["gone"]; ok {
+		t.Error("旧日条目应被清理")
+	}
+
+	if !scheduler.adoptTriedToday("u1") {
+		t.Error("当日条目应命中")
 	}
 }
 

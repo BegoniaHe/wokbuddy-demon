@@ -88,6 +88,12 @@ func buildProxyRegistry(cfg *Config) (*outbound.Registry, error) {
 func refreshProxySubscriptions(
 	cfgPath string, state *pool.Pool, client4 *upstream.Client,
 ) (int, error) {
+	// 与面板保存/恢复共用配置写锁：并发时两者各自 SetProxyRegistry +
+	// SetAccountRoute，后完成者生效；手动刷新若读到保存前的文件，运行中的出口会
+	// 退回旧配置，而面板显示「已保存」。顺带避免订阅被串行拉取两遍。
+	configWriteMu.Lock()
+	defer configWriteMu.Unlock()
+
 	cfg, err := Load(cfgPath)
 	if err != nil {
 		return 0, fmt.Errorf("读取配置失败: %w", err)

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestAnthropicToOpenAIRequest system/messages/tool_use/tool_result 映射。
@@ -45,7 +45,7 @@ func TestAnthropicToOpenAIRequest(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 
@@ -119,7 +119,7 @@ func TestAnthropicToolResultImage(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -157,7 +157,7 @@ func TestAnthropicToOpenAITools(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 
@@ -218,7 +218,7 @@ func TestAnthropicNonStreamResponse(t *testing.T) {
 	}
 
 	var msg map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &msg); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &msg); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 
@@ -351,7 +351,7 @@ func TestAnthropicCountTokens(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 
@@ -390,7 +390,7 @@ func TestAnthropicRequestDisableParallel(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -417,7 +417,7 @@ func TestAnthropicOutputConfig(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -514,7 +514,7 @@ func TestAnthropicAuthErrorShape(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("bad json: %v", err)
 	}
 

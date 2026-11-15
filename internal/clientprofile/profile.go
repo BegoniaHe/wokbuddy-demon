@@ -6,11 +6,11 @@
 package clientprofile
 
 import (
-	"bytes"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
+	"log"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -89,9 +90,9 @@ type Stainless struct {
 // Evidence 单个 surface 的来源证据。
 type Evidence struct {
 	Source  string `json:"source"`
-	File    string `json:"file,omitempty"`
-	Snippet string `json:"snippet,omitempty"`
-	Note    string `json:"note,omitempty"`
+	File    string `json:"file,omitempty,omitzero"`
+	Snippet string `json:"snippet,omitempty,omitzero"`
+	Note    string `json:"note,omitempty,omitzero"`
 }
 
 // Profile 一个 realm 的冻结快照。
@@ -103,7 +104,7 @@ type Profile struct {
 	Evidence map[string]Evidence `json:"evidence"`
 	// TLS 官方 ClientHello 参数（可选）。只有 upstream.tls_fingerprint=node 时必需；
 	// 两个已加载 realm 的该段必须逐字段相等（共享 Transport 无法按 realm 分流）。
-	TLS *TLS `json:"tls,omitempty"`
+	TLS *TLS `json:"tls,omitempty,omitzero"`
 }
 
 // TLS 官方 Node/BoringSSL ClientHello 的数值参数（#458）。顺序即线上顺序：
@@ -113,9 +114,52 @@ type TLS struct {
 	CipherSuites        []uint16 `json:"cipherSuites"`
 	Extensions          []uint16 `json:"extensions"`
 	Groups              []uint16 `json:"groups"`
-	PointFormats        []uint8  `json:"pointFormats"`
+	PointFormats        byteList `json:"pointFormats"`
 	SignatureAlgorithms []uint16 `json:"signatureAlgorithms"`
-	PSKModes            []uint8  `json:"pskModes"`
+	PSKModes            byteList `json:"pskModes"`
+}
+
+// byteList 是 JSON 数字数组形态的字节列表。
+//
+// encoding/json/v2 把 []byte 当作 base64 字符串，而官方 ClientHello 导出的是
+// 数字数组（[0]、[1]），故显式按数组语义编解码，避免把 TLS 参数读成 base64。
+type byteList []uint8
+
+// UnmarshalJSON 按数字数组解析，并校验落在 uint8 范围内。
+func (b *byteList) UnmarshalJSON(raw []byte) error {
+	var values []int
+	if err := jsonx.Unmarshal(raw, &values); err != nil {
+		return fmt.Errorf("byteList: %w", err)
+	}
+
+	out := make(byteList, len(values))
+
+	for i, value := range values {
+		if value < 0 || value > math.MaxUint8 {
+			return fmt.Errorf("byteList: 值 %d 超出 uint8 范围: %w", value, errInvalidProfile)
+		}
+
+		out[i] = uint8(value)
+	}
+
+	*b = out
+
+	return nil
+}
+
+// MarshalJSON 按数字数组输出（客户端指纹快照的既有格式）。
+func (b byteList) MarshalJSON() ([]byte, error) {
+	values := make([]int, len(b))
+	for i, value := range b {
+		values[i] = int(value)
+	}
+
+	out, err := jsonx.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("byteList: 编码数字数组: %w", err)
+	}
+
+	return out, nil
 }
 
 // Equal 判断两个 tls 段是否逐字段相等；nil 与 nil 相等。
@@ -172,6 +216,10 @@ func LoadDir(dir string) (*Set, error) {
 			continue
 		}
 
+		if !isProfileFileName(entry.Name()) {
+			continue
+		}
+
 		realm, profile, lerr := loadRealmFile(dir, entry.Name())
 		if lerr != nil {
 			return nil, lerr
@@ -213,6 +261,22 @@ func validateRealmTLSEquality(profiles map[string]*Profile) error {
 	return nil
 }
 
+// isProfileFileName 判断目录项是否是约定的 profile 文件名（cn.json / global.json）。
+//
+// 只认这两个名字：目录里常有 macOS 资源叉（._cn.json）、手工放的说明文件或缓存
+// 文件，它们不该让进程拒绝启动；只有这两个名字解析失败才 fail fast。
+func isProfileFileName(name string) bool {
+	if name == "cn.json" || name == "global.json" {
+		return true
+	}
+
+	if filepath.Ext(name) == ".json" {
+		log.Printf("WARN: [clientprofile] 忽略非 profile 文件 %s（只认 cn.json / global.json）", name)
+	}
+
+	return false
+}
+
 // loadRealmFile 读取并校验单个 realm 文件，返回文件名推导出的 realm。
 func loadRealmFile(dir, name string) (string, *Profile, error) {
 	realm := strings.TrimSuffix(name, ".json")
@@ -237,22 +301,25 @@ func loadRealmFile(dir, name string) (string, *Profile, error) {
 // LoadFile 读取并严格解析单个 profile 文件（拒绝未知字段与多段 JSON）。
 // 读取走 safefile：正文不是合法 JSON 时回落 <path>.bak（与 auth / state 同口径），
 // 但语义校验失败不回退，由调用方拒绝启动。
+//
+// 回退必须留痕：.bak 是**上一版**快照，静默使用等于让整个进程跑在过期指纹上
+// （UA / 版本 / commit 全部失真），正是本包要防的形态。用 ReadWithFallback 拿到
+// 来源标记，与 auth 的 loadAuthFile 同口径。
 func LoadFile(path string) (*Profile, error) {
-	raw, err := safefile.Read(path, nil)
+	raw, restored, err := safefile.ReadWithFallback(path, nil)
 	if err != nil {
 		return nil, fmt.Errorf("client profile %s: %w", path, err)
 	}
 
-	var profile Profile
-
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-
-	if err := decoder.Decode(&profile); err != nil {
-		return nil, fmt.Errorf("parse client profile %s: %w", path, err)
+	if restored {
+		log.Printf("WARN: client profile 正文损坏，已回退 %s.bak（指纹可能是上一版）: %s", path, path)
 	}
 
-	if err := ensureEOF(decoder); err != nil {
+	var profile Profile
+
+	// 拒绝未知字段与多段 JSON：profile 是部署侧快照，字段漂移或拼接内容都不该
+	// 被静默接受（jsonx.Unmarshal 在首个值之后遇到非空白内容即报错）。
+	if err := jsonx.Unmarshal(raw, &profile, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return nil, fmt.Errorf("parse client profile %s: %w", path, err)
 	}
 
@@ -261,19 +328,6 @@ func LoadFile(path string) (*Profile, error) {
 	}
 
 	return &profile, nil
-}
-
-func ensureEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return fmt.Errorf("文件包含多段 JSON: %w", errInvalidProfile)
-		}
-
-		return fmt.Errorf("decode trailing JSON: %w", err)
-	}
-
-	return nil
 }
 
 // Validate 校验结构、Win32 来源与出站值安全边界。不读解包树，因此不校验
@@ -409,18 +463,23 @@ func validateRequiredEmit(emit *Emit) error {
 }
 
 func validateEmitValues(emit *Emit) error {
-	values := map[string]string{
-		"chatUA": emit.ChatUA, "desktopUA": emit.DesktopUA, "billingUA": emit.BillingUA,
-		"xIdeVersion": emit.XIdeVersion, "desktopIdeVersion": emit.DesktopIdeVersion,
-		"desktopExtVersion": emit.DesktopExtVersion, "loginPlatform": emit.LoginPlatform,
-		"billingMeterUA": emit.BillingMeterUA,
+	// 按固定字段顺序校验：map 迭代顺序随机会让同一份坏 profile 每次报不同的字段。
+	values := []struct{ key, value string }{
+		{"chatUA", emit.ChatUA},
+		{"desktopUA", emit.DesktopUA},
+		{"billingUA", emit.BillingUA},
+		{"xIdeVersion", emit.XIdeVersion},
+		{"desktopIdeVersion", emit.DesktopIdeVersion},
+		{"desktopExtVersion", emit.DesktopExtVersion},
+		{"loginPlatform", emit.LoginPlatform},
+		{"billingMeterUA", emit.BillingMeterUA},
 	}
 	if emit.LoginUA != nil {
-		values["loginUA"] = *emit.LoginUA
+		values = append(values, struct{ key, value string }{"loginUA", *emit.LoginUA})
 	}
 
-	for key, value := range values {
-		if err := validateEmitValue(key, value); err != nil {
+	for _, item := range values {
+		if err := validateEmitValue(item.key, item.value); err != nil {
 			return err
 		}
 	}

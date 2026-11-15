@@ -1,8 +1,9 @@
 package upstream
 
 import (
-	"encoding/json"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestDeepSeekOffEffortDisablesThinking off/none/disabled（大小写、空白、camelCase）
@@ -63,7 +64,7 @@ func TestNonDeepSeekSupportedOffEffortPreserved(t *testing.T) {
 			}
 
 			var obj map[string]any
-			if err := json.Unmarshal(out, &obj); err != nil {
+			if err := jsonx.Unmarshal(out, &obj); err != nil {
 				t.Fatalf("unmarshal: %v (out=%s)", err, out)
 			}
 
@@ -172,7 +173,7 @@ func TestExplicitThinkingTypeKeptWithoutOffEffort(t *testing.T) {
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
 
@@ -185,7 +186,7 @@ func assertEffortFieldsAbsent(t *testing.T, out []byte) {
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
 

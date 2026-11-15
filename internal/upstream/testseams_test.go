@@ -1,9 +1,10 @@
 package upstream
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // 测试便利入口：只覆盖生产入口的默认参数组合，避免每个用例重复写 nil。
@@ -36,13 +37,13 @@ func injectPromptCacheKey(body []byte, uid, conversationID string) []byte {
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil || obj == nil {
+	if err := jsonx.Unmarshal(body, &obj); err != nil || obj == nil {
 		return body // 坏 body / 顶层 null：无字段可写，保持原文
 	}
 
 	injectPromptCacheKeyObj(obj, uid, conversationID)
 
-	out, err := json.Marshal(obj)
+	out, err := jsonx.Marshal(obj)
 	if err != nil {
 		return body
 	}

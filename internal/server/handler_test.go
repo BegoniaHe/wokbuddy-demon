@@ -2,7 +2,6 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"io"
 	"maps"
@@ -20,6 +19,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/prompt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/redisstore"
@@ -272,7 +272,7 @@ func assertRepairedToolCall(t *testing.T, msg, choice map[string]any, wantConten
 	}
 
 	var args map[string]any
-	if err := json.Unmarshal([]byte(fn["arguments"].(string)), &args); err != nil {
+	if err := jsonx.Unmarshal([]byte(fn["arguments"].(string)), &args); err != nil {
 		t.Fatalf("arguments 不是合法 JSON: %v", fn["arguments"])
 	}
 
@@ -290,7 +290,7 @@ func assertStatusSummary(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
 
 	var statusBody map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &statusBody); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &statusBody); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
 
@@ -553,7 +553,7 @@ func TestChatNonStreamAggregates(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
 
@@ -1411,7 +1411,7 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 	}
 
 	var e map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &e)
+	jsonx.Unmarshal(rec.Body.Bytes(), &e)
 
 	if e["error"] == nil {
 		t.Errorf("want error envelope: %s", rec.Body)
@@ -1541,7 +1541,7 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 
 	var resp map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	jsonx.Unmarshal(rec.Body.Bytes(), &resp)
 
 	if resp["object"] != "list" {
 		t.Errorf("object=%v", resp["object"])
@@ -1669,7 +1669,7 @@ func TestModelsDynamic(t *testing.T) {
 	}
 
 	var resp map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	jsonx.Unmarshal(rec.Body.Bytes(), &resp)
 
 	data := resp["data"].([]any)
 	if len(data) != 3 {
@@ -1787,7 +1787,7 @@ func TestModelsDynamicFallsBackToStatic(t *testing.T) {
 	}
 
 	var resp map[string]any
-	json.Unmarshal(rec.Body.Bytes(), &resp)
+	jsonx.Unmarshal(rec.Body.Bytes(), &resp)
 
 	data := resp["data"].([]any)
 	if len(data) != 0 {
@@ -2055,7 +2055,7 @@ func TestStatusInFlightFull(t *testing.T) {
 	}
 
 	var statusBody map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &statusBody); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &statusBody); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
 
@@ -2087,7 +2087,7 @@ func TestStatusPortraitFields(t *testing.T) {
 	var body struct {
 		Accounts []pool.Status `json:"accounts"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
 
@@ -2111,7 +2111,7 @@ func TestHealthzEmptyPool(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
 	}
 
@@ -2140,7 +2140,7 @@ func TestHealthz503WhenNoHealthy(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
 	}
 
@@ -2173,7 +2173,7 @@ func TestHealthz503WhenAllInFlightFull(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
 	}
 	// healthy 语义未变：账号仍是 healthy（只占满在途，非冷却/禁用）。
@@ -2196,7 +2196,7 @@ func TestHealthz200WithHealthy(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
 	}
 
@@ -2238,7 +2238,7 @@ func TestHealthzServiceIdentity(t *testing.T) {
 			}
 
 			var resp map[string]any
-			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 				t.Fatalf("healthz not json: %v body=%s", err, rec.Body)
 			}
 
@@ -2414,7 +2414,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 			Code string `json:"code"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &env); err != nil {
 		t.Fatalf("unmarshal: %v (body=%s)", err, rec.Body.String())
 	}
 
@@ -2611,7 +2611,7 @@ func assertSingleSystemMessage(t *testing.T, sentBody []byte, customSys string) 
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal(sentBody, &obj); err != nil {
+	if err := jsonx.Unmarshal(sentBody, &obj); err != nil {
 		t.Fatalf("out body not json: %v %s", err, sentBody)
 	}
 
@@ -2659,7 +2659,7 @@ func markupFixtureNamed(prose, name, cmd string) string {
 // markupUpstreamSSE 用一段正文拼上游 SSE（role 首帧 + 正文帧 + stop 收尾帧 + [DONE]）。
 func markupUpstreamSSE(content string) string {
 	chunk := func(delta map[string]any, finish any) string {
-		b, _ := json.Marshal(map[string]any{
+		b, _ := jsonx.Marshal(map[string]any{
 			"id": "resp-1", "object": "chat.completion.chunk", "created": 1, "model": "glm-5.2",
 			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
 		})
@@ -2703,7 +2703,7 @@ func TestChatNonStreamRepairsMarkupToolCalls(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
 
@@ -2798,7 +2798,7 @@ func (s *streamFrameScan) frame(t *testing.T, frameNo int, payload string) {
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+	if err := jsonx.Unmarshal([]byte(payload), &obj); err != nil {
 		t.Fatalf("帧不是合法 JSON: %q (%v)", payload, err)
 	}
 
@@ -2872,7 +2872,7 @@ func TestChatRepairsMarkupWithoutDeclaredTools(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
 
@@ -2916,7 +2916,7 @@ func TestChatMarkupRepairRejectsNonIdentifierToolName(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
 
@@ -2952,7 +2952,7 @@ func TestChatMarkupRepairStrictModeRejectsUndeclaredTool(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("resp not json: %v body=%s", err, rec.Body)
 	}
 
@@ -3356,7 +3356,7 @@ const unapprovedChannelBody = `{"code":11128,"msg":"Illegal API invocation from 
 func newChatBody(t *testing.T, system, stream string) string {
 	t.Helper()
 
-	sys, err := json.Marshal(system)
+	sys, err := jsonx.Marshal(system)
 	if err != nil {
 		t.Fatalf("marshal system: %v", err)
 	}
@@ -3444,7 +3444,7 @@ func assertSentenceSplit(t *testing.T, body []byte) {
 			Content string `json:"content"`
 		} `json:"messages"`
 	}
-	if err := json.Unmarshal(body, &retry); err != nil {
+	if err := jsonx.Unmarshal(body, &retry); err != nil {
 		t.Fatalf("retry body not json: %v (%s)", err, body)
 	}
 

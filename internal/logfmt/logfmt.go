@@ -64,11 +64,18 @@ func UID8(uid string) string {
 		return "-"
 	}
 
-	if len(uid) > 8 {
-		return uid[:8]
+	if len(uid) <= 8 {
+		return uid
 	}
 
-	return uid
+	// 按字节切会切碎多字节 rune（uid 来自上游 JSON），日志行出现非法 UTF-8。
+	// 与同包 Truncate 同口径回退到 rune 边界。
+	cut := 8
+	for cut > 0 && !utf8.RuneStart(uid[cut]) {
+		cut--
+	}
+
+	return uid[:cut]
 }
 
 // Label 返回日志里的账号标签，形如 "示例昵称甲(a1b2c3d4)"；昵称为空时退回 "a1b2c3d4"。
@@ -82,12 +89,36 @@ func UID8(uid string) string {
 func Label(uid, nick string) string {
 	short := UID8(uid)
 
-	nick = strings.TrimSpace(nick)
+	// 昵称来自上游 JSON（不可信）：含换行就能在运行日志里伪造整行，含大量字符
+	// 则把一条日志撑成多行。制表/回车/换行折叠成空格，长度与其它日志字段同口径
+	// 截断。
+	nick = strings.TrimSpace(SanitizeLine(nick))
 	if nick == "" {
 		return short
 	}
 
-	return nick + "(" + short + ")"
+	return Truncate(nick, nickLabelMaxWidth) + "(" + short + ")"
+}
+
+const (
+	// nickLabelMaxWidth 日志标签里昵称的最大字节数（与 UID8 一起构成可 grep 的行）。
+	nickLabelMaxWidth = 48
+)
+
+// SanitizeLine 把可能伪造日志行的字符压成空格：控制字符（含 ANSI 序列的 ESC
+// 0x1b）、DEL、C1 区，以及 Unicode 行/段分隔符 U+2028 / U+2029。
+//
+// 只折叠 \r\n\t 不够：昵称一路来自上游 JSON 且会进 os.Stderr 终端，0x1b 后跟
+// 转义序列即可清屏或伪造提示，U+2028 在部分查看器里同样按换行渲染。日志侧
+// （internal/upstream 的 RedactForLog）共用这一份口径，避免两处漂移。
+func SanitizeLine(str2 string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) || r == 0x2028 || r == 0x2029 {
+			return ' '
+		}
+
+		return r
+	}, str2)
 }
 
 // DisplayWidth 返回 s 的终端显示列宽：CJK / 全角 / emoji 记 2 列，其余记 1 列。

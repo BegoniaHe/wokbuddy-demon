@@ -3,13 +3,13 @@
 package panel
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -50,7 +50,7 @@ func TestAccountCheckinInactiveMessage(t *testing.T) {
 		CheckinDone    bool   `json:"checkin_done"`
 		CheckinMessage string `json:"checkin_message"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v body=%s", err, rec.Body.String())
 	}
 

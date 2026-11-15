@@ -1,12 +1,12 @@
 package upstream
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestSelectChatAgentPriority 官方顺序：tags 含 default → name=="cli" →
@@ -551,7 +551,7 @@ func assertChatVisibility(t *testing.T, infos []ModelInfo, want map[string]bool)
 func TestModelInfoChatVisibleNotSerialized(t *testing.T) {
 	t.Parallel()
 
-	raw, err := json.Marshal(ModelInfo{ID: "m", ChatVisible: new(false)}) //nolint:musttag // 内部结构无 JSON 契约，此处只验证字段被排除
+	raw, err := jsonx.Marshal(ModelInfo{ID: "m", ChatVisible: new(false)})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}

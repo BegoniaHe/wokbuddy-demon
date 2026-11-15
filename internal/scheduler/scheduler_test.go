@@ -2,7 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/cst"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -349,12 +349,12 @@ func (f *fakeUpstream) checkinTimes() []time.Time {
 }
 
 func jsonI64(v int64) string {
-	b, _ := json.Marshal(v)
+	b, _ := jsonx.Marshal(v)
 	return string(b)
 }
 
 func jsonString(v string) string {
-	b, _ := json.Marshal(v)
+	b, _ := jsonx.Marshal(v)
 	return string(b)
 }
 

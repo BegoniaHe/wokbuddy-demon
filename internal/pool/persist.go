@@ -3,16 +3,17 @@
 package pool
 
 import (
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"log"
 	"maps"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 )
 
@@ -63,7 +64,7 @@ func (p *Pool) RestoreFromSnapshot() {
 	}
 
 	var snap snapshot
-	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
+	if jsonx.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
 		// 快照无 savedAt：无法比较新旧，本地优先。
 		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
@@ -102,33 +103,58 @@ func (p *Pool) startFlusher() {
 	// stopCh 同步登记，Close 才能可靠停止（New 与 startFlusher 之间无并发窗口）。
 	p.stopCh = stopCh
 
+	p.flusherDone = make(chan struct{})
+
 	interval := flushInterval
+
 	go func() {
+		defer close(p.flusherDone)
+
 		t := time.NewTicker(interval)
 		defer t.Stop()
 
 		for {
 			select {
 			case <-t.C:
-				p.mu.Lock()
-				pending := p.dirty.Swap(false)
-
-				var seq uint64
-
-				var stateSnap stateFile
-				if pending {
-					seq, stateSnap = p.snapshotStateLocked()
-				}
-				p.mu.Unlock()
-
-				if pending {
-					p.persistState(seq, stateSnap)
-				}
+				p.persistTick()
 			case <-stopCh:
 				return
 			}
 		}
 	}()
+}
+
+// persistTick 一次定时落盘，panic 就地隔离。
+//
+// flusher 协程里是状态快照 + 文件/Redis 写入；一次 panic 会带走整个协程，
+// 之后账号池状态再也不会落盘（进程还在跑，看起来一切正常）。
+func (p *Pool) persistTick() {
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("ERR: [pool] 落盘循环 panic（已隔离）: %v\n%s", rec, debug.Stack())
+		}
+	}()
+
+	seq, stateSnap, pending := func() (uint64, stateFile, bool) {
+		p.mu.Lock()
+		// 必须 defer 解锁：上面的 recover 会把 snapshotStateLocked 里的 panic
+		// 就地隔离，显式 Unlock 不会执行，整个池（选号/status/落盘）会死锁在
+		// 一把永不释放的写锁上。
+		defer p.mu.Unlock()
+
+		pending := p.dirty.Swap(false)
+		if !pending {
+			return 0, stateFile{}, false
+		}
+
+		seq, snap := p.snapshotStateLocked()
+
+		return seq, snap, true
+	}()
+
+	if pending {
+		p.persistState(seq, stateSnap)
+	}
 }
 
 // Flush 同步把内存状态落盘（幂等：无变更且无在途快照时不写盘）。供进程退出前调用。
@@ -156,7 +182,7 @@ func (p *Pool) Flush() {
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) load() {
-	raw, err := safefile.Read(p.stateFp, nil)
+	raw, restored, err := safefile.ReadWithFallback(p.stateFp, nil)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			log.Printf("WARN: pool: state.json 不可用（%v），跳过本地状态恢复: %s", err, p.stateFp)
@@ -165,8 +191,12 @@ func (p *Pool) load() {
 		return
 	}
 
+	if restored {
+		log.Printf("WARN: pool: state.json 正文损坏，已回退 .bak（账号状态为上一版）: %s", p.stateFp)
+	}
+
 	var stateSnapshot stateFile
-	if err := json.Unmarshal(raw, &stateSnapshot); err != nil {
+	if err := jsonx.Unmarshal(raw, &stateSnapshot); err != nil {
 		log.Printf("WARN: pool: state.json 解析失败（%v），跳过本地状态恢复: %s", err, p.stateFp)
 		return
 	}
@@ -188,6 +218,11 @@ func (p *Pool) applySchedulingCursorsLocked(cursors map[string]int) {
 
 	for key, pos := range cursors {
 		if key == "" || pos < 0 {
+			continue
+		}
+		// 与 pickOrderedLocked 写入侧同口径的上限：state.json 可以人工编辑，也可能是
+		// 加限之前写下的旧文件，恢复时不得把台账重新撑到无界。
+		if _, seen := p.schedulingCursors[key]; !seen && len(p.schedulingCursors) >= maxSchedulingCursors {
 			continue
 		}
 
@@ -235,6 +270,8 @@ func buildEntryFromState(uid string, stateAccount2 *stateAccount, now time.Time)
 		softStreak:               stateAccount2.SoftStreak,
 		sessionDeadFails:         stateAccount2.SessionDeadFails,
 		consecutiveFails:         stateAccount2.ConsecutiveFails,
+		paidUser:                 stateAccount2.PaidUser,
+		paidObserved:             stateAccount2.PaidObserved,
 	}
 	// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 	clampRestoredCredits(entry2, now)
@@ -295,6 +332,8 @@ func restoreModelCooldowns(src map[string]stateModelCooldown, now time.Time) map
 
 		out[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
 	}
+	// 恢复路径也要压到每账号上限（state.json 可人工编辑/来自加限前的旧版本）。
+	pruneModelLedger(out, func(mc modelCooldown) time.Time { return mc.Until }, now)
 
 	if len(out) == 0 {
 		return nil
@@ -319,6 +358,8 @@ func restoreModelCosts(src map[string]stateModelCost, now time.Time) map[string]
 
 		out[m] = modelCostEntry(mc)
 	}
+	// 同上：恢复不得突破每账号台账上限。
+	pruneModelLedger(out, func(mc modelCostEntry) time.Time { return mc.LastSeen.Add(modelCostTTL) }, now)
 
 	if len(out) == 0 {
 		return nil
@@ -365,7 +406,7 @@ func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 		return
 	}
 
-	raw, err := json.MarshalIndent(stateFile2, "", "  ")
+	raw, err := jsonx.MarshalIndent(stateFile2)
 	if err != nil {
 		p.notePersistFail(err)
 		return
@@ -389,7 +430,7 @@ func (p *Pool) persistState(seq uint64, stateFile2 stateFile) {
 	}
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
 	if p.store != nil {
-		snapRaw, err := json.Marshal(snapshot{stateFile: stateFile2, SavedAt: p.now()})
+		snapRaw, err := jsonx.Marshal(snapshot{stateFile: stateFile2, SavedAt: p.now()})
 		if err == nil {
 			p.store.SaveState(snapRaw)
 		}
@@ -459,8 +500,10 @@ func buildStateAccount(entry5 *entry, now time.Time) stateAccount {
 		CreditsEarliestExpiry:    entry5.creditsEarliestExpiry,
 		CreditsEarliestRemaining: entry5.creditsEarliestRemaining,
 		CreditsExpiryBuckets:     entry5.creditsExpiryBuckets,
+		PaidUser:                 entry5.paidUser,
+		PaidObserved:             entry5.paidObserved,
 	}
-	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
+	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitzero 真省略）。
 	if !entry5.breakerUntil.IsZero() && now.Before(entry5.breakerUntil) {
 		u := entry5.breakerUntil
 		stateAccount2.BreakerUntil = &u

@@ -2,7 +2,7 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net/url"
@@ -55,7 +55,7 @@ func TestRetryBillingTransientDeadlineExceededNotTransient(t *testing.T) {
 func TestRetryBillingTransientLocalErrorNoRetry(t *testing.T) {
 	t.Parallel()
 
-	localErr := fmt.Errorf("resource summary parse: %w", &json.SyntaxError{Offset: 1})
+	localErr := fmt.Errorf("resource summary parse: %w", &jsontext.SyntacticError{ByteOffset: 1})
 	if IsTransientBillingErr(localErr) {
 		t.Fatal("本地解析错误不应被判为瞬时错误")
 	}

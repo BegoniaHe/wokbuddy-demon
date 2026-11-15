@@ -9,13 +9,14 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
@@ -43,7 +44,7 @@ func (c *Client) CheckinActivityStatus(a *auth.Auth) (todayChecked bool, err err
 	var status struct {
 		TodayCheckedIn bool `json:"today_checked_in"`
 	}
-	if err := json.Unmarshal(data, &status); err != nil {
+	if err := jsonx.Unmarshal(data, &status); err != nil {
 		return false, fmt.Errorf("checkin status parse: %w", err)
 	}
 
@@ -303,26 +304,22 @@ func (c *Client) checkinRaw(
 // 信封；也有 200 + code!=0 的业务拒绝。三条都先按码/文案定状态，成功才读积分。
 func checkinReceipt(status int, raw []byte) CheckinReceipt {
 	var env struct {
-		Code json.Number     `json:"code"`
-		Msg  string          `json:"msg"`
-		Data json.RawMessage `json:"data"`
+		Code jsontext.Value `json:"code"`
+		Msg  string         `json:"msg"`
+		Data jsontext.Value `json:"data"`
 	}
 
-	parsed := json.Unmarshal(raw, &env) == nil
+	parsed := jsonx.Unmarshal(raw, &env) == nil
 
 	code := ""
-	if parsed {
-		code = env.Code.String()
+	if parsed && env.Code.Kind() == '0' {
+		code = string(env.Code)
 	}
 
 	msg := cleanCheckinMessage(env.Msg)
 
 	if status < http.StatusBadRequest && (code == "" || code == "0") {
-		if receipt, ok := checkinTextOnlyReceipt(msg); ok {
-			return receipt
-		}
-
-		if receipt, ok := checkinSuccessReceipt(raw, env.Data); ok {
+		if receipt, ok := checkinSuccessBody(raw, msg, env.Data); ok {
 			return receipt
 		}
 
@@ -347,6 +344,15 @@ func checkinReceipt(status int, raw []byte) CheckinReceipt {
 	return CheckinReceipt{State: state, Message: msg}
 }
 
+// checkinSuccessBody 在 2xx 且业务码为空/0 时读成功回执：先按文案判拒绝，再读积分。
+func checkinSuccessBody(raw []byte, msg string, data jsontext.Value) (CheckinReceipt, bool) {
+	if receipt, ok := checkinTextOnlyReceipt(msg); ok {
+		return receipt, true
+	}
+
+	return checkinSuccessReceipt(raw, data)
+}
+
 // checkinTextOnlyReceipt 处理「成功码 + 拒绝文案」的 2xx 形态：上游把幂等/失败塞进
 // 200 + 文案时按文案走，不当成新签到（issue #511）。无文案可依时返回 ok=false。
 func checkinTextOnlyReceipt(msg string) (CheckinReceipt, bool) {
@@ -362,11 +368,33 @@ func checkinTextOnlyReceipt(msg string) (CheckinReceipt, bool) {
 	return CheckinReceipt{}, false
 }
 
+// checkinReceiptHasCriteria 报告回执里是否至少命中一个签到判据字段
+// （credit / streak_days / is_streak_day）。
+//
+// `{"code":0,"msg":"OK","data":null}` 这类空信封是合法 JSON 对象，却没有任何签到
+// 证据；当成成功会标记当日已签、面板报「签到成功」，而账号实际没签（#511 静默漏签）。
+func checkinReceiptHasCriteria(body []byte, credit *jsontext.Value) bool {
+	var presence map[string]jsontext.Value
+	if jsonx.Unmarshal(body, &presence) != nil {
+		return false
+	}
+
+	if _, hasStreak := presence["streak_days"]; hasStreak {
+		return true
+	}
+
+	if _, hasStreakDay := presence["is_streak_day"]; hasStreakDay {
+		return true
+	}
+
+	return credit != nil
+}
+
 // checkinSuccessReceipt 读成功回执：官方是平铺 {credit, streak_days, is_streak_day}；
 // 若上游把回执包在 data 信封里也照读。积分缺失只置 CreditKnown=false，不补 0。
 // 第二个返回值报告回执是否真的读成了 JSON 对象：读不成时由调用方判失败，
 // 不能当成新签到（空 body / HTML 页 / 半截 JSON 都会落到这里）。
-func checkinSuccessReceipt(raw, data json.RawMessage) (CheckinReceipt, bool) {
+func checkinSuccessReceipt(raw, data jsontext.Value) (CheckinReceipt, bool) {
 	body := raw
 	if len(data) > 0 && data[0] == '{' {
 		body = data
@@ -377,12 +405,16 @@ func checkinSuccessReceipt(raw, data json.RawMessage) (CheckinReceipt, bool) {
 	}
 
 	var flat struct {
-		Credit      *json.Number `json:"credit"`
-		StreakDays  int64        `json:"streak_days"`
-		IsStreakDay bool         `json:"is_streak_day"`
+		Credit      *jsontext.Value `json:"credit"`
+		StreakDays  int64           `json:"streak_days"`
+		IsStreakDay bool            `json:"is_streak_day"`
 	}
 
-	if json.Unmarshal(body, &flat) != nil {
+	if jsonx.Unmarshal(body, &flat) != nil {
+		return CheckinReceipt{}, false
+	}
+
+	if !checkinReceiptHasCriteria(body, flat.Credit) {
 		return CheckinReceipt{}, false
 	}
 
@@ -391,7 +423,7 @@ func checkinSuccessReceipt(raw, data json.RawMessage) (CheckinReceipt, bool) {
 	receipt.IsStreakDay = flat.IsStreakDay
 
 	if flat.Credit != nil {
-		if credit, err := flat.Credit.Int64(); err == nil {
+		if credit, ok := jsonx.Int64(*flat.Credit); ok {
 			receipt.Credit = credit
 			receipt.CreditKnown = true
 		}
