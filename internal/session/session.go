@@ -726,7 +726,8 @@ func ExtractSession(body []byte) (key, conversationID string) {
 		return "", ""
 	}
 
-	return deriveKey(probe.Messages), ""
+	// 走到这里必然没有 user_id，派生输入保持旧形态（零回归）。
+	return deriveKey(probe.Messages, ""), ""
 }
 
 // explicitConversationID 从顶层视图提取显式 conversationId（metadata 优先，
@@ -777,13 +778,19 @@ func rawJSONString(raw []byte) string {
 const derivedKeyPrefix = "d-"
 
 // DeriveCacheKey 仅供 prompt_cache_key / 出站 X-Conversation-ID 的会话段使用：
-// 与 ExtractSession 的第 6 项同源（system + 首条 user 的哈希），但**不设 user_id 闸**。
+// 与 ExtractSession 的第 6 项同源（system + 首条 user 的哈希），但**不设 user_id 闸**，
+// 且把调用方 user_id 掺进派生输入（issue #533）。
 //
 // 为什么需要它：ExtractSession 对带 user_id 的请求返回空串，那是「不把 user 钉到某个
 // 账号」的粘性契约；空串会让 prompt_cache_key 退化成每账号一个常量槽
 // （buildCacheKey(uid, "")），同账号上多段对话互相覆盖前缀缓存，出站会话头也只能逐
 // 请求随机。缓存槽按对话隔离与账号绑定是两件事：本函数只影响前者，粘性仍看
 // ExtractSession。
+//
+// 掺 user_id 的原因：本键同时是 StickyKeyFromContent 的绑定主键（handler.go 的
+// derive_binding）。中转站这类多下游用户部署里，两个用户的开场白相同（"hi" / 同一
+// 脚手架模板）会算出同一个键，第二个用户被钉到第一个用户的账号上。键的维度因此是
+// 加细（user + 对话内容），不是退回 user 单维——同一用户同一段对话仍稳定。
 func DeriveCacheKey(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -794,7 +801,13 @@ func DeriveCacheKey(body []byte) string {
 		return ""
 	}
 
-	return deriveKey(probe.Messages)
+	// metadata.user_id 优先，与显式会话键的 metadata 优先口径一致。
+	userID := rawJSONString(parseMetadata(probe.Metadata).UserID)
+	if userID == "" {
+		userID = rawJSONString(probe.UserID)
+	}
+
+	return deriveKey(probe.Messages, userID)
 }
 
 // contentStickyPrefix 内容派生粘性键前缀：与 sessKey 命名空间隔离，避免某个恰好
@@ -816,16 +829,22 @@ func StickyKeyFromContent(derived string) string {
 	return contentStickyPrefix + derived
 }
 
-// deriveKey 从 messages 原始 JSON 派生稳定会话键：SHA-256(system 文本 + 首条 user
-// 文本) 前 16 字节。
+// deriveKey 从 messages 原始 JSON 派生稳定会话键：SHA-256([user_id + NUL +] system
+// 文本 + NUL + 首条 user 文本) 前 16 字节。userID 为空时不加前缀段，输出逐字节不变
+// （无 user_id 的老客户端零回归；ExtractSession 的派生路径恒传空——带 user_id 的请求
+// 已被 anti-monopoly 闸拦下）。
 //
 // 为什么用「system + 首条 user」而不是全部消息：
 //   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
 //   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
 //   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
 //
+// 为什么掺 user_id：内容哈希单独不够区分「不同下游用户的同一段开场白」，中转站部署
+// 里会把两个用户钉到同一账号；user_id 作前缀段只加细维度，不改变同一用户同一段对话
+// 的稳定性（issue #533）。
+//
 // 取不到用户文本（纯图片等）时返回空串：不粘性，退回普通轮换（安全降级）。
-func deriveKey(raw []byte) string {
+func deriveKey(raw []byte, userID string) string {
 	if len(raw) == 0 {
 		return ""
 	}
@@ -835,7 +854,12 @@ func deriveKey(raw []byte) string {
 		return "" // 无用户消息：无从归属会话
 	}
 
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	payload := systemText + "\x00" + firstUserText
+	if userID != "" {
+		payload = userID + "\x00" + payload
+	}
+
+	sum := sha256.Sum256([]byte(payload))
 
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
 }
