@@ -504,7 +504,6 @@ func (s *Store) persistSnapshot(records []Record, seq uint64) error {
 	return nil
 }
 
-// persistLocked 在持锁状态下原子写盘当前记录；成功清 dirty，失败由调用方决定回滚。
 // persistLocked 在持锁状态下把当前记录落盘；失败由调用方回滚内存变更。
 //
 // 这里仍在 s.mu 内完成写入（含 fsync）：Create/Revoke/Delete/updateRecord 需要
