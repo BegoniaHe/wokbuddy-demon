@@ -14,6 +14,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -1103,5 +1104,43 @@ func TestRequestMetricsToolCounters(t *testing.T) {
 					event.ToolsDeclared, event.ToolCalls, testCase.wantDeclared, testCase.wantToolCalls)
 			}
 		})
+	}
+}
+
+// TestPaceEstimateMatchesPoolEstimate 响应整形节奏（server）与请求预扣（pool）必须
+// 同一口径。参考实现不复用 pool 的判据与常量，任一侧漂移都会在这里报错。
+func TestPaceEstimateMatchesPoolEstimate(t *testing.T) {
+	t.Parallel()
+
+	reference := func(text string) int64 {
+		ascii, cjk := 0, 0
+
+		for _, r := range text {
+			if r >= 0x2E80 {
+				cjk++
+			} else {
+				ascii++
+			}
+		}
+
+		return int64(ascii)/4 + int64(float64(cjk)/1.5)
+	}
+
+	cases := []string{
+		"",
+		"a",
+		"hello world",
+		"请分析这段日志",
+		"混合 ascii 与 CJK 中文 content",
+		"中",
+		"\ufffd",
+		"{}",
+	}
+
+	for _, text := range cases {
+		got, want := paceTextTokens(text), int64(pool.EstimatePromptTokens([]byte(text)))
+		if got != want || got != reference(text) {
+			t.Fatalf("paceTextTokens(%q)=%d pool=%d want %d", text, got, want, reference(text))
+		}
 	}
 }
