@@ -5,6 +5,8 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -153,6 +155,122 @@ func TestStreamKeepsUnsplitFrameVerbatim(t *testing.T) {
 	body := rec.Body.String()
 	if payloads := sseDataPayloads(t, body); len(payloads) == 0 || payloads[0] != payload {
 		t.Fatalf("不可拆帧必须原样透传，got %v: %q", payloads, body)
+	}
+}
+
+// TestProbeStreamVetoesConcatenatedErrorFrame 粘帧里的 error 段必须进首帧否决：
+// 只看首个对象时预览会放行，客户端拿到 200 + error 帧（issue #538）。
+func TestProbeStreamVetoesConcatenatedErrorFrame(t *testing.T) {
+	t.Parallel()
+
+	raw := `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"你好"}}]} ` +
+		`{"error":{"code":6004,"message":"limited"}}` + "\n\n"
+
+	probe := ProbeStream(strings.NewReader(raw))
+	defer probe.Release()
+
+	if probe.Kind == ErrNone {
+		t.Fatalf("kind=ErrNone，粘帧里的 error 段未触发否决: %+v", probe)
+	}
+
+	if !strings.Contains(probe.Frame, "6004") {
+		t.Fatalf("frame=%q want 粘帧里的 error 段", probe.Frame)
+	}
+
+	if !json.Valid([]byte(probe.Frame)) {
+		t.Fatalf("frame 必须是单个合法 JSON（交策略层分类）: %q", probe.Frame)
+	}
+}
+
+// TestAggregateConcatenatedErrorFrame 非流式粘帧带 error：必须上抛 FrameError，
+// 不能静默丢弃后按空流返回 502（issue #538）。
+func TestAggregateConcatenatedErrorFrame(t *testing.T) {
+	t.Parallel()
+
+	raw := `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"你好"}}]} ` +
+		`{"error":{"code":6004,"message":"limited"}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	_, err := Aggregate(strings.NewReader(raw))
+	if !errors.Is(err, errErrorFrame) {
+		t.Fatalf("err=%v want error frame", err)
+	}
+
+	if payload := ErrorFramePayload(err); !strings.Contains(payload, "6004") {
+		t.Fatalf("payload=%q want error 段", payload)
+	}
+}
+
+// TestAggregateConcatenatedContentFrames 粘帧里的正常内容也要并入聚合，不能只取
+// 首个对象丢掉后续段（issue #538）。
+func TestAggregateConcatenatedContentFrames(t *testing.T) {
+	t.Parallel()
+
+	raw := `data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"a"}}]} ` +
+		`{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"b"}}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("aggregate: %v", err)
+	}
+
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "ab" {
+		t.Fatalf("content=%q want %q", msg["content"], "ab")
+	}
+}
+
+// TestTextContinueReaderSplitsConcatenatedFrames 续写层的粘帧同样要按段处理：
+// 每帧单独 data 行且都是合法 JSON，error 段不再被当普通行整行透传（issue #538）。
+func TestTextContinueReaderSplitsConcatenatedFrames(t *testing.T) {
+	t.Parallel()
+
+	raw := `data: {"id":"c1","choices":[{"index":0,"delta":{"content":"a"}}]} ` +
+		`{"error":{"code":6004,"message":"limited"}}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	r := NewTextContinueReader(closeString{strings.NewReader(raw)}, "", false, nil)
+	defer r.Release()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	payloads := sseDataPayloads(t, string(out))
+	for _, payload := range payloads {
+		if payload == "[DONE]" {
+			continue
+		}
+
+		if !json.Valid([]byte(payload)) {
+			t.Fatalf("粘帧未按段拆分，data 载荷不是单个合法 JSON: %q（body=%q）", payload, out)
+		}
+	}
+
+	if !strings.Contains(string(out), `"content":"a"`) || !strings.Contains(string(out), "6004") {
+		t.Fatalf("拆段后内容丢失: %q", out)
+	}
+}
+
+// TestTextContinueReaderKeepsUnsplitFrameVerbatim 续写层拆不动的粘帧仍整行原样
+// 透传（与写出层同口径：宁可少切，不产出半截对象）。
+func TestTextContinueReaderKeepsUnsplitFrameVerbatim(t *testing.T) {
+	t.Parallel()
+
+	payload := `{"a":1} {"b":`
+
+	r := NewTextContinueReader(closeString{strings.NewReader("data: " + payload + "\n\n")}, "", false, nil)
+	defer r.Release()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := sseDataPayloads(t, string(out)); len(got) != 1 || got[0] != payload {
+		t.Fatalf("不可拆帧必须原样透传，got %v: %q", got, out)
 	}
 }
 

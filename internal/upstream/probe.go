@@ -181,6 +181,23 @@ func (p *StreamProbe) inspectLine(line string) {
 
 	var frame map[string]any
 	if json.Unmarshal([]byte(payload), &frame) != nil {
+		// 粘帧（issue #498 的形态）按段重新判定：只看首个对象会漏掉粘在后面的
+		// error 帧，预览放行后客户端拿到 200 + error（issue #538）。
+		for _, segment := range splitConcatenatedJSON(payload) {
+			p.inspectFramePayload(segment)
+		}
+
+		return
+	}
+
+	p.inspectFramePayload(payload)
+}
+
+// inspectFramePayload 判定单个 JSON 帧（粘帧已拆段）：error/业务错误进入否决，
+// 其余累计正文与终态。
+func (p *StreamProbe) inspectFramePayload(payload string) {
+	var frame map[string]any
+	if json.Unmarshal([]byte(payload), &frame) != nil {
 		return
 	}
 

@@ -203,16 +203,38 @@ func (a *streamAggregator) handleLine(line string) (bool, error) {
 	}
 
 	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) == nil && chunk != nil {
-		// 有效事件计数：仅 JSON 对象数据帧计入（解析失败、顶层 null 沿用静默 continue）。
-		// null 是合法 JSON 但解码成 nil map，没有可聚合字段，计入会掩盖空流。
-		a.validEvents++
-		if err := a.handleChunk(chunk); err != nil {
-			return false, err
-		}
+	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk == nil {
+		// 粘帧（issue #498 的形态）逐段聚合：整行解析失败就把 error 帧静默丢掉，
+		// 只剩这一帧时会被误判成空流（issue #538）。
+		return false, a.handleConcatenatedPayload(payload)
+	}
+
+	// 有效事件计数：仅 JSON 对象数据帧计入（解析失败、顶层 null 沿用静默 continue）。
+	// null 是合法 JSON 但解码成 nil map，没有可聚合字段，计入会掩盖空流。
+	a.validEvents++
+	if err := a.handleChunk(chunk); err != nil {
+		return false, err
 	}
 
 	return false, nil
+}
+
+// handleConcatenatedPayload 聚合粘帧里的各段（拆不动即无事可做）：每段按单帧同
+// 口径计数与并入，error 段与单帧一样上抛 FrameError。
+func (a *streamAggregator) handleConcatenatedPayload(payload string) error {
+	for _, segment := range splitConcatenatedJSON(payload) {
+		var chunk map[string]any
+		if json.Unmarshal([]byte(segment), &chunk) != nil || chunk == nil {
+			continue
+		}
+
+		a.validEvents++
+		if err := a.handleChunk(chunk); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // handleChunk 并入一个数据帧的顶层字段与 choices。聚合超限返回错误（issue #113）。

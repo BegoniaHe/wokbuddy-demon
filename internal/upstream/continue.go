@@ -246,14 +246,37 @@ func (c *TextContinueReader) handleLine(line string) {
 
 	var frame map[string]any
 	if json.Unmarshal([]byte(payload), &frame) != nil || frame == nil {
-		// 非 JSON 帧与顶层 null（nil map 没有可写字段，续写重写 id/model 会 panic）
-		// 一律原样透传。
-		c.out.WriteString(line)
+		c.handleUnparsedLine(line, payload)
 
 		return
 	}
 
 	c.handleFrame(line, frame)
+}
+
+// handleUnparsedLine 处置无法解析成单个对象的 data 行：粘帧（issue #498 的形态）
+// 逐段处理——整行透传会让 error 段绕过 handleFrame 的终态处置，客户端也仍拿到
+// 无法解析的 data 行（issue #538）；非 JSON 帧、顶层 null 与拆不动的粘帧原样透传。
+func (c *TextContinueReader) handleUnparsedLine(line, payload string) {
+	segments := splitConcatenatedJSON(payload)
+	if segments == nil {
+		c.out.WriteString(line)
+
+		return
+	}
+
+	for _, segment := range segments {
+		var frame map[string]any
+		if json.Unmarshal([]byte(segment), &frame) != nil || frame == nil {
+			// 拆出的段理论上都合法；顶层 null 解成 nil map（续写重写 id/model 会
+			// panic），与原路径一样原样透传。
+			c.out.WriteString("data: " + segment + "\n\n")
+
+			continue
+		}
+
+		c.handleFrame("data: "+segment+"\n\n", frame)
+	}
 }
 
 // handleDone 处理 [DONE]：首段因 length 截断且尚未续写时，先换流续写并吞掉本行；
