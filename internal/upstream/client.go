@@ -1802,6 +1802,13 @@ func (c *Client) prepareBody(body []byte, scope, uid, conversationID, conversati
 		agentCLI: true,
 	}
 
+	// cache_retention：CN 5.11.3 CLI 传输层对非自定义模型请求补该字段（#550）；
+	// global 5.9.4 官方不发，按 realm 门控。会话级 cacheRetention 与
+	// CODEBUDDY_DISABLE_PROMPT_CACHING_1H 都是客户端进程内状态，网关取默认分支。
+	if !isGlobalScope(scope) {
+		rewrite.cacheRetention = cacheRetentionLong
+	}
+
 	return rewriteChatBody(body, &rewrite)
 }
 

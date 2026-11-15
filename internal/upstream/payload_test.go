@@ -292,6 +292,61 @@ func TestPrepareBodyEffortDowngradeSkipsOff(t *testing.T) {
 	}
 }
 
+// TestPrepareBodyCacheRetention chat 出站 body 缺 cache_retention 时按 realm 补：
+// CN 5.11.3 CLI 传输层对非自定义模型请求写该字段（默认 long），global 5.9.4
+// 官方不发；显式值（含下游客户端自带）原样保留（#550）。
+func TestPrepareBodyCacheRetention(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		scope   string
+		body    string
+		want    any // nil = 字段不应出现
+		wantHas bool
+	}{
+		{
+			name: "cn 缺省补 long", scope: "cn",
+			body: `{"model":"glm-5.2","messages":[]}`,
+			want: "long", wantHas: true,
+		},
+		{
+			name: "cn 显式值保留", scope: "cn",
+			body: `{"model":"glm-5.2","messages":[],"cache_retention":"short"}`,
+			want: "short", wantHas: true,
+		},
+		{
+			name: "global 不注入", scope: "global|www.codebuddy.ai",
+			body: `{"model":"glm-5.2","messages":[]}`,
+			want: nil, wantHas: false,
+		},
+	}
+
+	client := New()
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			out := client.prepareBody([]byte(testCase.body), testCase.scope, "u1", "conv-1", "req-1")
+
+			var obj map[string]any
+			if err := jsonx.Unmarshal(out, &obj); err != nil {
+				t.Fatalf("unmarshal: %v (out=%s)", err, out)
+			}
+
+			got, has := obj["cache_retention"]
+			if has != testCase.wantHas {
+				t.Fatalf("cache_retention present=%v want %v (out=%s)", has, testCase.wantHas, out)
+			}
+
+			if has && got != testCase.want {
+				t.Errorf("cache_retention=%v want %v", got, testCase.want)
+			}
+		})
+	}
+}
+
 // TestPrepareBodyStreamOptions body 未显式带 stream_options 时注入
 // {include_usage: true}（D7，官方 CLI 流式必发）；body 已带则不覆盖。
 func TestPrepareBodyStreamOptions(t *testing.T) {
