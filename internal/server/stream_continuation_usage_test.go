@@ -42,7 +42,10 @@ func readStats(t *testing.T, cont *upstream.TextContinueReader) *chatStatsReader
 
 // assertContinuationUsage 断言统计与两段之和一致：completion/total/credit 累加，
 // prompt 取末段。
-func assertContinuationUsage(t *testing.T, stats *chatStatsReader, wantTokens int, wantCredit float64, wantTotal int) {
+func assertContinuationUsage(
+	t *testing.T, stats *chatStatsReader, wantTokens int, wantCredit float64, wantTotal int,
+	wantPrompt int64,
+) {
 	t.Helper()
 
 	if tokens, ok := stats.Tokens(); !ok || tokens != wantTokens {
@@ -57,9 +60,9 @@ func assertContinuationUsage(t *testing.T, stats *chatStatsReader, wantTokens in
 		t.Errorf("total_tokens=%d ok=%v want %d", total, ok, wantTotal)
 	}
 
-	if usage := stats.Usage(); !usage.HasPromptTokens || usage.PromptTokens != 20 {
-		t.Errorf("prompt_tokens=%d has=%v want 20（末段值）",
-			usage.PromptTokens, usage.HasPromptTokens)
+	if usage := stats.Usage(); !usage.HasPromptTokens || usage.PromptTokens != wantPrompt {
+		t.Errorf("prompt_tokens=%d has=%v want %d（末段值）",
+			usage.PromptTokens, usage.HasPromptTokens, wantPrompt)
 	}
 }
 
@@ -82,7 +85,7 @@ func TestStreamLengthContinuationStatsSumsUsage(t *testing.T) {
 		t.Fatal("length 截断未触发续写")
 	}
 
-	assertContinuationUsage(t, stats, 6, 3, 26)
+	assertContinuationUsage(t, stats, 6, 3, 26, 20)
 }
 
 // TestStreamStopContinuationStatsSumsUsage 长文 stop 续写（ContinueOnStop）与
@@ -106,5 +109,5 @@ func TestStreamStopContinuationStatsSumsUsage(t *testing.T) {
 		t.Fatal("长文 stop 未触发续写")
 	}
 
-	assertContinuationUsage(t, stats, 6, 3, 26)
+	assertContinuationUsage(t, stats, 6, 3, 26, 20)
 }
