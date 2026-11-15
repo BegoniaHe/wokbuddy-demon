@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -726,6 +727,14 @@ func waitSchedulerExit(sch *scheduler.Scheduler, runDone <-chan struct{}) {
 //
 //nolint:nestif // 预热按域线性分层，拆开反而割裂失败处理。
 func warmModelRates(ctx context.Context, client *upstream.Client, state7 *pool.Pool) {
+	// 预热跑在独立协程里（见启动处的 go）：一次 panic 会终止整个进程，连带所有
+	// 账号的 /v1/*。隔离后失败只影响本轮倍率表，下一轮懒触发仍会补上。
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("ERR: [upstream] 模型倍率预热 panic（已隔离）: %v\n%s", rec, debug.Stack())
+		}
+	}()
+
 	// 预热不得拖住进程退出：ctx 取消（SIGINT/SIGTERM）时立刻放弃剩余域。
 	if ctx.Err() != nil {
 		return
