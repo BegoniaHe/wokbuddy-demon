@@ -1107,6 +1107,22 @@ func TestRequestMetricsToolCounters(t *testing.T) {
 	}
 }
 
+// paceTextTokens 估算一段正文的 token 数：ASCII ≈ 4 字符/token，CJK ≈ 1.5 字符/token。
+// 只作出站整形节奏的测试 oracle；生产侧走 notePaceChars 累计后调 pool.ApproxTokens。
+func paceTextTokens(text string) int64 {
+	ascii, cjk := 0, 0
+
+	for _, r := range text {
+		if pool.IsCJKChar(r) {
+			cjk++
+		} else {
+			ascii++
+		}
+	}
+
+	return pool.ApproxTokens(int64(ascii), int64(cjk))
+}
+
 // TestPaceEstimateMatchesPoolEstimate 响应整形节奏（server）与请求预扣（pool）必须
 // 同一口径。参考实现不复用 pool 的判据与常量，任一侧漂移都会在这里报错。
 func TestPaceEstimateMatchesPoolEstimate(t *testing.T) {

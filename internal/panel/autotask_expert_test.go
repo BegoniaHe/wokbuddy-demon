@@ -13,7 +13,7 @@ import (
 )
 
 // TestRunExpertUseAllFailedReturnsError 全部召唤上报失败时必须返回错误：
-// 返回 nil 会让 autoRunAction 把「0 位完成」标成 done，失败被静默吞掉。
+// 返回 nil 会让 autoRunActionWithSnapshot 把「0 位完成」标成 done，失败被静默吞掉。
 func TestRunExpertUseAllFailedReturnsError(t *testing.T) {
 	t.Parallel()
 

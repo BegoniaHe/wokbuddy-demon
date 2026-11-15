@@ -6,10 +6,14 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	utls "github.com/refraction-networking/utls"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 )
@@ -318,3 +322,45 @@ func TestClientHelloSpecRejectsUnsupported(t *testing.T) {
 		t.Fatal("未知扩展 ID 应报错")
 	}
 }
+
+// buildClientHello 生成一次真实的首连 ClientHello 报文（不含任何会话恢复），
+// 供测试核对扩展顺序、JA3/JA4 与 padding 行为。仅测试使用：生产握手走
+// tlsdial.go 的 handshakeUTLS，不经这里。
+func buildClientHello(spec *clientprofile.TLS, serverName string) ([]byte, error) {
+	helloSpec, err := clientHelloSpec(spec, serverName)
+	if err != nil {
+		return nil, err
+	}
+
+	conn := &nopConn{}
+
+	uconn := utls.UClient(conn, &utls.Config{ServerName: serverName, OmitEmptyPsk: true}, utls.HelloCustom)
+	if err := uconn.ApplyPreset(helloSpec); err != nil {
+		return nil, fmt.Errorf("ApplyPreset: %w", err)
+	}
+
+	// 不加载会话：首连形状（无 pre_shared_key）。
+	if err := uconn.BuildHandshakeStateWithoutSession(); err != nil {
+		return nil, fmt.Errorf("BuildHandshakeState: %w", err)
+	}
+
+	return append([]byte(nil), uconn.HandshakeState.Hello.Raw...), nil
+}
+
+// nopConn 是 ClientHello 构造阶段占位的 net.Conn：BuildHandshakeState 只做序列化，
+// 不读写底层连接。
+type nopConn struct{}
+
+func (*nopConn) Read([]byte) (int, error)           { return 0, net.ErrClosed }
+func (*nopConn) Write(p []byte) (int, error)        { return len(p), nil }
+func (*nopConn) Close() error                       { return nil }
+func (*nopConn) LocalAddr() net.Addr                { return nopAddr{} }
+func (*nopConn) RemoteAddr() net.Addr               { return nopAddr{} }
+func (*nopConn) SetDeadline(_ time.Time) error      { return nil }
+func (*nopConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (*nopConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+type nopAddr struct{}
+
+func (nopAddr) Network() string { return "nop" }
+func (nopAddr) String() string  { return "nop" }

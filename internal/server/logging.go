@@ -269,23 +269,6 @@ func (s *chatStatsReader) paceExactTokens() (int64, bool) {
 	return s.paceExact.Load(), s.paceExactSeen.Load()
 }
 
-// paceTextTokens 估算一段正文的 token 数：ASCII ≈ 4 字符/token，CJK ≈ 1.5 字符/token。
-// 只用于响应整形的 TPM 节奏（issue #448），不参与计费或用量统计；直接在 string 上
-// 逐 rune 解码，不复制。口径来自 pool：请求预扣与响应节奏必须同一判据。
-func paceTextTokens(text string) int64 {
-	ascii, cjk := 0, 0
-
-	for _, r := range text {
-		if pool.IsCJKChar(r) {
-			cjk++
-		} else {
-			ascii++
-		}
-	}
-
-	return pool.ApproxTokens(int64(ascii), int64(cjk))
-}
-
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() *pool.TokenUsageDelta {
 	return &pool.TokenUsageDelta{
