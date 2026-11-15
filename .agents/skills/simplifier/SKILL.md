@@ -11,7 +11,7 @@ compatibility: >
   Codex CLI or OpenCode in the BegoniaHe/wokbuddy-demon checkout. Go 1.27;
   no extra tools.
 metadata:
-  author: BegoniaHe
+  author: BegoniaHe <163421589+BegoniaHe@users.noreply.github.com>
   checkout: BegoniaHe/wokbuddy-demon
   based_on: DietrichGebert/ponytail (MIT)
 ---

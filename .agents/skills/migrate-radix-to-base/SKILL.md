@@ -1,6 +1,10 @@
 ---
 name: migrate-radix-to-base
 description: Migrates React projects and components from Radix UI to Base UI. Use when asked to migrate from radix, move to base-ui, convert radix primitives, or switch a shadcn project's base library. Handles single components ("migrate accordion") and whole projects.
+metadata:
+  author: BegoniaHe <163421589+BegoniaHe@users.noreply.github.com>
+  checkout: BegoniaHe/wokbuddy-demon
+  based_on: shadcn-ui/ui (MIT)
 ---
 
 # Radix UI -> Base UI migration
