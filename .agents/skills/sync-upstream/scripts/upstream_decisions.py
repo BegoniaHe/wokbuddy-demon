@@ -211,7 +211,7 @@ def common_record_args(
     parser.add_argument(
         "--official-baseline",
         default=text_default,
-        help='official client versions/commits, e.g. "cn 5.8.3... / global 5.8.4..."',
+        help='official client versions/commits, e.g. "cn 5.11.3... / global 5.9.4..."',
     )
     parser.add_argument("--fork-adaptation", default=text_default)
     parser.add_argument("--revisit-when", default=text_default)

@@ -1,12 +1,14 @@
 package panel
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // model_probes 端点三态：文件存在 → 透传 + exists:true + updated_at；
@@ -30,9 +32,9 @@ func TestModelProbesEndpoint(t *testing.T) {
 	}
 
 	var got struct {
-		Probes    map[string]json.RawMessage `json:"probes"`
-		Exists    bool                       `json:"exists"`
-		UpdatedAt string                     `json:"updated_at"`
+		Probes    map[string]jsontext.Value `json:"probes"`
+		Exists    bool                      `json:"exists"`
+		UpdatedAt string                    `json:"updated_at"`
 	}
 	decodeJSONBytes(t, rec.Body.Bytes(), &got)
 
@@ -63,8 +65,8 @@ func TestModelProbesEndpointMissing(t *testing.T) {
 	}
 
 	var gotEmpty struct {
-		Probes map[string]json.RawMessage `json:"probes"`
-		Exists bool                       `json:"exists"`
+		Probes map[string]jsontext.Value `json:"probes"`
+		Exists bool                      `json:"exists"`
 	}
 	decodeJSONBytes(t, rec.Body.Bytes(), &gotEmpty)
 
@@ -111,7 +113,7 @@ func getModelProbes(cfg Config) *httptest.ResponseRecorder {
 func decodeJSONBytes(t *testing.T, data []byte, v any) {
 	t.Helper()
 
-	if err := json.Unmarshal(data, v); err != nil {
+	if err := jsonx.Unmarshal(data, v); err != nil {
 		t.Fatal(err)
 	}
 }

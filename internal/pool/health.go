@@ -148,17 +148,16 @@ func (e *entry) healthFactor(model string, now time.Time) float64 {
 }
 
 // pruneExpiredHealth 删除超过 healthTTL 无观测的健康条目（惰性清理，防 map 膨胀）。
+// 条目数另有 maxModelKeysPerAccount 硬上限：键是客户端可任填的模型名（见该常量注释）。
 // 调用方需已持 p.mu（pick 路径写锁）。
 func (e *entry) pruneExpiredHealth(now time.Time) {
-	if len(e.health) == 0 {
-		return
-	}
-
-	for model, mh := range e.health {
-		if now.Sub(mh.lastSeen) > healthTTL {
-			delete(e.health, model)
+	pruneModelLedger(e.health, func(mh *modelHealth) time.Time {
+		if mh == nil {
+			return time.Time{}
 		}
-	}
+
+		return mh.lastSeen.Add(healthTTL)
+	}, now)
 }
 
 // TTFTByModel 返回各模型当前 TTFT EWMA 的账号均值（ms）。只统计 healthTTL 内有

@@ -12,12 +12,12 @@ package server
 
 import (
 	"bytes"
-	"encoding/json"
 	"log"
 	"net/http"
 	"slices"
 	"strings"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -28,7 +28,7 @@ import (
 var contentTypeMarker = []byte(`"type"`)
 
 // modalityContent 只保留 part 数组里的 type：字符串 content（纯文本，最常见）在
-// UnmarshalJSON 里直接跳过，不复制原文。此前用 json.RawMessage 会把每条消息的
+// UnmarshalJSON 里直接跳过，不复制原文。此前用 jsontext.Value 会把每条消息的
 // content 全文复制一份，长上下文下每请求几十 KB 的无谓分配。
 type modalityContent struct {
 	parts []struct {
@@ -48,7 +48,7 @@ func (c *modalityContent) UnmarshalJSON(raw []byte) error {
 	}
 	// 解析失败时整条消息按纯文本处理（与旧逐条 Unmarshal + continue 同义）；
 	// 不能保留半解析出的 parts，否则畸形 content 会误报出模态。
-	if err := json.Unmarshal(raw, &parts); err != nil {
+	if err := jsonx.Unmarshal(raw, &parts); err != nil {
 		return nil //nolint:nilerr // 畸形 content 按纯文本处理，不阻断整包请求解析
 	}
 
@@ -72,7 +72,7 @@ func requestModalities(body []byte) []string {
 			Content modalityContent `json:"content"`
 		} `json:"messages"`
 	}
-	if json.Unmarshal(body, &peek) != nil {
+	if jsonx.Unmarshal(body, &peek) != nil {
 		return nil
 	}
 
@@ -201,13 +201,13 @@ func (f *chatFlow) applyModalityRoute() bool {
 	}
 	// 默认拒绝：明确告诉客户端模型缺哪个模态，并给出几个可用模型。
 	if !f.h.multimodalRoutingEnabled() {
-		f.rejectModality(modelInfo.ID, missing, infos)
+		f.rejectModality(modelInfo.ID, want, missing, infos)
 		return false
 	}
 	// 按模态路由：同 realm 目录里找支持全部模态的候选（首选目录第一条）。
 	cands := modelsSupporting(infos, want)
 	if len(cands) == 0 {
-		f.rejectModality(modelInfo.ID, missing, infos)
+		f.rejectModality(modelInfo.ID, want, missing, infos)
 		return false
 	}
 
@@ -220,10 +220,14 @@ func (f *chatFlow) applyModalityRoute() bool {
 }
 
 // rejectModality 写 400 model_capability：错误信息明确缺哪个模态，gateway_hint
-// 列出同 realm 支持该模态的候选模型（最多 3 个，不编造）。
-func (f *chatFlow) rejectModality(model string, missing []string, infos []upstream.ModelInfo) {
+// 列出同 realm 支持**全部请求模态**的候选模型（最多 3 个，不编造）。
+func (f *chatFlow) rejectModality(
+	model string, want, missing []string, infos []upstream.ModelInfo,
+) {
 	msg := "model \"" + model + "\" does not support " + strings.Join(missing, "/") + " input"
-	cands := modelsSupporting(infos, missing)
+	// 用 want 而不是 missing：路由分支也按 want 选候选。按 missing 检索会推荐
+	// 「只补了缺失那一项、仍差其它模态」的模型，客户端改选后照样 400。
+	cands := modelsSupporting(infos, want)
 	hint := ""
 
 	if len(cands) > 0 {

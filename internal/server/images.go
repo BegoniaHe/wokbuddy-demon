@@ -15,7 +15,7 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +26,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
@@ -186,7 +187,7 @@ func requestBodyModel(w http.ResponseWriter, body []byte) (string, bool) {
 	var peek struct {
 		Model string `json:"model"`
 	}
-	if json.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
+	if jsonx.Unmarshal(body, &peek) != nil || strings.TrimSpace(peek.Model) == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "model is required")
 
 		return "", false
@@ -485,9 +486,9 @@ func fillMediaUsage(delta *usage.Delta, raw []byte) {
 			TotalTokens      int64   `json:"total_tokens"`
 			Credit           float64 `json:"credit"`
 		} `json:"usage"`
-		Data json.RawMessage `json:"data"`
+		Data jsontext.Value `json:"data"`
 	}
-	if json.Unmarshal(raw, &payload) != nil {
+	if jsonx.Unmarshal(raw, &payload) != nil {
 		return
 	}
 
@@ -505,7 +506,7 @@ func fillMediaUsage(delta *usage.Delta, raw []byte) {
 				Credit float64 `json:"credit"`
 			} `json:"usage"`
 		}
-		if json.Unmarshal(payload.Data, &task) == nil && task.Usage.Credit > 0 {
+		if jsonx.Unmarshal(payload.Data, &task) == nil && task.Usage.Credit > 0 {
 			delta.Credit, delta.HasCredit = task.Usage.Credit, true
 		}
 	}

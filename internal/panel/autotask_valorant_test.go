@@ -1,7 +1,6 @@
 package panel
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -38,7 +38,7 @@ func TestRunValorantExpertChain(t *testing.T) {
 			raw, _ := io.ReadAll(r.Body)
 
 			var events []map[string]any
-			if err := json.Unmarshal(raw, &events); err != nil {
+			if err := jsonx.Unmarshal(raw, &events); err != nil {
 				t.Errorf("report body: %v", err)
 			}
 

@@ -1,10 +1,11 @@
 package auth
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestIsEnterprise 企业版判定：enterpriseId 非空即企业版（纯空白视为非企业）。
@@ -159,7 +160,7 @@ func TestSaveAtomicWritesEditionType(t *testing.T) {
 			var doc struct {
 				Account map[string]any `json:"account"`
 			}
-			if err = json.Unmarshal(raw, &doc); err != nil {
+			if err = jsonx.Unmarshal(raw, &doc); err != nil {
 				t.Fatalf("unmarshal: %v", err)
 			}
 

@@ -4,6 +4,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -154,6 +156,45 @@ func TestNormalizeIPMatchesNetIPString(t *testing.T) {
 
 		if got, want := normalizeIP(raw), ip.String(); got != want {
 			t.Errorf("normalizeIP(%q)=%q want %q", raw, got, want)
+		}
+	}
+}
+
+// XFF 只解析最右侧的有限段：客户端能塞任意多段，每段都会走一次
+// SplitHostPort + ParseIP。截断后结论必须与「全量解析」一致。
+func TestClientIPCapsForwardedHops(t *testing.T) {
+	t.Parallel()
+
+	trusted := mustProxies(t, "10.0.0.0/8")
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.RemoteAddr = "10.0.0.2:1234"
+
+	// 最左侧塞 200 段伪造地址，最右侧留下真实链路（不可信客户端 203.0.113.7）。
+	parts := make([]string, 0, 200)
+	for i := range 200 {
+		parts = append(parts, "198.51.100."+strconv.Itoa(i%256))
+	}
+
+	parts = append(parts, "203.0.113.7", "10.0.0.3")
+	req.Header.Set("X-Forwarded-For", strings.Join(parts, ", "))
+
+	if got := ClientIP(req, trusted); got != "203.0.113.7" {
+		t.Fatalf("ClientIP=%q want 203.0.113.7（最右侧非可信地址）", got)
+	}
+
+	if got := len(splitForwarded(req.Header.Values("X-Forwarded-For"))); got > maxForwardedHops {
+		t.Fatalf("解析段数=%d 超过上限 %d", got, maxForwardedHops)
+	}
+}
+
+// 带作用域后缀的 IPv6 地址（fe80::1%eth0）必须能解析出主机地址：否则可信反代
+// 之后同一来源被判成非法而回落到对端地址，限速把所有客户端归并成一条。
+func TestNormalizeIPStripsZone(t *testing.T) {
+	t.Parallel()
+
+	for _, raw := range []string{"fe80::1%eth0", "[fe80::1%25eth0]", "[fe80::1%eth0]:8080"} {
+		if got := normalizeIP(raw); got != "fe80::1" {
+			t.Fatalf("normalizeIP(%q)=%q want fe80::1", raw, got)
 		}
 	}
 }

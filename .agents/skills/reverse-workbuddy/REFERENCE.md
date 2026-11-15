@@ -43,12 +43,18 @@
   边界与成功判定见 `SKILL.md`「用网关凭证登录 wine 客户端」；登录态落盘形制与
   证据锚点见 `references/protocol-anchors.md`「客户端登录态落盘」。
 
-## 已知数据形态（2026-10-22 核对，Win32）
+## 已知数据形态（2026-11-15 核对，Win32）
 
 | Realm | 包版本 | `cli/product.json` `productName` | `endpoint` | `authentication.id` | commit | date |
 | --- | --- | --- | --- | --- | --- | --- |
-| `cn` | 5.8.3.41334564-db0e9b51 | WorkBuddy | https://www.workbuddy.cn | workbuddy-desktop | `db0e9b51b7fa0b383f41f5b0b83dd442c8557918` | 2026-10-15T01:58:12.880Z |
-| `global` | 5.8.4.41366630-73952edb | WorkBuddy AI | https://www.workbuddy.ai | workbuddy-desktop-ai | `73952edb48da46bd0b244661efe22f4f247c4977` | 2026-10-15T11:18:04.107Z |
+| `cn` | 5.11.3.43806934-ecace0f7 | WorkBuddy | https://www.workbuddy.cn | workbuddy-desktop | `ecace0f7028166695994300182295329b8b95449` | 2026-11-12T16:49:29.764Z |
+| `global` | 5.9.4.42593613-fa0a0901 | WorkBuddy AI | https://www.workbuddy.ai | workbuddy-desktop-ai | `fa0a0901906addaa1a4259f6df347388a5563ded` | 2026-10-29T15:46:44.029Z |
+
+同一时点两 realm 版本不同步（cn 5.11.3 / global 5.9.4）属常态：区分域不要假设版本号对齐，
+每次按各自 update 接口取；`authentication.id` 两 realm 不同（`workbuddy-desktop` vs
+`workbuddy-desktop-ai`），登录态文件 `<id>.info` 因此也不同名。`cli/product.json`
+**没有** `releaseDate` 键，包内只有 `date`；profile 的 `releaseDate` 需另取来源，
+不得由 `date` 或版本号推断。
 
 macOS 同版本包的 commit/date 可能与 Win32 不同（CN 的 commit 与 date 都不同、
 global 仅 releaseDate 不同），只能用于辅助对照，不得写入 profile 或代码常量。

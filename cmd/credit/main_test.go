@@ -93,32 +93,32 @@ func TestUserResourceRequestUsesIssuingDomain(t *testing.T) {
 	}{
 		{
 			name: "国内站（domain=codebuddy.cn 仍判 cn，缺省打 workbuddy.cn）",
-			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"}}`,
+			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.cn"},"account":{"uid":"u1"}}`,
 			want: "https://www.workbuddy.cn/billing/meter/get-user-resource",
 		},
 		{
 			name: "国内站无 domain",
-			raw:  `{"auth":{"accessToken":"at"}}`,
+			raw:  `{"auth":{"accessToken":"at"},"account":{"uid":"u1"}}`,
 			want: "https://www.workbuddy.cn/billing/meter/get-user-resource",
 		},
 		{
 			name: "官方国际站",
-			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.ai"}}`,
+			raw:  `{"auth":{"accessToken":"at","domain":"www.codebuddy.ai"},"account":{"uid":"u1"}}`,
 			want: "https://www.codebuddy.ai/billing/meter/get-user-resource",
 		},
 		{
 			name: "旧桌面国际站",
-			raw:  `{"auth":{"accessToken":"at","domain":"www.workbuddy.ai"}}`,
+			raw:  `{"auth":{"accessToken":"at","domain":"www.workbuddy.ai"},"account":{"uid":"u1"}}`,
 			want: "https://www.workbuddy.ai/billing/meter/get-user-resource",
 		},
 		{
 			name: "显式 global 无 domain",
-			raw:  `{"auth":{"accessToken":"at","realm":"global"}}`,
+			raw:  `{"auth":{"accessToken":"at","realm":"global"},"account":{"uid":"u1"}}`,
 			want: "https://www.workbuddy.ai/billing/meter/get-user-resource",
 		},
 		{
 			name: "realm=cn 但 domain 属 global",
-			raw:  `{"auth":{"accessToken":"at","realm":"cn","domain":"www.workbuddy.ai"}}`,
+			raw:  `{"auth":{"accessToken":"at","realm":"cn","domain":"www.workbuddy.ai"},"account":{"uid":"u1"}}`,
 			want: "https://www.workbuddy.ai/billing/meter/get-user-resource",
 		},
 	}

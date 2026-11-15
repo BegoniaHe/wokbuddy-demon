@@ -1,13 +1,15 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // ParseConfig 测试便利入口：基于默认值解析配置，不读环境变量。
@@ -690,8 +692,8 @@ func assertConfigDocAPIKey(t *testing.T, fp, want string) {
 		t.Fatal(err)
 	}
 
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(written, &doc); err != nil {
+	var doc map[string]jsontext.Value
+	if err := jsonx.Unmarshal(written, &doc); err != nil {
 		t.Fatal(err)
 	}
 
@@ -700,7 +702,7 @@ func assertConfigDocAPIKey(t *testing.T, fp, want string) {
 	}
 
 	var got string
-	if err := json.Unmarshal(doc["api_key"], &got); err != nil || got != want {
+	if err := jsonx.Unmarshal(doc["api_key"], &got); err != nil || got != want {
 		t.Fatalf("file api_key=%q err=%v want %q", got, err, want)
 	}
 }
@@ -714,7 +716,7 @@ func TestReplacePlaceholderAPIKeyKeepsExplicitValues(t *testing.T) {
 			dir := t.TempDir()
 			filePath := filepath.Join(dir, "config.json")
 
-			raw, err := json.Marshal(map[string]any{"api_key": explicit, "listen": ":9000"})
+			raw, err := jsonx.Marshal(map[string]any{"api_key": explicit, "listen": ":9000"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -912,7 +914,7 @@ func TestPromptHistoryKeepTurnsRejectsBad(t *testing.T) {
 		t.Run(fmt.Sprintf("非法值 %d", bad), func(t *testing.T) {
 			t.Parallel()
 
-			raw, err := json.Marshal(map[string]any{"prompt": map[string]any{"history_keep_turns": bad}})
+			raw, err := jsonx.Marshal(map[string]any{"prompt": map[string]any{"history_keep_turns": bad}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -940,7 +942,7 @@ func TestPromptHistoryKeepTurnsRejectsBad(t *testing.T) {
 func TestPromptHistoryKeepTurnsAccepted(t *testing.T) {
 	t.Parallel()
 
-	raw, err := json.Marshal(map[string]any{"prompt": map[string]any{"history_keep_turns": 7}})
+	raw, err := jsonx.Marshal(map[string]any{"prompt": map[string]any{"history_keep_turns": 7}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -980,7 +982,7 @@ func TestPromptFileOverride(t *testing.T) {
 
 	str := filepath.Join(dir, "c.json")
 	// 用 json.Marshal 拼路径：Windows 反斜杠必须转义，手工字符串拼接会产出非法 JSON。
-	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": str2}})
+	cfgJSON, err := jsonx.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": str2}})
 	if err != nil {
 		t.Fatal(err)
 	}

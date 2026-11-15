@@ -3,7 +3,7 @@ package panel
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +17,8 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 // 批量导入（cockpit / 桌面端 / 加密备份）共用的资源上限（issue #107）。
@@ -236,7 +238,7 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 	switch trimmed[0] {
 	case '[':
 		var accounts []cockpitAccount
-		if err := json.Unmarshal(trimmed, &accounts); err != nil {
+		if err := jsonx.Unmarshal(trimmed, &accounts); err != nil {
 			return nil, fmt.Errorf("accounts array: %w", err)
 		}
 
@@ -246,8 +248,8 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 		return nil, errCockpitRootValue
 	}
 
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(trimmed, &obj); err != nil {
+	var obj map[string]jsontext.Value
+	if err := jsonx.Unmarshal(trimmed, &obj); err != nil {
 		return nil, fmt.Errorf("root object: %w", err)
 	}
 
@@ -259,7 +261,7 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 	// 当成 uid 键，报出与真实原因无关的错误。
 	if isCockpitAccountObject(obj) {
 		var acc cockpitAccount
-		if err := json.Unmarshal(trimmed, &acc); err != nil {
+		if err := jsonx.Unmarshal(trimmed, &acc); err != nil {
 			return nil, fmt.Errorf("single account: %w", err)
 		}
 
@@ -270,7 +272,7 @@ func decodeCockpitAccounts(raw []byte) ([]cockpitAccount, error) {
 }
 
 // isCockpitAccountObject 判定对象是否为单条账号（任一账号键存在即算）。
-func isCockpitAccountObject(obj map[string]json.RawMessage) bool {
+func isCockpitAccountObject(obj map[string]jsontext.Value) bool {
 	for _, key := range []string{"uid", "access_token", "accessToken"} {
 		if _, ok := obj[key]; ok {
 			return true
@@ -282,17 +284,17 @@ func isCockpitAccountObject(obj map[string]json.RawMessage) bool {
 
 // decodeCockpitEnvelope 解 {account,auth} 信封：account 段可为单对象或数组，
 // 凭证段 auth 的非空字段补齐到每个账号上。
-func decodeCockpitEnvelope(accountRaw, authRaw json.RawMessage) ([]cockpitAccount, error) {
+func decodeCockpitEnvelope(accountRaw, authRaw jsontext.Value) ([]cockpitAccount, error) {
 	var authPart cockpitAccount
 
 	if len(bytes.TrimSpace(authRaw)) > 0 {
-		if err := json.Unmarshal(authRaw, &authPart); err != nil {
+		if err := jsonx.Unmarshal(authRaw, &authPart); err != nil {
 			return nil, fmt.Errorf("auth segment: %w", err)
 		}
 	}
 
 	var accounts []cockpitAccount
-	if err := json.Unmarshal(accountRaw, &accounts); err == nil {
+	if err := jsonx.Unmarshal(accountRaw, &accounts); err == nil {
 		for i := range accounts {
 			accounts[i].fillMissing(&authPart)
 		}
@@ -301,7 +303,7 @@ func decodeCockpitEnvelope(accountRaw, authRaw json.RawMessage) ([]cockpitAccoun
 	}
 
 	var single cockpitAccount
-	if err := json.Unmarshal(accountRaw, &single); err != nil {
+	if err := jsonx.Unmarshal(accountRaw, &single); err != nil {
 		return nil, fmt.Errorf("account segment: %w", err)
 	}
 
@@ -311,7 +313,7 @@ func decodeCockpitEnvelope(accountRaw, authRaw json.RawMessage) ([]cockpitAccoun
 }
 
 // decodeCockpitDict 解 `{"<uid>":{…}}` 字典；排序保证错误顺序与导入顺序可复现。
-func decodeCockpitDict(obj map[string]json.RawMessage) ([]cockpitAccount, error) {
+func decodeCockpitDict(obj map[string]jsontext.Value) ([]cockpitAccount, error) {
 	keys := make([]string, 0, len(obj))
 	for key := range obj {
 		keys = append(keys, key)
@@ -328,7 +330,7 @@ func decodeCockpitDict(obj map[string]json.RawMessage) ([]cockpitAccount, error)
 		}
 
 		var acc cockpitAccount
-		if err := json.Unmarshal(val, &acc); err != nil {
+		if err := jsonx.Unmarshal(val, &acc); err != nil {
 			return nil, fmt.Errorf("dictionary entry %q: %w", key, err)
 		}
 
@@ -417,17 +419,17 @@ func (p *Panel) postImportAccounts(ctx context.Context, accounts []*auth.Auth) {
 		sem <- struct{}{}
 
 		wg.Add(1)
-		go func(account3 *auth.Auth) {
+		p.goGuarded("import-account-checkin", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			uid := account3.UID
-			p.importCheckin(ctx, account3, uid)
+			uid := item.UID
+			p.importCheckin(ctx, item, uid)
 
-			if rm, tt, err := p.cfg.Upstream.UserResource(ctx, account3); err == nil {
+			if rm, tt, err := p.cfg.Upstream.UserResource(ctx, item); err == nil {
 				p.cfg.Pool.ReenableIfCredits(uid, rm, tt)
 			}
-		}(item)
+		})
 	}
 
 	wg.Wait()
@@ -492,12 +494,25 @@ func (p *Panel) persistImportedAuth(account *auth.Auth, realm, uid string) error
 		}
 	}
 
+	// 覆盖既有账号时先退役旧实例：否则旧实例在途 refresh 会把旧 token 写回同一
+	// 路径（锁按实例私有），内存是新凭证、磁盘是旧凭证，重启后旧凭证复活。
+	replacing := p.cfg.Pool.AuthByUID(uid) != nil
+
+	if replacing {
+		p.cfg.Pool.AuthByUID(uid).Retire()
+	}
+
 	if err := account.SaveAtomic(); err != nil {
 		return fmt.Errorf("uid=%s: save auth failed: %w", uid, err)
 	}
 
 	p.cfg.Pool.Add(account)
-	p.cfg.Pool.Revive(uid)
+
+	// 只有全新账号才按「人工恢复」口径清掉遗留状态。覆盖既有账号时调 Revive 会把
+	// 运维手动 disabled/paused 的号悄悄放回选号池，而响应里没有任何信号。
+	if !replacing {
+		p.cfg.Pool.Revive(uid)
+	}
 
 	return nil
 }
@@ -518,8 +533,11 @@ func (p *Panel) importCheckin(ctx context.Context, account4 *auth.Auth, uid stri
 		return
 	}
 
-	if err := p.cfg.Upstream.DailyCheckin(ctx, account4); err != nil {
+	// 回执口径：2xx 但回执读不出来（空 body / WAF HTML 页）不能算签到成功。
+	if receipt, err := p.cfg.Upstream.DailyCheckinReceipt(ctx, account4); err != nil {
 		log.Printf("panel: import checkin uid=%s: %v", uid, err)
+	} else if receipt.State == upstream.CheckinStateFailed {
+		log.Printf("panel: import checkin uid=%s: %s", uid, receipt.Message)
 	}
 }
 

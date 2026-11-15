@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var (
@@ -30,7 +30,7 @@ func TestPrepareBodyForcesStream(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"model":"glm-5.2","messages":[]}`), true)
 
 	var m map[string]any
-	json.Unmarshal(out, &m)
+	jsonx.Unmarshal(out, &m)
 
 	if m["stream"] != true {
 		t.Errorf("stream=%v", m["stream"])
@@ -43,7 +43,7 @@ func TestPrepareBodyToolChoiceFunctionObject(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"function","function":{"name":"get_weather"}},"tools":[{"type":"function"}]}`), true)
 
 	var m map[string]any
-	json.Unmarshal(out, &m)
+	jsonx.Unmarshal(out, &m)
 
 	if m["tool_choice"] != "get_weather" {
 		t.Errorf("tool_choice=%v", m["tool_choice"])
@@ -64,7 +64,7 @@ func TestPrepareBodyToolChoiceNone(t *testing.T) {
 		out := PrepareBodyOpt([]byte(str), true)
 
 		var m map[string]any
-		json.Unmarshal(out, &m)
+		jsonx.Unmarshal(out, &m)
 
 		if _, ok := m["tool_choice"]; ok {
 			t.Errorf("%s: tool_choice should be deleted", str)
@@ -86,7 +86,7 @@ func TestPrepareBodyToolChoiceAuto(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"auto"}}`), true)
 
 	var m map[string]any
-	json.Unmarshal(out, &m)
+	jsonx.Unmarshal(out, &m)
 
 	if m["tool_choice"] != "auto" {
 		t.Errorf("tool_choice=%v", m["tool_choice"])
@@ -140,8 +140,9 @@ func TestAggregate(t *testing.T) {
 		t.Errorf("finish_reason=%v", choices[0].(map[string]any)["finish_reason"])
 	}
 
+	// 聚合帧保留原始字面量解码，usage 里是 jsontext.Value；取值统一走 UsageNumber。
 	usage := resp["usage"].(map[string]any)
-	if usage["total_tokens"].(float64) != 7 {
+	if got, ok := UsageNumber(usage, "total_tokens"); !ok || got != 7 {
 		t.Errorf("usage=%v", usage)
 	}
 }
@@ -773,7 +774,7 @@ func streamFrames(t *testing.T, raw string) (frames []map[string]any, doneCount 
 
 		if strings.HasPrefix(str, "data: ") {
 			var obj map[string]any
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(str, "data: ")), &obj); err != nil {
+			if err := jsonx.Unmarshal([]byte(strings.TrimPrefix(str, "data: ")), &obj); err != nil {
 				t.Fatalf("bad frame %q: %v", str, err)
 			}
 
@@ -832,7 +833,7 @@ func TestNormalizeFrame(t *testing.T) {
 		t.Run(item.name, func(t *testing.T) {
 			t.Parallel()
 
-			raw, err := json.Marshal(normalizeFrame(item.in))
+			raw, err := jsonx.Marshal(normalizeFrame(item.in))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1136,7 +1137,8 @@ func TestAggregateEmptyStreamCases(t *testing.T) {
 			}
 
 			if u, ok := resp["usage"].(map[string]any); ok {
-				if u["total_tokens"].(float64) != item.wantUsage {
+				// 聚合帧保留原始字面量解码，usage 里是 jsontext.Value。
+				if got, ok := UsageNumber(u, "total_tokens"); !ok || got != item.wantUsage {
 					t.Errorf("usage=%v want %v", u["total_tokens"], item.wantUsage)
 				}
 			} else {
@@ -1208,7 +1210,7 @@ func findEmptyStreamError(body string) bool {
 		}
 
 		var e map[string]any
-		if json.Unmarshal([]byte(payload), &e) != nil {
+		if jsonx.Unmarshal([]byte(payload), &e) != nil {
 			continue
 		}
 
@@ -1475,7 +1477,7 @@ func upstreamSSEWithContent(chunks []string, finish string) string {
 	builder.WriteString(`data: {"id":"resp-1","object":"chat.completion.chunk","created":1,"model":"global:deepseek-v4.1-flash","choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n")
 
 	for _, str := range chunks {
-		nums, _ := json.Marshal(map[string]any{
+		nums, _ := jsonx.Marshal(map[string]any{
 			"id": "resp-1", "object": "chat.completion.chunk", "created": 1,
 			"model": "global:deepseek-v4.1-flash",
 			"choices": []any{map[string]any{
@@ -1486,7 +1488,7 @@ func upstreamSSEWithContent(chunks []string, finish string) string {
 		builder.WriteString("data: " + string(nums) + "\n\n")
 	}
 
-	nums2, _ := json.Marshal(map[string]any{
+	nums2, _ := jsonx.Marshal(map[string]any{
 		"id": "resp-1", "object": "chat.completion.chunk", "created": 1,
 		"model": "global:deepseek-v4.1-flash",
 		"choices": []any{map[string]any{
@@ -1524,7 +1526,7 @@ func viewSSE(t *testing.T, body string) []sseFrameView {
 		}
 
 		var obj map[string]any
-		if err := json.Unmarshal([]byte(payload), &obj); err != nil {
+		if err := jsonx.Unmarshal([]byte(payload), &obj); err != nil {
 			t.Fatalf("帧不是合法 JSON: %q (%v)", payload, err)
 		}
 
@@ -1614,7 +1616,7 @@ func TestStreamMarkupRepairIndexAfterRealToolCall(t *testing.T) {
 	var raw strings.Builder
 
 	writeFrame := func(payload map[string]any) {
-		encoded, err := json.Marshal(payload)
+		encoded, err := jsonx.Marshal(payload)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1724,7 +1726,7 @@ func assertMarkupRepairCall(t *testing.T, i int, testCase map[string]any, want s
 	argsJSON, _ := fn["arguments"].(string)
 
 	var args map[string]any
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
+	if err := jsonx.Unmarshal([]byte(argsJSON), &args); err != nil {
 		t.Fatalf("第 %d 个 tool_call arguments 不是合法 JSON: %q", i, argsJSON)
 	}
 
@@ -1980,9 +1982,15 @@ func TestStreamKeepaliveOnSilence(t *testing.T) {
 		t.Fatalf("stream: %v", err)
 	}
 
+	// 注释帧必须只有单个换行：带空行时它就是一个事件边界，会把上游已缓冲的
+	// 多行 data 事件切断（见 TestCommentDoesNotSplitBufferedData）。
 	out := rec.Body.String()
-	if !strings.Contains(out, ": keepalive\n\n") {
+	if !strings.Contains(out, ": keepalive\n") {
 		t.Fatalf("缺少 keepalive 注释帧:\n%s", out)
+	}
+
+	if strings.Contains(out, ": keepalive\n\n") {
+		t.Fatalf("keepalive 不得自带空行（会切断已缓冲事件）:\n%s", out)
 	}
 
 	if !strings.Contains(out, `"content":"hi"`) || !strings.Contains(out, "data: [DONE]") {
@@ -2208,6 +2216,57 @@ func TestStreamMultiLineData(t *testing.T) {
 	}
 }
 
+// TestAggregateMultiLineData 非流式聚合与流式同口径：规范的多行 data 事件要
+// 拼接后才解析。逐行独立解析会把整条事件判成坏帧，非流式请求因此只能拿到 502。
+func TestAggregateMultiLineData(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"id\":\"c1\",\n" +
+		"data: \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("aggregate: %v", err)
+	}
+
+	choices, _ := resp["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices=%v", resp["choices"])
+	}
+
+	message, _ := choices[0].(map[string]any)["message"].(map[string]any)
+
+	if content, _ := message["content"].(string); content != "hi" {
+		t.Fatalf("content=%q want hi", content)
+	}
+}
+
+// TestAggregateUnterminatedFinalEvent 末尾事件没有空行收尾时也要落帧：
+// 该帧带 finish_reason（EOF 无 [DONE] 的合法收尾），最后一段 content 不能丢。
+func TestAggregateUnterminatedFinalEvent(t *testing.T) {
+	t.Parallel()
+
+	raw := "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tail\"}," +
+		"\"finish_reason\":\"stop\"}]}\n"
+
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("aggregate: %v", err)
+	}
+
+	choices, _ := resp["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices=%v", resp["choices"])
+	}
+
+	message, _ := choices[0].(map[string]any)["message"].(map[string]any)
+
+	if content, _ := message["content"].(string); content != "tail" {
+		t.Fatalf("content=%q want tail", content)
+	}
+}
+
 // TestStreamMultiLineDataEventSizeLimit 多行 data 也必须受总量上限约束：
 // 单行均未超限但合计超限时，不能无限累积（恶意上游不发空行即可撑爆内存）。
 func TestStreamMultiLineDataEventSizeLimit(t *testing.T) {
@@ -2261,5 +2320,65 @@ func TestStreamAggregatorAcceptsDataWithoutSpace(t *testing.T) {
 	message, _ := choices[0].(map[string]any)["message"].(map[string]any)
 	if message["content"] != "hi" {
 		t.Fatalf("content=%v want hi", message["content"])
+	}
+}
+
+// TestStreamErrorFrameNotOverwritten 上游发完错误帧就断流时，收尾不得再补一帧
+// 「truncated before [DONE]」：那会把真实原因（如 6004 限流）覆盖成网关解析问题。
+// 仍按截断返回错误，供调用方把本次请求记为上游失败。
+func TestStreamErrorFrameNotOverwritten(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	raw := `data: {"error":{"code":6004,"message":"limited"}}` + "\n\n"
+
+	err := Stream(rec, strings.NewReader(raw))
+	if !errors.Is(err, errTruncatedStream) {
+		t.Fatalf("err=%v want errTruncatedStream", err)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "6004") {
+		t.Fatalf("上游错误帧丢失: %q", body)
+	}
+
+	if strings.Contains(body, "truncated before [DONE]") {
+		t.Fatalf("收尾覆盖了真实原因: %q", body)
+	}
+}
+
+// errAfterReader 先返回给定字节，再返回固定错误（模拟连接重置/代理中断）。
+type errAfterReader struct {
+	payload []byte
+	err     error
+}
+
+func (r *errAfterReader) Read(p []byte) (int, error) {
+	if len(r.payload) == 0 {
+		return 0, r.err
+	}
+
+	n := copy(p, r.payload)
+	r.payload = r.payload[n:]
+
+	return n, nil
+}
+
+// TestStreamReadErrorWritesDone 中途读错误（连接重置 / idle 超时）也必须给客户端
+// 收尾标记：否则客户端只能把断连当失败读到一半。
+func TestStreamReadErrorWritesDone(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	raw := `data: {"id":"x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n"
+
+	err := Stream(rec, &errAfterReader{payload: []byte(raw), err: io.ErrUnexpectedEOF})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("err=%v want 上游读错误原样上抛", err)
+	}
+
+	body := rec.Body.String()
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Fatalf("[DONE] count=%d want 1: %q", n, body)
 	}
 }

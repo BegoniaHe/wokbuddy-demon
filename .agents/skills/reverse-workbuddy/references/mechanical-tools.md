@@ -53,20 +53,22 @@ node .agents/skills/reverse-workbuddy/scripts/split_inline_modules.mjs \
   --target "global/<ver>" --min-bytes 300000
 ```
 
-## 实测基线（global 5.8.4）
+## 实测基线（cn 5.11.3，2026-11-15 重跑）
 
 | 指标 | 数值 |
 | --- | --- |
-| asar 树 | 13864 文件 / 581MB（`node_modules` 占 315MB，通常直接排除） |
-| `main/` | 176 js / 17MB / 5584 行，平均 3.0KB/行（一文件一模块；`__esmMin` 只出现在 `rolldown-runtime.js` 的定义处） |
-| `main/` 边 | 736 条 require 边，其中 142 条指向 `rolldown-runtime.js` |
-| 可读导出名 | 182 模块 / 45 个 facade / 137 条可读名 / 32 条 dangling（`transport.js` 单模块 30 条） |
-| 字面量 | `main/` 127998 个 / 51998 唯一（`--min-len 4 --max-len 300`） |
-| 格式化 | 181 文件 17MB→21MB，5793 行→516218 行，token 回校 0 失败 |
-| 重命名 | 181 文件 / 195534 个标识符，AST 结构校验 0 失败 |
-| 拆块 | 13 个 >300KB 文件 → 2279 块，字节区间无重叠 |
+| asar 树 | 12232 文件 / 691MB（`node_modules` 占 335MB，通常直接排除） |
+| `main/` | 325 js / 19.4MB / 6432 行，平均 3.0KB/行（一文件一模块；`__esmMin` 只出现在 `rolldown-runtime.js` 的定义处） |
+| `main/` 边 | 1439 条 require 边，其中 228 条指向 `rolldown-runtime.js` |
+| 可读导出名 | 331 模块 / 51 facade / 189 条可读名 / 28 条 dangling |
+| 字面量 | `main/` 145644 个 / 58377 唯一（`--min-len 4 --max-len 300`） |
+| 格式化 | global 5.8.4 实测：181 文件 17MB→21MB，5793 行→516218 行，token 回校 0 失败（本轮未重跑） |
+| 重命名 | global 5.8.4 实测：181 文件 / 195534 个标识符，AST 结构校验 0 失败（本轮未重跑） |
+| 拆块 | global 5.8.4 实测：13 个 >300KB 文件 → 2279 块，字节区间无重叠（本轮未重跑） |
 
-> 上表数字随版本与 `--min-len/--max-len/--dirs` 变化，改动脚本后要重跑并同步更新。
+> 上表数字随版本与 `--min-len/--max-len/--dirs` 变化，改动脚本后要重跑并同步更新；
+> 只跑清单/依赖图/导出面/字面量时几秒内可刷新前五行，格式化/重命名/拆块三行较慢，
+> 未重跑就必须标注原口径版本，不得把旧数字当当前基线。
 > 反例本身也是证据：`main/dist.js` 只有 292KB，`--min-bytes 300000` 默认口径切不到它，
 > 要用 `--files` 点名才会拆（实测 105 处工厂 → 拆块脚本报的 140 块含嵌套工厂）。
 

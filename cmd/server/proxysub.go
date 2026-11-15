@@ -6,7 +6,9 @@
 //   - Clash / KM YAML 的 proxies: 段（只取 http/https/socks5 型条目）。
 //
 // 只做「文本 → []string」，最终校验复用 outbound.ParseProxy；不引入第二套代理模型，
-// 也不引入 YAML 依赖——clash 只解析本项目需要的最小子集（items + key: value）。
+// 也不引入 YAML 依赖——clash 只解析本项目需要的最小子集（items + key: value + 标量
+// 清洗），嵌套列表/映射只用于跳过，不做子结构建模。`type: http` + `tls: true` 按
+// Clash 语义导出 https://；socks5 over TLS 出站不支持，跳过而不是降级成明文。
 // 非法条目单独跳过并记原因，不整批失败；订阅拉取/解析失败保留上一次成功结果。
 package main
 
@@ -25,6 +27,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/panel"
 )
 
 // errProxySubFailed 订阅拉取失败的静态哨兵（err113：错误串里含脱敏 URL 等动态内容）。
@@ -44,7 +47,7 @@ var proxySubFetcher = fetchProxySubscriptionText
 // fetchProxySubscriptionText 拉取订阅原文。错误信息只用脱敏后的 URL：订阅 URL 常
 // 带 token（路径或 query），不能进日志。
 func fetchProxySubscriptionText(rawURL string) (string, error) {
-	masked := maskProxySubURL(rawURL)
+	masked := panel.MaskProxySubURL(rawURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), proxySubFetchTimeout)
 	defer cancel()
@@ -86,30 +89,8 @@ func maskedHTTPError(err error) string {
 	return "请求失败"
 }
 
-// maskProxySubURL 订阅 URL 的打码口径：只留 scheme://host，丢掉可能带 token 的
-// 路径与 query（与 outbound.Proxy.Masked 同一思路）。
-func maskProxySubURL(raw string) string {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return "[invalid proxy subscription url]"
-	}
-
-	return u.Scheme + "://" + u.Host
-}
-
-// maskProxyEntry 单个代理条目的打码口径：同样只留 scheme://host[:port]。
-func maskProxyEntry(raw string) string {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Scheme == "" {
-		return "[unparsable proxy entry]"
-	}
-
-	if parsed.Host == "" {
-		return parsed.Scheme + "://"
-	}
-
-	return parsed.Scheme + "://" + parsed.Host
-}
+// 订阅 URL 与代理条目的打码口径统一由 internal/panel 提供：面板回显与保存侧还原
+// 必须是同一实现，否则「没改动」会被判成「改成了掩码值」（见 panel.MaskProxyEntry）。
 
 // proxySubscriptionCache 上一次成功解析结果（按订阅 URL）。刷新失败时沿用它，
 // 保证「拉不到 ≠ 清空现有代理」。
@@ -151,7 +132,7 @@ func resolveProxySubscriptions(subs []string) []string {
 		if len(proxies) == 0 {
 			cached := cachedProxySubscription(sub)
 			log.Printf("WARN: [server] 代理订阅未解析出可用代理（沿用上次结果 %d 条）: %s（跳过 %d 条）",
-				len(cached), maskProxySubURL(sub), len(skipped))
+				len(cached), panel.MaskProxySubURL(sub), len(skipped))
 			out = append(out, cached...)
 
 			continue
@@ -163,7 +144,7 @@ func resolveProxySubscriptions(subs []string) []string {
 
 		storeProxySubscription(sub, proxies)
 		log.Printf("INFO: [server] 代理订阅已解析: %s（%d 个代理，跳过 %d 条）",
-			maskProxySubURL(sub), len(proxies), len(skipped))
+			panel.MaskProxySubURL(sub), len(proxies), len(skipped))
 		out = append(out, proxies...)
 	}
 
@@ -230,7 +211,7 @@ func parseProxyList(text string) (proxies, skipped []string) {
 		}
 
 		if _, err := outbound.ParseProxy(entry); err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s: %v", maskProxyEntry(entry), err))
+			skipped = append(skipped, fmt.Sprintf("%s: %v", panel.MaskProxyEntry(entry), err))
 
 			continue
 		}
@@ -253,7 +234,7 @@ func parseClashProxies(text string) (proxies, skipped []string) {
 		}
 
 		if _, err := outbound.ParseProxy(entry); err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s: %v", maskProxyEntry(entry), err))
+			skipped = append(skipped, fmt.Sprintf("%s: %v", panel.MaskProxyEntry(entry), err))
 
 			continue
 		}
@@ -265,22 +246,16 @@ func parseClashProxies(text string) (proxies, skipped []string) {
 }
 
 // splitClashProxyItems 抽取 proxies: 段里的条目（每项一个 key/value 表）。只做
-// 行级最小解析：列表项 `- ` 起新项，后续 `key: value` 归属当前项；顶层其它键结束。
+// 行级最小解析：列表项 `- ` 起新项，后续同层 `key: value` 归属当前项；顶层其它键结束。
 //
-//nolint:cyclop,funlen,gocognit,gocyclo // 行级状态机：段起止、缩进、列表项与键值线性展开。
+// 缩进按两层记录：`- ` 的缩进决定条目层（更深的 `- ` 是嵌套列表，如 alpn，跳过），
+// 条目内首个 `key: value` 的缩进决定字段层（更深的缩进是嵌套映射，如 ws-opts 内的
+// path/headers，跳过）。不做嵌套收进子结构——本项目只需要外层字段。
 func splitClashProxyItems(text string) []map[string]string {
 	var (
-		items     []map[string]string
-		current   map[string]string
+		cursor    clashItemCursor
 		inProxies bool
 	)
-
-	flush := func() {
-		if current != nil {
-			items = append(items, current)
-			current = nil
-		}
-	}
 
 	for line := range strings.SplitSeq(text, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -303,27 +278,70 @@ func splitClashProxyItems(text string) []map[string]string {
 			break
 		}
 
-		if strings.HasPrefix(trimmed, "-") {
-			flush()
-
-			current = map[string]string{}
-			parseClashInlineItem(strings.TrimSpace(strings.TrimPrefix(trimmed, "-")), current)
+		if rest, ok := strings.CutPrefix(trimmed, "-"); ok {
+			cursor.startItem(indent, strings.TrimSpace(rest))
 
 			continue
 		}
 
-		if current == nil {
-			continue
-		}
-
-		if key, value, ok := splitClashKeyValue(trimmed); ok {
-			current[key] = value
-		}
+		cursor.addField(indent, trimmed)
 	}
 
-	flush()
+	cursor.flush()
 
-	return items
+	return cursor.items
+}
+
+// clashItemCursor 是 proxies 段的行级解析状态：当前条目、条目层（`- `）缩进与
+// 字段层（首个 `key: value`）缩进。
+type clashItemCursor struct {
+	items       []map[string]string
+	current     map[string]string
+	dashIndent  int
+	fieldIndent int
+}
+
+// startItem 处理列表项行：与条目层同缩进的 `- ` 起新项；更深的 `- ` 是嵌套列表
+// （如 alpn），跳过。
+func (c *clashItemCursor) startItem(indent int, rest string) {
+	if c.current != nil && indent > c.dashIndent {
+		return
+	}
+
+	c.flush()
+
+	c.current = map[string]string{}
+	c.dashIndent = indent
+	c.fieldIndent = -1
+
+	parseClashInlineItem(rest, c.current)
+}
+
+// addField 处理候选字段行：只收与首个字段同缩进的 `key: value`；更深的缩进属于
+// 嵌套映射（如 ws-opts 内的 path/headers），跳过，避免同名键覆盖外层。
+func (c *clashItemCursor) addField(indent int, line string) {
+	if c.current == nil {
+		return
+	}
+
+	if c.fieldIndent < 0 {
+		c.fieldIndent = indent
+	}
+
+	if indent != c.fieldIndent {
+		return
+	}
+
+	if key, value, ok := splitClashKeyValue(line); ok {
+		c.current[key] = value
+	}
+}
+
+func (c *clashItemCursor) flush() {
+	if c.current != nil {
+		c.items = append(c.items, c.current)
+		c.current = nil
+	}
 }
 
 // parseClashInlineItem 处理 `- {name: x, type: http, ...}` 行内形态；块形态传入空串。
@@ -346,7 +364,7 @@ func parseClashInlineItem(rest string, item map[string]string) {
 	}
 }
 
-// splitClashKeyValue 拆分一行 `key: value`，去掉两端引号。
+// splitClashKeyValue 拆分一行 `key: value`，并清洗标量（去行尾注释、去包裹引号）。
 func splitClashKeyValue(line string) (string, string, bool) {
 	key, value, ok := strings.Cut(line, ":")
 	if !ok {
@@ -354,7 +372,7 @@ func splitClashKeyValue(line string) (string, string, bool) {
 	}
 
 	key = strings.TrimSpace(key)
-	value = strings.Trim(strings.TrimSpace(value), `"'`)
+	value = clashScalar(value)
 
 	if key == "" || value == "" {
 		return "", "", false
@@ -363,8 +381,46 @@ func splitClashKeyValue(line string) (string, string, bool) {
 	return strings.ToLower(key), value, true
 }
 
+// clashScalar 清洗 Clash 标量：引号包裹的值原样取引号内内容（引号内的 # 不是注释），
+// 其余情况去掉行尾注释——`#` 前必须是空白，避免误伤密码里的 `#`。
+func clashScalar(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+
+	if quote := value[0]; quote == '"' || quote == '\'' {
+		if end := strings.IndexByte(value[1:], quote); end >= 0 {
+			return value[1 : end+1]
+		}
+
+		return strings.Trim(value, `"'`)
+	}
+
+	for i := 1; i < len(value); i++ {
+		if value[i] == '#' && (value[i-1] == ' ' || value[i-1] == '\t') {
+			return strings.TrimSpace(value[:i])
+		}
+	}
+
+	return value
+}
+
+// clashBool 解析 Clash 布尔标量；缺省或无法识别一律 false。
+func clashBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "true", "1", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 // clashProxyToURL 把一条 Clash 代理映射成 outbound.ParseProxy 认得的 URL。
 // 返回非空 reason 表示跳过。
+//
+// tls 语义对齐 Clash：`type: http` + `tls: true` 是 HTTPS 隧道，导出成 https://；
+// socks5 over TLS 出站不支持，跳过而不是降级成明文（代理口令不能明文出网）。
 func clashProxyToURL(item map[string]string) (string, string) {
 	kind := strings.ToLower(item["type"])
 	server := item["server"]
@@ -376,7 +432,15 @@ func clashProxyToURL(item map[string]string) (string, string) {
 	}
 
 	switch kind {
-	case "http", "https", "socks5", "socks5h":
+	case "http":
+		if clashBool(item["tls"]) {
+			kind = "https"
+		}
+	case "https":
+	case "socks5", "socks5h":
+		if clashBool(item["tls"]) {
+			return "", fmt.Sprintf("Clash 条目 %q: socks5 over TLS（tls: true）没有出站支持，已跳过", name)
+		}
 	default:
 		return "", fmt.Sprintf("Clash 条目 %q: 不支持的代理类型 %q 已跳过", name, kind)
 	}

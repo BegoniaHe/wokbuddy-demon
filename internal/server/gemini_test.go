@@ -1,13 +1,13 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -45,7 +45,7 @@ func TestGeminiToOpenAIRequest(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
 		t.Fatal(err)
 	}
 
@@ -227,7 +227,7 @@ func TestGeminiEndpointNonStream(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -296,7 +296,7 @@ func TestGeminiCountTokens(t *testing.T) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -371,5 +371,25 @@ func TestGeminiArgsObjectNull(t *testing.T) {
 
 	if len(args) != 0 {
 		t.Fatalf("args=%v want empty object", args)
+	}
+}
+
+// TestGeminiLegacyFunctionCallParts 旧式 function_call 由上游刻意保留
+// （upstream/sse.go 的 keepFunctionCall），只读 tool_calls 会让这类响应在 Gemini 面
+// 变成「正常结束、没有工具调用」。
+func TestGeminiLegacyFunctionCallParts(t *testing.T) {
+	t.Parallel()
+
+	parts := geminiFunctionParts(toolCallsWithLegacy(nil, map[string]any{
+		"name": "lookup", "arguments": `{"q":1}`,
+	}))
+
+	if len(parts) != 1 {
+		t.Fatalf("parts=%v want 1（旧式 function_call 应转成 functionCall）", parts)
+	}
+
+	call := parts[0].(map[string]any)["functionCall"].(map[string]any)
+	if call["name"] != "lookup" {
+		t.Errorf("call=%v", call)
 	}
 }

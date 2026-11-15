@@ -10,7 +10,6 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 const (
@@ -75,7 +75,7 @@ func (c *Client) AgenticSearch(
 		bizVia = "public"
 	}
 
-	body, err := json.Marshal(agenticRequestBody{
+	body, err := jsonx.Marshal(agenticRequestBody{
 		Query: query, SearchMode: agenticSearchMode, Stream: true, BizVia: strings.TrimSpace(bizVia),
 	})
 	if err != nil {
@@ -140,7 +140,7 @@ func agenticJSONError(status int, raw []byte) error {
 	}
 
 	var env apiEnvelope
-	if json.Unmarshal(trimmed, &env) != nil {
+	if jsonx.Unmarshal(trimmed, &env) != nil {
 		return nil //nolint:nilerr // 非 JSON 业务错误，交给 SSE 解析
 	}
 
@@ -175,7 +175,7 @@ func parseAgenticSSE(raw []byte) (*AgenticOutcome, error) {
 			Usage      *AgenticUsage `json:"usage"`
 			TokenUsage *AgenticUsage `json:"token_usage"`
 		}
-		if json.Unmarshal([]byte(data), &frame) != nil {
+		if jsonx.Unmarshal([]byte(data), &frame) != nil {
 			return nil, fmt.Errorf("agentic search parse done frame: %w", ErrAgenticSearchNoSynthesis)
 		}
 

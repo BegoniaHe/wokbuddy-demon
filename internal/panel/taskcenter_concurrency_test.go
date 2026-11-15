@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -56,7 +57,7 @@ func TestCollectQueueAccountsBoundsUpstreamConcurrency(t *testing.T) {
 	}
 
 	panel := &Panel{cfg: Config{Pool: state, Upstream: client}}
-	panel.collectQueueAccounts(true)
+	panel.collectQueueAccounts(context.Background(), true)
 
 	if got := peak.Load(); got > scanWorkers {
 		t.Fatalf("peak upstream concurrency=%d want <= %d", got, scanWorkers)

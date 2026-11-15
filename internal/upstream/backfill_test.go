@@ -1,8 +1,9 @@
 package upstream
 
 import (
-	"encoding/json"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // assistantRC 提取输出 messages 里各 assistant 消息的 reasoning_content（缺字段返回 ""+false）。
@@ -11,7 +12,7 @@ func assistantRC(t *testing.T, out []byte) []string {
 	t.Helper()
 
 	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
+	if err := jsonx.Unmarshal(out, &m); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
 
@@ -239,7 +240,7 @@ func TestMirrorReasoningFields(t *testing.T) {
 			out := PrepareBodyOptWithEfforts([]byte(testCase.body), false, nil)
 
 			var doc map[string]any
-			if err := json.Unmarshal(out, &doc); err != nil {
+			if err := jsonx.Unmarshal(out, &doc); err != nil {
 				t.Fatal(err)
 			}
 
@@ -281,7 +282,7 @@ func TestBackfillReasoningContentBothFields(t *testing.T) {
 	}
 	// 同时确认 reasoning 字段仍原样保留。
 	var m map[string]any
-	if err := json.Unmarshal(out, &m); err != nil {
+	if err := jsonx.Unmarshal(out, &m); err != nil {
 		t.Fatal(err)
 	}
 

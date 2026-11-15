@@ -11,9 +11,10 @@ import (
 )
 
 // attachModelBusy 给已构造的模型条目补 busy 字段（按 realm 各取一个可用账号）。
+// ctx 来自请求：客户端关页面后应立即放弃探测，而不是让两域各跑满 8s。
 //
 //nolint:gocognit // 逐模型附加繁忙度并汇总错误，线性展开。
-func (p *Panel) attachModelBusy(out []map[string]any, busyErrs *[]string) {
+func (p *Panel) attachModelBusy(ctx context.Context, out []map[string]any, busyErrs *[]string) {
 	for _, realm := range []string{"cn", "global"} {
 		names := modelNamesForRealm(out, realm)
 		if len(names) == 0 {
@@ -30,8 +31,8 @@ func (p *Panel) attachModelBusy(out []map[string]any, busyErrs *[]string) {
 			continue
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		levels, err := p.cfg.Upstream.ModelBusy(ctx, account, names)
+		reqCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		levels, err := p.cfg.Upstream.ModelBusy(reqCtx, account, names)
 
 		cancel()
 

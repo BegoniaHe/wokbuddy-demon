@@ -11,7 +11,6 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // 官方视频端点路径（CN / global 共用 chatBase）。
@@ -75,7 +75,7 @@ func (c *Client) GetVideoTask(
 		return 0, nil, errVideoTaskIDRequired
 	}
 
-	body, err := json.Marshal(struct {
+	body, err := jsonx.Marshal(struct {
 		TaskID string `json:"task_id"`
 	}{TaskID: taskID})
 	if err != nil {
@@ -129,7 +129,7 @@ func (c *Client) postVideo(
 
 	// 200 + 业务错误信封（部分上游故障形态）。
 	var env apiEnvelope
-	if json.Unmarshal(raw, &env) == nil && env.Code != 0 {
+	if jsonx.Unmarshal(raw, &env) == nil && env.Code != 0 {
 		kind := Classify(resp.StatusCode, string(raw))
 		if kind == ErrNone {
 			kind = ErrClient

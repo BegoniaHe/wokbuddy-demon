@@ -189,7 +189,7 @@ python3 .agents/skills/sync-upstream/scripts/upstream_decisions.py add \
   --reason-code upstream-protocol \
   --path internal/auth \
   --issue https://github.com/BegoniaHe/wokbuddy-demon/issues/282 \
-  --official-baseline "cn 5.8.3.41334564-db0e9b51 / global 5.8.4.41366630-73952edb" \
+  --official-baseline "cn 5.11.3.43806934-ecace0f7 / global 5.9.4.42593613-fa0a0901" \
   --notes "Official evidence: ...; fork gap: ..."
 ```
 

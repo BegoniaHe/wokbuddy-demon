@@ -17,7 +17,7 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +25,7 @@ import (
 	"net/url"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // growth 域任务路径（与 scripts/task_common.py 对齐）。
@@ -40,23 +41,23 @@ const mpPlatform = "miniprogram"
 // Task 单个任务的对外视图（字段名与上游 JSON 对齐，多余字段不透出）。
 type Task struct {
 	TaskCode     string `json:"task_code"`
-	Title        string `json:"title,omitempty"`
-	Description  string `json:"description,omitempty"` // 操作指引（含跳转说明）
-	TaskDesc     string `json:"task_desc,omitempty"`   // 达成条件简述
-	Credit       int64  `json:"credit,omitempty"`      // 奖励积分（上游 reward_credit）
-	Energy       int64  `json:"energy,omitempty"`      // 奖励能量（上游 reward_energy）
-	HasReward    bool   `json:"has_reward,omitempty"`  // 是否带奖励
-	RewardBuddy  bool   `json:"reward_buddy,omitempty"`
-	TaskType     string `json:"task_type,omitempty"` // single（一次性）/ 累计型
-	Tag          string `json:"tag,omitempty"`       // 端标记（PC 等）
-	JumpURL      string `json:"jump_url,omitempty"`  // 客户端跳转协议（workbuddy://...）
-	Locked       bool   `json:"locked,omitempty"`    // 上游标记未解锁
-	Target       int64  `json:"target"`              // 目标次数（恒输出：0 是有效进度值）
-	Current      int64  `json:"current"`             // 当前进度（恒输出：0 是有效进度值）
-	AcceptStatus string `json:"accept_status,omitempty"`
-	Status       string `json:"status,omitempty"`    // 上游任务状态（complete 等）
-	Claimable    bool   `json:"claimable,omitempty"` // 进度达标且未领取（本地推算）
-	Claimed      bool   `json:"claimed,omitempty"`   // 已领取（accept_status == claimed）
+	Title        string `json:"title,omitempty,omitzero"`
+	Description  string `json:"description,omitempty,omitzero"` // 操作指引（含跳转说明）
+	TaskDesc     string `json:"task_desc,omitempty,omitzero"`   // 达成条件简述
+	Credit       int64  `json:"credit,omitempty,omitzero"`      // 奖励积分（上游 reward_credit）
+	Energy       int64  `json:"energy,omitempty,omitzero"`      // 奖励能量（上游 reward_energy）
+	HasReward    bool   `json:"has_reward,omitempty,omitzero"`  // 是否带奖励
+	RewardBuddy  bool   `json:"reward_buddy,omitempty,omitzero"`
+	TaskType     string `json:"task_type,omitempty,omitzero"` // single（一次性）/ 累计型
+	Tag          string `json:"tag,omitempty,omitzero"`       // 端标记（PC 等）
+	JumpURL      string `json:"jump_url,omitempty,omitzero"`  // 客户端跳转协议（workbuddy://...）
+	Locked       bool   `json:"locked,omitempty,omitzero"`    // 上游标记未解锁
+	Target       int64  `json:"target"`                       // 目标次数（恒输出：0 是有效进度值）
+	Current      int64  `json:"current"`                      // 当前进度（恒输出：0 是有效进度值）
+	AcceptStatus string `json:"accept_status,omitempty,omitzero"`
+	Status       string `json:"status,omitempty,omitzero"`    // 上游任务状态（complete 等）
+	Claimable    bool   `json:"claimable,omitempty,omitzero"` // 进度达标且未领取（本地推算）
+	Claimed      bool   `json:"claimed,omitempty,omitzero"`   // 已领取（accept_status == claimed）
 }
 
 // ListTasks 拉取全量任务列表（默认口径，无端标记头）。
@@ -88,11 +89,11 @@ func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
 
 // growthJSONMP 发 growth 域请求（小程序口径：叠加 X-Client-Platform: miniprogram）
 // 并解信封。语义同 growthJSON。
-func (c *Client) growthJSONMP(account2 *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+func (c *Client) growthJSONMP(account2 *auth.Auth, method, path string, body any) (jsontext.Value, error) {
 	var rdr io.Reader
 
 	if body != nil {
-		raw, err := json.Marshal(body)
+		raw, err := jsonx.Marshal(body)
 		if err != nil {
 			return nil, fmt.Errorf("growthJSONMP: %w", err)
 		}
@@ -133,9 +134,11 @@ func (c *Client) ClaimRewardMP(account *auth.Auth, taskCode string) (credit, ene
 
 	data, err := c.doJSONFor(account, req)
 	if err != nil {
-		// chat 域对该路径 400（部分任务/租户形态）→ Web 域降级（已实测可领）。
+		// 只有 chat 域对该路径返回 400（部分任务/租户形态）才降级 Web 域（已实测
+		// 可领）。其它错误（5xx / 429 / 鉴权终态 / 网络）在 Web 域上是同一份上游
+		// 状态：重放只会白打一次上游，还可能在原错误已生效（限流）时放大压力。
 		ue := &Error{}
-		if errors.As(err, &ue) {
+		if errors.As(err, &ue) && ue.Status == http.StatusBadRequest {
 			return c.ClaimReward(account, taskCode)
 		}
 
@@ -146,13 +149,13 @@ func (c *Client) ClaimRewardMP(account *auth.Auth, taskCode string) (credit, ene
 }
 
 // parseClaimReward 解析领奖响应 data：{"already_claimed":bool,"credit":n,"energy":n}。
-func parseClaimReward(data json.RawMessage) (credit, energy int64, err error) {
+func parseClaimReward(data jsontext.Value) (credit, energy int64, err error) {
 	var resp struct {
 		AlreadyClaimed bool  `json:"already_claimed"`
 		Credit         int64 `json:"credit"`
 		Energy         int64 `json:"energy"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return 0, 0, fmt.Errorf("parseClaimReward: %w", err)
 	}
 
@@ -160,7 +163,7 @@ func parseClaimReward(data json.RawMessage) (credit, energy int64, err error) {
 }
 
 // parseGrowthTasks 解析 growth 任务列表 data.tasks[]（默认与 mp 口径共用）。
-func growthProgress(raw json.RawMessage, cur, tgt int64) (int64, int64) {
+func growthProgress(raw jsontext.Value, cur, tgt int64) (int64, int64) {
 	// progress 可能是 {current,target} 对象（实测口径），覆盖平铺字段。
 	if len(raw) == 0 || string(raw) == "null" {
 		return cur, tgt
@@ -170,7 +173,7 @@ func growthProgress(raw json.RawMessage, cur, tgt int64) (int64, int64) {
 		Current int64 `json:"current"`
 		Target  int64 `json:"target"`
 	}
-	if json.Unmarshal(raw, &pr) == nil && (pr.Target > 0 || pr.Current > 0) {
+	if jsonx.Unmarshal(raw, &pr) == nil && (pr.Target > 0 || pr.Current > 0) {
 		return pr.Current, pr.Target
 	}
 
@@ -178,29 +181,29 @@ func growthProgress(raw json.RawMessage, cur, tgt int64) (int64, int64) {
 }
 
 //nolint:funlen // 任务列表解析与归一化线性展开。
-func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
+func parseGrowthTasks(data jsontext.Value) ([]Task, error) {
 	var resp struct {
 		Tasks []struct {
-			TaskCode     string          `json:"task_code"`
-			Title        string          `json:"title"`
-			Description  string          `json:"description"`
-			TaskDesc     string          `json:"task_desc"`
-			RewardCredit int64           `json:"reward_credit"` // 上游实际字段名（reward_ 前缀）
-			RewardEnergy int64           `json:"reward_energy"`
-			HasReward    bool            `json:"has_reward"`
-			RewardBuddy  bool            `json:"reward_buddy"`
-			TaskType     string          `json:"task_type"`
-			Tag          string          `json:"tag"`
-			JumpURL      string          `json:"jump_url"`
-			Locked       bool            `json:"locked"`
-			AcceptStatus string          `json:"accept_status"`
-			Status       string          `json:"status"`
-			Target       int64           `json:"target"`
-			Current      int64           `json:"current"`
-			Progress     json.RawMessage `json:"progress"`
+			TaskCode     string         `json:"task_code"`
+			Title        string         `json:"title"`
+			Description  string         `json:"description"`
+			TaskDesc     string         `json:"task_desc"`
+			RewardCredit int64          `json:"reward_credit"` // 上游实际字段名（reward_ 前缀）
+			RewardEnergy int64          `json:"reward_energy"`
+			HasReward    bool           `json:"has_reward"`
+			RewardBuddy  bool           `json:"reward_buddy"`
+			TaskType     string         `json:"task_type"`
+			Tag          string         `json:"tag"`
+			JumpURL      string         `json:"jump_url"`
+			Locked       bool           `json:"locked"`
+			AcceptStatus string         `json:"accept_status"`
+			Status       string         `json:"status"`
+			Target       int64          `json:"target"`
+			Current      int64          `json:"current"`
+			Progress     jsontext.Value `json:"progress"`
 		} `json:"tasks"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("parseGrowthTasks: %w", err)
 	}
 
@@ -296,7 +299,7 @@ func (c *Client) ClaimReward(account3 *auth.Auth, taskCode string) (credit, ener
 		Credit         int64 `json:"credit"`
 		Energy         int64 `json:"energy"`
 	}
-	if err := json.Unmarshal(data, &resp); err != nil {
+	if err := jsonx.Unmarshal(data, &resp); err != nil {
 		return 0, 0, fmt.Errorf("ClaimReward: %w", err)
 	}
 

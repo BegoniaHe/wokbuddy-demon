@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestChatHeadersEnterpriseTenant 企业账号同时发企业/租户头；个人 global 不发企业
@@ -143,7 +143,7 @@ func TestStreamDuplicateToolCallIDStripped(t *testing.T) {
 		}
 
 		var obj map[string]any
-		if json.Unmarshal([]byte(strings.TrimPrefix(frame, "data: ")), &obj) != nil {
+		if jsonx.Unmarshal([]byte(strings.TrimPrefix(frame, "data: ")), &obj) != nil {
 			continue
 		}
 
@@ -300,7 +300,7 @@ func TestSummaryTotalsDefaultsSizeToRemain(t *testing.T) {
 	t.Parallel()
 
 	var summary resourceSummaryResp
-	if err := json.Unmarshal([]byte(`{"Packages":[
+	if err := jsonx.Unmarshal([]byte(`{"Packages":[
 		{"CycleTotalCapacity":0,"CycleRemainCapacity":12}
 	]}`), &summary); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -399,7 +399,7 @@ func TestSummaryTotalsAcceptsStringCapacity(t *testing.T) {
 	t.Parallel()
 
 	var summary resourceSummaryResp
-	if err := json.Unmarshal([]byte(`{"Packages":[
+	if err := jsonx.Unmarshal([]byte(`{"Packages":[
 		{"CycleTotalCapacity":" 1000 ","CycleRemainCapacity":"700.0","CycleUsedCapacity":"300"}
 	]}`), &summary); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -767,7 +767,7 @@ func TestStringPreciseCapacityDecoded(t *testing.T) {
 		"CapacityRemainPrecise":"75","CapacityUsedPrecise":"25","CapacitySizePrecise":"100",
 		"CycleCapacitySizePrecise":"0"
 	}`
-	if err := json.Unmarshal([]byte(rawPackage), &pkg); err != nil {
+	if err := jsonx.Unmarshal([]byte(rawPackage), &pkg); err != nil {
 		t.Fatalf("package unmarshal: %v", err)
 	}
 
@@ -783,7 +783,7 @@ func TestStringPreciseCapacityDecoded(t *testing.T) {
 		"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":100,
 		"CapacityRemainPrecise":"75","CapacityUsedPrecise":"25","CapacitySizePrecise":"100"
 	}`
-	if err := json.Unmarshal([]byte(rawAccount), &acct); err != nil {
+	if err := jsonx.Unmarshal([]byte(rawAccount), &acct); err != nil {
 		t.Fatalf("resource unmarshal: %v", err)
 	}
 
@@ -806,7 +806,7 @@ func TestMalformedPreciseCapacityFallsBack(t *testing.T) {
 	t.Parallel()
 
 	var pkg billingPackageAccount
-	if err := json.Unmarshal([]byte(`{
+	if err := jsonx.Unmarshal([]byte(`{
 		"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":100,
 		"CapacitySizePrecise":"bad"
 	}`), &pkg); err != nil {
@@ -820,7 +820,7 @@ func TestMalformedPreciseCapacityFallsBack(t *testing.T) {
 
 	// CycleSize 有效但 CycleRemain 非法：整体回落整数，不得改用 Capacity 精确值
 	// （Capacity* 是总额，不能覆盖当周期余额）。
-	if err := json.Unmarshal([]byte(`{
+	if err := jsonx.Unmarshal([]byte(`{
 		"CapacityRemain":10,"CapacityUsed":90,"CapacitySize":100,
 		"CapacityRemainPrecise":"50","CapacityUsedPrecise":"50","CapacitySizePrecise":"50",
 		"CycleCapacitySize":100,"CycleCapacityRemain":40,"CycleCapacityUsed":60,
@@ -872,7 +872,7 @@ func TestStringPreciseCapacityBranches(t *testing.T) {
 	}
 	for _, testCase := range cases {
 		var pkg billingPackageAccount
-		if err := json.Unmarshal([]byte(testCase.raw), &pkg); err != nil {
+		if err := jsonx.Unmarshal([]byte(testCase.raw), &pkg); err != nil {
 			t.Fatalf("%s unmarshal: %v", testCase.name, err)
 		}
 

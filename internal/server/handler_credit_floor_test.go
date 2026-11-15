@@ -3,13 +3,13 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -30,7 +30,7 @@ func TestStatusCreditFloor(t *testing.T) {
 	}
 
 	var body map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
 
@@ -54,7 +54,7 @@ func TestStatusCreditFloorZeroOff(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
 
 	var body map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
 
@@ -82,7 +82,7 @@ func TestStatusCreditFloorByRealm(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
 
 	var body map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("status not json: %v", err)
 	}
 

@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -255,5 +257,145 @@ func TestClaimCompensationIdempotent(t *testing.T) {
 
 	if got := fixture.claimCalls.Load(); got != 1 {
 		t.Fatalf("claim calls=%d want 1", got)
+	}
+}
+
+// TestClaimKeyBoundedPerUID 幂等闸按 uid 只保留最近一次周期 key：同一周期重复
+// 领取被拦，新周期放行，台账大小按账号数而非「账号数 × 周期数」增长。
+func TestClaimKeyBoundedPerUID(t *testing.T) {
+	t.Parallel()
+
+	sched := &Scheduler{}
+	oldKey := "u1|2026-10-24 23:59:59|500"
+	newKey := "u1|2026-10-31 23:59:59|500"
+
+	if !sched.beginClaim(oldKey) {
+		t.Fatal("首个周期应占用")
+	}
+
+	sched.finishClaim(oldKey, true)
+
+	if sched.beginClaim(oldKey) {
+		t.Fatal("同一周期重复领取应被拦截")
+	}
+
+	if !sched.beginClaim(newKey) {
+		t.Fatal("新周期应放行")
+	}
+
+	sched.finishClaim(newKey, true)
+
+	if got := len(sched.claimedKeys); got != 1 {
+		t.Fatalf("claimedKeys=%d want 1（每 uid 只留最近一条）", got)
+	}
+
+	// 另一账号不受影响。
+	if !sched.beginClaim("u2|2026-10-31 23:59:59|500") {
+		t.Fatal("不同账号应各自记账")
+	}
+}
+
+// TestCompensationCancelledRowsAreVisible ctx 取消后未派发的行必须显形。
+//
+// 未派发的行若保持零值，与「已查询、当前无活动」完全不可区分：SummarizeCompensation
+// 会把它算成三不靠（既非 claimed 也非 skipped/errored），批量结果看起来一切正常，
+// 实际有 N 个账号根本没查——与本文件「不要静默失败」的命题相反。
+func TestCompensationCancelledRowsAreVisible(t *testing.T) {
+	t.Parallel()
+
+	fixture := &compensationFixture{
+		httpStatus: http.StatusOK,
+		statusBody: `{"code":0,"data":{"active":true,"credit_num":100}}`,
+	}
+	sched := fixture.scheduler(t,
+		&auth.Auth{UID: "a", AccessToken: "at"},
+		&auth.Auth{UID: "b", AccessToken: "at"},
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rows := sched.CompensationStatusAll(ctx)
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+
+	for i := range rows {
+		if !rows[i].Skipped || rows[i].Reason == "" {
+			t.Fatalf("未查询的行未显形: %+v", rows[i])
+		}
+	}
+
+	if got := fixture.statusCalls.Load(); got != 0 {
+		t.Fatalf("取消后不应再打上游，statusCalls=%d", got)
+	}
+
+	claimRows, summary := sched.ClaimCompensationNow(ctx)
+	if len(claimRows) != 2 {
+		t.Fatalf("claimRows=%d want 2", len(claimRows))
+	}
+
+	if summary.Errored != 0 || summary.Claimed != 0 || summary.Skipped != 2 {
+		t.Fatalf("汇总应把未派发行计为 skipped: %+v", summary)
+	}
+}
+
+// TestCompensationStatusAllDispatchesConcurrently 钉住「并发查询」：guarded 只做
+// panic 隔离，同步调用会把批量查询退化成逐账号串行（面板 N × 上游 RTT）。
+//
+// 用闸门强制两个请求同时在飞：串行实现等不到第二个请求，只能等到超时后返回。
+func TestCompensationStatusAllDispatchesConcurrently(t *testing.T) {
+	t.Parallel()
+
+	var (
+		inFlight atomic.Int32
+		peak     atomic.Int32
+	)
+
+	gate := make(chan struct{})
+
+	var gateOnce sync.Once
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := inFlight.Add(1)
+		defer inFlight.Add(-1)
+
+		for {
+			prev := peak.Load()
+			if cur <= prev || peak.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+
+		if cur >= 2 {
+			gateOnce.Do(func() { close(gate) })
+		}
+
+		select {
+		case <-gate:
+		case <-time.After(2 * time.Second):
+			// 串行实现：第二个请求永远不会同时在飞。
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"code":0,"data":{"active":false}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	state := pool.New("")
+	state.Add(&auth.Auth{UID: "a", AccessToken: "at"})
+	state.Add(&auth.Auth{UID: "b", AccessToken: "at"})
+
+	sched := New(&Config{Pool: state, Upstream: &upstream.Client{
+		HTTP: srv.Client(), BillingBaseCN: srv.URL, ChatBaseCN: srv.URL,
+	}})
+
+	rows := sched.CompensationStatusAll(context.Background())
+	if len(rows) != 2 {
+		t.Fatalf("rows=%d want 2", len(rows))
+	}
+
+	if got := peak.Load(); got < 2 {
+		t.Fatalf("同时在飞的上游请求峰值=%d want >=2（批量查询被串行化了）", got)
 	}
 }

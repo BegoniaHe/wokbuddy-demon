@@ -2,7 +2,6 @@ package panel
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"mime/multipart"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -82,7 +82,7 @@ func newSecurePanel(t *testing.T) (*Panel, *pool.Pool, *httptest.Server) {
 func exportEncryptedEnvelope(t *testing.T, panel2 *Panel) []byte {
 	t.Helper()
 
-	body, _ := json.Marshal(map[string]string{"password": "correct horse battery"})
+	body, _ := jsonx.Marshal(map[string]string{"password": "correct horse battery"})
 	rec := httptest.NewRecorder()
 	panel2.exportEncrypted(rec, httptest.NewRequest(http.MethodPost, "/panel/api/export/encrypted", bytes.NewReader(body)))
 
@@ -120,7 +120,7 @@ func importEncryptedEnvelope(t *testing.T, panel2 *Panel, envelope []byte) (impo
 		Skipped  int `json:"skipped"`
 	}
 
-	_ = json.Unmarshal(rec.Body.Bytes(), &res)
+	_ = jsonx.Unmarshal(rec.Body.Bytes(), &res)
 
 	return res.Imported, res.Skipped, rec.Body.Bytes()
 }
@@ -186,7 +186,7 @@ func TestImportEncryptedRejectsTooManyAccounts(t *testing.T) {
 	panel, poolState, _ := newSecurePanel(t)
 	accounts := make([]secureAccount, maxImportAccounts+1)
 
-	plain, err := json.Marshal(accounts)
+	plain, err := jsonx.Marshal(accounts)
 	if err != nil {
 		t.Fatal(err)
 	}

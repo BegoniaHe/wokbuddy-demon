@@ -4,7 +4,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/notify"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
@@ -751,8 +752,6 @@ func Load(path string) (*Config, error) {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
 
-		markImplicitTimingClamp(raw, config)
-
 		if _, err := ParseConfigInto(raw, config); err != nil {
 			return nil, err
 		}
@@ -774,9 +773,9 @@ func Load(path string) (*Config, error) {
 // JSON 里显式写出的值（含与 median 矛盾的值）仍走校验报错。
 func markImplicitTimingClamp(raw []byte, config3 *Config) {
 	var doc struct {
-		Schedule map[string]json.RawMessage `json:"schedule"`
+		Schedule map[string]jsontext.Value `json:"schedule"`
 	}
-	if json.Unmarshal(raw, &doc) != nil {
+	if jsonx.Unmarshal(raw, &doc) != nil {
 		return
 	}
 
@@ -792,7 +791,12 @@ func markImplicitTimingClamp(raw []byte, config3 *Config) {
 // ParseConfigInto 把 JSON 覆盖到 c 上并 normalize（不做 env、不读文件）。
 // 面板保存配置走这条路径：与 Load 完全同一套解析/校验逻辑，避免两处漂移。
 func ParseConfigInto(raw []byte, config3 *Config) (*Config, error) {
-	if err := json.Unmarshal(raw, config3); err != nil {
+	// 与 Load / parseConfigWithEnv 同序：先标记「隐式落回默认」的时延字段，再解码。
+	// 三处必须一致，否则旧配置（checkin_account_delay 超范围但未显式写 clamp）
+	// 会在某些入口拿到「floor 不能大于 median」的假报错。
+	markImplicitTimingClamp(raw, config3)
+
+	if err := jsonx.Unmarshal(raw, config3); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
@@ -807,7 +811,6 @@ func ParseConfigInto(raw []byte, config3 *Config) (*Config, error) {
 // 与 Load 同序：JSON → env → normalize，避免 env 覆盖的字段被误报为已变化。
 func parseConfigWithEnv(raw []byte) (*Config, error) {
 	config := Default()
-	markImplicitTimingClamp(raw, config)
 
 	if _, err := ParseConfigInto(raw, config); err != nil {
 		return nil, err
@@ -839,7 +842,7 @@ func WriteDefault(path string) (string, error) {
 		return "", fmt.Errorf("normalize default config: %w", normErr)
 	}
 
-	out, err := json.MarshalIndent(config, "", "  ") //nolint:gosec // config 本就是凭据载体，落盘为设计行为
+	out, err := jsonx.MarshalIndent(config)
 	if err != nil {
 		return "", fmt.Errorf("marshal config: %w", err)
 	}
@@ -893,7 +896,7 @@ func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
 		return "", false, err
 	}
 
-	encoded, err := json.Marshal(key)
+	encoded, err := jsonx.Marshal(key)
 	if err != nil {
 		return "", false, fmt.Errorf("marshal api_key: %w", err)
 	}
@@ -907,7 +910,7 @@ func ReplacePlaceholderAPIKey(path string) (string, bool, error) {
 }
 
 // readConfigDoc 读取配置文件为可按顶层键修改的文档，并返回当前 api_key。
-func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
+func readConfigDoc(path string) (map[string]jsontext.Value, string, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return nil, "", fmt.Errorf("readConfigDoc: %w", err)
@@ -922,14 +925,14 @@ func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
 		return nil, "", fmt.Errorf("read config: %w", err)
 	}
 
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	var doc map[string]jsontext.Value
+	if err := jsonx.Unmarshal(raw, &doc); err != nil {
 		return nil, "", fmt.Errorf("parse config: %w", err)
 	}
 
 	var current string
 	if v, ok := doc["api_key"]; ok {
-		if err := json.Unmarshal(v, &current); err != nil {
+		if err := jsonx.Unmarshal(v, &current); err != nil {
 			return nil, "", fmt.Errorf("parse api_key: %w", err)
 		}
 	}
@@ -938,8 +941,8 @@ func readConfigDoc(path string) (map[string]json.RawMessage, string, error) {
 }
 
 // writeConfigDoc 原子写回配置文档（tmp + rename），保留所有未修改的顶层键。
-func writeConfigDoc(path string, doc map[string]json.RawMessage) error {
-	out, err := json.MarshalIndent(doc, "", "  ")
+func writeConfigDoc(path string, doc map[string]jsontext.Value) error {
+	out, err := jsonx.MarshalIndent(doc)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -1535,8 +1538,13 @@ func (c *Config) normalizeLogging() error {
 // normalizeProxies 校验出站代理 URL（issue #15）：任一非法即拒绝（避免运行时才暴露）。
 // 订阅 URL 只校验 scheme/host（内容在拉取时逐条校验，issue #490）。
 func (c *Config) normalizeProxies() error {
-	for _, raw := range c.Upstream.Proxies {
-		if _, err := outbound.ParseProxy(raw); err != nil {
+	for i, raw := range c.Upstream.Proxies {
+		// 归一为去空白后的串：ParseProxy 内部会 TrimSpace 解析，但原串回写进配置，
+		// 而热生效判定按原始串比较——纯空白差异会触发整表重建（含串行拉订阅）。
+		trimmed := strings.TrimSpace(raw)
+		c.Upstream.Proxies[i] = trimmed
+
+		if _, err := outbound.ParseProxy(trimmed); err != nil {
 			return fmt.Errorf("upstream.proxies: %w", err)
 		}
 	}
@@ -2593,8 +2601,13 @@ func (c *Config) normalizeKeepaliveWindow() error {
 
 // normalizeListenAndHours 补齐 listen 前缀与六个排程小时数组的缺省值。
 func (c *Config) normalizeListenAndHours() {
-	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
-		c.Listen = ":" + c.Listen
+	// 只给「纯端口」补前缀：`127.0.0.1`、`localhost` 这类漏写端口的配置若被拼成
+	// `:127.0.0.1`，启动时只会看到 `unknown port` 的报错，与真实原因（漏端口）
+	// 毫无关联。带冒号的值（含 IPv6）一律原样交给 net.Listen 判定。
+	if !strings.Contains(c.Listen, ":") {
+		if _, err := strconv.Atoi(c.Listen); err == nil {
+			c.Listen = ":" + c.Listen
+		}
 	}
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。

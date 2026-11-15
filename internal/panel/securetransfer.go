@@ -7,7 +7,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // 加密账号备份（issue #30）：AES-256-GCM + PBKDF2-HMAC-SHA256 派生密钥，每次导出
@@ -30,8 +30,13 @@ const (
 	secureKDF             = "pbkdf2-sha256"
 	secureIterations      = 600_000
 	secureSaltLen         = 16
-	// secureMaxIter 解密侧上限：拒绝畸形文件声明的超大迭代（防 CPU DoS）。
-	secureMaxIter = 5_000_000
+	// secureMinIter / secureMaxIter 解密侧允许的迭代数区间（导出固定 secureIterations）。
+	//
+	// 只设「上限 500 万」不够：envelope 由用户上传，iter=5000000 会比正常导出贵 8 倍
+	// CPU，且在校验密码之前就烧掉（几个并发即饱和）。区间留 2× 余量以兼容未来的
+	// 参数上调，同时把 DoS 放大倍数钉在 2 以内。
+	secureMinIter = secureIterations / 2
+	secureMaxIter = secureIterations * 2
 	secureMinPass = 8
 	// secureMaxUploadBytes 加密导入请求体上限（防无界读；正常导出远小于此）。
 	// ParseMultipartForm 的 maxMemory 只决定内存/临时文件切分，不限制大小，
@@ -50,22 +55,22 @@ var (
 // secureAccount 加密备份中的单个账号（含可恢复登录态的 token）。
 type secureAccount struct {
 	UID          string `json:"uid"`
-	Nickname     string `json:"nickname,omitempty"`
+	Nickname     string `json:"nickname,omitempty,omitzero"`
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
 	ExpiresAt    int64  `json:"expires_at"` // Unix 秒
-	Domain       string `json:"domain,omitempty"`
-	Realm        string `json:"realm,omitempty"`
-	EnterpriseID string `json:"enterprise_id,omitempty"`
+	Domain       string `json:"domain,omitempty,omitzero"`
+	Realm        string `json:"realm,omitempty,omitzero"`
+	EnterpriseID string `json:"enterprise_id,omitempty,omitzero"`
 	// EditionType 账号版本（account.type：personal / ultimate / exclusive）。
 	// 出站 X-Private-Data 的企业版判定除 enterpriseId 外还看该值，备份丢它会
 	// 让「无 enterpriseId 的 ultimate/exclusive 账号」导入后退化成个人号。
-	EditionType string `json:"edition_type,omitempty"`
-	DeviceToken string `json:"device_token,omitempty"`
+	EditionType string `json:"edition_type,omitempty,omitzero"`
+	DeviceToken string `json:"device_token,omitempty,omitzero"`
 	// 静态 Key / 企业身份头字段：导出再导入后出站仍需 X-Id-Source 与
 	// X-Department-Info，不能只保留 enterpriseId。
-	IDSource           string `json:"id_source,omitempty"`
-	DepartmentFullName string `json:"department_full_name,omitempty"`
+	IDSource           string `json:"id_source,omitempty,omitzero"`
+	DepartmentFullName string `json:"department_full_name,omitempty,omitzero"`
 }
 
 // secureEnvelope 加密备份外层（明文头 + base64 密文）。
@@ -105,7 +110,7 @@ func encryptPayload(password string, plaintext []byte) ([]byte, error) {
 		Cipher:  base64.StdEncoding.EncodeToString(nums),
 	}
 
-	raw, err := json.Marshal(env)
+	raw, err := jsonx.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("encryptPayload: %w", err)
 	}
@@ -150,12 +155,17 @@ func decryptPayload(password string, raw []byte) ([]byte, error) {
 // parseSecureEnvelope 解析并校验 envelope 头（版本/KDF/迭代上限）。
 func parseSecureEnvelope(raw []byte) (secureEnvelope, error) {
 	var env secureEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := jsonx.Unmarshal(raw, &env); err != nil {
 		return env, errSecureDecrypt
 	}
 
 	if env.Version != secureEnvelopeVersion || env.KDF != secureKDF ||
-		env.Iter <= 0 || env.Iter > secureMaxIter {
+		env.Iter < secureMinIter || env.Iter > secureMaxIter {
+		return env, errSecureDecrypt
+	}
+
+	// salt 是 base64 文本：按编码后长度校验，避免解码出短盐（弱化 KDF 输入）。
+	if len(env.Salt) != base64.StdEncoding.EncodedLen(secureSaltLen) {
 		return env, errSecureDecrypt
 	}
 
@@ -239,7 +249,7 @@ func (p *Panel) exportEncrypted(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	plain, err := json.Marshal(accounts) //nolint:gosec // 加密导出前序列化账号，输出随即加密
+	plain, err := jsonx.Marshal(accounts)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "序列化失败")
 		return
@@ -321,7 +331,7 @@ func readSecureAccounts(w http.ResponseWriter, r *http.Request) ([]secureAccount
 	}
 
 	var accounts []secureAccount
-	if err := json.Unmarshal(plain, &accounts); err != nil {
+	if err := jsonx.Unmarshal(plain, &accounts); err != nil {
 		writeErr(w, http.StatusBadRequest, "解密后内容不是有效账号数组")
 		return nil, false
 	}

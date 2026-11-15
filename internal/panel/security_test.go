@@ -78,6 +78,10 @@ func TestSecurityHeadersOnAllPanelResponses(t *testing.T) {
 		if header.Get("Referrer-Policy") != "no-referrer" {
 			t.Errorf("%s %s: Referrer-Policy=%q", item.method, item.path, header.Get("Referrer-Policy"))
 		}
+
+		if header.Get("X-Robots-Tag") != "noindex, nofollow" {
+			t.Errorf("%s %s: X-Robots-Tag=%q want noindex, nofollow", item.method, item.path, header.Get("X-Robots-Tag"))
+		}
 	}
 }
 

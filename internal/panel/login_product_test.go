@@ -2,6 +2,7 @@ package panel
 
 import (
 	"net/http"
+	"net/url"
 	"testing"
 )
 
@@ -101,11 +102,11 @@ func driveLoginProduct(t *testing.T, panel *Panel, realm, wantUA string, item lo
 
 	switch item.wantPath {
 	case "/v2/plugin/auth/state":
-		if _, _, _, err := panel.loginStartState(realm); err != nil {
+		if _, _, _, err := panel.loginStartState(t.Context(), realm); err != nil {
 			t.Fatalf("loginStartState: %v", err)
 		}
 	case "/v2/plugin/auth/token":
-		if _, _, pending, _, err := panel.pollLoginToken(realm, "", "s-1"); err != nil || pending {
+		if _, _, pending, _, err := panel.pollLoginToken(t.Context(), realm, "", "s-1"); err != nil || pending {
 			t.Fatalf("pollLoginToken pending=%v err=%v", pending, err)
 		}
 	default:
@@ -114,7 +115,7 @@ func driveLoginProduct(t *testing.T, panel *Panel, realm, wantUA string, item lo
 			t.Fatalf("ua=%q want %q", endpoint.userAgent, wantUA)
 		}
 
-		if _, err := panel.fetchLoginAccount(&endpoint, "s-1", "access-token"); err != nil {
+		if _, err := panel.fetchLoginAccount(t.Context(), &endpoint, "s-1", "access-token"); err != nil {
 			t.Fatalf("fetchLoginAccount: %v", err)
 		}
 	}
@@ -126,12 +127,22 @@ func checkLoginProductRequest(
 ) {
 	t.Helper()
 
-	if got.URL.String() != target.url {
+	// loginSessionId 每次发起现场生成，比较前抹掉（其形态在下面单独断言）。
+	if normalizeLoginURL(t, got.URL.String()) != normalizeLoginURL(t, target.url) {
 		t.Errorf("url=%s want %s", got.URL.String(), target.url)
 	}
 
-	if item.wantPath == "/v2/plugin/auth/state" && got.URL.Query().Get("platform") != platform {
-		t.Errorf("platform=%q want %q", got.URL.Query().Get("platform"), platform)
+	if item.wantPath == "/v2/plugin/auth/state" {
+		query := got.URL.Query()
+		if query.Get("platform") != platform {
+			t.Errorf("platform=%q want %q", query.Get("platform"), platform)
+		}
+
+		if platform == "workbuddy" {
+			assertUUIDv4(t, query.Get("loginSessionId"))
+		} else if query.Get("loginSessionId") != "" {
+			t.Errorf("platform=%q 不得带 loginSessionId", platform)
+		}
 	}
 
 	assertPanelLoginHeader(t, got.Header, "X-Product", loginProductSaaS)
@@ -150,6 +161,22 @@ func checkLoginProductRequest(
 	for _, name := range []string{"X-No-User-Id", "X-No-Enterprise-Id", "X-No-Department-Info"} {
 		assertPanelLoginHeader(t, got.Header, name, "true")
 	}
+}
+
+// normalizeLoginURL 去掉每次现场生成的 loginSessionId，便于比较固定部分。
+func normalizeLoginURL(t *testing.T, raw string) string {
+	t.Helper()
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse login url %q: %v", raw, err)
+	}
+
+	query := parsed.Query()
+	query.Del("loginSessionId")
+	parsed.RawQuery = query.Encode()
+
+	return parsed.String()
 }
 
 // assertPanelLoginHeader 核对单个请求头。

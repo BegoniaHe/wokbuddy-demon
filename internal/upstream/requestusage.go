@@ -3,7 +3,7 @@
 package upstream
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"strconv"
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // get-user-request-usage 路径。实测 CN/global 的 Web 用量页均走无 /v2 的主路径；
@@ -93,9 +94,9 @@ func (c *Client) RequestUsage(
 
 // parseRequestUsage 宽容解析上游用量响应：列表字段名在常见命名中取首个命中，
 // 时间兼容 unix 秒/毫秒与常见字符串格式；缺失字段跳过而非报错。
-func parseRequestUsage(data json.RawMessage, page, pageSize int) (*RequestUsagePage, error) {
+func parseRequestUsage(data jsontext.Value, page, pageSize int) (*RequestUsagePage, error) {
 	var root map[string]any
-	if err := json.Unmarshal(data, &root); err != nil {
+	if err := jsonx.Unmarshal(data, &root); err != nil {
 		return nil, fmt.Errorf("parse request usage: %w", err)
 	}
 

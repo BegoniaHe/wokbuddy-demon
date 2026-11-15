@@ -16,8 +16,12 @@ package redisstore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +35,10 @@ const (
 	// writeWorkers 写者池并发度：跨 key 并行，单 key 仍串行。慢链路 RTT 下吞吐为
 	// writeWorkers/RTT；同 key 合并后队列长度以活跃 key 数为界，不会按请求数堆积。
 	writeWorkers = 8
+	// writeQueueMax 队列积压上限（按不同 key 计）。排空速率固定（writeWorkers /
+	// 单写超时），redis 长时间不可用时活跃 key 数仍可能超过它：不封顶就是无界内存。
+	// 超限丢最旧的一条并记一次日志——镜像本来就是尽力而为，主状态在本地文件。
+	writeQueueMax = 4096
 )
 
 // Store 只放本期需要的方法。上下文由实现内部构造（读操作配短超时，写操作 fire-and-forget）。
@@ -58,6 +66,9 @@ const (
 	bindPrefix  = "wb2api:bind:"
 	stateKey    = "wb2api:state"
 	readTimeout = 3 * time.Second
+	// loadBindsTimeout 启动期全量恢复绑定的总超时。SCAN 分页 + 分批 MGET 共用
+	// 这一个 ctx，用 3s 会在 key 多时整批丢失（见 LoadBinds 注释）。
+	loadBindsTimeout = 30 * time.Second
 )
 
 // New 根据 url+token 构建 Store。
@@ -71,10 +82,17 @@ func New(url, token string) Store {
 	}
 
 	full := normalizeURL(url, token)
+	// 口令可能在 token 里，也可能内嵌在整条连接串的 userinfo 里（用户把
+	// rediss://default:<pass>@host 整条填进 upstash.url）。两者都要参与脱敏：
+	// net/url 的 *url.Error 会把完整连接串原样引号回显，只按 token 替换时
+	// （token 为空）等于完全不脱敏。
+	secrets := []string{token, urlPassword(full), full}
 
 	opt, err := redis.ParseURL(full)
 	if err != nil {
-		log.Printf("[redisstore] 警告: redis 连接串解析失败 (%v)，降级 Noop", err)
+		log.Printf("[redisstore] 警告: redis 连接串解析失败（%s），降级 Noop",
+			redactSecrets(err.Error(), secrets...))
+
 		return Noop{}
 	}
 
@@ -86,7 +104,11 @@ func New(url, token string) Store {
 	defer cancel()
 
 	if err := client.Ping(ctx).Err(); err != nil {
-		log.Printf("[redisstore] 警告: upstash 连接失败 (%v)，降级 Noop（纯内存模式）", err)
+		// 与解析失败同口径脱敏：normalizeURL 把 url 的 scheme 之后全部当 host，
+		// 用户把 token 误填进 upstash.url 时，Ping 错误里的
+		// "lookup <token>: no such host" 会把 token 原样打进日志。
+		log.Printf("[redisstore] 警告: upstash 连接失败 (%s)，降级 Noop（纯内存模式）",
+			redactSecrets(err.Error(), secrets...))
 
 		_ = client.Close()
 
@@ -141,6 +163,11 @@ type Upstash struct {
 	initOnce sync.Once
 	// wg 已提交未完成的写（Close 排空用）。
 	wg sync.WaitGroup
+	// dropped 因积压上限被丢弃的写数；writeErrs 执行失败的写数；
+	// lastDropLog 上次打 WARN 的时刻（两类共用，每分钟一次）。
+	dropped     int64
+	writeErrs   int64
+	lastDropLog time.Time
 }
 
 // writeJob 一次异步写：key 是 Redis key（同 key 串行 + 合并），fn 执行实际命令。
@@ -171,6 +198,14 @@ func (u *Upstash) goWrite(key string, fn func()) {
 	}
 
 	job := &writeJob{key: key, fn: fn}
+
+	// 积压上限：redis 长时间不可用时按「不同 key 数」增长而排空速率固定，不封顶
+	// 就是无界内存（每条 job 的闭包都被持续持有）。丢最旧的一条，镜像失效由下次
+	// 同 key 写或全量快照兜底；只在对齐 writeQueueMax 时打一条 WARN，不刷屏。
+	if len(u.queue) >= writeQueueMax {
+		u.dropOldestLocked()
+	}
+
 	u.queue = append(u.queue, job)
 	u.pending[key] = job
 	// 与入队同一把锁 Add：Close 在同一把锁下置 stopped 并 wg.Wait，
@@ -179,6 +214,64 @@ func (u *Upstash) goWrite(key string, fn func()) {
 	u.mu.Unlock()
 
 	u.cond.Signal()
+}
+
+// dropOldestLocked 丢弃队列中最旧的一条写并释放它的 wg 计数。调用方必须已持有 u.mu。
+// 队列里的条目必然不在 busy（claim 取走时会从 queue 摘除），所以不必担心打断在途写。
+func (u *Upstash) dropOldestLocked() {
+	if len(u.queue) == 0 {
+		return
+	}
+
+	old := u.queue[0]
+	u.queue = u.queue[1:]
+
+	if u.pending[old.key] == old {
+		delete(u.pending, old.key)
+	}
+
+	u.wg.Done()
+	u.dropped++
+
+	// 每分钟最多一条：redis 长时间不可用时每次提交都会命中上限。
+	if time.Since(u.lastDropLog) >= time.Minute {
+		u.lastDropLog = time.Now()
+
+		log.Printf("[redisstore] WARN: 写队列积压超过 %d，已丢弃 %d 条镜像写（redis 不可用或过慢）",
+			writeQueueMax, u.dropped)
+	}
+}
+
+// logWriteErr 单条镜像写失败留痕（每分钟最多一条 + 累计数）。
+//
+// redis 长时间不可用时的吞吐上限是 writeWorkers/5s，SetBind 还挂在会话粘性的
+// 每请求路径上：不限流就是持续刷屏，而运维真正需要的是「丢了多少」。
+// sessionKeyDigest 把会话键折成固定长度的不可逆摘要用于日志。
+//
+// 会话键就是客户端给的 conversation_id / prompt_cache_key：原值进日志既泄漏用户
+// 会话标识，又能被塞入换行伪造后续日志行（Redis 抖动期间每次请求都会触发），且
+// 长度不受限。摘要仍能在同一进程内把多次失败归到同一个键。
+func sessionKeyDigest(key string) string {
+	sum := sha256.Sum256([]byte(key))
+
+	return hex.EncodeToString(sum[:8])
+}
+
+func (u *Upstash) logWriteErr(operation string) {
+	u.mu.Lock()
+	u.writeErrs++
+
+	emit := time.Since(u.lastDropLog) >= time.Minute
+	if emit {
+		u.lastDropLog = time.Now()
+	}
+
+	failures := u.writeErrs
+	u.mu.Unlock()
+
+	if emit {
+		log.Printf("[redisstore] WARN: 镜像写失败 %s（累计 %d 次；redis 不可用或过慢）", operation, failures)
+	}
 }
 
 // ensureInit 初始化队列与写者池（幂等）。New 与测试零值构造共用同一入口。
@@ -203,14 +296,35 @@ func (u *Upstash) runWriter() {
 			return // 已停止且队列排空
 		}
 
-		job.fn()
+		u.runJob(job)
+	}
+}
+
+// runJob 执行一条镜像写，并**无论如何**释放 key 占用与 wg 计数。
+//
+// fn 里跑的是 go-redis 命令与调用方的序列化逻辑（closure 捕获的 payload 等）。
+// 一次 panic 此前会终结这个写者 goroutine：u.busy[job.key] 再也不会清除，claim
+// 此后一直跳过该 key 的所有写（同 key 串行语义变成永久阻塞），u.wg 也永不减，
+// Close 的 wg.Wait 只能靠 10s 超时兜底——镜像从此静默停更且没有任何日志。
+// 仓库其它后台循环（apikey.flushGuarded / scheduler.guarded）都是同一口径。
+func (u *Upstash) runJob(job *writeJob) {
+	defer func() {
+		rec := recover()
 
 		u.mu.Lock()
 		delete(u.busy, job.key)
 		u.mu.Unlock()
+
 		u.wg.Done()
+
 		u.cond.Broadcast() // 该 key 解锁后可能有排队写可开工
-	}
+
+		if rec != nil {
+			log.Printf("ERR: [redisstore] 镜像写 panic（已隔离）: %v", rec)
+		}
+	}()
+
+	job.fn()
 }
 
 // claim 等待并取一条可执行的写并标记其 key 忙；收到关停且队列排空时返回 nil。
@@ -296,7 +410,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 		defer cancel()
 
 		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
-			log.Printf("[redisstore] debug: SetBind %s: %v", key, err)
+			u.logWriteErr("SetBind " + sessionKeyDigest(key))
 		}
 	})
 }
@@ -308,34 +422,83 @@ func (u *Upstash) DelBind(key string) {
 		defer cancel()
 
 		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {
-			log.Printf("[redisstore] debug: DelBind %s: %v", key, err)
+			u.logWriteErr("DelBind " + sessionKeyDigest(key))
 		}
 	})
 }
 
 // SaveState 异步写池状态 JSON 快照。
 func (u *Upstash) SaveState(data []byte) {
+	// 入队前复制：写是异步的，调用方返回后可能复用该缓冲。
+	payload := slices.Clone(data)
+
 	u.goWrite(stateKey, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		if err := u.client.Set(ctx, stateKey, data, keyTTL).Err(); err != nil {
-			log.Printf("[redisstore] debug: SaveState: %v", err)
+		if err := u.client.Set(ctx, stateKey, payload, keyTTL).Err(); err != nil {
+			u.logWriteErr("SaveState")
 		}
 	})
 }
 
-// LoadState 同步读池状态快照。
+// LoadState 同步读池状态快照。ok=false 表示无快照；读失败单独留痕（不以「冷启动」
+// 伪装成正常路径，否则 Redis 不可读时恢复逻辑静默退化为从零开始）。
 func (u *Upstash) LoadState() ([]byte, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
 
-	v, err := u.client.Get(ctx, stateKey).Bytes()
-	if err != nil {
+	snapshot, err := u.client.Get(ctx, stateKey).Bytes()
+	if errors.Is(err, redis.Nil) {
 		return nil, false
 	}
 
-	return v, true
+	if err != nil {
+		log.Printf("[redisstore] WARN: 读取状态快照失败（按无快照处理）: %v", err)
+
+		return nil, false
+	}
+
+	return snapshot, true
+}
+
+// redactSecret 把错误串中的凭证替换为 ***（凭证不得进入日志）。
+// redactSecrets 把消息里出现的各个秘密替换成 ***（空串跳过；长串先替换，
+// 避免整条连接串被较短的口令先切断后漏出剩余部分）。
+func redactSecrets(msg string, secrets ...string) string {
+	slices.SortFunc(secrets, func(a, b string) int { return len(b) - len(a) })
+
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+
+		msg = strings.ReplaceAll(msg, secret, "***")
+	}
+
+	return msg
+}
+
+// urlPassword 取连接串 userinfo 里的口令（没有则空串）。
+// 不用 net/url 解析：这里的调用场景正是「连接串非法、ParseURL 失败」，需要一条
+// 不依赖解析成功的兜底路径。
+func urlPassword(full string) string {
+	at := strings.LastIndex(full, "@")
+	if at < 0 {
+		return ""
+	}
+
+	scheme := strings.Index(full, "://")
+	if scheme < 0 || scheme+3 >= at {
+		return ""
+	}
+
+	userinfo := full[scheme+3 : at]
+	if _, pass, ok := strings.Cut(userinfo, ":"); ok {
+		return pass
+	}
+
+	return ""
 }
 
 // bindMGetBatchSize 每批 MGET 的 key 数：把 N+1 次 GET 收敛为 SCAN + 常数次往返。
@@ -430,8 +593,12 @@ func loadBinds(ctx context.Context, scan bindScanPage, mget bindMGet) map[string
 }
 
 // LoadBinds 全量读取粘性会话绑定（SCAN bind:* 前缀 + 分批 MGET）。
+//
+// 用独立的启动期超时而非 3s 读超时：整个扫描是「每页 200 个 key + 每批 100 个
+// MGET」，全部共用一个 ctx。按包注释给的 50–300ms RTT，3s 在 300ms RTT 下只够
+// 约 10 次往返，2000 个 key 之后整批丢失，最终只留一条 "incomplete" WARN。
 func (u *Upstash) LoadBinds() map[string]string {
-	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), loadBindsTimeout)
 	defer cancel()
 
 	return loadBinds(ctx,

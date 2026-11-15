@@ -8,7 +8,7 @@ package server
 import (
 	"bytes"
 	"cmp"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -38,10 +39,10 @@ var (
 // responsesRequest 只声明转换所需的字段；未知字段忽略，便于协议演进。
 type responsesRequest struct {
 	Model             string           `json:"model"`
-	Input             json.RawMessage  `json:"input"`
+	Input             jsontext.Value   `json:"input"`
 	Instructions      string           `json:"instructions"`
 	Tools             []map[string]any `json:"tools"`
-	ToolChoice        json.RawMessage  `json:"tool_choice"`
+	ToolChoice        jsontext.Value   `json:"tool_choice"`
 	MaxOutputTokens   int              `json:"max_output_tokens"`
 	Temperature       *float64         `json:"temperature"`
 	TopP              *float64         `json:"top_p"`
@@ -50,7 +51,7 @@ type responsesRequest struct {
 	Stream            bool             `json:"stream"`
 	ParallelToolCalls *bool            `json:"parallel_tool_calls"`
 	Reasoning         *responsesReason `json:"reasoning"`
-	Text              json.RawMessage  `json:"text"`
+	Text              jsontext.Value   `json:"text"`
 }
 
 type responsesReason struct {
@@ -130,14 +131,14 @@ func newResponsesChatInput(
 // responsesAdditionalTools 从 input 数组里的 additional_tools 条目收集工具。
 // 新版 Codex（0.162+）在 use_responses_lite 下把工具整份放进 input，顶层 tools
 // 为空；不合并就等于上游看不到任何工具。
-func responsesAdditionalTools(input json.RawMessage) []map[string]any {
+func responsesAdditionalTools(input jsontext.Value) []map[string]any {
 	trimmed := bytes.TrimSpace(input)
 	if len(trimmed) == 0 || trimmed[0] != '[' {
 		return nil
 	}
 
 	var items []map[string]any
-	if json.Unmarshal(trimmed, &items) != nil {
+	if jsonx.Unmarshal(trimmed, &items) != nil {
 		return nil
 	}
 
@@ -169,12 +170,12 @@ func responsesCustomTools(body []byte) map[string]bool {
 }
 
 // responsesToolInputs 解析原始请求的 tools 与 input。
-func responsesToolInputs(body []byte) ([]map[string]any, json.RawMessage) {
+func responsesToolInputs(body []byte) ([]map[string]any, jsontext.Value) {
 	var req struct {
 		Tools []map[string]any `json:"tools"`
-		Input json.RawMessage  `json:"input"`
+		Input jsontext.Value   `json:"input"`
 	}
-	if json.Unmarshal(body, &req) != nil {
+	if jsonx.Unmarshal(body, &req) != nil {
 		return nil, nil
 	}
 
@@ -251,7 +252,7 @@ func responsesToOpenAIWithClient(
 	applyResponsesParams(out, req, refs)
 	applyResponsesDefaultMaxTokens(out, req.Model, httpClient, aliases)
 
-	converted, err := json.Marshal(out)
+	converted, err := jsonx.Marshal(out)
 	if err != nil {
 		return nil, "", "", false, fmt.Errorf("encode request: %w", err)
 	}
@@ -299,7 +300,7 @@ func decodeResponsesRequest(body []byte) (*responsesRequest, error) {
 	}
 
 	var req responsesRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := jsonx.Unmarshal(body, &req); err != nil {
 		return nil, fmt.Errorf("invalid JSON body: %w", err)
 	}
 
@@ -326,7 +327,7 @@ func responsesMessages(req *responsesRequest, refs map[string]responsesToolRef) 
 	}
 
 	var items []map[string]any
-	if err := json.Unmarshal(req.Input, &items); err != nil {
+	if err := jsonx.Unmarshal(req.Input, &items); err != nil {
 		return nil, fmt.Errorf("invalid input: %w", err)
 	}
 
@@ -395,14 +396,14 @@ func (b *responsesInputMessages) flushImages() {
 }
 
 // responsesStringInput 识别 Responses 的字符串 input；null 视为未提供。
-func responsesStringInput(raw json.RawMessage) (string, bool) {
+func responsesStringInput(raw jsontext.Value) (string, bool) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || trimmed[0] != '"' {
 		return "", false
 	}
 
 	var text string
-	if json.Unmarshal(raw, &text) != nil {
+	if jsonx.Unmarshal(raw, &text) != nil {
 		return "", false
 	}
 
@@ -601,7 +602,7 @@ func responsesInputCustomToolCall(item map[string]any, refs map[string]responses
 		callID = stringValue(item["id"])
 	}
 
-	args, err := json.Marshal(map[string]any{"input": input})
+	args, err := jsonx.Marshal(map[string]any{"input": input})
 	if err != nil {
 		return nil, fmt.Errorf("custom_tool_call input: %w", err)
 	}
@@ -647,7 +648,7 @@ func responsesToolOutputParts(raw any) (string, []any) {
 			return "", nil
 		}
 
-		data, err := json.Marshal(raw)
+		data, err := jsonx.Marshal(raw)
 		if err != nil {
 			return "", nil
 		}
@@ -731,7 +732,7 @@ func responsesContent(raw any) any {
 	return parts
 }
 
-// responsesContentPart 转换单个内容块；不支持的块返回 nil（忽略）。
+// responsesContentPart 转换单个内容块；不支持的块返回 nil（忽略，调用方留痕）。
 func responsesContentPart(part map[string]any) map[string]any {
 	switch stringValue(part["type"]) {
 	case "input_text", typeOutputText, "text":
@@ -751,6 +752,10 @@ func responsesContentPart(part map[string]any) map[string]any {
 
 			return map[string]any{"type": "image_url", "image_url": image}
 		}
+	case "input_file", "input_audio":
+		// 上游 chat/completions 面没有文档/音频输入形态。静默丢会让模型「收到了
+		// 请求但看不到附件」，客户端与日志都没有线索——至少留一条 WARN。
+		log.Printf("WARN: [server] responses: 丢弃不支持的内容块 type=%s", stringValue(part["type"]))
 	}
 
 	return nil
@@ -818,7 +823,7 @@ func applyResponsesSampling(out map[string]any, req *responsesRequest) {
 
 // responsesTextFormat 把 Responses text.format 映射为 chat/completions response_format。
 // 只映射上游认识的 text / json_object / json_schema；缺失或未知格式返回 nil。
-func responsesTextFormat(raw json.RawMessage) any {
+func responsesTextFormat(raw jsontext.Value) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
@@ -826,7 +831,7 @@ func responsesTextFormat(raw json.RawMessage) any {
 	var text struct {
 		Format map[string]any `json:"format"`
 	}
-	if json.Unmarshal(raw, &text) != nil || text.Format == nil {
+	if jsonx.Unmarshal(raw, &text) != nil || text.Format == nil {
 		return nil
 	}
 
@@ -1125,13 +1130,13 @@ func responsesCustomTool(tool map[string]any) map[string]any {
 }
 
 // responsesToolChoice 映射 Responses tool_choice 到 OpenAI tool_choice。
-func responsesToolChoice(raw json.RawMessage, refs map[string]responsesToolRef) any {
+func responsesToolChoice(raw jsontext.Value, refs map[string]responsesToolRef) any {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil
 	}
 
 	var choice string
-	if json.Unmarshal(raw, &choice) == nil {
+	if jsonx.Unmarshal(raw, &choice) == nil {
 		switch choice {
 		case "auto", "none", "required":
 			return choice
@@ -1145,7 +1150,7 @@ func responsesToolChoice(raw json.RawMessage, refs map[string]responsesToolRef) 
 		Name string `json:"name"`
 		Mode string `json:"mode"`
 	}
-	if json.Unmarshal(raw, &obj) != nil {
+	if jsonx.Unmarshal(raw, &obj) != nil {
 		return nil
 	}
 
@@ -1307,7 +1312,8 @@ func responsesOutput(
 	}
 
 	output = append(output, responsesFunctionItems(
-		msg["tool_calls"], customTools, namespaces, stringValue(choice["finish_reason"]),
+		toolCallsWithLegacy(msg["tool_calls"], msg["function_call"]),
+		customTools, namespaces, stringValue(choice["finish_reason"]),
 	)...)
 	if len(output) == 0 {
 		output = append(output, responsesMessageItem("msg_gateway", "", "completed"))
@@ -1443,8 +1449,8 @@ func responsesSetNamespace(item map[string]any, namespace string) {
 // 只接受约定包裹形态（对象 + input 字符串）；缺字段/类型不符/参数不完整返回 ok=false，
 // 由调用方标 incomplete，绝不把半截 JSON 或原文交给客户端执行（issue #259）。
 func responsesCustomToolInput(args string) (string, bool) {
-	var payload map[string]json.RawMessage
-	if json.Unmarshal([]byte(args), &payload) != nil {
+	var payload map[string]jsontext.Value
+	if jsonx.Unmarshal([]byte(args), &payload) != nil {
 		return "", false
 	}
 
@@ -1454,7 +1460,7 @@ func responsesCustomToolInput(args string) (string, bool) {
 	}
 
 	var input string
-	if json.Unmarshal(raw, &input) != nil {
+	if jsonx.Unmarshal(raw, &input) != nil {
 		return "", false
 	}
 
@@ -1582,8 +1588,10 @@ type responsesToolState struct {
 	namespace string
 	index     int
 	args      strings.Builder
-	started   bool
-	custom    bool
+	// pending 暂存 name 到位前到达的参数增量（按到达顺序补发）。
+	pending []string
+	started bool
+	custom  bool
 }
 
 func newResponsesStreamWriter(
@@ -1624,7 +1632,7 @@ func (s *responsesStreamWriter) handleLine(line string) error {
 
 func (s *responsesStreamWriter) handleChunk(payload string) error {
 	var chunk map[string]any
-	if json.Unmarshal([]byte(payload), &chunk) != nil {
+	if jsonx.Unmarshal([]byte(payload), &chunk) != nil {
 		return nil //nolint:nilerr // 非 JSON 噪声帧丢弃
 	}
 
@@ -1632,15 +1640,19 @@ func (s *responsesStreamWriter) handleChunk(payload string) error {
 		return s.handleUpstreamError(errObj)
 	}
 
-	if err := s.ensureStart(chunk); err != nil {
-		return err
-	}
-
+	// usage 先记：末帧常常只有 usage、没有 choices。
 	s.captureUsage(chunk)
 
+	// 与 anthropic 面同口径：无 choices 的帧（ping / usage-only / 非内容帧）不触发
+	// 流启动。上游会给缺 id 的帧补占位 chatcmpl-wb2api，首帧若是这类帧，
+	// response.created/in_progress/completed 会被占位 id 锁死，后续真实 id 被忽略。
 	choice := firstOpenAIChoice(chunk)
 	if choice == nil {
 		return nil
+	}
+
+	if err := s.ensureStart(chunk); err != nil {
+		return err
 	}
 
 	if delta, _ := choice["delta"].(map[string]any); delta != nil {
@@ -1739,7 +1751,7 @@ func (s *responsesStreamWriter) applyDelta(delta map[string]any) error {
 		}
 	}
 
-	return s.emitTools(delta["tool_calls"])
+	return s.emitTools(toolCallsWithLegacy(delta["tool_calls"], delta["function_call"]))
 }
 
 func (s *responsesStreamWriter) emitText(text string) error {
@@ -1775,47 +1787,112 @@ func (s *responsesStreamWriter) emitTools(raw any) error {
 			continue
 		}
 
-		idx := intValue(call["index"])
-
-		state := s.toolState(idx, call)
-		if state == nil {
-			continue
-		}
-
-		if args := toolCallArguments(call); args != "" {
-			state.args.WriteString(args)
-
-			// custom 工具的增量是 JSON 包装的 {"input":...}，无法逐片还原为
-			// freeform 文本；只在 done 事件给最终 input，避免把包装层透给客户端。
-			if state.custom {
-				continue
-			}
-
-			if err := s.event("response.function_call_arguments.delta", map[string]any{
-				"type": "response.function_call_arguments.delta", "item_id": state.id,
-				keyOutputIndex: state.index, "delta": args,
-			}); err != nil {
-				return err
-			}
+		if err := s.emitToolCall(intValue(call["index"]), call); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-// toolState 首次出现时登记并写出 output_item.added；缺 name 的片段返回 nil。
-func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *responsesToolState {
-	if state, ok := s.tools[idx]; ok {
-		return state
+// emitToolCall 处理单个工具调用分片。
+//
+// 参数先累加再判断 name：上游存在「首片只带 id/arguments、name 随后续分片到达」
+// 的形态（internal/upstream/sse.go stripToolCallNames 正是为此保留空 name）。
+func (s *responsesStreamWriter) emitToolCall(idx int, call map[string]any) error {
+	state := s.bufferTool(idx, call)
+
+	args := toolCallArguments(call)
+	if args != "" {
+		state.args.WriteString(args)
 	}
 
-	name, callID := toolCallIdentity(call)
-	name, namespace := responsesResolveToolName(name, s.namespaces)
+	return s.routeToolArgs(idx, state, args)
+}
 
-	if name == "" {
+// routeToolArgs 决定增量去向：已宣告的直接下发；未宣告的先缓冲，name 到位后补发。
+func (s *responsesStreamWriter) routeToolArgs(idx int, state *responsesToolState, args string) error {
+	if !state.started {
+		return s.startBufferedTool(idx, state, args)
+	}
+
+	if args != "" && !state.custom {
+		if err := s.emitArgsDelta(state, args); err != nil {
+			return err
+		}
+	}
+
+	return s.flushPendingArgs(state)
+}
+
+// startBufferedTool 缓冲未宣告阶段的增量，并在 name 就绪时宣告后补发。
+func (s *responsesStreamWriter) startBufferedTool(idx int, state *responsesToolState, args string) error {
+	if args != "" {
+		state.pending = append(state.pending, args)
+	}
+
+	if !s.startTool(idx, state) {
 		return nil
 	}
 
+	return s.flushPendingArgs(state)
+}
+
+// flushPendingArgs 按到达顺序补发缓冲增量（custom 工具只在 done 给完整 input）。
+func (s *responsesStreamWriter) flushPendingArgs(state *responsesToolState) error {
+	if !state.custom {
+		for _, pending := range state.pending {
+			if err := s.emitArgsDelta(state, pending); err != nil {
+				return err
+			}
+		}
+	}
+
+	state.pending = nil
+
+	return nil
+}
+
+// emitArgsDelta 下发一段 function_call_arguments.delta。
+func (s *responsesStreamWriter) emitArgsDelta(state *responsesToolState, args string) error {
+	return s.event("response.function_call_arguments.delta", map[string]any{
+		"type": "response.function_call_arguments.delta", "item_id": state.id,
+		keyOutputIndex: state.index, "delta": args,
+	})
+}
+
+// bufferTool 登记/取回工具占位状态（name 可暂缺），并补全晚到的名字与 call id。
+func (s *responsesStreamWriter) bufferTool(idx int, call map[string]any) *responsesToolState {
+	name, callID := toolCallIdentity(call)
+
+	state, ok := s.tools[idx]
+	if ok {
+		if state.name == "" {
+			state.name = name
+		}
+
+		if state.callID == "" {
+			state.callID = callID
+		}
+
+		return state
+	}
+
+	state = &responsesToolState{name: name, callID: callID}
+	s.tools[idx] = state
+	s.toolSeq = append(s.toolSeq, idx)
+
+	return state
+}
+
+// startTool 在 name 就绪时宣告 output_item.added；name 仍为空返回 false。
+func (s *responsesStreamWriter) startTool(idx int, state *responsesToolState) bool {
+	name, namespace := responsesResolveToolName(state.name, s.namespaces)
+	if name == "" {
+		return false
+	}
+
+	callID := state.callID
 	if callID == "" {
 		callID = fmt.Sprintf("call_%d", idx)
 	}
@@ -1827,19 +1904,22 @@ func (s *responsesStreamWriter) toolState(idx int, call map[string]any) *respons
 		prefix = "ctc_"
 	}
 
-	state := &responsesToolState{
-		id: prefix + callID, callID: callID, name: name, namespace: namespace,
-		index: s.nextIdx, started: true, custom: custom,
-	}
+	state.id = prefix + callID
+	state.name, state.namespace = name, namespace
+	state.custom = custom
+	state.index = s.nextIdx
+	state.started = true
 	s.nextIdx++
-	s.tools[idx] = state
-	s.toolSeq = append(s.toolSeq, idx)
-	_ = s.event("response.output_item.added", map[string]any{
+	// 写失败必须上抛：否则 started/nextIdx 已前移，后续 delta 会指向一个客户端
+	// 从未收到 output_item.added 的 item。
+	if err := s.event("response.output_item.added", map[string]any{
 		"type": "response.output_item.added", keyOutputIndex: state.index,
 		"item": s.functionItem(state, "in_progress"),
-	})
+	}); err != nil {
+		return false
+	}
 
-	return state
+	return true
 }
 
 func (s *responsesStreamWriter) finish() error {
@@ -1862,10 +1942,8 @@ func (s *responsesStreamWriter) finish() error {
 		return err
 	}
 
-	for _, idx := range s.toolSeq {
-		if err := s.closeTool(s.tools[idx]); err != nil {
-			return err
-		}
+	if err := s.closeTools(); err != nil {
+		return err
 	}
 
 	if len(s.outputs) == 0 {
@@ -1875,6 +1953,27 @@ func (s *responsesStreamWriter) finish() error {
 	}
 
 	return s.emitCompletion()
+}
+
+// closeTools 收尾全部已宣告的工具块；name 始终未到的分片丢弃并留痕。
+func (s *responsesStreamWriter) closeTools() error {
+	for _, idx := range s.toolSeq {
+		state := s.tools[idx]
+		if state == nil || !state.started {
+			if state != nil {
+				log.Printf("WARN: [responses] 工具调用缺 name，已丢弃（index=%d, args=%d bytes）",
+					idx, len(state.args.String()))
+			}
+
+			continue
+		}
+
+		if err := s.closeTool(state); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // emitCompletion 写出 response.completed / response.incomplete。
@@ -2065,33 +2164,14 @@ func (s *responsesStreamWriter) responseObject(status string) map[string]any {
 }
 
 func (s *responsesStreamWriter) captureUsage(chunk map[string]any) {
-	usage, _ := chunk["usage"].(map[string]any)
-	if usage == nil {
-		return
-	}
-
-	if n := intValue(usage["prompt_tokens"]); n > 0 {
-		s.inputTokens = n
-	}
-
-	if n := intValue(usage["completion_tokens"]); n > 0 {
-		s.outputTokens = n
-	}
-
-	if cached, cacheWrite := responsesCachedTokens(usage); cached > 0 || cacheWrite > 0 {
-		s.cachedTokens, s.cacheWrite = cached, cacheWrite
-	}
-
-	if n := responsesReasoningTokens(usage); n > 0 {
-		s.reasoningTokens = n
-	}
+	applyTokenUsage(chunk, &s.inputTokens, &s.outputTokens, &s.cachedTokens, &s.cacheWrite, &s.reasoningTokens)
 }
 
 func (s *responsesStreamWriter) event(name string, payload map[string]any) error {
 	payload["sequence_number"] = s.seq
 	s.seq++
 
-	raw, err := json.Marshal(payload)
+	raw, err := jsonx.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("event: %w", err)
 	}

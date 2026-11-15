@@ -3,7 +3,6 @@ package upstream
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +15,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 var (
@@ -564,7 +564,7 @@ func assertEffortsDowngrade(t *testing.T, infos []ModelInfo, outbound []byte) {
 	}
 
 	var m map[string]any
-	if err := json.Unmarshal(outbound, &m); err != nil {
+	if err := jsonx.Unmarshal(outbound, &m); err != nil {
 		t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
 	}
 

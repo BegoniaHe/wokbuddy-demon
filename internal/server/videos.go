@@ -13,13 +13,13 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -168,6 +168,9 @@ func (h *Handler) resolveVideoModel(
 // videoTaskModel 查询端点的选号域。官方查询 body 只有 task_id、没有模型，故：
 //   - 可选 ?model= 与提交同口径解析（含可见性 / 白名单校验），供跨域任务查询；
 //   - 缺省 = 命名密钥绑定的域，否则 cn（与裸模型名默认域一致）。
+//
+// 缺省时不参与模型维度判定（可见性 / 密钥模型白名单 / 模型级冷却）是刻意的：
+// task_id 只能由已过模型门禁的提交产生，查询只读状态、不触发出站生成。
 func (h *Handler) videoTaskModel(w http.ResponseWriter, r *http.Request) (string, string, bool) {
 	rawModel := strings.TrimSpace(r.URL.Query().Get("model"))
 	if rawModel != "" {
@@ -267,5 +270,5 @@ func videoTaskFailed(raw []byte) bool {
 		} `json:"data"`
 	}
 
-	return json.Unmarshal(raw, &env) == nil && env.Data.Status == "failed"
+	return jsonx.Unmarshal(raw, &env) == nil && env.Data.Status == "failed"
 }

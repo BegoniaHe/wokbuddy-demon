@@ -4,10 +4,11 @@
 package upstream
 
 import (
-	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestSplitConcatenatedJSON 表驱动：字符串内花括号/转义引号不算结构，半截对象、
@@ -129,7 +130,7 @@ func TestStreamSplitsConcatenatedJSONFrames(t *testing.T) {
 			continue
 		}
 
-		if !json.Valid([]byte(payload)) {
+		if !jsonx.Valid([]byte(payload)) {
 			t.Errorf("data 帧不是单个合法 JSON: %q", payload)
 		}
 	}

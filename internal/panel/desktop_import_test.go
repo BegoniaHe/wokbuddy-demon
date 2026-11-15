@@ -11,9 +11,13 @@ import (
 func TestDesktopScanEndpoint(t *testing.T) {
 	t.Parallel()
 
-	p := New(&Config{Version: "test"})
+	pnl := New(&Config{Version: "test"})
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/import/desktop/scan", nil)
+	// 本机端点有回环护栏（与 agents* 同口径）：扫描会回本机绝对路径。
+	req.RemoteAddr = "127.0.0.1:12345"
+
 	rec := httptest.NewRecorder()
-	p.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panel/api/import/desktop/scan", nil))
+	pnl.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)

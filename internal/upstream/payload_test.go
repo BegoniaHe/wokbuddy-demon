@@ -2,7 +2,7 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestNormalizeRoles 验证出站请求体把 developer 角色归一为 system。
@@ -107,7 +108,7 @@ func TestNormalizeRoles(t *testing.T) {
 		out := PrepareBodyOptWithEfforts([]byte(`{"model":"glm-5.2","temperature":0.7}`), false, nil)
 
 		var obj map[string]any
-		if err := json.Unmarshal(out, &obj); err != nil {
+		if err := jsonx.Unmarshal(out, &obj); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
 
@@ -123,7 +124,7 @@ func rolesFromBody(t *testing.T, out []byte) []string {
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
 
@@ -222,7 +223,7 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 			out := PrepareBodyOptWithEfforts([]byte(item.body), false, item.efforts)
 
 			var m map[string]any
-			if err := json.Unmarshal(out, &m); err != nil {
+			if err := jsonx.Unmarshal(out, &m); err != nil {
 				t.Fatalf("unmarshal: %v (body=%s)", err, out)
 			}
 
@@ -279,7 +280,7 @@ func TestPrepareBodyEffortDowngradeSkipsOff(t *testing.T) {
 			out := PrepareBodyOptWithEfforts([]byte(item.body), false, efforts)
 
 			var m map[string]any
-			if err := json.Unmarshal(out, &m); err != nil {
+			if err := jsonx.Unmarshal(out, &m); err != nil {
 				t.Fatalf("unmarshal: %v (body=%s)", err, out)
 			}
 
@@ -299,7 +300,7 @@ func TestPrepareBodyStreamOptions(t *testing.T) {
 	out := PrepareBodyOptWithEfforts([]byte(`{"model":"glm-5.2","messages":[]}`), false, nil)
 
 	var obj map[string]any
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("unmarshal: %v (out=%s)", err, out)
 	}
 
@@ -339,7 +340,7 @@ func PrepareBodyOptWithEffertsPreserve(t *testing.T, body string) []byte {
 func decodeBody(b []byte) (map[string]any, error) {
 	var obj map[string]any
 
-	err := json.Unmarshal(b, &obj)
+	err := jsonx.Unmarshal(b, &obj)
 	if err != nil {
 		return obj, fmt.Errorf("decodeBody: %w", err)
 	}
@@ -469,7 +470,7 @@ func lookupToolPattern(t *testing.T, body string, path ...any) string {
 	t.Helper()
 
 	var obj map[string]any
-	if err := json.Unmarshal([]byte(body), &obj); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
 
@@ -579,7 +580,7 @@ func testPatternPropertiesKeyNormalized(t *testing.T) {
 	var obj map[string]any
 
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
-	if err := json.Unmarshal(out, &obj); err != nil {
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
 
@@ -602,7 +603,7 @@ func testMessageContentBackslashUntouched(t *testing.T) {
 	out := string(PrepareBodyOptWithEfforts([]byte(raw), false, nil))
 
 	var obj map[string]any
-	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+	if err := jsonx.Unmarshal([]byte(out), &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
 
@@ -625,18 +626,18 @@ func testNoToolsNoop(t *testing.T) {
 	body := `{"model":"m","messages":[{"role":"user","content":"a` + str + str + `_b"}]}`
 
 	var inObj, outObj map[string]any
-	if err := json.Unmarshal([]byte(body), &inObj); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &inObj); err != nil {
 		t.Fatal(err)
 	}
 
 	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
-	if err := json.Unmarshal(out, &outObj); err != nil {
+	if err := jsonx.Unmarshal(out, &outObj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
 
-	inMsg, _ := json.Marshal(inObj["messages"])
+	inMsg, _ := jsonx.Marshal(inObj["messages"])
 
-	outMsg, _ := json.Marshal(outObj["messages"])
+	outMsg, _ := jsonx.Marshal(outObj["messages"])
 	if string(inMsg) != string(outMsg) {
 		t.Fatalf("messages changed without tools: %s -> %s", inMsg, outMsg)
 	}
@@ -1037,11 +1038,11 @@ func TestDropReasoningContentParts(t *testing.T) {
 
 			// 用解码后的结构比较：map 序列化键序不稳定，字符串比较会假失败。
 			var got, want any
-			if err := json.Unmarshal([]byte(mustMarshal(t, obj["messages"])), &got); err != nil {
+			if err := jsonx.Unmarshal([]byte(mustMarshal(t, obj["messages"])), &got); err != nil {
 				t.Fatalf("unmarshal got: %v", err)
 			}
 
-			if err := json.Unmarshal([]byte(testCase.want), &want); err != nil {
+			if err := jsonx.Unmarshal([]byte(testCase.want), &want); err != nil {
 				t.Fatalf("unmarshal want: %v", err)
 			}
 
@@ -1094,7 +1095,7 @@ func TestPrepareBodyDropsReasoningParts(t *testing.T) {
 func mustMarshal(t *testing.T, v any) string {
 	t.Helper()
 
-	raw, err := json.Marshal(v)
+	raw, err := jsonx.Marshal(v)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -1137,7 +1138,7 @@ func TestInjectConversationRequestID(t *testing.T) {
 		`{"role":"user","content":"new","conversationRequestId":"client-id"}]}`
 
 	var obj map[string]any
-	if err := json.Unmarshal([]byte(body), &obj); err != nil {
+	if err := jsonx.Unmarshal([]byte(body), &obj); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1182,7 +1183,7 @@ func TestChatStreamInjectsConversationRequestBody(t *testing.T) {
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal(got, &obj); err != nil {
+	if err := jsonx.Unmarshal(got, &obj); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1266,13 +1267,13 @@ func TestNormalizeToolEnumTypesKeepValuesAndNested(t *testing.T) {
 	}
 
 	var obj map[string]any
-	if err := json.Unmarshal([]byte(out), &obj); err != nil {
+	if err := jsonx.Unmarshal([]byte(out), &obj); err != nil {
 		t.Fatalf("out not json: %v", err)
 	}
 
 	level := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)["level"].(map[string]any)
 
-	enum, _ := json.Marshal(level["enum"])
+	enum, _ := jsonx.Marshal(level["enum"])
 	if string(enum) != `["low","high"]` {
 		t.Fatalf("enum values mutated: %s", enum)
 	}
@@ -1348,5 +1349,52 @@ func TestNormalizeToolSchemasPropertyNamedLikeValueKeyword(t *testing.T) {
 
 	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "enum", "type"); got != "string" {
 		t.Fatalf("名为 enum 的属性未归一: %q", got)
+	}
+}
+
+// 出站改写只动结构与已知字段，客户端的数值字面量必须逐字保留。
+//
+// 默认 json.Unmarshal 把一切数字变成 float64：seed=9007199254740993 变成 ...992、
+// 1.0 变成 1、20 位整数 id 变成另一个值。客户端按值定位资源（会话、缓存、工具
+// 调用 id）时这类改写会静默指向错误对象。
+func TestRewriteChatBodyPreservesNumberLiterals(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"glm-5.2","seed":9007199254740993,"temperature":1.0,` +
+		`"metadata":{"trace_id":12345678901234567890},` +
+		`"messages":[{"role":"user","content":"hi"}]}`
+
+	out := rewriteChatBody([]byte(body), &chatBodyRewrite{})
+
+	for _, want := range []string{
+		`"seed":9007199254740993`,
+		`"temperature":1`,
+		`"trace_id":12345678901234567890`,
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("改写后丢失数值字面量 %s: %s", want, out)
+		}
+	}
+}
+
+// decodeObjectRawNumbers 是出站改写与 SSE 帧重建的统一入口：数字按字面量保留。
+func TestDecodeObjectRawNumbersKeepsLiterals(t *testing.T) {
+	t.Parallel()
+
+	obj, err := decodeObjectRawNumbers([]byte(`{"big":12345678901234567890,"f":1.50}`))
+	if err != nil {
+		t.Fatalf("decodeObjectRawNumbers: %v", err)
+	}
+
+	if got, ok := obj["big"].(jsontext.Value); !ok || string(got) != "12345678901234567890" {
+		t.Fatalf("big=%#v want 原字面量 12345678901234567890", obj["big"])
+	}
+
+	if got, ok := obj["f"].(jsontext.Value); !ok || string(got) != "1.50" {
+		t.Fatalf("f=%#v want 原字面量 1.50", obj["f"])
+	}
+
+	if _, err := decodeObjectRawNumbers([]byte(`not json`)); err == nil {
+		t.Fatal("非法 JSON 应报错")
 	}
 }

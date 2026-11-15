@@ -1,13 +1,13 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/reqlog"
 )
 
@@ -154,7 +154,7 @@ func TestNonStreamFinishReason(t *testing.T) {
 // stopNoToolCallsSSE 造一段「正文正常 + finish_reason=stop + 零 tool_calls」的流。
 func stopNoToolCallsSSE() string {
 	chunk := func(delta map[string]any, finish any) string {
-		b, _ := json.Marshal(map[string]any{
+		b, _ := jsonx.Marshal(map[string]any{
 			"id": "resp-1", "object": "chat.completion.chunk", "created": 1, "model": "glm-5.2",
 			"choices": []any{map[string]any{"index": 0, "delta": delta, "finish_reason": finish}},
 		})

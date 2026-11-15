@@ -1,12 +1,13 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // responses_shadow_test.go 实现一个与客户端同口径的 Responses SSE 影子解析器：
@@ -51,7 +52,7 @@ func shadowParseEvents(t *testing.T, raw string) []shadowEvent {
 		payload := strings.Join(dataLines, "\n")
 
 		var data map[string]any
-		if err := json.Unmarshal([]byte(payload), &data); err != nil {
+		if err := jsonx.Unmarshal([]byte(payload), &data); err != nil {
 			t.Fatalf("解析 SSE data 失败: %v\npayload=%s", err, payload)
 		}
 

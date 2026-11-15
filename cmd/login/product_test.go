@@ -4,9 +4,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 )
 
 // loginHit 记录一次设备授权请求的路径、查询与头，供头集断言使用。
@@ -82,6 +86,84 @@ func assertLoginProductHeaders(
 		assertLoginHeader(t, hit.header, name, "true", wantPath)
 	}
 }
+
+// TestLoginStateURLJourneyParams 授权链接补齐 version 与 loginSessionId（issue #534）：
+// version 随部署 profile，loginSessionId 只在 CN 站（platform=workbuddy）追加。
+func TestLoginStateURLJourneyParams(t *testing.T) {
+	t.Parallel()
+
+	cnIdentity := loginIdentity{
+		platform:  "workbuddy",
+		version:   "5.9.3",
+		sessionID: "11111111-2222-4333-8444-555555555555",
+	}
+
+	cnQuery := mustLoginStateQuery(t, loginStateURL(upstreamBaseCN, cnIdentity))
+	assertLoginStateParam(t, cnQuery, "platform", "workbuddy")
+	assertLoginStateParam(t, cnQuery, "version", "5.9.3")
+	assertLoginStateParam(t, cnQuery, "loginSessionId", cnIdentity.sessionID)
+
+	global := loginIdentity{platform: "workbuddy-ai", version: "5.9.4"}
+	globalQuery := mustLoginStateQuery(t, loginStateURL(upstreamBaseGlobal, global))
+	assertLoginStateParam(t, globalQuery, "version", "5.9.4")
+
+	if got := globalQuery.Get("loginSessionId"); got != "" {
+		t.Errorf("global 链接不得带 loginSessionId（官方只在 CN 站追加），got %q", got)
+	}
+}
+
+// TestLoginIdentityForJourneyParams 部署 profile 的 source.version 与 CN 站
+// loginSessionId 必须落到登录身份上（仓库不内置版本常量）。
+func TestLoginIdentityForJourneyParams(t *testing.T) {
+	t.Parallel()
+
+	profiles, err := clientprofile.LoadDir("../../internal/upstream/testdata/profile")
+	if err != nil {
+		t.Fatalf("load test profiles: %v", err)
+	}
+
+	cnIdentity := loginIdentityFor(profiles, realmCN)
+	if cnIdentity.version != "9.9.9" {
+		t.Errorf("cn version=%q want 9.9.9（来自 profile source.version）", cnIdentity.version)
+	}
+
+	if !loginUUIDv4Pattern.MatchString(cnIdentity.sessionID) {
+		t.Errorf("cn loginSessionId=%q 不是 UUIDv4", cnIdentity.sessionID)
+	}
+
+	global := loginIdentityFor(profiles, realmGlobal)
+	if global.version != "9.9.10" {
+		t.Errorf("global version=%q want 9.9.10", global.version)
+	}
+
+	if global.sessionID != "" {
+		t.Errorf("global loginSessionId=%q want 空（官方只在 CN 站生成）", global.sessionID)
+	}
+}
+
+// mustLoginStateQuery 解析 auth/state 的查询参数。
+func mustLoginStateQuery(t *testing.T, raw string) url.Values {
+	t.Helper()
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse state url %q: %v", raw, err)
+	}
+
+	return parsed.Query()
+}
+
+// assertLoginStateParam 断言 auth/state 查询参数取值。
+func assertLoginStateParam(t *testing.T, query url.Values, key, want string) {
+	t.Helper()
+
+	if got := query.Get(key); got != want {
+		t.Errorf("%s=%q want %q", key, got, want)
+	}
+}
+
+// loginUUIDv4Pattern UUIDv4 字面量（version=4、variant=10xx）。
+var loginUUIDv4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
 
 // assertLoginHeader 核对单个请求头；wantPath 只用于失败定位。
 func assertLoginHeader(t *testing.T, header http.Header, name, want, wantPath string) {

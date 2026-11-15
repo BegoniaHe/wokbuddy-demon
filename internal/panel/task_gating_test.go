@@ -2,7 +2,6 @@ package panel
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -106,7 +106,7 @@ func assertSkipped(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int,
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -134,7 +134,7 @@ func TestPanelTaskEndpointsDenyGlobalAndEnterprise(t *testing.T) {
 				Skipped bool  `json:"skipped"`
 				Tasks   []any `json:"tasks"`
 			}
-			if err := json.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
+			if err := jsonx.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
 				t.Fatal(err)
 			}
 
@@ -244,7 +244,7 @@ func assertCheckinSkipped(t *testing.T, kind string) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 
@@ -277,7 +277,7 @@ func assertCheckinAllowed(t *testing.T, kind string) {
 	}
 
 	var resp map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
 

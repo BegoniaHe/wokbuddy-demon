@@ -4,13 +4,13 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 const sseNarrationStop = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0," +
@@ -207,7 +207,7 @@ func TestChatNonStreamNarrationContinued(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 
@@ -243,7 +243,7 @@ func TestChatNonStreamToolRoundAdoptsOnlyToolCalls(t *testing.T) {
 	}
 
 	var got map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 

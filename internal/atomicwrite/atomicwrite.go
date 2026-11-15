@@ -5,7 +5,9 @@
 // 失败。本包在 Windows 下做有界退避重试，非 Windows 保持单次 rename 语义（issue #26）。
 package atomicwrite
 
-import "time"
+import (
+	"time"
+)
 
 // 退避参数：有界（上限次数 + 延迟封顶），避免调用方（如 auth.SaveAtomic 全程持锁）
 // 因重试长时间阻塞。测试可临时调小。
@@ -13,6 +15,13 @@ var (
 	renameMaxAttempts = 50
 	renameBaseDelay   = 2 * time.Millisecond
 	renameMaxDelay    = 50 * time.Millisecond
+	// renameRetryBudget 单次 Rename 的累计退避上限。
+	//
+	// 只有次数上限时，50 次 × 封顶 50ms 的睡眠累计约 2.3s；而调用方（如
+	// auth.SaveAtomic）全程持账号锁，Windows 上一条永久无效路径（目录只读 /
+	// ACL 拒绝，同样映射 fs.ErrPermission）会让该账号每次保存都堵这么久。
+	// 瞬时占用（杀软扫描、索引器）通常几十毫秒内解除，300ms 上限足够。
+	renameRetryBudget = 300 * time.Millisecond
 )
 
 // Rename 原子替换 oldpath → newpath。非 Windows 等价于单次 os.Rename；
@@ -32,6 +41,7 @@ func renameWithRetry(
 	var err error
 
 	delay := renameBaseDelay
+	start := time.Now()
 
 	for attempt := range renameMaxAttempts {
 		err = doRename(oldpath, newpath)
@@ -40,6 +50,10 @@ func renameWithRetry(
 		}
 
 		if !retryable(err) || attempt == renameMaxAttempts-1 {
+			return err
+		}
+
+		if time.Since(start)+delay > renameRetryBudget {
 			return err
 		}
 

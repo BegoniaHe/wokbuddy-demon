@@ -16,8 +16,7 @@ import (
 	"cmp"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
-	"errors"
+	"encoding/json/jsontext"
 	"fmt"
 	"io"
 	"log"
@@ -35,6 +34,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/credithist"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/httpauth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/livecfg"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pricing"
@@ -193,6 +193,21 @@ func (p *Panel) tryLockAccount(uid string) bool {
 	p.taskMu.Unlock()
 
 	return mu.TryLock()
+}
+
+// lockAccountForTask 取账号任务锁，抢不到直接回 409。
+//
+// 锁的既定语义是「同一账号的任务动作同时只允许一条在跑」（见 tryLockAccount 头注）。
+// 手动签到/余额刷新/任务 accept/claim 原先都落在锁外，可与队列、「一键完成」、
+// 补领清扫并发打同一账号的任务状态机（重复 accept 批次、claim 与 claim 竞态）。
+func (p *Panel) lockAccountForTask(w http.ResponseWriter, uid string) bool {
+	if p.tryLockAccount(uid) {
+		return true
+	}
+
+	writeErr(w, http.StatusConflict, "该账号有任务动作正在执行中，请等本轮结束后再试")
+
+	return false
 }
 
 // unlockAccount 释放账号任务锁（与 tryLockAccount 配对）。
@@ -498,13 +513,19 @@ func (p *Panel) allowScope(w http.ResponseWriter, r *http.Request, requireAdmin 
 		return false
 	}
 
-	p.authLimiter.Reset(ip)
-
 	if requireAdmin && res.Scope != httpauth.ScopeAdmin {
 		// 凭据有效但作用域不足：泛化 403，不区分不存在/已撤销/作用域不足。
+		// 这里**不能**清失败预算：否则持有 readonly key 的人可以「猜 admin key（记一次
+		// 失败）→ 用 readonly key 打任意接口（清零）」无限试探，限速形同失效。
 		writeErr(w, http.StatusForbidden, "forbidden")
 
 		return false
+	}
+
+	// 同上：只有 admin 作用域凭据的成功才清预算。readonly 打读接口也会到这里，
+	// 若一并清零，攻击者用 readonly key 就能洗白对 admin key 的猜测预算。
+	if res.Scope == httpauth.ScopeAdmin {
+		p.authLimiter.Reset(ip)
 	}
 
 	return true
@@ -668,7 +689,9 @@ func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
 		To:        parseTimeParam(values.Get("to")),
 	})
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err.Error())
+		// 归档读取失败会把日志目录的绝对路径带进响应；readonly 凭据也能触发。
+		// 统一截断（与其它上游错误同口径），细节留在服务端日志。
+		writeErr(w, http.StatusInternalServerError, truncateStr(err.Error(), 200))
 		return
 	}
 	// 空结果回 []（而不是 JSON null）：前端把 null 与"归档关闭"混在一起会走错分支，
@@ -693,7 +716,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 
 	var busyErrs []string
 	if len(out) > 0 {
-		p.attachModelBusy(out, &busyErrs)
+		p.attachModelBusy(r.Context(), out, &busyErrs)
 	}
 
 	if len(out) == 0 {
@@ -896,7 +919,7 @@ func applyPanelModelTier(entry map[string]any, modelInfo *upstream.ModelInfo) {
 // 一致），网关自身不解析字段语义、不据此做任何路由或出站决策；上游改了限制后
 // 重跑一次工具、下次查询即刷新，无需重启网关。
 func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
-	out := map[string]any{"probes": map[string]json.RawMessage{}, "exists": false}
+	out := map[string]any{"probes": map[string]jsontext.Value{}, "exists": false}
 	if p.cfg.ProbeFile == "" {
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -915,16 +938,16 @@ func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var item struct {
-		Version int                        `json:"version"`
-		Probes  map[string]json.RawMessage `json:"probes"`
+		Version int                       `json:"version"`
+		Probes  map[string]jsontext.Value `json:"probes"`
 	}
-	if err := json.Unmarshal(raw, &item); err != nil {
+	if err := jsonx.Unmarshal(raw, &item); err != nil {
 		writeErr(w, http.StatusBadGateway, "parse probes: "+err.Error())
 		return
 	}
 
 	if item.Probes == nil {
-		item.Probes = map[string]json.RawMessage{}
+		item.Probes = map[string]jsontext.Value{}
 	}
 
 	out["probes"] = item.Probes
@@ -1138,6 +1161,11 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	// 额度查询按 realm/企业口径分流（upstream.UserResourceSnapshot）。
 	// 前端对企业版账号不渲染「签到」按钮；此处是 API 侧防御（外部脚本/旧缓存
 	// 前端仍可能调用）。
+	if !p.lockAccountForTask(w, uid) {
+		return
+	}
+	defer p.unlockAccount(uid)
+
 	denyReason, checkin := p.runCheckin(r.Context(), account, uid)
 
 	resp := checkinResponse(account, denyReason, checkin)
@@ -1154,6 +1182,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 
 	p.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
 	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	p.cfg.Pool.SetPaidStatus(uid, snap.PaidUser)
 	resp["credits"] = snap.Remain
 	resp["credits_total"] = snap.Total
 	log.Printf("panel: checkin uid=%s state=%s msg=%q credit=%d/%v credits=%d/%d",
@@ -1171,6 +1200,11 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !p.lockAccountForTask(w, uid) {
+		return
+	}
+	defer p.unlockAccount(uid)
+
 	// 与签到/后台刷新同口径：写完整批次，单号刷新不清空到期明细。
 	snap, err := p.cfg.Upstream.UserResourceSnapshot(r.Context(), account, p.expiringSoonWindow())
 	if err != nil {
@@ -1179,6 +1213,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	p.cfg.Pool.SetPaidStatus(uid, snap.PaidUser)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": snap.Remain, "credits_total": snap.Total})
 }
 
@@ -1423,7 +1458,8 @@ func (p *Panel) syncNicknames(ctx context.Context) {
 		}
 
 		wg.Add(1)
-		go func(j nicknameJob) {
+
+		p.goGuarded("nickname-refresh", func() {
 			defer wg.Done()
 			defer func() { <-sem }()
 
@@ -1436,7 +1472,7 @@ func (p *Panel) syncNicknames(ctx context.Context) {
 			updated += numVal
 			failed += num2
 			mu.Unlock()
-		}(j)
+		})
 	}
 
 	wg.Wait()
@@ -1601,8 +1637,6 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 // 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
 // 标 error，不影响其它账号——一个号 token 失效不该让整页空白。客户端断开后
 // 不再派发剩余账号。
-//
-//nolint:funlen // 并发拉包/合并/错误隔离线性展开。
 func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	accts := p.cfg.Pool.List()
@@ -1625,28 +1659,11 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			defer func() { <-sem }()
 
-			packageAccountRow2 := packageAccountRow{UID: status.UID, Nickname: status.Nickname, Realm: status.Realm}
+			// 与同包其它扇出同口径：这里跑的是上游响应解析与 out[i] 写入，
+			// 一次 panic 就是进程级终止，会连带所有账号的 /v1/* 中断。
+			defer recoverGuarded("packages-account")
 
-			account := p.cfg.Pool.AuthByUID(status.UID)
-			if account == nil {
-				packageAccountRow2.Error = "account not loaded"
-				out[i] = packageAccountRow2
-
-				return
-			}
-
-			packs, remain, size, err := p.cfg.Upstream.CreditPackages(account)
-			if err != nil {
-				packageAccountRow2.Error = err.Error()
-				out[i] = packageAccountRow2
-
-				return
-			}
-
-			packageAccountRow2.Packages = packs
-			packageAccountRow2.Remain = remain
-			packageAccountRow2.Size = size
-			out[i] = packageAccountRow2
+			out[i] = p.packageRowFor(status)
 		}(i, status)
 	}
 
@@ -1661,8 +1678,34 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out, "grants": creditGrants(out)})
 }
 
+// packageRowFor 拉取单账号积分包并组装行（失败写 Error，不返回错误）。
+func (p *Panel) packageRowFor(status *pool.Status) packageAccountRow {
+	row := packageAccountRow{UID: status.UID, Nickname: status.Nickname, Realm: status.Realm}
+
+	account := p.cfg.Pool.AuthByUID(status.UID)
+	if account == nil {
+		row.Error = "account not loaded"
+
+		return row
+	}
+
+	packs, remain, size, err := p.cfg.Upstream.CreditPackages(account)
+	if err != nil {
+		// 上游错误原文可能很长且带内部文案：截断后再进面板 JSON。
+		row.Error = truncateStr(err.Error(), 200)
+
+		return row
+	}
+
+	row.Packages = packs
+	row.Remain = remain
+	row.Size = size
+
+	return row
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	raw, err := json.Marshal(v)
+	raw, err := jsonx.Marshal(v)
 	if err != nil {
 		http.Error(w, "internal encode error", http.StatusInternalServerError)
 		return
@@ -1677,18 +1720,12 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
 }
 
-var errTrailingJSON = errors.New("unexpected data after JSON body")
-
 // decodeJSONBody 解码请求体中的单个 JSON 值：首个值之后的非空数据同样视为
-// 畸形请求，避免 `{"force":true} garbage` 被静默接受并执行写操作。
+// 畸形请求，避免 `{"force":true} garbage` 被静默接受并执行写操作
+// （jsonx.UnmarshalRead 在首个值之后遇到非空白内容即报错）。
 func decodeJSONBody(body io.Reader, v any) error {
-	dec := json.NewDecoder(body)
-	if err := dec.Decode(v); err != nil {
+	if err := jsonx.UnmarshalRead(body, v); err != nil {
 		return fmt.Errorf("decode json body: %w", err)
-	}
-
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errTrailingJSON
 	}
 
 	return nil
@@ -1731,7 +1768,7 @@ type packageAccountRow struct {
 	Remain   int64                    `json:"remain"`
 	Size     int64                    `json:"size"`
 	Packages []upstream.CreditPackage `json:"packages"`
-	Error    string                   `json:"error,omitempty"`
+	Error    string                   `json:"error,omitempty,omitzero"`
 }
 
 // creditGrant 积分包获取历史的一行（issue #100，只读快照）。
@@ -1744,8 +1781,8 @@ type creditGrant struct {
 	Inferred  bool   `json:"inferred"`
 	Size      int64  `json:"size"`
 	Remain    int64  `json:"remain"`
-	CreatedAt string `json:"created_at,omitempty"`
-	ExpiresAt int64  `json:"expires_at,omitempty"`
+	CreatedAt string `json:"created_at,omitempty,omitzero"`
+	ExpiresAt int64  `json:"expires_at,omitempty,omitzero"`
 	Status    string `json:"status"`
 }
 
@@ -1831,7 +1868,7 @@ type remainingRow struct {
 	Used        int64   `json:"used"`
 	Budget      float64 `json:"budget"`
 	Remaining   float64 `json:"remaining"`
-	WindowStart string  `json:"window_start,omitempty"`
+	WindowStart string  `json:"window_start,omitempty,omitzero"`
 	Cooling     bool    `json:"cooling"`
 	Estimated   bool    `json:"estimated"`
 	Samples     int     `json:"samples"`
@@ -1859,12 +1896,16 @@ func (p *Panel) usageRemaining(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// remainingRows 汇总账号×模型的已用/预算/窗口；同一 24h 窗口内按 resetAt-24h 起算。
-func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.Budget, int) {
-	budgets := p.cfg.Quota.Budgets()
-	events := p.cfg.Quota.Events()
-	y, m, d := now.Date()
-	daily := p.cfg.Usage.TokensByAccountModel(time.Date(y, m, d, 0, 0, 0, 0, now.Location()))
+// remainingRowSpec 待输出的账号×模型组合（窗口用量稍后批量补齐）。
+type remainingRowSpec struct {
+	acct  *pool.Status
+	model string
+	used  int64
+	reset time.Time
+}
+
+// indexQuotaEvents 由事件集合建立「账号×模型 → 最近重置时间」与「账号 → 模型集合」。
+func indexQuotaEvents(events []quota.Event) (map[string]time.Time, map[string]map[string]bool) {
 	resetByKey := map[string]time.Time{}
 	modelsByUID := map[string]map[string]bool{}
 
@@ -1881,9 +1922,48 @@ func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.B
 		modelsByUID[item.UID][item.Model] = true
 	}
 
-	rows := make([]remainingRow, 0)
+	return resetByKey, modelsByUID
+}
 
+// remainingRows 汇总账号×模型的已用/预算/窗口；同一 24h 窗口内按 resetAt-24h 起算。
+func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.Budget, int) {
+	budgets := p.cfg.Quota.Budgets()
+	events := p.cfg.Quota.Events()
+	y, m, d := now.Date()
+	daily := p.cfg.Usage.TokensByAccountModel(time.Date(y, m, d, 0, 0, 0, 0, now.Location()))
+	resetByKey, modelsByUID := indexQuotaEvents(events)
+
+	// 先扫描一遍待出行，收集需要按窗口重算的 (realm, uid, model) 三元组：
+	// 窗口用量一次遍历聚合，而不是逐行在 recorder 锁内扫全表。
+	specs, sinceByKey := p.remainingRowSpecs(modelsByUID, daily, resetByKey)
+	windowUsed := p.cfg.Usage.TokensSinceByKey(sinceByKey)
+
+	rows := make([]remainingRow, 0, len(specs))
+
+	for _, spec := range specs {
+		used := spec.used
+		if !spec.reset.IsZero() {
+			used = windowUsed[spec.acct.Realm+"|"+spec.acct.UID+"|"+spec.model]
+		}
+
+		rows = append(rows, p.remainingRow(spec.acct, spec.model, used, spec.reset, budgets, now))
+	}
+
+	slices.SortStableFunc(rows, func(a, b remainingRow) int { return remainingRowCompare(&a, &b) })
+
+	return rows, budgets, len(events)
+}
+
+// remainingRowSpecs 展开账号×模型组合，并为有撞线重置的项收集窗口起点。
+func (p *Panel) remainingRowSpecs(
+	modelsByUID map[string]map[string]bool,
+	daily map[string]map[string]int64,
+	resetByKey map[string]time.Time,
+) ([]remainingRowSpec, map[string]time.Time) {
 	all := p.cfg.Pool.List()
+	specs := make([]remainingRowSpec, 0, len(all))
+	sinceByKey := map[string]time.Time{}
+
 	for i := range all {
 		acct := &all[i]
 
@@ -1897,15 +1977,18 @@ func (p *Panel) remainingRows(now time.Time) ([]remainingRow, map[string]quota.B
 		}
 
 		for model := range models {
-			rows = append(rows, p.remainingRow(
-				acct, model, daily[acct.UID][model], resetByKey[acct.UID+"|"+model], budgets, now,
-			))
+			reset := resetByKey[acct.UID+"|"+model]
+			specs = append(specs, remainingRowSpec{
+				acct: acct, model: model, used: daily[acct.UID][model], reset: reset,
+			})
+
+			if !reset.IsZero() {
+				sinceByKey[acct.Realm+"|"+acct.UID+"|"+model] = reset.Add(-24 * time.Hour)
+			}
 		}
 	}
 
-	slices.SortStableFunc(rows, func(a, b remainingRow) int { return remainingRowCompare(&a, &b) })
-
-	return rows, budgets, len(events)
+	return specs, sinceByKey
 }
 
 // remainingRowCompare 剩余量升序；同量按 realm/uid/model 固定次序。
@@ -1926,8 +2009,8 @@ func remainingRowCompare(left, right *remainingRow) int {
 	return cmp.Compare(left.Model, right.Model)
 }
 
-// remainingRow 组装单行；有撞线重置时间时改用同窗口用量。
-func (p *Panel) remainingRow(
+// remainingRow 组装单行；有撞线重置时间时 used 已是同窗口用量（调用方一次聚合）。
+func (*Panel) remainingRow(
 	acct *pool.Status,
 	model string,
 	used int64,
@@ -1939,8 +2022,6 @@ func (p *Panel) remainingRow(
 	if !reset.IsZero() {
 		row.WindowStart = reset.Add(-24 * time.Hour).Format(time.RFC3339)
 		row.Cooling = reset.After(now)
-		used = p.cfg.Usage.TokensSince(acct.Realm, acct.UID, model, reset.Add(-24*time.Hour))
-		row.Used = used
 	}
 
 	budget, ok := budgets[acct.Realm+"|"+model]
@@ -1961,7 +2042,7 @@ func (p *Panel) remainingRow(
 
 // remainingETag 依据行与事件数生成弱 ETag。
 func remainingETag(rows []remainingRow, events int) string {
-	raw, err := json.Marshal(struct {
+	raw, err := jsonx.Marshal(struct {
 		Rows   []remainingRow `json:"rows"`
 		Events int            `json:"events"`
 	}{Rows: rows, Events: events})

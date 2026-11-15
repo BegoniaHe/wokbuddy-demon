@@ -3,21 +3,26 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 // userIDOnlyBody 构造一条只带 metadata.user_id 的多轮请求（不带任何会话标识）。
 func userIDOnlyBody(first, last string) map[string]any {
+	return userIDOnlyBodyFor("u1", first, last)
+}
+
+// userIDOnlyBodyFor 同上，但显式指定调用方 user_id（多下游用户部署的夹具）。
+func userIDOnlyBodyFor(uid, first, last string) map[string]any {
 	return map[string]any{
 		"model":    "glm-5.2",
-		"metadata": map[string]any{"user_id": "u1"},
+		"metadata": map[string]any{"user_id": uid},
 		"messages": []any{
 			map[string]any{"role": "system", "content": "sys"},
 			map[string]any{"role": "user", "content": first},
@@ -31,7 +36,7 @@ func userIDOnlyBody(first, last string) map[string]any {
 func marshalBody(t *testing.T, body map[string]any) string {
 	t.Helper()
 
-	raw, err := json.Marshal(body)
+	raw, err := jsonx.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -112,6 +117,31 @@ func assertContentBindings(t *testing.T, binds *bindStore, wantCount int, checkF
 			t.Errorf("binding %q -> %q want a pool uid", key, uid)
 		}
 	}
+}
+
+// TestUserIDClientDistinctUsersDoNotShareBinding 相同开场白 + 不同 user_id 不得共享
+// 绑定键（issue #533）：中转站多下游用户部署里，否则第二个用户被钉在第一个用户的账号上。
+func TestUserIDClientDistinctUsersDoNotShareBinding(t *testing.T) {
+	t.Parallel()
+	handler, binds := newUserIDStickyHandler(t, true)
+
+	send := func(uid string) {
+		t.Helper()
+
+		rec := postChat(t, handler, marshalBody(t, userIDOnlyBodyFor(uid, "hi", "second")))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+		}
+	}
+
+	send("u1")
+	assertContentBindings(t, binds, 1, true)
+
+	send("u2") // 同一段开场白，另一个下游用户
+	assertContentBindings(t, binds, 2, true)
+
+	send("u1") // 用户 1 再发一轮：仍命中自己的键，不新增
+	assertContentBindings(t, binds, 2, false)
 }
 
 // TestUserIDClientDeriveBindingCanBeDisabled 开关关闭时回退旧行为：无会话键即不绑定。

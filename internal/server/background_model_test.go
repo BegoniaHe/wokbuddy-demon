@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
@@ -64,7 +64,7 @@ func TestBackgroundModelRedirect(t *testing.T) {
 			}
 
 			var got map[string]any
-			if err := json.Unmarshal([]byte(seen), &got); err != nil {
+			if err := jsonx.Unmarshal([]byte(seen), &got); err != nil {
 				t.Fatal(err)
 			}
 

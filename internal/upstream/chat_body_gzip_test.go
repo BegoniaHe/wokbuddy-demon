@@ -4,7 +4,6 @@ package upstream
 import (
 	"bytes"
 	"compress/gzip"
-	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // capturedChatRequest 一次 chat 出站尝试的可观测项。
@@ -123,7 +123,7 @@ func assertGunzippedModel(t *testing.T, body []byte, wantModel string) {
 	}
 
 	var payload map[string]any
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	if err := jsonx.Unmarshal(raw, &payload); err != nil {
 		t.Fatalf("解压后不是合法 JSON: %v (%s)", err, raw)
 	}
 

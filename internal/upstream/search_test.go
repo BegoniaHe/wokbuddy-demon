@@ -2,7 +2,6 @@ package upstream
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 // TestSearchRequestShape 请求形状：路径、方法、字段顺序、必要头。
@@ -228,7 +228,7 @@ func TestSearchParsesFlatResponse(t *testing.T) {
 		t.Fatalf("outcome=%+v want 2 条且 total 兜底为 2", out)
 	}
 
-	raw, _ := json.Marshal(out)
+	raw, _ := jsonx.Marshal(out)
 	if !strings.Contains(string(raw), `"results":[`) {
 		t.Errorf("results 必须序列化为数组: %s", raw)
 	}

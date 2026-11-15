@@ -11,7 +11,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BegoniaHe/wokbuddy-demon/internal/logfmt"
 )
+
+// ringMaxLineBytes 入环单行上限（与 runlog 单行上限同量级）。
+const ringMaxLineBytes = 4 << 10
 
 // 日志频道。
 const (
@@ -81,7 +86,9 @@ func (r *Ring) Write(nums []byte) (int, error) {
 			continue
 		}
 
-		text := tsPrefixRe.ReplaceAllString(line, "")
+		// 单行上限：上游错误 body / 整段 HTML 会经 log.Printf 进来，无界行会被保留
+		// cap 份，并随 /panel/api/logs 与 error_summary 整体序列化输出。
+		text := logfmt.TruncateEllipsis(tsPrefixRe.ReplaceAllString(line, ""), ringMaxLineBytes)
 
 		r.entries = append(r.entries, LogEntry{TS: now, Ch: classifyLine(text), Text: text})
 		if overflow := len(r.entries) - r.cap; overflow > 0 {

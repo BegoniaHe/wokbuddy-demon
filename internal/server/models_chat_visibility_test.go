@@ -1,11 +1,11 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/pool"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
@@ -29,7 +29,7 @@ func modelIDsFromList(t *testing.T, body []byte) map[string]bool {
 	t.Helper()
 
 	var resp map[string]any
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := jsonx.Unmarshal(body, &resp); err != nil {
 		t.Fatalf("unmarshal models: %v", err)
 	}
 

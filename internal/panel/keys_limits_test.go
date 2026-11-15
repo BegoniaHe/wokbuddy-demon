@@ -2,7 +2,6 @@ package panel
 
 import (
 	"bytes"
-	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
@@ -10,6 +9,7 @@ import (
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
 func TestKeysCreateWithLimits(t *testing.T) {
@@ -26,7 +26,7 @@ func TestKeysCreateWithLimits(t *testing.T) {
 	}
 
 	var created keysResp
-	if err := json.Unmarshal([]byte(resp), &created); err != nil {
+	if err := jsonx.Unmarshal([]byte(resp), &created); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
 

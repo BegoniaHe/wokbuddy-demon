@@ -14,6 +14,10 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/apikey"
 )
 
+// maxKeyNameRunes 密钥名称长度上限：名称会写进快照文件并原样回给只读凭据，
+// 不限长时可写入数 MB（请求体上限 16MiB），且每次变更都全量重写快照。
+const maxKeyNameRunes = 64
+
 // keysList 列出全部命名密钥（不含哈希与明文）。
 func (p *Panel) keysList(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Keys == nil {
@@ -41,7 +45,16 @@ func (p *Panel) keysCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec, raw, err := p.cfg.Keys.Create(strings.TrimSpace(body.Name), body.Limits)
+	name := strings.TrimSpace(body.Name)
+	// 名称会写进密钥快照文件并原样回给任何只读凭据；请求体上限 16MiB，不限长时
+	// 可以写入数 MB 的 name（每次 Create/UpdateLimits 都全量重写快照）。
+	if len([]rune(name)) > maxKeyNameRunes {
+		writeErr(w, http.StatusBadRequest, "name 过长（最多 64 字符）")
+
+		return
+	}
+
+	rec, raw, err := p.cfg.Keys.Create(name, body.Limits)
 	if err != nil {
 		if errors.Is(err, apikey.ErrInvalidLimits) {
 			writeErr(w, http.StatusBadRequest, err.Error())
