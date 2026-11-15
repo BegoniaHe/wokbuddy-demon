@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -65,6 +66,11 @@ type Auth struct {
 	DepartmentFullName string
 	Nickname           string
 	FilePath           string // 来源文件；refresh 后原子写回此处
+
+	// expiresAtMillis 记录来源文件 expiresAt 的单位（Parse 归一为秒之前是否为毫秒）。
+	// SaveAtomic 按同一单位写回：网关目录可能同时被官方客户端读取，单位变了客户端
+	// 会判成已过期或极远未来（issue #540）。
+	expiresAtMillis bool
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
@@ -179,6 +185,7 @@ func (a *Auth) Snapshot() Auth {
 		Nickname:           a.Nickname,
 		DeviceToken:        a.DeviceToken,
 		FilePath:           a.FilePath,
+		expiresAtMillis:    a.expiresAtMillis,
 		retired:            a.retired,
 	}
 }
@@ -492,7 +499,9 @@ func Parse(raw []byte) (*Auth, error) {
 		return nil, err
 	}
 	// 官方 CLI 写入 Unix 毫秒，本仓库内部统一按秒。阈值 1e11 落在当前秒/毫秒值之间：
-	// 两侧都不会误判。写回 SaveAtomic 仍按秒。
+	// 两侧都不会误判。来源单位记在 expiresAtMillis，SaveAtomic 按同一单位写回
+	// （issue #540）；写回全量重建时仍按秒。
+	auth.expiresAtMillis = auth.ExpiresAt > millisThreshold
 	auth.ExpiresAt = NormalizeExpiresAt(auth.ExpiresAt)
 
 	if strings.TrimSpace(auth.AccessToken) == "" {
@@ -506,14 +515,15 @@ func Parse(raw []byte) (*Auth, error) {
 // 官方 CodeBuddy CLI 与工作台客户端都把 expiresAt 写成毫秒；所有从官方
 // 凭据构造 Auth 的路径都必须经过这里，避免把毫秒当成极远未来而永不刷新。
 func NormalizeExpiresAt(expiresAt int64) int64 {
-	const millisThreshold = 1e11
-
 	if expiresAt > millisThreshold {
 		return expiresAt / 1000
 	}
 
 	return expiresAt
 }
+
+// millisThreshold 区分秒与毫秒时间戳的阈值：落在当前秒/毫秒量级之间，两侧都不误判。
+const millisThreshold = 1e11
 
 // parseAuthDoc 按磁盘形态选择解析器：存在 "auth" 键即嵌套形，否则扁平形。
 func parseAuthDoc(raw []byte, probe map[string]json.RawMessage) (Auth, error) {
@@ -602,10 +612,10 @@ func parseFlatAuth(raw []byte) (Auth, error) {
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename），保持嵌套形（插件可读）格式。
+// 已存在的同名文件作为底稿：只覆盖本仓库建模的键，未建模键与 expiresAt 单位原样
+// 保留——网关目录可能同时被官方客户端读取（issue #540）。
 // 全程持 a.mu：防止与 RefreshToken 修改 token 字段并发，杜绝写回半更新。
 // 防御：accessToken 为空时拒绝写回，避免误用空凭证覆盖有效文件。
-//
-//nolint:funlen,maintidx // 校验/序列化/原子写/回写缓存线性展开。
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -622,38 +632,7 @@ func (a *Auth) SaveAtomic() error {
 		return errNoFilePathSet
 	}
 
-	accountDoc := map[string]any{
-		"uid":          a.UID,
-		"enterpriseId": a.EnterpriseID,
-		"nickname":     a.Nickname,
-	}
-	// 可选身份字段只在有值时写回：手写账号通常没有这些键，写空键会让插件侧
-	// 读到「已填但为空」的版本 / 来源（type 尤其：空串不等于 personal）。
-	for key, value := range map[string]string{
-		"type":               a.EditionType,
-		"idSource":           a.IDSource,
-		"departmentFullName": a.DepartmentFullName,
-	} {
-		if value != "" {
-			accountDoc[key] = value
-		}
-	}
-
-	doc := map[string]any{
-		"auth": map[string]any{
-			"accessToken":  a.AccessToken,
-			"refreshToken": a.RefreshToken,
-			"expiresAt":    a.ExpiresAt,
-			"domain":       a.Domain,
-			"realm":        a.realm,
-		},
-		"account": accountDoc,
-	}
-	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
-	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
-	if a.DeviceToken != "" {
-		doc["device_token"] = a.DeviceToken
-	}
+	doc := a.mergeDoc(readAuthDoc(a.FilePath))
 
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -677,7 +656,97 @@ func (a *Auth) SaveAtomic() error {
 	return nil
 }
 
-// SaveAtomicRetry 在 SaveAtomic 基础上做有界重试（0/100ms/300ms）。
+// readAuthDoc 读取 FilePath 现有的 JSON 文档作为保守写回的底稿。文件不存在、
+// 不可读或不是 JSON 对象时返回 nil（按全量重建处理，与引入底稿前一致）。
+func readAuthDoc(path string) map[string]any {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+
+	var doc map[string]any
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil
+	}
+
+	return doc
+}
+
+// flatAuthKeys 扁平形底稿里已建模的顶层键：迁入嵌套形后不能在顶层重名留旧值。
+var flatAuthKeys = []string{
+	"accessToken", "refreshToken", "expiresAt", "domain", "realm",
+	"uid", "enterpriseId", "type", "idSource", "departmentFullName", "nickname",
+	"device_token",
+}
+
+// mergeDoc 在底稿上覆盖本仓库建模的键（issue #540）：auth/account 对象里未建模
+// 的键（account.phoneNumber / uin / email 等）与顶层扩展键原样保留，嵌套层级不
+// 重排。扁平形底稿的已知顶层键删除后迁入嵌套形，避免同一字段留两份旧值与新值。
+func (a *Auth) mergeDoc(base map[string]any) map[string]any {
+	doc := base
+	if doc == nil {
+		doc = map[string]any{}
+	} else if _, nested := doc["auth"]; !nested {
+		for _, key := range flatAuthKeys {
+			delete(doc, key)
+		}
+	}
+
+	authDoc := childObject(doc, "auth")
+	authDoc["accessToken"] = a.AccessToken
+	authDoc["refreshToken"] = a.RefreshToken
+	authDoc["expiresAt"] = a.expiresAtOnDisk()
+	authDoc["domain"] = a.Domain
+	authDoc["realm"] = a.realm
+	doc["auth"] = authDoc
+
+	accountDoc := childObject(doc, "account")
+	accountDoc["uid"] = a.UID
+	accountDoc["enterpriseId"] = a.EnterpriseID
+	accountDoc["nickname"] = a.Nickname
+	// 可选身份字段只在有值时写回：手写账号通常没有这些键，写空键会让插件侧
+	// 读到「已填但为空」的版本 / 来源（type 尤其：空串不等于 personal）。
+	for key, value := range map[string]string{
+		"type":               a.EditionType,
+		"idSource":           a.IDSource,
+		"departmentFullName": a.DepartmentFullName,
+	} {
+		if value != "" {
+			accountDoc[key] = value
+		}
+	}
+
+	doc["account"] = accountDoc
+
+	// DeviceToken 非空才写回顶层 device_token：避免在无该字段的旧文件里引入空键
+	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
+	if a.DeviceToken != "" {
+		doc["device_token"] = a.DeviceToken
+	}
+
+	return doc
+}
+
+// childObject 取 doc[key] 的对象形态；缺失或不是对象时新建。
+func childObject(doc map[string]any, key string) map[string]any {
+	child, _ := doc[key].(map[string]any)
+	if child == nil {
+		child = map[string]any{}
+	}
+
+	return child
+}
+
+// expiresAtOnDisk 按来源文件的单位写回 expiresAt（秒或毫秒）。网关目录可能同时
+// 被官方客户端读取，单位变了客户端会判成已过期或极远未来（issue #540）。
+func (a *Auth) expiresAtOnDisk() int64 {
+	if a.expiresAtMillis {
+		return a.ExpiresAt * 1000
+	}
+
+	return a.ExpiresAt
+}
+
 // refresh 成功后上游已轮换 RT；落盘瞬时失败（磁盘满、bind-mount 抖动）不能静默
 // 留下旧 RT，否则重启后可能再也刷新不了。
 func (a *Auth) SaveAtomicRetry() error {
