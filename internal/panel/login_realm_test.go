@@ -1,6 +1,8 @@
 package panel
 
 import (
+	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -11,42 +13,106 @@ func TestLoginEndpoints(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		realm      string
-		wantState  string
-		wantOrigin string
+		realm        string
+		wantBase     string
+		wantPlatform string
+		wantOrigin   string
 	}{
-		{"global", "https://www.workbuddy.ai/v2/plugin/auth/state?platform=workbuddy-ai", "https://www.workbuddy.ai"},
-		{"cn", "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
-		{"", "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
-		{"weird", "https://www.workbuddy.cn/v2/plugin/auth/state?platform=workbuddy", "https://www.codebuddy.cn"},
+		{"global", "https://www.workbuddy.ai", "workbuddy-ai", "https://www.workbuddy.ai"},
+		{"cn", "https://www.workbuddy.cn", "workbuddy", "https://www.codebuddy.cn"},
+		{"", "https://www.workbuddy.cn", "workbuddy", "https://www.codebuddy.cn"},
+		{"weird", "https://www.workbuddy.cn", "workbuddy", "https://www.codebuddy.cn"},
 	}
 	for _, item := range cases {
 		t.Run(item.realm, func(t *testing.T) {
 			t.Parallel()
 
-			ep := loginCandidatesWithIdentity(item.realm, defaultLoginIdentity(item.realm))[0]
+			endpoint := loginCandidatesWithIdentity(item.realm, defaultLoginIdentity(item.realm))[0]
 
-			st, tok, acct, origin := ep.state, ep.token, ep.account, ep.origin
-			if st != item.wantState {
-				t.Errorf("realm=%q state=%q want %q", item.realm, st, item.wantState)
+			parsed, err := url.Parse(endpoint.state)
+			if err != nil {
+				t.Fatalf("realm=%q state=%q: %v", item.realm, endpoint.state, err)
 			}
 
+			if got := parsed.Scheme + "://" + parsed.Host + parsed.Path; got != item.wantBase+"/v2/plugin/auth/state" {
+				t.Errorf("realm=%q state=%q want base %q", item.realm, endpoint.state, item.wantBase)
+			}
+
+			if got := parsed.Query().Get("platform"); got != item.wantPlatform {
+				t.Errorf("realm=%q platform=%q want %q", item.realm, got, item.wantPlatform)
+			}
+
+			tok, acct, origin := endpoint.token, endpoint.account, endpoint.origin
 			if origin != item.wantOrigin {
 				t.Errorf("realm=%q origin=%q want %q", item.realm, origin, item.wantOrigin)
 			}
 			// token/account 端点必与 state 同 base。
-			if item.realm == "global" {
-				if tok[:len("https://www.workbuddy.ai")] != "https://www.workbuddy.ai" ||
-					acct[:len("https://www.workbuddy.ai")] != "https://www.workbuddy.ai" {
-					t.Errorf("global token/account endpoints should be workbuddy.ai: %q %q", tok, acct)
-				}
-			} else {
-				if tok[:len("https://www.workbuddy.cn")] != "https://www.workbuddy.cn" ||
-					acct[:len("https://www.workbuddy.cn")] != "https://www.workbuddy.cn" {
-					t.Errorf("cn token/account endpoints should be workbuddy.cn: %q %q", tok, acct)
-				}
+			if tok[:len(item.wantBase)] != item.wantBase || acct[:len(item.wantBase)] != item.wantBase {
+				t.Errorf("realm=%q token/account endpoints should be %s: %q %q", item.realm, item.wantBase, tok, acct)
 			}
 		})
+	}
+}
+
+// TestLoginStateURLJourneyParams 授权链接补齐 version 与 loginSessionId（issue #534）：
+// version 来自部署 profile（空则不补），loginSessionId 只在 CN 站（platform=workbuddy）。
+func TestLoginStateURLJourneyParams(t *testing.T) {
+	t.Parallel()
+
+	panel := loginTestPanel(t)
+
+	cnState := loginCandidatesWithIdentity("cn", panel.loginIdentityFor("cn"))[0].state
+	cnQuery := mustStateQuery(t, cnState)
+	assertJourneyParam(t, cnQuery, "version", "9.9.9")
+	assertUUIDv4(t, cnQuery.Get("loginSessionId"))
+
+	globalState := loginCandidatesWithIdentity("global", panel.loginIdentityFor("global"))[0].state
+	globalQuery := mustStateQuery(t, globalState)
+	assertJourneyParam(t, globalQuery, "version", "9.9.10")
+
+	if got := globalQuery.Get("loginSessionId"); got != "" {
+		t.Errorf("global 链接不得带 loginSessionId（官方只在 CN 站追加），got %q", got)
+	}
+
+	// 无部署 profile 的缺省身份不补 version，但 CN 仍带现场生成的 loginSessionId。
+	bareQuery := mustStateQuery(t, loginStateURL(upstreamBaseCN, defaultLoginIdentity("cn")))
+	if got := bareQuery.Get("version"); got != "" {
+		t.Errorf("无 profile 时不得补 version，got %q", got)
+	}
+
+	assertUUIDv4(t, bareQuery.Get("loginSessionId"))
+}
+
+// mustStateQuery 解析 auth/state 的查询参数。
+func mustStateQuery(t *testing.T, raw string) url.Values {
+	t.Helper()
+
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse state url %q: %v", raw, err)
+	}
+
+	return parsed.Query()
+}
+
+// assertJourneyParam 断言查询参数取值。
+func assertJourneyParam(t *testing.T, query url.Values, key, want string) {
+	t.Helper()
+
+	if got := query.Get(key); got != want {
+		t.Errorf("%s=%q want %q", key, got, want)
+	}
+}
+
+// uuidV4Pattern UUIDv4 字面量（version=4、variant=10xx）。
+var uuidV4Pattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// assertUUIDv4 断言 loginSessionId 是 UUIDv4。
+func assertUUIDv4(t *testing.T, got string) {
+	t.Helper()
+
+	if !uuidV4Pattern.MatchString(got) {
+		t.Errorf("loginSessionId=%q 不是 UUIDv4", got)
 	}
 }
 

@@ -25,6 +25,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
 
 const (
@@ -55,20 +56,30 @@ type loginEndpoint struct {
 	userAgent string
 }
 
-// loginIdentity 设备授权链路的客户端身份：UA 与 auth/state 的 platform 参数。
+// loginIdentity 设备授权链路的客户端身份：UA、auth/state 的 platform、授权页读取的
+// 客户端版本与会话标识。
 type loginIdentity struct {
 	userAgent string
 	platform  string
+	// version 授权页读取的客户端版本，来自部署 profile（仓库不内置版本常量）；空则不补。
+	version string
+	// sessionID 授权页的 loginSessionId：官方只对 CN 站（platform=workbuddy）现场生成。
+	sessionID string
 }
 
-// defaultLoginIdentity 只提供 platform 缺省值；UA 必须来自部署 profile。
+// defaultLoginIdentity 只提供 platform 缺省值与 CN 站的 loginSessionId；UA 与 version
+// 必须来自部署 profile（仓库不内置客户端版本 / 登录 UA）。
 func defaultLoginIdentity(realm string) loginIdentity {
-	platform := "workbuddy"
+	identity := loginIdentity{platform: "workbuddy"}
 	if realm == "global" {
-		platform = "workbuddy-ai"
+		identity.platform = "workbuddy-ai"
 	}
 
-	return loginIdentity{platform: platform}
+	if identity.platform == "workbuddy" {
+		identity.sessionID = session.NewUUIDv4()
+	}
+
+	return identity
 }
 
 // loginIdentityFor 取部署 profile 的 loginUA / loginPlatform。profile 或 loginUA
@@ -92,6 +103,9 @@ func (p *Panel) loginIdentityFor(realm string) loginIdentity {
 		identity.platform = profile.Emit.LoginPlatform
 	}
 
+	// 授权页把 version 编进 console/auth/risk-context 与 signin-callback 的 redirect_uri。
+	identity.version = profile.Source.Version
+
 	return identity
 }
 
@@ -103,12 +117,30 @@ func loginEndpointForBaseWithIdentity(realm, base string, identity loginIdentity
 
 	return loginEndpoint{
 		base:      base,
-		state:     base + "/v2/plugin/auth/state?platform=" + url.QueryEscape(identity.platform),
+		state:     loginStateURL(base, identity),
 		token:     base + "/v2/plugin/auth/token?state=",
 		account:   base + "/v2/plugin/login/account?state=",
 		origin:    origin,
 		userAgent: identity.userAgent,
 	}
+}
+
+// loginStateURL 拼 auth/state 地址：platform 恒有；version 来自部署 profile（空则不补）；
+// loginSessionId 只在 CN 站（platform=workbuddy）追加——与官方
+// appendHostLoginJourneyParams 的 platform!=='workbuddy' → return 同口径。
+func loginStateURL(base string, identity loginIdentity) string {
+	query := url.Values{}
+	query.Set("platform", identity.platform)
+
+	if identity.version != "" {
+		query.Set("version", identity.version)
+	}
+
+	if identity.platform == "workbuddy" && identity.sessionID != "" {
+		query.Set("loginSessionId", identity.sessionID)
+	}
+
+	return base + "/v2/plugin/auth/state?" + query.Encode()
 }
 
 func loginCandidatesWithIdentity(realm string, identity loginIdentity) []loginEndpoint {
