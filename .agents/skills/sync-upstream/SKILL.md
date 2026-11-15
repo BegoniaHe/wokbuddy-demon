@@ -6,6 +6,9 @@ description: >-
   in the decision ledger, and open Issues on BegoniaHe/wokbuddy-demon. Use for
   upstream synchronization audits, reference-fork commit classification, and
   upstream protocol drift review; do not use to absorb or cherry-pick code.
+metadata:
+  author: BegoniaHe <163421589+BegoniaHe@users.noreply.github.com>
+  checkout: BegoniaHe/wokbuddy-demon
 ---
 
 # Audit the reference fork and open issues

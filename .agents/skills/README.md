@@ -1,6 +1,6 @@
 # Skills
 
-`.agents/skills/` 是本仓库**唯一**的技能来源。每个技能是一个目录，含 `SKILL.md`（共享指令），可选 `REFERENCE.md`、`scripts/`、`agents/openai.yaml`（Codex UI 元数据）。
+`.agents/skills/` 是本仓库**唯一**的技能来源。每个技能是一个目录，含 `SKILL.md`（共享指令），可选 `REFERENCE.md`、`references/`（按需加载的细分文档）、`scripts/`、`assets/`、`agents/openai.yaml`（Codex UI 元数据）。
 
 ## Codex CLI 与 OpenCode
 

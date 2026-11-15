@@ -1,12 +1,17 @@
 ---
 name: issue-to-pr
-description: Implement a planned or small, obvious wokbuddy-demon Issue and prepare its pull request: frontier-ordered vertical slices, tests at existing seams, real checks, a Conventional Commit, and a template-matched PR body with evidence and an Agent note. Use when an Issue or accepted plan is ready to build and ship; not for planning-only requests, reference-fork audits, or merging.
+description: >-
+  Implement a planned or small, obvious wokbuddy-demon Issue and prepare its
+  pull request: frontier-ordered vertical slices, tests at existing seams, real
+  checks, a Conventional Commit, and a template-matched PR body with evidence
+  and an Agent note. Use when an Issue or accepted plan is ready to build and
+  ship; not for planning-only requests, reference-fork audits, or merging.
 license: MIT
 compatibility: >
   Codex CLI or OpenCode in the BegoniaHe/wokbuddy-demon checkout. Requires
   Python 3.x and git; gh is needed only to push and open the PR.
 metadata:
-  author: BegoniaHe
+  author: BegoniaHe <163421589+BegoniaHe@users.noreply.github.com>
   checkout: BegoniaHe/wokbuddy-demon
 ---
 

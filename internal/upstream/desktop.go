@@ -498,6 +498,8 @@ func (c *Client) ReportDesktopEvent(account2 *auth.Auth, events ...DesktopEvent)
 	// 与 surfaceReport 同口径：个人号不发 X-No-Enterprise-Id 声明头（#298）。
 	injectEnterpriseIDHeaders(req, account2)
 	req.Header.Set("X-Request-ID", session.NewUUIDv7Hex())
+	// 桌面 report 是主进程面：CN 5.11.3 起随出站头提供者带 X-Device-Token（#552）。
+	c.injectMainProcessProviderHeaders(req, account2)
 
 	if account2.UID != "" {
 		req.Header.Set("X-User-Id", account2.UID)
@@ -1004,6 +1006,8 @@ func (c *Client) setDesktopExpertHeaders(
 	header.Set("X-Ide-Type", "WorkBuddy")
 	header.Set("X-Ide-Version", c.clientVersionFor(account5))
 	header.Set("X-Codebuddy-Request", "1")
+	// 桌面 chat 同为主进程面：CN 5.11.3 起随出站头提供者带 X-Device-Token（#552）。
+	c.injectMainProcessProviderHeaders(req, account5)
 	// 链路族（traceparent/b3 单头 + X-B3-*），与 injectConversationHeaders 同口径。
 	spanID := requestID[:16]
 	parentSpanID := session.NewMessageID()[:16]

@@ -5,8 +5,9 @@
 // （或任意挂载路径），网关定期读取并注入消费者的请求头。读取频率限 5 分钟一次缓存，
 // >1KB 或读失败则忽略（优雅降级不注入，不影响主流程）。
 //
-// 消费面（真机 2026-10-28 抓包）：chat 与签到。chat 与签到的注入点见
-// internal/upstream/headers.go（surfaceChat 与 checkinHeaders）；
+// 消费面按官方基线分两代：CN 5.11.3 / global 5.9.4 起主进程出站头提供者在一方域
+// 统一注入（billing / report / refresh / v3-config / logout / 模型目录 / 桌面 chat，
+// 见 injectMainProcessProviderHeaders）；chat 与签到另有显式注入点。
 // 取舍（发 = 更像官方，不发 = 更少设备关联）见 internal/upstream/UPSTREAM.md §六。
 package upstream
 

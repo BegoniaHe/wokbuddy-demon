@@ -6,7 +6,7 @@ compatibility: >
   Codex CLI or OpenCode in the BegoniaHe/wokbuddy-demon checkout. Requires
   Python 3.x, git, and gh when fetching a GitHub Issue.
 metadata:
-  author: BegoniaHe
+  author: BegoniaHe <163421589+BegoniaHe@users.noreply.github.com>
   checkout: BegoniaHe/wokbuddy-demon
 ---
 
