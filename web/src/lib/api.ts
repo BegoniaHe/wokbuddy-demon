@@ -34,19 +34,44 @@ export interface ApiError extends Error {
   status?: number;
 }
 
-// api 发起 /panel/api/<path> 请求；非 2xx 抛 Error（message 取后端 error 字段）。
-export async function api<T = unknown>(path: string, opts: RequestInit = {}): Promise<T> {
-  const h: Record<string, string> = { ...(opts.headers as Record<string, string> | undefined) };
+// panelFetch 发起 /panel/api/<path> 原始请求并返回 Response，响应体交给调用方解析。
+//
+// api() 覆盖不了两类调用：带 FormData 的上传（api() 在有 body 时强制
+// Content-Type: application/json，会打断 multipart 边界）与二进制下载（api() 只解析
+// JSON）。这两类此前各自手拼 Authorization，绕开了 401 的密钥门——管理密钥失效时
+// 用户只看到「HTTP 401」，不知道要重新填密钥。这里把鉴权与 401 口径收回同一处。
+export async function panelFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const h: Record<string, string> = { ...(init.headers as Record<string, string> | undefined) };
   const k = getKey();
   if (k) h['Authorization'] = 'Bearer ' + k;
-  if (opts.body) h['Content-Type'] = 'application/json';
-  const r = await fetch('/panel/api/' + path, { ...opts, headers: h });
+  const r = await fetch('/panel/api/' + path, { ...init, headers: h });
   if (r.status === 401) {
     onUnauthorized?.();
     const err: ApiError = new Error('密钥无效或未填写');
     err.status = 401;
     throw err;
   }
+  return r;
+}
+
+// panelKeyValid 探测某把管理面密钥是否仍被接受。
+//
+// 用于「保存配置后决定是否替换现有凭据」：这里的 401 是预期结果之一，不能弹密钥门，
+// 所以刻意不走 panelFetch。
+export async function panelKeyValid(k: string): Promise<boolean> {
+  try {
+    const r = await fetch('/panel/api/overview', { headers: { Authorization: 'Bearer ' + k } });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+// api 发起 /panel/api/<path> 请求；非 2xx 抛 Error（message 取后端 error 字段）。
+export async function api<T = unknown>(path: string, opts: RequestInit = {}): Promise<T> {
+  const h: Record<string, string> = { ...(opts.headers as Record<string, string> | undefined) };
+  if (opts.body) h['Content-Type'] = 'application/json';
+  const r = await panelFetch(path, { ...opts, headers: h });
   const d = (await r.json().catch(() => ({}))) as { error?: string };
   if (!r.ok) {
     const err: ApiError = new Error(d.error || 'HTTP ' + r.status);
