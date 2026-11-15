@@ -621,6 +621,59 @@ func TestDeriveCacheKeyIgnoresUserIDGate(t *testing.T) {
 	}
 }
 
+// TestDeriveCacheKeyMixesUserID 派生键必须掺入调用方 user_id：中转站多下游用户
+// 开场白相同（"hi"）时不得撞到同一粘性键，否则第二个用户被钉在第一个用户的账号上；
+// 无 user_id 时输入逐字节不变（老客户端零回归），同一 user_id 跨轮稳定（issue #533）。
+func TestDeriveCacheKeyMixesUserID(t *testing.T) {
+	t.Parallel()
+
+	const plain = `{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`
+
+	// golden：无 user_id 时派生输入不变，键与修复前逐字节相同。
+	if got := DeriveCacheKey([]byte(plain)); got != "d-29837c222e5eed0abd99f68be30e930c" {
+		t.Fatalf("无 user_id 的派生键必须保持旧值（golden），got %q", got)
+	}
+
+	body := func(prefix, tail string) string {
+		return prefix + `"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}` + tail + `]}`
+	}
+	topLevel := func(uid, tail string) string { return body(`{"user_id":"`+uid+`",`, tail) }
+	metaLevel := func(uid, tail string) string { return body(`{"metadata":{"user_id":"`+uid+`"},`, tail) }
+
+	keyUser1 := DeriveCacheKey([]byte(topLevel("u1", "")))
+	keyUser2 := DeriveCacheKey([]byte(topLevel("u2", "")))
+
+	if keyUser1 == "" || keyUser2 == "" {
+		t.Fatalf("带 user_id 的请求仍须派生缓存键：u1=%q u2=%q", keyUser1, keyUser2)
+	}
+
+	if keyUser1 == keyUser2 {
+		t.Fatalf("不同 user_id + 相同开场白必须得到不同键，got %q", keyUser1)
+	}
+
+	if keyUser1 == DeriveCacheKey([]byte(plain)) {
+		t.Fatalf("掺入 user_id 后的键必须与无 user_id 的键区分，got %q", keyUser1)
+	}
+
+	// 同一 user_id 跨轮：尾轮追加不换键。
+	tail := `,{"role":"assistant","content":"ok"},{"role":"user","content":"next"}`
+	if got := DeriveCacheKey([]byte(topLevel("u1", tail))); got != keyUser1 {
+		t.Fatalf("同一 user_id 跨轮键必须稳定：%q vs %q", keyUser1, got)
+	}
+
+	// metadata.user_id 与顶层 user_id 同义：同一用户同一段对话落同一键。
+	if got := DeriveCacheKey([]byte(metaLevel("u1", ""))); got != keyUser1 {
+		t.Fatalf("metadata.user_id 与顶层 user_id 应产出同一键：%q vs %q", got, keyUser1)
+	}
+
+	// 两者同时存在时以 metadata 为准（显式会话键同为 metadata 优先）。
+	both := `{"user_id":"u2","metadata":{"user_id":"u1"},` +
+		`"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi"}]}`
+	if got := DeriveCacheKey([]byte(both)); got != keyUser1 {
+		t.Fatalf("metadata.user_id 应优先于顶层 user_id：%q vs %q", got, keyUser1)
+	}
+}
+
 // TestStickyKeyFromContentNamespace 内容派生粘性键必须与 sessKey 命名空间隔离，
 // 空派生键不产生绑定键（issue #481）。
 func TestStickyKeyFromContentNamespace(t *testing.T) {
