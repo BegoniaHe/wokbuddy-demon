@@ -75,6 +75,41 @@
 
 最后一个是 `Expert_Philanthropy`：它需要真实捐款，领奖时会校验捐赠回执。这种决定应该由你本人来做，所以小恶魔只负责提醒，不负责替你慷慨。
 
+## 🔌 端点一览
+
+网关对外只有两类面：**协议面**（客户端用，认 `api_key` 或命名密钥）与**运维面**（探活 / 监控 / 排障用，认 `api_key` 或 `admin_api_key`）。下表是完整清单；未列出的路径一律 404，错误体按客户端形态回 OpenAI / Anthropic / Gemini 三种信封。
+
+**协议面**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/v1/chat/completions` | OpenAI 兼容对话，流式 / 非流式 |
+| POST | `/v1/responses` | OpenAI Responses 兼容；`GET` 同路径回 `426`，那是 Codex 的 WebSocket 探测，让它立刻回落 POST |
+| GET | `/v1/models` | 模型列表，按 realm 绑定与命名密钥白名单裁剪 |
+| GET | `/v1/models/{model}` | 单个模型详情；按客户端形态返回 OpenAI 或 Anthropic 字段 |
+| POST | `/v1/messages` | Anthropic Messages 兼容；同义别名 `POST /messages` |
+| POST | `/v1/messages/count_tokens` | 输入 token 估算：本地按字节近似（4 字节 ≈ 1 token），**不作计费依据**；别名 `POST /messages/count_tokens` |
+| POST | `/v1/search/messages` | 联网搜索（`features.search_endpoint`，默认关）；`deep:true` 综述式另受 `features.search_deep` 约束 |
+| POST | `/v1beta/models/{model}:{action}` | Gemini CLI GATEWAY 模式，`action` 取 `generateContent` / `streamGenerateContent` / `countTokens`；`v1alpha`、`v1` 同义 |
+| POST | `/v2/chat/busy` | 官方客户端模型忙预检，只读本地池状态、不产生上游请求，单批最多 50 个模型 |
+| POST | `/v1/tools/fetch` | 官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；别名 `POST /v1/fetch` |
+| POST | `/v1/images/generations` | 出图（`features.images_endpoint`，默认关） |
+| POST | `/v1/images/edits` | 图生图（与出图共用同一开关） |
+| POST | `/v1/videos/generations` | 视频任务提交（`features.videos_endpoint`，默认关） |
+| GET | `/v1/videos/{task_id}` | 视频任务查询；跨域任务必须带 `?model=` 决定选号域 |
+
+**运维面**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/status` | 账号池状态与计数 |
+| GET | `/healthz` | 探活，**无鉴权**：可服务回 200；停机中或无可服务账号回 503。响应含 `realm_servable`，按域报告 CN / global 可达性 |
+| GET | `/metrics` | Prometheus 指标 |
+| GET | `/debug/pprof/*` | 运行时 profiling；GET / HEAD 只读即可，其余动作要求 admin |
+| GET | `/panel/` | 内嵌管理面板。页面与静态资源公开，数据接口 `/panel/api/*` 才鉴权 |
+
+鉴权口径：协议面接受默认 `api_key` 或任一命名密钥；运维面只认默认 `api_key`，设了 `admin_api_key` / `readonly_api_key` 后改为只认这两把（细节见「使用须知」）。`api_key` 为空时全部放行——公网部署必设。
+
 ## 🧭 小恶魔守则
 
 1. **数据不出门**：凭证与状态留在本机，不往云端兜一圈。
@@ -239,6 +274,62 @@ WB2API_CAPTURE_DIR=./data/capture ./wokbuddy-demon
 - 开启后每次命中异常形态（预告句续写、工具轮续写、reasoning-only 救援、非流式续写、stop 无 tool_calls）落一份样本：`capture-<UTC 时间戳>-<形态>.json`。
 - 样本只含**请求形状**（模型、是否流式、声明工具数）、**脱敏后的响应尾部**（≤400 字）与**判定结果**；`Authorization` / token / Cookie / `uid=` 一律替换为 `[REDACTED]`。
 - 目录不可写只告警一次并降级，不影响请求。样本属于本机诊断材料，不要提交进仓库（`data/` 已 gitignore）。
+
+## 🔧 环境变量（`WB2A_*`）
+
+除 `config.json` 外，进程还认一组 `WB2A_*` 环境变量。它们在**加载配置时覆盖同名配置项**，优先级高于文件——面板保存配置触发的重载也会再叠一次，所以「环境变量设了值，面板里改同名项却没生效」是这个机制在起作用，不是面板的 bug。
+
+解析口径：
+
+- 整型 / 布尔变量解析失败按**未设置**处理，既不报错也不回落到 `0` / `true`；字符串变量空串即未设置。
+- 环境变量只在进程启动时读入。运行中改不了，设了就得以环境变量为准——想交回配置文件，把变量去掉后重启。
+- `cmd/credit` 这类配套 CLI 同样认 `WB2A_AUTH_DIR`，口径与主程序一致。
+
+**监听与鉴权**
+
+| 环境变量 | 覆盖配置项 | 默认 / 说明 |
+|---|---|---|
+| `WB2A_LISTEN` | `listen` | `:7863`；默认只监听本机，公网部署请置于 HTTPS 反代之后 |
+| `WB2A_API_KEY` | `api_key` | **空 = 不鉴权直接放行**，公网部署必设 |
+| `WB2A_AUTH_DIR` | `auth_dir` | `./auths`；凭证目录，含明文 refreshToken |
+| `WB2A_STATE_FILE` | `state_file` | `./data/state.json` |
+| `WB2A_SOFT_RATE` | `cooldown.soft_rate` | `600s`；软冷却退避基数 |
+| `WB2A_SOFT_RATE_MAX` | `cooldown.soft_rate_max` | `2h`；软冷却退避上限 |
+
+**出站超时与身份**
+
+| 环境变量 | 覆盖配置项 | 默认 / 说明 |
+|---|---|---|
+| `WB2A_TIMEOUT_SECONDS` | `upstream.timeout_seconds` | `120`；短 RPC 总时长 |
+| `WB2A_HEADER_TIMEOUT_SECONDS` | `upstream.header_timeout_seconds` | `120`；首字节前等待 |
+| `WB2A_IDLE_TIMEOUT_SECONDS` | `upstream.idle_timeout_seconds` | `300`；流中空闲 |
+| `WB2A_USER_AGENT` | `upstream.user_agent` | 空 = 用内置快照值 |
+| `WB2A_CLIENT_VERSION` | `upstream.client_version` | 空 = 用内置快照值 |
+| `WB2A_CLI_VERSION` | `upstream.cli_version` | 空 = 用内置快照值 |
+| `WB2A_CLIENT_NAME` | `upstream.client_name` | 空 = 用内置快照值 |
+| `WB2A_DEVICE_TOKEN` | `upstream.device_token` | 空 = 不注入设备 token |
+| `WB2A_DEVICE_TOKEN_FILE` | `upstream.device_token_file` | 空 = 不读文件 |
+| `WB2A_PASSTHROUGH_IP` | `upstream.passthrough_ip` | `false`；开启前确认部署形态与信任边界 |
+
+**特性开关与提示词**
+
+| 环境变量 | 覆盖配置项 | 默认 / 说明 |
+|---|---|---|
+| `WB2A_SANITIZE_FINGERPRINTS` | `features.sanitize_blacklist_fingerprints` | `true`；出站脱敏，**不要关** |
+| `WB2A_MULTIMODAL_ROUTING` | `features.multimodal_routing` | `false`；多模态路由 |
+| `WB2A_PROMPT_MODE` | `prompt.mode` | `passthrough`；可选 `custom` / `append`，非法值启动报错 |
+| `WB2A_PROMPT_FILE` | `prompt.file` | 空 = 用内置提示词；仅 `custom` / `append` 模式读取，不可读即启动报错 |
+| `WB2A_EXPIRING_SOON` | `pool.expiring_soon` | `168h`；多久内算「即将过期」 |
+| `WB2A_PREFER_EXPIRING` | `pool.prefer_expiring` | `true`；优先选即将过期的账号 |
+| `WB2A_CROSS_DOMAIN_FALLBACK` | `pool.cross_domain_fallback` | `false`；跨域回落 |
+| `WB2A_DNS` | `dns_servers` | 逗号分隔，如 `1.1.1.1:53,8.8.8.8:53`；覆盖整个列表 |
+
+**诊断**
+
+| 环境变量 | 说明 |
+|---|---|
+| `WB2A_DEBUG_CHAT` | 非空即为 desktop chat 出站打印 `[dbg]` 行：URL 走 `Redacted()`，`Authorization` / Cookie / `x-device-token` 等敏感头整段隐藏，其余头截断 200 字节。**只用于排障**——不在敏感清单里的自定义头不做通用脱敏，别在共享终端里长期开启。 |
+| `WB2API_CAPTURE_DIR` | 异常形态取证采样，默认关闭；细节见上一节「取证采样」。 |
 
 ## 🐾 适合谁
 

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { api, getKey, postJSON } from '@/lib/api';
+import { api, panelFetch, postJSON } from '@/lib/api';
 import { toast } from '@/components/Toaster';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -171,11 +171,8 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
     setImportErr('');
     const fd = new FormData();
     fd.append('file', file);
-    const h: Record<string, string> = {};
-    const k = getKey();
-    if (k) h['Authorization'] = 'Bearer ' + k;
     try {
-      const r = await fetch('/panel/api/import/cockpit', { method: 'POST', body: fd, headers: h });
+      const r = await panelFetch('import/cockpit', { method: 'POST', body: fd });
       const d = (await r.json()) as { error?: string; imported?: number; skipped?: number };
       if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
       setImportMsg('导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : ''));
@@ -192,11 +189,12 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
       setSecErr('密码至少 8 位');
       return;
     }
-    const h: Record<string, string> = { 'Content-Type': 'application/json' };
-    const k = getKey();
-    if (k) h['Authorization'] = 'Bearer ' + k;
     try {
-      const r = await fetch('/panel/api/export/encrypted', { method: 'POST', headers: h, body: JSON.stringify({ password: secPass }) });
+      const r = await panelFetch('export/encrypted', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: secPass }),
+      });
       if (!r.ok) {
         const d = (await r.json().catch(() => ({}))) as { error?: string };
         throw new Error(d.error || 'HTTP ' + r.status);
@@ -224,11 +222,8 @@ export function AddAccountDialog({ open, onOpenChange }: { open: boolean; onOpen
     const fd = new FormData();
     fd.append('file', file);
     fd.append('password', secPass);
-    const h: Record<string, string> = {};
-    const k = getKey();
-    if (k) h['Authorization'] = 'Bearer ' + k;
     try {
-      const r = await fetch('/panel/api/import/encrypted', { method: 'POST', body: fd, headers: h });
+      const r = await panelFetch('import/encrypted', { method: 'POST', body: fd });
       const d = (await r.json()) as { error?: string; imported?: number; skipped?: number };
       if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
       setSecMsg('导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : ''));

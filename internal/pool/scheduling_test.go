@@ -264,3 +264,35 @@ func TestEstimatePromptTokensMatchesRuneRange(t *testing.T) {
 		}
 	}
 }
+
+// TestApproxTokensAndCJKBoundary 请求预扣与响应节奏共用的口径锚点：CJK 起点与
+// 换算下限在此锁死（server 侧用它做节奏估算，改这里等于改两侧）。
+func TestApproxTokensAndCJKBoundary(t *testing.T) {
+	t.Parallel()
+
+	if IsCJKChar(0x2E7F) {
+		t.Fatal("0x2E7F 不是 CJK 起点")
+	}
+
+	if !IsCJKChar(0x2E80) || !IsCJKChar('中') {
+		t.Fatal("0x2E80 与 CJK 汉字必须判为 CJK")
+	}
+
+	cases := []struct {
+		ascii, cjk, want int64
+	}{
+		{0, 0, 0},
+		{3, 0, 0}, // 3/4 截断为 0
+		{4, 0, 1},
+		{0, 1, 0}, // 1/1.5 截断为 0
+		{0, 3, 2},
+		{8, 3, 4},
+	}
+
+	for _, testCase := range cases {
+		if got := ApproxTokens(testCase.ascii, testCase.cjk); got != testCase.want {
+			t.Fatalf("ApproxTokens(%d,%d)=%d want %d",
+				testCase.ascii, testCase.cjk, got, testCase.want)
+		}
+	}
+}

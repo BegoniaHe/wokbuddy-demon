@@ -112,6 +112,16 @@ func jitterCooldown(duration time.Duration) time.Duration {
 // cjkRangeStart CJK 统一表意文字的起始 rune。
 const cjkRangeStart = 0x2E80
 
+// IsCJKChar 报告 r 是否落在 CJK 区间（粗略估算用，不做 Unicode 分类）。
+// 请求预扣（EstimatePromptTokens）与响应整形节奏（server 侧）共用这条判据。
+func IsCJKChar(r rune) bool { return r >= cjkRangeStart }
+
+// ApproxTokens 把 ASCII/CJK 字符数换算成 token 估算：ASCII ≈ 4 字符/token，
+// CJK ≈ 1.5 字符/token。只用于预扣与节奏估算，不参与计费或 usage 统计。
+func ApproxTokens(ascii, cjk int64) int64 {
+	return ascii/4 + int64(float64(cjk)/1.5)
+}
+
 // EstimatePromptTokens 粗略估算请求的 prompt token：ASCII ≈ 4 字节/token，
 // CJK ≈ 1.5 字节/token。只用于请求前预扣，不参与计费或 usage 统计。
 //
@@ -125,14 +135,14 @@ func EstimatePromptTokens(body []byte) int {
 		r, size := utf8.DecodeRune(body)
 		body = body[size:]
 
-		if r >= cjkRangeStart {
+		if IsCJKChar(r) {
 			cjk++
 		} else {
 			ascii++
 		}
 	}
 
-	return ascii/4 + int(float64(cjk)/1.5)
+	return int(ApproxTokens(int64(ascii), int64(cjk)))
 }
 
 // ReserveForRequest 请求级预扣（issue #116 P1-1）：按实测单价或目录倍率估算本次

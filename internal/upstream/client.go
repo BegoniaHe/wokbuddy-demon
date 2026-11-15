@@ -1814,7 +1814,7 @@ func (c *Client) prepareBody(body []byte, scope, uid, conversationID, conversati
 
 // chatBodySnapshots 一次读锁取出出站改写需要的三类目录快照：effort 档位、
 // 模型声明默认档、输出上限。任一桶为空都返回 nil（调用方按「未知」处理）。
-// 与 effortsSnapshot 同契约：写入时克隆/新建、发布后不可变，读路径零拷贝。
+// 写入时克隆/新建、发布后不可变，读路径零拷贝。
 func (c *Client) chatBodySnapshots(scope string) (map[string][]string, map[string]string, map[string]int64) {
 	k := realmKey(scope)
 
@@ -1856,30 +1856,6 @@ func snapshotBucket[T any](buckets map[string]T, key string, nonEmpty func(T) bo
 
 // nonEmptyMap 判断 map 桶是否非空（snapshotBucket 的空值判定）。
 func nonEmptyMap[K comparable, V any](m map[K]V) bool { return len(m) > 0 }
-
-// effortsSnapshot 返回 effort 能力缓存的只读快照；nil 表示未知（透传不降级）。
-// storeEfforts 在写入时已克隆输入并整体替换桶，快照发布后不可变，读路径零拷贝。
-// 调用方只读，不得修改返回的 map/slice。
-func (c *Client) effortsSnapshot(scope string) map[string][]string {
-	c.effortsMu.RLock()
-	defer c.effortsMu.RUnlock()
-
-	bucket, _ := snapshotBucket(c.efforts, realmKey(scope), nonEmptyMap)
-
-	return bucket
-}
-
-// defaultEffortsSnapshot 返回指定 realm 的模型 defaultEffort 只读快照；
-// 该域无探测或无声明默认档 → nil（thinking.go 回退硬编码 high）。
-// 与 effortsSnapshot 同契约：写入时克隆，快照不可变，调用方只读。
-func (c *Client) defaultEffortsSnapshot(scope string) map[string]string {
-	c.effortsMu.RLock()
-	defer c.effortsMu.RUnlock()
-
-	bucket, _ := snapshotBucket(c.defaultEfforts, realmKey(scope), nonEmptyMap)
-
-	return bucket
-}
 
 // realmKey 归一化缓存键：空串视为 cn（老调用/无前缀模型名）。
 func realmKey(realm string) string {

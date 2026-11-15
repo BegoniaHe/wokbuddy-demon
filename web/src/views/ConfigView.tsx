@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { api, LS_KEY, postJSON } from '@/lib/api';
+import { api, LS_KEY, panelKeyValid, postJSON } from '@/lib/api';
 import {
   CFG_FIELD_BY_NAME,
   collectConfig,
@@ -127,13 +127,7 @@ export function ConfigView() {
         let existingValid = false;
 
         if (existing) {
-          try {
-            existingValid = (await fetch('/panel/api/overview', {
-              headers: { Authorization: 'Bearer ' + existing },
-            })).ok;
-          } catch {
-            existingValid = false;
-          }
+          existingValid = await panelKeyValid(existing);
         }
 
         if (!existingValid) {

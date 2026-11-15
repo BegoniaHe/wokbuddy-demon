@@ -13,7 +13,7 @@ func TestEffortsSnapshotImmutable(t *testing.T) {
 	// 写入后调用方改输入，不得污染缓存。
 	in["m1"][0] = "mutated"
 
-	old, defs := client.effortsSnapshot("cn"), client.defaultEffortsSnapshot("cn")
+	old, defs, _ := client.chatBodySnapshots("cn")
 	if old["m1"][0] != "low" || defs["m1"] != "high" {
 		t.Fatalf("store did not clone input: efforts=%v defaults=%v", old, defs)
 	}
@@ -24,7 +24,7 @@ func TestEffortsSnapshotImmutable(t *testing.T) {
 		t.Fatalf("old snapshot mutated by refresh: %v", old)
 	}
 
-	next, _ := client.effortsSnapshot("cn"), client.defaultEffortsSnapshot("cn")
+	next, _, _ := client.chatBodySnapshots("cn")
 	if next["m1"][0] != "medium" {
 		t.Fatalf("new snapshot=%v want medium", next)
 	}

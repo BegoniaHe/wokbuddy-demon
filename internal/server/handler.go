@@ -601,8 +601,7 @@ func writeClientAuthError(w http.ResponseWriter, r *http.Request) {
 
 // writeAuthFailLimit 运维面鉴权失败超限响应。
 func writeAuthFailLimit(w http.ResponseWriter, retry time.Duration) {
-	seconds := max(int((retry+time.Second-1)/time.Second), 1)
-	w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	w.Header().Set("Retry-After", strconv.Itoa(httpauth.RetryAfterSeconds(retry)))
 	writeOpenAIError(w, http.StatusTooManyRequests, "too_many_auth_failures", "too many authentication failures")
 }
 
@@ -4555,9 +4554,7 @@ func (f *chatFlow) retryAfterSeconds(status int) int {
 		return 0
 	}
 
-	seconds := max(int(math.Ceil(time.Until(until).Seconds())), 1)
-
-	return seconds
+	return httpauth.RetryAfterSeconds(time.Until(until))
 }
 
 // earliestRecovery 汇总账号/模型级冷却与上游 Retry-After，返回最早的未来解封时刻。
@@ -5260,10 +5257,5 @@ func secondsUntilLocalMidnight(now time.Time) int {
 	y, m, d := now.Date()
 	next := time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
 
-	sec := int(math.Ceil(next.Sub(now).Seconds()))
-	if sec < 1 {
-		return 1
-	}
-
-	return sec
+	return httpauth.RetryAfterSeconds(next.Sub(now))
 }

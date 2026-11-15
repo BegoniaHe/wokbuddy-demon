@@ -44,11 +44,11 @@ func TestClassifyCheckin(t *testing.T) {
 	}
 }
 
-// TestIsCheckinInactiveNonError 非 *Error 永不判 inactive（避免把网络抖动当活动未开启）。
-func TestIsCheckinInactiveNonError(t *testing.T) {
+// TestClassifyCheckinNonError 非 *Error 永不判 inactive（避免把网络抖动当活动未开启）。
+func TestClassifyCheckinNonError(t *testing.T) {
 	t.Parallel()
 
-	if IsCheckinInactive(errStatic) {
-		t.Error("plain error 不应判 inactive（只认 *Error.Msg）")
+	if got := ClassifyCheckin(errStatic); got == CheckinInactive {
+		t.Errorf("plain error 不应判 inactive（只认 *Error.Msg），got=%v", got)
 	}
 }

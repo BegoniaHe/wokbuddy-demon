@@ -53,7 +53,7 @@ type autoAction struct {
 	Attempt  bool   // true = 尝试型（上游未证实可脚本化，跑了可能不点亮）
 	run      func(p *Panel, a *auth.Auth) (string, error)
 	// runWithTask 可选：动作需要任务进度时，由执行器在动作开始前按码读取最新详情，
-	// 不复用批量预检快照（快照可能已过期）。动作后回读仍由 autoRunAction 重新请求。
+	// 不复用批量预检快照（快照可能已过期）。动作后回读仍由 autoRunActionWithSnapshot 重新请求。
 	runWithTask func(p *Panel, a *auth.Auth, before *upstream.Task) (string, error)
 	// rereadBeforeCheck 与其他动作共享进度时置 true：执行前预检必须回读最新任务，
 	// 不能按本轮起始快照重复执行已经点亮的事件链。
@@ -1490,7 +1490,7 @@ func runExpertBatch(panel8 *Panel, account15 *auth.Auth, expertType string, coun
 		}
 	}
 
-	// 一次都没成功时不能返回 nil：调用方（autoRunAction）会把 nil 当 done，
+	// 一次都没成功时不能返回 nil：调用方（autoRunActionWithSnapshot）会把 nil 当 done，
 	// 任务中心就会把「0 位完成」展示成成功。
 	if ok == 0 {
 		return "", fmt.Errorf("%w（%d 次尝试）: %w", errExpertAllFailed, fail, lastErr)
@@ -1657,11 +1657,6 @@ func (p *Panel) autoAcceptBatchMP(account11 *auth.Auth, mpTasks []upstream.Task)
 		"task_code": "(批量接受-mp)", "status": "done",
 		"message": fmt.Sprintf("已接受 %d 个小程序任务", len(codes)),
 	}}
-}
-
-// autoRunAction 执行单个任务动作并组装结果条目（单项失败不影响后续项）。
-func (p *Panel) autoRunAction(account5 *auth.Auth, act autoAction) map[string]any {
-	return p.autoRunActionWithSnapshot(account5, act, nil)
 }
 
 // autoRunActionWithSnapshot 优先使用一轮共享快照做执行前检查；快照未覆盖时
