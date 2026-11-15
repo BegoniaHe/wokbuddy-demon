@@ -4678,6 +4678,9 @@ type resourceSummaryResp struct {
 		CycleRemainCapacity flexInt64 `json:"CycleRemainCapacity"`
 		CycleUsedCapacity   flexInt64 `json:"CycleUsedCapacity"`
 	} `json:"Packages"`
+	// IsPaidUser 官方桌面端消费的付费状态（`isPaidUser:!!e?.IsPaidUser`）。
+	// 用 *bool 区分「字段缺失」与 false：缺失是「不知道」，不得回落成免费号（issue #529）。
+	IsPaidUser *bool `json:"IsPaidUser"`
 }
 
 // fetchResourceSummary 查询额度汇总（官方桌面端主路径）。
@@ -4993,37 +4996,45 @@ func (c *Client) UserResourceSnapshot(
 		return snap, nil
 	}
 
-	remain, total, expiring, totals, err := c.personalResource(ctx, account, soon)
+	probe, err := c.personalResource(ctx, account, soon)
 	if err != nil {
 		return ResourceSnapshot{}, err
 	}
 
-	return ResourceSnapshot{Remain: remain, Total: total, Expiring: expiring, Buckets: totals.bucketList()}, nil
+	return ResourceSnapshot{
+		Remain:   probe.remain,
+		Total:    probe.total,
+		Expiring: probe.expiring,
+		Buckets:  probe.totals.bucketList(),
+		PaidUser: probe.paid,
+	}, nil
 }
 
-// personalResource 个人号余额查询主体：返回汇总与含日桶的累加器。
+// resourceProbe 个人号余额查询的聚合结果（issue #529 起带付费状态观测）。
+type resourceProbe struct {
+	remain, total, expiring int64
+	totals                  *resourceTotals
+	// paid 上游 summary 的 IsPaidUser：nil = 字段缺失 / 旧端点回退，按未知处理。
+	paid *bool
+}
+
+// personalResource 个人号余额查询主体：返回汇总、含日桶的累加器与付费状态观测。
 func (c *Client) personalResource(
 	ctx context.Context, account *auth.Auth, soon time.Duration,
-) (int64, int64, int64, *resourceTotals, error) {
+) (resourceProbe, error) {
 	now := time.Now()
 	// 官方桌面端主路径：summary 汇总 remain/total；失败时回落旧 get-user-resource。
 	if summary, serr := c.fetchResourceSummary(ctx, account); serr == nil && len(summary.Packages) > 0 {
 		remain, total := summary.summaryTotals()
 		expiring, totals := c.resourcePackages(account, now, soon)
 
-		return remain, total, expiring, totals, nil
+		return resourceProbe{
+			remain: remain, total: total, expiring: expiring, totals: totals, paid: summary.IsPaidUser,
+		}, nil
 	} else if serr != nil {
 		log.Printf("WARN: [upstream] resource summary failed: %v (fallback get-user-resource)", serr)
 	}
 
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
-	}
 	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500 会让
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
 	var data json.RawMessage
@@ -5031,17 +5042,17 @@ func (c *Client) personalResource(
 	err := c.retryBillingTransient(ctx, func() error {
 		var e error
 
-		data, e = c.billingMeterJSON(account, billingMeterPaths(), body)
+		data, e = c.billingMeterJSON(account, billingMeterPaths(), resourceQueryBody(now))
 
 		return e
 	})
 	if err != nil {
-		return 0, 0, 0, nil, err
+		return resourceProbe{}, err
 	}
 
 	var resp resourceDetailedResp
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, nil, fmt.Errorf("resource parse: %w", err)
+		return resourceProbe{}, fmt.Errorf("resource parse: %w", err)
 	}
 
 	var totals resourceTotals
@@ -5054,7 +5065,21 @@ func (c *Client) personalResource(
 	// 这里补旧端点回退路径。成功才回调，失败不写脏数据。
 	c.notifyBalance(account, totals.remain, totals.total)
 
-	return totals.remain, totals.total, totals.expiring, &totals, nil
+	return resourceProbe{
+		remain: totals.remain, total: totals.total, expiring: totals.expiring, totals: &totals,
+	}, nil
+}
+
+// resourceQueryBody get-user-resource 回退路径的分页查询体（近一年内到期的有效包）。
+func resourceQueryBody(now time.Time) map[string]any {
+	return map[string]any{
+		"PageNumber":               1,
+		"PageSize":                 100,
+		"ProductCode":              "p_tcaca",
+		"Status":                   []int{0, 3},
+		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
+		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
+	}
 }
 
 // resourceDetailedResp get-user-resource 响应信封。
@@ -5107,6 +5132,9 @@ type ResourceSnapshot struct {
 	Total    int64          `json:"total"`
 	Expiring int64          `json:"expiring"`
 	Buckets  []ExpiryBucket `json:"buckets,omitempty"`
+	// PaidUser 上游 summary 的 IsPaidUser 观测（issue #529）：true 付费、false 免费、
+	// nil 未知（字段缺失 / 企业口径 / 旧端点回退）。只做观测与透出，不参与选号。
+	PaidUser *bool `json:"paid_user,omitempty"`
 }
 
 // resourceTotals 个人资源聚合累加器。

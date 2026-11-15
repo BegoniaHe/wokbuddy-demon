@@ -1004,6 +1004,7 @@ func (s *Scheduler) runCheckinAccount(
 	s.cfg.Pool.SetCreditsSnapshot(
 		status.UID, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets),
 	)
+	s.cfg.Pool.SetPaidStatus(status.UID, snap.PaidUser)
 	s.notifyCreditLow(account, snap.Remain)
 
 	return ok, state, checkinErr
@@ -1365,6 +1366,7 @@ func (s *Scheduler) refreshBalanceAccount(
 
 	s.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
 	s.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, mapExpiryBuckets(snap.Buckets))
+	s.cfg.Pool.SetPaidStatus(uid, snap.PaidUser)
 	s.notifyCreditLow(account, snap.Remain)
 }
 

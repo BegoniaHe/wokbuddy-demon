@@ -137,6 +137,10 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitzero"`
+	// PaidUser 付费状态三态（issue #529）：true 付费、false 免费、null 未知
+	// （上游 summary 未下发 IsPaidUser / 企业口径 / 尚未刷新）。
+	PaidUser     *bool     `json:"paid_user"`
+	PaidObserved time.Time `json:"paid_observed,omitzero"`
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
@@ -285,6 +289,11 @@ type entry struct {
 	// 出池）。与冷却/熔断**取更长者不叠加**（healthy 判定是并列或门，任一截止
 	// 未到期即不可选，生效的一定是最远者），到期自动回池，无需显式复位。
 	degradeUntil time.Time
+	// paidUser 上游 summary 的 IsPaidUser 观测（issue #529）：true 付费、false 免费、
+	// nil 未知（字段缺失 / 企业口径 / 从未刷新）。只做观测与面板透出，不参与选号。
+	paidUser *bool
+	// paidObserved paidUser 的观测时刻（零值 = 从未观测）。
+	paidObserved time.Time
 	// modelCost 实测扣费账本：model → 观测。由每次成功请求的 usage.credit
 	// 折算而来（上游没有"按模型的用量"接口，只能实测）。选号时据此把「该模型上
 	// 免费/便宜的号」排在前面（pick 的 costTier 硬分层）。
@@ -546,6 +555,10 @@ type stateAccount struct {
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
 	// ProxySlot 出站代理槽 ID（issue #96）；空 = 不绑定。
 	ProxySlot string `json:"proxy_slot,omitempty"`
+	// PaidUser / PaidObserved 付费状态观测（issue #529）：nil = 未知，不落键；
+	// 观测时刻与之一并持久化，重启后面板仍能显示三态而不是退回未知。
+	PaidUser     *bool     `json:"paid_user,omitempty"`
+	PaidObserved time.Time `json:"paid_observed,omitzero"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态

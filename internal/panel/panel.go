@@ -1154,6 +1154,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 
 	p.cfg.Pool.ReenableIfCredits(uid, snap.Remain, snap.Total)
 	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	p.cfg.Pool.SetPaidStatus(uid, snap.PaidUser)
 	resp["credits"] = snap.Remain
 	resp["credits_total"] = snap.Total
 	log.Printf("panel: checkin uid=%s state=%s msg=%q credit=%d/%v credits=%d/%d",
@@ -1179,6 +1180,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.cfg.Pool.SetCreditsSnapshot(uid, snap.Remain, snap.Total, snap.Expiring, poolExpiryBuckets(snap.Buckets))
+	p.cfg.Pool.SetPaidStatus(uid, snap.PaidUser)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": snap.Remain, "credits_total": snap.Total})
 }
 

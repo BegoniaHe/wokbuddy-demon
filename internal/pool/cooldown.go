@@ -108,6 +108,29 @@ func (p *Pool) SetCreditsDetailed(
 	p.dirty.Store(true)
 }
 
+// SetPaidStatus 记录一次上游 summary 的付费状态观测（issue #529）：true 付费、
+// false 免费、nil 未知（字段缺失 / 企业口径）。观测时刻随写，nil 不回落成免费。
+func (p *Pool) SetPaidStatus(uid string, paid *bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	entry2, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+
+	if paid == nil {
+		entry2.paidUser = nil
+	} else {
+		v := *paid
+		entry2.paidUser = &v
+	}
+
+	entry2.paidObserved = p.now()
+
+	p.dirty.Store(true)
+}
+
 // SetCreditsSnapshot 写入一次余额快照（含逐日到期批次）：先按 SetCreditsDetailed
 // 同口径钳制汇总值，再落批次并按批次重算「最早到期批次 / 剩余量」——
 // 这样快照与面板「检查」对同一账号给出完全一致的批次（issue #200）。
