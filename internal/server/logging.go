@@ -261,7 +261,7 @@ func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.ha
 
 // paceEmittedTokens 返回已见 completion 输出的 token 估算（响应整形用，issue #448）。
 func (s *chatStatsReader) paceEmittedTokens() int64 {
-	return pacedTextTokens(s.paceASCII.Load(), s.paceCJK.Load())
+	return pool.ApproxTokens(s.paceASCII.Load(), s.paceCJK.Load())
 }
 
 // paceExactTokens 返回流中已观测到的精确 completion_tokens。
@@ -269,29 +269,21 @@ func (s *chatStatsReader) paceExactTokens() (int64, bool) {
 	return s.paceExact.Load(), s.paceExactSeen.Load()
 }
 
-// paceCJKStart CJK 统一表意文字的起始 rune（与 pool.EstimatePromptTokens 同口径）。
-const paceCJKStart = 0x2E80
-
 // paceTextTokens 估算一段正文的 token 数：ASCII ≈ 4 字符/token，CJK ≈ 1.5 字符/token。
 // 只用于响应整形的 TPM 节奏（issue #448），不参与计费或用量统计；直接在 string 上
-// 逐 rune 解码，不复制。
+// 逐 rune 解码，不复制。口径来自 pool：请求预扣与响应节奏必须同一判据。
 func paceTextTokens(text string) int64 {
 	ascii, cjk := 0, 0
 
 	for _, r := range text {
-		if r >= paceCJKStart {
+		if pool.IsCJKChar(r) {
 			cjk++
 		} else {
 			ascii++
 		}
 	}
 
-	return pacedTextTokens(int64(ascii), int64(cjk))
-}
-
-// pacedTextTokens 把整条流累计的 ASCII/CJK 字符数换算为 token 估算。
-func pacedTextTokens(ascii, cjk int64) int64 {
-	return ascii/4 + int64(float64(cjk)/1.5)
+	return pool.ApproxTokens(int64(ascii), int64(cjk))
 }
 
 // Usage 返回流式响应中已收到的 token usage 字段。
@@ -458,7 +450,7 @@ func (s *chatStatsReader) notePaceChars(text string) {
 	var ascii, cjk int64
 
 	for _, r := range text {
-		if r >= paceCJKStart {
+		if pool.IsCJKChar(r) {
 			cjk++
 		} else {
 			ascii++
