@@ -271,6 +271,14 @@ type entry struct {
 	// 单 until 字段做不到的）。空 map = 无模型级避让（不豁免）。
 	// 持久化（stateAccount.ModelCooldowns）：重启后仍避开已知不可用的模型。
 	modelCooldowns map[string]modelCooldown
+	// ruleIDs 账号挂载的模型规则引用（只存规则 id，持久化）。展开结果不落盘：
+	// 规则本体与引用同存 state.json，加载时先账号后规则本体再统一展开（issue #569）。
+	ruleIDs []string
+	// ruleDenied / ruleAllowed 规则展开后的运行态模型集合（按账号所属域展开成裸名）。
+	// ruleAllowed 为 nil 表示没有生效的 allow 规则（不约束）；deny 优先于 allow。
+	// 只在规则/引用/凭证域变化时重算（见 modelrules.go），选号热路径只读。
+	ruleDenied  map[string]struct{}
+	ruleAllowed map[string]struct{}
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
 	// 持久化（stateAccount.SessionDeadFails）：上游持续 session dead 时重启归零会导致
@@ -432,6 +440,12 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if e.disabled || e.paused {
+		return false
+	}
+
+	// 人工模型规则优先于自动冷却：运维显式声明的模型范围就是本账号该跑什么，
+	// 被规则挡住的模型直接不可选（见 modelrules.go）。
+	if e.ruleBlockedModel(reqModel) {
 		return false
 	}
 
@@ -628,6 +642,9 @@ type stateAccount struct {
 	// 观测时刻与之一并持久化，重启后面板仍能显示三态而不是退回未知。
 	PaidUser     *bool     `json:"paid_user,omitempty,omitzero"`
 	PaidObserved time.Time `json:"paid_observed,omitzero"`
+	// ModelRules 账号挂载的模型规则 id（issue #569）。只存引用：规则本体在
+	// stateFile.ModelRules，加载时先账号后规则本体再统一展开。
+	ModelRules []string `json:"model_rules,omitempty,omitzero"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态
@@ -655,6 +672,9 @@ type stateFile struct {
 	// 池级而非逐号：游标描述「这个域的模型当前轮询到第几个账号」。
 	// 持久化以保留顺序耗尽进度（跨重启不该从第一个号重新打）。
 	SchedulingCursors map[string]int `json:"scheduling_cursors,omitempty,omitzero"`
+	// ModelRules 模型规则本体（issue #569）。与账号上的 ruleIDs 引用同存：加载时
+	// 先恢复账号引用、再恢复规则本体，最后统一展开；展开结果改写运行态、不写引用。
+	ModelRules []ModelRule `json:"model_rules,omitempty,omitzero"`
 }
 
 // flushInterval 后台落盘周期。

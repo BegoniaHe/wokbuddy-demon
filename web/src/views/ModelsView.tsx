@@ -42,6 +42,8 @@ import { Tag } from '@/components/ui-kit';
 import { toast } from '@/components/Toaster';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
+import { ModelRulesCard } from '@/components/ModelRulesCard';
+import type { Account } from '@/lib/types';
 
 interface Probe {
   claimed?: number;
@@ -136,7 +138,10 @@ export function ModelsView() {
   //   - 最近真实请求来自 request_metrics.recent（失败静默，不加标签）。
   const overviewQ = useQuery({
     queryKey: ['overview'],
-    queryFn: () => api<{ model_locks?: ModelLockLike[] }>('overview').catch((): { model_locks?: ModelLockLike[] } => ({})),
+    queryFn: () =>
+      api<{ model_locks?: ModelLockLike[]; accounts?: Account[] }>('overview').catch(
+        (): { model_locks?: ModelLockLike[]; accounts?: Account[] } => ({}),
+      ),
     refetchInterval: 30000,
   });
   const recentQ = useQuery({
@@ -195,7 +200,9 @@ export function ModelsView() {
     : all.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
 
   return (
-    <Card>
+    <>
+      <ModelRulesCard accounts={overviewQ.data?.accounts ?? []} />
+      <Card>
       <CardHeader className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0">
           <CardTitle>模型能力</CardTitle>
@@ -325,7 +332,8 @@ export function ModelsView() {
           </TableBody>
         </Table>
       </div>
-    </Card>
+      </Card>
+    </>
   );
 }
 

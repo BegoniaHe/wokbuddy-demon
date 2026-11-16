@@ -128,3 +128,19 @@ export interface Overview {
   accounts?: Account[];
   model_locks?: ModelLock[];
 }
+
+// 模型规则（issue #569）：按账号批量挂模型黑白名单。
+export type ModelRuleMode = 'allow' | 'deny';
+
+export interface ModelRule {
+  id: string;
+  name?: string;
+  mode: ModelRuleMode;
+  models: string[];
+}
+
+export interface ModelRulesView {
+  rules?: ModelRule[];
+  assignments?: Record<string, string[]>;
+  counts?: Record<string, number>;
+}

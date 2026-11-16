@@ -1574,6 +1574,7 @@ type chatFlow struct {
 	authReplay      map[string]bool
 	lastErr         error
 	modelBlock      pool.ModelBlockStatus
+	ruleBlock       pool.RuleBlockStatus
 	degradedApplied bool
 	// splitRetried 是否已因 11128「渠道未授权」把 system 按句界拆开重试过（只重试一次）。
 	splitRetried bool
@@ -2201,6 +2202,9 @@ func (f *chatFlow) reportNoAccount() {
 	//   (b) 本 realm 的号都在，但每个号都对这个模型处于模型级冷却（11136/11141/6004）。
 	// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 	f.modelBlock = f.h.cfg.Pool.ModelBlockedForRealm(f.bareModel, f.realm)
+	// 规则挡住全池：运维显式配置、不会自愈，与上游抖动/账号冷却区分开（末端落
+	// 400 model_not_allowed，见 applyRuleBlockOverride）。
+	f.ruleBlock = f.h.cfg.Pool.RuleBlockedForRealm(f.bareModel, f.realm)
 
 	detail := map[string]any{"model": f.bareModel}
 	if f.modelBlock.Blocked {
@@ -4533,6 +4537,8 @@ func (f *chatFlow) writeFinalError() {
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
 
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
+
+	status, code, msg, hint = f.applyRuleBlockOverride(status, code, msg, hint)
 	if seconds := f.retryAfterSeconds(status); seconds > 0 {
 		f.out.Header("Retry-After", strconv.Itoa(seconds))
 	}
@@ -4808,6 +4814,23 @@ func (f *chatFlow) applyModelBlockOverride(
 	}
 
 	return status, code, msg, hint
+}
+
+// applyRuleBlockOverride 本域所有可选账号都被模型规则挡住时改回 400 model_not_allowed。
+// 规则是运维显式配置、不会自愈：落 503 会被客户端当成上游抖动反复重试（issue #569）。
+// 只要还有账号可选就不覆盖——那才是真实的上游/冷却问题。
+func (f *chatFlow) applyRuleBlockOverride(status int, code, msg, hint string) (int, string, string, string) {
+	if !f.ruleBlock.AllBlocked() {
+		return status, code, msg, hint
+	}
+
+	hint = fmt.Sprintf(
+		"model_not_allowed: blocked by pool model rules (blocked=%d eligible=%d in realm %s)",
+		f.ruleBlock.Blocked, f.ruleBlock.Eligible, f.realm,
+	)
+
+	return http.StatusBadRequest, "model_not_allowed",
+		"model is not allowed for this realm by pool model rules", hint
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
