@@ -1045,8 +1045,9 @@ func TestRunBalanceRefreshIncludesDisabledUpdatesCredits(t *testing.T) {
 	s.RunBalanceRefreshNow()
 
 	status, _ := state.Status("u2")
-	if status.Credits != 700 {
-		t.Errorf("禁用号 credits=%d want 700（余额刷新应覆盖禁用号）", status.Credits)
+	// 余额刷新覆盖禁用号：真实快照写进 credits_raw，可用量按 issue #571 语义归零。
+	if status.CreditsRaw != 700 || status.Credits != 0 {
+		t.Errorf("禁用号 credits=%d raw=%d want 0/700（刷新写快照，可用量归零）", status.Credits, status.CreditsRaw)
 	}
 
 	if !status.Disabled {

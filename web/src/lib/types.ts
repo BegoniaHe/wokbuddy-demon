@@ -34,6 +34,8 @@ export interface Account {
   cool_kind?: string;
   reason?: string;
   credits?: number;
+  // credits_raw 真实余额快照：disabled 账号的 credits 归零，冻结值只在这里。
+  credits_raw?: number;
   credits_total?: number;
   // paid_user 上游 summary 的 IsPaidUser 观测（issue #529）：true 付费、false 免费、
   // null / 缺省 = 未知（字段缺失 / 企业口径 / 尚未刷新）。
@@ -127,4 +129,32 @@ export interface Overview {
   uptime_sec: number;
   accounts?: Account[];
   model_locks?: ModelLock[];
+  // credits 服务端积分汇总：available 不含禁用号冻结快照，snapshot 含，quota 为总额度。
+  credits?: CreditsSummary;
+}
+
+export interface CreditsTotals {
+  available: number;
+  snapshot: number;
+  quota: number;
+}
+
+export interface CreditsSummary extends CreditsTotals {
+  by_realm?: Record<string, CreditsTotals>;
+}
+
+// 模型规则（issue #569）：按账号批量挂模型黑白名单。
+export type ModelRuleMode = 'allow' | 'deny';
+
+export interface ModelRule {
+  id: string;
+  name?: string;
+  mode: ModelRuleMode;
+  models: string[];
+}
+
+export interface ModelRulesView {
+  rules?: ModelRule[];
+  assignments?: Record<string, string[]>;
+  counts?: Record<string, number>;
 }

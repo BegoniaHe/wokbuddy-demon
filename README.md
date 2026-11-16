@@ -138,7 +138,7 @@ docker compose up -d --build
 
 然后打开 **<http://127.0.0.1:7863/panel/>**，在面板里点「添加账号」完成登录。
 
-默认只监听本机。第一次启动会自动处理好配置文件；面板与账号状态分别落在 `data/` 和 `auths/`，升级或重启都不会弄丢。
+默认只监听 `127.0.0.1:7863`。第一次启动会自动处理好配置文件；面板与账号状态分别落在 `data/` 和 `auths/`，升级或重启都不会弄丢。
 
 不想用 Docker？下载 nightly 单文件（或自行构建）直接运行即可。前端已经打包进二进制，不需要额外安装运行时。
 
@@ -289,12 +289,32 @@ WB2API_CAPTURE_DIR=./data/capture ./wokbuddy-demon
 
 | 环境变量 | 覆盖配置项 | 默认 / 说明 |
 |---|---|---|
-| `WB2A_LISTEN` | `listen` | `:7863`；默认只监听本机，公网部署请置于 HTTPS 反代之后 |
+| `WB2A_LISTEN` | `listen` | `127.0.0.1:7863`；只监听本机，公网部署请置于 HTTPS 反代之后 |
 | `WB2A_API_KEY` | `api_key` | **空 = 不鉴权直接放行**，公网部署必设 |
 | `WB2A_AUTH_DIR` | `auth_dir` | `./auths`；凭证目录，含明文 refreshToken |
 | `WB2A_STATE_FILE` | `state_file` | `./data/state.json` |
 | `WB2A_SOFT_RATE` | `cooldown.soft_rate` | `600s`；软冷却退避基数 |
 | `WB2A_SOFT_RATE_MAX` | `cooldown.soft_rate_max` | `2h`；软冷却退避上限 |
+
+`listen` 默认 `127.0.0.1:7863`：二进制与 Docker 都只监听本机。需要从局域网访问（或让反代在另一台机器上）必须显式放开：
+
+```bash
+# 二进制 / make run
+WB2A_LISTEN=0.0.0.0:7863 ./wokbuddy-demon -config config.json
+# 或写进 config.json 的 "listen": "0.0.0.0:7863"
+```
+
+```yaml
+# docker compose：宿主机侧端口映射与容器内监听都要放开
+ports:
+  - "0.0.0.0:7863:7863"
+environment:
+  - WB2A_LISTEN=0.0.0.0:7863
+```
+
+放开即把网关与面板暴露给该网段，而程序**无内置 TLS**：只在可信内网这么做，跨网段一律走 HTTPS 反代，并确保 `api_key` 非空。
+
+> 升级提示：此默认值自「默认监听全网卡」改为回环。已有 `config.json` 不会被自动改写——从旧版本升级、又是靠默认值直接局域网访问的部署，需要显式加 `listen` 或 `WB2A_LISTEN`，否则升级后会连不上。
 
 **出站超时与身份**
 

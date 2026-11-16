@@ -2033,6 +2033,44 @@ func TestStatusEndpoint(t *testing.T) {
 	assertStatusSummary(t, rec)
 }
 
+// TestStatusCreditsSummary /status 顶层积分汇总（issue #571）：available 不含
+// 禁用号冻结快照，snapshot 含，by_realm 分域且空 realm 归 cn。
+func TestStatusCreditsSummary(t *testing.T) {
+	t.Parallel()
+
+	state := testPoolWith(
+		&auth.Auth{UID: "live", AccessToken: "at", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "dead", AccessToken: "at", ExpiresAt: 9999999999},
+	)
+	state.SetCredits("live", 10, 20)
+	state.SetCredits("dead", 30, 40)
+	state.Disable("dead", "12153 session dead")
+
+	h := NewHandler(&Config{Pool: state, Upstream: upstream.New()})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status", nil))
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var body struct {
+		Credits pool.CreditsSummary `json:"credits"`
+	}
+	if err := jsonx.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+
+	if body.Credits.Available != 10 || body.Credits.Snapshot != 40 || body.Credits.Quota != 20 {
+		t.Errorf("credits=%+v want available=10 snapshot=40 quota=20", body.Credits)
+	}
+
+	cn := body.Credits.ByRealm["cn"]
+	if cn.Available != 10 || cn.Snapshot != 40 || cn.Quota != 20 {
+		t.Errorf("by_realm.cn=%+v want 10/40/20", cn)
+	}
+}
+
 // TestStatusInFlightFull /status 透出满载计数：healthy 且占满在途的账号数。
 func TestStatusInFlightFull(t *testing.T) {
 	t.Parallel()

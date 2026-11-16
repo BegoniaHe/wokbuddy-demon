@@ -747,6 +747,9 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 「某号为何对某模型不出票」。零值也显式写出（缺失会让人误以为没记录）。
 		"credit_floor":          h.cfg.Pool.CreditFloor(),
 		"credit_floor_by_realm": h.cfg.Pool.CreditFloorByRealm(),
+		// credits 顶层汇总：available 不含禁用号的冻结快照，snapshot 含（真实余额），
+		// quota 为可用账号总额度。外部集成不必自行遍历 accounts 求和。
+		"credits": h.cfg.Pool.CreditsSummary(),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,
@@ -1574,6 +1577,7 @@ type chatFlow struct {
 	authReplay      map[string]bool
 	lastErr         error
 	modelBlock      pool.ModelBlockStatus
+	ruleBlock       pool.RuleBlockStatus
 	degradedApplied bool
 	// splitRetried 是否已因 11128「渠道未授权」把 system 按句界拆开重试过（只重试一次）。
 	splitRetried bool
@@ -2201,6 +2205,9 @@ func (f *chatFlow) reportNoAccount() {
 	//   (b) 本 realm 的号都在，但每个号都对这个模型处于模型级冷却（11136/11141/6004）。
 	// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 	f.modelBlock = f.h.cfg.Pool.ModelBlockedForRealm(f.bareModel, f.realm)
+	// 规则挡住全池：运维显式配置、不会自愈，与上游抖动/账号冷却区分开（末端落
+	// 400 model_not_allowed，见 applyRuleBlockOverride）。
+	f.ruleBlock = f.h.cfg.Pool.RuleBlockedForRealm(f.bareModel, f.realm)
 
 	detail := map[string]any{"model": f.bareModel}
 	if f.modelBlock.Blocked {
@@ -3293,25 +3300,29 @@ func (f *chatFlow) handleStreamSuccess(
 	var cont *upstream.TextContinueReader
 
 	if !probe.HasTool && probe.Text != "" {
-		cont = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
-			return f.continueUpstream(ctx, acct, partial)
-		})
+		cont = upstream.NewTextContinueReader(stream, "", false,
+			func(partial string, kind upstream.TailKind) (io.ReadCloser, error) {
+				return f.continueUpstream(ctx, acct, partial, kind)
+			})
 		// 长文续接（issue #494）：客户端把输出上限要到 32k+ 时，stopped 的长文也按
 		// 可续写处理；短答 stop 由响应侧门槛挡掉（见 longFormContinuationMinChars）。
 		if f.longFormRequested() {
 			cont.ContinueOnStop(longFormContinuationMinChars)
 		}
-		// 预告句与工具轮（issue #495）：尾部是冒号/省略号/未闭合代码块时续写一次；
+		// 预告句 / 承诺句与工具轮（issue #495 / #570）：尾部形态由 classifyTail 判定，
 		// 本轮声明了工具就只采纳续写里的 tool_calls，丢弃续写正文。
-		cont.ContinueOnStopTail(narrationTail, f.declaredToolCount > 0,
-			func(tail string) {
-				log.Printf("INFO: [server] stream acct=%s model=%s: narration tail %q, "+
-					"continuing once (declared_tools=%d)",
-					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel,
+		cont.ContinueOnStopTail(func(text string) upstream.TailKind {
+			return classifyTail(text, f.declaredToolCount > 0)
+		}, f.declaredToolCount > 0,
+			func(tail string, kind upstream.TailKind) {
+				log.Printf("INFO: [server] stream acct=%s model=%s: %s tail %q, "+
+					"continuing (declared_tools=%d)",
+					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind,
 					upstream.RedactForLog(tail, 160), f.declaredToolCount)
 				captureSample("narration_tail", f.bareModel, true, tail, map[string]any{
 					captureKeyDeclaredTools: f.declaredToolCount,
 					"tools_only":            f.declaredToolCount > 0,
+					"tail_shape":            kind.String(),
 				})
 			})
 
@@ -3683,9 +3694,9 @@ func (f *chatFlow) handlePreStreamEmpty(
 // continueUpstream 发起截断续写请求：复用 ChatStreamContext → prepareBody 管线，
 // 同账号同模型，不手拼 raw body（脱敏/thinking/缓存键仍生效）。
 func (f *chatFlow) continueUpstream(
-	ctx context.Context, acct *auth.Auth, partial string,
+	ctx context.Context, acct *auth.Auth, partial string, kind upstream.TailKind,
 ) (io.ReadCloser, error) {
-	body := upstream.BuildContinuationBody(f.body, partial)
+	body := upstream.BuildContinuationBody(f.body, partial, kind)
 
 	next, status, respBody, err := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, body, f.clientIP, f.chatMeta)
 	if err != nil || status >= http.StatusBadRequest {
@@ -3931,7 +3942,7 @@ func (f *chatFlow) handleNonStreamSuccess(
 // continueNonStream 非流式 finish_reason=length（或长文请求的 stop）且有正文时续写
 // 一次，把第二段正文拼进同一响应（issue #247 / #494）。工具调用不续写；失败保留首段终态。
 //
-//nolint:cyclop,funlen,gocyclo // 续写前置条件线性校验（形态、已有调用、正文、只做一次），拆散更难读。
+//nolint:cyclop,funlen,gocyclo,maintidx // 续写前置条件线性校验（形态、已有调用、正文、次数上限），拆散更难读。
 func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp map[string]any) map[string]any {
 	if f.nonstreamContinued || len(resp) == 0 {
 		return resp
@@ -3947,7 +3958,7 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		return resp
 	}
 
-	wanted, toolsOnly := f.nonStreamContinuePlan(resp, choice)
+	wanted, toolsOnly, kind := f.nonStreamContinuePlan(resp, choice)
 	if !wanted {
 		return resp
 	}
@@ -3965,11 +3976,12 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		captureKeyDeclaredTools: f.declaredToolCount,
 		"tools_only":            toolsOnly,
 		"shape":                 f.aggregateShape(resp),
+		"tail_shape":            kind.String(),
 	})
 
 	f.nonstreamContinued = true
 
-	next, err := f.continueUpstream(ctx, acct, partial)
+	next, err := f.continueUpstream(ctx, acct, partial, kind)
 	if err != nil {
 		return resp
 	}
@@ -4533,6 +4545,8 @@ func (f *chatFlow) writeFinalError() {
 	status, code, msg, hint, upstreamMsgPassed := f.finalErrorEnvelope()
 
 	status, code, msg, hint = f.applyModelBlockOverride(status, code, msg, hint, upstreamMsgPassed)
+
+	status, code, msg, hint = f.applyRuleBlockOverride(status, code, msg, hint)
 	if seconds := f.retryAfterSeconds(status); seconds > 0 {
 		f.out.Header("Retry-After", strconv.Itoa(seconds))
 	}
@@ -4808,6 +4822,23 @@ func (f *chatFlow) applyModelBlockOverride(
 	}
 
 	return status, code, msg, hint
+}
+
+// applyRuleBlockOverride 本域所有可选账号都被模型规则挡住时改回 400 model_not_allowed。
+// 规则是运维显式配置、不会自愈：落 503 会被客户端当成上游抖动反复重试（issue #569）。
+// 只要还有账号可选就不覆盖——那才是真实的上游/冷却问题。
+func (f *chatFlow) applyRuleBlockOverride(status int, code, msg, hint string) (int, string, string, string) {
+	if !f.ruleBlock.AllBlocked() {
+		return status, code, msg, hint
+	}
+
+	hint = fmt.Sprintf(
+		"model_not_allowed: blocked by pool model rules (blocked=%d eligible=%d in realm %s)",
+		f.ruleBlock.Blocked, f.ruleBlock.Eligible, f.realm,
+	)
+
+	return http.StatusBadRequest, "model_not_allowed",
+		"model is not allowed for this realm by pool model rules", hint
 }
 
 // tokensPerSecond 计算吐字速率（token/s），返回 (速率, 是否有意义)。
