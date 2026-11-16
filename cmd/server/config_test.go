@@ -22,7 +22,7 @@ func TestDefault(t *testing.T) {
 	t.Parallel()
 
 	config := Default()
-	if config.Listen != ":7863" {
+	if config.Listen != "127.0.0.1:7863" {
 		t.Errorf("listen=%s", config.Listen)
 	}
 
@@ -785,7 +785,7 @@ func assertWrittenDefaults(t *testing.T, fp, key string) {
 
 	checkStr(t, "api_key", config.APIKey, key)
 
-	if config.Listen != ":7863" || config.AuthDir != "./auths" || config.StateFile != "./data/state.json" {
+	if config.Listen != "127.0.0.1:7863" || config.AuthDir != "./auths" || config.StateFile != "./data/state.json" {
 		t.Errorf("generated defaults off: %+v", config)
 	}
 

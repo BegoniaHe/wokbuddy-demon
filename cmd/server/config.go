@@ -76,7 +76,7 @@ var (
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
+	Listen    string `json:"listen"`     // "127.0.0.1:7863"
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
@@ -620,7 +620,7 @@ func Default() *Config {
 
 func baseDefaults() *Config {
 	config := &Config{
-		Listen:    ":7863",
+		Listen:    "127.0.0.1:7863",
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
@@ -827,7 +827,7 @@ func parseConfigWithEnv(raw []byte) (*Config, error) {
 
 // WriteDefault 在 path 落一份推荐配置（首次运行自动生成，双击即开免手工复制样例）。
 // 值取自 Default()（含超时/熔断/签到排程等推荐值），api_key 用 crypto/rand 随机生成：
-// 安全默认优于示例占位符（listen 绑定 0.0.0.0，空 key 会把网关裸暴露给局域网）。
+// 安全默认优于示例占位符（listen 只绑回环，空 key 也不会把网关暴露给局域网）。
 // 返回生成的 key 供启动日志透出。已存在时经 O_EXCL 原子拒绝，绝不改写用户配置。
 func WriteDefault(path string) (string, error) {
 	key, err := randomAPIKey()
