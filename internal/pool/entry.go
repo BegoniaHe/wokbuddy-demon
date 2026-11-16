@@ -71,10 +71,14 @@ type ExpiryBucket struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID          string `json:"uid"`
-	Nickname     string `json:"nickname,omitempty,omitzero"`
-	Credits      int64  `json:"credits"`
-	CreditsTotal int64  `json:"credits_total,omitempty,omitzero"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty,omitzero"`
+	// Credits 当前可用量：disabled 账号归零（授权终态，余额不再可消费）。
+	Credits int64 `json:"credits"`
+	// CreditsRaw 最后一次成功刷新得到的真实快照，disabled 账号也保留——调度轮换
+	// 与诊断要看真实余额，不能让「可用量」的语义改写掉它。
+	CreditsRaw   int64 `json:"credits_raw"`
+	CreditsTotal int64 `json:"credits_total,omitempty,omitzero"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
