@@ -14,50 +14,38 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 7dcae8ed9e66aabc1ac11015fa7028b40e394cb4
-  audited_at_utc: 2026-11-15T10:12:15Z
+  commit: c4b53cd8024e38aa59fe1914691269776c757d2c
+  audited_at_utc: 2026-11-16T11:31:16Z
   sync_method: audit
   official_baseline:
     cn: 5.11.3.43806934-ecace0f7 (commit ecace0f7028166695994300182295329b8b95449)
     global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
   reviewed_window:
-    from: 2026-11-11
-    to: 2026-11-14
-    non_merge_commits: 53
-    merge_commits: 15
+    from: 2026-11-14
+    to: 2026-11-16
+    non_merge_commits: 14
+    merge_commits: 4
   dispositions:
-    issue: 8
-    revisit: 14
-    skip: 46
+    issue: 6
+    revisit: 1
+    skip: 11
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/528
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/529
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/530
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/531
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/532
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/533
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/534
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/569
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/570
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/571
   note: >-
-    2026-11-15 续审 1c007bb0..7dcae8ed（53 条非 merge、15 条纯 merge，共 68 项；窗口
-    2026-11-11..14）。**官方 CN 基线跳版**：5.9.3.42398134-d4692421 →
-    5.11.3.43806934-ecace0f7（commit ecace0f7），global 未变 5.9.4.42593613-fa0a0901；
-    已重跑 download_latest --dry-run / download_latest / 解包新 CN 包（7z → app-64.7z →
-    extract_asar）/ protocol_sweep。CN 5.9.3→5.11.3 端点集变化：新增 /v2/chat/decisions、
-    /v2/geoblock、/v2/security-log-report/v1/logs、/v2/service-proxy、/v2/as/conversations、
-    /v2/user-asset/skill/get-list 与 v1/customer/buddyone* 一簇；头族新增
-    X-Client-Platform / X-Client-Product / X-CodeBuddy-Session-Id / X-No-Tenant-Id /
-    X-Qcloud-Env-Id / X-RateLimit-Dimension / X-RateLimit-Layer / X-WB-UA，去掉 X-Proxy-Error
-    （前两项属 connector-market 与 client-identity 面，RateLimit 两项是读响应头，不在 chat 面；
-    本轮未做 5.9.3→5.11.3 的逐表面指纹重对齐，属独立议题）。8 项 issue（7 单：#534 覆盖两个
-    提交）、14 项 revisit、46 项 skip。新开单：#528 面板缺 X-Robots-Tag noindex；
-    #529 billing summary 未解析 IsPaidUser（官方包 isPaidUser:!!e?.IsPaidUser 为据）；
-    #530 LoadDir 的 realm 回写给落败文件也写盘、mtime 翻转导致重启胜出者漂移；
-    #531 Clash 订阅导入忽略 tls/嵌套/行尾注释（http+tls 会明文发代理口令）；
-    #532 额度窗口探针不校验选号闸门、200+error 帧被当成打通；
-    #533 内容派生粘性键未掺 user_id（derive_binding 缺省 true 时不同下游用户撞同一账号）；
-    #534 设备授权链接缺 version/loginSessionId（官方 appendHostLoginJourneyParams 只对
-    platform==='workbuddy' 追加）。14 项 revisit 集中在无包内证据或需实测的项：proxypool
-    出口画像（3d0f293e/2603cbff，需第三方查询与部署边界决策）、modelTiers accessMode
-    （accessMode 在两包内 0 命中）、3D 端点（tcproxy 0 命中）、续写记账与截断终态、
-    粘帧 error 首帧否决、$wbEncrypted 回写字段保留、面板 reqlog 缺 realm 等。
-    本轮不改实现；游标推进是独立的 chore(sync) 元数据提交。
+    2026-11-16 续审 7dcae8ed..c4b53cd8（14 条非 merge、4 条 merge，共 18 项；窗口
+    2026-11-14..16）。官方 Win32 版本未变（cn 5.11.3.43806934-ecace0f7 /
+    global 5.9.4.42593613-fa0a0901），重跑 download_latest --dry-run 与 protocol_sweep
+    复核，两包解包目录与基线一致。6 项 issue（3 单）、1 项 revisit、11 项 skip。
+    新开单：#569 模型规则（按账号批量挂模型黑白名单 + 全池被挡回 400 model_not_allowed，
+    覆盖 8519ea26 / 74456c87）；#570 续写救援闸门对齐（无标点悬停不救、工具轮只看尾部
+    标点、缺「等用户回话」否决、救援上限只有一次，覆盖 89cdfe71 / bd595648 / 09189a53）；
+    #571 /status 积分语义分离（禁用号 credits 报冻结快照，面板合计把死钱算进可用额度，
+    覆盖 eca5f30b）。revisit 只有 0a2a55fb（默认+mp 任务列表合并）：上游两列表的包含
+    关系属参考侧线上实测，官方静态包无法证明，本仓也未实测。11 项 skip 分三类：① 纯
+    merge 与 merge 封装（982deea1 / 97ed35e5 / 1f07c661 / 35e1a27e）；② 参考侧测试与
+    CI 基建（1166967d / 452643bb / e069e65c）；③ 形态不存在或架构不同（d2708ca6 无
+    deepseek-harness 兼容层、c4b53cd8 的 /v1/videos 别名本仓无而 /v1/videos/generations
+    已在 tracedPath、f5d08c04 面板 tooltip 属 React 技术栈、2fa6876e 版本字面量本仓由
+    部署 profile 提供）。本轮不改实现；游标推进是独立的 chore(sync) 元数据提交。

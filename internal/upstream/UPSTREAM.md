@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `7dcae8ed9e66aabc1ac11015fa7028b40e394cb4`（2026-11-15）。该基线与本仓库无共同祖先，
+  `c4b53cd8024e38aa59fe1914691269776c757d2c`（2026-11-16）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -240,6 +240,38 @@ Win32 版本未变，仍是 cn 5.9.3.42398134-d4692421 / global 5.9.4.42593613-f
 `afda7e9c` 本仓游标是持久化状态故置脏正确、`a98ab36c` flush 走字节/滞留双阈值）。
 CN 5.9.3→5.11.3 的端点与头族漂移已记录在 `upstream-sync.yaml` 的本轮 note，逐表面指纹
 重对齐属独立议题，不在本轮范围。后续审计从 `7dcae8ed` 之后开始。
+
+2026-11-16 续审 `7dcae8ed..c4b53cd8`（14 条非 merge + 4 条 merge，共 18 项，窗口
+2026-11-14..16；官方 Win32 版本未变，仍是 cn 5.11.3.43806934-ecace0f7 /
+global 5.9.4.42593613-fa0a0901，重跑 `download_latest --dry-run` / `protocol_sweep`
+复核）。6 项 issue（3 单）、1 项 revisit、11 项 skip：
+
+- **#569**（模型规则，`8519ea26` / `74456c87`）：参考 fork 新增「命名的一组模型 +
+  deny/allow 模式，挂到账号上即刻影响选号」的号池治理面，并在本域全部可选账号都被
+  规则挡住时回 400 `model_not_allowed`。本仓 `internal/pool/entry.go:433-443`
+  `healthyForModel` 只有 disabled/paused → modelCooled → healthy 三档，没有账号级模型
+  集合；`internal/panel/panel.go:372` 只有只读 `GET /panel/api/models`；
+  `internal/server/handler.go:4687-4693` 全池不可用一律 503。
+- **#570**（救援闸门，`89cdfe71` / `bd595648` / `09189a53`）：本仓 `rescue.go:121-139`
+  的 `narrationTail` 只认冒号/省略号/未闭合代码块，无标点悬停（「我将开始修改 …」）
+  与非长文请求的工具轮句号收尾都不救；无「等用户回话」否决（会误救末句交回控制权的
+  冒号收尾）；`internal/upstream/continue.go:689-693` 的 `continueTried` 只允许救一次。
+  参考三提交分别给出最后一句意图/收尾词分流、长度闸门只拦标点型悬停、末句判等用户回话
+  与上限 2 次（结构未闭合仍 1 次）。触发样本属参考侧线上实测，官方包无字面量。
+- **#571**（积分语义，`eca5f30b`）：本仓 `internal/pool/state.go:659` 对禁用号仍报
+  冻结快照，`Status` 无 `credits_raw`，`/status` 无顶层汇总，面板
+  `web/src/views/AccountsView.tsx:138-140` 全量求和把死钱算进可用额度。
+
+`0a2a55fb` 记 `revisit`：参考侧合并默认 + mp 任务列表（改版后 mp 列表不再是超集，
+`Library_read` 被判「该账号没有此任务」）；上游两列表的包含关系属参考侧线上实测，
+官方静态包无法证明，本仓 `autotask.go:1519-1560` 两份快照分开保存、非 mp 任务只查
+默认列表，是否同样受影响需实测。
+
+11 项 `skip`：纯 merge 与 merge 封装（`982deea1`/`97ed35e5`/`1f07c661`/`35e1a27e`）；
+参考侧测试与 CI 基建（`1166967d`/`452643bb` 的 logstore 绝对日期用例、`e069e65c` 的
+官方头夹具门禁）；形态不存在或架构不同（`d2708ca6` 的 deepseek-harness 搜索卡片补丁、
+`c4b53cd8` 的 `POST /v1/videos` 别名、`f5d08c04` 面板 tooltip、`2fa6876e` 的版本字面量
+——本仓版本恒来自部署 profile）。后续审计从 `c4b53cd8` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
