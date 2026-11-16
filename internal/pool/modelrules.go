@@ -58,7 +58,7 @@ type ModelRule struct {
 
 // RuleBlockStatus 本域某模型被模型规则挡住的情况（供 400 model_not_allowed 判定）。
 type RuleBlockStatus struct {
-	// Eligible 本域账号级可选（healthy）的账号数。
+	// Eligible 本域可参与选号的账号数（不含禁用 / 暂停；不剔除临时冷却）。
 	Eligible int `json:"eligible"`
 	// Blocked 其中被模型规则挡住该模型的账号数。
 	Blocked int `json:"blocked"`
@@ -312,8 +312,12 @@ func (p *Pool) RuleAccountCounts() map[string]int {
 	return out
 }
 
-// RuleBlockedForRealm 统计本域某模型被规则挡住的情况：Eligible 是账号级可选的账号数，
-// Blocked 是其中被规则挡住该模型的账号数。
+// RuleBlockedForRealm 统计本域某模型被规则挡住的情况：Eligible 是本域可参与选号的
+// 账号数，Blocked 是其中被规则挡住该模型的账号数。
+//
+// 判定不看临时冷却：规则是常驻配置，冷却会自愈。若把冷却中的号排除在 Eligible 之外，
+// 「唯一没被规则挡的号恰好在退避」就会被读成「全池被规则挡住」，把可重试的上游失败
+// 伪装成不可重试的 400 model_not_allowed（见 server 侧 applyRuleBlockOverride）。
 func (p *Pool) RuleBlockedForRealm(model, realm string) RuleBlockStatus {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -322,16 +326,10 @@ func (p *Pool) RuleBlockedForRealm(model, realm string) RuleBlockStatus {
 		return RuleBlockStatus{}
 	}
 
-	now := p.now()
-
 	var status RuleBlockStatus
 
 	for _, entry2 := range p.byUID {
-		if realm != "" && entry2.a.Realm() != realm {
-			continue
-		}
-
-		if !entry2.healthy(now) {
+		if modelBlockIgnores(entry2, realm) {
 			continue
 		}
 

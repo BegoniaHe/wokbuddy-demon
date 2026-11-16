@@ -7,6 +7,7 @@ import (
 	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 )
@@ -344,5 +345,81 @@ func TestRuleBlockedForRealm(t *testing.T) {
 
 	if got := state.RuleBlockedForRealm("glm-5.2", "global"); got.Blocked != 0 || got.AllBlocked() {
 		t.Errorf("global 域不受 cn 号规则影响: %+v", got)
+	}
+}
+
+// TestRuleBlockedIgnoresTransientCooldown 「唯一没被规则挡的号在临时冷却」不能被读成
+// 全池被规则挡住：冷却会自愈，规则不会，对外错误语义完全不同。
+func TestRuleBlockedIgnoresTransientCooldown(t *testing.T) {
+	t.Parallel()
+
+	state := rulePool()
+	state.Add(&auth.Auth{UID: "cn2", Domain: "www.codebuddy.cn"})
+
+	rule, err := state.UpsertRule(ModelRule{Mode: ModelRuleDeny, Models: []string{"glm-5.2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := state.AssignRules("cn1", []string{rule.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// cn2 未被规则挡住，但正处于 429 软冷却：不可选，却仍算本域的规则可选项。
+	state.Cooldown("cn2", CoolSoft, time.Minute, "429")
+
+	if got := state.RuleBlockedForRealm("glm-5.2", "cn"); got.Eligible != 2 || got.Blocked != 1 || got.AllBlocked() {
+		t.Errorf("冷却中的号不应被算成规则阻塞: %+v", got)
+	}
+}
+
+// TestModelRuleDenySkipsPick 被规则挡住的账号在选号主路径上直接不可选（不依赖
+// healthyForModel 之外的分支判断）。
+func TestModelRuleDenySkipsPick(t *testing.T) {
+	t.Parallel()
+
+	state := rulePool()
+
+	rule, err := state.UpsertRule(ModelRule{Mode: ModelRuleDeny, Models: []string{"glm-5.2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := state.AssignRules("cn1", []string{rule.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// cn1 是唯一的 cn 号且被规则挡住：本域没有可选账号。
+	if acct := state.PickExcludingForRealm(map[string]bool{}, "glm-5.2", "cn"); acct != nil {
+		t.Fatalf("被规则挡住的账号不应被选中: uid=%s", acct.UID)
+	}
+
+	// 未被规则挡住的模型照常选中。
+	if acct := state.PickExcludingForRealm(map[string]bool{}, "glm-4.6", "cn"); acct == nil || acct.UID != "cn1" {
+		t.Fatalf("未命中规则的模型应照常选中 cn1, got %+v", acct)
+	}
+}
+
+// TestModelRuleDenyNotBypassedByFallback 全冷却兜底不能让规则号跑被禁模型：
+// 规则号同时处于软冷却（兜底候选）、另一个号本请求已试过时，兜底必须返回 nil。
+func TestModelRuleDenyNotBypassedByFallback(t *testing.T) {
+	t.Parallel()
+
+	state := rulePool()
+
+	rule, err := state.UpsertRule(ModelRule{Mode: ModelRuleDeny, Models: []string{"glm-5.2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := state.AssignRules("cn1", []string{rule.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// cn1 有冷却截止（进得了兜底候选），g1 本请求已试过。
+	state.Cooldown("cn1", CoolSoft, time.Minute, "429")
+
+	if acct := state.PickExcludingForRealm(map[string]bool{"g1": true}, "glm-5.2", ""); acct != nil {
+		t.Fatalf("兜底把规则号捞回来了: uid=%s", acct.UID)
 	}
 }

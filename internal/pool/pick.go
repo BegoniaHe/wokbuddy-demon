@@ -250,8 +250,10 @@ func (p *Pool) excludeReason(
 		return reason
 	}
 
-	if reqModel != "" && entry5.modelCooled(now, reqModel) {
-		return "model_cooldown"
+	// 人工模型规则优先于自动冷却（issue #569）：被规则挡住的模型直接不可选，
+	// 与 healthyForModel 同判据（选号主路径与有序策略共用本谓词）。
+	if reason := entry5.modelExcludeReason(reqModel, now); reason != "" {
+		return reason
 	}
 
 	if !entry5.healthy(now) {
@@ -268,6 +270,24 @@ func (p *Pool) excludeReason(
 
 	if p.inFlightFull(entry5) {
 		return "in_flight_full"
+	}
+
+	return ""
+}
+
+// modelExcludeReason 返回账号对该模型不可选的原因（空 = 可选）。人工模型规则优先于
+// 自动冷却（issue #569）：规则由运维显式声明、不会自行解封，先判它再判会自愈的冷却。
+func (e *entry) modelExcludeReason(reqModel string, now time.Time) string {
+	if reqModel == "" {
+		return ""
+	}
+
+	if e.ruleBlockedModel(reqModel) {
+		return "model_rule"
+	}
+
+	if e.modelCooled(now, reqModel) {
+		return "model_cooldown"
 	}
 
 	return ""
@@ -849,6 +869,12 @@ func (p *Pool) fallbackEligible(
 	}
 
 	if p.fallbackCoolingBlocks(entry2, model, now) {
+		return false
+	}
+
+	// 人工模型规则在兜底路径同样生效：主路径被规则挡住的号不能靠「全冷却兜底」
+	// 捞回来跑被禁的模型（规则是运维显式配置，与自动冷却无关）。
+	if model != "" && entry2.ruleBlockedModel(model) {
 		return false
 	}
 
