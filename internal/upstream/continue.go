@@ -671,9 +671,9 @@ func (c *TextContinueReader) writeFrameJSON(frame map[string]any) {
 	c.out.WriteString("data: " + string(raw) + "\n\n")
 }
 
-// rewriteContinuationFrame 把续写帧的 id/model 对齐首段，并把首段 usage 并进
+// rewriteContinuationFrame 把续写帧的 id/model 对齐首段，并把已累计的 usage 并进
 // 续写帧：prompt/cache 留末段，completion/credit 累加，total 重算。续写是第二次
-// 上游调用，只报本段会漏记首段完成量（issue #247 / #432，与非流式同口径）。
+// 上游调用，只报本段会漏记前面各段完成量（issue #247 / #432，与非流式同口径）。
 func (c *TextContinueReader) rewriteContinuationFrame(frame map[string]any) {
 	if !c.continuation {
 		return
@@ -687,9 +687,14 @@ func (c *TextContinueReader) rewriteContinuationFrame(frame map[string]any) {
 		frame["model"] = c.firstMdl
 	}
 
-	if usage, ok := frame["usage"].(map[string]any); ok && c.firstUsage != nil {
-		mergeUsageNumbers(usage, c.firstUsage)
-		recomputeMergedUsageTotal(usage)
+	if usage, ok := frame["usage"].(map[string]any); ok && len(usage) > 0 {
+		if c.firstUsage != nil {
+			mergeUsageNumbers(usage, c.firstUsage)
+			recomputeMergedUsageTotal(usage)
+		}
+		// 多段续写（issue #570 起预告句最多救两次）把累计值留作下一段基线：只留住
+		// 首段会让第三段漏记中间段用量，末帧反而比上一帧少。
+		c.firstUsage = usage
 	}
 }
 

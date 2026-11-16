@@ -3,6 +3,7 @@ package upstream
 import (
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -380,6 +381,50 @@ func TestTextContinueReaderPreservesLengthWithSeparateUsage(t *testing.T) {
 
 	if !strings.Contains(string(out), `"total_tokens":15`) {
 		t.Fatalf("usage frame lost after length: %s", out)
+	}
+}
+
+// TestTextContinueReaderMergesUsageAcrossRescues 两段预告句各救一次（issue #570）后
+// 仍要累计中间段用量：末帧 completion 必须各段相加，不能比上一帧还少。
+func TestTextContinueReaderMergesUsageAcrossRescues(t *testing.T) {
+	t.Parallel()
+
+	segment := func(id, text string, completion int) string {
+		return `data: {"id":"` + id + `","model":"m","choices":[{"index":0,"delta":{"content":"` + text + `"}}]}` + "\n\n" +
+			`data: {"id":"` + id + `","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":` +
+			strconv.Itoa(completion) + `,"total_tokens":` + strconv.Itoa(completion+10) + `}}` + "\n\n" +
+			"data: [DONE]\n\n"
+	}
+
+	streams := []string{
+		segment("a", "我将开始修改 ", 5),
+		segment("b", "先看一下 ", 7),
+		segment("c", "改好了。", 11),
+	}
+
+	calls := 0
+
+	r := NewTextContinueReader(closeString{strings.NewReader(streams[0])}, "", false,
+		func(string, TailKind) (io.ReadCloser, error) {
+			calls++
+
+			return closeString{strings.NewReader(streams[calls])}, nil
+		})
+	r.ContinueOnStopTail(func(string) TailKind { return TailPromise }, false, nil)
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if calls != 2 {
+		t.Fatalf("续写次数=%d want 2", calls)
+	}
+
+	// 三段 completion 5+7+11=23，prompt 取末段 10 → total 33。
+	last := string(out)[strings.LastIndex(string(out), `"usage"`):]
+	if !strings.Contains(last, `"completion_tokens":23`) || !strings.Contains(last, `"total_tokens":33`) {
+		t.Fatalf("多段 usage 未累计: %s", last)
 	}
 }
 
