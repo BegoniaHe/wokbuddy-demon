@@ -41,6 +41,8 @@ RUN sed -i 's/\r$//' /app/login.sh /app/signin.sh /app/credit.sh && chmod 755 /a
 COPY config.example.json /app/config.json
 RUN chown app:app /app/config.json
 USER app
+# 二进制默认只监听回环；容器内必须监听全部网卡才能被端口映射接住。
+ENV WB2A_LISTEN=0.0.0.0:7863
 EXPOSE 7863
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:7863/healthz || exit 1

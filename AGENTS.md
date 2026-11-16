@@ -146,7 +146,7 @@ WokBuddy Demon 是一个本地网关：接收 OpenAI 兼容的 `/v1/*` 请求，
 
 把这些当设计约束，而非可选加固：
 
-- `api_key` 为空 = 不鉴权直接放行。公网部署**必须**设置 `api_key`，并置于 HTTPS / 反代之后或仅内网可达。默认监听 `:7863`，无内置 TLS。
+- `api_key` 为空 = 不鉴权直接放行。公网部署**必须**设置 `api_key`，并置于 HTTPS / 反代之后或仅内网可达。默认只监听 `127.0.0.1:7863`（容器镜像经 `WB2A_LISTEN` 放开到 `0.0.0.0`），无内置 TLS。
 - 鉴权比较必须走 `internal/httpauth` 的常量时间实现；不要退回字符串直接比较（计时侧信道）。
 - 凭证（`auths/*.json`）、状态（`data/`）、`config.json` 不得进入版本库、日志或面板回显；请求归档只写脱敏元数据。
 - 出站脱敏开关（`features.sanitize_blacklist_fingerprints`）默认开启，不要弱化。

@@ -71,10 +71,14 @@ type ExpiryBucket struct {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID          string `json:"uid"`
-	Nickname     string `json:"nickname,omitempty,omitzero"`
-	Credits      int64  `json:"credits"`
-	CreditsTotal int64  `json:"credits_total,omitempty,omitzero"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty,omitzero"`
+	// Credits 当前可用量：disabled 账号归零（授权终态，余额不再可消费）。
+	Credits int64 `json:"credits"`
+	// CreditsRaw 最后一次成功刷新得到的真实快照，disabled 账号也保留——调度轮换
+	// 与诊断要看真实余额，不能让「可用量」的语义改写掉它。
+	CreditsRaw   int64 `json:"credits_raw"`
+	CreditsTotal int64 `json:"credits_total,omitempty,omitzero"` // 积分总额度（各套餐聚合）；0 = 未知（旧 state/查询失败）
 	// CreditsExpiring / CreditsEarliestExpiry / CreditsEarliestRemaining 描述当前积分中
 	// 的到期压力。CreditsExpiring 是配置窗口内的剩余积分；后两者是全部未来到期批次中
 	// 最早的一批及其剩余量，供 WorkDaddy 同口径的“最早到期优先”路由使用。
@@ -271,6 +275,14 @@ type entry struct {
 	// 单 until 字段做不到的）。空 map = 无模型级避让（不豁免）。
 	// 持久化（stateAccount.ModelCooldowns）：重启后仍避开已知不可用的模型。
 	modelCooldowns map[string]modelCooldown
+	// ruleIDs 账号挂载的模型规则引用（只存规则 id，持久化）。展开结果不落盘：
+	// 规则本体与引用同存 state.json，加载时先账号后规则本体再统一展开（issue #569）。
+	ruleIDs []string
+	// ruleDenied / ruleAllowed 规则展开后的运行态模型集合（按账号所属域展开成裸名）。
+	// ruleAllowed 为 nil 表示没有生效的 allow 规则（不约束）；deny 优先于 allow。
+	// 只在规则/引用/凭证域变化时重算（见 modelrules.go），选号热路径只读。
+	ruleDenied  map[string]struct{}
+	ruleAllowed map[string]struct{}
 	// sessionDeadFails 连续 12153（ErrSessionDead）计数。12153 在真实环境会被临时性触发
 	// （网络抖动/上游闪断/refresh 竞态），一次失败就永久禁用太粗暴——连续达到阈值才判死。
 	// 持久化（stateAccount.SessionDeadFails）：上游持续 session dead 时重启归零会导致
@@ -432,6 +444,12 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	if e.disabled || e.paused {
+		return false
+	}
+
+	// 人工模型规则优先于自动冷却：运维显式声明的模型范围就是本账号该跑什么，
+	// 被规则挡住的模型直接不可选（见 modelrules.go）。
+	if e.ruleBlockedModel(reqModel) {
 		return false
 	}
 
@@ -628,6 +646,9 @@ type stateAccount struct {
 	// 观测时刻与之一并持久化，重启后面板仍能显示三态而不是退回未知。
 	PaidUser     *bool     `json:"paid_user,omitempty,omitzero"`
 	PaidObserved time.Time `json:"paid_observed,omitzero"`
+	// ModelRules 账号挂载的模型规则 id（issue #569）。只存引用：规则本体在
+	// stateFile.ModelRules，加载时先账号后规则本体再统一展开。
+	ModelRules []string `json:"model_rules,omitempty,omitzero"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态
@@ -655,6 +676,9 @@ type stateFile struct {
 	// 池级而非逐号：游标描述「这个域的模型当前轮询到第几个账号」。
 	// 持久化以保留顺序耗尽进度（跨重启不该从第一个号重新打）。
 	SchedulingCursors map[string]int `json:"scheduling_cursors,omitempty,omitzero"`
+	// ModelRules 模型规则本体（issue #569）。与账号上的 ruleIDs 引用同存：加载时
+	// 先恢复账号引用、再恢复规则本体，最后统一展开；展开结果改写运行态、不写引用。
+	ModelRules []ModelRule `json:"model_rules,omitempty,omitzero"`
 }
 
 // flushInterval 后台落盘周期。

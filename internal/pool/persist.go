@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"slices"
 	"time"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
@@ -201,8 +202,10 @@ func (p *Pool) load() {
 		return
 	}
 
+	// 顺序不能反：账号上只有规则 id 引用，规则本体必须随后恢复再统一展开。
 	p.applyAccountsLocked(stateSnapshot.Accounts)
 	p.applySchedulingCursorsLocked(stateSnapshot.SchedulingCursors)
+	p.applyModelRulesLocked(stateSnapshot.ModelRules)
 }
 
 // applySchedulingCursorsLocked 恢复有序策略游标（缺失/损坏视为无游标）。
@@ -272,6 +275,7 @@ func buildEntryFromState(uid string, stateAccount2 *stateAccount, now time.Time)
 		consecutiveFails:         stateAccount2.ConsecutiveFails,
 		paidUser:                 stateAccount2.PaidUser,
 		paidObserved:             stateAccount2.PaidObserved,
+		ruleIDs:                  slices.Clone(stateAccount2.ModelRules),
 	}
 	// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 	clampRestoredCredits(entry2, now)
@@ -371,18 +375,20 @@ func restoreModelCosts(src map[string]stateModelCost, now time.Time) map[string]
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
 // adoptSnapshot 采用 Redis 快照为当前池状态，并置 dirty 让下一次落盘把它物化回本地
 // state.json（否则快照只在内存生效，下次崩溃恢复又回到旧本地文件）。
-func (p *Pool) adoptSnapshot(s snapshot) {
+func (p *Pool) adoptSnapshot(snap snapshot) {
 	p.mu.Lock()
-	p.applySnapshotLocked(s)
+	p.applySnapshotLocked(snap)
 	p.mu.Unlock()
 	p.dirty.Store(true)
 }
 
-func (p *Pool) applySnapshotLocked(s snapshot) {
+func (p *Pool) applySnapshotLocked(snap snapshot) {
 	p.byUID = map[string]*entry{}
-	p.applyAccountsLocked(s.Accounts)
+	p.applyAccountsLocked(snap.Accounts)
 	// 有序策略游标同样随快照恢复（本地与 Redis 两路一致）。
-	p.applySchedulingCursorsLocked(s.SchedulingCursors)
+	p.applySchedulingCursorsLocked(snap.SchedulingCursors)
+	// 模型规则同理：先账号（只有 id 引用）后规则本体，再统一展开。
+	p.applyModelRulesLocked(snap.ModelRules)
 }
 
 // snapshotStateLocked 生成一份带单调序号的一致快照；调用方必须已持有 p.mu。
@@ -472,6 +478,10 @@ func (p *Pool) stateOverviewLocked() stateFile {
 		maps.Copy(state.SchedulingCursors, p.schedulingCursors)
 	}
 
+	if len(p.modelRules) > 0 {
+		state.ModelRules = p.rulesLocked()
+	}
+
 	return state
 }
 
@@ -502,6 +512,7 @@ func buildStateAccount(entry5 *entry, now time.Time) stateAccount {
 		CreditsExpiryBuckets:     entry5.creditsExpiryBuckets,
 		PaidUser:                 entry5.paidUser,
 		PaidObserved:             entry5.paidObserved,
+		ModelRules:               slices.Clone(entry5.ruleIDs),
 	}
 	// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitzero 真省略）。
 	if !entry5.breakerUntil.IsZero() && now.Before(entry5.breakerUntil) {

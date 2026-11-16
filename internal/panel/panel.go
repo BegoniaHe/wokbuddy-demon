@@ -333,6 +333,7 @@ func (p *Panel) routesTasks() {
 	p.route("POST /panel/api/balance_all", scopeAdmin, p.balanceAll)
 }
 
+//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesImport() {
 	p.route("POST /panel/api/login/start", scopeAdmin, p.loginStart)
 	p.route("GET /panel/api/login/poll", scopeAdmin, p.loginPoll)
@@ -373,9 +374,13 @@ func (p *Panel) routesModels() {
 	p.route("GET /panel/api/model_probes", scopeRead, p.modelProbes)
 	p.route("POST /panel/api/model_probes", scopeAdmin, p.modelProbe)
 	p.route("GET /panel/api/model_health", scopeRead, p.modelHealth)
+	// 模型规则（issue #569）：规则 CRUD 与账号维度批量挂载。
+	p.route("GET /panel/api/model_rules", scopeRead, p.modelRules)
+	p.route("POST /panel/api/model_rules", scopeAdmin, p.modelRuleUpsert)
+	p.route("POST /panel/api/model_rules/{id}/delete", scopeAdmin, p.modelRuleDelete)
+	p.route("POST /panel/api/model_rules/assign", scopeAdmin, p.modelRuleAssign)
 }
 
-//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesConfig() {
 	p.route("GET /panel/api/config", scopeAdmin, p.getConfig)
 	p.route("POST /panel/api/config", scopeAdmin, p.saveConfig)
@@ -626,6 +631,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"daily_reset_at":       nextLocalMidnight(),
 		"proxy_slots":          p.proxySlots(),
 		"accounts":             p.cfg.Pool.List(),
+		// credits 积分汇总（available 不含禁用号冻结快照），面板统计条直接用它，
+		// 不再自己遍历 accounts 求和（issue #571）。
+		"credits": p.cfg.Pool.CreditsSummary(),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
