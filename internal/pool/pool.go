@@ -12,10 +12,13 @@ import (
 )
 
 type Pool struct {
-	mu      sync.RWMutex
-	byUID   map[string]*entry
-	stateFp string
-	dirty   atomic.Bool // 内存有变更待落盘
+	mu    sync.RWMutex
+	byUID map[string]*entry
+	// modelRules 模型规则本体（issue #569）：id → 规则。账号上只存 id 引用，
+	// 展开结果在 entry.ruleDenied/ruleAllowed；本体与引用同存 state.json。
+	modelRules map[string]ModelRule
+	stateFp    string
+	dirty      atomic.Bool // 内存有变更待落盘
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
@@ -829,6 +832,8 @@ func (p *Pool) upsertLocked(account *auth.Auth) *auth.Auth {
 	if e, ok := p.byUID[account.UID]; ok {
 		old := e.a
 		e.a = account // 保留 credits/cooling 状态
+		// 凭证可能换了域（cn ↔ global）：规则展开按域，必须重算。
+		p.applyRulesLocked(e)
 
 		if old == account {
 			return nil

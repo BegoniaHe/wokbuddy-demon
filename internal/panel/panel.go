@@ -333,6 +333,7 @@ func (p *Panel) routesTasks() {
 	p.route("POST /panel/api/balance_all", scopeAdmin, p.balanceAll)
 }
 
+//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesImport() {
 	p.route("POST /panel/api/login/start", scopeAdmin, p.loginStart)
 	p.route("GET /panel/api/login/poll", scopeAdmin, p.loginPoll)
@@ -373,9 +374,13 @@ func (p *Panel) routesModels() {
 	p.route("GET /panel/api/model_probes", scopeRead, p.modelProbes)
 	p.route("POST /panel/api/model_probes", scopeAdmin, p.modelProbe)
 	p.route("GET /panel/api/model_health", scopeRead, p.modelHealth)
+	// 模型规则（issue #569）：规则 CRUD 与账号维度批量挂载。
+	p.route("GET /panel/api/model_rules", scopeRead, p.modelRules)
+	p.route("POST /panel/api/model_rules", scopeAdmin, p.modelRuleUpsert)
+	p.route("POST /panel/api/model_rules/{id}/delete", scopeAdmin, p.modelRuleDelete)
+	p.route("POST /panel/api/model_rules/assign", scopeAdmin, p.modelRuleAssign)
 }
 
-//nolint:dupl // 路由注册逐条平铺，形状相近但端点与 handler 各异。
 func (p *Panel) routesConfig() {
 	p.route("GET /panel/api/config", scopeAdmin, p.getConfig)
 	p.route("POST /panel/api/config", scopeAdmin, p.saveConfig)
