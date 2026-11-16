@@ -657,6 +657,7 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		Enterprise:               entry2.a.IsEnterprise(),
 		Nickname:                 entry2.a.NicknameValue(),
 		Credits:                  entry2.credits,
+		CreditsRaw:               entry2.credits,
 		CreditsTotal:             entry2.creditsTotal,
 		CreditsExpiring:          entry2.creditsExpiring,
 		CreditsEarliestExpiry:    entry2.creditsEarliestExpiry,
@@ -686,6 +687,10 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 		PaidObserved:       entry2.paidObserved,
 	}
 
+	// 已禁用账号不再可消费余额：对外报可用量 0，真实快照留在 CreditsRaw。
+	// paused 不受影响——它照常保号、照常刷新余额，余额是真实的。
+	zeroDisabledCredits(&status, entry2)
+
 	fillPaidStatus(&status, entry2)
 	fillStatusReason(&status, entry2)
 
@@ -694,6 +699,15 @@ func (p *Pool) statusOf(uid string, entry2 *entry) Status {
 	}
 
 	return status
+}
+
+// zeroDisabledCredits 禁用号不再可消费余额：对外报可用量 0，真实快照留在
+// CreditsRaw 供调度轮换与诊断使用；paused 不受影响（它照常保号、照常刷新余额）。
+func zeroDisabledCredits(status *Status, entry2 *entry) {
+	if entry2.disabled {
+		status.Credits = 0
+		status.CreditsTotal = 0
+	}
 }
 
 // fillPaidStatus 复制付费状态指针，避免调用方改动 Status 反写池内观测（issue #529）。

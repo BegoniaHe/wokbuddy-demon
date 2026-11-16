@@ -747,6 +747,9 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 「某号为何对某模型不出票」。零值也显式写出（缺失会让人误以为没记录）。
 		"credit_floor":          h.cfg.Pool.CreditFloor(),
 		"credit_floor_by_realm": h.cfg.Pool.CreditFloorByRealm(),
+		// credits 顶层汇总：available 不含禁用号的冻结快照，snapshot 含（真实余额），
+		// quota 为可用账号总额度。外部集成不必自行遍历 accounts 求和。
+		"credits": h.cfg.Pool.CreditsSummary(),
 		// cost_explore 事件与 per-model 时间戳（时间值由 encoding/json 写 RFC3339）。
 		"cost_explore": map[string]any{
 			"events_total": exploreEvents,

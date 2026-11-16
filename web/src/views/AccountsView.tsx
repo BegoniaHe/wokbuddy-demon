@@ -135,8 +135,11 @@ export function AccountsView() {
   }
 
   const accounts = data.accounts ?? [];
-  const remSum = accounts.reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = accounts.reduce((a, s) => a + (s.credits_total || 0), 0);
+  // 服务端已给出汇总（available 不含禁用号冻结快照）；旧响应缺字段时按同一口径回落。
+  const remSum = data.credits?.available ?? accounts.reduce((a, s) => a + (s.disabled ? 0 : (s.credits || 0)), 0);
+  const totSum =
+    data.credits?.quota ??
+    accounts.reduce((a, s) => a + (!s.disabled && (s.credits_total || 0) > 0 ? (s.credits_total || 0) : 0), 0);
   const creditsText = totSum > 0 ? remSum + ' / ' + totSum : String(remSum);
 
   const afterAction = () => {
@@ -673,13 +676,20 @@ function AccountRow({
 
   const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
   const unlimited = s.credits_total === -1;
-  const cred = unlimited
-    ? '不限'
-    : s.credits == null
+  // 禁用号的 credits 是 0（不可消费），冻结快照在 credits_raw：显示快照并标注冻结，
+  // 避免把死余额当成可用额度。
+  const rawCred = s.credits_raw;
+  const cred = s.disabled
+    ? rawCred == null
       ? '—'
-      : s.credits_total && s.credits_total > 0
-        ? s.credits + '/' + s.credits_total
-        : String(s.credits);
+      : String(rawCred) + '（冻结）'
+    : unlimited
+      ? '不限'
+      : s.credits == null
+        ? '—'
+        : s.credits_total && s.credits_total > 0
+          ? s.credits + '/' + s.credits_total
+          : String(s.credits);
   const pct = unlimited
     ? 100
     : s.credits_total && s.credits_total > 0
@@ -687,7 +697,8 @@ function AccountRow({
       : Math.round(((s.credits || 0) / maxCred) * 100);
 
   let credTip: string;
-  if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
+  if (s.disabled) credTip = '已禁用：可用积分 0；冻结快照 ' + (rawCred ?? 0) + ' 分（最后一次成功刷新，不计入池内可用合计）';
+  else if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
   else if (s.credits_total && s.credits_total > 0) {
     credTip =
       (s.enterprise ? '企业版剩余额度 ' : '剩余 ') +
