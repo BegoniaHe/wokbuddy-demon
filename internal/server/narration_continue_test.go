@@ -11,6 +11,7 @@ import (
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 const sseNarrationStop = "data: {\"id\":\"c1\",\"choices\":[{\"index\":0," +
@@ -32,31 +33,49 @@ const sseTailToolCall = "data: {\"id\":\"c2\",\"choices\":[{\"index\":0," +
 	"data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 	"data: [DONE]\n\n"
 
-// TestNarrationTail 尾部形态判据：冒号/省略号/未闭合代码块命中，完整句不命中。
-func TestNarrationTail(t *testing.T) {
+// TestClassifyTail 尾部形态判据（issue #495 / #570）：标点型悬停、无标点承诺句、
+// 结构未闭合分别归位；完整句、等用户回话、超长标点型悬停不救。
+func TestClassifyTail(t *testing.T) {
 	t.Parallel()
 
+	longPrefix := strings.Repeat("我把三处改动逐行过了一遍，其中两点需要单独说明。", 20) // ≈600B
+
 	cases := []struct {
-		name string
-		text string
-		want bool
+		name      string
+		text      string
+		toolRound bool
+		want      upstream.TailKind
 	}{
-		{"full-width-colon", "文件结构如下：", true},
-		{"ascii-colon", "The plan is:", true},
-		{"ellipsis", "然后它就……", true},
-		{"ascii-ellipsis", "and then...", true},
-		{"open-fence", "```go\nfunc main() {", true},
-		{"closed-fence", "```go\nfunc main() {}\n```", false},
-		{"complete-sentence", "配置项在 config.json 里。", false},
-		{"empty", "   ", false},
+		{"full-width-colon", "文件结构如下：", false, upstream.TailPunctuated},
+		{"ascii-colon", "The plan is:", false, upstream.TailPunctuated},
+		{"ellipsis", "然后它就……", false, upstream.TailPunctuated},
+		{"ascii-ellipsis", "and then...", false, upstream.TailPunctuated},
+		{"open-fence", "```go\nfunc main() {", false, upstream.TailStructural},
+		{"closed-fence", "```go\nfunc main() {}\n```", false, upstream.TailNone},
+		{"complete-sentence", "配置项在 config.json 里。", false, upstream.TailNone},
+		{"empty", "   ", false, upstream.TailNone},
+		{"promise-short", "我将开始修改 internal/verify/check.go", false, upstream.TailPromise},
+		{"promise-long", longPrefix + "我将开始修改 internal/verify/check.go", false, upstream.TailPromise},
+		// 长度闸门只约束标点型悬停：超长的「停在冒号上」多半是正常排版。
+		{"punctuated-too-long", longPrefix + "改动清单如下：", false, upstream.TailNone},
+		// 交回控制权是故意的收尾，不能替用户拍板。
+		{"yields-to-user", "我已经过了一遍，请确认后我再发送：", false, upstream.TailNone},
+		// 中段的「是否需要」是技术叙述，只看末句窗口。
+		{"mid-text-yield-marker", longPrefix + "为是否需要更换提供量化支撑。\n\n我将开始修改 check.go", false, upstream.TailPromise},
+		// 工具轮句号收尾：意图词判没写完，收尾词优先判答完。
+		{"tool-round-intent", "前面三处引用都已经逐个核对过，参数名与返回类型都对得上。我继续检查其余链接。", true, upstream.TailPromise},
+		{"tool-round-closing", "前面三处引用都已经逐个核对过，参数名与返回类型都对得上。任务已全部完成，我来总结一下。", true, upstream.TailNone},
+		{"tool-round-short", "已改完。", true, upstream.TailPromise},
+		// 非工具轮不按最后一句的意图词救：那是普通叙述。
+		{"plain-intent-sentence", "前面三处引用都已经逐个核对过，参数名与返回类型都对得上。我继续检查其余链接。", false, upstream.TailNone},
 	}
 
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := narrationTail(testCase.text); got != testCase.want {
-				t.Errorf("narrationTail(%q)=%v want %v", testCase.text, got, testCase.want)
+			if got := classifyTail(testCase.text, testCase.toolRound); got != testCase.want {
+				t.Errorf("classifyTail(%q, toolRound=%v)=%v want %v", testCase.text, testCase.toolRound, got, testCase.want)
 			}
 		})
 	}

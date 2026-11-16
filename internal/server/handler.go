@@ -3296,25 +3296,29 @@ func (f *chatFlow) handleStreamSuccess(
 	var cont *upstream.TextContinueReader
 
 	if !probe.HasTool && probe.Text != "" {
-		cont = upstream.NewTextContinueReader(stream, "", false, func(partial string) (io.ReadCloser, error) {
-			return f.continueUpstream(ctx, acct, partial)
-		})
+		cont = upstream.NewTextContinueReader(stream, "", false,
+			func(partial string, kind upstream.TailKind) (io.ReadCloser, error) {
+				return f.continueUpstream(ctx, acct, partial, kind)
+			})
 		// 长文续接（issue #494）：客户端把输出上限要到 32k+ 时，stopped 的长文也按
 		// 可续写处理；短答 stop 由响应侧门槛挡掉（见 longFormContinuationMinChars）。
 		if f.longFormRequested() {
 			cont.ContinueOnStop(longFormContinuationMinChars)
 		}
-		// 预告句与工具轮（issue #495）：尾部是冒号/省略号/未闭合代码块时续写一次；
+		// 预告句 / 承诺句与工具轮（issue #495 / #570）：尾部形态由 classifyTail 判定，
 		// 本轮声明了工具就只采纳续写里的 tool_calls，丢弃续写正文。
-		cont.ContinueOnStopTail(narrationTail, f.declaredToolCount > 0,
-			func(tail string) {
-				log.Printf("INFO: [server] stream acct=%s model=%s: narration tail %q, "+
-					"continuing once (declared_tools=%d)",
-					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel,
+		cont.ContinueOnStopTail(func(text string) upstream.TailKind {
+			return classifyTail(text, f.declaredToolCount > 0)
+		}, f.declaredToolCount > 0,
+			func(tail string, kind upstream.TailKind) {
+				log.Printf("INFO: [server] stream acct=%s model=%s: %s tail %q, "+
+					"continuing (declared_tools=%d)",
+					logfmt.Label(acct.UID, acct.NicknameValue()), f.bareModel, kind,
 					upstream.RedactForLog(tail, 160), f.declaredToolCount)
 				captureSample("narration_tail", f.bareModel, true, tail, map[string]any{
 					captureKeyDeclaredTools: f.declaredToolCount,
 					"tools_only":            f.declaredToolCount > 0,
+					"tail_shape":            kind.String(),
 				})
 			})
 
@@ -3686,9 +3690,9 @@ func (f *chatFlow) handlePreStreamEmpty(
 // continueUpstream 发起截断续写请求：复用 ChatStreamContext → prepareBody 管线，
 // 同账号同模型，不手拼 raw body（脱敏/thinking/缓存键仍生效）。
 func (f *chatFlow) continueUpstream(
-	ctx context.Context, acct *auth.Auth, partial string,
+	ctx context.Context, acct *auth.Auth, partial string, kind upstream.TailKind,
 ) (io.ReadCloser, error) {
-	body := upstream.BuildContinuationBody(f.body, partial)
+	body := upstream.BuildContinuationBody(f.body, partial, kind)
 
 	next, status, respBody, err := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, body, f.clientIP, f.chatMeta)
 	if err != nil || status >= http.StatusBadRequest {
@@ -3934,7 +3938,7 @@ func (f *chatFlow) handleNonStreamSuccess(
 // continueNonStream 非流式 finish_reason=length（或长文请求的 stop）且有正文时续写
 // 一次，把第二段正文拼进同一响应（issue #247 / #494）。工具调用不续写；失败保留首段终态。
 //
-//nolint:cyclop,funlen,gocyclo // 续写前置条件线性校验（形态、已有调用、正文、只做一次），拆散更难读。
+//nolint:cyclop,funlen,gocyclo,maintidx // 续写前置条件线性校验（形态、已有调用、正文、次数上限），拆散更难读。
 func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp map[string]any) map[string]any {
 	if f.nonstreamContinued || len(resp) == 0 {
 		return resp
@@ -3950,7 +3954,7 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		return resp
 	}
 
-	wanted, toolsOnly := f.nonStreamContinuePlan(resp, choice)
+	wanted, toolsOnly, kind := f.nonStreamContinuePlan(resp, choice)
 	if !wanted {
 		return resp
 	}
@@ -3968,11 +3972,12 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 		captureKeyDeclaredTools: f.declaredToolCount,
 		"tools_only":            toolsOnly,
 		"shape":                 f.aggregateShape(resp),
+		"tail_shape":            kind.String(),
 	})
 
 	f.nonstreamContinued = true
 
-	next, err := f.continueUpstream(ctx, acct, partial)
+	next, err := f.continueUpstream(ctx, acct, partial, kind)
 	if err != nil {
 		return resp
 	}

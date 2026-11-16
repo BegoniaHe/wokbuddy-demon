@@ -19,7 +19,7 @@ func continuationStreams(t *testing.T, first, second string) (*upstream.TextCont
 	t.Helper()
 
 	cont := upstream.NewTextContinueReader(io.NopCloser(strings.NewReader(first)), "", false,
-		func(string) (io.ReadCloser, error) {
+		func(string, upstream.TailKind) (io.ReadCloser, error) {
 			return io.NopCloser(strings.NewReader(second)), nil
 		})
 
