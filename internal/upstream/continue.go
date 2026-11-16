@@ -1,10 +1,12 @@
 // continue.go 截断续写：上游以 finish_reason=length 结束且已产生正文时，自动用
-// 同账号同模型发起一次续写，把后续正文拼接到同一 SSE 流里。
+// 同账号同模型发起一次续写，把后续正文拼接到同一 SSE 流里；正文停在预告句 /
+// 承诺句上（issue #495 / #570）时也走同一条续写路径，续写指令按尾部形态选择。
 //
-// 约束（issue #247）：
+// 约束（issue #247 / #570）：
 //   - 只续写正文；工具调用（尤其是参数未闭合）不盲重试；
 //   - 续写请求由调用方经 ChatStreamContext → prepareBody 发起（本文件只负责判定与拼接）；
-//   - 次数上限 1 次；续写失败时把首段的 length 原样交给客户端；
+//   - 次数上限：预告句 / 承诺句 2 次，结构未闭合与 length 截断 1 次；
+//   - 续写失败时把首段的终态原样交给客户端；
 //   - 续写帧复用首段的 id/model，客户端看到的是同一条流。
 package upstream
 
@@ -22,8 +24,40 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 )
 
-// ContinueOpener 发起一次续写请求；partial 是已输出的正文。
-type ContinueOpener func(partial string) (io.ReadCloser, error)
+// TailKind 续写触发时正文尾部的形态（由调用方探针判定，见 server 侧 classifyTail）。
+// 形态决定续写的上限与追加的续写指令；TailNone 表示不是尾部触发的续写（length 截断）。
+type TailKind int
+
+const (
+	// TailNone 非尾部触发（length 截断 / 长文 stop）。
+	TailNone TailKind = iota
+	// TailPunctuated 标点型悬停：停在冒号/逗号/顿号/破折号/省略号/左括号上（排版习惯）。
+	TailPunctuated
+	// TailPromise 无标点悬停：承诺句 / 工具轮意图句被掐断，与正文长度无关。
+	TailPromise
+	// TailStructural 结构未闭合：未闭合代码块或截断的调用标记。
+	TailStructural
+)
+
+// String 形态的日志标签。
+func (k TailKind) String() string {
+	switch k {
+	case TailPunctuated:
+		return "punctuated"
+	case TailPromise:
+		return "promise"
+	case TailStructural:
+		return "structural"
+	case TailNone:
+		return "none"
+	}
+
+	return "none"
+}
+
+// ContinueOpener 发起一次续写请求；partial 是已输出的正文，kind 是触发形态
+// （决定续写指令文案，见 continuationInstructionFor）。
+type ContinueOpener func(partial string, kind TailKind) (io.ReadCloser, error)
 
 // TextContinueReader 在检测到 finish_reason=length + 正文后切换到续写流。
 type TextContinueReader struct {
@@ -45,7 +79,9 @@ type TextContinueReader struct {
 	// stopMinChars stop 触发续写所需的已输出字符数（长文口径的短答门槛）。
 	stopMinChars int
 	// stopTail 尾部探针：非 nil 时 stop 是否可续写由它判定（预告句 / 工具轮，#495）。
-	stopTail func(string) bool
+	stopTail func(string) TailKind
+	// stopKind 本次 stop 触发时的尾部形态（由探针给出）。
+	stopKind TailKind
 	// stopByTail 本次 stop 是尾部探针授权的：跳过 stopMinChars 的字符门槛。
 	stopByTail bool
 	// toolsOnly 工具轮续写：只采纳续写段的 tool_calls，丢弃正文。
@@ -54,11 +90,12 @@ type TextContinueReader struct {
 	continuationToolsOnly bool
 	// continuationHasTool 续写段是否已带回工具调用。
 	continuationHasTool bool
-	// onContinue 真正发起续写时的诊断回调（收到已输出正文的尾部片段）。
-	onContinue func(tail string)
+	// onContinue 真正发起续写时的诊断回调（收到已输出正文的尾部片段与触发形态）。
+	onContinue func(tail string, kind TailKind)
 	// finishStop 本次终态是 stop（且已开启 stopTriggers）：与 finishLength 同处置。
-	finishStop    bool
-	continueTried bool
+	finishStop bool
+	// continueTries 本请求已发起的续写次数（上限见 tryContinue）。
+	continueTries int
 	continued     bool
 	continuation  bool
 	// streamGen 每次切换底层流（续写）+1：Read 用它判断「本行处理期间流已换」，
@@ -126,12 +163,12 @@ func (c *TextContinueReader) ContinueOnStop(minChars int) *TextContinueReader {
 	return c
 }
 
-// ContinueOnStopTail 让「正文停在预告句」的 stop 触发一次续写（issue #495）。
-// tail 判据作用于已输出正文；toolsOnly 为真表示本轮声明了工具——只采纳续写段里
-// 的 tool_calls，丢弃续写正文（工具轮「说一句就停」的补救）。onTrigger 在真正
-// 发起续写时收到已输出正文的尾部片段，供调用方落诊断日志（可能为 nil）。
+// ContinueOnStopTail 让「正文停在预告句 / 承诺句」的 stop 触发续写（issue #495 / #570）。
+// tail 探针作用于已输出正文并返回尾部形态；toolsOnly 为真表示本轮声明了工具——只采纳
+// 续写段里的 tool_calls，丢弃续写正文（工具轮「说一句就停」的补救）。onTrigger 在真正
+// 发起续写时收到已输出正文的尾部片段与形态，供调用方落诊断日志（可能为 nil）。
 func (c *TextContinueReader) ContinueOnStopTail(
-	tail func(string) bool, toolsOnly bool, onTrigger func(tail string),
+	tail func(string) TailKind, toolsOnly bool, onTrigger func(tail string, kind TailKind),
 ) *TextContinueReader {
 	if c != nil {
 		c.stopTriggers = true
@@ -261,7 +298,7 @@ func (c *TextContinueReader) handleLine(line string) {
 // handleDone 处理 [DONE]：首段因 length 截断且尚未续写时，先换流续写并吞掉本行；
 // 否则原行透传。
 func (c *TextContinueReader) handleDone(line string) {
-	if c.continueTriggered() && !c.continued && c.tryContinue() {
+	if c.continueTriggered() && c.tryContinue() {
 		return
 	}
 
@@ -274,8 +311,6 @@ func (c *TextContinueReader) handleDone(line string) {
 }
 
 // handleFrame 处理 JSON 帧：错误帧原样重编码，正常帧按是否需要改写决定透传方式。
-//
-//nolint:cyclop,gocyclo // 帧分派按优先级线性展开（错误帧 → 终态暂存 → 工具轮过滤 → 透传）。
 func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 	c.captureMeta(frame)
 
@@ -293,7 +328,7 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 
 	c.inspectFrame(frame)
 
-	if c.continueTriggered() && !c.continued {
+	if c.continueTriggered() {
 		c.holdLengthFrame(line, frame)
 
 		return
@@ -458,6 +493,9 @@ func stripFinishReason(frame map[string]any) map[string]any {
 // 原帧的值——length 仍是 length，stop 仍是 stop。
 func finishOnlyFrameLine(frame map[string]any) []byte {
 	out, _ := deepCopyMap(frame)
+	// 终态帧的 usage 已由 holdLengthFrame 单独写出（并已按续写口径合并）；暂存副本
+	// 不能再带 usage，否则补发时会用首段原值覆盖续写段的合并值（多段用量回退）。
+	delete(out, "usage")
 	choices, _ := out["choices"].([]any)
 
 	for _, raw := range choices {
@@ -531,21 +569,23 @@ func (c *TextContinueReader) inspectFrame(frame map[string]any) {
 		}
 	}, c.inspectDelta)
 
-	if !sawStop || !c.stopTriggers || c.continued {
+	if !sawStop || !c.stopTriggers {
 		return
 	}
 
-	// 给了尾部探针就按它判（预告句 / 工具轮，#495）；否则沿用长文口径——stop 一律
-	// 可续写，短答由 tryContinue 的字符门槛挡掉（#494）。
+	// 给了尾部探针就按它判（预告句 / 承诺句 / 工具轮，#495 / #570）；否则沿用长文
+	// 口径——stop 一律可续写，短答由 tryContinue 的字符门槛挡掉（#494）。
+	// 续写段再次停在预告句上同样走这里：救援次数由 tryContinue 的上限控制。
 	if c.stopTail == nil {
 		c.finishStop = true
 
 		return
 	}
 
-	if c.stopTail(c.text.String()) {
+	if kind := c.stopTail(c.text.String()); kind != TailNone {
 		c.finishStop = true
 		c.stopByTail = true
+		c.stopKind = kind
 
 		return
 	}
@@ -660,7 +700,7 @@ func (c *TextContinueReader) continueTriggered() bool {
 
 // handleEOF 流结束：有暂存终态时尝试续写；否则收尾。
 func (c *TextContinueReader) handleEOF() {
-	if c.continueTriggered() && !c.continued {
+	if c.continueTriggered() {
 		if c.tryContinue() {
 			return
 		}
@@ -679,35 +719,60 @@ func (c *TextContinueReader) handleEOF() {
 	c.done = true
 }
 
-// tryContinue 发起一次续写。成功则切换 reader；失败则补发暂存的 length 帧。
-//
-//nolint:cyclop,gocyclo // 续写前置条件线性校验（只做一次 → 无工具 → 正文非空 → 门槛）。
-func (c *TextContinueReader) tryContinue() bool {
-	// 只尝试一次：失败后 held 里的 length 终态已经补发，若在 EOF 处再试会把
-	// 续写帧写到已经发出的 [DONE] 之后，并重复打上游。工具调用不盲重试：参数
-	// 分片可能未闭合，续写会拼出半截参数。
-	if c.continueTried {
-		return false
-	}
+// 每个请求的续写次数上限。
+const (
+	// narrationMaxRescues 预告句 / 承诺句最多救几次。2 而不是 1：长正文的模型常连写
+	// 两段预告（「我先说明结论，然后我将开始修改…」，再停一次），只给一次机会时第二
+	// 段又原样回到客户端。上限仍在，避免「反复预告」把请求拖成无限续写。
+	narrationMaxRescues = 2
+	// singleShotRescues 结构未闭合与 length 截断只补一次：残缺标记留在已输出前缀里，
+	// 追加正文补不完它，再救只是白花一次上游调用。
+	singleShotRescues = 1
+)
 
-	c.continueTried = true
-
+// continueAllowed 报告本次是否还允许发起续写：上限按形态分开——预告句 / 承诺句给
+// 两次；结构未闭合（残缺标记补不完）与 length 截断仍只补一次。次数在真正发起前
+// 累加，失败也算用过，避免重复打上游。
+func (c *TextContinueReader) continueAllowed() bool {
 	if c.hasTool || c.open == nil || c.text.Len() == 0 {
-		c.flushHeld()
-
 		return false
 	}
 
 	// 只因 stop 触发时（非 length 截断）还要求已输出成篇内容：短答是正常收尾。
-	// 尾部探针授权的 stop（预告句 / 工具轮）不受该门槛约束。
+	// 尾部探针授权的 stop（预告句 / 承诺句 / 工具轮）不受该门槛约束。
 	if c.finishStop && !c.finishLength && !c.stopByTail &&
 		utf8.RuneCountInString(c.text.String()) < c.stopMinChars {
+		return false
+	}
+
+	return c.continueTries < c.continueLimit()
+}
+
+// continueLimit 本次续写的次数上限：预告句 / 承诺句两次；结构未闭合与 length 截断一次。
+func (c *TextContinueReader) continueLimit() int {
+	if c.stopByTail && (c.stopKind == TailPunctuated || c.stopKind == TailPromise) {
+		return narrationMaxRescues
+	}
+
+	return singleShotRescues
+}
+
+// tryContinue 发起一次续写。成功则切换 reader；失败则补发暂存的终态帧。
+func (c *TextContinueReader) tryContinue() bool {
+	if !c.continueAllowed() {
 		c.flushHeld()
 
 		return false
 	}
 
-	next, err := c.open(c.text.String())
+	kind := TailNone
+	if c.stopByTail {
+		kind = c.stopKind
+	}
+
+	c.continueTries++
+
+	next, err := c.open(c.text.String(), kind)
 	if err != nil || next == nil {
 		c.flushHeld()
 
@@ -727,12 +792,13 @@ func (c *TextContinueReader) tryContinue() bool {
 	c.continuationToolsOnly = c.toolsOnly && c.stopByTail
 
 	if c.onContinue != nil {
-		c.onContinue(tailSnippet(c.text.String(), continuationTailLogChars))
+		c.onContinue(tailSnippet(c.text.String(), continuationTailLogChars), kind)
 	}
 
 	c.finishLength = false
 	c.finishStop = false
 	c.stopByTail = false
+	c.stopKind = TailNone
 
 	// 工具轮保留首段终态作为「续写没带回调用」时的兜底，其余情况丢弃。
 	if !c.continuationToolsOnly {
@@ -832,7 +898,35 @@ func recomputeMergedUsageTotal(usageMap map[string]any) {
 const continuationInstruction = "Continue the previous response from exactly where it stopped. " +
 	"Do not repeat any text already produced. Do not add commentary."
 
-func BuildContinuationBody(src []byte, partial string) []byte {
+// narrationNudge 尾部停在标点型悬停（冒号/逗号/未闭合代码块）时的续写指令。
+// 必须点明「你停在预告上」：否则模型会以为任务已完成而重复一遍结论。
+const narrationNudge = "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，" +
+	"剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，" +
+	"不要重复已经写过的内容，不要重新开头，不要道歉或解释。"
+
+// narrationPromiseNudge 尾部是「我将…/我会…」这类承诺句时的续写指令。
+// 不能复用 narrationNudge：那条说「停在冒号上」，承诺句既没有冒号也不是预告排版，
+// 模型会反过来争辩「上一条并未中断」，争论也会一并写进客户端正文。
+const narrationPromiseNudge = "你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，" +
+	"承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，" +
+	"不要解释为什么停下，不要重复已经写过的内容，不要重新开头。"
+
+// continuationInstructionFor 按触发形态选续写指令：承诺句用专门的文案，其余沿用
+// 通用「从断点接着写」。
+func continuationInstructionFor(kind TailKind) string {
+	switch kind {
+	case TailPunctuated:
+		return narrationNudge
+	case TailPromise:
+		return narrationPromiseNudge
+	case TailNone, TailStructural:
+	}
+
+	return continuationInstruction
+}
+
+// BuildContinuationBody 在原始请求体后追加 assistant 部分正文与按形态选定的续写指令。
+func BuildContinuationBody(src []byte, partial string, kind TailKind) []byte {
 	obj, err := decodeObjectRawNumbers(src)
 	if err != nil || obj == nil {
 		return src
@@ -841,7 +935,7 @@ func BuildContinuationBody(src []byte, partial string) []byte {
 	msgs, _ := obj["messages"].([]any)
 	msgs = append(msgs,
 		map[string]any{"role": "assistant", "content": partial},
-		map[string]any{"role": "user", "content": continuationInstruction},
+		map[string]any{"role": "user", "content": continuationInstructionFor(kind)},
 	)
 	obj["messages"] = msgs
 

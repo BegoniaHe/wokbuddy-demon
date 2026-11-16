@@ -96,7 +96,7 @@ func TestTextContinueReaderSplicesLength(t *testing.T) {
 
 	var partial string
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(p string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(p string, _ TailKind) (io.ReadCloser, error) {
 		partial = p
 		return closeString{strings.NewReader(second)}, nil
 	})
@@ -263,7 +263,7 @@ func TestTextContinueReaderToolNotRetried(t *testing.T) {
 
 	called := false
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		called = true
 
 		return closeString{strings.NewReader("")}, nil
@@ -294,7 +294,7 @@ func TestTextContinueReaderContinueFailureAttemptedOnce(t *testing.T) {
 
 	calls := 0
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		calls++
 
 		return nil, io.ErrUnexpectedEOF
@@ -331,7 +331,7 @@ func TestTextContinueReaderContinuesWhenDoneHasNoNewline(t *testing.T) {
 
 	calls := 0
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		calls++
 
 		return closeString{strings.NewReader(second)}, nil
@@ -365,7 +365,7 @@ func TestTextContinueReaderPreservesLengthWithSeparateUsage(t *testing.T) {
 		`data: {"id":"a","model":"m","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}` + "\n\n" +
 		"data: [DONE]\n\n"
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		return nil, io.ErrUnexpectedEOF
 	})
 
@@ -395,10 +395,10 @@ func TestTextContinueReaderKeepsStopInUsageFrame(t *testing.T) {
 		`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25}}` + "\n\n" +
 		"data: [DONE]\n\n"
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		return closeString{strings.NewReader(second)}, nil
 	})
-	r.ContinueOnStopTail(func(string) bool { return true }, true, nil)
+	r.ContinueOnStopTail(func(string) TailKind { return TailPunctuated }, true, nil)
 
 	out, err := io.ReadAll(r)
 	if err != nil {
@@ -424,10 +424,10 @@ func TestTextContinueReaderRestoresStopWhenContinueFails(t *testing.T) {
 		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}` + "\n\n" +
 		"data: [DONE]\n\n"
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		return nil, io.ErrUnexpectedEOF
 	})
-	r.ContinueOnStopTail(func(string) bool { return true }, false, nil)
+	r.ContinueOnStopTail(func(string) TailKind { return TailPunctuated }, false, nil)
 
 	out, err := io.ReadAll(r)
 	if err != nil {
@@ -454,7 +454,7 @@ func TestTextContinueReaderMergesFirstUsage(t *testing.T) {
 	second := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":4,"total_tokens":24,"credit":2,"prompt_tokens_details":{"cached_tokens":5}}}` + "\n\n" +
 		"data: [DONE]\n\n"
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		return closeString{strings.NewReader(second)}, nil
 	})
 
@@ -488,7 +488,7 @@ func TestTextContinueReaderKeepsLastUsageWithoutPrompt(t *testing.T) {
 	second := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"completion_tokens":4,"total_tokens":9,"credit":2}}` + "\n\n" +
 		"data: [DONE]\n\n"
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		return closeString{strings.NewReader(second)}, nil
 	})
 
@@ -525,7 +525,7 @@ func TestTextContinueReaderNullFrame(t *testing.T) {
 		`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
 		"data: [DONE]\n\n"
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string) (io.ReadCloser, error) {
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false, func(string, TailKind) (io.ReadCloser, error) {
 		return closeString{strings.NewReader(second)}, nil
 	})
 
