@@ -14,38 +14,39 @@ upstream:
   branch: main
 
 last_audited:
-  commit: c4b53cd8024e38aa59fe1914691269776c757d2c
-  audited_at_utc: 2026-11-16T11:31:16Z
+  commit: 27b7458f7251942066f912c5677a0f9bc0c3ebdd
+  audited_at_utc: 2026-11-17T08:54:00Z
   sync_method: audit
   official_baseline:
     cn: 5.11.3.43806934-ecace0f7 (commit ecace0f7028166695994300182295329b8b95449)
-    global: 5.9.4.42593613-fa0a0901 (commit fa0a0901906addaa1a4259f6df347388a5563ded)
+    global: 5.11.4.44121853-0026dff0 (commit 0026dff06ce8414140e6f2fa731049855c3ecc6f)
   reviewed_window:
-    from: 2026-11-14
-    to: 2026-11-16
-    non_merge_commits: 14
-    merge_commits: 4
+    from: 2026-11-16
+    to: 2026-11-17
+    non_merge_commits: 3
+    merge_commits: 0
   dispositions:
-    issue: 6
-    revisit: 1
-    skip: 11
+    issue: 2
+    revisit: 0
+    skip: 1
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/569
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/570
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/571
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/577
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/578
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/579
   note: >-
-    2026-11-16 续审 7dcae8ed..c4b53cd8（14 条非 merge、4 条 merge，共 18 项；窗口
-    2026-11-14..16）。官方 Win32 版本未变（cn 5.11.3.43806934-ecace0f7 /
-    global 5.9.4.42593613-fa0a0901），重跑 download_latest --dry-run 与 protocol_sweep
-    复核，两包解包目录与基线一致。6 项 issue（3 单）、1 项 revisit、11 项 skip。
-    新开单：#569 模型规则（按账号批量挂模型黑白名单 + 全池被挡回 400 model_not_allowed，
-    覆盖 8519ea26 / 74456c87）；#570 续写救援闸门对齐（无标点悬停不救、工具轮只看尾部
-    标点、缺「等用户回话」否决、救援上限只有一次，覆盖 89cdfe71 / bd595648 / 09189a53）；
-    #571 /status 积分语义分离（禁用号 credits 报冻结快照，面板合计把死钱算进可用额度，
-    覆盖 eca5f30b）。revisit 只有 0a2a55fb（默认+mp 任务列表合并）：上游两列表的包含
-    关系属参考侧线上实测，官方静态包无法证明，本仓也未实测。11 项 skip 分三类：① 纯
-    merge 与 merge 封装（982deea1 / 97ed35e5 / 1f07c661 / 35e1a27e）；② 参考侧测试与
-    CI 基建（1166967d / 452643bb / e069e65c）；③ 形态不存在或架构不同（d2708ca6 无
-    deepseek-harness 兼容层、c4b53cd8 的 /v1/videos 别名本仓无而 /v1/videos/generations
-    已在 tracedPath、f5d08c04 面板 tooltip 属 React 技术栈、2fa6876e 版本字面量本仓由
-    部署 profile 提供）。本轮不改实现；游标推进是独立的 chore(sync) 元数据提交。
+    2026-11-17 续审 c4b53cd8..27b7458f（3 条非 merge、0 条 merge；窗口 2026-11-16..17）。
+    **global 基线跳版**：5.9.4.42593613-fa0a0901 → 5.11.4.44121853-0026dff0（commit
+    0026dff0），cn 未变 5.11.3.43806934-ecace0f7；重跑 download_latest --dry-run /
+    download_latest / 新 global 包解包（7z → app-64.7z → extract_asar）/ protocol_sweep。
+    2 项 issue（2 单）、1 项 skip。新开单：#577 工具结果早于调用的倒置未重排（出站撞
+    11148 tool_call_sequence_broken，官方 \"errorCode.11148\":Incomplete tool call
+    records. Start a new task + actions:[switchModel]），覆盖 27b7458f；#578 续写/救援换段
+    等待期无 SSE 心跳（缺省 keepalive_interval=0，十万级 prompt prefill 3~30s 静默，
+    客户端 idle 超时断流），覆盖 06a401ed。skip 只有 38dca39c（面板实时任务卡，参考侧
+    面板技术栈）。基线跳版另开 #579：global 5.11.4 包内已带与 cn 5.11.3 逐字相同的
+    main/client-identity.js 与 main/device-token.js（2394 B / 428 B 两包一致），本仓
+    headers.go:304-307 仍对 global 跳过 X-Device-Token 与 X-Client-* 头族。global
+    5.9.4→5.11.4 的端点/头族漂移已由 protocol_sweep --compare 粗扫（新增 geoblock /
+    tunnels / relay-key / buddyone 等运营面；auth/token/refresh 形态沿用
+    /v2/plugin/auth/token/refresh 未变），逐表面指纹重对齐仍属独立议题。本轮不改实现；
+    游标推进是独立的 chore(sync) 元数据提交。
