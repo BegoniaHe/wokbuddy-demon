@@ -3327,6 +3327,10 @@ func (f *chatFlow) handleStreamSuccess(
 			})
 
 		stream = cont
+		// 换段等待期补 SSE 注释帧（#578）：换段是全新上游 POST，大 prompt 的 prefill
+		// 常 3~15s，缺省部署（keepalive_interval=0）下这段时间零字节会被客户端 idle
+		// 超时断流。间隔沿用首帧等待期口径（ttfb_keepalive_interval，缺省 1500ms）。
+		cont.ContinueKeepalive(f.h.cfg.TTFBKeepaliveInterval)
 		// 惰性 defer：Release 自带 nil 判定，normal 路径与提前返回路径都不会漏还。
 		defer cont.Release()
 	}

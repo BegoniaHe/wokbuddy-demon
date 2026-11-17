@@ -19,6 +19,8 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
@@ -101,9 +103,18 @@ type TextContinueReader struct {
 	// streamGen 每次切换底层流（续写）+1：Read 用它判断「本行处理期间流已换」，
 	// 而不是比较 reader 指针——切换实现为同一条 bufio Reset，指针不变。
 	streamGen uint64
-	done      bool
-	released  bool
-	err       error
+	// keepalive 换段等待期的 SSE 注释帧间隔（见 ContinueKeepalive）；0 = 不补帧。
+	keepalive time.Duration
+	// wait 在途换段请求：open 在 goroutine 里发起，Read 在等待期补心跳。
+	// Close 可能来自另一 goroutine（客户端断开），故用原子指针交换而不是普通字段。
+	wait atomic.Pointer[continueWait]
+	// doneLine [DONE] 触发换段时暂存该行：换段失败要按同步失败口径补发。
+	doneLine string
+	// closed Close 已调用：不再发起新的换段请求（客户端已断开，发起只会白打上游）。
+	closed   atomic.Bool
+	done     bool
+	released bool
+	err      error
 }
 
 // continueReaderPool 续写层 64KB 行缓冲的复用池。
@@ -185,6 +196,17 @@ func (c *TextContinueReader) Continued() bool {
 	return c != nil && c.continued
 }
 
+// ContinueKeepalive 让换段等待期按 d 的间隔写 SSE 注释帧（#578）：换段是全新上游
+// POST，大 prompt 的 prefill 常 3~15s、慢时 30s+，缺省部署又没有入站 keepalive，
+// 这段时间客户端零字节会被 idle 超时断流。d <= 0 关闭（退回旧的静默等待）。
+func (c *TextContinueReader) ContinueKeepalive(d time.Duration) *TextContinueReader {
+	if c != nil {
+		c.keepalive = d
+	}
+
+	return c
+}
+
 // ContinuationToolCall 报告续写段是否带回工具调用（工具轮诊断用）。
 func (c *TextContinueReader) ContinuationToolCall() bool {
 	return c != nil && c.continuationHasTool
@@ -205,6 +227,9 @@ func (c *TextContinueReader) Release() {
 
 // Read 实现 io.Reader：优先返回内部缓冲，行级解析并改写终态。
 //
+// 换段请求在途时（c.wait）不阻塞等上游：按 keepalive 间隔先返回注释帧，字节到客户端
+// 后才继续等，覆盖缺省部署下换段期间的静默窗口（#578）。
+//
 //nolint:wrapcheck // io.Reader 实现直接返回底层错误。
 func (c *TextContinueReader) Read(dst []byte) (int, error) {
 	for c.out.Len() == 0 {
@@ -214,6 +239,12 @@ func (c *TextContinueReader) Read(dst []byte) (int, error) {
 			}
 
 			return 0, io.EOF
+		}
+
+		if c.wait.Load() != nil {
+			c.pumpContinue()
+
+			continue
 		}
 
 		genBefore := c.streamGen
@@ -250,6 +281,12 @@ func (c *TextContinueReader) afterReadError(genBefore uint64, err error) bool {
 		return false
 	}
 
+	// 换段请求在途（[DONE] 触发的异步续写）：旧流读到哪结束都不再影响状态，
+	// 等 pumpContinue 拿结果即可——这里再走 handleEOF 会把在途换段当成失败收尾。
+	if c.wait.Load() != nil {
+		return false
+	}
+
 	c.handleEOF()
 
 	if !errors.Is(err, io.EOF) {
@@ -259,8 +296,15 @@ func (c *TextContinueReader) afterReadError(genBefore uint64, err error) bool {
 	return true
 }
 
-// Close 关闭当前上游流。
+// Close 关闭当前上游流。在途换段请求不会被同步等待：发起方观察到 abandon 关闭后
+// 自行回收迟到的响应体（避免客户端断开时泄漏 fd）。
 func (c *TextContinueReader) Close() error {
+	c.closed.Store(true)
+
+	if wait := c.wait.Load(); wait != nil {
+		wait.abandonWait()
+	}
+
 	if c.src == nil {
 		return nil
 	}
@@ -298,8 +342,14 @@ func (c *TextContinueReader) handleLine(line string) {
 // handleDone 处理 [DONE]：首段因 length 截断且尚未续写时，先换流续写并吞掉本行；
 // 否则原行透传。
 func (c *TextContinueReader) handleDone(line string) {
-	if c.continueTriggered() && c.tryContinue() {
-		return
+	if c.continueTriggered() {
+		// 换段请求在途期间先扣下本行：失败时按同步失败口径补发（见 pumpContinue）。
+		c.doneLine = line
+		if c.tryContinue(false) {
+			return
+		}
+
+		c.doneLine = ""
 	}
 
 	// 工具轮续写没带回任何调用时，首段终态必须补在 [DONE] 之前（#495）。
@@ -706,7 +756,7 @@ func (c *TextContinueReader) continueTriggered() bool {
 // handleEOF 流结束：有暂存终态时尝试续写；否则收尾。
 func (c *TextContinueReader) handleEOF() {
 	if c.continueTriggered() {
-		if c.tryContinue() {
+		if c.tryContinue(true) {
 			return
 		}
 
@@ -762,9 +812,45 @@ func (c *TextContinueReader) continueLimit() int {
 	return singleShotRescues
 }
 
-// tryContinue 发起一次续写。成功则切换 reader；失败则补发暂存的终态帧。
-func (c *TextContinueReader) tryContinue() bool {
-	if !c.continueAllowed() {
+// continueResult 换段请求的结果：src 与 err 互斥（err 非空表示本次换段失败）。
+type continueResult struct {
+	src io.ReadCloser
+	err error
+}
+
+// continueWait 在途换段请求。result 收结果；abandon 由 Read 放弃等待时关闭（发起方
+// 据此回收迟到的响应体）；ticker 在等待期补 SSE 注释帧（nil = 不补）。
+type continueWait struct {
+	result  chan continueResult
+	abandon chan struct{}
+	kind    TailKind
+	// eof 由 handleEOF 发起：失败时按首段终态收尾并结束流（没有 [DONE] 行要补）。
+	eof    bool
+	ticker *time.Ticker
+	// once 保证 abandon 只关闭一次（Close 与读端可能同时放弃）。
+	once sync.Once
+}
+
+// stop 停止心跳定时器（幂等）。
+func (w *continueWait) stop() {
+	if w.ticker != nil {
+		w.ticker.Stop()
+	}
+}
+
+// abandonWait 放弃本次换段（幂等）：发起方据此回收迟到的响应体。
+func (w *continueWait) abandonWait() {
+	w.once.Do(func() { close(w.abandon) })
+	w.stop()
+}
+
+// tryContinue 发起一次续写。返回 true 表示请求已在途，Read 负责等待结果并在等待期
+// 补心跳（见 pumpContinue）；返回 false 表示未发起或已同步失败，暂存终态已补发。
+//
+// 换段是一次全新的上游 POST（大 prompt prefill 常 3~15s，慢时 30s+），不能同步等：
+// 同步实现会让 Read 在这段窗口里不产任何字节，缺省部署下客户端 idle 超时断流（#578）。
+func (c *TextContinueReader) tryContinue(eof bool) bool {
+	if !c.continueAllowed() || c.closed.Load() {
 		c.flushHeld()
 
 		return false
@@ -777,13 +863,125 @@ func (c *TextContinueReader) tryContinue() bool {
 
 	c.continueTries++
 
-	next, err := c.open(c.text.String(), kind)
-	if err != nil || next == nil {
-		c.flushHeld()
-
-		return false
+	wait := &continueWait{
+		result:  make(chan continueResult),
+		abandon: make(chan struct{}),
+		kind:    kind,
+		eof:     eof,
+	}
+	if c.keepalive > 0 {
+		wait.ticker = time.NewTicker(c.keepalive)
 	}
 
+	c.wait.Store(wait)
+
+	partial := c.text.String()
+
+	go func() {
+		next, err := c.open(partial, kind)
+		// Close 已放弃本次换段时由发起方回收响应体：没人会再消费它。
+		select {
+		case wait.result <- continueResult{src: next, err: err}:
+		case <-wait.abandon:
+			if next != nil {
+				_ = next.Close()
+			}
+		}
+	}()
+
+	return true
+}
+
+// pumpContinue 等待在途换段：结果到达则切换新流或按首段终态收尾；未到达则按
+// keepalive 间隔写注释帧，让客户端在换段静默窗口里持续收到字节（#578）。
+func (c *TextContinueReader) pumpContinue() {
+	wait := c.wait.Load()
+	if wait == nil {
+		return
+	}
+
+	var tick <-chan time.Time
+	if wait.ticker != nil {
+		tick = wait.ticker.C
+	}
+
+	select {
+	case <-wait.abandon:
+		c.abandonContinue(wait)
+	case res := <-wait.result:
+		c.resumeContinue(wait, res)
+	case <-tick:
+		// 只写单换行：注释行不得制造事件边界（与 keepaliveIfIdle 同口径）。
+		c.out.WriteString(sseKeepaliveLine)
+	}
+}
+
+// resumeContinue 处理已到达的换段结果：Close 优先，其次切换新流或按首段终态收尾。
+func (c *TextContinueReader) resumeContinue(wait *continueWait, res continueResult) {
+	// Close 与结果同时就绪：select 可能先取到结果，这里补一次放弃判定。
+	select {
+	case <-wait.abandon:
+		if res.src != nil {
+			_ = res.src.Close()
+		}
+
+		c.abandonContinue(wait)
+
+		return
+	default:
+	}
+
+	wait.stop()
+	c.wait.CompareAndSwap(wait, nil)
+
+	if res.err == nil && res.src != nil {
+		c.applyContinue(wait, res.src)
+
+		return
+	}
+
+	c.failContinue(wait, res.src)
+}
+
+// abandonContinue Close 已发生：放弃本次换段，按关闭口径结束 Read。发起方可能正
+// 在往 result 送迟到的响应体，这里清空一次，避免它永久阻塞。
+func (c *TextContinueReader) abandonContinue(wait *continueWait) {
+	wait.stop()
+	c.wait.CompareAndSwap(wait, nil)
+
+	select {
+	case res := <-wait.result:
+		if res.src != nil {
+			_ = res.src.Close()
+		}
+	default:
+	}
+
+	c.err = io.ErrClosedPipe
+	c.done = true
+}
+
+// failContinue 换段失败：按首段终态收尾，不挂住 Read。
+func (c *TextContinueReader) failContinue(wait *continueWait, late io.ReadCloser) {
+	if late != nil {
+		_ = late.Close()
+	}
+
+	c.flushHeld()
+
+	if wait.eof {
+		c.done = true
+
+		return
+	}
+
+	// [DONE] 触发：补回首段终态与 [DONE]，与同步失败路径同口径。
+	c.out.WriteString(c.doneLine)
+	c.doneLine = ""
+}
+
+// applyContinue 换段成功：切换底层流并复位段级状态。
+func (c *TextContinueReader) applyContinue(wait *continueWait, next io.ReadCloser) {
 	_ = c.src.Close()
 	c.src = next
 	// 复用同一条 64KB 行缓冲：老流的残留（被截断的尾巴）本就该丢弃，
@@ -797,7 +995,7 @@ func (c *TextContinueReader) tryContinue() bool {
 	c.continuationToolsOnly = c.toolsOnly && c.stopByTail
 
 	if c.onContinue != nil {
-		c.onContinue(tailSnippet(c.text.String(), continuationTailLogChars), kind)
+		c.onContinue(tailSnippet(c.text.String(), continuationTailLogChars), wait.kind)
 	}
 
 	c.finishLength = false
@@ -809,8 +1007,6 @@ func (c *TextContinueReader) tryContinue() bool {
 	if !c.continuationToolsOnly {
 		c.held = nil
 	}
-
-	return true
 }
 
 // continuationTailLogChars 续写触发日志里尾部片段的字符上限。
