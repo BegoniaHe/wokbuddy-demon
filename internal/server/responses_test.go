@@ -1103,3 +1103,46 @@ func TestResponsesStreamWriterLengthMarksToolIncomplete(t *testing.T) {
 		}
 	}
 }
+
+// TestResponsesEarlyToolOutputReordered 端到端：function_call_output 排在
+// function_call 之前（Codex 经本地代理转 /v1/responses 的形态）时，发往上游的 body
+// 里 assistant(tool_calls) 必须在 tool 之前，否则上游判 11148 顶死整条会话。
+func TestResponsesEarlyToolOutputReordered(t *testing.T) {
+	t.Parallel()
+
+	var seen []string
+
+	up := recordingUpstream(t, []string{sseOK}, &seen)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: p, Upstream: up})
+
+	body := `{"model":"glm-5.2","input":[
+		{"type":"function_call_output","call_id":"call_early","output":"ok"},
+		{"type":"function_call","call_id":"call_early","name":"lookup","arguments":"{}"}
+	]}`
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if len(seen) != 1 {
+		t.Fatalf("upstream calls=%d want 1", len(seen))
+	}
+
+	assistantAt := strings.Index(seen[0], `"role":"assistant"`)
+	toolAt := strings.Index(seen[0], `"role":"tool"`)
+
+	if assistantAt < 0 || toolAt < 0 {
+		t.Fatalf("出站 body 缺少 assistant 或 tool 消息: %s", seen[0])
+	}
+
+	if assistantAt > toolAt {
+		t.Errorf("出站 body 仍是 tool 在 assistant 之前（上游判 11148）: %s", seen[0])
+	}
+
+	if !strings.Contains(seen[0], `"tool_calls"`) {
+		t.Errorf("出站 body 丢失 tool_calls: %s", seen[0])
+	}
+}
