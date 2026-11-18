@@ -340,7 +340,7 @@ func TestChatMidTextYieldMarkerStillRescued(t *testing.T) {
 	}
 }
 
-// markupFixture 把 `||` 替换成标记分隔符（两个全角竖线 U+FF5C）：源码里不写死
+// markupTail 把 `||` 替换成标记分隔符（两个全角竖线 U+FF5C）：源码里不写死
 // 全角字面量，避免编辑器/复制粘贴静默改坏。
 func markupTail(body string) string {
 	return strings.ReplaceAll(body, "||", "\uFF5C\uFF5C")
