@@ -222,11 +222,15 @@ func promiseSentence(text string) bool {
 		return false
 	}
 
-	if gerundSentence(last) {
+	if gerundSentence(last) || narrationPrefix(last) {
 		return true
 	}
 
 	low := strings.ToLower(last)
+	if englishGerundNarration(low) {
+		return true
+	}
+
 	// 「我来看一下这段代码」是观察性叙述，不是承诺动手。先把反向措辞从匹配窗口里剔除：
 	// 同一句里若还有真承诺词（「对我来说简单，我将开始修改」）仍按承诺句处理。
 	for _, negative := range promiseNegatives {
@@ -247,15 +251,53 @@ func promiseSentence(text string) bool {
 // 不收「下面」「接着」这类泛词：「下面这些文件都已改好。」是典型收尾。同样不收
 // 「接下来」「下一步」：它们常用来对用户说话（「接下来你可以运行 npm test」），
 // 长正文里认它们会把写完的回答再续写一段，白付一次整段上下文（issue #592）。
+//
+// 也不收裸的 `i'm` / `正在`：`i'm` 会命中「I'm sorry, but…」「I'm not able to…」这类
+// 收尾，`正在` 会命中「文件正在被占用」这类状态描述。两者的旁白形态改由
+// narrationPrefix / englishGerundNarration 判定（issue #592 审查）。
 var promiseMarkers = []string{
 	"我将", "我会", "我来", "我继续", "我需要", "我得", "我打算", "我开始", "我再",
 	"我接着", "我还要", "我马上", "我这就", "我们接着", "接下来开始", "现在开始",
-	"现在修复", "再检查", "正在",
-	"let me", "let's", "let us", "i will", "i'll", "i'm", "i need to", "i should",
+	"现在修复", "再检查",
+	"let me", "let's", "let us", "i will", "i'll", "i need to", "i should",
+	"i'm going to", "i'm about to", "i am going to", "i am about to",
 }
 
 // promiseNegatives 出现在末句里说明这句话是观察或议论而非承诺（issue #592）。
-var promiseNegatives = []string{"我来看", "对我来说", "对我们来说"}
+//
+// 「正在被」是被动状态描述（「文件正在被占用」），不是模型自述正在动手。
+var promiseNegatives = []string{"我来看", "对我来说", "对我们来说", "正在被"}
+
+// narrationPrefix 报告末句是否是中文自述旁白的开头（「正在修改 foo.go」「我正在核对
+// 第二处」）：模型常用「正在做…」代替动手。只认句首或紧跟「我 / 我们」的形态，
+// 「缓存正在失效」「文件正在被占用」这类状态描述不算（issue #592）。
+func narrationPrefix(last string) bool {
+	if strings.HasPrefix(last, "正在") {
+		return true
+	}
+
+	return strings.Contains(last, "我正在") || strings.Contains(last, "我们正在")
+}
+
+// englishGerundNarration 报告末句是否是「i'm / i am + 现在分词」的英文旁白
+// （「I'm updating the config」）：只有现在分词才算「正在做」，形容词 / 副词收尾
+// （「I'm sorry」「I'm not able to」）不算（issue #592）。
+func englishGerundNarration(low string) bool {
+	for _, subject := range englishGerundSubjects {
+		if _, after, found := strings.Cut(low, subject); found {
+			word, _, _ := strings.Cut(strings.TrimLeft(after, " \t"), " ")
+
+			if isGerundWord(word) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// englishGerundSubjects 「i'm / i am + 现在分词」旁白的英文主语形态（已小写）。
+var englishGerundSubjects = []string{"i'm ", "i am "}
 
 // gerundSentence 报告末句是否以现在分词开头的英文旁白（「Reading foo.go」「Updating
 // the config」）：模型用「正在做…」代替动手，与本仓中文词表同类。
@@ -268,6 +310,12 @@ func gerundSentence(last string) bool {
 		return false
 	}
 
+	return isGerundWord(word)
+}
+
+// isGerundWord 报告单个词是否是现在分词（以 -ing 结尾的纯字母词，且不在非分词词表里）。
+// 门槛 6 个字母：更短的 -ing 结尾词（bring / thing / sting）几乎都是名词或非分词。
+func isGerundWord(word string) bool {
 	low := strings.ToLower(word)
 	if len(low) < 6 || !strings.HasSuffix(low, "ing") {
 		return false

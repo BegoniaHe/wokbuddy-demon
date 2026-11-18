@@ -59,9 +59,11 @@ func TestPromiseMarkers(t *testing.T) {
 		"现在修复参数名",
 		"再检查一遍缓存键",
 		"正在修改 foo.go",
+		"我正在核对第二处",
 		"Let me check the logs",
 		"Let's fix it",
 		"I'm updating the config",
+		"I'm going to patch it",
 		"I need to read foo.go",
 		"I should update the docs",
 		"Next I will check the logs",
@@ -95,6 +97,12 @@ func TestPromiseMarkers(t *testing.T) {
 		// 带冒号的标题不是现在分词旁白。
 		"Testing: all 42 cases passed",
 		"Nothing else to add.",
+		// 裸的 `i'm` 会命中这类收尾：只有现在分词形态才算「正在做」（审查项）。
+		"I'm sorry, but the tool timed out",
+		"I'm not able to do that",
+		// 「正在」出现在状态描述里不是自述动手（审查项）。
+		"文件正在被占用，请稍后重试",
+		"缓存正在失效，请勿重启",
 	}
 
 	for _, text := range negatives {
