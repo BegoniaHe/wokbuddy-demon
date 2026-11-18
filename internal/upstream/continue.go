@@ -96,6 +96,10 @@ type TextContinueReader struct {
 	finishStop bool
 	// continueTries 本请求已发起的续写次数（上限见 tryContinue）。
 	continueTries int
+	// rescueTextLen 上一次发起续写时的正文长度（字节）：续写段一字未写时不再发起
+	// 下一次（issue #585）。同样的前缀 + 同样的指令几乎必然得到同样的空结果，第二次
+	// 请求只是把整段上下文再付一次上游调用。
+	rescueTextLen int
 	continued     bool
 	continuation  bool
 	// streamGen 每次切换底层流（续写）+1：Read 用它判断「本行处理期间流已换」，
@@ -750,6 +754,12 @@ func (c *TextContinueReader) continueAllowed() bool {
 		return false
 	}
 
+	// 一次都没救过时 rescueTextLen 尚未赋值，按「有进展」处理；救过则要求续写段确实
+	// 写出了新正文（哪怕又停在承诺句上）。
+	if c.continueTries > 0 && c.text.Len() == c.rescueTextLen {
+		return false
+	}
+
 	return c.continueTries < c.continueLimit()
 }
 
@@ -776,6 +786,7 @@ func (c *TextContinueReader) tryContinue() bool {
 	}
 
 	c.continueTries++
+	c.rescueTextLen = c.text.Len()
 
 	next, err := c.open(c.text.String(), kind)
 	if err != nil || next == nil {

@@ -428,6 +428,47 @@ func TestTextContinueReaderMergesUsageAcrossRescues(t *testing.T) {
 	}
 }
 
+// TestTextContinueReaderStopsWhenRescueWroteNothing 续写段一字未写时不再发起第二次
+// （issue #585）：同样的前缀 + 同样的指令几乎必然得到同样的空结果，第二次请求只是把
+// 整段上下文再付一次上游调用。
+func TestTextContinueReaderStopsWhenRescueWroteNothing(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"我将开始修改 foo.go"}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	// 续写段只有 stop，没有任何正文。
+	empty := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	calls := 0
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false,
+		func(string, TailKind) (io.ReadCloser, error) {
+			calls++
+
+			return closeString{strings.NewReader(empty)}, nil
+		})
+	r.ContinueOnStopTail(func(string) TailKind { return TailPromise }, false, nil)
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("续写次数=%d want 1（续写段零正文，不再发起第二次）", calls)
+	}
+
+	if got := strings.Count(string(out), `"finish_reason":"stop"`); got != 1 {
+		t.Fatalf("终态数=%d want 1: %s", got, out)
+	}
+
+	if got := strings.Count(string(out), "[DONE]"); got != 1 {
+		t.Fatalf("[DONE] 数=%d want 1: %s", got, out)
+	}
+}
+
 // TestTextContinueReaderKeepsStopInUsageFrame 上游把 stop 与 usage 放同一帧：工具轮
 // 续写没带回调用时，首段 stop 必须补发（#495），否则整条响应没有任何 finish_reason。
 func TestTextContinueReaderKeepsStopInUsageFrame(t *testing.T) {
