@@ -31,7 +31,8 @@ import (
 //
 // 判定次序：11133/11135 上游业务码**先于** Kind 表——实测这两族归 ErrClient/
 // ErrBadParams 皆有可能（Classify 词表不含 11133），hint 层自带判定（hint 是补充
-// 说明非权威分类，误判代价只是多一条中性补充说明）；其余走 Kind 一对一映射。
+// 说明非权威分类，误判代价只是多一条中性补充说明）；工具定义拒收（11129/11152）
+// 按业务码 + 请求是否声明 tools 判定，同样先于 Kind 表；其余走 Kind 一对一映射。
 func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	// 11133 model_param_invalid 家族（图片回归实测：不支持图片的模型传图，或任意
 	// 参数被模型供应商拒绝）。只有请求确实带图、且目录能对该模型做出「不支持图片」
@@ -54,6 +55,13 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	// 11135 invalid_image_data 家族（图片数据无效，Discussion #77 实测形态）。
 	if isInvalidImageData(msg) {
 		return "image data rejected by upstream; use a real/valid image, may need a new conversation"
+	}
+	// 11129 / 11152：工具定义侧的请求级拒收（不罚号、不轮转），但客户端只看得到
+	// 「工具定义不合规 / 工具名称不规范」——指出要改哪儿。只在请求确实声明了 tools
+	// 时给：11101 等请求体畸形、messages 缺空都不该被指去翻自己的 schema。
+	if isToolDefinitionRejection(msg, ctx.HasTools) {
+		return "tool definitions were rejected by upstream (tool definition validation, " +
+			"not request body syntax); check tools[].function.name and tools[].function.parameters"
 	}
 	// 其余走 Kind 一对一映射；未覆盖形态（ErrNone/ErrNotFound/ErrServer/
 	// ErrBadParams/ErrClient 等）无 hint。
@@ -245,6 +253,36 @@ func isToolSchemaRejection(body string, hasTools bool) bool {
 	}
 
 	return hasTools && containsAnyLower(strings.ToLower(body), toolSchemaRejectMarkers)
+}
+
+// isToolDefinitionRejection 报告 body 是否是工具定义侧的请求级拒收（11129 工具定义
+// 不合规 / 11152 工具名称不规范）。官方 i18n 原文：Invalid tool definition / Invalid
+// tool names（中文「工具定义不合规」「工具名称不规范」）。
+//
+// hasTools 是前提：没声明 tools 的请求按它指去改 tools 只会误导（11101 请求体畸形
+// 因此不会被指过去）。判定只影响 gateway_hint 文案，误判代价是多一条中性提示。
+func isToolDefinitionRejection(body string, hasTools bool) bool {
+	if !hasTools {
+		return false
+	}
+
+	lower := strings.ToLower(body)
+
+	for _, code := range toolDefinitionRejectCodes {
+		if codeMarker(lower, code) {
+			return true
+		}
+	}
+
+	return containsAnyLower(lower, toolDefinitionRejectMarkers)
+}
+
+// toolDefinitionRejectCodes 工具定义侧的请求级拒收码。
+var toolDefinitionRejectCodes = []string{"11129", "11152"}
+
+// toolDefinitionRejectMarkers 工具定义拒收的文案家族（小写）：上游丢业务码时兜底。
+var toolDefinitionRejectMarkers = []string{
+	"invalid tool definition", "invalid tool name", "工具定义不合规", "工具名称不规范",
 }
 
 // isInvalidImageData 上游 11135 body 判定（code 11135 / invalid_image_data /
