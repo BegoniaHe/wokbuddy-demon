@@ -159,7 +159,7 @@ func classifyTail(text string, toolRound bool) upstream.TailKind {
 		return upstream.TailStructural
 	}
 
-	if textYieldsToUser(trimmed) {
+	if textYieldsToUser(trimmed, toolRound) {
 		return upstream.TailNone
 	}
 
@@ -315,28 +315,41 @@ func sentenceBoundary(runes []rune, i int) bool {
 	return false
 }
 
-// userYieldMarkers 末句出现这些措辞说明模型把控制权交回用户（等拍板 / 等补充信息）。
+// userYieldDirectMarkers 「明确对用户说」的措辞（issue #587）：出现在正文任何位置都
+// 说明这一轮在等用户拍板。
 //
 // 救援的语义是「模型没说完，替它补上」，但有一类收尾是故意的：模型在等用户确认
 // （「邮件已经写好，请确认后我再发送」）。这时补一句「继续执行下一步」会拿到工具调用
 // 并被采纳，等于替用户按下了发送键——宁可漏救，也不能替用户拍板。
-var userYieldMarkers = []string{
-	"请确认", "确认后", "等你确认", "待你确认", "等你回复", "是否需要", "需不需要",
-	"要不要我", "要不要", "你希望", "请告知", "让我知道", "请你确认", "你确认后",
-	"确认无误", "可以吗", "行吗", "好吗",
+var userYieldDirectMarkers = []string{
+	"请确认", "请你确认", "你确认后", "等你确认", "待你确认", "等你回复", "要不要",
+	"你希望", "让我知道", "可以吗", "行吗", "好吗", "确认无误",
 }
 
-// userYieldMarkersEN 英文形态（模型偶发用英文收尾）。
+// userYieldTechnicalMarkers 技术叙述里也可能出现的措辞：只有位置在末句、正文末尾最后
+// 一个问句、或后面紧跟「我 / 你」时才算交回控制权。
+var userYieldTechnicalMarkers = []string{"确认后", "是否需要", "需不需要", "请告知"}
+
+// userYieldMarkersEN 英文形态里「明确对用户说」的一族（模型偶发用英文收尾）。
 var userYieldMarkersEN = []string{
-	"please confirm", "let me know", "should i ", "do you want", "would you like",
-	"awaiting your", "waiting for your", "confirm before", "shall i ",
+	"please confirm", "let me know", "awaiting your", "waiting for your",
+	"should i ", "shall i ", "do you want", "would you like",
 }
 
-// textYieldsToUser 报告正文是否在「等用户回话」：以问号收尾，或末句含请确认类措辞。
+// userYieldTechnicalMarkersEN 英文形态里技术叙述也可能出现的一族。
+var userYieldTechnicalMarkersEN = []string{"confirm before"}
+
+// textYieldsToUser 报告正文是否在「等用户回话」：以问号收尾，或命中交回控制权的措辞。
 //
-// 只判末句窗口：整段 Contains 会被正文中段的技术叙述误伤（真实样本里「是否需要
-// 更换钢丝绳」距尾部三千余字），长正文几乎必然命中，等于长会话永远不救。
-func textYieldsToUser(text string) bool {
+// 位置判据分两族（issue #587）。明确对用户说的话在正文任何位置都否决救援：确认请求
+// 前置、后面再跟草稿或参数时（「请确认后我再发送。草稿放在 draft.md 里。」），只扫
+// 末句会漏掉它，工具轮便会把续写里的发送类工具调用采纳下来。技术叙述里也可能出现的
+// 措辞只在末句窗口、正文末尾问句、或紧跟「我 / 你」时否决——真实样本里「是否需要更换
+// 钢丝绳」距尾部三千余字，整段匹配等于长会话永远不救。
+//
+// toolRound 取更保守的整段匹配：工具轮的救援会采纳续写里的工具调用，多漏救一次也好过
+// 替用户按下发送键。
+func textYieldsToUser(text string, toolRound bool) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return false
@@ -346,23 +359,85 @@ func textYieldsToUser(text string) bool {
 		return true
 	}
 
-	tail := userYieldTail(trimmed)
+	low := strings.ToLower(trimmed)
 
-	for _, marker := range userYieldMarkers {
-		if strings.Contains(tail, marker) {
-			return true
-		}
+	if containsAnyMarker(trimmed, userYieldDirectMarkers) || containsAnyMarker(low, userYieldMarkersEN) {
+		return true
 	}
 
-	low := strings.ToLower(tail)
+	if toolRound {
+		return containsAnyMarker(trimmed, userYieldTechnicalMarkers) ||
+			containsAnyMarker(low, userYieldTechnicalMarkersEN)
+	}
 
-	for _, marker := range userYieldMarkersEN {
-		if strings.Contains(low, marker) {
+	tail := userYieldTail(trimmed)
+	question := lastQuestionSegment(trimmed)
+	lowTail := strings.ToLower(tail)
+	lowQuestion := strings.ToLower(question)
+
+	return yieldsAtTail(trimmed, tail, question, userYieldTechnicalMarkers) ||
+		yieldsAtTail(low, lowTail, lowQuestion, userYieldTechnicalMarkersEN)
+}
+
+// yieldsAtTail 报告技术叙述类措辞是否落在「交回控制权」的位置上：末句窗口、正文末尾
+// 问句，或紧跟着对「我 / 你」说话。
+func yieldsAtTail(text, tail, question string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(tail, marker) || strings.Contains(question, marker) ||
+			yieldAddressesUser(text, marker) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// containsAnyMarker 报告 text 是否含任一 marker。
+func containsAnyMarker(text string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// yieldAddressesUser 报告 text 里的 marker 是否紧跟「我 / 你」（「确认后我再发送」是在
+// 对用户说话，不是技术叙述里的「确认后」）。marker 可多次出现，任一处紧跟即算。
+func yieldAddressesUser(text, marker string) bool {
+	for rest := text; ; {
+		_, after, found := strings.Cut(rest, marker)
+		if !found {
+			return false
+		}
+
+		trimmed := strings.TrimLeft(after, " \t")
+		if strings.HasPrefix(trimmed, "我") || strings.HasPrefix(trimmed, "你") {
+			return true
+		}
+
+		rest = after
+	}
+}
+
+// lastQuestionSegment 取正文最后一个问句（不含问号）：「是否需要我发给你过目？收件人：
+// 张三」这种把问题与后续正文分开写的形态，末句窗口看不到问句里的措辞。
+func lastQuestionSegment(text string) string {
+	trimmed := strings.TrimRight(text, " \t\r\n")
+
+	i := strings.LastIndexAny(trimmed, "？?")
+	if i < 0 {
+		return ""
+	}
+
+	head := trimmed[:i]
+	if start := strings.LastIndexAny(head, "。！？!?\n"); start >= 0 {
+		_, size := utf8.DecodeRuneInString(head[start:])
+		head = head[start+size:]
+	}
+
+	return strings.TrimSpace(head)
 }
 
 // userYieldTail 取「最后一次句读之后」的窗口：交回控制权总是最后一句里的事。

@@ -340,6 +340,71 @@ func TestChatMidTextYieldMarkerStillRescued(t *testing.T) {
 	}
 }
 
+// TestTextYieldPositions 交回控制权的位置判据（issue #587）：明确对用户说的话出现在
+// 正文任何位置都否决救援；技术叙述只在末句 / 末尾问句 / 紧跟「我 / 你」时否决；
+// 工具轮取整段匹配；复数人称「我们 / 你们」不算直接称呼。
+func TestTextYieldPositions(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		text      string
+		toolRound bool
+		want      upstream.TailKind
+	}{
+		// 确认请求前置、草稿在后：末句看不到「请确认后」，仍必须否决。
+		{"confirm-then-draft-tool-round", "请确认后我再发送。草稿放在 draft.md 里。", true, upstream.TailNone},
+		{"confirm-then-draft", "请确认后我再发送。草稿放在 draft.md 里。", false, upstream.TailNone},
+		// 直接措辞不带「我 / 你」、也不在末句时，只有「任何位置都否决」才拦得住。
+		{"direct-marker-alone-tool-round", "请确认。草稿放在 draft.md 里。", true, upstream.TailNone},
+		{"direct-marker-then-promise", "请确认。草稿放在 draft.md 里，我将开始发送", false, upstream.TailNone},
+		// 「是否需要」紧跟「我」＝对用户说话。
+		{"question-with-followup", "是否需要我先发给你过目。草稿如下：", false, upstream.TailNone},
+		// 直接措辞在末尾问句里、后面还有正文。
+		{"send-question-then-recipient", "要不要现在发送？\n收件人：张三", false, upstream.TailNone},
+		// 中段技术叙述不否决后面的承诺句。
+		{"technical-mid-text-promise", "为「是否需要更换」提供量化支撑。\n\n我将开始修改 check.go", false, upstream.TailPromise},
+		{"technical-mid-text-confirmed", "配置确认后就会生效。我将开始修改 check.go", false, upstream.TailPromise},
+		// 「你们」不是直接称呼。
+		{"plural-pronoun-not-direct", "你们那边的配置我没动过，我将开始修改 check.go", false, upstream.TailPromise},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := classifyTail(testCase.text, testCase.toolRound); got != testCase.want {
+				t.Errorf("classifyTail(%q, toolRound=%v)=%v want %v",
+					testCase.text, testCase.toolRound, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestChatToolRoundConfirmThenDraftNotRescued 工具轮里确认请求前置、草稿在后：不发起
+// 救援（否则续写里的发送类工具调用会被采纳，等于替用户按下发送键）。
+func TestChatToolRoundConfirmThenDraftNotRescued(t *testing.T) {
+	t.Parallel()
+
+	client, bodies := fakeUpstreamCapturingBodies(t, func(int) string {
+		return sseStopContent("请确认后我再发送。草稿放在 draft.md 里。")
+	})
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(&Config{Pool: state, Upstream: client})
+
+	body := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],` +
+		declaredToolsBody + `}`
+
+	rec := postChat(t, h, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	if got := len(chatBodies(bodies)); got != 1 {
+		t.Fatalf("请求数=%d want 1（在等用户拍板，不应续写）", got)
+	}
+}
+
 // TestChatPunctuatedTailTooLongNotRescued 标点型悬停超过长度闸门：多半是正常排版
 // （说明 + 列表），不救。
 func TestChatPunctuatedTailTooLongNotRescued(t *testing.T) {
