@@ -6,6 +6,7 @@
 package server
 
 import (
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -221,7 +222,16 @@ func promiseSentence(text string) bool {
 		return false
 	}
 
+	if gerundSentence(last) {
+		return true
+	}
+
 	low := strings.ToLower(last)
+	// 「我来看一下这段代码」是观察性叙述，不是承诺动手。先把反向措辞从匹配窗口里剔除：
+	// 同一句里若还有真承诺词（「对我来说简单，我将开始修改」）仍按承诺句处理。
+	for _, negative := range promiseNegatives {
+		low = strings.ReplaceAll(low, negative, "")
+	}
 
 	for _, marker := range promiseMarkers {
 		if strings.Contains(low, marker) {
@@ -233,10 +243,49 @@ func promiseSentence(text string) bool {
 }
 
 // promiseMarkers 末句出现这些词说明模型在预告下一步动作（承诺句形态）。
-// 不收「下面」「接着」这类泛词：「下面这些文件都已改好。」是典型收尾。
+//
+// 不收「下面」「接着」这类泛词：「下面这些文件都已改好。」是典型收尾。同样不收
+// 「接下来」「下一步」：它们常用来对用户说话（「接下来你可以运行 npm test」），
+// 长正文里认它们会把写完的回答再续写一段，白付一次整段上下文（issue #592）。
 var promiseMarkers = []string{
-	"我将", "我会", "我来", "我继续", "接下来", "下一步", "现在开始", "现在修复", "再检查",
-	"let me", "next, i'll", "next i'll", "next i will", "now i'll", "i'll now", "i will",
+	"我将", "我会", "我来", "我继续", "我需要", "我得", "我打算", "我开始", "我再",
+	"我接着", "我还要", "我马上", "我这就", "我们接着", "接下来开始", "现在开始",
+	"现在修复", "再检查", "正在",
+	"let me", "let's", "let us", "i will", "i'll", "i'm", "i need to", "i should",
+}
+
+// promiseNegatives 出现在末句里说明这句话是观察或议论而非承诺（issue #592）。
+var promiseNegatives = []string{"我来看", "对我来说", "对我们来说"}
+
+// gerundSentence 报告末句是否以现在分词开头的英文旁白（「Reading foo.go」「Updating
+// the config」）：模型用「正在做…」代替动手，与本仓中文词表同类。
+//
+// 只认纯字母的首词：带冒号的是标题不是旁白（「Testing: all 42 cases passed」），
+// 名词与介词形态（nothing / during / string 等）也不算。
+func gerundSentence(last string) bool {
+	word, rest, found := strings.Cut(strings.TrimSpace(last), " ")
+	if !found || strings.TrimSpace(rest) == "" {
+		return false
+	}
+
+	low := strings.ToLower(word)
+	if len(low) < 6 || !strings.HasSuffix(low, "ing") {
+		return false
+	}
+
+	for _, r := range low {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+
+	return !slices.Contains(gerundStopwords, low)
+}
+
+// gerundStopwords 以 -ing 结尾但不是现在分词的高频词：出现即不按旁白处理。
+var gerundStopwords = []string{
+	"nothing", "something", "anything", "everything", "during", "morning",
+	"evening", "string", "strings", "thing", "things",
 }
 
 // toolRoundTail 工具轮句号收尾的分流：够长之后看最后一句——收尾词优先（仍算答完），
