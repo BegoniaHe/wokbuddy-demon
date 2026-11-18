@@ -2029,6 +2029,10 @@ func (s *streamWriter) consumeLine(res lineResult, lastWrite *time.Time) (n int,
 	return n, false, res.err
 }
 
+// sseKeepaliveLine SSE 注释心跳行：只写单换行，注释行不得制造事件边界。续写换段
+// 等待期（continue.go）与入站 keepalive 共用同一形态。
+const sseKeepaliveLine = ": keepalive\n"
+
 // keepaliveIfIdle 静默超过间隔时写一帧 SSE 注释心跳。
 func (s *streamWriter) keepaliveIfIdle(lastWrite *time.Time) error {
 	if time.Since(*lastWrite) < s.keepalive {
@@ -2039,7 +2043,7 @@ func (s *streamWriter) keepaliveIfIdle(lastWrite *time.Time) error {
 	// 只写单换行：注释行不得制造事件边界。传两个换行时 default 分支会把空行
 	// 原样透传，上游把一帧 JSON 拆成多条 data 行且静默超过 keepalive 间隔时，
 	// 客户端会先收到只含前半段 JSON 的事件。
-	if _, _, err := s.handleStreamLine(": keepalive\n"); err != nil {
+	if _, _, err := s.handleStreamLine(sseKeepaliveLine); err != nil {
 		return err
 	}
 
