@@ -301,7 +301,8 @@ global 5.9.4.42593613-fa0a0901，重跑 `download_latest --dry-run` / `protocol_
 基线跳版另开 **#579**（无对应参考提交）：global 5.11.4 包内已带与 cn 5.11.3 **逐字相同**
 的 `main/client-identity.js`（2394 B）与 `main/device-token.js`（428 B），注册点在
 `main/server.js` 的 `oe.n({getOrigins:...})` 与 `R.T({getProduct:...})`；本仓
-`headers.go:304-307` 仍对 global 账号直接跳过 `X-Device-Token` 与 `X-Client-*` 头族。
+`headers.go:307-310` 与 `headers.go:332-335` 仍对 global 账号直接跳过 `X-Device-Token` 与
+`X-Client-*` 头族。
 global 5.9.4→5.11.4 的端点/头族漂移已用 `protocol_sweep --compare` 粗扫：新增
 `/v2/geoblock`、`/v1/tunnels`、`/v1/relay-key`、`/v1/customer/buddyone/*` 等运营面，
 refresh 仍是 `/v2${prefixPath}/auth/token/refresh`（未变）；逐表面指纹重对齐属独立议题。
@@ -390,7 +391,7 @@ cn 恒需、global 仅在 `global.enabled` 时需要，文件缺失或校验失�
 | images（generations + edits） | Content-Type / Authorization / conversation / identity | 复用 chat 头族 | 同上；两个端点同族同策略 |
 | videos（generations + tasks） | Content-Type / Authorization / conversation / identity | 复用 chat 头族（`surfaceVideos`，`VideosHeaders`） | 官方 `VideoService` 与图像面同源；两个端点同族同策略；只做透传，不轮询 |
 | growth（`/v2/activity/growth/*`） | Node 原生 `fetch`：`user-agent: node`（显式 `upstream.user_agent` 仍优先，见下）、`accept-language: *`、`sec-fetch-mode: cors`、`accept-encoding: br, gzip, deflate`，无 `X-Request-ID` / `X-Product` / `X-Requested-With` | 独立轻头族（`surfaceGrowth`，`GrowthHeaders`） | 2026-10-28 真机 `buddy/info` 逐字比对（#375）。实测只命中 `buddy/info` 一条；`travel/status\|depart\|claim`、`streak`、`tasks`、`heatmap`、`lottery`、`makeup-cards` 同仓库同域同为 `productHeaders` 来源，按**同面假设**复用，尚无逐路径抓包 |
-| chat/busy | renderer `wb.http.post`，8 个轻头（`Accept` 宽松值 / `Content-Type` / 三段 UA / `X-Request-ID` / `X-Product: SaaS` / `Authorization` / `X-User-Id` / `X-Domain`） | 独立轻头族（`surfaceModelBusy`） | 2026-10-28 真机：该路径没有任何会话头 / `acp-connection-id` / `baggage` / b3 / `x-stainless-*` / `X-Codebuddy-Request`（#371）。企业账号的 `X-Enterprise-Id` / `X-Tenant-Id` 取舍：真机样本是个人号，无证据，按「不猜测」不发 |
+| chat/busy | renderer `wb.http.post`，8 个轻头（`Accept` 宽松值 / `Content-Type` / 三段 UA / `X-Request-ID` / `X-Product: SaaS` / `Authorization` / `X-User-Id` / `X-Domain`），CN 侧另带 `X-Client-Version` / `X-Client-Platform` / `X-Client-Product` | 独立轻头族（`surfaceModelBusy`） | 2026-10-28 真机：该路径没有任何会话头 / `acp-connection-id` / `baggage` / b3 / `x-stainless-*` / `X-Codebuddy-Request`；`X-Device-Token` 仍不带（#371 / #552）。客户端身份三头由 `injectClientIdentityHeaders` 注入（#590）。企业账号的 `X-Enterprise-Id` / `X-Tenant-Id` 取舍：真机样本是个人号，无证据，按「不猜测」不发 |
 
 证据来自部署 profile 与 `.tmp/workbuddy` 解包（2026-10-27）：CN 5.9.3 包内
 `X-Agent-Runtime` 官方在 chat / images / search / webfetch 全发，枚举是
@@ -416,7 +417,7 @@ chat / refresh 头族差异（已对齐 / 刻意保留 / 不适用）：
 | 轻头族 `X-Domain` | 已对齐（与 chat 是两条表面） | 官方 `enterpriseHeaders()` 无 domain 时回落 **endpoint authority**；轻头族各面（refresh / v3-config / billing / report / busy / growth）统一按本次请求 URL 的 host 取值，不回落 chat base——billing 面走 `billing_base`，取 chat host 会把别的域发给 billing。`cn.chat_base` / `cn.billing_base` 覆盖时各自跟随。该口径只服务认证/轻业务面与 daemon VLM 网关，**不可**套用到 chat（#465） |
 | 非 chat 业务面的 `X-Request-ID` | 已对齐（refresh / v3-config / billing / busy / report） | 官方 HTTP 层 `applyRequestId` 对每条业务请求补 32 hex（UUIDv7 形态）；`/v2/activity/growth/*` 是 Node 裸 fetch 面，真机**不带**该头，故 growth 不在覆盖范围（#369 / #375） |
 | `X-Stainless-*` | 已补（仅 CLI chat） | 2026-11-04 官方 5.9.3 抓包：`POST /v2/chat/completions` 恒带 7 个小写头（`arch` / `lang` / `os` / `package-version` / `retry-count` / `runtime` / `runtime-version`），值来自打包的 OpenAI SDK 6.25.0 + Node v22.21.1。值整组冻结在 profile `emit.stainless`（schema 2 必填），Go 源码不保留版本字面量；agenttool 四路与桌面 chat 不发（#456） |
-| `X-Client-Version` / `X-Client-Platform` / `X-Client-Product` | 已补（CN 主进程面） | CN 5.11.3 `main/client-identity.js` 新增出站头提供者，按产品 endpoint origin 注册后由 RestOperations 拦截器统一注入：版本取 `electron.app.getVersion()`（即 profile 的 `emit.desktopIdeVersion`），平台是 `process.platform` 的归一值（本仓基线 Win32 → `windows`），产品取 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`）。global 5.9.4 无该提供者，global 5.11.4 起同形（#579 待适配）；CLI bundle 只有常量声明、chat 出站不设；growth（Node 裸 fetch）与 busy（渲染层 `wb.http.post`）同样不带（#551） |
+| `X-Client-Version` / `X-Client-Platform` / `X-Client-Product` | 已补（CN 主进程面 + chat / busy） | CN 5.11.3 `main/client-identity.js` 新增出站头提供者：`setClientIdentitySource` 注册、`buildClientIdentityHeaders` 生成，按产品 endpoint origin 命中后由 `main/proxy-env2.js` 的 `getOutboundHeaders` 统一注入，不接收路径参数、无按面豁免分支——chat（`/v2/chat/completions`）与 busy（`/v2/chat/busy`）因此与轻业务面同口径（#590）。版本取 `electron.app.getVersion()`（即 profile 的 `emit.desktopIdeVersion`），平台是 `process.platform` 的归一值（本仓基线 Win32 → `windows`），产品取 `cli/product.json` 的 `applicationName`（CN `WorkBuddy` / global `workbuddy-ai`）。global 5.9.4 无该提供者，global 5.11.4 起同形（#579 待适配）；growth（Node 裸 fetch）仍不带，该面是否经注入层尚未取证，按「不猜测」保持不发 |
 | `X-Codebuddy-Request: 1` | 仅 chat 族（chat + agenttool 四路） | 2026-10-28 真机抓包：7 条 chat 全带；refresh / busy / report / v3-config / billing / growth 共 14 条业务请求 0 命中（#368）。agenttool 四路无真机证据，沿 chat 头族一起发 |
 | 个人号 `X-No-Enterprise-Id` | chat / 模型目录已删，refresh / v3-config 保留 | 2026-11-04 官方 5.9.3 静态+抓包：chat 链路构造点为 0，个人号缺企业上下文时就是不发；本仓 chat 与 `FetchModels` / `globalModelsOnce` 改用 `injectEnterpriseIDHeaders`（仅企业 ID 非空时发 `X-Enterprise-Id` / `X-Tenant-Id`）。`injectEnterpriseHeaders` 的 `X-No-Enterprise-Id=1` 只留给 refresh / v3-config / 桌面面（#455） |
 | 个人号 `X-No-Department-Info` | 已删除（chat 与模型目录） | 它原先只由 `injectChatDomain` 注入；官方 chat 从不发 `X-No-*`，缺少部门上下文时省略。refresh / v3-config 本来就不发该头，行为不变（#455） |
