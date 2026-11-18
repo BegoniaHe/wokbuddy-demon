@@ -26,14 +26,21 @@ last_audited:
     non_merge_commits: 51
     merge_commits: 12
   dispositions:
-    issue: 8
-    revisit: 2
-    skip: 53
+    issue: 16
+    revisit: 0
+    skip: 47
   issues:
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/577
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/583
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/584
     - https://github.com/BegoniaHe/wokbuddy-demon/issues/585
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/586
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/587
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/588
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/589
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/590
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/591
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/592
   note: >-
     2026-11-18 续审 27b7458f..733942a7（63 条 = 51 非 merge + 12 merge；窗口 2026-11-16..18）。
     官方基线未变（cn 5.11.3.43806934-ecace0f7 / global 5.11.4.44121853-0026dff0），只重跑
@@ -51,4 +58,9 @@ last_audited:
     头边界、d6301fe9 的值域/容器键、224fc567 与 f1394fea 的半角点切句、bb8a9536 的无标点闸门）；
     无对应模块 2 条（internal/updater、searchtool 的 probeOnce）。本轮不改实现；游标推进是独立的
     chore(sync) 元数据提交。
-
+    2026-11-18 同日复检 63 项，改判 12 项处置、修正 1 条备注：224fc567 / f1394fea 与
+    89c84fb3 / 6cd32a7d、183c470b、40161992、f8d83465 由 skip/revisit 改为 issue；
+    96265d71、a5890ef0、d6301fe9 的「已覆盖/无模块」不成立，改为 issue；fdf05eae /
+    f6682159 是本仓不存在的参考侧回归，改回 skip 并把约束并入 #584。75653945 维持 skip，
+    零输出约束并入 #589；6bc6ff28 维持 skip，改正心跳不关闭首帧否决的备注。新开 #586–#592，
+    并在 #583 / #584 补验收约束。最终 16 issue / 47 skip / 0 revisit。
