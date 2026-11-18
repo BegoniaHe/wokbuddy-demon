@@ -186,9 +186,17 @@ func classifyTail(text string, toolRound bool) upstream.TailKind {
 	return upstream.TailNone
 }
 
-// structurallyOpen 报告尾部是否「结构上没写完」：围栏数量为奇数说明还缺收尾 ```。
+// structurallyOpen 报告尾部是否「结构上没写完」：围栏数量为奇数说明还缺收尾 ```；
+// 或者尾部停在一个没写完的原生工具调用标记里（issue #588）。截断的调用标记既不是
+// 承诺句也不以句末标点收尾，只看围栏会让它落 TailNone、不触发续写，客户端拿到半截
+// 参数；它与未闭合代码块同类，都该用「从断点接着写」的结构指令，不能套承诺句文案。
 func structurallyOpen(text string) bool {
-	return strings.Count(strings.TrimRight(text, " \t\r\n"), "```")%2 == 1
+	trimmed := strings.TrimRight(text, " \t\r\n")
+	if strings.Count(trimmed, "```")%2 == 1 {
+		return true
+	}
+
+	return upstream.UnclosedMarkup(trimmed)
 }
 
 // punctuatedTail 报告尾部是否停在标点型悬停的收尾符上。
