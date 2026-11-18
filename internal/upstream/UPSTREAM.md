@@ -21,7 +21,7 @@
 - **前序 fork 同步点**：`linguo2625469/workbuddy2api-panel` 的 `main` 末次提交
   （`Merge PR #152`，`fix(panel): 积分到期提醒卡片默认可见`）；该 fork 已停止维护。
 - **参考 fork 审计基线**：`misakano7545/workbuddy2api-panel` `main` @
-  `c4b53cd8024e38aa59fe1914691269776c757d2c`（2026-11-16）。该基线与本仓库无共同祖先，
+  `27b7458f7251942066f912c5677a0f9bc0c3ebdd`（2026-11-17）。该基线与本仓库无共同祖先，
   是逻辑审计游标，不是本仓库祖先。
 - **本仓库重建方式**：**丢弃全部 git 历史**，以当前工作区快照做初始提交。
   重建前的完整提交历史，请回溯前序 fork 仓库。
@@ -272,6 +272,40 @@ global 5.9.4.42593613-fa0a0901，重跑 `download_latest --dry-run` / `protocol_
 官方头夹具门禁）；形态不存在或架构不同（`d2708ca6` 的 deepseek-harness 搜索卡片补丁、
 `c4b53cd8` 的 `POST /v1/videos` 别名、`f5d08c04` 面板 tooltip、`2fa6876e` 的版本字面量
 ——本仓版本恒来自部署 profile）。后续审计从 `c4b53cd8` 之后开始。
+
+2026-11-17 续审 `c4b53cd8..27b7458f`（3 条非 merge、0 条 merge；窗口 2026-11-16..17）。
+**官方 global 基线跳版**：`5.9.4.42593613-fa0a0901` → `5.11.4.44121853-0026dff0`
+（commit `0026dff0`），cn 未变 `5.11.3.43806934-ecace0f7`；重跑 `download_latest
+--dry-run` / `download_latest` / 新 global 包解包（7z → app-64.7z → `extract_asar`）/
+`protocol_sweep`。2 项 issue（2 单）、1 项 skip：
+
+- **#577**（工具配对倒置）：`27b7458f` — OpenAI 兼容协议按位置配对，`role:tool` 结果必须
+  在声明它的 `assistant.tool_calls` 之后；Codex 经 cc-switch 类本地代理转 `/v1/responses`
+  时 `function_call_output` 排在 `function_call` 之前，本仓 `responses.go:372-387` 按
+  input 原序拼接，出站即倒置。现有管线（`payload.go:124-134` 的 merge → repack → cleanup）
+  盖不住：`tool_pairing.go:35` 的 repack 只从 assistant 起步、`:167` 的 cleanup 只判两侧
+  id 齐备。官方 global 5.11.4 `renderer/assets/en-BZmJsSE5.js` 的
+  `"errorCode.11148":Incomplete tool call records. Start a new task`、
+  `common-THF5HTIS.js` 的 `11148:{actions:[switchModel]...}` 确认该码语义与处置。
+- **#578**（换段等待无心跳）：`06a401ed` — 续写/救援每段都是一次全新上游 POST，
+  `continue.go:766-814` 的 `tryContinue` 同步发起，`Read` 等待期不产字节；keepalive 只在
+  `upstream.keepalive_interval > 0` 时生效（`sse.go:1872-1879`、`1952-1981`），而缺省
+  `"0"`（`config.example.json:107`、`cmd/server/config.go:1984-1985`），TTFB 心跳
+  （`handler.go:3610`）覆盖不到流中途。十万级 prompt prefill 3~30s 静默 → 客户端 idle
+  超时断流。官方静态包对本形态无字面量证据，按「后端上游功能尽量适配」政策开单。
+
+`38dca39c` 记 `skip`：面板任务中心实时任务卡 + 自动轮询（`internal/panel/tasklive.go`、
+前端 30s 静默刷新）属参考侧面板技术栈，本仓面板是 React + 内嵌产物；其「小程序口径是
+默认口径超集」的断言与 `0a2a55fb` 的 revisit 同源（参考侧线上实测，官方包无证据）。
+
+基线跳版另开 **#579**（无对应参考提交）：global 5.11.4 包内已带与 cn 5.11.3 **逐字相同**
+的 `main/client-identity.js`（2394 B）与 `main/device-token.js`（428 B），注册点在
+`main/server.js` 的 `oe.n({getOrigins:...})` 与 `R.T({getProduct:...})`；本仓
+`headers.go:304-307` 仍对 global 账号直接跳过 `X-Device-Token` 与 `X-Client-*` 头族。
+global 5.9.4→5.11.4 的端点/头族漂移已用 `protocol_sweep --compare` 粗扫：新增
+`/v2/geoblock`、`/v1/tunnels`、`/v1/relay-key`、`/v1/customer/buddyone/*` 等运营面，
+refresh 仍是 `/v2${prefixPath}/auth/token/refresh`（未变）；逐表面指纹重对齐属独立议题。
+后续审计从 `27b7458f` 之后开始。
 
 ## 四、本分支相对基线的演进（节选）
 
