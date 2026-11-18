@@ -246,7 +246,8 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 //   - 更早的 5.9.3 真机抓包只有 chat（主请求与辅助请求）与签到两条显式注入点，
 //     global 侧至今仍是这个形态。
 //
-// growth 是 Node 裸 fetch、busy 是渲染层 wb.http.post，都不经主进程拦截器，恒不带。
+// growth 是 Node 裸 fetch、busy 是渲染层 wb.http.post，都不经主进程拦截器，
+// X-Device-Token 恒不带（busy 的客户端身份三头另说，见 injectClientIdentityHeaders）。
 // /v2/plugin/auth/state 是面板登录面，不经本包。#342 的「只在 auth/state 与签到消费」
 // 对 chat 不成立（#376）。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
@@ -281,7 +282,9 @@ func (c *Client) deviceToken(account *auth.Auth) string {
 // 面在 CN 5.11.3 上要带 X-Device-Token（#552）与 X-Client-*（#551）。
 //
 // growth 是主进程里的 Node 裸 fetch（`e.fetch(...)` 不经 RestOperations），
-// busy 是渲染层 `wb.http.post`，两者都不在主进程头覆盖范围——这是取舍不是遗漏。
+// busy 是渲染层 `wb.http.post`，两者都不在 X-Device-Token 的覆盖范围——这是取舍
+// 不是遗漏。busy 的 X-Client-* 三头另由 applyHeaders 显式注入（真机 155/155 抓包
+// 覆盖 /v2/chat/busy，见 injectClientIdentityHeaders）。
 func (s surface) mainProcess() bool {
 	switch s {
 	case surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceLogout:
@@ -312,10 +315,26 @@ func (c *Client) injectMainProcessProviderHeaders(req *http.Request, account *au
 		req.Header.Set("X-Device-Token", token)
 	}
 
-	// 客户端身份三头（#551，main/client-identity.js 的 buildClientIdentityHeaders）：
-	// 版本 = electron.app.getVersion()（桌面构建版本，取 profile 冻结值）；
-	// 平台 = Win32 归一值；产品 = cli/product.json 的 applicationName。
-	// 版本取不到就整条不发：空值头是比缺失更明显的非官方指纹。
+	c.injectClientIdentityHeaders(req, account)
+}
+
+// injectClientIdentityHeaders 注入客户端身份三头（#551 / #590）。
+//
+// 官方 CN 5.11.3 的 `main/client-identity.js` 由 `setClientIdentitySource` 注册
+// 提供者、`buildClientIdentityHeaders` 生成这三个头；`main/server.js` 以产品
+// endpoint 为 origin 注册，`proxy-env2.js` 的 `getOutboundHeaders` 按 origin 命中后
+// 统一注入，不接收路径参数、没有按面豁免的分支。故 chat / busy 与轻业务面同口径。
+//
+// 取值只复用 profile 与产品配置：版本 = electron.app.getVersion()（桌面构建版本，
+// 取 profile 冻结的 emit.desktopIdeVersion）；平台 = Win32 归一值；产品 =
+// cli/product.json 的 applicationName。版本取不到时只省略 X-Client-Version 这一个头
+// （空值头是比缺失更明显的非官方指纹），平台与产品恒发。global 5.9.4 没有该提供者
+// （5.11.4 的适配见 #579），这里直接跳过。
+func (c *Client) injectClientIdentityHeaders(req *http.Request, account *auth.Auth) {
+	if account != nil && account.IsGlobal() {
+		return
+	}
+
 	if version := c.profileVersion(
 		account, func(p *clientprofile.Profile) string { return p.Emit.DesktopIdeVersion },
 	); version != "" {
@@ -369,6 +388,12 @@ func (c *Client) applyHeaders(
 	// surfaceBilling 一并覆盖。
 	if srf.mainProcess() {
 		c.injectMainProcessProviderHeaders(req, account)
+	}
+
+	// busy 是渲染层 wb.http.post，没有 X-Device-Token（真机 8 轻头不带），但真机
+	// 155/155 抓包（含 /v2/chat/busy）都带客户端身份三头，故只补三头（#590）。
+	if srf == surfaceModelBusy {
+		c.injectClientIdentityHeaders(req, account)
 	}
 }
 
@@ -465,6 +490,9 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 		if token := c.deviceToken(account); token != "" {
 			req.Header.Set("X-Device-Token", token)
 		}
+		// 客户端身份三头：同一提供者按 origin 命中，chat 出站与轻业务面同口径
+		// （#590）；global 由 injectClientIdentityHeaders 内部跳过。
+		c.injectClientIdentityHeaders(req, account)
 
 		injectChatBaggage(req)
 	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth,

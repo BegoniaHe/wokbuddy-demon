@@ -244,8 +244,9 @@ func TestClientIdentityOnCNMainProcessSurfaces(t *testing.T) {
 }
 
 // TestClientIdentityAbsentOffMainProcessSurfaces 三类面不带 X-Client-*：global
-// （5.9.4 无提供者）、growth（Node 裸 fetch）、busy（渲染层 wb.http.post）；
-// CLI chat 出站也不设（官方 bundle 只有常量声明，无赋值点，#551）。
+// （5.9.4 无提供者，5.11.4 的适配见 #579）与 growth（Node 裸 fetch，未在官方包内
+// 定位到注入链路，按「不猜测」保持不发）。CN chat / busy 带三头，见
+// TestClientIdentityOnCNChatAndBusy（#590）。
 func TestClientIdentityAbsentOffMainProcessSurfaces(t *testing.T) {
 	t.Parallel()
 
@@ -263,11 +264,14 @@ func TestClientIdentityAbsentOffMainProcessSurfaces(t *testing.T) {
 	}{
 		{"global billing", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.BillingHeaders(req, a) }},
 		{"global refresh", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.RefreshHeaders(req, a) }},
-		{"growth", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) { c.GrowthHeaders(req, a) }},
-		{"busy", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
-		{"chat", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) {
+		{"global report", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.ReportHeaders(req, a) }},
+		{"global v3config", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.V3ConfigHeaders(req, a, "") }},
+		{"global chat", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) {
 			c.ChatHeaders(req, a, "", ChatMeta{})
 		}},
+		{"global busy", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
+		{"growth", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) { c.GrowthHeaders(req, a) }},
+		{"global growth", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.GrowthHeaders(req, a) }},
 	}
 
 	for _, testCase := range cases {
@@ -292,6 +296,61 @@ func TestClientIdentityAbsentOffMainProcessSurfaces(t *testing.T) {
 	}
 }
 
+// TestClientIdentityOnCNChatAndBusy CN 5.11.3 的客户端身份提供者按产品 endpoint
+// 的 origin 命中（`main/server.js` 的 `setClientIdentitySource` 注册点），对
+// `/v2/chat/completions` 与 `/v2/chat/busy` 同样注入 X-Client-* 三头，没有按面
+// 豁免的分支（#590）。取值只来自 profile 与产品配置，个人号与企业号同口径。
+func TestClientIdentityOnCNChatAndBusy(t *testing.T) {
+	t.Parallel()
+
+	personal := surfaceGoldenAccount()
+	enterprise := &auth.Auth{
+		UID: "u-ent", AccessToken: "at", EnterpriseID: "ent-1", Domain: "www.workbuddy.cn",
+	}
+
+	cases := []struct {
+		name    string
+		account *auth.Auth
+		call    func(client *Client, req *http.Request, account *auth.Auth)
+	}{
+		{"chat 个人号", personal, func(c *Client, req *http.Request, a *auth.Auth) {
+			c.ChatHeaders(req, a, "", ChatMeta{})
+		}},
+		{"chat 企业号", enterprise, func(c *Client, req *http.Request, a *auth.Auth) {
+			c.ChatHeaders(req, a, "", ChatMeta{})
+		}},
+		{"busy 个人号", personal, func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
+		{"busy 企业号", enterprise, func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
+	}
+
+	want := map[string]string{
+		"X-Client-Version":  "9.9.9", // profile emit.desktopIdeVersion（测试 profile 假值）
+		"X-Client-Platform": "windows",
+		"X-Client-Product":  "WorkBuddy",
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newProfileClient(t)
+
+			req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			testCase.call(client, req, testCase.account)
+
+			for name, wantValue := range want {
+				if got := req.Header.Get(name); got != wantValue {
+					t.Errorf("%s %s=%q want %q", testCase.name, name, got, wantValue)
+				}
+			}
+		})
+	}
+}
+
 func TestModelBusyGoldenHeaderSet(t *testing.T) {
 	t.Parallel()
 
@@ -308,16 +367,20 @@ func TestModelBusyGoldenHeaderSet(t *testing.T) {
 	assertHeaderKeys(t, req,
 		"Accept", "Content-Type", "User-Agent", "X-Request-Id",
 		"X-Product", "Authorization", "X-User-Id", "X-Domain",
+		"X-Client-Version", "X-Client-Platform", "X-Client-Product",
 	)
 
 	for name, want := range map[string]string{
-		"Accept":        "application/json, text/plain, */*",
-		"Content-Type":  "application/json",
-		"X-Product":     "SaaS",
-		"Authorization": "Bearer at",
-		"X-User-Id":     "u1",
-		"X-Domain":      "www.workbuddy.cn",
-		"User-Agent":    "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+		"Accept":            "application/json, text/plain, */*",
+		"Content-Type":      "application/json",
+		"X-Product":         "SaaS",
+		"Authorization":     "Bearer at",
+		"X-User-Id":         "u1",
+		"X-Domain":          "www.workbuddy.cn",
+		"User-Agent":        "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+		"X-Client-Version":  "9.9.9",
+		"X-Client-Platform": "windows",
+		"X-Client-Product":  "WorkBuddy",
 	} {
 		if got := req.Header.Get(name); got != want {
 			t.Errorf("%s=%q want %q", name, got, want)
@@ -342,8 +405,9 @@ func TestModelBusyGoldenHeaderSet(t *testing.T) {
 	}
 }
 
-// TestModelBusyEnterpriseAccountBareToo 企业账号同样 8 轻头：真机样本是个人号，
-// 企业号是否带 X-Enterprise-Id / X-Tenant-Id 无证据，按「不猜测」不发。
+// TestModelBusyEnterpriseAccountBareToo 企业账号同样不带企业声明头：真机样本是个人号，
+// 企业号是否带 X-Enterprise-Id / X-Tenant-Id 无证据，按「不猜测」不发（轻头族 8 头 +
+// 客户端身份三头，#590）。
 func TestModelBusyEnterpriseAccountBareToo(t *testing.T) {
 	t.Parallel()
 
@@ -360,6 +424,7 @@ func TestModelBusyEnterpriseAccountBareToo(t *testing.T) {
 	assertHeaderKeys(t, req,
 		"Accept", "Content-Type", "User-Agent", "X-Request-Id",
 		"X-Product", "Authorization", "X-User-Id", "X-Domain",
+		"X-Client-Version", "X-Client-Platform", "X-Client-Product",
 	)
 }
 
@@ -750,6 +815,7 @@ func TestChatGoldenHeaderSet(t *testing.T) {
 		"X-Private-Data", "X-Product", "X-Request-Id",
 		"X-Requested-With", "X-Root-Request-Id", "X-Trace-Id", "X-User-Id",
 		"X-Device-Token",
+		"X-Client-Version", "X-Client-Platform", "X-Client-Product",
 		"x-stainless-arch", "x-stainless-lang", "x-stainless-os",
 		"x-stainless-package-version", "x-stainless-retry-count",
 		"x-stainless-runtime", "x-stainless-runtime-version",
@@ -761,6 +827,17 @@ func TestChatGoldenHeaderSet(t *testing.T) {
 
 	if got := req.Header.Get("X-Agent-Runtime"); got != "local-agent" {
 		t.Errorf("X-Agent-Runtime=%q want local-agent", got)
+	}
+
+	// 客户端身份三头与轻业务面同源：同一提供者按 origin 命中 chat（#590）。
+	for name, want := range map[string]string{
+		"X-Client-Version":  "9.9.9", // profile emit.desktopIdeVersion
+		"X-Client-Platform": "windows",
+		"X-Client-Product":  "WorkBuddy",
+	} {
+		if got := req.Header.Get(name); got != want {
+			t.Errorf("%s=%q want %q", name, got, want)
+		}
 	}
 
 	assertTraceFamily(t, req, convReqID)
