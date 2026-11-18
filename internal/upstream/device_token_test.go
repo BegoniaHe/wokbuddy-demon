@@ -102,9 +102,10 @@ func TestDeviceTokenOnCNMainProcessSurfaces(t *testing.T) {
 	}
 }
 
-// TestDeviceTokenOmittedOnGlobalMainProcessSurfaces global 5.9.4 没有主进程出站头
-// 提供者，仍是 5.9.3 的两条显式形态：chat 与签到带该头，其余主进程面不带（#552）。
-func TestDeviceTokenOmittedOnGlobalMainProcessSurfaces(t *testing.T) {
+// TestDeviceTokenOnGlobalMainProcessSurfaces global 5.11.4 起与 CN 5.11.3 同形：
+// 主进程出站头提供者（main/device-token.js）覆盖 billing / report / v3-config /
+// refresh / logout，均带 X-Device-Token（#579）。
+func TestDeviceTokenOnGlobalMainProcessSurfaces(t *testing.T) {
 	t.Parallel()
 
 	account := &auth.Auth{
@@ -136,28 +137,10 @@ func TestDeviceTokenOmittedOnGlobalMainProcessSurfaces(t *testing.T) {
 
 			testCase.call(req)
 
-			if got := req.Header.Get("X-Device-Token"); got != "" {
-				t.Errorf("%s X-Device-Token=%q want empty（global 无出站头提供者）", testCase.name, got)
+			if got := req.Header.Get("X-Device-Token"); got != "tok-from-auth" {
+				t.Errorf("%s X-Device-Token=%q want tok-from-auth", testCase.name, got)
 			}
 		})
-	}
-}
-
-// TestCheckinHeadersGlobalOnly 签到面的显式注入只服务 global：CN 侧已由
-// surfaceBilling 的主进程提供者统一注入，两条路径并存会重复 Set 同一个头。
-func TestCheckinHeadersGlobalOnly(t *testing.T) {
-	t.Parallel()
-
-	client := &Client{}
-
-	cn := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-cn"}
-	if got := client.checkinHeaders(cn); got != nil {
-		t.Errorf("CN checkinHeaders=%v want nil（CN 由主进程面统一注入）", got)
-	}
-
-	global := &auth.Auth{AccessToken: "at", UID: "u1", DeviceToken: "tok-global", Domain: "www.workbuddy.ai"}
-	if got := client.checkinHeaders(global); got["X-Device-Token"] != "tok-global" {
-		t.Errorf("global checkinHeaders=%v want X-Device-Token=tok-global", got)
 	}
 }
 

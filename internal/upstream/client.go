@@ -1386,8 +1386,8 @@ type Client struct {
 	PassthroughIP bool
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：
-	// config upstream.device_token。CN 5.11.3 起主进程出站头提供者把该头覆盖到
-	// 全部主进程业务面，global 与 chat/签到仍按显式注入面（见 resolveDeviceToken）。
+	// config upstream.device_token。CN 5.11.3 / global 5.11.4 起主进程出站头提供者把
+	// 该头覆盖到全部主进程业务面，chat 面仍按显式注入（见 resolveDeviceToken）。
 	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
 	DeviceToken string
 
