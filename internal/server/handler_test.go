@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"log"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -2395,36 +2396,226 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	}
 }
 
-// TestContentBlockedStickyDegraded 降级后新请求直达 Degraded（不再先撞 400）。
+// TestContentBlockedStickyDegraded 降级后**同一触发源**的新请求直达 Degraded
+// （不再先撞 400）。issue #591：粘性按「账号 + 入站 system 指纹」判定。
 func TestContentBlockedStickyDegraded(t *testing.T) {
 	t.Parallel()
 
-	var firstCall bool
+	const persona = "persona-x"
 
-	client := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		if !firstCall {
-			firstCall = true
-			return 400, `{"code":"11-128","msg":"blocked by security policy"}`, false
+	body := newChatBody(t, persona, "true")
+
+	// 上游只对「仍带原始 system」的请求返回 400；降到 Degraded 后 200。这样能区分
+	// 「直达降级层」与「先撞 400 再重试」。
+	var seen [][]byte
+
+	client := recordChatUpstream(&seen, func(_ int, raw []byte) *http.Response {
+		if strings.Contains(string(raw), persona) {
+			return errorJSON(http.StatusBadRequest, blockedByPolicyBody)
 		}
 
-		return 200, sseOK, true
+		return streamOK()
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	handler := NewHandler(&Config{Pool: p, Upstream: client, PromptMode: "passthrough"})
 
-	// 首请求触发降级 → 200。
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"system","content":"x"},{"role":"user","content":"hi"}]}`)))
-
-	if rec.Code != 200 {
+	// 首请求：原文 400 → 降级重试 → 200（两次上游调用）。
+	if rec := postChat(t, handler, body); rec.Code != http.StatusOK {
 		t.Fatalf("first req code=%d", rec.Code)
 	}
-	// 降级粘性：新请求 Active()=true，body 已被 Rewrite(Degraded)，上游首字节即 200。
-	// 但 fake 上游只对 firstCall 返回 400，之后都 200，无法区分"直达"与"重试"。
-	// 用 degrade.Active() 直接断言粘性生效。
-	if !handler.degrade.Active() {
-		t.Fatal("degrade should be active after trigger")
+
+	if len(seen) != 2 {
+		t.Fatalf("first req upstream calls=%d want 2 (400 + degraded retry)", len(seen))
+	}
+	// 同一触发源（同账号 + 同 system 指纹）的新请求：首次出站即为 Degraded，只一次调用。
+	if rec := postChat(t, handler, body); rec.Code != http.StatusOK {
+		t.Fatalf("second req code=%d", rec.Code)
+	}
+
+	if len(seen) != 3 {
+		t.Fatalf("second req must go straight to degraded (1 call), got %d total calls", len(seen))
+	}
+
+	if got := string(seen[2]); !strings.Contains(got, prompt.Degraded) || strings.Contains(got, persona) {
+		t.Fatalf("second req body should be degraded prompt only: %s", got)
+	}
+}
+
+// upstreamCall 一次出站调用（Authorization + body），供触发源隔离用例断言。
+type upstreamCall struct{ authz, body string }
+
+// newDegradeIsolationHandler 造「双账号 + 只拦含 blockOn 原文」的假上游装置：
+// 出站 body 仍带该子串即 400（安全策略拦截，走中性提示词降级），其余 200。
+func newDegradeIsolationHandler(t *testing.T, blockOn string) (*Handler, *pool.Pool, *[]upstreamCall) {
+	t.Helper()
+
+	calls := &[]upstreamCall{}
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw, _ := io.ReadAll(r.Body)
+			*calls = append(*calls, upstreamCall{authz: r.Header.Get("Authorization"), body: string(raw)})
+
+			if strings.Contains(string(raw), blockOn) {
+				return errorJSON(http.StatusBadRequest, blockedByPolicyBody), nil
+			}
+
+			return streamOK(), nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	accounts := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+
+	return NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"}), accounts, calls
+}
+
+// TestContentBlockedDegradeIsolatedPerSource 一次内容拦截只降级同一触发源（issue #591）：
+// 同账号上另一个 system 指纹的请求保持原文，不继承降级。
+func TestContentBlockedDegradeIsolatedPerSource(t *testing.T) {
+	t.Parallel()
+
+	const (
+		personaA = "persona-a-591"
+		personaB = "persona-b-591"
+	)
+
+	handler, _, calls := newDegradeIsolationHandler(t, personaA)
+
+	// 首请求被拦 → 降级重试 200（2 次上游调用，第二次换成 Degraded）。
+	if rec := postChat(t, handler, newChatBody(t, personaA, "true")); rec.Code != http.StatusOK {
+		t.Fatalf("trigger code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if len(*calls) != 2 || !strings.Contains((*calls)[1].body, prompt.Degraded) {
+		t.Fatalf("trigger 应 400 + 降级重试，calls=%d", len(*calls))
+	}
+
+	// 同一账号、不同 system 指纹 → 原文照发（首发即 200，无降级重试）。
+	*calls = nil
+
+	if rec := postChat(t, handler, newChatBody(t, personaB, "true")); rec.Code != http.StatusOK {
+		t.Fatalf("leg code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if len(*calls) != 1 {
+		t.Fatalf("不同 system 指纹的请求不该被降级：上游调用=%d want 1", len(*calls))
+	}
+
+	if got := outboundSystem(t, []byte((*calls)[0].body)); got != personaB {
+		t.Fatalf("出站 system 被改写: %q want %q", got, personaB)
+	}
+}
+
+// TestContentBlockedDegradeNotSharedAcrossAccounts 同 system 指纹换账号不继承降级
+// （issue #591）：新账号的触发源尚未形成，首发仍带原文。
+func TestContentBlockedDegradeNotSharedAcrossAccounts(t *testing.T) {
+	t.Parallel()
+
+	const personaA = "persona-a-591"
+
+	handler, accounts, calls := newDegradeIsolationHandler(t, personaA)
+
+	if rec := postChat(t, handler, newChatBody(t, personaA, "true")); rec.Code != http.StatusOK {
+		t.Fatalf("trigger code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	firstAuthz := (*calls)[0].authz
+
+	firstUID, ok := map[string]string{"Bearer at1": "u1", "Bearer at2": "u2"}[firstAuthz]
+	if !ok {
+		t.Fatalf("未知 Authorization: %q", firstAuthz)
+	}
+	// 停掉已降级的号，逼同 system 指纹的请求落到另一个号。
+	accounts.Pause(firstUID)
+
+	*calls = nil
+
+	if rec := postChat(t, handler, newChatBody(t, personaA, "true")); rec.Code != http.StatusOK {
+		t.Fatalf("leg code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if len(*calls) == 0 {
+		t.Fatal("无上游调用")
+	}
+
+	if (*calls)[0].authz == firstAuthz {
+		t.Fatalf("应换到另一个账号，仍是 %q", firstAuthz)
+	}
+
+	if got := outboundSystem(t, []byte((*calls)[0].body)); got != personaA {
+		t.Fatalf("另一个账号首发出站 system 被改写: %q want %q", got, personaA)
+	}
+}
+
+// TestContentBlockedDegradeKeepsNoSystemRequest 无 system 的普通请求不因他处误报
+// 丢失 system（issue #591）：仍按 passthrough 补回兜底 system，而非换成中性提示词。
+func TestContentBlockedDegradeKeepsNoSystemRequest(t *testing.T) {
+	t.Parallel()
+
+	const personaA = "persona-a-591"
+
+	handler, _, calls := newDegradeIsolationHandler(t, personaA)
+
+	if rec := postChat(t, handler, newChatBody(t, personaA, "true")); rec.Code != http.StatusOK {
+		t.Fatalf("trigger code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	*calls = nil
+
+	noSystem := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	if rec := postChat(t, handler, noSystem); rec.Code != http.StatusOK {
+		t.Fatalf("leg code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if len(*calls) != 1 {
+		t.Fatalf("上游调用=%d want 1", len(*calls))
+	}
+
+	if got := outboundSystem(t, []byte((*calls)[0].body)); got != upstream.LeadingSystemFallback {
+		t.Fatalf("兜底 system 被改写: %q", got)
+	}
+}
+
+// TestDegradeGateLogHasNoPromptText 降级日志可观测但脱敏（issue #591）：触发与命中
+// 两条日志只带 uid8 与 system 指纹前缀，不含 system 原文。
+//
+// 不 t.Parallel：log.SetOutput 是进程级全局（与 internal/auth、internal/panel 同口径）。
+func TestDegradeGateLogHasNoPromptText(t *testing.T) { //nolint:paralleltest // 改写进程级 log 输出，必须串行
+	const persona = "ultra-secret-persona-591"
+
+	var buf bytes.Buffer
+
+	oldOutput, oldFlags := log.Writer(), log.Flags()
+
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+
+	defer func() {
+		log.SetOutput(oldOutput)
+		log.SetFlags(oldFlags)
+	}()
+
+	client := newFakeUpstream(t, func(string) (int, string, bool) {
+		return http.StatusBadRequest, blockedByPolicyBody, false
+	})
+	accounts := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{Pool: accounts, Upstream: client, PromptMode: "passthrough"})
+
+	postChat(t, handler, newChatBody(t, persona, "true"))
+
+	logs := buf.String()
+	if !strings.Contains(logs, "degrade gate armed") {
+		t.Fatalf("降级触发应有一行可观测日志: %s", logs)
+	}
+
+	if !strings.Contains(logs, prompt.SystemFingerprint([]byte(newChatBody(t, persona, "true")))) {
+		t.Errorf("日志应带 system 指纹便于按触发源排查: %s", logs)
+	}
+
+	if strings.Contains(logs, persona) {
+		t.Errorf("日志不得包含提示词原文: %s", logs)
 	}
 }
 
@@ -2439,9 +2630,9 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	handler := NewHandler(&Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: "SYS"})
 
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`)))
+	const body = `{"model":"glm-5.2","messages":[{"role":"system","content":"old"},{"role":"user","content":"hi"}]}`
+
+	rec := postChat(t, handler, body)
 	// custom 模式下仍拦 → 400 content_blocked（内容终态，换号无意义），不降级重试。
 	if rec.Code != 400 {
 		t.Fatalf("code=%d want 400 content_blocked (custom does not degrade)", rec.Code)
@@ -2469,7 +2660,7 @@ func TestContentBlockedCustomModeDoesNotDegrade(t *testing.T) {
 		t.Errorf("content_blocked should carry gateway_hint: %s", rec.Body.String())
 	}
 
-	if handler.degrade.Active() {
+	if degradeActiveFor(handler, "u1", body) {
 		t.Error("degrade should NOT be active in custom mode")
 	}
 }
@@ -3390,6 +3581,39 @@ const sysPersona = "You are a helpful assistant."
 // unapprovedChannelBody 11128「渠道未授权」上游原文（实测形态）。
 const unapprovedChannelBody = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`
 
+// blockedByPolicyBody 11-128「安全策略拦截」上游原文：码不是 11128 也非 request
+// illegal → 不走拆句，走中性提示词降级（degrade 路径的唯一入口形态）。
+const blockedByPolicyBody = `{"code":"11-128","msg":"blocked by security policy"}`
+
+// degradeActiveFor 报告降级闸门对「该账号 + 该入站请求的 system 指纹」这一触发源
+// 是否生效（与 handler 内部判据同源：prompt.SystemFingerprint）。
+func degradeActiveFor(h *Handler, uid, body string) bool {
+	return h.degrade.Active(uid, prompt.SystemFingerprint([]byte(body)))
+}
+
+// outboundSystem 取一次出站 body 里第一条 system 消息的 content（无则空串）。
+func outboundSystem(t *testing.T, body []byte) string {
+	t.Helper()
+
+	var req struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := jsonx.Unmarshal(body, &req); err != nil {
+		t.Fatalf("outbound body not json: %v (%s)", err, body)
+	}
+
+	for _, msg := range req.Messages {
+		if msg.Role == "system" {
+			return msg.Content
+		}
+	}
+
+	return ""
+}
+
 // newChatBody 组装一次 chat 请求体（system 内容按参数注入）。
 func newChatBody(t *testing.T, system, stream string) string {
 	t.Helper()
@@ -3466,8 +3690,8 @@ func TestContentBlocked11128SplitsSystemInsteadOfDegrading(t *testing.T) {
 
 	assertSentenceSplit(t, bodies[1])
 
-	if handler.degrade.Active() {
-		t.Fatal("11128 拆句重试不该触发全局降级窗口")
+	if degradeActiveFor(handler, "u1", newChatBody(t, sysLong, "true")) {
+		t.Fatal("11128 拆句重试不该触发降级窗口")
 	}
 }
 
@@ -3622,8 +3846,8 @@ func TestChannelRefusedSplitsSystemInsteadOfRotating(t *testing.T) {
 
 	assertSentenceSplit(t, bodies[1])
 
-	if handler.degrade.Active() {
-		t.Fatal("11-128 拆句重试不该触发全局降级窗口")
+	if degradeActiveFor(handler, "u1", newChatBody(t, sysLong, "true")) {
+		t.Fatal("11-128 拆句重试不该触发降级窗口")
 	}
 
 	if total, healthy, cooling, disabled, _ := accounts.CountsDetailed(); total != 1 || healthy != 1 ||

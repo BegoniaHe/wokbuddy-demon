@@ -33,6 +33,124 @@ const sseTailToolCall = "data: {\"id\":\"c2\",\"choices\":[{\"index\":0," +
 	"data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 	"data: [DONE]\n\n"
 
+// TestLastSentenceBoundary 末句切分的半角句界（issue #586）：`.` `!` `?` 只有后接
+// 空白或行尾才切；URL 查询串、文件名、版本号与紧贴下文的标点都不切。
+func TestLastSentenceBoundary(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		// 半角标点后接正文：不是句界，整句保留。
+		{"url-query", "我将读取 https://example.com/a?q=1", "我将读取 https://example.com/a?q=1"},
+		{"bang-tight", "我将开始修复!现在", "我将开始修复!现在"},
+		{"filename", "我将开始修改 internal/verify/check.go", "我将开始修改 internal/verify/check.go"},
+		{"version", "我把依赖升到 v1.2", "我把依赖升到 v1.2"},
+		// 半角标点后接空白或行尾：是句界，正常切。
+		{"bang-space", "Done! Next I will check the logs.", "Next I will check the logs"},
+		{"question-space", "先说明一处? 我把余下的都改完了", "我把余下的都改完了"},
+		{"dot-space", "先说明一处. 我把余下的都改完了", "我把余下的都改完了"},
+		{"newline", "先说明一处\n我把余下的都改完了", "我把余下的都改完了"},
+		// 全角标点保持任意位置切句。
+		{"full-width", "我先说明。我将开始修改 check.go", "我将开始修改 check.go"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := lastSentence(testCase.text); got != testCase.want {
+				t.Errorf("lastSentence(%q)=%q want %q", testCase.text, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestPromiseMarkers 承诺句词表的正负例矩阵（issue #592）：常见第一人称意图词与
+// 现在分词英文旁白要救；「接下来」「下一步」这类对用户说话的泛词、观察性叙述与带
+// 冒号的标题不救。
+func TestPromiseMarkers(t *testing.T) {
+	t.Parallel()
+
+	positives := []string{
+		"我将开始修改 check.go",
+		"我会把三处调用改掉",
+		"我来处理这个分支",
+		"我继续检查其余链接",
+		"我需要先读取 foo.go",
+		"我得先确认依赖版本",
+		"我打算先改 handler",
+		"我开始改第二处",
+		"我再核对一遍",
+		"我接着改第三处",
+		"我还要补一条用例",
+		"我马上处理",
+		"我这就改",
+		"我们接着看下一处",
+		"接下来开始改实现",
+		"现在开始改第一处",
+		"现在修复参数名",
+		"再检查一遍缓存键",
+		"正在修改 foo.go",
+		"我正在核对第二处",
+		"Let me check the logs",
+		"Let's fix it",
+		"I'm updating the config",
+		"I'm going to patch it",
+		"I need to read foo.go",
+		"I should update the docs",
+		"Next I will check the logs",
+		"Now I'll patch it",
+		"Reading foo.go now",
+		"Updating the config file",
+	}
+
+	for _, text := range positives {
+		t.Run("positive/"+text, func(t *testing.T) {
+			t.Parallel()
+
+			if got := classifyTail(text, false); got != upstream.TailPromise {
+				t.Errorf("classifyTail(%q)=%v want promise", text, got)
+			}
+		})
+	}
+
+	negatives := []string{
+		// 「接下来」「下一步」常用来对用户说话（无句末标点的长尾才是真会被判承诺的形态）。
+		"接下来这些文件都已改好。",
+		"接下来这些文件都已改好",
+		"接下来你可以运行 npm test。",
+		"接下来你可以运行 npm test",
+		"下一步是把结果写进 README",
+		// 观察与议论不是承诺。
+		"对我来说，这意味着三处调用都要改。",
+		"对我来说，这意味着三处调用都要改",
+		"我来看一下这份代码。",
+		"我来看一下这份代码",
+		// 带冒号的标题不是现在分词旁白。
+		"Testing: all 42 cases passed",
+		"Nothing else to add.",
+		// 裸的 `i'm` 会命中这类收尾：只有现在分词形态才算「正在做」（审查项）。
+		"I'm sorry, but the tool timed out",
+		"I'm not able to do that",
+		// 「正在」出现在状态描述里不是自述动手（审查项）。
+		"文件正在被占用，请稍后重试",
+		"缓存正在失效，请勿重启",
+	}
+
+	for _, text := range negatives {
+		t.Run("negative/"+text, func(t *testing.T) {
+			t.Parallel()
+
+			if got := classifyTail(text, false); got != upstream.TailNone {
+				t.Errorf("classifyTail(%q)=%v want none", text, got)
+			}
+		})
+	}
+}
+
 // TestClassifyTail 尾部形态判据（issue #495 / #570）：标点型悬停、无标点承诺句、
 // 结构未闭合分别归位；完整句、等用户回话、超长标点型悬停不救。
 func TestClassifyTail(t *testing.T) {
@@ -56,6 +174,9 @@ func TestClassifyTail(t *testing.T) {
 		{"empty", "   ", false, upstream.TailNone},
 		{"promise-short", "我将开始修改 internal/verify/check.go", false, upstream.TailPromise},
 		{"promise-long", longPrefix + "我将开始修改 internal/verify/check.go", false, upstream.TailPromise},
+		// 半角标点后接正文不是句界（issue #586）：URL 查询串与紧贴的感叹号都保住末句。
+		{"promise-with-url-query", "我将读取 https://example.com/a?q=1", false, upstream.TailPromise},
+		{"promise-bang-tight", "我将开始修复!现在", false, upstream.TailPromise},
 		// 长度闸门只约束标点型悬停：超长的「停在冒号上」多半是正常排版。
 		{"punctuated-too-long", longPrefix + "改动清单如下：", false, upstream.TailNone},
 		// 交回控制权是故意的收尾，不能替用户拍板。

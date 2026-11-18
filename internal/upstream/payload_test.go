@@ -1393,17 +1393,352 @@ func TestNormalizeToolSchemasSkipsValueKeywords(t *testing.T) {
 }
 
 // TestNormalizeToolSchemasPropertyNamedLikeValueKeyword 属性名与值域键同名（合法：
-// properties 里可以有一个叫 enum 的参数）时仍要进它自己的 schema。
+// properties 里可以有一个叫 enum / default / example 的参数）时仍要进它自己的
+// schema——值域键只在自己的层止步，不能把同名的属性名一起挡掉。
 func TestNormalizeToolSchemasPropertyNamedLikeValueKeyword(t *testing.T) {
 	t.Parallel()
 
 	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
-		`{"type":"object","properties":{"enum":{"enum":["a","b"]}}}}}]}`
+		`{"type":"object","properties":{` +
+		`"enum":{"enum":["a","b"]},` +
+		`"default":{"enum":["x","y"]},` +
+		`"example":{"enum":["p","q"]}}}}}]}`
 
 	out := string(PrepareBodyOptWithEfforts([]byte(body), false, nil))
 
-	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "enum", "type"); got != "string" {
-		t.Fatalf("名为 enum 的属性未归一: %q", got)
+	for _, name := range []string{"enum", "default", "example"} {
+		if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", name, "type"); got != "string" {
+			t.Fatalf("名为 %s 的属性未归一: %q", name, got)
+		}
+	}
+}
+
+// toolParametersSchema 取出出站 body 的 tools[index] 参数 schema 并以 jsonx 确定性
+// 键序编码回字符串（断言「整棵 schema 逐字节不变」用）。
+func toolParametersSchema(t *testing.T, body []byte, index int) string {
+	t.Helper()
+
+	obj, err := decodeBody(body)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	rawTools, ok := obj["tools"].([]any)
+	if !ok || index >= len(rawTools) {
+		t.Fatalf("tools[%d] 不存在: %v", index, obj["tools"])
+	}
+
+	tool, ok := rawTools[index].(map[string]any)
+	if !ok {
+		t.Fatalf("tools[%d] 不是对象: %T", index, rawTools[index])
+	}
+
+	params, has := tool["parameters"]
+	if !has {
+		fn, ok := tool["function"].(map[string]any)
+		if !ok {
+			t.Fatalf("tools[%d] 既无 parameters 也无 function: %v", index, tool)
+		}
+
+		params, has = fn["parameters"]
+	}
+
+	if !has {
+		t.Fatalf("tools[%d].parameters 不存在", index)
+	}
+
+	raw, err := jsonx.Marshal(params)
+	if err != nil {
+		t.Fatalf("marshal parameters: %v", err)
+	}
+
+	return string(raw)
+}
+
+// toolSchemaCoercionBody 包一个 properties.n 形态的 schema 进 tools[].function.parameters。
+func toolSchemaCoercionBody(schema string) string {
+	return `{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"tools":[` +
+		`{"type":"function","function":{"name":"pick","parameters":{"type":"object",` +
+		`"properties":{"n":` + schema + `}}}}]}`
+}
+
+// lookupToolProperty 取出 properties.<name> 的 schema 并编码回字符串。
+func lookupToolProperty(t *testing.T, body []byte, name string) string {
+	t.Helper()
+
+	obj, err := decodeBody(body)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	params, ok := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("parameters 不是对象")
+	}
+
+	props, ok := params["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("properties 不是对象")
+	}
+
+	value, has := props[name]
+	if !has {
+		t.Fatalf("properties.%s 不存在: %v", name, props)
+	}
+
+	raw, err := jsonx.Marshal(value)
+	if err != nil {
+		t.Fatalf("marshal properties.%s: %v", name, err)
+	}
+
+	return string(raw)
+}
+
+// TestNormalizeToolSchemaKeywordCoercion 关键字取值类型纠偏（11129 实案）：弱类型
+// 客户端（Python dict / PHP array 序列化）把 minimum 写成 "1"、uniqueItems 写成
+// "true"、description 写成 123、enum 写成 "x"、required 写成有重复项的数组，上游按
+// 强类型反序列化 tools[].function.parameters 后整单 400 code=11129「工具定义不合规」。
+// 六类都在出站前纠成合法类型；纠不动的值删键（留着必然整单被拒）。
+func TestNormalizeToolSchemaKeywordCoercion(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		schema string // properties.n 的原样 JSON
+		want   string // 期望规整结果（jsonx 确定性键序）
+	}{
+		{
+			name:   "minimum 字符串数字转数字",
+			schema: `{"type":"integer","minimum":"1"}`,
+			want:   `{"minimum":1,"type":"integer"}`,
+		},
+		{
+			name: "数值类关键字全组转数字",
+			schema: `{"maximum":"10","exclusiveMinimum":"0","exclusiveMaximum":"9","multipleOf":"0.5",` +
+				`"minLength":"1","maxLength":"5","minItems":"0","maxItems":"3",` +
+				`"minProperties":"1","maxProperties":"2"}`,
+			want: `{"exclusiveMaximum":9,"exclusiveMinimum":0,"maxItems":3,"maxLength":5,` +
+				`"maxProperties":2,"maximum":10,"minItems":0,"minLength":1,"minProperties":1,"multipleOf":0.5}`,
+		},
+		{
+			name:   "uniqueItems 字符串布尔转布尔",
+			schema: `{"type":"array","uniqueItems":"true"}`,
+			want:   `{"type":"array","uniqueItems":true}`,
+		},
+		{
+			name:   "additionalProperties 字符串布尔转布尔",
+			schema: `{"type":"object","additionalProperties":"false"}`,
+			want:   `{"additionalProperties":false,"type":"object"}`,
+		},
+		{
+			name:   "additionalProperties 子 schema 形态保留并规整",
+			schema: `{"type":"object","additionalProperties":{"type":"string","maxLength":"8"}}`,
+			want:   `{"additionalProperties":{"maxLength":8,"type":"string"},"type":"object"}`,
+		},
+		{
+			name:   "description 非字符串删键",
+			schema: `{"type":"string","description":123}`,
+			want:   `{"type":"string"}`,
+		},
+		{
+			name:   "title 非字符串删键",
+			schema: `{"type":"object","title":{"a":1}}`,
+			want:   `{"type":"object"}`,
+		},
+		{
+			name:   "enum 非数组删键",
+			schema: `{"type":"string","enum":"x"}`,
+			want:   `{"type":"string"}`,
+		},
+		{
+			name:   "enum 非数组删键且不补 type",
+			schema: `{"enum":"x"}`,
+			want:   `{}`,
+		},
+		{
+			name:   "required 去重",
+			schema: `{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b","a"]}`,
+			want: `{"properties":{"a":{"type":"string"},"b":{"type":"string"}},` +
+				`"required":["a","b"],"type":"object"}`,
+		},
+		{
+			name:   "纠不动的值删键",
+			schema: `{"type":"string","minimum":"abc","uniqueItems":"yes","required":"a"}`,
+			want:   `{"type":"string"}`,
+		},
+		{
+			name:   "合法取值原样保留",
+			schema: `{"type":"integer","minimum":1,"maximum":10,"uniqueItems":false}`,
+			want:   `{"maximum":10,"minimum":1,"type":"integer","uniqueItems":false}`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			body := toolSchemaCoercionBody(testCase.schema)
+			out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+
+			if got := lookupToolProperty(t, out, "n"); got != testCase.want {
+				t.Fatalf("规整结果 = %s, want %s (输入 %s)", got, testCase.want, testCase.schema)
+			}
+		})
+	}
+}
+
+// TestNormalizeToolSchemasValidSchemaUntouched 合法 schema 出站后一个字节不动：既有
+// 取值类型正确、又含数据键（default / example / examples / const / enum）、依赖容器与
+// 合法数值关键字时不产生任何改写。
+func TestNormalizeToolSchemasValidSchemaUntouched(t *testing.T) {
+	t.Parallel()
+
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","title":"参数","description":"说明",` +
+		`"properties":{"n":{"type":"integer","minimum":1,"maximum":10,"multipleOf":2},` +
+		`"list":{"type":"array","items":{"type":"string"},"minItems":1,"uniqueItems":true},` +
+		`"obj":{"type":"object","additionalProperties":false,"minProperties":1,` +
+		`"dependentRequired":{"a":["b"]},"dependentSchemas":{"c":{"type":"string"}},` +
+		`"dependencies":{"d":["e"],"f":{"type":"number"}}}},` +
+		`"required":["n","list"],` +
+		`"example":{"pattern":"a` + str + str + `_b","enum":["x"]},` +
+		`"examples":[{"const":1}],"default":null}}}]}`
+
+	want := toolParametersSchema(t, []byte(body), 0)
+	got := toolParametersSchema(t, PrepareBodyOptWithEfforts([]byte(body), false, nil), 0)
+
+	if got != want {
+		t.Fatalf("合法 schema 被改写:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestNormalizeToolSchemasSkipsSingularExample 单数 example 与复数 examples 同属数据
+// 取值：里面的 pattern `\_` 不改写、enum 不补 type（example 里的对象是客户端写的数据，
+// 不是 schema 子树）。
+func TestNormalizeToolSchemasSkipsSingularExample(t *testing.T) {
+	t.Parallel()
+
+	body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","properties":{"sample":{"type":"string",` +
+		`"example":{"pattern":"a` + str + str + `_b","enum":["x"]}}}}}}]}`
+
+	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+	props := []any{"tools", 0, "function", "parameters", "properties", "sample"}
+
+	if got := lookupToolPattern(t, string(out), append(props, "example", "pattern")...); got != `a\_b` {
+		t.Fatalf("example 内的 pattern 被改写: %q", got)
+	}
+
+	if got := lookupToolPattern(t, string(out), append(props, "example", "type")...); got != "" {
+		t.Fatalf("example 内被补了 type: %q", got)
+	}
+
+	if got := lookupToolProperty(t, out, "sample"); got != `{"example":{"enum":["x"],"pattern":"a\\_b"},"type":"string"}` {
+		t.Fatalf("example 数据被改写: %s", got)
+	}
+}
+
+// TestNormalizeToolSchemasDependencyContainers dependentSchemas / dependentRequired /
+// dependencies 的键是**属性名**：撞上 patternProperties / enum 之类的关键字时不得按
+// 关键字处理；值里的真子 schema 仍照常规整。
+func TestNormalizeToolSchemasDependencyContainers(t *testing.T) {
+	t.Parallel()
+
+	// 属性名恰好叫 enum：值是真子 schema，要照常规整（漏进 schemaMapKeys 时会被
+	// schemaValueKeys 当成数据键整棵跳过，pattern 不会归一）。
+	dependentSchemas := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","dependentSchemas":{"enum":{"pattern":"a` + str + str + `_b"}}}}}]}`
+
+	out := string(PrepareBodyOptWithEfforts([]byte(dependentSchemas), false, nil))
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "dependentSchemas", "enum", "pattern"); got != "a_b" {
+		t.Fatalf("dependentSchemas 下的子 schema 未归一: %q", got)
+	}
+
+	// 属性名恰好叫 patternProperties：它是名字不是关键字，键（正则）不得被改写。
+	dependencies := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","dependencies":{"patternProperties":{"^a` + str + str + `_b$":{"type":"string"}}}}}}]}`
+	outBytes := PrepareBodyOptWithEfforts([]byte(dependencies), false, nil)
+
+	obj, err := decodeBody(outBytes)
+	if err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	deps := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)["dependencies"].(map[string]any)
+
+	named, ok := deps["patternProperties"].(map[string]any)
+	if !ok {
+		t.Fatalf("属性名 patternProperties 被当成关键字处理: %v", deps)
+	}
+
+	if _, has := named["^a"+str+"_b$"]; !has {
+		t.Fatalf("属性名层被当关键字改写: %v", named)
+	}
+
+	// dependentRequired 与 dependencies 的属性名数组形态都是数据，原样保留。
+	lists := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+		`{"type":"object","dependentRequired":{"items":["type"]},"dependencies":{"enum":["default"]}}` +
+		`}}]}`
+
+	got := toolParametersSchema(t, PrepareBodyOptWithEfforts([]byte(lists), false, nil), 0)
+	if got != `{"dependencies":{"enum":["default"]},"dependentRequired":{"items":["type"]},"type":"object"}` {
+		t.Fatalf("依赖容器的属性名数组被改写: %s", got)
+	}
+}
+
+// TestNormalizeToolSchemasTopLevelRef 顶层 `$ref` 出站前展开：同层 `$defs` /
+// `definitions` 可解析时换成真实 schema（规范化随后作用在展开结果上），展不开则删
+// `$ref` 键（上游强类型反序列化认不出即整单 11129）。只处理顶层节点。
+func TestNormalizeToolSchemasTopLevelRef(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		parameters string // tools[].function.parameters 原样 JSON
+		want       string // 展开后的期望 schema（jsonx 确定性键序）
+	}{
+		{
+			name: "$defs 可解析则展开",
+			parameters: `{"$ref":"#/$defs/Args","$defs":{"Args":{"type":"object",` +
+				`"properties":{"q":{"type":"string","minimum":"1"}}}}}`,
+			want: `{"properties":{"q":{"minimum":1,"type":"string"}},"type":"object"}`,
+		},
+		{
+			name:       "definitions 可解析则展开",
+			parameters: `{"$ref":"#/definitions/Args","definitions":{"Args":{"type":"object"}}}`,
+			want:       `{"type":"object"}`,
+		},
+		{
+			name:       "无 $defs 删 $ref 键",
+			parameters: `{"$ref":"#/$defs/Args","title":"t"}`,
+			want:       `{"title":"t"}`,
+		},
+		{
+			name:       "目标不存在删 $ref 键",
+			parameters: `{"$ref":"#/$defs/Missing","$defs":{"Other":{"type":"object"}}}`,
+			want:       `{"$defs":{"Other":{"type":"object"}}}`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			body := `{"messages":[],"tools":[{"type":"function","function":{"name":"t","parameters":` +
+				testCase.parameters + `}}]}`
+			out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+
+			if got := toolParametersSchema(t, out, 0); got != testCase.want {
+				t.Fatalf("展开结果 = %s, want %s", got, testCase.want)
+			}
+		})
+	}
+
+	// 裸 tools[].parameters 形态同样展开。
+	bare := `{"messages":[],"tools":[{"name":"t","parameters":` +
+		`{"$ref":"#/$defs/Args","$defs":{"Args":{"type":"object"}}}}]}`
+	if got := toolParametersSchema(t, PrepareBodyOptWithEfforts([]byte(bare), false, nil), 0); got != `{"type":"object"}` {
+		t.Fatalf("裸 parameters 的 $ref 未展开: %s", got)
 	}
 }
 

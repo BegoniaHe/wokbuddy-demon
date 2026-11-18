@@ -53,8 +53,8 @@ func TestChatStainlessHeaders(t *testing.T) {
 		}
 	}
 
-	if got := len(req.Header); got != 39 {
-		t.Errorf("chat 头总数=%d want 39（含七个 stainless）", got)
+	if got := len(req.Header); got != 42 {
+		t.Errorf("chat 头总数=%d want 42（含七个 stainless 与身份三头）", got)
 	}
 }
 

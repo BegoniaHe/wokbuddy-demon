@@ -196,56 +196,84 @@ func TestLightSurfaceGoldenHeaderSets(t *testing.T) {
 	}
 }
 
-// TestClientIdentityOnCNMainProcessSurfaces CN 5.11.3 起 main/client-identity.js 的
-// 出站头提供者对主进程面统一注入 X-Client-Version / Platform / Product（#551）：
-// 版本取 profile 冻结的桌面构建版本，平台是 Win32 归一值，产品是 applicationName。
-// global 5.9.4 没有该提供者，chat 族（CLI）与 growth / busy 都不带。
-func TestClientIdentityOnCNMainProcessSurfaces(t *testing.T) {
+// TestClientIdentityOnMainProcessSurfaces CN 5.11.3 起、global 5.11.4 起
+// main/client-identity.js 的出站头提供者对主进程面统一注入 X-Client-Version /
+// Platform / Product（#551 / #579）：版本取 profile 冻结的桌面构建版本，平台是 Win32
+// 归一值，产品是 applicationName（CN `WorkBuddy` / global `workbuddy-ai`）。
+func TestClientIdentityOnMainProcessSurfaces(t *testing.T) {
 	t.Parallel()
 
 	client := newProfileClient(t)
-	account := surfaceGoldenAccount()
 
-	want := map[string]string{
-		"X-Client-Version":  "9.9.9", // profile emit.desktopIdeVersion（测试 profile 假值）
-		"X-Client-Platform": "windows",
-		"X-Client-Product":  "WorkBuddy",
+	globalAccount := &auth.Auth{
+		AccessToken: "at", UID: "u-global", Domain: "www.workbuddy.ai",
+	}
+	if _, err := auth.BackfillRealmFor(globalAccount, "global"); err != nil {
+		t.Fatalf("BackfillRealmFor: %v", err)
+	}
+
+	realms := []struct {
+		name    string
+		account *auth.Auth
+		want    map[string]string
+	}{
+		{
+			name:    "cn",
+			account: surfaceGoldenAccount(),
+			want: map[string]string{
+				"X-Client-Version":  "9.9.9", // profile emit.desktopIdeVersion（测试 profile 假值）
+				"X-Client-Platform": "windows",
+				"X-Client-Product":  "WorkBuddy",
+			},
+		},
+		{
+			name:    "global",
+			account: globalAccount,
+			want: map[string]string{
+				"X-Client-Version":  "9.9.10",
+				"X-Client-Platform": "windows",
+				"X-Client-Product":  "workbuddy-ai",
+			},
+		},
 	}
 
 	surfaces := []struct {
 		name string
-		call func(req *http.Request)
+		call func(req *http.Request, account *auth.Auth)
 	}{
-		{"billing", func(req *http.Request) { client.BillingHeaders(req, account) }},
-		{"report", func(req *http.Request) { client.ReportHeaders(req, account) }},
-		{"refresh", func(req *http.Request) { client.RefreshHeaders(req, account) }},
-		{"v3config", func(req *http.Request) { client.V3ConfigHeaders(req, account, "") }},
-		{"logout", func(req *http.Request) { client.LogoutHeaders(req, account) }},
+		{"billing", func(req *http.Request, account *auth.Auth) { client.BillingHeaders(req, account) }},
+		{"report", func(req *http.Request, account *auth.Auth) { client.ReportHeaders(req, account) }},
+		{"refresh", func(req *http.Request, account *auth.Auth) { client.RefreshHeaders(req, account) }},
+		{"v3config", func(req *http.Request, account *auth.Auth) { client.V3ConfigHeaders(req, account, "") }},
+		{"logout", func(req *http.Request, account *auth.Auth) { client.LogoutHeaders(req, account) }},
 	}
 
-	for _, testCase := range surfaces {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
+	for _, realm := range realms {
+		for _, surface := range surfaces {
+			t.Run(realm.name+"/"+surface.name, func(t *testing.T) {
+				t.Parallel()
 
-			req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/report", http.NoBody)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			testCase.call(req)
-
-			for name, wantValue := range want {
-				if got := req.Header.Get(name); got != wantValue {
-					t.Errorf("%s %s=%q want %q", testCase.name, name, got, wantValue)
+				req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/report", http.NoBody)
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
-		})
+
+				surface.call(req, realm.account)
+
+				for name, want := range realm.want {
+					if got := req.Header.Get(name); got != want {
+						t.Errorf("%s %s=%q want %q", surface.name, name, got, want)
+					}
+				}
+			})
+		}
 	}
 }
 
-// TestClientIdentityAbsentOffMainProcessSurfaces 三类面不带 X-Client-*：global
-// （5.9.4 无提供者）、growth（Node 裸 fetch）、busy（渲染层 wb.http.post）；
-// CLI chat 出站也不设（官方 bundle 只有常量声明，无赋值点，#551）。
+// TestClientIdentityAbsentOffMainProcessSurfaces 三类面不带 X-Client-*：两个 realm 的
+// growth（Node 裸 fetch）、global 的 chat 与 busy（global 侧 chat / busy 的客户端身份
+// 头无真机证据，按「不猜测」保持不发）。CN chat / busy 带三头（#590），主进程面两个
+// realm 都带（#551 / #579）。
 func TestClientIdentityAbsentOffMainProcessSurfaces(t *testing.T) {
 	t.Parallel()
 
@@ -261,13 +289,12 @@ func TestClientIdentityAbsentOffMainProcessSurfaces(t *testing.T) {
 		account *auth.Auth
 		call    func(client *Client, req *http.Request, account *auth.Auth)
 	}{
-		{"global billing", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.BillingHeaders(req, a) }},
-		{"global refresh", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.RefreshHeaders(req, a) }},
-		{"growth", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) { c.GrowthHeaders(req, a) }},
-		{"busy", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
-		{"chat", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) {
+		{"global chat", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) {
 			c.ChatHeaders(req, a, "", ChatMeta{})
 		}},
+		{"global busy", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
+		{"cn growth", surfaceGoldenAccount(), func(c *Client, req *http.Request, a *auth.Auth) { c.GrowthHeaders(req, a) }},
+		{"global growth", globalAccount, func(c *Client, req *http.Request, a *auth.Auth) { c.GrowthHeaders(req, a) }},
 	}
 
 	for _, testCase := range cases {
@@ -292,6 +319,86 @@ func TestClientIdentityAbsentOffMainProcessSurfaces(t *testing.T) {
 	}
 }
 
+// TestClientIdentityOnCNChatAndBusy CN 5.11.3 的客户端身份提供者按产品 endpoint
+// 的 origin 命中（`main/server.js` 的 `setClientIdentitySource` 注册点），对
+// `/v2/chat/completions` 与 `/v2/chat/busy` 同样注入 X-Client-* 三头，没有按面
+// 豁免的分支（#590）。取值只来自 profile 与产品配置，个人号与企业号同口径。
+func TestClientIdentityOnCNChatAndBusy(t *testing.T) {
+	t.Parallel()
+
+	personal := surfaceGoldenAccount()
+	enterprise := &auth.Auth{
+		UID: "u-ent", AccessToken: "at", EnterpriseID: "ent-1", Domain: "www.workbuddy.cn",
+	}
+
+	cases := []struct {
+		name    string
+		account *auth.Auth
+		call    func(client *Client, req *http.Request, account *auth.Auth)
+	}{
+		{"chat 个人号", personal, func(c *Client, req *http.Request, a *auth.Auth) {
+			c.ChatHeaders(req, a, "", ChatMeta{})
+		}},
+		{"chat 企业号", enterprise, func(c *Client, req *http.Request, a *auth.Auth) {
+			c.ChatHeaders(req, a, "", ChatMeta{})
+		}},
+		{"busy 个人号", personal, func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
+		{"busy 企业号", enterprise, func(c *Client, req *http.Request, a *auth.Auth) { c.ModelBusyHeaders(req, a) }},
+	}
+
+	want := map[string]string{
+		"X-Client-Version":  "9.9.9", // profile emit.desktopIdeVersion（测试 profile 假值）
+		"X-Client-Platform": "windows",
+		"X-Client-Product":  "WorkBuddy",
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := newProfileClient(t)
+
+			req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/chat/completions", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			testCase.call(client, req, testCase.account)
+
+			for name, wantValue := range want {
+				if got := req.Header.Get(name); got != wantValue {
+					t.Errorf("%s %s=%q want %q", testCase.name, name, got, wantValue)
+				}
+			}
+		})
+	}
+}
+
+// TestClientIdentityVersionOmittedWithoutProfile profile 缺 desktopIdeVersion（未装配
+// profile）时只省略 X-Client-Version：空值头比缺失更像非官方指纹（#551 口径保留），
+// 平台与产品恒发。
+func TestClientIdentityVersionOmittedWithoutProfile(t *testing.T) {
+	t.Parallel()
+
+	client := &Client{}
+	account := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	req, err := http.NewRequest(http.MethodPost, "https://www.workbuddy.cn/v2/report", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.injectMainProcessProviderHeaders(req, account)
+
+	if got := req.Header.Get("X-Client-Version"); got != "" {
+		t.Errorf("X-Client-Version=%q want empty（profile 无 desktopIdeVersion）", got)
+	}
+
+	if got := req.Header.Get("X-Client-Platform"); got != clientPlatformWindows {
+		t.Errorf("X-Client-Platform=%q want %q", got, clientPlatformWindows)
+	}
+}
+
 func TestModelBusyGoldenHeaderSet(t *testing.T) {
 	t.Parallel()
 
@@ -308,16 +415,20 @@ func TestModelBusyGoldenHeaderSet(t *testing.T) {
 	assertHeaderKeys(t, req,
 		"Accept", "Content-Type", "User-Agent", "X-Request-Id",
 		"X-Product", "Authorization", "X-User-Id", "X-Domain",
+		"X-Client-Version", "X-Client-Platform", "X-Client-Product",
 	)
 
 	for name, want := range map[string]string{
-		"Accept":        "application/json, text/plain, */*",
-		"Content-Type":  "application/json",
-		"X-Product":     "SaaS",
-		"Authorization": "Bearer at",
-		"X-User-Id":     "u1",
-		"X-Domain":      "www.workbuddy.cn",
-		"User-Agent":    "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+		"Accept":            "application/json, text/plain, */*",
+		"Content-Type":      "application/json",
+		"X-Product":         "SaaS",
+		"Authorization":     "Bearer at",
+		"X-User-Id":         "u1",
+		"X-Domain":          "www.workbuddy.cn",
+		"User-Agent":        "WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/8.8.8",
+		"X-Client-Version":  "9.9.9",
+		"X-Client-Platform": "windows",
+		"X-Client-Product":  "WorkBuddy",
 	} {
 		if got := req.Header.Get(name); got != want {
 			t.Errorf("%s=%q want %q", name, got, want)
@@ -342,8 +453,9 @@ func TestModelBusyGoldenHeaderSet(t *testing.T) {
 	}
 }
 
-// TestModelBusyEnterpriseAccountBareToo 企业账号同样 8 轻头：真机样本是个人号，
-// 企业号是否带 X-Enterprise-Id / X-Tenant-Id 无证据，按「不猜测」不发。
+// TestModelBusyEnterpriseAccountBareToo 企业账号同样不带企业声明头：真机样本是个人号，
+// 企业号是否带 X-Enterprise-Id / X-Tenant-Id 无证据，按「不猜测」不发（轻头族 8 头 +
+// 客户端身份三头，#590）。
 func TestModelBusyEnterpriseAccountBareToo(t *testing.T) {
 	t.Parallel()
 
@@ -360,6 +472,7 @@ func TestModelBusyEnterpriseAccountBareToo(t *testing.T) {
 	assertHeaderKeys(t, req,
 		"Accept", "Content-Type", "User-Agent", "X-Request-Id",
 		"X-Product", "Authorization", "X-User-Id", "X-Domain",
+		"X-Client-Version", "X-Client-Platform", "X-Client-Product",
 	)
 }
 
@@ -750,6 +863,7 @@ func TestChatGoldenHeaderSet(t *testing.T) {
 		"X-Private-Data", "X-Product", "X-Request-Id",
 		"X-Requested-With", "X-Root-Request-Id", "X-Trace-Id", "X-User-Id",
 		"X-Device-Token",
+		"X-Client-Version", "X-Client-Platform", "X-Client-Product",
 		"x-stainless-arch", "x-stainless-lang", "x-stainless-os",
 		"x-stainless-package-version", "x-stainless-retry-count",
 		"x-stainless-runtime", "x-stainless-runtime-version",
@@ -761,6 +875,17 @@ func TestChatGoldenHeaderSet(t *testing.T) {
 
 	if got := req.Header.Get("X-Agent-Runtime"); got != "local-agent" {
 		t.Errorf("X-Agent-Runtime=%q want local-agent", got)
+	}
+
+	// 客户端身份三头与轻业务面同源：同一提供者按 origin 命中 chat（#590）。
+	for name, want := range map[string]string{
+		"X-Client-Version":  "9.9.9", // profile emit.desktopIdeVersion
+		"X-Client-Platform": "windows",
+		"X-Client-Product":  "WorkBuddy",
+	} {
+		if got := req.Header.Get(name); got != want {
+			t.Errorf("%s=%q want %q", name, got, want)
+		}
 	}
 
 	assertTraceFamily(t, req, convReqID)

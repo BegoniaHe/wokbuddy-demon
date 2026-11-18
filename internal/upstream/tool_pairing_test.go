@@ -347,6 +347,145 @@ func TestRepackToolResultBlocks(t *testing.T) {
 	})
 }
 
+// TestReorderEarlyToolResults 结果早于声明者的倒置形态必须把结果挪到 assistant 之后。
+//
+// Codex 经 cc-switch 一类本地代理转 /v1/responses 时 input 里 function_call_output
+// 排在 function_call 之前，出站即「tool 在 assistant 之前」→ 上游判 11148 顶死会话。
+func TestReorderEarlyToolResults(t *testing.T) {
+	t.Parallel()
+	t.Run("单条早到", func(t *testing.T) {
+		t.Parallel()
+
+		input := msgs(t, `[
+			{"role":"user","content":"u"},
+			{"role":"tool","tool_call_id":"c00","content":"r0"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
+			{"role":"user","content":"next"}
+		]`)
+
+		out, changed := reorderEarlyToolResults(input)
+		if !changed {
+			t.Fatal("changed=false，期望把早到结果后移")
+		}
+
+		assertSummary(t, summarize(out), []string{
+			"user(-)", "assistant(c00)", "tool(c00)", "user(-)",
+		})
+	})
+
+	t.Run("同批两条早到保持原相对顺序", func(t *testing.T) {
+		t.Parallel()
+
+		input := msgs(t, `[
+			{"role":"user","content":"u"},
+			{"role":"tool","tool_call_id":"c01","content":"r1"},
+			{"role":"tool","tool_call_id":"c00","content":"r0"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"},{"id":"c01"}]}
+		]`)
+
+		out, changed := reorderEarlyToolResults(input)
+		if !changed {
+			t.Fatal("changed=false，期望把早到结果后移")
+		}
+
+		assertSummary(t, summarize(out), []string{
+			"user(-)", "assistant(c00,c01)", "tool(c01)", "tool(c00)",
+		})
+	})
+
+	t.Run("正常结果与早到结果混排", func(t *testing.T) {
+		t.Parallel()
+
+		// 早到结果不插在紧跟 assistant 的位置：那会与同批正常结果的相对顺序冲突。
+		input := msgs(t, `[
+			{"role":"user","content":"u"},
+			{"role":"tool","tool_call_id":"c00","content":"r0"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"},{"id":"c01"}]},
+			{"role":"tool","tool_call_id":"c01","content":"r1"}
+		]`)
+
+		out, changed := reorderEarlyToolResults(input)
+		if !changed {
+			t.Fatal("changed=false，期望把早到结果后移")
+		}
+
+		assertSummary(t, summarize(out), []string{
+			"user(-)", "assistant(c00,c01)", "tool(c01)", "tool(c00)",
+		})
+	})
+
+	t.Run("顺序本就正确零改动", func(t *testing.T) {
+		t.Parallel()
+
+		input := msgs(t, `[
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
+			{"role":"tool","tool_call_id":"c00","content":"r0"},
+			{"role":"user","content":"next"}
+		]`)
+
+		if _, changed := reorderEarlyToolResults(input); changed {
+			t.Error("changed=true，顺序正确的报文不应重排")
+		}
+	})
+
+	t.Run("无声明者的孤儿结果原位不动", func(t *testing.T) {
+		t.Parallel()
+
+		input := msgs(t, `[
+			{"role":"tool","tool_call_id":"orphan","content":"r"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
+			{"role":"tool","tool_call_id":"c00","content":"r0"}
+		]`)
+
+		if _, changed := reorderEarlyToolResults(input); changed {
+			t.Error("changed=true，孤儿结果应交给 cleanupOrphanToolCalls 删除")
+		}
+	})
+
+	t.Run("同一 id 多次声明跟最后一次", func(t *testing.T) {
+		t.Parallel()
+
+		// 结果夹在两次声明之间：按最后一次声明判为早到，挪到末尾那次声明之后。
+		input := msgs(t, `[
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]},
+			{"role":"tool","tool_call_id":"c00","content":"r0"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"c00"}]}
+		]`)
+
+		out, changed := reorderEarlyToolResults(input)
+		if !changed {
+			t.Fatal("changed=false，期望按最后一次声明后移")
+		}
+
+		assertSummary(t, summarize(out), []string{
+			"assistant(c00)", "assistant(c00)", "tool(c00)",
+		})
+	})
+}
+
+// TestPrepareBodyReordersEarlyToolResults 全链路：出站管线必须把「结果早于调用」的
+// 倒置形态归一到上游认可的形态，且终态配对完整（cleanup 不得误删）。
+func TestPrepareBodyReordersEarlyToolResults(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"deepseek-v4.1-flash","messages":[
+		{"role":"user","content":"继续"},
+		{"role":"tool","tool_call_id":"call_early","content":"/opt"},
+		{"role":"assistant","content":null,"tool_calls":[{"id":"call_early","type":"function","function":{"name":"exec_command","arguments":"{}"}}]}
+	]}`
+	out := PrepareBodyOptWithEfforts([]byte(body), false, nil)
+
+	var obj map[string]any
+	if err := jsonx.Unmarshal(out, &obj); err != nil {
+		t.Fatalf("unmarshal 出站 body: %v", err)
+	}
+
+	messages, _ := obj["messages"].([]any)
+	assertSummary(t, summarize(messages), []string{
+		"user(-)", "assistant(call_early)", "tool(call_early)",
+	})
+}
+
 // TestCleanupOrphanToolCalls 缺一侧的配对必须两侧同口径剔除（否则残留半截配对 → 11148）。
 func TestCleanupOrphanToolCalls(t *testing.T) {
 	t.Parallel()

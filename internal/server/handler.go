@@ -1570,6 +1570,9 @@ type chatFlow struct {
 	turnKey     string
 	turnKeyBody []byte // prompt.Rewrite 之前的 body（轮级键按它派生）
 	stickyUID   string
+	// sysFP 入站 system 文本指纹（issue #591）：降级触发源的一半，在任何提示词
+	// 改写之前取一次。只存哈希前缀，不要把原文带进日志或状态。
+	sysFP string
 
 	// 轮转状态
 	tried map[string]bool
@@ -1941,6 +1944,9 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		rawModel: chatInput2.model,
 		realm:    realm,
 		realmErr: realmErr,
+		// 降级触发源里的 system 侧指纹：必须在 Append/Rewrite 改动 messages 之前
+		// 从入站 body 取（issue #591）。
+		sysFP: prompt.SystemFingerprint(chatInput2.body),
 		// 工具名名单：上游在没有 tools 的请求里会把工具调用吐成原生标记文本
 		// （见 upstream/dsml.go），修复层用它做严格判定。名单来自「本请求声明的
 		// tools」与「会话历史里出现过的工具名」两个来源。在提示词/模型名改写之前
@@ -1981,17 +1987,16 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 // applyPromptRewrite 按 PromptMode 改写出站提示词（轮转前、每请求一次）。
 //   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
 //   - append：开头连续 system/developer 块后插自有提示词，既有消息逐字不动。
-//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
-//   - append + 降级期：退化为 replace（带指纹原文重试是确定性再撞墙）。
+//   - passthrough：只补齐开头角色。
+//
+// 降级改写不在这里：它按「账号 + 入站 system 指纹」判定触发源，选号前账号未知，
+// 见 applyDegrade（issue #591）。
 func (f *chatFlow) applyPromptRewrite() {
 	switch {
 	case f.h.cfg.PromptMode == "custom" && f.h.cfg.PromptText != "":
 		f.body = prompt.Rewrite(f.body, f.h.cfg.PromptText)
-	case f.h.cfg.PromptMode == "append" && f.h.cfg.PromptText != "" && !f.h.degrade.Active():
+	case f.h.cfg.PromptMode == "append" && f.h.cfg.PromptText != "":
 		f.body = prompt.Append(f.body, f.h.cfg.PromptText)
-	case f.canDegrade() && f.h.degrade.Active():
-		f.body = prompt.Rewrite(f.body, prompt.Degraded)
-		f.degradedApplied = true
 	case f.h.cfg.PromptMode == "passthrough":
 		// 上游形态校验要求首条是 system；passthrough 不替换客户端提示词，
 		// 但必须补齐开头角色。用官方分发包的兜底文案，不能自造句（自造句本身是
@@ -2034,6 +2039,25 @@ func (f *chatFlow) initSessionKeys(body []byte) {
 // canDegrade 报告当前 PromptMode 是否支持降级重试（passthrough / append）。
 func (f *chatFlow) canDegrade() bool {
 	return f.h.cfg.PromptMode == "passthrough" || f.h.cfg.PromptMode == "append"
+}
+
+// applyDegrade 按触发源（账号 UID + 入站 system 指纹）判定是否把本次尝试的出站
+// 提示词换成 Degraded 中性提示词（issue #591）。
+//
+// 判据放在选号之后：触发源含账号，只有「同一账号 + 同一份 system 文本」的后续请求
+// 才继承降级；其他账号或其他人设的请求保持原文——一次误报不再改写全池。
+// degradedApplied 保证一次请求只改写一次：同一请求内换号后沿用（原文已知会撞墙，
+// 再带一次只会白撞 400）。
+func (f *chatFlow) applyDegrade(acct *auth.Auth) {
+	if f.degradedApplied || !f.canDegrade() || !f.h.degrade.Active(acct.UID, f.sysFP) {
+		return
+	}
+
+	f.body = prompt.Rewrite(f.body, prompt.Degraded)
+	f.degradedApplied = true
+
+	log.Printf("INFO: [server] degrade gate hit acct=%s sysfp=%s model=%s: system replaced with neutral prompt",
+		logfmt.Label(acct.UID, acct.NicknameValue()), sysFPLabel(f.sysFP), f.bareModel)
 }
 
 // buildChatMeta 组装会话头族（对话轮级聚合 ID + 透传 ID），轮转循环外生成一次：
@@ -2755,6 +2779,9 @@ func (f *chatFlow) penalizeRefreshFailure(acct *auth.Auth, err error) {
 
 // dispatch 发起一次上游转发，按错误分类与响应形态分派收尾。
 func (f *chatFlow) dispatch(ctx context.Context, acct *auth.Auth, i int) rotationAction {
+	// 降级判据含账号 + 入站 system 指纹，只能在选号后判定（issue #591）。
+	f.applyDegrade(acct)
+
 	// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 	attemptStarted := time.Now()
 	rc, status, respBody, terr := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, f.body, f.clientIP, f.chatMeta)
@@ -2883,8 +2910,8 @@ func (f *chatFlow) handleTransportError(
 //     - 11-128「通道校验失败」（ErrChannelRefused）：分类器按码+文案定性，同样按连续
 //     原文匹配，拆句后实测 200。
 //     两者都只重试一次、同号、正文逐字保留（客户端人设/项目约定不丢）；不换号、不罚
-//     号、不计连败，也**不**触发全局降级窗口——degrade.Trigger 会把整池降到次日 0 点，
-//     代价远大于一次重试。
+//     号、不计连败，也**不**触发降级窗口——降级会把该触发源（同账号 + 同 system 指纹）
+//     的后续请求降到次日 0 点，代价远大于一次重试。
 //  2. 拆句不适用（人格句这类拆开会废指令的短段）或拆完仍是 11128：回落到中性提示词降级
 //     重试（既有兜底，保留）。11-128 不走中性降级：通道证据在客户端一侧，换措辞无用，
 //     拆句后仍失败即按既有零动作透传（不罚号）。
@@ -2905,12 +2932,13 @@ func (f *chatFlow) retryContentBlocked(kind upstream.ErrKind, acct *auth.Auth, r
 		return false
 	}
 
-	f.h.degrade.Trigger()
+	f.h.degrade.Trigger(acct.UID, f.sysFP)
 	f.body = prompt.Rewrite(f.body, prompt.Degraded)
 	f.degradedApplied = true
 	delete(f.tried, acct.UID) // 单账号池也能拿到重试机会（降级重试占一次名额）
 	f.releaseHeld()
-	log.Printf("content-blocked (likely fingerprint false positive) -> degraded prompt retry")
+	log.Printf("INFO: [server] content-blocked acct=%s sysfp=%s model=%s (likely false positive)"+
+		" -> degraded retry", logfmt.Label(acct.UID, acct.NicknameValue()), sysFPLabel(f.sysFP), f.bareModel)
 
 	return true
 }
@@ -2972,10 +3000,10 @@ func (f *chatFlow) handleHTTPError(
 
 		return f.handleSessionDeadError(ctx, acct, status, respBody, i)
 	}
-	// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，触发降级
-	// 到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append 降级重试同样退化
-	// 为 replace——原文在场只会确定性再撞 400）。第二次仍被拦 → 回内容防火墙错误。
-	// 内容问题非账号问题：applyErrorPolicy 不罚账号。
+	// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，把该触发源
+	// （账号 + 入站 system 指纹）降级到次日 00:00 CST，换 Degraded 中性提示词同请求内
+	// 重试（append 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。第二次
+	// 仍被拦 → 回内容防火墙错误。内容问题非账号问题：applyErrorPolicy 不罚账号。
 	if f.retryContentBlocked(kind, acct, respBody) {
 		return rotContinue
 	}
@@ -3327,6 +3355,10 @@ func (f *chatFlow) handleStreamSuccess(
 			})
 
 		stream = cont
+		// 换段等待期补 SSE 注释帧（#578）：换段是全新上游 POST，大 prompt 的 prefill
+		// 常 3~15s，缺省部署（keepalive_interval=0）下这段时间零字节会被客户端 idle
+		// 超时断流。间隔沿用首帧等待期口径（ttfb_keepalive_interval，缺省 1500ms）。
+		cont.ContinueKeepalive(f.h.cfg.TTFBKeepaliveInterval)
 		// 惰性 defer：Release 自带 nil 判定，normal 路径与提前返回路径都不会漏还。
 		defer cont.Release()
 	}

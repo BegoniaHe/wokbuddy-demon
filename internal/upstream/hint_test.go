@@ -51,6 +51,56 @@ func TestGatewayHintModelParamInvalidToolSchema(t *testing.T) {
 	}
 }
 
+// TestGatewayHintToolDefinitionRejection 工具定义侧的请求级拒收（11129 工具定义不合规 /
+// 11152 工具名称不规范）：只在请求确实声明了 tools 时给「检查 tools」的指向；11101
+// 请求体畸形不给（否则客户端会去翻自己的 schema）。
+func TestGatewayHintToolDefinitionRejection(t *testing.T) {
+	t.Parallel()
+
+	bodies := []struct {
+		name string
+		body string
+	}{
+		{"11129 业务码", `{"code":11129,"msg":"Invalid tool definition. Start a new task and retry"}`},
+		{"11152 业务码", `{"code":11152,"msg":"Invalid tool names. Start a new task and retry"}`},
+		{"11152 中文文案", `{"code":11152,"msg":"工具名称不规范，请新建任务重试"}`},
+		{"11129 数字 code 无空格", `{"code":11129,"msg":"bad tool"}`},
+	}
+
+	for _, item := range bodies {
+		kind := Classify(400, item.body)
+		if kind != ErrBadParams {
+			t.Fatalf("%s: 分类变了: %v", item.name, kind)
+		}
+
+		hint := GatewayHint(kind, item.body, HintContext{HasTools: true})
+		if !strings.Contains(hint, "tools[].function.parameters") {
+			t.Fatalf("%s: 未声明 tools 指向: %q", item.name, hint)
+		}
+
+		// 没声明 tools 的请求不能按它指去改 tools。
+		if got := GatewayHint(kind, item.body, HintContext{}); got != "" {
+			t.Fatalf("%s: 未声明 tools 却给了 hint: %q", item.name, got)
+		}
+	}
+
+	// 11101 请求体畸形：即使声明了 tools 也不指向 schema。
+	badParams := `{"code":11101,"msg":"Unmarshal chat params failed with error: unexpected EOF"}`
+	if got := GatewayHint(ErrBadParams, badParams, HintContext{HasTools: true}); got != "" {
+		t.Fatalf("11101 被指去改 tools: %q", got)
+	}
+
+	// 上游丢业务码只留文案（官方 i18n 原文）时同样命中，但仍以 hasTools 为前提。
+	textOnly := `{"msg":"Invalid tool definition. Start a new task and retry"}`
+	if got := GatewayHint(ErrBadParams, textOnly, HintContext{HasTools: true}); !strings.Contains(got, "tools[].function.parameters") {
+		t.Fatalf("文案形态未命中: %q", got)
+	}
+
+	if got := GatewayHint(ErrBadParams, textOnly, HintContext{}); got != "" {
+		t.Fatalf("文案形态在未声明 tools 时给了 hint: %q", got)
+	}
+}
+
 // TestBusinessFrameError 钉住顶层业务错误信封的判定口径：code 字符串/数字均可，
 // 0 与空串不是错误，error/choices 帧归各自的既有分支处理。
 func TestBusinessFrameError(t *testing.T) {

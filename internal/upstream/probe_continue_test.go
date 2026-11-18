@@ -428,6 +428,213 @@ func TestTextContinueReaderMergesUsageAcrossRescues(t *testing.T) {
 	}
 }
 
+// TestTextContinueReaderStopsWhenRescueWroteNothing 续写段一字未写时不再发起第二次
+// （issue #585）：同样的前缀 + 同样的指令几乎必然得到同样的空结果，第二次请求只是把
+// 整段上下文再付一次上游调用。
+func TestTextContinueReaderStopsWhenRescueWroteNothing(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"我将开始修改 foo.go"}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+	// 续写段只有 stop，没有任何正文。
+	empty := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	calls := 0
+
+	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false,
+		func(string, TailKind) (io.ReadCloser, error) {
+			calls++
+
+			return closeString{strings.NewReader(empty)}, nil
+		})
+	r.ContinueOnStopTail(func(string) TailKind { return TailPromise }, false, nil)
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("续写次数=%d want 1（续写段零正文，不再发起第二次）", calls)
+	}
+
+	if got := strings.Count(string(out), `"finish_reason":"stop"`); got != 1 {
+		t.Fatalf("终态数=%d want 1: %s", got, out)
+	}
+
+	if got := strings.Count(string(out), "[DONE]"); got != 1 {
+		t.Fatalf("[DONE] 数=%d want 1: %s", got, out)
+	}
+}
+
+// TestTextContinueReaderDropsCompletionDeclaration 续写段只回「已完成」时（issue #589）：
+// 这几个字不进客户端正文，也不再为它发起一次救援。带句末标点的写法一并拦——模型几乎
+// 总会给「已完成」补一个句号。
+func TestTextContinueReaderDropsCompletionDeclaration(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"我将开始修改 foo.go"}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	for _, declaration := range []string{"已完成", "已完成。", "已经完成！"} {
+		t.Run(declaration, func(t *testing.T) {
+			t.Parallel()
+
+			declared := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"` + declaration + `"}}]}` + "\n\n" +
+				`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: [DONE]\n\n"
+
+			calls := 0
+
+			r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false,
+				func(string, TailKind) (io.ReadCloser, error) {
+					calls++
+
+					return closeString{strings.NewReader(declared)}, nil
+				})
+			r.ContinueOnStopTail(func(string) TailKind { return TailPromise }, false, nil)
+
+			out, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if calls != 1 {
+				t.Fatalf("续写次数=%d want 1（声明完成即终态）", calls)
+			}
+
+			if strings.Contains(string(out), "已完成") || strings.Contains(string(out), "已经完成") {
+				t.Fatalf("声明完成不应拼进客户端正文: %s", out)
+			}
+
+			if !strings.Contains(string(out), "我将开始修改 foo.go") {
+				t.Fatalf("首段正文不应丢失: %s", out)
+			}
+
+			if got := strings.Count(string(out), `"finish_reason":"stop"`); got != 1 {
+				t.Fatalf("终态数=%d want 1: %s", got, out)
+			}
+
+			if got := strings.Count(string(out), "[DONE]"); got != 1 {
+				t.Fatalf("[DONE] 数=%d want 1: %s", got, out)
+			}
+		})
+	}
+}
+
+// TestTextContinueReaderDropsDeclarationAfterRoleFrame 续写段以 role-only delta 开帧
+// （真机常见）或先来只带思考的帧时，「已完成」同样不下发（#589）：元数据帧不代表本段
+// 正文结束，不能因此提前放行暂存帧，否则整个判定被关掉。
+func TestTextContinueReaderDropsDeclarationAfterRoleFrame(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"我将开始修改 foo.go"}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	for _, lead := range []string{
+		`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}` + "\n\n",
+		`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"reasoning_content":"再想一下"}}]}` + "\n\n",
+	} {
+		t.Run(lead, func(t *testing.T) {
+			t.Parallel()
+
+			declared := lead +
+				`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"已完成"}}]}` + "\n\n" +
+				`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: [DONE]\n\n"
+
+			calls := 0
+
+			r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false,
+				func(string, TailKind) (io.ReadCloser, error) {
+					calls++
+
+					return closeString{strings.NewReader(declared)}, nil
+				})
+			r.ContinueOnStopTail(func(string) TailKind { return TailPromise }, false, nil)
+
+			out, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if calls != 1 {
+				t.Fatalf("续写次数=%d want 1（声明完成即终态）", calls)
+			}
+
+			if strings.Contains(string(out), "已完成") {
+				t.Fatalf("「已完成」不应写进客户端正文: %s", out)
+			}
+
+			if !strings.Contains(string(out), "我将开始修改 foo.go") {
+				t.Fatalf("首段正文不应丢失: %s", out)
+			}
+
+			if got := strings.Count(string(out), `"finish_reason":"stop"`); got != 1 {
+				t.Fatalf("终态数=%d want 1: %s", got, out)
+			}
+
+			if got := strings.Count(string(out), "[DONE]"); got != 1 {
+				t.Fatalf("[DONE] 数=%d want 1: %s", got, out)
+			}
+		})
+	}
+}
+
+// TestTextContinueReaderStreamsRealContinuation 续写段的真实正文照常下发：暂存机制
+// 只拦「已完成」这类声明，不吞内容——包括以「已完成」开头但随后是正文的形态。
+func TestTextContinueReaderStreamsRealContinuation(t *testing.T) {
+	t.Parallel()
+
+	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"我将开始修改 foo.go"}}]}` + "\n\n" +
+		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+		"data: [DONE]\n\n"
+
+	for _, tail := range []string{"改好了。", "已完成三处调用修改并跑通测试。"} {
+		t.Run(tail, func(t *testing.T) {
+			t.Parallel()
+
+			second := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"` + tail + `"}}]}` + "\n\n" +
+				`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: [DONE]\n\n"
+
+			calls := 0
+
+			r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false,
+				func(string, TailKind) (io.ReadCloser, error) {
+					calls++
+
+					return closeString{strings.NewReader(second)}, nil
+				})
+			// 只有首段触发救援：续写段的 stop 按 TailNone 收尾，本用例只关心内容是否下发。
+			r.ContinueOnStopTail(func(string) TailKind {
+				if calls == 0 {
+					return TailPromise
+				}
+
+				return TailNone
+			}, false, nil)
+
+			out, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if calls != 1 {
+				t.Fatalf("续写次数=%d want 1", calls)
+			}
+
+			if !strings.Contains(string(out), tail) {
+				t.Fatalf("续写正文不应丢失: %s", out)
+			}
+		})
+	}
+}
+
 // TestTextContinueReaderKeepsStopInUsageFrame 上游把 stop 与 usage 放同一帧：工具轮
 // 续写没带回调用时，首段 stop 必须补发（#495），否则整条响应没有任何 finish_reason。
 func TestTextContinueReaderKeepsStopInUsageFrame(t *testing.T) {
