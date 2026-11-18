@@ -33,6 +33,41 @@ const sseTailToolCall = "data: {\"id\":\"c2\",\"choices\":[{\"index\":0," +
 	"data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
 	"data: [DONE]\n\n"
 
+// TestLastSentenceBoundary 末句切分的半角句界（issue #586）：`.` `!` `?` 只有后接
+// 空白或行尾才切；URL 查询串、文件名、版本号与紧贴下文的标点都不切。
+func TestLastSentenceBoundary(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		// 半角标点后接正文：不是句界，整句保留。
+		{"url-query", "我将读取 https://example.com/a?q=1", "我将读取 https://example.com/a?q=1"},
+		{"bang-tight", "我将开始修复!现在", "我将开始修复!现在"},
+		{"filename", "我将开始修改 internal/verify/check.go", "我将开始修改 internal/verify/check.go"},
+		{"version", "我把依赖升到 v1.2", "我把依赖升到 v1.2"},
+		// 半角标点后接空白或行尾：是句界，正常切。
+		{"bang-space", "Done! Next I will check the logs.", "Next I will check the logs"},
+		{"question-space", "先说明一处? 我把余下的都改完了", "我把余下的都改完了"},
+		{"dot-space", "先说明一处. 我把余下的都改完了", "我把余下的都改完了"},
+		{"newline", "先说明一处\n我把余下的都改完了", "我把余下的都改完了"},
+		// 全角标点保持任意位置切句。
+		{"full-width", "我先说明。我将开始修改 check.go", "我将开始修改 check.go"},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := lastSentence(testCase.text); got != testCase.want {
+				t.Errorf("lastSentence(%q)=%q want %q", testCase.text, got, testCase.want)
+			}
+		})
+	}
+}
+
 // TestClassifyTail 尾部形态判据（issue #495 / #570）：标点型悬停、无标点承诺句、
 // 结构未闭合分别归位；完整句、等用户回话、超长标点型悬停不救。
 func TestClassifyTail(t *testing.T) {
@@ -56,6 +91,9 @@ func TestClassifyTail(t *testing.T) {
 		{"empty", "   ", false, upstream.TailNone},
 		{"promise-short", "我将开始修改 internal/verify/check.go", false, upstream.TailPromise},
 		{"promise-long", longPrefix + "我将开始修改 internal/verify/check.go", false, upstream.TailPromise},
+		// 半角标点后接正文不是句界（issue #586）：URL 查询串与紧贴的感叹号都保住末句。
+		{"promise-with-url-query", "我将读取 https://example.com/a?q=1", false, upstream.TailPromise},
+		{"promise-bang-tight", "我将开始修复!现在", false, upstream.TailPromise},
 		// 长度闸门只约束标点型悬停：超长的「停在冒号上」多半是正常排版。
 		{"punctuated-too-long", longPrefix + "改动清单如下：", false, upstream.TailNone},
 		// 交回控制权是故意的收尾，不能替用户拍板。

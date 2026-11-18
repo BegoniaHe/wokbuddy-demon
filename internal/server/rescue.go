@@ -7,6 +7,7 @@ package server
 
 import (
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -304,12 +305,17 @@ func lastSentence(text string) string {
 }
 
 // sentenceBoundary 报告该位置是否是句末分隔点（只用于切最后一句）。
+//
+// 半角 `.` `!` `?` 只有后接空白或行尾才算句界（issue #586）：URL 查询串
+// （`…/a?q=1`）、文件名（`internal/verify/check.go`）、版本号（`v1.2`）与紧贴下文
+// 的感叹号（`我将开始修复!现在`）都不是句子交界，按任意位置切会把真正的末句
+// 切成半截，承诺句判据再也看不到「我将…」。全角 `。！？` 保持任意位置切句。
 func sentenceBoundary(runes []rune, i int) bool {
 	switch runes[i] {
-	case '。', '！', '？', '!', '?', '\n':
+	case '。', '！', '？', '\n':
 		return true
-	case '.':
-		return i+1 >= len(runes) || runes[i+1] == ' ' || runes[i+1] == '\n'
+	case '.', '!', '?':
+		return i+1 >= len(runes) || unicode.IsSpace(runes[i+1])
 	}
 
 	return false
