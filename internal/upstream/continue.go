@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"strings"
 	"sync"
@@ -878,7 +879,7 @@ func (c *TextContinueReader) tryContinue(eof bool) bool {
 	partial := c.text.String()
 
 	go func() {
-		next, err := c.open(partial, kind)
+		next, err := c.openContinue(partial, kind)
 		// Close 已放弃本次换段时由发起方回收响应体：没人会再消费它。
 		select {
 		case wait.result <- continueResult{src: next, err: err}:
@@ -890,6 +891,33 @@ func (c *TextContinueReader) tryContinue(eof bool) bool {
 	}()
 
 	return true
+}
+
+// errContinueOpenPanic 换段协程里 open panic 的替身错误：按换段失败收尾，不向上抛。
+var errContinueOpenPanic = errors.New("续写请求 panic（已隔离）")
+
+// openContinue 在换段协程里调用 open 并隔离 panic。换段跑在独立 goroutine 上，
+// 没有 net/http 的按请求 recover 兜底，一次 panic 就是进程级终止；隔离后按换段失败
+// 收尾（补发首段终态），客户端拿到已写出的前半段而不是连接被掐断。
+func (c *TextContinueReader) openContinue(partial string, kind TailKind) (io.ReadCloser, error) {
+	var (
+		next io.ReadCloser
+		err  error
+	)
+
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				log.Printf("ERR: [upstream] 续写请求 panic（已隔离）: %v", recovered)
+
+				next, err = nil, errContinueOpenPanic
+			}
+		}()
+
+		next, err = c.open(partial, kind)
+	}()
+
+	return next, err
 }
 
 // pumpContinue 等待在途换段：结果到达则切换新流或按首段终态收尾；未到达则按

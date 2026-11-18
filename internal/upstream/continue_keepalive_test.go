@@ -203,3 +203,29 @@ func TestTextContinueReaderKeepaliveCloseReapsLateBody(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// TestTextContinueReaderSwitchPanicIsolated 换段协程里 panic 必须隔离：换段跑在独立
+// goroutine 上，没有 net/http 的按请求 recover，未隔离就是进程级终止。隔离后按换段
+// 失败收尾（补发首段终态与唯一一条 [DONE]），不向上抛。
+func TestTextContinueReaderSwitchPanicIsolated(t *testing.T) {
+	t.Parallel()
+
+	r := NewTextContinueReader(closeString{strings.NewReader(continueTestFirst)}, "", false,
+		func(string, TailKind) (io.ReadCloser, error) {
+			panic("boom")
+		}).ContinueKeepalive(20 * time.Millisecond)
+	defer r.Close()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	if !strings.Contains(string(out), `"finish_reason":"length"`) {
+		t.Errorf("首段终态未补发: %q", out)
+	}
+
+	if n := strings.Count(string(out), "data: [DONE]"); n != 1 {
+		t.Errorf("[DONE] 数量=%d want 1: %q", n, out)
+	}
+}
