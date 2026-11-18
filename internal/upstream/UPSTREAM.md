@@ -307,6 +307,41 @@ global 5.9.4→5.11.4 的端点/头族漂移已用 `protocol_sweep --compare` �
 refresh 仍是 `/v2${prefixPath}/auth/token/refresh`（未变）；逐表面指纹重对齐属独立议题。
 后续审计从 `27b7458f` 之后开始。
 
+2026-11-18 续审 `27b7458f..733942a7`（63 条：51 非 merge + 12 merge；窗口 2026-11-16..18）。
+官方基线未变（cn `5.11.3.43806934-ecace0f7` / global `5.11.4.44121853-0026dff0`），
+只重跑 `download_latest --dry-run` 复核解包树。8 项 `issue` 记入 4 单（新开 3 单）：
+
+- **#583**（工具 schema 出站纠偏）：`615dc753` / `733942a7` — `11129` / `11152` 的分类
+  本仓已对（`client.go:974-977` `requestLevelCodes`），缺的是 `payload.go:787-866` 只有
+  `\_` 归一与 `enum` 补 `type`，没有关键字**取值类型**纠偏（`minimum:"1"`、
+  `uniqueItems:"true"`、`description:123`、`required` 重复）与顶层 `$ref` 展开；`hint.go:56-60`
+  自述 `ErrBadParams` 无 hint。官方证据：cn 5.11.3 `renderer/assets/en-BZmJsSE5.js`
+  `"errorCode.11152":Invalid tool names. Start a new task and retry`、
+  `"errorCode.11129":Invalid tool definition. Start a new task and retry`；`zh-cn-J68R5HFz.js`
+  「工具名称不规范，请新建任务重试」「工具定义不合规，请新建任务重试」。关键字拒收集合是
+  参考侧 2026-11-18 于 `www.workbuddy.cn` 的活体证据，实现前需用本仓账号复测。
+- **#584**（`/v1/responses` 回放）：`0e41952f` / `94a68792` / `fdf05eae` / `f6682159` —
+  `responses.go:448-483` 对 `reasoning` / `compaction` 落 `default` 丢弃，`:485-497`
+  只认 user/assistant/system 且返回 `{role, content}`；Chat 形状 `{"role":"tool","tool_call_id":...}`
+  整请求 400（实测复现），assistant 的 `tool_calls` / `reasoning_content` 被剥后与结果成孤儿。
+- **#585**（救援无进展）：`6c508881` — `continue.go:726-757` 只判次数上限，没有「上次救援后
+  正文长度未变则不再救」的判据，救援段只回 `finish=stop` 时第二次请求体一字不差地重发。
+- **#577**（已开）：`e14a3d03` 是同一缺口的细化（早到结果按最近一次声明配对，跨轮复用 id
+  不再误挪），实现 #577 时一并覆盖，不新开单。
+
+确认已覆盖、记 `skip` 的实质项：`ae44d739`（实测 `FrameKind` 对 11151/11129/11115/11148/11101/11152
+的帧均定出请求级 kind，全部命中 `handler.go:3119-3125` `failFastKind`，不轮转）、
+`96265d71` / `77ca3fe7`（`headers.go:285-330` 的 `mainProcess` 与 `surfaceGrowth` 边界已按 #551
+落地）、`d6301fe9`（`payload.go:840-866` 的 `schemaValueKeys` / `schemaMapKeys` 已覆盖值域与容器名）、
+`224fc567` / `f1394fea`（`rescue.go:285-317` 的半角点切句）、`bb8a9536`（无标点只在末句承诺时救）。
+
+2 项 `revisit`：`183c470b`（未闭合代码块 / 截断调用标记是否需专用指令，缺漏救样本）、
+`f8d83465`（救援指令的「已完成」出口，缺假阳性样本）。其余 `skip` 按簇：面板实时任务卡 16 条
+（`internal/panel/tasklive.go` + `app.js`，参考侧面板技术栈）、异步换段收尾 5 条（本仓仍同步
+`tryContinue`，根因由 #578 跟踪）、官方头夹具与 CI 2 条、真机探针与测试组织 6 条、
+narration 判据/词表 6 条（本仓 `rescue.go` 独立实现，#570 已结单）、无对应模块 2 条
+（`internal/updater`、`internal/server/searchtool.go` 的 `probeOnce`）。后续审计从 `733942a7` 之后开始。
+
 ## 四、本分支相对基线的演进（节选）
 
 - **可视化运维层**：内嵌 Web 管理面板（账号运维 / 用量与积分 / 模型档位 / 在线改配置 / 运行日志 / 任务中心）。
@@ -545,4 +580,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-13（参考 fork 审计基线 `1c007bb0`；窗口 `79ba3d62..1c007bb0` 共 4 项=4 非 merge + 0 纯 merge，官方 Win32 版本未变；新开 #511 签到回执四态、#512 上游注入身份指令脱敏，星巴克限时活动领奖 2 条按 skip；不直接吸收）。_
+_最近更新：2026-11-18（参考 fork 审计基线 `733942a7`；窗口 `27b7458f..733942a7` 共 63 项=51 非 merge + 12 merge，官方 Win32 版本未变；新开 #583 工具 schema 关键字/顶层 `$ref` 纠偏、#584 `/v1/responses` 回放、#585 救援无进展，`e14a3d03` 并入 #577，2 项 revisit；不直接吸收）。_
