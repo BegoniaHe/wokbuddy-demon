@@ -340,6 +340,80 @@ func TestChatMidTextYieldMarkerStillRescued(t *testing.T) {
 	}
 }
 
+// markupTail 把 `||` 替换成标记分隔符（两个全角竖线 U+FF5C）：源码里不写死
+// 全角字面量，避免编辑器/复制粘贴静默改坏。
+func markupTail(body string) string {
+	return strings.ReplaceAll(body, "||", "\uFF5C\uFF5C")
+}
+
+// TestClassifyTailUnclosedMarkup 截断的原生工具调用标记按结构未闭合处理（issue #588）：
+// 与未闭合代码块同类；标记闭合完整时照常落 TailNone。
+func TestClassifyTailUnclosedMarkup(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		text string
+		want upstream.TailKind
+	}{
+		{"unclosed-calls", markupTail("我先执行命令：\n<||DSML|| calls>\n" +
+			"<||DSML|| invoke name=\"exec_command\">\n" +
+			"<||DSML|| parameter name=\"cmd\" string=\"true\">ls -la"), upstream.TailStructural},
+		{"truncated-attribute", markupTail("先执行\n<||DSML|| parameter name=\"cm"), upstream.TailStructural},
+		{"closed-block", markupTail("已执行\n<||DSML|| calls>\n" +
+			"<||DSML|| invoke name=\"exec_command\">\n" +
+			"<||DSML|| parameter name=\"cmd\" string=\"true\">ls -la</||DSML|| parameter>\n" +
+			"</||DSML|| invoke>\n</||DSML|| calls>"), upstream.TailNone},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := classifyTail(testCase.text, false); got != testCase.want {
+				t.Errorf("classifyTail(%q)=%v want %v", testCase.text, got, testCase.want)
+			}
+		})
+	}
+}
+
+// TestChatStructuralMarkupTailRescued 截断的调用标记触发一次救援，且用通用「从断点
+// 接着写」指令，不套承诺句文案（issue #588）。
+func TestChatStructuralMarkupTailRescued(t *testing.T) {
+	t.Parallel()
+
+	truncated := markupTail("我先执行命令：\n<||DSML|| calls>\n" +
+		"<||DSML|| invoke name=\"exec_command\">\n<||DSML|| parameter name=\"cm")
+
+	client, bodies := fakeUpstreamCapturingBodies(t, func(call int) string {
+		if call == 1 {
+			return sseStopContent(truncated)
+		}
+
+		return sseStopContent(markupTail("d\" string=\"true\">ls -la</||DSML|| parameter>"))
+	})
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	got := chatBodies(bodies)
+	if len(got) != 2 {
+		t.Fatalf("请求数=%d want 2（结构未闭合救一次）", len(got))
+	}
+
+	if !strings.Contains(got[1], "from exactly where it stopped") {
+		t.Errorf("截断标记应带通用续写指令: %s", got[1])
+	}
+
+	if strings.Contains(got[1], "承诺句") {
+		t.Errorf("截断标记不应复用承诺句指令: %s", got[1])
+	}
+}
+
 // TestChatPunctuatedTailTooLongNotRescued 标点型悬停超过长度闸门：多半是正常排版
 // （说明 + 列表），不救。
 func TestChatPunctuatedTailTooLongNotRescued(t *testing.T) {
