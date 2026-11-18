@@ -709,9 +709,22 @@ func (c *TextContinueReader) holdUntilSettled(frame map[string]any) bool {
 		return true
 	}
 
+	// 元数据帧（role-only 首帧、只带思考的帧、空 delta）不代表本段正文结束：放行且
+	// 不收尾。真机续写段常以 `delta.role` 开帧，收尾会把「先暂存再判定」整个关掉，
+	// 「已完成」照样写进客户端正文（#589）。
+	if !frameEndsSegment(frame) {
+		return false
+	}
+
 	c.settleSegment()
 
 	return false
+}
+
+// frameEndsSegment 报告帧是否代表本段正文已经结束（终态 / 工具调用 / 用量）：
+// 只有这类帧才需要先把暂存的正文定性放行，再写出自己。
+func frameEndsSegment(frame map[string]any) bool {
+	return frameHasToolCalls(frame) || frameHasFinish(frame) || frameHasUsage(frame)
 }
 
 // frameTextOnly 报告帧只携带正文（不带工具调用）：只有这种帧可以暂存后丢弃。
