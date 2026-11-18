@@ -1,14 +1,19 @@
 package server
 
 import (
+	"bytes"
+	"encoding/base64"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 func TestResponsesRequestMapping(t *testing.T) {
@@ -210,7 +215,7 @@ func TestResponsesRequestIgnoresUnknownItem(t *testing.T) {
 	body := `{"model":"m","input":[
 		{"type":"message","role":"user","content":"hi"},
 		{"type":"web_search_call","id":"ws_1","status":"completed"},
-		{"type":"compaction","encrypted_content":"xx"}
+		{"type":"compaction","encrypted_content":"xX9f_-Qm9zLpT0aV3rYb8cN2dE5fG7hJ1kM4nP6qR8sT"}
 	]}`
 
 	raw, _, _, _, err := responsesToOpenAI([]byte(body))
@@ -772,7 +777,9 @@ func TestResponsesRequestRejectsNullInput(t *testing.T) {
 	}
 }
 
-func TestResponsesRequestIgnoresReasoningItem(t *testing.T) {
+// TestResponsesRequestDropsReasoningAtBoundary reasoning 项只在后继 assistant 落地时
+// 挂载；user / tool 边界上没有归属，就地丢弃，不跨轮泄漏（issue #584）。
+func TestResponsesRequestDropsReasoningAtBoundary(t *testing.T) {
 	t.Parallel()
 
 	body := `{
@@ -783,7 +790,8 @@ func TestResponsesRequestIgnoresReasoningItem(t *testing.T) {
 			{"type":"message","role":"user","content":"hi"},
 			{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{\"q\":1}"},
 			{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"think"}]},
-			{"type":"function_call_output","call_id":"c1","output":"ok"}
+			{"type":"function_call_output","call_id":"c1","output":"ok"},
+			{"type":"reasoning","id":"rs_2","summary":[{"type":"summary_text","text":"tail"}]}
 		]
 	}`
 
@@ -799,10 +807,108 @@ func TestResponsesRequestIgnoresReasoningItem(t *testing.T) {
 
 	msgs, _ := got["messages"].([]any)
 	if len(msgs) != 4 {
-		t.Fatalf("messages=%d want 4 (reasoning 应被忽略): %v", len(msgs), msgs)
+		t.Fatalf("messages=%d want 4（边界上的 reasoning 应丢弃）: %v", len(msgs), msgs)
 	}
 
 	assertResponsesMessages(t, msgs)
+
+	for i, raw2 := range msgs {
+		if _, ok := raw2.(map[string]any)["reasoning_content"]; ok {
+			t.Errorf("messages[%d] 不该带 reasoning_content: %v", i, raw2)
+		}
+	}
+}
+
+// TestResponsesRequestReplaysReasoning reasoning 项解出的思考挂到后继 assistant 的
+// reasoning_content：正文消息与工具调用批次都算同一轮，连续段按 "\n" 拼接，
+// 空文本既不产出消息也不产出字段（issue #584）。
+func TestResponsesRequestReplaysReasoning(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name    string
+		input   string
+		want    []string
+		wantMsg int
+	}{
+		{
+			name: "思考挂到后继 assistant 正文",
+			input: `{"type":"reasoning","summary":[{"type":"summary_text","text":"plan"}]},
+				{"type":"message","role":"assistant","content":"done"}`,
+			want:    []string{"plan"},
+			wantMsg: 1,
+		},
+		{
+			name: "连续思考段按换行拼接",
+			input: `{"type":"reasoning","summary":[{"type":"summary_text","text":"first"}]},
+				{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},
+				{"type":"message","role":"assistant","content":"done"}`,
+			want:    []string{"first\nsecond"},
+			wantMsg: 1,
+		},
+		{
+			name: "summary 缺失时退到 content",
+			input: `{"type":"reasoning","content":[{"type":"reasoning_text","text":"deep"}]},
+				{"type":"message","role":"assistant","content":"done"}`,
+			want:    []string{"deep"},
+			wantMsg: 1,
+		},
+		{
+			name: "思考挂到工具调用批次",
+			input: `{"type":"reasoning","summary":[{"type":"summary_text","text":"need tool"}]},
+				{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"}`,
+			want:    []string{"need tool"},
+			wantMsg: 1,
+		},
+		{
+			name: "空思考不产出字段",
+			input: `{"type":"reasoning","summary":[]},
+				{"type":"message","role":"assistant","content":"done"}`,
+			want:    []string{""},
+			wantMsg: 1,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			body := `{"model":"m","input":[` + testCase.input + `]}`
+
+			raw, _, _, _, err := responsesToOpenAI([]byte(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var got map[string]any
+			if err := jsonx.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
+			}
+
+			msgs, _ := got["messages"].([]any)
+			if len(msgs) != testCase.wantMsg {
+				t.Fatalf("messages=%d want %d: %v", len(msgs), testCase.wantMsg, msgs)
+			}
+
+			assertReasoningContent(t, msgs, testCase.want[0])
+		})
+	}
+}
+
+// assertReasoningContent 断言转换结果里唯一的 reasoning_content 取值符合预期。
+func assertReasoningContent(t *testing.T, msgs []any, want string) {
+	t.Helper()
+
+	got := ""
+
+	for _, raw := range msgs {
+		msg, _ := raw.(map[string]any)
+		if value, ok := msg["reasoning_content"].(string); ok {
+			got = value
+		}
+	}
+
+	if got != want {
+		t.Errorf("reasoning_content=%q want %q: %v", got, want, msgs)
+	}
 }
 
 func TestResponsesRequestRejectsReasoningOnlyInput(t *testing.T) {
@@ -811,6 +917,348 @@ func TestResponsesRequestRejectsReasoningOnlyInput(t *testing.T) {
 	body := `{"model":"m","input":[{"type":"reasoning","id":"rs_1","summary":[]}]}`
 	if _, _, _, _, err := responsesToOpenAI([]byte(body)); !errors.Is(err, errNoConvertibleItems) {
 		t.Fatalf("reasoning-only input error = %v, want %v", err, errNoConvertibleItems)
+	}
+}
+
+// TestResponsesRequestChatShapedToolPairs 客户端把 chat messages 原样塞进 input 时，
+// role=tool 的工具结果必须保住 tool_call_id 与 name，出站的 assistant.tool_calls 与
+// tool 结果仍成对（否则 cleanupOrphanToolCalls 把这一对一起删掉，issue #584）。
+func TestResponsesRequestChatShapedToolPairs(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"glm-5.2",
+		"input":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"","reasoning_content":"plan",
+				"tool_calls":[{"id":"call_1","type":"function",
+					"function":{"name":"lookup","arguments":"{\"q\":1}"}}]},
+			{"role":"tool","tool_call_id":"call_1","name":"lookup","content":"ok"}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatalf("Chat 形状的 tool 项不该 400: %v", err)
+	}
+
+	var converted map[string]any
+	if err := jsonx.Unmarshal(raw, &converted); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := converted["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("messages=%d want 3: %v", len(msgs), msgs)
+	}
+
+	assistant := msgs[1].(map[string]any)
+
+	calls, _ := assistant["tool_calls"].([]any)
+	if len(calls) != 1 || calls[0].(map[string]any)["id"] != "call_1" {
+		t.Fatalf("assistant.tool_calls=%v", assistant["tool_calls"])
+	}
+
+	if assistant["reasoning_content"] != "plan" {
+		t.Errorf("assistant.reasoning_content=%v", assistant["reasoning_content"])
+	}
+
+	tool := msgs[2].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_1" || tool["name"] != "lookup" {
+		t.Fatalf("tool=%v", tool)
+	}
+
+	assertChatToolPairSurvivesOutbound(t, body)
+}
+
+// assertChatToolPairSurvivesOutbound 走完整出站管线（cleanupOrphanToolCalls 在内），
+// 断言上游收到的请求里调用与结果仍成对。
+func assertChatToolPairSurvivesOutbound(t *testing.T, body string) {
+	t.Helper()
+
+	var captured []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			captured, _ = io.ReadAll(r.Body)
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(sseOK)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	var outbound map[string]any
+	if err := jsonx.Unmarshal(captured, &outbound); err != nil {
+		t.Fatalf("出站请求体解析失败: %v (%s)", err, captured)
+	}
+
+	msgs, _ := outbound["messages"].([]any)
+
+	callIDs := map[string]bool{}
+
+	for _, item := range msgs {
+		msg, _ := item.(map[string]any)
+
+		if calls, ok := msg["tool_calls"].([]any); ok {
+			for _, call := range calls {
+				callIDs[stringValue(call.(map[string]any)["id"])] = true
+			}
+		}
+	}
+
+	resultIDs := map[string]bool{}
+
+	for _, item := range msgs {
+		msg, _ := item.(map[string]any)
+		if msg["role"] == "tool" {
+			resultIDs[stringValue(msg["tool_call_id"])] = true
+		}
+	}
+
+	if !callIDs["call_1"] || !resultIDs["call_1"] {
+		t.Fatalf("出站配对丢失: 调用=%v 结果=%v (%s)", callIDs, resultIDs, captured)
+	}
+}
+
+// TestResponsesRequestChatShapedToolImages Chat 形状工具结果里的图片按
+// function_call_output 同一条路径拆分，并等并行结果全部落地后才发图。
+func TestResponsesRequestChatShapedToolImages(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"m",
+		"input":[
+			{"role":"user","content":"look"},
+			{"role":"assistant","content":"","tool_calls":[
+				{"id":"c1","type":"function","function":{"name":"view_image","arguments":"{}"}},
+				{"id":"c2","type":"function","function":{"name":"view_image","arguments":"{}"}}
+			]},
+			{"role":"tool","tool_call_id":"c1","content":[
+				{"type":"input_image","image_url":"data:image/png;base64,aaa"}
+			]},
+			{"role":"tool","tool_call_id":"c2","content":"ok"}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 5 {
+		t.Fatalf("messages=%d want 5（图片必须落在两条结果之后）: %v", len(msgs), msgs)
+	}
+
+	for i := 2; i <= 3; i++ {
+		if role := msgs[i].(map[string]any)["role"]; role != "tool" {
+			t.Fatalf("messages[%d] 应为 tool: %v", i, msgs)
+		}
+	}
+
+	image := msgs[4].(map[string]any)
+
+	parts, _ := image["content"].([]any)
+	if image["role"] != "user" || len(parts) != 1 || parts[0].(map[string]any)["type"] != "image_url" {
+		t.Errorf("图片消息=%v", image)
+	}
+}
+
+// TestResponsesRequestSkipsHostedToolItems 托管工具回执（web_search_call、
+// mcp_call 等）与无内容元数据项不生成 user 空消息、不打断并行工具结果，
+// 也不清空夹在中间的思考（issue #584 追加验收）。
+func TestResponsesRequestSkipsHostedToolItems(t *testing.T) {
+	t.Parallel()
+
+	body := `{
+		"model":"m",
+		"input":[
+			{"type":"message","role":"user","content":"look"},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"plan"}]},
+			{"type":"web_search_call","id":"ws_1","status":"completed"},
+			{"type":"image_generation_call","id":"ig_1","status":"completed"},
+			{"type":"function_call","call_id":"c1","name":"view_image","arguments":"{}"},
+			{"type":"function_call","call_id":"c2","name":"view_image","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":[
+				{"type":"input_image","image_url":"data:image/png;base64,aaa"}
+			]},
+			{"type":"mcp_call","id":"mcp_1","status":"completed"},
+			{"type":"computer_call","id":"cu_1"},
+			{"id":"no_type_meta"},
+			{"type":"file_search_call","id":"fs_1",
+				"results":[{"file_id":"f1","text":"t","filename":"a.txt","score":1}]},
+			{"type":"code_interpreter_call","id":"ci_1","code":"1+1"},
+			{"type":"additional_tools","role":"developer","tools":[]},
+			{"type":"function_call_output","call_id":"c2","output":[
+				{"type":"input_image","image_url":"data:image/png;base64,bbb"}
+			]}
+		]
+	}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 6 {
+		t.Fatalf("messages=%d want 6（托管回执应被跳过）: %v", len(msgs), msgs)
+	}
+
+	assertNoEmptyUserMessages(t, msgs)
+	assertParallelToolImagesMerged(t, msgs)
+
+	// 托管回执夹在思考与工具批次之间，思考仍挂在 assistant 上。
+	if rc := msgs[1].(map[string]any)["reasoning_content"]; rc != "plan" {
+		t.Errorf("reasoning_content=%v want plan", rc)
+	}
+}
+
+// assertNoEmptyUserMessages 断言正文之外没有 user 空消息（只能是工具图片消息）。
+func assertNoEmptyUserMessages(t *testing.T, msgs []any) {
+	t.Helper()
+
+	for i, item := range msgs {
+		msg, _ := item.(map[string]any)
+		if msg["role"] != "user" || i == 0 {
+			continue
+		}
+
+		parts, _ := msg["content"].([]any)
+		if len(parts) == 0 || parts[0].(map[string]any)["type"] != "image_url" {
+			t.Fatalf("messages[%d] 是 user 空消息: %v", i, msg)
+		}
+	}
+}
+
+// assertParallelToolImagesMerged 断言两条并行结果相邻、图片合并落在它们之后。
+func assertParallelToolImagesMerged(t *testing.T, msgs []any) {
+	t.Helper()
+
+	if msgs[3].(map[string]any)["role"] != "tool" || msgs[4].(map[string]any)["role"] != "tool" {
+		t.Fatalf("并行结果被打断: %v", msgs)
+	}
+
+	parts, _ := msgs[5].(map[string]any)["content"].([]any)
+	if len(parts) != 2 {
+		t.Errorf("图片应合并为一条消息: %v", msgs[5])
+	}
+}
+
+// TestResponsesRequestCompaction compaction 只接受能解出 {"summary":...} 的摘要：
+// 密文（URL-safe base64、非 JSON base64、summary 为空的 JSON）一律丢弃，
+// 纯文本摘要按 rune 封顶 32 KiB（issue #584 追加验收）。
+func TestResponsesRequestCompaction(t *testing.T) {
+	t.Parallel()
+
+	summaries := map[string]string{
+		"有效摘要": base64.StdEncoding.EncodeToString([]byte(`{"v":1,"summary":"history"}`)),
+		// URL-safe 密文：0xFB/0xFF 的 URL 编码必然产出 '-'/'_'，标准解码必然失败。
+		"URL-safe base64":  base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0xfb, 0xff}, 24)),
+		"非 JSON base64":    base64.StdEncoding.EncodeToString([]byte(strings.Repeat("not-json ", 8))),
+		"summary 为空的 JSON": base64.StdEncoding.EncodeToString([]byte(`{"v":1,"summary":""}`)),
+	}
+
+	for name, blob := range summaries {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			body := `{"model":"m","input":[
+				{"type":"compaction","encrypted_content":"` + blob + `"},
+				{"type":"message","role":"user","content":"hi"}
+			]}`
+
+			raw, _, _, _, err := responsesToOpenAI([]byte(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var got map[string]any
+			if err := jsonx.Unmarshal(raw, &got); err != nil {
+				t.Fatal(err)
+			}
+
+			msgs, _ := got["messages"].([]any)
+
+			want := 1
+			if name == "有效摘要" {
+				want = 2
+			}
+
+			if len(msgs) != want {
+				t.Fatalf("%s: messages=%d want %d: %v", name, len(msgs), want, msgs)
+			}
+
+			if want == 2 {
+				summary := msgs[0].(map[string]any)
+				if summary["role"] != "system" ||
+					summary["content"] != responsesCompactionPrefix+"history" {
+					t.Errorf("交接摘要=%v", summary)
+				}
+			}
+		})
+	}
+}
+
+// TestResponsesRequestCompactionSummaryCapped 超长纯文本摘要按 rune 边界封顶 32 KiB，
+// 裁剪不得产生非法 UTF-8。
+func TestResponsesRequestCompactionSummaryCapped(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"m","input":[
+		{"type":"compaction","encrypted_content":"` + strings.Repeat("摘要", 12000) + `"},
+		{"type":"message","role":"user","content":"hi"}
+	]}`
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages=%d want 2: %v", len(msgs), msgs)
+	}
+
+	summary := stringValue(msgs[0].(map[string]any)["content"])
+	trimmed := strings.TrimPrefix(summary, responsesCompactionPrefix)
+
+	if len(trimmed) > responsesCompactionSummaryMax {
+		t.Errorf("摘要 %d 字节超过上限 %d", len(trimmed), responsesCompactionSummaryMax)
+	}
+
+	if !utf8.ValidString(trimmed) {
+		t.Error("摘要裁剪产生了非法 UTF-8")
 	}
 }
 

@@ -8,12 +8,14 @@ package server
 import (
 	"bytes"
 	"cmp"
+	"encoding/base64"
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -339,18 +341,14 @@ func responsesMessages(req *responsesRequest, refs map[string]responsesToolRef) 
 	builder := &responsesInputMessages{msgs: msgs}
 
 	for index, item := range items {
-		converted, images, ok, err := responsesInputItem(item, refs)
+		converted, err := builder.addItem(item, refs)
 		if err != nil {
 			return nil, warnToolCallMissingName(req.Model, index, item, err)
 		}
 
-		if !ok {
-			continue
+		if converted {
+			convertedItems++
 		}
-
-		builder.add(converted, images)
-
-		convertedItems++
 	}
 
 	if convertedItems == 0 {
@@ -367,12 +365,17 @@ func responsesMessages(req *responsesRequest, refs map[string]responsesToolRef) 
 type responsesInputMessages struct {
 	msgs       []any
 	toolImages []any
+	// pendingReasoning 暂存 reasoning 项解出的思考段，等所属的 assistant 内容落地时
+	// 挂到 reasoning_content；连续段按 "\n" 拼接，user/tool 边界清空不跨轮泄漏。
+	pendingReasoning []string
 }
 
 func (b *responsesInputMessages) add(converted, images []any) {
 	if len(b.toolImages) > 0 && !responsesIsToolMessage(converted) {
 		b.flushImages()
 	}
+
+	b.attachReasoning(converted)
 
 	b.msgs = append(b.msgs, converted...)
 	if responsesIsToolMessage(converted) {
@@ -384,6 +387,62 @@ func (b *responsesInputMessages) add(converted, images []any) {
 	if len(images) > 0 {
 		b.msgs = append(b.msgs, responsesToolImageMessage(images))
 	}
+}
+
+// addItem 转换并追加单条 input 项；reasoning 项只暂存思考、不产出消息。
+func (b *responsesInputMessages) addItem(item map[string]any, refs map[string]responsesToolRef) (bool, error) {
+	if stringValue(item["type"]) == "reasoning" {
+		b.addReasoning(responsesReasoningText(item))
+
+		return false, nil
+	}
+
+	converted, images, ok, err := responsesInputItem(item, refs)
+	if err != nil || !ok {
+		return false, err
+	}
+
+	b.add(converted, images)
+
+	return true, nil
+}
+
+// addReasoning 暂存 reasoning 项解出的思考段；空文本不产生字段，也不产出消息。
+func (b *responsesInputMessages) addReasoning(text string) {
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+
+	b.pendingReasoning = append(b.pendingReasoning, text)
+}
+
+// attachReasoning 把暂存的思考挂到紧随其后的 assistant 消息（正文或工具调用批次）；
+// 后继是 user/tool 等边界时就地丢弃，绝不跨轮泄漏。
+func (b *responsesInputMessages) attachReasoning(converted []any) {
+	if len(b.pendingReasoning) == 0 {
+		return
+	}
+
+	text := strings.Join(b.pendingReasoning, "\n")
+	b.pendingReasoning = nil
+
+	if len(converted) != 1 {
+		return
+	}
+
+	msg, _ := converted[0].(map[string]any)
+	if stringValue(msg["role"]) != "assistant" {
+		return
+	}
+
+	// Chat 形状回放的 assistant 可能内联同一份思考，重复拼接会让上游读到两遍。
+	if inline := stringValue(msg["reasoning_content"]); inline != "" {
+		if inline != text {
+			text += "\n" + inline
+		}
+	}
+
+	msg["reasoning_content"] = text
 }
 
 func (b *responsesInputMessages) flushImages() {
@@ -447,13 +506,11 @@ func warnToolCallMissingName(model string, index int, item map[string]any, err e
 }
 
 // responsesInputItem 转换单条 input item，返回消息与需要单独回传的图片。
-// 其余类型（reasoning、compaction 等）没有 chat/completions 对应语义，ok=false 忽略。
+// reasoning 由调用方暂存后挂载；未知类型（含托管工具回执）ok=false 跳过。
 func responsesInputItem(item map[string]any, refs map[string]responsesToolRef) ([]any, []any, bool, error) {
 	switch stringValue(item["type"]) {
 	case "", "message":
-		msg, err := responsesInputMessage(item)
-
-		return []any{msg}, nil, true, err
+		return responsesInputChatItem(item)
 	case typeFunctionCall:
 		msg, err := responsesInputFunctionCall(item, refs)
 
@@ -477,8 +534,107 @@ func responsesInputItem(item map[string]any, refs map[string]responsesToolRef) (
 		msg, images, err := responsesInputCustomToolOutput(item)
 
 		return []any{msg}, images, true, err
+	case "compaction":
+		return responsesInputCompactionItem(item)
 	default:
 		return nil, nil, false, nil
+	}
+}
+
+// responsesInputChatItem 处理 Chat 形状消息（无 type 或 type=message）。
+func responsesInputChatItem(item map[string]any) ([]any, []any, bool, error) {
+	// Chat 形状的工具结果（客户端把 chat messages 原样塞进 input）：没有 type，
+	// 只有 role=tool + tool_call_id。按 function_call_output 处理才能保住配对——
+	// 落成普通消息会把 tool_call_id 丢掉，出站 cleanupOrphanToolCalls 连带删掉
+	// 整轮调用与结果（issue #584）。
+	if stringValue(item["role"]) == "tool" && stringValue(item[keyToolCallID]) != "" {
+		msg, images := responsesInputFunctionOutput(map[string]any{
+			"call_id": item[keyToolCallID],
+			"name":    item["name"],
+			"output":  item["content"],
+		})
+		if msg == nil {
+			return nil, nil, false, nil
+		}
+
+		return []any{msg}, images, true, nil
+	}
+
+	if responsesEmptyChatItem(item) {
+		return nil, nil, false, nil
+	}
+
+	msg, err := responsesInputMessage(item)
+
+	return []any{msg}, nil, true, err
+}
+
+// responsesInputCompactionItem 把 compaction 项解成 system 交接摘要；解不出摘要就跳过。
+func responsesInputCompactionItem(item map[string]any) ([]any, []any, bool, error) {
+	summary := responsesCompactionSummary(stringValue(item["encrypted_content"]))
+	if summary == "" {
+		return nil, nil, false, nil
+	}
+
+	return []any{map[string]any{
+		"role":    "system",
+		"content": responsesCompactionPrefix + summary,
+	}}, nil, true, nil
+}
+
+// responsesCompactionPrefix 上下文压缩摘要转成 system 交接消息时的来源标记。
+const responsesCompactionPrefix = "Summary of the earlier conversation (context checkpoint):\n\n"
+
+// responsesCompactionSummaryMax 交接摘要送上游的字节上限。摘要每轮随历史重发，来源
+// 又是客户端，不封顶时一份异常大的摘要会让此后每一轮都更早撞上游上下文上限。
+const responsesCompactionSummaryMax = 32 << 10
+
+// responsesOpaqueCompaction 只由 base64/base64url/token 字符组成、且够长的串：真实的
+// encrypted_content 是密文（URL-safe base64 不带 padding 时标准解码会失败），解不出
+// 摘要就是对上游无意义的乱码。纯文本摘要总会有空白或非 ASCII 字符；短于 32 的放行，
+// 免得 "Done" 这类单词被当成密文。
+var responsesOpaqueCompaction = regexp.MustCompile(`^[A-Za-z0-9+/=_.\-]{32,}$`)
+
+// responsesCompactionSummary 尽力解出 compaction 项的交接摘要：正常形态是
+// base64(JSON {"summary":...})，先补齐 padding 再解；能解出 JSON 但 summary 为空同样是
+// 「没有摘要」。解不开时，像密文的丢弃、其余按纯文本摘要保留——外部提供者可能塞的就是
+// 纯文本摘要，丢了它就丢了唯一一份上下文交接。结果按 rune 边界封顶。
+func responsesCompactionSummary(blob string) string {
+	text := strings.TrimSpace(blob)
+	if text == "" {
+		return ""
+	}
+
+	if raw, err := base64.StdEncoding.DecodeString(text + strings.Repeat("=", (4-len(text)%4)%4)); err == nil {
+		var decoded struct {
+			Summary string `json:"summary"`
+		}
+		if jsonx.Unmarshal(raw, &decoded) == nil {
+			return logfmt.Truncate(decoded.Summary, responsesCompactionSummaryMax)
+		}
+	}
+
+	if responsesOpaqueCompaction.MatchString(text) {
+		return ""
+	}
+
+	return logfmt.Truncate(text, responsesCompactionSummaryMax)
+}
+
+// responsesEmptyChatItem 报告无 type 的项既没有 role 也没有可用内容：托管工具回执的
+// 元数据项等按消息送出只会变出一条 user 空消息，拆开并行工具结果。带内容的项照旧送达。
+func responsesEmptyChatItem(item map[string]any) bool {
+	if stringValue(item["role"]) != "" {
+		return false
+	}
+
+	switch content := responsesContent(item["content"]).(type) {
+	case string:
+		return strings.TrimSpace(content) == ""
+	case []any:
+		return len(content) == 0
+	default:
+		return true
 	}
 }
 
@@ -496,7 +652,20 @@ func responsesInputMessage(item map[string]any) (any, error) {
 		return nil, fmt.Errorf("unsupported message role %q: %w", role, errResponsesInputMessageFailed)
 	}
 
-	return map[string]any{"role": role, "content": responsesContent(item["content"])}, nil
+	msg := map[string]any{"role": role, "content": responsesContent(item["content"])}
+	if role == "assistant" {
+		// Chat 形状回放：tool_calls 与内联 reasoning_content 是这一轮自己的历史，剥成
+		// {role, content} 会让调用与结果两侧都对不上（出站按 id 配对）。
+		if calls, ok := item["tool_calls"].([]any); ok && len(calls) > 0 {
+			msg["tool_calls"] = calls
+		}
+
+		if reasoning := stringValue(item["reasoning_content"]); reasoning != "" {
+			msg["reasoning_content"] = reasoning
+		}
+	}
+
+	return msg, nil
 }
 
 // responsesInputFunctionCall 把 Responses function_call 映射为 assistant tool_calls。
@@ -559,6 +728,43 @@ func responsesInputAgentMessage(item map[string]any) (any, bool) {
 	return map[string]any{"role": "user", "content": responsesAgentMessagePrefix + text}, true
 }
 
+// responsesReasoningText 提取 reasoning 项里的思考文本：summary 优先（Responses 标准
+// 形态是 summary_text 段数组，各段按 "\n" 连接），取不到再退到 content。encrypted_content
+// 是密文，不可解，不参与提取；全空返回空串，调用方按「没有思考」跳过。
+func responsesReasoningText(item map[string]any) string {
+	for _, key := range []string{"summary", "content"} {
+		if text := responsesReasoningParts(item[key]); text != "" {
+			return text
+		}
+	}
+
+	return ""
+}
+
+// responsesReasoningParts 读取单个数组成员：字符串直取，数组取各段 text 并按 "\n" 连接
+// （思考段的边界有语义，直接拼掉会让两段读成一句）。
+func responsesReasoningParts(raw any) string {
+	if text, ok := raw.(string); ok {
+		return text
+	}
+
+	parts, ok := raw.([]any)
+	if !ok {
+		return ""
+	}
+
+	texts := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		m, _ := part.(map[string]any)
+		if text := stringValue(m["text"]); text != "" {
+			texts = append(texts, text)
+		}
+	}
+
+	return strings.Join(texts, "\n")
+}
+
 // responsesInputFunctionOutput 把 function_call_output 映射为 role=tool 消息。
 // 缺 call_id 的输出来自子代理/其他任务，降级为带来源标记的 user 消息。
 func responsesInputFunctionOutput(item map[string]any) (any, []any) {
@@ -576,11 +782,17 @@ func responsesInputFunctionOutput(item map[string]any) (any, []any) {
 		}, images
 	}
 
-	return map[string]any{
+	msg := map[string]any{
 		"role":        "tool",
 		keyToolCallID: callID,
 		"content":     text,
-	}, images
+	}
+	// 只有 Chat 形状的工具结果带 name，原样保留。
+	if name := stringValue(item["name"]); name != "" {
+		msg["name"] = name
+	}
+
+	return msg, images
 }
 
 // responsesInputCustomToolCall 把 custom_tool_call 降级为 assistant tool_calls。
