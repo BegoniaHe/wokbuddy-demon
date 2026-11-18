@@ -877,13 +877,17 @@ func (c *TextContinueReader) continueAllowed() bool {
 		return false
 	}
 
-	// 一次都没救过时 rescueTextLen 尚未赋值，按「有进展」处理；救过则要求续写段确实
-	// 写出了新正文（哪怕又停在承诺句上）。
-	if c.continueTries > 0 && c.text.Len() == c.rescueTextLen {
+	if !c.continueProgressed() {
 		return false
 	}
 
 	return c.continueTries < c.continueLimit()
+}
+
+// continueProgressed 报告上一次续写段是否写出了新正文：一次都没救过时 rescueTextLen
+// 尚未赋值，按「有进展」处理；救过则要求续写段确实写出了新正文（哪怕又停在承诺句上）。
+func (c *TextContinueReader) continueProgressed() bool {
+	return c.continueTries == 0 || c.text.Len() != c.rescueTextLen
 }
 
 // continueLimit 本次续写的次数上限：预告句 / 承诺句两次；结构未闭合与 length 截断一次。

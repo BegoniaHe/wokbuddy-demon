@@ -344,6 +344,18 @@ func isGlobalAccount(account *auth.Auth) bool {
 	return account != nil && account.IsGlobal()
 }
 
+// injectClientIdentityHeadersForRenderSurface 给渲染层 / CLI 出站的 chat 与 busy 补客户端
+// 身份三头（#590）：真机证据（155/155 抓包）只来自 CN 5.11.3，global 侧这两个面没有
+// 样本，按「不猜测」不发。主进程面不走这里（两个 realm 都发，见
+// injectMainProcessProviderHeaders）。
+func (c *Client) injectClientIdentityHeadersForRenderSurface(req *http.Request, account *auth.Auth) {
+	if isGlobalAccount(account) {
+		return
+	}
+
+	c.injectClientIdentityHeaders(req, account)
+}
+
 // applyHeaders 出站头族唯一构造入口：按 surface 分发到 chat 头族或轻头族。
 //
 //nolint:gocritic // ChatMeta 值传递与 ChatHeaders 保持同一公开 API。
@@ -374,10 +386,9 @@ func (c *Client) applyHeaders(
 	}
 
 	// busy 是渲染层 wb.http.post，没有 X-Device-Token（真机 8 轻头不带），但真机
-	// 155/155 抓包（含 /v2/chat/busy）都带客户端身份三头，故只补三头（#590）；该证据
-	// 来自 CN 5.11.3，global 侧没有对应真机样本，按「不猜测」保持不发。
-	if srf == surfaceModelBusy && !isGlobalAccount(account) {
-		c.injectClientIdentityHeaders(req, account)
+	// 155/155 抓包（含 /v2/chat/busy）都带客户端身份三头，故只补三头（#590）。
+	if srf == surfaceModelBusy {
+		c.injectClientIdentityHeadersForRenderSurface(req, account)
 	}
 }
 
@@ -475,10 +486,8 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 			req.Header.Set("X-Device-Token", token)
 		}
 		// 客户端身份三头：同一提供者按 origin 命中，chat 出站与轻业务面同口径
-		// （#590，CN 真机证据）。global 侧 chat 出站无对应真机样本，按「不猜测」不发。
-		if !isGlobalAccount(account) {
-			c.injectClientIdentityHeaders(req, account)
-		}
+		// （#590，CN 真机证据）。
+		c.injectClientIdentityHeadersForRenderSurface(req, account)
 
 		injectChatBaggage(req)
 	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth,
