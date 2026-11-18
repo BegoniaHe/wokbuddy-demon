@@ -327,8 +327,9 @@ func (c *Client) injectMainProcessProviderHeaders(req *http.Request, account *au
 //
 // 取值只复用 profile 与产品配置：版本 = electron.app.getVersion()（桌面构建版本，
 // 取 profile 冻结的 emit.desktopIdeVersion）；平台 = Win32 归一值；产品 =
-// cli/product.json 的 applicationName。版本取不到就整条不发：空值头是比缺失更明显
-// 的非官方指纹。global 5.9.4 没有该提供者（5.11.4 的适配见 #579），这里直接跳过。
+// cli/product.json 的 applicationName。版本取不到时只省略 X-Client-Version 这一个头
+// （空值头是比缺失更明显的非官方指纹），平台与产品恒发。global 5.9.4 没有该提供者
+// （5.11.4 的适配见 #579），这里直接跳过。
 func (c *Client) injectClientIdentityHeaders(req *http.Request, account *auth.Auth) {
 	if account != nil && account.IsGlobal() {
 		return
