@@ -340,6 +340,49 @@ func TestChatMidTextYieldMarkerStillRescued(t *testing.T) {
 	}
 }
 
+// TestChatCompletionDeclarationNotForwarded 续写段只回「已完成」：这三个字不进客户端
+// 正文，也不再发起第二次救援；救援指令必须带「已完成则零输出」的出口（issue #589）。
+func TestChatCompletionDeclarationNotForwarded(t *testing.T) {
+	t.Parallel()
+
+	client, bodies := fakeUpstreamCapturingBodies(t, func(call int) string {
+		if call == 1 {
+			return sseStopContent("我将开始修改 internal/verify/check.go")
+		}
+
+		return sseStopContent("已完成")
+	})
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(&Config{Pool: state, Upstream: client})
+
+	rec := postChat(t, h, `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	got := chatBodies(bodies)
+	if len(got) != 2 {
+		t.Fatalf("请求数=%d want 2（声明完成后不再续写）", len(got))
+	}
+
+	if !strings.Contains(got[1], "不要输出任何内容") {
+		t.Errorf("救援指令应带「已完成则零输出」的出口: %s", got[1])
+	}
+
+	body := rec.Body.String()
+	if strings.Contains(body, "已完成") {
+		t.Errorf("「已完成」不应写入客户端正文: %s", body)
+	}
+
+	if !strings.Contains(body, "internal/verify/check.go") {
+		t.Errorf("首段正文不应丢失: %s", body)
+	}
+
+	if n := strings.Count(body, "[DONE]"); n != 1 {
+		t.Errorf("[DONE] 数=%d want 1: %s", n, body)
+	}
+}
+
 // TestChatPunctuatedTailTooLongNotRescued 标点型悬停超过长度闸门：多半是正常排版
 // （说明 + 列表），不救。
 func TestChatPunctuatedTailTooLongNotRescued(t *testing.T) {

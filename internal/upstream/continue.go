@@ -90,6 +90,15 @@ type TextContinueReader struct {
 	continuationToolsOnly bool
 	// continuationHasTool 续写段是否已带回工具调用。
 	continuationHasTool bool
+	// noMoreContinue 续写段已被判定为「已完成」声明：不再发起救援（issue #589）。
+	noMoreContinue bool
+	// segmentStart 本次续写段开始时的正文长度（字节），用于取本段新增的正文。
+	segmentStart int
+	// pending 续写段里尚未确定归属的正文帧（已按续写口径重编码，顺序即写出顺序）。
+	// 模型按旧习惯只回「已完成」时这些帧不能下发，判定为真实正文才按序放行。
+	pending []string
+	// settled 本段已确定是真实正文（或已按声明收尾）：后续帧直接写出。
+	settled bool
 	// onContinue 真正发起续写时的诊断回调（收到已输出正文的尾部片段与触发形态）。
 	onContinue func(tail string, kind TailKind)
 	// finishStop 本次终态是 stop（且已开启 stopTriggers）：与 finishLength 同处置。
@@ -298,6 +307,8 @@ func (c *TextContinueReader) handleLine(line string) {
 // handleDone 处理 [DONE]：首段因 length 截断且尚未续写时，先换流续写并吞掉本行；
 // 否则原行透传。
 func (c *TextContinueReader) handleDone(line string) {
+	c.settleSegment()
+
 	if c.continueTriggered() && c.tryContinue() {
 		return
 	}
@@ -314,13 +325,7 @@ func (c *TextContinueReader) handleDone(line string) {
 func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 	c.captureMeta(frame)
 
-	if _, hasErr := frame["error"]; hasErr {
-		c.writeFrameJSON(frame)
-
-		return
-	}
-
-	if _, _, isErr := frameBusinessError(frame); isErr {
+	if frameIsError(frame) {
 		c.writeFrameJSON(frame)
 
 		return
@@ -357,6 +362,10 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 		case !frameHasFinish(frame):
 			return
 		}
+	}
+
+	if c.holdUntilSettled(frame) {
+		return
 	}
 
 	c.writeFrameJSON(frame)
@@ -661,14 +670,62 @@ func (c *TextContinueReader) appendText(text string) {
 
 // writeFrameJSON 写回数据帧；续写段复用首段 id/model。
 func (c *TextContinueReader) writeFrameJSON(frame map[string]any) {
+	c.out.WriteString(c.frameLine(frame))
+}
+
+// frameLine 把帧按续写口径重编码成一行 data；编码失败返回空串（不写出）。
+func (c *TextContinueReader) frameLine(frame map[string]any) string {
 	c.rewriteContinuationFrame(frame)
 
 	raw, err := jsonx.Marshal(frame)
 	if err != nil {
-		return
+		return ""
 	}
 
-	c.out.WriteString("data: " + string(raw) + "\n\n")
+	return "data: " + string(raw) + "\n\n"
+}
+
+// frameIsError 报告帧是否是错误帧（顶层 error 字段，或业务错误码）。
+func frameIsError(frame map[string]any) bool {
+	if _, hasErr := frame["error"]; hasErr {
+		return true
+	}
+
+	_, _, isErr := frameBusinessError(frame)
+
+	return isErr
+}
+
+// holdUntilSettled 处理续写段「先暂存、再放行」的一步（issue #589）：正文帧暂存并返回
+// 真（本帧不要写出），非正文帧（终态 / usage）先收尾暂存帧以保持写出顺序并返回假。
+func (c *TextContinueReader) holdUntilSettled(frame map[string]any) bool {
+	if !c.continuation || c.settled {
+		return false
+	}
+
+	if frameTextOnly(frame) {
+		c.holdDeclarationFrame(frame)
+
+		return true
+	}
+
+	c.settleSegment()
+
+	return false
+}
+
+// frameTextOnly 报告帧只携带正文（不带工具调用）：只有这种帧可以暂存后丢弃。
+func frameTextOnly(frame map[string]any) bool {
+	return frameHasText(frame) && !frameHasToolCalls(frame)
+}
+
+// frameHasText 报告帧是否携带正文（delta.content / message.content）。
+func frameHasText(frame map[string]any) bool {
+	return frameChoiceNodeHas(frame, func(node map[string]any) bool {
+		text, _ := node["content"].(string)
+
+		return text != ""
+	})
 }
 
 // rewriteContinuationFrame 把续写帧的 id/model 对齐首段，并把已累计的 usage 并进
@@ -705,6 +762,8 @@ func (c *TextContinueReader) continueTriggered() bool {
 
 // handleEOF 流结束：有暂存终态时尝试续写；否则收尾。
 func (c *TextContinueReader) handleEOF() {
+	c.settleSegment()
+
 	if c.continueTriggered() {
 		if c.tryContinue() {
 			return
@@ -739,7 +798,7 @@ const (
 // 两次；结构未闭合（残缺标记补不完）与 length 截断仍只补一次。次数在真正发起前
 // 累加，失败也算用过，避免重复打上游。
 func (c *TextContinueReader) continueAllowed() bool {
-	if c.hasTool || c.open == nil || c.text.Len() == 0 {
+	if c.hasTool || c.open == nil || c.text.Len() == 0 || c.noMoreContinue {
 		return false
 	}
 
@@ -793,6 +852,9 @@ func (c *TextContinueReader) tryContinue() bool {
 	c.streamGen++
 	c.continued = true
 	c.continuation = true
+	c.segmentStart = c.text.Len()
+	c.pending = nil
+	c.settled = false
 	// 只有尾部探针授权的 stop 才走「只采纳调用」；length 截断照旧续正文。
 	c.continuationToolsOnly = c.toolsOnly && c.stopByTail
 
@@ -811,6 +873,100 @@ func (c *TextContinueReader) tryContinue() bool {
 	}
 
 	return true
+}
+
+// settleSegment 收尾本次续写段的暂存帧（issue #589）：本段只是「已完成」这类声明时
+// 丢弃——这三个字不进客户端正文，也不再发起救援；真实正文按序放行。
+func (c *TextContinueReader) settleSegment() {
+	if c.settled {
+		return
+	}
+
+	c.settled = true
+
+	if len(c.pending) == 0 {
+		return
+	}
+
+	if completionDeclaration(c.segmentText()) {
+		c.noMoreContinue = true
+		c.pending = nil
+
+		return
+	}
+
+	for _, line := range c.pending {
+		c.out.WriteString(line)
+	}
+
+	c.pending = nil
+}
+
+// holdDeclarationFrame 暂存续写段的正文帧：在能确定本段不是「已完成」声明之前先不下发，
+// 一旦正文超出了这类声明的形态就立即放行（流式不因此变慢）。
+func (c *TextContinueReader) holdDeclarationFrame(frame map[string]any) {
+	if line := c.frameLine(frame); line != "" {
+		c.pending = append(c.pending, line)
+	}
+
+	if !completionPrefixPossible(c.segmentText()) {
+		c.settleSegment()
+	}
+}
+
+// segmentText 取本次续写段新增的正文。
+func (c *TextContinueReader) segmentText() string {
+	text := c.text.String()
+	if c.segmentStart >= len(text) {
+		return ""
+	}
+
+	return text[c.segmentStart:]
+}
+
+// completionDeclMaxRunes 「已完成」类声明的最长字符数：超过它的正文肯定是新内容。
+const completionDeclMaxRunes = 16
+
+// completionPhrases 模型按旧习惯回复「已完成」时的终态措辞：这类内容不能拼进客户端
+// 正文，也不该再为它发起一次救援（issue #589）。
+var completionPhrases = []string{"已完成", "已经完成", "已改完", "已经改完", "全部完成", "任务已完成"}
+
+// completionDeclaration 报告续写段正文是否只是声明「已完成」：按尾部后缀判断，不依赖
+// 末句切分（续写段与上一条之间可能没有分隔符）。
+func completionDeclaration(segment string) bool {
+	trimmed := strings.TrimSpace(segment)
+	if trimmed == "" || utf8.RuneCountInString(trimmed) > completionDeclMaxRunes {
+		return false
+	}
+
+	for _, phrase := range completionPhrases {
+		if strings.HasSuffix(trimmed, phrase) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// completionPrefixPossible 报告续写段正文是否仍可能是一个「已完成」声明：只有这种前缀
+// 形态才需要继续暂存，其余正文一出现就放行。
+func completionPrefixPossible(segment string) bool {
+	trimmed := strings.TrimSpace(segment)
+	if trimmed == "" {
+		return true
+	}
+
+	if utf8.RuneCountInString(trimmed) > completionDeclMaxRunes {
+		return false
+	}
+
+	for _, phrase := range completionPhrases {
+		if strings.HasPrefix(phrase, trimmed) || strings.HasSuffix(trimmed, phrase) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // continuationTailLogChars 续写触发日志里尾部片段的字符上限。
@@ -903,18 +1059,23 @@ func recomputeMergedUsageTotal(usageMap map[string]any) {
 const continuationInstruction = "Continue the previous response from exactly where it stopped. " +
 	"Do not repeat any text already produced. Do not add commentary."
 
+// completionExit 两条救援指令共用的完成出口（issue #589）：判据误触发时模型只需要零
+// 输出；让它回一句「已完成」会把这三个字当正文拼进客户端输出，甚至被当成续写内容转发。
+const completionExit = "如果这部分其实已经写完，就不要输出任何内容：不要回复「已完成」，" +
+	"不要解释，也不要争辩。\n\n"
+
 // narrationNudge 尾部停在标点型悬停（冒号/逗号/未闭合代码块）时的续写指令。
 // 必须点明「你停在预告上」：否则模型会以为任务已完成而重复一遍结论。
 const narrationNudge = "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，" +
 	"剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，" +
-	"不要重复已经写过的内容，不要重新开头，不要道歉或解释。"
+	"不要重复已经写过的内容，不要重新开头，不要道歉或解释。\n\n" + completionExit
 
 // narrationPromiseNudge 尾部是「我将…/我会…」这类承诺句时的续写指令。
 // 不能复用 narrationNudge：那条说「停在冒号上」，承诺句既没有冒号也不是预告排版，
 // 模型会反过来争辩「上一条并未中断」，争论也会一并写进客户端正文。
 const narrationPromiseNudge = "你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，" +
 	"承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，" +
-	"不要解释为什么停下，不要重复已经写过的内容，不要重新开头。"
+	"不要解释为什么停下，不要重复已经写过的内容，不要重新开头。\n\n" + completionExit
 
 // continuationInstructionFor 按触发形态选续写指令：承诺句用专门的文案，其余沿用
 // 通用「从断点接着写」。
