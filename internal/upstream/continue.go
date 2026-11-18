@@ -945,9 +945,10 @@ const completionDeclMaxRunes = 16
 var completionPhrases = []string{"已完成", "已经完成", "已改完", "已经改完", "全部完成", "任务已完成"}
 
 // completionDeclaration 报告续写段正文是否只是声明「已完成」：按尾部后缀判断，不依赖
-// 末句切分（续写段与上一条之间可能没有分隔符）。
+// 末句切分（续写段与上一条之间可能没有分隔符）。尾部句末标点先剥掉——模型几乎总会
+// 给「已完成。」补一个句号，不剥就只拦到不带标点的那一种写法。
 func completionDeclaration(segment string) bool {
-	trimmed := strings.TrimSpace(segment)
+	trimmed := trimSegmentSentences(segment)
 	if trimmed == "" || utf8.RuneCountInString(trimmed) > completionDeclMaxRunes {
 		return false
 	}
@@ -964,7 +965,7 @@ func completionDeclaration(segment string) bool {
 // completionPrefixPossible 报告续写段正文是否仍可能是一个「已完成」声明：只有这种前缀
 // 形态才需要继续暂存，其余正文一出现就放行。
 func completionPrefixPossible(segment string) bool {
-	trimmed := strings.TrimSpace(segment)
+	trimmed := trimSegmentSentences(segment)
 	if trimmed == "" {
 		return true
 	}
@@ -980,6 +981,12 @@ func completionPrefixPossible(segment string) bool {
 	}
 
 	return false
+}
+
+// trimSegmentSentences 去掉首尾空白与尾部句末标点：判定「声明完成」时不该被结尾的
+// 句号 / 感叹号挡住（「已完成。」与「已完成」是同一句话）。
+func trimSegmentSentences(segment string) string {
+	return strings.TrimRight(strings.TrimSpace(segment), "。！？!?.")
 }
 
 // continuationTailLogChars 续写触发日志里尾部片段的字符上限。

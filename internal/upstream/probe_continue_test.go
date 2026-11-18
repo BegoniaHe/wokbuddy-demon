@@ -429,50 +429,58 @@ func TestTextContinueReaderMergesUsageAcrossRescues(t *testing.T) {
 }
 
 // TestTextContinueReaderDropsCompletionDeclaration 续写段只回「已完成」时（issue #589）：
-// 这三个字不进客户端正文，也不再为它发起一次救援。
+// 这几个字不进客户端正文，也不再为它发起一次救援。带句末标点的写法一并拦——模型几乎
+// 总会给「已完成」补一个句号。
 func TestTextContinueReaderDropsCompletionDeclaration(t *testing.T) {
 	t.Parallel()
 
 	first := `data: {"id":"a","model":"m","choices":[{"index":0,"delta":{"content":"我将开始修改 foo.go"}}]}` + "\n\n" +
 		`data: {"id":"a","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
 		"data: [DONE]\n\n"
-	declared := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"已完成"}}]}` + "\n\n" +
-		`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
-		"data: [DONE]\n\n"
 
-	calls := 0
+	for _, declaration := range []string{"已完成", "已完成。", "已经完成！"} {
+		t.Run(declaration, func(t *testing.T) {
+			t.Parallel()
 
-	r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false,
-		func(string, TailKind) (io.ReadCloser, error) {
-			calls++
+			declared := `data: {"id":"b","model":"m","choices":[{"index":0,"delta":{"content":"` + declaration + `"}}]}` + "\n\n" +
+				`data: {"id":"b","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n" +
+				"data: [DONE]\n\n"
 
-			return closeString{strings.NewReader(declared)}, nil
+			calls := 0
+
+			r := NewTextContinueReader(closeString{strings.NewReader(first)}, "", false,
+				func(string, TailKind) (io.ReadCloser, error) {
+					calls++
+
+					return closeString{strings.NewReader(declared)}, nil
+				})
+			r.ContinueOnStopTail(func(string) TailKind { return TailPromise }, false, nil)
+
+			out, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if calls != 1 {
+				t.Fatalf("续写次数=%d want 1（声明完成即终态）", calls)
+			}
+
+			if strings.Contains(string(out), "已完成") || strings.Contains(string(out), "已经完成") {
+				t.Fatalf("声明完成不应拼进客户端正文: %s", out)
+			}
+
+			if !strings.Contains(string(out), "我将开始修改 foo.go") {
+				t.Fatalf("首段正文不应丢失: %s", out)
+			}
+
+			if got := strings.Count(string(out), `"finish_reason":"stop"`); got != 1 {
+				t.Fatalf("终态数=%d want 1: %s", got, out)
+			}
+
+			if got := strings.Count(string(out), "[DONE]"); got != 1 {
+				t.Fatalf("[DONE] 数=%d want 1: %s", got, out)
+			}
 		})
-	r.ContinueOnStopTail(func(string) TailKind { return TailPromise }, false, nil)
-
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if calls != 1 {
-		t.Fatalf("续写次数=%d want 1（声明完成即终态）", calls)
-	}
-
-	if strings.Contains(string(out), "已完成") {
-		t.Fatalf("「已完成」不应拼进客户端正文: %s", out)
-	}
-
-	if !strings.Contains(string(out), "我将开始修改 foo.go") {
-		t.Fatalf("首段正文不应丢失: %s", out)
-	}
-
-	if got := strings.Count(string(out), `"finish_reason":"stop"`); got != 1 {
-		t.Fatalf("终态数=%d want 1: %s", got, out)
-	}
-
-	if got := strings.Count(string(out), "[DONE]"); got != 1 {
-		t.Fatalf("[DONE] 数=%d want 1: %s", got, out)
 	}
 }
 
