@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -54,6 +55,29 @@ func TestGatewayHintModelParamInvalidToolSchema(t *testing.T) {
 // TestGatewayHintToolDefinitionRejection 工具定义侧的请求级拒收（11129 工具定义不合规 /
 // 11152 工具名称不规范）：只在请求确实声明了 tools 时给「检查 tools」的指向；11101
 // 请求体畸形不给（否则客户端会去翻自己的 schema）。
+// TestClassifyModelBackendDisabled 11103「该模型的上游后端未启用」按请求级归类，
+// 且 hint 指向换模型（issue #605）：换任何账号结果一致，不能罚号也不能轮转。
+func TestClassifyModelBackendDisabled(t *testing.T) {
+	t.Parallel()
+
+	body := `{"code":11103,"msg":"the model backend is not enabled"}`
+
+	if kind := Classify(http.StatusBadRequest, body); kind != ErrBadParams {
+		t.Fatalf("kind = %v, want ErrBadParams", kind)
+	}
+
+	hint := GatewayHint(ErrBadParams, body, HintContext{})
+	if !strings.Contains(hint, "switch to another model") {
+		t.Fatalf("hint = %q, want switch-model guidance", hint)
+	}
+
+	// SSE 错误帧同一口径：首帧 11103 不轮转。
+	frame := `{"error":{"code":11103,"message":"the model backend is not enabled"}}`
+	if kind := FrameKind(frame); kind != ErrBadParams {
+		t.Fatalf("frame kind = %v, want ErrBadParams", kind)
+	}
+}
+
 func TestGatewayHintToolDefinitionRejection(t *testing.T) {
 	t.Parallel()
 

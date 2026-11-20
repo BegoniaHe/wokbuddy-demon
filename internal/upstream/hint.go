@@ -56,6 +56,13 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	if isInvalidImageData(msg) {
 		return "image data rejected by upstream; use a real/valid image, may need a new conversation"
 	}
+	// 11103：该模型的上游后端未启用（官方 errorCode.11103 = Model configuration
+	// error. Switch models）。确定性模型配置错误，换号无用——客户端唯一有效的动作
+	// 是换模型（issue #605）。
+	if isModelBackendDisabled(msg) {
+		return "the upstream backend for this model is not enabled (11103, server-side model " +
+			"configuration); switching accounts will not help — switch to another model"
+	}
 	// 11129 / 11152：工具定义侧的请求级拒收（不罚号、不轮转），但客户端只看得到
 	// 「工具定义不合规 / 工具名称不规范」——指出要改哪儿。只在请求确实声明了 tools
 	// 时给：11101 等请求体畸形、messages 缺空都不该被指去翻自己的 schema。
@@ -275,6 +282,12 @@ func isToolDefinitionRejection(body string, hasTools bool) bool {
 	}
 
 	return containsAnyLower(lower, toolDefinitionRejectMarkers)
+}
+
+// isModelBackendDisabled 报告 body 是否命中 11103「模型上游后端未启用」。
+// 只认结构化 code（文案会被聚合器改写）。
+func isModelBackendDisabled(body string) bool {
+	return codeMarker(strings.ToLower(body), "11103")
 }
 
 // toolDefinitionRejectCodes 工具定义侧的请求级拒收码。

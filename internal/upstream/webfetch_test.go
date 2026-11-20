@@ -144,6 +144,39 @@ func TestWebFetchBusinessError(t *testing.T) {
 	}
 }
 
+// TestWebFetchDomainLevelCodes 域名/边缘级业务码归哨兵错误（issue #605）：同一 URL
+// 换号结果一致，不能按账号级失败轮转罚号。只认结构化 code，不按文案匹配。
+func TestWebFetchDomainLevelCodes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		body string
+		want error
+	}{
+		{"15021 domain routing policy", `{"code":15021,"msg":"domain not allowed"}`, ErrWebFetchDomainBlocked},
+		{"15022 target unreachable", `{"code":15022,"msg":"cannot reach target"}`, ErrWebFetchTargetUnreachable},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := testClient(func(*http.Request) (*http.Response, error) {
+				return jsonResp(400, testCase.body), nil
+			})
+
+			_, err := client.WebFetch(
+				context.Background(), &auth.Auth{UID: "u1", AccessToken: "at"},
+				WebFetchRequest{URL: "https://example.com"}, ChatMeta{},
+			)
+			if !errors.Is(err, testCase.want) {
+				t.Fatalf("err=%v want %v", err, testCase.want)
+			}
+		})
+	}
+}
+
 // TestWebFetchAcceptsTextishApplicationTypes 与官方 classifyResourceKind 同口径：
 // application/javascript / yaml 等文本形态不能被误判为非文本（只有 image/video/
 // audio 与已知二进制类型才拒绝）。
