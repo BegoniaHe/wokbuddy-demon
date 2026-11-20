@@ -239,14 +239,14 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 // 三者皆空/读失败则返回空串（调用方不注入该头，优雅降级）。
 //
 // 消费面按官方基线分两代：
-//   - CN 5.11.3 / global 5.9.4 起，主进程出站头提供者（main/device-token.js）在一方域
+//   - CN 5.11.3 / global 5.11.4 起，主进程出站头提供者（main/device-token.js）在一方域
 //     上统一注入，凡经 RestOperations 发出的业务请求都带（billing / report / refresh /
 //     v3-config / logout / 模型目录 / 桌面 chat），见 surface.mainProcess 与
-//     injectMainProcessProviderHeaders（#552）；
-//   - 更早的 5.9.3 真机抓包只有 chat（主请求与辅助请求）与签到两条显式注入点，
-//     global 侧至今仍是这个形态。
+//     injectMainProcessProviderHeaders（#552 / #579）；
+//   - 更早的 5.9.3 真机抓包只有 chat（主请求与辅助请求）与签到两条显式注入点。
 //
-// growth 是 Node 裸 fetch、busy 是渲染层 wb.http.post，都不经主进程拦截器，恒不带。
+// growth 是 Node 裸 fetch、busy 是渲染层 wb.http.post，都不经主进程拦截器，
+// X-Device-Token 恒不带（busy 的客户端身份三头另说，见 injectClientIdentityHeaders）。
 // /v2/plugin/auth/state 是面板登录面，不经本包。#342 的「只在 auth/state 与签到消费」
 // 对 chat 不成立（#376）。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
@@ -276,12 +276,14 @@ func (c *Client) deviceToken(account *auth.Auth) string {
 
 // mainProcess 该轻头族面是否由官方**主进程** RestOperations 发出。
 //
-// CN 5.11.3 把设备 token 与客户端身份提升为「主进程出站头提供者」：以产品
-// endpoint 为 origin 注册后，凡经 RestOperations 拦截器的请求统一注入。因此这些
-// 面在 CN 5.11.3 上要带 X-Device-Token（#552）与 X-Client-*（#551）。
+// CN 5.11.3 / global 5.11.4 把设备 token 与客户端身份提升为「主进程出站头提供者」：
+// 以产品 endpoint 为 origin 注册后，凡经 RestOperations 拦截器的请求统一注入。因此这些
+// 面在两个 realm 上都要带 X-Device-Token（#552）与 X-Client-*（#551 / #579）。
 //
 // growth 是主进程里的 Node 裸 fetch（`e.fetch(...)` 不经 RestOperations），
-// busy 是渲染层 `wb.http.post`，两者都不在主进程头覆盖范围——这是取舍不是遗漏。
+// busy 是渲染层 `wb.http.post`，两者都不在 X-Device-Token 的覆盖范围——这是取舍
+// 不是遗漏。busy 的 X-Client-* 三头另由 applyHeaders 显式注入（真机 155/155 抓包
+// 覆盖 /v2/chat/busy，见 injectClientIdentityHeaders）。
 func (s surface) mainProcess() bool {
 	switch s {
 	case surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceLogout:
@@ -296,26 +298,37 @@ func (s surface) mainProcess() bool {
 
 // injectMainProcessProviderHeaders 注入官方**主进程出站头提供者**给出的头族。
 //
-// CN 5.11.3 起以产品 endpoint 为 origin 注册的出站头提供者替主进程统一注入这些头；
-// global 5.9.4 没有该提供者，保持各面原有的显式形态。调用点只该是主进程面
-// （surface.mainProcess、桌面 report / chat、CN 模型目录）。
+// CN 5.11.3 起、global 5.11.4 起，两个 realm 都以产品 endpoint 为 origin 注册了同一份
+// 出站头提供者（main/device-token.js + main/client-identity.js），替主进程统一注入这些
+// 头；两侧同形，不再按 realm 分支。调用点只该是主进程面（surface.mainProcess、桌面
+// report / chat、模型目录）。
 //
 // 覆盖两族：X-Device-Token（#552）与 X-Client-Version/Platform/Product（#551）。
 func (c *Client) injectMainProcessProviderHeaders(req *http.Request, account *auth.Auth) {
-	if account != nil && account.IsGlobal() {
-		return
-	}
-
 	// X-Device-Token：取不到值时不发，不自造 `X-Device-Token-Error`——网关没有
 	// Turing SDK 同源错误串，伪造取值等于自造指纹（见 UPSTREAM.md §六）。
 	if token := c.deviceToken(account); token != "" {
 		req.Header.Set("X-Device-Token", token)
 	}
 
-	// 客户端身份三头（#551，main/client-identity.js 的 buildClientIdentityHeaders）：
-	// 版本 = electron.app.getVersion()（桌面构建版本，取 profile 冻结值）；
-	// 平台 = Win32 归一值；产品 = cli/product.json 的 applicationName。
-	// 版本取不到就整条不发：空值头是比缺失更明显的非官方指纹。
+	c.injectClientIdentityHeaders(req, account)
+}
+
+// injectClientIdentityHeaders 注入客户端身份三头（#551 / #590）。
+//
+// 官方 CN 5.11.3 的 `main/client-identity.js` 由 `setClientIdentitySource` 注册
+// 提供者、`buildClientIdentityHeaders` 生成这三个头；`main/server.js` 以产品
+// endpoint 为 origin 注册，`proxy-env2.js` 的 `getOutboundHeaders` 按 origin 命中后
+// 统一注入，不接收路径参数、没有按面豁免的分支。故 chat / busy 与轻业务面同口径。
+//
+// 取值只复用 profile 与产品配置：版本 = electron.app.getVersion()（桌面构建版本，
+// 取 profile 冻结的 emit.desktopIdeVersion）；平台 = Win32 归一值；产品 =
+// cli/product.json 的 applicationName。版本取不到时只省略 X-Client-Version 这一个头
+// （空值头是比缺失更明显的非官方指纹），平台与产品恒发。
+//
+// 本函数只负责「按官方提供者取头」：哪个面发由调用点决定——主进程面两个 realm 都发
+// （CN #551 / global #579），chat 与 busy 只有 CN 有真机证据（#590）。
+func (c *Client) injectClientIdentityHeaders(req *http.Request, account *auth.Auth) {
 	if version := c.profileVersion(
 		account, func(p *clientprofile.Profile) string { return p.Emit.DesktopIdeVersion },
 	); version != "" {
@@ -326,20 +339,21 @@ func (c *Client) injectMainProcessProviderHeaders(req *http.Request, account *au
 	req.Header.Set("X-Client-Product", applicationNameFor(account))
 }
 
-// checkinHeaders 签到面显式注入的请求头：X-Device-Token（取值为空时不注入）。
-//
-// 签到走 surfaceBilling，CN 侧已由 mainProcess 统一注入覆盖；这里只服务 global
-// 5.9.x 的显式注入点（official authority-snapshot 的 buildHeadersWithTuringToken）。
-func (c *Client) checkinHeaders(a *auth.Auth) map[string]string {
-	if a == nil || !a.IsGlobal() {
-		return nil
+// isGlobalAccount 报告账号是否属于 global 域（nil 账号按 CN 处理，与本包其余判据同口径）。
+func isGlobalAccount(account *auth.Auth) bool {
+	return account != nil && account.IsGlobal()
+}
+
+// injectClientIdentityHeadersForRenderSurface 给渲染层 / CLI 出站的 chat 与 busy 补客户端
+// 身份三头（#590）：真机证据（155/155 抓包）只来自 CN 5.11.3，global 侧这两个面没有
+// 样本，按「不猜测」不发。主进程面不走这里（两个 realm 都发，见
+// injectMainProcessProviderHeaders）。
+func (c *Client) injectClientIdentityHeadersForRenderSurface(req *http.Request, account *auth.Auth) {
+	if isGlobalAccount(account) {
+		return
 	}
 
-	if tok := c.resolveDeviceToken(a); tok != "" {
-		return map[string]string{"X-Device-Token": tok}
-	}
-
-	return nil
+	c.injectClientIdentityHeaders(req, account)
 }
 
 // applyHeaders 出站头族唯一构造入口：按 surface 分发到 chat 头族或轻头族。
@@ -364,11 +378,17 @@ func (c *Client) applyHeaders(
 
 	c.lightHeaders(srf, req, account)
 
-	// 主进程面额外注入出站头提供者的头族（CN 5.11.3 起 X-Device-Token 覆盖全部
-	// RestOperations 面，#552）。growth / busy 不在 mainProcess 范围内，签到走
+	// 主进程面额外注入出站头提供者的头族（CN 5.11.3 / global 5.11.4 起覆盖全部
+	// RestOperations 面，#552 / #579）。growth / busy 不在 mainProcess 范围内，签到走
 	// surfaceBilling 一并覆盖。
 	if srf.mainProcess() {
 		c.injectMainProcessProviderHeaders(req, account)
+	}
+
+	// busy 是渲染层 wb.http.post，没有 X-Device-Token（真机 8 轻头不带），但真机
+	// 155/155 抓包（含 /v2/chat/busy）都带客户端身份三头，故只补三头（#590）。
+	if srf == surfaceModelBusy {
+		c.injectClientIdentityHeadersForRenderSurface(req, account)
 	}
 }
 
@@ -421,7 +441,7 @@ func (c *Client) chatFamilyHeaders(
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// X-Device-Token：chat 面注入（见 chatSurfaceOverrides），agenttool 四路与
-	// 其余面不注入（真机口径见 #376）；签到路径的注入见 Client.checkinHeaders。
+	// 其余面不注入（真机口径见 #376）；主进程面见 injectMainProcessProviderHeaders。
 	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, account.UID, meta)
 
@@ -465,6 +485,9 @@ func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *a
 		if token := c.deviceToken(account); token != "" {
 			req.Header.Set("X-Device-Token", token)
 		}
+		// 客户端身份三头：同一提供者按 origin 命中，chat 出站与轻业务面同口径
+		// （#590，CN 真机证据）。
+		c.injectClientIdentityHeadersForRenderSurface(req, account)
 
 		injectChatBaggage(req)
 	case surfaceModelBusy, surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceGrowth,
@@ -1162,7 +1185,7 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 // BillingHeaders billing meter 族（/billing/meter/*、balance、签到）请求头。
 // 官方 `buildHeaders` 只有 Accept / Authorization / Content-Type / X-User-Id
 // （外加按需的企业与 X-Domain 头），没有 Accept-Language、没有
-// X-Requested-With，也没有 X-Device-Token（签到单独注入，见 Client.checkinHeaders）。
+// X-Requested-With，也没有 X-Device-Token（两 realm 均由主进程出站头提供者统一注入，见 injectMainProcessProviderHeaders）。
 // UA 见 billingMeterUA（axios 默认串，取自抓包）。
 func (c *Client) BillingHeaders(req *http.Request, account6 *auth.Auth) {
 	c.applyHeaders(surfaceBilling, req, account6, "", ChatMeta{})

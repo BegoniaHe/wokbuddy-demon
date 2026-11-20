@@ -5,9 +5,9 @@
 // （或任意挂载路径），网关定期读取并注入消费者的请求头。读取频率限 5 分钟一次缓存，
 // >1KB 或读失败则忽略（优雅降级不注入，不影响主流程）。
 //
-// 消费面按官方基线分两代：CN 5.11.3 / global 5.9.4 起主进程出站头提供者在一方域
+// 消费面按官方基线分两代：CN 5.11.3 / global 5.11.4 起主进程出站头提供者在两个 realm
 // 统一注入（billing / report / refresh / v3-config / logout / 模型目录 / 桌面 chat，
-// 见 injectMainProcessProviderHeaders）；chat 与签到另有显式注入点。
+// 见 injectMainProcessProviderHeaders）；chat 另有显式注入点，签到随主进程面覆盖。
 // 取舍（发 = 更像官方，不发 = 更少设备关联）见 internal/upstream/UPSTREAM.md §六。
 package upstream
 

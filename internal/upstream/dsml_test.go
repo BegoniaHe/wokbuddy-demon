@@ -79,6 +79,43 @@ var testTools = map[string]bool{"exec_command": true, "write_stdin": true}
 
 // --- 基本解析 ---------------------------------------------------------------
 
+// TestUnclosedMarkup 尾部截断判定（issue #588）：没闭合的标记块 / 标签算截断，
+// 完整块、纯正文与空文本都不算。
+func TestUnclosedMarkup(t *testing.T) {
+	t.Parallel()
+
+	full := mkBlock(mkInvoke("exec_command", mkParam("cmd", "ls")))
+	paramHead := "<" + markupPipe + "DSML" + markupPipe + " parameter name=\"cmd\" string=\"true\">ls"
+
+	cases := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{"empty", "   ", false},
+		{"prose", "我把三处引用都核对过，参数名与返回类型都对得上。", false},
+		{"complete-block", "先执行\n" + full, false},
+		// 块已开、invoke / parameter 未闭合：截断在块内部。
+		{"unclosed-block", "先执行\n" + markupOpen, true},
+		{"unclosed-invoke", "先执行\n" + markupOpen + "\n" +
+			"<" + markupPipe + "DSML" + markupPipe + " invoke name=\"exec_command\">\n" + paramHead, true},
+		// 截断在标签属性中间：最后一个标记前缀之后没有 `>`。
+		{"truncated-attr", "先执行\n<" + markupPipe + "DSML" + markupPipe + " parameter name=\"cm", true},
+		// 截断在收尾标签内部。
+		{"truncated-close", "先执行\n" + full + "\n</" + markupPipe + "DSML" + markupPipe + " para", true},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := UnclosedMarkup(testCase.text); got != testCase.want {
+				t.Errorf("UnclosedMarkup(%q)=%v want %v", testCase.text, got, testCase.want)
+			}
+		})
+	}
+}
+
 func TestMarkupRepairSingleCall(t *testing.T) {
 	t.Parallel()
 

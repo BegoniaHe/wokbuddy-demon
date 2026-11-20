@@ -13,6 +13,175 @@ package upstream
 
 import "strings"
 
+// reorderEarlyToolResults 把**早于声明者**出现的 tool 结果挪到该 assistant 的结果块之后。
+//
+// OpenAI 兼容协议按位置配对：role:tool 结果必须出现在声明它的 assistant.tool_calls
+// 之后。Codex 经 cc-switch 一类本地代理转 /v1/responses 时，input 里的
+// function_call_output 会排在对应 function_call 之前；本仓按 input 原序拼接后出站
+// 就是「tool 在前、assistant(tool_calls) 在后」，上游判 11148 并顶死整条会话。
+//
+// 这里只调顺序、不改内容：
+//
+//	tool c0 | assistant tool_calls=[c0 c1] | tool c1
+//	→ assistant tool_calls=[c0 c1] | tool c1 | tool c0
+//
+// 早到结果统一落到「所属 assistant 之后、其后连续 tool 结果之后」，不插在紧跟
+// assistant 的位置——那会与同批正常结果的相对顺序冲突。同批早到结果之间保持原相对
+// 顺序。同一 id 被多条 assistant 声明时跟最后一次声明走（与 cleanupOrphanToolCalls
+// 的对称裁剪同口径）；找不到声明者的孤儿结果原位不动，交给 cleanup 删除。
+//
+// 必须排在 repackToolResultBlocks 之前：repack 只从 assistant 起步，早到的 tool 会
+// 被当普通消息直通留在原位；cleanup 又因两侧 id 齐全判配对完整，两步都盖不住这种
+// 倒置。本来顺序正确时返回原 slice（零改动）。
+func reorderEarlyToolResults(messages []any) ([]any, bool) {
+	if len(messages) < 2 {
+		return messages, false
+	}
+
+	declAt := toolCallDeclarationIndex(messages)
+	if len(declAt) == 0 || !hasEarlyToolResult(messages, declAt) {
+		return messages, false
+	}
+
+	builder := earlyResultReorder{
+		out:     make([]any, 0, len(messages)),
+		pending: make(map[int][]any, 2),
+		owner:   -1,
+	}
+	for i, m := range messages {
+		builder.add(i, m, declAt)
+	}
+
+	builder.flush()
+
+	return builder.out, true
+}
+
+// earlyResultReorder 重排构建状态：pending 按声明者下标暂存早到结果，owner 是已写出、
+// 结果块尚未收尾的 assistant 下标（-1 = 当前不在结果块内）。
+type earlyResultReorder struct {
+	out     []any
+	pending map[int][]any
+	owner   int
+}
+
+// add 按原序吸收一条消息；早到结果暂存，等所属 assistant 的结果块收尾时补在块后。
+func (b *earlyResultReorder) add(index int, m any, declAt map[string]int) {
+	msg, ok := m.(map[string]any)
+	if !ok {
+		b.flush()
+		b.out = append(b.out, m)
+
+		return
+	}
+
+	if at, early := earlyToolOwner(msg, index, declAt); early {
+		b.pending[at] = append(b.pending[at], m)
+
+		return
+	}
+
+	// 非 tool 消息是结果块的边界：先把早到结果补在整块之后。
+	if role, _ := msg["role"].(string); role != "tool" {
+		b.flush()
+	}
+
+	b.out = append(b.out, m)
+
+	if role, _ := msg["role"].(string); role == "assistant" && len(b.pending[index]) > 0 {
+		b.owner = index
+	}
+}
+
+// flush 把当前 assistant 结果块的早到结果追加到块之后。
+func (b *earlyResultReorder) flush() {
+	if b.owner < 0 {
+		return
+	}
+
+	b.out = append(b.out, b.pending[b.owner]...)
+	delete(b.pending, b.owner)
+
+	b.owner = -1
+}
+
+// earlyToolOwner 判断一条消息是否「早于声明者」的 tool 结果，返回所属 assistant 下标
+// （同一 id 跟最后一次声明）。
+func earlyToolOwner(msg map[string]any, index int, declAt map[string]int) (int, bool) {
+	if role, _ := msg["role"].(string); role != "tool" {
+		return 0, false
+	}
+
+	id, _ := msg["tool_call_id"].(string)
+
+	at, declared := declAt[id]
+	if !declared || at <= index {
+		return 0, false
+	}
+
+	return at, true
+}
+
+// toolCallDeclarationIndex 收集每个 tool_call id 最后一次声明的 assistant 下标。
+func toolCallDeclarationIndex(messages []any) map[string]int {
+	declAt := map[string]int{}
+
+	for i, m := range messages {
+		if msg, ok := m.(map[string]any); ok {
+			recordToolCallDeclarations(msg, i, declAt)
+		}
+	}
+
+	return declAt
+}
+
+// recordToolCallDeclarations 记录单条消息声明的 tool_call id → 消息下标（后者覆盖前者）。
+func recordToolCallDeclarations(msg map[string]any, index int, declAt map[string]int) {
+	if role, _ := msg["role"].(string); role != "assistant" {
+		return
+	}
+
+	tcs, ok := msg["tool_calls"].([]any)
+	if !ok {
+		return
+	}
+
+	for _, entry := range tcs {
+		if id := toolCallEntryID(entry); id != "" {
+			declAt[id] = index
+		}
+	}
+}
+
+// toolCallEntryID 读取 assistant.tool_calls[] 单项的 id；非对象/无 id 返回空串。
+func toolCallEntryID(entry any) string {
+	tc, ok := entry.(map[string]any)
+	if !ok {
+		return ""
+	}
+
+	id, _ := tc["id"].(string)
+
+	return id
+}
+
+// hasEarlyToolResult 报告是否存在位于声明者之前的 tool 结果。顺序本来正确时据此
+// 提前返回，不分配输出 slice。
+func hasEarlyToolResult(messages []any, declAt map[string]int) bool {
+	for i, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if _, early := earlyToolOwner(msg, i, declAt); early {
+			return true
+		}
+	}
+
+	return false
+}
+
 // repackToolResultBlocks 把插在 assistant.tool_calls 与其 tool 结果之间的非 tool 消息
 // 挪到整组之后，保证同一批 tool_call 的结果在 wire 上连续。
 //

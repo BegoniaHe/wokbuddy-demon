@@ -6,7 +6,9 @@
 package server
 
 import (
+	"slices"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
@@ -159,7 +161,7 @@ func classifyTail(text string, toolRound bool) upstream.TailKind {
 		return upstream.TailStructural
 	}
 
-	if textYieldsToUser(trimmed) {
+	if textYieldsToUser(trimmed, toolRound) {
 		return upstream.TailNone
 	}
 
@@ -186,9 +188,17 @@ func classifyTail(text string, toolRound bool) upstream.TailKind {
 	return upstream.TailNone
 }
 
-// structurallyOpen 报告尾部是否「结构上没写完」：围栏数量为奇数说明还缺收尾 ```。
+// structurallyOpen 报告尾部是否「结构上没写完」：围栏数量为奇数说明还缺收尾 ```；
+// 或者尾部停在一个没写完的原生工具调用标记里（issue #588）。截断的调用标记既不是
+// 承诺句也不以句末标点收尾，只看围栏会让它落 TailNone、不触发续写，客户端拿到半截
+// 参数；它与未闭合代码块同类，都该用「从断点接着写」的结构指令，不能套承诺句文案。
 func structurallyOpen(text string) bool {
-	return strings.Count(strings.TrimRight(text, " \t\r\n"), "```")%2 == 1
+	trimmed := strings.TrimRight(text, " \t\r\n")
+	if strings.Count(trimmed, "```")%2 == 1 {
+		return true
+	}
+
+	return upstream.UnclosedMarkup(trimmed)
 }
 
 // punctuatedTail 报告尾部是否停在标点型悬停的收尾符上。
@@ -221,7 +231,20 @@ func promiseSentence(text string) bool {
 		return false
 	}
 
+	if gerundSentence(last) || narrationPrefix(last) {
+		return true
+	}
+
 	low := strings.ToLower(last)
+	if englishGerundNarration(low) {
+		return true
+	}
+
+	// 「我来看一下这段代码」是观察性叙述，不是承诺动手。先把反向措辞从匹配窗口里剔除：
+	// 同一句里若还有真承诺词（「对我来说简单，我将开始修改」）仍按承诺句处理。
+	for _, negative := range promiseNegatives {
+		low = strings.ReplaceAll(low, negative, "")
+	}
 
 	for _, marker := range promiseMarkers {
 		if strings.Contains(low, marker) {
@@ -233,10 +256,93 @@ func promiseSentence(text string) bool {
 }
 
 // promiseMarkers 末句出现这些词说明模型在预告下一步动作（承诺句形态）。
-// 不收「下面」「接着」这类泛词：「下面这些文件都已改好。」是典型收尾。
+//
+// 不收「下面」「接着」这类泛词：「下面这些文件都已改好。」是典型收尾。同样不收
+// 「接下来」「下一步」：它们常用来对用户说话（「接下来你可以运行 npm test」），
+// 长正文里认它们会把写完的回答再续写一段，白付一次整段上下文（issue #592）。
+//
+// 也不收裸的 `i'm` / `正在`：`i'm` 会命中「I'm sorry, but…」「I'm not able to…」这类
+// 收尾，`正在` 会命中「文件正在被占用」这类状态描述。两者的旁白形态改由
+// narrationPrefix / englishGerundNarration 判定（issue #592 审查）。
 var promiseMarkers = []string{
-	"我将", "我会", "我来", "我继续", "接下来", "下一步", "现在开始", "现在修复", "再检查",
-	"let me", "next, i'll", "next i'll", "next i will", "now i'll", "i'll now", "i will",
+	"我将", "我会", "我来", "我继续", "我需要", "我得", "我打算", "我开始", "我再",
+	"我接着", "我还要", "我马上", "我这就", "我们接着", "接下来开始", "现在开始",
+	"现在修复", "再检查",
+	"let me", "let's", "let us", "i will", "i'll", "i need to", "i should",
+	"i'm going to", "i'm about to", "i am going to", "i am about to",
+}
+
+// promiseNegatives 出现在末句里说明这句话是观察或议论而非承诺（issue #592）。
+//
+// 「正在被」是被动状态描述（「文件正在被占用」），不是模型自述正在动手。
+var promiseNegatives = []string{"我来看", "对我来说", "对我们来说", "正在被"}
+
+// narrationPrefix 报告末句是否是中文自述旁白的开头（「正在修改 foo.go」「我正在核对
+// 第二处」）：模型常用「正在做…」代替动手。只认句首或紧跟「我 / 我们」的形态，
+// 「缓存正在失效」「文件正在被占用」这类状态描述不算（issue #592）。
+func narrationPrefix(last string) bool {
+	if strings.HasPrefix(last, "正在") {
+		return true
+	}
+
+	return strings.Contains(last, "我正在") || strings.Contains(last, "我们正在")
+}
+
+// englishGerundNarration 报告末句是否是「i'm / i am + 现在分词」的英文旁白
+// （「I'm updating the config」）：只有现在分词才算「正在做」，形容词 / 副词收尾
+// （「I'm sorry」「I'm not able to」）不算（issue #592）。
+func englishGerundNarration(low string) bool {
+	for _, subject := range englishGerundSubjects {
+		if _, after, found := strings.Cut(low, subject); found {
+			word, _, _ := strings.Cut(strings.TrimLeft(after, " \t"), " ")
+
+			if isGerundWord(word) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// englishGerundSubjects 「i'm / i am + 现在分词」旁白的英文主语形态（已小写）。
+var englishGerundSubjects = []string{"i'm ", "i am "}
+
+// gerundSentence 报告末句是否以现在分词开头的英文旁白（「Reading foo.go」「Updating
+// the config」）：模型用「正在做…」代替动手，与本仓中文词表同类。
+//
+// 只认纯字母的首词：带冒号的是标题不是旁白（「Testing: all 42 cases passed」），
+// 名词与介词形态（nothing / during / string 等）也不算。
+func gerundSentence(last string) bool {
+	word, rest, found := strings.Cut(strings.TrimSpace(last), " ")
+	if !found || strings.TrimSpace(rest) == "" {
+		return false
+	}
+
+	return isGerundWord(word)
+}
+
+// isGerundWord 报告单个词是否是现在分词（以 -ing 结尾的纯字母词，且不在非分词词表里）。
+// 门槛 6 个字母：更短的 -ing 结尾词（bring / thing / sting）几乎都是名词或非分词。
+func isGerundWord(word string) bool {
+	low := strings.ToLower(word)
+	if len(low) < 6 || !strings.HasSuffix(low, "ing") {
+		return false
+	}
+
+	for _, r := range low {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+
+	return !slices.Contains(gerundStopwords, low)
+}
+
+// gerundStopwords 以 -ing 结尾但不是现在分词的高频词：出现即不按旁白处理。
+var gerundStopwords = []string{
+	"nothing", "something", "anything", "everything", "during", "morning",
+	"evening", "string", "strings", "thing", "things",
 }
 
 // toolRoundTail 工具轮句号收尾的分流：够长之后看最后一句——收尾词优先（仍算答完），
@@ -304,39 +410,57 @@ func lastSentence(text string) string {
 }
 
 // sentenceBoundary 报告该位置是否是句末分隔点（只用于切最后一句）。
+//
+// 半角 `.` `!` `?` 只有后接空白或行尾才算句界（issue #586）：URL 查询串
+// （`…/a?q=1`）、文件名（`internal/verify/check.go`）、版本号（`v1.2`）与紧贴下文
+// 的感叹号（`我将开始修复!现在`）都不是句子交界，按任意位置切会把真正的末句
+// 切成半截，承诺句判据再也看不到「我将…」。全角 `。！？` 保持任意位置切句。
 func sentenceBoundary(runes []rune, i int) bool {
 	switch runes[i] {
-	case '。', '！', '？', '!', '?', '\n':
+	case '。', '！', '？', '\n':
 		return true
-	case '.':
-		return i+1 >= len(runes) || runes[i+1] == ' ' || runes[i+1] == '\n'
+	case '.', '!', '?':
+		return i+1 >= len(runes) || unicode.IsSpace(runes[i+1])
 	}
 
 	return false
 }
 
-// userYieldMarkers 末句出现这些措辞说明模型把控制权交回用户（等拍板 / 等补充信息）。
+// userYieldDirectMarkers 「明确对用户说」的措辞（issue #587）：出现在正文任何位置都
+// 说明这一轮在等用户拍板。
 //
 // 救援的语义是「模型没说完，替它补上」，但有一类收尾是故意的：模型在等用户确认
 // （「邮件已经写好，请确认后我再发送」）。这时补一句「继续执行下一步」会拿到工具调用
 // 并被采纳，等于替用户按下了发送键——宁可漏救，也不能替用户拍板。
-var userYieldMarkers = []string{
-	"请确认", "确认后", "等你确认", "待你确认", "等你回复", "是否需要", "需不需要",
-	"要不要我", "要不要", "你希望", "请告知", "让我知道", "请你确认", "你确认后",
-	"确认无误", "可以吗", "行吗", "好吗",
+var userYieldDirectMarkers = []string{
+	"请确认", "请你确认", "你确认后", "等你确认", "待你确认", "等你回复", "要不要",
+	"你希望", "让我知道", "可以吗", "行吗", "好吗", "确认无误",
 }
 
-// userYieldMarkersEN 英文形态（模型偶发用英文收尾）。
+// userYieldTechnicalMarkers 技术叙述里也可能出现的措辞：只有位置在末句、正文末尾最后
+// 一个问句、或后面紧跟「我 / 你」时才算交回控制权。
+var userYieldTechnicalMarkers = []string{"确认后", "是否需要", "需不需要", "请告知"}
+
+// userYieldMarkersEN 英文形态里「明确对用户说」的一族（模型偶发用英文收尾）。
 var userYieldMarkersEN = []string{
-	"please confirm", "let me know", "should i ", "do you want", "would you like",
-	"awaiting your", "waiting for your", "confirm before", "shall i ",
+	"please confirm", "let me know", "awaiting your", "waiting for your",
+	"should i ", "shall i ", "do you want", "would you like",
 }
 
-// textYieldsToUser 报告正文是否在「等用户回话」：以问号收尾，或末句含请确认类措辞。
+// userYieldTechnicalMarkersEN 英文形态里技术叙述也可能出现的一族。
+var userYieldTechnicalMarkersEN = []string{"confirm before"}
+
+// textYieldsToUser 报告正文是否在「等用户回话」：以问号收尾，或命中交回控制权的措辞。
 //
-// 只判末句窗口：整段 Contains 会被正文中段的技术叙述误伤（真实样本里「是否需要
-// 更换钢丝绳」距尾部三千余字），长正文几乎必然命中，等于长会话永远不救。
-func textYieldsToUser(text string) bool {
+// 位置判据分两族（issue #587）。明确对用户说的话在正文任何位置都否决救援：确认请求
+// 前置、后面再跟草稿或参数时（「请确认后我再发送。草稿放在 draft.md 里。」），只扫
+// 末句会漏掉它，工具轮便会把续写里的发送类工具调用采纳下来。技术叙述里也可能出现的
+// 措辞只在末句窗口、正文末尾问句、或紧跟「我 / 你」时否决——真实样本里「是否需要更换
+// 钢丝绳」距尾部三千余字，整段匹配等于长会话永远不救。
+//
+// toolRound 取更保守的整段匹配：工具轮的救援会采纳续写里的工具调用，多漏救一次也好过
+// 替用户按下发送键。
+func textYieldsToUser(text string, toolRound bool) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return false
@@ -346,23 +470,85 @@ func textYieldsToUser(text string) bool {
 		return true
 	}
 
-	tail := userYieldTail(trimmed)
+	low := strings.ToLower(trimmed)
 
-	for _, marker := range userYieldMarkers {
-		if strings.Contains(tail, marker) {
-			return true
-		}
+	if containsAnyMarker(trimmed, userYieldDirectMarkers) || containsAnyMarker(low, userYieldMarkersEN) {
+		return true
 	}
 
-	low := strings.ToLower(tail)
+	if toolRound {
+		return containsAnyMarker(trimmed, userYieldTechnicalMarkers) ||
+			containsAnyMarker(low, userYieldTechnicalMarkersEN)
+	}
 
-	for _, marker := range userYieldMarkersEN {
-		if strings.Contains(low, marker) {
+	tail := userYieldTail(trimmed)
+	question := lastQuestionSegment(trimmed)
+	lowTail := strings.ToLower(tail)
+	lowQuestion := strings.ToLower(question)
+
+	return yieldsAtTail(trimmed, tail, question, userYieldTechnicalMarkers) ||
+		yieldsAtTail(low, lowTail, lowQuestion, userYieldTechnicalMarkersEN)
+}
+
+// yieldsAtTail 报告技术叙述类措辞是否落在「交回控制权」的位置上：末句窗口、正文末尾
+// 问句，或紧跟着对「我 / 你」说话。
+func yieldsAtTail(text, tail, question string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(tail, marker) || strings.Contains(question, marker) ||
+			yieldAddressesUser(text, marker) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// containsAnyMarker 报告 text 是否含任一 marker。
+func containsAnyMarker(text string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// yieldAddressesUser 报告 text 里的 marker 是否紧跟「我 / 你」（「确认后我再发送」是在
+// 对用户说话，不是技术叙述里的「确认后」）。marker 可多次出现，任一处紧跟即算。
+func yieldAddressesUser(text, marker string) bool {
+	for rest := text; ; {
+		_, after, found := strings.Cut(rest, marker)
+		if !found {
+			return false
+		}
+
+		trimmed := strings.TrimLeft(after, " \t")
+		if strings.HasPrefix(trimmed, "我") || strings.HasPrefix(trimmed, "你") {
+			return true
+		}
+
+		rest = after
+	}
+}
+
+// lastQuestionSegment 取正文最后一个问句（不含问号）：「是否需要我发给你过目？收件人：
+// 张三」这种把问题与后续正文分开写的形态，末句窗口看不到问句里的措辞。
+func lastQuestionSegment(text string) string {
+	trimmed := strings.TrimRight(text, " \t\r\n")
+
+	i := strings.LastIndexAny(trimmed, "？?")
+	if i < 0 {
+		return ""
+	}
+
+	head := trimmed[:i]
+	if start := strings.LastIndexAny(head, "。！？!?\n"); start >= 0 {
+		_, size := utf8.DecodeRuneInString(head[start:])
+		head = head[start+size:]
+	}
+
+	return strings.TrimSpace(head)
 }
 
 // userYieldTail 取「最后一次句读之后」的窗口：交回控制权总是最后一句里的事。

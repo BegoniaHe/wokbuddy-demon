@@ -80,6 +80,31 @@ var (
 // 时写出的 <tool_name>、NAME 之类占位符。
 var markupToolNameRe = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$`)
 
+// UnclosedMarkup 报告正文尾部是否停在一个没写完的原生工具调用标记里（issue #588）：
+// 标记块已开始但没闭合，或最后一个开始标记连 `>` 都还没写到。
+//
+// 只用于尾部形态判定（这段正文是不是被截断），不解析参数、不执行任何东西。截断的
+// 调用标记既不是承诺句也不以句末标点收尾，不单独识别就会落 TailNone、不触发续写，
+// 客户端拿到半截调用。
+//
+// 判定按整段计数做，不按末句切分：截断点可能落在标记中间的任意位置。
+func UnclosedMarkup(text string) bool {
+	trimmed := strings.TrimRight(text, " \t\r\n")
+	if trimmed == "" {
+		return false
+	}
+	// 截断常落在属性值中间（parameter name="cm 之后再无 `>`）：最后一个标记前缀之后
+	// 仍没有 `>` 就是没写完的标签，此时下面的正则也匹配不到这个开始标记。
+	if i := strings.LastIndex(trimmed, markupPipe+"DSML"+markupPipe); i >= 0 &&
+		!strings.Contains(trimmed[i:], ">") {
+		return true
+	}
+
+	return strings.Count(trimmed, markupOpen) > strings.Count(trimmed, markupClose) ||
+		len(markupInvokeRe.FindAllString(trimmed, -1)) > strings.Count(trimmed, markupInvokeClose) ||
+		len(markupParamRe.FindAllString(trimmed, -1)) > strings.Count(trimmed, markupParamClose)
+}
+
 // markupMaxBlockBytes 单次标记块的累积上限。正常块从几百字节（一条 ls）到几十 KB
 // （一段 apply_patch）。超过上限仍未闭合 → 判定「这不是标记」（例如模型在正文里
 // 讨论这段语法），立即原文回吐并退出块态，避免无限缓冲。

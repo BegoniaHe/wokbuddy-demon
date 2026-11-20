@@ -114,22 +114,24 @@ func normalizeChatBody(obj map[string]any, rewrite *chatBodyRewrite) {
 	normalizeImageURL(obj)
 	// 出站形态修补（issue #482）：reasoning 片段剔除 + "[" 开头字符串补位。
 	applyOutboundShapePatches(obj)
-	// tool 配对三步（见 tool_pairing.go）：先合并再重排再清理。所有模型一律执行（独立于
-	// deepseek-only 的 sanitize 开关）。这是「让请求通过」的安全网——不完整配对的
-	// tool_calls/tool 结果会让上游对之后每条消息都返 400，必须先行剔除；
-	// 插在结果中间的非 tool 消息（Codex image_resize_notice）同样判配对断裂，
-	// 先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
+	// tool 配对四步（见 tool_pairing.go）：先合并、再重排早到结果、再重排插入消息、
+	// 最后清理。所有模型一律执行（独立于 deepseek-only 的 sanitize 开关）。这是
+	// 「让请求通过」的安全网——不完整配对的 tool_calls/tool 结果会让上游对之后每条
+	// 消息都返 400，必须先行剔除；插在结果中间的非 tool 消息（Codex
+	// image_resize_notice）同样判配对断裂，先 repack 挪后，再 cleanup 删孤儿，两侧同口径。
 	//
 	// 顺序不能换：mergeAdjacentToolCalls 必须最先跑——它把「背靠背的两条
 	// assistant.tool_calls」合成一条（部分 agent 客户端回放并行调用的报文形状），是上游
-	// deepseek 系模型 11148 的正面修复；先合并再 repack，repack 才看得到完整的一批调用。
+	// deepseek 系模型 11148 的正面修复；先合并再重排，重排才看得到完整的一批调用。
+	// reorderEarlyToolResults 必须早于 repack：早到的 tool 只有它认（repack 会把早到
+	// 的 tool 当普通消息直通，cleanup 又因两侧 id 齐全判配对完整）。
 	if msgs, ok := obj["messages"].([]any); ok {
 		msgs, _ = mergeAdjacentToolCalls(msgs)
+		msgs, _ = reorderEarlyToolResults(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
-		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
-		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
-		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
+		// 任一步重排/删除（哪怕后续步骤零改动）都必须落到 obj——不能只在「最后一步
+		// 改动」时回写，否则前一步单独生效的结果会被原 slice 覆盖丢失。
 		obj["messages"] = msgs
 	}
 
@@ -769,7 +771,8 @@ func toolChoiceFunctionName(table map[string]any) string {
 }
 
 // normalizeToolSchemas 规整 tools 子树的 JSON Schema：pattern 的非标转义 `\_`（→ `_`）
-// + 只写 enum 不写 type 的属性补出可无损推断的 type。
+// + 只写 enum 不写 type 的属性补出可无损推断的 type + 关键字取值类型纠偏
+// （见 coerceSchemaKeywords）+ 顶层 `$ref` 展开（见 expandTopLevelRef）。
 //
 // 上游对 tools[].function.parameters 做严格 JSON Schema/正则文法校验，pattern 含
 // `\_`（转义的字面量下划线）会整体拒收：400 code=11129 invalid_function_call_
@@ -797,26 +800,97 @@ func normalizeToolSchemas(obj map[string]any) {
 		}
 		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
 		if fn, ok := tool["function"].(map[string]any); ok {
-			normalizeSchemaTree(fn["parameters"])
+			normalizeToolParameters(fn)
 		}
 
-		normalizeSchemaTree(tool["parameters"])
+		normalizeToolParameters(tool)
 	}
 }
 
-// normalizeSchemaTree 递归规整 schema 树的单个节点，两件事：
+// normalizeToolParameters 规整一个持 parameters 的容器（tools[] 或 tools[].function）：
+// 先展开顶层 `$ref`，再递归归一展开后的真实 schema。
+func normalizeToolParameters(holder map[string]any) {
+	params, has := holder["parameters"]
+	if !has {
+		return
+	}
+
+	params = expandTopLevelRef(params)
+	holder["parameters"] = params
+
+	normalizeSchemaTree(params)
+}
+
+// expandTopLevelRef 展开 parameters 顶层的本地 `$ref`（`#/$defs/<name>` /
+// `#/definitions/<name>`）：同层有 `$defs`/`definitions` 且能解析时就地换成真实
+// schema（保住参数语义），展不开则删掉 `$ref` 键——上游按强类型反序列化时，认不出的
+// `$ref` 等于整颗工具被拒（400 code=11129）。
 //
-//  1. pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是
+// 只处理顶层节点：嵌套 `$ref` 实测 200（联合 type 数组、oneOf、嵌套 `$ref`+`$defs`
+// 同理），不扩面。展开后丢掉原节点的 `$defs`：它只用于这次解析，其余引用不在范围内。
+func expandTopLevelRef(node any) any {
+	n, ok := node.(map[string]any)
+	if !ok {
+		return node
+	}
+
+	ref, ok := n["$ref"].(string)
+	if !ok {
+		return node
+	}
+
+	if target := resolveSchemaRef(n, ref); target != nil {
+		return target
+	}
+
+	delete(n, "$ref")
+
+	return n
+}
+
+// resolveSchemaRef 在同层 `$defs` / `definitions` 里解析本地引用，返回目标 schema；
+// 展不开（不是本地引用 / 名字不存在 / 目标不是对象）返回 nil。
+func resolveSchemaRef(node map[string]any, ref string) map[string]any {
+	for _, container := range []string{"$defs", "definitions"} {
+		name, ok := strings.CutPrefix(ref, "#/"+container+"/")
+		if !ok || name == "" {
+			continue
+		}
+
+		defs, ok := node[container].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		// JSON Pointer 转义：`~1` → `/`，`~0` → `~`（顺序不可换，否则 `~01` 会被
+		// 二次解码成 `/`）。
+		name = strings.ReplaceAll(name, "~1", "/")
+		name = strings.ReplaceAll(name, "~0", "~")
+
+		if target, ok := defs[name].(map[string]any); ok {
+			return target
+		}
+	}
+
+	return nil
+}
+
+// normalizeSchemaTree 递归规整 schema 树的单个节点，三件事：
+//
+//  1. 关键字取值类型纠偏（见 coerceSchemaKeywords）；
+//  2. pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是
 //     正则；map 键不可原地改，命中时重建该层）；
-//  2. 只写 enum、没写 type 的属性补出 type（见 inferEnumType）。
+//  3. 只写 enum、没写 type 的属性补出 type（见 inferEnumType）。
 //
-// 第 2 条的实案：工具参数 schema 写成 {"enum":["a","b"]} 而不给 type，Kimi 系模型
+// 第 3 条的实案：工具参数 schema 写成 {"enum":["a","b"]} 而不给 type，Kimi 系模型
 // 严格校验后整单 400 code=11133（Invalid request parameters，extError「the request
 // parameters were rejected by the model provider」）——该模型对这类客户端等于全废；
 // 补上 "type":"string" 即 200（hy3 / glm-5.3 不受影响）。
 func normalizeSchemaTree(node any) {
 	switch n := node.(type) {
 	case map[string]any:
+		coerceSchemaKeywords(n)
+
 		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
 			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
 		}
@@ -835,15 +909,23 @@ func normalizeSchemaTree(node any) {
 	}
 }
 
-// schemaValueKeys 承载**数据取值**而非子 schema 的键：default / examples / const /
-// enum。递归必须在此止步——它们是值域，不是 schema 子树；进到默认值或示例里补
-// type、把 `\_` 改成 `_`，改的是客户端写的数据本身（default 里的对象会凭空多出
-// 一个 type 键），实际下发的默认值/示例就与原意不符。
-var schemaValueKeys = []string{"default", "examples", "const", "enum"}
+// schemaValueKeys 承载**数据取值**而非子 schema 的键：default / example / examples /
+// const / enum / dependentRequired。递归必须在此止步——它们是值域，不是 schema 子树；
+// 进到默认值或示例里补 type、把 `\_` 改成 `_`，改的是客户端写的数据本身（default 里的
+// 对象会凭空多出一个 type 键），实际下发的默认值/示例就与原意不符。
+//
+// dependentRequired 的值是「属性名 → 属性名数组」，里面没有任何子 schema。
+var schemaValueKeys = []string{"default", "example", "examples", "const", "enum", "dependentRequired"}
 
 // schemaMapKeys 值为「名字 → 子 schema」映射的键。必须显式处理：键名由用户决定
 // （properties 里完全可以有叫 enum / default 的属性），不能靠 schemaValueKeys 过滤。
-var schemaMapKeys = []string{"properties", "patternProperties", "$defs", "definitions"}
+//
+// dependentSchemas / dependencies 同理：它们的键是**属性名**，值才是子 schema（
+// dependencies 的值还可能是属性名数组，递归到数组里的字符串是 no-op）。漏了这两个
+// 键，属性名撞上 patternProperties / enum 之类的关键字就会被当成关键字处理。
+var schemaMapKeys = []string{
+	"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies",
+}
 
 // normalizeSchemaChild 按 schema 关键字归一递归方向：值域键不进入，名字映射键
 // 逐个进，其余（items / anyOf / allOf / $ref 等）按普通子树进。
@@ -863,6 +945,193 @@ func normalizeSchemaChild(key string, value any) {
 	default:
 		normalizeSchemaTree(value)
 	}
+}
+
+// schemaNumberKeys 取值必须是 JSON 数值的关键字。
+var schemaNumberKeys = []string{
+	"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
+	"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties",
+}
+
+// schemaBoolKeys 取值必须是 JSON 布尔的关键字。additionalProperties 另有一层例外：
+// 它也允许是子 schema（对象），那种形态交给递归，只有标量形态才纠偏。
+var schemaBoolKeys = []string{"uniqueItems", "additionalProperties"}
+
+// schemaStringKeys 取值必须是 JSON 字符串的关键字。
+var schemaStringKeys = []string{"description", "title"}
+
+// coerceSchemaKeywords 就地纠偏单个 schema 节点的**关键字取值类型**：弱类型客户端
+// （Python dict / PHP array 序列化）会把 minimum 写成 "1"、uniqueItems 写成 "true"、
+// description 写成 123、enum 写成 "x"、required 写成有重复项的数组。上游按强类型
+// 反序列化 tools[].function.parameters，类型不符即整单 400 code=11129（「工具定义
+// 不合规」），换账号无用，只能在发送前修。
+//
+// 纠不动就删键：留着一个类型不符的关键字等于保证整颗工具被拒；删键只让该约束失效，
+// 请求仍能通过，好过整单失败。
+//
+// 只在 schema 节点上调用：数据取值（schemaValueKeys）与名字映射键（schemaMapKeys）
+// 都由 normalizeSchemaChild 拦住，不会以「节点」身份进到这里。
+func coerceSchemaKeywords(n map[string]any) {
+	coerceSchemaNumbers(n)
+	coerceSchemaBools(n)
+	coerceSchemaStrings(n)
+	coerceSchemaEnum(n)
+	coerceSchemaRequired(n)
+}
+
+// coerceSchemaNumbers 数值类关键字：字符串数字转数字字面量，纠不动删键。
+func coerceSchemaNumbers(n map[string]any) {
+	for _, key := range schemaNumberKeys {
+		if value, has := n[key]; has {
+			if fixed, ok := schemaNumberValue(value); ok {
+				n[key] = fixed
+			} else {
+				delete(n, key)
+			}
+		}
+	}
+}
+
+// coerceSchemaBools 布尔类关键字：字符串布尔转布尔，纠不动删键。
+func coerceSchemaBools(n map[string]any) {
+	for _, key := range schemaBoolKeys {
+		value, has := n[key]
+		if !has {
+			continue
+		}
+
+		if _, isSchema := value.(map[string]any); isSchema {
+			continue // additionalProperties 的子 schema 形态，递归照常处理
+		}
+
+		if fixed, ok := schemaBoolValue(value); ok {
+			n[key] = fixed
+		} else {
+			delete(n, key)
+		}
+	}
+}
+
+// coerceSchemaStrings description / title 必须字符串，非字符串删键。
+func coerceSchemaStrings(n map[string]any) {
+	for _, key := range schemaStringKeys {
+		if value, has := n[key]; has {
+			if _, ok := value.(string); !ok {
+				delete(n, key)
+			}
+		}
+	}
+}
+
+// coerceSchemaEnum enum 必须是数组：字符串 / 标量形态无法无损还原成值域，删掉——
+// 补 type（inferEnumType）只认数组形态。
+func coerceSchemaEnum(n map[string]any) {
+	if value, has := n["enum"]; has {
+		if _, ok := value.([]any); !ok {
+			delete(n, "enum")
+		}
+	}
+}
+
+// coerceSchemaRequired required 去重并剔除非字符串项；不是数组则删键。
+func coerceSchemaRequired(n map[string]any) {
+	if value, has := n["required"]; has {
+		if fixed, ok := dedupeStringList(value); ok {
+			n["required"] = fixed
+		} else {
+			delete(n, "required")
+		}
+	}
+}
+
+// schemaNumberValue 把字符串数字转成数字字面量；已是数值（解码保留的原始字面量 /
+// 手构造 map 的 float64 等）原样通过，其余判否（调用方删键）。
+func schemaNumberValue(value any) (any, bool) {
+	if literal, ok := value.(jsontext.Value); ok {
+		if isNumberLiteral(literal) {
+			return literal, true
+		}
+
+		return nil, false
+	}
+
+	switch value.(type) {
+	case float64, int64, int:
+		return value, true
+	}
+
+	text, ok := value.(string)
+	if !ok {
+		return nil, false
+	}
+
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil, false
+	}
+
+	literal := jsontext.Value(trimmed)
+	if !isNumberLiteral(literal) {
+		return nil, false
+	}
+
+	return literal, true
+}
+
+// isNumberLiteral 报告原始字面量是否是合法 JSON 数字（Kind 判类型，IsValid 拦掉
+// `0x1p3` / `01` / `Inf` 这类非 JSON 数字写法）。
+func isNumberLiteral(value jsontext.Value) bool {
+	return value.Kind() == '0' && jsonx.Valid(value)
+}
+
+// schemaBoolValue 把 "true"/"false" 字符串（大小写不敏感）转成布尔；已是布尔原样
+// 通过，其余判否。
+func schemaBoolValue(value any) (any, bool) {
+	if flag, ok := value.(bool); ok {
+		return flag, true
+	}
+
+	text, ok := value.(string)
+	if !ok {
+		return nil, false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "true":
+		return true, true
+	case "false":
+		return false, true
+	}
+
+	return nil, false
+}
+
+// dedupeStringList 去重 required 的字符串数组（保留首次出现的顺序），非字符串项
+// 一并剔除；整体不是数组则判否（调用方删键）。
+func dedupeStringList(value any) (any, bool) {
+	items, ok := value.([]any)
+	if !ok {
+		return nil, false
+	}
+
+	out := make([]any, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+
+	for _, item := range items {
+		name, ok := item.(string)
+		if !ok {
+			continue
+		}
+
+		if _, dup := seen[name]; dup {
+			continue
+		}
+
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+
+	return out, true
 }
 
 // inferEnumType 给「有 enum 无 type」的 schema 节点补出可无损推断的 type；推不出唯一

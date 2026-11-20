@@ -22,11 +22,11 @@ import (
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 // 偶发上游 5xx（code 10000）做有界重试（见 retryBillingTransient）——单次抖动不再
 // 让该账号整天漏签；「已签到」等业务错误不重试。
-// 签到走 surfaceBilling：CN 侧 X-Device-Token 由主进程出站头提供者统一注入（#552），
-// global 侧仍用 checkinHeaders 的显式注入；auth/state 是面板登录面，不经本包。
+// 签到走 surfaceBilling：两个 realm 的 X-Device-Token 都由主进程出站头提供者统一注入
+// （#552 / #579）；auth/state 是面板登录面，不经本包。
 func (c *Client) DailyCheckin(ctx context.Context, a *auth.Auth) error {
 	return c.retryBillingTransient(ctx, func() error {
-		_, err := c.billingMeterJSONHeaders(a, checkinMeterPaths(), map[string]any{}, c.checkinHeaders(a))
+		_, err := c.billingMeterJSONHeaders(a, checkinMeterPaths(), map[string]any{}, nil)
 		return err
 	})
 }
@@ -35,7 +35,7 @@ func (c *Client) DailyCheckin(ctx context.Context, a *auth.Auth) error {
 // 返回 today_checked_in；请求失败时调用方回落直接签到路径。
 func (c *Client) CheckinActivityStatus(a *auth.Auth) (todayChecked bool, err error) {
 	data, err := c.billingMeterJSONHeaders(
-		a, []string{checkinActivityStatusPath}, map[string]any{}, c.checkinHeaders(a),
+		a, []string{checkinActivityStatusPath}, map[string]any{}, nil,
 	)
 	if err != nil {
 		return false, err
@@ -202,7 +202,7 @@ func (c *Client) DailyCheckinReceipt(ctx context.Context, account *auth.Auth) (C
 	err := c.retryBillingTransient(ctx, func() error {
 		var reqErr error
 
-		raw, status, reqErr = c.checkinRaw(ctx, account, c.checkinHeaders(account))
+		raw, status, reqErr = c.checkinRaw(ctx, account)
 		if reqErr != nil {
 			return reqErr
 		}
@@ -231,7 +231,7 @@ func (c *Client) DailyCheckinReceipt(ctx context.Context, account *auth.Auth) (C
 // 回执是平铺对象、失败回执是 HTTP 400 信封，两条都只能从原始 body 取。候选路径
 // 仍按 404 换下一条（与 billingMeterJSONLimitHeaders 同口径）。
 func (c *Client) checkinRaw(
-	ctx context.Context, account *auth.Auth, headers map[string]string,
+	ctx context.Context, account *auth.Auth,
 ) ([]byte, int, error) {
 	paths := checkinMeterPaths()
 
@@ -245,10 +245,6 @@ func (c *Client) checkinRaw(
 		}
 
 		c.applyHeaders(surfaceBilling, req, account, "", ChatMeta{})
-
-		for k, v := range headers {
-			req.Header.Set(k, v)
-		}
 
 		raw, status, err := doRawResponse(c.HTTPForAccount(account), req, defaultJSONBodyLimit)
 		if err != nil {
