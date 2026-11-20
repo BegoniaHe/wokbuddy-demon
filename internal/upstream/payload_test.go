@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -710,6 +711,172 @@ func testSanitizeOnOffSame(t *testing.T) {
 			t.Fatalf("sanitize=%v: pattern = %q, want %q", sanitize, got, "a_b")
 		}
 	}
+}
+
+// unicodeEscapeBody 构造「路径字段挂着 `^[^\uD800-\uDFFF]*$`」的工具 schema
+// （双层转义：JSON 里是 `\\uD800`，解码后是字面 `\uD800`）。
+func unicodeEscapeBody(patternJSON string) string {
+	return `{"messages":[],"tools":[{"type":"function","function":{"name":"write","parameters":{` +
+		`"type":"object","properties":{"path":{"type":"string","pattern":` + patternJSON + `},` +
+		`"content":{"type":"string"}},"required":["path"]}}}]}`
+}
+
+func testJSUnicodeEscapeTranslated(t *testing.T) {
+	out := string(PrepareBodyOptWithEfforts([]byte(unicodeEscapeBody(
+		`"^[^`+str+str+`uD800-`+str+str+`uDFFF]*$"`)), false, nil))
+
+	// JSON 解出来是 `^[^\uD800-\uDFFF]*$`，出站必须已译成 RE2 的 `\x{...}`。
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "path", "pattern"); got != `^[^\x{D800}-\x{DFFF}]*$` {
+		t.Fatalf("pattern = %q, want RE2 \\x{...} form", got)
+	}
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "content", "type"); got != "string" {
+		t.Fatalf("sibling field disturbed: %q", got)
+	}
+}
+
+func testJSUnicodeEscapeCompiles(t *testing.T) {
+	out := string(PrepareBodyOptWithEfforts([]byte(unicodeEscapeBody(
+		`"^[^`+str+str+`uD800-`+str+str+`uDFFF]*$"`)), false, nil))
+
+	pattern := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "path", "pattern")
+
+	compiled, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatalf("translated pattern does not compile: %v", err)
+	}
+
+	// 代理对区间仍被排除：普通路径可匹配，替换符 U+FFFD（不在 D800-DFFF 内）也可匹配。
+	if !compiled.MatchString("/tmp/a.txt") || !compiled.MatchString("\uFFFD") {
+		t.Fatalf("translated pattern lost its character class: %q", pattern)
+	}
+}
+
+func testSingleLayerEscapeUntouched(t *testing.T) {
+	// 单层转义：JSON 里的 `\uD83D\uDE00` 是合法代理对，解码后就是 😀，出站不该出现 `\x{`。
+	out := string(PrepareBodyOptWithEfforts([]byte(unicodeEscapeBody(
+		`"[\uD83D\uDE00]"`)), false, nil))
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "path", "pattern"); got != "[\U0001F600]" {
+		t.Fatalf("decoded single layer pattern = %q, want emoji literal", got)
+	}
+
+	if strings.Contains(out, `\x{`) {
+		t.Fatalf("single layer escape mutated into RE2 form: %s", out)
+	}
+}
+
+func testUntranslatablePatternDropped(t *testing.T) {
+	// `\u0041` 可译，但 `(?=` 是 JS 前瞻、RE2 不支持：整条 pattern 丢掉（只放宽一条
+	// 正则），其余 schema 与工具本身必须原样保留。
+	out := string(PrepareBodyOptWithEfforts([]byte(unicodeEscapeBody(
+		`"^`+str+str+`u0041(?=x)$"`)), false, nil))
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "path", "pattern"); got != "" {
+		t.Fatalf("untranslatable pattern kept: %q", got)
+	}
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "path", "type"); got != "string" {
+		t.Fatalf("sibling schema field disturbed: %q", got)
+	}
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "required", 0); got != "path" {
+		t.Fatalf("tool schema damaged: %q", got)
+	}
+}
+
+func testNoUnicodeEscapeUntouched(t *testing.T) {
+	out := string(PrepareBodyOptWithEfforts([]byte(unicodeEscapeBody(
+		`"^`+str+str+`d{4}-[a-z]+$"`)), false, nil))
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "path", "pattern"); got != `^\d{4}-[a-z]+$` {
+		t.Fatalf("pattern without unicode escape mutated: %q", got)
+	}
+
+	if strings.Contains(out, `\x{`) {
+		t.Fatalf("unexpected RE2 rewrite: %s", out)
+	}
+}
+
+func testEscapedBackslashBeforeU(t *testing.T) {
+	// `\\u0042` 是「转义的反斜杠 + u0042」：不是 JS 的 unicode 转义，不能译。
+	out := string(PrepareBodyOptWithEfforts([]byte(unicodeEscapeBody(
+		`"^A`+str+str+str+str+`u0042$"`)), false, nil))
+
+	if got := lookupToolPattern(t, out, "tools", 0, "function", "parameters", "properties", "path", "pattern"); got != `^A\\u0042$` {
+		t.Fatalf("escaped backslash rewritten: %q", got)
+	}
+}
+
+// testPatternPropertiesKeyUnicodeEscape patternProperties 的键本身也是正则：`\uXXXX`
+// 同样要译成 RE2 形态；译完仍编不过的键跟着丢掉，否则整颗 tools 一样被 11129 拒收
+// （issue #610）。
+func testPatternPropertiesKeyUnicodeEscape(t *testing.T) {
+	out := string(PrepareBodyOptWithEfforts([]byte(`{"messages":[],"tools":[{"type":"function",`+
+		`"function":{"name":"write","parameters":{"type":"object","patternProperties":{`+
+		`"^`+str+str+`u0041$":{"type":"string"},"^`+str+str+`u0042(?=x)$":{"type":"string"}}}}}]}`),
+		false, nil))
+
+	var obj map[string]any
+	if err := jsonx.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+
+	params, ok := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("parameters missing: %s", out)
+	}
+
+	props, ok := params["patternProperties"].(map[string]any)
+	if !ok {
+		t.Fatalf("patternProperties missing: %s", out)
+	}
+
+	if _, ok := props[`^\x{0041}$`]; !ok {
+		t.Fatalf("patternProperties keys = %v, want translated \\x{0041}", props)
+	}
+
+	for key := range props {
+		if strings.Contains(key, `(?=`) || strings.Contains(key, `\u`) {
+			t.Fatalf("untranslatable key kept: %q", key)
+		}
+	}
+}
+
+// TestNormalizeToolPatternUnicodeEscapes 工具 schema pattern 里 JS 风格 `\uXXXX`
+// 转义的出站纠偏（issue #610）：客户端把 `^[^\uD800-\uDFFF]*$` 这类 pattern 二次
+// 转义进 JSON，网关解码后出站仍是字面 `\uD800`——RE2 没有 `\u` 转义，上游按
+// 11129「工具定义不合规」整颗 tools 拒收。
+func TestNormalizeToolPatternUnicodeEscapes(t *testing.T) {
+	t.Parallel()
+	t.Run("js escape translated to RE2", func(t *testing.T) {
+		t.Parallel()
+		testJSUnicodeEscapeTranslated(t)
+	})
+	t.Run("translated pattern compiles and keeps class", func(t *testing.T) {
+		t.Parallel()
+		testJSUnicodeEscapeCompiles(t)
+	})
+	t.Run("single layer escape decoded untouched", func(t *testing.T) {
+		t.Parallel()
+		testSingleLayerEscapeUntouched(t)
+	})
+	t.Run("untranslatable pattern dropped", func(t *testing.T) {
+		t.Parallel()
+		testUntranslatablePatternDropped(t)
+	})
+	t.Run("no unicode escape untouched", func(t *testing.T) {
+		t.Parallel()
+		testNoUnicodeEscapeUntouched(t)
+	})
+	t.Run("escaped backslash before u untouched", func(t *testing.T) {
+		t.Parallel()
+		testEscapedBackslashBeforeU(t)
+	})
+	t.Run("patternProperties key translated", func(t *testing.T) {
+		t.Parallel()
+		testPatternPropertiesKeyUnicodeEscape(t)
+	})
 }
 
 // TestClampGPTMinMaxTokens GPT 系上游要求 max_tokens ≥ 16（实测 gpt-6-sol/gpt-6-luna/

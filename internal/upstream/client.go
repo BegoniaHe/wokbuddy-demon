@@ -971,7 +971,11 @@ var hardCreditCodes = []string{
 // requestLevelCodes 客户端语义为 editInput/newTask/reupload/upgradeClient 的
 // 请求级业务码：同一 body 换号结果不变，必须不罚号、不轮转、透传原文。
 // 11136/11141 另由 modelAccessCodes / modelRetiredCodes 处理（模型级避让）。
+// 11103 是「该模型的上游后端未启用」：官方 errorCode.11103 = Model configuration
+// error. Switch models —— 服务端模型配置不完整，同一 body 换任何账号结果一致
+// （issue #605）。归请求级后换号无用、也不该给健康号记连败。
 var requestLevelCodes = []string{
+	"11103",
 	"11125", "11129", "11130", "11132", "11137", "11138", "11139",
 	"11148", "11149", "11150", "11151", "11152", "11153", "11154", "11155",
 	"12654", "14405",

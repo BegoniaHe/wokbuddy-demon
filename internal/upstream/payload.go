@@ -8,6 +8,7 @@ import (
 	"encoding/json/jsontext"
 	"log"
 	"math"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -878,8 +879,9 @@ func resolveSchemaRef(node map[string]any, ref string) map[string]any {
 // normalizeSchemaTree 递归规整 schema 树的单个节点，三件事：
 //
 //  1. 关键字取值类型纠偏（见 coerceSchemaKeywords）；
-//  2. pattern 值与 patternProperties 键里的 `\_` → `_`（patternProperties 的键也是
-//     正则；map 键不可原地改，命中时重建该层）；
+//  2. pattern 值与 patternProperties 键里的非标正则转义（`\_` → `_`、JS 的
+//     `\uXXXX` → RE2 的 `\x{XXXX}`，见 normalizePatternForUpstream；patternProperties
+//     的键也是正则；map 键不可原地改，命中时重建该层）；
 //  3. 只写 enum、没写 type 的属性补出 type（见 inferEnumType）。
 //
 // 第 3 条的实案：工具参数 schema 写成 {"enum":["a","b"]} 而不给 type，Kimi 系模型
@@ -891,8 +893,14 @@ func normalizeSchemaTree(node any) {
 	case map[string]any:
 		coerceSchemaKeywords(n)
 
-		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
-			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
+		if p, ok := n["pattern"].(string); ok {
+			if normalized, keep := normalizePatternForUpstream(p); keep {
+				n["pattern"] = normalized
+			} else {
+				// 译完仍编不过：丢掉这条 pattern 只是放宽一条正则，留着等于让整颗
+				// tools 被上游 11129 拒收（issue #610）。
+				delete(n, "pattern")
+			}
 		}
 
 		inferEnumType(n)
@@ -907,6 +915,98 @@ func normalizeSchemaTree(node any) {
 			normalizeSchemaTree(v)
 		}
 	}
+}
+
+// normalizePatternForUpstream 把 pattern 值里的非 RE2 转义译成 RE2 能解析的形态：
+// `\_` → `_`、JS 的 `\uXXXX` → `\x{XXXX}`。第二个返回值为 false 表示译完仍不能
+// 编译（客户端的正则里还混着 RE2 不认的语法，如 JS 前瞻 `(?=...)`），调用方必须
+// 丢掉这条 pattern：上游按 RE2 解析，编不过的 pattern 会让整颗 tools 收到 11129。
+//
+// 只对含 `\u` 的 pattern 做编译验证：其余 pattern 走的是与既有 `\_` 归一相同的
+// 零编译路径，不新增开销。
+func normalizePatternForUpstream(pattern string) (string, bool) {
+	if strings.Contains(pattern, `\_`) {
+		pattern = strings.ReplaceAll(pattern, `\_`, `_`)
+	}
+
+	translated, translatedAny := translateJSPatternUnicode(pattern)
+	if !translatedAny {
+		return translated, true
+	}
+
+	if _, err := regexp.Compile(translated); err != nil {
+		return "", false
+	}
+
+	return translated, true
+}
+
+// translateJSPatternUnicode 把 JS 的 `\uXXXX` 转义译成 RE2 的 `\x{XXXX}`（代理对
+// 按两段分别译）。返回译后串与是否发生过翻译；`\\`（转义的反斜杠）之后的 `u` 不是
+// 转义序列，原样保留。
+func translateJSPatternUnicode(pattern string) (string, bool) {
+	if !strings.Contains(pattern, `\u`) {
+		return pattern, false
+	}
+
+	var out strings.Builder
+
+	out.Grow(len(pattern))
+
+	translated := false
+
+	for i := 0; i < len(pattern); {
+		if pattern[i] != '\\' || i+1 >= len(pattern) {
+			out.WriteByte(pattern[i])
+			i++
+
+			continue
+		}
+
+		if pattern[i+1] == '\\' {
+			out.WriteString(`\\`)
+
+			i += 2
+
+			continue
+		}
+
+		if pattern[i+1] == 'u' && i+6 <= len(pattern) && isHexDigits(pattern[i+2:i+6]) {
+			out.WriteString(`\x{`)
+			out.WriteString(pattern[i+2 : i+6])
+			out.WriteByte('}')
+
+			i += 6
+			translated = true
+
+			continue
+		}
+
+		out.WriteByte(pattern[i])
+		i++
+	}
+
+	if !translated {
+		return pattern, false
+	}
+
+	return out.String(), true
+}
+
+// isHexDigits 报告 text 是否全为十六进制数字（`\uXXXX` 的 XXXX 部分）。
+func isHexDigits(text string) bool {
+	if text == "" {
+		return false
+	}
+
+	for i := range len(text) {
+		c := text[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+
+	return true
 }
 
 // schemaValueKeys 承载**数据取值**而非子 schema 的键：default / example / examples /
@@ -1232,8 +1332,9 @@ func mergeEnumType(kind, cur string) (string, bool) {
 	}
 }
 
-// normalizePatternProperties 改写 patternProperties 键里的 `\_`（map 键不可原地改，
-// 命中时重建该层并写回 n）。
+// normalizePatternProperties 用 normalizePatternForUpstream 改写 patternProperties 的
+// 键（键本身也是正则）：`\_` → `_`、`\uXXXX` → `\x{XXXX}`；译完仍编不过的键整条丢掉
+// （map 键不可原地改，命中时重建该层并写回 n）。
 func normalizePatternProperties(n map[string]any) {
 	props, ok := n["patternProperties"].(map[string]any)
 	if !ok {
@@ -1244,9 +1345,17 @@ func normalizePatternProperties(n map[string]any) {
 
 	fixed := make(map[string]any, len(props))
 	for item, iface := range props {
-		if strings.Contains(item, `\_`) {
-			item = strings.ReplaceAll(item, `\_`, `_`)
+		normalized, keep := normalizePatternForUpstream(item)
+		if !keep {
 			rebuilt = true
+
+			continue
+		}
+
+		if normalized != item {
+			rebuilt = true
+
+			item = normalized
 		}
 
 		fixed[item] = iface

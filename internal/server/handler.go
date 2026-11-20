@@ -3113,7 +3113,7 @@ func (*Handler) tracedPath(r *http.Request) bool {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
 		"/v1/responses", "/v1/search/messages", "/v1/images/generations", "/v1/images/edits",
 		"/v1/videos/generations",
-		"/v1/tools/fetch", "/v1/fetch":
+		"/v1/tools/fetch", "/v1/fetch", "/v1/tools/search":
 		return true
 	}
 
@@ -3131,6 +3131,11 @@ func (h *Handler) registerSearchRoute() {
 	h.mux.HandleFunc(
 		"POST /v1/search/messages",
 		h.withRecovery(h.withClientAuth(h.anthropicSearchHandler)),
+	)
+	// DeepSeek 官方形状的同族出口（issue #608）：同一上游能力、同一开关。
+	h.mux.HandleFunc(
+		"POST /v1/tools/search",
+		h.withRecovery(h.withClientAuth(h.toolsSearchEndpointHandler)),
 	)
 }
 
@@ -4737,7 +4742,7 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 	msg = "all accounts are temporarily unavailable, please retry later"
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
-	hint = upstream.NoHealthyAccountHint()
+	hint = f.pickFailureHint()
 
 	if s2, c2, m2, ok := localErrorEnvelope(f.lastErr, status, code, msg); ok {
 		// 本地分类错误（超时 / 截断 / 空流 / 大小超限）：属于上游或传输层异常，

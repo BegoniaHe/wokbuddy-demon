@@ -53,6 +53,9 @@ type searchFailure struct {
 	code   string
 	msg    string
 	hint   string
+	// retryOtherRealm 该失败是域名/边缘级判定（15022 上游浏览器连不上目标站），
+	// 换域出口可能能通：调用方可以换另一域再试一次（issue #605）。
+	retryOtherRealm bool
 }
 
 // runSearch 执行一次联网搜索（内部有界轮转），并返回最终服务该请求的账号 UID
@@ -67,7 +70,7 @@ func (h *Handler) runSearch(
 		chatMeta = *meta
 	}
 
-	return runAgentTool(ctx, h, "search", max(h.cfg.MaxRotate+1, 1), false,
+	return runAgentTool(ctx, h, "search", max(h.cfg.MaxRotate+1, 1), false, searchRealm,
 		func(ctx context.Context, acct *auth.Auth) (*upstream.SearchOutcome, error) {
 			return h.cfg.Upstream.Search(ctx, acct, query, opts, chatMeta)
 		})
@@ -83,7 +86,7 @@ func (h *Handler) runAgenticSearch(
 		chatMeta = *meta
 	}
 
-	return runAgentTool(ctx, h, "search_deep", 1, false,
+	return runAgentTool(ctx, h, "search_deep", 1, false, searchRealm,
 		func(ctx context.Context, acct *auth.Auth) (*upstream.AgenticOutcome, error) {
 			bizVia := "public"
 			if acct.IsEnterprise() {
@@ -151,9 +154,12 @@ func searchTraceOutcome(fail *searchFailure) string {
 // 不接收 model：snippet/深检索请求体不含 model，webfetch 的 model_name 也不是
 // 网关池里的聊天模型；把客户端模型名交给 applyErrorPolicy 会误写模型级冷却/路由熔断。
 //
+// realm 指定选号域：搜索/抓取默认只走 CN 域（searchRealm）；15022 的换域兜底会
+// 用另一域重跑一次本函数。
+//
 //nolint:funlen // 轮转/租约/错误处置线性展开。
 func runAgentTool[T any](
-	ctx context.Context, handler *Handler, stage string, attempts int, rotateTransport bool,
+	ctx context.Context, handler *Handler, stage string, attempts int, rotateTransport bool, realm string,
 	call func(context.Context, *auth.Auth) (T, error),
 ) (T, string, *searchFailure) {
 	var zero T
@@ -170,9 +176,9 @@ func runAgentTool[T any](
 	)
 
 	for i := range attempts {
-		acct := handler.cfg.Pool.PickExcludingForRealm(tried, "", searchRealm)
+		acct := handler.cfg.Pool.PickExcludingForRealm(tried, "", realm)
 		if acct == nil {
-			uid, fail := exhaustedFailure(lastFail, lastUID)
+			uid, fail := exhaustedFailure(handler, stage, tried, lastFail, lastUID)
 
 			return zero, uid, fail
 		}
@@ -212,7 +218,7 @@ func runAgentTool[T any](
 		}
 	}
 
-	uid, fail := exhaustedFailure(lastFail, lastUID)
+	uid, fail := exhaustedFailure(handler, stage, tried, lastFail, lastUID)
 
 	return zero, uid, fail
 }
@@ -221,12 +227,19 @@ func runAgentTool[T any](
 //
 // 为什么带出 uid：调用方的用量记录在 uid 为空时直接 return，失败请求就既不计
 // 请求数也不计延迟，失败率在面板上完全不可见。
-func exhaustedFailure(lastFail *searchFailure, lastUID string) (string, *searchFailure) {
+//
+// 一次都没打到上游（lastFail 为空）时，hint 带一次选号成因拆解（issue #607）。
+func exhaustedFailure(
+	handler *Handler, stage string, tried map[string]bool, lastFail *searchFailure, lastUID string,
+) (string, *searchFailure) {
 	if lastFail != nil {
 		return lastUID, lastFail
 	}
 
-	return "", noHealthyAccountFailure()
+	fail := noHealthyAccountFailure()
+	fail.hint = handler.noPickHint(stage, "", searchRealm, tried, false)
+
+	return "", fail
 }
 
 // runWithAccountLease 在账号在途租约下执行一次工具调用，无论正常返回还是 panic
@@ -314,7 +327,7 @@ func (h *Handler) agentToolErrorFailure(
 ) *searchFailure {
 	// 确定性上游结果（缺正文/非文本/超限/无综述）：换号不会改变，直接终态。
 	if agentToolDeterministicError(err) {
-		return deterministicAgentToolFailure(stage)
+		return deterministicAgentToolFailure(stage, err)
 	}
 
 	// 客户端已断开：这不是上游故障。按 499 终态返回（调用方按 client_closed
@@ -387,7 +400,7 @@ func (h *Handler) agentToolReplayAfterRefresh[T any](
 	// 重放后仍是确定性失败（缺正文/非文本/超限/无综述）：与首次失败同口径直接
 	// 终态，不能当成传输层错误去换号（换号只会重复同一份响应）。
 	if agentToolDeterministicError(err) {
-		return zero, deterministicAgentToolFailure(stage)
+		return zero, deterministicAgentToolFailure(stage, err)
 	}
 
 	var upErr *upstream.Error
@@ -412,12 +425,24 @@ func (h *Handler) agentToolReplayAfterRefresh[T any](
 }
 
 // deterministicAgentToolFailure 确定性失败的终端形态：带 code 让调用方停止轮转。
-func deterministicAgentToolFailure(stage string) *searchFailure {
-	return &searchFailure{
+//
+// 域名/边缘级业务码（issue #605）另有两处差异：
+//   - 15021 域名路由策略拒绝：同一 URL 换号无意义，按客户端问题回 400；
+//   - 15022 上游浏览器连不上目标站：换域出口可能能通，标记 retryOtherRealm。
+func deterministicAgentToolFailure(stage string, err error) *searchFailure {
+	fail := &searchFailure{
 		status: http.StatusBadGateway,
 		code:   "upstream_" + stage + "_failed",
 		msg:    "upstream " + stage + " failed",
 	}
+
+	if errors.Is(err, upstream.ErrWebFetchDomainBlocked) {
+		fail.status = http.StatusBadRequest
+	}
+
+	fail.retryOtherRealm = errors.Is(err, upstream.ErrWebFetchTargetUnreachable)
+
+	return fail
 }
 
 // agentToolDeterministicError 报告不随账号变化的确定性失败：缺正文/非文本/
@@ -427,6 +452,8 @@ func agentToolDeterministicError(err error) bool {
 		errors.Is(err, upstream.ErrWebFetchNonText) ||
 		errors.Is(err, upstream.ErrWebFetchTooLarge) ||
 		errors.Is(err, upstream.ErrWebFetchBadResponse) ||
+		errors.Is(err, upstream.ErrWebFetchDomainBlocked) ||
+		errors.Is(err, upstream.ErrWebFetchTargetUnreachable) ||
 		errors.Is(err, upstream.ErrAgenticSearchNoSynthesis) ||
 		errors.Is(err, upstream.ErrAgenticSearchTooLarge)
 }

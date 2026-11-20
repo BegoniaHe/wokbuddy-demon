@@ -1,6 +1,7 @@
 package upstream
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -48,6 +49,29 @@ func TestGatewayHintModelParamInvalidToolSchema(t *testing.T) {
 		if !strings.Contains(got, "request parameters were rejected by the model provider") {
 			t.Fatalf("普通 11133 的中性 hint 被改动: %q", got)
 		}
+	}
+}
+
+// TestClassifyModelBackendDisabled 11103「该模型的上游后端未启用」按请求级归类，
+// 且 hint 指向换模型（issue #605）：换任何账号结果一致，不能罚号也不能轮转。
+func TestClassifyModelBackendDisabled(t *testing.T) {
+	t.Parallel()
+
+	body := `{"code":11103,"msg":"the model backend is not enabled"}`
+
+	if kind := Classify(http.StatusBadRequest, body); kind != ErrBadParams {
+		t.Fatalf("kind = %v, want ErrBadParams", kind)
+	}
+
+	hint := GatewayHint(ErrBadParams, body, HintContext{})
+	if !strings.Contains(hint, "switch to another model") {
+		t.Fatalf("hint = %q, want switch-model guidance", hint)
+	}
+
+	// SSE 错误帧同一口径：首帧 11103 不轮转。
+	frame := `{"error":{"code":11103,"message":"the model backend is not enabled"}}`
+	if kind := FrameKind(frame); kind != ErrBadParams {
+		t.Fatalf("frame kind = %v, want ErrBadParams", kind)
 	}
 }
 

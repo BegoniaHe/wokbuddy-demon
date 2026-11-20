@@ -38,6 +38,12 @@ var (
 	ErrWebFetchTooLarge = errors.New("webfetch response too large")
 	// ErrWebFetchBadResponse 200 响应不是可解析的 JSON（协议/代理故障，换号不会变）。
 	ErrWebFetchBadResponse = errors.New("webfetch returned malformed response")
+	// ErrWebFetchDomainBlocked 域名级路由策略拒绝（15021）：同一 URL 换任何账号
+	// 报文一致，换号无意义（issue #605）。
+	ErrWebFetchDomainBlocked = errors.New("webfetch blocked by upstream domain routing policy")
+	// ErrWebFetchTargetUnreachable 上游浏览器连不上目标站（15022）：同一账号重试
+	// 无意义，但换域出口可能能通（issue #605）。
+	ErrWebFetchTargetUnreachable = errors.New("webfetch target unreachable from upstream browser")
 )
 
 // WebFetchRequest 一次服务端抓取的可选参数。URL 必填；其余空值按官方默认。
@@ -152,10 +158,7 @@ func normalizeWebFetchRequest(req *WebFetchRequest) ([]byte, int, error) {
 // parseWebFetchResponse 校验状态/业务码/文本类型/正文，任一不满足都明确失败。
 func parseWebFetchResponse(status int, raw []byte, fallbackURL string) (*WebFetchOutcome, error) {
 	if status >= http.StatusBadRequest {
-		return nil, &Error{
-			Kind: Classify(status, string(raw)), Status: status,
-			Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
-		}
+		return nil, webFetchErrorResponse(status, raw)
 	}
 
 	var parsed struct {
@@ -197,6 +200,35 @@ func parseWebFetchResponse(status int, raw []byte, fallbackURL string) (*WebFetc
 	}
 
 	return &WebFetchOutcome{URL: outURL, ContentType: parsed.ContentType, Content: content}, nil
+}
+
+// webFetchErrorResponse 把非成功响应翻成错误：域名/边缘级业务码先于账号级分类，
+// 归哨兵错误（换号对同一 URL 结果一致，issue #605）；其余沿用既有 Classify 口径。
+func webFetchErrorResponse(status int, raw []byte) error {
+	if err := webFetchDomainFailure(businessCode(string(raw))); err != nil {
+		return err
+	}
+
+	return &Error{
+		Kind: Classify(status, string(raw)), Status: status,
+		Msg: truncate(string(raw), 200), Code: businessCode(string(raw)),
+	}
+}
+
+// webFetchDomainFailure 把域名/边缘级业务码译成哨兵错误（未命中返回 nil）。
+//
+// 只认结构化 code，不按文案匹配：15021 是上游按域名路由策略拒绝，15022 是上游
+// 浏览器连不上目标站——两者对同一 URL 的任何账号报文一致，属请求级事实而不是账号
+// 故障（issue #605）。
+func webFetchDomainFailure(code string) error {
+	switch strings.TrimSpace(code) {
+	case "15021":
+		return fmt.Errorf("%w (code=15021)", ErrWebFetchDomainBlocked)
+	case "15022":
+		return fmt.Errorf("%w (code=15022)", ErrWebFetchTargetUnreachable)
+	default:
+		return nil
+	}
 }
 
 // isTextualContentType 与官方 classifyResourceKind 同口径：image/video/audio 与
