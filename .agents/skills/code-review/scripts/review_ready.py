@@ -53,7 +53,7 @@ VERDICT_ALLOWED = {
 }
 
 ID_RE = re.compile(r"^F[0-9]+$")
-FINGERPRINT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$")
+FINGERPRINT_RE = re.compile(r"^(?=.*[A-Za-z0-9])[A-Za-z0-9._:/@+-]+$")
 COMMENT_MARKER = "<!-- code-review:summary -->"
 
 
@@ -79,22 +79,39 @@ def nonempty_str(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def load_json(path: Path, problems: list[str]) -> object:
+def read_text(path: Path, problems: list[str]) -> str | None:
+    """读取 UTF-8 文本；缺失或不可读时登记问题并返回 None。"""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return path.read_text(encoding="utf-8")
     except FileNotFoundError:
         problems.append("缺少文件: %s" % path)
-    except json.JSONDecodeError as err:
-        problems.append("%s 不是合法 JSON: %s" % (path.name, err))
+    except (OSError, UnicodeDecodeError) as err:
+        problems.append("%s 无法以 UTF-8 读取: %s" % (path.name, err))
     return None
 
 
+def load_coverage(path: Path, problems: list[str]) -> dict | None:
+    """读取账本；非对象 JSON 也算失败，门禁不得静默通过。"""
+    text = read_text(path, problems)
+    if text is None:
+        return None
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as err:
+        problems.append("%s 不是合法 JSON: %s" % (path.name, err))
+        return None
+    if not isinstance(value, dict):
+        problems.append("%s 顶层必须是 JSON 对象" % path.name)
+        return None
+    return value
+
+
 def load_findings(path: Path, problems: list[str]) -> list[dict]:
-    if not path.exists():
-        problems.append("缺少文件: %s" % path)
+    text = read_text(path, problems)
+    if text is None:
         return []
     records: list[dict] = []
-    for lineno, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.strip()
         if not line:
             continue
@@ -299,11 +316,9 @@ def check_links(units: list[dict], finding_ids: set[str], problems: list[str]) -
 
 
 def check_report(run_dir: Path, finding_ids: set[str], problems: list[str]) -> None:
-    path = run_dir / "REPORT.md"
-    if not path.exists():
-        problems.append("缺少文件: REPORT.md")
+    text = read_text(run_dir / "REPORT.md", problems)
+    if text is None:
         return
-    text = path.read_text(encoding="utf-8")
     for heading in ("## 结论", "## 覆盖范围"):
         if heading not in text:
             problems.append("REPORT.md 缺少章节: %s" % heading)
@@ -319,15 +334,18 @@ def check_comment(run_dir: Path, mode: object, problems: list[str]) -> None:
     if not path.exists():
         problems.append("PR 模式缺少文件: COMMENT.md")
         return
-    first = path.read_text(encoding="utf-8").lstrip().splitlines()[:1]
+    text = read_text(path, problems)
+    if text is None:
+        return
+    first = text.lstrip().splitlines()[:1]
     if not first or first[0].strip() != COMMENT_MARKER:
         problems.append("COMMENT.md 首行必须是 %s" % COMMENT_MARKER)
 
 
 def check_run(run_dir: Path, changed_file: Path | None = None) -> list[str]:
     problems: list[str] = []
-    coverage = load_json(run_dir / "COVERAGE.json", problems)
-    if not isinstance(coverage, dict):
+    coverage = load_coverage(run_dir / "COVERAGE.json", problems)
+    if coverage is None:
         return problems
 
     changed, units, counts = check_coverage(coverage, problems)

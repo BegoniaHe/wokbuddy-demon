@@ -208,6 +208,19 @@ class ReviewReadyTest(unittest.TestCase):
         self.write_run(GOOD_COVERAGE, findings, GOOD_REPORT)
         self.assert_failure("fingerprint 重复")
 
+    def test_dot_directory_fingerprint_accepted(self) -> None:
+        findings = json.loads(json.dumps(GOOD_FINDINGS))
+        findings[0]["fingerprint"] = ".agents/skills/x/SKILL.md:stale-convention"
+        self.write_run(GOOD_COVERAGE, findings, GOOD_REPORT)
+        code, _, err = self.check()
+        self.assertEqual(code, 0, err)
+
+    def test_punctuation_only_fingerprint_fails(self) -> None:
+        findings = json.loads(json.dumps(GOOD_FINDINGS))
+        findings[0]["fingerprint"] = ".:"
+        self.write_run(GOOD_COVERAGE, findings, GOOD_REPORT)
+        self.assert_failure("fingerprint 必须是非空稳定根因标识")
+
     def test_unlinked_finding_fails(self) -> None:
         coverage = json.loads(json.dumps(GOOD_COVERAGE))
         coverage["units"][1]["findings"] = []
@@ -226,6 +239,14 @@ class ReviewReadyTest(unittest.TestCase):
         changed = Path(self.tmp.name) / "changed.txt"
         changed.write_text("internal/pool/pool.go\nweb/src/app.tsx\nnew/file.go\n", encoding="utf-8")
         self.assert_failure("实际变更文件未登记", changed)
+
+    def test_non_object_coverage_fails(self) -> None:
+        (self.run_dir / "COVERAGE.json").write_text("[]", encoding="utf-8")
+        self.assert_failure("顶层必须是 JSON 对象")
+
+    def test_unreadable_report_fails(self) -> None:
+        (self.run_dir / "REPORT.md").write_bytes(b"\xff\xfe")
+        self.assert_failure("无法以 UTF-8 读取")
 
     def test_comment_marker_required_for_pr(self) -> None:
         self.write_run(GOOD_COVERAGE, GOOD_FINDINGS, GOOD_REPORT, comment="## 摘要\n")
