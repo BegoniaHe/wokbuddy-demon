@@ -52,9 +52,6 @@ func TestGatewayHintModelParamInvalidToolSchema(t *testing.T) {
 	}
 }
 
-// TestGatewayHintToolDefinitionRejection 工具定义侧的请求级拒收（11129 工具定义不合规 /
-// 11152 工具名称不规范）：只在请求确实声明了 tools 时给「检查 tools」的指向；11101
-// 请求体畸形不给（否则客户端会去翻自己的 schema）。
 // TestClassifyModelBackendDisabled 11103「该模型的上游后端未启用」按请求级归类，
 // 且 hint 指向换模型（issue #605）：换任何账号结果一致，不能罚号也不能轮转。
 func TestClassifyModelBackendDisabled(t *testing.T) {
@@ -78,6 +75,9 @@ func TestClassifyModelBackendDisabled(t *testing.T) {
 	}
 }
 
+// TestGatewayHintToolDefinitionRejection 工具定义侧的请求级拒收（11129 工具定义不合规 /
+// 11152 工具名称不规范）：只在请求确实声明了 tools 时给「检查 tools」的指向；11101
+// 请求体畸形不给（否则客户端会去翻自己的 schema）。
 func TestGatewayHintToolDefinitionRejection(t *testing.T) {
 	t.Parallel()
 
