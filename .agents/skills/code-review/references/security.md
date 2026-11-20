@@ -87,17 +87,18 @@ a shared process.
 ## Severity anchors
 
 Only `confirmed` findings get severity, and it cannot exceed the demonstrated
-result.
+result. Record the ledger's three values (`critical` / `important` / `minor`);
+the anchors below merge into them, so there is no fourth level to invent.
 
-- **Critical** — unauthenticated bypass of the gateway or panel; cross-account
-  or cross-realm credential/response exposure; secret exfiltration; remote code
+- `critical` — unauthenticated bypass of the gateway or panel; cross-account or
+  cross-realm credential/response exposure; secret exfiltration; remote code
   execution; state corruption that loses or mixes accounts.
-- **High** — an authenticated principal fully defeats an explicit control with
+- `important` — an authenticated principal fully defeats an explicit control with
   real consequences (readonly → admin, data key → management action, one
-  account's credentials used for another's request).
-- **Medium** — a real boundary violation with limited blast radius or uncommon
-  preconditions (requires a specific config, a local attacker, a narrow window).
-- **Low** — disclosure of non-secret internals, or an effect needing sustained
+  account's credentials used for another's request); or a real boundary violation
+  with limited blast radius or uncommon preconditions (requires a specific
+  config, a local attacker, a narrow window).
+- `minor` — disclosure of non-secret internals, or an effect needing sustained
   effort for minimal gain.
 
 If you cannot state the concrete damage, the severity is lower than it feels.

@@ -18,7 +18,9 @@ metadata:
   checkout: BegoniaHe/wokbuddy-demon
   based_on: >-
     cloudflare/security-audit-skill, obra/superpowers, mattpocock/skills,
-    trailofbits/skills, addyosmani/agent-skills, allemaar/open-skills (MIT)
+    trailofbits/skills, addyosmani/agent-skills, allemaar/open-skills,
+    agentkitco/agentkit-dev-skills, anthropics/skills; 各来源许可不同，逐行见
+    references/sources.md
 ---
 
 # Review a wokbuddy-demon change
