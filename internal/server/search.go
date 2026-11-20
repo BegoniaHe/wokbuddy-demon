@@ -172,7 +172,7 @@ func runAgentTool[T any](
 	for i := range attempts {
 		acct := handler.cfg.Pool.PickExcludingForRealm(tried, "", searchRealm)
 		if acct == nil {
-			uid, fail := exhaustedFailure(lastFail, lastUID)
+			uid, fail := exhaustedFailure(handler, stage, tried, lastFail, lastUID)
 
 			return zero, uid, fail
 		}
@@ -212,7 +212,7 @@ func runAgentTool[T any](
 		}
 	}
 
-	uid, fail := exhaustedFailure(lastFail, lastUID)
+	uid, fail := exhaustedFailure(handler, stage, tried, lastFail, lastUID)
 
 	return zero, uid, fail
 }
@@ -221,12 +221,19 @@ func runAgentTool[T any](
 //
 // 为什么带出 uid：调用方的用量记录在 uid 为空时直接 return，失败请求就既不计
 // 请求数也不计延迟，失败率在面板上完全不可见。
-func exhaustedFailure(lastFail *searchFailure, lastUID string) (string, *searchFailure) {
+//
+// 一次都没打到上游（lastFail 为空）时，hint 带一次选号成因拆解（issue #607）。
+func exhaustedFailure(
+	handler *Handler, stage string, tried map[string]bool, lastFail *searchFailure, lastUID string,
+) (string, *searchFailure) {
 	if lastFail != nil {
 		return lastUID, lastFail
 	}
 
-	return "", noHealthyAccountFailure()
+	fail := noHealthyAccountFailure()
+	fail.hint = handler.noPickHint(stage, "", searchRealm, tried, false)
+
+	return "", fail
 }
 
 // runWithAccountLease 在账号在途租约下执行一次工具调用，无论正常返回还是 panic

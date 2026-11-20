@@ -193,7 +193,8 @@ func (h *Handler) acquireVideoAccount(
 	acct := h.cfg.Pool.PickExcludingForRealmMedia(map[string]bool{}, bareModel, realm, true)
 	if acct == nil {
 		writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "no_healthy_account",
-			"all accounts are temporarily unavailable, please retry later", upstream.NoHealthyAccountHint())
+			"all accounts are temporarily unavailable, please retry later",
+			h.noPickHint("videos", bareModel, realm, nil, true))
 
 		return nil, false
 	}
