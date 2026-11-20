@@ -273,6 +273,40 @@ func TestWebFetchNoHealthyAccountIs503(t *testing.T) {
 	}
 }
 
+// TestWebFetchCrossRealmFallbackKeepsTargetUnreachable 跨域回退开启但另一域没有可服务
+// 账号时，15022 仍是「目标站连不上」502：不能被改写成池故障 503（issue #605）。
+func TestWebFetchCrossRealmFallbackKeepsTargetUnreachable(t *testing.T) {
+	t.Parallel()
+
+	testPool := testPoolWith(&auth.Auth{UID: "cn1", AccessToken: "at1", ExpiresAt: 9999999999})
+	testPool.SetCrossDomainFallback(true)
+
+	var calls atomic.Int32
+
+	handler := NewHandler(&Config{
+		Pool: testPool,
+		Upstream: &upstream.Client{
+			HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				calls.Add(1)
+
+				return jsonResponse(http.StatusBadRequest, `{"code":15022,"msg":"cannot reach target"}`), nil
+			})},
+			ChatBaseCN:    "https://fake.example",
+			BillingBaseCN: "https://fake.example",
+		},
+		Live: livecfg.New(livecfg.Snapshot{WebFetchEndpoint: true}),
+	})
+
+	rec := postFetch(t, handler, `{"url":"https://93.184.216.34/a"}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d want 502（目标站不可达，不是池故障），body=%s", rec.Code, rec.Body)
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls=%d want 1（另一域无号时不再打上游）", got)
+	}
+}
+
 func strconvQuote(s string) string {
 	return `"` + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) + `"`
 }

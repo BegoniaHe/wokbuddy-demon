@@ -112,10 +112,18 @@ func (h *Handler) fetchWithCrossRealmFallback(
 		return outcome, uid, fail
 	}
 
+	other := otherRealm(searchRealm)
 	log.Printf("INFO: [server] webfetch target unreachable on realm=%s, retrying realm=%s",
-		searchRealm, otherRealm(searchRealm))
+		searchRealm, other)
 
-	return runAgentTool(r.Context(), h, "webfetch", attempts, true, otherRealm(searchRealm), call)
+	retryOutcome, retryUID, retryFail := runAgentTool(r.Context(), h, "webfetch", attempts, true, other, call)
+	// 另一域没有可服务账号时保持原判：否则「目标站连不上」会被改写成池故障 503
+	// （口径同 switchRealmForModelNotFound）。
+	if retryFail != nil && retryFail.code == "no_healthy_account" {
+		return outcome, uid, fail
+	}
+
+	return retryOutcome, retryUID, retryFail
 }
 
 // crossRealmFetchAllowed 报告 15022 的换域兜底是否可用：跨域回退开关打开，且当前
