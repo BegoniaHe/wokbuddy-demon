@@ -25,6 +25,7 @@
 | `sync-upstream`         | 审计参考 fork `misakano7545/workbuddy2api-panel` `main` 提交，对照官方客户端确认后开 Issue |
 | `plan-issue`            | 把 Issue 或请求变成研究充分、可验证的实施计划                  |
 | `issue-to-pr`           | 按计划实现 Issue、跑检查与冷评审，生成模板匹配的 PR（不 merge） |
+| `code-review`           | 审查模块 / PR / 分支区间 / 未提交改动，覆盖率账本 + 三态判定，可选安全模块 |
 | `simplifier`            | 要最小改动、YAGNI、砍过度设计/依赖时                           |
 | `reverse-workbuddy`     | 解包 `.tmp/workbuddy/` 官方客户端并比对 `internal/upstream/` 协议差异 |
 | `shadcn`                | 增删/调试/组合 shadcn 组件、preset 与设计系统                  |
