@@ -1,0 +1,7 @@
+interface:
+  display_name: 'Review a change'
+  short_description: 'Coverage-led review with confirmed/needs-validation/rejected verdicts'
+  default_prompt: 'Use $code-review to review the current change with a per-file coverage ledger, verify each finding as confirmed/needs-validation/rejected, then post a PR summary plus inline comments or report back in chat. Enable the security module when auth or upstream code moved. Do not fix or push unless asked.'
+
+policy:
+  allow_implicit_invocation: true
