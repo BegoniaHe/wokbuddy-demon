@@ -1332,8 +1332,9 @@ func mergeEnumType(kind, cur string) (string, bool) {
 	}
 }
 
-// normalizePatternProperties 改写 patternProperties 键里的 `\_`（map 键不可原地改，
-// 命中时重建该层并写回 n）。
+// normalizePatternProperties 用 normalizePatternForUpstream 改写 patternProperties 的
+// 键（键本身也是正则）：`\_` → `_`、`\uXXXX` → `\x{XXXX}`；译完仍编不过的键整条丢掉
+// （map 键不可原地改，命中时重建该层并写回 n）。
 func normalizePatternProperties(n map[string]any) {
 	props, ok := n["patternProperties"].(map[string]any)
 	if !ok {
@@ -1344,9 +1345,17 @@ func normalizePatternProperties(n map[string]any) {
 
 	fixed := make(map[string]any, len(props))
 	for item, iface := range props {
-		if strings.Contains(item, `\_`) {
-			item = strings.ReplaceAll(item, `\_`, `_`)
+		normalized, keep := normalizePatternForUpstream(item)
+		if !keep {
 			rebuilt = true
+
+			continue
+		}
+
+		if normalized != item {
+			rebuilt = true
+
+			item = normalized
 		}
 
 		fixed[item] = iface

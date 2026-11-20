@@ -808,6 +808,41 @@ func testEscapedBackslashBeforeU(t *testing.T) {
 	}
 }
 
+// testPatternPropertiesKeyUnicodeEscape patternProperties 的键本身也是正则：`\uXXXX`
+// 同样要译成 RE2 形态；译完仍编不过的键跟着丢掉，否则整颗 tools 一样被 11129 拒收
+// （issue #610）。
+func testPatternPropertiesKeyUnicodeEscape(t *testing.T) {
+	out := string(PrepareBodyOptWithEfforts([]byte(`{"messages":[],"tools":[{"type":"function",`+
+		`"function":{"name":"write","parameters":{"type":"object","patternProperties":{`+
+		`"^`+str+str+`u0041$":{"type":"string"},"^`+str+str+`u0042(?=x)$":{"type":"string"}}}}}]}`),
+		false, nil))
+
+	var obj map[string]any
+	if err := jsonx.Unmarshal([]byte(out), &obj); err != nil {
+		t.Fatalf("out not json: %v", err)
+	}
+
+	params, ok := obj["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)["parameters"].(map[string]any)
+	if !ok {
+		t.Fatalf("parameters missing: %s", out)
+	}
+
+	props, ok := params["patternProperties"].(map[string]any)
+	if !ok {
+		t.Fatalf("patternProperties missing: %s", out)
+	}
+
+	if _, ok := props[`^\x{0041}$`]; !ok {
+		t.Fatalf("patternProperties keys = %v, want translated \\x{0041}", props)
+	}
+
+	for key := range props {
+		if strings.Contains(key, `(?=`) || strings.Contains(key, `\u`) {
+			t.Fatalf("untranslatable key kept: %q", key)
+		}
+	}
+}
+
 // TestNormalizeToolPatternUnicodeEscapes 工具 schema pattern 里 JS 风格 `\uXXXX`
 // 转义的出站纠偏（issue #610）：客户端把 `^[^\uD800-\uDFFF]*$` 这类 pattern 二次
 // 转义进 JSON，网关解码后出站仍是字面 `\uD800`——RE2 没有 `\u` 转义，上游按
@@ -837,6 +872,10 @@ func TestNormalizeToolPatternUnicodeEscapes(t *testing.T) {
 	t.Run("escaped backslash before u untouched", func(t *testing.T) {
 		t.Parallel()
 		testEscapedBackslashBeforeU(t)
+	})
+	t.Run("patternProperties key translated", func(t *testing.T) {
+		t.Parallel()
+		testPatternPropertiesKeyUnicodeEscape(t)
 	})
 }
 
