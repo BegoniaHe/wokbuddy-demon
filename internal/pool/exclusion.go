@@ -33,8 +33,10 @@ func (p *Pool) ExclusionSummary(
 		return nil
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	// 只读遍历：与 ServableForModelRealm / AllDailyBlocked 同口径用读锁，
+	// 不在失败路径上与选号争写锁。
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
 	// 路由级避让先于账号级排除生效（与 pickTraceWith 的早退判定同源）。
 	now := p.now()
