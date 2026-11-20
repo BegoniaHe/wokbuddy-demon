@@ -4742,7 +4742,7 @@ func (f *chatFlow) finalErrorEnvelope() (status int, code, msg, hint string, ups
 	msg = "all accounts are temporarily unavailable, please retry later"
 	// gateway_hint（末端透传）：上游错误按 Kind + 原文 + 请求形态判定；本地调度类
 	// 错误（无上游原文）固定 no_healthy_account hint。
-	hint = upstream.NoHealthyAccountHint()
+	hint = f.pickFailureHint()
 
 	if s2, c2, m2, ok := localErrorEnvelope(f.lastErr, status, code, msg); ok {
 		// 本地分类错误（超时 / 截断 / 空流 / 大小超限）：属于上游或传输层异常，
