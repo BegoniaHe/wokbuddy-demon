@@ -37,5 +37,12 @@ func (f *chatFlow) pickFailureHint() string {
 		return upstream.NoHealthyAccountHint()
 	}
 
-	return f.h.noPickHint("chat", f.bareModel, f.realm, f.tried, false)
+	// 跨域回退开启时域不是约束（pickRealms 会把两个域都试一遍）：按请求域归类会把
+	// 另一域账号算成「realm 排除」，运维会照着这条提示去查域配置。
+	realm := f.realm
+	if f.crossRealm {
+		realm = ""
+	}
+
+	return f.h.noPickHint("chat", f.bareModel, realm, f.tried, false)
 }

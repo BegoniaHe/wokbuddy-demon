@@ -38,3 +38,34 @@ func TestNoPickHint(t *testing.T) {
 		t.Fatalf("base hint disappeared: %q", got)
 	}
 }
+
+// TestPickFailureHintCrossRealmIgnoresRealm 跨域回退开启时域不是约束：另一域的冷却
+// 账号不能被算成「realm 排除」，否则运维会照着提示去查域配置（issue #607）。
+func TestPickFailureHintCrossRealmIgnoresRealm(t *testing.T) {
+	t.Parallel()
+
+	global := &auth.Auth{UID: "g1", AccessToken: "at", ExpiresAt: 9999999999}
+	if _, err := auth.BackfillRealmFor(global, "global"); err != nil {
+		t.Fatalf("backfill realm: %v", err)
+	}
+
+	testPool := pool.New("")
+	testPool.Add(global)
+	testPool.Cooldown("g1", pool.CoolHard, time.Hour, "test")
+
+	handler := &Handler{cfg: Config{Pool: testPool}}
+
+	// 跨域回退开启：域不参与排除，如实报「冷却」。
+	flow := &chatFlow{h: handler, realm: "cn", bareModel: "m", crossRealm: true}
+	if got, want := flow.pickFailureHint(),
+		upstream.NoHealthyAccountHint()+"; no_pick{total=1 cooling=1}"; got != want {
+		t.Fatalf("cross-realm hint = %q, want %q", got, want)
+	}
+
+	// 未开跨域回退：域就是约束，global 号确实是按 realm 排除的。
+	flow = &chatFlow{h: handler, realm: "cn", bareModel: "m"}
+	if got, want := flow.pickFailureHint(),
+		upstream.NoHealthyAccountHint()+"; no_pick{total=1 realm=1}"; got != want {
+		t.Fatalf("single-realm hint = %q, want %q", got, want)
+	}
+}
