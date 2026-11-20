@@ -3113,7 +3113,7 @@ func (*Handler) tracedPath(r *http.Request) bool {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
 		"/v1/responses", "/v1/search/messages", "/v1/images/generations", "/v1/images/edits",
 		"/v1/videos/generations",
-		"/v1/tools/fetch", "/v1/fetch":
+		"/v1/tools/fetch", "/v1/fetch", "/v1/tools/search":
 		return true
 	}
 
@@ -3131,6 +3131,11 @@ func (h *Handler) registerSearchRoute() {
 	h.mux.HandleFunc(
 		"POST /v1/search/messages",
 		h.withRecovery(h.withClientAuth(h.anthropicSearchHandler)),
+	)
+	// DeepSeek 官方形状的同族出口（issue #608）：同一上游能力、同一开关。
+	h.mux.HandleFunc(
+		"POST /v1/tools/search",
+		h.withRecovery(h.withClientAuth(h.toolsSearchEndpointHandler)),
 	)
 }
 

@@ -64,7 +64,7 @@
 - **面板内试聊**：直接输入提示词走真实 `/v1` 链路，验证模型、账号与流式输出；对话只存在本机浏览器。
 - **本地状态持久化**：重启后还记得昨天干到哪，不会一键失忆。
 - **登录与搬家**：面板里完成授权登录；需要换机器时，可以加密导出再导入账号。
-- **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态，单批最多 50 个模型）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations` 与 `POST /v1/images/edits` 提供官方出图 / 图生图（`features.images_endpoint`，默认关，两者共用同一开关）。
+- **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态，单批最多 50 个模型）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/search` 提供 DeepSeek 官方形状的搜索出口（同一 `features.search_endpoint` 开关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations` 与 `POST /v1/images/edits` 提供官方出图 / 图生图（`features.images_endpoint`，默认关，两者共用同一开关）。
 - **视频生成**：`POST /v1/videos/generations` 提交任务，JSON 形态原样透传官方 `VideoService` 的字段（`prompt` / `model` / `watermark`，可选 `seconds` / `image_url` / `last_image_url` / `reference_images` / `reference_videos` / `reference_audios` / `extra_parameters`），返回上游 `{code,msg,requestId,data:{id}}`，`data.id` 即任务 id；`GET /v1/videos/{task_id}` 查询任务（可选 `?model=` 决定选号域，跨域任务必须带），`data.status=completed` 时原样透出 `data[].url` 与 `data.usage.credit`，`failed` 归一为 502 通用文案。由 `features.videos_endpoint` 控制（默认关）。网关只做无状态透传，**不轮询**，轮询节奏由客户端决定；带 `text-to-video` / `image-to-video` 标签的模型在 `/v1/models` 以 `capabilities` 数组可见。
 - **官方档位徽章**：解析 `/v3/config` 的 `modelTiers`，在模型页与试聊选择器显示档位与升级提示，不改变选号或模型过滤。
 - **按密钥裁剪模型列表**：命名密钥的 `/v1/models` 只展示其 realm 绑定与模型白名单允许的条目，复用同一份缓存，不额外请求上游。
@@ -90,6 +90,7 @@
 | POST | `/v1/messages` | Anthropic Messages 兼容；同义别名 `POST /messages` |
 | POST | `/v1/messages/count_tokens` | 输入 token 估算：本地按字节近似（4 字节 ≈ 1 token），**不作计费依据**；别名 `POST /messages/count_tokens` |
 | POST | `/v1/search/messages` | 联网搜索（`features.search_endpoint`，默认关）；`deep:true` 综述式另受 `features.search_deep` 约束 |
+| POST | `/v1/tools/search` | DeepSeek 官方形状的联网搜索（同一 `features.search_endpoint` 开关）：`{"query", "count"}` → `{"results":[...]}` |
 | POST | `/v1beta/models/{model}:{action}` | Gemini CLI GATEWAY 模式，`action` 取 `generateContent` / `streamGenerateContent` / `countTokens`；`v1alpha`、`v1` 同义 |
 | POST | `/v2/chat/busy` | 官方客户端模型忙预检，只读本地池状态、不产生上游请求，单批最多 50 个模型 |
 | POST | `/v1/tools/fetch` | 官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；别名 `POST /v1/fetch` |
@@ -109,6 +110,20 @@
 | GET | `/panel/` | 内嵌管理面板。页面与静态资源公开，数据接口 `/panel/api/*` 才鉴权 |
 
 鉴权口径：协议面接受默认 `api_key` 或任一命名密钥；运维面只认默认 `api_key`，设了 `admin_api_key` / `readonly_api_key` 后改为只认这两把（细节见「使用须知」）。`api_key` 为空时全部放行——公网部署必设。
+
+### 🔍 DeepSeek 形状搜索 `POST /v1/tools/search`
+
+按 DeepSeek 文档把搜索 base 填成 `http(s)://<网关>/v1/tools` 的客户端会拼出这个端点。它与 `/v1/search/messages` 是**同一上游能力**（`/agenttool/v1/search`）、同一开关（`features.search_endpoint`，默认关，关闭回 `403` 且不出网）、同一套取号 / 换号 / 用量记账，差别只在进出站形状：
+
+- 入站：`query` 必填（2..128 字符，下限沿用上游口径）、`count` 1..50 默认 10（上游实际最多返回 10 条）；越界在入口 `400`，不消耗账号额度。`need_content` / `ori_question` / `localization` 上游没有对应能力，按 DeepSeek 文档「未知字段忽略」静默忽略。
+- 回程：`{"results":[{rerank_score,title,url,snippet,summary,content,site_name,site_icon,date,authority}]}`，十个键恒存在；上游没有对应能力的按契约给默认值（`summary` / `content` 为空串，`site_name` / `site_icon` / `date` 为 `null`，`rerank_score` 为 `0`，`authority` 为 `-1`）。无结果时是 `{"results":[]}`。
+- `need_content=true` 不报错、也不伪造正文：`content` 恒为空串。**要正文走既有 deep 语义**——`POST /v1/search/messages` 的 `deep:true` 综述式检索（需 `features.search_deep`）。
+
+```bash
+curl -s http://127.0.0.1:7863/v1/tools/search \
+  -H "x-api-key: test_key" -H "content-type: application/json" \
+  -d '{"query":"golang context 用法","count":5}'
+```
 
 ## 🧭 小恶魔守则
 

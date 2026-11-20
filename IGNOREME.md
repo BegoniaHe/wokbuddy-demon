@@ -293,6 +293,7 @@ curl -s http://localhost:7863/metrics -H "Authorization: Bearer your-api-key"
 | OpenAI Responses | `POST /v1/responses`（流式/非流式文本、function/custom tools、结构化输出；reasoning/compaction 等状态 item 忽略） |
 | Anthropic Messages | `POST /v1/messages`、`POST /v1/messages/count_tokens`、`GET /v1/models`（按 `anthropic-version` 头返回 Anthropic 形态） |
 | 联网搜索（Anthropic 形态） | `POST /v1/search/messages`（需 `features.search_endpoint=true`，默认关闭；`deep=true` 需 `features.search_deep`） |
+| 联网搜索（DeepSeek 形态） | `POST /v1/tools/search`（同一 `features.search_endpoint` 开关）：`{"query","count"}` → `{"results":[...]}`，`need_content` 等无上游能力的字段静默忽略 |
 | 官方工具出口 | `POST /v2/chat/busy`（模型忙预检，只读本地池状态）、`POST /v1/tools/fetch` / `POST /v1/fetch`（官方服务端抓取，需 `features.web_fetch_endpoint=true`） |
 | 官方图像 | `POST /v1/images/generations`（出图）、`POST /v1/images/edits`（图生图，JSON 形态、非 multipart），需 `features.images_endpoint=true` |
 | Gemini GenerateContent | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`（也接受 `/v1`、`/v1alpha` 版本前缀） |
@@ -488,7 +489,7 @@ gemini
 | `cn.chat_base` | 空 | 国内版 upstream chat base 覆盖（如指向自建/自选入口）。空 = 默认 `https://www.workbuddy.cn`，并在首 token 前按 `408/502/503/504` 或传输错误回落 `copilot.tencent.com`、`wb.tencentbuddy.com`；**非空时只用该值、不回落**（与 `global.chat_base` 同语义）。改后需重启 |
 | `cn.billing_base` | 空 | 国内版 billing / 签到 / 活跃上报 base 覆盖。空 = 默认 `https://www.workbuddy.cn`（官方 5.9.3 桌面全走产品域）；显式填 `https://www.codebuddy.cn` 可退回旧口径。**不**影响 growth 任务 / 旅行、桌面与 Web 的 `/v2/report`（各走 `chat_base` / `web_base`）与小程序埋点（固定 `codebuddy.cn`）。改后需重启 |
 | `features.local_web_tools` | `false` | 允许 `/v1/responses` 把 `web_search` / `web_fetch` 服务端工具交给网关本地执行；每个工具轮次额外消耗一次上游额度 |
-| `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
+| `features.search_endpoint` | `false` | 开放 `POST /v1/search/messages`：Anthropic Messages 形态的**官方联网搜索**（上游 `/agenttool/v1/search`，请求须在 `tools` 里声明 `web_search`）；同开关也开放 DeepSeek 官方形状的 `POST /v1/tools/search`（`{"query","count"}` → `{"results":[...]}`）。每次调用消耗一次账号额度；当前只放行 CN 域账号选号。热生效 |
 | `features.search_deep` | `false` | 允许 `POST /v1/search/messages` 的 `deep:true`：上游 `/agenttool/v1/agentic_search` 综述式检索，单次最长 120s、只做单次尝试（不随 `upstream.rotate_max` 放大）。热生效 |
 | `features.web_fetch_endpoint` | `false` | 开放 `POST /v1/tools/fetch`（`/v1/fetch` 同义别名）：官方服务端抓取（上游 `/agenttool/v1/webfetch`），入口做 scheme / userinfo / 私网 SSRF 校验，仅 CN 域。热生效 |
 | `features.images_endpoint` | `false` | 开放 `POST /v1/images/generations`（官方出图）与 `POST /v1/images/edits`（官方图生图，JSON 形态）；尚未在真实账号验证鉴权与计费，默认关闭。两端点共用本开关。热生效 |
