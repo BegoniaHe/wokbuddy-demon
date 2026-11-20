@@ -115,6 +115,35 @@ gate.
   issue number in the footer.
 - No credentials, `data/`, `config.json`, or generated logs in the diff.
 
+## PR body and merge preconditions
+
+- The body uses the template matching the type (`fix.md`, `feat.md`, `docs.md`,
+  `chore.md`, `refactor.md`; `perf`/`style` belong to `refactor.md`,
+  `build`/`ops`/`test` to `chore.md`). A body with no `## Summary` and no
+  `## Validation` leaves nothing to check the diff against — that is a spec
+  finding, not a formatting nit.
+- `## Validation` must name the commands actually run. A claimed pass that CI
+  contradicts (`test`, `golangci`, `build (…)`) is Critical.
+- Checklist items stay unticked only with a reason. Exactly one author note:
+  a fabricated `## Human note` on an agent PR, or an `## Agent note` on a human
+  PR, is an `AI_POLICY.md` finding.
+- `Fixes #<n>` / `Related: #<n>` must match `closingIssuesReferences`. A bug-fix
+  PR that points at no Issue is a spec gap.
+- Merge preconditions are policy, not test results: a human maintainer review
+  plus one separate AI-assisted review (`CodeRabbit`, a dispatched agent review,
+  or a review the maintainer requested). The author agent's own note does not
+  count, and "CI is green" does not substitute. Name which one is missing rather
+  than calling the PR merge-ready.
+
+## CI jobs
+
+`statusCheckRollup` on a PR here carries `golangci`, `test`,
+`build (<os>, <arch>, <ext>)` ×5, `Block committed secrets`, and `CodeRabbit`;
+`build-and-publish` belongs to the trunk/nightly path, not the PR gate. A red
+code job blocks merge; a red `CodeRabbit` is a review signal, not a build
+failure; `Block committed secrets` red is Critical whatever the finding text
+says.
+
 ## Calibration in this repo
 
 - CI-failing conditions (fmt/lint, unbuilt `dist`, failing tests) are Critical

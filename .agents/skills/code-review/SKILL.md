@@ -115,9 +115,27 @@ git diff <base>...<head>
 ```
 
 Confirm refs resolve and the diff is non-empty; an empty range is "nothing to
-review", not a clean review. For several open PRs, use
-`gh pr list --repo BegoniaHe/wokbuddy-demon --state open --json number,url,title,headRefName`
-and review each in its own run. No open PR at all: say so and stop.
+review", not a clean review. No open PR at all: say so and stop.
+
+Several open PRs: this repo does not review them one by one. The convention is a
+consolidation branch — `chore/consolidate-open-prs-<date>`, `chore/consolidate-*`,
+or `integration/consolidate-open-prs` — that merges the batch into one branch for
+a single review and merge, after which the source PRs are closed with a comment
+pointing at the consolidating PR (`并入 #615`, `已并入 #603`). Check for that
+first:
+
+```bash
+gh pr list --repo BegoniaHe/wokbuddy-demon --state open \
+  --json number,title,baseRefName,headRefName,body
+```
+
+A PR whose `headRefName` matches `consolidate`/`integration` and whose body lists
+`#<n>` PR numbers is the aggregation, and it is the range to review — one run,
+`range` mode over `main...<headRefName>`, with a PR→commit map in the report
+(see `REFERENCE.md`). Reviewing an absorbed PR on its own re-litigates code that
+already moved; if the user names such a PR, review the consolidating branch and
+say which PR you were pointed at. Only when no aggregation exists do you review
+each open PR in its own run.
 
 ### Security module
 
@@ -324,10 +342,27 @@ and say so. Re-running a review updates the marked summary comment instead of
 adding a second one, and skips inline comments already present for the same
 `path:line`.
 
+Inline is a complement, not the channel. No PR in this repo's history carries
+inline review comments; the summary comment is where review feedback has always
+lived. Post inline only for a confirmed finding whose `path:line` is in the diff
+and whose fix benefits from being read next to the code; a run with zero inline
+comments is complete when the summary carries every confirmed finding. Never
+treat "no inline posted" as unfinished, and never split one finding across both
+channels.
+
 Only confirmed findings get inline comments. A `needs-validation` lead appears
 in the summary table with its blocker and next check; a rejected candidate
 appears only in the appendix line. Neither carries a severity or an inline
 defect comment.
+
+Merge-ready is a policy claim, not a test result. This repo merges only with a
+human maintainer review plus a separate AI-assisted review, and an author
+agent's own note does not count as that second review (`AI_POLICY.md`). When the
+conclusion says merge-ready, name which of the two is still missing and cite the
+CI jobs you actually saw (`golangci`, `test`, `build (…)`, `Block committed
+secrets`); `CodeRabbit` is the standing third-party AI review. Review findings
+never substitute for either precondition, and a green `review_ready.py check` is
+neither.
 
 **No PR** — report in chat with the same severity grouping and the report path.
 Lead with the verdict and the blockers; do not paste the whole report.

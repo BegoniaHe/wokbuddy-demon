@@ -8,13 +8,15 @@ rules live in `AGENTS.md` — cite both, do not restate them here.
 | Field       | Value                                                      |
 | ----------- | ---------------------------------------------------------- |
 | Repository  | `BegoniaHe/wokbuddy-demon`                                 |
-| Base branch | `main`                                                     |
+| Base branch | `main`; a stacked PR targets its own `baseRefName` instead |
 | Run dir     | `.tmp/code-review/<run-id>/` (`*.tmp` is gitignored)       |
 | Gate script | `scripts/review_ready.py` (`start`, `check`)               |
 | Build gates | `make fmt-check`, `make lint`, `go test ./...`, `make web-check` |
 | Front end   | `web/` source; committed bundle `internal/panel/dist`      |
 
 `<run-id>` is `pr-<n>`, `worktree`, `module-<slug>`, or `range-<base>-<head>`.
+A consolidation PR keeps `pr-<n>` (its head *is* the range) and records the
+absorbed PR→commit map in `CONTEXT.md` and `REPORT.md`.
 Do not relocate run files into `docs/`, `data/`, or the repo root.
 
 Run dir contents:
@@ -71,6 +73,15 @@ Look in this order, and say which one you used:
 3. `.tmp/issue-plan/<run-id>/PLAN.md` and `RESEARCH.md` when a planning
    workspace exists.
 4. A spec path the user passed.
+
+A consolidation PR's body is a spec of specs: it lists the absorbed `#<n>`
+numbers, so read each one's `## Summary` with `gh pr view <n> --json body` and
+treat their union as the range's intent. A per-PR summary that contradicts the
+aggregated diff is a spec finding, not a style note.
+
+The PR body is also a contract to be reviewed, not only a spec source: the
+matched template's `## Validation` and `## Checklist`, and the single author
+note, are checked in `references/standards.md`.
 
 No spec: the spec pass reports `no spec available` and does not invent
 acceptance criteria. A PR body that says "see issue" with no issue counts as no
@@ -303,10 +314,49 @@ Verify the posted URL with `gh pr view <n> --repo BegoniaHe/wokbuddy-demon --jso
 | Cross-repository (`isCrossRepository`)     | Comment, never push; post patches instead of commits.           |
 | `headRepositoryOwner.login != BegoniaHe`   | Same as cross-repository.                                       |
 | Head is `main`                             | Comment only; never push.                                       |
-| PR closed or merged                        | Report in chat; do not comment on a dead thread.                |
+| PR closed or merged                        | Report in chat; do not comment on a dead thread. Check first whether the change already landed via a consolidation PR; if it did, review that one instead. |
+| Consolidated away (`并入 #N` / `已并入 #N`) | The thread is dead, the code is not: the range is `main...#N`'s head. Report against `#N` and name the PR you were pointed at. |
+| Consolidation PR (`consolidate`/`integration` head) | One `range` run over `main...<head>`; map every absorbed PR to its commits; see "Consolidation trains". |
+| Stacked PR (`baseRefName != main`)         | Range is `<baseRefName>...<headRefName>`; judge only this layer, and say the base is a branch, not `main`. |
+| Dependabot `deps(deps): bump …`             | Review the pin, the lockfile, and `dependency-review.yml`; do not re-review the third-party code itself. |
 | `maintainerCanModify == false`             | Comment only; the branch is not writable.                       |
 | CI red                                     | Review the code; fold failing checks into coverage, not findings. |
 | Diff too large for one pass                | Split by file, merge findings, state the split in coverage.     |
+
+## Consolidation trains
+
+`main` advances through merge commits, and a batch of open PRs is usually landed
+as one train (`#445`, `#452`, `#474`, `#510`, `#567`, `#576`, `#603`, `#615` are
+this shape). The single-branch review that produced `#615` and `#603` is the
+normal path here, not an exception, so start any multi-PR review by looking for
+the train:
+
+```bash
+# is there a train, and which PRs does it claim to absorb?
+gh pr list --repo BegoniaHe/wokbuddy-demon --state open \
+  --json number,title,baseRefName,headRefName,body
+gh pr view <n> --repo BegoniaHe/wokbuddy-demon --json body,commits
+
+# which commits came from which source branch
+git log --oneline --graph main..<headRefName>
+git log --oneline main..<headRefName> --merges
+git log --oneline --first-parent main..<headRefName>
+
+# what an absorbed PR pointed at
+gh pr view <absorbed-n> --repo BegoniaHe/wokbuddy-demon --json comments \
+  --jq '.comments[-1].body'
+```
+
+A train merges its source branches, so its history holds one merge commit per
+absorbed PR; those merge points are the PR→commit map. Put that map in
+`REPORT.md` under 覆盖范围 (`#611 → 99bc9896, #612 → cf53c3bc, …`), so a reader can
+tell which part of the range answers which PR. Spec is the union of the absorbed
+`## Summary` sections; a gap in one PR that the train silently dropped is a spec
+finding on the train.
+
+Coverage still follows files, not PRs: one unit per changed file in the train,
+even when three PRs touched it. When the train is what the user named, do not
+open a second run per absorbed PR.
 
 ## Redaction
 
