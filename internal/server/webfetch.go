@@ -54,10 +54,8 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 	started := time.Now()
 	usageModel := webFetchUsageModel(&req)
 
-	outcome, uid, fail := runAgentTool(r.Context(), h, "webfetch", max(h.cfg.MaxRotate+1, 1), true,
-		func(ctx context.Context, acct *auth.Auth) (*upstream.WebFetchOutcome, error) {
-			return h.cfg.Upstream.WebFetch(ctx, acct, req, meta)
-		})
+	outcome, uid, fail := h.fetchWithCrossRealmFallback(r, &req, &meta)
+
 	if fail != nil {
 		// 调用方已断开（runAgentTool 归成 499/client_closed）：连接已关，写响应体
 		// 没有意义，也不能记成上游失败——否则一次用户取消就变成 502 + HTTPError。
@@ -96,6 +94,46 @@ func (h *Handler) webFetchEndpointHandler(w http.ResponseWriter, r *http.Request
 		"url":          outcome.URL,
 		"content_type": outcome.ContentType,
 	})
+}
+
+// fetchWithCrossRealmFallback 执行一次抓取，并在 15022（上游浏览器连不上目标站）时
+// 换另一域再试一次（issue #605）：同一 URL 同域换号撞同一堵墙，不同域出口不同。
+func (h *Handler) fetchWithCrossRealmFallback(
+	r *http.Request, req *upstream.WebFetchRequest, meta *upstream.ChatMeta,
+) (*upstream.WebFetchOutcome, string, *searchFailure) {
+	attempts := max(h.cfg.MaxRotate+1, 1)
+
+	call := func(ctx context.Context, acct *auth.Auth) (*upstream.WebFetchOutcome, error) {
+		return h.cfg.Upstream.WebFetch(ctx, acct, *req, *meta)
+	}
+
+	outcome, uid, fail := runAgentTool(r.Context(), h, "webfetch", attempts, true, searchRealm, call)
+	if fail == nil || !fail.retryOtherRealm || !h.crossRealmFetchAllowed(r) {
+		return outcome, uid, fail
+	}
+
+	other := otherRealm(searchRealm)
+	log.Printf("INFO: [server] webfetch target unreachable on realm=%s, retrying realm=%s",
+		searchRealm, other)
+
+	retryOutcome, retryUID, retryFail := runAgentTool(r.Context(), h, "webfetch", attempts, true, other, call)
+	// 另一域没有可服务账号时保持原判：否则「目标站连不上」会被改写成池故障 503
+	// （口径同 switchRealmForModelNotFound）。
+	if retryFail != nil && retryFail.code == "no_healthy_account" {
+		return outcome, uid, fail
+	}
+
+	return retryOutcome, retryUID, retryFail
+}
+
+// crossRealmFetchAllowed 报告 15022 的换域兜底是否可用：跨域回退开关打开，且当前
+// 命名密钥没有绑定到具体域（绑定域的密钥只用本域出口）。
+func (h *Handler) crossRealmFetchAllowed(r *http.Request) bool {
+	if h.cfg.Pool == nil || !h.cfg.Pool.CrossDomainFallback() {
+		return false
+	}
+
+	return keyRealmFrom(r.Context()) == ""
 }
 
 // readWebFetchRequest 读取 body 并做 SSRF 校验；失败已写出响应。
