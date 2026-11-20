@@ -14,41 +14,43 @@ upstream:
   branch: main
 
 last_audited:
-  commit: 733942a75011cb2dd66caa97281b1ad67fa95c90
-  audited_at_utc: 2026-11-18T10:18:00Z
+  commit: be99749dbc58b8c789492d99a8a0f1b165560a4c
+  audited_at_utc: 2026-11-20T09:48:52Z
   sync_method: audit
   official_baseline:
     cn: 5.11.3.43806934-ecace0f7 (commit ecace0f7028166695994300182295329b8b95449)
     global: 5.11.4.44121853-0026dff0 (commit 0026dff06ce8414140e6f2fa731049855c3ecc6f)
   reviewed_window:
-    from: 2026-11-16
-    to: 2026-11-18
-    non_merge_commits: 51
-    merge_commits: 12
+    from: 2026-11-18
+    to: 2026-11-20
+    non_merge_commits: 18
+    merge_commits: 0
   dispositions:
-    issue: 8
-    revisit: 2
-    skip: 53
+    issue: 10
+    revisit: 0
+    skip: 8
   issues:
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/577
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/583
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/584
-    - https://github.com/BegoniaHe/wokbuddy-demon/issues/585
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/604
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/605
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/606
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/607
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/608
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/609
+    - https://github.com/BegoniaHe/wokbuddy-demon/issues/610
   note: >-
-    2026-11-18 续审 27b7458f..733942a7（63 条 = 51 非 merge + 12 merge；窗口 2026-11-16..18）。
+    2026-11-20 续审 733942a7..be99749d（18 条，全部单亲提交、无 merge bubble；窗口 2026-11-18..20）。
     官方基线未变（cn 5.11.3.43806934-ecace0f7 / global 5.11.4.44121853-0026dff0），只重跑
-    download_latest --dry-run 复核解包树。8 项 issue 记入 4 单，新开 3 单：#583 工具 schema 关键字
-    取值类型与顶层 $ref 出站前未纠偏、ErrBadParams 缺 tools 指向 hint（615dc753 / 733942a7；11129 与
-    11152 的分类已对，官方 en-BZmJsSE5.js 的 errorCode.11129 / .11152 文案确认语义，关键字拒收集合属
-    参考侧 2026-11-18 活体证据、实现前需复测）；#584 /v1/responses 回放丢 reasoning/compaction 且 Chat
-    形状 tool 项整单 400（0e41952f / 94a68792 / fdf05eae / f6682159，400 已实测复现）；#585 救援段一字
-    未写时仍发第二次续写（6c508881）。e14a3d03 并入既有 #577（早到结果按最近声明配对是其细化）。
-    2 项 revisit：183c470b（未闭合代码块/截断调用标记是否需专用指令）、f8d83465（救援指令「已完成」
-    出口），均缺本仓样本。53 项 skip 按簇：merge 12 条；面板实时任务卡 16 条（参考侧 internal/panel/
-    tasklive.go + app.js，本仓面板为 React）；异步换段收尾 5 条（本仓仍同步 tryContinue，根因由 #578
-    跟踪）；官方头夹具与 CI 2 条；真机探针与测试组织 6 条；narration 判据/词表 6 条（本仓 rescue.go
-    独立实现，#570 已结单）；确认已覆盖 6 条（ae44d739 的 FrameKind 实测、96265d71/77ca3fe7 的主进程
-    头边界、d6301fe9 的值域/容器键、224fc567 与 f1394fea 的半角点切句、bb8a9536 的无标点闸门）；
-    无对应模块 2 条（internal/updater、searchtool 的 probeOnce）。本轮不改实现；游标推进是独立的
-    chore(sync) 元数据提交。
+    download_latest --dry-run 复核解包树。10 项 issue 记入 7 单：#604 语音端点 /v1/audio/speech 与
+    /v1/audio/transcriptions（923dbec2 落地 + e1280ca5 / 269b92e2 / 08cb9351 三条修订；官方两包
+    main/server.js 确认端点与 SSE 事件、model/voice 常量，multipart 字段 audio，其余细节属参考侧真号
+    活体证据）；#605 11103 落 ErrClient 轮转全池（官方 errorCode.11103 文案确认语义）且 fetch 的
+    15021/15022 未做域名级短路（包内 0 命中，活体证据）；#606 续写救援以 role=user 注入且无关闭开关、
+    无「非用户消息」自述（参考侧真机事故）；#607 503 no_healthy_account 不带排除成因（本仓 pick.go
+    已有 excludeReason 分类，只缺接到 hint/WARN）；#608 缺 DeepSeek 官方形状 /v1/tools/search（fetch
+    侧已有 DSH 出口，外部契约为 api-docs.deepseek.com）；#609 加号登录直连出网、落盘后不写
+    proxy_slot（本仓已有账号级出口槽）；#610 工具 schema pattern 的 JS \u 转义未译成 RE2 \x{...}。
+    8 项 skip：救援诊断枚举（34120825，参考侧 narration/toolonly 模块）、非对话端点台账（1fafb141，
+    本仓 tracedPath 已覆盖且无 /v1/search、/v1/embeddings 端点）、README/注释文档 3 条
+    （b902132c / d582d709 / 937fef2b）、活体探针 3 条（56c826c1 / b8a704b0 的 WS 流式 ASR、
+    be99749d 的跨账号前缀缓存结论为按账号隔离）。本轮不改实现；游标推进是独立的 chore(sync) 元数据提交。
 

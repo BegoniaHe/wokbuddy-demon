@@ -343,6 +343,42 @@ refresh 仍是 `/v2${prefixPath}/auth/token/refresh`（未变）；逐表面指�
 narration 判据/词表 6 条（本仓 `rescue.go` 独立实现，#570 已结单）、无对应模块 2 条
 （`internal/updater`、`internal/server/searchtool.go` 的 `probeOnce`）。后续审计从 `733942a7` 之后开始。
 
+2026-11-20 续审 `733942a7..be99749d`（18 条，全部单亲提交、无 merge bubble；窗口 2026-11-18..20）。
+官方基线未变（cn `5.11.3.43806934-ecace0f7` / global `5.11.4.44121853-0026dff0`），只重跑
+`download_latest --dry-run` 复核解包树。10 项 `issue` 记入 7 单：
+
+- **#604**（语音端点）：`923dbec2` 落地 `/v1/audio/speech` 与 `/v1/audio/transcriptions`，
+  `e1280ca5` / `269b92e2` / `08cb9351` 是同一端点的三条修订（multipart boundary、
+  未配置音色归请求级、3MB 入口 / `15053` / TTS SSE 错误帧）。官方两包 `app-asar/main/server.js`
+  确认 `${base}/v2/audio/speech`（`model=hunyuan-tts-2.5`、`voice=f191_female_cn_tts2.5_flash`、
+  `response_format=pcm`、`sample_rate=24000`、SSE `speech.audio.delta` / `speech.audio.done`）
+  与 `${endpoint}/agenttool/v1/asr`（multipart 字段 `audio`）；本仓全仓 0 命中、`features` 无开关。
+- **#605**（错误分类）：`b35a8d03` — `11103`「该模型后端未启用」官方文案
+  `errorCode.11103 = Model configuration error. Switch models`，本仓 `client.go:974-978`
+  无该码 → 400 落 `ErrClient` 轮转并喂连败，末端 `503 no_healthy_account`；
+  `/v1/tools/fetch` 的 `15021` / `15022` 也按账号级失败罚号（包内 0 命中，活体证据）。
+- **#606**（救援注入）：`85179d43` — `continue.go:1354-1372` 以 `role=user` 追加续写指令，
+  `continue.go:1318-1351` 无「网关自动生成」自述，`livecfg.go:29-53` 与 `config.example.json`
+  均无关闭开关；参考侧真机事故是注入被读成用户批准后改工作区配置。
+- **#607**（503 成因）：`d40d4b83` — 本仓 `pick.go:242-278` 的 `excludeReason` 分类已完整，
+  但只在 `logging.decision_trace` 开启时进归档（`handler.go:2455-2463`），503 hint 与 WARN
+  都不带计数（`hint.go:115-121` 是常量）。
+- **#608**（DeepSeek 搜索形状）：`676f9da9` — 本仓已有 `/v1/tools/fetch`、`/v1/fetch`
+  （`handler.go:402-403`），搜索只有 Anthropic 形状的 `/v1/search/messages`
+  （`handler.go:3130-3136`）；DeepSeek 文档的 `POST /v1/tools/search` 与 `results[]` 契约缺失。
+- **#609**（加号登录出口）：`6ef24501` — `internal/panel/login.go:192` / `cmd/login/main.go:705`
+  均为裸 `http.Client` 直连，`persistLoginAuth` 不写 `proxy_slot`，而账号级/域级出口槽
+  （`pool/entry.go:105-106`、`outbound/registry.go:125-148`）已存在。
+- **#610**（schema 转义）：`abed8395` / `937fef2b` — `payload.go:894-896` 的 `pattern` 只归一
+  `\_`，JS 的 `\uXXXX` 原样出站会被 RE2 解析拒绝（`11129`）；单层转义经 JSON 解码已是
+  U+FFFD、不受影响，需加对照用例。
+
+8 项 `skip`：`34120825` 救援诊断枚举（参考侧 narration/toolonly 模块，本仓判据在
+`continue.go` / `rescue.go`）、`1fafb141` 非对话端点台账（本仓 `tracedPath` 已覆盖全部既有
+被代理 POST，且无 `/v1/search`、`/v1/embeddings` 端点）、文档 3 条（`b902132c` / `d582d709` /
+`937fef2b`）、活体探针 3 条（`56c826c1` / `b8a704b0` 的 WS 流式 ASR、`be99749d` 的跨账号
+前缀缓存结论为按账号隔离）。后续审计从 `be99749d` 之后开始。
+
 ## 四、本分支相对基线的演进（节选）
 
 - **可视化运维层**：内嵌 Web 管理面板（账号运维 / 用量与积分 / 模型档位 / 在线改配置 / 运行日志 / 任务中心）。
