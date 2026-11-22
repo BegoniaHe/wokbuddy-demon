@@ -379,6 +379,31 @@ narration 判据/词表 6 条（本仓 `rescue.go` 独立实现，#570 已结单
 `937fef2b`）、活体探针 3 条（`56c826c1` / `b8a704b0` 的 WS 流式 ASR、`be99749d` 的跨账号
 前缀缓存结论为按账号隔离）。后续审计从 `be99749d` 之后开始。
 
+2026-11-22 续审 `be99749d..24e59f89`（12 条，全部单亲提交、无 merge bubble；窗口 2026-11-20..22）。
+官方基线未变（cn `5.11.3.43806934-ecace0f7` / global `5.11.4.44121853-0026dff0`），重跑
+`download_latest --dry-run` 与解包树复核。3 项 `issue`：
+
+- **#617**（视频参考素材形状）：`c27d7311` — 官方两包 `app-asar/cli/dist/codebuddy-lite-wb.mjs`
+  的 `VideoService.buildConfiguredRequest` 把 `reference_images` / `reference_videos` /
+  `reference_audios` 映射成 `{image_url}` / `{video_url}` / `{audio_url}` 对象数组；本仓
+  `videos.go:76-81` 只 `rewriteModel` 后原样透传，客户端给字符串数组会被上游 `11101`
+  （`cannot unmarshal string into … CreateVideoRequest.reference_images`）整单 400。
+- **#618**（视频提交 4xx 罚号）：`4221f2b2` — 本仓 `videos.go:246` 走
+  `handleMediaFailure` → `applyErrorPolicy`，未分类 4xx 归 `ErrClient` → `NoteFailures`；
+  官方 `validateVideoParameters` 确认 `seconds` / `resolution` / `aspect_ratio` 属请求级能力
+  约束（`supportedSeconds` / `minSeconds` / `maxSeconds` 本地校验），`14407` 具体码仅在打包
+  二进制出现，语义来自参考侧真号实测。
+- **#619**（Responses 同轮回放）：`9ad206bd`（PR #281）— 官方 `toWireMessage` 把 assistant
+  正文与 `tool_calls` 放同一条；本仓 `responses.go:641-696` 把 `message` 与 `function_call`
+  拆成两条 assistant，出站 `tool_pairing.go:601-664` 的 `mergeForwardToolCalls` /
+  `mergeBackwardToolCalls` 对「文本 assistant → 调用 assistant」正向顺序都不命中。
+
+9 项 `skip`：语音端点 3 条（`026f9c06` / `d5ce7de4` / `c4052548`）属 #604 未实现范围，
+`d629a8ca` 的 11102 请求级本仓已有 `ErrModelNotFound` fail-fast（`14401` 在包内 js 0 命中），
+`0eeeb1e6` / `5b40d46d` 与 `e2d0eb6a` 记 `docs-scope`（形状结论已并入 #617），`c84b6f2b`
+的 auth 测试夹具问题在本仓不存在，`24e59f89` 的 MCP `generate_video` 参数不适用（本仓无
+MCP 端点）。后续审计从 `24e59f89` 之后开始。
+
 ## 四、本分支相对基线的演进（节选）
 
 - **可视化运维层**：内嵌 Web 管理面板（账号运维 / 用量与积分 / 模型档位 / 在线改配置 / 运行日志 / 任务中心）。
@@ -617,4 +642,4 @@ billing meter 面不发该头（`lightSurfaceOverrides` 里两路径分开）。
 ---
 
 _发布形态：滚动更新，无版本号；`appVersion`（`cmd/server/main.go`）为编译期注入的构建标识，非发布版本。_
-_最近更新：2026-11-18（参考 fork 审计基线 `733942a7`；窗口 `27b7458f..733942a7` 共 63 项=51 非 merge + 12 merge，官方 Win32 版本未变；新开 #583 工具 schema 关键字/顶层 `$ref` 纠偏、#584 `/v1/responses` 回放、#585 救援无进展，`e14a3d03` 并入 #577，2 项 revisit；不直接吸收）。_
+_最近更新：2026-11-22（参考 fork 审计基线 `24e59f89`；窗口 `be99749d..24e59f89` 共 12 项，全部单亲提交，官方 Win32 版本未变；新开 #617 视频参考素材形状、#618 视频提交 4xx 罚号、#619 Responses 同轮回放，语音端点 3 条与 11102 等 9 项记 skip；不直接吸收）。_
