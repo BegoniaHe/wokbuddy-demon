@@ -490,3 +490,85 @@ func modelEntriesByID(t *testing.T, body []byte) map[string]map[string]any {
 
 	return byID
 }
+
+// TestVideoSubmit4xxKeepsAccountLevelKinds 账号级语义即使回 4xx 也不得被提交阶段的
+// 请求级透传分支吞掉：402 余额耗尽进长冷却、11136 缺模型权限写 (账号,模型) 负缓存、
+// 14017 授权故障进软冷却（issue #618 的判据必须是错误分类而不是状态码）。
+func TestVideoSubmit4xxKeepsAccountLevelKinds(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		check  func(t *testing.T, st pool.Status)
+	}{
+		{
+			name:   "hard_credit_402",
+			status: http.StatusPaymentRequired,
+			body:   `{"code":402,"msg":"insufficient credits"}`,
+			check: func(t *testing.T, st pool.Status) {
+				t.Helper()
+
+				if !st.Cooling || st.CoolKind != "hard_credit" {
+					t.Fatalf("402 必须按余额耗尽长冷却: %+v", st)
+				}
+			},
+		},
+		{
+			name:   "model_blocked_11136",
+			status: http.StatusBadRequest,
+			body:   `{"code":11136,"msg":"model not permitted for this account"}`,
+			check: func(t *testing.T, st pool.Status) {
+				t.Helper()
+
+				if len(st.RateLimitedModels) == 0 {
+					t.Fatalf("11136 必须写 (账号,模型) 负缓存: %+v", st)
+				}
+			},
+		},
+		{
+			name:   "account_fault_14017",
+			status: http.StatusBadRequest,
+			body:   `{"code":14017,"msg":"trial not activated"}`,
+			check: func(t *testing.T, st pool.Status) {
+				t.Helper()
+
+				if !st.Cooling {
+					t.Fatalf("14017 必须账号冷却: %+v", st)
+				}
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			client := &upstream.Client{
+				HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return jsonResponse(testCase.status, testCase.body), nil
+				})},
+				ChatBaseCN:    "https://fake.example",
+				BillingBaseCN: "https://fake.example",
+			}
+
+			state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+			handler := NewHandler(&Config{
+				Pool:     state,
+				Upstream: client,
+				Live:     livecfg.New(livecfg.Snapshot{VideosEndpoint: true}),
+			})
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/videos/generations",
+				strings.NewReader(`{"model":"seedance-2.5","prompt":"cat"}`)))
+
+			if rec.Code < http.StatusBadRequest {
+				t.Fatalf("code=%d 错误响应不得回 2xx", rec.Code)
+			}
+
+			testCase.check(t, statusOf(t, state, "u1"))
+		})
+	}
+}
