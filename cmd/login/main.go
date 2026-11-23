@@ -781,6 +781,7 @@ func loginEgressClient(config loginConfig, realm, pinned string) (*http.Client, 
 	jar, _ := cookiejar.New(nil)
 
 	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+
 	if !config.bindProxy {
 		if pinned != "" {
 			return nil, "", fmt.Errorf(
@@ -834,7 +835,9 @@ func loginRegistry(config loginConfig) (*outbound.Registry, error) {
 }
 
 // withDial 把 client 换成按槽出站的 Transport（超时口径与面板一致）。
-func withDial(client *http.Client, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
+func withDial(
+	client *http.Client, dial func(ctx context.Context, network, addr string) (net.Conn, error),
+) *http.Client {
 	client.Transport = &http.Transport{
 		DialContext:         dial,
 		TLSHandshakeTimeout: 10 * time.Second,
@@ -842,6 +845,35 @@ func withDial(client *http.Client, dial func(ctx context.Context, network, addr 
 	}
 
 	return client
+}
+
+// loginClient 装配本次登录的出站 client 与槽（issue #609）：配了槽就整条链路固定走
+// 同一条，槽不可用直接失败。`login realm` 是纯本地子命令，不走这里——配置坏掉时仍要
+// 能切域自救。
+//
+// poll 是另一个进程：沿用 url 发起时选定的槽，不重新选举。
+func loginClient(realm, subcommand string) (*http.Client, string) {
+	config, cerr := loadLoginConfig(loginConfigPath)
+	if cerr != nil {
+		fatalf("%v", cerr)
+	}
+
+	pinned := ""
+	if subcommand == "poll" {
+		pinned = loadLoginState(stateFile, realm).Slot
+	}
+
+	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
+	client, slot, eerr := loginEgressClient(config, realm, pinned)
+	if eerr != nil {
+		fatalf("登录出口不可用: %v", eerr)
+	}
+
+	if slot != "" {
+		fmt.Fprintf(os.Stderr, "login: 登录出站走代理槽 %s\n", slot)
+	}
+
+	return client, slot
 }
 
 func main() {
@@ -858,28 +890,7 @@ func main() {
 
 	switch rest[0] {
 	case "url", "poll":
-		// 登录出口（issue #609）：配了槽就整条链路固定走同一条，槽不可用直接失败。
-		// `login realm` 是纯本地子命令，不走这里——配置坏掉时仍要能切域自救。
-		config, cerr := loadLoginConfig(loginConfigPath)
-		if cerr != nil {
-			fatalf("%v", cerr)
-		}
-
-		// poll 是另一个进程：沿用 url 发起时选定的槽，不重新选举。
-		pinned := ""
-		if rest[0] == "poll" {
-			pinned = loadLoginState(stateFile, realm).Slot
-		}
-
-		// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
-		client, slot, eerr := loginEgressClient(config, realm, pinned)
-		if eerr != nil {
-			fatalf("登录出口不可用: %v", eerr)
-		}
-
-		if slot != "" {
-			fmt.Fprintf(os.Stderr, "login: 登录出站走代理槽 %s\n", slot)
-		}
+		client, slot := loginClient(realm, rest[0])
 
 		if rest[0] == "url" {
 			runURL(base, origin, realm, stateFile, mustLoginIdentity(realm), client, slot, os.Stdout)
