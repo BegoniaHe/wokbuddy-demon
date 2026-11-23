@@ -332,6 +332,18 @@ func TestVideoGenerateNormalizesReferenceShapes(t *testing.T) {
 			want:  `[{"image_url":"https://img.example/a.png"},{"image_url":"https://img.example/b.png"}]`,
 		},
 		{
+			name:  "single_string_wrapped",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_images":"https://img.example/a.png"}`,
+			field: "reference_images",
+			want:  `[{"image_url":"https://img.example/a.png"}]`,
+		},
+		{
+			name:  "single_object_wrapped",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_videos":{"url":"https://v.example/b.mp4"}}`,
+			field: "reference_videos",
+			want:  `[{"video_url":"https://v.example/b.mp4"}]`,
+		},
+		{
 			name:  "objects",
 			in:    `{"model":"seedance-2.5","prompt":"cat","reference_images":[{"image_url":"https://img.example/a.png"}]}`,
 			field: "reference_images",

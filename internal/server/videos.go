@@ -279,7 +279,8 @@ var videoReferenceFields = []struct{ field, key string }{
 //
 // 官方客户端在提交前做同一层包装：字符串条目补成 {<key>: url}；已是对象时优先取
 // <key>、退一步取 url；两者都取不到的条目丢弃（宁可少一条素材，也不要因一个字段
-// 形状不符让整单 400）。空数组按官方 `length &&` 口径视为不设置该字段。
+// 形状不符让整单 400）。空数组按官方 `length &&` 口径视为不设置该字段；客户端把
+// 单条素材直接写成字符串或对象时按一条素材归一，不整段丢弃。
 func normalizeVideoReferences(body []byte) []byte {
 	if len(body) == 0 {
 		return body
@@ -317,7 +318,7 @@ func normalizeVideoField(obj map[string]any, field, key string) bool {
 		return false
 	}
 
-	items, _ := raw.([]any)
+	items := videoReferenceItems(raw)
 	normalized := make([]any, 0, len(items))
 
 	for _, item := range items {
@@ -333,6 +334,23 @@ func normalizeVideoField(obj map[string]any, field, key string) bool {
 	}
 
 	return true
+}
+
+// videoReferenceItems 把字段值当素材列表读：单个字符串或对象按一条素材处理。
+//
+// 非数组形态（`reference_images:"https://…"`、单个对象）在官方客户端不会出现，
+// 但客户端写错时直接删掉整段字段等于「静默少素材」——出一个没有参考素材的视频
+// 并照常计费。按单条素材归一与「字符串条目自动包装」是同一层宽容。null 与其它
+// 类型仍视为未设置。
+func videoReferenceItems(raw any) []any {
+	switch typed := raw.(type) {
+	case []any:
+		return typed
+	case string, map[string]any:
+		return []any{typed}
+	default:
+		return nil
+	}
 }
 
 // normalizeVideoReferenceEntry 归一单条参考素材；取不到 URL 时丢弃。
