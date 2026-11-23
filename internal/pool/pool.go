@@ -842,7 +842,9 @@ func (p *Pool) upsertLocked(account *auth.Auth) *auth.Auth {
 		return old
 	}
 
-	p.byUID[account.UID] = &entry{a: account}
+	// 首次见到该账号时用 auth 文件里的注册出口作答（issue #609）：CLI 登录没有
+	// 账号池，绑定只能随 auth 文件落盘。state.json 里的既有绑定在载入时覆盖它。
+	p.byUID[account.UID] = &entry{a: account, proxySlot: strings.TrimSpace(account.ProxySlot)}
 
 	return nil
 }
