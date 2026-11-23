@@ -355,6 +355,7 @@ func responsesMessages(req *responsesRequest, refs map[string]responsesToolRef) 
 		return nil, errNoConvertibleItems
 	}
 
+	builder.flushPendingAssistant()
 	builder.flushImages()
 
 	return builder.msgs, nil
@@ -368,6 +369,12 @@ type responsesInputMessages struct {
 	// pendingReasoning 暂存 reasoning 项解出的思考段，等所属的 assistant 内容落地时
 	// 挂到 reasoning_content；连续段按 "\n" 拼接，user/tool 边界清空不跨轮泄漏。
 	pendingReasoning []string
+	// pendingAssistant 暂存「只带正文、未终结」的 assistant 消息，等紧随的
+	// tool_calls 并成一条 wire 消息（issue #619）。nil = 无暂存。
+	pendingAssistant map[string]any
+	// lastToolBatch 指向本轮最近一条已落地的 assistant tool_calls 消息，相邻的
+	// function_call / custom_tool_call 直接并进同一批（issue #619）。
+	lastToolBatch map[string]any
 }
 
 func (b *responsesInputMessages) add(converted, images []any) {
@@ -402,9 +409,108 @@ func (b *responsesInputMessages) addItem(item map[string]any, refs map[string]re
 		return false, err
 	}
 
+	if b.mergeSameTurnToolCalls(item, converted) {
+		return true, nil
+	}
+
 	b.add(converted, images)
 
 	return true, nil
+}
+
+// mergeSameTurnToolCalls 把同轮的 assistant 正文与紧随的 tool_calls 并成一条
+// {role:"assistant", content, tool_calls:[…]}，并把相邻的并行调用合成同一批
+// （issue #619，官方 wire 形态）。返回 true 表示该项已被处理，不再走 add。
+//
+// 边界（user / tool / compaction / agent_message / final_answer 正文）先落地暂存
+// 正文并关闭调用批次；reasoning 项不经过这里，仍暂存在 pendingReasoning 等所属
+// assistant 落地时挂上。
+func (b *responsesInputMessages) mergeSameTurnToolCalls(item map[string]any, converted []any) bool {
+	msg := singleAssistantMessage(converted)
+	if msg == nil {
+		b.flushPendingAssistant()
+		b.lastToolBatch = nil
+
+		return false
+	}
+
+	calls, _ := msg["tool_calls"].([]any)
+	if len(calls) == 0 {
+		if stringValue(item["phase"]) == "final_answer" {
+			b.flushPendingAssistant()
+			b.lastToolBatch = nil
+
+			return false
+		}
+
+		b.flushPendingAssistant()
+		b.attachReasoning(converted)
+		b.pendingAssistant = msg
+		b.lastToolBatch = nil
+
+		return true
+	}
+
+	switch {
+	case b.pendingAssistant != nil:
+		pending := b.pendingAssistant
+		b.pendingAssistant = nil
+		pending["tool_calls"] = calls
+		mergeAssistantReasoning(pending, msg)
+		b.add([]any{pending}, nil)
+		b.lastToolBatch = pending
+	case b.lastToolBatch != nil:
+		existing, _ := b.lastToolBatch["tool_calls"].([]any)
+		b.lastToolBatch["tool_calls"] = append(existing, calls...)
+		mergeAssistantReasoning(b.lastToolBatch, msg)
+	default:
+		b.lastToolBatch = msg
+		b.add(converted, nil)
+	}
+
+	return true
+}
+
+// flushPendingAssistant 把暂存的 assistant 正文落地。
+func (b *responsesInputMessages) flushPendingAssistant() {
+	if b.pendingAssistant == nil {
+		return
+	}
+
+	msg := b.pendingAssistant
+	b.pendingAssistant = nil
+
+	b.add([]any{msg}, nil)
+}
+
+// singleAssistantMessage 取出转换结果中唯一的 assistant 消息；其它形态返回 nil。
+func singleAssistantMessage(converted []any) map[string]any {
+	if len(converted) != 1 {
+		return nil
+	}
+
+	msg, _ := converted[0].(map[string]any)
+	if stringValue(msg["role"]) != "assistant" {
+		return nil
+	}
+
+	return msg
+}
+
+// mergeAssistantReasoning 把 src 的 reasoning_content 并进 dst（去重，与
+// attachReasoning 的拼接口径一致）。
+func mergeAssistantReasoning(dst, src map[string]any) {
+	incoming := stringValue(src["reasoning_content"])
+	if incoming == "" {
+		return
+	}
+
+	switch existing := stringValue(dst["reasoning_content"]); {
+	case existing == "":
+		dst["reasoning_content"] = incoming
+	case existing != incoming:
+		dst["reasoning_content"] = existing + "\n" + incoming
+	}
 }
 
 // addReasoning 暂存 reasoning 项解出的思考段；空文本不产生字段，也不产出消息。
