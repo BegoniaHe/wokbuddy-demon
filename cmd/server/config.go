@@ -415,6 +415,9 @@ type Config struct {
 		// GET /v1/videos/{task_id}（查询任务，issue #467）。
 		// 默认 false：视频端点同样未在真实账号验证鉴权/计费。
 		VideosEndpoint bool `json:"videos_endpoint"`
+		// NarrationEnabled 是否允许截断续写（救援）自动补发（issue #606）。默认 true；
+		// 关闭后一次续写请求都不发出。热生效，livecfg 按取反存储。
+		NarrationEnabled bool `json:"narration_enabled"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`
@@ -703,6 +706,7 @@ func applyUpstreamDefaults(config7 *Config) {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	config7.Global.Enabled = true
 	config7.Features.SanitizeBlacklistFingerprints = true
+	config7.Features.NarrationEnabled = true
 	config7.Features.LocalWebToolRounds = 3
 	config7.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 }

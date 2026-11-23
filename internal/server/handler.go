@@ -152,6 +152,9 @@ type Config struct {
 	WebFetchEndpoint bool // POST /v1/tools/fetch
 	ImagesEndpoint   bool // POST /v1/images/{generations,edits}
 	VideosEndpoint   bool // POST /v1/videos/generations 与 GET /v1/videos/{task_id}
+	// NarrationDisabled 关闭自动续写（features.narration_enabled=false，issue #606）。
+	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
+	NarrationDisabled bool
 	// HiddenModels 模型黑名单（"cn:x"/"global:x" 归一形式）；空 = 关闭。
 	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
 	HiddenModels map[string]struct{}
@@ -227,6 +230,7 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		WebFetchEndpoint:   h.cfg.WebFetchEndpoint,
 		ImagesEndpoint:     h.cfg.ImagesEndpoint,
 		VideosEndpoint:     h.cfg.VideosEndpoint,
+		NarrationDisabled:  h.cfg.NarrationDisabled,
 		BackgroundNames:    h.cfg.BackgroundNames,
 		BackgroundTarget:   h.cfg.BackgroundTarget,
 		HiddenModels:       h.cfg.HiddenModels,
@@ -3728,11 +3732,20 @@ func (f *chatFlow) handlePreStreamEmpty(
 	return rotContinue
 }
 
+// errNarrationDisabled features.narration_enabled=false 时的续写拒绝（issue #606）：
+// 调用方按「本次不续写」处理，不当作上游失败。
+var errNarrationDisabled = errors.New("narration disabled by features.narration_enabled")
+
 // continueUpstream 发起截断续写请求：复用 ChatStreamContext → prepareBody 管线，
 // 同账号同模型，不手拼 raw body（脱敏/thinking/缓存键仍生效）。
 func (f *chatFlow) continueUpstream(
 	ctx context.Context, acct *auth.Auth, partial string, kind upstream.TailKind,
 ) (io.ReadCloser, error) {
+	// 总闸门（issue #606）：流式与非流式两条救援路径都以本函数为唯一出站口。
+	if f.h.loadLive().NarrationDisabled {
+		return nil, errNarrationDisabled
+	}
+
 	body := upstream.BuildContinuationBody(f.body, partial, kind)
 
 	next, status, respBody, err := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, body, f.clientIP, f.chatMeta)

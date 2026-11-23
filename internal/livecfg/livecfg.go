@@ -47,6 +47,9 @@ type Snapshot struct {
 	// （features.videos_endpoint，默认 false，issue #467）。与 images_endpoint
 	// 同口径：未在真实账号验证计费前不默认开启。
 	VideosEndpoint bool
+	// NarrationDisabled 是 features.narration_enabled 的取反存储（零值 = 开启；
+	// issue #606）：置位后任何自动续写请求都不发出。
+	NarrationDisabled bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
 	// BackgroundNames 后台模型改写名单（小写；issue #103）。空 = 关闭。
