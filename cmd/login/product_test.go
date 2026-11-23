@@ -45,13 +45,13 @@ func recordLoginFlow(t *testing.T, realm, platform, origin string) []loginHit {
 	statePath := filepath.Join(t.TempDir(), "state.json")
 	identity := loginIdentity{userAgent: "ua", platform: platform}
 
-	runURL(srv.URL, origin, realm, statePath, identity, srv.Client(), io.Discard)
+	runURL(srv.URL, origin, realm, statePath, identity, srv.Client(), "", io.Discard)
 
 	if _, err := os.Stat(statePath); err != nil {
 		t.Fatalf("state 未落盘: %v", err)
 	}
 
-	runPoll(srv.URL, origin, realm, statePath, identity, srv.Client(), io.Discard)
+	runPoll(srv.URL, origin, realm, statePath, identity, srv.Client(), "", io.Discard)
 
 	return hits
 }

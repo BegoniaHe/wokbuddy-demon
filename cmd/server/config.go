@@ -420,6 +420,12 @@ type Config struct {
 		LocalWebTools bool `json:"local_web_tools"`
 		// LocalWebToolRounds 本地工具最多代跑轮数；<=0 回落 3，>8 钳到 8。
 		LocalWebToolRounds int `json:"local_web_tool_rounds"`
+		// LoginBindProxy 加号登录链路是否按出口槽出站（issue #609，默认 true）。
+		// 开启后 auth/state → auth/token → login/account 整条链路固定走同一条启用且
+		// 健康的槽，并在落盘后把该槽写成账号 proxy_slot；有启用槽但都不可用时明确
+		// 报错（不回落直连）。一条启用槽都没有时仍直连。热生效。
+		// 只放行单一站点线路的部署可能需要关掉——关掉即完全直连。
+		LoginBindProxy bool `json:"login_bind_proxy"`
 		// ConversationRequestBody 在当前轮最后一条 user 消息写
 		// conversationRequestId / startsNewUserRequest（issue #249）。默认 false：
 		// 官方桌面端形态，先用真实账号小流量 A/B 确认上游接受后再开启。
@@ -704,6 +710,8 @@ func applyUpstreamDefaults(config7 *Config) {
 	config7.Global.Enabled = true
 	config7.Features.SanitizeBlacklistFingerprints = true
 	config7.Features.LocalWebToolRounds = 3
+	// 加号登录默认走已配置的出口槽（issue #609）：显式 false 才直连。
+	config7.Features.LoginBindProxy = true
 	config7.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 }
 

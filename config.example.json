@@ -129,6 +129,7 @@
     "multimodal_routing": false,
     "local_web_tools": false,
     "local_web_tool_rounds": 3,
+    "login_bind_proxy": true,
     "search_endpoint": false,
     "search_deep": false,
     "web_fetch_endpoint": false,

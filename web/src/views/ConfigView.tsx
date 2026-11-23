@@ -648,6 +648,11 @@ export function ConfigView() {
             {text('proxies', { placeholder: 'http://user:pass@host:port, socks5://host:1080' })}
             <FieldDescription>逗号分隔；非空按健康轮换，失败自动冷却；需重启</FieldDescription>
           </Field>
+          {check(
+            'login_bind_proxy',
+            '加号登录按出口槽出站',
+            '开启后 auth/state → auth/token → login/account 整条链路固定走同一条启用且健康的槽，落盘后把该槽写成账号出口绑定；有启用槽但都不可用时直接报错（不回落直连）；一条启用槽都没有仍直连。热生效',
+          )}
           <Separator className="my-4" />
           <div className="grid gap-x-5 md:grid-cols-3">
             <Field>
