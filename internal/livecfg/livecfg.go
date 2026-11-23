@@ -52,6 +52,9 @@ type Snapshot struct {
 	TTSEnabled bool
 	// ASREnabled 是否开放 POST /v1/audio/transcriptions（features.asr_enabled，默认 false）。
 	ASREnabled bool
+	// NarrationDisabled 是 features.narration_enabled 的取反存储（零值 = 开启；
+	// issue #606）：置位后任何自动续写请求都不发出。
+	NarrationDisabled bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
 	// LoginBindProxy 加号登录链路是否按出口槽出站（features.login_bind_proxy，

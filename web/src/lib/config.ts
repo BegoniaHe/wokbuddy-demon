@@ -113,6 +113,7 @@ export const CFG_FIELDS: FieldDef[] = [
   { name: 'videos_endpoint', path: ['features', 'videos_endpoint'], kind: 'checkbox' },
   { name: 'tts_enabled', path: ['features', 'tts_enabled'], kind: 'checkbox' },
   { name: 'asr_enabled', path: ['features', 'asr_enabled'], kind: 'checkbox' },
+  { name: 'narration_enabled', path: ['features', 'narration_enabled'], kind: 'checkbox' },
   { name: 'session_sticky_enabled', path: ['session_sticky', 'enabled'], kind: 'checkbox' },
   { name: 'request_client_info', path: ['logging', 'request_client_info'], kind: 'checkbox' },
 ];

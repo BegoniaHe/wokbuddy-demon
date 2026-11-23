@@ -137,6 +137,7 @@
     "videos_endpoint": false,
     "tts_enabled": false,
     "asr_enabled": false,
+    "narration_enabled": true,
     "conversation_request_body": false
   },
   "prompt": {

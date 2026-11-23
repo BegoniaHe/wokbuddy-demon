@@ -421,6 +421,9 @@ type Config struct {
 		// ASREnabled 是否开放 POST /v1/audio/transcriptions（上游 /agenttool/v1/asr，
 		// issue #604）。与 tts_enabled 分开：两个端点的失败形态与上游限额不同。
 		ASREnabled bool `json:"asr_enabled"`
+		// NarrationEnabled 是否允许截断续写（救援）自动补发（issue #606）。默认 true；
+		// 关闭后一次续写请求都不发出。热生效，livecfg 按取反存储。
+		NarrationEnabled bool `json:"narration_enabled"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`
@@ -715,6 +718,7 @@ func applyUpstreamDefaults(config7 *Config) {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	config7.Global.Enabled = true
 	config7.Features.SanitizeBlacklistFingerprints = true
+	config7.Features.NarrationEnabled = true
 	config7.Features.LocalWebToolRounds = 3
 	// 加号登录默认走已配置的出口槽（issue #609）：显式 false 才直连。
 	config7.Features.LoginBindProxy = true

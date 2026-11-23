@@ -1314,6 +1314,7 @@ func liveSnapshot(cfg *Config) livecfg.Snapshot {
 		VideosEndpoint:     cfg.Features.VideosEndpoint,
 		TTSEnabled:         cfg.Features.TTSEnabled,
 		ASREnabled:         cfg.Features.ASREnabled,
+		NarrationDisabled:  !cfg.Features.NarrationEnabled,
 		LocalWebTools:      cfg.Features.LocalWebTools,
 		LocalWebToolRounds: cfg.Features.LocalWebToolRounds,
 		LoginBindProxy:     cfg.Features.LoginBindProxy,
