@@ -166,7 +166,7 @@ func TestLoginCLISlotEgress(t *testing.T) {
 	target := deadLoginAddr(t)
 	proxy := newLoginTunnelProxy(t, map[string]string{target: srv.Listener.Addr().String()})
 
-	client, slot, err := loginEgressClient(loginConfigWith(makeLoginSlot("egress", "http://"+proxy.addr, true)), realmCN)
+	client, slot, err := loginEgressClient(loginConfigWith(makeLoginSlot("egress", "http://"+proxy.addr, true)), realmCN, "")
 	if err != nil {
 		t.Fatalf("loginEgressClient: %v", err)
 	}
@@ -192,7 +192,7 @@ func TestLoginCLINoSlotIsDirect(t *testing.T) {
 
 	srv, hits := newLoginUpstream(t)
 
-	client, slot, err := loginEgressClient(loginConfigWith(), realmCN)
+	client, slot, err := loginEgressClient(loginConfigWith(), realmCN, "")
 	if err != nil || slot != "" {
 		t.Fatalf("slot=%q err=%v want 直连", slot, err)
 	}
@@ -215,7 +215,7 @@ func TestLoginCLISwitchOffIsDirect(t *testing.T) {
 	config := loginConfigWith(makeLoginSlot("egress", "http://"+proxy.addr, true))
 	config.bindProxy = false
 
-	client, slot, err := loginEgressClient(config, realmCN)
+	client, slot, err := loginEgressClient(config, realmCN, "")
 	if err != nil || slot != "" {
 		t.Fatalf("slot=%q err=%v want 直连", slot, err)
 	}
@@ -237,7 +237,7 @@ func TestLoginCLIBrokenSlotFailsClosed(t *testing.T) {
 	t.Parallel()
 
 	client, slot, err := loginEgressClient(
-		loginConfigWith(makeLoginSlot("broken", "ftp://user:s3cr3t-pass@127.0.0.1:1", true)), realmCN)
+		loginConfigWith(makeLoginSlot("broken", "ftp://user:s3cr3t-pass@127.0.0.1:1", true)), realmCN, "")
 	if !errors.Is(err, outbound.ErrNoHealthySlot) || client != nil || slot != "" {
 		t.Fatalf("slot=%q client=%v err=%v want ErrNoHealthySlot", slot, client != nil, err)
 	}
@@ -332,6 +332,49 @@ func runLoginFlow(t *testing.T, base string, client *http.Client) {
 	// 两段各自有 30s 超时；这里收紧总时长，逻辑失败会立刻返回而不是等满超时。
 	client.Timeout = 10 * time.Second
 
-	runURL(base, originRefererCN, realmCN, statePath, identity, client, io.Discard)
-	runPoll(base, originRefererCN, realmCN, statePath, identity, client, io.Discard)
+	runURL(base, originRefererCN, realmCN, statePath, identity, client, "", io.Discard)
+	runPoll(base, originRefererCN, realmCN, statePath, identity, client, "", io.Discard)
+}
+
+// TestLoginCLIPinnedSlotIsHonored poll 是另一个进程：发起时选定的槽必须被沿用，
+// 不重新选举；槽已不可用时 fail-closed，绝不换出口或回落直连。
+func TestLoginCLIPinnedSlotIsHonored(t *testing.T) {
+	t.Parallel()
+
+	config := loginConfigWith(
+		makeLoginSlot("preferred", "http://127.0.0.1:1", true),
+		makeLoginSlot("pinned", "http://127.0.0.1:2", true),
+	)
+
+	_, slot, err := loginEgressClient(config, realmCN, "pinned")
+	if err != nil || slot != "pinned" {
+		t.Fatalf("slot=%q err=%v want pinned（沿用发起时的出口）", slot, err)
+	}
+
+	if client, got, err := loginEgressClient(config, realmCN, "gone"); client != nil || got != "" ||
+		!errors.Is(err, outbound.ErrProxyDial) {
+		t.Fatalf("已消失的发起槽必须 fail-closed: slot=%q err=%v", got, err)
+	}
+
+	off := loginConfigWith(makeLoginSlot("pinned", "http://127.0.0.1:2", true))
+	off.bindProxy = false
+
+	if client, got, err := loginEgressClient(off, realmCN, "pinned"); client != nil || got != "" ||
+		!errors.Is(err, outbound.ErrProxyDial) {
+		t.Fatalf("开关中途关闭也不得静默直连: slot=%q err=%v", got, err)
+	}
+}
+
+// TestLoginOutputCarriesProxySlot CLI 没有账号池，绑定只能随 auth 文件落盘。
+func TestLoginOutputCarriesProxySlot(t *testing.T) {
+	t.Parallel()
+
+	out := buildLoginOutput(tokenBundle{AccessToken: "at"}, realmCN, accountInfo{UID: "u1"}, "residential")
+	if out["proxy_slot"] != "residential" {
+		t.Fatalf("proxy_slot=%v want residential", out["proxy_slot"])
+	}
+
+	if _, has := buildLoginOutput(tokenBundle{AccessToken: "at"}, realmCN, accountInfo{UID: "u1"}, "")["proxy_slot"]; has {
+		t.Fatal("直连登录不得写空绑定")
+	}
 }

@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -283,6 +284,7 @@ type loginState struct {
 	State string `json:"state"`
 	Realm string `json:"realm,omitempty,omitzero"` // url 落盘时写回的 realm，poll 读回校验防混域
 	Base  string `json:"base,omitempty,omitzero"`  // url 命中 origin，poll 优先同源
+	Slot  string `json:"slot,omitempty,omitzero"`  // 发起时选定的出口槽：poll 沿用，不重新选举
 }
 
 // tokenBundle 是 auth/token 成功返回的凭证包。
@@ -405,7 +407,10 @@ func validateRealmMatch(stateRealm, cliRealm string) error {
 // （可注入临时文件便于测试）。空 realm 视为缺省（调用方已归一）。
 //
 //nolint:funlen // URL/poll 候选轮转线性展开。
-func runURL(base, origin, realm, statePath string, identity loginIdentity, client *http.Client, out io.Writer) {
+func runURL(
+	base, origin, realm, statePath string, identity loginIdentity, client *http.Client, slot string,
+	out io.Writer,
+) {
 	headers := noAuthHeaders(commonHeaders(origin, identity.userAgent))
 
 	var (
@@ -449,7 +454,7 @@ func runURL(base, origin, realm, statePath string, identity loginIdentity, clien
 		fatalf("auth state: missing state or authUrl")
 	}
 
-	raw, merr := jsonx.Marshal(loginState{State: item.State, Realm: realm, Base: usedBase})
+	raw, merr := jsonx.Marshal(loginState{State: item.State, Realm: realm, Base: usedBase, Slot: slot})
 	if merr != nil {
 		fatalf("marshal state: %v", merr)
 	}
@@ -468,7 +473,8 @@ func runURL(base, origin, realm, statePath string, identity loginIdentity, clien
 // GET 一次，成功再 GET login/account（带 Bearer），stdout 打印完整 token+account JSON。
 // statePath 可注入临时文件便于测试。
 func runPoll(
-	base, origin, realm, statePath string, identity loginIdentity, client *http.Client, out io.Writer,
+	base, origin, realm, statePath string, identity loginIdentity, client *http.Client, slot string,
+	out io.Writer,
 ) {
 	loginState2 := loadLoginState(statePath, realm)
 	headers := commonHeaders(origin, identity.userAgent)
@@ -485,7 +491,7 @@ func runPoll(
 		failOnPollAccountError(err)
 	}
 
-	oraw, oerr := jsonx.Marshal(buildLoginOutput(tok, realm, acct))
+	oraw, oerr := jsonx.Marshal(buildLoginOutput(tok, realm, acct, slot))
 	if oerr != nil {
 		fatalf("marshal output: %v", oerr)
 	}
@@ -682,8 +688,8 @@ func pollAccount(
 // buildLoginOutput 组装 poll 输出的完整 JSON（login.sh 据此落盘 auth 文件）。
 // realm 永不空：显式 --realm 优先（ResolveRealm 处理），否则按上游返回的 domain 推断——
 // 保证登录落盘的 auth 文件恒带 realm 键。
-func buildLoginOutput(tok tokenBundle, realm string, acct accountInfo) map[string]any {
-	return map[string]any{
+func buildLoginOutput(tok tokenBundle, realm string, acct accountInfo, slot string) map[string]any {
+	out := map[string]any{
 		"access_token":  tok.AccessToken,
 		"refresh_token": tok.RefreshToken,
 		"expires_in":    tok.ExpiresIn,
@@ -694,6 +700,14 @@ func buildLoginOutput(tok tokenBundle, realm string, acct accountInfo) map[strin
 		"type":          acct.Type,
 		"nickname":      acct.Nickname,
 	}
+
+	// 注册出口：CLI 没有账号池，绑定只能随 auth 文件落盘，server 首次载入时作为
+	// 初始绑定（state.json 里的既有绑定优先）。
+	if slot != "" {
+		out["proxy_slot"] = slot
+	}
+
+	return out
 }
 
 // loginSlot 命名出口槽（与 config 的 proxy_slots 同名字段一一对应）。
@@ -758,23 +772,38 @@ func loadLoginConfig(path string) (loginConfig, error) {
 //   - 有启用槽 → 整条 state/token/account 固定走挑中的槽；
 //   - 有启用槽但都不可用/不健康 → 报错（调用方必须失败，绝不回落直连）。
 //
+// pinned 是发起时选定的槽（state 文件里记的）：poll 是另一个进程，必须沿用它而不是
+// 重新选举，否则同一 device-auth 会话的 auth/state 与 auth/token 可能来自两条出口，
+// 且「第一条启用槽已死、后面有健康槽」的部署会永久挑到死槽（进程内的冷却记忆每次清零）。
+//
 // 返回的 slot 为空表示直连。
-func loginEgressClient(config loginConfig, realm string) (*http.Client, string, error) {
+func loginEgressClient(config loginConfig, realm, pinned string) (*http.Client, string, error) {
 	jar, _ := cookiejar.New(nil)
 
 	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
 	if !config.bindProxy {
+		if pinned != "" {
+			return nil, "", fmt.Errorf(
+				"%w: 本次登录发起时绑定了槽 %q，但 features.login_bind_proxy 已关闭（不回落直连）",
+				outbound.ErrProxyDial, pinned)
+		}
+
 		return client, "", nil
 	}
 
-	slots := make([]outbound.Slot, 0, len(config.Slots))
-	for _, slot := range config.Slots {
-		slots = append(slots, outbound.Slot{ID: slot.ID, Name: slot.Name, URL: slot.URL, Enabled: slot.Enabled})
+	reg, err := loginRegistry(config)
+	if err != nil {
+		return nil, "", err
 	}
 
-	reg, err := outbound.NewRegistry(nil, slots, config.RealmSlots)
-	if err != nil {
-		return nil, "", fmt.Errorf("构造登录出口注册表失败: %w", err)
+	if pinned != "" {
+		dial, ok := reg.SlotDial(pinned)
+		if !ok {
+			return nil, "", fmt.Errorf("%w: 登录发起时的代理槽 %q 已不可用（不换出口、不回落直连）",
+				outbound.ErrProxyDial, pinned)
+		}
+
+		return withDial(client, dial), pinned, nil
 	}
 
 	slot, dial, lerr := reg.LoginSlot(realm)
@@ -786,13 +815,33 @@ func loginEgressClient(config loginConfig, realm string) (*http.Client, string, 
 		return client, "", nil
 	}
 
+	return withDial(client, dial), slot, nil
+}
+
+// loginRegistry 用配置文件里的槽构造一次性注册表（CLI 无长驻池，进程内不记忆冷却）。
+func loginRegistry(config loginConfig) (*outbound.Registry, error) {
+	slots := make([]outbound.Slot, 0, len(config.Slots))
+	for _, slot := range config.Slots {
+		slots = append(slots, outbound.Slot{ID: slot.ID, Name: slot.Name, URL: slot.URL, Enabled: slot.Enabled})
+	}
+
+	reg, err := outbound.NewRegistry(nil, slots, config.RealmSlots)
+	if err != nil {
+		return nil, fmt.Errorf("构造登录出口注册表失败: %w", err)
+	}
+
+	return reg, nil
+}
+
+// withDial 把 client 换成按槽出站的 Transport（超时口径与面板一致）。
+func withDial(client *http.Client, dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
 	client.Transport = &http.Transport{
 		DialContext:         dial,
 		TLSHandshakeTimeout: 10 * time.Second,
 		IdleConnTimeout:     30 * time.Second,
 	}
 
-	return client, slot, nil
+	return client
 }
 
 func main() {
@@ -805,30 +854,40 @@ func main() {
 		fatalf("usage: login [--realm=cn|global] <url|poll>")
 	}
 
-	// 登录出口（issue #609）：配了槽就整条链路固定走同一条，槽不可用直接失败。
-	config, cerr := loadLoginConfig(loginConfigPath)
-	if cerr != nil {
-		fatalf("%v", cerr)
-	}
-
-	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
-	client, slot, eerr := loginEgressClient(config, realm)
-	if eerr != nil {
-		fatalf("登录出口不可用: %v", eerr)
-	}
-
-	if slot != "" {
-		fmt.Fprintf(os.Stderr, "login: 登录出站走代理槽 %s\n", slot)
-	}
-
 	base, origin := realmConfig(realm)
 
 	switch rest[0] {
-	case "url":
-		runURL(base, origin, realm, stateFile, mustLoginIdentity(realm), client, os.Stdout)
+	case "url", "poll":
+		// 登录出口（issue #609）：配了槽就整条链路固定走同一条，槽不可用直接失败。
+		// `login realm` 是纯本地子命令，不走这里——配置坏掉时仍要能切域自救。
+		config, cerr := loadLoginConfig(loginConfigPath)
+		if cerr != nil {
+			fatalf("%v", cerr)
+		}
 
-	case "poll":
-		runPoll(base, origin, realm, stateFile, mustLoginIdentity(realm), client, os.Stdout)
+		// poll 是另一个进程：沿用 url 发起时选定的槽，不重新选举。
+		pinned := ""
+		if rest[0] == "poll" {
+			pinned = loadLoginState(stateFile, realm).Slot
+		}
+
+		// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
+		client, slot, eerr := loginEgressClient(config, realm, pinned)
+		if eerr != nil {
+			fatalf("登录出口不可用: %v", eerr)
+		}
+
+		if slot != "" {
+			fmt.Fprintf(os.Stderr, "login: 登录出站走代理槽 %s\n", slot)
+		}
+
+		if rest[0] == "url" {
+			runURL(base, origin, realm, stateFile, mustLoginIdentity(realm), client, slot, os.Stdout)
+
+			return
+		}
+
+		runPoll(base, origin, realm, stateFile, mustLoginIdentity(realm), client, slot, os.Stdout)
 
 	case "realm":
 		// 交互式选域（login.sh 无 --realm 传参且 stdin 为 tty 时调用）。
