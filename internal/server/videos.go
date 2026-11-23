@@ -243,6 +243,17 @@ func (h *Handler) forwardVideo(
 
 	h.recordMediaAttempt(acct, realm, bareModel, final, r)
 
+	// 提交阶段的请求级 4xx 透传上游原文，不喂连败/熔断（issue #618）：视频提交是
+	// 单次尝试、不换号，参数越界一类的 4xx 是请求问题而非账号问题。401/403/429
+	// 仍是账号级信号，走下面的既有处置。查询端点保持现状。
+	if !isTaskQuery && videoSubmitRequestStatus(final.status) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(final.status)
+		_, _ = w.Write(final.raw)
+
+		return
+	}
+
 	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "video") {
 		return
 	}
@@ -260,6 +271,21 @@ func (h *Handler) forwardVideo(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(final.status)
 	_, _ = w.Write(final.raw)
+}
+
+// videoSubmitRequestStatus 报告提交阶段的状态码是否属于请求级 4xx（issue #618）：
+// 401/403/429 是账号级信号，交给既有失败处置；其余 4xx 是参数/能力约束，不罚号。
+func videoSubmitRequestStatus(status int) bool {
+	if status < http.StatusBadRequest || status >= http.StatusInternalServerError {
+		return false
+	}
+
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests:
+		return false
+	}
+
+	return true
 }
 
 // videoTaskFailed 报告任务终态是否为 failed；其余状态（排队 / 运行中 / completed）

@@ -314,6 +314,112 @@ func TestVideoTaskModelQuerySelectsRealm(t *testing.T) {
 	}
 }
 
+// TestVideoSubmit4xxIsRequestLevel 视频提交阶段 4xx 视为请求级：账号不喂连败、
+// 不入冷却，响应体透传上游原文（issue #618）。
+func TestVideoSubmit4xxIsRequestLevel(t *testing.T) {
+	t.Parallel()
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusBadRequest,
+				`{"code":14407,"msg":"unsupported video duration: 1 seconds, supported range: 4-15 seconds"}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{VideosEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/videos/generations",
+		strings.NewReader(`{"model":"seedance-2.5","prompt":"cat","seconds":1}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if !strings.Contains(rec.Body.String(), "unsupported video duration") {
+		t.Fatalf("upstream body must pass through: %s", rec.Body)
+	}
+
+	st := statusOf(t, state, "u1")
+	if st.ConsecutiveFails != 0 || st.BreakerFails != 0 || st.Cooling {
+		t.Errorf("参数错误不得罚号: fails=%d breaker=%d cooling=%v",
+			st.ConsecutiveFails, st.BreakerFails, st.Cooling)
+	}
+}
+
+// TestVideoSubmit429StillPenalizes 429 仍是账号级信号：按软限流冷却，不被提交阶段
+// 的请求级透传分支吞掉（issue #618）。
+func TestVideoSubmit429StillPenalizes(t *testing.T) {
+	t.Parallel()
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusTooManyRequests,
+				`{"code":6004,"msg":"rate limited, will reset in 10 minutes"}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{VideosEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/videos/generations",
+		strings.NewReader(`{"model":"seedance-2.5","prompt":"cat"}`)))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if st := statusOf(t, state, "u1"); !st.Cooling {
+		t.Errorf("429 必须进入冷却: %+v", st)
+	}
+}
+
+// TestVideoTask4xxKeepsExistingPolicy 查询端点的失败处置保持现状（issue #618 范围外）：
+// 未知 4xx 仍按既有 ErrClient 口径喂连败。
+func TestVideoTask4xxKeepsExistingPolicy(t *testing.T) {
+	t.Parallel()
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusBadRequest, `{"code":9999,"msg":"bad task"}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	state := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	handler := NewHandler(&Config{
+		Pool:     state,
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{VideosEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/videos/task-1", nil))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if st := statusOf(t, state, "u1"); st.ConsecutiveFails == 0 {
+		t.Errorf("查询端点未知 4xx 仍应喂连败: %+v", st)
+	}
+}
+
 // TestModelsListShowsVideoCapability 视频生成模型在 /v1/models 以 capabilities
 // 标记可见（issue #467），同时不进入 chat 可见集合：别名仍按隐藏处理。
 func TestModelsListShowsVideoCapability(t *testing.T) {
