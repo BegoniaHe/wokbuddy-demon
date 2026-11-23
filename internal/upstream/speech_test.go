@@ -219,3 +219,33 @@ func sseResponse(status int, body string) *http.Response {
 		Body:       io.NopCloser(strings.NewReader(body)),
 	}
 }
+
+// TestSpeechTruncatedStreamIsError 帧边界断流（收到音频但没有 done 收尾）不能当成功：
+// 客户端会把截断音频当完整结果播放。
+func TestSpeechTruncatedStreamIsError(t *testing.T) {
+	t.Parallel()
+
+	body := `data: {"type":"speech.audio.delta","audio":{"data":"AAEC"}}` + "\n\n"
+
+	if _, err := readSpeechStream(strings.NewReader(body)); !errors.Is(err, ErrSpeechTruncated) {
+		t.Fatalf("err=%v want ErrSpeechTruncated", err)
+	}
+}
+
+// TestSpeechBusinessErrorInOKStatus 2xx + JSON 错误信封按上游报错分类，不能退化成
+// 「空音频 → 传输层失败」把码与文案全丢掉。
+func TestSpeechBusinessErrorInOKStatus(t *testing.T) {
+	t.Parallel()
+
+	body := `{"code":10000,"msg":"get voice config failed"}`
+
+	_, err := readSpeechStream(strings.NewReader(body))
+	if err == nil || errors.Is(err, ErrSpeechEmptyAudio) {
+		t.Fatalf("err=%v want 上游错误信封", err)
+	}
+
+	uerr, ok := errors.AsType[*Error](err)
+	if !ok || uerr.Code != "10000" || uerr.Msg == "" {
+		t.Fatalf("err=%v want *Error(code=10000)", err)
+	}
+}

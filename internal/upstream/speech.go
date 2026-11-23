@@ -145,7 +145,7 @@ func (c *Client) Speech(
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode >= http.StatusBadRequest {
+	if resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, speechHTTPError(resp)
 	}
 
@@ -162,14 +162,30 @@ func speechHTTPError(resp *http.Response) error {
 	}
 }
 
+// ErrSpeechTruncated TTS 流在帧边界断开：收到了音频却没有 speech.audio.done /
+// [DONE] 收尾标记。不当作成功——客户端会把截断音频当完整结果播放（与 chat 聚合器的
+// 截断检测同口径）。
+var ErrSpeechTruncated = errors.New("speech stream truncated before done marker")
+
 // readSpeechStream 逐行读 SSE，拼 speech.audio.delta 的 base64 PCM 分片。
 func readSpeechStream(body io.Reader) ([]byte, error) {
 	reader := bufio.NewReaderSize(body, 64<<10)
 
 	pcm := make([]byte, 0, 64<<10)
 
+	var (
+		sawDone bool
+		// envelope 记首个非 SSE 的 JSON 行：上游把业务错误放在 2xx 里时，空音频
+		// 会被读成「传输层失败」，把它的码与文案一起丢掉。
+		envelope string
+	)
+
 	for {
 		line, readErr := ReadSSELine(reader)
+
+		if trimmed := strings.TrimSpace(line); envelope == "" && strings.HasPrefix(trimmed, "{") {
+			envelope = trimmed
+		}
 
 		next, done, frameErr := appendSpeechFrame(pcm, line)
 		if frameErr != nil {
@@ -183,6 +199,8 @@ func readSpeechStream(body io.Reader) ([]byte, error) {
 		}
 
 		if done {
+			sawDone = true
+
 			break
 		}
 
@@ -196,7 +214,18 @@ func readSpeechStream(body io.Reader) ([]byte, error) {
 	}
 
 	if len(pcm) == 0 {
+		if envelope != "" {
+			return nil, &Error{
+				Kind: Classify(http.StatusBadGateway, envelope), Status: http.StatusBadGateway,
+				Msg: truncate(envelope, 200), Code: businessCode(envelope),
+			}
+		}
+
 		return nil, ErrSpeechEmptyAudio
+	}
+
+	if !sawDone {
+		return nil, ErrSpeechTruncated
 	}
 
 	return pcm, nil
