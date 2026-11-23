@@ -47,8 +47,19 @@ type Snapshot struct {
 	// （features.videos_endpoint，默认 false，issue #467）。与 images_endpoint
 	// 同口径：未在真实账号验证计费前不默认开启。
 	VideosEndpoint bool
+	// TTSEnabled 是否开放 POST /v1/audio/speech（features.tts_enabled，默认 false，
+	// issue #604）。两个语音开关分开：TTS/ASR 走不同上游端点、失败形态不同。
+	TTSEnabled bool
+	// ASREnabled 是否开放 POST /v1/audio/transcriptions（features.asr_enabled，默认 false）。
+	ASREnabled bool
+	// NarrationDisabled 是 features.narration_enabled 的取反存储（零值 = 开启；
+	// issue #606）：置位后任何自动续写请求都不发出。
+	NarrationDisabled bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
+	// LoginBindProxy 加号登录链路是否按出口槽出站（features.login_bind_proxy，
+	// 默认 true，issue #609）。关闭后 state/token/account 三条一律直连。
+	LoginBindProxy bool
 	// BackgroundNames 后台模型改写名单（小写；issue #103）。空 = 关闭。
 	BackgroundNames map[string]bool
 	// BackgroundTarget 后台模型改写目标（issue #103）。

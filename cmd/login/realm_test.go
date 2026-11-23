@@ -178,7 +178,7 @@ func TestBuildLoginOutputRealmAlwaysSet(t *testing.T) {
 
 			tokCopy := tok
 			tokCopy.Domain = item.domain
-			out := buildLoginOutput(tokCopy, item.realm, acct)
+			out := buildLoginOutput(tokCopy, item.realm, acct, "")
 
 			m, ok := out["realm"].(string)
 			if !ok {

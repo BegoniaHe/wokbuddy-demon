@@ -29,6 +29,10 @@ const (
 	surfaceAgenticSearch
 	surfaceImages
 	surfaceVideos
+	// surfaceSpeech 文本转语音（/v2/audio/speech，回 SSE）；surfaceASR 语音转文本
+	// （/agenttool/v1/asr，multipart）。两者都与官方 chat 同客户端头族（issue #604）。
+	surfaceSpeech
+	surfaceASR
 	surfaceModelBusy
 	surfaceBilling
 	surfaceReport
@@ -45,7 +49,8 @@ const (
 // （见 internal/upstream/UPSTREAM.md §六）。
 func (s surface) chatFamily() bool {
 	switch s {
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
+		surfaceSpeech, surfaceASR:
 		return true
 	default:
 		return false
@@ -226,7 +231,8 @@ func (c *Client) lightUA(srf surface, account *auth.Auth) string {
 		// 个 plugin 头族；此处此前返回空串，UA 键整条缺失，http.Transport 落回
 		// Go-http-client/1.1——与 refresh 同号相邻发出时是明显的非官方指纹。
 		return c.userAgent(account)
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
+		surfaceSpeech, surfaceASR:
 		// 走 chat 头族，不经轻头族默认 UA。
 		return ""
 	}
@@ -289,7 +295,7 @@ func (s surface) mainProcess() bool {
 	case surfaceBilling, surfaceReport, surfaceRefresh, surfaceV3Config, surfaceLogout:
 		return true
 	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
-		surfaceModelBusy, surfaceGrowth:
+		surfaceSpeech, surfaceASR, surfaceModelBusy, surfaceGrowth:
 		return false
 	}
 
@@ -451,6 +457,9 @@ func (c *Client) chatFamilyHeaders(
 // chatSurfaceOverrides chat 头族内的 surface 差异：agenttool 四路是同步 JSON / SSE，
 // 头集与 chat 流式不同。
 func (c *Client) chatSurfaceOverrides(srf surface, req *http.Request, account *auth.Auth) {
+	//nolint:exhaustive // 语音两面（surfaceSpeech / surfaceASR）的形态差异在
+	// upstream/speech.go 按端点设定（TTS 的 SSE Accept、ASR 的 multipart boundary），
+	// 放进本表会让「头族」与「端点契约」两处事实分叉。
 	switch srf {
 	case surfaceSearch, surfaceWebFetch, surfaceAgenticSearch:
 		// 官方 WebSearchTool / fetchContentViaApi 头族：非流式 JSON，Content-Type
@@ -554,6 +563,7 @@ func (c *Client) lightHeaders(srf surface, req *http.Request, account *auth.Auth
 		accept = "application/json, text/plain, */*"
 		contentType = "application/json;charset=UTF-8"
 	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
+		surfaceSpeech, surfaceASR,
 		surfaceBilling, surfaceRefresh, surfaceV3Config, surfaceGrowth, surfaceLogout:
 	}
 
@@ -660,7 +670,8 @@ func (*Client) lightSurfaceOverrides(srf surface, req *http.Request, account *au
 	case surfaceBilling:
 		// billing 域面（meter）：企业头只在真有值时发，个人号不发声明头。
 		injectEnterpriseIDHeaders(req, account)
-	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos:
+	case surfaceChat, surfaceSearch, surfaceWebFetch, surfaceAgenticSearch, surfaceImages, surfaceVideos,
+		surfaceSpeech, surfaceASR:
 		// 不走轻头族（chatFamily() 已在 applyHeaders 分流）。
 	}
 }

@@ -65,7 +65,9 @@
 - **本地状态持久化**：重启后还记得昨天干到哪，不会一键失忆。
 - **登录与搬家**：面板里完成授权登录；需要换机器时，可以加密导出再导入账号。
 - **官方工具出口**：`POST /v2/chat/busy` 模型忙预检（只读本地池状态，单批最多 50 个模型）；`POST /v1/search/messages` 支持 `deep:true` 综述式检索（`features.search_deep`，默认关）；`POST /v1/tools/search` 提供 DeepSeek 官方形状的搜索出口（同一 `features.search_endpoint` 开关）；`POST /v1/tools/fetch` 提供官方 webfetch 的 DSH 形态出口（`features.web_fetch_endpoint`，默认关）；`POST /v1/images/generations` 与 `POST /v1/images/edits` 提供官方出图 / 图生图（`features.images_endpoint`，默认关，两者共用同一开关）。
-- **视频生成**：`POST /v1/videos/generations` 提交任务，JSON 形态原样透传官方 `VideoService` 的字段（`prompt` / `model` / `watermark`，可选 `seconds` / `image_url` / `last_image_url` / `reference_images` / `reference_videos` / `reference_audios` / `extra_parameters`），返回上游 `{code,msg,requestId,data:{id}}`，`data.id` 即任务 id；`GET /v1/videos/{task_id}` 查询任务（可选 `?model=` 决定选号域，跨域任务必须带），`data.status=completed` 时原样透出 `data[].url` 与 `data.usage.credit`，`failed` 归一为 502 通用文案。由 `features.videos_endpoint` 控制（默认关）。网关只做无状态透传，**不轮询**，轮询节奏由客户端决定；带 `text-to-video` / `image-to-video` 标签的模型在 `/v1/models` 以 `capabilities` 数组可见。
+- **视频生成**：`POST /v1/videos/generations` 提交任务，JSON 形态原样透传官方 `VideoService` 的字段（`prompt` / `model` / `watermark`，可选 `seconds` / `image_url` / `last_image_url` / `reference_images` / `reference_videos` / `reference_audios` / `extra_parameters`），返回上游 `{code,msg,requestId,data:{id}}`，`data.id` 即任务 id；三个 `reference_*` 字段由网关归一为上游要求的对象数组（字符串条目补成 `{image_url|video_url|audio_url}`，已是对象时取同名字段再退 `url`，取不到 URL 的条目丢弃）；`GET /v1/videos/{task_id}` 查询任务（可选 `?model=` 决定选号域，跨域任务必须带），`data.status=completed` 时原样透出 `data[].url` 与 `data.usage.credit`，`failed` 归一为 502 通用文案。由 `features.videos_endpoint` 控制（默认关）。网关只做无状态透传，**不轮询**，轮询节奏由客户端决定；带 `text-to-video` / `image-to-video` 标签的模型在 `/v1/models` 以 `capabilities` 数组可见。
+- **语音端点**：`POST /v1/audio/speech` 朗读（OpenAI TTS 形态：`model` / `input` / `voice` / `response_format`），上游固定 `hunyuan-tts-2.5`，只回 `wav`（24kHz 单声道 PCM 套 RIFF 头）或 `pcm`，请求 `mp3` 一律 400——上游没有 mp3，声称支持就是撒谎；`voice` 省略时用官方默认 `f191_female_cn_tts2.5_flash`。`POST /v1/audio/transcriptions` 转写（multipart 字段 `audio`，也接受 OpenAI 的 `file`），单个文件上限 3MB（超限入口直接 413，不把尺寸问题交给上游判成表单解析失败），返回 `{text}`。两条路径分别由 `features.tts_enabled` / `features.asr_enabled` 控制（默认关，关着回 403 而不是 404）；`model` 只用来取 realm 前缀，语音模型不进 `/v1/models`。
+- **自动续写开关**：截断续写救援（预告句 / 承诺句 / 长文续接的网关自动补发）由 `features.narration_enabled` 控制（默认开、热生效，面板可改）；关闭后一次续写请求都不发，开启时三条续写指令都带「【wb2api 网关自动续写·非用户消息】」前缀，避免被 agent 类客户端读成用户授权。
 - **官方档位徽章**：解析 `/v3/config` 的 `modelTiers`，在模型页与试聊选择器显示档位与升级提示，不改变选号或模型过滤。
 - **按密钥裁剪模型列表**：命名密钥的 `/v1/models` 只展示其 realm 绑定与模型白名单允许的条目，复用同一份缓存，不额外请求上游。
 
@@ -98,6 +100,8 @@
 | POST | `/v1/images/edits` | 图生图（与出图共用同一开关） |
 | POST | `/v1/videos/generations` | 视频任务提交（`features.videos_endpoint`，默认关） |
 | GET | `/v1/videos/{task_id}` | 视频任务查询；跨域任务必须带 `?model=` 决定选号域 |
+| POST | `/v1/audio/speech` | 语音合成（`features.tts_enabled`，默认关）；只回 `wav` / `pcm`，`mp3` 明确 400 |
+| POST | `/v1/audio/transcriptions` | 语音转写（`features.asr_enabled`，默认关）；multipart 字段 `audio`，单文件上限 3MB |
 
 **运维面**
 
@@ -183,7 +187,7 @@ docker compose up -d --build
 图片 / 视频请求比文本更容易触发上游按账号的风控与限额，一次画图被判异常可能连坐同一个账号上的文本请求。开启分区后两类请求各用各的号：
 
 - `pool.media_partition`：默认 `false`（不分区，行为与之前完全一致）。
-- `pool.media_accounts`：媒体号 uid 列表。开启分区后，`/v1/images/*` 与 `/v1/videos/generations` 只从这些账号选号；文本请求只从**其余**账号选号。
+- `pool.media_accounts`：媒体号 uid 列表。开启分区后，`/v1/images/*`、`/v1/videos/*` 与 `/v1/audio/*` 只从这些账号选号；文本请求只从**其余**账号选号。
 - 媒体号耗尽时选号明确失败（`503 no_healthy_account`），**不跨区回落**——跨区回落等于绕过分区，与动机相反；全冷却兜底同样遵守分区。
 - 只影响选号池，不改账号归属、健康台账与 `state.json`；与 `pool.strategy` 等既有选号策略叠加，不是另一套框架。热生效。
 
@@ -223,7 +227,9 @@ docker compose up -d --build
 
 **失效不回落**：前两档命中但槽不存在 / 已禁用 / 构造失败时，该请求直接失败（`502`，且不惩罚账号），**绝不**静默改走全局池或直连——静默直连会让人以为在走代理，实际暴露了宿主机真实 IP。
 
-**覆盖范围**：账号作用域内的全部出站请求——对话、token 刷新、余额/积分包、签到、保活、旅行、成长任务、活跃上报、搜索 / 抓取、图像、模型目录探测，以及带账号 token 的国际版注册激活 / 补地区链路。无账号的调用（面板 / `cmd/login` 的 OAuth 设备授权）不进这三组配置——那条链路用独立的短超时 client，出口只受进程环境 `HTTP_PROXY` / `HTTPS_PROXY` 影响（Go 默认 Transport 的行为）；上游出站 transport 不设 `Proxy`，只认上面这套槽与全局池，不读环境变量。
+**覆盖范围**：账号作用域内的全部出站请求——对话、token 刷新、余额/积分包、签到、保活、旅行、成长任务、活跃上报、搜索 / 抓取、图像、模型目录探测，以及带账号 token 的国际版注册激活 / 补地区链路。
+
+**加号登录**（面板「添加账号」与 `cmd/login` 的 OAuth 设备授权）不持账号，因此按 `features.login_bind_proxy`（默认 `true`，热生效）挑一条**启用且健康**的槽：候选顺序是 `realm_proxy_slots` 的 realm 默认槽 → 其余启用槽（配置顺序），冷却中的槽跳过。整条 `auth/state` → `auth/token` → `login/account` 固定走同一条槽，落盘后立刻把该槽写成账号的 `proxy_slot`（在注册激活 / 签到 / 余额刷新之前），因此新号注册用的是哪条出口、以后就跑哪条。有启用槽但都不可用时登录直接报错（`502`，不回落直连）；一条启用槽都没有时仍直连，未配代理的部署照旧能加号；关掉开关则一律直连。直连路径走 Go 默认 Transport，仍会读进程环境 `HTTP_PROXY` / `HTTPS_PROXY`；命中槽时用槽自己的拨号器，不读环境变量。
 
 三个字段都**热生效**：面板保存后立即换出口，不需要重启（改动会重建出口注册表并原子替换拨号器，在途请求不受影响）。
 

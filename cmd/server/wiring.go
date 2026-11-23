@@ -374,6 +374,9 @@ func applyStaticLiveFallbacks(conf *server.Config, cfg *Config) {
 	conf.WebFetchEndpoint = cfg.Features.WebFetchEndpoint
 	conf.ImagesEndpoint = cfg.Features.ImagesEndpoint
 	conf.VideosEndpoint = cfg.Features.VideosEndpoint
+	conf.TTSEnabled = cfg.Features.TTSEnabled
+	conf.ASREnabled = cfg.Features.ASREnabled
+	conf.NarrationDisabled = !cfg.Features.NarrationEnabled
 	conf.BackgroundNames = backgroundNameSet(cfg.Models.BackgroundNames)
 	conf.BackgroundTarget = cfg.Models.BackgroundTarget
 	conf.HiddenModels = livecfg.NormalizeHiddenModels(cfg.Models.Hidden)

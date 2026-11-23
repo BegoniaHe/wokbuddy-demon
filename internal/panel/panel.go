@@ -230,6 +230,9 @@ type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
 	base    string // 发起登录命中的 origin（CN 回落时 poll 优先同源）
+	// slot 发起时选定的出口槽（issue #609）：整条 state/token/account 链路固定
+	// 同一条槽；空 = 直连（无槽或开关关闭）。
+	slot string
 
 	// pending 日志去重：同一 state 的上游 code/msg 未变化时不重复打印。
 	pendingLogged bool

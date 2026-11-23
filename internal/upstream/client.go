@@ -776,9 +776,46 @@ func classifyEarly(status int, body string) (ErrKind, bool) {
 		return classifyModelParamInvalid(body), true
 	}
 
+	// 语音端点的两类请求级失败（issue #604）：与账号无关，同一请求换任何号都是同一句，
+	// 落 ErrServer 会让网关轮转全池并给健康号各记一笔连败。
+	if kind, ok := classifySpeechRequestLevel(status, body); ok {
+		return kind, true
+	}
+
 	// 客户端明确的请求级业务码先于账号/限流层：同一 body 换号结果不变。
 	return classifyRequestLevel(body)
 }
+
+// classifySpeechRequestLevel 判定语音端点（TTS / ASR）的请求级失败。
+//
+//   - TTS 音色未配置：上游用 **500 外壳** + code 10000 报
+//     "get voice config failed: voice X not found in Rainbow"（真号实测）。音色表是
+//     全局配置，与账号无关；
+//   - ASR 15053「ASR recognition failed」：指**这段音频**识别不出来（裸 PCM 没有
+//     容器头必现），换号只会重复同一句；15052「failed to parse multipart form /
+//     ensure file size is under 3MB」同属请求体形态问题，换号同样无效。
+func classifySpeechRequestLevel(status int, body string) (ErrKind, bool) {
+	lower := strings.ToLower(body)
+
+	if status >= http.StatusInternalServerError && strings.Contains(lower, speechVoiceMissingMarker) {
+		return ErrBadParams, true
+	}
+
+	if hasBusinessCode(body, asrRecognitionFailedCode) || hasBusinessCode(body, asrFormFailedCode) {
+		return ErrBadParams, true
+	}
+
+	return ErrNone, false
+}
+
+// speechVoiceMissingMarker 上游「音色未配置」错误的文案标记（TTS 专用）。
+const speechVoiceMissingMarker = "get voice config failed"
+
+// asrRecognitionFailedCode ASR 认不出这段音频的业务码（请求级，与账号无关）。
+const asrRecognitionFailedCode = "15053"
+
+// asrFormFailedCode ASR 解不出表单 / 文件超限的业务码（请求体形态问题，非账号问题）。
+const asrFormFailedCode = "15052"
 
 // classifyModelParamInvalid 细分 11133：缺/空 messages → ErrBadParams 请求级
 // fail-fast；图像/GIF → ErrImageInvalid（提示换模型或移除图片）；其余按官方

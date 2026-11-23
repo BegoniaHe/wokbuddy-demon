@@ -152,6 +152,11 @@ type Config struct {
 	WebFetchEndpoint bool // POST /v1/tools/fetch
 	ImagesEndpoint   bool // POST /v1/images/{generations,edits}
 	VideosEndpoint   bool // POST /v1/videos/generations 与 GET /v1/videos/{task_id}
+	TTSEnabled       bool // POST /v1/audio/speech（issue #604，默认关）
+	ASREnabled       bool // POST /v1/audio/transcriptions（issue #604，默认关）
+	// NarrationDisabled 关闭自动续写（features.narration_enabled=false，issue #606）。
+	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
+	NarrationDisabled bool
 	// HiddenModels 模型黑名单（"cn:x"/"global:x" 归一形式）；空 = 关闭。
 	// Live 快照优先，此字段仅作 Live 为 nil 的裸用/测试路径回落。
 	HiddenModels map[string]struct{}
@@ -227,6 +232,9 @@ func (h *Handler) loadLive() livecfg.Snapshot {
 		WebFetchEndpoint:   h.cfg.WebFetchEndpoint,
 		ImagesEndpoint:     h.cfg.ImagesEndpoint,
 		VideosEndpoint:     h.cfg.VideosEndpoint,
+		TTSEnabled:         h.cfg.TTSEnabled,
+		ASREnabled:         h.cfg.ASREnabled,
+		NarrationDisabled:  h.cfg.NarrationDisabled,
 		BackgroundNames:    h.cfg.BackgroundNames,
 		BackgroundTarget:   h.cfg.BackgroundTarget,
 		HiddenModels:       h.cfg.HiddenModels,
@@ -376,26 +384,7 @@ func (*Handler) notFound(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withRecovery(h.withClientAuth(h.chatCompletions)))
 	h.mux.HandleFunc("POST /v1/responses", h.withRecovery(h.withClientAuth(h.responsesHandler)))
-	// 图像端点（issue #253 出图、issue #357 图生图）：默认关闭，开启后独立透传
-	// /v2/images/generations 与 /v2/images/edits（同一套校验/选号/记账）。
-	h.mux.HandleFunc(
-		"POST /v1/images/generations",
-		h.withRecovery(h.withClientAuth(h.imagesEndpointHandler(upstream.ImageGenerationsPath))),
-	)
-	h.mux.HandleFunc(
-		"POST /v1/images/edits",
-		h.withRecovery(h.withClientAuth(h.imagesEndpointHandler(upstream.ImageEditsPath))),
-	)
-	// 视频端点（issue #467）：默认关闭，开启后独立透传 /v2/videos/generations
-	// 提交任务与 /v2/videos/tasks 查询任务（网关不做轮询）。
-	h.mux.HandleFunc(
-		"POST /v1/videos/generations",
-		h.withRecovery(h.withClientAuth(h.videoGenerateHandler)),
-	)
-	h.mux.HandleFunc(
-		"GET /v1/videos/{task_id}",
-		h.withRecovery(h.withClientAuth(h.videoTaskHandler)),
-	)
+	h.registerMediaRoutes()
 	// 官方客户端模型忙预检（issue #273）：只读本地池状态，不产生上游请求。
 	h.mux.HandleFunc("POST /v2/chat/busy", h.withRecovery(h.withClientAuth(h.busyHandler)))
 	// 官方 webfetch 的 DSH 形态出口（issue #276）：默认关闭，/v1/fetch 为同义别名。
@@ -431,6 +420,36 @@ func (h *Handler) registerRoutes() {
 	h.mux.HandleFunc("/debug/pprof/profile", h.withRecovery(h.withOpsAuth(pprof.Profile)))
 	h.mux.HandleFunc("/debug/pprof/symbol", h.withRecovery(h.withOpsAuth(pprof.Symbol)))
 	h.mux.HandleFunc("/debug/pprof/trace", h.withRecovery(h.withOpsAuth(pprof.Trace)))
+}
+
+// registerMediaRoutes 注册非对话的媒体端点：出图 / 图生图（issue #253、#357）、
+// 出视频 / 任务查询（issue #467）、语音合成 / 转写（issue #604）。全部默认关闭
+// （features.*），开启后各自透传对应官方端点。
+func (h *Handler) registerMediaRoutes() {
+	h.mux.HandleFunc(
+		"POST /v1/images/generations",
+		h.withRecovery(h.withClientAuth(h.imagesEndpointHandler(upstream.ImageGenerationsPath))),
+	)
+	h.mux.HandleFunc(
+		"POST /v1/images/edits",
+		h.withRecovery(h.withClientAuth(h.imagesEndpointHandler(upstream.ImageEditsPath))),
+	)
+	h.mux.HandleFunc(
+		"POST /v1/videos/generations",
+		h.withRecovery(h.withClientAuth(h.videoGenerateHandler)),
+	)
+	h.mux.HandleFunc(
+		"GET /v1/videos/{task_id}",
+		h.withRecovery(h.withClientAuth(h.videoTaskHandler)),
+	)
+	h.mux.HandleFunc(
+		"POST /v1/audio/speech",
+		h.withRecovery(h.withClientAuth(h.audioSpeechHandler)),
+	)
+	h.mux.HandleFunc(
+		"POST /v1/audio/transcriptions",
+		h.withRecovery(h.withClientAuth(h.audioTranscriptionsHandler)),
+	)
 }
 
 // responsesWebsocketUnsupported 明确告知客户端 WS transport 不可用，回 426。
@@ -3112,7 +3131,7 @@ func (*Handler) tracedPath(r *http.Request) bool {
 	switch r.URL.Path {
 	case "/v1/chat/completions", "/v1/messages", "/messages",
 		"/v1/responses", "/v1/search/messages", "/v1/images/generations", "/v1/images/edits",
-		"/v1/videos/generations",
+		"/v1/videos/generations", "/v1/audio/speech", "/v1/audio/transcriptions",
 		"/v1/tools/fetch", "/v1/fetch", "/v1/tools/search":
 		return true
 	}
@@ -3728,11 +3747,20 @@ func (f *chatFlow) handlePreStreamEmpty(
 	return rotContinue
 }
 
+// errNarrationDisabled features.narration_enabled=false 时的续写拒绝（issue #606）：
+// 调用方按「本次不续写」处理，不当作上游失败。
+var errNarrationDisabled = errors.New("narration disabled by features.narration_enabled")
+
 // continueUpstream 发起截断续写请求：复用 ChatStreamContext → prepareBody 管线，
 // 同账号同模型，不手拼 raw body（脱敏/thinking/缓存键仍生效）。
 func (f *chatFlow) continueUpstream(
 	ctx context.Context, acct *auth.Auth, partial string, kind upstream.TailKind,
 ) (io.ReadCloser, error) {
+	// 总闸门（issue #606）：流式与非流式两条救援路径都以本函数为唯一出站口。
+	if f.h.loadLive().NarrationDisabled {
+		return nil, errNarrationDisabled
+	}
+
 	body := upstream.BuildContinuationBody(f.body, partial, kind)
 
 	next, status, respBody, err := f.h.cfg.Upstream.ChatStreamContext(ctx, acct, body, f.clientIP, f.chatMeta)

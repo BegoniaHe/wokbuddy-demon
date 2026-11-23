@@ -13,6 +13,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -77,6 +78,10 @@ func (h *Handler) serveVideoGenerate(w http.ResponseWriter, r *http.Request) {
 		// 与出图同一份改写逻辑（logging.go rewriteModel）：只换 model，其余字段原样。
 		body = rewriteModel(body, bareModel)
 	}
+
+	// 参考素材形状归一（issue #617）：官方 VideoService 出站前把字符串条目包成
+	// {image_url|video_url|audio_url}，上游对字符串数组直接 400。
+	body = normalizeVideoReferences(body)
 
 	h.forwardVideo(w, r, acct, body, realm, bareModel, h.cfg.Upstream.GenerateVideo, false)
 }
@@ -243,7 +248,18 @@ func (h *Handler) forwardVideo(
 
 	h.recordMediaAttempt(acct, realm, bareModel, final, r)
 
-	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "video") {
+	// 提交阶段的请求级 4xx 透传上游原文，不喂连败/熔断（issue #618）：视频提交是
+	// 单次尝试、不换号，参数越界一类的 4xx 是请求问题而非账号问题。账号级分类
+	// （401/402/403/404/429 等）走下面的既有处置。查询端点保持现状。
+	if !isTaskQuery && videoSubmitRequestStatus(final) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(final.status)
+		_, _ = w.Write(final.raw)
+
+		return
+	}
+
+	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "video", false) {
 		return
 	}
 
@@ -260,6 +276,142 @@ func (h *Handler) forwardVideo(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(final.status)
 	_, _ = w.Write(final.raw)
+}
+
+// videoReferenceFields 三个参考素材字段与其对象内层键。官方
+// `VideoService.buildConfiguredRequest` 逐字使用这三个映射。
+var videoReferenceFields = []struct{ field, key string }{
+	{"reference_images", "image_url"},
+	{"reference_videos", "video_url"},
+	{"reference_audios", "audio_url"},
+}
+
+// normalizeVideoReferences 把 reference_images / reference_videos / reference_audios
+// 归一为上游要求的对象数组（issue #617）。
+//
+// 官方客户端在提交前做同一层包装：字符串条目补成 {<key>: url}；已是对象时优先取
+// <key>、退一步取 url；两者都取不到的条目丢弃（宁可少一条素材，也不要因一个字段
+// 形状不符让整单 400）。空数组按官方 `length &&` 口径视为不设置该字段；客户端把
+// 单条素材直接写成字符串或对象时按一条素材归一，不整段丢弃。
+func normalizeVideoReferences(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	obj, err := jsonx.DecodeObject(body)
+	if err != nil {
+		return body
+	}
+
+	changed := false
+
+	for _, ref := range videoReferenceFields {
+		if normalizeVideoField(obj, ref.field, ref.key) {
+			changed = true
+		}
+	}
+
+	if !changed {
+		return body
+	}
+
+	out, err := jsonx.Marshal(obj)
+	if err != nil {
+		return body
+	}
+
+	return out
+}
+
+// normalizeVideoField 归一单个参考素材字段，返回该字段是否存在。
+func normalizeVideoField(obj map[string]any, field, key string) bool {
+	raw, ok := obj[field]
+	if !ok {
+		return false
+	}
+
+	items := videoReferenceItems(raw)
+	normalized := make([]any, 0, len(items))
+
+	for _, item := range items {
+		if entry, ok := normalizeVideoReferenceEntry(item, key); ok {
+			normalized = append(normalized, entry)
+		}
+	}
+
+	if len(normalized) == 0 {
+		delete(obj, field)
+	} else {
+		obj[field] = normalized
+	}
+
+	return true
+}
+
+// videoReferenceItems 把字段值当素材列表读：单个字符串或对象按一条素材处理。
+//
+// 非数组形态（`reference_images:"https://…"`、单个对象）在官方客户端不会出现，
+// 但客户端写错时直接删掉整段字段等于「静默少素材」——出一个没有参考素材的视频
+// 并照常计费。按单条素材归一与「字符串条目自动包装」是同一层宽容。null 与其它
+// 类型仍视为未设置。
+func videoReferenceItems(raw any) []any {
+	switch typed := raw.(type) {
+	case []any:
+		return typed
+	case string, map[string]any:
+		return []any{typed}
+	default:
+		return nil
+	}
+}
+
+// normalizeVideoReferenceEntry 归一单条参考素材；取不到 URL 时丢弃。
+func normalizeVideoReferenceEntry(item any, key string) (map[string]any, bool) {
+	switch typed := item.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil, false
+		}
+
+		return map[string]any{key: typed}, true
+	case map[string]any:
+		for _, candidate := range []string{key, "url"} {
+			if url := stringValue(typed[candidate]); url != "" {
+				return map[string]any{key: url}, true
+			}
+		}
+	}
+
+	return nil, false
+}
+
+// videoSubmitRequestStatus 报告提交阶段的失败是否属于请求级 4xx（issue #618）。
+//
+// 判据是 upstream 的错误分类白名单而不是状态码：402（余额耗尽）、404（上游偶发）、
+// 11136（账号缺该模型权限）、14017（授权/试用故障）都落在 4xx 窗口里，按状态码
+// 分流会把账号级信号一起吞掉——余额为 0 的账号会持续被视频选号命中并反复 402，
+// 缺权限账号不被 (账号,模型) 负缓存避让。白名单方向也保证新增错误分类默认走既有
+// 账号级处置，而不是默认透传。
+func videoSubmitRequestStatus(final mediaAttempt) bool {
+	if final.status < http.StatusBadRequest || final.status >= http.StatusInternalServerError {
+		return false
+	}
+
+	var uerr *upstream.Error
+	if !errors.As(final.err, &uerr) {
+		return false
+	}
+
+	switch uerr.Kind {
+	case upstream.ErrClient, upstream.ErrBadParams, upstream.ErrContentBlocked,
+		upstream.ErrModelNotFound, upstream.ErrPromptTooLong, upstream.ErrImageInvalid,
+		upstream.ErrChannelRefused:
+		// 参数 / 内容 / 能力 / 通道约束：换账号结果一样，属请求问题。
+		return true
+	default:
+		// 账号级分类（余额、授权、权限、限流、会话、上游故障…）交给 handleMediaFailure。
+		return false
+	}
 }
 
 // videoTaskFailed 报告任务终态是否为 failed；其余状态（排队 / 运行中 / completed）

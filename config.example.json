@@ -129,11 +129,15 @@
     "multimodal_routing": false,
     "local_web_tools": false,
     "local_web_tool_rounds": 3,
+    "login_bind_proxy": true,
     "search_endpoint": false,
     "search_deep": false,
     "web_fetch_endpoint": false,
     "images_endpoint": false,
     "videos_endpoint": false,
+    "tts_enabled": false,
+    "asr_enabled": false,
+    "narration_enabled": true,
     "conversation_request_body": false
   },
   "prompt": {

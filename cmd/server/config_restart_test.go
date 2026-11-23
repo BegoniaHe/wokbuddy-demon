@@ -13,6 +13,9 @@ func TestRestartRequiredFieldsHotChangeEmpty(t *testing.T) {
 	newCfg.Pool.CreditFloor = 100
 
 	newCfg.Schedule.CheckinHours = []int{1, 2}
+	// features.login_bind_proxy 走 livecfg 快照（issue #609），改开关不需要重启。
+	newCfg.Features.LoginBindProxy = false
+
 	if got := restartRequiredFields(oldCfg, newCfg); len(got) != 0 {
 		t.Fatalf("hot-only changes reported restart: %v", got)
 	}

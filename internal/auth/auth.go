@@ -82,6 +82,11 @@ type Auth struct {
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
 
+	// ProxySlot 注册出口绑定（出站代理槽 ID，issue #609）。账号文件是 CLI 登录
+	// 唯一的落盘载体（`cmd/login` 没有账号池），所以「用哪条出口注册的」记在这里；
+	// 池在首次见到该账号时把它作为初始绑定，state.json 里的既有绑定优先。
+	ProxySlot string
+
 	// retired 标记该凭证已从账号池删除：SaveAtomic 在此后拒绝写回，防止
 	// 删除时仍在途的 token refresh 把 auth 文件重新创建出来。
 	retired bool
@@ -612,6 +617,7 @@ func parseNestedAuth(raw []byte) (Auth, error) {
 		IDSource:           looseString(accountDoc["idSource"]),
 		DepartmentFullName: looseString(accountDoc["departmentFullName"]),
 		Nickname:           looseString(accountDoc["nickname"]),
+		ProxySlot:          looseString(accountDoc["proxy_slot"]),
 		DeviceToken:        looseString(doc["device_token"]),
 	}, nil
 }
@@ -645,6 +651,7 @@ func parseFlatAuth(raw []byte) (Auth, error) {
 		IDSource:           looseString(item["idSource"]),
 		DepartmentFullName: looseString(item["departmentFullName"]),
 		Nickname:           looseString(item["nickname"]),
+		ProxySlot:          looseString(item["proxy_slot"]),
 		DeviceToken:        looseString(item["device_token"]),
 	}, nil
 }
@@ -928,6 +935,10 @@ func (a *Auth) saveDocLocked() map[string]any {
 		if value != "" {
 			accountDoc[key] = value
 		}
+	}
+	// proxy_slot 只在绑定时写：空串表示未绑定，写空键会让面板显示「已绑空槽」。
+	if slot := strings.TrimSpace(a.ProxySlot); slot != "" {
+		accountDoc["proxy_slot"] = slot
 	}
 
 	doc := map[string]any{

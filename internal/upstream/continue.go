@@ -1311,11 +1311,17 @@ func recomputeMergedUsageTotal(usageMap map[string]any) {
 
 // BuildContinuationBody 在原始请求体后追加 assistant 部分正文与续写指令。
 // 返回的新 body 仍交给 ChatStreamContext（经 prepareBody 脱敏/思考/缓存键管线）。
+// gatewayContinuationPrefix 标出「网关自动续写」来源（issue #606）：agent 类客户端
+// 会把 role=user 的消息读成用户授权，前缀让这条注入不再伪装成用户原话。挡不住模型
+// 执行，只改变来源自述。
+const gatewayContinuationPrefix = "【wb2api 网关自动续写·非用户消息】\n\n"
+
 // continuationInstruction 截断续写时追加的合成 user 指令。历史裁剪按「user 消息
 // 算一轮」计数，这条合成消息不算客户端的一轮（见 history.go 的 trimHistory），
 // 否则 prompt.history_keep_turns=1 时会把它顶成唯一一轮、连被续写的 partial
 // 正文一起裁掉。
-const continuationInstruction = "Continue the previous response from exactly where it stopped. " +
+const continuationInstruction = gatewayContinuationPrefix +
+	"Continue the previous response from exactly where it stopped. " +
 	"Do not repeat any text already produced. Do not add commentary."
 
 // completionExit 两条救援指令共用的完成出口（issue #589）：判据误触发时模型只需要零
@@ -1325,14 +1331,14 @@ const completionExit = "如果这部分其实已经写完，就不要输出任�
 
 // narrationNudge 尾部停在标点型悬停（冒号/逗号/未闭合代码块）时的续写指令。
 // 必须点明「你停在预告上」：否则模型会以为任务已完成而重复一遍结论。
-const narrationNudge = "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，" +
+const narrationNudge = gatewayContinuationPrefix + "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，" +
 	"剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，" +
 	"不要重复已经写过的内容，不要重新开头，不要道歉或解释。\n\n" + completionExit
 
 // narrationPromiseNudge 尾部是「我将…/我会…」这类承诺句时的续写指令。
 // 不能复用 narrationNudge：那条说「停在冒号上」，承诺句既没有冒号也不是预告排版，
 // 模型会反过来争辩「上一条并未中断」，争论也会一并写进客户端正文。
-const narrationPromiseNudge = "你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，" +
+const narrationPromiseNudge = gatewayContinuationPrefix + "你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，" +
 	"承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，" +
 	"不要解释为什么停下，不要重复已经写过的内容，不要重新开头。\n\n" + completionExit
 

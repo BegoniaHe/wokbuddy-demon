@@ -415,11 +415,26 @@ type Config struct {
 		// GET /v1/videos/{task_id}（查询任务，issue #467）。
 		// 默认 false：视频端点同样未在真实账号验证鉴权/计费。
 		VideosEndpoint bool `json:"videos_endpoint"`
+		// TTSEnabled 是否开放 POST /v1/audio/speech（上游 /v2/audio/speech，issue #604）。
+		// 默认 false：语音端点未在真实账号验证计费，与其它新增出站面同口径。
+		TTSEnabled bool `json:"tts_enabled"`
+		// ASREnabled 是否开放 POST /v1/audio/transcriptions（上游 /agenttool/v1/asr，
+		// issue #604）。与 tts_enabled 分开：两个端点的失败形态与上游限额不同。
+		ASREnabled bool `json:"asr_enabled"`
+		// NarrationEnabled 是否允许截断续写（救援）自动补发（issue #606）。默认 true；
+		// 关闭后一次续写请求都不发出。热生效，livecfg 按取反存储。
+		NarrationEnabled bool `json:"narration_enabled"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`
 		// LocalWebToolRounds 本地工具最多代跑轮数；<=0 回落 3，>8 钳到 8。
 		LocalWebToolRounds int `json:"local_web_tool_rounds"`
+		// LoginBindProxy 加号登录链路是否按出口槽出站（issue #609，默认 true）。
+		// 开启后 auth/state → auth/token → login/account 整条链路固定走同一条启用且
+		// 健康的槽，并在落盘后把该槽写成账号 proxy_slot；有启用槽但都不可用时明确
+		// 报错（不回落直连）。一条启用槽都没有时仍直连。热生效。
+		// 只放行单一站点线路的部署可能需要关掉——关掉即完全直连。
+		LoginBindProxy bool `json:"login_bind_proxy"`
 		// ConversationRequestBody 在当前轮最后一条 user 消息写
 		// conversationRequestId / startsNewUserRequest（issue #249）。默认 false：
 		// 官方桌面端形态，先用真实账号小流量 A/B 确认上游接受后再开启。
@@ -703,7 +718,10 @@ func applyUpstreamDefaults(config7 *Config) {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	config7.Global.Enabled = true
 	config7.Features.SanitizeBlacklistFingerprints = true
+	config7.Features.NarrationEnabled = true
 	config7.Features.LocalWebToolRounds = 3
+	// 加号登录默认走已配置的出口槽（issue #609）：显式 false 才直连。
+	config7.Features.LoginBindProxy = true
 	config7.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 }
 
