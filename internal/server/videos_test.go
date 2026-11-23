@@ -314,7 +314,152 @@ func TestVideoTaskModelQuerySelectsRealm(t *testing.T) {
 	}
 }
 
-// TestModelsListShowsVideoCapability 视频生成模型在 /v1/models 以 capabilities
+// TestVideoGenerateNormalizesReferenceShapes 参考素材按官方口径归一为对象数组
+// （issue #617）：字符串补成 {<key>: url}，对象取 <key> 再退 url，取不到的丢弃。
+func TestVideoGenerateNormalizesReferenceShapes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		in    string
+		field string
+		want  string // 期望字段的 JSON 字面量；空串表示字段应缺失
+	}{
+		{
+			name:  "strings",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_images":["https://img.example/a.png","https://img.example/b.png"]}`,
+			field: "reference_images",
+			want:  `[{"image_url":"https://img.example/a.png"},{"image_url":"https://img.example/b.png"}]`,
+		},
+		{
+			name:  "objects",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_images":[{"image_url":"https://img.example/a.png"}]}`,
+			field: "reference_images",
+			want:  `[{"image_url":"https://img.example/a.png"}]`,
+		},
+		{
+			name:  "mixed_with_url_fallback",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_videos":["https://v.example/a.mp4",{"url":"https://v.example/b.mp4"},{"video_url":"https://v.example/c.mp4"}]}`,
+			field: "reference_videos",
+			want:  `[{"video_url":"https://v.example/a.mp4"},{"video_url":"https://v.example/b.mp4"},{"video_url":"https://v.example/c.mp4"}]`,
+		},
+		{
+			name:  "unusable_entries_dropped",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_audios":["",{"name":"x"},{"audio_url":"https://a.example/a.mp3"}]}`,
+			field: "reference_audios",
+			want:  `[{"audio_url":"https://a.example/a.mp3"}]`,
+		},
+		{
+			name:  "all_unusable_field_removed",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_images":[{},{"url":""},""]}`,
+			field: "reference_images",
+			want:  "",
+		},
+		{
+			name:  "empty_array_removed",
+			in:    `{"model":"seedance-2.5","prompt":"cat","reference_images":[]}`,
+			field: "reference_images",
+			want:  "",
+		},
+		{
+			name:  "absent_field_stays_absent",
+			in:    `{"model":"seedance-2.5","prompt":"cat"}`,
+			field: "reference_images",
+			want:  "",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			var gotBody []byte
+
+			client := &upstream.Client{
+				HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					gotBody, _ = io.ReadAll(r.Body)
+
+					return jsonResponse(http.StatusOK, `{"code":0,"data":{"id":"task-1"}}`), nil
+				})},
+				ChatBaseCN:    "https://fake.example",
+				BillingBaseCN: "https://fake.example",
+			}
+
+			handler := NewHandler(&Config{
+				Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+				Upstream: client,
+				Live:     livecfg.New(livecfg.Snapshot{VideosEndpoint: true}),
+			})
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/videos/generations",
+				strings.NewReader(testCase.in)))
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+
+			var out map[string]any
+			if err := jsonx.Unmarshal(gotBody, &out); err != nil {
+				t.Fatalf("decode outbound body: %v (%s)", err, gotBody)
+			}
+
+			got, present := out[testCase.field]
+			if testCase.want == "" {
+				if present {
+					t.Fatalf("%s must be absent, got %v", testCase.field, got)
+				}
+
+				return
+			}
+
+			encoded, err := jsonx.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if string(encoded) != testCase.want {
+				t.Fatalf("%s=%s want %s", testCase.field, encoded, testCase.want)
+			}
+		})
+	}
+}
+
+// TestVideoTaskIgnoresReferenceShape 查询端点不参与参考素材归一（issue #617
+// 范围外）：body 由网关内部构造，用户传入的 reference_* 不会被改写。
+func TestVideoTaskIgnoresReferenceShape(t *testing.T) {
+	t.Parallel()
+
+	var gotBody []byte
+
+	client := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			gotBody, _ = io.ReadAll(r.Body)
+
+			return jsonResponse(http.StatusOK, `{"code":0,"data":{"status":"running"}}`), nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+
+	handler := NewHandler(&Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: client,
+		Live:     livecfg.New(livecfg.Snapshot{VideosEndpoint: true}),
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/videos/task-1", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+
+	if string(gotBody) != `{"task_id":"task-1"}` {
+		t.Fatalf("body=%s", gotBody)
+	}
+}
+
 // 标记可见（issue #467），同时不进入 chat 可见集合：别名仍按隐藏处理。
 func TestModelsListShowsVideoCapability(t *testing.T) {
 	t.Parallel()
