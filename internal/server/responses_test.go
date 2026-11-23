@@ -1126,8 +1126,9 @@ func TestResponsesRequestSkipsHostedToolItems(t *testing.T) {
 	}
 
 	msgs, _ := got["messages"].([]any)
-	if len(msgs) != 6 {
-		t.Fatalf("messages=%d want 6（托管回执应被跳过）: %v", len(msgs), msgs)
+	// 相邻的两个 function_call 按官方 wire 形态并成一条 assistant（issue #619）。
+	if len(msgs) != 5 {
+		t.Fatalf("messages=%d want 5（托管回执跳过 + 并行调用合并）: %v", len(msgs), msgs)
 	}
 
 	assertNoEmptyUserMessages(t, msgs)
@@ -1160,14 +1161,149 @@ func assertNoEmptyUserMessages(t *testing.T, msgs []any) {
 func assertParallelToolImagesMerged(t *testing.T, msgs []any) {
 	t.Helper()
 
-	if msgs[3].(map[string]any)["role"] != "tool" || msgs[4].(map[string]any)["role"] != "tool" {
+	// 末尾固定是「两条 tool 结果 + 一条合并后的图片 user 消息」；前面的 assistant
+	// 批次数量随同轮合并（issue #619）变化，不按绝对下标断言。
+	total := len(msgs)
+	if total < 5 {
 		t.Fatalf("并行结果被打断: %v", msgs)
 	}
 
-	parts, _ := msgs[5].(map[string]any)["content"].([]any)
-	if len(parts) != 2 {
-		t.Errorf("图片应合并为一条消息: %v", msgs[5])
+	if msgs[total-3].(map[string]any)["role"] != "tool" || msgs[total-2].(map[string]any)["role"] != "tool" {
+		t.Fatalf("并行结果被打断: %v", msgs)
 	}
+
+	parts, _ := msgs[total-1].(map[string]any)["content"].([]any)
+	if len(parts) != 2 {
+		t.Errorf("图片应合并为一条消息: %v", msgs[total-1])
+	}
+}
+
+// TestResponsesSameTurnAssistantTextMergedWithToolCalls 同轮 assistant 正文与紧随
+// 的并行 function_call 并成一条 {content, tool_calls}（issue #619，官方 wire 形态）；
+// 前置 reasoning 仍挂到这条合并消息上。
+func TestResponsesSameTurnAssistantTextMergedWithToolCalls(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"m","input":[
+		{"type":"message","role":"user","content":"go"},
+		{"type":"reasoning","summary":[{"type":"summary_text","text":"plan"}]},
+		{"type":"message","role":"assistant","phase":"commentary","content":"running tests"},
+		{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"},
+		{"type":"function_call","call_id":"c2","name":"shell","arguments":"{}"},
+		{"type":"function_call_output","call_id":"c1","output":"ok1"},
+		{"type":"function_call_output","call_id":"c2","output":"ok2"}
+	]}`
+
+	msgs := responsesMessagesForTest(t, body)
+	if len(msgs) != 4 {
+		t.Fatalf("messages=%d want 4: %v", len(msgs), msgs)
+	}
+
+	assistant := msgs[1].(map[string]any)
+	if assistant["content"] != "running tests" {
+		t.Errorf("content=%v want running tests", assistant["content"])
+	}
+
+	if assistant["reasoning_content"] != "plan" {
+		t.Errorf("reasoning_content=%v want plan", assistant["reasoning_content"])
+	}
+
+	calls, _ := assistant["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("tool_calls=%v want 2", assistant["tool_calls"])
+	}
+
+	for index, want := range []string{"c1", "c2"} {
+		if got := calls[index].(map[string]any)["id"]; got != want {
+			t.Errorf("tool_calls[%d].id=%v want %s", index, got, want)
+		}
+	}
+
+	if msgs[2].(map[string]any)["role"] != "tool" || msgs[3].(map[string]any)["role"] != "tool" {
+		t.Errorf("工具结果必须紧跟合并后的 assistant: %v", msgs)
+	}
+}
+
+// TestResponsesFinalAnswerDoesNotMergeToolCalls final_answer 正文是该轮终结，
+// 后续 function_call 不并入（issue #619）。
+func TestResponsesFinalAnswerDoesNotMergeToolCalls(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"m","input":[
+		{"type":"message","role":"user","content":"go"},
+		{"type":"message","role":"assistant","phase":"final_answer","content":"done"},
+		{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}
+	]}`
+
+	msgs := responsesMessagesForTest(t, body)
+	if len(msgs) != 3 {
+		t.Fatalf("messages=%d want 3: %v", len(msgs), msgs)
+	}
+
+	answer := msgs[1].(map[string]any)
+	if answer["content"] != "done" {
+		t.Errorf("content=%v want done", answer["content"])
+	}
+
+	if _, has := answer["tool_calls"]; has {
+		t.Errorf("final_answer 不得并入 tool_calls: %v", answer)
+	}
+
+	call := msgs[2].(map[string]any)
+	if calls, _ := call["tool_calls"].([]any); len(calls) != 1 {
+		t.Errorf("后续调用应独立成条: %v", call)
+	}
+}
+
+// TestResponsesSameTurnBoundaryStopsMerge user / tool 边界之后的 function_call
+// 不与上一轮正文合并（issue #619）。
+func TestResponsesSameTurnBoundaryStopsMerge(t *testing.T) {
+	t.Parallel()
+
+	body := `{"model":"m","input":[
+		{"type":"message","role":"assistant","phase":"commentary","content":"part"},
+		{"type":"message","role":"user","content":"next"},
+		{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}
+	]}`
+
+	msgs := responsesMessagesForTest(t, body)
+	if len(msgs) != 3 {
+		t.Fatalf("messages=%d want 3: %v", len(msgs), msgs)
+	}
+
+	if msgs[0].(map[string]any)["content"] != "part" {
+		t.Errorf("user 边界前正文必须独立成条: %v", msgs[0])
+	}
+
+	if _, has := msgs[0].(map[string]any)["tool_calls"]; has {
+		t.Errorf("跨 user 边界不得合并: %v", msgs[0])
+	}
+
+	if calls, _ := msgs[2].(map[string]any)["tool_calls"].([]any); len(calls) != 1 {
+		t.Errorf("边界后的调用应独立成条: %v", msgs[2])
+	}
+}
+
+// responsesMessagesForTest 把 Responses 请求体转成 messages 并断言无错误。
+func responsesMessagesForTest(t *testing.T, body string) []any {
+	t.Helper()
+
+	raw, _, _, _, err := responsesToOpenAI([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := jsonx.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, ok := got["messages"].([]any)
+	if !ok {
+		t.Fatalf("messages missing: %s", raw)
+	}
+
+	return msgs
 }
 
 // TestResponsesRequestCompaction compaction 只接受能解出 {"summary":...} 的摘要：
@@ -1592,5 +1728,66 @@ func TestResponsesEarlyToolOutputReordered(t *testing.T) {
 
 	if !strings.Contains(seen[0], `"tool_calls"`) {
 		t.Errorf("出站 body 丢失 tool_calls: %s", seen[0])
+	}
+}
+
+// TestResponsesCompactionAndToolBoundariesStopMerge compaction 项与工具结果同样是
+// 边界：assistant 正文之后的 function_call 不跨越它们合并（issue #619 验收第二条
+// 点名 compaction / user / tool 三者，此前只有 user 边界有用例）。
+func TestResponsesCompactionAndToolBoundariesStopMerge(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ name, body string }{
+		{
+			name: "compaction",
+			body: `{"model":"m","input":[
+				{"type":"message","role":"user","content":"go"},
+				{"type":"message","role":"assistant","phase":"commentary","content":"part"},
+				{"type":"compaction","encrypted_content":"earlier summary"},
+				{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}
+			]}`,
+		},
+		{
+			name: "tool_output",
+			body: `{"model":"m","input":[
+				{"type":"message","role":"user","content":"go"},
+				{"type":"message","role":"assistant","phase":"commentary","content":"part"},
+				{"type":"function_call_output","call_id":"c0","output":"ok"},
+				{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}
+			]}`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			msgs := responsesMessagesForTest(t, testCase.body)
+
+			var text map[string]any
+
+			for _, msg := range msgs {
+				if item, ok := msg.(map[string]any); ok && item["content"] == "part" {
+					text = item
+				}
+			}
+
+			if text == nil {
+				t.Fatalf("正文必须独立成条: %v", msgs)
+			}
+
+			if _, has := text["tool_calls"]; has {
+				t.Fatalf("跨 %s 边界不得合并: %v", testCase.name, text)
+			}
+
+			last, ok := msgs[len(msgs)-1].(map[string]any)
+			if !ok {
+				t.Fatalf("末条形态异常: %v", msgs)
+			}
+
+			if calls, _ := last["tool_calls"].([]any); len(calls) != 1 {
+				t.Fatalf("边界后的调用应独立成条: %v", last)
+			}
+		})
 	}
 }
