@@ -214,7 +214,7 @@ type loginEgress struct {
 // 部署不能因此加不了号）；有启用槽但都不可用 → 报错（fail-closed，绝不静默直连）。
 // features.login_bind_proxy 关闭时一律直连。
 func (p *Panel) loginEgressFor(realm string) (loginEgress, error) {
-	if !p.cfg.Live.Load().LoginBindProxy {
+	if !p.loginBindProxy() {
 		return loginEgress{}, nil
 	}
 
@@ -239,6 +239,18 @@ func (p *Panel) loginEgressForSlot(slot string) (loginEgress, error) {
 
 	return loginEgress{}, fmt.Errorf("%w: 代理槽 %q 已不可用（本次登录中止，不回落直连）",
 		outbound.ErrProxyDial, slot)
+}
+
+// loginBindProxy 读取 features.login_bind_proxy（默认 true）。
+//
+// Live 快照缺失时按「开启」处理而不是按零值（false）处理：零值会让配了代理槽的
+// 部署静默直连，把宿主机 IP 交出去，而这正是这条链路要避免的形态。
+func (p *Panel) loginBindProxy() bool {
+	if p == nil || p.cfg.Live == nil {
+		return true
+	}
+
+	return p.cfg.Live.Load().LoginBindProxy
 }
 
 // loginRegistry 返回当前生效的出站注册表（nil = 未装配，等价直连）。
@@ -725,6 +737,14 @@ func writeLoginPollError(w http.ResponseWriter, err error) {
 		return
 	}
 
+	// 出口不可用不是「等用户完成登录」：返回非 200 让前端停下并展示真实原因，
+	// 与 loginEgressForSlot 的 502 同口径（否则前端会每 3s 打一条死代理到 TTL）。
+	if errors.Is(err, outbound.ErrProxyDial) || errors.Is(err, outbound.ErrNoHealthySlot) {
+		writeErr(w, http.StatusBadGateway, err.Error())
+
+		return
+	}
+
 	// 许可终态返回非 200 + 上游 msg，前端停止轮询并展示真实原因。
 	if codeErr, ok := errors.AsType[*logincode.Error](err); ok && logincode.IsTerminal(codeErr.Code) {
 		msg := codeErr.Msg
@@ -914,8 +934,12 @@ func (p *Panel) persistLoginAuth(
 	// 注册出口固定绑定：登录用哪条槽注册的，账号就绑哪条，事后可回答「这个号是
 	// 哪条出口注册的」（issue #609）。必须在 postLoginTasks 之前，否则注册后的第一
 	// 批出站（激活/签到/余额）会换成另一条线路。
-	if slot != "" && !p.cfg.Pool.SetProxySlot(acct.UID, slot) {
-		log.Printf("WARN: [panel] 登录出口绑定失败：账号 %s 不在池中（槽 %s）", acct.UID, slot)
+	//
+	// 已有绑定不动：同一个账号重新登录不该顺手改掉运维手工设好的出口。
+	if slot != "" && p.cfg.Pool.ProxySlotOf(acct.UID) == "" {
+		if !p.cfg.Pool.SetProxySlot(acct.UID, slot) {
+			log.Printf("WARN: [panel] 登录出口绑定失败：账号 %s 不在池中（槽 %s）", acct.UID, slot)
+		}
 	}
 
 	return account, 0, ""

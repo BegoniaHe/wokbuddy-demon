@@ -3,6 +3,7 @@ package panel
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -506,4 +507,66 @@ func redirectLoginBases(t *testing.T, base string) {
 	t.Cleanup(func() {
 		upstreamBaseCN, upstreamBaseGlobal, cnLoginFallbackBases = oldCN, oldGlobal, oldFallback
 	})
+}
+
+// TestLoginKeepsExistingProxySlotBinding 重新登录不覆盖人工绑定：只有账号尚无绑定
+// 时才把本次出口写成 proxy_slot（issue #609 审查）。
+//
+//nolint:paralleltest // 串行替换包级登录基址
+func TestLoginKeepsExistingProxySlotBinding(t *testing.T) {
+	loginSrv, _ := newFakeLoginUpstream(t)
+	billingSrv, _ := newFakeBillingUpstream(t)
+
+	loginTarget := deadLoopbackAddr(t)
+	proxy := newFakeTunnelProxy(t, map[string]string{
+		loginTarget:               listenersAddr(loginSrv),
+		listenersAddr(billingSrv): listenersAddr(billingSrv),
+	})
+	redirectLoginBases(t, "http://"+loginTarget)
+
+	panel, state, _ := newEgressPanel(t, proxy.addr, livecfg.Snapshot{LoginBindProxy: true}, billingSrv.URL)
+
+	panel.pollLogin(t, panel.startLogin(t))
+
+	const uid = "u-proxy"
+	if got := state.ProxySlotOf(uid); got != "egress" {
+		t.Fatalf("首次登录应绑定本次出口: proxy_slot=%q", got)
+	}
+
+	if !state.SetProxySlot(uid, "manual") {
+		t.Fatal("预置人工绑定失败（账号不在池中）")
+	}
+
+	panel.pollLogin(t, panel.startLogin(t))
+
+	if got := state.ProxySlotOf(uid); got != "manual" {
+		t.Fatalf("重新登录不得覆盖人工绑定: proxy_slot=%q", got)
+	}
+}
+
+// TestLoginBindProxyDefaultsOnWithoutLive 未装配 Live 快照时按「开启」理解，不能按
+// 零值直连——那正是配了代理槽却把宿主机 IP 交出去的形态。
+func TestLoginBindProxyDefaultsOnWithoutLive(t *testing.T) {
+	t.Parallel()
+
+	var nilPanel *Panel
+	if !nilPanel.loginBindProxy() {
+		t.Fatal("nil Panel 必须视为开启")
+	}
+
+	if !(&Panel{}).loginBindProxy() {
+		t.Fatal("缺失 Live 快照必须视为开启")
+	}
+}
+
+// TestLoginPollProxyFailureIs502 出口故障是部署错误，不能按 pending 让前端空转到 TTL。
+func TestLoginPollProxyFailureIs502(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	writeLoginPollError(rec, fmt.Errorf("doJSON: %w", outbound.ErrProxyDial))
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d want 502", rec.Code)
+	}
 }
