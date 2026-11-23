@@ -135,6 +135,8 @@
     "web_fetch_endpoint": false,
     "images_endpoint": false,
     "videos_endpoint": false,
+    "tts_enabled": false,
+    "asr_enabled": false,
     "conversation_request_body": false
   },
   "prompt": {

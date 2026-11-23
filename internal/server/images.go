@@ -272,7 +272,7 @@ func (h *Handler) forwardImages(
 
 	h.recordMediaAttempt(acct, realm, bareModel, final, r)
 
-	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "image") {
+	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "image", false) {
 		return
 	}
 
@@ -285,10 +285,14 @@ func (h *Handler) forwardImages(
 	_, _ = w.Write(final.raw)
 }
 
-// handleMediaFailure 记账后的错误处置（出图 / 出视频共用）；返回 true 表示已写出
-// 响应。refreshFail 非空且非凭证失效时只喂熔断计数，不累计 session dead。
+// handleMediaFailure 记账后的错误处置（出图 / 出视频 / 语音共用）；返回 true 表示
+// 已写出响应。refreshFail 非空且非凭证失效时只喂熔断计数，不累计 session dead。
+//
+// preserveStatus 为 true 时请求级失败透传上游状态码（语音端点要求 500 原样透出，
+// 见 issue #604）；媒体端点保持既有的「请求级一律 400」口径。
 func (h *Handler) handleMediaFailure(
 	w http.ResponseWriter, acct *auth.Auth, bareModel string, final mediaAttempt, refreshFail error, noun string,
+	preserveStatus bool,
 ) bool {
 	if final.err == nil {
 		return false
@@ -310,7 +314,7 @@ func (h *Handler) handleMediaFailure(
 		return true
 	}
 
-	h.handleMediaError(w, acct, bareModel, final.status, final.raw, uerr, noun)
+	h.handleMediaError(w, acct, bareModel, final.status, final.raw, uerr, noun, preserveStatus)
 
 	return true
 }
@@ -376,7 +380,7 @@ func (h *Handler) imageCaller(upstreamPath string) mediaCall {
 // 但不换号（单次尝试）。noun 只用于空消息兜底文案（image / video）。
 func (h *Handler) handleMediaError(
 	w http.ResponseWriter, acct *auth.Auth, model string, status int, raw []byte,
-	uerr *upstream.Error, noun string,
+	uerr *upstream.Error, noun string, preserveStatus bool,
 ) {
 	kind := uerr.Kind
 
@@ -403,7 +407,7 @@ func (h *Handler) handleMediaError(
 		outStatus = http.StatusServiceUnavailable
 		code = "upstream_overload"
 	case failFastKind(kind):
-		outStatus = http.StatusBadRequest
+		outStatus = requestLevelStatus(status, preserveStatus)
 		code = "invalid_request"
 	case kind == upstream.ErrSessionDead:
 		outStatus = http.StatusBadGateway
@@ -424,6 +428,17 @@ func (h *Handler) handleMediaError(
 	}
 
 	writeOpenAIErrorHint(w, outStatus, code, msg, h.hintOf(kind, string(raw), model, true, false, uerr))
+}
+
+// requestLevelStatus 请求级失败的对外状态码：默认一律 400（换号必然同样失败，
+// 客户端应改请求）；preserveStatus 时保留上游的 ≥400 原码——语音端点要求如此
+// （issue #604：音色未配置是上游 500 + code 10000，改成 400 会让客户端以为请求写错）。
+func requestLevelStatus(status int, preserveStatus bool) int {
+	if preserveStatus && status >= http.StatusBadRequest {
+		return status
+	}
+
+	return http.StatusBadRequest
 }
 
 // recordMediaAttempt 记一次媒体上游尝试的账：reqlog 结果 + usage（响应 usage 缺失时

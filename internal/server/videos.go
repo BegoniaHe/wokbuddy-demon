@@ -259,7 +259,7 @@ func (h *Handler) forwardVideo(
 		return
 	}
 
-	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "video") {
+	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "video", false) {
 		return
 	}
 

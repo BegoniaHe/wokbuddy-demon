@@ -415,6 +415,12 @@ type Config struct {
 		// GET /v1/videos/{task_id}（查询任务，issue #467）。
 		// 默认 false：视频端点同样未在真实账号验证鉴权/计费。
 		VideosEndpoint bool `json:"videos_endpoint"`
+		// TTSEnabled 是否开放 POST /v1/audio/speech（上游 /v2/audio/speech，issue #604）。
+		// 默认 false：语音端点未在真实账号验证计费，与其它新增出站面同口径。
+		TTSEnabled bool `json:"tts_enabled"`
+		// ASREnabled 是否开放 POST /v1/audio/transcriptions（上游 /agenttool/v1/asr，
+		// issue #604）。与 tts_enabled 分开：两个端点的失败形态与上游限额不同。
+		ASREnabled bool `json:"asr_enabled"`
 		// LocalWebTools 允许 Responses 请求把 web_search/web_fetch 服务端工具交给
 		// 网关本地执行（issue #104）。默认 false = 原样透传。
 		LocalWebTools bool `json:"local_web_tools"`

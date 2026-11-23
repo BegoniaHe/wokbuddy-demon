@@ -70,9 +70,33 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "tool definitions were rejected by upstream (tool definition validation, " +
 			"not request body syntax); check tools[].function.name and tools[].function.parameters"
 	}
+	// 语音端点的请求级失败（issue #604）。
+	if hint := speechParamHint(kind, msg); hint != "" {
+		return hint
+	}
 	// 其余走 Kind 一对一映射；未覆盖形态（ErrNone/ErrNotFound/ErrServer/
 	// ErrBadParams/ErrClient 等）无 hint。
 	return gatewayHintByKind[kind]
+}
+
+// speechParamHint 语音端点请求级失败的补充说明（issue #604 的两种形态）：
+//   - 音色未配置：上游用 500 外壳报 "get voice config failed: voice X not found"，
+//     是部署侧（上游）全局配置问题；不点名默认音色，用户只能看到 500 猜不到改什么；
+//   - 15053：上游按容器嗅探音频，裸 PCM 没有容器头必现，换号也是同一句。
+func speechParamHint(kind ErrKind, msg string) string {
+	if kind != ErrBadParams {
+		return ""
+	}
+
+	if strings.Contains(strings.ToLower(msg), speechVoiceMissingMarker) {
+		return "requested voice is not configured at upstream; omit `voice` to use the default " + TTSDefaultVoice
+	}
+
+	if hasBusinessCode(msg, asrRecognitionFailedCode) {
+		return "audio could not be recognized upstream; send a real audio container (wav/mp3/m4a), not raw PCM"
+	}
+
+	return ""
 }
 
 // gatewayHintByKind ErrKind → 固定 hint 文案（未覆盖形态无 hint）。
