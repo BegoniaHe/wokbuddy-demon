@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,18 +27,23 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/auth"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/upstream"
 )
 
 const (
-	upstreamBaseCN      = "https://www.workbuddy.cn"
-	upstreamBaseGlobal  = "https://www.workbuddy.ai"
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 	// loginProductSaaS 是官方 REST 拦截器在请求未自带 X-Product 时补的
 	// deploymentType。两版 cli/product.json 都是 SaaS；本仓不走那层客户端。
 	loginProductSaaS = "SaaS"
+)
+
+// 登录端点基址。用 var 只为把测试流量改到回环假上游：生产恒为官方域。
+var (
+	upstreamBaseCN     = "https://www.workbuddy.cn"
+	upstreamBaseGlobal = "https://www.workbuddy.ai"
 )
 
 // CN 登录 origin 回落顺序：与 cmd/login、chat/refresh 保持同一口径。
@@ -189,8 +195,95 @@ func loginReplayable(status int) bool {
 }
 
 // loginHTTP 设备授权专用 client：短超时、无 cookie（每请求携带 state，无会话态）。
+// 直连出口（一条启用槽都没有 / 开关关闭）与既有测试的替换点都用它。
 var loginHTTP = &http.Client{Timeout: 30 * time.Second}
 
+// loginDial 出站拨号器（与 outbound 池的 DialContext 同签名）。
+type loginDial = func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// loginEgress 一条登录链路的固定出口（issue #609）：slot 为空 = 直连。
+type loginEgress struct {
+	slot string
+	dial loginDial
+}
+
+// loginEgressFor 为「还没有账号」的登录挑一条启用且健康的槽，整条
+// state/token/account 链路固定走它（issue #609）。
+//
+// 语义与 outbound.Registry.LoginSlot 一致：一条启用槽都没有 → 直连（未配代理的
+// 部署不能因此加不了号）；有启用槽但都不可用 → 报错（fail-closed，绝不静默直连）。
+// features.login_bind_proxy 关闭时一律直连。
+func (p *Panel) loginEgressFor(realm string) (loginEgress, error) {
+	if !p.cfg.Live.Load().LoginBindProxy {
+		return loginEgress{}, nil
+	}
+
+	slot, dial, err := p.loginRegistry().LoginSlot(realm)
+	if err != nil {
+		return loginEgress{}, fmt.Errorf("登录出口不可用: %w", err)
+	}
+
+	return loginEgress{slot: slot, dial: dial}, nil
+}
+
+// loginEgressForSlot 按发起时选定的槽取拨号器：槽在轮询期间被删除/禁用/改名即
+// fail-closed 中止本次登录，绝不换出口、也绝不回落直连。
+func (p *Panel) loginEgressForSlot(slot string) (loginEgress, error) {
+	if slot == "" {
+		return loginEgress{}, nil
+	}
+
+	if dial, ok := p.loginRegistry().SlotDial(slot); ok {
+		return loginEgress{slot: slot, dial: dial}, nil
+	}
+
+	return loginEgress{}, fmt.Errorf("%w: 代理槽 %q 已不可用（本次登录中止，不回落直连）",
+		outbound.ErrProxyDial, slot)
+}
+
+// loginRegistry 返回当前生效的出站注册表（nil = 未装配，等价直连）。
+func (p *Panel) loginRegistry() *outbound.Registry {
+	if p == nil || p.cfg.Upstream == nil {
+		return nil
+	}
+
+	return p.cfg.Upstream.ProxyRegistry()
+}
+
+// client 返回本次出站的 client：有槽则新建按槽出站的 Transport；无槽沿用
+// loginHTTP（直连，测试可替换）。
+func (e loginEgress) client() *http.Client {
+	if e.dial == nil {
+		return loginHTTP
+	}
+
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			DialContext:         e.dial,
+			TLSHandshakeTimeout: 10 * time.Second,
+			IdleConnTimeout:     30 * time.Second,
+		},
+	}
+}
+
+// close 关闭按槽新建的 Transport 的空闲连接；共享的直连 client 不动。
+func (e loginEgress) close(client *http.Client) {
+	if e.dial != nil {
+		client.CloseIdleConnections()
+	}
+}
+
+// loginEgressLabel 日志用出口标签：直连 / 槽 id（槽 id 不含凭据）。
+func loginEgressLabel(egress loginEgress) string {
+	if egress.slot == "" {
+		return "direct"
+	}
+
+	return "slot:" + egress.slot
+}
+
+// commonHeaders 按 origin 设置通用请求头（Origin/Referer 随 realm 变化）。
 func commonHeaders(req *http.Request, origin, userAgent string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -227,11 +320,13 @@ type apiEnvelope struct {
 	Data jsontext.Value `json:"data"`
 }
 
-// doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）。
+// doJSON 发一次 JSON 请求并解信封。origin 为 Origin/Referer 基础域（随 realm 切）；
+// client 由调用方按本次登录的固定出口提供（loginEgress.client）。
 // ctx 来自 HTTP 请求：轮询客户端断开后应立即放弃（原先用 Background()，一次
 // auth/state→token→account 链路在客户端关页面后仍会跑满全部候选 origin 与超时）。
 func doJSON(
-	ctx context.Context, method, fullURL, bearer string, body io.Reader, origin, userAgent string,
+	ctx context.Context, client *http.Client, method, fullURL, bearer string,
+	body io.Reader, origin, userAgent string,
 ) (jsontext.Value, int, error) {
 	//nolint:gosec // URL 由固定 realm 端点拼接，非用户可控主机
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, body)
@@ -252,7 +347,7 @@ func doJSON(
 	req.Header.Set("X-No-Enterprise-Id", "true")
 	req.Header.Set("X-No-Department-Info", "true")
 
-	resp, err := loginHTTP.Do(req) //nolint:gosec // 同上，请求 URL 来自固定 realm 端点
+	resp, err := client.Do(req) //nolint:gosec // 同上，请求 URL 来自固定 realm 端点
 	if err != nil {
 		return nil, 0, fmt.Errorf("doJSON: %w", err)
 	}
@@ -282,14 +377,23 @@ func doJSON(
 	return env.Data, resp.StatusCode, nil
 }
 
-// loginStartState 按 origin 候选发起 auth/state，返回响应、命中的 endpoint 与最后状态。
+// loginStartState 按 origin 候选发起 auth/state，返回响应、命中的 endpoint、本次
+// 登录固定的出口与最后状态。
 func (p *Panel) loginStartState(
 	ctx context.Context, realm string,
-) (jsontext.Value, loginEndpoint, int, error) {
+) (jsontext.Value, loginEndpoint, loginEgress, int, error) {
 	identity := p.loginIdentityFor(realm)
 	if identity.userAgent == "" {
-		return nil, loginEndpoint{}, 0, errLoginProfileMissing
+		return nil, loginEndpoint{}, loginEgress{}, 0, errLoginProfileMissing
 	}
+
+	egress, eerr := p.loginEgressFor(realm)
+	if eerr != nil {
+		return nil, loginEndpoint{}, loginEgress{}, 0, eerr
+	}
+
+	client := egress.client()
+	defer egress.close(client)
 
 	var (
 		lastStatus int
@@ -298,10 +402,11 @@ func (p *Panel) loginStartState(
 
 	for _, endpoint := range loginCandidatesWithIdentity(realm, identity) {
 		data, status, err := doJSON(
-			ctx, http.MethodPost, endpoint.state, "", bytes.NewReader([]byte("{}")), endpoint.origin, endpoint.userAgent,
+			ctx, client, http.MethodPost, endpoint.state, "",
+			bytes.NewReader([]byte("{}")), endpoint.origin, endpoint.userAgent,
 		)
 		if err == nil {
-			return data, endpoint, status, nil
+			return data, endpoint, egress, status, nil
 		}
 
 		lastStatus, lastErr = status, err
@@ -310,7 +415,7 @@ func (p *Panel) loginStartState(
 		}
 	}
 
-	return nil, loginEndpoint{}, lastStatus, lastErr
+	return nil, loginEndpoint{}, loginEgress{}, lastStatus, lastErr
 }
 
 // loginRealmFromBody 解析登录请求体里的 realm；缺省或非法值按 cn。
@@ -339,10 +444,17 @@ func loginRealmFromBody(r *http.Request) string {
 func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 	realm := loginRealmFromBody(r)
 
-	data, used, status, err := p.loginStartState(r.Context(), realm)
+	data, used, egress, status, err := p.loginStartState(r.Context(), realm)
 	if err != nil {
 		if errors.Is(err, errLoginProfileMissing) {
 			writeErr(w, http.StatusServiceUnavailable, err.Error())
+
+			return
+		}
+		// 出口不可用（有启用槽但全不健康/槽缺失）必须明确报代理错误：回落直连
+		// 等于把宿主机 IP 交出去，还让随后的账号绑定成为谎话（issue #609）。
+		if errors.Is(err, outbound.ErrNoHealthySlot) || errors.Is(err, outbound.ErrProxyDial) {
+			writeErr(w, http.StatusBadGateway, "auth state: "+err.Error())
 
 			return
 		}
@@ -369,9 +481,10 @@ func (p *Panel) loginStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	p.logins[item.State] = loginSession{created: time.Now(), realm: realm, base: used.base}
+	p.logins[item.State] = loginSession{created: time.Now(), realm: realm, base: used.base, slot: egress.slot}
 	p.loginMu.Unlock()
-	log.Printf("panel: 发起 OAuth 添加账号 realm=%s（state=%s...）", realm, item.State[:min(8, len(item.State))])
+	log.Printf("panel: 发起 OAuth 添加账号 realm=%s 出口=%s（state=%s...）",
+		realm, loginEgressLabel(egress), item.State[:min(8, len(item.State))])
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "url": item.AuthURL, "state": item.State, "realm": realm,
 	})
@@ -443,13 +556,14 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, known := p.lookupLoginSession(state)
-	if !known {
-		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
+	sess, egress, client, ok := p.loginPollSession(w, state)
+	if !ok {
 		return
 	}
 
-	tok, pendingInfo, pending, endpoint, err := p.pollLoginToken(r.Context(), sess.realm, sess.base, state)
+	defer egress.close(client)
+
+	tok, pendingInfo, pending, endpoint, err := p.pollLoginToken(r.Context(), client, sess.realm, sess.base, state)
 	if err != nil {
 		// 许可终态会让前端停止轮询；收敛会话，避免状态永久留在 p.logins。
 		if loginTokenTerminal(err) {
@@ -468,7 +582,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	acct, ok := p.pollLoginAccount(r.Context(), w, &endpoint, state, tok.AccessToken)
+	acct, ok := p.pollLoginAccount(r.Context(), client, w, &endpoint, state, tok.AccessToken)
 	if !ok {
 		return
 	}
@@ -482,14 +596,39 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.finishClaimedLogin(r.Context(), w, state, sess.realm, tok, acct)
+	p.finishClaimedLogin(r.Context(), w, state, sess.realm, sess.slot, tok, acct)
+}
+
+// loginPollSession 取登录会话并按发起时选定的槽重建出口。返回 false 表示已回写
+// 错误响应（state 过期 / 槽已不可用），调用方直接返回。
+func (p *Panel) loginPollSession(
+	w http.ResponseWriter, state string,
+) (loginSession, loginEgress, *http.Client, bool) {
+	sess, known := p.lookupLoginSession(state)
+	if !known {
+		writeErr(w, http.StatusNotFound, "unknown or expired state（请重新发起添加账号）")
+
+		return loginSession{}, loginEgress{}, nil, false
+	}
+
+	// 同一 state 的整条链路固定同一条出口：轮询阶段按发起时选定的槽重建拨号器，
+	// 槽已不可用即 fail-closed 中止（不换出口、不回落直连）。
+	egress, err := p.loginEgressForSlot(sess.slot)
+	if err != nil {
+		p.dropLoginSession(state)
+		writeErr(w, http.StatusBadGateway, err.Error())
+
+		return loginSession{}, loginEgress{}, nil, false
+	}
+
+	return sess, egress, egress.client(), true
 }
 
 // finishClaimedLogin 落盘凭证并跑登录后置任务（会话已被独占认领）。
 func (p *Panel) finishClaimedLogin(
-	ctx context.Context, w http.ResponseWriter, state, realm string, tok loginToken, acct loginAccount,
+	ctx context.Context, w http.ResponseWriter, state, realm, slot string, tok loginToken, acct loginAccount,
 ) {
-	account, status, msg := p.persistLoginAuth(realm, tok, acct)
+	account, status, msg := p.persistLoginAuth(realm, slot, tok, acct)
 	if status != 0 {
 		// 非 200 会让前端停止轮询；会话不清掉就得等 TTL 或下次 login/start 才回收。
 		p.dropLoginSession(state)
@@ -546,9 +685,9 @@ func (p *Panel) finishLoginPoll(
 // pollLoginAccount 取账号信息并回写 pending / 终态响应；返回值 ok=false 表示
 // 本轮轮询已处理完毕，调用方应直接返回。其他错误保持忽略（由 uid 校验兜底）。
 func (p *Panel) pollLoginAccount(
-	ctx context.Context, w http.ResponseWriter, endpoint *loginEndpoint, state, bearer string,
+	ctx context.Context, client *http.Client, w http.ResponseWriter, endpoint *loginEndpoint, state, bearer string,
 ) (loginAccount, bool) {
-	acct, err := p.fetchLoginAccount(ctx, endpoint, state, bearer)
+	acct, err := p.fetchLoginAccount(ctx, client, endpoint, state, bearer)
 	if err == nil {
 		return acct, true
 	}
@@ -605,7 +744,7 @@ func writeLoginPollError(w http.ResponseWriter, err error) {
 // 就绪返回 pending=true 并带回上游 code/msg；成功返回解析后的凭证与命中的 origin
 // （account 端点同源）。
 func (p *Panel) pollLoginToken(
-	ctx context.Context, realm, preferredBase, state string,
+	ctx context.Context, client *http.Client, realm, preferredBase, state string,
 ) (loginToken, loginPendingInfo, bool, loginEndpoint, error) {
 	identity := p.loginIdentityFor(realm)
 	if identity.userAgent == "" {
@@ -615,7 +754,7 @@ func (p *Panel) pollLoginToken(
 	var lastErr error
 
 	for _, endpoint := range loginCandidatesPreferWithIdentity(realm, preferredBase, identity) {
-		tok, pendingInfo, pending, status, err := requestLoginToken(ctx, &endpoint, state)
+		tok, pendingInfo, pending, status, err := requestLoginToken(ctx, client, &endpoint, state)
 		if err == nil {
 			return tok, pendingInfo, pending, endpoint, nil
 		}
@@ -635,10 +774,10 @@ func (p *Panel) pollLoginToken(
 // pending=true 且 err=nil；pending 业务码同时带回 code/msg 供日志使用。许可终态与其他
 // 错误原样返回给调用方决定是否换 origin。
 func requestLoginToken(
-	ctx context.Context, endpoint *loginEndpoint, state string,
+	ctx context.Context, client *http.Client, endpoint *loginEndpoint, state string,
 ) (loginToken, loginPendingInfo, bool, int, error) {
 	tokRaw, status, err := doJSON(
-		ctx, http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
+		ctx, client, http.MethodGet, endpoint.token+state, "", nil, endpoint.origin, endpoint.userAgent,
 	)
 	if err != nil {
 		if codeErr, ok := errors.AsType[*logincode.Error](err); ok && logincode.IsPending(codeErr.Code) {
@@ -712,12 +851,12 @@ func loginTokenTerminal(err error) bool {
 
 // fetchLoginAccount 取 uid/nickname；失败返回错误，由 loginPoll 区分 pending / 终态 / 忽略。
 func (*Panel) fetchLoginAccount(
-	ctx context.Context, endpoint *loginEndpoint, state, bearer string,
+	ctx context.Context, client *http.Client, endpoint *loginEndpoint, state, bearer string,
 ) (loginAccount, error) {
 	var acct loginAccount
 
 	acctRaw, _, err := doJSON(
-		ctx, http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent,
+		ctx, client, http.MethodGet, endpoint.account+state, bearer, nil, endpoint.origin, endpoint.userAgent,
 	)
 	if err != nil {
 		return loginAccount{}, err
@@ -732,7 +871,12 @@ func (*Panel) fetchLoginAccount(
 
 // persistLoginAuth 校验 uid、落盘凭证并热加载进池。返回非零 status 表示失败，
 // 调用方据此回写 HTTP 错误；成功时返回落盘后的 auth。
-func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount) (*auth.Auth, int, string) {
+//
+// slot 是本次登录链路实际使用的出口槽（空 = 直连登录），落盘后立刻写成账号
+// proxy_slot（issue #609）：位置在注册激活 / 签到 / 余额刷新等后续出站动作之前。
+func (p *Panel) persistLoginAuth(
+	realm, slot string, tok loginToken, acct loginAccount,
+) (*auth.Auth, int, string) {
 	if acct.UID == "" {
 		return nil, http.StatusBadGateway, "login done but no uid（token 已发但账号信息获取失败，请重试）"
 	}
@@ -748,25 +892,9 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 		return nil, http.StatusInternalServerError, "mkdir auth dir: " + err.Error()
 	}
 
-	account := &auth.Auth{
-		AccessToken:  tok.AccessToken,
-		RefreshToken: tok.RefreshToken,
-		ExpiresAt:    time.Now().Add(loginExpiry(tok.ExpiresIn)).Unix(),
-		Domain:       tok.Domain,
-		UID:          acct.UID,
-		EnterpriseID: acct.EnterpriseID,
-		EditionType:  acct.EditionType,
-		Nickname:     acct.Nickname,
-		FilePath:     filepath.Join(p.cfg.AuthDir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
-	}
-	// global 登录：落盘 auth.realm=global（Realm() 按此判域；不写则依赖 domain 后缀回落）。
-	if realm == "global" {
-		if _, err := auth.BackfillRealmFor(account, "global"); err != nil {
-			return nil, http.StatusInternalServerError, "set realm: " + err.Error()
-		}
-	} else {
-		// CN 也显式补 realm 键（幂等），让 auth 文件形态统一（与 LoadDir 存量迁移对齐）。
-		_, _ = account.BackfillRealm()
+	account := newLoginAuth(p.cfg.AuthDir, tok, acct)
+	if err := applyLoginRealm(account, realm); err != nil {
+		return nil, http.StatusInternalServerError, err.Error()
 	}
 
 	// 同一 uid 重新登录：先退役旧实例再落盘。锁是按实例私有的，旧实例此刻尚未被
@@ -783,7 +911,46 @@ func (p *Panel) persistLoginAuth(realm string, tok loginToken, acct loginAccount
 	p.cfg.Pool.Add(account)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
+	// 注册出口固定绑定：登录用哪条槽注册的，账号就绑哪条，事后可回答「这个号是
+	// 哪条出口注册的」（issue #609）。必须在 postLoginTasks 之前，否则注册后的第一
+	// 批出站（激活/签到/余额）会换成另一条线路。
+	if slot != "" && !p.cfg.Pool.SetProxySlot(acct.UID, slot) {
+		log.Printf("WARN: [panel] 登录出口绑定失败：账号 %s 不在池中（槽 %s）", acct.UID, slot)
+	}
+
 	return account, 0, ""
+}
+
+// newLoginAuth 按 token 与账号信息构造待落盘的凭证（嵌套形，与 auths/ 目录既有格式一致）。
+func newLoginAuth(dir string, tok loginToken, acct loginAccount) *auth.Auth {
+	return &auth.Auth{
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		ExpiresAt:    time.Now().Add(loginExpiry(tok.ExpiresIn)).Unix(),
+		Domain:       tok.Domain,
+		UID:          acct.UID,
+		EnterpriseID: acct.EnterpriseID,
+		EditionType:  acct.EditionType,
+		Nickname:     acct.Nickname,
+		FilePath:     filepath.Join(dir, fmt.Sprintf("workbuddy-%s.json", acct.UID)),
+	}
+}
+
+// applyLoginRealm 按登录 realm 写 auth.realm 键。global 登录必须落盘 auth.realm=global
+// （Realm() 按此判域，不写则依赖 domain 后缀回落）；CN 也显式补一次（幂等），让 auth
+// 文件形态统一（与 LoadDir 存量迁移对齐）。
+func applyLoginRealm(account *auth.Auth, realm string) error {
+	if realm == "global" {
+		if _, err := auth.BackfillRealmFor(account, "global"); err != nil {
+			return fmt.Errorf("set realm: %w", err)
+		}
+
+		return nil
+	}
+
+	_, _ = account.BackfillRealm()
+
+	return nil
 }
 
 // postLoginTasks 登录完成后的签到/激活与余额刷新，返回 (提示消息, 余额, 总额)。

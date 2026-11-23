@@ -1314,6 +1314,7 @@ func liveSnapshot(cfg *Config) livecfg.Snapshot {
 		VideosEndpoint:     cfg.Features.VideosEndpoint,
 		LocalWebTools:      cfg.Features.LocalWebTools,
 		LocalWebToolRounds: cfg.Features.LocalWebToolRounds,
+		LoginBindProxy:     cfg.Features.LoginBindProxy,
 		BackgroundNames:    backgroundNameSet(cfg.Models.BackgroundNames),
 		BackgroundTarget:   cfg.Models.BackgroundTarget,
 		HiddenModels:       livecfg.NormalizeHiddenModels(cfg.Models.Hidden),

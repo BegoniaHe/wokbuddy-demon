@@ -49,6 +49,9 @@ type Snapshot struct {
 	VideosEndpoint bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
+	// LoginBindProxy 加号登录链路是否按出口槽出站（features.login_bind_proxy，
+	// 默认 true，issue #609）。关闭后 state/token/account 三条一律直连。
+	LoginBindProxy bool
 	// BackgroundNames 后台模型改写名单（小写；issue #103）。空 = 关闭。
 	BackgroundNames map[string]bool
 	// BackgroundTarget 后台模型改写目标（issue #103）。

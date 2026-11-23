@@ -113,6 +113,17 @@ func (pool *Pool) Health() []Health {
 // Len 返回池内代理数（0 = 直连）。
 func (pool *Pool) Len() int { return len(pool.states) }
 
+// healthy 报告池内至少一个代理当前不在冷却中（登录链路挑节点用，issue #609）。
+func (pool *Pool) healthy() bool {
+	for _, health := range pool.Health() {
+		if health.CooldownSec == 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Masked 返回池内首个代理的脱敏地址（面板槽视图用）；空池返回空串。
 func (pool *Pool) Masked() string {
 	if len(pool.states) == 0 {

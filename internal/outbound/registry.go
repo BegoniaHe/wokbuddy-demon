@@ -7,10 +7,16 @@ package outbound
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"strings"
 )
+
+// ErrNoHealthySlot 有启用代理槽但当前没有健康可用的出口（全部冷却或构造失败）。
+// 登录链路据此 fail-closed：绝不静默回落直连（issue #609）。
+var ErrNoHealthySlot = errors.New("no healthy proxy slot")
 
 // Slot 命名代理槽配置（与 config 的同名字段一一对应）。
 type Slot struct {
@@ -144,6 +150,62 @@ func (r *Registry) RealmSlot(realm string) string {
 	}
 
 	return r.realm[normRealm(realm)]
+}
+
+// LoginSlot 为「还没有账号」的登录链路挑一条固定出口（issue #609）。
+//
+// 候选顺序：realm 默认槽 → 其余启用槽（配置顺序）。冷却中的槽跳过。返回语义：
+//   - ("", nil, nil)     一条启用槽都没有 → 调用方直连（未配代理不能因此加不了号）；
+//   - (id, dial, nil)    整条登录链路必须固定走该拨号器；
+//   - ("", nil, error)   有启用槽但都不可用/不健康（ErrNoHealthySlot）→ 调用方必须
+//     报错，绝不回落直连（回落等于把宿主机 IP 交出去，还让账号绑定成为谎话）。
+func (r *Registry) LoginSlot(
+	realm string,
+) (string, func(ctx context.Context, network, addr string) (net.Conn, error), error) {
+	if r == nil {
+		return "", nil, nil
+	}
+
+	enabled := 0
+
+	for _, view := range r.views {
+		if view.Enabled {
+			enabled++
+		}
+	}
+
+	if enabled == 0 {
+		return "", nil, nil
+	}
+
+	for _, id := range r.loginOrder(realm) {
+		pool, ok := r.slots[id]
+		if !ok || !pool.healthy() {
+			continue
+		}
+
+		return id, pool.DialContext, nil
+	}
+
+	return "", nil, fmt.Errorf("%w: realm %s 的启用槽都不可用（不回落直连）", ErrNoHealthySlot, normRealm(realm))
+}
+
+// loginOrder realm 默认槽优先，其余启用槽按配置顺序（禁用槽不参与登录出口）。
+func (r *Registry) loginOrder(realm string) []string {
+	preferred := r.RealmSlot(realm)
+
+	out := make([]string, 0, len(r.views)+1)
+	if preferred != "" {
+		out = append(out, preferred)
+	}
+
+	for _, view := range r.views {
+		if view.Enabled && view.ID != preferred {
+			out = append(out, view.ID)
+		}
+	}
+
+	return out
 }
 
 // HasSlot 报告是否存在可用（启用且构造成功）的命名槽。

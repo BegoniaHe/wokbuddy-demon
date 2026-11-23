@@ -41,6 +41,7 @@ import (
 	"github.com/BegoniaHe/wokbuddy-demon/internal/clientprofile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/jsonx"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/logincode"
+	"github.com/BegoniaHe/wokbuddy-demon/internal/outbound"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/safefile"
 	"github.com/BegoniaHe/wokbuddy-demon/internal/session"
 )
@@ -80,6 +81,10 @@ const (
 // Windows resolves to <drive>:\tmp\... and aborts the OAuth flow with
 // "The system cannot find the path specified". os.TempDir() is /tmp on Linux.
 var stateFile = filepath.Join(os.TempDir(), "wb2api-login-state.json")
+
+// loginConfigPath CLI 读取登录出口配置的路径（与 server 同目录同文件）；
+// var 便于测试替换临时文件。
+var loginConfigPath = "config.json"
 
 // exitFunc 供测试替换（默认 os.Exit；测试持临时替换为 panic 以进程内捕获 fatal）。
 var exitFunc = os.Exit
@@ -691,6 +696,105 @@ func buildLoginOutput(tok tokenBundle, realm string, acct accountInfo) map[strin
 	}
 }
 
+// loginSlot 命名出口槽（与 config 的 proxy_slots 同名字段一一对应）。
+type loginSlot struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	URL     string `json:"url"`
+	Enabled bool   `json:"enabled"`
+}
+
+// loginConfig 登录出口相关的配置片段（issue #609）：CLI 没有账号池上下文，只需要
+// 命名槽、realm 默认槽，以及决定是否按槽出站的开关。
+type loginConfig struct {
+	Slots      []loginSlot
+	RealmSlots map[string]string
+	// bindProxy features.login_bind_proxy（缺省 true，与 server 的 Default 同口径）。
+	bindProxy bool
+}
+
+// loadLoginConfig 读取登录出口配置。文件缺失 = 未配代理（直连）：首次部署时配置
+// 可能还没生成，登录不该因此失败；文件存在但解析失败则报错（配置坏了就明确失败，
+// 不要静默按直连出网）。
+func loadLoginConfig(path string) (loginConfig, error) {
+	config := loginConfig{bindProxy: true}
+
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return config, nil
+		}
+
+		return config, fmt.Errorf("read login config: %w", err)
+	}
+
+	var parsed struct {
+		Upstream struct {
+			ProxySlots      []loginSlot       `json:"proxy_slots"`
+			RealmProxySlots map[string]string `json:"realm_proxy_slots"`
+		} `json:"upstream"`
+		Features struct {
+			LoginBindProxy *bool `json:"login_bind_proxy"`
+		} `json:"features"`
+	}
+
+	if err := jsonx.Unmarshal(raw, &parsed); err != nil {
+		return config, fmt.Errorf("parse login config: %w", err)
+	}
+
+	config.Slots = parsed.Upstream.ProxySlots
+	config.RealmSlots = parsed.Upstream.RealmProxySlots
+
+	if parsed.Features.LoginBindProxy != nil {
+		config.bindProxy = *parsed.Features.LoginBindProxy
+	}
+
+	return config, nil
+}
+
+// loginEgressClient 按配置为 CLI 登录挑出口（与面板同口径，issue #609）：
+//   - 开关关闭 → 直连；
+//   - 一条启用槽都没有 → 直连（未配代理的部署不能因此加不了号）；
+//   - 有启用槽 → 整条 state/token/account 固定走挑中的槽；
+//   - 有启用槽但都不可用/不健康 → 报错（调用方必须失败，绝不回落直连）。
+//
+// 返回的 slot 为空表示直连。
+func loginEgressClient(config loginConfig, realm string) (*http.Client, string, error) {
+	jar, _ := cookiejar.New(nil)
+
+	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	if !config.bindProxy {
+		return client, "", nil
+	}
+
+	slots := make([]outbound.Slot, 0, len(config.Slots))
+	for _, slot := range config.Slots {
+		slots = append(slots, outbound.Slot{ID: slot.ID, Name: slot.Name, URL: slot.URL, Enabled: slot.Enabled})
+	}
+
+	reg, err := outbound.NewRegistry(nil, slots, config.RealmSlots)
+	if err != nil {
+		return nil, "", fmt.Errorf("构造登录出口注册表失败: %w", err)
+	}
+
+	slot, dial, lerr := reg.LoginSlot(realm)
+	if lerr != nil {
+		return nil, "", fmt.Errorf("挑选登录出口失败: %w", lerr)
+	}
+
+	if dial == nil {
+		return client, "", nil
+	}
+
+	client.Transport = &http.Transport{
+		DialContext:         dial,
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     30 * time.Second,
+	}
+
+	return client, slot, nil
+}
+
 func main() {
 	realm, rest, err := parseRealmArgs(os.Args[1:])
 	if err != nil {
@@ -700,9 +804,22 @@ func main() {
 	if len(rest) < 1 {
 		fatalf("usage: login [--realm=cn|global] <url|poll>")
 	}
+
+	// 登录出口（issue #609）：配了槽就整条链路固定走同一条，槽不可用直接失败。
+	config, cerr := loadLoginConfig(loginConfigPath)
+	if cerr != nil {
+		fatalf("%v", cerr)
+	}
+
 	// 每个流程独立 cookie jar（oauth.go:22-29：多账号登录互不串会话）
-	jar, _ := cookiejar.New(nil)
-	client := &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	client, slot, eerr := loginEgressClient(config, realm)
+	if eerr != nil {
+		fatalf("登录出口不可用: %v", eerr)
+	}
+
+	if slot != "" {
+		fmt.Fprintf(os.Stderr, "login: 登录出站走代理槽 %s\n", slot)
+	}
 
 	base, origin := realmConfig(realm)
 
