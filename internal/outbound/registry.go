@@ -154,7 +154,8 @@ func (r *Registry) RealmSlot(realm string) string {
 
 // LoginSlot 为「还没有账号」的登录链路挑一条固定出口（issue #609）。
 //
-// 候选顺序：realm 默认槽 → 其余启用槽（配置顺序）。冷却中的槽跳过。返回语义：
+// 候选顺序：realm 默认槽 → 其余「未分配给其它 realm」的启用槽（见 loginOrder）。
+// 冷却中的槽跳过。返回语义：
 //   - ("", nil, nil)     一条启用槽都没有 → 调用方直连（未配代理不能因此加不了号）；
 //   - (id, dial, nil)    整条登录链路必须固定走该拨号器；
 //   - ("", nil, error)   有启用槽但都不可用/不健康（ErrNoHealthySlot）→ 调用方必须
@@ -190,9 +191,14 @@ func (r *Registry) LoginSlot(
 	return "", nil, fmt.Errorf("%w: realm %s 的启用槽都不可用（不回落直连）", ErrNoHealthySlot, normRealm(realm))
 }
 
-// loginOrder realm 默认槽优先，其余启用槽按配置顺序（禁用槽不参与登录出口）。
+// loginOrder realm 默认槽优先，其次是「没有分配给任何其它 realm」的启用槽。
+//
+// 已分配给其它 realm 的槽不参与本 realm 的登录出口：登录用哪条槽注册，事后会被
+// 永久写成账号的 proxy_slot（issue #609），跨 realm 兜底等于把 global 账号钉在
+// 只给 CN 用的线路上，而配置界面看不出原因。没有可用候选时由调用方 fail-closed。
 func (r *Registry) loginOrder(realm string) []string {
-	preferred := r.RealmSlot(realm)
+	norm := normRealm(realm)
+	preferred := r.RealmSlot(norm)
 
 	out := make([]string, 0, len(r.views)+1)
 	if preferred != "" {
@@ -200,12 +206,25 @@ func (r *Registry) loginOrder(realm string) []string {
 	}
 
 	for _, view := range r.views {
-		if view.Enabled && view.ID != preferred {
-			out = append(out, view.ID)
+		if !view.Enabled || view.ID == preferred || r.claimedByOtherRealm(view.ID, norm) {
+			continue
 		}
+
+		out = append(out, view.ID)
 	}
 
 	return out
+}
+
+// claimedByOtherRealm 报告槽是否已被其它 realm 的默认出口占用。
+func (r *Registry) claimedByOtherRealm(slot, realm string) bool {
+	for other, id := range r.realm {
+		if other != realm && id == slot {
+			return true
+		}
+	}
+
+	return false
 }
 
 // HasSlot 报告是否存在可用（启用且构造成功）的命名槽。

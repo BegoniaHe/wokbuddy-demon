@@ -141,3 +141,34 @@ func TestLoginSlotErrorRedactsPassword(t *testing.T) {
 		}
 	}
 }
+
+// TestLoginSlotKeepsRealmIsolation 已分配给其它 realm 的槽不参与本 realm 的登录出口：
+// 登录槽会落成账号 proxy_slot 永久绑定，跨 realm 兜底等于把 global 账号钉在只给
+// CN 用的线路上。只剩跨 realm 候选时 fail-closed。
+func TestLoginSlotKeepsRealmIsolation(t *testing.T) {
+	t.Parallel()
+
+	registry, err := NewRegistry(nil, []Slot{
+		{ID: "cn-line", URL: "http://127.0.0.1:1", Enabled: true},
+		{ID: "generic", URL: "http://127.0.0.1:2", Enabled: true},
+	}, map[string]string{"cn": "cn-line"})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	id, dial, err := registry.LoginSlot("global")
+	if err != nil || id != "generic" || dial == nil {
+		t.Fatalf("global 只能用未被占用的通用槽: id=%q err=%v", id, err)
+	}
+
+	cnOnly, err := NewRegistry(nil, []Slot{
+		{ID: "cn-line", URL: "http://127.0.0.1:1", Enabled: true},
+	}, map[string]string{"cn": "cn-line"})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+
+	if _, _, err := cnOnly.LoginSlot("global"); !errors.Is(err, ErrNoHealthySlot) {
+		t.Fatalf("只剩跨 realm 候选必须 fail-closed: %v", err)
+	}
+}
