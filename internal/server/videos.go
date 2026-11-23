@@ -78,6 +78,10 @@ func (h *Handler) serveVideoGenerate(w http.ResponseWriter, r *http.Request) {
 		body = rewriteModel(body, bareModel)
 	}
 
+	// 参考素材形状归一（issue #617）：官方 VideoService 出站前把字符串条目包成
+	// {image_url|video_url|audio_url}，上游对字符串数组直接 400。
+	body = normalizeVideoReferences(body)
+
 	h.forwardVideo(w, r, acct, body, realm, bareModel, h.cfg.Upstream.GenerateVideo, false)
 }
 
@@ -260,6 +264,113 @@ func (h *Handler) forwardVideo(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(final.status)
 	_, _ = w.Write(final.raw)
+}
+
+// videoReferenceFields 三个参考素材字段与其对象内层键。官方
+// `VideoService.buildConfiguredRequest` 逐字使用这三个映射。
+var videoReferenceFields = []struct{ field, key string }{
+	{"reference_images", "image_url"},
+	{"reference_videos", "video_url"},
+	{"reference_audios", "audio_url"},
+}
+
+// normalizeVideoReferences 把 reference_images / reference_videos / reference_audios
+// 归一为上游要求的对象数组（issue #617）。
+//
+// 官方客户端在提交前做同一层包装：字符串条目补成 {<key>: url}；已是对象时优先取
+// <key>、退一步取 url；两者都取不到的条目丢弃（宁可少一条素材，也不要因一个字段
+// 形状不符让整单 400）。空数组按官方 `length &&` 口径视为不设置该字段；客户端把
+// 单条素材直接写成字符串或对象时按一条素材归一，不整段丢弃。
+func normalizeVideoReferences(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	obj, err := jsonx.DecodeObject(body)
+	if err != nil {
+		return body
+	}
+
+	changed := false
+
+	for _, ref := range videoReferenceFields {
+		if normalizeVideoField(obj, ref.field, ref.key) {
+			changed = true
+		}
+	}
+
+	if !changed {
+		return body
+	}
+
+	out, err := jsonx.Marshal(obj)
+	if err != nil {
+		return body
+	}
+
+	return out
+}
+
+// normalizeVideoField 归一单个参考素材字段，返回该字段是否存在。
+func normalizeVideoField(obj map[string]any, field, key string) bool {
+	raw, ok := obj[field]
+	if !ok {
+		return false
+	}
+
+	items := videoReferenceItems(raw)
+	normalized := make([]any, 0, len(items))
+
+	for _, item := range items {
+		if entry, ok := normalizeVideoReferenceEntry(item, key); ok {
+			normalized = append(normalized, entry)
+		}
+	}
+
+	if len(normalized) == 0 {
+		delete(obj, field)
+	} else {
+		obj[field] = normalized
+	}
+
+	return true
+}
+
+// videoReferenceItems 把字段值当素材列表读：单个字符串或对象按一条素材处理。
+//
+// 非数组形态（`reference_images:"https://…"`、单个对象）在官方客户端不会出现，
+// 但客户端写错时直接删掉整段字段等于「静默少素材」——出一个没有参考素材的视频
+// 并照常计费。按单条素材归一与「字符串条目自动包装」是同一层宽容。null 与其它
+// 类型仍视为未设置。
+func videoReferenceItems(raw any) []any {
+	switch typed := raw.(type) {
+	case []any:
+		return typed
+	case string, map[string]any:
+		return []any{typed}
+	default:
+		return nil
+	}
+}
+
+// normalizeVideoReferenceEntry 归一单条参考素材；取不到 URL 时丢弃。
+func normalizeVideoReferenceEntry(item any, key string) (map[string]any, bool) {
+	switch typed := item.(type) {
+	case string:
+		if strings.TrimSpace(typed) == "" {
+			return nil, false
+		}
+
+		return map[string]any{key: typed}, true
+	case map[string]any:
+		for _, candidate := range []string{key, "url"} {
+			if url := stringValue(typed[candidate]); url != "" {
+				return map[string]any{key: url}, true
+			}
+		}
+	}
+
+	return nil, false
 }
 
 // videoTaskFailed 报告任务终态是否为 failed；其余状态（排队 / 运行中 / completed）
