@@ -1730,3 +1730,64 @@ func TestResponsesEarlyToolOutputReordered(t *testing.T) {
 		t.Errorf("出站 body 丢失 tool_calls: %s", seen[0])
 	}
 }
+
+// TestResponsesCompactionAndToolBoundariesStopMerge compaction 项与工具结果同样是
+// 边界：assistant 正文之后的 function_call 不跨越它们合并（issue #619 验收第二条
+// 点名 compaction / user / tool 三者，此前只有 user 边界有用例）。
+func TestResponsesCompactionAndToolBoundariesStopMerge(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct{ name, body string }{
+		{
+			name: "compaction",
+			body: `{"model":"m","input":[
+				{"type":"message","role":"user","content":"go"},
+				{"type":"message","role":"assistant","phase":"commentary","content":"part"},
+				{"type":"compaction","encrypted_content":"earlier summary"},
+				{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}
+			]}`,
+		},
+		{
+			name: "tool_output",
+			body: `{"model":"m","input":[
+				{"type":"message","role":"user","content":"go"},
+				{"type":"message","role":"assistant","phase":"commentary","content":"part"},
+				{"type":"function_call_output","call_id":"c0","output":"ok"},
+				{"type":"function_call","call_id":"c1","name":"shell","arguments":"{}"}
+			]}`,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			msgs := responsesMessagesForTest(t, testCase.body)
+
+			var text map[string]any
+
+			for _, msg := range msgs {
+				if item, ok := msg.(map[string]any); ok && item["content"] == "part" {
+					text = item
+				}
+			}
+
+			if text == nil {
+				t.Fatalf("正文必须独立成条: %v", msgs)
+			}
+
+			if _, has := text["tool_calls"]; has {
+				t.Fatalf("跨 %s 边界不得合并: %v", testCase.name, text)
+			}
+
+			last, ok := msgs[len(msgs)-1].(map[string]any)
+			if !ok {
+				t.Fatalf("末条形态异常: %v", msgs)
+			}
+
+			if calls, _ := last["tool_calls"].([]any); len(calls) != 1 {
+				t.Fatalf("边界后的调用应独立成条: %v", last)
+			}
+		})
+	}
+}
