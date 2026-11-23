@@ -363,41 +363,9 @@ func readTranscriptionUpload(
 		return nil, false
 	}
 
-	upload := &transcriptionUpload{}
-
-	for {
-		part, partErr := reader.NextPart()
-		if partErr != nil {
-			if errors.Is(partErr, io.EOF) {
-				break
-			}
-			// 整体请求体超限由 limitRequestBody 在读取途中抛出，按 413 收口，
-			// 不要归成「multipart 形态错误」。
-			if isBodyTooLarge(partErr) {
-				writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-					bodyTooLargeMessage(maxBodyBytes), "")
-
-				return nil, false
-			}
-
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "malformed multipart body: "+partErr.Error())
-
-			return nil, false
-		}
-
-		if takeErr := upload.takePart(part); takeErr != nil {
-			if errors.Is(takeErr, errAudioPartTooLarge) {
-				writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
-					"audio file exceeds the 3MB upstream limit",
-					"send a shorter recording or a more compressed format")
-
-				return nil, false
-			}
-
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", takeErr.Error())
-
-			return nil, false
-		}
+	upload, ok := readTranscriptionParts(w, reader, maxBodyBytes)
+	if !ok {
+		return nil, false
 	}
 
 	if len(upload.audio) == 0 {
@@ -408,6 +376,53 @@ func readTranscriptionUpload(
 	}
 
 	return upload, true
+}
+
+// readTranscriptionParts 读完所有表单分片；出错时已写出响应，返回 ok=false。
+func readTranscriptionParts(
+	w http.ResponseWriter, reader *multipart.Reader, maxBodyBytes int64,
+) (*transcriptionUpload, bool) {
+	upload := &transcriptionUpload{}
+
+	for {
+		part, partErr := reader.NextPart()
+		if partErr != nil {
+			if errors.Is(partErr, io.EOF) {
+				return upload, true
+			}
+
+			writeTranscribePartError(w, partErr, maxBodyBytes)
+
+			return nil, false
+		}
+
+		if takeErr := upload.takePart(part); takeErr != nil {
+			writeTranscribePartError(w, takeErr, maxBodyBytes)
+
+			return nil, false
+		}
+	}
+}
+
+// writeTranscribePartError 处置读分片期间的错误：整体请求体超限按 413 收口（不归成
+// 「multipart 形态错误」），其余按 400。
+func writeTranscribePartError(w http.ResponseWriter, partErr error, maxBodyBytes int64) {
+	if errors.Is(partErr, errAudioPartTooLarge) {
+		writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+			"audio file exceeds the 3MB upstream limit",
+			"send a shorter recording or a more compressed format")
+
+		return
+	}
+
+	if isBodyTooLarge(partErr) {
+		writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+			bodyTooLargeMessage(maxBodyBytes), "")
+
+		return
+	}
+
+	writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "malformed multipart body: "+partErr.Error())
 }
 
 // takePart 把单个表单分片收进 upload：音频分片按 3MB 上限读入，model 取第一个，

@@ -183,9 +183,7 @@ func readSpeechStream(body io.Reader) ([]byte, error) {
 	for {
 		line, readErr := ReadSSELine(reader)
 
-		if trimmed := strings.TrimSpace(line); envelope == "" && strings.HasPrefix(trimmed, "{") {
-			envelope = trimmed
-		}
+		envelope = captureSpeechEnvelope(envelope, line)
 
 		next, done, frameErr := appendSpeechFrame(pcm, line)
 		if frameErr != nil {
@@ -204,31 +202,53 @@ func readSpeechStream(body io.Reader) ([]byte, error) {
 			break
 		}
 
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
+		if readErr == nil {
+			continue
+		}
 
-			return nil, fmt.Errorf("speech read: %w", readErr)
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+
+		return nil, fmt.Errorf("speech read: %w", readErr)
+	}
+
+	return finishSpeechStream(pcm, sawDone, envelope)
+}
+
+// finishSpeechStream 收尾判定：空音频要区分「上游报错」与「真的没有音频」，
+// 有音频但没收到收尾标记则按截断报错。
+func finishSpeechStream(pcm []byte, sawDone bool, envelope string) ([]byte, error) {
+	if len(pcm) > 0 {
+		if !sawDone {
+			return nil, ErrSpeechTruncated
+		}
+
+		return pcm, nil
+	}
+
+	if envelope != "" {
+		return nil, &Error{
+			Kind: Classify(http.StatusBadGateway, envelope), Status: http.StatusBadGateway,
+			Msg: truncate(envelope, 200), Code: businessCode(envelope),
 		}
 	}
 
-	if len(pcm) == 0 {
-		if envelope != "" {
-			return nil, &Error{
-				Kind: Classify(http.StatusBadGateway, envelope), Status: http.StatusBadGateway,
-				Msg: truncate(envelope, 200), Code: businessCode(envelope),
-			}
-		}
+	return nil, ErrSpeechEmptyAudio
+}
 
-		return nil, ErrSpeechEmptyAudio
+// captureSpeechEnvelope 记首个以 { 开头的行：上游把业务错误放在 2xx 的裸 JSON 体里时，
+// 它不是 SSE 帧，但带着真实的业务码与文案。
+func captureSpeechEnvelope(current, line string) string {
+	if current != "" {
+		return current
 	}
 
-	if !sawDone {
-		return nil, ErrSpeechTruncated
+	if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "{") {
+		return trimmed
 	}
 
-	return pcm, nil
+	return current
 }
 
 // appendSpeechFrame 处理一行 SSE：非 data 行原样放过，data 行解出本帧音频与收尾标记。
