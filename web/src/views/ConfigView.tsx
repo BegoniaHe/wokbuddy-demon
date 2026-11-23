@@ -763,6 +763,8 @@ export function ConfigView() {
           {check('web_fetch_endpoint', '开放 POST /v1/tools/fetch（官方服务端抓取；每次调用消耗一次账号额度）')}
           {check('images_endpoint', '开放 POST /v1/images/generations 与 /v1/images/edits（官方出图 / 图生图；尚未在真实账号验证计费）')}
           {check('videos_endpoint', '开放 POST /v1/videos/generations 与 GET /v1/videos/{task_id}（官方出视频 / 任务查询；尚未在真实账号验证计费）')}
+          {check('tts_enabled', '开放 POST /v1/audio/speech（官方语音合成；只回 wav / pcm，每次调用消耗一次账号额度）')}
+          {check('asr_enabled', '开放 POST /v1/audio/transcriptions（官方语音转文字；单个文件上限 3MB）')}
           {check('session_sticky_enabled', '会话粘性路由')}
           <p className="mt-2.5 text-2xs text-muted-foreground">
             提示词模式/文件与会话粘性开关需重启进程生效，其余开关保存后即时生效；未修改的敏感值（设备 Token / Upstash Token）留空即可保留。

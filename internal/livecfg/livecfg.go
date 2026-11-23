@@ -47,6 +47,11 @@ type Snapshot struct {
 	// （features.videos_endpoint，默认 false，issue #467）。与 images_endpoint
 	// 同口径：未在真实账号验证计费前不默认开启。
 	VideosEndpoint bool
+	// TTSEnabled 是否开放 POST /v1/audio/speech（features.tts_enabled，默认 false，
+	// issue #604）。两个语音开关分开：TTS/ASR 走不同上游端点、失败形态不同。
+	TTSEnabled bool
+	// ASREnabled 是否开放 POST /v1/audio/transcriptions（features.asr_enabled，默认 false）。
+	ASREnabled bool
 	// LocalWebToolRounds 本地工具最多代跑轮数（默认 3，封顶 8）。
 	LocalWebToolRounds int
 	// BackgroundNames 后台模型改写名单（小写；issue #103）。空 = 关闭。

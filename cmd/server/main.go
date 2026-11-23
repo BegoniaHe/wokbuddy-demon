@@ -1312,6 +1312,8 @@ func liveSnapshot(cfg *Config) livecfg.Snapshot {
 		WebFetchEndpoint:   cfg.Features.WebFetchEndpoint,
 		ImagesEndpoint:     cfg.Features.ImagesEndpoint,
 		VideosEndpoint:     cfg.Features.VideosEndpoint,
+		TTSEnabled:         cfg.Features.TTSEnabled,
+		ASREnabled:         cfg.Features.ASREnabled,
 		LocalWebTools:      cfg.Features.LocalWebTools,
 		LocalWebToolRounds: cfg.Features.LocalWebToolRounds,
 		BackgroundNames:    backgroundNameSet(cfg.Models.BackgroundNames),
