@@ -193,7 +193,9 @@ func TestAudioSpeechPCMFormat(t *testing.T) {
 	t.Parallel()
 
 	client := audioFakeClient(func(*http.Request) *http.Response {
-		return sseUpstream(http.StatusOK, `data: {"type":"speech.audio.delta","audio":{"data":"AAEC"}}`+"\n\n")
+		return sseUpstream(http.StatusOK,
+			`data: {"type":"speech.audio.delta","audio":{"data":"AAEC"}}`+"\n\n"+
+				`data: {"type":"speech.audio.done"}`+"\n\n")
 	})
 
 	handler := audioHandler(t, client, livecfg.Snapshot{TTSEnabled: true}, nil)
@@ -542,5 +544,99 @@ func TestAudioPathsAreTraced(t *testing.T) {
 		if !handler.tracedPath(httptest.NewRequest(http.MethodPost, path, nil)) {
 			t.Errorf("%s 未纳入请求台账", path)
 		}
+	}
+}
+
+// testMultipart 按顺序写入若干分片（name, filename, 内容）。
+func testMultipart(t *testing.T, parts ...[3]string) *http.Request {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	writer := multipart.NewWriter(&buf)
+
+	for _, part := range parts {
+		var (
+			dst io.Writer
+			err error
+		)
+		if part[1] == "" {
+			dst, err = writer.CreateFormField(part[0])
+		} else {
+			dst, err = writer.CreateFormFile(part[0], part[1])
+		}
+
+		if err != nil {
+			t.Fatalf("create part %s: %v", part[0], err)
+		}
+
+		if _, err := io.WriteString(dst, part[2]); err != nil {
+			t.Fatalf("write part %s: %v", part[0], err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &buf)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	return req
+}
+
+// TestAudioTranscriptionsRespectsMaxBodyBytes ASR 入口同样受 server.max_body_bytes
+// 约束：非音频分片不能把请求体推到任意大（此前只有 3MB 音频分片上限）。
+func TestAudioTranscriptionsRespectsMaxBodyBytes(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	client := audioFakeClient(func(*http.Request) *http.Response {
+		called = true
+
+		return jsonResponse(http.StatusOK, `{"code":0,"text":"x"}`)
+	})
+
+	handler := NewHandler(&Config{
+		Pool:         testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:     client,
+		Live:         livecfg.New(livecfg.Snapshot{ASREnabled: true}),
+		MaxBodyBytes: 1024,
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, testMultipart(t,
+		[3]string{"audio", "a.wav", "RIFF"},
+		[3]string{"prompt", "", strings.Repeat("x", 4096)},
+	))
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("code=%d body=%s want 413", rec.Code, rec.Body)
+	}
+
+	if called {
+		t.Fatal("超限请求不得打到上游")
+	}
+}
+
+// TestAudioTranscriptionsEmptyFirstPartKeepsLaterAudio 0 字节的 `audio` 分片不能吃掉
+// 后面有效的 `file` 分片（否则明明给了音频却回 400）。
+func TestAudioTranscriptionsEmptyFirstPartKeepsLaterAudio(t *testing.T) {
+	t.Parallel()
+
+	client := audioFakeClient(func(r *http.Request) *http.Response {
+		return jsonResponse(http.StatusOK, `{"code":0,"text":"ok"}`)
+	})
+
+	handler := audioHandler(t, client, livecfg.Snapshot{ASREnabled: true}, nil)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, testMultipart(t,
+		[3]string{"audio", "empty.wav", ""},
+		[3]string{"file", "real.wav", "RIFFdata"},
+	))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s want 200", rec.Code, rec.Body)
 	}
 }

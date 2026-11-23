@@ -169,7 +169,14 @@ func writeSpeechAudio(w http.ResponseWriter, format string, pcm []byte) {
 	if format == audioFormatWAV {
 		w.Header().Set("Content-Type", "audio/wav")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(wavFromPCM(pcm))
+		// 头与 PCM 分两次写出：整段 64MiB 的合成结果再拷贝一份会让并发峰值翻倍。
+		_, _ = w.Write(wavHeader(len(pcm)))
+		_, _ = w.Write(pcm)
+
+		// RIFF chunk 按偶数对齐：奇数长度的 data 后面必须补一个填充字节。
+		if len(pcm)%2 == 1 {
+			_, _ = w.Write([]byte{0})
+		}
 
 		return
 	}
@@ -187,7 +194,7 @@ func (h *Handler) serveTranscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upload, ok := readTranscriptionUpload(w, r)
+	upload, ok := readTranscriptionUpload(w, r, h.cfg.MaxBodyBytes)
 	if !ok {
 		return
 	}
@@ -339,7 +346,14 @@ var errAudioPartTooLarge = errors.New("audio file exceeds the 3MB upstream limit
 // 让超大上传先吃满网关内存。
 //
 // 字段名同时接受 audio（issue #604 契约）与 file（OpenAI 官方命名）。
-func readTranscriptionUpload(w http.ResponseWriter, r *http.Request) (*transcriptionUpload, bool) {
+func readTranscriptionUpload(
+	w http.ResponseWriter, r *http.Request, maxBodyBytes int64,
+) (*transcriptionUpload, bool) {
+	// 与其它入口同口径：整体请求体先受 server.max_body_bytes 约束，音频分片另有
+	// 3MB 上限（upstream.ASRMaxAudioBytes）。缺这一层时，任意非音频分片都能把
+	// 请求体推到任意大，文档化的上限形同虚设。
+	limitRequestBody(w, r, maxBodyBytes)
+
 	reader, err := r.MultipartReader()
 	if err != nil {
 		writeOpenAIErrorHint(w, http.StatusBadRequest, "invalid_request",
@@ -356,6 +370,14 @@ func readTranscriptionUpload(w http.ResponseWriter, r *http.Request) (*transcrip
 		if partErr != nil {
 			if errors.Is(partErr, io.EOF) {
 				break
+			}
+			// 整体请求体超限由 limitRequestBody 在读取途中抛出，按 413 收口，
+			// 不要归成「multipart 形态错误」。
+			if isBodyTooLarge(partErr) {
+				writeOpenAIErrorHint(w, http.StatusRequestEntityTooLarge, "payload_too_large",
+					bodyTooLargeMessage(maxBodyBytes), "")
+
+				return nil, false
 			}
 
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "malformed multipart body: "+partErr.Error())
@@ -393,8 +415,9 @@ func readTranscriptionUpload(w http.ResponseWriter, r *http.Request) (*transcrip
 func (upload *transcriptionUpload) takePart(part *multipart.Part) error {
 	switch name := part.FormName(); name {
 	case "audio", "file":
-		// 两个名字都给时先到先用，避免后一个覆盖已读出的音频。
-		if upload.audio != nil {
+		// 两个名字都给时先到先用，避免后一个覆盖已读出的音频；空分片不算占用，
+		// 否则 0 字节的 `audio` 会吃掉后面有效的 `file` 分片。
+		if len(upload.audio) > 0 {
 			_, _ = io.Copy(io.Discard, part)
 
 			return nil
@@ -421,9 +444,12 @@ func (upload *transcriptionUpload) takePart(part *multipart.Part) error {
 	return nil
 }
 
-// wavFromPCM 给 24kHz 单声道 s16le 裸 PCM 套 44 字节 RIFF 头（上游只产裸 PCM，
+// wavHeader 生成 24kHz 单声道 s16le 裸 PCM 的 44 字节 RIFF 头（上游只产裸 PCM，
 // 浏览器 / 播放器要容器才认）。字段按标准 WAV 头声明，无附加 chunk。
-func wavFromPCM(pcm []byte) []byte {
+//
+// pcmLen 为奇数时 RIFF 要求 data chunk 后补一个 0 字节：大小字段按「数据 + 填充」
+// 记账，否则严格解析器会把末尾读越界。
+func wavHeader(pcmLen int) []byte {
 	const (
 		wavHeaderBytes  = 44
 		pcmBits         = 16
@@ -433,12 +459,13 @@ func wavFromPCM(pcm []byte) []byte {
 
 	blockAlign := pcmChannels * pcmBits / 8
 	byteRate := upstream.TTSSampleRate * blockAlign
+	dataBytes := pcmLen + pcmLen%2
 
 	// 长度按 int 计算后再落盘：pcm 已由 upstream 侧限到 64MiB，不会溢出 uint32。
-	out := make([]byte, wavHeaderBytes+len(pcm))
+	out := make([]byte, wavHeaderBytes)
 
 	copy(out[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(out[4:8], uint32(wavHeaderBytes-8+len(pcm))) //nolint:gosec // pcm 由上游限到 64MiB
+	binary.LittleEndian.PutUint32(out[4:8], uint32(wavHeaderBytes-8+dataBytes)) //nolint:gosec // pcm 由上游限到 64MiB
 	copy(out[8:12], "WAVE")
 	copy(out[12:16], "fmt ")
 	binary.LittleEndian.PutUint32(out[16:20], 16) // fmt chunk 长度
@@ -449,8 +476,7 @@ func wavFromPCM(pcm []byte) []byte {
 	binary.LittleEndian.PutUint16(out[32:34], uint16(blockAlign))
 	binary.LittleEndian.PutUint16(out[34:36], pcmBits)
 	copy(out[36:40], "data")
-	binary.LittleEndian.PutUint32(out[40:44], uint32(len(pcm))) //nolint:gosec // pcm 由上游限到 64MiB
-	copy(out[wavHeaderBytes:], pcm)
+	binary.LittleEndian.PutUint32(out[40:44], uint32(pcmLen)) //nolint:gosec // pcm 由上游限到 64MiB
 
 	return out
 }
