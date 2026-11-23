@@ -13,6 +13,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -247,6 +248,17 @@ func (h *Handler) forwardVideo(
 
 	h.recordMediaAttempt(acct, realm, bareModel, final, r)
 
+	// 提交阶段的请求级 4xx 透传上游原文，不喂连败/熔断（issue #618）：视频提交是
+	// 单次尝试、不换号，参数越界一类的 4xx 是请求问题而非账号问题。账号级分类
+	// （401/402/403/404/429 等）走下面的既有处置。查询端点保持现状。
+	if !isTaskQuery && videoSubmitRequestStatus(final) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(final.status)
+		_, _ = w.Write(final.raw)
+
+		return
+	}
+
 	if h.handleMediaFailure(w, acct, bareModel, final, refreshFail, "video") {
 		return
 	}
@@ -371,6 +383,35 @@ func normalizeVideoReferenceEntry(item any, key string) (map[string]any, bool) {
 	}
 
 	return nil, false
+}
+
+// videoSubmitRequestStatus 报告提交阶段的失败是否属于请求级 4xx（issue #618）。
+//
+// 判据是 upstream 的错误分类白名单而不是状态码：402（余额耗尽）、404（上游偶发）、
+// 11136（账号缺该模型权限）、14017（授权/试用故障）都落在 4xx 窗口里，按状态码
+// 分流会把账号级信号一起吞掉——余额为 0 的账号会持续被视频选号命中并反复 402，
+// 缺权限账号不被 (账号,模型) 负缓存避让。白名单方向也保证新增错误分类默认走既有
+// 账号级处置，而不是默认透传。
+func videoSubmitRequestStatus(final mediaAttempt) bool {
+	if final.status < http.StatusBadRequest || final.status >= http.StatusInternalServerError {
+		return false
+	}
+
+	var uerr *upstream.Error
+	if !errors.As(final.err, &uerr) {
+		return false
+	}
+
+	switch uerr.Kind {
+	case upstream.ErrClient, upstream.ErrBadParams, upstream.ErrContentBlocked,
+		upstream.ErrModelNotFound, upstream.ErrPromptTooLong, upstream.ErrImageInvalid,
+		upstream.ErrChannelRefused:
+		// 参数 / 内容 / 能力 / 通道约束：换账号结果一样，属请求问题。
+		return true
+	default:
+		// 账号级分类（余额、授权、权限、限流、会话、上游故障…）交给 handleMediaFailure。
+		return false
+	}
 }
 
 // videoTaskFailed 报告任务终态是否为 failed；其余状态（排队 / 运行中 / completed）
