@@ -40,6 +40,9 @@ const (
 	TailPromise
 	// TailStructural 结构未闭合：未闭合代码块或截断的调用标记。
 	TailStructural
+	// TailBrowserComplete 正文只有一条 ::browser-complete{...} 控制标记（issue #629）：
+	// 浏览器任务没做完，标记本身不是最终答案。
+	TailBrowserComplete
 )
 
 // String 形态的日志标签。
@@ -51,6 +54,8 @@ func (k TailKind) String() string {
 		return "promise"
 	case TailStructural:
 		return "structural"
+	case TailBrowserComplete:
+		return "browser-complete"
 	case TailNone:
 		return "none"
 	}
@@ -95,6 +100,15 @@ type TextContinueReader struct {
 	continuationHasTool bool
 	// noMoreContinue 续写段已被判定为「已完成」声明：不再发起救援（issue #589）。
 	noMoreContinue bool
+	// browserGate 浏览器完成标记闸门：开启时（ContinueOnBrowserComplete）正文帧先暂存，
+	// 定性为「整段只有一条控制标记」则吞掉，否则原样放行（issue #629）。
+	browserGate bool
+	// browserRescue 本请求带工具上下文：吞掉控制标记后补一次续写；否则只吞标记。
+	browserRescue bool
+	// browserFrames 闸门暂存的正文原始帧（顺序即写出顺序）。
+	browserFrames []string
+	// browserSwallowed 本次流吞掉过一条独立控制标记：客户端零正文不等于上游空流。
+	browserSwallowed bool
 	// segmentStart 本次续写段开始时的正文长度（字节），用于取本段新增的正文。
 	segmentStart int
 	// pending 续写段里尚未确定归属的正文帧（已按续写口径重编码，顺序即写出顺序）。
@@ -203,6 +217,24 @@ func (c *TextContinueReader) ContinueOnStopTail(
 	}
 
 	return c
+}
+
+// ContinueOnBrowserComplete 开启浏览器完成标记闸门（issue #629）：正文只有一条独立
+// `::browser-complete{...}` 控制标记时不下发。toolContext 为真（本请求声明了 tools，
+// 或最后一条消息是工具结果）时吞掉标记后补一次续写；否则只吞标记，不额外打一次上游。
+func (c *TextContinueReader) ContinueOnBrowserComplete(toolContext bool) *TextContinueReader {
+	if c != nil {
+		c.browserGate = true
+		c.browserRescue = toolContext
+	}
+
+	return c
+}
+
+// BrowserCompleteSwallowed 报告本流是否吞掉过一条浏览器完成控制标记（issue #629）：
+// 调用方据此把「零正文」判为正常收尾，而不是按上游空流处置账号。
+func (c *TextContinueReader) BrowserCompleteSwallowed() bool {
+	return c != nil && c.browserSwallowed
 }
 
 // Continued 报告本流是否发生过续写（诊断日志用）。
@@ -356,6 +388,7 @@ func (c *TextContinueReader) handleLine(line string) {
 // handleDone 处理 [DONE]：首段因 length 截断且尚未续写时，先换流续写并吞掉本行；
 // 否则原行透传。
 func (c *TextContinueReader) handleDone(line string) {
+	c.settleBrowserGate(true)
 	c.settleSegment()
 
 	if c.continueTriggered() {
@@ -388,6 +421,11 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 
 	c.inspectFrame(frame)
 
+	// 浏览器完成标记闸门（issue #629）：正文可能是独立控制标记时先暂存，定性后放行或吞掉。
+	if c.holdBrowserCompleteFrame(frame, line) {
+		return
+	}
+
 	if c.continueTriggered() {
 		c.holdLengthFrame(line, frame)
 
@@ -404,19 +442,8 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 
 	// 工具轮续写只采纳调用（issue #495）：正文/思考帧丢弃；终态帧只在已采纳调用后
 	// 才写出，否则由首段 stop（held）保底。用量仍要记账，剥掉终态后写出。
-	if c.continuationToolsOnly {
-		switch {
-		case frameHasToolCalls(frame):
-			c.continuationHasTool = true
-		case !c.continuationHasTool:
-			if frameHasUsage(frame) {
-				c.writeFrameJSON(stripFinishReason(frame))
-			}
-
-			return
-		case !frameHasFinish(frame):
-			return
-		}
+	if c.continuationToolsOnly && c.writeToolsOnlyFrame(frame) {
+		return
 	}
 
 	if c.holdUntilSettled(frame) {
@@ -424,6 +451,25 @@ func (c *TextContinueReader) handleFrame(line string, frame map[string]any) {
 	}
 
 	c.writeFrameJSON(frame)
+}
+
+// writeToolsOnlyFrame 工具轮续写的帧策略（issue #495）：返回 true 表示本帧已处置完毕
+// （丢弃或已按剥掉终态的形态写出），调用方不要再写出它。
+func (c *TextContinueReader) writeToolsOnlyFrame(frame map[string]any) bool {
+	switch {
+	case frameHasToolCalls(frame):
+		c.continuationHasTool = true
+	case !c.continuationHasTool:
+		if frameHasUsage(frame) {
+			c.writeFrameJSON(stripFinishReason(frame))
+		}
+
+		return true
+	case !frameHasFinish(frame):
+		return true
+	}
+
+	return false
 }
 
 // holdLengthFrame 在续写前暂存终态：续写成功则丢弃，失败则补发。
@@ -456,6 +502,75 @@ func (c *TextContinueReader) holdLengthFrame(line string, frame map[string]any) 
 	}
 
 	c.held = append(c.held, line...)
+}
+
+// holdBrowserCompleteFrame 浏览器完成标记闸门（issue #629）：正文帧在定性前先暂存，
+// 定性后放行或吞掉。返回 true 表示本帧已暂存（不要写出）。
+//
+// 只在正文仍可能是（或就是）一条独立控制标记时暂存：正常回答的第一个正文帧就会发散
+// 并立即放行，不增加可见延迟。
+func (c *TextContinueReader) holdBrowserCompleteFrame(frame map[string]any, line string) bool {
+	if !c.browserGate {
+		return false
+	}
+
+	if frameTextOnly(frame) {
+		c.browserFrames = append(c.browserFrames, line)
+		c.settleBrowserGate(false)
+
+		return true
+	}
+
+	// 非正文帧（终态 / 工具调用 / 用量）代表本段结束：先定性，再交给后续分支写出。
+	if frameEndsSegment(frame) {
+		c.settleBrowserGate(true)
+	}
+
+	return false
+}
+
+// settleBrowserGate 定性浏览器完成标记闸门：整段只有一条控制标记时吞掉，并按工具上下文
+// 决定是否补一次续写（issue #629）；其余情况（正文已发散 / 段结束但不是纯标记 / 流被
+// 截断）把暂存帧原样放行。
+//
+// 吞掉时同时清掉 stop/length 触发标记：控制标记不是完成出口，非工具轮只吞不下发、不续写；
+// 工具轮换成 TailBrowserComplete，避免 narration / toolonly 对同一段再救一次。
+func (c *TextContinueReader) settleBrowserGate(segmentEnded bool) {
+	if !c.browserGate {
+		return
+	}
+
+	text := c.text.String()
+
+	if segmentEnded && BrowserCompleteOnly(text) {
+		c.browserGate = false
+		c.browserFrames = nil
+		c.browserSwallowed = true
+		c.finishLength = false
+		c.finishStop = c.browserRescue
+		c.stopByTail = c.browserRescue
+		c.stopKind = TailNone
+
+		if c.browserRescue {
+			c.stopKind = TailBrowserComplete
+		}
+
+		return
+	}
+
+	if segmentEnded || !BrowserCompletePossible(text) {
+		c.flushBrowserGate()
+	}
+}
+
+// flushBrowserGate 放行闸门暂存的正文帧（原样写出，顺序不变）。
+func (c *TextContinueReader) flushBrowserGate() {
+	for _, line := range c.browserFrames {
+		c.out.WriteString(line)
+	}
+
+	c.browserFrames = nil
+	c.browserGate = false
 }
 
 // frameHasSubstantive 报告帧是否携带正文/拒答/工具调用。
@@ -830,6 +945,7 @@ func (c *TextContinueReader) continueTriggered() bool {
 
 // handleEOF 流结束：有暂存终态时尝试续写；否则收尾。
 func (c *TextContinueReader) handleEOF() {
+	c.settleBrowserGate(true)
 	c.settleSegment()
 
 	if c.continueTriggered() {
@@ -1342,6 +1458,13 @@ const narrationPromiseNudge = gatewayContinuationPrefix + "你上一条回复最
 	"承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，" +
 	"不要解释为什么停下，不要重复已经写过的内容，不要重新开头。\n\n" + completionExit
 
+// browserCompleteNudge 正文只有一条 ::browser-complete 控制标记时的续写指令（issue #629）。
+// 必须点明「那是一条控制标记、不是答案」：模型自己以为任务已经结束，不说明就会再回一遍
+// 标记或者争辩任务已完成。完成出口复用 completionExit（同 #589）。
+const browserCompleteNudge = gatewayContinuationPrefix + "你上一条回复只输出了一条浏览器完成控制标记「::browser-complete{...}」就结束了，" +
+	"那是一条控制标记，不是最终答案，浏览器任务并没有做完。请接着把没做完的部分做完：" +
+	"需要调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要解释为什么停下。\n\n" + completionExit
+
 // continuationInstructionFor 按触发形态选续写指令：承诺句用专门的文案，其余沿用
 // 通用「从断点接着写」。
 func continuationInstructionFor(kind TailKind) string {
@@ -1350,6 +1473,8 @@ func continuationInstructionFor(kind TailKind) string {
 		return narrationNudge
 	case TailPromise:
 		return narrationPromiseNudge
+	case TailBrowserComplete:
+		return browserCompleteNudge
 	case TailNone, TailStructural:
 	}
 

@@ -152,21 +152,24 @@ func (s *chatStat) done() {
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
-	hasContent          bool
-	hasToolCall         bool
-	hasRefusal          bool
-	finishReason        string
-	br                  *bufio.Reader
-	src                 io.Closer // 底层上游 body（可为 nil）；Close 透传以解除异步读取阻塞
-	start               time.Time
-	ttfb                time.Duration
-	seen                bool // 已见过首个 data 帧（TTFB 只记一次）
-	promptTokens        int
-	completionTokens    int
-	totalTokens         int
-	hasPromptTokens     bool
-	hasCompletionTokens bool
-	hasTotalTokens      bool
+	hasContent  bool
+	hasToolCall bool
+	hasRefusal  bool
+	// suppressedControlMarker 上游只发了一条浏览器完成控制标记、被网关吞掉（issue #629）：
+	// 它算实质输出（不能按空流罚号），但不进客户端正文。
+	suppressedControlMarker bool
+	finishReason            string
+	br                      *bufio.Reader
+	src                     io.Closer // 底层上游 body（可为 nil）；Close 透传以解除异步读取阻塞
+	start                   time.Time
+	ttfb                    time.Duration
+	seen                    bool // 已见过首个 data 帧（TTFB 只记一次）
+	promptTokens            int
+	completionTokens        int
+	totalTokens             int
+	hasPromptTokens         bool
+	hasCompletionTokens     bool
+	hasTotalTokens          bool
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	hasCredit bool
 	credit    float64
@@ -642,7 +645,13 @@ func functionCallMapHasPayload(fc map[string]any) bool {
 // HasSubstantiveOutput 报告流中是否产生正文、工具调用或拒答。
 // 仅有 reasoning/reasoning_content 的流不算完成的回答。
 func (s *chatStatsReader) HasSubstantiveOutput() bool {
-	return s.hasContent || s.hasToolCall || s.hasRefusal
+	return s.hasContent || s.hasToolCall || s.hasRefusal || s.suppressedControlMarker
+}
+
+// noteSuppressedControlMarker 记录「上游发了控制标记、被网关吞掉」（issue #629）：
+// 客户端零正文不等于上游空流，不能据此罚号。
+func (s *chatStatsReader) noteSuppressedControlMarker() {
+	s.suppressedControlMarker = true
 }
 
 // FailedFinish 报告流是否以下游无法消费的 finish_reason 结束且没有实质输出。

@@ -28,6 +28,9 @@ const (
 	shapeNarrationTail
 	// shapeToolDeclaredNoCall 声明了工具、预告句收尾却零工具调用（工具轮「说一句就停」）。
 	shapeToolDeclaredNoCall
+	// shapeBrowserComplete 正文只有一条 ::browser-complete{...} 控制标记（issue #629）：
+	// 浏览器任务提前收尾，标记本身不是最终答案。
+	shapeBrowserComplete
 )
 
 // longFormContinuationMinTokens 长文续接的请求侧门槛：客户端自己把输出上限要到
@@ -101,6 +104,18 @@ func (f *chatFlow) aggregateShape(resp map[string]any) responseShape {
 		return shapeNormal
 	}
 
+	return f.stopShape(content)
+}
+
+// stopShape 非流式「stop 且零工具调用」时的形态判定：独立控制标记 → 尾部形态 →
+// 长文截断，依次收敛。
+func (f *chatFlow) stopShape(content string) responseShape {
+	// 独立控制标记（issue #629）：只有一条 ::browser-complete{...}，不是最终答案。
+	// 必须在尾部判据之前——工具轮里 classifyTail 会把短标记判成承诺句，走 narration 文案。
+	if upstream.BrowserCompleteOnly(content) {
+		return shapeBrowserComplete
+	}
+
 	if classifyTail(content, f.declaredToolCount > 0) != upstream.TailNone {
 		// 声明了工具却只说不做（issue #495）：工具轮触发，续写只采纳工具调用。
 		if f.declaredToolCount > 0 {
@@ -131,6 +146,14 @@ func (f *chatFlow) nonStreamContinuePlan(
 	switch shape {
 	case shapeLongFormTruncated:
 		return true, false, upstream.TailNone
+	case shapeBrowserComplete:
+		// 浏览器完成控制标记（issue #629）：带工具上下文才补一次续写；纯聊天只吞标记
+		// （wanted=false），不为一条控制标记多打一次上游。
+		if !f.toolContext {
+			return false, false, upstream.TailBrowserComplete
+		}
+
+		return true, f.declaredToolCount > 0, upstream.TailBrowserComplete
 	case shapeNarrationTail, shapeToolDeclaredNoCall:
 		message, _ := choice["message"].(map[string]any)
 		content, _ := message["content"].(string)
@@ -140,6 +163,19 @@ func (f *chatFlow) nonStreamContinuePlan(
 	}
 
 	return false, false, upstream.TailNone
+}
+
+// stripBrowserCompleteMarker 吞掉非流式正文里的独立控制标记（issue #629）：这行标记
+// 不是最终答案，透给客户端会让浏览器回合提前收尾。返回是否发生了吞掉。
+func stripBrowserCompleteMarker(msg map[string]any) bool {
+	content, _ := msg["content"].(string)
+	if !upstream.BrowserCompleteOnly(content) {
+		return false
+	}
+
+	msg["content"] = ""
+
+	return true
 }
 
 // classifyTail 判定正文尾部形态，决定是否续写、续写上限与指令（流式与非流式共用）：
