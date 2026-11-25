@@ -1560,7 +1560,10 @@ type chatFlow struct {
 	// declaredToolCount 本请求声明的去重工具数（不含会话历史），>0 才进请求归档
 	// 的「声明 / 调用」统计；declaredTools 仍含历史名，供标记修复判定。
 	declaredToolCount int
-	reqHasImage       bool
+	// toolContext 本请求带工具上下文（声明了 tools，或最后一条消息是工具结果）：
+	// 浏览器完成控制标记只有在这种上下文里才值得补一次续写（issue #629）。
+	toolContext bool
+	reqHasImage bool
 	// reqModalities 请求携带的非文本输入模态（issue #109，改写前取一次，
 	// 供 gateway_hint 与能力判定/路由共用，避免重复解析请求体）。
 	reqModalities []string
@@ -1972,6 +1975,8 @@ func (h *Handler) newChatFlow(chatInput2 *chatInput, out chatResponder) *chatFlo
 		// 取（那些改写不动 tools / messages[].tool_calls 子树）。
 		declaredTools:     declaredTools,
 		declaredToolCount: declaredToolCount,
+		// 工具上下文（issue #629）：声明了 tools，或最后一条消息是工具结果。
+		toolContext: declaredToolCount > 0 || upstream.LastMessageIsToolResult(chatInput2.body),
 		// gateway_hint 判定与模态能力判定所需的请求形态（多模态 part）：在改写前取。
 		reqHasImage:    containsModality(reqMods, upstream.ModalityImage),
 		reqModalities:  reqMods,
@@ -3379,6 +3384,9 @@ func (f *chatFlow) handleStreamSuccess(
 			})
 
 		stream = cont
+		// 浏览器完成控制标记（issue #629）：独立标记一行都不下发；带工具上下文时
+		// 补一次续写（TailBrowserComplete），纯聊天只吞标记。
+		cont.ContinueOnBrowserComplete(f.toolContext)
 		// 换段等待期补 SSE 注释帧（#578）：换段是全新上游 POST，大 prompt 的 prefill
 		// 常 3~15s，缺省部署（keepalive_interval=0）下这段时间零字节会被客户端 idle
 		// 超时断流。间隔沿用首帧等待期口径（ttfb_keepalive_interval，缺省 1500ms）。
@@ -3403,6 +3411,12 @@ func (f *chatFlow) handleStreamSuccess(
 	sErr := f.out.Stream(stats, upstream.FrameHintFunc(func() upstream.HintContext {
 		return f.h.hintContext(f.bareModel, f.reqHasImage, f.declaredToolCount > 0)
 	}), repair, func(payload string) { errFrame = payload })
+
+	// 吞掉控制标记后客户端零正文，但上游确实产出了实质输出：不按空流罚号（issue #629）。
+	if cont.BrowserCompleteSwallowed() {
+		stats.noteSuppressedControlMarker()
+	}
+
 	f.applyStreamOutcome(ctx, acct, stats, errFrame, sErr)
 	f.dropPacingIfClientGone(sErr)
 
@@ -4025,6 +4039,9 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 
 	wanted, toolsOnly, kind := f.nonStreamContinuePlan(resp, choice)
 	if !wanted {
+		// 独立控制标记不是最终答案：即使不续写（无工具上下文）也不下发（issue #629）。
+		stripBrowserCompleteMarker(msg)
+
 		return resp
 	}
 
@@ -4035,6 +4052,11 @@ func (f *chatFlow) continueNonStream(ctx context.Context, acct *auth.Auth, resp 
 	partial, _ := msg["content"].(string)
 	if partial == "" {
 		return resp
+	}
+
+	if kind == upstream.TailBrowserComplete {
+		// 标记不进最终正文（续写指令仍带着它，模型据此知道自己刚发过标记）。
+		msg["content"] = ""
 	}
 
 	captureSample("nonstream_continuation", f.bareModel, false, partial, map[string]any{
