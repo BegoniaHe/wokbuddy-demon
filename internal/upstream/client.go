@@ -3161,13 +3161,12 @@ func (c *Client) FetchModels(account9 *auth.Auth) ([]ModelInfo, error) {
 	}
 
 	if probeResult2.err != nil {
-		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn）。
-		log.Printf("WARN: [upstream] fetch models: v3/config probe failed "+
-			"(degraded to enterprise endpoint): %v", probeResult2.err)
+		// /v3 失败降级：不拖累企业端点结果（降级仅企业端点 + warn，同类降级只报一次）。
+		warnModelDegraded("cn-models-v3", "fetch models", "v3/config", "enterprise endpoint", probeResult2.err)
 	}
 
 	if enterprise.err != nil {
-		log.Printf("WARN: [upstream] fetch models: enterprise endpoint failed (v3/config only): %v", enterprise.err)
+		warnModelDegraded("cn-models-ent", "fetch models", "enterprise endpoint", "v3/config", enterprise.err)
 	}
 
 	// v3 没有默认 agent 判定时，用企业端点的白名单给 v3 独有模型补判定；
